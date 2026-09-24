@@ -14,7 +14,7 @@
 //! [`crate::LensTypesError::ManifestMismatch`] entsteht ausschließlich über
 //! [`IndexManifest::compatible_with`].
 //!
-//! Contract-Master Abschnitt C (AW0-08, `docs/aw-contract-master.md`).
+//! Contract-Master Abschnitt C (AW0-08, `docs/design/build-history.md`).
 
 use serde::{Deserialize, Serialize};
 
@@ -63,7 +63,7 @@ pub struct IndexManifest {
     /// Abstandsmaß des Index.
     pub metric: Metric,
     /// Digest über die Menge der indizierten Quellen.
-    pub source_set_digest: harw_types::ContentDigest,
+    pub source_set_digest: harw_digest::ContentDigest,
 }
 
 impl IndexManifest {
@@ -92,7 +92,7 @@ impl IndexManifest {
     /// # Examples
     /// ```rust
     /// use harw_lens_types::{IndexManifest, Locality, Metric, LensTypesError};
-    /// use harw_types::ContentDigest;
+    /// use harw_digest::ContentDigest;
     ///
     /// let manifest = IndexManifest {
     ///     model: "text-embed-3".to_owned(),
@@ -127,7 +127,7 @@ impl IndexManifest {
 mod tests {
     use super::*;
     use crate::test_support::{TestResult, ctx};
-    use harw_types::ContentDigest;
+    use harw_digest::ContentDigest;
 
     fn sample_manifest() -> IndexManifest {
         IndexManifest {

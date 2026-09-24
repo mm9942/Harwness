@@ -13,7 +13,7 @@
 //! Fehlertypen: keine — gesendete Frames werden mit `let _ = …` stille verworfen,
 //! falls der Receiver bereits geschlossen wurde.
 //!
-//! Spec-Quelle: `docs/design/codex-tui-study/00-harw-tui-redesign-spec.md`,
+//! Spec-Quelle: `docs/design/tui-architecture.md`,
 //! Abschnitt 2.5 + SLICE 4.
 //!
 //! # Beispiele

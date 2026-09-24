@@ -1,7 +1,7 @@
 //! Web-Einstieg auf die gemeinsame Runtime-Montage (`harw-runtime`).
 //!
 //! # Zweck
-//! Schließt Befund F-045 (`docs/remediation/CONTRACTS.md` §runtime-spec,
+//! Schließt Befund F-045 (`docs/design/runtime-contracts.md` §runtime-spec,
 //! `harw-runtime/src/sandbox.rs::permissions_for_tier`-Moduldoc): der
 //! frühere `harw-cli/src/web.rs`-Pfad (vor W2d-1/B1) reichte jedes [`PermissionTier`] eines Peers unverändert an
 //! [`harw_web::server::WebContextFactory`] weiter, ohne die Sandbox danach zu
@@ -53,7 +53,7 @@
 //! # fn demo() -> Result<(), String> {
 //! let root = harw_runtime::root_sandbox(
 //!     harw_runtime::EntryKind::Web,
-//!     Path::new("/home/mia/projects/harwness"),
+//!     Path::new("/home/user/projects/harwness"),
 //! )
 //! .map_err(|error| error.to_string())?;
 //! let sandbox = crate::runtime_web::narrow_web_sandbox(&root, PermissionTier::Observer);
@@ -192,7 +192,7 @@ pub(crate) fn web_assembly(
         job_store: None,
         approval_store,
     };
-    // Web-Einstieg ist CommandsOnly (CONTRACTS.md §runtime-spec-Tabelle):
+    // Web-Einstieg ist CommandsOnly (docs/design/runtime-contracts.md §runtime-spec-Tabelle):
     // der Root-Turn ruft nie ein Modell auf.
     let model = ModelSource::Echo("harw web führt keine Modell-Turns aus".to_owned());
     let mut builder = RuntimeAssembly::builder(spec).model(model).stores(stores);

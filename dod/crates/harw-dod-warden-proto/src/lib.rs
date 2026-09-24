@@ -86,7 +86,7 @@
 //! `serde`, `serde_json`; `harw-macros` zieht `syn`, `quote`, `proc-macro2`;
 //! `jiff` zieht seine eigene Zeitzonen-Kette) kommt bei einer vollständigen,
 //! blattgenauen transitiven Zählung auf 65 Crates — weit über der in
-//! `docs/aw-plan.md` („Jetzt entschieden", Nr. 1) festgelegten Obergrenze
+//! `docs/design/build-history.md` („Jetzt entschieden", Nr. 1) festgelegten Obergrenze
 //! von 12. Das eigentliche Gate (`xtask`, Gate „Warden-Abhängigkeitszahl")
 //! existiert zum Zeitpunkt dieses Knotens noch nicht als lauffähiger Code
 //! (`xtask/src/gate_privileges.rs` — das strukturell nächstliegende Gate —

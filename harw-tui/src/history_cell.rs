@@ -83,8 +83,8 @@
 //! assert!(!lines.is_empty());
 //! ```
 //!
-//! Spec-Quelle: `docs/design/codex-tui-study/00-harw-tui-redesign-spec.md` §2.10 / SLICE 7
-//! und `docs/design/codex-tui-study/04-rendering-style-dynamic.md` §3 sowie
+//! Spec-Quelle: `docs/design/tui-architecture.md` §2.10 / SLICE 7
+//! und `docs/design/tui-architecture.md` §3 sowie
 //! AP W5-01 / W5-10a.
 
 use std::sync::{Arc, Mutex};
@@ -171,7 +171,7 @@ pub(crate) trait HistoryCell: Send + Sync + std::fmt::Debug {
 /// - `lines` (`Vec<Line<'static>>`): Vorgerenderte Zeilen.
 ///
 /// # Spec-Referenz
-/// `00-harw-tui-redesign-spec.md` SLICE 7 / `04-rendering-style-dynamic.md` §3.
+/// `docs/design/tui-architecture.md`.
 #[derive(Debug)]
 pub(crate) struct PlainHistoryCell {
     /// Vorgerenderte, breitenunabhängige Ausgabezeilen.
@@ -211,7 +211,7 @@ impl HistoryCell for PlainHistoryCell {
 /// - `text` (`String`): Rohtext der Nutzereingabe.
 ///
 /// # Spec-Referenz
-/// `00-harw-tui-redesign-spec.md` SLICE 7 / `04-rendering-style-dynamic.md` §3.
+/// `docs/design/tui-architecture.md`.
 #[derive(Debug)]
 pub(crate) struct UserHistoryCell {
     /// Rohtext der Nutzereingabe vor der Darstellung.
@@ -281,7 +281,7 @@ impl HistoryCell for UserHistoryCell {
 /// da `String` beide Bounds erfüllt.
 ///
 /// # Spec-Referenz
-/// `00-harw-tui-redesign-spec.md` SLICE 7 / `04-rendering-style-dynamic.md` §3
+/// `docs/design/tui-architecture.md`
 /// ("`AgentMarkdownCell { source }` — Re-rendert bei jeder `display_lines(width)`-Anfrage").
 #[derive(Debug)]
 pub(crate) struct AssistantHistoryCell {
@@ -1212,7 +1212,7 @@ impl HistoryCell for GoalCell {
 /// assert!(lines.len() >= 2);
 /// ```
 ///
-/// Spec-Quelle: `00-harw-tui-redesign-spec.md` SLICE 7.
+/// Spec-Quelle: `docs/design/tui-architecture.md`.
 pub(crate) fn wrap_plain(text: &str, width: u16) -> Vec<Line<'static>> {
     let col_width = (width as usize).max(1);
     let mut result: Vec<Line<'static>> = Vec::new();
@@ -1477,7 +1477,9 @@ pub(crate) type SharedToolCell = Arc<Mutex<ToolCell>>;
 /// - `fs.edit` → `Edit(<Pfad>)`.
 /// - `doc.read_pdf` → `ReadPdf(<Pfad>)`, bzw. `ReadPdf(<Pfad>, Seiten
 ///   <Bereich>)` wenn das Argument `pages` gesetzt ist (dieselbe
-///   Darstellungsform wie `fs.read`, nur mit optionalem Seitenbereich).
+///   Darstellungsform wie `fs.read`, nur mit optionalem Seitenbereich);
+///   geht die Datei an einen Remote-OCR-Dienst, folgt
+///   `→ remote OCR (<Host>)`.
 /// - `transfer_to_<rolle>` → `Agent(<rolle>)`.
 /// - alles andere → `name(schlüssel: wert, …)` mit den ersten bis zu drei
 ///   **skalaren** Argumenten (Zeichenketten in Anführungszeichen, auf 40
@@ -1524,16 +1526,31 @@ pub(crate) fn tool_label(call: &ToolCall) -> String {
         "fs.write" => format!("Write({})", str_arg("path").unwrap_or("")),
         "fs.edit" => format!("Edit({})", str_arg("path").unwrap_or("")),
         "doc.read_pdf" => {
-            let path = str_arg("path").unwrap_or("");
-            match str_arg("pages") {
-                Some(pages) if !pages.is_empty() => format!("ReadPdf({path}, Seiten {pages})"),
-                _ => format!("ReadPdf({path})"),
-            }
+            let target = harw_registry_defaults::remote_ocr_target();
+            read_pdf_label(
+                str_arg("path").unwrap_or(""),
+                str_arg("pages"),
+                harw_registry_defaults::remote_ocr_host(call, target.as_ref()),
+            )
         }
         other if other.len() > "transfer_to_".len() && other.starts_with("transfer_to_") => {
             format!("Agent({})", &other["transfer_to_".len()..])
         }
         _ => unknown_tool_label(call),
+    }
+}
+
+/// Label für `doc.read_pdf`: `ReadPdf(<Pfad>[, Seiten <Bereich>])`, mit
+/// Zusatz `→ remote OCR (<Host>)`, wenn die Datei an einen Remote-OCR-Dienst
+/// geht (`remote_host` ist `Some`).
+fn read_pdf_label(path: &str, pages: Option<&str>, remote_host: Option<&str>) -> String {
+    let base = match pages {
+        Some(pages) if !pages.is_empty() => format!("ReadPdf({path}, Seiten {pages})"),
+        _ => format!("ReadPdf({path})"),
+    };
+    match remote_host {
+        Some(host) => format!("{base} → remote OCR ({host})"),
+        None => base,
     }
 }
 
@@ -3501,6 +3518,16 @@ mod tests {
             tool_label(&with_pages),
             "ReadPdf(docs/report.pdf, Seiten 2-5)"
         );
+    }
+
+    /// Geht die Datei an einen Remote-OCR-Dienst, nennt das Label den Host.
+    #[test]
+    fn test_read_pdf_label_names_remote_ocr_host() {
+        assert_eq!(
+            read_pdf_label("a.pdf", Some("1-2"), Some("api.mistral.ai")),
+            "ReadPdf(a.pdf, Seiten 1-2) → remote OCR (api.mistral.ai)"
+        );
+        assert_eq!(read_pdf_label("a.pdf", None, None), "ReadPdf(a.pdf)");
     }
 
     /// `transfer_to_<rolle>` ergibt `Agent(<rolle>)`.

@@ -3,7 +3,7 @@
 //!
 //! # Verantwortungsbereich
 //! Trägt [`FieldName`], [`FieldValue`] und das Makro [`field!`] (Vertrag
-//! A.1, `docs/aw-contract-master.md`). `FieldName` ist ausschließlich über
+//! A.1, `docs/design/build-history.md`). `FieldName` ist ausschließlich über
 //! [`field!`] konstruierbar: die Prüfung (nicht leer, keine Steuerzeichen)
 //! läuft in einer `const`-Deklaration zur Compile-Zeit, nicht als
 //! Laufzeit-`Result`.

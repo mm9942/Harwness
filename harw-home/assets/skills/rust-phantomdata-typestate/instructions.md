@@ -37,7 +37,7 @@ impl S3Object {
 ## Richtig
 
 ```rust
-// apps/sgh-flow/src/typestate/s3.rs:49-92
+// apps/acme-app/src/typestate/s3.rs:49-92
 use std::marker::PhantomData;
 
 // Zero-Sized Marker Structs — keine Laufzeit-Kosten
@@ -49,7 +49,7 @@ use std::marker::PhantomData;
 pub struct S3Object<State = Pending> {
     pub key: String,
     pub bucket: String,
-    _state: PhantomData<State>,   // apps/sgh-flow/src/typestate/s3.rs:92
+    _state: PhantomData<State>,   // apps/acme-app/src/typestate/s3.rs:92
 }
 
 // Nur S3Object<Pending> hat mark_stored() und cancel()
@@ -59,7 +59,7 @@ impl S3Object<Pending> {
     }
 
     // Transition konsumiert self → Pending-Objekt existiert danach nicht mehr
-    // apps/sgh-flow/src/typestate/s3.rs:127
+    // apps/acme-app/src/typestate/s3.rs:127
     pub fn mark_stored(self) -> S3Object<Stored> {
         S3Object { bucket: self.bucket, key: self.key, _state: PhantomData }
     }
@@ -92,7 +92,7 @@ let url = stored.retrieve();          // nur auf Stored erlaubt
 ### Session-Rollen: gleiches Muster
 
 ```rust
-// apps/sgh-flow/src/typestate/session.rs:46 + :80-129
+// apps/acme-app/src/typestate/session.rs:46 + :80-129
 use std::marker::PhantomData;
 
 pub struct Session<Role> { user_id: Option<Uuid>, _role: PhantomData<Role> }

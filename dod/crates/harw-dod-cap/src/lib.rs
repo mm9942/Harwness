@@ -2,7 +2,7 @@
 //!
 //! # Verantwortungsbereich
 //! Diese Crate ist das *Zugriffs*vokabular, an dem alle Sensor-Crates des
-//! AW0-Ausbauprogramms gleichzeitig hängen (Vertrag `docs/aw-contract-master.md`,
+//! AW0-Ausbauprogramms gleichzeitig hängen (Vertrag `docs/design/build-history.md`,
 //! Abschnitt F). Sie besitzt vier eng zusammenhängende Bausteine:
 //!
 //! - [`Capability`] / [`CapabilityClass`]: welche Ressource ein Sensor lesen

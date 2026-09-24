@@ -23,7 +23,7 @@ use std::os::unix::fs::MetadataExt;
 /// use harw_fsutil::{OpenMode, ensure_private_regular, open_nofollow};
 /// use std::path::Path;
 ///
-/// let file = open_nofollow(Path::new("/home/mia/.harw/auth.toml"), OpenMode::read_only())?;
+/// let file = open_nofollow(Path::new("/home/user/.harw/auth.toml"), OpenMode::read_only())?;
 /// ensure_private_regular(&file)?;
 /// # Ok::<(), std::io::Error>(())
 /// ```

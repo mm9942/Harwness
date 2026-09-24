@@ -14,8 +14,7 @@
 //!    die neue Datei fehlt) wird als letzter vertrauenswürdiger Layer ergänzt.
 //! 3. [`harw_config::discover_config_with_restricted_and_project_settings`] —
 //!    Merge der vertrauten Layer; ein nicht vertrauter Repo-Layer darf ausschließlich **verengen**
-//!    (`harw-config/src/discovery.rs:435`, Entscheidungstabelle im Ledger
-//!    `docs/remediation/ledger/W1/W1-06a.md`).
+//!    (`harw-config/src/discovery.rs:435`).
 //! 4. [`harw_config::ResolvedConfig::validate`] — Referenz- und
 //!    Klartext-Secret-Prüfung (`harw-config/src/discovery.rs:54`).
 //!

@@ -5,7 +5,7 @@
 # `executor` **nicht** read-only: er führt ausschließlich eng gebundene
 # Prozessaufträge (`shell.exec`) im Auftrag des Haupt-Agenten aus und liefert eine kurze
 # Zusammenfassung statt der Rohausgaben zurück. Zweck laut Contract
-# (`harw-scopes-contract.md`, Abschnitt „Nachträgliche Entscheidungen“ /
+# (`docs/design/config-scopes.md`, Abschnitt „Nachträgliche Entscheidungen“ /
 # Welle-B-Tabelle): die TUI soll Befehlsfolgen an diesen Worker delegieren
 # können, damit im Hauptfenster nur eine kompakte Fortschrittszeile erscheint
 # statt vieler einzelner Tool-Aufrufe.

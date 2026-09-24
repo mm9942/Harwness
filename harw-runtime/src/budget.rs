@@ -6,7 +6,7 @@
 //!
 //! 1. [`RootBudget`] — was der **Wurzel**-Agent eines Laufs höchstens
 //!    verbrauchen darf (Runden, Tokens, Wanduhrzeit). Vertrag
-//!    `docs/remediation/CONTRACTS.md` §runtime-spec.
+//!    `docs/design/runtime-contracts.md` §runtime-spec.
 //! 2. [`child_limits`] — wie viele **Kinder** ein Agent gleichzeitig halten
 //!    darf.
 //!

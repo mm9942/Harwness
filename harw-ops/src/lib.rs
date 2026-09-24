@@ -57,7 +57,7 @@
 //! read/write `uia_model`/`uia_provider` instead of
 //! `default_model`/`default_provider`, so the UIA can pin its own selection
 //! independent of the session default.
-//! `sandbox-lease` (Plan `recursive-cooking-lobster.md` Teil B5) ist der
+//! `sandbox-lease` ist der
 //! einzige Weg, über den ein Modell selbst eine Host-Freigabe für
 //! `shell.exec` anfordern kann: der Bestätigungsdialog, den es auslöst, ist
 //! die Freigabe selbst, deshalb trägt sein `model_tool` bewusst `approval =
@@ -176,6 +176,8 @@ pub mod knowledge_common;
 #[cfg(test)]
 pub(crate) mod knowledge_test_support;
 pub mod learn;
+// Live-Übernahme von Modellwechseln (Provider-Neubau, Rollenwahl).
+pub mod live_model;
 pub mod matrix;
 pub mod memory;
 pub mod mode;
@@ -395,7 +397,7 @@ pub fn register_all(registry: &mut OperationRegistry) {
         // `uia_effort`, independent of the session's default reasoning
         // effort. Same registration gap and fix as `uia-worker-model`.
         Arc::new(effort::UiaEffortOperation),
-        // Plan `recursive-cooking-lobster.md` Teil B5: der einzige Weg, über
+        // Der einzige Weg, über
         // den ein Modell selbst eine Host-Freigabe für `shell.exec`
         // anfordern kann (siehe Moduldoku, Abschnitt „Op-Set", und
         // `crate::sandbox_lease`-Moduldoku).
@@ -948,7 +950,7 @@ mod tests {
             // This node: implemented, now registered, now listed.
             "uia-worker-model",
             "uia-effort",
-            // Plan `recursive-cooking-lobster.md` Teil B5: der einzige Weg,
+            // Der einzige Weg,
             // über den ein Modell selbst eine Host-Freigabe für
             // `shell.exec` anfordern kann.
             "sandbox-lease",

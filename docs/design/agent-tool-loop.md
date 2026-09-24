@@ -1,5 +1,7 @@
 # Agent-as-tool execution contract
 
+> Status: implemented · Last reviewed: 2026-09-24
+
 Harwness uses two intentionally different multi-agent paths.
 
 ## Bounded micro-agent as a tool

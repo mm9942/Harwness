@@ -24,7 +24,7 @@ fn read_config(path: &str) -> Result<Config, AppError> {
 ## Richtig
 
 ```rust
-// Datei: apps/sgh-flow/src/runtime.rs:98–106
+// Datei: apps/acme-app/src/runtime.rs:98–106
 // bootstrap() und execute_command() geben beide Result<_, AppError> zurück.
 // ? propagiert AppError automatisch nach oben — From-Impls erledigen die Konversion.
 
@@ -109,7 +109,7 @@ fn first_line_or_err(text: &str) -> Result<&str, AppError> {
 ## Methodenketten mit `?`
 
 ```rust
-// Datei: apps/sgh-flow/src/iceberg/error.rs (Verwendungsmuster)
+// Datei: apps/acme-app/src/iceberg/error.rs (Verwendungsmuster)
 // Mehrere ?-Operatoren in einer Zeile — funktioniert, weil From-Impls vorhanden:
 fn parse_and_store(raw: &str) -> Result<(), IcebergError> {
     let val: serde_json::Value = serde_json::from_str(raw)?;  // serde_json::Error → IcebergError::Json

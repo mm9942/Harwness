@@ -20,7 +20,7 @@ let vaults: Vec<FileVault> = vec![FileVault::new()];  // ❌ nur ein Typ möglic
 // Factory: gibt entweder FileVault oder InProcessPlaintextVault zurück —
 // Caller kennt nur den Trait, nicht die konkrete Implementierung.
 //
-// Realer Code: apps/sgh-flow/src/services/secret_vault.rs:841
+// Realer Code: apps/acme-app/src/services/secret_vault.rs:841
 pub fn build_vault() -> AppResult<Box<dyn SecretVault>> {  // ✅
     if let Ok(backend) = std::env::var("SECRET_VAULT_BACKEND") {
         match backend.to_lowercase().as_str() {
@@ -39,7 +39,7 @@ pub fn build_vault() -> AppResult<Box<dyn SecretVault>> {  // ✅
 }
 
 // Heterogene Collection: App-Context hält verschiedene Repository-Impls
-// Realer Code: apps/sgh-flow/src/app.rs:180
+// Realer Code: apps/acme-app/src/app.rs:180
 pub struct AppContext {
     pub users:         Arc<dyn UserRepository>,      // ✅ Trait-Objekt in Arc (shared)
     pub invoice_read:  Arc<dyn InvoiceReadRepository>,

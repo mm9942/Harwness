@@ -26,9 +26,10 @@ use ratatui::{
     layout::Rect,
     style::{Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, Paragraph, Widget, Wrap},
+    widgets::{Block, Borders},
 };
 
+use crate::dialog_frame::{self, BodyScroll, DialogContent, PinnedRow};
 use crate::sanitize::sanitize_inline;
 use crate::style;
 use crate::tui_event::TuiEvent;
@@ -71,6 +72,8 @@ pub(crate) struct AskUserDialog {
     states: Vec<QuestionState>,
     index: usize,
     shown_at: Instant,
+    /// Scroll-Zustand des Körpers (Reiter, Fragetext).
+    body_scroll: BodyScroll,
 }
 
 impl std::fmt::Debug for AskUserDialog {
@@ -99,6 +102,7 @@ impl AskUserDialog {
             states,
             index: 0,
             shown_at: now,
+            body_scroll: BodyScroll::default(),
         }
     }
 
@@ -139,7 +143,8 @@ impl AskUserDialog {
                 AskStep::Stay(false)
             }
             TuiEvent::Resize(..) | TuiEvent::Draw => AskStep::Stay(true),
-            TuiEvent::Mouse(_) => AskStep::Stay(false),
+            // Das Mausrad scrollt den Fragetext.
+            TuiEvent::Mouse(mouse) => AskStep::Stay(self.body_scroll.handle_wheel(mouse.kind)),
         }
     }
 
@@ -156,6 +161,10 @@ impl AskUserDialog {
         }
         if !self.armed(now) {
             return AskStep::Stay(false);
+        }
+        // `Strg+↑↓` scrollt den Fragetext, ohne die Auswahl zu ändern.
+        if self.body_scroll.handle_key(&key) {
+            return AskStep::Stay(true);
         }
         if editing {
             return self.handle_editing_key(key);
@@ -351,10 +360,31 @@ impl AskUserDialog {
         }
     }
 
+    /// Scrollt den Fragetext um `lines` Zeilen; ändert nie die Auswahl.
+    pub(crate) fn scroll_body(&self, up: bool, lines: usize) {
+        if up {
+            self.body_scroll.scroll_up(lines);
+        } else {
+            self.body_scroll.scroll_down(lines);
+        }
+    }
+
+    /// Alle Zeilen (Körper, Optionen, Fußzeile) — für Tests.
+    #[cfg(test)]
     fn lines(&self, theme: style::Theme, now: Instant) -> Vec<Line<'static>> {
+        let content = self.content(theme, now, u16::MAX);
+        let mut lines = content.body;
+        lines.extend(content.pinned.into_iter().map(|row| row.line));
+        lines
+    }
+
+    /// Körper (Reiter, Frage) und angeheftete Zeilen (Optionen, „Andere“,
+    /// Tastenhinweis).
+    fn content(&self, theme: style::Theme, now: Instant, width: u16) -> DialogContent {
         let dim = style::dim_style(theme);
         let accent = style::selected_style(theme);
-        let mut lines = Vec::new();
+        let mut body = Vec::new();
+        let mut pinned = Vec::new();
         let total = self.questions.len();
         let mut tabs: Vec<Span<'static>> = vec![Span::styled(
             format!("Frage {}/{total}  ", self.index + 1),
@@ -369,18 +399,18 @@ impl AskUserDialog {
             let style = if i == self.index { accent } else { dim };
             tabs.push(Span::styled(format!("[{mark}{label}] "), style));
         }
-        lines.push(Line::from(tabs));
+        body.push(Line::from(tabs));
         let (Some(question), Some(state)) =
             (self.questions.get(self.index), self.states.get(self.index))
         else {
-            return lines;
+            return DialogContent { body, pinned };
         };
-        lines.push(Line::styled(
+        body.push(Line::styled(
             sanitize_inline(&question.question),
             Style::default().add_modifier(Modifier::BOLD),
         ));
         if question.multi_select {
-            lines.push(Line::styled("(Mehrfachauswahl)", dim));
+            body.push(Line::styled("(Mehrfachauswahl)", dim));
         }
         for (i, option) in question.options.iter().enumerate() {
             let chosen = state.selected.get(i).copied().unwrap_or(false);
@@ -410,7 +440,7 @@ impl AskUserDialog {
                     dim,
                 ));
             }
-            lines.push(Line::from(spans));
+            pinned.push(PinnedRow::content(Line::from(spans)));
         }
         let other_index = question.options.len();
         let pointer = if state.cursor == other_index {
@@ -436,48 +466,67 @@ impl AskUserDialog {
         } else {
             Style::default()
         };
-        lines.push(Line::from(vec![
+        pinned.push(PinnedRow::content(Line::from(vec![
             Span::styled(
                 format!("{pointer} {}. {marker} Andere: ", other_index + 1),
                 style,
             ),
             Span::styled(text, if state.editing { Style::default() } else { dim }),
-        ]));
-        let footer = if !self.armed(now) {
-            "Fenster wird gleich scharf … · Esc bricht ab"
+        ])));
+        let footers: &[&str] = if !self.armed(now) {
+            &[
+                "Fenster wird gleich scharf … · Esc bricht ab",
+                "gleich scharf … · Esc",
+            ]
         } else if state.editing {
-            "Tippen · Enter übernehmen · Esc zurück"
+            &["Tippen · Enter übernehmen · Esc zurück", "Enter · Esc"]
         } else if question.multi_select {
-            "↑↓ wählen · Leertaste/Ziffer markieren · Enter bestätigen · Tab nächste Frage · Esc abbrechen"
+            &[
+                "↑↓ wählen · Leertaste/Ziffer markieren · Enter bestätigen · Tab nächste Frage · Esc abbrechen",
+                "↑↓ · Leertaste markieren · Enter · Tab · Esc",
+                "↑↓ · ␣ · Enter · Tab · Esc",
+            ]
         } else {
-            "↑↓ wählen · Ziffer/Enter übernehmen · Tab nächste Frage · Esc abbrechen"
+            &[
+                "↑↓ wählen · Ziffer/Enter übernehmen · Tab nächste Frage · Esc abbrechen",
+                "↑↓ · Enter übernehmen · Tab · Esc",
+                "↑↓ · Enter · Tab · Esc",
+            ]
         };
-        lines.push(Line::styled(footer, dim));
-        lines
+        pinned.push(PinnedRow::content(Line::styled(
+            dialog_frame::pick_fitting(footers, width),
+            dim,
+        )));
+        DialogContent { body, pinned }
     }
 
     /// Benötigte Höhe (inkl. Rahmen).
     pub(crate) fn desired_height(&self, width: u16, theme: style::Theme) -> u16 {
         let inner_width = width.saturating_sub(2).max(1);
-        let rows = Paragraph::new(self.lines(theme, Instant::now()))
-            .wrap(Wrap { trim: false })
-            .line_count(inner_width);
-        u16::try_from(rows)
-            .unwrap_or(u16::MAX)
-            .saturating_add(2)
+        self.content(theme, Instant::now(), inner_width)
+            .desired_height(width)
             .clamp(MIN_DIALOG_HEIGHT, MAX_DIALOG_HEIGHT)
     }
 
     /// Zeichnet das Fenster anstelle des Composers.
+    ///
+    /// # Beschreibung
+    /// Optionen und Tastenhinweis sind angeheftet; der Fragetext scrollt bei
+    /// Platzmangel im Fenster (`Strg+↑↓`, Mausrad).
     pub(crate) fn render(&self, area: Rect, buf: &mut Buffer, theme: style::Theme) {
         let block = Block::default()
             .borders(Borders::ALL)
             .border_style(Style::default().fg(style::accent_color(theme)))
             .title(" Rückfrage des Agenten · ask_user ");
-        Paragraph::new(self.lines(theme, Instant::now()))
-            .wrap(Wrap { trim: false })
-            .block(block)
-            .render(area, buf);
+        let width = block.inner(area.intersection(buf.area)).width.max(1);
+        dialog_frame::render_dialog(
+            block,
+            area,
+            buf,
+            &self.content(theme, Instant::now(), width),
+            &self.body_scroll,
+            style::dim_style(theme),
+        );
     }
 }
 

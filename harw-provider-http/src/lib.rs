@@ -119,10 +119,11 @@ pub use anthropic::{
 pub use codex::{is_codex_base_url, is_codex_login_reference};
 pub use error::{HttpProviderError, HttpProviderResult};
 pub use retry::{
-    JitterSource, RetryDecision, RetryPolicy, RetrySleeper, RetryingProvider, SleepFuture,
-    StdJitter, ThreadSleeper, retry_decision,
+    DEFAULT_RATE_LIMIT_BUDGET, DEFAULT_RATE_LIMIT_MAX_DELAY, JitterSource, RetryDecision,
+    RetryPolicy, RetrySleeper, RetryingProvider, SleepFuture, StdJitter, ThreadSleeper,
+    rate_limit_decision, retry_decision,
 };
-pub use routing::RoutingModelProvider;
+pub use routing::{RoutingBackends, RoutingModelProvider};
 
 mod codex;
 mod credential_pool;
@@ -393,6 +394,100 @@ fn build_provider_with_optional_resolver(
     home: Option<&Path>,
     budgets: &budget::ProviderBudgetRegistry,
 ) -> HttpProviderResult<(Box<dyn ModelProvider>, ProviderLoadRegistry)> {
+    build_routing_provider_with_optional_resolver(config, resolver, home, budgets)
+        .map(|(router, load_controls)| (Box::new(router) as Box<dyn ModelProvider>, load_controls))
+}
+
+/// Wie [`build_provider_with_load_registry_and_home`], liefert aber den
+/// konkreten [`RoutingModelProvider`].
+///
+/// # Description
+/// Für Composition Roots, die über [`RoutingModelProvider::backends`] ein
+/// beim Start nicht baubares Backend später neu bauen wollen (Live-
+/// Modellwechsel auf einen anderen Provider, siehe
+/// [`build_named_backend`]).
+///
+/// # Errors
+/// Wie [`build_provider`].
+pub fn build_routing_provider_with_load_registry_and_home(
+    config: &harw_config::ResolvedConfig,
+    home: &Path,
+    resolver: Option<&dyn SecretResolver>,
+) -> HttpProviderResult<(RoutingModelProvider, ProviderLoadRegistry)> {
+    build_routing_provider_with_optional_resolver(
+        config,
+        resolver,
+        Some(home),
+        &budget::ProviderBudgetRegistry::global(),
+    )
+}
+
+/// Baut genau ein konfiguriertes Provider-Backend neu — derselbe Weg wie
+/// beim Start ([`build_provider`]), nur für `provider_name`.
+///
+/// # Description
+/// Existiert für den Live-Modellwechsel: ein Backend, das beim Start nicht
+/// gebaut werden konnte (z. B. weil der `secrets:`-Resolver nur für den
+/// Vorgabe-Provider geöffnet wurde), wird mit den jetzt verfügbaren
+/// Zugangsdaten gebaut und per [`RoutingBackends::replace`] eingesetzt.
+/// Die Modell-Vorgabe des Backends folgt derselben Regel wie beim Start;
+/// die eigentliche Modellwahl trägt ohnehin jeder Request
+/// (`ModelRequest::model_id`).
+///
+/// # Arguments
+/// - `config`: aufgelöste Konfiguration.
+/// - `provider_name`: Schlüssel des Providers in `config.providers`.
+/// - `home`: harw-Home für `file:`-Referenzen (`None` = fail-closed).
+/// - `resolver`: optionaler `secrets:`-Resolver.
+///
+/// # Returns
+/// Das Backend und — falls unterstützt — sein Auslastungs-Handle.
+///
+/// # Errors
+/// - [`HttpProviderError::MissingDefault`]: kein `default_model`.
+/// - [`HttpProviderError::DefaultProviderNotFound`]: Provider unbekannt oder
+///   deaktiviert.
+/// - Jeder Baufehler von [`build_provider`] (Zugangsdaten, Endpoint, …).
+pub fn build_named_backend(
+    config: &harw_config::ResolvedConfig,
+    provider_name: &str,
+    home: Option<&Path>,
+    resolver: Option<&dyn SecretResolver>,
+) -> HttpProviderResult<NamedProviderBuild> {
+    let model = config.harness.default_model.as_deref().ok_or_else(|| {
+        HttpProviderError::MissingDefault {
+            what: "default_model".to_owned(),
+        }
+    })?;
+    let provider = config
+        .providers
+        .get(provider_name)
+        .filter(|provider| provider.enabled)
+        .ok_or_else(|| HttpProviderError::DefaultProviderNotFound {
+            name: provider_name.to_owned(),
+        })?;
+    let sources = SecretSources {
+        env_layer: &config.env_layer,
+        resolver,
+        home,
+        endpoint: None,
+    };
+    build_named_provider(
+        provider_name,
+        provider,
+        config,
+        model,
+        sources,
+        &budget::ProviderBudgetRegistry::global(),
+    )
+}
+
+fn build_routing_provider_with_optional_resolver(
+    config: &harw_config::ResolvedConfig,
+    resolver: Option<&dyn SecretResolver>,
+    home: Option<&Path>,
+    budgets: &budget::ProviderBudgetRegistry,
+) -> HttpProviderResult<(RoutingModelProvider, ProviderLoadRegistry)> {
     let sources = SecretSources {
         env_layer: &config.env_layer,
         resolver,
@@ -411,6 +506,7 @@ fn build_provider_with_optional_resolver(
     })?;
 
     let mut providers = BTreeMap::new();
+    let mut unavailable = BTreeMap::new();
     let mut load_controls: ProviderLoadRegistry = BTreeMap::new();
     for (name, provider) in config
         .providers
@@ -418,31 +514,24 @@ fn build_provider_with_optional_resolver(
         .filter(|(_, provider)| provider.enabled)
         .collect::<BTreeMap<_, _>>()
     {
-        let backend = match build_named_provider(name, provider, config, model, sources, budgets) {
+        match build_named_provider(name, provider, config, model, sources, budgets) {
             Ok((backend, load_control)) => {
                 if let Some(load_control) = load_control {
                     load_controls.insert(name.to_owned(), load_control);
                 }
-                backend
+                providers.insert(name.to_owned(), backend);
             }
-            Err(error) if name != provider_name => Box::new(UnavailableProvider(error.to_string())),
+            Err(error) if name != provider_name => {
+                unavailable.insert(name.to_owned(), error.to_string());
+            }
             Err(error) => return Err(error),
-        };
-        providers.insert(name.to_owned(), backend);
+        }
     }
 
     Ok((
-        Box::new(RoutingModelProvider::new(providers, provider_name)?),
+        RoutingModelProvider::with_unavailable(providers, unavailable, provider_name)?,
         load_controls,
     ))
-}
-
-struct UnavailableProvider(String);
-
-impl ModelProvider for UnavailableProvider {
-    fn respond<'a>(&'a self, _request: ModelRequest) -> ModelFuture<'a> {
-        Box::pin(async move { Err(ModelError::RequestFailed(self.0.clone())) })
-    }
 }
 
 /// Constructs one configured backend with its provider-local defaults.
@@ -466,6 +555,13 @@ impl ModelProvider for UnavailableProvider {
 /// attempt plus two retries; `max_delay: 20s` caps the (unused, since only
 /// two retries occur) further exponential growth; `max_retry_after: 60s`
 /// still honours a server-provided `Retry-After` header up to a minute.
+///
+/// HTTP 429 (`RateLimited`) is **not** bound by `max_attempts`: it waits
+/// within [`retry::DEFAULT_RATE_LIMIT_BUDGET`] (5 min), honouring
+/// `Retry-After`, with exponential backoff up to
+/// [`retry::DEFAULT_RATE_LIMIT_MAX_DELAY`] and jitter (see `retry` module
+/// doc). Previously a 429 with `retry-after: 30` exhausted the three attempts
+/// after ~60 s and killed background children.
 fn network_retry_policy() -> RetryPolicy {
     RetryPolicy {
         max_attempts: 3,
@@ -473,6 +569,8 @@ fn network_retry_policy() -> RetryPolicy {
         max_delay: Duration::from_secs(20),
         max_retry_after: Duration::from_secs(60),
         retry_timeouts: true,
+        rate_limit_budget: retry::DEFAULT_RATE_LIMIT_BUDGET,
+        rate_limit_max_delay: retry::DEFAULT_RATE_LIMIT_MAX_DELAY,
     }
 }
 
@@ -1363,9 +1461,10 @@ pub struct ProviderLoadStatus {
     /// Provider ohne installierten Limiter gebaut wurde (siehe
     /// [`OpenAiResponsesProvider::concurrency_limiter`]-Doku).
     pub available_permits: usize,
-    /// Aktuell fällige Pacing-Wartezeit aus beobachteten Rate-Limit-Headern
-    /// (siehe [`rate_limiter::ProviderRateLimiter::pending_wait`]); `None`,
-    /// wenn kein Kontingent knapp ist oder der Pacer deaktiviert ist.
+    /// Aktuell fällige Wartezeit: Pacing aus beobachteten Rate-Limit-Headern
+    /// oder die gemeinsame Abkühlphase nach einem HTTP 429 (siehe
+    /// [`rate_limiter::ProviderRateLimiter::status_wait`]); `None`, wenn
+    /// gerade nicht gewartet werden muss.
     pub rate_limit_wait: Option<Duration>,
     /// Gesamtzahl seit Provider-Konstruktion beobachteter HTTP-429-Antworten
     /// (siehe [`rate_limiter::ProviderRateLimiter::rate_limited_count`]).
@@ -1463,7 +1562,7 @@ pub(crate) fn provider_load_status(
         available_permits: concurrency_limiter
             .map(DynamicConcurrencyLimiter::available)
             .unwrap_or(usize::MAX),
-        rate_limit_wait: rate_limiter.pending_wait(),
+        rate_limit_wait: rate_limiter.status_wait(),
         recent_rate_limited: rate_limiter.rate_limited_count(),
         budgets: Vec::new(),
     }
@@ -4077,6 +4176,9 @@ impl OpenAiResponsesProvider {
                 )
                 .await?
         };
+        // Laufende 429-Abkühlphase dieses Providers abwarten, bevor ein Slot
+        // belegt wird (siehe `ProviderRateLimiter::wait_for_cooldown`).
+        self.rate_limiter.wait_for_cooldown().await;
 
         // Hartes Nebenläufigkeits-Limit (siehe [`Self::concurrency_limiter`]):
         // blockiert, bis ein Slot frei wird, statt fehlzuschlagen. Der
@@ -4156,6 +4258,13 @@ impl OpenAiResponsesProvider {
                     // Sperrt alle Budget-Buckets dieses Requests (auch für
                     // bereits Wartende) für die `Retry-After`-Dauer.
                     self.budgets.penalize(model, hint.map(Duration::from_secs));
+                    // Gemeinsame Abkühlphase für alle Requests dieses
+                    // Providers (UIA und Kinder), siehe
+                    // `ProviderRateLimiter::note_rate_limit_cooldown`.
+                    if let Some(secs) = hint {
+                        self.rate_limiter
+                            .note_rate_limit_cooldown(Duration::from_secs(secs));
+                    }
                 }
                 let error =
                     model_error_for_status(status.as_u16(), request_id.as_deref(), hint, &body);

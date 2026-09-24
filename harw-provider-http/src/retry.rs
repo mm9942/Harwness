@@ -14,9 +14,22 @@
 //!   ([`RetryPolicy::backoff_delay`]).
 //! - Meldet der Provider einen Wartehinweis (`Transient::retry_after_secs`
 //!   oder `RateLimited::retry_after_secs`), wird **mindestens** so lange
-//!   gewartet. Liegt der Hinweis über `max_retry_after`, wird nicht
-//!   wiederholt (früher zu senden als der Provider erlaubt, würde nur
-//!   denselben Fehler erneut auslösen und Versuche verbrauchen).
+//!   gewartet. Liegt der Hinweis eines `Transient` über `max_retry_after`,
+//!   wird nicht wiederholt (früher zu senden als der Provider erlaubt, würde
+//!   nur denselben Fehler erneut auslösen und Versuche verbrauchen).
+//!
+//! ## HTTP 429 (`RateLimited`)
+//! Ein Rate-Limit ist kein Defekt, sondern eine Aufforderung zu warten.
+//! Früher galt dafür dieselbe Versuchsgrenze wie für 5xx (3 Versuche): mit
+//! `retry-after: 30` gab ein Kind-Agent nach gut 60 s auf, obwohl der
+//! Provider nur um Geduld bat. Jetzt gilt für 429 ein eigenes **Warte-Budget**
+//! ([`RetryPolicy::rate_limit_budget`], Vorgabe 5 min) statt der
+//! Versuchsgrenze: gewartet wird `max(retry_after, Backoff)` plus Jitter
+//! (bis 10 % des Hinweises, damit parallele Kinder nicht im Gleichtakt
+//! erneut anklopfen); der Backoff wächst exponentiell bis
+//! [`RetryPolicy::rate_limit_max_delay`]. Erst wenn die nächste Wartezeit
+//! das Budget sprengen würde (oder schon der Hinweis allein größer ist),
+//! wird aufgegeben — die Meldung nennt dann Versuche und Wartezeit.
 //!
 //! ## Determinismus
 //! Zufall ([`JitterSource`]) und Warten ([`RetrySleeper`]) sind injizierbar;
@@ -91,11 +104,18 @@ pub struct RetryPolicy {
     /// überlasteter lokaler Server wird durch Wiederholen nur länger
     /// blockiert. Übrige wiederholbare Fehler bleiben unberührt.
     pub retry_timeouts: bool,
+    /// Gesamtes Warte-Budget für HTTP-429-Wiederholungen
+    /// ([`ModelError::RateLimited`]); ersetzt für 429 die Versuchsgrenze
+    /// `max_attempts` (siehe Moduldoku „HTTP 429“).
+    pub rate_limit_budget: Duration,
+    /// Obergrenze des exponentiellen 429-Backoffs (ohne Provider-Hinweis).
+    pub rate_limit_max_delay: Duration,
 }
 
 impl Default for RetryPolicy {
     /// 4 Versuche, 10 s Basis, 30 s Deckel, `retry_after` bis 60 s. Durch
     /// Equal-Jitter liegt die erste Wartezeit damit immer bei mindestens 5 s.
+    /// HTTP 429: 5 min Warte-Budget, Backoff bis 60 s.
     fn default() -> Self {
         Self {
             max_attempts: 4,
@@ -103,9 +123,17 @@ impl Default for RetryPolicy {
             max_delay: Duration::from_secs(30),
             max_retry_after: Duration::from_secs(60),
             retry_timeouts: true,
+            rate_limit_budget: DEFAULT_RATE_LIMIT_BUDGET,
+            rate_limit_max_delay: DEFAULT_RATE_LIMIT_MAX_DELAY,
         }
     }
 }
+
+/// Vorgabe für [`RetryPolicy::rate_limit_budget`]: 5 min Gesamtwartezeit.
+pub const DEFAULT_RATE_LIMIT_BUDGET: Duration = Duration::from_secs(5 * 60);
+
+/// Vorgabe für [`RetryPolicy::rate_limit_max_delay`].
+pub const DEFAULT_RATE_LIMIT_MAX_DELAY: Duration = Duration::from_secs(60);
 
 impl RetryPolicy {
     /// Berechnet die Backoff-Wartezeit vor Wiederholung `retry_index` (0-basiert).
@@ -131,6 +159,18 @@ impl RetryPolicy {
         };
         let half = cap / 2;
         half + half.mul_f64(unit)
+    }
+
+    /// Backoff vor der 429-Wiederholung `retry_index` (0-basiert): wie
+    /// [`Self::backoff_delay`], aber gedeckelt auf
+    /// [`Self::rate_limit_max_delay`] statt `max_delay`.
+    #[must_use]
+    pub fn rate_limit_backoff_delay(&self, retry_index: u32, unit: f64) -> Duration {
+        Self {
+            max_delay: self.rate_limit_max_delay,
+            ..*self
+        }
+        .backoff_delay(retry_index, unit)
     }
 }
 
@@ -174,24 +214,120 @@ pub fn retry_decision(
     if !policy.retry_timeouts && matches!(error, ModelError::Timeout { .. }) {
         return RetryDecision::GiveUp;
     }
+    // `RateLimited::retry_after_secs` ist – anders als bei `Transient` –
+    // nicht optional (der Provider liefert immer einen Wert, notfalls
+    // einen Fallback; siehe `anthropic.rs::parse_retry_after`). 429 folgt
+    // dem Warte-Budget statt `max_retry_after` (siehe Moduldoku).
+    if let Some(hint) = rate_limit_hint(error) {
+        return rate_limit_decision(policy, hint, retry_index, unit, Duration::ZERO);
+    }
     let backoff = policy.backoff_delay(retry_index, unit);
     let hint = match error {
         ModelError::Transient {
             retry_after_secs: Some(secs),
             ..
         } => Some(Duration::from_secs(*secs)),
-        // `RateLimited::retry_after_secs` ist – anders als bei `Transient` –
-        // nicht optional (der Provider liefert immer einen Wert, notfalls
-        // einen Fallback; siehe `anthropic.rs::parse_retry_after`).
-        ModelError::RateLimited {
-            retry_after_secs, ..
-        } => Some(Duration::from_secs(*retry_after_secs)),
         _ => None,
     };
     match hint {
         Some(hint) if hint > policy.max_retry_after => RetryDecision::GiveUp,
         Some(hint) => RetryDecision::Retry(hint.max(backoff)),
         None => RetryDecision::Retry(backoff),
+    }
+}
+
+/// Wartehinweis eines HTTP-429-Fehlers, `None` für alle anderen Fehler.
+///
+/// # Description
+/// Anthropic meldet 429 als [`ModelError::RateLimited`], der
+/// OpenAI-kompatible Pfad als `Transient { status: Some(429) }` (ggf. ohne
+/// Hinweis → `0`, dann greift allein der Backoff). Beide folgen demselben
+/// Warte-Budget.
+#[must_use]
+pub fn rate_limit_hint(error: &ModelError) -> Option<Duration> {
+    match error {
+        ModelError::RateLimited {
+            retry_after_secs, ..
+        } => Some(Duration::from_secs(*retry_after_secs)),
+        ModelError::Transient {
+            status: Some(429),
+            retry_after_secs,
+            ..
+        } => Some(Duration::from_secs(retry_after_secs.unwrap_or(0))),
+        _ => None,
+    }
+}
+
+/// Entscheidet über eine Wiederholung nach HTTP 429
+/// ([`ModelError::RateLimited`]).
+///
+/// # Description
+/// Wartezeit `max(hint, Backoff) + hint/10 · unit`, Backoff über
+/// [`RetryPolicy::rate_limit_backoff_delay`]. Aufgegeben wird, wenn
+/// `waited` plus diese Wartezeit [`RetryPolicy::rate_limit_budget`]
+/// überschreiten würde — ein Hinweis jenseits des Budgets (z. B. ein
+/// Stunden-Kontingent) endet also sofort statt nach sinnlosem Warten.
+///
+/// # Arguments
+/// - `policy` (`&RetryPolicy`): Strategie.
+/// - `hint` (`Duration`): vom Provider gemeldete Wartezeit.
+/// - `retry_index` (`u32`): Index der geplanten 429-Wiederholung (0-basiert).
+/// - `unit` (`f64`): Jitter-Wert in `[0, 1]`.
+/// - `waited` (`Duration`): bisher für 429 abgewartete Zeit dieses Aufrufs.
+///
+/// # Returns
+/// Die [`RetryDecision`].
+#[must_use]
+pub fn rate_limit_decision(
+    policy: &RetryPolicy,
+    hint: Duration,
+    retry_index: u32,
+    unit: f64,
+    waited: Duration,
+) -> RetryDecision {
+    let unit = if unit.is_nan() {
+        0.0
+    } else {
+        unit.clamp(0.0, 1.0)
+    };
+    let backoff = policy.rate_limit_backoff_delay(retry_index, unit);
+    let delay = hint.max(backoff) + (hint / 10).mul_f64(unit);
+    match waited.checked_add(delay) {
+        Some(total) if total <= policy.rate_limit_budget => RetryDecision::Retry(delay),
+        _ => RetryDecision::GiveUp,
+    }
+}
+
+/// Ergänzt die Meldung eines endgültig aufgegebenen 429 um Versuche und
+/// Wartezeit, damit sichtbar ist, dass gewartet wurde (und wie lange).
+fn annotate_rate_limit_give_up(error: ModelError, attempts: u32, waited: Duration) -> ModelError {
+    if attempts <= 1 && waited.is_zero() {
+        return error;
+    }
+    let note = |message: String| {
+        format!(
+            "{message} (aufgegeben nach {attempts} Versuchen und {} s Wartezeit)",
+            waited.as_secs()
+        )
+    };
+    match error {
+        ModelError::RateLimited {
+            retry_after_secs,
+            message,
+        } => ModelError::RateLimited {
+            retry_after_secs,
+            message: note(message),
+        },
+        ModelError::Transient {
+            status: Some(429),
+            retry_after_secs,
+            message,
+        } => ModelError::Transient {
+            status: Some(429),
+            retry_after_secs,
+            message: note(message),
+        },
+        other => other,
     }
 }
 
@@ -311,8 +447,7 @@ enum Waited {
 /// nie abgebrochenen Token.
 ///
 /// # Concurrency
-/// `Send + Sync`; die Anfrage wird je Versuch geklont (nur wenn noch ein
-/// weiterer Versuch möglich ist).
+/// `Send + Sync`; die Anfrage wird je Versuch geklont.
 pub struct RetryingProvider<P: ModelProvider> {
     inner: P,
     policy: RetryPolicy,
@@ -416,41 +551,72 @@ impl<P: ModelProvider> ModelProvider for RetryingProvider<P> {
     fn respond<'a>(&'a self, request: ModelRequest) -> ModelFuture<'a> {
         Box::pin(async move {
             let max_attempts = self.policy.max_attempts.max(1);
-            let mut pending = Some(request);
+            // Versuche insgesamt (für die Meldung) sowie getrennt gezählte
+            // Nicht-429-Versuche (Grenze `max_attempts`) und 429-
+            // Wiederholungen (Grenze: Warte-Budget).
             let mut attempt: u32 = 1;
+            let mut other_attempts: u32 = 1;
+            let mut rate_limit_retries: u32 = 0;
+            let mut rate_limit_waited = Duration::ZERO;
             loop {
                 if self.cancel.is_cancelled() {
                     return Err(ModelError::Cancelled);
                 }
-                let current = if attempt >= max_attempts {
-                    pending.take()
-                } else {
-                    pending.clone()
-                };
-                let Some(current) = current else {
-                    return Err(ModelError::RequestFailed(
-                        "retry state lost the pending request".to_owned(),
-                    ));
-                };
-                let error = match self.race_respond(current).await {
+                // Je Versuch ein Klon: 429-Wiederholungen sind nicht mehr
+                // durch `max_attempts` begrenzt, der letzte Versuch ist also
+                // nicht im Voraus bekannt.
+                let error = match self.race_respond(request.clone()).await {
                     Ok(response) => return Ok(response),
                     Err(error) => error,
                 };
-                if attempt >= max_attempts {
-                    return Err(error);
-                }
-                let decision =
-                    retry_decision(&self.policy, &error, attempt - 1, self.jitter.next_unit());
-                let RetryDecision::Retry(delay) = decision else {
-                    return Err(error);
+                let hint = rate_limit_hint(&error);
+                let decision = match hint {
+                    Some(hint) => rate_limit_decision(
+                        &self.policy,
+                        hint,
+                        rate_limit_retries,
+                        self.jitter.next_unit(),
+                        rate_limit_waited,
+                    ),
+                    None if other_attempts >= max_attempts => RetryDecision::GiveUp,
+                    None => retry_decision(
+                        &self.policy,
+                        &error,
+                        other_attempts - 1,
+                        self.jitter.next_unit(),
+                    ),
                 };
-                tracing::warn!(
-                    attempt,
-                    max_attempts,
-                    delay_ms = u64::try_from(delay.as_millis()).unwrap_or(u64::MAX),
-                    error = %error,
-                    "retrying transient model error"
-                );
+                let RetryDecision::Retry(delay) = decision else {
+                    return Err(annotate_rate_limit_give_up(
+                        error,
+                        attempt,
+                        rate_limit_waited,
+                    ));
+                };
+                let delay_ms = u64::try_from(delay.as_millis()).unwrap_or(u64::MAX);
+                if hint.is_some() {
+                    rate_limit_retries = rate_limit_retries.saturating_add(1);
+                    rate_limit_waited = rate_limit_waited.saturating_add(delay);
+                    tracing::warn!(
+                        attempt,
+                        delay_ms,
+                        waited_ms = u64::try_from(rate_limit_waited.as_millis())
+                            .unwrap_or(u64::MAX),
+                        budget_ms = u64::try_from(self.policy.rate_limit_budget.as_millis())
+                            .unwrap_or(u64::MAX),
+                        error = %error,
+                        "waiting for provider rate limit (HTTP 429) before retrying"
+                    );
+                } else {
+                    other_attempts = other_attempts.saturating_add(1);
+                    tracing::warn!(
+                        attempt,
+                        max_attempts,
+                        delay_ms,
+                        error = %error,
+                        "retrying transient model error"
+                    );
+                }
                 match self.wait(delay).await {
                     Waited::Cancelled => return Err(ModelError::Cancelled),
                     Waited::Elapsed(Err(timer_error)) => {
@@ -459,7 +625,7 @@ impl<P: ModelProvider> ModelProvider for RetryingProvider<P> {
                     }
                     Waited::Elapsed(Ok(())) => {}
                 }
-                attempt += 1;
+                attempt = attempt.saturating_add(1);
             }
         })
     }
@@ -476,6 +642,11 @@ impl<P: ModelProvider> ModelProvider for RetryingProvider<P> {
     fn pinned_model_id(&self) -> Option<String> {
         self.inner.pinned_model_id()
     }
+
+    /// Reicht die gepinnte Provider-ID des umhüllten Providers durch.
+    fn pinned_provider_id(&self) -> Option<String> {
+        self.inner.pinned_provider_id()
+    }
 }
 
 #[cfg(test)]
@@ -491,6 +662,8 @@ mod tests {
             max_delay: Duration::from_secs(1),
             max_retry_after: Duration::from_secs(60),
             retry_timeouts: true,
+            rate_limit_budget: Duration::from_secs(60),
+            rate_limit_max_delay: Duration::from_secs(1),
         }
     }
 
@@ -556,9 +729,10 @@ mod tests {
             retry_after_secs: 5,
             message: "429".to_owned(),
         };
+        // 429: Hinweis plus bis zu 10 % Jitter (hier voll: 5 s + 0,5 s).
         assert_eq!(
             retry_decision(&policy, &rate_limited, 0, 1.0),
-            RetryDecision::Retry(Duration::from_secs(5))
+            RetryDecision::Retry(Duration::from_millis(5_500))
         );
         let rate_limited_over_cap = ModelError::RateLimited {
             retry_after_secs: 61,
@@ -722,5 +896,156 @@ mod tests {
         // das Cancel nicht gegen den `inner.respond`-Aufruf gerennt, sondern
         // ist wirkungslos verpufft.
         assert!(started.elapsed() < Duration::from_millis(150));
+    }
+    /// Fester Jitter und aufzeichnender Sleeper ohne echte Zeit.
+    struct FixedJitter(f64);
+
+    impl JitterSource for FixedJitter {
+        fn next_unit(&self) -> f64 {
+            self.0
+        }
+    }
+
+    #[derive(Default)]
+    struct RecordingSleeper {
+        waits: Mutex<Vec<Duration>>,
+    }
+
+    impl RetrySleeper for RecordingSleeper {
+        fn sleep(&self, duration: Duration) -> SleepFuture {
+            self.waits
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .push(duration);
+            Box::pin(std::future::ready(Ok(())))
+        }
+    }
+
+    /// Antwortet `failures`-mal mit HTTP 429 (`retry_after_secs`), danach
+    /// erfolgreich.
+    struct RateLimitedThenOk {
+        failures: u32,
+        retry_after_secs: u64,
+        calls: AtomicU64,
+    }
+
+    impl ModelProvider for RateLimitedThenOk {
+        fn respond<'a>(&'a self, _request: ModelRequest) -> ModelFuture<'a> {
+            Box::pin(async move {
+                let call = self.calls.fetch_add(1, Ordering::SeqCst);
+                if call < u64::from(self.failures) {
+                    Err(ModelError::RateLimited {
+                        retry_after_secs: self.retry_after_secs,
+                        message: "provider returned HTTP 429: rate_limit_error: Error".to_owned(),
+                    })
+                } else {
+                    Ok(ModelResponse::text("ok"))
+                }
+            })
+        }
+    }
+
+    fn empty_request() -> ModelRequest {
+        harw_core::ModelRequest::new(
+            Default::default(),
+            Vec::new(),
+            harw_core::ConversationHistory::new(),
+            Vec::new(),
+        )
+    }
+
+    /// Regression (Export 429): mit `retry-after: 30` gaben Kinder nach drei
+    /// Versuchen (~60 s) auf. 429 folgt jetzt dem Warte-Budget, nicht der
+    /// Versuchsgrenze: fünf 429 in Folge werden abgewartet.
+    #[tokio::test]
+    async fn test_rate_limited_retries_beyond_max_attempts_within_budget() -> TestResult {
+        let sleeper = Arc::new(RecordingSleeper::default());
+        let policy = RetryPolicy {
+            max_attempts: 3,
+            rate_limit_budget: Duration::from_secs(300),
+            rate_limit_max_delay: Duration::from_secs(60),
+            ..RetryPolicy::default()
+        };
+        let provider = RetryingProvider::new(
+            RateLimitedThenOk {
+                failures: 5,
+                retry_after_secs: 30,
+                calls: AtomicU64::new(0),
+            },
+            policy,
+        )
+        .with_sleeper(Arc::clone(&sleeper) as Arc<dyn RetrySleeper>)
+        .with_jitter(Arc::new(FixedJitter(0.0)));
+        let response = provider
+            .respond(empty_request())
+            .await
+            .map_err(ctx("rate-limited request eventually succeeds"))?;
+        assert_eq!(response.message.as_deref(), Some("ok"));
+        let waits = sleeper
+            .waits
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone();
+        assert_eq!(waits.len(), 5);
+        // Nie kürzer als der Hinweis des Providers.
+        assert!(waits.iter().all(|wait| *wait >= Duration::from_secs(30)));
+        Ok(())
+    }
+
+    /// Ist das Budget aufgebraucht, endet der Aufruf mit einer Meldung, die
+    /// Versuche und Wartezeit nennt; ein Hinweis jenseits des Budgets endet
+    /// sofort.
+    #[tokio::test]
+    async fn test_rate_limited_gives_up_when_budget_exhausted() -> TestResult {
+        let sleeper = Arc::new(RecordingSleeper::default());
+        let policy = RetryPolicy {
+            rate_limit_budget: Duration::from_secs(70),
+            ..RetryPolicy::default()
+        };
+        let provider = RetryingProvider::new(
+            RateLimitedThenOk {
+                failures: u32::MAX,
+                retry_after_secs: 30,
+                calls: AtomicU64::new(0),
+            },
+            policy,
+        )
+        .with_sleeper(Arc::clone(&sleeper) as Arc<dyn RetrySleeper>)
+        .with_jitter(Arc::new(FixedJitter(0.0)));
+        let message = match provider.respond(empty_request()).await {
+            Err(ModelError::RateLimited { message, .. }) => message,
+            other => {
+                return Err(crate::test_support::TestError::Unexpected(format!(
+                    "expected RateLimited, got {other:?}"
+                )));
+            }
+        };
+        // 30 s + 30 s = 60 s gewartet; eine dritte Wartezeit sprengt 70 s.
+        assert!(message.contains("aufgegeben nach 3 Versuchen"), "{message}");
+        assert!(message.contains("60 s Wartezeit"), "{message}");
+        assert_eq!(
+            rate_limit_decision(
+                &RetryPolicy::default(),
+                Duration::from_secs(3 * 3600),
+                0,
+                0.0,
+                Duration::ZERO
+            ),
+            RetryDecision::GiveUp
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn test_rate_limit_backoff_grows_to_its_own_cap() {
+        let policy = RetryPolicy::default();
+        assert_eq!(
+            rate_limit_decision(&policy, Duration::ZERO, 0, 1.0, Duration::ZERO),
+            RetryDecision::Retry(Duration::from_secs(10))
+        );
+        assert_eq!(
+            rate_limit_decision(&policy, Duration::ZERO, 10, 1.0, Duration::ZERO),
+            RetryDecision::Retry(DEFAULT_RATE_LIMIT_MAX_DELAY)
+        );
     }
 }

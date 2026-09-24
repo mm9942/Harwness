@@ -27,7 +27,7 @@
 //! version = 1
 //!
 //! [[project]]
-//! canonical_root = "/home/mia/projects/beispiel"
+//! canonical_root = "/home/user/projects/beispiel"
 //! owner_uid = 1000
 //! digest = "blake3:…64 Hex-Zeichen…"
 //! ```
@@ -59,8 +59,8 @@
 //! use harw_home::trust::{TrustStatus, project_trust_status, trust_project};
 //! use std::path::Path;
 //!
-//! let home = Path::new("/home/mia/.harw");
-//! let repo = Path::new("/home/mia/projects/beispiel");
+//! let home = Path::new("/home/user/.harw");
+//! let repo = Path::new("/home/user/projects/beispiel");
 //! if project_trust_status(home, repo)? != TrustStatus::Trusted {
 //!     let record = trust_project(home, repo)?;
 //!     println!("vertraut: {} ({})", record.canonical_root.display(), record.digest);
@@ -136,7 +136,7 @@ const DIGEST_PREFIX: &str = "blake3:";
 /// use std::path::PathBuf;
 ///
 /// let record = TrustRecord {
-///     canonical_root: PathBuf::from("/home/mia/projects/beispiel"),
+///     canonical_root: PathBuf::from("/home/user/projects/beispiel"),
 ///     owner_uid: 1000,
 ///     digest: format!("blake3:{}", "0".repeat(64)),
 /// };
@@ -183,7 +183,7 @@ struct TrustFile {
 /// use harw_home::trust::TrustStore;
 /// use std::path::Path;
 ///
-/// let store = TrustStore::load(Path::new("/home/mia/.harw"))?;
+/// let store = TrustStore::load(Path::new("/home/user/.harw"))?;
 /// for record in store.records() {
 ///     println!("{}", record.canonical_root.display());
 /// }

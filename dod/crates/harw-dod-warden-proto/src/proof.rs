@@ -21,7 +21,7 @@
 //! ([`crate::action::WardenAction::is_admissible_from`])? Beide Prüfungen
 //! sind rein strukturell; sie ersetzen nicht die eigentliche
 //! Vertrauensgrenze des Systems (ein `SOCK_SEQPACKET`-Unix-Socket mit
-//! `SO_PEERCRED`, AW5-04b, Entscheidung Nr. 3 in `docs/aw-plan.md`) — sie
+//! `SO_PEERCRED`, AW5-04b, Entscheidung Nr. 3 in `docs/design/build-history.md`) — sie
 //! sind die zusätzliche Schicht, die selbst ein Absender, der den Socket
 //! benutzen darf, nicht umgehen kann, indem er einfach andere Nutzdaten in
 //! dieselbe Beleg-Hülle packt.

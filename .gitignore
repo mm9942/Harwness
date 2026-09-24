@@ -53,3 +53,11 @@ harw-export-*
 
 # Temporäre Arbeitsdateien im Root
 .tmp_*
+
+# Never publish session transcripts, exports or local credentials
+docs/sessions/
+docs/archive/
+**/*transcript*
+**/codex-session-*
+auth.toml
+*.key

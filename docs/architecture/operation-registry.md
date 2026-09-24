@@ -1,5 +1,7 @@
 # Operation Registry — Single Source of Truth
 
+> Status: implemented · Last reviewed: 2026-09-24
+
 ## Overview
 
 HARW defines every command as a single `#[operation(...)]` declaration. From that
@@ -155,15 +157,15 @@ single-segment path for purposes of dispatch, help, and completion indexing.
 
 ---
 
-## What Has Not Moved Yet (deliberately unstable in 0.2.0)
+## What Has Not Moved Yet
 
-- **IR-based agent instantiation**: The pipeline from `harw-agent-dsl` through the
-  DSL runtime to `AgentSession::new` is not yet wired. Operations continue to
-  receive `AgentRole` values from `harw-types` directly; the DSL IR path is parsed
-  and validated but not executed at session startup.
+- **IR-based agent instantiation**: Open. The pipeline from `harw-agent-dsl`
+  through the DSL runtime to `AgentSession::new` is not yet wired. Operations
+  continue to receive `AgentRole` values from `harw-types` directly; the DSL
+  IR path is parsed and validated but not executed at session startup.
 
-- **`harw::Harness::builder()` fluent API**: The `harw` facade crate is present in
-  the workspace and re-exports canonical types (`OperationMeta`, `OperationRegistry`,
-  `CommandRegistry`, domain enums). The `Harness::builder()` constructor and its
-  associated configuration DSL are planned for milestone 0.3.0 and are not shipped
-  in 0.2.0.
+- **`harw::Harness::builder()` fluent API**: Open. The `harw` facade crate
+  (`harw/src/lib.rs`) is present in the workspace and re-exports canonical
+  types (`OperationMeta`, `OperationRegistry`, `CommandRegistry`, domain
+  enums). A `Harness::builder()` constructor and its associated
+  configuration DSL are not shipped.

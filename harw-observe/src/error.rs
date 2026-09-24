@@ -2,7 +2,7 @@
 //!
 //! # Verantwortungsbereich
 //! Trägt [`ObserveError`], den einen Fehlertyp dieser Crate (Vertrag §H.1,
-//! `docs/aw-contract-master.md`). `harw-observe` hat kein Backend und kein
+//! `docs/design/build-history.md`). `harw-observe` hat kein Backend und kein
 //! I/O — die Quellen solcher Fehler sind aktuell die validierenden
 //! Konstruktoren von [`crate::trace::TraceContext`] sowie
 //! [`crate::null_counter::assert_all_zero`] (Knoten AW1-07), wenn ein

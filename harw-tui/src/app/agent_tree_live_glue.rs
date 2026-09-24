@@ -67,7 +67,7 @@ mod tests {
         app.agent_monitor.apply(&AgentEvent {
             agent: root.clone(),
             parent: None,
-            role: "emily-ui".to_owned(),
+            role: "assistant-ui".to_owned(),
             kind: AgentEventKind::Turn(TurnEvent::UsageUpdated {
                 turn_id: TurnId::new(),
                 round: TokenUsage::default(),
@@ -145,7 +145,7 @@ mod tests {
         app.agent_monitor.apply(&AgentEvent {
             agent: app.session_id().clone(),
             parent: None,
-            role: "emily-ui".to_owned(),
+            role: "assistant-ui".to_owned(),
             kind: AgentEventKind::Turn(TurnEvent::UsageUpdated {
                 turn_id: TurnId::new(),
                 round: TokenUsage::default(),

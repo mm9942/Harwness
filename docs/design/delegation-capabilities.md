@@ -1,35 +1,36 @@
-# Delegationscapabilities und lokaler Organisationsgraph
+# Delegation capabilities and the local organization graph
 
-## Zweck
+> Status: implemented · Last reviewed: 2026-09-24
 
-Eine organisatorische Rolle ist eine globale Sicherheitsobergrenze, aber kein
-Agentenkatalog und keine Modelloberfläche. Ein Agent darf nur Zielagenten
-kennen und anfordern, für die ihm seine eigene, bereits geprüfte Definition
-zur Laufzeit eine konkrete Delegationscapability ausstellt.
+## Purpose
 
-Dieser Vertrag verhindert zwei unterschiedliche Fehlerklassen:
+An organizational role is a global security ceiling, but neither an agent
+catalog nor a model-facing surface. An agent may only know and request target
+agents for which its own, already-verified definition issues a concrete
+delegation capability at runtime.
 
-1. Ein Modell kann eine vorhandene, aber für seine Position nicht bestimmte
-   Rolle erraten oder aus einer Fehlermeldung ableiten.
-2. Eine pauschale Berechtigung `ChildOrchestrator → ChildOrchestrator` wird
-   irrtümlich zu einer rekursiven, unbeschränkten Delegationsbefugnis.
+This contract prevents two distinct classes of error:
 
-## Begriffe
+1. A model could guess an existing role not meant for its position, or infer
+   one from an error message.
+2. A blanket `ChildOrchestrator → ChildOrchestrator` permission could become,
+   by accident, an unbounded recursive delegation authority.
 
-- **Organisationsrolle**: geschlossene Kategorie (`UserInterface`,
-  `RootOrchestrator`, `ChildOrchestrator`, `Worker`, `UiaWorker` — Addendum J,
-  `AgentSteward` — Addendum K). Die Rollenmatrix ist nur eine notwendige obere
-  Grenze.
-- **Agentendefinition**: versionierte, vertrauenswürdig eingebettete
-  Spezialisierung mit Rolle, Tool-Fläche, Budget und Spawn-Vertrag.
-- **Delegationscapability**: konkrete, von einem Parent übertragene Befugnis,
-  genau eine Zieldefinition innerhalb engerer Grenzen zu starten.
-- **Child-Lease**: die nach erfolgreicher Admission erzeugte Laufzeitressource
-  eines Kindes. Ein Lease entsteht nie direkt aus Modell-JSON.
+## Terms
 
-## Sichtbarkeit
+- **Organizational role**: a closed category (`UserInterface`,
+  `RootOrchestrator`, `ChildOrchestrator`, `Worker`, `UiaWorker`,
+  `AgentSteward`). The role matrix is only a necessary upper bound.
+- **Agent definition**: a versioned, trustedly-embedded specialization with
+  role, tool surface, budget, and spawn contract.
+- **Delegation capability**: a concrete authority, transferred from a parent,
+  to start exactly one target definition within tighter bounds.
+- **Child lease**: the runtime resource created after successful admission of
+  a child. A lease is never created directly from model JSON.
 
-Die sichtbare Delegationsmenge eines Agenten ist:
+## Visibility
+
+The visible delegation set of an agent is:
 
 ```text
 DefinitionDeclaredTargets
@@ -42,124 +43,118 @@ DefinitionDeclaredTargets
 ∩ ReadWriteScopeCeiling
 ```
 
-Nur diese geschnittene Menge wird als Tool-Parameter und als lokales
-Organisationswissen exponiert. Ist sie leer, gibt es keine Spawn-/Delegations-
-Oberfläche und keinen Agentenkatalog.
+Only this intersected set is exposed as a tool parameter and as local
+organizational knowledge. If it is empty, there is no spawn/delegation
+surface and no agent catalog.
 
-Die Schnittmenge ist monoton: Kein Kind darf über mehr Autorität, Kontext,
-Netz-, Dateisystem- oder Toolrechte, Budget oder Resttiefe als sein Parent
-verfügen.
+The intersection is monotone: no child may hold more authority, context, network
+or filesystem access, tool rights, budget, or remaining depth than its parent.
 
-## Rollenprojektionen
+## Role projections
 
-| Rolle | Darf über Delegation wissen |
+| Role | May know via delegation |
 | --- | --- |
-| UIA | Nur ausdrücklich ausgestellte Einstiegscapabilities, normalerweise `activate-root`. Keine Worker- oder Sub-Orchestrator-Namen. |
-| Root-Orchestrator | Seine eigenen, konkreten Worker- und Subtree-Capabilities sowie die Verantwortung für Ziel, Budget und Synthese. |
-| Sub-Orchestrator | Ausschließlich sein delegierter Teilbaum, lokale Worker und explizit weitergereichte Subtree-Capabilities. Keine Geschwister oder Root-exklusiven Ziele. |
-| Worker | Keine dauerhafte Delegation und kein Agentenkatalog. |
-| `uia-worker` (`UiaWorker`, Addendum J) | Eigene, vollständig abgekapselte Organisationsrolle; nur die UIA darf ihn spawnen, er selbst hat keine dauerhafte Delegation und keinen Agentenkatalog. |
-| `agent-steward` (`AgentSteward`, Addendum K) | Interner Agent, der das Wissen über Agentendefinitionen explizit besitzt und umsetzt; sowohl die UIA als auch der Root-Orchestrator dürfen ihn spawnen, er selbst hat keine dauerhafte Delegation und keinen Agentenkatalog. |
+| UIA | Only explicitly issued entry capabilities, normally `activate-root`. No worker or sub-orchestrator names. |
+| Root orchestrator | Its own concrete worker and subtree capabilities, plus responsibility for goal, budget, and synthesis. |
+| Sub-orchestrator | Only its delegated subtree, local workers, and explicitly passed-down subtree capabilities. No siblings or root-exclusive targets. |
+| Worker | No persistent delegation and no agent catalog. |
+| `uia-worker` (`UiaWorker`) | Its own, fully encapsulated organizational role; only the UIA may spawn it, and it has no persistent delegation or agent catalog of its own. |
+| `agent-steward` (`AgentSteward`) | An internal agent that explicitly owns and applies knowledge of agent definitions; both the UIA and the root orchestrator may spawn it, and it has no persistent delegation or agent catalog of its own. |
 
-## Rekursive Sub-Orchestrierung
+## Recursive sub-orchestration
 
-`ChildOrchestrator → ChildOrchestrator` in der Rollenmatrix bedeutet nicht,
-dass jeder Child-Orchestrator weitere Child-Orchestratoren starten kann. Eine
-solche Admission benötigt zusätzlich eine exakte Zieldefinition, die
+`ChildOrchestrator → ChildOrchestrator` in the role matrix does not mean every
+child orchestrator can start further child orchestrators. Such an admission
+additionally requires an exact target definition that
 
-1. in der Definition des Parents deklariert ist,
-2. vom Parent tatsächlich an diesen Lauf weitergereicht wurde und
-3. innerhalb aller verbleibenden Decken liegt.
+1. is declared in the parent's own definition,
+2. was actually passed down to this parent's run, and
+3. lies within every remaining ceiling.
 
-Die Runtime behandelt ein nicht vorhandenes Ziel als nicht sichtbar. Sie darf
-bei einer Ablehnung keine Namen, Rollen oder sonstigen Eigenschaften weiterer
-registrierter Agenten offenlegen.
+The runtime treats a nonexistent target as invisible. On rejection it must not
+disclose names, roles, or other properties of further registered agents.
 
-## UIA-Routing
+## UIA routing
 
-Die UIA ist ein lokaler, interaktiver Eintrittspunkt. Sie erstellt keinen
-Worker direkt. Delegierbare Arbeit wird als Arbeitsabsicht an eine sichtbare
-Root-Capability gegeben:
+The UIA is a local, interactive entry point. It never creates a worker
+directly. Delegable work is handed as a work intent to a visible root
+capability:
 
 ```text
-UIA → Root-Orchestrator → Worker oder begrenzter Sub-Orchestrator-Teilbaum
+UIA → root orchestrator → worker or bounded sub-orchestrator subtree
 ```
 
-Damit ist eine abgelehnte UIA→Worker-Admission kein normaler Laufzeitpfad,
-sondern ein nicht exponierbarer Zustand.
+A rejected UIA→worker admission is therefore not a normal runtime path, but a
+state that must never be exposed.
 
-## Migrationszustand
+## Migration state
 
-Die bestehende Rollenmatrix und die exakte
-`allowed_child_orchestrators`-Prüfung bleiben während der Migration als
-fail-closed Admission-Grenze bestehen. Folgeschritte ersetzen die freie
-rollenbasierte Modell-Eingabe durch capability-identifizierte Requests und
-projizieren die sichtbare Menge in Tool-Schemas und Kontextprogramme.
+The existing role matrix and the exact `allowed_child_orchestrators` check
+remain, as a fail-closed admission boundary, in place during migration.
+Follow-up work replaces free role-based model input with
+capability-identified requests and projects the visible set into tool schemas
+and context programs.
 
-## Root vs. Sub-Orchestrator: positionell, nicht kategorisch
+## Root vs. sub-orchestrator: positional, not categorical
 
-Projektsetzung (bindende Vorgabe des Projektinhabers, nicht Gegenstand
-dieser Analyse):
+Project stance (a binding decision by the project owner, not the subject of
+this analysis):
 
-> Ein Root-Orchestrator ist ein Orchestrator, der nur deshalb so heißt, weil
-> es unter ihm Sub-Orchestratoren gibt.
+> A root orchestrator is an orchestrator that is only called that because
+> there are sub-orchestrators below it.
 
-Die Unterscheidung `RootOrchestrator`/`ChildOrchestrator` ist damit
-**positionell** (Ort im Baum: besitzt der Agent selbst einen Orchestrator-
-Parent, oder ist er die Wurzel des aktuellen Auftrags), nicht **kategorisch**
-(keine grundverschiedene Rechteklasse mit Fähigkeiten, die der jeweils
-anderen Rolle grundsätzlich verwehrt sind).
+The `RootOrchestrator`/`ChildOrchestrator` distinction is therefore
+**positional** (place in the tree: does the agent itself have an orchestrator
+parent, or is it the root of the current assignment), not **categorical**
+(not a fundamentally different rights class with capabilities the other role
+is categorically denied).
 
-### Aktuelle Abweichungen von der Zielarchitektur
+### Current deviations from the target architecture
 
-Der heutige Code-Stand behandelt beide Rollen an drei Stellen als
-kategorisch verschieden. Das sind keine Fehler und keine Rechtfertigung der
-Trennung — nur der dokumentierte Ist-Zustand gegenüber der oben zitierten
-Zielsetzung:
+The current code treats the two roles as categorically distinct in three
+places. These are not bugs and not a justification for the distinction — only
+the documented current state against the target above:
 
-1. **Spawn-Matrix — `AgentSteward` nur von `RootOrchestrator`.**
-   `harw-agent-dsl/src/roles.rs`, Funktion `can_spawn` (ab Zeile 92): Zeile
-   106 gewährt `(RootOrchestrator, AgentSteward) => true`, der
-   `ChildOrchestrator`-Block (Zeilen 111–113) trägt jedoch keinen
-   `AgentSteward`-Arm und fällt auf `(ChildOrchestrator, _) => false`
-   zurück. Ein `ChildOrchestrator` kann `AgentSteward` also nicht spawnen,
-   selbst wenn er positionell als Root für seinen eigenen Teilbaum
-   fungiert.
-2. **Unterschiedliche Standard-Reasoning-Effort-Gewichte.**
-   `harw-core/src/child_controller.rs`, `struct RoleEffortWeights` (ab Zeile
-   848) mit `impl Default for RoleEffortWeights` (Zeilen 857–868):
-   `root_orchestrator: High`, `root_orchestrator_with_subs: Medium`,
-   `sub_orchestrator: Medium`. `RoleEffortWeights::for_child` (Zeilen
-   886–913) liest bei `ChildOrchestrator` immer `self.sub_orchestrator`
-   (fest `Medium`), während `RootOrchestrator` nur dann auf `Medium`
-   absinkt, wenn er selbst Sub-Orchestrator-Freigaben trägt
-   (`has_child_orchestrator_grants`). Ein `ChildOrchestrator` ohne eigene
-   Sub-Orchestrator-Freigaben bekommt damit dasselbe Gewicht wie ein
-   `RootOrchestrator` MIT solchen Freigaben — nicht dasselbe wie ein
-   `RootOrchestrator` ohne sie.
-3. **`ChildOrchestrator` hat keine eingebaute Instanz.** Unter
-   `harw-registry-defaults/agents/` trägt aktuell kein Agent
-   `role = "child-orchestrator"` als tatsächliche Rollenzuweisung. Der
-   String taucht nur in zwei Begründungskommentaren auf —
-   `harw-registry-defaults/agents/families/security/security.toml:236` und
-   `harw-registry-defaults/agents/organization/default.toml:109` — beide
-   erklären ausdrücklich, warum die dort beschriebene Leader-Rolle
-   (`analyst` bzw. `context-steward`) stattdessen `role = "worker"` trägt
-   und nicht `role = "child-orchestrator"`. Die Rolle existiert damit nur im
-   Typsystem (`AgentRoleId::ChildOrchestrator`) und in der Spawn-Matrix,
-   nicht in einer gelebten Konfiguration.
+1. **Spawn matrix — `AgentSteward` only from `RootOrchestrator`.**
+   `harw-agent-dsl/src/roles.rs`, function `can_spawn`: the
+   `(RootOrchestrator, AgentSteward) => true` arm has no matching
+   `ChildOrchestrator` arm, so `(ChildOrchestrator, AgentSteward)` falls
+   through to `(ChildOrchestrator, _) => false`. A `ChildOrchestrator` cannot
+   spawn `AgentSteward`, even when it positionally acts as the root of its
+   own subtree.
+2. **Different default reasoning-effort weights.**
+   `harw-core/src/child_controller.rs`, `struct RoleEffortWeights` with
+   `impl Default for RoleEffortWeights`: `root_orchestrator: High`,
+   `root_orchestrator_with_subs: Medium`, `sub_orchestrator: Medium`.
+   `RoleEffortWeights::for_child` always reads `self.sub_orchestrator` (fixed
+   `Medium`) for `ChildOrchestrator`, while `RootOrchestrator` only drops to
+   `Medium` when it itself carries sub-orchestrator grants
+   (`has_child_orchestrator_grants`). A `ChildOrchestrator` with no
+   sub-orchestrator grants of its own therefore gets the same weight as a
+   `RootOrchestrator` WITH such grants — not the same as a `RootOrchestrator`
+   without them.
+3. **`ChildOrchestrator` has no built-in instance.** Under
+   `harw-registry-defaults/agents/`, no agent currently carries
+   `role = "child-orchestrator"` as an actual role assignment. The string
+   only appears in two justification comments —
+   `harw-registry-defaults/agents/families/security/security.toml` and
+   `harw-registry-defaults/agents/organization/default.toml` — both
+   explaining why the leader role described there (`analyst` and
+   `context-steward` respectively) carries `role = "worker"` instead of
+   `role = "child-orchestrator"`. The role therefore exists only in the type
+   system (`AgentRoleId::ChildOrchestrator`) and in the spawn matrix, not in
+   any configuration actually in use.
 
-### Kein Umbau in dieser Welle
+### No rework in this pass
 
-Eine Zusammenführung zu einer einzigen Orchestrator-Rolle mit
-Positionsmerkmal (statt zwei getrennten `AgentRoleId`-Varianten) ist ein
-**separates, noch nicht begonnenes Umbau-Vorhaben**. Es berührt die
-Spawn-Matrix (`can_spawn`) und ihre Tests in `harw-agent-dsl/src/roles.rs`
-direkt sowie `RoleEffortWeights` in `harw-core/src/child_controller.rs`.
+Merging the two into a single orchestrator role with a positional marker
+(instead of two separate `AgentRoleId` variants) is a **separate, not yet
+started** piece of rework. It touches the spawn matrix (`can_spawn`) and its
+tests in `harw-agent-dsl/src/roles.rs` directly, as well as
+`RoleEffortWeights` in `harw-core/src/child_controller.rs`.
 
-Dieses Vorhaben wird bewusst **nicht** parallel zum aktuell laufenden
-Spawn-Delegations-Fix umgesetzt: Liefen beide Änderungen gleichzeitig, wäre
-bei einem auftretenden Problem nicht mehr zuordenbar, ob die Ursache im
-Delegations-Fix oder im Rollen-Umbau liegt. Die Vereinheitlichung folgt als
-eigener, isoliert testbarer Schritt, sobald der Spawn-Delegations-Fix
-abgeschlossen und verifiziert ist.
+This unification is deliberately **not** done alongside the current
+spawn-delegation fix: running both changes at once would make it impossible
+to tell, if a problem surfaced, whether the cause was the delegation fix or
+the role rework. The unification follows as its own, separately testable
+step once the spawn-delegation fix is complete and verified.

@@ -12,7 +12,7 @@
 //!   verschmilzt die Ergebnisse über [`harw_lens_rank::rrf_fuse`].
 //! - [`federated_pack`]: füllt aus dem verschmolzenen Ergebnis ein einziges
 //!   Budget über [`harw_lens_rank::pack`] -- derselbe Vertrag, den
-//!   `harw-core::Assembly::budget` (Montage) laut `docs/aw-contract-master.md`
+//!   `harw-core::Assembly::budget` (Montage) laut `docs/design/build-history.md`
 //!   ebenfalls einlösen soll (siehe [`federated_pack`]s
 //!   Moduldokumentation für den dokumentierten Befund, dass das heute noch
 //!   nicht der Fall ist).

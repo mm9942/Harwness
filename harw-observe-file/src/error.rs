@@ -2,7 +2,7 @@
 //!
 //! # Verantwortungsbereich
 //! Trägt [`ObserveFileError`], den einen Fehlertyp dieser Crate (Vertrag
-//! §H.1, `docs/aw-contract-master.md`). Deckt Verzeichnis-/Dateizugriff
+//! §H.1, `docs/design/build-history.md`). Deckt Verzeichnis-/Dateizugriff
 //! beim Öffnen ([`FileSink::open`][crate::FileSink::open]) und beim
 //! Rotieren der aktiven Datei ab.
 //!

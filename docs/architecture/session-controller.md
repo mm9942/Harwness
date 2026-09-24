@@ -1,7 +1,8 @@
 # Architecture: TuiSessionController (Long-lived)
 
+> Status: implemented · Last reviewed: 2026-09-24
+
 Companion to `docs/architecture/operation-registry.md`.
-Describes the 0.2.0 session controller design.
 
 ---
 

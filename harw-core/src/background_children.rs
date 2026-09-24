@@ -341,6 +341,9 @@ pub struct BackgroundRun {
     pub progress: BackgroundProgress,
     /// Kurzfassung des Ergebnisses (nur nach dem Ende).
     pub summary: Option<String>,
+    /// Provider und Modell des Kindes als `<provider>/<modell>` (bei der
+    /// Abkopplung aus dem Admission-Record, [`BackgroundChildren::set_model_route`]).
+    pub model_route: Option<String>,
 }
 
 impl BackgroundRun {
@@ -374,6 +377,8 @@ pub struct BackgroundNotice {
     pub text: String,
     /// Laufzeit.
     pub elapsed: Duration,
+    /// Provider und Modell des Kindes (`<provider>/<modell>`), falls bekannt.
+    pub model_route: Option<String>,
 }
 
 #[derive(Debug, Default)]
@@ -460,10 +465,22 @@ impl BackgroundChildren {
                     status: BackgroundStatus::Running,
                     progress: BackgroundProgress::default(),
                     summary: None,
+                    model_route: None,
                 },
             );
             true
         })
+    }
+
+    /// Hält Provider und Modell eines eingetragenen Laufs fest (Anzeige
+    /// `<provider>/<modell>` in `/agent bg`, `agent.status` und der
+    /// Abschlussmeldung).
+    pub fn set_model_route(&self, child: &SessionId, route: Option<String>) {
+        self.with_state(|state| {
+            if let Some(run) = state.runs.get_mut(child.as_str()) {
+                run.model_route = route;
+            }
+        });
     }
 
     /// `true`, solange `child` als laufender Hintergrund-Lauf eingetragen ist
@@ -505,6 +522,7 @@ impl BackgroundChildren {
                 status,
                 text,
                 elapsed,
+                model_route: run.model_route.clone(),
             };
             state.notices.push_back(notice.clone());
             // Nur die jüngsten abgeschlossenen Läufe bleiben zur Anzeige.
@@ -720,6 +738,9 @@ impl ManagedAgentSpawner {
                 message: format!("child {child} already runs in the background"),
             });
         }
+        // Anzeige `<provider>/<modell>`: das Modell, das das Kind bei der
+        // Admission bekommen hat.
+        self.background.set_model_route(child, record.model_route());
         // Runde 5, Teil O: eigener Token — ein Abbruch des startenden
         // UIA-Turns reißt das Hintergrund-Kind nicht mehr mit.
         let own_token = self.detach_cancel_token(child);
@@ -1090,6 +1111,29 @@ mod tests {
             registry
                 .run_for(&SessionId::new(), child.as_str())
                 .is_none()
+        );
+    }
+
+    /// Anzeige `<provider>/<modell>`: die bei der Abkopplung festgehaltene
+    /// Route erscheint im Lauf und in der Abschlussmeldung.
+    #[test]
+    fn model_route_reaches_run_and_notice() {
+        let registry = BackgroundChildren::default();
+        let parent = SessionId::new();
+        let child = SessionId::new();
+        assert!(registry.register(&child, &parent, "root-orchestrator", None));
+        registry.set_model_route(&child, Some("openai/gpt-5".to_owned()));
+        assert_eq!(
+            registry
+                .run_for(&parent, child.as_str())
+                .and_then(|run| run.model_route)
+                .as_deref(),
+            Some("openai/gpt-5")
+        );
+        let notice = registry.finish(&child, BackgroundStatus::Failed, "x".to_owned());
+        assert_eq!(
+            notice.and_then(|notice| notice.model_route).as_deref(),
+            Some("openai/gpt-5")
         );
     }
 

@@ -1,6 +1,6 @@
 //! Die Sammelstelle: hält Sensoren, ruft `poll`, führt ihren
 //! Gesundheitszustand und puffert, was sie liefern (Knoten AW2-18,
-//! Vertrag `docs/aw-contract-master.md`).
+//! Vertrag `docs/design/build-history.md`).
 //!
 //! # Die härteste Auflage: keine Parselogik
 //! **Diese Crate enthält keine einzige Zeile, die eine Quelle deutet.**

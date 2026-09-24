@@ -695,7 +695,7 @@ mod tests {
         let provider = provider_with_headers(&[
             ("authorization", "env:GATEWAY_BEARER"),
             ("x-api-key", "secrets:gateway/api-key"),
-            ("cf-aig-token", "file:/home/mia/.harw/secrets/cf.token"),
+            ("cf-aig-token", "file:/home/user/.harw/secrets/cf.token"),
             ("x-provider-marker", "plain-value"),
             ("keyboard", "not-a-credential"),
         ])?;

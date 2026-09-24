@@ -43,6 +43,10 @@ pub struct AgentOrchestrationEvent {
     /// `active_model` der Kind-Session); `None`, wenn unbekannt.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
+    /// Der vom Kind angesprochene Provider (Anzeige `<provider>/<modell>`);
+    /// `None`, wenn unbekannt.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider: Option<String>,
 }
 
 impl AgentOrchestrationEvent {

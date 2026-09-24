@@ -32,7 +32,7 @@ fn find_users(filter: &UserFilter) -> Vec<User> {
 }
 
 // impl AsRef<str> akzeptiert &str, String, Cow<str>, … ohne Konvertierung
-// (aus apps/sgh-flow/src/runtime.rs:508)
+// (aus apps/acme-app/src/runtime.rs:508)
 fn set_env_if_absent(key: &str, value: impl AsRef<str>) {
     if key.is_empty() || std::env::var_os(key).is_some() {
         return;

@@ -104,8 +104,7 @@ impl ToolsCommandOutcome {
 /// that borrow before calling this function with `&mut activation`.
 ///
 /// Dispatches a `/tools` command, never letting the session's activation
-/// exceed `ceiling` (Welle W2d-1/B, Befund `w4-tui-control.md` §5; Fix
-/// W2d-1/F-T, Befunde T2/T3/T7).
+/// exceed `ceiling`.
 ///
 /// Entfernt W2d-2/CE (E8): der frühere unbegrenzte `dispatch_tools_command`
 /// (ohne Deckenprüfung) hatte in `tools_command.rs` keine eigenen Tests und

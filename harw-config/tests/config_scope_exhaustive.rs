@@ -238,7 +238,7 @@ fn test_field_table_exhaustive_mcp_principal_toml() -> TestResult {
         id: "p1".to_owned(),
         credential_ref: SecretRef::from_str("env:P1_TOKEN")
             .map_err(ctx("env:P1_TOKEN secret ref"))?,
-        tenant: "mia".to_owned(),
+        tenant: "alice".to_owned(),
         workspace: "harwness".to_owned(),
         job_capabilities: vec![],
     };
@@ -297,13 +297,21 @@ fn test_field_table_exhaustive_onboarding_seen() {
 
 #[test]
 fn test_field_table_exhaustive_tools_section() {
-    // `ToolsSection` hat aktuell nur das eine Feld `plan` — keine eigene
-    // FIELD_TABLE-Zeile fuer den Container "tools.plan" selbst (nur fuer
-    // dessen Unterfelder, s. naechster Test). Die Destrukturierung sichert
+    // `ToolsSection` hat die Felder `plan` und `doc` — keine eigene
+    // FIELD_TABLE-Zeile fuer die Container selbst (nur fuer deren
+    // Unterfelder, s. die folgenden Tests). Die Destrukturierung sichert
     // dennoch zu, dass ein kuenftiges zweites `[tools.*]`-Geschwisterfeld
     // (z. B. `[tools.search]`) hier einen Compile-Fehler ausloest.
-    let ToolsSection { plan } = ToolsSection::default();
-    let _ = plan;
+    let ToolsSection { plan, doc } = ToolsSection::default();
+    let _ = (plan, doc);
+}
+
+// [tools.doc] (Abschnitt 1.8a, 1 Feld)
+#[test]
+fn test_field_table_exhaustive_doc_section() {
+    let harw_config::DocSection { remote_ocr } = harw_config::DocSection::default();
+    let _ = remote_ocr;
+    assert_path_in_field_table_exactly_once("tools.doc.remote_ocr");
 }
 
 #[test]

@@ -31,7 +31,7 @@ use serde::Serialize;
 ///
 /// # Errors
 /// Gibt `HandlerResult` mit Status 500 zurück, wenn die Serialisierung fehlschlägt.
-// apps/sgh-flow/src/api/admin_vector_store.rs:254
+// apps/acme-app/src/api/admin_vector_store.rs:254
 fn dto_response<T: Serialize>(status: StatusCode, value: &T) -> HandlerResult {
     match serde_json::to_value(value) {
         Ok(v) => json_response(status, &v),

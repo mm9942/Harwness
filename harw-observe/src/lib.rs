@@ -6,7 +6,7 @@
 //! [`NullCounterRegistry`] und [`ObserveError`]. Kennt kein Backend: jeder
 //! Sink lebt in einer eigenen Crate (siehe `harw-observe-file`, der erste
 //! echte Implementierer von [`TelemetrySink`]). Vertrag:
-//! `docs/aw-contract-master.md`, Abschnitt A.
+//! `docs/design/build-history.md`, Abschnitt A.
 //!
 //! # Exportierte Typen
 //! [`FieldName`], [`FieldValue`], [`MetricKind`], [`Unit`],

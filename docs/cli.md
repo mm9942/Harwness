@@ -1,51 +1,52 @@
-# Kommandozeile `harw`
+# `harw` command line
 
-Diese Seite beschreibt den Befehlsbaum des Programms `harw`, die globalen
-Flags und die Sitzungs-Flags, das Verhalten von `--json` sowie die Zuordnung
-der älteren Schreibweisen zu den neuen Befehlen. Die jeweils genaue Grammatik
-der installierten Fassung zeigt `harw --help` bzw. `harw <befehl> --help`.
+This page describes the command tree of the `harw` program, the global
+flags and session flags, the behavior of `--json`, the `harw kill` process
+killer, and the mapping from older spellings to the current commands. The
+exact grammar of your installed build is always available via `harw --help`
+and `harw <command> --help`.
 
-## Überblick
+## Overview
 
 ```text
-harw [PROMPT] [-r [SITZUNG]] [--all]            Chat starten (wie `harw chat`)
+harw [PROMPT] [-r [SESSION]] [--all]            Start chat (same as `harw chat`)
 
-Arbeiten
-  chat [PROMPT] [-r [SITZUNG]] [--all]          Interaktiver Chat
-  exec PROMPT…                                  Einmalige Anfrage ohne Oberfläche
+Working
+  chat [PROMPT] [-r [SESSION]] [--all]          Interactive chat
+  exec PROMPT…                                  One-shot request, no UI
   analyze [CRATE] [--workspace] [--order bottom-up|top-down]
-          [--dry-run] [--max-parallel N]        Workspace-Abhängigkeitsanalyse
-  session list [--all] | show ID | resume ID    Gespeicherte Sitzungen
+          [--dry-run] [--max-parallel N]        Workspace dependency analysis
+  session list [--all] | show ID | resume ID    Saved sessions
 
-Konfiguration
-  config                                        Interaktives Menü (Alias: settings)
-  config get KEY | set KEY [WERT]               Einzelnen Schlüssel lesen/setzen
-         [--global | --project]                 (set ohne WERT löscht den Schlüssel)
+Configuration
+  config                                        Interactive menu (alias: settings)
+  config get KEY | set KEY [VALUE]              Read/write a single key
+         [--global | --project]                 (set without VALUE deletes the key)
   config permissions get | set-mode ask|auto|full
-         | allow WERKZEUG [--pattern M] | deny WERKZEUG [--pattern M]
+         | allow TOOL [--pattern M] | deny TOOL [--pattern M]
          | unallow INDEX | undeny INDEX
   config provider … | config model default ID
-  provider list | add NAME --api DIALEKT --base-url URL [--auth REF] [--models A,B]
+  provider list | add NAME --api DIALECT --base-url URL [--auth REF] [--models A,B]
                   [--auth-header bearer|x-api-key|api-key|none] [--no-auth]
                   [--allow-insecure-lan]
            | remove NAME | enable NAME | disable NAME
            | scan [NAME] [--free-only] [--prune]
-  model                                         Modelle auflisten (Alias: models)
-  model list | scan [NAME] [--free-only] [--prune] | add [PROVIDER/MODELL]
-        | remove PROVIDER/MODELL | default ID | internal … | catalog [--refresh]
+  model                                         List models (alias: models)
+  model list | scan [NAME] [--free-only] [--prune] | add [PROVIDER/MODEL]
+        | remove PROVIDER/MODEL | default ID | internal … | catalog [--refresh]
   auth login | token | import | status | prune [PROVIDER]
   project trust | untrust | status [DIR]
 
-Agenten und Wissen
+Agents and knowledge
   agent uia-new | skills [ARGS…] | plugins [ARGS…]
   knowledge index [build [--source docs|knowledge] [--force] | status]
             | memory [ARGS…] | proposals [ARGS…]
   jobs list [FILTER] | show ID | approve ID [--note TEXT]
        | deny ID [--reason TEXT] | cancel ID | retry ID
 
-Dienste
+Services
   gateway [install|start|stop|restart|enable|disable|status]
-  serve [--config-dir DIR] | web [--socket PFAD]
+  serve [--config-dir DIR] | web [--socket PATH]
   service install | status | uninstall
   mcp setup [SERVER] | check [SERVER]
   channel connect telegram [--pair CODE]
@@ -60,134 +61,184 @@ System
   kill [ARGS…]
 ```
 
-`agent skills`, `agent plugins`, `knowledge memory` und `knowledge proposals`
-reichen alle folgenden Argumente unverändert weiter, auch solche mit
-führendem Bindestrich. Sie entsprechen den Chat-Befehlen `/skills`,
-`/plugins`, `/memory` und `/context-proposal`.
+`agent skills`, `agent plugins`, `knowledge memory` and `knowledge proposals`
+forward all following arguments unchanged, including ones with a leading
+hyphen. They correspond to the chat commands `/skills`, `/plugins`,
+`/memory` and `/context-proposal`.
 
-## Anbieter (`harw provider`)
+## Provider (`harw provider`)
 
-`harw provider add NAME --api DIALEKT --base-url URL` legt
-`providers/NAME.toml` im aktiven Profil an oder überschreibt eine vorhandene
-Datei. Seit Runde 7 gelten diese Optionen:
+`harw provider add NAME --api DIALECT --base-url URL` creates
+`providers/NAME.toml` in the active profile, or overwrites an existing one.
+The following options apply:
 
-- `--auth REF` nennt eine Secret-Referenz (`env:VAR`, `secrets:NAME`, …).
-  Ein Klartext-Schlüssel wird abgelehnt.
-- `--auth-header bearer|x-api-key|api-key|none` wählt den Transport des
-  Schlüssels. Ohne Angabe gilt die Vorgabe des Dialekts (`bearer`).
-- `--no-auth` bedeutet: kein Schlüssel und kein Auth-Header, etwa für einen
-  lokalen vLLM- oder LM-Studio-Server. Die Option schließt `--auth` und
-  `--auth-header` aus.
-- `--allow-insecure-lan` erlaubt `http` zu einer privaten LAN-IP
-  (`10/8`, `172.16/12`, `192.168/16`). Sonst ist `http` nur für Loopback
-  zulässig.
+- `--auth REF` names a secret reference (`env:VAR`, `secrets:NAME`, …). A
+  plaintext key is rejected.
+- `--auth-header bearer|x-api-key|api-key|none` selects how the key is
+  transported. Without it, the dialect's default applies (`bearer`).
+- `--no-auth` means: no key and no auth header, e.g. for a local vLLM or
+  LM Studio server. This option excludes `--auth` and `--auth-header`.
+- `--allow-insecure-lan` allows `http` to a private LAN IP (`10/8`,
+  `172.16/12`, `192.168/16`). Otherwise `http` is only allowed for loopback.
 
-Zeigt die Basis-URL auf die eigene Maschine (oder mit
-`--allow-insecure-lan` ins LAN), schreibt `add` ohne `--auth` automatisch
-`auth_header = "none"` und `max_concurrency = 1`.
+If the base URL points at the local machine (or into the LAN with
+`--allow-insecure-lan`), `add` without `--auth` automatically writes
+`auth_header = "none"` and `max_concurrency = 1`.
 
-`harw provider scan [NAME]` fragt `/models` ab und schreibt je Modell
-`models/<id>.toml`. Das Kontextfenster (`context_window`) kommt aus
-`context_length`, aus vLLMs `max_model_len` oder, bei lokalen Providern,
-zusätzlich aus LM Studios `GET /api/v0/models`. Meldet der Server
-`supported_parameters` ohne `"tools"`, setzt der Scan
-`[capabilities] tool_calling = false`. Ein vorhandenes `context_window` bleibt
-erhalten, wenn der Server keines meldet.
+`harw provider scan [NAME]` queries `/models` and writes one
+`models/<id>.toml` per model. The context window (`context_window`) comes
+from `context_length`, from vLLM's `max_model_len`, or, for local providers,
+additionally from LM Studio's `GET /api/v0/models`. If the server reports
+`supported_parameters` without `"tools"`, the scan sets
+`[capabilities] tool_calling = false`. An existing `context_window` is kept
+if the server does not report one.
 
-Neue Felder in `providers/<name>.toml`, jeweils optional:
-`request_timeout_secs`, `stream_idle_timeout_secs`, `retry_timeouts`,
-`max_tokens_field` (`"max_tokens"`, `"max_completion_tokens"` oder `"both"`),
-`send_reasoning_effort`, `strict_tools`, `parallel_tool_calls` und
-`allow_insecure_lan`. Lokale Provider haben eigene Vorgaben. Die Übersicht und
-die Startbefehle für vLLM und LM Studio stehen in
+Optional fields in `providers/<name>.toml`: `request_timeout_secs`,
+`stream_idle_timeout_secs`, `retry_timeouts`, `max_tokens_field`
+(`"max_tokens"`, `"max_completion_tokens"` or `"both"`),
+`send_reasoning_effort`, `strict_tools`, `parallel_tool_calls` and
+`allow_insecure_lan`. Local providers have their own defaults. The overview
+and the startup commands for vLLM and LM Studio are in
 [setup/local-models.md](setup/local-models.md).
 
-## Globale Flags
+## Global flags
 
-Globale Flags dürfen vor oder hinter jedem Befehl stehen und wirken bei allen
-Befehlen.
+Global flags may appear before or after any command and apply to every
+command.
 
-| Flag | Wirkung |
+| Flag | Effect |
 | --- | --- |
-| `--home DIR` | Verwendet `DIR` statt `HARW_HOME` bzw. `~/.harw` als Harwness-Verzeichnis. |
-| `--profile NAME` | Verwendet das Profil `NAME` statt des aktiven Profils (hat Vorrang vor `HARW_PROFILE`). |
-| `-C DIR`, `--cwd DIR` | Arbeitet so, als wäre `harw` in `DIR` gestartet worden (Projekt-Erkennung, Sitzungsliste, Aufträge). |
-| `--log LEVEL` | Protokoll-Filter, z. B. `info` (Vorgabe), `debug` oder `harw_core=debug,info`. |
-| `--log-sensitive` | Protokolliert auch Prompts, Werkzeugargumente und Antworten. Nur zur Fehlersuche. |
-| `-v`, `--verbose` | Zeigt jeden Werkzeugaufruf mit allen Argumenten statt einer kurzen Vorschau. |
-| `--json` | Gibt das Ergebnis als JSON aus (siehe unten). |
+| `--home DIR` | Uses `DIR` instead of `HARW_HOME` or `~/.harw` as the Harwness directory. |
+| `--profile NAME` | Uses profile `NAME` instead of the active profile (takes precedence over `HARW_PROFILE`). |
+| `-C DIR`, `--cwd DIR` | Behaves as if `harw` had been started in `DIR` (project detection, session list, jobs). |
+| `--log LEVEL` | Log filter, e.g. `info` (default), `debug`, or `harw_core=debug,info`. |
+| `--log-sensitive` | Also logs prompts, tool arguments and responses. Debugging only. |
+| `-v`, `--verbose` | Shows every tool call with all arguments instead of a short preview. |
+| `--json` | Prints the result as JSON (see below). |
 
-## Sitzungs-Flags
+## Session flags
 
-Sitzungs-Flags werden wie globale Flags an beliebiger Stelle angenommen,
-wirken aber nur bei `chat` (einschließlich `harw` ohne Befehl), `exec` und
-`analyze`. Bei jedem anderen Befehl bricht `harw` mit einer Fehlermeldung ab,
-die auf `chat`, `exec` und `analyze` verweist, statt das Flag still zu
-ignorieren.
+Session flags are accepted anywhere, like global flags, but only take
+effect for `chat` (including `harw` with no command), `exec` and `analyze`.
+On every other command `harw` aborts with an error message pointing at
+`chat`, `exec` and `analyze`, rather than silently ignoring the flag.
 
-| Flag | Wirkung |
+| Flag | Effect |
 | --- | --- |
-| `--mode MODUS` | Startet im angegebenen Interaktionsmodus (`chat`, `plan`, `explore`, `work`, `shell`). |
-| `--approval ask\|auto\|full` | Freigabemodus nur für diese Sitzung: `ask` fragt bei jedem Werkzeugaufruf, `auto` lässt unkritische Aufrufe durch, prüft die übrigen mit Vorfilter und Klassifizierer und fragt im Zweifel, `full` fragt nie. Überschreibt den konfigurierten Standard. |
-| `--model ID` | Verwendet für diese Sitzung das Modell `ID` statt des Standardmodells. |
-| `--goal TEXT` | Setzt beim Start ein Ziel, auf das die Sitzung hinarbeitet. |
-| `--agent NAME` | Startet die Sitzung mit der Agentendefinition `NAME` als Wurzel (eingebaute Rolle wie `root-orchestrator` oder eine eigene Definition) statt der konfigurierten `active_agent_definition`. Nur für diese Sitzung; dauerhaft setzt man sie mit `/agent use NAME` (Entfernen: `/agent use --clear`), wirksam ab der nächsten Sitzung. |
-| `--add-dir PFAD` | Erlaubt Dateizugriffe ohne Rückfrage zusätzlich unter `PFAD` (mehrfach angebbar). |
+| `--mode MODE` | Starts in the given interaction mode (`chat`, `plan`, `explore`, `work`, `shell`). |
+| `--approval ask\|auto\|full` | Approval mode for this session only: `ask` prompts on every tool call, `auto` lets uncritical calls through and checks the rest with a pre-filter and classifier, asking when in doubt, `full` never asks (not even for `process.kill`, `host.sudo_exec` or remote OCR uploads; only an explicit deny rule refuses a call). Overrides the configured default. |
+| `--model ID` | Uses model `ID` for this session instead of the default model. |
+| `--goal TEXT` | Sets a goal for the session to work towards at startup. |
+| `--agent NAME` | Starts the session with agent definition `NAME` as its root (a built-in role such as `root-orchestrator`, or a custom definition) instead of the configured `active_agent_definition`. Applies to this session only; to make it permanent use `/agent use NAME` (remove with `/agent use --clear`), effective from the next session. |
+| `--add-dir PATH` | Allows file access without confirmation under `PATH` as well (repeatable). |
 
-Nicht global sind die Chat-Flags `-r/--resume` und `--all`: sie gelten nur für
-`harw` ohne Befehl und für `harw chat`. `--all` gibt es zusätzlich bei
+The chat flags `-r/--resume` and `--all` are not global: they only apply to
+`harw` with no command and to `harw chat`. `--all` also exists for
 `harw session list`.
 
-Sitzungen ohne einen einzigen Nutzer-Turn werden seit Runde 5 nicht mehr
-gespeichert. Ältere leere Sitzungen blendet die Auswahl von `harw -r` aus;
-über `--all` oder eine ausdrückliche ID bleiben sie erreichbar. Eine
-fortgesetzte Sitzung zeigt einen Resume-Hinweis statt einer neuen Begrüßung.
+Sessions with no user turn at all are no longer saved. Older empty sessions
+are hidden from the `harw -r` picker; they remain reachable via `--all` or
+an explicit ID. A resumed session shows a resume notice instead of a new
+greeting.
 
-## Anmeldedaten prüfen (`harw auth`)
+## Checking credentials (`harw auth`)
 
-- Anmeldedaten werden beim Lesen normalisiert: aller ASCII-Leerraum
-  (Zeilenumbrüche, CRLF aus `.env`, umbrochene Pastes) wird entfernt. Das gilt
-  auch für `CLAUDE_CODE_OAUTH_TOKEN` und `ANTHROPIC_API_KEY`.
-- `harw auth token` prüft das Format eines Anthropic-Tokens, bevor er
-  gespeichert wird: Setup-/OAuth-Tokens beginnen mit `sk-ant-oat`, API-Keys
-  mit `sk-ant-api`, erlaubt ist nur sichtbares ASCII. Die Fehlermeldung nennt
-  die Ursache, nie den Token-Wert.
-- `harw auth status` hängt an jede Anthropic-Token-Datei einen kurzen
-  Formatbefund an, ebenfalls ohne den Wert auszugeben.
+- Credentials are normalized on read: all ASCII whitespace (newlines, CRLF
+  from `.env`, wrapped pastes) is stripped. This also applies to
+  `CLAUDE_CODE_OAUTH_TOKEN` and `ANTHROPIC_API_KEY`.
+- `harw auth token` validates the format of an Anthropic token before
+  storing it: setup/OAuth tokens start with `sk-ant-oat`, API keys with
+  `sk-ant-api`, and only printable ASCII is allowed. The error message
+  names the cause, never the token value.
+- `harw auth status` appends a short format check to each Anthropic token
+  file, likewise without printing the value.
 
-## Ausgabe mit `--json`
+## Output with `--json`
 
-Befehle mit JSON-Form schreiben mit `--json` genau ein formatiertes
-JSON-Dokument auf die Standardausgabe; Hinweise und Fehler gehen weiterhin auf
-die Standardfehlerausgabe.
+Commands with a JSON form write exactly one formatted JSON document to
+standard output with `--json`; notices and errors still go to standard
+error.
 
-- **Tabellen** (z. B. `harw session list`) werden zu einem Array von Objekten,
-  deren Schlüssel die Spaltenüberschriften sind.
-- **Einzelwerte** (z. B. `harw session show ID`) werden zu einem Objekt.
-- **Operationen** (`harw jobs …`, `harw agent skills|plugins`,
-  `harw knowledge memory|proposals`) liefern ihre strukturierten Daten, sofern
-  vorhanden, sonst `{"text": "…"}` mit der Textausgabe.
+- **Tables** (e.g. `harw session list`) become an array of objects whose
+  keys are the column headers.
+- **Single values** (e.g. `harw session show ID`) become an object.
+- **Operations** (`harw jobs …`, `harw agent skills|plugins`,
+  `harw knowledge memory|proposals`) return their structured data where
+  available, otherwise `{"text": "…"}` with the text output.
 
-Befehle ohne JSON-Form – etwa interaktive Dialoge wie `harw agent uia-new`,
-`harw knowledge index` oder `harw provider …` – brechen mit `--json` mit der
-Meldung `` `<befehl>` unterstützt --json nicht `` ab, statt das Flag zu
-ignorieren. Der Exit-Status ist dann ungleich null.
+Commands without a JSON form — such as interactive dialogs like
+`harw agent uia-new`, `harw knowledge index` or `harw provider …` — abort
+with `--json` with the message `` `<command>` does not support --json ``
+instead of ignoring the flag. The exit status is then non-zero.
 
-## Ältere Schreibweisen
+## `harw kill`
 
-Die folgenden Schreibweisen funktionieren weiterhin, erscheinen aber nicht
-mehr in der Hilfe. Beim Aufruf weist `harw` auf der Standardfehlerausgabe auf
-den neuen Namen hin, z. B. ``Hinweis: `harw lens` heißt jetzt `harw knowledge index`.``
-`settings` und `models` sind Aliase von `config` bzw. `model` und bleiben
-dauerhaft gültig.
+`harw kill` selects processes precisely and terminates them reliably. It is
+a thin wrapper: every argument after `kill` is forwarded unchanged to the
+bundled `killer` binary (crate `harw-killer`; see `harw-killer/README.md`
+and `harw-killer/src/cli.rs` for the full flag reference), so
+`harw kill --help` shows `killer`'s own help. Linux only.
 
-| alt | neu |
+The engine uses **pidfd**-based process selection: it matches processes by
+exact executable basename and/or PID, sends **SIGKILL immediately**
+(no SIGTERM phase), waits, and sends a **second SIGKILL** to survivors.
+Both signal attempts use the same pidfd handle, so a killed PID cannot be
+reused by an unrelated process in between. PID 1, `killer` itself and its
+own ancestors (such as the calling shell) are always protected.
+
+Common flags (see `harw-killer/src/cli.rs` for the authoritative list):
+
+| Flag | Effect |
+| --- | --- |
+| `-p`, `--process NAME…` | One or more exact executable basenames to match (repeatable). |
+| `--pid PID…` | One or more explicit PIDs to match (repeatable). |
+| `--uid UID` | Restricts the selection to this effective UID. |
+| `-n`, `--dry-run` | Preview the selection only; no signal, no confirmation, no sudo. |
+| `-y`, `--yes` | Skip the interactive confirmation. |
+| `-t`, `--timeout SECONDS` | Seconds to wait before the second SIGKILL (default 5). |
+| `--kill-wait SECONDS` | Seconds to wait after the second SIGKILL before reporting a survivor (default 2). |
+| `--json` | Machine-readable report on stdout; diagnostics on stderr. |
+| `--no-sudo` | Never invoke `sudo` for processes owned by another user. |
+
+At least one selector (`--process` or `--pid`) is required; `harw kill`
+never selects "all processes". Processes owned by another user are handled
+as a separate group via `sudo` unless `--no-sudo` is given.
+
+```bash
+# Preview which rustc/cargo processes would be selected
+harw kill -p rustc cargo -n
+
+# Kill all `node` processes owned by the current user, no confirmation
+harw kill --process node -y
+
+# Kill an explicit PID
+harw kill --pid 12345 -y
+
+# Wait 3 seconds before the second SIGKILL instead of the default 5
+harw kill -p cargo -y -t 3
+```
+
+The agent tool `process.kill` uses the same underlying engine
+(`harw_killer::api`) but is more restricted: it only ever terminates
+processes owned by the current user (processes of other users are reported
+as errors, never killed — no `sudo`), it always requires user approval
+before running, and it is never invoked via `sudo`.
+
+## Older spellings
+
+The following spellings still work but no longer appear in `--help`. On
+use, `harw` prints a note on standard error pointing at the new name, e.g.
+``Note: `harw lens` is now `harw knowledge index`.`` `settings` and `models`
+are aliases of `config` and `model` respectively, and remain valid
+permanently.
+
+| old | new |
 | --- | --- |
 | `harw settings …` | `harw config …` |
-| `harw settings provider …` | `harw provider …` (oder `harw config provider …`) |
+| `harw settings provider …` | `harw provider …` (or `harw config provider …`) |
 | `harw models …` | `harw model …` |
-| `harw models delete ZIEL` | `harw model remove ZIEL` |
-| `harw models scan …` | `harw provider scan …` (oder `harw model scan …`) |
+| `harw models delete TARGET` | `harw model remove TARGET` |
+| `harw models scan …` | `harw provider scan …` (or `harw model scan …`) |
 | `harw catalog [--refresh]` | `harw model catalog [--refresh]` |
 | `harw connect --channel telegram [--pair CODE]` | `harw channel connect telegram [--pair CODE]` |
 | `harw lens [build\|status]` | `harw knowledge index [build\|status]` |
@@ -195,56 +246,60 @@ dauerhaft gültig.
 | `harw run TEXT…` | `harw debug echo TEXT…` |
 | `harw classify TEXT…` | `harw debug classify TEXT…` |
 | `harw analyze --bottom-up` / `--top-down` | `harw analyze --order bottom-up` / `--order top-down` |
-| `/skills`, `/plugins` (nur im Chat) | `harw agent skills …`, `harw agent plugins …` |
-| `/memory`, `/context-proposal` (nur im Chat) | `harw knowledge memory …`, `harw knowledge proposals …` |
-| Aufträge nur im Chat | `harw jobs list\|show\|approve\|deny\|cancel\|retry` |
-| `harw -r SITZUNG` | weiterhin gültig; zusätzlich `harw session resume SITZUNG` |
-| `HARW_PROFILE=NAME harw …` | weiterhin gültig; zusätzlich `harw --profile NAME …` |
+| `/skills`, `/plugins` (chat only) | `harw agent skills …`, `harw agent plugins …` |
+| `/memory`, `/context-proposal` (chat only) | `harw knowledge memory …`, `harw knowledge proposals …` |
+| Jobs, chat only | `harw jobs list\|show\|approve\|deny\|cancel\|retry` |
+| `harw -r SESSION` | still valid; also `harw session resume SESSION` |
+| `HARW_PROFILE=NAME harw …` | still valid; also `harw --profile NAME …` |
 
-`--bottom-up` und `--top-down` schließen sich gegenseitig und mit `--order`
-aus; eine Kombination ist ein Parse-Fehler.
+`--bottom-up` and `--top-down` are mutually exclusive with each other and
+with `--order`; combining them is a parse error.
 
-## Beispiele
+## Examples
 
 ```bash
-# Chat im Erkundungsmodus mit einem anderen Modell starten
-harw --mode explore --model openrouter/qwen/qwen3-coder "Wie ist das Projekt aufgebaut?"
+# Start chat in explore mode with a different model
+harw --mode explore --model openrouter/qwen/qwen3-coder "How is the project structured?"
 
-# Einmalige Anfrage in einem anderen Verzeichnis, ohne Rückfragen
-harw -C ~/src/projekt --approval full exec "Formatiere alle Rust-Dateien"
+# One-shot request in a different directory, without confirmation prompts
+harw -C ~/src/project --approval full exec "Format all Rust files"
 
-# Sitzungen aller Projekte als JSON auflisten und eine fortsetzen
+# List sessions across all projects as JSON and resume one
 harw session list --all --json
 harw session resume 3f2a
 
-# Anbieter anlegen, Modelle abfragen, Standardmodell setzen
-harw provider add lokal --api ollama --base-url http://localhost:11434
-harw provider scan lokal
-harw model default lokal/qwen3
+# Add a provider, query its models, set the default model
+harw provider add local --api ollama --base-url http://localhost:11434
+harw provider scan local
+harw model default local/qwen3
 
-# Lokalen vLLM-Server ohne Schlüssel anbinden und Kontextfenster einlesen
+# Attach a local vLLM server without a key and read its context window
 harw provider add vllm --api openai-chat --base-url http://localhost:8000/v1 --no-auth
 harw provider scan vllm
 
-# Anbieter-Katalog aus models.dev aktualisieren
+# Refresh the provider catalog from models.dev
 harw model catalog --refresh
 
-# Wartenden Auftrag freigeben bzw. ablehnen
+# Approve or deny a pending job
 harw jobs list
-harw jobs approve job-17 --note "Geprüft"
-harw jobs deny job-18 --reason "Zu weitreichend"
+harw jobs approve job-17 --note "Reviewed"
+harw jobs deny job-18 --reason "Too broad"
 
-# Gedächtnis durchsuchen, Skills verwalten
-harw knowledge memory search "Build-Fehler"
+# Search memory, manage skills
+harw knowledge memory search "build failure"
 harw agent skills list
 
-# Telegram anbinden und Kopplung abschließen
+# Connect Telegram and finish pairing
 harw channel connect telegram
 harw channel connect telegram --pair ABCD-EFGH
 
-# Mit einem anderen Profil prüfen
-harw --profile arbeit doctor
+# Check with a different profile
+harw --profile work doctor
 
-# Analyse von den Wurzeln abwärts, nur anzeigen
+# Analyze bottom-up from the roots, preview only
 harw analyze --order top-down --dry-run
+
+# Kill stray build processes
+harw kill -p rustc cargo -n
+harw kill -p rustc cargo -y
 ```

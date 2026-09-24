@@ -1,67 +1,66 @@
-# Lokale Modelle: vLLM, LM Studio und Ollama
+# Local models: vLLM, LM Studio and Ollama
 
-Status: Ist (ab Runde 7, Teil L)
+This page describes how `harw` works with a model server running locally
+(or on your own LAN). Any server with an OpenAI-compatible
+`chat/completions` interface is supported. vLLM, LM Studio and Ollama have
+been tested.
 
-Diese Seite beschreibt, wie `harw` mit einem lokal (oder im eigenen LAN)
-betriebenen Modell-Server arbeitet. Unterstützt wird jeder Server mit einer
-OpenAI-kompatiblen `chat/completions`-Schnittstelle. Erprobt sind vLLM,
-LM Studio und Ollama.
+## What `harw` does differently for local providers
 
-## Was `harw` bei lokalen Providern anders macht
+A provider counts as **local** if its base URL points at the local
+machine (`localhost`, `127.0.0.0/8`, `::1`), if it uses the `ollama`
+transport, or if it points at a private LAN IP with
+`allow_insecure_lan = true`. Local providers get different defaults. Each
+one can be overridden individually in `providers/<name>.toml`.
 
-Ein Provider gilt als **lokal**, wenn seine Basis-URL auf die eigene Maschine
-zeigt (`localhost`, `127.0.0.0/8`, `::1`), wenn er den Transport `ollama`
-nutzt oder wenn er mit `allow_insecure_lan = true` auf eine private LAN-IP
-zeigt. Für lokale Provider gelten andere Vorgaben. Jede davon lässt sich in
-`providers/<name>.toml` einzeln überschreiben.
-
-| Einstellung | Cloud-Vorgabe | Lokale Vorgabe | Bedeutung |
+| Setting | Cloud default | Local default | Meaning |
 |---|---|---|---|
-| `auth_header` | `bearer` | `none` (nur ohne `auth`) | kein Schlüssel, kein `Authorization`-Header |
-| `max_concurrency` | unbegrenzt | `1` (beim Anlegen und im Katalog) | ein Modell, eine GPU: Anfragen laufen nacheinander |
-| `request_timeout_secs` | 120 | 600 | Gesamtzeit ohne Streaming bzw. Wartezeit bis zu den Antwort-Headern |
-| `stream_idle_timeout_secs` | = Request-Zeitlimit | 120 | Abbruch erst, wenn so lange **kein Byte** kommt |
-| `retry_timeouts` | `true` | `false` | Zeitüberschreitungen werden lokal nicht wiederholt |
-| `max_tokens_field` | `max_completion_tokens` | `max_tokens` | Feldname der Ausgabegrenze (`both` sendet beide) |
-| `send_reasoning_effort` | `true` | `false` | `reasoning_effort` im Request |
-| `strict_tools` | `true` | `false` | `"strict"` und strikte Schemas je Werkzeug |
-| `parallel_tool_calls` | (weggelassen) | `false` | Wert von `parallel_tool_calls`, sobald Werkzeuge angeboten werden |
+| `auth_header` | `bearer` | `none` (only without `auth`) | no key, no `Authorization` header |
+| `max_concurrency` | unlimited | `1` (on creation and in the catalog) | one model, one GPU: requests run sequentially |
+| `request_timeout_secs` | 120 | 600 | total time without streaming, or wait time until response headers |
+| `stream_idle_timeout_secs` | = request timeout | 120 | abort only once **no byte** arrives for this long |
+| `retry_timeouts` | `true` | `false` | timeouts are not retried locally |
+| `max_tokens_field` | `max_completion_tokens` | `max_tokens` | field name for the output limit (`both` sends both) |
+| `send_reasoning_effort` | `true` | `false` | `reasoning_effort` in the request |
+| `strict_tools` | `true` | `false` | `"strict"` and strict schemas per tool |
+| `parallel_tool_calls` | (omitted) | `false` | value of `parallel_tool_calls` once tools are offered |
 
-Weitere Punkte:
+Further points:
 
-- **Streaming:** Beim Streaming gibt es kein Gesamt-Zeitlimit mehr. Eine lange,
-  aber stetig fließende Antwort wird also nicht abgeschnitten. Das gilt auch
-  für Cloud-Provider.
-- **Kontextfenster:** Lokale Modelle bekommen nie das Fenster des Herstellers
-  aus dem eingebauten Katalog. Ein lokal gestartetes `Qwen3-32B` hat das
-  Fenster, das der Server mit `--max-model-len` bzw. der Kontextlänge in
-  LM Studio bekommen hat. Maßgeblich ist `context_window` in
-  `models/<id>.toml`. `harw provider scan` trägt das Fenster ein, sobald der
-  Server es meldet. Fehlt es, gilt ein Rückfallfenster von 32k Token, und die
-  Sitzung warnt im Log.
-- **Proxy:** Für Loopback-Adressen verwendet `harw` nie einen Proxy aus
-  `HTTP(S)_PROXY`. Das wirkt wie ein automatisches `NO_PROXY` für `localhost`.
-- **Denktext und Werkzeug-Syntax:** `<think>…</think>` erscheint im Live-Stream
-  als Denktext, nicht als Antwort. Text ab `<tool_call>`, `[TOOL_CALLS]` oder
-  `<|python_tag|>` wird nicht live angezeigt. Am Ende der Antwort werden
-  solche Text-Aufrufe erkannt: Hermes/Qwen-`<tool_call>`, Mistral-
-  `[TOOL_CALLS]`, Llama-`<|python_tag|>` sowie eine Antwort, die nur aus einem
-  JSON-Aufruf eines angebotenen Werkzeugs besteht. Unbekannte Werkzeugnamen
-  oder kaputtes JSON werden nie ausgeführt. Der Text bleibt dann Text.
-- **Modelle ohne Werkzeuge:** Steht in `models/<id>.toml` unter
-  `[capabilities]` der Eintrag `tool_calling = false`, bietet `harw` dem Modell
-  keine Werkzeuge an. Stattdessen bekommt es einen kurzen Hinweis. `harw
-  provider scan` setzt den Wert, wenn der Server `supported_parameters` ohne
-  `"tools"` meldet.
+- **Streaming:** while streaming, there is no overall time limit. A long
+  but steadily flowing response is therefore not cut off. This also
+  applies to cloud providers.
+- **Context window:** local models never get the manufacturer's window
+  from the built-in catalog. A locally started `Qwen3-32B` has whatever
+  window the server was given via `--max-model-len` or the context length
+  in LM Studio. `context_window` in `models/<id>.toml` is authoritative.
+  `harw provider scan` fills in the window once the server reports it. If
+  it is missing, a fallback window of 32k tokens applies, and the session
+  logs a warning.
+- **Proxy:** for loopback addresses, `harw` never uses a proxy from
+  `HTTP(S)_PROXY`. This acts like an automatic `NO_PROXY` for `localhost`.
+- **Reasoning text and tool syntax:** `<think>…</think>` appears in the
+  live stream as reasoning text, not as the answer. Text starting with
+  `<tool_call>`, `[TOOL_CALLS]` or `<|python_tag|>` is not shown live. At
+  the end of the response, such text-encoded tool calls are recognized:
+  Hermes/Qwen `<tool_call>`, Mistral `[TOOL_CALLS]`, Llama
+  `<|python_tag|>`, and a response that consists solely of a JSON call to
+  an offered tool. Unknown tool names or malformed JSON are never
+  executed; the text is then left as plain text.
+- **Models without tools:** if `models/<id>.toml` has `tool_calling =
+  false` under `[capabilities]`, `harw` does not offer the model any
+  tools. It gets a short notice instead. `harw provider scan` sets this
+  value when the server reports `supported_parameters` without
+  `"tools"`.
 
 ## vLLM
 
-vLLM braucht für Werkzeugaufrufe zwei Startoptionen:
-`--enable-auto-tool-choice` und einen zum Modell passenden
-`--tool-call-parser`. Ohne sie antwortet das Modell nur mit Text.
+vLLM needs two startup options for tool calls: `--enable-auto-tool-choice`
+and a `--tool-call-parser` matching the model. Without them the model only
+responds with text.
 
 ```bash
-# Qwen3 (Hermes-Format für Werkzeuge), 32k Kontext, eine GPU
+# Qwen3 (Hermes format for tools), 32k context, one GPU
 vllm serve Qwen/Qwen3-32B \
   --port 8000 \
   --max-model-len 32768 \
@@ -75,75 +74,75 @@ vllm serve Qwen/Qwen3-Coder-30B-A3B-Instruct \
   --enable-auto-tool-choice --tool-call-parser qwen3_coder
 ```
 
-Übliche Parser: `hermes` (Qwen2.5/Qwen3, Hermes), `qwen3_coder`, `mistral`,
-`llama3_json` (Llama 3.x). Mit `--reasoning-parser` liefert vLLM den Denktext
-getrennt in `reasoning_content`. `harw` liest ihn, zeigt ihn aber nicht als
-Antwort an.
+Common parsers: `hermes` (Qwen2.5/Qwen3, Hermes), `qwen3_coder`,
+`mistral`, `llama3_json` (Llama 3.x). With `--reasoning-parser`, vLLM
+delivers reasoning text separately in `reasoning_content`. `harw` reads
+it but does not show it as the answer.
 
-`harw` einrichten:
+Setting up `harw`:
 
 ```bash
 harw provider add vllm --api openai-chat --base-url http://localhost:8000/v1 --no-auth
-harw provider scan vllm          # liest die Modelle und `max_model_len`
-harw config set default_provider vllm   # optional: vLLM als Standard
+harw provider scan vllm          # reads the models and `max_model_len`
+harw config set default_provider vllm   # optional: make vLLM the default
 harw model default Qwen/Qwen3-32B
 ```
 
-Läuft vLLM mit `--api-key`, statt `--no-auth` die Referenz angeben:
-`--auth env:VLLM_API_KEY`. Der Header ist dann `Authorization: Bearer …`.
-`--auth-header x-api-key` wählt einen anderen Transport.
+If vLLM runs with `--api-key`, pass a reference instead of `--no-auth`:
+`--auth env:VLLM_API_KEY`. The header is then `Authorization: Bearer …`.
+`--auth-header x-api-key` selects a different transport.
 
 ## LM Studio
 
-1. In LM Studio unter **Developer** den lokalen Server starten
-   (Standard-Port 1234).
-2. Ein Modell laden und dabei die **Context Length** bewusst setzen (z. B.
-   32768). Das ist das Fenster, mit dem `harw` rechnet.
-3. In `harw` einrichten:
+1. In LM Studio, start the local server under **Developer** (default
+   port 1234).
+2. Load a model and deliberately set the **Context Length** (e.g.
+   32768). This is the window `harw` uses.
+3. Set it up in `harw`:
 
 ```bash
 harw provider add lmstudio --api openai-chat --base-url http://localhost:1234/v1 --no-auth
 harw provider scan lmstudio
 ```
 
-LM Studio meldet das Kontextfenster nicht über `/v1/models`. `harw provider
-scan` fragt deshalb für lokale Provider zusätzlich `GET /api/v0/models` ab und
-übernimmt `loaded_context_length` bzw. `max_context_length`. Ein von Hand in
-`models/<id>.toml` eingetragenes `context_window` bleibt bei einem erneuten
-Scan erhalten, wenn der Server keines meldet.
+LM Studio does not report the context window via `/v1/models`. For local
+providers, `harw provider scan` therefore also queries
+`GET /api/v0/models` and takes `loaded_context_length` or
+`max_context_length` from there. A `context_window` entered by hand in
+`models/<id>.toml` is kept on a repeated scan if the server reports none.
 
-Der Katalog-Seed legt `providers/lmstudio.toml` und `providers/vllm.toml`
-bereits deaktiviert an, mit `auth_header = "none"` und
-`max_concurrency = 1`. `harw provider enable lmstudio` genügt dann.
+The catalog seed already creates `providers/lmstudio.toml` and
+`providers/vllm.toml` disabled, with `auth_header = "none"` and
+`max_concurrency = 1`. `harw provider enable lmstudio` is then enough.
 
 ## Ollama
 
 ```bash
-harw provider add lokal --api ollama --base-url http://localhost:11434 --no-auth
-harw provider scan lokal
+harw provider add local --api ollama --base-url http://localhost:11434 --no-auth
+harw provider scan local
 ```
 
-Ollama meldet das Kontextfenster nicht. Deshalb `context_window` in
-`models/<id>.toml` passend zu `num_ctx` setzen.
+Ollama does not report the context window. Set `context_window` in
+`models/<id>.toml` to match `num_ctx`.
 
-## Server im LAN
+## Servers on the LAN
 
-`http` zu einer privaten IP (`10.0.0.0/8`, `172.16.0.0/12`,
-`192.168.0.0/16`, IPv6-ULA) ist nur mit ausdrücklichem Opt-in erlaubt. Der
-Datenverkehr ist dann unverschlüsselt:
+`http` to a private IP (`10.0.0.0/8`, `172.16.0.0/12`, `192.168.0.0/16`,
+IPv6 ULA) is only allowed with an explicit opt-in. Traffic is then
+unencrypted:
 
 ```bash
 harw provider add gpu-box --api openai-chat \
   --base-url http://192.168.1.20:8000/v1 --no-auth --allow-insecure-lan
 ```
 
-Hostnamen (`gpu-box.lan`) zählen nicht, weil DNS überallhin zeigen kann. Wer
-einen Namen braucht, stellt TLS davor und nutzt `https`.
+Hostnames (`gpu-box.lan`) don't count, because DNS can point anywhere. If
+you need a name, put TLS in front of it and use `https`.
 
-## Kontextfenster und Nebenläufigkeit
+## Context window and concurrency
 
 ```toml
-# models/Qwen%2FQwen3-32B.toml (von `harw provider scan` geschrieben)
+# models/Qwen%2FQwen3-32B.toml (written by `harw provider scan`)
 id = "Qwen/Qwen3-32B"
 provider = "vllm"
 context_window = 32768
@@ -158,25 +157,25 @@ name = "vllm"
 api = "openai-chat"
 base_url = "http://localhost:8000/v1"
 auth_header = "none"
-max_concurrency = 1          # 2–4, wenn der Server genug KV-Cache hat
-request_timeout_secs = 900   # sehr lange Prompts auf langsamer Hardware
+max_concurrency = 1          # 2-4 if the server has enough KV cache
+request_timeout_secs = 900   # very long prompts on slower hardware
 ```
 
-`max_concurrency` ist die empfohlene Stelle für die Parallelität.
-`[rate_limit] max_concurrent` gilt zusätzlich je Budget-Bucket (auch je
-Modell). Stehen beide, gewinnt die kleinere Grenze. Weitere Anfragen, etwa von
-parallelen Kindern, warten in der Warteschlange des Providers. Die Wartezeit
-zählt nicht zum Request-Zeitlimit, und das Log meldet
+`max_concurrency` is the recommended place for parallelism.
+`[rate_limit] max_concurrent` also applies per budget bucket (including
+per model). If both are set, the smaller limit wins. Further requests,
+e.g. from parallel children, wait in the provider's queue. The wait time
+does not count toward the request timeout, and the log reports
 `provider.concurrency.waiting_for_slot`.
 
-Bei Fenstern unter 64k passen die vollständigen Werkzeugschemas oft nicht
-neben Auftrag und Verlauf. Solche Kinder am besten mit einer Rolle starten,
-die nur wenige Werkzeuge hat, z. B. Explorer.
+With windows under 64k, the full tool schemas often don't fit next to the
+task and history. Such children are best started with a role that has
+only a few tools, e.g. explorer.
 
-## Rollen gemischt: lokal und Cloud
+## Mixed roles: local and cloud
 
-Die Rollen-Modelle lassen sich je Stelle wählen. Ein häufiges Muster:
-Erkunden und einfache Worker laufen lokal, der Orchestrator in der Cloud.
+The role models can be chosen per slot. A common pattern: exploration and
+simple workers run locally, the orchestrator runs in the cloud.
 
 ```bash
 harw model internal set explorer Qwen/Qwen3-32B --provider vllm
@@ -184,7 +183,7 @@ harw model internal set worker-simple Qwen/Qwen3-32B --provider vllm
 harw model internal set root-orchestrator claude-opus-5-5 --provider anthropic
 ```
 
-Gleichwertig in der Harness-Konfiguration:
+Equivalent in the harness configuration:
 
 ```toml
 [internal_models.explorer]
@@ -196,5 +195,5 @@ provider = "vllm"
 model = "Qwen/Qwen3-32B"
 ```
 
-Mit `max_concurrency = 1` arbeitet eine Explorer-Welle ihre Kinder dann
-nacheinander ab, statt den lokalen Server zu überlasten.
+With `max_concurrency = 1`, an explorer wave then processes its children
+one after another instead of overloading the local server.

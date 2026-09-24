@@ -1,12 +1,15 @@
-# Tool-Inventar: Codex / Hermes / OpenClaw
+# Tool Inventory: Codex / Hermes / OpenClaw
 
-**Status:** Recon-Ergebnis, versioniert für den Rust-Design-Vergleich.
-**Quellen:** `codex-rs/`, `~/.hermes/`, `inspirations/openclaw/`.
-**Bindet an:** `philosophy.md` §10 (Operations ≠ Tools ≠ Permissions), §11 (Agent-Computer-Schnittstelle), §12 (Authority-Reduktion).
+> Status: implemented · Last reviewed: 2026-09-24
+
+A recon snapshot comparing the tool surfaces of three reference agent
+stacks (Codex, Hermes, OpenClaw), used as a design comparison for
+`harw-tools`. Binds to `philosophy.md` §10 (operations != tools !=
+permissions), §11 (agent-computer interface), §12 (authority reduction).
 
 ---
 
-## Übersichtstabelle
+## Overview table
 
 | Tool | Kategorie | codex | hermes | openclaw | Notes |
 |---|---|---|---|---|---|
@@ -42,49 +45,70 @@
 
 ---
 
-## Cluster
+## Clusters
 
-- **Shell:** Codex hat drei Stufen (`shell_command`, `unified_exec`, `run_user_shell_command`). Hermes fasst zu `terminal` + `close_terminal`. OpenClaw delegiert extern via `gateway`.
-- **FS-Write:** Nur Codex mit `apply_patch` + eigenem Approval-Event. Hermes/OpenClaw schreiben via Shell durch.
-- **Web:** `web_search` in allen dreien, `web_fetch` in Hermes + OpenClaw, `image_generation` nur Codex.
-- **Task/Todo:** Codex verwaltet `update_plan` (Turn-lokal); Hermes/OpenClaw haben `cron` (dauerhaft).
-- **Memory:** Nur Hermes hat First-Class-`memory`-Tool — klare Lücke bei den anderen.
-- **MCP-Bridge:** Codex `tool_search` + Plugin-Install-Elicitation. Hermes 3-stufig `tool_search` → `tool_describe` → `tool_call`. OpenClaw eigene Channel-MCP-Tools.
-- **Agent-Spawn:** Hermes `delegate_task`, OpenClaw `gateway`/`agents_list`. Codex keine direkte Spawn-Tool-Ebene — läuft über Session-Protokoll.
-- **Sandbox/Approval:** Codex am tiefsten (Guardian, execpolicy, zwei Approval-Event-Klassen). OpenClaw deklarative `ToolAvailabilityExpression`. Hermes `clarify`.
-
----
-
-## Systematische Unterschiede
-
-- **Codex** — tiefstes Approval-Modell; `apply_patch` als kanonischer FS-Write; Deferred-Tool-Loading im Responses-API-Typ.
-- **OpenClaw** — kein eigenes Shell/FS-Tool, alles über Plugins/MCP; einziger mit Channel-MCP-Tools; deklarative Availability-DSL.
-- **Hermes** — breiteste Palette (Memory, TTS, Vision, Smart-Home, X-Search); 3-stufiges Tool-Bridge-Pattern; einziges mit First-Class-`memory`-Tool.
-
----
-
-## Lücken in `harw-tools` heute
-
-- **Memory** — kein Tool-Adapter für `harw-memory` (obwohl Backend fertig ist).
-- **Agent-Spawn** — kein Adapter für Job-Runtime.
-- **Browser/Computer-Use** — kein Crate.
-- **Notification (TTS)** — kein Crate.
-- **Cron** — `harw-job-runtime` existiert, aber kein Tool-Export.
-- **Channel-MCP** — kein Adapter.
+- **Shell:** Codex has three tiers (`shell_command`, `unified_exec`,
+  `run_user_shell_command`). Hermes collapses to `terminal` +
+  `close_terminal`. OpenClaw delegates externally via `gateway`.
+- **FS write:** Only Codex has `apply_patch` with its own approval event.
+  Hermes/OpenClaw write through the shell.
+- **Web:** `web_search` in all three, `web_fetch` in Hermes + OpenClaw,
+  `image_generation` only in Codex.
+- **Task/todo:** Codex manages `update_plan` (turn-local); Hermes/OpenClaw
+  have `cron` (persistent).
+- **Memory:** Only Hermes has a first-class `memory` tool — a clear gap in
+  the others.
+- **MCP bridge:** Codex has `tool_search` plus plugin-install elicitation.
+  Hermes has a 3-stage `tool_search` -> `tool_describe` -> `tool_call`.
+  OpenClaw has its own channel-MCP tools.
+- **Agent spawn:** Hermes has `delegate_task`, OpenClaw has
+  `gateway`/`agents_list`. Codex has no direct spawn-tool layer — it runs
+  over the session protocol.
+- **Sandbox/approval:** Codex goes deepest (Guardian, execpolicy, two
+  approval-event classes). OpenClaw has a declarative
+  `ToolAvailabilityExpression`. Hermes has `clarify`.
 
 ---
 
-## Harw-Kanon (12 Tools, priorisiert)
+## Systematic differences
 
-1. `shell_command` — Shell/Exec, Sandbox-first
-2. `apply_patch` — FS-Write via Sequence-Diff
+- **Codex** — deepest approval model; `apply_patch` as the canonical FS
+  write; deferred tool loading in the Responses-API type.
+- **OpenClaw** — no own shell/FS tool, everything via plugins/MCP; the only
+  one with channel-MCP tools; a declarative availability DSL.
+- **Hermes** — broadest range (memory, TTS, vision, smart home, X search); a
+  3-stage tool-bridge pattern; the only one with a first-class `memory`
+  tool.
+
+---
+
+## Gaps in `harw-tools` today
+
+- **Memory** — no tool adapter for `harw-memory`, even though the backend
+  is complete.
+- **Agent spawn** — child agents are invoked via `AgentToolAdapter`
+  (`harw-core-bridge`, see `docs/design/agents-as-tools.md`), not through a
+  `harw-tools` adapter; there is no `harw-tool-*` crate for it.
+- **Notification (TTS)** — no crate.
+- **Cron** — `harw-job-runtime` exists, but there is no tool export for it.
+- **Channel-MCP** — no adapter.
+
+Browser/computer-use is no longer a gap: `harw-browser` and
+`harw-tool-browser` exist.
+
+---
+
+## Harwness canon (priority tool list)
+
+1. `shell_command` — shell/exec, sandbox-first
+2. `apply_patch` — FS write via sequence diff
 3. `web_search` — cross-source
 4. `web_fetch` — cross-source
-5. `tool_search` — MCP-Bridge / Deferred Discovery
-6. `update_plan` — Turn-Task-State
-7. `request_user_input` — Human-in-Loop
-8. `request_permissions` — Authority-Escalation
-9. `memory_read` + `memory_write` — First-Class-Memory (Hermes-Lücke schließen)
-10. `cron_schedule` — Persistent Scheduling
-11. `delegate_task` — Agent-Spawn mit Lease/Budget (philosophy.md §6, §7)
-12. `execute_code` — Sandbox-Runner
+5. `tool_search` — MCP bridge / deferred discovery
+6. `update_plan` — turn-scoped task state
+7. `request_user_input` — human-in-the-loop
+8. `request_permissions` — authority escalation
+9. `memory_read` + `memory_write` — first-class memory (closing the Hermes gap)
+10. `cron_schedule` — persistent scheduling
+11. `delegate_task` — agent spawn with lease/budget (philosophy.md §6, §7)
+12. `execute_code` — sandbox runner

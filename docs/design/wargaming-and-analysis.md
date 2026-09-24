@@ -1,101 +1,105 @@
-# Business-Wargaming, analytisches Handwerk und Visualisierung
+# Business Wargaming, Analytical Tradecraft, and Visualization
 
-Status: Entwurf · Stand 2026-09-23 · Ergänzt `docs/design/matrix-game.md` (Matrix-Game-Kern: GameMaster, Spieler-Agenten, Szenario-Schema `harwness.matrix-scenario/v1`). Wo dieses Dokument Typ- oder Feldnamen des Kerns voraussetzt, gilt bei Abweichung `matrix-game.md`; die hier eingeführten Erweiterungen sind additiv formuliert.
+> Status: partially implemented · Last reviewed: 2026-09-24
 
-Quellen (Studienmaterial, sinngemäß und in eigenen Worten wiedergegeben):
+This document extends `docs/design/matrix-game.md` (the matrix-game core: GameMaster, player agents, scenario schema `harwness.matrix-scenario/v1`). Where it assumes a type or field name from the core, `matrix-game.md` wins on any mismatch; the extensions introduced here are additive.
 
-- Oriesek & Schwarz, *Business Wargaming* (Teams, Züge, Gamebook, Debriefing, Fallstudien Mobilfunk/Automobil, Frühwarnsysteme).
-- Hall & Citrenbaum, *Intelligence Analysis: How to Think in Complex Environments* (Dekomposition von Hypothesen in Beobachtbares, kritisches Denken, Mirror Imaging, Annahmenprüfung, Red Teaming).
-- Herman, *Intelligence Power in Peace and War* (Single-Source vs. All-Source, Trichter der Veredelung, Intelligence-Zyklus und seine Grenzen, Need-to-know).
-- Zelazny, *Say It With Charts* (Botschaft → Vergleichsart → Diagrammform).
-- Ergänzend, nicht aus dem Material: Analysis of Competing Hypotheses (Heuer), Admiralty-/NATO-Quellenbewertung (A–F/1–6). Beides ist gängige Praxis und wird hier als Standardtechnik behandelt.
+Sources (study material, paraphrased and summarized in our own words):
 
----
-
-## 0. Kurzfassung
-
-1. **Business-Modus** (`mode = "business"`) macht aus dem Matrix Game ein Oriesek-artiges Strategie-Wargame: Unternehmens-, Wettbewerber- und Marktteam als Spieler-Agenten, der Rust-`GameMaster` als Control/White Cell, drei Züge mit simulierten Zeitsprüngen, Entscheidungsvorlagen statt Freitext, ein pragmatisches Marktmodell mit menschlich/agentisch überstimmbarer Bewertung, Schocks als Injects, strukturiertes Debriefing (Beobachtung → Lehre → Implikation → Empfehlung).
-2. **Analytisches Handwerk** wird als vier plus zwei Skills (`analysis-ach`, `key-assumptions`, `red-team`, `indicators-warnings`, `source-grading`, `hypothesis-decomposition`) und als additive Felder im `ResearchFinding` kodiert (Hypothesen, Annahmen, Indikatoren, Quellenbewertung, Wahrscheinlichkeitssprache getrennt von Konfidenz).
-3. **Intelligence-Zyklus**: Orchestrator = Tasking/All-Source-Analyse, Worker = Single-Source-Sammlung + Erstverarbeitung. Need-to-know ist bereits Kernprinzip (`ContextCeiling::intersect`, `VisibilityScope`) und wird auf die Sichtbarkeit im Matrix Game übertragen.
-4. **Visualisierung**: jede Grafik hat einen Botschaftstitel; Vergleichsart bestimmt das ratatui-Widget.
-5. **Priorisierte Umsetzung** in §5.
+- Oriesek & Schwarz, *Business Wargaming* (teams, moves, gamebook, debriefing, telecom/automotive case studies, early-warning systems).
+- Hall & Citrenbaum, *Intelligence Analysis: How to Think in Complex Environments* (decomposing hypotheses into observables, critical thinking, mirror imaging, assumption checking, red teaming).
+- Herman, *Intelligence Power in Peace and War* (single-source vs. all-source, the refining funnel, the intelligence cycle and its limits, need-to-know).
+- Zelazny, *Say It With Charts* (message → comparison type → chart form).
+- Not from the study material, added for completeness: Analysis of Competing Hypotheses (Heuer), the Admiralty/NATO source-rating scale (A–F/1–6). Both are standard practice and are treated here as such.
 
 ---
 
-## 1. Business-Wargame-Modus für das Matrix Game
+## 0. Summary
 
-### 1.1 Was ein Business-Wargame von einem Planspiel unterscheidet
+1. **Business mode** (`mode = "business"`) turns the matrix game into an Oriesek-style strategy wargame: company, competitor, and market teams as player agents, the Rust `GameMaster` as control/white cell, structured decision templates, a pragmatic market model that a bound adjudicator can override, shocks as injects, and a structured debrief (observation → lesson → implication → recommendation). This is implemented in `harw-matrix-game` (see §1 for what's built vs. still open).
+2. **Analytical tradecraft** is planned as additive fields on `ResearchFinding` (hypotheses, assumptions, indicators, source grading, likelihood language kept separate from confidence) plus a set of skills that would teach agents to use them. The schema fields are implemented in `harw-research`; the skills themselves are not yet built (§2).
+3. **Intelligence cycle**: orchestrator = tasking/all-source analysis, worker = single-source collection + first-pass processing. Need-to-know is already a core principle (`ContextCeiling::intersect`, per-child context scoping) and is carried over to matrix-game visibility. This mapping is conceptual; no dedicated `all-source-analyst`/`red-teamer` agents exist yet (§3).
+4. **Visualization**: every chart should have a message-first title; the comparison type should pick the ratatui widget. Not yet implemented (§4).
+5. Status of each piece, tracked in §5.
 
-Oriesek/Schwarz grenzen das Business-Wargame deutlich von Business-School-Simulationen ab: Dort liegen die „richtigen" Stellschrauben im Modell und sind nach wenigen Runden durchschaut. Ein Wargame dagegen wird für **eine konkrete Organisation und konkrete Schlüsselfragen** entworfen, die Erkenntnis entsteht aus der Interaktion der Teams, und das Rechenmodell ist nur Hilfsmittel des Control-Teams, das es jederzeit korrigieren darf. Für uns folgt daraus:
+---
 
-- Das Marktmodell im `GameMaster` ist **deterministisch, klein und überstimmbar** – es liefert einen Vorschlag, keine Wahrheit. Jede Überstimmung wird mit Begründung protokolliert (Nachvollziehbarkeit war ein Erfolgsfaktor im Buch: wenn keine harten Daten da sind, muss man wenigstens rückwärts erklären können, warum etwas so ausging).
-- Jedes Szenario beginnt mit **Schlüsselfragen** (`key_questions`), die das Debriefing am Ende explizit beantworten muss. Ohne sie ist das Spiel nicht startfähig (Validierungsfehler).
+## 1. Business-wargame mode for the matrix game
 
-### 1.2 Rollenmodell → unsere Topologie
+> Status: implemented (`harw-matrix-game/src/scenario.rs`, `business.rs`; orchestration in `harw-ops/src/matrix/`). Some KPI and stakeholder detail described below is not modeled yet — see the notes per subsection.
 
-Das Buch nennt vier Grundelemente: Unternehmensteam, Wettbewerberteams, Marktteam, Control-Team. Control spielt zusätzlich alle nicht explizit besetzten Stakeholder (Regulator, kleinere Wettbewerber, Zielunternehmen einer Übernahme, Interessengruppen) und kann Schocks einspielen.
+### 1.1 What sets a business wargame apart from a training simulation
 
-| Buch-Rolle | Harwness | Umsetzung |
+Oriesek/Schwarz draw a sharp line between a business wargame and a business-school simulation: in the latter, the "right" levers live in the model and are figured out after a few rounds. A wargame, by contrast, is designed for **one specific organization and specific key questions**; the insight comes from the teams' interaction, and the computational model is only a tool for the control team, which may correct it at any time. For us that means:
+
+- The market model in the `GameMaster` is **deterministic, small, and overridable** — it produces a proposal, not a ground truth. Every override is logged with a rationale (traceability was a success factor in the book: without hard data, you must at least be able to explain afterward why something turned out the way it did).
+- Every scenario starts with **key questions** (`key_questions`) that the debrief must explicitly answer at the end. Without them the game cannot start (a validation error).
+
+### 1.2 Role model → our topology
+
+The book names four basic elements: the company team, competitor teams, the market team, and the control team. Control also plays every stakeholder not explicitly cast (regulator, smaller competitors, an acquisition target, interest groups) and can inject shocks.
+
+| Book role | Harwness | Implementation |
 |---|---|---|
-| Unternehmensteam („Blue") | Spieler-Agent `company` | spielt den aktuellen Strategieplan (oder eine Alternative, `strategy_variant`) |
-| Wettbewerber 1..n („Red") | Spieler-Agenten `competitor_a`, `competitor_b` | erhalten Gamebook-Profil; Auftrag „Be the enemy" |
-| Marktteam | Spieler-Agent `market` **oder** White-Cell-Subagent des GM | vergibt relative Attraktivität/Marktanteile |
-| Control / White Cell | Rust-`GameMaster` (+ optionaler LLM-Adjudikator) | Zeitplan, Regeln, KPI-Rechnung, Schocks, Rest-Stakeholder, Offenlegung |
-| Regulator, Kleinwettbewerber, Übernahmeziele | vom `GameMaster` gespielt (`[[business.stakeholders]]`) | Entscheidungen per Regel + Adjudikator-Prompt |
-| Coach / Devil's Advocate je Team | Skill `red-team` am Spieler-Agenten | stellt Annahmen in Frage, erzwingt Vorlagen-Disziplin |
+| Company team ("Blue") | player agent `company` | plays the current strategy plan (or an alternative, `strategy_variant`) |
+| Competitor 1..n ("Red") | player agents `competitor_a`, `competitor_b` | get a gamebook profile; directive "be the enemy" |
+| Market team | player agent `market` **or** a white-cell sub-agent of the GameMaster | assigns relative attractiveness/market shares |
+| Control / white cell | the Rust `GameMaster` (+ optional LLM adjudicator) | schedule, rules, KPI computation, shocks, remaining stakeholders, disclosure |
+| Regulator, minor competitors, acquisition targets | played by the `GameMaster` (`[[business.stakeholders]]`) | decisions via rule or adjudicator prompt |
+| Coach / devil's advocate per team | not a separate skill yet — see §2 | intended to challenge assumptions, enforce template discipline |
 
-Bei **vier Spieler-Slots** gibt es zwei sinnvolle Belegungen (Szenario-Feld `business.market_role`):
+With **four player slots**, there are two workable layouts (scenario field `business.market_role`):
 
-- `market_role = "player"` (Standard): company, competitor_a, competitor_b, market. Der Markt ist dann ein bewertender Spieler – er reicht keine Angebote ein, sondern Bewertungen (eigene Vorlage `market_assessment`).
-- `market_role = "white_cell"`: der Markt wird als interner Subagent des GM gefahren; der vierte Slot wird ein dritter Wettbewerber. Die Automobil-Fallstudie im Buch zeigt ein bewährtes Trio: der tatsächliche Hauptwettbewerber, ein Neueinsteiger aus einem Nachbarmarkt und ein fiktiver aggressiver Billiganbieter.
+- `market_role = "player"` (default): company, competitor_a, competitor_b, market. The market is then an evaluating player — it doesn't submit offers, only assessments (its own `market_assessment` template).
+- `market_role = "white_cell"`: the market runs as an internal sub-agent of the GameMaster; the fourth slot becomes a third competitor. The book's automotive case study shows a proven trio: the actual main competitor, a newcomer from an adjacent market, and a fictional aggressive low-cost entrant.
 
-Das Marktteam ist Bewerter, nicht Konkurrent; es darf daher keine privaten Kanäle zu Anbieterteams nutzen, außer für explizit modellierte Kundengespräche (Kanaltyp `sales_call`, vom GM mitgelesen).
+The market team is an evaluator, not a competitor; it may not use private channels to seller teams except for explicitly modeled customer conversations (channel type `sales_call`, read by the GameMaster).
 
-### 1.3 Zugstruktur
+### 1.3 Move structure
 
-Laut Buch sind drei Züge üblich; der erste startet in der Gegenwart auf Basis realer Daten, spätere Züge springen in die Zukunft (z. B. 1 Jahr, 2 Jahre, 4+ Jahre, der letzte als „Foresight"). Ein Zug ist ein Entscheidungszyklus. Die Mobilfunk-Fallstudie gliedert: Markteintritt – Positionierung gegen Wettbewerber – langfristige Verfestigung.
+The book typically uses three moves; the first starts in the present on real data, later moves jump forward in time (e.g. +1 year, +2 years, +4 or more years, the last one as "foresight"). A move is a decision cycle. The telecom case study structures it as: market entry — positioning against competitors — long-term consolidation.
 
-Abbildung auf GM-Phasen je Zug (`MovePhase` im GM-Zustandsautomaten):
+Mapping onto GameMaster phases per move (`MovePhase` in the game-master state machine):
 
 ```
-Brief ─▶ Deliberation ─▶ Submission ─▶ Plenary ─▶ MarketAssessment ─▶ Adjudication ─▶ Hotwash ─▶ (nächster Zug)
-  │          │ private Paarkanäle (GM cc)   │ öffentliche Pitches    │ Marktbewertung   │ KPI-Rechnung, Schocks
-  │          │ Entscheidungsvorlage          │ (alle sehen alles)     │                  │ Offenlegung
-  └ Zug-Briefing: öffentlicher Lagebericht + privater Team-Bericht (KPIs, P&L-Auszug)
+Brief ─▶ Deliberation ─▶ Submission ─▶ Plenary ─▶ MarketAssessment ─▶ Adjudication ─▶ Hotwash ─▶ (next move)
+  │          │ private pair channels (GM cc'd)   │ public pitches       │ market rating    │ KPI computation, shocks
+  │          │ decision template                  │ (all see everything) │                  │ disclosure
+  └ Move brief: public situation report + private team report (KPIs, P&L excerpt)
 ```
 
-- **Brief**: GM verteilt `public_situation` (alle) und `team_report` (nur Team) – Startpunkt des Zuges ist das Ergebnis des Vorzugs. Wer Anteile „gekauft" hat, sieht jetzt die leere Kasse und eingeschränkte Optionen (Budgetgrenze aus `cash`).
-- **Deliberation**: Team-interne Überlegung (ein Agent pro Team; optional Kind-Agenten als Teamrollen: Leiter, Briefer, Kommunikator – die Mobilfunk-Fallstudie nennt genau diese drei plus Coach). Kontakt zu anderen Teams **nur** über private Paarkanäle; der GM ist in jedem Kanal stiller Mitleser (im Buch: jede E-Mail zwischen Teams geht automatisch in Kopie an Control).
-- **Submission**: strukturierte Entscheidungsvorlage (§1.5). Fristen sind hart; ein verspätetes Team erhält die Vorzugsentscheidung als „Status quo" (das Buch betont, dass ein nachhinkendes Team das ganze Spiel aus dem Takt bringt).
-- **Plenary**: Jedes Anbieterteam liefert einen öffentlichen Pitch (Nutzenversprechen, max. N Tokens). Ab hier haben alle denselben Informationsstand über Angebote.
-- **MarketAssessment**: Marktteam bewertet je Segment Attraktivität (0–10) und begründet; Rechenmodell erzeugt Anteilsvorschlag.
-- **Adjudication**: GM konsolidiert harte Daten (Preis, Invest) und weiche Daten (Marktbewertung) zu KPIs, prüft Deals gegen Regeln (Kartellrecht, Finanzkraft), entscheidet Stakeholder-Reaktionen, spielt fällige Injects ein.
-- **Hotwash**: kurze Zwischenlehren nach jedem Zug (Buch: nach jedem Zug eine erste Zusammenfassung). Jeder Spieler liefert drei Sätze „was hat funktioniert / was nicht / was überrascht"; GM hängt sie ans AAR-Protokoll.
+- **Brief**: the GameMaster distributes `public_situation` (all) and `team_report` (team only) — the move starts from the previous move's outcome. A team that "bought" market share now sees an emptier war chest and constrained options (budget from `cash`).
+- **Deliberation**: internal team discussion (one agent per team; optionally child agents as team roles: lead, briefer, communicator — the telecom case study names exactly these three plus a coach). Contact with other teams **only** through private pair channels; the GameMaster silently reads every channel (in the book: every email between teams is automatically copied to control).
+- **Submission**: a structured decision template (§1.5). Deadlines are hard; a late team gets the prior decision as "status quo" (the book stresses that a lagging team throws the whole game off pace).
+- **Plenary**: every seller team delivers a public pitch (value proposition, max N tokens). From here everyone has the same information about the offers on the table.
+- **MarketAssessment**: the market team rates attractiveness per segment (0–10) with a rationale; the computational model produces a share proposal.
+- **Adjudication**: the GameMaster consolidates hard data (price, investment) and soft data (market ratings) into KPIs, checks deals against rules (antitrust, financial capacity), decides stakeholder reactions, and plays due injects.
+- **Hotwash**: a short mid-game lesson after every move (the book does this after each move too). Every player supplies three sentences — "what worked / what didn't / what surprised me" — which the GameMaster appends to the AAR record.
 
-**Variante „attack-counter"** (`business.variant = "attack_counter"`, nach der Automobil-Fallstudie): Runde 1 greifen Wettbewerber an (mit fiktiv unbegrenztem Kapital, aber legal und plausibel), Runde 2 entwickelt das Unternehmen Gegenstrategien, Runde 3 reagieren die Angreifer auf eine „abgefangene" Gegenstrategie. Ein „Botschafter" trägt die Absicht einer Gruppe in die nächste – bei uns eine GM-generierte Zusammenfassung, die als `ambassador_brief` in den Kontext des Gegenübers geht. Diese Variante braucht kein Marktteam und passt gut zu Blind-Spot-Analysen.
+**"Attack-counter" variant** (`business.variant = "attack_counter"`, after the book's automotive case study): move 1 has competitors attack (with fictionally unlimited but legally and plausibly bounded capital), move 2 has the company develop counter-strategies, move 3 has the attackers react to an "intercepted" counter-strategy. An "ambassador" carries a group's intent into the next move — for us, a GameMaster-generated summary that goes into the counterpart's context as `ambassador_brief`. This variant needs no market team and suits blind-spot analysis well.
 
-### 1.4 Injects (Markt- und Szenario-Schocks)
+### 1.4 Injects (market and scenario shocks)
 
-Das Buch beschreibt Schocks als Eingriffe von Control, die Teams zwingen, ein Thema zu adressieren (Produktrückruf, Sicherheitsbedenken, Regulierungsänderung). Wir unterscheiden:
+The book describes shocks as control interventions that force teams to address a topic (a product recall, a safety concern, a regulatory change). We distinguish:
 
-| Art | Auslöser | Sichtbarkeit | Beispiel |
+| Kind | Trigger | Visibility | Example |
 |---|---|---|---|
-| `scheduled` | fester Zug/Phase | public oder Team-Liste | Marktöffnung Privatkunden ab Zug 2 |
-| `conditional` | Prädikat über Weltzustand | public | Anteil eines Teams > 40 % → Kartellprüfung |
-| `random` | seed-deterministischer Wurf mit `p` | privat | Lieferantenausfall bei `competitor_b` |
-| `control_discretion` | Adjudikator-Vorschlag, vom GM bestätigt | variabel | Presseleak eines Allianzgesprächs |
+| `scheduled` | fixed move/phase | public or a team list | consumer-market opening from move 2 |
+| `conditional` | predicate over world state | public | a team's share > 40% → antitrust review |
+| `random` | seed-deterministic roll with `p` | private | a supplier failure at `competitor_b` |
+| `control_discretion` | adjudicator proposal, confirmed by the GameMaster | variable | a press leak of an alliance talk |
 
-Alle Injects sind im Szenario deklariert; der Adjudikator darf nur **aus dem Katalog** wählen (kein Erfinden neuer Weltfakten durch das LLM). Zufall ist seed-basiert, damit ein Spiel reproduzierbar erneut gespielt werden kann – das Buch berichtet, dass wiederholte Spiele mit anderen Teilnehmern zwar anders verlaufen, aber ähnliche Lehren ergeben; genau diese Robustheit wollen wir mit `harw matrix replay --seed` messen können.
+All injects are declared in the scenario; the adjudicator may only choose **from the catalog** (the LLM cannot invent new world facts). Randomness is seed-based so a game can be replayed reproducibly — the book reports that repeated plays with different participants unfold differently but yield similar lessons, a robustness we want to be able to measure with `matrix compare` (§11.5 of `matrix-game.md`).
 
-### 1.5 Strategische Entscheidungsvorlage
+### 1.5 Strategic decision template
 
-Im Buch sind Vorlagen das Medium, über das Teams dem Markt und Control harte Daten liefern. Bei uns ist die Vorlage ein Tool-Aufruf `submit_move` mit JSON-Schema (vom GM aus dem Szenario generiert):
+In the book, templates are the medium through which teams give the market and control hard data. For us the template is a tool call, `submit_move`, with a JSON schema (generated by the GameMaster from the scenario):
 
 ```json
 {
   "team": "competitor_a",
   "move": 2,
-  "strategic_intent": "Preisführerschaft im KMU-Segment, Premium halten",
+  "strategic_intent": "Price leadership in the SME segment, hold premium positioning elsewhere",
   "actions": [
     {"kind": "price",    "segment": "sme",     "offer": "cloud_basic", "value": 19.0},
     {"kind": "invest",   "area": "sales",      "amount_meur": 12},
@@ -104,99 +108,78 @@ Im Buch sind Vorlagen das Medium, über das Teams dem Markt und Control harte Da
     {"kind": "lobby",    "target": "regulator", "topic": "data_residency"}
   ],
   "assumptions": [
-    {"id": "A1", "text": "company senkt nicht vor Zug 3 die Preise", "confidence": "medium"}
+    {"id": "A1", "text": "company will not cut prices before move 3", "confidence": "medium"}
   ],
-  "expected_reactions": {"company": "Bündelangebot", "competitor_b": "Nischenrückzug"},
+  "expected_reactions": {"company": "bundled offer", "competitor_b": "niche retreat"},
   "expected_kpis": {"share_sme": 0.30, "ebit_meur": 4.0},
-  "pitch": "…öffentlicher Text für das Plenum…"
+  "pitch": "…public text for the plenary…"
 }
 ```
 
-Wichtige Regeln:
+Key rules:
 
-- `actions[].kind` ist ein geschlossener Satz aus `business.action_kinds`; unbekannte Aktionen gehen als `free_argument` in die klassische Matrix-Game-Adjudikation (Argument + Gründe, siehe unten).
-- `assumptions` und `expected_reactions` sind Pflicht. Sie sind der Rohstoff fürs Debriefing: der GM vergleicht nach dem Zug Erwartung und Ergebnis („Prognosefehler je Team").
-- Budgetprüfung: Summe `invest` ≤ verfügbare Mittel; sonst Ablehnung mit Fehlermeldung an den Agenten (ein Korrekturversuch, dann Status quo).
+- `actions[].kind` is a closed set from `business.action_kinds`; unknown action kinds fall through to plain matrix-game adjudication (argument + reasons) as `free_argument`.
+- `assumptions` and `expected_reactions` are required. They are the raw material for the debrief: after the move, the GameMaster compares expectation against outcome ("forecast error" per team).
+- Budget check: the sum of `invest` ≤ available funds; otherwise the submission is rejected with an error (one correction attempt, then status quo).
 
-### 1.6 Adjudikation im Business-Kontext
+### 1.6 Adjudication in the business context
 
-Drei Schichten, in dieser Reihenfolge:
+Three layers, in this order:
 
-1. **Regelprüfung (Rust, deterministisch)**: Budget, Kapazität, Regulierung (`business.rules`), Kartellschwellen. Deals zwischen Teams brauchen beiderseitige `alliance`/`acquisition`-Aktionen mit gleicher `proposal_ref`.
-2. **Marktmodell (Rust, deterministisch)**: Attraktivitätsmodell je Segment, z. B. Anteil_i ∝ exp(β · Score_i), Score = gewichtete Summe aus Marktbewertung (weich), Preisposition, Vertriebsinvest (mit abnehmendem Grenznutzen), Produktfit. Ausgabe: Anteile, Umsatz, Deckungsbeitrag, EBIT, Cash. Bewusst wenige KPIs – das Buch empfiehlt pragmatische Modelle, die sich auf die Schlüsselfragen beschränken.
-3. **Control-Urteil (LLM-Adjudikator, optional, gebunden)**: Darf Modellergebnisse innerhalb `business.override_bounds` (z. B. ±5 Prozentpunkte Anteil) korrigieren und muss dafür eine Begründung schreiben (`AdjudicationOverride { field, from, to, rationale }`). Das Buch schildert genau diesen Fall: Ein Team wählte eine extreme Billigstrategie, das Kostenmodell hätte sie zu Unrecht bestraft, also passte Control Kosten manuell an. Nicht katalogisierte Aktionen (`free_argument`) werden nach Matrix-Game-Logik bewertet: Argument mit Gründen, Gegenargumente der betroffenen Teams, dann Wahrscheinlichkeit (gestaffelt `almost_certain`/`likely`/`even`/`unlikely`/`remote`) und seed-deterministischer Wurf.
+1. **Rule check (Rust, deterministic)**: budget, capacity, regulation (`business.rules`), antitrust thresholds. Deals between teams need matching `alliance`/`acquisition` actions from both sides with the same `proposal_ref`. — Implemented via `business::evaluate_predicate` and `restriction_for`; a matched `restrict_actions` rule becomes a veto in adjudication (`phases::resolve_argument`), and `require_stakeholder` becomes an umpire note.
+2. **Market model (Rust, deterministic)**: an attractiveness model per segment — `share_i ∝ exp(β · score_i)`, where `score` is a weighted sum of the market rating (soft), price position, sales investment (with diminishing returns), and product fit. Implemented as `business::apply_market_model` (`logit_share`), applied at round end via `phases::close_round_with_market`, and journaled as a `WorldDelta`. Output today is limited to **market share**; revenue, contribution margin, EBIT, and cash as further KPIs are open — the book recommends pragmatic models that stay scoped to the key questions, which is also why we started with the smallest useful KPI.
+3. **Control judgment (LLM adjudicator, optional, bounded)**: may correct model results within `business.override_bounds` (e.g. ±5 percentage points of share) and must write a rationale for doing so. The book describes exactly this case: a team chose an extreme low-cost strategy that the cost model would have unfairly punished, so control manually adjusted costs. Actions outside the catalog (`free_argument`) are judged by plain matrix-game logic: argument with reasons, counter-arguments from affected teams, then a probability (`almost_certain`/`likely`/`even`/`unlikely`/`remote`) and a seed-deterministic roll. — **Open**: the bounded-override mechanism (`AdjudicationOverride { field, from, to, rationale }`) as a distinct, journaled event type is not yet implemented; today an override would have to go through the general effect-validation and facilitator-note path.
 
-Stakeholder-Entscheidungen (Regulator genehmigt Übernahme nur mit Auflagen, Zielvorstand lehnt ab) trifft der GM per Regel oder Adjudikator mit Stakeholder-Profil aus dem Szenario.
+Stakeholder decisions (a regulator approving an acquisition only with conditions, a target board declining) are made by the GameMaster via rule or adjudicator, using the stakeholder profile from the scenario.
 
-### 1.7 Informationsgleichheit und Offenlegung
+### 1.7 Information parity and disclosure
 
-Im Buch verbreitet Control bestimmte Informationen aktiv weiter (etwa eine geschlossene Allianz), weil sie in der Realität über die Medien bekannt würden – so bleibt Informationsgleichheit gewahrt. Umsetzung als deklarative Offenlegungsregeln:
+In the book, control actively spreads certain information (e.g. a concluded alliance) because it would become public through the media in reality — this preserves information parity. We plan to implement this as declarative disclosure rules:
 
 ```toml
 [[business.disclosure]]
-on = "alliance_signed"      # Ereignis im GM
-audience = "all"            # oder Team-Liste
+on = "alliance_signed"      # event in the GameMaster
+audience = "all"            # or a team list
 delay_phases = 0
-template = "{a} und {b} geben eine Partnerschaft bekannt: {summary}"
+template = "{a} and {b} announce a partnership: {summary}"
 ```
 
-Private Kanalinhalte werden **nie** wörtlich offengelegt, nur als vom GM formulierte Meldung (siehe Compartmentation §3.3).
+> Status: open. Declarative `[[business.disclosure]]` rules are not implemented; today, disclosure of business-mode events follows the general public/private mechanics of §2 in `matrix-game.md` (an umpire or the GameMaster narrating a fact publicly), without a dedicated templated-disclosure table.
 
-### 1.8 Debriefing und Insight Capture
+Private channel content is **never** disclosed verbatim, only as a message the GameMaster formulates (see compartmentation, §3.3).
 
-Das Buch hält das detaillierte Debriefing für den wichtigsten Teil; es stützt sich auf Coach-Beobachtungen, Teilnehmer-Input, Modelldaten und die Auswertung des gesamten E-Mail-Verkehrs (wer mit wem worüber, Muster wie „alle suchen im selben Zug ähnliche Allianzen"). Die Struktur ist deduktiv: Beobachtungen → Lehren → Konsequenzen → konkrete Empfehlungen zurück in den Strategieplan.
+### 1.8 Debriefing and insight capture
 
-Wir erzeugen ein AAR-Artefakt `harwness.matrix-aar/v1` (JSON + gerendertes Markdown):
+The book treats the detailed debrief as the most important part; it draws on coach observations, participant input, model data, and analysis of the full message traffic (who talked to whom about what, patterns like "everyone sought similar alliances in the same move"). The structure is deductive: observations → lessons → implications → concrete recommendations back into the strategy plan.
 
-```rust
-pub struct BusinessAar {
-    pub scenario_id: String,
-    pub seed: u64,
-    pub key_questions: Vec<KeyQuestionAnswer>,   // je Schlüsselfrage: Antwort + Belege (Zug/Kanal/Event-IDs)
-    pub observations: Vec<Observation>,          // faktisch, mit Event-Referenz
-    pub lessons: Vec<Lesson>,                    // verweist auf observation_ids
-    pub implications: Vec<Implication>,          // für das Unternehmen
-    pub recommendations: Vec<Recommendation>,    // umsetzbar, mit Owner-Vorschlag
-    pub forecast_errors: Vec<ForecastError>,     // expected_kpis/expected_reactions vs. Ergebnis
-    pub channel_patterns: Vec<ChannelPattern>,   // Kontaktgraph je Zug, Gleichklang von Deals
-    pub bias_checks: Vec<BiasCheck>,             // siehe unten
-    pub indicators: Vec<IndicatorRef>,           // Übergabe an indicators-warnings (§2)
-}
-```
+`harw-matrix-game/src/aar.rs` implements the AAR for both classic and business-mode runs (§8.2 of `matrix-game.md`), and `harw-ops/src/matrix/report.rs` additionally builds a paper-ready `report.md` for business-mode runs, including market shares start→end per team and segment, and an after-action review structured around four questions (planned / happened / why / lessons) — this fulfills the deductive structure described above. Channel-traffic pattern analysis (a team×team contact matrix, first mention of deal keywords), a fixed bias checklist (from the book's automotive case study), and a `CounterApproach` taxonomy (ignore / prevent / provide / prepare / convert / reduce / anticipate) as a distinct, structured AAR field are **open** — not modeled as their own data structures yet; a human or the umpire can still capture this qualitatively in the narrative AAR text today.
 
-- **Kanalanalyse** ist rein deterministisch (Rust): Kontaktmatrix Team×Team je Zug, Nachrichtenzahl, erste Erwähnung von Deal-Stichworten. Das LLM interpretiert nur.
-- **Bias-Checkliste** aus der Automobil-Fallstudie, in eigenen Worten: Wahrscheinlichkeitsdenken (man sucht das Erwartbare statt des Überraschenden), Gruppendenken, blinde Flecken, Erfahrungsfixierung, Hang zum Spektakulären (kleine Züge werden unterschätzt), Produktverliebtheit (Kunden kaufen Nutzen, nicht Produkte). Jeder Punkt wird im AAR mit „beobachtet / nicht beobachtet + Beleg" beantwortet.
-- **Gegenstrategien** klassifiziert das AAR nach den sieben Umgangsformen mit Überraschungen aus der Fallstudie: ignorieren (als unerheblich einstufen), verhindern (Voraussetzungen beseitigen), vorsorgen (Notfallplan), vorbereiten (Elemente in die laufende Strategie einbauen), umwandeln (Überraschung zur Chance machen), abmildern (Schaden begrenzen, z. B. Versicherung), vorwegnehmen (die befürchtete Aktion selbst ausführen). Rust-Enum `CounterApproach { Neglect, Prevent, Provide, Prepare, Convert, Reduce, Anticipate }`.
-- **Brücke zur Frühwarnung**: Das Buch schlägt vor, die im Wargame identifizierten Bedrohungs- und Chancenfelder als Suchfelder eines strategischen Frühwarnsystems zu nutzen (schwache Signale, Umfeldscanning). Jede Empfehlung kann Indikatoren tragen, die der Skill `indicators-warnings` in beobachtbare Signale zerlegt und die als Kanban-Karten/Knowledge-Einträge (`harw-knowledge`) weiterleben.
-
-Persistenz: AAR und vollständiges Ereignisprotokoll (inkl. Kanalinhalte) unter `knowledge_dir/matrix/<scenario_id>/<run_id>/`, Sichtbarkeit `VisibilityScope` des Spielleiters; Spieler-Agenten sehen nach Spielende nur das öffentliche AAR („Endex-Freigabe" konfigurierbar).
-
-### 1.9 Vollständiges Beispiel-Szenario
+### 1.9 A complete example scenario
 
 ```toml
 schema = "harwness.matrix-scenario/v1"
 id = "cloud-sme-2027"
-title = "KMU-Cloud: Markteintritt eines Hyperscalers"
+title = "SME cloud: a hyperscaler's market entry"
 mode = "business"
 seed = 20270101
-language = "de"
+language = "en"
 
 [game]
 moves = 3
-# simulierte Zeit je Zug (Zug 3 = Foresight)
-move_labels = ["2027 – Markteintritt", "2028 – Positionierung", "2031 – Verfestigung"]
-phase_deadline_turns = 6          # max. Agenten-Turns je Phase und Team
+# simulated time per move (move 3 = foresight)
+move_labels = ["2027 – market entry", "2028 – positioning", "2031 – consolidation"]
+phase_deadline_turns = 6          # max agent turns per phase and team
 max_channel_messages_per_move = 12
 
 [[game.key_questions]]
 id = "KQ1"
-text = "Hält unsere Premium-Positionierung, wenn ein Hyperscaler KMU-Preise um 30 % unterbietet?"
+text = "Does our premium positioning hold if a hyperscaler undercuts SME prices by 30%?"
 [[game.key_questions]]
 id = "KQ2"
-text = "Lohnt eine Allianz mit einem regionalen Systemhaus-Verbund gegenüber eigenem Vertriebsausbau?"
+text = "Is an alliance with a regional systems-integrator consortium worth more than expanding our own sales force?"
 [[game.key_questions]]
 id = "KQ3"
-text = "Welche Regulierung (Datenresidenz) verändert die Spielregeln, und wer profitiert?"
+text = "Which regulation (data residency) changes the rules of the game, and who benefits?"
 
 [business]
 variant = "strategy_test"         # | "attack_counter" | "crisis_response"
@@ -210,16 +193,16 @@ kind = "logit_share"
 beta = 0.9
 weights = { market_score = 0.45, price_position = 0.30, sales_invest = 0.15, product_fit = 0.10 }
 sales_invest_saturation_meur = 20
-kpis = ["share", "revenue", "contribution_margin", "ebit", "cash"]
+kpis = ["share"]
 
 [[business.segments]]
 id = "sme"
-name = "KMU (10–249 MA)"
-size_meur = [800, 950, 1300]      # je Zug
+name = "SME (10-249 employees)"
+size_meur = [800, 950, 1300]      # per move
 price_sensitivity = 0.8
 [[business.segments]]
 id = "enterprise"
-name = "Großkunden"
+name = "Enterprise"
 size_meur = [1200, 1260, 1400]
 price_sensitivity = 0.35
 
@@ -235,7 +218,7 @@ effect = "restrict_actions:[invest,acquisition]"
 [[teams]]
 id = "company"
 role = "company"
-display = "NordCloud AG (wir)"
+display = "NordCloud AG (us)"
 agent = "matrix-player"
 strategy_brief = "gamebook/nordcloud.md"
 start = { cash = 60, share = { sme = 0.34, enterprise = 0.22 }, capacity = 1.0 }
@@ -243,16 +226,16 @@ start = { cash = 60, share = { sme = 0.34, enterprise = 0.22 }, capacity = 1.0 }
 [[teams]]
 id = "competitor_a"
 role = "competitor"
-display = "Hyperscaler X (Neueinsteiger KMU)"
+display = "Hyperscaler X (SME newcomer)"
 agent = "matrix-player"
 strategy_brief = "gamebook/hyperscaler-x.md"
-directive = "Be the enemy: gewinne KMU-Anteile legal, plausibel, aggressiv."
+directive = "Be the enemy: win SME share, legally, plausibly, aggressively."
 start = { cash = 500, share = { sme = 0.05, enterprise = 0.30 }, capacity = 3.0 }
 
 [[teams]]
 id = "competitor_b"
 role = "competitor"
-display = "ValueHost GmbH (Billiganbieter, fiktiv)"
+display = "ValueHost GmbH (fictional low-cost provider)"
 agent = "matrix-player"
 strategy_brief = "gamebook/valuehost.md"
 start = { cash = 25, share = { sme = 0.28, enterprise = 0.03 }, capacity = 0.8 }
@@ -260,201 +243,175 @@ start = { cash = 25, share = { sme = 0.28, enterprise = 0.03 }, capacity = 0.8 }
 [[teams]]
 id = "market"
 role = "market"
-display = "Marktteam (KMU- und Großkunden-Panel)"
+display = "Market panel (SME and enterprise)"
 agent = "matrix-market"
 strategy_brief = "gamebook/market-panel.md"
 assessment_scale = [0, 10]
 
 [[business.stakeholders]]
 id = "regulator"
-display = "Aufsichtsbehörde Datenschutz/Wettbewerb"
+display = "Data-protection/competition authority"
 played_by = "gamemaster"
-profile = "Prüft Übernahmen ab 40 % Segmentanteil; sensibel für Datenresidenz."
+profile = "Reviews acquisitions above 40% segment share; sensitive to data residency."
 [[business.stakeholders]]
 id = "sysint_alliance"
-display = "Verbund regionaler Systemhäuser"
+display = "Regional systems-integrator consortium"
 played_by = "gamemaster"
-profile = "Sucht exklusiven Plattformpartner; verlangt 20 % Marge und Leadschutz."
+profile = "Seeking an exclusive platform partner; wants 20% margin and lead protection."
 
 [channels]
-pairwise = "all_players"          # private Paarkanäle zwischen allen Teams
-observer = "gamemaster"           # GM liest jeden Kanal mit (cc Control)
+pairwise = "all_players"          # private pair channels between all teams
+observer = "gamemaster"           # the GameMaster reads every channel (cc'd to control)
 market_contact = "sales_call_only"
-
-[[business.disclosure]]
-on = "alliance_signed"
-audience = "all"
-delay_phases = 0
-template = "{a} und {b} verkünden eine Partnerschaft: {summary}"
-[[business.disclosure]]
-on = "price_change"
-audience = "all"
-delay_phases = 1                  # Listenpreise sind nach einer Phase öffentlich
 
 [[injects]]
 id = "INJ-1"
 kind = "scheduled"
 at = { move = 2, phase = "brief" }
 audience = "all"
-text = "Gesetzentwurf: Personenbezogene KMU-Daten müssen ab 2029 im Inland verarbeitet werden."
+text = "Draft bill: personal SME data must be processed domestically starting 2029."
 [[injects]]
 id = "INJ-2"
 kind = "conditional"
 when = "share('competitor_a','sme') > 0.25"
 audience = "all"
-text = "Fachpresse: Kartellbehörde prüft Kampfpreise im KMU-Cloudmarkt."
+text = "Trade press: antitrust authority reviewing SME cloud price-cutting."
 [[injects]]
 id = "INJ-3"
 kind = "random"
 p = 0.25
 at = { move = 3, phase = "brief" }
 audience = ["competitor_b"]
-text = "Ihr Rechenzentrumsbetreiber kündigt; 20 % Kapazität fallen für einen Zug aus."
+text = "Your data-center operator cancels the contract; 20% of capacity is out for one move."
 [[injects]]
 id = "INJ-4"
 kind = "control_discretion"
 audience = "all"
-text = "Ein Allianzgespräch wird öffentlich geleakt."
-
-[debrief]
-hotwash_each_move = true
-bias_checklist = true
-counter_approach_taxonomy = true
-export_indicators = true
-endex_release = "public_aar_only"
+text = "An alliance conversation is publicly leaked."
 ```
 
-Gamebooks (`gamebook/*.md`) sind Teil des Szenario-Pakets: je Team ein Einseiter-Profil (Strategie, Finanzen, Stärken/Schwächen), plus ein gemeinsamer Marktüberblick. Das Buch betont, dass alle Teilnehmer dieselbe Grundlage erhalten; teamprivate Zusatzinformationen gehören in `strategy_brief` und sind nur dem Team sichtbar.
+Gamebooks (`gamebook/*.md`) are part of the scenario package: a one-page profile per team (strategy, finances, strengths/weaknesses), plus a shared market overview. The book emphasizes that all participants get the same baseline; team-private additional information belongs in `strategy_brief` and is visible only to that team.
 
-Validierung (GM beim Laden): `key_questions` ≥ 1; genau ein `company`; `market_role = "player"` ⇒ genau ein Team `role = "market"`; Summen Startanteile je Segment ≤ 1; alle `injects.when`/`rules.when` parsebar; `size_meur`-Länge = `moves`.
+Validation on load: `key_questions` ≥ 1; exactly one `company`; `market_role = "player"` ⇒ exactly one team with `role = "market"`; starting shares per segment sum to ≤ 1; all `injects.when`/`rules.when` are parseable; `size_meur` length matches `moves`. See `harw-matrix-game/src/scenario.rs::validate_business` for the implemented checks.
 
 ---
 
-## 2. Analytisches Handwerk für Analyst-/Researcher-/Explorer-Agenten
+## 2. Analytical tradecraft for analyst/researcher/explorer agents
 
-### 2.1 Auswahl der Techniken
+> Status: partially implemented. The `ResearchFinding` schema extensions below are implemented in `harw-research`. The skills and agent assets that would teach agents to use them are **open** — not yet created.
 
-| Technik | Kerngedanke (eigene Worte) | Form | Warum |
+### 2.1 Choice of techniques
+
+| Technique | Core idea (our summary) | Form | Why |
 |---|---|---|---|
-| Hypothesen-Dekomposition | Hall/Citrenbaum: eine Hypothese in erwartbare Aktivitäten, Transaktionen, Verhalten zerlegen („wenn das stimmt, müsste ich X sehen") und damit die Sammlung steuern | Skill `hypothesis-decomposition` | macht Explorer-Aufträge prüfbar |
-| Analysis of Competing Hypotheses | mehrere Hypothesen gegen alle Belege matrixartig prüfen, die am wenigsten widerlegte gewinnt; Diagnostizität statt Bestätigung | Skill `analysis-ach` + Finding-Feld `hypotheses` | wirkt dem Bestätigungsfehler entgegen |
-| Key Assumptions Check | Annahmen explizit machen, wie Hypothesen testen, in Beobachtbares zerlegen (Hall: schlechte Annahmen sind oft der Single Point of Failure) | Skill `key-assumptions` + Feld `key_assumptions` | Annahmen verschwinden sonst im Fließtext |
-| Red Team / Devil's Advocate | Gegenposition aus Sicht des Gegenübers, gezielt gegen Mirror Imaging | Skill `red-team`; im Matrix Game als Coach | Hall nennt Red Teams wiederholt als Gegenmittel |
-| Indicators & Warnings | Beobachtbare Signale je Szenario/Annahme mit Schwelle und Prüffrequenz; Frühwarnung vor Überraschung | Skill `indicators-warnings` + Feld `indicators` | verbindet Wargame-AAR mit Monitoring |
-| Quellenbewertung | Zuverlässigkeit der Quelle (A–F) getrennt von Glaubwürdigkeit der Information (1–6); Unabhängigkeit prüfen | Skill `source-grading` + Felder an `SourceReference` | Herman: Collectors prüfen ihre Quellen selbst auf Unzuverlässigkeit/Täuschung |
-| Wahrscheinlichkeitssprache | Herman: Aufgabe der Analyse ist, die Spannweite der Unsicherheit möglichst genau zu vermitteln, meist über kodierte Begriffe | Feld `likelihood` (neben `confidence`) | trennt „wie wahrscheinlich" von „wie belastbar" |
+| Hypothesis decomposition | Hall/Citrenbaum: break a hypothesis into expected activities, transactions, behavior ("if this is true, I should see X") and use that to steer collection | skill `hypothesis-decomposition` (open) | makes explorer assignments checkable |
+| Analysis of Competing Hypotheses | test several hypotheses against all evidence in a matrix; the least-refuted one wins; diagnosticity over confirmation | skill `analysis-ach` (open) + finding field `hypotheses` (implemented) | counteracts confirmation bias |
+| Key Assumptions Check | make assumptions explicit, test them like hypotheses, decompose into observables (Hall: weak assumptions are often the single point of failure) | skill `key-assumptions` (open) + field `key_assumptions` (implemented) | assumptions otherwise disappear into prose |
+| Red team / devil's advocate | argue the counterparty's position, specifically against mirror imaging | skill `red-team` (open); in the matrix game, a coach role | Hall repeatedly names red teams as a countermeasure |
+| Indicators & warnings | observable signals per scenario/assumption with threshold and check frequency; early warning against surprise | skill `indicators-warnings` (open) + field `indicators` (implemented) | connects a wargame AAR to ongoing monitoring |
+| Source grading | source reliability (A–F) kept separate from information credibility (1–6); check independence | skill `source-grading` (open) + fields on `SourceReference` (implemented) | Herman: collectors must vet their own sources for unreliability/deception |
+| Likelihood language | Herman: analysis's job is to convey the range of uncertainty as precisely as possible, usually via coded terms | field `likelihood` next to `confidence` (implemented) | separates "how likely" from "how solid" |
 
-Nicht übernommen (vorerst): kulturelle/semiotische Analyse aus Hall – für Code-/Dependency-Recherche ohne Nutzen; Anomalie- und Trendanalyse gehen implizit in `indicators-warnings` auf (Basislinie + Abweichung).
+Not adopted (for now): Hall's cultural/semiotic analysis — no use for code/dependency research; anomaly and trend analysis fold implicitly into `indicators-warnings` (baseline + deviation).
 
-### 2.2 Skill-Manifeste
+### 2.2 Skill manifests (open — not yet created)
 
-Format folgt `harw-config/src/skill_toml.rs` (`name`, `enabled`, `description`, `instructions_file` – Default `instructions.md`, `tools`, `mcps`; `deny_unknown_fields`). Alle Skills sind **read-only**; sie verändern nichts, sondern strukturieren Denken und Rückgabe.
+The skills below are designed against the format in `harw-config/src/skill_toml.rs` (`name`, `enabled`, `description`, `instructions_file` — default `instructions.md`, `tools`, `mcps`; `deny_unknown_fields`). All would be **read-only**: they change nothing, only structure thinking and the returned finding. None of `harw-home/assets/skills/{analysis-ach,key-assumptions,red-team,indicators-warnings,source-grading,hypothesis-decomposition}/` exist yet; the outlines below record the intended design.
 
-#### `harw-home/assets/skills/analysis-ach/skill.toml`
+#### `analysis-ach`
 
 ```toml
 name = "analysis-ach"
-description = "Analysis of Competing Hypotheses: mehrere Erklärungen gegen alle Belege prüfen, Diagnostizität statt Bestätigung."
+description = "Analysis of Competing Hypotheses: test several explanations against all evidence, diagnosticity over confirmation."
 instructions_file = "instructions.md"
 tools = ["filesystem.read"]
 ```
 
-`instructions.md` (Gliederung):
-1. **Wann**: Frage hat ≥ 2 plausible Erklärungen (Ursache eines Fehlers, Absicht eines Wettbewerbers, Grund einer Regression).
-2. **Hypothesen bilden**: mindestens 3, sich gegenseitig ausschließend, inkl. einer „unbequemen" und einer Null-Hypothese; je `H1..Hn` mit einem Satz.
-3. **Belegliste**: jedes Beweisstück einmal, mit Quellbewertung (Verweis `source-grading`); auch Fehlen erwarteter Belege zählt.
-4. **Matrix**: je Beleg × Hypothese `consistent | inconsistent | neutral`; Belege, die überall konsistent sind, als nicht-diagnostisch markieren.
-5. **Bewertung**: Hypothesen nach Zahl gewichteter Inkonsistenzen ordnen; nie nach Zahl der Bestätigungen.
-6. **Sensitivität**: Welche 1–2 Belege entscheiden? Was, wenn sie falsch/manipuliert sind?
-7. **Rückgabe**: `hypotheses[]` mit `status` und `inconsistency_score`, Schluss nennt führende Hypothese + nächste Sammlungsaufgabe, die H1 vs. H2 am besten trennt.
-8. **Anti-Patterns**: nur eine Hypothese; Belege nach Passung auswählen; Konfidenz `high` bei zwei gleichauf liegenden Hypothesen.
+Intended structure: (1) **When**: the question has ≥ 2 plausible explanations (cause of a bug, a competitor's intent, reason for a regression). (2) **Form hypotheses**: at least 3, mutually exclusive, including one "uncomfortable" one and a null hypothesis; one sentence each, `H1..Hn`. (3) **Evidence list**: every piece of evidence once, with a source rating (see `source-grading`); the absence of expected evidence counts too. (4) **Matrix**: each evidence item × hypothesis, `consistent | inconsistent | neutral`; evidence consistent with everything is marked non-diagnostic. (5) **Scoring**: rank hypotheses by the number of weighted inconsistencies, never by the number of confirmations. (6) **Sensitivity**: which 1–2 pieces of evidence are decisive? What if they're wrong or manipulated? (7) **Return**: `hypotheses[]` with `status` and `inconsistency_score`; the conclusion names the leading hypothesis and the next collection task that best separates H1 from H2. (8) **Anti-patterns**: only one hypothesis; picking evidence that fits; `high` confidence with two neck-and-neck hypotheses.
 
-#### `harw-home/assets/skills/key-assumptions/skill.toml`
+#### `key-assumptions`
 
 ```toml
 name = "key-assumptions"
-description = "Tragende Annahmen offenlegen, begründen, als Hypothese testen und in beobachtbare Prüfsignale zerlegen."
+description = "Surface load-bearing assumptions, justify them, test them like hypotheses, and decompose them into observable checks."
 instructions_file = "instructions.md"
 tools = ["filesystem.read"]
 ```
 
-Gliederung: (1) Schlussfolgerung notieren; (2) jede unausgesprochene Voraussetzung als Satz formulieren (Trigger-Formulierungen: „natürlich", „wird sicher", „wie immer"); (3) je Annahme: *Warum glauben wir das? Unter welchen Umständen wäre sie falsch? War sie früher schon falsch?*; (4) Einstufung `supported | caveated | unsupported`; (5) Mirror-Imaging-Check nach Hall – Warnsätze wie „das würden die nie tun, weil es keinen Sinn ergibt"; (6) jede `unsupported`-Annahme bekommt ≥ 1 Indikator; (7) Rückgabe `key_assumptions[]`; Regel: eine `unsupported` Annahme auf dem kritischen Pfad deckelt `confidence` auf `medium`.
+Intended structure: (1) note the conclusion; (2) phrase every unstated precondition as a sentence (trigger words: "of course," "surely," "as always"); (3) per assumption: *why do we believe this? Under what circumstances would it be false? Has it been false before?*; (4) classify as `supported | caveated | unsupported`; (5) a mirror-imaging check per Hall — warning phrases like "they'd never do that, it makes no sense"; (6) every `unsupported` assumption gets ≥ 1 indicator; (7) return `key_assumptions[]`; rule: one `unsupported` assumption on the critical path caps `confidence` at `medium`.
 
-#### `harw-home/assets/skills/red-team/skill.toml`
+#### `red-team`
 
 ```toml
 name = "red-team"
-description = "Gegenposition aus Sicht des Gegenübers einnehmen, Mirror Imaging und Gruppendenken aufdecken, stärkste Alternative formulieren."
+description = "Take the counterparty's position, surface mirror imaging and groupthink, formulate the strongest alternative."
 instructions_file = "instructions.md"
 tools = ["filesystem.read"]
 ```
 
-Gliederung: (1) Rolle annehmen: Ziele, Zwänge, Informationsstand und Kultur des Gegenübers (Wettbewerber, Angreifer, Reviewer, Nutzer) – nicht die eigenen; (2) „Wie würde ich das eigene Vorhaben schlagen/brechen?" – drei konkrete Angriffe, legal und plausibel; (3) stärkste Gegenthese in 5 Sätzen (Devil's Advocate, auch wenn man sie nicht glaubt); (4) Prüfung auf Gruppendenken: Welche Position hat im Team niemand vertreten?; (5) Hall: Kritik ohne Vorschlag reicht nicht – je Einwand eine nicht eigennützige Gegenmaßnahme; (6) Rückgabe als `dissent[]` + `alternative_hypotheses`; (7) Einsatz: als Kind-Agent über `agent_tool` mit **engerer** Kontextdecke (sieht Schlussfolgerung und Belege, nicht die Deliberation des Autors – vermeidet Anchoring).
+Intended structure: (1) adopt the role: goals, constraints, information state, and culture of the counterparty (competitor, attacker, reviewer, user) — not one's own; (2) "how would I beat/break this plan?" — three concrete, legal, plausible attacks; (3) the strongest counter-thesis in 5 sentences (devil's advocate, even if not believed); (4) a groupthink check: which position did nobody on the team hold?; (5) Hall: criticism without a proposal isn't enough — a non-self-serving countermeasure per objection; (6) return as `dissent[]` + `alternative_hypotheses`; (7) usage: as a child agent with a **narrower** context ceiling (sees the conclusion and evidence, not the author's deliberation — avoids anchoring).
 
-#### `harw-home/assets/skills/indicators-warnings/skill.toml`
+#### `indicators-warnings`
 
 ```toml
 name = "indicators-warnings"
-description = "Szenarien und Annahmen in beobachtbare Indikatoren mit Basislinie, Schwelle, Quelle und Prüftakt übersetzen."
+description = "Translate scenarios and assumptions into observable indicators with a baseline, threshold, source, and check cadence."
 instructions_file = "instructions.md"
 tools = ["filesystem.read", "web.search", "web.fetch"]
 ```
 
-Gliederung: (1) Eingang: Szenario, Hypothese, Annahme oder AAR-Empfehlung; (2) Zerlegung nach Hall: „wenn das eintritt, sehe ich zuerst …" – Aktivitäten, Transaktionen, technische Spuren, **und** das Ausbleiben normaler Aktivitäten; (3) je Indikator: Basislinie (normal), Schwelle (Warnung), Quelle/Sammler, Prüftakt, Vorlaufzeit; (4) Diagnostizität: unterscheidet der Indikator zwischen Szenarien, oder feuert er bei allen?; (5) schwache Signale (Oriesek/Schwarz, Frühwarnkapitel): gezieltes Scanning in den Suchfeldern aus dem Wargame; (6) Rückgabe `indicators[]`; optional Anlage als Kanban-Karte mit Wiedervorlage.
+Intended structure: (1) input: a scenario, hypothesis, assumption, or AAR recommendation; (2) decompose per Hall: "if this happens, I'd first see …" — activities, transactions, technical traces, **and** the absence of normal activity; (3) per indicator: baseline (normal), threshold (warning), source/collector, check cadence, lead time; (4) diagnosticity: does the indicator distinguish between scenarios, or fire for all of them?; (5) weak signals (Oriesek/Schwarz's early-warning chapter): targeted scanning in the search fields the wargame identified; (6) return `indicators[]`; optionally filed as a follow-up card.
 
-#### `harw-home/assets/skills/source-grading/skill.toml`
+#### `source-grading`
 
 ```toml
 name = "source-grading"
-description = "Belege nach Quellzuverlässigkeit (A–F) und Informationsglaubwürdigkeit (1–6) bewerten und Abhängigkeiten zwischen Quellen erkennen."
+description = "Rate evidence by source reliability (A-F) and information credibility (1-6); spot dependencies between sources."
 instructions_file = "instructions.md"
 tools = ["filesystem.read", "web.fetch"]
 ```
 
-Gliederung: (1) Zwei Achsen strikt trennen: *Wer* sagt es (Track Record, Nähe zur Sache, Interessenlage) vs. *Was* wird gesagt (durch Unabhängiges bestätigt? plausibel? widerspruchsfrei?); (2) Zuordnung für unsere Quellklassen: `Standard`/`OfficialDocs`/`CargoRegistrySource` → typ. A–B, `ReleaseNotes`/`Repository` → B–C, `Web` → C–F; lokaler Quelltext ist Primärbeleg (A) für „was der Code tut", nicht für „was er tun soll"; (3) Zirkelbestätigung erkennen: zwei Blogposts, die dieselbe Pressemitteilung zitieren, sind *eine* Quelle (`derived_from`); (4) Täuschung/Veraltung prüfen (Datum, Version, Digest); (5) Rückgabe: je `SourceReference` `reliability`, `credibility`, `derived_from`.
+Intended structure: (1) keep two axes strictly separate: *who* says it (track record, closeness to the matter, interests) vs. *what* is said (confirmed by something independent? plausible? consistent?); (2) mapping for our source classes: `Standard`/`OfficialDocs`/`CargoRegistrySource` → typically A–B, `ReleaseNotes`/`Repository` → B–C, `Web` → C–F; local source code is a primary source (A) for "what the code does," not for "what it's supposed to do"; (3) spot circular confirmation: two blog posts citing the same press release are *one* source (`derived_from`); (4) check for deception/staleness (date, version, digest); (5) return: per `SourceReference`, `reliability`, `credibility`, `derived_from`.
 
-#### `harw-home/assets/skills/hypothesis-decomposition/skill.toml`
+#### `hypothesis-decomposition`
 
 ```toml
 name = "hypothesis-decomposition"
-description = "Hypothese oder Fragestellung in konkrete, prüfbare Beobachtungen zerlegen und daraus gebundene Sammelaufträge ableiten."
+description = "Decompose a hypothesis or question into concrete, checkable observations and derive bounded collection tasks from them."
 instructions_file = "instructions.md"
 tools = ["filesystem.read"]
 ```
 
-Gliederung: (1) Treiber benennen – Hall unterscheidet Hypothese, Erwartung, Ahnung, Rätsel; alle werden gleich zerlegt; (2) Funktionen, die erfüllt sein müssen, wenn die Hypothese stimmt; (3) je Funktion Beobachtbares (Dateien, Logzeilen, Versionen, Metriken); (4) daraus `ResearchQuestion`s mit `scope`, `expected_output`, `stop_condition` für Explorer-Kinder; (5) Rückkopplung: welche Beobachtung würde die Hypothese *widerlegen*?
+Intended structure: (1) name the driver — Hall distinguishes hypothesis, expectation, hunch, and puzzle; all decompose the same way; (2) the functions that must hold if the hypothesis is true; (3) per function, what's observable (files, log lines, versions, metrics); (4) turn those into `ResearchQuestion`s with `scope`, `expected_output`, `stop_condition` for explorer children; (5) feedback: which observation would *refute* the hypothesis?
 
-#### Agent-Zuordnung
+#### Agent assignment (open)
 
-- `harw-home/assets/agents/source-researcher/agent.toml`: `skills = ["dependency-research", "source-grading"]`.
-- Neuer Worker `all-source-analyst` (§3.1): `skills = ["analysis-ach", "key-assumptions", "source-grading", "indicators-warnings"]`.
-- Neuer Worker `red-teamer`: `skills = ["red-team", "key-assumptions"]`, kleines Kontextbudget.
-- Matrix-Spieler (`matrix-player`): `skills = ["red-team"]` im Business-Modus (Coach-Funktion), Market-Spieler: keine.
+Intended: `harw-home/assets/agents/source-researcher/agent.toml` gains `skills = ["dependency-research", "source-grading"]`; a new worker `all-source-analyst` gets `skills = ["analysis-ach", "key-assumptions", "source-grading", "indicators-warnings"]`; a new worker `red-teamer` gets `skills = ["red-team", "key-assumptions"]` with a small context budget; the matrix player agent (`matrix-player`) gets `skills = ["red-team"]` in business mode (coach function), the market player gets none. None of these agent assets exist yet.
 
-### 2.3 Änderungen am Recherche-Schema (`harw-research`)
+### 2.3 Changes to the research schema (`harw-research`)
 
-Alle Felder additiv mit `#[serde(default)]` → alte Findings bleiben gültig.
+> Status: implemented. All fields are additive via `#[serde(default)]`, so older findings still deserialize.
 
 ```rust
 // harw-research/src/types.rs
 
-/// Zuverlässigkeit der Quelle (Admiralty/NATO-Achse 1).
+/// Source reliability (Admiralty/NATO axis 1).
 #[serde(rename_all = "snake_case")]
-pub enum SourceReliability { A, B, C, D, E, F }   // F = nicht beurteilbar
+pub enum SourceReliability { A, B, C, D, E, F }   // F = cannot be judged
 
-/// Glaubwürdigkeit der Information (Achse 2).
+/// Credibility of the information (axis 2).
 pub enum InfoCredibility { Confirmed, ProbablyTrue, PossiblyTrue, Doubtful, Improbable, CannotJudge }
 
 pub struct SourceReference {
-    // … bestehende Felder …
+    // … existing fields …
     #[serde(default)] pub reliability: Option<SourceReliability>,
     #[serde(default)] pub credibility: Option<InfoCredibility>,
-    /// Locator einer anderen Quelle, von der diese abhängt (Zirkelbestätigung).
+    /// Locator of another source this one depends on (circular confirmation).
     #[serde(default)] pub derived_from: Option<String>,
 }
 
-/// Geschätzte Wahrscheinlichkeit der Aussage – getrennt von `Confidence`
-/// (Belastbarkeit der Analyse).
+/// Estimated likelihood of the statement — kept separate from `Confidence`
+/// (how solid the analysis is).
 pub enum Likelihood { AlmostCertain, VeryLikely, Likely, RoughlyEven, Unlikely, VeryUnlikely, Remote }
 
 pub enum HypothesisStatus { Leading, Viable, Weakened, Refuted }
@@ -462,7 +419,7 @@ pub struct HypothesisAssessment {
     pub id: String,                  // "H1"
     pub statement: String,
     pub status: HypothesisStatus,
-    #[serde(default)] pub consistent_evidence: Vec<usize>,    // Indizes in `evidence`
+    #[serde(default)] pub consistent_evidence: Vec<usize>,    // indices into `evidence`
     #[serde(default)] pub inconsistent_evidence: Vec<usize>,
     #[serde(default)] pub inconsistency_score: f32,
 }
@@ -479,164 +436,169 @@ pub struct KeyAssumption {
 pub struct Indicator {
     pub id: String,                  // "I1"
     pub observable: String,
-    pub supports: Vec<String>,       // Hypothesen-/Annahmen-IDs
+    pub supports: Vec<String>,       // hypothesis/assumption IDs
     #[serde(default)] pub baseline: String,
     #[serde(default)] pub threshold: String,
     #[serde(default)] pub check_every: Option<String>,   // "7d", "per-release"
 }
 
 pub struct ResearchFinding {
-    // … bestehende Felder …
+    // … existing fields …
     #[serde(default)] pub likelihood: Option<Likelihood>,
     #[serde(default)] pub confidence_rationale: String,
     #[serde(default)] pub hypotheses: Vec<HypothesisAssessment>,
     #[serde(default)] pub key_assumptions: Vec<KeyAssumption>,
     #[serde(default)] pub indicators: Vec<Indicator>,
-    /// Abweichende Einschätzungen (Red Team, zweiter Analyst).
+    /// Dissenting assessments (red team, a second analyst).
     #[serde(default)] pub dissent: Vec<String>,
 }
 ```
 
-Neue Regeln in `harw-research/src/validate.rs::validate_finding` (zusätzlich zur bestehenden Beleg-Pflicht ab `Medium`):
+Validation rules in `harw-research/src/validate.rs::validate_finding` (in addition to the existing evidence requirement from `Medium` up):
 
-1. `hypotheses` nicht leer ⇒ mindestens 2 Einträge und genau eine `Leading`; Evidenz-Indizes müssen in `evidence` liegen.
-2. `confidence >= High` ⇒ mindestens eine Quelle mit `reliability ∈ {A, B}` **oder** zwei Quellen, die nicht per `derived_from` voneinander abhängen.
-3. Eine `KeyAssumption { status: Unsupported, on_critical_path: true }` ⇒ `confidence <= Medium`.
-4. `confidence == Verified` ⇒ mindestens eine Quelle mit `credibility == Confirmed`.
-5. `confidence >= Medium` ⇒ `confidence_rationale` nicht leer (Warnung statt Fehler in der ersten Stufe, per Feature-Flag scharf schalten).
+1. `hypotheses` non-empty ⇒ at least 2 entries and exactly one `Leading`; evidence indices must exist in `evidence`.
+2. `confidence >= High` ⇒ at least one source with `reliability ∈ {A, B}` **or** two sources that are not related via `derived_from`.
+3. A `KeyAssumption { status: Unsupported, on_critical_path: true }` ⇒ `confidence <= Medium`.
+4. `confidence == Verified` ⇒ at least one source with `credibility == Confirmed`.
+5. `confidence >= Medium` ⇒ `confidence_rationale` non-empty.
 
-`FindingBundle` erhält `#[serde(default)] pub requirements_trace: Vec<(QuestionId, Vec<usize>)>` – welche Findings welche Frage beantworten; `coverage_gaps` bleibt. Der JSON-Schema-Export (`harw-research/src/schema.rs`) muss die neuen Felder aufnehmen, damit Kind-Agenten sie im Prompt sehen.
+`FindingBundle` carries `#[serde(default)] pub requirements_trace: Vec<(QuestionId, Vec<usize>)>` — which findings answer which question; `coverage_gaps` remains. The JSON schema export includes the new fields so child agents see them in their prompts.
 
 ---
 
-## 3. Intelligence-Zyklus im Harness
+## 3. The intelligence cycle in the harness
 
-### 3.1 Abbildung der Phasen
+> Status: conceptual mapping onto existing mechanisms; no dedicated new agent assets. Open items are called out per subsection.
 
-Herman beschreibt den Prozess als Kette aus Sammlung mit Single-Source-Berichten, All-Source-Analyse zu „fertiger" Intelligence und Verteilung an Nutzer; das Volumen schrumpft dabei stark und der Wert je Einheit steigt (sein Bild: Veredelung von Rohöl). Er warnt zugleich, dass der saubere Zyklus eine Idealisierung ist – in der Praxis schieben Produzenten Ergebnisse aktiv an Nutzer, die eher reagieren als bestellen, und Erstverarbeitung steuert die Sammlung direkt nach.
+### 3.1 Mapping the phases
 
-| Phase | Harwness-Rolle | Artefakt | Bestehender Code |
+Herman describes the process as a chain from collection (single-source reports) to all-source analysis that produces "finished" intelligence, then distribution to users; volume shrinks sharply along the way while the value per unit rises (his image: refining crude oil). He also warns that the clean cycle is an idealization — in practice, producers actively push results to users who tend to react rather than order, and first-pass processing directly steers what gets collected next.
+
+| Phase | Harwness role | Artifact | Existing code |
 |---|---|---|---|
-| Tasking / Requirements | Root-/Kind-Orchestrator | `ResearchQuestion` (Frage, Scope, Stop-Bedingung); Schlüsselfragen = `key_questions` im Wargame | `harw-research/src/types.rs`, `harw-plan` |
-| Collection | Explorer-/Source-Researcher-Worker | Rohbelege: `SourceReference` mit Digest | `harw-explorer`, `harw-tool-web`, `harw-tool-fs`, `harw-lens` |
-| Processing | derselbe Worker (Herman: Verarbeitung gehört nah an die Sammlung) | normalisiertes `ResearchFinding`, Quellbewertung | `validate.rs::parse_and_validate` |
-| Analysis (All-Source) | `all-source-analyst` oder Orchestrator | fusioniertes Finding mit ACH, Annahmen, Indikatoren | neu: Agent-Asset + Skills |
-| Dissemination | Rückgabe an Parent, TUI, Knowledge | `ReturnEnvelope`, AAR, Knowledge-Artefakt | `return_envelope.rs`, `harw-knowledge` |
-| Feedback / Re-Tasking | Orchestrator | neue `ResearchQuestion`s aus `unresolved_questions`, `coverage_gaps`, Indikatoren | `FindingBundle.coverage_gaps` |
+| Tasking / requirements | root/child orchestrator | `ResearchQuestion` (question, scope, stop condition); a wargame's key questions = `key_questions` | `harw-research/src/types.rs`, `harw-plan` |
+| Collection | explorer/source-researcher worker | raw evidence: `SourceReference` with a digest | `harw-explorer`, `harw-tool-web`, `harw-tool-fs`, `harw-lens` |
+| Processing | the same worker (Herman: processing belongs close to collection) | normalized `ResearchFinding`, source rating | `validate.rs::parse_and_validate` |
+| Analysis (all-source) | an `all-source-analyst` or the orchestrator | a fused finding with ACH, assumptions, indicators | open: no dedicated agent asset yet |
+| Dissemination | return to the parent, TUI, knowledge base | `ReturnEnvelope`, AAR, knowledge artifact | `return_envelope.rs`, `harw-knowledge` |
+| Feedback / re-tasking | orchestrator | new `ResearchQuestion`s from `unresolved_questions`, `coverage_gaps`, indicators | `FindingBundle.coverage_gaps` |
 
-Konsequenzen:
+Consequences:
 
-- **Trennung Single-Source/All-Source**: Worker ziehen Schlüsse nur über ihre eigene Quelle („in `Cargo.lock` steht X"), die übergreifende Bewertung macht der Analyst. Prompt-Regel im Worker-`system.md`: *keine Gesamturteile jenseits des eigenen Scopes*; Schema-Regel: Worker-Findings ohne `hypotheses`, Analyst-Findings mit.
-- **Trichter statt Durchreichen**: Kinder geben kompakte Findings zurück, keine Rohdaten; Rohdaten bleiben per `FragmentReference` (Digest) abrufbar. Das ist zugleich Token-Ökonomie (`docs/design/token-efficiency.md`).
-- **Push-Modell ernst nehmen**: Worker dürfen `suggested_next_actions` und unerwartete Nebenbefunde melden (eigenes Feld `serendipity: Vec<String>` im `ReturnEnvelope`, optional), statt nur die bestellte Frage zu beantworten.
-- **Sammlungssteuerung durch Verarbeitung**: `hypothesis-decomposition` erzeugt Folgefragen direkt; der Orchestrator entscheidet nur über Budget/Admission.
+- **Separating single-source from all-source**: workers should draw conclusions only about their own source ("`Cargo.lock` says X"); the cross-source judgment is the analyst's job. This is a prompting convention today, not yet a schema-enforced one.
+- **A funnel, not a pass-through**: children return compact findings, not raw data; raw data stays retrievable via a `FragmentReference` (digest). This is also token economy (`docs/design/token-efficiency.md`).
+- **Taking the push model seriously**: workers may report `suggested_next_actions` and unexpected side findings (an optional `serendipity: Vec<String>` field on `ReturnEnvelope`) instead of only answering the assigned question. — Open: `serendipity` is not implemented on `ReturnEnvelope` yet.
+- **Processing steers collection**: `hypothesis-decomposition` would generate follow-up questions directly; the orchestrator only decides budget/admission. — Depends on the not-yet-built skill.
 
-### 3.2 Need-to-know als Prinzip
+### 3.2 Need-to-know as a principle
 
-Herman definiert Need-to-know sinngemäß so, dass Information nur an diejenigen geht, die sie zwingend brauchen – nicht an alle, denen sie nützlich sein könnte. Er warnt aber auch vor überzogener Geheimhaltung, die Nutzung behindert und zum Revierverhalten wird. Beides übernehmen wir:
+Herman defines need-to-know, in essence, as giving information only to those who must have it — not to everyone it might be useful to. He also warns against excessive secrecy, which hampers use and turns into turf behavior. We take both lessons:
 
-**Kind-Agenten-Kontext** (existiert bereits im Kern, hier als Leitlinie):
-- `ContextCeiling::intersect` kann nur verengen (`harw-context/src/ceiling.rs`) – Need-to-know ist damit strukturell erzwungen.
-- Neu als Konvention: Jeder Delegationsauftrag trägt einen `need_to_know`-Abschnitt: welche Sektionen das Kind *braucht*; Default ist Frage + Scope + minimal nötige Fragmente, nicht die Elternhistorie.
-- Gegen Überkompartimentierung: **Tearline-Zusammenfassungen** – der Parent darf einem Kind statt des vollen Fragments eine bereinigte Kurzfassung + `FragmentReference` geben; das Kind kann den Volltext nur über eine auditierte Anfrage nachladen, sofern die Decke es erlaubt.
-- Red-Team-Kinder bekommen bewusst *weniger* (keine Deliberation des Autors), damit sie unabhängig urteilen.
+**Child-agent context** (already exists in the core; stated here as a guideline):
+- `ContextCeiling::intersect` can only narrow (`harw-context/src/ceiling.rs`) — need-to-know is thus structurally enforced.
+- Convention (not yet a hard schema requirement): every delegation should carry a `need_to_know` note — which sections the child actually needs; the default is the question, its scope, and the minimum necessary fragments, not the parent's full history.
+- Against over-compartmentalization: **tearline summaries** — a parent may hand a child a redacted short version plus a `FragmentReference` instead of the full fragment; the child can only pull the full text via an audited request, if the ceiling allows it. — Open: tearline summaries as a distinct mechanism are not implemented.
+- Red-team children deliberately get *less* context (not the author's deliberation), so they can judge independently.
 
-### 3.3 Compartmentation im Matrix Game
+### 3.3 Compartmentation in the matrix game
 
-| Informationsklasse | Sichtbar für | Mechanismus |
+| Information class | Visible to | Mechanism |
 |---|---|---|
-| Gemeinsames Gamebook, `public_situation`, Plenum, offengelegte Ereignisse | alle | öffentlicher Kanal |
-| `strategy_brief`, `team_report`, eigene Vorlage | eigenes Team | Team-Scope |
-| Paarkanal A↔B | A, B, GM (Mitleser) | privater Kanal mit `observer = gamemaster` |
-| Modellinterna, Seed, Inject-Katalog, Adjudikator-Begründungen | nur GM | GM-Scope; nach Endex optional im AAR |
-| Marktbewertungen (Rohwerte) | Markt, GM | aggregiert als Anteile öffentlich |
+| Shared gamebook, `public_situation`, plenary, disclosed events | everyone | public channel |
+| `strategy_brief`, `team_report`, own template | own team | team scope |
+| Pair channel A↔B | A, B, the GameMaster (reading along) | private channel, `observer = gamemaster` |
+| Model internals, seed, inject catalog, adjudicator rationale | GameMaster only | GameMaster scope; optionally in the AAR after the game ends |
+| Market ratings (raw values) | market team, GameMaster | aggregated to public shares |
 
-Regeln:
-1. **Kein Informationsabfluss durch Zusammenfassung**: Wenn der GM für Team C einen Lagebericht erzeugt, bekommt der erzeugende LLM-Aufruf nur Eingaben, die C sehen darf (Kontextdecke je Empfänger, gleiche Mechanik wie §3.2). Das ist die wichtigste technische Invariante; Test: Kanarienwort in Kanal A↔B darf in keinem Bericht an C auftauchen.
-2. **Quellenschutz-Regel** (in Anlehnung an die von Herman geschilderte Praxis, auf geschützte Quellen nur mit anderweitiger Deckung zu handeln): Ein Team darf im öffentlichen Pitch keine Information zitieren, die es nur aus einem privaten Kanal kennt, ohne die Quelle preiszugeben; der GM markiert Verstöße im AAR (nicht blockierend).
-3. **Täuschung ist erlaubt** in Paarkanälen (Wettbewerber dürfen bluffen); der GM protokolliert, bewertet aber nicht moralisch. Das Marktteam ist davon ausgenommen (bewertet ehrlich).
+Rules:
+1. **No information leakage through summarization**: when the GameMaster generates a situation report for team C, the underlying LLM call receives only inputs C is allowed to see (a context ceiling per recipient, the same mechanism as §3.2). This is the most important technical invariant; a canary-word test checks that a word planted in channel A↔B never appears in any report to C. This follows directly from the projection mechanism in `matrix-game.md` §2.
+2. **Source-protection rule** (following the practice Herman describes, of acting on protected sources only with independent cover): a team may not cite in a public pitch information it only knows from a private channel without giving up the source; the GameMaster flags violations in the AAR (non-blocking). — Open: not implemented as an automated check yet; today this is a norm stated in the player prompt, not enforced by code.
+3. **Deception is allowed** in pair channels (competitors may bluff); the GameMaster records it but does not moralize. The market team is exempt (it rates honestly).
 
 ---
 
-## 4. Visualisierung nach Zelazny – TUI und Berichte
+## 4. Visualization per Zelazny — TUI and reports
 
-### 4.1 Grundsätze
+> Status: open. None of `harw-tui/src/charts.rs`, the message-title heuristic, or a dedicated matrix-game "situation" tab exist yet. This section records the intended design for future work.
 
-Zelaznys Kette: erst die **Botschaft** bestimmen, daraus die **Vergleichsart**, daraus die **Diagrammform**. Der Titel einer Grafik ist die Botschaft, nicht das Thema („Explorer-2 verbraucht zwei Drittel der Tokens" statt „Token-Verbrauch nach Agent"). Er unterscheidet fünf Vergleiche: Anteil am Ganzen (Komponente), Rangfolge (Item), Veränderung über Zeit (Zeitreihe), Verteilung über Größenklassen (Häufigkeit), Zusammenhang zweier Variablen (Korrelation). Kreisdiagramme hält er für überbewertet, Balken für unterschätzt.
+### 4.1 Principles
 
-Übertragen auf ratatui 0.29 (`harw-tui/Cargo.toml`):
+Zelazny's chain: first settle the **message**, then the **comparison type**, then the **chart form**. A chart's title is the message, not the topic ("explorer-2 uses two-thirds of the tokens," not "token usage by agent"). He distinguishes five comparisons: share of a whole (component), ranking (item), change over time (time series), distribution across size classes (frequency), and the relationship between two variables (correlation). He rates pie charts as overrated and bar charts as underrated.
 
-| Vergleich | Signalwörter in der Botschaft | Zelazny-Form | ratatui |
+Mapped onto ratatui (`harw-tui/Cargo.toml`):
+
+| Comparison | Signal words in the message | Zelazny form | ratatui |
 |---|---|---|---|
-| Komponente | Anteil, % von, entfällt auf | Kreis / 100-%-Balken | gestapelter 100-%-Balken als eine Zeile farbiger `Span`s; oder `Gauge`/`LineGauge` je Teil |
-| Item | größer, kleiner, Rang, gleichauf | horizontale Balken | `BarChart` mit `.direction(Direction::Horizontal)`, absteigend sortiert |
-| Zeitreihe | steigt, fällt, schwankt, seit | Säulen / Linie | `Sparkline` (kompakt), `Chart` + `Dataset` `GraphType::Line` |
-| Häufigkeit | Bereich, Konzentration, Verteilung | Säulen-Histogramm | `BarChart` vertikal, Buckets als Labels |
-| Korrelation | hängt ab von, steigt mit | Punktdiagramm | `Chart` mit `GraphType::Scatter`, `Marker::Braille` |
-| exakte Werte | – | Tabelle | `Table` (Zahlen rechtsbündig, Botschaft im Block-Titel) |
+| Component | share, % of, accounts for | pie / 100% bar | a stacked 100% bar as one line of colored `Span`s; or a `Gauge`/`LineGauge` per part |
+| Item | larger, smaller, rank, tied | horizontal bars | `BarChart` with `.direction(Direction::Horizontal)`, sorted descending |
+| Time series | rises, falls, fluctuates, since | columns / line | `Sparkline` (compact), `Chart` + `Dataset` with `GraphType::Line` |
+| Frequency | range, concentration, distribution | column histogram | `BarChart` vertical, buckets as labels |
+| Correlation | depends on, rises with | scatter | `Chart` with `GraphType::Scatter`, `Marker::Braille` |
+| exact values | – | table | `Table` (numbers right-aligned, message in the block title) |
 
-### 4.2 Konkrete Anwendungen
+### 4.2 Intended applications
 
-**Token-Verbrauch** (`AgentMonitor::totals`, `harw_types::TokenUsage`)
-- Komponente: „Explorer-Kinder verbrauchen 58 % der Eingabetokens" – eine 100-%-Zeile pro Lauf (Root / Kinder / UIA-Worker), Cache-Anteil als eigene Komponente („41 % aus Cache").
-- Item: „source-researcher ist der teuerste Agent" – horizontaler `BarChart`, Top-8.
-- Zeitreihe: `Sparkline` Tokens/Minute je Agent im Agentenpanel (eine Zeile Höhe).
-- Gauge: Kontextbelegung gegen `ContextBudgetSpec` – `Gauge` mit Titel „Kontext 82 % – Compaction bald fällig".
+**Token usage** (`AgentMonitor::totals`, `harw_types::TokenUsage`)
+- Component: "explorer children use 58% of input tokens" — one 100% line per run (root / children / UIA workers), cache share as its own component ("41% from cache").
+- Item: "source-researcher is the most expensive agent" — a horizontal `BarChart`, top 8.
+- Time series: a `Sparkline` of tokens/minute per agent in the agent panel (one line tall).
+- Gauge: context usage against `ContextBudgetSpec` — a `Gauge` titled "context 82% — compaction due soon."
 
-**Agentenaktivität**
-- Häufigkeit: „Die meisten Tool-Aufrufe dauern unter 2 s, fünf über 30 s" – Histogramm der Tool-Latenzen.
-- Item: Tool-Aufrufe je Werkzeug, horizontal.
-- Korrelation: „Längere Kontexte gehen nicht mit mehr Retries einher" – Scatter Kontextgröße × Retries je Turn (nur im Report/Detailansicht, nicht im Live-Panel).
+**Agent activity**
+- Frequency: "most tool calls finish under 2s, five take over 30s" — a histogram of tool latencies.
+- Item: tool calls per tool, horizontal.
+- Correlation: "longer contexts don't correlate with more retries" — a scatter of context size × retries per turn (report/detail view only, not the live panel).
 
-**Matrix Game – Weltzustand** (neues Panel, Tab `Lage`)
-- Komponente: Marktanteil je Segment im aktuellen Zug (100-%-Zeile je Segment, Teamfarben).
-- Zeitreihe: Anteil/EBIT je Team über Züge – `Chart` Line, x = Zug-Labels.
-- Item: Rangfolge Cash nach Zug.
-- `Table`: KPI-Matrix Team × KPI mit Δ zum Vorzug; Titel automatisch: größte Veränderung.
-- Liste (kein Diagramm): Ereignis-Zeitleiste (Injects, Offenlegungen) mit Zug/Phase.
-- Sichtbarkeit: Die TUI zeigt für einen Spieler-Blick nur dessen Scope (gleiche Compartment-Regeln wie §3.3); der Spielleiter-Blick zeigt alles.
+**Matrix-game world state** (a new "situation" tab)
+- Component: market share per segment for the current move (a 100% line per segment, team colors).
+- Time series: share/EBIT per team across moves — a `Chart` line, x = move labels.
+- Item: cash ranking by move.
+- `Table`: a team × KPI matrix with delta from the previous move; auto title: the biggest change.
+- List (not a chart): an event timeline (injects, disclosures) by move/phase.
+- Visibility: a player view shows only that player's scope (the same compartment rules as §3.3); the game-master view shows everything.
 
-**AAR-Berichte** (Markdown, `harw-tui/src/export.rs` bzw. AAR-Renderer)
-- Jede Sektion beginnt mit einer Botschaftsüberschrift; pro Botschaft höchstens ein Diagramm.
-- Markdown-Diagramme als Unicode-Balken (`█▉▊▋▌▍▎▏`) + Tabelle mit Zahlen; kein Kreis.
-- Prognosefehler (erwartete vs. tatsächliche KPIs) als paarweise Balken je Team (Zelazny nutzt gepaarte Balken auch für Zusammenhänge mit wenigen Punkten).
+**AAR reports** (markdown, an AAR renderer)
+- Every section starts with a message heading; at most one chart per message.
+- Markdown charts as Unicode bars (`█▉▊▋▌▍▎▏`) plus a number table; no pies.
+- Forecast error (expected vs. actual KPIs) as paired bars per team.
 
-### 4.3 Botschaftstitel automatisch erzeugen
+### 4.3 Deriving message titles automatically
 
-Neues Modul `harw-tui/src/charts.rs` (rein, testbar):
+A future, pure and testable module `harw-tui/src/charts.rs`:
 
 ```rust
 pub enum Comparison { Component, Item, TimeSeries, Frequency, Correlation }
 
-/// Leitet aus Daten eine Botschaft ab; Fallback ist der Thementitel.
+/// Derives a message from data; falls back to the topic title.
 pub fn message_title(kind: Comparison, series: &LabeledSeries, topic: &str) -> String;
-// Component: größter Anteil ≥ 40 % → "{label} macht {pct} % aus"
-// Item: Abstand Platz1/Platz2 ≥ 1.5× → "{label} führt deutlich"; sonst "… etwa gleichauf"
-// TimeSeries: Steigung/Varianz → "steigt seit …" | "fällt" | "schwankt"
-// Frequency: Modus-Bucket → "Meiste Werte zwischen {a} und {b}"
-// Correlation: |r| < 0.2 → "Kein Zusammenhang zwischen …"; sonst Richtung
+// Component: largest share ≥ 40% → "{label} accounts for {pct}%"
+// Item: gap between rank 1 and rank 2 ≥ 1.5x → "{label} leads clearly"; else "… roughly tied"
+// TimeSeries: slope/variance → "rising since …" | "falling" | "fluctuating"
+// Frequency: modal bucket → "most values between {a} and {b}"
+// Correlation: |r| < 0.2 → "no relationship between …"; else direction
 ```
 
-Dieselbe Funktion nutzen AAR-Renderer und TUI, damit Report und Bildschirm dieselbe Aussage treffen.
+The same function would be used by both the AAR renderer and the TUI, so the report and the screen make the same claim.
 
 ---
 
-## 5. Priorisierte Umsetzungsliste
+## 5. Status by area
 
-| Prio | Arbeitspaket | Dateien / Crates | Abnahme |
-|---|---|---|---|
-| P0 | Recherche-Schema additiv erweitern (Quellbewertung, Likelihood, Hypothesen, Annahmen, Indikatoren, Dissent) | `harw-research/src/types.rs`, `schema.rs`, `validate.rs` | Alt-Findings deserialisieren unverändert; Regeln 1–4 aus §2.3 mit Tests |
-| P0 | Sechs Skills anlegen | `harw-home/assets/skills/{analysis-ach,key-assumptions,red-team,indicators-warnings,source-grading,hypothesis-decomposition}/{skill.toml,instructions.md}` | `harw-config` Discovery lädt sie (`discovery.rs`), `deny_unknown_fields` grün |
-| P0 | Szenario-Schema `mode = "business"` + Validierung | Matrix-Crate laut `matrix-game.md` (Szenario-Parser), Beispiel `cloud-sme-2027` als Fixture | Beispiel aus §1.9 lädt; Negativtests für jede Validierungsregel |
-| P1 | GM-Business-Phasen, Entscheidungsvorlage `submit_move`, Regelprüfung, Logit-Marktmodell, gebundene Overrides | Matrix-Crate (`gamemaster`, `business/market_model.rs`, `business/rules.rs`) | deterministischer Replay bei gleichem Seed; Override außerhalb Bounds wird abgelehnt |
-| P1 | Compartment-Invariante: Berichte je Empfänger nur aus dessen Scope, GM als Mitleser, Offenlegungsregeln | Matrix-Crate + `harw-context` (Decke je Empfänger) | Kanarienwort-Test (§3.3 Regel 1) |
-| P1 | Agent-Assets `all-source-analyst`, `red-teamer`; `source-researcher` um `source-grading` ergänzen; Worker-Prompt „kein Urteil jenseits des Scopes" | `harw-home/assets/agents/*` | Assets laden; Delegationsmatrix erlaubt Orchestrator → neue Worker |
-| P1 | AAR `harwness.matrix-aar/v1`: Kanalanalyse, Prognosefehler, Bias-Checkliste, `CounterApproach`, Indikator-Export | Matrix-Crate (`aar.rs`), Ablage über `harw-knowledge` | AAR beantwortet jede `key_question` mit Beleg-IDs |
-| P2 | `charts.rs` mit `Comparison` + `message_title`; Token-Komponentenzeile, Sparklines, Kontext-Gauge im Agentenpanel | `harw-tui/src/charts.rs`, `agent_monitor.rs` | Snapshot-Tests der Render-Ausgabe; Titel-Heuristik-Unit-Tests |
-| P2 | TUI-Tab „Lage" für Matrix Game (KPI-Table, Anteilszeilen, Zeitreihe, Ereignisliste) mit Scope-Filter | `harw-tui/src/` (neues Panel), `panes.rs` | Spieler-Blick zeigt keine fremden Kanäle |
-| P2 | Tearline-Zusammenfassungen + `need_to_know`-Abschnitt im Delegationsauftrag | `harw-core/src/child_controller.rs`, `harw-context/src/reference.rs` | Kind erhält Referenz statt Volltext; Nachladen auditiert |
-| P3 | Variante `attack_counter` mit Botschafter-Briefs | Matrix-Crate | Drei-Runden-Ablauf spielbar |
-| P3 | Indikatoren als Wiedervorlage (Frühwarnung) | `harw-knowledge` (kanban), Skill `indicators-warnings` | Indikator aus AAR erscheint als Karte mit Prüftakt |
-| P3 | `ReturnEnvelope.serendipity` (Push-Befunde) | `harw-research/src/return_envelope.rs` | optionales Feld, abwärtskompatibel |
+| Area | Status | Notes |
+|---|---|---|
+| Business-mode scenario schema, phases, rules, market model | Implemented | `harw-matrix-game/src/scenario.rs`, `business.rs`, `phases.rs` |
+| `report.md` / LaTeX handoff for business-mode runs | Implemented | `harw-ops/src/matrix/report.rs`, `uia-latex-writer` template `business-paper` |
+| Bounded adjudicator overrides as a distinct journaled event | Open | today handled through the general effect-validation/facilitator-note path |
+| Declarative `[[business.disclosure]]` rules | Open | disclosure today follows plain public/private mechanics |
+| Structured channel-pattern analysis, bias checklist, `CounterApproach` taxonomy in the AAR | Open | narrative AAR text can cover this qualitatively today |
+| `ResearchFinding` schema extensions (hypotheses, assumptions, indicators, source grading, likelihood) | Implemented | `harw-research/src/types.rs`, `schema.rs`, `validate.rs` |
+| Six analytical skills (`analysis-ach`, `key-assumptions`, `red-team`, `indicators-warnings`, `source-grading`, `hypothesis-decomposition`) | Open | not created under `harw-home/assets/skills/` |
+| `all-source-analyst` / `red-teamer` agent assets; `source-researcher` gaining `source-grading` | Open | not created under `harw-home/assets/agents/` |
+| Compartmentation invariant (per-recipient context ceiling, canary-word non-leak test) | Implemented (mechanism) / Open (dedicated test) | follows from `matrix-game.md` §2's projection guarantee; a dedicated canary-word regression test for business mode is not confirmed |
+| Tearline summaries, `need_to_know` section on delegation | Open | `ContextCeiling::intersect` exists; the tearline convention does not |
+| `ReturnEnvelope.serendipity` | Open | not implemented |
+| `harw-tui/src/charts.rs`, `message_title`, matrix-game "situation" tab | Open | not implemented |
+| `attack_counter` variant with ambassador briefs | Open (scenario-level only) | the variant field is data; the ambassador-brief mechanic is not confirmed implemented |
+| Indicators as knowledge-base follow-ups | Open | depends on `indicators-warnings` |
 
-Offene Punkte: Name und Struktur der Matrix-Crate sowie die exakten Kern-Felder (`[[teams]]`, `[channels]`, `[[injects]]`) sind mit `matrix-game.md` abzugleichen; ob der LLM-Adjudikator standardmäßig aktiv ist, entscheidet das Kostenbudget je Spiel.
+Crate and field names for the matrix-game core (`[[teams]]`, `[channels]`, `[[injects]]`, etc.) are governed by `matrix-game.md`; this document's business-mode extensions build on top of it without redefining them.

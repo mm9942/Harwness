@@ -1525,6 +1525,130 @@ mod tests {
         Ok(())
     }
 
+    // ── Live-Modellwechsel: Provider-Client der laufenden Montage ─────────────
+
+    /// Test-Dienst: meldet `ensure_provider_ready` für `failing` als
+    /// Fehlschlag und merkt sich jeden geprüften Provider.
+    struct RecordingLiveControl {
+        failing: Option<&'static str>,
+        checked: std::sync::Mutex<Vec<String>>,
+    }
+
+    impl crate::live_model::LiveModelControl for RecordingLiveControl {
+        fn ensure_provider_ready(&self, provider: &str) -> Result<(), String> {
+            if let Ok(mut checked) = self.checked.lock() {
+                checked.push(provider.to_owned());
+            }
+            match self.failing {
+                Some(failing) if failing == provider => {
+                    Err("credential could not be resolved".to_owned())
+                }
+                _ => Ok(()),
+            }
+        }
+
+        fn set_internal_model(
+            &self,
+            _point: harw_config::InternalModelPoint,
+            _choice: Option<harw_config::InternalModelChoice>,
+        ) -> bool {
+            false
+        }
+    }
+
+    /// Kontext mit Controller, Config und Live-Dienst.
+    fn ctx_with_live(
+        ctrl: SharedSessionController,
+        config: harw_config::ResolvedConfig,
+        live: Arc<RecordingLiveControl>,
+    ) -> TestResult<(OpContext, std::path::PathBuf)> {
+        let (base, tmp) = make_test_ctx(None, None)?;
+        let mut services = ServiceMap::new();
+        services.insert(ctrl);
+        services.insert(Arc::new(config));
+        services.insert(live as crate::live_model::SharedLiveModelControl);
+        let ctx = OpContext::new(
+            SessionId::new(),
+            TurnId::new(),
+            base.sandbox().clone(),
+            services,
+        );
+        Ok((ctx, tmp))
+    }
+
+    /// Live-Modellwechsel: `/model switch` auf ein Modell eines anderen
+    /// Providers lässt die laufende Montage dessen Client bauen, bevor der
+    /// Controller wechselt; der nächste Turn nutzt dann Provider und Modell.
+    #[test]
+    fn model_switch_makes_the_target_provider_ready_before_switching() -> TestResult {
+        let ctrl = Arc::new(NullSessionController::new());
+        let live = Arc::new(RecordingLiveControl {
+            failing: None,
+            checked: std::sync::Mutex::new(Vec::new()),
+        });
+        let shared: SharedSessionController = Arc::clone(&ctrl) as SharedSessionController;
+        let (ctx, _tmp) = ctx_with_live(shared, two_provider_config(), Arc::clone(&live))?;
+
+        super::handle_switch_core(&ctx, "model-b".to_owned(), |_, _| None)
+            .map_err(ctx_err("switch must succeed"))?;
+        assert_eq!(
+            live.checked.lock().map(|checked| checked.clone()).ok(),
+            Some(vec!["provider-b".to_owned()])
+        );
+        let snap = ctrl.snapshot();
+        assert_eq!(snap.active_provider.as_deref(), Some("provider-b"));
+        assert_eq!(snap.active_model.as_deref(), Some("model-b"));
+        Ok(())
+    }
+
+    /// Kann der Client des Ziel-Providers nicht gebaut werden, lehnt der
+    /// Wechsel mit klarer Meldung ab und das alte Modell bleibt aktiv.
+    #[test]
+    fn model_switch_keeps_the_old_model_when_the_provider_client_cannot_be_built() -> TestResult {
+        let ctrl = Arc::new(NullSessionController::new());
+        ctrl.set_active_provider("provider-a".to_owned())
+            .map_err(ctx("seed active provider"))?;
+        ctrl.set_active_model("model-a".to_owned())
+            .map_err(ctx("seed active model"))?;
+        let live = Arc::new(RecordingLiveControl {
+            failing: Some("provider-b"),
+            checked: std::sync::Mutex::new(Vec::new()),
+        });
+        let shared: SharedSessionController = Arc::clone(&ctrl) as SharedSessionController;
+        let (ctx, _tmp) = ctx_with_live(shared, two_provider_config(), live)?;
+
+        let mut persisted = false;
+        let result = super::handle_switch_core(&ctx, "model-b".to_owned(), |_, _| {
+            persisted = true;
+            None
+        });
+        match result {
+            Err(OpError::InvalidArguments(message)) => {
+                assert!(message.contains("provider-b"), "{message}");
+                assert!(
+                    message.contains("credential could not be resolved"),
+                    "{message}"
+                );
+                assert!(message.contains("previous model stays active"), "{message}");
+            }
+            other => {
+                return Err(TestError::Unexpected(format!(
+                    "expected InvalidArguments, got {other:?}"
+                )));
+            }
+        }
+        assert!(!persisted, "a rejected switch must not be persisted");
+        let snap = ctrl.snapshot();
+        assert_eq!(snap.active_provider.as_deref(), Some("provider-a"));
+        assert_eq!(snap.active_model.as_deref(), Some("model-a"));
+        Ok(())
+    }
+
+    /// Kurzform für `map_err` auf [`OpError`] in diesen Tests.
+    fn ctx_err(context: &'static str) -> impl FnOnce(OpError) -> TestError {
+        move |error| TestError::Unexpected(format!("{context}: {error:?}"))
+    }
+
     // ── Welle 2 (2d), Teil 2: `/uia-worker-model` ──────────────────────────────
 
     /// Runde 5, Teil G: ein Ziel-Modell eines anderen Providers als der

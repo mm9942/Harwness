@@ -39,6 +39,7 @@ use std::time::{Duration, Instant};
 use crossterm::event::{KeyCode, KeyModifiers};
 use harw_core::ManagedAgentSpawner;
 use harw_core::child_approval::{ChildApprovalAnswer, ChildApprovalBroker, ChildApprovalRequest};
+use harw_extension_api::approval_mode::ApprovalMode;
 use harw_runtime::AutoModeHandle;
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
 use tokio::sync::oneshot;
@@ -237,11 +238,59 @@ pub(crate) fn poll(app: &mut ChatApp) -> bool {
     show_next(app) || changed
 }
 
+/// Beantwortet unter „Full Access" jede wartende (und eine offene)
+/// Kind-Frage selbst mit „freigeben" — ohne Dialog.
+///
+/// # Beschreibung
+/// Nutzerentscheidung 2026-09-24: unter Full Access fragt harw nie. Kinder
+/// folgen dem Modus der Wurzel und stellen dann gar keine Fragen mehr
+/// (`harw_runtime::ApprovalChain::for_child`); das hier fängt nur Fragen ab,
+/// die schon unterwegs waren, als die Nutzerin auf Full Access umschaltete.
+///
+/// # Rückgabe
+/// `true`, wenn mindestens eine Frage beantwortet wurde (neu zeichnen).
+fn approve_waiting_in_mode(app: &mut ChatApp, mode: Option<ApprovalMode>) -> bool {
+    if mode != Some(ApprovalMode::FullAccess) {
+        return false;
+    }
+    let mut prompts: Vec<ChildApprovalPrompt> = Vec::new();
+    if let Some((prompt, _)) = app.child_approvals.open.take() {
+        app.pending_approval_dialog = None;
+        prompts.push(prompt);
+    }
+    prompts.extend(app.child_approvals.queue.drain(..));
+    let mut answered = false;
+    for prompt in prompts {
+        if !prompt.is_waiting() {
+            continue;
+        }
+        let line = format!(
+            "Full Access: {} für {} ohne Rückfrage freigegeben.",
+            prompt.request.call.name,
+            prompt.request.requester_label()
+        );
+        tracing::info!(
+            child = %prompt.request.child,
+            tool = %prompt.request.call.name,
+            "tui.child_approvals.full_access_approved"
+        );
+        prompt.answer(ChildApprovalAnswer::Approve);
+        app.push_line(Role::System, line);
+        answered = true;
+    }
+    answered
+}
+
 /// Zeigt die nächste wartende Frage, wenn der Dialog frei ist.
 ///
 /// # Rückgabe
-/// `true`, wenn eine Frage geöffnet wurde.
+/// `true`, wenn eine Frage geöffnet (oder unter „Full Access" ohne Dialog
+/// beantwortet) wurde.
 pub(crate) fn show_next(app: &mut ChatApp) -> bool {
+    let mode = app.current_approval();
+    if approve_waiting_in_mode(app, mode) {
+        return true;
+    }
     if app.child_approvals.open.is_some()
         || app.pending_approval_dialog.is_some()
         || app.pending_host_permit.is_some()
@@ -308,7 +357,7 @@ pub(crate) fn route_event(app: &mut ChatApp, event: TuiEvent) -> Result<bool, Tu
         return Ok(false);
     };
     match dialog.handle_key(key, armed) {
-        DialogAction::Stay | DialogAction::ToggleDetails => Ok(true),
+        DialogAction::Stay | DialogAction::ToggleDetails | DialogAction::Scrolled => Ok(true),
         DialogAction::Decided(choice) => {
             decide(app, choice);
             Ok(true)
@@ -364,7 +413,7 @@ fn build_dialog(app: &ChatApp, request: &ChildApprovalRequest) -> ApprovalDialog
             Some(app.project_root().to_owned())
         },
         justification: None,
-        risk: None,
+        risk: crate::app::approval_risk(&request.call),
         origin: Some(request.requester_label()),
         // Keine Regel, kein Lern-Angebot: eine Kind-Freigabe gilt einmalig.
         remember_rule: None,

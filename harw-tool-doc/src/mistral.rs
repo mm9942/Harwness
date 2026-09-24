@@ -18,8 +18,11 @@
 //! - [`MistralOcrClient`] — Egress-geprüfter HTTP-Client für `/ocr`,
 //!   `/files` und `/files/{id}/url`.
 //! - [`install_mistral_ocr`] / [`mistral_ocr`] — prozessweiter
-//!   `OnceLock<Arc<MistralOcrClient>>`, analog zu
+//!   `OnceLock` mit Client und Freigabe-Modus, analog zu
 //!   `harw_tool_web::fetch::{install_fetcher, shared_fetcher}`.
+//! - [`RemoteOcrTarget`] / [`remote_ocr_target`] — wohin `doc.read_pdf`
+//!   Dateien schickt und ob das eine Freigabe braucht
+//!   (`[tools.doc].remote_ocr`); gelesen von der Freigabe-Politik und der TUI.
 //!
 //! # Sicherheitskontrakt
 //! Der `reqwest::Client` entsteht ausschließlich über
@@ -44,16 +47,19 @@
 //!
 //! # Examples
 //! ```rust,no_run
-//! use harw_tool_doc::{DEFAULT_OCR_MODEL, install_mistral_ocr};
+//! use harw_tool_doc::{DEFAULT_OCR_MODEL, RemoteOcrApproval, install_mistral_ocr};
 //! use harw_tool_doc::mistral::MistralOcrConfig;
 //! use secrecy::SecretString;
 //!
 //! # fn demo() -> Result<(), Box<dyn std::error::Error>> {
-//! install_mistral_ocr(MistralOcrConfig {
-//!     base_url: "https://api.mistral.ai/v1".to_owned(),
-//!     api_key: SecretString::new("sk-...".into()),
-//!     model: DEFAULT_OCR_MODEL.to_owned(),
-//! })?;
+//! install_mistral_ocr(
+//!     MistralOcrConfig {
+//!         base_url: "https://api.mistral.ai/v1".to_owned(),
+//!         api_key: SecretString::new("sk-...".into()),
+//!         model: DEFAULT_OCR_MODEL.to_owned(),
+//!     },
+//!     RemoteOcrApproval::Ask,
+//! )?;
 //! # Ok(())
 //! # }
 //! ```
@@ -111,6 +117,9 @@ pub struct MistralOcrClient {
     client: Client,
     // Basis-URL ohne abschließenden `/`, z. B. `"https://api.mistral.ai/v1"`.
     base_url: String,
+    // Host der Basis-URL, z. B. `"api.mistral.ai"` (Egress-Allowlist und
+    // Anzeige im Freigabe-Dialog).
+    host: String,
     api_key: SecretString,
     model: String,
 }
@@ -160,14 +169,21 @@ impl MistralOcrClient {
     /// ```
     pub fn new(config: MistralOcrConfig) -> DocToolResult<Self> {
         let host = base_url_host(&config.base_url)?;
-        let policy = Arc::new(EgressPolicy::new(vec![host], false)?);
+        let policy = Arc::new(EgressPolicy::new(vec![host.clone()], false)?);
         let client = harw_egress::build_client(policy)?;
         Ok(Self {
             client,
             base_url: normalize_base_url(&config.base_url),
+            host,
             api_key: config.api_key,
             model: config.model,
         })
+    }
+
+    /// Host, an den dieser Client Dateien schickt, z. B. `"api.mistral.ai"`.
+    #[must_use]
+    pub fn host(&self) -> &str {
+        &self.host
     }
 
     /// Extrahiert Seitentext per Mistral OCR.
@@ -353,18 +369,59 @@ impl MistralOcrClient {
 // Prozessweite Installation
 // ---------------------------------------------------------------------------
 
-static MISTRAL_OCR: OnceLock<Arc<MistralOcrClient>> = OnceLock::new();
+/// Ob ein Remote-OCR-Aufruf vor dem Versand eine Nutzer-Freigabe braucht
+/// (`[tools.doc].remote_ocr`: `ask` → [`Self::Ask`], `on` → [`Self::Auto`];
+/// bei `off` wird gar kein Client installiert).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RemoteOcrApproval {
+    /// Jeder Aufruf, der die Datei an den Remote-Dienst schicken würde,
+    /// braucht eine Freigabe — auch im Vollzugriff.
+    Ask,
+    /// Ohne Nachfrage (bisheriges Verhalten).
+    Auto,
+}
+
+/// Wohin `doc.read_pdf` eine Datei schickt, wenn es nicht lokal extrahiert.
+///
+/// # Examples
+/// ```rust
+/// use harw_tool_doc::mistral::{RemoteOcrApproval, RemoteOcrTarget};
+///
+/// let target = RemoteOcrTarget {
+///     host: "api.mistral.ai".to_owned(),
+///     approval: RemoteOcrApproval::Ask,
+/// };
+/// assert_eq!(target.approval, RemoteOcrApproval::Ask);
+/// ```
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RemoteOcrTarget {
+    /// Host des Remote-Dienstes, z. B. `"api.mistral.ai"`.
+    pub host: String,
+    /// Ob der Versand eine Freigabe braucht.
+    pub approval: RemoteOcrApproval,
+}
+
+// Installierter Client samt Ziel-Beschreibung; beides entsteht in einem
+// Schritt, damit Client und Freigabe-Modus nie auseinanderlaufen.
+struct InstalledOcr {
+    client: Arc<MistralOcrClient>,
+    target: RemoteOcrTarget,
+}
+
+static MISTRAL_OCR: OnceLock<InstalledOcr> = OnceLock::new();
 
 /// Hinterlegt den prozessweiten Mistral-OCR-Client.
 ///
 /// # Description
-/// Baut den Client über [`MistralOcrClient::new`] und hinterlegt ihn in
-/// einem `static OnceLock`. Gedacht für einen einzigen Aufruf beim Boot
-/// (`harw-cli`); ein zweiter Aufruf scheitert, ohne den bestehenden Client zu
-/// ersetzen.
+/// Baut den Client über [`MistralOcrClient::new`] und hinterlegt ihn
+/// zusammen mit `approval` in einem `static OnceLock`. Gedacht für einen
+/// einzigen Aufruf beim Boot (`harw-cli`); ein zweiter Aufruf scheitert, ohne
+/// den bestehenden Client zu ersetzen.
 ///
 /// # Arguments
 /// - `config` ([`MistralOcrConfig`]): Basis-URL, API-Schlüssel, Modell.
+/// - `approval` ([`RemoteOcrApproval`]): ob jeder Versand eine Freigabe
+///   braucht (`[tools.doc].remote_ocr = "ask"`) oder nicht (`"on"`).
 ///
 /// # Returns
 /// `Ok(())`, wenn dieser Aufruf den Client installiert hat.
@@ -379,22 +436,34 @@ static MISTRAL_OCR: OnceLock<Arc<MistralOcrClient>> = OnceLock::new();
 ///
 /// # Examples
 /// ```rust,no_run
-/// use harw_tool_doc::mistral::{DEFAULT_OCR_MODEL, MistralOcrConfig, install_mistral_ocr};
+/// use harw_tool_doc::mistral::{
+///     DEFAULT_OCR_MODEL, MistralOcrConfig, RemoteOcrApproval, install_mistral_ocr,
+/// };
 /// use secrecy::SecretString;
 ///
 /// # fn demo() -> Result<(), Box<dyn std::error::Error>> {
-/// install_mistral_ocr(MistralOcrConfig {
-///     base_url: "https://api.mistral.ai/v1".to_owned(),
-///     api_key: SecretString::new("sk-...".into()),
-///     model: DEFAULT_OCR_MODEL.to_owned(),
-/// })?;
+/// install_mistral_ocr(
+///     MistralOcrConfig {
+///         base_url: "https://api.mistral.ai/v1".to_owned(),
+///         api_key: SecretString::new("sk-...".into()),
+///         model: DEFAULT_OCR_MODEL.to_owned(),
+///     },
+///     RemoteOcrApproval::Ask,
+/// )?;
 /// # Ok(())
 /// # }
 /// ```
-pub fn install_mistral_ocr(config: MistralOcrConfig) -> DocToolResult<()> {
+pub fn install_mistral_ocr(
+    config: MistralOcrConfig,
+    approval: RemoteOcrApproval,
+) -> DocToolResult<()> {
     let client = Arc::new(MistralOcrClient::new(config)?);
+    let target = RemoteOcrTarget {
+        host: client.host().to_owned(),
+        approval,
+    };
     MISTRAL_OCR
-        .set(client)
+        .set(InstalledOcr { client, target })
         .map_err(|_| DocToolError::AlreadyConfigured)
 }
 
@@ -403,8 +472,9 @@ pub fn install_mistral_ocr(config: MistralOcrConfig) -> DocToolResult<()> {
 ///
 /// # Returns
 /// `Some(Arc<MistralOcrClient>)`, wenn [`install_mistral_ocr`] zuvor
-/// erfolgreich war, sonst `None` (kein Mistral-Provider konfiguriert —
-/// Aufrufer fallen dann auf die native Extraktion zurück).
+/// erfolgreich war, sonst `None` (kein Mistral-Provider konfiguriert oder
+/// `remote_ocr = "off"` — Aufrufer fallen dann auf die native Extraktion
+/// zurück).
 ///
 /// # Concurrency
 /// Threadsicher über [`OnceLock`]; beliebig oft von mehreren Threads
@@ -421,7 +491,52 @@ pub fn install_mistral_ocr(config: MistralOcrConfig) -> DocToolResult<()> {
 /// ```
 #[must_use]
 pub fn mistral_ocr() -> Option<Arc<MistralOcrClient>> {
-    MISTRAL_OCR.get().map(Arc::clone)
+    MISTRAL_OCR
+        .get()
+        .map(|installed| Arc::clone(&installed.client))
+}
+
+/// Liefert das Remote-OCR-Ziel des Prozesses, falls ein Client installiert
+/// ist.
+///
+/// # Returns
+/// `Some(RemoteOcrTarget)` nach erfolgreichem [`install_mistral_ocr`], sonst
+/// `None` (`doc.read_pdf` extrahiert dann immer lokal).
+///
+/// # Concurrency
+/// Threadsicher über [`OnceLock`].
+///
+/// # Examples
+/// ```rust,no_run
+/// use harw_tool_doc::mistral::remote_ocr_target;
+///
+/// if let Some(target) = remote_ocr_target() {
+///     println!("doc.read_pdf sends PDFs to {}", target.host);
+/// }
+/// ```
+#[must_use]
+pub fn remote_ocr_target() -> Option<RemoteOcrTarget> {
+    MISTRAL_OCR.get().map(|installed| installed.target.clone())
+}
+
+/// Wert von `backend`, der die lokale Extraktion erzwingt.
+pub const NATIVE_BACKEND: &str = "native";
+
+/// Ob ein `doc.read_pdf`-Aufruf mit diesen Argumenten Remote-OCR nutzen
+/// würde, sofern ein Client installiert ist — also `backend` nicht
+/// [`NATIVE_BACKEND`] ist. Dieselbe Regel wie in `crate::tool::run`.
+///
+/// # Examples
+/// ```rust
+/// use harw_tool_doc::mistral::arguments_request_remote_ocr;
+/// use serde_json::json;
+///
+/// assert!(arguments_request_remote_ocr(&json!({ "path": "a.pdf" })));
+/// assert!(!arguments_request_remote_ocr(&json!({ "path": "a.pdf", "backend": "native" })));
+/// ```
+#[must_use]
+pub fn arguments_request_remote_ocr(arguments: &Value) -> bool {
+    arguments.get("backend").and_then(Value::as_str) != Some(NATIVE_BACKEND)
 }
 
 // ---------------------------------------------------------------------------
@@ -607,6 +722,33 @@ fn truncate_chars(input: &str, max_chars: usize) -> String {
 mod tests {
     use super::*;
     use crate::test_support::{TestError, TestResult, ctx};
+
+    #[test]
+    fn test_arguments_request_remote_ocr_only_native_stays_local() {
+        use serde_json::json;
+        assert!(arguments_request_remote_ocr(&json!({ "path": "a.pdf" })));
+        assert!(arguments_request_remote_ocr(
+            &json!({ "path": "a.pdf", "backend": "auto" })
+        ));
+        assert!(arguments_request_remote_ocr(
+            &json!({ "path": "a.pdf", "backend": null })
+        ));
+        assert!(!arguments_request_remote_ocr(
+            &json!({ "path": "a.pdf", "backend": "native" })
+        ));
+    }
+
+    #[test]
+    fn test_client_reports_host_of_base_url() -> TestResult {
+        let client = MistralOcrClient::new(MistralOcrConfig {
+            base_url: "https://api.mistral.ai/v1/".to_owned(),
+            api_key: SecretString::new("sk-test".into()),
+            model: DEFAULT_OCR_MODEL.to_owned(),
+        })
+        .map_err(ctx("Client bauen"))?;
+        assert_eq!(client.host(), "api.mistral.ai");
+        Ok(())
+    }
 
     #[test]
     fn test_base_url_host_extracts_hostname() -> TestResult {

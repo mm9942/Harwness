@@ -1,7 +1,6 @@
 //! Gemeinsame Runtime-Montage (`RuntimeAssembly`) für alle `harw`-Einstiege.
 //!
-//! Gerüst aus Welle W0a. Verträge (`spec`, `error`) liefert Agent W0B-05,
-//! die Montage die Wellen W2b/W2c gemäß `docs/remediation/CONTRACTS.md` §runtime.
+//! Verträge (`spec`, `error`) und Montage folgen `docs/design/runtime-contracts.md` §runtime.
 #![forbid(unsafe_code)]
 
 // Runde 5, Teil K: Hintergrund-Agenten (`agent.status`/`agent.cancel`, `[agents]`).
@@ -27,6 +26,8 @@ pub mod handoff;
 // Runde 5, Teil N: Host-Mode-Anfrage aus dem Orchestrator-Baum.
 pub mod host_escalation_wiring;
 pub mod job_ledger;
+// Live-Modellwechsel: Kinder, Rollenwahl und Provider-Neubau ohne Neustart.
+pub mod live_model;
 pub mod mcp_wiring;
 pub mod memory_wiring;
 pub mod model;

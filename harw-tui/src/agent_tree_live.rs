@@ -171,7 +171,7 @@ fn tail_chars(text: &str, max: usize) -> String {
 /// - `explicit_root` (`Option<&str>`): explizit gestarteter Wurzel-Agent
 ///   (`RuntimeSpec::active_agent`), z. B. `root-orchestrator`.
 /// - `active_uia` (`Option<&str>`): aktive UIA-Definition
-///   (`harness.active_uia_definition`), z. B. `emily-ui`.
+///   (`harness.active_uia_definition`), z. B. `assistant-ui`.
 ///
 /// # Rückgabe
 /// Der explizite Wurzel-Agent, sonst `UIA · <name>`, sonst `UIA`.
@@ -494,9 +494,9 @@ mod tests {
     /// Die Wurzel heißt nach ihrer tatsächlichen Rolle.
     #[test]
     fn root_label_follows_uia_or_explicit_root() {
-        assert_eq!(root_label(None, Some("emily-ui")), "UIA · emily-ui");
+        assert_eq!(root_label(None, Some("assistant-ui")), "UIA · assistant-ui");
         assert_eq!(
-            root_label(Some("root-orchestrator"), Some("emily-ui")),
+            root_label(Some("root-orchestrator"), Some("assistant-ui")),
             "root-orchestrator"
         );
         assert_eq!(root_label(Some("  "), None), "UIA");
@@ -553,6 +553,7 @@ mod tests {
                 detail: None,
                 tool_calls: None,
                 model: None,
+                provider: None,
             }),
         });
         let mut rows = vec![row("child-5", Some("uia"))];

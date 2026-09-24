@@ -212,6 +212,9 @@ pub struct AgentSession {
     /// Löst bei einem Modellwechsel das neue Kontextfenster auf, damit
     /// Auto-Compaction und Byte-Budget dem aktiven Modell folgen.
     context_window_resolver: Option<std::sync::Arc<crate::child_controller::ContextWindowResolver>>,
+    /// Löst bei einem Modellwechsel die Ausgabereserve (Tokens) des neuen
+    /// Modells auf (siehe [`Self::with_output_reserve_resolver`]).
+    output_reserve_resolver: Option<std::sync::Arc<crate::child_controller::ContextWindowResolver>>,
     /// Vorgabe-Grenzen für Turns ohne eigene Grenzen (siehe `run_turn`).
     default_turn_limits: Option<crate::turn_loop::TurnLimits>,
     /// Startzeitpunkt des offenen Handoffs (für `ChildCompleted::duration_ms`).
@@ -606,6 +609,7 @@ impl AgentSession {
             handoff_started_at: None,
             default_turn_limits: None,
             context_window_resolver: None,
+            output_reserve_resolver: None,
             compaction_observer: None,
             tool_outcome_observer: None,
             compaction_summary_model: (None, None),
@@ -1197,6 +1201,17 @@ impl AgentSession {
         if !changed {
             return;
         }
+        // Ausgabereserve des neuen Modells (Live-Modellwechsel): ohne diesen
+        // Schritt forderte jede Anfrage weiter die Reserve des alten Modells
+        // an — bei einem Modell mit kleinerem Ausgabelimit lehnt der
+        // Provider das ab.
+        let reserve = self
+            .output_reserve_resolver
+            .as_ref()
+            .map(|resolve| resolve(model.as_ref().map(ModelId::as_str)));
+        if let Some(reserve) = reserve {
+            self.max_output_tokens = Some(reserve);
+        }
         let Some(resolve) = self.context_window_resolver.clone() else {
             self.active_model = model;
             return;
@@ -1205,7 +1220,11 @@ impl AgentSession {
         self.active_model = model;
         let window = resolve(self.active_model.as_ref().map(ModelId::as_str));
         if let Some(policy) = self.auto_compact {
-            self.auto_compact = Some(policy.rescaled(window));
+            let policy = policy.rescaled(window);
+            self.auto_compact = Some(match reserve {
+                Some(reserve) => policy.with_output_reserve(reserve),
+                None => policy,
+            });
         }
         self.context_budget.max_history_bytes = match self.configured_max_history_bytes {
             Some(configured) => configured,
@@ -1227,6 +1246,22 @@ impl AgentSession {
         resolver: std::sync::Arc<crate::child_controller::ContextWindowResolver>,
     ) -> Self {
         self.context_window_resolver = Some(resolver);
+        self
+    }
+
+    /// Setzt den Resolver für die Ausgabereserve je Modell.
+    ///
+    /// # Beschreibung
+    /// Bei einem echten Modellwechsel ([`Self::set_active_model`]) werden
+    /// damit [`Self::max_output_tokens`] und die Ausgabereserve der
+    /// Auto-Compact-Policy auf das neue Modell gesetzt. Ohne Resolver
+    /// bleiben beide unverändert.
+    #[must_use]
+    pub fn with_output_reserve_resolver(
+        mut self,
+        resolver: std::sync::Arc<crate::child_controller::ContextWindowResolver>,
+    ) -> Self {
+        self.output_reserve_resolver = Some(resolver);
         self
     }
 
@@ -2431,6 +2466,31 @@ forbidden = [{forbidden}]
         session.set_active_model(Some(ModelId::from("small")));
         assert_eq!(session.context_budget().max_history_bytes, 123_456);
         assert!(session.pending_compaction());
+    }
+
+    #[test]
+    fn test_set_active_model_follows_output_reserve_of_new_model() {
+        let reserve: std::sync::Arc<crate::child_controller::ContextWindowResolver> =
+            std::sync::Arc::new(|model: Option<&str>| match model {
+                Some("small") => 4_096,
+                _ => 32_000,
+            });
+        let mut session = resolver_session()
+            .with_output_reserve_resolver(reserve)
+            .with_auto_compact(Some(
+                crate::auto_compact::AutoCompactPolicy::for_context_window(1_000_000),
+            ));
+        session.set_max_output_tokens(Some(32_000));
+        session.set_active_model(Some(ModelId::from("small")));
+        assert_eq!(session.max_output_tokens(), Some(4_096));
+        assert_eq!(
+            session
+                .auto_compact()
+                .map(crate::auto_compact::AutoCompactPolicy::output_reserve_tokens),
+            Some(4_096)
+        );
+        session.set_active_model(Some(ModelId::from("big")));
+        assert_eq!(session.max_output_tokens(), Some(32_000));
     }
 
     #[test]

@@ -21,9 +21,17 @@
 //! teilt. `/sandbox-lease` (siehe `harw-ops/src/sandbox_lease.rs`) setzt
 //! ausschließlich die globale Freigabe; die rein sitzungseigenen Methoden
 //! bleiben für Aufrufer erhalten, die bewusst nur eine einzelne Sitzung
-//! freigeben wollen. `is_session_approved`, `take_single_use`,
-//! `has_single_use` und `session_approval_remaining` berücksichtigen beide
-//! Zustände gemeinsam (siehe die jeweilige Methodendoku).
+//! freigeben wollen. `is_session_approved`, `take_single_use` und
+//! `has_single_use` berücksichtigen beide Zustände gemeinsam (siehe die
+//! jeweilige Methodendoku).
+//!
+//! # Kein Zeitablauf (Nutzerentscheidung 2026-09-24)
+//! Eine Sitzungs- oder prozessweite Freigabe (Host-Arbeitsphase) hat **keine**
+//! Ablaufzeit: sie bleibt aktiv, bis der Nutzer sie selbst beendet — über
+//! Strg+H in der TUI (`ChatApp::end_host_mode`) oder das getippte
+//! `/sandbox-lease revoke`. Das Modell kann eine Phase weder beenden noch
+//! verlängern. Einmal-Freigaben bleiben einmalig. Der Zustand ist rein
+//! In-Memory; ein Prozessende beendet jede Phase ohnehin.
 //!
 //! # Verantwortungsgrenze
 //! Diese Datei ändert nichts an `process_permit.rs`: sie hält ausschließlich
@@ -35,10 +43,8 @@
 //! [`HostPermitSessionRegistry`] ist `Send + Sync`; der gesamte Zustand liegt
 //! hinter einem einzigen [`Mutex`].
 
-use std::sync::Mutex;
-use std::time::{Duration, Instant};
-
 use crate::process_permit::{ProcessPermitId, ProcessPermitRequest};
+use std::sync::Mutex;
 
 /// Ein Eintrag: welcher exakte Antrag bereits einen ausgestellten Permit hat.
 #[derive(Debug, Clone)]
@@ -50,8 +56,10 @@ struct RememberedPermit {
 #[derive(Debug, Default)]
 struct RegistryState {
     /// Sitzungen, deren Nutzer der lokalen UI einmalig für Host-Ausführung
-    /// zugestimmt hat, mit Ablaufzeitpunkt (Sitzungsende / Lease-Ende).
-    approved_sessions: Vec<(String, Instant)>,
+    /// zugestimmt hat — ohne Ablaufzeitpunkt: der Eintrag bleibt, bis der
+    /// Nutzer die Phase beendet ([`HostPermitSessionRegistry::forget_session`]/
+    /// [`HostPermitSessionRegistry::revoke_session_approval`]).
+    approved_sessions: Vec<String>,
     /// Bereits ausgestellte Permits, um denselben Antrag ohne erneute
     /// `issue_after_local_approval`-Ausstellung wiederzuverwenden.
     remembered: Vec<RememberedPermit>,
@@ -63,9 +71,9 @@ struct RegistryState {
     /// Prozessweite Freigabe („volle Sandbox-Deaktivierung“, Nutzerwunsch
     /// 2026-09-21): gilt — anders als `approved_sessions` — für **jede**
     /// Session-ID desselben `harw`-Prozesses (Root-Session und jede
-    /// Kind-Session), bis der Ablaufzeitpunkt erreicht ist oder
-    /// [`HostPermitSessionRegistry::revoke_global_approval`] sie entfernt.
-    global_approval: Option<Instant>,
+    /// Kind-Session), bis [`HostPermitSessionRegistry::revoke_global_approval`]
+    /// sie entfernt — kein Zeitablauf.
+    global_approval: bool,
     /// Prozessweite Einmal-Freigabe: der nächste
     /// [`HostPermitSessionRegistry::take_single_use`]-Aufruf **jeder**
     /// Session-ID verbraucht sie, genau wie `single_use` es für eine
@@ -103,8 +111,8 @@ pub struct HostPermitSessionRegistry {
 }
 
 impl HostPermitSessionRegistry {
-    /// Merkt sich, dass die lokale UI Host-Ausführung für `session` bis
-    /// `ttl` ab jetzt erlaubt hat.
+    /// Merkt sich, dass die lokale UI Host-Ausführung für `session` erlaubt
+    /// hat — bis der Nutzer die Phase selbst beendet (kein Zeitablauf).
     ///
     /// # Beschreibung
     /// Wird genau einmal pro Sitzung aufgerufen, ausgelöst durch den
@@ -113,13 +121,13 @@ impl HostPermitSessionRegistry {
     /// einen eigenen Permit über [`crate::ProcessPermitLedger::issue_after_local_approval`]
     /// ausstellen lassen — die Zustimmung des Menschen bezog sich auf die
     /// Sitzung, nicht auf einen einzelnen Befehlstext. Ein erneuter Aufruf für
-    /// dieselbe `session` ersetzt die zuvor gemerkte Ablaufzeit vollständig
-    /// (kein Verlängern über ein Maximum, kein Vereinigen zweier Fristen).
+    /// dieselbe `session` ist idempotent (kein zweiter Eintrag). Die Zustimmung
+    /// endet ausschließlich über [`Self::forget_session`] bzw.
+    /// [`Self::revoke_session_approval`] (Strg+H bzw. `/sandbox-lease revoke`)
+    /// oder mit dem Prozess.
     ///
     /// # Argumente
     /// - `session` (`impl Into<String>`): die Sitzungs-ID, die zugestimmt hat.
-    /// - `ttl` (`Duration`): wie lange die Zustimmung ab jetzt gilt, bevor
-    ///   [`Self::is_session_approved`] wieder `false` liefert.
     ///
     /// # Panics
     /// Nie: ein vergifteter [`Mutex`] (ein Aufrufer hat unter Halten der Sperre
@@ -135,32 +143,27 @@ impl HostPermitSessionRegistry {
     ///
     /// # Examples
     /// ```rust
-    /// use std::time::Duration;
     /// use harw_sandbox::HostPermitSessionRegistry;
     ///
     /// let registry = HostPermitSessionRegistry::default();
-    /// registry.mark_session_approved("session-1", Duration::from_secs(60));
+    /// registry.mark_session_approved("session-1");
     /// assert!(registry.is_session_approved("session-1"));
     /// ```
-    pub fn mark_session_approved(&self, session: impl Into<String>, ttl: Duration) {
+    pub fn mark_session_approved(&self, session: impl Into<String>) {
         let session = session.into();
-        let expires_at = Instant::now() + ttl;
         if let Ok(mut state) = self.state.lock() {
-            state
-                .approved_sessions
-                .retain(|(existing, _)| existing != &session);
-            state.approved_sessions.push((session, expires_at));
+            if !state.approved_sessions.contains(&session) {
+                state.approved_sessions.push(session);
+            }
         }
     }
 
-    /// `true`, wenn `session` noch eine gültige lokale Host-Zustimmung hat.
+    /// `true`, wenn `session` eine aktive lokale Host-Zustimmung hat.
     ///
     /// # Beschreibung
-    /// Räumt bei jedem Aufruf beiläufig alle bereits abgelaufenen
-    /// Zustimmungen aus dem inneren Zustand (nicht nur die von `session`) —
-    /// es gibt keinen separaten Hintergrund-Aufräumer, jeder Abfrageaufruf
-    /// erledigt das selbst. Liefert zusätzlich `true`, wenn eine
-    /// [`Self::mark_global_approval`]-Freigabe noch aktiv ist — diese gilt
+    /// Rein lesend; es gibt keinen Zeitablauf, eine Zustimmung bleibt bis zum
+    /// Widerruf durch den Nutzer bestehen. Liefert zusätzlich `true`, wenn eine
+    /// [`Self::mark_global_approval`]-Freigabe aktiv ist — diese gilt
     /// prozessweit, also auch für eine `session`, die nie selbst über
     /// [`Self::mark_session_approved`] zugestimmt hat (Root-Session und jede
     /// Kind-Session teilen sich dieselbe Registry-Instanz).
@@ -169,10 +172,10 @@ impl HostPermitSessionRegistry {
     /// - `session` (`&str`): die zu prüfende Sitzungs-ID.
     ///
     /// # Returns
-    /// `true`, wenn für `session` eine noch nicht abgelaufene Zustimmung aus
-    /// [`Self::mark_session_approved`] vorliegt, **oder** eine noch nicht
-    /// abgelaufene prozessweite Freigabe aus [`Self::mark_global_approval`]
-    /// aktiv ist; `false` für eine unbekannte, abgelaufene oder noch nie
+    /// `true`, wenn für `session` eine nicht widerrufene Zustimmung aus
+    /// [`Self::mark_session_approved`] vorliegt, **oder** eine nicht
+    /// widerrufene prozessweite Freigabe aus [`Self::mark_global_approval`]
+    /// aktiv ist; `false` für eine unbekannte, widerrufene oder noch nie
     /// zugestimmte Sitzung ohne aktive globale Freigabe — und ebenso `false`,
     /// wenn der interne [`Mutex`] vergiftet ist (fail-closed statt Panik).
     ///
@@ -189,19 +192,14 @@ impl HostPermitSessionRegistry {
     /// ```
     #[must_use]
     pub fn is_session_approved(&self, session: &str) -> bool {
-        let Ok(mut state) = self.state.lock() else {
+        let Ok(state) = self.state.lock() else {
             return false;
         };
-        let now = Instant::now();
-        state
-            .approved_sessions
-            .retain(|(_, expires_at)| *expires_at > now);
-        cleanup_global_approval(&mut state, now);
-        state
-            .approved_sessions
-            .iter()
-            .any(|(existing, _)| existing == session)
-            || state.global_approval.is_some()
+        state.global_approval
+            || state
+                .approved_sessions
+                .iter()
+                .any(|existing| existing == session)
     }
 
     /// Liefert die bereits gemerkte Permit-Kennung für einen exakt
@@ -283,7 +281,6 @@ impl HostPermitSessionRegistry {
     ///     request_for_workspace,
     /// };
     /// use std::path::Path;
-    /// use std::time::Duration;
     ///
     /// let ledger = ProcessPermitLedger::default();
     /// let registry = HostPermitSessionRegistry::default();
@@ -295,7 +292,7 @@ impl HostPermitSessionRegistry {
     ///     ProcessEnvironment::LocalHost,
     /// );
     /// let id = ledger
-    ///     .issue_after_local_approval(request.clone(), HostApprovalScope::SessionLease, Duration::from_secs(60))
+    ///     .issue_after_local_approval(request.clone(), HostApprovalScope::SessionLease, None)
     ///     .expect("issuing a valid request must succeed");
     /// registry.remember_permit(request.clone(), id);
     /// assert_eq!(registry.lookup_permit(&request), Some(id));
@@ -335,11 +332,10 @@ impl HostPermitSessionRegistry {
     ///
     /// # Examples
     /// ```rust
-    /// use std::time::Duration;
     /// use harw_sandbox::HostPermitSessionRegistry;
     ///
     /// let registry = HostPermitSessionRegistry::default();
-    /// registry.mark_session_approved("session-1", Duration::from_secs(60));
+    /// registry.mark_session_approved("session-1");
     /// let removed = registry.forget_session("session-1");
     /// assert!(removed.is_empty(), "keine Permits waren gemerkt");
     /// assert!(!registry.is_session_approved("session-1"));
@@ -350,7 +346,7 @@ impl HostPermitSessionRegistry {
         };
         state
             .approved_sessions
-            .retain(|(existing, _)| existing != session);
+            .retain(|existing| existing != session);
         let mut removed_ids = Vec::new();
         state.remembered.retain(|entry| {
             if entry.request.session == session {
@@ -527,11 +523,10 @@ impl HostPermitSessionRegistry {
     ///
     /// # Examples
     /// ```rust
-    /// use std::time::Duration;
     /// use harw_sandbox::HostPermitSessionRegistry;
     ///
     /// let registry = HostPermitSessionRegistry::default();
-    /// registry.mark_session_approved("session-1", Duration::from_secs(60));
+    /// registry.mark_session_approved("session-1");
     /// registry.mark_single_use("session-1".to_owned());
     /// registry.revoke_session_approval("session-1");
     /// assert!(!registry.is_session_approved("session-1"));
@@ -543,91 +538,25 @@ impl HostPermitSessionRegistry {
         if let Ok(mut state) = self.state.lock() {
             state
                 .approved_sessions
-                .retain(|(existing, _)| existing != session);
+                .retain(|existing| existing != session);
             state.single_use.retain(|existing| existing != session);
         }
     }
 
-    /// Restlaufzeit der Sitzungsfreigabe von `session`, falls noch gültig.
-    ///
-    /// # Beschreibung
-    /// Räumt wie [`Self::is_session_approved`] beiläufig alle bereits
-    /// abgelaufenen Zustimmungen aus dem inneren Zustand auf (nicht nur die
-    /// von `session`, auch eine abgelaufene globale Freigabe). Liefert das
-    /// Maximum aus sitzungseigener und globaler Restlaufzeit: eine
-    /// `session`, die selbst nie zugestimmt hat, aber unter einer aktiven
-    /// [`Self::mark_global_approval`]-Freigabe läuft, bekommt deren
-    /// Restlaufzeit; ist zusätzlich eine eigene, länger laufende
-    /// Sitzungsfreigabe aktiv, gewinnt die längere der beiden.
-    ///
-    /// # Argumente
-    /// - `session` (`&str`): die zu prüfende Sitzungs-ID.
-    ///
-    /// # Returns
-    /// `Some(duration)` mit der längeren der beiden verbleibenden Zeiten
-    /// (sitzungseigen aus [`Self::mark_session_approved`], global aus
-    /// [`Self::mark_global_approval`]) bis zum jeweiligen Ablauf, sofern
-    /// mindestens eine der beiden noch nicht verstrichen ist; `None`, wenn
-    /// weder eine sitzungseigene noch eine globale Freigabe aktiv ist — und
-    /// ebenso `None` bei vergiftetem [`Mutex`] (fail-closed).
-    ///
-    /// # Concurrency
-    /// `Send + Sync`; sperrt kurz denselben [`Mutex`] wie jede andere Methode
-    /// dieses Typs.
-    ///
-    /// # Examples
-    /// ```rust
-    /// use std::time::Duration;
-    /// use harw_sandbox::HostPermitSessionRegistry;
-    ///
-    /// let registry = HostPermitSessionRegistry::default();
-    /// assert_eq!(registry.session_approval_remaining("session-1"), None);
-    /// registry.mark_session_approved("session-1", Duration::from_secs(60));
-    /// assert!(registry.session_approval_remaining("session-1").is_some());
-    /// ```
-    #[must_use]
-    pub fn session_approval_remaining(&self, session: &str) -> Option<Duration> {
-        let Ok(mut state) = self.state.lock() else {
-            return None;
-        };
-        let now = Instant::now();
-        state
-            .approved_sessions
-            .retain(|(_, expires_at)| *expires_at > now);
-        cleanup_global_approval(&mut state, now);
-        let own = state
-            .approved_sessions
-            .iter()
-            .find(|(existing, _)| existing == session)
-            .map(|(_, expires_at)| expires_at.saturating_duration_since(now));
-        let global = state
-            .global_approval
-            .map(|expires_at| expires_at.saturating_duration_since(now));
-        match (own, global) {
-            (Some(own), Some(global)) => Some(own.max(global)),
-            (Some(own), None) => Some(own),
-            (None, Some(global)) => Some(global),
-            (None, None) => None,
-        }
-    }
-
     /// Merkt sich eine prozessweite Host-Ausführungsfreigabe („volle
-    /// Sandbox-Deaktivierung“, Nutzerwunsch 2026-09-21): gilt bis `ttl` ab
-    /// jetzt für **jede** Session-ID desselben `harw`-Prozesses — die
+    /// Sandbox-Deaktivierung“, Nutzerwunsch 2026-09-21): gilt bis zum
+    /// Widerruf durch den Nutzer ([`Self::revoke_global_approval`]) für
+    /// **jede** Session-ID desselben `harw`-Prozesses — die
     /// Root-Session und jede Kind-Session, die dieselbe Registry-Instanz
     /// teilt (siehe `harw_registry_defaults::profile::build_shell_provider`,
     /// das Ledger/Registry/Fragekanal jetzt an jeden `ShellToolProvider`
     /// hängt, nicht nur an einen mit `SandboxProfile::Host`).
     ///
     /// # Beschreibung
-    /// Ein erneuter Aufruf ersetzt die zuvor gemerkte Ablaufzeit vollständig
-    /// (kein Verlängern über ein Maximum, kein Vereinigen zweier Fristen) —
-    /// dasselbe Ersetzungsverhalten wie [`Self::mark_session_approved`].
-    ///
-    /// # Argumente
-    /// - `ttl` (`Duration`): wie lange die Freigabe ab jetzt für jede
-    ///   Session-ID gilt, bevor [`Self::is_session_approved`] für eine
-    ///   Session ohne eigene Zustimmung wieder `false` liefert.
+    /// Idempotent; es gibt keinen Zeitablauf (Nutzerentscheidung
+    /// 2026-09-24): die Freigabe endet ausschließlich über
+    /// [`Self::revoke_global_approval`] (Strg+H bzw. `/sandbox-lease revoke`)
+    /// oder mit dem Prozess.
     ///
     /// # Panics
     /// Nie: ein vergifteter [`Mutex`] wird über `if let Ok(..)` übersprungen,
@@ -640,57 +569,42 @@ impl HostPermitSessionRegistry {
     ///
     /// # Examples
     /// ```rust
-    /// use std::time::Duration;
     /// use harw_sandbox::HostPermitSessionRegistry;
     ///
     /// let registry = HostPermitSessionRegistry::default();
-    /// registry.mark_global_approval(Duration::from_secs(60));
+    /// registry.mark_global_approval();
     /// assert!(registry.is_session_approved("any-session-id"));
     /// ```
-    pub fn mark_global_approval(&self, ttl: Duration) {
+    pub fn mark_global_approval(&self) {
         if let Ok(mut state) = self.state.lock() {
-            state.global_approval = Some(Instant::now() + ttl);
+            state.global_approval = true;
         }
     }
 
-    /// Restlaufzeit der prozessweiten Freigabe aus
-    /// [`Self::mark_global_approval`], falls noch gültig.
-    ///
-    /// # Beschreibung
-    /// Räumt eine bereits abgelaufene globale Freigabe beiläufig auf, genau
-    /// wie [`Self::is_session_approved`] es für sitzungseigene Zustimmungen
-    /// tut.
+    /// `true`, solange die prozessweite Freigabe aus
+    /// [`Self::mark_global_approval`] aktiv ist (nicht widerrufen).
     ///
     /// # Returns
-    /// `Some(duration)` mit der verbleibenden Zeit bis zum Ablauf, wenn
-    /// [`Self::mark_global_approval`] aufgerufen wurde und die Frist noch
-    /// nicht verstrichen ist; sonst `None` — auch bei vergiftetem [`Mutex`]
-    /// (fail-closed).
+    /// `true` nach [`Self::mark_global_approval`] und vor
+    /// [`Self::revoke_global_approval`]; sonst `false` — auch bei vergiftetem
+    /// [`Mutex`] (fail-closed).
     ///
     /// # Concurrency
     /// `Send + Sync`; sperrt kurz denselben [`Mutex`] wie jede andere Methode
-    /// dieses Typs.
+    /// dieses Typs. Rein lesend.
     ///
     /// # Examples
     /// ```rust
-    /// use std::time::Duration;
     /// use harw_sandbox::HostPermitSessionRegistry;
     ///
     /// let registry = HostPermitSessionRegistry::default();
-    /// assert_eq!(registry.global_approval_remaining(), None);
-    /// registry.mark_global_approval(Duration::from_secs(60));
-    /// assert!(registry.global_approval_remaining().is_some());
+    /// assert!(!registry.has_global_approval());
+    /// registry.mark_global_approval();
+    /// assert!(registry.has_global_approval());
     /// ```
     #[must_use]
-    pub fn global_approval_remaining(&self) -> Option<Duration> {
-        let Ok(mut state) = self.state.lock() else {
-            return None;
-        };
-        let now = Instant::now();
-        cleanup_global_approval(&mut state, now);
-        state
-            .global_approval
-            .map(|expires_at| expires_at.saturating_duration_since(now))
+    pub fn has_global_approval(&self) -> bool {
+        self.state.lock().is_ok_and(|state| state.global_approval)
     }
 
     /// Merkt sich eine prozessweite Einmal-Freigabe: der nächste
@@ -777,11 +691,10 @@ impl HostPermitSessionRegistry {
     ///
     /// # Examples
     /// ```rust
-    /// use std::time::Duration;
     /// use harw_sandbox::HostPermitSessionRegistry;
     ///
     /// let registry = HostPermitSessionRegistry::default();
-    /// registry.mark_global_approval(Duration::from_secs(60));
+    /// registry.mark_global_approval();
     /// registry.mark_global_single_use();
     /// registry.revoke_global_approval();
     /// assert!(!registry.is_session_approved("any-session-id"));
@@ -789,20 +702,9 @@ impl HostPermitSessionRegistry {
     /// ```
     pub fn revoke_global_approval(&self) {
         if let Ok(mut state) = self.state.lock() {
-            state.global_approval = None;
+            state.global_approval = false;
             state.global_single_use = false;
         }
-    }
-}
-
-/// Entfernt eine bereits abgelaufene globale Freigabe aus `state`, ohne die
-/// Sperre erneut zu nehmen (der Aufrufer hält sie bereits).
-fn cleanup_global_approval(state: &mut RegistryState, now: Instant) {
-    if state
-        .global_approval
-        .is_some_and(|expires_at| expires_at <= now)
-    {
-        state.global_approval = None;
     }
 }
 
@@ -814,6 +716,7 @@ mod tests {
     };
     use crate::test_support::{TestError, TestResult};
     use std::path::Path;
+    use std::time::Duration;
 
     fn request(session: &str, command: &str) -> ProcessPermitRequest {
         request_for_workspace(
@@ -833,11 +736,7 @@ mod tests {
         request: &ProcessPermitRequest,
     ) -> TestResult<ProcessPermitId> {
         ledger
-            .issue_after_local_approval(
-                request.clone(),
-                HostApprovalScope::SessionLease,
-                Duration::from_secs(60),
-            )
+            .issue_after_local_approval(request.clone(), HostApprovalScope::SessionLease, None)
             .map_err(|e| TestError::Context {
                 context: "issuing a valid host request must succeed",
                 source: e.to_string(),
@@ -848,39 +747,33 @@ mod tests {
     fn test_is_session_approved_before_and_after_mark_session_approved() {
         let registry = HostPermitSessionRegistry::default();
         assert!(!registry.is_session_approved("s1"));
-        registry.mark_session_approved("s1", Duration::from_secs(60));
+        registry.mark_session_approved("s1");
         assert!(registry.is_session_approved("s1"));
         assert!(!registry.is_session_approved("s2"));
     }
 
     #[test]
-    fn test_is_session_approved_after_ttl_elapses_returns_false() {
+    fn test_session_approval_does_not_expire_over_time() {
+        // Nutzerentscheidung 2026-09-24: kein Zeitablauf — nur der Nutzer
+        // beendet eine Host-Arbeitsphase.
         let registry = HostPermitSessionRegistry::default();
-        registry.mark_session_approved("s1", Duration::from_millis(20));
-        assert!(registry.is_session_approved("s1"));
-
-        std::thread::sleep(Duration::from_millis(60));
-
+        registry.mark_session_approved("s1");
+        std::thread::sleep(Duration::from_millis(30));
         assert!(
-            !registry.is_session_approved("s1"),
-            "an expired lease must no longer count as approved"
+            registry.is_session_approved("s1"),
+            "a session approval must stay active until the user revokes it"
         );
     }
 
     #[test]
-    fn test_mark_session_approved_replaces_an_existing_approval() {
-        // A second `mark_session_approved` for the same session must not
-        // accumulate a stale short-lived entry alongside a fresh long-lived
-        // one; the state carries exactly one expiry per session.
+    fn test_mark_session_approved_is_idempotent_and_one_revoke_ends_it() {
         let registry = HostPermitSessionRegistry::default();
-        registry.mark_session_approved("s1", Duration::from_millis(20));
-        registry.mark_session_approved("s1", Duration::from_secs(60));
-
-        std::thread::sleep(Duration::from_millis(60));
-
+        registry.mark_session_approved("s1");
+        registry.mark_session_approved("s1");
+        registry.revoke_session_approval("s1");
         assert!(
-            registry.is_session_approved("s1"),
-            "the later, longer-lived approval must win over the earlier short one"
+            !registry.is_session_approved("s1"),
+            "a repeated mark must not leave a second entry behind a single revoke"
         );
     }
 
@@ -903,7 +796,7 @@ mod tests {
     fn test_forget_session_clears_approval_and_returns_removed_ids() -> TestResult {
         let ledger = ProcessPermitLedger::default();
         let registry = HostPermitSessionRegistry::default();
-        registry.mark_session_approved("s1", Duration::from_secs(60));
+        registry.mark_session_approved("s1");
         let req = request("s1", "echo hi");
         let id = issue(&ledger, &req)?;
         registry.remember_permit(req.clone(), id);
@@ -956,7 +849,7 @@ mod tests {
     #[test]
     fn test_revoke_session_approval_removes_session_and_single_use_and_is_idempotent() {
         let registry = HostPermitSessionRegistry::default();
-        registry.mark_session_approved("s1", Duration::from_secs(60));
+        registry.mark_session_approved("s1");
         registry.mark_single_use("s1".to_owned());
 
         registry.revoke_session_approval("s1");
@@ -975,34 +868,6 @@ mod tests {
         assert!(!registry.is_session_approved("unknown"));
     }
 
-    #[test]
-    fn test_session_approval_remaining_none_without_approval() {
-        let registry = HostPermitSessionRegistry::default();
-        assert_eq!(registry.session_approval_remaining("s1"), None);
-    }
-
-    #[test]
-    fn test_session_approval_remaining_some_before_expiry() -> TestResult {
-        let registry = HostPermitSessionRegistry::default();
-        registry.mark_session_approved("s1", Duration::from_secs(60));
-        let remaining = registry
-            .session_approval_remaining("s1")
-            .ok_or(TestError::Missing(
-                "a freshly approved session's remaining time",
-            ))?;
-        assert!(remaining <= Duration::from_secs(60));
-        assert!(remaining > Duration::from_secs(0));
-        Ok(())
-    }
-
-    #[test]
-    fn test_session_approval_remaining_none_after_expiry() {
-        let registry = HostPermitSessionRegistry::default();
-        registry.mark_session_approved("s1", Duration::from_millis(20));
-        std::thread::sleep(Duration::from_millis(60));
-        assert_eq!(registry.session_approval_remaining("s1"), None);
-    }
-
     // ── Prozessweite Freigabe (Nutzerwunsch „volle Sandbox-Deaktivierung“,
     // 2026-09-21) ────────────────────────────────────────────────────────────
 
@@ -1010,7 +875,7 @@ mod tests {
     fn test_mark_global_approval_is_seen_by_a_session_that_never_approved_itself() {
         let registry = HostPermitSessionRegistry::default();
         assert!(!registry.is_session_approved("foreign-session"));
-        registry.mark_global_approval(Duration::from_secs(60));
+        registry.mark_global_approval();
         assert!(
             registry.is_session_approved("foreign-session"),
             "a global approval must cover every session id, not just the one that requested it"
@@ -1019,41 +884,22 @@ mod tests {
     }
 
     #[test]
-    fn test_global_approval_remaining_none_without_approval_and_some_after() -> TestResult {
+    fn test_has_global_approval_before_and_after_mark() {
         let registry = HostPermitSessionRegistry::default();
-        assert_eq!(registry.global_approval_remaining(), None);
-        registry.mark_global_approval(Duration::from_secs(60));
-        let remaining = registry
-            .global_approval_remaining()
-            .ok_or(TestError::Missing(
-                "a freshly marked global approval's remaining time",
-            ))?;
-        assert!(remaining <= Duration::from_secs(60));
-        assert!(remaining > Duration::from_secs(0));
-        Ok(())
+        assert!(!registry.has_global_approval());
+        registry.mark_global_approval();
+        assert!(registry.has_global_approval());
     }
 
     #[test]
-    fn test_global_approval_remaining_none_after_expiry() {
+    fn test_global_approval_does_not_expire_over_time() {
         let registry = HostPermitSessionRegistry::default();
-        registry.mark_global_approval(Duration::from_millis(20));
-        std::thread::sleep(Duration::from_millis(60));
-        assert_eq!(registry.global_approval_remaining(), None);
-        assert!(
-            !registry.is_session_approved("foreign-session"),
-            "an expired global approval must no longer count as approved"
-        );
-    }
-
-    #[test]
-    fn test_mark_global_approval_replaces_an_existing_global_approval() {
-        let registry = HostPermitSessionRegistry::default();
-        registry.mark_global_approval(Duration::from_millis(20));
-        registry.mark_global_approval(Duration::from_secs(60));
-        std::thread::sleep(Duration::from_millis(60));
+        registry.mark_global_approval();
+        std::thread::sleep(Duration::from_millis(30));
+        assert!(registry.has_global_approval());
         assert!(
             registry.is_session_approved("foreign-session"),
-            "the later, longer-lived global approval must win over the earlier short one"
+            "a global approval must stay active until the user revokes it"
         );
     }
 
@@ -1116,13 +962,13 @@ mod tests {
     #[test]
     fn test_revoke_global_approval_removes_both_global_approval_and_global_single_use() {
         let registry = HostPermitSessionRegistry::default();
-        registry.mark_global_approval(Duration::from_secs(60));
+        registry.mark_global_approval();
         registry.mark_global_single_use();
 
         registry.revoke_global_approval();
         assert!(!registry.is_session_approved("foreign-session"));
         assert!(!registry.has_global_single_use());
-        assert_eq!(registry.global_approval_remaining(), None);
+        assert!(!registry.has_global_approval());
 
         // Zweiter Aufruf ist ein No-Op statt eines Fehlers oder einer Panik.
         registry.revoke_global_approval();
@@ -1132,8 +978,8 @@ mod tests {
     #[test]
     fn test_revoke_global_approval_leaves_an_independent_session_approval_untouched() {
         let registry = HostPermitSessionRegistry::default();
-        registry.mark_session_approved("s1", Duration::from_secs(60));
-        registry.mark_global_approval(Duration::from_secs(60));
+        registry.mark_session_approved("s1");
+        registry.mark_global_approval();
 
         registry.revoke_global_approval();
 
@@ -1142,23 +988,5 @@ mod tests {
             "revoking the global approval must not remove an independent session-own approval"
         );
         assert!(!registry.is_session_approved("foreign-session"));
-    }
-
-    #[test]
-    fn test_session_approval_remaining_is_the_max_of_session_own_and_global() -> TestResult {
-        let registry = HostPermitSessionRegistry::default();
-        registry.mark_session_approved("s1", Duration::from_millis(20));
-        registry.mark_global_approval(Duration::from_secs(60));
-
-        let remaining = registry
-            .session_approval_remaining("s1")
-            .ok_or(TestError::Missing(
-                "either the session-own or the global approval",
-            ))?;
-        assert!(
-            remaining > Duration::from_millis(20),
-            "the longer global approval must win over the shorter session-own one: {remaining:?}"
-        );
-        Ok(())
     }
 }

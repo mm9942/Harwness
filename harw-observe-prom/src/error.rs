@@ -2,7 +2,7 @@
 //!
 //! # Verantwortungsbereich
 //! Trägt [`PromError`], den einen Fehlertyp dieser Crate (Vertrag §H.1,
-//! `docs/aw-contract-master.md`). Die einzige fehlbare Operation dieser
+//! `docs/design/build-history.md`). Die einzige fehlbare Operation dieser
 //! Crate ist [`crate::PromEndpoint::bind`]: Socket-Bindung (TCP-Loopback
 //! oder Unix-Socket) und die Typ-Zwang-Tiefenverteidigung gegen eine
 //! Nicht-Loopback-Adresse (siehe Moduldoc von `crate::endpoint`).

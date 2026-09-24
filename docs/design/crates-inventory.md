@@ -1,6 +1,8 @@
 # Harwness Crate Inventory (Procurement List)
 
-Status: design-time inventory, researched 2026-07-14 against crates.io. This is the
+> Status: partially implemented · Last reviewed: 2026-09-24
+
+Design-time inventory, researched 2026-07-14 against crates.io. This is the
 canonical list of external dependencies for the crates planned in
 [interaction-contract.md](interaction-contract.md),
 [tui-command-contract.md](tui-command-contract.md),
@@ -28,7 +30,7 @@ canonical list of external dependencies for the crates planned in
 | toml 0.8 | harw-config | keep |
 | uuid 1 (`v4`) | harw-types | **add `v7` feature** for time-ordered IDs |
 | secrecy 0.8 | harw-provider | workspace convention for in-memory secrets; wraps zeroize |
-| tokio 1 (`rt`, `sync`, `macros`) | harw-core | features grow to `net`, `time`, `rt-multi-thread` once harw-channel lands |
+| tokio 1 (`rt`, `sync`, `macros`, `net`, `time`, `rt-multi-thread`) | harw-core, harw-channel | features grew once `harw-channel` landed |
 | once_cell, url, async-trait | various | keep |
 
 ## harw-tui
@@ -130,8 +132,8 @@ See [secrets-and-audit.md](secrets-and-audit.md) for the full design.
 Rules: crypt_guard is consumed as a **crates.io dependency** (not a path dep)
 so Harwness builds standalone. **No direct deps** on ml-kem, ml-dsa, slh-dsa,
 hkdf, chacha20poly1305, aes-gcm-siv — they come transitively through
-crypt_guard. No securehub-* dependencies of any kind (reference-only study;
-Harwness is independent of sgh-flow).
+crypt_guard. No dependency on any external reference-only study project;
+Harwness's cryptography is self-contained.
 
 Hand-rolled: hash-chained audit log (prev-hash linking + periodically
 ML-DSA-signed chain-head checkpoints) — no existing crate or in-house project

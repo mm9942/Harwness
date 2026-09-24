@@ -15,7 +15,7 @@
 //!
 //! Defaults sind bewusst restriktiv (`Default = sicher/aus`): Bind ist immer
 //! Loopback, Port `0` (ephemer statt eines vorhersagbaren Standardports).
-//! Laut `docs/remediation/ledger/W3/C-CFG.md` gilt **"Web-Bind nicht vom
+//! Es gilt **"Web-Bind nicht vom
 //! Repo"**: ein nicht vertrauter Repo-Layer darf `[web]` überhaupt nicht
 //! beeinflussen — weder verengend noch erweiternd. Die Merge-Logik (die
 //! diese Sektion aus einem Repo-Layer schlicht ignoriert) lebt in

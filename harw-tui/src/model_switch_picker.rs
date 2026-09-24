@@ -1,8 +1,6 @@
 //! Zweistufiger Provider/Modell-Umschalt-Picker für `/model`- und
 //! `/uia model`-artige Befehle.
 //!
-//! Spec-Quelle: `recursive-cooking-lobster.md`, Abschnitt "Welle 1 — 1d".
-//!
 //! # Verantwortung
 //! Kapselt die Zwei-Stufen-Navigation (Provider auswählen → Modell
 //! auswählen) hinter einem einzigen Widget, das intern zwei
@@ -74,8 +72,9 @@ pub(crate) enum PickerTarget {
         /// Provider-ID, an die dieser Worker gebunden ist.
         fixed_provider: String,
     },
-    /// Modell einer internen Rolle (`/models set`, ab nächster Sitzung);
-    /// Provider frei wählbar.
+    /// Modell einer internen Rolle (`/models set`; Kind-Rollen sofort für
+    /// neu gestartete Agenten, übrige ab nächster Sitzung); Provider frei
+    /// wählbar.
     Role {
         /// Die Rolle, deren Modell gesetzt wird.
         role: ModelRole,
@@ -120,7 +119,14 @@ impl PickerTarget {
             Self::Uia => "UIA-Modell".to_owned(),
             Self::UiaWorker { .. } => "UIA-Worker-Modell".to_owned(),
             Self::Role { role } => {
-                format!("Modell für {} (ab nächster Sitzung)", role.label())
+                // Live-Modellwechsel: Kind-Rollen gelten sofort für neue
+                // Agenten, alle übrigen erst ab der nächsten Sitzung.
+                let effect = if role.applies_to_new_agents_live() {
+                    "neue Agenten sofort"
+                } else {
+                    "ab nächster Sitzung"
+                };
+                format!("Modell für {} ({effect})", role.label())
             }
             Self::UiaWorkerRole { role } => format!("UIA-Worker-Modell für {role}"),
         }
@@ -875,6 +881,11 @@ mod tests {
         }
         .context_label();
         assert!(label.contains(ModelRole::Explorer.label()));
+        assert!(label.contains("neue Agenten sofort"));
+        let label = PickerTarget::Role {
+            role: ModelRole::SessionTitle,
+        }
+        .context_label();
         assert!(label.contains("ab nächster Sitzung"));
     }
 

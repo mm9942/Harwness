@@ -1,7 +1,7 @@
 //! Wiederverwendbarer nummerierter Auswahldialog im Stil des Freigabe-Panels.
 //!
-//! Spec-Quelle: `nope-permissions-gibt-es-wild-lobster.md` Schritt 3
-//! (Freigabe-Panel, nummerierte Optionen) und `harw-scopes-contract.md`
+//! Spec-Quelle: Freigabe-Panel mit nummerierten Optionen,
+//! `docs/design/tui-command-contract.md`
 //! Slice E1 (`/export`-Auswahl: Zwischenablage / Datei / Abbrechen).
 //!
 //! # Verantwortung
@@ -20,15 +20,20 @@
 //! # Fehlertypen
 //! Keine — alle Operationen sind infallibel.
 
-use crossterm::event::{KeyCode, KeyEvent};
+use crossterm::event::{KeyCode, KeyEvent, MouseEventKind};
 use ratatui::{
     buffer::Buffer,
     layout::Rect,
     style::Style,
     text::Line,
-    widgets::{Block, Borders, Widget},
+    widgets::{
+        Block, Borders, Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState, StatefulWidget,
+        Widget, Wrap,
+    },
 };
+use unicode_width::UnicodeWidthChar;
 
+use crate::dialog_frame::{BodyScroll, wrapped_rows};
 use crate::sanitize::sanitize_inline;
 use crate::style;
 
@@ -78,6 +83,9 @@ pub struct ChoiceDialog {
     /// [`Self::with_footer_hint`]). `None` (der Standard bei [`Self::new`])
     /// belässt es beim Standardtext.
     footer_hint: Option<String>,
+    /// Scroll-Zustand des Hinweistexts (langer Befehl/Grund der
+    /// Host-Permit-Frage), `Strg+↑↓` bzw. Mausrad.
+    body_scroll: BodyScroll,
 }
 
 impl ChoiceDialog {
@@ -112,6 +120,7 @@ impl ChoiceDialog {
             options,
             selected: 0,
             footer_hint: None,
+            body_scroll: BodyScroll::default(),
         }
     }
 
@@ -178,6 +187,7 @@ impl ChoiceDialog {
     /// plus eine Leerzeile (siehe [`Self::render`]) plus eine Zeile je Option
     /// plus die Fußzeile (1).
     #[must_use]
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn desired_height(&self) -> u16 {
         let border = 2u16;
         let prompt_rows: u16 = if self.prompt.is_some() { 2 } else { 0 };
@@ -187,6 +197,55 @@ impl ChoiceDialog {
             .saturating_add(prompt_rows)
             .saturating_add(option_rows)
             .saturating_add(footer_rows)
+    }
+
+    /// Wie [`Self::desired_height`], aber mit umgebrochenem Hinweistext und
+    /// umgebrochener Fußzeile bei der Gesamtbreite `width` (inkl. Rahmen) —
+    /// für Aufrufer, die den Dialog anstelle des Composers zeichnen.
+    #[must_use]
+    pub fn desired_height_for(&self, width: u16) -> u16 {
+        let inner = width.saturating_sub(2).max(1);
+        let prompt_rows = self
+            .prompt_lines(style::Theme::Dark)
+            .map_or(0, |lines| wrapped_rows(&lines, inner).saturating_add(1));
+        let footer_rows = wrapped_rows(&[Line::from(self.footer_text().to_owned())], inner);
+        let rows = 2 + prompt_rows + self.options.len() + footer_rows;
+        u16::try_from(rows).unwrap_or(u16::MAX)
+    }
+
+    /// Scrollt den Hinweistext per Mausrad.
+    ///
+    /// # Rückgabe
+    /// `true` für Rad-Ereignisse (neu zeichnen).
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub fn scroll_wheel(&self, kind: MouseEventKind) -> bool {
+        self.body_scroll.handle_wheel(kind)
+    }
+
+    /// Scrollt den Hinweistext um `lines` Zeilen; ändert nie die Auswahl.
+    ///
+    /// # Rückgabe
+    /// Immer `true` (neu zeichnen).
+    pub fn scroll_body(&self, up: bool, lines: usize) -> bool {
+        if up {
+            self.body_scroll.scroll_up(lines);
+        } else {
+            self.body_scroll.scroll_down(lines);
+        }
+        true
+    }
+
+    fn footer_text(&self) -> &str {
+        self.footer_hint.as_deref().unwrap_or(FOOTER_HINT)
+    }
+
+    fn prompt_lines(&self, theme: style::Theme) -> Option<Vec<Line<'static>>> {
+        self.prompt.as_ref().map(|prompt| {
+            vec![Line::styled(
+                sanitize_inline(prompt),
+                style::dim_style(theme),
+            )]
+        })
     }
 
     /// Verarbeitet einen Tastendruck und gibt eine [`ChoiceAction`] zurück.
@@ -217,6 +276,10 @@ impl ChoiceDialog {
     /// assert_eq!(dialog.handle_key(key), ChoiceAction::Cancel);
     /// ```
     pub fn handle_key(&mut self, key: KeyEvent) -> ChoiceAction {
+        // `Strg+↑↓` scrollt den Hinweistext und ändert nie die Auswahl.
+        if self.body_scroll.handle_key(&key) {
+            return ChoiceAction::Stay;
+        }
         match key.code {
             KeyCode::Up => {
                 self.selected = self.selected.saturating_sub(1);
@@ -268,6 +331,7 @@ impl ChoiceDialog {
     /// # Nebenläufigkeit
     /// Rein synchron; kein Locking erforderlich.
     pub fn render(&self, area: Rect, buf: &mut Buffer, theme: style::Theme) {
+        let area = area.intersection(buf.area);
         let title = sanitize_inline(&self.title);
         let block = Block::default().borders(Borders::ALL).title(title);
         let inner = block.inner(area);
@@ -276,31 +340,88 @@ impl ChoiceDialog {
         if inner.width == 0 || inner.height == 0 {
             return;
         }
+        let width = inner.width;
+        let height = usize::from(inner.height);
 
-        let mut y = inner.y;
-        let bottom = inner.bottom();
+        // Fußzeile: angeheftet unten, umgebrochen statt abgeschnitten.
+        let footer = vec![Line::styled(
+            self.footer_text().to_owned(),
+            style::dim_style(theme),
+        )];
+        let footer_rows = if height >= 2 {
+            wrapped_rows(&footer, width).min(height - 1)
+        } else {
+            0
+        };
+        let available = height - footer_rows;
 
-        if let Some(prompt) = &self.prompt {
-            if y < bottom {
-                let prompt_area = Rect::new(inner.x, y, inner.width, 1);
-                Widget::render(
-                    Line::styled(sanitize_inline(prompt), style::dim_style(theme)),
-                    prompt_area,
+        // Hinweistext: bekommt, was die Optionen übrig lassen (mindestens
+        // eine Zeile), und scrollt darüber hinaus.
+        let prompt = self.prompt_lines(theme);
+        let prompt_rows = prompt
+            .as_ref()
+            .map_or(0, |lines| wrapped_rows(lines, width));
+        let rest = available.saturating_sub(self.options.len());
+        let (prompt_height, gap) = if prompt_rows == 0 {
+            (0, 0)
+        } else if rest > prompt_rows {
+            (prompt_rows, 1)
+        } else if rest >= 1 {
+            (rest, 0)
+        } else if available > 1 {
+            (1, 0)
+        } else {
+            (0, 0)
+        };
+        let max_offset = prompt_rows.saturating_sub(prompt_height);
+        self.body_scroll.set_limit(max_offset);
+        let offset = self.body_scroll.offset();
+        if let Some(lines) = prompt
+            && prompt_height > 0
+        {
+            let prompt_area = Rect {
+                height: u16::try_from(prompt_height).unwrap_or(inner.height),
+                ..inner
+            };
+            Paragraph::new(lines)
+                .wrap(Wrap { trim: false })
+                .scroll((u16::try_from(offset).unwrap_or(u16::MAX), 0))
+                .render(prompt_area, buf);
+            if max_offset > 0 {
+                let bar_area = Rect {
+                    width: inner.width.saturating_add(1),
+                    ..prompt_area
+                }
+                .intersection(area);
+                let mut state = ScrollbarState::new(max_offset.saturating_add(1))
+                    .position(offset)
+                    .viewport_content_length(prompt_height);
+                StatefulWidget::render(
+                    Scrollbar::new(ScrollbarOrientation::VerticalRight)
+                        .begin_symbol(None)
+                        .end_symbol(None),
+                    bar_area,
                     buf,
+                    &mut state,
                 );
-                y = y.saturating_add(1);
             }
-            // Leerzeile zwischen Hinweis und Optionsliste, sofern Platz vorhanden.
-            y = y.saturating_add(1).min(bottom);
         }
 
-        let footer_reserved: u16 = if inner.height >= 2 { 1 } else { 0 };
-        let list_bottom = bottom.saturating_sub(footer_reserved);
-
-        for (idx, option) in self.options.iter().enumerate() {
-            if y >= list_bottom {
-                break;
-            }
+        // Optionen: ein Fenster um die Auswahl, falls nicht alle passen.
+        let options_height = available.saturating_sub(prompt_height + gap);
+        let start = if options_height > 0 && self.selected >= options_height {
+            self.selected + 1 - options_height
+        } else {
+            0
+        };
+        let mut y = inner.y + u16::try_from(prompt_height + gap).unwrap_or(inner.height);
+        for (idx, option) in self
+            .options
+            .iter()
+            .enumerate()
+            .skip(start)
+            .take(options_height)
+        {
             let is_selected = idx == self.selected;
             let marker = if is_selected { "❯ " } else { "  " };
             let row_style = if is_selected {
@@ -308,22 +429,49 @@ impl ChoiceDialog {
             } else {
                 Style::default()
             };
-            let label = format!("{marker}{}. {}", idx + 1, sanitize_inline(option));
+            let label = fit_to_width(
+                &format!("{marker}{}. {}", idx + 1, sanitize_inline(option)),
+                usize::from(width),
+            );
             let row_area = Rect::new(inner.x, y, inner.width, 1);
             Widget::render(Line::styled(label, row_style), row_area, buf);
             y = y.saturating_add(1);
         }
 
-        if footer_reserved == 1 {
-            let footer_text = self.footer_hint.as_deref().unwrap_or(FOOTER_HINT);
-            let footer_area = Rect::new(inner.x, bottom - 1, inner.width, 1);
-            Widget::render(
-                Line::styled(footer_text, style::dim_style(theme)),
-                footer_area,
-                buf,
-            );
+        if footer_rows > 0 {
+            let footer_height = u16::try_from(footer_rows).unwrap_or(1);
+            let footer_area = Rect {
+                y: inner.bottom() - footer_height,
+                height: footer_height,
+                ..inner
+            };
+            Paragraph::new(footer)
+                .wrap(Wrap { trim: false })
+                .render(footer_area, buf);
         }
     }
+}
+
+/// Kürzt `text` auf `width` Spalten (mit `…`), ohne Zeichen zu zerteilen.
+fn fit_to_width(text: &str, width: usize) -> String {
+    let total: usize = text.chars().map(|ch| ch.width().unwrap_or(0)).sum();
+    if total <= width {
+        return text.to_owned();
+    }
+    let mut out = String::new();
+    let mut used = 0;
+    for ch in text.chars() {
+        let w = ch.width().unwrap_or(0);
+        if used + w + 1 > width {
+            break;
+        }
+        used += w;
+        out.push(ch);
+    }
+    if width > 0 {
+        out.push('…');
+    }
+    out
 }
 
 // ---------------------------------------------------------------------------
@@ -518,5 +666,58 @@ mod tests {
             .join("");
 
         assert!(rendered.contains(FOOTER_HINT));
+    }
+
+    /// Host-Permit-Muster: langer Hinweistext in einem kleinen Fenster —
+    /// Optionen und Fußzeile bleiben sichtbar, der Hinweis scrollt, ohne
+    /// die Auswahl zu ändern.
+    #[test]
+    fn test_long_prompt_scrolls_while_options_stay_visible() {
+        let prompt = (0..30)
+            .map(|i| format!("wort{i}"))
+            .collect::<Vec<_>>()
+            .join(" ");
+        let mut dialog = ChoiceDialog::new(
+            "Host-Ausführung erlauben?",
+            Some(prompt),
+            vec![
+                "Einmalig".to_owned(),
+                "Für die Sitzung".to_owned(),
+                "Nein, ablehnen".to_owned(),
+            ],
+        )
+        .with_selected(1);
+        let render = |dialog: &ChoiceDialog| {
+            let area = Rect::new(0, 0, 40, 8);
+            let mut buf = Buffer::empty(area);
+            dialog.render(area, &mut buf, style::Theme::Dark);
+            (0..8u16)
+                .map(|y| (0..40u16).map(|x| buf[(x, y)].symbol()).collect::<String>())
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+        let before = render(&dialog);
+        for needle in [
+            "1. Einmalig",
+            "2. Für die Sitzung",
+            "3. Nein, ablehnen",
+            "wort0",
+        ] {
+            assert!(before.contains(needle), "{needle}: {before}");
+        }
+        assert!(dialog.desired_height_for(40) > 8);
+        let ctrl_down = KeyEvent::new(KeyCode::Down, KeyModifiers::CONTROL);
+        assert_eq!(dialog.handle_key(ctrl_down), ChoiceAction::Stay);
+        assert!(dialog.scroll_wheel(crossterm::event::MouseEventKind::ScrollDown));
+        let after = render(&dialog);
+        assert!(!after.contains("wort0 "), "{after}");
+        for needle in ["1. Einmalig", "❯ 2. Für die Sitzung", "3. Nein, ablehnen"] {
+            assert!(after.contains(needle), "{needle}: {after}");
+        }
+        assert_eq!(
+            dialog.handle_key(make_key(KeyCode::Enter)),
+            ChoiceAction::Chosen(1),
+            "Scrollen hat die Auswahl nicht verändert"
+        );
     }
 }

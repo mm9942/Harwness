@@ -77,10 +77,13 @@ jobs:
   check:
     name: fmt, clippy, test (root workspace)
     needs: changes
+    # Auch bei `dod`-Änderungen: die Struktur-Gates (`xtask gates`) laden
+    # Produkt- und DoD-Workspace zusammen und prüfen die DoD-Binaries.
     if: >-
       ${{ !cancelled() && (github.event_name != 'pull_request'
       || needs.changes.result != 'success'
       || needs.changes.outputs.rust == 'true'
+      || needs.changes.outputs.dod == 'true'
       || needs.changes.outputs.workflows == 'true') }}
     runs-on: ubuntu-latest
     steps:
@@ -124,6 +127,17 @@ jobs:
 
       - name: cargo clippy
         run: cargo clippy --workspace --tests -- -D warnings
+
+      # Die Warden-Gates lesen `dod/Cargo.lock` und die entpackten Quellen im
+      # Registry-Cache; der Root-Build holt nur die Pakete aus `Cargo.lock`.
+      - name: Fetch dod dependencies (for xtask gates)
+        run: cargo fetch --locked --manifest-path dod/Cargo.toml --target x86_64-unknown-linux-gnu
+
+      # Verbotene Kanten, Privilegienbudget je DoD-Binary, Warden-Hülle und
+      # kein C-Build im Warden-Teilbaum. Ein Gate, das nichts geprüft hat,
+      # ist rot (siehe xtask/src/gates.rs).
+      - name: xtask gates
+        run: cargo run -q -p xtask -- gates
 
       # nextest führt jeden Test in einem eigenen Prozess parallel aus; Doc-Tests
       # unterstützt nextest nicht, die laufen separat über `cargo test --doc`.

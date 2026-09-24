@@ -239,9 +239,8 @@ impl Sensor for ScanReportSensor {
 /// Pfadzugriff, also keine zusätzliche TOCTOU-Lücke zwischen Typprüfung und
 /// diesem einen `open()`-Aufruf.
 ///
-/// Kein `harw-fsutil`-`O_NOFOLLOW`-Pfad: `harw-fsutil` ist zum Zeitpunkt
-/// dieser Korrektur keine Abhängigkeit dieser Crate (siehe Ledger
-/// `docs/remediation/ledger/W5/D-SEC.md`); Symlink-Auflösung ist ohnehin
+/// Kein `harw-fsutil`-`O_NOFOLLOW`-Pfad: `harw-fsutil` ist keine
+/// Abhängigkeit dieser Crate; Symlink-Auflösung ist ohnehin
 /// bereits Aufgabe von `harw_dod_cap::ReadScope` (über
 /// [`harw_dod_readfs::glob::glob`]/[`harw_dod_readfs::read_to_string`]) —
 /// diese Funktion prüft ausschließlich den Dateityp, nicht die
@@ -249,8 +248,7 @@ impl Sensor for ScanReportSensor {
 ///
 /// # Warum das Literal `0o4000` statt einer `libc`/`rustix`-Abhängigkeit
 /// `O_NONBLOCK` ist auf Linux ABI-stabil `0o4000` (`<fcntl.h>`, `asm-generic`);
-/// dieser Workspace baut ausschließlich für Linux (x86_64/aarch64 — siehe
-/// Ledger `docs/remediation/ledger/W3/C-FIXT.md`, Abschnitt API-Nachweis).
+/// dieser Workspace baut ausschließlich für Linux (x86_64/aarch64).
 /// Eine neue Abhängigkeit nur für diese eine, plattformweit garantierte
 /// Konstante wäre eine unnötige `dep-request`.
 ///
@@ -261,9 +259,8 @@ impl Sensor for ScanReportSensor {
 /// zweites Mal. Zwischen beiden Aufrufen könnte ein Angreifer mit
 /// Schreibzugriff auf dasselbe Verzeichnis den Pfad erneut gegen eine FIFO
 /// austauschen — dieselbe Restlücke, die auch `harw-dod-cap`s
-/// `ReadScope::open` zwischen Kanonisierung und `File::open` trägt (siehe
-/// Ledger `docs/remediation/ledger/W3/C-SCOPE.md`, Abschnitt „Offene
-/// Annahmen"). Ein vollständiger Fix bräuchte eine `openat2`-gestützte
+/// `ReadScope::open` zwischen Kanonisierung und `File::open` trägt (offene
+/// Annahme). Ein vollständiger Fix bräuchte eine `openat2`-gestützte
 /// Grundfunktion in `harw-dod-cap`/`harw-dod-readfs` (außerhalb dieser
 /// Zuständigkeit) statt eines zweiten, unabhängigen `open()`-Aufrufs hier.
 /// Diese Korrektur schließt den **unbedingten** Block auf einer dauerhaft
@@ -750,10 +747,8 @@ mod tests {
     /// darf weder den Abruf scheitern lassen noch einen Treffer für seinen
     /// eigenen Inhalt erzeugen — die Treffer eines echten Nachbarn müssen
     /// trotzdem ankommen. Steht stellvertretend für die FIFO-Variante aus dem
-    /// Befund (siehe `open_if_regular_file`-Unit-Tests oben und Ledger
-    /// `docs/remediation/ledger/W5/D-SEC.md` für die Begründung, warum eine
-    /// echte FIFO ohne neue Testabhängigkeit hier nicht angelegt werden
-    /// kann).
+    /// Befund (siehe `open_if_regular_file`-Unit-Tests oben) — eine echte
+    /// FIFO kann ohne neue Testabhängigkeit hier nicht angelegt werden.
     #[test]
     fn test_poll_skips_directory_shaped_like_a_report_but_still_reports_sibling_file() -> TestResult
     {

@@ -2,6 +2,8 @@
 name = "harw-tool-process"
 version.workspace = true
 edition.workspace = true
+license.workspace = true
+repository.workspace = true
 rust-version.workspace = true
 description = "Agent-Werkzeuge process.list/process.kill über die Bibliotheks-API von harw-killer (nur Linux)."
 publish.workspace = true

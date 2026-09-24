@@ -1,6 +1,6 @@
 //! `/export` — fordert einen Export der Sitzung an (keine Datei-E/A hier).
 //!
-//! Spec-Quelle: Contract `harw-scopes-contract.md`, „Nachträgliche
+//! Spec-Quelle: Contract `docs/design/tui-command-contract.md`, „Nachträgliche
 //! Entscheidungen" (Slice E1: Auswahl „in die Zwischenablage kopieren" /
 //! „als Datei speichern" / „abbrechen"), Slice B4.
 //!

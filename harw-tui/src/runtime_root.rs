@@ -1034,8 +1034,7 @@ fn build_root_runtime(
         app = app.with_plan_services(TuiPlanServices::from(plan));
     }
     if let Some(store_root) = session_store_root {
-        // Aufgabe 2 (Plan `recursive-cooking-lobster.md` Teil F): die
-        // Session-Store-Wurzel wird IMMER hinterlegt, wenn sie bekannt ist —
+        // Die Session-Store-Wurzel wird IMMER hinterlegt, wenn sie bekannt ist —
         // unabhängig von `[session] title_generation`. Das ist die einzige
         // zuverlässige Grundlage für `apply_session_store_started_at`
         // (`app.rs`), das für JEDE fortgesetzte Sitzung das tatsächliche
@@ -1624,8 +1623,8 @@ mod tests {
             "session-a",
             Some("Mein Titel"),
             0,
-            Some("/home/mia/projects/harwness"),
-            Some("/home/mia/projects/harwness/sub"),
+            Some("/home/user/projects/harwness"),
+            Some("/home/user/projects/harwness/sub"),
         );
 
         let entry = session_entry_from_meta(SessionId::from_str("session-a"), &meta);
@@ -1635,7 +1634,7 @@ mod tests {
         assert_eq!(entry.last_active, SystemTime::from(meta.last_opened_at));
         assert_eq!(
             entry.project_label.as_deref(),
-            Some("/home/mia/projects/harwness"),
+            Some("/home/user/projects/harwness"),
             "project_root has priority over cwd"
         );
         assert_eq!(entry.turns, None, "zero completed turns must not be shown");
@@ -1729,12 +1728,12 @@ mod greeting_tests {
         .assume_utc();
         let greeting = tui_greeting_at(
             "/work/Harwness",
-            Some("harwness.agent.emily-ui"),
-            "Mia",
+            Some("harwness.agent.assistant-ui"),
+            "Alice",
             None,
             now,
         );
-        assert!(greeting.starts_with("emily-ui: Guten Abend, Mia!"));
+        assert!(greeting.starts_with("assistant-ui: Guten Abend, Alice!"));
         assert!(greeting.contains("»Harwness«"));
         assert!(greeting.contains("2026-09-14 19:05 UTC"));
         Ok(())
@@ -1751,12 +1750,12 @@ mod greeting_tests {
         let greeting = tui_greeting_at(
             "/work/Harwness",
             Some("harwness.agent.terminal-ui@1"),
-            "Mia",
+            "Alice",
             None,
             now,
         );
 
-        assert!(greeting.starts_with("terminal-ui@1: Guten Morgen, Mia!"));
+        assert!(greeting.starts_with("terminal-ui@1: Guten Morgen, Alice!"));
         Ok(())
     }
 
@@ -1769,8 +1768,8 @@ mod greeting_tests {
         .assume_utc();
         let greeting = tui_greeting_at(
             "/work/Harwness",
-            Some("harwness.agent.emily-ui"),
-            "Mia",
+            Some("harwness.agent.assistant-ui"),
+            "Alice",
             Some("Provider: anthropic · Modell: claude-sonnet"),
             now,
         );
@@ -1787,8 +1786,8 @@ mod greeting_tests {
         .assume_utc();
         let greeting = tui_greeting_at(
             "/work/Harwness",
-            Some("harwness.agent.emily-ui"),
-            "Mia",
+            Some("harwness.agent.assistant-ui"),
+            "Alice",
             None,
             now,
         );

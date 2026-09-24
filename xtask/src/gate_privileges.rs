@@ -48,13 +48,13 @@
 //!
 //! Es bleibt also bei einer **handgepflegten Tabelle**
 //! ([`CRATE_PRIVILEGE`]) — ausdrücklich benannt, nicht versteckt: das ist
-//! genau die Machtstruktur, gegen die `gate_writescopes.rs` mit gutem Grund
+//! genau die Machtstruktur, gegen die das frühere Schreibbereichs-Gate mit gutem Grund
 //! antritt ("ein unvollständiges Prüfinstrument ist schlechter als keins,
 //! weil es Sicherheit suggeriert"). Der Unterschied, der diese Tabelle
 //! rechtfertigt, ist die nächste Sektion.
 //!
 //! # Warum eine unbekannte Crate ein Verstoß ist
-//! Die Schreibbereichstabelle in `gate_writescopes.rs` scheiterte, weil eine
+//! Die Schreibbereichstabelle des früheren Schreibbereichs-Gates scheiterte, weil eine
 //! **fehlende Zeile als "kein Problem" galt** — sechzehn Lücken blieben
 //! unbemerkt, weil Schweigen dort Zustimmung bedeutete. Diese Tabelle macht
 //! das Gegenteil zur Regel: [`lookup_privilege`] liefert `None` für jede
@@ -107,21 +107,16 @@
 //! Wirkung, ohne eine neue Fähigkeit des Graphen vorauszusetzen.
 //!
 //! # Fehlendes Binary
-//! Zwei der vier Crates (`harw-probe-bpf`, `harw-warden`) sind heute reine
-//! Gerüste: ihre `[dependencies]`-Tabelle ist vollständig leer (siehe
-//! `harw-probe-bpf/Cargo.toml`, `harw-warden/Cargo.toml`) — kein interner und
-//! kein externer Eintrag. [`missing_binaries`] erkennt das über genau dieses
-//! Signal (leer *und* leer, nicht bloß "kein interner Dep"), statt über eine
-//! zweite, gepflegte Liste "welche Binaries gibt es schon" — eine zweite
-//! Liste wäre ihrerseits eine Quelle für stille Lücken. Ein so erkanntes
-//! fehlendes Binary macht das Gate **nicht rot**: [`evaluate`] überspringt es
-//! vollständig (keine Prüfung, kein Verstoß) und `checked` zählt nur die
-//! tatsächlich geprüften Binaries — bei zwei Gerüsten und zwei gebauten
-//! Binaries steht dort `2`, nie `4`. Sichtbar bleibt der Rest trotzdem:
-//! [`run`] gibt für jedes fehlende Binary vor dem Gate-Ergebnis eine eigene
-//! Zeile aus (`GateReport` selbst hat kein Feld für Randbemerkungen dieser
-//! Art; siehe „Meldung an den Verteiler" unten für die Alternative, die
-//! *nicht* umgesetzt wurde).
+//! Alle vier Binaries liegen im eigenständigen DoD-Workspace unter `dod/`.
+//! [`run`] lädt deshalb Produkt- und DoD-Workspace zusammen
+//! ([`super::load_all_workspaces`]). Fehlt eines der vier trotzdem im
+//! Graphen, ist das ein **Verstoß**, kein Hinweis: ein Binary, das das Gate
+//! nicht sieht, kann es nicht prüfen, und genau dieser Zustand hat das Gate
+//! früher rot-ohne-Befund bzw. mit „Gerüst"-Hinweisen stehen lassen, als nur
+//! `.` geladen wurde. Ein vorhandenes Binary zählt in `checked`, auch wenn
+//! seine interne Hülle leer ist — eine leere Hülle liegt trivial im Budget
+//! und ist eine echte Aussage. [`missing_binaries`] liefert die fehlenden
+//! Namen für Tests und Meldungen.
 //!
 //! # Warum keine neue Abhängigkeit auf `harw-dod-cap`
 //! Dieses Gate bräuchte inhaltlich `harw_dod_cap::CapabilityClass` — aber
@@ -136,21 +131,14 @@
 //! `harw_dod_cap::CapabilityClass`, aber ohne den Cargo-Kantenzug. Diese
 //! Datei fügt **keine neue Abhängigkeit** zu `xtask/Cargo.toml` hinzu.
 //!
-//! # Meldung an den Verteiler (nicht umgesetzt)
-//! Sauberer wäre ein `notes: Vec<String>`-Feld auf [`crate::gates::GateReport`]
-//! für genau diese Art von „geprüft, aber nicht bewertet"-Information, statt
-//! des `println!` in [`run`]. Das ist eine Änderung an `gates.rs`, das laut
-//! Auftrag nicht in diesem Knoten geändert werden soll — hiermit gemeldet,
-//! nicht vorgenommen.
-//!
-//! # Zählen, auch wenn nichts da ist
-//! Solange die vier Binaries leer sind, ist das Gate grün — aber es gibt die
-//! Zahl der geprüften Binaries aus. Ein Gate, das schweigend nichts tut, ist
-//! von einem grünen nicht zu unterscheiden.
+//! # Zählen
+//! `checked` ist die Zahl der tatsächlich gefundenen und geprüften Binaries.
+//! Ein Gate, das schweigend nichts tut, ist von einem grünen nicht zu
+//! unterscheiden.
 //!
 //! # Stand
 //! Knoten **AW0-10b**: gelandet. [`evaluate`] prüft gegen konstruierte
-//! Graphen (siehe `tests`); [`run`] liest den echten Workspace über
+//! Graphen (siehe `tests`); [`run`] liest Produkt- und DoD-Workspace über
 //! `harw-code-graph`.
 
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -409,6 +397,28 @@ pub const CRATE_PRIVILEGE: &[(&str, RequiredPrivilege)] = &[
     ("harw-observe-prom", RequiredPrivilege::Unprivileged),
     ("harw-observe-otlp", RequiredPrivilege::Unprivileged),
     ("harw-types", RequiredPrivilege::Unprivileged),
+    // Leaf-Crate für `ContentDigest` (blake3 + serde), aus `harw-types`
+    // herausgelöst und dort re-exportiert — reine Berechnung, kein I/O.
+    ("harw-digest", RequiredPrivilege::Unprivileged),
+    // --- Erst sichtbar, seit die Gates Produkt- und DoD-Workspace zusammen
+    // laden (vorher endete jede Hülle an der Workspace-Grenze). Je Crate den
+    // Quelltext auf `Capability::`, Netlink/Socket, fanotify/inotify, BPF,
+    // `capset`/`prctl` und Mount-Aufrufe durchsucht: kein Treffer. ---
+    // Berechtigungs-Vokabular und dessen Algebra (`Permission`,
+    // `AuthorityContext`); liest höchstens eine übergebene Richtliniendatei
+    // mit `std::fs`, ohne erhöhte Fähigkeit.
+    ("harw-authority", RequiredPrivilege::Unprivileged),
+    // Erzeugt Shell-Completion-Skripte (`clap_complete`) und schreibt sie in
+    // Dateien unter dem Home-Verzeichnis des Aufrufers — gewöhnliche
+    // Benutzer-I/O.
+    ("harw-completions", RequiredPrivilege::Unprivileged),
+    // Parst und validiert die DoD-Systemkonfiguration; öffnet sie per
+    // symlinkfreiem Descriptor-Walk (`rustix::fs`) und prüft Eigentum und
+    // Modus — Lesen, keine Capability.
+    ("harw-dod-config", RequiredPrivilege::Unprivileged),
+    // Symlinkfeste Datei-Grundbausteine (`openat2`, atomares Schreiben,
+    // Rechteprüfung über `geteuid`) — gewöhnliche Dateisystem-Syscalls.
+    ("harw-fsutil", RequiredPrivilege::Unprivileged),
     // --- Netlink (Capability::class() == Netlink) ---
     // Konservativ: `AuditBackend` trägt `Capability::ReadAuditNetlink`; das
     // (laut eigener Moduldoku bewusst nicht existierende) Journal-Backend
@@ -454,64 +464,33 @@ fn lookup_privilege(name: &str) -> Option<RequiredPrivilege> {
         .map(|(_, class)| *class)
 }
 
-/// Ob ein Binary-Knoten als "bereits gebaut" gilt — siehe Moduldoku,
-/// Abschnitt „Fehlendes Binary".
+/// Die Namen aller überwachten Binaries, die im Graphen fehlen.
 ///
 /// # Description
-/// Ein Binary gilt als noch nicht vorhanden, wenn es entweder gar kein
-/// Mitglied des Workspace ist (`node` ist `None`), oder wenn sein
-/// `[dependencies]`-Abschnitt vollständig leer ist — weder ein interner noch
-/// ein externer Eintrag. Letzteres ist der heutige Zustand von
-/// `harw-probe-bpf` und `harw-warden`: reine Gerüst-Crates ohne eine einzige
-/// Abhängigkeit.
-///
-/// # Arguments
-/// - `node` (`Option<&CrateNode>`): der Graphknoten des Binaries, oder
-///   `None`, wenn der Name kein Workspace-Mitglied ist.
-///
-/// # Returns
-/// `true`, wenn das Binary geprüft werden kann (mindestens eine reguläre
-/// Abhängigkeit trägt).
-///
-/// # Errors
-/// Keine — totale, panikfreie Funktion.
-///
-/// # Examples
-/// ```text
-/// is_binary_present(None) == false
-/// ```
-#[must_use]
-fn is_binary_present(node: Option<&CrateNode>) -> bool {
-    node.is_some_and(|n| !n.deps.is_empty() || !n.external_deps.is_empty())
-}
-
-/// Die Namen aller überwachten Binaries, die derzeit als nicht vorhanden gelten.
-///
-/// # Description
-/// Öffentlich, damit sowohl [`run`] (zur Ausgabe je einer Hinweiszeile) als
-/// auch Tests (ohne stdout mitschneiden zu müssen) dasselbe Urteil abfragen
-/// können — siehe [`is_binary_present`] für das Kriterium.
+/// Öffentlich, damit Tests dasselbe Urteil abfragen können, das
+/// [`evaluate`] als Verstoß meldet — siehe Moduldoku, Abschnitt „Fehlendes
+/// Binary".
 ///
 /// # Arguments
 /// - `graph` (`&WorkspaceGraph`): der zu prüfende Workspace-Graph.
 ///
 /// # Returns
-/// Die Namen aus [`MONITORED_BINARIES`], die aktuell fehlen, in der
-/// Reihenfolge der Tabelle.
+/// Die Namen aus [`MONITORED_BINARIES`], die im Graphen nicht vorkommen, in
+/// der Reihenfolge der Tabelle.
 ///
 /// # Errors
 /// Keine — totale, panikfreie Funktion.
 ///
 /// # Examples
 /// ```text
-/// // Auf dem echten Workspace, solange AW7-01d/AW5-04b nicht gelandet sind:
-/// missing_binaries(&graph) == vec!["harw-probe-bpf", "harw-warden"]
+/// // Auf dem zusammengeführten Produkt- + DoD-Graphen:
+/// missing_binaries(&graph) == Vec::<&str>::new()
 /// ```
 #[must_use]
 pub fn missing_binaries(graph: &WorkspaceGraph) -> Vec<&'static str> {
     MONITORED_BINARIES
         .iter()
-        .filter(|spec| !is_binary_present(graph.get(spec.name)))
+        .filter(|spec| graph.get(spec.name).is_none())
         .map(|spec| spec.name)
         .collect()
 }
@@ -583,22 +562,19 @@ fn reachable_with_chain(
 /// Führt Gate 2 aus.
 ///
 /// # Description
-/// Lädt den echten Workspace-Graphen über `harw-code-graph` (kein
-/// `cargo`-Subprozess) und delegiert die eigentliche Prüfung an [`evaluate`].
-/// Gibt vor dem Ergebnis für jedes über [`missing_binaries`] erkannte,
-/// noch nicht gebaute Binary eine eigene Hinweiszeile aus — das ist die in
-/// der Moduldoku ("Fehlendes Binary") angekündigte Sichtbarkeit, die im
-/// `checked`-Feld allein nicht steckt.
+/// Lädt Produkt- und DoD-Workspace zusammen über
+/// [`super::load_all_workspaces`] (kein `cargo`-Subprozess) und delegiert
+/// die eigentliche Prüfung an [`evaluate`].
 ///
 /// # Returns
-/// Einen [`GateReport`] mit der Zahl der **tatsächlich geprüften** Binaries
-/// (nicht `4`, solange Binaries fehlen) und den gefundenen Verstößen.
+/// Einen [`GateReport`] mit der Zahl der gefundenen und geprüften Binaries
+/// und den gefundenen Verstößen — ein fehlendes Binary ist einer davon.
 ///
 /// # Errors
-/// Wenn der Workspace-Graph nicht gelesen werden kann (kaputtes oder
-/// fehlendes `Cargo.toml`). Ein **Verstoß** ist dagegen kein `Err`, sondern
-/// erscheint im Bericht: das Gate hat dann erfolgreich geprüft und etwas
-/// gefunden.
+/// Wenn einer der beiden Workspace-Graphen nicht gelesen werden kann
+/// (kaputtes oder fehlendes `Cargo.toml`). Ein **Verstoß** ist dagegen kein
+/// `Err`, sondern erscheint im Bericht: das Gate hat dann erfolgreich
+/// geprüft und etwas gefunden.
 ///
 /// # Examples
 /// ```text
@@ -607,13 +583,7 @@ fn reachable_with_chain(
 /// println!("{}", report.summary());
 /// ```
 pub fn run() -> Result<GateReport, String> {
-    let graph = WorkspaceGraph::load(Path::new("."))
-        .map_err(|error| format!("Workspace-Graph nicht lesbar: {error}"))?;
-
-    for binary in missing_binaries(&graph) {
-        println!("privileges: '{binary}' hat noch keine Abhängigkeiten (Gerüst) — nicht geprüft");
-    }
-
+    let graph = super::load_all_workspaces(Path::new("."))?;
     Ok(evaluate(&graph))
 }
 
@@ -622,14 +592,14 @@ pub fn run() -> Result<GateReport, String> {
 /// # Description
 /// Getrennt von [`run`], damit die Prüfung gegen einen **konstruierten**
 /// Graphen möglich ist — wie in `gate_edges.rs`. Für jedes in
-/// [`MONITORED_BINARIES`] gelistete, tatsächlich vorhandene Binary
-/// ([`is_binary_present`]) wird die vollständige Hülle
+/// [`MONITORED_BINARIES`] gelistete, im Graphen vorhandene Binary wird die
+/// vollständige Hülle
 /// ([`reachable_with_chain`]) gebildet; jede erreichte Crate wird gegen
 /// [`CRATE_PRIVILEGE`] geprüft: fehlt der Eintrag, ist das ein Verstoß
 /// (Moduldoku, „Warum eine unbekannte Crate ein Verstoß ist"); ist die
 /// Fähigkeit außerhalb des Budgets ([`BinaryBudget::allows`]), ebenfalls.
-/// Ein fehlendes Binary wird übersprungen, ohne `checked` zu erhöhen und
-/// ohne einen Verstoß zu erzeugen.
+/// Ein im Graphen fehlendes Binary ist ein eigener Verstoß und erhöht
+/// `checked` nicht (Moduldoku, „Fehlendes Binary").
 ///
 /// # Arguments
 /// - `graph` (`&WorkspaceGraph`): der zu prüfende Abhängigkeitsgraph.
@@ -657,8 +627,15 @@ pub fn evaluate(graph: &WorkspaceGraph) -> GateReport {
     let mut violations = Vec::new();
     let mut checked = 0usize;
 
+    let missing = missing_binaries(graph);
     for spec in MONITORED_BINARIES {
-        if !is_binary_present(graph.get(spec.name)) {
+        if missing.contains(&spec.name) {
+            violations.push(format!(
+                "{} ({}) ist nicht im Workspace-Graphen — das Binary kann nicht geprüft \
+                 werden (Produkt- und DoD-Workspace geladen?)",
+                spec.name,
+                spec.budget.label()
+            ));
             continue;
         }
         checked += 1;
@@ -719,11 +696,26 @@ mod tests {
         }
     }
 
-    fn graph(crates: Vec<CrateNode>) -> WorkspaceGraph {
+    /// Graph genau aus `crates`, ohne Ergänzung — für die Fälle, in denen
+    /// ein Binary fehlen soll.
+    fn bare_graph(crates: Vec<CrateNode>) -> WorkspaceGraph {
         WorkspaceGraph {
             root: PathBuf::from("."),
             crates,
         }
+    }
+
+    /// Graph aus `crates`, ergänzt um jedes nicht genannte Binary aus
+    /// [`MONITORED_BINARIES`] als Knoten ohne Abhängigkeiten. Ein fehlendes
+    /// Binary ist ein Verstoß; die Tests, die eine einzelne Kante prüfen,
+    /// brauchen deshalb alle vier im Graphen.
+    fn graph(mut crates: Vec<CrateNode>) -> WorkspaceGraph {
+        for spec in MONITORED_BINARIES {
+            if !crates.iter().any(|c| c.name == spec.name) {
+                crates.push(node(spec.name, &[]));
+            }
+        }
+        bare_graph(crates)
     }
 
     #[test]
@@ -737,10 +729,7 @@ mod tests {
         let report = evaluate(&g);
 
         assert!(!report.is_green());
-        assert_eq!(
-            report.checked, 1,
-            "nur harw-sentinel ist im Graphen vorhanden"
-        );
+        assert_eq!(report.checked, MONITORED_BINARIES.len());
         assert!(
             report.violations.iter().any(|v| {
                 v.contains("harw-sentinel (unprivilegiert)")
@@ -762,7 +751,7 @@ mod tests {
         let report = evaluate(&g);
 
         assert!(report.is_green(), "{:?}", report.violations);
-        assert_eq!(report.checked, 1);
+        assert_eq!(report.checked, MONITORED_BINARIES.len());
     }
 
     #[test]
@@ -785,17 +774,20 @@ mod tests {
     }
 
     #[test]
-    fn test_evaluate_missing_binary_is_not_red_and_not_counted() {
+    fn test_evaluate_missing_binary_is_a_violation_and_not_counted() {
         // Nur harw-sentinel ist im Graphen; die anderen drei Binaries fehlen
-        // vollständig (kein Workspace-Mitglied in diesem konstruierten Graphen).
-        let g = graph(vec![
+        // vollständig — genau der Zustand, als die Gates nur `.` luden.
+        let g = bare_graph(vec![
             node("harw-sentinel", &["harw-dod-cpu"]),
             node("harw-dod-cpu", &[]),
         ]);
 
         let report = evaluate(&g);
 
-        assert!(report.is_green());
+        assert!(
+            !report.is_green(),
+            "ein fehlendes Binary darf nicht grün sein"
+        );
         assert_eq!(
             report.checked, 1,
             "nur harw-sentinel wurde tatsächlich geprüft"
@@ -804,27 +796,28 @@ mod tests {
             missing_binaries(&g),
             vec!["harw-probe-fs", "harw-probe-bpf", "harw-warden"]
         );
+        assert_eq!(report.violations.len(), 3, "{:?}", report.violations);
+        assert!(
+            report
+                .violations
+                .iter()
+                .all(|v| v.contains("nicht im Workspace-Graphen")),
+            "{:?}",
+            report.violations
+        );
     }
 
     #[test]
-    fn test_evaluate_stub_binary_with_empty_deps_counts_as_missing() {
-        // Entspricht dem heutigen Zustand von harw-probe-bpf/harw-warden:
-        // Workspace-Mitglied, aber [dependencies] vollständig leer.
-        let g = graph(vec![node("harw-probe-bpf", &[])]);
+    fn test_evaluate_binary_without_dependencies_is_checked_not_skipped() {
+        // Ein vorhandenes Binary mit leerer interner Hülle liegt trivial im
+        // Budget — das ist eine Aussage, kein „nicht geprüft".
+        let g = graph(Vec::new());
 
         let report = evaluate(&g);
 
-        assert!(!report.is_green(), "leerer Deps-Graph prüft nichts (G-102)");
-        assert_eq!(report.checked, 0);
-        assert_eq!(
-            missing_binaries(&g),
-            vec![
-                "harw-sentinel",
-                "harw-probe-fs",
-                "harw-probe-bpf",
-                "harw-warden"
-            ]
-        );
+        assert!(report.is_green(), "{:?}", report.violations);
+        assert_eq!(report.checked, MONITORED_BINARIES.len());
+        assert!(missing_binaries(&g).is_empty());
     }
 
     #[test]
@@ -902,7 +895,7 @@ mod tests {
         let report = evaluate(&g);
 
         assert!(report.is_green(), "{:?}", report.violations);
-        assert_eq!(report.checked, 1);
+        assert_eq!(report.checked, MONITORED_BINARIES.len());
     }
 
     #[test]
@@ -935,7 +928,7 @@ mod tests {
         let report = evaluate(&g);
 
         assert!(report.is_green(), "{:?}", report.violations);
-        assert_eq!(report.checked, 1);
+        assert_eq!(report.checked, MONITORED_BINARIES.len());
     }
 
     #[test]
@@ -960,11 +953,12 @@ mod tests {
 
     #[test]
     fn test_evaluate_empty_graph_is_red_with_zero_checked() {
-        let report = evaluate(&graph(Vec::new()));
+        let report = evaluate(&bare_graph(Vec::new()));
 
         assert!(!report.is_green(), "leerer Graph prüft nichts (G-102)");
         assert_eq!(report.checked, 0);
-        assert_eq!(missing_binaries(&graph(Vec::new())).len(), 4);
+        assert_eq!(report.violations.len(), 4, "{:?}", report.violations);
+        assert_eq!(missing_binaries(&bare_graph(Vec::new())).len(), 4);
     }
 
     #[test]
@@ -984,7 +978,7 @@ mod tests {
             "beide Crates sind unprivilegiert eingetragen: {:?}",
             report.violations
         );
-        assert_eq!(report.checked, 1);
+        assert_eq!(report.checked, MONITORED_BINARIES.len());
     }
 
     #[test]

@@ -450,6 +450,56 @@ pub fn format_handoff_text(summary: &str, facts: &HandoffFacts<'_>) -> String {
 
 // ── Fortsetzungs-Buch ─────────────────────────────────────────────────────────
 
+/// Wie der fortgesetzte Vorgänger endete — bestimmt den Einleitungssatz von
+/// [`continuation_task`].
+///
+/// # Beschreibung
+/// Früher hieß es immer „dessen Budget erschöpft war", auch nach einem
+/// Provider-Fehler (Export 429: HTTP 429 vor dem ersten Arbeitsschritt).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PredecessorEnd {
+    /// Token-, Zeit- oder Werkzeugbudget erschöpft.
+    BudgetExhausted,
+    /// Mit einem Fehler beendet (Provider, Lease, Turn-Ergebnis …).
+    Failed {
+        /// Grund in Kurzform (wie im Endbericht).
+        reason: String,
+    },
+    /// An einer Turn-Grenze oder von einem Turn-Wächter beendet.
+    Stopped {
+        /// Die konkrete Grenze bzw. der Wächter.
+        reason: String,
+    },
+    /// Abgebrochen (Nutzerin, Elternteil, Herunterfahren).
+    Cancelled,
+}
+
+impl PredecessorEnd {
+    /// Der Satz, mit dem die Fortsetzung ihren Vorgänger einordnet.
+    #[must_use]
+    fn sentence(&self) -> String {
+        match self {
+            Self::BudgetExhausted => "Du setzt die Arbeit eines Vorgängers derselben Rolle fort, \
+                                      dessen Budget erschöpft war."
+                .to_owned(),
+            Self::Failed { reason } => format!(
+                "Du setzt die Arbeit eines Vorgängers derselben Rolle fort, der mit einem Fehler \
+                 endete ({}). Prüfe zuerst, ob die Ursache noch besteht; bis dahin Erreichtes \
+                 bleibt gültig.",
+                reason.trim()
+            ),
+            Self::Stopped { reason } => format!(
+                "Du setzt die Arbeit eines Vorgängers derselben Rolle fort, der vorzeitig \
+                 beendet wurde ({}).",
+                reason.trim()
+            ),
+            Self::Cancelled => "Du setzt die Arbeit eines Vorgängers derselben Rolle fort, der \
+                                abgebrochen wurde."
+                .to_owned(),
+        }
+    }
+}
+
 /// Eine vorgehaltene Budget-Übergabe.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HandoffRecord {
@@ -468,6 +518,8 @@ pub struct HandoffRecord {
     pub kind: BudgetHandoff,
     /// Das ursprüngliche Kind der Kette.
     pub origin: SessionId,
+    /// Wie das Kind endete (Budget, Fehler, Abbruch).
+    pub end: PredecessorEnd,
 }
 
 /// Verknüpfung einer Fortsetzung mit ihrem Vorgänger.
@@ -496,6 +548,8 @@ pub struct ContinuationSeed {
     pub sandbox: Option<SandboxSpec>,
     /// Die Übergabe des Vorgängers.
     pub handoff: String,
+    /// Wie der Vorgänger endete.
+    pub end: PredecessorEnd,
 }
 
 /// Abgewiesene Fortsetzung; die Meldung geht an das Modell.
@@ -603,6 +657,7 @@ impl HandoffLedger {
             role: record.role.clone(),
             sandbox: record.sandbox.clone(),
             handoff: record.handoff.clone(),
+            end: record.end.clone(),
         })
     }
 
@@ -636,19 +691,25 @@ impl HandoffLedger {
 ///
 /// # Beschreibung
 /// Beginnt mit „Fortsetzung von <id>", damit Agent-Panel und Ereignisse die
-/// Fortsetzung als solche zeigen (Kurzkopf des Auftrags).
+/// Fortsetzung als solche zeigen (Kurzkopf des Auftrags). Der
+/// Einleitungssatz folgt dem tatsächlichen Ende des Vorgängers (`end`).
 #[must_use]
-pub fn continuation_task(of: &SessionId, handoff: &str, task: Option<&str>) -> String {
+pub fn continuation_task(
+    of: &SessionId,
+    end: &PredecessorEnd,
+    handoff: &str,
+    task: Option<&str>,
+) -> String {
     let task = task
         .map(str::trim)
         .filter(|task| !task.is_empty())
         .unwrap_or("Arbeite die offenen Punkte der Übergabe ab.");
     format!(
-        "Fortsetzung von {of}: {task}\n\nDu setzt die Arbeit eines Vorgängers derselben Rolle \
-         fort, dessen Budget erschöpft war. Fang nicht von vorn an: stütze dich auf seine \
+        "Fortsetzung von {of}: {task}\n\n{} Fang nicht von vorn an: stütze dich auf seine \
          Übergabe, prüfe Befunde nur, wo nötig, und arbeite an den offenen Punkten und \
          empfohlenen nächsten Schritten weiter.\n\n--- Übergabe des Vorgängers ---\n{handoff}\n\
-         --- Ende der Übergabe ---"
+         --- Ende der Übergabe ---",
+        end.sentence()
     )
 }
 
@@ -913,6 +974,7 @@ mod tests {
             handoff: "## Offene Punkte\n- Rest".to_owned(),
             kind: BudgetHandoff::Compacted,
             origin: origin.clone(),
+            end: PredecessorEnd::BudgetExhausted,
         }
     }
 
@@ -1013,14 +1075,46 @@ mod tests {
     #[test]
     fn the_continuation_task_names_its_predecessor_and_carries_the_handoff() {
         let of = SessionId::new();
-        let task = continuation_task(&of, "## Offene Punkte\n- B prüfen", None);
+        let task = continuation_task(
+            &of,
+            &PredecessorEnd::BudgetExhausted,
+            "## Offene Punkte\n- B prüfen",
+            None,
+        );
         assert!(
             task.starts_with(&format!("Fortsetzung von {of}:")),
             "{task}"
         );
         assert!(task.contains("## Offene Punkte\n- B prüfen"));
         assert!(task.contains("nicht von vorn"));
-        let explicit = continuation_task(&of, "H", Some("nur noch Modul C"));
+        assert!(task.contains("dessen Budget erschöpft war"));
+        let explicit = continuation_task(
+            &of,
+            &PredecessorEnd::BudgetExhausted,
+            "H",
+            Some("nur noch Modul C"),
+        );
         assert!(explicit.contains("nur noch Modul C"));
+    }
+
+    /// Export 429: nach einem Fehler (nicht Budget) darf der Auftrag nicht
+    /// behaupten, das Budget sei erschöpft gewesen.
+    #[test]
+    fn the_continuation_task_names_the_real_end_cause() {
+        let of = SessionId::new();
+        let failed = continuation_task(
+            &of,
+            &PredecessorEnd::Failed {
+                reason: "Fehler: rate limited by provider (HTTP 429)".to_owned(),
+            },
+            "H",
+            None,
+        );
+        assert!(!failed.contains("Budget erschöpft"), "{failed}");
+        assert!(failed.contains("mit einem Fehler endete"), "{failed}");
+        assert!(failed.contains("HTTP 429"), "{failed}");
+        let cancelled = continuation_task(&of, &PredecessorEnd::Cancelled, "H", None);
+        assert!(cancelled.contains("abgebrochen wurde"), "{cancelled}");
+        assert!(!cancelled.contains("Budget"), "{cancelled}");
     }
 }

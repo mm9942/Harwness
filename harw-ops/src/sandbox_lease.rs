@@ -1,8 +1,7 @@
 //! `/sandbox-lease` — Modell-getriebene Aufhebung der Sandbox für `shell.exec`.
 //!
-//! Spec-Quelle: `/home/mia/.claude/plans/recursive-cooking-lobster.md`, Teil
-//! B5 ("Neue Operation `sandbox-lease`") und Teil B3
-//! (`Arc<harw_tool_shell::HostPermitHandles>`-ServiceMap-Eintrag).
+//! Neue Operation `sandbox-lease` mit einem
+//! `Arc<harw_tool_shell::HostPermitHandles>`-ServiceMap-Eintrag.
 //!
 //! # Verantwortungsbereich
 //! Diese Operation ist der **einzige** Weg, über den ein Modell selbst eine
@@ -22,11 +21,22 @@
 //! ausgestellte Ledger-Permits der aufrufenden Sitzung ab
 //! ([`harw_sandbox::ProcessPermitLedger::revoke_session`]).
 //!
+//! # Lebensdauer einer Freigabe (Nutzerentscheidung 2026-09-24)
+//! Eine erteilte Host-Arbeitsphase hat **keinen** Zeitablauf. Sie bleibt
+//! aktiv, bis der **Nutzer** sie beendet — per Strg+H in der TUI
+//! (`ChatApp::end_host_mode`) oder durch das getippte `/sandbox-lease
+//! revoke`. Das Modell kann sie nicht beenden: `revoke` wird nur angenommen,
+//! wenn der [`OpContext`] den Marker [`HostLeaseUserControl`] trägt, den die
+//! Montage ausschließlich in die Slash-`ServiceMap` legt
+//! (`harw-runtime/src/services.rs`). Auf der Model-Tool-Fläche (und Web/Job)
+//! fehlt er, `revoke` endet dort mit [`OpError::NotAvailable`]. Der Marker
+//! ist kein Argumentfeld und damit über Tool-Argumente nicht fälschbar.
+//!
 //! # Unterkommandos (beide Flächen, gemeinsamer Rumpf)
 //! - `request` (Vorgabe auf der Model-Tool-Fläche, siehe
 //!   [`SandboxLeaseArgs::from_raw_args`] für den abweichenden Command-Vorgabe-
 //!   Wert) — verlangt `reason` (nicht-leer). Ist bereits eine prozessweite
-//!   Freigabe aktiv, wird sofort mit der Restlaufzeit geantwortet, **ohne**
+//!   Freigabe aktiv, wird sofort bestätigt, **ohne**
 //!   erneut zu fragen. Sonst geht ein [`harw_tool_shell::HostPermitPrompt`]
 //!   an die anzeigende Oberfläche (Vorauswahl
 //!   [`harw_tool_shell::HostPermitVariant::SessionLease`]); die Operation
@@ -36,10 +46,12 @@
 //!   angehängt — ist ein Fehler (fail-closed, dieselbe Sicherheitsregel wie
 //!   [`harw_tool_shell::exec`]).
 //! - `status` (Vorgabe auf der Command-Fläche für ein bares
-//!   `/sandbox-lease`) — meldet „aktiv, noch N min“, „Einmalfreigabe offen“
-//!   oder „aus“, rein lesend; berücksichtigt sowohl die prozessweite als auch
-//!   eine etwaige sitzungseigene Freigabe der aufrufenden Sitzung.
-//! - `revoke` — entfernt die prozessweite Sitzungs- und Einmalfreigabe
+//!   `/sandbox-lease`) — meldet „aktiv (bis Strg+H oder /sandbox-lease
+//!   revoke)“, „Einmalfreigabe offen“ oder „aus“, rein lesend;
+//!   berücksichtigt sowohl die prozessweite als auch eine etwaige
+//!   sitzungseigene Freigabe der aufrufenden Sitzung.
+//! - `revoke` (nur Command-Fläche, nur mit [`HostLeaseUserControl`]) —
+//!   entfernt die prozessweite Sitzungs- und Einmalfreigabe
 //!   ([`harw_sandbox::HostPermitSessionRegistry::revoke_global_approval`])
 //!   sowie eine etwaige sitzungseigene Freigabe der aufrufenden Sitzung
 //!   ([`harw_sandbox::HostPermitSessionRegistry::revoke_session_approval`])
@@ -60,7 +72,9 @@
 //! # Fehler
 //! - [`OpError::NotAvailable`]: kein `Arc<`[`harw_tool_shell::HostPermitHandles`]`>`
 //!   im [`OpContext`] registriert — „Host-Freigaben sind in dieser
-//!   Oberfläche nicht verfügbar“.
+//!   Oberfläche nicht verfügbar“; oder `revoke` ohne
+//!   [`HostLeaseUserControl`] (Modell-Aufruf) — nur der Nutzer beendet eine
+//!   Host-Arbeitsphase.
 //! - [`OpError::InvalidArguments`]: `reason` fehlt oder ist leer bei
 //!   `action = "request"`, oder eine unbekannte Aktion.
 //! - [`OpError::Execution`]: die Anfrage wurde vom Nutzer abgelehnt, es kam
@@ -72,7 +86,7 @@ use std::sync::Arc;
 use harw_macros::operation;
 use harw_operations::{FromRawArgs, OpContext, OpError, OpOutput};
 use harw_tool_shell::{
-    HOST_PERMIT_PROMPT_TIMEOUT, HOST_SESSION_LEASE_TTL, HostPermitHandles, HostPermitPrompt,
+    HOST_PERMIT_PROMPT_TIMEOUT, HostLeaseUserControl, HostPermitHandles, HostPermitPrompt,
     HostPermitVariant, SANDBOX_LEASE_WORKER_DEFINITION,
 };
 
@@ -85,10 +99,22 @@ const NO_HOST_PERMIT_HANDLES: &str = "Host-Freigaben sind in dieser Oberfläche 
 const SANDBOX_LEASE_DENIED_MSG: &str =
     "Sandbox-Lease-Anfrage vom Nutzer abgelehnt oder keine Antwort erhalten";
 
+/// Meldung für einen `revoke`-Versuch ohne [`HostLeaseUserControl`] — also
+/// jeden Aufruf, der nicht aus einer vom Nutzer getippten Slash-Eingabe
+/// stammt (Model-Tool, Web, Job).
+const REVOKE_USER_ONLY_MSG: &str = "Nur der Nutzer kann den Host-Modus beenden \
+     (Strg+H oder das getippte /sandbox-lease revoke); das Modell kann eine \
+     Sandbox-Lease nicht widerrufen.";
+
+/// Statusanzeige einer aktiven Host-Arbeitsphase (kein Zeitablauf).
+const ACTIVE_UNTIL_USER_ENDS: &str = "aktiv (bis Strg+H oder /sandbox-lease revoke)";
+
 /// Eingabe-Argumente der `sandbox-lease`-Operation.
 ///
 /// # Felder
-/// - `action` (`Option<String>`): `"request"` | `"status"` | `"revoke"`.
+/// - `action` (`Option<String>`): `"request"` | `"status"` | `"revoke"`
+///   (`revoke` nur über das vom Nutzer getippte `/sandbox-lease revoke`, siehe
+///   Moduldoku).
 ///   Auf der Command-Fläche löst [`FromRawArgs::from_raw_args`] ein fehlendes
 ///   Token bereits auf `Some("status")` auf; auf den JSON-Flächen bleibt ein
 ///   fehlendes Feld `None` und der Operationsrumpf fällt dort auf
@@ -99,7 +125,7 @@ const SANDBOX_LEASE_DENIED_MSG: &str =
 #[derive(Debug, Default, serde::Deserialize, harw_macros::OpArgs)]
 pub struct SandboxLeaseArgs {
     /// `"request"` (Vorgabe für die JSON-Flächen) | `"status"` (Vorgabe für
-    /// ein bares `/sandbox-lease`) | `"revoke"`.
+    /// ein bares `/sandbox-lease`). Beenden kann eine Freigabe nur der Nutzer.
     #[serde(default)]
     pub action: Option<String>,
     /// Freitext-Begründung; Pflicht (nicht-leer) bei `action = "request"`.
@@ -145,7 +171,8 @@ impl FromRawArgs for SandboxLeaseArgs {
 /// Was passiert: mit `action = "request"` und einem konkreten `reason` zeigt
 /// dieses Werkzeug dem Nutzer einen Bestätigungsdialog (die Zustimmung dort
 /// *ist* die Freigabe, kein weiterer Schritt nötig). Der Nutzer wählt im
-/// Dialog zwischen einer mehrstündigen Sitzungsfreigabe und einer
+/// Dialog zwischen einer Host-Arbeitsphase, die aktiv bleibt, bis er sie
+/// selbst beendet (Strg+H oder `/sandbox-lease revoke`), und einer
 /// einmaligen Freigabe für genau den nächsten `shell.exec`-Aufruf. Nach
 /// Zustimmung laufen die betroffenen `shell.exec`-Aufrufe dieser harw-Sitzung
 /// **inklusive aller Kind-Agenten** (z. B. `uia-shell-worker`,
@@ -153,15 +180,15 @@ impl FromRawArgs for SandboxLeaseArgs {
 /// Toolchains, Netzzugriff) statt in der isolierten Sandbox; das Ergebnis
 /// trägt `"executed_on": "host"`. Immer zuerst den Grund nennen (`reason`),
 /// bevor dieses Werkzeug aufgerufen wird — der Dialog zeigt ihn dem Nutzer.
-/// Eine bereits aktive Freigabe wird ohne erneuten Dialog sofort mit der
-/// Restlaufzeit bestätigt.
+/// Eine bereits aktive Freigabe wird ohne erneuten Dialog sofort bestätigt.
 ///
-/// `action = "status"` meldet nur, ob/wie lange eine Freigabe aktiv ist
-/// (rein lesend, kein Dialog). `action = "revoke"` widerruft eine aktive
-/// Freigabe sofort (idempotent).
+/// `action = "status"` meldet nur, ob eine Freigabe aktiv ist (rein lesend,
+/// kein Dialog). Beenden kann eine Freigabe nur der Nutzer (Strg+H oder das
+/// getippte `/sandbox-lease revoke`); ein `revoke` aus dem Model-Tool wird
+/// abgewiesen.
 #[operation(
     name = "sandbox-lease",
-    summary = "Fordert eine Sandbox-Aufhebung für shell.exec dieser harw-Sitzung inkl. aller Kind-Agenten an — nutzen, wenn eine Aufgabe cargo/rustc, Nutzer-Toolchains, Netzzugriff oder Dateien außerhalb des Workspace braucht; nicht versuchen, Toolchains in der Sandbox nachzuinstallieren. action=\"request\" (mit Grund) zeigt einen Bestätigungsdialog, in dem der Nutzer die Freigabe erteilt oder ablehnt (Dialog ist die Freigabe) und zwischen einer mehrstündigen Sitzungsfreigabe oder einer einmaligen Freigabe wählt; danach laufen shell.exec-Aufrufe dieser harw-Sitzung inkl. aller Kind-Agenten auf dem Host. action=\"status\" zeigt eine bestehende Freigabe (rein lesend), action=\"revoke\" widerruft sie (idempotent).",
+    summary = "Fordert eine Sandbox-Aufhebung für shell.exec dieser harw-Sitzung inkl. aller Kind-Agenten an — nutzen, wenn eine Aufgabe cargo/rustc, Nutzer-Toolchains, Netzzugriff oder Dateien außerhalb des Workspace braucht; Toolchains nie in der Sandbox nachinstallieren. action=\"request\" (mit Grund) öffnet den Bestätigungsdialog: der Nutzer erteilt oder verweigert die Freigabe und wählt Host-Arbeitsphase (aktiv, bis er sie beendet) oder einmalige Freigabe; danach laufen die shell.exec-Aufrufe auf dem Host. action=\"status\" zeigt die Freigabe (rein lesend). Beenden kann sie nur der Nutzer (Strg+H oder getipptes /sandbox-lease revoke), nicht das Modell.",
     domain = "execution",
     permission = "operator",
     command(path = "/sandbox-lease", visibility = "tui_only", busy = "immediate"),
@@ -174,7 +201,8 @@ async fn sandbox_lease(ctx: &OpContext, args: SandboxLeaseArgs) -> Result<OpOutp
         "status" => handle_status(ctx),
         "revoke" => handle_revoke(ctx),
         other => Err(OpError::InvalidArguments(format!(
-            "Unbekannte /sandbox-lease Aktion: '{other}'. Erlaubt: request, status, revoke."
+            "Unbekannte /sandbox-lease Aktion: '{other}'. Erlaubt: request, status \
+             (revoke nur für den Nutzer über das getippte /sandbox-lease revoke)."
         ))),
     }
 }
@@ -188,29 +216,21 @@ fn resolve_handles(ctx: &OpContext) -> Result<&Arc<HostPermitHandles>, OpError> 
         .ok_or_else(|| OpError::NotAvailable(NO_HOST_PERMIT_HANDLES.to_owned()))
 }
 
-/// Rundet die verbleibende Sitzungsfreigabe-Dauer aufwärts auf ganze Minuten.
-fn remaining_minutes(remaining: std::time::Duration) -> u64 {
-    remaining.as_secs().div_ceil(60)
-}
-
 /// Implementiert `action = "status"` — rein lesend.
 ///
 /// # Beschreibung
-/// [`harw_sandbox::HostPermitSessionRegistry::session_approval_remaining`]
+/// [`harw_sandbox::HostPermitSessionRegistry::is_session_approved`]
 /// und [`harw_sandbox::HostPermitSessionRegistry::has_single_use`]
 /// berücksichtigen sowohl die prozessweite Freigabe (die `request` unten
 /// setzt) als auch eine etwaige sitzungseigene Freigabe der aufrufenden
-/// Sitzung — ein direkter Blick auf `global_approval_remaining`/
-/// `has_global_single_use` ist hier nicht nötig, weil die aufrufende
-/// Methode bereits das Maximum aus beiden liefert.
+/// Sitzung — ein direkter Blick auf `has_global_approval`/
+/// `has_global_single_use` ist hier nicht nötig. Eine Restlaufzeit gibt es
+/// nicht mehr (kein Zeitablauf).
 fn handle_status(ctx: &OpContext) -> Result<OpOutput, OpError> {
     let handles = resolve_handles(ctx)?;
     let session_id = ctx.session_id().as_str();
-    let text = if let Some(remaining) = handles.registry.session_approval_remaining(session_id) {
-        format!(
-            "Sandbox-Lease: aktiv, noch {} min.",
-            remaining_minutes(remaining)
-        )
+    let text = if handles.registry.is_session_approved(session_id) {
+        format!("Sandbox-Lease: {ACTIVE_UNTIL_USER_ENDS}.")
     } else if handles.registry.has_single_use(session_id) {
         "Sandbox-Lease: Einmalfreigabe offen.".to_owned()
     } else {
@@ -219,10 +239,13 @@ fn handle_status(ctx: &OpContext) -> Result<OpOutput, OpError> {
     Ok(OpOutput::from(text))
 }
 
-/// Implementiert `action = "revoke"` — idempotent.
+/// Implementiert `action = "revoke"` — idempotent, **nur für den Nutzer**.
 ///
 /// # Beschreibung
-/// Entfernt die prozessweite Sitzungs- und Einmalfreigabe
+/// Verlangt [`HostLeaseUserControl`] im [`OpContext`] (nur die Slash-Fläche
+/// trägt ihn, siehe Moduldoku); fehlt er, wird nichts verändert und
+/// [`OpError::NotAvailable`] mit [`REVOKE_USER_ONLY_MSG`] geliefert. Sonst
+/// entfernt sie die prozessweite Sitzungs- und Einmalfreigabe
 /// ([`harw_sandbox::HostPermitSessionRegistry::revoke_global_approval`]) —
 /// das beendet die Host-Ausführung für die Root-Session **und** jede
 /// Kind-Session, die dieselbe Registry teilt — sowie eine etwaige
@@ -234,6 +257,9 @@ fn handle_status(ctx: &OpContext) -> Result<OpOutput, OpError> {
 /// nicht ab — die Registry-Freigabe ist bereits entfernt, das ist die
 /// sicherheitsrelevante Wirkung.
 fn handle_revoke(ctx: &OpContext) -> Result<OpOutput, OpError> {
+    if ctx.service::<HostLeaseUserControl>().is_none() {
+        return Err(OpError::NotAvailable(REVOKE_USER_ONLY_MSG.to_owned()));
+    }
     let handles = resolve_handles(ctx)?;
     let session_id = ctx.session_id().as_str();
     handles.registry.revoke_global_approval();
@@ -268,17 +294,15 @@ async fn handle_request(ctx: &OpContext, reason: Option<&str>) -> Result<OpOutpu
     let handles = resolve_handles(ctx)?;
     let session_id = ctx.session_id().as_str().to_owned();
 
-    // Bereits aktive prozessweite Freigabe: sofortiger Erfolg mit
-    // Restdauer, kein erneuter Prompt (siehe Moduldoku). Geprüft wird
-    // ausdrücklich die globale Freigabe, nicht `session_approval_remaining`
-    // — dieser Pfad setzt unten selbst nur noch die globale Freigabe, eine
-    // rein sitzungseigene Zustimmung entsteht über `/sandbox-lease` nicht
-    // mehr.
-    if let Some(remaining) = handles.registry.global_approval_remaining() {
+    // Bereits aktive prozessweite Freigabe: sofortiger Erfolg, kein
+    // erneuter Prompt (siehe Moduldoku). Geprüft wird ausdrücklich die
+    // globale Freigabe, nicht `is_session_approved` — dieser Pfad setzt
+    // unten selbst nur noch die globale Freigabe, eine rein sitzungseigene
+    // Zustimmung entsteht über `/sandbox-lease` nicht mehr.
+    if handles.registry.has_global_approval() {
         return Ok(OpOutput::from(format!(
-            "Sandbox-Lease bereits aktiv, noch {} min; shell.exec läuft bereits auf dem Host \
-             (für diese harw-Sitzung inkl. aller Kind-Agenten).",
-            remaining_minutes(remaining)
+            "Sandbox-Lease bereits {ACTIVE_UNTIL_USER_ENDS}; shell.exec läuft bereits auf dem \
+             Host (für diese harw-Sitzung inkl. aller Kind-Agenten)."
         )));
     }
 
@@ -317,14 +341,13 @@ async fn handle_request(ctx: &OpContext, reason: Option<&str>) -> Result<OpOutpu
             // Prozessweit statt sitzungseigen (Nutzerwunsch „volle
             // Sandbox-Deaktivierung“, 2026-09-21): gilt damit auch für jede
             // Kind-Session (z. B. `uia-shell-worker`, `host-process-worker`),
-            // nicht nur für `session_id` selbst.
-            handles
-                .registry
-                .mark_global_approval(HOST_SESSION_LEASE_TTL);
+            // nicht nur für `session_id` selbst. Kein Zeitablauf: die Phase
+            // endet nur durch den Nutzer (Strg+H oder `/sandbox-lease revoke`).
+            handles.registry.mark_global_approval();
             Ok(OpOutput::from(format!(
-                "Sandbox-Lease erteilt für {} Stunden; shell.exec läuft jetzt auf dem Host \
-                 (für diese harw-Sitzung inkl. aller Kind-Agenten).",
-                HOST_SESSION_LEASE_TTL.as_secs() / 3600
+                "Sandbox-Lease erteilt, {ACTIVE_UNTIL_USER_ENDS}; shell.exec läuft jetzt auf \
+                 dem Host (für diese harw-Sitzung inkl. aller Kind-Agenten). Beenden kann sie \
+                 nur der Nutzer."
             )))
         }
         HostPermitVariant::SingleExecution => {
@@ -344,7 +367,7 @@ async fn handle_request(ctx: &OpContext, reason: Option<&str>) -> Result<OpOutpu
 
 #[cfg(test)]
 mod tests {
-    use super::{SandboxLeaseArgs, sandbox_lease};
+    use super::{REVOKE_USER_ONLY_MSG, SandboxLeaseArgs, sandbox_lease};
     use crate::test_support::{TestError, TestResult, ctx};
     use crate::testutil::toks;
     use harw_authority::{
@@ -352,16 +375,31 @@ mod tests {
     };
     use harw_operations::{FromRawArgs, OpContext, OpError, context::ServiceMap};
     use harw_sandbox::{HostPermitSessionRegistry, ProcessPermitLedger};
-    use harw_tool_shell::{HostPermitHandles, HostPermitVariant, host_permit_prompt_channel};
+    use harw_tool_shell::{
+        HostLeaseUserControl, HostPermitHandles, HostPermitVariant, host_permit_prompt_channel,
+    };
     use harw_types::{SessionId, TenantId, TurnId, WorkspaceId};
     use std::path::PathBuf;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicU64, Ordering};
-    use std::time::Duration;
 
     /// Baut einen `OpContext` mit frischem temporärem Workspace, optional mit
-    /// registrierten `Arc<HostPermitHandles>`.
+    /// registrierten `Arc<HostPermitHandles>` — **ohne** den Nutzer-Marker
+    /// [`HostLeaseUserControl`], also wie auf der Model-Tool-Fläche.
     fn test_context(handles: Option<Arc<HostPermitHandles>>) -> TestResult<(OpContext, PathBuf)> {
+        build_context(handles, false)
+    }
+
+    /// Wie [`test_context`], aber wie auf der Slash-Fläche: mit
+    /// [`HostLeaseUserControl`] (vom Nutzer getipptes `/sandbox-lease`).
+    fn user_context(handles: Arc<HostPermitHandles>) -> TestResult<(OpContext, PathBuf)> {
+        build_context(Some(handles), true)
+    }
+
+    fn build_context(
+        handles: Option<Arc<HostPermitHandles>>,
+        user_typed: bool,
+    ) -> TestResult<(OpContext, PathBuf)> {
         static COUNTER: AtomicU64 = AtomicU64::new(0);
         let id = COUNTER.fetch_add(1, Ordering::Relaxed);
         let root = std::env::temp_dir().join(format!(
@@ -387,6 +425,9 @@ mod tests {
         let mut services = ServiceMap::new();
         if let Some(handles) = handles {
             services.insert(handles);
+        }
+        if user_typed {
+            services.insert(HostLeaseUserControl);
         }
         let ctx = OpContext::new(
             SessionId::new(),
@@ -482,13 +523,24 @@ mod tests {
         let (ctx, root) = test_context(Some(Arc::clone(&handles)))?;
         handles
             .registry
-            .mark_session_approved(ctx.session_id().as_str(), Duration::from_secs(600));
+            .mark_session_approved(ctx.session_id().as_str());
 
         let output = sandbox_lease(&ctx, args("status", None))
             .await
             .map_err(crate::test_support::ctx("status must not fail"))?;
         std::fs::remove_dir_all(&root).ok();
-        assert!(output.text.contains("aktiv"), "{}", output.text);
+        assert!(
+            output
+                .text
+                .contains("aktiv (bis Strg+H oder /sandbox-lease revoke)"),
+            "{}",
+            output.text
+        );
+        assert!(
+            !output.text.contains("min"),
+            "no remaining time any more: {}",
+            output.text
+        );
         Ok(())
     }
 
@@ -516,9 +568,7 @@ mod tests {
     {
         let handles = fresh_handles(None);
         let (ctx, root) = test_context(Some(Arc::clone(&handles)))?;
-        handles
-            .registry
-            .mark_global_approval(Duration::from_secs(600));
+        handles.registry.mark_global_approval();
 
         let output = sandbox_lease(&ctx, args("status", None))
             .await
@@ -537,10 +587,10 @@ mod tests {
     #[tokio::test]
     async fn sandbox_lease_revoke_clears_an_active_lease_and_is_idempotent() -> TestResult {
         let handles = fresh_handles(None);
-        let (ctx, root) = test_context(Some(Arc::clone(&handles)))?;
+        let (ctx, root) = user_context(Arc::clone(&handles))?;
         handles
             .registry
-            .mark_session_approved(ctx.session_id().as_str(), Duration::from_secs(600));
+            .mark_session_approved(ctx.session_id().as_str());
 
         let first = sandbox_lease(&ctx, args("revoke", None))
             .await
@@ -567,10 +617,8 @@ mod tests {
     #[tokio::test]
     async fn sandbox_lease_revoke_clears_the_global_lease_for_every_session() -> TestResult {
         let handles = fresh_handles(None);
-        let (ctx, root) = test_context(Some(Arc::clone(&handles)))?;
-        handles
-            .registry
-            .mark_global_approval(Duration::from_secs(600));
+        let (ctx, root) = user_context(Arc::clone(&handles))?;
+        handles.registry.mark_global_approval();
         assert!(handles.registry.is_session_approved("some-child-session"));
 
         let output = sandbox_lease(&ctx, args("revoke", None))
@@ -583,8 +631,56 @@ mod tests {
             !handles.registry.is_session_approved("some-child-session"),
             "revoke must clear the global approval for every session id, not just the caller's"
         );
-        assert_eq!(handles.registry.global_approval_remaining(), None);
+        assert!(!handles.registry.has_global_approval());
         Ok(())
+    }
+
+    /// Nutzerentscheidung 2026-09-24: das Modell (Model-Tool-Fläche, kein
+    /// [`HostLeaseUserControl`] im Kontext) darf eine Host-Arbeitsphase nicht
+    /// beenden — der Aufruf wird abgewiesen und ändert nichts.
+    #[tokio::test]
+    async fn sandbox_lease_revoke_from_the_model_is_rejected_and_keeps_the_lease() -> TestResult {
+        let handles = fresh_handles(None);
+        let (ctx, root) = test_context(Some(Arc::clone(&handles)))?;
+        handles.registry.mark_global_approval();
+        handles
+            .registry
+            .mark_session_approved(ctx.session_id().as_str());
+
+        let result = sandbox_lease(&ctx, args("revoke", None)).await;
+        std::fs::remove_dir_all(&root).ok();
+        match result {
+            Err(OpError::NotAvailable(message)) => {
+                assert_eq!(message, REVOKE_USER_ONLY_MSG);
+                assert!(message.contains("Strg+H"), "{message}");
+            }
+            other => {
+                return Err(TestError::Unexpected(format!(
+                    "expected NotAvailable for a model revoke, got {other:?}"
+                )));
+            }
+        }
+        assert!(
+            handles.registry.has_global_approval(),
+            "a rejected model revoke must leave the global lease active"
+        );
+        assert!(
+            handles
+                .registry
+                .is_session_approved(ctx.session_id().as_str())
+        );
+        Ok(())
+    }
+
+    /// Das Model-Tool-Summary bietet `revoke` nicht mehr an und nennt keine
+    /// Ablaufzeit.
+    #[test]
+    fn sandbox_lease_summary_offers_no_model_revoke_and_no_expiry() {
+        use harw_operations::Operation;
+        let summary = super::SandboxLeaseOperation.meta().summary;
+        assert!(!summary.contains("action=\"revoke\""), "{summary}");
+        assert!(!summary.contains("mehrstündig"), "{summary}");
+        assert!(summary.contains("nur der Nutzer"), "{summary}");
     }
 
     // ── request ────────────────────────────────────────────────────────────
@@ -628,9 +724,7 @@ mod tests {
         // Behebung nicht mehr aus, weil `request` selbst keine mehr setzt.
         let handles = fresh_handles(None);
         let (ctx, root) = test_context(Some(Arc::clone(&handles)))?;
-        handles
-            .registry
-            .mark_global_approval(Duration::from_secs(600));
+        handles.registry.mark_global_approval();
 
         let output = sandbox_lease(&ctx, args("request", Some("brauche cargo")))
             .await
@@ -699,7 +793,7 @@ mod tests {
             "a sandbox-lease grant must cover every session id of this harw process, \
              not only the one that requested it"
         );
-        assert!(handles.registry.global_approval_remaining().is_some());
+        assert!(handles.registry.has_global_approval());
         Ok(())
     }
 

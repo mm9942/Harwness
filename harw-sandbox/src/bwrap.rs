@@ -77,8 +77,7 @@ pub const SANDBOX_CARGO_HOME: &str = "/var/cache/harw/cargo";
 const WAIT_OR_CANCEL_POLL_INTERVAL: Duration = Duration::from_millis(20);
 
 /// Host-`PATH` (und optional Host-Cargo/-Rustup-Verzeichnisse), die
-/// [`BwrapLauncher::with_host_path`] in den Plan übernimmt (Teil C1, Plan
-/// `recursive-cooking-lobster.md`).
+/// [`BwrapLauncher::with_host_path`] in den Plan übernimmt.
 ///
 /// # Description
 /// Reiner Werte-Typ ohne eigene Invarianten-Prüfung — [`BwrapLauncher::plan`]
@@ -323,9 +322,8 @@ impl BwrapLauncher {
     }
 
     /// Bindet den Host-`PATH` (und optional Host-Cargo/-Rustup-Verzeichnisse)
-    /// an diesen Launcher; siehe [`plan`](Self::plan) für die genaue Wirkung
-    /// (Teil C1, Plan `recursive-cooking-lobster.md`). Ohne Aufruf bleibt der
-    /// Plan byte-identisch zum bisherigen Minimal-`PATH`.
+    /// an diesen Launcher; siehe [`plan`](Self::plan) für die genaue Wirkung.
+    /// Ohne Aufruf bleibt der Plan byte-identisch zum bisherigen Minimal-`PATH`.
     #[must_use]
     pub fn with_host_path(mut self, binding: HostPathBinding) -> Self {
         self.host_path = Some(binding);

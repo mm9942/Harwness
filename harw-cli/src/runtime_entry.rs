@@ -6,8 +6,7 @@
 //! [`harw_runtime::RuntimeAssembly::builder`] zusammensetzt, statt die
 //! Montage-Reihenfolge (Spec → Sitzungswurzel → Speicher → Modell → Bau) an
 //! jeder Aufrufstelle erneut hinzuschreiben (Vertrag:
-//! `docs/remediation/AGENT-BRIEF.md`, `docs/remediation/CONTRACTS-W2d2.md`
-//! §1.3, `docs/remediation/ledger/W2d1/A1.md`):
+//! `docs/design/runtime-contracts.md` §1.3):
 //!
 //! - [`runtime_spec`] — die Eingangsbeschreibung eines Laufs ohne Overrides.
 //! - [`profile_sessions_root`] — das Transkriptverzeichnis des aktiven Profils
@@ -283,7 +282,7 @@ pub(crate) fn build_assembly(
 /// # Beschreibung
 /// Deckt die beiden lokalen Eingangsflächen ab, an denen `harw` selbst den
 /// Prozess-Eigentümer authentifiziert: [`IngressSurface::Tui`] und
-/// [`IngressSurface::Cli`] (Vertrag `docs/remediation/CONTRACTS-W2d2.md`
+/// [`IngressSurface::Cli`] (Vertrag `docs/design/runtime-contracts.md`
 /// §1.3, E4: lokaler Principal Tier [`PermissionTier::Operator`]). Die
 /// Kennung ist die vom Kernel bezeugte Prozess-UID
 /// (`rustix::process::getuid`, dasselbe Muster wie

@@ -1,8 +1,6 @@
 //! Sitzungs-Metadaten-Sidecar: `<session-id>.meta.json` neben dem Transcript.
 //!
-//! Spec: `/home/mia/.claude/plans/nope-permissions-gibt-es-wild-lobster.md`
-//! Schritt 7 ("Session-Titel und Resume-Picker") und Zeile A7 der
-//! Slice-Tabelle in `harw-scopes-contract.md` §5.
+//! Deckt Session-Titel und Resume-Picker ab (siehe `docs/design/runtime-contracts.md`).
 //!
 //! Dieses Modul besitzt **keinen** eigenen Store-Typ, sondern eine Handvoll
 //! freier Funktionen über `<root>/<session-id>.meta.json` — bewusst analog zu
@@ -705,8 +703,8 @@ mod tests {
             title_source: TitleSource::Manual,
             created_at: Timestamp::now(),
             last_opened_at: Timestamp::now(),
-            cwd: Some(PathBuf::from("/home/mia/projects/harwness")),
-            project_root: Some(PathBuf::from("/home/mia/projects/harwness")),
+            cwd: Some(PathBuf::from("/home/user/projects/harwness")),
+            project_root: Some(PathBuf::from("/home/user/projects/harwness")),
             project_key: Some("harwness-abc123".to_owned()),
             first_user_message: Some("Hallo".to_owned()),
             turns: 3,
@@ -1023,8 +1021,8 @@ mod tests {
     fn set_project_updates_and_clears_fields() -> TestResult {
         let temp = tempfile::tempdir()?;
         let session = SessionId::from_str("session-a");
-        let cwd = PathBuf::from("/home/mia/projects/harwness/sub");
-        let root = PathBuf::from("/home/mia/projects/harwness");
+        let cwd = PathBuf::from("/home/user/projects/harwness/sub");
+        let root = PathBuf::from("/home/user/projects/harwness");
 
         let meta = set_project(
             temp.path(),

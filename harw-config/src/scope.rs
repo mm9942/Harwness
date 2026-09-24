@@ -1,5 +1,5 @@
 //! `SettingScope` — die drei Lebensdauern einer Einstellung (Contract
-//! `harw-scopes-contract.md` §2, Zeile A2).
+//! `docs/design/config-scopes.md` §2, Zeile A2).
 //!
 //! Eine Einstellung kann auf drei Ebenen mit steigender Präzedenz gelten:
 //! `Global` (dauerhaft für den User, `~/.harw/config.toml`), `Project`
@@ -219,6 +219,12 @@ pub const PERMISSIONS_DEFAULT_MODE_ORDER: &[&str] = &["ask", "auto", "full"];
 /// `GlobalOnly`-Abweichung behandelt (ignoriert + `ScopeDiagnostic`).
 pub const POLICY_VISIBILITY_SCOPE_ORDER: &[&str] = &["self", "everyone"];
 
+/// Strenge-Reihenfolge für `tools.doc.remote_ocr`: Index 0 = strengster Wert.
+/// `off` schickt nie eine Datei nach außen, `ask` nur nach Freigabe, `on`
+/// ohne Nachfrage. Entspricht der Variantenreihenfolge von
+/// [`crate::RemoteOcrMode`].
+pub const TOOLS_DOC_REMOTE_OCR_ORDER: &[&str] = &["off", "ask", "on"];
+
 /// Ein Eintrag der zentralen Deklarationstabelle [`FIELD_TABLE`]
 /// (`docs/design/config-scopes.md` Abschnitt 7a).
 #[derive(Debug, Clone, Copy)]
@@ -264,10 +270,10 @@ pub struct FieldScope {
 /// Die zentrale, öffentliche Deklarationstabelle: ein Eintrag pro
 /// `HarnessConfig`-Blattfeld (`docs/design/config-scopes.md` Abschnitt 6.3),
 /// in derselben Reihenfolge wie Abschnitt 1/6.3 der Spezifikation, damit die
-/// Tabelle 1:1 dagegen geprüft werden kann. Exakt 111 Einträge (Abschnitt 6.3
-/// Kontrollsumme: `ProfileReplaces` 57 · `GlobalOnly` 11 · `MinBound` 18 ·
+/// Tabelle 1:1 dagegen geprüft werden kann. Exakt 115 Einträge (Abschnitt 6.3
+/// Kontrollsumme: `ProfileReplaces` 57 · `GlobalOnly` 11 · `MinBound` 21 ·
 /// `CompositeMember` 11 · `Intersection` 4 · `OrBool` 3 · `Union` 2 ·
-/// `AndBool` 2 · `StricterOf` 2 · `PerFileValidated` 1).
+/// `AndBool` 2 · `StricterOf` 3 · `PerFileValidated` 1).
 ///
 /// Rein deklarativ — keine Merge-Logik (die lebt in `crate::merge`). Der
 /// Exhaustivitäts-Test, der jedes `HarnessConfig`-/Section-Struct-Feld
@@ -331,6 +337,10 @@ pub static FIELD_TABLE: &[FieldScope] = &[
     FieldScope { path: "tools.plan.require_exploration_for", scope: Scope::Profile, merge: MergeRule::ProfileReplaces, ordering: None, intersection_key: None, security_critical: false },
     FieldScope { path: "tools.plan.exploration_ttl_secs", scope: Scope::Profile, merge: MergeRule::ProfileReplaces, ordering: None, intersection_key: None, security_critical: false },
     FieldScope { path: "tools.plan.max_expand_depth", scope: Scope::Global, merge: MergeRule::MinBound, ordering: None, intersection_key: None, security_critical: false },
+    // 1.8a [tools.doc] (1) — Remote-OCR für `doc.read_pdf`. Home und Profil
+    // setzen frei, ein nicht vertrautes Projekt darf nur verschärfen
+    // (`merge_tools_doc`, Ordnung `off` < `ask` < `on`).
+    FieldScope { path: "tools.doc.remote_ocr", scope: Scope::Profile, merge: MergeRule::StricterOf, ordering: Some(TOOLS_DOC_REMOTE_OCR_ORDER), intersection_key: None, security_critical: true },
     // 1.9 [mode] (1)
     FieldScope { path: "mode.default", scope: Scope::Profile, merge: MergeRule::ProfileReplaces, ordering: None, intersection_key: None, security_critical: false },
     // 1.10 [research] (5)
@@ -441,7 +451,8 @@ mod merge_rule_tests {
         // Runde 5, Teil N: +1 für `shell.max_timeout_secs`.
         // Runde 7, Teil A2: +2 für `guards.orchestrator_read_*`.
         // Runde 7, Teil L4: +1 für `permissions.auto_classifier_timeout_secs`.
-        assert_eq!(FIELD_TABLE.len(), 114);
+        // `[tools.doc]`: +1 für `tools.doc.remote_ocr`.
+        assert_eq!(FIELD_TABLE.len(), 115);
     }
 
     #[test]
@@ -469,7 +480,8 @@ mod merge_rule_tests {
         assert_eq!(count(MergeRule::OrBool), 3);
         assert_eq!(count(MergeRule::Union), 2);
         assert_eq!(count(MergeRule::AndBool), 2);
-        assert_eq!(count(MergeRule::StricterOf), 2);
+        // `[tools.doc]`: +1 (`tools.doc.remote_ocr`).
+        assert_eq!(count(MergeRule::StricterOf), 3);
         assert_eq!(count(MergeRule::PerFileValidated), 1);
     }
 

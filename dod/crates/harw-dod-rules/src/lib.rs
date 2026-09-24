@@ -1,5 +1,5 @@
 //! Regeln, Baselines und die Geburt eines Befunds (Knoten AW4-03,
-//! Contract-Master `docs/aw-contract-master.md` §G.1).
+//! Contract-Master `docs/design/build-history.md` §G.1).
 //!
 //! # Zweck
 //! Diese Crate ist der Ort, an dem aus Beobachtungen — `HostSample` und

@@ -18,8 +18,12 @@
 //! `provider/modell`, getrennt am **ersten** `/`, sofern das Präfix ein
 //! aktivierter Provider ist (z. B. `openrouter/nvidia/nemotron-…`).
 //!
-//! Alle Änderungen wirken **ab der nächsten Sitzung**; nur `/model` wechselt
-//! das Modell der laufenden Sitzung live.
+//! Änderungen an Kind-Rollen (Orchestrator, Sub-Orchestrator, Worker,
+//! Explorer, Recherche, Gedächtnis) gelten in einer TUI-Sitzung sofort für
+//! **neu gestartete** Agenten (Live-Modellwechsel über
+//! [`crate::live_model::LiveModelControl`]); alle übrigen Rollen wirken ab
+//! der nächsten Sitzung. `/model` wechselt das Modell der laufenden Sitzung
+//! live.
 //!
 //! # Sicherheitsregel — kein ModelTool
 //! `permission = "operator"`, `visibility = "tui_only"`: das Modell darf die
@@ -194,6 +198,30 @@ pub(crate) fn finish_text(mut text: String, note: Option<&str>) -> String {
     text
 }
 
+/// Wie [`finish_text`], meldet aber eine live übernommene Rollenwahl.
+///
+/// # Argumente
+/// - `live`: `true`, wenn die laufende Sitzung die Wahl bereits für neu
+///   gestartete Agenten übernommen hat
+///   ([`crate::live_model::LiveModelControl::set_internal_model`]).
+fn finish_role_text(text: String, note: Option<&str>, live: bool) -> String {
+    if !live {
+        return finish_text(text, note);
+    }
+    let mut text = text;
+    match note {
+        Some(note) => {
+            text.push_str(" — gilt ab sofort für neu gestartete Agenten.\n");
+            text.push_str(note);
+        }
+        None => text.push_str(
+            " — gespeichert; gilt ab sofort für neu gestartete Agenten \
+             (laufende behalten ihr Modell).",
+        ),
+    }
+    text
+}
+
 /// Zellinhalt für die Tabelle: `-` statt leer.
 fn cell(value: Option<&str>) -> &str {
     value.filter(|value| !value.is_empty()).unwrap_or("-")
@@ -263,7 +291,9 @@ fn render_show(
     }
     lines.push(String::new());
     lines.push(format!(
-        "{EFFECTIVE_NEXT_SESSION} Ändern: /models set <rolle> <modell|provider/modell>, \
+        "{EFFECTIVE_NEXT_SESSION} Kind-Rollen (Orchestrator, Worker, Explorer, Recherche, \
+         Gedächtnis) gelten sofort für neu gestartete Agenten. \
+         Ändern: /models set <rolle> <modell|provider/modell>, \
          /models reset <rolle>."
     ));
 
@@ -300,6 +330,12 @@ fn handle_set(
 ) -> Result<OpOutput, OpError> {
     let (provider, model) = resolve_target(config, target)?;
     let persistence = crate::config_util::selection_persistence(ctx);
+    // Live-Übernahme: nur eine Stelle, deren Provider jetzt erreichbar ist,
+    // wird überhaupt gespeichert (sonst bliebe eine unbrauchbare Wahl stehen).
+    if role.internal_point().is_some() {
+        crate::live_model::ensure_provider_ready(ctx, &provider)?;
+    }
+    let mut live = false;
 
     let note = match role {
         ModelRole::Uia => {
@@ -318,13 +354,27 @@ fn handle_set(
                     other.key()
                 ))
             })?;
-            persistence.persist_internal_model(point, Some(provider.as_str()), Some(model.as_str()))
+            let note = persistence.persist_internal_model(
+                point,
+                Some(provider.as_str()),
+                Some(model.as_str()),
+            );
+            live = crate::live_model::apply_internal_model(
+                ctx,
+                point,
+                Some(harw_config::InternalModelChoice {
+                    provider: Some(provider.clone()),
+                    model: Some(model.clone()),
+                }),
+            );
+            note
         }
     };
 
-    let text = finish_text(
+    let text = finish_role_text(
         format!("Modell für {} gesetzt: {provider}/{model}", role.label()),
         note.as_deref(),
+        live,
     );
     Ok(OpOutput {
         text,
@@ -342,6 +392,7 @@ fn handle_set(
 /// Führt `reset <rolle>` aus.
 fn handle_reset(ctx: &OpContext, role: ModelRole) -> Result<OpOutput, OpError> {
     let persistence = crate::config_util::selection_persistence(ctx);
+    let mut live = false;
     let note = match role {
         ModelRole::Uia => persistence.clear_uia_selection(),
         // Runde 5, Teil G: eigener Eintrag und alter Familien-Pin weg → die
@@ -358,13 +409,16 @@ fn handle_reset(ctx: &OpContext, role: ModelRole) -> Result<OpOutput, OpError> {
                     other.key()
                 ))
             })?;
-            persistence.persist_internal_model(point, None, None)
+            let note = persistence.persist_internal_model(point, None, None);
+            live = crate::live_model::apply_internal_model(ctx, point, None);
+            note
         }
     };
 
-    let text = finish_text(
+    let text = finish_role_text(
         format!("Modellwahl für {} zurückgesetzt", role.label()),
         note.as_deref(),
+        live,
     );
     Ok(OpOutput {
         text,
@@ -804,6 +858,84 @@ mod tests {
                 provider: Some("provider-a".to_owned()),
                 model: Some("model-a-2026".to_owned()),
             }]
+        );
+        Ok(())
+    }
+
+    /// Live-Modellwechsel: `/models set orchestrator …` prüft den Provider,
+    /// meldet die Wahl an die laufende Montage (neu gestartete Agenten nehmen
+    /// sie sofort) und sagt das in der Bestätigung.
+    #[tokio::test]
+    async fn models_set_child_role_applies_live_when_the_runtime_supports_it() -> TestResult {
+        type Call = (InternalModelPoint, Option<harw_config::InternalModelChoice>);
+        #[derive(Default)]
+        struct LiveRecorder {
+            ready: std::sync::Mutex<Vec<String>>,
+            calls: std::sync::Mutex<Vec<Call>>,
+        }
+        impl crate::live_model::LiveModelControl for LiveRecorder {
+            fn ensure_provider_ready(&self, provider: &str) -> Result<(), String> {
+                if let Ok(mut ready) = self.ready.lock() {
+                    ready.push(provider.to_owned());
+                }
+                Ok(())
+            }
+            fn set_internal_model(
+                &self,
+                point: InternalModelPoint,
+                choice: Option<harw_config::InternalModelChoice>,
+            ) -> bool {
+                if let Ok(mut calls) = self.calls.lock() {
+                    calls.push((point, choice));
+                }
+                true
+            }
+        }
+
+        let base = fixture(test_config(), None)?;
+        let live = Arc::new(LiveRecorder::default());
+        let persistence: Arc<dyn SelectionPersistence> = base.recorder.clone();
+        let mut services = ServiceMap::new();
+        services.insert(persistence);
+        services.insert(Arc::new(test_config()));
+        services.insert(Arc::clone(&live) as crate::live_model::SharedLiveModelControl);
+        let live_ctx = OpContext::new(
+            SessionId::new(),
+            TurnId::new(),
+            base.ctx.sandbox().clone(),
+            services,
+        );
+        let args = ModelsArgs::from_raw_args(&toks(&["set", "orchestrator", "model-a"]))
+            .map_err(ctx("args"))?;
+        let output = super::models(&live_ctx, args)
+            .await
+            .map_err(ctx("set orchestrator"))?;
+
+        assert_eq!(
+            live.ready.lock().map(|ready| ready.clone()).ok(),
+            Some(vec!["provider-a".to_owned()])
+        );
+        assert_eq!(
+            live.calls.lock().map(|calls| calls.clone()).ok(),
+            Some(vec![(
+                InternalModelPoint::RootOrchestrator,
+                Some(harw_config::InternalModelChoice {
+                    provider: Some("provider-a".to_owned()),
+                    model: Some("model-a-2026".to_owned()),
+                }),
+            )])
+        );
+        assert!(
+            output
+                .text
+                .contains("gilt ab sofort für neu gestartete Agenten"),
+            "{}",
+            output.text
+        );
+        assert_eq!(
+            base.recorder.calls().len(),
+            1,
+            "die Wahl wird weiterhin gespeichert"
         );
         Ok(())
     }

@@ -22,7 +22,7 @@
 //! Defaults sind bewusst restriktiv (`Default = sicher/aus`):
 //! `kill_requires_human = true`, `auto_freeze = true`, leere
 //! cgroup-Präfixliste. Ein nicht vertrauter Repo-Layer darf diese Sektion
-//! laut `docs/remediation/ledger/W3/C-CFG.md` nur verengen
+//! nur verengen
 //! (`allowed_cgroup_prefixes` nur Schnittmenge, `auto_freeze` nur Richtung
 //! `true`); `kill_requires_human` ist ohnehin in jeder Layer fest auf `true`
 //! erzwungen (siehe unten) und `proof_key_dir` wird aus einem Repo-Layer

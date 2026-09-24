@@ -322,7 +322,7 @@ pub enum Surface {
 
     /// Exposition als Agent-as-Tool: das Modell ruft einen Child-Agent auf.
     ///
-    /// Details siehe `docs/design/wave-4-agents-as-tools.md`.
+    /// Details siehe `docs/design/agents-as-tools.md`.
     /// Wichtigste Invariante: Child-Authority ⊆ Parent-Authority (monoton fallend).
     ///
     /// - `child_name`: Bezeichner der Child-Agent-Definition (aus einer späteren AgentRegistry).

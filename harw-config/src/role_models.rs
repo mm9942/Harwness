@@ -162,6 +162,25 @@ impl ModelRole {
             Self::AutoClassifier => Some(InternalModelPoint::AutoClassifier),
         }
     }
+
+    /// `true`, wenn eine Wahl dieser Rolle (`/models set|reset`) in der
+    /// laufenden Sitzung sofort für **neu gestartete** Kind-Agenten gilt
+    /// (Live-Modellwechsel: die Kind-Modellstellen des Wurzel-Baums). Alle
+    /// übrigen Rollen werden beim Start einmal verdrahtet und wirken erst ab
+    /// der nächsten Sitzung.
+    #[must_use]
+    pub fn applies_to_new_agents_live(self) -> bool {
+        matches!(
+            self,
+            Self::Orchestrator
+                | Self::SubOrchestrator
+                | Self::WorkerSimple
+                | Self::WorkerComplex
+                | Self::Explorer
+                | Self::Research
+                | Self::MemoryConsolidation
+        )
+    }
 }
 
 /// Herkunft des aufgelösten Modells einer Rolle.

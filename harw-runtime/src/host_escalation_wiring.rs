@@ -18,7 +18,9 @@
 //! # Sitzungsphase und Kinder
 //! Eine Host-Arbeitsphase — über `/sandbox-lease` oder über eine
 //! `request_host`-Freigabe — wird prozessweit eingetragen
-//! (`HostPermitSessionRegistry::mark_global_approval`). Weil
+//! (`HostPermitSessionRegistry::mark_global_approval`) und bleibt ohne
+//! Zeitablauf aktiv, bis der Nutzer sie beendet (Strg+H oder
+//! `/sandbox-lease revoke`). Weil
 //! `profile_tool_providers` Ledger, Registry und Fragekanal an **jeden**
 //! gebauten `ShellToolProvider` hängt (auch Strict/Cargo/Tmux) und beide
 //! Kind-Fabriken dieselbe `HostPermitWiring` bekommen, laufen alle
@@ -225,7 +227,7 @@ mod tests {
         }
     }
 
-    /// Nutzerinnen-Fall: eine aktive `/sandbox-lease` (prozessweit, 12 h)
+    /// Nutzerinnen-Fall: eine aktive `/sandbox-lease` (prozessweit, bis Strg+H)
     /// muss auch für Kinder mit Strict- **und** Cargo-Profil gelten — der
     /// Aufruf läuft ohne erneute Frage auf dem Host.
     #[tokio::test]
@@ -242,7 +244,7 @@ mod tests {
             )
             .with_host_escalation(escalation_for_entry(EntryKind::Tui));
             // Genau das, was `/sandbox-lease` bei „Host-Arbeitsphase“ tut.
-            registry.mark_global_approval(harw_tool_shell::HOST_SESSION_LEASE_TTL);
+            registry.mark_global_approval();
 
             let factory = factory(profile.clone(), wiring)?;
             let root = SessionId::new();

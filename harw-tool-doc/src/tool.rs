@@ -272,7 +272,7 @@ async fn run(context: &ToolExecutionContext, args: &DocReadPdfArgs) -> DocToolRe
         .and_then(|name| name.to_str())
         .unwrap_or(args.path.as_str());
 
-    let force_native = args.backend.as_deref() == Some("native");
+    let force_native = args.backend.as_deref() == Some(crate::mistral::NATIVE_BACKEND);
     let mistral_client = if force_native {
         None
     } else {
@@ -439,8 +439,10 @@ fn doc_read_pdf_spec() -> ToolSpec {
         JsonSchema {
             schema_type: Some(JsonSchemaType::String),
             description: Some(
-                "'auto' (default: uses Mistral OCR when a Mistral provider is configured) or \
-                 'native' (forces local extraction)."
+                "'auto' (default: uses remote Mistral OCR when a Mistral provider is configured, \
+                 which uploads the file to the Mistral API) or 'native' (forces local \
+                 extraction, nothing leaves the machine). Remote OCR may need user approval; \
+                 if that approval is denied, retry with backend 'native' for local extraction."
                     .to_owned(),
             ),
             ..Default::default()

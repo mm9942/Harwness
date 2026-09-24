@@ -680,6 +680,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "harw-digest"
+version = "0.3.0"
+dependencies = [
+ "blake3",
+ "serde",
+]
+
+[[package]]
 name = "harw-dod"
 version = "0.3.0"
 dependencies = [
@@ -1150,8 +1158,8 @@ dependencies = [
 name = "harw-lens-types"
 version = "0.3.0"
 dependencies = [
+ "harw-digest",
  "harw-macros",
- "harw-types",
  "serde",
 ]
 
@@ -1159,7 +1167,6 @@ dependencies = [
 name = "harw-macros"
 version = "0.3.0"
 dependencies = [
- "harw-authority",
  "proc-macro2",
  "quote",
  "syn 2.0.119",
@@ -1340,7 +1347,7 @@ dependencies = [
 name = "harw-types"
 version = "0.3.0"
 dependencies = [
- "blake3",
+ "harw-digest",
  "jiff",
  "serde",
  "serde_json",

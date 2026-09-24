@@ -1,9 +1,8 @@
 //! `harw-provider` — Provider-Schicht des Harness.
 //!
-//! Diese Crate setzt das Typestate-Skelett aus
-//! `04_Project/12-provider-typestate-skeleton.md` um und übernimmt die
-//! Registry-/Fallback-Doktrin aus `11-provider-registry-and-fallback-policy.md`
-//! sowie das OpenAI-/Bearer-Schema aus `08-openai-endpoint-and-bearer-auth.md`.
+//! Diese Crate setzt ein Typestate-Skelett für Provider um, dazu die
+//! Registry-/Fallback-Doktrin und das OpenAI-/Bearer-Schema (siehe
+//! `docs/architecture/model-provider-routing.md`).
 //!
 //! ## Leitentscheidungen (aus den Quell-Noten, wörtlich gegründet)
 //! 1. **Der Provider ist das Hauptobjekt.** `Primary`/`Secondary` sind Tags am
@@ -81,7 +80,9 @@ pub use marker::ChatGptOAuthAuth;
 // ===== Auth surface =====
 #[cfg(feature = "chatgpt-oauth")]
 pub use auth::ChatGptOAuthConfig;
-pub use auth::{ApiKeyConfig, AuthProvider, BearerAuth, HeaderMap, SghAuth, StaticBearerConfig};
+pub use auth::{
+    ApiKeyConfig, AuthProvider, BearerAuth, HeaderMap, ProviderAuth, StaticBearerConfig,
+};
 
 // ===== Model surface =====
 pub use model::{

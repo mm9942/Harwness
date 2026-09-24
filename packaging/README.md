@@ -2,13 +2,16 @@
 
 ## From source (recommended today)
 
+See [docs/setup/install.md](../docs/setup/install.md) for the full guide.
+
 ```sh
 scripts/install.sh            # builds release + installs to ~/.local/bin
 HARW_INSTALL_DIR=/opt/bin scripts/install.sh   # custom target
 ```
 
 The installer checks prerequisites (cargo, optional bwrap), builds
-`harw-cli --release`, installs the `harw` binary (mode 0755), and wires
+`harw` and `killer` in release mode (through `make install` when `make` is
+available), installs both binaries (mode 0755), and wires
 `~/.local/bin` into `~/.bashrc`/`~/.zshrc` idempotently. It never touches an
 existing `~/.harw` — first `harw` run performs onboarding.
 

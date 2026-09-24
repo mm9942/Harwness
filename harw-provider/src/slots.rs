@@ -421,7 +421,7 @@ mod tests {
         CustomerProviderPolicy, ProviderCapabilityMatrix, ProviderGovernor, ProviderMetrics,
         ProviderMetricsSnapshot, ProviderSelectionTrace, RetryPolicy, SelectionDecision,
     };
-    use crate::auth::{ApiKeyConfig, SghAuth};
+    use crate::auth::{ApiKeyConfig, ProviderAuth};
     use crate::marker::ModelCapabilityTag;
     use crate::model::{ModelRecord, ModelSettings};
     use crate::provider::{ProviderBuilder, ProviderRecord, ProviderSettings};
@@ -441,7 +441,7 @@ mod tests {
             .id(ProviderId::from(name))
             .name(ProviderName::from(name))
             .base_url(Url::parse("https://api.example.com/v1")?)
-            .auth(SghAuth::ApiKey(ApiKeyConfig {
+            .auth(ProviderAuth::ApiKey(ApiKeyConfig {
                 api_key: SecretString::new("test-key".to_owned()),
             }))
             .add_models(models)

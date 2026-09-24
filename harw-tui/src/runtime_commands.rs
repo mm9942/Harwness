@@ -1,5 +1,4 @@
-//! Laufzeit-Hilfen für Slash-Kommandos der TUI (Welle W2d-1/A, Befund
-//! `w4-tui-control.md` §5).
+//! Laufzeit-Hilfen für Slash-Kommandos der TUI.
 //!
 //! # Zweck
 //! Bündelt drei kleine, rechterelevante Bausteine, die der Slash-Pfad der TUI
@@ -182,7 +181,7 @@ mod tests {
     fn test_caller_tier_returns_principal_tier() {
         let p = Principal::trusted_ingress(
             PrincipalKind::Human,
-            "mia",
+            "alice",
             IngressSurface::Tui,
             PermissionTier::Maintainer,
         );

@@ -64,7 +64,7 @@ use tokio::sync::broadcast;
 
 use super::{
     ChatApp, Role, apply_host_permit_decision, approval_dialog_key_is_armed,
-    open_host_permit_prompt,
+    auto_grant_host_permit, open_host_permit_prompt,
 };
 use crate::agent_tree::AgentRow;
 use crate::approval::ChildTurnDriver;
@@ -78,6 +78,57 @@ use crate::tui_event::TuiEvent;
 pub(crate) const AUTO_TURN_PROMPT: &str = "Ein Hintergrund-Agent hat sich gemeldet (siehe oben). \
      Fasse das Ergebnis für die Nutzerin kurz zusammen und nenne, falls nötig, die nächsten \
      Schritte. Das vollständige Ergebnis liefert agent.result {child_id}.";
+
+/// Trenner zwischen eingereihten Meldungen und dem Turn-Text
+/// ([`attach_queued_notices`]).
+const NOTICE_SEPARATOR: &str = "\n\n---\n";
+
+/// Anfänge eingespeister Meldungen ([`format_notice`],
+/// `ParentMessage::to_model_text`, `stale_model_text`) — auch mit dem `↩ `
+/// der Anzeige-Überschreibung eines Auto-Turns ([`take_auto_turn`]).
+const NOTICE_PREFIXES: &[&str] = &["[Hintergrund-Agent ", "[Nachricht von ", "[Frage von "];
+
+/// Ob `text` mit einer eingespeisten Meldung beginnt.
+fn starts_with_notice(text: &str) -> bool {
+    let text = text.trim_start();
+    let text = text.strip_prefix('↩').map_or(text, str::trim_start);
+    NOTICE_PREFIXES
+        .iter()
+        .any(|prefix| text.starts_with(prefix))
+}
+
+/// Übersetzt den Text einer Nutzerzelle in Export-Einträge und trennt dabei
+/// eingespeiste Meldungen (Hintergrund-Agenten, Kind-Nachrichten, die
+/// Auto-Turn-Anweisung) von dem, was die Nutzerin tatsächlich schrieb.
+///
+/// # Beschreibung
+/// Eingespeiste Meldungen stehen im Verlauf als Nutzernachricht (die
+/// Historie kennt keine Herkunft), gehören im Export aber nicht unter
+/// `## Du`:
+/// - ein Auto-Turn (endet mit [`AUTO_TURN_PROMPT`]) bzw. seine Anzeige
+///   (`↩ [Hintergrund-Agent …]`) wird vollständig zur
+///   [`ExportEntry::Notice`];
+/// - vor einem getippten Turn eingereihte Meldungen
+///   (`<Meldungen>\n\n---\n<Text>`) werden getrennt: Meldungen als
+///   `Notice`, der Rest als `User`;
+/// - alles andere bleibt `User`.
+pub(crate) fn user_text_export_entries(text: &str) -> Vec<crate::export::ExportEntry> {
+    use crate::export::ExportEntry;
+    if text.trim_end().ends_with(AUTO_TURN_PROMPT) || starts_with_notice(text) {
+        if let Some((notices, typed)) = text.rsplit_once(NOTICE_SEPARATOR)
+            && starts_with_notice(notices)
+            && !typed.trim_end().ends_with(AUTO_TURN_PROMPT)
+            && !typed.trim().is_empty()
+        {
+            return vec![
+                ExportEntry::Notice(notices.to_owned()),
+                ExportEntry::User(typed.to_owned()),
+            ];
+        }
+        return vec![ExportEntry::Notice(text.to_owned())];
+    }
+    vec![ExportEntry::User(text.to_owned())]
+}
 
 /// Zeitfenster, in dem ein zweites `/quit` trotz laufender Hintergrund-Agenten
 /// beendet.
@@ -449,8 +500,14 @@ pub(crate) fn format_notice(notice: &BackgroundNotice) -> String {
         BackgroundStatus::Failed => "fehlgeschlagen",
         BackgroundStatus::Cancelled => "abgebrochen",
     };
+    // Anzeige `<provider>/<modell>` des Kindes, falls bekannt.
+    let route = notice
+        .model_route
+        .as_deref()
+        .map(|route| format!(" ({route})"))
+        .unwrap_or_default();
     format!(
-        "[Hintergrund-Agent {} {} {verb} nach {} s]\n{}",
+        "[Hintergrund-Agent {} {}{route} {verb} nach {} s]\n{}",
         notice.role,
         notice.child,
         notice.elapsed.as_secs(),
@@ -524,7 +581,7 @@ pub(crate) fn attach_queued_notices(app: &mut ChatApp, turn_text: String) -> Str
         .drain(..)
         .map(|notice| notice.text)
         .collect();
-    format!("{}\n\n---\n{turn_text}", notices.join("\n\n"))
+    format!("{}{NOTICE_SEPARATOR}{turn_text}", notices.join("\n\n"))
 }
 
 /// Das Register des Spawners, um im Leerlauf auf neue Meldungen zu warten.
@@ -585,8 +642,13 @@ pub(crate) fn mark_rows(app: &ChatApp, rows: &mut [AgentRow]) {
 
 /// Eine Zeile je Lauf für `/agent bg`.
 fn run_line(run: &BackgroundRun) -> String {
+    let route = run
+        .model_route
+        .as_deref()
+        .map(|route| format!(" · {route}"))
+        .unwrap_or_default();
     let mut line = format!(
-        "  {} ({}) · {} · {} s · {} Werkzeugaufrufe · {} Tokens",
+        "  {} ({}){route} · {} · {} s · {} Werkzeugaufrufe · {} Tokens",
         run.role,
         run.child,
         run.status.label_de(),
@@ -718,7 +780,11 @@ pub(crate) fn poll_idle_prompts(
             worker = prompt.worker_definition(),
             "tui.host_permit.prompt_shown_idle"
         );
-        app.background.host_permit_shown_at = Some(open_host_permit_prompt(app, prompt));
+        // Full Access: Sitzungs-Lease ohne Dialog (die Systemzeile braucht
+        // trotzdem ein Neuzeichnen).
+        if let Some(prompt) = auto_grant_host_permit(app, prompt) {
+            app.background.host_permit_shown_at = Some(open_host_permit_prompt(app, prompt));
+        }
         opened = true;
     }
     opened

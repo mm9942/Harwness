@@ -172,7 +172,7 @@ async fn agent(ctx: &OpContext, args: AgentArgs) -> Result<OpOutput, OpError> {
                     "- {} (role={}, model={}, depth={}, lease_expires_at={})",
                     record.child,
                     record.role,
-                    record.model.as_deref().unwrap_or("-"),
+                    record.model_route().as_deref().unwrap_or("-"),
                     record.depth,
                     record.lease_expires_at
                 ));
@@ -750,6 +750,7 @@ mod tests {
             status: harw_core::child_controller::ChildStatus::Running,
             task_complexity: None,
             model: None,
+            provider: None,
             consumed: harw_core::child_controller::ChildUsage::default(),
             charged_to_parent: harw_core::child_controller::ChildUsage::default(),
             live: harw_core::child_controller::ChildLiveStats {

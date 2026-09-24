@@ -160,8 +160,8 @@ fn detached_start_survives(
 /// # Beschreibung
 /// F-017/E3b. Ein fehlendes Eltern-Level (`None`) heißt **nicht** „unbegrenzt":
 /// ohne diesen Deckel hob ein `None` beim Elternteil auch den `effort_cap` der
-/// Agent-IR auf, und das Kind lief mit dem Provider-Default — genau der
-/// Befund E3(b) aus `w3-core-child-jobs-mcp.md`. Statt eines Provider-Defaults
+/// Agent-IR auf, und das Kind lief mit dem Provider-Default — ein früherer
+/// Befund. Statt eines Provider-Defaults
 /// klammert [`ManagedAgentSpawner::clamp_child_reasoning_effort`] dann auf
 /// diesen Wert.
 ///
@@ -174,8 +174,7 @@ fn detached_start_survives(
 const DEFAULT_CHILD_REASONING_EFFORT: ReasoningEffort = ReasoningEffort::Medium;
 
 /// Löst den Kind-Default-Reasoning-Effort nach der Nutzerentscheidung-Rangfolge
-/// **Provider > Modell > Agent > Rolle** auf (Welle 8,
-/// `recursive-cooking-lobster.md`).
+/// **Provider > Modell > Agent > Rolle** auf.
 ///
 /// # Beschreibung
 /// Spiegelt absichtlich dieselbe Rangfolgen-Logik wie
@@ -866,6 +865,11 @@ pub struct ChildRecord {
     /// Kind-Modell, sonst das `active_model` der Kind-Session. `None`, wenn
     /// keines von beiden bekannt ist (dann gilt der Provider-Default).
     pub model: Option<String>,
+    /// Der Provider, den dieses Kind anspricht (Anzeige `<provider>/<modell>`):
+    /// gepinnter Provider, sonst `active_provider` der Kind-Session, sonst
+    /// Hauptprovider der Factory, sonst der des Elternteils. `None`, wenn
+    /// unbekannt.
+    pub provider: Option<String>,
     /// Bisher abgerechneter Verbrauch dieses Kindes **samt Nachkommen**.
     ///
     /// Das Kind selbst trägt am Ende jedes
@@ -965,6 +969,18 @@ pub struct ChildLiveStats {
 }
 
 impl ChildRecord {
+    /// Provider und Modell dieses Kindes als `<provider>/<modell>` (ohne
+    /// Provider nur das Modell); `None`, wenn beides unbekannt ist.
+    #[must_use]
+    pub fn model_route(&self) -> Option<String> {
+        match (self.provider.as_deref(), self.model.as_deref()) {
+            (Some(provider), Some(model)) => Some(format!("{provider}/{model}")),
+            (None, Some(model)) => Some(model.to_owned()),
+            (Some(provider), None) => Some(provider.to_owned()),
+            (None, None) => None,
+        }
+    }
+
     fn durable_lease(&self) -> ChildLeaseRecord {
         ChildLeaseRecord {
             child: self.child.clone(),
@@ -1893,6 +1909,38 @@ pub trait ChildRegistryFactory: Send + Sync {
         None
     }
 
+    /// Provider-ID, die der Kind-Provider für `role`/`complexity` fest
+    /// anspricht — Gegenstück zu [`Self::pinned_model_for_task`] für die
+    /// Anzeige `<provider>/<modell>`.
+    ///
+    /// # Description
+    /// Der Default liefert `None`, statt [`Self::model_for_task`] ein
+    /// weiteres Mal aufzurufen (Factories mit Nebenwirkungen in `model_for`
+    /// bleiben unberührt); Factories mit Provider-Routing überschreiben ihn.
+    ///
+    /// # Returns
+    /// Die gepinnte Provider-ID oder `None` (kein Pin bekannt).
+    fn pinned_provider_for_task(
+        &self,
+        role: &str,
+        complexity: Option<TaskComplexity>,
+    ) -> Option<String> {
+        let _ = (role, complexity);
+        None
+    }
+
+    /// Provider-ID, die ein **ungepinntes** Kind dieser Factory anspricht
+    /// (Gegenstück zu [`Self::main_model_for_task`]). Der Default liefert
+    /// `None`; dann gilt der Provider des Elternteils.
+    fn main_provider_for_task(
+        &self,
+        role: &str,
+        complexity: Option<TaskComplexity>,
+    ) -> Option<String> {
+        let _ = (role, complexity);
+        None
+    }
+
     /// Liefert Provider- und Modell-Standard-Reasoning-Effort für die
     /// Provider-/Modell-Zuordnung, die diese Factory für `role` tatsächlich
     /// auflöst (Welle 8: Rangfolge Provider > Modell > Agent > Rolle).
@@ -2063,6 +2111,9 @@ pub struct ManagedAgentSpawner {
     /// [`Self::with_root_model`]) — Rückfall für das Kind-Modell, wenn weder
     /// Pin noch Factory-Hauptmodell bekannt sind.
     root_model: Option<String>,
+    /// Provider der extern gefahrenen Wurzel ([`Self::with_root_provider`]) —
+    /// Rückfall für die Provider-Anzeige eines Kindes.
+    root_provider: Option<String>,
     /// Absoluter Auto-Compact-Deckel (Input-Tokens) für Kind-Sessions aus der
     /// Konfiguration ([`Self::with_compaction_ceiling`]). `None`: es gilt
     /// [`crate::auto_compact::DEFAULT_ABSOLUTE_CEILING_TOKENS`].
@@ -2441,6 +2492,7 @@ fn emit_orchestration_event(
         detail: AgentOrchestrationEvent::bounded_detail(detail),
         tool_calls: Some(record.live.tool_calls),
         model: record.model.clone(),
+        provider: record.provider.clone(),
     });
 }
 
@@ -2715,6 +2767,15 @@ impl ManagedAgentSpawner {
         self
     }
 
+    /// Setzt den Provider der extern gefahrenen Wurzel (Anzeige
+    /// `<provider>/<modell>` eines Kindes, Rückfall wie
+    /// [`Self::with_root_model`]).
+    #[must_use]
+    pub fn with_root_provider(mut self, provider: Option<String>) -> Self {
+        self.root_provider = provider;
+        self
+    }
+
     /// Runde 5, Teil J: legt fest, was ein Kind am Ende seines Token-Budgets
     /// liefert.
     ///
@@ -2787,6 +2848,7 @@ impl ManagedAgentSpawner {
             context_window_resolver: None,
             model_known_probe: None,
             root_model: None,
+            root_provider: None,
             compaction_ceiling: None,
             orchestration_observer: None,
             child_tasks: Mutex::new(BTreeMap::new()),
@@ -5279,6 +5341,9 @@ impl ManagedAgentSpawner {
             );
             input.user_text = Some(cap_task_text(text, max_bytes));
         }
+        // Klon mit geteiltem Zähler: nach dem Turn liefert er den konkreten
+        // Grund eines `CancelReason::Budget`-Endes (`stop_detail`).
+        let turn_control = input.control.clone();
 
         let turn = {
             let session = running.session_mut()?;
@@ -5419,7 +5484,7 @@ impl ManagedAgentSpawner {
                 if let Some(text) = full_text.as_deref() {
                     self.comms.set_last_assistant(child, text);
                 }
-                if let Some(cause) = Self::outcome_end_cause(&outcome) {
+                if let Some(cause) = Self::outcome_end_cause(&outcome, turn_control.stop_detail()) {
                     self.finalize_child_end(child, cause).await;
                 }
                 self.set_status(child, ChildStatus::Completed);
@@ -5671,7 +5736,14 @@ impl ManagedAgentSpawner {
 
     /// Runde 5, Teil M: die Endursache eines terminalen, nicht
     /// erfolgreichen Turn-Ergebnisses (`None` für `Completed` und Pausen).
-    fn outcome_end_cause(outcome: &TurnOutcome) -> Option<crate::child_comms::ChildEndCause> {
+    ///
+    /// `stop_detail` ist der vom Turn vermerkte konkrete Grund eines
+    /// `CancelReason::Budget`-Endes ([`crate::turn_loop::TurnControl::stop_detail`]:
+    /// welche Grenze mit Wert und Verbrauch bzw. welcher Turn-Wächter).
+    fn outcome_end_cause(
+        outcome: &TurnOutcome,
+        stop_detail: Option<String>,
+    ) -> Option<crate::child_comms::ChildEndCause> {
         use crate::child_comms::ChildEndCause;
         match outcome {
             TurnOutcome::Failed { reason } => {
@@ -5685,12 +5757,13 @@ impl ManagedAgentSpawner {
                 None => "Antwort abgelehnt".to_owned(),
             })),
             // Token-Budget (Teil C/J, dann verwirft `enforce_child_budget`
-            // den Bericht wieder) oder Abbruch durch einen Turn-Wächter.
+            // den Bericht wieder), eine Turn-Grenze oder ein Turn-Wächter —
+            // der Turn vermerkt, welche(r) (`stop_detail`).
             TurnOutcome::Cancelled {
                 reason: CancelReason::Budget,
-            } => Some(ChildEndCause::Outcome(
-                "Turn vorzeitig beendet (Token-Budget oder Turn-Wächter)".to_owned(),
-            )),
+            } => Some(ChildEndCause::TurnStopped(stop_detail.unwrap_or_else(
+                || "Turn-Grenze erreicht (ohne vermerkten Grund)".to_owned(),
+            ))),
             TurnOutcome::Cancelled { reason } => Self::cancel_cause(Some(*reason)),
             TurnOutcome::Completed
             | TurnOutcome::AwaitingApproval { .. }
@@ -5741,6 +5814,9 @@ impl ManagedAgentSpawner {
             let note = match &cause {
                 ChildEndCause::Cancelled { .. } | ChildEndCause::Released => "abgebrochen",
                 ChildEndCause::LeaseExpired => "die Sitzung ist nach dem Lease-Ablauf verworfen",
+                cause if cause.is_rate_limited() => {
+                    "Provider-Rate-Limit (HTTP 429) — eine Verdichtung liefe in dasselbe Limit"
+                }
                 _ => "bei diesem Ende nicht vorgesehen",
             };
             (None, Some(note.to_owned()))
@@ -5775,6 +5851,7 @@ impl ManagedAgentSpawner {
                     crate::child_handoff::BudgetHandoff::LastAnswer
                 },
                 origin: self.continuation_origin(child),
+                end: cause.predecessor_end(),
             };
             match self.handoff_ledger.lock() {
                 Ok(mut ledger) => {
@@ -5926,6 +6003,7 @@ impl ManagedAgentSpawner {
             ),
             kind,
             origin: self.continuation_origin(child),
+            end: crate::child_handoff::PredecessorEnd::BudgetExhausted,
         };
         match self.handoff_ledger.lock() {
             Ok(mut ledger) => ledger.record(entry),
@@ -6489,6 +6567,7 @@ impl ManagedAgentSpawner {
             .filter(|task| !task.trim().is_empty());
         input.instructions = Some(crate::child_handoff::continuation_task(
             &seed.of,
+            &seed.end,
             &seed.handoff,
             task.as_deref(),
         ));
@@ -6695,6 +6774,18 @@ impl ManagedAgentSpawner {
                 .get(input.parent_session_id.as_str())
                 .and_then(|record| record.model.clone());
         }
+        // Dasselbe für den Provider (nur Anzeige): eigene Wahl der
+        // Eltern-Session, sonst ihr Admission-Wert, sonst der der Wurzel.
+        let parent_provider: Option<String> = manager
+            .get(&input.parent_session_id)
+            .ok()
+            .and_then(|parent| parent.active_provider().map(|p| p.as_str().to_owned()))
+            .or_else(|| {
+                active
+                    .get(input.parent_session_id.as_str())
+                    .and_then(|record| record.provider.clone())
+            })
+            .or_else(|| self.root_provider.clone());
         let active_for_parent = active
             .values()
             .filter(|record| record.parent == input.parent_session_id)
@@ -6988,6 +7079,14 @@ impl ManagedAgentSpawner {
         let child_main_model: Option<String> = definition
             .registry_factory
             .main_model_for_task(role_name, task_complexity);
+        // Anzeige `<provider>/<modell>`: der Provider, den das Kind anspricht.
+        let child_pinned_provider: Option<String> = definition
+            .registry_factory
+            .pinned_provider_for_task(role_name, task_complexity);
+        let child_main_provider: Option<String> = definition
+            .registry_factory
+            .main_provider_for_task(role_name, task_complexity);
+        let child_provider: Option<String>;
         // Für `ChildRecord::model`: gepinntes Modell, sonst `active_model`;
         // gesetzt im Auto-Compact-Block unten, der die Kind-Session ohnehin liest.
         let mut child_model: Option<String> = child_pinned_model.clone();
@@ -7038,6 +7137,15 @@ impl ManagedAgentSpawner {
                 child_session.set_active_model(Some(harw_types::ModelId::from(model)));
             }
             child_model.clone_from(&model);
+            child_provider = child_pinned_provider
+                .clone()
+                .or_else(|| {
+                    child_session
+                        .active_provider()
+                        .map(|provider| provider.as_str().to_owned())
+                })
+                .or_else(|| child_main_provider.clone())
+                .or_else(|| parent_provider.clone());
             let window = self.context_window_for(model.as_deref());
             let window_known = self
                 .model_known_probe
@@ -7287,6 +7395,7 @@ impl ManagedAgentSpawner {
             status: ChildStatus::Admitted,
             task_complexity,
             model: child_model,
+            provider: child_provider,
             consumed: ChildUsage::default(),
             charged_to_parent: ChildUsage::default(),
         };
@@ -8128,6 +8237,7 @@ specialization = "child-controller-test"
             status: ChildStatus::Admitted,
             task_complexity: None,
             model: None,
+            provider: None,
             consumed: ChildUsage::default(),
             charged_to_parent: ChildUsage::default(),
         };
@@ -8925,6 +9035,7 @@ specialization = "child-controller-test"
                         status: ChildStatus::Admitted,
                         task_complexity: None,
                         model: None,
+                        provider: None,
                         consumed: ChildUsage::default(),
                         charged_to_parent: ChildUsage::default(),
                     },
@@ -9017,6 +9128,7 @@ specialization = "child-controller-test"
                         status: ChildStatus::Admitted,
                         task_complexity: None,
                         model: None,
+                        provider: None,
                         consumed: ChildUsage::default(),
                         charged_to_parent: ChildUsage::default(),
                     },
@@ -10754,6 +10866,7 @@ max_trust = "instruction"
             status: ChildStatus::Admitted,
             task_complexity: None,
             model: None,
+            provider: None,
             consumed: ChildUsage::default(),
             charged_to_parent: ChildUsage::default(),
         };
@@ -11281,6 +11394,7 @@ admitted = ["fs.read", "shell.exec"]
                     status: ChildStatus::Admitted,
                     task_complexity: None,
                     model: None,
+                    provider: None,
                     consumed: ChildUsage::default(),
                     charged_to_parent: ChildUsage::default(),
                 },
@@ -13228,6 +13342,7 @@ max_depth = 0
                 None,
                 TurnInput::user(crate::child_handoff::continuation_task(
                     first,
+                    &seed.end,
                     &seed.handoff,
                     None,
                 )),

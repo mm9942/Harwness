@@ -24,7 +24,7 @@
 //! nichts davon ist ein Fehlerfall.
 //!
 //! # Stand
-//! Inhalt aus Knoten **AW0-09**, nach `docs/aw-contract-master.md`
+//! Inhalt aus Knoten **AW0-09**, nach `docs/design/build-history.md`
 //! Abschnitt D, erweitert um `bm25_scores` in Knoten **W9-C4**. Siehe die
 //! Moduldokumentation von [`collapse::collapse`] für eine Vertragslücke
 //! gegenüber Abschnitt C (`EdgeIndex`-Methoden).

@@ -1,5 +1,7 @@
 # Agent Composition Contract — Design Only (post-0.2.0)
 
+> Status: proposal · Last reviewed: 2026-09-24
+
 **Status:** design draft, no implementation. Nothing in this document changes
 runtime behaviour and nothing here is required by the 0.2.0 milestone. It
 exists to answer the question goal.md's bottom-up analysis raised: *what,

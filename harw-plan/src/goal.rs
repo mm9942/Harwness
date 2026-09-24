@@ -317,7 +317,7 @@ pub trait GoalStore: Send + Sync {
     ///
     /// # Arguments
     /// - `action` (`GoalAction`): anzuwendende Aktion.
-    /// - `actor` (`&str`): Bezeichner des Akteurs (z. B. `"human:mia"`,
+    /// - `actor` (`&str`): Bezeichner des Akteurs (z. B. `"human:alice"`,
     ///   `"model:gpt"`).
     ///
     /// # Errors
@@ -867,7 +867,7 @@ mod tests {
             validate_goal_action(Some(&goal), &action, "model:gpt"),
             Err(PlanError::ActorNotAuthorized { .. })
         ));
-        assert!(validate_goal_action(Some(&goal), &action, "human:mia").is_ok());
+        assert!(validate_goal_action(Some(&goal), &action, "human:alice").is_ok());
     }
 
     #[test]
@@ -910,7 +910,7 @@ mod tests {
             Criterion {
                 description: "Doku vollständig".to_owned(),
                 verification: vec![VerificationStep::Manual {
-                    note: "Review durch Mia".to_owned(),
+                    note: "Review durch Alice".to_owned(),
                 }],
             },
         ];

@@ -1,4 +1,4 @@
-# Eingebaute Matrix-Game-Rolle `matrix-redcell` (Runde 3, Frank-Ideen) — der
+# Eingebaute Matrix-Game-Rolle `matrix-redcell` — der
 # optionale vierte Sitz-Typ des Matrix-Games (`harw-matrix-game`), neben
 # `matrix-player` (Spieler), `matrix-umpire` (Schiedsrichter) und
 # `matrix-market` (Markt). Die Red Cell sieht nur öffentliche Einträge und

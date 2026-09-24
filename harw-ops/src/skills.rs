@@ -205,7 +205,7 @@ pub trait SkillStatePersistence: Send + Sync {
 /// ```rust,no_run
 /// use harw_ops::skills::{LayeredSkillStatePersistence, SkillStatePersistence};
 ///
-/// let persistence = LayeredSkillStatePersistence::new(vec!["/home/mia/.harw".into()]);
+/// let persistence = LayeredSkillStatePersistence::new(vec!["/home/user/.harw".into()]);
 /// let outcome = persistence.set_skill_enabled("review", false)?;
 /// println!("{}", outcome.manifest.display());
 /// # Ok::<(), harw_operations::OpError>(())

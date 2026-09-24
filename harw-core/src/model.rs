@@ -617,6 +617,20 @@ pub trait ModelProvider: Send + Sync {
     fn pinned_model_id(&self) -> Option<String> {
         None
     }
+
+    /// Fest angeheftete Provider-ID dieses Providers, Gegenstück zu
+    /// [`Self::pinned_model_id`].
+    ///
+    /// # Description
+    /// Dient der Anzeige, welchen Provider ein Kind tatsächlich anspricht
+    /// (`<provider>/<modell>`). Wrapper-Provider sollen den Wert ihres
+    /// inneren Providers weiterreichen. Default: `None` (kein Pin bekannt).
+    ///
+    /// # Returns
+    /// Die angeheftete Provider-ID oder `None`.
+    fn pinned_provider_id(&self) -> Option<String> {
+        None
+    }
 }
 
 /// Fehler eines Modell-Aufrufs.

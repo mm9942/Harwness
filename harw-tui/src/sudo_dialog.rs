@@ -6,12 +6,20 @@
 //! Frage mit genau einer [`SudoAnswer`] — oder lehnt ab. Hält außerdem das
 //! optionale Sitzungs-Merken des Passworts.
 //!
+//! Unter dem Freigabemodus „Full Access" ([`SudoUi::open_full_access`]) gibt
+//! es keine Freigabefrage: passwortloses sudo und ein gemerktes
+//! Sitzungspasswort laufen ohne Fenster, sonst erscheint nur die
+//! Passworteingabe.
+//!
 //! # Sicherheitsregeln
 //! - **Alles abfangen:** Solange das Fenster offen ist, gehen *alle*
 //!   Eingabeereignisse (Tasten, Pastes, Maus) an [`SudoUi::handle_event`].
 //!   Nichts erreicht Composer, Busy-Warteschlange oder Eingabe-Historie
 //!   (`remember_input`); die Einbindung in `app.rs` prüft
-//!   [`SudoUi::is_open`] deshalb **vor** jedem anderen Zweig.
+//!   [`SudoUi::is_open`] deshalb **vor** jedem anderen Zweig. Einzige
+//!   Ausnahme ist das Mausrad: es scrollt nach Position (Fensterkörper,
+//!   Agenten-Panel oder Verlauf, siehe `app::scroll_routing`) — reines Lesen,
+//!   es erreicht nie Composer, Warteschlange oder Historie.
 //! - **Maskiert ohne Längenhinweis:** angezeigt wird nur `••••••••` (fest)
 //!   oder `(leer)`.
 //! - **Genullte Puffer:** der Eingabepuffer ist ein `Zeroizing<Vec<u8>>` mit
@@ -39,6 +47,7 @@ use std::sync::{Arc, Mutex, PoisonError, Weak};
 use std::time::{Duration, Instant};
 
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
+use harw_extension_api::approval_mode::ApprovalMode;
 use harw_tool_shell::sudo::display_argv;
 use harw_tool_shell::{
     SUDO_MAX_SECRET_BYTES, SudoAnswer, SudoAuthFailureHook, SudoPrompt, SudoPromptReceiver,
@@ -49,11 +58,12 @@ use ratatui::{
     layout::Rect,
     style::Style,
     text::{Line, Span},
-    widgets::{Block, Borders, Paragraph, Widget, Wrap},
+    widgets::{Block, Borders},
 };
 use zeroize::{Zeroize, Zeroizing};
 
 use crate::app::{ChatApp, Role};
+use crate::dialog_frame::{self, BodyScroll, DialogContent, PinnedRow};
 use crate::sanitize::{sanitize_inline, sanitize_reveal_inline};
 use crate::style;
 use crate::tui_event::TuiEvent;
@@ -214,6 +224,8 @@ struct OpenDialog {
     input: PasswordBuffer,
     selected: usize,
     notice: Option<&'static str>,
+    /// Scroll-Zustand des Körpers (Worker, Verzeichnis, Befehl, Grund).
+    body_scroll: BodyScroll,
 }
 
 impl OpenDialog {
@@ -253,6 +265,15 @@ impl SudoEventOutcome {
             notice: Some(notice),
         }
     }
+}
+
+/// Ergebnis von [`SudoUi::open_full_access`].
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub(crate) struct SudoFullAccessOutcome {
+    /// Systemzeilen für den Verlauf (nie mit Geheimnis).
+    pub(crate) notices: Vec<String>,
+    /// Ob die Passworteingabe geöffnet wurde.
+    pub(crate) opened: bool,
 }
 
 /// Zustand des sudo-Fensters in der `ChatApp`.
@@ -444,8 +465,71 @@ impl SudoUi {
             input: PasswordBuffer::new(),
             selected,
             notice: None,
+            body_scroll: BodyScroll::default(),
         });
         stale
+    }
+
+    /// Nimmt `prompt` unter dem Freigabemodus „Full Access" an
+    /// (Nutzerentscheidung 2026-09-24: keine Bestätigung, nur das Passwort,
+    /// wenn `sudo` eines verlangt).
+    ///
+    /// # Beschreibung
+    /// - Passwortloses sudo: sofort [`SudoAnswer::ApproveOnce`], **kein**
+    ///   Fenster.
+    /// - Gültiges gemerktes Sitzungspasswort: sofort damit freigeben, kein
+    ///   Fenster (ein falsches Passwort löscht es wie gewohnt über den
+    ///   Fehler-Rückruf).
+    /// - Sonst: nur die Passworteingabe (dieselbe maskierte Eingabe wie
+    ///   immer; Esc/Ctrl+C brechen ab). Es gibt keine „Freigeben/Ablehnen"-
+    ///   Frage.
+    ///
+    /// Eine noch offene ältere Frage wird wie in [`Self::open`] abgelehnt.
+    ///
+    /// # Rückgabe
+    /// Systemzeilen für den Verlauf (nie mit Geheimnis) und ob ein Fenster
+    /// geöffnet wurde.
+    pub(crate) fn open_full_access(
+        &mut self,
+        prompt: SudoPrompt,
+        now: Instant,
+    ) -> SudoFullAccessOutcome {
+        let mut notices: Vec<String> = self.deny_open().into_iter().collect();
+        let argv = display_argv(prompt.argv());
+        if prompt.passwordless() {
+            prompt.approve(SudoAnswer::ApproveOnce);
+            notices.push(format!(
+                "sudo ohne Rückfrage ausgeführt (Full Access, passwortlos): {argv}"
+            ));
+            return SudoFullAccessOutcome {
+                notices,
+                opened: false,
+            };
+        }
+        if let Some((secret, generation)) = self.remembered_copy(now) {
+            let hook = self.failure_hook(generation);
+            prompt.approve_with_failure_hook(SudoAnswer::ApproveSession { secret }, hook);
+            notices.push(format!(
+                "sudo ohne Rückfrage ausgeführt (Full Access, gemerktes Sitzungspasswort): {argv}"
+            ));
+            return SudoFullAccessOutcome {
+                notices,
+                opened: false,
+            };
+        }
+        self.open = Some(OpenDialog {
+            prompt,
+            shown_at: now,
+            kind: DialogKind::Password,
+            input: PasswordBuffer::new(),
+            selected: 0,
+            notice: Some("Full Access: sudo verlangt ein Passwort (Esc bricht ab)"),
+            body_scroll: BodyScroll::default(),
+        });
+        SudoFullAccessOutcome {
+            notices,
+            opened: true,
+        }
     }
 
     /// Lehnt ein offenes Fenster ab und nullt den Puffer.
@@ -466,8 +550,15 @@ impl SudoUi {
             TuiEvent::Key(key) => self.handle_key(key, now),
             TuiEvent::Paste(text) => self.handle_paste(Zeroizing::new(text), now),
             TuiEvent::Resize(..) | TuiEvent::Draw => SudoEventOutcome::redraw(),
-            // Maus (Scrollen, Klicks) wird verschluckt.
-            TuiEvent::Mouse(_) => SudoEventOutcome::default(),
+            // Das Mausrad scrollt den Körper des Fensters; alles andere
+            // (Klicks) wird verschluckt. Nichts erreicht den Composer.
+            TuiEvent::Mouse(mouse) => {
+                if self.scroll_wheel(mouse.kind) {
+                    SudoEventOutcome::redraw()
+                } else {
+                    SudoEventOutcome::default()
+                }
+            }
         }
     }
 
@@ -491,6 +582,10 @@ impl SudoUi {
         };
         if now.saturating_duration_since(open.shown_at) < SUDO_ARMING_DELAY {
             return SudoEventOutcome::default();
+        }
+        // `Strg+↑↓` scrollt den Körper, ohne die Auswahl zu ändern.
+        if open.body_scroll.handle_key(&key) {
+            return SudoEventOutcome::redraw();
         }
         let option_count = open.options(session_allowed).len();
         match key.code {
@@ -618,12 +713,43 @@ impl SudoUi {
         }
     }
 
-    /// Baut die Zeilen des offenen Fensters.
-    fn lines(&self, theme: style::Theme, now: Instant) -> Option<Vec<Line<'static>>> {
+    /// Scrollt den Körper per Mausrad.
+    ///
+    /// # Rückgabe
+    /// `true`, wenn ein Fenster offen ist und das Ereignis ein Rad war.
+    pub(crate) fn scroll_wheel(&self, kind: crossterm::event::MouseEventKind) -> bool {
+        self.open
+            .as_ref()
+            .is_some_and(|open| open.body_scroll.handle_wheel(kind))
+    }
+
+    /// Scrollt den Körper um `lines` Zeilen (Scroll-Aktionen der
+    /// Tastenbelegung).
+    ///
+    /// # Rückgabe
+    /// `true`, wenn ein Fenster offen ist.
+    pub(crate) fn scroll_body(&self, up: bool, lines: usize) -> bool {
+        let Some(open) = self.open.as_ref() else {
+            return false;
+        };
+        if up {
+            open.body_scroll.scroll_up(lines);
+        } else {
+            open.body_scroll.scroll_down(lines);
+        }
+        true
+    }
+
+    /// Baut Körper (scrollbar) und angeheftete Zeilen des offenen Fensters.
+    ///
+    /// # Beschreibung
+    /// Körper: Worker/Sitzung, Verzeichnis, Befehl, Grund. Angeheftet (immer
+    /// sichtbar): Passwort-/Hinweiszeile, Optionen, Meldung, Tastenhinweis.
+    fn content(&self, theme: style::Theme, now: Instant, width: u16) -> Option<DialogContent> {
         let open = self.open.as_ref()?;
         let prompt = &open.prompt;
         let dim = style::dim_style(theme);
-        let mut lines = vec![
+        let body = vec![
             Line::styled(
                 format!(
                     "Worker: {} · Sitzung: {}",
@@ -647,24 +773,24 @@ impl SudoUi {
                 "Grund: {}",
                 sanitize_reveal_inline(prompt.reason())
             )),
-            Line::from(""),
         ];
+        let mut pinned = vec![PinnedRow::padding()];
         match open.kind {
-            DialogKind::Passwordless => lines.push(Line::styled(
+            DialogKind::Passwordless => pinned.push(PinnedRow::content(Line::styled(
                 "Passwortloses sudo — keine Passworteingabe nötig.",
                 dim,
-            )),
-            DialogKind::RememberedSession => lines.push(Line::styled(
+            ))),
+            DialogKind::RememberedSession => pinned.push(PinnedRow::content(Line::styled(
                 "Gemerktes Sitzungspasswort wird verwendet (jeder Befehl braucht diese Freigabe).",
                 dim,
-            )),
+            ))),
             DialogKind::Password => {
                 let shown = if open.input.is_empty() {
                     "(leer)"
                 } else {
                     MASK
                 };
-                lines.push(Line::from(format!("Passwort: {shown}")));
+                pinned.push(PinnedRow::content(format!("Passwort: {shown}")));
             }
         }
         let mut options: Vec<Span<'static>> = Vec::new();
@@ -680,46 +806,76 @@ impl SudoUi {
             let marker = if index == open.selected { "❯ " } else { "  " };
             options.push(Span::styled(format!("{marker}[{label}]"), style));
         }
-        lines.push(Line::from(options));
+        pinned.push(PinnedRow::content(Line::from(options)));
         if let Some(notice) = open.notice {
-            lines.push(Line::styled(notice, style::warning_style(theme)));
+            pinned.push(PinnedRow::content(Line::styled(
+                notice,
+                style::warning_style(theme),
+            )));
         }
         let footer = if now.saturating_duration_since(open.shown_at) < SUDO_ARMING_DELAY {
-            "Fenster wird gleich scharf … · Esc/Ctrl+C lehnt ab"
+            dialog_frame::pick_fitting(
+                &[
+                    "Fenster wird gleich scharf … · Esc/Ctrl+C lehnt ab",
+                    "gleich scharf … · Esc lehnt ab",
+                ],
+                width,
+            )
         } else {
-            "Enter bestätigen · Tab/←→ wählen · Esc/Ctrl+C ablehnen"
+            dialog_frame::pick_fitting(
+                &[
+                    "Enter bestätigen · Tab/←→ wählen · Esc/Ctrl+C ablehnen",
+                    "Enter ok · Tab wählen · Esc ablehnen",
+                    "Enter · Tab · Esc",
+                ],
+                width,
+            )
         };
-        lines.push(Line::styled(footer, dim));
-        Some(lines)
+        pinned.push(PinnedRow::content(Line::styled(footer, dim)));
+        Some(DialogContent { body, pinned })
     }
 
     /// Benötigte Höhe (inkl. Rahmen) oder `None` ohne offenes Fenster.
     pub(crate) fn desired_height(&self, width: u16, theme: style::Theme) -> Option<u16> {
-        let lines = self.lines(theme, Instant::now())?;
         let inner_width = width.saturating_sub(2).max(1);
-        let rows = Paragraph::new(lines)
-            .wrap(Wrap { trim: false })
-            .line_count(inner_width);
-        let rows = u16::try_from(rows).unwrap_or(u16::MAX).saturating_add(2);
-        Some(rows.clamp(MIN_DIALOG_HEIGHT, MAX_DIALOG_HEIGHT))
+        let content = self.content(theme, Instant::now(), inner_width)?;
+        Some(
+            content
+                .desired_height(width)
+                .clamp(MIN_DIALOG_HEIGHT, MAX_DIALOG_HEIGHT),
+        )
     }
 
     /// Zeichnet das Fenster anstelle des Composers.
     ///
+    /// # Beschreibung
+    /// Passwort-/Hinweiszeile, Optionen und Tastenhinweis sind angeheftet;
+    /// reicht die Höhe nicht, scrollt der Körper (Befehl, Grund …) im
+    /// Fenster (`Strg+↑↓`, Mausrad). Gezeichnet wird nie außerhalb von
+    /// `area ∩ buf.area`.
+    ///
     /// # Rückgabe
     /// `true`, wenn ein Fenster gezeichnet wurde.
     pub(crate) fn render(&self, area: Rect, buf: &mut Buffer, theme: style::Theme) -> bool {
-        let Some(lines) = self.lines(theme, Instant::now()) else {
+        let Some(open) = self.open.as_ref() else {
             return false;
         };
         let block = Block::default()
             .borders(Borders::ALL)
             .border_style(style::warning_style(theme))
             .title(" sudo-Freigabe · Root-Befehl ");
-        Paragraph::new(lines)
-            .wrap(Wrap { trim: false })
-            .block(block)
-            .render(area, buf);
+        let inner_width = block.inner(area.intersection(buf.area)).width.max(1);
+        let Some(content) = self.content(theme, Instant::now(), inner_width) else {
+            return false;
+        };
+        dialog_frame::render_dialog(
+            block,
+            area,
+            buf,
+            &content,
+            &open.body_scroll,
+            style::dim_style(theme),
+        );
         true
     }
 }
@@ -733,6 +889,24 @@ impl SudoUi {
 pub(crate) fn accept_prompt(app: &mut ChatApp, maybe_prompt: Option<SudoPrompt>) -> bool {
     match maybe_prompt {
         Some(prompt) => {
+            // Nutzerentscheidung 2026-09-24: unter „Full Access" keine
+            // Freigabefrage — nur die Passworteingabe, wenn sudo eine braucht.
+            let full_access = app
+                .runtime()
+                .is_some_and(|rt| rt.approval_mode().get() == ApprovalMode::FullAccess);
+            if full_access {
+                tracing::info!(
+                    session = prompt.session(),
+                    worker = prompt.worker(),
+                    passwordless = prompt.passwordless(),
+                    "tui.sudo.full_access"
+                );
+                let outcome = app.sudo.open_full_access(prompt, Instant::now());
+                for notice in outcome.notices {
+                    app.push_line(Role::System, notice);
+                }
+                return true;
+            }
             tracing::info!(
                 session = prompt.session(),
                 worker = prompt.worker(),
@@ -1017,6 +1191,72 @@ mod tests {
         assert!(matches!(
             answer.into_answer().await,
             Some(SudoAnswer::ApproveOnce)
+        ));
+        Ok(())
+    }
+
+    /// Full Access, passwortloses sudo: sofort `ApproveOnce`, kein Fenster.
+    #[tokio::test]
+    async fn test_full_access_passwordless_runs_without_any_window() -> TestResult {
+        let (sudo_prompt, answer) = prompt(true);
+        let mut ui = SudoUi::new(None, DEFAULT_SUDO_SESSION);
+        let outcome = ui.open_full_access(sudo_prompt, Instant::now());
+        assert!(!outcome.opened);
+        assert!(
+            !ui.is_open(),
+            "unter Full Access darf kein Fenster erscheinen"
+        );
+        assert_eq!(outcome.notices.len(), 1, "{:?}", outcome.notices);
+        assert!(matches!(
+            answer.into_answer().await,
+            Some(SudoAnswer::ApproveOnce)
+        ));
+        Ok(())
+    }
+
+    /// Full Access mit Passwort: nur die Passworteingabe, keine
+    /// Freigeben/Ablehnen-Frage; Enter mit Passwort führt aus.
+    #[tokio::test]
+    async fn test_full_access_with_password_shows_only_the_password_input() -> TestResult {
+        let (sudo_prompt, answer) = prompt(false);
+        let mut ui = SudoUi::new(None, DEFAULT_SUDO_SESSION);
+        let shown = Instant::now();
+        let outcome = ui.open_full_access(sudo_prompt, shown);
+        assert!(outcome.opened);
+        assert_eq!(
+            ui.open.as_ref().map(|open| open.kind),
+            Some(DialogKind::Password)
+        );
+        let now = armed_now(shown);
+        type_password(&mut ui, now, PASSWORD);
+        ui.handle_event(key(KeyCode::Enter), now);
+        assert!(matches!(
+            answer.into_answer().await,
+            Some(SudoAnswer::Password {
+                remember: false,
+                ..
+            })
+        ));
+        Ok(())
+    }
+
+    /// Full Access mit gemerktem Sitzungspasswort: sofort freigegeben, kein
+    /// Fenster.
+    #[tokio::test]
+    async fn test_full_access_uses_a_remembered_password_without_a_window() -> TestResult {
+        let mut ui = SudoUi::new(None, Duration::from_secs(600));
+        let now = Instant::now();
+        let secret = SudoSecret::from_zeroizing(Zeroizing::new(PASSWORD.as_bytes().to_vec()))
+            .map_err(|_| TestError::Missing("gültiges Testpasswort"))?;
+        ui.remember(secret, now);
+
+        let (sudo_prompt, answer) = prompt(false);
+        let outcome = ui.open_full_access(sudo_prompt, now);
+        assert!(!outcome.opened);
+        assert!(!ui.is_open());
+        assert!(matches!(
+            answer.into_answer().await,
+            Some(SudoAnswer::ApproveSession { .. })
         ));
         Ok(())
     }

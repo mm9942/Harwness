@@ -164,8 +164,7 @@ pub const PURE_CRATES: &[(&str, &[&str])] = &[(
 /// kein `Err`, sondern erscheint im Bericht: das Gate hat dann erfolgreich
 /// geprüft und etwas gefunden.
 pub fn run() -> Result<GateReport, String> {
-    let graph = WorkspaceGraph::load(Path::new("."))
-        .map_err(|error| format!("Workspace-Graph nicht lesbar: {error}"))?;
+    let graph = super::load_all_workspaces(Path::new("."))?;
     Ok(evaluate(&graph))
 }
 

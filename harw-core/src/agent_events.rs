@@ -261,6 +261,11 @@ impl crate::ModelProvider for UsageReportingProvider {
     fn pinned_model_id(&self) -> Option<String> {
         self.inner.pinned_model_id()
     }
+
+    /// Reicht die gepinnte Provider-ID des umhüllten Providers durch.
+    fn pinned_provider_id(&self) -> Option<String> {
+        self.inner.pinned_provider_id()
+    }
 }
 
 #[cfg(test)]

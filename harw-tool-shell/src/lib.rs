@@ -12,10 +12,10 @@
 //!
 //! # Modules
 //! - [`exec`] — [`ShellToolProvider`], [`ShellExecutor`], [`ShellExecError`],
-//!   [`HOST_SESSION_LEASE_TTL`], [`HOST_PERMIT_PROMPT_TIMEOUT`]: Host-Ausführung
+//!   [`HOST_PERMIT_PROMPT_TIMEOUT`]: Host-Ausführung
 //!   ohne `bwrap` läuft für Modell-Aufrufe ausschließlich über
-//!   [`ShellExecutor::run_command`] (Plan `recursive-cooking-lobster.md` Teil B1).
-//!   Runde 6, Teil B: [`run_operator_command`]/[`OperatorCommand`] — `!`-Befehle
+//!   [`ShellExecutor::run_command`].
+//!   [`run_operator_command`]/[`OperatorCommand`] — `!`-Befehle
 //!   der Nutzerin immer auf dem Host (ohne Freigabe, sudo bleibt abgelehnt,
 //!   Audit `shell.operator_exec`)
 //! - [`limits`] — [`ShellLimits`], [`ShellLimitsError`]: rlimits über festgepinntes `prlimit`
@@ -54,7 +54,7 @@ pub mod sudo;
 
 pub use exec::{
     BUILD_COMMAND_DEFAULT_TIMEOUT_SECS, DEFAULT_MAX_TIMEOUT_SECS, HOST_PERMIT_PROMPT_TIMEOUT,
-    HOST_SESSION_LEASE_TTL, ShellExecError, ShellExecutor, ShellToolProvider,
+    ShellExecError, ShellExecutor, ShellToolProvider,
 };
 // Runde 6, Teil B: Operator-Weg für `!`-Befehle der Nutzerin (immer Host).
 pub use exec::{
@@ -67,8 +67,9 @@ pub use host_escalation::{
     HostRequesterBook, SandboxDenial, classify_sandbox_denial,
 };
 pub use host_permit_prompt::{
-    HostPermitHandles, HostPermitPrompt, HostPermitPromptReceiver, HostPermitPromptSender,
-    HostPermitVariant, SANDBOX_LEASE_WORKER_DEFINITION, host_permit_prompt_channel,
+    HostLeaseUserControl, HostPermitHandles, HostPermitPrompt, HostPermitPromptReceiver,
+    HostPermitPromptSender, HostPermitVariant, SANDBOX_LEASE_WORKER_DEFINITION,
+    host_permit_prompt_channel,
 };
 pub use latex::{
     LATEX_BUILD_TOOL, LATEX_CHECK_TOOL, LATEX_TEMPLATE_TOOL, LatexEngine, LatexToolProvider,

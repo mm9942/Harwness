@@ -3,6 +3,8 @@ publish.workspace = true
 name = "harw-tool-doc"
 version.workspace = true
 edition.workspace = true
+license.workspace = true
+repository.workspace = true
 # Höher als workspace.package.rust-version (1.85): oxidize-pdf >=5 (die von
 # doc.read_pdf/native.rs verwendete API-Generation, siehe design-doc
 # doc_read_pdf_design.md) deklariert selbst rust-version 1.88. Mit dem

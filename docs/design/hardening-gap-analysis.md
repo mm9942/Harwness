@@ -1,7 +1,13 @@
-# Hardening Gap Analysis — Bottom-Up Codebase Review
+# Hardening Status
 
-Generated from a bottom-up read of all 34 workspace crates, mapped against
-`hardening-suggestive-inspiration.md` (32 sections).
+> Status: partially implemented · Last reviewed: 2026-09-24
+
+This document tracks a set of structural-hardening gaps identified by a
+bottom-up review of the workspace, each checked against an external
+hardening reference document (not itself part of this repository). It is
+maintained going forward: each gap below is either **Implemented** (with
+the file that closes it) or **Open**. Re-verify against the code before
+trusting a status older than a few weeks.
 
 The review traversed crates in dependency order: L0 leaves (types, agent-dsl,
 plan, memory, home) → L1 (sandbox) → L2 (protocol, job-runtime) → L3 (config,
@@ -22,8 +28,9 @@ sketches — particularly in tool scope detection, typed resource scopes,
 context compilation, severity envelopes, and the TurnScope unification
 point. These are not bugs; they are missing architectural seams.
 
-> **Ist-Stand (2026-09)**: G8, G11, G12, and G14 are resolved (see their
-> Status fields below). G1–G7, G9, G10, and G13 are still open.
+**Current state (2026-09-24):** G5, G8, G11, G12, G13, and G14 are
+implemented (see their Status fields below). G1–G4, G6, G7, G9, and G10 are
+still open.
 
 ## Gap Register
 
@@ -119,36 +126,32 @@ session narrowing.
 
 ### G5. ToolExposure — Resident/Deferred/Hidden/Denied (§14, §15)
 
-**Status**: Gap — mention only in a comment
+**Status**: Implemented — `harw-core/src/activation.rs`
 
-`ToolExposure` is referenced in a doc comment (`activation.rs:6`) but does
-not exist as a type. The hardening doc wants three exposure tiers plus a
-denied state.
+`ToolExposure` is now a real enum with `Resident`, `Deferred`, `Hidden`,
+`Denied` variants, with the invariant documented in place that a
+tool-search tool may only search within the already-admitted callable set
+and can never discover a `Denied` tool.
 
-**Evidence**:
-- `rg "ToolExposure"` → only a doc comment
-- No enum with `Resident`, `Deferred`, `Hidden`, `Denied`
-
-**Hardening delta**: Add `ToolExposure` enum. The turn-loop computes
-exposure per turn from `Callable Tool Set + TurnTrigger + TaskIntent +
-ModelProfile`. A tool-search tool, if added, must only search within the
-already-admitted callable set.
+**Evidence**: `harw-core/src/activation.rs` — `pub enum ToolExposure`.
 
 ---
 
 ### G6. TurnScope Unification (§16, §29, §32)
 
-**Status**: Gap — does not exist
+**Status**: Open — still does not exist as a type
 
 The hardening doc's deepest insight: `TurnScope` should be the single
 authoritative turn description consumed by `ToolResolver`,
 `ContextCompiler`, `ModelRouter`, and `ApprovalEngine`. Currently these
 subsystems work independently — `collect_tools` reads from the session
 activation, `context_budget::assemble` reads from fragments + history, and
-there is no shared authority boundary.
+there is no shared authority boundary. `TurnScope` is now named in a doc
+comment in `harw-operations/src/operation.rs` (describing the still-open
+G14 follow-on work for scope-aware approval), but no such type exists.
 
 **Evidence**:
-- `rg "TurnScope"` → 0 results
+- `TurnScope` appears only in a doc comment (`harw-operations/src/operation.rs`), not as a type
 - `ToolResolver` does not exist as a type
 - `ContextCompiler` does not exist as a type
 - `collect_tools` (turn_loop.rs:274) directly queries `session.activation()`
@@ -267,7 +270,8 @@ shell effects.
 
 ### G11. `deny_unknown_fields` Coverage (§11, cross-cutting)
 
-**Status**: Resolved (2026-09) — now 263 occurrences across the tree.
+**Status**: Implemented — now 363 occurrences across the tree (up from 4
+at the original review, 263 at the last check).
 
 **Status (original)**: Gap — only 4 uses
 
@@ -312,21 +316,15 @@ thread-localRefCell pattern), document the safety invariant.
 
 ### G13. DefinitionRef String Deserialization (§10)
 
-**Status**: Gap — struct form only
+**Status**: Implemented — `harw-agent-dsl/src/ids.rs`
 
-`DefinitionRef` (harw-agent-dsl/src/ids.rs) deserializes from a TOML table
-(`{ id = "...", version = "..." }`). The hardening doc wants ergonomic
-string form (`extends = "harwness.agent.worker-base@1"`) alongside the
-struct form. Family patches already parse strings manually, creating two
-syntaxes.
+`DefinitionRef` now has a custom `Deserialize` impl accepting both the
+string form (`extends = "harwness.agent.worker-base@1"`, parsed as a
+`DefinitionId` with `version = None`) and the table form (`extends = { id
+= "...", version = "..." }`).
 
-**Evidence**:
-- `harw-agent-dsl/src/ids.rs` — `DefinitionRef` has no custom deserializer
-- Tests in `raw.rs` use `extends = { id = "..." }`
-- `family.rs::apply_roster_patch` manually parses strings via `parse_def_ref`
-
-**Hardening delta**: Add a custom `Deserialize` impl for `DefinitionRef`
-that accepts both string and table forms.
+**Evidence**: `harw-agent-dsl/src/ids.rs` — `impl<'de> Deserialize<'de> for
+DefinitionRef`.
 
 ---
 
@@ -396,6 +394,6 @@ Ordered by leverage (security impact × feasibility):
 | P3 | G1 (AgentTemplate) | Medium | Medium — reduces definition duplication | Open |
 | P3 | G2 (Family protocols) | Medium | Medium — typed family contracts | Open |
 | P3 | G9 (Return envelopes) | Medium | High — structured parent-child communication | Open |
-| P4 | G5 (ToolExposure) | Low | Medium — progressive tool loading | Open |
-| P4 | G13 (DefinitionRef strings) | Low | Low — DSL ergonomics | Open |
+| P4 | G5 (ToolExposure) | Low | Medium — progressive tool loading | Resolved |
+| P4 | G13 (DefinitionRef strings) | Low | Low — DSL ergonomics | Resolved |
 | P4 | G14 (ApprovalPolicy) | Medium | Medium — scope-aware approval | Resolved |

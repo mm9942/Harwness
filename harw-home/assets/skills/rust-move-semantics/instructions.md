@@ -30,7 +30,7 @@ fn log_name(name: &str) {
 }
 
 /// Typestate transition: consumes `self` so the old state cannot be reused.
-/// Real pattern: apps/sgh-flow/src/typestate/api.rs:108
+/// Real pattern: apps/acme-app/src/typestate/api.rs:108
 ///   pub fn authenticate_bearer(self, claims: AuthClaims) -> ApiRequest<BearerAuth>
 pub struct Request<S> {
     path: String,

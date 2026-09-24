@@ -1,6 +1,8 @@
 # Config Structure — the `.harw/` Tree
 
-Status: draft, implemented in `harw-config` (this doc is the source of truth
+> Status: implemented · Last reviewed: 2026-09-24
+
+Implemented in `harw-config` (this doc is the source of truth
 for the schema; the crate is kept in sync with it).
 
 Inspiration: OpenClaw's single `openclaw.json` (`inspirations/openclaw/docs/gateway/configuration.md`,
@@ -110,10 +112,14 @@ retention_days = 90                  # 0 = keep forever
 [policy]
 default_visibility_scope = "self"    # Self|DescendantTree|ExplicitlyGranted|OperatorOnly (harw-policy)
 require_approval_for = ["exec", "fs-write-outside-workspace"]
+
+[tools.doc]
+remote_ocr = "ask"                   # off|ask|on — may doc.read_pdf upload PDFs to a remote OCR
+                                     # service (Mistral)? default "off"; "ask" asks before every upload
 ```
 
 Notes:
-- `[logging]`, `[tui]`, `[session]`, `[policy]` are all optional tables;
+- `[logging]`, `[tui]`, `[session]`, `[policy]`, `[tools.doc]` are all optional tables;
   every field inside them has a hard-coded default so a bare `config.toml`
   with only `default_provider`/`default_model` remains valid (backward
   compatible with the pre-existing two-field `HarnessConfig`).

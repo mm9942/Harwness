@@ -16,7 +16,7 @@
 //!
 //! Defaults sind bewusst restriktiv (`Default = sicher/aus`): leere
 //! Allowlists, `allow_private = false`. Ein nicht vertrauter Repo-Layer darf
-//! diese Sektion laut `docs/remediation/ledger/W3/C-CFG.md` nur verengen
+//! diese Sektion nur verengen
 //! (Schnittmenge der Hostlisten, `allow_private` nur Richtung `false`); die
 //! Merge-Logik lebt in `harw_config::discovery`, nicht hier.
 //!

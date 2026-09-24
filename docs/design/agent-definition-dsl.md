@@ -2,9 +2,11 @@
 
 # Harwness Agent Definition DSL
 
+> Status: partially implemented · Last reviewed: 2026-09-24
+
 **Status:** Normative design draft  
 **Scope:** User-extensible TOML definitions for roles, specializations, families, clans, cells, context policies, return contracts, and organization templates  
-**Companion documents:** [`philosophy.md`](../philosophy/philosophy.md), [`coding-philosophy.md`](../philosophy/coding-philosophy.md), `agents-systemdesign-philosophy.md`
+**Companion documents:** [`philosophy.md`](../philosophy/philosophy.md), [`coding-philosophy.md`](../philosophy/coding-philosophy.md)
 
 > Users may extend behavior, composition, models, context policies, families, clans, and organization templates.  
 > Users may never extend authority beyond the runtime maximum or violate the role hierarchy.
@@ -165,9 +167,9 @@ Every reusable definition has a stable namespaced ID.
 
 ```toml
 id = "harwness.agent.focused-pure-coding@1"
-id = "mia.agent.rust-pqc-worker@1"
+id = "acme.agent.rust-pqc-worker@1"
 id = "harwness.family.focused-coding@1"
-id = "mia.organization.crypt-guard-release@2"
+id = "acme.organization.crypt-guard-release@2"
 ```
 
 The syntax is:
@@ -214,7 +216,7 @@ extends = "harwness.agent.worker-base@1"
 mixins = [
   "harwness.mixin.rust-coding@1",
   "harwness.mixin.file-scoped-write@1",
-  "mia.mixin.no-clone-preference@1",
+  "acme.mixin.no-clone-preference@1",
 ]
 ```
 
@@ -356,7 +358,7 @@ A user may build on the pure coding worker:
 
 ```toml
 schema = "harwness.agent/v1"
-id = "mia.agent.rust-pqc-pure-coder@1"
+id = "acme.agent.rust-pqc-pure-coder@1"
 version = "1.0.0"
 
 extends = "harwness.agent.focused-pure-coding@1"
@@ -366,8 +368,8 @@ description = "A file-scoped Rust worker for cryptographic code with explicit ow
 
 mixins = [
   "harwness.mixin.rust-coding@1",
-  "mia.mixin.cryptographic-zeroize@1",
-  "mia.mixin.explicit-ownership-elevation@1",
+  "acme.mixin.cryptographic-zeroize@1",
+  "acme.mixin.explicit-ownership-elevation@1",
 ]
 
 [patch.models.preferred]
@@ -787,15 +789,15 @@ Users can extend the family:
 
 ```toml
 schema = "harwness.family/v1"
-id = "mia.family.crypt-guard-coding@1"
+id = "acme.family.crypt-guard-coding@1"
 version = "1.0.0"
 
 extends = "harwness.family.focused-coding@1"
 
 [patch.workers.allowed]
 append = [
-  "mia.agent.rust-pqc-pure-coder@1",
-  "mia.agent.crypto-verification@1",
+  "acme.agent.rust-pqc-pure-coder@1",
+  "acme.agent.crypto-verification@1",
 ]
 
 [patch.invariants]
@@ -860,7 +862,7 @@ A user may build on it:
 
 ```toml
 schema = "harwness.organization/v1"
-id = "mia.organization.harwness-development@1"
+id = "acme.organization.harwness-development@1"
 version = "1.0.0"
 
 extends = "harwness.organization.software-project@1"
@@ -869,7 +871,7 @@ extends = "harwness.organization.software-project@1"
 id = "memory"
 name = "Memory Systems Clan"
 leader = "harwness.agent.focused-coding-orchestrator@1"
-family = "mia.family.harwness-memory@1"
+family = "acme.family.harwness-memory@1"
 plan_scope = "memory/*"
 child_depth_cost = 1
 
@@ -902,15 +904,15 @@ Users should be able to create definitions through:
 Example CLI:
 
 ```text
-harwness agent new mia.agent.rust-api-worker@1 \
+harwness agent new acme.agent.rust-api-worker@1 \
   --extends harwness.agent.focused-pure-coding@1
 
-harwness agent validate mia.agent.rust-api-worker@1
+harwness agent validate acme.agent.rust-api-worker@1
 
-harwness family new mia.family.backend@1 \
+harwness family new acme.family.backend@1 \
   --extends harwness.family.focused-coding@1
 
-harwness org instantiate mia.organization.harwness-development@1 \
+harwness org instantiate acme.organization.harwness-development@1 \
   --goal goal_01J...
 ```
 
@@ -1071,7 +1073,7 @@ Example:
 
 ```text
 error[HARW-AUTH-004]:
-  definition `mia.agent.experimental-worker@1` attempts to append
+  definition `acme.agent.experimental-worker@1` attempts to append
   capability `agent.spawn.child-orchestrator`
 
   workers may not spawn durable agents
@@ -1165,7 +1167,7 @@ extends = "harwness.agent.focused-pure-coding@1"
 
 mixins = [
   "harwness.mixin.rust-coding@1",
-  "mia.mixin.cryptographic-zeroize@1",
+  "acme.mixin.cryptographic-zeroize@1",
 ]
 
 [patch.context.must_include]

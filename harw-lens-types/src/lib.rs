@@ -15,7 +15,7 @@
 //! - [`error`]: der eine Fehlertyp dieser Crate.
 //!
 //! `#![forbid(unsafe_code)]` kommt bereits aus `[workspace.lints]`
-//! (`docs/aw-contract-master.md`) und wird hier nicht erneut gesetzt.
+//! (`docs/design/build-history.md`) und wird hier nicht erneut gesetzt.
 //!
 //! # Nebenläufigkeit
 //! Alle exportierten Typen sind reine Daten; [`CostEstimator`] ist
@@ -29,7 +29,7 @@
 //! # Examples
 //! ```rust
 //! use harw_lens_types::{ByteSpan, Chunk, ChunkDigest, SourceRef};
-//! use harw_types::ContentDigest;
+//! use harw_digest::ContentDigest;
 //!
 //! let span = ByteSpan::new(0, 5).expect("start <= end");
 //! let chunk = Chunk {

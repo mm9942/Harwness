@@ -4506,7 +4506,7 @@ mod tests {
                 credential_ref: "secrets:mcp-token"
                     .parse()
                     .map_err(ctx("valid secret ref"))?,
-                tenant: "mia".to_owned(),
+                tenant: "alice".to_owned(),
                 workspace: "harwness".to_owned(),
                 job_capabilities: Vec::new(),
             });
@@ -4615,7 +4615,7 @@ mod tests {
                 credential_ref: "secrets:mcp-token"
                     .parse()
                     .map_err(ctx("valid secret ref"))?,
-                tenant: "mia".to_owned(),
+                tenant: "alice".to_owned(),
                 workspace: "harwness".to_owned(),
                 job_capabilities: Vec::new(),
             });
@@ -4657,11 +4657,11 @@ mod tests {
             .mcp_listener
             .principals
             .push(harw_config::McpPrincipalToml {
-                id: "mia-local".to_owned(),
+                id: "alice-local".to_owned(),
                 credential_ref: format!("file:{}", credential_path.display())
                     .parse()
                     .map_err(ctx("valid secret ref"))?,
-                tenant: "mia".to_owned(),
+                tenant: "alice".to_owned(),
                 workspace: "harwness".to_owned(),
                 job_capabilities: Vec::new(),
             });
@@ -4671,7 +4671,7 @@ mod tests {
         let principal = authenticator
             .authenticate(Some("Bearer super-secret-token"))
             .map_err(ctx("token authenticates"))?;
-        assert_eq!(principal.principal_key, "mia-local");
+        assert_eq!(principal.principal_key, "alice-local");
         std::fs::remove_dir_all(&dir).ok();
         Ok(())
     }
@@ -4684,11 +4684,11 @@ mod tests {
             .mcp_listener
             .principals
             .push(harw_config::McpPrincipalToml {
-                id: "mia-local".to_owned(),
+                id: "alice-local".to_owned(),
                 credential_ref: "env:HARW_TEST_UNUSED"
                     .parse()
                     .map_err(ctx("valid secret ref"))?,
-                tenant: "mia".to_owned(),
+                tenant: "alice".to_owned(),
                 workspace: "harwness".to_owned(),
                 job_capabilities: vec![
                     McpJobCapabilityToml::ReadOwn,
@@ -4698,7 +4698,7 @@ mod tests {
 
         let registry = build_principal_registry(&config)
             .map_err(ctx("distinct principal ids build a registry"))?;
-        let principal = registry.get("mia-local").ok_or(TestError::Missing(
+        let principal = registry.get("alice-local").ok_or(TestError::Missing(
             "configured principal is present in the registry",
         ))?;
         assert!(
@@ -4735,7 +4735,7 @@ mod tests {
                     credential_ref: "env:HARW_TEST_UNUSED"
                         .parse()
                         .map_err(ctx("valid secret ref"))?,
-                    tenant: "mia".to_owned(),
+                    tenant: "alice".to_owned(),
                     workspace: "harwness".to_owned(),
                     job_capabilities,
                 });
@@ -4773,7 +4773,7 @@ mod tests {
                     credential_ref: "env:HARW_TEST_UNUSED"
                         .parse()
                         .map_err(ctx("valid secret ref"))?,
-                    tenant: "mia".to_owned(),
+                    tenant: "alice".to_owned(),
                     workspace: workspace.to_owned(),
                     job_capabilities: vec![McpJobCapabilityToml::SubmitOwn],
                 });
@@ -4877,11 +4877,11 @@ mod tests {
             .mcp_listener
             .principals
             .push(harw_config::McpPrincipalToml {
-                id: "mia-local".to_owned(),
+                id: "alice-local".to_owned(),
                 credential_ref: "env:HARW_TEST_MCP_TOKEN_UNSET_FOR_SURE"
                     .parse()
                     .map_err(ctx("valid secret ref"))?,
-                tenant: "mia".to_owned(),
+                tenant: "alice".to_owned(),
                 workspace: "harwness".to_owned(),
                 job_capabilities: Vec::new(),
             });
@@ -4892,7 +4892,7 @@ mod tests {
                     "missing environment credential must fail closed".into(),
                 ));
             }
-            Err(error) => assert!(error.contains("mia-local"), "{error}"),
+            Err(error) => assert!(error.contains("alice-local"), "{error}"),
         }
         Ok(())
     }

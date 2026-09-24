@@ -3,13 +3,14 @@ publish.workspace = true
 name = "harw-macros"
 version.workspace = true
 edition.workspace = true
+license.workspace = true
+repository.workspace = true
 rust-version.workspace = true
 
 [lib]
 proc-macro = true
 
 [dependencies]
-harw-authority = { path = "../harw-authority" }
 syn = { version = "2", features = ["full", "extra-traits"] }
 quote = "1"
 proc-macro2 = "1"

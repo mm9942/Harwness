@@ -45,7 +45,7 @@
 //! };
 //! use std::path::Path;
 //!
-//! let path = Path::new("/home/mia/.harw/auth.toml");
+//! let path = Path::new("/home/user/.harw/auth.toml");
 //! write_atomic(path, b"token = \"...\"\n", AtomicWriteOptions::private())?;
 //! let file = open_nofollow(path, OpenMode::read_only())?;
 //! ensure_private_regular(&file)?;

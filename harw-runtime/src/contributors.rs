@@ -2,7 +2,7 @@
 //!
 //! # Beschreibung
 //! Die Montage in [`crate::assembly`] ist bewusst geschlossen: sie kennt genau
-//! die Bausteine, die `docs/remediation/CONTRACTS.md` §runtime-spec nennt, und
+//! die Bausteine, die `docs/design/runtime-contracts.md` §runtime-spec nennt, und
 //! keine Erweiterungsliste. Teil B des Plans („Abgleich mit Teil A") braucht
 //! aber eine Stelle, an der ein Subsystem (Netz-Politik W5, DoD-Kette,
 //! Browser-Host, Web-UI) **zusätzliche** Werkzeuge, Operationen oder

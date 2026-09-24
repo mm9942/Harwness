@@ -5,7 +5,7 @@
 //! # Verantwortungsbereich
 //! Der zweite echte Implementierer von [`harw_observe::TelemetrySink`] nach
 //! `harw-observe-file::FileSink` (Vertrag A.3/A.6,
-//! `docs/aw-contract-master.md`; Knoten AW3-04). Besitzt [`PromSink`]
+//! `docs/design/build-history.md`; Knoten AW3-04). Besitzt [`PromSink`]
 //! (Zustandshaltung + Textrendering, siehe `crate::sink`-Moduldoc für die
 //! Ableitung aus `MetricKey`), [`PromEndpoint`] + [`BindAddr`]
 //! (Socket-Bindung + minimaler HTTP-Antwortpfad, siehe

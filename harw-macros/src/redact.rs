@@ -1,7 +1,7 @@
 //! `#[derive(Redact)]`-Expansion.
 //!
 //! Spec: AW0-02-Brief, Abschnitt 3 (`#[derive(Redact)]`); Vertragsabschnitt
-//! A.5 (`harw-observe`, `Redact`/`Redacted`) in `docs/aw-contract-master.md`.
+//! A.5 (`harw-observe`, `Redact`/`Redacted`) in `docs/design/build-history.md`.
 //!
 //! # Zweck
 //! `harw_observe::Redact` ist mit Absicht schmal geschnitten:

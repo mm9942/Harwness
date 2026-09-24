@@ -27,7 +27,7 @@ loop {
 ## Richtig
 
 ```rust
-// Datei: apps/sgh-flow/src/services/python_agent.rs:49
+// Datei: apps/acme-app/src/services/python_agent.rs:49
 // ANSI-Escape-Sequenzen aus einem String herausfiltern
 let mut chars = s.chars().peekable();
 while let Some(ch) = chars.next() {
@@ -41,7 +41,7 @@ while let Some(ch) = chars.next() {
     }
 }
 
-// Datei: apps/sgh-flow/src/services/child_supervisor.rs:245
+// Datei: apps/acme-app/src/services/child_supervisor.rs:245
 // Veraltete Restart-Events aus dem Ringpuffer entfernen
 while let Some(&front) = self.events.front() {
     if now.duration_since(front) > self.window {
@@ -51,7 +51,7 @@ while let Some(&front) = self.events.front() {
     }
 }
 
-// Datei: apps/sgh-flow/src/websocket/event_bridge.rs:539
+// Datei: apps/acme-app/src/websocket/event_bridge.rs:539
 // Async-Channel leeren bis Sender geschlossen wird
 while let Some(envelope) = rx.recv().await {
     // rx.recv() gibt None zurück wenn alle Sender weg sind —

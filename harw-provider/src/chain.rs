@@ -1,6 +1,6 @@
 //! Fallback-Kette als abgeleitete Runtime-Sicht (Note 11 §5–§7, Note 12 §15–§16).
 //!
-//! Mias Kollaps: `primary` und `fallbacks` sind keine zwei Felder — es ist *ein*
+//! Kern-Einsicht: `primary` und `fallbacks` sind keine zwei Felder — es ist *ein*
 //! geordneter 1D-`Vec`. `primary` ist nur ein Kosename für `chain[0]`,
 //! `fallbacks` für `chain[1..]`. Agent-Overrides sind **Operationen auf dem Vec**
 //! ([`VecOp`]), kein Zwei-Felder-Merge.

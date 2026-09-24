@@ -124,7 +124,7 @@ use crate::children::RuntimeChildRegistryFactory;
 use crate::config::{ConfigTrustReport, load_config};
 use crate::contributors::{AssemblyContributor, AssemblyInputs, AssemblyParts};
 use crate::error::{RuntimeError, RuntimeResult};
-use crate::model::{ModelSource, build_root_model_with_registry_and_resolver};
+use crate::model::ModelSource;
 use crate::sandbox::{root_network_scope, root_sandbox_with_network};
 use crate::services::{PlanServices, RuntimeServices, RuntimeServicesParts, ServiceSurface};
 use crate::spec::{
@@ -163,6 +163,24 @@ const DEFAULT_APPROVAL_TIMEOUT_SECS: u64 = 1800;
 /// erst verdichten, nachdem der Provider die Anfrage bereits abgelehnt hat.
 /// Jeder Rückfall wird mit `tracing::warn!` gemeldet ([`model_limits_for`]).
 pub const UNKNOWN_MODEL_CONTEXT_WINDOW_TOKENS: u64 = 32_768;
+
+/// Kontextfenster (Token) des eingebauten Offline-Echos
+/// ([`ModelSource::Echo`]), wenn weder Konfiguration noch Katalog ein Fenster
+/// für das (optionale) Wurzelmodell nennen.
+///
+/// Der Echo ist kein echtes Modell: er hat kein Fenster, das eine Anfrage
+/// überschreiten könnte, und ruft keinen Provider. Das konservative
+/// [`UNKNOWN_MODEL_CONTEXT_WINDOW_TOKENS`] schützt ein *unbekanntes echtes*
+/// Modell vor einer Ablehnung durch den Provider; beim Echo würde es nur den
+/// Offline-Pfad (`harw run`, SDK `offline_echo`, Tests) an die zufällige Größe
+/// von System-Prompt und Werkzeugschemata koppeln. 200k entspricht dem
+/// verbreiteten Fenster großer Cloud-Modelle (und dem früheren Rückfallwert);
+/// die Verdichtungs-Obergrenze (`[compaction] absolute_ceiling_tokens`) gilt
+/// unverändert. Ein konfiguriertes/katalogisiertes Fenster hat weiterhin
+/// Vorrang (Tests, die mit Echo bewusst ein kleines Fenster setzen, bleiben
+/// gültig). [`ModelSource::Override`] bekommt diesen Wert **nicht**: dahinter
+/// steht in Produktion ein echter Provider (Jobs, Telegram).
+pub const OFFLINE_ECHO_CONTEXT_WINDOW_TOKENS: u64 = 200_000;
 
 /// Fester Token-Aufschlag für System-Prompt, Werkzeugschemata und
 /// Kontextfragmente, den die Auto-Verdichtung zusätzlich zur Ausgabereserve
@@ -1260,6 +1278,10 @@ pub struct RuntimeAssemblyBuilder {
     /// Löst `secrets:`-Referenzen beim Bau von [`ModelSource::Configured`]
     /// auf; ohne ihn schlägt jedes `auth = "secrets:…"` fehl (Befund C2a).
     secret_resolver: Option<Arc<dyn SecretResolver + Send + Sync>>,
+    /// Öffnet den `secrets:`-Resolver nachträglich, wenn ein Live-
+    /// Modellwechsel einen beim Start nicht gebauten Provider braucht
+    /// ([`Self::secret_resolver_opener`]).
+    secret_resolver_opener: Option<Arc<crate::live_model::SecretResolverOpener>>,
     /// Verengung von Werkzeugsatz, Identität und Sandbox-Rechten durch den
     /// Aufrufer (CONTRACTS-W2d2 §1.1); `None` heißt „Profil unverändert".
     narrowing: Option<RuntimeNarrowing>,
@@ -1377,6 +1399,24 @@ impl RuntimeAssemblyBuilder {
     #[must_use]
     pub fn secret_resolver(mut self, resolver: Arc<dyn SecretResolver + Send + Sync>) -> Self {
         self.secret_resolver = Some(resolver);
+        self
+    }
+
+    /// Übergibt einen Öffner für den `secrets:`-Resolver (Live-Modellwechsel).
+    ///
+    /// # Beschreibung
+    /// Der Aufrufer öffnet beim Start nur dann einen Resolver, wenn der
+    /// Vorgabe-Provider ihn braucht. Wechselt die Sitzung später auf einen
+    /// Provider mit `secrets:`-Referenz, öffnet
+    /// [`crate::live_model::LiveModelRouting`] den Speicher über diesen
+    /// Öffner und baut den Provider-Client neu — ohne Neustart. Ohne Aufruf
+    /// scheitert ein solcher Wechsel mit einer klaren Meldung.
+    #[must_use]
+    pub fn secret_resolver_opener(
+        mut self,
+        opener: Arc<crate::live_model::SecretResolverOpener>,
+    ) -> Self {
+        self.secret_resolver_opener = Some(opener);
         self
     }
 
@@ -1530,6 +1570,7 @@ impl RuntimeAssemblyBuilder {
             contributors,
             root_session_id,
             secret_resolver,
+            secret_resolver_opener,
             narrowing,
             project_facts,
             global_facts,
@@ -2147,12 +2188,26 @@ impl RuntimeAssemblyBuilder {
         //    HTTP-Client bauen darf (siehe dessen Doku und
         //    [`crate::model::build_uia_model_with_resolver`]).
         let source_is_configured = matches!(&model_source, ModelSource::Configured);
-        let (default_tree_model, root_load_registry) = build_root_model_with_registry_and_resolver(
-            &spec,
-            &config,
-            model_source,
-            secret_resolver.as_deref().map(|r| r as &dyn SecretResolver),
-        )?;
+        // Der Offline-Echo ist kein echtes Modell: Wurzel und Kinder bekommen
+        // ohne bekanntes Fenster [`OFFLINE_ECHO_CONTEXT_WINDOW_TOKENS`] statt
+        // des 32k-Rückfalls für unbekannte echte Modelle
+        // ([`session_model_limits`]).
+        let offline_echo = matches!(&model_source, ModelSource::Echo(_));
+        let (default_tree_model, root_load_registry, root_backends) =
+            crate::model::build_root_model_with_backends(
+                &spec,
+                &config,
+                model_source,
+                secret_resolver.as_deref().map(|r| r as &dyn SecretResolver),
+            )?;
+        // Live-Modellwechsel: generische Auswahl und Rollenwahl für neu
+        // gestartete Kinder, Neubau eines beim Start nicht baubaren
+        // Provider-Clients (siehe `crate::live_model`).
+        let live_models = Arc::new(
+            crate::live_model::LiveModelRouting::new(Arc::clone(&config))
+                .with_backends(root_backends, spec.home.clone())
+                .with_secret_resolvers(secret_resolver.clone(), secret_resolver_opener),
+        );
         // Welle 3a: bei aktiver UIA bekommt sie ihr eigenes Provider-Modell
         // (`uia_client`), aus dem sich zusätzlich das Modell der gesamten
         // `uia-worker`-Rollenfamilie ableitet (`uia_worker_model`) — beide
@@ -2238,8 +2293,10 @@ impl RuntimeAssemblyBuilder {
                 uia_worker_model: &uia_worker_model,
                 // Runde 5, Teil G.
                 uia_worker_routing: Arc::clone(&uia_worker_routing),
+                live_models: Arc::clone(&live_models),
                 root_session_id: &root_session_id,
                 root_model_id: root_model_id.clone(),
+                offline_echo,
                 spawn_context: &spawn_context,
                 reasoning_effort: spec.reasoning_effort,
                 activation: &activation,
@@ -2394,6 +2451,11 @@ impl RuntimeAssemblyBuilder {
         }
         .with_home_context(Arc::clone(&home_context))
         .with_agent_events(Arc::new(agent_events.clone()));
+        // Live-Modellwechsel: `/model switch` & Co. bauen darüber einen
+        // Provider-Client neu bzw. übernehmen die Rollenwahl.
+        let services = services.with_live_model_control(
+            Arc::clone(&live_models) as harw_ops::live_model::SharedLiveModelControl
+        );
         // Runde 5, Teil E: `/permissions log` liest das Auto-Modus-Protokoll.
         let services = match chain.auto_mode() {
             Some(auto) => services.with_auto_decision_log(auto.log().clone()),
@@ -2825,6 +2887,7 @@ impl RuntimeAssemblyBuilder {
             root_uia_reasoning_effort_defaults,
             pitfall_advisor,
             root_model_id,
+            offline_echo,
             registry: Mutex::new(Some(registry)),
             responder: Mutex::new(None),
             host_permit_ledger,
@@ -2837,6 +2900,7 @@ impl RuntimeAssemblyBuilder {
             plan_ui_requests: Mutex::new(plan_ui_receiver),
             // Runde 5, Teil G.
             uia_worker_routing,
+            live_models,
         })
     }
 }
@@ -3698,13 +3762,34 @@ fn effective_root_model_id(config: &ResolvedConfig, uia_root: bool) -> Option<St
     config.harness.default_model.clone()
 }
 
+/// Der Provider des Modells, das die Wurzelsitzung dieses Laufs treibt —
+/// Gegenstück zu [`effective_root_model_id`] (dieselbe UIA-Rangfolge).
+///
+/// # Rückgabe
+/// `uia_provider` bei nutzbarer UIA-Auswahl einer UIA-Wurzel, sonst
+/// `default_provider`.
+fn effective_root_provider_id(config: &ResolvedConfig, uia_root: bool) -> Option<String> {
+    if uia_root
+        && config.harness.uia_model.is_some()
+        && let Some(provider) = config.harness.uia_provider.as_deref()
+        && config
+            .providers
+            .get(provider)
+            .is_some_and(|provider| provider.enabled)
+    {
+        return Some(provider.to_owned());
+    }
+    config.harness.default_provider.clone()
+}
+
 /// Die für das Kontext-/Ausgabebudget relevanten Grenzen eines Modells.
 ///
 /// Ergebnis von [`model_limits_for`]; alle Token-Angaben in Tokens.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ModelLimits {
     /// Effektives Kontextfenster (nie 0; unbekannt →
-    /// [`UNKNOWN_MODEL_CONTEXT_WINDOW_TOKENS`]).
+    /// [`UNKNOWN_MODEL_CONTEXT_WINDOW_TOKENS`], beim Offline-Echo
+    /// [`OFFLINE_ECHO_CONTEXT_WINDOW_TOKENS`]).
     pub context_window: u64,
     /// `[models.<id>].max_tokens`, falls konfiguriert.
     pub configured_max_output: Option<u64>,
@@ -3933,6 +4018,32 @@ fn version_dots_to_dashes(id: &str) -> String {
 /// Die [`ModelLimits`] des Modells.
 #[must_use]
 pub fn model_limits_for(config: &ResolvedConfig, model_id: &str) -> ModelLimits {
+    let (limits, local) = lookup_model_limits(config, model_id);
+    if !limits.known && local {
+        tracing::warn!(
+            model = model_id,
+            fallback_tokens = UNKNOWN_MODEL_CONTEXT_WINDOW_TOKENS,
+            "runtime.context_window.unknown_local_model: lokales Modell ohne \
+             [models.<id>].context_window; `harw provider scan` liest das Fenster vom \
+             Server, sonst gilt das konservative Rückfallfenster"
+        );
+    } else if !limits.known {
+        tracing::warn!(
+            model = model_id,
+            fallback_tokens = UNKNOWN_MODEL_CONTEXT_WINDOW_TOKENS,
+            "runtime.context_window.unknown_model: weder [models.<id>].context_window noch \
+             der Modellkatalog kennen dieses Modell; konservatives Rückfallfenster aktiv"
+        );
+    }
+    limits
+}
+
+/// Die Nachschlage-Logik von [`model_limits_for`] ohne Warnung.
+///
+/// # Rückgabe
+/// `(limits, local)` — `local` ist `true`, wenn das Modell über einen lokalen
+/// Provider läuft ([`model_runs_locally`]).
+fn lookup_model_limits(config: &ResolvedConfig, model_id: &str) -> (ModelLimits, bool) {
     let configured = config.models.get(model_id).or_else(|| {
         config.models.values().find(|model| {
             model.id == model_id || model.aliases.iter().any(|alias| alias.as_str() == model_id)
@@ -3962,30 +4073,15 @@ pub fn model_limits_for(config: &ResolvedConfig, model_id: &str) -> ModelLimits 
     let context_window = configured_window
         .or(catalog_window)
         .unwrap_or(UNKNOWN_MODEL_CONTEXT_WINDOW_TOKENS);
-    if !known && local {
-        tracing::warn!(
-            model = model_id,
-            fallback_tokens = UNKNOWN_MODEL_CONTEXT_WINDOW_TOKENS,
-            "runtime.context_window.unknown_local_model: lokales Modell ohne \
-             [models.<id>].context_window; `harw provider scan` liest das Fenster vom \
-             Server, sonst gilt das konservative Rückfallfenster"
-        );
-    } else if !known {
-        tracing::warn!(
-            model = model_id,
-            fallback_tokens = UNKNOWN_MODEL_CONTEXT_WINDOW_TOKENS,
-            "runtime.context_window.unknown_model: weder [models.<id>].context_window noch \
-             der Modellkatalog kennen dieses Modell; konservatives Rückfallfenster aktiv"
-        );
-    }
-    ModelLimits {
+    let limits = ModelLimits {
         context_window,
         configured_max_output: configured.and_then(|model| model.max_tokens),
         catalog_max_output: catalog_entry.and_then(|entry| entry.max_output),
         thinking: configured.is_some_and(|model| model.reasoning)
             || catalog_entry.is_some_and(|entry| entry.thinking),
         known,
-    }
+    };
+    (limits, local)
 }
 
 /// Runde 7, Teil L3: `true`, wenn `model_id` über einen lokalen Provider
@@ -4034,6 +4130,45 @@ fn model_limits_or_fallback(
             }
         }
     }
+}
+
+/// Grenzen für Wurzel und Kinder einer Montage mit Modellquelle
+/// `offline_echo` ([`ModelSource::Echo`]) bzw. einem echten Provider.
+///
+/// # Beschreibung
+/// Ohne Echo exakt [`model_limits_or_fallback`] (unbekanntes echtes Modell →
+/// [`UNKNOWN_MODEL_CONTEXT_WINDOW_TOKENS`] mit Warnung). Mit Echo gilt ein
+/// konfiguriertes oder katalogisiertes Fenster weiterhin; nur der Rückfall
+/// ist [`OFFLINE_ECHO_CONTEXT_WINDOW_TOKENS`] — ohne Warnung, denn der Echo
+/// hat kein Fenster, das überschritten werden könnte.
+///
+/// # Argumente
+/// - `config` (`&ResolvedConfig`): die aufgelöste Konfiguration.
+/// - `offline_echo` (`bool`): `true`, wenn die Montage den Offline-Echo fährt.
+/// - `model` / `fallback` (`Option<&str>`): wie bei [`model_limits_or_fallback`].
+///
+/// # Rückgabe
+/// Die [`ModelLimits`] für Fenster und Ausgabereserve.
+fn session_model_limits(
+    config: &ResolvedConfig,
+    offline_echo: bool,
+    model: Option<&str>,
+    fallback: Option<&str>,
+) -> ModelLimits {
+    if !offline_echo {
+        return model_limits_or_fallback(config, model, fallback);
+    }
+    model
+        .or(fallback)
+        .map(|model| lookup_model_limits(config, model).0)
+        .filter(|limits| limits.known)
+        .unwrap_or(ModelLimits {
+            context_window: OFFLINE_ECHO_CONTEXT_WINDOW_TOKENS,
+            configured_max_output: None,
+            catalog_max_output: None,
+            thinking: false,
+            known: false,
+        })
 }
 
 /// Kontextfenster eines Modells in Tokens.
@@ -4159,12 +4294,18 @@ struct SpawnerInputs<'a> {
     /// Runde 5, Teil G: eigene Modellwahl je UIA-Worker-Rolle; die
     /// UIA-Worker-Fabrik baut das Modell jedes Kindes beim Start daraus.
     uia_worker_routing: Arc<crate::uia_worker_routing::UiaWorkerRouting>,
+    /// Live-Modellwahl der Montage; die Fabrik des Wurzel-Baums gibt neu
+    /// gestarteten Kindern daraus Hauptmodell und Rollenwahl.
+    live_models: Arc<crate::live_model::LiveModelRouting>,
     /// Die Kennung der Wurzelsitzung, unter der der Spawner sie registriert.
     root_session_id: &'a SessionId,
     /// Das Modell, das die Wurzelsitzung treibt ([`effective_root_model_id`]);
     /// Teil C: Rückfall für das Kind-Modell und Hauptmodell der
     /// UIA-Worker-Fabrik.
     root_model_id: Option<String>,
+    /// `true` bei [`ModelSource::Echo`]: Kind-Fenster ohne bekanntes Modell
+    /// sind dann [`OFFLINE_ECHO_CONTEXT_WINDOW_TOKENS`] ([`session_model_limits`]).
+    offline_echo: bool,
     /// Der eine Spawn-Kontext des Laufs (Sandbox, Trace, Decke).
     spawn_context: &'a SpawnContext,
     /// Der gewählte Reasoning-Effort, falls einer gesetzt ist.
@@ -4247,8 +4388,10 @@ fn build_spawner(
         model,
         uia_worker_model,
         uia_worker_routing,
+        live_models,
         root_session_id,
         root_model_id,
+        offline_echo,
         spawn_context,
         reasoning_effort,
         activation,
@@ -4304,6 +4447,9 @@ fn build_spawner(
         .with_internal_models(crate::children::resolve_internal_models_for_children(
             config,
         ))
+        // Live-Modellwechsel: neue Kinder folgen `/model switch` und
+        // `/models set` ohne Neustart.
+        .with_live_models(live_models)
         .with_profile_agents_dir(profile_agents_dir.clone())
         .with_browser_config(config.browser.clone())
         .with_spawner_slot(Arc::clone(&spawner_slot))
@@ -4398,8 +4544,13 @@ fn build_spawner(
         // (Teil C: ohne Modell das effektive Vorgabemodell des Wurzel-Baums,
         // nicht das rohe `default_model`).
         .with_context_window_resolver(Arc::new(move |model: Option<&str>| {
-            model_limits_or_fallback(&window_config, model, window_default.as_deref())
-                .context_window
+            session_model_limits(
+                &window_config,
+                offline_echo,
+                model,
+                window_default.as_deref(),
+            )
+            .context_window
         }))
         // Teil C: ein unbekanntes Kind-Modell (Rückfallfenster) meldet die
         // Admission laut im Trace und im Agent-Panel.
@@ -4411,6 +4562,11 @@ fn build_spawner(
         // Teil C: Rückfall für das Kind-Modell, wenn weder Rollen-Pin noch
         // Fabrik-Hauptmodell bekannt sind.
         .with_root_model(root_model_id.clone())
+        // Anzeige `<provider>/<modell>`: Provider der Wurzel als Rückfall.
+        .with_root_provider(effective_root_provider_id(
+            config,
+            spawn_context.organizational_role == AgentRoleId::UserInterface,
+        ))
         // Welle 3: dieselbe feste Verdichtungs-Obergrenze wie die Wurzel
         // (`[compaction] absolute_ceiling_tokens`, sonst Kern-Vorgabe).
         .with_compaction_ceiling(Some(configured_compaction_ceiling(config)))
@@ -4589,6 +4745,10 @@ pub struct RuntimeAssembly {
     /// [`Self::new_root_session`] leitet daraus Kontextfenster und
     /// Ausgabereserve ab.
     root_model_id: Option<String>,
+    /// `true`, wenn die Montage den Offline-Echo fährt ([`ModelSource::Echo`]);
+    /// ohne bekanntes Wurzelmodell gilt dann
+    /// [`OFFLINE_ECHO_CONTEXT_WINDOW_TOKENS`] ([`session_model_limits`]).
+    offline_echo: bool,
     registry: Mutex<Option<ExtensionRegistry>>,
     responder: Mutex<Option<Arc<dyn ApprovalHandler>>>,
     /// Einmal je Montage instanziierter Permit-Ledger für Host-Profil-Worker
@@ -4622,6 +4782,8 @@ pub struct RuntimeAssembly {
     /// Runde 5, Teil G: Modellwahl der UIA-Worker-Rollen (siehe
     /// [`Self::uia_worker_routing`]).
     uia_worker_routing: Arc<crate::uia_worker_routing::UiaWorkerRouting>,
+    /// Live-Modellwahl der Montage (siehe [`Self::live_models`]).
+    live_models: Arc<crate::live_model::LiveModelRouting>,
 }
 
 impl std::fmt::Debug for RuntimeAssembly {
@@ -4658,6 +4820,7 @@ impl RuntimeAssembly {
             contributors: crate::contributors::default_contributors(),
             root_session_id: None,
             secret_resolver: None,
+            secret_resolver_opener: None,
             narrowing: None,
             project_facts: None,
             global_facts: None,
@@ -4848,6 +5011,59 @@ impl RuntimeAssembly {
     #[must_use]
     pub fn uia_worker_routing(&self) -> &Arc<crate::uia_worker_routing::UiaWorkerRouting> {
         &self.uia_worker_routing
+    }
+
+    /// Die Live-Modellwahl dieses Laufs (Live-Modellwechsel).
+    ///
+    /// # Beschreibung
+    /// Die TUI meldet hierüber an jeder Turn-Grenze die generische Auswahl
+    /// des Controllers
+    /// ([`crate::live_model::LiveModelRouting::set_live_main`]); neu
+    /// gestartete Kinder des Wurzel-Baums nehmen sie, laufende behalten ihr
+    /// Modell.
+    #[must_use]
+    pub fn live_models(&self) -> &Arc<crate::live_model::LiveModelRouting> {
+        &self.live_models
+    }
+
+    /// Provider/Modell, das die Wurzelsitzung mit `active_model`/
+    /// `active_provider` tatsächlich anspricht, als aufgelöste Kennungen.
+    ///
+    /// # Beschreibung
+    /// Ohne eigene Wahl gilt das effektive Wurzelmodell des Starts
+    /// (UIA-Modell bei UIA-Wurzel, sonst Vorgabemodell) und dessen
+    /// Provider; ein Alias wird über den Modellkatalog zur Modell-ID
+    /// aufgelöst. Grundlage der Modellanzeige (`<provider>/<modell>`).
+    #[must_use]
+    pub fn resolved_root_route(
+        &self,
+        active_provider: Option<&str>,
+        active_model: Option<&str>,
+    ) -> (Option<String>, Option<String>) {
+        let model = active_model
+            .map(str::to_owned)
+            .or_else(|| self.root_model_id.clone());
+        let provider = active_provider.map(str::to_owned).or_else(|| {
+            match active_model {
+                // Eigene Modellwahl ohne Provider: Provider laut Katalog.
+                Some(model) => harw_config::catalog_provider_of(&self.config, model),
+                None => self.root_provider_id(),
+            }
+        });
+        let model = model.map(|model| crate::live_model::resolve_model_id(&self.config, &model));
+        (provider, model)
+    }
+
+    /// `true`, wenn die Wurzelsitzung dieses Laufs eine UIA ist (dann gilt
+    /// für sie die UIA-Auswahl des Controllers vor der generischen).
+    #[must_use]
+    pub fn root_is_uia(&self) -> bool {
+        self.spawn_context.organizational_role == AgentRoleId::UserInterface
+    }
+
+    /// Provider des effektiven Wurzelmodells des Starts.
+    fn root_provider_id(&self) -> Option<String> {
+        effective_root_provider_id(&self.config, self.root_is_uia())
     }
 
     /// Der Vertrauensbericht der Konfigurationsschichten.
@@ -5200,8 +5416,13 @@ impl RuntimeAssembly {
         // Aufschlag für System-Prompt/Werkzeuge werden vom Fenster abgezogen.
         // Der Handoff-Beobachter schreibt bei jeder Verdichtung
         // `<project>/.harw/handoff.json` (Contract §"harw-runtime/src/handoff.rs").
-        let root_limits =
-            model_limits_or_fallback(&self.config, self.root_model_id.as_deref(), None);
+        let offline_echo = self.offline_echo;
+        let root_limits = session_model_limits(
+            &self.config,
+            offline_echo,
+            self.root_model_id.as_deref(),
+            None,
+        );
         let context_window = root_limits.context_window;
         let output_reserve = root_limits.output_reserve_tokens();
         // Addendum F+G / Welle 8: eine UIA-Wurzel ohne expliziten Effort
@@ -5247,8 +5468,18 @@ impl RuntimeAssembly {
                     let config = Arc::clone(&self.config);
                     let root_model_id = self.root_model_id.clone();
                     Arc::new(move |model: Option<&str>| {
-                        model_limits_or_fallback(&config, model, root_model_id.as_deref())
+                        session_model_limits(&config, offline_echo, model, root_model_id.as_deref())
                             .context_window
+                    })
+                })
+                // Live-Modellwechsel: die Ausgabereserve folgt dem neuen
+                // Modell (sonst bliebe die Reserve des Start-Modells stehen).
+                .with_output_reserve_resolver({
+                    let config = Arc::clone(&self.config);
+                    let root_model_id = self.root_model_id.clone();
+                    Arc::new(move |model: Option<&str>| {
+                        session_model_limits(&config, offline_echo, model, root_model_id.as_deref())
+                            .output_reserve_tokens()
                     })
                 })
                 .with_auto_compact(Some(
@@ -5745,6 +5976,51 @@ mod tests {
         assert_eq!(
             model_limits_or_fallback(&config, None, None).context_window,
             UNKNOWN_MODEL_CONTEXT_WINDOW_TOKENS
+        );
+    }
+
+    /// Der Offline-Echo ist kein echtes Modell: ohne bekanntes Fenster gilt
+    /// [`OFFLINE_ECHO_CONTEXT_WINDOW_TOKENS`], während ein unbekanntes Modell
+    /// hinter einem echten Provider beim konservativen 32k-Rückfall bleibt.
+    #[test]
+    fn offline_echo_gets_a_large_window_while_unknown_real_models_keep_32k() {
+        const _: () =
+            assert!(OFFLINE_ECHO_CONTEXT_WINDOW_TOKENS > UNKNOWN_MODEL_CONTEXT_WINDOW_TOKENS);
+        let config = ResolvedConfig::default();
+
+        // Echo ohne Modell (SDK `offline_echo`) und mit unbekanntem Modell.
+        for (model, fallback) in [(None, None), (Some("my-local-model"), None)] {
+            let echo = session_model_limits(&config, true, model, fallback);
+            assert_eq!(echo.context_window, OFFLINE_ECHO_CONTEXT_WINDOW_TOKENS);
+            assert!(!echo.known);
+            assert!(
+                echo.output_reserve_tokens() < echo.context_window / 2,
+                "Reserve muss deutlich unter dem Fenster bleiben"
+            );
+        }
+
+        // Echter Provider: unverändert der konservative Rückfall.
+        for (model, fallback) in [(None, None), (Some("my-local-model"), None)] {
+            let real = session_model_limits(&config, false, model, fallback);
+            assert_eq!(real.context_window, UNKNOWN_MODEL_CONTEXT_WINDOW_TOKENS);
+            assert_eq!(real.context_window, 32_768);
+            assert!(!real.known);
+        }
+
+        // Ein bekanntes Fenster gewinnt auch beim Echo (Verdichtungstests
+        // setzen bewusst kleine Fenster).
+        let mut small = ResolvedConfig::default();
+        small.models.insert(
+            "tiny".to_owned(),
+            model_toml("tiny-model", Some(8_000), None),
+        );
+        let echo_small = session_model_limits(&small, true, None, Some("tiny"));
+        assert!(echo_small.known);
+        assert_eq!(echo_small.context_window, 8_000);
+        let echo_catalog = session_model_limits(&config, true, Some("claude-haiku-4-5"), None);
+        assert_eq!(
+            echo_catalog.context_window,
+            model_limits_for(&config, "claude-haiku-4-5").context_window
         );
     }
 
@@ -6354,8 +6630,7 @@ mod tests {
     /// `harness.active_uia_definition`.
     ///
     /// # Beschreibung
-    /// Seit dem UIA-Vertrag (siehe `resolve_active_uia`,
-    /// `docs/sessions/session-transcript-2026-09-14.md`) montieren `EntryKind::Tui`
+    /// Seit dem UIA-Vertrag (siehe `resolve_active_uia`) montieren `EntryKind::Tui`
     /// und `EntryKind::OneShot` nur mit einer konfigurierten UIA
     /// (fail-closed, `RuntimeError::Registry`). Test-Fixtures müssen deshalb
     /// selbst eine bereitstellen, statt implizit auf einen Bootstrap

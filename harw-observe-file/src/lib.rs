@@ -5,7 +5,7 @@
 //! Implementierer von [`harw_observe::TelemetrySink`] — ein Trait ohne
 //! echten Implementierer ist eine Vermutung, keine Zusage. Besitzt
 //! [`FileSink`] und [`ObserveFileError`]; kennt kein anderes Backend.
-//! Vertrag: `docs/aw-contract-master.md`, Abschnitt A.6.
+//! Vertrag: `docs/design/build-history.md`, Abschnitt A.6.
 //!
 //! # Exportierte Typen
 //! [`FileSink`], [`ObserveFileError`], [`ObserveFileResult`].

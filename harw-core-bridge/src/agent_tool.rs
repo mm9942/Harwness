@@ -83,7 +83,7 @@
 //!   Pause-Erlaubnis.
 //!
 //! # Spec-Quelle
-//! `docs/design/wave-4-agents-as-tools.md`, `agent-definition-dsl.md` §13,
+//! `docs/design/agents-as-tools.md`, `agent-definition-dsl.md` §13,
 //! `coding-philosophy.md` §4.
 //!
 //! # Beispiel
@@ -172,7 +172,7 @@ use crate::context_ext::OpContextCoreExt;
 /// `Send + Sync` — kann sicher hinter `Arc` über Thread-Grenzen geteilt werden.
 ///
 /// # Spec-Quelle
-/// `docs/design/wave-4-agents-as-tools.md`, Abschnitt 4
+/// `docs/design/agents-as-tools.md`, Abschnitt 4
 pub struct AgentToolAdapter {
     op: Arc<dyn Operation>,
     child_name: &'static str,
@@ -1862,8 +1862,8 @@ const KNOWN_AUTHORITY_REDUCERS: &[&str] = &[
 /// Liefert die Permission-Obergrenze einer bekannten Reducer-Kennung.
 ///
 /// # Beschreibung
-/// Gespiegelt aus `harw_registry_defaults::authority::AuthorityReducer::ceiling`
-/// (W5/RD, `docs/remediation/ledger/W5/RD.md` §2/§3.5). Bewusst **gespiegelt,
+/// Gespiegelt aus `harw_registry_defaults::authority::AuthorityReducer::ceiling`.
+/// Bewusst **gespiegelt,
 /// nicht aufgerufen**: `cargo metadata` zeigt zwar keinen Zyklus, aber
 /// `harw-core-bridge/Cargo.toml` liegt außerhalb der Zuständigkeit von
 /// A-BRIDGE, und `harw-registry-defaults` zöge den gesamten Werkzeugbaum

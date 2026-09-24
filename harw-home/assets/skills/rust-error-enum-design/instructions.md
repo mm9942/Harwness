@@ -26,7 +26,7 @@ enum AppError {
 ## Richtig
 
 ```rust
-// Datei: apps/sgh-flow/src/iceberg/error.rs:35–84
+// Datei: apps/acme-app/src/iceberg/error.rs:35–84
 use std::fmt;
 
 pub enum IcebergError {

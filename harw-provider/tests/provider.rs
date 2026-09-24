@@ -5,9 +5,9 @@ mod common;
 use common::{TestError, TestResult};
 use harw_provider::{
     AgentProviderOverride, ApiKeyConfig, BearerAuth, HeaderMap, InvocationRequest,
-    InvocationResponse, ModelBuilder, ProviderBuilder, ProviderError, ProviderInvoker,
-    ProviderRegistry, ProviderResult, SghAuth, VecOp, VecProviderRegistry, invoke_with_failover,
-    resolve_provider_chain_with_override,
+    InvocationResponse, ModelBuilder, ProviderAuth, ProviderBuilder, ProviderError,
+    ProviderInvoker, ProviderRegistry, ProviderResult, VecOp, VecProviderRegistry,
+    invoke_with_failover, resolve_provider_chain_with_override,
 };
 use harw_types::{ModelId, ModelName, ProviderId, ProviderName};
 use url::Url;
@@ -18,7 +18,7 @@ fn record(name: &str, primary: bool) -> TestResult<harw_provider::ProviderRecord
         .id(ProviderId::from(name))
         .name(ProviderName::from(name))
         .base_url(url)
-        .auth(SghAuth::ApiKey(ApiKeyConfig {
+        .auth(ProviderAuth::ApiKey(ApiKeyConfig {
             api_key: secrecy_string(),
         }));
     let built = if primary {

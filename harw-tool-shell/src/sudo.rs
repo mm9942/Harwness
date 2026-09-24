@@ -164,8 +164,9 @@ const AUTH_FAILURE_MARKERS: &[&str] = &[
 const PROMPT_LINE_PREFIXES: &[&str] = &["[sudo] password for", "Password:", "Sorry, try again."];
 
 /// Meldung ohne angehängtes Freigabefenster (fail-closed).
-const NO_UI_MSG: &str = "host.sudo_exec: kein Freigabefenster verfügbar — Root-Befehle gibt es \
-     nur in der interaktiven TUI (fail-closed)";
+const NO_UI_MSG: &str = "host.sudo_exec: kein Freigabefenster verfügbar — Root-Befehle laufen \
+     nur mit angeschlossener interaktiver TUI (fail-closed). Nicht erneut versuchen: nenne dem \
+     Nutzer den exakten Befehl, damit er ihn selbst ausführt.";
 /// Meldung bei Ablehnung, Zeitablauf oder fallengelassener Antwort.
 const DENIED_MSG: &str =
     "host.sudo_exec: nicht freigegeben (abgelehnt, Zeitablauf oder Fenster geschlossen)";
@@ -653,35 +654,233 @@ fn escalation_name(word: &str) -> Option<&'static str> {
         .find(|candidate| *candidate == name)
 }
 
+/// Shell-Interpreter, deren `-c`-Argument selbst eine Befehlszeile ist
+/// (`bash -c 'sudo id'`).
+const SHELL_INTERPRETERS: &[&str] = &["sh", "bash", "zsh", "dash", "ksh", "mksh", "ash"];
+
+/// Höchste Verschachtelung von `sh -c '…'`, die [`escalation_program`]
+/// noch auswertet (Schutz vor Rekursion ohne Ende).
+const MAX_SHELL_C_DEPTH: u8 = 4;
+
+/// Wo der Zerleger in [`command_segments`] gerade steht.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ShellFrame {
+    /// Befehlskontext; `closer` sagt, was ihn beendet.
+    Command { closer: FrameCloser, parens: u32 },
+    /// In `'…'`: alles ist Literal.
+    Single,
+    /// In `"…"`: Literal bis auf `\`, `$(` und Backtick.
+    Double,
+}
+
+/// Was einen verschachtelten Befehlskontext beendet.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FrameCloser {
+    /// Oberste Ebene: nur das Zeilenende.
+    Top,
+    /// `$(` … `)`.
+    Paren,
+    /// `` ` `` … `` ` ``.
+    Backtick,
+}
+
+/// Gesicherter Zerlegerstand vor einer Befehlsersetzung.
+struct SavedWord {
+    word: String,
+    word_started: bool,
+    segment: Vec<String>,
+}
+
+/// Schließt das aktuelle Wort ab (auch ein leeres `""`).
+fn end_word(word: &mut String, word_started: &mut bool, segment: &mut Vec<String>) {
+    if *word_started || !word.is_empty() {
+        segment.push(std::mem::take(word));
+    }
+    *word_started = false;
+}
+
+/// Schließt den aktuellen einfachen Befehl ab.
+fn end_segment(segment: &mut Vec<String>, segments: &mut Vec<Vec<String>>) {
+    if !segment.is_empty() {
+        segments.push(std::mem::take(segment));
+    }
+}
+
+/// Zerlegt eine Shell-Zeile anführungszeichengerecht in **einfache Befehle**
+/// (je eine Wortliste).
+///
+/// # Beschreibung
+/// Ein neuer Befehl beginnt nach `;`, `&`, `&&`, `|`, `||`, `(`, `)`,
+/// Zeilenende, am Anfang von `$(…)` und `` `…` `` (auch innerhalb von
+/// `"…"`) und am Ende einer solchen Ersetzung. Innerhalb von `'…'` und
+/// `"…"` ist nichts davon ein Trenner: ein Suchmuster wie
+/// `'sudo_exec|sudo -'` bleibt **ein** Argument. Anführungszeichen und
+/// Backslashes werden wie in der Shell entfernt (`s"u"do` → `sudo`),
+/// `# …` am Wortanfang ist ein Kommentar. Keine vollständige Shell-Grammatik
+/// (Here-Docs, `case`-Muster und Umleitungsziele bleiben gewöhnliche Wörter).
+fn command_segments(command: &str) -> Vec<Vec<String>> {
+    let mut segments: Vec<Vec<String>> = Vec::new();
+    let mut segment: Vec<String> = Vec::new();
+    let mut word = String::new();
+    let mut word_started = false;
+    let mut stack = vec![ShellFrame::Command {
+        closer: FrameCloser::Top,
+        parens: 0,
+    }];
+    let mut saved: Vec<SavedWord> = Vec::new();
+
+    let mut chars = command.chars().peekable();
+    while let Some(c) = chars.next() {
+        let Some(frame) = stack.last().copied() else {
+            break;
+        };
+        // Beginn einer Befehlsersetzung (`$(` oder Backtick) aus Befehls-
+        // oder Doppelquote-Kontext: aktuellen Stand sichern, neu beginnen.
+        let opens_substitution = match frame {
+            ShellFrame::Single => false,
+            ShellFrame::Double => (c == '$' && chars.peek() == Some(&'(')) || c == '`',
+            ShellFrame::Command { closer, .. } => {
+                (c == '$' && chars.peek() == Some(&'('))
+                    || (c == '`' && closer != FrameCloser::Backtick)
+            }
+        };
+        if opens_substitution {
+            let closer = if c == '$' {
+                chars.next();
+                FrameCloser::Paren
+            } else {
+                FrameCloser::Backtick
+            };
+            saved.push(SavedWord {
+                word: std::mem::take(&mut word),
+                word_started,
+                segment: std::mem::take(&mut segment),
+            });
+            word_started = false;
+            stack.push(ShellFrame::Command { closer, parens: 0 });
+            continue;
+        }
+        match frame {
+            ShellFrame::Single => {
+                if c == '\'' {
+                    stack.pop();
+                } else {
+                    word.push(c);
+                }
+            }
+            ShellFrame::Double => match c {
+                '"' => {
+                    stack.pop();
+                }
+                '\\' => match chars.next() {
+                    Some('\n') | None => {}
+                    Some(next @ ('$' | '`' | '"' | '\\')) => word.push(next),
+                    Some(next) => {
+                        word.push('\\');
+                        word.push(next);
+                    }
+                },
+                other => word.push(other),
+            },
+            ShellFrame::Command { closer, parens } => {
+                let closes = (c == ')' && parens == 0 && closer == FrameCloser::Paren)
+                    || (c == '`' && closer == FrameCloser::Backtick);
+                if closes {
+                    end_word(&mut word, &mut word_started, &mut segment);
+                    end_segment(&mut segment, &mut segments);
+                    stack.pop();
+                    if let Some(outer) = saved.pop() {
+                        word = outer.word;
+                        segment = outer.segment;
+                    }
+                    // Die Ersetzung ist Teil des umgebenden Wortes.
+                    word_started = true;
+                    continue;
+                }
+                match c {
+                    '\'' => {
+                        word_started = true;
+                        stack.push(ShellFrame::Single);
+                    }
+                    '"' => {
+                        word_started = true;
+                        stack.push(ShellFrame::Double);
+                    }
+                    '\\' => match chars.next() {
+                        Some('\n') | None => {}
+                        Some(next) => word.push(next),
+                    },
+                    '#' if word.is_empty() && !word_started => {
+                        while chars.peek().is_some_and(|next| *next != '\n') {
+                            chars.next();
+                        }
+                    }
+                    ';' | '&' | '|' | '\n' | '\r' => {
+                        end_word(&mut word, &mut word_started, &mut segment);
+                        end_segment(&mut segment, &mut segments);
+                    }
+                    '(' | ')' => {
+                        end_word(&mut word, &mut word_started, &mut segment);
+                        end_segment(&mut segment, &mut segments);
+                        if let Some(ShellFrame::Command { parens, .. }) = stack.last_mut() {
+                            if c == '(' {
+                                *parens += 1;
+                            } else {
+                                *parens = parens.saturating_sub(1);
+                            }
+                        }
+                    }
+                    other if other.is_whitespace() => {
+                        end_word(&mut word, &mut word_started, &mut segment);
+                    }
+                    other => word.push(other),
+                }
+            }
+        }
+    }
+    end_word(&mut word, &mut word_started, &mut segment);
+    end_segment(&mut segment, &mut segments);
+    // Nicht geschlossene Ersetzungen: ihre äußeren Befehle zählen mit.
+    while let Some(outer) = saved.pop() {
+        let mut outer_segment = outer.segment;
+        if outer.word_started || !outer.word.is_empty() {
+            outer_segment.push(outer.word);
+        }
+        end_segment(&mut outer_segment, &mut segments);
+    }
+    segments
+}
+
 /// Findet ein Rechte-Werkzeug in **Befehlsposition** einer Shell-Zeile.
 ///
 /// # Beschreibung
-/// Zerlegt die Zeile an `;`, `&`, `|`, `(`, `)`, `{`, `}`, Backtick,
-/// `$(` und Zeilenenden in Abschnitte und prüft je Abschnitt das erste Wort
-/// nach Zuweisungen (`VAR=wert`), Wrappern wie `env`/`nohup`/`timeout` samt
-/// deren Optionen/Zahlen und Schlüsselwörtern wie `then`. Anführungszeichen
-/// und Backslashes werden vorher entfernt (`s"u"do` → `sudo`). Das ist eine
-/// Heuristik gegen versehentliches und naives `sudo` über `shell.exec`, keine
-/// vollständige Shell-Analyse — die eigentliche Grenze bleibt, dass
-/// `shell.exec` auf dem Host jeden Befehlstext einzeln freigeben lässt und
-/// in der Sandbox `no_new_privs` gilt.
+/// Zerlegt die Zeile anführungszeichengerecht in einfache Befehle
+/// ([`command_segments`]: Trenner `;`, `&`, `&&`, `|`, `||`, `(`, `)`,
+/// Zeilenende, `$(…)`, `` `…` ``) und prüft je Befehl das erste Wort nach
+/// Zuweisungen (`VAR=wert`), Wrappern wie `env`/`exec`/`nohup`/`time`/
+/// `xargs`/`timeout` samt deren Optionen/Zahlen und Schlüsselwörtern wie
+/// `then`. `sh -c '…'`/`bash -c "…"` wird rekursiv geprüft. Ein Wort
+/// **innerhalb** eines gequoteten Arguments (`rg 'sudo -|x'`,
+/// `git commit -m 'use sudo'`) und ein Teilwort (`sudo_exec`,
+/// `/etc/sudoers`) sind nie ein Treffer. Das ist eine Heuristik gegen
+/// versehentliches und naives `sudo` über `shell.exec`, keine vollständige
+/// Shell-Analyse — die eigentliche Grenze bleibt, dass `shell.exec` auf dem
+/// Host jeden Befehlstext einzeln freigeben lässt und in der Sandbox
+/// `no_new_privs` gilt.
 ///
 /// # Rückgabe
 /// Der Name des gefundenen Werkzeugs, sonst `None`.
 #[must_use]
 pub fn escalation_program(command: &str) -> Option<&'static str> {
-    let normalized: String = command
-        .replace("$(", "\n")
-        .chars()
-        .filter(|c| !matches!(c, '\'' | '"' | '\\'))
-        .map(|c| match c {
-            ';' | '&' | '|' | '(' | ')' | '{' | '}' | '`' | '\n' | '\r' => '\n',
-            other => other,
-        })
-        .collect();
-    for segment in normalized.split('\n') {
+    escalation_program_at_depth(command, 0)
+}
+
+/// [`escalation_program`] mit Rekursionstiefe für `sh -c`.
+fn escalation_program_at_depth(command: &str, depth: u8) -> Option<&'static str> {
+    for segment in command_segments(command) {
         let mut after_wrapper = false;
-        for word in segment.split_whitespace() {
+        let mut words = segment.iter();
+        while let Some(word) = words.next() {
             let is_assignment = word
                 .split_once('=')
                 .is_some_and(|(name, _)| !name.is_empty() && !name.contains('/'));
@@ -700,6 +899,20 @@ pub fn escalation_program(command: &str) -> Option<&'static str> {
             if let Some(found) = escalation_name(word) {
                 return Some(found);
             }
+            if depth < MAX_SHELL_C_DEPTH && SHELL_INTERPRETERS.contains(&basename(word)) {
+                // `bash -c 'cmd'`, `sh -lc "cmd"`: das Argument nach der
+                // ersten Option mit `c` ist selbst eine Befehlszeile.
+                let mut rest = words.by_ref().skip_while(|arg| {
+                    !(arg.starts_with('-') && !arg.starts_with("--") && arg.contains('c'))
+                });
+                if rest.next().is_some() {
+                    if let Some(script) = rest.next() {
+                        if let Some(found) = escalation_program_at_depth(script, depth + 1) {
+                            return Some(found);
+                        }
+                    }
+                }
+            }
             break;
         }
     }
@@ -707,13 +920,30 @@ pub fn escalation_program(command: &str) -> Option<&'static str> {
 }
 
 /// Meldung für `shell.exec`, wenn [`escalation_program`] anschlägt.
+///
+/// # Beschreibung
+/// `shell.exec` kennt die Rolle des Aufrufers nicht; die Meldung nennt
+/// deshalb alle drei Wege in Reihenfolge: selbst `host.sudo_exec` rufen
+/// (nur `uia-shell-worker`/`host-process-worker` in der TUI), sonst an
+/// `uia-shell-worker` delegieren, sonst den Schritt mit exaktem argv an den
+/// Elternteil/die UIA zurückgeben. Sie sagt ausdrücklich, dass sudo
+/// **möglich** ist — ohne diesen Satz gaben Modelle auf („sudo geht nicht“)
+/// oder reichten den Befehl an die Nutzerin weiter.
 #[must_use]
 pub fn shell_escalation_message(program: &str) -> String {
     format!(
-        "shell.exec: `{program}` ist über shell.exec nicht erlaubt. Root-Befehle laufen \
-         ausschließlich über das Werkzeug `{SUDO_EXEC_TOOL}` mit exaktem argv (ohne `{program}`) \
-         und Freigabe im TUI-Fenster; dieses Werkzeug steht nur uia-shell-worker und \
-         host-process-worker in der TUI zur Verfügung."
+        "shell.exec: `{program}` läuft nicht über shell.exec — sudo selbst funktioniert aber: \
+         Root-Befehle laufen über das Werkzeug `{SUDO_EXEC_TOOL}` mit exaktem argv (ohne \
+         `{program}`) und Grund. Der Nutzer bestätigt den exakten Befehl im Freigabefenster \
+         der TUI und gibt dort sein Passwort ein, falls sudo eines verlangt (passwortloses \
+         sudo geht ebenso). So gehst du vor: Hast du `{SUDO_EXEC_TOOL}` (uia-shell-worker, \
+         host-process-worker), rufe es jetzt auf. Sonst delegiere den Schritt mit \
+         `transfer_to_uia-shell-worker` (exakter Befehl + Grund), wenn du das Werkzeug hast; \
+         andernfalls gib ihn mit exaktem argv und Grund an deinen Elternteil bzw. die UIA \
+         zurück (Ergebnis oder `parent.message`). Nie ein Passwort in Chat oder Befehl, nie \
+         `sudo -S` oder `echo … | sudo`. Sag nie, sudo sei unmöglich. Nur ohne TUI (serve, \
+         telegram, one-shot) fehlt dieser Weg — dann nenne dem Nutzer den exakten Befehl zum \
+         Selbstausführen."
     )
 }
 
@@ -1595,11 +1825,14 @@ impl ToolProvider for SudoToolProvider {
     fn tools(&self) -> Vec<ToolSpec> {
         vec![ToolSpec::Function(FunctionToolSpec {
             name: ToolName::new(SUDO_EXEC_TOOL),
-            description: "Run ONE command as root on the local host via sudo. The user approves \
-                every call in a dedicated TUI window (the password never reaches you). argv runs \
-                exactly as given, without a shell. Returns exit_code/stdout/stderr, or an error if \
+            description: "Run ONE command as root on the local host via sudo. sudo works: the \
+                user sees the exact argv and your reason in a TUI approval window, confirms and \
+                types their sudo password there if sudo asks (passwordless sudo works too). The \
+                password never reaches you — never ask for it in chat, put it into a command or \
+                use `sudo -S`/`echo … | sudo`. Returns exit_code/stdout/stderr, or an error if \
                 the user denied it or authentication failed — then do not retry on your own, ask \
-                the user. Never call sudo via shell.exec."
+                the user. Never call sudo via shell.exec; never say sudo is impossible while this \
+                tool is available."
                 .to_owned(),
             parameters: Self::parameter_schema(),
             strict: true,
@@ -1861,6 +2094,21 @@ mod tests {
             "timeout 10 su -c id",
             "s\"u\"do id",
             "if true; then run0 id; fi",
+            "sudo apt install x",
+            "cd /; sudo -i",
+            "echo x | sudo tee f",
+            "env FOO=1 sudo ls",
+            "true || sudo id",
+            "echo \"$(sudo id)\"",
+            "echo `doas id`",
+            "(sudo id)",
+            "xargs -0 sudo rm < list",
+            "time sudo id",
+            "exec sudo id",
+            "FOO='a b' sudo id",
+            "bash -c 'sudo id'",
+            "sh -lc \"apt update && sudo apt upgrade\"",
+            "ls\nsudo id",
         ] {
             assert!(escalation_program(command).is_some(), "{command}");
         }
@@ -1871,8 +2119,61 @@ mod tests {
             "echo sudo",
             "cat /etc/sudoers.d/x",
             "git commit -m 'use sudo later'",
+            // Realer Fehlalarm: `sudo` nur im gequoteten Suchmuster.
+            "rg -n 'sudo_exec|passwordless|passwd|Command::new|sudo -|sudo-Freigabe|sudo wird|\
+             sudo.*abgelehnt' ~/Harwness/harw-tui/src/sudo_dialog.rs",
+            "grep -E \"x|sudo -S\" f",
+            "echo 'a; sudo id'",
+            "echo \"a && sudo id\"",
+            "rg sudo_exec src/",
+            "echo x # ; sudo id",
+            "bash -c 'echo sudo'",
+            "bash script.sh sudo",
         ] {
             assert_eq!(escalation_program(command), None, "{command}");
+        }
+    }
+
+    #[test]
+    fn test_command_segments_respect_quotes_and_substitutions() {
+        assert_eq!(
+            command_segments("rg -n 'a|sudo -' f && echo \"x;y\" | wc"),
+            vec![
+                vec![
+                    "rg".to_owned(),
+                    "-n".to_owned(),
+                    "a|sudo -".to_owned(),
+                    "f".to_owned()
+                ],
+                vec!["echo".to_owned(), "x;y".to_owned()],
+                vec!["wc".to_owned()],
+            ]
+        );
+        assert_eq!(
+            command_segments("echo \"$(id -u)\" s\"u\"do"),
+            vec![
+                vec!["id".to_owned(), "-u".to_owned()],
+                vec!["echo".to_owned(), String::new(), "sudo".to_owned()],
+            ]
+        );
+    }
+
+    #[test]
+    fn test_shell_escalation_message_is_actionable() {
+        let text = shell_escalation_message("sudo");
+        for phrase in [
+            "sudo selbst funktioniert",
+            SUDO_EXEC_TOOL,
+            "gibt dort sein Passwort ein",
+            "passwortloses sudo geht ebenso",
+            "`transfer_to_uia-shell-worker`",
+            "an deinen Elternteil bzw. die UIA",
+            "exaktem argv",
+            "nie `sudo -S`",
+            "Sag nie, sudo sei unmöglich",
+            "Nur ohne TUI",
+        ] {
+            assert!(text.contains(phrase), "fehlt „{phrase}“: {text}");
         }
     }
 
@@ -1910,7 +2211,7 @@ mod tests {
     #[test]
     fn test_clean_stderr_drops_marker_and_prompt_lines() {
         let cleaned = clean_stderr(
-            b"harw-sudo-x:Sorry, try again.\n[sudo] password for mia: \nreal error\n",
+            b"harw-sudo-x:Sorry, try again.\n[sudo] password for alice: \nreal error\n",
             b"harw-sudo-x:",
         );
         assert_eq!(cleaned, "real error");
@@ -1919,7 +2220,7 @@ mod tests {
     #[test]
     fn test_audit_record_redacts_to_fields_without_any_secret_field() -> TestResult {
         let record = SudoAuditRecord {
-            operator: "mia".to_owned(),
+            operator: "alice".to_owned(),
             session: "s1".to_owned(),
             worker: "uia-shell-worker".to_owned(),
             argv: display_argv(&["apt-get".to_owned(), "install".to_owned(), "a b".to_owned()]),
@@ -2357,6 +2658,14 @@ mod tests {
             let text = rendered(&output);
             assert!(matches!(output, ToolOutput::Error { .. }), "{command}");
             assert!(text.contains(SUDO_EXEC_TOOL), "{command}: {text}");
+            assert!(
+                text.contains("sudo selbst funktioniert"),
+                "{command}: {text}"
+            );
+            assert!(
+                text.contains("transfer_to_uia-shell-worker"),
+                "{command}: {text}"
+            );
         }
         Ok(())
     }

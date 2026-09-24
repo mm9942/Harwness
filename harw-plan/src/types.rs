@@ -316,7 +316,7 @@ pub struct EvidenceRef {
     /// Zeitpunkt, zu dem der Nachweis angehängt wurde.
     #[serde(with = "time::serde::rfc3339")]
     pub attached_at: OffsetDateTime,
-    /// Akteur, der den Nachweis angehängt hat (z. B. `"worker-abc"`, `"human:mia"`).
+    /// Akteur, der den Nachweis angehängt hat (z. B. `"worker-abc"`, `"human:alice"`).
     pub actor: String,
     /// Digest des Nachweisinhalts, sofern er inhaltsadressiert vorliegt.
     ///

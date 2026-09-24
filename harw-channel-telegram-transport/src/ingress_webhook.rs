@@ -297,7 +297,7 @@ mod tests {
     }
 
     fn update_body() -> &'static str {
-        r#"{"update_id":42,"message":{"message_id":9,"chat":{"id":123,"type":"private"},"from":{"id":8,"is_bot":false,"first_name":"Mia"},"text":"hello"}}"#
+        r#"{"update_id":42,"message":{"message_id":9,"chat":{"id":123,"type":"private"},"from":{"id":8,"is_bot":false,"first_name":"Alice"},"text":"hello"}}"#
     }
 
     async fn call(config: WebhookConfig, request: Request<Body>) -> StatusCode {
@@ -369,7 +369,7 @@ mod tests {
                 config(sender)?,
                 request(
                     Some("correct-secret"),
-                    r#"{"update_id":43,"callback_query":{"id":"query","from":{"id":8,"is_bot":false,"first_name":"Mia"}}}"#,
+                    r#"{"update_id":43,"callback_query":{"id":"query","from":{"id":8,"is_bot":false,"first_name":"Alice"}}}"#,
                 )?,
             )
             .await,
@@ -536,7 +536,7 @@ mod tests {
     }
 
     fn callback_body() -> &'static str {
-        r#"{"update_id":77,"callback_query":{"id":"cb-1","from":{"id":8,"is_bot":false,"first_name":"Mia"},"message":{"message_id":9,"chat":{"id":123,"type":"private"},"text":"approve?"},"data":"opaque-token"}}"#
+        r#"{"update_id":77,"callback_query":{"id":"cb-1","from":{"id":8,"is_bot":false,"first_name":"Alice"},"message":{"message_id":9,"chat":{"id":123,"type":"private"},"text":"approve?"},"data":"opaque-token"}}"#
     }
 
     fn config_with_consumer(
@@ -622,7 +622,7 @@ mod tests {
                     config.clone(),
                     request(
                         Some("correct-secret"),
-                        r#"{"update_id":43,"callback_query":{"id":"query","from":{"id":8,"is_bot":false,"first_name":"Mia"}}}"#,
+                        r#"{"update_id":43,"callback_query":{"id":"query","from":{"id":8,"is_bot":false,"first_name":"Alice"}}}"#,
                     )?,
                 )
                 .await,

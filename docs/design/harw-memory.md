@@ -1,85 +1,85 @@
 # harw-memory — Long-Term Memory & Continuous Improvement
 
-**Status:** Design (2026-07-16)
-**Owner:** harw-memory crate
+> Status: implemented · Last reviewed: 2026-09-24
 
-## Zweck
+## Purpose
 
-Persistente, tokensparsame Memory-Schicht für Agent-Sessions. Kombiniert das
-Beste aus drei Inspirationen:
+A persistent, token-frugal memory layer for agent sessions, combining tiered
+storage (HOT/WARM/COLD), append-only signal logging, and periodic
+consolidation.
 
-- **ClawHub `memory` / `self-improving`** — Tiered HOT/WARM/COLD, Indices, "never infer from silence".
-- **Codex `memories/`** — Zwei-Phasen-Pipeline: Rollout-Extraktion (parallel) → globale Konsolidierung (seriell, LLM-Agent).
-- **Hermes `~/.hermes/memories/MEMORY.md`** — radikale Minimalität als Fallback-Kern.
+## Non-goals
 
-## Nicht-Ziele
+- No external database (SQLite optional, not required).
+- No automatic model call on every turn.
+- No "silent inference" — memory is only written from an explicit signal
+  (correction, post-task reflection, or a pattern repeated 3+ times).
+- Not a replacement for skill configs or role definitions.
 
-- Keine externe DB (SQLite optional in Phase 2, nicht MVP).
-- Kein automatischer LLM-Call auf jedem Turn.
-- Kein "Silent Inference" — es wird nur gelernt, was explizit signalisiert wird
-  (Korrektur, Reflexion nach Task, ≥3× wiederholte Instruktion).
-- Kein Ersatz für Skill-Configs oder Rollen-Definitionen.
+## Core principles
 
-## Kernprinzipien
+1. **Token budget first.** HOT is bounded to ≤100 lines (~2 KB) by
+   construction. WARM/COLD are only loaded on a match.
+2. **Explicit over implicit.** Signals are appended when the user corrects
+   something or a reflection is signaled after a turn.
+3. **Append-only + periodic consolidation.** Signals are written append-only;
+   promotion/demotion runs in a separate, idempotent `maintain()` pass.
+4. **Local-first.** All data on local disk, no network access on the default
+   path.
 
-1. **Token-Budget zuerst.** HOT ist per Konstruktion ≤100 Zeilen (~2 KB). WARM/COLD werden nur geladen, wenn ein Match zutrifft.
-2. **Explizit vor implizit.** Signale werden angehängt, wenn der User korrigiert oder eine Reflexion nach einem Turn signalisiert.
-3. **Append-only + periodische Konsolidierung.** Signale werden append-only geschrieben; Promotion/Demotion läuft in einer separaten `maintain()`-Pass (idempotent).
-4. **Local-first.** Alle Daten auf der lokalen Platte, kein Netzwerkzugriff im Standardpfad.
-5. **Verhaltenskompatibel mit Hermes.** Wenn kein Setup existiert, verhält sich das Crate wie Hermes: eine `MEMORY.md`, `§`-delimitiert.
+## On-disk layout
 
-## Layout auf Platte
-
-Default-Wurzel: `<HARWNESS_HOME>/memory/` (fällt auf `~/.harwness/memory/` zurück).
+Default root: `<HARWNESS_HOME>/memory/` (falls back to `~/.harwness/memory/`).
 
 ```
 <home>/memory/
-├── HOT.md                # ≤100 Zeilen; immer geladen; von Hand oder Consolidation-Agent geschrieben
-├── INDEX.md              # Tier-Übersicht (Zähler, Timestamps)
+├── HOT.md                # <=100 lines; always loaded; hand- or agent-written
+├── INDEX.md              # tier overview (counters, timestamps)
 ├── warm/
-│   ├── INDEX.md          # <namespace> → Datei-Pfad, size, last_used
-│   └── {namespace}.md    # z. B. project/harwness.md, domain/rust.md
+│   ├── INDEX.md          # <namespace> -> file path, size, last_used
+│   └── {namespace}.md    # e.g. project/harwness.md, domain/rust.md
 ├── cold/
-│   └── {archived}.md     # Namensschema wie warm/
+│   └── {archived}.md     # same naming scheme as warm/
 ├── signals/
 │   ├── corrections.jsonl # append-only, NDJSON
 │   ├── reflections.jsonl # append-only
-│   └── patterns.jsonl    # candidates mit Zähler
+│   └── patterns.jsonl    # candidates with a counter
 └── state.json            # last_maintenance, usage_counters, promotion_state
 ```
 
 ## Tiers
 
-| Tier | Ort | Größenlimit | Load-Semantik | Persistenz |
+| Tier | Location | Size limit | Load semantics | Persistence |
 |------|-----|-------------|---------------|------------|
-| HOT | `HOT.md` | ≤100 Zeilen | Bei jedem Session-Start | User- oder Agent-editiert |
-| WARM | `warm/{ns}.md` | ≤200 Zeilen/Datei | Bei `recall(query)` mit Namespace-/Keyword-Match | Auto (Promotion aus signals) |
-| COLD | `cold/{ns}.md` | unbegrenzt | Nur bei expliziter Anfrage | Auto (Demotion aus WARM) |
+| HOT | `HOT.md` | <=100 lines | On every session start | User- or agent-edited |
+| WARM | `warm/{ns}.md` | <=200 lines/file | On `recall(query)` with a namespace/keyword match | Auto (promoted from signals) |
+| COLD | `cold/{ns}.md` | unbounded | Only on explicit request | Auto (demoted from WARM) |
 
-## Übergänge
+## Transitions
 
-- **Signal → WARM:** Ein Muster in `patterns.jsonl` wird bei ≥3 Vorkommen in 7 Tagen zu einer WARM-Zeile (mit User-Bestätigung — nicht stumm).
-- **WARM → HOT:** Explizite Nutzer-Bestätigung (`/memory promote <ns>`) oder ≥3 Recall-Hits in 7 Tagen.
-- **WARM → COLD:** 30 Tage kein Recall.
-- **COLD → gelöscht:** Nie ohne User-Bestätigung.
+- **Signal -> WARM:** a pattern in `patterns.jsonl` becomes a WARM line after
+  3+ occurrences in 7 days.
+- **WARM -> HOT:** explicit user confirmation (`/memory promote <ns>`).
+- **WARM -> COLD:** no recall for 30 days.
+- **COLD -> deleted:** never without user confirmation.
 
-## Rust-API (Skeleton)
+## Rust API (core trait)
 
 ```rust
 pub trait Memory: Send + Sync {
-    /// HOT tier als kompletter Text (≤100 Zeilen garantiert).
+    /// HOT tier as full text (<=100 lines guaranteed).
     fn hot(&self) -> Result<String, MemoryError>;
 
-    /// Recall WARM/COLD anhand Namespace + Keyword.
+    /// Recall WARM/COLD by namespace + keyword.
     fn recall<'a>(&self, query: RecallQuery<'a>) -> Result<Vec<Entry>, MemoryError>;
 
-    /// Signal anhängen (append-only).
+    /// Append a signal (append-only).
     fn record(&self, signal: Signal) -> Result<(), MemoryError>;
 
-    /// Wartung: Promotion, Decay, Compaction. Idempotent, seriell (single-lock).
+    /// Maintenance: promotion, decay, compaction. Idempotent, single-locked.
     fn maintain(&self) -> Result<MaintenanceReport, MemoryError>;
 
-    /// Statistik ohne Content-Load — nur Zähler/Timestamps.
+    /// Stats without loading content — counters/timestamps only.
     fn stats(&self) -> Result<Stats, MemoryError>;
 }
 
@@ -88,49 +88,35 @@ pub enum Signal {
     Reflection { context: String, lesson: String },
     PatternHint { key: String, note: String },
 }
-
-pub struct RecallQuery<'a> {
-    pub namespace: Option<&'a str>,
-    pub keywords: &'a [&'a str],
-    pub include_cold: bool,
-    pub limit: usize,
-}
 ```
 
-## Integration in harwness
+This is the original crate skeleton; the current implementation extends it
+with the short-term ring buffer, the fact store, and the router described in
+`docs/design/memory-v2.md` and `docs/design/memory-v3-ltm.md`.
 
-- **OpContext-Service.** `Arc<dyn Memory>` in `ServiceMap`. Ops holen es per `ctx.service::<Arc<dyn Memory>>()`.
-- **System-Prompt-Injection.** Der Turn-Loop hängt `memory.hot()` an den System-Prompt an, nach den Rollen-Instructions.
-- **Slash-Command `/memory`.** Subcommands: `list`, `recall <keywords>`, `record correction <text>`, `record reflection <lesson>`, `promote <ns>`, `demote <ns>`, `stats`, `maintain`.
-- **Tracing.** Jeder `recall` / `record` / `maintain` emittiert Spans mit `namespace`, `tier`, `hit_count`, `bytes_loaded` — direkt in die Wave-3-Token-Statuszeile speisbar.
+## Integration in Harwness
 
-## Vergleich zu den drei Inspirationen
+- **OpContext service.** `Arc<dyn Memory>` lives in `ServiceMap`; operations
+  fetch it via `ctx.service::<Arc<dyn Memory>>()`.
+- **System-prompt injection.** The turn loop appends `memory.hot()` to the
+  system prompt, after the role instructions.
+- **Slash command `/memory`.** Subcommands: `list`, `recall <keywords>`,
+  `record correction <text>`, `record reflection <lesson>`, `promote <ns>`,
+  `demote <ns>`, `stats`, `maintain`.
+- **Tracing.** Every `recall` / `record` / `maintain` emits spans with
+  `namespace`, `tier`, `hit_count`, `bytes_loaded`.
 
-| Aspekt | Hermes | Codex | ClawHub | **harw-memory** |
-|--------|--------|-------|---------|-----------------|
-| Tiers | keine | 2 Phasen | 3 (HOT/WARM/COLD) | 3 |
-| Trigger | manuell | Session-Start (async) | Auf Signal | Auf Signal + optional Session-Start |
-| Konsolidierung | keine | LLM-Agent (Phase 2) | Regel-basiert | Regel-basiert + LLM opt-in |
-| Storage | 1 Datei | State-DB + Git-Baseline | Dateien + INDEX | Dateien + JSONL-Signals |
-| Learning-Quelle | User schreibt | Rollout-Extraktion | Korrekturen | Korrekturen + Reflexionen |
-| Silent Inference | ja | ja (LLM entscheidet) | **nein** | **nein** |
-| Token-Kosten | 8 Zeilen | hoch (Phase 1+2) | mittel | **niedrig** (HOT ≤100 Zeilen) |
+## Security
 
-## Milestones
+- No secrets in memory (redaction filter on `record`).
+- No network access on the default path.
+- Never stores credentials, health data, or third-party PII.
 
-- **M1** — Crate-Skeleton + `FileMemoryStore` + trait + Tests (kein LLM, keine Consolidation-Pipeline).
-- **M2** — OpContext-Integration + `/memory`-Slash-Command + System-Prompt-Injection.
-- **M3** — Signal-Auto-Detection (`Correction`-Heuristik auf User-Nachrichten).
-- **M4** — Opt-in Consolidation-Agent (Codex-Phase-2-Analog): LLM merged WARM→HOT auf Anfrage.
+## Implementation
 
-## Sicherheit
-
-- Keine Secrets in Memory (Redaction-Filter auf `record`).
-- Kein Netzwerkzugriff im Standardpfad.
-- `boundaries.md`-Regel: nie Credentials, Health-Data, Third-Party-PII.
-
-## Offene Fragen
-
-1. Sollen Memories per-Session sein oder global? (Vorschlag: global per default, per-Session als Namespace).
-2. Wie interagiert `harw-memory` mit `harw-session-store`? (Vorschlag: getrennt — Session-Store ist Turn-History, Memory ist verdichtete Erkenntnis).
-3. Format `HOT.md` als frei-Text oder strukturiert? (Vorschlag: `§`-delimitiert wie Hermes, plus optionale YAML-Front-Matter je Block).
+Implemented (see `harw-memory/src/store.rs`, `types.rs`, `file_store.rs`,
+`detect.rs`, `learning.rs`, `heartbeat.rs`, `promote.rs`, `facts.rs`,
+`short_term.rs`, `extraction.rs`, `consolidation.rs`). See
+`docs/design/memory-v2.md` for the STM/heartbeat/learning layer and
+`docs/design/memory-v3-ltm.md` for the fact store, scopes, and
+extraction/consolidation pipeline.

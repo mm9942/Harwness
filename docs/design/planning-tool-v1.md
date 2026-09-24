@@ -1,15 +1,21 @@
-# harw-plan v1 — First-Class Planning-Tool
+# harw-plan v1 — First-Class Planning Tool
 
-**Status:** Design-Anker.
-**Bindend:** `coding-philosophy.md` §6 (Planning ist First-Class), §7 (Plan ist Executable Dependency Graph), §8 (WriteSet-Disjunktheit), §15 (Failure/Recovery), §19 (Authority nicht durch Prosa). Zusätzlich `philosophy.md` §5 (Goal ≠ Plan), §6 (Modell besitzt keine Prozesse), §12 (monotone Authority-Reduktion).
+> Status: implemented · Last reviewed: 2026-09-24
 
-Diese Version ist ein **Vertical Slice**: ein neues Crate `harw-plan` mit Kern-Datentypen, In-Memory- und File-Store, Validation und einer minimalen synchronen API. Adapter (Command / Model-Tool / Channel), MCP-Bridge und TUI-Projektion kommen in Folge-Waves — nicht in diesem Slice (coding-philosophy §11).
+Binding: `coding-philosophy.md` §6 (planning is first-class), §7 (a plan is
+an executable dependency graph), §8 (write-scope disjointness), §15
+(failure/recovery), §19 (authority not established by prose). Also
+`philosophy.md` §5 (goal != plan), §6 (the model does not own processes), §12
+(monotone authority reduction).
 
----
+This design describes a **vertical slice**: a crate `harw-plan` with core
+data types, an in-memory and a file store, validation, and a minimal
+synchronous API. Adapters (command / model tool / channel), the MCP bridge,
+and TUI projection were follow-on work, not part of this slice.
 
-## 1. Verantwortungsbereich
+## 1. Scope
 
-Genau die Semantik aus coding-philosophy.md §6.1:
+Exactly the semantics from `coding-philosophy.md` §6.1:
 
 ```
 create plan | inspect plan | add or update node | declare dependency |
@@ -18,11 +24,10 @@ mark node ready | mark node blocked | invalidate stale nodes |
 record evidence | close or supersede plan revision
 ```
 
-Ausdrücklich nicht: Job-Admission, Executor-Aufruf, LLM-Interaktion. Das Planning-Tool **beschreibt** Arbeit — es **führt** keine aus.
+Explicitly not: job admission, executor invocation, LLM interaction. The
+planning tool **describes** work — it does not **execute** any.
 
----
-
-## 2. Kern-Typen (verbindlich)
+## 2. Core types
 
 ```rust
 // harw-plan/src/types.rs
@@ -67,7 +72,7 @@ pub struct EvidenceRef {
     pub locator: String,       // path, url, id
     #[serde(with = "time::serde::rfc3339")]
     pub attached_at: OffsetDateTime,
-    pub actor: String,         // "worker-abc", "orchestrator", "human:mia"
+    pub actor: String,         // "worker-abc", "orchestrator", "human:alice"
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -104,7 +109,9 @@ pub struct Plan {
 }
 ```
 
-`PlanId`, `TaskId`, `RevisionId`, `PathOrSymbol`, `ContractRef` leben in `harw-types`. Wenn dort nicht vorhanden: als Newtype in `harw-plan/src/ids.rs` deklarieren mit TODO-Kommentar für spätere Umsiedlung. **Kein Cross-Crate-Editier-Impuls im Skeleton-Fanout.**
+`PlanId`, `TaskId`, `RevisionId`, `PathOrSymbol`, `ContractRef` live in
+`harw-types`. Where not present there, declared as a newtype in
+`harw-plan/src/ids.rs` with a TODO comment for later relocation.
 
 ---
 
@@ -128,11 +135,12 @@ pub enum PlanAction {
 }
 ```
 
-Jede Mutation wird über `PlanStore::apply(action) -> PlanResult<PlanEvent>` gefahren. Reine Wert-Actions; kein `&mut PlanNode` in der API-Signatur.
+Every mutation runs through `PlanStore::apply(action) -> PlanResult<PlanEvent>`.
+Actions are plain values; there is no `&mut PlanNode` in the API signature.
 
 ---
 
-## 4. Store-Trait und Referenz-Implementierungen
+## 4. Store trait and reference implementations
 
 ```rust
 // harw-plan/src/store.rs
@@ -145,36 +153,43 @@ pub trait PlanStore: Send + Sync {
 }
 ```
 
-Zwei Implementierungen im Slice:
+Two implementations in this slice:
 
-- `InMemoryPlanStore` — für Tests, RwLock-gebunden.
-- `FilePlanStore` — persistent unter `<root>/plans/<plan_id>/rev-<n>.json` plus `history.jsonl` (append-only Event-Log).
+- `InMemoryPlanStore` — for tests, RwLock-backed.
+- `FilePlanStore` — persistent under `<root>/plans/<plan_id>/rev-<n>.json`
+  plus `history.jsonl` (append-only event log).
 
-Beide sind `Send + Sync`.
+Both are `Send + Sync`.
 
 ---
 
 ## 5. Validation (coding-philosophy §6.3)
 
-**Datei:** `harw-plan/src/validate.rs`.
+**File:** `harw-plan/src/validate.rs`.
 
-Vor `apply` muss `validate(&plan, &action)` bestehen. Verbindliche Regeln:
+`validate(&plan, &action)` must pass before `apply`. Binding rules:
 
-- Referenzierte Nodes existieren.
-- `AddDependency` erzeugt keinen Zyklus (DFS im Dependency-Graph).
-- `SetStatus` folgt einer legalen Übergangs-Matrix (Draft→Ready→InProgress→Completed/Blocked; Superseded ist terminal).
-- `SetStatus(Completed)` verlangt mindestens ein `EvidenceRef`.
-- `AddNode` erzwingt: `forbidden_scope ∩ write_scope == ∅`.
-- `AddNode` erzwingt: `write_scope` disjunkt zu allen aktiven `write_scope` von Nodes im Status `Ready | InProgress` (coding-philosophy §8).
-- `Supersede` erhöht `revision` monoton.
-- `Invalidate` legaler nur für Nodes ≠ `Completed` (bereits committete Arbeit wird nur via Supersede ungültig).
-- `AttachEvidence` ist idempotent auf `(id, kind, locator)`.
+- Referenced nodes exist.
+- `AddDependency` never creates a cycle (DFS over the dependency graph).
+- `SetStatus` follows a legal transition matrix
+  (Draft→Ready→InProgress→Completed/Blocked; Superseded is terminal).
+- `SetStatus(Completed)` requires at least one `EvidenceRef`.
+- `AddNode` enforces `forbidden_scope ∩ write_scope == ∅`.
+- `AddNode` enforces that `write_scope` is disjoint from every active
+  `write_scope` of nodes in status `Ready | InProgress` (coding-philosophy
+  §8).
+- `Supersede` increases `revision` monotonically.
+- `Invalidate` is only legal for nodes that are not `Completed` (already
+  committed work is only invalidated via `Supersede`).
+- `AttachEvidence` is idempotent on `(id, kind, locator)`.
 
-Fehler in `PlanError` mit Varianten `CycleDetected`, `IllegalTransition`, `ScopeConflict`, `NodeMissing`, `RevisionRegressed`, `EvidenceMissing`, `ForbiddenScopeOverlap`, `Io`, `Serde`.
+Errors live in `PlanError` with variants `CycleDetected`,
+`IllegalTransition`, `ScopeConflict`, `NodeMissing`, `RevisionRegressed`,
+`EvidenceMissing`, `ForbiddenScopeOverlap`, `Io`, `Serde`.
 
 ---
 
-## 6. Konfiguration (coding-philosophy §6.4)
+## 6. Configuration (coding-philosophy §6.4)
 
 ```toml
 [tools.plan]
@@ -186,54 +201,53 @@ validate_write_conflicts = true
 max_nodes = 256
 ```
 
-`enabled = false` muss die Registrierung **komplett** entfernen. Im Slice:
+`enabled = false` must remove the registration **completely**:
 
-- `PlanToolConfig` struct mit `#[serde(default)]` auf allen Feldern; Default = disabled außer für Tests.
-- `PlanStore` wird nur konstruiert, wenn `PlanToolConfig::is_enabled()`.
-- Wenn deaktiviert: **kein** `pub use` und **kein** Registry-Eintrag. Der Consumer bekommt zur Compile-Zeit einen `Option<Arc<dyn PlanStore>>` oder gar keine Referenz.
+- `PlanToolConfig` struct with `#[serde(default)]` on every field; default is
+  disabled except for tests.
+- `PlanStore` is only constructed when `PlanToolConfig::is_enabled()`.
+- When disabled: **no** `pub use` and **no** registry entry. The consumer
+  gets an `Option<Arc<dyn PlanStore>>` at compile time, or no reference at
+  all.
 
 ---
 
 ## 7. Authority (coding-philosophy §19)
 
-Untrusted `PlanAction`-Inputs dürfen nie:
+Untrusted `PlanAction` inputs may never:
 
-- `actor` selbst wählen (der Runtime setzt den Actor auf Basis der Session).
-- `plan_id` außerhalb der eigenen Session ändern.
-- `revision` direkt setzen (nur `apply` erhöht sie).
-- `created_at`/`updated_at` überschreiben (Runtime-Timestamps).
+- choose `actor` themselves (the runtime sets the actor from the session),
+- change `plan_id` outside their own session,
+- set `revision` directly (only `apply` increments it),
+- overwrite `created_at`/`updated_at` (runtime timestamps).
 
-Diese Regeln werden im `apply` durch das Verwerfen entsprechender Payload-Felder erzwungen — nicht durch Prompt-Vertrauen.
+These rules are enforced in `apply` by discarding the corresponding payload
+fields — not by trusting the prompt.
 
 ---
 
-## 8. Vertical-Slice-Grenzen (coding-philosophy §11)
+## 8. Vertical-slice boundaries (coding-philosophy §11)
 
-**Im Slice enthalten:**
+**In the slice:**
 
-- Alle Typen aus §2.
+- All types from §2.
 - `PlanAction` (§3).
-- `PlanStore`-Trait mit `InMemoryPlanStore` + `FilePlanStore`.
-- Vollständige Validation (§5) mit Tests pro Regel.
-- `PlanToolConfig` mit `enabled = false`-Default (§6).
+- The `PlanStore` trait with `InMemoryPlanStore` + `FilePlanStore`.
+- Full validation (§5) with a test per rule.
+- `PlanToolConfig` with an `enabled = false` default (§6).
 
-**Nicht im Slice:**
+**Not in the slice (follow-on work):**
 
-- Adapter (Command / Model-Tool / Channel) — Folge-Wave.
-- MCP-Bridging — Folge-Wave.
-- TUI-Projektion — Folge-Wave.
-- Cross-Crate-Konsumenten (`harw-job-runtime`, `harw-tools`) — Folge-Wave.
+- Adapters (command / model tool / channel).
+- MCP bridging.
+- TUI projection.
+- Cross-crate consumers (`harw-job-runtime`, `harw-tools`).
 
-Der Slice ist selbst-verifizierend über `cargo test -p harw-plan`.
+The slice is self-verifying via `cargo test -p harw-plan`.
 
----
+## Implementation
 
-## 9. Fanout-Aufteilung
-
-Ein einzelner Focused-Coding-Task-Agent bekommt das komplette Slice-Crate. Kein Sub-Fanout, weil:
-
-- die Module (`types.rs`, `actions.rs`, `store.rs`, `file_store.rs`, `validate.rs`, `error.rs`, `config.rs`, `lib.rs`) sich gegenseitig referenzieren — Interface-Drift zwischen parallelen Workern wäre teuer;
-- der ganze Slice ~800 LOC — bounded genug für einen Worker;
-- coding-philosophy §13: „Tightly coupled work should remain under one atomic owner".
-
-**Der Worker bekommt diesen Design-Doc als Vertrag und hat keine architektonische Freiheit.**
+Implemented: `harw-plan/src/{types,actions,store,file_store,validate,
+memory_store,ids,config,error}.rs`, plus later additions
+(`admission.rs`, `catalog.rs`, `goal.rs`, `goal_store.rs`, `graph.rs`,
+`mutation.rs`) beyond this original slice.

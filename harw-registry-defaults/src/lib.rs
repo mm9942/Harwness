@@ -86,6 +86,9 @@ use harw_extension_api::{
 };
 use harw_instructions::AgentIdentity;
 use harw_project_discovery::ProjectContext;
+// Remote-OCR-Status von `doc.read_pdf`; re-exportiert, damit die TUI den
+// Freigabe-Hinweis ohne eigene `harw-tool-doc`-Kante testen kann.
+pub use harw_tool_doc::{RemoteOcrApproval, RemoteOcrTarget, remote_ocr_target};
 
 pub use agent_definition_tools::{
     AgentDefinitionToolProvider, DefinitionAuthorCeiling, DefinitionWriteMode,
@@ -165,7 +168,10 @@ pub const AUTO_APPROVED_TOOLS: &[&str] = &[
     // PDF-Datei aus dem Workspace seitenweise als Text/Markdown — dieselbe
     // Berechtigung (`Permission::ReadWorkspace`) und dieselbe read-only
     // Eigenschaft wie `fs.read`, erscheint deshalb überall, wo ein lesender
-    // FS-Provider registriert wird (siehe `profile::DOC_TOOLS`).
+    // FS-Provider registriert wird (siehe `profile::DOC_TOOLS`). Ausnahme:
+    // würde der Aufruf die Datei an einen Remote-OCR-Dienst schicken und
+    // steht `[tools.doc].remote_ocr` auf `ask`, fragt `review` unter
+    // `ask`/`auto` trotzdem (siehe [`remote_ocr_requires_approval`]).
     "doc.read_pdf",
     // Workspace-Explorer (`harw-tool-explorer`) — Baum, Projekte, Relationen,
     // Suche ab der Workspace-Wurzel; rein lesend, `Permission::ReadWorkspace`
@@ -290,10 +296,15 @@ pub const AUTO_APPROVED_TOOLS: &[&str] = &[
     //   ausdrücklich darum bittet.
 ];
 
-/// Werkzeuge, die **immer** eine Rückfrage auslösen — auch unter
-/// [`ApprovalMode::FullAccess`] und selbst dann, wenn eine passende
-/// [`AllowRuleSet`]-Regel sonst automatisch freigeben würde (Welle FANIN-K,
-/// Nachtrag K3, „Freigabe-Härtung“).
+/// Werkzeuge, die unter `ask` und `auto` **immer** eine Rückfrage auslösen —
+/// selbst dann, wenn eine passende [`AllowRuleSet`]-Regel sonst automatisch
+/// freigeben würde (Welle FANIN-K, Nachtrag K3, „Freigabe-Härtung“).
+///
+/// # Ausnahme `FullAccess` (Nutzerentscheidung 2026-09-24)
+/// Unter [`ApprovalMode::FullAccess`] fragt harw **nie** — auch nicht für
+/// diese Werkzeuge. „Full Access" heißt: keine Bestätigung, auch nicht für
+/// `process.kill`, `host.sudo_exec` oder `agent.cancel`. Wer Rückfragen will,
+/// wählt `ask` oder `auto`.
 ///
 /// # Description
 /// `agents.write_uia` (`crate::agent_definition_tools`, Nachtrag K) legt ein
@@ -302,13 +313,14 @@ pub const AUTO_APPROVED_TOOLS: &[&str] = &[
 /// Vorschlag dauerhaft. Beide verlangen bei `review_level = "user_required"`
 /// ein `user_confirmed: true` im Aufrufargument — aber dieses Feld ist keine
 /// echte Freigabe, nur eine vom Modell behauptete Zeichenkette. Ohne diese
-/// Liste könnte ein im [`ApprovalMode::FullAccess`]-Modus laufendes Modell
-/// (oder eine `/permissions`-Regel für den Werkzeugnamen) `user_confirmed:
-/// true` selbst setzen und den vorgelagerten Freigabepfad damit umgehen.
+/// Liste könnte eine `/permissions`-Allow-Regel für den Werkzeugnamen den
+/// vorgelagerten Freigabepfad umgehen, während das Modell `user_confirmed:
+/// true` selbst setzt. (Unter `FullAccess` hat die Nutzerin genau das
+/// ausdrücklich gewählt.)
 ///
-/// [`DefaultApprovalPolicy::review`] prüft diese Liste deshalb **vor** jeder
-/// [`AllowRuleSet`]-Auswertung und vor der Modus-Logik — wie eine
-/// eingebaute, nie löschbare `Deny`-Regel für genau diese beiden Namen. Jedes
+/// [`DefaultApprovalPolicy::review`] prüft diese Liste deshalb unter
+/// `ask`/`auto` **vor** jeder [`AllowRuleSet`]-Auswertung und vor der
+/// Modus-Logik. Jedes
 /// hier gelistete Werkzeug bleibt zusätzlich außerhalb von
 /// [`AUTO_APPROVED_TOOLS`] (das gilt bereits, da beide Werkzeuge schreiben).
 ///
@@ -328,14 +340,16 @@ pub const AUTO_APPROVED_TOOLS: &[&str] = &[
 ///
 /// # `process.kill`
 /// Schickt SIGKILL an Host-Prozesse — nicht umkehrbar. Deshalb fragt es wie
-/// die beiden Agenten-Werkzeuge immer, auch unter `FullAccess` und trotz
-/// passender Allow-Regel.
+/// die beiden Agenten-Werkzeuge unter `ask`/`auto` immer, trotz passender
+/// Allow-Regel; unter `FullAccess` nicht.
 ///
 /// # `host.sudo_exec`
 /// Führt einen Root-Befehl über `sudo` aus (Runde 5, Teil B). Neben dem
-/// eigenen TUI-Freigabefenster (Passwort/„Freigeben“) fragt es wie
-/// `process.kill` immer auch über die normale Freigabe — eine Allow-Regel
-/// oder `FullAccess` kann das nie überspringen.
+/// eigenen TUI-Freigabefenster (Passwort/„Freigeben“) fragt es unter
+/// `ask`/`auto` wie `process.kill` immer auch über die normale Freigabe —
+/// eine Allow-Regel überspringt das nie. Unter `FullAccess` fragt keine der
+/// beiden Stufen; die TUI zeigt dann nur noch das Passwortfeld, wenn `sudo`
+/// selbst ein Passwort verlangt.
 pub const ALWAYS_ASK_TOOLS: &[&str] = &[
     "agents.write_uia",
     "agents.commit_proposal",
@@ -345,9 +359,184 @@ pub const ALWAYS_ASK_TOOLS: &[&str] = &[
     // TUI-Fenster immer über die normale Freigabe.
     "host.sudo_exec",
     // Runde 5, Teil K: Abbruch eines eigenen Hintergrund-Agenten — nie
-    // automatisch, auch nicht im Voll- oder Auto-Modus.
+    // automatisch im Auto-Modus (im Voll-Modus fragt nichts).
     "agent.cancel",
 ];
+
+/// Werkzeug, dessen Remote-OCR-Versand eine eigene Freigabe braucht.
+pub const REMOTE_OCR_TOOL: &str = "doc.read_pdf";
+
+/// Quelle des Remote-OCR-Status für [`DefaultApprovalPolicy`].
+///
+/// Standard ist [`harw_tool_doc::remote_ocr_target`] (der prozessweite
+/// Status aus `harw-cli`s `install_doc_ocr`); Tests setzen über
+/// [`DefaultApprovalPolicy::with_remote_ocr_status`] eine eigene Funktion.
+pub type RemoteOcrStatus = fn() -> Option<RemoteOcrTarget>;
+
+/// Hinweis an das Modell, wenn ein Remote-OCR-Aufruf nicht freigegeben
+/// wurde oder niemand ihn freigeben kann.
+pub const REMOTE_OCR_DENIAL_HINT: &str =
+    "remote OCR needs approval; retry with `backend: \"native\"` for local extraction";
+
+/// Ob `call` unter dem Ziel `target` eine Remote-OCR-Freigabe braucht.
+///
+/// # Beschreibung
+/// `true` genau dann, wenn `call` [`REMOTE_OCR_TOOL`] ist, ein
+/// Remote-OCR-Client installiert ist (`target` ist `Some`), sein Modus
+/// [`harw_tool_doc::RemoteOcrApproval::Ask`] ist und die Argumente nicht
+/// `backend: "native"` verlangen. Das Prädikat selbst kennt keinen
+/// Freigabemodus; [`DefaultApprovalPolicy::review`] wertet es nur unter
+/// `ask`/`auto` aus — unter [`ApprovalMode::FullAccess`] fragt auch der
+/// Remote-OCR-Versand nicht (Nutzerentscheidung 2026-09-24).
+///
+/// # Examples
+/// ```rust
+/// use harw_extension_api::{ToolCall, ToolName};
+/// use harw_registry_defaults::remote_ocr_requires_approval;
+/// use harw_tool_doc::{RemoteOcrApproval, RemoteOcrTarget};
+/// use serde_json::json;
+///
+/// let target = RemoteOcrTarget {
+///     host: "api.mistral.ai".to_owned(),
+///     approval: RemoteOcrApproval::Ask,
+/// };
+/// let call = ToolCall {
+///     id: Default::default(),
+///     name: ToolName::new("doc.read_pdf"),
+///     arguments: json!({ "path": "a.pdf" }),
+/// };
+/// assert!(remote_ocr_requires_approval(&call, Some(&target)));
+/// assert!(!remote_ocr_requires_approval(&call, None));
+/// ```
+#[must_use]
+pub fn remote_ocr_requires_approval(call: &ToolCall, target: Option<&RemoteOcrTarget>) -> bool {
+    call.name.as_str() == REMOTE_OCR_TOOL
+        && target.is_some_and(|target| target.approval == harw_tool_doc::RemoteOcrApproval::Ask)
+        && harw_tool_doc::arguments_request_remote_ocr(&call.arguments)
+}
+
+/// Host, an den `call` die Datei schickt, wenn es ein `doc.read_pdf` mit
+/// Remote-OCR-Pfad ist und ein Client installiert ist (Modus egal); sonst
+/// `None`. Für die Verlaufsanzeige der TUI.
+///
+/// # Examples
+/// ```rust
+/// use harw_extension_api::{ToolCall, ToolName};
+/// use harw_registry_defaults::{RemoteOcrApproval, RemoteOcrTarget, remote_ocr_host};
+/// use serde_json::json;
+///
+/// let target = RemoteOcrTarget {
+///     host: "api.mistral.ai".to_owned(),
+///     approval: RemoteOcrApproval::Auto,
+/// };
+/// let call = ToolCall {
+///     id: Default::default(),
+///     name: ToolName::new("doc.read_pdf"),
+///     arguments: json!({ "path": "a.pdf" }),
+/// };
+/// assert_eq!(remote_ocr_host(&call, Some(&target)), Some("api.mistral.ai"));
+/// ```
+#[must_use]
+pub fn remote_ocr_host<'a>(
+    call: &ToolCall,
+    target: Option<&'a RemoteOcrTarget>,
+) -> Option<&'a str> {
+    if call.name.as_str() != REMOTE_OCR_TOOL
+        || !harw_tool_doc::arguments_request_remote_ocr(&call.arguments)
+    {
+        return None;
+    }
+    target.map(|target| target.host.as_str())
+}
+
+/// Wie [`remote_ocr_requires_approval`], gegen den prozessweiten
+/// Remote-OCR-Status ([`harw_tool_doc::remote_ocr_target`]). Für Aufrufer,
+/// die die Rückfrage vorhersagen müssen (`harw-runtime`s
+/// `AskResolutionPolicy`), ohne eine eigene Politik zu tragen.
+#[must_use]
+pub fn call_needs_remote_ocr_approval(call: &ToolCall) -> bool {
+    remote_ocr_requires_approval(call, harw_tool_doc::remote_ocr_target().as_ref())
+}
+
+/// Hinweistext für den Freigabe-Dialog, wenn `call` die Datei an einen
+/// Remote-OCR-Dienst schicken würde und dafür gefragt wird.
+///
+/// # Returns
+/// `Some(text)` mit dem Host aus dem prozessweiten Remote-OCR-Status
+/// ([`harw_tool_doc::remote_ocr_target`]), wenn
+/// [`remote_ocr_requires_approval`] für `call` gilt; sonst `None`.
+#[must_use]
+pub fn remote_ocr_approval_notice(call: &ToolCall) -> Option<String> {
+    remote_ocr_approval_notice_with(call, harw_tool_doc::remote_ocr_target().as_ref())
+}
+
+/// Wie [`remote_ocr_approval_notice`], mit explizit übergebenem Ziel
+/// (testbar ohne prozessweiten Status).
+///
+/// # Examples
+/// ```rust
+/// use harw_extension_api::{ToolCall, ToolName};
+/// use harw_registry_defaults::remote_ocr_approval_notice_with;
+/// use harw_tool_doc::{RemoteOcrApproval, RemoteOcrTarget};
+/// use serde_json::json;
+///
+/// let target = RemoteOcrTarget {
+///     host: "api.mistral.ai".to_owned(),
+///     approval: RemoteOcrApproval::Ask,
+/// };
+/// let call = ToolCall {
+///     id: Default::default(),
+///     name: ToolName::new("doc.read_pdf"),
+///     arguments: json!({ "path": "a.pdf" }),
+/// };
+/// let notice = remote_ocr_approval_notice_with(&call, Some(&target));
+/// assert!(notice.is_some_and(|text| text.contains("api.mistral.ai")));
+/// ```
+#[must_use]
+pub fn remote_ocr_approval_notice_with(
+    call: &ToolCall,
+    target: Option<&RemoteOcrTarget>,
+) -> Option<String> {
+    if !remote_ocr_requires_approval(call, target) {
+        return None;
+    }
+    target.map(|target| {
+        format!(
+            "Sends the file contents to {} (remote OCR). Deny, or ask for backend=native, \
+             to keep it local.",
+            target.host
+        )
+    })
+}
+
+/// Begründung der harten Ablehnung, wenn unter [`ApprovalMode::FullAccess`]
+/// eine ausdrückliche `/permissions`-Deny-Regel auf `call` passt.
+///
+/// # Beschreibung
+/// Unter `FullAccess` fragt harw nie; eine Deny-Regel ist dort deshalb keine
+/// Rückfrage (wie unter `ask`/`auto`), sondern eine Ablehnung mit diesem
+/// Grund. Das Modell erfährt so, dass die Nutzerin den Aufruf selbst
+/// gesperrt hat.
+///
+/// # Examples
+/// ```rust
+/// use harw_extension_api::{ToolCall, ToolName};
+/// use harw_registry_defaults::full_access_deny_reason;
+///
+/// let call = ToolCall {
+///     id: Default::default(),
+///     name: ToolName::new("shell.exec"),
+///     arguments: serde_json::json!({ "command": "git push" }),
+/// };
+/// assert!(full_access_deny_reason(&call).contains("shell.exec"));
+/// ```
+#[must_use]
+pub fn full_access_deny_reason(call: &ToolCall) -> String {
+    format!(
+        "'{}' is blocked by a /permissions deny rule (full access never asks, so the rule refuses the call)",
+        call.name.as_str()
+    )
+}
 
 /// Default approval boundary for the built-in coding-agent tool set.
 ///
@@ -371,8 +560,9 @@ pub const ALWAYS_ASK_TOOLS: &[&str] = &[
 /// - `Some(`[`RuleDecision::Deny`]`)`: dieselbe „immer fragen“-Auskunft, die
 ///   die Politik auch für nicht in [`AUTO_APPROVED_TOOLS`] gelistete Aufrufe
 ///   liefert ([`ApprovalDecision::AskUser`]) — fail-closed, **niemals**
-///   automatisch freigegeben, unabhängig vom Modus (auch nicht bei
-///   [`ApprovalMode::FullAccess`]).
+///   automatisch freigegeben. Unter [`ApprovalMode::FullAccess`], wo nie
+///   gefragt wird, wird daraus eine harte Ablehnung
+///   ([`ApprovalDecision::Deny`] mit [`full_access_deny_reason`]).
 /// - `Some(`[`RuleDecision::Allow`]`)`: freigegeben, ohne dass die
 ///   Modus-Logik überhaupt befragt wird.
 /// - `None`: keine Regel passt, die bisherige Modus-Logik entscheidet
@@ -392,6 +582,9 @@ pub struct DefaultApprovalPolicy {
     /// `harw-runtime`). `None` = bisheriges Verhalten (`auto` fragt bei
     /// allem außerhalb von [`AUTO_APPROVED_TOOLS`]).
     auto_gate: Option<Arc<dyn AutoApprovalGate>>,
+    /// Quelle des Remote-OCR-Status (`doc.read_pdf` → Mistral); Standard
+    /// [`harw_tool_doc::remote_ocr_target`], in Tests injizierbar.
+    remote_ocr: RemoteOcrStatus,
 }
 
 impl Default for DefaultApprovalPolicy {
@@ -446,7 +639,23 @@ impl DefaultApprovalPolicy {
             mode,
             rules,
             auto_gate: None,
+            remote_ocr: harw_tool_doc::remote_ocr_target,
         }
+    }
+
+    /// Ersetzt die Quelle des Remote-OCR-Status (Standard:
+    /// [`harw_tool_doc::remote_ocr_target`]).
+    ///
+    /// # Arguments
+    /// - `status` ([`RemoteOcrStatus`]): liefert das aktuelle Remote-OCR-Ziel
+    ///   oder `None`, wenn kein Client installiert ist.
+    ///
+    /// # Returns
+    /// Die Politik mit der neuen Quelle.
+    #[must_use]
+    pub fn with_remote_ocr_status(mut self, status: RemoteOcrStatus) -> Self {
+        self.remote_ocr = status;
+        self
     }
 
     /// Runde 5, Teil E: hängt das Auto-Modus-Gate an.
@@ -489,18 +698,26 @@ impl DefaultApprovalPolicy {
 }
 
 impl ApprovalHandler for DefaultApprovalPolicy {
-    /// Entscheidet zuerst anhand von [`ALWAYS_ASK_TOOLS`], dann anhand der
-    /// [`AllowRuleSet`], dann anhand des Freigabemodus in der eigenen
-    /// [`ApprovalModeCell`].
+    /// Entscheidet zuerst anhand von `FullAccess`, dann anhand von
+    /// [`ALWAYS_ASK_TOOLS`], dann anhand der [`AllowRuleSet`], dann anhand
+    /// des Freigabemodus in der eigenen [`ApprovalModeCell`].
     ///
     /// # Description
+    /// -1. [`ApprovalMode::FullAccess`] → nie eine Rückfrage
+    ///    (Nutzerentscheidung 2026-09-24): eine passende `Deny`-Regel wird zu
+    ///    [`ApprovalDecision::Deny`] ([`full_access_deny_reason`]), alles
+    ///    andere zu [`ApprovalDecision::Allow`] — auch [`ALWAYS_ASK_TOOLS`],
+    ///    Remote-OCR und ohne das Auto-Modus-Gate zu befragen.
     /// 0. `call.name` ∈ [`ALWAYS_ASK_TOOLS`] → sofort
-    ///    [`ApprovalDecision::AskUser`], ohne Regeln oder Modus überhaupt zu
-    ///    befragen — auch nicht unter [`ApprovalMode::FullAccess`] oder mit
-    ///    einer passenden `Allow`-Regel (Nachtrag K3, „Freigabe-Härtung“).
+    ///    [`ApprovalDecision::AskUser`], ohne Regeln überhaupt zu befragen —
+    ///    auch mit einer passenden `Allow`-Regel (Nachtrag K3,
+    ///    „Freigabe-Härtung“). Ebenso ein `doc.read_pdf`, das die Datei an
+    ///    einen Remote-OCR-Dienst schicken würde, solange
+    ///    `[tools.doc].remote_ocr = "ask"` gilt
+    ///    ([`remote_ocr_requires_approval`]).
     /// 1. [`AllowRuleSet::evaluate`] auf `call.name`/`call.arguments`:
-    ///    - `Some(`[`RuleDecision::Deny`]`)` → [`ApprovalDecision::AskUser`],
-    ///      unabhängig vom Modus (fail-closed, nie automatisch freigegeben).
+    ///    - `Some(`[`RuleDecision::Deny`]`)` → [`ApprovalDecision::AskUser`]
+    ///      (fail-closed, nie automatisch freigegeben).
     ///    - `Some(`[`RuleDecision::Allow`]`)` → [`ApprovalDecision::Allow`],
     ///      ohne die Modus-Logik zu befragen.
     ///    - `None` → weiter mit Schritt 2.
@@ -516,19 +733,36 @@ impl ApprovalHandler for DefaultApprovalPolicy {
     ///      niemand gefragt werden kann (Kind ohne Freigabe-Kanal); sonst
     ///      wandelt es selbst in `ask` um — der Grund steht dann im
     ///      Entscheidungsprotokoll unter der Id des Aufrufs.
-    ///    - [`ApprovalMode::FullAccess`]: nichts fragt.
+    ///    - [`ApprovalMode::FullAccess`]: siehe Schritt -1.
     ///
     /// Regeln und Modus werden bei **jedem** Aufruf frisch gelesen, damit eine
     /// Umschaltung sofort greift und nicht erst im nächsten Turn.
     fn review<'a>(&'a self, call: &'a ToolCall) -> ExtFuture<'a, ApprovalDecision> {
-        // Nachtrag K3, „Freigabe-Härtung“: gewinnt über jede Regel und jeden
-        // Modus, auch `FullAccess` — siehe die Begründung bei
-        // `ALWAYS_ASK_TOOLS`.
+        let mode = self.mode.get();
+        // Nutzerentscheidung 2026-09-24: `FullAccess` fragt NIE — auch nicht
+        // für `ALWAYS_ASK_TOOLS`, Remote-OCR oder über das Auto-Modus-Gate.
+        // Einzige Ausnahme ist eine ausdrückliche `/permissions`-Deny-Regel:
+        // sie ist eine Anweisung der Nutzerin und wird hier zur harten
+        // Ablehnung (nicht zur Rückfrage).
+        if mode == ApprovalMode::FullAccess {
+            let decision = match self.rules.evaluate(call.name.as_str(), &call.arguments) {
+                Some(RuleDecision::Deny) => ApprovalDecision::Deny(full_access_deny_reason(call)),
+                Some(RuleDecision::Allow) | None => ApprovalDecision::Allow,
+            };
+            return Box::pin(async move { decision });
+        }
+        // Nachtrag K3, „Freigabe-Härtung“: gewinnt über jede Regel und die
+        // Modi `ask`/`auto` — siehe die Begründung bei `ALWAYS_ASK_TOOLS`.
         if ALWAYS_ASK_TOOLS.contains(&call.name.as_str()) {
             return Box::pin(async { ApprovalDecision::AskUser(Default::default()) });
         }
+        // `[tools.doc].remote_ocr = "ask"`: die Datei verließe die Maschine.
+        // Das ist keine Ausführungsfrage, deshalb fragt es unter `ask`/`auto`
+        // trotz Allow-Regel; unter `FullAccess` (oben) fragt es nicht.
+        if remote_ocr_requires_approval(call, (self.remote_ocr)().as_ref()) {
+            return Box::pin(async { ApprovalDecision::AskUser(Default::default()) });
+        }
         let rule_decision = self.rules.evaluate(call.name.as_str(), &call.arguments);
-        let mode = self.mode.get();
         let requires_approval = match mode {
             ApprovalMode::AlwaysAsk => true,
             ApprovalMode::Delegated => Self::requires_explicit_approval(call),
@@ -550,7 +784,8 @@ impl ApprovalHandler for DefaultApprovalPolicy {
         Box::pin(async move {
             match rule_decision {
                 // Fail-closed: eine Deny-Regel darf niemals automatisch
-                // freigegeben werden, auch nicht unter `FullAccess`.
+                // freigegeben werden (unter `FullAccess` lehnt sie oben hart
+                // ab).
                 Some(RuleDecision::Deny) => ApprovalDecision::AskUser(Default::default()),
                 Some(RuleDecision::Allow) => ApprovalDecision::Allow,
                 None if requires_approval => match gate {
@@ -993,14 +1228,159 @@ mod tests {
             scope: RuleScope::Session,
         });
         let policy = DefaultApprovalPolicy::with_rules(
-            ApprovalModeCell::new(ApprovalMode::FullAccess),
-            rules,
+            ApprovalModeCell::new(ApprovalMode::Delegated),
+            rules.clone(),
         );
         assert!(matches!(
             block_on(policy.review(&call(harw_tool_plan::ASK_USER_TOOL)))?,
             ApprovalDecision::AskUser(_)
         ));
+        // Unter `FullAccess` fragt nichts: die Deny-Regel lehnt hart ab.
+        let policy = DefaultApprovalPolicy::with_rules(
+            ApprovalModeCell::new(ApprovalMode::FullAccess),
+            rules,
+        );
+        assert!(matches!(
+            block_on(policy.review(&call(harw_tool_plan::ASK_USER_TOOL)))?,
+            ApprovalDecision::Deny(_)
+        ));
         Ok(())
+    }
+
+    fn remote_ocr_ask() -> Option<RemoteOcrTarget> {
+        Some(RemoteOcrTarget {
+            host: "api.mistral.ai".to_owned(),
+            approval: harw_tool_doc::RemoteOcrApproval::Ask,
+        })
+    }
+
+    fn remote_ocr_auto() -> Option<RemoteOcrTarget> {
+        Some(RemoteOcrTarget {
+            host: "api.mistral.ai".to_owned(),
+            approval: harw_tool_doc::RemoteOcrApproval::Auto,
+        })
+    }
+
+    fn read_pdf(arguments: serde_json::Value) -> ToolCall {
+        ToolCall {
+            id: Default::default(),
+            name: harw_extension_api::ToolName::new(REMOTE_OCR_TOOL),
+            arguments,
+        }
+    }
+
+    /// `[tools.doc].remote_ocr = "ask"`: `doc.read_pdf` fragt unter `ask`
+    /// und `auto`, sobald die Datei an den Remote-Dienst ginge — auch trotz
+    /// Allow-Regel. `backend: "native"`, Modus `on` und „kein Client
+    /// installiert“ bleiben ohne Rückfrage. `FullAccess` fragt nie (siehe
+    /// `review_allows_remote_ocr_under_full_access`).
+    #[test]
+    fn review_asks_for_remote_ocr_in_ask_mode_outside_full_access() -> TestResult {
+        use harw_extension_api::allow_rules::{ApprovalRule, RuleScope};
+        use serde_json::json;
+
+        let remote = read_pdf(json!({ "path": "scan.pdf" }));
+        let native = read_pdf(json!({ "path": "scan.pdf", "backend": "native" }));
+        let mode = ApprovalMode::Delegated;
+        let rules = AllowRuleSet::new();
+        rules.add(ApprovalRule {
+            tool: REMOTE_OCR_TOOL.to_owned(),
+            pattern: None,
+            decision: RuleDecision::Allow,
+            scope: RuleScope::Session,
+        });
+        let asking = DefaultApprovalPolicy::with_rules(ApprovalModeCell::new(mode), rules)
+            .with_remote_ocr_status(remote_ocr_ask);
+        assert!(
+            matches!(
+                block_on(asking.review(&remote))?,
+                ApprovalDecision::AskUser(_)
+            ),
+            "remote OCR unter {mode:?} muss fragen"
+        );
+        assert!(
+            matches!(block_on(asking.review(&native))?, ApprovalDecision::Allow),
+            "backend native unter {mode:?} bleibt ohne Rückfrage"
+        );
+
+        let auto = DefaultApprovalPolicy::new(ApprovalModeCell::new(mode))
+            .with_remote_ocr_status(remote_ocr_auto);
+        assert!(matches!(
+            block_on(auto.review(&remote))?,
+            ApprovalDecision::Allow
+        ));
+
+        let none =
+            DefaultApprovalPolicy::new(ApprovalModeCell::new(mode)).with_remote_ocr_status(|| None);
+        assert!(matches!(
+            block_on(none.review(&remote))?,
+            ApprovalDecision::Allow
+        ));
+        // Weiterhin auto-freigegeben: die Rückfrage hängt nur am Remote-Pfad.
+        assert!(AUTO_APPROVED_TOOLS.contains(&REMOTE_OCR_TOOL));
+        Ok(())
+    }
+
+    /// Nutzerentscheidung 2026-09-24: unter `FullAccess` fragt auch der
+    /// Remote-OCR-Versand unter `[tools.doc].remote_ocr = "ask"` nicht —
+    /// mit und ohne Allow-Regel.
+    #[test]
+    fn review_allows_remote_ocr_under_full_access() -> TestResult {
+        use harw_extension_api::allow_rules::{ApprovalRule, RuleScope};
+        use serde_json::json;
+
+        let remote = read_pdf(json!({ "path": "scan.pdf" }));
+        let plain = DefaultApprovalPolicy::new(ApprovalModeCell::new(ApprovalMode::FullAccess))
+            .with_remote_ocr_status(remote_ocr_ask);
+        assert!(matches!(
+            block_on(plain.review(&remote))?,
+            ApprovalDecision::Allow
+        ));
+
+        let rules = AllowRuleSet::new();
+        rules.add(ApprovalRule {
+            tool: REMOTE_OCR_TOOL.to_owned(),
+            pattern: None,
+            decision: RuleDecision::Allow,
+            scope: RuleScope::Session,
+        });
+        let with_rule = DefaultApprovalPolicy::with_rules(
+            ApprovalModeCell::new(ApprovalMode::FullAccess),
+            rules,
+        )
+        .with_remote_ocr_status(remote_ocr_ask);
+        assert!(matches!(
+            block_on(with_rule.review(&remote))?,
+            ApprovalDecision::Allow
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn remote_ocr_notice_names_host_only_when_asking() {
+        use serde_json::json;
+
+        let remote = read_pdf(json!({ "path": "scan.pdf" }));
+        let native = read_pdf(json!({ "path": "scan.pdf", "backend": "native" }));
+        let notice = remote_ocr_approval_notice_with(&remote, remote_ocr_ask().as_ref());
+        assert!(
+            notice
+                .as_deref()
+                .is_some_and(|text| text.contains("api.mistral.ai") && text.contains("native")),
+            "{notice:?}"
+        );
+        assert_eq!(
+            remote_ocr_approval_notice_with(&native, remote_ocr_ask().as_ref()),
+            None
+        );
+        assert_eq!(
+            remote_ocr_approval_notice_with(&remote, remote_ocr_auto().as_ref()),
+            None
+        );
+        assert_eq!(
+            remote_ocr_approval_notice_with(&call("fs.read"), remote_ocr_ask().as_ref()),
+            None
+        );
     }
 
     #[test]
@@ -1173,7 +1553,8 @@ mod tests {
 
     /// Eine `Deny`-Regel gewinnt über eine passende `Allow`-Regel und über
     /// den Modus `FullAccess` — beides würde ohne Regel automatisch
-    /// freigeben.
+    /// freigeben. Unter `FullAccess` (fragt nie) wird sie zur harten
+    /// Ablehnung, unter `auto` zur Rückfrage.
     #[test]
     fn review_deny_rule_beats_allow_rule_and_full_access_mode() -> TestResult {
         use harw_extension_api::allow_rules::{ApprovalRule, RuleDecision, RuleScope};
@@ -1191,14 +1572,24 @@ mod tests {
             decision: RuleDecision::Deny,
             scope: RuleScope::Session,
         });
-        let policy = DefaultApprovalPolicy::with_rules(
-            ApprovalModeCell::new(ApprovalMode::FullAccess),
-            rules,
-        );
+        let cell = ApprovalModeCell::new(ApprovalMode::FullAccess);
+        let policy = DefaultApprovalPolicy::with_rules(cell.clone(), rules);
 
         let mut call = call("shell.exec");
         call.arguments = serde_json::json!({"command": "git push origin main"});
 
+        match block_on(policy.review(&call))? {
+            ApprovalDecision::Deny(reason) => {
+                assert_eq!(reason, full_access_deny_reason(&call));
+            }
+            other => {
+                return Err(TestError::Unexpected(format!(
+                    "Deny-Regel unter FullAccess muss hart ablehnen, war {other:?}"
+                )));
+            }
+        }
+
+        cell.set(ApprovalMode::Delegated);
         assert!(matches!(
             block_on(policy.review(&call))?,
             ApprovalDecision::AskUser(_)
@@ -1206,16 +1597,56 @@ mod tests {
         Ok(())
     }
 
-    /// Nachtrag K3, „Freigabe-Härtung“: `agents.write_uia` und
-    /// `agents.commit_proposal` fragen immer nach — auch unter
-    /// `ApprovalMode::FullAccess` und selbst mit einer passenden `Allow`-Regel,
-    /// die für jedes andere Werkzeug automatisch freigeben würde.
+    /// Nachtrag K3, „Freigabe-Härtung“: `ALWAYS_ASK_TOOLS` fragen unter
+    /// `ask` und `auto` immer nach — selbst mit einer passenden
+    /// `Allow`-Regel, die für jedes andere Werkzeug automatisch freigeben
+    /// würde.
     #[test]
-    fn review_always_asks_for_uia_and_commit_proposal_even_under_full_access_and_an_allow_rule()
+    fn review_always_asks_for_always_ask_tools_outside_full_access_even_with_an_allow_rule()
     -> TestResult {
         use harw_extension_api::allow_rules::{ApprovalRule, RuleDecision, RuleScope};
 
+        for mode in [ApprovalMode::AlwaysAsk, ApprovalMode::Delegated] {
+            for tool in ALWAYS_ASK_TOOLS {
+                let rules = AllowRuleSet::new();
+                rules.add(ApprovalRule {
+                    tool: (*tool).to_owned(),
+                    pattern: None,
+                    decision: RuleDecision::Allow,
+                    scope: RuleScope::Global,
+                });
+                let policy = DefaultApprovalPolicy::with_rules(ApprovalModeCell::new(mode), rules);
+
+                assert!(
+                    matches!(
+                        block_on(policy.review(&call(tool)))?,
+                        ApprovalDecision::AskUser(_)
+                    ),
+                    "{tool} muss unter {mode:?} trotz Allow-Regel nachfragen"
+                );
+            }
+        }
+        Ok(())
+    }
+
+    /// Nutzerentscheidung 2026-09-24: unter `FullAccess` fragt harw nie —
+    /// jedes `ALWAYS_ASK_TOOLS`-Werkzeug (Kill, sudo, Agenten-Commits,
+    /// `agent.cancel`) wird ohne Rückfrage freigegeben, mit und ohne
+    /// Allow-Regel.
+    #[test]
+    fn review_allows_every_always_ask_tool_under_full_access() -> TestResult {
+        use harw_extension_api::allow_rules::{ApprovalRule, RuleDecision, RuleScope};
+
         for tool in ALWAYS_ASK_TOOLS {
+            let plain = DefaultApprovalPolicy::new(ApprovalModeCell::new(ApprovalMode::FullAccess));
+            assert!(
+                matches!(
+                    block_on(plain.review(&call(tool)))?,
+                    ApprovalDecision::Allow
+                ),
+                "{tool} muss unter FullAccess ohne Rückfrage laufen"
+            );
+
             let rules = AllowRuleSet::new();
             rules.add(ApprovalRule {
                 tool: (*tool).to_owned(),
@@ -1223,17 +1654,16 @@ mod tests {
                 decision: RuleDecision::Allow,
                 scope: RuleScope::Global,
             });
-            let policy = DefaultApprovalPolicy::with_rules(
+            let with_rule = DefaultApprovalPolicy::with_rules(
                 ApprovalModeCell::new(ApprovalMode::FullAccess),
                 rules,
             );
-
             assert!(
                 matches!(
-                    block_on(policy.review(&call(tool)))?,
-                    ApprovalDecision::AskUser(_)
+                    block_on(with_rule.review(&call(tool)))?,
+                    ApprovalDecision::Allow
                 ),
-                "{tool} muss trotz FullAccess und einer Allow-Regel nachfragen"
+                "{tool} muss unter FullAccess mit Allow-Regel ohne Rückfrage laufen"
             );
         }
         Ok(())
@@ -1403,6 +1833,44 @@ mod tests {
             );
         }
         assert_eq!(gate.calls(), 0);
+        Ok(())
+    }
+
+    /// Nutzerentscheidung 2026-09-24: unter `FullAccess` wird der
+    /// Auto-Modus-Klassifizierer (Vorfilter + Modell) nie befragt — auch ein
+    /// Gate, das ablehnen würde (etwa `privilege-escalation` für `sudo`),
+    /// kann dort keine Rückfrage erzwingen.
+    #[test]
+    fn auto_gate_is_never_consulted_under_full_access() -> TestResult {
+        use harw_extension_api::auto_mode::{AutoDecision, AutoVerdict, VerdictSource};
+
+        for verdict in [
+            AutoVerdict::new(
+                AutoDecision::Ask,
+                "privilege-escalation",
+                "`sudo` erhöht Rechte",
+                VerdictSource::Prefilter,
+            ),
+            AutoVerdict::new(
+                AutoDecision::Deny,
+                "exfiltration",
+                "verschiebt nach ~",
+                VerdictSource::Classifier,
+            ),
+        ] {
+            let gate = FixedGate::with_verdict(verdict);
+            let policy = gated_policy(ApprovalMode::FullAccess, AllowRuleSet::new(), &gate);
+            let mut sudo = call("shell.exec");
+            sudo.arguments = serde_json::json!({ "command": "sudo apt-get install ripgrep" });
+            for probe in [sudo, call("fs.write"), call("process.kill")] {
+                assert!(
+                    matches!(block_on(policy.review(&probe))?, ApprovalDecision::Allow),
+                    "{} muss unter FullAccess ohne Klassifizierer freigegeben werden",
+                    probe.name.as_str()
+                );
+            }
+            assert_eq!(gate.calls(), 0, "FullAccess befragt den Klassifizierer nie");
+        }
         Ok(())
     }
 

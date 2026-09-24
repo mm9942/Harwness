@@ -10,7 +10,7 @@ use std::sync::Arc;
 use harw_types::{CustomerId, ProviderId, ProviderName};
 use url::Url;
 
-use crate::auth::SghAuth;
+use crate::auth::ProviderAuth;
 use crate::error::{ProviderError, ProviderResult};
 use crate::marker::{
     ApiKeyAuth, OpenAiCompat, ProviderRoleTag, Registered, RoleMarker, Secondary, Unregistered,
@@ -53,7 +53,7 @@ pub struct Provider<
     pub id: ProviderId,
     pub name: ProviderName,
     pub base_url: Url,
-    pub auth: SghAuth,
+    pub auth: ProviderAuth,
     pub settings: ProviderSettings,
     pub models: Vec<ModelRecord>,
     pub fallback_tags: Vec<ProviderRoleTag>,
@@ -77,7 +77,7 @@ impl<RoleTag, KindTag, AuthTag, StateTag> Provider<RoleTag, KindTag, AuthTag, St
         &self.base_url
     }
     #[must_use]
-    pub fn auth(&self) -> &SghAuth {
+    pub fn auth(&self) -> &ProviderAuth {
         &self.auth
     }
     #[must_use]
@@ -120,7 +120,7 @@ pub struct ProviderRecord {
     pub id: ProviderId,
     pub name: ProviderName,
     pub base_url: Url,
-    pub auth: SghAuth,
+    pub auth: ProviderAuth,
     pub role: ProviderRoleTag,
     pub settings: ProviderSettings,
     pub models: Vec<ModelRecord>,
@@ -145,7 +145,7 @@ pub trait ProviderLike: Send + Sync + 'static {
     fn id(&self) -> &ProviderId;
     fn name(&self) -> &ProviderName;
     fn base_url(&self) -> &Url;
-    fn auth(&self) -> &SghAuth;
+    fn auth(&self) -> &ProviderAuth;
     fn settings(&self) -> &ProviderSettings;
     fn models(&self) -> &[ModelRecord];
     fn fallback_tags(&self) -> &[ProviderRoleTag];
@@ -174,7 +174,7 @@ where
     fn base_url(&self) -> &Url {
         &self.base_url
     }
-    fn auth(&self) -> &SghAuth {
+    fn auth(&self) -> &ProviderAuth {
         &self.auth
     }
     fn settings(&self) -> &ProviderSettings {
@@ -218,7 +218,7 @@ pub struct ProviderBuilder<
     id: Option<ProviderId>,
     name: Option<ProviderName>,
     base_url: Option<Url>,
-    auth: Option<SghAuth>,
+    auth: Option<ProviderAuth>,
     settings: Option<ProviderSettings>,
     models: Vec<ModelRecord>,
     fallback_tags: Vec<ProviderRoleTag>,
@@ -270,7 +270,7 @@ impl<RoleTag, KindTag, AuthTag, StateTag> ProviderBuilder<RoleTag, KindTag, Auth
         self
     }
     #[must_use]
-    pub fn auth(mut self, auth: SghAuth) -> Self {
+    pub fn auth(mut self, auth: ProviderAuth) -> Self {
         self.auth = Some(auth);
         self
     }

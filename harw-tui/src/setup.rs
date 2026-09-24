@@ -1,6 +1,6 @@
 //! Interaktiver Ersteinrichtungs-Assistent (Provider → Auth → Modell).
 //!
-//! Spec-Quelle: `docs/design/codex-tui-study/00-harw-tui-redesign-spec.md`,
+//! Spec-Quelle: `docs/design/tui-architecture.md`,
 //! Abschnitt SLICE 1 (Onboarding-OAuth/Paste-Fix) sowie
 //! `docs/design/CONTRACT-setup-install.md`, Abschnitt „Crate
 //! `harw-tui` (neue Datei `src/setup.rs`)".

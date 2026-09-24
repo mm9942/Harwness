@@ -64,7 +64,7 @@ impl HeaderMap {
 /// Auth-Tiers (Note 08 / Note 12 §4). Eine Variante, ein Pfad — kein
 /// Multi-Variant-Login-Enum à la `CodexAuth`.
 #[derive(Clone, Debug)]
-pub enum SghAuth {
+pub enum ProviderAuth {
     ApiKey(ApiKeyConfig),
     StaticBearer(StaticBearerConfig),
     #[cfg(feature = "chatgpt-oauth")]
@@ -72,7 +72,7 @@ pub enum SghAuth {
     None,
 }
 
-impl SghAuth {
+impl ProviderAuth {
     /// Hängt die passenden Auth-Header an. Das Token wird lokal in den
     /// `Bearer …`-String gegossen und landet nie als `String`-Feld irgendwo,
     /// das später auseinandergeloggt wird (Note 08 §4.5).

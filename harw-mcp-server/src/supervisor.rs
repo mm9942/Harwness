@@ -1040,7 +1040,7 @@ mod tests {
             TenantId::from_str("tenant-a"),
             WorkspaceId::from_str("workspace-a"),
             ApprovalActor::Operator {
-                id: "mia".to_owned(),
+                id: "alice".to_owned(),
             },
         )
     }
@@ -1065,7 +1065,7 @@ mod tests {
         McpRequestContext::from_trusted_ingress(
             "mcp-session-test".to_owned(),
             principal(
-                "mia",
+                "alice",
                 "tenant-a",
                 "workspace-a",
                 vec![McpJobCapability::CancelOwn],
@@ -1077,7 +1077,7 @@ mod tests {
         McpRequestContext::from_trusted_ingress(
             "mcp-submit-session-test".to_owned(),
             principal(
-                "mia",
+                "alice",
                 "tenant-a",
                 "workspace-a",
                 vec![McpJobCapability::SubmitOwn, McpJobCapability::ReadOwn],
@@ -1194,7 +1194,7 @@ mod tests {
     fn own_capabilities_do_not_cross_actor_or_scope() {
         let job_scope = scope();
         let owner = principal(
-            "mia",
+            "alice",
             "tenant-a",
             "workspace-a",
             vec![McpJobCapability::ReadOwn, McpJobCapability::CancelOwn],
@@ -1209,7 +1209,7 @@ mod tests {
         );
         assert!(!can_read(&another_actor, &job_scope));
         let another_workspace = principal(
-            "mia",
+            "alice",
             "tenant-a",
             "workspace-b",
             vec![McpJobCapability::CancelWorkspace],

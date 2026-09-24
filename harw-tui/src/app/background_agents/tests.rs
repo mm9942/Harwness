@@ -728,3 +728,67 @@ fn the_launch_result_carries_the_note_only_after_an_interrupted_start() {
             .is_some_and(|note| note.contains(child.as_str()))
     );
 }
+
+/// Anzeige `<provider>/<modell>`: die erste Zeile der Abschlussmeldung nennt
+/// das Modell, auf dem das Kind lief.
+#[test]
+fn notice_first_line_names_the_child_model_route() -> TestResult {
+    let notice = harw_core::background_children::BackgroundNotice {
+        child: harw_types::SessionId::try_from_str("child-1").map_err(ctx("child id"))?,
+        parent: harw_types::SessionId::try_from_str("root").map_err(ctx("parent id"))?,
+        role: "matrix-game-master".to_owned(),
+        status: BackgroundStatus::Failed,
+        text: "Fehler".to_owned(),
+        elapsed: std::time::Duration::from_secs(81),
+        model_route: Some("anthropic/claude-opus-5-5".to_owned()),
+    };
+    let text = format_notice(&notice);
+    let first = text.lines().next().unwrap_or_default();
+    assert_eq!(
+        first,
+        "[Hintergrund-Agent matrix-game-master child-1 (anthropic/claude-opus-5-5) \
+         fehlgeschlagen nach 81 s]"
+    );
+    Ok(())
+}
+
+// ── Export: eingespeiste Meldungen (Export 429) ───────────────────────────────
+
+/// Ein Auto-Turn samt Anweisung ist keine Nutzernachricht.
+#[test]
+fn auto_turn_text_exports_as_notice_not_as_user() {
+    use crate::export::ExportEntry;
+    let text = format!(
+        "[Hintergrund-Agent matrix-game-master c1 fehlgeschlagen nach 81 s]\n[child_end …]\
+         {NOTICE_SEPARATOR}{AUTO_TURN_PROMPT}"
+    );
+    let entries = user_text_export_entries(&text);
+    assert_eq!(entries, vec![ExportEntry::Notice(text.clone())]);
+    // Die Anzeige-Überschreibung des Live-Auto-Turns ebenso.
+    let display = "↩ [Hintergrund-Agent matrix-game-master c1 fehlgeschlagen nach 81 s]";
+    assert_eq!(
+        user_text_export_entries(display),
+        vec![ExportEntry::Notice(display.to_owned())]
+    );
+}
+
+/// Vor einem getippten Turn eingereihte Meldungen werden abgetrennt; der
+/// getippte Text bleibt `User`.
+#[test]
+fn queued_notices_are_split_from_the_typed_text() {
+    use crate::export::ExportEntry;
+    let text = format!("[Nachricht von explorer (c2)] Zwischenstand{NOTICE_SEPARATOR}weiter so");
+    assert_eq!(
+        user_text_export_entries(&text),
+        vec![
+            ExportEntry::Notice("[Nachricht von explorer (c2)] Zwischenstand".to_owned()),
+            ExportEntry::User("weiter so".to_owned()),
+        ]
+    );
+    assert_eq!(
+        user_text_export_entries("nun gut nutze das matrix game"),
+        vec![ExportEntry::User(
+            "nun gut nutze das matrix game".to_owned()
+        )]
+    );
+}

@@ -3,6 +3,8 @@ publish.workspace = true
 name = "harw-explorer"
 version.workspace = true
 edition.workspace = true
+license.workspace = true
+repository.workspace = true
 rust-version.workspace = true
 description = "Universeller, projektunabhängiger Explorer: durchsucht den gesamten Baum ab einer Wurzel und erkennt Projekte, Dateitypen und Relationen."
 

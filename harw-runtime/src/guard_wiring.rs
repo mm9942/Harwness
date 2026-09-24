@@ -336,8 +336,7 @@ fn parse_effort_field(
 }
 
 /// Löst den Standard-Reasoning-Effort eines Kindes nach der
-/// Nutzerentscheidung-Rangfolge **Provider > Modell > Agent > Rolle** auf
-/// (Welle 8, `recursive-cooking-lobster.md`).
+/// Nutzerentscheidung-Rangfolge **Provider > Modell > Agent > Rolle** auf.
 ///
 /// # Beschreibung
 /// Prüft die vier Ebenen in genau dieser Reihenfolge und liefert den ersten

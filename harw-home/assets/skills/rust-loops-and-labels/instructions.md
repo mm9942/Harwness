@@ -40,12 +40,12 @@ for outer in &matrix {
 
 ```rust
 // Iterator-Chain statt Index-Schleife
-// Datei: apps/sgh-flow/src/db/repositories/invoice_items.rs:404
+// Datei: apps/acme-app/src/db/repositories/invoice_items.rs:404
 let items: Vec<InvoiceItemRow> = rows.into_iter().map(ItemRow::into_row).collect();
 // into_iter() überträgt Ownership; keine Kopie, kein Index.
 
 // `loop` mit break-Wert für Retry-Logik
-// Datei: apps/sgh-flow/src/services/python_agent.rs:619
+// Datei: apps/acme-app/src/services/python_agent.rs:619
 let file = loop {
     match File::open(&log_path).await {
         Ok(f) => break f,                          // Wert aus der Schleife heraus
@@ -72,7 +72,7 @@ let file = loop {
 }
 
 // filter_map: kombiniertes Filter + Transformation ohne Zwischenvec
-// Datei: apps/sgh-flow/src/runtime.rs:473
+// Datei: apps/acme-app/src/runtime.rs:473
 let resolved: Vec<_> = env_vars
     .filter_map(|(env_key, paths)| {
         std::env::var(env_key).ok().map(|val| (val, paths))

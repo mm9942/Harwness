@@ -7,7 +7,11 @@
 //!
 //! - [`edges`] — verbotene Kanten im Abhängigkeitsgraphen (Knoten AW0-10a)
 //! - [`privileges`] — Privilegienbudget je Binary (Knoten AW0-10b)
-//! - [`writescopes`] — Schreibbereichstabelle aus dem Plan (Knoten AW0-10c)
+//!
+//! Ein früheres drittes Gate prüfte die Schreibbereichstabelle des
+//! Ausbauplans auf Kollisionen paralleler Arbeitsknoten. Mit dem Abschluss des
+//! Ausbauprogramms (siehe `docs/design/build-history.md`) entfiel die Tabelle
+//! und damit dieses Gate.
 //!
 //! # Warum die Aufteilung
 //! Der ursprüngliche Zuschnitt hatte alle drei Gates in einer Datei. Er ist
@@ -26,18 +30,60 @@
 //! Verteiler aus Knoten AW0-00/AW0-10; die drei Gates entstehen in AW0-10a,
 //! AW0-10b und AW0-10c.
 
+use std::path::Path;
+
+use harw_code_graph::WorkspaceGraph;
+
 #[path = "gate_edges.rs"]
 pub mod edges;
 #[path = "gate_privileges.rs"]
 pub mod privileges;
-#[path = "gate_writescopes.rs"]
-pub mod writescopes;
 // Die zwei Warden-Gates aus dem Verifikationsplan, nachgetragen: sie standen
 // als Abnahmebestandteil im Plan und waren nie gebaut worden. Beide teilen
 // eine Huellenberechnung, sind aber einzeln aufrufbar, weil sie verschiedene
 // Fragen stellen — Anzahl gegen Bauart.
 #[path = "gate_warden.rs"]
 pub mod warden;
+
+/// Unterverzeichnis des eigenständigen DoD-Workspace, relativ zur Repo-Wurzel.
+///
+/// # Description
+/// `dod/` ist ein eigener Cargo-Workspace (eigenes `Cargo.lock`, eigene
+/// `[workspace.dependencies]`) und steht in der Wurzel-`Cargo.toml` unter
+/// `exclude`. Dort liegen alle vier Binaries, die `privileges` und die
+/// Warden-Gates prüfen, und alle Sensor-Crates, auf die sich die Regeln von
+/// `edges` beziehen.
+pub const DOD_WORKSPACE: &str = "dod";
+
+/// Lädt Produkt- und DoD-Workspace als **einen** Graphen.
+///
+/// # Description
+/// Vor dieser Funktion lud jedes Gate nur `.`. Seit DoD ein eigener
+/// Workspace ist, fehlten damit alle vier Binaries und alle Sensoren im
+/// Graphen: die Sensor- und Warden-Regeln von `edges` prüften still nichts,
+/// `privileges` meldete die Binaries als „Gerüst", und die Warden-Gates
+/// fanden ihre Wurzel nicht. Die DoD-Crates hängen per `path` an
+/// Produkt-Crates (`harw-types`, `harw-macros`, …); erst
+/// [`WorkspaceGraph::load_many`] macht diese Kanten zu internen Kanten, damit
+/// die Hüllen über die Workspace-Grenze hinweg weiterlaufen.
+///
+/// # Arguments
+/// - `repo_root` (`&Path`): Wurzel des Repositorys (die Produkt-`Cargo.toml`).
+///
+/// # Errors
+/// Wenn einer der beiden Workspaces nicht lesbar ist. Ein fehlendes `dod/`
+/// ist ein Fehler, kein leiser Rückfall auf den Produkt-Workspace allein —
+/// genau dieser Rückfall hat die Gates zuvor blind gemacht.
+pub fn load_all_workspaces(repo_root: &Path) -> Result<WorkspaceGraph, String> {
+    let dod_root = repo_root.join(DOD_WORKSPACE);
+    WorkspaceGraph::load_many(&[repo_root, dod_root.as_path()]).map_err(|error| {
+        format!(
+            "Workspace-Graph (Produkt '{}' + DoD '{}') nicht lesbar: {error}",
+            repo_root.display(),
+            dod_root.display()
+        )
+    })
+}
 
 /// Das Ergebnis eines einzelnen Gates.
 ///
@@ -100,7 +146,7 @@ impl GateReport {
 ///
 /// # Arguments
 /// - `args` (`&[String]`): Namen einzelner Gates (`edges`, `privileges`,
-///   `writescopes`); leer bedeutet alle.
+///   `warden-deps`, `warden-cbuild`); leer bedeutet alle.
 ///
 /// # Returns
 /// `Ok(())`, wenn jedes ausgeführte Gate grün ist.
@@ -112,13 +158,7 @@ impl GateReport {
 /// Tippfehler rot werden, nicht still alles überspringen.
 pub fn run(args: &[String]) -> Result<(), String> {
     let selected: Vec<&str> = if args.is_empty() {
-        vec![
-            "edges",
-            "privileges",
-            "writescopes",
-            "warden-deps",
-            "warden-cbuild",
-        ]
+        vec!["edges", "privileges", "warden-deps", "warden-cbuild"]
     } else {
         args.iter().map(String::as_str).collect()
     };
@@ -128,7 +168,6 @@ pub fn run(args: &[String]) -> Result<(), String> {
         let report = match name {
             "edges" => edges::run()?,
             "privileges" => privileges::run()?,
-            "writescopes" => writescopes::run()?,
             "warden-deps" => warden::dependency_budget::run()?,
             "warden-cbuild" => warden::c_build::run()?,
             other => return Err(format!("unbekanntes Gate '{other}'")),
@@ -174,6 +213,87 @@ fn failure_message(failures: &[&GateReport]) -> String {
 #[cfg(test)]
 mod tests {
     use super::GateReport;
+    use crate::test_support::{TestError, TestResult};
+
+    /// Wurzel des Repositorys, unabhängig vom Arbeitsverzeichnis des
+    /// Testlaufs (Cargo startet Tests im Paketverzeichnis `xtask/`).
+    fn repo_root() -> TestResult<&'static std::path::Path> {
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .ok_or(TestError::Missing("Repo-Wurzel über xtask/"))
+    }
+
+    /// Der Befund, der diese Tests ausgelöst hat: die Gates luden nur `.`,
+    /// fanden die vier DoD-Binaries nicht und prüften still nichts. Gegen
+    /// den **echten** Graphen, nicht gegen ein Fixture.
+    #[test]
+    fn test_load_all_workspaces_finds_all_monitored_binaries() -> TestResult {
+        let graph = super::load_all_workspaces(repo_root()?).map_err(TestError::Unexpected)?;
+
+        assert!(
+            super::privileges::missing_binaries(&graph).is_empty(),
+            "alle vier Binaries müssen im zusammengeführten Graphen liegen: fehlend {:?}",
+            super::privileges::missing_binaries(&graph)
+        );
+        let warden = graph
+            .get(super::warden::WARDEN_ROOT)
+            .ok_or(TestError::Missing("harw-warden im Graphen"))?;
+        assert!(
+            warden.deps.iter().any(|dep| dep == "harw-types"),
+            "die Pfad-Kante DoD → Produkt muss intern sein, sonst endet jede Hülle an der Workspace-Grenze: {:?}",
+            warden.deps
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn test_edges_on_real_graph_sees_every_rule_subject() -> TestResult {
+        let graph = super::load_all_workspaces(repo_root()?).map_err(TestError::Unexpected)?;
+
+        // Jede Regel nennt Crates beim Namen. Fehlt einer davon im Graphen,
+        // prüft die Regel still nichts — genau der frühere Zustand.
+        for sensor in super::edges::SENSOR_CRATES {
+            assert!(
+                graph.get(sensor).is_some(),
+                "Sensor '{sensor}' fehlt im Graphen"
+            );
+        }
+        for (pure, _) in super::edges::PURE_CRATES {
+            assert!(
+                graph.get(pure).is_some(),
+                "reine Crate '{pure}' fehlt im Graphen"
+            );
+        }
+        for name in [
+            "harw-sentinel",
+            "harw-warden",
+            "harw-dod-sentinel",
+            "harw-dod-escalate",
+        ] {
+            assert!(
+                graph.get(name).is_some(),
+                "Regel-Subjekt '{name}' fehlt im Graphen"
+            );
+        }
+
+        let report = super::edges::evaluate(&graph);
+        assert!(report.checked > 0, "{report:?}");
+        Ok(())
+    }
+
+    #[test]
+    fn test_privileges_on_real_graph_checks_all_four_binaries() -> TestResult {
+        let graph = super::load_all_workspaces(repo_root()?).map_err(TestError::Unexpected)?;
+
+        let report = super::privileges::evaluate(&graph);
+
+        assert_eq!(
+            report.checked,
+            super::privileges::MONITORED_BINARIES.len(),
+            "{report:?}"
+        );
+        Ok(())
+    }
 
     /// Befund G-102: ein Gate, das nichts geprüft hat (`checked == 0`),
     /// darf nicht als grün gelten — auch wenn `violations` zufällig leer

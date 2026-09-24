@@ -1,8 +1,9 @@
 # Channel Ingress Layer — Design, with Telegram as First Binding
 
-Status: draft
+> Status: implemented · Last reviewed: 2026-09-24
+
 Scope: `harw-channel` (core abstraction) + `harw-channel-telegram` (first concrete binding)
-Depends on: `harw-types` (IDs, `SessionKey`), `harw-session-store` (append-only journal), `harw-policy` (visibility scopes), `harw-catalog` (capability manifests), `harw-protocol` (approvals, events)
+Depends on: `harw-types` (IDs, `SessionKey`), `harw-session-store` (append-only journal), `harw-sandbox` (visibility scopes), `harw-catalog` (capability manifests), `harw-protocol` (approvals, events)
 
 ---
 
@@ -205,7 +206,7 @@ Telegram delivers attachments as `file_id` references, not bytes; the adapter mu
 
 - BotFather's `/setcommands` menu is regenerated at bind startup (and on policy change) from the intersection of: commands registered in the harness's central command registry, and commands visible under the requesting peer's resolved visibility scope. A command an `OperatorOnly`-scoped peer cannot invoke should not appear in their `/` picker at all — `menu_source = "policy_visible"` means the menu is peer-relative, not one global static list, so `setMyCommands` is called per-scope (Telegram supports per-chat/per-user command scopes natively) rather than once globally.
 - Commands arrive as ordinary `InboundEvent`s with a recognized `/name` prefix (with or without `@botusername` suffix, which the adapter strips before dispatch). Unknown `/foo` commands hit `unknown_command_fallback`: `reply_help` (default — points at `/help`), `ignore` (silent drop, useful for busy multi-bot groups), or `route_to_agent` (treat it as ordinary chat text — the agent decides whether it's a real request, useful for personas where "commands" are conversational).
-- Command *authorization* is enforced by `harw-policy`, not the channel adapter — the adapter's job is only to attach the `SenderRef`/`SessionKey`/`ChannelId` context so policy can resolve visibility scope; the actual gate (e.g. an `OperatorOnly` command silently absent from the menu **and** rejected with an audit record if attempted anyway via typed text) lives in the policy layer, same as it would for a CLI-originated command. This keeps the channel layer from needing its own copy of authorization logic that could drift from the canonical policy engine.
+- Command *authorization* is enforced by `harw-sandbox`, not the channel adapter — the adapter's job is only to attach the `SenderRef`/`SessionKey`/`ChannelId` context so policy can resolve visibility scope; the actual gate (e.g. an `OperatorOnly` command silently absent from the menu **and** rejected with an audit record if attempted anyway via typed text) lives in the policy layer, same as it would for a CLI-originated command. This keeps the channel layer from needing its own copy of authorization logic that could drift from the canonical policy engine.
 
 ### 4.2 Approval flows over Telegram
 
@@ -228,7 +229,7 @@ cwd: /workspace
 
 ## 5. Security model
 
-- **No implicit escalation.** A channel binding carries a *sandbox profile* that can only intersect with (never union into) whatever capability bundle the resolved tenant/session would otherwise have. Concretely: `harw-policy` computes the session's rights from tenant/catalog/visibility-scope as usual, and the channel binding's profile (e.g. "Telegram-originated sessions never get raw filesystem write, regardless of tenant policy") is applied as an additional restriction, never as a grant. A channel adapter has no code path that can add a capability; it only has `deny`/`restrict` hooks.
+- **No implicit escalation.** A channel binding carries a *sandbox profile* that can only intersect with (never union into) whatever capability bundle the resolved tenant/session would otherwise have. Concretely: `harw-sandbox` computes the session's rights from tenant/catalog/visibility-scope as usual, and the channel binding's profile (e.g. "Telegram-originated sessions never get raw filesystem write, regardless of tenant policy") is applied as an additional restriction, never as a grant. A channel adapter has no code path that can add a capability; it only has `deny`/`restrict` hooks.
 - **Full audit of inbound commands.** Every admitted `InboundEvent` that results in a dispatched turn is journaled with: `SessionKey`, `SenderRef`, `ChannelId`, raw `update_id`, and a content hash (not necessarily full content, to keep the audit log from becoming a second copy of possibly-sensitive message bodies — full content already lives in the session transcript). Rejections at `admit()` are also logged (lighter-weight, no session context needed) so "bot ignored me" support questions are answerable from logs alone.
 - **Replay/dedup via `update_id`.** Telegram's `update_id` is monotonically increasing per bot and is the basis for at-least-once delivery (long-poll `offset` acking, webhook retries). The adapter maintains a small sliding-window dedup cache (`update_id` → already-processed marker) so a Telegram-side retry of an update it never got an ack for cannot double-dispatch a turn or double-count toward rate limits. For long-poll, the confirmed `offset` is persisted (not just kept in memory) so a process restart resumes after the last acked update rather than re-processing or gapping.
 - **Token storage.** Bot tokens and webhook secrets are never held as bare config values — `bot_token_ref`/`secret_token_ref` resolve through an indirection (`env:` today) at bind startup, held in memory only as long as the adapter needs them, and never logged (structured `tracing` fields for this module explicitly exclude the resolved token; only the *ref string*, e.g. `env:TELEGRAM_SUPPORT_BOT_TOKEN`, is safe to log).

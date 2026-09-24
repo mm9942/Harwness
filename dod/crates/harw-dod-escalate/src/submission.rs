@@ -21,7 +21,7 @@
 //! Pflichtfelder) nach dem Deserialisieren, [`TriageSubmission::binds`]
 //! schließt 3 ein.
 //!
-//! # Wire-Format (eingefroren, siehe Ledger `docs/remediation/ledger/W3/C-WPROTO.md`)
+//! # Wire-Format (eingefroren)
 //! JSON-Objekt, `deny_unknown_fields`:
 //! `{"version": 1, "finding": "<FindingId>", "finding_digest": "<hex>", "verdict": <SecurityVerdict>}`.
 //!

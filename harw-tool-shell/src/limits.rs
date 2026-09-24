@@ -215,8 +215,8 @@ pub(crate) struct LaunchCommand {
 ///
 /// Nimmt bewusst ein loses `program`/`args`-Paar statt eines
 /// [`harw_sandbox::BwrapCommandPlan`], damit derselbe Mechanismus auch den
-/// Host-Pfad ohne `bwrap` trägt (Plan `recursive-cooking-lobster.md` Teil B1,
-/// `crate::exec::ShellExecutor::run_host_command`): dort gibt es keinen
+/// Host-Pfad ohne `bwrap` trägt
+/// (`crate::exec::ShellExecutor::run_host_command`): dort gibt es keinen
 /// `BwrapCommandPlan`, nur `/bin/sh -c <command>`. Der `bwrap`-Pfad
 /// (`crate::exec::ShellExecutor::run_command`) übergibt weiterhin
 /// `launcher.executable()` und `plan.args()`.

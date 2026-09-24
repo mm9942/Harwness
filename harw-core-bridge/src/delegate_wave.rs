@@ -9,7 +9,7 @@
 //! Handoff `transfer_to_<rolle>`: ein Handoff übergibt den Turn an das Kind
 //! (`TurnOutcome::AwaitingChild`), `delegate_wave` ist ein gewöhnlicher,
 //! blockierender Werkzeugaufruf (Agent-as-Tool, `docs/design/
-//! wave-4-agents-as-tools.md` §3).
+//! docs/design/agents-as-tools.md` §3).
 //!
 //! ```text
 //! delegate_wave {
@@ -792,7 +792,12 @@ pub async fn delegate_wave(
         };
         payloads.push(match continuation {
             Some(Ok(seed)) => {
-                let task = continuation_task(&seed.of, &seed.handoff, Some(target.task.as_str()));
+                let task = continuation_task(
+                    &seed.of,
+                    &seed.end,
+                    &seed.handoff,
+                    Some(target.task.as_str()),
+                );
                 seeds[position] = Some(seed);
                 target.payload_with_task(&task, position, size)
             }

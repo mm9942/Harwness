@@ -36,7 +36,7 @@
 //!   der Rolle); Ergebnis und Verlauf landen an der Karte. Ohne
 //!   [`JobWorkerContext::knowledge`] bleiben diese Jobs unberührt.
 //!
-//! # Runtime assembly (W2d-2 J1, CONTRACTS-W2d2.md §1.3)
+//! # Runtime assembly (W2d-2 J1, docs/design/runtime-contracts.md §extension)
 //! Every executed job is assembled through
 //! `crate::runtime_jobs::job_assembly` and gets its root session from
 //! `harw_runtime::RuntimeAssembly::new_root_session`, under the session id
@@ -116,7 +116,7 @@ const MISSING_PLAN_SERVICES: &str =
     "plan-node job cannot run: this worker was started without a plan store";
 
 /// Reason recorded when a job is claimed by a worker without a HARW home
-/// (CONTRACTS-W2d2.md E3): without a home there is no runtime assembly.
+/// (docs/design/runtime-contracts.md §extension): without a home there is no runtime assembly.
 const MISSING_RUNTIME_ROOT: &str = "job runtime requires a HARW home";
 
 /// Reason recorded when [`RuntimeAssembly::builder`]`.build()` fails while
@@ -154,7 +154,7 @@ pub struct JobRuntimeRoot {
 ///
 /// # Description
 /// Built once by `harw serve` and shared as `Arc<JobWorkerContext>` with every
-/// poll (CONTRACTS-W2d2.md §1.3).
+/// poll (docs/design/runtime-contracts.md §extension).
 ///
 /// # Concurrency
 /// Immutable after construction; `Send + Sync`.
@@ -1097,6 +1097,11 @@ impl ModelProvider for BudgetedModelProvider {
     fn pinned_model_id(&self) -> Option<String> {
         self.inner.pinned_model_id()
     }
+
+    /// Reicht die gepinnte Provider-ID des umhüllten Providers durch.
+    fn pinned_provider_id(&self) -> Option<String> {
+        self.inner.pinned_provider_id()
+    }
 }
 
 // Operator id used to build a plan-node job's own trust principal (R7).
@@ -1302,7 +1307,7 @@ fn ensure_same_workspace_root(
     }
 }
 
-// Job-Art und Verengung eines Plan-Knotens (CONTRACTS-W2d2.md §2 J1, E10):
+// Job-Art und Verengung eines Plan-Knotens (docs/design/runtime-contracts.md §extension):
 // Profil nach Knotenart und tatsächlich gewährtem Schreibrecht, Identität des
 // Plan-Knoten-Agenten, Rechte und Workspace-Root der abgeleiteten Sandbox (R0-F).
 fn plan_node_narrowing(

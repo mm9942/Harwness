@@ -1,86 +1,101 @@
-# Agent-IR v1 — Bestehende Pipeline als expliziter Compiler-Kanal
+# Agent IR v1 — the existing pipeline as an explicit compiler channel
 
-**Status:** Design-Anker (deskriptiv, kein neues Crate).
-**Bindet an:** [`agent-definition-dsl.md`](agent-definition-dsl.md) §17, [`coding-philosophy.md`](../philosophy/coding-philosophy.md) §6, §7, §11.
+> Status: partially implemented · Last reviewed: 2026-09-24
 
-Diese Doku macht die **Lowering-Stufen sichtbar**, die in `harw-agent-dsl` bereits latent existieren. Sie ersetzt keine Implementierung — sie benennt.
+**Design anchor** (descriptive, no new crate).
+**Binds to:** [`agent-definition-dsl.md`](agent-definition-dsl.md) §17, [`coding-philosophy.md`](../philosophy/coding-philosophy.md) §6, §7, §11.
 
-Absichtlich **kein** `harw-ir`/`harw-lowering`/`harw-codegen`-Crate. Alles bleibt in `harw-agent-dsl`. Der Wert liegt in expliziten Grenzen zwischen den Stufen, nicht in neuen Crates.
+This document makes the **lowering stages** that already exist latently in
+`harw-agent-dsl` explicit. It replaces no implementation — it names one.
+
+Deliberately **no** `harw-ir`/`harw-lowering`/`harw-codegen` crate. Everything
+stays in `harw-agent-dsl`. The value is in explicit boundaries between the
+stages, not in new crates.
 
 ---
 
-## 1. Die vier Stufen
+## 1. The four stages
 
 ```
 TOML Source
-    │  parse.rs (Frontend / Parser)
+    │  parse.rs (frontend / parser)
     ▼
-Raw*Definition  (AST — Frontend-Output, syntax-nahe)
-    │  resolve.rs (Semantic Analysis + Lowering)
+Raw*Definition  (AST — frontend output, syntax-close)
+    │  resolve.rs (semantic analysis + lowering)
     ▼
-Resolved*Definition  (IR — normalisiert, monomorph, verifiziert)
-    │  Consumer (Runtime / Job-Admission / Executor)
+Resolved*Definition  (IR — normalized, monomorphic, verified)
+    │  Consumer (runtime / job admission / executor)
     ▼
-Runtime Effect  (Backend — Jobs, Tool-Surface, Leases, Model Requests)
+Runtime Effect  (backend — jobs, tool surface, leases, model requests)
 ```
 
-Alle Vorstufen sind bereits implementiert (Wave G):
+All earlier stages are implemented:
 
 - Frontend: `parse.rs::parse_toml`
 - AST: `raw::RawAgentDefinition`
-- Analysis + Lowering: `resolve.rs::resolve_definition`
-- Semantic Verifier: `authority.rs::AuthorityCeiling::is_reduction_of`
-- IR: `resolved::ResolvedAgentDefinition` mit `ResolutionTrace` als Provenance
-
-Neu in Wave I:
-
-- AST für Family: `family::RawFamilyDefinition`
-- AST für Organization/Clan/Cell: `organization::RawOrganizationDefinition`
-- IR für Family: `family::ResolvedFamily`
-- IR für Organization: `organization::ResolvedOrganization`
+- Analysis + lowering: `resolve.rs::resolve_definition`
+- Semantic verifier: `authority.rs::AuthorityCeiling::is_reduction_of`
+- IR: `resolved::ResolvedAgentDefinition` with `ResolutionTrace` as provenance
+- AST for Family: `family::RawFamilyDefinition`
+- AST for Organization/Clan/Cell: `organization::RawOrganizationDefinition`
+- IR for Family: `family::ResolvedFamily`
+- IR for Organization: `organization::ResolvedOrganization`
+- Fourth stage, runtime-shaped IR: `executable::ExecutableAgentIr`
+  (`harw-agent-dsl/src/executable.rs`), produced by `executable::lower`
 
 ---
 
-## 2. Warum keine eigenen Backend-Crates
+## 2. Why there are no separate backend crates
 
-Ein Compiler produziert Maschinencode. Harwness produziert **Runtime-Effekte** — und die leben nicht in einem Backend-Crate, sondern in `harw-job-runtime`, `harw-plan`, `harw-tools`, `harw-provider`. Diese Crates sind das Backend.
+A compiler produces machine code. Harwness produces **runtime effects** — and
+those don't live in a backend crate, they live in `harw-job-runtime`,
+`harw-plan`, `harw-tools`, `harw-provider`. Those crates are the backend.
 
-Der Consumer-Kontrakt ist immer derselbe:
+The consumer contract is always the same:
 
 ```rust
 fn admit_agent(resolved: ResolvedAgentDefinition, org: &ResolvedOrganization) -> JobHandle;
 ```
 
-Was der Compiler-Vergleich klar macht:
+What the compiler comparison clarifies:
 
-- **AST bleibt syntax-nah.** Keine Cross-Reference-Auflösung, keine Merge-Semantik.
-- **IR ist normalisiert und verifiziert.** Nach `resolve_definition` gilt: keine Cycles, keine Authority-Elevation, alle Refs aufgelöst.
-- **Consumer sehen nur IR.** Kein Runtime-Konsument darf `RawAgentDefinition` sehen — das ist der Grund, warum `raw` in `harw-agent-dsl` internal bleibt und nur `resolved` exportiert wird.
+- **The AST stays syntax-close.** No cross-reference resolution, no merge
+  semantics.
+- **The IR is normalized and verified.** After `resolve_definition` the
+  following hold: no cycles, no authority elevation, all refs resolved.
+- **Consumers only ever see IR.** No runtime consumer may see
+  `RawAgentDefinition` — that's why `raw` stays internal to `harw-agent-dsl`
+  and only `resolved` is exported.
 
 ---
 
-## 3. Optimierungs-Passes (spätere Waves, hier deklariert)
+## 3. Optimization passes (later work, declared here)
 
-Die folgenden Passes sind sinnvoll — aber **keiner ist Voraussetzung** für ein funktionierendes System. Sie sind Kandidaten für Wave J+.
+The following passes would be useful — but **none of them is a prerequisite**
+for a working system. They are candidates for future waves; none are
+implemented.
 
-| Pass | Wirkung |
+| Pass | Effect |
 |---|---|
-| `RemoveUnusedTools` | Tools, die keine Consumer im Plan-Graph haben, aus Tool-Surface entfernen |
-| `MinimizeContext` | Context-Items, die von keinem Rendering-Pfad referenziert werden, weglassen |
-| `CollapseRedundantPolicies` | zwei identische ContextPolicies → gemeinsam nutzen |
-| `PartitionWriteSets` | WriteSets orthogonal machen, damit Fanout garantiert disjunkt ist |
-| `InsertVerificationBarrier` | vor jedem Merge-Kandidaten einen `harw-plan`-Barrier-Node einsetzen |
-| `EnforceToolChoiceReset` | nach jedem Terminal-Return `reset_tool_choice=true` erzwingen |
-| `LowerGoalGraphToJobs` | ausdrucksstarke Goal-Graphen zu ausführbaren Job-Sequenzen abflachen |
-| `InsertDurabilityBoundaries` | vor jedem State-Effekt einen `persist-before-rerun`-Marker einsetzen |
+| `RemoveUnusedTools` | remove tools with no consumer in the plan graph from the tool surface |
+| `MinimizeContext` | drop context items no rendering path references |
+| `CollapseRedundantPolicies` | share two identical context policies |
+| `PartitionWriteSets` | make write sets orthogonal so fanout is guaranteed disjoint |
+| `InsertVerificationBarrier` | insert a `harw-plan` barrier node before every merge candidate |
+| `EnforceToolChoiceReset` | force `reset_tool_choice=true` after every terminal return |
+| `LowerGoalGraphToJobs` | flatten expressive goal graphs into executable job sequences |
+| `InsertDurabilityBoundaries` | insert a `persist-before-rerun` marker before every state effect |
 
-Der wichtigste Pass für die aktuelle Fanout-Diszplin: **`PartitionWriteSets`** — genau der, den ich beim Wave-Fanout händisch prüfe. Wenn er als Compiler-Pass existiert, verschwindet die manuelle Prüfung.
+The most relevant pass for fanout discipline is **`PartitionWriteSets`** — the
+one manually checked today during multi-agent fanout planning. If it existed
+as a compiler pass, that manual check would disappear.
 
 ---
 
-## 4. „Borrow Checker, Harwness Edition"
+## 4. "Borrow checker, Harwness edition"
 
-Wenn die IR ein Feld `write_scope: Vec<PathRule>` pro Job-Template trägt und ein Analyzer über den Job-Graph iteriert:
+If the IR carries a `write_scope: Vec<PathRule>` field per job template and an
+analyzer iterates the job graph, a conflict could be reported like:
 
 ```
 HARW-BORROW-017:
@@ -90,15 +105,20 @@ HARW-BORROW-017:
     hint: split plan node or serialize execution
 ```
 
-Wir haben das bereits als Runtime-Check in `harw-plan/src/admission.rs`. Ein IR-Pass hebt es auf Plan-Compile-Zeit — genau wie ein echter Borrow Checker.
+This already exists as a runtime check in `harw-plan/src/admission.rs`. An IR
+pass would move it to plan-compile time — like a real borrow checker.
 
 ---
 
-## 5. Was diese Doku *nicht* rechtfertigt
+## 5. What this document does *not* justify
 
-- Kein separates `harw-ir`-Crate.
-- Kein Multi-Backend-Executor (nicht nötig — die einzelnen Runtime-Crates *sind* die Backends).
-- Keine LLVM-Analogie. Kein MLIR. Kein pretty printer für IR.
-- Keine SSA-Umformung, keine phi-Nodes, keine dominator tree. Das ist eine Agent-Runtime, kein Optimizer.
+- No separate `harw-ir` crate.
+- No multi-backend executor (not needed — the individual runtime crates *are*
+  the backends).
+- No LLVM analogy. No MLIR. No IR pretty printer.
+- No SSA transform, no phi nodes, no dominator tree. This is an agent
+  runtime, not an optimizer.
 
-Die Klammer ist präzise: **Lowering-Grenzen benennen, damit die 22 DSL-Invarianten (§22 in `agent-definition-dsl.md`) an einer Stelle durchgesetzt werden können.** Nicht mehr, nicht weniger.
+The scope is precise: **name the lowering boundaries so the DSL invariants
+(agent-definition-dsl.md §22) can be enforced in one place.** Nothing more,
+nothing less.

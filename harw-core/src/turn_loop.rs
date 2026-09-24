@@ -597,6 +597,10 @@ struct TurnMeter {
     /// Ob die Abschluss-Anweisung des Token-Budgets bereits ausgelöst wurde
     /// (nur für das einmalige Log; die Anweisung selbst bleibt danach aktiv).
     wrap_up_announced: bool,
+    /// Konkreter Grund eines `CancelReason::Budget`-Endes (welche Grenze mit
+    /// Wert und Verbrauch bzw. welcher Turn-Wächter); der erste gewinnt.
+    /// Siehe [`TurnControl::stop_detail`].
+    stop_detail: Option<String>,
 }
 
 /// Vorgabe-Schwelle (Prozent des Limits), ab der ein Turn mit
@@ -912,25 +916,46 @@ impl TurnControl {
         if let Some(reason) = self.cancel.reason() {
             return Some(reason);
         }
-        let meter = self.meter();
-        let fresh_exhausted = self.token_budget.is_some_and(|budget| {
-            budget.exhausted(
-                budget
-                    .used_before
-                    .saturating_add(meter.usage.fresh_tokens()),
-            )
+        let mut meter = self.meter();
+        let fresh_used = self.token_budget.map(|budget| {
+            budget
+                .used_before
+                .saturating_add(meter.usage.fresh_tokens())
         });
-        let exhausted = meter.model_rounds >= self.limits.max_model_rounds
-            || meter.usage.output_tokens >= self.limits.max_output_tokens_total
-            || fresh_exhausted
-            || self.wall_time_exceeded(&meter);
+        let fresh_exhausted = self
+            .token_budget
+            .zip(fresh_used)
+            .is_some_and(|(budget, used)| budget.exhausted(used));
+        let detail = if meter.model_rounds >= self.limits.max_model_rounds {
+            Some(format!(
+                "Rundenlimit des Turns erreicht ({}/{} Modellrunden)",
+                meter.model_rounds, self.limits.max_model_rounds
+            ))
+        } else if meter.usage.output_tokens >= self.limits.max_output_tokens_total {
+            Some(format!(
+                "Ausgabe-Token-Limit des Turns erreicht ({}/{} Tokens)",
+                meter.usage.output_tokens, self.limits.max_output_tokens_total
+            ))
+        } else if fresh_exhausted {
+            Some(format!(
+                "Token-Budget erschöpft ({}/{} Tokens)",
+                fresh_used.unwrap_or(0),
+                self.token_budget.map_or(0, |budget| budget.limit)
+            ))
+        } else if self.wall_time_exceeded(&meter) {
+            Some(self.wall_time_detail())
+        } else {
+            None
+        };
         if fresh_exhausted {
             tracing::warn!(
                 limit = self.token_budget.map_or(0, |budget| budget.limit),
                 "turn_loop.token_budget_exhausted"
             );
         }
-        exhausted.then_some(CancelReason::Budget)
+        let detail = detail?;
+        meter.stop_detail.get_or_insert(detail);
+        Some(CancelReason::Budget)
     }
 
     // Prüfpunkt vor dem Auslösen von `count` Werkzeugaufrufen.
@@ -938,12 +963,51 @@ impl TurnControl {
         if let Some(reason) = self.cancel.reason() {
             return Some(reason);
         }
-        let meter = self.meter();
+        let mut meter = self.meter();
         let requested =
             u64::from(meter.tool_calls).saturating_add(u64::try_from(count).unwrap_or(u64::MAX));
-        let exhausted =
-            requested > u64::from(self.limits.max_tool_calls) || self.wall_time_exceeded(&meter);
-        exhausted.then_some(CancelReason::Budget)
+        let detail = if requested > u64::from(self.limits.max_tool_calls) {
+            Some(format!(
+                "Werkzeug-Limit des Turns erreicht ({requested}/{} Aufrufe)",
+                self.limits.max_tool_calls
+            ))
+        } else if self.wall_time_exceeded(&meter) {
+            Some(self.wall_time_detail())
+        } else {
+            None
+        };
+        let detail = detail?;
+        meter.stop_detail.get_or_insert(detail);
+        Some(CancelReason::Budget)
+    }
+
+    // Beschreibung eines Wanduhr-Endes mit Grenze.
+    fn wall_time_detail(&self) -> String {
+        format!(
+            "Zeitlimit des Turns erreicht ({} s)",
+            self.limits.wall_time.as_secs()
+        )
+    }
+
+    /// Vermerkt den konkreten Grund eines `CancelReason::Budget`-Endes (z. B.
+    /// einen Abbruch durch einen Turn-Wächter). Ein bereits vermerkter Grund
+    /// bleibt stehen.
+    pub(crate) fn note_stop_detail(&self, detail: impl Into<String>) {
+        self.meter()
+            .stop_detail
+            .get_or_insert_with(|| detail.into());
+    }
+
+    /// Der konkrete Grund, aus dem dieser Turn mit `CancelReason::Budget`
+    /// endete: welche Grenze (mit Wert und Verbrauch) oder welcher
+    /// Turn-Wächter. `None`, solange kein solches Ende eintrat.
+    ///
+    /// # Concurrency
+    /// Klone teilen den Zähler; der Aufrufer (z. B. der Kind-Spawner) liest
+    /// den Grund über seinen eigenen Klon.
+    #[must_use]
+    pub fn stop_detail(&self) -> Option<String> {
+        self.meter().stop_detail.clone()
     }
 }
 
@@ -1632,6 +1696,30 @@ fn is_valid_handoff_role(role: &str) -> bool {
             .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
 }
 
+/// Rollenname des Host-Shell-Arms der UIA, der Root-Befehle über
+/// `host.sudo_exec` anfragen darf (`harw_registry_defaults::profile::
+/// role_names::UIA_SHELL_WORKER`; `harw-core` hängt nicht von
+/// `harw-registry-defaults` ab, deshalb als Literal).
+const SUDO_HANDOFF_ROLE: &str = "uia-shell-worker";
+
+/// Zusatz zur Beschreibung von `transfer_to_<role>` für Rollen, deren Zweck
+/// das Modell sonst nicht aus dem Namen errät.
+///
+/// # Beschreibung
+/// Heute nur `uia-shell-worker`: ohne diesen Satz sagte die UIA „sudo geht
+/// nicht“, statt Root-Befehle dorthin zu delegieren. Jede andere Rolle
+/// bekommt einen leeren Zusatz (Beschreibung unverändert).
+fn handoff_role_hint(role: &str) -> &'static str {
+    if role == SUDO_HANDOFF_ROLE {
+        " Host- und Root-Befehle (sudo): sudo funktioniert über diesen Agenten — er fragt \
+         `host.sudo_exec` an, der Nutzer bestätigt den exakten Befehl im Freigabefenster der \
+         TUI und gibt dort sein Passwort ein, falls sudo eines verlangt. Im Auftrag exakten \
+         Befehl und Grund nennen, nie ein Passwort."
+    } else {
+        ""
+    }
+}
+
 /// Baut die Werkzeugdefinition `transfer_to_<role>` für ein Delegationsziel.
 ///
 /// # Beschreibung
@@ -1654,27 +1742,20 @@ fn handoff_tool_spec(role: &str) -> ToolSpec {
     let mut properties = BTreeMap::new();
     properties.insert(
         "task".to_owned(),
-        string_property(
-            "Konkreter, eigenständig verständlicher Arbeitsauftrag für den Unteragenten. / \
-             Concrete, self-contained task for the sub-agent.",
-        ),
+        string_property("Konkreter, eigenständig verständlicher Arbeitsauftrag."),
     );
     properties.insert(
         "context".to_owned(),
-        string_property(
-            "Optionaler Zusatzkontext (Fakten, Pfade, Randbedingungen). / \
-             Optional extra context (facts, paths, constraints).",
-        ),
+        string_property("Optionaler Zusatzkontext (Fakten, Pfade, Randbedingungen)."),
     );
     // Runde 5, Teil J: Fortsetzung eines am Budget beendeten eigenen Kindes
     // derselben Rolle; geprüft von `ManagedAgentSpawner::admit`.
     properties.insert(
         "continue_from".to_owned(),
         string_property(
-            "Optional: ID eines eigenen Kindes dieser Rolle, das am Token-Budget endete. Das \
-             neue Kind bekommt dessen Übergabe als Kontext und ein frisches Budget (höchstens 3 \
-             Fortsetzungen je ursprünglichem Kind). / Optional: id of an own child of this role \
-             that ended at its token budget; the new child continues from its handoff.",
+            "Optional: ID eines eigenen, am Token-Budget beendeten Kindes dieser Rolle; das \
+             neue Kind setzt mit dessen Übergabe und frischem Budget fort (höchstens 3 \
+             Fortsetzungen je ursprünglichem Kind).",
         ),
     );
     // Runde 5, Teil K: Hintergrundlauf. Ausgewertet nur von der TUI für
@@ -1686,10 +1767,8 @@ fn handoff_tool_spec(role: &str) -> ToolSpec {
             schema_type: Some(JsonSchemaType::Boolean),
             description: Some(
                 "Optional: im Hintergrund laufen lassen (nur Orchestratoren der UIA in der TUI; \
-                 Vorgabe dort true). Das Werkzeug kehrt dann sofort mit {child_id, status, hint} \
-                 zurück, das Ergebnis kommt später als Benachrichtigung. false erzwingt \
-                 synchrones Warten. / Optional: run in the background (UIA orchestrators in the \
-                 TUI only; default true there); false forces a synchronous wait."
+                 Vorgabe dort true): sofortige Rückkehr mit {child_id, status, hint}, das \
+                 Ergebnis kommt als Benachrichtigung. false erzwingt synchrones Warten."
                     .to_owned(),
             ),
             ..JsonSchema::default()
@@ -1699,8 +1778,8 @@ fn handoff_tool_spec(role: &str) -> ToolSpec {
         name: ToolName::new(format!("{HANDOFF_PREFIX}{role}")),
         description: format!(
             "Delegiert eine Aufgabe an den Unteragenten '{role}' und wartet auf sein Ergebnis \
-             (ein Orchestrator der UIA läuft in der TUI im Hintergrund). / \
-             Delegates a task to the '{role}' sub-agent and waits for its result."
+             (ein Orchestrator der UIA läuft in der TUI im Hintergrund).{}",
+            handoff_role_hint(role)
         ),
         parameters: JsonSchema {
             schema_type: Some(JsonSchemaType::Object),
@@ -2437,6 +2516,17 @@ async fn apply_session_guard(
     denied
 }
 
+/// Vermerkt den Abbruch durch einen Turn-Wächter als konkreten Endgrund im
+/// Steuerblock des laufenden Turns ([`TurnControl::stop_detail`]), damit ein
+/// Kind-Endbericht „Turn-Wächter (no_progress_rounds): …" statt einer
+/// Vermutung nennt.
+fn note_guard_stop(session: &AgentSession, event: &crate::guard::DriftEvent) {
+    if let Some(control) = session.active_turn_control() {
+        let detail: String = event.detail.chars().take(200).collect();
+        control.note_stop_detail(format!("Turn-Wächter ({}): {detail}", event.kind.key()));
+    }
+}
+
 /// Wendet die Turn-Wächter (Addendum F+G) auf ein einzelnes, bereits
 /// berechnetes Tool-Ergebnis an.
 ///
@@ -2504,6 +2594,7 @@ async fn apply_tool_guard(
         GuardVerdict::Abort { event, hint } => {
             report_drift(session, store, &event).await;
             tracing::warn!(hint = %hint, "turn_loop.guard_abort");
+            note_guard_stop(session, &event);
             Some(CancelReason::Budget)
         }
     };
@@ -3847,6 +3938,7 @@ async fn drive_turn(
                     GuardVerdict::Abort { event, hint } => {
                         report_drift(session, store, &event).await;
                         tracing::warn!(hint = %hint, "turn_loop.guard_abort");
+                        note_guard_stop(session, &event);
                         return cancel_turn(session, handle, total_usage, CancelReason::Budget)
                             .await;
                     }
@@ -4384,6 +4476,7 @@ async fn drive_turn(
                 GuardVerdict::Abort { event, hint } => {
                     report_drift(session, store, &event).await;
                     tracing::warn!(hint = %hint, "turn_loop.guard_abort");
+                    note_guard_stop(session, &event);
                     return cancel_turn(session, handle, total_usage, CancelReason::Budget).await;
                 }
             }
@@ -5558,6 +5651,47 @@ fn state_store_error(error: StateStoreError, operation_name: &str) -> CoreError 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Ein Turn-Grenzen-Ende vermerkt die konkrete Grenze mit Wert (statt
+    /// „Token-Budget oder Turn-Wächter"); der erste Grund gewinnt.
+    #[test]
+    fn budget_checkpoints_record_the_concrete_limit() {
+        let rounds = TurnControl::new().with_limits(TurnLimits {
+            max_model_rounds: 0,
+            ..TurnLimits::unlimited()
+        });
+        assert_eq!(rounds.stop_detail(), None);
+        assert_eq!(rounds.model_checkpoint(), Some(CancelReason::Budget));
+        assert_eq!(
+            rounds.stop_detail().as_deref(),
+            Some("Rundenlimit des Turns erreicht (0/0 Modellrunden)")
+        );
+        rounds.note_stop_detail("später");
+        assert!(
+            rounds
+                .stop_detail()
+                .is_some_and(|d| d.starts_with("Rundenlimit"))
+        );
+
+        let tools = TurnControl::new().with_limits(TurnLimits {
+            max_tool_calls: 2,
+            ..TurnLimits::unlimited()
+        });
+        assert_eq!(tools.tool_checkpoint(2), None);
+        assert_eq!(tools.tool_checkpoint(3), Some(CancelReason::Budget));
+        // Klone teilen den Grund (so liest ihn der Kind-Spawner).
+        assert_eq!(
+            tools.clone().stop_detail().as_deref(),
+            Some("Werkzeug-Limit des Turns erreicht (3/2 Aufrufe)")
+        );
+
+        let budget = TurnControl::new().with_token_budget(TurnTokenBudget::new(100, 150));
+        assert_eq!(budget.model_checkpoint(), Some(CancelReason::Budget));
+        assert_eq!(
+            budget.stop_detail().as_deref(),
+            Some("Token-Budget erschöpft (150/100 Tokens)")
+        );
+    }
     use crate::activation::{SessionActivation, ToolProfile};
     use crate::session::AgentSession;
     use crate::test_support::{TestError, TestResult, ctx};
@@ -9245,6 +9379,32 @@ mod tests {
         // Runde 5, Teil J: optionale Fortsetzung, der Auftrag bleibt Pflicht.
         assert!(properties.contains_key("continue_from"));
         Ok(())
+    }
+
+    /// `transfer_to_uia-shell-worker` sagt, dass sudo über diesen Agenten
+    /// funktioniert (Freigabe und Passwort im TUI-Fenster); andere
+    /// Handoff-Beschreibungen bleiben ohne Zusatz.
+    #[test]
+    fn uia_shell_worker_handoff_names_the_sudo_path() {
+        let ToolSpec::Function(shell) = handoff_tool_spec("uia-shell-worker");
+        for phrase in [
+            "sudo funktioniert über diesen Agenten",
+            "`host.sudo_exec`",
+            "gibt dort sein Passwort ein",
+            "nie ein Passwort",
+        ] {
+            assert!(
+                shell.description.contains(phrase),
+                "{phrase}: {}",
+                shell.description
+            );
+        }
+        let ToolSpec::Function(explorer) = handoff_tool_spec("explorer");
+        assert!(
+            !explorer.description.contains("sudo"),
+            "{}",
+            explorer.description
+        );
     }
 
     #[test]

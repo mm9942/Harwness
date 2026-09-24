@@ -10,8 +10,10 @@
 //! [`harw_provider_http::resolve_provider_credential`] auf. Gelingt das,
 //! installiert sie den prozessweiten Mistral-OCR-Client der Crate
 //! `harw-tool-doc` (`harw_tool_doc::install_mistral_ocr`) mit
-//! [`harw_tool_doc::DEFAULT_OCR_MODEL`]; `doc.read_pdf` greift danach über
-//! `harw_tool_doc::mistral_ocr()` auf ihn zu. Ohne passenden Provider, ohne
+//! [`harw_tool_doc::DEFAULT_OCR_MODEL`] und dem Freigabe-Modus aus
+//! `[tools.doc].remote_ocr`; `doc.read_pdf` greift danach über
+//! `harw_tool_doc::mistral_ocr()` auf ihn zu. Bei `remote_ocr = "off"`
+//! installiert sie gar nichts. Ohne passenden Provider, ohne
 //! auflösbares Credential oder bei einem Installationsfehler bleibt
 //! `doc.read_pdf` beim lokalen `oxidize-pdf`-Pfad — diese Funktion bricht
 //! einen Laufzeitpfad nie ab.
@@ -39,9 +41,11 @@
 use std::collections::HashMap;
 use std::path::Path;
 
-use harw_config::{ProviderToml, ResolvedConfig};
+use harw_config::{ProviderToml, RemoteOcrMode, ResolvedConfig};
 use harw_provider_http::SecretResolver;
-use harw_tool_doc::{DEFAULT_OCR_MODEL, DocToolError, MistralOcrConfig, install_mistral_ocr};
+use harw_tool_doc::{
+    DEFAULT_OCR_MODEL, DocToolError, MistralOcrConfig, RemoteOcrApproval, install_mistral_ocr,
+};
 
 /// Host des offiziellen Mistral-API-Endpunkts, gegen den `base_url` geprüft wird.
 const MISTRAL_API_HOST: &str = "api.mistral.ai";
@@ -50,9 +54,9 @@ const MISTRAL_API_HOST: &str = "api.mistral.ai";
 /// erkennt (Kleinschreibung unbeachtet).
 const MISTRAL_PROVIDER_NAME: &str = "mistral";
 
-/// Installiert das Mistral-OCR-Backend für `doc.read_pdf`, falls ein
-/// aktivierter Mistral-Provider konfiguriert und sein Credential auflösbar
-/// ist.
+/// Installiert das Mistral-OCR-Backend für `doc.read_pdf`, falls
+/// `[tools.doc].remote_ocr` nicht `off` ist, ein aktivierter
+/// Mistral-Provider konfiguriert und sein Credential auflösbar ist.
 ///
 /// # Beschreibung
 /// Sucht über [`find_mistral_provider`] den ersten passenden Provider in
@@ -108,6 +112,10 @@ pub fn install_doc_ocr(
     home: Option<&Path>,
     resolver: Option<&dyn SecretResolver>,
 ) {
+    let Some(approval) = remote_ocr_approval(config.harness.tools.doc.remote_ocr) else {
+        tracing::info!("doc.read_pdf: remote OCR disabled by config, nutzt lokale Extraktion");
+        return;
+    };
     let Some((provider_id, provider)) = find_mistral_provider(&config.providers) else {
         tracing::debug!(
             "doc.read_pdf: kein aktivierter Mistral-Provider konfiguriert, nutzt lokale Extraktion"
@@ -145,9 +153,13 @@ pub fn install_doc_ocr(
         model: DEFAULT_OCR_MODEL.to_owned(),
     };
 
-    match install_mistral_ocr(ocr_config) {
+    match install_mistral_ocr(ocr_config, approval) {
         Ok(()) => {
-            tracing::info!(provider = provider_id, "doc.read_pdf nutzt Mistral OCR");
+            tracing::info!(
+                provider = provider_id,
+                approval = ?approval,
+                "doc.read_pdf nutzt Mistral OCR"
+            );
         }
         Err(DocToolError::AlreadyConfigured) => {
             tracing::debug!(
@@ -162,6 +174,16 @@ pub fn install_doc_ocr(
                 "doc.read_pdf: Mistral-OCR-Client konnte nicht installiert werden, nutzt lokale Extraktion"
             );
         }
+    }
+}
+
+// Übersetzt `[tools.doc].remote_ocr` in den Freigabe-Modus des
+// OCR-Clients; `None` bei `off` (dann wird kein Client installiert).
+fn remote_ocr_approval(mode: RemoteOcrMode) -> Option<RemoteOcrApproval> {
+    match mode {
+        RemoteOcrMode::Off => None,
+        RemoteOcrMode::Ask => Some(RemoteOcrApproval::Ask),
+        RemoteOcrMode::On => Some(RemoteOcrApproval::Auto),
     }
 }
 
@@ -204,7 +226,10 @@ mod tests {
 
     use harw_config::{OriginAllowlistToml, ProviderToml, SecretRef};
 
-    use super::find_mistral_provider;
+    use harw_config::{RemoteOcrMode, ResolvedConfig};
+    use harw_tool_doc::RemoteOcrApproval;
+
+    use super::{find_mistral_provider, install_doc_ocr, remote_ocr_approval};
     use crate::test_support::{TestError, TestResult};
 
     // Minimaler, vollständiger `ProviderToml`-Testwert; nur `base_url` und
@@ -318,5 +343,40 @@ mod tests {
 
         assert!(find_mistral_provider(&providers).is_none());
         Ok(())
+    }
+
+    #[test]
+    fn remote_ocr_approval_maps_config_modes() {
+        assert_eq!(remote_ocr_approval(RemoteOcrMode::Off), None);
+        assert_eq!(
+            remote_ocr_approval(RemoteOcrMode::Ask),
+            Some(RemoteOcrApproval::Ask)
+        );
+        assert_eq!(
+            remote_ocr_approval(RemoteOcrMode::On),
+            Some(RemoteOcrApproval::Auto)
+        );
+    }
+
+    // `remote_ocr = "off"` installiert keinen Client, obwohl ein Mistral-
+    // Provider mit auflösbarem Credential konfiguriert ist. Kein anderer
+    // Test dieser Crate installiert einen OCR-Client, der prozessweite
+    // `OnceLock` bleibt darum leer.
+    #[test]
+    fn install_doc_ocr_off_installs_no_client() {
+        let mut config = ResolvedConfig::default();
+        config.harness.tools.doc.remote_ocr = RemoteOcrMode::Off;
+        config.providers.insert(
+            "mistral".to_owned(),
+            test_provider("https://api.mistral.ai/v1", true),
+        );
+        config
+            .env_layer
+            .insert("TEST_API_KEY".to_owned(), "sk-test".to_owned());
+
+        install_doc_ocr(&config, None, None);
+
+        assert!(harw_tool_doc::remote_ocr_target().is_none());
+        assert!(harw_tool_doc::mistral::mistral_ocr().is_none());
     }
 }

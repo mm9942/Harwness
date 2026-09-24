@@ -1,67 +1,108 @@
-# killer — Design und Umsetzung
+# harw-killer — design and implementation
 
-Auftrag: Bash-Tool durch ein nutzbares Rust-Projekt mit Clap, präziser
-Prozessauswahl und bewusst doppeltem SIGKILL ersetzen.
+> Status: implemented · Last reviewed: 2026-09-24
 
-## Entscheidungen
+Goal: a precise, Linux-only process terminator with clap-based argument
+parsing and a deliberate double-SIGKILL termination sequence, usable both as
+a standalone binary and as a library integrated into the `harw` agent
+harness.
 
-- Linux-only, `/proc` + Kernel-pidfds, keine Shell-basierte Suche.
-- Mehrere exakte ausführbare Dateinamen mit -p/--process (Fallback `comm`);
-  kombinierbar mit mehreren expliziten --pid-Werten. Kein Regex.
-- PID 1, eigener Prozess und Vorfahren bleiben ausgeschlossen.
-- Geöffnete pidfds binden die Auswahl an die Prozessinstanz. Vor/nach Öffnen
-  wird die Startzeit geprüft; zusätzlich wird geprüft, ob das pidfd bereits
-  Exit meldet, bevor die Auswahl akzeptiert wird.
-- Vorschau, Bestätigung bzw. `--yes`, `--dry-run`, JSON.
-- KILL an die eigenen Ziele, gemeinsamer Timeout, nochmals KILL an Überlebende,
-  begrenzte Nachkontrolle. Zombies zählen als beendet.
-- Fremde Ziele: `sudo` führt einen internen Helfer aus. Dieser dupliziert mit
-  `pidfd_getfd` das bereits gehaltene pidfd des Elternprozesses. Keine erneute
-  Suche, keine Signalzustellung über nackte numerische Ziel-PIDs.
-- Falls Kernel/Ptrace-/sudo-Policy diesen Weg blockieren, Fehler statt
-  unsicherem Fallback. Ein bewusst als root gestarteter Aufruf braucht keinen Helfer.
-- Keine Prozessgruppen, Nachfahrenauswahl oder dauerhaftes Nachverfolgen von
-  neu gestarteten Prozessen in v0.1. Ein pidfd bindet die Prozessinstanz, nicht
-  ihr Programm: ein späteres `exec` bleibt dieselbe Instanz.
+## Decisions
 
-## Modulgrenzen und Umsetzung
+- Linux-only, `/proc` plus kernel pidfds; no shell-based process search.
+- Multiple exact executable names via `-p`/`--process` (falls back to
+  `comm`); combinable with multiple explicit `--pid` values. No regex.
+- PID 1, the calling process itself, and its ancestors are always excluded.
+- Open pidfds bind the selection to the process *instance*. Start time is
+  checked before/after opening; the pidfd is also checked for an already
+  observed exit before the selection is accepted.
+- Preview, interactive confirmation or `--yes`, `--dry-run`, `--json`.
+- KILL to owned targets, a shared timeout, a second KILL to survivors, and a
+  bounded follow-up check. Zombies count as terminated.
+- Foreign-owned targets: `sudo` runs an internal helper, which duplicates
+  the parent's already-held pidfd via `pidfd_getfd`. No re-search by
+  name/PID, no signalling through bare numeric target PIDs.
+- If a kernel/ptrace/sudo policy blocks that path, the result is an error,
+  never an unsafe fallback. A caller already running as root needs no
+  helper.
+- No process groups, descendant selection, or persistent tracking of
+  newly-started processes in v0.1. A pidfd binds the process instance, not
+  its program: a later `exec` remains the same instance.
+- SIGKILL as the first signal, plus the retry, are an explicit, deliberate
+  choice — there is no SIGTERM phase and no `--no-kill`/`--no-retry` switch.
+  The default algorithm always runs both KILL phases while targets remain
+  alive; a reused PID never receives a second signal it wasn't selected for.
+- The CLI is intentionally generic: `-p`/`--process` takes exact executable
+  names, `--pid` takes positive PIDs; both form a union, `--uid` filters
+  it. No Rust-specific flags, regex, substrings, or positional arguments.
 
-1. `cli.rs`: Auswahl, Optionen, Validierung.
-2. `process.rs`: Procfs-Snapshot, Startzeit, Vorfahren, Auswahl.
-3. `pidfd.rs`: sichere rustix-Grenze; OwnedFd und poll.
-4. `engine.rs`: KILL, Timeout, KILL und Ergebniszustände.
-5. `main.rs`: Vorschau, Zustimmung, Rechtewechsel, Ausgabe/Exitcodes.
-6. Integrationstests mit isolierten eigenen Kindern; CI, README, Paket.
+## Module boundaries
 
-Kein setuid-Binary und kein installierter privilegierter Dienst. `sudo` startet
-gewöhnlichen ausführbaren Code als root: nur ein selbst gebautes/vertrautes
-Binary verwenden, keine pauschale NOPASSWD-Regel auf schreibbare Dateien setzen.
+1. `cli.rs` — selection, options, validation.
+2. `process.rs` — procfs snapshot, start time, ancestry, selection.
+3. `pidfd.rs` — safe rustix boundary; `OwnedFd` and poll.
+4. `engine.rs` — KILL, timeout, KILL, and result states.
+5. `main.rs` / `lib.rs` — preview, confirmation, privilege escalation,
+   output/exit codes.
+6. Integration tests with isolated, self-owned child processes.
 
-## Verbindliche Nutzerkorrektur
+No setuid binary and no installed privileged service. `sudo` runs ordinary
+executable code as root: only a self-built/trusted binary is used, never a
+blanket `NOPASSWD` rule on a file other users can write.
 
-SIGKILL auch als erstes Signal und die Wiederholung sind ausdrücklich gewollt.
-Die anfangs angenommene SIGTERM-Phase ist verworfen. Kein --no-kill/--no-retry-
-Schalter: der Standardalgorithmus führt beide KILL-Phasen aus, soweit Ziele
-noch leben. Kein zweites Signal an eine wiederverwendete PID.
+## Integration into Harwness
 
-## Generische CLI (Nutzerkorrektur)
+`harw-killer` is a regular workspace crate (`harw-killer`); its termination
+semantics are unchanged from the standalone design above.
 
--p/--process nimmt mehrere exakte ausführbare Namen entgegen; --pid mehrere
-positive PIDs. Beide Selektoren bilden eine Vereinigung, --uid filtert diese.
-Keine Rust-spezifischen Flags, Regex, Teilstrings oder Positionsargumente.
+- `src/lib.rs`: all CLI orchestration (`run_cli`, `HelperInvocation`).
+  `main.rs` is only a thin entry point for the `killer` binary.
+- `HelperInvocation::Standalone` starts the sudo helper as before, as
+  `<exe> --helper …`; `HelperInvocation::Subcommand(["kill"])` starts it as
+  `<exe> kill --helper …`, so that `harw kill …` takes the same path.
+- `src/api.rs`: a programmatic interface for agents (`preview`,
+  `kill_own`). It uses the same selection and the same KILL/wait/KILL
+  engine, but **never** starts sudo: foreign-owned targets get an error
+  result instead.
+- `harw kill` (in `harw-cli`) forwards all arguments unchanged to
+  `run_cli`.
+- The agent tools `process.list` (preview only) and `process.kill`
+  (approval-gated) live in the `harw-tool-process` crate and call into
+  `src/api.rs`. See `harw-tool-process/src/provider.rs` for the exact
+  security contract: `process.kill` requires `Permission::ExecuteProcess`,
+  is never in `AUTO_APPROVED_TOOLS`, and is always in `ALWAYS_ASK_TOOLS`
+  (`harw-registry-defaults`) — in `ask` and `auto` it asks for approval
+  every time, even with a matching allow rule. Under `FullAccess` nothing
+  asks, including `process.kill`.
 
-## Integration in Harwness
+## Design principles
 
-Das Projekt lebt als Workspace-Crate `harw-killer` weiter; Semantik unverändert.
+These principles, distilled from the crate's internal style guide, apply
+project-wide beyond this crate's own scope:
 
-- `src/lib.rs`: gesamte CLI-Orchestrierung (`run_cli`, `HelperInvocation`).
-  `main.rs` ist nur noch ein dünner Einstieg für das `killer`-Binary.
-- `HelperInvocation::Standalone` startet den sudo-Helfer wie bisher als
-  `<exe> --helper …`; `HelperInvocation::Subcommand(["kill"])` als
-  `<exe> kill --helper …`, damit `harw kill …` denselben Weg nimmt.
-- `src/api.rs`: programmatische Schnittstelle für Agenten (`preview`,
-  `kill_own`). Sie verwendet dieselbe Auswahl und dieselbe KILL/Warte/KILL-
-  Engine, startet aber **nie** sudo: fremde Ziele erhalten ein Fehlerergebnis.
-- `harw kill` (harw-cli) reicht alle Argumente unverändert an `run_cli` durch.
-- Agent-Werkzeuge `process.list` (nur Vorschau) und `process.kill`
-  (freigabepflichtig) liegen im Crate `harw-tool-process`.
+- **Module split by responsibility.** Error domain, data types, CLI
+  parsing, low-level kernel access, and orchestration logic each live in
+  their own module (see the layout table in `README.md`), rather than one
+  large file.
+- **A handwritten crate error type.** `Error` in `src/error.rs` is a plain
+  enum with named variants and preserved source chains (no `anyhow`,
+  `thiserror`, `failure`, or general-purpose logging crate in the
+  production dependency graph). Context is attached at I/O boundaries; no
+  production code uses `unwrap`/`expect`.
+- **Typestate for confirmation.** `Plan<Selected>` becomes `Plan<Approved>`
+  only by consuming `self` (`src/typestate/`), so a plan cannot be acted on
+  before it has been explicitly approved, and the type system — not a
+  runtime flag — enforces the ordering.
+- **`#![forbid(unsafe_code)]`.** Low-level operations (`pidfd_open`,
+  `pidfd_getfd`, signalling, polling) are delegated to the safe `rustix`
+  API rather than hand-written `unsafe` blocks.
+- **No panics in production paths.** Fallible operations return `Result`;
+  optional procfs metadata that is missing gets a documented fallback and
+  diagnostic instead of a panic, while required values fail explicitly.
+- **Structured tracing, not ad-hoc printing.** Operational diagnostics go
+  through `tracing` with a single installed subscriber, `--log LEVEL`, and
+  structured fields; CLI report data (tables, JSON) is kept separate from
+  diagnostic output.
+- **Synchronous design.** No threads or async tasks are spawned; the CLI
+  and engine block the calling thread deliberately, which keeps the
+  KILL/wait/KILL sequence easy to reason about and test.

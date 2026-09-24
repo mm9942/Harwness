@@ -244,6 +244,88 @@ impl WorkspaceGraph {
         })
     }
 
+    /// Lädt mehrere Cargo-Workspaces und führt sie zu **einem** Graphen
+    /// zusammen.
+    ///
+    /// # Description
+    /// Jeder Workspace wird mit [`Self::load`] gelesen. [`Self::load`]
+    /// klassifiziert eine Abhängigkeit nur dann als intern, wenn sie ein
+    /// Member *desselben* Workspace ist. Zeigt ein Crate per `path` auf ein
+    /// Member eines anderen geladenen Workspace (etwa ein DoD-Crate unter
+    /// `dod/` auf `harw-types` im Produkt-Workspace), landet die Kante dort
+    /// in `external_deps` und die Hülle endet an ihr. Diese Funktion
+    /// verschiebt solche Einträge nach `deps`, setzt `is_leaf` neu und
+    /// berechnet die Ebenen über den zusammengeführten Graphen.
+    ///
+    /// Taucht dasselbe Manifest in zwei Workspaces auf (überlappende
+    /// Wurzeln), bleibt es einmal im Graphen. Tragen zwei *verschiedene*
+    /// Manifeste denselben Crate-Namen, ist das ein Fehler, kein stilles
+    /// „erstes gewinnt".
+    ///
+    /// # Arguments
+    /// - `roots` (`&[&Path]`): die Workspace-Wurzeln; die erste wird zu
+    ///   [`Self::root`] des Ergebnisses.
+    ///
+    /// # Errors
+    /// Jeder Fehler aus [`Self::load`], dazu
+    /// [`CodeGraphError::DuplicateMember`] bei einem doppelt vergebenen Namen
+    /// und [`CodeGraphError::CycleDetected`], falls erst die Kanten zwischen
+    /// den Workspaces einen Zyklus schließen. Eine leere `roots`-Liste ist
+    /// [`CodeGraphError::InvalidPath`]: ein Graph ohne Wurzel prüft nichts.
+    pub fn load_many(roots: &[&Path]) -> CodeGraphResult<Self> {
+        let Some(first_root) = roots.first() else {
+            return Err(CodeGraphError::InvalidPath {
+                path: "(keine Workspace-Wurzel übergeben)".to_owned(),
+            });
+        };
+
+        let mut crates: Vec<CrateNode> = Vec::new();
+        let mut manifest_by_name: HashMap<String, PathBuf> = HashMap::new();
+        for root in roots {
+            let graph = Self::load(root)?;
+            for node in graph.crates {
+                let canonical = fs::canonicalize(&node.manifest_path)?;
+                match manifest_by_name.get(&node.name) {
+                    Some(existing) if *existing == canonical => continue,
+                    Some(existing) => {
+                        return Err(CodeGraphError::DuplicateMember {
+                            name: node.name,
+                            first: existing.display().to_string(),
+                            second: canonical.display().to_string(),
+                        });
+                    }
+                    None => {
+                        manifest_by_name.insert(node.name.clone(), canonical);
+                        crates.push(node);
+                    }
+                }
+            }
+        }
+
+        let all_names: HashSet<String> = manifest_by_name.into_keys().collect();
+        for node in &mut crates {
+            let (now_internal, still_external): (Vec<String>, Vec<String>) = node
+                .external_deps
+                .drain(..)
+                .partition(|dep| all_names.contains(dep));
+            node.external_deps = still_external;
+            node.deps.extend(now_internal);
+            node.deps.sort();
+            node.deps.dedup();
+            node.is_leaf = node.deps.is_empty();
+        }
+
+        let level_map = compute_levels(&crates)?;
+        for node in &mut crates {
+            node.level = level_map.get(&node.name).copied().unwrap_or(0);
+        }
+
+        Ok(Self {
+            root: first_root.to_path_buf(),
+            crates,
+        })
+    }
+
     /// Sucht ein Crate anhand seines Namens.
     #[must_use]
     pub fn get(&self, name: &str) -> Option<&CrateNode> {
@@ -781,6 +863,109 @@ mod tests {
 
         fs::remove_dir_all(&root).ok();
         Ok(())
+    }
+
+    /// Baut zwei getrennte Workspaces nach: `prod` mit `a`, `b → a`, und
+    /// `side` mit `s → b` per `path` über die Workspace-Grenze hinweg sowie
+    /// einer echten externen Abhängigkeit `serde`.
+    fn write_two_workspaces(label: &str) -> TestResult<PathBuf> {
+        let base = scratch_dir(label)?;
+        let prod = base.join("prod");
+        let side = base.join("side");
+        fs::create_dir_all(&prod).map_err(ctx("prod anlegen"))?;
+        fs::create_dir_all(&side).map_err(ctx("side anlegen"))?;
+        write_crate(&prod, "a", &[])?;
+        write_crate(&prod, "b", &["a"])?;
+        write_root(&prod, &["a", "b"])?;
+        let s_dir = side.join("s");
+        fs::create_dir_all(&s_dir).map_err(ctx("Crate-Verzeichnis s anlegen"))?;
+        fs::write(
+            s_dir.join("Cargo.toml"),
+            "[package]\nname = \"s\"\nversion = \"0.1.0\"\n\n[dependencies]\nb = { path = \"../../prod/b\" }\nserde = \"1\"\n",
+        )
+        .map_err(ctx("Cargo.toml von s schreiben"))?;
+        write_root(&side, &["s"])?;
+        Ok(base)
+    }
+
+    #[test]
+    fn load_many_reclassifies_cross_workspace_path_dependency_as_internal() -> TestResult {
+        let base = write_two_workspaces("load-many-cross")?;
+        let prod = base.join("prod");
+        let side = base.join("side");
+
+        // Einzeln geladen endet die Kante an der Workspace-Grenze.
+        let side_only = WorkspaceGraph::load(&side).map_err(ctx("side allein laden"))?;
+        let s_alone = side_only
+            .get("s")
+            .ok_or(TestError::Missing("Crate s im Einzel-Graphen"))?;
+        assert!(s_alone.deps.is_empty());
+        assert_eq!(
+            s_alone.external_deps,
+            vec!["b".to_owned(), "serde".to_owned()]
+        );
+
+        let merged = WorkspaceGraph::load_many(&[prod.as_path(), side.as_path()])
+            .map_err(ctx("beide Workspaces laden"))?;
+        assert_eq!(merged.root, prod);
+        assert_eq!(merged.crates.len(), 3);
+        let s = merged
+            .get("s")
+            .ok_or(TestError::Missing("Crate s im zusammengeführten Graphen"))?;
+        assert_eq!(s.deps, vec!["b".to_owned()]);
+        assert_eq!(s.external_deps, vec!["serde".to_owned()]);
+        assert!(!s.is_leaf);
+        assert_eq!(s.level, 2, "a auf 0, b auf 1, s auf 2");
+
+        let levels = merged
+            .topological_levels()
+            .map_err(ctx("Ebenen des zusammengeführten Graphen"))?;
+        assert_eq!(levels.len(), 3);
+
+        fs::remove_dir_all(&base).ok();
+        Ok(())
+    }
+
+    #[test]
+    fn load_many_keeps_a_crate_loaded_twice_only_once() -> TestResult {
+        let base = write_two_workspaces("load-many-dedupe")?;
+        let prod = base.join("prod");
+
+        let merged = WorkspaceGraph::load_many(&[prod.as_path(), prod.as_path()])
+            .map_err(ctx("denselben Workspace zweimal laden"))?;
+        let mut names: Vec<&str> = merged.crates.iter().map(|c| c.name.as_str()).collect();
+        names.sort_unstable();
+        assert_eq!(names, vec!["a", "b"]);
+
+        fs::remove_dir_all(&base).ok();
+        Ok(())
+    }
+
+    #[test]
+    fn load_many_rejects_same_name_with_different_manifest() -> TestResult {
+        let base = write_two_workspaces("load-many-duplicate")?;
+        let prod = base.join("prod");
+        let other = base.join("other");
+        fs::create_dir_all(&other).map_err(ctx("other anlegen"))?;
+        write_crate(&other, "a", &[])?;
+        write_root(&other, &["a"])?;
+
+        let result = WorkspaceGraph::load_many(&[prod.as_path(), other.as_path()]);
+        assert!(
+            matches!(result, Err(CodeGraphError::DuplicateMember { ref name, .. }) if name == "a"),
+            "zwei verschiedene Manifeste mit demselben Namen dürfen nicht still verschmelzen: {result:?}"
+        );
+
+        fs::remove_dir_all(&base).ok();
+        Ok(())
+    }
+
+    #[test]
+    fn load_many_without_roots_is_an_error() {
+        assert!(matches!(
+            WorkspaceGraph::load_many(&[]),
+            Err(CodeGraphError::InvalidPath { .. })
+        ));
     }
 
     #[test]

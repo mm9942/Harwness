@@ -263,7 +263,38 @@ pub const WARDEN_ROOT: &str = "harw-warden";
 /// schrumpft — zum Beispiel durch ein `cargo update`, das die in
 /// `harw-dod-warden-proto/Cargo.toml` vermutete veraltete `jiff`-Auflösung
 /// auffrischt.
-pub const MAX_WARDEN_RUNTIME_DEPS: usize = 46;
+///
+/// **Sperrklinke 46 → 54 (2026-09-24), mit Begründung je Knoten.** Seit
+/// `harw-warden` im eigenen DoD-Workspace unter `dod/` liegt, fand dieses Gate
+/// seine Wurzel nicht mehr („nicht im Workspace-Graphen") und hat nichts
+/// gemessen. In dieser Zeit ist die Hülle ungemessen gewachsen. Nach dem
+/// Umbau auf den zusammengeführten Graphen und `dod/Cargo.lock` misst der Lauf
+/// 54 (intern 5, extern 49). Die acht Knoten lassen sich einzeln zuordnen:
+///
+/// - **+5 über `harw-types` → `tokio-util`** (`tokio-util`, `tokio`, `bytes`,
+///   `futures-core`, `futures-sink`): `CancelToken` wurde aus `harw-core`
+///   nach `harw-types` verschoben (F-160/G-017) und wickelt
+///   `tokio_util::sync::CancellationToken`. Der Warden benutzt
+///   `CancelToken` nicht, er braucht aus `harw-types` nur `CgroupId`,
+///   `FindingId`, `ApprovalActor` und `ContentDigest`. Die Kante ist für den
+///   Warden also unnötig, aber nicht mit einer Zeile lösbar: ein
+///   abschaltbares Feature in `harw-types` würde beim gemeinsamen Bau der
+///   vier DoD-Binaries (`dod/Makefile`, `build`) durch Feature-Vereinigung
+///   wieder eingeschaltet, dieses Gate zählte dann weniger, als tatsächlich
+///   gebaut wird. Die ehrliche Lösung ist, `CancelToken` aus `harw-types`
+///   herauszulösen (rund fünfzehn Verwender). Danach sinkt diese Zahl um
+///   fünf.
+/// - **+2 über `harw-completions`** (`harw-completions`, `clap_complete`):
+///   der Warden hat bewusst einen `completions`-Unterbefehl (Feature
+///   `clap-args`); `clap` selbst war schon vorher in der Hülle.
+/// - **+1 `harw-digest`**: `ContentDigest` ist aus `harw-types` in diese
+///   Leaf-Crate gewandert (Regel L7 im `edges`-Gate). Kein neuer Fremdcode —
+///   `blake3` und `serde` waren schon vorher in der Hülle —, nur ein neuer
+///   Knoten im selben Baum.
+///
+/// 46 + 5 + 2 + 1 = 54. Die Klinke gilt ab hier wieder: nicht steigen ohne
+/// neuen Absatz hier, jederzeit sinken.
+pub const MAX_WARDEN_RUNTIME_DEPS: usize = 54;
 
 /// Crate-Namen, deren Anwesenheit als `[build-dependencies]`-Kante ein
 /// verlässliches Zeichen für einen echten C-Übersetzer-Bauschritt ist —
@@ -841,6 +872,66 @@ fn resolve_workspace_edge(
     }
 }
 
+/// Die `[workspace.dependencies]`-Tabellen aller geladenen Workspaces, je
+/// mit ihrer Wurzel.
+///
+/// # Description
+/// Seit DoD ein eigener Workspace ist, erbt ein Crate unter `dod/` seine
+/// `workspace = true`-Angaben aus `dod/Cargo.toml`, ein Produkt-Crate wie
+/// `harw-types` dagegen aus der Wurzel-`Cargo.toml`. Beide Tabellen sind
+/// bewusst gleich gehalten, aber nicht identisch (die Wurzel kennt z. B.
+/// `include_dir`, DoD nicht). Eine einzige Tabelle für alle Kanten würde
+/// eine fehlende Angabe verdecken oder eine fremde Angabe unterschieben;
+/// deshalb wird je Elternteil die Tabelle des Workspace gewählt, in dessen
+/// Verzeichnis sein Manifest liegt ([`Self::for_crate`]).
+#[derive(Debug, Default)]
+struct WorkspaceDependencyTables {
+    /// `(Workspace-Wurzel, Tabelle)`, die tiefste Wurzel zuerst, damit
+    /// `dod/` vor `.` gewinnt.
+    tables: Vec<(std::path::PathBuf, HashMap<String, DependencyEdgeAttrs>)>,
+    /// Leere Tabelle für Elternteile außerhalb jedes geladenen Workspace
+    /// (Registry-Crates). Deren veröffentlichte Manifeste sind von Cargo
+    /// normalisiert und tragen kein `workspace = true`; tritt es doch auf,
+    /// meldet [`resolve_workspace_edge`] den fehlenden Eintrag als Problem.
+    empty: HashMap<String, DependencyEdgeAttrs>,
+}
+
+impl WorkspaceDependencyTables {
+    /// Liest `[workspace.dependencies]` aus jeder Wurzel in `roots`.
+    ///
+    /// # Errors
+    /// Wenn eine der Wurzel-`Cargo.toml`-Dateien nicht lesbar ist.
+    fn load(roots: &[&Path]) -> Result<Self, String> {
+        let mut tables = Vec::with_capacity(roots.len());
+        for root in roots {
+            tables.push((root.to_path_buf(), parse_workspace_dependencies(root)?));
+        }
+        tables.sort_by_key(|(root, _)| std::cmp::Reverse(root.components().count()));
+        Ok(Self {
+            tables,
+            empty: HashMap::new(),
+        })
+    }
+
+    /// Die Tabelle, gegen die `workspace = true`-Kanten von `parent`
+    /// aufgelöst werden: die des Workspace, unter dessen Wurzel das
+    /// Crate-Verzeichnis liegt; für Crates außerhalb des Graphen die leere
+    /// Tabelle.
+    fn for_crate(
+        &self,
+        graph: &WorkspaceGraph,
+        parent: &str,
+    ) -> &HashMap<String, DependencyEdgeAttrs> {
+        let Some(node) = graph.get(parent) else {
+            return &self.empty;
+        };
+        self.tables
+            .iter()
+            .find(|(root, _)| node.dir.starts_with(root))
+            .map_or(&self.empty, |(_, table)| table)
+    }
+}
+
 /// Ergänzt implizite Features für nicht namensraum-gebundene optionale
 /// Abhängigkeiten zur `[features]`-Tabelle eines Manifests.
 ///
@@ -1404,7 +1495,7 @@ struct ClosureBuilder<'a> {
     lock_by_name: HashMap<&'a str, Vec<&'a LockEntry>>,
     lock_by_key: HashMap<(String, String), &'a LockEntry>,
     locator: &'a RegistrySourceLocator,
-    workspace_deps: &'a HashMap<String, DependencyEdgeAttrs>,
+    workspace_deps: &'a WorkspaceDependencyTables,
     /// Je Crate-Name angeforderte Features / `default-features`-Stand aus
     /// dem *vorigen* Durchlauf von [`compute_closure`]s Fixpunkt-Schleife —
     /// read-only während dieses Durchlaufs.
@@ -1425,7 +1516,7 @@ impl<'a> ClosureBuilder<'a> {
         graph: &'a WorkspaceGraph,
         lock: &'a [LockEntry],
         locator: &'a RegistrySourceLocator,
-        workspace_deps: &'a HashMap<String, DependencyEdgeAttrs>,
+        workspace_deps: &'a WorkspaceDependencyTables,
         prev_requested_features: &'a HashMap<String, HashSet<String>>,
         prev_default_enabled: &'a HashMap<String, bool>,
     ) -> Self {
@@ -1489,7 +1580,8 @@ impl<'a> ClosureBuilder<'a> {
             .get(dep_name)
             .cloned()
             .unwrap_or_default();
-        let (attrs, problem) = resolve_workspace_edge(dep_name, &raw_attrs, self.workspace_deps);
+        let table = self.workspace_deps.for_crate(self.graph, parent_name);
+        let (attrs, problem) = resolve_workspace_edge(dep_name, &raw_attrs, table);
         if let Some(msg) = problem {
             self.result.problems.push(msg);
         }
@@ -1788,7 +1880,7 @@ fn compute_closure(
     graph: &WorkspaceGraph,
     lock: &[LockEntry],
     locator: &RegistrySourceLocator,
-    workspace_deps: &HashMap<String, DependencyEdgeAttrs>,
+    workspace_deps: &WorkspaceDependencyTables,
 ) -> ClosureResult {
     let mut requested_features: HashMap<String, HashSet<String>> = HashMap::new();
     let mut default_enabled: HashMap<String, bool> = HashMap::new();
@@ -1909,21 +2001,34 @@ fn evaluate_c_build(result: &ClosureResult) -> GateReport {
 /// Lädt Workspace-Graph, Lockfile und Registry-Locator und berechnet die
 /// Hülle einmalig — gemeinsame Grundlage für beide `run()`-Funktionen.
 ///
+/// # Description
+/// `harw-warden` ist ein Member des DoD-Workspace unter `dod/`. Maßgeblich
+/// für seine Hülle ist deshalb `dod/Cargo.lock` — das Lockfile, mit dem das
+/// Binary tatsächlich gebaut wird, und das auch die per `path` eingebundenen
+/// Produkt-Crates (`harw-types`, `harw-completions`, …) mit deren
+/// aufgelösten Kanten führt. Der Graph umfasst beide Workspaces
+/// ([`super::load_all_workspaces`]); `workspace = true` wird je Crate gegen
+/// die Tabelle seines eigenen Workspace aufgelöst
+/// ([`WorkspaceDependencyTables`]).
+///
+/// # Arguments
+/// - `repo_root` (`&Path`): Wurzel des Repositorys.
+///
 /// # Errors
-/// Wenn der Workspace-Graph, `Cargo.lock` oder `CARGO_HOME`/`HOME` nicht
-/// gelesen werden können. Ein einzelner nicht auflösbarer *Knoten* in der
-/// Hülle ist dagegen kein `Err` — siehe Moduldoku.
-fn load_and_compute() -> Result<ClosureResult, String> {
-    let root_path = Path::new(".");
-    let graph = WorkspaceGraph::load(root_path)
-        .map_err(|error| format!("Workspace-Graph nicht lesbar: {error}"))?;
-    let lock = parse_lock_entries(root_path)?;
+/// Wenn einer der Workspace-Graphen, `dod/Cargo.lock` oder
+/// `CARGO_HOME`/`HOME` nicht gelesen werden können. Ein einzelner nicht
+/// auflösbarer *Knoten* in der Hülle ist dagegen kein `Err` — siehe
+/// Moduldoku.
+fn load_and_compute(repo_root: &Path) -> Result<ClosureResult, String> {
+    let dod_root = repo_root.join(super::DOD_WORKSPACE);
+    let graph = super::load_all_workspaces(repo_root)?;
+    let lock = parse_lock_entries(&dod_root)?;
     let locator = RegistrySourceLocator::from_env()
         .map_err(|error| format!("Registry-Locator nicht verfügbar: {error}"))?;
-    // Neu mit der Feature-Auflösungs-Korrektur: die Wurzel-
-    // `[workspace.dependencies]`-Tabelle wird für `dep.workspace = true`
+    // Neu mit der Feature-Auflösungs-Korrektur: die
+    // `[workspace.dependencies]`-Tabellen werden für `dep.workspace = true`
     // gebraucht (siehe Moduldoku, Abschnitt „Feature-Auflösung").
-    let workspace_deps = parse_workspace_dependencies(root_path)?;
+    let workspace_deps = WorkspaceDependencyTables::load(&[repo_root, dod_root.as_path()])?;
 
     Ok(compute_closure(
         WARDEN_ROOT,
@@ -1936,6 +2041,8 @@ fn load_and_compute() -> Result<ClosureResult, String> {
 
 /// Gate 4: Warden-Abhängigkeitszahl (K53).
 pub mod dependency_budget {
+    use std::path::Path;
+
     use super::{GateReport, evaluate_dependency_budget, load_and_compute};
 
     /// Führt Gate 4 aus.
@@ -1961,13 +2068,15 @@ pub mod dependency_budget {
     /// println!("{}", report.summary());
     /// ```
     pub fn run() -> Result<GateReport, String> {
-        let result = load_and_compute()?;
+        let result = load_and_compute(Path::new("."))?;
         Ok(evaluate_dependency_budget(&result))
     }
 }
 
 /// Gate 5: kein C-Übersetzer im Warden-Teilbaum.
 pub mod c_build {
+    use std::path::Path;
+
     use super::{GateReport, evaluate_c_build, load_and_compute};
 
     /// Führt Gate 5 aus.
@@ -1992,7 +2101,7 @@ pub mod c_build {
     /// println!("{}", report.summary());
     /// ```
     pub fn run() -> Result<GateReport, String> {
-        let result = load_and_compute()?;
+        let result = load_and_compute(Path::new("."))?;
         // R3-03: `CBuildException::reason`/`::since` sind sonst nirgends
         // gelesen (einziger anderer Zugriff ist `.krate`/`.tool` in
         // `is_c_build_exception`) und würden clippys `-D warnings`
@@ -2693,6 +2802,105 @@ dependencies = []
         assert!(result.is_err());
 
         fs::remove_dir_all(&dir).ok();
+        Ok(())
+    }
+
+    #[test]
+    fn test_workspace_dependency_tables_pick_the_table_of_the_crates_own_workspace() -> TestResult {
+        let base =
+            std::env::temp_dir().join(format!("gate-warden-ws-tables-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&base);
+        let dod = base.join("dod");
+        fs::create_dir_all(&dod).map_err(ctx("Scratch-Verzeichnisse anlegen"))?;
+        fs::write(
+            base.join("Cargo.toml"),
+            "[workspace.dependencies]\nonly-root = \"1\"\n",
+        )
+        .map_err(ctx("Wurzel-Cargo.toml schreiben"))?;
+        fs::write(
+            dod.join("Cargo.toml"),
+            "[workspace.dependencies]\nonly-dod = \"2\"\n",
+        )
+        .map_err(ctx("dod/Cargo.toml schreiben"))?;
+
+        let tables = WorkspaceDependencyTables::load(&[base.as_path(), dod.as_path()])
+            .map_err(TestError::Unexpected)?;
+        let node = |name: &str, dir: std::path::PathBuf| CrateNode {
+            name: name.to_owned(),
+            version: "0.0.0".to_owned(),
+            manifest_path: dir.join("Cargo.toml"),
+            dir,
+            deps: Vec::new(),
+            dev_deps: Vec::new(),
+            build_deps: Vec::new(),
+            external_deps: Vec::new(),
+            is_leaf: true,
+            level: 0,
+        };
+        let graph = WorkspaceGraph {
+            root: base.clone(),
+            crates: vec![
+                node("prod-crate", base.join("prod-crate")),
+                node("dod-crate", dod.join("crates").join("dod-crate")),
+            ],
+        };
+
+        assert!(
+            tables
+                .for_crate(&graph, "prod-crate")
+                .contains_key("only-root")
+        );
+        assert!(
+            !tables
+                .for_crate(&graph, "prod-crate")
+                .contains_key("only-dod")
+        );
+        assert!(
+            tables
+                .for_crate(&graph, "dod-crate")
+                .contains_key("only-dod")
+        );
+        assert!(
+            !tables
+                .for_crate(&graph, "dod-crate")
+                .contains_key("only-root")
+        );
+        assert!(tables.for_crate(&graph, "registry-crate").is_empty());
+
+        fs::remove_dir_all(&base).ok();
+        Ok(())
+    }
+
+    /// Gegen den echten Repo-Stand: die Warden-Hülle wird über Produkt- und
+    /// DoD-Workspace hinweg berechnet und prüft etwas. Vorher fand das Gate
+    /// seine Wurzel nicht und meldete nur ein Problem.
+    #[test]
+    fn test_load_and_compute_on_real_repo_reaches_across_the_workspace_boundary() -> TestResult {
+        let repo_root = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .ok_or(TestError::Missing("Repo-Wurzel über xtask/"))?;
+
+        let result = load_and_compute(repo_root).map_err(TestError::Unexpected)?;
+
+        assert!(result.checked() > 0);
+        assert!(
+            !result
+                .problems
+                .iter()
+                .any(|p| p.contains("nicht im Workspace-Graphen")),
+            "{:?}",
+            result.problems
+        );
+        assert!(
+            result.internal.iter().any(|c| c == "harw-dod-warden"),
+            "DoD-interne Kante fehlt: {:?}",
+            result.internal
+        );
+        assert!(
+            result.internal.iter().any(|c| c == "harw-types"),
+            "Kante DoD → Produkt fehlt: {:?}",
+            result.internal
+        );
         Ok(())
     }
 }

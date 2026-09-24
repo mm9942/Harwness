@@ -1,225 +1,222 @@
-# `harw-dod`: Charta der Fassade
+# `harw-dod`: Charter of the Facade
 
-**Status:** Entwurf zur Diskussion, noch nicht normativ
-**Zweck dieses Dokuments:** Warum diese Fassade existiert, wie sie heißt,
-warum sie so heißt, was sie darf und was sie ausdrücklich nicht darf
-**Verwandt:** `harw-security-observability-plan.md`, `harw-context-plan.md`,
+> Status: implemented · Last reviewed: 2026-09-24
+
+**Purpose of this document:** why this facade exists, why it is named as it
+is, what it may do and what it explicitly may not do.
+**Related:** `harw-security-observability-plan.md`,
 `harw-dod-integration-and-dependencies.md`
 
 ---
 
-## 1. Warum überhaupt eine Fassade
+## 1. Why a facade at all
 
-Das Sicherheitssubsystem besteht aus acht Crates über vier Ebenen. Ohne
-Fassade müsste jeder Konsument die Schichtung kennen, aus welchem Crate
-`Finding` kommt, aus welchem `WardenAction`, welche Version welches Schemas
-gerade gilt. Das ist genau der Zustand, den `harw` für das SDK aufgelöst hat:
-eine Fassade auf L6 mit einem Prelude, hinter der die interne Schichtung
-umbaubar bleibt.
+The security subsystem is split across roughly thirty crates in the `dod/`
+workspace, at several layers: capability/data vocabulary
+(`harw-dod-cap`, `harw-dod-signals`, `harw-dod-readfs`, `harw-dod-fixtures`),
+thirteen `Sensor`-implementing crates (`harw-dod-cpu`, `-thermal`, `-memory`,
+`-blockio`, `-netcounters`, `-gpu`, `-cgroup`, `-listener`, `-scanreport`,
+`-workspace`, `-authlog`, `-fsmon`, `-procmon`), shared infrastructure that is
+not itself a sensor (`harw-dod-bpf`, `harw-dod-netlink`), event translation
+(`harw-dod-flow`), evaluation (`harw-dod-rules`, `harw-dod-sentinel`), and the
+escalation/enforcement chain (`harw-dod-escalate`, `harw-dod-warden-proto`,
+`harw-dod-warden`, `harw-dod-netpolicy`).
 
-Für Verteidigungscode ist das mehr als Bequemlichkeit. Eine Fassade ist eine
-**Reduktionsfläche**: sie legt fest, was von außen überhaupt erreichbar ist,
-und alles, was sie nicht reexportiert, existiert für Konsumenten nicht. Bei
-einem Subsystem, dessen halber Sinn darin besteht, Erreichbarkeit zu
-begrenzen, ist das kein Komfortmerkmal, sondern die Umsetzung von S1 auf
-Modulebene.
+Without a facade, every consumer would need to know this layering: which
+crate `Finding` comes from, which crate `WardenAction` comes from, which
+schema version currently applies. `harw-dod` (`dod/crates/harw-dod`) is that
+facade: a curated re-export surface, modeled on the same discipline as
+`harw-lens`'s facade, with no logic of its own.
 
----
-
-## 2. Der Name
-
-`harw-dod` folgt dem Muster von `harw`: kurzer Name, klare Zugehörigkeit,
-keine Beschreibung der Interna. Für das Kürzel gilt eine Festlegung, die
-diese Charta trifft:
-
-> **DoD steht in diesem Projekt für Detect, Orient, Defend.**
-
-Das ist kein Wortspiel um seiner selbst willen. Die drei Silben sind die drei
-Schichten des Subsystems, und sie stehen in genau der Reihenfolge, in der ein
-Befund sie durchläuft:
-
-**Detect** ist `harw-sensor`: lesen, messen, Ereignisse erzeugen. Keine
-Bewertung, keine Privilegien über Lesegruppen hinaus.
-
-**Orient** ist `harw-rules` plus die agentische Triage: einordnen. Was ist
-Vertragsverletzung, was Schwellwert, was Abweichung. Hier lebt das Wissen,
-die Baseline, die Historie, das Urteil.
-
-**Defend** ist `harw-escalate` plus `harw-warden`: die Leiter und der
-Durchsetzer. Reversibel vor irreversibel, geschlossene Aktionsmenge,
-Audit-Pflicht.
-
-Die Anspielung auf die OODA-Schleife (Observe, Orient, Decide, Act) ist
-gewollt. Und das Entscheidende ist, was im Kürzel **fehlt**:
-
-> **Das A für Act steht bewusst nicht im Namen.**
-
-Handeln in seiner irreversiblen Form gehört dem Menschen. Kill, Rollback,
-Entzug von Berechtigungen laufen niemals automatisch (S5, S11). Das Kürzel
-beschreibt exakt die drei Schritte, die das System allein gehen darf, und
-lässt den vierten weg. Wer den Namen liest und die Charta kennt, weiß damit
-sofort, wo die Grenze liegt.
-
-**Was der Name nicht bedeutet.** Kein Department, keine Behörde, kein
-Machtzentrum. Die Fassade ist ein Reexport-Modul ohne eigene Logik und ohne
-eigene Rechte. Sie ist der schmalste Teil des Systems, nicht der mächtigste.
-Das ist wichtig genug, um es in die Crate-Doku zu schreiben, weil das Kürzel
-sonst eine Erwartung weckt, die die Architektur ausdrücklich nicht erfüllt.
+For defensive code this is more than convenience. A facade is a **reduction
+surface**: it fixes what is reachable from the outside, and anything it does
+not re-export does not exist for consumers. For a subsystem whose entire
+point is to bound reachability, that is not a comfort feature — it is the
+enforcement of the "structurally prevent, don't just police" principle at
+the module level.
 
 ---
 
-## 3. Was die Fassade ist
+## 2. The name
 
-```rust
-//! `harw-dod` — Detect, Orient, Defend.
-//! Fassade des Sicherheits- und Verteidigungssubsystems.
-//!
-//! Diese Crate enthält KEINE Logik. Sie reexportiert Typen und
-//! Einstiegspunkte und hält das Prelude. Wer Verhalten ändern will,
-//! ändert es in der Crate, die es besitzt.
+`harw-dod` follows the pattern of `harw`: a short name, clear ownership, no
+description of internals. The acronym has a fixed meaning:
 
-pub mod detect {   // aus harw-signals, harw-sensor
-    pub use harw_signals::{SecurityEvent, EventKind, Actor, HostSample, SampleScope};
-    pub use harw_sensor::{Sensor, SensorCapability, SensorHandle, Unbound, Bound};
-}
+> **DoD stands, in this project, for Detect, Orient, Defend.**
 
-pub mod orient {   // aus harw-signals, harw-rules
-    pub use harw_signals::{Finding, Raw, RuleChecked, Triaged, Hardness, Severity,
-                           Verdict, Assessment, ProposedAction};
-    pub use harw_rules::{Rule, RuleContext, Baseline, Expectation, BaselineIndex};
-}
+This is not wordplay for its own sake. The three syllables are the three
+layers a finding passes through, in that order:
 
-pub mod defend {   // aus harw-escalate, harw-warden-proto
-    pub use harw_escalate::{Action, Proposed, Authorized, Ladder, Freeze,
-                            FreezeActive, FreezeResolved, dispatch};
-    pub use harw_warden_proto::{WardenAction, WardenRequest, AuthorizationProof};
-}
+**Detect** is the thirteen `Sensor` crates plus `harw-dod-cap` /
+`harw-dod-signals`: read, measure, produce events. No judgment, no
+privileges beyond their declared read scope.
 
-pub mod prelude { /* die zwanzig Typen, die man wirklich täglich braucht */ }
-```
+**Orient** is `harw-dod-rules` (plus `harw-dod-sentinel` as the aggregator):
+classification. Contract violation vs. threshold vs. drift. This is where
+baselines, history and verdicts live.
 
-Der Zuschnitt in `detect`, `orient`, `defend` ist bewusst nicht der
-Crate-Zuschnitt. Ein Konsument denkt in Phasen, nicht in Abhängigkeitsebenen.
-Dass `Finding` in `harw-signals` wohnt und `Rule` in `harw-rules`, ist eine
-Frage der Schichtung; dass beide zum Einordnen gehören, ist die Frage des
-Nutzers.
+**Defend** is `harw-dod-escalate` plus `harw-dod-warden`: the ladder and the
+enforcer. Reversible before irreversible, a closed action set, mandatory
+audit.
 
----
+The allusion to the OODA loop (Observe, Orient, Decide, Act) is intentional.
+What matters is what is **missing** from the acronym:
 
-## 4. Was die Fassade ausdrücklich nicht ist
+> **The A for Act is deliberately not in the name.**
 
-**Kein Ort für Logik.** Kein `impl`, keine Funktion mit Verhalten, keine
-Hilfsroutine, die sich irgendwo sonst nicht unterbringen ließ. Fassaden, die
-anfangen, Dinge selbst zu erledigen, werden zu Sammelbecken.
+Irreversible action belongs to the human. Kill, rollback, revocation of
+permissions never happen automatically. The acronym names exactly the three
+steps the system may take on its own and omits the fourth.
 
-**Kein Weg zum Warden.** `harw-dod` reexportiert `dispatch`, aber `dispatch`
-nimmt ausschließlich `Action<Authorized>`, und dessen Konstruktor ist
-`pub(crate)` in `harw-escalate`. Die Fassade kann diese Grenze nicht
-aufweichen, weil sie nichts konstruieren kann, was sie nicht sieht. Das ist
-S1 als Sichtbarkeitsregel, und die Fassade macht sie nicht auf.
-
-**Kein Dach über der Infrastruktur.** `harw-context` und `harw-observe`
-liegen nicht unter dieser Fassade. Kontext und Telemetrie sind für jeden
-Agenten da, vom UIA bis zum Verifier. Sie unter die Sicherheitsfassade zu
-ziehen würde zwei Fehler auf einmal machen: Infrastrukturänderungen sähen wie
-Sicherheitsänderungen aus, und die Fassade wäre nicht mehr die schmale
-Reduktionsfläche, als die sie gedacht ist.
-
-**Kein privilegierter Prozess.** `harw-warden` ist ein eigenes Binary mit
-eigenem Abhängigkeitsbudget. Die Fassade linkt seine Wire-Typen
-(`harw-warden-proto`), nie seine Implementierung.
+**What the name does not mean.** No department, no authority, no power
+center. The facade is a re-export module with no logic and no rights of its
+own — the narrowest part of the system, not the most powerful one.
 
 ---
 
-## 5. Intentionen: warum wir überhaupt so bauen
+## 3. What the facade is
 
-Dieser Abschnitt gehört in die Charta, weil jede der acht Crates leichter zu
-verstehen ist, wenn man die Absicht dahinter kennt. Sechs Sätze, aus denen
-alles andere folgt.
+`harw-dod` (`dod/crates/harw-dod/src/lib.rs`) re-exports individual, named
+items — no `pub use *`, no phase-shaped sub-modules (`detect`/`orient`/
+`defend`). The admission test the module doc states for every re-export:
 
-**Erstens: Unmöglichkeit ausdrücken, nicht Korrektheit prüfen.** Eine Prüfung
-kann vergessen werden, ein Typ nicht. Deshalb kann `PermissionSet` nur
-schneiden, `EgressSet` nur schneiden, `ContextBudgetSpec` nur verengen und
-`Action<Authorized>` nur an einem Ort entstehen. Die Präzedenz ist im eigenen
-Haus: `can_spawn` war dokumentiert und wurde nie aufgerufen, die Capabilities
-konnten nie umgangen werden, weil es dort nichts zu umgehen gab.
+1. Is it a parameter or return type of an already re-exported
+   type/function?
+2. Is it a tool a caller needs to fill those parameters, without which they
+   would have to reach into internals directly?
+3. Would withholding this name silently make a decision that actually
+   belongs to the caller?
 
-**Zweitens: strukturell verhindern schlägt überwachen.** Ein großer Teil
-dessen, was klassische Sicherheitswerkzeuge erkennen wollen, kann hier gar
-nicht erst stattfinden: ein Agent ohne Egress-Ziel erreicht es nicht, ein
-Kind ohne Schreibrecht schreibt nicht, ein Fragment außerhalb der Ceiling
-wird nicht gerendert. Überwachung ist die Antwort für den Rest, nicht die
-erste Antwort.
+**"Observe the host"** — capability vocabulary from `harw-dod-cap`
+(`Capability`, `CapabilityClass`, `ReadScope`, `SensorHandle`, `Bound`,
+`Unbound`, `SensorError`, `Permanence`), data vocabulary from
+`harw-dod-signals` (`Sensor`, `SensorReading`, `SecurityEvent`, `EventKind`,
+`Actor`, `AuthOutcome`, `DriftSeverity`, `HostSample`, `Severity`,
+`Hardness`, `SecurityEvidence`), the aggregator from `harw-dod-sentinel`
+(`Sentinel`, `SentinelConfig`, `SensorHealth`, `DegradeReason`,
+`RetryPolicy`, `EvidenceBuffer`), and the nine unprivileged sensors
+(`CpuSensor`, `ThermalSensor`, `MemorySensor`, `BlockioSensor`,
+`NetCountersSensor`, `GpuSensor`, `ListenerSensor`, `ScanReportSensor`,
+`WorkspaceDriftSensor`). Four privileged sensors/loaders (`AuthlogSensor`,
+`FsMonSensor`, `ProcmonSensor`, the `BpfLoader` family, `harw-dod-flow`'s
+`observe`) sit behind this crate's `privileged` Cargo feature as optional
+path dependencies, so a consumer that writes plain `harw-dod` in its
+`Cargo.toml` gets none of those privilege classes on its dependency edge
+(checked by `dod/crates/harw-dod/tests/facade.rs`).
 
-**Drittens: vorschlagen ist nicht committen.** Das Muster zieht sich durchs
-ganze Haus: der Dream-Job schlägt vor, die UIA definiert und committet nicht,
-`reconcile` liefert Schritte und `apply` wendet terminale Goal-Übergänge
-nicht an, und `validate_goal_action` weist Modell-Akteure ab. Die Triage
-folgt demselben Muster: sie liefert ein Verdikt mit `ProposedAction`, die
-Leiter autorisiert, der Mensch entscheidet über das Irreversible.
+**"Assess a finding"** — from `harw-dod-rules`: `run_rules`,
+`run_rules_checked`, `Rule`, `RuleContext`, the three shipped rules
+(`EgressFlowRule`, `BaselineDeviationRule`, `StructureDriftRule`), `Finding`,
+`FindingKind`, `RuleChecked`, `Triaged`, `Verdict`, `triage`, `Baseline`,
+`PalaceStatus`.
 
-**Viertens: das Urteil ist agentisch, der Reflex ist deterministisch.**
-Paketfilter, Ratenbegrenzung, seccomp, Integritätsprüfung bleiben Kernel und
-Regelwerk, weil sie schnell, unbestechlich und unter Angriff verfügbar sein
-müssen. Ein Sprachmodell lässt sich überreden, ein Paketfilter nicht. Was ein
-Agent besser kann als bestehende Werkzeuge, ist die Schicht darüber:
-Korrelation über Zeit, Triage von Rauschen, Erklärung von Drift. Genau dort
-sitzt er, und nirgends darunter.
-
-**Fünftens: der Sollzustand ist bekannt, also ist Abweichung entscheidbar.**
-Das ist der Vorteil, den kein zugekauftes Sicherheitswerkzeug hat. Wir wissen,
-welcher Agent welchen Flow erzeugen darf, welcher Vertrag für welchen Pfad
-gilt, welcher Plan-Knoten gerade aktiv ist. Deshalb ist eine
-Vertragsverletzung hier ein harter Befund und keine Heuristik, und deshalb
-darf sie handeln, während eine Statistik nur warnen darf.
-
-**Sechstens: gebaut wird für lange Betriebsdauer.** Deshalb reines Rust im
-privilegierten Pfad, deshalb kein Kernelmodul, deshalb jede fremde Bibliothek
-hinter einem eigenen Trait, deshalb ein Abhängigkeitsbudget mit Obergrenze.
-Ein Verteidigungssystem, das bei jedem Kernel-Update bricht, verteidigt nicht,
-es beschäftigt.
+That is the whole surface. There is no `Action`, `Authorized` or
+`Action<Authorized>` reachable from `harw_dod` at all — the crate has a
+`compile_fail` doctest that proves the import itself fails name resolution
+(E0432), not just a privilege check.
 
 ---
 
-## 6. Was das System ausdrücklich nicht tun soll
+## 4. What the facade explicitly is not
 
-Diese Liste gehört in die Charta, weil ein Sicherheitssubsystem ohne erklärte
-Grenzen zwangsläufig wächst.
+**Not a place for logic.** No `impl` with behavior, no helper that didn't
+fit anywhere else. Facades that start doing things themselves become junk
+drawers.
 
-- **Keine Verhaltensprofile von Personen.** Änderungsattribution ja, damit
-  Drift erklärbar und Rollback möglich ist. Kein Modell darüber, ob sich
-  jemand normal verhält. Für menschliche Akteure endet die Leiter bei Melden
-  und Protokollieren.
-- **Keine eigene Schadcode-Erkennung.** Etablierte Werkzeuge laufen per
-  Timer mit festen Argumenten, wir lesen Reports. Wir bauen die Triage, nicht
-  den Scanner.
-- **Kein Kernelmodul.** Alle benötigten Fähigkeiten sind über stabile
-  Schnittstellen erreichbar. Ein Out-of-Tree-Modul gäbe genau die
-  Versionsstabilität auf, die Punkt sechs oben zum Ziel erklärt.
-- **Kein generischer Ausführungspfad.** Es gibt keine Warden-Operation, die
-  Text als Befehl nimmt. Wenn eine neue Fähigkeit gebraucht wird, ist sie
-  eine neue benannte Aktion mit Zulässigkeitsregel und Audit-Namen, oder sie
-  existiert nicht.
-- **Kein eigener Zustand für Plan und Ziel.** Findings leben in
-  `harw-knowledge`, Plan-Wirkung läuft ausschließlich über
-  `harw-plan-bridge`. Die Fassade besitzt nichts.
+**No path to the warden.** `harw-dod-escalate`, `harw-dod-warden-proto`,
+`harw-dod-warden` and `harw-dod-netpolicy` are **not** part of this facade,
+not even behind a feature. Reasons: `Action::authorize` is `pub(crate)` in
+`harw-dod-escalate` (the only place in the workspace that produces an
+`AuthorizationProof`); the escalation functions take a
+`harw_session_store::FreezeStore`, which would pull in a fourth crate;
+`harw-dod-warden` has exactly one caller (the `harw-warden` binary, which
+already names it directly); and `harw-dod-netpolicy` does not implement
+`Sensor` at all — it plans `NetPlan` rules against `harw-sandbox`'s
+`NetworkScope`/`EgressTarget` vocabulary and belongs, if anywhere, to a
+future enforcement-facing facade with its own rationale.
+
+**No roof over infrastructure.** `harw-context` and the `harw-observe*`
+telemetry crates are not under this facade. Context and telemetry serve
+every agent, not just the security path; folding them under the security
+facade would make infrastructure changes look like security changes.
+
+**No privileged process.** `harw-dod-warden` is its own binary with its own
+dependency budget. The facade links its wire types (`harw-dod-warden-proto`)
+where relevant elsewhere, never its implementation.
 
 ---
 
-## 7. Aufnahmekriterien für die Fassade
+## 5. Intentions: why the system is built this way
 
-Damit `harw-dod` schmal bleibt, gilt für jeden Reexport:
+**First: express impossibility, not check correctness.** A check can be
+forgotten, a type cannot. `PermissionSet` can only narrow, `EgressSet` can
+only narrow, `ContextBudgetSpec` can only narrow, and `Action<Authorized>`
+can only be constructed in one place.
 
-1. Der Typ gehört zu einer der drei Phasen. Was in keine passt, gehört
-   wahrscheinlich nicht ins Subsystem.
-2. Der Typ ist Teil eines Vertrags, nicht einer Implementierung. `Rule` ja,
-   die konkrete Schwellwertregel nein.
-3. Der Typ eröffnet keinen Weg an einer Invariante vorbei. Insbesondere kein
-   Konstruktor für `Action<Authorized>`, kein Weg an der Ladder vorbei, kein
-   direkter Warden-Client ohne Proof.
-4. Der Reexport ist versioniert wie das Subsystem. Ein Schemawechsel ist eine
-   Fassadenänderung und wird als solche im Changelog geführt.
+**Second: structurally preventing beats monitoring.** Much of what
+classical security tools try to detect cannot happen here in the first
+place: an agent with no egress target cannot reach one, a child without
+write permission does not write. Monitoring is the answer for the rest, not
+the first answer.
 
-Ein Reexport, der eines dieser Kriterien verletzt, wird abgelehnt, auch wenn
-er bequem wäre. Bequemlichkeit ist der übliche Weg, auf dem Fassaden ihre
-Reduktionswirkung verlieren.
+**Third: proposing is not committing.** The pattern repeats throughout: a
+verdict carries `ProposedAction`, the ladder authorizes, the human decides
+on the irreversible.
+
+**Fourth: the verdict is agentic, the reflex is deterministic.** Packet
+filters, rate limiting, seccomp and integrity checks stay in kernel and
+rule-engine territory because they must be fast, incorruptible and
+available under attack. A language model can be talked into things, a
+packet filter cannot. What an agent is good for is the layer above:
+correlating over time, triaging noise, explaining drift — and nowhere below
+that.
+
+**Fifth: because the desired state is known, deviation is decidable.** This
+project knows which agent may produce which flow, which contract applies to
+which path, which plan node is currently active. A contract violation is
+therefore a hard finding here, not a heuristic, and may act, while a
+statistical signal may only warn.
+
+**Sixth: built for long operating life.** Pure Rust on the privileged path,
+no kernel module, every third-party library behind its own trait, a capped
+dependency budget. A defense system that breaks on every kernel update
+isn't defending, it's keeping people busy.
+
+---
+
+## 6. What the system explicitly does not do
+
+- **No behavioral profiling of people.** Change attribution yes, so drift
+  is explainable and rollback possible. No model of whether a person is
+  behaving "normally." For human actors, the ladder ends at reporting and
+  logging.
+- **No in-house malware detection.** Established tools run on a timer with
+  fixed arguments; this system reads their reports. It builds the triage,
+  not the scanner.
+- **No kernel module.** All needed capabilities are reachable through
+  stable interfaces.
+- **No generic execution path.** There is no warden operation that takes
+  text as a command. A new capability is a new named action with an
+  admission rule and an audit name, or it does not exist.
+- **No own state for plan and goal.** Findings live in `harw-knowledge`;
+  plan effects go exclusively through `harw-plan-bridge`. The facade owns
+  nothing.
+
+---
+
+## 7. Admission criteria for the facade
+
+For every re-export:
+
+1. The type belongs to one of the three phases (detect/orient/defend, with
+   defend excluded per §4). What fits none of them probably doesn't belong
+   in the subsystem's public surface.
+2. The type is part of a contract, not an implementation detail.
+3. The type does not open a path around an invariant — in particular, no
+   constructor for `Action<Authorized>`, no way around the ladder, no
+   direct warden client without a proof.
+4. The re-export is versioned with the subsystem; a schema change is a
+   facade change and is tracked as one.
+
+A re-export that violates one of these is rejected even when convenient.
+Convenience is the usual way facades lose their reduction effect.

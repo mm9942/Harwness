@@ -1,5 +1,9 @@
 # DoD system installation
 
+See [`docs/setup/dod.md`](../docs/setup/dod.md) for a full walkthrough
+(purpose, components, privilege model, and step-by-step installation). This
+file documents the packaging Makefile itself.
+
 This directory owns the system-wide DoD package. The default prefix is
 `/usr/local`; `PREFIX=/usr` is suitable for a distribution package. The
 package never installs into a user's HARW home tree.

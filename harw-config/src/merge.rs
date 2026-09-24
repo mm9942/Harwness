@@ -1141,6 +1141,31 @@ fn merge_tools_plan(
     );
 }
 
+// `[tools.doc]` (Abschnitt 1.8a) — `remote_ocr`. Wie `merge_shell_limits`:
+// vertraute Layer (Home und Profil) setzen frei, auch lockernd; ein nicht
+// vertrautes Projekt darf nur verschärfen (`off` < `ask` < `on`), nie etwa
+// von `ask` auf `on` wechseln.
+fn merge_tools_doc(
+    trusted: &mut HarnessConfig,
+    incoming: crate::plan_toml::DocSection,
+    raw: &toml::Value,
+    role: LayerRole,
+    layer_path: &Path,
+    out: &mut Vec<ScopeDiagnostic>,
+) {
+    const FIELD: &str = "tools.doc.remote_ocr";
+    if !field_present(raw, &["tools", "doc", "remote_ocr"]) {
+        return;
+    }
+    let value = incoming.remote_ocr;
+    if role != LayerRole::UntrustedProject || value <= trusted.tools.doc.remote_ocr {
+        trusted.tools.doc.remote_ocr = value;
+    } else {
+        let diagnostic = ScopeDiagnostic::new(FIELD, layer_path, &value.as_str());
+        reject(out, diagnostic, role, RejectionReason::LessStrictValue);
+    }
+}
+
 // `[mode]` (Abschnitt 1.9) — einziges Feld `ProfileReplaces`.
 fn merge_mode(
     trusted: &mut HarnessConfig,
@@ -1847,6 +1872,7 @@ pub fn merge_layer_into(
         &mut out,
     );
     merge_onboarding(trusted, incoming.onboarding, raw, role, layer_path);
+    merge_tools_doc(trusted, incoming.tools.doc, raw, role, layer_path, &mut out);
     merge_tools_plan(trusted, incoming.tools, raw, role, layer_path, &mut out);
     merge_mode(trusted, incoming.mode, raw, role, layer_path);
     merge_research(trusted, incoming.research, raw, role, layer_path, &mut out);
@@ -2126,6 +2152,79 @@ mod tests {
         );
         assert_eq!(fresh.agents.max_root_orchestrators, None);
         assert!(!diagnostics.is_empty());
+        Ok(())
+    }
+
+    // [tools.doc] remote_ocr: Home/Profil setzen frei, ein nicht vertrautes
+    // Projekt verschärft nur (`off` < `ask` < `on`).
+    #[test]
+    fn test_tools_doc_remote_ocr_untrusted_project_only_tightens() -> TestResult {
+        use crate::plan_toml::RemoteOcrMode;
+
+        let mut trusted = HarnessConfig::default();
+        assert_eq!(trusted.tools.doc.remote_ocr, RemoteOcrMode::Off);
+
+        let home = "[tools.doc]\nremote_ocr = \"ask\"";
+        merge_layer_into(
+            &mut trusted,
+            toml::from_str(home).map_err(ctx("parse home"))?,
+            &raw_from(home)?,
+            LayerRole::Baseline,
+            &layer_path(),
+        );
+        assert_eq!(trusted.tools.doc.remote_ocr, RemoteOcrMode::Ask);
+
+        // Ein vertrautes Profil darf lockern.
+        let profile = "[tools.doc]\nremote_ocr = \"on\"";
+        merge_layer_into(
+            &mut trusted,
+            toml::from_str(profile).map_err(ctx("parse profile"))?,
+            &raw_from(profile)?,
+            LayerRole::Refinement,
+            &layer_path(),
+        );
+        assert_eq!(trusted.tools.doc.remote_ocr, RemoteOcrMode::On);
+
+        // Ein Layer ohne `[tools.doc]` lässt den Wert stehen.
+        let unrelated = "[shell]\nmax_timeout_secs = 60";
+        merge_layer_into(
+            &mut trusted,
+            toml::from_str(unrelated).map_err(ctx("parse unrelated"))?,
+            &raw_from(unrelated)?,
+            LayerRole::Refinement,
+            &layer_path(),
+        );
+        assert_eq!(trusted.tools.doc.remote_ocr, RemoteOcrMode::On);
+
+        let tighten = "[tools.doc]\nremote_ocr = \"ask\"";
+        let diagnostics = merge_layer_into(
+            &mut trusted,
+            toml::from_str(tighten).map_err(ctx("parse tighten"))?,
+            &raw_from(tighten)?,
+            LayerRole::UntrustedProject,
+            &layer_path(),
+        );
+        assert_eq!(trusted.tools.doc.remote_ocr, RemoteOcrMode::Ask);
+        assert!(diagnostics.is_empty());
+
+        // Default `off`: das Projekt darf weder auf `ask` noch auf `on`
+        // lockern.
+        for loosen in [
+            "[tools.doc]\nremote_ocr = \"ask\"",
+            "[tools.doc]\nremote_ocr = \"on\"",
+        ] {
+            let mut fresh = HarnessConfig::default();
+            let diagnostics = merge_layer_into(
+                &mut fresh,
+                toml::from_str(loosen).map_err(ctx("parse loosen"))?,
+                &raw_from(loosen)?,
+                LayerRole::UntrustedProject,
+                &layer_path(),
+            );
+            assert_eq!(fresh.tools.doc.remote_ocr, RemoteOcrMode::Off);
+            assert_eq!(diagnostics.len(), 1, "Lockerung sichtbar abgelehnt");
+            assert_eq!(diagnostics[0].field, "tools.doc.remote_ocr");
+        }
         Ok(())
     }
 
@@ -2568,14 +2667,14 @@ mod tests {
         let p1 = McpPrincipalToml {
             id: "p1".to_owned(),
             credential_ref: SecretRef::from_str("env:P1_TOKEN").map_err(ctx("env:P1_TOKEN"))?,
-            tenant: "mia".to_owned(),
+            tenant: "alice".to_owned(),
             workspace: "harwness".to_owned(),
             job_capabilities: vec![],
         };
         let p2 = McpPrincipalToml {
             id: "p2".to_owned(),
             credential_ref: SecretRef::from_str("env:P2_TOKEN").map_err(ctx("env:P2_TOKEN"))?,
-            tenant: "mia".to_owned(),
+            tenant: "alice".to_owned(),
             workspace: "harwness".to_owned(),
             job_capabilities: vec![],
         };
@@ -2589,7 +2688,7 @@ mod tests {
                 [[mcp_listener.principals]]
                 id = "p1"
                 credential_ref = "env:P1_TOKEN"
-                tenant = "mia"
+                tenant = "alice"
                 workspace = "harwness"
             "#,
         )?;

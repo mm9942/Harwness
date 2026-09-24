@@ -1,7 +1,7 @@
 //! Runtime-Montage der Gateway-Einstiege (`harw gateway`: Telegram, Dream).
 //!
 //! # Beschreibung
-//! Vertrag: `docs/remediation/CONTRACTS.md` §runtime-spec
+//! Vertrag: `docs/design/runtime-contracts.md` §runtime-spec
 //! (`EntryKind::GatewayDream`: `{}`-Rechte, `RegistryProfile::NoTools`,
 //! `AskResolution::Fail`; `EntryKind::GatewayTelegram`: `{Read, Write}`,
 //! `RegistryProfile::WorkspaceEdit` ohne Shell und Netz,
@@ -56,8 +56,7 @@
 //! Die frühere Montage (vor W2d-1) bildete einen gescheiterten
 //! Provider-Aufbau auf `()` ab und fiel lautlos auf
 //! [`harw_core::EchoModelProvider`] zurück — Telegram-Antworten und
-//! Dream-Berichte liefen dann unbemerkt mit Echo-Inhalt weiter
-//! (`docs/remediation/ledger/W2b/W2B-01.md` beschreibt denselben
+//! Dream-Berichte liefen dann unbemerkt mit Echo-Inhalt weiter (derselbe
 //! Provider-Fehlerpfad als `RuntimeError::Provider`, dessen `Display`-Text
 //! [`gateway_assembly`] hier durchreicht). Dieses Modul tut das bewusst
 //! **nicht**: jeder Fehler aus `RuntimeAssemblyBuilder::build` wird
@@ -112,7 +111,7 @@ impl GatewayEntry {
     ///
     /// # Beschreibung
     /// `Telegram` → [`EntryKind::GatewayTelegram`], `Dream` →
-    /// [`EntryKind::GatewayDream`] (`docs/remediation/CONTRACTS.md`
+    /// [`EntryKind::GatewayDream`] (`docs/design/runtime-contracts.md`
     /// §runtime-spec). Beide reduzieren über [`EntryKind::profile`] auf
     /// identische Rechte; die Varianten bleiben getrennt, damit Diagnose und
     /// Audit den auslösenden Kanal unterscheiden können.

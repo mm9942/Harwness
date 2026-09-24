@@ -69,6 +69,10 @@ use reqwest::header::HeaderMap;
 /// Obergrenze für eine einzelne Wartezeit pro `wait_for_slot`-Aufruf.
 const MAX_WAIT: Duration = Duration::from_secs(120);
 
+/// Obergrenze der gemeinsamen 429-Abkühlphase
+/// ([`ProviderRateLimiter::note_rate_limit_cooldown`]).
+const MAX_COOLDOWN: Duration = Duration::from_secs(10 * 60);
+
 /// Angenommene Fensterlänge, wenn nach einem abgelaufenen Reset kein
 /// beobachtetes Fenster bekannt ist (typische Limits sind "pro Minute").
 const DEFAULT_WINDOW: Duration = Duration::from_secs(60);
@@ -172,6 +176,12 @@ pub struct ProviderRateLimiter {
     /// (`QuotaExceeded` oder `Transient{status: Some(429)}`) der Fehler
     /// anschließend übersetzt wird.
     rate_limited_count: AtomicU64,
+    /// Gemeinsame Abkühlphase nach einem HTTP 429 (Ende der vom Provider
+    /// verlangten Wartezeit). Läuft — wie der Zähler — unabhängig von
+    /// `enabled`: alle Requests dieses Providers (UIA **und** Kinder teilen
+    /// sich die Instanz) warten sie ab, statt parallel erneut in dasselbe
+    /// Limit zu laufen. Sichtbar als `rate_limit_wait` im Load-Status.
+    cooldown_until: Mutex<Option<Instant>>,
 }
 
 impl fmt::Debug for ProviderRateLimiter {
@@ -212,6 +222,7 @@ impl ProviderRateLimiter {
             safety_margin_pct,
             state: Mutex::new(State::default()),
             rate_limited_count: AtomicU64::new(0),
+            cooldown_until: Mutex::new(None),
         }
     }
 
@@ -253,6 +264,72 @@ impl ProviderRateLimiter {
     #[must_use]
     pub fn rate_limited_count(&self) -> u64 {
         self.rate_limited_count.load(Ordering::Relaxed)
+    }
+
+    /// Merkt nach einem HTTP 429 eine gemeinsame Abkühlphase von `wait` vor.
+    ///
+    /// # Description
+    /// Unabhängig von [`Self::is_enabled`]. Eine bereits länger laufende
+    /// Abkühlphase wird nie verkürzt. `wait` wird auf [`MAX_COOLDOWN`]
+    /// gedeckelt (ein Stunden-Kontingent soll keine späteren Requests
+    /// stundenlang still blockieren; die Retry-Hülle gibt bei solchen
+    /// Hinweisen ohnehin sofort auf).
+    ///
+    /// # Concurrency
+    /// Kurzer, synchroner Lock; nie über ein `.await` gehalten.
+    pub fn note_rate_limit_cooldown(&self, wait: Duration) {
+        if wait.is_zero() {
+            return;
+        }
+        let until = Instant::now() + wait.min(MAX_COOLDOWN);
+        let mut cooldown = match self.cooldown_until.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        if cooldown.is_none_or(|current| current < until) {
+            *cooldown = Some(until);
+        }
+    }
+
+    /// Restdauer der gemeinsamen 429-Abkühlphase, falls eine läuft.
+    #[must_use]
+    pub fn cooldown_remaining(&self) -> Option<Duration> {
+        let cooldown = match self.cooldown_until.lock() {
+            Ok(guard) => *guard,
+            Err(poisoned) => *poisoned.into_inner(),
+        };
+        cooldown
+            .map(|until| until.saturating_duration_since(Instant::now()))
+            .filter(|remaining| !remaining.is_zero())
+    }
+
+    /// Wartet eine laufende 429-Abkühlphase ab (höchstens [`MAX_WAIT`]).
+    ///
+    /// # Description
+    /// Wird vor dem Belegen eines Nebenläufigkeits-Slots aufgerufen, damit
+    /// ein wartender Request keinen Slot blockiert. Abbruchsicher: das
+    /// Future darf jederzeit gedroppt werden.
+    pub async fn wait_for_cooldown(&self) {
+        let Some(remaining) = self.cooldown_remaining() else {
+            return;
+        };
+        let wait = remaining.min(MAX_WAIT);
+        tracing::info!(
+            wait_ms = u64::try_from(wait.as_millis()).unwrap_or(u64::MAX),
+            "provider.rate_limit.cooldown_wait"
+        );
+        tokio::time::sleep(wait).await;
+    }
+
+    /// Aktuell fällige Wartezeit für die Statusanzeige: das Maximum aus
+    /// Header-Pacing ([`Self::pending_wait`], nur wenn aktiv) und der
+    /// gemeinsamen 429-Abkühlphase ([`Self::cooldown_remaining`]).
+    #[must_use]
+    pub fn status_wait(&self) -> Option<Duration> {
+        match (self.pending_wait(), self.cooldown_remaining()) {
+            (Some(pacing), Some(cooldown)) => Some(pacing.max(cooldown)),
+            (pacing, cooldown) => pacing.or(cooldown),
+        }
     }
 
     /// Wertet Rate-Limit-Header einer HTTP-Antwort aus und aktualisiert den
@@ -833,7 +910,7 @@ fn parse_go_like_duration(input: &str) -> Option<Duration> {
 /// Minimalimplementierung ohne Fremd-Crate (keine `chrono`/`jiff`-Abhängigkeit
 /// in dieser Crate verfügbar); nutzt Howard Hinnants `days_from_civil` zur
 /// Umrechnung Kalenderdatum → Tage seit Epoche.
-fn parse_rfc3339_epoch_seconds(input: &str) -> Option<f64> {
+pub(crate) fn parse_rfc3339_epoch_seconds(input: &str) -> Option<f64> {
     let s = input.trim();
     if s.len() < 20 {
         return None;
@@ -984,6 +1061,27 @@ mod tests {
         limiter.observe_headers(&headers);
         assert_eq!(limiter.pending_wait(), None);
         Ok(())
+    }
+
+    /// Export 429: nach einem 429 teilen sich alle Requests des Providers
+    /// eine Abkühlphase — auch bei deaktiviertem Header-Pacer — und der
+    /// Load-Status zeigt sie als Wartezeit.
+    #[test]
+    fn test_rate_limit_cooldown_is_shared_and_visible_even_when_disabled() {
+        let limiter = ProviderRateLimiter::new(None);
+        assert!(!limiter.is_enabled());
+        assert_eq!(limiter.status_wait(), None);
+        limiter.note_rate_limit_cooldown(Duration::from_secs(30));
+        let wait = limiter.status_wait().unwrap_or_default();
+        assert!(wait > Duration::from_secs(25) && wait <= Duration::from_secs(30));
+        // Eine kürzere Meldung verkürzt die laufende Abkühlphase nicht.
+        limiter.note_rate_limit_cooldown(Duration::from_secs(1));
+        assert!(limiter.cooldown_remaining().unwrap_or_default() > Duration::from_secs(25));
+        // Gedeckelt auf MAX_COOLDOWN.
+        limiter.note_rate_limit_cooldown(Duration::from_secs(24 * 3600));
+        assert!(limiter.cooldown_remaining().unwrap_or_default() <= MAX_COOLDOWN);
+        // Pacing-Zustand bleibt deaktiviert.
+        assert_eq!(limiter.pending_wait(), None);
     }
 
     #[test]

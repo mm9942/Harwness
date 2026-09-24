@@ -5,8 +5,8 @@
 //! Eine Stelle, an der der Job-Worker Identität, Sandbox und Runtime-Montage
 //! eines Jobs aus der gemeinsamen Runtime (`harw-runtime`) ableitet, statt sie
 //! in `job_worker.rs` selbst zusammenzusetzen. Vertrag:
-//! `docs/remediation/CONTRACTS.md` §principal und §runtime-spec (Zeilen
-//! `JobPrompt` / `JobPlanNode`), `docs/remediation/CONTRACTS-W2d2.md` §1.3.
+//! `docs/design/runtime-contracts.md` §principal und §runtime-spec (Zeilen
+//! `JobPrompt` / `JobPlanNode`), `docs/design/runtime-contracts.md` §1.3.
 //!
 //! # Verantwortung
 //! - [`JobEntry`]: welche Art Job läuft (Prompt oder Plan-Knoten) und die
@@ -19,8 +19,7 @@
 //! - [`JobAssemblyInputs`] / [`job_assembly`]: die Runtime-Montage eines Jobs
 //!   direkt über [`RuntimeAssembly::builder`] — mit fester Wurzel-Session-id
 //!   und optionaler [`RuntimeNarrowing`] (Plan-Knoten).
-//! - [`configured_principal_ids`]: schließt die Restlücke aus
-//!   `docs/remediation/ledger/W1/W1-13.md` §1 — der Worker prüft, ob der
+//! - [`configured_principal_ids`]: der Worker prüft, ob der
 //!   Einreicher eines Jobs noch ein *aktuell konfigurierter* MCP-Principal ist.
 //!
 //! # Nebenläufigkeit
@@ -68,7 +67,7 @@ pub(crate) enum JobEntry {
 }
 
 impl JobEntry {
-    /// Bildet die Job-Art auf den Runtime-Einstieg ab (CONTRACTS.md §runtime-spec).
+    /// Bildet die Job-Art auf den Runtime-Einstieg ab (docs/design/runtime-contracts.md §runtime-spec).
     ///
     /// # Returns
     /// `Prompt` → [`EntryKind::JobPrompt`], `PlanNode` → [`EntryKind::JobPlanNode`].
@@ -84,7 +83,7 @@ impl JobEntry {
 /// Baut den Principal eines Jobs an der Eingangsgrenze des Job-Workers.
 ///
 /// # Description
-/// `Channel` × `JobWorker` × `Observer` (CONTRACTS.md §principal, R7). Die
+/// `Channel` × `JobWorker` × `Observer` (docs/design/runtime-contracts.md §principal, R7). Die
 /// Kennung ist die id des authentifizierten Einreichers aus dem gespeicherten
 /// Job-Scope, nie ein Wert aus der Job-Eingabe. Auf `JobWorker` liefert
 /// [`Principal::approval_actor`] bewusst `None`: ein Job beantwortet keine
@@ -113,7 +112,7 @@ pub(crate) fn job_principal(submitter_id: &str) -> Principal {
     )
 }
 
-/// Baut die Wurzel-Sandbox eines Jobs (CONTRACTS.md §runtime-spec).
+/// Baut die Wurzel-Sandbox eines Jobs (docs/design/runtime-contracts.md §runtime-spec).
 ///
 /// # Description
 /// `Prompt` → [`root_sandbox`] mit [`EntryKind::JobPrompt`] (leere Rechte);
@@ -135,7 +134,7 @@ pub(crate) fn job_sandbox(entry: JobEntry, project_root: &Path) -> Result<Sandbo
     .map_err(|error| error.to_string())
 }
 
-/// Eingaben der Runtime-Montage eines Jobs (CONTRACTS-W2d2.md §1.3).
+/// Eingaben der Runtime-Montage eines Jobs (docs/design/runtime-contracts.md §extension).
 ///
 /// # Description
 /// Bündelt alles, was [`job_assembly`] braucht, damit die Montage genau eine

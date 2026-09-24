@@ -47,7 +47,7 @@
 //! Danach entscheidet [`ApprovalStore::resolve`] über Einmaligkeit,
 //! Actor-Bindung (`ApprovalActorMismatch`) und TTL (`ApprovalExpired`).
 //!
-//! **Grenzen (Ledger `docs/remediation/ledger/W4a/A-APPR.md`):**
+//! **Grenzen:**
 //! - *Transport:* Der Unix-Socket authentisiert heute nur über die UID. Ein
 //!   Same-UID-Prozess (auch ein modellgestarteter) ist vom Bediener nicht zu
 //!   unterscheiden. Die Token-Pflicht für `approval.resolve` auch am
@@ -303,7 +303,7 @@ impl From<SessionStoreError> for SecurityError {
 ///
 /// let tui = Principal::trusted_ingress(
 ///     PrincipalKind::Human,
-///     "mia",
+///     "alice",
 ///     IngressSurface::Tui,
 ///     PermissionTier::Owner,
 /// );

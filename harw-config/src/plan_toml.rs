@@ -17,17 +17,80 @@
 //! Der Planmodus ist standardmäßig aktiv. `enabled = false` entfernt die
 //! Registrierung weiterhin vollständig; dieses Modul liefert nur die
 //! deklarative Konfiguration, das Entfernen selbst obliegt dem Consumer.
+//!
+//! Daneben `[tools.doc]` ([`DocSection`]): `remote_ocr` steuert, ob
+//! `doc.read_pdf` Workspace-PDFs an einen Remote-OCR-Dienst schicken darf
+//! (`off`/`ask`/`on`, Default `ask`). Auswertung in `harw-cli`
+//! (`doc_ocr::install_doc_ocr`) und in der Freigabe-Politik.
 
 use serde::{Deserialize, Serialize};
 
 /// `[tools]` — Container-Sektion für werkzeugspezifische Konfigurationen.
-/// Aktuell nur `plan`; künftige Tool-Sektionen (z. B. `[tools.search]`)
-/// werden hier als weitere Felder ergänzt, sobald sie gebraucht werden.
+/// Aktuell `plan` und `doc`; künftige Tool-Sektionen (z. B.
+/// `[tools.search]`) werden hier als weitere Felder ergänzt, sobald sie
+/// gebraucht werden.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ToolsSection {
     #[serde(default)]
     pub plan: PlanSection,
+    #[serde(default)]
+    pub doc: DocSection,
+}
+
+/// `[tools.doc]` — Steuerung der Dokument-Werkzeuge (`doc.read_pdf`).
+///
+/// # Examples
+/// ```rust
+/// use harw_config::{DocSection, RemoteOcrMode};
+///
+/// let section: DocSection = toml::from_str("remote_ocr = \"off\"").expect("valid");
+/// assert_eq!(section.remote_ocr, RemoteOcrMode::Off);
+/// assert_eq!(DocSection::default().remote_ocr, RemoteOcrMode::Off);
+/// ```
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DocSection {
+    /// Ob `doc.read_pdf` Workspace-PDFs an einen Remote-OCR-Dienst (Mistral)
+    /// schicken darf. Default [`RemoteOcrMode::Off`]: ohne Angabe bleibt
+    /// OCR lokal.
+    #[serde(default)]
+    pub remote_ocr: RemoteOcrMode,
+}
+
+/// Modus für Remote-OCR in `doc.read_pdf` (`[tools.doc].remote_ocr`).
+///
+/// Die Variantenreihenfolge ist zugleich die Strenge-Ordnung (`Off` <
+/// `Ask` < `On`, strengster Wert zuerst): ein nicht vertrauter
+/// Projekt-Layer darf nur zu einem kleineren Wert wechseln.
+#[derive(
+    Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize,
+)]
+#[serde(rename_all = "lowercase")]
+pub enum RemoteOcrMode {
+    /// Nie remote: der OCR-Client wird gar nicht installiert, `doc.read_pdf`
+    /// extrahiert immer lokal. Default, wenn nichts angegeben ist.
+    #[default]
+    Off,
+    /// Remote nur nach Freigabe: jeder `doc.read_pdf`-Aufruf, der an den
+    /// Remote-Dienst ginge, braucht eine Nutzer-Freigabe (auch im
+    /// Vollzugriff).
+    Ask,
+    /// Remote ohne Nachfrage, sobald ein Mistral-Provider konfiguriert ist
+    /// (bisheriges Verhalten).
+    On,
+}
+
+impl RemoteOcrMode {
+    /// TOML-Schreibweise des Werts (`"off"`, `"ask"`, `"on"`).
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Off => "off",
+            Self::Ask => "ask",
+            Self::On => "on",
+        }
+    }
 }
 
 /// `[tools.plan]` — Sichtbarkeit, Persistenz und Validierungs-Policy des
@@ -240,6 +303,42 @@ mod tests {
         };
         assert!(error.to_string().contains("unknown field"));
         Ok(())
+    }
+
+    #[test]
+    fn test_tools_doc_remote_ocr_parses_all_three_values() -> TestResult {
+        for (raw, expected) in [
+            ("off", RemoteOcrMode::Off),
+            ("ask", RemoteOcrMode::Ask),
+            ("on", RemoteOcrMode::On),
+        ] {
+            let tools: ToolsSection = toml::from_str(&format!("[doc]\nremote_ocr = \"{raw}\"\n"))
+                .map_err(ctx("parse remote_ocr"))?;
+            assert_eq!(tools.doc.remote_ocr, expected);
+            assert_eq!(expected.as_str(), raw);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn test_tools_doc_remote_ocr_defaults_to_off() -> TestResult {
+        let tools: ToolsSection = toml::from_str("").map_err(ctx("parse empty"))?;
+        assert_eq!(tools.doc.remote_ocr, RemoteOcrMode::Off);
+        let tools: ToolsSection = toml::from_str("[doc]\n").map_err(ctx("parse empty doc"))?;
+        assert_eq!(tools.doc.remote_ocr, RemoteOcrMode::Off);
+        Ok(())
+    }
+
+    #[test]
+    fn test_tools_doc_rejects_unknown_mode_and_field() {
+        assert!(toml::from_str::<ToolsSection>("[doc]\nremote_ocr = \"always\"\n").is_err());
+        assert!(toml::from_str::<ToolsSection>("[doc]\nremote = \"on\"\n").is_err());
+    }
+
+    #[test]
+    fn test_remote_ocr_mode_order_is_strictest_first() {
+        assert!(RemoteOcrMode::Off < RemoteOcrMode::Ask);
+        assert!(RemoteOcrMode::Ask < RemoteOcrMode::On);
     }
 
     #[test]

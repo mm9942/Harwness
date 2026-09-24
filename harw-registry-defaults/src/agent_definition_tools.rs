@@ -2730,7 +2730,7 @@ contract = "harwness.return.research-finding@1"
             name: ToolName::new("uia_self.update_document"),
             arguments: serde_json::json!({
                 "target": "identity",
-                "content": "Ich bin Emily.",
+                "content": "Ich bin Assistant.",
                 "reason": "Erstpflege",
             }),
         };
@@ -2746,7 +2746,7 @@ contract = "harwness.return.research-finding@1"
         assert_eq!(
             std::fs::read_to_string(directory.join("identity.md"))
                 .map_err(ctx("identity.md lesen"))?,
-            "Ich bin Emily."
+            "Ich bin Assistant."
         );
         std::fs::remove_dir_all(&directory).map_err(ctx("Verzeichnis entfernen"))?;
         Ok(())
@@ -2768,14 +2768,14 @@ contract = "harwness.return.research-finding@1"
             name: ToolName::new("uia_self.update_document"),
             arguments: serde_json::json!({
                 "target": "user",
-                "content": "Name: Mia",
+                "content": "Name: Alice",
                 "reason": "Nutzer hat sich vorgestellt",
             }),
         };
         let output = executor.write(&call);
         assert_eq!(
             std::fs::read_to_string(directory.join("USER.md")).map_err(ctx("USER.md lesen"))?,
-            "Name: Mia"
+            "Name: Alice"
         );
         assert!(matches!(output, ToolOutput::Json { .. }));
         std::fs::remove_dir_all(&directory).map_err(ctx("Verzeichnis entfernen"))?;

@@ -1,160 +1,120 @@
 # Memory v2 — STM/LTM, Self-Learning, Continuous Improvement
 
-**Status:** Design-Anker (Vertrag für Fanout).
-**Bindend:** `philosophy.md` §3, §4, §5, §7 sowie §16 (Invarianten 7, 8, 10, 15).
-**Inspirationen:** codex-rs `context-fragments`/`models-manager`, Hermes `~/.hermes/memories/` mit `MEMORY.md` + Lock-File, OpenClaw `context-engine`/self-improving Skill-Bundle (HOT/WARM/COLD, Heartbeat).
+> Status: implemented · Last reviewed: 2026-09-24
 
----
+Extends `docs/design/harw-memory.md` with an in-process short-term layer, a
+deterministic promotion/decay heartbeat, and signal-based self-learning, all
+without any model call in the hot path.
 
-## 1. Ziel
+## 1. Goal
 
-Eine tokensparsame Memory-Schicht, die
+A token-frugal memory layer that:
 
-1. **Short-Term Memory (STM)** — flüchtigen Turn-Kontext im Prozess hält (kein I/O),
-2. **Long-Term Memory (LTM)** — persistente Tiers HOT/WARM/COLD nach philosophy.md §3 verwaltet,
-3. **Self-Learning** — Korrekturen, Reflexionen und Muster-Kandidaten aus Signalen extrahiert,
-4. **Continuous Improvement (Heartbeat)** — deterministisch promotiert/demotiert/archiviert,
+1. **Short-Term Memory (STM)** — holds volatile turn context in-process (no I/O),
+2. **Long-Term Memory (LTM)** — manages the persistent HOT/WARM/COLD tiers,
+3. **Self-Learning** — extracts corrections, reflections, and pattern
+   candidates from signals,
+4. **Continuous Improvement (heartbeat)** — promotes/demotes/archives
+   deterministically,
 
-und dabei die **kleinste hoch-signifikante Tokenmenge pro Turn** liefert (philosophy.md §3, „Kontext muss konstruiert werden, nicht akkumulieren").
+while delivering the smallest highly-significant token set per turn. No LLM
+calls in the hot path; all rules are pure Rust.
 
-Keine LLM-Aufrufe im Hot-Path. Alle Regeln sind pure Rust.
-
----
-
-## 2. Layer-Übersicht
+## 2. Layer overview
 
 ```
 +---------------------------------------------------------------+
-|  Turn Context Assembly (harw-core, außerhalb dieses Crates)   |
-|      ↑ pulls (bounded)                                        |
+|  Turn Context Assembly (harw-core, outside this crate)        |
+|      ^ pulls (bounded)                                        |
 +---------------------------------------------------------------+
    |                                    |
    |  hot() + recall(namespace,kw)      |  stm.snapshot()
-   ↓                                    ↓
+   v                                    v
 +-------------------------+    +----------------------------+
 |  LTM (FileMemoryStore)  |    |  STM (in-process)          |
-|  HOT ≤100 lines         |    |  Ring-Buffer, N=32 default |
-|  WARM per namespace     |    |  Salience-Score, TTL       |
+|  HOT <=100 lines        |    |  Ring buffer, N=32 default |
+|  WARM per namespace     |    |  Salience score, TTL       |
 |  COLD archive           |    |  Send + Sync via RwLock    |
 +-------------------------+    +----------------------------+
-        ↑                             ↑
-        |  maintain() (heartbeat)     |  push(...) pro Turn
+        ^                             ^
+        |  maintain() (heartbeat)     |  push(...) per turn
 +---------------------------------------------------------------+
 |  Signals (append-only JSONL)                                  |
-|  correction | reflection | pattern_hint                        |
+|  correction | reflection | pattern_hint                       |
 +---------------------------------------------------------------+
-        ↑
-        |  detect + record aus dem laufenden Turn
+        ^
+        |  detected + recorded from the running turn
 ```
-
----
 
 ## 3. Short-Term Memory (STM)
 
-**Datei:** `harw-memory/src/short_term.rs` (neu).
+**File:** `harw-memory/src/short_term.rs`.
 
-- Reiner In-Process-Speicher — kein Filesystem-I/O.
+- Pure in-process storage — no filesystem I/O.
 - `struct ShortTermMemory { inner: RwLock<Inner> }` (`Send + Sync`).
-- `Inner` enthält:
-  - `VecDeque<StmEntry>` mit `capacity` (Default 32),
-  - `token_budget: usize` (Default 2048 Token, Schätzung `content.len() / 4`),
-  - `session_id: String`.
+- `Inner` holds a `VecDeque<StmEntry>` with a `capacity` (default 32), a
+  `token_budget: usize` (default 2048 tokens, estimated as
+  `content.len() / 4`), and a `session_id`.
 - `StmEntry { at: Timestamp, role: StmRole, salience: u8 /*0..=100*/, content: String }`.
 - `StmRole { User, Assistant, Tool, System }`.
-- API:
-  - `pub fn new(session_id: impl Into<String>, capacity: usize, token_budget: usize) -> Self`
-  - `pub fn push(&self, role: StmRole, salience: u8, content: impl Into<String>)`
-  - `pub fn snapshot(&self) -> Vec<StmEntry>` (klont).
-  - `pub fn render(&self, max_tokens: usize) -> String` — komprimiert von hinten (jüngste zuerst), fällt unter `max_tokens` durch Weglassen niedrigster Salience.
-  - `pub fn clear(&self)`.
-- **Verdrängung:** Wenn `capacity` überschritten → pop_front nach `salience` (kleinster raus), bei Gleichstand ältestes. Wenn Token-Budget überschritten → gleicher Algorithmus bis unter Budget.
-- **Kein Alloc-Sturm:** `render` benutzt `String::with_capacity(max_tokens * 4)`.
-
-Tests (mind. 6):
-- Cap-Verhalten,
-- Budget-Verhalten,
-- Verdrängung nach Salience,
-- Send+Sync-Compile-Test,
-- `render` respektiert `max_tokens`,
-- `clear` leert alles.
-
-**Bindung an philosophy.md §3:** STM ist genau der „Working Context — Daten für den unmittelbar aktuellen Turn".
-
----
+- API: `new`, `push`, `snapshot` (clones), `render(max_tokens)` (compresses
+  from the back, most recent first, dropping the lowest-salience entries to
+  stay under budget), `clear`.
+- **Eviction:** over `capacity`, the lowest-salience entry is popped first
+  (oldest on a tie). Over the token budget, the same rule applies until back
+  under budget.
 
 ## 4. Long-Term Memory (LTM)
 
-**Bereits vorhanden:** `harw-memory/src/{store.rs,file_store.rs,types.rs,workflow.rs}`.
-Contract bleibt stabil. `Tier::Hot::max_lines() = 100`, `Warm = 200`, `Cold = None`.
+Implemented in `harw-memory/src/{store.rs,file_store.rs,types.rs,workflow.rs}`.
+The tier contract is stable: `Tier::Hot::max_lines() = 100`,
+`Warm = 200`, `Cold = None`.
 
-Erweiterung dieser Doku: STM speist LTM **nicht** direkt. Signale werden weiterhin explizit via `store.record(Signal::…)` erzeugt (aus TUI/Core), oder aus STM-Reflection promoviert.
-
----
+STM does not feed LTM directly. Signals are still created explicitly via
+`store.record(Signal::…)` (from the TUI/core), or promoted from an STM
+reflection.
 
 ## 5. Self-Learning
 
-**Datei:** `harw-memory/src/learning.rs` (neu). Ergänzt `detect.rs`.
+**File:** `harw-memory/src/learning.rs` (extends `detect.rs`).
 
-- `pub fn score_correction(text: &str) -> u8` — 0..=100 Score anhand Regex-loser Keyword-Menge (nutze `detect::detect_correction`).
-- `struct PatternCounter` — flache HashMap-Wrapper `key -> (count, first_seen, last_seen)`. Persistenz in `signals/patterns.json`.
-  - `pub fn observe(&mut self, key: &str, now: Timestamp)`
-  - `pub fn is_promotable(&self, key: &str, now: Timestamp, window_days: i64, threshold: u32) -> bool`
-    - Default `window_days = 7`, `threshold = 3`.
-  - `pub fn prune(&mut self, now: Timestamp, max_age_days: i64)`
-  - Serialisierbar via serde (JSON).
-- `pub struct LessonRule { pub keyword: &'static str, pub weight: u8 }` — statische Tabelle deutscher + englischer Korrektur-Trigger (mind. 20 Einträge, siehe self-improving/SKILL.md „Learning Signals").
-- Integration: `FileMemoryStore::maintain()` ruft `learning::PatternCounter::load_or_default(root)` und promoviert `PatternHint`-Signale nach WARM, wenn `is_promotable == true`.
+- `score_correction(text: &str) -> u8` — a 0..=100 score from a keyword set
+  (via `detect::detect_correction`).
+- `PatternCounter` — a `key -> (count, first_seen, last_seen)` map, persisted
+  to `signals/patterns.json`, with `observe`, `is_promotable(key, now,
+  window_days, threshold)` (default `window_days = 7`, `threshold = 3`), and
+  `prune`.
+- `LessonRule { keyword: &'static str, weight: u8 }` — a static table of
+  correction-trigger keywords (German and English).
+- `FileMemoryStore::maintain()` loads the `PatternCounter` state and promotes
+  `PatternHint` signals to WARM once `is_promotable` returns true.
 
-Tests (mind. 6):
-- Zähler-Increment,
-- Fenster-Pruning,
-- Promotion-Schwelle exakt bei 3,
-- JSON-Roundtrip,
-- Score-Werte für Korrektur-Beispiele,
-- Store-Roundtrip (leerer Zustand).
+## 6. Continuous Improvement — heartbeat
 
-**Bindung an philosophy.md §16 Invariante 8:** „Memory ist eine Promotion-Pipeline, kein unkontrolliertes Langzeit-Transcript."
+**File:** `harw-memory/src/heartbeat.rs`.
 
----
+- `Heartbeat<'a, M: Memory> { store: &'a M, clock: fn() -> Timestamp }`.
+- Rules:
+  - `PatternHint` 3x in 7d -> WARM (`domain/<key>.md`).
+  - HOT entry unused for 30d -> WARM (`domain/inactive.md`).
+  - WARM entry unused for 90d -> COLD.
+  - HOT overflow (>100 lines) -> oldest by `last_used` -> WARM.
+- `tick(store, now) -> MemoryResult<HeartbeatReport>` is idempotent.
+- `HeartbeatReport { promoted, demoted, archived, hot_lines_after }`.
 
-## 6. Continuous Improvement — Heartbeat
+## 7. Cost and resource budget
 
-**Datei:** `harw-memory/src/heartbeat.rs` (neu).
+| Aspect | Value |
+|---|---|
+| HOT tokens/turn | <= ~1,500 (~100 lines x 15 tokens) |
+| STM tokens/turn | <= 2,048 (configurable default) |
+| WARM load/turn | exactly 1 namespace (namespace + keyword match) |
+| I/O per turn | 1x `hot()` + 1x `recall()` |
+| I/O per heartbeat | O(HOT+WARM), append-only |
+| Lock contention | RwLock (STM), file locks (LTM) |
+| LLM calls | 0 in the memory layer |
 
-- `pub struct Heartbeat<'a, M: Memory> { store: &'a M, clock: fn() -> Timestamp }`.
-- Regeln (aus self-improving/SKILL.md „Automatic Promotion/Demotion"):
-  - PatternHint 3× in 7d → nach WARM (`domain/<key>.md`).
-  - HOT-Eintrag ungenutzt seit 30d → nach WARM (`domain/inactive.md`).
-  - WARM-Eintrag ungenutzt seit 90d → nach COLD.
-  - HOT-Overflow (>100 Zeilen) → älteste per `last_used` → WARM.
-- Wrapper-Funktion `pub fn tick<M: Memory>(store: &M, now: Timestamp) -> MemoryResult<HeartbeatReport>` — idempotent.
-- `HeartbeatReport { promoted: usize, demoted: usize, archived: usize, hot_lines_after: usize }`.
-- Nutzt bestehende `WorkflowMarker`/`WorkflowStep`-Statemachine als atomaren Rahmen (vgl. philosophy.md §4).
-
-Tests (mind. 5):
-- Promotion bei 3×,
-- Demotion HOT→WARM bei Alter,
-- Archivierung WARM→COLD bei Alter,
-- HOT-Overflow-Trimming,
-- Idempotenz zweier aufeinander folgender `tick`s bei stabiler Uhr.
-
----
-
-## 7. Kosten- und Ressourcenbudget
-
-| Aspekt | Wert | Herkunft |
-|---|---|---|
-| HOT-Tokens/Turn | ≤ ~1 500 (≈100 Zeilen × 15 Tokens) | philosophy.md §3 |
-| STM-Tokens/Turn | ≤ 2 048 (Default konfigurierbar) | design |
-| WARM-Load/Turn | genau 1 Namespace (Namespace + Keyword-Match) | philosophy.md §3 |
-| I/O pro Turn | 1× `hot()` + 1× `recall()` | design |
-| I/O pro Heartbeat | O(HOT+WARM), append-only | philosophy.md §4 |
-| Lock-Contention | RwLock (STM), Datei-Locks (LTM) | bestehend |
-| LLM-Aufrufe | 0 in Memory-Layer | bindend |
-
----
-
-## 8. Datei-Layout LTM
+## 8. LTM file layout
 
 ```
 <root>/
@@ -164,7 +124,7 @@ Tests (mind. 5):
     corrections.jsonl
     reflections.jsonl
     patterns.jsonl
-    patterns.json       # PatternCounter-State (learning.rs)
+    patterns.json       # PatternCounter state (learning.rs)
   warm/
     domain/<key>.md
     project/<name>.md
@@ -172,22 +132,8 @@ Tests (mind. 5):
     <namespace>.md
 ```
 
----
+## Implementation
 
-## 9. Fanout-Verantwortungen (verbindlich)
-
-| Datei | Owner-Agent | Acceptance-Command |
-|---|---|---|
-| `harw-memory/src/short_term.rs` (neu) | Agent-A | `cargo test -p harw-memory --lib short_term` |
-| `harw-memory/src/heartbeat.rs` (neu) | Agent-B | `cargo test -p harw-memory --lib heartbeat` |
-| `harw-memory/src/learning.rs` (neu) | Agent-C | `cargo test -p harw-memory --lib learning` |
-| `harw-model-catalog/src/providers.toml` + `embedded.rs` (edit) | Agent-D | `cargo test -p harw-model-catalog` |
-| `harw-model-catalog/src/behavior.rs` (neu) | Agent-E | `cargo test -p harw-model-catalog --lib behavior` |
-
-Jeder Agent muss:
-- `lib.rs` um `pub mod <neuer_modul>;` erweitern (soweit vorhanden),
-- volle `///` und `//!` Doku,
-- keine `unwrap()`/`expect()` außerhalb Tests,
-- keine `anyhow`/`thiserror`,
-- Fehler in bestehende `MemoryError`/`CatalogError` einreihen,
-- keine externen Netzwerkaufrufe.
+Implemented: `harw-memory/src/short_term.rs`, `heartbeat.rs`, `learning.rs`.
+The model-catalog behavior/router work referenced in earlier drafts of this
+document is tracked separately — see `docs/design/model-catalog-v2.md`.

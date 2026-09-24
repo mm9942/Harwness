@@ -3,26 +3,15 @@ publish.workspace = true
 name = "harw-types"
 version.workspace = true
 edition.workspace = true
+license.workspace = true
+repository.workspace = true
 rust-version.workspace = true
 
 [dependencies]
-# BEFUND (Gate-Lauf, `warden-no-c-build`): `blake3` 1.8.7 verlangt in seiner
-# eigenen, gepinnten Quelle (`~/.cargo/registry/src/.../blake3-1.8.7/Cargo.toml`)
-# `[build-dependencies.cc]` **ohne** `optional = true` — diese Kante ist
-# bedingungslos, für jede Feature-Kombination. Geprüft: das Feature `pure`
-# (`pure = []`) schaltet in `build.rs` nur die SIMD-Assembly-/C-Intrinsics-
-# Pfade ab (reine Rust-Intrinsics werden gebaut) — es hebt weder die
-# `cc`-Build-Dependency im Manifest auf, noch verhindert es den
-# C-Compiler-Sondierungsaufruf `c_compiler_support()` in `build.rs`, der auf
-# x86/x86_64-Targets unabhängig von `pure` ausgeführt wird (nur der
-# *Fehlschlag* dieser Sondierung ist bei `pure` unschädlich, siehe dortige
-# `main()`-Logik). Damit gibt es **kein** Merkmal, dessen Abwahl diesen Fund
-# beseitigt, ohne die Version zu wechseln (verboten laut Auftrag) — ein
-# echter, mit den erlaubten Mitteln nicht behebbarer Verstoß. `ContentDigest`
-# bleibt unverändert auf `blake3` mit Default-Features (`std`), da eine
-# Featureänderung hier keinen Nutzen hätte und ungeprüfte Abwahl verboten
-# ist.
-blake3 = { workspace = true }
+# `ContentDigest`/`InvalidDigest` liegen in der Leaf-Crate `harw-digest`
+# (nur blake3 + serde) und werden hier re-exportiert — damit Crates, die nur
+# den Digest brauchen, nicht `jiff`/`uuid`/`tokio-util` erben (Regel L7).
+harw-digest = { path = "../harw-digest" }
 # C-APPR: `Clock::now() -> jiff::Timestamp` (Serveruhr, F-122).
 jiff = { workspace = true }
 serde = { version = "1", features = ["derive"] }

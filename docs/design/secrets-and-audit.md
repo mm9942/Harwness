@@ -1,17 +1,19 @@
 # Secrets & Audit
 
-Status: design draft. No code exists yet for `harw-secrets` — this document
-specifies the shape it must have before implementation starts.
+> Status: partially implemented · Last reviewed: 2026-09-24
 
-> **Ist-Stand (2026-09)**: The "no code exists yet" claim above is outdated.
-> `harw-secrets` exists and implements the envelope (DEK/KEK), with
-> ML-KEM-1024 as the default policy, rotation, KEK provenance, the
-> hash-chained audit log, and ML-DSA checkpoints as designed below.
-> `crypt_guard` is pinned to `=3.0.1` (not the `2.0.3`/`"2"` referenced in
-> §2.1/§5.1). Still open: audit events are only emitted for `secret.*`
-> actions (approval/channel/plugin events from §4.4 are not wired up yet),
-> and at-rest encryption of the session journal and knowledge artifacts
-> (§1.b) is not implemented.
+This document was originally written as a design draft before any code
+existed for `harw-secrets`, and much of it below still reads that way
+(design rationale, sketches, open questions). **Current state:**
+`harw-secrets` exists and implements the envelope (DEK/KEK), with
+ML-KEM-1024 as the default policy, rotation, KEK provenance, the
+hash-chained audit log, and ML-DSA checkpoints as designed below.
+`crypt_guard` is pinned to `=3.0.2` (not the `2.0.3`/`"2"` referenced in
+§2.1/§5.1 below — those sections are kept as historical design rationale,
+not the current pin). Still open: audit events are only emitted for
+`secret.*` actions (approval/channel/plugin events from §4.4 are not wired
+up yet), and at-rest encryption of the session journal and knowledge
+artifacts (§1.b) is not implemented.
 
 ## 0. Why one document
 
@@ -566,12 +568,12 @@ similar the reference material may look:
   filesystem-first storage model (see `docs/design/knowledge-surfaces.md`
   §1 for the sibling filesystem-based design).
   Nothing here talks to a database or a network service.
-- **No `sgh-flow` coupling of any kind.** No shared crate, no shared wire
-  format, no shared identifiers, no assumption that Harwness and sgh-flow
-  ever run in the same process or exchange data. The `crypt_guard` dependency
-  is a coincidental shared *library* dependency (both projects use the same
-  published crate for PQC sealing), not an architectural coupling between
-  the two projects.
+- **No coupling to any other in-house project.** No shared crate, no shared
+  wire format, no shared identifiers, no assumption that Harwness and any
+  other project ever run in the same process or exchange data. Where the
+  `crypt_guard` dependency happens to also be used elsewhere, that is a
+  coincidental shared *library* dependency (the same published crate for
+  PQC sealing), not an architectural coupling.
 
 ## 7. Open questions
 

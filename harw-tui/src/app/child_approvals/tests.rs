@@ -189,3 +189,32 @@ fn every_approval_variant_is_a_single_approval() {
         }
     );
 }
+
+/// Nutzerentscheidung 2026-09-24: unter „Full Access" beantwortet die TUI
+/// eine bereits unterwegs gewesene Kind-Frage selbst — kein Dialog.
+#[tokio::test]
+async fn full_access_answers_relayed_child_requests_without_a_dialog() -> TestResult {
+    let (mut app, broker) = app_with_channel()?;
+    let answer = submit(&broker)?;
+    let prompt = app
+        .child_approvals
+        .receiver
+        .as_mut()
+        .ok_or(TestError::Missing("Kanal der Kind-Fragen"))?
+        .try_recv()
+        .map_err(|_| TestError::Missing("zugestellte Kind-Frage"))?;
+    app.child_approvals.queue.push_back(prompt);
+
+    assert!(!approve_waiting_in_mode(
+        &mut app,
+        Some(ApprovalMode::Delegated)
+    ));
+    assert!(approve_waiting_in_mode(
+        &mut app,
+        Some(ApprovalMode::FullAccess)
+    ));
+    assert!(!is_open(&app));
+    assert!(app.pending_approval_dialog.is_none());
+    assert!(matches!(answer.await, Ok(ChildApprovalAnswer::Approve)));
+    Ok(())
+}

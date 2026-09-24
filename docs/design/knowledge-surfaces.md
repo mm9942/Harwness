@@ -1,10 +1,11 @@
 # Knowledge & Work Surfaces
 
-Status: design draft. No code exists yet for `harw-knowledge`, `harw-session-store`,
-`harw-job-runtime`, `harw-catalog`, or `harw-policy` — this document specifies the
-shape they must have before implementation starts.
+> Status: implemented · Last reviewed: 2026-09-24
 
-> **Ist-Stand (2026-09-24, Runde 4).** The "no code exists yet" line above is
+The "no code exists yet" framing below is historical, kept only where it
+still explains a design decision.
+
+> **Current state.** The "no code exists yet" line above is
 > historical. `harw-knowledge`, `harw-session-store`, `harw-job-runtime` and
 > `harw-catalog` exist; store, index, recall and visibility are implemented,
 > and `ArtifactKind` has more variants than the 8 sketched in §8.1. All five
@@ -735,7 +736,7 @@ never show a state the job ledger disagrees with.
    toward surface-only to keep palace writes strictly promotion-gated, but
    worth deciding before `harw-knowledge` v1 locks the `Confidence` enum.
 
-   **Status (Runde 4): decided — surface only, never auto-downgrade.**
+   **Status: decided — surface only, never auto-downgrade.**
    Every dream run looks for staleness candidates
    (`harw_knowledge::dream::palace_stale_candidates`, called from
    `run_maintenance` in `harw-ops/src/dream_run.rs`): `provisional` entries
@@ -753,12 +754,12 @@ never show a state the job ledger disagrees with.
    property of the `WorkbenchScope` variant rather than one global config
    key?
 
-   **Status (Runde 4): decided — retention per scope.**
+   **Status: decided — retention per scope.**
    `harw_knowledge::workbench::Retention` belongs to the scope
    (`retention.json` in the scope directory), not to a global key. Defaults:
    session scopes expire after 14 days without change
    (`DEFAULT_SESSION_RETENTION_DAYS`), project scopes `keep`. Set with
-   `/workbench retention [keep|<tage>d] [--scope=…]`; expired scopes are
+   `/workbench retention [keep|<days>d] [--scope=…]`; expired scopes are
    pruned by the maintenance step of every dream run (`prune_expired`). The
    diary, by contrast, has one profile key, `[knowledge.diary]
    retention_days` (default 90; older days move into the monthly rollup).
@@ -768,7 +769,7 @@ never show a state the job ledger disagrees with.
    `Budget` type is implemented and its units (tokens vs. wall-time vs. tool
    invocations) are finalized — this doc can't pick a number in a vacuum.
 
-   **Status (Runde 4): decided.** `[dream] budget` = 16 384 tokens per run
+   **Status: decided.** `[dream] budget` = 16 384 tokens per run
    (profile key, `config-scopes.md` §1.18) plus a fixed wall-clock limit of
    300 s (`DREAM_MAX_WALL`); exceeding either aborts the run before a report
    is written. `max_tool_calls` is effectively 0: the dream turn runs with
@@ -786,7 +787,7 @@ never show a state the job ledger disagrees with.
    a concrete mechanism (advisory flock? a per-board write-serializing
    actor?) before that becomes a real race instead of a theoretical one.
 
-   **Status (Runde 4): decided — advisory file locks via `fs4`.**
+   **Status: decided — advisory file locks via `fs4`.**
    `harw_knowledge::lock::KnowledgeLock` takes an exclusive `flock` (or
    `LockFileEx`) on a hidden neighbour file `.<name>.lock`, polling with a
    timeout instead of blocking. The lock is released on drop and when the
@@ -802,7 +803,7 @@ never show a state the job ledger disagrees with.
    operator?). This likely needs to fold into `harw-policy`'s broader
    approval model rather than being decided locally in this document.
 
-   **Status (Runde 4): partly decided.** For the new read tools, agents see
+   **Status: partly decided.** For the new read tools, agents see
    through `palace.search`/`palace.recall` only `established` nodes, including
    ones with `OperatorOnly` visibility: the operator's explicit
    `/palace promote` is the release to agents. `provisional` topics stay
@@ -818,9 +819,9 @@ never show a state the job ledger disagrees with.
    ReviewRequired }` transitions *require* a linked diary entry, or is that
    over-engineering a convention Hermes gets away with as just a convention?
 
-   **Status (Runde 4): partly decided — convention, not a requirement.**
+   **Status: partly decided — convention, not a requirement.**
    Cards have their own evidence field (`evidence`, `/kanban evidence
-   <karte> <pfad|url>`), timestamped comments with author, and a history;
+   <card> <path|url>`), timestamped comments with author, and a history;
    the kanban worker writes result and job history to the card. A linked
    diary entry is **not** required for `ReviewRequired`, but a diary entry
    can be linked as evidence by its path. Whether a requirement is worth it

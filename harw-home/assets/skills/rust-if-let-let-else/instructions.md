@@ -29,7 +29,7 @@ fn needs_setup() -> bool {
 Wenn ein Wert vorhanden sein *kann* und du im Fehler-/None-Fall einfach weitermachst:
 
 ```rust
-// Datei: apps/sgh-flow/src/services/auto_cli_key.rs:208
+// Datei: apps/acme-app/src/services/auto_cli_key.rs:208
 // Env-Variable ist optional; fehlt sie, macht die Funktion einfach weiter.
 if let Ok(raw) = std::env::var(ADMIN_CLI_KEY_ORG_ENV) {
     match raw.trim().parse::<Uuid>() {
@@ -44,7 +44,7 @@ if let Ok(raw) = std::env::var(ADMIN_CLI_KEY_ORG_ENV) {
 }
 // Kein else nötig — Kontrollfluss läuft einfach weiter
 
-// Datei: apps/sgh-flow/src/services/auto_cli_key.rs:235
+// Datei: apps/acme-app/src/services/auto_cli_key.rs:235
 if let Some(ref oid) = id {
     info!(org_id = %oid, "resolved first organization");
 }
@@ -57,14 +57,14 @@ Der extrahierte Wert (`exe`, `setup_bin`) ist *nach* dem `else`-Block im Scope �
 zusätzliches Einrücken nötig.
 
 ```rust
-// Datei: apps/sgh-flow/src/main.rs:25
+// Datei: apps/acme-app/src/main.rs:25
 // Kann current_exe nicht auflösen → einfach zurückkehren, kein Crash
 let Ok(exe) = std::env::current_exe() else {
     return;
 };
 // `exe` ist hier als PathBuf verfügbar
 
-// Datei: apps/sgh-flow/src/setup_guard.rs:60
+// Datei: apps/acme-app/src/setup_guard.rs:60
 pub fn needs_setup() -> bool {
     // Setup-Binary fehlt → Setup bereits abgeschlossen, false zurückgeben
     let Some(setup_bin) = setup_binary_path() else {
@@ -73,7 +73,7 @@ pub fn needs_setup() -> bool {
     if !setup_bin.is_file() {
         return false;
     }
-    // Datei: apps/sgh-flow/src/setup_guard.rs:67
+    // Datei: apps/acme-app/src/setup_guard.rs:67
     let Some(prefix) = install_prefix() else {
         return true; // Prefix nicht auflösbar → Konfiguration fehlt
     };

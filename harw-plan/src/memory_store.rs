@@ -845,7 +845,7 @@ mod tests {
             PlanAction::BindGoal {
                 goal_id: "g-1".to_owned(),
             },
-            "human:mia",
+            "human:alice",
         )?;
 
         assert_eq!(store.current()?.goal_id.as_deref(), Some("g-1"));

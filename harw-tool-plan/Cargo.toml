@@ -3,6 +3,8 @@ publish.workspace = true
 name = "harw-tool-plan"
 version.workspace = true
 edition.workspace = true
+license.workspace = true
+repository.workspace = true
 rust-version.workspace = true
 
 # Runde 5, Teil F: Plan-Modus wie in Claude Code — `plan.write`, `plan.exit`,
