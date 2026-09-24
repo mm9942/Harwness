@@ -350,14 +350,22 @@ fn parse_target(raw: &Value, index: usize) -> Result<WaveTarget, OpError> {
 }
 
 /// Liest ein nicht-leeres Textfeld eines Ziels.
-fn required_text(object: &Map<String, Value>, field: &str, index: usize) -> Result<String, OpError> {
+fn required_text(
+    object: &Map<String, Value>,
+    field: &str,
+    index: usize,
+) -> Result<String, OpError> {
     object
         .get(field)
         .and_then(Value::as_str)
         .map(str::trim)
         .filter(|text| !text.is_empty())
         .map(str::to_owned)
-        .ok_or_else(|| invalid(&format!("`targets[{index}].{field}` must be a non-empty string")))
+        .ok_or_else(|| {
+            invalid(&format!(
+                "`targets[{index}].{field}` must be a non-empty string"
+            ))
+        })
 }
 
 /// Lehnt jedes Feld außerhalb von `allowed` ab (geschlossenes Schema).
@@ -563,9 +571,7 @@ impl TargetStatus {
                 (Some(Ok(value)), true) if is_pause_report(&value) => Self::Paused(value),
                 (Some(Ok(value)), true) => Self::Completed(value),
                 (Some(Err(message)), true) => Self::Failed(message),
-                _ => Self::Failed(
-                    "der Fan-out-Platz lieferte nicht genau ein Ergebnis".to_owned(),
-                ),
+                _ => Self::Failed("der Fan-out-Platz lieferte nicht genau ein Ergebnis".to_owned()),
             },
         }
     }
@@ -719,17 +725,20 @@ pub async fn delegate_wave(
         ));
     }
 
-    let visible: BTreeSet<String> =
-        harw_extension_api::AgentSpawner::delegation_target_names(spawner.as_ref(), ctx.session_id())
-            .into_iter()
-            .collect();
+    let visible: BTreeSet<String> = harw_extension_api::AgentSpawner::delegation_target_names(
+        spawner.as_ref(),
+        ctx.session_id(),
+    )
+    .into_iter()
+    .collect();
     if visible.is_empty() {
         return Err(OpError::NotAvailable(format!(
             "delegate_wave: {NO_CAPABILITY}"
         )));
     }
     let caller = spawner.child_record(ctx.session_id());
-    let declared = DeclaredTargets::for_caller(policy, caller.as_ref().map(|record| record.role.as_str()));
+    let declared =
+        DeclaredTargets::for_caller(policy, caller.as_ref().map(|record| record.role.as_str()));
     let admission = admit_targets(request, &visible, &declared, policy);
     let budget = wave_budget_cap(spawner.child_budget(ctx.session_id()));
 
@@ -1186,14 +1195,19 @@ mod tests {
         assert!(
             !report(
                 WaveJoin::Collect,
-                vec![TargetStatus::Failed("x".to_owned()), TargetStatus::Cancelled]
+                vec![
+                    TargetStatus::Failed("x".to_owned()),
+                    TargetStatus::Cancelled
+                ]
             )
             .is_satisfied()
         );
         assert!(
             !report(
                 WaveJoin::Any,
-                vec![TargetStatus::Paused(json!({ "paused": "approval", "child": "c" }))]
+                vec![TargetStatus::Paused(
+                    json!({ "paused": "approval", "child": "c" })
+                )]
             )
             .is_satisfied(),
             "eine Pause ist kein Abschluss"
@@ -1230,7 +1244,9 @@ mod tests {
             TargetStatus::Paused(_)
         ));
         assert!(matches!(
-            TargetStatus::from_fanout(Ok(vec![Ok(json!({ "paused": "child", "extra": 1, "child": "c" }))])),
+            TargetStatus::from_fanout(Ok(vec![Ok(
+                json!({ "paused": "child", "extra": 1, "child": "c" })
+            )])),
             TargetStatus::Completed(_)
         ));
         assert!(matches!(
@@ -1332,7 +1348,10 @@ mod tests {
         );
         let request = parse(json!({ "targets": [{ "role": "explorer", "task": "a" }] }))?;
         let result = delegate_wave(&bare, &request, &policy()).await;
-        assert!(matches!(result, Err(OpError::NotAvailable(_))), "{result:?}");
+        assert!(
+            matches!(result, Err(OpError::NotAvailable(_))),
+            "{result:?}"
+        );
         let _ = std::fs::remove_dir_all(tmp);
         Ok(())
     }
@@ -1372,7 +1391,10 @@ mod tests {
         let result = operation
             .run(&runtime, OpInput::command("/delegate_wave", Vec::new()))
             .await;
-        assert!(matches!(result, Err(OpError::InvalidArguments(_))), "{result:?}");
+        assert!(
+            matches!(result, Err(OpError::InvalidArguments(_))),
+            "{result:?}"
+        );
         let _ = std::fs::remove_dir_all(tmp);
         Ok(())
     }
