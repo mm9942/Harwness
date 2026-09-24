@@ -2611,15 +2611,15 @@ impl ChatApp {
             return;
         };
         if !query.contains(char::is_whitespace) {
-            match self.command_popup.as_mut() {
-                Some(popup) if matches!(popup.mode(), PopupMode::CommandName) => {
-                    popup.on_query_change(query);
-                }
-                _ => {
-                    let mut popup = CommandPopup::new(&self.command_registry);
-                    popup.on_query_change(query);
-                    self.command_popup = Some(popup);
-                }
+            let reuse = matches!(
+                self.command_popup.as_ref().map(CommandPopup::mode),
+                Some(PopupMode::CommandName)
+            );
+            if !reuse {
+                self.command_popup = Some(CommandPopup::new(&self.command_registry));
+            }
+            if let Some(popup) = self.command_popup.as_mut() {
+                popup.on_query_change(query);
             }
             return;
         }
@@ -6083,6 +6083,7 @@ fn scroll_and_composer_key(app: &mut ChatApp, key: KeyEvent, bus: &HarwEventSend
         let line = app.input.text().to_owned();
         app.input.clear();
         app.command_popup = None;
+        app.mention_popup = None;
         match classify_line(&line) {
             LineAction::Quit => bus.send(HarwEvent::Quit),
             LineAction::Ignore => {}
@@ -6184,6 +6185,7 @@ fn scroll_and_composer_key(app: &mut ChatApp, key: KeyEvent, bus: &HarwEventSend
             if app.escape_armed {
                 app.input.clear();
                 app.command_popup = None;
+                app.mention_popup = None;
                 app.escape_armed = false;
             } else {
                 app.escape_armed = true;
@@ -6210,6 +6212,7 @@ fn scroll_and_composer_key(app: &mut ChatApp, key: KeyEvent, bus: &HarwEventSend
                 app.remember_input(&text);
                 app.scroll.force_follow();
                 app.command_popup = None;
+                app.mention_popup = None;
                 match classify_line(&text) {
                     LineAction::Quit => bus.send(HarwEvent::Quit),
                     LineAction::Ignore => {}
@@ -7745,6 +7748,7 @@ fn queue_busy_key(app: &mut ChatApp, key: KeyEvent) -> BusyKeyOutcome {
     match app.input.handle_key(key) {
         InputAction::Submit(text) => {
             app.remember_input(&text);
+            app.mention_popup = None;
             match classify_line(&text) {
                 LineAction::Chat(text) => app.pending_turns.push_back(text),
                 LineAction::Command(raw) => {
