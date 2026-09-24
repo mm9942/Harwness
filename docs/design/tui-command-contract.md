@@ -14,6 +14,15 @@ prior art surveyed under `inspirations/openclaw` and Hermes's
 semantic below is Harwness-original and must not be assumed compatible with
 either source.
 
+> **Ist-Stand (2026-09-24, deutsch):** Die §§1–7 sind der ursprüngliche
+> Zielentwurf. Was der Code heute tatsächlich anbietet — Befehlsinventar
+> (Operationen, TUI-lokale Befehle, Ersatz-Spezifikationen, geplante
+> Befehle), Präfixe `#`/`@`, Tastenbelegung F1/F5–F8, `/models`,
+> `/mode default` und die CLI-Flags `--mode`/`--approval`/`--model` — steht
+> verbindlich in **§8**. Modelle je Rolle, Modus vs. Freigabe und die
+> Start-Rangfolge beschreibt `tui-roles-models-modes.md`. Bei Widerspruch
+> gilt §8.
+
 ---
 
 ## 1. Formal Command Grammar
@@ -180,6 +189,8 @@ Legend for **Tier**: `Obs` `Op` `Maint` `Own`.
 |---|---|---|---|---|
 | `/doctor` | `[--fix] [--section=catalog\|config\|provider\|mcp\|sandbox\|policy]` | Health check across catalog/config/provider/MCP/sandbox/policy | Obs (plain), Maint (`--fix`) | Y |
 | `/model` | `show \| list \| switch <id>` | Inspect the active model, or atomically switch provider+model together (implemented grammar; see `interaction-contract.md` §2.6.1 for the full Ist-Stand table, including the new `/uia-model`, `/uia-worker-model`, `/effort`, `/uia-effort`, `/provider-concurrency` siblings) | Op | Y |
+| `/models` (neu) | `[show \| set <rolle> <ziel> \| reset <rolle> \| pick <rolle>]` | Modelle **je Rolle** (12 Rollen, siehe `tui-roles-models-modes.md`) anzeigen/setzen/zurücksetzen; wirkt **ab nächster Sitzung** — nur `/model` wechselt live. `pick` öffnet TUI-lokal den Modell-Picker der Rolle. Details §8.2 | Op | - |
+| `/mode` (aktualisiert) | `[show \| <modus> \| default <modus>]` | Interaktionsmodus (`chat\|plan\|explore\|work\|shell`) anzeigen, für die laufende Sitzung anfordern (wirkt an der nächsten Turn-Grenze) oder als `[mode] default` persistieren (neue Sitzungen). Bare `/mode` öffnet in der TUI die Modus-/Freigabe-Auswahl (F7) | Op | - |
 | `/provider` | `show \| list \| test` | Inspect provider status and credentials only — **`/provider switch` no longer exists**; a provider (and model) switch is exclusively driven by `/model switch <id>` (atomic, works even across providers) | Op | R |
 | `/skills` | `[SkillRef] [--search=text] [--install]` | Browse, search, or install skills | Op (browse), Maint (`--install`) | R |
 | `/tools` | `[ToolRef] [--enable \| --disable]` | Show or toggle tool availability for the session | Op | R |
@@ -190,16 +201,20 @@ Legend for **Tier**: `Obs` `Op` `Maint` `Own`.
 | `/sandbox-lease` (neu, Nutzerentscheidung 2026-09-21) | `[status \| revoke]` | Host-Freigabe für `shell.exec`: `status` zeigt die aktive Freigabe (Sitzung/Einzelaufruf/aus), `revoke` beendet eine aktive Sitzungsfreigabe sofort (`busy = "immediate"`); die Freigabe selbst wird nicht über den Command, sondern über das gleichnamige Modell-Tool `sandbox-lease` (Argument `reason`) angefordert und im `HostPermitDialog` bestätigt — siehe `interaction-contract.md` §2.6 und `mediated-process-execution.md` | Maint | - |
 | `/plugins` | `[--list \| --enable=name \| --disable=name]` | Manage extension-api plugins | Maint | - |
 
-### 2.6 Knowledge surfaces (names reserved here; semantics detailed by another design worker)
+### 2.6 Knowledge surfaces
 
-| Command | One-line semantics | Tier | Parity |
+Ist-Grammatik (aus `harw-ops/src/{memory,diary,palace,workbench,kanban}.rs`;
+`/dream` nur als TUI-Vertrag, es gibt noch keine Operation). Stufe laut
+`OperationMeta` ist bei allen `operator`.
+
+| Command | Ist-Grammatik | Tier | Parity |
 |---|---|---|---|
-| `/memory` | Query/append durable cross-session agent memory | Op | Y |
-| `/diary` | Per-session narrative log of what the agent did and why | Obs | R |
-| `/dream` | Offline/idle-time consolidation pass over memory | Maint | - |
-| `/palace` | Spatial/associative index over long-term memory ("memory palace") | Obs | - |
-| `/workbench` | Scratch surface for in-progress artifacts before promotion to work items | Op | R |
-| `/kanban` | Visual board projection of the work graph (§2.3) | Obs | Y |
+| `/memory` | `list \| stats \| recall <stichwort…> \| record <text…> [--project\|--global] \| forget <name> \| maintain \| consolidate [--project\|--global]` | Op | Y |
+| `/diary` | `today \| show [agent] [--date=YYYY-MM-DD] \| note <text>`; `#text` ist Zucker für `note` (§3) | Op | R |
+| `/dream` | `list \| show <id>` (Vertrag; nur TUI-Ersatzspezifikation) | Op | - |
+| `/palace` | `list \| show <id> \| search <anfrage> [--max-hops=n] [--max=n] \| promote <thema>` | Op | Y |
+| `/workbench` | `show [--scope=session\|project:<slug>] \| pin <pfad> [notiz] \| unpin <pfad> \| note <text> \| hypothesis add\|confirm\|reject <text>` | Op | R |
+| `/kanban` | `[--board=<id>] show [karte] \| list [--all] \| boards \| add\|create <titel> … \| move <karte> <todo\|ready\|running\|done\|blocked\|archived> \| todo\|ready\|claim\|unblock\|done\|archive <karte> \| block <karte> <grund>` | Op | Y |
 
 ### 2.7 Channels
 
@@ -240,8 +255,8 @@ ordinary chat input routed to the active agent.
 | `/` | **Command** | Structured command per §1–§2. |
 | `!` | **Shell** | Runs the remainder as a host shell command through the sandboxed execution surface; output streams to an Inline or Pager surface depending on length. Requires `Operator` tier and an enabled `commands.shell` capability flag. **Ist-Stand 2026-09-21:** läuft mit dem beim Programmstart gelesenen zsh-PATH des harw-Prozesses — jedes existierende PATH-Verzeichnis außerhalb von `/usr /bin /lib /lib64` und dem Workspace wird per `--ro-bind-try` in die Sandbox gebunden (ausgenommen `/` und exakt `$HOME`), `~/.cargo/bin` zieht zusätzlich `RUSTUP_HOME`/`CARGO_HOME` nach sich; der Prozess läuft weiterhin in bwrap, nicht auf dem Host, und zwar unabhängig von einem aktiven `sandbox-lease`. Die normale Modell-`shell.exec` in der Projekt-Sandbox bleibt ohne Lease hermetisch mit Minimal-PATH — siehe `mediated-process-execution.md`. |
 | `!!` | **Shell-repeat** | Re-runs the last `!` shell command verbatim. Bare `!!` with no trailing text; any trailing text after `!!` is an error (`CommandError::TrailingTokens`), to avoid ambiguity with `!! <new cmd>` meaning something else. |
-| `#` | **Note** | Appends the remainder as a timestamped entry to `/diary` (§2.6) without invoking the agent. Never sent to the model as a prompt — purely a local annotation. |
-| `@` | **Mention** | Addresses a specific `AgentRef` or file. `@planner <text>` routes `<text>` to the named agent (equivalent to `/mention`). `@./path/to/file` (leading `./`, `../`, or `/`) attaches file content as context instead. Disambiguation rule: a token is an `AgentRef` if it resolves in the topology; otherwise, if it looks path-like, it is a file mention; otherwise it is a literal `@` character passed through as chat text with a warning toast. |
+| `#` | **Notiz** (Ist) | `#text` wird zu `/diary note text`, wenn die `diary`-Operation registriert ist, sonst zu `/memory record text`. Kein Modell-Turn; läuft über denselben Op-Pfad (eine Audit-Spur). Details §8.3. |
+| `@` | **Erwähnung** (Ist) | `@rolle text`: **Delegationswunsch an die UIA** — der Text geht als normaler Chat an die UIA, eingeleitet mit „[Delegationswunsch an Rolle „rolle“]“; die UIA entscheidet, ob sie delegiert (kein direktes Routing). `@pfad` hängt eine Projektdatei als `<datei pfad="…">…</datei>`-Block an (64 KiB je Datei, 256 KiB gesamt, max. 8 Dateien, Sperrliste). Eine bekannte Rolle hat Vorrang; eine gleichnamige Datei per `./name`. Details §8.3. |
 
 Two forms deliberately **not** used, to keep the prefix set minimal and
 unambiguous: no `?` prefix (help is `/help` or the dedicated `Help` key, §4)
@@ -276,6 +291,13 @@ plain chat text.
 
 Harwness TUI keybindings follow a ratatui-style global/view-local split with
 optional two-key chords, entirely configurable via TOML in `harw-config`.
+
+> **Ist-Stand:** Die tatsächliche Standardbelegung (u. a. `Ctrl+K` = Zeile
+> löschen, `Shift+Tab` = Freigabe-Zyklus, F1 Hilfe, F5 Werkbank, F6 Kanban,
+> F7 Modusauswahl, F8 Modelle) und das reale Dateiformat
+> (`[tui].keybindings_file`, flache Tabelle `aktion = "chord"`) stehen in
+> §8.4. Die folgenden Tabellen und das TOML-Schema in §4.4 sind der
+> ursprüngliche Entwurf.
 
 ### 4.1 Global keys (active in every view)
 
@@ -727,10 +749,9 @@ levels plus a "Provider-Default (zurücksetzen)" entry that emits `clear`.
    is charged against the parent's is a `harw-job-runtime` concern not yet
    designed; the command surface above assumes a `--budget=Duration` flag
    but the semantics (hard cap vs. soft warning) are undecided.
-3. **Knowledge-surface commands** (`/memory`, `/diary`, `/dream`, `/palace`,
-   `/workbench`, `/kanban`) are reserved names + one-liners only per the
-   task brief; their full argument grammar, storage model, and parity
-   detail belong to a dedicated design document and are out of scope here.
+3. ~~Knowledge-surface commands~~ — erledigt: Grammatik in §2.6, Speicher-
+   modell in `knowledge-surfaces.md`. Offen bleibt nur `/dream` (keine
+   Operation, nur TUI-Ersatzspezifikation `list|show`).
 4. **Command versioning across channel native-command registration** (e.g.
    if Harwness later registers native Telegram bot commands) is not
    addressed; this document only defines the internal contract that any

@@ -1834,7 +1834,8 @@ mod tests {
         // `WorkerSimple`/`WorkerComplex` path exactly like `model_for_task`.
         let factory = factory_with_worker_complex_effort_defaults(Some("high"), Some("high"))?;
         for role in [
-            // Builtin definition, but not a worker role.
+            // Builtin definition, but not a worker role; its own
+            // `RootOrchestrator` point (R1) is unresolved in this fixture.
             role_names::ROOT_ORCHESTRATOR,
             // Repo-local role without a builtin definition.
             "some-repo-local-role",

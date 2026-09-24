@@ -305,9 +305,9 @@ impl TelegramAttachmentIntake {
                         error = %error,
                         "Telegram attachment could not be cached"
                     );
-                    report.rejected.push(format!(
-                        "{label}: Datei konnte nicht gespeichert werden"
-                    ));
+                    report
+                        .rejected
+                        .push(format!("{label}: Datei konnte nicht gespeichert werden"));
                 }
             }
         }
@@ -462,7 +462,10 @@ Textanhang notiz.txt (10 Bytes):\n```text\nhallo\nwelt\n```\n";
             rejected: Vec::new(),
         };
         let preamble = report.prompt_preamble();
-        assert!(preamble.contains("`````text\nx ```` y\n`````\n"), "{preamble}");
+        assert!(
+            preamble.contains("`````text\nx ```` y\n`````\n"),
+            "{preamble}"
+        );
     }
 
     #[test]
@@ -470,7 +473,10 @@ Textanhang notiz.txt (10 Bytes):\n```text\nhallo\nwelt\n```\n";
         assert_eq!(display_name("../../etc/passwd"), "passwd");
         assert_eq!(display_name("a\nb\u{7}c.txt"), "a b c.txt");
         let long = "x".repeat(300);
-        assert_eq!(display_name(&long).chars().count(), MAX_DISPLAY_NAME_CHARS + 1);
+        assert_eq!(
+            display_name(&long).chars().count(),
+            MAX_DISPLAY_NAME_CHARS + 1
+        );
     }
 
     #[test]
@@ -505,7 +511,10 @@ Textanhang notiz.txt (10 Bytes):\n```text\nhallo\nwelt\n```\n";
         let bad_type = TelegramTransportError::AttachmentRejected {
             reason: "MIME type is not allowed: application/x-msdownload".to_owned(),
         };
-        assert_eq!(user_reason(&bad_type, 10), "Dateityp wird nicht unterstützt");
+        assert_eq!(
+            user_reason(&bad_type, 10),
+            "Dateityp wird nicht unterstützt"
+        );
         let other = TelegramTransportError::WebhookAuth;
         assert_eq!(user_reason(&other, 10), "Datei konnte nicht geladen werden");
     }
