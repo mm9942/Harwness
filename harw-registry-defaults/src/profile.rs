@@ -214,20 +214,20 @@ pub mod role_names {
     pub const SECURITY_ENDPOINT_TRIAGE: &str = "security-endpoint-triage";
 
     /// Spieler-Sitz des Matrix-Games (Runde 3, Welle E): formuliert aus der
-    /// eigenen Sicht einen Zug. Werkzeuglos und ohne Netz — der
-    /// Matrix-Runner übergibt die Sicht im Prompt
+    /// eigenen Sicht einen Zug. Liest nur die eigenen Unterlagen (ohne Netz,
+    /// ohne Schreiben/Exec) — der Matrix-Runner übergibt die Sicht im Prompt
     /// (`agents/roles/matrix-player/matrix-player.toml`).
     pub const MATRIX_PLAYER: &str = "matrix-player";
     /// Schiedsrichter-Sitz des Matrix-Games: bewertet Züge und schreibt den
-    /// Lagebericht. Werkzeuglos und ohne Netz
+    /// Lagebericht. Liest nur Unterlagen (ohne Netz, ohne Schreiben/Exec)
     /// (`agents/roles/matrix-umpire/matrix-umpire.toml`).
     pub const MATRIX_UMPIRE: &str = "matrix-umpire";
     /// Markt-Sitz des Matrix-Games: schätzt Wahrscheinlichkeiten offener
-    /// Entwicklungen. Werkzeuglos und ohne Netz
+    /// Entwicklungen. Liest nur Unterlagen (ohne Netz, ohne Schreiben/Exec)
     /// (`agents/roles/matrix-market/matrix-market.toml`).
     pub const MATRIX_MARKET: &str = "matrix-market";
     /// Die drei Sitz-Rollen des Matrix-Games. Alle bekommen
-    /// [`crate::profile::RegistryProfile::NoTools`] und den Reducer
+    /// [`crate::profile::RegistryProfile::MatrixReader`] und den Reducer
     /// [`crate::authority::AuthorityReducer::ReadOnly`].
     pub const MATRIX_ROLES: [&str; 3] = [MATRIX_PLAYER, MATRIX_UMPIRE, MATRIX_MARKET];
 
@@ -717,6 +717,9 @@ pub(crate) const BROWSER_TOOLS: &[&str] = &[
 ///   (siehe deren Begründung bei [`RegistryProfile::MemoryStewardship`]
 ///   unten für den Grund, warum `Full` dafür zu weit wäre).
 /// - `NoTools` — registriert und bewirbt gar nichts.
+/// - `MatrixReader` — nur die lesenden `fs.*` plus `doc.read_pdf`; Rechte
+///   genau `{ReadWorkspace}` (Matrix-Game-Sitze, siehe
+///   [`RegistryProfile::MatrixReader`]).
 /// - `WorkspaceEdit` — Workspace lesen und schreiben (`fs.*` inklusive
 ///   `fs.write`), aber kein `shell.*`, kein `web.*`, kein `lens.ask`; Rechte
 ///   genau `{ReadWorkspace, WriteWorkspace}` (siehe
@@ -967,6 +970,23 @@ pub enum RegistryProfile {
     /// Keine eingebaute Rolle bekommt dieses Profil — es ist ein reines
     /// Einstiegsprofil.
     WorkspaceEdit,
+    /// Nur lesende Unterlagen: [`FS_READ_ONLY_TOOLS`] (`fs.read`, `fs.list`,
+    /// `fs.search`, `fs.glob`, `fs.grep`) plus [`DOC_TOOLS`]
+    /// (`doc.read_pdf`) — kein `fs.write`, kein `shell.*`, kein
+    /// `process.*`, kein `web.*`, kein `explore.*`, kein `deps.*`, kein
+    /// `lens.ask`. Rechte genau `{ReadWorkspace}`.
+    ///
+    /// # Warum dieses Profil existiert (Runde 3, Matrix-Unterlagen)
+    /// Nutzerwunsch: die Sitze des Matrix-Games ([`role_names::MATRIX_ROLES`])
+    /// sollen Dateien aus einem Unterlagen-Ordner lesen können. Der
+    /// Matrix-Runner kopiert je Sitz nur die für ihn sichtbaren Unterlagen in
+    /// einen eigenen Ordner und setzt ihn als Sandbox-Wurzel des Kindes; das
+    /// Profil liefert genau die Werkzeuge, um diesen Ordner zu lesen.
+    /// `ReadOnlyExplore` wäre zu weit (`explore.*` sieht den ganzen Baum,
+    /// `deps.*` den Registry-Cache, dazu `web.*`), `NoTools` zu eng. Der
+    /// Reducer der Rollen bleibt
+    /// [`crate::authority::AuthorityReducer::ReadOnly`] — kein Netz.
+    MatrixReader,
 }
 
 impl RegistryProfile {
@@ -988,6 +1008,7 @@ impl RegistryProfile {
         RegistryProfile::UiaShellWorker,
         RegistryProfile::ReadOnlyResearch,
         RegistryProfile::WorkspaceEdit,
+        RegistryProfile::MatrixReader,
     ];
 
     /// Liefert die Rollenbeschreibung, die im System-Prompt erscheint.
@@ -1025,6 +1046,7 @@ impl RegistryProfile {
             }
             RegistryProfile::ReadOnlyResearch => "read-only research agent",
             RegistryProfile::WorkspaceEdit => "workspace editing agent without shell",
+            RegistryProfile::MatrixReader => "matrix game seat reading its materials",
         }
     }
 
@@ -1222,6 +1244,14 @@ impl RegistryProfile {
                 .chain(DEPS_WORKSPACE_TOOLS.iter())
                 .copied()
                 .collect(),
+            // Nur lesende Unterlagen der Matrix-Sitze (siehe die Begründung
+            // bei `RegistryProfile::MatrixReader`): lesender fs.*-Kern plus
+            // `doc.read_pdf` — kein Netz, kein Schreiben, keine Ausführung.
+            RegistryProfile::MatrixReader => FS_READ_ONLY_TOOLS
+                .iter()
+                .chain(DOC_TOOLS.iter())
+                .copied()
+                .collect(),
         }
     }
 
@@ -1371,11 +1401,13 @@ pub fn profile_for_role(role: &str) -> Option<RegistryProfile> {
         | role_names::SECURITY_BASELINE_TRIAGE
         | role_names::SECURITY_STRUCTURE_TRIAGE
         | role_names::SECURITY_ENDPOINT_TRIAGE => Some(RegistryProfile::NoTools),
-        // Die drei Matrix-Game-Sitze sind ebenso werkzeuglos: der
+        // Die drei Matrix-Game-Sitze lesen nur ihre Unterlagen (lesende
+        // `fs.*` plus `doc.read_pdf`, ohne Netz, Schreiben oder Exec); der
         // Matrix-Runner übergibt jedem Sitz seine Sicht im Prompt und liest
-        // die Antwort als Text (`agents/roles/matrix-*/matrix-*.toml`).
+        // die Antwort als Text (`agents/roles/matrix-*/matrix-*.toml`). Siehe
+        // die Begründung bei `RegistryProfile::MatrixReader`.
         role_names::MATRIX_PLAYER | role_names::MATRIX_UMPIRE | role_names::MATRIX_MARKET => {
-            Some(RegistryProfile::NoTools)
+            Some(RegistryProfile::MatrixReader)
         }
         // Einzige eingebaute Rolle mit der Prozessoberfläche: sie führt nur
         // beauftragte Sandbox-Prozesse aus. Das ist eine ausdrückliche,
@@ -1996,6 +2028,18 @@ fn profile_tool_providers(
                 DEPS_WORKSPACE_TOOLS,
             ));
             vec![filesystem, doc, explorer, dependencies]
+        }
+        // Nur lesende Unterlagen: gefilterter, lesender FS-Provider +
+        // lesender Doc-Provider — kein Explorer-, Deps-, Web- oder
+        // Shell-Provider. Siehe die Begründung bei
+        // `RegistryProfile::MatrixReader`.
+        RegistryProfile::MatrixReader => {
+            let filesystem: Arc<dyn ToolProvider> = Arc::new(RestrictedToolProvider::new(
+                Arc::new(FsToolProvider::default()),
+                FS_READ_ONLY_TOOLS,
+            ));
+            let doc: Arc<dyn ToolProvider> = Arc::new(DocToolProvider);
+            vec![filesystem, doc]
         }
     }
 }

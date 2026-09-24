@@ -393,6 +393,48 @@ fn without_an_allowlist_the_root_gets_no_hosts() -> TestResult {
     Ok(())
 }
 
+/// Runde 3, Welle D: ein montierter Telegram-Lauf liest und schreibt im
+/// Workspace (`fs.write`), führt aber weder `shell.*`/`process.*` noch
+/// `web.*`, trägt kein Netz, und sein Freigabemodus ist unabhängig von der
+/// Konfiguration immer `ask`.
+#[test]
+fn telegram_reads_and_writes_without_shell_network_or_relaxed_approval() -> TestResult {
+    use harw_extension_api::approval_mode::ApprovalMode;
+
+    let fixture = fixture()?;
+    let assembled = assemble(EntryKind::GatewayTelegram, &fixture)?;
+    let snapshot = assembled.assembly.rights_snapshot();
+    assert_eq!(snapshot.permissions, ["ReadWorkspace", "WriteWorkspace"]);
+    assert!(assembled.assembly.sandbox().network_scope().is_empty());
+    let tools = snapshot.tools;
+    for expected in ["fs.read", "fs.write"] {
+        assert!(
+            tools.iter().any(|tool| tool == expected),
+            "{expected} fehlt: {tools:?}"
+        );
+    }
+    for tool in &tools {
+        assert!(
+            !tool.starts_with("shell.")
+                && !tool.starts_with("process.")
+                && !tool.starts_with("web.")
+                && tool != "lens.ask",
+            "Telegram darf {tool} nicht führen: {tools:?}"
+        );
+    }
+    assert_eq!(
+        assembled.assembly.approval_mode().get(),
+        ApprovalMode::AlwaysAsk
+    );
+
+    // Auch ein expliziter Aufrufer-Override lockert den Modus nicht.
+    let mut spec = spec_for(EntryKind::GatewayTelegram, &fixture);
+    spec.approval_override = Some(ApprovalMode::FullAccess);
+    let relaxed = build_with_spec(spec).map_err(ctx("Telegram mit Override montiert"))?;
+    assert_eq!(relaxed.approval_mode().get(), ApprovalMode::AlwaysAsk);
+    Ok(())
+}
+
 /// Die Read-only-Rollen (analyst, researcher-deps, planner, die vier
 /// security-*-triage-Rollen) bekommen auch unter einer vernetzten
 /// UIA-Wurzel kein Netz, kein Schreiben und keine Ausführung: ihr Reducer
@@ -665,13 +707,10 @@ fn a_foreign_session_id_is_refused() -> TestResult {
 
 #[test]
 fn root_activation_matches_the_session_base_activation() -> TestResult {
-    // `EntryKind::Tui` (und `OneShot`) montieren seit dem UIA-Vertrag
-    // ausschließlich über `harness.active_uia_definition`
-    // (`resolve_active_uia`, `harw-runtime/src/assembly.rs`) — dort ersetzt
-    // die UIA jede `active_agent`-Auswahl vollständig (`agent_ir` bleibt
-    // `None`, sobald `uia_ir` gesetzt ist). `EntryKind::Analyze` ist kein
-    // UI-Einstieg: `resolve_active_uia` liefert für ihn immer `Ok(None)`,
-    // also bestimmt `active_agent` hier weiterhin die Wurzelaktivierung.
+    // `active_agent` bestimmt die Wurzelaktivierung (seit Runde 3, Welle C1
+    // auch in `Tui`/`OneShot`, wo ein expliziter Agent die UIA ersetzt;
+    // siehe `an_explicit_root_agent_makes_the_uia_optional`).
+    // `EntryKind::Analyze` ist kein UI-Einstieg und kennt keine UIA-Pflicht.
     // Zugleich führt `Analyze` — wie `Tui`/`OneShot` — einen
     // `SpawnerPolicy::BuiltinRoles`-Spawner, den `new_root_session`
     // braucht, um überhaupt eine Sitzung zu eröffnen (sonst
@@ -714,12 +753,10 @@ fn root_activation_matches_the_session_base_activation() -> TestResult {
 
 #[test]
 fn an_unknown_active_agent_fails_closed() -> TestResult {
-    // `active_agent` bestimmt die Wurzelaktivierung nur für Nicht-UI-
-    // Einstiege (`resolve_active_uia` in `harw-runtime/src/assembly.rs`
-    // gibt für alles außer `Tui`/`OneShot` `Ok(None)` zurück, also greift
-    // dort `resolve_active_agent(spec.active_agent, ...)`). `Analyze` ist
-    // ein solcher Nicht-UI-Einstieg. Fail-closed bei unbekannter Rolle
-    // bleibt die geprüfte Absicht — nur der Einstieg wechselt.
+    // `active_agent` bestimmt die Wurzelaktivierung jedes Einstiegs
+    // (`resolve_explicit_root_agent` in `harw-runtime/src/assembly.rs`).
+    // Fail-closed bei unbekannter Rolle bleibt die geprüfte Absicht; den
+    // `Tui`-Fall prüft `tui_fails_closed_on_an_unknown_explicit_root_agent`.
     let fixture = fixture()?;
     let (events, _event_rx) = tokio::sync::mpsc::unbounded_channel::<SessionEventAlias>();
     let state_store: Arc<dyn StateStore> = Arc::new(InMemoryStateStore::new());
@@ -739,21 +776,28 @@ fn an_unknown_active_agent_fails_closed() -> TestResult {
     Ok(())
 }
 
+/// Runde 3, Welle C1: ein explizit gewählter Wurzel-Agent gewinnt über die
+/// UIA — also scheitert ein unbekannter Name jetzt auch in `Tui`
+/// fail-closed, statt von der UIA überschattet zu werden.
 #[test]
-fn tui_ignores_an_unknown_active_agent_because_the_uia_governs() -> TestResult {
-    // In `Tui` (und `OneShot`) bestimmt ausschließlich die konfigurierte
-    // UIA die Root-Aktivierung; `resolve_active_agent` wird für
-    // `spec.active_agent` gar nicht erst aufgerufen, sobald `uia_ir`
-    // aufgelöst ist (`agent_ir` bleibt `None`). Eine unbekannte
-    // `active_agent`-Rolle darf die UIA daher weder ersetzen noch die
-    // Montage zu Fall bringen — die Fixture-UIA aus `write_fixture_uia`
-    // montiert unverändert.
+fn tui_fails_closed_on_an_unknown_explicit_root_agent() -> TestResult {
     let fixture = fixture()?;
-    let (events, _event_rx) = tokio::sync::mpsc::unbounded_channel::<SessionEventAlias>();
-    let state_store: Arc<dyn StateStore> = Arc::new(InMemoryStateStore::new());
     let mut spec = spec_for(EntryKind::Tui, &fixture);
     spec.active_agent = Some("definitely-not-a-role".to_owned());
-    let built = RuntimeAssembly::builder(spec)
+    let built = build_with_spec(spec);
+    assert!(
+        matches!(built, Err(RuntimeError::Registry { .. })),
+        "ein unbekannter --agent muss scheitern: {:?}",
+        built.err()
+    );
+    Ok(())
+}
+
+/// Montiert eine beliebige Eingangsbeschreibung mit Echo-Modell.
+fn build_with_spec(spec: RuntimeSpec) -> Result<RuntimeAssembly, RuntimeError> {
+    let (events, _event_rx) = tokio::sync::mpsc::unbounded_channel::<SessionEventAlias>();
+    let state_store: Arc<dyn StateStore> = Arc::new(InMemoryStateStore::new());
+    RuntimeAssembly::builder(spec)
         .model(ModelSource::Echo("echo".to_owned()))
         .stores(RuntimeStores {
             state_store,
@@ -761,12 +805,80 @@ fn tui_ignores_an_unknown_active_agent_because_the_uia_governs() -> TestResult {
             approval_store: None,
         })
         .session_events(events)
-        .build();
+        .build()
+}
 
-    assert!(
-        built.is_ok(),
-        "die UIA muss eine unbekannte active_agent-Rolle in Tui überschatten: {built:?}"
-    );
+/// Ein Projekt, dessen Root-Space **keine** UIA konfiguriert.
+fn fixture_without_uia() -> TestResult<Fixture> {
+    let dir = tempfile::tempdir()?;
+    let home = dir.path().join("home");
+    let project = dir.path().join("project");
+    std::fs::create_dir_all(&home).map_err(ctx("home"))?;
+    std::fs::create_dir_all(&project).map_err(ctx("project"))?;
+    std::fs::write(project.join("Cargo.toml"), "[workspace]\n").map_err(ctx("marker"))?;
+    Ok(Fixture {
+        _dir: dir,
+        home,
+        project,
+    })
+}
+
+/// Runde 3, Welle C1: mit explizitem Wurzel-Agenten ist die UIA nicht Pflicht.
+/// `Tui` und `OneShot` montieren ohne `active_uia_definition`, die Wurzel
+/// trägt die Organisationsrolle des gewählten Agenten (`explorer` →
+/// `Worker`), und ohne Agent bleibt die UIA-Pflicht bestehen.
+#[test]
+fn an_explicit_root_agent_makes_the_uia_optional() -> TestResult {
+    for entry in [EntryKind::Tui, EntryKind::OneShot] {
+        let fixture = fixture_without_uia()?;
+
+        let without_agent = build_with_spec(spec_for(entry, &fixture));
+        assert!(
+            matches!(without_agent, Err(RuntimeError::Registry { .. })),
+            "{entry:?}: ohne Agent bleibt die UIA Pflicht"
+        );
+
+        let mut spec = spec_for(entry, &fixture);
+        spec.active_agent = Some(role_names::EXPLORER.to_owned());
+        let assembly = build_with_spec(spec).map_err(|error| {
+            TestError::Unexpected(format!("{entry:?} mit --agent explorer: {error}"))
+        })?;
+        assert_eq!(
+            assembly.spawn_context().organizational_role,
+            AgentRoleId::Worker,
+            "{entry:?}"
+        );
+        // Die Wurzelaktivierung folgt der Definition des Agenten
+        // (`Minimal` + `admitted` − `forbidden`), nicht der Vorgabe.
+        assert_eq!(
+            assembly.root_activation().profile(),
+            harw_core::ToolProfile::Minimal,
+            "{entry:?}"
+        );
+    }
+    Ok(())
+}
+
+/// Runde 3, Welle C1: als Wurzel sind nur Root-/Child-Orchestrator und
+/// Worker zulässig. Eine UIA (`user-interface`) oder ein UIA-Helfer als
+/// `--agent` ist ein Konfigurationsfehler — auch wenn eine UIA konfiguriert
+/// ist, gewinnt der explizite Agent und wird geprüft.
+#[test]
+fn an_explicit_root_agent_with_a_foreign_role_is_a_config_error() -> TestResult {
+    let fixture = fixture()?;
+    for agent in [
+        "harwness.agent.fixture-uia@1".to_owned(),
+        role_names::UIA_WORKER.to_owned(),
+    ] {
+        let mut spec = spec_for(EntryKind::Tui, &fixture);
+        spec.active_agent = Some(agent.clone());
+        let built = build_with_spec(spec);
+        assert!(
+            matches!(built, Err(RuntimeError::Config { .. })),
+            "{agent}: {:?}",
+            built.err()
+        );
+    }
     Ok(())
 }
 

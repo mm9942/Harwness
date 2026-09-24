@@ -125,7 +125,7 @@ use crate::config::{ConfigTrustReport, load_config};
 use crate::contributors::{AssemblyContributor, AssemblyInputs, AssemblyParts};
 use crate::error::{RuntimeError, RuntimeResult};
 use crate::model::{ModelSource, build_root_model_with_registry_and_resolver};
-use crate::sandbox::{root_network_scope, root_sandbox, root_sandbox_with_network};
+use crate::sandbox::{root_network_scope, root_sandbox_with_network};
 use crate::services::{PlanServices, RuntimeServices, RuntimeServicesParts, ServiceSurface};
 use crate::spec::{
     AskResolution, EntryKind, EntryProfile, OperationSurface, RootBudget, RuntimeSpec,
@@ -807,7 +807,7 @@ pub struct RuntimeNarrowing {
 /// Mandant und Alias der reinen Enthaltenseins-Prüfung in [`sandbox_root`].
 ///
 /// Die Registry dieser Prüfung lebt nur für die Dauer des Aufrufs; die
-/// eigentliche Bindung entsteht danach über [`root_sandbox`] mit dem
+/// eigentliche Bindung entsteht danach über [`crate::sandbox::root_sandbox`] mit dem
 /// Mandanten des Einstiegs.
 const NARROWED_ROOT_TENANT: &str = "narrowing";
 /// Workspace-Alias der Enthaltenseins-Prüfung (siehe [`NARROWED_ROOT_TENANT`]).
@@ -974,7 +974,7 @@ fn sandbox_root(
 /// Stellt sicher, dass die gebaute Sandbox genau an `expected` gebunden ist.
 ///
 /// # Beschreibung
-/// [`root_sandbox`] kanonisiert den übergebenen, bereits kanonischen Pfad
+/// [`crate::sandbox::root_sandbox`] kanonisiert den übergebenen, bereits kanonischen Pfad
 /// erneut. Wurde zwischen beiden Schritten eine Pfadkomponente ausgetauscht,
 /// wiche die Bindung ab; das wird hier fail-closed abgefangen.
 ///
@@ -1160,7 +1160,7 @@ fn narrowed_registry_profile(
 /// Ohne Verengung bleibt `sandbox` unverändert. Mit Verengung entsteht
 /// `sandbox.restrict(&narrowing.permissions)`; das Ergebnis wird zusätzlich
 /// gegen die Profilrechte geprüft, damit auch eine künftige Änderung an
-/// [`root_sandbox`] oder [`SandboxSpec::restrict`] nie still mehr Rechte
+/// [`crate::sandbox::root_sandbox`] oder [`SandboxSpec::restrict`] nie still mehr Rechte
 /// ergibt, als die Tabelle dem Einstieg zuspricht.
 ///
 /// # Fehler
@@ -1493,7 +1493,7 @@ impl RuntimeAssemblyBuilder {
     /// - [`RuntimeError::Config`] / [`RuntimeError::Trust`] aus
     ///   [`load_config`].
     /// - [`RuntimeError::Discovery`], wenn die Projekterkennung scheitert.
-    /// - [`RuntimeError::Sandbox`] aus [`root_sandbox`], oder wenn
+    /// - [`RuntimeError::Sandbox`] aus [`crate::sandbox::root_sandbox`], oder wenn
     ///   [`RuntimeNarrowing::workspace_root`] relativ ist, nicht existiert oder
     ///   außerhalb des erkannten Projekt-Roots liegt.
     /// - [`RuntimeError::Registry`], wenn die Registry nicht montiert, ein
