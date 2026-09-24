@@ -16,6 +16,82 @@
   "records": [
     {
       "vendor": "openai",
+      "canonical_id": "gpt-6-sol",
+      "aliases": [],
+      "family": "gpt",
+      "release_version": "6",
+      "variant": "sol",
+      "lifecycle": "ga",
+      "context_window": 1050000,
+      "max_output_tokens": 128000,
+      "modalities": ["text", "image"],
+      "capabilities": {
+        "tool_calling": "parallel",
+        "parallel_tools": true,
+        "structured_output": "json_schema",
+        "reasoning": "effort",
+        "reasoning_effort_levels": ["none", "low", "medium", "high", "xhigh", "max"],
+        "prompt_caching": "explicit",
+        "streaming": "server_sent",
+        "image_input": true
+      },
+      "native_agent_features": {
+        "computer_use": true,
+        "code_execution": true,
+        "built_in_search": true,
+        "file_search": true
+      },
+      "knowledge_cutoff": "2026-04-20",
+      "released_at": "2026-09-22",
+      "sources": [
+        {
+          "url": "https://developers.openai.com/api/docs/models/gpt-6-sol",
+          "title": "gpt-6-sol model card — OpenAI API docs",
+          "fetched_at": "2026-09-24T00:00:00Z"
+        }
+      ],
+      "notes": "Cost-efficient high-end tier of the GPT-6 series, below GPT-6 Astra and above GPT-6 Luna. Aimed at agentic coding, long-horizon software engineering and computer use. Reasoning effort defaults to medium."
+    },
+    {
+      "vendor": "openai",
+      "canonical_id": "gpt-6-luna",
+      "aliases": [],
+      "family": "gpt",
+      "release_version": "6",
+      "variant": "luna",
+      "lifecycle": "ga",
+      "context_window": 1050000,
+      "max_output_tokens": 128000,
+      "modalities": ["text", "image"],
+      "capabilities": {
+        "tool_calling": "parallel",
+        "parallel_tools": true,
+        "structured_output": "json_schema",
+        "reasoning": "effort",
+        "reasoning_effort_levels": ["none", "low", "medium", "high", "xhigh", "max"],
+        "prompt_caching": "explicit",
+        "streaming": "server_sent",
+        "image_input": true
+      },
+      "native_agent_features": {
+        "computer_use": true,
+        "code_execution": true,
+        "built_in_search": true,
+        "file_search": true
+      },
+      "knowledge_cutoff": "2026-05-18",
+      "released_at": "2026-09-22",
+      "sources": [
+        {
+          "url": "https://developers.openai.com/api/docs/models/gpt-6-luna",
+          "title": "gpt-6-luna model card — OpenAI API docs",
+          "fetched_at": "2026-09-24T00:00:00Z"
+        }
+      ],
+      "notes": "Fast, cost-efficient tier of the GPT-6 series, below GPT-6 Sol. Aimed at high-volume, latency-sensitive work; higher reasoning effort covers harder agentic tasks. Reasoning effort defaults to medium."
+    },
+    {
+      "vendor": "openai",
       "canonical_id": "gpt-5.6-sol",
       "aliases": ["gpt-5.6"],
       "family": "gpt",
