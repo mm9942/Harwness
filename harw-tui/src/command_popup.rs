@@ -12,6 +12,19 @@
 //! - [`CommandItem`]: Name + Beschreibung eines Befehls.
 //! - [`CommandPopup`]: Widget-Zustand (Items, Filterindex, Auswahl).
 //! - [`PopupAction`]: Ereignis das `on_key` zurückgibt.
+//! - [`PopupMode`]: Befehlsnamen- oder Unterkommando-Auswahl.
+//!
+//! # Modi
+//! - [`PopupMode::CommandName`] ([`CommandPopup::new`]): alle Befehle des
+//!   Katalogs; Ziffern `1`–`9` wählen direkt.
+//! - [`PopupMode::Subcommand`] ([`CommandPopup::for_subcommands`]): die
+//!   Unterkommando-Hinweise eines Befehls. Ziffern sind hier **keine**
+//!   Auswahl (sie können Argumente sein, z. B. `/permissions remove 2`);
+//!   `on_key` meldet für sie `Stay`, und der Aufrufer reicht sie an die
+//!   Eingabe weiter (siehe [`CommandPopup::digits_select`]).
+//!
+//! Unter der Liste steht eine Fußzeile mit der Nutzungszeile des markierten
+//! Eintrags, sobald der Bereich mindestens zwei Zeilen hoch ist.
 //!
 //! # Nebenläufigkeit
 //! Kein interner Zustand wird geteilt; der Aufrufer hält `CommandPopup` exklusiv.
@@ -23,6 +36,7 @@ use crossterm::event::{KeyCode, KeyEvent};
 use ratatui::{buffer::Buffer, layout::Rect, style::Style, text::Line, widgets::Widget};
 
 use crate::CommandRegistry;
+use crate::CommandSpec;
 use crate::style;
 
 // ---------------------------------------------------------------------------
@@ -86,6 +100,20 @@ pub(crate) struct CommandItem {
     pub name: String,
     /// Menschenlesbare Kurzbeschreibung für die Anzeige im Popup.
     pub description: String,
+    /// Nutzungszeile für die Fußzeile; leer, wenn unbekannt.
+    pub usage: String,
+}
+
+/// Auswahlmodus des Popups.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum PopupMode {
+    /// Auswahl eines Befehlsnamens (`/mo` → `/model`).
+    CommandName,
+    /// Auswahl eines Unterkommandos von `command` (ohne führendes `/`).
+    Subcommand {
+        /// Kanonischer Befehlsname, dessen Unterkommandos angeboten werden.
+        command: String,
+    },
 }
 
 /// Aktionssignal das `CommandPopup::on_key` zurückgibt.
@@ -135,6 +163,8 @@ pub(crate) struct CommandPopup {
     /// [`Self::tab_outcome`]: eine bewusst bewegte Markierung hat Vorrang vor
     /// der automatischen Rang-/Präfix-Logik.
     selection_moved: bool,
+    /// Befehlsnamen- oder Unterkommando-Auswahl.
+    mode: PopupMode,
 }
 
 // ---------------------------------------------------------------------------
@@ -154,15 +184,54 @@ impl CommandPopup {
             .specs()
             .iter()
             .map(|spec| {
-                let domain_str = format!("{:?}", spec.domain);
-                let permission_str = format!("{:?}", spec.permission);
+                let description = if spec.summary.is_empty() {
+                    let domain_str = format!("{:?}", spec.domain);
+                    let permission_str = format!("{:?}", spec.permission);
+                    make_description(&domain_str, &permission_str)
+                } else {
+                    spec.summary.clone()
+                };
                 CommandItem {
                     name: spec.name.as_str().to_owned(),
-                    description: make_description(&domain_str, &permission_str),
+                    description,
+                    usage: spec.usage.clone(),
                 }
             })
             .collect();
+        Self::with_items(items, PopupMode::CommandName)
+    }
 
+    /// Erstellt ein Unterkommando-Popup für `spec`.
+    ///
+    /// # Beschreibung
+    /// Ein Eintrag je [`crate::command::SubcommandHint`]; Beschreibung ist
+    /// dessen `summary`, die Fußzeile zeigt `/<befehl> <unterkommando> <args>`.
+    /// Die Reihenfolge ist bei leerem Suchtext die Rang-Reihenfolge (Länge,
+    /// dann alphabetisch), wie im Befehlsmodus.
+    ///
+    /// # Rückgabe
+    /// `None`, wenn `spec` keine Unterkommandos kennt.
+    pub(crate) fn for_subcommands(spec: &CommandSpec) -> Option<Self> {
+        if spec.subcommands.is_empty() {
+            return None;
+        }
+        let command = spec.name.as_str().to_owned();
+        let items = spec
+            .subcommands
+            .iter()
+            .map(|hint| CommandItem {
+                name: hint.name.to_owned(),
+                description: hint.summary.to_owned(),
+                usage: format!("/{command} {} {}", hint.name, hint.args)
+                    .trim_end()
+                    .to_owned(),
+            })
+            .collect();
+        Some(Self::with_items(items, PopupMode::Subcommand { command }))
+    }
+
+    /// Gemeinsamer Aufbau beider Modi.
+    fn with_items(items: Vec<CommandItem>, mode: PopupMode) -> Self {
         let mut popup = Self {
             items,
             selected: 0,
@@ -170,6 +239,7 @@ impl CommandPopup {
             filtered: Vec::new(),
             prefix_count: 0,
             selection_moved: false,
+            mode,
         };
         // Baut `filtered`/`prefix_count` über dieselbe Rang-Logik wie jede
         // spätere Eingabe auf, statt Registrierungsreihenfolge zu
@@ -246,6 +316,53 @@ impl CommandPopup {
     pub(crate) fn selected_name(&self) -> Option<&str> {
         let &item_idx = self.filtered.get(self.selected)?;
         Some(&self.items[item_idx].name)
+    }
+
+    /// Aktueller Auswahlmodus.
+    pub(crate) fn mode(&self) -> &PopupMode {
+        &self.mode
+    }
+
+    /// `true`, wenn Ziffern `1`–`9` direkt einen Eintrag wählen (nur im
+    /// Befehlsmodus). Im Unterkommando-Modus soll der Aufrufer Ziffern als
+    /// normale Eingabe behandeln.
+    pub(crate) fn digits_select(&self) -> bool {
+        matches!(self.mode, PopupMode::CommandName)
+    }
+
+    /// Eingabezeile, die nach Übernahme von `accepted` im Composer stehen soll
+    /// (mit abschließendem Leerzeichen): `"/name "` bzw.
+    /// `"/befehl unterkommando "`.
+    pub(crate) fn completion_line(&self, accepted: &str) -> String {
+        match &self.mode {
+            PopupMode::CommandName => format!("/{accepted} "),
+            PopupMode::Subcommand { command } => format!("/{command} {accepted} "),
+        }
+    }
+
+    /// Eingabezeile für einen erweiterten Suchtext
+    /// ([`TabOutcome::ExtendQuery`]): `"/query"` bzw. `"/befehl query"`.
+    pub(crate) fn query_line(&self, query: &str) -> String {
+        match &self.mode {
+            PopupMode::CommandName => format!("/{query}"),
+            PopupMode::Subcommand { command } => format!("/{command} {query}"),
+        }
+    }
+
+    /// Fußzeilentext für den markierten Eintrag (`"Nutzung: …"`), sofern
+    /// dieser eine Nutzungszeile hat.
+    pub(crate) fn footer_line(&self) -> Option<String> {
+        let &item_idx = self.filtered.get(self.selected)?;
+        let usage = &self.items[item_idx].usage;
+        (!usage.is_empty()).then(|| format!("Nutzung: {usage}"))
+    }
+
+    /// Gewünschte Höhe in Zeilen bei höchstens `max_rows`: Trefferzahl plus
+    /// ggf. eine Fußzeile, gedeckelt auf `max_rows`.
+    pub(crate) fn preferred_height(&self, max_rows: u16) -> u16 {
+        let rows = u16::try_from(self.filtered.len()).unwrap_or(u16::MAX);
+        let footer = u16::from(self.footer_line().is_some());
+        rows.saturating_add(footer).min(max_rows)
     }
 
     /// Gibt `true` zurück wenn keine Items in der gefilterten Liste vorhanden sind.
@@ -325,6 +442,7 @@ impl CommandPopup {
                 Some(name) => PopupAction::Accept(name.to_owned()),
                 None => PopupAction::Stay,
             },
+            KeyCode::Char('1'..='9') if !self.digits_select() => PopupAction::Stay,
             KeyCode::Char(c @ '1'..='9') => {
                 let zero_based = (c as usize) - ('1' as usize);
                 if zero_based < self.filtered.len() {
@@ -344,7 +462,18 @@ impl CommandPopup {
     /// `Down` folgt der Ausschnitt der Auswahl. Damit bleiben auch Befehle nach
     /// der achten Zeile in kleinen Terminals erreichbar und sichtbar.
     pub(crate) fn render(&self, area: Rect, buf: &mut Buffer, theme: style::Theme) {
-        let visible = self.visible_range(area.height as usize);
+        // Fußzeile nur, wenn neben ihr noch mindestens eine Listenzeile passt.
+        let footer = self.footer_line().filter(|_| area.height >= 2);
+        let list_height = area.height - u16::from(footer.is_some());
+        if let Some(text) = footer {
+            let footer_area = Rect::new(area.left(), area.bottom() - 1, area.width, 1);
+            Widget::render(
+                Line::styled(text, style::dim_style(theme)),
+                footer_area,
+                buf,
+            );
+        }
+        let visible = self.visible_range(list_height as usize);
         // `Range` wird vom `for`-Loop konsumiert. Die Startposition brauchen wir
         // daneben für die Zeile innerhalb des sichtbaren Fensters.
         let visible_start = visible.start;

@@ -135,10 +135,12 @@ pub fn run_workbench(
             }))
         }
         "unpin" => {
-            let raw_path = tail.first().ok_or_else(|| usage("/workbench unpin <path>"))?;
+            let raw_path = tail
+                .first()
+                .ok_or_else(|| usage("/workbench unpin <path>"))?;
             let path = resolve_path(raw_path, cwd);
-            let removed = workbench::unpin(store, &scope, author, &path, now)
-                .map_err(map_knowledge_error)?;
+            let removed =
+                workbench::unpin(store, &scope, author, &path, now).map_err(map_knowledge_error)?;
             Ok(OpOutput::from(if removed {
                 format!("Gelöst: {path}")
             } else {
@@ -179,7 +181,9 @@ fn run_hypothesis(
         "add" => {
             let number = workbench::add_hypothesis(store, scope, author, &text, now)
                 .map_err(map_knowledge_error)?;
-            Ok(OpOutput::from(format!("Hypothese #{number} angelegt: {text}")))
+            Ok(OpOutput::from(format!(
+                "Hypothese #{number} angelegt: {text}"
+            )))
         }
         "confirm" | "reject" => {
             let decided = if action == "confirm" {
@@ -407,7 +411,8 @@ mod tests {
 
     #[test]
     fn from_raw_args_keeps_every_token() -> TestResult {
-        let args = WorkbenchArgs::from_raw_args(&toks(&["note", "a", "b"])).map_err(ctx("parse"))?;
+        let args =
+            WorkbenchArgs::from_raw_args(&toks(&["note", "a", "b"])).map_err(ctx("parse"))?;
         assert_eq!(args.tokens, toks(&["note", "a", "b"]));
         Ok(())
     }
@@ -431,7 +436,10 @@ mod tests {
         run(&store, &["hypothesis", "reject", "#2"]).map_err(ctx("reject"))?;
 
         let text = run(&store, &["show"]).map_err(ctx("show"))?;
-        assert!(text.contains("/work/project/src/lib.rs — Einstieg"), "{text}");
+        assert!(
+            text.contains("/work/project/src/lib.rs — Einstieg"),
+            "{text}"
+        );
         assert!(text.contains("#1 Lock hängt"), "{text}");
         assert!(!text.contains("Netz langsam"), "{text}");
         assert!(text.contains("Entschiedene Hypothesen: 1"), "{text}");

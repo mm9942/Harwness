@@ -13,8 +13,10 @@
 //! `Accept`-Auswahl geschieht.
 //!
 //! # Schlüsseltypen
-//! - [`PickerTarget`] — für welchen Umschalt-Kontext (Orchestrator, UIA,
-//!   fester UIA-Worker) der Picker instanziiert wurde.
+//! - [`PickerTarget`] — für welchen Umschalt-Kontext (Sitzungs-/
+//!   Standardmodell, UIA, fester UIA-Worker, Modell je Rolle) der Picker
+//!   instanziiert wurde; [`PickerTarget::command_line`] übersetzt eine
+//!   `Accept`-Auswahl in die auszuführende Slash-Zeile.
 //! - [`ProviderEntry`] / [`ModelEntry`] — Anzeige-Fixtures, vom Aufrufer
 //!   befüllt (keine Config-Abhängigkeit in diesem Modul).
 //! - [`ModelSwitchPicker`] — Widget-Zustand mit `on_key`/`render`-Muster,
@@ -35,12 +37,14 @@
 //! # Verdrahtungshinweis
 //! Dieses Modul ist in `harw-tui/src/app.rs` eingehängt: `ChatApp::overlay`
 //! trägt die (dortige, private) Variante `Overlay::ModelSwitch`, die
-//! [`ModelSwitchPicker::on_key`] aufruft und `PickerAction::Accept` je nach
-//! [`ModelSwitchPicker::target`] in `/model switch …`- bzw.
-//! `/uia model …`-Befehle übersetzt.
+//! [`ModelSwitchPicker::on_key`] aufruft und `PickerAction::Accept` über
+//! [`PickerTarget::command_line`] in `/model switch …`, `/uia-model switch …`,
+//! `/uia-worker-model switch …` bzw. `/models set …` übersetzt.
 
 use crossterm::event::{KeyCode, KeyEvent};
 use ratatui::{buffer::Buffer, layout::Rect};
+
+use harw_config::ModelRole;
 
 use crate::choice_dialog::{ChoiceAction, ChoiceDialog};
 use crate::style;
@@ -60,7 +64,8 @@ const MODEL_FOOTER_WITH_BACK: &str = "↑↓ wählen · ← zurück · Enter bes
 /// UIA-Worker an genau einen Provider gebunden ist.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum PickerTarget {
-    /// Umschaltung des Haupt-Orchestrator-Modells.
+    /// Sitzungs-/Standardmodell (`/model`): wirkt live auf die laufende
+    /// Sitzung.
     Orchestrator,
     /// Umschaltung des UIA-Modells (Provider frei wählbar).
     Uia,
@@ -69,6 +74,48 @@ pub(crate) enum PickerTarget {
         /// Provider-ID, an die dieser Worker gebunden ist.
         fixed_provider: String,
     },
+    /// Modell einer internen Rolle (`/models set`, ab nächster Sitzung);
+    /// Provider frei wählbar.
+    Role {
+        /// Die Rolle, deren Modell gesetzt wird.
+        role: ModelRole,
+    },
+}
+
+impl PickerTarget {
+    /// Slash-Zeile, die eine bestätigte Auswahl ausführt.
+    ///
+    /// # Beschreibung
+    /// - [`Self::Orchestrator`] → `/model switch <modell>`
+    /// - [`Self::Uia`] → `/uia-model switch <modell>`
+    /// - [`Self::UiaWorker`] → `/uia-worker-model switch <modell>`
+    /// - [`Self::Role`] → `/models set <rolle> <provider>/<modell>`
+    ///
+    /// Bei den ersten drei wechselt der Ziel-Op Provider und Modell atomar
+    /// anhand der Modell-ID (`provider` bleibt implizit, wie bisher in
+    /// `app.rs`).
+    #[must_use]
+    pub(crate) fn command_line(&self, provider: &str, model: &str) -> String {
+        match self {
+            Self::Orchestrator => format!("/model switch {model}"),
+            Self::Uia => format!("/uia-model switch {model}"),
+            Self::UiaWorker { .. } => format!("/uia-worker-model switch {model}"),
+            Self::Role { role } => format!("/models set {} {provider}/{model}", role.key()),
+        }
+    }
+
+    /// Deutsche Kontextbeschriftung (Dialogtitel, Fehlermeldungen).
+    #[must_use]
+    pub(crate) fn context_label(&self) -> String {
+        match self {
+            Self::Orchestrator => "Sitzungs-/Standardmodell (/model)".to_owned(),
+            Self::Uia => "UIA-Modell".to_owned(),
+            Self::UiaWorker { .. } => "UIA-Worker-Modell".to_owned(),
+            Self::Role { role } => {
+                format!("Modell für {} (ab nächster Sitzung)", role.label())
+            }
+        }
+    }
 }
 
 /// Interne Navigationsstufe des Pickers.
@@ -237,8 +284,12 @@ impl ModelSwitchPicker {
         let provider_start_index = active_provider
             .and_then(|ap| providers.iter().position(|p| p.id == ap))
             .unwrap_or(0);
-        let provider_dialog = ChoiceDialog::new(PROVIDER_DIALOG_TITLE, None, provider_labels)
-            .with_selected(provider_start_index);
+        let provider_dialog = ChoiceDialog::new(
+            PROVIDER_DIALOG_TITLE,
+            Some(target.context_label()),
+            provider_labels,
+        )
+        .with_selected(provider_start_index);
 
         let active_provider_owned = active_provider.map(str::to_owned);
         let active_model_owned = active_model.map(str::to_owned);
@@ -248,9 +299,12 @@ impl ModelSwitchPicker {
             let model_labels: Vec<String> = models.iter().map(|m| m.label.to_owned()).collect();
             let provider_matches = active_provider == Some(fixed_provider.as_str());
             let model_start_index = initial_model_index(models, provider_matches, active_model);
-            let model_dialog =
-                ChoiceDialog::new(model_dialog_title(fixed_provider), None, model_labels)
-                    .with_selected(model_start_index);
+            let model_dialog = ChoiceDialog::new(
+                model_dialog_title(fixed_provider),
+                Some(target.context_label()),
+                model_labels,
+            )
+            .with_selected(model_start_index);
             let selected_provider = Some(fixed_provider.to_owned());
 
             return Some(Self {
@@ -343,9 +397,12 @@ impl ModelSwitchPicker {
                     initial_model_index(models, provider_matches, self.active_model.as_deref());
                 let model_labels: Vec<String> = models.iter().map(|m| m.label.to_owned()).collect();
 
-                let mut model_dialog =
-                    ChoiceDialog::new(model_dialog_title(&provider_id), None, model_labels)
-                        .with_selected(model_start_index);
+                let mut model_dialog = ChoiceDialog::new(
+                    model_dialog_title(&provider_id),
+                    Some(self.target.context_label()),
+                    model_labels,
+                )
+                .with_selected(model_start_index);
                 if can_go_back(&self.target) {
                     model_dialog = model_dialog.with_footer_hint(MODEL_FOOTER_WITH_BACK);
                 }
@@ -379,7 +436,7 @@ impl ModelSwitchPicker {
             ChoiceAction::Chosen(idx) => {
                 let provider_id = match &self.target {
                     PickerTarget::UiaWorker { fixed_provider } => fixed_provider.to_owned(),
-                    PickerTarget::Orchestrator | PickerTarget::Uia => {
+                    PickerTarget::Orchestrator | PickerTarget::Uia | PickerTarget::Role { .. } => {
                         match self.selected_provider.take() {
                             Some(id) => id,
                             None => return PickerAction::Cancel,

@@ -196,12 +196,14 @@ fn parse_transition(sub: &str, tail: &[String]) -> Result<TransitionRequest, OpE
         "unblock" => Action::Unblock,
         "archive" => Action::Archive,
         "block" => {
-            let raw = reason_flag.or_else(|| extra.first().cloned()).ok_or_else(|| {
-                OpError::InvalidArguments(format!(
-                    "Aufruf: /kanban block <card> <{}>",
-                    reason_names()
-                ))
-            })?;
+            let raw = reason_flag
+                .or_else(|| extra.first().cloned())
+                .ok_or_else(|| {
+                    OpError::InvalidArguments(format!(
+                        "Aufruf: /kanban block <card> <{}>",
+                        reason_names()
+                    ))
+                })?;
             Action::Block(parse_reason(&raw)?)
         }
         "move" => {
@@ -254,7 +256,10 @@ fn boards(store: &KnowledgeStore) -> Result<OpOutput, OpError> {
 /// Zustandsbezeichnung einer Karte; `None`, wenn sie ohne Ledger unbekannt ist.
 fn view(record: &CardRecord, jobs: Option<&dyn JobTransitions>) -> Result<Option<Card>, OpError> {
     match (jobs, &record.work_id) {
-        (Some(jobs), _) => record.view_with(jobs).map(Some).map_err(map_knowledge_error),
+        (Some(jobs), _) => record
+            .view_with(jobs)
+            .map(Some)
+            .map_err(map_knowledge_error),
         (None, None) => record.view(None).map(Some).map_err(map_knowledge_error),
         (None, Some(_)) => Ok(None),
     }
@@ -419,7 +424,10 @@ fn show(
 ) -> Result<OpOutput, OpError> {
     let card_id = card_ref(tail, "/kanban show <card>")?;
     let record = load_record(store, board_id, &card_id)?;
-    let mut out = format!("{} — {}\nBoard: {board_id}\nLane: {}\n", record.id, record.title, record.lane_id);
+    let mut out = format!(
+        "{} — {}\nBoard: {board_id}\nLane: {}\n",
+        record.id, record.title, record.lane_id
+    );
     match view(&record, jobs)? {
         Some(card) => {
             out.push_str(&format!("Zustand: {}\n", state_text(&card.state)));
@@ -475,10 +483,7 @@ fn default_lanes(board_id: &BoardId) -> Vec<Lane> {
 }
 
 /// Lädt ein Board oder legt es mit den Status-Lanes an.
-fn ensure_board(
-    store: &KnowledgeStore,
-    board_id: &BoardId,
-) -> Result<(Board, Vec<Lane>), OpError> {
+fn ensure_board(store: &KnowledgeStore, board_id: &BoardId) -> Result<(Board, Vec<Lane>), OpError> {
     let exists = board::list_board_ids(store)
         .map_err(map_knowledge_error)?
         .contains(board_id);
@@ -502,7 +507,11 @@ fn resolve_lane(
     board_state: &mut (Board, Vec<Lane>),
     lane_ref: &str,
 ) -> Result<Lane, OpError> {
-    if let Some(lane) = board_state.1.iter().find(|lane| lane.id.as_str() == lane_ref) {
+    if let Some(lane) = board_state
+        .1
+        .iter()
+        .find(|lane| lane.id.as_str() == lane_ref)
+    {
         return Ok(lane.clone());
     }
     let role = lane_ref
@@ -584,7 +593,10 @@ fn create(
     let mut board_state = ensure_board(store, board_id)?;
     let lane = resolve_lane(store, &mut board_state, &lane_ref)?;
 
-    let parents: Vec<CardId> = parent_flags.iter().map(|raw| CardId::new(raw.trim())).collect();
+    let parents: Vec<CardId> = parent_flags
+        .iter()
+        .map(|raw| CardId::new(raw.trim()))
+        .collect();
     for parent in &parents {
         load_record(store, board_id, parent)?;
     }
@@ -807,7 +819,10 @@ mod tests {
 
         let created = run(&store, jobs, &["create", "Parser", "bauen"]).map_err(ctx("create"))?;
         assert_eq!(created, "card-1 angelegt in triage (triage).");
-        assert_eq!(run(&store, jobs, &["todo", "card-1"]).map_err(ctx("todo"))?, "card-1 → todo");
+        assert_eq!(
+            run(&store, jobs, &["todo", "card-1"]).map_err(ctx("todo"))?,
+            "card-1 → todo"
+        );
         assert_eq!(
             run(&store, jobs, &["ready", "card-1"]).map_err(ctx("ready"))?,
             "card-1 → ready"
@@ -846,7 +861,10 @@ mod tests {
         let ledger = InMemoryJobTransitions::new();
         let jobs: Option<&dyn JobTransitions> = Some(&ledger);
         run(&store, jobs, &["add", "Alias", "Karte"]).map_err(ctx("add"))?;
-        assert_eq!(run(&store, jobs, &["move", "card-1", "todo"]).map_err(ctx("move todo"))?, "card-1 → todo");
+        assert_eq!(
+            run(&store, jobs, &["move", "card-1", "todo"]).map_err(ctx("move todo"))?,
+            "card-1 → todo"
+        );
         run(&store, jobs, &["move", "card-1", "ready"]).map_err(ctx("move ready"))?;
         run(&store, jobs, &["move", "card-1", "running"]).map_err(ctx("move running"))?;
         assert_eq!(
@@ -854,11 +872,15 @@ mod tests {
             "card-1 → blocked (Capability)"
         );
         assert_eq!(
-            run(&store, jobs, &["move", "card-1", "ready"]).map_err(ctx("move ready from blocked"))?,
+            run(&store, jobs, &["move", "card-1", "ready"])
+                .map_err(ctx("move ready from blocked"))?,
             "card-1 → ready"
         );
         run(&store, jobs, &["claim", "card-1"]).map_err(ctx("claim"))?;
-        assert_eq!(run(&store, jobs, &["done", "card-1"]).map_err(ctx("done"))?, "card-1 → done");
+        assert_eq!(
+            run(&store, jobs, &["done", "card-1"]).map_err(ctx("done"))?,
+            "card-1 → done"
+        );
 
         let output = run_kanban(
             &store,
@@ -928,8 +950,12 @@ mod tests {
     fn without_a_ledger_transitions_are_unavailable_and_state_is_not_guessed() -> TestResult {
         let store = temporary_store("no-ledger")?;
         let ledger = InMemoryJobTransitions::new();
-        run(&store, Some(&ledger), &["create", "Gebunden", "--assignee=coding"])
-            .map_err(ctx("create with ledger"))?;
+        run(
+            &store,
+            Some(&ledger),
+            &["create", "Gebunden", "--assignee=coding"],
+        )
+        .map_err(ctx("create with ledger"))?;
         run(&store, None, &["create", "Frei"]).map_err(ctx("create without ledger"))?;
 
         match run(&store, None, &["claim", "card-1"]) {
@@ -941,7 +967,10 @@ mod tests {
             }
         }
         let listed = run(&store, None, &[]).map_err(ctx("list without ledger"))?;
-        assert!(listed.contains("unbekannt — kein Job-Ledger (1)"), "{listed}");
+        assert!(
+            listed.contains("unbekannt — kein Job-Ledger (1)"),
+            "{listed}"
+        );
         assert!(listed.contains("triage (1)"), "{listed}");
         let shown = run(&store, None, &["show", "card-1"]).map_err(ctx("show"))?;
         assert!(shown.contains("Zustand: unbekannt"), "{shown}");

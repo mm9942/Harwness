@@ -86,7 +86,12 @@ pub fn run_diary(
         None => show(store, caller, &[], now),
         Some("show") => show(store, caller, tokens.get(1..).unwrap_or_default(), now),
         Some("today") => show(store, caller, &[], now),
-        Some("note") => note(store, caller, &tokens.get(1..).unwrap_or_default().join(" "), now),
+        Some("note") => note(
+            store,
+            caller,
+            &tokens.get(1..).unwrap_or_default().join(" "),
+            now,
+        ),
         // `/diary <agent>` ist Kurzform von `/diary show <agent>`.
         Some(_) => show(store, caller, tokens, now),
     }
@@ -143,7 +148,11 @@ fn parse_entries(body: &str) -> Vec<(String, String, String)> {
             .and_then(|rest| rest.split_once(" — "));
         match header {
             Some((time, trigger)) => {
-                entries.push((time.trim().to_owned(), trigger.trim().to_owned(), String::new()));
+                entries.push((
+                    time.trim().to_owned(),
+                    trigger.trim().to_owned(),
+                    String::new(),
+                ));
             }
             None => {
                 if let Some((_, _, text)) = entries.last_mut() {
@@ -231,9 +240,7 @@ fn validate_agent(raw: &str) -> Result<&str, OpError> {
     let unsafe_id = raw.is_empty()
         || raw == "."
         || raw == ".."
-        || raw
-            .chars()
-            .any(|c| c == '/' || c == '\\' || c.is_control());
+        || raw.chars().any(|c| c == '/' || c == '\\' || c.is_control());
     if unsafe_id {
         return Err(OpError::InvalidArguments(format!(
             "ungültige Agent-Id '{raw}'"

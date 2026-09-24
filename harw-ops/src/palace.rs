@@ -505,7 +505,8 @@ mod tests {
             VisibilityScope::OperatorOnly,
         )?;
 
-        let promoted = run(&store, &["promote", "topic/deploy-pipeline"]).map_err(ctx("promote"))?;
+        let promoted =
+            run(&store, &["promote", "topic/deploy-pipeline"]).map_err(ctx("promote"))?;
         assert!(promoted.contains("palace/deploy-pipeline"));
         run(&store, &["promote", "on-call"]).map_err(ctx("promote second"))?;
 
