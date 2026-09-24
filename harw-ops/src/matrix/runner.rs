@@ -71,8 +71,8 @@ use harw_matrix_game::phases::{
     PhaseConfig, PhaseOutput, PhaseStep, PlayerDebrief, RoundArgument, RoundCursor,
     UmpireAdjudication, UmpireNarration, UmpireRuling, UmpireSynthesis, Verdict, apply_inject,
     close_negotiation, close_round, end_game, enter_phase, expected_calls, open_channels,
-    open_game, post_messages, record_briefing, record_narration, record_standing,
-    resolve_argument, reveal_round, reveal_secret, submit_counters, validate_counter_argument,
+    open_game, post_messages, record_briefing, record_narration, record_standing, resolve_argument,
+    reveal_round, reveal_secret, submit_counters, validate_counter_argument,
     validate_negotiation_messages, validate_negotiation_request, validate_player_argument,
     validate_umpire_adjudication, validate_umpire_narration,
 };
@@ -507,6 +507,12 @@ pub struct MatrixRun {
     inject_counter: u32,
     end_reason: String,
     run_dir: Option<PathBuf>,
+    /// Pfad der Szenario-Datei (Basis relativer `[materials]`-Ordner).
+    scenario_path: Option<PathBuf>,
+    /// `<run_dir>/materials`, sobald die Sitz-Kopien angelegt sind.
+    materials_root: Option<PathBuf>,
+    /// Kopierberichte je Sitz (für das Journal nach dem Anlegen).
+    materials_reports: Vec<(String, MaterialsReport)>,
     flushed: usize,
     status: RunStatus,
     timestamps: bool,
@@ -581,9 +587,16 @@ impl MatrixRun {
     ///
     /// # Errors
     /// [`OpError::Execution`] bei Kern- oder Dateifehlern.
+    /// `scenario_path` ist der Pfad der Szenario-Datei (für relative
+    /// `[materials]`-Ordner; `None` bei gebündelten Szenarien).
+    ///
+    /// # Errors
+    /// [`OpError::Execution`] bei Kern- oder Dateifehlern,
+    /// [`OpError::InvalidArguments`], wenn der Unterlagen-Ordner fehlt.
     pub fn start(
         loaded: LoadedScenario,
         source: String,
+        scenario_path: Option<PathBuf>,
         master_seed: [u8; 32],
         run_id: String,
         run_dir: Option<PathBuf>,
@@ -592,25 +605,69 @@ impl MatrixRun {
         let at = timestamps.then(Timestamp::now);
         let log = open_game(&loaded, &master_seed, at).map_err(matrix_err)?;
         let cfg = PhaseConfig::from_scenario(&loaded.scenario);
-        let run = Self::from_log(loaded, source, log, run_id, run_dir, timestamps, cfg)?;
+        let mut run = Self::from_log(
+            loaded,
+            source,
+            scenario_path,
+            log,
+            run_id,
+            run_dir,
+            timestamps,
+            cfg,
+        )?;
+        run.note_materials()?;
         Ok(run)
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn from_log(
         loaded: LoadedScenario,
         source: String,
+        scenario_path: Option<PathBuf>,
         log: GameLog,
         run_id: String,
         run_dir: Option<PathBuf>,
         timestamps: bool,
         cfg: PhaseConfig,
     ) -> Result<Self, OpError> {
+        let mut materials_root = None;
+        let mut materials_reports = Vec::new();
         if let Some(dir) = &run_dir {
             std::fs::create_dir_all(dir)
                 .map_err(|e| io_err("Laufverzeichnis nicht anlegbar", dir, &e))?;
             let copy = dir.join(SCENARIO_FILE);
             std::fs::write(&copy, &source)
                 .map_err(|e| io_err("Szenario-Kopie nicht schreibbar", &copy, &e))?;
+            let source_dir = loaded.materials_dir(scenario_path.as_deref());
+            if let Some(src) = &source_dir {
+                if !src.is_dir() {
+                    return Err(OpError::InvalidArguments(format!(
+                        "Unterlagen-Ordner `{}` existiert nicht",
+                        src.display()
+                    )));
+                }
+            }
+            let root = dir.join(MATERIALS_DIR);
+            let mut seats: Vec<Seat> = log
+                .state
+                .players
+                .iter()
+                .cloned()
+                .map(Seat::Player)
+                .collect();
+            seats.push(Seat::Umpire);
+            for seat in &seats {
+                let key = seat_key(seat);
+                let report = build_seat_materials(
+                    source_dir.as_deref(),
+                    &log.state.players,
+                    seat,
+                    &root.join(&key),
+                )
+                .map_err(OpError::Execution)?;
+                materials_reports.push((key, report));
+            }
+            materials_root = Some(root);
         }
         let cursor = RoundCursor {
             round: log.state.round,
@@ -633,6 +690,9 @@ impl MatrixRun {
             inject_counter: 0,
             end_reason: "Reguläres Spielende".to_owned(),
             run_dir,
+            scenario_path,
+            materials_root,
+            materials_reports,
             flushed: 0,
             status: RunStatus::Running,
             timestamps,
@@ -659,6 +719,12 @@ impl MatrixRun {
     #[must_use]
     pub fn source(&self) -> &str {
         &self.source
+    }
+
+    /// Pfad der Szenario-Datei (`None` bei gebündelten Szenarien).
+    #[must_use]
+    pub fn scenario_path(&self) -> Option<&Path> {
+        self.scenario_path.as_deref()
     }
 
     /// Zustand und Journal.
@@ -751,6 +817,21 @@ impl MatrixRun {
         ))
     }
 
+    /// Journalisiert die Kopierberichte der Unterlagen (nur Beobachter).
+    fn note_materials(&mut self) -> Result<(), OpError> {
+        for (key, report) in std::mem::take(&mut self.materials_reports) {
+            let mut detail = format!(
+                "Sitz `{key}`: {} Datei(en), {} Byte",
+                report.copied, report.bytes
+            );
+            if !report.skipped.is_empty() {
+                detail.push_str(&format!(" · übersprungen: {}", report.skipped.join("; ")));
+            }
+            self.note("materials", detail)?;
+        }
+        Ok(())
+    }
+
     /// Hängt alle noch nicht geschriebenen Journalzeilen an `journal.jsonl`
     /// an und veröffentlicht sie als Live-Events.
     ///
@@ -809,7 +890,8 @@ impl MatrixRun {
     /// # Errors
     /// [`OpError::NotAvailable`] ohne Spawner, sonst wie [`Self::step_with`].
     pub async fn step(&mut self, ctx: &OpContext) -> Result<StepReport, OpError> {
-        let driver = SpawnerDriver::from_ctx(ctx)?;
+        let driver =
+            SpawnerDriver::from_ctx(ctx)?.with_materials(self.materials_root.clone(), &self.run_id);
         let mut driver = driver.with_children(std::mem::take(&mut self.children));
         let result = self.step_with(&mut driver).await;
         self.children = driver.into_children();
@@ -834,10 +916,7 @@ impl MatrixRun {
         let next = match self.jump.take() {
             Some(cursor) => cursor,
             None => self.cursor.next(&self.cfg).ok_or_else(|| {
-                OpError::InvalidArguments(format!(
-                    "Lauf `{}` hat keine weitere Phase",
-                    self.run_id
-                ))
+                OpError::InvalidArguments(format!("Lauf `{}` hat keine weitere Phase", self.run_id))
             })?,
         };
         self.cursor = next;
@@ -862,8 +941,7 @@ impl MatrixRun {
             Phase::Adjudikation => self.run_adjudication(driver, &mut report).await?,
             Phase::Rundenende => {
                 let at = self.at();
-                close_round(&mut self.log, self.loaded.scenario.rules(), at)
-                    .map_err(matrix_err)?;
+                close_round(&mut self.log, self.loaded.scenario.rules(), at).map_err(matrix_err)?;
             }
             Phase::Schlussargumente => self.run_final_arguments(driver, &mut report).await?,
             Phase::Aar => self.run_aar(driver, &mut report).await?,
@@ -937,6 +1015,9 @@ impl MatrixRun {
                     prompt: std::mem::take(&mut prompt),
                 })
                 .await;
+            for warning in driver.take_warnings() {
+                self.note("materials", warning)?;
+            }
             let raw = match answer {
                 Ok(raw) => raw,
                 Err(error) => {
@@ -1177,9 +1258,7 @@ impl MatrixRun {
             };
             match self.call_seat(driver, call, &vis, report).await? {
                 Some((PhaseOutput::PlayerArgument(argument), _)) => {
-                    sealed
-                        .seal(player.clone(), argument)
-                        .map_err(matrix_err)?;
+                    sealed.seal(player.clone(), argument).map_err(matrix_err)?;
                 }
                 _ => sealed.forfeit(player.clone()).map_err(matrix_err)?,
             }
@@ -1438,7 +1517,10 @@ impl MatrixRun {
         let mut synthesis: Option<UmpireSynthesis> = None;
         let mut debriefs: BTreeMap<PlayerId, PlayerDebrief> = BTreeMap::new();
         for call in &self.calls_for(Phase::Aar, PhaseStep::Main) {
-            match (self.call_seat(driver, call, &vis, report).await?, &call.seat) {
+            match (
+                self.call_seat(driver, call, &vis, report).await?,
+                &call.seat,
+            ) {
                 (Some((PhaseOutput::UmpireSynthesis(s), _)), _) => synthesis = Some(s),
                 (Some((PhaseOutput::PlayerDebrief(d), _)), Seat::Player(p)) => {
                     debriefs.insert(p.clone(), d);
@@ -1521,9 +1603,7 @@ impl MatrixRun {
         let argument_id = value
             .get("argument_id")
             .and_then(Value::as_str)
-            .ok_or_else(|| {
-                OpError::InvalidArguments("Override braucht `argument_id`".to_owned())
-            })?
+            .ok_or_else(|| OpError::InvalidArguments("Override braucht `argument_id`".to_owned()))?
             .to_owned();
         if self.log.state.outcomes.contains_key(&argument_id) {
             let effects: Vec<EffectOp> = value
@@ -1673,15 +1753,23 @@ impl MatrixRun {
         let mut forked = Self::from_log(
             self.loaded.clone(),
             self.source.clone(),
+            self.scenario_path.clone(),
             log,
             run_id,
             run_dir,
             self.timestamps,
             self.cfg,
         )?;
-        forked.note("fork", format!("von `{}` ab Rundenende {round}", self.run_id))?;
+        forked.note(
+            "fork",
+            format!("von `{}` ab Rundenende {round}", self.run_id),
+        )?;
+        forked.note_materials()?;
         forked.flush()?;
-        self.note("fork", format!("→ `{}` ab Rundenende {round}", forked.run_id))?;
+        self.note(
+            "fork",
+            format!("→ `{}` ab Rundenende {round}", forked.run_id),
+        )?;
         self.flush()?;
         Ok(forked)
     }
@@ -1831,7 +1919,12 @@ fn public_texts(output: &PhaseOutput, args: &[RoundArgument]) -> Vec<(String, St
                 .narrations
                 .iter()
                 .filter(|x| x.audience.0.is_public())
-                .map(|x| (format!("umpire:{}:narration", x.argument_id), x.text.clone()))
+                .map(|x| {
+                    (
+                        format!("umpire:{}:narration", x.argument_id),
+                        x.text.clone(),
+                    )
+                })
                 .collect();
             if let Some(summary) = &n.round_summary {
                 out.push(("umpire:round_summary".to_owned(), summary.clone()));
@@ -1884,8 +1977,7 @@ fn neutral_ruling(arg: &RoundArgument, rules: &Rules) -> UmpireRuling {
         umpire_cons: Vec::new(),
         context_modifier: 0,
         context_reason: None,
-        probability: matches!(rules.adjudication, AdjudicationSystem::EstimativeD100)
-            .then_some(50),
+        probability: matches!(rules.adjudication, AdjudicationSystem::EstimativeD100).then_some(50),
         inconsistent_with: None,
         public_rationale: None,
         private_notes: Some("Ersatzurteil des Runners (Umpire-Antwort ungültig).".to_owned()),
@@ -1941,9 +2033,7 @@ fn entry_from(kind: &EntryKind) -> Option<String> {
         | EntryKind::Narrated { .. }
         | EntryKind::StandingSet { .. } => Some(UMPIRE_KEY.to_owned()),
         EntryKind::FacilitatorNote { .. } => Some("facilitator".to_owned()),
-        EntryKind::InjectApplied { attributed, .. } => {
-            attributed.then(|| "facilitator".to_owned())
-        }
+        EntryKind::InjectApplied { attributed, .. } => attributed.then(|| "facilitator".to_owned()),
         _ => None,
     }
 }
@@ -2093,11 +2183,7 @@ pub fn entry_text(kind: &EntryKind, scenario: &Scenario) -> String {
             from,
             to,
             cause,
-        } => format!(
-            "{var}: {} → {} ({cause})",
-            from.display(),
-            to.display()
-        ),
+        } => format!("{var}: {} → {} ({cause})", from.display(), to.display()),
         EntryKind::OngoingStarted { ongoing } => format!("Fortwirkend: {}", ongoing.text),
         EntryKind::OngoingStopped { id } => format!("Fortwirkender Effekt `{id}` beendet."),
         EntryKind::EffectRejected {
@@ -2142,6 +2228,291 @@ pub fn entry_json(round: u32, audience: &Audience, kind: &EntryKind, scenario: &
         "from": entry_from(kind),
         "text": entry_text(kind, scenario),
     })
+}
+
+// ── Unterlagen ───────────────────────────────────────────────────────────────
+
+/// Ergebnis des Kopierens der Unterlagen eines Sitzes.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct MaterialsReport {
+    /// Kopierte Dateien.
+    pub copied: usize,
+    /// Kopierte Bytes.
+    pub bytes: u64,
+    /// Übersprungene Einträge mit Grund.
+    pub skipped: Vec<String>,
+}
+
+/// Ein einzelner, harmloser Pfadbestandteil (kein Trenner, kein `.`/`..`).
+fn safe_component(name: &str) -> bool {
+    !name.is_empty() && name != "." && name != ".." && !name.contains(['/', '\\', '\0'])
+}
+
+/// Gültige Paarordner `paare/<a>+<b>/` (keine Symlinks), sortiert.
+fn pair_folders(src_root: &Path) -> Vec<(String, String, String)> {
+    let Ok(entries) = std::fs::read_dir(src_root.join("paare")) else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    for entry in entries.flatten() {
+        let Ok(meta) = std::fs::symlink_metadata(entry.path()) else {
+            continue;
+        };
+        if !meta.is_dir() {
+            continue;
+        }
+        let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
+            continue;
+        };
+        if let Some((a, b)) = pair_folder_members(&name) {
+            out.push((name, a, b));
+        }
+    }
+    out.sort();
+    out
+}
+
+/// Kopierplan eines Sitzes: `(Quelle relativ zu dir, Ziel relativ zur Kopie)`
+/// gemäß [`materials_for_seat`].
+#[must_use]
+pub fn materials_plan(
+    src_root: &Path,
+    players: &[PlayerId],
+    seat: &Seat,
+) -> Vec<(PathBuf, PathBuf)> {
+    let selection = materials_for_seat(seat);
+    let pairs = pair_folders(src_root);
+    let mut plan = Vec::new();
+    if selection.shared {
+        plan.push((PathBuf::from("geteilt"), PathBuf::from("geteilt")));
+    }
+    if let Some(own) = selection.own.as_deref().filter(|own| safe_component(own)) {
+        plan.push((PathBuf::from(own), PathBuf::from("eigene")));
+    }
+    if selection.pairs_with {
+        if let Seat::Player(me) = seat {
+            for (name, a, b) in &pairs {
+                let partner = if a == me.as_str() {
+                    b
+                } else if b == me.as_str() {
+                    a
+                } else {
+                    continue;
+                };
+                plan.push((
+                    Path::new("paare").join(name),
+                    PathBuf::from(format!("mit-{partner}")),
+                ));
+            }
+        }
+    }
+    if selection.all_seats {
+        for player in players.iter().filter(|p| safe_component(p.as_str())) {
+            plan.push((
+                PathBuf::from(player.as_str()),
+                Path::new("sitze").join(player.as_str()),
+            ));
+        }
+    }
+    if selection.all_pairs {
+        for (name, _, _) in &pairs {
+            plan.push((Path::new("paare").join(name), Path::new("paare").join(name)));
+        }
+    }
+    if selection.umpire {
+        plan.push((PathBuf::from("umpire"), PathBuf::from("schiedsrichter")));
+    }
+    plan
+}
+
+/// Legt die Unterlagen-Kopie eines Sitzes unter `dest` an. Ohne Quelle
+/// entsteht ein leerer Ordner. Kopiert werden nur reguläre Dateien
+/// (≤ [`MAX_MATERIAL_FILE_BYTES`], zusammen ≤ [`MAX_MATERIAL_TOTAL_BYTES`]);
+/// symbolische Links, Sonderdateien und alles, was kanonisiert außerhalb
+/// der Quelle liegt, wird übersprungen.
+///
+/// # Errors
+/// Deutsche Fehlerbeschreibung bei Ein-/Ausgabefehlern.
+pub fn build_seat_materials(
+    source: Option<&Path>,
+    players: &[PlayerId],
+    seat: &Seat,
+    dest: &Path,
+) -> Result<MaterialsReport, String> {
+    std::fs::create_dir_all(dest)
+        .map_err(|e| format!("Unterlagen-Kopie `{}` nicht anlegbar: {e}", dest.display()))?;
+    let mut report = MaterialsReport::default();
+    let Some(source) = source else {
+        return Ok(report);
+    };
+    let root = source
+        .canonicalize()
+        .map_err(|e| format!("Unterlagen-Ordner `{}` nicht lesbar: {e}", source.display()))?;
+    for (src_rel, dest_rel) in materials_plan(&root, players, seat) {
+        let src = root.join(&src_rel);
+        let Ok(meta) = std::fs::symlink_metadata(&src) else {
+            continue;
+        };
+        if meta.file_type().is_symlink() {
+            report
+                .skipped
+                .push(format!("{}: symbolischer Link", src_rel.display()));
+            continue;
+        }
+        if !meta.is_dir() {
+            continue;
+        }
+        let canonical = src
+            .canonicalize()
+            .map_err(|e| format!("`{}` nicht lesbar: {e}", src.display()))?;
+        if !canonical.starts_with(&root) {
+            report.skipped.push(format!(
+                "{}: außerhalb des Unterlagen-Ordners",
+                src_rel.display()
+            ));
+            continue;
+        }
+        let target = dest.join(&dest_rel);
+        std::fs::create_dir_all(&target)
+            .map_err(|e| format!("`{}` nicht anlegbar: {e}", target.display()))?;
+        copy_tree(&root, &canonical, &target, &src_rel, 0, &mut report)?;
+    }
+    Ok(report)
+}
+
+fn copy_tree(
+    root: &Path,
+    dir: &Path,
+    target: &Path,
+    label: &Path,
+    depth: usize,
+    report: &mut MaterialsReport,
+) -> Result<(), String> {
+    if depth >= MAX_MATERIAL_DEPTH {
+        report
+            .skipped
+            .push(format!("{}: zu tief verschachtelt", label.display()));
+        return Ok(());
+    }
+    let mut entries: Vec<std::fs::DirEntry> = std::fs::read_dir(dir)
+        .map_err(|e| format!("`{}` nicht lesbar: {e}", dir.display()))?
+        .flatten()
+        .collect();
+    entries.sort_by_key(std::fs::DirEntry::file_name);
+    for entry in entries {
+        let name = entry.file_name();
+        let path = entry.path();
+        let shown = label.join(&name);
+        let Ok(meta) = std::fs::symlink_metadata(&path) else {
+            continue;
+        };
+        let kind = meta.file_type();
+        if kind.is_symlink() {
+            report
+                .skipped
+                .push(format!("{}: symbolischer Link", shown.display()));
+            continue;
+        }
+        let Ok(canonical) = path.canonicalize() else {
+            continue;
+        };
+        if !canonical.starts_with(root) {
+            report.skipped.push(format!(
+                "{}: außerhalb des Unterlagen-Ordners",
+                shown.display()
+            ));
+            continue;
+        }
+        let out = target.join(&name);
+        if kind.is_dir() {
+            std::fs::create_dir_all(&out)
+                .map_err(|e| format!("`{}` nicht anlegbar: {e}", out.display()))?;
+            copy_tree(root, &canonical, &out, &shown, depth + 1, report)?;
+        } else if kind.is_file() {
+            copy_limited(&canonical, &out, meta.len(), &shown, report)?;
+        } else {
+            report
+                .skipped
+                .push(format!("{}: keine reguläre Datei", shown.display()));
+        }
+    }
+    Ok(())
+}
+
+fn copy_limited(
+    src: &Path,
+    out: &Path,
+    len: u64,
+    shown: &Path,
+    report: &mut MaterialsReport,
+) -> Result<(), String> {
+    if len > MAX_MATERIAL_FILE_BYTES {
+        report
+            .skipped
+            .push(format!("{}: größer als 5 MiB", shown.display()));
+        return Ok(());
+    }
+    if report.bytes.saturating_add(len) > MAX_MATERIAL_TOTAL_BYTES {
+        report
+            .skipped
+            .push(format!("{}: Gesamtgrenze 50 MiB erreicht", shown.display()));
+        return Ok(());
+    }
+    let file =
+        std::fs::File::open(src).map_err(|e| format!("`{}` nicht lesbar: {e}", src.display()))?;
+    let mut limited = std::io::Read::take(file, MAX_MATERIAL_FILE_BYTES + 1);
+    let mut sink = std::fs::File::create(out)
+        .map_err(|e| format!("`{}` nicht schreibbar: {e}", out.display()))?;
+    let copied = std::io::copy(&mut limited, &mut sink)
+        .map_err(|e| format!("`{}` nicht kopierbar: {e}", src.display()))?;
+    drop(sink);
+    // Die Datei ist zwischen Prüfung und Kopie gewachsen: verwerfen.
+    if copied > MAX_MATERIAL_FILE_BYTES
+        || report.bytes.saturating_add(copied) > MAX_MATERIAL_TOTAL_BYTES
+    {
+        let _ = std::fs::remove_file(out);
+        report.skipped.push(format!(
+            "{}: Grenze beim Kopieren überschritten",
+            shown.display()
+        ));
+        return Ok(());
+    }
+    report.copied += 1;
+    report.bytes += copied;
+    Ok(())
+}
+
+/// Sandbox eines Sitzes: Workspace = seine Unterlagen-Kopie, Rechte =
+/// `{ReadWorkspace}` ∩ Parent-Rechte, kein Netz.
+///
+/// # Errors
+/// Deutsche Fehlerbeschreibung, wenn die Kopie nicht bindbar ist.
+pub fn seat_sandbox(
+    parent: &SandboxSpec,
+    seat_dir: &Path,
+    workspace: &str,
+) -> Result<SandboxSpec, String> {
+    let tenant = parent.workspace().tenant().clone();
+    let workspace = WorkspaceId::from_str(workspace);
+    let registry = WorkspaceRegistry::build(
+        seat_dir,
+        [WorkspaceRegistration {
+            tenant: tenant.clone(),
+            workspace: workspace.clone(),
+            root: seat_dir.to_path_buf(),
+        }],
+    )
+    .map_err(|e| e.to_string())?;
+    let binding = registry
+        .resolve(&tenant, &workspace)
+        .map_err(|e| e.to_string())?;
+    let permissions = parent
+        .restrict(&PermissionRequest::from_permissions([
+            Permission::ReadWorkspace,
+        ]))
+        .permissions()
+        .clone();
+    Ok(SandboxSpec::from_resolved(binding, permissions))
 }
 
 #[cfg(test)]
@@ -2211,6 +2582,7 @@ mod tests {
         Ok(MatrixRun::start(
             loaded,
             KARST.to_owned(),
+            None,
             seed,
             "test-run".to_owned(),
             None,
@@ -2249,7 +2621,11 @@ mod tests {
         }
         let seats = data["seats"].as_array().ok_or("seats")?;
         assert_eq!(seats.len(), 5, "4 Spieler + Umpire");
-        assert!(seats.iter().any(|s| s["id"] == "umpire" && s["role"] == "umpire"));
+        assert!(
+            seats
+                .iter()
+                .any(|s| s["id"] == "umpire" && s["role"] == "umpire")
+        );
         let views = data["views"].as_object().ok_or("views")?;
         assert!(views.contains_key("rat") && views.contains_key("umpire"));
         let observer = data["observer"].as_array().ok_or("observer")?;
@@ -2319,7 +2695,10 @@ mod tests {
         assert_eq!(report.phase, Phase::Aar);
         assert!(report.ended);
         assert_eq!(run.status(), RunStatus::Ended);
-        assert!(run.aar().is_some_and(|md| md.contains("After-Action-Review")));
+        assert!(
+            run.aar()
+                .is_some_and(|md| md.contains("After-Action-Review"))
+        );
         assert!(run.step_with(&mut driver).await.is_err());
         Ok(())
     }
@@ -2329,7 +2708,10 @@ mod tests {
         let mut run = run()?;
         let id = run.queue_inject("Sturmflut im Hafen", &Audience::Public, false, Vec::new())?;
         assert_eq!(id, "facilitator-1");
-        assert!(run.queue_inject("  ", &Audience::Public, false, Vec::new()).is_err());
+        assert!(
+            run.queue_inject("  ", &Audience::Public, false, Vec::new())
+                .is_err()
+        );
         assert!(
             run.queue_inject(
                 "x",
@@ -2340,7 +2722,9 @@ mod tests {
             .is_err()
         );
         let last = run.log().journal.entries().last().ok_or("leer")?;
-        assert!(matches!(&last.kind, EntryKind::FacilitatorNote { command, .. } if command == "inject"));
+        assert!(
+            matches!(&last.kind, EntryKind::FacilitatorNote { command, .. } if command == "inject")
+        );
         assert_eq!(last.audience, Audience::ObserverOnly);
         Ok(())
     }
@@ -2381,6 +2765,147 @@ mod tests {
         assert_eq!(patched.argument_id, "r1-a1");
         assert_eq!(patched.context_modifier, 2);
         assert!(patch_ruling(&ruling, &json!({"unbekannt": 1})).is_err());
+        Ok(())
+    }
+
+    // ── Unterlagen ──────────────────────────────────────────────────────────
+
+    fn write(path: &Path, bytes: &[u8]) -> TestResult {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        std::fs::write(path, bytes)?;
+        Ok(())
+    }
+
+    fn players() -> Vec<PlayerId> {
+        ["a", "b", "c"].into_iter().map(PlayerId::new).collect()
+    }
+
+    /// Quelle: geteilt/, a/, b/, c/, paare/a+b/, umpire/.
+    fn materials_source(root: &Path) -> TestResult {
+        write(&root.join("geteilt/lage.txt"), b"fuer alle")?;
+        write(&root.join("a/plan.txt"), b"nur a")?;
+        write(&root.join("b/plan.txt"), b"nur b")?;
+        write(&root.join("c/plan.txt"), b"nur c")?;
+        write(&root.join("paare/a+b/deal.txt"), b"a und b")?;
+        write(&root.join("umpire/notiz.txt"), b"nur umpire")?;
+        Ok(())
+    }
+
+    fn files_under(root: &Path) -> Vec<String> {
+        fn walk(base: &Path, dir: &Path, out: &mut Vec<String>) {
+            let Ok(entries) = std::fs::read_dir(dir) else {
+                return;
+            };
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    walk(base, &path, out);
+                } else if let Ok(rel) = path.strip_prefix(base) {
+                    out.push(rel.to_string_lossy().replace('\\', "/"));
+                }
+            }
+        }
+        let mut out = Vec::new();
+        walk(root, root, &mut out);
+        out.sort();
+        out
+    }
+
+    #[test]
+    fn materials_layout_per_seat_and_privacy() -> TestResult {
+        let tmp = tempfile::tempdir()?;
+        let src = tmp.path().join("src");
+        materials_source(&src)?;
+        let dest = tmp.path().join("dest");
+        let players = players();
+        for seat in [
+            Seat::player("a"),
+            Seat::player("b"),
+            Seat::player("c"),
+            Seat::Umpire,
+        ] {
+            build_seat_materials(Some(&src), &players, &seat, &dest.join(seat_key(&seat)))?;
+        }
+        assert_eq!(
+            files_under(&dest.join("a")),
+            vec!["eigene/plan.txt", "geteilt/lage.txt", "mit-b/deal.txt"]
+        );
+        assert_eq!(
+            files_under(&dest.join("b")),
+            vec!["eigene/plan.txt", "geteilt/lage.txt", "mit-a/deal.txt"]
+        );
+        // C ist nicht im Paar a+b und sieht keine fremden Sitz-Ordner.
+        assert_eq!(
+            files_under(&dest.join("c")),
+            vec!["eigene/plan.txt", "geteilt/lage.txt"]
+        );
+        assert_eq!(
+            std::fs::read_to_string(dest.join("a/eigene/plan.txt"))?,
+            "nur a",
+            "A bekommt nie B's Datei"
+        );
+        assert_eq!(
+            files_under(&dest.join("umpire")),
+            vec![
+                "geteilt/lage.txt",
+                "paare/a+b/deal.txt",
+                "schiedsrichter/notiz.txt",
+                "sitze/a/plan.txt",
+                "sitze/b/plan.txt",
+                "sitze/c/plan.txt",
+            ]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn materials_without_source_is_an_empty_dir() -> TestResult {
+        let tmp = tempfile::tempdir()?;
+        let dest = tmp.path().join("leer");
+        let report = build_seat_materials(None, &players(), &Seat::player("a"), &dest)?;
+        assert_eq!(report, MaterialsReport::default());
+        assert!(dest.is_dir());
+        assert!(files_under(&dest).is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn materials_skip_oversize_files() -> TestResult {
+        let tmp = tempfile::tempdir()?;
+        let src = tmp.path().join("src");
+        let big = usize::try_from(MAX_MATERIAL_FILE_BYTES + 1)?;
+        write(&src.join("geteilt/gross.bin"), &vec![0u8; big])?;
+        write(&src.join("geteilt/klein.txt"), b"ok")?;
+        let dest = tmp.path().join("dest");
+        let report = build_seat_materials(Some(&src), &players(), &Seat::player("a"), &dest)?;
+        assert_eq!(files_under(&dest), vec!["geteilt/klein.txt"]);
+        assert!(report.skipped.iter().any(|s| s.contains("gross.bin")));
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn materials_skip_symlinks_and_refuse_traversal() -> TestResult {
+        let tmp = tempfile::tempdir()?;
+        let src = tmp.path().join("src");
+        let outside = tmp.path().join("geheim");
+        write(&outside.join("passwort.txt"), b"streng geheim")?;
+        write(&src.join("geteilt/lage.txt"), b"ok")?;
+        std::os::unix::fs::symlink(outside.join("passwort.txt"), src.join("geteilt/link.txt"))?;
+        std::os::unix::fs::symlink(&outside, src.join("geteilt/ordnerlink"))?;
+        // Der eigene Ordner von `a` ist selbst ein Link nach draußen.
+        std::os::unix::fs::symlink(&outside, src.join("a"))?;
+        let dest = tmp.path().join("dest");
+        let report = build_seat_materials(Some(&src), &players(), &Seat::player("a"), &dest)?;
+        assert_eq!(files_under(&dest), vec!["geteilt/lage.txt"]);
+        assert!(report.skipped.len() >= 3, "{:?}", report.skipped);
+        // Traversal über die Sitz-ID wird gar nicht erst geplant.
+        let plan = materials_plan(&src, &players(), &Seat::player(".."));
+        assert!(plan.iter().all(|(from, _)| from != Path::new("..")));
+        let plan = materials_plan(&src, &players(), &Seat::player("../geheim"));
+        assert!(plan.iter().all(|(_, to)| to != Path::new("eigene")));
         Ok(())
     }
 
