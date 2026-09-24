@@ -140,7 +140,7 @@ pub(crate) fn content_height(area: Rect, has_header: bool) -> usize {
 /// # Argumente
 /// - `title`: Rahmentitel (wird bereinigt).
 /// - `header`: optionale feste (nicht scrollende) erste Zeile, z. B. eine
-///   Reiterleiste; gefolgt von einer Leerzeile, sofern Platz ist.
+///   Reiterleiste (nur gezeichnet, wenn mindestens eine Inhaltszeile bleibt).
 /// - `lines`: alle Inhaltszeilen; sichtbar ist das Fenster ab `scroll`.
 /// - `scroll`: erster sichtbarer Zeilenindex (wird auf das Ende geklemmt).
 /// - `footer`: Tastenhinweis in der letzten Zeile.

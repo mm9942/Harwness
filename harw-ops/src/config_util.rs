@@ -910,8 +910,8 @@ mod tests {
         RecordingSelectionPersistence, SelectionPersistence, clear_uia_keys, execution_error,
         write_default_interaction_mode, write_internal_model,
     };
-    use harw_config::InternalModelPoint;
     use crate::test_support::{TestResult, ctx};
+    use harw_config::InternalModelPoint;
 
     #[test]
     fn recording_selection_persistence_records_default_selection_call() {
@@ -1154,7 +1154,7 @@ mod tests {
             Some("openrouter"),
             Some("nvidia/nemotron"),
         )
-        .map_err(|reason| crate::test_support::TestError::Unexpected(reason))?;
+        .map_err(ctx("Schreibkern"))?;
         writer.save().map_err(ctx("save"))?;
 
         let reopened = harw_config::ConfigWriter::open(&config_path).map_err(ctx("reopen"))?;
@@ -1175,19 +1175,23 @@ mod tests {
             Some("anthropic"),
             None,
         )
-        .map_err(|reason| crate::test_support::TestError::Unexpected(reason))?;
+        .map_err(ctx("Schreibkern"))?;
         writer.save().map_err(ctx("save2"))?;
         let reopened = harw_config::ConfigWriter::open(&config_path).map_err(ctx("reopen3"))?;
         assert_eq!(
             reopened.get_value("internal_models.explorer.provider"),
             Some("anthropic".to_owned())
         );
-        assert!(reopened.get_value("internal_models.explorer.model").is_none());
+        assert!(
+            reopened
+                .get_value("internal_models.explorer.model")
+                .is_none()
+        );
 
         // Reset: die ganze Stellen-Tabelle verschwindet.
         let mut writer = harw_config::ConfigWriter::open(&config_path).map_err(ctx("reopen4"))?;
         write_internal_model(&mut writer, InternalModelPoint::Explorer, None, None)
-            .map_err(|reason| crate::test_support::TestError::Unexpected(reason))?;
+            .map_err(ctx("Schreibkern"))?;
         writer.save().map_err(ctx("save3"))?;
         let content = std::fs::read_to_string(&config_path).map_err(ctx("read back"))?;
         assert!(
@@ -1228,12 +1232,14 @@ mod tests {
         let config_path = dir.path().join("config.toml");
 
         let mut writer = harw_config::ConfigWriter::open(&config_path).map_err(ctx("open"))?;
-        write_default_interaction_mode(&mut writer, "explore")
-            .map_err(|reason| crate::test_support::TestError::Unexpected(reason))?;
+        write_default_interaction_mode(&mut writer, "explore").map_err(ctx("Schreibkern"))?;
         writer.save().map_err(ctx("save"))?;
 
         let reopened = harw_config::ConfigWriter::open(&config_path).map_err(ctx("reopen"))?;
-        assert_eq!(reopened.get_value("mode.default"), Some("explore".to_owned()));
+        assert_eq!(
+            reopened.get_value("mode.default"),
+            Some("explore".to_owned())
+        );
         let content = std::fs::read_to_string(&config_path).map_err(ctx("read back"))?;
         assert!(content.contains("[mode]"), "{content}");
         Ok(())

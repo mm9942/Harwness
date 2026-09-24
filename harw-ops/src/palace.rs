@@ -2,8 +2,12 @@
 //! (`docs/design/knowledge-surfaces.md` §2.2/§2.5, `interaction-contract.md` §2.2).
 //!
 //! # Subcommands
+//! - (bare) / `list` — alle sichtbaren Knoten; `OpOutput::data` =
+//!   `{"nodes":[{"id","title","status","links","updated"}]}`.
 //! - `show <ArtifactRef>` — Knoten mit Titel, Status, Tags, Body, ausgehenden
-//!   Links (`[[wikilinks]]` + Frontmatter-`links`) und berechneten Backlinks.
+//!   Links (`[[wikilinks]]` + Frontmatter-`links`) und berechneten Backlinks;
+//!   `OpOutput::data` = `{"node":{"id","title","status","links","updated",
+//!   "tags","backlinks","body"}}`.
 //! - `search <query> [--max-hops=n] [--max=n]` — graphbewusster Recall über
 //!   Palace-Knoten; begrenzt durch `RecallQuery::validate` (§2.3).
 //! - `promote <topic-ref>` — Thema → Palace-Knoten (§2.5).
@@ -108,16 +112,84 @@ pub fn run_palace(
 ) -> Result<OpOutput, OpError> {
     let tail = tokens.get(1..).unwrap_or_default();
     match tokens.first().map(String::as_str) {
+        None | Some("list") => list(store),
         Some("show") => show(store, tail),
         Some("search") => search_nodes(store, tail),
         Some("promote") => promote(store, caller, tail, now),
         Some(other) => Err(OpError::InvalidArguments(format!(
-            "unbekannter /palace-Subcommand: {other} (show, search, promote)"
+            "unbekannter /palace-Subcommand: {other} (list, show, search, promote)"
         ))),
-        None => Err(OpError::InvalidArguments(
-            "Aufruf: /palace show <id> | search <query> | promote <topic>".to_owned(),
-        )),
     }
+}
+
+/// Titel eines Knotens (`extra.title`, sonst die Id).
+fn node_title(node: &KnowledgeArtifact) -> &str {
+    node.frontmatter
+        .extra
+        .get(TITLE_KEY)
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or(node.id.as_str())
+}
+
+/// Status eines Knotens (`extra.confidence`, sonst `provisional`).
+fn node_status(node: &KnowledgeArtifact) -> &str {
+    node.frontmatter
+        .extra
+        .get(CONFIDENCE_KEY)
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("provisional")
+}
+
+/// Ausgehende Links: Frontmatter-`links` plus `[[wikilinks]]`, sortiert, eindeutig.
+fn node_links(node: &KnowledgeArtifact) -> Vec<String> {
+    let mut outgoing: Vec<String> = node
+        .frontmatter
+        .links
+        .iter()
+        .map(ToString::to_string)
+        .chain(scan_wikilinks(&node.body))
+        .collect();
+    outgoing.sort();
+    outgoing.dedup();
+    outgoing
+}
+
+/// Kopf-Nutzlast eines Knotens (ohne Body/Backlinks).
+fn node_summary(node: &KnowledgeArtifact) -> serde_json::Value {
+    serde_json::json!({
+        "id": node.id.as_str(),
+        "title": node_title(node),
+        "status": node_status(node),
+        "links": node_links(node),
+        "updated": node.frontmatter.updated_at.to_string(),
+    })
+}
+
+fn list(store: &KnowledgeStore) -> Result<OpOutput, OpError> {
+    let index = rebuild(store)?;
+    let nodes = visible_nodes(&index)?;
+    let data = serde_json::json!({
+        "nodes": nodes.iter().map(node_summary).collect::<Vec<_>>(),
+    });
+    if nodes.is_empty() {
+        return Ok(OpOutput {
+            text: "Keine sichtbaren Palace-Knoten.".to_owned(),
+            data: Some(data),
+        });
+    }
+    let mut out = format!("{} Palace-Knoten:\n", nodes.len());
+    for node in &nodes {
+        out.push_str(&format!(
+            "· {} — {} [{}]\n",
+            node.id,
+            node_title(node),
+            node_status(node)
+        ));
+    }
+    Ok(OpOutput {
+        text: out,
+        data: Some(data),
+    })
 }
 
 /// `palace/<slug>` aus `palace/<slug>` oder `<slug>`.
@@ -162,24 +234,9 @@ fn show(store: &KnowledgeStore, tail: &[String]) -> Result<OpOutput, OpError> {
             OpError::InvalidArguments(format!("kein sichtbarer Palace-Knoten '{target}'"))
         })?;
 
-    let extra = &node.frontmatter.extra;
-    let title = extra
-        .get(TITLE_KEY)
-        .and_then(serde_json::Value::as_str)
-        .unwrap_or(node.id.as_str());
-    let status = extra
-        .get(CONFIDENCE_KEY)
-        .and_then(serde_json::Value::as_str)
-        .unwrap_or("provisional");
-    let mut outgoing: Vec<String> = node
-        .frontmatter
-        .links
-        .iter()
-        .map(ToString::to_string)
-        .chain(scan_wikilinks(&node.body))
-        .collect();
-    outgoing.sort();
-    outgoing.dedup();
+    let title = node_title(&node);
+    let status = node_status(&node);
+    let outgoing = node_links(&node);
     let backlinks: Vec<String> = index
         .backlinks(&node.id)
         .into_iter()
@@ -204,7 +261,16 @@ fn show(store: &KnowledgeStore, tail: &[String]) -> Result<OpOutput, OpError> {
     for link in &backlinks {
         out.push_str(&format!("  ← {link}\n"));
     }
-    Ok(OpOutput::from(out))
+    let mut data = node_summary(&node);
+    if let Some(fields) = data.as_object_mut() {
+        fields.insert("tags".to_owned(), serde_json::json!(node.frontmatter.tags));
+        fields.insert("backlinks".to_owned(), serde_json::json!(backlinks));
+        fields.insert("body".to_owned(), serde_json::json!(node.body.trim()));
+    }
+    Ok(OpOutput {
+        text: out,
+        data: Some(serde_json::json!({ "node": data })),
+    })
 }
 
 fn search_nodes(store: &KnowledgeStore, tail: &[String]) -> Result<OpOutput, OpError> {
@@ -453,6 +519,29 @@ mod tests {
 
         let hits = run(&store, &["search", "canary", "--max=5"]).map_err(ctx("search"))?;
         assert!(hits.contains("palace/deploy-pipeline"), "{hits}");
+
+        let listed = run_palace(
+            &store,
+            &AgentId::new("operator"),
+            &toks(&["list"]),
+            jiff::Timestamp::UNIX_EPOCH,
+        )
+        .map_err(ctx("list"))?;
+        let data = listed.data.ok_or(TestError::Missing("list data"))?;
+        assert_eq!(data["nodes"].as_array().map(Vec::len), Some(2));
+        assert_eq!(data["nodes"][0]["id"], "palace/deploy-pipeline");
+        assert_eq!(data["nodes"][0]["status"], "established");
+
+        let shown = run_palace(
+            &store,
+            &AgentId::new("operator"),
+            &toks(&["show", "on-call"]),
+            jiff::Timestamp::UNIX_EPOCH,
+        )
+        .map_err(ctx("show data"))?;
+        let node = shown.data.ok_or(TestError::Missing("show data"))?;
+        assert_eq!(node["node"]["backlinks"][0], "palace/deploy-pipeline");
+        assert_eq!(node["node"]["body"], "Rufbereitschaft für den Deploy.");
         std::fs::remove_dir_all(store.root()).ok();
         Ok(())
     }
@@ -472,6 +561,7 @@ mod tests {
             vec!["search"],
             vec!["search", "x", "--max-hops=99"],
             vec!["frobnicate"],
+            vec!["show"],
         ] {
             match run(&store, &tokens) {
                 Err(OpError::InvalidArguments(_)) => {}
