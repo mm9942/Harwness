@@ -40,16 +40,22 @@ use harw_catalog::{
 use harw_config::{
     InternalModelPoint, ResolvedConfig, ResolvedInternalModel, SkillToml, resolve_internal_model,
 };
-use harw_core::{ChildRegistryFactory, ManagedAgentSpawner, ModelProvider, PinnedModelProvider};
+use harw_core::{
+    ChildRegistryFactory, ManagedAgentSpawner, ModelProvider, PinnedModelProvider, StateStore,
+};
 use harw_extension_api::{
     AgentSpawnError, AgentSpawner, ExtensionRegistry, SpawnFuture, SpawnInput,
 };
+use harw_operations::OpContext;
+use harw_operations::adapter::ModelToolProvider;
+use harw_operations::context::ServiceMap;
+use harw_operations::operation::Operation;
 use harw_project_discovery::ProjectContext;
 use harw_registry_defaults::embedded_agents::builtin_agent_definitions;
 use harw_registry_defaults::profile::{
     HostPermitWiring, IdentityOverrides,
     assemble_registry_for_sandbox_with_definition_access_and_sandbox_profile_and_permits,
-    profile_for_role, role_names,
+    composition_tools_for_role, profile_for_role, role_names,
 };
 
 use crate::approval::ApprovalChain;
@@ -96,6 +102,42 @@ pub fn internal_point_for_role(role: &str) -> Option<InternalModelPoint> {
         r if r == role_names::MEMORY_STEWARD => Some(InternalModelPoint::MemoryConsolidation),
         r if r == role_names::AGENT_STEWARD => Some(InternalModelPoint::WorkerComplex),
         _ => None,
+    }
+}
+
+/// Bildet die Organisationsrolle einer Orchestrator-Definition auf ihre
+/// interne Modellstelle ab (R1).
+///
+/// # Description
+/// Reine Zuordnung über die **gesenkte** Organisationsrolle
+/// ([`ExecutableAgentIr::role`]), nicht über den Rollennamen: jede
+/// Definition mit `role = "root-orchestrator"` →
+/// [`InternalModelPoint::RootOrchestrator`], jede mit
+/// `role = "child-orchestrator"` (darunter `coding-orchestrator`,
+/// `research-orchestrator`, `analysis-orchestrator`) →
+/// [`InternalModelPoint::SubOrchestrator`]. Ohne explizite Wahl lösen beide
+/// Stellen auf das Hauptmodell auf
+/// ([`InternalModelPoint::uses_openrouter_default`] ist für sie `false`) —
+/// das Verhalten bleibt dann das bisherige Eltern-Modell.
+///
+/// # Arguments
+/// - `role` (`harw_agent_dsl::roles::AgentRoleId`): die Organisationsrolle.
+///
+/// # Returns
+/// `Some(point)` für die beiden Orchestrator-Rollen, sonst `None`.
+#[must_use]
+pub fn orchestrator_point_for_organizational_role(
+    role: harw_agent_dsl::roles::AgentRoleId,
+) -> Option<InternalModelPoint> {
+    use harw_agent_dsl::roles::AgentRoleId;
+
+    match role {
+        AgentRoleId::RootOrchestrator => Some(InternalModelPoint::RootOrchestrator),
+        AgentRoleId::ChildOrchestrator => Some(InternalModelPoint::SubOrchestrator),
+        AgentRoleId::UserInterface
+        | AgentRoleId::Worker
+        | AgentRoleId::UiaWorker
+        | AgentRoleId::AgentSteward => None,
     }
 }
 
@@ -206,7 +248,10 @@ pub fn definition_write_mode_for_parent_role(
 /// ([`InternalModelPoint::Explorer`], [`InternalModelPoint::Research`],
 /// [`InternalModelPoint::MemoryConsolidation`]), sowie zusätzlich die beiden
 /// Worker-Modellstufen ([`InternalModelPoint::WorkerSimple`],
-/// [`InternalModelPoint::WorkerComplex`], Addendum D+E) — die übrigen
+/// [`InternalModelPoint::WorkerComplex`], Addendum D+E) und die beiden
+/// Orchestrator-Stellen ([`InternalModelPoint::RootOrchestrator`],
+/// [`InternalModelPoint::SubOrchestrator`], R1, über
+/// [`orchestrator_point_for_organizational_role`]) — die übrigen
 /// Stellen (`SessionTitle`, `CompactionSummary`, `DreamReflection`) haben
 /// eigene Aufrufstellen außerhalb dieser Fabrik.
 ///
@@ -227,6 +272,8 @@ pub fn resolve_internal_models_for_children(
         InternalModelPoint::MemoryConsolidation,
         InternalModelPoint::WorkerSimple,
         InternalModelPoint::WorkerComplex,
+        InternalModelPoint::RootOrchestrator,
+        InternalModelPoint::SubOrchestrator,
     ]
     .into_iter()
     .map(|point| (point, resolve_internal_model(config, point)))

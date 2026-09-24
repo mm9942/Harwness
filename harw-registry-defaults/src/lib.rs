@@ -64,6 +64,7 @@ pub mod authority;
 pub mod embedded_agents;
 pub mod profile;
 pub mod research_web;
+pub mod skill_proposal_tools;
 
 #[cfg(test)]
 mod test_support;
@@ -82,7 +83,9 @@ pub use agent_definition_tools::{
     AgentDefinitionToolProvider, DefinitionAuthorCeiling, DefinitionWriteMode,
     UiaSelfDocumentToolProvider,
 };
-pub use authority::{AuthorityReducer, authority_reducer_for_role, tool_permission};
+pub use authority::{
+    AuthorityReducer, authority_reducer_for_role, delegation_targets_for_role, tool_permission,
+};
 pub use error::{RegistryDefaultsError, RegistryDefaultsResult};
 pub use profile::{
     AgentDefinitionAccess, HostPermitWiring, IdentityOverrides, RegistryProfile,
@@ -92,6 +95,7 @@ pub use profile::{
     profile_for_role, role_names,
 };
 pub use research_web::{install_web_tools, researcher_web_network_scope, researcher_web_policy};
+pub use skill_proposal_tools::{SkillAuthorCeiling, SkillProposalStore, SkillProposalToolProvider};
 
 /// Die Werkzeuge, die ohne Nutzerrückfrage ausgeführt werden dürfen.
 ///
@@ -183,6 +187,18 @@ pub const AUTO_APPROVED_TOOLS: &[&str] = &[
     // "none")`, ohne Seitenpfad in andere Executor).
     "status",
     "ps",
+    // Fan-out-Operation der Orchestratoren (`harw-core-bridge::delegate_wave`,
+    // Plan Punkt 1; `model_tool(readonly = false, approval = "none")`). Die
+    // Operation selbst schreibt nichts: jedes gestartete Kind läuft mit seinem
+    // eigenen, per `AuthorityReducer` gedeckelten Rechtesatz, seiner eigenen
+    // Freigabe-Politik und unter dem Budget-Deckel der Welle
+    // (`wave_budget_cap`). Ein Child-Orchestrator läuft mit
+    // `allow_pause = false` und könnte eine Rückfrage nie beantworten — eine
+    // Freigabepflicht hier würde jede verschachtelte Welle blockieren.
+    // Registriert wird sie ausschließlich für Orchestrator-Rollen
+    // (`profile::composition_tools_for_role`), nie über ein
+    // `RegistryProfile`.
+    "delegate_wave",
     // Bewusst entfernt (W1-05, Register F-014, G-003, G-004, F-043, G-068):
     // - `plan`, `goal`: deklarieren `model_tool(approval = "always")` und
     //   mutieren PlanStore bzw. Ziel; die Auto-Freigabe überstimmte die
@@ -226,12 +242,22 @@ pub const AUTO_APPROVED_TOOLS: &[&str] = &[
 /// [`AUTO_APPROVED_TOOLS`]/die Modus-Logik, aber nicht zusätzlich über diese
 /// Liste.
 ///
+/// # `skills.commit_proposal`
+/// Übernimmt einen Skill-Vorschlag dauerhaft in `<profil>/skills/`
+/// ([`skill_proposal_tools`]); wie `agents.commit_proposal` ist ein
+/// `user_confirmed: true` im Argument keine echte Freigabe. `skills.propose`
+/// und `skills.reject_proposal` bleiben normal freigabepflichtig.
+///
 /// # `process.kill`
 /// Schickt SIGKILL an Host-Prozesse — nicht umkehrbar. Deshalb fragt es wie
 /// die beiden Agenten-Werkzeuge immer, auch unter `FullAccess` und trotz
 /// passender Allow-Regel.
-pub const ALWAYS_ASK_TOOLS: &[&str] =
-    &["agents.write_uia", "agents.commit_proposal", "process.kill"];
+pub const ALWAYS_ASK_TOOLS: &[&str] = &[
+    "agents.write_uia",
+    "agents.commit_proposal",
+    "skills.commit_proposal",
+    "process.kill",
+];
 
 /// Default approval boundary for the built-in coding-agent tool set.
 ///
@@ -551,12 +577,20 @@ mod tests {
     /// fremden Executor aufrufen (`harw-ops/src/status.rs`, `ps.rs`).
     const READ_ONLY_ROOT_OPERATIONS: &[&str] = &["status", "ps"];
 
+    /// Fan-out-Operationen der Composition-Root für Orchestratoren
+    /// (`profile::ORCHESTRATION_TOOLS`, heute `delegate_wave`): nicht
+    /// read-only im engeren Sinn, aber ohne eigene Schreibwirkung — jedes
+    /// Kind bleibt an seine eigene Rechte- und Freigabegrenze gebunden
+    /// (Begründung bei [`AUTO_APPROVED_TOOLS`]).
+    const NON_PAUSING_ORCHESTRATION_OPERATIONS: &[&str] = crate::profile::ORCHESTRATION_TOOLS;
+
     #[test]
     fn auto_approved_tools_are_a_subset_of_the_read_only_surface() {
         // Umkehrung der früheren Deckungsprüfung: nicht „jedes Profil-Werkzeug
         // muss in die Allowlist“, sondern „jeder Allowlist-Eintrag muss
         // nachweislich read-only sein“.
         let mut read_only_surface: Vec<&str> = READ_ONLY_ROOT_OPERATIONS.to_vec();
+        read_only_surface.extend_from_slice(NON_PAUSING_ORCHESTRATION_OPERATIONS);
         for profile in RegistryProfile::ALL.iter().filter(|p| p.is_read_only()) {
             read_only_surface.extend(profile.registered_tool_names());
         }

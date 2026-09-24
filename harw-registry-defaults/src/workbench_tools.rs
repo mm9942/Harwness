@@ -309,10 +309,9 @@ mod tests {
         let names: Vec<String> = provider
             .tools()
             .iter()
-            .map(|spec| match spec {
-                ToolSpec::Function(function) => function.name.as_str().to_owned(),
-                #[allow(unreachable_patterns)]
-                _ => String::new(),
+            .map(|spec| {
+                let ToolSpec::Function(function) = spec;
+                function.name.as_str().to_owned()
             })
             .collect();
         assert_eq!(

@@ -172,7 +172,8 @@ pub(super) fn telegram_menu_plan(
                 (BotCommandScope::AllGroupChats, basic),
                 (BotCommandScope::AllPrivateChats, private),
             ];
-            let pinned: BTreeSet<i64> = binding.security.pinned_identities.iter().copied().collect();
+            let pinned: BTreeSet<i64> =
+                binding.security.pinned_identities.iter().copied().collect();
             for chat_id in pinned {
                 plan.push((BotCommandScope::Chat { chat_id }, full.clone()));
             }
@@ -187,12 +188,18 @@ pub(super) fn telegram_menu_plan(
             for chat_id in groups {
                 plan.push((BotCommandScope::Chat { chat_id }, full.clone()));
                 if admin_groups {
-                    plan.push((BotCommandScope::ChatAdministrators { chat_id }, full.clone()));
+                    plan.push((
+                        BotCommandScope::ChatAdministrators { chat_id },
+                        full.clone(),
+                    ));
                 }
             }
             Ok(plan)
         }
-        "static" => Ok(vec![(BotCommandScope::Default, telegram_handled_commands())]),
+        "static" => Ok(vec![(
+            BotCommandScope::Default,
+            telegram_handled_commands(),
+        )]),
         "none" => Ok(Vec::new()),
         other => Err(format!(
             "unbekannte commands.menu_source {other:?} (erwartet policy_visible, static oder none)"
@@ -330,7 +337,16 @@ impl TelegramCommandHandler {
                 role,
                 task,
             } => {
-                self.submit_work(key, event, &actor, &target, &workspace_alias, &role, &task, now);
+                self.submit_work(
+                    key,
+                    event,
+                    &actor,
+                    &target,
+                    &workspace_alias,
+                    &role,
+                    &task,
+                    now,
+                );
                 return CommandDisposition::Handled;
             }
             TelegramCommand::Task { role, task } => match self.effective_workspace(key) {
@@ -532,9 +548,9 @@ impl TelegramCommandHandler {
     fn workspace(&self, key: &SessionKey, alias: Option<&str>) -> String {
         match alias {
             None => match self.effective_workspace(key) {
-                Ok(Some(alias)) => format!(
-                    "Aktueller Arbeitsbereich: {alias}. Wechseln mit /workspace <alias>."
-                ),
+                Ok(Some(alias)) => {
+                    format!("Aktueller Arbeitsbereich: {alias}. Wechseln mit /workspace <alias>.")
+                }
                 Ok(None) => {
                     "Kein Arbeitsbereich gewählt. Wählen mit /workspace <alias>.".to_owned()
                 }
@@ -702,7 +718,12 @@ pub(super) fn help_text() -> String {
     for spec in HANDLED_COMMANDS {
         text.push_str(spec.usage);
         text.push_str(" – ");
-        text.push_str(spec.description.split(':').next().unwrap_or(spec.description));
+        text.push_str(
+            spec.description
+                .split(':')
+                .next()
+                .unwrap_or(spec.description),
+        );
         text.push('\n');
     }
     text.push_str("\nAndere Nachrichten gehen direkt an den Assistenten.");
@@ -872,9 +893,8 @@ mod tests {
     }
 
     fn toml_binding(extra: &str) -> TestResult<TelegramChannelToml> {
-        let source = format!(
-            "id = \"telegram:ops\"\nbot_token_ref = \"env:HARW_TEST_TOKEN\"\n{extra}"
-        );
+        let source =
+            format!("id = \"telegram:ops\"\nbot_token_ref = \"env:HARW_TEST_TOKEN\"\n{extra}");
         toml::from_str(&source).map_err(ctx("binding parses"))
     }
 
@@ -900,14 +920,24 @@ mod tests {
         );
         assert_eq!(
             names(&BotCommandScope::AllPrivateChats),
-            Some(vec!["help".to_owned(), "start".to_owned(), "pair".to_owned()])
+            Some(vec![
+                "help".to_owned(),
+                "start".to_owned(),
+                "pair".to_owned()
+            ])
         );
         let full: Vec<String> = telegram_handled_commands()
             .into_iter()
             .map(|command| command.command)
             .collect();
-        assert_eq!(names(&BotCommandScope::Chat { chat_id: 42 }), Some(full.clone()));
-        assert_eq!(names(&BotCommandScope::Chat { chat_id: 7 }), Some(full.clone()));
+        assert_eq!(
+            names(&BotCommandScope::Chat { chat_id: 42 }),
+            Some(full.clone())
+        );
+        assert_eq!(
+            names(&BotCommandScope::Chat { chat_id: 7 }),
+            Some(full.clone())
+        );
         assert_eq!(
             names(&BotCommandScope::Chat { chat_id: -1001 }),
             Some(full.clone())
@@ -922,8 +952,7 @@ mod tests {
     }
 
     #[test]
-    fn policy_visible_plan_skips_admin_scope_without_admins_and_rejects_bad_groups()
-    -> TestResult {
+    fn policy_visible_plan_skips_admin_scope_without_admins_and_rejects_bad_groups() -> TestResult {
         let binding = toml_binding("[groups]\nallowed_chats = [\"-5\"]\n")?;
         let plan = telegram_menu_plan(&binding).map_err(TestError::Unexpected)?;
         assert!(
@@ -938,10 +967,9 @@ mod tests {
 
     #[test]
     fn static_none_and_unknown_menu_sources() -> TestResult {
-        let static_plan = telegram_menu_plan(&toml_binding(
-            "[commands]\nmenu_source = \"static\"\n",
-        )?)
-        .map_err(TestError::Unexpected)?;
+        let static_plan =
+            telegram_menu_plan(&toml_binding("[commands]\nmenu_source = \"static\"\n")?)
+                .map_err(TestError::Unexpected)?;
         assert_eq!(
             static_plan,
             vec![(BotCommandScope::Default, telegram_handled_commands())]
@@ -1017,7 +1045,10 @@ mod tests {
     #[test]
     fn unknown_commands_follow_the_configured_fallback() -> TestResult {
         let help = fixture(UnknownCommandFallback::ReplyHelp, None, false)?;
-        assert_eq!(run(&help, "100", "/frobnicate"), CommandDisposition::Handled);
+        assert_eq!(
+            run(&help, "100", "/frobnicate"),
+            CommandDisposition::Handled
+        );
         assert!(last_message(&help)?.contains("/help"));
 
         let pass = fixture(UnknownCommandFallback::PassThrough, None, false)?;
@@ -1028,11 +1059,17 @@ mod tests {
         assert!(pass.outbound.messages().is_empty());
 
         let ignore = fixture(UnknownCommandFallback::Ignore, None, false)?;
-        assert_eq!(run(&ignore, "100", "/frobnicate"), CommandDisposition::Handled);
+        assert_eq!(
+            run(&ignore, "100", "/frobnicate"),
+            CommandDisposition::Handled
+        );
         assert!(ignore.outbound.messages().is_empty());
 
         // Bekannter Befehl mit ungültigen Argumenten: immer Syntaxhinweis.
-        assert_eq!(run(&pass, "100", "/request nur"), CommandDisposition::Handled);
+        assert_eq!(
+            run(&pass, "100", "/request nur"),
+            CommandDisposition::Handled
+        );
         assert!(last_message(&pass)?.contains("/request <workspace>"));
         // `/pair` wird nie beantwortet.
         let before = help.outbound.messages().len();
@@ -1078,8 +1115,7 @@ mod tests {
     }
 
     #[test]
-    fn task_without_workspace_asks_for_selection_and_workspace_switch_is_checked()
-    -> TestResult {
+    fn task_without_workspace_asks_for_selection_and_workspace_switch_is_checked() -> TestResult {
         let fixture = fixture(UnknownCommandFallback::ReplyHelp, None, false)?;
         run(&fixture, "100", "/task implementer fix it");
         assert!(last_message(&fixture)?.contains("Kein Arbeitsbereich"));
