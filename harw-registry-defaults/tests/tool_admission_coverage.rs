@@ -416,3 +416,65 @@ fn orchestrators_admit_exactly_their_composition_tools() -> TestResult {
     }
     Ok(())
 }
+
+/// Runde 3, Welle E: die drei Matrix-Game-Sitze admittieren kein Werkzeug,
+/// und ihr Profil (`NoTools`) bewirbt keines — Inventar und Aufrufrecht
+/// bleiben deckungsgleich leer, wie bei den `security-*-triage`-Rollen.
+#[test]
+fn matrix_roles_admit_and_advertise_no_tools() -> TestResult {
+    let roles = resolved_roles()?;
+    for role in role_names::MATRIX_ROLES {
+        let ir = roles
+            .get(role)
+            .ok_or(TestError::Unexpected(format!("{role} fehlt")))?;
+        let profile =
+            profile_for_role(role).ok_or(TestError::Unexpected(format!("{role} ohne Profil")))?;
+        assert_eq!(profile, RegistryProfile::NoTools, "{role}");
+        assert!(profile.tool_names().is_empty(), "{role}: {profile:?}");
+        assert!(
+            composition_tools_for_role(role).is_empty(),
+            "{role} ist kein Orchestrator"
+        );
+        assert!(
+            ir.tool_surface().admitted().is_empty(),
+            "{role} admittiert {:?}",
+            ir.tool_surface().admitted()
+        );
+        assert_eq!(ir.spawn_contract().max_depth(), Some(0), "{role}");
+    }
+    Ok(())
+}
+
+/// Runde 3, Welle D: `RegistryProfile::WorkspaceEdit` (Telegram mit
+/// Workspace) bewirbt Lese- und Schreibwerkzeuge, aber nie `shell.*`,
+/// `process.*`, `web.*`, `browser.*` oder `lens.ask` — und verlangt genau
+/// `{ReadWorkspace, WriteWorkspace}`. Keine eingebaute Rolle bekommt es.
+#[test]
+fn workspace_edit_profile_never_includes_shell_or_web_tools() {
+    use harw_authority::{Permission, PermissionSet};
+
+    let tools = RegistryProfile::WorkspaceEdit.tool_names();
+    assert!(tools.contains(&"fs.write"), "{tools:?}");
+    assert!(tools.contains(&"fs.read"), "{tools:?}");
+    for tool in &tools {
+        assert!(
+            !tool.starts_with("shell.")
+                && !tool.starts_with("process.")
+                && !tool.starts_with("web.")
+                && !tool.starts_with("browser.")
+                && *tool != "lens.ask",
+            "WorkspaceEdit bewirbt {tool}"
+        );
+    }
+    assert_eq!(
+        RegistryProfile::WorkspaceEdit.required_permissions(),
+        PermissionSet::from_policy([Permission::ReadWorkspace, Permission::WriteWorkspace])
+    );
+    for role in role_names::ALL {
+        assert_ne!(
+            profile_for_role(role),
+            Some(RegistryProfile::WorkspaceEdit),
+            "{role} darf WorkspaceEdit nicht bekommen"
+        );
+    }
+}

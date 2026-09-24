@@ -10,20 +10,29 @@
 //! hartkodierte Rechteliste `{Read, Write, Execute}` — auch dort, wo die
 //! Reduktionstabelle weniger vorsieht. Dieses Modul ist die eine Stelle:
 //! die Rechte kommen ausschließlich aus [`EntryKind::profile`], die
-//! Workspace-Bindung entsteht nach genau einem Muster, und Netzrechte
-//! vergibt keine der drei Funktionen.
+//! Workspace-Bindung entsteht nach genau einem Muster, und Netz-Hosts kommen
+//! ausschließlich aus der Egress-Allowlist der Konfiguration
+//! ([`root_network_scope`]).
 //!
 //! `build_local_spawn_context` selbst ist seit W2d-2 entfernt; sein
 //! Nachfolger ist [`root_sandbox`] hier, aufgerufen aus der
 //! RuntimeAssembly-Montage (siehe [`crate::RuntimeAssembly`]).
 //!
 //! # Netz
-//! Jede hier gebaute [`SandboxSpec`] entsteht über
-//! [`SandboxSpec::from_resolved`] und trägt damit den leeren
-//! [`harw_authority::NetworkScope`]; [`harw_authority::Permission::NetworkAccess`]
-//! ist in keinem Eintrag der Reduktionstabelle enthalten (Vertrag
-//! `docs/remediation/CONTRACTS.md` §runtime-spec: „Netz überall leer bis
-//! Welle W5 (P1.7)").
+//! [`harw_authority::Permission::NetworkAccess`] steht nur in den
+//! Tabellenzeilen von [`EntryKind::Tui`] und [`EntryKind::OneShot`] (Runde 3,
+//! Welle A2: „UIA-Wurzel egress-gebunden“). Die Hosts dazu liefert
+//! [`root_network_scope`] aus der Egress-Allowlist der Konfiguration;
+//! [`root_sandbox_with_network`] bindet sie an die Wurzel-Sandbox. Ist der
+//! Scope leer — keine Allowlist konfiguriert oder ein Einstieg ohne Netzrecht
+//! —, streicht die Montage auch das Recht selbst (fail-closed): eine Sandbox
+//! trägt `NetworkAccess` nie ohne mindestens einen erlaubten Host.
+//! [`root_sandbox`] und [`plan_node_sandbox`] bauen stets ohne Netz.
+//!
+//! Kinder erben das Netz ausschließlich über die Sandbox des Elternteils
+//! (`ensure_child_of`, Schnittmenge); kein Kind bekommt je mehr Hosts als
+//! die Wurzel, und jeder Abruf läuft zusätzlich durch die prozessweite
+//! Egress-Policy (`harw_registry_defaults::install_web_tools`).
 //!
 //! # Fehler
 //! Alle fallierenden Funktionen melden [`RuntimeError::Sandbox`]; die
@@ -33,9 +42,10 @@
 use std::path::{Path, PathBuf};
 
 use harw_authority::{
-    Permission, PermissionRequest, PermissionSet, SandboxSpec, WorkspaceRegistration,
+    NetworkScope, Permission, PermissionRequest, PermissionSet, SandboxSpec, WorkspaceRegistration,
     WorkspaceRegistry,
 };
+use harw_config::ResolvedConfig;
 use harw_plan::PlanNodeKind;
 use harw_types::{PermissionTier, TenantId, WorkspaceId};
 
@@ -137,18 +147,133 @@ fn bind_project(
 ///   gebunden wird.
 ///
 /// # Rückgabe
-/// Eine [`SandboxSpec`] mit den Profilrechten, gebunden an `project_root`
-/// und mit leerem Netz-Scope.
+/// Eine [`SandboxSpec`] mit den Profilrechten ohne
+/// [`Permission::NetworkAccess`], gebunden an `project_root` und mit leerem
+/// Netz-Scope. Netz bindet nur [`root_sandbox_with_network`].
 ///
 /// # Errors
 /// [`RuntimeError::Sandbox`], wenn `project_root` nicht kanonisierbar ist,
 /// kein Verzeichnis ist oder die Workspace-Registrierung scheitert.
 pub fn root_sandbox(entry: EntryKind, project_root: &Path) -> RuntimeResult<SandboxSpec> {
+    root_sandbox_with_network(entry, project_root, NetworkScope::empty())
+}
+
+/// Baut die Wurzel-Sandbox eines Einstiegs samt egress-gebundenem Netz.
+///
+/// # Beschreibung
+/// Wie [`root_sandbox`], bindet aber zusätzlich `network_scope`, sofern das
+/// Einstiegsprofil [`Permission::NetworkAccess`] trägt **und** der Scope
+/// mindestens einen Host nennt. Fehlt eines von beidem, entsteht eine
+/// Sandbox ohne `NetworkAccess` und mit leerem Scope (fail-closed): ein
+/// Einstieg ohne Netzrecht bekommt nie Hosts, und ein Netzrecht ohne Hosts
+/// wird gar nicht erst vergeben.
+///
+/// # Argumente
+/// - `entry` ([`EntryKind`]): der Einstieg, dessen Profil die Rechte nennt.
+/// - `project_root` (`&Path`): Wurzel des Projekts.
+/// - `network_scope` ([`NetworkScope`]): die Hosts aus
+///   [`root_network_scope`].
+///
+/// # Errors
+/// [`RuntimeError::Sandbox`], wenn `project_root` nicht kanonisierbar ist,
+/// kein Verzeichnis ist oder die Workspace-Registrierung scheitert.
+pub fn root_sandbox_with_network(
+    entry: EntryKind,
+    project_root: &Path,
+    network_scope: NetworkScope,
+) -> RuntimeResult<SandboxSpec> {
     let binding = bind_project(tenant_name(entry), project_root)?;
-    Ok(SandboxSpec::from_resolved(
-        binding,
-        entry.profile().permissions,
-    ))
+    let permissions = entry.profile().permissions;
+    if permissions.contains(Permission::NetworkAccess) && !network_scope.is_empty() {
+        return Ok(SandboxSpec::from_resolved_with_network(
+            binding,
+            permissions,
+            network_scope,
+        ));
+    }
+    let without_network = PermissionSet::from_policy(
+        permissions
+            .iter()
+            .filter(|permission| *permission != Permission::NetworkAccess),
+    );
+    Ok(SandboxSpec::from_resolved(binding, without_network))
+}
+
+/// Der Netz-Scope der Wurzel-Sandbox eines Einstiegs.
+///
+/// # Beschreibung
+/// Nur Einstiege, deren Profil [`Permission::NetworkAccess`] trägt (`Tui`,
+/// `OneShot`), bekommen Hosts. Die Hosts sind die Egress-Allowlist der
+/// Konfiguration — dieselben Listen, aus denen
+/// `harw_registry_defaults::install_web_tools` die prozessweite
+/// Egress-Policy baut: `[network].allow_hosts` ∪
+/// `[network].researcher_web_hosts` ∪ `[research].network_allow_hosts`.
+/// Ist diese Vereinigung nicht leer, kommt der Host des konfigurierten
+/// Such-Backends (`[web.search]`) hinzu, damit `web.search` der Helfer
+/// überhaupt ein Ziel hat; die Egress-Policy lässt ihn ohnehin zu.
+///
+/// Leere Allowlist heißt kein Host (fail-closed): der Such-Host allein
+/// öffnet nie Netz.
+///
+/// # Argumente
+/// - `entry` ([`EntryKind`]): der Einstieg.
+/// - `config` (`&ResolvedConfig`): die aufgelöste Konfiguration des Laufs.
+///
+/// # Rückgabe
+/// Ein [`NetworkScope`]; leer für jeden Einstieg ohne Netzrecht und bei leerer
+/// Allowlist.
+#[must_use]
+pub fn root_network_scope(entry: EntryKind, config: &ResolvedConfig) -> NetworkScope {
+    if !entry
+        .profile()
+        .permissions
+        .contains(Permission::NetworkAccess)
+    {
+        return NetworkScope::empty();
+    }
+    let mut hosts: Vec<String> = config
+        .network
+        .allow_hosts
+        .iter()
+        .chain(config.network.researcher_web_hosts.iter())
+        .chain(config.harness.research.network_allow_hosts.iter())
+        .map(|host| host.trim().to_owned())
+        .filter(|host| !host.is_empty())
+        .collect();
+    if hosts.is_empty() {
+        return NetworkScope::empty();
+    }
+    if let Some(search_host) = search_backend_host(config) {
+        hosts.push(search_host);
+    }
+    hosts.sort();
+    hosts.dedup();
+    NetworkScope::from_hosts(hosts)
+}
+
+/// Der Host des konfigurierten Such-Backends (`[web.search]`).
+///
+/// # Beschreibung
+/// Spiegelt die Zuordnung in `harw_registry_defaults::install_web_tools`
+/// (dort privat): `brave`, `tavily` und die Vorgabe DuckDuckGo haben feste
+/// Hosts, `searxng` nimmt den Host aus `endpoint`.
+fn search_backend_host(config: &ResolvedConfig) -> Option<String> {
+    let search = &config.web.search;
+    match search.provider.as_str() {
+        "brave" => Some("api.search.brave.com".to_owned()),
+        "tavily" => Some("api.tavily.com".to_owned()),
+        "searxng" => search.endpoint.as_deref().and_then(url_host),
+        _ => Some("html.duckduckgo.com".to_owned()),
+    }
+}
+
+/// Zieht den Host aus einer URL (ohne Schema, Userinfo, Port und Pfad).
+fn url_host(url: &str) -> Option<String> {
+    let rest = url.split_once("://").map_or(url, |(_, rest)| rest);
+    let authority = rest.split(['/', '?', '#']).next()?;
+    let host = authority.rsplit('@').next()?;
+    let host = host.split(':').next()?;
+    (!host.is_empty()).then(|| host.to_ascii_lowercase())
 }
 
 /// Die Rechte, die ein Aufrufer-Tier höchstens tragen darf.
@@ -318,6 +443,26 @@ mod tests {
         tempfile::TempDir::new().map_err(ctx("temp dir"))
     }
 
+    /// Die Profilrechte ohne [`Permission::NetworkAccess`].
+    fn profile_without_network(entry: EntryKind) -> PermissionSet {
+        PermissionSet::from_policy(
+            entry
+                .profile()
+                .permissions
+                .iter()
+                .filter(|permission| *permission != Permission::NetworkAccess),
+        )
+    }
+
+    /// Eine Konfiguration ohne jede Egress-Allowlist.
+    fn config_without_allowlist() -> ResolvedConfig {
+        let mut config = ResolvedConfig::default();
+        config.network.allow_hosts.clear();
+        config.network.researcher_web_hosts.clear();
+        config.harness.research.network_allow_hosts.clear();
+        config
+    }
+
     #[test]
     fn root_sandbox_takes_its_permissions_from_the_entry_profile() -> TestResult {
         let dir = existing_root()?;
@@ -327,11 +472,100 @@ mod tests {
                 root_sandbox(entry, root).map_err(ctx("temp dir binds as workspace root"))?;
             assert_eq!(
                 sandbox.permissions(),
-                &entry.profile().permissions,
+                &profile_without_network(entry),
                 "{entry:?}"
             );
         }
         Ok(())
+    }
+
+    #[test]
+    fn root_sandbox_with_hosts_grants_network_only_to_networked_entries() -> TestResult {
+        let dir = existing_root()?;
+        let root = dir.path();
+        let scope = NetworkScope::from_hosts(["docs.rs".to_owned()]);
+        for entry in ALL_ENTRIES {
+            let sandbox = root_sandbox_with_network(entry, root, scope.clone())
+                .map_err(ctx("temp dir binds as workspace root"))?;
+            let networked = matches!(entry, EntryKind::Tui | EntryKind::OneShot);
+            assert_eq!(
+                sandbox.permissions().contains(Permission::NetworkAccess),
+                networked,
+                "{entry:?}"
+            );
+            assert_eq!(
+                sandbox.network_scope().allows("docs.rs"),
+                networked,
+                "{entry:?}"
+            );
+            assert!(!sandbox.network_scope().allows("evil.example"), "{entry:?}");
+            if networked {
+                assert_eq!(sandbox.permissions(), &entry.profile().permissions);
+            } else {
+                assert!(sandbox.network_scope().is_empty(), "{entry:?}");
+                assert_eq!(sandbox.permissions(), &profile_without_network(entry));
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn root_sandbox_without_hosts_drops_the_network_permission() -> TestResult {
+        let dir = existing_root()?;
+        let root = dir.path();
+        for entry in [EntryKind::Tui, EntryKind::OneShot] {
+            let sandbox = root_sandbox_with_network(entry, root, NetworkScope::empty())
+                .map_err(ctx("temp dir binds as workspace root"))?;
+            assert!(!sandbox.permissions().contains(Permission::NetworkAccess));
+            assert!(sandbox.network_scope().is_empty());
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn root_network_scope_is_the_egress_allowlist_plus_the_search_host() {
+        let mut config = config_without_allowlist();
+        config.network.allow_hosts = vec!["example.org".to_owned()];
+        config.harness.research.network_allow_hosts = vec!["docs.rs".to_owned()];
+        config.network.researcher_web_hosts = vec!["crates.io".to_owned()];
+        for entry in [EntryKind::Tui, EntryKind::OneShot] {
+            let scope = root_network_scope(entry, &config);
+            for host in ["example.org", "docs.rs", "crates.io", "html.duckduckgo.com"] {
+                assert!(scope.allows(host), "{entry:?} {host}");
+            }
+            assert!(!scope.allows("evil.example"), "{entry:?}");
+        }
+    }
+
+    #[test]
+    fn root_network_scope_without_allowlist_is_empty() {
+        let config = config_without_allowlist();
+        for entry in ALL_ENTRIES {
+            assert!(
+                root_network_scope(entry, &config).is_empty(),
+                "{entry:?}: ohne Allowlist darf kein Host entstehen"
+            );
+        }
+    }
+
+    #[test]
+    fn root_network_scope_is_empty_for_entries_without_network() {
+        let config = ResolvedConfig::default();
+        for entry in ALL_ENTRIES {
+            if matches!(entry, EntryKind::Tui | EntryKind::OneShot) {
+                continue;
+            }
+            assert!(root_network_scope(entry, &config).is_empty(), "{entry:?}");
+        }
+    }
+
+    #[test]
+    fn url_host_strips_scheme_userinfo_port_and_path() {
+        assert_eq!(
+            url_host("https://user@Search.Example:8443/path?q=1"),
+            Some("search.example".to_owned())
+        );
+        assert_eq!(url_host("https://"), None);
     }
 
     #[test]

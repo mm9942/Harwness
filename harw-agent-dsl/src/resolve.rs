@@ -25,6 +25,7 @@ use crate::layers::DefinitionLayer;
 use crate::merge::{MergeOp, apply_merge_op};
 use crate::raw::RawAgentDefinition;
 use crate::resolved::{ResolutionStep, ResolutionTrace, ResolvedAgentDefinition};
+use crate::skills::{SKILLS_CONFIG_KEY, union_skills, validate_skill_list, validate_skill_name};
 
 /// Löst eine geschichtete Definitions-Menge in eine [`ResolvedAgentDefinition`] auf.
 ///
@@ -128,6 +129,7 @@ pub fn resolve_definition(
         config: toml::Table::new(),
         authority: AuthorityCeiling::default(),
         reasoning_effort: None,
+        skills: Vec::new(),
     };
     // 4–5. Ziel-Layer aufsteigend komponieren. Höhere Layer sind Overlays.
     for (layer_index, definition) in target_layers.iter().enumerate() {
@@ -142,6 +144,17 @@ pub fn resolve_definition(
         )?;
     }
 
+    // Skills liegen unter einem reservierten Config-Schlüssel (siehe
+    // `crate::skills`); nur eingetragen, wenn überhaupt eine Ebene Skills
+    // führt — Definitionen ohne Skills behalten eine unveränderte Config.
+    let mut config = ctx.config;
+    if !ctx.skills.is_empty() {
+        config.insert(
+            SKILLS_CONFIG_KEY.to_owned(),
+            toml::Value::Array(ctx.skills.into_iter().map(toml::Value::String).collect()),
+        );
+    }
+
     Ok(ResolvedAgentDefinition {
         id: target_id.clone(),
         version: target.version.clone(),
@@ -152,7 +165,7 @@ pub fn resolve_definition(
         authority: ctx.authority,
         reasoning_effort: ctx.reasoning_effort,
         trace: ResolutionTrace { steps: ctx.steps },
-        config: ctx.config,
+        config,
     })
 }
 
@@ -186,6 +199,10 @@ struct ResolveCtx<'a> {
     /// stets die spezifischste Definition, die tatsächlich eine Aussage
     /// trifft — analog zur Vererbungsregel von `BudgetSpec::effort_cap`.
     reasoning_effort: Option<String>,
+    /// Akkumulierte Skill-Liste: Vereinigung mit Duplikat-Entfernung in
+    /// Anwendungsreihenfolge (Basis → Mixins → eigene Liste → höhere
+    /// Schicht); nur `[patch.skills]` kann geerbte Einträge entfernen.
+    skills: Vec<String>,
 }
 
 /// Wendet die "spezifischere Definition überschreibt"-Regel für
@@ -271,6 +288,8 @@ fn apply_mixins(
         }
         merge_tables(&mut ctx.config, &mixin.tables);
         apply_reasoning_effort_override(ctx, mixin);
+        validate_skill_list(&mixin.id, &mixin.skills, "skills")?;
+        union_skills(&mut ctx.skills, &mixin.skills);
         ctx.steps.push(ResolutionStep {
             source: mixin_ref.id.to_string(),
             kind: "mixin".to_owned(),
@@ -304,6 +323,12 @@ fn apply_definition_content(
         ctx.authority = definition_authority;
     }
 
+    // `[patch.skills]` wirkt auf die geerbte Liste, bevor die eigene Liste
+    // vereinigt wird — der einzige Weg, geerbte Skills zu entfernen.
+    if let Some(skills_patch) = definition.patch.get(SKILLS_CONFIG_KEY) {
+        apply_skills_patch(&mut ctx.skills, skills_patch, &definition.id)?;
+    }
+
     let authority_before_patch = ctx.authority.clone();
     apply_patches(
         &mut ctx.config,
@@ -323,6 +348,9 @@ fn apply_definition_content(
     // ihrer Ebene die spezifischste und überschreibt, was Basis/Mixins zuvor
     // gesetzt haben (siehe [`apply_reasoning_effort_override`]).
     apply_reasoning_effort_override(ctx, definition);
+
+    validate_skill_list(&definition.id, &definition.skills, "skills")?;
+    union_skills(&mut ctx.skills, &definition.skills);
 
     ctx.steps.push(ResolutionStep {
         source: definition.id.to_string(),
@@ -437,6 +465,10 @@ fn apply_patches(
     parent_authority: &AuthorityCeiling,
 ) -> DslResult<()> {
     for (field, patch_value) in patch {
+        if field == SKILLS_CONFIG_KEY {
+            // Eigener Pfad: `apply_skills_patch` (typisierte Liste statt Config).
+            continue;
+        }
         if field == "authority" {
             // Authority-Patch: nur Intersect erlaubt
             let patch_table = match patch_value.as_table() {
@@ -498,6 +530,55 @@ fn apply_patches(
             }
         }
     }
+    Ok(())
+}
+
+/// Wendet eine `[patch.skills]`-Operation auf die akkumulierte Skill-Liste an.
+///
+/// Das Ergebnis wird streng geprüft (nur Strings, gültige Namen) und danach
+/// dedupliziert — `append`/`prepend` eines bereits geerbten Namens ist also
+/// kein Fehler, sondern ein No-op an der ersten Position.
+fn apply_skills_patch(
+    skills: &mut Vec<String>,
+    patch_value: &toml::Value,
+    of: &DefinitionId,
+) -> DslResult<()> {
+    let Some(patch_table) = patch_value.as_table() else {
+        return Ok(());
+    };
+    let mut current = toml::Value::Array(skills.drain(..).map(toml::Value::String).collect());
+    try_apply_table_op(&mut current, patch_table)?;
+    let Some(values) = current.as_array() else {
+        return Err(DslError::InvalidSkill {
+            of: Box::new(of.clone()),
+            skill: current.to_string(),
+            reason: "'patch.skills' muss eine Liste von Strings ergeben",
+            location: DiagLocation::field("patch.skills"),
+        });
+    };
+    let mut patched = Vec::with_capacity(values.len());
+    for (index, entry) in values.iter().enumerate() {
+        let Some(name) = entry.as_str() else {
+            return Err(DslError::InvalidSkill {
+                of: Box::new(of.clone()),
+                skill: entry.to_string(),
+                reason: "Skill-Eintrag ist kein String",
+                location: DiagLocation::field(format!("patch.skills[{index}]")),
+            });
+        };
+        patched.push(name.to_owned());
+    }
+    for (index, name) in patched.iter().enumerate() {
+        if let Err(reason) = validate_skill_name(name) {
+            return Err(DslError::InvalidSkill {
+                of: Box::new(of.clone()),
+                skill: name.clone(),
+                reason,
+                location: DiagLocation::field(format!("patch.skills[{index}]")),
+            });
+        }
+    }
+    union_skills(skills, &patched);
     Ok(())
 }
 
@@ -1570,6 +1651,199 @@ specialization = "project"
         ];
         let resolved = resolve_definition(&id, &layers, now())?;
         assert_eq!(resolved.reasoning_effort.as_deref(), Some("low"));
+        Ok(())
+    }
+
+    // -----------------------------------------------------------------
+    // skills: erstklassiges Feld, Vereinigung über extends/Mixins/Schichten
+    // -----------------------------------------------------------------
+
+    fn skills_base() -> TestResult<RawAgentDefinition> {
+        Ok(parse_toml(
+            r#"
+schema = "harwness.agent/v1"
+id = "harwness.agent.skills-base@1"
+version = "1.0.0"
+role = "worker"
+specialization = "base"
+skills = ["review", "rust"]
+"#,
+        )?)
+    }
+
+    #[test]
+    fn test_skills_absent_everywhere_leaves_config_untouched() -> TestResult {
+        let raw = parse_toml(MINIMAL_WORKER)?;
+        let id = DefinitionId::parse("harwness.agent.worker@1")?;
+        let resolved = resolve_definition(&id, &[(DefinitionLayer::BuiltIn, raw)], now())?;
+        assert!(resolved.skills().is_empty());
+        assert!(!resolved.config.contains_key(SKILLS_CONFIG_KEY));
+        Ok(())
+    }
+
+    #[test]
+    fn test_skills_union_over_extends_and_mixin_dedupes() -> TestResult {
+        let mixin = parse_toml(
+            r#"
+schema = "harwness.mixin/v1"
+id = "harwness.mixin.skills-mixin@1"
+version = "1.0.0"
+role = "worker"
+specialization = "mixin"
+skills = ["docs", "review"]
+"#,
+        )?;
+        let target = parse_toml(
+            r#"
+schema = "harwness.agent/v1"
+id = "harwness.agent.skills-child@1"
+version = "1.0.0"
+role = "worker"
+specialization = "child"
+extends = { id = "harwness.agent.skills-base@1" }
+mixins = [{ id = "harwness.mixin.skills-mixin@1" }]
+skills = ["rust", "testing"]
+"#,
+        )?;
+        let id = DefinitionId::parse("harwness.agent.skills-child@1")?;
+        let layers = vec![
+            (DefinitionLayer::BuiltIn, skills_base()?),
+            (DefinitionLayer::BuiltIn, mixin),
+            (DefinitionLayer::BuiltIn, target),
+        ];
+        let resolved = resolve_definition(&id, &layers, now())?;
+        assert_eq!(resolved.skills(), ["review", "rust", "docs", "testing"]);
+        Ok(())
+    }
+
+    #[test]
+    fn test_skills_higher_layer_adds_without_dropping_lower() -> TestResult {
+        let builtin = parse_toml(
+            r#"
+schema = "harwness.agent/v1"
+id = "harwness.agent.skills-layered@1"
+version = "1.0.0"
+role = "worker"
+specialization = "builtin"
+skills = ["review"]
+"#,
+        )?;
+        let project = parse_toml(
+            r#"
+schema = "harwness.agent/v1"
+id = "harwness.agent.skills-layered@1"
+version = "1.1.0"
+role = "worker"
+specialization = "project"
+skills = ["docs"]
+"#,
+        )?;
+        let id = DefinitionId::parse("harwness.agent.skills-layered@1")?;
+        let layers = vec![
+            (DefinitionLayer::BuiltIn, builtin),
+            (DefinitionLayer::Project, project),
+        ];
+        let resolved = resolve_definition(&id, &layers, now())?;
+        assert_eq!(resolved.skills(), ["review", "docs"]);
+        Ok(())
+    }
+
+    #[test]
+    fn test_skills_patch_remove_drops_inherited_skill() -> TestResult {
+        let target = parse_toml(
+            r#"
+schema = "harwness.agent/v1"
+id = "harwness.agent.skills-trim@1"
+version = "1.0.0"
+role = "worker"
+specialization = "trim"
+extends = { id = "harwness.agent.skills-base@1" }
+skills = ["docs"]
+
+[patch.skills]
+remove = ["rust"]
+"#,
+        )?;
+        let id = DefinitionId::parse("harwness.agent.skills-trim@1")?;
+        let layers = vec![
+            (DefinitionLayer::BuiltIn, skills_base()?),
+            (DefinitionLayer::BuiltIn, target),
+        ];
+        let resolved = resolve_definition(&id, &layers, now())?;
+        assert_eq!(resolved.skills(), ["review", "docs"]);
+        Ok(())
+    }
+
+    #[test]
+    fn test_skills_invalid_name_rejected_with_field_path() -> TestResult {
+        let raw = parse_toml(
+            r#"
+schema = "harwness.agent/v1"
+id = "harwness.agent.skills-bad@1"
+version = "1.0.0"
+role = "worker"
+specialization = "bad"
+skills = ["ok", "Not_Ok"]
+"#,
+        )?;
+        let id = DefinitionId::parse("harwness.agent.skills-bad@1")?;
+        let Err(error) = resolve_definition(&id, &[(DefinitionLayer::BuiltIn, raw)], now()) else {
+            return Err(TestError::Unexpected("Err erwartet".into()));
+        };
+        assert!(matches!(error, DslError::InvalidSkill { .. }), "{error}");
+        assert!(error.to_string().contains("skills[1]"), "{error}");
+        Ok(())
+    }
+
+    #[test]
+    fn test_skills_duplicate_in_one_definition_rejected() -> TestResult {
+        let raw = parse_toml(
+            r#"
+schema = "harwness.agent/v1"
+id = "harwness.agent.skills-dup@1"
+version = "1.0.0"
+role = "worker"
+specialization = "dup"
+skills = ["review", "review"]
+"#,
+        )?;
+        let id = DefinitionId::parse("harwness.agent.skills-dup@1")?;
+        let result = resolve_definition(&id, &[(DefinitionLayer::BuiltIn, raw)], now());
+        assert!(matches!(result, Err(DslError::InvalidSkill { .. })));
+        Ok(())
+    }
+
+    #[test]
+    fn test_skills_invalid_name_in_mixin_rejected() -> TestResult {
+        let mixin_src = format!(
+            r#"
+schema = "harwness.mixin/v1"
+id = "harwness.mixin.skills-bad-mixin@1"
+version = "1.0.0"
+role = "worker"
+specialization = "mixin"
+skills = ["{}"]
+"#,
+            "x".repeat(65)
+        );
+        let mixin = parse_toml(&mixin_src)?;
+        let target = parse_toml(
+            r#"
+schema = "harwness.agent/v1"
+id = "harwness.agent.skills-mixin-user@1"
+version = "1.0.0"
+role = "worker"
+specialization = "target"
+mixins = [{ id = "harwness.mixin.skills-bad-mixin@1" }]
+"#,
+        )?;
+        let id = DefinitionId::parse("harwness.agent.skills-mixin-user@1")?;
+        let layers = vec![
+            (DefinitionLayer::BuiltIn, mixin),
+            (DefinitionLayer::BuiltIn, target),
+        ];
+        let result = resolve_definition(&id, &layers, now());
+        assert!(matches!(result, Err(DslError::InvalidSkill { .. })));
         Ok(())
     }
 }

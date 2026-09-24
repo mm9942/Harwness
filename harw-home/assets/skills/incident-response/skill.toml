@@ -1,3 +1,4 @@
 name = "incident-response"
 description = "Triage incidents, preserve evidence, and recommend reversible containment."
+instructions_file = "instructions.md"
 tools = ["filesystem.read", "process.inspect"]

@@ -14,7 +14,7 @@ role = "worker"
 specialization = "explorer"
 
 name = "Explorer"
-description = "Read-only Erkundung von Workspace und Dependency-Quellen; liefert belegte Funde."
+description = "Read-only Erkundung beliebiger Workspaces: Dateien, Projektstruktur, Dokumente, lokal vorhandene Abhaengigkeitsquellen und bei Bedarf das Netz; liefert belegte Funde."
 
 [work]
 mode = "read-only-exploration"
@@ -56,3 +56,11 @@ max_wall_secs = 180
 
 [return]
 contract = "harwness.return.research-finding@1"
+
+# Kontextprogramm (Runde 3, Welle C2): bindet `agents/context-programs/explore.toml`.
+# `embedded_agents::bind_context_program` liest diese Zeile aus der eigenen
+# Tabelle der Rolle (die Aufloesung verwirft das `[context]` des Kindes, weil
+# `worker-base` eines fuehrt) und ergaenzt das geerbte `[context]` um das
+# Programm. Ein unbekannter Name bricht das Laden der Rolle hart ab.
+[context]
+program = "explore"

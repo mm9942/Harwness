@@ -91,11 +91,11 @@
 //! und stehen ebenfalls in der Grundausstattung, nicht hinter dem
 //! `[tools.plan]`-Gate.
 //!
-//! **Planungsfläche** ([`register_plan_tools`], 6 Ops, hinter dem
-//! `[tools.plan] enabled`-Gate): `plan`, `goal`, `explore`, `research_deps`,
-//! `research_web`, `analyze`. Sie bilden zusammen den Controller-Kreis —
-//! Recherche erzeugt Findings, `plan reconcile` macht Evidenz daraus, `goal
-//! check` wertet sie gegen die Kriterien aus.
+//! **Planungsfläche** ([`register_plan_tools`], 7 Ops, hinter dem
+//! `[tools.plan] enabled`-Gate): `plan`, `goal`, `explore`, `research`,
+//! `research_deps`, `research_web`, `analyze`. Sie bilden zusammen den
+//! Controller-Kreis — Recherche erzeugt Findings, `plan reconcile` macht
+//! Evidenz daraus, `goal check` wertet sie gegen die Kriterien aus.
 //!
 //! # Web-Fläche (`Surface::Web`) — nach welcher Regel entschieden wurde
 //! `Surface::Web` existiert seit UI-00 (samt `WebAdapter`/`WebRouteTable` in
@@ -408,14 +408,15 @@ pub fn register_all(registry: &mut OperationRegistry) {
 }
 
 /// Anzahl der Operationen, die [`register_plan_tools`] bei aktivem Gate hinzufügt.
-pub const PLAN_TOOL_COUNT: usize = 6;
+pub const PLAN_TOOL_COUNT: usize = 7;
 
 /// Registriert die Planungs-, Explorations- und Recherche-Operationen — gegated.
 ///
 /// # Beschreibung
-/// Fügt der Registry sechs Operationen hinzu: `plan`, `goal`, `explore`,
-/// `research_deps`, `research_web` und `analyze`. Ist `config.enabled` `false`,
-/// wird **nichts** registriert und die Funktion ist ein No-op.
+/// Fügt der Registry sieben Operationen hinzu: `plan`, `goal`, `explore`,
+/// `research`, `research_deps`, `research_web` und `analyze`. Ist
+/// `config.enabled` `false`, wird **nichts** registriert und die Funktion ist
+/// ein No-op.
 ///
 /// Das Gate wirkt damit *vor* dem Modell: eine nicht registrierte Operation
 /// erscheint gar nicht erst in der Werkzeugliste eines `ModelRequest`. Das ist
@@ -424,8 +425,8 @@ pub const PLAN_TOOL_COUNT: usize = 6;
 /// `enabled` **zusätzlich** in ihrem Rumpf (fail-closed, defense in depth), für
 /// den Fall, dass eine Laufzeit sie an diesem Gate vorbei registriert.
 ///
-/// Die sechs Operationen stehen bewusst zusammen: `explore` und `research_*`
-/// erzeugen die Findings, die `plan reconcile` zu Evidenz macht, und `analyze`
+/// Die sieben Operationen stehen bewusst zusammen: `explore`, `research` und
+/// `research_*` erzeugen die Findings, die `plan reconcile` zu Evidenz macht, und `analyze`
 /// schreibt seine Ergebnisse in denselben Plan. Ohne Plan-Store wäre die
 /// Recherche folgenlos — sie zusammen zu schalten hält den Kreis geschlossen.
 ///
@@ -460,6 +461,7 @@ pub const PLAN_TOOL_COUNT: usize = 6;
 /// assert_eq!(added, harw_ops::PLAN_TOOL_COUNT);
 /// assert!(registry.find_by_command("/plan").is_some());
 /// assert!(registry.find_by_command("/goal").is_some());
+/// assert!(registry.find_by_command("/research").is_some());
 /// assert!(registry.find_by_command("/analyze").is_some());
 /// ```
 pub fn register_plan_tools(registry: &mut OperationRegistry, config: &PlanToolConfig) -> usize {
@@ -470,6 +472,7 @@ pub fn register_plan_tools(registry: &mut OperationRegistry, config: &PlanToolCo
         Arc::new(plan::PlanOperation),
         Arc::new(goal::GoalOperation),
         Arc::new(explore::ExploreOperation),
+        Arc::new(research::ResearchOperation),
         Arc::new(research::ResearchDepsOperation),
         Arc::new(research::ResearchWebOperation),
         Arc::new(analyze::AnalyzeOperation),
@@ -527,6 +530,12 @@ mod tests {
         (
             "explore",
             "/api/explore",
+            WebMethod::Get,
+            ApprovalPolicy::None,
+        ),
+        (
+            "research",
+            "/api/research",
             WebMethod::Get,
             ApprovalPolicy::None,
         ),
@@ -649,6 +658,7 @@ mod tests {
             ("attach", PermissionTier::Operator),
             ("permissions", PermissionTier::Operator),
             ("explore", PermissionTier::Operator),
+            ("research", PermissionTier::Operator),
             ("research_deps", PermissionTier::Operator),
             ("research_web", PermissionTier::Operator),
             ("analyze", PermissionTier::Operator),
@@ -736,7 +746,7 @@ mod tests {
 
         assert_eq!(added, 0, "geschlossenes Gate darf nichts registrieren");
         assert_eq!(reg.len(), before, "Registry darf nicht wachsen");
-        for path in ["/plan", "/goal", "/explore", "/analyze"] {
+        for path in ["/plan", "/goal", "/explore", "/research", "/analyze"] {
             assert!(
                 reg.find_by_command(path).is_none(),
                 "{path} darf bei geschlossenem Gate nicht auffindbar sein",
@@ -758,6 +768,7 @@ mod tests {
             "/plan",
             "/goal",
             "/explore",
+            "/research",
             "/research-deps",
             "/research-web",
             "/analyze",
@@ -935,6 +946,7 @@ mod tests {
             "plan",
             "goal",
             "explore",
+            "research",
             "research_deps",
             "research_web",
             "analyze",

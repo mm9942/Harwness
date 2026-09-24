@@ -1747,6 +1747,9 @@ fn telegram_chat_state_root(channel_state: &Path, binding_id: &str) -> PathBuf {
 
 /// Über Transport-Neustarts hinweg stabile Dienste einer Telegram-Bindung.
 struct TelegramBindingServices {
+    /// Aufgelöster Root-Space; Grundlage der Runtime-Montage je Turn im
+    /// Sitzungs-Dispatcher (Chats mit Arbeitsbereich).
+    home: PathBuf,
     /// Autoritative Workspace-Auflösung aus `binding.workspaces`.
     workspaces: Arc<harw_authority::WorkspaceRegistry>,
     /// Chat-Zustand; geteilt von Befehlsverarbeitung und Sitzungs-Dispatcher.
@@ -1809,6 +1812,7 @@ fn telegram_binding_services(
         &binding.id,
     )));
     Ok(TelegramBindingServices {
+        home: home.to_path_buf(),
         workspaces: Arc::new(workspaces),
         chat_state,
         admin_sender_ids,
@@ -1953,6 +1957,9 @@ async fn start_telegram_binding(
         attachments,
         max_parallel_sessions: TELEGRAM_MAX_PARALLEL_SESSIONS,
         approval_ttl: TELEGRAM_APPROVAL_TTL,
+        home: services.home.clone(),
+        workspaces: Arc::clone(&services.workspaces),
+        default_workspace_alias: services.default_workspace_alias.clone(),
     });
     let turn_approvals = sessions.turn_approvals();
     let consumer = Arc::new(GatewayTelegramConsumer {

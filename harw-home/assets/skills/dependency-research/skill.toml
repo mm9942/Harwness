@@ -1,3 +1,4 @@
 name = "dependency-research"
 description = "Research versions, compatibility, licensing, provenance, and authoritative documentation."
+instructions_file = "instructions.md"
 tools = ["filesystem.read", "web.search", "web.fetch"]

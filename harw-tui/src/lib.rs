@@ -39,6 +39,7 @@ pub(crate) mod keybindings;
 pub(crate) mod knowledge_view;
 pub(crate) mod local_commands;
 pub(crate) mod markdown;
+pub(crate) mod matrix_view;
 pub(crate) mod mention;
 pub(crate) mod mention_popup;
 pub(crate) mod mode_picker;

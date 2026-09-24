@@ -14,6 +14,15 @@
 //! ([`AgentSession::hydrate_from_store`]) – so setzt jede Nachricht das
 //! bisherige Gespräch fort, auch über Neustarts hinweg.
 //!
+//! # Werkzeuge
+//! Hat der Chat einen Arbeitsbereich (`/workspace`, sonst der
+//! Bindungs-Default), baut jeder Turn eine eigene `RuntimeAssembly`
+//! (`EntryKind::GatewayTelegram`, `cwd` und Sandbox = kanonische
+//! Workspace-Wurzel aus der `WorkspaceRegistry`, Modell per
+//! `ModelSource::Override`); Freigaben beantwortet nur
+//! `ApprovalActor::ChannelPeer` des Absenders. Ohne (auflösbaren)
+//! Arbeitsbereich bleibt der Turn werkzeuglos.
+//!
 //! # Streaming
 //! Während eines Turns werden `TurnEvent::AssistantDelta`-Ereignisse
 //! gesammelt und höchstens alle [`STREAM_UPDATE_INTERVAL`] (1,5 s) als
@@ -42,27 +51,33 @@
 
 use std::collections::{HashMap, VecDeque};
 use std::future::Future;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError, Weak, mpsc as std_mpsc};
 use std::time::{Duration, Instant};
 
+use harw_authority::WorkspaceRegistry;
 use harw_channel::{ApprovalAction, ApprovalPrompt, InboundEvent, OutboundContent, SessionKey};
 use harw_channel_telegram::ChatStateStore;
 use harw_channel_telegram_transport::TelegramRenderer;
 use harw_core::{
-    AgentSession, ApprovalResolution, CoreResult, ModelProvider, TurnInput, TurnOutcome,
-    resume_after_approval, run_turn,
+    AgentSession, ApprovalResolution, CoreResult, ModelProvider, StateStore, TurnInput,
+    TurnOutcome, resume_after_approval, run_turn,
 };
 use harw_extension_api::empty_extension_registry;
-use harw_protocol::TurnEvent;
-use harw_types::{AgentRole, ApprovalActor, PeerId};
+use harw_protocol::{SessionEvent, TurnEvent};
+use harw_registry_defaults::profile::IdentityOverrides;
+use harw_runtime::{
+    EntryKind, ModelSource, RuntimeAssembly, RuntimeNarrowing, RuntimeSpec, RuntimeStores,
+};
+use harw_types::{AgentRole, ApprovalActor, PeerId, Principal, SessionId, TenantId, WorkspaceId};
 use jiff::{SignedDuration, Timestamp};
 use tokio::runtime::Runtime;
-use tokio::sync::mpsc::{UnboundedReceiver, unbounded_channel};
+use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
 
 use super::telegram_attachments::{IngestReport, TelegramAttachmentIntake};
 use super::telegram_callbacks::TurnApprovalSink;
+use crate::runtime_gateway::{GatewayEntry, channel_principal};
 
 /// Mindestabstand zwischen zwei Streaming-Aktualisierungen.
 pub(super) const STREAM_UPDATE_INTERVAL: Duration = Duration::from_millis(1500);
@@ -99,6 +114,14 @@ pub(super) struct TelegramSessionConfig {
     /// Obergrenze der Wartezeit auf eine Freigabe (zusätzlich zur
     /// `timeout_at` der Kern-Session; die frühere gilt).
     pub approval_ttl: SignedDuration,
+    /// Aufgelöster Root-Space (`~/.harw` bzw. `HARW_HOME`) für die
+    /// Runtime-Montage je Turn.
+    pub home: PathBuf,
+    /// Autoritative Workspace-Auflösung der Bindung (`binding.workspaces`).
+    pub workspaces: Arc<WorkspaceRegistry>,
+    /// Alias des Workspaces mit `default = true`, falls vorhanden; gilt, wenn
+    /// der Chat keinen eigenen gewählt hat (wie `/task` und `/status`).
+    pub default_workspace_alias: Option<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -451,6 +474,116 @@ fn last_assistant_text(session: &AgentSession) -> Option<String> {
 }
 
 // ---------------------------------------------------------------------------
+// Werkzeuge je Turn: Workspace-Wahl und Runtime-Montage
+// ---------------------------------------------------------------------------
+
+/// Werkzeugwahl eines Turns, abgeleitet aus dem Chat-Zustand.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum TurnWorkspace {
+    /// Kein Arbeitsbereich gewählt: der Turn bleibt werkzeuglos.
+    None,
+    /// Der gewählte Alias löst für den Mandanten nicht (mehr) auf: der Turn
+    /// bleibt werkzeuglos (fail-closed), der Alias wird geloggt.
+    Unresolved(String),
+    /// Kanonische Wurzel des gewählten Arbeitsbereichs; der Turn bekommt eine
+    /// an genau diese Wurzel gebundene Runtime-Montage.
+    Bound(PathBuf),
+}
+
+/// Entscheidet, ob und an welchen Arbeitsbereich ein Turn gebunden wird.
+///
+/// # Description
+/// Chat-Wahl vor Bindungs-Default (wie `/task` und `/status`); leere Aliase
+/// zählen als „keiner“. Die Wurzel kommt ausschließlich aus der
+/// autoritativen [`WorkspaceRegistry`] der Bindung für `tenant` — nie aus
+/// Chat- oder Modelltext.
+fn select_turn_workspace(
+    chat_alias: Option<&str>,
+    default_alias: Option<&str>,
+    tenant: &TenantId,
+    workspaces: &WorkspaceRegistry,
+) -> TurnWorkspace {
+    let alias = chat_alias
+        .map(str::trim)
+        .filter(|alias| !alias.is_empty())
+        .or_else(|| {
+            default_alias
+                .map(str::trim)
+                .filter(|alias| !alias.is_empty())
+        });
+    let Some(alias) = alias else {
+        return TurnWorkspace::None;
+    };
+    match workspaces.resolve(tenant, &WorkspaceId::from_str(alias)) {
+        Ok(binding) => TurnWorkspace::Bound(binding.canonical_root().to_path_buf()),
+        Err(_) => TurnWorkspace::Unresolved(alias.to_owned()),
+    }
+}
+
+/// Principal eines Turns: der Kanal-Principal der Bindung, verengt auf den
+/// Absender der auslösenden Nachricht (`telegram:<bindung>:<absender>`).
+fn telegram_turn_principal(key: &SessionKey, approver: &PeerId) -> Principal {
+    let binding = super::telegram_principal_peer(key.channel.as_str());
+    channel_principal(
+        GatewayEntry::Telegram,
+        &format!("{binding}:{}", approver.as_str()),
+    )
+}
+
+/// Spec der Runtime-Montage eines Turns mit Arbeitsbereich.
+fn telegram_turn_spec(
+    home: &Path,
+    workspace_root: &Path,
+    key: &SessionKey,
+    approver: &PeerId,
+) -> RuntimeSpec {
+    crate::runtime_entry::runtime_spec(
+        EntryKind::GatewayTelegram,
+        home,
+        workspace_root,
+        telegram_turn_principal(key, approver),
+    )
+}
+
+/// Bindet die Wurzel-Sandbox an genau den Arbeitsbereich statt an einen
+/// darüber erkannten Projekt-Root (Muster der Plan-Knoten, R0-F).
+/// Werkzeugsatz und Rechte bleiben die des Einstiegsprofils — die
+/// Verengung kann sie nie erweitern.
+fn telegram_turn_narrowing(workspace_root: &Path) -> RuntimeNarrowing {
+    let profile = EntryKind::GatewayTelegram.profile();
+    RuntimeNarrowing {
+        registry_profile: profile.registry_profile,
+        identity: IdentityOverrides::default(),
+        permissions: profile.permissions,
+        workspace_root: Some(workspace_root.to_path_buf()),
+    }
+}
+
+/// Einziger Akteur, der Freigaben dieses Turns beantworten darf.
+fn channel_approval_actor(key: &SessionKey, approver: &PeerId) -> ApprovalActor {
+    ApprovalActor::ChannelPeer {
+        channel: key.channel.clone(),
+        peer: approver.clone(),
+    }
+}
+
+/// Setzt den Freigabe-Akteur der Wurzelsitzung.
+///
+/// `Principal::approval_actor` liefert für Telegram bewusst `None`: Kanäle
+/// mit Peer-Bindung tragen ihren Akteur selbst. Ohne ihn endete jede
+/// Rückfrage mit `MissingApprovalActor`, und die Wiederaufnahme über
+/// [`TurnApprovalSink::resolve`] (`ChannelPeer`) passte nicht.
+fn with_channel_approval_actor(session: AgentSession, actor: ApprovalActor) -> AgentSession {
+    match session.spawn_context().cloned() {
+        Some(mut context) => {
+            context.approval_actor = Some(actor);
+            session.with_spawn_context(context)
+        }
+        None => session,
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Engine
 // ---------------------------------------------------------------------------
 
@@ -549,18 +682,65 @@ impl Engine {
                 return;
             }
         };
+        let workspace = match self.config.chat_state.get(key) {
+            Ok(state) => select_turn_workspace(
+                state.workspace_alias.as_deref(),
+                self.config.default_workspace_alias.as_deref(),
+                &key.tenant,
+                self.config.workspaces.as_ref(),
+            ),
+            Err(error) => {
+                tracing::error!(channel = %key.channel, peer = %key.peer, error = %error, "Telegram chat state could not be read");
+                self.notify(
+                    runtime,
+                    target,
+                    "Die Sitzung konnte nicht geladen werden.".to_owned(),
+                );
+                return;
+            }
+        };
         let (event_tx, _event_rx) = unbounded_channel();
         let (turn_tx, mut turn_rx) = unbounded_channel();
-        let mut session = AgentSession::new_with_id(
-            session_id,
-            AgentRole::Assistant,
-            None,
-            empty_extension_registry(),
-            event_tx,
-        )
-        .with_turn_event_sink(turn_tx);
-        let store = super::build_telegram_state_store(&self.config.transcript_root);
-        if let Err(error) = runtime.block_on(session.hydrate_from_store(&store)) {
+        let store: Arc<dyn StateStore> = Arc::new(super::build_telegram_state_store(
+            &self.config.transcript_root,
+        ));
+        let mut session = match workspace {
+            TurnWorkspace::Bound(root) => match self.workspace_session(
+                key,
+                &approver,
+                session_id,
+                &root,
+                Arc::clone(&store),
+                event_tx,
+                turn_tx,
+            ) {
+                Ok(session) => session,
+                Err(error) => {
+                    tracing::error!(channel = %key.channel, peer = %key.peer, error = %error, "Telegram workspace runtime assembly failed");
+                    self.notify(
+                        runtime,
+                        target,
+                        "Die Werkzeuge für den Arbeitsbereich konnten nicht bereitgestellt werden."
+                            .to_owned(),
+                    );
+                    return;
+                }
+            },
+            unbound => {
+                if let TurnWorkspace::Unresolved(alias) = &unbound {
+                    tracing::warn!(channel = %key.channel, peer = %key.peer, alias = %alias, "Telegram chat workspace does not resolve; turn runs without tools");
+                }
+                AgentSession::new_with_id(
+                    session_id,
+                    AgentRole::Assistant,
+                    None,
+                    empty_extension_registry(),
+                    event_tx,
+                )
+                .with_turn_event_sink(turn_tx)
+            }
+        };
+        if let Err(error) = runtime.block_on(session.hydrate_from_store(store.as_ref())) {
             tracing::error!(channel = %key.channel, peer = %key.peer, error = %error, "Telegram session hydration failed");
             self.notify(
                 runtime,
@@ -571,7 +751,12 @@ impl Engine {
         }
         let mut stream = self.new_stream();
         let outcome = runtime.block_on(self.pump(
-            run_turn(&mut session, self.config.provider.as_ref(), &store, input),
+            run_turn(
+                &mut session,
+                self.config.provider.as_ref(),
+                store.as_ref(),
+                input,
+            ),
             &mut turn_rx,
             &mut stream,
             target,
@@ -579,6 +764,57 @@ impl Engine {
         self.conclude(
             runtime, key, target, approver, session, turn_rx, stream, outcome,
         );
+    }
+
+    /// Baut die Wurzelsitzung eines Turns mit Arbeitsbereich über eine
+    /// eigene [`RuntimeAssembly`] (Muster `runtime_jobs::job_assembly`).
+    ///
+    /// # Description
+    /// Spec: [`telegram_turn_spec`] (`EntryKind::GatewayTelegram`, `cwd` =
+    /// kanonische Workspace-Wurzel, Principal des Absenders). Modell: der
+    /// Binding-Provider per [`ModelSource::Override`]. Speicher: der
+    /// Telegram-Transkript-Store, keine Jobs, keine durablen Freigaben.
+    /// Sandbox: per [`telegram_turn_narrowing`] an genau die Wurzel gebunden.
+    /// Kein Responder: `AskResolution::Interactive` pausiert den Turn
+    /// (`TurnOutcome::AwaitingApproval`), der bestehende Park-/Resume-Pfad
+    /// beantwortet die Rückfrage. Der Freigabe-Akteur wird auf
+    /// `ChannelPeer{channel, approver}` gesetzt. Die Montage selbst ist ein
+    /// Local dieser Funktion und wird vor jedem `await` verworfen; die
+    /// Sitzung besitzt ihre Registry.
+    ///
+    /// # Errors
+    /// Der `Display`-Text des Montage- oder Sitzungsfehlers — nur für das
+    /// lokale Log, nie für den Chat (er kann Pfade enthalten).
+    #[allow(clippy::too_many_arguments)]
+    fn workspace_session(
+        &self,
+        key: &SessionKey,
+        approver: &PeerId,
+        session_id: SessionId,
+        workspace_root: &Path,
+        store: Arc<dyn StateStore>,
+        event_tx: UnboundedSender<SessionEvent>,
+        turn_tx: UnboundedSender<TurnEvent>,
+    ) -> Result<AgentSession, String> {
+        let spec = telegram_turn_spec(&self.config.home, workspace_root, key, approver);
+        let assembly = RuntimeAssembly::builder(spec)
+            .model(ModelSource::Override(Arc::clone(&self.config.provider)))
+            .stores(RuntimeStores {
+                state_store: store,
+                job_store: None,
+                approval_store: None,
+            })
+            .root_session_id(session_id.clone())
+            .narrowing(telegram_turn_narrowing(workspace_root))
+            .build()
+            .map_err(|error| error.to_string())?;
+        let root = assembly
+            .new_root_session(session_id, event_tx, turn_tx, None)
+            .map_err(|error| error.to_string())?;
+        Ok(with_channel_approval_actor(
+            root.session,
+            channel_approval_actor(key, approver),
+        ))
     }
 
     fn process_resume(&self, runtime: &Runtime, job: ResumeJob) {
@@ -1102,7 +1338,7 @@ impl TurnApprovalSink for TurnApprovals {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_support::{TestError, TestResult};
+    use crate::test_support::{TestError, TestResult, ctx};
     use harw_channel::{ChannelId, TenantId};
 
     fn key(peer: &str) -> SessionKey {
@@ -1361,6 +1597,104 @@ mod tests {
         assert_eq!(
             with_text,
             format!("{}\nFasse zusammen", report.prompt_preamble())
+        );
+        Ok(())
+    }
+
+    fn registry_with_ops(home: &Path) -> TestResult<WorkspaceRegistry> {
+        std::fs::create_dir_all(home.join("ws").join("ops")).map_err(ctx("workspace root"))?;
+        WorkspaceRegistry::build(
+            home,
+            [harw_authority::WorkspaceRegistration {
+                tenant: TenantId::from_str("tenant"),
+                workspace: WorkspaceId::from_str("ops"),
+                root: PathBuf::from("ws/ops"),
+            }],
+        )
+        .map_err(ctx("workspace registry"))
+    }
+
+    #[test]
+    fn chat_without_workspace_stays_tool_less() -> TestResult {
+        let home = tempfile::tempdir().map_err(ctx("temp home"))?;
+        let registry = registry_with_ops(home.path())?;
+        let tenant = TenantId::from_str("tenant");
+        assert_eq!(
+            select_turn_workspace(None, None, &tenant, &registry),
+            TurnWorkspace::None
+        );
+        assert_eq!(
+            select_turn_workspace(Some("  "), None, &tenant, &registry),
+            TurnWorkspace::None
+        );
+        // Ein nicht (mehr) auflösbarer Alias bleibt fail-closed werkzeuglos.
+        assert_eq!(
+            select_turn_workspace(Some("gone"), None, &tenant, &registry),
+            TurnWorkspace::Unresolved("gone".to_owned())
+        );
+        // Fremder Mandant: derselbe Alias löst nicht auf.
+        assert_eq!(
+            select_turn_workspace(Some("ops"), None, &TenantId::from_str("other"), &registry),
+            TurnWorkspace::Unresolved("ops".to_owned())
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn chat_with_workspace_binds_the_canonical_root() -> TestResult {
+        let home = tempfile::tempdir().map_err(ctx("temp home"))?;
+        let registry = registry_with_ops(home.path())?;
+        let tenant = TenantId::from_str("tenant");
+        let expected = home
+            .path()
+            .join("ws")
+            .join("ops")
+            .canonicalize()
+            .map_err(ctx("canonical root"))?;
+        assert_eq!(
+            select_turn_workspace(Some("ops"), None, &tenant, &registry),
+            TurnWorkspace::Bound(expected.clone())
+        );
+        // Ohne Chat-Wahl gilt der Bindungs-Default (wie `/task`, `/status`).
+        assert_eq!(
+            select_turn_workspace(None, Some("ops"), &tenant, &registry),
+            TurnWorkspace::Bound(expected)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn workspace_turn_spec_uses_gateway_telegram_and_the_workspace_root() -> TestResult {
+        let home = tempfile::tempdir().map_err(ctx("temp home"))?;
+        let registry = registry_with_ops(home.path())?;
+        let TurnWorkspace::Bound(root) =
+            select_turn_workspace(Some("ops"), None, &TenantId::from_str("tenant"), &registry)
+        else {
+            return Err(TestError::Missing("bound workspace"));
+        };
+        let chat = key("100");
+        let sender = PeerId::from_str("42");
+        let spec = telegram_turn_spec(home.path(), &root, &chat, &sender);
+        assert_eq!(spec.entry, EntryKind::GatewayTelegram);
+        assert_eq!(spec.cwd, root);
+        assert_eq!(spec.home, home.path());
+        assert_eq!(spec.principal.id(), "telegram:tg:42");
+        assert!(spec.active_agent.is_none());
+        assert!(spec.approval_override.is_none());
+
+        let narrowing = telegram_turn_narrowing(&root);
+        assert_eq!(narrowing.workspace_root.as_deref(), Some(root.as_path()));
+        assert_eq!(
+            narrowing.registry_profile,
+            EntryKind::GatewayTelegram.profile().registry_profile
+        );
+
+        assert_eq!(
+            channel_approval_actor(&chat, &sender),
+            ApprovalActor::ChannelPeer {
+                channel: ChannelId::from_str("tg"),
+                peer: PeerId::from_str("42"),
+            }
         );
         Ok(())
     }

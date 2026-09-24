@@ -160,7 +160,7 @@ Section-Default zurückgesetzt (Bug); **ÜBERNOMMEN** = explizite Ausnahme
 
 | TOML-Pfad | Typ | Default | Datei:Zeile | Merge heute |
 |---|---|---|---|---|
-| `mode.default` | `String` (`chat`/`plan`/`explore`/`work`/`shell`) | `"plan"` | `mode_toml.rs:25` | ERSETZT |
+| `mode.default` | `String` (`chat`/`plan`/`explore`/`work`/`shell`) | `"chat"` | `mode_toml.rs:25` | ERSETZT |
 
 ### 1.10 `[research]` (`research_toml.rs:16-105`)
 

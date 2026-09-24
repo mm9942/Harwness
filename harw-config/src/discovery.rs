@@ -140,7 +140,14 @@ impl ResolvedConfig {
     /// actually selected/used (`harw-runtime`), not at load time.
     pub fn validate(&self) -> ConfigResult<()> {
         validate_mcp_listener(&self.harness)?;
-        if let Some(definition) = &self.harness.active_agent_definition {
+        // Nutzer-Definitionen tragen eine versionierte Id (`…@N`) und müssen
+        // hier auflösbar sein. Schlichte Namen (z. B. `root-orchestrator`,
+        // gesetzt per `/agent use`) bezeichnen mitgelieferte Rollen, die
+        // diese Crate nicht kennt; sie prüft die Runtime beim Start
+        // (`resolve_active_agent`, fail-closed).
+        if let Some(definition) = &self.harness.active_agent_definition
+            && (definition.contains('@') || self.executable_agents.contains_key(definition))
+        {
             require_reference(&self.executable_agents, "agent definition", definition)?;
         }
         if let Some(definition) = &self.harness.active_uia_definition {
@@ -1977,6 +1984,15 @@ job_capabilities = ["cancel_workspace"]
             Err(ConfigError::UnresolvedRef { kind, reference })
                 if kind == "agent definition" && reference == "harwness.agent.missing@1"
         ));
+        Ok(())
+    }
+
+    #[test]
+    fn validate_leaves_bare_builtin_agent_names_to_the_runtime() -> TestResult {
+        let mut config = ResolvedConfig::default();
+        config.harness.active_agent_definition = Some("root-orchestrator".to_owned());
+
+        assert!(config.validate().is_ok());
         Ok(())
     }
 

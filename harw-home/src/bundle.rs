@@ -249,6 +249,10 @@ static BUNDLED_FILES: &[BundledFile] = &[
         contents: include_str!("../assets/skills/contract-fanout-migration/skill.toml"),
     },
     BundledFile {
+        relative_path: "skills/debugging/instructions.md",
+        contents: include_str!("../assets/skills/debugging/instructions.md"),
+    },
+    BundledFile {
         relative_path: "skills/debugging/skill.toml",
         contents: include_str!("../assets/skills/debugging/skill.toml"),
     },
@@ -259,6 +263,10 @@ static BUNDLED_FILES: &[BundledFile] = &[
     BundledFile {
         relative_path: "skills/dependency-add-and-research/skill.toml",
         contents: include_str!("../assets/skills/dependency-add-and-research/skill.toml"),
+    },
+    BundledFile {
+        relative_path: "skills/dependency-research/instructions.md",
+        contents: include_str!("../assets/skills/dependency-research/instructions.md"),
     },
     BundledFile {
         relative_path: "skills/dependency-research/skill.toml",
@@ -297,8 +305,16 @@ static BUNDLED_FILES: &[BundledFile] = &[
         contents: include_str!("../assets/skills/function-signature-design/skill.toml"),
     },
     BundledFile {
+        relative_path: "skills/implementation/instructions.md",
+        contents: include_str!("../assets/skills/implementation/instructions.md"),
+    },
+    BundledFile {
         relative_path: "skills/implementation/skill.toml",
         contents: include_str!("../assets/skills/implementation/skill.toml"),
+    },
+    BundledFile {
+        relative_path: "skills/incident-response/instructions.md",
+        contents: include_str!("../assets/skills/incident-response/instructions.md"),
     },
     BundledFile {
         relative_path: "skills/incident-response/skill.toml",
@@ -335,6 +351,10 @@ static BUNDLED_FILES: &[BundledFile] = &[
     BundledFile {
         relative_path: "skills/ownership-and-resource-lifetimes/skill.toml",
         contents: include_str!("../assets/skills/ownership-and-resource-lifetimes/skill.toml"),
+    },
+    BundledFile {
+        relative_path: "skills/planning/instructions.md",
+        contents: include_str!("../assets/skills/planning/instructions.md"),
     },
     BundledFile {
         relative_path: "skills/planning/skill.toml",
@@ -605,8 +625,16 @@ static BUNDLED_FILES: &[BundledFile] = &[
         contents: include_str!("../assets/skills/secret-handling/skill.toml"),
     },
     BundledFile {
+        relative_path: "skills/security-inspection/instructions.md",
+        contents: include_str!("../assets/skills/security-inspection/instructions.md"),
+    },
+    BundledFile {
         relative_path: "skills/security-inspection/skill.toml",
         contents: include_str!("../assets/skills/security-inspection/skill.toml"),
+    },
+    BundledFile {
+        relative_path: "skills/server-operations/instructions.md",
+        contents: include_str!("../assets/skills/server-operations/instructions.md"),
     },
     BundledFile {
         relative_path: "skills/server-operations/skill.toml",
@@ -627,6 +655,10 @@ static BUNDLED_FILES: &[BundledFile] = &[
     BundledFile {
         relative_path: "skills/typestate-and-illegal-states/skill.toml",
         contents: include_str!("../assets/skills/typestate-and-illegal-states/skill.toml"),
+    },
+    BundledFile {
+        relative_path: "skills/verification/instructions.md",
+        contents: include_str!("../assets/skills/verification/instructions.md"),
     },
     BundledFile {
         relative_path: "skills/verification/skill.toml",

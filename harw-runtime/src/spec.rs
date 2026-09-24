@@ -6,8 +6,19 @@
 //! seine [`EntryKind`]; welche Sandbox-Rechte, welches Registry-Profil, welche
 //! Operations-Fläche, welche Ask-Auflösung, welcher Spawner und welche
 //! Kontext-Decke daraus folgen, legt ausschließlich [`EntryKind::profile`] fest
-//! (Vertrag: `docs/remediation/CONTRACTS.md` §runtime-spec). Netzrechte
-//! ([`Permission::NetworkAccess`]) vergibt bis Welle W5 (P1.7) **kein** Einstieg.
+//! (Vertrag: `docs/remediation/CONTRACTS.md` §runtime-spec).
+//!
+//! # Netz
+//! Nur die beiden Nutzeroberflächen [`EntryKind::Tui`] und
+//! [`EntryKind::OneShot`] tragen [`Permission::NetworkAccess`] (Runde 3,
+//! Welle A2: „UIA-Wurzel egress-gebunden“). Das Recht ist hier nur die
+//! Obergrenze; welche Hosts es tatsächlich öffnet, bestimmt
+//! [`crate::sandbox::root_network_scope`] aus der Egress-Allowlist der
+//! Konfiguration. Ohne Allowlist bleibt der Scope leer und die Montage
+//! streicht das Recht wieder (fail-closed). Die UIA-Wurzel selbst registriert
+//! trotzdem kein `web.*` (`RegistryProfile::Full` enthält keine
+//! Web-Werkzeuge); das Netz ist reine, egress-gebundene Durchreichung an ihre
+//! Helfer, deren Netz nie breiter ist als das der Wurzel.
 
 use std::path::PathBuf;
 use std::time::Duration;
@@ -119,8 +130,8 @@ impl EntryKind {
     /// # Tabelle (CONTRACTS.md §runtime-spec)
     /// | Entry | Rechte | Registry / Ops | Ask | Spawner | Decke | Projektkontext |
     /// |---|---|---|---|---|---|---|
-    /// | Tui | {R, W, X} | Full + AllWithModelTools | Interactive | BuiltinRoles | LocalRoot | ja |
-    /// | OneShot | {R, W, X} | Full + AllWithModelTools | RejectTurn | BuiltinRoles | LocalRoot | ja |
+    /// | Tui | {R, W, X, N} | Full + AllWithModelTools | Interactive | BuiltinRoles | LocalRoot | ja |
+    /// | OneShot | {R, W, X, N} | Full + AllWithModelTools | RejectTurn | BuiltinRoles | LocalRoot | ja |
     /// | LocalEcho | {R, W, X} | Full + None | Fail | None | LocalRoot | ja |
     /// | Analyze | {R, W, X} | Full + CommandsOnly | Fail | BuiltinRoles | LocalRoot | ja |
     /// | Doctor | {R, W, X} | Full + AllWithModelTools | Fail | None | LocalRoot | ja |
@@ -128,24 +139,41 @@ impl EntryKind {
     /// | McpServe | {} | NoTools + None | BlockJob | None | Closed | nein |
     /// | JobPrompt | {} | NoTools + None | BlockJob | None | Closed | nein |
     /// | JobPlanNode | {R, W} | Full + None | Fail | None | LocalRoot | ja |
-    /// | GatewayTelegram / GatewayDream | {} | NoTools + None | Fail | None | Closed | nein |
+    /// | GatewayTelegram | {R, W} | WorkspaceEdit + None | Interactive | None | Closed | nein |
+    /// | GatewayDream | {} | NoTools + None | Fail | None | Closed | nein |
     ///
     /// `R` = [`Permission::ReadWorkspace`], `W` = [`Permission::WriteWorkspace`],
-    /// `X` = [`Permission::ExecuteProcess`]. Für `Web` ist `{R}` die
+    /// `X` = [`Permission::ExecuteProcess`], `N` = [`Permission::NetworkAccess`]
+    /// (Hosts nur aus der Egress-Allowlist, siehe Moduldoku „Netz“). Für `Web` ist `{R}` die
     /// Spec-Obergrenze; die tier-abhängige Verengung liefert W2B-02
     /// (`permissions_for_tier`). Für `JobPlanNode` ist `{R, W}` die Obergrenze,
     /// die der Plan-Knoten-Vertrag weiter verengen darf.
     ///
-    /// Kein Einstieg erhält Netz-, Secret-, Plugin- oder Registry-Leserechte.
+    /// `GatewayTelegram` (Runde 3, Welle D) liest und schreibt im gebundenen
+    /// Workspace des Chats, aber ohne Shell und ohne Netz; jede Rückfrage
+    /// beantwortet die Person über Freigabe-Buttons im Chat (`Interactive`),
+    /// und der Freigabemodus ist für diesen Einstieg unabhängig von der
+    /// Konfiguration immer `ask` (`crate::assembly::effective_approval_mode`).
+    ///
+    /// Kein Einstieg erhält Secret-, Plugin- oder Registry-Leserechte; Netz
+    /// tragen nur `Tui` und `OneShot`, und zwar egress-gebunden.
     #[must_use]
     pub fn profile(self) -> EntryProfile {
-        use Permission::{ExecuteProcess, ReadWorkspace, WriteWorkspace};
+        use Permission::{ExecuteProcess, NetworkAccess, ReadWorkspace, WriteWorkspace};
 
         let rwx = || PermissionSet::from_policy([ReadWorkspace, WriteWorkspace, ExecuteProcess]);
+        let rwxn = || {
+            PermissionSet::from_policy([
+                ReadWorkspace,
+                WriteWorkspace,
+                ExecuteProcess,
+                NetworkAccess,
+            ])
+        };
 
         match self {
             EntryKind::Tui => EntryProfile {
-                permissions: rwx(),
+                permissions: rwxn(),
                 registry_profile: RegistryProfile::Full,
                 operations: OperationSurface::AllWithModelTools,
                 ask: AskResolution::Interactive,
@@ -154,7 +182,7 @@ impl EntryKind {
                 project_context: true,
             },
             EntryKind::OneShot => EntryProfile {
-                permissions: rwx(),
+                permissions: rwxn(),
                 registry_profile: RegistryProfile::Full,
                 operations: OperationSurface::AllWithModelTools,
                 ask: AskResolution::RejectTurn,
@@ -216,7 +244,16 @@ impl EntryKind {
                 ceiling: CeilingPolicy::LocalRoot,
                 project_context: true,
             },
-            EntryKind::GatewayTelegram | EntryKind::GatewayDream => EntryProfile {
+            EntryKind::GatewayTelegram => EntryProfile {
+                permissions: PermissionSet::from_policy([ReadWorkspace, WriteWorkspace]),
+                registry_profile: RegistryProfile::WorkspaceEdit,
+                operations: OperationSurface::None,
+                ask: AskResolution::Interactive,
+                spawner: SpawnerPolicy::None,
+                ceiling: CeilingPolicy::Closed,
+                project_context: false,
+            },
+            EntryKind::GatewayDream => EntryProfile {
                 permissions: PermissionSet::empty(),
                 registry_profile: RegistryProfile::NoTools,
                 operations: OperationSurface::None,
@@ -379,14 +416,16 @@ mod tests {
         use AskResolution as A;
         use CeilingPolicy as C;
         use OperationSurface as O;
-        use Permission::{ExecuteProcess as X, ReadWorkspace as R, WriteWorkspace as W};
+        use Permission::{
+            ExecuteProcess as X, NetworkAccess as N, ReadWorkspace as R, WriteWorkspace as W,
+        };
         use RegistryProfile as P;
         use SpawnerPolicy as S;
 
         let expected: [Row; 11] = [
             (
                 EntryKind::Tui,
-                &[R, W, X],
+                &[R, W, X, N],
                 P::Full,
                 O::AllWithModelTools,
                 A::Interactive,
@@ -396,7 +435,7 @@ mod tests {
             ),
             (
                 EntryKind::OneShot,
-                &[R, W, X],
+                &[R, W, X, N],
                 P::Full,
                 O::AllWithModelTools,
                 A::RejectTurn,
@@ -476,10 +515,10 @@ mod tests {
             ),
             (
                 EntryKind::GatewayTelegram,
-                &[],
-                P::NoTools,
+                &[R, W],
+                P::WorkspaceEdit,
                 O::None,
-                A::Fail,
+                A::Interactive,
                 S::None,
                 C::Closed,
                 false,
@@ -511,9 +550,8 @@ mod tests {
     }
 
     #[test]
-    fn no_entry_grants_network_or_other_elevated_permissions() {
+    fn no_entry_grants_secrets_plugins_or_registry() {
         let forbidden = [
-            Permission::NetworkAccess,
             Permission::ReadSecrets,
             Permission::ManagePlugins,
             Permission::ReadCargoRegistry,
@@ -527,11 +565,42 @@ mod tests {
     }
 
     #[test]
-    fn job_gateway_and_mcp_have_empty_permissions_and_no_tools() {
+    fn only_the_user_interfaces_carry_network() {
+        for kind in ALL {
+            let networked = kind
+                .profile()
+                .permissions
+                .contains(Permission::NetworkAccess);
+            assert_eq!(
+                networked,
+                matches!(kind, EntryKind::Tui | EntryKind::OneShot),
+                "{kind:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn telegram_reads_and_writes_but_never_executes_or_networks() {
+        let profile = EntryKind::GatewayTelegram.profile();
+        assert_eq!(
+            profile.permissions,
+            set(&[Permission::ReadWorkspace, Permission::WriteWorkspace])
+        );
+        assert!(!profile.permissions.contains(Permission::ExecuteProcess));
+        assert!(!profile.permissions.contains(Permission::NetworkAccess));
+        assert_eq!(profile.registry_profile, RegistryProfile::WorkspaceEdit);
+        assert_eq!(profile.operations, OperationSurface::None);
+        assert_eq!(profile.ask, AskResolution::Interactive);
+        assert_eq!(profile.spawner, SpawnerPolicy::None);
+        assert_eq!(profile.ceiling, CeilingPolicy::Closed);
+        assert!(!profile.project_context);
+    }
+
+    #[test]
+    fn job_dream_and_mcp_have_empty_permissions_and_no_tools() {
         let closed = [
             EntryKind::McpServe,
             EntryKind::JobPrompt,
-            EntryKind::GatewayTelegram,
             EntryKind::GatewayDream,
         ];
         for kind in closed {
@@ -574,23 +643,32 @@ mod tests {
     }
 
     #[test]
-    fn every_profile_is_subset_of_local_rwx() {
-        let rwx = set(&[
-            Permission::ReadWorkspace,
-            Permission::WriteWorkspace,
-            Permission::ExecuteProcess,
-        ]);
+    fn every_profile_is_subset_of_the_tui_profile() {
+        let tui = EntryKind::Tui.profile().permissions;
+        assert_eq!(
+            tui,
+            set(&[
+                Permission::ReadWorkspace,
+                Permission::WriteWorkspace,
+                Permission::ExecuteProcess,
+                Permission::NetworkAccess,
+            ])
+        );
         for kind in ALL {
             let perms = kind.profile().permissions;
-            assert!(perms.is_subset_of(&rwx), "{kind:?}");
+            assert!(perms.is_subset_of(&tui), "{kind:?}");
         }
     }
 
     #[test]
-    fn only_tui_asks_interactively() {
+    fn only_tui_and_telegram_ask_interactively() {
         for kind in ALL {
             let interactive = kind.profile().ask == AskResolution::Interactive;
-            assert_eq!(interactive, kind == EntryKind::Tui, "{kind:?}");
+            assert_eq!(
+                interactive,
+                matches!(kind, EntryKind::Tui | EntryKind::GatewayTelegram),
+                "{kind:?}"
+            );
         }
     }
 
@@ -659,7 +737,12 @@ mod tests {
         assert_eq!(snapshot.approval_actor, Some(expected_actor));
         assert_eq!(
             snapshot.permissions,
-            ["ReadWorkspace", "WriteWorkspace", "ExecuteProcess"]
+            [
+                "ReadWorkspace",
+                "WriteWorkspace",
+                "ExecuteProcess",
+                "NetworkAccess"
+            ]
         );
         assert_eq!(snapshot.clone(), snapshot);
     }

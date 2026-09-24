@@ -1,19 +1,21 @@
 # Eingebauter Web-Rechercheur (AP W3-04) — Registry-Profil `Research`.
 #
-# Die einzige eingebaute Rolle mit allen vier Netz-Werkzeugen (`web.fetch`,
-# `web.search`, `web.docs_rs`, `web.crates_io`); `explorer`/`uia-explorer`
-# fuehren nur `web.fetch`/`web.search`, die uebrigen UIA-Rollen nur
-# `web.fetch`. Der Zugang bleibt doppelt
-# begrenzt: `web.*` ist nur die Tool-Oberflaeche, die tatsaechlich erreichbaren
-# Hosts bestimmt die Egress-Policy aus `[network].researcher_web_hosts`
+# Fuehrt alle vier Netz-Werkzeuge (`web.fetch`, `web.search`,
+# `web.docs_rs`, `web.crates_io`) — ebenso die UIA-Helfer `uia-worker` und
+# `uia-writer`. `explorer`, `uia-explorer`, `researcher` und
+# `dependency-researcher` fuehren nur `web.fetch`/`web.search`; die Rolle ist
+# also nicht die einzige mit Netzzugang, aber die einzige Recherche-Rolle ohne
+# jeden Workspace-Zugriff. Der Zugang bleibt doppelt begrenzt: `web.*` ist nur
+# die Tool-Oberflaeche, die tatsaechlich erreichbaren Hosts bestimmt die
+# Egress-Policy aus `[network].researcher_web_hosts`
 # (`harw_registry_defaults::research_web::researcher_web_policy`; leer = kein
 # Netz, private Ziele nie).
 #
 # W5 RD / Annahme A5: Die Rolle liest KEINE Workspace-Daten — weder `fs.*` noch
-# `deps.*` (auch nicht `deps.graph`/`deps.locked`, die `Cargo.lock` und
+# `deps.*` (auch nicht `deps.graph`/`deps.locked`, die Lockfiles und
 # Workspace-Metadaten lesen). Wer ins Netz schreiben kann, darf nichts Lokales
-# lesen, das er hinaustragen koennte. Crate-Namen und Versionen bekommt die
-# Rolle ueber ihren Auftrag vom Elternteil. Reducer: `reduce_to_read_network`.
+# lesen, das er hinaustragen koennte. Paketnamen, Versionen und Fragen bekommt
+# die Rolle ueber ihren Auftrag vom Elternteil. Reducer: `reduce_to_read_network`.
 
 schema = "harwness.agent/v1"
 id = "harwness.agent.researcher-web@1"
@@ -23,7 +25,7 @@ role = "worker"
 specialization = "researcher-web"
 
 name = "Web Documentation Researcher"
-description = "Holt offizielle Dokumentation und Crate-Metadaten ueber die Host-Allowlist der Sandbox."
+description = "Holt offizielle Dokumentation, Release-Notes und Paket-Metadaten ueber die Host-Allowlist der Sandbox; liest keine Workspace-Daten."
 
 [research]
 sources = ["official-docs", "official-repositories", "release-notes"]
@@ -71,3 +73,11 @@ max_wall_secs = 180
 
 [return]
 contract = "harwness.return.research-finding@1"
+
+# Kontextprogramm (Runde 3, Welle C2): bindet `agents/context-programs/research-web.toml`.
+# `embedded_agents::bind_context_program` liest diese Zeile aus der eigenen
+# Tabelle der Rolle (die Aufloesung verwirft das `[context]` des Kindes, weil
+# `worker-base` eines fuehrt) und ergaenzt das geerbte `[context]` um das
+# Programm. Ein unbekannter Name bricht das Laden der Rolle hart ab.
+[context]
+program = "research-web"

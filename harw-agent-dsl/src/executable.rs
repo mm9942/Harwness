@@ -329,6 +329,10 @@ pub struct ExecutableAgentIr {
     /// Aufgabe des Konsumenten (`harw-runtime::guard_wiring::resolve_default_reasoning_effort`).
     reasoning_effort: Option<String>,
 
+    /// Skills dieses Agenten (Vereinigung über `extends`/Mixins/Schichten,
+    /// siehe [`crate::skills`]); streng validiert, reihenfolgetreu.
+    skills: Vec<String>,
+
     /// SpawnContract — the immutable snapshot passed at session construction.
     spawn_contract: SpawnContract,
     /// JobTemplate — the shape of the work unit this agent runs.
@@ -594,7 +598,11 @@ pub struct ReturnPipeline {
 /// mit einem `v3`-Digest; beide Räume sind durch den Domain-String getrennt).
 /// Golden-Snapshots aus `v2` sind ab diesem Knoten bewusst ungültig — kein
 /// stillschweigend verschobener Hash, siehe Abschlussbericht des Knotens.
-const SNAPSHOT_HASH_DOMAIN: &str = "harwness.executable-ir.snapshot/v5";
+///
+/// `v6` fügt `skills` (reihenfolgetreu, direkt nach `reasoning_effort`)
+/// hinzu; auch eine leere Liste hasht eine 4-Byte-Null-Länge, daher
+/// verschiebt sich jeder Digest.
+const SNAPSHOT_HASH_DOMAIN: &str = "harwness.executable-ir.snapshot/v6";
 
 /// Berechnet einen stabilen BLAKE3-Digest über die Inhaltsfelder einer [`ExecutableAgentIr`].
 ///
@@ -731,6 +739,8 @@ fn compute_snapshot_id(ir: &ExecutableAgentIr) -> SnapshotId {
     hash_str(&mut hasher, &ir.specialization);
     // reasoning_effort — neu in v5: undurchsichtiges Label, Präsenz-Byte + Wert
     hash_opt_str(&mut hasher, ir.reasoning_effort.as_deref());
+    // skills — neu in v6: reihenfolgetreu (Reihenfolge der Fragmente)
+    hash_str_vec(&mut hasher, &ir.skills);
     // authority.capabilities (sorted for determinism)
     let mut sorted_caps = ir.authority.capabilities.clone();
     sorted_caps.sort();
@@ -826,6 +836,21 @@ impl ExecutableAgentIr {
     /// Aussage getroffen hat.
     pub fn reasoning_effort(&self) -> Option<&str> {
         self.reasoning_effort.as_deref()
+    }
+
+    /// Returns the skills this agent is bound to (`skills = [...]` in the
+    /// definition, unioned over `extends`/mixins/layers).
+    ///
+    /// # Description
+    /// Namen sind geprüft (`[a-z0-9-]`, 1–64 Zeichen, keine Duplikate) und
+    /// stehen in Auflösungsreihenfolge. Der Konsument lädt daraus
+    /// Instruktionsfragmente und muss einen aktivierten, aber nicht ladbaren
+    /// Skill fail-closed behandeln.
+    ///
+    /// # Returns
+    /// Die Skill-Namen; leer, wenn die Definition keine Skills führt.
+    pub fn skills(&self) -> &[String] {
+        &self.skills
     }
 
     /// Returns the immutable spawn contract snapshot.
@@ -1231,6 +1256,8 @@ impl ReturnPipeline {
 /// # Errors
 /// - [`DslError::Parse`]: if `resolved.specialization` is empty. A non-empty
 ///   specialization is a hard precondition for the executable IR (§10).
+/// - [`DslError::InvalidSkill`]: if `resolved.config` carries a malformed
+///   `skills` entry (not a string array, invalid name, duplicate).
 ///
 /// # Concurrency
 /// Pure function — safe from any thread. Does not touch I/O.
@@ -1347,12 +1374,17 @@ pub fn lower(resolved: &ResolvedAgentDefinition) -> Result<ExecutableAgentIr, Ds
         contract: config_string(&resolved.config, &["return", "return_pipeline"], "contract"),
     };
 
+    // Streng (fail-closed): ein fehlerhafter `skills`-Eintrag in einer von
+    // Hand gebauten Config wird abgelehnt, nicht verschluckt.
+    let skills = crate::skills::skills_from_config_strict(&resolved.id, &resolved.config)?;
+
     let mut ir = ExecutableAgentIr {
         id: resolved.id.clone(),
         role: resolved.role,
         specialization: resolved.specialization.clone(),
         authority: resolved.authority.clone(),
         reasoning_effort: resolved.reasoning_effort.clone(),
+        skills,
         spawn_contract,
         job_template,
         context_program,
@@ -2607,6 +2639,99 @@ mod tests {
             ir2.snapshot_id(),
             "reasoning_effort participates in the content hash (v5)"
         );
+        Ok(())
+    }
+
+    // -----------------------------------------------------------------
+    // skills: Durchreichen von ResolvedAgentDefinition in die IR (v6)
+    // -----------------------------------------------------------------
+
+    fn base_resolved_with_skills(skills: toml::Value) -> TestResult<ResolvedAgentDefinition> {
+        let mut resolved = base_resolved("worker")?;
+        resolved
+            .config
+            .insert(crate::skills::SKILLS_CONFIG_KEY.to_owned(), skills);
+        Ok(resolved)
+    }
+
+    fn skill_array(names: &[&str]) -> toml::Value {
+        toml::Value::Array(
+            names
+                .iter()
+                .map(|name| toml::Value::String((*name).to_owned()))
+                .collect(),
+        )
+    }
+
+    #[test]
+    fn test_lower_without_skills_yields_empty_list() -> TestResult {
+        let ir = lower(&base_resolved("worker")?).map_err(ctx("lower should succeed"))?;
+        assert!(ir.skills().is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn test_lower_passes_through_skills_in_order() -> TestResult {
+        let resolved = base_resolved_with_skills(skill_array(&["rust", "code-review"]))?;
+        assert_eq!(resolved.skills(), ["rust", "code-review"]);
+        let ir = lower(&resolved).map_err(ctx("lower should succeed"))?;
+        assert_eq!(ir.skills(), ["rust", "code-review"]);
+        Ok(())
+    }
+
+    #[test]
+    fn test_lower_rejects_malformed_skills_fail_closed() -> TestResult {
+        for bad in [
+            skill_array(&["Bad_Name"]),
+            skill_array(&["a", "a"]),
+            toml::Value::Array(vec![toml::Value::Integer(3)]),
+            toml::Value::String("rust".to_owned()),
+        ] {
+            let result = lower(&base_resolved_with_skills(bad.clone())?);
+            assert!(
+                matches!(result, Err(DslError::InvalidSkill { .. })),
+                "expected InvalidSkill for {bad}"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn test_snapshot_id_differs_when_skills_differ() -> TestResult {
+        let none = lower(&base_resolved("worker")?).map_err(ctx("lower should succeed"))?;
+        let ab = lower(&base_resolved_with_skills(skill_array(&["a", "b"]))?)
+            .map_err(ctx("lower should succeed"))?;
+        let ba = lower(&base_resolved_with_skills(skill_array(&["b", "a"]))?)
+            .map_err(ctx("lower should succeed"))?;
+        assert_ne!(none.snapshot_id(), ab.snapshot_id());
+        assert_ne!(
+            ab.snapshot_id(),
+            ba.snapshot_id(),
+            "skills are hashed order-preserving (v6)"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn test_skills_flow_from_toml_through_resolve_into_ir() -> TestResult {
+        let raw = crate::parse::parse_toml(
+            r#"
+schema = "harwness.agent/v1"
+id = "harwness.agent.skilled@1"
+version = "1.0.0"
+role = "worker"
+specialization = "skilled"
+skills = ["rust", "code-review"]
+"#,
+        )?;
+        let id = make_id("harwness.agent.skilled@1")?;
+        let resolved = crate::resolve::resolve_definition(
+            &id,
+            &[(crate::layers::DefinitionLayer::BuiltIn, raw)],
+            time::OffsetDateTime::now_utc(),
+        )?;
+        let ir = lower(&resolved).map_err(ctx("lower should succeed"))?;
+        assert_eq!(ir.skills(), ["rust", "code-review"]);
         Ok(())
     }
 }

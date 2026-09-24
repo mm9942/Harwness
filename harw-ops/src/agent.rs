@@ -473,14 +473,21 @@ fn usage_against_limit(used: u64, limit: Option<u64>, unit: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::AgentArgs;
+    use crate::config_util::RecordedSelectionPersistCall;
+    use crate::test_support::ctx as ctx_err;
     use crate::test_support::{TestError, TestResult, ctx};
     use crate::testutil::toks;
     use harw_authority::{PermissionSet, SandboxSpec, WorkspaceRegistration, WorkspaceRegistry};
     use harw_operations::{FromRawArgs, OpContext, OpError, context::ServiceMap};
+    use harw_registry_defaults::role_names::{ROOT_ORCHESTRATOR, UIA_WORKER};
     use harw_types::{SessionId, TenantId, TurnId, WorkspaceId};
     use std::sync::atomic::{AtomicU64, Ordering};
 
     fn test_context() -> TestResult<(OpContext, std::path::PathBuf)> {
+        test_context_with(ServiceMap::new())
+    }
+
+    fn test_context_with(services: ServiceMap) -> TestResult<(OpContext, std::path::PathBuf)> {
         static COUNTER: AtomicU64 = AtomicU64::new(0);
         let id = COUNTER.fetch_add(1, Ordering::Relaxed);
         let root =
@@ -503,7 +510,7 @@ mod tests {
             .map_err(ctx("resolve workspace binding"))?;
         let sandbox = SandboxSpec::from_resolved(binding, PermissionSet::empty());
         Ok((
-            OpContext::new(SessionId::new(), TurnId::new(), sandbox, ServiceMap::new()),
+            OpContext::new(SessionId::new(), TurnId::new(), sandbox, services),
             root,
         ))
     }
@@ -918,6 +925,106 @@ mod tests {
                 )));
             }
         }
+        Ok(())
+    }
+
+    // ── /agent use ──────────────────────────────────────────────────────────
+
+    type Recorder = std::sync::Arc<crate::config_util::RecordingSelectionPersistence>;
+
+    /// Kontext mit leerer Konfiguration und aufzeichnender Persistenz, damit
+    /// `/agent use` weder `HARW_HOME` liest noch schreibt.
+    fn use_context() -> TestResult<(OpContext, std::path::PathBuf, Recorder)> {
+        let recorder: Recorder =
+            std::sync::Arc::new(crate::config_util::RecordingSelectionPersistence::new());
+        let persistence: std::sync::Arc<dyn crate::config_util::SelectionPersistence> =
+            recorder.clone();
+        let mut services = ServiceMap::new();
+        services.insert(persistence);
+        services.insert(std::sync::Arc::new(harw_config::ResolvedConfig::default()));
+        let (ctx, root) = test_context_with(services)?;
+        Ok((ctx, root, recorder))
+    }
+
+    fn use_args(target: Option<&str>) -> AgentArgs {
+        AgentArgs {
+            action: Some("use".to_owned()),
+            target: target.map(str::to_owned),
+            value: None,
+        }
+    }
+
+    #[test]
+    fn test_agent_args_from_raw_args_use_clear() -> TestResult {
+        let args = AgentArgs::from_raw_args(&toks(&["use", "--clear"]))
+            .map_err(|e| TestError::Unexpected(format!("Unerwarteter Fehler: {e}")))?;
+        assert_eq!(args.action.as_deref(), Some("use"));
+        assert_eq!(args.target.as_deref(), Some("--clear"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn agent_use_persists_builtin_root_agent_without_spawner() -> TestResult {
+        let (ctx, root, recorder) = use_context()?;
+        let result = super::agent(&ctx, use_args(Some(ROOT_ORCHESTRATOR))).await;
+        std::fs::remove_dir_all(root).map_err(ctx_err("remove test workspace"))?;
+        let output = result.map_err(|e| TestError::Unexpected(format!("{e:?}")))?;
+        let text = output.text;
+        assert!(text.contains("gilt ab nächster Sitzung"), "{text}");
+        assert_eq!(
+            recorder.calls(),
+            vec![RecordedSelectionPersistCall::ActiveAgent {
+                name: Some(ROOT_ORCHESTRATOR.to_owned()),
+            }]
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn agent_use_clear_removes_the_selection() -> TestResult {
+        let (ctx, root, recorder) = use_context()?;
+        let result = super::agent(&ctx, use_args(Some("--clear"))).await;
+        std::fs::remove_dir_all(root).map_err(ctx_err("remove test workspace"))?;
+        let output = result.map_err(|e| TestError::Unexpected(format!("{e:?}")))?;
+        assert!(
+            output.text.contains("gilt ab nächster Sitzung"),
+            "{}",
+            output.text
+        );
+        assert_eq!(
+            recorder.calls(),
+            vec![RecordedSelectionPersistCall::ActiveAgent { name: None }]
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn agent_use_rejects_unknown_missing_and_non_root_agents() -> TestResult {
+        let (ctx, root, recorder) = use_context()?;
+        let unknown = super::agent(&ctx, use_args(Some("gibt-es-nicht"))).await;
+        let missing = super::agent(&ctx, use_args(None)).await;
+        let non_root = super::agent(&ctx, use_args(Some(UIA_WORKER))).await;
+        std::fs::remove_dir_all(root).map_err(ctx_err("remove test workspace"))?;
+
+        assert!(
+            matches!(&unknown, Err(OpError::InvalidArguments(message))
+                if message.contains("Unbekannter Agent") && message.contains(ROOT_ORCHESTRATOR)),
+            "{unknown:?}"
+        );
+        assert!(
+            matches!(&missing, Err(OpError::InvalidArguments(message))
+                if message.contains("/agent use")),
+            "{missing:?}"
+        );
+        assert!(
+            matches!(&non_root, Err(OpError::InvalidArguments(message))
+                if message.contains("nicht als Wurzel")),
+            "{non_root:?}"
+        );
+        assert!(
+            recorder.calls().is_empty(),
+            "ungültige Namen dürfen nichts speichern"
+        );
         Ok(())
     }
 }

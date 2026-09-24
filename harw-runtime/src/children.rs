@@ -775,21 +775,49 @@ impl RuntimeChildRegistryFactory {
         })
     }
 
-    /// Die Skill-Fragmente einer Kind-Rolle (leer ohne Katalog oder ohne
-    /// `agent.toml` für diese Rolle).
+    /// Die Skill-Fragmente einer Kind-Rolle: die direkt im Katalog
+    /// (`agents/<rolle>/agent.toml`) konfigurierten Skills, vereinigt mit den
+    /// Skills der eingebauten Agent-Definition der Rolle
+    /// ([`ExecutableAgentIr::skills`]).
+    ///
+    /// # Description
+    /// Reihenfolge: Katalog-Skills zuerst, danach die Definitions-Skills, die
+    /// der Katalog nicht schon nennt (Duplikate zählen einmal). Deaktivierte
+    /// Skills werden wie im Katalogpfad übersprungen. Leer, wenn weder der
+    /// Katalog noch die Definition Skills für die Rolle führen.
     ///
     /// # Errors
     /// [`AgentSpawnError`], wenn ein aktivierter Skill nicht geladen werden
-    /// kann — fail-closed: ein Kind startet nie mit einem Teil seiner Skills.
+    /// kann oder ein Definitions-Skill im Katalog unbekannt ist — fail-closed:
+    /// ein Kind startet nie mit einem Teil seiner Skills. Ebenso, wenn die
+    /// Definition der Rolle Skills verlangt, aber kein Skill-Katalog
+    /// hinterlegt ist ([`Self::with_skill_catalog`]): ohne Katalog lässt sich
+    /// weder „aktiviert" prüfen noch der Skill laden.
     fn skill_fragments_for_role(&self, role: &str) -> Result<Vec<String>, AgentSpawnError> {
+        let definition_skills: &[String] = self
+            .builtin_definitions
+            .get(role)
+            .map(ExecutableAgentIr::skills)
+            .unwrap_or(&[]);
         let Some(wiring) = &self.skill_catalog else {
-            return Ok(Vec::new());
+            if definition_skills.is_empty() {
+                return Ok(Vec::new());
+            }
+            return Err(AgentSpawnError {
+                message: format!(
+                    "child role '{role}' requires the skills [{}] from its agent definition, \
+                     but no skill catalog is wired: refusing to start it without them",
+                    definition_skills.join(", ")
+                ),
+            });
         };
-        let Some(names) = wiring.catalog.direct_skills_of(role) else {
+        let catalog_skills = wiring.catalog.direct_skills_of(role).unwrap_or(&[]);
+        let names = merge_skill_names(catalog_skills, definition_skills);
+        if names.is_empty() {
             return Ok(Vec::new());
-        };
+        }
         let snapshots =
-            load_enabled_skills(|name| wiring.catalog.skill(name), &wiring.roots, names).map_err(
+            load_enabled_skills(|name| wiring.catalog.skill(name), &wiring.roots, &names).map_err(
                 |detail| AgentSpawnError {
                     message: format!("could not load the skills of child role '{role}': {detail}"),
                 },
@@ -1323,6 +1351,19 @@ impl ChildRegistryFactory for RuntimeChildRegistryFactory {
         );
         Ok(registry)
     }
+}
+
+/// Vereinigt Katalog- und Definitions-Skills einer Rolle: Katalog zuerst,
+/// dann jeder Definitions-Skill, den der Katalog nicht schon nennt; Duplikate
+/// innerhalb einer Quelle zählen ebenfalls einmal.
+fn merge_skill_names(catalog: &[String], definition: &[String]) -> Vec<String> {
+    let mut names: Vec<String> = Vec::with_capacity(catalog.len() + definition.len());
+    for name in catalog.iter().chain(definition) {
+        if !names.contains(name) {
+            names.push(name.clone());
+        }
+    }
+    names
 }
 
 /// Lädt die aktivierten Skills aus `names` als eingefrorene Snapshots.
@@ -2082,6 +2123,140 @@ mod tests {
                 .skill_fragments_for_role(role_names::EXPLORER)
                 .map_err(|error| crate::test_support::TestError::Unexpected(error.message))?
                 .is_empty()
+        );
+        Ok(())
+    }
+
+    /// Eine gesenkte Test-Definition für `role` mit den DSL-Skills `skills`
+    /// (ohne `time`-Abhängigkeit: Trace bleibt leer).
+    fn ir_with_skills(skills: &[&str]) -> TestResult<ExecutableAgentIr> {
+        let list = skills
+            .iter()
+            .map(|name| format!("\"{name}\""))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let raw = harw_agent_dsl::parse::parse_toml(&format!(
+            "schema = \"harwness.agent/v1\"\n\
+             id = \"harwness.agent.skill-child@1\"\n\
+             version = \"1.0.0\"\n\
+             role = \"worker\"\n\
+             specialization = \"skill-child\"\n\
+             skills = [{list}]\n"
+        ))
+        .map_err(ctx("parse test definition"))?;
+        let mut config = raw.tables;
+        config.insert(
+            harw_agent_dsl::skills::SKILLS_CONFIG_KEY.to_owned(),
+            toml::Value::Array(raw.skills.into_iter().map(toml::Value::String).collect()),
+        );
+        let resolved = harw_agent_dsl::resolved::ResolvedAgentDefinition {
+            id: raw.id,
+            version: raw.version,
+            role: raw.role,
+            specialization: raw.specialization,
+            name: raw.name,
+            description: raw.description,
+            reasoning_effort: raw.reasoning_effort,
+            authority: harw_agent_dsl::authority::AuthorityCeiling::default(),
+            trace: harw_agent_dsl::resolved::ResolutionTrace { steps: Vec::new() },
+            config,
+        };
+        harw_agent_dsl::lower(&resolved).map_err(ctx("lower test definition"))
+    }
+
+    #[test]
+    fn merge_skill_names_puts_catalog_first_and_dedupes() {
+        let merged = merge_skill_names(
+            &["review".to_owned(), "off".to_owned(), "review".to_owned()],
+            &["docs".to_owned(), "review".to_owned()],
+        );
+        assert_eq!(merged, ["review", "off", "docs"]);
+    }
+
+    #[test]
+    fn child_registry_injects_definition_skills_deduped_with_catalog() -> TestResult {
+        let (layer, config) = skill_fixture(role_names::EXPLORER)?;
+        let mut factory = RuntimeChildRegistryFactory::new(
+            test_project(),
+            Arc::new(harw_core::EchoModelProvider::new("echo")),
+            test_chain(&config),
+        )
+        .map_err(ctx("factory builds"))?
+        .with_skill_catalog(&config, vec![layer.path().to_path_buf()])
+        .map_err(ctx("skill catalog"))?;
+        // Katalog führt `review` für den Explorer; die Definition verlangt
+        // es ebenfalls — es darf nur einmal injiziert werden.
+        factory.builtin_definitions.insert(
+            role_names::EXPLORER.to_owned(),
+            ir_with_skills(&["review"])?,
+        );
+        // Planner: kein agent.toml, nur die Definition nennt `review`.
+        factory.builtin_definitions.insert(
+            role_names::PLANNER.to_owned(),
+            ir_with_skills(&["review", "off"])?,
+        );
+
+        let explorer = factory
+            .skill_fragments_for_role(role_names::EXPLORER)
+            .map_err(|error| crate::test_support::TestError::Unexpected(error.message))?;
+        assert_eq!(explorer.len(), 1, "{explorer:?}");
+        assert!(explorer[0].starts_with("# Skill: review (sha256 "));
+
+        let planner = factory
+            .skill_fragments_for_role(role_names::PLANNER)
+            .map_err(|error| crate::test_support::TestError::Unexpected(error.message))?;
+        assert_eq!(planner.len(), 1, "disabled `off` is skipped: {planner:?}");
+        assert!(planner[0].contains("Read tests first."));
+        Ok(())
+    }
+
+    #[test]
+    fn child_registry_fails_closed_on_unknown_definition_skill() -> TestResult {
+        let (layer, config) = skill_fixture(role_names::EXPLORER)?;
+        let mut factory = RuntimeChildRegistryFactory::new(
+            test_project(),
+            Arc::new(harw_core::EchoModelProvider::new("echo")),
+            test_chain(&config),
+        )
+        .map_err(ctx("factory builds"))?
+        .with_skill_catalog(&config, vec![layer.path().to_path_buf()])
+        .map_err(ctx("skill catalog"))?;
+        factory.builtin_definitions.insert(
+            role_names::PLANNER.to_owned(),
+            ir_with_skills(&["missing"])?,
+        );
+        let Err(error) = factory.skill_fragments_for_role(role_names::PLANNER) else {
+            return Err(crate::test_support::TestError::Unexpected(
+                "an unknown definition skill must refuse the spawn".to_owned(),
+            ));
+        };
+        assert!(error.message.contains("missing"), "{}", error.message);
+        Ok(())
+    }
+
+    #[test]
+    fn child_registry_without_catalog_refuses_definition_skills() -> TestResult {
+        let config = harw_config::ResolvedConfig::default();
+        let mut factory = RuntimeChildRegistryFactory::new(
+            test_project(),
+            Arc::new(harw_core::EchoModelProvider::new("echo")),
+            test_chain(&config),
+        )
+        .map_err(ctx("factory builds"))?;
+        factory
+            .builtin_definitions
+            .insert(role_names::PLANNER.to_owned(), ir_with_skills(&["review"])?);
+        assert!(
+            factory
+                .skill_fragments_for_role(role_names::PLANNER)
+                .is_err()
+        );
+        assert!(
+            factory
+                .skill_fragments_for_role(role_names::EXPLORER)
+                .map_err(|error| crate::test_support::TestError::Unexpected(error.message))?
+                .is_empty(),
+            "roles without definition skills stay unaffected"
         );
         Ok(())
     }

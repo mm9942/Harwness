@@ -23,11 +23,11 @@ version = "1.0.0"
 name = "Harwness Research Family"
 
 # Familienweite Invarianten. Jede ist an den eingebetteten Rollen nachprüfbar:
-#   * `workers_are_read_only` — alle drei Worker führen `fs.write` und
+#   * `workers_are_read_only` — alle fünf Worker führen `fs.write` und
 #     `shell.exec` ausdrücklich in `forbidden`.
 #   * `children_never_pause` — `worker-base.toml` setzt `allow_pause = false`;
 #     ein read-only Kind hat keinen Kanal für eine Freigabe.
-#   * `findings_carry_sources` — alle drei Worker geben
+#   * `findings_carry_sources` — alle fünf Worker geben
 #     `harwness.return.research-finding@1` zurück, also belegte Funde.
 invariants = [
   "workers_are_read_only",
@@ -43,19 +43,32 @@ invariants = [
 [orchestrators]
 allowed = ["harwness.agent.research-orchestrator@1", "harwness.agent.analyst@1"]
 
-# Die drei read-only Rechercheure. `explorer` liest Workspace und
-# Dependency-Quellen, `researcher-deps` belegt Dependency-Verhalten aus
-# `Cargo.lock` und dem lokalen Quellcache, `researcher-web` ist die einzige
-# Rolle mit Netzzugang (doppelt begrenzt durch die Host-Allowlist der Sandbox).
+# Die fünf read-only Rechercheure:
+#   * `explorer` liest Workspace, Projektstruktur, Dokumente und lokal
+#     vorhandene Abhängigkeitsquellen; bei Bedarf `web.search`/`web.fetch`.
+#   * `researcher` recherchiert allgemeine Themen aus Web, Workspace-Dokumenten
+#     und PDFs (`web.search`/`web.fetch`).
+#   * `dependency-researcher` belegt Abhängigkeiten ökosystem-neutral aus
+#     Manifesten, Lockfiles und den offiziellen Paket-Registries
+#     (`web.search`/`web.fetch`).
+#   * `researcher-deps` ist der Rust/Cargo-Spezialist: `Cargo.lock` und der
+#     lokale Registry-Quellcache, ohne Netz.
+#   * `researcher-web` führt alle vier `web.*`-Werkzeuge, liest dafür aber
+#     keinerlei Workspace-Daten.
+# Netzzugang haben damit vier der fünf Worker, nicht nur `researcher-web`;
+# jeder Abruf bleibt an die Egress-Policy und die Host-Allowlist der Sandbox
+# gebunden, und das Netz eines Kindes ist nie breiter als das seiner Eltern.
 [workers]
 allowed = [
   "harwness.agent.explorer@1",
+  "harwness.agent.researcher@1",
+  "harwness.agent.dependency-researcher@1",
   "harwness.agent.researcher-deps@1",
   "harwness.agent.researcher-web@1",
 ]
 
 # Familienweite Vorgaben. `return_contract` ist hier keine Wiederholung, sondern
-# die gemeinsame Zusage: alle drei Worker liefern denselben Vertrag, ein
+# die gemeinsame Zusage: alle fünf Worker liefern denselben Vertrag, ein
 # Konsument muss die Rückgabe also nicht je Rolle unterscheiden.
 [defaults]
 return_contract = "harwness.return.research-finding@1"

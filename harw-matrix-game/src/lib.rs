@@ -21,6 +21,8 @@
 //! - [`phases`]: Phasen-FSM, JSON-Contracts, Effekt-Validierung,
 //!   deterministische GameMaster-Schritte.
 //! - [`aar`]: After-Action-Review als Markdown.
+//! - [`prompts`]: System-, Zug- und Korrektur-Prompts für Spieler-, Markt-
+//!   und Umpire-Agenten; Zug-Prompts entstehen nur aus [`visibility::SeatView`].
 //! - [`events`]: [`events::MatrixGameEvent`] für das TUI-Panel.
 //!
 //! # Concurrency
@@ -40,6 +42,7 @@ pub mod dice;
 pub mod error;
 pub mod events;
 pub mod phases;
+pub mod prompts;
 pub mod scenario;
 pub mod state;
 pub mod visibility;

@@ -693,7 +693,7 @@ mod tests {
 
         assert!(cfg.tools.plan.enabled);
         assert!(cfg.tools.plan.persist);
-        assert_eq!(cfg.mode.default, "plan");
+        assert_eq!(cfg.mode.default, "chat");
         assert_eq!(cfg.research.max_fetch_bytes, 1_048_576);
         assert_eq!(
             cfg.permissions,

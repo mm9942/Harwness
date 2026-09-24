@@ -1,3 +1,4 @@
 name = "security-inspection"
 description = "Perform authorized, non-destructive security inspection and evidence-based reporting."
+instructions_file = "instructions.md"
 tools = ["filesystem.read", "process.inspect"]

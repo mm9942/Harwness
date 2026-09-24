@@ -130,3 +130,11 @@ max_wall_secs = 120
 # (`harw-agent-dsl/src/executable.rs`).
 [return]
 contract = "harwness.security-verdict/v1"
+
+# Kontextprogramm (Runde 3, Welle C2): bindet `agents/context-programs/triage.toml`.
+# `embedded_agents::bind_context_program` liest diese Zeile aus der eigenen
+# Tabelle der Rolle (die Aufloesung verwirft das `[context]` des Kindes, weil
+# `worker-base` eines fuehrt) und ergaenzt das geerbte `[context]` um das
+# Programm. Ein unbekannter Name bricht das Laden der Rolle hart ab.
+[context]
+program = "triage"

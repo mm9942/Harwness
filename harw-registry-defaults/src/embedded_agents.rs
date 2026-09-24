@@ -117,6 +117,16 @@
 //! mitgegeben, damit das `extends` der eingebetteten Rollen auflöst. Gesenkt werden nur
 //! die Rollen aus [`crate::role_names::ALL`].
 //!
+//! # Kontextprogramm-Bindung
+//! Eine Rolle bindet ein Programm aus `agents/context-programs/` per
+//! `[context] program = "<name>"` (Name = Dateistamm, z. B. `"explore"`).
+//! [`builtin_agent_definitions`] löst es über
+//! `harw_agent_dsl::context_program::resolve_context_program` auf und schreibt
+//! es vor `lower` in die aufgelöste `[context]`-Tabelle; inline deklarierte
+//! Selektoren ergänzen das Programm. Ein unbekannter Name ist ein harter
+//! Fehler. Einzelheiten und die Grenze durch die Wurzel-Kontextdecke stehen
+//! bei `bind_context_program` und `ROOT_CEILING_SECTIONS`.
+//!
 //! # Fehler
 //! Alle Fehler dieses Moduls sind
 //! [`RegistryDefaultsError::AgentDefinition`] und tragen den Namen der
@@ -131,6 +141,10 @@
 use std::collections::HashMap;
 use std::sync::OnceLock;
 
+use harw_agent_dsl::context_program::{
+    RawContextProgramDefinition, ResolvedContextProgramDefinition, SectionStrength,
+    resolve_context_program,
+};
 use harw_agent_dsl::error::DslError;
 use harw_agent_dsl::family::{RawFamilyDefinition, resolve_family};
 use harw_agent_dsl::ids::DefinitionId;
@@ -597,7 +611,9 @@ pub fn builtin_agent_toml() -> &'static [(&'static str, &'static str)] {
 ///   eingebetteten Baum, zwei Dateien deklarieren denselben Rollennamen
 ///   (siehe [`reject_duplicate_names`]), eine eingebettete Definition ist
 ///   syntaktisch fehlerhaft, ihre Basis fehlt, sie verletzt die
-///   Authority-Monotonie oder das Senken schlägt fehl. Der Fehler benennt die
+///   Authority-Monotonie, sie bindet ein unbekanntes oder nicht auflösbares
+///   Kontextprogramm (`[context] program`), ein Kontextprogramm parst nicht
+///   oder das Senken schlägt fehl. Der Fehler benennt die
 ///   betroffene Definition und trägt den [`DslError`] als Ursache.
 ///
 /// # Nebenläufigkeit
@@ -629,34 +645,338 @@ pub fn builtin_agent_definitions(
 
     let now = OffsetDateTime::now_utc();
 
+    // 0. Die Kontextprogramm-Bibliothek (`agents/context-programs/*.toml`)
+    //    einmal parsen; Rollen binden daraus per `[context] program = "…"`.
+    let programs = ContextProgramLibrary::parse(builtin_context_program_toml())?;
+
     // 1. Alle eingebetteten Definitionen parsen. Auch die Basis wandert in den
     //    Schichtstapel, damit `extends` der eingebetteten Rollen auflösen kann.
+    //    Je Zielrolle werden zusätzlich ihre *eigenen* Tabellen gemerkt: die
+    //    Auflösung verwirft das `[context]` des Kindes, sobald die Basis eines
+    //    führt (siehe `worker-base.toml`), die Programmbindung steht aber genau
+    //    dort.
     let mut layers: Vec<(DefinitionLayer, RawAgentDefinition)> =
         Vec::with_capacity(builtin_agent_toml().len());
-    let mut targets: Vec<(&'static str, DefinitionId)> = Vec::with_capacity(role_names::ALL.len());
+    let mut targets: Vec<(&'static str, DefinitionId, toml::Table)> =
+        Vec::with_capacity(role_names::ALL.len());
 
     for (name, source) in builtin_agent_toml() {
         let raw = parse_toml(source).map_err(|error| definition_error(name, error))?;
         if role_names::ALL.contains(name) {
-            targets.push((*name, raw.id.clone()));
+            targets.push((*name, raw.id.clone(), raw.tables.clone()));
         }
         layers.push((DefinitionLayer::BuiltIn, raw));
     }
 
-    // 2. Nur die startbaren Rollen auflösen und senken — und nur, wenn keine
-    //    lokale Definition denselben Namen belegt.
+    // 2. Nur die startbaren Rollen auflösen, ihr Kontextprogramm binden und
+    //    senken — und nur, wenn keine lokale Definition denselben Namen belegt.
     let mut definitions = HashMap::with_capacity(targets.len());
-    for (name, id) in targets {
+    for (name, id, own_tables) in targets {
         if existing.contains_key(name) {
             continue;
         }
-        let resolved =
+        let mut resolved =
             resolve_definition(&id, &layers, now).map_err(|error| definition_error(name, error))?;
+        bind_context_program(&own_tables, &mut resolved.config, &programs, now)
+            .map_err(|error| definition_error(name, error))?;
         let ir = lower(&resolved).map_err(|error| definition_error(name, error))?;
         definitions.insert(name.to_owned(), ir);
     }
 
     Ok(definitions)
+}
+
+// ─── Kontextprogramm-Bindung ────────────────────────────────────────────────
+
+/// Reserviertes Root-Unterverzeichnis der Kontextprogramm-Bibliothek (siehe
+/// [`NON_ROLE_ROOT_DIRS`]).
+const CONTEXT_PROGRAMS_DIR: &str = "context-programs";
+
+/// Schlüssel der Programmbindung in der `[context]`-Tabelle einer Rolle.
+const CONTEXT_PROGRAM_KEY: &str = "program";
+
+/// Cache für [`builtin_context_program_toml`].
+static CONTEXT_PROGRAM_TOML: OnceLock<Vec<(&'static str, &'static str)>> = OnceLock::new();
+
+/// Die Sektionen der lokal vertrauten Wurzeldecke — Spiegel von
+/// `harw_context::ceiling::ROOT_CONTEXT_SECTIONS`.
+///
+/// # Warum ein Spiegel
+/// Diese Crate hängt nicht direkt von `harw-context` ab. Die Liste ist hier
+/// trotzdem nötig, weil `harw_core::child_controller` beim Start eines Kindes
+/// jede `must_include`-Sektion seiner IR gegen die geschnittene Kontextdecke
+/// prüft und das Kind **abweist**, wenn eine davon fehlt. Ein gebundenes
+/// Programm verlangt teils Sektionen, die keine Wurzeldecke zulässt
+/// (`plan.current`, `goal.invariants`, `diff.changeset`, `error.trace`,
+/// `child.returns`, `deps.lockfile_index`, `web.fetch_allowlist`). Würden sie
+/// ungefiltert zu `must_include`, ließe sich keine der gebundenen Rollen mehr
+/// starten.
+///
+/// Deshalb übernimmt [`bind_context_program`] als `must_include` nur die
+/// Programm-Sektionen, die diese Decke zulässt. Das vollständige Programm
+/// bleibt über `context_policy` (die kanonische Programm-ID) benannt. Wird
+/// die Wurzeldecke erweitert, muss diese Liste mitgezogen werden. Der Test
+/// `test_bound_programs_defer_exactly_the_sections_outside_the_root_ceiling`
+/// hält fest, welche Sektionen heute zurückgestellt sind.
+const ROOT_CEILING_SECTIONS: &[&str] = &[
+    "task.objective",
+    "task.read_scope",
+    "new.trigger_return",
+    "history.tail",
+    "legacy.v1",
+    "delegation.targets",
+    "continuation.instruction",
+];
+
+/// Sammelt die Kontextprogramme direkt unter `agents/context-programs/`.
+///
+/// Nicht rekursiv: `golden/` und `TESTS.txt` liegen daneben. Name ist der
+/// Dateistamm (`explore.toml` → `"explore"`), nach Namen sortiert.
+fn discover_context_program_toml<'a>(root: &Dir<'a>) -> Vec<(&'a str, &'a str)> {
+    let mut out = Vec::new();
+    if let Some(dir) = root.get_dir(CONTEXT_PROGRAMS_DIR) {
+        for entry in dir.entries() {
+            let DirEntry::File(file) = entry else {
+                continue;
+            };
+            let Some(relative) = toml_relative_path(file) else {
+                continue;
+            };
+            let Some(contents) = file.contents_utf8() else {
+                continue;
+            };
+            out.push((file_stem(relative), contents));
+        }
+    }
+    out.sort_by_key(|(name, _)| *name);
+    out
+}
+
+/// Die eingebauten Kontextprogramme als (Name, TOML-Quelltext).
+///
+/// # Beschreibung
+/// Der Name ist der Dateistamm unter `agents/context-programs/` und zugleich
+/// der Wert, mit dem eine Rolle per `[context] program = "<name>"` bindet.
+///
+/// # Rückgabe
+/// Ein statischer, nach Namen sortierter Ausschnitt.
+///
+/// # Nebenläufigkeit
+/// Der Baum wird höchstens einmal pro Prozess durchlaufen ([`OnceLock`]).
+///
+/// # Beispiele
+/// ```rust
+/// use harw_registry_defaults::embedded_agents::builtin_context_program_toml;
+///
+/// let names: Vec<&str> = builtin_context_program_toml().iter().map(|(n, _)| *n).collect();
+/// assert!(names.contains(&"explore"));
+/// assert!(names.contains(&"base"));
+/// ```
+#[must_use]
+pub fn builtin_context_program_toml() -> &'static [(&'static str, &'static str)] {
+    CONTEXT_PROGRAM_TOML
+        .get_or_init(|| discover_context_program_toml(&AGENTS_DIR))
+        .as_slice()
+}
+
+/// Die geparste Kontextprogramm-Bibliothek: Name → ID plus der gemeinsame
+/// [`DefinitionLayer::BuiltIn`]-Stapel für `resolve_context_program`.
+struct ContextProgramLibrary<'a> {
+    /// (Dateistamm, deklarierte ID) je Programm.
+    ids: Vec<(&'a str, DefinitionId)>,
+    /// Alle Programme als Layer, damit `extends` (auf `base`) auflöst.
+    layers: Vec<(DefinitionLayer, RawContextProgramDefinition)>,
+}
+
+impl<'a> ContextProgramLibrary<'a> {
+    /// Parst alle Programmquellen.
+    ///
+    /// # Errors
+    /// [`RegistryDefaultsError::AgentDefinition`] mit dem Namen
+    /// `context-programs/<name>`, wenn zwei Dateien denselben Namen tragen oder
+    /// eine Datei nicht als `harwness.context/v1` parst.
+    fn parse(sources: &[(&'a str, &str)]) -> Result<Self, RegistryDefaultsError> {
+        reject_duplicate_names(sources, "Kontextprogramm")?;
+        let mut ids = Vec::with_capacity(sources.len());
+        let mut layers = Vec::with_capacity(sources.len());
+        for (name, source) in sources {
+            let raw = toml::from_str::<RawContextProgramDefinition>(source).map_err(|error| {
+                definition_error(
+                    &format!("{CONTEXT_PROGRAMS_DIR}/{name}"),
+                    dsl_error_from_toml(error.to_string()),
+                )
+            })?;
+            ids.push((*name, raw.id.clone()));
+            layers.push((DefinitionLayer::BuiltIn, raw));
+        }
+        Ok(Self { ids, layers })
+    }
+
+    /// Löst das Programm `name` über `resolve_context_program` auf.
+    ///
+    /// # Errors
+    /// [`DslError::Parse`], wenn kein Programm so heißt (die Meldung nennt die
+    /// bekannten Namen) oder die Auflösung scheitert.
+    fn resolve(
+        &self,
+        name: &str,
+        now: OffsetDateTime,
+    ) -> Result<ResolvedContextProgramDefinition, DslError> {
+        let Some((_, id)) = self.ids.iter().find(|(known, _)| *known == name) else {
+            let known: Vec<&str> = self.ids.iter().map(|(known, _)| *known).collect();
+            return Err(DslError::Parse(format!(
+                "unbekanntes Kontextprogramm '{name}' in [context].{CONTEXT_PROGRAM_KEY} — bekannt sind: {}",
+                known.join(", ")
+            )));
+        };
+        resolve_context_program(id, &self.layers, now).map_err(|error| {
+            DslError::Parse(format!(
+                "Kontextprogramm '{name}' lässt sich nicht auflösen: {error}"
+            ))
+        })
+    }
+}
+
+/// Die `[context]`-Tabelle einer TOML-Tabelle, falls vorhanden.
+fn context_table(tables: &toml::Table) -> Option<&toml::Table> {
+    tables.get("context").and_then(toml::Value::as_table)
+}
+
+/// Liest eine String-Liste aus `table[field]`; fehlt sie, ist sie leer.
+fn table_strings(table: Option<&toml::Table>, field: &str) -> Vec<String> {
+    table
+        .and_then(|table| table.get(field))
+        .and_then(toml::Value::as_array)
+        .map(|values| {
+            values
+                .iter()
+                .filter_map(toml::Value::as_str)
+                .map(str::to_owned)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Liest die explizite Kontext-Politik (`policy` bzw. `context_policy`).
+fn table_policy(table: Option<&toml::Table>) -> Option<String> {
+    let table = table?;
+    ["policy", "context_policy"]
+        .iter()
+        .find_map(|field| table.get(*field).and_then(toml::Value::as_str))
+        .map(str::to_owned)
+}
+
+/// Hängt `value` an, sofern noch nicht enthalten.
+fn push_unique(list: &mut Vec<String>, value: &str) {
+    if !list.iter().any(|existing| existing == value) {
+        list.push(value.to_owned());
+    }
+}
+
+/// Der gebundene Programmname: zuerst aus den eigenen Tabellen der Rolle,
+/// sonst aus der aufgelösten Config (geerbt oder eigene Sektion ohne Basis).
+///
+/// # Errors
+/// [`DslError::Toml`], wenn `program` kein String ist.
+fn context_program_name(
+    own_tables: &toml::Table,
+    resolved_config: &toml::Table,
+) -> Result<Option<String>, DslError> {
+    let value = context_table(own_tables)
+        .and_then(|table| table.get(CONTEXT_PROGRAM_KEY))
+        .or_else(|| {
+            context_table(resolved_config).and_then(|table| table.get(CONTEXT_PROGRAM_KEY))
+        });
+    match value {
+        None => Ok(None),
+        Some(toml::Value::String(name)) => Ok(Some(name.clone())),
+        Some(other) => Err(DslError::Toml(format!(
+            "[context].{CONTEXT_PROGRAM_KEY} muss ein String sein, gefunden: {}",
+            other.type_str()
+        ))),
+    }
+}
+
+/// Bindet das per `[context] program = "<name>"` benannte Kontextprogramm
+/// in die aufgelöste Config, bevor `lower` sie liest.
+///
+/// # Beschreibung
+/// Ohne Bindung bleibt `resolved_config` unverändert. Mit Bindung entsteht
+/// eine neue `[context]`-Tabelle:
+///
+/// - `policy`: eine inline gesetzte `policy`/`context_policy` gewinnt, sonst
+///   die kanonische ID des Programms (z. B. `harwness.context.explore@1`).
+/// - `must_include`: zuerst die `must-include`-Sektionen des aufgelösten
+///   Programms in Deklarationsreihenfolge, soweit [`ROOT_CEILING_SECTIONS`]
+///   sie zulässt, danach die inline deklarierten Selektoren (geerbt aus der
+///   Basis, dann die eigenen der Rolle). Doppelte werden entfernt.
+/// - `exclude`: zuerst die Ausschlüsse des Programms, danach die inline
+///   deklarierten. Ein Programm-Ausschluss, den die Rolle inline exakt als
+///   `must_include` führt, entfällt: inline gewinnt.
+///
+/// # Errors
+/// - [`DslError::Toml`]: `program` ist kein String.
+/// - [`DslError::Parse`]: kein eingebautes Programm trägt diesen Namen, oder
+///   seine Auflösung scheitert. Ein unbekannter Name ist ein harter Fehler,
+///   kein stiller Rückfall auf die Basis.
+fn bind_context_program(
+    own_tables: &toml::Table,
+    resolved_config: &mut toml::Table,
+    programs: &ContextProgramLibrary<'_>,
+    now: OffsetDateTime,
+) -> Result<(), DslError> {
+    let Some(name) = context_program_name(own_tables, resolved_config)? else {
+        return Ok(());
+    };
+    let program = programs.resolve(&name, now)?;
+
+    let inherited = context_table(resolved_config);
+    let own = context_table(own_tables);
+
+    let mut inline_must_include = table_strings(inherited, "must_include");
+    for selector in table_strings(own, "must_include") {
+        push_unique(&mut inline_must_include, &selector);
+    }
+    let mut inline_exclude = table_strings(inherited, "exclude");
+    for selector in table_strings(own, "exclude") {
+        push_unique(&mut inline_exclude, &selector);
+    }
+    let policy = table_policy(own)
+        .or_else(|| table_policy(inherited))
+        .unwrap_or_else(|| program.id.to_string());
+
+    let mut must_include: Vec<String> = Vec::new();
+    for section in &program.sections {
+        if section.strength == SectionStrength::MustInclude
+            && ROOT_CEILING_SECTIONS.contains(&section.name.as_str())
+        {
+            push_unique(&mut must_include, &section.name);
+        }
+    }
+    for selector in &inline_must_include {
+        push_unique(&mut must_include, selector);
+    }
+
+    let mut exclude: Vec<String> = Vec::new();
+    for selector in &program.exclude {
+        if !inline_must_include.contains(selector) {
+            push_unique(&mut exclude, selector);
+        }
+    }
+    for selector in &inline_exclude {
+        push_unique(&mut exclude, selector);
+    }
+
+    let to_array = |values: Vec<String>| {
+        toml::Value::Array(values.into_iter().map(toml::Value::String).collect())
+    };
+    let mut context = toml::Table::new();
+    context.insert(CONTEXT_PROGRAM_KEY.to_owned(), toml::Value::String(name));
+    context.insert("policy".to_owned(), toml::Value::String(policy));
+    context.insert("must_include".to_owned(), to_array(must_include));
+    context.insert("exclude".to_owned(), to_array(exclude));
+    resolved_config.insert("context".to_owned(), toml::Value::Table(context));
+    Ok(())
 }
 
 /// Baut den typisierten Fehler für eine benannte eingebaute Definition.
@@ -1962,18 +2282,364 @@ mod tests {
         Ok(())
     }
 
+    /// Die gemeinsamen Selektoren der Basis (bzw. der gleichlautenden
+    /// Inline-Sektion der Orchestratoren) bleiben bei jeder Rolle erhalten —
+    /// auch bei denen, die zusätzlich ein Kontextprogramm binden. Ohne
+    /// Bindung ist das `[context]` exakt das der Basis.
     #[test]
     fn test_builtin_roles_carry_the_shared_context_program_from_the_base() -> TestResult {
+        const BASE_MUST_INCLUDE: [&str; 3] =
+            ["task.objective", "task.read_scope", "new.trigger_return"];
+        const BASE_EXCLUDE: [&str; 2] = ["full_parent_transcript", "sibling_transcripts"];
+        let bound: HashMap<&str, &str> = EXPECTED_CONTEXT_PROGRAM_BINDINGS.into_iter().collect();
         for (role, ir) in builtin()? {
+            let program = ir.context_program();
+            if bound.contains_key(role.as_str()) {
+                for selector in BASE_MUST_INCLUDE {
+                    assert!(
+                        program.must_include().iter().any(|s| s == selector),
+                        "{role}: {selector} fehlt in must_include"
+                    );
+                }
+                for selector in BASE_EXCLUDE {
+                    assert!(
+                        program.exclude().iter().any(|s| s == selector),
+                        "{role}: {selector} fehlt in exclude"
+                    );
+                }
+            } else {
+                assert_eq!(program.must_include(), BASE_MUST_INCLUDE, "{role}");
+                assert_eq!(program.exclude(), BASE_EXCLUDE, "{role}");
+                assert_eq!(program.context_policy(), None, "{role}");
+            }
+        }
+        Ok(())
+    }
+
+    // ── Kontextprogramm-Bindung (Runde 3, Welle C2) ─────────────────────────
+
+    /// Rolle → gebundenes Kontextprogramm (Dateistamm unter
+    /// `agents/context-programs/`). Eine eigene `reviewer`-Rolle gibt es
+    /// nicht; `analyst` trägt `review`.
+    const EXPECTED_CONTEXT_PROGRAM_BINDINGS: [(&str, &str); 14] = [
+        (role_names::EXPLORER, "explore"),
+        (role_names::PLANNER, "plan"),
+        (role_names::EXECUTOR, "implement"),
+        (role_names::ANALYST, "review"),
+        (role_names::SECURITY_EGRESS_TRIAGE, "triage"),
+        (role_names::SECURITY_BASELINE_TRIAGE, "triage"),
+        (role_names::SECURITY_STRUCTURE_TRIAGE, "triage"),
+        (role_names::SECURITY_ENDPOINT_TRIAGE, "triage"),
+        (role_names::ROOT_ORCHESTRATOR, "orchestrate"),
+        (role_names::CODING_ORCHESTRATOR, "orchestrate"),
+        (role_names::RESEARCH_ORCHESTRATOR, "orchestrate"),
+        (role_names::ANALYSIS_ORCHESTRATOR, "orchestrate"),
+        (role_names::RESEARCHER_DEPS, "research-deps"),
+        (role_names::RESEARCHER_WEB, "research-web"),
+    ];
+
+    /// Die eingebettete Programmbibliothek, geparst.
+    fn program_library() -> TestResult<ContextProgramLibrary<'static>> {
+        ContextProgramLibrary::parse(builtin_context_program_toml())
+            .map_err(ctx("die eingebaute Kontextprogramm-Bibliothek muss parsen"))
+    }
+
+    /// Löst ein Bibliotheksprogramm auf oder scheitert mit seinem Namen.
+    fn resolved_program(name: &str) -> TestResult<ResolvedContextProgramDefinition> {
+        program_library()?
+            .resolve(name, OffsetDateTime::now_utc())
+            .map_err(|error| TestError::Unexpected(format!("{name}: {error}")))
+    }
+
+    #[test]
+    fn test_context_program_library_embeds_all_ten_programs() {
+        let names: BTreeSet<&str> = builtin_context_program_toml()
+            .iter()
+            .map(|(name, _)| *name)
+            .collect();
+        let expected: BTreeSet<&str> = [
+            "base",
+            "curate",
+            "explore",
+            "implement",
+            "orchestrate",
+            "plan",
+            "research-deps",
+            "research-web",
+            "review",
+            "triage",
+        ]
+        .into_iter()
+        .collect();
+        assert_eq!(
+            names, expected,
+            "golden/ und TESTS.txt dürfen nicht mitzählen"
+        );
+    }
+
+    /// Je Bindung: die IR nennt das Programm als `context_policy`, trägt alle
+    /// Ausschlüsse des Programms und jede `must-include`-Sektion, die die
+    /// Wurzeldecke zulässt.
+    #[test]
+    fn test_every_mapped_role_binds_its_context_program() -> TestResult {
+        let definitions = builtin()?;
+        for (role, program_name) in EXPECTED_CONTEXT_PROGRAM_BINDINGS {
+            let ir = definitions
+                .get(role)
+                .ok_or_else(|| TestError::Unexpected(format!("{role} fehlt")))?;
+            let program = resolved_program(program_name)?;
+            let bound = ir.context_program();
+            let expected_policy = program.id.to_string();
             assert_eq!(
-                ir.context_program().must_include(),
-                ["task.objective", "task.read_scope", "new.trigger_return"],
+                bound.context_policy(),
+                Some(expected_policy.as_str()),
+                "{role} muss {program_name} binden"
+            );
+            for selector in &program.exclude {
+                assert!(
+                    bound.exclude().iter().any(|s| s == selector),
+                    "{role}: Programm-Ausschluss {selector} fehlt"
+                );
+            }
+            for section in &program.sections {
+                if section.strength == SectionStrength::MustInclude
+                    && ROOT_CEILING_SECTIONS.contains(&section.name.as_str())
+                {
+                    assert!(
+                        bound.must_include().iter().any(|s| *s == section.name),
+                        "{role}: must-include-Sektion {} aus {program_name} fehlt",
+                        section.name
+                    );
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Laufzeitsicherheit: `harw_core::child_controller` weist ein Kind ab,
+    /// dessen `must_include` eine Sektion außerhalb der Kontextdecke nennt.
+    /// Keine gesenkte Rolle darf das tun — sonst ließe sie sich nicht starten.
+    #[test]
+    fn test_no_role_must_include_leaves_the_root_ceiling() -> TestResult {
+        for (role, ir) in builtin()? {
+            for selector in ir.context_program().must_include() {
+                assert!(
+                    ROOT_CEILING_SECTIONS.contains(&selector.as_str()),
+                    "{role}: must_include '{selector}' liegt außerhalb der Wurzeldecke"
+                );
+            }
+            assert!(
+                ir.context_program().section_detail().is_empty(),
+                "{role}: section_detail wird ebenfalls gegen die Decke geprüft"
+            );
+        }
+        Ok(())
+    }
+
+    /// Hält fest, welche `must-include`-Sektionen der gebundenen Programme
+    /// heute an der Wurzeldecke scheitern und deshalb nicht in `must_include`
+    /// landen. Wird die Decke (`harw_context::ceiling::ROOT_CONTEXT_SECTIONS`
+    /// und der Spiegel [`ROOT_CEILING_SECTIONS`]) erweitert, schlägt dieser
+    /// Test an — gewollt, damit die Bindung bewusst nachgezogen wird.
+    #[test]
+    fn test_bound_programs_defer_exactly_the_sections_outside_the_root_ceiling() -> TestResult {
+        let expected: [(&str, &[&str]); 8] = [
+            ("explore", &[]),
+            ("plan", &["goal.invariants", "plan.current"]),
+            ("implement", &["plan.current"]),
+            ("review", &["diff.changeset", "goal.invariants"]),
+            ("triage", &["error.trace"]),
+            ("orchestrate", &["plan.current", "child.returns"]),
+            ("research-deps", &["deps.lockfile_index"]),
+            ("research-web", &["web.fetch_allowlist"]),
+        ];
+        for (name, deferred) in expected {
+            let program = resolved_program(name)?;
+            let actual: Vec<&str> = program
+                .sections
+                .iter()
+                .filter(|section| section.strength == SectionStrength::MustInclude)
+                .map(|section| section.name.as_str())
+                .filter(|section| !ROOT_CEILING_SECTIONS.contains(section))
+                .collect();
+            assert_eq!(actual, deferred, "{name}");
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn test_explorer_binding_merges_program_and_inline_selectors_in_order() -> TestResult {
+        let definitions = builtin()?;
+        let explorer = definitions[role_names::EXPLORER].context_program();
+        assert_eq!(
+            explorer.context_policy(),
+            Some("harwness.context.explore@1")
+        );
+        assert_eq!(
+            explorer.must_include(),
+            [
+                "task.objective",
+                "history.tail",
+                "task.read_scope",
+                "new.trigger_return"
+            ]
+        );
+        assert_eq!(
+            explorer.exclude(),
+            [
+                "credential.*",
+                "secret.*",
+                "sibling_transcripts",
+                "full_parent_transcript",
+                "plan.*"
+            ]
+        );
+        Ok(())
+    }
+
+    /// Parst eine synthetische Rolle und bindet ihr Programm gegen die echte
+    /// Bibliothek — ohne `agents/` anzufassen.
+    fn bind_synthetic(context: &str) -> Result<toml::Table, DslError> {
+        let source = format!(
+            "schema = \"harwness.agent/v1\"\n\
+             id = \"harwness.agent.synthetic@1\"\n\
+             version = \"1.0.0\"\n\
+             role = \"worker\"\n\
+             specialization = \"synthetic\"\n\
+             {context}\n"
+        );
+        let raw = parse_toml(&source)?;
+        let mut config = raw.tables.clone();
+        let library = ContextProgramLibrary::parse(builtin_context_program_toml())
+            .map_err(|error| DslError::Parse(error.to_string()))?;
+        bind_context_program(
+            &raw.tables,
+            &mut config,
+            &library,
+            OffsetDateTime::now_utc(),
+        )?;
+        Ok(config)
+    }
+
+    #[test]
+    fn test_unknown_context_program_is_a_hard_error() -> TestResult {
+        let Err(error) = bind_synthetic("[context]\nprogram = \"gibt-es-nicht\"") else {
+            return Err(TestError::Unexpected(
+                "ein unbekanntes Kontextprogramm darf nicht still ignoriert werden".to_owned(),
+            ));
+        };
+        let message = error.to_string();
+        assert!(message.contains("gibt-es-nicht"), "{message}");
+        assert!(
+            message.contains("explore"),
+            "die Meldung nennt die bekannten Programme: {message}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn test_non_string_context_program_is_a_hard_error() {
+        assert!(bind_synthetic("[context]\nprogram = 3").is_err());
+    }
+
+    #[test]
+    fn test_inline_context_extends_and_wins_over_the_program() -> TestResult {
+        let config = bind_synthetic(
+            "[context]\n\
+             program = \"review\"\n\
+             policy = \"harwness.context.custom@1\"\n\
+             must_include = [\"plan.current\", \"task.read_scope\"]\n\
+             exclude = [\"secret.extra\"]",
+        )
+        .map_err(|error| TestError::Unexpected(error.to_string()))?;
+        let ir_source = config
+            .get("context")
+            .and_then(toml::Value::as_table)
+            .ok_or(TestError::Missing("[context] muss gesetzt sein"))?;
+        assert_eq!(
+            ir_source.get("policy").and_then(toml::Value::as_str),
+            Some("harwness.context.custom@1"),
+            "eine inline gesetzte Politik gewinnt"
+        );
+        let exclude = table_strings(Some(ir_source), "exclude");
+        assert!(
+            !exclude.iter().any(|s| s == "plan.current"),
+            "inline must_include hebt den gleichnamigen Programm-Ausschluss auf: {exclude:?}"
+        );
+        assert!(exclude.iter().any(|s| s == "secret.extra"), "{exclude:?}");
+        assert!(exclude.iter().any(|s| s == "credential.*"), "{exclude:?}");
+        let must_include = table_strings(Some(ir_source), "must_include");
+        assert_eq!(
+            must_include,
+            [
+                "task.objective",
+                "history.tail",
+                "plan.current",
+                "task.read_scope"
+            ],
+            "Programm zuerst (gefiltert auf die Wurzeldecke), dann inline"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn test_role_without_program_keeps_its_context_untouched() -> TestResult {
+        let config = bind_synthetic("[context]\nmust_include = [\"task.objective\"]")
+            .map_err(|error| TestError::Unexpected(error.to_string()))?;
+        let context = config
+            .get("context")
+            .and_then(toml::Value::as_table)
+            .ok_or(TestError::Missing("[context] muss erhalten bleiben"))?;
+        assert_eq!(
+            context.len(),
+            1,
+            "ohne Bindung keine zusätzlichen Schlüssel"
+        );
+        Ok(())
+    }
+
+    // ── Matrix-Game-Sitze (Runde 3, Welle E) ───────────────────────────────
+
+    /// Die drei Matrix-Sitz-Rollen: organisatorisch `Worker`, ohne jedes
+    /// Werkzeug, nicht pausierbar, ohne eigene Ebene darunter und mit einem
+    /// Text-Rückgabevertrag.
+    #[test]
+    fn test_matrix_seat_roles_are_tool_less_non_pausing_text_workers() -> TestResult {
+        let definitions = builtin()?;
+        for role in role_names::MATRIX_ROLES {
+            let ir = definitions
+                .get(role)
+                .ok_or_else(|| TestError::Unexpected(format!("{role} fehlt")))?;
+            assert_eq!(
+                ir.role(),
+                harw_agent_dsl::roles::AgentRoleId::Worker,
                 "{role}"
             );
+            assert!(
+                ir.tool_surface().admitted().is_empty(),
+                "{role} muss werkzeuglos sein: {:?}",
+                ir.tool_surface().admitted()
+            );
+            for tool in ["fs.write", "shell.exec", "web.fetch", "web.search"] {
+                assert!(
+                    ir.tool_surface().forbidden().iter().any(|t| t == tool),
+                    "{role} muss {tool} ausdrücklich verbieten"
+                );
+            }
+            assert!(!ir.lifecycle_machine().allow_pause(), "{role}");
+            assert_eq!(ir.spawn_contract().max_depth(), Some(0), "{role}");
+            let contract = ir
+                .return_pipeline()
+                .contract()
+                .ok_or_else(|| TestError::Unexpected(format!("{role} ohne Rückgabevertrag")))?;
+            assert!(
+                contract.starts_with("harwness.matrix."),
+                "{role}: Text-Vertrag des Matrix-Games erwartet, gefunden {contract}"
+            );
             assert_eq!(
-                ir.context_program().exclude(),
-                ["full_parent_transcript", "sibling_transcripts"],
-                "{role}"
+                ir.context_program().context_policy(),
+                None,
+                "{role}: Matrix-Sitze sehen nur ihre Sicht aus dem Prompt"
             );
         }
         Ok(())
@@ -2154,8 +2820,11 @@ mod tests {
         // jeweils `[spawn] max_depth = 0`) plus `executor` (Slice B7: ein
         // Ausführungs-Job führt die ihm übergebene Befehlsfolge selbst aus
         // und meldet zurück, statt weiter zu delegieren — siehe
-        // `agents/executor.toml` `[spawn] max_depth = 0`).
-        const ZERO_DEPTH_ROLES: [&str; 11] = [
+        // `agents/executor.toml` `[spawn] max_depth = 0`) plus die drei
+        // Matrix-Game-Sitze (Runde 3, Welle E: ein Zug, ein Urteil bzw. eine
+        // Schätzung ist eine einzelne Textantwort, kein Fan-out — siehe
+        // `agents/roles/matrix-*/matrix-*.toml`, jeweils `[spawn] max_depth = 0`).
+        const ZERO_DEPTH_ROLES: [&str; 14] = [
             role_names::SECURITY_EGRESS_TRIAGE,
             role_names::SECURITY_BASELINE_TRIAGE,
             role_names::SECURITY_STRUCTURE_TRIAGE,
@@ -2167,6 +2836,9 @@ mod tests {
             role_names::UIA_WRITER,
             role_names::UIA_SHELL_WORKER,
             role_names::EXECUTOR,
+            role_names::MATRIX_PLAYER,
+            role_names::MATRIX_UMPIRE,
+            role_names::MATRIX_MARKET,
         ];
 
         let definitions = builtin()?;
@@ -2333,10 +3005,32 @@ mod tests {
             role_names_of(&resolved.workers),
             vec![
                 role_names::EXPLORER,
+                role_names::RESEARCHER,
+                role_names::DEPENDENCY_RESEARCHER,
                 role_names::RESEARCHER_DEPS,
                 role_names::RESEARCHER_WEB,
             ]
         );
+        // Die Familien-Invarianten gelten für jeden Worker des Rosters:
+        // read-only (`workers_are_read_only`) und belegte Funde
+        // (`findings_carry_sources`).
+        let definitions = builtin()?;
+        for name in role_names_of(&resolved.workers) {
+            let ir = definitions
+                .get(name)
+                .ok_or_else(|| TestError::Unexpected(format!("{name} fehlt")))?;
+            for tool in ["fs.write", "shell.exec"] {
+                assert!(
+                    ir.tool_surface().forbidden().iter().any(|t| t == tool),
+                    "{name} muss {tool} verbieten"
+                );
+            }
+            assert_eq!(
+                ir.return_pipeline().contract(),
+                Some("harwness.return.research-finding@1"),
+                "{name}"
+            );
+        }
         assert_eq!(
             role_names_of(&resolved.orchestrators),
             vec![role_names::RESEARCH_ORCHESTRATOR, role_names::ANALYST],

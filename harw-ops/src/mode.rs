@@ -597,9 +597,9 @@ mod tests {
 
     #[tokio::test]
     async fn test_mode_show_reports_configured_default() -> TestResult {
-        // Die injizierte Standard-Config trägt `[mode] default = "plan"`.
+        // Die injizierte Standard-Config trägt `[mode] default = "chat"`.
         let report = run(&[]).await?;
-        assert_eq!(report["default"], serde_json::json!("plan"));
+        assert_eq!(report["default"], serde_json::json!("chat"));
         Ok(())
     }
 
