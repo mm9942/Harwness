@@ -169,13 +169,9 @@ fn write_private_atomic(target: &Path, bytes: &[u8]) -> std::io::Result<()> {
             Err(error) => return Err(error),
         }
     };
-    let result = file
-        .write_all(bytes)
-        .and_then(|()| file.sync_all())
-        .and_then(|()| {
-            drop(file);
-            std::fs::rename(&temp_path, target)
-        });
+    let written = file.write_all(bytes).and_then(|()| file.sync_all());
+    drop(file);
+    let result = written.and_then(|()| std::fs::rename(&temp_path, target));
     if result.is_err() {
         let _ = std::fs::remove_file(&temp_path);
     }
@@ -310,7 +306,7 @@ impl AttachmentCache {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_support::{TestResult, ctx};
+    use crate::test_support::{TestError, TestResult, ctx};
     use harw_types::{ChannelId, PeerId, TenantId};
 
     fn scope(peer: &str) -> SessionKey {
@@ -409,7 +405,7 @@ mod tests {
             .path()
             .join(scope_dir_name(&scope("3")))
             .join(format!("{}.json", "0".repeat(64)));
-        create_private_dir(corrupt.parent().ok_or(crate::test_support::TestError::Missing("parent"))?)
+        create_private_dir(corrupt.parent().ok_or(TestError::Missing("parent"))?)
             .map_err(ctx("corrupt dir"))?;
         std::fs::write(&corrupt, b"not json").map_err(ctx("corrupt write"))?;
 

@@ -57,7 +57,10 @@ pub(crate) fn validate_tool_name(name: &str) -> Result<(), SdkError> {
 }
 
 /// Übersetzt das JSON-Schema eines Werkzeugs; verlangt `"type": "object"`.
-pub(crate) fn tool_schema(name: &str, parameters: serde_json::Value) -> Result<JsonSchema, SdkError> {
+pub(crate) fn tool_schema(
+    name: &str,
+    parameters: serde_json::Value,
+) -> Result<JsonSchema, SdkError> {
     let schema: JsonSchema = serde_json::from_value(parameters).map_err(|error| {
         SdkError::invalid(
             "tool.parameters",
@@ -143,7 +146,10 @@ impl SdkToolProvider {
 
 impl ToolProvider for SdkToolProvider {
     fn tools(&self) -> Vec<ToolSpec> {
-        self.entries.iter().map(|entry| entry.spec.clone()).collect()
+        self.entries
+            .iter()
+            .map(|entry| entry.spec.clone())
+            .collect()
     }
 
     fn executor(&self, name: &ToolName) -> Option<Arc<dyn ToolExecutor>> {
@@ -235,10 +241,7 @@ pub(crate) fn validate_context_sources(sources: &[Arc<dyn ContextSource>]) -> Re
     for source in sources {
         let namespace = source.namespace();
         if namespace.trim().is_empty() {
-            return Err(SdkError::invalid(
-                "context.namespace",
-                "must not be empty",
-            ));
+            return Err(SdkError::invalid("context.namespace", "must not be empty"));
         }
         if !seen.insert(namespace) {
             return Err(SdkError::invalid(
@@ -332,7 +335,10 @@ fn sessions_root(home: &Path) -> Result<PathBuf, SdkError> {
 /// - `home`: aufgelöster Root-Space.
 /// - `ephemeral`: `true` für einen flüchtigen In-Memory-Speicher (kein
 ///   Fortsetzen über Prozessgrenzen).
-pub(crate) fn open_state_store(home: &Path, ephemeral: bool) -> Result<Arc<dyn StateStore>, SdkError> {
+pub(crate) fn open_state_store(
+    home: &Path,
+    ephemeral: bool,
+) -> Result<Arc<dyn StateStore>, SdkError> {
     if ephemeral {
         return Ok(Arc::new(InMemoryStateStore::new()));
     }
@@ -353,9 +359,12 @@ mod tests {
     type TestResult = std::result::Result<(), Box<dyn std::error::Error>>;
 
     fn echo_tool(name: &str, parameters: serde_json::Value) -> Arc<dyn Tool> {
-        Arc::new(FnTool::new(name, "echo", parameters, |args: serde_json::Value| async move {
-            Ok::<_, ToolError>(args)
-        }))
+        Arc::new(FnTool::new(
+            name,
+            "echo",
+            parameters,
+            |args: serde_json::Value| async move { Ok::<_, ToolError>(args) },
+        ))
     }
 
     #[test]
@@ -376,17 +385,26 @@ mod tests {
         ]);
         assert!(matches!(
             duplicate,
-            Err(SdkError::InvalidInput { field: "tool.name", .. })
+            Err(SdkError::InvalidInput {
+                field: "tool.name",
+                ..
+            })
         ));
         let not_object = SdkToolProvider::new(vec![echo_tool("b", json!({"type": "string"}))]);
         assert!(matches!(
             not_object,
-            Err(SdkError::InvalidInput { field: "tool.parameters", .. })
+            Err(SdkError::InvalidInput {
+                field: "tool.parameters",
+                ..
+            })
         ));
         let not_schema = SdkToolProvider::new(vec![echo_tool("c", json!("object"))]);
         assert!(matches!(
             not_schema,
-            Err(SdkError::InvalidInput { field: "tool.parameters", .. })
+            Err(SdkError::InvalidInput {
+                field: "tool.parameters",
+                ..
+            })
         ));
     }
 
@@ -453,8 +471,7 @@ mod tests {
 
     #[test]
     fn context_namespaces_must_be_unique_and_non_empty() {
-        let unique: Vec<Arc<dyn ContextSource>> =
-            vec![Arc::new(Fixed("a")), Arc::new(Fixed("b"))];
+        let unique: Vec<Arc<dyn ContextSource>> = vec![Arc::new(Fixed("a")), Arc::new(Fixed("b"))];
         assert!(validate_context_sources(&unique).is_ok());
         let twice: Vec<Arc<dyn ContextSource>> = vec![Arc::new(Fixed("a")), Arc::new(Fixed("a"))];
         assert!(validate_context_sources(&twice).is_err());

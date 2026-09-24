@@ -83,8 +83,8 @@ pub use serde_json;
 pub mod prelude {
     pub use crate::{
         ApprovalHandler, ApprovalPolicy, ApprovalRequest, AutoDeny, BoxFuture, ContextItem,
-        ContextSource, Decision, EventStream, FnTool, Harwness, HarwnessBuilder, Mode,
-        SdkError, SdkEvent, Session, SessionId, Tool, ToolContext, ToolError, TurnReport,
-        TurnStatus, approval_fn,
+        ContextSource, Decision, EventStream, FnTool, Harwness, HarwnessBuilder, Mode, SdkError,
+        SdkEvent, Session, SessionId, Tool, ToolContext, ToolError, TurnReport, TurnStatus,
+        approval_fn,
     };
 }

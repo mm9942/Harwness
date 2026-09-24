@@ -595,7 +595,12 @@ mod tests {
             Some("tool.name")
         );
         assert_eq!(
-            field_of(base().tool_arc(noop_tool("a")).tool_arc(noop_tool("a")).validate()),
+            field_of(
+                base()
+                    .tool_arc(noop_tool("a"))
+                    .tool_arc(noop_tool("a"))
+                    .validate()
+            ),
             Some("tool.name")
         );
         let valid = base()

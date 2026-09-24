@@ -12,10 +12,7 @@ use harwness_sdk::prelude::*;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let prompt = std::env::args()
-        .skip(1)
-        .collect::<Vec<_>>()
-        .join(" ");
+    let prompt = std::env::args().skip(1).collect::<Vec<_>>().join(" ");
     let prompt = if prompt.trim().is_empty() {
         "Liste die wichtigsten Dateien dieses Projekts auf.".to_owned()
     } else {
@@ -46,7 +43,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 SdkEvent::ToolCall { tool, source, .. } => {
                     eprintln!("\n[{}] -> {tool}", source.role);
                 }
-                SdkEvent::ToolResult { output, duration, .. } => {
+                SdkEvent::ToolResult {
+                    output, duration, ..
+                } => {
                     let state = if output.is_success() { "ok" } else { "error" };
                     eprintln!("[tool] <- {state} ({} ms)", duration.as_millis());
                 }

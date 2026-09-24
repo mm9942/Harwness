@@ -6,6 +6,36 @@ Semantic Versioning within the 0.x pre-release range.
 
 ## [Unreleased]
 
+**Neuer Befehlsbaum der Kommandozeile (`harw`)**
+- Befehle nach Aufgaben geordnet: `chat`, `exec`, `analyze`, `session`,
+  `config`, `provider`, `model`, `auth`, `project`, `agent`, `knowledge`,
+  `jobs`, `gateway`, `serve`, `web`, `service`, `mcp`, `channel` sowie die
+  System-Befehle. Vollständige Referenz mit Zuordnung alt → neu in
+  [`docs/cli.md`](docs/cli.md).
+- Neu: `harw exec PROMPT…` für eine echte einmalige Anfrage ohne Oberfläche;
+  `harw session list [--all] | show ID | resume ID`; `harw provider
+  list|add|remove|enable|disable|scan`; `harw model catalog [--refresh]`;
+  `harw agent uia-new|skills|plugins`; `harw knowledge index|memory|proposals`;
+  `harw jobs list|show|approve [--note]|deny [--reason]|cancel|retry`;
+  `harw channel connect telegram [--pair CODE]`; `harw debug echo|classify`.
+  Skills, Plugins, Gedächtnis, Kontext-Vorschläge und Aufträge sind damit
+  auch außerhalb des Chats erreichbar.
+- Neue globale Flags `--profile NAME`, `-C/--cwd DIR` und `--json`; `-v` als
+  Kurzform von `--verbose`. Befehle ohne JSON-Form brechen bei `--json` mit
+  einer Fehlermeldung ab, statt das Flag still zu ignorieren.
+- Neue Sitzungs-Flags `--approval ask|auto|full` und `--model ID`. Sitzungs-
+  Flags (`--mode`, `--approval`, `--model`, `--goal`, `--add-dir`) wirken nur
+  bei `chat`, `exec` und `analyze`; bei anderen Befehlen meldet `harw` einen
+  Fehler, statt sie still zu ignorieren.
+- `harw analyze --order bottom-up|top-down` ersetzt `--bottom-up`/`--top-down`
+  (beide weiterhin versteckt gültig, aber nicht miteinander oder mit
+  `--order` kombinierbar).
+- Umbenannt: `settings` → `config`, `models` → `model` (alte Namen bleiben
+  Aliase), `models delete` → `model remove` (Alias `delete`). Ältere
+  Schreibweisen `connect`, `lens`, `uia`, `catalog`, `run` und `classify`
+  funktionieren weiter, sind aber versteckt und verweisen per Hinweis auf den
+  neuen Befehl.
+
 ### Added
 
 - **`harw project` subcommand**: `harw project trust [DIR]`, `harw project untrust [DIR]`,

@@ -288,7 +288,9 @@ mod tests {
             "Verdoppelt n.",
             json!({"type": "object"}),
             |args: serde_json::Value| async move {
-                let n = args["n"].as_i64().ok_or_else(|| ToolError::new("n fehlt"))?;
+                let n = args["n"]
+                    .as_i64()
+                    .ok_or_else(|| ToolError::new("n fehlt"))?;
                 Ok::<_, ToolError>(json!(n * 2))
             },
         )

@@ -321,7 +321,8 @@ impl Session {
         let usage_before = self.root.total_usage().clone();
         let token = CancelToken::new();
         self.cancel.arm(token.clone());
-        let input = TurnInput::user(text).with_control(TurnControl::new().with_cancel(token.clone()));
+        let input =
+            TurnInput::user(text).with_control(TurnControl::new().with_cancel(token.clone()));
         let driven = drive(
             &self.assembly,
             &mut self.root,
@@ -419,31 +420,32 @@ async fn drive(
         .await
         .map_err(SdkError::turn)?;
     for _ in 0..MAX_RESUMES_PER_TURN {
-        outcome = match outcome {
-            TurnOutcome::AwaitingApproval { .. } => {
-                let resolution = decide(assembly, session, approvals, cancel).await?;
-                asked = asked.saturating_add(1);
-                let actor = assembly.principal().approval_actor().ok_or_else(|| {
-                    SdkError::Approval {
-                        detail: "the runtime principal has no approval actor".to_owned(),
-                    }
-                })?;
-                resume_after_approval(session, model, store, actor, resolution)
-                    .await
-                    .map_err(SdkError::turn)?
-            }
-            TurnOutcome::AwaitingChild {
-                child,
-                call_id,
-                role,
-            } => {
-                let result = run_child(assembly, &child, &role, store).await;
-                resume_after_child(session, model, store, child, call_id, result)
-                    .await
-                    .map_err(SdkError::turn)?
-            }
-            settled => return Ok((settled, asked)),
-        };
+        outcome =
+            match outcome {
+                TurnOutcome::AwaitingApproval { .. } => {
+                    let resolution = decide(assembly, session, approvals, cancel).await?;
+                    asked = asked.saturating_add(1);
+                    let actor = assembly.principal().approval_actor().ok_or_else(|| {
+                        SdkError::Approval {
+                            detail: "the runtime principal has no approval actor".to_owned(),
+                        }
+                    })?;
+                    resume_after_approval(session, model, store, actor, resolution)
+                        .await
+                        .map_err(SdkError::turn)?
+                }
+                TurnOutcome::AwaitingChild {
+                    child,
+                    call_id,
+                    role,
+                } => {
+                    let result = run_child(assembly, &child, &role, store).await;
+                    resume_after_child(session, model, store, child, call_id, result)
+                        .await
+                        .map_err(SdkError::turn)?
+                }
+                settled => return Ok((settled, asked)),
+            };
     }
     Err(SdkError::Turn {
         detail: format!("the turn did not settle after {MAX_RESUMES_PER_TURN} resumes"),
@@ -461,9 +463,11 @@ async fn decide(
     approvals: &dyn ApprovalHandler,
     cancel: &CancelToken,
 ) -> Result<ApprovalResolution, SdkError> {
-    let pending = session.pending_approval().ok_or_else(|| SdkError::Approval {
-        detail: "the turn paused for approval without a pending request".to_owned(),
-    })?;
+    let pending = session
+        .pending_approval()
+        .ok_or_else(|| SdkError::Approval {
+            detail: "the turn paused for approval without a pending request".to_owned(),
+        })?;
     let request = ApprovalRequest {
         session_id: SessionId::from_core(session.id()),
         request_id: pending.request.as_str().to_owned(),
@@ -511,9 +515,9 @@ async fn run_child(
     match run.outcome {
         TurnOutcome::Completed => match spawner.child_final_assistant_text(child) {
             Ok(text) => ToolCallResult::success(serde_json::Value::String(text)),
-            Err(error) => ToolCallResult::error(format!(
-                "child agent '{role}' left no answer: {error}"
-            )),
+            Err(error) => {
+                ToolCallResult::error(format!("child agent '{role}' left no answer: {error}"))
+            }
         },
         TurnOutcome::AwaitingApproval { .. } => ToolCallResult::error(format!(
             "child agent '{role}' paused for its own approval; nested approvals are not driven \
@@ -525,7 +529,9 @@ async fn run_child(
         )),
         other => {
             let status = TurnStatus::from_outcome(other);
-            ToolCallResult::error(format!("child agent '{role}' ended without an answer: {status:?}"))
+            ToolCallResult::error(format!(
+                "child agent '{role}' ended without an answer: {status:?}"
+            ))
         }
     }
 }

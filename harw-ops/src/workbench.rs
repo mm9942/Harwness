@@ -3,7 +3,10 @@
 //!
 //! # Subcommands
 //! - (bare) / `show` `[--scope=session|project:<slug>]` — Panel-Text:
-//!   angeheftete Dateien, offene Hypothesen, Live-Tail von `NOTES.md`.
+//!   angeheftete Dateien, offene Hypothesen, Live-Tail von `NOTES.md`; dazu
+//!   `OpOutput::data` = `{"scope","pinned":[{"path","note"}],
+//!   "hypotheses":[{"id","text","status"}],"notes_tail":[..]}` für das
+//!   TUI-Workbench-Pane.
 //! - `pin <path> [note]` — heftet eine Datei an; ein relativer Pfad wird
 //!   gegen das Arbeitsverzeichnis des Prozesses aufgelöst (TUI-cwd).
 //! - `unpin <path>` — löst eine angeheftete Datei.
@@ -197,11 +200,46 @@ fn run_hypothesis(
     }
 }
 
-/// Rendert das Panel (§5.2) als Text.
+/// Strukturierte Nutzlast des Panels für die TUI (`OpOutput::data`).
+///
+/// Form: `{"scope", "pinned":[{"path","note"}],
+/// "hypotheses":[{"id","text","status"}], "notes_tail":[..]}`; `id` ist die
+/// Auswahl `#<n>`, die `hypothesis confirm|reject` direkt versteht.
+fn panel_data(bench: &Workbench) -> serde_json::Value {
+    let pinned: Vec<serde_json::Value> = bench
+        .pinned
+        .iter()
+        .map(|entry| serde_json::json!({ "path": entry.absolute_path, "note": entry.note }))
+        .collect();
+    let hypotheses: Vec<serde_json::Value> = bench
+        .hypotheses
+        .iter()
+        .enumerate()
+        .map(|(index, hypothesis)| {
+            serde_json::json!({
+                "id": format!("#{}", index + 1),
+                "text": hypothesis.text,
+                "status": hypothesis.status.label(),
+            })
+        })
+        .collect();
+    serde_json::json!({
+        "scope": bench.scope.path_component(),
+        "pinned": pinned,
+        "hypotheses": hypotheses,
+        "notes_tail": bench.notes_tail(NOTES_TAIL_LINES),
+    })
+}
+
+/// Rendert das Panel (§5.2) als Text plus [`panel_data`].
 fn render(bench: &Workbench) -> Result<OpOutput, OpError> {
+    let data = Some(panel_data(bench));
     let scope = bench.scope.path_component();
     if bench.is_empty() {
-        return Ok(OpOutput::from(format!("Workbench {scope} ist leer.")));
+        return Ok(OpOutput {
+            text: format!("Workbench {scope} ist leer."),
+            data,
+        });
     }
     let mut out = format!("Workbench {scope}\n");
     out.push_str(&format!("Angeheftet ({}):\n", bench.pinned.len()));
@@ -230,7 +268,7 @@ fn render(bench: &Workbench) -> Result<OpOutput, OpError> {
     for line in tail {
         out.push_str(&format!("  {line}\n"));
     }
-    Ok(OpOutput::from(out))
+    Ok(OpOutput { text: out, data })
 }
 
 /// Löst einen relativen Pfad gegen `cwd` auf; absolute bleiben unverändert.
@@ -401,6 +439,37 @@ mod tests {
 
         let unpinned = run(&store, &["unpin", "/work/project/src/lib.rs"]).map_err(ctx("unpin"))?;
         assert!(unpinned.starts_with("Gelöst"));
+        std::fs::remove_dir_all(store.root()).ok();
+        Ok(())
+    }
+
+    #[test]
+    fn show_carries_the_panel_data_for_the_tui() -> TestResult {
+        let store = temporary_store("data")?;
+        run(&store, &["pin", "/abs/x.rs", "warum"]).map_err(ctx("pin"))?;
+        run(&store, &["hypothesis", "add", "H1"]).map_err(ctx("add"))?;
+        run(&store, &["note", "zeile"]).map_err(ctx("note"))?;
+        let output = run_workbench(
+            &store,
+            "s-1",
+            &AgentId::new("operator"),
+            &toks(&["show"]),
+            jiff::Timestamp::now(),
+            None,
+        )
+        .map_err(ctx("show"))?;
+        let data = output.data.ok_or(TestError::Missing("show data"))?;
+        assert_eq!(data["scope"], "session:s-1");
+        assert_eq!(data["pinned"][0]["path"], "/abs/x.rs");
+        assert_eq!(data["pinned"][0]["note"], "warum");
+        assert_eq!(data["hypotheses"][0]["id"], "#1");
+        assert_eq!(data["hypotheses"][0]["status"], "testing");
+        assert!(
+            data["notes_tail"]
+                .as_array()
+                .is_some_and(|lines| lines.iter().any(|line| line == "zeile")),
+            "{data}"
+        );
         std::fs::remove_dir_all(store.root()).ok();
         Ok(())
     }

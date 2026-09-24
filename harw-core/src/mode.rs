@@ -395,6 +395,27 @@ impl InteractionMode {
             Self::Shell => "shell",
         }
     }
+
+    /// Eine deutsche Zeile, die den Modus für eine Person beschreibt.
+    ///
+    /// # Beschreibung
+    /// Für Oberflächen wie Modusauswahl und `/mode show`; abgeleitet aus der
+    /// Doku der Varianten.
+    ///
+    /// # Returns
+    /// Eine nicht leere Beschreibung ohne abschließenden Punkt.
+    #[must_use]
+    pub fn summary_de(self) -> &'static str {
+        match self {
+            Self::Chat => "Gespräch ohne Werkzeugeinschränkung",
+            Self::Plan => "Planen und recherchieren, nichts verändern",
+            Self::Explore => "Nur lesende Werkzeuge zum Erkunden",
+            Self::Work => "Ausführen mit vollem Werkzeugsatz inkl. Schreiben und Shell",
+            Self::Shell => {
+                "Wie Arbeiten, Host-Werkzeuge nur über eine vom Nutzer bestätigte Sandbox-Freigabe"
+            }
+        }
+    }
 }
 
 impl std::fmt::Display for InteractionMode {
@@ -456,6 +477,16 @@ mod tests {
         InteractionMode::Work,
         InteractionMode::Shell,
     ];
+
+    #[test]
+    fn every_mode_has_a_non_empty_german_summary() {
+        for mode in InteractionMode::ALL {
+            assert!(
+                !mode.summary_de().trim().is_empty(),
+                "{mode:?} braucht eine Zusammenfassung"
+            );
+        }
+    }
 
     #[test]
     fn test_default_is_chat() {

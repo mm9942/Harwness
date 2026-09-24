@@ -83,7 +83,7 @@ use harw_core::{
     InteractionMode, JobExecutionRegistry, ModelMessage, ModelProvider, TurnInput, TurnOutcome,
     run_turn,
 };
-use harw_extension_api::{ApprovalMode, ContextProvider};
+use harw_extension_api::ContextProvider;
 use harw_mcp_server::{
     BoundMcpListener, DurableMcpSupervisor, McpAuthenticator, McpEventBus, McpJobCapability,
     McpListenerConfig, McpPrincipal, McpSupervisor, PrincipalRegistry, StaticBearerAuthenticator,
@@ -3249,16 +3249,15 @@ mod tests {
 
     #[test]
     fn log_flag_source_distinguishes_default_from_explicit() -> TestResult {
-        use clap::CommandFactory;
-        let default = Cli::command()
+        let default = cli::command()
             .try_get_matches_from(["harw"])
             .map_err(ctx("bare harw parses"))?;
         assert!(!log_flag_explicit(&default));
-        let explicit = Cli::command()
+        let explicit = cli::command()
             .try_get_matches_from(["harw", "--log", "info"])
             .map_err(ctx("--log parses"))?;
         assert!(log_flag_explicit(&explicit));
-        let after_subcommand = Cli::command()
+        let after_subcommand = cli::command()
             .try_get_matches_from(["harw", "doctor", "--log", "debug"])
             .map_err(ctx("--log after subcommand parses"))?;
         assert!(log_flag_explicit(&after_subcommand));
@@ -3949,8 +3948,9 @@ mod tests {
         let args = AnalyzeArgs {
             crate_name: Some("harw-core".to_owned()),
             workspace: false,
+            order: AnalyzeOrder::TopDown,
             bottom_up: false,
-            top_down: true,
+            top_down: false,
             dry_run: true,
             max_parallel: Some(3),
         };
@@ -3975,8 +3975,9 @@ mod tests {
         let args = AnalyzeArgs {
             crate_name: Some("harw-core".to_owned()),
             workspace: false,
+            order: AnalyzeOrder::TopDown,
             bottom_up: false,
-            top_down: true,
+            top_down: false,
             dry_run: true,
             max_parallel: Some(3),
         };
@@ -3992,20 +3993,39 @@ mod tests {
     }
 
     #[test]
-    fn analyze_rejects_contradictory_direction_and_scope_flags() -> TestResult {
-        let both_directions = AnalyzeArgs {
+    fn analyze_legacy_top_down_flag_maps_onto_top_down_token() -> TestResult {
+        let args = AnalyzeArgs {
             crate_name: None,
             workspace: false,
-            bottom_up: true,
+            order: AnalyzeOrder::BottomUp,
+            bottom_up: false,
             top_down: true,
             dry_run: false,
             max_parallel: None,
         };
-        assert!(analyze_tokens(&both_directions).is_err());
+        assert_eq!(
+            analyze_tokens(&args).map_err(ctx("Alt-Flag ist übersetzbar"))?,
+            vec!["--top-down".to_owned()]
+        );
+        let default_order = AnalyzeArgs {
+            top_down: false,
+            ..args
+        };
+        assert!(
+            analyze_tokens(&default_order)
+                .map_err(ctx("Vorgabe ist übersetzbar"))?
+                .is_empty(),
+            "bottom-up ist die Vorgabe der Operation und braucht kein Token"
+        );
+        Ok(())
+    }
 
+    #[test]
+    fn analyze_rejects_contradictory_scope_flags() -> TestResult {
         let workspace_and_crate = AnalyzeArgs {
             crate_name: Some("harw-core".to_owned()),
             workspace: true,
+            order: AnalyzeOrder::BottomUp,
             bottom_up: false,
             top_down: false,
             dry_run: false,
@@ -4022,6 +4042,7 @@ mod tests {
         let zero_parallel = AnalyzeArgs {
             crate_name: None,
             workspace: true,
+            order: AnalyzeOrder::BottomUp,
             bottom_up: false,
             top_down: false,
             dry_run: false,
@@ -4123,13 +4144,18 @@ mod tests {
         let args = AnalyzeArgs {
             crate_name: None,
             workspace: false,
+            order: AnalyzeOrder::BottomUp,
             bottom_up: false,
             top_down: false,
             dry_run: true,
             max_parallel: None,
         };
+        let global = GlobalArgs {
+            home: Some(home.path().to_path_buf()),
+            ..GlobalArgs::default()
+        };
 
-        let result = cmd_analyze(Some(home.path().to_path_buf()), None, None, &args);
+        let result = cmd_analyze(&global, &args);
         let Err(error) = result else {
             return Err(TestError::Unexpected(
                 "harw analyze muss ohne `[tools.plan] enabled = true` scheitern".into(),
@@ -4144,9 +4170,116 @@ mod tests {
         let cli = Cli::try_parse_from(["harw", "--mode", "explore", "--goal", "Bridge fertig"])
             .map_err(ctx("root flags parse"))?;
 
-        assert_eq!(cli.mode.as_deref(), Some("explore"));
-        assert_eq!(cli.goal.as_deref(), Some("Bridge fertig"));
+        assert_eq!(cli.global.mode.as_deref(), Some("explore"));
+        assert_eq!(cli.global.goal.as_deref(), Some("Bridge fertig"));
         assert!(cli.command.is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn valid_mode_names_lists_every_interaction_mode() {
+        assert_eq!(valid_mode_names(), "chat, plan, explore, work, shell");
+    }
+
+    #[test]
+    fn session_flags_are_accepted_for_chat_exec_and_analyze() -> TestResult {
+        for argv in [
+            vec!["harw", "--mode", "explore"],
+            vec!["harw", "chat", "--model", "m1"],
+            vec!["harw", "exec", "--approval", "ask", "hallo", "welt"],
+            vec!["harw", "analyze", "--goal", "Ziel"],
+            vec!["harw", "--add-dir", "/tmp"],
+        ] {
+            let cli = Cli::try_parse_from(argv.clone()).map_err(ctx("session flags parse"))?;
+            reject_misplaced_session_flags(cli.command.as_ref(), &cli.global)
+                .map_err(ctx("session flags are allowed here"))?;
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn session_flags_are_rejected_for_other_commands() -> TestResult {
+        let cli = Cli::try_parse_from(["harw", "doctor", "--mode", "explore"])
+            .map_err(ctx("doctor with --mode parses"))?;
+        let result = reject_misplaced_session_flags(cli.command.as_ref(), &cli.global);
+        let Err(error) = result else {
+            return Err(TestError::Unexpected(
+                "--mode bei doctor darf nicht still ignoriert werden".into(),
+            ));
+        };
+        assert!(error.contains("--mode"), "{error}");
+        assert!(error.contains("harw doctor"), "{error}");
+        for allowed in ["harw chat", "harw exec", "harw analyze"] {
+            assert!(error.contains(allowed), "{error} nennt '{allowed}' nicht");
+        }
+
+        let analyze = Cli::try_parse_from(["harw", "analyze", "--add-dir", "/tmp"])
+            .map_err(ctx("analyze with --add-dir parses"))?;
+        assert!(reject_misplaced_session_flags(analyze.command.as_ref(), &analyze.global).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn json_is_rejected_for_commands_without_json_output() -> TestResult {
+        let doctor = Cli::try_parse_from(["harw", "doctor", "--json"])
+            .map_err(ctx("doctor with --json parses"))?;
+        let result = reject_unsupported_json(doctor.command.as_ref(), &doctor.global);
+        let Err(error) = result else {
+            return Err(TestError::Unexpected(
+                "--json bei doctor muss abgelehnt werden".into(),
+            ));
+        };
+        assert!(error.contains("harw doctor"), "{error}");
+
+        let root = Cli::try_parse_from(["harw", "--json"]).map_err(ctx("root --json parses"))?;
+        assert!(reject_unsupported_json(root.command.as_ref(), &root.global).is_err());
+
+        let resume = Cli::try_parse_from(["harw", "session", "resume", "abc", "--json"])
+            .map_err(ctx("session resume --json parses"))?;
+        assert!(reject_unsupported_json(resume.command.as_ref(), &resume.global).is_err());
+
+        for argv in [
+            vec!["harw", "session", "list", "--json"],
+            vec!["harw", "jobs", "list", "--json"],
+            // Vor dem Befehl, weil `memory`/`skills` alle folgenden
+            // Argumente unverändert weiterreichen.
+            vec!["harw", "--json", "knowledge", "memory"],
+            vec!["harw", "--json", "agent", "skills"],
+            vec!["harw", "doctor"],
+        ] {
+            let cli = Cli::try_parse_from(argv).map_err(ctx("json-capable command parses"))?;
+            reject_unsupported_json(cli.command.as_ref(), &cli.global)
+                .map_err(ctx("json-capable command accepts --json"))?;
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn exec_joins_prompt_words_and_is_not_a_tui_start() -> TestResult {
+        let cli =
+            Cli::try_parse_from(["harw", "exec", "sag", "hallo"]).map_err(ctx("exec parses"))?;
+        assert!(!starts_tui(&cli));
+        let Some(Command::Exec(args)) = cli.command else {
+            return Err(TestError::Unexpected("erwartete Command::Exec".into()));
+        };
+        assert_eq!(args.prompt.join(" "), "sag hallo");
+
+        let bare = Cli::try_parse_from(["harw"]).map_err(ctx("bare harw parses"))?;
+        assert!(starts_tui(&bare));
+        let resume = Cli::try_parse_from(["harw", "session", "resume", "abc"])
+            .map_err(ctx("session resume parses"))?;
+        assert!(starts_tui(&resume));
+        Ok(())
+    }
+
+    #[test]
+    fn command_label_names_new_and_legacy_commands() -> TestResult {
+        assert_eq!(command_label(None), "harw");
+        let bug = Cli::try_parse_from(["harw", "bug-report", "--title", "x"])
+            .map_err(ctx("bug-report parses"))?;
+        assert_eq!(command_label(bug.command.as_ref()), "harw bug-report");
+        let legacy = Cli::try_parse_from(["harw", "catalog"]).map_err(ctx("catalog parses"))?;
+        assert_eq!(command_label(legacy.command.as_ref()), "harw catalog");
         Ok(())
     }
 

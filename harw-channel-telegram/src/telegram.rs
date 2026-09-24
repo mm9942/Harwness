@@ -2015,7 +2015,9 @@ mod tests {
         let (_dir, store) = store()?;
         let code = issue(&store, "ops", b"seed12345")?;
         let mut adapter_config = unpinned_pairing_config();
-        adapter_config.allowed_group_chats.insert("-1001".to_owned());
+        adapter_config
+            .allowed_group_chats
+            .insert("-1001".to_owned());
         let mut inbound = dm_event("1", &format!("/pair {code}"));
         inbound.peer = PeerId::from_str("-1001");
         let (adapter, forwarded, notices) =
@@ -2078,7 +2080,9 @@ mod tests {
         let (_dir, store) = store()?;
         let code = issue(&store, "ops", b"seed12345")?;
         let mut adapter_config = config(ChannelId::from_str("telegram:ops"));
-        adapter_config.allowed_group_chats.insert("-1001".to_owned());
+        adapter_config
+            .allowed_group_chats
+            .insert("-1001".to_owned());
         // `alice` ist gepinnt; ohne Erwähnung, wie ein schlichtes `/pair` in der Gruppe.
         let mut inbound = event("-1001", false);
         inbound.text = Some(format!("/pair {code}"));
@@ -2206,7 +2210,10 @@ mod tests {
         let attachments = adapter.capabilities().attachments;
         assert_eq!(attachments.max_size_bytes, 1024);
         assert_eq!(attachments.max_count_per_message, 2);
-        assert_eq!(attachments.allowed_kinds, vec!["application/pdf".to_owned()]);
+        assert_eq!(
+            attachments.allowed_kinds,
+            vec!["application/pdf".to_owned()]
+        );
         Ok(())
     }
 }

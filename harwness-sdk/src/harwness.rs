@@ -23,7 +23,9 @@ use std::sync::Arc;
 
 use harw_core::StateStore;
 use harw_protocol::{SessionEvent, TurnEvent};
-use harw_runtime::{EntryKind, ModelSource, RootSession, RuntimeAssembly, RuntimeSpec, RuntimeStores};
+use harw_runtime::{
+    EntryKind, ModelSource, RootSession, RuntimeAssembly, RuntimeSpec, RuntimeStores,
+};
 use harw_types::{IngressSurface, PermissionTier, Principal, PrincipalKind};
 
 use crate::adapter::{SdkContributor, SdkToolProvider};

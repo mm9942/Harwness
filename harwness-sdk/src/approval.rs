@@ -203,8 +203,14 @@ mod tests {
             }
         });
         let shared: Arc<dyn ApprovalHandler> = Arc::new(handler);
-        assert_eq!(shared.decide(&request("fs.write")?).await, Decision::Approve);
-        assert_eq!(shared.decide(&request("shell.exec")?).await, Decision::deny("no"));
+        assert_eq!(
+            shared.decide(&request("fs.write")?).await,
+            Decision::Approve
+        );
+        assert_eq!(
+            shared.decide(&request("shell.exec")?).await,
+            Decision::deny("no")
+        );
         Ok(())
     }
 
@@ -213,6 +219,9 @@ mod tests {
         use harw_extension_api::ApprovalMode;
         assert_eq!(ApprovalPolicy::default().to_core(), ApprovalMode::Delegated);
         assert_eq!(ApprovalPolicy::AlwaysAsk.to_core(), ApprovalMode::AlwaysAsk);
-        assert_eq!(ApprovalPolicy::FullAccess.to_core(), ApprovalMode::FullAccess);
+        assert_eq!(
+            ApprovalPolicy::FullAccess.to_core(),
+            ApprovalMode::FullAccess
+        );
     }
 }

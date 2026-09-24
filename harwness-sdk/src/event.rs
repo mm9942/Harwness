@@ -801,10 +801,7 @@ mod tests {
         };
         assert!(!source.is_root());
         assert_eq!(source.role, "reviewer");
-        assert_eq!(
-            source.parent.as_ref().map(SessionId::as_str),
-            Some("root")
-        );
+        assert_eq!(source.parent.as_ref().map(SessionId::as_str), Some("root"));
         assert!(!mapped.is_root_finish());
 
         let internal = AgentEvent {

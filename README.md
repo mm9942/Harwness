@@ -127,7 +127,7 @@ cargo run -p harw-cli -- onboard
 cargo run -p harw-cli --
 ```
 
-`harw init` creates the local root space. `harw onboard` configures a provider and model. Running `harw` without a subcommand starts the interactive terminal client; passing a prompt runs a one-shot interaction.
+`harw init` creates the local root space. `harw onboard` configures a provider and model. Running `harw` (or `harw chat`) without further arguments starts the interactive terminal client, optionally with a first prompt; `harw exec PROMPT` runs a single non-interactive request and exits.
 
 Shell completions: `harw completions --install` (detects the shell from `$SHELL`; pass `bash`, `zsh`, `fish`, `elvish` or `powershell` explicitly, add `--dry-run` to preview). Open a new shell afterwards.
 
@@ -135,13 +135,18 @@ Useful commands include:
 
 ```bash
 harw doctor
-harw settings
-harw --resume
-harw analyze --dry-run
+harw config                          # interactive settings menu (alias: settings)
+harw session list                    # saved sessions; resume with `harw session resume ID` or `harw -r`
+harw provider scan                   # query providers for available models
+harw model default ID                # set the default model (alias: models)
+harw jobs list                       # background jobs; approve/deny with --note/--reason
+harw analyze --order top-down --dry-run
 harw gateway
 ```
 
-Run `harw --help` and `harw <subcommand> --help` for the exact grammar supported by the checked-out version.
+Global flags (`--home`, `--profile`, `-C/--cwd`, `--log`, `-v`, `--json`) work with every command. Session flags (`--mode`, `--approval ask|auto|full`, `--model`, `--goal`, `--add-dir`) apply only to `chat`, `exec` and `analyze` and are rejected elsewhere. Commands without a JSON form fail with `--json` instead of ignoring it. Older spellings such as `harw settings`, `harw models`, `harw connect`, `harw lens` or `harw run` still work and print a hint to the new name.
+
+The full command reference (in German), including the old-to-new mapping, is in [docs/cli.md](docs/cli.md). Run `harw --help` and `harw <subcommand> --help` for the exact grammar supported by the checked-out version.
 
 ## Telegram setup and pairing
 

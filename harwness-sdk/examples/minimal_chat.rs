@@ -12,10 +12,7 @@ use harwness_sdk::prelude::*;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let prompt = std::env::args()
-        .skip(1)
-        .collect::<Vec<_>>()
-        .join(" ");
+    let prompt = std::env::args().skip(1).collect::<Vec<_>>().join(" ");
     let prompt = if prompt.trim().is_empty() {
         "Sag in einem Satz, was du kannst.".to_owned()
     } else {
