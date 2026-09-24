@@ -52,6 +52,11 @@ fn parse_command(input: &str) -> CommandResult<Invocation> {
     })
 }
 
+/// Runde 6, Teil B: `!cmd` und `! cmd` sind gleichwertig (der Composer
+/// setzt nach einem getippten `!` automatisch ein Leerzeichen); der Befehl
+/// wird an beiden Enden zugeschnitten. `!!` und `! !` wiederholen den
+/// letzten Befehl; `!! <mehr>` bleibt ein Fehler, `! !cmd` ist dagegen ein
+/// gewöhnlicher Befehl `!cmd`.
 fn parse_shell(input: &str) -> CommandResult<Invocation> {
     if let Some(remainder) = input.strip_prefix('!') {
         let extra = tokenize(remainder)?;
@@ -64,7 +69,11 @@ fn parse_shell(input: &str) -> CommandResult<Invocation> {
         });
     }
 
-    Ok(Invocation::Shell(input.trim_start().to_owned()))
+    let command = input.trim();
+    if command == "!" {
+        return Ok(Invocation::ShellRepeat);
+    }
+    Ok(Invocation::Shell(command.to_owned()))
 }
 
 fn parse_mention(input: &str) -> CommandResult<Invocation> {
@@ -182,6 +191,29 @@ mod tests {
             classify_input("!! ls"),
             Err(CommandError::TrailingTokens { command, .. }) if command == "!!"
         ));
+    }
+
+    /// Runde 6, Teil B: `!cmd` und `! cmd` werden gleich geparst, der
+    /// Befehl sauber zugeschnitten.
+    #[test]
+    fn shell_with_and_without_space_parse_identically() {
+        let expected = Ok(Invocation::Shell("ls -la ~".to_owned()));
+        assert_eq!(classify_input("!ls -la ~"), expected);
+        assert_eq!(classify_input("! ls -la ~"), expected);
+        assert_eq!(classify_input("!   ls -la ~  "), expected);
+    }
+
+    /// Runde 6, Teil B: nach dem automatischen Leerzeichen wird `!!` zu
+    /// `! !` — beides wiederholt den letzten Befehl.
+    #[test]
+    fn shell_repeat_accepts_auto_space_form() {
+        assert_eq!(classify_input("!!"), Ok(Invocation::ShellRepeat));
+        assert_eq!(classify_input("! !"), Ok(Invocation::ShellRepeat));
+        assert_eq!(classify_input("! ! "), Ok(Invocation::ShellRepeat));
+        assert_eq!(
+            classify_input("! !x"),
+            Ok(Invocation::Shell("!x".to_owned()))
+        );
     }
 
     #[test]

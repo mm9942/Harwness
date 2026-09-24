@@ -293,6 +293,9 @@ pub struct ApprovalDialog {
     /// Runde 5 (Integration O): nur einmalige Zustimmung anbieten — blendet
     /// „Ja, und in den auto-Modus wechseln“ aus (Kind-Freigaben).
     once_only: bool,
+    /// Runde 6, Teil A1: warum der Auto-Modus fragt („<Kategorie> –
+    /// <Grund>“); erscheint als Zeile „Auto-Modus: …“.
+    auto_reason: Option<String>,
     /// Zeitpunkt, zu dem die Frage automatisch als Ablehnung gilt.
     deadline: Instant,
     /// Ob die Freitext-Ablehnungsbegründung angeboten wird.
@@ -330,6 +333,7 @@ impl ApprovalDialog {
             remember_rule: request.remember_rule,
             learn_offer: None,
             once_only: false,
+            auto_reason: None,
             deadline: request.deadline,
             reason_input_enabled: request.reason_input_enabled,
             selected: 0,
@@ -351,6 +355,21 @@ impl ApprovalDialog {
     #[must_use]
     pub fn with_learning_offer(mut self, offer: LearnOfferView) -> Self {
         self.learn_offer = Some(offer);
+        self
+    }
+
+    /// Runde 6, Teil A1: hängt den Grund an, aus dem der Auto-Modus fragt.
+    ///
+    /// # Argumente
+    /// - `reason` (`Option<String>`): `"<Kategorie> – <Grund>"` aus
+    ///   `crate::permissions_view::auto_ask_reason_for`; `None` lässt das
+    ///   Panel unverändert.
+    ///
+    /// # Rückgabe
+    /// Das Panel mit der Zeile „Auto-Modus: …“.
+    #[must_use]
+    pub fn with_auto_reason(mut self, reason: Option<String>) -> Self {
+        self.auto_reason = reason.filter(|reason| !reason.trim().is_empty());
         self
     }
 
@@ -717,14 +736,19 @@ impl ApprovalDialog {
         rows
     }
 
-    /// Zusatzfelder (cwd, Risiko, Begründung, Herkunft) in Anzeigereihenfolge,
-    /// jeweils mit Beschriftung; fehlende Felder werden ausgelassen.
+    /// Zusatzfelder (Herkunft, Auto-Modus-Grund, cwd, Risiko, Begründung) in
+    /// Anzeigereihenfolge, jeweils mit Beschriftung; fehlende Felder werden
+    /// ausgelassen.
     fn info_fields(&self) -> Vec<(&'static str, String)> {
         let mut fields = Vec::new();
         if let Some(origin) = &self.origin {
             // Runde 5, Teil O: Kind-Freigaben nennen ihren Absender als
             // „angefragt von: <rolle> (<pfad im baum>)“.
             fields.push(("angefragt von", origin.clone()));
+        }
+        // Runde 6, Teil A1: der Grund des Auto-Modus steht vor cwd/Risiko.
+        if let Some(reason) = &self.auto_reason {
+            fields.push(("Auto-Modus", reason.clone()));
         }
         if let Some(cwd) = &self.cwd {
             fields.push(("cwd", cwd.clone()));
@@ -1223,6 +1247,22 @@ mod tests {
             DialogAction::Stay
         );
         assert!(!dialog.reason_editing);
+    }
+
+    /// Runde 6, Teil A1: fragt der Auto-Modus statt abzulehnen, steht sein
+    /// Grund als Zeile „Auto-Modus: <Kategorie> – <Grund>“ im Dialog.
+    #[test]
+    fn test_auto_mode_reason_is_shown_as_a_line() {
+        let dialog = shell_dialog(None).with_auto_reason(Some(
+            "exfiltration – verschiebt export.md nach ~".to_owned(),
+        ));
+        let rendered = render_dialog(&dialog, 90, 24);
+        assert!(
+            rendered.contains("Auto-Modus: exfiltration – verschiebt export.md nach ~"),
+            "{rendered}"
+        );
+        let plain = render_dialog(&shell_dialog(None).with_auto_reason(None), 90, 24);
+        assert!(!plain.contains("Auto-Modus:"), "{plain}");
     }
 
     #[test]

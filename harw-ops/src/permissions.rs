@@ -958,6 +958,66 @@ mod tests {
         Ok(())
     }
 
+    /// Runde 6, Teil A: `/permissions log` markiert eine Ablehnung, die zur
+    /// Rückfrage wurde; eine echte Ablehnung bleibt unmarkiert.
+    #[tokio::test]
+    async fn permissions_log_marks_a_denial_that_became_a_question() -> TestResult {
+        use harw_extension_api::auto_mode::{
+            AutoDecision, AutoDecisionLog, AutoLogEntry, AutoVerdict, VerdictSource,
+        };
+        let base = test_context()?;
+        let log = AutoDecisionLog::new();
+        let entry = |call_id: &str, verdict: AutoVerdict| AutoLogEntry {
+            at: jiff::Timestamp::now(),
+            call_id: call_id.to_owned(),
+            tool: "shell.exec".to_owned(),
+            summary: format!("mv export.md ~/ ({call_id})"),
+            verdict,
+        };
+        let deny = || {
+            AutoVerdict::new(
+                AutoDecision::Deny,
+                "transfer-outside-workspace",
+                "Ziel außerhalb des Workspace",
+                VerdictSource::Classifier,
+            )
+        };
+        let _ = log.record(entry("gefragt", deny().escalate_to_ask()));
+        let _ = log.record(entry("abgelehnt", deny()));
+        let mut services = ServiceMap::new();
+        services.insert(log);
+        let ctx = OpContext::new(
+            base.session_id().clone(),
+            base.turn_id().clone(),
+            base.sandbox().clone(),
+            services,
+        );
+
+        let result = permissions(
+            &ctx,
+            PermissionsArgs {
+                cmd: Some("log".to_owned()),
+                tail: Vec::new(),
+            },
+        )
+        .await
+        .map_err(crate::test_support::ctx("permissions log"))?;
+
+        let asked = result
+            .text
+            .lines()
+            .find(|line| line.contains("(gefragt)"))
+            .ok_or(TestError::Missing("Zeile der Rückfrage"))?;
+        assert!(asked.contains("(Ablehnung → Rückfrage)"), "{asked}");
+        let denied = result
+            .text
+            .lines()
+            .find(|line| line.contains("(abgelehnt)"))
+            .ok_or(TestError::Missing("Zeile der Ablehnung"))?;
+        assert!(!denied.contains("Rückfrage"), "{denied}");
+        Ok(())
+    }
+
     #[tokio::test]
     async fn permissions_show_without_a_mode_cell_is_not_available() -> TestResult {
         let ctx = test_context()?;

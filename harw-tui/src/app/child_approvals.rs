@@ -372,6 +372,14 @@ fn build_dialog(app: &ChatApp, request: &ChildApprovalRequest) -> ApprovalDialog
         reason_input_enabled: true,
     })
     .once_only()
+    // Runde 6, Teil A: Grund des Auto-Modus (auch ein umgewandeltes deny).
+    .with_auto_reason(
+        app.runtime()
+            .and_then(|rt| rt.auto_mode())
+            .and_then(|auto| auto.log().verdict_for(request.call.id.as_str()))
+            .as_ref()
+            .and_then(crate::permissions_view::auto_ask_reason_for),
+    )
 }
 
 #[cfg(test)]

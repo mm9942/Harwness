@@ -40,22 +40,26 @@
 //! `#[cfg(test)]`, um die vorherigen Test-Erwartungen (feste Service-Bündel)
 //! als Closures nachzubilden.
 //!
-//! # Host-PATH für `!`-Befehle (Plan Teil C2)
-//! [`execute_shell`] baut seinen `ShellToolProvider` über
-//! [`shell_escape_provider`] mit der beim Prozessstart gelesenen
-//! [`harw_sandbox::HostPathBinding::from_env`] (der zsh-`PATH` des Nutzers,
-//! `RUSTUP_HOME`/`CARGO_HOME`). Ohne diese Bindung (`PATH` unset/leer) bleibt
-//! der `bwrap`-Plan byte-identisch zu heute. Die normale Modell-`shell.exec`-
-//! Ausführung in der Projekt-Sandbox bleibt davon unberührt — sie baut ihren
-//! eigenen `ShellToolProvider` in `harw-runtime`, nicht hier.
+//! # `!`-Befehle laufen auf dem Host (Runde 6, Teil B)
+//! `!`/`!!` sind Befehle der Nutzerin selbst und laufen **immer auf dem
+//! Host** über [`harw_tool_shell::OperatorCommand`]: echtes `HOME`, geerbte
+//! Umgebung, `cwd` = Projektwurzel, `setsid`, rlimits, gekappte Ausgabe,
+//! Zeitlimit; `sudo`/`doas`/`pkexec` bleiben abgelehnt; keine Freigabe,
+//! aber ein Audit-Ereignis `shell.operator_exec`. Früher lief `!` in
+//! Bubblewrap mit flüchtigem `HOME=/tmp/home` — `!cp x ~/` meldete Exit 0,
+//! die Datei verschwand aber mit der Sandbox. Die TUI startet `!` über
+//! [`admit_shell_line`] und `app/operator_shell.rs` asynchron (auch während
+//! eines Turns); [`execute_shell`] bedient nur noch die synchronen Pfade.
+//! Die Modell-`shell.exec`-Ausführung bleibt unverändert in der Sandbox.
+//! Nicht-TUI-Kanäle (Telegram) kennen kein `!` (geprüft in Runde 6).
 //!
 //! # `!`-Modus wie in Claude Code (Plan Teil F)
 //! [`execute_shell`] liefert seit Plan Teil F kein reines `String` mehr,
 //! sondern [`ShellDisplayOutcome`] — Anzeigetext (`display_text`,
 //! byte-identisch zum bisherigen Rückgabewert) plus ein optionales
 //! strukturiertes [`ShellRunOutcome`] (`run`), gesetzt genau dann, wenn der
-//! `shell.exec`-Ausführer tatsächlich lief (`ToolOutput::Json` mit
-//! `exit_code`). [`execute_with_context`] nutzt weiterhin nur
+//! Befehl tatsächlich auf dem Host lief (seit Runde 6, Teil B).
+//! [`execute_with_context`] nutzt weiterhin nur
 //! `display_text` und bleibt dadurch für alle bisherigen Aufrufer
 //! (`execute_command_as`, `dispatch_slash_command`, die Busy-Sofort-
 //! Dispatch- und Test-Pfade) unverändert.
@@ -72,11 +76,10 @@
 //! „Kein vorheriger !-Befehl“, `run: None` (kein Folge-Turn). Die alte,
 //! zustandslose [`execute_with_context`] kennt keinen Sitzungszustand und
 //! bleibt für `!!` bei „Shell-Wiederholung ist noch nicht verfügbar.“ — das
-//! ist folgenlos, weil `!!` als Nicht-`Command`-Invocation in
-//! [`busy_availability_for`] immer `DeferredUntilTurnEnd` ist und deshalb nie
-//! über den Busy-Sofort-Dispatch (`dispatch_slash_command`), sondern
-//! ausschließlich über den Idle-Zweig in `app.rs` (also über
-//! `dispatch_command_with_shell_result`) erreicht wird.
+//! ist folgenlos, weil die TUI seit Runde 6, Teil B jede `!`/`!!`-Zeile mit
+//! Runtime-Montage vorher abfängt (`app/operator_shell.rs`, im Leerlauf wie
+//! während eines Turns) und asynchron auf dem Host ausführt; die hiesigen
+//! Pfade sind nur noch der Rückfall ohne Montage bzw. für Tests.
 //!
 //! # Nebenläufigkeit
 //! `execute_command_as` ist `async` und ruft `CommandAdapter::dispatch` (ebenfalls
@@ -99,7 +102,6 @@ use std::collections::HashSet;
 use std::sync::Arc;
 
 use harw_authority::SandboxSpec;
-use harw_extension_api::contributors::ToolProvider;
 #[cfg(test)]
 use harw_operations::SharedSessionController;
 use harw_operations::adapter::CommandAdapter;
@@ -107,11 +109,11 @@ use harw_operations::operation::{BusyAvailability, BusySubcommand};
 #[cfg(test)]
 use harw_operations::registry::OperationRegistry;
 use harw_operations::{OpContext, PermissionTier, ServiceMap};
-use harw_sandbox::HostPathBinding;
-use harw_tool_shell::ShellToolProvider;
-use harw_tools::spec::ToolName;
-use harw_tools::{ToolCall, ToolExecutionContext, ToolOutput};
-use harw_types::{SessionId, ToolCallId, TurnId};
+// Runde 6, Teil B: `!`-Befehle laufen über den Operator-Weg auf dem Host.
+use harw_tool_shell::{
+    OPERATOR_DEFAULT_TIMEOUT_SECS, OperatorCommand, OperatorEnd, OperatorOutcome, ShellLimits,
+};
+use harw_types::{SessionId, TurnId};
 
 #[cfg(test)]
 use crate::session_controller::TuiSessionController;
@@ -175,8 +177,8 @@ pub(crate) struct CommandServices<'a> {
 ///   geklont, Services siehe unten) und [`CommandAdapter::dispatch`] awaiten.
 ///   `Ok(output)` liefert `output.text`; `Err(error)` wird als
 ///   `"Fehler: {error}"` gerendert. Nicht gefunden: `"Unbekannter Command: {path}"`.
-/// - [`Invocation::Shell`]: wird im lokalen TUI-Kontext standardmäßig durch den
-///   Bubblewrap-gebundenen `shell.exec`-Ausführer ausgeführt. `HARW_DISABLE_SHELL=1`
+/// - [`Invocation::Shell`]: läuft im lokalen TUI-Kontext standardmäßig auf dem
+///   Host (Operator-Weg, Runde 6, Teil B). `HARW_DISABLE_SHELL=1`
 ///   schaltet die Capability für den Prozess aus.
 /// - [`Invocation::ShellRepeat`]: ist noch nicht implementiert.
 /// - [`Invocation::Note`]: wird vorab zu `/diary note …` bzw.
@@ -353,9 +355,10 @@ pub(crate) async fn dispatch_slash_command(
 /// # Beschreibung
 /// Nutzt [`crate::classify_input`] (denselben Parser wie jeder andere
 /// Dispatch-Pfad). Nur [`Invocation::Command`] kann `Immediate`/`Staged`
-/// liefern:
-/// - Kein Befehl (`Shell`, `ShellRepeat`, `Note`, `Mention`, `Chat`) →
-///   `DeferredUntilTurnEnd`.
+/// liefern — und seit Runde 6, Teil B `!`/`!!`:
+/// - `Shell`, `ShellRepeat` → `Immediate` (sofort, auf dem Host; das
+///   Ergebnis geht erst nach dem Ende an den Agenten).
+/// - Kein Befehl (`Note`, `Mention`, `Chat`) → `DeferredUntilTurnEnd`.
 /// - Unbekannter Befehlsname (`registry.find` liefert `None`) →
 ///   `DeferredUntilTurnEnd` — die ehrliche „unbekannter Befehl"-Meldung
 ///   entsteht weiterhin erst im eigentlichen Dispatch, nicht hier.
@@ -378,7 +381,16 @@ pub(crate) async fn dispatch_slash_command(
 /// Die [`BusyAvailability`] dieser Eingabe.
 #[must_use]
 pub(crate) fn busy_availability_for(registry: &CommandRegistry, raw: &str) -> BusyAvailability {
-    let Ok(Invocation::Command { name, raw_args }) = crate::classify_input(raw) else {
+    let invocation = crate::classify_input(raw);
+    // Runde 6, Teil B: `!`-Befehle der Nutzerin laufen sofort, auch während
+    // eines Turns (asynchron auf dem Host, `app/operator_shell.rs`).
+    if matches!(
+        invocation,
+        Ok(Invocation::Shell(_) | Invocation::ShellRepeat)
+    ) {
+        return BusyAvailability::Immediate;
+    }
+    let Ok(Invocation::Command { name, raw_args }) = invocation else {
         return BusyAvailability::DeferredUntilTurnEnd;
     };
 
@@ -546,11 +558,7 @@ where
                 Err(error) => format!("Fehler: {error}"),
             }
         }
-        CommandAction::Shell(command) => {
-            execute_shell(sandbox, session_id, command)
-                .await
-                .display_text
-        }
+        CommandAction::Shell(command) => execute_shell(sandbox, command).await.display_text,
         CommandAction::ShellRepeat => "Shell-Wiederholung ist noch nicht verfügbar.".to_owned(),
         CommandAction::Note(note) => format!("Notiz: {note}"),
         CommandAction::Mention { target, body } => format!("@{target}: {body}"),
@@ -559,16 +567,15 @@ where
 }
 
 /// Ergebnis eines tatsächlich ausgeführten `!`/`!!`-Laufs (Plan Teil F):
-/// Grundlage für den automatischen Folge-Turn, den `app.rs` nach einem
-/// erfolgreichen `shell.exec`-Aufruf startet.
+/// Grundlage für den automatischen Folge-Turn bzw. (während eines Turns)
+/// den Kontext des nächsten Turns.
 ///
 /// # Beschreibung
-/// Nur gesetzt, wenn der `shell.exec`-Ausführer wirklich lief und ein
-/// `ToolOutput::Json` mit `exit_code` lieferte (siehe [`execute_shell`]) —
-/// bei Admission-Fehlern (`HARW_DISABLE_SHELL`, fehlende Capability), einem
-/// nicht verfügbaren Ausführer oder einer Ablehnung durch die Sandbox-
-/// Autorität gibt es kein `ShellRunOutcome`, und `app.rs` startet dann
-/// bewusst keinen Folge-Turn.
+/// Nur gesetzt, wenn der Befehl wirklich auf dem Host gestartet wurde
+/// ([`shell_run_outcome`], Runde 6, Teil B) — bei Admission-Fehlern
+/// (`HARW_DISABLE_SHELL`, fehlende Capability), einer Ablehnung (`sudo`,
+/// leerer Befehl) oder einem Startfehler gibt es kein `ShellRunOutcome`, und
+/// es folgt bewusst kein Turn.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ShellRunOutcome {
     /// Der ausgeführte Befehlstext, ohne führendes `!` (bei `!!` der
@@ -576,10 +583,15 @@ pub(crate) struct ShellRunOutcome {
     pub(crate) command: String,
     /// Exit-Code des Prozesses.
     pub(crate) exit_code: i64,
-    /// `stdout` und `stderr` zusammengeführt, ungekappt — die Kappung auf
-    /// 8000 Zeichen erfolgt erst beim Bau der Folge-Turn-Nachricht in
-    /// `app.rs` (`build_shell_turn_message`).
+    /// `stdout` und `stderr` zusammengeführt (auf das Byte-Budget des
+    /// Operator-Wegs gekappt) — die Kappung auf 8000 Zeichen erfolgt erst
+    /// beim Bau der Folge-Turn-Nachricht in `app.rs`
+    /// (`build_shell_turn_message`).
     pub(crate) combined_output: String,
+    /// Runde 6, Teil B: Arbeitsverzeichnis auf dem Host (Projektwurzel).
+    pub(crate) cwd: std::path::PathBuf,
+    /// Runde 6, Teil B: Hinweis zum Ende (Zeitlimit, Kappung), sonst `None`.
+    pub(crate) note: Option<String>,
 }
 
 /// Rückgabe von [`execute_shell`]: Anzeigetext für die Verlaufszelle
@@ -670,7 +682,7 @@ where
             CommandDispatchOutcome { text, shell: None }
         }
         CommandAction::Shell(command) => {
-            let outcome = execute_shell(sandbox, session_id, command).await;
+            let outcome = execute_shell(sandbox, command).await;
             CommandDispatchOutcome {
                 text: outcome.display_text,
                 shell: outcome.run,
@@ -678,7 +690,7 @@ where
         }
         CommandAction::ShellRepeat => match last_shell_command {
             Some(command) => {
-                let outcome = execute_shell(sandbox, session_id, command.to_owned()).await;
+                let outcome = execute_shell(sandbox, command.to_owned()).await;
                 CommandDispatchOutcome {
                     text: outcome.display_text,
                     shell: outcome.run,
@@ -701,117 +713,195 @@ where
     }
 }
 
-/// Baut den `ShellToolProvider` für lokale `!`-Befehle, optional mit der
-/// beim Prozessstart gelesenen Host-PATH-Bindung (Plan
-/// `recursive-cooking-lobster.md` Teil C2).
+/// Ergebnis der Zulassung einer `!`-Zeile (Runde 6, Teil B).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum ShellAdmission {
+    /// Keine `!`/`!!`-Zeile — der normale Befehlspfad ist zuständig.
+    NotShell,
+    /// Zugelassen; der (zugeschnittene, bei `!!` aufgelöste) Befehl soll
+    /// auf dem Host laufen.
+    Run(String),
+    /// Abgelehnt (Capability, Berechtigung, Parser, leerer Befehl, `!!`
+    /// ohne Vorgänger); der Text wird angezeigt, es läuft nichts.
+    Rejected(String),
+}
+
+/// Lässt eine `!`/`!!`-Zeile zu, ohne sie auszuführen (Runde 6, Teil B).
 ///
 /// # Beschreibung
-/// Reine Hilfsfunktion, ausgelagert aus [`execute_shell`], damit die
-/// Übernahme einer [`HostPathBinding`] in den `ShellToolProvider` ohne
-/// `bwrap`-Aufbau testbar ist: `binding = Some(..)` ruft
-/// [`ShellToolProvider::with_host_path`] auf, `binding = None` liefert den
-/// unveränderten `ShellToolProvider::new()`. Wirkt sich nur auf den
-/// `bwrap`-Sandbox-Pfad von `run_command` aus, nicht auf die normale
-/// Modell-`shell.exec`-Ausführung (die baut ihren eigenen
-/// `ShellToolProvider` ohne Host-PATH-Bindung, siehe `harw-runtime`).
+/// Nutzt dieselbe Admission wie jeder andere Dispatch
+/// ([`classify_and_admit`] mit [`tui_dispatch_context`], also
+/// `HARW_DISABLE_SHELL` und die Operator-Stufe). `!cmd` und `! cmd` sind
+/// gleichwertig; der Befehl wird an beiden Enden zugeschnitten. `!!` (auch
+/// `! !`) löst gegen `last_shell_command` auf.
 ///
 /// # Argumente
-/// - `binding` (`Option<HostPathBinding>`): siehe [`HostPathBinding::from_env`].
+/// - `adapters`: Command-Adapter (für den Katalog).
+/// - `caller_permission`: Stufe der Aufruferin.
+/// - `raw_line`: die abgeschickte Zeile.
+/// - `last_shell_command`: der zuletzt gestartete `!`-Befehl der Sitzung.
 ///
 /// # Rückgabe
-/// Ein [`ShellToolProvider`] mit oder ohne Host-PATH-Bindung.
-fn shell_escape_provider(binding: Option<HostPathBinding>) -> ShellToolProvider {
-    let provider = ShellToolProvider::new();
-    match binding {
-        Some(binding) => provider.with_host_path(binding),
-        None => provider,
+/// [`ShellAdmission`].
+pub(crate) fn admit_shell_line(
+    adapters: &[CommandAdapter],
+    caller_permission: PermissionTier,
+    raw_line: &str,
+    last_shell_command: Option<&str>,
+) -> ShellAdmission {
+    if !raw_line.starts_with('!') {
+        return ShellAdmission::NotShell;
+    }
+    let context = tui_dispatch_context(caller_permission);
+    match classify_and_admit(adapters, context, raw_line) {
+        Err(text) => ShellAdmission::Rejected(text),
+        Ok((_, CommandAction::Shell(command))) => {
+            let command = command.trim();
+            if command.is_empty() {
+                ShellAdmission::Rejected("Kein Befehl nach `!` angegeben.".to_owned())
+            } else {
+                ShellAdmission::Run(command.to_owned())
+            }
+        }
+        Ok((_, CommandAction::ShellRepeat)) => match last_shell_command {
+            Some(command) => ShellAdmission::Run(command.to_owned()),
+            None => ShellAdmission::Rejected("Kein vorheriger !-Befehl".to_owned()),
+        },
+        Ok(_) => ShellAdmission::NotShell,
     }
 }
 
-/// Führt einen lokalen `!`-Befehl ausschließlich über den normalen,
-/// Bubblewrap-gebundenen `shell.exec`-Ausführer aus. Die übergebene TUI-Sandbox
-/// ist die gesamte Autoritätsquelle; weder Arbeitsverzeichnis noch Rechte kommen
-/// aus dem vom Benutzer getippten Text. Der beim Start dieses Prozesses
-/// gelesene zsh-PATH ([`HostPathBinding::from_env`]) wird über
-/// [`shell_escape_provider`] an den `ShellToolProvider` gereicht (Plan Teil
-/// C2) — wirkt sich nur auf den `bwrap`-Pfad aus, nicht auf die normale
-/// Modell-`shell.exec`-Ausführung.
+/// Baut den Operator-Befehl für einen `!`-Befehl (Runde 6, Teil B).
 ///
-/// Liefert seit Plan Teil F [`ShellDisplayOutcome`] statt eines reinen
-/// `String`: `display_text` ist byte-identisch zum bisherigen
-/// Rückgabewert; `run` ist nur bei einem echten `ToolOutput::Json`-Ergebnis
-/// gesetzt (siehe [`ShellRunOutcome`]).
-async fn execute_shell(
+/// # Beschreibung
+/// `cwd` ist die kanonische Projektwurzel der TUI-Sandbox; die Umgebung wird
+/// vollständig geerbt (echtes `HOME`). rlimits: Standard-[`ShellLimits`].
+pub(crate) fn operator_command(
     sandbox: &SandboxSpec,
-    session_id: &SessionId,
-    command: String,
-) -> ShellDisplayOutcome {
-    let provider = shell_escape_provider(HostPathBinding::from_env());
-    let tool_name = ToolName::new("shell.exec");
-    let Some(executor) = provider.executor(&tool_name) else {
-        return ShellDisplayOutcome {
-            display_text: "Shell-Ausführung fehlgeschlagen: shell.exec ist nicht verfügbar."
-                .to_owned(),
-            run: None,
-        };
-    };
-    let context = ToolExecutionContext::new(session_id.clone(), TurnId::new(), sandbox.clone());
-    // Geklont, weil `command` unten für `ShellRunOutcome::command` gebraucht
-    // wird, nachdem `serde_json::json!` das Original in die Aufrufargumente
-    // verschoben hat.
-    let command_for_result = command.clone();
-    let call = ToolCall {
-        id: ToolCallId::new(),
-        name: tool_name,
-        arguments: serde_json::json!({ "command": command }),
-    };
-    match executor.execute(&context, &call).await {
-        Ok(ToolOutput::Json { content }) => {
-            let stdout = content
-                .get("stdout")
-                .and_then(serde_json::Value::as_str)
-                .unwrap_or("");
-            let stderr = content
-                .get("stderr")
-                .and_then(serde_json::Value::as_str)
-                .unwrap_or("");
-            let exit_code = content
-                .get("exit_code")
-                .and_then(serde_json::Value::as_i64)
-                .unwrap_or(-1);
-            let display_text = match (stdout.is_empty(), stderr.is_empty()) {
-                (true, true) => format!("Shell beendet (Exit-Code {exit_code})."),
-                (false, true) => stdout.to_owned(),
-                (true, false) => format!("stderr:\n{stderr}"),
-                (false, false) => format!("{stdout}\nstderr:\n{stderr}"),
-            };
-            let combined_output = match (stdout.is_empty(), stderr.is_empty()) {
-                (true, true) => String::new(),
-                (false, true) => stdout.to_owned(),
-                (true, false) => stderr.to_owned(),
-                (false, false) => format!("{stdout}\n{stderr}"),
-            };
-            ShellDisplayOutcome {
-                display_text,
-                run: Some(ShellRunOutcome {
-                    command: command_for_result,
-                    exit_code,
-                    combined_output,
-                }),
-            }
+    command: &str,
+    timeout: std::time::Duration,
+) -> OperatorCommand {
+    OperatorCommand::new(command, sandbox.workspace().canonical_root())
+        .with_limits(operator_limits())
+        .with_timeout(timeout)
+}
+
+/// Großzügige rlimits für `!`-Befehle der Nutzerin.
+///
+/// # Beschreibung
+/// Die Vorgaben von [`ShellLimits`] sind für Modellbefehle gedacht; mit 2 GiB
+/// Adressraum und 256 Dateideskriptoren scheitern eigene Befehle wie
+/// `! cargo build`. Die Nutzerin tippt hier selbst, deshalb gelten nur
+/// Schutzgrenzen gegen Ausreißer. Fehlt `prlimit`, läuft der Befehl trotzdem;
+/// das Zeitlimit bleibt die harte Grenze.
+fn operator_limits() -> ShellLimits {
+    const GIB: u64 = 1024 * 1024 * 1024;
+    ShellLimits {
+        as_bytes: 64 * GIB,
+        fsize_bytes: 64 * GIB,
+        nofile: 8192,
+        nproc: 8192,
+        require_rlimits: false,
+        ..ShellLimits::default()
+    }
+}
+
+/// Anzeigetext eines beendeten `!`-Befehls (Runde 6, Teil B).
+///
+/// # Beschreibung
+/// Ablehnung → `Shell-Ausführung abgelehnt: …`, Startfehler →
+/// `Shell-Ausführung fehlgeschlagen: …`. Sonst die Ausgabe (stdout, danach
+/// `stderr:` und stderr) und eine Abschlusszeile „Shell beendet (Exit-Code
+/// N) – auf dem Host ausgeführt, cwd …“ mit Hinweisen auf Zeitlimit bzw.
+/// Kappung.
+#[must_use]
+pub(crate) fn operator_display_text(outcome: &OperatorOutcome) -> String {
+    match &outcome.end {
+        OperatorEnd::Denied { message } => {
+            return format!("Shell-Ausführung abgelehnt: {message}");
         }
-        Ok(ToolOutput::Text { content }) => ShellDisplayOutcome {
-            display_text: content,
-            run: None,
-        },
-        Ok(ToolOutput::Error { message }) => ShellDisplayOutcome {
-            display_text: format!("Shell-Ausführung abgelehnt: {message}"),
-            run: None,
-        },
-        Err(error) => ShellDisplayOutcome {
-            display_text: format!("Shell-Ausführung fehlgeschlagen: {error}"),
-            run: None,
-        },
+        OperatorEnd::Failed { message } if !outcome.executed_on_host => {
+            return format!("Shell-Ausführung fehlgeschlagen: {message}");
+        }
+        _ => {}
+    }
+    let body = match (outcome.stdout.is_empty(), outcome.stderr.is_empty()) {
+        (true, true) => String::new(),
+        (false, true) => outcome.stdout.clone(),
+        (true, false) => format!("stderr:\n{}", outcome.stderr),
+        (false, false) => format!("{}\nstderr:\n{}", outcome.stdout, outcome.stderr),
+    };
+    let footer = format!(
+        "Shell beendet (Exit-Code {}) – auf dem Host ausgeführt, cwd {}{}.",
+        outcome.exit_code,
+        outcome.cwd.display(),
+        operator_note(outcome)
+            .map(|note| format!("; {note}"))
+            .unwrap_or_default()
+    );
+    let body = body.trim_end_matches('\n');
+    if body.is_empty() {
+        footer
+    } else {
+        format!("{body}\n{footer}")
+    }
+}
+
+/// Zusatzhinweis zum Ende eines `!`-Befehls (Zeitlimit, Kappung, Fehler).
+fn operator_note(outcome: &OperatorOutcome) -> Option<String> {
+    match &outcome.end {
+        OperatorEnd::TimedOut { timeout_secs } => Some(format!(
+            "Zeitlimit {timeout_secs} s erreicht, Prozess beendet"
+        )),
+        OperatorEnd::OutputLimit => Some("Ausgabe zu groß, gekappt und Prozess beendet".to_owned()),
+        OperatorEnd::Cancelled => Some("mit Ctrl+C abgebrochen, Prozess beendet".to_owned()),
+        OperatorEnd::Failed { message } => Some(format!("Fehler: {message}")),
+        OperatorEnd::Exited if outcome.truncated => Some("Ausgabe gekappt".to_owned()),
+        OperatorEnd::Exited | OperatorEnd::Denied { .. } => None,
+    }
+}
+
+/// Strukturiertes Ergebnis für den Folge-Turn (Runde 6, Teil B).
+///
+/// # Rückgabe
+/// `None`, wenn der Befehl nie gestartet wurde (Ablehnung, Startfehler) —
+/// dann gibt es keinen Folge-Turn.
+#[must_use]
+pub(crate) fn shell_run_outcome(outcome: &OperatorOutcome) -> Option<ShellRunOutcome> {
+    if !outcome.executed_on_host {
+        return None;
+    }
+    Some(ShellRunOutcome {
+        command: outcome.command.clone(),
+        exit_code: outcome.exit_code,
+        combined_output: outcome.combined_output(),
+        cwd: outcome.cwd.clone(),
+        note: operator_note(outcome),
+    })
+}
+
+/// Führt einen lokalen `!`-Befehl der Nutzerin **auf dem Host** aus
+/// (Runde 6, Teil B; vorher Bubblewrap mit flüchtigem `HOME`).
+///
+/// # Beschreibung
+/// Läuft über [`harw_tool_shell::OperatorCommand`] (echtes `HOME`, geerbte
+/// Umgebung, `setsid`, rlimits, gekapptes Ergebnis, Zeitlimit
+/// [`OPERATOR_DEFAULT_TIMEOUT_SECS`]); `cwd` ist die Projektwurzel der
+/// Sandbox. `sudo`/`doas`/`pkexec` bleiben abgelehnt. Die TUI selbst nutzt
+/// den asynchronen Weg in `app/operator_shell.rs`; diese Funktion bedient
+/// die synchronen Dispatch-Pfade ([`execute_with_context`],
+/// [`dispatch_command_with_shell_result`]).
+async fn execute_shell(sandbox: &SandboxSpec, command: String) -> ShellDisplayOutcome {
+    let outcome = operator_command(
+        sandbox,
+        &command,
+        std::time::Duration::from_secs(OPERATOR_DEFAULT_TIMEOUT_SECS),
+    )
+    .run()
+    .await;
+    ShellDisplayOutcome {
+        display_text: operator_display_text(&outcome),
+        run: shell_run_outcome(&outcome),
     }
 }
 
@@ -973,9 +1063,7 @@ mod tests {
     use crate::session_controller::TuiSessionController;
     use harw_operations::SessionController;
 
-    use super::{
-        CommandServices, build_services, dispatch_command_with_shell_result, shell_escape_provider,
-    };
+    use super::{CommandServices, build_services, dispatch_command_with_shell_result};
     use crate::test_support::{TestError, TestResult, ctx};
 
     /// Baut alle 16 `harw-ops`-Adapter über die echte Registrierungsfunktion.
@@ -1302,13 +1390,11 @@ mod tests {
         Ok(())
     }
 
-    /// Mit einem vorherigen Befehl versucht `!!`, ihn über `execute_shell`
-    /// erneut auszuführen — anders als die zustandslose `execute_with_context`
-    /// (siehe `test_shell_repeat_is_not_implemented`), die diesen Zustand
-    /// nicht kennt. `test_sandbox()` gewährt kein `ExecuteProcess`, daher
-    /// scheitert die Ausführung fail-closed; das beweist trotzdem, dass der
-    /// gespeicherte Befehl tatsächlich (erneut) beim Ausführer ankommt statt
-    /// bei der alten „noch nicht verfügbar"-Meldung stehen zu bleiben.
+    /// Mit einem vorherigen Befehl führt `!!` ihn erneut aus — anders als die
+    /// zustandslose `execute_with_context` (siehe
+    /// `test_shell_repeat_is_not_implemented`). Runde 6, Teil B: der Befehl
+    /// läuft auf dem Host (Projektwurzel als cwd), unabhängig von
+    /// `ExecuteProcess` der Sandbox, und liefert ein strukturiertes Ergebnis.
     #[tokio::test]
     async fn dispatch_shell_repeat_with_previous_command_reruns_it() -> TestResult {
         let adapters = adapters();
@@ -1328,13 +1414,16 @@ mod tests {
         .await;
         std::fs::remove_dir_all(tmp).ok();
 
-        assert_eq!(
-            outcome.text,
-            "Shell-Ausführung abgelehnt: shell.exec denied: ExecuteProcess permission missing"
-        );
+        let shell = outcome
+            .shell
+            .ok_or(TestError::Missing("!! muss erneut ausgeführt werden"))?;
+        assert_eq!(shell.command, "echo hi");
+        assert_eq!(shell.exit_code, 0, "{shell:?}");
+        assert_eq!(shell.combined_output.trim(), "hi");
         assert!(
-            outcome.shell.is_none(),
-            "eine von der Sandbox abgelehnte Ausführung darf keinen Folge-Turn auslösen"
+            outcome.text.contains("auf dem Host ausgeführt"),
+            "{}",
+            outcome.text
         );
         assert_ne!(
             outcome.text, "Shell-Wiederholung ist noch nicht verfügbar.",
@@ -1343,11 +1432,9 @@ mod tests {
         Ok(())
     }
 
-    /// Ein direkter `!`-Befehl (nicht `!!`) läuft über denselben Pfad wie
-    /// `execute_with_context`s `CommandAction::Shell`-Zweig — `test_sandbox()`
-    /// gewährt kein `ExecuteProcess`, daher `shell: None` und derselbe
-    /// Ablehnungstext wie bei der bestehenden `!`-Deny-Prüfung
-    /// (`test_execute_with_context_admitted_shell_denied_without_execute_permission`).
+    /// Runde 6, Teil B: `sudo` in einem `!`-Befehl wird vor dem Start
+    /// abgelehnt (Hinweis auf das sudo-Fenster) — kein strukturiertes
+    /// Ergebnis, also auch kein Folge-Turn.
     #[tokio::test]
     async fn dispatch_shell_command_reports_no_structured_result_when_denied() -> TestResult {
         let adapters: Vec<CommandAdapter> = Vec::new();
@@ -1360,7 +1447,7 @@ mod tests {
             &sandbox,
             &session_id,
             harw_operations::PermissionTier::Owner,
-            "!echo hi",
+            "!sudo ls",
             None,
             || build_services(&adapters, None, None, &controller, None, None),
         )
@@ -1368,16 +1455,17 @@ mod tests {
         std::fs::remove_dir_all(tmp).ok();
 
         assert!(outcome.shell.is_none());
-        assert_eq!(
-            outcome.text,
-            "Shell-Ausführung abgelehnt: shell.exec denied: ExecuteProcess permission missing"
+        assert!(
+            outcome.text.starts_with("Shell-Ausführung abgelehnt:"),
+            "{}",
+            outcome.text
         );
+        assert!(outcome.text.contains("sudo-Fenster"), "{}", outcome.text);
         Ok(())
     }
 
     #[tokio::test]
-    async fn test_execute_with_context_admitted_shell_denied_without_execute_permission()
-    -> TestResult {
+    async fn test_execute_with_context_admitted_shell_rejects_sudo() -> TestResult {
         let adapters = adapters();
         let (sandbox, tmp) = test_sandbox()?;
         let session_id = SessionId::new();
@@ -1400,7 +1488,7 @@ mod tests {
             &sandbox,
             &session_id,
             context,
-            "!ls -la",
+            "!sudo ls -la",
             || {
                 build_services(
                     &adapters,
@@ -1427,14 +1515,10 @@ mod tests {
             .await;
         std::fs::remove_dir_all(tmp).ok();
 
-        // `test_sandbox()` gewährt nur ReadWorkspace/WriteWorkspace, kein
-        // ExecuteProcess: `execute_shell` läuft jetzt tatsächlich bis zum
-        // echten `shell.exec`-Ausführer durch (kein Platzhalter mehr) und
-        // dieser lehnt fail-closed wegen der fehlenden Berechtigung ab.
-        assert_eq!(
-            shell,
-            "Shell-Ausführung abgelehnt: shell.exec denied: ExecuteProcess permission missing"
-        );
+        // Runde 6, Teil B: `!` läuft auf dem Host; `sudo` bleibt dort vor
+        // dem Start abgelehnt (Hinweis auf das sudo-Fenster).
+        assert!(shell.starts_with("Shell-Ausführung abgelehnt:"), "{shell}");
+        assert!(shell.contains("sudo-Fenster"), "{shell}");
         assert_eq!(repeat, "Shell-Wiederholung ist noch nicht verfügbar.");
         Ok(())
     }
@@ -2052,6 +2136,67 @@ mod tests {
         CommandRegistry::built_in().map_err(ctx("built_in"))
     }
 
+    /// Runde 6, Teil B: `!`/`!!` laufen während eines Turns sofort.
+    #[test]
+    fn busy_availability_for_bang_is_immediate() -> TestResult {
+        let registry = built_in_registry()?;
+        for raw in ["!ls", "! ls", "!!", "! !"] {
+            assert_eq!(
+                super::busy_availability_for(&registry, raw),
+                BusyAvailability::Immediate,
+                "{raw}"
+            );
+        }
+        Ok(())
+    }
+
+    /// Runde 6, Teil B: `!cmd` und `! cmd` werden gleich zugelassen und
+    /// zugeschnitten; `! !` wiederholt; leer und `!!` ohne Vorgänger werden
+    /// abgelehnt; Nicht-`!`-Zeilen bleiben beim normalen Pfad.
+    #[test]
+    fn admit_shell_line_normalizes_and_resolves_repeat() {
+        use super::{ShellAdmission, admit_shell_line};
+        let adapters: Vec<CommandAdapter> = Vec::new();
+        let tier = PermissionTier::Operator;
+        let run = |cmd: &str| ShellAdmission::Run(cmd.to_owned());
+        assert_eq!(
+            admit_shell_line(&adapters, tier, "!ls -la", None),
+            run("ls -la")
+        );
+        assert_eq!(
+            admit_shell_line(&adapters, tier, "! ls -la ", None),
+            run("ls -la")
+        );
+        assert_eq!(
+            admit_shell_line(&adapters, tier, "! !", Some("pwd")),
+            run("pwd")
+        );
+        assert_eq!(
+            admit_shell_line(&adapters, tier, "!!", Some("pwd")),
+            run("pwd")
+        );
+        assert!(matches!(
+            admit_shell_line(&adapters, tier, "!!", None),
+            ShellAdmission::Rejected(_)
+        ));
+        assert!(matches!(
+            admit_shell_line(&adapters, tier, "! ", None),
+            ShellAdmission::Rejected(_)
+        ));
+        assert!(matches!(
+            admit_shell_line(&adapters, PermissionTier::Observer, "!ls", None),
+            ShellAdmission::Rejected(_)
+        ));
+        assert_eq!(
+            admit_shell_line(&adapters, tier, "/status", None),
+            ShellAdmission::NotShell
+        );
+        assert_eq!(
+            admit_shell_line(&adapters, tier, "\\!ls", None),
+            ShellAdmission::NotShell
+        );
+    }
+
     #[test]
     fn busy_availability_for_status_is_immediate() -> TestResult {
         assert_eq!(
@@ -2387,45 +2532,6 @@ mod tests {
             );
         }
         Ok(())
-    }
-
-    // -----------------------------------------------------------------------
-    // 14. shell_escape_provider (C2): HostPathBinding taken up by the
-    //     ShellToolProvider that backs local `!`-commands.
-    // -----------------------------------------------------------------------
-
-    /// `shell_escape_provider_without_binding_leaves_host_path_none`: with no
-    /// `HostPathBinding` (e.g. `HostPathBinding::from_env()` returned `None`
-    /// because `PATH` was unset), the built provider must be indistinguishable
-    /// from `ShellToolProvider::new()` — no bwrap plan change without a call.
-    #[test]
-    fn shell_escape_provider_without_binding_leaves_host_path_none() {
-        let provider = shell_escape_provider(None);
-        assert!(
-            provider.host_path.is_none(),
-            "shell_escape_provider(None) must not set a host_path binding"
-        );
-    }
-
-    /// `shell_escape_provider_with_binding_sets_host_path`: with a supplied
-    /// `HostPathBinding`, `shell_escape_provider` must thread it through
-    /// `ShellToolProvider::with_host_path` unchanged (Plan Teil C2). Verified
-    /// without ever touching `bwrap` — this is a pure struct-field check.
-    #[test]
-    fn shell_escape_provider_with_binding_sets_host_path() {
-        let binding = harw_sandbox::HostPathBinding {
-            path: "/host/bin:/host/usr/bin".to_owned(),
-            ..harw_sandbox::HostPathBinding::default()
-        };
-
-        let provider = shell_escape_provider(Some(binding.clone()));
-
-        assert_eq!(
-            provider.host_path,
-            Some(binding),
-            "shell_escape_provider(Some(binding)) must carry the exact binding into \
-             ShellToolProvider::host_path via with_host_path"
-        );
     }
 
     // -----------------------------------------------------------------------

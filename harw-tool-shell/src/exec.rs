@@ -1,6 +1,6 @@
 //! Shell-execution tool provider and executor for Harwness.
 //!
-//! Spec source: `/home/mia/.claude/plans/recursive-cooking-lobster.md`, Teil B1
+//! Spec source: `/home/nutzerin/.claude/plans/recursive-cooking-lobster.md`, Teil B1
 //! ("Echte Host-Ausführung") and Teil C2 (`ShellToolProvider::with_host_path`).
 //!
 //! **Security note**: By default this executor launches `/bin/sh -c` only through a
@@ -13,9 +13,11 @@
 //! ([`HostPermitSessionRegistry::take_single_use`]) for the calling session, the
 //! command runs directly on the host (`/bin/sh -c`, no `bwrap`) with the harness's own
 //! inherited environment (no `env_clear`) and the sandbox's canonical workspace root as
-//! `cwd`. There is no other path to host execution: every other combination of
-//! profile/registry state still requires a successful Bubblewrap plan, unchanged from
-//! before.
+//! `cwd`. There is no other path to host execution for model calls: every other
+//! combination of profile/registry state still requires a successful Bubblewrap plan,
+//! unchanged from before. Runde 6, Teil B: der Operator-Weg (`operator`,
+//! [`run_operator_command`]) ist kein Modell-Werkzeug — er führt nur die von der
+//! Nutzerin selbst getippten `!`-Befehle der TUI auf dem Host aus.
 //!
 //! # Responsibility scope
 //! - Owns [`ShellToolProvider`] (implements [`harw_extension_api::contributors::ToolProvider`])
@@ -91,6 +93,14 @@ mod escalation;
 // Obergrenze `[shell] max_timeout_secs`, klare Zeitablauf-Meldung.
 mod timeouts;
 pub use timeouts::{BUILD_COMMAND_DEFAULT_TIMEOUT_SECS, DEFAULT_MAX_TIMEOUT_SECS};
+// Runde 6, Teil B: `!`-Befehle der Nutzerin laufen immer auf dem Host
+// (ohne bwrap und ohne Freigabe, mit denselben Bausteinen wie
+// `run_host_command`).
+mod operator;
+pub use operator::{
+    OPERATOR_DEFAULT_TIMEOUT_SECS, OperatorCommand, OperatorEnd, OperatorOutcome,
+    operator_escalation_message, run_operator_command,
+};
 
 // ── Constants ─────────────────────────────────────────────────────────────────
 

@@ -13,8 +13,11 @@
 //! # Modules
 //! - [`exec`] — [`ShellToolProvider`], [`ShellExecutor`], [`ShellExecError`],
 //!   [`HOST_SESSION_LEASE_TTL`], [`HOST_PERMIT_PROMPT_TIMEOUT`]: Host-Ausführung
-//!   ohne `bwrap` läuft ausschließlich über [`ShellExecutor::run_command`]
-//!   (Plan `recursive-cooking-lobster.md` Teil B1)
+//!   ohne `bwrap` läuft für Modell-Aufrufe ausschließlich über
+//!   [`ShellExecutor::run_command`] (Plan `recursive-cooking-lobster.md` Teil B1).
+//!   Runde 6, Teil B: [`run_operator_command`]/[`OperatorCommand`] — `!`-Befehle
+//!   der Nutzerin immer auf dem Host (ohne Freigabe, sudo bleibt abgelehnt,
+//!   Audit `shell.operator_exec`)
 //! - [`limits`] — [`ShellLimits`], [`ShellLimitsError`]: rlimits über festgepinntes `prlimit`
 //!   und tmpfs-Größe (W1-03)
 //! - [`host_permit_prompt`] — [`HostPermitPrompt`], [`HostPermitVariant`],
@@ -48,6 +51,11 @@ pub mod sudo;
 pub use exec::{
     BUILD_COMMAND_DEFAULT_TIMEOUT_SECS, DEFAULT_MAX_TIMEOUT_SECS, HOST_PERMIT_PROMPT_TIMEOUT,
     HOST_SESSION_LEASE_TTL, ShellExecError, ShellExecutor, ShellToolProvider,
+};
+// Runde 6, Teil B: Operator-Weg für `!`-Befehle der Nutzerin (immer Host).
+pub use exec::{
+    OPERATOR_DEFAULT_TIMEOUT_SECS, OperatorCommand, OperatorEnd, OperatorOutcome,
+    operator_escalation_message, run_operator_command,
 };
 // Runde 5, Teil N: Host-Mode-Anfrage aus dem Orchestrator-Baum.
 pub use host_escalation::{

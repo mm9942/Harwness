@@ -629,7 +629,11 @@ fn discovery_runs_exactly_once_per_assembly() -> TestResult {
     // Das Projektverzeichnis verschwindet **nach** der Montage. Eine
     // verborgene zweite Erkennung könnte danach nicht mehr gelingen; der
     // Beweis hängt also nicht an einem Zähler, sondern an der Unmöglichkeit.
-    std::fs::remove_dir_all(&fixture.project).map_err(ctx("Projekt entfernen"))?;
+    // Umbenennen statt `remove_dir_all`: Die Montage darf im Hintergrund
+    // noch in das Projekt schreiben (Journal, Caches); ein Löschen liefe dann
+    // in `ENOTEMPTY`. Das Umbenennen ist atomar, der Pfad ist sofort weg.
+    let parked = fixture.project.with_file_name("project-entfernt");
+    std::fs::rename(&fixture.project, &parked).map_err(ctx("Projekt entfernen"))?;
     assert!(
         harw_project_discovery::discover_project(
             &fixture.project,

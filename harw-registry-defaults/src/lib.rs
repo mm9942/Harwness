@@ -500,6 +500,10 @@ impl ApprovalHandler for DefaultApprovalPolicy {
     ///      Teil E: ist ein Auto-Modus-Gate angehängt
     ///      ([`Self::with_auto_gate`]), entscheidet statt der Rückfrage sein
     ///      Urteil (`allow` → `Allow`, `ask` → `AskUser`, `deny` → `Deny`).
+    ///      Runde 6, Teil A1: das Gate liefert `deny` nur noch dort, wo
+    ///      niemand gefragt werden kann (Kind ohne Freigabe-Kanal); sonst
+    ///      wandelt es selbst in `ask` um — der Grund steht dann im
+    ///      Entscheidungsprotokoll unter der Id des Aufrufs.
     ///    - [`ApprovalMode::FullAccess`]: nichts fragt.
     ///
     /// Regeln und Modus werden bei **jedem** Aufruf frisch gelesen, damit eine
@@ -1264,13 +1268,17 @@ mod tests {
 
     impl FixedGate {
         fn new(decision: harw_extension_api::auto_mode::AutoDecision) -> Arc<Self> {
+            Self::with_verdict(harw_extension_api::auto_mode::AutoVerdict::new(
+                decision,
+                "test",
+                "fester Testgrund",
+                harw_extension_api::auto_mode::VerdictSource::Classifier,
+            ))
+        }
+
+        fn with_verdict(verdict: harw_extension_api::auto_mode::AutoVerdict) -> Arc<Self> {
             Arc::new(Self {
-                verdict: harw_extension_api::auto_mode::AutoVerdict::new(
-                    decision,
-                    "test",
-                    "fester Testgrund",
-                    harw_extension_api::auto_mode::VerdictSource::Classifier,
-                ),
+                verdict,
                 calls: std::sync::atomic::AtomicUsize::new(0),
             })
         }
@@ -1314,8 +1322,11 @@ mod tests {
         Ok(())
     }
 
+    /// Runde 6, Teil A1: ein `deny`, das nach der Umwandlung im Gate übrig
+    /// bleibt (niemand kann gefragt werden: Kind ohne Kanal, Nicht-TUI),
+    /// wird zum harten `Deny` mit Grund.
     #[test]
-    fn auto_gate_deny_becomes_a_deny_with_reason() -> TestResult {
+    fn auto_gate_final_deny_stays_a_deny_with_reason() -> TestResult {
         use harw_extension_api::auto_mode::{AUTO_DENIAL_PREFIX, AutoDecision};
         let gate = FixedGate::new(AutoDecision::Deny);
         let policy = gated_policy(ApprovalMode::Delegated, AllowRuleSet::new(), &gate);
@@ -1329,6 +1340,30 @@ mod tests {
                 "erwartet Deny, war {other:?}"
             ))),
         }
+    }
+
+    /// Runde 6, Teil A1: ein vom Gate aus `deny` umgewandeltes `ask` (Wurzel
+    /// bzw. Kind mit Kanal) wird zur Rückfrage, nicht zur Ablehnung.
+    #[test]
+    fn auto_gate_escalated_deny_becomes_a_question() -> TestResult {
+        use harw_extension_api::auto_mode::{AutoDecision, AutoVerdict, VerdictSource};
+        let gate = FixedGate::with_verdict(
+            AutoVerdict::new(
+                AutoDecision::Deny,
+                "exfiltration",
+                "verschiebt nach ~",
+                VerdictSource::Classifier,
+            )
+            .escalate_to_ask(),
+        );
+        let policy = gated_policy(ApprovalMode::Delegated, AllowRuleSet::new(), &gate);
+
+        assert!(matches!(
+            block_on(policy.review(&call("shell.exec")))?,
+            ApprovalDecision::AskUser(_)
+        ));
+        assert_eq!(gate.calls(), 1);
+        Ok(())
     }
 
     /// Harte Regel: `ALWAYS_ASK_TOOLS` erreichen das Gate nie — auch nicht,

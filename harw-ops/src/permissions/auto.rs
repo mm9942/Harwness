@@ -135,8 +135,15 @@ pub(super) fn decision_log(ctx: &OpContext, tail: &[String]) -> Result<OpOutput,
                 AutoDecision::Ask => "? gefragt ",
                 AutoDecision::Deny => "✗ abgelehnt",
             };
+            // Runde 6, Teil A: Eine Ablehnung, die zur Rückfrage wurde, ist
+            // als solche erkennbar.
+            let escalated = if entry.verdict.escalated {
+                "  (Ablehnung → Rückfrage)"
+            } else {
+                ""
+            };
             format!(
-                "  {time}  {label}  {}  — {}: {} [{}]",
+                "  {time}  {label}  {}  — {}: {} [{}]{escalated}",
                 single_line(&entry.summary),
                 single_line(&entry.verdict.category),
                 single_line(&entry.verdict.reason),
