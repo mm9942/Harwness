@@ -6395,14 +6395,11 @@ specialization = "child-controller-test"
         for caller in all {
             for target in all {
                 for name in ["matrix-player", "worker"] {
-                    let expected = if caller == AgentRoleId::UserInterface
+                    let listed_uia_worker = caller == AgentRoleId::UserInterface
                         && target == AgentRoleId::Worker
-                        && name == "matrix-player"
-                    {
-                        true
-                    } else {
-                        can_delegate_to(caller, target, name, &allowed_orchestrators)
-                    };
+                        && name == "matrix-player";
+                    let expected = listed_uia_worker
+                        || can_delegate_to(caller, target, name, &allowed_orchestrators);
                     assert_eq!(
                         spawner.spawn_permitted(caller, target, name, &allowed_orchestrators),
                         expected,

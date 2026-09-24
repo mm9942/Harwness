@@ -1015,10 +1015,12 @@ fn ensure_bound_to(sandbox: &SandboxSpec, expected: &Path) -> RuntimeResult<()> 
 /// gilt für `UiaQuickHelper`/`UiaWriter`, die seit der Nutzerentscheidung
 /// „die UIA-Helfer recherchieren kurz online und fügen manchmal
 /// Abhängigkeiten hinzu“ ebenfalls `deps.*` und `web.fetch`/`web.search`
-/// registrieren: kein Einstiegsprofil trägt
-/// [`harw_authority::Permission::NetworkAccess`] oder `ReadCargoRegistry`,
-/// die Werkzeuge fallen bei einer Verengung also über
-/// `tool_names_for(granted)` bzw. am Rechte-Prolog heraus.
+/// registrieren: kein Einstiegsprofil trägt `ReadCargoRegistry`, und die
+/// einzigen Einstiege mit [`harw_authority::Permission::NetworkAccess`]
+/// (`Tui`, `OneShot`) führen Modell-Tool-Operationen und dürfen deshalb nur
+/// auf `Full` verengen ([`ensure_narrowing_fits_operations`]); die Werkzeuge
+/// fallen bei einer Verengung also über `tool_names_for(granted)` bzw. am
+/// Rechte-Prolog heraus.
 ///
 /// # Fehler
 /// [`RuntimeError::Registry`] für jede nicht zugelassene Kombination.
@@ -1169,9 +1171,36 @@ fn narrowed_sandbox(
     narrowing: Option<&RuntimeNarrowing>,
 ) -> RuntimeResult<SandboxSpec> {
     let sandbox = match narrowing {
-        Some(narrowing) => sandbox.restrict(&PermissionRequest::from_permissions(
-            narrowing.permissions.iter(),
-        )),
+        Some(narrowing) => {
+            // Das Netz (Hosts) bleibt nur erhalten, wenn die Verengung
+            // `NetworkAccess` selbst weiterträgt — so entsteht nie ein
+            // Netzrecht ohne Hosts und nie Hosts ohne Netzrecht.
+            let keeps_network = narrowing
+                .permissions
+                .contains(harw_authority::Permission::NetworkAccess);
+            let scope = if keeps_network {
+                sandbox.network_scope().clone()
+            } else {
+                NetworkScope::empty()
+            };
+            let narrowed = sandbox.restrict(
+                &PermissionRequest::from_permissions(narrowing.permissions.iter())
+                    .with_network_scope(scope),
+            );
+            if narrowed.network_scope().is_empty()
+                && narrowed
+                    .permissions()
+                    .contains(harw_authority::Permission::NetworkAccess)
+            {
+                narrowed.restrict(&PermissionRequest::from_permissions(
+                    narrowed.permissions().iter().filter(|permission| {
+                        *permission != harw_authority::Permission::NetworkAccess
+                    }),
+                ))
+            } else {
+                narrowed
+            }
+        }
         None => sandbox,
     };
     if sandbox.permissions().is_subset_of(&profile.permissions) {
@@ -6046,6 +6075,7 @@ mod tests {
             EntryKind::Web,
             EntryKind::McpServe,
             EntryKind::JobPlanNode,
+            EntryKind::GatewayTelegram,
         ] {
             let profile = entry.profile();
             let assembly = fixture_builder(entry, &fixture)

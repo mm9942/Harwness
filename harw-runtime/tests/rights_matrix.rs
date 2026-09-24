@@ -819,7 +819,8 @@ fn the_operation_surface_reaches_the_assembled_run() -> TestResult {
 /// Die Namen der Plan-Werkzeuge, die `register_plan_tools`
 /// (`harw-ops/src/lib.rs`) unter das volle Werkzeugprofil mischt:
 /// `PlanOperation`, `GoalOperation`, `ExploreOperation`,
-/// `ResearchDepsOperation`, `ResearchWebOperation`, `AnalyzeOperation`
+/// `ResearchDepsOperation`, `ResearchWebOperation`, `AnalyzeOperation` und
+/// die allgemeine Recherche `research` (Runde 3, Welle B)
 /// (`OperationMeta::name` je Datei in `harw-ops/src/{plan,goal,explore,
 /// research,analyze}.rs`).
 const PLAN_TOOL_NAMES: &[&str] = &[
@@ -829,6 +830,7 @@ const PLAN_TOOL_NAMES: &[&str] = &[
     "research_deps",
     "research_web",
     "analyze",
+    "research",
 ];
 
 /// Z2c-01, zweite Hälfte: **nur** [`OperationSurface::AllWithModelTools`]

@@ -27,6 +27,13 @@
 //!    resolve to organizational role `UiaWorker`, which a `UserInterface`
 //!    caller may spawn. These are the exact redirect targets `/explore` and
 //!    `/research-web` must use once a UIA caller invokes them.
+//! 3. [`test_matrix_roles_are_tool_less_worker_roles_fit_for_the_uia_allowlist`]
+//!    — die `/matrix`-Rollen (`role_names::MATRIX_ROLES`) sind `Worker`, die
+//!    die Spawn-Matrix einer UIA-Wurzel verweigert; sie werden nur über die
+//!    enge Freigabeliste `ManagedAgentSpawner::with_uia_spawnable_roles`
+//!    admittiert. Der Test belegt die Sicherheitsvoraussetzung dieser Liste:
+//!    jede gelistete Rolle ist werkzeuglos (`RegistryProfile::NoTools`) und
+//!    netzlos (`AuthorityReducer::ReadOnly`).
 //!
 //! Both tests resolve roles through the real [`builtin_agent_definitions`]
 //! pipeline — the same one `harw-runtime` mounts for `EntryKind::Tui` /
@@ -40,8 +47,10 @@
 use std::collections::HashMap;
 
 use harw_agent_dsl::roles::{AgentRoleId, can_spawn};
+use harw_authority::Permission;
+use harw_registry_defaults::authority::{AuthorityReducer, authority_reducer_for_role};
 use harw_registry_defaults::embedded_agents::builtin_agent_definitions;
-use harw_registry_defaults::profile::role_names;
+use harw_registry_defaults::profile::{RegistryProfile, profile_for_role, role_names};
 
 mod common;
 use common::{TestError, TestResult, ctx};
@@ -116,6 +125,59 @@ fn test_uia_explorer_and_uia_writer_are_uia_worker_and_allowed_for_uia() -> Test
         assert!(
             can_spawn(AgentRoleId::UserInterface, ir.role()),
             "a UserInterface caller must be able to spawn '{role_name}'"
+        );
+    }
+    Ok(())
+}
+
+/// Sicherheitsvoraussetzung der UIA-Freigabeliste
+/// (`harw-core::child_controller::ManagedAgentSpawner::with_uia_spawnable_roles`):
+/// Die Runtime-Montage übergibt dort genau `role_names::MATRIX_ROLES`. Die
+/// Liste hebelt `can_spawn(UserInterface, Worker) == false` für diese Namen
+/// aus — vertretbar nur, weil jede dieser Rollen **keine Werkzeuge** und
+/// **kein Netz** hat. Dieser Test hält genau das fest: jede Matrix-Rolle
+/// bildet auf `RegistryProfile::NoTools` und `AuthorityReducer::ReadOnly`
+/// ab, das Profil registriert kein Werkzeug, die Reducer-Decke enthält kein
+/// `NetworkAccess`, und die Rolle ist ein `Worker`, den die Spawn-Matrix
+/// allein einer UIA-Wurzel weiterhin verweigert (die Ausnahme also wirklich
+/// nur über die explizite Liste entsteht).
+#[test]
+fn test_matrix_roles_are_tool_less_worker_roles_fit_for_the_uia_allowlist() -> TestResult {
+    let roles = resolved_roles()?;
+
+    for role_name in role_names::MATRIX_ROLES {
+        assert_eq!(
+            profile_for_role(role_name),
+            Some(RegistryProfile::NoTools),
+            "UIA-spawnable role '{role_name}' must map to RegistryProfile::NoTools"
+        );
+        assert!(
+            RegistryProfile::NoTools.tool_names().is_empty(),
+            "RegistryProfile::NoTools must register no tools"
+        );
+        assert_eq!(
+            authority_reducer_for_role(role_name),
+            Some(AuthorityReducer::ReadOnly),
+            "UIA-spawnable role '{role_name}' must map to AuthorityReducer::ReadOnly"
+        );
+        assert!(
+            !AuthorityReducer::ReadOnly
+                .ceiling()
+                .contains(Permission::NetworkAccess),
+            "AuthorityReducer::ReadOnly must never grant network access"
+        );
+
+        let ir = roles.get(role_name).ok_or(TestError::Unexpected(format!(
+            "builtin role '{role_name}' must be registered"
+        )))?;
+        assert_eq!(
+            ir.role(),
+            AgentRoleId::Worker,
+            "role '{role_name}' must resolve to organizational role Worker"
+        );
+        assert!(
+            !can_spawn(AgentRoleId::UserInterface, ir.role()),
+            "only the explicit UIA allowlist may admit '{role_name}', never the spawn matrix"
         );
     }
     Ok(())
