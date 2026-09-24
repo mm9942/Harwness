@@ -24,7 +24,7 @@
 //! ebenfalls bestes Bemühen und erst ab der nächsten Sitzung wirksam.
 //!
 //! Zusätzlich stellt dieses Modul [`SelectionPersistence`] bereit: einen
-//! austauschbaren Dienst-Trait, der die vier `persist_*`-Funktionen hinter
+//! austauschbaren Dienst-Trait, der die `persist_*`-/`clear_*`-Funktionen hinter
 //! einer gemeinsamen Schnittstelle bündelt, plus [`FileSelectionPersistence`]
 //! (Standard-Implementierung, ruft unverändert die freien Funktionen auf) und
 //! [`RecordingSelectionPersistence`] (No-op-Aufzeichnung für Tests). Die
@@ -639,7 +639,7 @@ fn write_default_interaction_mode(
 // [`OpContext`] end-to-end durchlaufen, ohne die echte,
 // `HARW_HOME`-auflösende Persistenz zu berühren.
 
-/// Austauschbarer Persistenz-Dienst für die vier Operator-Auswahl-Persistenzen.
+/// Austauschbarer Persistenz-Dienst für die Operator-Auswahl-Persistenzen (Default, UIA, UIA-Worker, UIA-Effort, interne Modellstellen).
 ///
 /// # Description
 /// Spiegelt exakt die Signaturen der bestehenden freien Funktionen

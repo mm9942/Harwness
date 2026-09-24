@@ -561,7 +561,6 @@ impl TelegramCommandHandler {
             Ok(state) => {
                 let workspace = state
                     .workspace_alias
-                    .map(|alias| alias.to_owned())
                     .or_else(|| {
                         self.default_workspace_alias
                             .as_ref()
@@ -569,7 +568,10 @@ impl TelegramCommandHandler {
                     })
                     .unwrap_or_else(|| "keiner".to_owned());
                 lines.push(format!("Arbeitsbereich: {workspace}"));
-                lines.push(format!("Unterhaltung: Nr. {}", state.session_generation + 1));
+                lines.push(format!(
+                    "Unterhaltung: Nr. {}",
+                    state.session_generation.saturating_add(1)
+                ));
             }
             Err(error) => {
                 tracing::error!(channel = %key.channel, peer = %key.peer, error = %error, "Telegram chat state could not be read");
@@ -1033,8 +1035,10 @@ mod tests {
         assert_eq!(run(&pass, "100", "/request nur"), CommandDisposition::Handled);
         assert!(last_message(&pass)?.contains("/request <workspace>"));
         // `/pair` wird nie beantwortet.
+        let before = help.outbound.messages().len();
         assert_eq!(run(&help, "100", "/pair ABCD"), CommandDisposition::Handled);
-        assert!(!last_message(&help)?.contains("pair"));
+        assert_eq!(run(&help, "100", "/pair"), CommandDisposition::Handled);
+        assert_eq!(help.outbound.messages().len(), before);
         Ok(())
     }
 

@@ -373,10 +373,12 @@ pub(crate) const PLANNED_COMMANDS: &[(&str, &str)] = &[
 /// # Rückgabe
 /// Die statische Hinweisliste oder eine leere Liste für unbekannte Befehle.
 pub(crate) fn subcommand_hints(name: &str) -> &'static [SubcommandHint] {
-    HINT_TABLE
-        .iter()
-        .find(|(command, _, _)| *command == name)
-        .map_or(&[], |(_, _, hints)| hints)
+    for (command, _, hints) in HINT_TABLE {
+        if *command == name {
+            return *hints;
+        }
+    }
+    &[]
 }
 
 /// Nutzungszeile aus der Katalogtabelle, falls vorhanden.
