@@ -93,7 +93,7 @@ impl IngestReport {
                 .unwrap_or_else(|| format!("Anhang {}", index + 1));
             out.push_str(&format!(
                 "- {name} ({mime}, {size} Bytes, sha256 {digest}): {path}\n",
-                mime = display_name(&cached.mime),
+                mime = display_mime(&cached.mime),
                 size = cached.size_bytes,
                 digest = cached.digest_sha256,
                 path = cached.path.display(),
@@ -340,6 +340,19 @@ fn attachment_label(attachment: &AttachmentRef, index: usize) -> String {
 /// [`MAX_DISPLAY_NAME_CHARS`] Zeichen.
 fn display_name(raw: &str) -> String {
     let base = raw.rsplit(['/', '\\']).next().unwrap_or(raw);
+    sanitize_label(base)
+}
+
+/// Bereinigt einen MIME-Typ für die Anzeige: Steuerzeichen raus, gekürzt auf
+/// [`MAX_DISPLAY_NAME_CHARS`] Zeichen. Der Schrägstrich bleibt erhalten
+/// (`application/pdf`), anders als bei [`display_name`].
+fn display_mime(raw: &str) -> String {
+    sanitize_label(raw)
+}
+
+/// Ersetzt Steuerzeichen durch Leerzeichen, trimmt und kürzt auf
+/// [`MAX_DISPLAY_NAME_CHARS`] Zeichen.
+fn sanitize_label(base: &str) -> String {
     let cleaned: String = base
         .chars()
         .map(|c| if c.is_control() { ' ' } else { c })

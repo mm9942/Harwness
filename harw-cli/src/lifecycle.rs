@@ -1618,6 +1618,10 @@ mod tests {
             // (harw-ops/src/sandbox_lease.rs).
             "provider-concurrency",
             "sandbox-lease",
+            // Workbench-Werkzeuge (harw-registry-defaults/src/workbench_tools.rs):
+            // Notizen und Hypothesen der Sitzung, Recht `ReadWorkspace`.
+            "workbench.note",
+            "workbench.hypothesis",
         ]
         .into_iter()
         .collect();
