@@ -96,6 +96,16 @@ pub struct RawAgentDefinition {
     #[serde(default)]
     pub reasoning_effort: Option<String>,
 
+    /// Skills, deren Instruktionsfragmente dieser Agent beim Start erhält
+    /// (erstklassiges Top-Level-Feld, nicht Teil von [`Self::tables`]).
+    ///
+    /// Namen: `[a-z0-9-]`, 1–64 Zeichen, keine Duplikate — geprüft beim
+    /// Auflösen ([`crate::resolve::resolve_definition`]), nicht beim Parsen.
+    /// Vererbung über `extends`/Mixins/Schichten ist eine Vereinigung mit
+    /// Duplikat-Entfernung; Details in [`crate::skills`].
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub skills: Vec<String>,
+
     /// Alle weiteren TOML-Tabellen (z. B. `[work]`, `[context]`, `[tools]`).
     /// Compiler-Erweiterungen deserialisieren diese Felder später.
     #[serde(flatten)]
@@ -184,6 +194,49 @@ max_wall_time_seconds = 1800
         assert!(raw.extends.is_some());
         assert_eq!(raw.name.as_deref(), Some("Focused Pure Coding Task Agent"));
         Ok(())
+    }
+
+    #[test]
+    fn test_skills_is_first_class_field_not_in_tables() -> TestResult {
+        let src = r#"
+schema = "harwness.agent/v1"
+id = "harwness.agent.test-min@1"
+version = "1.0.0"
+role = "worker"
+specialization = "focused-pure-coding"
+skills = ["code-review", "rust"]
+"#;
+        let raw = parse_toml(src)?;
+        assert_eq!(raw.skills, ["code-review", "rust"]);
+        assert!(!raw.tables.contains_key("skills"));
+        Ok(())
+    }
+
+    #[test]
+    fn test_skills_absent_defaults_to_empty() -> TestResult {
+        let src = r#"
+schema = "harwness.agent/v1"
+id = "harwness.agent.test-min@1"
+version = "1.0.0"
+role = "worker"
+specialization = "focused-pure-coding"
+"#;
+        let raw = parse_toml(src)?;
+        assert!(raw.skills.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn test_skills_rejects_non_string_entries() {
+        let src = r#"
+schema = "harwness.agent/v1"
+id = "harwness.agent.test-min@1"
+version = "1.0.0"
+role = "worker"
+specialization = "focused-pure-coding"
+skills = [1]
+"#;
+        assert!(parse_toml(src).is_err());
     }
 
     #[test]

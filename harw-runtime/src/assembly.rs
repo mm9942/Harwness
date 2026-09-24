@@ -2148,7 +2148,8 @@ impl RuntimeAssemblyBuilder {
                     prompts: Some(host_permit_prompt_sender.clone()),
                 })),
             })
-            .with_home_context(home_context),
+            .with_home_context(home_context)
+            .with_agent_events(Arc::new(agent_events.clone())),
         );
 
         // 12. Modell-Tool-Fläche der Operationen — **nur** für

@@ -30,6 +30,14 @@
 //! Eine Budget-*Anpassung* (`/agent budget <id> <wert>`) bietet der Controller
 //! nicht an; sie bleibt fail-closed [`OpError::NotAvailable`].
 //!
+//! `use` braucht keinen Spawner: `/agent use <name>` prüft den Namen gegen
+//! die eingebauten Rollen (`harw_registry_defaults::role_names::ALL`) und die
+//! konfigurierten Agentendefinitionen und verankert ihn über
+//! [`crate::config_util::SelectionPersistence::persist_active_agent`] als
+//! `active_agent_definition` in der Profil-`config.toml`;
+//! `/agent use --clear` entfernt den Eintrag. Beides gilt ab der nächsten
+//! Sitzung.
+//!
 //! # Beispiel
 //! ```rust,no_run
 //! use harw_ops::agent::AgentArgs;
@@ -57,9 +65,10 @@ use harw_operations::{OpContext, OpError, OpOutput};
 ///
 /// # Felder
 /// - `action` (`Option<String>`): Token 0 — Sub-Kommando. Gültige Werte:
-///   `"list"` (Standard), `"stop"`, `"budget"`. `None` wird intern als `"list"` behandelt.
-/// - `target` (`Option<String>`): Token 1 — Ziel-Agent-ID (z. B. `"abc-42"`).
-///   Relevant für `stop` und `budget`; bei `list` ignoriert.
+///   `"list"` (Standard), `"stop"`, `"budget"`, `"use"`. `None` wird intern als `"list"` behandelt.
+/// - `target` (`Option<String>`): Token 1 — Ziel-Agent-ID (z. B. `"abc-42"`),
+///   bei `use` der Agentenname oder `--clear`.
+///   Relevant für `stop`, `budget` und `use`; bei `list` ignoriert.
 /// - `value` (`Option<String>`): Token 2 — dritter Parameter (z. B. Budget-Grenze).
 ///   Relevant für `budget`; bei `list` und `stop` ignoriert.
 ///
@@ -81,7 +90,7 @@ use harw_operations::{OpContext, OpError, OpOutput};
 /// ```
 #[derive(Default, serde::Deserialize, harw_macros::FromRawArgs)]
 pub struct AgentArgs {
-    /// Sub-Kommando: `"list"` (Standard), `"stop"`, `"budget"`. Token 0.
+    /// Sub-Kommando: `"list"` (Standard), `"stop"`, `"budget"`, `"use"`. Token 0.
     #[serde(default)]
     #[raw(first)]
     pub action: Option<String>,
@@ -104,7 +113,8 @@ pub struct AgentArgs {
 /// Abbruchwirkung beim Controller. `budget` zeigt Limits, Budget-Deckel und
 /// Live-Verbrauch für den gesamten Teilbaum oder — mit `target` — für genau
 /// einen besessenen Knoten. Fehlt der Dienst, bleibt die Operation
-/// fail-closed mit [`OpError::NotAvailable`].
+/// fail-closed mit [`OpError::NotAvailable`]. `use` wählt ohne Spawner die
+/// Wurzel-Agentendefinition für künftige Sitzungen (siehe [`agent_use`]).
 ///
 /// **Command only**: Das Modell darf diese Operation nicht selbst aufrufen, da
 /// sich das Modell nicht selbst manipulieren darf. Kein `model_tool`-Attribut.
@@ -135,12 +145,15 @@ pub struct AgentArgs {
 /// ```
 #[operation(
     name = "agent",
-    summary = "Child-Agent-Management: list/stop/budget gegen den registrierten ManagedAgentSpawner.",
+    summary = "Child-Agent-Management: list/stop/budget gegen den registrierten ManagedAgentSpawner; use wählt den Wurzel-Agenten ab der nächsten Sitzung.",
     domain = "agents",
     permission = "operator",
     command(path = "/agent", visibility = "channel_parity", busy = "immediate")
 )]
 async fn agent(ctx: &OpContext, args: AgentArgs) -> Result<OpOutput, OpError> {
+    if args.action.as_deref() == Some("use") {
+        return agent_use(ctx, args.target.as_deref());
+    }
     let Some(spawner) = ctx.service::<std::sync::Arc<harw_core::ManagedAgentSpawner>>() else {
         return Err(OpError::NotAvailable(
             "child-agent management is not available".to_owned(),
@@ -224,6 +237,120 @@ async fn agent(ctx: &OpContext, args: AgentArgs) -> Result<OpOutput, OpError> {
             "unknown /agent action '{unknown}'"
         ))),
     }
+}
+
+/// Rollen, die als Wurzel einer Sitzung starten dürfen (`--agent`,
+/// `active_agent_definition`).
+const ROOT_CAPABLE_ROLES: [harw_agent_dsl::roles::AgentRoleId; 3] = [
+    harw_agent_dsl::roles::AgentRoleId::RootOrchestrator,
+    harw_agent_dsl::roles::AgentRoleId::ChildOrchestrator,
+    harw_agent_dsl::roles::AgentRoleId::Worker,
+];
+
+/// Aufrufhilfe für `/agent use`.
+const AGENT_USE_USAGE: &str = "/agent use <name> | /agent use --clear";
+
+/// `/agent use <name>` bzw. `/agent use --clear`.
+///
+/// # Beschreibung
+/// Mit `--clear` wird `active_agent_definition` aus der Profil-`config.toml`
+/// entfernt. Sonst wird `name` gegen die konfigurierten Agentendefinitionen
+/// (`ResolvedConfig::executable_agents`, Vorrang) und die eingebauten Rollen
+/// geprüft ([`validate_root_agent`]) und erst danach gespeichert. Beides
+/// wirkt ab der nächsten Sitzung; die laufende Sitzung bleibt unverändert.
+///
+/// # Fehler
+/// - [`OpError::InvalidArguments`]: Name fehlt, ist unbekannt oder hat eine
+///   Rolle, die nicht als Wurzel starten darf.
+/// - [`OpError::Execution`]: Config-Discovery oder das Senken der
+///   eingebauten Definitionen schlägt fehl.
+fn agent_use(ctx: &OpContext, target: Option<&str>) -> Result<OpOutput, OpError> {
+    let target = target.map(str::trim).filter(|target| !target.is_empty());
+    let Some(target) = target else {
+        return Err(OpError::InvalidArguments(format!(
+            "Agentenname fehlt. Aufruf: {AGENT_USE_USAGE}."
+        )));
+    };
+    let persistence = crate::config_util::selection_persistence(ctx);
+    let (mut text, note) = if target == "--clear" {
+        (
+            "Aktiver Agent entfernt – gilt ab nächster Sitzung.".to_owned(),
+            persistence.persist_active_agent(None),
+        )
+    } else {
+        let config = crate::provider::resolved_config(ctx)?;
+        let builtin = harw_registry_defaults::embedded_agents::builtin_agent_definitions(
+            &config.executable_agents,
+        )
+        .map_err(|error| {
+            OpError::Execution(format!(
+                "eingebaute Agentendefinitionen nicht ladbar: {error}"
+            ))
+        })?;
+        validate_root_agent(target, &config.executable_agents, &builtin)?;
+        (
+            format!("Aktiver Agent: {target} – gilt ab nächster Sitzung."),
+            persistence.persist_active_agent(Some(target)),
+        )
+    };
+    if let Some(note) = note {
+        text.push('\n');
+        text.push_str(&note);
+    }
+    Ok(OpOutput::from(text))
+}
+
+/// Prüft, ob `name` eine bekannte, als Wurzel startbare Agentendefinition ist.
+///
+/// # Beschreibung
+/// Konfigurierte Definitionen (`configured`) haben Vorrang vor den
+/// eingebauten (`builtin`) — dieselbe Reihenfolge wie
+/// `harw-runtime::assembly::resolve_active_agent`. Erlaubt sind nur die
+/// Rollen aus [`ROOT_CAPABLE_ROLES`].
+///
+/// # Fehler
+/// [`OpError::InvalidArguments`] mit deutschem Text und der Liste der
+/// zulässigen Namen, wenn der Name unbekannt ist oder seine Rolle nicht als
+/// Wurzel starten darf.
+fn validate_root_agent(
+    name: &str,
+    configured: &std::collections::HashMap<String, harw_agent_dsl::ExecutableAgentIr>,
+    builtin: &std::collections::HashMap<String, harw_agent_dsl::ExecutableAgentIr>,
+) -> Result<(), OpError> {
+    let known = configured.get(name).or_else(|| builtin.get(name));
+    match known {
+        Some(ir) if ROOT_CAPABLE_ROLES.contains(&ir.role()) => Ok(()),
+        Some(ir) => Err(OpError::InvalidArguments(format!(
+            "Agent '{name}' hat die Rolle {:?} und kann nicht als Wurzel starten. \
+             Zulässig: {}.",
+            ir.role(),
+            root_capable_names(configured, builtin)
+        ))),
+        None => Err(OpError::InvalidArguments(format!(
+            "Unbekannter Agent '{name}'. Zulässig: {}.",
+            root_capable_names(configured, builtin)
+        ))),
+    }
+}
+
+/// Sortierte, kommagetrennte Liste aller als Wurzel startbaren Namen.
+fn root_capable_names(
+    configured: &std::collections::HashMap<String, harw_agent_dsl::ExecutableAgentIr>,
+    builtin: &std::collections::HashMap<String, harw_agent_dsl::ExecutableAgentIr>,
+) -> String {
+    let mut names: Vec<&str> = configured
+        .iter()
+        .chain(
+            builtin
+                .iter()
+                .filter(|(name, _)| !configured.contains_key(*name)),
+        )
+        .filter(|(_, ir)| ROOT_CAPABLE_ROLES.contains(&ir.role()))
+        .map(|(name, _)| name.as_str())
+        .collect();
+    names.sort_unstable();
+    names.dedup();
+    names.join(", ")
 }
 
 /// Formatiert den Budget-Bericht für `/agent budget`.

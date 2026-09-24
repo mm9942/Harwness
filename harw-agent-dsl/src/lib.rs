@@ -4,9 +4,21 @@
 //! der normativen Spezifikation `agent-definition-dsl.md`.
 //!
 //! # Scope
-//! Enthält: Kern-Datentypen, Parser, Loader, Layered-Resolver, Authority-Validator.
-//! Nicht enthalten (Folge-Waves): Specialization-Registry, Family/Organization/Clan/Cell-Compiler,
-//! vollständige Diagnostics-Codes, Frozen-Snapshot-Migration.
+//! Enthält: Kern-Datentypen, Parser, Layered-Resolver, Authority-Validator,
+//! Skill-Bindung (`skills = [...]`, [`skills`]), Lowering zur
+//! [`ExecutableAgentIr`] samt Snapshot-Digest, Kontextprogramme
+//! ([`context_program`]), Familien inkl. Mitgliedschaften ([`family`]) sowie
+//! Organisationen mit Clan-/Cell-Deklaration und Strukturprüfung
+//! ([`organization`]).
+//!
+//! Nicht enthalten (Folge-Waves): Specialization-Registry (`specialization`
+//! bleibt ein freies Label), Ausführung von Clans/Cells (hier nur Deklaration
+//! und Validierung — das Laufzeitverhalten liegt außerhalb dieses Crates),
+//! stabile Diagnostics-Codes (es gibt nur [`DiagLocation`](error::DiagLocation)
+//! mit Schicht/Feldpfad), Migration eingefrorener Snapshots über
+//! Hash-Domänen hinweg (ein Verweis aus einer älteren Domäne wird nur
+//! abgelehnt, nicht übersetzt) sowie die Übersetzung von `reasoning_effort`
+//! in Runtime-Typen (Aufgabe der Konsumenten).
 //!
 //! # Modulübersicht
 //! - [`error`] — [`DslError`](error::DslError) und [`DslResult`](error::DslResult)
@@ -19,6 +31,7 @@
 //! - [`authority`] — [`AuthorityCeiling`](authority::AuthorityCeiling)
 //! - [`resolved`] — [`ResolvedAgentDefinition`](resolved::ResolvedAgentDefinition), [`ResolutionTrace`](resolved::ResolutionTrace)
 //! - [`resolve`] — [`resolve_definition`](resolve::resolve_definition)
+//! - [`skills`] — Namensregeln und Vererbung der Skill-Liste einer Definition
 //! - [`context_program`] — [`RawContextProgramDefinition`](context_program::RawContextProgramDefinition),
 //!   [`resolve_context_program`](context_program::resolve_context_program), Deckenprüfung über
 //!   [`ContextCeilingAdmission`](context_program::ContextCeilingAdmission) (Knoten AW2-01)
@@ -63,6 +76,7 @@ pub mod raw;
 pub mod resolve;
 pub mod resolved;
 pub mod roles;
+pub mod skills;
 #[cfg(test)]
 mod test_support;
 

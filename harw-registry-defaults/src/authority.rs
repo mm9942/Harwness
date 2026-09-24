@@ -315,6 +315,9 @@ pub fn reduce_to_read_workspace_network(granted: &PermissionSet) -> PermissionSe
 /// - die vier `security-*-triage`-Rollen → [`AuthorityReducer::ReadOnly`]
 ///   (Profil `NoTools`, sie brauchen gar kein Recht; `ReadOnly` ist die engste
 ///   Kennung des Vokabulars).
+/// - die drei Matrix-Game-Sitze `matrix-player`, `matrix-umpire`,
+///   `matrix-market` → [`AuthorityReducer::ReadOnly`] (Profil `NoTools`,
+///   dieselbe Begründung wie bei den Triage-Rollen).
 /// - `memory-steward` → [`AuthorityReducer::ReadRegistry`] (Profil
 ///   `MemoryStewardship`; nächstliegender Reducer gleicher Lese-Reichweite).
 /// - `executor` → [`AuthorityReducer::ReadOnly`] (Profil `ShellExecution`;
@@ -421,6 +424,11 @@ pub fn authority_reducer_for_role(role: &str) -> Option<AuthorityReducer> {
         | role_names::SECURITY_STRUCTURE_TRIAGE
         | role_names::SECURITY_ENDPOINT_TRIAGE
         | role_names::EXECUTOR => Some(AuthorityReducer::ReadOnly),
+        // Die drei Matrix-Game-Sitze (Profil `NoTools`): brauchen gar kein
+        // Recht; `ReadOnly` ist die engste Kennung — nie Netz, nie Schreiben.
+        role_names::MATRIX_PLAYER | role_names::MATRIX_UMPIRE | role_names::MATRIX_MARKET => {
+            Some(AuthorityReducer::ReadOnly)
+        }
         role_names::MEMORY_STEWARD => Some(AuthorityReducer::ReadRegistry),
         // Nutzerentscheidung „kurz online recherchieren, manchmal
         // Abhängigkeiten hinzufügen“: `UiaQuickHelper` registriert
@@ -842,7 +850,10 @@ mod tests {
             role_names::SECURITY_BASELINE_TRIAGE,
             role_names::SECURITY_STRUCTURE_TRIAGE,
             role_names::SECURITY_ENDPOINT_TRIAGE,
-        ] {
+        ]
+        .into_iter()
+        .chain(role_names::MATRIX_ROLES)
+        {
             assert_eq!(
                 authority_reducer_for_role(role),
                 Some(AuthorityReducer::ReadOnly),
