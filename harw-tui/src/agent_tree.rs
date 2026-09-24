@@ -16,7 +16,7 @@ use crate::{
 };
 
 /// A presentation snapshot; missing telemetry remains unknown rather than zero.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub(crate) struct AgentRow {
     pub id: String,
     pub parent: Option<String>,
@@ -30,6 +30,11 @@ pub(crate) struct AgentRow {
     pub budget: String,
     pub result: Option<String>,
     pub can_stop: bool,
+    /// Runde 5, Teil I: Budget-Deckel aus der Admission (für die Auslastung).
+    pub budget_limits: crate::agent_tree_live::BudgetLimits,
+    /// Runde 5, Teil I: Live-Werte aus dem Agenten-Monitor (`None` ohne
+    /// Beobachtung, z. B. bei Kindern aus einem früheren Prozess).
+    pub live: Option<crate::agent_tree_live::AgentRowLive>,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -139,35 +144,19 @@ impl AgentTree {
         let inner = block.inner(area);
         block.render(area, buffer);
         let lines: Vec<Line<'static>> = if self.details {
-            row.map(|row| {
-                vec![
-                    format!("{} · {}", row.role, row.status),
-                    format!("ID: {}", row.id),
-                    format!("Eltern: {}", row.parent.as_deref().unwrap_or("—")),
-                    format!("Auftrag: {}", row.task.as_deref().unwrap_or("—")),
-                    format!(
-                        "Tokens: {} · Tools: {} · Dauer: {} ms",
-                        known(row.tokens),
-                        known(row.tool_calls),
-                        known(row.duration_ms)
-                    ),
-                    format!("Budget: {}", row.budget),
-                    String::new(),
-                    row.result
-                        .clone()
-                        .unwrap_or_else(|| "Noch kein Ergebnis.".to_owned()),
-                ]
-            })
-            .unwrap_or_default()
-            .into_iter()
-            .flat_map(|text| {
-                sanitize_display(&text)
-                    .lines()
-                    .map(str::to_owned)
-                    .collect::<Vec<_>>()
-            })
-            .map(Line::from)
-            .collect()
+            // Runde 5, Teil I: Live-Werte, Auftrag, Budget-Auslastung,
+            // Ergebnis bzw. letzter Schritt (`crate::agent_tree_live`).
+            row.map(crate::agent_tree_live::detail_lines)
+                .unwrap_or_default()
+                .into_iter()
+                .flat_map(|text| {
+                    sanitize_display(&text)
+                        .lines()
+                        .map(str::to_owned)
+                        .collect::<Vec<_>>()
+                })
+                .map(Line::from)
+                .collect()
         } else {
             visible
                 .iter()
@@ -179,18 +168,16 @@ impl AgentTree {
                         &row.status
                     };
                     let marker = if index == selected { "›" } else { " " };
+                    // Runde 5, Teil I: Live-Werte und gekürzter Auftrag.
                     let text = format!(
-                        "{marker} {}{} {} · {} · Tokens {} · Tools {}",
+                        "{marker} {}{} {}",
                         "  ".repeat(row.depth.min(24)),
                         if self.collapsed.contains(&row.id) {
                             "▸"
                         } else {
                             "▾"
                         },
-                        row.role,
-                        status,
-                        known(row.tokens),
-                        known(row.tool_calls)
+                        crate::agent_tree_live::tree_text(row, status),
                     );
                     let line = Line::from(sanitize_inline(&text));
                     if index == selected {
@@ -215,10 +202,6 @@ impl AgentTree {
     }
 }
 
-fn known<T: std::fmt::Display>(value: Option<T>) -> String {
-    value.map_or_else(|| "—".to_owned(), |value| value.to_string())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -238,6 +221,8 @@ mod tests {
             budget: "—".to_owned(),
             result: None,
             can_stop: parent.is_some(),
+            budget_limits: crate::agent_tree_live::BudgetLimits::default(),
+            live: None,
         }
     }
     fn key(code: KeyCode) -> KeyEvent {
@@ -282,7 +267,7 @@ mod tests {
 
     #[test]
     fn unknown_usage_is_not_zero_and_terminal_nodes_cannot_stop() {
-        assert_eq!(known::<u64>(None), "—");
+        assert_eq!(crate::agent_tree_live::known::<u64>(None), "—");
         let mut node = row("done", Some("uia"), 1);
         node.can_stop = false;
         assert_eq!(

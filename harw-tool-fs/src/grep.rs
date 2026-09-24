@@ -507,7 +507,7 @@ fn run_rg(rg: &Path, root: &Path, args: &GrepArgs, start_rel: &Path, cap: usize)
     if args.case_insensitive.unwrap_or(false) {
         cmd.arg("--ignore-case");
     }
-    if let Some(glob) = args.glob.as_deref() {
+    if let Some(glob) = args.glob.as_deref().filter(|glob| !glob.is_empty()) {
         cmd.arg("--glob").arg(glob);
     }
     cmd.arg("-e")
@@ -580,7 +580,12 @@ fn run_rg(rg: &Path, root: &Path, args: &GrepArgs, start_rel: &Path, cap: usize)
 /// Liefert nie `Err`; Pfad-, Muster- oder I/O-Fehler werden als
 /// `Ok(ToolOutput::error(...))` zurückgegeben.
 fn grep_with_engine(root: &Path, args: &GrepArgs, rg: Option<&Path>) -> ToolOutput {
-    let start_input = args.path.as_deref().unwrap_or(".");
+    // Strict-Schema: `null` und `""` gelten als „nicht gesetzt“ (Wurzel).
+    let start_input = args
+        .path
+        .as_deref()
+        .filter(|path| !path.is_empty())
+        .unwrap_or(".");
     let start_rel = match normalize_relative(start_input) {
         Ok(rel) => rel,
         Err(reason) => return ToolOutput::error(format!("fs.grep: {reason}")),
@@ -599,7 +604,7 @@ fn grep_with_engine(root: &Path, args: &GrepArgs, rg: Option<&Path>) -> ToolOutp
         }
     };
 
-    let file_matcher = match args.glob.as_deref() {
+    let file_matcher = match args.glob.as_deref().filter(|glob| !glob.is_empty()) {
         Some(pattern) => match GlobBuilder::new(pattern).literal_separator(true).build() {
             Ok(glob) => Some(glob.compile_matcher()),
             Err(err) => {
@@ -626,8 +631,10 @@ fn grep_with_engine(root: &Path, args: &GrepArgs, rg: Option<&Path>) -> ToolOutp
         .unwrap_or(DEFAULT_CONTEXT_LINES)
         .min(MAX_CONTEXT_LINES);
     // `clamp(1, HARD_MAX_RESULTS)`: siehe `glob.rs` — gleiche Grenzen.
+    // `0` gilt wie `null` als „nicht gesetzt“ (Vorgabe), nicht als „ein Treffer“.
     let cap = args
         .max_matches
+        .filter(|&matches| matches > 0)
         .unwrap_or(DEFAULT_MAX_MATCHES)
         .clamp(1, HARD_MAX_RESULTS);
 
@@ -872,6 +879,34 @@ mod tests {
             text.contains("# Hinweis") && text.contains("begrenzt"),
             "expected a truncation hint: {text}"
         );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_fs_grep_empty_path_glob_and_zero_limit_mean_not_set() -> TestResult {
+        // Strict-Schema: Modelle senden für ungenutzte Felder `""` bzw. `0`.
+        let dir = TempDir::new()?;
+        let ws = dir.path().join("ws");
+        fs::create_dir_all(&ws)?;
+        let content = (0..10)
+            .map(|i| format!("line MATCHME {i}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        fs::write(ws.join("many.txt"), content)?;
+
+        let sandbox = make_sandbox_with_permissions(dir.path(), vec![Permission::ReadWorkspace])?;
+        let ctx = make_ctx(sandbox);
+        let mut args = grep_args("MATCHME");
+        args.path = Some(String::new());
+        args.glob = Some(String::new());
+        args.max_matches = Some(0);
+
+        let text = text_of(fs_grep(&ctx, args).await?)?;
+        let match_line_count = text
+            .lines()
+            .filter(|l| !l.starts_with('#') && l.contains(':'))
+            .count();
+        assert_eq!(match_line_count, 10, "alle Treffer erwartet: {text}");
         Ok(())
     }
 

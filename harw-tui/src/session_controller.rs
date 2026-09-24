@@ -77,6 +77,18 @@ struct Inner {
     generation: u64,
     /// Letzte erfolgreich auf eine Session angewendete Generation.
     applied_generation: u64,
+    /// Runde 5, Teil H: `true`, sobald seit dem letzten Apply der
+    /// Reasoning-Effort gesetzt wurde. Nur dann überschreibt
+    /// [`TuiSessionController::apply_to_session`] den Effort der Session.
+    effort_dirty: bool,
+    /// Runde 5, Teil H: `true`, sobald seit dem letzten Apply Modell,
+    /// Provider oder die UIA-Auswahl gesetzt wurden. Nur dann überschreibt
+    /// [`TuiSessionController::apply_to_session`] Modell und Provider der
+    /// Session — ein bloßer Moduswechsel (`/mode`, Shift+Tab) darf Modell und
+    /// Provider nicht auf „nicht gesetzt“ zurückstellen (sonst wechselt die
+    /// Route auf den Katalog-Standard, ein kleineres Fenster merkt eine
+    /// Notfall-Verdichtung vor und fremde Zugangsdaten schlagen fehl).
+    route_dirty: bool,
 }
 
 // ── TuiSessionController ─────────────────────────────────────────────────────
@@ -192,6 +204,10 @@ impl TuiSessionController {
                 .and_then(InteractionMode::parse),
             generation: 0,
             applied_generation: 0,
+            // Ein Snapshot ist ein vollständiger Zustand: beim nächsten Apply
+            // gilt er für alle Felder (auch ein `None` löscht).
+            effort_dirty: true,
+            route_dirty: true,
         };
         Self {
             inner: Mutex::new(inner),
@@ -254,30 +270,44 @@ impl TuiSessionController {
         if inner.generation == inner.applied_generation {
             return false;
         }
-        session.set_reasoning_effort(inner.reasoning_effort);
-        let selection = if is_uia_root_session(session) {
-            inner.uia_selection.as_ref()
-        } else {
-            None
-        };
-        session.set_active_model(
-            selection
-                .and_then(|selection| selection.model())
-                .or(inner.active_model.as_deref())
-                .map(ModelId::from),
-        );
-        session.set_active_provider(
-            selection
-                .and_then(|selection| selection.provider())
-                .or(inner.active_provider.as_deref())
-                .map(ProviderId::from),
-        );
+        // Runde 5, Teil H: nur tatsächlich gesetzte Felder übertragen — wie
+        // beim Modus unten. Sonst setzte jeder Moduswechsel Effort, Modell und
+        // Provider der Session auf „nicht gesetzt“ zurück.
+        if inner.effort_dirty {
+            session.set_reasoning_effort(inner.reasoning_effort);
+        }
+        if inner.route_dirty {
+            let selection = if is_uia_root_session(session) {
+                inner.uia_selection.as_ref()
+            } else {
+                None
+            };
+            // Runde 5 (Integration G): eine UIA-Auswahl gilt als Ganzes. Nie
+            // achsenweise mit der generischen Route mischen — sonst trägt ein
+            // `/uia-provider switch` ohne Modell das Modell eines anderen
+            // Providers weiter (Provider/Modell-Mismatch).
+            let (model, provider) = match selection {
+                Some(selection)
+                    if selection.model().is_some() || selection.provider().is_some() =>
+                {
+                    (selection.model(), selection.provider())
+                }
+                _ => (
+                    inner.active_model.as_deref(),
+                    inner.active_provider.as_deref(),
+                ),
+            };
+            session.set_active_model(model.map(ModelId::from));
+            session.set_active_provider(provider.map(ProviderId::from));
+        }
         if let Some(mode) = inner.interaction_mode {
             if session.mode() != mode {
                 session.set_mode(mode);
             }
         }
         inner.applied_generation = inner.generation;
+        inner.effort_dirty = false;
+        inner.route_dirty = false;
         true
     }
 }
@@ -385,6 +415,7 @@ impl SessionController for TuiSessionController {
             .lock()
             .map_err(|_| SessionControlError::Disconnected)?;
         inner.reasoning_effort = effort;
+        inner.effort_dirty = true;
         inner.generation = inner.generation.saturating_add(1);
         Ok(())
     }
@@ -405,6 +436,7 @@ impl SessionController for TuiSessionController {
             .lock()
             .map_err(|_| SessionControlError::Disconnected)?;
         inner.active_model = Some(model_id);
+        inner.route_dirty = true;
         inner.generation = inner.generation.saturating_add(1);
         Ok(())
     }
@@ -425,6 +457,7 @@ impl SessionController for TuiSessionController {
             .lock()
             .map_err(|_| SessionControlError::Disconnected)?;
         inner.active_provider = Some(provider_id);
+        inner.route_dirty = true;
         inner.generation = inner.generation.saturating_add(1);
         Ok(())
     }
@@ -436,6 +469,7 @@ impl SessionController for TuiSessionController {
             .lock()
             .map_err(|_| SessionControlError::Disconnected)?;
         inner.uia_selection = Some(selection);
+        inner.route_dirty = true;
         inner.generation = inner.generation.saturating_add(1);
         Ok(())
     }
@@ -448,6 +482,7 @@ impl SessionController for TuiSessionController {
             .map_err(|_| SessionControlError::Disconnected)?;
         let selection = inner.uia_selection.get_or_insert_with(UiaSelection::empty);
         selection.provider = Some(provider_id);
+        inner.route_dirty = true;
         inner.generation = inner.generation.saturating_add(1);
         Ok(())
     }
@@ -460,6 +495,7 @@ impl SessionController for TuiSessionController {
             .map_err(|_| SessionControlError::Disconnected)?;
         let selection = inner.uia_selection.get_or_insert_with(UiaSelection::empty);
         selection.model = Some(model_id);
+        inner.route_dirty = true;
         inner.generation = inner.generation.saturating_add(1);
         Ok(())
     }
@@ -923,6 +959,53 @@ mod tests {
         assert!(
             session.active_model().is_none(),
             "session.active_model must be None after applying a None snapshot"
+        );
+        Ok(())
+    }
+
+    // ── Runde 5, Teil H: ein Moduswechsel lässt Modell, Provider und Effort
+    //    der Session unangetastet ─────────────────────────────────────────────
+
+    #[test]
+    fn apply_after_a_mode_change_keeps_model_provider_and_effort() -> TestResult {
+        let mut session = test_session();
+        session.set_active_model(Some(ModelId::from("claude-opus-5-5")));
+        session.set_active_provider(Some(ProviderId::from("anthropic")));
+        session.set_reasoning_effort(Some(ReasoningEffort::High));
+
+        let ctrl = TuiSessionController::new();
+        ctrl.request_mode("work")
+            .map_err(ctx("work must be a known mode"))?;
+        assert!(ctrl.apply_to_session(&mut session), "mode change applies");
+
+        assert_eq!(session.mode(), InteractionMode::Work);
+        assert_eq!(
+            session.active_model(),
+            Some(&ModelId::from("claude-opus-5-5")),
+            "a mode change must not reset the model"
+        );
+        assert_eq!(
+            session.active_provider(),
+            Some(&ProviderId::from("anthropic")),
+            "a mode change must not reset the provider"
+        );
+        assert_eq!(session.reasoning_effort(), Some(ReasoningEffort::High));
+        Ok(())
+    }
+
+    #[test]
+    fn apply_after_an_effort_change_keeps_the_model() -> TestResult {
+        let mut session = test_session();
+        session.set_active_model(Some(ModelId::from("claude-opus-5-5")));
+        let ctrl = TuiSessionController::new();
+        ctrl.set_reasoning_effort(Some(ReasoningEffort::Low))
+            .map_err(ctx("set effort"))?;
+        assert!(ctrl.apply_to_session(&mut session));
+        assert_eq!(session.reasoning_effort(), Some(ReasoningEffort::Low));
+        assert_eq!(
+            session.active_model(),
+            Some(&ModelId::from("claude-opus-5-5")),
+            "an effort change must not reset the model"
         );
         Ok(())
     }

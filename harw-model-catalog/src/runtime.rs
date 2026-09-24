@@ -408,11 +408,12 @@ pub const DEFAULT_PROFILE: ModelRuntimeProfile = ModelRuntimeProfile {
 /// ```
 pub fn profile_for(model: &str) -> ModelRuntimeProfile {
     match model {
-        // Anthropic — Claude Opus 4.8
-        // Balanced: Flagship-Orchestrator mit gutem Long-Context, aber kein 1M-Fenster.
+        // Anthropic — Claude Opus 5.5 (Standardmodell), Fable 5.1, Opus 4.8
+        // Balanced: Flagship-Orchestratoren; Opus 5.5 und Fable 5.1 erben das
+        // Opus-4.8-Profil, bis Beobachtungsdaten (Layer 4) ein eigenes rechtfertigen.
         // Standard delegation: vertrauenswürdiges Modell für Orchestration (philosophy.md §2).
         // retry 3/500ms/false: stabil, kein aggressives Tool-Retry nötig.
-        "claude-opus-4-8" => ModelRuntimeProfile {
+        "claude-opus-5-5" | "claude-fable-5-1" | "claude-opus-4-8" => ModelRuntimeProfile {
             context_policy: ContextPolicy::Balanced,
             compaction_policy: CompactionPolicy::OnPressure,
             delegation_policy: DelegationPolicy::Standard,
@@ -735,6 +736,17 @@ mod tests {
                 "Model '{}' must return a valid runtime profile",
                 model
             );
+        }
+    }
+
+    /// Test 2b: Das Anthropic-Standardmodell und Fable 5.1 teilen das
+    /// Opus-Profil und fallen nicht auf DEFAULT_PROFILE zurück.
+    #[test]
+    fn test_current_anthropic_flagships_share_opus_profile() {
+        let opus = profile_for("claude-opus-4-8");
+        for model in ["claude-opus-5-5", "claude-fable-5-1"] {
+            assert_ne!(profile_for(model), DEFAULT_PROFILE, "{model}");
+            assert_eq!(profile_for(model), opus, "{model}");
         }
     }
 

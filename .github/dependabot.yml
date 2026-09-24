@@ -1,5 +1,8 @@
 # Dependabot: monatliche Update-Vorschläge für alle Paket-Ökosysteme im Repo.
 # https://docs.github.com/code-security/dependabot/dependabot-version-updates/configuration-options-for-the-dependabot.yml-file
+#
+# Je Ökosystem höchstens 3 offene PRs, damit die CI nicht mit Einzel-PRs
+# überflutet wird.
 
 version: 2
 updates:
@@ -8,6 +11,7 @@ updates:
     directory: "/"
     schedule:
       interval: "monthly"
+    open-pull-requests-limit: 3
     groups:
       cargo-minor-patch:
         update-types: ["minor", "patch"]
@@ -17,6 +21,7 @@ updates:
     directory: "/dod"
     schedule:
       interval: "monthly"
+    open-pull-requests-limit: 3
     groups:
       dod-minor-patch:
         update-types: ["minor", "patch"]
@@ -26,12 +31,26 @@ updates:
     directory: "/webui"
     schedule:
       interval: "monthly"
+    open-pull-requests-limit: 3
     groups:
       webui-minor-patch:
         update-types: ["minor", "patch"]
 
-  # GitHub-Actions-Workflows unter .github/workflows.
+  # GitHub-Actions-Workflows unter .github/workflows. Alle Updates (auch
+  # Major) in einem gebündelten PR pro Monat.
   - package-ecosystem: "github-actions"
     directory: "/"
     schedule:
       interval: "monthly"
+    open-pull-requests-limit: 3
+    groups:
+      actions:
+        patterns: ["*"]
+
+  # Gepinnte Rust-Toolchain (rust-toolchain.toml im Wurzelverzeichnis, gilt
+  # auch für dod/). Ein Update ändert lokal und in der CI zugleich die Version.
+  - package-ecosystem: "rust-toolchain"
+    directory: "/"
+    schedule:
+      interval: "monthly"
+    open-pull-requests-limit: 3

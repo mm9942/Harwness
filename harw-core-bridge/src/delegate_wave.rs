@@ -13,7 +13,7 @@
 //!
 //! ```text
 //! delegate_wave {
-//!   targets: [{ role, task, complexity?, id? }, …],   // 1 ..= 16
+//!   targets: [{ role, task, complexity?, id?, continue_from? }, …],   // 1 ..= 16
 //!   join: "all" | "any" | "collect",                 // Standard "all"
 //!   max_parallel: n                                  // Standard min(4, Ziele)
 //! }
@@ -37,7 +37,7 @@
 //! # Ausführung
 //! Die zugelassenen Ziele laufen in einem rollierenden Pool mit höchstens
 //! `max_parallel` Plätzen. Jeder Platz ist genau ein
-//! [`fanout_children`]-Aufruf mit einer einzigen Frage — damit gelten
+//! [`crate::fanout_children`]-Aufruf mit einer einzigen Frage — damit gelten
 //! unverändert dieselben Grenzen wie für `/analyze` und `explore`: monoton
 //! reduzierte Sandbox, Budget-Verschnitt mit der Agent-IR, Effort-Klammer,
 //! Return-Contract samt Reparatur-Turn, Slot-Freigabe per RAII. Die
@@ -51,6 +51,16 @@
 //!   `fanout_children` gibt ihren Slot frei, der Kind-Controller legt die
 //!   Sitzung als gescheitert zurück), nicht gestartete nie gestartet.
 //! - `collect`: auf jedes Ziel warten und alles sammeln, auch Fehlschläge.
+//!
+//! # Fortsetzung (Runde 5, Teil J)
+//! Ein Ziel mit `continue_from: <child_id>` setzt ein eigenes Kind fort, das
+//! an seinem Token-Budget endete (`harw_core::child_handoff`). Es muss
+//! dieselbe Rolle tragen und durchläuft dieselbe Zulassung wie jedes Ziel;
+//! danach prüft der Spawner Eigentum, Budget-Ende, Rolle und die Kettengrenze
+//! (höchstens drei Fortsetzungen je ursprünglichem Kind) und nach der
+//! Admission, dass die Sandbox nicht weiter ist als die des Vorgängers. Das
+//! neue Kind bekommt die Übergabe als ersten Kontext (`task` optional) und
+//! ein frisches Budget; im Agent-Panel heißt es „Fortsetzung von <id>“.
 //!
 //! # Budget
 //! Jedes Kind bekommt höchstens das Budget des **Aufrufers** (sein eigener
@@ -88,7 +98,12 @@ use harw_operations::operation::{
 };
 use serde_json::{Map, Value, json};
 
-use crate::agent_tool::{ChildReturnContract, fanout_children};
+// Runde 5, Teil J: Fortsetzung budget-beendeter Kinder (`continue_from`).
+use harw_core::child_controller::ManagedAgentSpawner;
+use harw_core::child_handoff::{ContinuationSeed, continuation_task};
+use harw_types::SessionId;
+
+use crate::agent_tool::{ChildReturnContract, fanout_children_with};
 use crate::context_ext::OpContextCoreExt;
 
 /// Werkzeugname, unter dem die Operation dem Modell erscheint.
@@ -112,7 +127,8 @@ const NO_CAPABILITY: &str = "no delegation capability is available for this requ
 const TOP_LEVEL_FIELDS: &[&str] = &["targets", "join", "max_parallel"];
 
 /// Erlaubte Felder je Ziel.
-const TARGET_FIELDS: &[&str] = &["id", "role", "task", "complexity"];
+/// Runde 5, Teil J: `continue_from` setzt ein budget-beendetes Kind fort.
+const TARGET_FIELDS: &[&str] = &["id", "role", "task", "complexity", "continue_from"];
 
 // ── Anfrage ───────────────────────────────────────────────────────────────────
 
@@ -199,6 +215,10 @@ pub struct WaveTarget {
     pub task: String,
     /// Optionale Komplexitätsangabe.
     pub complexity: Option<WaveComplexity>,
+    /// Runde 5, Teil J: ID eines eigenen, am Budget beendeten Kindes, das
+    /// dieses Ziel (mit derselben Rolle) fortsetzt. `task` darf dann leer
+    /// sein (Vorgabe: die offenen Punkte der Übergabe abarbeiten).
+    pub continue_from: Option<String>,
 }
 
 impl WaveTarget {
@@ -215,13 +235,25 @@ impl WaveTarget {
     /// - `size` (`usize`): Anzahl Ziele der Welle.
     #[must_use]
     pub fn payload(&self, position: usize, size: usize) -> Value {
+        self.payload_with_task(&self.task, position, size)
+    }
+
+    /// Wie [`Self::payload`], aber mit einem anderen Auftragstext — für eine
+    /// Fortsetzung (Runde 5, Teil J) die Übergabe samt Kennzeichnung
+    /// (`harw_core::child_handoff::continuation_task`). Zusätzlich trägt die
+    /// Nutzlast dann `continuation.of`.
+    #[must_use]
+    pub fn payload_with_task(&self, task: &str, position: usize, size: usize) -> Value {
         let mut payload = json!({
             "id": self.id,
             "role": self.role,
-            "task": self.task,
-            "question": { "id": self.id, "question": self.task },
+            "task": task,
+            "question": { "id": self.id, "question": task },
             "wave": { "tool": DELEGATE_WAVE_TOOL, "position": position + 1, "size": size },
         });
+        if let (Some(of), Some(object)) = (&self.continue_from, payload.as_object_mut()) {
+            object.insert("continuation".to_owned(), json!({ "of": of }));
+        }
         if let (Some(complexity), Some(object)) = (self.complexity, payload.as_object_mut()) {
             object.insert("complexity".to_owned(), json!(complexity.as_str()));
         }
@@ -317,7 +349,21 @@ fn parse_target(raw: &Value, index: usize) -> Result<WaveTarget, OpError> {
         .ok_or_else(|| invalid(&format!("`targets[{index}]` must be an object")))?;
     reject_unknown_fields(object, TARGET_FIELDS, &format!("targets[{index}]"))?;
     let role = required_text(object, "role", index)?;
-    let task = required_text(object, "task", index)?;
+    // Runde 5, Teil J: eine Fortsetzung darf ohne eigenen Auftrag kommen.
+    let continue_from = match object.get("continue_from") {
+        None | Some(Value::Null) => None,
+        Some(Value::String(id)) if !id.trim().is_empty() => Some(id.trim().to_owned()),
+        Some(_) => {
+            return Err(invalid(&format!(
+                "`targets[{index}].continue_from` must be a non-empty child id"
+            )));
+        }
+    };
+    let task = match (&continue_from, object.get("task")) {
+        (Some(_), None | Some(Value::Null)) => String::new(),
+        (Some(_), Some(Value::String(text))) => text.trim().to_owned(),
+        _ => required_text(object, "task", index)?,
+    };
     let id = match object.get("id") {
         None | Some(Value::Null) => format!("t{}", index + 1),
         Some(Value::String(id)) => {
@@ -346,6 +392,7 @@ fn parse_target(raw: &Value, index: usize) -> Result<WaveTarget, OpError> {
         role,
         task,
         complexity,
+        continue_from,
     })
 }
 
@@ -732,22 +779,41 @@ pub async fn delegate_wave(
     let budget = wave_budget_cap(spawner.remaining_budget(ctx.session_id()));
 
     let size = request.targets.len();
-    let payloads: Vec<Value> = request
-        .targets
-        .iter()
-        .enumerate()
-        .map(|(position, target)| target.payload(position, size))
-        .collect();
+    let mut statuses: Vec<Option<TargetStatus>> = (0..size).map(|_| None).collect();
+    // Runde 5, Teil J: Fortsetzungen werden erst nach der regulären
+    // Zulassung geprüft (nur eigene, budget-beendete Kinder derselben Rolle,
+    // Kettengrenze); ein abgelehntes Ziel verrät dabei nichts Neues.
+    let mut seeds: Vec<Option<ContinuationSeed>> = (0..size).map(|_| None).collect();
+    let mut payloads: Vec<Value> = Vec::with_capacity(size);
+    for (position, target) in request.targets.iter().enumerate() {
+        let continuation = match (&target.continue_from, admission[position]) {
+            (Some(from), Some(_)) => Some(prepare_continuation(ctx, &spawner, target, from)),
+            _ => None,
+        };
+        payloads.push(match continuation {
+            Some(Ok(seed)) => {
+                let task = continuation_task(&seed.of, &seed.handoff, Some(target.task.as_str()));
+                seeds[position] = Some(seed);
+                target.payload_with_task(&task, position, size)
+            }
+            Some(Err(message)) => {
+                statuses[position] = Some(TargetStatus::Failed(message));
+                target.payload(position, size)
+            }
+            None => target.payload(position, size),
+        });
+    }
     let contracts: Vec<ChildReturnContract> = request
         .targets
         .iter()
         .map(|target| child_contract(ctx, &target.role))
         .collect();
 
-    let mut statuses: Vec<Option<TargetStatus>> = (0..size).map(|_| None).collect();
     let mut queue: VecDeque<(usize, &'static str)> = VecDeque::new();
     for (position, reducer) in admission.iter().enumerate() {
         match reducer {
+            // Eine abgelehnte Fortsetzung steht schon als `failed` fest.
+            Some(_) if statuses[position].is_some() => {}
             Some(reducer) => queue.push_back((position, *reducer)),
             None => statuses[position] = Some(TargetStatus::Unavailable),
         }
@@ -767,7 +833,7 @@ pub async fn delegate_wave(
                 break;
             };
             let target = &request.targets[position];
-            let future: SlotFuture<'_> = Box::pin(fanout_children(
+            let future: SlotFuture<'_> = Box::pin(fanout_children_with(
                 ctx,
                 &target.role,
                 std::slice::from_ref(&payloads[position]),
@@ -776,6 +842,8 @@ pub async fn delegate_wave(
                 1,
                 JoinSemantics::AllTerminal,
                 contracts[position],
+                // Runde 5, Teil J: Fortsetzung binden, sonst `None`.
+                seeds[position].as_ref(),
             ));
             running.push((position, future));
         }
@@ -852,6 +920,26 @@ fn child_contract(ctx: &OpContext, role: &str) -> ChildReturnContract {
         .unwrap_or(ChildReturnContract::Text)
 }
 
+/// Runde 5, Teil J: prüft ein `continue_from`-Ziel gegen das
+/// Fortsetzungs-Buch des Spawners (eigenes Kind des Aufrufers, am Budget
+/// beendet, dieselbe Rolle, Kettengrenze). Der Aufrufer ist die Sitzung aus
+/// dem Ausführungskontext, nie ein Modell-Argument.
+///
+/// # Errors
+/// Die Meldung für den `failed`-Eintrag des Ziels.
+fn prepare_continuation(
+    ctx: &OpContext,
+    spawner: &ManagedAgentSpawner,
+    target: &WaveTarget,
+    from: &str,
+) -> Result<ContinuationSeed, String> {
+    let from = SessionId::try_from_str(from.to_owned())
+        .map_err(|_| format!("continue_from: '{from}' ist keine gültige Kind-ID"))?;
+    spawner
+        .prepare_continuation(ctx.session_id(), &from, &target.role)
+        .map_err(|error| error.message)
+}
+
 // ── Operation ─────────────────────────────────────────────────────────────────
 
 /// Die Modell-Tool-Fläche von `delegate_wave`.
@@ -897,7 +985,13 @@ const DELEGATE_WAVE_ARGS_SCHEMA: ArgsSchemaFn = || {
                             "role",
                             string_schema("Exakter Rollenname eines sichtbaren Delegationsziels."),
                         ),
-                        ("task", string_schema("Abgegrenzter Auftrag dieses Kindes.")),
+                        (
+                            "task",
+                            string_schema(
+                                "Abgegrenzter Auftrag dieses Kindes (Pflicht, außer bei \
+                                 continue_from).",
+                            ),
+                        ),
                         (
                             "complexity",
                             enum_string_schema(
@@ -905,8 +999,18 @@ const DELEGATE_WAVE_ARGS_SCHEMA: ArgsSchemaFn = || {
                                 &["simple", "complex"],
                             ),
                         ),
+                        // Runde 5, Teil J: Fortsetzung eines budget-beendeten Kindes.
+                        (
+                            "continue_from",
+                            string_schema(
+                                "Optional: ID eines eigenen Kindes, das am Token-Budget endete \
+                                 (siehe dessen Übergabe). Das neue Kind derselben Rolle bekommt \
+                                 die Übergabe als Kontext und ein frisches Budget; höchstens 3 \
+                                 Fortsetzungen je ursprünglichem Kind.",
+                            ),
+                        ),
                     ],
-                    &["role", "task"],
+                    &["role"],
                 )),
             ),
             (
@@ -1084,6 +1188,42 @@ mod tests {
             .map(|index| json!({ "role": "explorer", "task": format!("q{index}") }))
             .collect();
         expect_invalid(json!({ "targets": too_many }), "at most")?;
+        Ok(())
+    }
+
+    /// Runde 5, Teil J: `continue_from` macht den Auftrag optional und
+    /// landet als `continuation.of` in der Nutzlast.
+    #[test]
+    fn test_parse_accepts_a_continuation_without_task() -> TestResult {
+        let request = parse(json!({
+            "targets": [
+                { "role": "explorer", "continue_from": " child-1 " },
+                { "role": "explorer", "task": "nur Modul C", "continue_from": "child-2" },
+            ]
+        }))?;
+        assert_eq!(request.targets[0].continue_from.as_deref(), Some("child-1"));
+        assert_eq!(request.targets[0].task, "");
+        assert_eq!(request.targets[1].task, "nur Modul C");
+        let payload = request.targets[1].payload_with_task("Fortsetzung von child-2: …", 1, 2);
+        assert_eq!(payload["continuation"]["of"], json!("child-2"));
+        assert_eq!(payload["task"], json!("Fortsetzung von child-2: …"));
+        assert_eq!(
+            payload["question"]["question"],
+            json!("Fortsetzung von child-2: …")
+        );
+        let plain = parse(json!({ "targets": [{ "role": "explorer", "task": "a" }] }))?;
+        assert!(plain.targets[0].payload(0, 1).get("continuation").is_none());
+
+        expect_invalid(
+            json!({ "targets": [{ "role": "explorer", "continue_from": "" }] }),
+            "continue_from",
+        )?;
+        expect_invalid(
+            json!({ "targets": [{ "role": "explorer", "continue_from": 7 }] }),
+            "continue_from",
+        )?;
+        // Ohne `continue_from` bleibt der Auftrag Pflicht.
+        expect_invalid(json!({ "targets": [{ "role": "explorer" }] }), "task")?;
         Ok(())
     }
 

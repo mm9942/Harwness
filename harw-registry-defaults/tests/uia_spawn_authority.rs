@@ -180,6 +180,7 @@ fn test_matrix_roles_are_read_only_worker_roles_fit_for_the_uia_allowlist() -> T
             );
             assert!(
                 tool != "fs.write"
+                    && tool != "fs.edit"
                     && !tool.starts_with("web.")
                     && !tool.starts_with("shell.")
                     && !tool.starts_with("process.")

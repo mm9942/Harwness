@@ -754,9 +754,16 @@ pub async fn compact_for_budget_with(
                 .unwrap_or(DEFAULT_SUMMARY_WINDOW_TOKENS),
             bytes_per_token: calibration.bytes_per_token(),
         };
+        // Runde 5, Teil H: die jüngsten Nutzer-Turns bleiben wörtlich
+        // stehen, soweit sie neben aktuellem Turn, Overhead und der
+        // Zusammenfassung selbst ins Ziel passen.
+        let keep_bytes = recent_turns_budget_bytes(&history, target, overhead, &calibration);
         if let Some((summarized, result)) = summarize_older(
             &history,
-            SummarySpan::AllOlder,
+            SummarySpan::AllOlderExceptRecentTurns {
+                user_turns: COMPACTION_KEEP_RECENT_USER_TURNS,
+                max_bytes: keep_bytes,
+            },
             &config,
             model,
             &mut summary_usage,
@@ -826,6 +833,39 @@ pub async fn compact_for_budget_with(
         outcome,
         items_before,
     ))
+}
+
+/// Byte-Budget für die wörtlich behaltenen jüngsten Nutzer-Turns einer
+/// Voll-Zusammenfassung (Runde 5, Teil H).
+///
+/// # Beschreibung
+/// `target − overhead − aktueller Turn − Zusammenfassung`
+/// ([`SUMMARY_MAX_OUTPUT_TOKENS`] als Obergrenze der Zusammenfassung), in
+/// Tokens gerechnet und mit der kalibrierten Rate in Bytes umgerechnet
+/// (abgerundet). `0`, wenn nichts übrig bleibt — dann wird wie bisher alles
+/// Ältere zusammengefasst.
+fn recent_turns_budget_bytes(
+    history: &ConversationHistory,
+    target_tokens: u64,
+    overhead_tokens: u64,
+    calibration: &TokenCalibration,
+) -> u64 {
+    let (_, current) = split_current_turn(history);
+    let current_bytes = current
+        .iter()
+        .flatten()
+        .map(model_item_bytes)
+        .fold(0_u64, u64::saturating_add);
+    let available_tokens = target_tokens
+        .saturating_sub(overhead_tokens)
+        .saturating_sub(calibration.bytes_to_tokens(current_bytes))
+        .saturating_sub(u64::from(SUMMARY_MAX_OUTPUT_TOKENS));
+    let rate = calibration.bytes_per_token();
+    if available_tokens == 0 || !rate.is_finite() || rate <= 0.0 {
+        return 0;
+    }
+    // Sättigende `as`-Umwandlung wie in `TokenCalibration::bytes_to_tokens`.
+    (available_tokens as f64 * rate).floor() as u64
 }
 
 /// Gemeinsamer Abschluss beider Einstiegspunkte: meldet die
@@ -1383,6 +1423,19 @@ fn render_content(parts: &[ContentPart]) -> String {
     buf
 }
 
+/// Runde 5, Teil J: Reintext-Rendering eines ganzen Verlaufs mit demselben
+/// Format wie der Zusammenfassungs-Prompt ([`render_item`]; Tool-Ergebnisse
+/// auf [`SUMMARY_RENDER_RESULT_MAX_BYTES`] gekappt, Reasoning fällt weg).
+/// Grundlage der Übergabe-Verdichtung am Budget-Ende eines Kindes
+/// ([`crate::child_handoff`]).
+pub(crate) fn render_transcript(items: &[TurnItem]) -> String {
+    let mut transcript = String::new();
+    for item in items {
+        render_item(&mut transcript, item);
+    }
+    transcript
+}
+
 /// Entfernt führende (auch mehrfach verschachtelte) [`SUMMARY_MARKER`] —
 /// Grundlage dafür, dass Zusammenfassungen nie ineinander geschachtelt
 /// werden.
@@ -1442,8 +1495,70 @@ impl SummaryConfig {
 enum SummarySpan {
     /// Die ältere Hälfte der (nicht angehefteten) älteren Gruppen.
     OlderHalf,
-    /// Alle älteren Gruppen.
-    AllOlder,
+    /// Alle älteren Gruppen **außer** den jüngsten vollständigen Nutzer-Turns
+    /// (Nutzernachricht samt folgenden Antworten/Werkzeugrunden), höchstens
+    /// `user_turns` Stück und zusammen höchstens `max_bytes`
+    /// ([`model_item_bytes`]); die behaltenen Turns bleiben wörtlich stehen
+    /// (Runde 5, Teil H). `max_bytes = 0` fasst alle älteren Gruppen zusammen.
+    AllOlderExceptRecentTurns {
+        /// Höchstzahl wörtlich behaltener Nutzer-Turns.
+        user_turns: usize,
+        /// Byte-Budget der behaltenen Turns.
+        max_bytes: u64,
+    },
+}
+
+/// Runde 5, Teil H: so viele jüngste Nutzer-Turns behält eine
+/// Voll-Zusammenfassung (auch die Notfall-Verdichtung) wörtlich, sofern sie
+/// ins Budget passen — nie nur Zusammenfassung plus aktuelle Nachricht, wenn
+/// das Budget mehr erlaubt.
+pub const COMPACTION_KEEP_RECENT_USER_TURNS: usize = 2;
+
+/// Teilt `rest` (ältere, nicht angeheftete Gruppen) in den zusammenzufassenden
+/// Anfang und den wörtlich behaltenen Schluss (Runde 5, Teil H).
+///
+/// # Beschreibung
+/// Der Schluss besteht nur aus **vollständigen** Nutzer-Turns: jeweils eine
+/// `UserMessage`-Gruppe plus alle folgenden Gruppen bis zur nächsten
+/// Nutzernachricht. Von hinten werden höchstens `user_turns` solcher Turns
+/// genommen, solange ihre Bytes zusammen `max_bytes` nicht überschreiten; der
+/// erste nicht mehr passende Turn beendet die Auswahl (der Schluss bleibt
+/// zusammenhängend). Gruppen vor der ersten Nutzernachricht zählen nie zum
+/// Schluss.
+fn split_recent_user_turns(
+    mut rest: Vec<Vec<TurnItem>>,
+    user_turns: usize,
+    max_bytes: u64,
+) -> (Vec<Vec<TurnItem>>, Vec<Vec<TurnItem>>) {
+    if user_turns == 0 || max_bytes == 0 {
+        return (rest, Vec::new());
+    }
+    let group_bytes = |group: &Vec<TurnItem>| {
+        group
+            .iter()
+            .map(model_item_bytes)
+            .fold(0_u64, u64::saturating_add)
+    };
+    let mut split = rest.len();
+    let mut used = 0_u64;
+    let mut taken = 0_usize;
+    let mut cursor = rest.len();
+    let mut pending = 0_u64;
+    while cursor > 0 && taken < user_turns {
+        cursor -= 1;
+        pending = pending.saturating_add(group_bytes(&rest[cursor]));
+        if is_user_group(&rest[cursor]) {
+            if used.saturating_add(pending) > max_bytes {
+                break;
+            }
+            used = used.saturating_add(pending);
+            pending = 0;
+            taken += 1;
+            split = cursor;
+        }
+    }
+    let kept = rest.split_off(split);
+    (rest, kept)
 }
 
 /// Ergebnis eines erfolgreichen Zusammenfassungs-Aufrufs.
@@ -1505,8 +1620,18 @@ async fn summarize_older(
             let split = rest.len().div_ceil(2);
             rest.split_off(split)
         }
-        SummarySpan::AllOlder => Vec::new(),
+        SummarySpan::AllOlderExceptRecentTurns {
+            user_turns,
+            max_bytes,
+        } => {
+            let (summarize, kept) = split_recent_user_turns(rest, user_turns, max_bytes);
+            rest = summarize;
+            kept
+        }
     };
+    if rest.is_empty() {
+        return None;
+    }
 
     let result = run_summary(&prior, &rest, config, model, usage_out).await?;
 
@@ -2822,5 +2947,143 @@ mod tests {
             Some(TurnItem::UserMessage(_))
         ));
         Ok(())
+    }
+
+    // --- Runde 5, Teil H: Notfall-Verdichtung behält die jüngsten Turns -----
+
+    /// Baut sechs ältere Nutzer-Turns mit großer Antwort und eine aktuelle
+    /// Nachricht; liefert Session und die Tokens eines älteren Turns.
+    fn session_with_old_turns() -> (AgentSession, u64, u64) {
+        let big = "x".repeat(20_000);
+        let mut session = test_session();
+        for i in 0..6 {
+            session.history_mut().push(user(&format!("frage {i}")));
+            session
+                .history_mut()
+                .push(assistant(&format!("antwort {i} {big}")));
+        }
+        session.history_mut().push(user("aktuell"));
+        let calibration = *session.token_calibration();
+        let turn_tokens = calibration.bytes_to_tokens(estimate_history_bytes(&[
+            user("frage 0"),
+            assistant(&format!("antwort 0 {big}")),
+        ]));
+        let current_tokens =
+            calibration.bytes_to_tokens(estimate_history_bytes(&[user("aktuell")]));
+        (session, turn_tokens, current_tokens)
+    }
+
+    fn user_texts(history: &ConversationHistory) -> Vec<String> {
+        history
+            .items()
+            .iter()
+            .filter_map(|item| match item {
+                TurnItem::UserMessage(message) => Some(render_content(&message.content)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn test_emergency_compaction_keeps_the_last_two_user_turns_when_they_fit() -> TestResult {
+        let (mut session, turn_tokens, current_tokens) = session_with_old_turns();
+        let target = u64::from(SUMMARY_MAX_OUTPUT_TOKENS)
+            + current_tokens
+            + turn_tokens * 2
+            + turn_tokens / 2;
+        let model =
+            RecordingSummaryModel::new("Arbeitsstand: Fragen 0–3 beantwortet", StopReason::EndTurn);
+
+        let outcome = compact_for_budget(
+            &mut session,
+            &model,
+            target,
+            0,
+            Some(CompactDecision::Emergency),
+        )
+        .await?;
+
+        assert!(
+            outcome.summarized,
+            "die älteren Turns werden zusammengefasst"
+        );
+        assert!(
+            outcome.tokens_after <= target,
+            "{} > {target}",
+            outcome.tokens_after
+        );
+        let history = session.history();
+        assert!(
+            history.items().first().is_some_and(is_pinned_summary),
+            "die Zusammenfassung (Arbeitsstand) steht vorn"
+        );
+        assert_eq!(
+            user_texts(history),
+            vec!["frage 4", "frage 5", "aktuell"],
+            "die letzten zwei Nutzer-Turns bleiben wörtlich stehen"
+        );
+        // Summary + 2 × (Frage + Antwort) + aktuelle Nachricht — nie nur 2.
+        assert_eq!(history.len(), 6);
+        let prompts = model.prompts();
+        let prompt = prompts
+            .first()
+            .map(|(prompt, _)| prompt.clone())
+            .ok_or(TestError::Missing("Zusammenfassungs-Prompt"))?;
+        assert!(prompt.contains("frage 3"), "{prompt}");
+        assert!(
+            !prompt.contains("frage 4"),
+            "behaltene Turns nicht zusammenfassen"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_emergency_compaction_keeps_only_what_fits() -> TestResult {
+        let (mut session, turn_tokens, current_tokens) = session_with_old_turns();
+        // Budget für genau einen älteren Turn.
+        let target =
+            u64::from(SUMMARY_MAX_OUTPUT_TOKENS) + current_tokens + turn_tokens + turn_tokens / 2;
+        let model = RecordingSummaryModel::new("Arbeitsstand", StopReason::EndTurn);
+
+        compact_for_budget(
+            &mut session,
+            &model,
+            target,
+            0,
+            Some(CompactDecision::Emergency),
+        )
+        .await?;
+
+        assert_eq!(user_texts(session.history()), vec!["frage 5", "aktuell"]);
+        Ok(())
+    }
+
+    #[test]
+    fn test_split_recent_user_turns_takes_whole_turns_from_the_end() {
+        let groups: Vec<Vec<TurnItem>> = vec![
+            vec![assistant("vorspann")],
+            vec![user("a")],
+            vec![assistant("antwort a")],
+            vec![user("b")],
+            vec![assistant("antwort b")],
+            vec![user("c")],
+            vec![assistant("antwort c")],
+        ];
+        let (summarize, kept) = split_recent_user_turns(groups.clone(), 2, u64::MAX);
+        assert_eq!(summarize.len(), 3);
+        assert_eq!(kept.len(), 4);
+        assert!(matches!(
+            kept.first().map(Vec::as_slice),
+            Some([TurnItem::UserMessage(_)])
+        ));
+
+        // Ohne Budget: alles wird zusammengefasst.
+        let (summarize, kept) = split_recent_user_turns(groups.clone(), 2, 0);
+        assert_eq!(summarize.len(), groups.len());
+        assert!(kept.is_empty());
+
+        // Ein Budget, das keinen vollständigen Turn fasst, behält nichts.
+        let (_, kept) = split_recent_user_turns(groups, 2, 1);
+        assert!(kept.is_empty());
     }
 }

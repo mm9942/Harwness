@@ -54,7 +54,7 @@ const NEW_FILE_MODE: u32 = 0o644;
 const PROTECTED_COMPONENTS: &[&str] = &[".git", ".harw"];
 
 /// Liefert die erste geschützte Komponente von `relative`, falls vorhanden.
-fn protected_component(relative: &Path) -> Option<&'static str> {
+pub(crate) fn protected_component(relative: &Path) -> Option<&'static str> {
     relative.components().find_map(|component| {
         let Component::Normal(part) = component else {
             return None;

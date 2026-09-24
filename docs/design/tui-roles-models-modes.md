@@ -1,8 +1,9 @@
 # Rollen, Modelle, Modi und Freigabe in der TUI
 
-Status: Ist-Stand 2026-09-24, verbindlich für TUI und `harw-ops`.
+Status: Ist-Stand 2026-09-24 (Runde 5), verbindlich für TUI und `harw-ops`.
 Zugehörig: `tui-command-contract.md` §8 (Befehle, Tasten, Präfixe).
 Quellen: `harw-config/src/role_models.rs`, `harw-config/src/internal_models.rs`,
+`harw-config/src/uia_worker_models.rs`,
 `harw-ops/src/{models,model,mode,effort}.rs`,
 `harw-extension-api/src/approval_mode.rs`, `harw-runtime/src/approval.rs`
 (`ApprovalChain::for_child`), `harw-runtime/src/assembly.rs`
@@ -21,7 +22,7 @@ Live-Modell der laufenden Sitzung.
 | Rolle (`key`) | Label | Konfiguration | Mögliche Herkunft (`RoleModelSource`) |
 |---|---|---|---|
 | `uia` | Benutzeroberfläche (UIA) | `uia_provider` + `uia_model` | `UiaPin` (beide gesetzt **und** Provider vorhanden und aktiviert), sonst `DefaultModel`, sonst `Unset` |
-| `uia-worker` | UIA-Worker | `uia_worker_model` | `UiaWorkerPin`, sonst `InheritsUia`. Provider **immer** der der UIA-Zeile (Kopplungsregel) |
+| `uia-worker` | UIA-Worker | `[uia_worker_models] uia_worker`, sonst alter Pin `uia_worker_model` | feste Wahl (`provider/modell`) oder `InheritsUia` (Wert `"uia"`). Seit Runde 5 **ohne** Kopplung an den UIA-Provider, Einzelheiten §1.1 |
 | `orchestrator` | Orchestrator | `[internal_models.root_orchestrator]` | `Explicit`, sonst `DefaultModel`/`Unset` — **nie** OpenRouter-Standard |
 | `sub-orchestrator` | Sub-Orchestrator | `[internal_models.sub_orchestrator]` | `Explicit`, sonst `InheritsOrchestrator` (Provider/Modell der Orchestrator-Zeile) — nie OpenRouter-Standard |
 | `worker-simple` | Worker (einfach) | `[internal_models.worker_simple]` | `Explicit` / `OpenRouterDefault` / `DefaultModel` / `Unset` |
@@ -32,6 +33,7 @@ Live-Modell der laufenden Sitzung.
 | `title` | Sitzungstitel | `[internal_models.session_title]` (Legacy: `session.title_model`) | wie oben |
 | `memory` | Gedächtnis-Konsolidierung | `[internal_models.memory_consolidation]` | wie oben |
 | `dream` | Traum-Reflexion | `[internal_models.dream_reflection]` | wie oben |
+| `auto-classifier` | Auto-Modus-Klassifizierer | `[internal_models.auto_classifier]` | `Explicit`, sonst das schnelle Modell des aktiven Providers (Anthropic: `claude-haiku-4-5`; sonst nach Namensmerkmalen wie `haiku`, `mini`, `flash`); nie OpenRouter-Standard |
 
 Herkunft im Einzelnen:
 
@@ -62,6 +64,30 @@ Organisationsrolle (`root-orchestrator` → Orchestrator, `child-orchestrator`
 `uia-worker`-Familie (`uia-worker`, `uia-explorer`, `uia-writer`,
 `uia-shell-worker`) bekommt ihr Modell aus der UIA-Sitzung.
 
+### 1.1 Eigene Modellwahl je UIA-Worker-Rolle (Runde 5, Teil G)
+
+Jede Rolle der `uia-worker`-Familie hat eine eigene Wahl unter
+`[uia_worker_models]` (TOML-Schlüssel mit `_` statt `-`):
+
+```toml
+[uia_worker_models]
+uia_worker       = "uia"                       # wie UIA (folgt auch einem Live-Wechsel)
+uia_shell_worker = "anthropic/claude-sonnet-5" # feste Wahl, Trennung am ersten `/`
+# uia_writer, uia_latex_writer, uia_explorer
+```
+
+- Ohne Eintrag gilt der alte Pin `uia_worker_model` als feste Wahl, jetzt mit
+  dem Provider, dem das Modell im Katalog gehört, sonst „wie UIA“.
+- Eine feste Wahl bleibt nur, solange ihr Provider angemeldet ist; sonst fällt
+  die Rolle mit einem Hinweis auf „wie UIA“ zurück. Ein Wechsel des
+  UIA-Providers scheitert damit nie an einer Worker-Bindung.
+- Laufende Worker behalten ihr Modell bis zum Ende ihres Laufs, neue Worker
+  nehmen die neue Wahl.
+- Setzen: `/models worker [<rolle|all> <uia|ziel>]` oder in `/models` (F8):
+  nach der UIA-Wahl öffnet sich direkt der Bereich „UIA-Worker-Modelle“
+  (Enter wählt das Modell einer Rolle, `a` setzt alle auf „wie UIA“, Esc
+  beendet).
+
 ## 2. Wann eine Modelländerung wirkt
 
 **Regel: jede Modell- und Effort-Wahl wirkt ab der nächsten Sitzung — außer
@@ -73,11 +99,13 @@ Organisationsrolle (`root-orchestrator` → Orchestrator, `child-orchestrator`
 | `/effort <stufe>` | Live-Zustand der Sitzung | sofort |
 | `/models set <rolle> <ziel>` | Profil-`config.toml` (`uia_*`, `uia_worker_model` bzw. `[internal_models.*]`) | ab nächster Sitzung |
 | `/models reset <rolle>` | entfernt die explizite Wahl | ab nächster Sitzung |
+| `/models worker <rolle\|all> <uia\|ziel>` | Profil-`config.toml` (`[uia_worker_models]`) | neue Worker ab sofort, laufende behalten ihr Modell |
 | `/uia-model`, `/uia-worker-model`, `/uia-effort` | Profil-`config.toml` | ab nächster Sitzung |
 
-`/models set uia-worker` akzeptiert nur Modelle des UIA-Providers; zuerst
-`/models set uia <modell>`. Keiner dieser Befehle hat ein Modell-Werkzeug:
-das Modell darf weder sein eigenes noch das Modell seiner Kinder wählen.
+`/models set uia-worker` akzeptiert seit Runde 5 auch Modelle anderer
+Provider. `/mode` ändert das Modell nicht (mehr). Keiner dieser Befehle hat ein
+Modell-Werkzeug: das Modell darf weder sein eigenes noch das Modell seiner
+Kinder wählen.
 
 ## 3. Modus, Freigabe und Shift+Tab
 
@@ -97,6 +125,52 @@ Modus, setzt Freigabe `ask` und fordert Modus `plan` an; die nächste Stufe
 setzt wieder nur die Freigabe und stellt den gemerkten Modus wieder her.
 Bei offenem `/`-Popup wirkt `Shift+Tab` nicht. Statuszeile:
 `Modus: <modus> · Freigabe: <ask|auto|full>`.
+
+### 3.0 Plan-Modus (Runde 5, Teil F)
+
+Die Stufe `plan` ist ein vollwertiger Plan-Modus:
+
+- Statuszeile „⏸ plan mode on (shift+tab to cycle)“ in eigener Farbe;
+  Composer-Hinweis „Plan-Modus – es wird nichts verändert“.
+- Die Sperre wirkt **sofort**, auch mitten im Turn (`PlanModeGate`): nichts
+  Schreibendes, keine Ausführung. Das einzige Schreibwerkzeug ist
+  `plan.write`, und es schreibt nur unter `.harw/plans/<slug>.md`.
+- Der Agent darf schreibgeschützte Kinder (`explorer`/`researcher`,
+  höchstens 3 parallel) starten und mit `ask_user` strukturierte Rückfragen
+  stellen (nur Wurzel, nur TUI).
+- `plan.exit` öffnet ein Fenster mit dem gerenderten Plan und drei Optionen:
+  1. umsetzen im Auto-Modus → Modus `work`, Freigabe `auto`;
+  2. umsetzen, Änderungen einzeln freigeben → `work`, `ask`;
+  3. weiter planen, mit Freitext-Rückmeldung an den Agenten.
+- `plan.enter` ist nur ein Vorschlag des Agenten; erst „Ja“ schaltet um.
+- Der freigegebene Plan bleibt als angehefteter Kontext in jeder Anfrage und
+  übersteht die Verdichtung. `/plan show|list|open|edit` verwaltet die
+  Plan-Dateien; `/plan` bzw. `/mode plan` schalten ein.
+
+### 3.0.1 Auto-Modus (Runde 5, Teil E)
+
+In `auto` gibt die Runtime frei, was in `AUTO_APPROVED_TOOLS` steht. Für die
+übrigen Aufrufe gilt diese Reihenfolge:
+
+1. `ALWAYS_ASK_TOOLS` (`process.kill`, `host.sudo_exec`, `agent.cancel`, …)
+   fragen immer.
+2. Deny-Regeln, dann Allow-Regeln (`[[permissions.deny]]`/`[[permissions.allow]]`
+   mit `tool` und optional `match` bzw. `path`). Deny-Regeln gelten auch in
+   `ask`.
+3. Ein deterministischer Vorfilter: Schreiben außerhalb des Workspace, in
+   `.git`/`.harw` oder an Credential-Pfaden, `rm -rf` außerhalb,
+   `git push --force`, `curl … | sh`, Netz außerhalb der Policy — ein Treffer
+   ist nie eine Freigabe.
+4. Der Klassifizierer (Rolle `auto-classifier`, ohne Werkzeuge, Geheimnisse
+   vorher entfernt) entscheidet `allow|ask|deny` mit Kategorie und Grund.
+   Fehler, Parsefehler oder mehr als 10 s → Rückfrage.
+
+Die Werkzeugzelle zeigt „auto ✓ <Grund>“ bzw. „Vom Auto-Modus abgelehnt ·
+<Kategorie>“; `/permissions log` listet die letzten Entscheidungen. Nach 3
+Ablehnungen in Folge oder 20 in der Sitzung fällt die Sitzung auf `ask`
+zurück. Ab der dritten gleichartigen manuellen Freigabe bietet der Dialog
+„Ja, und künftig erlauben: <muster>“ (Sitzung oder Projekt) an, nie für
+`ALWAYS_ASK_TOOLS` oder riskante Muster.
 
 ### 3.1 Kinder folgen der Freigabe live, gedeckelt auf `auto`
 

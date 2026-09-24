@@ -2188,10 +2188,15 @@ mod tests {
     /// (Runde 4, Teil H).
     const EXPECTED_BUSY_CLASSES: &[(&str, &str, &str)] = &[
         ("add-workdir", "deferred", ""),
+        // Runde 5, Teil K: `/agent bg` und `/agent cancel <id>` (TUI-lokal,
+        // Hintergrund-Agenten) erben `immediate`.
         ("agent", "immediate", ""),
-        ("agents", "immediate", ""),
+        // Runde 5, Teil I: `/agents` entfällt (nur noch `/agent`; `/agent
+        // stream <modus>` erbt dessen `immediate`).
         ("approve", "immediate", ""),
         ("attach", "immediate", ""),
+        // Runde 5, Teil L: `/btw` läuft neben dem Turn (lokaler Befehl).
+        ("btw", "immediate", ""),
         ("bug-report", "deferred", ""),
         ("cancel", "immediate", ""),
         ("clear", "deferred", ""),
@@ -2231,11 +2236,15 @@ mod tests {
             "deferred",
             "-=immediate,list=immediate,show=immediate,search=immediate",
         ),
+        // Runde 5, Teil E: `rules`/`log` sind lesend und laufen sofort.
         (
             "permissions",
             "deferred",
-            "-=immediate,show=immediate,mode=immediate,set=immediate",
+            "-=immediate,show=immediate,mode=immediate,set=immediate,rules=immediate,log=immediate",
         ),
+        // Runde 5, Teil F: lokale Ersatz-Spezifikation (Plan-Modus an,
+        // `/plan show|list|open`; `/plan edit` wartet als lokaler Abfang).
+        ("plan", "immediate", ""),
         (
             "plugins",
             "immediate",
@@ -2335,6 +2344,8 @@ mod tests {
         let cases: &[(&str, BusyAvailability)] = &[
             ("/permissions", BusyAvailability::Immediate),
             ("/permissions mode auto", BusyAvailability::Immediate),
+            ("/permissions log", BusyAvailability::Immediate),
+            ("/permissions rules", BusyAvailability::Immediate),
             (
                 "/permissions allow shell",
                 BusyAvailability::DeferredUntilTurnEnd,
@@ -2361,6 +2372,12 @@ mod tests {
             ("/whoami", BusyAvailability::DeferredUntilTurnEnd),
             ("/compact", BusyAvailability::DeferredUntilTurnEnd),
             ("/new", BusyAvailability::DeferredUntilTurnEnd),
+            // Runde 5, Teil I: Live-Stream-Umschalter wirkt sofort.
+            ("/agent stream none", BusyAvailability::Immediate),
+            // Runde 5, Teil K: Hintergrund-Agenten auflisten/abbrechen wirkt sofort.
+            ("/agent bg", BusyAvailability::Immediate),
+            ("/agent cancel x", BusyAvailability::Immediate),
+            ("/agent stream orchestrators", BusyAvailability::Immediate),
         ];
         for (raw, expected) in cases {
             assert_eq!(

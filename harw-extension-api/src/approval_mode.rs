@@ -81,7 +81,8 @@ impl ApprovalMode {
         match self {
             Self::AlwaysAsk => "jeder Werkzeugaufruf wird einzeln bestätigt",
             Self::Delegated => {
-                "harw gibt lesende Werkzeuge selbst frei und fragt bei schreibenden und ausführenden"
+                // Runde 5, Teil E: mit Klassifizierer (ohne Modell: fragt).
+                "harw gibt lesende Werkzeuge selbst frei; den Rest beurteilt der Auto-Klassifizierer, im Zweifel wird gefragt"
             }
             Self::FullAccess => "kein Werkzeugaufruf fragt nach",
         }

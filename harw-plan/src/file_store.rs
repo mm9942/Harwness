@@ -28,6 +28,19 @@
 //! `crate::mutation` (über `crate::store::stage_actions`) — dieselbe Funktion,
 //! die auch `InMemoryPlanStore` aufruft.
 //!
+//! # Mehrere Pläne (Runde 5, Teil P)
+//! Jeder Plan liegt wie bisher in seinem eigenen Verzeichnis
+//! `<root>/plans/<plan_id>/` mit eigener Revisionsfolge, eigenen Siegeln und
+//! eigener `history.jsonl`. Neu ist der Katalog-Index
+//! `<root>/plan-index.json` ([`crate::catalog::PlanIndex`]): aktiver Plan,
+//! Archiv-Flags und Freigabestand. Beim Start werden **alle** gültigen
+//! Plan-Verzeichnisse geladen. Fehlt der Index (Altbestand), ist der Plan
+//! aktiv, den der Einzelplan-Store gewählt hätte; der Index entsteht erst bei
+//! der ersten Katalogänderung — das Lesen eines Altbestands schreibt nichts.
+//! Ein beschädigter **aktiver** Plan bricht das Öffnen ab (wie bisher); ein
+//! beschädigter inaktiver Plan wird mit `warn!` übersprungen und ist dann
+//! nicht wählbar.
+//!
 //! # Concurrency
 //! `Send + Sync` über `RwLock`; synchronisiert Threads, nicht Prozesse.
 //!
@@ -46,6 +59,7 @@ use time::OffsetDateTime;
 use tracing::{debug, info, warn};
 
 use crate::actions::{PlanAction, PlanEvent};
+use crate::catalog::{PLAN_INDEX_FILE, PlanApproval, PlanIndex, PlanMeta, PlanSummary};
 use crate::config::PlanToolConfig;
 use crate::error::{PlanError, PlanResult};
 use crate::ids::{PlanId, RevisionId};
@@ -349,20 +363,64 @@ pub(crate) mod seal {
     }
 }
 
-/// Interner Zustand des File-Stores.
-struct Inner {
+/// Ein Plan im Katalog samt History, Revisionsfolge und Siegelkette.
+struct Slot {
     /// Aktueller Planzustand (gecacht im RAM).
-    plan: Option<Plan>,
+    plan: Plan,
     /// Event-History (gecacht).
     history: Vec<PlanEvent>,
-    /// Plan-ID (für Verzeichnis-Aufbau).
-    plan_id: Option<PlanId>,
-    /// Nächste Revisionsnummer.
+    /// Nächste Revisionsnummer dieses Plans.
     next_revision: RevisionId,
     /// Letztes Glied der Siegelkette (`None` vor dem ersten Siegel).
     seal: Option<seal::SealLink>,
+    /// Katalogdaten (Archiv, Freigabestand).
+    meta: PlanMeta,
+}
+
+/// Interner Zustand des File-Stores.
+struct Inner {
+    /// Alle Pläne in Anlagereihenfolge.
+    plans: Vec<Slot>,
+    /// Der aktive Plan (Ziel aller Mutationen).
+    active: Option<PlanId>,
     /// Wurzelverzeichnis.
     root: PathBuf,
+}
+
+impl Inner {
+    // Der aktive Plan.
+    fn active_slot(&self) -> Option<&Slot> {
+        let active = self.active.as_ref()?;
+        self.plans.iter().find(|slot| &slot.plan.id == active)
+    }
+
+    // Index des aktiven Plans.
+    fn active_position(&self) -> Option<usize> {
+        let active = self.active.as_ref()?;
+        self.plans.iter().position(|slot| &slot.plan.id == active)
+    }
+
+    // Index des Plans `id` oder `PlanUnknown`.
+    fn position_of(&self, id: &PlanId) -> PlanResult<usize> {
+        self.plans
+            .iter()
+            .position(|slot| &slot.plan.id == id)
+            .ok_or_else(|| PlanError::PlanUnknown { id: id.clone() })
+    }
+
+    // Der Katalog-Index, wie er nach einer Änderung auf Platte gehört.
+    fn index(&self) -> PlanIndex {
+        let mut index = PlanIndex {
+            active: self.active.as_ref().map(|id| id.as_str().to_owned()),
+            ..PlanIndex::default()
+        };
+        for slot in &self.plans {
+            index
+                .plans
+                .insert(slot.plan.id.as_str().to_owned(), slot.meta);
+        }
+        index
+    }
 }
 
 /// Vollständig synchronisierter, aber noch nicht sichtbarer Snapshot-Write.
@@ -421,27 +479,19 @@ pub struct FilePlanStore {
     config: PlanToolConfig,
 }
 
-/// Ergebnis von [`FilePlanStore::load`]: der aus `<root>/plans/` rekonstruierte
-/// Store-Zustand.
-struct LoadedPlanState {
-    plan: Option<Plan>,
-    history: Vec<PlanEvent>,
-    plan_id: Option<PlanId>,
-    next_revision: RevisionId,
-    seal: Option<seal::SealLink>,
+/// Ergebnis von [`FilePlanStore::load`]: der aus `<root>/plans/` und
+/// `<root>/plan-index.json` rekonstruierte Katalog.
+struct LoadedCatalog {
+    plans: Vec<Slot>,
+    active: Option<PlanId>,
 }
 
-impl LoadedPlanState {
-    // Leerer Store ohne Plan.
-    fn empty() -> Self {
-        Self {
-            plan: None,
-            history: Vec::new(),
-            plan_id: None,
-            next_revision: RevisionId::new(1),
-            seal: None,
-        }
-    }
+/// Ein aus seinem Verzeichnis geladener Plan (ohne Katalogdaten).
+struct LoadedPlan {
+    plan: Plan,
+    history: Vec<PlanEvent>,
+    next_revision: RevisionId,
+    seal: Option<seal::SealLink>,
 }
 
 impl FilePlanStore {
@@ -479,37 +529,51 @@ impl FilePlanStore {
         let root = root.as_ref().to_path_buf();
         std::fs::create_dir_all(&root)?;
         let loaded = Self::load(&root)?;
-        if let Some(plan) = &loaded.plan {
-            config.validate_plan(plan).map_err(PlanError::Config)?;
+        // Wie bisher wird der aktive Plan gegen die Konfiguration geprüft;
+        // inaktive Pläne erst, wenn sie per Mutation wieder angefasst werden.
+        if let Some(active) = &loaded.active
+            && let Some(slot) = loaded.plans.iter().find(|slot| &slot.plan.id == active)
+        {
+            config
+                .validate_plan(&slot.plan)
+                .map_err(PlanError::Config)?;
         }
         Ok(Self {
             inner: RwLock::new(Inner {
-                plan: loaded.plan,
-                history: loaded.history,
-                plan_id: loaded.plan_id,
-                next_revision: loaded.next_revision,
-                seal: loaded.seal,
+                plans: loaded.plans,
+                active: loaded.active,
                 root,
             }),
             config,
         })
     }
 
-    /// Lädt beim Start den neuesten vollständigen Planstand aus dem Dateibaum.
+    /// Lädt beim Start alle Pläne und den Katalog-Index aus dem Dateibaum.
     ///
     /// Die Dateinamen sind die durable Sequenzquelle. Berücksichtigt werden
     /// nur Verzeichnisse, deren Name eine gültige [`PlanId`] ist (andere werden
-    /// mit `warn!` übersprungen). Gewählt wird die höchste Revision
-    /// (Tie-Break: lexikografisch größere Plan-ID); nur dieser Snapshot wird
-    /// gelesen, gegen sein Siegel geprüft und muss die ID seines Verzeichnisses
-    /// tragen.
-    fn load(root: &Path) -> PlanResult<LoadedPlanState> {
+    /// mit `warn!` übersprungen) und die mindestens einen Snapshot enthalten.
+    /// Aktiv ist der Plan aus `plan-index.json`; fehlt der Index
+    /// (Altbestand, Migration), der Plan mit der höchsten Snapshot-Revision
+    /// (Tie-Break: lexikografisch größere Plan-ID) — genau die Wahl des
+    /// früheren Einzelplan-Stores.
+    ///
+    /// # Errors
+    /// Lese-, Siegel- und ID-Fehler des **aktiven** Plans sowie ein
+    /// unlesbarer Index. Fehler inaktiver Pläne werden mit `warn!`
+    /// übersprungen.
+    fn load(root: &Path) -> PlanResult<LoadedCatalog> {
         let plans_root = root.join("plans");
+        let index = Self::read_index(root)?;
         if !plans_root.exists() {
-            return Ok(LoadedPlanState::empty());
+            return Ok(LoadedCatalog {
+                plans: Vec::new(),
+                active: None,
+            });
         }
 
-        let mut newest: Option<(RevisionId, PlanId, PathBuf)> = None;
+        // (Plan-ID, höchste Snapshot-Revision, Pfad dieses Snapshots)
+        let mut candidates: Vec<(PlanId, RevisionId, PathBuf)> = Vec::new();
         for entry in std::fs::read_dir(&plans_root)? {
             let entry = entry?;
             if !entry.file_type()?.is_dir() {
@@ -523,6 +587,7 @@ impl FilePlanStore {
                 );
                 continue;
             };
+            let mut newest: Option<(RevisionId, PathBuf)> = None;
             for file in std::fs::read_dir(entry.path())? {
                 let file = file?;
                 if !file.file_type()?.is_file() {
@@ -538,31 +603,91 @@ impl FilePlanStore {
                     continue;
                 };
                 let revision = RevisionId::new(number);
-                if newest.as_ref().is_none_or(|(current, current_id, _)| {
-                    revision > *current
-                        || (revision == *current && plan_id.as_str() > current_id.as_str())
-                }) {
-                    newest = Some((revision, plan_id.clone(), file.path()));
+                if newest
+                    .as_ref()
+                    .is_none_or(|(current, _)| revision > *current)
+                {
+                    newest = Some((revision, file.path()));
                 }
+            }
+            if let Some((revision, path)) = newest {
+                candidates.push((plan_id, revision, path));
             }
         }
 
-        let Some((file_revision, plan_id, snapshot_path)) = newest else {
-            return Ok(LoadedPlanState::empty());
+        // Aktiver Plan: laut Index, sonst die Wahl des Einzelplan-Stores.
+        let active = match &index {
+            Some(index) => index
+                .active_id()
+                .filter(|id| candidates.iter().any(|(candidate, _, _)| candidate == id)),
+            None => candidates
+                .iter()
+                .max_by(|(left_id, left_rev, _), (right_id, right_rev, _)| {
+                    left_rev
+                        .cmp(right_rev)
+                        .then_with(|| left_id.as_str().cmp(right_id.as_str()))
+                })
+                .map(|(id, _, _)| id.clone()),
         };
-        let bytes = std::fs::read(&snapshot_path)?;
-        let plan_dir = Self::plan_dir(root, &plan_id)?;
+
+        let mut plans = Vec::with_capacity(candidates.len());
+        for (plan_id, file_revision, snapshot_path) in candidates {
+            let is_active = active.as_ref() == Some(&plan_id);
+            match Self::load_plan(root, &plan_id, file_revision, &snapshot_path) {
+                Ok(loaded) => {
+                    let meta = index
+                        .as_ref()
+                        .map(|index| index.meta(&plan_id))
+                        .unwrap_or_default();
+                    plans.push(Slot {
+                        plan: loaded.plan,
+                        history: loaded.history,
+                        next_revision: loaded.next_revision,
+                        seal: loaded.seal,
+                        meta,
+                    });
+                }
+                Err(error) if is_active => return Err(error),
+                Err(error) => {
+                    warn!(
+                        plan_id = %plan_id,
+                        error = %error,
+                        "Inaktiver Plan ist nicht lesbar und wird übersprungen"
+                    );
+                }
+            }
+        }
+        plans.sort_by(|left, right| {
+            left.plan
+                .created_at
+                .cmp(&right.plan.created_at)
+                .then_with(|| left.plan.id.as_str().cmp(right.plan.id.as_str()))
+        });
+        Ok(LoadedCatalog { plans, active })
+    }
+
+    /// Lädt einen Plan aus seinem Verzeichnis: neuester Snapshot (gegen sein
+    /// Siegel geprüft, muss die ID seines Verzeichnisses tragen) plus alle
+    /// späteren History-Ereignisse.
+    fn load_plan(
+        root: &Path,
+        plan_id: &PlanId,
+        file_revision: RevisionId,
+        snapshot_path: &Path,
+    ) -> PlanResult<LoadedPlan> {
+        let bytes = std::fs::read(snapshot_path)?;
+        let plan_dir = Self::plan_dir(root, plan_id)?;
         let dir_sealed = seal::directory_is_sealed(&plan_dir)?;
-        let seal_link = seal::verify(&snapshot_path, file_revision.value(), &bytes, dir_sealed)?;
+        let seal_link = seal::verify(snapshot_path, file_revision.value(), &bytes, dir_sealed)?;
         let plan: Plan = serde_json::from_slice(&bytes)?;
-        if plan.id != plan_id {
+        if &plan.id != plan_id {
             return Err(PlanError::InvalidId {
                 field: "plan.id",
                 value: plan.id.into_inner(),
             });
         }
 
-        let history_path = Self::history_path(root, &plan_id)?;
+        let history_path = Self::history_path(root, plan_id)?;
         let history = if history_path.exists() {
             let reader = BufReader::new(std::fs::File::open(history_path)?);
             reader
@@ -599,13 +724,62 @@ impl FilePlanStore {
             .max(plan.revision)
             .max(history_revision)
             .next();
-        Ok(LoadedPlanState {
-            plan: Some(plan),
+        Ok(LoadedPlan {
+            plan,
             history,
-            plan_id: Some(plan_id),
             next_revision,
             seal: seal_link,
         })
+    }
+
+    /// `true`, wenn `dir` mindestens einen Snapshot `rev-<n>.json` enthält.
+    ///
+    /// Ein Verzeichnis ohne Snapshot (etwa Reste eines fehlgeschlagenen
+    /// ersten `Create`) blockiert ein neues `Create` derselben ID nicht.
+    fn dir_holds_snapshot(dir: &Path) -> PlanResult<bool> {
+        if !dir.is_dir() {
+            return Ok(false);
+        }
+        for entry in std::fs::read_dir(dir)? {
+            let entry = entry?;
+            let is_snapshot = entry
+                .file_name()
+                .to_str()
+                .and_then(|name| name.strip_prefix("rev-"))
+                .and_then(|rest| rest.strip_suffix(".json"))
+                .is_some_and(|number| number.parse::<u64>().is_ok());
+            if is_snapshot {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
+    /// Pfad des Katalog-Index.
+    fn index_path(root: &Path) -> PathBuf {
+        root.join(PLAN_INDEX_FILE)
+    }
+
+    /// Liest `plan-index.json`; `None`, wenn es ihn (noch) nicht gibt.
+    ///
+    /// # Errors
+    /// [`PlanError::Io`] / [`PlanError::Serde`] bei unlesbarem Index.
+    fn read_index(root: &Path) -> PlanResult<Option<PlanIndex>> {
+        let path = Self::index_path(root);
+        if !path.exists() {
+            return Ok(None);
+        }
+        let bytes = std::fs::read(&path)?;
+        Ok(Some(serde_json::from_slice(&bytes)?))
+    }
+
+    /// Schreibt `plan-index.json` atomar (Tmp-Datei + Rename + Verzeichnis-Sync).
+    ///
+    /// # Errors
+    /// [`PlanError::Io`] / [`PlanError::Serde`] bei Schreibfehler.
+    fn write_index(root: &Path, index: &PlanIndex) -> PlanResult<()> {
+        let bytes = serde_json::to_vec_pretty(index)?;
+        Self::stage_atomic_write(&Self::index_path(root), &bytes)?.commit()
     }
 
     /// Gibt das Plan-Verzeichnis zurück — erst nach Grammatikprüfung der ID.
@@ -806,47 +980,83 @@ impl FilePlanStore {
     }
 }
 
+impl FilePlanStore {
+    // Lese-Lock mit einheitlichem Fehler.
+    fn read_inner(&self) -> PlanResult<std::sync::RwLockReadGuard<'_, Inner>> {
+        self.inner
+            .read()
+            .map_err(|_| PlanError::Io(std::io::Error::other("RwLock vergiftet")))
+    }
+
+    // Schreib-Lock mit einheitlichem Fehler.
+    fn write_inner(&self) -> PlanResult<std::sync::RwLockWriteGuard<'_, Inner>> {
+        self.inner
+            .write()
+            .map_err(|_| PlanError::Io(std::io::Error::other("RwLock vergiftet")))
+    }
+
+    /// Wendet eine Katalogänderung an: RAM-Zustand ändern, neuen Index
+    /// dauerhaft schreiben; scheitert das Schreiben, werden Katalogdaten und
+    /// aktiver Plan auf den vorherigen Stand zurückgesetzt.
+    fn commit_catalog(inner: &mut Inner, change: impl FnOnce(&mut Inner)) -> PlanResult<()> {
+        let previous_meta: Vec<PlanMeta> = inner.plans.iter().map(|slot| slot.meta).collect();
+        let previous_active = inner.active.clone();
+        change(inner);
+        let index = inner.index();
+        if let Err(error) = Self::write_index(&inner.root, &index) {
+            for (slot, meta) in inner.plans.iter_mut().zip(previous_meta) {
+                slot.meta = meta;
+            }
+            inner.active = previous_active;
+            return Err(error);
+        }
+        Ok(())
+    }
+}
+
 impl PlanStore for FilePlanStore {
     fn current(&self) -> PlanResult<Plan> {
-        let inner = self
-            .inner
-            .read()
-            .map_err(|_| PlanError::Io(std::io::Error::other("RwLock vergiftet")))?;
-        inner.plan.clone().ok_or(PlanError::PlanNotFound)
+        let inner = self.read_inner()?;
+        inner
+            .active_slot()
+            .map(|slot| slot.plan.clone())
+            .ok_or(PlanError::PlanNotFound)
     }
 
     fn revision(&self) -> RevisionId {
         let inner = self.inner.read().unwrap_or_else(|e| e.into_inner());
-        match &inner.plan {
-            Some(p) => p.revision,
+        match inner.active_slot() {
+            Some(slot) => slot.plan.revision,
             None => RevisionId::new(0),
         }
     }
 
     fn apply(&self, action: PlanAction, actor: &str) -> PlanResult<PlanEvent> {
-        let mut inner = self
-            .inner
-            .write()
-            .map_err(|_| PlanError::Io(std::io::Error::other("RwLock vergiftet")))?;
+        let mut inner = self.write_inner()?;
 
         let now = OffsetDateTime::now_utc();
 
-        // `Create` legt an, es überschreibt nicht — auch nicht den beim Start
-        // aus `<root>/plans/` geladenen Plan.
+        // `Create` legt einen **weiteren** Plan an und macht ihn aktiv
+        // (Runde 5, Teil P). Eine vergebene ID — auch die eines beim Start
+        // geladenen oder archivierten Plans — wird abgelehnt: `Create`
+        // überschreibt nie.
         if let PlanAction::Create { plan_id, goal } = &action {
             self.config
                 .validate_action(&action, 0)
                 .map_err(PlanError::Config)?;
-            if let Some(existing) = inner.plan.as_ref() {
-                return Err(PlanError::PlanExists {
-                    id: existing.id.clone(),
-                });
-            }
-
             // Grammatik vor jedem Pfadzugriff (F-013/G-032).
             let plan_id = PlanId::parse(plan_id.as_str())?;
+            if inner.position_of(&plan_id).is_ok() {
+                return Err(PlanError::PlanExists { id: plan_id });
+            }
+            // Auch ein nicht ladbares Verzeichnis derselben ID (etwa ein
+            // übersprungener, beschädigter Plan) wird nicht überschrieben.
+            if Self::dir_holds_snapshot(&Self::plan_dir(&inner.root, &plan_id)?)? {
+                return Err(PlanError::PlanExists { id: plan_id });
+            }
+
             info!(plan_id = %plan_id, "Persistenten Plan erstellen");
-            let revision = inner.next_revision;
+            let revision = RevisionId::new(1);
             let plan = Plan {
                 id: plan_id.clone(),
                 revision,
@@ -864,33 +1074,53 @@ impl PlanStore for FilePlanStore {
                 applied_at: now,
             };
             let link = Self::publish(&inner.root, &plan, std::slice::from_ref(&event))?;
-            inner.next_revision = revision.next();
-            inner.plan = Some(plan);
-            inner.plan_id = Some(plan_id);
-            inner.seal = link;
-            inner.history.push(event.clone());
+            inner.plans.push(Slot {
+                plan,
+                history: vec![event.clone()],
+                next_revision: revision.next(),
+                seal: link,
+                meta: PlanMeta::default(),
+            });
+            inner.active = Some(plan_id.clone());
+            // Der Plan ist bereits dauerhaft; ein fehlgeschlagener
+            // Index-Write kostet nur die Aktiv-Markierung nach einem
+            // Neustart, deshalb hier nur `warn!`.
+            let index = inner.index();
+            if let Err(error) = Self::write_index(&inner.root, &index) {
+                warn!(
+                    plan_id = %plan_id,
+                    error = %error,
+                    "Plan-Index konnte nach Create nicht geschrieben werden"
+                );
+            }
             return Ok(event);
         }
 
-        let plan = inner.plan.as_ref().ok_or(PlanError::PlanNotFound)?;
-        let revision = inner.next_revision;
+        let Some(position) = inner.active_position() else {
+            return Err(PlanError::PlanNotFound);
+        };
+        let root = inner.root.clone();
+        let Some(slot) = inner.plans.get_mut(position) else {
+            return Err(PlanError::PlanNotFound);
+        };
+        let revision = slot.next_revision;
         // Validierung + Mutation auf einem Kandidaten — einzige Mutationsstelle,
         // geteilt mit `InMemoryPlanStore`. Sichtbar erst nach dem dauerhaften
         // History-Append.
         let (candidate, events) =
-            stage_actions(plan, vec![action], actor, &self.config, revision, now)
+            stage_actions(&slot.plan, vec![action], actor, &self.config, revision, now)
                 .map_err(|(_, error)| error)?;
-        let link = Self::publish(&inner.root, &candidate, &events)?;
+        let link = Self::publish(&root, &candidate, &events)?;
         let Some(event) = events.into_iter().next() else {
             return Err(PlanError::PlanNotFound);
         };
         debug!(revision = %revision, actor = actor, "Persistente Aktion angewendet");
-        inner.next_revision = revision.next();
-        inner.plan = Some(candidate);
+        slot.next_revision = revision.next();
+        slot.plan = candidate;
         if let Some(link) = link {
-            inner.seal = Some(link);
+            slot.seal = Some(link);
         }
-        inner.history.push(event.clone());
+        slot.history.push(event.clone());
         Ok(event)
     }
 
@@ -901,13 +1131,17 @@ impl PlanStore for FilePlanStore {
         actor: &str,
         expected_rev: RevisionId,
     ) -> PlanResult<PlanRevision> {
-        let mut inner = self
-            .inner
-            .write()
-            .map_err(|_| PlanError::Io(std::io::Error::other("RwLock vergiftet")))?;
+        let mut inner = self.write_inner()?;
         self.config.require_enabled().map_err(PlanError::Config)?;
 
-        let current = check_batch_target(inner.plan.as_ref(), plan, expected_rev)?;
+        let Some(position) = inner.active_position() else {
+            return Err(PlanError::PlanNotFound);
+        };
+        let root = inner.root.clone();
+        let Some(slot) = inner.plans.get_mut(position) else {
+            return Err(PlanError::PlanNotFound);
+        };
+        let current = check_batch_target(Some(&slot.plan), plan, expected_rev)?;
         if actions.is_empty() {
             return Ok(PlanRevision {
                 revision: current.revision,
@@ -921,7 +1155,7 @@ impl PlanStore for FilePlanStore {
             actions,
             actor,
             &self.config,
-            inner.next_revision,
+            slot.next_revision,
             now,
         )
         .map_err(|(index, source)| PlanError::BatchActionRejected {
@@ -929,14 +1163,14 @@ impl PlanStore for FilePlanStore {
             source: Box::new(source),
         })?;
 
-        let link = Self::publish(&inner.root, &candidate, &events)?;
+        let link = Self::publish(&root, &candidate, &events)?;
         let revision = candidate.revision;
-        inner.next_revision = revision.next();
-        inner.plan = Some(candidate);
+        slot.next_revision = revision.next();
+        slot.plan = candidate;
         if let Some(link) = link {
-            inner.seal = Some(link);
+            slot.seal = Some(link);
         }
-        inner.history.extend(events.iter().cloned());
+        slot.history.extend(events.iter().cloned());
         info!(
             plan_id = %plan,
             revision = %revision,
@@ -948,46 +1182,119 @@ impl PlanStore for FilePlanStore {
     }
 
     fn history(&self, since: Option<RevisionId>) -> PlanResult<Vec<PlanEvent>> {
-        let inner = self
-            .inner
-            .read()
-            .map_err(|_| PlanError::Io(std::io::Error::other("RwLock vergiftet")))?;
+        let inner = self.read_inner()?;
 
-        // Lese von Disk (history.jsonl) falls Plan-ID bekannt
-        if let Some(plan_id) = &inner.plan_id {
-            let path = Self::history_path(&inner.root, plan_id)?;
-            if !path.exists() {
-                return Ok(vec![]);
-            }
-            let f = std::fs::File::open(&path)?;
-            let reader = BufReader::new(f);
-            let mut events = Vec::new();
-            for line in reader.lines() {
-                let line = line?;
-                if line.trim().is_empty() {
-                    continue;
-                }
-                let ev: PlanEvent = serde_json::from_str(&line)?;
-                if let Some(since_rev) = since
-                    && ev.revision < since_rev
-                {
-                    continue;
-                }
-                events.push(ev);
-            }
-            return Ok(events);
-        }
+        // Ohne aktiven Plan gibt es keine History.
+        let Some(slot) = inner.active_slot() else {
+            return Ok(Vec::new());
+        };
 
-        // Fallback: RAM-Cache
-        Ok(match since {
-            None => inner.history.clone(),
-            Some(rev) => inner
+        // Lese von Disk (history.jsonl) des aktiven Plans; fehlt die Datei,
+        // gilt der RAM-Cache.
+        let path = Self::history_path(&inner.root, &slot.plan.id)?;
+        if !path.exists() {
+            return Ok(slot
                 .history
                 .iter()
-                .filter(|e| e.revision >= rev)
+                .filter(|event| since.is_none_or(|since_rev| event.revision >= since_rev))
                 .cloned()
-                .collect(),
-        })
+                .collect());
+        }
+        let f = std::fs::File::open(&path)?;
+        let reader = BufReader::new(f);
+        let mut events = Vec::new();
+        for line in reader.lines() {
+            let line = line?;
+            if line.trim().is_empty() {
+                continue;
+            }
+            let ev: PlanEvent = serde_json::from_str(&line)?;
+            if let Some(since_rev) = since
+                && ev.revision < since_rev
+            {
+                continue;
+            }
+            events.push(ev);
+        }
+        Ok(events)
+    }
+
+    fn list_plans(&self) -> PlanResult<Vec<PlanSummary>> {
+        let inner = self.read_inner()?;
+        Ok(inner
+            .plans
+            .iter()
+            .map(|slot| {
+                let active = inner.active.as_ref() == Some(&slot.plan.id);
+                PlanSummary::from_plan(&slot.plan, active, slot.meta)
+            })
+            .collect())
+    }
+
+    fn plan_by_id(&self, id: &PlanId) -> PlanResult<Plan> {
+        let inner = self.read_inner()?;
+        let position = inner.position_of(id)?;
+        inner
+            .plans
+            .get(position)
+            .map(|slot| slot.plan.clone())
+            .ok_or_else(|| PlanError::PlanUnknown { id: id.clone() })
+    }
+
+    fn plan_meta(&self, id: &PlanId) -> PlanResult<PlanMeta> {
+        let inner = self.read_inner()?;
+        let position = inner.position_of(id)?;
+        inner
+            .plans
+            .get(position)
+            .map(|slot| slot.meta)
+            .ok_or_else(|| PlanError::PlanUnknown { id: id.clone() })
+    }
+
+    fn switch_plan(&self, id: &PlanId, actor: &str) -> PlanResult<Plan> {
+        let mut inner = self.write_inner()?;
+        let position = inner.position_of(id)?;
+        let target = id.clone();
+        Self::commit_catalog(&mut inner, |inner| {
+            if let Some(slot) = inner.plans.get_mut(position) {
+                slot.meta.archived = false;
+            }
+            inner.active = Some(target);
+        })?;
+        info!(plan_id = %id, actor = actor, "Aktiven Plan gewechselt");
+        inner
+            .plans
+            .get(position)
+            .map(|slot| slot.plan.clone())
+            .ok_or_else(|| PlanError::PlanUnknown { id: id.clone() })
+    }
+
+    fn archive_plan(&self, id: &PlanId, actor: &str) -> PlanResult<()> {
+        let mut inner = self.write_inner()?;
+        let position = inner.position_of(id)?;
+        let target = id.clone();
+        Self::commit_catalog(&mut inner, |inner| {
+            if let Some(slot) = inner.plans.get_mut(position) {
+                slot.meta.archived = true;
+            }
+            if inner.active.as_ref() == Some(&target) {
+                inner.active = None;
+            }
+        })?;
+        info!(plan_id = %id, actor = actor, "Plan archiviert");
+        Ok(())
+    }
+
+    fn set_approval(&self, id: &PlanId, approval: PlanApproval, actor: &str) -> PlanResult<()> {
+        let mut inner = self.write_inner()?;
+        let position = inner.position_of(id)?;
+        Self::commit_catalog(&mut inner, |inner| {
+            if let Some(slot) = inner.plans.get_mut(position) {
+                slot.meta.approval = approval;
+            }
+        })?;
+        info!(plan_id = %id, actor = actor, approval = approval.label(), "Freigabestand gesetzt");
+        Ok(())
     }
 }
 
@@ -1184,9 +1491,10 @@ mod tests {
             "orchestrator",
         )?;
 
+        // Runde 5, Teil P: nur dieselbe ID wird abgelehnt.
         let result = store.apply(
             PlanAction::Create {
-                plan_id: PlanId::new("p-zweit"),
+                plan_id: PlanId::new("p-erst"),
                 goal: "darf nicht überschreiben".to_owned(),
             },
             "orchestrator",
@@ -1194,12 +1502,14 @@ mod tests {
 
         assert!(
             matches!(&result, Err(PlanError::PlanExists { id }) if id == &PlanId::new("p-erst")),
-            "ein zweites Create muss fail-closed abgelehnt werden, Ergebnis: {result:?}"
+            "ein zweites Create mit derselben ID muss abgelehnt werden, Ergebnis: {result:?}"
         );
         assert_eq!(store.current()?.id, PlanId::new("p-erst"));
-        assert!(
-            !dir.path().join("plans").join("p-zweit").exists(),
-            "das abgelehnte Create darf kein Plan-Verzeichnis anlegen"
+        assert_eq!(store.current()?.goal_statement, "erster Plan");
+        assert_eq!(
+            store.history(None)?.len(),
+            1,
+            "kein Event für das abgelehnte Create"
         );
         Ok(())
     }
@@ -1683,6 +1993,235 @@ mod tests {
 
         assert!(matches!(result, Err(PlanError::RevisionConflict { .. })));
         assert_eq!(history_lines(&dir, "p-conflict")?, 2);
+        Ok(())
+    }
+
+    // ── Runde 5, Teil P: Plan-Katalog ───────────────────────────────────────
+
+    fn create(store: &FilePlanStore, id: &str, goal: &str) -> TestResult {
+        store.apply(
+            PlanAction::Create {
+                plan_id: PlanId::new(id),
+                goal: goal.to_owned(),
+            },
+            "orchestrator",
+        )?;
+        Ok(())
+    }
+
+    #[test]
+    fn test_two_plans_in_a_row_survive_a_restart() -> TestResult {
+        let dir = TempDir::new()?;
+        {
+            let store = make_store(&dir)?;
+            create(&store, "plan-analyze", "automatische Analyse")?;
+            store.apply(
+                PlanAction::AddNode {
+                    node: make_node("t-a"),
+                },
+                "op:analyze",
+            )?;
+            // Genau der Fall aus dem Transkript: ein Auto-Plan blockiert
+            // das eigene `create` nicht mehr.
+            create(&store, "crypt-guard-hardening-v1", "Härtung")?;
+            assert_eq!(store.current()?.id, PlanId::new("crypt-guard-hardening-v1"));
+            assert_eq!(store.revision(), RevisionId::new(1));
+            assert!(
+                dir.path()
+                    .join("plans")
+                    .join("crypt-guard-hardening-v1")
+                    .join("rev-1.json")
+                    .exists(),
+                "jeder Plan beginnt mit eigenem Checkpoint rev-1"
+            );
+        }
+
+        let reloaded = make_store(&dir)?;
+        assert_eq!(
+            reloaded.current()?.id,
+            PlanId::new("crypt-guard-hardening-v1"),
+            "der aktive Plan kommt aus plan-index.json"
+        );
+        let analyze = reloaded.plan_by_id(&PlanId::new("plan-analyze"))?;
+        assert_eq!(analyze.nodes.len(), 1);
+        assert_eq!(reloaded.list_plans()?.len(), 2);
+        // Mutationen treffen nach dem Neustart den aktiven Plan.
+        reloaded.apply(
+            PlanAction::AddNode {
+                node: make_node("t-h"),
+            },
+            "orchestrator",
+        )?;
+        assert_eq!(reloaded.current()?.revision, RevisionId::new(2));
+        assert_eq!(
+            reloaded
+                .plan_by_id(&PlanId::new("plan-analyze"))?
+                .nodes
+                .len(),
+            1
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn test_switch_archive_and_list_are_persisted() -> TestResult {
+        let dir = TempDir::new()?;
+        {
+            let store = make_store(&dir)?;
+            create(&store, "p-a", "A")?;
+            create(&store, "p-b", "B")?;
+            store.switch_plan(&PlanId::new("p-a"), "human:test")?;
+            store.archive_plan(&PlanId::new("p-b"), "human:test")?;
+            store.set_approval(
+                &PlanId::new("p-a"),
+                crate::PlanApproval::Proposed,
+                "model:test",
+            )?;
+        }
+        let reloaded = make_store(&dir)?;
+        assert_eq!(reloaded.current()?.id, PlanId::new("p-a"));
+        let listed = reloaded.list_plans()?;
+        let ids: Vec<&str> = listed.iter().map(|summary| summary.id.as_str()).collect();
+        assert_eq!(ids, vec!["p-a", "p-b"]);
+        let b = reloaded.plan_meta(&PlanId::new("p-b"))?;
+        assert!(b.archived, "Archiv-Flag überlebt den Neustart");
+        assert_eq!(
+            reloaded.plan_meta(&PlanId::new("p-a"))?.approval,
+            crate::PlanApproval::Proposed
+        );
+        assert!(
+            dir.path()
+                .join("plans")
+                .join("p-b")
+                .join("rev-1.json")
+                .exists(),
+            "archivieren löscht nichts"
+        );
+
+        reloaded.archive_plan(&PlanId::new("p-a"), "human:test")?;
+        assert!(matches!(reloaded.current(), Err(PlanError::PlanNotFound)));
+        drop(reloaded);
+        let again = make_store(&dir)?;
+        assert!(
+            matches!(again.current(), Err(PlanError::PlanNotFound)),
+            "kein aktiver Plan bleibt auch nach dem Neustart so"
+        );
+        again.switch_plan(&PlanId::new("p-b"), "human:test")?;
+        assert!(!again.plan_meta(&PlanId::new("p-b"))?.archived);
+        assert!(matches!(
+            again.archive_plan(&PlanId::new("p-nix"), "human:test"),
+            Err(PlanError::PlanUnknown { .. })
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn test_legacy_single_plan_store_migrates_without_data_loss() -> TestResult {
+        let dir = TempDir::new()?;
+        {
+            let store = make_store(&dir)?;
+            create(&store, "p-alt", "Altbestand")?;
+            store.apply(
+                PlanAction::AddNode {
+                    node: make_node("t-1"),
+                },
+                "orchestrator",
+            )?;
+        }
+        // Altbestand nachbauen: vor Teil P gab es keinen Index.
+        let index_path = dir.path().join(crate::catalog::PLAN_INDEX_FILE);
+        std::fs::remove_file(&index_path)?;
+
+        let migrated = make_store(&dir)?;
+        let plan = migrated.current()?;
+        assert_eq!(plan.id, PlanId::new("p-alt"));
+        assert_eq!(plan.nodes.len(), 1, "Knoten aus der History nachgespielt");
+        assert_eq!(migrated.history(None)?.len(), 2);
+        let meta = migrated.plan_meta(&PlanId::new("p-alt"))?;
+        assert_eq!(
+            meta,
+            crate::PlanMeta::default(),
+            "Altbestand gilt als bestätigt"
+        );
+        assert!(
+            !index_path.exists(),
+            "das Lesen eines Altbestands schreibt nichts"
+        );
+
+        // Das erste neue `create` klappt und schreibt den Index.
+        create(&migrated, "p-neu", "neu")?;
+        assert!(index_path.exists());
+        assert_eq!(migrated.list_plans()?.len(), 2);
+        Ok(())
+    }
+
+    #[test]
+    fn test_legacy_store_with_two_plan_dirs_activates_the_newest() -> TestResult {
+        let dir = TempDir::new()?;
+        {
+            let store = make_store(&dir)?;
+            create(&store, "p-klein", "klein")?;
+            create(&store, "p-gross", "groß")?;
+            for id in ["t-1", "t-2"] {
+                store.apply(
+                    PlanAction::AddNode {
+                        node: make_node(id),
+                    },
+                    "orchestrator",
+                )?;
+            }
+            // Checkpoint erzwingen, damit p-gross die höchste Snapshot-
+            // Revision trägt (Status-Terminal ist ein Checkpoint-Auslöser).
+            store.apply(
+                PlanAction::SetStatus {
+                    id: TaskId::new("t-1"),
+                    status: PlanNodeStatus::Superseded,
+                    reason: None,
+                },
+                "orchestrator",
+            )?;
+            store.switch_plan(&PlanId::new("p-klein"), "human:test")?;
+        }
+        std::fs::remove_file(dir.path().join(crate::catalog::PLAN_INDEX_FILE))?;
+
+        let migrated = make_store(&dir)?;
+        assert_eq!(
+            migrated.current()?.id,
+            PlanId::new("p-gross"),
+            "ohne Index gilt die Wahl des Einzelplan-Stores (höchste Revision)"
+        );
+        assert!(migrated.plan_by_id(&PlanId::new("p-klein")).is_ok());
+        Ok(())
+    }
+
+    #[test]
+    fn test_corrupt_inactive_plan_is_skipped_but_not_overwritten() -> TestResult {
+        let dir = TempDir::new()?;
+        {
+            let store = make_store(&dir)?;
+            create(&store, "p-kaputt", "wird beschädigt")?;
+            create(&store, "p-gut", "bleibt aktiv")?;
+        }
+        std::fs::write(
+            dir.path().join("plans").join("p-kaputt").join("rev-1.json"),
+            b"{ manipuliert",
+        )?;
+        let store = make_store(&dir)?;
+        assert_eq!(store.current()?.id, PlanId::new("p-gut"));
+        assert!(matches!(
+            store.plan_by_id(&PlanId::new("p-kaputt")),
+            Err(PlanError::PlanUnknown { .. })
+        ));
+        assert!(matches!(
+            store.apply(
+                PlanAction::Create {
+                    plan_id: PlanId::new("p-kaputt"),
+                    goal: "überschreiben?".to_owned(),
+                },
+                "orchestrator",
+            ),
+            Err(PlanError::PlanExists { .. })
+        ));
         Ok(())
     }
 }

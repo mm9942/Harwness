@@ -136,8 +136,10 @@ use harw_authority::{Permission, PermissionRequest, PermissionSet, SandboxSpec};
 use harw_core::cancel::CancelToken;
 use harw_core::child_controller::{
     AgentBudget, CHILD_RETURN_MAX_BYTES, ChildRegistryFactory, ChildRunResult, JoinSemantics,
-    ManagedAgentSpawner, cap_child_return_text,
+    ManagedAgentSpawner, cap_child_return_text_for_child,
 };
+// Runde 5, Teil J: Übergabe-Verdichtung und Fortsetzung am Budget-Ende.
+use harw_core::child_handoff::{BudgetHandoff, ContinuationSeed};
 use harw_core::turn_loop::{TurnInput, TurnOutcome};
 use harw_core::{ModelMessage, StateStore};
 use harw_types::{ReasoningEffort, SessionId};
@@ -598,20 +600,28 @@ impl AgentToolAdapter {
                 "AgentToolAdapter: Reasoning-Effort für Child geklammert"
             );
 
+            // Runde 5, Teil J: eine Fortsetzung (`continue_from` in `args`,
+            // bei der Admission geprüft und gebunden) startet mit ihrem
+            // hinterlegten Auftrag — Übergabe als erster Kontext.
+            let turn_input = if spawner.continuation_link(&child).is_some() {
+                TurnInput::default()
+            } else {
+                TurnInput::user(args.to_string())
+            };
             let run_result = spawner
-                .run_child_with_budget(
-                    &child,
-                    store.as_ref(),
-                    None,
-                    TurnInput::user(args.to_string()),
-                    budget,
-                )
+                .run_child_with_budget(&child, store.as_ref(), None, turn_input, budget)
                 .await
                 .map_err(|e| {
-                    OpError::NotAvailable(format!(
-                        "Child-Agent-Ausführung fehlgeschlagen (child={child}, role='{role}', \
-                         allow_pause={allow_pause}): {e}"
-                    ))
+                    // Runde 5, Teil M: Endbericht (Journal, ggf. Übergabe)
+                    // statt eines nackten Fehlers.
+                    with_child_end_report(
+                        spawner.as_ref(),
+                        &child,
+                        OpError::NotAvailable(format!(
+                            "Child-Agent-Ausführung fehlgeschlagen (child={child}, role='{role}', \
+                             allow_pause={allow_pause}): {e}"
+                        )),
+                    )
                 })?;
 
             match &run_result.outcome {
@@ -624,7 +634,11 @@ impl AgentToolAdapter {
                     };
                     Ok(OpOutput {
                         text,
-                        data: Some(json!({ "budget_exhausted": true })),
+                        // Runde 5, Teil J: wie das Ergebnis entstand.
+                        data: Some(json!({
+                            "budget_exhausted": true,
+                            "handoff": handoff_label(&run_result),
+                        })),
                     })
                 }
                 TurnOutcome::Completed => {
@@ -677,22 +691,30 @@ impl AgentToolAdapter {
                         reason = ?reason,
                         "AgentToolAdapter: Child-Agent-Turn abgebrochen"
                     );
-                    Err(OpError::Execution(format!(
-                        "Child-Agent '{}' (Rolle '{role}') wurde abgebrochen (reason={reason:?})",
-                        run_result.child
-                    )))
+                    Err(with_child_end_report(
+                        spawner.as_ref(),
+                        &run_result.child,
+                        OpError::Execution(format!(
+                            "Child-Agent '{}' (Rolle '{role}') wurde abgebrochen (reason={reason:?})",
+                            run_result.child
+                        )),
+                    ))
                 }
                 TurnOutcome::Truncated => {
                     tracing::warn!(
                         child = %run_result.child,
                         "AgentToolAdapter: Child-Agent-Antwort abgeschnitten"
                     );
-                    Err(OpError::Execution(format!(
-                        "Child-Agent '{}' (Rolle '{role}') brach durch Abschneiden der \
-                         Modellausgabe (max_tokens/Kontextfenster) ab, bevor etwaige Tool-Calls \
-                         der Antwort ausgeführt wurden",
-                        run_result.child
-                    )))
+                    Err(with_child_end_report(
+                        spawner.as_ref(),
+                        &run_result.child,
+                        OpError::Execution(format!(
+                            "Child-Agent '{}' (Rolle '{role}') brach durch Abschneiden der \
+                             Modellausgabe (max_tokens/Kontextfenster) ab, bevor etwaige \
+                             Tool-Calls der Antwort ausgeführt wurden",
+                            run_result.child
+                        )),
+                    ))
                 }
                 TurnOutcome::Refused { detail } => {
                     tracing::warn!(
@@ -700,10 +722,15 @@ impl AgentToolAdapter {
                         detail = ?detail,
                         "AgentToolAdapter: Child-Agent-Antwort abgelehnt"
                     );
-                    Err(OpError::Execution(format!(
-                        "Child-Agent '{}' (Rolle '{role}') lehnte die Antwort ab (detail={detail:?})",
-                        run_result.child
-                    )))
+                    Err(with_child_end_report(
+                        spawner.as_ref(),
+                        &run_result.child,
+                        OpError::Execution(format!(
+                            "Child-Agent '{}' (Rolle '{role}') lehnte die Antwort ab \
+                             (detail={detail:?})",
+                            run_result.child
+                        )),
+                    ))
                 }
                 TurnOutcome::Failed { reason } => {
                     tracing::warn!(
@@ -711,10 +738,15 @@ impl AgentToolAdapter {
                         reason = %reason,
                         "AgentToolAdapter: Child-Agent-Wiederaufnahme gescheitert"
                     );
-                    Err(OpError::Execution(format!(
-                        "Child-Agent '{}' (Rolle '{role}') scheiterte endgültig (reason={reason})",
-                        run_result.child
-                    )))
+                    Err(with_child_end_report(
+                        spawner.as_ref(),
+                        &run_result.child,
+                        OpError::Execution(format!(
+                            "Child-Agent '{}' (Rolle '{role}') scheiterte endgültig \
+                             (reason={reason})",
+                            run_result.child
+                        )),
+                    ))
                 }
             }
             // Bei `Completed` fällt `slot` hier — nach der Auswertung.
@@ -841,6 +873,25 @@ impl AgentProductAdapter {
                 })
             }
         }
+    }
+}
+
+/// Runde 5, Teil M: ergänzt den Fehler eines nicht regulär beendeten Kindes
+/// um seinen Endbericht (Status, Grund, Journal-Kurzfassung, ggf.
+/// Übergabe). Ohne Bericht bleibt der Fehler unverändert.
+fn with_child_end_report(
+    spawner: &harw_core::child_controller::ManagedAgentSpawner,
+    child: &harw_types::SessionId,
+    error: OpError,
+) -> OpError {
+    let Some(report) = spawner.child_end_report(child) else {
+        return error;
+    };
+    let text = report.to_parent_text();
+    match error {
+        OpError::Execution(message) => OpError::Execution(format!("{message}\n\n{text}")),
+        OpError::NotAvailable(message) => OpError::NotAvailable(format!("{message}\n\n{text}")),
+        other => other,
     }
 }
 
@@ -1032,7 +1083,7 @@ fn full_child_return_text(
 ///
 /// # Description
 /// Liegt [`ChildRunResult::full_text`] vor, wird er hier über
-/// [`cap_child_return_text`] gekappt; sonst gilt der Text von
+/// [`cap_child_return_text_for_child`] gekappt; sonst gilt der Text von
 /// [`ManagedAgentSpawner::child_final_assistant_text`] unverändert.
 ///
 /// # Errors
@@ -1042,7 +1093,12 @@ fn plain_child_return_text(
     result: &ChildRunResult,
 ) -> Result<String, harw_extension_api::AgentSpawnError> {
     match &result.full_text {
-        Some(text) => Ok(cap_child_return_text(text, CHILD_RETURN_MAX_BYTES)),
+        // Runde 5, Teil H: die Kürzungsmarke nennt `agent.result` mit der Kind-ID.
+        Some(text) => Ok(cap_child_return_text_for_child(
+            text,
+            CHILD_RETURN_MAX_BYTES,
+            &result.child,
+        )),
         None => spawner.child_final_assistant_text(&result.child),
     }
 }
@@ -2142,6 +2198,41 @@ pub async fn fanout_children(
     join: JoinSemantics,
     contract: ChildReturnContract,
 ) -> Result<Vec<Result<Value, String>>, OpError> {
+    fanout_children_with(
+        ctx,
+        role,
+        questions,
+        authority_reducer,
+        budget,
+        max_parallel,
+        join,
+        contract,
+        None,
+    )
+    .await
+}
+
+/// Wie [`fanout_children`]; mit `continuation` (Runde 5, Teil J) wird jedes
+/// frisch admittierte Kind vor seinem ersten Lauf als Fortsetzung eines
+/// budget-beendeten Vorgängers gebunden
+/// ([`ManagedAgentSpawner::bind_continuation`]: gleicher Elternteil, gleiche
+/// Rolle, keine weitere Sandbox, Kettengrenze). Scheitert die Bindung, wird
+/// das Kind freigegeben, ohne zu laufen, und seine Position ist ein `Err`.
+///
+/// # Errors
+/// Wie [`fanout_children`].
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn fanout_children_with(
+    ctx: &OpContext,
+    role: &str,
+    questions: &[Value],
+    authority_reducer: &str,
+    budget: AgentBudget,
+    max_parallel: usize,
+    join: JoinSemantics,
+    contract: ChildReturnContract,
+    continuation: Option<&ContinuationSeed>,
+) -> Result<Vec<Result<Value, String>>, OpError> {
     if questions.is_empty() {
         return Ok(Vec::new());
     }
@@ -2188,6 +2279,7 @@ pub async fn fanout_children(
         budget,
         contract,
         winner: &winner,
+        continuation,
     };
 
     let mut results: Vec<Option<Result<Value, String>>> = (0..total).map(|_| None).collect();
@@ -2284,6 +2376,8 @@ struct FanoutShared<'a> {
     contract: ChildReturnContract,
     /// Gesetzt, sobald bei `AnyTerminal` ein Gewinner feststeht.
     winner: &'a AtomicBool,
+    /// Runde 5, Teil J: bindet jedes Kind als Fortsetzung dieses Vorgängers.
+    continuation: Option<&'a ContinuationSeed>,
 }
 
 impl FanoutShared<'_> {
@@ -2366,6 +2460,17 @@ async fn run_fanout_slot(
     if shared.sibling_won() {
         return Err(CANCELLED_BY_SIBLING.to_owned());
     }
+    // Runde 5, Teil J: eine Fortsetzung wird vor ihrem ersten Lauf gebunden;
+    // scheitert das, gibt `slot` das Kind frei, ohne dass es läuft.
+    if let Some(seed) = shared.continuation {
+        shared
+            .spawner
+            .bind_continuation(&child, seed)
+            .map_err(|error| {
+                tracing::warn!(child = %child, error = %error, "agent_fanout.continuation_refused");
+                error.message
+            })?;
+    }
 
     // Fail-closed: ohne Admission-Record wäre `unwrap_or_default` „kein Limit".
     let ir_budget = shared
@@ -2391,7 +2496,16 @@ async fn run_fanout_slot(
             effective,
         )
         .await
-        .map_err(|error| format!("Child-Ausführung fehlgeschlagen: {error}"))?;
+        .map_err(|error| {
+            // Runde 5, Teil M: Endbericht (Journal, ggf. Übergabe) anhängen.
+            match shared.spawner.child_end_report(&child) {
+                Some(report) => format!(
+                    "Child-Ausführung fehlgeschlagen: {error}\n\n{}",
+                    report.to_parent_text()
+                ),
+                None => format!("Child-Ausführung fehlgeschlagen: {error}"),
+            }
+        })?;
     if shared.sibling_won() {
         return Err(CANCELLED_BY_SIBLING.to_owned());
     }
@@ -2546,6 +2660,12 @@ const BUDGET_EXHAUSTED_NOTE: &str =
 ///   `/explore` es wie jedes Finding weiterverarbeiten können;
 /// - [`ChildReturnContract::Text`]: der Freitext mit vorangestelltem Hinweis;
 /// - sonst ein Objekt `{"budget_exhausted": true, "partial_result": …}`.
+///
+/// Runde 5, Teil J: jedes Objekt trägt zusätzlich `"handoff"`
+/// (`"compacted"`/`"last_answer"`). Bei `compacted` ist `full_text` die
+/// markierte Übergabe-Verdichtung: beim Contract `Text` geht sie unverändert
+/// zurück (sie trägt ihre Markierung selbst), bei `ResearchFinding` wird sie
+/// die `conclusion`, sonst `partial_result`.
 fn budget_exhausted_value(
     contract: ChildReturnContract,
     result: &ChildRunResult,
@@ -2553,28 +2673,40 @@ fn budget_exhausted_value(
     question: &Value,
 ) -> Value {
     let partial = result.full_text.clone().unwrap_or_default();
-    let partial = cap_child_return_text(&partial, CHILD_RETURN_MAX_BYTES);
+    // Runde 5, Teil H: die Kürzungsmarke nennt `agent.result` mit der Kind-ID.
+    let partial = cap_child_return_text_for_child(&partial, CHILD_RETURN_MAX_BYTES, &result.child);
+    let handoff = handoff_label(result);
+    let compacted = result.budget_handoff == Some(BudgetHandoff::Compacted);
     tracing::warn!(
         child = %result.child,
         role,
         contract = contract.as_label(),
         partial_bytes = partial.len(),
+        handoff,
         "agent_fanout.budget_exhausted_partial_result"
     );
-    if contract != ChildReturnContract::Text
+    // Runde 5, Teil J: eine verdichtete Übergabe ist Markdown, nie ein
+    // Vertragsobjekt — sie wird nicht erst gegen den Contract geparst.
+    if !compacted
+        && contract != ChildReturnContract::Text
         && let Ok(Value::Object(mut map)) = evaluate_child_return(contract, &partial)
     {
         map.insert("budget_exhausted".to_owned(), Value::Bool(true));
+        map.insert("handoff".to_owned(), json!(handoff));
         return Value::Object(map);
     }
     match contract {
+        // Die Übergabe trägt ihre Markierung selbst (`HANDOFF_MARKER`).
+        ChildReturnContract::Text if compacted => Value::String(partial),
         ChildReturnContract::Text => Value::String(if partial.is_empty() {
             format!("[budget_exhausted: true] {BUDGET_EXHAUSTED_NOTE}; keine Antwort vorhanden.")
         } else {
             format!("[budget_exhausted: true] {BUDGET_EXHAUSTED_NOTE}.\n\n{partial}")
         }),
         ChildReturnContract::ResearchFinding => {
-            let conclusion = if partial.trim().is_empty() {
+            let conclusion = if compacted {
+                partial.clone()
+            } else if partial.trim().is_empty() {
                 format!("{BUDGET_EXHAUSTED_NOTE}; das Kind hat noch keine Antwort geliefert.")
             } else {
                 format!("Teilergebnis ({BUDGET_EXHAUSTED_NOTE}):\n{partial}")
@@ -2602,15 +2734,31 @@ fn budget_exhausted_value(
             match serde_json::to_value(&finding) {
                 Ok(Value::Object(mut map)) => {
                     map.insert("budget_exhausted".to_owned(), Value::Bool(true));
+                    map.insert("handoff".to_owned(), json!(handoff));
                     Value::Object(map)
                 }
-                _ => json!({ "budget_exhausted": true, "partial_result": partial }),
+                _ => json!({
+                    "budget_exhausted": true,
+                    "handoff": handoff,
+                    "partial_result": partial,
+                }),
             }
         }
-        ChildReturnContract::ReturnEnvelope | ChildReturnContract::SecurityVerdict => {
-            json!({ "budget_exhausted": true, "partial_result": partial })
-        }
+        ChildReturnContract::ReturnEnvelope | ChildReturnContract::SecurityVerdict => json!({
+            "budget_exhausted": true,
+            "handoff": handoff,
+            "partial_result": partial,
+        }),
     }
+}
+
+/// Runde 5, Teil J: das Label, wie das Ergebnis eines budget-beendeten
+/// Kindes entstand (`"compacted"` oder `"last_answer"`).
+fn handoff_label(result: &ChildRunResult) -> &'static str {
+    result
+        .budget_handoff
+        .unwrap_or(BudgetHandoff::LastAnswer)
+        .as_str()
 }
 
 // ── Contract-/Belegungsauswertung mit Ein-Versuch-Reparatur ─────────────────
@@ -4774,7 +4922,94 @@ contract = "{contract}"
             full_text: text.map(ToOwned::to_owned),
             usage: harw_core::child_controller::ChildUsage::default(),
             budget_exhausted: true,
+            budget_handoff: Some(harw_core::child_handoff::BudgetHandoff::LastAnswer),
         }
+    }
+
+    /// Runde 5, Teil J: ein budget-beendetes Kind mit verdichteter Übergabe.
+    fn compacted_run(text: &str) -> harw_core::child_controller::ChildRunResult {
+        harw_core::child_controller::ChildRunResult {
+            budget_handoff: Some(harw_core::child_handoff::BudgetHandoff::Compacted),
+            ..exhausted_run(Some(text))
+        }
+    }
+
+    fn handoff_text() -> String {
+        format!(
+            "{} Budget erreicht – Übergabe-Zusammenfassung (verdichtet aus 3 Modellrunden, 2 \
+             Tool-Aufrufen)\n\n## Auftrag\nA\n## Offene Punkte\n- B",
+            harw_core::child_handoff::HANDOFF_MARKER
+        )
+    }
+
+    #[test]
+    fn a_compacted_text_handoff_goes_back_unchanged_with_its_marker() {
+        let text = handoff_text();
+        let value = super::budget_exhausted_value(
+            super::ChildReturnContract::Text,
+            &compacted_run(&text),
+            "worker",
+            &serde_json::Value::Null,
+        );
+        // Unverändert — also ohne den Teilergebnis-Präfix davor.
+        assert_eq!(value.as_str(), Some(text.as_str()));
+    }
+
+    #[test]
+    fn a_compacted_research_handoff_becomes_a_marked_finding() -> TestResult {
+        let question = serde_json::json!({ "question": { "id": "q-9", "text": "Wo?" } });
+        let value = super::budget_exhausted_value(
+            super::ChildReturnContract::ResearchFinding,
+            &compacted_run(&handoff_text()),
+            "explorer",
+            &question,
+        );
+        assert_eq!(
+            value.get("handoff"),
+            Some(&serde_json::Value::from("compacted"))
+        );
+        assert_eq!(
+            value.get("budget_exhausted"),
+            Some(&serde_json::Value::Bool(true))
+        );
+        super::bind_finding_to_question(&value, &question).map_err(TestError::Unexpected)?;
+        let finding: harw_research::ResearchFinding = serde_json::from_value(value)
+            .map_err(|error| TestError::Unexpected(error.to_string()))?;
+        assert!(
+            finding
+                .conclusion
+                .starts_with(harw_core::child_handoff::HANDOFF_MARKER)
+        );
+        assert!(finding.conclusion.contains("## Offene Punkte"));
+        Ok(())
+    }
+
+    #[test]
+    fn a_typed_handoff_names_how_it_was_produced() {
+        let compacted = super::budget_exhausted_value(
+            super::ChildReturnContract::ReturnEnvelope,
+            &compacted_run(&handoff_text()),
+            "worker",
+            &serde_json::Value::Null,
+        );
+        assert_eq!(
+            compacted.get("handoff"),
+            Some(&serde_json::Value::from("compacted"))
+        );
+        let fallback = super::budget_exhausted_value(
+            super::ChildReturnContract::ReturnEnvelope,
+            &exhausted_run(Some("halb")),
+            "worker",
+            &serde_json::Value::Null,
+        );
+        assert_eq!(
+            fallback.get("handoff"),
+            Some(&serde_json::Value::from("last_answer"))
+        );
+        assert_eq!(
+            fallback.get("partial_result"),
+            Some(&serde_json::Value::from("halb"))
+        );
     }
 
     #[test]

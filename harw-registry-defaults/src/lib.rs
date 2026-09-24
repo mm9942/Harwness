@@ -75,9 +75,12 @@ pub mod workbench_tools;
 mod test_support;
 
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use harw_extension_api::allow_rules::{AllowRuleSet, RuleDecision};
 use harw_extension_api::approval_mode::ApprovalModeCell;
+// Runde 5, Teil E: Naht zum Auto-Modus-Klassifizierer.
+use harw_extension_api::auto_mode::AutoApprovalGate;
 use harw_extension_api::{
     ApprovalDecision, ApprovalHandler, ApprovalMode, ExtFuture, ExtensionRegistry, ToolCall,
 };
@@ -224,6 +227,41 @@ pub const AUTO_APPROVED_TOOLS: &[&str] = &[
     "diary.read",
     "palace.search",
     "palace.recall",
+    // Runde 5, Teil H: `agent.result` (`harw-core-bridge::AgentResultOperation`,
+    // `model_tool(readonly, approval = "none")`) liest nur den bereits
+    // erzeugten Antworttext eines **eigenen** Kindes aus dem Ergebnisarchiv
+    // des Spawners; die Eltern-Kind-Bindung prüft der Spawner, nicht das
+    // Modell. Registriert über die Composition-Root
+    // (`profile::CHILD_RESULT_TOOLS`), nie über ein `RegistryProfile`.
+    "agent.result",
+    // Runde 5, Teil K: `agent.status` (`harw-core-bridge::AgentStatusOperation`,
+    // `model_tool(readonly, approval = "none")`) liest nur das Register der
+    // eigenen Hintergrund-Agenten (Status, Fortschritt); die Eltern-Kind-
+    // Bindung prüft der Spawner. Nur Wurzel, nur TUI (Composition-Root).
+    // `agent.cancel` steht bewusst NICHT hier, sondern in `ALWAYS_ASK_TOOLS`.
+    "agent.status",
+    // Runde 5, Teil M: `agent.message`/`parent.message`
+    // (`harw-core-bridge::agent_messaging`, `model_tool(readonly,
+    // approval = "none")`) transportieren nur Text zwischen direkt
+    // verbundenen Sitzungen (eigenes, laufendes Kind bzw. direkter
+    // Elternteil; Bindung prüft der Spawner, 4-KiB-Deckel, begrenzte
+    // Postfächer, Rate-Limit). Keine Schreibwirkung auf Workspace, Host oder
+    // Netz, keine Rechte-Erweiterung — Nutzerentscheidung: keine
+    // Freigabepflicht, nie in `ALWAYS_ASK_TOOLS`.
+    "agent.message",
+    "parent.message",
+    // Runde 5, Teil F: `ask_user` (`harw-tool-plan`) liest nur die Antwort der
+    // Nutzerin aus einem eigenen Auswahlfenster; es schreibt nichts, startet
+    // nichts und geht nicht ins Netz. Nur Wurzel, nur TUI (sonst
+    // fail-closed).
+    "ask_user",
+    // Runde 5 (Integration, Nutzerwunsch „wie Claude Code“): `plan.write`
+    // schreibt ausschließlich die Plan-Datei unter `.harw/plans/<slug>.md`
+    // (Slug-Grammatik, Symlink-Sperre, 256-KiB-Deckel, harw-tool-plan) und
+    // lehnt außerhalb des Plan-Modus ab. Kein Workspace-Quellcode, kein
+    // Prozess, kein Netz — deshalb ohne Rückfrage unter `Delegated`/`Full`
+    // (die Plan-Stufe nutzt `Delegated`). Unter `AlwaysAsk` fragt es weiter.
+    "plan.write",
     // Bewusst entfernt (W1-05, Register F-014, G-003, G-004, F-043, G-068):
     // - `plan`, `goal`: deklarieren `model_tool(approval = "always")` und
     //   mutieren PlanStore bzw. Ziel; die Auto-Freigabe überstimmte die
@@ -280,11 +318,23 @@ pub const AUTO_APPROVED_TOOLS: &[&str] = &[
 /// Schickt SIGKILL an Host-Prozesse — nicht umkehrbar. Deshalb fragt es wie
 /// die beiden Agenten-Werkzeuge immer, auch unter `FullAccess` und trotz
 /// passender Allow-Regel.
+///
+/// # `host.sudo_exec`
+/// Führt einen Root-Befehl über `sudo` aus (Runde 5, Teil B). Neben dem
+/// eigenen TUI-Freigabefenster (Passwort/„Freigeben“) fragt es wie
+/// `process.kill` immer auch über die normale Freigabe — eine Allow-Regel
+/// oder `FullAccess` kann das nie überspringen.
 pub const ALWAYS_ASK_TOOLS: &[&str] = &[
     "agents.write_uia",
     "agents.commit_proposal",
     "skills.commit_proposal",
     "process.kill",
+    // Runde 5, Teil B: Root-Befehl über sudo — fragt zusätzlich zum eigenen
+    // TUI-Fenster immer über die normale Freigabe.
+    "host.sudo_exec",
+    // Runde 5, Teil K: Abbruch eines eigenen Hintergrund-Agenten — nie
+    // automatisch, auch nicht im Voll- oder Auto-Modus.
+    "agent.cancel",
 ];
 
 /// Default approval boundary for the built-in coding-agent tool set.
@@ -326,6 +376,10 @@ pub struct DefaultApprovalPolicy {
     /// Geteilte Freigaberegeln (`/permissions` „nicht mehr fragen“, Contract
     /// §2/§4); leer, wenn [`Self::new`] ohne eigene Regelmenge gebaut wurde.
     rules: AllowRuleSet,
+    /// Runde 5, Teil E: das Auto-Modus-Gate (Vorfilter + Klassifizierer aus
+    /// `harw-runtime`). `None` = bisheriges Verhalten (`auto` fragt bei
+    /// allem außerhalb von [`AUTO_APPROVED_TOOLS`]).
+    auto_gate: Option<Arc<dyn AutoApprovalGate>>,
 }
 
 impl Default for DefaultApprovalPolicy {
@@ -376,7 +430,32 @@ impl DefaultApprovalPolicy {
     /// Die Politik; hält nur Zeiger auf beide geteilten Zellen.
     #[must_use]
     pub fn with_rules(mode: ApprovalModeCell, rules: AllowRuleSet) -> Self {
-        Self { mode, rules }
+        Self {
+            mode,
+            rules,
+            auto_gate: None,
+        }
+    }
+
+    /// Runde 5, Teil E: hängt das Auto-Modus-Gate an.
+    ///
+    /// # Beschreibung
+    /// Das Gate wird **nur** im Modus [`ApprovalMode::Delegated`] befragt und
+    /// **nur** für Aufrufe, für die diese Politik sonst
+    /// [`ApprovalDecision::AskUser`] liefern würde (nicht in
+    /// [`AUTO_APPROVED_TOOLS`], nicht in [`ALWAYS_ASK_TOOLS`], keine
+    /// passende Regel). Es kann also nie mehr erlauben als „diese eine
+    /// Rückfrage entfällt"; `ALWAYS_ASK_TOOLS` erreichen es nie.
+    ///
+    /// # Arguments
+    /// - `gate` (`Arc<dyn AutoApprovalGate>`): das Gate der Sitzung.
+    ///
+    /// # Returns
+    /// Die Politik mit Gate.
+    #[must_use]
+    pub fn with_auto_gate(mut self, gate: Arc<dyn AutoApprovalGate>) -> Self {
+        self.auto_gate = Some(gate);
+        self
     }
 
     /// Returns whether `call` must be explicitly approved before dispatch.
@@ -417,7 +496,10 @@ impl ApprovalHandler for DefaultApprovalPolicy {
     ///    - [`ApprovalMode::AlwaysAsk`]: jeder Aufruf wird bestätigt, auch ein
     ///      lesender.
     ///    - [`ApprovalMode::Delegated`]: die Voreinstellung —
-    ///      [`AUTO_APPROVED_TOOLS`] läuft durch, alles andere fragt.
+    ///      [`AUTO_APPROVED_TOOLS`] läuft durch, alles andere fragt. Runde 5,
+    ///      Teil E: ist ein Auto-Modus-Gate angehängt
+    ///      ([`Self::with_auto_gate`]), entscheidet statt der Rückfrage sein
+    ///      Urteil (`allow` → `Allow`, `ask` → `AskUser`, `deny` → `Deny`).
     ///    - [`ApprovalMode::FullAccess`]: nichts fragt.
     ///
     /// Regeln und Modus werden bei **jedem** Aufruf frisch gelesen, damit eine
@@ -430,10 +512,24 @@ impl ApprovalHandler for DefaultApprovalPolicy {
             return Box::pin(async { ApprovalDecision::AskUser(Default::default()) });
         }
         let rule_decision = self.rules.evaluate(call.name.as_str(), &call.arguments);
-        let requires_approval = match self.mode.get() {
+        let mode = self.mode.get();
+        let requires_approval = match mode {
             ApprovalMode::AlwaysAsk => true,
             ApprovalMode::Delegated => Self::requires_explicit_approval(call),
             ApprovalMode::FullAccess => false,
+        };
+        // Runde 5, Teil F: `plan.exit`, `plan.enter` und `ask_user` öffnen ein
+        // eigenes Fenster; ihre Ausführung IST die Rückfrage an die Nutzerin
+        // und wirkt ohne deren Antwort nicht. Eine zusätzliche Freigabe davor
+        // wäre eine doppelte Frage — auch unter `AlwaysAsk` (Stufe `plan`).
+        // Eine Deny-Regel fragt weiterhin (Regelpfad oben/unten).
+        let requires_approval =
+            requires_approval && !harw_tool_plan::USER_DIALOG_TOOLS.contains(&call.name.as_str());
+        // Runde 5, Teil E: nur `auto`, nur ohne Regeltreffer, nur dort, wo
+        // sonst gefragt würde — Deny vor Allow vor Klassifizierer.
+        let gate = match (mode, &rule_decision) {
+            (ApprovalMode::Delegated, None) if requires_approval => self.auto_gate.clone(),
+            _ => None,
         };
         Box::pin(async move {
             match rule_decision {
@@ -441,7 +537,10 @@ impl ApprovalHandler for DefaultApprovalPolicy {
                 // freigegeben werden, auch nicht unter `FullAccess`.
                 Some(RuleDecision::Deny) => ApprovalDecision::AskUser(Default::default()),
                 Some(RuleDecision::Allow) => ApprovalDecision::Allow,
-                None if requires_approval => ApprovalDecision::AskUser(Default::default()),
+                None if requires_approval => match gate {
+                    Some(gate) => gate.decide(call).await.into_approval(),
+                    None => ApprovalDecision::AskUser(Default::default()),
+                },
                 None => ApprovalDecision::Allow,
             }
         })
@@ -535,6 +634,7 @@ mod tests {
         let expected_tools = vec![
             "fs.read".to_owned(),
             "fs.write".to_owned(),
+            "fs.edit".to_owned(),
             "fs.list".to_owned(),
             "fs.search".to_owned(),
             "fs.glob".to_owned(),
@@ -626,6 +726,21 @@ mod tests {
             .extend_from_slice(crate::workbench_tools::WorkbenchReadToolProvider::TOOL_NAMES);
         read_only_surface.extend_from_slice(crate::diary_tools::DiaryToolProvider::TOOL_NAMES);
         read_only_surface.extend_from_slice(crate::palace_tools::PalaceToolProvider::TOOL_NAMES);
+        // Runde 5, Teil H: `agent.result` liest nur eigene Kind-Ergebnisse.
+        read_only_surface.extend_from_slice(crate::profile::CHILD_RESULT_TOOLS);
+        // Runde 5, Teil F: `ask_user` liest nur die Antwort der Nutzerin.
+        read_only_surface.push(harw_tool_plan::ASK_USER_TOOL);
+        // Runde 5 (Integration): `plan.write` schreibt ausschließlich die
+        // Plan-Datei unter `.harw/plans` (kein Workspace-Quellcode) und nur im
+        // Plan-Modus — bewusste, dokumentierte Ausnahme (siehe
+        // `AUTO_APPROVED_TOOLS`).
+        read_only_surface.push(harw_tool_plan::PLAN_WRITE_TOOL);
+        // Runde 5, Teil K: `agent.status` liest nur eigene Hintergrund-Läufe.
+        read_only_surface.push("agent.status");
+        // Runde 5, Teil M: Nachrichten zwischen Elternteil und eigenem Kind
+        // (reiner Text, ohne Schreibwirkung).
+        read_only_surface.extend_from_slice(crate::profile::CHILD_MESSAGE_TOOLS);
+        read_only_surface.extend_from_slice(crate::profile::PARENT_MESSAGE_TOOLS);
         for profile in RegistryProfile::ALL.iter().filter(|p| p.is_read_only()) {
             read_only_surface.extend(profile.registered_tool_names());
         }
@@ -685,6 +800,51 @@ mod tests {
                 "{name} deklariert eine Freigabe bzw. hat Nebenwirkungen und \
                  darf nicht auto-freigegeben sein"
             );
+        }
+    }
+
+    /// Runde 5, Teil H: `agent.result` ist rein lesend, auto-freigegeben und
+    /// nie in der Immer-fragen-Liste.
+    #[test]
+    fn agent_result_is_auto_approved_and_never_always_ask() {
+        for tool in crate::profile::CHILD_RESULT_TOOLS {
+            assert!(AUTO_APPROVED_TOOLS.contains(tool), "{tool}");
+            assert!(!ALWAYS_ASK_TOOLS.contains(tool), "{tool}");
+            assert!(
+                !DefaultApprovalPolicy::requires_explicit_approval(&call(tool)),
+                "{tool} muss ohne Rückfrage laufen"
+            );
+        }
+    }
+
+    /// Runde 5, Teil K: `agent.status` ist lesend und auto-freigegeben,
+    /// `agent.cancel` fragt immer — nie automatisch.
+    #[test]
+    fn agent_status_is_auto_approved_and_agent_cancel_always_asks() {
+        assert!(AUTO_APPROVED_TOOLS.contains(&"agent.status"));
+        assert!(!ALWAYS_ASK_TOOLS.contains(&"agent.status"));
+        assert!(!DefaultApprovalPolicy::requires_explicit_approval(&call(
+            "agent.status"
+        )));
+        assert!(!AUTO_APPROVED_TOOLS.contains(&"agent.cancel"));
+        assert!(ALWAYS_ASK_TOOLS.contains(&"agent.cancel"));
+        assert!(DefaultApprovalPolicy::requires_explicit_approval(&call(
+            "agent.cancel"
+        )));
+    }
+
+    /// Runde 5, Teil M: `agent.message`/`parent.message` brauchen keine
+    /// Freigabe, stehen aber nie in `ALWAYS_ASK_TOOLS` und tragen keine
+    /// Sandbox-Rechteklasse.
+    #[test]
+    fn agent_messaging_tools_are_auto_approved_without_permission_class() {
+        for tool in crate::profile::CHILD_MESSAGE_TOOLS
+            .iter()
+            .chain(crate::profile::PARENT_MESSAGE_TOOLS)
+        {
+            assert!(AUTO_APPROVED_TOOLS.contains(tool), "{tool}");
+            assert!(!ALWAYS_ASK_TOOLS.contains(tool), "{tool}");
+            assert_eq!(crate::authority::tool_permission(tool), None, "{tool}");
         }
     }
 
@@ -760,6 +920,65 @@ mod tests {
     // seine eigene Zelle: Sie teilen keinen Zustand, brauchen keine
     // Wiederherstellung am Ende und können in beliebiger Reihenfolge parallel
     // laufen.
+
+    /// Runde 5, Teil F: die Dialog-Werkzeuge (`plan.exit`, `plan.enter`,
+    /// `ask_user`) fragen in keinem Modus zusätzlich — ihr eigenes Fenster
+    /// ist die Rückfrage. `plan.write` ist unter `Delegated` auto-freigegeben
+    /// (nur `.harw/plans`), unter `AlwaysAsk` fragt es; eine Deny-Regel fragt
+    /// auch bei Dialog-Werkzeugen.
+    #[test]
+    fn user_dialog_tools_never_ask_twice_but_plan_write_does() -> TestResult {
+        use harw_extension_api::allow_rules::{ApprovalRule, RuleDecision, RuleScope};
+
+        for mode in [
+            ApprovalMode::AlwaysAsk,
+            ApprovalMode::Delegated,
+            ApprovalMode::FullAccess,
+        ] {
+            let policy = DefaultApprovalPolicy::new(ApprovalModeCell::new(mode));
+            for tool in harw_tool_plan::USER_DIALOG_TOOLS {
+                assert!(
+                    matches!(
+                        block_on(policy.review(&call(tool)))?,
+                        ApprovalDecision::Allow
+                    ),
+                    "{tool} unter {mode:?}"
+                );
+            }
+        }
+        assert!(AUTO_APPROVED_TOOLS.contains(&harw_tool_plan::PLAN_WRITE_TOOL));
+        assert!(AUTO_APPROVED_TOOLS.contains(&harw_tool_plan::ASK_USER_TOOL));
+        assert!(!harw_tool_plan::USER_DIALOG_TOOLS.contains(&harw_tool_plan::PLAN_WRITE_TOOL));
+        // `plan.write` läuft in der Plan-Stufe (`Delegated`) ohne Rückfrage …
+        let policy = DefaultApprovalPolicy::new(ApprovalModeCell::new(ApprovalMode::Delegated));
+        assert!(matches!(
+            block_on(policy.review(&call(harw_tool_plan::PLAN_WRITE_TOOL)))?,
+            ApprovalDecision::Allow
+        ));
+        // … fragt unter `AlwaysAsk` aber weiterhin.
+        let policy = DefaultApprovalPolicy::new(ApprovalModeCell::new(ApprovalMode::AlwaysAsk));
+        assert!(matches!(
+            block_on(policy.review(&call(harw_tool_plan::PLAN_WRITE_TOOL)))?,
+            ApprovalDecision::AskUser(_)
+        ));
+
+        let rules = AllowRuleSet::new();
+        rules.add(ApprovalRule {
+            tool: harw_tool_plan::ASK_USER_TOOL.to_owned(),
+            pattern: None,
+            decision: RuleDecision::Deny,
+            scope: RuleScope::Session,
+        });
+        let policy = DefaultApprovalPolicy::with_rules(
+            ApprovalModeCell::new(ApprovalMode::FullAccess),
+            rules,
+        );
+        assert!(matches!(
+            block_on(policy.review(&call(harw_tool_plan::ASK_USER_TOOL)))?,
+            ApprovalDecision::AskUser(_)
+        ));
+        Ok(())
+    }
 
     #[test]
     fn review_in_always_ask_mode_asks_even_for_read_only_tools() -> TestResult {
@@ -1019,6 +1238,7 @@ mod tests {
     fn default_approval_policy_requires_approval_for_mutating_removed_and_unknown_tools() {
         for name in [
             "fs.write",
+            "fs.edit",
             "shell.exec",
             "stop",
             "memory",
@@ -1031,5 +1251,143 @@ mod tests {
                 "{name} must not receive automatic approval"
             );
         }
+    }
+
+    // ── Runde 5, Teil E: Auto-Modus-Gate ─────────────────────────────────────
+
+    /// Ein Gate-Doppel mit festem Urteil, das seine Befragungen zählt.
+    #[derive(Debug)]
+    struct FixedGate {
+        verdict: harw_extension_api::auto_mode::AutoVerdict,
+        calls: std::sync::atomic::AtomicUsize,
+    }
+
+    impl FixedGate {
+        fn new(decision: harw_extension_api::auto_mode::AutoDecision) -> Arc<Self> {
+            Arc::new(Self {
+                verdict: harw_extension_api::auto_mode::AutoVerdict::new(
+                    decision,
+                    "test",
+                    "fester Testgrund",
+                    harw_extension_api::auto_mode::VerdictSource::Classifier,
+                ),
+                calls: std::sync::atomic::AtomicUsize::new(0),
+            })
+        }
+
+        fn calls(&self) -> usize {
+            self.calls.load(std::sync::atomic::Ordering::SeqCst)
+        }
+    }
+
+    impl AutoApprovalGate for FixedGate {
+        fn decide<'a>(
+            &'a self,
+            _call: &'a ToolCall,
+        ) -> ExtFuture<'a, harw_extension_api::auto_mode::AutoVerdict> {
+            self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let verdict = self.verdict.clone();
+            Box::pin(async move { verdict })
+        }
+    }
+
+    fn gated_policy(
+        mode: ApprovalMode,
+        rules: AllowRuleSet,
+        gate: &Arc<FixedGate>,
+    ) -> DefaultApprovalPolicy {
+        DefaultApprovalPolicy::with_rules(ApprovalModeCell::new(mode), rules)
+            .with_auto_gate(Arc::clone(gate) as Arc<dyn AutoApprovalGate>)
+    }
+
+    #[test]
+    fn auto_gate_allow_skips_the_question_in_delegated_mode() -> TestResult {
+        use harw_extension_api::auto_mode::AutoDecision;
+        let gate = FixedGate::new(AutoDecision::Allow);
+        let policy = gated_policy(ApprovalMode::Delegated, AllowRuleSet::new(), &gate);
+
+        assert!(matches!(
+            block_on(policy.review(&call("shell.exec")))?,
+            ApprovalDecision::Allow
+        ));
+        assert_eq!(gate.calls(), 1);
+        Ok(())
+    }
+
+    #[test]
+    fn auto_gate_deny_becomes_a_deny_with_reason() -> TestResult {
+        use harw_extension_api::auto_mode::{AUTO_DENIAL_PREFIX, AutoDecision};
+        let gate = FixedGate::new(AutoDecision::Deny);
+        let policy = gated_policy(ApprovalMode::Delegated, AllowRuleSet::new(), &gate);
+
+        match block_on(policy.review(&call("fs.write")))? {
+            ApprovalDecision::Deny(reason) => {
+                assert!(reason.starts_with(AUTO_DENIAL_PREFIX), "{reason}");
+                Ok(())
+            }
+            other => Err(TestError::Unexpected(format!(
+                "erwartet Deny, war {other:?}"
+            ))),
+        }
+    }
+
+    /// Harte Regel: `ALWAYS_ASK_TOOLS` erreichen das Gate nie — auch nicht,
+    /// wenn es `allow` sagen würde.
+    #[test]
+    fn auto_gate_never_sees_always_ask_tools() -> TestResult {
+        use harw_extension_api::auto_mode::AutoDecision;
+        let gate = FixedGate::new(AutoDecision::Allow);
+        let policy = gated_policy(ApprovalMode::Delegated, AllowRuleSet::new(), &gate);
+
+        for tool in ALWAYS_ASK_TOOLS {
+            assert!(
+                matches!(
+                    block_on(policy.review(&call(tool)))?,
+                    ApprovalDecision::AskUser(_)
+                ),
+                "{tool} muss trotz Auto-Gate fragen"
+            );
+        }
+        assert_eq!(gate.calls(), 0);
+        Ok(())
+    }
+
+    /// Das Gate wird nur in `auto` befragt, nie für bereits freigegebene
+    /// Lesewerkzeuge und nie, wenn eine Regel trifft (Deny vor Allow vor
+    /// Klassifizierer).
+    #[test]
+    fn auto_gate_is_consulted_only_where_the_policy_would_ask() -> TestResult {
+        use harw_extension_api::allow_rules::{ApprovalRule, RuleScope};
+        use harw_extension_api::auto_mode::AutoDecision;
+
+        let gate = FixedGate::new(AutoDecision::Allow);
+        for mode in [ApprovalMode::AlwaysAsk, ApprovalMode::FullAccess] {
+            let policy = gated_policy(mode, AllowRuleSet::new(), &gate);
+            let _ = block_on(policy.review(&call("shell.exec")))?;
+        }
+        let delegated = gated_policy(ApprovalMode::Delegated, AllowRuleSet::new(), &gate);
+        assert!(matches!(
+            block_on(delegated.review(&call("fs.read")))?,
+            ApprovalDecision::Allow
+        ));
+        assert_eq!(gate.calls(), 0, "weder ask/full noch Lesewerkzeuge");
+
+        let rules = AllowRuleSet::new();
+        rules.add(ApprovalRule {
+            tool: "shell.exec".to_owned(),
+            pattern: None,
+            decision: RuleDecision::Deny,
+            scope: RuleScope::Session,
+        });
+        let with_deny = gated_policy(ApprovalMode::Delegated, rules, &gate);
+        assert!(
+            matches!(
+                block_on(with_deny.review(&call("shell.exec")))?,
+                ApprovalDecision::AskUser(_)
+            ),
+            "Deny-Regel schlägt ein Gate-allow"
+        );
+        assert_eq!(gate.calls(), 0);
+        Ok(())
     }
 }

@@ -124,7 +124,12 @@ async fn fs_glob(context: &ToolExecutionContext, args: GlobArgs) -> Result<ToolO
 
 /// Synchroner Kern von [`fs_glob`].
 fn glob_blocking(root: &Path, args: &GlobArgs) -> ToolOutput {
-    let start_input = args.path.as_deref().unwrap_or(".");
+    // Strict-Schema: `null` und `""` gelten als „nicht gesetzt“ (Wurzel).
+    let start_input = args
+        .path
+        .as_deref()
+        .filter(|path| !path.is_empty())
+        .unwrap_or(".");
     let start_rel = match normalize_relative(start_input) {
         Ok(rel) => rel,
         Err(reason) => return ToolOutput::error(format!("fs.glob: {reason}")),
@@ -148,9 +153,11 @@ fn glob_blocking(root: &Path, args: &GlobArgs) -> ToolOutput {
         Err(err) => return ToolOutput::error(format!("fs.glob: Workspace nicht lesbar: {err}")),
     };
     // `clamp(1, HARD_MAX_RESULTS)`: mindestens ein Treffer, höchstens die
-    // harte Obergrenze — auch wenn der Aufrufer 0 oder etwas Riesiges angibt.
+    // harte Obergrenze — auch wenn der Aufrufer etwas Riesiges angibt.
+    // `0` gilt wie `null` als „nicht gesetzt“ (Vorgabe), nicht als „ein Treffer“.
     let cap = args
         .max_results
+        .filter(|&results| results > 0)
         .unwrap_or(DEFAULT_MAX_RESULTS)
         .clamp(1, HARD_MAX_RESULTS);
 
@@ -366,6 +373,35 @@ mod tests {
                     content["note"].as_str().is_some(),
                     "expected a truncation note"
                 );
+            }
+            other => {
+                return Err(TestError::Unexpected(format!(
+                    "expected json output, got: {other:?}"
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_fs_glob_empty_path_and_zero_limit_mean_not_set() -> TestResult {
+        // Strict-Schema: Modelle senden für ungenutzte Felder `""` bzw. `0`.
+        let dir = TempDir::new()?;
+        let ws = dir.path().join("ws");
+        fs::create_dir_all(&ws)?;
+        for i in 0..5 {
+            fs::write(ws.join(format!("file{i}.rs")), "// f")?;
+        }
+
+        let sandbox = make_sandbox_with_permissions(dir.path(), vec![Permission::ReadWorkspace])?;
+        let ctx = make_ctx(sandbox);
+        let output = fs_glob(&ctx, glob_args("*.rs", Some(""), Some(0))).await?;
+        match output {
+            ToolOutput::Json { content } => {
+                let matches = content["matches"]
+                    .as_array()
+                    .ok_or(TestError::Missing("matches"))?;
+                assert_eq!(matches.len(), 5, "0 darf nicht auf einen Treffer kappen");
             }
             other => {
                 return Err(TestError::Unexpected(format!(

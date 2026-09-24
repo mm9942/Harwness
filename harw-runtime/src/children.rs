@@ -389,6 +389,15 @@ pub struct RuntimeChildRegistryFactory {
     /// [`Self::with_knowledge`] nicht aufgerufen wurde — dann bekommt kein
     /// Kind `workbench.show`/`diary.read`/`palace.*`/`kanban.*`.
     knowledge: Option<ChildKnowledgeWiring>,
+    /// Runde 5, Teil C: automatische Diary-Einträge der Kinder (Verdichtung,
+    /// Sitzungsende; Agent-Id = Rollenname). `None`, solange
+    /// [`Self::with_child_diary`] nicht aufgerufen wurde — dann schreibt kein
+    /// Kind ins Tagebuch.
+    diary: Option<Arc<crate::diary_wiring::DiaryRecorder>>,
+    /// Runde 5, Teil G: eigene Modellwahl je UIA-Worker-Rolle. Nur bei der
+    /// UIA-Worker-Fabrik gesetzt ([`Self::with_uia_worker_routing`]); dann
+    /// bestimmt sie das Modell **jedes** Kindes dieser Fabrik beim Start.
+    uia_worker_routing: Option<Arc<crate::uia_worker_routing::UiaWorkerRouting>>,
 }
 
 /// Wissensquellen der lesenden Kind-Werkzeuge (Plan Teil D).
@@ -497,7 +506,26 @@ impl RuntimeChildRegistryFactory {
             skill_catalog: None,
             delegate_wave_store: None,
             knowledge: None,
+            diary: None,
+            uia_worker_routing: None,
         }
+    }
+
+    /// Runde 5, Teil G: hängt die Modellwahl der UIA-Worker-Rollen an.
+    ///
+    /// # Description
+    /// Nur für die UIA-Worker-Fabrik der Montage: jedes über diese Fabrik
+    /// gestartete Kind bekommt sein Modell dann aus
+    /// [`crate::uia_worker_routing::UiaWorkerRouting::model_for_role`] —
+    /// eigene feste Wahl oder „wie UIA“ (live). Ohne Aufruf bleibt das
+    /// bisherige Verhalten (Eltern-Modell dieser Fabrik).
+    #[must_use]
+    pub fn with_uia_worker_routing(
+        mut self,
+        routing: Arc<crate::uia_worker_routing::UiaWorkerRouting>,
+    ) -> Self {
+        self.uia_worker_routing = Some(routing);
+        self
     }
 
     /// Ergänzt die aufgelösten internen Modellstellen (Addendum C).
@@ -798,6 +826,34 @@ impl RuntimeChildRegistryFactory {
         }
     }
 
+    /// Hinterlegt den Diary-Recorder für die automatischen Einträge der
+    /// Kinder (Runde 5, Teil C).
+    ///
+    /// # Beschreibung
+    /// Jedes über diese Fabrik admittierte Kind wird mit seinem Rollennamen
+    /// als Agent-Id beim Recorder angemeldet
+    /// ([`crate::diary_wiring::DiaryRecorder::session_started`]); Verdichtung
+    /// und Runden zählt der Recorder über die Beobachter, die
+    /// [`ChildRegistryFactory::child_session_observers`] an die Kind-Sitzung
+    /// hängt. Die Freigabe des Kindes
+    /// ([`ChildRegistryFactory::child_session_released`]) schreibt höchstens
+    /// einen Sitzungsende-Eintrag — und keinen, wenn das Kind keine Runde
+    /// beendet hat.
+    ///
+    /// # Arguments
+    /// - `recorder`: derselbe Recorder darf mehrere Fabriken bedienen
+    ///   (Zähler je Sitzung); `None` lässt die Fabrik unverändert.
+    #[must_use]
+    pub fn with_child_diary(
+        mut self,
+        recorder: Option<Arc<crate::diary_wiring::DiaryRecorder>>,
+    ) -> Self {
+        if recorder.is_some() {
+            self.diary = recorder;
+        }
+        self
+    }
+
     /// Hängt die lesenden Wissens-Provider an die Kind-Registry von `role`
     /// (siehe [`Self::with_knowledge`]).
     ///
@@ -875,6 +931,48 @@ impl RuntimeChildRegistryFactory {
             ));
         }
         builder
+    }
+
+    /// Hängt `host.sudo_exec` (`harw_tool_shell::SudoToolProvider`, Runde 5
+    /// Teil B) an die Kind-Registry von `role`.
+    ///
+    /// # Beschreibung
+    /// Fail-closed in drei Stufen: ohne sudo-Fragekanal in der
+    /// Host-Permit-Verdrahtung (jeder Nicht-TUI-Einstieg) gibt es kein
+    /// Werkzeug; eine Rolle außerhalb von
+    /// [`harw_registry_defaults::profile::sudo_tools_for_role`] bekommt es nie;
+    /// eine Rolle ohne eingebaute Definition, die es admittiert, ebenfalls
+    /// nicht.
+    ///
+    /// # Rückgabe
+    /// Der Builder, ergänzt um genau einen Provider oder unverändert.
+    fn with_sudo_exec(
+        &self,
+        role: &str,
+        builder: harw_extension_api::ExtensionRegistryBuilder,
+    ) -> harw_extension_api::ExtensionRegistryBuilder {
+        let Some(sender) = self
+            .host_permit_wiring
+            .as_ref()
+            .and_then(|wiring| wiring.sudo_prompts.clone())
+        else {
+            return builder;
+        };
+        let offered = harw_registry_defaults::profile::sudo_tools_for_role(role);
+        let admitted = self.builtin_definitions.get(role).is_some_and(|ir| {
+            offered.iter().any(|tool| {
+                ir.tool_surface()
+                    .admitted()
+                    .iter()
+                    .any(|admitted| admitted == tool)
+            })
+        });
+        if !admitted {
+            return builder;
+        }
+        builder.tool_provider(Arc::new(harw_tool_shell::SudoToolProvider::new(
+            sender, role,
+        )))
     }
 
     /// Die interne Modellstelle eines Kind-Starts mit Aufgabenkomplexität
@@ -1133,12 +1231,44 @@ impl RuntimeChildRegistryFactory {
 }
 
 impl ChildRegistryFactory for RuntimeChildRegistryFactory {
+    /// Runde 5, Teil C: meldet das Kind mit seinem Rollennamen beim
+    /// Diary-Recorder an und liefert dessen Verdichtungs- und
+    /// Runden-Beobachter; ohne Recorder keine Beobachter.
+    fn child_session_observers(
+        &self,
+        role: &str,
+        child: &harw_types::SessionId,
+    ) -> harw_core::ChildSessionObservers {
+        // Runde 5, Teil N: Kind-ID und Baum-Pfad für Host-Mode-Anfragen.
+        crate::host_escalation_wiring::bind_child(self.host_permit_wiring.as_ref(), role, child);
+        let Some(recorder) = &self.diary else {
+            return harw_core::ChildSessionObservers::default();
+        };
+        recorder.session_started(child, Some(harw_knowledge::AgentId::new(role.to_owned())));
+        harw_core::ChildSessionObservers {
+            compaction: Some(recorder.compaction_observer(None)),
+            tool_outcome: Some(recorder.tool_outcome_observer(None)),
+        }
+    }
+
+    /// Runde 5, Teil C: Sitzungsende-Eintrag des Kindes (höchstens einer je
+    /// Kind-Lauf, keiner ohne beendete Runde — siehe
+    /// [`crate::diary_wiring::DiaryRecorder::session_closed`]).
+    fn child_session_released(&self, _role: &str, child: &harw_types::SessionId) {
+        // Runde 5, Teil N: freigegebene Kinder verlassen das Anfragenden-Buch.
+        crate::host_escalation_wiring::release(self.host_permit_wiring.as_ref(), child);
+        if let Some(recorder) = &self.diary {
+            recorder.session_closed(child);
+        }
+    }
+
     /// Baut die Registry eines Kindes nach dem Profil seiner Rolle.
     ///
     /// # Argumente
     /// - `role` (`&str`): der registrierte Rollenname.
-    /// - `_input` (`&SpawnInput`): ungenutzt — die Registry hängt allein an
-    ///   `role`, nie an Modell-JSON.
+    /// - `input` (`&SpawnInput`): die Registry hängt allein an `role`, nie an
+    ///   Modell-JSON; gelesen wird nur die vertrauenswürdige
+    ///   `parent_session_id` (Runde 5, Teil N: Baum-Pfad für Host-Mode).
     /// - `_suggestions` (`Option<&harw_catalog::AgentSuggestions>`): ungenutzt;
     ///   ein Vorschlag wird hier nie zu einem registrierten Werkzeug.
     ///
@@ -1166,7 +1296,7 @@ impl ChildRegistryFactory for RuntimeChildRegistryFactory {
     fn build_registry(
         &self,
         role: &str,
-        _input: &SpawnInput,
+        input: &SpawnInput,
         _suggestions: Option<&harw_catalog::AgentSuggestions>,
     ) -> Result<ExtensionRegistry, AgentSpawnError> {
         let profile = profile_for_role(role).ok_or_else(|| AgentSpawnError {
@@ -1198,6 +1328,13 @@ impl ChildRegistryFactory for RuntimeChildRegistryFactory {
         // — Geschwister bleiben voneinander unabhängig, folgen aber weiter der
         // Wurzel.
         let child_chain = self.chain.for_child();
+        // Runde 5, Teil N: Elternteil und Rolle für den Baum-Pfad vormerken;
+        // `child_session_observers` bindet danach die Kind-ID.
+        crate::host_escalation_wiring::note_spawn(
+            self.host_permit_wiring.as_ref(),
+            &input.parent_session_id,
+            role,
+        );
         // Teil B4: ruft dieselbe Delegationskette wie zuvor
         // `assemble_registry_for_project` mit exakt deren bisherigen
         // Default-Werten auf (`granted = profile.required_permissions()`,
@@ -1258,9 +1395,43 @@ impl ChildRegistryFactory for RuntimeChildRegistryFactory {
             registry_builder =
                 registry_builder.tool_provider(Arc::new(self.delegate_wave_provider()));
         }
+        // Runde 5, Teil H: `agent.result` für jede Rolle, die Kinder starten
+        // darf; der Spawner wird wie bei `delegate_wave` nur schwach gehalten.
+        if !harw_registry_defaults::profile::child_result_tools_for_role(role).is_empty() {
+            let slot = Arc::clone(&self.spawner_slot);
+            registry_builder = registry_builder.tool_provider(Arc::new(
+                crate::agent_result_wiring::agent_result_provider(move || {
+                    slot.get().and_then(Weak::upgrade)
+                }),
+            ));
+        }
+        // Runde 5, Teil M: `agent.message` für jede Rolle, die Kinder starten
+        // darf, `parent.message` für jede Kind-Rolle mit Elternteil; die
+        // `SessionActivation` schaltet sie nur frei, wenn die Definition sie
+        // admittiert. Spawner schwach gehalten wie oben.
+        if !harw_registry_defaults::profile::child_message_tools_for_role(role).is_empty() {
+            let slot = Arc::clone(&self.spawner_slot);
+            registry_builder = registry_builder.tool_provider(Arc::new(
+                crate::agent_messaging_wiring::agent_message_provider(move || {
+                    slot.get().and_then(Weak::upgrade)
+                }),
+            ));
+        }
+        if !harw_registry_defaults::profile::parent_message_tools_for_role(role).is_empty() {
+            let slot = Arc::clone(&self.spawner_slot);
+            registry_builder = registry_builder.tool_provider(Arc::new(
+                crate::agent_messaging_wiring::parent_message_provider(move || {
+                    slot.get().and_then(Weak::upgrade)
+                }),
+            ));
+        }
         // Plan Teil D: lesende Wissenswerkzeuge nur für zugelassene Rollen,
         // deren Definition sie admittiert (siehe `with_knowledge_readers`).
         registry_builder = self.with_knowledge_readers(role, profile, registry_builder);
+        // Runde 5, Teil B: `host.sudo_exec` nur für die Host-Shell-Worker, nur
+        // mit sudo-Fragekanal (TUI) und nur, wenn die Definition der Rolle es
+        // admittiert (siehe `with_sudo_exec`).
+        registry_builder = self.with_sudo_exec(role, registry_builder);
         let registry = registry_builder.build();
         tracing::debug!(
             role,
@@ -1315,6 +1486,10 @@ impl ChildRegistryFactory for RuntimeChildRegistryFactory {
     /// Nie: jede Auflösung fällt bei Unklarheit auf das Eltern-Modell
     /// zurück, statt zu scheitern.
     fn model_for(&self, role: &str) -> Result<Arc<dyn ModelProvider>, AgentSpawnError> {
+        // Runde 5, Teil G: UIA-Worker-Fabrik → eigene Wahl je Rolle.
+        if let Some(routing) = &self.uia_worker_routing {
+            return Ok(routing.model_for_role(role));
+        }
         let Some(point) = self.internal_point_for_child(role) else {
             return Ok(Arc::clone(&self.model));
         };
@@ -1345,6 +1520,10 @@ impl ChildRegistryFactory for RuntimeChildRegistryFactory {
         role: &str,
         complexity: Option<harw_core::TaskComplexity>,
     ) -> Result<Arc<dyn ModelProvider>, AgentSpawnError> {
+        // Runde 5, Teil G: UIA-Worker-Fabrik → eigene Wahl je Rolle.
+        if let Some(routing) = &self.uia_worker_routing {
+            return Ok(routing.model_for_role(role));
+        }
         match self.internal_point_for_task(role, complexity) {
             Some(point) => Ok(self.pinned_model_for_point(role, point)),
             None => Ok(Arc::clone(&self.model)),
@@ -2288,6 +2467,78 @@ mod tests {
     }
 
     // -------------------------------------------------------------------
+    // Runde 5, Teil B — `host.sudo_exec` nur mit TUI-Kanal und nur für die
+    // Host-Shell-Worker.
+    // -------------------------------------------------------------------
+
+    /// Die Werkzeugnamen, die [`RuntimeChildRegistryFactory::with_sudo_exec`]
+    /// für `role` an einen leeren Builder hängt.
+    fn sudo_tools_mounted_for(factory: &RuntimeChildRegistryFactory, role: &str) -> Vec<String> {
+        factory
+            .with_sudo_exec(
+                role,
+                harw_extension_api::ExtensionRegistryBuilder::default(),
+            )
+            .build()
+            .tool_providers()
+            .iter()
+            .flat_map(|provider| provider.tools())
+            .map(|spec| spec.name().to_owned())
+            .collect()
+    }
+
+    #[test]
+    fn sudo_exec_is_mounted_only_with_a_tui_channel_and_only_for_host_shell_workers() -> TestResult
+    {
+        let config = harw_config::ResolvedConfig::default();
+        let wiring = || {
+            let (sender, _receiver) = harw_tool_shell::host_permit_prompt_channel();
+            HostPermitWiring::new(
+                Arc::new(harw_sandbox::ProcessPermitLedger::default()),
+                Arc::new(harw_sandbox::HostPermitSessionRegistry::default()),
+                sender,
+            )
+        };
+        let factory = || {
+            RuntimeChildRegistryFactory::new(
+                test_project(),
+                Arc::new(harw_core::EchoModelProvider::new("echo")),
+                test_chain(&config),
+            )
+        };
+
+        // Ohne Verdrahtung (kein Host-Pfad) und ohne sudo-Kanal (jeder
+        // Nicht-TUI-Einstieg): nie ein Werkzeug.
+        let bare = factory().map_err(ctx("factory builds"))?;
+        assert!(sudo_tools_mounted_for(&bare, role_names::UIA_SHELL_WORKER).is_empty());
+        let without_sudo = factory()
+            .map_err(ctx("factory builds"))?
+            .with_host_permits(harw_sandbox::SandboxProfile::Host, Some(wiring()));
+        assert!(sudo_tools_mounted_for(&without_sudo, role_names::UIA_SHELL_WORKER).is_empty());
+
+        // Mit sudo-Kanal: genau die Host-Shell-Worker.
+        let (sudo, _sudo_receiver) = harw_tool_shell::sudo_prompt_channel();
+        let with_sudo = factory().map_err(ctx("factory builds"))?.with_host_permits(
+            harw_sandbox::SandboxProfile::Host,
+            Some(wiring().with_sudo_prompts(Some(sudo))),
+        );
+        assert_eq!(
+            sudo_tools_mounted_for(&with_sudo, role_names::UIA_SHELL_WORKER),
+            vec![harw_tool_shell::SUDO_EXEC_TOOL.to_owned()]
+        );
+        for role in role_names::ALL {
+            if *role == role_names::UIA_SHELL_WORKER {
+                continue;
+            }
+            assert!(
+                sudo_tools_mounted_for(&with_sudo, role).is_empty(),
+                "{role} darf host.sudo_exec nie bekommen"
+            );
+        }
+        Ok(())
+    }
+
+    // -------------------------------------------------------------------
     // Welle 4 — Skills erreichen Agenten.
     // -------------------------------------------------------------------
 
@@ -2847,6 +3098,102 @@ mod tests {
                 "{role}"
             );
         }
+        Ok(())
+    }
+
+    // --- Runde 5, Teil C: Diary der Kind-Agenten ---
+
+    /// Einträge des Agenten `agent` am Tag von `at` (Sekunden seit Epoche).
+    fn diary_entries(
+        store: &harw_knowledge::KnowledgeStore,
+        agent: &str,
+        at: i64,
+    ) -> TestResult<Vec<harw_knowledge::diary::DiaryRecord>> {
+        let date = jiff::Timestamp::from_second(at)
+            .map_err(ctx("valid timestamp"))?
+            .strftime("%Y-%m-%d")
+            .to_string();
+        Ok(harw_knowledge::diary::read_day_entries(
+            store,
+            &harw_knowledge::AgentId::new(agent.to_owned()),
+            &date,
+        )
+        .map_err(ctx("read diary day"))?
+        .map(|day| day.entries)
+        .unwrap_or_default())
+    }
+
+    /// Ein Kind mit Runde und Verdichtung schreibt unter seinem Rollennamen
+    /// einen `compaction`- und genau einen `end-of-session`-Eintrag, auch
+    /// bei doppelter Freigabe; ein Kind ohne Runde schreibt nichts; ohne
+    /// Recorder liefert die Fabrik keine Beobachter.
+    #[test]
+    fn child_diary_records_compaction_and_one_session_end_under_the_role_name() -> TestResult {
+        let root = tempfile::tempdir().map_err(ctx("temporary knowledge root"))?;
+        let store = Arc::new(harw_knowledge::KnowledgeStore::new(root.path()));
+        let at = 1_758_715_200;
+        let clock: crate::diary_wiring::DiaryClock = Arc::new(move || {
+            jiff::Timestamp::from_second(at).unwrap_or(jiff::Timestamp::UNIX_EPOCH)
+        });
+        let recorder = Arc::new(
+            crate::diary_wiring::DiaryRecorder::new(
+                Arc::clone(&store),
+                harw_knowledge::AgentId::new("root".to_owned()),
+            )
+            .with_clock(clock),
+        );
+        let without = RuntimeChildRegistryFactory::new(
+            test_project(),
+            Arc::new(harw_core::EchoModelProvider::new("echo")),
+            test_chain(&harw_config::ResolvedConfig::default()),
+        )
+        .map_err(ctx("factory builds"))?;
+        let idle = harw_types::SessionId::from_str("child-idle");
+        let observers = without.child_session_observers(role_names::EXPLORER, &idle);
+        assert!(observers.compaction.is_none() && observers.tool_outcome.is_none());
+
+        let factory = without.with_child_diary(Some(Arc::clone(&recorder)));
+        let busy = harw_types::SessionId::from_str("child-busy");
+        let observers = factory.child_session_observers(role_names::EXPLORER, &busy);
+        let turns = observers
+            .tool_outcome
+            .ok_or(crate::test_support::TestError::Missing("turn observer"))?;
+        let compaction = observers
+            .compaction
+            .ok_or(crate::test_support::TestError::Missing(
+                "compaction observer",
+            ))?;
+        turns.on_turn_finished(&busy);
+        compaction.on_compacted(
+            &busy,
+            &harw_core::CompactionOutcome {
+                tokens_before: 80_000,
+                tokens_after: 9_000,
+                summarized: true,
+                summary_text: Some("Kind hat die Module kartiert.".to_owned()),
+                ..harw_core::CompactionOutcome::default()
+            },
+        );
+        factory.child_session_released(role_names::EXPLORER, &busy);
+        factory.child_session_released(role_names::EXPLORER, &busy);
+
+        let written = diary_entries(&store, role_names::EXPLORER, at)?;
+        let triggers: Vec<_> = written.iter().map(|entry| entry.trigger).collect();
+        assert_eq!(
+            triggers,
+            vec![
+                harw_knowledge::diary::DiaryTrigger::Compaction,
+                harw_knowledge::diary::DiaryTrigger::EndOfSession,
+            ],
+            "{written:?}"
+        );
+        assert!(written[1].text.contains("1 Turns"), "{}", written[1].text);
+        assert!(diary_entries(&store, "root", at)?.is_empty());
+
+        // Ein Kind ohne beendete Runde hinterlässt keinen Eintrag.
+        let _ = factory.child_session_observers(role_names::PLANNER, &idle);
+        factory.child_session_released(role_names::PLANNER, &idle);
+        assert!(diary_entries(&store, role_names::PLANNER, at)?.is_empty());
         Ok(())
     }
 }

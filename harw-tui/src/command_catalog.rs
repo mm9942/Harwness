@@ -115,6 +115,28 @@ const MODE: &[SubcommandHint] = &[
     ),
 ];
 
+/// `/plan` (Runde 5, Teil F): die lokalen Plan-Modus-Befehle vorn, dazu der
+/// Einstieg in die `plan`-Operation (`inspect`). Bare `/plan` schaltet den
+/// Plan-Modus ein.
+const PLAN: &[SubcommandHint] = &[
+    SubcommandHint::new("show", "", "Aktuellen bzw. angehefteten Plan anzeigen"),
+    SubcommandHint::new("edit", "", "Aktuellen Plan im $EDITOR öffnen"),
+    SubcommandHint::new("list", "", "Pläne des Projekts (.harw/plans) auflisten"),
+    SubcommandHint::new("open", "<name>", "Früheren Plan zum Weiterplanen laden"),
+    SubcommandHint::new("inspect", "[id]", "Plan-Graph der plan-Operation anzeigen"),
+    // Runde 5, Teil P: Plan-Store (mehrere Pläne, Freigabe, Schritte). `list`
+    // zeigt hier die Plan-Dateien; die Graphen listet `plans`.
+    SubcommandHint::new("plans", "", "Alle Plan-Graphen des Plan-Stores auflisten"),
+    SubcommandHint::new("switch", "<id>", "Anderen Plan-Graphen aktiv machen"),
+    SubcommandHint::new("archive", "<id>", "Plan-Graphen ausblenden (nicht löschen)"),
+    SubcommandHint::new("submit", "[id]", "Vorgeschlagenen Plan bestätigen"),
+    SubcommandHint::new(
+        "step",
+        "<id> <open|running|done|blocked> [beleg]",
+        "Schritt-Fortschritt melden (done nur mit Beleg)",
+    ),
+];
+
 /// `/models` — Modelle je Rolle.
 const MODELS: &[SubcommandHint] = &[
     SubcommandHint::new("show", "", "Modelle aller Rollen anzeigen"),
@@ -125,6 +147,12 @@ const MODELS: &[SubcommandHint] = &[
     ),
     SubcommandHint::new("reset", "<rolle>", "Rolle auf Vorgabe zurücksetzen"),
     SubcommandHint::new("pick", "<rolle>", "Modellauswahl für eine Rolle öffnen"),
+    // Runde 5, Teil G: eigene Modellwahl je UIA-Worker-Rolle.
+    SubcommandHint::new(
+        "worker",
+        "[<rolle|all> <uia|ziel>]",
+        "UIA-Worker-Modelle anzeigen oder setzen („uia“ = wie UIA)",
+    ),
 ];
 
 /// `/permissions`, Grammatik aus `harw-ops/src/permissions.rs`.
@@ -135,17 +163,21 @@ const PERMISSIONS: &[SubcommandHint] = &[
         "<ask|auto|full> [--session|--project|--global]",
         "Freigabemodus setzen",
     ),
+    // Runde 5, Teil E: `--user` (= `--global`), `rules`, `rm`, `log`.
     SubcommandHint::new(
         "allow",
-        "<tool> [muster] [--session|--project|--global]",
+        "<tool> [muster] [--session|--project|--user]",
         "Allow-Regel hinzufügen",
     ),
     SubcommandHint::new(
         "deny",
-        "<tool> [muster] [--session|--project|--global]",
-        "Deny-Regel hinzufügen",
+        "<tool> [muster] [--session|--project|--user]",
+        "Deny-Regel hinzufügen (schlägt Allow)",
     ),
+    SubcommandHint::new("rules", "", "Regeln mit Herkunft auflisten"),
     SubcommandHint::new("remove", "<nr>", "Regel nach Nummer entfernen"),
+    SubcommandHint::new("rm", "<nr>", "Regel nach Nummer entfernen (Kurzform)"),
+    SubcommandHint::new("log", "[anzahl]", "Letzte Auto-Modus-Entscheidungen"),
 ];
 
 /// `/memory`, Grammatik aus `harw-ops/src/memory.rs`.
@@ -170,6 +202,15 @@ const AGENT: &[SubcommandHint] = &[
     SubcommandHint::new("list", "", "Aktive Kind-Agenten auflisten"),
     SubcommandHint::new("stop", "<agent-id>", "Kind-Agenten abbrechen"),
     SubcommandHint::new("budget", "[agent-id]", "Budget und Lease anzeigen"),
+    // Runde 5, Teil I: TUI-lokal abgefangen (vor der Operation `/agent`).
+    SubcommandHint::new(
+        "stream",
+        "<orchestrators|all|none>",
+        "Live-Stream der Kind-Agenten im Verlauf (Sitzung)",
+    ),
+    // Runde 5, Teil K: TUI-lokal abgefangen (Hintergrund-Agenten).
+    SubcommandHint::new("bg", "", "Hintergrund-Agenten mit Fortschritt auflisten"),
+    SubcommandHint::new("cancel", "<agent-id>", "Hintergrund-Agenten abbrechen"),
 ];
 
 /// `/export` — Optionen statt Unterkommandos (`harw-ops/src/export.rs`).
@@ -387,14 +428,20 @@ const HINT_TABLE: &[(&str, &str, &[SubcommandHint])] = &[
         UIA_EFFORT,
     ),
     ("mode", "/mode [show|<modus>|default <modus>]", MODE),
+    // Runde 5, Teil F.
+    (
+        "plan",
+        "/plan [show|edit|list|open <name>|inspect|plans|switch|submit|step …]",
+        PLAN,
+    ),
     (
         "models",
-        "/models [show|set <rolle> <ziel>|reset <rolle>|pick <rolle>]",
+        "/models [show|set <rolle> <ziel>|reset <rolle>|pick <rolle>|worker [<rolle|all> <uia|ziel>]]",
         MODELS,
     ),
     (
         "permissions",
-        "/permissions [show|mode <modus>|allow <tool>|deny <tool>|remove <nr>]",
+        "/permissions [show|mode <modus>|allow <tool>|deny <tool>|rules|rm <nr>|log]",
         PERMISSIONS,
     ),
     (
@@ -404,7 +451,7 @@ const HINT_TABLE: &[(&str, &str, &[SubcommandHint])] = &[
     ),
     (
         "agent",
-        "/agent [list|stop <agent-id>|budget [agent-id]]",
+        "/agent [list|stop <agent-id>|budget [agent-id]|stream <orchestrators|all|none>|bg|cancel <agent-id>]",
         AGENT,
     ),
     (
@@ -470,7 +517,7 @@ const SUMMARY_OVERRIDES: &[(&str, &str)] = &[
         "memory",
         "Langzeitgedächtnis: auflisten, suchen, festhalten, vergessen",
     ),
-    ("agent", "Kind-Agenten auflisten, stoppen, Budget anzeigen"),
+    ("agent", "Kind-Agenten: Baum, Liste, Stopp, Budget, Stream"),
 ];
 
 /// Befehle aus dem Interaktionsvertrag, die (noch) weder als Operation noch
@@ -592,7 +639,7 @@ fn local_spec(
 
 /// Namen der Ersatz-Spezifikationen für (noch) fehlende Operationen.
 #[cfg_attr(not(test), allow(dead_code))]
-pub(crate) const FALLBACK_COMMANDS: &[&str] = &["mode", "matrix"];
+pub(crate) const FALLBACK_COMMANDS: &[&str] = &["mode", "matrix", "plan"];
 
 /// Spezifikationen aller TUI-lokalen Befehle plus Ersatz-Spezifikationen
 /// ([`FALLBACK_COMMANDS`]).
@@ -605,7 +652,7 @@ pub(crate) const FALLBACK_COMMANDS: &[&str] = &["mode", "matrix"];
 /// sobald die Operation registriert ist.
 pub(crate) fn local_command_specs() -> Vec<CommandSpec> {
     use BusyAvailability::{DeferredUntilTurnEnd as Deferred, Immediate, Staged};
-    use CommandDomain::{AgentTopology, Execution, Misc, SessionLifecycle};
+    use CommandDomain::{Execution, Misc, SessionLifecycle};
     use PermissionTier::{Observer, Operator};
 
     [
@@ -682,13 +729,16 @@ pub(crate) fn local_command_specs() -> Vec<CommandSpec> {
             "Sitzung umbenennen",
             "/rename <titel>",
         ),
+        // Runde 5, Teil I: `/agents` entfällt (nur noch `/agent`); die
+        // Eingabe `/agents` zeigt einen Hinweis (`local_commands`).
+        // Runde 5, Teil L: flüchtige Nebenfrage, jederzeit (auch im Turn).
         local_spec(
-            "agents",
-            AgentTopology,
-            Observer,
+            "btw",
+            Misc,
+            Operator,
             Immediate,
-            "Agenten-Panel ein-/ausblenden",
-            "/agents",
+            "Nebenfrage zum Gespräch, ohne den Agenten zu unterbrechen (nicht im Verlauf)",
+            "/btw <frage>",
         ),
         // ── Ersatz, solange die Operation fehlt ───────────────────────────
         local_spec(
@@ -707,6 +757,18 @@ pub(crate) fn local_command_specs() -> Vec<CommandSpec> {
             "Matrix-Game: Spiel starten, steuern und beobachten (bare: Panel)",
             "",
         ),
+        // Runde 5, Teil F: `/plan` (Plan-Modus an) und `/plan
+        // show|edit|list|open` sind immer lokal; die `plan`-Operation (nur
+        // mit Plan-Diensten) gewinnt als Spezifikation, sobald sie
+        // registriert ist.
+        local_spec(
+            "plan",
+            SessionLifecycle,
+            Operator,
+            Immediate,
+            "Plan-Modus einschalten; Pläne anzeigen, bearbeiten, öffnen",
+            "",
+        ),
     ]
     .into_iter()
     .flatten()
@@ -723,12 +785,15 @@ mod tests {
     /// Echte lokale Befehle (keine Ersatz-Spezifikationen).
     const REAL_LOCAL: &[&str] = &[
         "tools", "resume", "sessions", "exit", "clear", "verbose", "keys", "whoami", "rename",
-        "agents",
+        // Runde 5, Teil L:
+        "btw",
     ];
 
-    /// Befehle, deren Operation fehlen darf. Seit `/matrix` registriert ist,
-    /// ist die Liste leer; `matrix` behält nur seine Ersatz-Spezifikation.
-    const ALLOWED_MISSING: &[&str] = &[];
+    /// Befehle, deren Operation fehlen darf. `matrix` behält nur seine
+    /// Ersatz-Spezifikation. Runde 5, Teil F: die `plan`-Operation gibt es
+    /// nur mit Plan-Diensten (`[tools.plan]`, TUI-Vorgabe), nie im
+    /// eingebauten Katalog; `/plan` selbst ist lokal.
+    const ALLOWED_MISSING: &[&str] = &["plan"];
 
     #[test]
     fn local_specs_cover_every_local_and_fallback_name_once() {
@@ -819,7 +884,7 @@ mod tests {
             |cmd: &str| -> Vec<&str> { subcommand_hints(cmd).iter().map(|h| h.name).collect() };
         assert_eq!(names("model"), ["show", "list", "switch"]);
         assert_eq!(names("provider"), ["show", "list", "test"]);
-        assert_eq!(names("models"), ["show", "set", "reset", "pick"]);
+        assert_eq!(names("models"), ["show", "set", "reset", "pick", "worker"]);
         assert_eq!(names("sandbox-lease"), ["status", "revoke"]);
         assert!(names("mode").contains(&"default"));
         assert!(names("tools").contains(&"profile"));
@@ -853,6 +918,10 @@ mod tests {
             assert!(names("kanban").contains(&sub), "{sub}");
         }
         assert!(names("workbench").contains(&"retention"));
+        // Runde 5, Teil E.
+        for sub in ["allow", "deny", "rules", "rm", "log"] {
+            assert!(names("permissions").contains(&sub), "{sub}");
+        }
         assert!(subcommand_hints("no-such-command").is_empty());
     }
 

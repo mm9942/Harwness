@@ -210,6 +210,9 @@ pub fn child_limits(config: &ResolvedConfig, model_id: &str) -> ChildLimits {
     let limits = ChildLimits {
         max_active_children_per_parent: usize::from(profile.max_child_fanout)
             .min(conservative.max_active_children_per_parent),
+        // Runde 5, Teil K: `[agents] max_spawn_depth` (Vorgabe 4 = bisher
+        // fest `conservative().max_depth`, geklemmt auf 1–6).
+        max_depth: config.harness.agents.effective_max_spawn_depth(),
         ..conservative
     };
     tracing::debug!(
@@ -245,6 +248,29 @@ mod tests {
     /// Ein Modell, dessen Katalogprofil Delegation verbietet
     /// (`harw-model-catalog/src/runtime.rs`: `max_child_fanout: 0`).
     const FORBIDDEN_MODEL: &str = "deepseek-reasoner";
+
+    /// Runde 5, Teil K: `[agents] max_spawn_depth` steuert die Kind-Tiefe;
+    /// die Vorgabe entspricht dem bisherigen festen Wert, der Fan-out bleibt
+    /// vom Modellprofil gedeckelt.
+    #[test]
+    fn spawn_depth_follows_the_agents_section_and_defaults_to_four() {
+        let config = ResolvedConfig::default();
+        let model = "claude-opus-5-5";
+        assert_eq!(
+            child_limits(&config, model).max_depth,
+            ChildLimits::conservative().max_depth
+        );
+        let mut deeper = ResolvedConfig::default();
+        deeper.harness.agents.max_spawn_depth = Some(6);
+        assert_eq!(child_limits(&deeper, model).max_depth, 6);
+        let mut clamped = ResolvedConfig::default();
+        clamped.harness.agents.max_spawn_depth = Some(99);
+        assert_eq!(child_limits(&clamped, model).max_depth, 6);
+        assert_eq!(
+            child_limits(&deeper, model).max_active_children_per_parent,
+            child_limits(&config, model).max_active_children_per_parent
+        );
+    }
 
     #[test]
     fn unbounded_local_is_finite() {

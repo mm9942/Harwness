@@ -128,8 +128,12 @@ impl FsListExecutor {
             Ok(rel) => rel,
             Err(reason) => return Ok(ToolOutput::error(format!("fs.list: {reason}"))),
         };
+        // `null` und `0` gelten als „nicht gesetzt“ (Strict-Schema: Modelle
+        // senden für ungenutzte Felder oft `0`, das sonst ein leeres Listing
+        // ergäbe).
         let cap = args
             .max_entries
+            .filter(|&entries| entries > 0)
             .unwrap_or(self.max_entries)
             .min(self.max_entries)
             .min(HARD_MAX_ENTRIES);
@@ -418,6 +422,37 @@ mod tests {
             3
         );
         assert_eq!(content["stopped"], "entry_limit");
+        Ok(())
+    }
+
+    #[test]
+    fn test_fs_list_zero_or_null_max_entries_means_default() -> TestResult {
+        let fixture = Fixture::new()?;
+        for i in 0..2 {
+            fs::write(fixture.ws.join(format!("f{i}")), "x")?;
+        }
+        let executor = FsListExecutor { max_entries: 10 };
+        let ctx = fixture.ctx(vec![Permission::ReadWorkspace])?;
+        for max_entries in [serde_json::json!(0), serde_json::Value::Null] {
+            let output = executor.list_dir(
+                &ctx,
+                &call(
+                    "fs.list",
+                    serde_json::json!({ "path": ".", "max_entries": max_entries }),
+                ),
+            )?;
+            let ToolOutput::Json { content } = output else {
+                return Err(TestError::Unexpected("expected json output".to_string()));
+            };
+            assert_eq!(
+                content["entries"]
+                    .as_array()
+                    .ok_or(TestError::Missing("entries"))?
+                    .len(),
+                2,
+                "max_entries={max_entries}"
+            );
+        }
         Ok(())
     }
 

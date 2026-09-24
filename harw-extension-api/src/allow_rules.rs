@@ -407,7 +407,20 @@ fn shell_pattern_matches(pattern: &str, command: &str, decision: RuleDecision) -
         return false;
     }
 
-    segment_tokens[..pattern_tokens.len()] == pattern_tokens[..]
+    // Runde 5, Teil E: ein an das letzte Muster-Token angehängtes `*`
+    // (`"cargo test*"`) ist ein Präfix-Glob nur für dieses Token — die
+    // Tokens davor müssen weiterhin exakt passen.
+    let last = pattern_tokens.len() - 1;
+    pattern_tokens
+        .iter()
+        .zip(segment_tokens.iter())
+        .enumerate()
+        .all(
+            |(index, (pattern_token, token))| match pattern_token.strip_suffix('*') {
+                Some(prefix) if index == last && !prefix.is_empty() => token.starts_with(prefix),
+                _ => pattern_token == token,
+            },
+        )
 }
 
 /// Prüft, ob ein Pfad eine `..`-Komponente enthält.
@@ -574,6 +587,37 @@ mod tests {
             rules.evaluate("shell.exec", &json!({"command": "git statusx"})),
             None,
             "a token must match in full, not as a substring prefix"
+        );
+    }
+
+    /// Runde 5, Teil E: `match = "cargo test*"` — angehängtes `*` am letzten
+    /// Token ist ein Präfix-Glob nur für dieses Token.
+    #[test]
+    fn test_evaluate_shell_trailing_glob_on_last_token() {
+        let rules = AllowRuleSet::new();
+        rules.add(rule(
+            "shell.exec",
+            Some("cargo test*"),
+            RuleDecision::Allow,
+            RuleScope::Session,
+        ));
+
+        assert_eq!(
+            rules.evaluate("shell.exec", &json!({"command": "cargo test --workspace"})),
+            Some(RuleDecision::Allow)
+        );
+        assert_eq!(
+            rules.evaluate("shell.exec", &json!({"command": "cargo tests"})),
+            Some(RuleDecision::Allow)
+        );
+        assert_eq!(
+            rules.evaluate("shell.exec", &json!({"command": "cargo build"})),
+            None
+        );
+        assert_eq!(
+            rules.evaluate("shell.exec", &json!({"command": "cargo test; rm -rf /"})),
+            None,
+            "ein zusammengesetzter Befehl trifft nie eine Allow-Regel"
         );
     }
 

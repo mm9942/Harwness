@@ -192,6 +192,12 @@ pub struct HostPermitPrompt {
     workspace: PathBuf,
     preselected: HostPermitVariant,
     responder: oneshot::Sender<Option<HostPermitVariant>>,
+    /// Runde 5, Teil N: wer fragt (Rolle, Kind-ID, Baum-Pfad) — nur bei einer
+    /// Host-Mode-Anfrage aus dem Agentenbaum gesetzt.
+    requester: Option<crate::host_escalation::HostRequester>,
+    /// Runde 5, Teil N: der vom Modell genannte Grund einer Host-Mode-Anfrage
+    /// (reine Anzeige, nie ausgewertet).
+    reason: Option<String>,
 }
 
 impl HostPermitPrompt {
@@ -227,9 +233,40 @@ impl HostPermitPrompt {
                 workspace,
                 preselected,
                 responder,
+                requester: None,
+                reason: None,
             },
             answer,
         )
+    }
+
+    /// Runde 5, Teil N: hängt an, wer fragt (Rolle, Kind-ID, Baum-Pfad).
+    /// Reine Anzeige — ändert nie, was [`Self::approve`] genehmigt.
+    #[must_use]
+    pub fn with_requester(mut self, requester: crate::host_escalation::HostRequester) -> Self {
+        self.requester = Some(requester);
+        self
+    }
+
+    /// Runde 5, Teil N: hängt den Grund einer Host-Mode-Anfrage an (reine
+    /// Anzeige).
+    #[must_use]
+    pub fn with_reason(mut self, reason: impl Into<String>) -> Self {
+        self.reason = Some(reason.into());
+        self
+    }
+
+    /// Wer fragt — `Some` nur bei einer Host-Mode-Anfrage aus dem Agentenbaum
+    /// (`shell.exec` mit `request_host`).
+    #[must_use]
+    pub fn requester(&self) -> Option<&crate::host_escalation::HostRequester> {
+        self.requester.as_ref()
+    }
+
+    /// Der Grund einer Host-Mode-Anfrage, falls angegeben.
+    #[must_use]
+    pub fn reason(&self) -> Option<&str> {
+        self.reason.as_deref()
     }
 
     /// Die Sitzung, für die Host-Zugriff angefragt wird.
@@ -399,6 +436,29 @@ mod tests {
             HostPermitVariant::SessionLease
         );
         Ok(())
+    }
+
+    #[test]
+    fn test_requester_and_reason_are_carried_but_default_to_none() {
+        let (plain, _answer) = HostPermitPrompt::new(
+            "s1".to_owned(),
+            "host-process-worker@1".to_owned(),
+            "echo hi".to_owned(),
+            PathBuf::from("/workspace"),
+            HostPermitVariant::SingleExecution,
+        );
+        assert!(plain.requester().is_none());
+        assert!(plain.reason().is_none());
+        let requester = crate::host_escalation::HostRequester {
+            role: "executor".to_owned(),
+            session: "child-1".to_owned(),
+            path: "uia › root-orchestrator › executor".to_owned(),
+        };
+        let prompt = plain
+            .with_requester(requester.clone())
+            .with_reason("cargo fetch braucht Netz");
+        assert_eq!(prompt.requester(), Some(&requester));
+        assert_eq!(prompt.reason(), Some("cargo fetch braucht Netz"));
     }
 
     #[test]

@@ -440,6 +440,198 @@ pub fn composition_tools_for_role(role: &str) -> &'static [&'static str] {
     }
 }
 
+// ── Runde 5, Teil H: `agent.result` ─────────────────────────────────────────
+
+/// Das rein lesende Werkzeug `agent.result`
+/// (`harw_core_bridge::AgentResultOperation`, Runde 5 Teil H): liefert den
+/// ungekürzten Antworttext eines **eigenen**, abgeschlossenen Kind-Laufs aus
+/// dem Ergebnisarchiv des Spawners, optional seitenweise.
+///
+/// # Warum nicht Teil eines [`RegistryProfile`]
+/// Wie [`ORCHESTRATION_TOOLS`]: die Operation braucht den
+/// `ManagedAgentSpawner` aus `harw-core`. Die Composition-Root hängt sie an
+/// die Wurzel mit Spawner (`harw-runtime/src/assembly.rs`) und an die
+/// Registry jeder Rolle aus [`child_result_tools_for_role`]
+/// (`harw-runtime/src/children.rs`).
+///
+/// # Rechte
+/// Rein lesend, ohne Sandbox-Rechteklasse (`tool_permission` liefert wie für
+/// `delegate_wave` `None`): die Grenze zieht die Eltern-Kind-Bindung im
+/// Spawner, nicht die Sandbox. Steht in [`crate::AUTO_APPROVED_TOOLS`].
+pub const CHILD_RESULT_TOOLS: &[&str] = &["agent.result"];
+
+/// Liefert [`CHILD_RESULT_TOOLS`] für jede Rolle, die Kinder starten darf
+/// (heute die Orchestratoren, siehe [`is_orchestrator_role`]), sonst nichts.
+///
+/// # Beispiele
+/// ```rust
+/// use harw_registry_defaults::profile::{child_result_tools_for_role, role_names};
+///
+/// assert_eq!(
+///     child_result_tools_for_role(role_names::ROOT_ORCHESTRATOR),
+///     &["agent.result"]
+/// );
+/// assert!(child_result_tools_for_role(role_names::EXPLORER).is_empty());
+/// ```
+#[must_use]
+pub fn child_result_tools_for_role(role: &str) -> &'static [&'static str] {
+    if is_orchestrator_role(role) {
+        CHILD_RESULT_TOOLS
+    } else {
+        &[]
+    }
+}
+
+// ── Runde 5, Teil M: `agent.message` / `parent.message` ─────────────────────
+
+/// Das Werkzeug `agent.message` (`harw_core_bridge::AgentMessageOperation`,
+/// Runde 5 Teil M): schickt einem **eigenen, laufenden** Kind eine
+/// Textnachricht (Kurskorrektur oder Antwort auf seine Frage), die es an
+/// seiner nächsten Runden-Grenze liest.
+///
+/// # Warum nicht Teil eines [`RegistryProfile`]
+/// Wie [`CHILD_RESULT_TOOLS`]: die Operation braucht den
+/// `ManagedAgentSpawner`. Die Composition-Root hängt sie an die Wurzel mit
+/// Spawner und an die Registry jeder Rolle aus
+/// [`child_message_tools_for_role`].
+///
+/// # Rechte
+/// Keine Sandbox-Rechteklasse (`tool_permission` liefert `None`), keine
+/// Freigabepflicht ([`crate::AUTO_APPROVED_TOOLS`], nie
+/// [`crate::ALWAYS_ASK_TOOLS`]): das Werkzeug transportiert nur Text an das
+/// eigene Kind — die Eltern-Kind-Bindung prüft der Spawner.
+pub const CHILD_MESSAGE_TOOLS: &[&str] = &["agent.message"];
+
+/// Liefert [`CHILD_MESSAGE_TOOLS`] für jede Rolle, die Kinder starten darf
+/// (dieselbe Fläche wie [`child_result_tools_for_role`]), sonst nichts.
+///
+/// # Beispiele
+/// ```rust
+/// use harw_registry_defaults::profile::{child_message_tools_for_role, role_names};
+///
+/// assert_eq!(
+///     child_message_tools_for_role(role_names::ROOT_ORCHESTRATOR),
+///     &["agent.message"]
+/// );
+/// assert!(child_message_tools_for_role(role_names::EXPLORER).is_empty());
+/// ```
+#[must_use]
+pub fn child_message_tools_for_role(role: &str) -> &'static [&'static str] {
+    if is_orchestrator_role(role) {
+        CHILD_MESSAGE_TOOLS
+    } else {
+        &[]
+    }
+}
+
+/// Das Werkzeug `parent.message` (`harw_core_bridge::ParentMessageOperation`,
+/// Runde 5 Teil M): ein Kind meldet seinem **direkten** Elternteil einen
+/// Zwischenstand (`info`, höchstens einmal je 30 s) oder stellt eine Frage
+/// (`question`, wartet bis zu 10 min auf `agent.message`).
+///
+/// # Rechte
+/// Wie [`CHILD_MESSAGE_TOOLS`]: keine Rechteklasse, keine Freigabepflicht,
+/// Längendeckel 4 KiB, nur an den direkten Elternteil.
+pub const PARENT_MESSAGE_TOOLS: &[&str] = &["parent.message"];
+
+/// Die Rollen, die als Kind mit einem Elternteil laufen und
+/// [`PARENT_MESSAGE_TOOLS`] bekommen.
+///
+/// # Bewusst nicht enthalten
+/// - die vier Security-Triage-Rollen: parametergetrieben, ohne eigene
+///   Werkzeugoberfläche (`[tools].admitted = []`);
+/// - die vier Matrix-Sitze: der Matrix-Runner fährt sie, kein wartender
+///   Eltern-Turn liest ihre Meldungen;
+/// - `memory-steward`: ein Harness-interner Konsolidierungslauf ohne
+///   Modell-Elternteil;
+/// - `executor`: bewusst genau `shell.exec` (siehe `agents/executor.toml`
+///   und `test_only_executor_gets_the_shell_execution_profile`).
+pub const PARENT_MESSAGE_ROLES: &[&str] = &[
+    role_names::ROOT_ORCHESTRATOR,
+    role_names::CODING_ORCHESTRATOR,
+    role_names::RESEARCH_ORCHESTRATOR,
+    role_names::ANALYSIS_ORCHESTRATOR,
+    role_names::EXPLORER,
+    role_names::RESEARCHER_DEPS,
+    role_names::DEPENDENCY_RESEARCHER,
+    role_names::RESEARCHER,
+    role_names::RESEARCHER_WEB,
+    role_names::PLANNER,
+    role_names::ANALYST,
+    role_names::UIA_WORKER,
+    role_names::UIA_EXPLORER,
+    role_names::UIA_WRITER,
+    role_names::UIA_SHELL_WORKER,
+    role_names::UIA_LATEX_WRITER,
+    role_names::AGENT_STEWARD,
+];
+
+/// Liefert [`PARENT_MESSAGE_TOOLS`] für die Rollen aus
+/// [`PARENT_MESSAGE_ROLES`], sonst nichts.
+///
+/// # Beispiele
+/// ```rust
+/// use harw_registry_defaults::profile::{parent_message_tools_for_role, role_names};
+///
+/// assert_eq!(
+///     parent_message_tools_for_role(role_names::EXPLORER),
+///     &["parent.message"]
+/// );
+/// assert!(parent_message_tools_for_role(role_names::MATRIX_PLAYER).is_empty());
+/// ```
+#[must_use]
+pub fn parent_message_tools_for_role(role: &str) -> &'static [&'static str] {
+    if PARENT_MESSAGE_ROLES.contains(&role) {
+        PARENT_MESSAGE_TOOLS
+    } else {
+        &[]
+    }
+}
+
+// ── Runde 5, Teil B: `host.sudo_exec` ───────────────────────────────────────
+
+/// Das Root-Werkzeug `host.sudo_exec` (`harw_tool_shell::SudoToolProvider`,
+/// Runde 5 Teil B).
+///
+/// # Warum nicht Teil eines [`RegistryProfile`]
+/// Der Provider braucht die Sendeseite des sudo-Fragekanals, die es nur in
+/// der interaktiven TUI gibt (`EntryKind::Tui`). Die Composition-Root
+/// (`harw-runtime/src/children.rs`) hängt ihn deshalb nur an die Registry
+/// der Rollen aus [`SUDO_ROLES`] und nur, wenn ein solcher Kanal existiert —
+/// sonst fehlt das Werkzeug (fail-closed). Es steht in
+/// [`crate::ALWAYS_ASK_TOOLS`] und braucht `Permission::ExecuteProcess`
+/// ([`crate::authority::tool_permission`]).
+///
+/// # Deckung
+/// Wie [`ORCHESTRATION_TOOLS`]: die Deckungstests vergleichen die TOML-Seite
+/// gegen `profile.tool_names()` ∪ [`composition_tools_for_role`] ∪
+/// [`knowledge_tools_for_role`] ∪ [`sudo_tools_for_role`].
+pub const SUDO_TOOLS: &[&str] = &["host.sudo_exec"];
+
+/// Die einzigen Rollen, die Root-Befehle anfragen dürfen
+/// (Nutzerentscheidung Runde 5): die beiden Host-Shell-Worker.
+/// `host-process-worker` steht bewusst nicht in [`role_names::ALL`] (siehe
+/// dort), deshalb hier als Literal.
+pub const SUDO_ROLES: &[&str] = &[role_names::UIA_SHELL_WORKER, "host-process-worker"];
+
+/// Liefert [`SUDO_TOOLS`] für die Rollen aus [`SUDO_ROLES`], sonst nichts.
+///
+/// # Beispiele
+/// ```rust
+/// use harw_registry_defaults::profile::{role_names, sudo_tools_for_role};
+///
+/// assert_eq!(sudo_tools_for_role(role_names::UIA_SHELL_WORKER), &["host.sudo_exec"]);
+/// assert!(sudo_tools_for_role(role_names::EXECUTOR).is_empty());
+/// ```
+#[must_use]
+pub fn sudo_tools_for_role(role: &str) -> &'static [&'static str] {
+    if SUDO_ROLES.contains(&role) {
+        SUDO_TOOLS
+    } else {
+        &[]
+    }
+}
+
 /// Die lesenden Wissenswerkzeuge (Plan Teil D), die die Composition-Root
 /// neben der Profil-Registry an Wurzel und ausgewählte Kind-Rollen hängt:
 /// `workbench.show`, `diary.read`, `palace.search`, `palace.recall`.
@@ -573,6 +765,7 @@ pub(crate) const FS_READ_ONLY_TOOLS: &[&str] =
 const FS_FULL_TOOLS: &[&str] = &[
     "fs.read",
     "fs.write",
+    "fs.edit",
     "fs.list",
     "fs.search",
     "fs.glob",
@@ -580,7 +773,7 @@ const FS_FULL_TOOLS: &[&str] = &[
 ];
 
 /// Die Werkzeuge von [`RegistryProfile::MemoryStewardship`]: die fünf
-/// lesenden `fs.*`-Werkzeuge plus `fs.write`, in Provider-Reihenfolge —
+/// lesenden `fs.*`-Werkzeuge plus `fs.write`/`fs.edit`, in Provider-Reihenfolge —
 /// identisch zu [`FS_FULL_TOOLS`], aber bewusst als eigene Konstante
 /// benannt, weil sie (anders als `FS_FULL_TOOLS`) nie mit `shell.exec`
 /// zusammen registriert werden darf. Siehe `agents/memory-steward.toml`
@@ -852,7 +1045,7 @@ pub(crate) const BROWSER_TOOLS: &[&str] = &[
 ///   ([`crate::research_web::researcher_web_policy`]).
 /// - `Planning` — `ReadOnlyExplore` plus `lens.ask` (Plan-/Goal-Operationen
 ///   bewirbt es nicht: das Kind besitzt dafür keinen Executor).
-/// - `MemoryStewardship` — genau `fs.*` (alle sechs Werkzeuge, inklusive
+/// - `MemoryStewardship` — genau `fs.*` (alle sieben Werkzeuge, inklusive
 ///   `fs.write`) plus `doc.read_pdf`, aber **kein** `shell.exec` und kein
 ///   `web.*`. Einzige eingebaute Rolle: [`role_names::MEMORY_STEWARD`]
 ///   (siehe deren Begründung bei [`RegistryProfile::MemoryStewardship`]
@@ -934,7 +1127,7 @@ pub enum RegistryProfile {
     /// = []`), etwa die vier `security-*-triage`-Rollen (siehe
     /// [`role_names::SECURITY_EGRESS_TRIAGE`] u. a.).
     NoTools,
-    /// Genau `fs.*` (alle sechs Werkzeuge, inklusive `fs.write`) plus
+    /// Genau `fs.*` (alle sieben Werkzeuge, inklusive `fs.write`) plus
     /// `doc.read_pdf` — kein `shell.exec`, kein `web.*`, kein `deps.*`, kein
     /// `lens.ask`.
     ///
@@ -1034,7 +1227,7 @@ pub enum RegistryProfile {
     /// `web.fetch`/`web.search`), aber ohne `deps.*` — siehe
     /// `agents/uia-explorer.toml`.
     UiaExplorer,
-    /// Schreibende Erkundungsspezialisierung der UIA: alle sechs
+    /// Schreibende Erkundungsspezialisierung der UIA: alle sieben
     /// `fs.*`-Werkzeuge inklusive `fs.write` ([`FS_FULL_TOOLS`]) plus
     /// [`DOC_TOOLS`] (`doc.read_pdf`) plus die fünf lesenden
     /// `deps.*`-Werkzeuge ([`DEPS_TOOLS`]) plus alle vier `web.*`-Werkzeuge
@@ -1098,7 +1291,7 @@ pub enum RegistryProfile {
     /// (egress-gebundenen) Hosts.
     ReadOnlyResearch,
     /// Workspace lesen und schreiben, aber weder ausführen noch ins Netz:
-    /// alle sechs `fs.*`-Werkzeuge (inklusive `fs.write`) plus
+    /// alle sieben `fs.*`-Werkzeuge (inklusive `fs.write`) plus
     /// `doc.read_pdf` plus `explore.*` plus die workspace-lesenden
     /// `deps.graph`/`deps.locked` — kein `shell.*`, kein `process.*`, kein
     /// `web.*`, kein `lens.ask`, kein `deps.source_*`.
@@ -1110,8 +1303,8 @@ pub enum RegistryProfile {
     /// schreiben und bringt Netz-Werkzeuge mit, `UiaWriter` bringt `web.*`
     /// und den Registry-Quellcache mit. Die Rechte bleiben deshalb exakt
     /// `{ReadWorkspace, WriteWorkspace}`: `deps.source_*`
-    /// (`ReadCargoRegistry`) ist bewusst nicht dabei. `fs.edit` gibt es in
-    /// `harw-tool-fs` (noch) nicht; kommt es hinzu, gehört es hierher.
+    /// (`ReadCargoRegistry`) ist bewusst nicht dabei. `fs.edit` (Runde 5,
+    /// Teil D) gehört mit `fs.write` dazu — gleiches Recht, Freigabe je Aufruf.
     /// Keine eingebaute Rolle bekommt dieses Profil — es ist ein reines
     /// Einstiegsprofil.
     WorkspaceEdit,
@@ -1132,7 +1325,7 @@ pub enum RegistryProfile {
     /// Reducer der Rollen bleibt
     /// [`crate::authority::AuthorityReducer::ReadOnly`] — kein Netz.
     MatrixReader,
-    /// LaTeX-Schreibspezialisierung der UIA: alle sechs `fs.*`-Werkzeuge
+    /// LaTeX-Schreibspezialisierung der UIA: alle sieben `fs.*`-Werkzeuge
     /// inklusive `fs.write` ([`FS_FULL_TOOLS`]) plus [`DOC_TOOLS`]
     /// (`doc.read_pdf`) plus [`LATEX_TOOLS`] (`latex.build`) — kein
     /// `shell.*`, kein `process.*`, kein `web.*`, kein `deps.*`, kein
@@ -1153,8 +1346,8 @@ pub enum RegistryProfile {
     /// [`RegistryProfile::MemoryStewardship`] hat zwar dieselbe
     /// Werkzeugmenge, ist aber der Gedächtnis-Konsolidierung vorbehalten und
     /// trägt deren Rollenbeschreibung; `UiaShellWorker` bringt die freie
-    /// Shell mit. `fs.edit` gibt es in `harw-tool-fs` (noch) nicht; kommt es
-    /// hinzu, gehört es hierher. Rolle: [`role_names::UIA_LATEX_WRITER`],
+    /// Shell mit. `fs.edit` (Runde 5, Teil D) ist wie `fs.write` zugelassen.
+    /// Rolle: [`role_names::UIA_LATEX_WRITER`],
     /// Reducer [`crate::authority::AuthorityReducer::ReadOnly`] — ohne Netz;
     /// `fs.write` (`WriteWorkspace`) und `latex.build` (`ExecuteProcess`)
     /// sind wie bei `uia-writer`/`uia-shell-worker` die dokumentierte
@@ -1332,7 +1525,7 @@ impl RegistryProfile {
             // Siehe die Begründung bei `RegistryProfile::NoTools`: keine
             // Werkzeuge registriert, keine beworben.
             RegistryProfile::NoTools => Vec::new(),
-            // Alle sechs `fs.*`-Werkzeuge (inklusive `fs.write`) plus
+            // Alle sieben `fs.*`-Werkzeuge (inklusive `fs.write`) plus
             // `doc.read_pdf`, aber kein `shell.exec` — siehe die Begründung
             // bei `RegistryProfile::MemoryStewardship`.
             RegistryProfile::MemoryStewardship => MEMORY_STEWARDSHIP_TOOLS
@@ -1382,7 +1575,7 @@ impl RegistryProfile {
                 .copied()
                 .collect(),
             // Schreibende Erkundungsspezialisierung der UIA (siehe die
-            // Begründung bei `RegistryProfile::UiaWriter`): alle sechs
+            // Begründung bei `RegistryProfile::UiaWriter`): alle sieben
             // fs.*-Werkzeuge (inklusive `fs.write`) plus `doc.read_pdf` plus
             // die lesenden `deps.*` plus `web.fetch`/`web.search` — kein
             // `shell.exec`.
@@ -1415,7 +1608,7 @@ impl RegistryProfile {
                 .collect(),
             // Workspace lesen und schreiben ohne Shell und ohne Netz (siehe
             // die Begründung bei `RegistryProfile::WorkspaceEdit`): alle
-            // sechs `fs.*` plus `doc.read_pdf` plus `explore.*` plus die
+            // sieben `fs.*` plus `doc.read_pdf` plus `explore.*` plus die
             // workspace-lesenden `deps.graph`/`deps.locked`.
             RegistryProfile::WorkspaceEdit => FS_FULL_TOOLS
                 .iter()
@@ -1433,7 +1626,7 @@ impl RegistryProfile {
                 .copied()
                 .collect(),
             // LaTeX-Schreibspezialisierung der UIA (siehe die Begründung bei
-            // `RegistryProfile::UiaLatexWriter`): alle sechs `fs.*`
+            // `RegistryProfile::UiaLatexWriter`): alle sieben `fs.*`
             // (inklusive `fs.write`) plus `doc.read_pdf` plus `latex.build`
             // — kein Netz, keine freie Shell, keine `deps.*`, kein
             // `explore.*`.
@@ -1929,6 +2122,23 @@ pub struct HostPermitWiring {
     /// Anzeige-Vorauswahl für eine neu geöffnete Frage; ändert nie, was
     /// tatsächlich genehmigt wird.
     pub preselected_variant: HostPermitVariant,
+    /// Runde 5, Teil B: Sendeseite des sudo-Fragekanals (`host.sudo_exec`).
+    /// Nur die TUI-Montage setzt ihn; `None` heißt: kein
+    /// `harw_tool_shell::SudoToolProvider` wird gebaut (fail-closed). Reist
+    /// mit dieser Verdrahtung, damit er die Kind-Fabriken ohne eigene
+    /// Verdrahtungsebene erreicht.
+    pub sudo_prompts: Option<harw_tool_shell::SudoPromptSender>,
+    /// Runde 5, Teil N: Host-Mode-Anfragen aus dem Agentenbaum
+    /// (`shell.exec` mit `request_host`). Nur die TUI-Montage setzt sie;
+    /// `None` heißt: jede Anfrage endet fail-closed mit
+    /// `harw_tool_shell::HOST_MODE_REQUIRES_TUI_MSG`. Reist wie
+    /// `sudo_prompts` mit dieser Verdrahtung zu jeder Kind-Fabrik.
+    pub host_escalation: Option<harw_tool_shell::HostEscalation>,
+    /// Runde 5, Teil N: Obergrenze für `shell.exec`-Zeitlimits aus
+    /// `[shell] max_timeout_secs` (bereits geklemmt). `None`: Vorgabe
+    /// `harw_tool_shell::DEFAULT_MAX_TIMEOUT_SECS`. Reist mit dieser
+    /// Verdrahtung, weil sie jeden Shell-Provider (Wurzel und Kinder) erreicht.
+    pub shell_max_timeout_secs: Option<u64>,
 }
 
 impl HostPermitWiring {
@@ -1945,7 +2155,37 @@ impl HostPermitWiring {
             registry,
             prompt_sender,
             preselected_variant: HostPermitVariant::default(),
+            sudo_prompts: None,
+            host_escalation: None,
+            shell_max_timeout_secs: None,
         }
+    }
+
+    /// Runde 5, Teil N: hängt die Verdrahtung für Host-Mode-Anfragen an
+    /// (`shell.exec` mit `request_host`; nur TUI).
+    #[must_use]
+    pub fn with_host_escalation(
+        mut self,
+        escalation: Option<harw_tool_shell::HostEscalation>,
+    ) -> Self {
+        // Runde 5, Teil N: nur die TUI-Montage übergibt `Some`.
+        self.host_escalation = escalation;
+        self
+    }
+
+    /// Runde 5, Teil N: setzt die Obergrenze für `shell.exec`-Zeitlimits
+    /// (`[shell] max_timeout_secs`, bereits geklemmt).
+    #[must_use]
+    pub fn with_shell_max_timeout_secs(mut self, max_timeout_secs: u64) -> Self {
+        self.shell_max_timeout_secs = Some(max_timeout_secs);
+        self
+    }
+
+    /// Hängt die Sendeseite des sudo-Fragekanals an (nur TUI, Runde 5 Teil B).
+    #[must_use]
+    pub fn with_sudo_prompts(mut self, sender: Option<harw_tool_shell::SudoPromptSender>) -> Self {
+        self.sudo_prompts = sender;
+        self
     }
 
     /// Setzt die Anzeige-Vorauswahl einer neu geöffneten Frage.
@@ -2003,6 +2243,14 @@ fn profile_tool_providers(
                 .with_host_permit_registry(Arc::clone(&wiring.registry))
                 .with_host_permit_prompts(wiring.prompt_sender.clone())
                 .with_preselected_permit_variant(wiring.preselected_variant);
+            // Runde 5, Teil N: Host-Mode-Anfrage nur mit TUI-Verdrahtung.
+            if let Some(escalation) = &wiring.host_escalation {
+                provider = provider.with_host_escalation(escalation.clone());
+            }
+            // Runde 5, Teil N: Obergrenze `[shell] max_timeout_secs`.
+            if let Some(max_timeout_secs) = wiring.shell_max_timeout_secs {
+                provider = provider.with_max_timeout_secs(max_timeout_secs);
+            }
         }
         Arc::new(provider)
     };
@@ -2060,7 +2308,7 @@ fn profile_tool_providers(
         }
         // Keine Provider: siehe die Begründung bei `RegistryProfile::NoTools`.
         RegistryProfile::NoTools => Vec::new(),
-        // Der volle, ungefilterte `FsToolProvider` (alle sechs `fs.*`, inklusive
+        // Der volle, ungefilterte `FsToolProvider` (alle sieben `fs.*`, inklusive
         // `fs.write`) plus der lesende Doc-Provider — aber kein
         // `ShellToolProvider`. Siehe die Begründung bei
         // `RegistryProfile::MemoryStewardship`.
@@ -2159,7 +2407,7 @@ fn profile_tool_providers(
             vec![filesystem, doc, explorer, web]
         }
         // Schreibende Erkundungsspezialisierung der UIA: voller, ungefilterter
-        // FS-Provider (alle sechs `fs.*`, inklusive `fs.write`) + lesender
+        // FS-Provider (alle sieben `fs.*`, inklusive `fs.write`) + lesender
         // Doc-Provider + vollständig lesender Deps-Provider + auf
         // `web.fetch`/`web.search` gefilterter Web-Provider — kein
         // `ShellToolProvider`. Siehe die Begründung bei
@@ -2210,7 +2458,7 @@ fn profile_tool_providers(
             vec![filesystem, doc, explorer, web]
         }
         // Workspace lesen und schreiben ohne Shell und ohne Netz: voller,
-        // ungefilterter FS-Provider (alle sechs `fs.*`, inklusive
+        // ungefilterter FS-Provider (alle sieben `fs.*`, inklusive
         // `fs.write`) + lesender Doc-Provider + Explorer-Provider + auf
         // `deps.graph`/`deps.locked` gefilterter Deps-Provider — kein
         // `ShellToolProvider`, kein `WebToolProvider`. Siehe die Begründung
@@ -2238,7 +2486,7 @@ fn profile_tool_providers(
             vec![filesystem, doc]
         }
         // LaTeX-Schreibspezialisierung der UIA: voller, ungefilterter
-        // FS-Provider (alle sechs `fs.*`, inklusive `fs.write`) + lesender
+        // FS-Provider (alle sieben `fs.*`, inklusive `fs.write`) + lesender
         // Doc-Provider + `LatexToolProvider` (`latex.build`, festes argv in
         // der Bubblewrap-Sandbox, nie Host) — kein Shell-, Web-, Deps- oder
         // Explorer-Provider. Siehe die Begründung bei
@@ -3291,6 +3539,7 @@ mod tests {
         let expected = vec![
             "fs.read",
             "fs.write",
+            "fs.edit",
             "fs.list",
             "fs.search",
             "fs.glob",
@@ -3331,6 +3580,7 @@ mod tests {
         let expected = vec![
             "fs.read",
             "fs.write",
+            "fs.edit",
             "fs.list",
             "fs.search",
             "fs.glob",
@@ -3542,7 +3792,7 @@ mod tests {
         for profile in RegistryProfile::ALL.iter().filter(|p| p.is_read_only()) {
             let assembled = assemble(*profile)?;
             let names = registered_names(&assembled);
-            for forbidden in ["fs.write", "shell.exec"] {
+            for forbidden in ["fs.write", "fs.edit", "shell.exec"] {
                 assert!(
                     !names.contains(&forbidden.to_owned()),
                     "{profile:?} darf {forbidden} nicht registrieren"
@@ -3720,6 +3970,7 @@ mod tests {
             provider.executor(&ToolName::new("fs.write")).is_none(),
             "gefiltertes Werkzeug darf nicht per Namensraten erreichbar sein"
         );
+        assert!(provider.executor(&ToolName::new("fs.edit")).is_none());
         assert!(provider.executor(&ToolName::new("unbekannt")).is_none());
         assert!(!provider.parallel_safe(&ToolName::new("fs.write")));
         assert!(provider.parallel_safe(&ToolName::new("fs.read")));
@@ -3821,6 +4072,56 @@ mod tests {
             }
         }
         assert!(composition_tools_for_role("unbekannt").is_empty());
+    }
+
+    /// Runde 5, Teil B: `host.sudo_exec` bekommen ausschließlich die beiden
+    /// Host-Shell-Worker; kein Profil registriert es selbst, es braucht
+    /// `ExecuteProcess` und fragt immer (`ALWAYS_ASK_TOOLS`), und nie ist es
+    /// automatisch freigegeben.
+    #[test]
+    fn test_sudo_tools_are_offered_only_to_the_two_host_shell_workers() {
+        for role in role_names::ALL {
+            let expected: &[&str] = if *role == role_names::UIA_SHELL_WORKER {
+                SUDO_TOOLS
+            } else {
+                &[]
+            };
+            assert_eq!(sudo_tools_for_role(role), expected, "{role}");
+        }
+        assert_eq!(sudo_tools_for_role("host-process-worker"), SUDO_TOOLS);
+        assert!(sudo_tools_for_role("sandbox-shell-worker").is_empty());
+        assert!(sudo_tools_for_role("unbekannt").is_empty());
+        for profile in RegistryProfile::ALL {
+            for tool in SUDO_TOOLS {
+                assert!(
+                    !profile.registered_tool_names().contains(tool),
+                    "{profile:?} darf {tool} nicht selbst registrieren"
+                );
+            }
+        }
+        for tool in SUDO_TOOLS {
+            assert_eq!(
+                crate::authority::tool_permission(tool),
+                Some(harw_authority::Permission::ExecuteProcess)
+            );
+            assert!(crate::ALWAYS_ASK_TOOLS.contains(tool), "{tool}");
+            assert!(!crate::AUTO_APPROVED_TOOLS.contains(tool), "{tool}");
+        }
+    }
+
+    /// Ohne ausdrücklichen Aufruf trägt die Host-Permit-Verdrahtung keinen
+    /// sudo-Kanal (fail-closed für jeden Nicht-TUI-Einstieg).
+    #[test]
+    fn test_host_permit_wiring_has_no_sudo_channel_by_default() {
+        let (sender, _receiver) = harw_tool_shell::host_permit_prompt_channel();
+        let wiring = HostPermitWiring::new(
+            Arc::new(ProcessPermitLedger::default()),
+            Arc::new(HostPermitSessionRegistry::default()),
+            sender,
+        );
+        assert!(wiring.sudo_prompts.is_none());
+        let (sudo, _sudo_receiver) = harw_tool_shell::sudo_prompt_channel();
+        assert!(wiring.with_sudo_prompts(Some(sudo)).sudo_prompts.is_some());
     }
 
     /// Plan Teil D: die lesenden Wissenswerkzeuge sind ausnahmslos

@@ -803,6 +803,11 @@ fn render_show(store: &dyn GoalStore, ctx: &OpContext) -> Result<String, OpError
         format!("Statement: {}", goal.statement),
         format!("Plan-Bindung: {binding}"),
     ];
+    // Runde 5, Teil P: Fortschritt des gebundenen Plans (n/m Schritte) und
+    // der aktuelle Schritt.
+    if let Some(progress) = crate::plan_catalog::goal_progress_line(ctx, &goal) {
+        lines.push(progress);
+    }
 
     if !goal.non_goals.is_empty() {
         lines.push(format!("Non-Goals: {}", goal.non_goals.join("; ")));

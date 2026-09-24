@@ -129,8 +129,61 @@ fn token(home: &Path, provider: &str) -> Result<(), String> {
                 .to_owned(),
         );
     }
-    let token = SecretString::new(trimmed.to_owned().into_boxed_str());
+    let normalized: String = trimmed
+        .chars()
+        .filter(|character| !character.is_ascii_whitespace())
+        .collect();
+    if provider == "anthropic" {
+        check_anthropic_token_format(&normalized).map_err(str::to_owned)?;
+    }
+    let token = SecretString::new(normalized.into_boxed_str());
     persist_and_hint(home, provider, &token)
+}
+
+/// Prüft das Format eines Anthropic-Tokens, ohne ihn auszugeben.
+///
+/// Setup-/OAuth-Tokens beginnen mit `sk-ant-oat`, API-Keys mit `sk-ant-api`;
+/// beide bestehen nur aus sichtbarem ASCII. Fehlt das Präfix (z. B. nur der
+/// hintere Teil eingefügt), würde Harw den Wert als API-Key senden und
+/// Anthropic mit 401 antworten; Sonderzeichen (typografische Anführungszeichen
+/// aus einem Paste) scheitern schon als HTTP-Header.
+///
+/// # Errors
+/// Eine Klartext-Begründung ohne den Token-Wert.
+fn check_anthropic_token_format(token: &str) -> Result<(), &'static str> {
+    if !token.chars().all(|character| character.is_ascii_graphic()) {
+        return Err(
+            "der Token enthält unsichtbare oder Nicht-ASCII-Zeichen (z. B. typografische \
+             Anführungszeichen aus einem Paste); bitte ohne Anführungszeichen erneut einfügen",
+        );
+    }
+    if !token.starts_with("sk-ant-") {
+        return Err(
+            "der Token beginnt nicht mit `sk-ant-` (Setup-Tokens: `sk-ant-oat01-…`); \
+             vermutlich wurde nur ein Teil eingefügt – bitte den vollständigen Token \
+             aus `claude setup-token` einfügen",
+        );
+    }
+    Ok(())
+}
+
+/// Kurzbefund für `harw auth status` über eine Anthropic-Token-Datei.
+fn anthropic_token_file_note(path: &Path) -> &'static str {
+    let Ok(raw) = std::fs::read_to_string(path) else {
+        return "";
+    };
+    let normalized: String = raw
+        .chars()
+        .filter(|character| !character.is_ascii_whitespace())
+        .collect();
+    match check_anthropic_token_format(&normalized) {
+        Ok(()) if normalized.starts_with("sk-ant-oat") => " (Format: sk-ant-oat… ok)",
+        Ok(()) => " (Format: sk-ant-… ohne `oat` – wird als API-Key gesendet)",
+        Err(_) if !normalized.starts_with("sk-ant-") => {
+            " (Format: Präfix `sk-ant-oat` fehlt – `harw auth token` neu ausführen)"
+        }
+        Err(_) => " (Format: ungültige Zeichen – `harw auth token` neu ausführen)",
+    }
 }
 
 /// Speichert den Token (0600), ohne ihn in einer Shell-Zeile auszugeben.
@@ -258,7 +311,12 @@ fn status(home: &Path) -> Result<(), String> {
         ),
     ];
     for (label, path) in files {
-        println!("  file {:<28} {}", label, yes_no(path.is_file()));
+        let note = if label.ends_with("anthropic-oauth.token") && path.is_file() {
+            anthropic_token_file_note(&path)
+        } else {
+            ""
+        };
+        println!("  file {:<28} {}{note}", label, yes_no(path.is_file()));
     }
     eprintln!("\n(Home: {home_str})");
     Ok(())
@@ -425,7 +483,35 @@ fn read_all_stdin() -> Result<String, String> {
 
 #[cfg(test)]
 mod tests {
-    use super::looks_like_jwt;
+    #[test]
+    fn anthropic_token_format_check_explains_without_echo() {
+        assert!(check_anthropic_token_format("sk-ant-oat01-abcDEF_123").is_ok());
+        assert!(check_anthropic_token_format("sk-ant-api03-abc").is_ok());
+        let missing = check_anthropic_token_format("oat01-abcDEF")
+            .err()
+            .unwrap_or_default();
+        assert!(missing.contains("sk-ant-"), "{missing}");
+        assert!(!missing.contains("abcDEF"));
+        let quoted = check_anthropic_token_format("\u{201c}sk-ant-oat01-x\u{201d}")
+            .err()
+            .unwrap_or_default();
+        assert!(quoted.contains("Anführungszeichen"), "{quoted}");
+    }
+
+    #[test]
+    fn anthropic_token_file_note_flags_missing_prefix() -> Result<(), std::io::Error> {
+        let dir = std::env::temp_dir().join(format!("harw-auth-note-{}", std::process::id()));
+        std::fs::create_dir_all(&dir)?;
+        let file = dir.join("anthropic-oauth.token");
+        std::fs::write(&file, "oat01-only-the-tail\n")?;
+        assert!(anthropic_token_file_note(&file).contains("fehlt"));
+        std::fs::write(&file, "sk-ant-oat01-complete\n")?;
+        assert!(anthropic_token_file_note(&file).contains("ok"));
+        std::fs::remove_dir_all(&dir)?;
+        Ok(())
+    }
+
+    use super::{anthropic_token_file_note, check_anthropic_token_format, looks_like_jwt};
 
     #[test]
     fn jwt_like_values_are_rejected_for_openai_platform_auth() {

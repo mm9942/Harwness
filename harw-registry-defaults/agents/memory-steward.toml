@@ -86,6 +86,7 @@ admitted = [
   "fs.grep",
   "doc.read_pdf",
   "fs.write",
+  "fs.edit",
 ]
 forbidden = [
   "shell.exec",

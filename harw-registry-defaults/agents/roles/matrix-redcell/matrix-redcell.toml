@@ -56,6 +56,7 @@ admitted = [
 ]
 forbidden = [
     "fs.write",
+    "fs.edit",
     "shell.exec",
     "process.kill",
     "web.fetch",

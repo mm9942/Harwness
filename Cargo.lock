@@ -2608,6 +2608,7 @@ dependencies = [
  "harw-research",
  "harw-sandbox",
  "harw-session-store",
+ "harw-tool-plan",
  "harw-tool-shell",
  "harw-tools",
  "harw-types",
@@ -2748,6 +2749,7 @@ dependencies = [
  "harw-tool-explorer",
  "harw-tool-fs",
  "harw-tool-lens",
+ "harw-tool-plan",
  "harw-tool-process",
  "harw-tool-shell",
  "harw-tool-web",
@@ -2809,6 +2811,7 @@ dependencies = [
  "harw-sandbox",
  "harw-secrets",
  "harw-session-store",
+ "harw-tool-plan",
  "harw-tool-shell",
  "harw-types",
  "jiff",
@@ -2985,6 +2988,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "harw-tool-plan"
+version = "0.3.0"
+dependencies = [
+ "harw-authority",
+ "harw-extension-api",
+ "harw-tools",
+ "harw-types",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "harw-tool-process"
 version = "0.3.0"
 dependencies = [
@@ -3005,8 +3023,11 @@ dependencies = [
 name = "harw-tool-shell"
 version = "0.3.0"
 dependencies = [
+ "blake3",
  "harw-authority",
  "harw-extension-api",
+ "harw-macros",
+ "harw-observe",
  "harw-sandbox",
  "harw-tools",
  "harw-types",
@@ -3015,6 +3036,7 @@ dependencies = [
  "tempfile",
  "tokio",
  "tracing",
+ "zeroize",
 ]
 
 [[package]]
@@ -3084,6 +3106,7 @@ dependencies = [
  "harw-runtime",
  "harw-sandbox",
  "harw-session-store",
+ "harw-tool-plan",
  "harw-tool-shell",
  "harw-tools",
  "harw-types",
@@ -3098,6 +3121,7 @@ dependencies = [
  "tracing",
  "unicode-segmentation",
  "unicode-width 0.2.0",
+ "zeroize",
 ]
 
 [[package]]

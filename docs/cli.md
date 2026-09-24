@@ -89,7 +89,7 @@ ignorieren.
 | Flag | Wirkung |
 | --- | --- |
 | `--mode MODUS` | Startet im angegebenen Interaktionsmodus (`chat`, `plan`, `explore`, `work`, `shell`). |
-| `--approval ask\|auto\|full` | Freigabemodus nur für diese Sitzung: `ask` fragt bei jedem Werkzeugaufruf, `auto` lässt unkritische Aufrufe durch und fragt beim Rest, `full` fragt nie. Überschreibt den konfigurierten Standard. |
+| `--approval ask\|auto\|full` | Freigabemodus nur für diese Sitzung: `ask` fragt bei jedem Werkzeugaufruf, `auto` lässt unkritische Aufrufe durch, prüft die übrigen mit Vorfilter und Klassifizierer und fragt im Zweifel, `full` fragt nie. Überschreibt den konfigurierten Standard. |
 | `--model ID` | Verwendet für diese Sitzung das Modell `ID` statt des Standardmodells. |
 | `--goal TEXT` | Setzt beim Start ein Ziel, auf das die Sitzung hinarbeitet. |
 | `--agent NAME` | Startet die Sitzung mit der Agentendefinition `NAME` als Wurzel (eingebaute Rolle wie `root-orchestrator` oder eine eigene Definition) statt der konfigurierten `active_agent_definition`. Nur für diese Sitzung; dauerhaft setzt man sie mit `/agent use NAME` (Entfernen: `/agent use --clear`), wirksam ab der nächsten Sitzung. |
@@ -98,6 +98,23 @@ ignorieren.
 Nicht global sind die Chat-Flags `-r/--resume` und `--all`: sie gelten nur für
 `harw` ohne Befehl und für `harw chat`. `--all` gibt es zusätzlich bei
 `harw session list`.
+
+Sitzungen ohne einen einzigen Nutzer-Turn werden seit Runde 5 nicht mehr
+gespeichert. Ältere leere Sitzungen blendet die Auswahl von `harw -r` aus;
+über `--all` oder eine ausdrückliche ID bleiben sie erreichbar. Eine
+fortgesetzte Sitzung zeigt einen Resume-Hinweis statt einer neuen Begrüßung.
+
+## Anmeldedaten prüfen (`harw auth`)
+
+- Anmeldedaten werden beim Lesen normalisiert: aller ASCII-Leerraum
+  (Zeilenumbrüche, CRLF aus `.env`, umbrochene Pastes) wird entfernt. Das gilt
+  auch für `CLAUDE_CODE_OAUTH_TOKEN` und `ANTHROPIC_API_KEY`.
+- `harw auth token` prüft das Format eines Anthropic-Tokens, bevor er
+  gespeichert wird: Setup-/OAuth-Tokens beginnen mit `sk-ant-oat`, API-Keys
+  mit `sk-ant-api`, erlaubt ist nur sichtbares ASCII. Die Fehlermeldung nennt
+  die Ursache, nie den Token-Wert.
+- `harw auth status` hängt an jede Anthropic-Token-Datei einen kurzen
+  Formatbefund an, ebenfalls ohne den Wert auszugeben.
 
 ## Ausgabe mit `--json`
 

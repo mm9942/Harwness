@@ -80,6 +80,13 @@ pub(crate) enum PickerTarget {
         /// Die Rolle, deren Modell gesetzt wird.
         role: ModelRole,
     },
+    /// Runde 5, Teil G: eigene Modellwahl einer UIA-Worker-Rolle
+    /// (`/models worker <rolle> <provider>/<modell>`); Provider frei
+    /// wählbar, unabhängig vom UIA-Provider.
+    UiaWorkerRole {
+        /// Rollenname, z. B. `uia-writer`.
+        role: String,
+    },
 }
 
 impl PickerTarget {
@@ -101,6 +108,7 @@ impl PickerTarget {
             Self::Uia => format!("/uia-model switch {model}"),
             Self::UiaWorker { .. } => format!("/uia-worker-model switch {model}"),
             Self::Role { role } => format!("/models set {} {provider}/{model}", role.key()),
+            Self::UiaWorkerRole { role } => format!("/models worker {role} {provider}/{model}"),
         }
     }
 
@@ -114,6 +122,7 @@ impl PickerTarget {
             Self::Role { role } => {
                 format!("Modell für {} (ab nächster Sitzung)", role.label())
             }
+            Self::UiaWorkerRole { role } => format!("UIA-Worker-Modell für {role}"),
         }
     }
 }
@@ -185,6 +194,9 @@ pub(crate) struct ModelSwitchPicker {
     active_provider: Option<String>,
     /// Ursprünglich aktives Modell (Kontext für Vorauswahl-Logik).
     active_model: Option<String>,
+    /// Runde 5, Teil G: nach `Accept` den Bereich „UIA-Worker-Modelle“
+    /// öffnen (UIA-Wahl aus `/models`).
+    reopen_uia_workers: bool,
 }
 
 /// Ereignis, das [`ModelSwitchPicker::on_key`] zurückgibt.
@@ -317,6 +329,7 @@ impl ModelSwitchPicker {
                 selected_provider,
                 active_provider: active_provider_owned,
                 active_model: active_model_owned,
+                reopen_uia_workers: false,
             });
         }
 
@@ -330,7 +343,22 @@ impl ModelSwitchPicker {
             selected_provider: None,
             active_provider: active_provider_owned,
             active_model: active_model_owned,
+            reopen_uia_workers: false,
         })
+    }
+
+    /// Runde 5, Teil G: nach der Bestätigung soll sich der Bereich
+    /// „UIA-Worker-Modelle“ öffnen (UIA-Wahl aus `/models`).
+    pub(crate) fn set_uia_workers_follow_up(&mut self) {
+        self.reopen_uia_workers = true;
+    }
+
+    /// Runde 5, Teil G: `true`, wenn nach `Accept` der Bereich
+    /// „UIA-Worker-Modelle“ (wieder) geöffnet werden soll — nach der UIA-Wahl
+    /// aus `/models` und nach jeder Wahl für eine UIA-Worker-Rolle.
+    #[must_use]
+    pub(crate) fn opens_uia_workers_after(&self) -> bool {
+        self.reopen_uia_workers || matches!(self.target, PickerTarget::UiaWorkerRole { .. })
     }
 
     /// Gibt den Umschalt-Kontext zurück, für den dieser Picker aufgebaut
@@ -436,12 +464,13 @@ impl ModelSwitchPicker {
             ChoiceAction::Chosen(idx) => {
                 let provider_id = match &self.target {
                     PickerTarget::UiaWorker { fixed_provider } => fixed_provider.to_owned(),
-                    PickerTarget::Orchestrator | PickerTarget::Uia | PickerTarget::Role { .. } => {
-                        match self.selected_provider.take() {
-                            Some(id) => id,
-                            None => return PickerAction::Cancel,
-                        }
-                    }
+                    PickerTarget::Orchestrator
+                    | PickerTarget::Uia
+                    | PickerTarget::Role { .. }
+                    | PickerTarget::UiaWorkerRole { .. } => match self.selected_provider.take() {
+                        Some(id) => id,
+                        None => return PickerAction::Cancel,
+                    },
                 };
 
                 let models = models_for_provider(&self.models_by_provider, &provider_id);
@@ -885,6 +914,61 @@ mod tests {
                 "/models set research openai/gpt-5"
             );
         }
+        Ok(())
+    }
+
+    /// Runde 5, Teil G: eine UIA-Worker-Rolle wählt Provider und Modell
+    /// frei — auch einen anderen Provider als die UIA — und führt zu
+    /// `/models worker <rolle> <provider>/<modell>`; danach öffnet sich der
+    /// Worker-Bereich wieder.
+    #[test]
+    fn test_uia_worker_role_picks_any_provider_and_reopens_workers() -> TestResult {
+        let target = PickerTarget::UiaWorkerRole {
+            role: "uia-writer".to_owned(),
+        };
+        let mut picker = ModelSwitchPicker::new(
+            target.clone(),
+            providers_fixture(),
+            models_fixture(),
+            Some("anthropic"),
+            Some("claude-opus"),
+        )
+        .ok_or(TestError::Missing("picker"))?;
+        assert!(picker.opens_uia_workers_after());
+
+        assert_eq!(picker.on_key(make_key(KeyCode::Down)), PickerAction::Stay);
+        assert_eq!(picker.on_key(make_key(KeyCode::Enter)), PickerAction::Stay);
+        let accepted = picker.on_key(make_key(KeyCode::Enter));
+        assert_eq!(
+            accepted,
+            PickerAction::Accept {
+                provider: "openai".to_owned(),
+                model: "gpt-5".to_owned(),
+            }
+        );
+        assert_eq!(
+            target.command_line("openai", "gpt-5"),
+            "/models worker uia-writer openai/gpt-5"
+        );
+        assert!(target.context_label().contains("uia-writer"));
+        Ok(())
+    }
+
+    /// Runde 5, Teil G: nur die UIA-Wahl aus `/models` öffnet danach den
+    /// Worker-Bereich.
+    #[test]
+    fn test_uia_picker_follow_up_flag() -> TestResult {
+        let mut picker = ModelSwitchPicker::new(
+            PickerTarget::Uia,
+            providers_fixture(),
+            models_fixture(),
+            None,
+            None,
+        )
+        .ok_or(TestError::Missing("picker"))?;
+        assert!(!picker.opens_uia_workers_after());
+        picker.set_uia_workers_follow_up();
+        assert!(picker.opens_uia_workers_after());
         Ok(())
     }
 }

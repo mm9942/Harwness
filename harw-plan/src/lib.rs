@@ -14,6 +14,8 @@
 //! - Ziel-Verwaltung: [`goal`]
 //! - Store-Trait: [`store`]
 //! - Implementierungen: [`memory_store`], [`file_store`], [`goal_store`]
+//! - Plan-Katalog (mehrere Pläne, ein aktiver, Archiv, Freigabestand):
+//!   [`catalog`]
 //!
 //! # Architekturregel: eine Mutationsstelle
 //! Der Plan wird ausschließlich über `PlanStore::apply` verändert. Die
@@ -51,6 +53,8 @@
 
 pub mod actions;
 pub mod admission;
+// Runde 5, Teil P: mehrere Pläne je Store, ein aktiver.
+pub mod catalog;
 pub mod config;
 pub mod error;
 pub mod file_store;
@@ -84,6 +88,10 @@ mod test_support;
 
 pub use crate::actions::{NodePatch, PlanAction, PlanEvent};
 pub use crate::admission::ScopeMatcher;
+pub use crate::catalog::{
+    PlanApproval, PlanMeta, PlanSummary, current_step, has_blocked_step, plan_progress,
+    progress_bar,
+};
 pub use crate::config::PlanToolConfig;
 pub use crate::error::{PlanError, PlanResult, PlanToolConfigError};
 pub use crate::file_store::FilePlanStore;

@@ -8,6 +8,8 @@
 
 pub mod allow_rules;
 pub mod approval_mode;
+// Runde 5, Teil E: Auto-Modus (Klassifizierer-Naht, Protokoll, Deckel).
+pub mod auto_mode;
 pub mod capabilities;
 pub mod contributors;
 pub mod error;

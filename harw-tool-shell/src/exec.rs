@@ -84,6 +84,14 @@ use std::{
 use tokio::process::{Child, Command as TokioCommand};
 use tracing::{debug, info, warn};
 
+// Runde 5, Teil N: Host-Mode-Anfrage (`request_host`) und Sandbox-Hinweis;
+// umhüllt jeden ausgegebenen `ShellExecutor`.
+mod escalation;
+// Runde 5, Teil N (Folgeauftrag): Zeitlimit per Argument, Build-Vorgabe,
+// Obergrenze `[shell] max_timeout_secs`, klare Zeitablauf-Meldung.
+mod timeouts;
+pub use timeouts::{BUILD_COMMAND_DEFAULT_TIMEOUT_SECS, DEFAULT_MAX_TIMEOUT_SECS};
+
 // ── Constants ─────────────────────────────────────────────────────────────────
 
 const TOOL_NAME: &str = "shell.exec";
@@ -714,9 +722,11 @@ impl ShellExecutor {
         // `BwrapLauncher::spawn` ist synchron und kann nicht pipen. Der validierte Plan wird
         // daher hier mit Tokio gestartet — mit dem festgepinnten `launcher.executable()`,
         // nie mit einem über `PATH` gesuchten `bwrap`.
+        // Runde 5, Teil N: RLIMIT_CPU wächst mit dem gewährten Zeitlimit.
+        let limits = timeouts::limits_for(self.limits, effective_timeout);
         let launch = launch_command(
             prlimit.as_deref(),
-            &self.limits,
+            &limits,
             launcher.executable(),
             plan.args(),
         );
@@ -808,7 +818,9 @@ impl ShellExecutor {
 
         let setsid = resolve_setsid();
         let (program, shell_args) = host_shell_argv(setsid, &args.command);
-        let launch = launch_command(prlimit.as_deref(), &self.limits, &program, &shell_args);
+        // Runde 5, Teil N: RLIMIT_CPU wächst mit dem gewährten Zeitlimit.
+        let limits = timeouts::limits_for(self.limits, effective_timeout);
+        let launch = launch_command(prlimit.as_deref(), &limits, &program, &shell_args);
 
         let mut command = TokioCommand::new(&launch.program);
         command.args(&launch.args);
@@ -1072,7 +1084,7 @@ impl ShellExecutor {
 /// # Concurrency
 /// `Send + Sync`; sicher von mehreren Tasks gleichzeitig aufrufbar, die
 /// zugrundeliegende Suche läuft dank `OnceLock` nur einmal.
-fn resolve_setsid() -> Option<&'static Path> {
+pub(crate) fn resolve_setsid() -> Option<&'static Path> {
     static SETSID_PATH: OnceLock<Option<PathBuf>> = OnceLock::new();
     SETSID_PATH.get_or_init(find_setsid).as_deref()
 }
@@ -1266,6 +1278,17 @@ impl ToolExecutor for ShellExecutor {
             // 2. Reject invalid caller-controlled values before sandbox planning or spawn.
             self.effective_timeout(&args)?;
 
+            // 2b. Runde 5, Teil B: Rechte-Werkzeuge (`sudo`, `doas`, `pkexec`,
+            //     `su`, …) in Befehlsposition laufen nie über `shell.exec` —
+            //     Root-Befehle gibt es nur über `host.sudo_exec` mit Freigabe
+            //     im TUI-Fenster (fail-closed, auch im Host-Profil).
+            if let Some(program) = crate::sudo::escalation_program(&args.command) {
+                warn!(program, "shell.exec denied: privilege escalation program");
+                return Ok(ToolOutput::error(crate::sudo::shell_escalation_message(
+                    program,
+                )));
+            }
+
             // 3. Permission check
             if let Some(err) = harw_tools::sandbox_guard::require_permission(
                 context,
@@ -1353,6 +1376,17 @@ pub struct ShellToolProvider {
     /// `run_command` tatsächlich einen `bwrap`-Plan baut; wirkungslos für den
     /// Host-Pfad aus Plan Teil B1, der ohnehin ohne `bwrap` läuft.
     pub host_path: Option<HostPathBinding>,
+    /// Runde 5, Teil N: Verdrahtung für Host-Mode-Anfragen (`request_host`)
+    /// aus dem Agentenbaum; nur die TUI setzt sie
+    /// ([`Self::with_host_escalation`]). `None` heißt: jede Anfrage endet
+    /// fail-closed mit [`crate::HOST_MODE_REQUIRES_TUI_MSG`].
+    pub host_escalation: Option<crate::host_escalation::HostEscalation>,
+    /// Runde 5, Teil N: Obergrenze für `timeout_secs` eines Aufrufs (Konfig
+    /// `[shell] max_timeout_secs`, Vorgabe [`DEFAULT_MAX_TIMEOUT_SECS`]).
+    /// [`Self::timeout_secs`] bleibt die Vorgabe ohne Angabe;
+    /// Build-/Test-Befehle bekommen ohne Angabe
+    /// [`BUILD_COMMAND_DEFAULT_TIMEOUT_SECS`], ebenfalls gedeckelt.
+    pub max_timeout_secs: u64,
 }
 
 impl ShellToolProvider {
@@ -1450,6 +1484,54 @@ impl ShellToolProvider {
         self
     }
 
+    /// Runde 5, Teil N: erlaubt Host-Mode-Anfragen (`shell.exec` mit
+    /// `request_host`) über den angehängten Host-Permit-Fragekanal. Wirkt
+    /// nur zusammen mit Ledger, Registry und Fragekanal; ändert nichts am
+    /// Sandbox-Pfad eines Aufrufs ohne `request_host`.
+    #[must_use]
+    pub fn with_host_escalation(
+        mut self,
+        escalation: crate::host_escalation::HostEscalation,
+    ) -> Self {
+        self.host_escalation = Some(escalation);
+        self
+    }
+
+    /// Runde 5, Teil N: setzt die Obergrenze für `timeout_secs` (bereits
+    /// geklemmter Wert aus `[shell] max_timeout_secs`).
+    #[must_use]
+    pub fn with_max_timeout_secs(mut self, max_timeout_secs: u64) -> Self {
+        self.max_timeout_secs = max_timeout_secs;
+        self
+    }
+
+    /// Die Zeitlimit-Politik dieses Providers.
+    fn timeout_policy(&self) -> timeouts::TimeoutPolicy {
+        timeouts::TimeoutPolicy {
+            default_secs: self.timeout_secs,
+            build_default_secs: BUILD_COMMAND_DEFAULT_TIMEOUT_SECS,
+            max_secs: self.max_timeout_secs.max(self.timeout_secs),
+        }
+    }
+
+    /// Baut den inneren, unumhüllten [`ShellExecutor`] aus der
+    /// Provider-Konfiguration. Seine Kappung ist die Obergrenze; das
+    /// wirksame Zeitlimit schreibt die Hülle vorher in die Argumente.
+    fn build_executor(&self) -> ShellExecutor {
+        ShellExecutor {
+            timeout_secs: self.max_timeout_secs.max(self.timeout_secs),
+            max_output_bytes: self.max_output_bytes,
+            limits: self.limits,
+            sandbox_profile: self.sandbox_profile.clone(),
+            permit_ledger: self.permit_ledger.clone(),
+            host_permit_registry: self.host_permit_registry.clone(),
+            host_permit_prompts: self.host_permit_prompts.clone(),
+            preselected_permit_variant: self.preselected_permit_variant,
+            host_permit_timeout: self.host_permit_timeout,
+            host_path: self.host_path.clone(),
+        }
+    }
+
     /// Builds the [`JsonSchema`] for the `shell.exec` parameters.
     ///
     /// # Description
@@ -1482,11 +1564,20 @@ impl ShellToolProvider {
             JsonSchema {
                 schema_type: Some(JsonSchemaType::Integer),
                 description: Some(
-                    "Optional per-call timeout override. Cannot exceed provider default."
+                    "Optional timeout in seconds for this call. Default 30 s; build/test \
+                     commands (cargo, make, npm, pytest, go, ...) default to 600 s. Capped by \
+                     the configured maximum ([shell] max_timeout_secs, default 900). Set it \
+                     explicitly for long-running commands."
                         .to_owned(),
                 ),
                 ..Default::default()
             },
+        );
+
+        // Runde 5, Teil N: optionale Host-Mode-Anfrage.
+        properties.insert(
+            escalation::REQUEST_HOST_FIELD.to_owned(),
+            escalation::request_host_schema(),
         );
 
         JsonSchema {
@@ -1521,6 +1612,8 @@ impl Default for ShellToolProvider {
             preselected_permit_variant: HostPermitVariant::SingleExecution,
             host_permit_timeout: HOST_PERMIT_PROMPT_TIMEOUT,
             host_path: None,
+            host_escalation: None,
+            max_timeout_secs: DEFAULT_MAX_TIMEOUT_SECS,
         }
     }
 }
@@ -1552,7 +1645,12 @@ impl ToolProvider for ShellToolProvider {
             name: ToolName::new(TOOL_NAME),
             description: "Execute a shell command inside the isolated project sandbox. \
                 Runs under Bubblewrap via /bin/sh -c and captures stdout+stderr. \
-                Requires ExecuteProcess permission."
+                Requires ExecuteProcess permission. Default timeout 30 s, build/test \
+                commands (cargo, make, npm, pytest, go, ...) 600 s; for long commands set \
+                timeout_secs explicitly (capped by [shell] max_timeout_secs, default 900). \
+                If the sandbox blocks the command \
+                (network, path outside, missing tool, namespace), you may retry with \
+                request_host {reason} to ask the user for Host-Mode."
                 .to_owned(),
             parameters: Self::parameter_schema(),
             strict: true,
@@ -1586,18 +1684,13 @@ impl ToolProvider for ShellToolProvider {
     /// ```
     fn executor(&self, name: &ToolName) -> Option<Arc<dyn ToolExecutor>> {
         if name.as_str() == TOOL_NAME {
-            Some(Arc::new(ShellExecutor {
-                timeout_secs: self.timeout_secs,
-                max_output_bytes: self.max_output_bytes,
-                limits: self.limits,
-                sandbox_profile: self.sandbox_profile.clone(),
-                permit_ledger: self.permit_ledger.clone(),
-                host_permit_registry: self.host_permit_registry.clone(),
-                host_permit_prompts: self.host_permit_prompts.clone(),
-                preselected_permit_variant: self.preselected_permit_variant,
-                host_permit_timeout: self.host_permit_timeout,
-                host_path: self.host_path.clone(),
-            }))
+            // Runde 5, Teil N: jeder Executor ist umhüllt — ohne
+            // `request_host` verhält er sich wie bisher (plus Sandbox-Hinweis).
+            Some(Arc::new(escalation::EscalatingShellExecutor::new(
+                self.build_executor(),
+                self.host_escalation.clone(),
+                self.timeout_policy(),
+            )))
         } else {
             None
         }
@@ -2280,6 +2373,8 @@ mod tests {
             preselected_permit_variant: HostPermitVariant::SingleExecution,
             host_permit_timeout: HOST_PERMIT_PROMPT_TIMEOUT,
             host_path: None,
+            host_escalation: None,
+            max_timeout_secs: DEFAULT_MAX_TIMEOUT_SECS,
         };
         let call = make_call_with_timeout("echo partial_before_timeout; sleep 5", 1);
         let started = std::time::Instant::now();
@@ -2379,6 +2474,8 @@ mod tests {
             preselected_permit_variant: HostPermitVariant::SingleExecution,
             host_permit_timeout: HOST_PERMIT_PROMPT_TIMEOUT,
             host_path: None,
+            host_escalation: None,
+            max_timeout_secs: DEFAULT_MAX_TIMEOUT_SECS,
         };
         // Generate more than the configured output cap.
         let call = make_call("echo 'this_is_a_longer_string_than_ten_bytes'");
@@ -2421,6 +2518,8 @@ mod tests {
             preselected_permit_variant: HostPermitVariant::SingleExecution,
             host_permit_timeout: HOST_PERMIT_PROMPT_TIMEOUT,
             host_path: None,
+            host_escalation: None,
+            max_timeout_secs: DEFAULT_MAX_TIMEOUT_SECS,
         };
         let started = std::time::Instant::now();
 
@@ -2465,6 +2564,8 @@ mod tests {
             preselected_permit_variant: HostPermitVariant::SingleExecution,
             host_permit_timeout: HOST_PERMIT_PROMPT_TIMEOUT,
             host_path: None,
+            host_escalation: None,
+            max_timeout_secs: DEFAULT_MAX_TIMEOUT_SECS,
         };
         // Mit geerbtem Terminal-stdin würde `cat` bis zum Timeout blockieren.
         let call = make_call("cat; echo stdin_reached_eof");
@@ -2496,8 +2597,13 @@ mod tests {
             ToolOutput::Json { content } => {
                 assert_eq!(content["exit_code"], 0, "{content}");
                 let stdout = content["stdout"].as_str().unwrap_or("");
+                // Runde 5, Teil N: RLIMIT_CPU wächst mit dem Zeitlimit
+                // (`timeouts::limits_for`); Vorgabe-Zeitlimit hier 30 s.
+                let cpu =
+                    timeouts::limits_for(ShellLimits::default(), DEFAULT_TIMEOUT_SECS).cpu_secs;
+                let cpu = cpu.to_string();
                 let expected = [
-                    ("Max cpu time", "60"),
+                    ("Max cpu time", cpu.as_str()),
                     ("Max file size", "268435456"),
                     ("Max processes", "4096"),
                     ("Max open files", "256"),

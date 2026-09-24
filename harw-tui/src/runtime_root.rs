@@ -617,13 +617,22 @@ pub fn run_tui(assembly: Arc<RuntimeAssembly>, options: TuiRunOptions) -> Result
     app.seed_session_usage(session.id().as_str(), session.total_usage());
     app.set_active_mode(session.mode());
     app.set_historic_agent_events(historic_agents);
-    let uia_user_name = active_uia_user_name(&assembly);
-    app.push_lines(vec![Line::from(tui_greeting(
-        app.project_root(),
-        assembly.config().harness.active_uia_definition.as_deref(),
-        uia_user_name.as_deref(),
-        provider_model_info(assembly.config()).as_deref(),
-    ))]);
+    // Runde 5, Teil H: eine fortgesetzte Sitzung (`harw -r <id>`) wird nicht
+    // neu begrüßt, sondern als fortgesetzt gemeldet.
+    if crate::session_lifecycle::has_user_turn(&session) {
+        app.push_lines(vec![Line::from(crate::session_lifecycle::resume_notice(
+            session.id(),
+            session.history().len(),
+        ))]);
+    } else {
+        let uia_user_name = active_uia_user_name(&assembly);
+        app.push_lines(vec![Line::from(tui_greeting(
+            app.project_root(),
+            assembly.config().harness.active_uia_definition.as_deref(),
+            uia_user_name.as_deref(),
+            provider_model_info(assembly.config()).as_deref(),
+        ))]);
+    }
     if let Some(error) = key_bindings_error {
         tracing::warn!(%error, "tui.keybindings.load_failed");
         push_system_text(&mut app, &format!("{error}; using default key bindings"));
@@ -748,6 +757,10 @@ pub fn run_tui(assembly: Arc<RuntimeAssembly>, options: TuiRunOptions) -> Result
                                 frame_req.schedule_frame();
                                 continue;
                             }
+                            // Runde 5, Teil H: eine leere Vorgängersitzung
+                            // (z. B. die Platzhalter-Sitzung von `harw -r`)
+                            // hinterlässt keine Sidecars.
+                            gateway.discard_if_empty(Some(resume.session_store_root.as_path()));
                             gateway.replace(
                                 next_runtime.session,
                                 Arc::clone(next_assembly.state_store()),
@@ -767,6 +780,32 @@ pub fn run_tui(assembly: Arc<RuntimeAssembly>, options: TuiRunOptions) -> Result
                             approvals = next_runtime.approvals;
                             host_permit_prompts = next_runtime.host_permit_prompts;
                             let previous = std::mem::replace(&mut current, next_assembly);
+                            // Runde 5, Teil K: laufende Hintergrund-Agenten der
+                            // alten Sitzung werden abgebrochen und protokolliert.
+                            let cancelled = crate::app::background_agents::cancel_all(
+                                previous.spawner(),
+                                previous.root_session_id(),
+                                "session switch (/new, /resume)",
+                            );
+                            if cancelled > 0 {
+                                push_system_text(
+                                    &mut app,
+                                    &format!(
+                                        "{cancelled} Hintergrund-Agent(en) der vorigen Sitzung abgebrochen."
+                                    ),
+                                );
+                            }
+                            // Runde 5, Teil N: ein Sitzungswechsel beendet eine
+                            // laufende Host-Phase bewusst (neue Montage, frische
+                            // Registry) — sichtbar machen.
+                            if let Some(notice) =
+                                crate::host_permit_dialog::session_switch_host_notice(
+                                    previous.host_permit_session_registry(),
+                                    previous.root_session_id().as_str(),
+                                )
+                            {
+                                push_system_text(&mut app, notice);
+                            }
                             previous.close_session(previous.root_session_id());
                             tracing::info!(
                                 previous = %previous.root_session_id(),
@@ -783,7 +822,20 @@ pub fn run_tui(assembly: Arc<RuntimeAssembly>, options: TuiRunOptions) -> Result
     });
     // `guard` stellt das Terminal zurück, auch im Fehlerfall.
     drop(guard);
+    // Runde 5, Teil K: laufende Hintergrund-Agenten enden mit der TUI.
+    crate::app::background_agents::cancel_all(
+        current.spawner(),
+        current.root_session_id(),
+        "tui exited",
+    );
     let persistence = runtime.block_on(gateway.persist_state());
+    // Runde 5, Teil H: beim Beenden ohne einen einzigen Nutzer-Turn bleibt
+    // nichts von der leeren Sitzung zurück.
+    gateway.discard_if_empty(
+        resume
+            .as_ref()
+            .map(|resume| resume.session_store_root.as_path()),
+    );
     crate::gateway::ChatGateway::session_mut(&mut gateway)
         .announce_closed(Some("tui exited".to_owned()));
     current.close_session(current.root_session_id());
@@ -951,6 +1003,33 @@ fn build_root_runtime(
     .with_session_controller(controller)
     .with_project_root(assembly.project().project_root.display().to_string())
     .with_managed_spawner(assembly.spawner().cloned());
+    // Runde 5, Teil B: sudo-Fragekanal (`host.sudo_exec`) — nur eine
+    // TUI-Montage hat ihn. Die App hält ihn samt Sitzungs-Merken des
+    // Passworts; `/new`, `/resume` und Beenden verwerfen die alte App und
+    // damit auch ein gemerktes Passwort (Drop → genullt).
+    let sudo_minutes = assembly
+        .config()
+        .harness
+        .host
+        .effective_sudo_session_minutes();
+    app = app.with_sudo_prompts(
+        assembly.take_sudo_prompts(),
+        std::time::Duration::from_secs(u64::from(sudo_minutes) * 60),
+    );
+    // Runde 5, Teil I: Live-Stream der Kind-Agenten (`[tui] child_stream`);
+    // Orchestrator-Erkennung über die Rollendefinitionen (eingebaut + lokal).
+    app = app.with_child_stream(
+        assembly.config().harness.tui.child_stream.into(),
+        crate::child_stream::OrchestratorRoles::from_definitions(
+            assembly.config().executable_agents.values(),
+        ),
+    );
+    // Runde 5, Teil F: Plan-Fragekanal (`plan.exit`/`plan.enter`/`ask_user`,
+    // nur TUI-Montage) und geteilter Plan-Zustand (Sperre, `/plan …`).
+    app = app.with_plan_ui(
+        assembly.take_plan_ui_requests(),
+        Some(assembly.plan_session().clone()),
+    );
     if let Some(plan) = assembly.plan_services() {
         app = app.with_plan_services(TuiPlanServices::from(plan));
     }
@@ -988,6 +1067,11 @@ fn build_root_runtime(
     app.set_active_mode(session.mode());
     // Live-Bus des Laufs: Agenten-Panel, Streaming-Vorschau und Σ-Tokens.
     app.attach_agent_events(assembly.agent_events());
+    // Runde 5, Teil K: Orchestratoren der UIA-Wurzel laufen im Hintergrund.
+    let approval_driver = crate::app::background_agents::attach_launcher(approval_driver, assembly);
+    // Runde 5, Teil O: Freigabe-Fragen von Kindern gehen an die Nutzerin
+    // (Freigabedialog mit Absender) statt sofort zu scheitern.
+    crate::app::child_approvals::attach(&mut app, assembly.spawner(), assembly.auto_mode());
     tracing::info!(
         session_id = %session.id(),
         mode = session.mode().as_str(),
@@ -1095,13 +1179,23 @@ async fn resume_session(
         .seed_session_usage(runtime.session.id().as_str(), runtime.session.total_usage());
     runtime.app.set_active_mode(runtime.session.mode());
     runtime.app.set_historic_agent_events(historic_agents);
-    let uia_user_name = active_uia_user_name(&assembly);
-    runtime.app.push_lines(vec![Line::from(tui_greeting(
-        runtime.app.project_root(),
-        assembly.config().harness.active_uia_definition.as_deref(),
-        uia_user_name.as_deref(),
-        provider_model_info(assembly.config()).as_deref(),
-    ))]);
+    // Runde 5, Teil H: `/resume` begrüßt nicht neu („Guten Morgen …“), als
+    // wäre die Sitzung neu gestartet, sondern meldet die Fortsetzung.
+    if crate::session_lifecycle::has_user_turn(&runtime.session) {
+        let notice = crate::session_lifecycle::resume_notice(
+            runtime.session.id(),
+            runtime.session.history().len(),
+        );
+        runtime.app.push_lines(vec![Line::from(notice)]);
+    } else {
+        let uia_user_name = active_uia_user_name(&assembly);
+        runtime.app.push_lines(vec![Line::from(tui_greeting(
+            runtime.app.project_root(),
+            assembly.config().harness.active_uia_definition.as_deref(),
+            uia_user_name.as_deref(),
+            provider_model_info(assembly.config()).as_deref(),
+        ))]);
+    }
     Ok(ResumedRuntime { assembly, runtime })
 }
 
@@ -1213,8 +1307,29 @@ impl ResumableGateway {
     /// Speichert den vollständigen, versionierten Zustand der aktiven
     /// Sitzung. Der Verlauf bleibt weiterhin im Turn-Loop append-only; diese
     /// Methode sichert die dazugehörige Projektion für Start, Resume und Exit.
+    ///
+    /// Runde 5, Teil H: eine Sitzung ohne Nutzer-Turn wird nicht gesichert —
+    /// sonst legte das Sichern ein Transcript an, und jede frische
+    /// Start-/`/new`-Sitzung erschiene später als leere Sitzung im Picker
+    /// (`crate::session_lifecycle`).
     async fn persist_state(&self) -> harw_core::state_store::StateStoreResult<()> {
+        if !crate::session_lifecycle::should_persist(&self.session) {
+            tracing::debug!(
+                session_id = %self.session.id(),
+                "tui.session.persist_skipped_without_user_turn"
+            );
+            return Ok(());
+        }
         self.session.persist_state(self.store.as_ref()).await
+    }
+
+    /// Runde 5, Teil H: entfernt die Sidecars der aktiven Sitzung, falls sie
+    /// leer ist (kein Nutzer-Turn, kein Transcript). Best-effort.
+    fn discard_if_empty(&self, store_root: Option<&std::path::Path>) {
+        if let Some(root) = store_root {
+            let _removed =
+                crate::session_lifecycle::discard_empty_session_sidecars(root, &self.session);
+        }
     }
 }
 

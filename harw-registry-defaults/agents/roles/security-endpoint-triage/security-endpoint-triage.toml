@@ -112,7 +112,7 @@ may_research_web = false
 # Keine Werkzeugoberfläche beansprucht — siehe Begründung oben.
 [tools]
 admitted = []
-forbidden = ["fs.write", "shell.exec", "web.fetch", "web.docs_rs", "web.crates_io"]
+forbidden = ["fs.write", "fs.edit", "shell.exec", "web.fetch", "web.docs_rs", "web.crates_io"]
 
 # Ein reiner Sichtungs-/Vorschlags-Job braucht keine Kind-Agenten.
 [spawn]

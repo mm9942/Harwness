@@ -4,8 +4,16 @@
 //! die Montage die Wellen W2b/W2c gemäß `docs/remediation/CONTRACTS.md` §runtime.
 #![forbid(unsafe_code)]
 
+// Runde 5, Teil K: Hintergrund-Agenten (`agent.status`/`agent.cancel`, `[agents]`).
+pub mod agent_background_wiring;
+// Runde 5, Teil M: Montage von `agent.message`/`parent.message`.
+pub mod agent_messaging_wiring;
+// Runde 5, Teil H: Montage von `agent.result`.
+pub mod agent_result_wiring;
 pub mod approval;
 pub mod assembly;
+// Runde 5, Teil E: Auto-Modus (Vorfilter, Klassifizierer, Deckel).
+pub mod auto_classifier;
 pub mod budget;
 pub mod ceiling;
 pub mod children;
@@ -16,16 +24,22 @@ pub mod dream_run;
 pub mod error;
 pub mod guard_wiring;
 pub mod handoff;
+// Runde 5, Teil N: Host-Mode-Anfrage aus dem Orchestrator-Baum.
+pub mod host_escalation_wiring;
 pub mod job_ledger;
 pub mod mcp_wiring;
 pub mod memory_wiring;
 pub mod model;
+// Runde 5, Teil E: Lernen aus Freigaben.
+pub mod permission_rules;
 pub mod sandbox;
 pub mod services;
 pub mod session_title;
 pub mod spec;
 pub mod task_context;
 pub mod trace;
+// Runde 5, Teil G: eigene Modellwahl je UIA-Worker-Rolle zur Laufzeit.
+pub mod uia_worker_routing;
 
 #[cfg(test)]
 mod test_support;
@@ -35,6 +49,8 @@ pub use assembly::{
     RootSession, RuntimeAssembly, RuntimeAssemblyBuilder, RuntimeNarrowing, RuntimeStores,
     SessionLifecycleHook, TurnLimits, default_approval_mode,
 };
+// Runde 5, Teil E.
+pub use auto_classifier::{AutoModeHandle, ModelClassifierBackend, PrefilterContext};
 pub use budget::child_limits;
 pub use ceiling::root_ceiling;
 pub use children::RuntimeChildRegistryFactory;
@@ -51,6 +67,8 @@ pub use handoff::{
 };
 pub use memory_wiring::{MemoryCaptureObserver, MemoryConsolidationHook, spawn_startup_sweep};
 pub use model::{ModelSource, build_root_model, build_root_model_with_resolver};
+// Runde 5, Teil E.
+pub use permission_rules::{ApprovalLearner, LearnKey, LearnOffer};
 pub use sandbox::{permissions_for_tier, plan_node_sandbox, root_sandbox};
 pub use services::{PlanServices, RuntimeServices, RuntimeServicesParts, ServiceSurface};
 pub use session_title::{

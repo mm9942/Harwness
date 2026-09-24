@@ -87,6 +87,8 @@ The model produces intents. The runtime turns permitted intents into messages or
 
 Tools are registered through explicit Rust interfaces. The tool macro performs permission evaluation before deserializing model-controlled arguments. File access uses containment and no-follow mechanisms; shell, filesystem, dependency, web, browser, and planning operations each receive a scoped policy surface.
 
+Targeted edits use `fs.edit` (replace one exact match, or all with `replace_all`) under the same limits and approval as `fs.write`. `shell.exec` refuses `sudo`, `doas` and `pkexec`; root commands go only through the approval window of `host.sudo_exec`.
+
 Approval results combine conservatively: deny wins over ask, and ask wins over allow. Adding an approval handler can only make execution stricter. Session modes similarly reduce the base tool surface and cannot restore tools forbidden by an executable definition.
 
 ## Durable planning, jobs, and knowledge
@@ -105,7 +107,7 @@ Secrets use a hybrid cryptographic policy, while the audit system maintains tamp
 
 ## Quick start
 
-Build requirements are Rust **1.85** or newer and a normal Rust/Cargo toolchain.
+The toolchain is pinned to Rust **1.98.0** in `rust-toolchain.toml`; rustup installs it on the first `cargo` call, and CI uses the same file. The manifest MSRV floor stays at 1.85. Details: [docs/setup/build-prerequisites.md](docs/setup/build-prerequisites.md).
 
 ```bash
 cargo build -p harw-cli
@@ -140,9 +142,14 @@ The full command reference (in German), including the old-to-new mapping, is in 
 Slash commands are typed operations with the same permission checks on every front-end; `/help` (or `F1`) lists what the checked-out version registers. A few behaviors worth knowing:
 
 - **Commands during a running turn.** Read-only commands such as `/status`, `/usage`, `/diff` or `/agent` run immediately without blocking the turn. Changes such as `/model`, `/effort` or `/mode` are accepted during the turn but take effect from the next turn. Everything else waits until the turn ends. Messages you send while a turn runs are shown above the composer as "Wartet auf den nächsten Turn" until they are delivered.
-- **Interrupting.** `Ctrl+C` or `Esc` stops the running turn (model call, shell subprocesses, child agents). Messages and commands already queued are kept and delivered right afterwards. `Esc` closes an open popup first and never quits; pressing `Ctrl+C` twice quits.
+- **Interrupting.** `Ctrl+C` or `Esc` stops the running turn (model call, shell subprocesses, child agents). Messages and commands already queued are kept and delivered right afterwards. `Esc` closes an open popup first and never quits; pressing `Ctrl+C` twice quits. While child agents are running, the first `Esc` only asks for confirmation and a second `Esc` interrupts. `Enter` during a turn always queues the message and never interrupts.
+- **Side questions.** `/btw QUESTION` asks a quick question about the conversation without interrupting the agent. It uses no tools, is not added to the history, and can be cancelled with `Esc`.
+- **Auto mode.** With approval `auto`, calls outside the fixed auto-approved list go through a deterministic pre-filter and a small classifier model (`[internal_models.auto_classifier]`). Anything unclear, failing or slow falls back to asking; tools that always ask (e.g. `process.kill`, `host.sudo_exec`) are never auto-approved. After 3 denials in a row or 20 in a session, the session drops back to `ask`. Own rules with argument patterns: `/permissions allow|deny TOOL [PATTERN]`, `/permissions rules`, `/permissions log`.
+- **Plan mode.** `Shift+Tab` cycles `ask → auto → full → plan`. In plan mode (“⏸ plan mode on”) writing and executing tools are blocked immediately; the agent explores, may ask you structured questions (`ask_user`), writes its plan to `.harw/plans/` and asks to leave plan mode with `plan.exit`. You choose: implement with `auto`, implement with `ask`, or keep planning with feedback. The approved plan stays pinned in the context. `/plan show|list|open|edit` manages plan files.
+- **Root commands.** Host shell workers can request a root command through `host.sudo_exec`. The TUI shows the exact command in its own window; the password is typed there, masked, and never reaches the model, the history, logs or disk. Choose “once” or “for this session” (kept in memory for `[host] sudo_session_minutes`, default 10). Every root command still needs its own approval.
 - **Research.** `/research QUESTION` hands a bounded question to a read-only child agent and validates the result against a typed finding contract. `/research-deps` checks Rust dependencies; `/research-deps --generic` uses an ecosystem-neutral dependency researcher. These commands are available when the planning surface (`[tools.plan] enabled`) is on.
-- **Child agents.** A child agent gets the context window of the model it actually calls, falling back to the parent's model rather than a small default. Its token budget counts only new, uncached input plus output. Near the limit the child is asked to wrap up; at the limit its last answer is returned as a partial result (`budget_exhausted`) instead of being lost.
+- **Child agents.** A child agent gets the context window of the model it actually calls, falling back to the parent's model rather than a small default. Its token budget counts only new, uncached input plus output. Near the limit the child is asked to wrap up; at the limit it writes a structured handoff (falling back to its last answer), and the parent can continue it with `continue_from`.
+- **Background orchestrators.** An orchestrator started by the UIA in the TUI runs in the background; the UIA's turn ends right away and a new turn starts when the result arrives. The UIA can query (`agent.status`, `agent.result`), message (`agent.message`) and cancel (`agent.cancel`) its orchestrators, and children can report back with `parent.message`. `/agent` shows the live agent tree, `/agent bg` lists background runs, `/agent stream` controls the live output of child agents. Limits are set in `[agents]`. Guide (German): [docs/guides/hintergrund-agenten.md](docs/guides/hintergrund-agenten.md).
 - **Learning loop.** `/learn` scans the session for durable insights and files them as proposals only. Nothing is written to memory, skills or agent definitions until you accept a proposal and apply it yourself.
 
 ## Knowledge surfaces

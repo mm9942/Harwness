@@ -6,6 +6,17 @@ on:
   pull_request:
     branches: [main]
 
+# Ein neuer Push auf denselben Branch/PR bricht den noch laufenden alten Lauf ab.
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+# `pull-requests: read` braucht dorny/paths-filter, um bei PRs die geänderten
+# Dateien über die API zu lesen (ohne Checkout).
+permissions:
+  contents: read
+  pull-requests: read
+
 env:
   CARGO_TERM_COLOR: always
   # ~80 workspace crates produce hundreds of test binaries; full debuginfo
@@ -14,18 +25,78 @@ env:
   CARGO_PROFILE_DEV_DEBUG: line-tables-only
   CARGO_PROFILE_TEST_DEBUG: line-tables-only
 
+# Toolchain: Alle Jobs installieren die in `rust-toolchain.toml` gepinnte
+# Version per `rustup toolchain install` (ohne Argument liest rustup >= 1.28
+# die Datei inkl. Komponenten). rustup ist auf den GitHub-Runnern
+# vorinstalliert; so gibt es genau eine Quelle der Wahrheit, die Dependabot
+# (Ökosystem `rust-toolchain`) aktualisiert – keine zweite Versionsangabe im
+# Workflow, die auseinanderlaufen könnte, und keine Dritt-Action.
+#
+# Pfadfilter: Die Filter greifen nur bei `pull_request`. Bei Push auf main
+# laufen immer alle Jobs. Scheitert der Filter-Job selbst, laufen ebenfalls
+# alle Jobs (fail-open), damit nie ein Job ungeprüft „grün“ übersprungen wird.
+# Übersprungene Jobs zählen bei GitHub als erfolgreich und blockieren
+# erforderliche Checks nicht.
+
 jobs:
+  changes:
+    name: detect changes
+    runs-on: ubuntu-latest
+    outputs:
+      rust: ${{ steps.filter.outputs.rust }}
+      dod: ${{ steps.filter.outputs.dod }}
+      workflows: ${{ steps.filter.outputs.workflows }}
+      deps: ${{ steps.filter.outputs.deps }}
+    steps:
+      - name: Filter changed paths
+        id: filter
+        if: github.event_name == 'pull_request'
+        uses: dorny/paths-filter@v3
+        with:
+          # Alle Muster eines Filters müssen zutreffen: `rust` ist damit
+          # „alles außer“ den klar Rust-fremden Pfaden. Bewusst so breit, weil
+          # Crates Nicht-`.rs`-Dateien per include_str! einbetten (assets/*.md,
+          # deploy/, packaging/, harw-registry-defaults/ …).
+          predicate-quantifier: every
+          filters: |
+            rust:
+              - '**'
+              - '!docs/**'
+              - '!*.md'
+              - '!webui/**'
+              - '!images/**'
+              - '!dod/**'
+              - '!.github/**'
+            dod:
+              - 'dod/**'
+            workflows:
+              - '.github/**'
+            deps:
+              - '**/{Cargo.toml,Cargo.lock,deny.toml}'
+
   check:
     name: fmt, clippy, test (root workspace)
+    needs: changes
+    if: >-
+      ${{ !cancelled() && (github.event_name != 'pull_request'
+      || needs.changes.result != 'success'
+      || needs.changes.outputs.rust == 'true'
+      || needs.changes.outputs.workflows == 'true') }}
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Install stable Rust
-        uses: dtolnay/rust-toolchain@stable
+      - name: Install pinned Rust (rust-toolchain.toml)
+        run: |
+          rustup toolchain install
+          rustup show active-toolchain
+          rustc --version
+
+      - name: Install cargo-nextest
+        uses: taiki-e/install-action@v2
         with:
-          components: rustfmt, clippy
+          tool: nextest
 
       - name: Cache cargo (root workspace)
         uses: Swatinem/rust-cache@v2
@@ -54,18 +125,36 @@ jobs:
       - name: cargo clippy
         run: cargo clippy --workspace --tests -- -D warnings
 
-      - name: cargo test
-        run: cargo test --workspace
+      # nextest führt jeden Test in einem eigenen Prozess parallel aus; Doc-Tests
+      # unterstützt nextest nicht, die laufen separat über `cargo test --doc`.
+      - name: cargo nextest run
+        run: cargo nextest run --workspace
+
+      - name: cargo test --doc
+        run: cargo test --workspace --doc
 
   dod:
     name: test (dod workspace)
+    needs: changes
+    # dod hängt per Pfad an Root-Crates (harw-types, harw-macros …), daher
+    # auch bei `rust`-Änderungen.
+    if: >-
+      ${{ !cancelled() && (github.event_name != 'pull_request'
+      || needs.changes.result != 'success'
+      || needs.changes.outputs.dod == 'true'
+      || needs.changes.outputs.rust == 'true'
+      || needs.changes.outputs.workflows == 'true') }}
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Install stable Rust
-        uses: dtolnay/rust-toolchain@stable
+      # rustup findet `rust-toolchain.toml` im Elternordner auch für dod/.
+      - name: Install pinned Rust (rust-toolchain.toml)
+        run: |
+          rustup toolchain install
+          rustup show active-toolchain
+          rustc --version
 
       - name: Cache cargo (dod workspace)
         uses: Swatinem/rust-cache@v2
@@ -85,14 +174,40 @@ jobs:
 
   cargo-deny:
     name: cargo deny check
+    needs: changes
+    if: >-
+      ${{ !cancelled() && (github.event_name != 'pull_request'
+      || needs.changes.result != 'success'
+      || needs.changes.outputs.deps == 'true'
+      || needs.changes.outputs.workflows == 'true') }}
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
       # Uses the repo's existing deny.toml (root of the checkout) — no
-      # separate config needed.
+      # separate config needed. Die Action bringt ihre eigene Toolchain im
+      # Container mit; rust-toolchain.toml spielt hier keine Rolle.
       - name: cargo deny check
         uses: EmbarkStudios/cargo-deny-action@v2
         with:
           command: check
+
+  actionlint:
+    name: actionlint
+    needs: changes
+    if: >-
+      ${{ !cancelled() && (github.event_name != 'pull_request'
+      || needs.changes.result != 'success'
+      || needs.changes.outputs.workflows == 'true') }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # Offizielles Image des actionlint-Autors (rhysd); prüft alle Workflows
+      # unter .github/workflows inkl. shellcheck für `run:`-Blöcke.
+      - name: actionlint
+        uses: docker://rhysd/actionlint:1.7.7
+        with:
+          args: -color

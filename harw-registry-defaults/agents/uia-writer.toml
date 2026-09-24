@@ -12,7 +12,7 @@
 #
 # ── Werkzeugoberflaeche ─────────────────────────────────────────────────────
 # `RegistryProfile::UiaWriter` (`harw-registry-defaults/src/profile.rs`):
-# alle sechs fs.*-Werkzeuge (inklusive `fs.write`) plus `doc.read_pdf` plus
+# alle sieben fs.*-Werkzeuge (inklusive `fs.write`/`fs.edit`) plus `doc.read_pdf` plus
 # die fuenf rein lesenden `deps.*`-Werkzeuge plus alle vier `web.*`-Werkzeuge
 # (`web.fetch`/`web.docs_rs`/`web.crates_io`/`web.search`,
 # `UIA_HELPER_WEB_TOOLS`) — kein `shell.exec`, kein `lens.ask`, kein
@@ -42,7 +42,7 @@ role = "uia-worker"
 specialization = "uia-writer"
 
 name = "UIA Writer"
-description = "Erkundung und Dateiaenderung im Workspace fuer die UIA, unter der zugelassenen Organisationsrolle uia-worker."
+description = "Erkundung und kleine Code-Aenderungen im Workspace fuer die UIA (bis ca. 3 Dateien bzw. ein Modul, eine Funktion plus Tests), unter der zugelassenen Organisationsrolle uia-worker."
 
 [work]
 mode = "delegated-execution"
@@ -58,6 +58,7 @@ admitted = [
   "fs.grep",
   "doc.read_pdf",
   "fs.write",
+  "fs.edit",
   "deps.graph",
   "deps.locked",
   "deps.source_read",
@@ -77,6 +78,10 @@ admitted = [
   "diary.read",
   "palace.search",
   "palace.recall",
+  # Runde 5, Teil M: Zwischenstand (info) oder Frage (question) an den direkten
+  # Elternteil; nur Text, keine Rechte (siehe
+  # `harw_registry_defaults::profile::parent_message_tools_for_role`).
+  "parent.message",
 ]
 forbidden = [
   "shell.exec",

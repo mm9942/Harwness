@@ -356,6 +356,54 @@ fn try_persist_uia_worker_model(model: Option<&str>) -> Result<(), String> {
     writer.save().map_err(|error| error.to_string())
 }
 
+/// Runde 5, Teil G: verankert die Modellwahl **einer** UIA-Worker-Rolle
+/// (`[uia_worker_models] <rolle> = "uia" | "provider/modell"`) bestes
+/// Bemühen in der Profil-`config.toml`.
+///
+/// # Description
+/// `value = None` entfernt den Eintrag der Rolle (dann greift der alte
+/// `uia_worker_model`-Pin bzw. die Vorgabe „wie UIA“). **Niemals
+/// fehlschlagend** für den Aufrufer.
+///
+/// # Returns
+/// `None` bei Erfolg; `Some(note)` bei unbekannter Rolle oder
+/// Persistenzfehler.
+pub(crate) fn persist_uia_worker_role_model(role: &str, value: Option<&str>) -> Option<String> {
+    let result = open_profile_config_writer().and_then(|mut writer| {
+        write_uia_worker_role_model(&mut writer, role, value)?;
+        writer.save().map_err(|error| error.to_string())
+    });
+    match result {
+        Ok(()) => None,
+        Err(reason) => Some(format!(
+            "Hinweis: konnte das Modell für „{role}“ nicht dauerhaft speichern ({reason})."
+        )),
+    }
+}
+
+/// Reiner Schreibkern von [`persist_uia_worker_role_model`] (ohne `save`).
+///
+/// # Errors
+/// Unbekannte Rolle oder Fehler von [`harw_config::ConfigWriter::set_value`].
+fn write_uia_worker_role_model(
+    writer: &mut harw_config::ConfigWriter,
+    role: &str,
+    value: Option<&str>,
+) -> Result<(), String> {
+    let key = harw_config::UiaWorkerModelsToml::toml_key(role)
+        .ok_or_else(|| format!("unbekannte UIA-Worker-Rolle „{role}“"))?;
+    let path = format!("uia_worker_models.{key}");
+    match value {
+        Some(value) => writer
+            .set_value(&path, toml_edit::value(value))
+            .map_err(|error| error.to_string()),
+        None => {
+            writer.remove_value(&path);
+            Ok(())
+        }
+    }
+}
+
 /// Verankert `reasoning.uia` bestes Bemühen in der Profil-`config.toml`
 /// (`[reasoning] uia = "..."`), unabhängig von `uia_provider`/`uia_model`/
 /// `uia_worker_model`.
@@ -748,6 +796,9 @@ pub trait SelectionPersistence: Send + Sync {
 
     /// Siehe [`persist_active_agent`].
     fn persist_active_agent(&self, name: Option<&str>) -> Option<String>;
+
+    /// Runde 5, Teil G: siehe [`persist_uia_worker_role_model`].
+    fn persist_uia_worker_role_model(&self, role: &str, value: Option<&str>) -> Option<String>;
 }
 
 /// Standard-Implementierung von [`SelectionPersistence`]: ruft unverändert
@@ -804,6 +855,10 @@ impl SelectionPersistence for FileSelectionPersistence {
     fn persist_active_agent(&self, name: Option<&str>) -> Option<String> {
         persist_active_agent(name)
     }
+
+    fn persist_uia_worker_role_model(&self, role: &str, value: Option<&str>) -> Option<String> {
+        persist_uia_worker_role_model(role, value)
+    }
 }
 
 /// Ein einzelner aufgezeichneter Aufruf auf [`RecordingSelectionPersistence`].
@@ -838,6 +893,9 @@ pub enum RecordedSelectionPersistCall {
     ClearUia,
     /// Aufzeichnung von [`SelectionPersistence::persist_active_agent`].
     ActiveAgent { name: Option<String> },
+    /// Aufzeichnung von [`SelectionPersistence::persist_uia_worker_role_model`]
+    /// (Runde 5, Teil G).
+    UiaWorkerRoleModel { role: String, value: Option<String> },
 }
 
 /// No-op-Aufzeichnungs-Implementierung von [`SelectionPersistence`] für Tests.
@@ -944,6 +1002,14 @@ impl SelectionPersistence for RecordingSelectionPersistence {
     fn persist_active_agent(&self, name: Option<&str>) -> Option<String> {
         self.record(RecordedSelectionPersistCall::ActiveAgent {
             name: name.map(str::to_owned),
+        });
+        None
+    }
+
+    fn persist_uia_worker_role_model(&self, role: &str, value: Option<&str>) -> Option<String> {
+        self.record(RecordedSelectionPersistCall::UiaWorkerRoleModel {
+            role: role.to_owned(),
+            value: value.map(str::to_owned),
         });
         None
     }
@@ -1141,6 +1207,49 @@ mod tests {
         let reopened =
             harw_config::ConfigWriter::open(&config_path).map_err(ctx("reopen after removal"))?;
         assert!(reopened.get_value("uia_worker_model").is_none());
+        Ok(())
+    }
+
+    /// Runde 5, Teil G: die Worker-Rollenwahl landet unter
+    /// `[uia_worker_models]`, ist als `HarnessConfig` lesbar und lässt sich
+    /// wieder entfernen; eine unbekannte Rolle wird abgelehnt.
+    #[test]
+    fn test_uia_worker_role_model_round_trip() -> TestResult {
+        let dir = tempfile::tempdir().map_err(ctx("tempdir"))?;
+        let config_path = dir.path().join("config.toml");
+
+        let mut writer = harw_config::ConfigWriter::open(&config_path).map_err(ctx("open"))?;
+        super::write_uia_worker_role_model(&mut writer, "uia-writer", Some("openai/gpt-5"))
+            .map_err(crate::test_support::TestError::Unexpected)?;
+        super::write_uia_worker_role_model(&mut writer, "uia-explorer", Some("uia"))
+            .map_err(crate::test_support::TestError::Unexpected)?;
+        assert!(
+            super::write_uia_worker_role_model(&mut writer, "host-process-worker", Some("uia"))
+                .is_err()
+        );
+        writer.save().map_err(ctx("save"))?;
+
+        let content = std::fs::read_to_string(&config_path).map_err(ctx("read back"))?;
+        let parsed: harw_config::HarnessConfig =
+            toml::from_str(&content).map_err(ctx("parse harness config"))?;
+        assert_eq!(
+            parsed.uia_worker_models.get("uia-writer"),
+            Some("openai/gpt-5")
+        );
+        assert_eq!(parsed.uia_worker_models.get("uia-explorer"), Some("uia"));
+
+        let mut writer =
+            harw_config::ConfigWriter::open(&config_path).map_err(ctx("reopen for removal"))?;
+        super::write_uia_worker_role_model(&mut writer, "uia-writer", None)
+            .map_err(crate::test_support::TestError::Unexpected)?;
+        writer.save().map_err(ctx("save after removal"))?;
+        let reopened =
+            harw_config::ConfigWriter::open(&config_path).map_err(ctx("reopen after removal"))?;
+        assert!(reopened.get_value("uia_worker_models.uia_writer").is_none());
+        assert_eq!(
+            reopened.get_value("uia_worker_models.uia_explorer"),
+            Some("uia".to_owned())
+        );
         Ok(())
     }
 

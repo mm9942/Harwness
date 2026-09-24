@@ -46,6 +46,8 @@ members = [
     "harw-tool-web",
     "harw-tool-doc",
     "harw-tool-shell",
+    # Runde 5, Teil F: Plan-Modus (plan.write/plan.exit/plan.enter/ask_user).
+    "harw-tool-plan",
     "harw-browser",
     "harw-browser-thirtyfour",
     "harw-tool-browser",

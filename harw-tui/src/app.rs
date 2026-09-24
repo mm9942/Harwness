@@ -93,6 +93,30 @@
 //! ```
 
 mod busy_queue;
+// Runde 5, Teil F: Plan-Modus (Sperre, Plan-Fenster, `/plan …`, Editor).
+pub(crate) mod plan_mode;
+// Runde 5, Teil C: Kanban live (mtime-Signatur der Board-Dateien).
+mod kanban_live;
+// Runde 5, Teil G: gemeinsame Popup-Tasten für Idle- und Busy-Pfad.
+mod popup_keys;
+// Runde 5, Teil G: Modellwahl der UIA-Worker-Rollen (Worker-Bereich, Live-Wahl).
+mod uia_workers;
+// Runde 5, Teil I: Einhängepunkte des Kind-Live-Streams (`crate::child_stream`).
+mod child_stream_glue;
+// Runde 5, Teil I: Live-Werte der Agentenbaum-Ansicht `/agent`.
+mod agent_tree_live_glue;
+// Runde 5, Teil L: `/btw <frage>` — flüchtige Nebenfrage ohne Werkzeuge.
+pub(crate) mod btw;
+// Runde 5, Teil K: Hintergrund-Agenten (Starter, Meldungen, Leerlauf-Freigaben).
+pub(crate) mod background_agents;
+// Runde 5, Teil M: Kind-Meldungen (`parent.message`) an die UIA.
+mod agent_messages;
+// Runde 5, Teil O: Doppel-Esc bei laufenden Kindern, ehrliche Abbruch-Beschriftung.
+mod turn_safety;
+// Runde 5, Teil O: Freigabe-Fragen von Kind-Agenten im Freigabedialog.
+pub(crate) mod child_approvals;
+// Runde 5, Teil P: Goal-Marke (Statuszeile) und Goal-/Schritt-Verlaufszeilen.
+mod goal_marker_glue;
 
 use std::cell::Cell;
 use std::collections::{HashMap, HashSet};
@@ -148,7 +172,7 @@ use crate::clipboard::{self, ClipboardTarget};
 use crate::command_exec::{
     ShellRunOutcome, busy_availability_for, dispatch_command_with_shell_result, execute_command_as,
 };
-use crate::command_popup::{CommandPopup, PopupAction, PopupMode, TabOutcome};
+use crate::command_popup::{CommandPopup, PopupAction, PopupMode};
 use crate::events::{HarwEvent, HarwEventSender};
 use crate::export::{
     self, ExportAgentEntry, ExportEntry, ExportError, ExportErrorEntry, ExportMeta,
@@ -165,6 +189,8 @@ use crate::keybindings::{KeyAction, KeyBindings};
 use crate::model_switch_picker::{
     ModelEntry, ModelSwitchPicker, PickerAction as ModelSwitchAction, PickerTarget, ProviderEntry,
 };
+// Runde 5, Teil E: Lern-Angebot und Auto-Modus-Vermerke.
+use crate::permissions_view::{LearnOfferView, LearnScope, auto_note_for};
 use busy_queue::{BusyCommand, BusyDispatch, BusyJobDone, BusyJobs, FetchTarget};
 // Hinweis: die drei obigen Typen sind Re-Exporte aus
 // `harw_tool_shell::host_permit_prompt` (siehe `crate::host_permit_dialog`-
@@ -330,6 +356,10 @@ struct TurnEventState {
     /// aktuell laufenden Turns (oder `None`, wenn keine erschien). Siehe
     /// Dokumentation oben.
     last_commentary_text: Option<String>,
+    /// Runde 5, Teil O: `call_id` → Turn, in dem der Aufruf angefragt wurde.
+    /// Ein Turn-Abbruch markiert nur offene Aufrufe **seines** Turns als
+    /// unvollständig, nie ältere (etwa einen längst beendeten Handoff).
+    tool_call_turns: HashMap<harw_types::ToolCallId, harw_types::TurnId>,
 }
 
 impl TurnEventState {
@@ -503,7 +533,9 @@ pub(crate) enum PermissionCycleStage {
     Auto,
     /// Kein Werkzeugaufruf fragt nach ([`ApprovalMode::FullAccess`]).
     Full,
-    /// Plan-Modus: Freigabe `AlwaysAsk` plus [`InteractionMode::Plan`].
+    /// Plan-Modus: Freigabe `Delegated` plus [`InteractionMode::Plan`] — die
+    /// Plan-Sperre (Teil F) blockiert ohnehin alles Verändernde; lesende
+    /// Werkzeuge und `plan.write` sollen dort nicht jedes Mal fragen.
     Plan,
 }
 
@@ -960,6 +992,9 @@ pub struct ChatApp {
     /// Befehle und Datenabrufe, die während eines laufenden Turns nebenläufig
     /// laufen (Runde 4, Teil H; siehe [`busy_queue`]).
     busy_jobs: BusyJobs,
+    /// Runde 5, Teil L: `/btw`-Nebenfrage (Schnappschuss, laufender Auftrag;
+    /// siehe [`btw`]).
+    btw: btw::BtwState,
     /// Kooperativer Abbruchgriff für den gerade laufenden Turn. `Ctrl+C`
     /// löst ihn auch dann aus, wenn kein Freigabe-Dialog sichtbar ist.
     active_cancel: Option<CancelToken>,
@@ -1001,6 +1036,9 @@ pub struct ChatApp {
     /// Abonnement auf [`harw_core::AgentEventHub`]; nicht-blockierend geleert
     /// bei jedem Spinner-Tick und jedem Turn-Event ([`Self::drain_agent_events`]).
     agent_rx: Option<tokio::sync::broadcast::Receiver<harw_core::AgentEvent>>,
+    /// Runde 5, Teil C: Beobachtung der Dateien eines offenen Kanban-Boards
+    /// ([`kanban_live::KanbanLiveWatch`]).
+    kanban_live: kanban_live::KanbanLiveWatch,
     /// Live gestreamter Assistant-Text der laufenden Modell-Runde der Wurzel;
     /// transient unter dem Verlauf gezeichnet, geleert sobald die finale
     /// Nachricht als Zelle vorliegt.
@@ -1077,6 +1115,8 @@ pub struct ChatApp {
     /// Optionale Plan-/Ziel-Dienste der Composition-Root für [`PlanGraphCell`]
     /// und [`GoalCell`]; `None` degradiert beide zu Systemzeilen.
     plan_services: Option<TuiPlanServices>,
+    /// Runde 5, Teil P: Goal-Marke und Übergänge (`crate::goal_marker`).
+    goal_tracker: crate::goal_marker::GoalTracker,
     /// Detailgrad, mit dem Werkzeugzellen gerendert werden (Plan Schritt 2
     /// „Verbosity"); gesetzt über [`Self::with_verbose_tools`].
     tool_verbosity: ToolVerbosity,
@@ -1088,6 +1128,9 @@ pub struct ChatApp {
     /// sofern noch erweiterbar; `None` schließt implizit jede vorherige
     /// Gruppe (Plan Schritt 2 „Gruppierung").
     open_tool_group: Option<Arc<Mutex<ToolGroupCell>>>,
+    /// Runde 5, Teil I: Live-Blöcke der Kind-Agenten (Orchestratoren) unter
+    /// ihrer Agent-Zeile; siehe [`crate::child_stream`].
+    child_stream: crate::child_stream::ChildStreamRegistry,
     /// Ctrl+O-Vormerkung: `true` unmittelbar nach einem Druck, der nur die
     /// letzte Werkzeugzelle umgeschaltet hat — ein erneuter Druck schaltet
     /// dann alle um (Plan Schritt 2).
@@ -1106,6 +1149,15 @@ pub struct ChatApp {
     /// („Einmalig" / „Host-Arbeitsphase" / „Nein"); immer gemeinsam mit
     /// `pending_host_permit` gesetzt bzw. geleert.
     pending_host_permit_dialog: Option<ChoiceDialog>,
+    /// Runde 5, Teil B: eigenes sudo-Freigabefenster (`host.sudo_exec`) samt
+    /// Fragekanal und Sitzungs-Merken des Passworts (siehe
+    /// [`crate::sudo_dialog`]). Ein offenes Fenster fängt jede Eingabe ab.
+    pub(crate) sudo: crate::sudo_dialog::SudoUi,
+    /// Runde 5, Teil F: Plan-Fenster (`plan.exit`, `plan.enter`,
+    /// `ask_user`), Plan-Fragekanal und geteilter Plan-Zustand (siehe
+    /// [`crate::plan_dialog`], `app/plan_mode.rs`). Ein offenes Fenster fängt
+    /// jede Eingabe ab.
+    pub(crate) plan_ui: crate::plan_dialog::PlanUi,
     /// Vorgemerktes Ziel des Shift+Tab-Zyklus, solange ein Turn läuft (Plan
     /// Schritt 5, AP W5-05: der Wechsel gilt erst an der nächsten Turn-Grenze).
     pending_permission_stage: Option<PermissionCycleStage>,
@@ -1205,6 +1257,12 @@ pub struct ChatApp {
     /// Generation der aktuell offenen generischen Ansicht
     /// ([`Overlay::View`]); wächst bei jedem Öffnen.
     overlay_generation: u64,
+    /// Runde 5, Teil K: Meldungen und Leerlauf-Zustand der Hintergrund-Agenten.
+    background: background_agents::BackgroundUi,
+    /// Runde 5, Teil O: Nachfrage vor einem Esc-Abbruch mit laufenden Kindern.
+    esc_confirm: turn_safety::EscConfirm,
+    /// Runde 5, Teil O: Freigabe-Fragen von Kind-Agenten.
+    child_approvals: child_approvals::ChildApprovalUi,
 }
 
 /// Handgeschriebene `Debug`-Implementierung, da [`CommandAdapter`] (enthält
@@ -1241,6 +1299,9 @@ impl std::fmt::Debug for ChatApp {
                 &self.pending_host_permit_dialog.is_some(),
             )
             .field("host_mode_active", &self.host_mode_active())
+            .field("sudo", &self.sudo)
+            // Runde 5, Teil F.
+            .field("plan_ui", &self.plan_ui)
             .field("pending_permission_stage", &self.pending_permission_stage)
             .field("has_overlay", &self.overlay.is_some())
             .field("export_entries_len", &self.export_entries.len())
@@ -1315,6 +1376,8 @@ impl ChatApp {
             deferred_input: std::collections::VecDeque::new(),
             pending_turns: std::collections::VecDeque::new(),
             busy_jobs: BusyJobs::new(),
+            // Runde 5, Teil L.
+            btw: btw::BtwState::new(),
             active_cancel: None,
             cancel_requested_at: None,
             queue_kept_at: None,
@@ -1328,6 +1391,8 @@ impl ChatApp {
             total_usage: TokenUsage::default(),
             agent_monitor: crate::agent_monitor::AgentMonitor::default(),
             agent_rx: None,
+            // Runde 5, Teil C: Kanban live.
+            kanban_live: kanban_live::KanbanLiveWatch::default(),
             live_stream: String::new(),
             live_reasoning: String::new(),
             panels: crate::panes::PanelState::default(),
@@ -1347,13 +1412,19 @@ impl ChatApp {
             historic_agent_events: Vec::new(),
             active_mode: InteractionMode::default(),
             plan_services: None,
+            goal_tracker: crate::goal_marker::GoalTracker::default(),
             tool_verbosity: ToolVerbosity::Compact,
             tool_cells: Vec::new(),
             open_tool_group: None,
+            // Runde 5, Teil I.
+            child_stream: crate::child_stream::ChildStreamRegistry::default(),
             ctrl_o_expand_last_armed: false,
             pending_approval_dialog: None,
             pending_host_permit: None,
             pending_host_permit_dialog: None,
+            sudo: crate::sudo_dialog::SudoUi::default(),
+            // Runde 5, Teil F.
+            plan_ui: crate::plan_dialog::PlanUi::default(),
             pending_permission_stage: None,
             mode_before_plan: None,
             overlay: None,
@@ -1376,6 +1447,10 @@ impl ChatApp {
             pending_fetches: Vec::new(),
             pending_commands: std::collections::VecDeque::new(),
             overlay_generation: 0,
+            background: background_agents::BackgroundUi::default(),
+            // Runde 5, Teil O.
+            esc_confirm: turn_safety::EscConfirm::default(),
+            child_approvals: child_approvals::ChildApprovalUi::default(),
         }
     }
 
@@ -1447,6 +1522,27 @@ impl ChatApp {
     #[must_use]
     pub(crate) fn runtime(&self) -> Option<&Arc<harw_runtime::RuntimeAssembly>> {
         self.runtime.as_ref()
+    }
+
+    /// Runde 5, Teil B: hängt den sudo-Fragekanal (`host.sudo_exec`) und die
+    /// Merkfrist für „Für diese Sitzung“ an.
+    ///
+    /// # Argumente
+    /// - `receiver`: Empfänger aus `RuntimeAssembly::take_sudo_prompts`
+    ///   (`None` außerhalb einer TUI-Montage — dann gibt es kein Fenster).
+    /// - `session_ttl`: Merkfrist (`[host] sudo_session_minutes`);
+    ///   `Duration::ZERO` bietet nur „Einmalig“ an.
+    ///
+    /// # Rückgabe
+    /// `Self` für Builder-Verkettung.
+    #[must_use]
+    pub(crate) fn with_sudo_prompts(
+        mut self,
+        receiver: Option<harw_tool_shell::SudoPromptReceiver>,
+        session_ttl: Duration,
+    ) -> Self {
+        self.sudo = crate::sudo_dialog::SudoUi::new(receiver, session_ttl);
+        self
     }
 
     /// Hinterlegt die Kind-Spawn-Autorität dieser Session.
@@ -1719,6 +1815,8 @@ impl ChatApp {
             PickerTarget::Uia => "UIA-Modell-Auswahl".to_owned(),
             PickerTarget::UiaWorker { .. } => "UIA-Worker-Modell-Auswahl".to_owned(),
             PickerTarget::Role { .. } => target.context_label(),
+            // Runde 5, Teil G.
+            PickerTarget::UiaWorkerRole { .. } => target.context_label(),
         };
 
         let Some(config) = self.resolved_config() else {
@@ -1806,6 +1904,19 @@ impl ChatApp {
                 let row = harw_config::resolve_role_model(&config, *role);
                 (row.provider, row.model)
             }
+            // Runde 5, Teil G: Vorauswahl = feste Wahl der Rolle, sonst UIA.
+            PickerTarget::UiaWorkerRole { role } => {
+                match harw_config::resolve_uia_worker_model(&config, role).choice {
+                    harw_config::UiaWorkerModelChoice::Fixed { provider, model } => {
+                        (Some(provider), Some(model))
+                    }
+                    harw_config::UiaWorkerModelChoice::FollowUia => {
+                        let row =
+                            harw_config::resolve_role_model(&config, harw_config::ModelRole::Uia);
+                        (row.provider, row.model)
+                    }
+                }
+            }
         };
 
         let Some(picker) = ModelSwitchPicker::new(
@@ -1891,7 +2002,9 @@ impl ChatApp {
         let mut rows = vec![AgentRow {
             id: root.as_str().to_owned(),
             parent: None,
-            role: "Wurzel-Orchestrator".to_owned(),
+            // Runde 5, Teil I: tatsächliche Wurzelrolle (UIA bzw. expliziter
+            // Wurzel-Agent) statt „Wurzel-Orchestrator“.
+            role: self.agent_tree_root_label(),
             depth: 0,
             status: "running".to_owned(),
             task: None,
@@ -1901,12 +2014,17 @@ impl ChatApp {
             budget: "—".to_owned(),
             result: None,
             can_stop: false,
+            ..AgentRow::default()
         }];
         let mut seen = HashSet::from([root.as_str().to_owned()]);
         if let Some(spawner) = self.managed_spawner() {
             append_agent_tree_rows(spawner, &root, 1, &mut seen, &mut rows);
         }
         append_historic_agent_tree_rows(&self.historic_agent_events, &root, &mut seen, &mut rows);
+        // Runde 5, Teil I: Live-Werte (Monitor) und Spawn-Aufträge ergänzen.
+        self.enrich_agent_tree_rows(&mut rows);
+        // Runde 5, Teil K: „läuft im Hintergrund" statt nur „running".
+        background_agents::mark_rows(self, &mut rows);
         rows
     }
 
@@ -1966,7 +2084,10 @@ impl ChatApp {
                 if self.mode_before_plan.is_none() {
                     self.mode_before_plan = Some(self.active_mode);
                 }
-                self.set_approval_mode(ApprovalMode::AlwaysAsk);
+                // Runde 5: `Delegated` statt `AlwaysAsk` — Lesen und
+                // `plan.write` (nur `.harw/plans`) laufen ohne Rückfrage, alles
+                // andere sperrt die Plan-Sperre (`PlanModeGate`).
+                self.set_approval_mode(ApprovalMode::Delegated);
                 self.active_mode = InteractionMode::Plan;
                 if let Err(error) = self
                     .session_controller
@@ -1982,6 +2103,8 @@ impl ChatApp {
             PermissionCycleStage::Auto => self.finish_permission_stage(ApprovalMode::Delegated),
             PermissionCycleStage::Full => self.finish_permission_stage(ApprovalMode::FullAccess),
         }
+        // Runde 5, Teil F: die Plan-Sperre wirkt sofort, auch mitten im Turn.
+        self.sync_plan_lock();
     }
 
     // Gemeinsamer Abschluss der drei Nicht-Plan-Stufen: setzt den Freigabemodus
@@ -2189,6 +2312,8 @@ impl ChatApp {
     /// - `mode` ([`InteractionMode`]): der jetzt gültige Modus.
     pub(crate) fn set_active_mode(&mut self, mode: InteractionMode) {
         self.active_mode = mode;
+        // Runde 5, Teil F: `/mode plan` & Co. ziehen die Plan-Sperre nach.
+        self.sync_plan_lock();
     }
 
     /// Hängt eine geteilte, später noch veränderbare Zelle an den Verlauf an.
@@ -2263,6 +2388,13 @@ impl ChatApp {
     /// Liefert `true`, wenn sich Sichtbares geändert hat.
     pub(crate) fn drain_agent_events(&mut self) -> bool {
         let mut changed = self.poll_explorer();
+        // Runde 5, Teil C: offenes Kanban-Board alle 2 s gegen die Platte
+        // prüfen (Spinner-Takt im Busy-Pfad, Leerlauf-Takt in `run_loop`).
+        changed |= self.poll_kanban_live();
+        // Runde 5, Teil L: Abschluss einer `/btw`-Nebenfrage im Spinner-Takt.
+        changed |= self.poll_btw();
+        // Runde 5, Teil P: Goal-Marke und Schritt-Verlaufszeilen (max. 1×/s).
+        changed |= self.poll_goal_marker();
         let Some(rx) = self.agent_rx.as_mut() else {
             return changed;
         };
@@ -2280,7 +2412,19 @@ impl ChatApp {
                     harw_core::AgentEventKind::Knowledge { area, .. } => {
                         knowledge_areas.push(area.clone());
                     }
-                    _ => changed |= self.agent_monitor.apply(&event),
+                    _ => {
+                        // Runde 5, Teil I: Turn-Ereignisse der Kinder als
+                        // Delta in ihren Live-Block (sofern vorhanden).
+                        if let harw_core::AgentEventKind::Turn(turn) = &event.kind {
+                            changed |= self.child_stream.apply(
+                                &event.agent,
+                                event.parent.as_ref(),
+                                &event.role,
+                                turn,
+                            );
+                        }
+                        changed |= self.agent_monitor.apply(&event);
+                    }
                 },
                 Err(tokio::sync::broadcast::error::TryRecvError::Lagged(skipped)) => {
                     tracing::debug!(skipped, "tui.agent_events.lagged");
@@ -2292,6 +2436,8 @@ impl ChatApp {
                 }
             }
         }
+        // Runde 5, Teil I: neue Kind-Zellen in die Ctrl+O-Liste.
+        self.absorb_child_stream_handles();
         if !matrix_events.is_empty() {
             changed |= self.apply_matrix_events(&matrix_events);
         }
@@ -2424,6 +2570,10 @@ impl ChatApp {
     /// Schreibt synchron auf Platte. Der Anhänge-Vorgang ist ein einzelner,
     /// kurzer Schreibzugriff und läuft im Event-Loop-Thread.
     pub(crate) fn remember_input(&mut self, line: &str) {
+        // Runde 5, Teil L: `/btw` ist bewusst flüchtig — nie in die Historie.
+        if btw::is_btw_line(line) {
+            return;
+        }
         self.input.push_history(line.to_owned());
         self.input_history.append(line);
     }
@@ -2464,10 +2614,14 @@ impl ChatApp {
             self.apply_permission_stage(stage);
         }
         let applied = self.session_controller.apply_to_session(session);
+        // Runde 5, Teil G: „wie UIA“-Worker folgen der Live-Auswahl der UIA.
+        uia_workers::sync_live_uia(self, session);
         // Immer nachziehen, nicht nur bei `applied`: der Anzeigezustand soll
         // auch dann stimmen, wenn der Modus beim Aufbau der Session gesetzt
         // wurde oder ein anderer Pfad ihn verändert hat.
         self.active_mode = session.mode();
+        // Runde 5, Teil F: Sperre an der Turn-Grenze mit dem Kern abgleichen.
+        self.sync_plan_lock();
         if applied {
             tracing::debug!(
                 mode = session.mode().as_str(),
@@ -2565,6 +2719,11 @@ impl ChatApp {
             return false;
         }
         registry.forget_session(&session);
+        // Runde 5, Teil N: eine Host-Arbeitsphase gilt prozessweit
+        // (`/sandbox-lease`, `request_host`) — Strg+H beendet sie ganz, sonst
+        // meldete die Zeile „beendet“, während Kinder weiter auf dem Host
+        // liefen.
+        registry.revoke_global_approval();
         let _ = runtime.host_permit_ledger().revoke_session(&session);
         self.push_line(Role::System, "Host-Modus beendet — Isolation wieder aktiv.");
         // Register „CSI-Sicherheitsnetz und Paste-Platzhalter", Punkt 7: die
@@ -2691,6 +2850,14 @@ impl ChatApp {
     /// Aktualisiert den Filtertext (ohne führendes `/`) wenn das Popup bereits
     /// offen ist. (Spec-Abschnitt 2.8 / SLICE 5)
     fn sync_popup(&mut self) {
+        // Runde 5, Teil G: beim Blättern durch die Eingabe-History öffnet
+        // ein zurückgeholter `/befehl` kein Popup — Hoch/Runter bleiben bei
+        // der History, bis getippt oder editiert wird.
+        if self.input.is_browsing_history() {
+            self.command_popup = None;
+            self.mention_popup = None;
+            return;
+        }
         self.sync_command_popup();
         self.sync_mention_popup();
     }
@@ -3278,6 +3445,8 @@ fn apply_local_intercept(
         LocalIntercept::OpenOverlay(view) => app.open_overlay_view(view),
         LocalIntercept::OpenModelPicker(target) => app.open_model_switch_picker(target),
         LocalIntercept::OpenUiaWorkerPicker => app.open_uia_worker_picker(),
+        // Runde 5, Teil G: UIA-Wahl, danach Bereich „UIA-Worker-Modelle“.
+        LocalIntercept::OpenUiaPickerThenWorkers => app.open_uia_picker_then_workers(),
         LocalIntercept::OpenEffortChoice(target) => app.open_effort_choice(target),
         LocalIntercept::OpenAgentTree => app.open_agent_tree(),
         LocalIntercept::OpenSessionPicker => {
@@ -3333,6 +3502,16 @@ fn apply_local_intercept(
                     .map(|line| Line::from(line.to_owned()))
                     .collect(),
             );
+        }
+        // Runde 5, Teil F: `/plan`, `/plan show|edit|list|open`.
+        LocalIntercept::Plan(command) => plan_mode::apply_plan_command(app, &command),
+        // Runde 5, Teil I: `/agent stream <orchestrators|all|none>`.
+        LocalIntercept::ChildStream(args) => app.apply_child_stream_command(&args),
+        // Runde 5, Teil L: `/btw <frage>` — Nebenfrage ohne Werkzeuge.
+        LocalIntercept::Btw(question) => app.start_btw(&question),
+        // Runde 5, Teil K: `/agent bg`, `/agent cancel <id>`.
+        LocalIntercept::BackgroundAgents(args) => {
+            background_agents::apply_agents_command(app, &args);
         }
     }
     None
@@ -3482,7 +3661,11 @@ fn apply_overlay_outcome(app: &mut ChatApp, outcome: OverlayOutcome, bus: &HarwE
         OverlayOutcome::Close => app.overlay = None,
         // Der `HarwEvent::Command`-Zweig lädt die offene Ansicht danach neu
         // (`queue_overlay_refresh`).
-        OverlayOutcome::Run(command) => bus.send(HarwEvent::Command(command)),
+        OverlayOutcome::Run(command) => {
+            // Runde 5, Teil G: `r`/`a` im Worker-Bereich wirken sofort.
+            uia_workers::observe_command(app, &command);
+            bus.send(HarwEvent::Command(command));
+        }
         OverlayOutcome::RunAndClose(command) => {
             app.overlay = None;
             bus.send(HarwEvent::Command(command));
@@ -3604,6 +3787,13 @@ fn append_agent_tree_rows(
             budget,
             result: None,
             can_stop: !record.status.is_terminal(),
+            // Runde 5, Teil I: Deckel für die Budget-Auslastung.
+            budget_limits: crate::agent_tree_live::BudgetLimits {
+                tokens: record.budget.max_tokens,
+                tool_calls: record.budget.max_tool_calls,
+                wall_ms: record.budget.max_wall_time_ms,
+            },
+            live: None,
         });
         append_agent_tree_rows(spawner, &child, depth.saturating_add(1), seen, rows);
     }
@@ -3681,6 +3871,8 @@ fn append_historic_agent_tree_rows(
             budget: "—".to_owned(),
             result: event.detail,
             can_stop: false,
+            // Runde 5, Teil I.
+            ..AgentRow::default()
         });
         depths.insert(id, depth);
     }
@@ -4157,6 +4349,9 @@ pub(crate) struct QuitArm {
 ///   dieser Wurzelsitzung (siehe
 ///   [`harw_runtime::RuntimeAssembly::take_host_permit_prompts`]).
 ///   Ebenfalls in [`drive_turn_animated`] gepollt, aus demselben Grund.
+///   Runde 5, Teil K: zusätzlich im Leerlauf
+///   ([`background_agents::poll_idle_prompts`]), damit Fragen von
+///   Hintergrund-Agenten nicht in den Zeitablauf laufen.
 ///
 /// # Fehler
 /// [`TuiError`] bei Zeichnen, Terminal-I/O oder Turn-Fehler.
@@ -4188,13 +4383,37 @@ pub(crate) async fn run_loop(
     // Ein fertiger Busy-Auftrag weckt die Schleife über einen Frame, auch
     // wenn sein Turn schon vorbei ist (Runde 4, Teil H).
     app.busy_jobs.set_waker(frame_req.clone());
+    // Runde 5, Teil L: eine fertige `/btw`-Nebenfrage weckt die Schleife.
+    app.btw.set_waker(frame_req.clone());
 
     loop {
+        // Runde 5, Teil B: außerhalb eines Turns darf kein sudo-Fenster offen
+        // stehen (hier landen auch alle frühen Rückkehrwege eines Turns) —
+        // sonst ginge Getipptes an den Composer, während das Fenster noch
+        // sichtbar ist. Ablehnung ist der Default.
+        // Runde 5, Teil K: Ausnahme, solange ein Hintergrund-Agent läuft —
+        // dessen sudo-Frage wird im Leerlauf beantwortet (Tasten gehen dann
+        // an das Fenster, siehe `background_agents::route_idle_prompt_event`).
+        if !background_agents::keeps_idle_prompts(app) {
+            crate::sudo_dialog::deny_open(app);
+        }
+        // Runde 5, Teil F: ebenso kein Plan-Fenster (Schließen = keine
+        // Entscheidung) — und ein vorgemerktes `/plan edit` öffnet jetzt, im
+        // Leerlauf, den externen Editor.
+        plan_mode::close_open(app);
+        if plan_mode::run_pending_editor(guard, app) {
+            frame_req.schedule_frame();
+        }
         // Ergebnisse von Befehlen/Abrufen, die während des letzten Turns
         // gestartet wurden und erst danach fertig wurden.
         let mut busy_results = false;
         while let Some(done) = app.busy_jobs.try_recv() {
             apply_busy_job_done(app, done);
+            busy_results = true;
+        }
+        // Runde 5, Teil L: Abschluss einer `/btw`-Nebenfrage (Fehler als
+        // Systemzeile).
+        if app.poll_btw() {
             busy_results = true;
         }
         if busy_results {
@@ -4205,16 +4424,51 @@ pub(crate) async fn run_loop(
         while let Some(command) = app.pending_commands.pop_front() {
             harw_tx.send(HarwEvent::Command(command));
         }
+        // Runde 5, Teil C: Kanban live, gedrosselt auf 2 s — auch rege
+        // Eingaben schieben die Abfrage so nicht beliebig auf.
+        app.poll_kanban_live();
         // Ausstehende Datenabrufe für Ansichten und Werkbank (nie in den Chat).
         if process_pending_fetches(app).await {
+            frame_req.schedule_frame();
+        }
+
+        // Runde 5, Teil K: Freigabe-Fragen von Hintergrund-Agenten auch im
+        // Leerlauf zeigen; fertige Hintergrund-Agenten melden.
+        if background_agents::poll_idle_prompts(app, host_permit_prompts) {
+            frame_req.schedule_frame();
+        }
+        // Runde 5, Teil O: Freigabe-Fragen von Kind-Agenten (Hintergrund)
+        // im selben Freigabedialog, im selben Leerlauf-Takt.
+        if child_approvals::poll(app) {
+            frame_req.schedule_frame();
+        }
+        if background_agents::collect_finished(app) {
+            frame_req.schedule_frame();
+        }
+        // Runde 5, Teil M: Meldungen/Fragen der Kinder an die UIA (Zeile im
+        // Verlauf, Kontext für den nächsten Turn, Auto-Turn im Leerlauf).
+        if agent_messages::collect_parent_messages(app) {
             frame_req.schedule_frame();
         }
 
         // Eine während des vorherigen Turns abgeschickte Eingabe hat Vorrang.
         // Sie passiert denselben Pfad wie eine frische `HarwEvent::Submit`.
         let mut submitted: Option<String> = app.pending_turns.pop_front();
+        // Runde 5, Teil K: im Leerlauf startet eine Hintergrund-Meldung
+        // selbst einen UIA-Turn.
+        if submitted.is_none() {
+            submitted = background_agents::take_auto_turn(app);
+        }
 
         if submitted.is_none() {
+            // Runde 5, Teil K: Wecker für Hintergrund-Meldungen und ein
+            // Leerlauf-Takt für deren Freigabe-Fragen.
+            let background_wake = background_agents::waker(app);
+            let background_tick = background_agents::has_running(app);
+            // Runde 5, Teil C: Leerlauf-Takt nur bei offenem Kanban-Board.
+            let kanban_tick = app.kanban_live_active();
+            // Runde 5, Teil I: Leerlauf-Takt bei offener Agentenbaum-Ansicht.
+            let agent_tree_tick = app.agent_tree_live_active();
             tokio::select! {
                 maybe_tev = async { match app.deferred_input.pop_front() { Some(event) => Some(event), None => tui_rx.recv().await } } => {
                     let Some(tev) = maybe_tev else { return Ok(TuiRunOutcome::Quit) };
@@ -4225,6 +4479,27 @@ pub(crate) async fn run_loop(
                             app.pending_quit = None;
                         }
                     }
+                    // Runde 5, Teil K: ein im Leerlauf offenes sudo- oder
+                    // Host-Permit-Fenster (Hintergrund-Agent) bekommt die Eingabe.
+                    let tev = match background_agents::route_idle_prompt_event(app, tev) {
+                        Ok(redraw) => {
+                            if redraw {
+                                frame_req.schedule_frame();
+                            }
+                            continue;
+                        }
+                        Err(tev) => tev,
+                    };
+                    // Runde 5, Teil O: eine offene Kind-Freigabe bekommt die Eingabe.
+                    let tev = match child_approvals::route_event(app, tev) {
+                        Ok(redraw) => {
+                            if redraw {
+                                frame_req.schedule_frame();
+                            }
+                            continue;
+                        }
+                        Err(tev) => tev,
+                    };
 
                     match tev {
                         TuiEvent::Draw => {
@@ -4272,7 +4547,14 @@ pub(crate) async fn run_loop(
                 maybe_hev = harw_rx.recv() => {
                     let Some(hev) = maybe_hev else { return Ok(TuiRunOutcome::Quit) };
                     match hev {
-                        HarwEvent::Quit => return Ok(TuiRunOutcome::Quit),
+                        // Runde 5, Teil K: bei laufenden Hintergrund-Agenten
+                        // fragt `/quit` einmal nach.
+                        HarwEvent::Quit => {
+                            if background_agents::confirm_quit(app) {
+                                return Ok(TuiRunOutcome::Quit);
+                            }
+                            frame_req.schedule_frame();
+                        }
                         HarwEvent::SystemMessage(message) => {
                             // Mehrzeilige Ausgaben (z. B. `/help`) an `\n` aufteilen.
                             let lines: Vec<Line<'static>> = message
@@ -4308,6 +4590,11 @@ pub(crate) async fn run_loop(
                             // `/help`, `#notiz`, `@rolle` …) — vor dem regulären
                             // `/command`-Dispatch abgefangen. `/tools` und
                             // `/compact` bleiben darunter unverändert.
+                            // Runde 5, Teil L: `/btw` im Leerlauf antwortet auf
+                            // den aktuellen Gesprächsstand.
+                            if btw::is_btw_line(&raw) {
+                                app.capture_btw_snapshot(gateway.session_mut(), None);
+                            }
                             if let Some(intercepted) = local_intercept_for(app, &raw) {
                                 if let Some(outcome) =
                                     apply_local_intercept(app, intercepted, harw_tx)
@@ -4594,6 +4881,34 @@ pub(crate) async fn run_loop(
                         }
                     }
                 }
+                // Runde 5, Teil C: Kanban live im Leerlauf — prüft die
+                // Board-Dateien (und leert dabei den Agenten-Bus); ein
+                // eingereihtes Nachladen läuft oben über
+                // `process_pending_fetches`.
+                _ = tokio::time::sleep(kanban_live::KANBAN_LIVE_INTERVAL), if kanban_tick => {
+                    if app.drain_agent_events() {
+                        frame_req.schedule_frame();
+                    }
+                }
+                // Runde 5, Teil I: offene `/agent`-Ansicht zeichnet gedrosselt
+                // neu (Live-Werte, laufende Dauer), auch ohne Bus-Ereignis.
+                _ = tokio::time::sleep(crate::agent_tree_live::AGENT_TREE_LIVE_INTERVAL), if agent_tree_tick => {
+                    app.drain_agent_events();
+                    frame_req.schedule_frame();
+                }
+                // Runde 5, Teil K: ein Hintergrund-Agent ist fertig — der
+                // Schleifenanfang holt die Meldung ab und startet ggf. den
+                // Auto-Turn.
+                _ = background_agents::wait_for_notice(background_wake) => {
+                    frame_req.schedule_frame();
+                }
+                // Runde 5, Teil K: Leerlauf-Takt, solange Hintergrund-Agenten
+                // laufen — holt deren sudo-/Host-Permit-Fragen ab (oben,
+                // `poll_idle_prompts`) und zeigt ihren Fortschritt.
+                _ = tokio::time::sleep(background_agents::IDLE_POLL_INTERVAL), if background_tick => {
+                    app.drain_agent_events();
+                    frame_req.schedule_frame();
+                }
             }
         }
 
@@ -4617,6 +4932,9 @@ pub(crate) async fn run_loop(
         } else {
             (text.clone(), None)
         };
+        // Runde 5, Teil K: wartende Hintergrund-Meldungen gehen dem Turn als
+        // Kontext voran (auch einem normal getippten).
+        let turn_text = background_agents::attach_queued_notices(app, turn_text);
         let displayed_text = display_override.unwrap_or_else(|| text.clone());
         app.push_line(Role::User, displayed_text);
         if let Some(note) = attachment_note {
@@ -4831,12 +5149,15 @@ fn live_reasoning_lines(text: &str, width: u16, theme: style::Theme) -> Vec<Line
 fn handle_turn_event(app: &mut ChatApp, state: &mut TurnEventState, event: TurnEvent) -> bool {
     match event {
         TurnEvent::ToolCallRequested {
+            turn_id,
             call_id,
             tool_name,
             arguments,
             ..
         } => {
             app.clear_live_stream();
+            // Runde 5, Teil O: Turn des Aufrufs für die Abbruch-Markierung.
+            state.tool_call_turns.insert(call_id.clone(), turn_id);
             let already_known = state.pending_tool_cells.contains_key(&call_id);
             let call = ToolCall {
                 id: call_id.clone(),
@@ -4943,6 +5264,28 @@ fn handle_turn_event(app: &mut ChatApp, state: &mut TurnEventState, event: TurnE
             };
             if let Some(entry) = export_entry {
                 app.export_entries.push(entry);
+            }
+            // Runde 5, Teil E: „auto ✓ <Grund>“ bzw. „Vom Auto-Modus
+            // abgelehnt · <Kategorie>“ an der Zelle; löst der Deckel aus,
+            // erscheint sein Hinweis einmal als Systemzeile.
+            let auto_notice = app
+                .runtime()
+                .and_then(|rt| rt.auto_mode())
+                .and_then(|auto| {
+                    if let Some(note) = auto
+                        .log()
+                        .verdict_for(call_id.as_str())
+                        .as_ref()
+                        .and_then(auto_note_for)
+                    {
+                        if let Ok(mut guard) = cell.lock() {
+                            guard.set_approval_note(&note);
+                        }
+                    }
+                    auto.log().take_notice()
+                });
+            if let Some(notice) = auto_notice {
+                app.push_line(Role::System, notice);
             }
             true
         }
@@ -5098,6 +5441,8 @@ fn handle_turn_event(app: &mut ChatApp, state: &mut TurnEventState, event: TurnE
                     summary: question.clone(),
                 }));
             app.push_shared_cell(cell);
+            // Runde 5, Teil I: Live-Block (Orchestrator-Kinder) direkt darunter.
+            app.attach_child_stream_block(&child_id, &role, question.as_deref());
             tracing::debug!(child = %child_id, "tui.child_cell.created");
             true
         }
@@ -5222,11 +5567,16 @@ fn handle_turn_event(app: &mut ChatApp, state: &mut TurnEventState, event: TurnE
                 false
             }
         },
-        TurnEvent::TurnFailed { reason, .. } => {
-            mark_incomplete_tool_exports(app, state, &format!("unvollständig ({reason})"))
+        // Runde 5, Teil O: nur offene Aufrufe des beendeten Turns; beim
+        // Abbruch mit echtem Grund (Nutzerin vs. Turn-Grenze).
+        TurnEvent::TurnFailed {
+            turn_id, reason, ..
+        } => {
+            mark_incomplete_tool_exports(app, state, &turn_id, &format!("unvollständig ({reason})"))
         }
-        TurnEvent::TurnAborted { .. } => {
-            mark_incomplete_tool_exports(app, state, "unvollständig (abgebrochen)")
+        TurnEvent::TurnAborted { turn_id } => {
+            let label = turn_safety::aborted_label(app);
+            mark_incomplete_tool_exports(app, state, &turn_id, &label)
         }
         // TurnCompleted läuft exklusiv über den SessionEvent-Pfad, damit die
         // Token-Summary nicht doppelt erscheint. TurnStarted trägt keinen
@@ -5236,12 +5586,28 @@ fn handle_turn_event(app: &mut ChatApp, state: &mut TurnEventState, event: TurnE
 }
 
 /// Marks outstanding tools as incomplete when a turn terminates early.
+///
+/// Runde 5, Teil O: nur Aufrufe, die in `turn_id` angefragt wurden (oder deren
+/// Turn unbekannt ist, etwa eine vorab gezeigte Freigabefrage). Zellen früherer
+/// Turns bleiben unberührt — ein längst beendeter Aufruf wird nie nachträglich
+/// als „abgebrochen“ exportiert.
 fn mark_incomplete_tool_exports(
     app: &mut ChatApp,
     state: &mut TurnEventState,
+    turn_id: &harw_types::TurnId,
     reason: &str,
 ) -> bool {
-    let call_ids: Vec<_> = state.pending_tool_cells.keys().cloned().collect();
+    let call_ids: Vec<_> = state
+        .pending_tool_cells
+        .keys()
+        .filter(|call_id| {
+            state
+                .tool_call_turns
+                .get(*call_id)
+                .is_none_or(|requested_in| requested_in == turn_id)
+        })
+        .cloned()
+        .collect();
     let mut changed = false;
     for call_id in call_ids {
         let Some(cell) = state.pending_tool_cells.get(&call_id) else {
@@ -5255,7 +5621,9 @@ fn mark_incomplete_tool_exports(
         {
             continue;
         }
-        cell.mark_incomplete();
+        // Runde 5, Teil M: der echte Grund des Turn-Endes, nicht
+        // „Resume-Abbruch" (das gilt nur für den Resume-Pfad).
+        cell.mark_incomplete_with(reason);
         let tool_name = state
             .export_tool_calls
             .get(&call_id)
@@ -5842,7 +6210,11 @@ fn handle_overlay_key(app: &mut ChatApp, key: KeyEvent, bus: &HarwEventSender) -
             ModelSwitchAction::Cancel => app.overlay = None,
             ModelSwitchAction::Accept { provider, model } => {
                 let command = picker.target().command_line(&provider, &model);
+                // Runde 5, Teil G: Worker-Wahl live übernehmen, nach der
+                // UIA-Wahl aus `/models` den Worker-Bereich öffnen.
+                let reopen_workers = picker.opens_uia_workers_after();
                 app.overlay = None;
+                uia_workers::after_model_switch_accept(app, &command, reopen_workers);
                 bus.send(HarwEvent::Command(command));
             }
         },
@@ -5935,6 +6307,10 @@ fn handle_agent_tree_key(app: &mut ChatApp, key: KeyEvent) {
 /// # Rückgabe
 /// `true` wenn ein Redraw angefordert werden soll, sonst `false`.
 fn handle_key(app: &mut ChatApp, key: KeyEvent, bus: &HarwEventSender) -> bool {
+    // Runde 5, Teil L: Esc bricht eine wartende `/btw`-Nebenfrage ab.
+    if app.btw_esc_cancels(&key) {
+        return true;
+    }
     if let Some(redraw) = handle_view_hotkey(app, key) {
         return redraw;
     }
@@ -6117,18 +6493,10 @@ fn scroll_and_composer_key(app: &mut ChatApp, key: KeyEvent, bus: &HarwEventSend
         return handle_overlay_key(app, key, bus);
     }
 
-    // `@`-Erwähnungs-Popup: Navigation/Übernahme vor Composer und
-    // Befehls-Popup (beide schließen sich gegenseitig aus).
-    if let Some(redraw) = handle_mention_popup_key(app, key) {
+    // Runde 5, Teil G: `@`- und `/command`-Popup (Hoch/Runter/Tab/Esc/
+    // Enter-Übernahme) gemeinsam mit dem Busy-Pfad (`popup_keys`).
+    if let Some(redraw) = popup_keys::handle_popup_key(app, key) {
         return redraw;
-    }
-
-    // Das erste Escape schließt ausschließlich die Autovervollständigung.
-    // Ein direkt folgendes Escape erreicht danach den Composer und leert ihn.
-    if matches!(key.code, KeyCode::Esc) && app.has_popup() {
-        app.command_popup = None;
-        app.escape_armed = true;
-        return true;
     }
 
     // CyclePermissionMode (Standard Shift+Tab) — Zyklus ask → auto → full →
@@ -6202,26 +6570,9 @@ fn scroll_and_composer_key(app: &mut ChatApp, key: KeyEvent, bus: &HarwEventSend
             app.sync_popup();
             return true;
         }
-        // Im Unterkommando-Modus ohne getippten Suchtext (`/kanban `) sendet
-        // Enter die Zeile ab, statt still das erste Unterkommando zu wählen.
-        let completion = app
-            .command_popup
-            .as_ref()
-            .filter(|popup| {
-                !(matches!(popup.mode(), PopupMode::Subcommand { .. })
-                    && subcommand_query_is_empty(app.input.text()))
-            })
-            .and_then(|popup| {
-                popup
-                    .selected_name()
-                    .map(|name| popup.completion_line(name))
-            });
-        if let Some(line) = completion {
-            app.input.clear();
-            app.input.insert_str(&line);
-            app.command_popup = None;
-            return true;
-        }
+        // Runde 5, Teil G: die Übernahme einer markierten Popup-Auswahl
+        // (auch der Unterkommando-Sonderfall `/kanban `) liegt jetzt in
+        // `popup_keys::handle_popup_key`, das oben bereits lief.
         // Plain Enter ohne Auswahl: getippte Zeile absenden — mit aufgelösten
         // Paste-Platzhaltern, sonst bekäme das Modell nur
         // `[Pasted text #<id> +<n> lines]` statt des eingefügten Texts.
@@ -6250,37 +6601,9 @@ fn scroll_and_composer_key(app: &mut ChatApp, key: KeyEvent, bus: &HarwEventSend
     // ── Popup-Navigations-Pfad ────────────────────────────────────────────
     if app.has_popup() {
         match key.code {
-            // Tab vervollständigt shell-artig: unveränderte Markierung →
-            // Rang-/Präfixlogik (`CommandPopup::tab_outcome`); bewusst per
-            // Pfeiltaste/Ziffer bewegte Markierung → deren Auswahl gilt.
-            KeyCode::Tab => {
-                let outcome = app
-                    .command_popup
-                    .as_ref()
-                    .map(|popup| match popup.tab_outcome() {
-                        TabOutcome::None => TabOutcome::None,
-                        TabOutcome::Accept(name) => {
-                            TabOutcome::Accept(popup.completion_line(&name))
-                        }
-                        TabOutcome::ExtendQuery(common) => {
-                            TabOutcome::ExtendQuery(popup.query_line(&common))
-                        }
-                    });
-                match outcome.unwrap_or(TabOutcome::None) {
-                    TabOutcome::None => {}
-                    TabOutcome::Accept(line) => {
-                        app.input.clear();
-                        app.input.insert_str(&line);
-                        app.command_popup = None;
-                    }
-                    TabOutcome::ExtendQuery(line) => {
-                        app.input.clear();
-                        app.input.insert_str(&line);
-                        app.sync_popup();
-                    }
-                }
-                true
-            }
+            // Runde 5, Teil G: Tab/Shift+Tab/Esc und die Enter-Übernahme
+            // behandelt `popup_keys::handle_popup_key` (oben, gemeinsam mit
+            // dem Busy-Pfad); hier verbleiben Randfälle mit Modifikatoren.
             // Im Unterkommando-Modus sind Ziffern normale Eingabe.
             KeyCode::Char(character @ '1'..='9')
                 if !app
@@ -6429,6 +6752,9 @@ async fn run_turn_streaming(
     if app.apply_pending_controller_state(gateway.session_mut()) {
         persist_gateway_state(gateway).await?;
     }
+    // Runde 5, Teil L: Gesprächsstand für `/btw` während dieses Turns (die
+    // Sitzung ist danach bis zum Turn-Ende ausgeliehen).
+    app.capture_btw_snapshot(gateway.session_mut(), Some(text));
 
     // Keep a clone in the UI so Ctrl+C can cancel the core turn at its
     // cooperative checkpoints instead of merely queuing a character.
@@ -6440,6 +6766,8 @@ async fn run_turn_streaming(
     // "Warteschlange wird gesendet"-Hinweis.
     app.cancel_requested_at = None;
     app.queue_kept_at = None;
+    // Runde 5, Teil O: Esc-Nachfrage und Abbruchgrund gelten nur je Turn.
+    turn_safety::begin_turn(app);
     // Welle 4c, Punkt 8: denselben `ManagedAgentSpawner`, den die Wurzelsitzung
     // beim Admittieren von Kindern befragt ([`ChatApp::managed_spawner`] ist
     // exakt `RuntimeAssembly::spawner()` — siehe deren Montage in
@@ -6453,6 +6781,28 @@ async fn run_turn_streaming(
     if let Some(spawner) = app.managed_spawner() {
         if let Err(error) = spawner.register_parent_cancel_token(app.session_id(), cancel.clone()) {
             tracing::warn!(error = %error, "tui.turn.register_parent_cancel_token_failed");
+        }
+    }
+    // Runde 5, Teil E: die Nutzernachricht ist das „Ziel der Sitzung“ für
+    // den Auto-Modus-Klassifizierer (Geheimnisse entfernt er selbst).
+    if let Some(rt) = app.runtime() {
+        if let Some(auto) = rt.auto_mode() {
+            auto.context().set_goal(text);
+            // Runde 5 (Integration E/F): der angeheftete, freigegebene Plan ist
+            // Kontext für den Klassifizierer (gekürzt, ohne Geheimnis-Pfad —
+            // Redaction übernimmt der Klassifizierer selbst).
+            let plan = rt.plan_session().pinned().get().map(|doc| {
+                let mut content = doc.content;
+                if content.len() > 4096 {
+                    let mut cut = 4096;
+                    while !content.is_char_boundary(cut) {
+                        cut -= 1;
+                    }
+                    content.truncate(cut);
+                }
+                format!("{}\n{content}", doc.display_path)
+            });
+            auto.context().set_plan(plan);
         }
     }
     spinner.start();
@@ -6471,6 +6821,8 @@ async fn run_turn_streaming(
     )
     .await;
     spinner.stop();
+    // Runde 5, Teil O: Abbruchgrund für spät verarbeitete `TurnAborted` merken.
+    turn_safety::end_turn(app);
     app.active_cancel = None;
     // Turn ist beendet (egal ob normal, per Fehler oder per Abbruch) — der
     // transiente Abbruch-Hinweis hat damit ausgedient. Derselbe Reset gilt
@@ -6657,6 +7009,27 @@ async fn drive_turn_animated(
             loop {
                 tokio::select! {
                     result = &mut turn => break result,
+                    // Runde 5, Teil B: `host.sudo_exec` fragt während des
+                    // laufenden Turns im eigenen Fenster (`crate::sudo_dialog`).
+                    maybe_sudo = app.sudo.recv(), if app.sudo.is_listening() => {
+                        if crate::sudo_dialog::accept_prompt(app, maybe_sudo) {
+                            draw_viewport(guard, app, spinner, app.pending_quit.map(|arm| arm.label))?;
+                        }
+                    }
+                    // Runde 5, Teil F: `plan.exit`, `plan.enter` und `ask_user`
+                    // fragen während des laufenden Turns im eigenen Fenster.
+                    maybe_plan = app.plan_ui.recv(), if app.plan_ui.is_listening() => {
+                        if plan_mode::accept_request(app, maybe_plan) {
+                            draw_viewport(guard, app, spinner, app.pending_quit.map(|arm| arm.label))?;
+                        }
+                    }
+                    // Runde 5, Teil O: Freigabe-Fragen von Kind-Agenten im
+                    // selben Freigabedialog (mit Absender).
+                    maybe_child = app.child_approvals.recv(), if app.child_approvals.is_listening() => {
+                        if child_approvals::accept(app, maybe_child) {
+                            draw_viewport(guard, app, spinner, app.pending_quit.map(|arm| arm.label))?;
+                        }
+                    }
                     // B6: ein Modell-Tool (`sandbox-lease`) kann während des
                     // laufenden Turns eine Host-Permit-Frage stellen, ohne
                     // dass der Turn dafür pausiert (kein `TurnOutcome`-Wechsel
@@ -6683,6 +7056,35 @@ async fn drive_turn_animated(
                     }
                     event = tui_rx.recv(), if input_open => {
                         match event {
+                            // Runde 5, Teil B: ein offenes sudo-Fenster fängt
+                            // JEDES Ereignis ab — nichts erreicht Composer,
+                            // Busy-Queue oder Eingabe-Historie.
+                            Some(event) if app.sudo.is_open() => {
+                                if crate::sudo_dialog::route_event(app, event) {
+                                    draw_viewport(guard, app, spinner, app.pending_quit.map(|arm| arm.label))?;
+                                }
+                            }
+                            // Runde 5, Teil F: ein offenes Plan-Fenster fängt
+                            // jedes Ereignis ab (nach dem sudo-Fenster).
+                            Some(event) if app.plan_ui.is_open() => {
+                                if plan_mode::route_event(app, event) {
+                                    draw_viewport(guard, app, spinner, app.pending_quit.map(|arm| arm.label))?;
+                                }
+                            }
+                            // Runde 5, Teil O: eine offene Kind-Freigabe ist modal.
+                            Some(event) if child_approvals::is_open(app) => {
+                                match child_approvals::route_event(app, event) {
+                                    Ok(redraw) => {
+                                        if redraw {
+                                            draw_viewport(guard, app, spinner, app.pending_quit.map(|arm| arm.label))?;
+                                        }
+                                    }
+                                    Err(event) => {
+                                        let outcome = handle_busy_event(app, event);
+                                        settle_busy_outcome(guard, app, spinner, outcome)?;
+                                    }
+                                }
+                            }
                             Some(TuiEvent::Key(key))
                                 if key.modifiers.contains(KeyModifiers::CONTROL)
                                     && matches!(key.code, KeyCode::Char('c' | 'C'))
@@ -6717,8 +7119,12 @@ async fn drive_turn_animated(
                                 };
                                 match dialog.handle_key(key) {
                                     ChoiceAction::Stay => {
-                                        let outcome = queue_busy_key(app, key);
-                                        settle_busy_outcome(guard, app, spinner, outcome)?;
+                                        // Runde 5, Teil H: der Host-Permit-Dialog ist
+                                        // modal — Pfeiltasten usw. dürfen nie im
+                                        // Composer landen (dort riefen Hoch/Runter
+                                        // die Eingabe-Historie ab, etwa ein altes
+                                        // `/new`, das die nächste Eingabe abschickte).
+                                        draw_viewport(guard, app, spinner, app.pending_quit.map(|arm| arm.label))?;
                                     }
                                     ChoiceAction::Cancel => {
                                         if let Some(prompt) = app.pending_host_permit.take() {
@@ -6781,6 +7187,9 @@ async fn drive_turn_animated(
                     _ = tokio::time::sleep(SPINNER_INTERVAL) => {
                         spinner.tick();
                         app.drain_agent_events();
+                        // Runde 5, Teil O: aufgegebene Kind-Fragen schließen,
+                        // zurückgestellte wieder zeigen.
+                        child_approvals::poll(app);
                         // Ansichten füllen sich auch während eines Turns.
                         start_busy_work(app);
                         draw_viewport(guard, app, spinner, app.pending_quit.map(|arm| arm.label))?;
@@ -6847,6 +7256,15 @@ async fn drive_turn_animated(
         )
         .await?;
     }
+
+    // Runde 5, Teil B: nach Turn-Ende bleibt kein sudo-Fenster offen.
+    // Runde 5, Teil K: außer ein Hintergrund-Agent läuft weiter (dann
+    // beantwortet die Nutzerin es im Leerlauf).
+    if !background_agents::keeps_idle_prompts(app) {
+        crate::sudo_dialog::deny_open(app);
+    }
+    // Runde 5, Teil F: ebenso kein Plan-Fenster.
+    plan_mode::close_open(app);
 
     // Nachdem der Turn-Future gedroppt ist, ist der `&mut` auf die Session
     // frei — wir dürfen sie erneut ausleihen, um die Turn-Antwort zu
@@ -7164,6 +7582,11 @@ fn build_host_permit_dialog(prompt: &HostPermitPrompt) -> ChoiceDialog {
         HostPermitVariant::SessionLease.label().to_owned(),
         "Nein, ablehnen".to_owned(),
     ];
+    // Runde 5, Teil N: Host-Mode-Anfrage aus dem Agentenbaum — zeigt, wer
+    // fragt (Rolle, Kind-ID, Baum-Pfad), Grund, Befehl und cwd.
+    if let Some((title, hint)) = crate::host_permit_dialog::escalation_dialog_text(prompt) {
+        return ChoiceDialog::new(title, Some(hint), options).with_selected(selected);
+    }
     let is_sandbox_lease =
         prompt.worker_definition() == harw_tool_shell::SANDBOX_LEASE_WORKER_DEFINITION;
     let (title, hint) = if is_sandbox_lease {
@@ -7238,7 +7661,17 @@ fn build_approval_dialog(
     timeout: Duration,
 ) -> ApprovalDialog {
     let call = prompt.call();
-    let remember_rule = if call.name.as_str() == "shell.exec" {
+    // Runde 5, Teil E: mit Auto-Modus-Laufzeit ersetzt das Lern-Angebot
+    // (erst ab der dritten gleichartigen Freigabe, Scope Sitzung/Projekt,
+    // nie für ALWAYS_ASK_TOOLS oder riskante Muster) das sofortige
+    // „nicht mehr fragen“.
+    let learning = app
+        .runtime()
+        .and_then(|rt| rt.auto_mode())
+        .map(|auto| auto.learning_offer(call));
+    let remember_rule = if learning.is_some() {
+        None
+    } else if call.name.as_str() == "shell.exec" {
         call.arguments
             .get("command")
             .and_then(|value| value.as_str())
@@ -7246,7 +7679,7 @@ fn build_approval_dialog(
     } else {
         None
     };
-    ApprovalDialog::new(ApprovalDialogRequest {
+    let dialog = ApprovalDialog::new(ApprovalDialogRequest {
         call: call.clone(),
         cwd: if app.project_root().is_empty() {
             None
@@ -7259,7 +7692,11 @@ fn build_approval_dialog(
         remember_rule,
         deadline: Instant::now() + timeout,
         reason_input_enabled: true,
-    })
+    });
+    match learning.flatten() {
+        Some(offer) => dialog.with_learning_offer(LearnOfferView::from(&offer)),
+        None => dialog,
+    }
 }
 
 /// Setzt eine Entscheidung aus dem Freigabe-Panel um (Plan Schritt 3).
@@ -7337,6 +7774,51 @@ async fn apply_approval_decision(
         }
     }
 
+    // Runde 5, Teil E: angenommenes Lern-Angebot als Allow-Regel anlegen —
+    // Sitzung nur im Speicher, Projekt zusätzlich über `/permissions allow
+    // … --project` (ConfigWriter), erst jetzt nach der Bestätigung.
+    if let ApprovalChoice::ApproveAndLearn { offer, scope } = &choice {
+        let message = match app.runtime() {
+            Some(rt) => {
+                rt.services().allow_rules().add(offer.rule(*scope));
+                if let Some(auto) = rt.auto_mode() {
+                    auto.forget_learned(&harw_runtime::LearnKey {
+                        tool: offer.tool.clone(),
+                        pattern: offer.pattern.clone(),
+                    });
+                }
+                if *scope == LearnScope::Project {
+                    let command = offer.persist_command(quote_for_synthetic_command);
+                    let output = execute_command_as(
+                        app.adapters(),
+                        app.sandbox(),
+                        app.session_id(),
+                        runtime_commands::caller_tier(rt.principal()),
+                        &command,
+                        || runtime_commands::slash_service_map(rt.services()),
+                    )
+                    .await;
+                    tracing::info!(
+                        tool = %offer.tool,
+                        result = %output,
+                        "tui.approval.learned_rule_persist_attempted"
+                    );
+                }
+                let scope_text = match scope {
+                    LearnScope::Session => "für diese Sitzung",
+                    LearnScope::Project => "dauerhaft im Projekt",
+                };
+                format!("Künftig erlaubt ({scope_text}): {}", offer.display)
+            }
+            None => format!(
+                "„Künftig erlauben“ für {} gilt nur für diesen Aufruf — keine \
+                 Laufzeit-Montage zum Speichern verfügbar.",
+                offer.display
+            ),
+        };
+        app.push_line(Role::System, message);
+    }
+
     if matches!(choice, ApprovalChoice::ApproveAndAutoMode) {
         match app.runtime() {
             Some(rt) => rt.approval_mode().set(ApprovalMode::Delegated),
@@ -7347,15 +7829,24 @@ async fn apply_approval_decision(
         }
     }
 
+    // Runde 5, Teil E: manuelle Freigaben zählen für das Lern-Angebot.
+    let approved_call = prompt.call().clone();
+    let learned = matches!(choice, ApprovalChoice::ApproveAndLearn { .. });
     let (approved, delivered) = match choice {
         ApprovalChoice::Approve
         | ApprovalChoice::ApproveAndRemember(_)
-        | ApprovalChoice::ApproveAndAutoMode => (true, prompt.approve()),
+        | ApprovalChoice::ApproveAndAutoMode
+        | ApprovalChoice::ApproveAndLearn { .. } => (true, prompt.approve()),
         ApprovalChoice::Reject { reason } => {
             let reason = reason.unwrap_or_else(|| REASON_OPERATOR_REJECTED.to_owned());
             (false, prompt.reject(reason))
         }
     };
+    if approved && delivered && !learned {
+        if let Some(auto) = app.runtime().and_then(|rt| rt.auto_mode()) {
+            auto.record_manual_approval(&approved_call);
+        }
+    }
 
     let note = if approved && delivered {
         "✓ freigegeben"
@@ -7536,9 +8027,17 @@ async fn drive_pauses_to_completion(
         tokio::select! {
             result = &mut drive => {
                 let finished = result.map_err(tui_error_from_approval_driver)?;
+                // Runde 5, Teil O: `drive_to_completion` reicht terminale
+                // Ausgänge (Abbruch, Kürzung, Ablehnung, Fehler) unverändert
+                // durch — nur eine Pause darf hier nie mehr ankommen. Vorher
+                // ließ ein Esc-Abbruch nach einer Kind-Pause Debug-Builds hier
+                // in Panik geraten.
                 debug_assert!(
-                    matches!(finished, TurnOutcome::Completed),
-                    "drive_to_completion must only ever return Completed"
+                    !matches!(
+                        finished,
+                        TurnOutcome::AwaitingApproval { .. } | TurnOutcome::AwaitingChild { .. }
+                    ),
+                    "drive_to_completion must never return a pause"
                 );
                 // Eine noch offene Frage nach Turn-Ende: Ablehnung ist der
                 // Default, und das Panel darf nicht als Frage stehenbleiben.
@@ -7596,6 +8095,9 @@ async fn drive_pauses_to_completion(
                         let tool_cell =
                             ensure_tool_cell(app, turn_state, prompt.call_id().clone(), prompt.call());
                         let timeout = approval_driver.handler().timeout();
+                        // Runde 5, Teil O: die Wurzel-Frage hat Vorrang; eine
+                        // offene Kind-Frage wartet, bis der Dialog frei ist.
+                        child_approvals::yield_to_root(app);
                         app.pending_approval_dialog = Some(build_approval_dialog(&prompt, app, timeout));
                         dialog_shown_at = Some(Instant::now());
                         pending = Some(PendingApprovalPrompt { prompt, tool_cell });
@@ -7605,6 +8107,26 @@ async fn drive_pauses_to_completion(
                         tracing::warn!("tui.approval.prompt_channel_ended");
                         approvals_open = false;
                     }
+                }
+            }
+            // Runde 5, Teil B: `host.sudo_exec` fragt im eigenen Fenster
+            // (`crate::sudo_dialog`), auch während einer Pause.
+            maybe_sudo = app.sudo.recv(), if app.sudo.is_listening() => {
+                if crate::sudo_dialog::accept_prompt(app, maybe_sudo) {
+                    draw_viewport(guard, app, spinner, app.pending_quit.map(|arm| arm.label))?;
+                }
+            }
+            // Runde 5, Teil F: Plan-Fenster auch während einer Pause.
+            maybe_plan = app.plan_ui.recv(), if app.plan_ui.is_listening() => {
+                if plan_mode::accept_request(app, maybe_plan) {
+                    draw_viewport(guard, app, spinner, app.pending_quit.map(|arm| arm.label))?;
+                }
+            }
+            // Runde 5, Teil O: Freigabe-Fragen von Kind-Agenten, auch während
+            // der Eltern-Turn auf ein Kind wartet.
+            maybe_child = app.child_approvals.recv(), if app.child_approvals.is_listening() => {
+                if child_approvals::accept(app, maybe_child) {
+                    draw_viewport(guard, app, spinner, app.pending_quit.map(|arm| arm.label))?;
                 }
             }
             maybe_host_prompt = host_permit_prompts.recv(), if host_permit_prompts_open => {
@@ -7635,6 +8157,34 @@ async fn drive_pauses_to_completion(
             }
             maybe_event = tui_rx.recv(), if input_open => {
                 match maybe_event {
+                    // Runde 5, Teil B: ein offenes sudo-Fenster fängt JEDES
+                    // Ereignis ab (vor Freigabe-Panel, Host-Permit und Busy-Pfad).
+                    Some(event) if app.sudo.is_open() => {
+                        if crate::sudo_dialog::route_event(app, event) {
+                            draw_viewport(guard, app, spinner, app.pending_quit.map(|arm| arm.label))?;
+                        }
+                    }
+                    // Runde 5, Teil F: ein offenes Plan-Fenster fängt jedes
+                    // Ereignis ab (nach dem sudo-Fenster).
+                    Some(event) if app.plan_ui.is_open() => {
+                        if plan_mode::route_event(app, event) {
+                            draw_viewport(guard, app, spinner, app.pending_quit.map(|arm| arm.label))?;
+                        }
+                    }
+                    // Runde 5, Teil O: eine offene Kind-Freigabe ist modal.
+                    Some(event) if child_approvals::is_open(app) => {
+                        match child_approvals::route_event(app, event) {
+                            Ok(redraw) => {
+                                if redraw {
+                                    draw_viewport(guard, app, spinner, app.pending_quit.map(|arm| arm.label))?;
+                                }
+                            }
+                            Err(event) => {
+                                let outcome = handle_busy_event(app, event);
+                                settle_busy_outcome(guard, app, spinner, outcome)?;
+                            }
+                        }
+                    }
                     Some(event) if pending.is_none() && app.pending_host_permit.is_none() => {
                         let outcome = handle_busy_event(app, event);
                         settle_busy_outcome(guard, app, spinner, outcome)?;
@@ -7707,8 +8257,9 @@ async fn drive_pauses_to_completion(
                             };
                             match dialog.handle_key(key) {
                                 ChoiceAction::Stay => {
-                                    let outcome = queue_busy_key(app, key);
-                                    settle_busy_outcome(guard, app, spinner, outcome)?;
+                                    // Runde 5, Teil H: der Host-Permit-Dialog ist
+                                    // modal — keine Taste erreicht den Composer.
+                                    draw_viewport(guard, app, spinner, app.pending_quit.map(|arm| arm.label))?;
                                 }
                                 ChoiceAction::Cancel => {
                                     if let Some(prompt) = app.pending_host_permit.take() {
@@ -7791,6 +8342,9 @@ async fn drive_pauses_to_completion(
             _ = tokio::time::sleep(SPINNER_INTERVAL) => {
                 spinner.tick();
                 app.drain_agent_events();
+                // Runde 5, Teil O: aufgegebene Kind-Fragen schließen,
+                // zurückgestellte wieder zeigen.
+                child_approvals::poll(app);
                 // Ansichten füllen sich auch während eines Turns.
                 start_busy_work(app);
                 draw_viewport(guard, app, spinner, app.pending_quit.map(|arm| arm.label))?;
@@ -7902,12 +8456,23 @@ fn is_busy_safe_intercept(intercept: &LocalIntercept) -> bool {
         LocalIntercept::OpenOverlay(_)
             | LocalIntercept::OpenModelPicker(_)
             | LocalIntercept::OpenUiaWorkerPicker
+            | LocalIntercept::OpenUiaPickerThenWorkers
             | LocalIntercept::OpenEffortChoice(_)
             | LocalIntercept::OpenAgentTree
             | LocalIntercept::TogglePanel(_)
             | LocalIntercept::ToggleVerbose
             | LocalIntercept::System(_)
             | LocalIntercept::RenameSession(_)
+            // Runde 5, Teil I: reine Anzeige-Umschaltung, sofort wirksam.
+            | LocalIntercept::ChildStream(_)
+            // Runde 5, Teil L: `/btw` läuft neben dem Turn, ohne ihn zu berühren.
+            | LocalIntercept::Btw(_)
+            // Runde 5, Teil K: Liste bzw. Abbruch eines Hintergrund-Agenten.
+            | LocalIntercept::BackgroundAgents(_)
+    ) || matches!(
+        // Runde 5, Teil F: `/plan edit` braucht das Terminal und wartet.
+        intercept,
+        LocalIntercept::Plan(command) if command.busy_safe()
     )
 }
 
@@ -8064,6 +8629,13 @@ fn handle_busy_event(app: &mut ChatApp, event: TuiEvent) -> BusyKeyOutcome {
             app.pending_quit = None;
         }
     }
+    // Runde 5, Teil L: Esc bricht zuerst eine wartende `/btw`-Nebenfrage ab —
+    // der Turn läuft weiter; erst ein weiteres Esc unterbricht ihn.
+    if let TuiEvent::Key(key) = &event
+        && app.btw_esc_cancels(key)
+    {
+        return BusyKeyOutcome::Redraw;
+    }
     if let TuiEvent::Key(key) = &event {
         let is_ctrl_c = key.modifiers.contains(KeyModifiers::CONTROL)
             && matches!(key.code, KeyCode::Char('c' | 'C'));
@@ -8077,6 +8649,18 @@ fn handle_busy_event(app: &mut ChatApp, event: TuiEvent) -> BusyKeyOutcome {
             }
             if app.overlay.is_some() {
                 return route_busy_overlay_key(app, *key);
+            }
+            // Runde 5, Teil G: offene `/`- und `@`-Popups bekommen Hoch/
+            // Runter/Tab/Esc/Enter wie im Idle-Pfad (`popup_keys`). Ein
+            // offenes sudo-Fenster hat die Taste vorher schon abgefangen
+            // (Aufrufer). Enter ohne Übernahme sendet über `queue_busy_key`
+            // nach den Busy-Klassen ab.
+            if let Some(redraw) = popup_keys::handle_popup_key(app, *key) {
+                return if redraw {
+                    BusyKeyOutcome::Redraw
+                } else {
+                    BusyKeyOutcome::Idle
+                };
             }
             // Alt+↑ holt die zuletzt eingereihte Nachricht zum Bearbeiten
             // zurück in den leeren Composer.
@@ -8152,6 +8736,18 @@ fn handle_busy_event(app: &mut ChatApp, event: TuiEvent) -> BusyKeyOutcome {
             app.cycle_permission_stage(false);
             BusyKeyOutcome::Redraw
         }
+        // Runde 5: ToggleToolCells (Standard Ctrl+O) wirkt auch während eines
+        // laufenden Turns sofort — auch auf die Live-Blöcke der Kind-Agenten
+        // (Teil I) — und wird nicht in die Busy-Queue eingereiht.
+        TuiEvent::Key(key)
+            if app.key_bindings.action_for(&key) == Some(KeyAction::ToggleToolCells) =>
+        {
+            if app.toggle_tool_cells() {
+                BusyKeyOutcome::Redraw
+            } else {
+                BusyKeyOutcome::Idle
+            }
+        }
         TuiEvent::Draw | TuiEvent::Resize(_, _) => BusyKeyOutcome::Redraw,
         TuiEvent::Paste(text) => {
             // Große Pastes landen nur als kompakter Platzhalter im Composer
@@ -8172,6 +8768,11 @@ fn handle_busy_event(app: &mut ChatApp, event: TuiEvent) -> BusyKeyOutcome {
                 && !app.has_popup()
                 && app.active_cancel.is_some() =>
         {
+            // Runde 5, Teil O: laufen Kinder, die der Abbruch mitrisse,
+            // fragt das erste Esc nur nach (`turn_safety`).
+            if !turn_safety::esc_should_interrupt(app) {
+                return BusyKeyOutcome::Redraw;
+            }
             if interrupt_turn(app) {
                 BusyKeyOutcome::Redraw
             } else {
@@ -8318,7 +8919,9 @@ fn render_viewport(
     // Effort-Auswahl) ersetzen die gesamte Viewport (Plan Schritt 6/7) —
     // `Clear` erst, sonst bliebe Chat-Text unter dem Overlay stehen
     // (dasselbe Muster wie beim `/command`-Popup weiter unten).
-    match &app.overlay {
+    // Runde 5, Teil B: ein offenes sudo-Fenster (fängt jede Eingabe ab) darf
+    // nie unter einem Overlay verborgen sein — das Overlay pausiert solange.
+    match app.overlay.as_ref().filter(|_| !app.sudo.is_open()) {
         Some(Overlay::AgentTree(tree)) => {
             frame.render_widget(Clear, area);
             tree.render(area, frame.buffer_mut(), theme, &app.agent_tree_rows());
@@ -8356,10 +8959,16 @@ fn render_viewport(
     // Höhe und Cursor-Position müssen mit
     // derselben Breite rechnen, sonst laufen sie auseinander.
     let input_width = (area.width.saturating_sub(5)) as usize;
+    // Runde 5, Teil B: ein offenes sudo-Fenster hat Vorrang vor jeder Frage.
+    let sudo_height = app.sudo.desired_height(area.width, theme);
+    // Runde 5, Teil F: danach ein offenes Plan-Fenster.
+    let plan_height = app.plan_ui.desired_height(area.width, theme);
     let input_height = match (
         &app.pending_approval_dialog,
         &app.pending_host_permit_dialog,
     ) {
+        _ if sudo_height.is_some() => sudo_height.unwrap_or_default(),
+        _ if plan_height.is_some() => plan_height.unwrap_or_default(),
         (Some(dialog), _) => dialog.desired_height(area.width),
         // Eine Host-Permit-Frage kann nur auftreten, wenn keine normale
         // Werkzeugfreigabe offen ist (siehe `drive_pauses_to_completion`:
@@ -8493,10 +9102,8 @@ fn render_viewport(
     } else {
         ""
     };
-    let agents_suffix = match app.agent_monitor.active_count() {
-        0 | 1 => String::new(),
-        n => format!(" | {n} Agenten aktiv"),
-    };
+    // Runde 5, Teil K: „· N im Hintergrund".
+    let agents_suffix = background_agents::status_suffix(app, app.agent_monitor.active_count());
     // Spinner-Präfix: solange ein Turn läuft, zeigt die Statuszeile das
     // animierte Glyph plus Label — vorher wurde `spinner`/`quit_hint` zwar
     // berechnet und weitergereicht, aber nie tatsächlich gerendert. Die
@@ -8587,8 +9194,10 @@ fn render_viewport(
     // unübersehbar `HOST-MODUS AKTIV`") in einer eigenen, hervorgehobenen
     // Warnfarbe zeigen — ein einfacher String-Suffix in derselben Farbe wie
     // der Rest der Zeile wäre zu leicht zu übersehen.
+    // Runde 5, Teil P: feste Goal-Marke vorne, solange ein Goal aktiv ist.
+    let mut goal_spans = app.goal_status_spans(theme, status_area.width);
     if app.host_mode_active() {
-        let line = Line::from(vec![
+        goal_spans.extend([
             Span::styled(status, Style::default().fg(style::border_color(theme))),
             Span::styled(
                 " · HOST-MODUS AKTIV (Strg+H beendet)",
@@ -8597,7 +9206,22 @@ fn render_viewport(
                     .add_modifier(Modifier::BOLD),
             ),
         ]);
-        frame.render_widget(Paragraph::new(line), status_area);
+        frame.render_widget(Paragraph::new(Line::from(goal_spans)), status_area);
+    } else if app.current_permission_stage() == PermissionCycleStage::Plan {
+        // Runde 5, Teil F: deutliche Plan-Marke in eigener Farbe vorne.
+        let mut spans = vec![crate::plan_dialog::plan_status_span(theme)];
+        spans.append(&mut goal_spans);
+        spans.push(Span::styled(
+            status,
+            Style::default().fg(style::border_color(theme)),
+        ));
+        frame.render_widget(Paragraph::new(Line::from(spans)), status_area);
+    } else if !goal_spans.is_empty() {
+        goal_spans.push(Span::styled(
+            status,
+            Style::default().fg(style::border_color(theme)),
+        ));
+        frame.render_widget(Paragraph::new(Line::from(goal_spans)), status_area);
     } else {
         frame.render_widget(
             Paragraph::new(status).style(Style::default().fg(style::border_color(theme))),
@@ -8701,6 +9325,19 @@ fn render_viewport(
     // Composer vollständig (Plan Schritt 3); der Rest des Layouts (History,
     // Status) bleibt unverändert. Kein Text-Cursor in diesem Fall — das Panel
     // wird über Pfeiltasten/Ziffern bedient, nicht getippt.
+    // Runde 5, Teil B: das sudo-Fenster ersetzt den Composer vor allen
+    // anderen Fragen; kein Text-Cursor (das Passwort wird nie angezeigt).
+    if app.sudo.render(input_area, frame.buffer_mut(), theme) {
+        return;
+    }
+    // Runde 5, Teil F: Plan-Freigabe (Plan über dem Verlauf, Optionen statt
+    // Composer), Plan-Vorschlag und `ask_user`-Auswahl.
+    if app
+        .plan_ui
+        .render(input_area, history_area, frame.buffer_mut(), theme)
+    {
+        return;
+    }
     if let Some(dialog) = &app.pending_approval_dialog {
         dialog.render(input_area, frame.buffer_mut(), &theme);
         return;
@@ -8738,12 +9375,21 @@ fn render_viewport(
     let (cursor_row, cursor_col) = app.input.cursor_position(input_width);
     let input_rows = input_area.height.saturating_sub(2) as usize;
     let input_top = cursor_row.saturating_sub(input_rows.saturating_sub(1));
+    // Runde 5, Teil F: im Plan-Modus zeigt der leere Composer den Hinweis
+    // „Plan-Modus – es wird nichts verändert“ (Rahmen/Titel in Plan-Farbe).
+    let plan_mode_composer =
+        !shell_mode && app.current_permission_stage() == PermissionCycleStage::Plan;
+    if plan_mode_composer && app.input.text().is_empty() {
+        input_lines = vec![crate::plan_dialog::plan_placeholder_line(theme)];
+    }
     let (title_text, title_style, border_style) = if shell_mode {
         (
             " Shell-Modus · Enter führt aus · Esc/Backspace am Anfang verlässt ",
             style::shell_mode_style(theme),
             Style::default().fg(style::shell_mode_color(theme)),
         )
+    } else if plan_mode_composer {
+        crate::plan_dialog::plan_composer_chrome(theme)
     } else {
         (
             " harw ",
@@ -8940,6 +9586,78 @@ mod tests {
         ))
     }
 
+    /// Runde 5, Teil B: solange das sudo-Fenster offen ist, erreicht keine
+    /// Taste und kein Paste den Composer, die Busy-Warteschlange oder die
+    /// Eingabe-Historie; Verlauf und Export-Einträge enthalten das Passwort
+    /// nie, und nach Enter geht genau eine Antwort an die Ausführung.
+    #[tokio::test]
+    async fn sudo_dialog_swallows_every_key_and_paste_and_never_logs_the_password() -> TestResult {
+        let mut app = ChatApp::new(Vec::new(), test_sandbox()?, SessionId::new());
+        let (prompt, answer) = harw_tool_shell::SudoPrompt::new(
+            "s1".to_owned(),
+            "uia-shell-worker".to_owned(),
+            vec!["apt-get".to_owned(), "update".to_owned()],
+            PathBuf::from("/workspace"),
+            "Paketlisten".to_owned(),
+            false,
+        );
+        // Bereits scharf: das Fenster ist seit zwei Sekunden offen.
+        let Some(shown) = Instant::now().checked_sub(Duration::from_secs(2)) else {
+            return Ok(());
+        };
+        assert!(app.sudo.open(prompt, shown).is_none());
+        // Die Historie kann aus einer persistierten Datei vorbelegt sein;
+        // entscheidend ist, dass der Dialog nichts hinzufügt.
+        let history_before = app.input.history().len();
+        for c in "sehr-geheim".chars() {
+            crate::sudo_dialog::route_event(
+                &mut app,
+                TuiEvent::Key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE)),
+            );
+        }
+        crate::sudo_dialog::route_event(&mut app, TuiEvent::Paste("-paste".to_owned()));
+        for code in [KeyCode::PageUp, KeyCode::F(6), KeyCode::Home, KeyCode::End] {
+            crate::sudo_dialog::route_event(
+                &mut app,
+                TuiEvent::Key(KeyEvent::new(code, KeyModifiers::NONE)),
+            );
+        }
+        assert!(app.input.text().is_empty(), "Composer bleibt leer");
+        assert_eq!(
+            app.input.history().len(),
+            history_before,
+            "keine neue Eingabe-Historie"
+        );
+        assert!(
+            !app.input
+                .history()
+                .iter()
+                .any(|entry| entry.contains("geheim")),
+            "das Passwort steht nie in der Historie"
+        );
+        assert!(app.deferred_input.is_empty(), "keine Busy-Warteschlange");
+        assert!(app.pending_turns.is_empty());
+        assert!(app.overlay.is_none(), "keine Ansicht per Hotkey");
+        assert!(app.sudo.is_open());
+
+        crate::sudo_dialog::route_event(
+            &mut app,
+            TuiEvent::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+        );
+        assert!(!app.sudo.is_open());
+        assert!(matches!(
+            answer.into_answer().await,
+            Some(harw_tool_shell::SudoAnswer::Password {
+                remember: false,
+                ..
+            })
+        ));
+        let exported = format!("{:?}", app.export_entries);
+        assert!(!exported.contains("geheim"), "{exported}");
+        assert!(exported.contains("apt-get update"), "{exported}");
+        Ok(())
+    }
+
     /// Baut einen `ChatApp`-Testzustand mit leerer Adapter-Pipeline und einer
     /// frischen Test-Sandbox. Für Tests, die nur Verlauf/Popup/Scroll prüfen
     /// (nicht die Command-Adapter-Pipeline selbst — dafür siehe
@@ -9009,6 +9727,23 @@ mod tests {
         // Ein zweites Esc gibt den Fokus wie bisher an den Chat zurück.
         assert_eq!(handle_panel_key(&mut app, key(KeyCode::Esc)), Some(true));
         assert_eq!(app.panels.focus, crate::panes::PaneFocus::Chat);
+        Ok(())
+    }
+
+    /// Runde 5: Ctrl+O wirkt auch während eines laufenden Turns sofort und
+    /// landet nicht im Composer bzw. in der Busy-Queue.
+    #[test]
+    fn toggle_tool_cells_works_while_busy() -> TestResult {
+        let mut app = test_chat_app()?;
+        app.push_reasoning_cell("erste Zeile\nzweite Zeile".to_owned(), None);
+        assert!(app.has_collapsed_tool_cells());
+        let ctrl_o = TuiEvent::Key(KeyEvent::new(KeyCode::Char('o'), KeyModifiers::CONTROL));
+        assert!(matches!(
+            handle_busy_event(&mut app, ctrl_o),
+            BusyKeyOutcome::Redraw
+        ));
+        assert!(!app.has_collapsed_tool_cells());
+        assert!(app.input.text().is_empty(), "Ctrl+O darf nichts eintippen");
         Ok(())
     }
 

@@ -282,7 +282,10 @@ impl DoctorCheck for RuntimeCompositionCheck {
 }
 
 fn is_sensitive_tool(tool: &str) -> bool {
-    matches!(tool, "shell.exec" | "fs.write" | "filesystem.write")
+    matches!(
+        tool,
+        "shell.exec" | "fs.write" | "fs.edit" | "filesystem.write"
+    )
 }
 
 /// Prüft den erkannten Service-Manager via [`detect_service_manager`].

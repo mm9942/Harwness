@@ -1,0 +1,28 @@
+[package]
+publish.workspace = true
+name = "harw-tool-plan"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+# Runde 5, Teil F: Plan-Modus wie in Claude Code — `plan.write`, `plan.exit`,
+# `plan.enter`, `ask_user`, die sofortige Plan-Sperre (`PlanModeGate`) und der
+# angeheftete Plan als Kontextbeitrag. Kein Zyklus: die Crate hängt weder an
+# `harw-core` noch an `harw-runtime`/`harw-tui`; beide hängen an ihr.
+[dependencies]
+harw-authority = { path = "../harw-authority" }
+harw-extension-api = { path = "../harw-extension-api" }
+harw-tools = { path = "../harw-tools" }
+harw-types = { path = "../harw-types" }
+serde = { workspace = true, features = ["derive"] }
+serde_json.workspace = true
+# Fragekanal zur TUI (mpsc/oneshot) und Wartezeit auf die Entscheidung.
+tokio = { version = "1", features = ["sync", "time", "macros"] }
+tracing.workspace = true
+
+[dev-dependencies]
+tempfile = { workspace = true }
+tokio = { version = "1", features = ["sync", "time", "macros", "rt"] }
+
+[lints]
+workspace = true

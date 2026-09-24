@@ -22,6 +22,8 @@ Blocker, knappem Budget oder Bedarf jenseits des Teilbaums stoppen und
 zurückgeben. Die Sitzung wird an jeder Auftragsgrenze hart verdichtet.
 
 ## Übergabe
+Frage/Zwischenstand an den Auftraggeber: `parent.message`; an eigene
+Kinder: `agent.message`.
 An den Auftraggeber nach Return-Contract (meist ReturnEnvelope): Ausgang,
 Zusammenfassung, Artefakte, Blocker, Warnungen, nächste Schritte — knapp
 und faktenorientiert.

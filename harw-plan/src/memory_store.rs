@@ -6,7 +6,9 @@
 //! Die Mutationslogik selbst liegt **nicht** hier, sondern in
 //! `crate::mutation` — dieselbe Funktion, die auch `FilePlanStore` aufruft.
 //! Dieses Modul verantwortet ausschließlich Locking, Revisionsvergabe,
-//! Konfigurationsdurchsetzung und die Event-History.
+//! Konfigurationsdurchsetzung, die Event-History und (Runde 5, Teil P) den
+//! Plan-Katalog: mehrere Pläne mit eigener Revisionsfolge und History, genau
+//! einer davon aktiv (siehe [`crate::catalog`]).
 //!
 //! Exportierte Typen: [`InMemoryPlanStore`].
 
@@ -16,27 +18,67 @@ use time::OffsetDateTime;
 use tracing::{debug, info};
 
 use crate::actions::{PlanAction, PlanEvent};
+use crate::catalog::{PlanApproval, PlanMeta, PlanSummary};
 use crate::config::PlanToolConfig;
 use crate::error::{PlanError, PlanResult};
 use crate::ids::{PlanId, RevisionId};
 use crate::store::{PlanRevision, PlanStore, check_batch_target, stage_actions};
 use crate::types::Plan;
 
+/// Ein Plan im Katalog samt eigener History und Revisionsfolge.
+struct Slot {
+    /// Aktueller Planzustand.
+    plan: Plan,
+    /// Event-History dieses Plans (append-only).
+    history: Vec<PlanEvent>,
+    /// Nächste Revisionsnummer dieses Plans.
+    next_revision: RevisionId,
+    /// Katalogdaten (Archiv, Freigabestand).
+    meta: PlanMeta,
+}
+
 /// Interner Zustand des In-Memory-Stores.
 struct Inner {
-    /// Aktueller Planzustand.
-    plan: Option<Plan>,
-    /// Event-History (append-only).
-    history: Vec<PlanEvent>,
-    /// Nächste Revisionsnummer.
-    next_revision: RevisionId,
+    /// Alle Pläne in Anlagereihenfolge.
+    plans: Vec<Slot>,
+    /// Der aktive Plan (Ziel aller Mutationen).
+    active: Option<PlanId>,
+}
+
+impl Inner {
+    // Index des Plans `id`.
+    fn position(&self, id: &PlanId) -> Option<usize> {
+        self.plans.iter().position(|slot| &slot.plan.id == id)
+    }
+
+    // Der aktive Plan.
+    fn active_slot(&self) -> Option<&Slot> {
+        let active = self.active.as_ref()?;
+        self.plans.iter().find(|slot| &slot.plan.id == active)
+    }
+
+    // Der aktive Plan, veränderlich.
+    fn active_slot_mut(&mut self) -> Option<&mut Slot> {
+        let active = self.active.clone()?;
+        self.plans.iter_mut().find(|slot| slot.plan.id == active)
+    }
+
+    // Der Plan `id` oder `PlanUnknown`.
+    fn slot_mut(&mut self, id: &PlanId) -> PlanResult<&mut Slot> {
+        self.plans
+            .iter_mut()
+            .find(|slot| &slot.plan.id == id)
+            .ok_or_else(|| PlanError::PlanUnknown { id: id.clone() })
+    }
 }
 
 /// Thread-sicherer In-Memory-`PlanStore`.
 ///
 /// # Description
 /// Nutzt `std::sync::RwLock<Inner>` intern. Validierung erfolgt vor jeder
-/// Mutation. Ideal für Unit-Tests und Szenarien ohne Persistenz.
+/// Mutation. Ideal für Unit-Tests und Szenarien ohne Persistenz. Hält
+/// beliebig viele Pläne; Mutationen, `current()`, `history()` und
+/// `revision()` beziehen sich auf den aktiven Plan.
 ///
 /// # Concurrency
 /// `Send + Sync` durch `RwLock`. Lese-Operationen halten nur einen Lese-Lock;
@@ -79,9 +121,8 @@ impl InMemoryPlanStore {
     fn from_parts(config: PlanToolConfig) -> Self {
         Self {
             inner: RwLock::new(Inner {
-                plan: None,
-                history: Vec::new(),
-                next_revision: RevisionId::new(1),
+                plans: Vec::new(),
+                active: None,
             }),
             config,
         }
@@ -96,6 +137,20 @@ impl InMemoryPlanStore {
         config.require_enabled().map_err(PlanError::Config)?;
         Ok(Self::from_parts(config))
     }
+
+    // Lese-Lock mit einheitlichem Fehler.
+    fn read(&self) -> PlanResult<std::sync::RwLockReadGuard<'_, Inner>> {
+        self.inner
+            .read()
+            .map_err(|_| PlanError::Io(std::io::Error::other("RwLock vergiftet")))
+    }
+
+    // Schreib-Lock mit einheitlichem Fehler.
+    fn write(&self) -> PlanResult<std::sync::RwLockWriteGuard<'_, Inner>> {
+        self.inner
+            .write()
+            .map_err(|_| PlanError::Io(std::io::Error::other("RwLock vergiftet")))
+    }
 }
 
 impl Default for InMemoryPlanStore {
@@ -106,31 +161,29 @@ impl Default for InMemoryPlanStore {
 
 impl PlanStore for InMemoryPlanStore {
     fn current(&self) -> PlanResult<Plan> {
-        let inner = self
-            .inner
-            .read()
-            .map_err(|_| PlanError::Io(std::io::Error::other("RwLock vergiftet")))?;
-        inner.plan.clone().ok_or(PlanError::PlanNotFound)
+        let inner = self.read()?;
+        inner
+            .active_slot()
+            .map(|slot| slot.plan.clone())
+            .ok_or(PlanError::PlanNotFound)
     }
 
     fn revision(&self) -> RevisionId {
         let inner = self.inner.read().unwrap_or_else(|e| e.into_inner());
-        match &inner.plan {
-            Some(p) => p.revision,
+        match inner.active_slot() {
+            Some(slot) => slot.plan.revision,
             None => RevisionId::new(0),
         }
     }
 
     fn apply(&self, action: PlanAction, actor: &str) -> PlanResult<PlanEvent> {
-        let mut inner = self
-            .inner
-            .write()
-            .map_err(|_| PlanError::Io(std::io::Error::other("RwLock vergiftet")))?;
+        let mut inner = self.write()?;
 
         let now = OffsetDateTime::now_utc();
 
-        // Für Create brauchen wir keinen bestehenden Plan — aber es darf auch
-        // noch keiner existieren: `Create` legt an, es überschreibt nicht.
+        // `Create` legt einen **weiteren** Plan an und macht ihn aktiv
+        // (Runde 5, Teil P). Eine bereits vergebene ID wird abgelehnt —
+        // `Create` überschreibt nie.
         if let PlanAction::Create {
             ref plan_id,
             ref goal,
@@ -139,20 +192,17 @@ impl PlanStore for InMemoryPlanStore {
             self.config
                 .validate_action(&action, 0)
                 .map_err(PlanError::Config)?;
-            if let Some(existing) = inner.plan.as_ref() {
-                return Err(PlanError::PlanExists {
-                    id: existing.id.clone(),
-                });
-            }
             // Grammatik an der Store-Grenze, auch für per `PlanId::new`
             // erzeugte IDs (F-013/G-032).
             let plan_id = PlanId::parse(plan_id.as_str())?;
+            if inner.position(&plan_id).is_some() {
+                return Err(PlanError::PlanExists { id: plan_id });
+            }
 
             info!(plan_id = %plan_id, "Neuen Plan erstellen");
-            let revision = inner.next_revision;
-            inner.next_revision = revision.next();
+            let revision = RevisionId::new(1);
             let plan = Plan {
-                id: plan_id,
+                id: plan_id.clone(),
                 revision,
                 parent_revision: None,
                 goal_statement: goal.clone(),
@@ -161,35 +211,41 @@ impl PlanStore for InMemoryPlanStore {
                 created_at: now,
                 updated_at: now,
             };
-            inner.plan = Some(plan);
             let event = PlanEvent {
                 revision,
                 action,
                 actor: actor.to_owned(),
                 applied_at: now,
             };
-            inner.history.push(event.clone());
+            inner.plans.push(Slot {
+                plan,
+                history: vec![event.clone()],
+                next_revision: revision.next(),
+                meta: PlanMeta::default(),
+            });
+            inner.active = Some(plan_id);
             return Ok(event);
         }
 
-        let revision = inner.next_revision;
-        let Some(plan) = inner.plan.as_ref() else {
+        let config = &self.config;
+        let Some(slot) = inner.active_slot_mut() else {
             return Err(PlanError::PlanNotFound);
         };
+        let revision = slot.next_revision;
 
         // Validierung + Mutation auf einem Kandidaten — dieselbe Mechanik wie
         // `apply_batch` und `FilePlanStore`.
         let (candidate, mut events) =
-            stage_actions(plan, vec![action], actor, &self.config, revision, now)
+            stage_actions(&slot.plan, vec![action], actor, config, revision, now)
                 .map_err(|(_, error)| error)?;
         let Some(event) = events.pop() else {
             return Err(PlanError::PlanNotFound);
         };
 
-        inner.plan = Some(candidate);
-        inner.next_revision = revision.next();
+        slot.plan = candidate;
+        slot.next_revision = revision.next();
         debug!(revision = %revision, actor = actor, "Aktion angewendet");
-        inner.history.push(event.clone());
+        slot.history.push(event.clone());
         Ok(event)
     }
 
@@ -200,13 +256,14 @@ impl PlanStore for InMemoryPlanStore {
         actor: &str,
         expected_rev: RevisionId,
     ) -> PlanResult<PlanRevision> {
-        let mut inner = self
-            .inner
-            .write()
-            .map_err(|_| PlanError::Io(std::io::Error::other("RwLock vergiftet")))?;
+        let mut inner = self.write()?;
         self.config.require_enabled().map_err(PlanError::Config)?;
 
-        let current = check_batch_target(inner.plan.as_ref(), plan, expected_rev)?;
+        let config = &self.config;
+        let Some(slot) = inner.active_slot_mut() else {
+            return Err(PlanError::PlanNotFound);
+        };
+        let current = check_batch_target(Some(&slot.plan), plan, expected_rev)?;
         if actions.is_empty() {
             return Ok(PlanRevision {
                 revision: current.revision,
@@ -215,9 +272,9 @@ impl PlanStore for InMemoryPlanStore {
         }
 
         let now = OffsetDateTime::now_utc();
-        let first_revision = inner.next_revision;
+        let first_revision = slot.next_revision;
         let (candidate, events) =
-            stage_actions(current, actions, actor, &self.config, first_revision, now).map_err(
+            stage_actions(current, actions, actor, config, first_revision, now).map_err(
                 |(index, source)| PlanError::BatchActionRejected {
                     index,
                     source: Box::new(source),
@@ -225,9 +282,9 @@ impl PlanStore for InMemoryPlanStore {
             )?;
 
         let revision = candidate.revision;
-        inner.plan = Some(candidate);
-        inner.next_revision = revision.next();
-        inner.history.extend(events.iter().cloned());
+        slot.plan = candidate;
+        slot.next_revision = revision.next();
+        slot.history.extend(events.iter().cloned());
         info!(
             plan_id = %plan,
             revision = %revision,
@@ -239,13 +296,13 @@ impl PlanStore for InMemoryPlanStore {
     }
 
     fn history(&self, since: Option<RevisionId>) -> PlanResult<Vec<PlanEvent>> {
-        let inner = self
-            .inner
-            .read()
-            .map_err(|_| PlanError::Io(std::io::Error::other("RwLock vergiftet")))?;
+        let inner = self.read()?;
+        let Some(slot) = inner.active_slot() else {
+            return Ok(Vec::new());
+        };
         let events = match since {
-            None => inner.history.clone(),
-            Some(rev) => inner
+            None => slot.history.clone(),
+            Some(rev) => slot
                 .history
                 .iter()
                 .filter(|e| e.revision >= rev)
@@ -253,6 +310,65 @@ impl PlanStore for InMemoryPlanStore {
                 .collect(),
         };
         Ok(events)
+    }
+
+    fn list_plans(&self) -> PlanResult<Vec<PlanSummary>> {
+        let inner = self.read()?;
+        Ok(inner
+            .plans
+            .iter()
+            .map(|slot| {
+                let active = inner.active.as_ref() == Some(&slot.plan.id);
+                PlanSummary::from_plan(&slot.plan, active, slot.meta)
+            })
+            .collect())
+    }
+
+    fn plan_by_id(&self, id: &PlanId) -> PlanResult<Plan> {
+        let inner = self.read()?;
+        inner
+            .plans
+            .iter()
+            .find(|slot| &slot.plan.id == id)
+            .map(|slot| slot.plan.clone())
+            .ok_or_else(|| PlanError::PlanUnknown { id: id.clone() })
+    }
+
+    fn plan_meta(&self, id: &PlanId) -> PlanResult<PlanMeta> {
+        let inner = self.read()?;
+        inner
+            .plans
+            .iter()
+            .find(|slot| &slot.plan.id == id)
+            .map(|slot| slot.meta)
+            .ok_or_else(|| PlanError::PlanUnknown { id: id.clone() })
+    }
+
+    fn switch_plan(&self, id: &PlanId, actor: &str) -> PlanResult<Plan> {
+        let mut inner = self.write()?;
+        let slot = inner.slot_mut(id)?;
+        slot.meta.archived = false;
+        let plan = slot.plan.clone();
+        inner.active = Some(id.clone());
+        info!(plan_id = %id, actor = actor, "Aktiven Plan gewechselt");
+        Ok(plan)
+    }
+
+    fn archive_plan(&self, id: &PlanId, actor: &str) -> PlanResult<()> {
+        let mut inner = self.write()?;
+        inner.slot_mut(id)?.meta.archived = true;
+        if inner.active.as_ref() == Some(id) {
+            inner.active = None;
+        }
+        info!(plan_id = %id, actor = actor, "Plan archiviert");
+        Ok(())
+    }
+
+    fn set_approval(&self, id: &PlanId, approval: PlanApproval, actor: &str) -> PlanResult<()> {
+        let mut inner = self.write()?;
+        inner.slot_mut(id)?.meta.approval = approval;
+        info!(plan_id = %id, actor = actor, approval = approval.label(), "Freigabestand gesetzt");
+        Ok(())
     }
 }
 
@@ -406,9 +522,10 @@ mod tests {
         let store = InMemoryPlanStore::new();
         create_plan(&store)?;
 
+        // Runde 5, Teil P: nur eine bereits vergebene ID wird abgelehnt.
         let result = store.apply(
             PlanAction::Create {
-                plan_id: PlanId::new("p-zweit"),
+                plan_id: PlanId::new("p-test"),
                 goal: "darf nicht überschreiben".to_owned(),
             },
             "orchestrator",
@@ -416,7 +533,14 @@ mod tests {
 
         assert!(
             matches!(&result, Err(PlanError::PlanExists { id }) if id == &PlanId::new("p-test")),
-            "ein zweites Create muss fail-closed abgelehnt werden, Ergebnis: {result:?}"
+            "ein zweites Create mit derselben ID muss abgelehnt werden, Ergebnis: {result:?}"
+        );
+        assert!(
+            result
+                .as_ref()
+                .err()
+                .is_some_and(|error| error.to_string().contains("plan switch p-test")),
+            "die Meldung verweist auf `switch`"
         );
         // Der bestehende Plan bleibt unangetastet, es entsteht kein Event.
         let plan = store.current()?;
@@ -725,6 +849,131 @@ mod tests {
         )?;
 
         assert_eq!(store.current()?.goal_id.as_deref(), Some("g-1"));
+        Ok(())
+    }
+
+    // ── Runde 5, Teil P: Plan-Katalog ───────────────────────────────────────
+
+    fn create(store: &InMemoryPlanStore, id: &str, goal: &str) -> TestResult {
+        store.apply(
+            PlanAction::Create {
+                plan_id: PlanId::new(id),
+                goal: goal.to_owned(),
+            },
+            "orchestrator",
+        )?;
+        Ok(())
+    }
+
+    #[test]
+    fn test_two_plans_in_a_row_each_start_at_revision_one() -> TestResult {
+        let store = InMemoryPlanStore::new();
+        create(&store, "p-eins", "erstes Ziel")?;
+        store.apply(
+            PlanAction::AddNode {
+                node: make_node("t-1"),
+            },
+            "orchestrator",
+        )?;
+        create(&store, "p-zwei", "zweites Ziel")?;
+
+        let active = store.current()?;
+        assert_eq!(active.id, PlanId::new("p-zwei"));
+        assert_eq!(active.revision, RevisionId::new(1));
+        assert_eq!(store.revision(), RevisionId::new(1));
+        assert_eq!(store.history(None)?.len(), 1, "History je Plan");
+
+        // Der erste Plan bleibt unverändert erhalten.
+        let first = store.plan_by_id(&PlanId::new("p-eins"))?;
+        assert_eq!(first.nodes.len(), 1);
+        assert_eq!(first.revision, RevisionId::new(2));
+
+        // Mutationen treffen den aktiven Plan.
+        store.apply(
+            PlanAction::AddNode {
+                node: make_node("t-2"),
+            },
+            "orchestrator",
+        )?;
+        assert_eq!(store.current()?.nodes.len(), 1);
+        assert_eq!(store.plan_by_id(&PlanId::new("p-eins"))?.nodes.len(), 1);
+        Ok(())
+    }
+
+    #[test]
+    fn test_auto_created_analyze_plan_does_not_block_create() -> TestResult {
+        // Genau das Transkript: `/analyze` legt `plan-analyze` an, danach
+        // ruft die UIA `plan create crypt-guard-hardening-v1` auf.
+        let store = InMemoryPlanStore::new();
+        create(&store, "plan-analyze", "Analyse des Arbeitsbereichs")?;
+        create(&store, "crypt-guard-hardening-v1", "Härtung")?;
+        assert_eq!(store.current()?.id, PlanId::new("crypt-guard-hardening-v1"));
+        let ids: Vec<String> = store
+            .list_plans()?
+            .into_iter()
+            .map(|summary| summary.id.into_inner())
+            .collect();
+        assert_eq!(ids, vec!["plan-analyze", "crypt-guard-hardening-v1"]);
+        Ok(())
+    }
+
+    #[test]
+    fn test_switch_archive_and_list() -> TestResult {
+        let store = InMemoryPlanStore::new();
+        create(&store, "p-a", "A")?;
+        create(&store, "p-b", "B")?;
+
+        let switched = store.switch_plan(&PlanId::new("p-a"), "human:test")?;
+        assert_eq!(switched.id, PlanId::new("p-a"));
+        assert_eq!(store.current()?.id, PlanId::new("p-a"));
+
+        store.archive_plan(&PlanId::new("p-b"), "human:test")?;
+        let listed = store.list_plans()?;
+        assert_eq!(listed.len(), 2, "archivierte Pläne bleiben gelistet");
+        let b = listed
+            .iter()
+            .find(|summary| summary.id == PlanId::new("p-b"))
+            .ok_or(PlanError::PlanNotFound)?;
+        assert!(b.meta.archived);
+        assert!(!b.active);
+        assert!(
+            store.plan_by_id(&PlanId::new("p-b")).is_ok(),
+            "nicht gelöscht"
+        );
+
+        // Archivieren des aktiven Plans lässt keinen aktiven zurück.
+        store.archive_plan(&PlanId::new("p-a"), "human:test")?;
+        assert!(matches!(store.current(), Err(PlanError::PlanNotFound)));
+        assert_eq!(store.revision(), RevisionId::new(0));
+
+        // `switch` holt einen Plan aus dem Archiv zurück.
+        store.switch_plan(&PlanId::new("p-b"), "human:test")?;
+        assert!(!store.plan_meta(&PlanId::new("p-b"))?.archived);
+        assert_eq!(store.current()?.id, PlanId::new("p-b"));
+
+        assert!(matches!(
+            store.switch_plan(&PlanId::new("p-nix"), "human:test"),
+            Err(PlanError::PlanUnknown { .. })
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn test_approval_is_catalog_data_and_defaults_to_confirmed() -> TestResult {
+        let store = InMemoryPlanStore::new();
+        create(&store, "p-a", "A")?;
+        let id = PlanId::new("p-a");
+        assert_eq!(
+            store.plan_meta(&id)?.approval,
+            crate::PlanApproval::Confirmed
+        );
+        store.set_approval(&id, crate::PlanApproval::Proposed, "model:test")?;
+        assert_eq!(
+            store.plan_meta(&id)?.approval,
+            crate::PlanApproval::Proposed
+        );
+        // Keine neue Revision: Katalogdaten sind keine Plan-Mutation.
+        assert_eq!(store.revision(), RevisionId::new(1));
         Ok(())
     }
 }

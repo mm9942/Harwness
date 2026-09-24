@@ -100,6 +100,9 @@ pub(crate) enum LocalIntercept {
     /// UIA-Worker-Picker öffnen; den festen Provider löst `app.rs` auf
     /// (UIA-Pin, sonst aktiver/Standard-Provider).
     OpenUiaWorkerPicker,
+    /// Runde 5, Teil G: UIA-Modellwahl öffnen, danach direkt den Bereich
+    /// „UIA-Worker-Modelle“ (`/models pick uia`).
+    OpenUiaPickerThenWorkers,
     /// Effort-Auswahl für das Ziel öffnen.
     OpenEffortChoice(EffortTarget),
     /// Agentenbaum öffnen.
@@ -120,7 +123,25 @@ pub(crate) enum LocalIntercept {
     Chat(String),
     /// Systemzeile anzeigen; sonst nichts.
     System(String),
+    /// Runde 5, Teil F: lokaler `/plan`-Befehl (`/plan`, `/plan
+    /// show|edit|list|open`); `app/plan_mode.rs` führt ihn aus.
+    Plan(crate::plan_dialog::PlanCommand),
+    /// Runde 5, Teil I: `/agent stream <orchestrators|all|none>` — schaltet
+    /// den Live-Stream der Kind-Agenten für die Sitzung um. Trägt die rohen
+    /// Argumente hinter `stream`; geparst wird in [`crate::child_stream`].
+    ChildStream(String),
+    /// Runde 5, Teil K: `/agent bg` (Hintergrund-Agenten auflisten) und
+    /// `/agent cancel <id>` (eigenen Hintergrund-Agenten abbrechen); trägt
+    /// die rohen Argumente, ausgeführt in `app/background_agents.rs`.
+    BackgroundAgents(String),
+    /// Runde 5, Teil L: `/btw <frage>` — flüchtige Nebenfrage ohne
+    /// Werkzeuge; trägt die (nicht leere) Frage. `crate::app::btw` führt sie
+    /// aus.
+    Btw(String),
 }
+
+/// Runde 5, Teil I: Hinweis auf den entfallenen Befehl `/agents`.
+pub(crate) const AGENTS_REMOVED_HINT: &str = "/agents gibt es nicht mehr – nutze /agent";
 
 /// Erkennt die bare Form eines Befehls **oder** dessen argloses `switch`
 /// (Welle 4a/7b: `/model`, `/model switch`, `/uia-effort switch`, …).
@@ -190,7 +211,22 @@ pub(crate) fn intercept(raw: &str, ctx: &LocalCommandContext<'_>) -> Option<Loca
     match name {
         "resume" if bare => Some(LocalIntercept::OpenSessionPicker),
         "agent" if bare => Some(LocalIntercept::OpenAgentTree),
-        "agents" => Some(LocalIntercept::OpenAgentTree),
+        // Runde 5, Teil K: Hintergrund-Agenten — Liste und Abbruch, vor der
+        // Operation `/agent` (deren `stop` bleibt unverändert erreichbar).
+        "agent" if args == "bg" || args == "cancel" || args.starts_with("cancel ") => {
+            Some(LocalIntercept::BackgroundAgents(args.to_owned()))
+        }
+        // Runde 5, Teil I: `/agent stream …` vor der Operation `/agent`.
+        "agent" if args == "stream" || args.starts_with("stream ") => {
+            Some(LocalIntercept::ChildStream(
+                args.strip_prefix("stream")
+                    .unwrap_or_default()
+                    .trim()
+                    .to_owned(),
+            ))
+        }
+        // Runde 5, Teil I: `/agents` entfällt; keine stille Weiterleitung.
+        "agents" => Some(LocalIntercept::System(AGENTS_REMOVED_HINT.to_owned())),
         "models" => models_intercept(args, ctx),
         "mode" if bare => Some(LocalIntercept::OpenOverlay(Box::new(ModePicker::new(
             ctx.active_mode,
@@ -213,8 +249,20 @@ pub(crate) fn intercept(raw: &str, ctx: &LocalCommandContext<'_>) -> Option<Loca
             "Bitte einen Namen angeben: /rename <titel>".to_owned(),
         )),
         "rename" => Some(LocalIntercept::RenameSession(args.to_owned())),
+        // Runde 5, Teil L: `/btw` ohne Frage → Nutzungshinweis.
+        "btw" if bare => Some(LocalIntercept::System(
+            crate::app::btw::BTW_USAGE_HINT.to_owned(),
+        )),
+        "btw" => Some(LocalIntercept::Btw(args.to_owned())),
         "sessions" if bare => Some(LocalIntercept::Rewrite("/resume".to_owned())),
         "sessions" => Some(LocalIntercept::Rewrite(format!("/resume {args}"))),
+        // Runde 5, Teil F: `/plan` schaltet den Plan-Modus ein,
+        // `/plan show|edit|list|open` bedienen die Plan-Dateien. Alle übrigen
+        // Unterbefehle (`/plan inspect`, `/plan add …`) gehören weiter der
+        // `plan`-Operation.
+        "plan" if crate::plan_dialog::parse_plan_command(args).is_some() => {
+            crate::plan_dialog::parse_plan_command(args).map(LocalIntercept::Plan)
+        }
         "plan" | "goal" if ctx.registry.find(name).is_none() => {
             Some(LocalIntercept::System(format!(
                 "/{name} ist nicht verfügbar: Die Plan-Werkzeuge sind deaktiviert \
@@ -278,9 +326,17 @@ fn models_intercept(args: &str, ctx: &LocalCommandContext<'_>) -> Option<LocalIn
                     role_keys()
                 )));
             };
+            // Runde 5, Teil G: jede UIA-Worker-Rolle (auch `uia-worker`)
+            // bekommt eine eigene, vom UIA-Provider unabhängige Wahl.
+            if let Some(worker) = uia_worker_role(role) {
+                return Some(LocalIntercept::OpenModelPicker(
+                    PickerTarget::UiaWorkerRole {
+                        role: worker.to_owned(),
+                    },
+                ));
+            }
             match ModelRole::parse(role) {
-                Some(ModelRole::Uia) => Some(LocalIntercept::OpenModelPicker(PickerTarget::Uia)),
-                Some(ModelRole::UiaWorker) => Some(LocalIntercept::OpenUiaWorkerPicker),
+                Some(ModelRole::Uia) => Some(LocalIntercept::OpenUiaPickerThenWorkers),
                 Some(role) => Some(LocalIntercept::OpenModelPicker(PickerTarget::Role { role })),
                 None => Some(LocalIntercept::System(format!(
                     "Unbekannte Rolle „{role}“ — bekannte Rollen: {}",
@@ -288,8 +344,22 @@ fn models_intercept(args: &str, ctx: &LocalCommandContext<'_>) -> Option<LocalIn
                 ))),
             }
         }
+        // Runde 5, Teil G: `/models worker` ohne Argumente → Worker-Bereich.
+        Some("worker" | "workers") if words.clone().next().is_none() => Some(
+            LocalIntercept::OpenOverlay(Box::new(ModelRolesView::uia_workers(ctx.config))),
+        ),
         _ => None,
     }
+}
+
+/// Runde 5, Teil G: kanonischer Name einer UIA-Worker-Rolle
+/// ([`harw_config::UIA_WORKER_ROLES`]), Groß-/Kleinschreibung und `_`/`-`
+/// egal.
+fn uia_worker_role(raw: &str) -> Option<&'static str> {
+    let normalized = raw.trim().to_ascii_lowercase().replace('_', "-");
+    harw_config::UIA_WORKER_ROLES
+        .into_iter()
+        .find(|role| *role == normalized)
 }
 
 /// Kommagetrennte Liste aller Rollen-Schlüssel.
@@ -512,10 +582,33 @@ mod tests {
             Some(LocalIntercept::OpenAgentTree)
         ));
         assert!(fx.run("/agent list").is_none());
+        // Runde 5, Teil K: Hintergrund-Agenten auflisten bzw. abbrechen.
         assert!(matches!(
-            fx.run("/agents"),
-            Some(LocalIntercept::OpenAgentTree)
+            fx.run("/agent bg"),
+            Some(LocalIntercept::BackgroundAgents(ref args)) if args == "bg"
         ));
+        assert!(matches!(
+            fx.run("/agent cancel abc"),
+            Some(LocalIntercept::BackgroundAgents(ref args)) if args == "cancel abc"
+        ));
+        assert!(fx.run("/agent stop abc").is_none());
+        // Runde 5, Teil I: `/agents` gibt es nicht mehr — nur ein Hinweis.
+        for raw in ["/agents", "/agents stream all"] {
+            assert!(matches!(
+                fx.run(raw),
+                Some(LocalIntercept::System(ref text)) if text == AGENTS_REMOVED_HINT
+            ));
+        }
+        // `/agent stream <modus>` schaltet den Live-Stream.
+        assert!(matches!(
+            fx.run("/agent stream all"),
+            Some(LocalIntercept::ChildStream(ref mode)) if mode == "all"
+        ));
+        assert!(matches!(
+            fx.run("/agent stream"),
+            Some(LocalIntercept::ChildStream(ref mode)) if mode.is_empty()
+        ));
+        assert!(fx.run("/agent streamx").is_none());
     }
 
     #[test]
@@ -527,20 +620,32 @@ mod tests {
         assert!(overlay_debug(fx.run("/models"))?.contains("ModelRolesView"));
         assert!(fx.run("/models set explorer p/m").is_none());
         assert!(fx.run("/models show extra").is_none());
+        // Runde 5, Teil G: `/models worker` ohne Argumente öffnet den
+        // Worker-Bereich; mit Argumenten geht es an die Operation.
+        assert!(overlay_debug(fx.run("/models worker"))?.contains("UiaWorkers"));
+        assert!(fx.run("/models worker uia-writer uia").is_none());
         Ok(())
     }
 
     #[test]
     fn models_pick_maps_roles_to_picker_targets() -> TestResult {
         let fx = empty();
+        // Runde 5, Teil G: die UIA-Wahl öffnet danach den Worker-Bereich,
+        // jede UIA-Worker-Rolle hat einen eigenen, freien Picker.
         assert!(matches!(
             fx.run("/models pick uia"),
-            Some(LocalIntercept::OpenModelPicker(PickerTarget::Uia))
+            Some(LocalIntercept::OpenUiaPickerThenWorkers)
         ));
-        assert!(matches!(
-            fx.run("/models pick uia-worker"),
-            Some(LocalIntercept::OpenUiaWorkerPicker)
-        ));
+        for role in harw_config::UIA_WORKER_ROLES {
+            match fx.run(&format!("/models pick {role}")) {
+                Some(LocalIntercept::OpenModelPicker(PickerTarget::UiaWorkerRole {
+                    role: picked,
+                })) => assert_eq!(picked, role),
+                other => {
+                    return Err(TestError::Unexpected(format!("{role}: {other:?}")));
+                }
+            }
+        }
         assert!(matches!(
             fx.run("/models pick orchestrator"),
             Some(LocalIntercept::OpenModelPicker(PickerTarget::Role {
@@ -662,11 +767,39 @@ mod tests {
     #[test]
     fn plan_and_goal_hint_only_when_unregistered() -> TestResult {
         let fx = empty();
-        assert!(system(fx.run("/plan"))?.contains("[tools.plan]"));
+        // Runde 5, Teil F: bare `/plan` schaltet den Plan-Modus ein; der
+        // Hinweis gilt für die Unterbefehle der `plan`-Operation.
+        assert!(system(fx.run("/plan inspect"))?.contains("[tools.plan]"));
         assert!(system(fx.run("/goal check"))?.contains("[tools.plan]"));
         let registered = Fixture::new(CommandRegistry::new(vec![spec("plan")?, spec("goal")?]));
-        assert!(registered.run("/plan").is_none());
+        assert!(registered.run("/plan inspect").is_none());
         assert!(registered.run("/goal check").is_none());
+        Ok(())
+    }
+
+    /// Runde 5, Teil F: `/plan`, `/plan show|edit|list|open` sind lokal —
+    /// mit und ohne registrierte `plan`-Operation.
+    #[test]
+    fn plan_mode_subcommands_are_local() -> TestResult {
+        use crate::plan_dialog::PlanCommand;
+
+        let registered = Fixture::new(CommandRegistry::new(vec![spec("plan")?]));
+        for fx in [empty(), registered] {
+            for (line, expected) in [
+                ("/plan", PlanCommand::Enter),
+                ("/plan show", PlanCommand::Show),
+                ("/plan edit", PlanCommand::Edit),
+                ("/plan list", PlanCommand::List),
+                ("/plan open auth", PlanCommand::Open("auth".to_owned())),
+            ] {
+                match fx.run(line) {
+                    Some(LocalIntercept::Plan(command)) => assert_eq!(command, expected, "{line}"),
+                    other => {
+                        return Err(TestError::Unexpected(format!("{line}: {other:?}")));
+                    }
+                }
+            }
+        }
         Ok(())
     }
 }

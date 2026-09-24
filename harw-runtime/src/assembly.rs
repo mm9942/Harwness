@@ -1824,6 +1824,22 @@ impl RuntimeAssemblyBuilder {
             None,
             allow_rules.clone(),
         );
+        // Runde 5, Teil E: ausgebauter Auto-Modus (Vorfilter, Klassifizierer,
+        // Protokoll, Deckel) nur für Einstiege mit anwesender Person; die
+        // Modell-Anbindung folgt nach dem Bau des Wurzelmodells.
+        let chain = if profile.ask == AskResolution::Interactive {
+            chain.with_auto_mode(crate::auto_classifier::AutoModeHandle::new(
+                approval_mode.clone(),
+                crate::auto_classifier::PrefilterContext::new(
+                    bound_root.clone(),
+                    extra_roots.clone(),
+                    sandbox.network_scope().clone(),
+                    os_user_home(),
+                ),
+            ))
+        } else {
+            chain
+        };
 
         // 7. Registry: ein Projektkontext, eine Kette. Der Modellkontext folgt
         //    `profile.project_context` und einem gebundenen `workspace_root`.
@@ -1927,6 +1943,35 @@ impl RuntimeAssemblyBuilder {
                 host_permit_wiring.with_preselected_variant(HostPermitVariant::SessionLease)
             }
             _ => host_permit_wiring,
+        };
+        // Runde 5, Teil B: der sudo-Fragekanal (`host.sudo_exec`) entsteht
+        // ausschließlich für die interaktive TUI. Jeder andere Einstieg hat
+        // keinen Kanal — `RuntimeChildRegistryFactory::with_sudo_exec` baut
+        // dann kein Werkzeug (fail-closed). Der Sender reist mit der
+        // Host-Permit-Verdrahtung zu den Kind-Fabriken; den Empfänger holt
+        // die TUI einmalig über `RuntimeAssembly::take_sudo_prompts`.
+        let (sudo_prompt_sender, sudo_prompt_receiver) = if spec.entry == EntryKind::Tui {
+            let (sender, receiver) = harw_tool_shell::sudo_prompt_channel();
+            (Some(sender), Some(receiver))
+        } else {
+            (None, None)
+        };
+        let host_permit_wiring = host_permit_wiring.with_sudo_prompts(sudo_prompt_sender);
+        // Runde 5, Teil N: Host-Mode-Anfragen (`shell.exec` mit
+        // `request_host`) nur in der TUI; reist wie der sudo-Kanal mit der
+        // Verdrahtung zu Wurzel und Kind-Fabriken. Die Wurzel-Beschriftung
+        // für den Baum-Pfad wird unten beim Kennen der Wurzel-ID eingetragen.
+        let host_permit_wiring = host_permit_wiring
+            .with_host_escalation(crate::host_escalation_wiring::escalation_for_entry(
+                spec.entry,
+            ))
+            // Runde 5, Teil N: `[shell] max_timeout_secs` für jeden
+            // Shell-Provider (Wurzel und Kinder).
+            .with_shell_max_timeout_secs(config.harness.shell.effective_max_timeout_secs());
+        let host_root_label: Option<String> = if uia_ir.is_some() {
+            Some(crate::host_escalation_wiring::UIA_ROOT_LABEL.to_owned())
+        } else {
+            overrides.agent_name.clone()
         };
         // Teil B3/B4: `host_permit_wiring` wird unten von
         // `assemble_registry_for_sandbox_with_definition_access_and_sandbox_
@@ -2123,6 +2168,28 @@ impl RuntimeAssemblyBuilder {
             uia_ir.as_ref(),
             secret_resolver.as_deref().map(|r| r as &dyn SecretResolver),
         )?;
+        // Runde 5, Teil E: Klassifizierer-Modell (Rolle `auto-classifier`,
+        // Vorgabe: schnelles Modell des aktiven Providers) an den Auto-Modus.
+        // Nur bei konfiguriertem Provider: ein eingespieltes Modell (Echo,
+        // Tests) bekommt keinen Klassifizierer — dort gilt „ask" wie bisher,
+        // und kein Klassifizierer-Aufruf verbraucht eine Skript-Antwort.
+        if let Some(auto) = chain.auto_mode().filter(|_| source_is_configured) {
+            // Der Baum-Provider bedient wie bei den Kind-Rollen jede interne
+            // Modellstelle (Pin über Provider-Id + Modell).
+            if let Some(backend) = crate::auto_classifier::ModelClassifierBackend::from_config(
+                &config,
+                Arc::clone(&default_tree_model),
+                root_model_id.as_deref(),
+            ) {
+                auto.install_backend(Arc::new(backend));
+            }
+        }
+        // Runde 5, Teil G: eigene Modellwahl je UIA-Worker-Rolle, gebaut um
+        // den UIA-Client (`model`); die TUI hält sie über
+        // `RuntimeAssembly::uia_worker_routing` aktuell.
+        let uia_worker_routing = Arc::new(
+            crate::uia_worker_routing::UiaWorkerRouting::from_config(&config, Arc::clone(&model)),
+        );
         // Merge: derselbe Provider-Name in beiden Registries → der
         // Wurzel-Baum-Eintrag gewinnt (er bedient die meisten Kind-Rollen und
         // ist damit der repräsentative Handle für `/status`/`/provider`; ein
@@ -2132,6 +2199,12 @@ impl RuntimeAssemblyBuilder {
         let mut provider_load_registry: ProviderLoadRegistry = uia_load_registry;
         provider_load_registry.extend(root_load_registry);
         let root_session_id = root_session_id.unwrap_or_else(SessionId::new);
+        // Runde 5, Teil N: Wurzel des Baum-Pfads für Host-Mode-Anfragen.
+        crate::host_escalation_wiring::register_root(
+            host_permit_wiring_for_children.as_ref(),
+            &root_session_id,
+            host_root_label.as_deref(),
+        );
         // Plan Teil D: der Wissensspeicher des Profils entsteht **vor** dem
         // Spawner, damit Wurzel (Schritt 11/12a) und Kind-Registries
         // dieselbe Instanz teilen. Er legt nichts an; ohne auflösbares
@@ -2157,6 +2230,8 @@ impl RuntimeAssemblyBuilder {
                 chain: &chain,
                 model: &default_tree_model,
                 uia_worker_model: &uia_worker_model,
+                // Runde 5, Teil G.
+                uia_worker_routing: Arc::clone(&uia_worker_routing),
                 root_session_id: &root_session_id,
                 root_model_id: root_model_id.clone(),
                 spawn_context: &spawn_context,
@@ -2313,6 +2388,11 @@ impl RuntimeAssemblyBuilder {
         }
         .with_home_context(Arc::clone(&home_context))
         .with_agent_events(Arc::new(agent_events.clone()));
+        // Runde 5, Teil E: `/permissions log` liest das Auto-Modus-Protokoll.
+        let services = match chain.auto_mode() {
+            Some(auto) => services.with_auto_decision_log(auto.log().clone()),
+            None => services,
+        };
         // 11a. Traum-Starter für `/dream run` (Plan D5) — nur für die
         //      interaktiven Einstiege (TUI, One-Shot). Der Gateway-Traum
         //      (`EntryKind::GatewayDream`) hat seinen eigenen Scheduler; alle
@@ -2337,6 +2417,22 @@ impl RuntimeAssemblyBuilder {
             }
             _ => services,
         };
+        // Runde 5, Teil P: der Plan-Fragekanal der TUI entsteht schon hier
+        // (vorher erst in 12e), damit die `plan`-Operation ihn als
+        // `PlanConfirmChannel` in ihrer Service-Map findet. Schritt 12e
+        // nutzt denselben Sender/Empfänger.
+        let (plan_ui_sender, plan_ui_receiver) = if spec.entry == EntryKind::Tui {
+            let (sender, receiver) = harw_tool_plan::plan_ui_channel();
+            (Some(sender), Some(receiver))
+        } else {
+            (None, None)
+        };
+        let services = match &plan_ui_sender {
+            Some(sender) => {
+                services.with_plan_confirm(harw_tool_plan::PlanConfirmChannel::new(sender.clone()))
+            }
+            None => services,
+        };
         let services = Arc::new(services);
 
         // 12. Modell-Tool-Fläche der Operationen — **nur** für
@@ -2347,6 +2443,79 @@ impl RuntimeAssemblyBuilder {
             &operations,
             &services,
         );
+        // Runde 5, Teil H: `agent.result` an der Wurzel — nur mit Spawner und
+        // Modell-Werkzeugfläche; ein expliziter Wurzel-Agent nur, wenn seine
+        // Definition es admittiert (siehe `agent_result_wiring`).
+        let agent_result_root = spawner.as_ref().filter(|_| {
+            profile.operations == OperationSurface::AllWithModelTools
+                && match agent_ir.as_ref() {
+                    Some(_) => activation.is_tool_enabled(&ToolName::new(
+                        harw_core_bridge::AGENT_RESULT_TOOL.to_owned(),
+                    )),
+                    None => true,
+                }
+        });
+        let registry_builder = match agent_result_root {
+            Some(spawner) => {
+                let spawner = Arc::clone(spawner);
+                registry_builder.tool_provider(Arc::new(
+                    crate::agent_result_wiring::agent_result_provider(move || {
+                        Some(Arc::clone(&spawner))
+                    }),
+                ))
+            }
+            None => registry_builder,
+        };
+        // Runde 5, Teil M: `agent.message` an der Wurzel — dieselbe Bedingung
+        // wie `agent.result` (Spawner, Modell-Werkzeugfläche, bei explizitem
+        // Wurzel-Agenten nur, wenn seine Definition es admittiert). Die
+        // Wurzel hat keinen Elternteil, also kein `parent.message`.
+        let agent_message_root = spawner.as_ref().filter(|_| {
+            profile.operations == OperationSurface::AllWithModelTools
+                && match agent_ir.as_ref() {
+                    Some(_) => activation.is_tool_enabled(&ToolName::new(
+                        harw_core_bridge::AGENT_MESSAGE_TOOL.to_owned(),
+                    )),
+                    None => true,
+                }
+        });
+        let registry_builder = match agent_message_root {
+            Some(spawner) => {
+                let spawner = Arc::clone(spawner);
+                registry_builder.tool_provider(Arc::new(
+                    crate::agent_messaging_wiring::agent_message_provider(move || {
+                        Some(Arc::clone(&spawner))
+                    }),
+                ))
+            }
+            None => registry_builder,
+        };
+        // Runde 5, Teil K: `agent.status`/`agent.cancel` nur an der
+        // TUI-Wurzel (Hintergrund-Agenten gibt es nur dort) — mit Spawner und
+        // Modell-Werkzeugfläche; ein expliziter Wurzel-Agent nur, wenn seine
+        // Definition die Werkzeuge admittiert.
+        let registry_builder = match spawner.as_ref().filter(|_| {
+            spec.entry == EntryKind::Tui
+                && profile.operations == OperationSurface::AllWithModelTools
+        }) {
+            Some(spawner) => {
+                let spawner = Arc::clone(spawner);
+                let admitted: Vec<&'static str> = harw_core_bridge::AGENT_BACKGROUND_TOOLS
+                    .iter()
+                    .copied()
+                    .filter(|tool| match agent_ir.as_ref() {
+                        Some(_) => activation.is_tool_enabled(&ToolName::new((*tool).to_owned())),
+                        None => true,
+                    })
+                    .collect();
+                crate::agent_background_wiring::install_agent_background_tools(
+                    registry_builder,
+                    &admitted,
+                    move || Some(Arc::clone(&spawner)),
+                )
+            }
+            None => registry_builder,
+        };
         // 12a. Workbench-Werkzeuge der Wurzelsitzung: nur, wenn die Dienste
         //      einen `KnowledgeStore` tragen (`RuntimeServices::with_home_context`
         //      baut ihn aus dem aufgelösten Home-Kontext) **und** die Sitzung
@@ -2373,7 +2542,19 @@ impl RuntimeAssemblyBuilder {
         let registry_builder = match services.knowledge_store() {
             Some(store) if workbench_allowed => registry_builder
                 .tool_provider(Arc::new(
-                    harw_registry_defaults::WorkbenchToolProvider::new(Arc::clone(store)),
+                    harw_registry_defaults::WorkbenchToolProvider::new(Arc::clone(store))
+                        // Runde 5, Teil C: Live-Update der `/workbench`-Ansicht
+                        // nach `workbench.note`/`workbench.hypothesis`.
+                        .with_change_notifier({
+                            let hub = agent_events.clone();
+                            Arc::new(move |session: &str, scope: &str| {
+                                hub.publish_knowledge(
+                                    SessionId::from_str(session),
+                                    "workbench",
+                                    Some(scope.to_owned()),
+                                );
+                            })
+                        }),
                 ))
                 .tool_provider(Arc::new(
                     harw_registry_defaults::WorkbenchReadToolProvider::new(Arc::clone(store))
@@ -2538,6 +2719,52 @@ impl RuntimeAssemblyBuilder {
             registry_builder
         };
 
+        // 12e. Runde 5, Teil F: Plan-Modus der Wurzel. `plan.write`,
+        //      `plan.exit`, `plan.enter`, `ask_user` hängen NUR an dieser
+        //      Wurzel-Registry (Kind-Fabriken bekommen sie nie) und prüfen
+        //      zusätzlich die hier gebundene Wurzel-Sitzung. Den Fragekanal
+        //      gibt es nur für `EntryKind::Tui`; jeder andere Einstieg
+        //      antwortet fail-closed. Die `PlanModeGate` sperrt im Plan-Modus
+        //      sofort (auch mitten im Turn) alles außerhalb der
+        //      Plan-Positivliste; der angeheftete Plan ist ein Kontextbeitrag
+        //      je Anfrage und übersteht so jede Verdichtung.
+        let plan_session = harw_tool_plan::PlanSession::new(
+            harw_tool_plan::PlanDir::new(home_project.plans_dir()),
+            spec.mode_override == Some(InteractionMode::Plan),
+        );
+        plan_session.bind_root(root_session_id.as_str());
+        // Runde 5, Teil P: `plan_ui_sender`/`plan_ui_receiver` stammen aus
+        // Schritt 11 (vor `Arc::new(services)`).
+        // Nur Einstiege mit der vollen Modell-Werkzeugfläche (TUI, One-Shot,
+        // Doctor); Jobs, Gateways und reine Befehlsflächen bleiben unverändert.
+        let registry_builder = if matches!(
+            registry_profile,
+            RegistryProfile::NoTools | RegistryProfile::WorkspaceEdit
+        ) || profile.operations != OperationSurface::AllWithModelTools
+        {
+            registry_builder
+        } else {
+            registry_builder
+                .tool_provider(Arc::new(harw_tool_plan::PlanToolProvider::new(
+                    plan_session.clone(),
+                    plan_ui_sender,
+                )))
+                .approval_handler(Arc::new(harw_tool_plan::PlanModeGate::new(
+                    plan_session.lock().clone(),
+                    InteractionMode::Plan
+                        .allowed_tools()
+                        .unwrap_or_default()
+                        .iter()
+                        .copied(),
+                )))
+                .context_provider(Arc::new(harw_tool_plan::PinnedPlanContextProvider::new(
+                    plan_session.pinned().clone(),
+                )))
+                .map_err(|error| RuntimeError::Registry {
+                    detail: format!("could not register the pinned plan context provider: {error}"),
+                })?
+        };
+
         // Addendum B, „Präzisierung Konsolidierungszeitpunkt": holt beim
         // Aufbau der Wurzelsitzung liegengebliebene `_incoming`-Kandidaten
         // eines abgestürzten vorherigen Laufs nach. Nur für Einstiege, deren
@@ -2598,6 +2825,12 @@ impl RuntimeAssemblyBuilder {
             host_permit_registry,
             host_permit_prompt_sender,
             host_permit_prompts: Mutex::new(Some(host_permit_prompt_receiver)),
+            sudo_prompts: Mutex::new(sudo_prompt_receiver),
+            // Runde 5, Teil F.
+            plan_session,
+            plan_ui_requests: Mutex::new(plan_ui_receiver),
+            // Runde 5, Teil G.
+            uia_worker_routing,
         })
     }
 }
@@ -3879,6 +4112,9 @@ struct SpawnerInputs<'a> {
     /// UIA das über [`crate::model::build_uia_worker_model`] abgeleitete
     /// Modell (siehe [`split_root_and_uia_worker_models`]).
     uia_worker_model: &'a Arc<dyn ModelProvider>,
+    /// Runde 5, Teil G: eigene Modellwahl je UIA-Worker-Rolle; die
+    /// UIA-Worker-Fabrik baut das Modell jedes Kindes beim Start daraus.
+    uia_worker_routing: Arc<crate::uia_worker_routing::UiaWorkerRouting>,
     /// Die Kennung der Wurzelsitzung, unter der der Spawner sie registriert.
     root_session_id: &'a SessionId,
     /// Das Modell, das die Wurzelsitzung treibt ([`effective_root_model_id`]);
@@ -3966,6 +4202,7 @@ fn build_spawner(
         chain,
         model,
         uia_worker_model,
+        uia_worker_routing,
         root_session_id,
         root_model_id,
         spawn_context,
@@ -3991,6 +4228,18 @@ fn build_spawner(
     })?;
 
     let spawner_slot = Arc::new(std::sync::OnceLock::new());
+    // Runde 5, Teil C: ein gemeinsamer Diary-Recorder für die Kinder beider
+    // Fabriken (Agent-Id = Rollenname, Einträge bei Verdichtung und
+    // Kind-Freigabe); nur mit Wissensspeicher.
+    let child_diary = knowledge.as_ref().map(|(store, _)| {
+        Arc::new(
+            crate::diary_wiring::DiaryRecorder::new(
+                Arc::clone(store),
+                harw_knowledge::AgentId::new("child".to_owned()),
+            )
+            .with_agent_events(agent_events.clone()),
+        )
+    });
     // Teil C: die Modelle, die ungepinnte Kinder tatsächlich rufen. Der
     // Wurzel-Baum spricht das effektive Vorgabemodell an (inklusive Rückfall
     // auf das erste nutzbare Katalogmodell); die Wurzel selbst ggf. das
@@ -4034,7 +4283,9 @@ fn build_spawner(
         // den Spawner-Slot auf).
         .with_delegate_wave_store(Arc::clone(&state_store))
         .with_skill_catalog(config, skill_roots.clone())?
-        .with_optional_knowledge(knowledge.clone()),
+        .with_optional_knowledge(knowledge.clone())
+        // Runde 5, Teil C: Diary der Kind-Agenten.
+        .with_child_diary(child_diary.clone()),
     );
     // Welle 3a, Teil A: eine zweite Fabrik-Instanz, ausschließlich für die
     // `uia-worker`-Rollenfamilie (`AgentRoleId::UiaWorker`). Gleiches Projekt,
@@ -4079,11 +4330,15 @@ fn build_spawner(
         // `uia-worker`-Familie).
         .with_host_permits(sandbox_profile.clone(), host_permit_wiring.clone())
         .with_main_model_selection(uia_worker_provider, uia_worker_model_id)
+        // Runde 5, Teil G: Modell je Rolle (eigene Wahl oder „wie UIA“).
+        .with_uia_worker_routing(uia_worker_routing)
         // Teil C: ohne gültigen `uia_worker_model`-Pin ruft die Familie das
         // Modell der UIA-Sitzung (ohne aktive UIA: das Vorgabemodell).
         .with_effective_main_model(root_model_id.clone())
         .with_skill_catalog(config, skill_roots.clone())?
-        .with_optional_knowledge(knowledge),
+        .with_optional_knowledge(knowledge)
+        // Runde 5, Teil C: Diary der Kind-Agenten.
+        .with_child_diary(child_diary),
     );
 
     let model_id = config.harness.default_model.as_deref().unwrap_or_default();
@@ -4115,6 +4370,9 @@ fn build_spawner(
         // Welle 3: dieselbe feste Verdichtungs-Obergrenze wie die Wurzel
         // (`[compaction] absolute_ceiling_tokens`, sonst Kern-Vorgabe).
         .with_compaction_ceiling(Some(configured_compaction_ceiling(config)))
+        // Runde 5, Teil K: `[agents]` — Orchestrierungsgrenzen (geklemmt,
+        // konsistent); die allgemeine Tiefe steckt in `child_limits`.
+        .with_orchestration_limits(crate::agent_background_wiring::orchestration_limits(config))
         // Orchestrierungs-Events gehen live auf den Bus und danach in den
         // persistierenden StateStore-Observer.
         .with_orchestration_observer(Arc::new(harw_core::HubOrchestrationObserver::new(
@@ -4306,6 +4564,20 @@ pub struct RuntimeAssembly {
     /// (Take-once, wie die Wurzel-Registry) — genau ein Renderer (z. B.
     /// `harw-tui`) darf ihn übernehmen; ein zweiter Aufruf bekommt `Err`.
     host_permit_prompts: Mutex<Option<HostPermitPromptReceiver>>,
+    /// Runde 5, Teil B: Empfängerseite des sudo-Fragekanals
+    /// (`host.sudo_exec`); nur bei `EntryKind::Tui` gesetzt, take-once über
+    /// [`Self::take_sudo_prompts`].
+    sudo_prompts: Mutex<Option<harw_tool_shell::SudoPromptReceiver>>,
+    /// Runde 5, Teil F: geteilter Plan-Zustand der Wurzel (Sperre, aktueller
+    /// Slug, angehefteter Plan) — siehe [`Self::plan_session`].
+    plan_session: harw_tool_plan::PlanSession,
+    /// Runde 5, Teil F: Empfängerseite des Plan-Fragekanals (`plan.exit`,
+    /// `plan.enter`, `ask_user`); nur `EntryKind::Tui`, einmal abholbar über
+    /// [`Self::take_plan_ui_requests`].
+    plan_ui_requests: Mutex<Option<harw_tool_plan::PlanUiReceiver>>,
+    /// Runde 5, Teil G: Modellwahl der UIA-Worker-Rollen (siehe
+    /// [`Self::uia_worker_routing`]).
+    uia_worker_routing: Arc<crate::uia_worker_routing::UiaWorkerRouting>,
 }
 
 impl std::fmt::Debug for RuntimeAssembly {
@@ -4476,6 +4748,64 @@ impl RuntimeAssembly {
         })
     }
 
+    /// Händigt die Empfängerseite des sudo-Fragekanals (`host.sudo_exec`,
+    /// Runde 5 Teil B) einmalig aus.
+    ///
+    /// # Beschreibung
+    /// Nur eine `EntryKind::Tui`-Montage hat einen Kanal; jeder andere
+    /// Einstieg liefert `None`, ebenso ein zweiter Aufruf oder eine
+    /// vergiftete Sperre. Ohne abgeholten Empfänger läuft jede sudo-Frage in
+    /// den Zeitablauf und gilt als Ablehnung (fail-closed).
+    ///
+    /// # Returns
+    /// `Some(receiver)` beim ersten Aufruf einer TUI-Montage, sonst `None`.
+    #[must_use]
+    pub fn take_sudo_prompts(&self) -> Option<harw_tool_shell::SudoPromptReceiver> {
+        self.sudo_prompts
+            .lock()
+            .ok()
+            .and_then(|mut slot| slot.take())
+    }
+
+    /// Runde 5, Teil F: der geteilte Plan-Zustand der Wurzel.
+    ///
+    /// # Beschreibung
+    /// Die TUI setzt darüber die sofort wirkende Plan-Sperre (Shift+Tab,
+    /// `/plan`, Freigabe über `plan.exit`), liest den aktuellen Plan
+    /// (`/plan show|edit|open`) und heftet den freigegebenen Plan an.
+    #[must_use]
+    pub fn plan_session(&self) -> &harw_tool_plan::PlanSession {
+        &self.plan_session
+    }
+
+    /// Runde 5, Teil F: händigt die Empfängerseite des Plan-Fragekanals
+    /// (`plan.exit`, `plan.enter`, `ask_user`) einmalig aus.
+    ///
+    /// # Returns
+    /// `Some(receiver)` beim ersten Aufruf einer TUI-Montage, sonst `None`
+    /// (jeder andere Einstieg, zweiter Aufruf, vergiftete Sperre). Ohne
+    /// abgeholten Empfänger endet jede Frage ohne Antwort — nie als
+    /// Zustimmung.
+    #[must_use]
+    pub fn take_plan_ui_requests(&self) -> Option<harw_tool_plan::PlanUiReceiver> {
+        self.plan_ui_requests
+            .lock()
+            .ok()
+            .and_then(|mut slot| slot.take())
+    }
+
+    /// Runde 5, Teil G: die Modellwahl der UIA-Worker-Rollen dieses Laufs.
+    ///
+    /// # Beschreibung
+    /// Die TUI meldet hierüber die Live-Auswahl der UIA
+    /// ([`crate::uia_worker_routing::UiaWorkerRouting::set_live_uia`]) und
+    /// neue Rollenwahlen; neu gestartete UIA-Worker nehmen sie, laufende
+    /// behalten ihr Modell.
+    #[must_use]
+    pub fn uia_worker_routing(&self) -> &Arc<crate::uia_worker_routing::UiaWorkerRouting> {
+        &self.uia_worker_routing
+    }
+
     /// Der Vertrauensbericht der Konfigurationsschichten.
     #[must_use]
     pub const fn trust_report(&self) -> &ConfigTrustReport {
@@ -4630,6 +4960,18 @@ impl RuntimeAssembly {
     #[must_use]
     pub const fn allow_rules(&self) -> &AllowRuleSet {
         &self.allow_rules
+    }
+
+    /// Runde 5, Teil E: der geteilte Auto-Modus-Zustand dieses Laufs
+    /// (Protokoll für `/permissions log` und die Werkzeugzellen, Sitzungsziel
+    /// für den Klassifizierer, Lern-Zähler für den Freigabedialog).
+    ///
+    /// # Rückgabe
+    /// `Some` genau für Einstiege mit anwesender Person
+    /// ([`AskResolution::Interactive`]).
+    #[must_use]
+    pub fn auto_mode(&self) -> Option<&crate::auto_classifier::AutoModeHandle> {
+        self.chain.auto_mode()
     }
 
     /// Die zusätzlichen Workspace-Wurzeln dieses Laufs (`/add-workdir`,
@@ -5244,8 +5586,45 @@ mod tests {
         );
     }
 
+    /// Runde 5, Teil H: der echte Aufrufpfad (`model_limits_for` →
+    /// `match_catalog_key` über den eingebauten Katalog) kennt Opus 5.5 in
+    /// beiden Schreibweisen und liefert dessen Fenster, nicht das
+    /// Rückfallfenster und nicht das des Legacy-Modells `claude-opus-5`.
+    #[test]
+    fn opus_5_5_resolves_through_the_catalog_call_path() -> TestResult {
+        let catalog = builtin_catalog();
+        let expected = catalog
+            .get("claude-opus-5-5")
+            .map(|entry| entry.context_window)
+            .ok_or(TestError::Missing("Katalogeintrag claude-opus-5-5"))?;
+        let config = ResolvedConfig::default();
+        for id in ["claude-opus-5-5", "anthropic/claude-opus-5.5"] {
+            let key = match_catalog_key(catalog.keys().map(String::as_str), id)
+                .ok_or(TestError::Missing("Katalogtreffer für Opus 5.5"))?;
+            assert_eq!(
+                version_dots_to_dashes(&normalize_model_id(key)),
+                "claude-opus-5-5",
+                "{id} → {key}"
+            );
+            let limits = model_limits_for(&config, id);
+            assert!(limits.known, "{id} muss bekannt sein");
+            assert_eq!(limits.context_window, expected, "{id}");
+        }
+        Ok(())
+    }
+
     #[test]
     fn match_catalog_key_prefers_exact_then_normalized_then_longest_prefix() {
+        // Runde 5, Teil H: Opus 5.5 (Standardmodell) in beiden Schreibweisen
+        // gegen die Schlüsselliste — nie der Legacy-Eintrag `claude-opus-5`.
+        let opus_keys = ["claude-opus-5", "claude-opus-5-5", "claude-sonnet-5"];
+        for id in ["claude-opus-5-5", "anthropic/claude-opus-5.5"] {
+            assert_eq!(
+                match_catalog_key(opus_keys, id),
+                Some("claude-opus-5-5"),
+                "{id}"
+            );
+        }
         let keys = [
             "gpt-4o",
             "gpt-4o-mini",
@@ -6146,6 +6525,71 @@ mod tests {
         Ok(())
     }
 
+    /// Runde 5, Teil B: nur eine TUI-Montage hat einen sudo-Fragekanal
+    /// (take-once); jeder andere Einstieg hat keinen — dort wird
+    /// `host.sudo_exec` nie registriert (fail-closed).
+    #[test]
+    fn test_sudo_prompt_channel_exists_only_for_the_tui_entry() -> TestResult {
+        let fixture = build_fixture()?;
+        let (events, _event_rx) = tokio::sync::mpsc::unbounded_channel::<SessionEvent>();
+        let tui = fixture_builder(EntryKind::Tui, &fixture)
+            .session_events(events)
+            .build()
+            .map_err(ctx("Tui montiert"))?;
+        assert!(tui.take_sudo_prompts().is_some(), "TUI bekommt den Kanal");
+        assert!(tui.take_sudo_prompts().is_none(), "nur einmal abholbar");
+
+        let echo = fixture_builder(EntryKind::LocalEcho, &fixture)
+            .build()
+            .map_err(ctx("LocalEcho montiert"))?;
+        assert!(
+            echo.take_sudo_prompts().is_none(),
+            "Nicht-TUI-Einstiege haben keinen sudo-Kanal"
+        );
+        Ok(())
+    }
+
+    /// Runde 5, Teil F: die Plan-Werkzeuge hängen an der Wurzel der vollen
+    /// Modell-Werkzeugfläche, die Wurzel ist gebunden (Kinder nie), und nur
+    /// die TUI hat einen Plan-Fragekanal (take-once). Ohne Kanal antworten
+    /// `plan.exit`/`ask_user` fail-closed (siehe `harw-tool-plan`).
+    #[test]
+    fn test_plan_tools_are_root_only_and_the_ui_channel_exists_only_for_the_tui() -> TestResult {
+        let fixture = build_fixture()?;
+        let (events, _event_rx) = tokio::sync::mpsc::unbounded_channel::<SessionEvent>();
+        let tui = fixture_builder(EntryKind::Tui, &fixture)
+            .session_events(events)
+            .build()
+            .map_err(ctx("Tui montiert"))?;
+        let tools = tui.rights_snapshot().tools;
+        for name in harw_tool_plan::PlanToolProvider::TOOL_NAMES {
+            assert!(
+                tools.iter().any(|tool| tool == name),
+                "TUI-Wurzel muss {name} führen: {tools:?}"
+            );
+        }
+        assert!(
+            tui.plan_session().is_root(tui.root_session_id().as_str()),
+            "die Wurzel ist gebunden"
+        );
+        assert!(
+            !tui.plan_session().is_root(SessionId::new().as_str()),
+            "jede andere Sitzung (Kind) ist es nicht"
+        );
+        assert!(!tui.plan_session().lock().is_locked());
+        assert!(
+            tui.take_plan_ui_requests().is_some(),
+            "TUI bekommt den Kanal"
+        );
+        assert!(tui.take_plan_ui_requests().is_none(), "nur einmal abholbar");
+
+        let echo = fixture_builder(EntryKind::LocalEcho, &fixture)
+            .build()
+            .map_err(ctx("LocalEcho montiert"))?;
+        assert!(echo.take_plan_ui_requests().is_none());
+        Ok(())
+    }
+
     /// Regressionstest: ohne konfigurierten Provider-/Modell-/Agenten-
     /// Standard bleibt die UIA-Wurzel unverändert bei `role_effort_weights.uia`
     /// (Addendum F+G, bisheriges Verhalten).
@@ -6234,6 +6678,8 @@ mod tests {
             .map_err(ctx("LocalEcho montiert"))?
             .rights_snapshot();
         assert!(baseline.tools.iter().any(|tool| tool == "fs.write"));
+        // Runde 5, Teil H: `fs.edit` (Teil D) steht überall, wo `fs.write` steht.
+        assert!(baseline.tools.iter().any(|tool| tool == "fs.edit"));
         assert!(baseline.tools.iter().any(|tool| tool == "shell.exec"));
 
         let narrowed = fixture_builder(EntryKind::LocalEcho, &fixture)
@@ -6250,6 +6696,8 @@ mod tests {
         let snapshot = narrowed.rights_snapshot();
 
         assert!(!snapshot.tools.iter().any(|tool| tool == "fs.write"));
+        // Runde 5, Teil H: die Verengung auf Lesen entfernt auch `fs.edit`.
+        assert!(!snapshot.tools.iter().any(|tool| tool == "fs.edit"));
         assert!(!snapshot.tools.iter().any(|tool| tool == "shell.exec"));
         assert!(snapshot.tools.iter().any(|tool| tool == "fs.read"));
         // Neben dem Profil darf die Wurzel nur die sitzungsgebundenen

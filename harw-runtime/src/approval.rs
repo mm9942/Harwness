@@ -49,6 +49,7 @@ use harw_extension_api::{
 };
 use harw_registry_defaults::DefaultApprovalPolicy;
 
+use crate::auto_classifier::AutoModeHandle;
 use crate::spec::AskResolution;
 
 /// Stabiler Kurzname der Konfigurationspolitik in [`ApprovalChain::snapshot`].
@@ -195,6 +196,13 @@ impl AskResolutionPolicy {
             Some(RuleDecision::Allow) => return false,
             None => {}
         }
+        // Runde 5, Teil F: dieselbe Ausnahme wie in
+        // `DefaultApprovalPolicy::review` — `plan.exit`/`plan.enter`/`ask_user`
+        // fragen nie zusätzlich. Ohne TUI antworten sie selbst fail-closed
+        // („keine Rückfrage möglich …“) statt den Lauf hier abzulehnen.
+        if harw_tool_plan::USER_DIALOG_TOOLS.contains(&call.name.as_str()) {
+            return false;
+        }
         match self.mode.get() {
             ApprovalMode::AlwaysAsk => true,
             ApprovalMode::Delegated => DefaultApprovalPolicy::requires_explicit_approval(call),
@@ -239,6 +247,20 @@ impl ApprovalHandler for AskResolutionPolicy {
 
     fn label(&self) -> &'static str {
         Self::label_for(self.resolution)
+    }
+}
+
+/// Runde 5, Teil E: die Standardpolitik eines Kindes — mit Kind-Gate, wenn
+/// die Elternkette den Auto-Modus trägt.
+fn child_default_policy(
+    mode: ApprovalModeCell,
+    rules: AllowRuleSet,
+    auto: Option<&AutoModeHandle>,
+) -> DefaultApprovalPolicy {
+    let policy = DefaultApprovalPolicy::with_rules(mode, rules);
+    match auto {
+        Some(handle) => policy.with_auto_gate(handle.child_gate()),
+        None => policy,
     }
 }
 
@@ -290,6 +312,9 @@ pub struct ApprovalChain {
     /// mit [`Self::default`] (der [`DefaultApprovalPolicy`], die sie befragt)
     /// und mit [`Self::ask`] (dessen Vorhersage dieselbe Regelmenge braucht).
     rules: AllowRuleSet,
+    /// Runde 5, Teil E: der geteilte Auto-Modus-Zustand (Vorfilter,
+    /// Klassifizierer, Protokoll, Deckel). `None` = bisheriges Verhalten.
+    auto: Option<AutoModeHandle>,
 }
 
 impl std::fmt::Debug for ApprovalChain {
@@ -368,7 +393,43 @@ impl ApprovalChain {
             responder,
             mode,
             rules,
+            auto: None,
         }
+    }
+
+    /// Runde 5, Teil E: schaltet den ausgebauten Auto-Modus für diese Kette ein.
+    ///
+    /// # Beschreibung
+    /// Baut die Standardpolitik dieser Kette mit dem Wurzel-Gate des
+    /// `handle` neu ([`DefaultApprovalPolicy::with_auto_gate`]); Kinder aus
+    /// [`Self::for_child`] bekommen das Kind-Gate (ohne Pausenrecht: `ask`
+    /// wird dort zur Ablehnung mit Grund). Muss **vor** [`Self::install`]
+    /// bzw. [`Self::install_over_default`] aufgerufen werden.
+    ///
+    /// Die [`AskResolutionPolicy`] nicht interaktiver Einstiege bleibt
+    /// unverändert: sie sagt die Rückfrage ohne Klassifizierer voraus und
+    /// lehnt ab — dort gibt der Klassifizierer also nie zusätzlich frei
+    /// (fail-closed).
+    ///
+    /// # Arguments
+    /// - `handle` ([`AutoModeHandle`]): der geteilte Zustand der Sitzung.
+    ///
+    /// # Rückgabe
+    /// Die Kette mit Auto-Modus.
+    #[must_use]
+    pub fn with_auto_mode(mut self, handle: AutoModeHandle) -> Self {
+        self.default = Arc::new(
+            DefaultApprovalPolicy::with_rules(self.mode.clone(), self.rules.clone())
+                .with_auto_gate(handle.root_gate()),
+        );
+        self.auto = Some(handle);
+        self
+    }
+
+    /// Runde 5, Teil E: der geteilte Auto-Modus-Zustand, falls eingeschaltet.
+    #[must_use]
+    pub fn auto_mode(&self) -> Option<&AutoModeHandle> {
+        self.auto.as_ref()
     }
 
     /// Leitet die Kette einer **Kind**-Sitzung oder eines Job-Workers ab.
@@ -435,13 +496,15 @@ impl ApprovalChain {
                 .map(Arc::new),
             config: self.config.clone(),
             config_tools: self.config_tools.clone(),
-            default: Arc::new(DefaultApprovalPolicy::with_rules(
+            default: Arc::new(child_default_policy(
                 child_mode.clone(),
                 self.rules.clone(),
+                self.auto.as_ref(),
             )),
             responder: None,
             mode: child_mode,
             rules: self.rules.clone(),
+            auto: self.auto.clone(),
         }
     }
 
@@ -1379,6 +1442,110 @@ mod tests {
             block_on(chain.handlers()[1].review(&shell_call("git status --short")))?,
             ApprovalDecision::Allow
         ));
+        Ok(())
+    }
+
+    // ── Runde 5, Teil E: Auto-Modus in der Kette ─────────────────────────────
+
+    use crate::auto_classifier::{
+        AutoModeHandle, ClassifierBackend, ClassifierFuture, PrefilterContext,
+    };
+
+    /// Backend-Doppel mit fester Antwort.
+    struct FixedBackend(&'static str);
+
+    impl ClassifierBackend for FixedBackend {
+        fn complete<'a>(&'a self, _system: &'a str, _user: &'a str) -> ClassifierFuture<'a> {
+            let reply = self.0.to_owned();
+            Box::pin(async move { Ok(reply) })
+        }
+
+        fn label(&self) -> String {
+            "fixed".to_owned()
+        }
+    }
+
+    fn auto_chain(reply: Option<&'static str>) -> ApprovalChain {
+        let mode = ApprovalModeCell::new(ApprovalMode::Delegated);
+        let handle = AutoModeHandle::new(
+            mode.clone(),
+            PrefilterContext::new(
+                std::path::PathBuf::from("/work/project"),
+                harw_sandbox::ExtraRootsCell::new(),
+                harw_authority::NetworkScope::empty(),
+                None,
+            ),
+        );
+        if let Some(reply) = reply {
+            handle.install_backend(Arc::new(FixedBackend(reply)));
+        }
+        ApprovalChain::for_root(
+            &config_with(&[]),
+            AskResolution::Interactive,
+            mode,
+            None,
+            AllowRuleSet::new(),
+        )
+        .with_auto_mode(handle)
+    }
+
+    fn run_on_runtime<T>(future: ExtFuture<'_, T>) -> TestResult<T> {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .build()
+            .map_err(|error| TestError::Unexpected(format!("Laufzeit: {error}")))?;
+        Ok(runtime.block_on(future))
+    }
+
+    #[test]
+    fn with_auto_mode_lets_the_classifier_allow_in_the_root() -> TestResult {
+        let chain = auto_chain(Some(r#"{"decision":"allow","category":"t","reason":"r"}"#));
+        assert!(chain.auto_mode().is_some());
+        assert!(matches!(
+            run_on_runtime(chain.handlers()[0].review(&shell_call("cargo test")))?,
+            ApprovalDecision::Allow
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn with_auto_mode_asks_without_a_classifier_in_the_root() -> TestResult {
+        let chain = auto_chain(None);
+        assert!(matches!(
+            run_on_runtime(chain.handlers()[0].review(&shell_call("cargo test")))?,
+            ApprovalDecision::AskUser(_)
+        ));
+        Ok(())
+    }
+
+    /// Kind ohne Pausenrecht: `ask` wird zur Ablehnung mit Grund.
+    #[test]
+    fn a_child_denies_with_reason_instead_of_asking_in_auto_mode() -> TestResult {
+        let child = auto_chain(None).for_child();
+        assert!(child.auto_mode().is_some());
+        match run_on_runtime(child.handlers()[0].review(&shell_call("cargo test")))? {
+            ApprovalDecision::Deny(reason) => {
+                assert!(reason.contains("nicht pausieren"), "{reason}");
+                Ok(())
+            }
+            other => Err(TestError::Unexpected(format!(
+                "erwartet Deny, war {other:?}"
+            ))),
+        }
+    }
+
+    #[test]
+    fn always_ask_tools_stay_ask_with_auto_mode() -> TestResult {
+        let chain = auto_chain(Some(r#"{"decision":"allow"}"#));
+        for tool in harw_registry_defaults::ALWAYS_ASK_TOOLS {
+            assert!(
+                matches!(
+                    run_on_runtime(chain.handlers()[0].review(&call(tool)))?,
+                    ApprovalDecision::AskUser(_)
+                ),
+                "{tool}"
+            );
+        }
         Ok(())
     }
 }

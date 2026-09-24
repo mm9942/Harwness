@@ -82,6 +82,8 @@ use harw_extension_api::ToolCall;
 use crate::history_cell::{
     APPROVAL_COLLAPSED_ARGUMENT_LINES, ApprovalArgument, ApprovalArgumentValue, wrap_plain,
 };
+// Runde 5, Teil E: Lern-Angebot des Auto-Modus.
+use crate::permissions_view::{LearnOfferView, LearnScope};
 use crate::sanitize::{sanitize_inline, sanitize_reveal, sanitize_reveal_inline};
 use crate::style::{self, Theme};
 
@@ -117,6 +119,16 @@ pub enum ApprovalChoice {
     ApproveAndRemember(String),
     /// Option 3: freigeben und in den auto-Modus wechseln.
     ApproveAndAutoMode,
+    /// Runde 5, Teil E: freigeben und künftig erlauben (Lern-Angebot ab der
+    /// dritten gleichartigen Freigabe), mit gewähltem Scope. Der Aufrufer
+    /// legt die Regel an (Sitzung) bzw. schreibt sie über
+    /// `/permissions allow … --project` (Projekt).
+    ApproveAndLearn {
+        /// Das angenommene Angebot.
+        offer: LearnOfferView,
+        /// Sitzung oder Projekt.
+        scope: LearnScope,
+    },
     /// Option 4: ablehnen, optional mit einer vom Nutzer getippten Begründung.
     Reject {
         /// `Some(text)`, wenn der Nutzer über `Tab` eine Begründung eingegeben
@@ -198,6 +210,10 @@ enum OptionKind {
     Remember,
     /// „Ja, und in den auto-Modus wechseln“.
     AutoMode,
+    /// Runde 5, Teil E: „Ja, und künftig erlauben: … (nur diese Sitzung)“.
+    LearnSession,
+    /// Runde 5, Teil E: „Ja, und künftig erlauben: … (dauerhaft im Projekt)“.
+    LearnProject,
     /// „Nein“.
     Reject,
 }
@@ -271,6 +287,12 @@ pub struct ApprovalDialog {
     /// Regel-Vorschlag für „nicht mehr fragen“; steuert, ob Option 2
     /// erscheint.
     remember_rule: Option<String>,
+    /// Runde 5, Teil E: Lern-Angebot; steuert, ob die beiden
+    /// „künftig erlauben“-Optionen erscheinen.
+    learn_offer: Option<LearnOfferView>,
+    /// Runde 5 (Integration O): nur einmalige Zustimmung anbieten — blendet
+    /// „Ja, und in den auto-Modus wechseln“ aus (Kind-Freigaben).
+    once_only: bool,
     /// Zeitpunkt, zu dem die Frage automatisch als Ablehnung gilt.
     deadline: Instant,
     /// Ob die Freitext-Ablehnungsbegründung angeboten wird.
@@ -306,6 +328,8 @@ impl ApprovalDialog {
             risk: request.risk,
             origin: request.origin,
             remember_rule: request.remember_rule,
+            learn_offer: None,
+            once_only: false,
             deadline: request.deadline,
             reason_input_enabled: request.reason_input_enabled,
             selected: 0,
@@ -313,6 +337,32 @@ impl ApprovalDialog {
             reason_editing: false,
             reason_text: String::new(),
         }
+    }
+
+    /// Runde 5, Teil E: hängt das Lern-Angebot an („Ja, und künftig
+    /// erlauben: `<muster>`“, je eine Option für Sitzung und Projekt).
+    ///
+    /// # Argumente
+    /// - `offer` ([`LearnOfferView`]): das Angebot aus
+    ///   `harw_runtime::AutoModeHandle::learning_offer`.
+    ///
+    /// # Rückgabe
+    /// Das Panel mit den beiden zusätzlichen Optionen.
+    #[must_use]
+    pub fn with_learning_offer(mut self, offer: LearnOfferView) -> Self {
+        self.learn_offer = Some(offer);
+        self
+    }
+
+    /// Runde 5 (Integration O): bietet nur „Ja“ und „Nein“ an — für
+    /// Freigaben, die ausschließlich einmalig gelten (Kind-Agenten).
+    ///
+    /// # Rückgabe
+    /// Das Panel ohne die Option „Ja, und in den auto-Modus wechseln“.
+    #[must_use]
+    pub fn once_only(mut self) -> Self {
+        self.once_only = true;
+        self
     }
 
     /// Gibt die aktuell sichtbaren Optionen in Anzeigereihenfolge zurück.
@@ -324,7 +374,14 @@ impl ApprovalDialog {
         if self.remember_rule.is_some() {
             options.push(OptionKind::Remember);
         }
-        options.push(OptionKind::AutoMode);
+        // Runde 5, Teil E: Lern-Angebot mit Scope-Wahl.
+        if self.learn_offer.is_some() {
+            options.push(OptionKind::LearnSession);
+            options.push(OptionKind::LearnProject);
+        }
+        if !self.once_only {
+            options.push(OptionKind::AutoMode);
+        }
         options.push(OptionKind::Reject);
         options
     }
@@ -337,6 +394,18 @@ impl ApprovalDialog {
                 ApprovalChoice::ApproveAndRemember(self.remember_rule.clone().unwrap_or_default())
             }
             OptionKind::AutoMode => ApprovalChoice::ApproveAndAutoMode,
+            OptionKind::LearnSession | OptionKind::LearnProject => match &self.learn_offer {
+                Some(offer) => ApprovalChoice::ApproveAndLearn {
+                    offer: offer.clone(),
+                    scope: if kind == OptionKind::LearnProject {
+                        LearnScope::Project
+                    } else {
+                        LearnScope::Session
+                    },
+                },
+                // Nur sichtbar mit Angebot; ohne bleibt es eine einfache Freigabe.
+                None => ApprovalChoice::Approve,
+            },
             OptionKind::Reject => ApprovalChoice::Reject { reason: None },
         }
     }
@@ -350,6 +419,16 @@ impl ApprovalDialog {
                 format!("Ja, und nicht mehr fragen für: {}", sanitize_inline(rule))
             }
             OptionKind::AutoMode => "Ja, und in den auto-Modus wechseln".to_owned(),
+            OptionKind::LearnSession => self
+                .learn_offer
+                .as_ref()
+                .map(|offer| offer.option_label(LearnScope::Session))
+                .unwrap_or_default(),
+            OptionKind::LearnProject => self
+                .learn_offer
+                .as_ref()
+                .map(|offer| offer.option_label(LearnScope::Project))
+                .unwrap_or_default(),
             OptionKind::Reject => {
                 let hint = if self.reason_input_enabled {
                     REJECT_HINT_WITH_REASON
@@ -571,6 +650,8 @@ impl ApprovalDialog {
         match self.tool_name.as_str() {
             "shell.exec" => " Befehl ausführen? ".to_owned(),
             "fs.write" | "fs.patch" => " Datei schreiben? ".to_owned(),
+            // Runde 5, Teil H: `fs.edit` (Teil D) bekommt einen eigenen Titel.
+            "fs.edit" => " Datei bearbeiten? ".to_owned(),
             _ => " Werkzeug freigeben? ".to_owned(),
         }
     }
@@ -641,7 +722,9 @@ impl ApprovalDialog {
     fn info_fields(&self) -> Vec<(&'static str, String)> {
         let mut fields = Vec::new();
         if let Some(origin) = &self.origin {
-            fields.push(("Herkunft", origin.clone()));
+            // Runde 5, Teil O: Kind-Freigaben nennen ihren Absender als
+            // „angefragt von: <rolle> (<pfad im baum>)“.
+            fields.push(("angefragt von", origin.clone()));
         }
         if let Some(cwd) = &self.cwd {
             fields.push(("cwd", cwd.clone()));
@@ -706,6 +789,8 @@ impl ApprovalDialog {
 fn primary_argument_index(tool_name: &str, arguments: &[ApprovalArgument]) -> Option<usize> {
     let preferred: &[&str] = match tool_name {
         "fs.write" => &["path"],
+        // Runde 5, Teil H: Schlüsselargumente von `fs.edit` (Teil D).
+        "fs.edit" => &["path", "old_string", "new_string"],
         "shell.exec" => &["command"],
         _ => &["command", "path"],
     };
@@ -852,6 +937,19 @@ mod tests {
             "{rendered}"
         );
         assert!(rendered.contains("4. Nein"), "{rendered}");
+    }
+
+    /// Runde 5 (Integration O): Kind-Freigaben bieten nur „Ja“ und „Nein“.
+    #[test]
+    fn test_once_only_hides_the_auto_mode_option() {
+        let dialog = shell_dialog(None).once_only();
+        assert_eq!(
+            dialog.visible_options(),
+            vec![OptionKind::Approve, OptionKind::Reject]
+        );
+        let rendered = render_dialog(&dialog, 70, 20);
+        assert!(!rendered.contains("auto-Modus"), "{rendered}");
+        assert!(rendered.contains("2. Nein"), "{rendered}");
     }
 
     #[test]
@@ -1168,6 +1266,31 @@ mod tests {
         });
         assert!(render_dialog(&write, 70, 20).contains("Datei schreiben?"));
 
+        // Runde 5, Teil H: `fs.edit` fragt „Datei bearbeiten?“ und zeigt
+        // Pfad, alten und neuen Text.
+        let edit = ApprovalDialog::new(ApprovalDialogRequest {
+            call: tool_call(
+                "fs.edit",
+                harw_tools::serde_json::json!({
+                    "path": "src/lib.rs",
+                    "old_string": "alt",
+                    "new_string": "neu"
+                }),
+            ),
+            cwd: None,
+            justification: None,
+            risk: None,
+            origin: None,
+            remember_rule: None,
+            deadline: Instant::now() + Duration::from_secs(300),
+            reason_input_enabled: false,
+        });
+        let rendered = render_dialog(&edit, 70, 24);
+        assert!(rendered.contains("Datei bearbeiten?"), "{rendered}");
+        assert!(rendered.contains("src/lib.rs"), "{rendered}");
+        assert!(rendered.contains("old_string"), "{rendered}");
+        assert!(rendered.contains("new_string"), "{rendered}");
+
         let other = ApprovalDialog::new(ApprovalDialogRequest {
             call: tool_call("mcp.custom", harw_tools::serde_json::json!({})),
             cwd: None,
@@ -1179,5 +1302,61 @@ mod tests {
             reason_input_enabled: false,
         });
         assert!(render_dialog(&other, 70, 20).contains("Werkzeug freigeben?"));
+    }
+
+    // ── Runde 5, Teil E: Lern-Angebot ────────────────────────────────────────
+
+    fn learn_view() -> LearnOfferView {
+        LearnOfferView {
+            tool: "shell.exec".to_owned(),
+            pattern: Some("git status".to_owned()),
+            display: "shell.exec git status *".to_owned(),
+        }
+    }
+
+    #[test]
+    fn test_learning_offer_adds_session_and_project_options() {
+        let without = shell_dialog(None);
+        assert_eq!(without.visible_options().len(), 3);
+
+        let with = shell_dialog(None).with_learning_offer(learn_view());
+        assert_eq!(
+            with.visible_options(),
+            vec![
+                OptionKind::Approve,
+                OptionKind::LearnSession,
+                OptionKind::LearnProject,
+                OptionKind::AutoMode,
+                OptionKind::Reject,
+            ]
+        );
+        let rendered = render_dialog(&with, 90, 24);
+        assert!(
+            rendered.contains("künftig erlauben: shell.exec git status *"),
+            "{rendered}"
+        );
+    }
+
+    #[test]
+    fn test_learning_offer_choices_carry_the_scope() {
+        let mut dialog = shell_dialog(None).with_learning_offer(learn_view());
+        dialog.handle_key(make_key(KeyCode::Char('2')), true);
+        assert_eq!(
+            dialog.handle_key(make_key(KeyCode::Enter), true),
+            DialogAction::Decided(ApprovalChoice::ApproveAndLearn {
+                offer: learn_view(),
+                scope: LearnScope::Session,
+            })
+        );
+
+        let mut dialog = shell_dialog(None).with_learning_offer(learn_view());
+        dialog.handle_key(make_key(KeyCode::Char('3')), true);
+        assert_eq!(
+            dialog.handle_key(make_key(KeyCode::Enter), true),
+            DialogAction::Decided(ApprovalChoice::ApproveAndLearn {
+                offer: learn_view(),
+                scope: LearnScope::Project,
+            })
+        );
     }
 }

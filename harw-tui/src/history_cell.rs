@@ -1474,6 +1474,7 @@ pub(crate) type SharedToolCell = Arc<Mutex<ToolCell>>;
 /// - `fs.search`/`fs.grep` → `Search("<Muster>" in <Pfad oder .>)`.
 /// - `fs.list`/`fs.glob` → `List(<Pfad>)`.
 /// - `fs.write` → `Write(<Pfad>)`.
+/// - `fs.edit` → `Edit(<Pfad>)`.
 /// - `doc.read_pdf` → `ReadPdf(<Pfad>)`, bzw. `ReadPdf(<Pfad>, Seiten
 ///   <Bereich>)` wenn das Argument `pages` gesetzt ist (dieselbe
 ///   Darstellungsform wie `fs.read`, nur mit optionalem Seitenbereich).
@@ -1521,6 +1522,7 @@ pub(crate) fn tool_label(call: &ToolCall) -> String {
         ),
         "fs.list" | "fs.glob" => format!("List({})", str_arg("path").unwrap_or("")),
         "fs.write" => format!("Write({})", str_arg("path").unwrap_or("")),
+        "fs.edit" => format!("Edit({})", str_arg("path").unwrap_or("")),
         "doc.read_pdf" => {
             let path = str_arg("path").unwrap_or("");
             match str_arg("pages") {
@@ -1699,10 +1701,20 @@ impl ToolCell {
     }
 
     /// Markiert einen beim Resume offenen Aufruf sichtbar als unvollständig.
+    ///
+    /// Nur für den echten Resume-Pfad (Wiederaufnahme eines persistierten
+    /// Verlaufs); ein Turn-Ende nennt seinen echten Grund über
+    /// [`Self::mark_incomplete_with`] (Runde 5, Teil M).
     pub(crate) fn mark_incomplete(&mut self) {
+        self.mark_incomplete_with("unvollständig (Resume-Abbruch)");
+    }
+
+    /// Runde 5, Teil M: markiert einen offenen Aufruf als unvollständig und
+    /// nennt den echten Grund (z. B. „unvollständig (abgebrochen)").
+    pub(crate) fn mark_incomplete_with(&mut self, reason: &str) {
         if self.state == ToolState::Running {
             self.state = ToolState::Failed;
-            self.summary = Some("unvollständig (Resume-Abbruch)".to_owned());
+            self.summary = Some(reason.to_owned());
         }
     }
 
@@ -1723,6 +1735,9 @@ impl ToolCell {
     ///   sonst der JSON-Form), keine `preview`-Zeilen.
     /// - `fs.search`/`fs.grep`: `summary = Some("N Treffer")` (Länge von
     ///   `matches`/`results`, sonst `0`).
+    /// - `fs.edit`: `summary = Some("N Ersetzung(en) in <pfad>")` aus
+    ///   `replacements`/`path`; `preview` die ersten drei `-`/`+`-Zeilen aus
+    ///   `diff_excerpt`, `full_output` der ganze Diff-Ausschnitt.
     /// - `doc.read_pdf`: `summary` aus dem Seitenangaben-Teil der Kopfzeile
     ///   (`"Seiten X–Y von N (…)"`), wenn diese das erwartete Muster enthält
     ///   (siehe [`parse_read_pdf_page_summary`]) — dann keine `preview`-Zeilen,
@@ -1764,7 +1779,11 @@ impl ToolCell {
     /// Teil von [`ToolCell::complete`]: Fehlerzweig.
     fn apply_error(&mut self, message: &str) {
         self.state = ToolState::Failed;
-        self.summary = None;
+        // Runde 5, Teil M: der Endbericht eines Kind-Agenten nennt den
+        // echten Grund („abgebrochen: Zeitbudget 15 min erreicht · Übergabe
+        // verfügbar") statt eines generischen Fehlers.
+        self.summary =
+            harw_core::parse_child_end(message).map(|header| harw_core::child_end_label(&header));
         let first_line = message.lines().next().unwrap_or(message).to_owned();
         self.full_output = message.lines().map(str::to_owned).collect();
         self.preview = vec![first_line];
@@ -1952,6 +1971,42 @@ impl ToolCell {
                 self.hidden_lines = 0;
                 self.full_output = lines;
                 self.expanded = true;
+            }
+            // Runde 5, Teil D: `fs.edit` liefert `{path, replacements,
+            // diff_excerpt}`; die Zelle zeigt die Zahl der Ersetzungen und
+            // den Diff-Ausschnitt als Vorschau.
+            "fs.edit" => {
+                let replacements = value
+                    .get("replacements")
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(0);
+                let path = value.get("path").and_then(|v| v.as_str()).unwrap_or("?");
+                let noun = if replacements == 1 {
+                    "Ersetzung"
+                } else {
+                    "Ersetzungen"
+                };
+                let diff: Vec<String> = value
+                    .get("diff_excerpt")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .lines()
+                    .map(str::to_owned)
+                    .collect();
+                let changed: Vec<String> = diff
+                    .iter()
+                    .filter(|line| line.starts_with('-') || line.starts_with('+'))
+                    .cloned()
+                    .collect();
+                self.state = ToolState::Succeeded;
+                self.summary = Some(format!("{replacements} {noun} in {path}"));
+                self.preview = changed
+                    .iter()
+                    .take(TOOL_CELL_COLLAPSED_LINES)
+                    .cloned()
+                    .collect();
+                self.hidden_lines = changed.len().saturating_sub(self.preview.len());
+                self.full_output = diff;
             }
             "fs.search" | "fs.grep" => {
                 let count = value
@@ -3631,6 +3686,47 @@ mod tests {
         );
     }
 
+    /// `fs.edit`-Erfolg: Zusammenfassung „N Ersetzung(en) in <pfad>“, die
+    /// Vorschau zeigt die `-`/`+`-Zeilen des Diff-Ausschnitts.
+    #[test]
+    fn test_tool_cell_complete_fs_edit_summarizes_replacements() {
+        let call = make_tool_call(
+            "fs.edit",
+            harw_tools::serde_json::json!({
+                "path": "src/main.rs",
+                "old_string": "a",
+                "new_string": "b",
+            }),
+        );
+        assert_eq!(tool_label(&call), "Edit(src/main.rs)");
+        let mut cell = ToolCell::started(&call);
+        let result = harw_protocol::items::ToolCallResult::success(harw_tools::serde_json::json!({
+            "path": "src/main.rs",
+            "replacements": 1,
+            "diff_excerpt": "@@ Zeile 2 @@\n-    let x = 1;\n+    let x = 2;",
+        }));
+        cell.complete(&result, 1);
+
+        assert_eq!(cell.summary.as_deref(), Some("1 Ersetzung in src/main.rs"));
+        assert_eq!(
+            cell.preview,
+            vec!["-    let x = 1;".to_owned(), "+    let x = 2;".to_owned()]
+        );
+        assert_eq!(cell.hidden_lines, 0);
+        assert_eq!(cell.full_output.len(), 3);
+
+        let mut many = ToolCell::started(&call);
+        let result = harw_protocol::items::ToolCallResult::success(harw_tools::serde_json::json!({
+            "path": "a.txt",
+            "replacements": 3,
+            "diff_excerpt": "@@ Zeile 1 @@\n-foo\n+bar\n@@ Zeile 2 @@\n-foo\n+bar",
+        }));
+        many.complete(&result, 1);
+        assert_eq!(many.summary.as_deref(), Some("3 Ersetzungen in a.txt"));
+        assert_eq!(many.preview.len(), TOOL_CELL_COLLAPSED_LINES);
+        assert_eq!(many.hidden_lines, 1);
+    }
+
     /// `fs.search`-Erfolg zählt die Treffer im Feld `matches`.
     #[test]
     fn test_tool_cell_complete_fs_search_counts_matches() {
@@ -3998,5 +4094,52 @@ mod tests {
         let joined = lines_to_strings(&group.display_lines(80, style::Theme::Dark)).join("\n");
         assert!(joined.contains("1 fehlgeschlagen"), "war: {joined:?}");
         Ok(())
+    }
+
+    /// Runde 5, Teil M: ein Turn-Ende nennt seinen echten Grund; nur der
+    /// Resume-Pfad sagt „Resume-Abbruch".
+    #[test]
+    fn test_incomplete_label_names_the_real_reason() {
+        let call = make_tool_call(
+            "transfer_to_root-orchestrator",
+            harw_tools::serde_json::json!({ "task": "Umsetzen" }),
+        );
+        let mut cell = ToolCell::started(&call);
+        cell.mark_incomplete_with("unvollständig (abgebrochen)");
+        assert_eq!(cell.state, ToolState::Failed);
+        assert_eq!(cell.summary.as_deref(), Some("unvollständig (abgebrochen)"));
+
+        let mut resumed = ToolCell::started(&call);
+        resumed.mark_incomplete();
+        assert_eq!(
+            resumed.summary.as_deref(),
+            Some("unvollständig (Resume-Abbruch)")
+        );
+    }
+
+    /// Runde 5, Teil M: der Endbericht eines Kind-Agenten erscheint als
+    /// echter Grund in der Werkzeugzelle.
+    #[test]
+    fn test_child_end_report_shows_the_real_reason() {
+        let call = make_tool_call(
+            "transfer_to_root-orchestrator",
+            harw_tools::serde_json::json!({ "task": "Umsetzen" }),
+        );
+        let mut cell = ToolCell::started(&call);
+        cell.complete(
+            &harw_protocol::items::ToolCallResult::error(
+                "[child_end status=timeout handoff=yes] Zeitbudget 15 min erreicht\nKind-Agent …",
+            ),
+            1_224_814,
+        );
+        assert_eq!(cell.state, ToolState::Failed);
+        assert_eq!(
+            cell.summary.as_deref(),
+            Some("abgebrochen: Zeitbudget 15 min erreicht · Übergabe verfügbar")
+        );
+        // Ein gewöhnlicher Fehler bleibt ohne Zusammenfassung.
+        let mut plain = ToolCell::started(&call);
+        plain.complete(&harw_protocol::items::ToolCallResult::error("kaputt"), 1);
+        assert_eq!(plain.summary, None);
     }
 }

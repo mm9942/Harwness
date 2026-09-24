@@ -72,6 +72,10 @@ admitted = [
   "explore.relations",
   "explore.find",
   "delegate_wave",
+  # Runde 5, Teil H: ungekürzter Antworttext eines eigenen, abgeschlossenen
+  # Kindes (rein lesend, auto-freigegeben; die Composition-Root steuert es bei,
+  # siehe `harw_registry_defaults::profile::child_result_tools_for_role`).
+  "agent.result",
   # Lesende Wissenswerkzeuge (Plan Teil D, Entscheidung der Nutzerin
   # „Agenten dürfen Workbench, Palace und Diary lesen“): nur lesend,
   # `ReadWorkspace`. Die Composition-Root montiert sie, sobald ein
@@ -82,8 +86,16 @@ admitted = [
   "diary.read",
   "palace.search",
   "palace.recall",
+  # Runde 5, Teil M: Nachricht an ein eigenes, laufendes Kind (Kurskorrektur
+  # oder Antwort auf seine Frage; die Composition-Root steuert es bei, siehe
+  # `harw_registry_defaults::profile::child_message_tools_for_role`).
+  "agent.message",
+  # Runde 5, Teil M: Zwischenstand (info) oder Frage (question) an den direkten
+  # Elternteil; nur Text, keine Rechte (siehe
+  # `harw_registry_defaults::profile::parent_message_tools_for_role`).
+  "parent.message",
 ]
-forbidden = ["fs.write", "shell.exec", "web.fetch", "web.search", "web.docs_rs", "web.crates_io"]
+forbidden = ["fs.write", "fs.edit", "shell.exec", "web.fetch", "web.search", "web.docs_rs", "web.crates_io"]
 
 # Zugelassene Delegationsziele (siehe `coding-orchestrator.toml`).
 [delegation]
@@ -103,7 +115,10 @@ child_orchestrators = []
 [spawn.budget]
 max_tokens = 100000
 max_tool_calls = 70
-max_wall_secs = 900
+# Runde 5, Teil O: 60 min statt 15 — Orchestratoren arbeiten länger als
+# Worker; die Lease (15 min) ist davon getrennt und wird per Herzschlag
+# verlängert, solange das Kind arbeitet.
+max_wall_secs = 3600
 
 [return]
 contract = "harwness.return.envelope@1"

@@ -264,8 +264,8 @@ pub struct FieldScope {
 /// Die zentrale, öffentliche Deklarationstabelle: ein Eintrag pro
 /// `HarnessConfig`-Blattfeld (`docs/design/config-scopes.md` Abschnitt 6.3),
 /// in derselben Reihenfolge wie Abschnitt 1/6.3 der Spezifikation, damit die
-/// Tabelle 1:1 dagegen geprüft werden kann. Exakt 98 Einträge (Abschnitt 6.3
-/// Kontrollsumme: `ProfileReplaces` 50 · `GlobalOnly` 11 · `MinBound` 12 ·
+/// Tabelle 1:1 dagegen geprüft werden kann. Exakt 111 Einträge (Abschnitt 6.3
+/// Kontrollsumme: `ProfileReplaces` 57 · `GlobalOnly` 11 · `MinBound` 18 ·
 /// `CompositeMember` 11 · `Intersection` 4 · `OrBool` 3 · `Union` 2 ·
 /// `AndBool` 2 · `StricterOf` 2 · `PerFileValidated` 1).
 ///
@@ -295,6 +295,8 @@ pub static FIELD_TABLE: &[FieldScope] = &[
     // 1.3 [tui] (2)
     FieldScope { path: "tui.theme", scope: Scope::Profile, merge: MergeRule::ProfileReplaces, ordering: None, intersection_key: None, security_critical: false },
     FieldScope { path: "tui.keybindings_file", scope: Scope::Profile, merge: MergeRule::ProfileReplaces, ordering: None, intersection_key: None, security_critical: false },
+    // Runde 5, Teil I: Live-Stream der Kind-Agenten im Verlauf.
+    FieldScope { path: "tui.child_stream", scope: Scope::Profile, merge: MergeRule::ProfileReplaces, ordering: None, intersection_key: None, security_critical: false },
     // 1.4 [session] (5)
     FieldScope { path: "session.store_dir", scope: Scope::Profile, merge: MergeRule::ProfileReplaces, ordering: None, intersection_key: None, security_critical: false },
     FieldScope { path: "session.journal_format", scope: Scope::Profile, merge: MergeRule::ProfileReplaces, ordering: None, intersection_key: None, security_critical: false },
@@ -354,7 +356,7 @@ pub static FIELD_TABLE: &[FieldScope] = &[
     FieldScope { path: "sandbox.tmux", scope: Scope::Global, merge: MergeRule::GlobalOnly, ordering: None, intersection_key: None, security_critical: true },
     FieldScope { path: "sandbox.tmux.mode", scope: Scope::Global, merge: MergeRule::GlobalOnly, ordering: None, intersection_key: None, security_critical: true },
     FieldScope { path: "sandbox.tmux.socket_path", scope: Scope::Global, merge: MergeRule::GlobalOnly, ordering: None, intersection_key: None, security_critical: true },
-    // 1.13 [internal_models] (12)
+    // 1.13 [internal_models] (13)
     FieldScope { path: "internal_models.use_openrouter_defaults", scope: Scope::Profile, merge: MergeRule::ProfileReplaces, ordering: None, intersection_key: None, security_critical: false },
     FieldScope { path: "internal_models.session_title", scope: Scope::Profile, merge: MergeRule::ProfileReplaces, ordering: None, intersection_key: None, security_critical: false },
     FieldScope { path: "internal_models.compaction_summary", scope: Scope::Profile, merge: MergeRule::ProfileReplaces, ordering: None, intersection_key: None, security_critical: false },
@@ -366,6 +368,8 @@ pub static FIELD_TABLE: &[FieldScope] = &[
     FieldScope { path: "internal_models.worker_complex", scope: Scope::Profile, merge: MergeRule::ProfileReplaces, ordering: None, intersection_key: None, security_critical: false },
     FieldScope { path: "internal_models.root_orchestrator", scope: Scope::Profile, merge: MergeRule::ProfileReplaces, ordering: None, intersection_key: None, security_critical: false },
     FieldScope { path: "internal_models.sub_orchestrator", scope: Scope::Profile, merge: MergeRule::ProfileReplaces, ordering: None, intersection_key: None, security_critical: false },
+    // Runde 5, Teil E: Modell des Auto-Modus-Klassifizierers.
+    FieldScope { path: "internal_models.auto_classifier", scope: Scope::Profile, merge: MergeRule::ProfileReplaces, ordering: None, intersection_key: None, security_critical: false },
     FieldScope { path: "InternalModelChoice.provider/.model", scope: Scope::Profile, merge: MergeRule::CompositeMember, ordering: None, intersection_key: None, security_critical: false },
     // 1.14 [compaction] (2)
     FieldScope { path: "compaction.absolute_ceiling_tokens", scope: Scope::Global, merge: MergeRule::MinBound, ordering: None, intersection_key: None, security_critical: false },
@@ -394,6 +398,27 @@ pub static FIELD_TABLE: &[FieldScope] = &[
     FieldScope { path: "dream.idle_minutes", scope: Scope::Profile, merge: MergeRule::ProfileReplaces, ordering: None, intersection_key: None, security_critical: false },
     FieldScope { path: "dream.cooldown_minutes", scope: Scope::Profile, merge: MergeRule::ProfileReplaces, ordering: None, intersection_key: None, security_critical: false },
     FieldScope { path: "dream.schedule", scope: Scope::Profile, merge: MergeRule::ProfileReplaces, ordering: None, intersection_key: None, security_critical: false },
+    // 1.19 [host] (1) — Runde 5, Teil B: Merkfrist des sudo-Passworts in der
+    // TUI; sicherheitsrelevant, ein Profil darf sie nur verkürzen.
+    FieldScope { path: "host.sudo_session_minutes", scope: Scope::Global, merge: MergeRule::MinBound, ordering: None, intersection_key: None, security_critical: true },
+    // 1.20 [uia_worker_models] (5) — Runde 5, Teil G: eigene Modellwahl je
+    // UIA-Worker-Rolle (`"uia"` oder `"provider/modell"`).
+    FieldScope { path: "uia_worker_models.uia_worker", scope: Scope::Profile, merge: MergeRule::ProfileReplaces, ordering: None, intersection_key: None, security_critical: false },
+    FieldScope { path: "uia_worker_models.uia_shell_worker", scope: Scope::Profile, merge: MergeRule::ProfileReplaces, ordering: None, intersection_key: None, security_critical: false },
+    FieldScope { path: "uia_worker_models.uia_writer", scope: Scope::Profile, merge: MergeRule::ProfileReplaces, ordering: None, intersection_key: None, security_critical: false },
+    FieldScope { path: "uia_worker_models.uia_latex_writer", scope: Scope::Profile, merge: MergeRule::ProfileReplaces, ordering: None, intersection_key: None, security_critical: false },
+    FieldScope { path: "uia_worker_models.uia_explorer", scope: Scope::Profile, merge: MergeRule::ProfileReplaces, ordering: None, intersection_key: None, security_critical: false },
+    // 1.21 [agents] (4) — Runde 5, Teil K: Orchestrierungsgrenzen. Home und
+    // Profil setzen frei (auch nach oben), ein nicht vertrautes Projekt darf
+    // nur senken (`merge_agent_limits`); Klemmen erst beim Lesen.
+    FieldScope { path: "agents.max_root_orchestrators", scope: Scope::Profile, merge: MergeRule::MinBound, ordering: None, intersection_key: None, security_critical: true },
+    FieldScope { path: "agents.max_sub_orchestrators", scope: Scope::Profile, merge: MergeRule::MinBound, ordering: None, intersection_key: None, security_critical: true },
+    FieldScope { path: "agents.max_sub_orchestrator_depth", scope: Scope::Profile, merge: MergeRule::MinBound, ordering: None, intersection_key: None, security_critical: true },
+    FieldScope { path: "agents.max_spawn_depth", scope: Scope::Profile, merge: MergeRule::MinBound, ordering: None, intersection_key: None, security_critical: true },
+    // 1.22 [shell] (1) — Runde 5, Teil N: Obergrenze für `shell.exec`-
+    // Zeitlimits. Home und Profil setzen frei, ein nicht vertrautes Projekt
+    // senkt nur (`merge_shell_limits`); Klemmen erst beim Lesen.
+    FieldScope { path: "shell.max_timeout_secs", scope: Scope::Profile, merge: MergeRule::MinBound, ordering: None, intersection_key: None, security_critical: true },
 ];
 
 #[cfg(test)]
@@ -402,8 +427,14 @@ mod merge_rule_tests {
     use crate::test_support::{TestError, TestResult};
 
     #[test]
-    fn test_field_table_has_exactly_98_entries() {
-        assert_eq!(FIELD_TABLE.len(), 98);
+    fn test_field_table_has_exactly_106_entries() {
+        // Runde 5, Teil B: +1 für `host.sudo_session_minutes`.
+        // Runde 5, Teil E: +1 für `internal_models.auto_classifier`.
+        // Runde 5, Teil G: +5 für `uia_worker_models.*`.
+        // Runde 5, Teil I: +1 für `tui.child_stream`.
+        // Runde 5, Teil K: +4 für `agents.*`.
+        // Runde 5, Teil N: +1 für `shell.max_timeout_secs`.
+        assert_eq!(FIELD_TABLE.len(), 111);
     }
 
     #[test]
@@ -418,9 +449,12 @@ mod merge_rule_tests {
     #[test]
     fn test_merge_rule_variant_control_sum_matches_abschnitt_6_3() {
         let count = |rule: MergeRule| FIELD_TABLE.iter().filter(|f| f.merge == rule).count();
-        assert_eq!(count(MergeRule::ProfileReplaces), 50);
+        // Runde 5: Teil E +1 (`internal_models.auto_classifier`), Teil G +5
+        // (`uia_worker_models.*`), Teil I +1 (`tui.child_stream`).
+        assert_eq!(count(MergeRule::ProfileReplaces), 57);
         assert_eq!(count(MergeRule::GlobalOnly), 11);
-        assert_eq!(count(MergeRule::MinBound), 12);
+        // Runde 5, Teil K: +4 (`agents.*`); Teil N: +1 (`shell.max_timeout_secs`).
+        assert_eq!(count(MergeRule::MinBound), 18);
         assert_eq!(count(MergeRule::CompositeMember), 11);
         assert_eq!(count(MergeRule::Intersection), 4);
         assert_eq!(count(MergeRule::OrBool), 3);

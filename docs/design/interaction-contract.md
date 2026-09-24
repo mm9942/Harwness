@@ -442,7 +442,20 @@ Modul-Doc-Kommentar:
   `dependency-researcher`), `/research-web` recherchiert egress-gebunden im
   Netz.
 - **`/plan`** — Plan-Operation über `harw-plan`/`harw-plan-bridge`, Command
-  und Modell-Tool, jede Mutation läuft über `PlanStore::apply`.
+  und Modell-Tool, jede Mutation läuft über `PlanStore::apply`. Seit Runde 5
+  (Teil P) hält der Store mehrere Pläne, genau einer ist aktiv (`list` bzw.
+  in der TUI `/plan plans`, `switch`, `archive`, `inspect [id]`). Ein Plan der
+  Modell-Fläche ist zunächst ein Vorschlag; `submit` legt ihn in der TUI zur
+  Bestätigung vor, erst danach ist er verbindlich und an ein Goal gebunden.
+  `step <id> <open|running|done|blocked> [beleg]` meldet Fortschritt, `done`
+  nur mit Beleg. Daneben fängt die TUI die Plan-**Dateien** des Plan-Modus
+  lokal ab (Teil F): `/plan` (Plan-Modus an), `/plan show|list|open|edit`
+  über `.harw/plans/<slug>.md`.
+- **`/btw`** (Runde 5, Teil L, TUI-lokal) — flüchtige Nebenfrage zum
+  Gespräch: ein einzelner Modellaufruf auf einem Schnappschuss des Verlaufs,
+  ohne Werkzeuge, ohne den laufenden Turn zu berühren. Frage und Antwort
+  landen weder im Verlauf noch in der Eingabe-Historie; Esc bricht ab,
+  Zeitlimit 60 s. Andere Einstiege (Telegram) antworten mit einer Absage.
 - **`/usage`** — zeigt aufgezeichnete Token-Nutzung und Wächter-Ereignisse der
   aktuellen Sitzung aus dem `StateStore`-Snapshot.
 - **`/stop`** — bricht einen laufenden Job kontrolliert ab; Command und
@@ -463,7 +476,20 @@ Modul-Doc-Kommentar:
   bis … / Einzelfreigabe / aus". Details zur Host-Ausführung selbst stehen in
   `mediated-process-execution.md`.
 - **`/permissions`** — Übersicht über Workspace-Identität, Sandbox-Rechte,
-  Freigabemodus und Allow-/Deny-Regeln.
+  Freigabemodus und Allow-/Deny-Regeln. Seit Runde 5 (Teil E):
+  `allow|deny <tool> [muster] [--session|--project|--user]` (`--user` =
+  `--global`; Muster als `match` für Shell bzw. `path` für Dateien),
+  `rules` (Regeln mit Herkunft), `rm <nr>` (Kurzform von `remove`) und
+  `log [anzahl]` (letzte Auto-Modus-Entscheidungen samt Stand des
+  Sicherheitsdeckels). Reihenfolge der Prüfung: `ALWAYS_ASK_TOOLS` vorn,
+  dann Deny vor Allow vor Klassifizierer; Deny-Regeln gelten auch in `ask`.
+  Allow-Regeln für ein Werkzeug aus `ALWAYS_ASK_TOOLS` werden abgelehnt.
+- **`/agent`** — Agentenbaum mit Live-Werten (Wurzel „UIA · <name>“),
+  `list`, `stop`, `budget`, `use`. Seit Runde 5 fängt die TUI lokal ab:
+  `stream <orchestrators|all|none>` (Live-Stream der Kinder im Verlauf,
+  Teil I), `bg` (Hintergrund-Agenten mit Fortschritt) und `cancel <id>`
+  (eigenen Hintergrund-Agenten abbrechen, Teil K). Den früheren TUI-Befehl
+  `/agents` gibt es nicht mehr.
 - **`/effort`** — setzt die providerneutrale Reasoning-Stärke für nachfolgende
   Turns, live, für die laufende Sitzung; operator-only, TUI-only, kein
   Modell-Tool. Grammatik: `show | clear | minimal | low | medium | high |
@@ -552,7 +578,7 @@ Unterbefehl dieser beiden Operationen ist sofort verfügbar, siehe §2.6.3.
 
 ### 2.6.3 Busy-Verfügbarkeit während eines laufenden Turns
 
-Stand Runde 4, Teil H (`harw-operations/src/operation.rs`,
+Stand Runde 5 (Einstufung aus Runde 4, Teil H; `harw-operations/src/operation.rs`,
 `harw-tui/src/command_exec.rs`, `harw-tui/src/app.rs`,
 `harw-tui/src/app/busy_queue.rs`).
 
@@ -578,7 +604,7 @@ z. B. `busy_subcommands = "show=immediate, list=immediate, -=immediate"`
 
 | Klasse | Befehle |
 |---|---|
-| `Immediate` | `/help` `/status` `/ps` `/usage` `/diff` `/work` `/review` `/approve` `/deny` `/cancel` `/stop` `/agent` `/models` `/attach` `/sandbox-lease` `/provider-concurrency`; `/provider` (außer `test`); `/plugins` (außer `install`/`activate`/`uninstall`); lesende Formen: `/permissions` bare/`show`/`mode`/`set`, `/skills` bare/`list`/`show`, `/workbench` bare/`show`, `/diary` bare/`show`/`today`/`search`, `/palace` bare/`list`/`show`/`search`, `/matrix show`/`list`, `/model show`/`list`, `/effort`/`/mode`/`/uia-*` bare bzw. `show`/`list`; bei aktivem Planungs-Gate `/plan` bare/`inspect`/`ready`/`waves` und `/goal` bare/`show`/`check`. TUI-lokal: `/keys` `/whoami` `/verbose` `/agents` `/rename` |
+| `Immediate` | `/help` `/status` `/ps` `/usage` `/diff` `/work` `/review` `/approve` `/deny` `/cancel` `/stop` `/agent` `/models` `/attach` `/sandbox-lease` `/provider-concurrency`; `/provider` (außer `test`); `/plugins` (außer `install`/`activate`/`uninstall`); lesende Formen: `/permissions` bare/`show`/`mode`/`set`, `/skills` bare/`list`/`show`, `/workbench` bare/`show`, `/diary` bare/`show`/`today`/`search`, `/palace` bare/`list`/`show`/`search`, `/matrix show`/`list`, `/model show`/`list`, `/effort`/`/mode`/`/uia-*` bare bzw. `show`/`list`; `/permissions rules`/`log`; bei aktivem Planungs-Gate `/plan` bare/`inspect`/`ready`/`waves`/`list` und `/goal` bare/`show`/`check`; ohne Plan-Operation die lokale `/plan`-Ersatzspezifikation. TUI-lokal: `/keys` `/whoami` `/verbose` `/rename` `/btw`, `/agent stream`/`bg`/`cancel` |
 | `Staged` | `/model` (bare mit Picker und `switch <id>`), `/effort`, `/mode`, `/uia-model`, `/uia-worker-model`, `/uia-provider`, `/uia-effort` — jeweils die ändernden Formen |
 | `DeferredUntilTurnEnd` | `/compact` `/tools` `/new` `/resume` `/sessions` `/clear` `/quit` `/exit` `/export` `/add-workdir` `/retry` `/memory` `/learn` `/context-proposal` `/bug-report`; `/provider test`; `/permissions allow`/`deny`/`remove`; `/matrix` außer `show`/`list`; `/research*`, `/explore`, `/analyze`; alle schreibenden Unterbefehle von `/workbench`, `/kanban`, `/diary`, `/palace`, `/dream` |
 
@@ -640,9 +666,16 @@ Nachrichten mehr.
   Freigabe- oder Host-Permit-Dialog offen ist. Bis Runde 3 verwarf Ctrl+C
   die Warteschlange.
 - **Esc:** schließt zuerst ein offenes Popup bzw. Overlay und lässt den
-  Composer-Text stehen. Ist nichts offen und läuft ein Turn, unterbricht Esc
+  Composer-Text stehen; eine wartende `/btw`-Nebenfrage bricht Esc als
+  Erstes ab. Ist nichts offen und läuft ein Turn, unterbricht Esc
   ihn wie ein erster Ctrl+C-Druck, scharft aber **kein** Beenden — Esc
   schließt nie die App.
+- **Esc mit laufenden Kindern (Runde 5, Teil O):** Laufen synchrone
+  Kind-Agenten, zeigt das erste Esc nur „Esc bricht den Turn und N laufende
+  Agenten ab – nochmal Esc zum Bestätigen“; erst das zweite Esc bricht ab.
+  Hintergrund-Agenten und bereits beendete Kinder zählen nicht mit. Ohne
+  Kinder bricht Esc wie bisher sofort ab. `Enter` reiht während eines Turns
+  nur ein und bricht nie ab.
 - **Modellaufruf:** `harw-core/src/turn_loop.rs` racet den Modellaufruf
   gegen `CancelToken::cancelled()` (`tokio::select!`, `biased`); ein Treffer
   **und** ein `Err(ModelError::Cancelled)` aus dem Provider (racet dort

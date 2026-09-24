@@ -421,6 +421,17 @@ impl TelegramCommandHandler {
         let known = name
             .as_deref()
             .and_then(|name| HANDLED_COMMANDS.iter().find(|spec| spec.name == name));
+        // Runde 5, Teil L: TUI-eigene Befehle (`/btw`) bekommen unabhängig
+        // von der Fallback-Einstellung eine klare Absage.
+        if let Some(reply) = name.as_deref().and_then(tui_only_reply) {
+            match reply_target(event) {
+                Some(target) => self.reply(key, &target, reply),
+                None => {
+                    tracing::warn!(channel = %key.channel, peer = %key.peer, "Telegram peer is not a numeric chat id");
+                }
+            }
+            return CommandDisposition::Handled;
+        }
         let reply = match (known, self.unknown_command_fallback) {
             (Some(spec), _) => format!("Ungültige Angaben. Verwendung: {}", spec.usage),
             (None, UnknownCommandFallback::ReplyHelp) => {
@@ -644,6 +655,19 @@ fn command_name(text: &str) -> Option<String> {
     let name = token.strip_prefix('/')?;
     let name = name.split_once('@').map_or(name, |(name, _)| name);
     Some(name.to_ascii_lowercase())
+}
+
+/// Absage für Befehle, die es nur in der TUI gibt (Runde 5, Teil L).
+///
+/// # Rückgabe
+/// `Some(antwort)` für einen TUI-eigenen Befehl (derzeit `/btw`), sonst
+/// `None`.
+fn tui_only_reply(name: &str) -> Option<String> {
+    (name == "btw").then(|| {
+        "/btw ist nur in der TUI verfügbar (Nebenfrage während der Agent arbeitet). \
+         Hier einfach normal fragen."
+            .to_owned()
+    })
 }
 
 /// Die Freigabe-Aufforderung eines frisch angelegten Arbeitsauftrags. Der
@@ -1076,6 +1100,25 @@ mod tests {
         assert_eq!(run(&help, "100", "/pair ABCD"), CommandDisposition::Handled);
         assert_eq!(run(&help, "100", "/pair"), CommandDisposition::Handled);
         assert_eq!(help.outbound.messages().len(), before);
+        Ok(())
+    }
+
+    /// Runde 5, Teil L: `/btw` gibt es nur in der TUI — klare Absage, auch
+    /// bei `PassThrough`/`Ignore`.
+    #[test]
+    fn btw_is_rejected_as_tui_only() -> TestResult {
+        for fallback in [
+            UnknownCommandFallback::ReplyHelp,
+            UnknownCommandFallback::PassThrough,
+            UnknownCommandFallback::Ignore,
+        ] {
+            let fixture = fixture(fallback, None, false)?;
+            assert_eq!(
+                run(&fixture, "100", "/btw was macht der Agent?"),
+                CommandDisposition::Handled
+            );
+            assert!(last_message(&fixture)?.contains("nur in der TUI"));
+        }
         Ok(())
     }
 

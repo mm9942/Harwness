@@ -439,9 +439,12 @@ fn table_to_rule(table: &Table) -> RuleToml {
             .and_then(Item::as_str)
             .unwrap_or_default()
             .to_owned(),
-        pattern: table
-            .get("pattern")
-            .and_then(Item::as_str)
+        // Runde 5, Teil E: `match`/`path` sind Aliasse von `pattern`
+        // (siehe `RuleToml::pattern`), damit Dubletten- und Entfernen-Suche
+        // handgeschriebene Regeln ebenfalls erkennt.
+        pattern: ["pattern", "match", "path"]
+            .iter()
+            .find_map(|key| table.get(key).and_then(Item::as_str))
             .map(str::to_owned),
     }
 }

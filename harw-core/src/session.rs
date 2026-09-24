@@ -2628,6 +2628,48 @@ forbidden = [{forbidden}]
         Ok(())
     }
 
+    /// Runde 5, Teil F: im Plan-Modus ist `plan.write` das einzige
+    /// Schreibwerkzeug; `plan.exit`/`ask_user` sind sichtbar, alles
+    /// Schreibende und Ausführende ist abgeschaltet.
+    #[test]
+    fn test_set_mode_plan_enables_only_the_plan_file_writer() -> TestResult {
+        let mut session = session_with_permissions(&[
+            Permission::ReadWorkspace,
+            Permission::WriteWorkspace,
+            Permission::ExecuteProcess,
+            Permission::NetworkAccess,
+        ])?;
+        session.set_mode(InteractionMode::Plan);
+        let enabled = |name: &str| session.activation().is_tool_enabled(&ToolName::new(name));
+        for allowed in ["plan.write", "plan.exit", "ask_user", "fs.read", "explore"] {
+            assert!(
+                enabled(allowed),
+                "{allowed} muss im Plan-Modus sichtbar sein"
+            );
+        }
+        for denied in [
+            "fs.write",
+            "fs.edit",
+            "shell.exec",
+            "host.sudo_exec",
+            "process.kill",
+            "plan.enter",
+        ] {
+            assert!(
+                !enabled(denied),
+                "{denied} muss im Plan-Modus gesperrt sein"
+            );
+        }
+        session.set_mode(InteractionMode::Work);
+        assert!(
+            session
+                .activation()
+                .is_tool_enabled(&ToolName::new("fs.write")),
+            "das Verlassen des Plan-Modus stellt die Schreibwerkzeuge wieder her"
+        );
+        Ok(())
+    }
+
     #[test]
     fn test_set_mode_work_restores_the_base_and_invents_nothing() -> TestResult {
         // Der Schnitt läuft immer von der Basis-Sandbox aus: reversibel nach

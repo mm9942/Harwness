@@ -13,7 +13,9 @@
 //! - `/palace list` → `{"nodes":[{"id","title","status","links","updated"}]}`,
 //!   `/palace show <id>` → `{"node":{…,"tags","backlinks","body"}}`,
 //!   `/palace search <text>` → `{"query","truncated","hits":[{"id","title",
-//!   "status","score","hop_path"}]}`
+//!   "status","score","hop_path"}]}`,
+//!   `/memory topics` → `{"topics":[{"slug","title","status","origin"}]}`
+//!   (vorläufige Themen, Runde 5 Teil C)
 //! - `/dream list` → `{"reports":[{"id","date","proposals","suggestions"?}]}`,
 //!   `/dream show <id>` → `{"report":{"id","date","body","proposals",
 //!   "suggestions"?:[{"id","kind","target","text","status"}]}}`
@@ -38,6 +40,9 @@
 //!   fragt nach und belegt dann `/palace supersede <alt> <neu> --confirm`
 //!   vor; `p` belegt `/palace promote` vor (auf einem `topic/…`-Link nach
 //!   Rückfrage mit dem Thema), `e` belegt `/palace edit <id> ` vor.
+//!   `T` listet die vorläufigen Themen (`/memory topics`); dort belegt `p`
+//!   auf dem gewählten Thema nach Rückfrage `/palace promote topic/<slug>`
+//!   vor, `/` filtert lokal, `T`/`Esc` kehrt zur Knotenliste zurück.
 //! - Träume: `Tab` wählt einen Vorschlag, `a` nimmt ihn nach Rückfrage an
 //!   (`/dream review <id> accept <p-id>`), `r` lehnt ihn ab
 //!   (`/dream review <id> reject <p-id>`), `n` belegt `/dream run` vor.
@@ -71,6 +76,8 @@ pub(crate) const PALACE_SHOW_COMMAND: &str = "/palace show";
 pub(crate) const PALACE_SEARCH_COMMAND: &str = "/palace search";
 /// Vorbelegung für eine Themen-Promotion.
 pub(crate) const PALACE_PROMOTE_PREFILL: &str = "/palace promote ";
+/// Listet die vorläufigen Themen (Promote-Kandidaten, Runde 5 Teil C).
+pub(crate) const MEMORY_TOPICS_COMMAND: &str = "/memory topics";
 /// Listet die Traumberichte.
 pub(crate) const DREAM_LIST_COMMAND: &str = "/dream list";
 /// Lädt einen Traumbericht (`<cmd> <id>`).
@@ -339,6 +346,9 @@ pub(crate) struct KnowledgeBrowser {
     palace_hits_fresh: bool,
     /// Palast: zum Ersetzen markierter Knoten.
     supersede_from: Option<String>,
+    /// Palast: Themenmodus (`T`) — die Liste zeigt die vorläufigen Themen
+    /// aus `/memory topics` statt der Knoten (Runde 5, Teil C).
+    palace_topics: bool,
     /// Palast: zuvor besuchte Knoten (Esc geht zurück).
     trail: Vec<String>,
     /// Palast: das nächste Detail kommt aus einem gefolgten Link.
@@ -369,6 +379,7 @@ impl KnowledgeBrowser {
             palace_truncated: false,
             palace_hits_fresh: false,
             supersede_from: None,
+            palace_topics: false,
             trail: Vec::new(),
             following: false,
             list_stale: false,
@@ -501,6 +512,56 @@ impl KnowledgeBrowser {
         })
     }
 
+    /// Ein vorläufiges Thema aus `/memory topics`
+    /// (`{"slug","title","status","origin"}`); Id ist `topic/<slug>`. Der
+    /// Volltext (Titel, Herkunft) entsteht lokal für die Detailansicht.
+    fn parse_topic_item(value: &Value) -> Option<KnowledgeItem> {
+        let slug = str_field(value, "slug");
+        if !is_token(&slug) || slug.contains('/') {
+            return None;
+        }
+        let id = format!("topic/{slug}");
+        let title = opt_str_field(value, "title").unwrap_or_else(|| slug.clone());
+        let origin = value.get("origin").filter(|origin| origin.is_object());
+        let meta = origin
+            .map(|origin| {
+                let kind = str_field(origin, "kind");
+                let source = str_field(origin, "id");
+                match (kind.is_empty(), source.is_empty()) {
+                    (false, false) => format!("aus {kind} {source}"),
+                    (false, true) => format!("aus {kind}"),
+                    (true, false) => format!("aus {source}"),
+                    (true, true) => String::new(),
+                }
+            })
+            .unwrap_or_default();
+        let mut body = format!("{title}\n\nId: {id}");
+        if let Some(origin) = origin {
+            let detail = str_field(origin, "detail");
+            let at = str_field(origin, "at");
+            if !meta.is_empty() {
+                body.push_str(&format!("\nHerkunft: {meta}"));
+            }
+            if !detail.is_empty() {
+                body.push_str(&format!("\nBereich: {detail}"));
+            }
+            if !at.is_empty() {
+                body.push_str(&format!("\nErfasst: {at}"));
+            }
+        }
+        body.push_str("\n\np übernimmt das Thema nach Rückfrage in den Palast.");
+        Some(KnowledgeItem {
+            id,
+            title,
+            meta,
+            status: Some(
+                opt_str_field(value, "status").unwrap_or_else(|| "provisional".to_owned()),
+            ),
+            body: Some(body),
+            ..KnowledgeItem::default()
+        })
+    }
+
     /// Übernimmt Treffer von `/palace search`, sofern sie zur aktiven Suche
     /// passen (verspätete Antworten werden verworfen).
     fn apply_palace_hits(&mut self, data: &Value) {
@@ -583,6 +644,24 @@ impl KnowledgeBrowser {
     }
 
     fn apply_list(&mut self, data: &Value) {
+        // Runde 5, Teil C: Themenmodus. Themen gelten nur im Themenmodus,
+        // verspätete Knoten-/Trefferlisten überschreiben ihn nicht.
+        if self.kind == KnowledgeKind::Palace {
+            if let Some(topics) = data.get("topics").and_then(Value::as_array) {
+                if self.palace_topics {
+                    let items = topics
+                        .iter()
+                        .filter(|value| value.is_object())
+                        .filter_map(Self::parse_topic_item)
+                        .collect();
+                    self.replace_items(items);
+                }
+                return;
+            }
+            if self.palace_topics {
+                return;
+            }
+        }
         if self.kind == KnowledgeKind::Palace && data.get("hits").is_some_and(Value::is_array) {
             return self.apply_palace_hits(data);
         }
@@ -811,7 +890,10 @@ impl KnowledgeBrowser {
             return OverlayOutcome::Stay;
         };
         self.scroll = 0;
-        match (self.kind.show_command(), item.body) {
+        // Runde 5, Teil C: ein Thema hat (noch) keinen Palast-Knoten — das
+        // Detail entsteht lokal.
+        let show_command = self.kind.show_command().filter(|_| !self.palace_topics);
+        match (show_command, item.body) {
             (Some(command), _) if is_token(&item.id) => {
                 self.detail_pending = true;
                 self.trail.clear();
@@ -820,7 +902,13 @@ impl KnowledgeBrowser {
             (_, Some(body)) => {
                 self.pick = 0;
                 self.detail = Some(KnowledgeDetail {
-                    title: item.meta,
+                    // Runde 5, Teil C: ein Thema zeigt seinen Titel.
+                    title: if self.palace_topics {
+                        item.title
+                    } else {
+                        item.meta
+                    },
+                    status: item.status.filter(|_| self.palace_topics),
                     body,
                     ..KnowledgeDetail::default()
                 });
@@ -860,6 +948,7 @@ impl KnowledgeBrowser {
     fn list_refresh(&self) -> String {
         match self.kind {
             KnowledgeKind::Diary => self.diary.command(),
+            KnowledgeKind::Palace if self.palace_topics => MEMORY_TOPICS_COMMAND.to_owned(),
             KnowledgeKind::Palace => match &self.palace_query {
                 Some(query) => format!("{PALACE_SEARCH_COMMAND} {query}"),
                 None => PALACE_LIST_COMMAND.to_owned(),
@@ -953,6 +1042,22 @@ impl KnowledgeBrowser {
     }
 
     fn promote(&mut self) -> OverlayOutcome {
+        // Runde 5, Teil C: im Themenmodus das gewählte vorläufige Thema.
+        if self.palace_topics {
+            let Some(topic) = self
+                .selected_item()
+                .map(|item| item.id.clone())
+                .filter(|id| id.strip_prefix("topic/").is_some_and(is_token))
+            else {
+                self.notice = Some("Kein Thema gewählt.".to_owned());
+                return OverlayOutcome::Stay;
+            };
+            self.confirm = Some(Confirm {
+                question: format!("Thema {topic} in den Palast promoten (established)?"),
+                outcome: OverlayOutcome::Prefill(format!("{PALACE_PROMOTE_PREFILL}{topic}")),
+            });
+            return OverlayOutcome::Stay;
+        }
         if let Some(link) = self.selected_link()
             && let Some(slug) = link.target.strip_prefix("topic/")
             && is_token(slug)
@@ -965,6 +1070,21 @@ impl KnowledgeBrowser {
             return OverlayOutcome::Stay;
         }
         OverlayOutcome::Prefill(PALACE_PROMOTE_PREFILL.to_owned())
+    }
+
+    /// Wechselt zwischen Knotenliste und vorläufigen Themen (`T`, Runde 5
+    /// Teil C) und lädt die neue Liste.
+    fn toggle_topics(&mut self) -> OverlayOutcome {
+        self.palace_topics = !self.palace_topics;
+        self.palace_query = None;
+        self.palace_truncated = false;
+        self.palace_hits_fresh = false;
+        self.supersede_from = None;
+        self.filter = None;
+        self.items.clear();
+        self.loaded = false;
+        self.selected = 0;
+        OverlayOutcome::Fetch(self.list_refresh())
     }
 
     // ── Traum-Aktionen ──────────────────────────────────────────────────
@@ -1156,6 +1276,12 @@ impl KnowledgeBrowser {
     fn submit_input(&mut self, input: Input) -> OverlayOutcome {
         let text = normalize(&input.buffer);
         match input.kind {
+            InputKind::Filter if self.palace_topics => {
+                // Runde 5, Teil C: im Themenmodus bleibt der Filter lokal.
+                self.filter = Some(text).filter(|text| !text.is_empty());
+                self.clamp_selection();
+                OverlayOutcome::Stay
+            }
             InputKind::Filter => {
                 // Enter sucht über `/palace search`; der Live-Filter war nur
                 // die Vorschau über die geladene Liste.
@@ -1214,6 +1340,9 @@ impl KnowledgeBrowser {
         if self.kind == KnowledgeKind::Diary && !self.diary.header.is_empty() {
             title.push_str(&format!(" · {}", sanitize_inline(&self.diary.header)));
         }
+        if self.kind == KnowledgeKind::Palace && self.detail.is_none() && self.palace_topics {
+            title.push_str(" · vorläufige Themen");
+        }
         if self.kind == KnowledgeKind::Palace
             && self.detail.is_none()
             && let Some(query) = &self.palace_query
@@ -1248,16 +1377,23 @@ impl KnowledgeBrowser {
         if let Some(input) = &self.input {
             return match input.kind {
                 InputKind::Agent => "Enter übernehmen · Tab bekannter Agent · Esc abbrechen",
+                InputKind::Filter if self.palace_topics => "Enter filtern · Esc Filter löschen",
                 InputKind::Filter => "Enter /palace search · Esc Filter löschen",
                 InputKind::Search => "Enter suchen · Esc abbrechen",
             };
         }
         match (self.kind, self.detail.is_some()) {
+            (KnowledgeKind::Palace, true) if self.palace_topics => {
+                "p promoten · j/k scrollen · Esc zurück"
+            }
+            (KnowledgeKind::Palace, false) if self.palace_topics => {
+                "j/k · Enter anzeigen · p promoten · / filtern · T/Esc Knoten · R neu"
+            }
             (KnowledgeKind::Palace, true) => {
                 "Tab Link · Enter folgen · s ersetzen · p promoten · e bearbeiten · Esc zurück"
             }
             (KnowledgeKind::Palace, false) => {
-                "j/k · Enter öffnen · / suchen · s ersetzen · p promoten · R neu · Esc"
+                "j/k · Enter öffnen · / suchen · T Themen · s ersetzen · p promoten · R neu · Esc"
             }
             (KnowledgeKind::Dream, true) => {
                 "Tab Vorschlag · a annehmen · r ablehnen · j/k scrollen · R neu · Esc zurück"
@@ -1315,7 +1451,9 @@ impl KnowledgeBrowser {
         let mut lines: Vec<Line<'static>> = Vec::new();
         let visible = self.visible();
         if visible.is_empty() {
-            let text = if self.items.is_empty() {
+            let text = if self.items.is_empty() && self.palace_topics {
+                "Keine vorläufigen Themen."
+            } else if self.items.is_empty() {
                 self.kind.empty_text()
             } else {
                 "Kein Eintrag passt zum Filter."
@@ -1535,6 +1673,9 @@ impl OverlayView for KnowledgeBrowser {
                     self.palace_truncated = false;
                     self.selected = 0;
                     OverlayOutcome::Fetch(PALACE_LIST_COMMAND.to_owned())
+                } else if self.palace_topics {
+                    // Runde 5, Teil C: Themenmodus verlassen.
+                    self.toggle_topics()
                 } else {
                     OverlayOutcome::Close
                 }
@@ -1576,6 +1717,11 @@ impl OverlayView for KnowledgeBrowser {
                 });
                 OverlayOutcome::Stay
             }
+            (KnowledgeKind::Palace, KeyCode::Char('T')) if !in_detail => self.toggle_topics(),
+            (KnowledgeKind::Palace, KeyCode::Char('s' | 'e')) if self.palace_topics => {
+                self.notice = Some("Themen: nur p (promoten).".to_owned());
+                OverlayOutcome::Stay
+            }
             (KnowledgeKind::Palace, KeyCode::Char('s')) => self.supersede(),
             (KnowledgeKind::Palace, KeyCode::Char('p')) => self.promote(),
             (KnowledgeKind::Palace, KeyCode::Char('e')) => match self.current_node() {
@@ -1589,7 +1735,7 @@ impl OverlayView for KnowledgeBrowser {
             }
             (_, KeyCode::Char('R')) => match self.refresh_command() {
                 Some(command) => {
-                    if in_detail && self.kind.show_command().is_some() {
+                    if in_detail && self.kind.show_command().is_some() && !self.palace_topics {
                         self.detail_pending = true;
                     }
                     OverlayOutcome::Fetch(command)
@@ -2016,6 +2162,113 @@ mod tests {
         view.on_key(key(KeyCode::Esc));
         assert!(view.filter.is_none());
         assert_eq!(view.visible().len(), 3);
+        Ok(())
+    }
+
+    fn memory_topics() -> Value {
+        json!({"topics": [
+            {"slug": "canary-regel", "title": "Canary-Regel", "status": "provisional",
+             "origin": {"kind": "fact", "id": "f-12", "detail": "project", "at": "2026-09-20T10:00:00Z"}},
+            {"slug": "deploy", "title": "Deploy", "status": "provisional", "origin": null},
+            {"slug": "böse id", "title": "Leerzeichen"},
+            {"title": "ohne slug"}
+        ]})
+    }
+
+    /// Runde 5, Teil C: `T` listet die vorläufigen Themen, `p` belegt nach
+    /// Rückfrage `/palace promote topic/<slug>` vor, verspätete Knotenlisten
+    /// überschreiben den Themenmodus nicht, `T`/`Esc` kehren zurück.
+    #[test]
+    fn palace_topics_list_and_promote_after_confirmation() -> TestResult {
+        let mut view = KnowledgeBrowser::new(KnowledgeKind::Palace);
+        view.apply_data(&palace_nodes());
+        // Themen ohne Themenmodus werden ignoriert.
+        view.apply_data(&memory_topics());
+        assert_eq!(view.items().len(), 3);
+        assert!(render_to_string(&view)?.contains("T Themen"));
+
+        assert_eq!(
+            fetch_text(view.on_key(key(KeyCode::Char('T')))).as_deref(),
+            Some(MEMORY_TOPICS_COMMAND)
+        );
+        assert_eq!(
+            view.refresh_command().as_deref(),
+            Some(MEMORY_TOPICS_COMMAND)
+        );
+        assert!(view.items().is_empty());
+        // Eine verspätete Knotenliste überschreibt den Themenmodus nicht.
+        view.apply_data(&palace_nodes());
+        assert!(view.items().is_empty());
+        view.apply_data(&memory_topics());
+        let ids: Vec<&str> = view.items().iter().map(|item| item.id.as_str()).collect();
+        assert_eq!(ids, vec!["topic/canary-regel", "topic/deploy"]);
+        assert_eq!(view.items()[0].meta, "aus fact f-12");
+        let out = render_to_string(&view)?;
+        assert!(out.contains("vorläufige Themen (2)"), "{out}");
+        assert!(out.contains("p promoten"), "{out}");
+
+        // s/e gelten nicht für Themen.
+        assert_eq!(view.on_key(key(KeyCode::Char('s'))), OverlayOutcome::Stay);
+        assert!(view.supersede_from.is_none());
+        assert_eq!(view.on_key(key(KeyCode::Char('e'))), OverlayOutcome::Stay);
+
+        // Enter zeigt das Thema lokal, ohne Nachladen.
+        assert_eq!(view.on_key(key(KeyCode::Enter)), OverlayOutcome::Stay);
+        let detail = view.detail().ok_or("topic detail")?;
+        assert_eq!(detail.title, "Canary-Regel");
+        assert!(
+            detail.body.contains("Erfasst: 2026-09-20T10:00:00Z"),
+            "{}",
+            detail.body
+        );
+        view.on_key(key(KeyCode::Esc));
+        assert!(view.detail().is_none());
+
+        // p fragt nach; n bricht ab, y belegt vor.
+        view.on_key(key(KeyCode::Char('j')));
+        assert_eq!(view.on_key(key(KeyCode::Char('p'))), OverlayOutcome::Stay);
+        assert!(render_to_string(&view)?.contains("topic/deploy in den Palast promoten"));
+        assert_eq!(view.on_key(key(KeyCode::Char('n'))), OverlayOutcome::Stay);
+        view.on_key(key(KeyCode::Char('p')));
+        assert_eq!(
+            view.on_key(key(KeyCode::Char('y'))),
+            OverlayOutcome::Prefill("/palace promote topic/deploy".to_owned())
+        );
+
+        // Der Filter bleibt im Themenmodus lokal.
+        view.on_key(key(KeyCode::Char('/')));
+        type_text(&mut view, "canary");
+        assert_eq!(view.on_key(key(KeyCode::Enter)), OverlayOutcome::Stay);
+        assert_eq!(view.visible().len(), 1);
+        assert!(view.palace_query.is_none());
+        view.on_key(key(KeyCode::Esc));
+        assert!(view.filter.is_none());
+
+        // Esc verlässt den Themenmodus und lädt die Knoten.
+        assert_eq!(
+            fetch_text(view.on_key(key(KeyCode::Esc))).as_deref(),
+            Some(PALACE_LIST_COMMAND)
+        );
+        assert!(!view.palace_topics);
+        view.apply_data(&palace_nodes());
+        assert_eq!(view.items().len(), 3);
+        // T hin und zurück.
+        view.on_key(key(KeyCode::Char('T')));
+        assert_eq!(
+            fetch_text(view.on_key(key(KeyCode::Char('T')))).as_deref(),
+            Some(PALACE_LIST_COMMAND)
+        );
+        Ok(())
+    }
+
+    /// Ohne Themen zeigt der Themenmodus einen eigenen Leertext.
+    #[test]
+    fn palace_topics_empty_state() -> TestResult {
+        let mut view = KnowledgeBrowser::new(KnowledgeKind::Palace);
+        view.on_key(key(KeyCode::Char('T')));
+        view.apply_data(&json!({"topics": []}));
+        assert!(render_to_string(&view)?.contains("Keine vorläufigen Themen."));
+        assert_eq!(view.on_key(key(KeyCode::Char('p'))), OverlayOutcome::Stay);
         Ok(())
     }
 

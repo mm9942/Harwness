@@ -54,6 +54,9 @@ harw-core = { path = "../harw-core" }
 # die Kontext-Anbindung (`OpContextPlanExt`) und der Controller aus der Bridge.
 harw-plan = { path = "../harw-plan" }
 harw-plan-bridge = { path = "../harw-plan-bridge" }
+# Runde 5, Teil P: Bestätigungskanal (`PlanConfirmChannel`) der `plan`-Operation
+# zum Freigabefenster der TUI. Kein Zyklus: harw-tool-plan hängt nicht an harw-ops.
+harw-tool-plan = { path = "../harw-tool-plan" }
 # Strukturierte Kind-Rückgaben: `explore`/`research_*` parsen und validieren
 # `ResearchFinding`, `analyze` legt sie über den FindingStore ab.
 harw-research = { path = "../harw-research" }

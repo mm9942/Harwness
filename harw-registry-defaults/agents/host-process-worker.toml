@@ -38,7 +38,9 @@ may_write_code = false
 may_research_web = false
 
 [tools]
-admitted = ["shell.exec"]
+# Runde 5, Teil B: `host.sudo_exec` (Root-Befehl mit exaktem argv, jede
+# Ausführung im TUI-Fenster freigegeben; nur in der TUI registriert).
+admitted = ["shell.exec", "host.sudo_exec"]
 forbidden = [
   "fs.read",
   "fs.search",
@@ -46,6 +48,7 @@ forbidden = [
   "fs.glob",
   "fs.grep",
   "fs.write",
+  "fs.edit",
   "web.fetch",
   "web.docs_rs",
   "web.crates_io",

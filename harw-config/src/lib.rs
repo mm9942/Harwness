@@ -5,6 +5,7 @@
 //! Das Laden und Mergen mehrerer Konfigurationsebenen geschieht über
 //! [`discovery::discover_config`].
 
+pub mod agent_limits;
 pub mod agent_toml;
 pub mod auth_toml;
 pub mod browser_toml;
@@ -28,10 +29,16 @@ pub mod provider_toml;
 pub mod research_toml;
 mod role_models;
 pub mod scope;
+// Runde 5, Teil N: `[shell] max_timeout_secs`.
+pub mod shell_limits;
 pub mod skill_toml;
+// Runde 5, Teil G: eigene Modellwahl je UIA-Worker-Rolle.
+pub mod uia_worker_models;
 pub mod web_toml;
 pub mod writer;
 
+// Runde 5, Teil K: `[agents]` — Orchestrierungsgrenzen.
+pub use agent_limits::{AgentLimitsToml, EffectiveAgentLimits};
 pub use agent_toml::{AgentSuggestionsToml, AgentToml};
 pub use auth_toml::{AuthConfig, CredentialEntry, KekConfig, KekProvenance, SecretRef};
 pub use browser_toml::BrowserSection;
@@ -48,13 +55,21 @@ pub use error::{ConfigError, ConfigResult};
 pub use harness_config::{
     CargoSandboxModeToml, CargoSandboxToml, DEFAULT_DIARY_RETENTION_DAYS,
     DEFAULT_DREAM_BUDGET_TOKENS, DEFAULT_DREAM_COOLDOWN_MINUTES, DEFAULT_DREAM_ENABLED,
-    DEFAULT_DREAM_IDLE_MINUTES, DiaryToml, DreamToml, HarnessConfig, KnowledgeToml, LoggingSection,
-    McpJobCapabilityToml, McpListenerSection, McpPrincipalToml, PolicySection, SandboxSection,
-    SessionSection, TmuxOperationModeToml, TmuxSandboxToml, TuiSection,
+    DEFAULT_DREAM_IDLE_MINUTES, DEFAULT_SUDO_SESSION_MINUTES, DiaryToml, DreamToml, HarnessConfig,
+    HostToml, KnowledgeToml, LoggingSection, MAX_SUDO_SESSION_MINUTES, McpJobCapabilityToml,
+    McpListenerSection, McpPrincipalToml, PolicySection, SandboxSection, SessionSection,
+    TmuxOperationModeToml, TmuxSandboxToml, TuiSection,
 };
+// Runde 5, Teil N: `[shell] max_timeout_secs`.
+pub use shell_limits::ShellToml;
+// Runde 5, Teil I: Live-Stream der Kind-Agenten (`[tui] child_stream`).
+pub use harness_config::ChildStreamModeToml;
+// Runde 5, Teil E: `ANTHROPIC_FAST_MODEL`/`fast_model_for_active_provider`
+// (Vorgabe-Modell des Auto-Modus-Klassifizierers).
 pub use internal_models::{
-    InternalModelChoice, InternalModelPoint, InternalModelSource, InternalModelsToml,
-    OPENROUTER_PROVIDER, ResolvedInternalModel, openrouter_available, resolve_internal_model,
+    ANTHROPIC_FAST_MODEL, InternalModelChoice, InternalModelPoint, InternalModelSource,
+    InternalModelsToml, OPENROUTER_PROVIDER, ResolvedInternalModel, fast_model_for_active_provider,
+    openrouter_available, resolve_internal_model,
 };
 pub use loader::{
     load_skill_instructions, load_system_prompt, load_uia_personalization, load_uia_user_name,
@@ -72,6 +87,11 @@ pub use research_toml::ResearchSection;
 pub use role_models::*;
 pub use scope::{FIELD_TABLE, FieldScope, MergeRule, Scope, SettingScope};
 pub use skill_toml::SkillToml;
+pub use uia_worker_models::{
+    FOLLOW_UIA_VALUE, ResolvedUiaWorkerModel, UIA_WORKER_ROLES, UiaWorkerModelChoice,
+    UiaWorkerModelSource, UiaWorkerModelsToml, catalog_provider_of, provider_is_logged_in,
+    resolve_uia_worker_model, resolve_uia_worker_models,
+};
 pub use web_toml::{WebSearchToml, WebSection};
 pub use writer::{ConfigWriter, RuleKind};
 

@@ -22,7 +22,13 @@
 //!   (1-basiert) aus dem geteilten [`AllowRuleSet`] und, sofern die Regel aus
 //!   `Project`/`Global` stammt, versucht sie zusätzlich aus der jeweiligen
 //!   Datei zu entfernen (bestes Bemühen — Tool **und** Muster müssen
-//!   übereinstimmen).
+//!   übereinstimmen). `rm <nr>` ist die Kurzform (Runde 5, Teil E).
+//! - `rules` — die Regeln mit Herkunft (Runde 5, Teil E).
+//! - `log [anzahl]` — die letzten Entscheidungen des Auto-Modus samt Stand
+//!   des Sicherheitsdeckels (Runde 5, Teil E).
+//!
+//! `--user` ist ein Alias von `--global`. Eine Allow-Regel für ein Werkzeug
+//! aus `ALWAYS_ASK_TOOLS` wird abgelehnt (Runde 5, Teil E).
 //!
 //! # Scopes und Speicherorte (Contract §2)
 //! - `Session`: nur die geteilten Zellen ([`ApprovalModeCell`],
@@ -47,6 +53,9 @@
 //! (genau wie `/mode` ohne `SessionController`, siehe dessen Moduldoku).
 //! [`ExtraRootsCell`] wird in `show` nur gelesen (die Mutation gehört
 //! `/add-workdir`, siehe `crate::add_workdir`).
+
+// Runde 5, Teil E: `rules`, `log` und die Allow-Sperre für `ALWAYS_ASK_TOOLS`.
+mod auto;
 
 use std::path::{Path, PathBuf};
 
@@ -140,7 +149,8 @@ fn parse_scope_flags(
         match token.as_str() {
             "--session" => set_scope_flag(&mut scope, SettingScope::Session)?,
             "--project" => set_scope_flag(&mut scope, SettingScope::Project)?,
-            "--global" => set_scope_flag(&mut scope, SettingScope::Global)?,
+            // Runde 5, Teil E: `--user` ist ein Alias von `--global`.
+            "--global" | "--user" => set_scope_flag(&mut scope, SettingScope::Global)?,
             "--yes" => confirmed = true,
             other => positional.push(other.to_owned()),
         }
@@ -376,7 +386,7 @@ fn mode_lines(active: ApprovalMode) -> String {
     command(
         path = "/permissions",
         visibility = "tui_only",
-        busy_subcommands = "-=immediate, show=immediate, mode=immediate, set=immediate"
+        busy_subcommands = "-=immediate, show=immediate, mode=immediate, set=immediate, rules=immediate, log=immediate"
     ),
     // Web-Fläche: `method = "post"`, seit Mutationen (`mode`, `allow`, `deny`,
     // `remove`) möglich sind. `approval = "always"`, weil genau dieser Aufruf
@@ -391,10 +401,14 @@ async fn permissions(ctx: &OpContext, args: PermissionsArgs) -> Result<OpOutput,
         "mode" | "set" => set_mode(ctx, &args.tail),
         "allow" => set_rule(ctx, RuleDecision::Allow, &args.tail),
         "deny" => set_rule(ctx, RuleDecision::Deny, &args.tail),
-        "remove" => remove_rule(ctx, &args.tail),
+        // Runde 5, Teil E: `rm` als Kurzform, `rules` (Liste mit Herkunft)
+        // und `log` (letzte Auto-Modus-Entscheidungen).
+        "remove" | "rm" => remove_rule(ctx, &args.tail),
+        "rules" => auto::list_rules(ctx),
+        "log" => auto::decision_log(ctx, &args.tail),
         other => Err(OpError::NotAvailable(format!(
             "/permissions {other}: unbekanntes Unterkommando — verfügbar sind show, mode, \
-             allow, deny, remove; die Sandbox-Rechte selbst sind unveränderlich"
+             allow, deny, rules, remove|rm, log; die Sandbox-Rechte selbst sind unveränderlich"
         ))),
     }
 }
@@ -475,8 +489,9 @@ fn show(ctx: &OpContext) -> Result<OpOutput, OpError> {
          Regeln:\n{rules_text}\n\n\
          Arbeitsverzeichnisse:\n{roots_text}\n\n\
          Umschalten mit `/permissions mode <{}> [--session|--project|--global]`; \
-         Regeln mit `/permissions allow|deny <tool> [muster] [--project|--global]` \
-         bzw. `/permissions remove <nr>`.",
+         Regeln mit `/permissions allow|deny <tool> [muster] [--session|--project|--user]`, \
+         `/permissions rules` bzw. `/permissions rm <nr>`; Auto-Modus-Entscheidungen \
+         mit `/permissions log`.",
         workspace.workspace(),
         workspace.tenant(),
         workspace.canonical_root().display(),
@@ -568,6 +583,11 @@ fn set_rule(ctx: &OpContext, decision: RuleDecision, tail: &[String]) -> Result<
         )));
     };
     let pattern = positional.get(1).cloned();
+    // Runde 5, Teil E: `ALWAYS_ASK_TOOLS` sind nie per Regel freigebbar —
+    // eine Allow-Regel wäre wirkungslos und täuschte Sicherheit vor.
+    if decision == RuleDecision::Allow {
+        auto::reject_always_ask_allow(&tool)?;
+    }
     let Some(rule_set) = ctx.service::<AllowRuleSet>() else {
         return Err(OpError::NotAvailable(NO_ALLOW_RULE_SET.to_owned()));
     };
@@ -1447,6 +1467,155 @@ mod tests {
         let result =
             super::remove_persisted_rule(&missing, RuleDecision::Allow, "shell.exec", None);
         assert!(!result.map_err(ctx("must not error"))?);
+        Ok(())
+    }
+
+    // ── Runde 5, Teil E: rules, rm, log, --user, ALWAYS_ASK-Sperre ───────────
+
+    fn args(cmd: &str, tail: &[&str]) -> PermissionsArgs {
+        PermissionsArgs {
+            cmd: Some(cmd.to_owned()),
+            tail: tail.iter().map(|token| (*token).to_owned()).collect(),
+        }
+    }
+
+    #[test]
+    fn test_parse_scope_flags_accepts_user_as_global() -> TestResult {
+        let (_, flags) = parse_scope_flags(&toks(&["x", "--user"]), SettingScope::Project)
+            .map_err(ctx("parse"))?;
+        assert_eq!(flags.scope, SettingScope::Global);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn permissions_rules_lists_rules_with_origin() -> TestResult {
+        let (ctx, _cell, rules) = test_context_with_all_cells(ApprovalMode::Delegated)?;
+        rules.add(ApprovalRule {
+            tool: "shell.exec".to_owned(),
+            pattern: Some("cargo test*".to_owned()),
+            decision: RuleDecision::Allow,
+            scope: RuleScope::Project,
+        });
+        rules.add(ApprovalRule {
+            tool: "fs.write".to_owned(),
+            pattern: Some("secrets/**".to_owned()),
+            decision: RuleDecision::Deny,
+            scope: RuleScope::Session,
+        });
+        let output = permissions(&ctx, args("rules", &[]))
+            .await
+            .map_err(crate::test_support::ctx("rules"))?;
+        assert!(
+            output.text.contains("1. ✓ shell.exec cargo test*"),
+            "{}",
+            output.text
+        );
+        assert!(output.text.contains("Herkunft: Projekt"), "{}", output.text);
+        assert!(
+            output.text.contains("2. ✗ fs.write secrets/**"),
+            "{}",
+            output.text
+        );
+        assert!(output.text.contains("Herkunft: Sitzung"), "{}", output.text);
+        assert!(output.text.contains("process.kill"), "{}", output.text);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn permissions_rm_is_an_alias_of_remove() -> TestResult {
+        let (ctx, _cell, rules) = test_context_with_all_cells(ApprovalMode::Delegated)?;
+        rules.add(ApprovalRule {
+            tool: "shell.exec".to_owned(),
+            pattern: None,
+            decision: RuleDecision::Allow,
+            scope: RuleScope::Session,
+        });
+        permissions(&ctx, args("rm", &["1"]))
+            .await
+            .map_err(crate::test_support::ctx("rm"))?;
+        assert!(rules.snapshot().is_empty());
+        Ok(())
+    }
+
+    /// Harte Regel: `ALWAYS_ASK_TOOLS` sind nie per Regel freigebbar.
+    #[tokio::test]
+    async fn permissions_allow_rejects_always_ask_tools() -> TestResult {
+        let (ctx, _cell, rules) = test_context_with_all_cells(ApprovalMode::Delegated)?;
+        for tool in harw_registry_defaults::ALWAYS_ASK_TOOLS {
+            let result = permissions(&ctx, args("allow", &[*tool, "--session"])).await;
+            assert!(
+                matches!(result, Err(OpError::InvalidArguments(_))),
+                "{tool}: {result:?}"
+            );
+        }
+        assert!(rules.snapshot().is_empty());
+        // Eine Deny-Regel bleibt erlaubt (sie schränkt nur ein).
+        permissions(&ctx, args("deny", &["process.kill", "--session"]))
+            .await
+            .map_err(crate::test_support::ctx("deny"))?;
+        assert_eq!(rules.snapshot().len(), 1);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn permissions_log_without_a_log_is_not_available() -> TestResult {
+        let (ctx, _cell, _rules) = test_context_with_all_cells(ApprovalMode::Delegated)?;
+        let result = permissions(&ctx, args("log", &[])).await;
+        assert!(
+            matches!(result, Err(OpError::NotAvailable(_))),
+            "{result:?}"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn permissions_log_lists_decisions_newest_first() -> TestResult {
+        use harw_extension_api::auto_mode::{
+            AutoDecision, AutoDecisionLog, AutoLogEntry, AutoVerdict, VerdictSource,
+        };
+        let base = test_context()?;
+        let log = AutoDecisionLog::new();
+        for (index, decision) in [AutoDecision::Allow, AutoDecision::Deny]
+            .into_iter()
+            .enumerate()
+        {
+            log.record(AutoLogEntry {
+                at: jiff::Timestamp::UNIX_EPOCH,
+                call_id: format!("call-{index}"),
+                tool: "shell.exec".to_owned(),
+                summary: format!("shell.exec: befehl-{index}"),
+                verdict: AutoVerdict::new(
+                    decision,
+                    "kategorie",
+                    "grund",
+                    VerdictSource::Classifier,
+                ),
+            });
+        }
+        let mut services = ServiceMap::new();
+        services.insert(log);
+        let ctx = OpContext::new(
+            base.session_id().clone(),
+            base.turn_id().clone(),
+            base.sandbox().clone(),
+            services,
+        );
+        let output = permissions(&ctx, args("log", &["5"]))
+            .await
+            .map_err(crate::test_support::ctx("log"))?;
+        let text = output.text;
+        assert!(text.contains("insgesamt 1/20"), "{text}");
+        let newest = text
+            .find("befehl-1")
+            .ok_or(TestError::Missing("befehl-1"))?;
+        let oldest = text
+            .find("befehl-0")
+            .ok_or(TestError::Missing("befehl-0"))?;
+        assert!(newest < oldest, "neueste zuerst:\n{text}");
+        assert!(matches!(
+            permissions(&ctx, args("log", &["0"])).await,
+            Err(OpError::InvalidArguments(_))
+        ));
         Ok(())
     }
 }

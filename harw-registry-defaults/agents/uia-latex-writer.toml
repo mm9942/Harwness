@@ -8,12 +8,13 @@
 #
 # ── Werkzeugoberflaeche (Nutzerentscheidung) ─────────────────────────────
 # `RegistryProfile::UiaLatexWriter` (`harw-registry-defaults/src/profile.rs`):
-# alle sechs fs.*-Werkzeuge (inklusive `fs.write`) plus `doc.read_pdf` plus
-# das typisierte `latex.build` (`harw_tool_shell::LatexToolProvider`) —
-# kein `shell.exec`, kein `process.*`, kein `web.*`, kein `deps.*`, kein
-# `explore.*`, kein `lens.ask`, kein `browser.*`. `fs.edit` gibt es in
-# `harw-tool-fs` (noch) nicht; kommt es hinzu, gehoert es in Profil und
-# `admitted`.
+# alle sieben fs.*-Werkzeuge (inklusive `fs.write` und `fs.edit`) plus
+# `doc.read_pdf` plus das typisierte `latex.build`
+# (`harw_tool_shell::LatexToolProvider`) — kein `shell.exec`, kein
+# `process.*`, kein `web.*`, kein `deps.*`, kein `explore.*`, kein
+# `lens.ask`, kein `browser.*`. `fs.edit` (Runde 5, Teil D) ersetzt gezielt
+# Text in vorhandenen Dateien, braucht wie `fs.write` `WriteWorkspace` und
+# laeuft durch die Freigabe.
 #
 # `latex.build` startet ausschliesslich `latexmk -norc -<engine>
 # -interaction=nonstopmode -halt-on-error -file-line-error
@@ -26,7 +27,7 @@
 #
 # Reducer `reduce_to_read_only` (`AuthorityReducer::ReadOnly`): die Rolle
 # reicht nie Netz, Registry-Quellcache, Schreib- oder Ausfuehrungsrecht
-# weiter. `fs.write` (`WriteWorkspace`) und `latex.build`
+# weiter. `fs.write`/`fs.edit` (`WriteWorkspace`) und `latex.build`
 # (`ExecuteProcess`) kommen wie bei `uia-writer`/`uia-shell-worker` allein
 # ueber die feste Profilzuweisung; jede Schreibung und jeder Build laeuft
 # durch die Freigabekette.
@@ -69,7 +70,12 @@ admitted = [
   "fs.grep",
   "doc.read_pdf",
   "fs.write",
+  "fs.edit",
   "latex.build",
+  # Runde 5, Teil M: Zwischenstand (info) oder Frage (question) an den direkten
+  # Elternteil; nur Text, keine Rechte (siehe
+  # `harw_registry_defaults::profile::parent_message_tools_for_role`).
+  "parent.message",
 ]
 forbidden = [
   "shell.exec",

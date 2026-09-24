@@ -2355,15 +2355,24 @@ fn seed_startup_goal(
     };
 
     if plan_store.current().is_err() {
-        plan_store
-            .apply(
-                PlanAction::Create {
-                    plan_id: PlanId::new(STARTUP_PLAN_ID),
-                    goal: statement.to_owned(),
-                },
-                CLI_ACTOR,
-            )
-            .map_err(|error| format!("Plan konnte nicht angelegt werden: {error}"))?;
+        let startup_id = PlanId::new(STARTUP_PLAN_ID);
+        // Runde 5: Nach `plan archive plan-cli` existiert der Start-Plan noch
+        // im Katalog — dann wieder aktivieren statt an `PlanExists` zu scheitern.
+        if plan_store.plan_by_id(&startup_id).is_ok() {
+            plan_store
+                .switch_plan(&startup_id, CLI_ACTOR)
+                .map_err(|error| format!("Plan konnte nicht aktiviert werden: {error}"))?;
+        } else {
+            plan_store
+                .apply(
+                    PlanAction::Create {
+                        plan_id: startup_id,
+                        goal: statement.to_owned(),
+                    },
+                    CLI_ACTOR,
+                )
+                .map_err(|error| format!("Plan konnte nicht angelegt werden: {error}"))?;
+        }
     }
 
     let plan = plan_store

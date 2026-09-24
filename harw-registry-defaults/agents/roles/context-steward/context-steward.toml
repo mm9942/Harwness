@@ -66,7 +66,7 @@ may_research_web = false
 # nur "nicht in admitted" (dieselbe Disziplin wie bei `intel-scout`).
 [tools]
 admitted = []
-forbidden = ["fs.write", "shell.exec", "web.fetch", "web.docs_rs", "web.crates_io"]
+forbidden = ["fs.write", "fs.edit", "shell.exec", "web.fetch", "web.docs_rs", "web.crates_io"]
 
 # Reine Aggregation ohne Kind-Agenten — dieselbe Begruendung wie bei
 # `intel-scout`: ein Korrelations-/Kurations-Join braucht keine Delegation.
