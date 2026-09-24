@@ -318,330 +318,35 @@ fn is_telegram_pairing_command(text: &str) -> bool {
 
 /// Runtime consumer registered by this gateway composition. It deliberately
 /// accepts only events already admitted by `TelegramChannel`.
+///
+/// Reihenfolge je Ereignis: `/pair` wird verworfen (gehört zum lokalen
+/// `harw connect`-Ablauf), geschlossene Befehle verarbeitet der
+/// [`TelegramCommandHandler`], alles andere (Text und/oder Anhänge) reiht
+/// der [`TelegramSessionDispatcher`] nicht blockierend in die FIFO des Chats
+/// ein. Der Consumer hält den Dispatcher am Leben: endet der Admission-Thread
+/// (Transport-Neustart), werden Worker und Sweeper mit ihm beendet.
 struct GatewayTelegramConsumer {
-    provider: Arc<dyn ModelProvider>,
-    transcript_root: PathBuf,
-    outbound: Arc<dyn TelegramOutbound>,
-    /// Durable `WorkRequest` lifecycle store for `/request /review /approve
-    /// /deny /cancel` (docs/design/telegram-sandbox-work-requests.md).
-    work_requests: Arc<WorkRequestStore>,
-    /// Authoritative workspace-alias resolver. See this crate's `run`/
-    /// `supervise` docs for why it is currently built with zero registered
-    /// workspaces (no `harw-config` workspace-registration surface exists
-    /// yet): every `/request` fails closed with `WorkspaceUnresolved` until
-    /// that follow-up config surface lands, rather than trusting an alias.
-    workspaces: Arc<harw_authority::WorkspaceRegistry>,
-}
-
-impl GatewayTelegramConsumer {
-    /// Handles one of the closed `/request /review /approve /deny /cancel`
-    /// commands (docs/design/telegram-sandbox-work-requests.md, "Typed
-    /// request boundary"). Only the parsed, already-validated command
-    /// arguments are used — never `event.text`/attachments/callback data
-    /// beyond what `parse_command` extracted, so this cannot select a
-    /// workspace or grant a permission on its own authority.
-    fn handle_work_request_command(
-        &self,
-        key: &SessionKey,
-        event: &InboundEvent,
-        command: harw_channel_telegram_transport::TelegramCommand,
-    ) {
-        use harw_channel_telegram_transport::TelegramCommand;
-
-        let Ok(chat_id) = event.peer.as_str().parse::<i64>() else {
-            tracing::warn!(channel = %key.channel, peer = %key.peer, "Telegram peer is not a numeric chat id");
-            return;
-        };
-        let thread_id = event
-            .thread
-            .as_ref()
-            .and_then(|thread| thread.as_str().parse::<i64>().ok());
-        // The requester is the acting human, never a group's `PeerId`
-        // (docs/design/channel-ingress-telegram.md §3.3).
-        let requester = event
-            .sender
-            .as_ref()
-            .map(|sender| PeerId::from_str(sender.id.clone()))
-            .unwrap_or_else(|| event.peer.clone());
-        let now = Timestamp::now();
-
-        let reply = match command {
-            TelegramCommand::Request {
-                workspace_alias,
-                role,
-                task,
-            } => self
-                .work_requests
-                .submit(
-                    &key.channel,
-                    &requester,
-                    &key.tenant,
-                    &workspace_alias,
-                    &role,
-                    &task,
-                    event.raw_event_id.as_deref().unwrap_or_default(),
-                    self.workspaces.as_ref(),
-                    now,
-                )
-                .map(|record| format!("Requested {} (state: requested)", record.work_id)),
-            TelegramCommand::Review { work_id } => {
-                self.work_requests.review(&WorkId::from_str(work_id), now)
-            }
-            TelegramCommand::Approve { work_id } => {
-                self.work_requests.approve(&WorkId::from_str(work_id), now)
-            }
-            TelegramCommand::Deny { work_id } => {
-                self.work_requests.deny(&WorkId::from_str(work_id), now)
-            }
-            TelegramCommand::Cancel { work_id } => {
-                self.work_requests.cancel(&WorkId::from_str(work_id), now)
-            }
-        };
-
-        let markdown = match reply {
-            Ok(message) => message,
-            Err(error) => {
-                tracing::warn!(channel = %key.channel, peer = %key.peer, error = %error, "Telegram work-request command failed");
-                format!("Anfrage fehlgeschlagen: {error}")
-            }
-        };
-        if let Err(error) = self.outbound.send(
-            chat_id,
-            thread_id,
-            &harw_channel::OutboundContent::Message { markdown },
-        ) {
-            tracing::error!(error = %error, "Telegram work-request reply delivery failed");
-        }
-    }
+    commands: TelegramCommandHandler,
+    sessions: TelegramSessionDispatcher,
 }
 
 impl AdmittedEventConsumer for GatewayTelegramConsumer {
     fn handle_admitted(&self, key: SessionKey, event: InboundEvent) {
-        let Some(text) = event.text.clone().filter(|text| !text.trim().is_empty()) else {
-            tracing::warn!(channel = %key.channel, peer = %key.peer, "Telegram event has no text runtime handoff");
-            return;
-        };
-        if is_telegram_pairing_command(&text) {
-            tracing::debug!(channel = %key.channel, peer = %key.peer, "Telegram pairing command consumed outside model runtime");
+        let text = event.text.clone().filter(|text| !text.trim().is_empty());
+        if text.is_none() && event.attachments.is_empty() {
+            tracing::warn!(channel = %key.channel, peer = %key.peer, "Telegram event has neither text nor attachments for runtime handoff");
             return;
         }
-        if let Some(command) = harw_channel_telegram_transport::parse_command(&text) {
-            self.handle_work_request_command(&key, &event, command);
-            return;
-        }
-        if !event.attachments.is_empty() {
-            tracing::warn!(channel = %key.channel, peer = %key.peer, "Telegram attachments have no governed runtime intake handoff");
-            return;
-        }
-        let Ok(chat_id) = event.peer.as_str().parse::<i64>() else {
-            tracing::warn!(channel = %key.channel, peer = %key.peer, "Telegram peer is not a numeric chat id");
-            return;
-        };
-        let thread_id = event
-            .thread
-            .as_ref()
-            .and_then(|thread| thread.as_str().parse::<i64>().ok());
-
-        let store = build_telegram_state_store(&self.transcript_root);
-        let (event_tx, _event_rx) = tokio::sync::mpsc::unbounded_channel();
-        let mut session = AgentSession::new(
-            AgentRole::Assistant,
-            None,
-            empty_extension_registry(),
-            event_tx,
-        );
-        let runtime = match tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-        {
-            Ok(runtime) => runtime,
-            Err(error) => {
-                tracing::error!(error = %error, "Telegram admitted-event runtime could not start");
+        if let Some(text) = text.as_deref() {
+            if is_telegram_pairing_command(text) {
+                tracing::debug!(channel = %key.channel, peer = %key.peer, "Telegram pairing command consumed outside model runtime");
                 return;
             }
-        };
-        let response = match runtime.block_on(run_turn(
-            &mut session,
-            self.provider.as_ref(),
-            &store,
-            TurnInput::user(text),
-        )) {
-            Ok(TurnOutcome::Completed) => last_assistant_text(&session),
-            Ok(outcome) => {
-                tracing::warn!(
-                    ?outcome,
-                    "Telegram turn did not complete; no outbound reply sent"
-                );
+            if self.commands.handle(&key, &event, text) == CommandDisposition::Handled {
                 return;
             }
-            Err(error) => {
-                tracing::error!(error = %error, "Telegram governed turn failed");
-                return;
-            }
-        };
-        drop(runtime);
-        if let Err(error) = self.outbound.send(
-            chat_id,
-            thread_id,
-            &harw_channel::OutboundContent::Message { markdown: response },
-        ) {
-            tracing::error!(error = %error, "Telegram typed outbound delivery failed");
         }
-    }
-}
-
-/// Kurzantwort (`answerCallbackQuery`), wenn eine Button-Entscheidung
-/// ausgeführt wurde; das eigentliche Ergebnis folgt als Chat-Nachricht.
-const CALLBACK_DONE_TEXT: &str = "Entscheidung übernommen";
-/// Kurzantwort für unbekannte, abgelaufene, bereits verwendete oder nicht zum
-/// Nachrichtenkontext passende Tokens. Unterscheidet die Ursachen bewusst
-/// nicht, damit ein Klickender den Token-Raum nicht abtasten kann.
-const CALLBACK_EXPIRED_TEXT: &str = "Schaltfläche ungültig oder abgelaufen";
-/// Kurzantwort, wenn der Klickende nicht gepinnt oder der Chat nicht
-/// gepairt ist; das Token wird dabei nicht verbraucht.
-const CALLBACK_UNAUTHORIZED_TEXT: &str = "Keine Berechtigung für diese Entscheidung";
-/// Kurzantwort, wenn die Entscheidung erkannt, aber nicht ausführbar war.
-const CALLBACK_FAILED_TEXT: &str = "Entscheidung fehlgeschlagen";
-
-/// Callback-Consumer dieser Gateway-Komposition für Inline-Button-Klicks
-/// (`callback_query`), installiert auf Long-Poll- **und** Webhook-Ingress.
-///
-/// # Description
-/// [`CallbackConsumer::handle_callback`] ist synchron, läuft aber im
-/// Long-Poll-Thread bzw. innerhalb eines asynchronen axum-Handlers. Er
-/// blockiert deshalb nie: der Callback wird nur an einen eigenen Worker-
-/// Thread ([`GatewayCallbackWorker`]) übergeben, der Token-Prüfung,
-/// Work-Request-Übergang, Chat-Antwort und `answerCallbackQuery` erledigt.
-/// Die Callback-Nutzlast (`data`) wird nie geloggt.
-struct GatewayCallbackConsumer {
-    callbacks: mpsc::Sender<TelegramCallback>,
-}
-
-impl CallbackConsumer for GatewayCallbackConsumer {
-    fn handle_callback(&self, callback: TelegramCallback) {
-        if self.callbacks.send(callback).is_err() {
-            tracing::warn!("Telegram callback worker is gone; callback dropped unanswered");
-        }
-    }
-}
-
-/// Worker-Seite von [`GatewayCallbackConsumer`]; läuft auf einem eigenen
-/// `std`-Thread und endet, sobald der Consumer (mit dem Transport)
-/// verworfen wird.
-struct GatewayCallbackWorker {
-    /// Klon des Admission-Adapters: teilt dessen Approval-Token-Store und
-    /// Pairing-Store, damit Callbacks gegen dieselbe Grenze geprüft werden
-    /// wie Text-Befehle.
-    adapter: TelegramChannel,
-    /// Derselbe Store wie für `/approve` und `/deny` als Text-Befehl.
-    work_requests: Arc<WorkRequestStore>,
-    outbound: Arc<dyn TelegramOutbound>,
-    bot_client: Arc<TelegramClient>,
-}
-
-impl GatewayCallbackWorker {
-    fn run(self, callbacks: mpsc::Receiver<TelegramCallback>) {
-        for callback in callbacks {
-            let notice = self.decide(&callback);
-            self.answer(&callback.callback_id, notice);
-        }
-    }
-
-    /// Prüft Absender, Pairing und Token-Kontext und führt eine erkannte
-    /// Entscheidung wie `/approve`/`/deny` aus. Liefert die Kurzantwort für
-    /// `answerCallbackQuery`.
-    ///
-    /// Button-Klicks durchlaufen nicht die Admission des Nachrichtenpfads;
-    /// deshalb werden hier dieselben Mindest-Gates vorgezogen (gepinnter
-    /// Absender, gepairter Chat), **bevor** das Einmal-Token verbraucht wird,
-    /// damit ein fremder Klick kein gültiges Token entwerten kann.
-    fn decide(&self, callback: &TelegramCallback) -> &'static str {
-        if !self
-            .adapter
-            .config()
-            .is_sender_identity_pinned(&callback.sender.id)
-        {
-            tracing::warn!("Telegram callback from an unpinned sender rejected");
-            return CALLBACK_UNAUTHORIZED_TEXT;
-        }
-        let peer = PeerId::from_str(callback.chat_id.to_string());
-        match self.adapter.resolve_tenant(&peer) {
-            Ok(Some(_)) => {}
-            Ok(None) => {
-                tracing::warn!("Telegram callback from an unpaired chat rejected");
-                return CALLBACK_UNAUTHORIZED_TEXT;
-            }
-            Err(error) => {
-                tracing::error!(error = %error, "Telegram callback pairing lookup failed");
-                return CALLBACK_FAILED_TEXT;
-            }
-        }
-        let mut context = ApprovalCallbackContext::new(
-            TelegramChatId(callback.chat_id),
-            TelegramMessageId(callback.message_id),
-            peer,
-        );
-        if let Some(thread_id) = callback.thread_id {
-            context = context.with_thread(TelegramThreadId(thread_id));
-        }
-        let Some(pending) = self
-            .adapter
-            .consume_approval_callback(&callback.data, &context)
-        else {
-            tracing::warn!("Telegram callback token is unknown, stale, or out of context");
-            return CALLBACK_EXPIRED_TEXT;
-        };
-        let work_id = WorkId::from_str(pending.request_id);
-        let now = Timestamp::now();
-        let reply = match pending.decision.as_str() {
-            "approve" => self.work_requests.approve(&work_id, now),
-            "deny" => self.work_requests.deny(&work_id, now),
-            _ => {
-                tracing::warn!("Telegram callback carried an unsupported approval decision");
-                return CALLBACK_FAILED_TEXT;
-            }
-        };
-        let (markdown, notice) = match reply {
-            Ok(message) => (message, CALLBACK_DONE_TEXT),
-            Err(error) => {
-                tracing::warn!(error = %error, "Telegram callback work-request decision failed");
-                (
-                    format!("Anfrage fehlgeschlagen: {error}"),
-                    CALLBACK_FAILED_TEXT,
-                )
-            }
-        };
-        if let Err(error) = self.outbound.send(
-            callback.chat_id,
-            callback.thread_id,
-            &harw_channel::OutboundContent::Message { markdown },
-        ) {
-            tracing::error!(error = %error, "Telegram callback decision reply delivery failed");
-        }
-        notice
-    }
-
-    /// Beantwortet die Query, damit der Ladeindikator beim Nutzer endet.
-    /// Eigene kurzlebige Runtime wie der synchrone Renderer-Pfad: dieser
-    /// Thread gehört keiner Tokio-Runtime.
-    fn answer(&self, callback_id: &str, text: &str) {
-        let runtime = match tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-        {
-            Ok(runtime) => runtime,
-            Err(error) => {
-                tracing::error!(error = %error, "Telegram callback answer runtime could not start");
-                return;
-            }
-        };
-        if let Err(error) = runtime.block_on(self.bot_client.answer_callback_query(
-            callback_id,
-            Some(text),
-            false,
-        )) {
-            tracing::warn!(error = %error, "Telegram callback query could not be answered");
-        }
+        self.sessions.dispatch(key, event);
     }
 }
 
@@ -1153,22 +858,6 @@ async fn supervise(
         dream: dream_provider,
     } = providers;
     let telegram_profile = roots.profile.clone();
-    // Authoritative workspace-alias resolver for Telegram `/request`
-    // (docs/design/telegram-sandbox-work-requests.md, "Typed request
-    // boundary"). Built with **zero** registrations: `harw-config` has no
-    // workspace-registration TOML surface yet (only `harw-cli/src/gateway.rs`
-    // is in this change's file scope, not that config schema), so every
-    // `/request` fails closed with `WorkspaceUnresolved` until a follow-up
-    // change adds registrations here. This is deliberate fail-closed
-    // behavior, not a bug: no alias can select a workspace it was never
-    // configured to resolve to.
-    let workspaces = Arc::new(
-        harw_authority::WorkspaceRegistry::build(
-            home,
-            std::iter::empty::<harw_authority::WorkspaceRegistration>(),
-        )
-        .map_err(|error| format!("gateway: workspace registry: {error}"))?,
-    );
     // Ein einziger `WorkRequestStore` für alle Bindungen: er serialisiert
     // seine Dateizugriffe nur über einen prozessinternen Mutex, zwei parallel
     // laufende Instanzen auf demselben Verzeichnis dürften sich also nicht
@@ -1198,6 +887,19 @@ async fn supervise(
                     tracing::error!(binding = %binding.id, "Telegram binding has no mounted runtime assembly; remains disabled (fail closed)");
                     continue;
                 };
+                // Arbeitsbereiche, Befehls-Fallback und Chat-Zustand je
+                // Bindung; ein Fehler schließt nur diese Bindung.
+                let services = match telegram_binding_services(
+                    home,
+                    &plan.binding,
+                    &telegram_profile,
+                ) {
+                    Ok(services) => services,
+                    Err(reason) => {
+                        tracing::warn!(binding = %binding.id, reason = %reason, "Telegram binding remains disabled (fail closed)");
+                        continue;
+                    }
+                };
                 if matches!(plan.transport, TelegramTransportPlan::Webhook(_)) {
                     webhook_teardowns.push(TelegramWebhookTeardown {
                         binding_id: binding.id.clone(),
@@ -1209,7 +911,7 @@ async fn supervise(
                     provider,
                     telegram_profile.clone(),
                     roots.sessions.clone(),
-                    Arc::clone(&workspaces),
+                    services,
                     Arc::clone(&work_requests),
                 )));
             }
@@ -1992,69 +1694,6 @@ async fn drive_telegram_bindings(mut tasks: Vec<TelegramBindingTask>) -> Infalli
         Poll::Pending
     })
     .await
-}
-
-/// Die Befehle, die dieser Gateway für **jeden** admittierten Peer
-/// tatsächlich verarbeitet (`GatewayTelegramConsumer`,
-/// `harw_channel_telegram_transport::parse_command`). `/pair` fehlt bewusst:
-/// es gehört zum lokalen `harw connect`-Ablauf und wird nie vom Gateway
-/// ausgeführt.
-fn telegram_gateway_commands() -> Vec<BotCommand> {
-    [
-        (
-            "request",
-            "Arbeitsauftrag anfragen: /request <workspace> <rolle> <aufgabe>",
-        ),
-        ("review", "Arbeitsauftrag prüfen: /review <work-id>"),
-        ("approve", "Arbeitsauftrag freigeben: /approve <work-id>"),
-        ("deny", "Arbeitsauftrag ablehnen: /deny <work-id>"),
-        ("cancel", "Arbeitsauftrag abbrechen: /cancel <work-id>"),
-    ]
-    .into_iter()
-    .map(|(command, description)| BotCommand {
-        command: command.to_owned(),
-        description: description.to_owned(),
-    })
-    .collect()
-}
-
-/// Leitet das Befehlsmenü aus `[channel.telegram.commands].menu_source` ab.
-///
-/// - `"policy_visible"` (Vorgabe): genau die Befehle, die jeder admittierte
-///   Peer über diesen Gateway ausführen kann ([`telegram_gateway_commands`]).
-///   Der Client kennt derzeit nur den Standard-Scope von `setMyCommands`;
-///   peer-relative Menüs je Sichtbarkeits-Scope brauchen einen Scope-Parameter
-///   im Transport (siehe Integrationsbedarf im Bericht) — bis dahin ist das
-///   Menü die für alle admittierten Peers gleiche, policy-sichtbare Menge.
-/// - `"none"`: kein Menü veröffentlichen (ein bestehendes bleibt unberührt).
-/// - sonst: `Err` mit einer Meldung ohne Geheimnisinhalt.
-fn telegram_menu_commands(menu_source: &str) -> Result<Option<Vec<BotCommand>>, String> {
-    match menu_source.trim() {
-        "policy_visible" => Ok(Some(telegram_gateway_commands())),
-        "none" => Ok(None),
-        other => Err(format!(
-            "unknown commands.menu_source {other:?} (expected policy_visible or none)"
-        )),
-    }
-}
-
-/// Veröffentlicht das Befehlsmenü einer Bindung (best effort: ein Fehler wird
-/// geloggt, schließt die Bindung aber nicht — das Menü ist reine Anzeige,
-/// die Autorisierung liegt in Admission und Befehlsverarbeitung).
-async fn publish_telegram_command_menu(binding: &TelegramChannelToml, client: &TelegramClient) {
-    match telegram_menu_commands(&binding.commands.menu_source) {
-        Ok(Some(commands)) => {
-            if let Err(error) = client.set_my_commands(&commands).await {
-                tracing::warn!(binding = %binding.id, error = %error, "Telegram command menu could not be published");
-            }
-        }
-        Ok(None) => {
-            tracing::debug!(binding = %binding.id, "Telegram command menu publication disabled by config");
-        }
-        Err(reason) => {
-            tracing::warn!(binding = %binding.id, reason = %reason, "Telegram command menu not published");
-        }
-    }
 }
 
 /// Offset-Verzeichnis des Long-Poll-Runners einer Bindung.
@@ -3685,42 +3324,6 @@ transport = "carrier_pigeon"
         assert!(!is_valid_telegram_webhook_secret(&"a".repeat(257)));
         assert!(!is_valid_telegram_webhook_secret("has space"));
         assert!(!is_valid_telegram_webhook_secret("umlaut-ä"));
-    }
-
-    #[test]
-    fn telegram_menu_lists_exactly_the_commands_the_gateway_handles() -> TestResult {
-        let commands = telegram_menu_commands("policy_visible")
-            .map_err(TestError::Unexpected)?
-            .ok_or(TestError::Missing("policy_visible publishes a menu"))?;
-        assert_eq!(commands.len(), 5);
-        for command in &commands {
-            assert!((1..=32).contains(&command.command.len()));
-            assert!(
-                command
-                    .command
-                    .bytes()
-                    .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'_')
-            );
-            assert!((3..=256).contains(&command.description.chars().count()));
-            let sample = if command.command == "request" {
-                "/request ws role task".to_owned()
-            } else {
-                format!("/{} w-1", command.command)
-            };
-            assert!(
-                harw_channel_telegram_transport::parse_command(&sample).is_some(),
-                "menu advertises /{} but the gateway does not handle it",
-                command.command
-            );
-        }
-        assert!(!commands.iter().any(|command| command.command == "pair"));
-        Ok(())
-    }
-
-    #[test]
-    fn telegram_menu_source_none_skips_and_unknown_is_reported() {
-        assert_eq!(telegram_menu_commands("none"), Ok(None));
-        assert!(telegram_menu_commands("bogus").is_err());
     }
 
     #[test]

@@ -1639,10 +1639,11 @@ impl ChatApp {
     /// # Argumente
     /// - `target` (`PickerTarget`): Umschalt-Kontext (siehe oben).
     pub(crate) fn open_model_switch_picker(&mut self, target: PickerTarget) {
-        let context_label = match &target {
-            PickerTarget::Orchestrator => "Modell-Auswahl",
-            PickerTarget::Uia => "UIA-Modell-Auswahl",
-            PickerTarget::UiaWorker { .. } => "UIA-Worker-Modell-Auswahl",
+        let context_label: String = match &target {
+            PickerTarget::Orchestrator => "Modell-Auswahl".to_owned(),
+            PickerTarget::Uia => "UIA-Modell-Auswahl".to_owned(),
+            PickerTarget::UiaWorker { .. } => "UIA-Worker-Modell-Auswahl".to_owned(),
+            PickerTarget::Role { .. } => target.context_label(),
         };
 
         let Some(config) = self.resolved_config() else {
@@ -1726,6 +1727,10 @@ impl ChatApp {
                 Some(fixed_provider.clone()),
                 config.harness.uia_worker_model.clone(),
             ),
+            PickerTarget::Role { role } => {
+                let row = harw_config::resolve_role_model(&config, *role);
+                (row.provider, row.model)
+            }
         };
 
         let Some(picker) = ModelSwitchPicker::new(
