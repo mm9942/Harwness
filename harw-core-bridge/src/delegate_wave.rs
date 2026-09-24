@@ -792,7 +792,12 @@ pub async fn delegate_wave(
         };
         payloads.push(match continuation {
             Some(Ok(seed)) => {
-                let task = continuation_task(&seed.of, &seed.handoff, Some(target.task.as_str()));
+                let task = continuation_task(
+                    &seed.of,
+                    &seed.end,
+                    &seed.handoff,
+                    Some(target.task.as_str()),
+                );
                 seeds[position] = Some(seed);
                 target.payload_with_task(&task, position, size)
             }

@@ -84,20 +84,26 @@ preselect it at program start or via a repeatable command line.
 **Direct request path (implemented):** the `sandbox-lease` model tool
 (`harw-ops/src/sandbox_lease.rs`, a `model_tool` with no extra approval
 step of its own — the confirmation dialog itself *is* the approval) offers
-actions `request`/`status`/`revoke` with a `reason` argument. A `request`
+actions `request`/`status` with a `reason` argument. `revoke` exists only
+for the user (see below); a model call with `action = "revoke"` is
+rejected. A `request`
 triggers a `HostPermitPrompt` in the local UI
 (`worker_definition = "sandbox-lease"`, `command = reason`, preselecting
 the session-lease variant) and waits up to 300 seconds for a decision:
 
-- **`SessionLease`** (`mark_global_approval`, TTL-bound): from confirmation
+- **`SessionLease`** (`mark_global_approval`, no expiry): from confirmation
   onward, every `shell.exec` call in this harw session **and all its child
   agents** runs on the host — no bubblewrap, with the user environment
   inherited from harw (including `PATH`, `HOME`, `CARGO_HOME`/`RUSTUP_HOME`),
   `cwd` at the workspace root, still under the existing `prlimit` limits;
-  tool output carries `"executed_on": "host"` to distinguish it. The
-  `/sandbox-lease revoke` slash command ends the lease immediately and
-  process-wide (see below); the next call then runs in the strict sandbox
-  again.
+  tool output carries `"executed_on": "host"` to distinguish it. The lease
+  stays active until **the user** ends it (user decision 2026-09-24):
+  `Ctrl+H` in the TUI (`ChatApp::end_host_mode`) or the typed
+  `/sandbox-lease revoke` slash command end it immediately and process-wide
+  (see below); the next call then runs in the strict sandbox again. There
+  is no time-based expiry — neither the registry grant nor the
+  `SessionLease` permits in the `ProcessPermitLedger` (issued with
+  `ttl = None`) expire — and the model cannot end the lease.
 - **`SingleExecution`** (`mark_global_single_use`): only the immediately
   next `shell.exec` call, from **any session of this process**, runs on the
   host; the strict default profile applies automatically afterward.
@@ -110,6 +116,16 @@ the same unchangeable local confirmation view that indirect classification
 the UI. `/sandbox-lease status`/`revoke` likewise activate nothing; they
 only read status or end an existing grant.
 
+**Only the user can revoke.** The `sandbox-lease` op serves both the
+command surface and the model-tool surface with one body. `revoke` is
+accepted only when the `OpContext` carries the `HostLeaseUserControl`
+marker (`harw-tool-shell`), which `RuntimeServices::service_map` places
+exclusively on `ServiceSurface::Slash` — the service map of a user-typed
+slash command. Model-tool, web and job contexts never carry it, and since
+it is a service rather than an argument, no tool argument can forge it.
+Without it, `revoke` fails with "only the user can end host mode (Ctrl+H
+or /sandbox-lease revoke)" and changes nothing.
+
 The lease wiring reaches child registries too (`build_registry`,
 `harw-runtime/src/children.rs`), not only the root — `uia-shell-worker` and
 `host-process-worker` can execute on the host under an active lease as
@@ -120,14 +136,14 @@ too, so the dialog is not limited to appearing only between turns.
 scoped to the single session that requested it: `shell.exec` calls from a
 child session (a different session ID, e.g. `uia-shell-worker`) are covered
 too, for the whole harw process (root session and all child agents), until
-TTL expiry or `/sandbox-lease revoke`. `HostPermitSessionRegistry`
+the user ends it with `Ctrl+H` or `/sandbox-lease revoke` (or the process
+exits — the state is in-memory only). `HostPermitSessionRegistry`
 (`harw-sandbox/src/host_permit_session.rs`) carries this as a *global*
-approval state (`mark_global_approval`/`global_approval_remaining`/
+approval state (`mark_global_approval`/`has_global_approval`/
 `mark_global_single_use`/`has_global_single_use`/`revoke_global_approval`),
-consulted by `is_session_approved`, `take_single_use`,
-`has_single_use` and `session_approval_remaining` in addition to any
-per-session grant (a global single-use grant is consumed atomically only
-after the per-session one). `/sandbox-lease request` sets only the global
+consulted by `is_session_approved`, `take_single_use` and
+`has_single_use` in addition to any per-session grant (a global
+single-use grant is consumed atomically only after the per-session one). `/sandbox-lease request` sets only the global
 grant; `revoke` clears both.
 
 The wiring reaches every constructed `ShellToolProvider`, not only ones
@@ -189,6 +205,62 @@ natural user intent
 
 The agent may surface uncertainty and ask for confirmation, but can never
 turn a misclassification into host execution itself.
+
+
+## Root commands (`host.sudo_exec`)
+
+sudo **is possible** in harw — through one dedicated tool, never through
+`shell.exec`. The short version the model should give the user: *"sudo
+works: I request the command, you confirm the exact command in the approval
+window and enter your password there if sudo asks for one."*
+
+- **Tool.** `host.sudo_exec {argv, reason}` (`harw-tool-shell/src/sudo.rs`)
+  runs exactly one `argv` via a pinned `/usr/bin/sudo` (`-k`, `--`), never
+  through a shell; `argv[0]` must not itself be `sudo`/`doas`/`pkexec`/`su`.
+  It is in `ALWAYS_ASK_TOOLS`, so in `ask` and `auto` the normal approval
+  also asks. Under `full` neither the normal approval nor the sudo window
+  asks; the window only appears to take the password when `sudo` needs one.
+- **Who has it.** Only `uia-shell-worker` and `host-process-worker`
+  (`SUDO_ROLES`/`sudo_tools_for_role` in
+  `harw-registry-defaults/src/profile.rs`, admitted in their agent TOMLs).
+  Every other role — the UIA itself, `uia-worker`, `executor`, the
+  orchestrators — delegates or hands the step back:
+  - the UIA delegates with `transfer_to_uia-shell-worker` (exact command +
+    reason); the handoff tool's description says so
+    (`harw-core/src/turn_loop.rs::handoff_role_hint`), as do the UIA rules
+    (`knowledge/roles/uia.md`, section "sudo / Root-Befehle") and the
+    `shell` mode prompt (`harw-core/src/mode.rs::SHELL_PROMPT`);
+  - workers and orchestrators return the step with the exact `argv` and a
+    reason as a blocker to their parent, up to the UIA
+    (`knowledge/roles/{worker,uia-worker,root-orchestrator,sub-orchestrator}.md`).
+- **TUI only.** The provider needs the sudo prompt channel, which
+  `harw-runtime/src/assembly.rs` creates only for `EntryKind::Tui`;
+  `RuntimeChildRegistryFactory::with_sudo_exec` mounts the tool only then.
+  In `serve`, `telegram`, one-shot, jobs and every other entry the tool is
+  absent (fail-closed); the model should then give the user the exact
+  command to run themselves. With a TUI attached it must not do that.
+- **Password flow.** Before running, `host.sudo_exec` probes
+  `sudo -n -k true`. Passwordless sudo: the window
+  (`harw-tui/src/sudo_dialog.rs`) only shows the exact argv and reason with
+  approve/deny, and the command runs as `sudo -n -k -- argv…`. Otherwise
+  the user types the password into the masked field of that window; it is
+  written to sudo's stdin only after sudo prints a one-time prompt marker
+  (`-S -p <marker>`), and never reaches the model, the transcript or the
+  audit record. The model must never ask for a password in chat, put one
+  into a command, or use `sudo -S`/`echo … | sudo` itself.
+- **Refusals stay actionable.** `shell.exec` rejects `sudo`/`doas`/`pkexec`/
+  `su`/`run0` in command position (`escalation_program`) with
+  `shell_escalation_message`, which states that sudo works via
+  `host.sudo_exec`, and tells a role without the tool to delegate to
+  `uia-shell-worker` or to hand the exact `argv` back to its parent/the UIA.
+  The auto-mode prefilter (`harw-runtime/src/auto_classifier.rs`,
+  category `privilege-escalation`) uses the same detection and wording.
+- **Command position only.** Detection tokenizes the command shell-style:
+  quotes, `;`, `&&`, `||`, `|`, `(`, `$(…)`, backticks, wrappers such as
+  `env`/`exec`/`nohup`/`time`/`xargs`/`timeout`, and `sh -c '…'`. A `sudo`
+  inside a quoted argument (`rg 'sudo_exec|sudo -' …`,
+  `git commit -m 'use sudo'`) or as part of another word (`sudo_exec`,
+  `/etc/sudoers`) is not a hit.
 
 ## User consent
 

@@ -28,6 +28,95 @@ use ratatui::text::Line;
 use super::{ChatApp, ExportOutputFormat};
 use crate::export::{self, ExportAgentEntry, ExportEntry};
 
+/// Platzhalter, den `AgentSession::announce_configured` ohne gesetztes
+/// Sitzungsmodell meldet — kein Modellname.
+const UNRESOLVED_MODEL_PLACEHOLDER: &str = "default";
+
+/// Modellangabe für den Exportkopf: `<provider>/<modell-id>` des Modells,
+/// das die Wurzel (UIA) tatsächlich anspricht.
+///
+/// # Beschreibung
+/// Früher stand dort `anthropic/default`: der Vorgabe-Provider plus der
+/// Platzhalter `default` einer Sitzung ohne eigenes Modell — obwohl die UIA
+/// über `uia_provider`/`uia_model` ein anderes Modell nutzte. Reihenfolge:
+/// 1. ein live gewähltes Sitzungsmodell (`active_model`, mit
+///    `active_provider`),
+/// 2. die UIA-Auswahl des Controllers,
+/// 3. die UIA-Auswahl der Konfiguration (je Achse mit `default_*` als
+///    Rückfall, wie die Begrüßung),
+/// 4. das von der Sitzung gemeldete Modell (ohne den Platzhalter).
+///
+/// Ein Alias aus `models/*.toml` wird zur kanonischen Modell-ID aufgelöst;
+/// fehlt der Provider, kommt er aus dem Modelleintrag.
+pub(super) fn export_model_label(
+    snapshot: &harw_operations::session_control::SessionControlSnapshot,
+    config: Option<&harw_config::ResolvedConfig>,
+    session_model: Option<&str>,
+) -> Option<String> {
+    let usable = |model: Option<&str>| {
+        model
+            .map(str::trim)
+            .filter(|model| !model.is_empty() && *model != UNRESOLVED_MODEL_PLACEHOLDER)
+            .map(str::to_owned)
+    };
+    let config_selection = config.map(|config| {
+        harw_operations::session_control::UiaSelection::from_config(
+            config.harness.uia_provider.as_deref(),
+            config.harness.uia_model.as_deref(),
+            config.harness.default_provider.as_deref(),
+            config.harness.default_model.as_deref(),
+        )
+    });
+    let candidates = [
+        (
+            snapshot.active_provider.clone(),
+            usable(snapshot.active_model.as_deref()),
+        ),
+        (
+            snapshot.uia_selection.provider.clone(),
+            usable(snapshot.uia_selection.model()),
+        ),
+        (
+            config_selection
+                .as_ref()
+                .and_then(|selection| selection.provider.clone()),
+            usable(
+                config_selection
+                    .as_ref()
+                    .and_then(|selection| selection.model()),
+            ),
+        ),
+        (None, usable(session_model)),
+    ];
+    let (provider, model) = candidates
+        .into_iter()
+        .find(|(_, model)| model.is_some())
+        .unwrap_or((None, None));
+    let Some(model) = model else {
+        return provider;
+    };
+    // Alias → kanonische ID (bei bekanntem Provider nur dessen Modelle).
+    let resolved = config.and_then(|config| {
+        config.models.values().find(|entry| {
+            provider
+                .as_deref()
+                .is_none_or(|provider| entry.provider == provider)
+                && (entry.id == model || entry.aliases.iter().any(|alias| *alias == model))
+        })
+    });
+    let (provider, model) = match resolved {
+        Some(entry) => (
+            provider.or_else(|| Some(entry.provider.clone())),
+            entry.id.clone(),
+        ),
+        None => (provider, model),
+    };
+    Some(match provider {
+        Some(provider) => format!("{provider}/{model}"),
+        None => model,
+    })
+}
+
 /// Obergrenze der exportierten `!`-Ausgabe in Zeichen (wie die Kappung des
 /// Folge-Turns).
 pub(crate) const SHELL_EXPORT_MAX_CHARS: usize = 8000;
@@ -246,6 +335,60 @@ mod tests {
 
     fn markdown(app: &ChatApp) -> String {
         build_export(app, &ExportOptions::default(), ExportOutputFormat::Markdown)
+    }
+
+    fn model_config(uia: Option<(&str, &str)>) -> TestResult<harw_config::ResolvedConfig> {
+        let mut config = harw_config::ResolvedConfig::default();
+        config.harness.default_provider = Some("anthropic".to_owned());
+        config.harness.default_model = Some("sonnet".to_owned());
+        if let Some((provider, model)) = uia {
+            config.harness.uia_provider = Some(provider.to_owned());
+            config.harness.uia_model = Some(model.to_owned());
+        }
+        let entry: harw_config::ModelToml = serde_json::from_value(serde_json::json!({
+            "id": "claude-sonnet-5",
+            "provider": "anthropic",
+            "aliases": ["sonnet"],
+        }))
+        .map_err(ctx("model entry"))?;
+        config.models.insert("claude-sonnet-5".to_owned(), entry);
+        Ok(config)
+    }
+
+    /// Export 429: der Kopf zeigte `anthropic/default` (Vorgabe-Provider plus
+    /// Sitzungs-Platzhalter), obwohl die UIA ein anderes Modell nutzte.
+    #[test]
+    fn export_model_label_prefers_the_uia_selection_over_the_placeholder() -> TestResult {
+        let snapshot = harw_operations::session_control::SessionControlSnapshot::empty();
+        let config = model_config(Some(("openai", "gpt-6-sol")))?;
+        assert_eq!(
+            export_model_label(&snapshot, Some(&config), Some("default")).as_deref(),
+            Some("openai/gpt-6-sol")
+        );
+        Ok(())
+    }
+
+    /// Aliasse werden zur kanonischen Modell-ID aufgelöst; der Platzhalter
+    /// `default` zählt nie als Modell.
+    #[test]
+    fn export_model_label_resolves_aliases_and_ignores_the_placeholder() -> TestResult {
+        let snapshot = harw_operations::session_control::SessionControlSnapshot::empty();
+        let config = model_config(None)?;
+        assert_eq!(
+            export_model_label(&snapshot, Some(&config), Some("default")).as_deref(),
+            Some("anthropic/claude-sonnet-5")
+        );
+        assert_eq!(
+            export_model_label(&snapshot, None, Some("default")).as_deref(),
+            None
+        );
+        let mut live = harw_operations::session_control::SessionControlSnapshot::empty();
+        live.active_model = Some("sonnet".to_owned());
+        assert_eq!(
+            export_model_label(&live, Some(&config), None).as_deref(),
+            Some("anthropic/claude-sonnet-5")
+        );
+        Ok(())
     }
 
     /// Befehlsausgabe und Systemzeile landen im Export, die Anzeige bleibt

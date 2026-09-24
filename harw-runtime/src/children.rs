@@ -398,6 +398,10 @@ pub struct RuntimeChildRegistryFactory {
     /// UIA-Worker-Fabrik gesetzt ([`Self::with_uia_worker_routing`]); dann
     /// bestimmt sie das Modell **jedes** Kindes dieser Fabrik beim Start.
     uia_worker_routing: Option<Arc<crate::uia_worker_routing::UiaWorkerRouting>>,
+    /// Live-Modellwahl der Montage ([`Self::with_live_models`]): generische
+    /// Controller-Auswahl und Rollenwahl für **neu** gestartete Kinder. Nur
+    /// bei der Fabrik des Wurzel-Baums gesetzt; `None` → Stand des Starts.
+    live_models: Option<Arc<crate::live_model::LiveModelRouting>>,
 }
 
 /// Wissensquellen der lesenden Kind-Werkzeuge (Plan Teil D).
@@ -508,6 +512,58 @@ impl RuntimeChildRegistryFactory {
             knowledge: None,
             diary: None,
             uia_worker_routing: None,
+            live_models: None,
+        }
+    }
+
+    /// Hängt die Live-Modellwahl der Montage an (Live-Modellwechsel).
+    ///
+    /// # Description
+    /// Danach bestimmen [`crate::live_model::LiveModelRouting::set_live_main`]
+    /// (Hauptmodell ungepinnter Rollen) und
+    /// [`harw_ops::live_model::LiveModelControl::set_internal_model`]
+    /// (Rollenwahl) das Modell jedes **neu** gestarteten Kindes; die über
+    /// [`Self::with_internal_models`] gesetzten Stellen gelten dann nicht
+    /// mehr. Ohne Live-Wahl bleibt alles beim Stand des Starts.
+    #[must_use]
+    pub fn with_live_models(mut self, live: Arc<crate::live_model::LiveModelRouting>) -> Self {
+        self.live_models = Some(live);
+        self
+    }
+
+    /// Aktuelle Auflösung einer internen Modellstelle (live, sonst Start).
+    fn resolved_point(&self, point: InternalModelPoint) -> Option<ResolvedInternalModel> {
+        match &self.live_models {
+            Some(live) => live.resolved_internal_model(point),
+            None => self.internal_models.get(&point).cloned(),
+        }
+    }
+
+    /// Der Modellanbieter eines Kindes auf dem Hauptmodell: mit Live-Wahl
+    /// ein Pin auf deren Provider/Modell, sonst das Eltern-Modell.
+    fn main_model(&self) -> Arc<dyn ModelProvider> {
+        match &self.live_models {
+            Some(live) => live.main_model_provider(&self.model),
+            None => Arc::clone(&self.model),
+        }
+    }
+
+    /// Provider/Modell des Hauptmodells für die Effort-Vorgaben: Live-Wahl,
+    /// sonst [`Self::main_model_selection`], sonst die Config-Vorgabe.
+    fn main_selection(
+        &self,
+        config: &harw_config::ResolvedConfig,
+    ) -> (Option<String>, Option<String>) {
+        if let Some((provider, model)) = self.live_models.as_ref().and_then(|live| live.live_main())
+        {
+            return (provider, Some(model));
+        }
+        match &self.main_model_selection {
+            Some((provider, model)) => (provider.clone(), model.clone()),
+            None => (
+                config.harness.default_provider.clone(),
+                config.harness.default_model.clone(),
+            ),
         }
     }
 
@@ -1201,22 +1257,17 @@ impl RuntimeChildRegistryFactory {
         let Some(config) = self.reasoning_effort_config.as_deref() else {
             return (None, None);
         };
-        let Some(resolved) = self.internal_models.get(&point) else {
+        let Some(resolved) = self.resolved_point(point) else {
             return (None, None);
         };
         if resolved.is_main_model() {
-            let (provider_id, model_id): (Option<&str>, Option<&str>) =
-                match &self.main_model_selection {
-                    Some((provider, model)) => (provider.as_deref(), model.as_deref()),
-                    None => (
-                        config.harness.default_provider.as_deref(),
-                        config.harness.default_model.as_deref(),
-                    ),
-                };
+            let (provider_id, model_id) = self.main_selection(config);
             let provider_default = provider_id
+                .as_deref()
                 .and_then(|id| config.providers.get(id))
                 .and_then(|provider| provider.default_reasoning_effort);
             let model_default = model_id
+                .as_deref()
                 .and_then(|id| config.models.get(id))
                 .and_then(|model| model.default_reasoning_effort);
             return (provider_default, model_default);
@@ -1247,11 +1298,11 @@ impl RuntimeChildRegistryFactory {
         role: &str,
         point: InternalModelPoint,
     ) -> Arc<dyn ModelProvider> {
-        let Some(resolved) = self.internal_models.get(&point) else {
-            return Arc::clone(&self.model);
+        let Some(resolved) = self.resolved_point(point) else {
+            return self.main_model();
         };
         if resolved.is_main_model() {
-            return Arc::clone(&self.model);
+            return self.main_model();
         }
         let provider_id = resolved
             .provider
@@ -1373,8 +1424,8 @@ impl ChildRegistryFactory for RuntimeChildRegistryFactory {
             ..IdentityOverrides::default()
         };
         // Eine Kette je Kind: `for_child` legt eine Folgezelle an
-        // ([`ApprovalModeCell::follower`], gedeckelt auf
-        // `ApprovalMode::Delegated`). Eine Umstellung der Wurzel erreicht
+        // ([`ApprovalModeCell::follower`], seit 2026-09-24 ungedeckelt —
+        // unter `FullAccess` fragt auch kein Kind). Eine Umstellung der Wurzel erreicht
         // laufende Kinder sofort; ein `set` im Kind koppelt nur dieses Kind ab
         // — Geschwister bleiben voneinander unabhängig, folgen aber weiter der
         // Wurzel.
@@ -1553,7 +1604,7 @@ impl ChildRegistryFactory for RuntimeChildRegistryFactory {
             return Ok(routing.model_for_role(role));
         }
         let Some(point) = self.internal_point_for_child(role) else {
-            return Ok(Arc::clone(&self.model));
+            return Ok(self.main_model());
         };
         Ok(self.pinned_model_for_point(role, point))
     }
@@ -1588,7 +1639,7 @@ impl ChildRegistryFactory for RuntimeChildRegistryFactory {
         }
         match self.internal_point_for_task(role, complexity) {
             Some(point) => Ok(self.pinned_model_for_point(role, point)),
-            None => Ok(Arc::clone(&self.model)),
+            None => Ok(self.main_model()),
         }
     }
 
@@ -1607,12 +1658,57 @@ impl ChildRegistryFactory for RuntimeChildRegistryFactory {
     ) -> Option<String> {
         let pinned_point = self
             .internal_point_for_task(role, complexity)
-            .and_then(|point| self.internal_models.get(&point))
+            .and_then(|point| self.resolved_point(point))
             .is_some_and(|resolved| !resolved.is_main_model());
         if pinned_point {
             return None;
         }
+        // Live-Modellwechsel: das neu gewählte Hauptmodell, nicht das des
+        // Starts.
+        if let Some((_, model)) = self.live_models.as_ref().and_then(|live| live.live_main()) {
+            return Some(model);
+        }
         self.effective_main_model.clone()
+    }
+
+    /// Der Provider, den der Kind-Provider dieser Rolle fest anspricht
+    /// (Pin einer Rollenwahl, der UIA-Worker-Wahl oder des Live-Wechsels).
+    fn pinned_provider_for_task(
+        &self,
+        role: &str,
+        complexity: Option<harw_core::TaskComplexity>,
+    ) -> Option<String> {
+        self.model_for_task(role, complexity)
+            .ok()
+            .and_then(|provider| provider.pinned_provider_id())
+    }
+
+    /// Der Provider, den ein ungepinntes Kind dieser Rolle ruft (Anzeige
+    /// `<provider>/<modell>`): Live-Wahl, sonst die Hauptauswahl der Fabrik,
+    /// sonst die Config-Vorgabe; `None` bei einer gepinnten Stelle.
+    fn main_provider_for_task(
+        &self,
+        role: &str,
+        complexity: Option<harw_core::TaskComplexity>,
+    ) -> Option<String> {
+        let pinned_point = self
+            .internal_point_for_task(role, complexity)
+            .and_then(|point| self.resolved_point(point))
+            .is_some_and(|resolved| !resolved.is_main_model());
+        if pinned_point {
+            return None;
+        }
+        if let Some((provider, _)) = self.live_models.as_ref().and_then(|live| live.live_main()) {
+            return provider;
+        }
+        self.main_model_selection
+            .as_ref()
+            .and_then(|(provider, _)| provider.clone())
+            .or_else(|| {
+                self.reasoning_effort_config
+                    .as_ref()
+                    .and_then(|config| config.harness.default_provider.clone())
+            })
     }
 
     /// Die eingebaute Agent-IR einer Rolle.
@@ -2370,6 +2466,82 @@ mod tests {
                 .pinned_model_for_task(role_names::AGENT_STEWARD, None)
                 .as_deref(),
             Some("acme-model")
+        );
+        Ok(())
+    }
+
+    /// Live-Modellwechsel: ein nach `/model switch` gestartetes ungepinntes
+    /// Kind (Orchestrator) spricht Provider und Modell der neuen Wahl an,
+    /// nicht das Vorgabemodell des Starts; eine live gesetzte Rollenwahl
+    /// (`/models set orchestrator …`) hat Vorrang.
+    #[test]
+    fn new_children_follow_the_live_model_switch_and_role_choice() -> TestResult {
+        use harw_ops::live_model::LiveModelControl;
+        let config = Arc::new(harw_config::ResolvedConfig::default());
+        let chain = test_chain(&config);
+        let live = Arc::new(crate::live_model::LiveModelRouting::new(Arc::clone(
+            &config,
+        )));
+        let factory = RuntimeChildRegistryFactory::new(
+            test_project(),
+            Arc::new(harw_core::EchoModelProvider::new("echo")),
+            chain,
+        )
+        .map_err(ctx("factory builds"))?
+        .with_internal_models(resolve_internal_models_for_children(&config))
+        .with_effective_main_model(Some("start-model".to_owned()))
+        .with_live_models(Arc::clone(&live));
+
+        // Ohne Live-Wahl: Stand des Starts, kein Pin.
+        assert_eq!(
+            factory.main_model_for_task(role_names::ROOT_ORCHESTRATOR, None),
+            Some("start-model".to_owned())
+        );
+        assert_eq!(
+            factory.pinned_model_for_task(role_names::ROOT_ORCHESTRATOR, None),
+            None
+        );
+
+        live.set_live_main(Some("openai".to_owned()), Some("gpt-5".to_owned()));
+        assert_eq!(
+            factory.main_model_for_task(role_names::ROOT_ORCHESTRATOR, None),
+            Some("gpt-5".to_owned())
+        );
+        assert_eq!(
+            factory
+                .pinned_model_for_task(role_names::ROOT_ORCHESTRATOR, None)
+                .as_deref(),
+            Some("gpt-5")
+        );
+        assert_eq!(
+            factory
+                .pinned_provider_for_task(role_names::ROOT_ORCHESTRATOR, None)
+                .as_deref(),
+            Some("openai")
+        );
+
+        assert!(live.set_internal_model(
+            InternalModelPoint::RootOrchestrator,
+            Some(harw_config::InternalModelChoice {
+                provider: Some("anthropic".to_owned()),
+                model: Some("claude-role".to_owned()),
+            }),
+        ));
+        assert_eq!(
+            factory
+                .pinned_model_for_task(role_names::ROOT_ORCHESTRATOR, None)
+                .as_deref(),
+            Some("claude-role")
+        );
+        assert_eq!(
+            factory
+                .pinned_provider_for_task(role_names::ROOT_ORCHESTRATOR, None)
+                .as_deref(),
+            Some("anthropic")
+        );
+        assert_eq!(
+            factory.main_model_for_task(role_names::ROOT_ORCHESTRATOR, None),
+            None
         );
         Ok(())
     }

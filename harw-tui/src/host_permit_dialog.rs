@@ -161,7 +161,7 @@ mod tests {
     fn test_session_switch_notice_only_with_an_active_phase() {
         let registry = harw_sandbox::HostPermitSessionRegistry::default();
         assert_eq!(session_switch_host_notice(&registry, "old"), None);
-        registry.mark_global_approval(std::time::Duration::from_secs(60));
+        registry.mark_global_approval();
         assert_eq!(
             session_switch_host_notice(&registry, "old"),
             Some("Host-Modus beendet (neue Sitzung).")

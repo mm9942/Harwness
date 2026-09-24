@@ -464,15 +464,24 @@ here, one line each, purpose from the module doc comment:
   (`harw-ops/src/sandbox_lease.rs`, `model_tool` without extra approval,
   since the dialog itself *is* the approval; argument `reason`) triggers a
   `HostPermitPrompt` (pre-selected `SessionLease`) and waits up to 300s:
-  `SessionLease` -> `mark_session_approved` (TTL-bound, all `shell.exec`
-  calls for the session then run on the host); `SingleExecution` ->
-  `mark_single_use` (only the next call); rejection/timeout return an error
-  text. The command `/sandbox-lease [status|revoke]` (`busy = "immediate"`)
-  is purely local: `status` shows the active grant, `revoke` ends a session
-  grant immediately via `revoke_session_approval` +
-  `ledger.revoke_session`. `/status` (`harw-ops/src/status.rs`) additionally
-  shows a "Host lease: active until … / single-use / off" line. Details of
-  host execution itself live in `mediated-process-execution.md`.
+  `SessionLease` -> `mark_global_approval` (all `shell.exec` calls of the
+  harw process then run on the host); `SingleExecution` ->
+  `mark_global_single_use` (only the next call); rejection/timeout return an
+  error text. **A host lease has no expiry and only the user can end it**
+  (user decision 2026-09-24): `Ctrl+H` in the TUI (`end_host_mode`) or the
+  typed command `/sandbox-lease revoke`. The command
+  `/sandbox-lease [status|revoke]` (`busy = "immediate"`) is purely local:
+  `status` shows the active grant, `revoke` ends it immediately via
+  `revoke_global_approval` + `revoke_session_approval` +
+  `ledger.revoke_session`. The model tool does not offer `revoke`, and a
+  model call with `action = "revoke"` is rejected ("only the user can end
+  host mode"): the op accepts `revoke` only when its `OpContext` carries the
+  `HostLeaseUserControl` marker, which the runtime places exclusively in the
+  slash-command `ServiceMap` — it is not an argument, so the model cannot
+  forge it. `/status` (`harw-ops/src/status.rs`) additionally shows a
+  "Host-Lease: aktiv (bis Strg+H oder /sandbox-lease revoke) / Einmalfreigabe
+  / aus" line. Details of host execution itself live in
+  `mediated-process-execution.md`.
 - **`/permissions`** — an overview of workspace identity, sandbox rights,
   approval mode, and allow/deny rules: `allow|deny <tool> [pattern]
   [--session|--project|--user]` (`--user` = `--global`; a pattern is a
@@ -481,7 +490,8 @@ here, one line each, purpose from the module doc comment:
   auto-mode decisions, along with the current security-ceiling state).
   Check order: `ALWAYS_ASK_TOOLS` first, then deny before allow before the
   classifier; deny rules also apply in `ask` mode. An allow rule for a tool
-  in `ALWAYS_ASK_TOOLS` is rejected.
+  in `ALWAYS_ASK_TOOLS` is rejected. In `full` nothing asks, not even
+  `ALWAYS_ASK_TOOLS`; a deny rule then refuses the call instead of asking.
 - **`/agent`** — the agent tree with live values (root "UIA · <name>"),
   `list`, `stop`, `budget`, `use`. The TUI intercepts locally:
   `stream <orchestrators|all|none>` (live-stream children into the
@@ -514,7 +524,7 @@ target model belongs to a different provider than the currently active one.
 | `/uia-effort` | same grammar as `/effort` | persists `reasoning.uia` in the profile `config.toml`, **no** live override (a deliberate difference from `/effort`), takes effect from the next session | `tui_only` | `operator` |
 | `/provider` (alias `/p`) | `show \| list \| test` | read-only; `switch` falls into the unknown-subcommand branch and points to `/model` | `tui_only` | `operator` |
 | `/uia-provider` | `show \| list \| test` | like `/provider`, for the UIA pin selection; `switch` points to `/uia-model` | `tui_only` | `operator` |
-| `/provider-concurrency` | `<ProviderRef> <n \| unlimited>` | adjusts a provider's `max_concurrency` **live** via the `DynamicConcurrencyLimiter`: raising it releases permits immediately, lowering it is lazy (running requests are never aborted, only refill is throttled until the target is reached); recommendation on repeated HTTP 429s: lower, don't raise | `tui_only` **and** `model_tool` (the UIA can throttle itself) | `operator` (command); `approval = "always"` for the tool call (the macro only supports one static approval level per `model_tool`, so it applies to lowering too) |
+| `/provider-concurrency` | `<ProviderRef> [<n \| unlimited>]` | without a value: shows the provider's load state (concurrency, rate-limit wait incl. the shared HTTP-429 cooldown, observed 429s); with a value: adjusts a provider's `max_concurrency` **live** via the `DynamicConcurrencyLimiter`: raising it releases permits immediately, lowering it is lazy (running requests are never aborted, only refill is throttled until the target is reached); recommendation on repeated HTTP 429s: lower, don't raise | `tui_only` **and** `model_tool` (the UIA can throttle itself) | `operator` (command); `approval = "always"` for the tool call (the macro only supports one static approval level per `model_tool`, so it applies to lowering too) |
 
 **Visibility of the concurrency limit:** `/provider show` (via the shared
 `format_load_status` helper, `harw-ops/src/provider.rs`) and `/status`

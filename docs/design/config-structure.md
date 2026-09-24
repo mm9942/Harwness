@@ -115,7 +115,7 @@ require_approval_for = ["exec", "fs-write-outside-workspace"]
 
 [tools.doc]
 remote_ocr = "ask"                   # off|ask|on — may doc.read_pdf upload PDFs to a remote OCR
-                                     # service (Mistral)? "ask" asks before every upload
+                                     # service (Mistral)? default "off"; "ask" asks before every upload
 ```
 
 Notes:

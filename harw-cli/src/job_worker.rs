@@ -1097,6 +1097,11 @@ impl ModelProvider for BudgetedModelProvider {
     fn pinned_model_id(&self) -> Option<String> {
         self.inner.pinned_model_id()
     }
+
+    /// Reicht die gepinnte Provider-ID des umhüllten Providers durch.
+    fn pinned_provider_id(&self) -> Option<String> {
+        self.inner.pinned_provider_id()
+    }
 }
 
 // Operator id used to build a plan-node job's own trust principal (R7).

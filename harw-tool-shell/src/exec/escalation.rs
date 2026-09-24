@@ -30,9 +30,7 @@
 //! `Send + Sync`; gewartet wird nur auf einem `oneshot`, begrenzt durch
 //! [`ShellExecutor::host_permit_timeout`].
 
-use super::{
-    HOST_SESSION_LEASE_TTL, HOST_SINGLE_EXECUTION_TTL, ShellExecArgs, ShellExecutor, TOOL_NAME,
-};
+use super::{HOST_SINGLE_EXECUTION_TTL, ShellExecArgs, ShellExecutor, TOOL_NAME};
 use crate::host_escalation::{
     EscalationOutcome, HOST_ESCALATION_DENIED_MSG, HOST_ESCALATION_WORKER_PREFIX,
     HOST_MODE_REQUIRES_TUI_MSG, HostEscalation, HostRequester, HostRequesterBook, RequestHostArgs,
@@ -374,16 +372,18 @@ impl EscalatingShellExecutor {
         let (scope, ttl, outcome) = match variant {
             HostPermitVariant::SingleExecution => (
                 HostApprovalScope::SingleExecution,
-                HOST_SINGLE_EXECUTION_TTL,
+                Some(HOST_SINGLE_EXECUTION_TTL),
                 EscalationOutcome::ApprovedOnce,
             ),
             HostPermitVariant::SessionLease => {
                 // Dieselbe Wirkung wie `/sandbox-lease`: die Phase gilt für
-                // die ganze harw-Sitzung inkl. aller Kind-Agenten.
-                registry.mark_global_approval(HOST_SESSION_LEASE_TTL);
+                // die ganze harw-Sitzung inkl. aller Kind-Agenten, ohne
+                // Zeitablauf — bis der Nutzer sie beendet (Strg+H oder
+                // `/sandbox-lease revoke`).
+                registry.mark_global_approval();
                 (
                     HostApprovalScope::SessionLease,
-                    HOST_SESSION_LEASE_TTL,
+                    None,
                     EscalationOutcome::ApprovedSession,
                 )
             }
@@ -775,7 +775,7 @@ mod tests {
         let (sender, mut receiver) = host_permit_prompt_channel();
         let rig = tui_child_rig(sender, Duration::from_secs(30))?;
         // Auch eine laufende Phase ändert daran nichts.
-        rig.registry.mark_global_approval(Duration::from_secs(60));
+        rig.registry.mark_global_approval();
         for command in ["sudo ls /root", "doas true", "pkexec id"] {
             let output = rig
                 .executor
@@ -810,7 +810,7 @@ mod tests {
             make_sandbox(&tmp, vec![Permission::ExecuteProcess])?,
         );
         let registry = Arc::new(HostPermitSessionRegistry::default());
-        registry.mark_global_approval(Duration::from_secs(60));
+        registry.mark_global_approval();
         let provider = ShellToolProvider::default()
             .with_host_permit_registry(Arc::clone(&registry))
             .with_max_timeout_secs(120);

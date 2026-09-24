@@ -25,8 +25,11 @@
 //! Wurzelprozesses nie. Ein Fan-out konnte damit tun, was dem Elternteil
 //! ausdrücklich unter Vorbehalt stand. [`ApprovalChain::for_child`] gibt die
 //! Config-Politik deshalb unverändert weiter; den Freigabemodus übernimmt das
-//! Kind live von der Elternkette, aber **gedeckelt** auf
-//! [`ApprovalMode::Delegated`] (G-009).
+//! Kind live von der Elternkette — seit der Nutzerentscheidung 2026-09-24
+//! **ungedeckelt**, also auch [`ApprovalMode::FullAccess`]: „Full Access"
+//! heißt „keine Bestätigung", und ein Kind, das weiter fragte, holte genau
+//! die Dialoge über das Kind-Relais zurück, die die Nutzerin abgeschaltet
+//! hat.
 //!
 //! # Nebenläufigkeit
 //! [`ApprovalChain`] hält nur `Arc`-Zeiger und eine [`ApprovalModeCell`];
@@ -184,9 +187,14 @@ impl AskResolutionPolicy {
     /// Rückfrage missdeuten (und einen an sich freigegebenen Aufruf hier
     /// fälschlich ablehnen) oder eine Deny-Regel übersehen.
     fn would_ask(&self, call: &ToolCall) -> bool {
+        // Wie in `DefaultApprovalPolicy::review`: `FullAccess` fragt nie
+        // (eine Deny-Regel lehnt dort die Standardpolitik selbst hart ab).
+        if self.mode.get() == ApprovalMode::FullAccess {
+            return false;
+        }
         // Wie in `DefaultApprovalPolicy::review`: Remote-OCR unter
-        // `[tools.doc].remote_ocr = "ask"` fragt unabhängig von Regeln und
-        // Modus.
+        // `[tools.doc].remote_ocr = "ask"` fragt unter `ask`/`auto`
+        // unabhängig von Regeln.
         if harw_registry_defaults::call_needs_remote_ocr_approval(call) {
             return true;
         }
@@ -399,7 +407,11 @@ impl ApprovalChain {
         let config_policy = if config_tools.is_empty() {
             None
         } else {
-            Some(Arc::new(ConfigApprovalPolicy::new(config_tools.clone())))
+            // Die Pflichtliste liest dieselbe Zelle: unter `FullAccess`
+            // fragt auch sie nicht (Nutzerentscheidung 2026-09-24).
+            Some(Arc::new(
+                ConfigApprovalPolicy::new(config_tools.clone()).with_mode(mode.clone()),
+            ))
         };
 
         Self {
@@ -462,25 +474,24 @@ impl ApprovalChain {
     ///   Voreinstellungen und sah `[policy].require_approval_for` nie — der
     ///   Fan-out durfte, was dem Elternteil unter Vorbehalt stand (F-018).
     /// - Der Freigabemodus liegt in einer **Folgezelle**
-    ///   ([`ApprovalModeCell::follower`]) mit Obergrenze
-    ///   [`ApprovalMode::Delegated`]: eine Umstellung der Elternzelle erreicht
-    ///   laufende Kinder sofort, ein `set` im Kind koppelt nur dieses Kind ab
-    ///   und erreicht weder die Wurzel noch Geschwister. [`ApprovalMode::FullAccess`]
-    ///   wird dabei **nie** vererbt, sondern durch die Deckelung auf
-    ///   [`ApprovalMode::Delegated`] gesenkt (G-009) — „ich vertraue diesem
-    ///   Turn" ist eine Aussage über den Turn, den eine Person vor sich sieht,
-    ///   nicht über beliebig viele Kinder, die sie nie zu Gesicht bekommt.
-    ///   [`ApprovalMode::AlwaysAsk`] bleibt erhalten: die Deckelung lockert
-    ///   nie.
+    ///   ([`ApprovalModeCell::follower`]) ohne wirksame Obergrenze
+    ///   (Obergrenze [`ApprovalMode::FullAccess`]): eine Umstellung der
+    ///   Elternzelle erreicht laufende Kinder sofort, ein `set` im Kind
+    ///   koppelt nur dieses Kind ab und erreicht weder die Wurzel noch
+    ///   Geschwister. [`ApprovalMode::FullAccess`] wird seit der
+    ///   Nutzerentscheidung 2026-09-24 **vererbt** (vorher auf `Delegated`
+    ///   gedeckelt, G-009): unter „Full Access" darf auch kein Kind eine
+    ///   Rückfrage über das Kind-Relais an die TUI schicken.
+    ///   [`ApprovalMode::AlwaysAsk`] und [`ApprovalMode::Delegated`] bleiben
+    ///   ebenso erhalten.
     /// - Es gibt **keinen Responder**. Ein Kind und ein Job-Worker fragen
     ///   niemanden; sie haben keine Oberfläche, an der eine Antwort ankäme.
     /// - Die **Freigaberegeln werden unverändert weitergereicht** (dieselbe
     ///   [`AllowRuleSet`], kein `detached()`) — nach derselben Begründung wie
     ///   die Config-Politik: eine Regel kann einem Kind nie **mehr** erlauben,
     ///   als seine eigene Werkzeugfläche (Registry-Profil, Sandbox-Rechte)
-    ///   ohnehin zulässt (`a_child_never_inherits_full_access` gilt sinngemäß
-    ///   auch hier — nur die *Rückfrage* für einen bereits erlaubten Aufruf
-    ///   entfällt, keine neue Fähigkeit entsteht). Eine `Deny`-Regel wirkt im
+    ///   ohnehin zulässt (nur die *Rückfrage* für einen bereits erlaubten
+    ///   Aufruf entfällt, keine neue Fähigkeit entsteht). Eine `Deny`-Regel wirkt im
     ///   Kind genauso einschränkend wie in der Wurzel.
     ///
     /// # Wie `AskUser` im Kind endet
@@ -515,7 +526,15 @@ impl ApprovalChain {
         &self,
         mandate: Option<harw_extension_api::auto_mode::ChildMandate>,
     ) -> Self {
-        let child_mode = self.mode.follower(ApprovalMode::Delegated);
+        // Nutzerentscheidung 2026-09-24: das Kind folgt dem Modus der Wurzel
+        // ungedeckelt — unter `FullAccess` fragt auch kein Kind.
+        let child_mode = self.mode.follower(ApprovalMode::FullAccess);
+        // Die Pflichtliste der Wurzel, aber über der Zelle des Kindes (damit
+        // sie denselben Modus liest wie seine Standardpolitik).
+        let child_config = self
+            .config
+            .as_ref()
+            .map(|config| Arc::new(config.as_ref().clone().with_mode(child_mode.clone())));
 
         Self {
             // Die Ask-Auflösung ist die des Einstiegs und gilt für das Kind
@@ -528,12 +547,12 @@ impl ApprovalChain {
                     AskResolutionPolicy::new(
                         ask.resolution(),
                         child_mode.clone(),
-                        self.config.clone(),
+                        child_config.clone(),
                         self.rules.clone(),
                     )
                 })
                 .map(Arc::new),
-            config: self.config.clone(),
+            config: child_config,
             config_tools: self.config_tools.clone(),
             default: Arc::new(child_default_policy(
                 child_mode.clone(),
@@ -725,7 +744,7 @@ impl ApprovalChain {
     /// # Rückgabe
     /// Eine Referenz; ein Klon davon ist der Schalter, mit dem sich der Modus
     /// dieses Laufs umstellen lässt. Kinder aus [`Self::for_child`] folgen
-    /// der Umstellung live, gedeckelt auf [`ApprovalMode::Delegated`]; ein
+    /// der Umstellung live (auch nach [`ApprovalMode::FullAccess`]); ein
     /// `set` auf der Zelle eines Kindes erreicht die Elternkette nie.
     #[must_use]
     pub fn mode(&self) -> &ApprovalModeCell {
@@ -838,9 +857,11 @@ mod tests {
 
     /// Die Config-Politik greift auch dann, wenn die Standardpolitik das
     /// Werkzeug längst durchwinken würde — sonst wäre die Liste zahnlos.
+    /// Unter `FullAccess` fragt auch sie nicht (Nutzerentscheidung
+    /// 2026-09-24), und zwar live über dieselbe Zelle.
     #[test]
     fn config_policy_restricts_a_tool_the_default_policy_would_allow() -> TestResult {
-        let chain = root_chain(&["fs.read"], ApprovalMode::FullAccess);
+        let chain = root_chain(&["fs.read"], ApprovalMode::Delegated);
         let handlers = chain.handlers();
 
         assert!(matches!(
@@ -849,6 +870,12 @@ mod tests {
         ));
         assert!(matches!(
             block_on(handlers[1].review(&call("fs.read")))?,
+            ApprovalDecision::Allow
+        ));
+
+        chain.mode().set(ApprovalMode::FullAccess);
+        assert!(matches!(
+            block_on(handlers[0].review(&call("fs.read")))?,
             ApprovalDecision::Allow
         ));
         Ok(())
@@ -901,9 +928,12 @@ mod tests {
         assert_eq!(chain.handlers().len(), 3);
     }
 
-    /// G-009: `FullAccess` der Wurzel erreicht das Kind nie.
+    /// Nutzerentscheidung 2026-09-24 (ersetzt G-009): `FullAccess` der
+    /// Wurzel erreicht das Kind — weder seine Standardpolitik noch die
+    /// geerbte Pflichtliste fragen dort, also schickt es auch nichts über das
+    /// Kind-Relais an die TUI.
     #[test]
-    fn a_child_never_inherits_full_access() -> TestResult {
+    fn a_child_inherits_full_access_and_never_asks() -> TestResult {
         let root = ApprovalChain::for_root(
             &config_with(&["fs.write"]),
             AskResolution::Interactive,
@@ -913,11 +943,30 @@ mod tests {
         );
         let child = root.for_child();
 
-        assert_eq!(child.mode().get(), ApprovalMode::Delegated);
+        assert_eq!(child.mode().get(), ApprovalMode::FullAccess);
         assert_eq!(root.mode().get(), ApprovalMode::FullAccess);
 
-        // Die Kind-Politik muss die gesenkte Zelle wirklich lesen.
+        // Config (geerbte Pflichtliste) und Default des Kindes erlauben.
         let handlers = child.handlers();
+        assert_eq!(handlers.len(), 2, "ein Kind hat keinen Responder");
+        for tool in ["fs.write", "shell.exec", "process.kill", "host.sudo_exec"] {
+            for handler in &handlers {
+                assert!(
+                    matches!(
+                        block_on(handler.review(&call(tool)))?,
+                        ApprovalDecision::Allow
+                    ),
+                    "{tool} darf im Kind unter FullAccess nicht fragen"
+                );
+            }
+        }
+
+        // Zurück auf `auto`: das Kind folgt live und fragt wieder.
+        root.mode().set(ApprovalMode::Delegated);
+        assert!(matches!(
+            block_on(handlers[0].review(&call("fs.write")))?,
+            ApprovalDecision::AskUser(_)
+        ));
         assert!(matches!(
             block_on(handlers[1].review(&call("shell.exec")))?,
             ApprovalDecision::AskUser(_)
@@ -939,10 +988,10 @@ mod tests {
         Ok(())
     }
 
-    /// Eine Umstellung der Wurzel erreicht laufende Kinder live — gedeckelt
-    /// auf `Delegated`.
+    /// Eine Umstellung der Wurzel erreicht laufende Kinder (und Enkel) live
+    /// — ungedeckelt, auch nach `FullAccess`.
     #[test]
-    fn root_mode_changes_reach_children_capped_at_delegated() {
+    fn root_mode_changes_reach_children_including_full_access() {
         let root = root_chain(&[], ApprovalMode::Delegated);
         let child = root.for_child();
         assert!(child.mode().is_follower());
@@ -951,7 +1000,8 @@ mod tests {
         assert_eq!(child.mode().get(), ApprovalMode::AlwaysAsk);
 
         root.mode().set(ApprovalMode::FullAccess);
-        assert_eq!(child.mode().get(), ApprovalMode::Delegated);
+        assert_eq!(child.mode().get(), ApprovalMode::FullAccess);
+        assert_eq!(child.for_child().mode().get(), ApprovalMode::FullAccess);
 
         let grandchild = child.for_child();
         root.mode().set(ApprovalMode::AlwaysAsk);
@@ -975,18 +1025,7 @@ mod tests {
         // schon.
         root.mode().set(ApprovalMode::FullAccess);
         assert_eq!(child.mode().get(), ApprovalMode::AlwaysAsk);
-        assert_eq!(sibling.mode().get(), ApprovalMode::Delegated);
-    }
-
-    /// Auch ein lokales `set` im Kind durchbricht die Deckelung nicht.
-    #[test]
-    fn a_child_cannot_raise_itself_to_full_access() {
-        let root = root_chain(&[], ApprovalMode::FullAccess);
-        let child = root.for_child();
-
-        child.mode().set(ApprovalMode::FullAccess);
-
-        assert_eq!(child.mode().get(), ApprovalMode::Delegated);
+        assert_eq!(sibling.mode().get(), ApprovalMode::FullAccess);
     }
 
     /// F-018: Die Config-Politik der Wurzel gilt auch im Kind.
@@ -1211,13 +1250,14 @@ mod tests {
 
     /// Die Pflichtliste der Konfiguration zieht denselben Handler nach sich —
     /// sonst bliebe ein `require_approval_for`-Werkzeug in einem Lauf ohne
-    /// Antwortfläche unbemerkt erlaubt.
+    /// Antwortfläche unbemerkt erlaubt. Unter `FullAccess` fragt die Liste
+    /// nicht, also lehnt auch die Auflösung nichts ab.
     #[test]
     fn the_ask_handler_also_resolves_the_config_policy_list() -> TestResult {
         let chain = ApprovalChain::for_root(
             &config_with(&["fs.read"]),
             AskResolution::RejectTurn,
-            ApprovalModeCell::new(ApprovalMode::FullAccess),
+            ApprovalModeCell::new(ApprovalMode::Delegated),
             None,
             AllowRuleSet::new(),
         );
@@ -1226,10 +1266,17 @@ mod tests {
             block_on(chain.handlers()[2].review(&call("fs.read")))?,
             ApprovalDecision::Deny(_)
         ));
+        chain.mode().set(ApprovalMode::FullAccess);
+        assert!(matches!(
+            block_on(chain.handlers()[2].review(&call("fs.read")))?,
+            ApprovalDecision::Allow
+        ));
         Ok(())
     }
 
-    /// Das Kind erbt die Auflösung und liest seine **gedeckelte** Folgezelle.
+    /// Das Kind erbt die Auflösung und liest seine eigene Folgezelle: ein
+    /// Kind, das sich lokal auf `auto` gesetzt hat, wird aufgelöst, während
+    /// die Wurzel unter `FullAccess` nichts ablehnt.
     #[test]
     fn a_child_keeps_the_ask_resolution_over_its_own_cell() -> TestResult {
         let root = ApprovalChain::for_root(
@@ -1242,8 +1289,18 @@ mod tests {
         let child = root.for_child();
 
         assert_eq!(child.ask_resolution(), Some(AskResolution::Fail));
-        // Die Wurzel steht auf `FullAccess`, das Kind auf `Delegated` (G-009):
-        // derselbe Aufruf wird deshalb nur im Kind aufgelöst.
+        // Wurzel und Kind stehen auf `FullAccess`: nichts wird aufgelöst.
+        assert!(matches!(
+            block_on(root.handlers()[1].review(&call("shell.exec")))?,
+            ApprovalDecision::Allow
+        ));
+        assert!(matches!(
+            block_on(child.handlers()[1].review(&call("shell.exec")))?,
+            ApprovalDecision::Allow
+        ));
+        // Lokal abgekoppelt auf `auto`: derselbe Aufruf wird nur im Kind
+        // aufgelöst.
+        child.mode().set(ApprovalMode::Delegated);
         assert!(matches!(
             block_on(root.handlers()[1].review(&call("shell.exec")))?,
             ApprovalDecision::Allow
@@ -1368,6 +1425,7 @@ mod tests {
 
     /// Contract §2: Deny gewinnt über eine passende Allow-Regel und über den
     /// Modus `full` — beides würde ohne die Deny-Regel automatisch freigeben.
+    /// Unter `full` (fragt nie) lehnt die Regel hart ab statt zu fragen.
     #[test]
     fn review_deny_rule_beats_allow_rule_and_full_access_mode() -> TestResult {
         let rules = AllowRuleSet::new();
@@ -1391,6 +1449,11 @@ mod tests {
             rules,
         );
 
+        assert!(matches!(
+            block_on(chain.handlers()[0].review(&shell_call("git push origin main")))?,
+            ApprovalDecision::Deny(_)
+        ));
+        chain.mode().set(ApprovalMode::Delegated);
         assert!(matches!(
             block_on(chain.handlers()[0].review(&shell_call("git push origin main")))?,
             ApprovalDecision::AskUser(_)
@@ -1431,7 +1494,7 @@ mod tests {
 
     /// Ein Kind bekommt eine Deny-Regel der Wurzel niemals „geschenkt" weg —
     /// sie wirkt dort genauso einschränkend wie in der Wurzel selbst, auch
-    /// unter `FullAccess` (analog zu `a_child_never_inherits_full_access`).
+    /// unter `FullAccess` (dort als harte Ablehnung, weil nie gefragt wird).
     #[test]
     fn a_child_never_loses_a_deny_rule_of_the_parent() -> TestResult {
         let rules = AllowRuleSet::new();
@@ -1450,6 +1513,11 @@ mod tests {
         );
         let child = root.for_child();
 
+        assert!(matches!(
+            block_on(child.handlers()[0].review(&call("fs.write")))?,
+            ApprovalDecision::Deny(_)
+        ));
+        root.mode().set(ApprovalMode::Delegated);
         assert!(matches!(
             block_on(child.handlers()[0].review(&call("fs.write")))?,
             ApprovalDecision::AskUser(_)
@@ -1647,6 +1715,50 @@ mod tests {
             run_on_runtime(with.handlers()[0].review(&build))?,
             ApprovalDecision::Allow
         ));
+        Ok(())
+    }
+
+    /// Regression (Nutzerbefund 2026-09-24): unter „Freigabe: full" kam ein
+    /// „Befehl ausführen?"-Dialog mit „Auto-Modus: privilege-escalation" —
+    /// ein Kind war auf `auto` gedeckelt, der Vorfilter schlug bei `sudo` an
+    /// und die Frage lief über das Kind-Relais in die TUI. Unter `FullAccess`
+    /// dürfen weder Wurzel noch Kind (auch mit Relais) den Klassifizierer
+    /// befragen oder fragen.
+    #[test]
+    fn full_access_never_consults_the_classifier_in_root_or_child() -> TestResult {
+        let reply = r#"{"decision":"deny","category":"exfiltration","reason":"nein"}"#;
+        let chain = auto_chain(Some(reply));
+        let handle = chain
+            .auto_mode()
+            .ok_or(TestError::Missing("Auto-Modus der Kette"))?
+            .clone();
+        handle.set_child_relay_available(true);
+        chain.mode().set(ApprovalMode::FullAccess);
+
+        let child = chain.for_child();
+        for (label, handlers) in [("Wurzel", chain.handlers()), ("Kind", child.handlers())] {
+            for probe in [
+                shell_call("sudo apt-get install -y ripgrep"),
+                shell_call("cargo publish"),
+                call("process.kill"),
+                call("host.sudo_exec"),
+            ] {
+                for handler in &handlers {
+                    assert!(
+                        matches!(
+                            run_on_runtime(handler.review(&probe))?,
+                            ApprovalDecision::Allow
+                        ),
+                        "{label}: {} darf unter FullAccess nicht fragen",
+                        probe.name.as_str()
+                    );
+                }
+                assert!(
+                    handle.log().verdict_for(probe.id.as_str()).is_none(),
+                    "{label}: der Klassifizierer darf unter FullAccess nicht laufen"
+                );
+            }
+        }
         Ok(())
     }
 

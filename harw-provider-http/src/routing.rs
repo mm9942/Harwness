@@ -13,10 +13,103 @@
 //! default. A backend whose construction failed stays registered as an
 //! explicit error backend (see `build_provider`), so its requests fail
 //! loudly instead of reaching another provider.
+//!
+//! ## Live-Neubau eines Backends
+//! Die Backend-Tabelle liegt in einem geteilten [`RoutingBackends`]
+//! ([`RoutingModelProvider::backends`]). Ein beim Start nicht baubares
+//! Backend (z. B. fehlende Zugangsdaten) bleibt mit seinem Grund als
+//! „nicht verfügbar" markiert und kann zur Laufzeit per
+//! [`RoutingBackends::replace`] ersetzt werden — etwa wenn ein
+//! Modellwechsel auf diesen Provider zielt. Ein laufender Request behält
+//! das Backend, das er bei der Auswahl erhalten hat.
 
 use crate::error::{HttpProviderError, HttpProviderResult};
 use harw_core::{ModelError, ModelFuture, ModelProvider, ModelRequest};
 use std::collections::BTreeMap;
+use std::sync::{Arc, RwLock};
+
+/// Ein registriertes Backend samt optionalem Nicht-verfügbar-Grund.
+struct Backend {
+    /// Der Provider, an den geroutet wird.
+    provider: Arc<dyn ModelProvider>,
+    /// `Some(grund)`, wenn der Bau scheiterte und `provider` nur den Fehler
+    /// meldet.
+    unavailable: Option<String>,
+}
+
+/// Geteilte, zur Laufzeit ersetzbare Backend-Tabelle eines
+/// [`RoutingModelProvider`].
+///
+/// # Nebenläufigkeit
+/// Die Tabelle liegt hinter einem `RwLock`; jeder Request hält die Sperre
+/// nur für die Auswahl (Klon eines `Arc`), nie über den Modellaufruf.
+pub struct RoutingBackends {
+    entries: RwLock<BTreeMap<String, Backend>>,
+}
+
+impl RoutingBackends {
+    /// `true`, wenn `provider_id` registriert ist (verfügbar oder nicht).
+    #[must_use]
+    pub fn contains(&self, provider_id: &str) -> bool {
+        self.entries
+            .read()
+            .is_ok_and(|entries| entries.contains_key(provider_id))
+    }
+
+    /// Grund, warum das Backend von `provider_id` nicht nutzbar ist.
+    ///
+    /// # Returns
+    /// `None` für ein nutzbares Backend, `Some(grund)` für ein beim Bau
+    /// gescheitertes Backend oder eine vergiftete Sperre. Ein nicht
+    /// registrierter Provider liefert ebenfalls `Some`.
+    #[must_use]
+    pub fn unavailable_reason(&self, provider_id: &str) -> Option<String> {
+        let Ok(entries) = self.entries.read() else {
+            return Some("provider routing table lock is poisoned".to_owned());
+        };
+        match entries.get(provider_id) {
+            Some(backend) => backend.unavailable.clone(),
+            None => Some(format!("provider '{provider_id}' is not configured")),
+        }
+    }
+
+    /// Ersetzt (oder ergänzt) das Backend von `provider_id` durch ein
+    /// nutzbares.
+    ///
+    /// # Description
+    /// Wirkt nur auf Requests, die **danach** ausgewählt werden; ein
+    /// laufender Request behält sein Backend.
+    ///
+    /// # Errors
+    /// [`ModelError::RequestFailed`], wenn die Sperre vergiftet ist.
+    pub fn replace(
+        &self,
+        provider_id: &str,
+        provider: Box<dyn ModelProvider>,
+    ) -> Result<(), ModelError> {
+        let mut entries = self.entries.write().map_err(|_| {
+            ModelError::RequestFailed("provider routing table lock is poisoned".to_owned())
+        })?;
+        entries.insert(
+            provider_id.to_owned(),
+            Backend {
+                provider: Arc::from(provider),
+                unavailable: None,
+            },
+        );
+        Ok(())
+    }
+
+    /// Wählt das Backend unter der Lesesperre und klont seinen `Arc`.
+    fn get(&self, provider_id: &str) -> Result<Option<Arc<dyn ModelProvider>>, ModelError> {
+        let entries = self.entries.read().map_err(|_| {
+            ModelError::RequestFailed("provider routing table lock is poisoned".to_owned())
+        })?;
+        Ok(entries
+            .get(provider_id)
+            .map(|backend| Arc::clone(&backend.provider)))
+    }
+}
 
 /// Routes each model request to its selected configured provider backend.
 ///
@@ -24,7 +117,7 @@ use std::collections::BTreeMap;
 /// request-time lookup remains logarithmic and does not depend on insertion
 /// order.
 pub struct RoutingModelProvider {
-    providers: BTreeMap<String, Box<dyn ModelProvider>>,
+    backends: Arc<RoutingBackends>,
     default_provider_id: String,
 }
 
@@ -40,26 +133,87 @@ impl RoutingModelProvider {
         providers: BTreeMap<String, Box<dyn ModelProvider>>,
         default_provider_id: impl Into<String>,
     ) -> HttpProviderResult<Self> {
-        if providers.is_empty() {
+        Self::with_unavailable(providers, BTreeMap::new(), default_provider_id)
+    }
+
+    /// Wie [`Self::new`], zusätzlich mit beim Bau gescheiterten Backends.
+    ///
+    /// # Description
+    /// Jeder Eintrag in `unavailable` (Provider → Grund) wird als
+    /// Fehler-Backend registriert, das jeden Request mit dem Grund ablehnt
+    /// (kein stiller Rückfall), und bleibt über
+    /// [`RoutingBackends::unavailable_reason`] abfragbar, bis
+    /// [`RoutingBackends::replace`] es ersetzt. Ein Name in beiden Tabellen
+    /// gilt als nutzbar.
+    ///
+    /// # Errors
+    /// Wie [`Self::new`]; ein nicht baubarer Vorgabe-Provider zählt als
+    /// vorhanden (der Aufrufer entscheidet vorher, ob das fatal ist).
+    pub fn with_unavailable(
+        providers: BTreeMap<String, Box<dyn ModelProvider>>,
+        unavailable: BTreeMap<String, String>,
+        default_provider_id: impl Into<String>,
+    ) -> HttpProviderResult<Self> {
+        if providers.is_empty() && unavailable.is_empty() {
             return Err(HttpProviderError::EmptyProviderSet);
         }
 
         let default_provider_id = default_provider_id.into();
-        if !providers.contains_key(&default_provider_id) {
+        if !providers.contains_key(&default_provider_id)
+            && !unavailable.contains_key(&default_provider_id)
+        {
             return Err(HttpProviderError::DefaultProviderNotFound {
                 name: default_provider_id,
             });
         }
 
+        let mut entries: BTreeMap<String, Backend> = unavailable
+            .into_iter()
+            .map(|(name, reason)| {
+                let provider: Arc<dyn ModelProvider> =
+                    Arc::new(UnavailableProvider(reason.clone()));
+                (
+                    name,
+                    Backend {
+                        provider,
+                        unavailable: Some(reason),
+                    },
+                )
+            })
+            .collect();
+        for (name, provider) in providers {
+            entries.insert(
+                name,
+                Backend {
+                    provider: Arc::from(provider),
+                    unavailable: None,
+                },
+            );
+        }
+
         Ok(Self {
-            providers,
+            backends: Arc::new(RoutingBackends {
+                entries: RwLock::new(entries),
+            }),
             default_provider_id,
         })
     }
 
     /// Returns the ids of all registered backends in deterministic order.
-    pub fn provider_ids(&self) -> impl Iterator<Item = &str> {
-        self.providers.keys().map(String::as_str)
+    #[must_use]
+    pub fn provider_ids(&self) -> Vec<String> {
+        self.backends
+            .entries
+            .read()
+            .map(|entries| entries.keys().cloned().collect())
+            .unwrap_or_default()
+    }
+
+    /// Geteilter Handle auf die Backend-Tabelle (für einen Live-Neubau nach
+    /// einem Provider-Wechsel, siehe Moduldoku).
+    #[must_use]
+    pub fn backends(&self) -> Arc<RoutingBackends> {
+        Arc::clone(&self.backends)
     }
 
     /// Resolves the backend for `request` without any fallback.
@@ -67,7 +221,7 @@ impl RoutingModelProvider {
     /// # Errors
     /// [`ModelError::RequestFailed`] for an empty provider id or an id that is
     /// not registered (G-048: never routed to the default instead).
-    fn select(&self, request: &ModelRequest) -> Result<&dyn ModelProvider, ModelError> {
+    fn select(&self, request: &ModelRequest) -> Result<Arc<dyn ModelProvider>, ModelError> {
         let provider_id = match request.provider_id.as_ref() {
             None => self.default_provider_id.as_str(),
             Some(provider_id) if provider_id.as_str().trim().is_empty() => {
@@ -78,25 +232,32 @@ impl RoutingModelProvider {
             }
             Some(provider_id) => provider_id.as_str(),
         };
-        self.providers
-            .get(provider_id)
-            .map(|provider| &**provider)
-            .ok_or_else(|| {
-                tracing::warn!(
-                    provider = provider_id,
-                    "model request for unconfigured provider"
-                );
-                ModelError::RequestFailed(format!(
-                    "requested model provider '{provider_id}' is not configured"
-                ))
-            })
+        self.backends.get(provider_id)?.ok_or_else(|| {
+            tracing::warn!(
+                provider = provider_id,
+                "model request for unconfigured provider"
+            );
+            ModelError::RequestFailed(format!(
+                "requested model provider '{provider_id}' is not configured"
+            ))
+        })
+    }
+}
+
+/// Fehler-Backend eines beim Bau gescheiterten Providers: lehnt jeden
+/// Request mit dem Baufehler ab.
+struct UnavailableProvider(String);
+
+impl ModelProvider for UnavailableProvider {
+    fn respond<'a>(&'a self, _request: ModelRequest) -> ModelFuture<'a> {
+        Box::pin(async move { Err(ModelError::RequestFailed(self.0.clone())) })
     }
 }
 
 impl ModelProvider for RoutingModelProvider {
     fn respond<'a>(&'a self, request: ModelRequest) -> ModelFuture<'a> {
         match self.select(&request) {
-            Ok(provider) => provider.respond(request),
+            Ok(provider) => Box::pin(async move { provider.respond(request).await }),
             Err(error) => Box::pin(async move { Err(error) }),
         }
     }
@@ -343,10 +504,7 @@ mod tests {
             "zeta",
         )
         .map_err(ctx("router construction"))?;
-        assert_eq!(
-            router.provider_ids().collect::<Vec<_>>(),
-            vec!["alpha", "zeta"]
-        );
+        assert_eq!(router.provider_ids(), vec!["alpha", "zeta"]);
         Ok(())
     }
 

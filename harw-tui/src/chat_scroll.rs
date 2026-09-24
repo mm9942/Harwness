@@ -1,20 +1,35 @@
 //! Scroll-State-Verwaltung für die Chat-Historie-Ansicht.
 //!
 //! # Verantwortlichkeit
-//! Dieses Modul kapselt ausschließlich den Scroll-Zustand der Chat-Ansicht.
+//! Dieses Modul kapselt ausschließlich den Scroll-Zustand der Chat-Ansicht
+//! (und der Agenten-Detailspur, die dasselbe Modell nutzt).
 //! Es enthält kein Rendering, keinen Zugriff auf History-Cells und keine
 //! Kenntnis über den Inhalt der Nachrichten.
 //!
 //! Der Aufrufer besitzt die Cell-Liste und übergibt lediglich `total_lines`
 //! (Gesamtzeilenanzahl) und `viewport` (sichtbare Höhe) für Clamping-Berechnungen.
 //!
+//! # „Folgen nur am Ende"
+//! - Steht die Ansicht am Ende (`offset = 0`), folgt sie neuem Inhalt.
+//! - Hat der Nutzer hochgescrollt (`offset > 0`), bleibt der sichtbare Text
+//!   stehen: [`ChatScroll::sync_layout`] wird bei jedem Zeichnen mit der
+//!   aktuellen Gesamtzeilenzahl aufgerufen und erhöht den Offset (gemessen vom
+//!   Ende) um genau die Zahl der unten angehängten Zeilen. Gleichzeitig
+//!   zählt es diese Zeilen als „neu, ungesehen" für den Hinweis
+//!   [`ChatScroll::indicator_text`].
+//! - Ändert sich nur die Viewport-Höhe (Freigabe-Dialog ersetzt den Composer,
+//!   Terminal-Resize), bleibt beim Lesen die **oberste** sichtbare Zeile stehen.
+//! - Eigenes Absenden ([`ChatScroll::force_follow`]) und
+//!   [`ChatScroll::jump_to_bottom`] springen ans Ende und folgen wieder.
+//!
 //! # Schlüsseltypen
-//! - [`ChatScroll`] — das zentrale State-Struct (Copy)
+//! - [`ChatScroll`] — das zentrale State-Struct
 //! - [`ScrollAction`] — Rückgabewert von Event-Handlern
 //!
 //! # Nebenläufigkeit
-//! `ChatScroll` ist `Copy` und damit trivial zwischen Threads kopierbar.
-//! Kein interner Mutex oder `Arc` notwendig.
+//! Der Zustand liegt in [`Cell`]s, damit das Rendering (das nur `&ChatApp`
+//! sieht) den Anker nachführen kann. `ChatScroll` ist damit `Send`, aber
+//! nicht `Sync` — wie der übrige TUI-Zustand, der nur im UI-Thread lebt.
 //!
 //! # Fehler
 //! Dieses Modul produziert keine Fehler.
@@ -30,19 +45,35 @@
 //! assert_eq!(scroll.offset(), 5);
 //! ```
 
+use std::cell::Cell;
+
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseEvent, MouseEventKind};
+
+/// Zuletzt beim Zeichnen gemessene Geometrie des Scroll-Bereichs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Measure {
+    /// Gesamtzeilen (nach Umbruch).
+    total: usize,
+    /// Sichtbare Zeilen.
+    viewport: usize,
+    /// Breite, mit der umbrochen wurde.
+    width: u16,
+}
 
 /// State der Chat-Scroll-Position.
 ///
 /// `offset` ist die Anzahl Zeilen VOM ENDE aus gemessen:
 /// - `offset = 0` → am neuesten Ende (Standard, Auto-Follow neuer Nachrichten).
-/// - `offset = N` → N Zeilen zurückgescrollt.
-///
-/// Auto-Follow ist implizit: Solange `offset = 0` ist, zeigt die Ansicht stets
-/// das Ende der Historie, auch wenn neue Zeilen hinzukommen.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// - `offset = N` → N Zeilen zurückgescrollt; der sichtbare Text bleibt bei
+///   neuem Inhalt stehen (siehe [`ChatScroll::sync_layout`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ChatScroll {
-    offset: usize,
+    /// Zeilen vom Ende.
+    offset: Cell<usize>,
+    /// Seit dem Hochscrollen unten angehängte, noch nicht sichtbare Zeilen.
+    unseen: Cell<usize>,
+    /// Geometrie des letzten [`ChatScroll::sync_layout`]-Aufrufs.
+    last: Cell<Option<Measure>>,
 }
 
 /// Ergebnis einer Event-Bearbeitung.
@@ -57,46 +88,51 @@ pub enum ScrollAction {
 impl ChatScroll {
     /// Erstellt einen neuen `ChatScroll` im Auto-Follow-Modus am Ende der Historie.
     ///
-    /// # Description
-    /// Der initiale Zustand ist `offset = 0` (am Ende, Auto-Follow aktiv).
-    /// Entspricht dem typischen Verhalten bei einem frisch geöffneten Chat-Fenster.
-    ///
     /// # Returns
-    /// Eine neue `ChatScroll`-Instanz mit Standardwerten.
-    ///
-    /// # Examples
-    /// ```ignore
-    /// use harw_tui::chat_scroll::ChatScroll;
-    /// let s = ChatScroll::new();
-    /// assert_eq!(s.offset(), 0);
-    /// ```
+    /// Eine neue `ChatScroll`-Instanz mit Standardwerten (`offset = 0`).
     pub fn new() -> Self {
-        Self { offset: 0 }
+        Self {
+            offset: Cell::new(0),
+            unseen: Cell::new(0),
+            last: Cell::new(None),
+        }
     }
 
     /// Gibt den aktuellen Scroll-Offset zurück (Zeilen vom Ende gemessen).
-    ///
-    /// # Returns
-    /// `usize` — Anzahl Zeilen, um die vom Ende zurückgescrollt wurde.
-    ///
-    /// # Examples
-    /// ```ignore
-    /// use harw_tui::chat_scroll::ChatScroll;
-    /// let s = ChatScroll::new();
-    /// assert_eq!(s.offset(), 0);
-    /// ```
     pub fn offset(&self) -> usize {
-        self.offset
+        self.offset.get()
     }
 
-    /// Gibt `true` zurück, wenn der Nutzer aktuell am Ende der Historie ist (offset = 0),
-    /// d. h. Auto-Follow aktiv ist.
-    ///
-    /// # Returns
-    /// `true` wenn `offset == 0`.
+    /// `true`, solange die Ansicht am Ende steht und neuem Inhalt folgt.
+    pub fn is_following(&self) -> bool {
+        self.offset.get() == 0
+    }
+
+    /// Anzahl der seit dem Hochscrollen unten angehängten Zeilen, die noch
+    /// unterhalb des sichtbaren Bereichs liegen (0 beim Folgen).
+    pub fn unseen_lines(&self) -> usize {
+        self.unseen.get()
+    }
+
+    /// Test-Alias für [`ChatScroll::is_following`].
     #[cfg(test)]
     fn is_at_tail(&self) -> bool {
-        self.offset == 0
+        self.is_following()
+    }
+
+    /// Setzt den Offset und hält die Invariante `unseen <= offset`
+    /// (ungesehen kann nur sein, was unterhalb der Ansicht liegt).
+    fn set_offset(&self, offset: usize) {
+        self.offset.set(offset);
+        self.unseen.set(self.unseen.get().min(offset));
+    }
+
+    /// Größter sinnvoller Offset laut letzter Messung; ohne Messung
+    /// unbegrenzt (das nächste [`ChatScroll::sync_layout`] kappt).
+    fn cached_max_offset(&self) -> usize {
+        self.last
+            .get()
+            .map_or(usize::MAX, |m| m.total.saturating_sub(m.viewport))
     }
 
     /// Scrollt um `lines` Zeilen nach oben (in Richtung älterer Nachrichten).
@@ -111,100 +147,158 @@ impl ChatScroll {
     /// - `viewport` (`usize`): Höhe des sichtbaren Bereichs in Zeilen.
     pub fn scroll_up(&mut self, lines: usize, total_lines: usize, viewport: usize) {
         let max_offset = total_lines.saturating_sub(viewport);
-        self.offset = self.offset.saturating_add(lines).min(max_offset);
+        self.set_offset(self.offset.get().saturating_add(lines).min(max_offset));
+    }
+
+    /// Wie [`ChatScroll::scroll_up`], aber gegen die zuletzt beim Zeichnen
+    /// gemessene Geometrie begrenzt (für Ansichten, deren Tasten-Handler die
+    /// Zeilenzahl nicht kennen, z. B. die Agenten-Detailspur).
+    pub fn scroll_up_measured(&mut self, lines: usize) {
+        let max_offset = self.cached_max_offset();
+        self.set_offset(self.offset.get().saturating_add(lines).min(max_offset));
     }
 
     /// Scrollt um `lines` Zeilen nach unten (in Richtung neuerer Nachrichten).
-    ///
-    /// # Description
-    /// Reduziert den Offset um `lines`. Erreicht der Offset 0, ist Auto-Follow wieder aktiv.
-    ///
-    /// # Arguments
-    /// - `lines` (`usize`): Anzahl Zeilen, um die nach unten gescrollt wird.
+    /// Erreicht der Offset 0, ist Auto-Follow wieder aktiv.
     pub fn scroll_down(&mut self, lines: usize) {
-        self.offset = self.offset.saturating_sub(lines);
+        self.set_offset(self.offset.get().saturating_sub(lines));
     }
 
     /// Springt um eine Viewport-Höhe nach oben (Seite rauf).
-    ///
-    /// # Description
-    /// Erhöht den Offset um `viewport` Zeilen, clamped auf das Maximum.
-    ///
-    /// # Arguments
-    /// - `total_lines` (`usize`): Gesamtanzahl aller Zeilen in der Historie.
-    /// - `viewport` (`usize`): Höhe des sichtbaren Bereichs in Zeilen.
     pub fn page_up(&mut self, total_lines: usize, viewport: usize) {
         self.scroll_up(viewport, total_lines, viewport);
     }
 
     /// Springt um eine Viewport-Höhe nach unten (Seite runter).
-    ///
-    /// # Description
-    /// Reduziert den Offset um `viewport` Zeilen.
-    ///
-    /// # Arguments
-    /// - `viewport` (`usize`): Höhe des sichtbaren Bereichs in Zeilen.
     pub fn page_down(&mut self, viewport: usize) {
         self.scroll_down(viewport);
     }
 
     /// Springt an den Anfang der Historie (älteste Nachrichten).
-    ///
-    /// # Description
-    /// Setzt den Offset auf den maximalen Wert `total_lines.saturating_sub(viewport)`.
-    ///
-    /// # Arguments
-    /// - `total_lines` (`usize`): Gesamtanzahl aller Zeilen in der Historie.
-    /// - `viewport` (`usize`): Höhe des sichtbaren Bereichs in Zeilen.
     pub fn jump_to_top(&mut self, total_lines: usize, viewport: usize) {
-        self.offset = total_lines.saturating_sub(viewport);
+        self.set_offset(total_lines.saturating_sub(viewport));
+    }
+
+    /// Wie [`ChatScroll::jump_to_top`] mit der zuletzt gemessenen Geometrie.
+    pub fn jump_to_top_measured(&mut self) {
+        self.set_offset(self.cached_max_offset());
     }
 
     /// Springt an das Ende der Historie (neueste Nachrichten) und reaktiviert Auto-Follow.
-    ///
-    /// # Description
-    /// Setzt Offset auf 0.
     pub fn jump_to_bottom(&mut self) {
-        self.offset = 0;
+        self.set_offset(0);
     }
 
-    /// Reagiert auf neue Inhalte in der Chat-Historie.
+    /// Frühere Benachrichtigung über neuen Inhalt — bewusst ein No-Op.
     ///
     /// # Description
-    /// Wenn Auto-Follow aktiv ist (`offset = 0`), bleibt der Offset 0 (kein State-Change
-    /// notwendig). Wenn der Nutzer manuell hochgescrollt hat (`offset > 0`), wird der
-    /// Offset nicht verändert, damit die aktuelle Position erhalten bleibt.
-    pub fn on_new_content(&mut self) {
-        // Bei offset=0: Ansicht folgt bereits dem Ende, kein State-Change nötig.
-        // Bei offset>0: Nutzer hat manuell gescrollt — offset bleibt unverändert.
-    }
+    /// Der Anker wird nicht beim Anhängen, sondern beim Zeichnen in
+    /// [`ChatScroll::sync_layout`] nachgeführt: nur dort ist die umbrochene
+    /// Zeilenzahl bekannt, und so sind auch Inhalte erfasst, die ohne
+    /// Anhänge-Aufruf wachsen (Streaming-Deltas, geteilte Zellen,
+    /// Werkzeugergebnisse, Kind-Agenten-Updates).
+    pub fn on_new_content(&mut self) {}
 
     /// Erzwingt Auto-Follow, unabhängig vom aktuellen Zustand.
     ///
     /// # Description
-    /// Setzt `offset = 0`. Sinnvoll nach dem Absenden einer Nachricht
+    /// Setzt `offset = 0`. Nach dem Absenden einer eigenen Nachricht
     /// (Enter/Submit), damit die neue Antwort direkt sichtbar ist.
     pub fn force_follow(&mut self) {
-        self.offset = 0;
+        self.set_offset(0);
+    }
+
+    /// Führt den Anker beim Zeichnen nach und liefert den gültigen Offset.
+    ///
+    /// # Description
+    /// Vergleicht die aktuelle Geometrie mit der des letzten Aufrufs:
+    /// - **Folgen** (`offset = 0`): nichts zu tun, die Ansicht bleibt am Ende.
+    /// - **Hochgescrollt**, gleiche Breite: `offset += total - vorher_total`
+    ///   (Wachstum unten wird als ungesehen gezählt; Schrumpfen unten zieht
+    ///   den Offset nach, ohne dass Folgen stillschweigend wieder angeht).
+    /// - **Hochgescrollt**, andere Breite (Neuumbruch): Offset proportional
+    ///   skaliert — eine exakte Zeilen-Zuordnung gibt es nach Umbruch nicht.
+    /// - **Hochgescrollt**, andere Viewport-Höhe (Freigabe-Dialog, Resize):
+    ///   die oberste sichtbare Zeile bleibt stehen.
+    ///
+    /// Abschließend wird auf `total.saturating_sub(viewport)` gekappt; passt
+    /// alles in den Viewport, folgt die Ansicht wieder.
+    ///
+    /// # Arguments
+    /// - `total_lines` (`usize`): aktuelle Gesamtzeilen (nach Umbruch).
+    /// - `viewport` (`usize`): aktuell sichtbare Zeilen.
+    /// - `width` (`u16`): Umbruchbreite.
+    ///
+    /// # Returns
+    /// Den Offset vom Ende, mit dem jetzt gezeichnet werden soll.
+    pub fn sync_layout(&self, total_lines: usize, viewport: usize, width: u16) -> usize {
+        let now = Measure {
+            total: total_lines,
+            viewport,
+            width,
+        };
+        let prev = self.last.replace(Some(now));
+        let mut offset = self.offset.get();
+        let mut unseen = self.unseen.get();
+        if offset > 0
+            && let Some(prev) = prev
+        {
+            if prev.width == width {
+                if total_lines >= prev.total {
+                    let grown = total_lines - prev.total;
+                    offset = offset.saturating_add(grown);
+                    unseen = unseen.saturating_add(grown);
+                } else {
+                    let shrunk = prev.total - total_lines;
+                    offset = offset.saturating_sub(shrunk).max(1);
+                    unseen = unseen.saturating_sub(shrunk);
+                }
+            } else if prev.total > 0 {
+                let scale = |value: usize| -> usize {
+                    let scaled = (value as u128) * (total_lines as u128) / (prev.total as u128);
+                    usize::try_from(scaled).unwrap_or(usize::MAX)
+                };
+                offset = scale(offset).max(1);
+                unseen = scale(unseen);
+            }
+            // Oberste Zeile halten: start = total - offset - viewport.
+            if viewport < prev.viewport {
+                offset = offset.saturating_add(prev.viewport - viewport);
+            } else {
+                offset = offset.saturating_sub(viewport - prev.viewport).max(1);
+            }
+        }
+        let max_offset = total_lines.saturating_sub(viewport);
+        offset = offset.min(max_offset);
+        self.offset.set(offset);
+        self.unseen.set(unseen.min(offset));
+        offset
+    }
+
+    /// Hinweistext, solange die Ansicht nicht folgt.
+    ///
+    /// # Arguments
+    /// - `jump_key` (`&str`): Anzeigename der Taste, die ans Ende springt
+    ///   (Chat: `"Strg+Ende"`, Agenten-Detail: `"G"`).
+    ///
+    /// # Returns
+    /// `None` beim Folgen, sonst z. B. `"↓ 12 neue Zeilen · Strg+Ende springt ans Ende"`.
+    pub fn indicator_text(&self, jump_key: &str) -> Option<String> {
+        if self.is_following() {
+            return None;
+        }
+        let head = match self.unseen_lines() {
+            0 => "↑ hochgescrollt".to_owned(),
+            1 => "↓ 1 neue Zeile".to_owned(),
+            n => format!("↓ {n} neue Zeilen"),
+        };
+        Some(format!("{head} · {jump_key} springt ans Ende"))
     }
 
     /// Berechnet den sichtbaren Zeilen-Range `[start, end)` für das Rendering.
-    ///
-    /// # Description
-    /// - `end = total_lines - offset` (clamped auf `[0, total_lines]`)
-    /// - `start = end.saturating_sub(viewport)`
-    ///
-    /// Der Aufrufer kann `lines[start..end]` direkt rendern.
-    ///
-    /// # Arguments
-    /// - `total_lines` (`usize`): Gesamtanzahl aller Zeilen in der Historie.
-    /// - `viewport` (`usize`): Höhe des sichtbaren Bereichs in Zeilen.
-    ///
-    /// # Returns
-    /// `(start, end)` als `(usize, usize)` wobei `start <= end <= total_lines`.
     #[cfg(test)]
     fn visible_range(&self, total_lines: usize, viewport: usize) -> (usize, usize) {
-        let end = total_lines.saturating_sub(self.offset);
+        let end = total_lines.saturating_sub(self.offset.get());
         let start = end.saturating_sub(viewport);
         (start, end)
     }
@@ -219,12 +313,9 @@ impl ChatScroll {
     /// - `Shift+Down` → [`scroll_down`](ChatScroll::scroll_down) um 1
     /// - `Ctrl+Home` → [`jump_to_top`](ChatScroll::jump_to_top)
     /// - `Ctrl+End` → [`jump_to_bottom`](ChatScroll::jump_to_bottom)
+    /// - `End` (ohne Modifier) → [`jump_to_bottom`](ChatScroll::jump_to_bottom),
+    ///   aber nur solange hochgescrollt ist (sonst Passthrough an den Composer)
     /// - Alle anderen Keys → [`ScrollAction::Passthrough`]
-    ///
-    /// # Arguments
-    /// - `key` (`KeyEvent`): Das zu verarbeitende Tastatur-Event.
-    /// - `total_lines` (`usize`): Gesamtanzahl aller Zeilen in der Historie.
-    /// - `viewport` (`usize`): Höhe des sichtbaren Bereichs in Zeilen.
     ///
     /// # Returns
     /// [`ScrollAction::Redraw`] wenn der Event konsumiert wurde,
@@ -260,6 +351,10 @@ impl ChatScroll {
                 self.jump_to_bottom();
                 ScrollAction::Redraw
             }
+            KeyCode::End if key.modifiers.is_empty() && !self.is_following() => {
+                self.jump_to_bottom();
+                ScrollAction::Redraw
+            }
             _ => ScrollAction::Passthrough,
         }
     }
@@ -270,15 +365,6 @@ impl ChatScroll {
     /// - `MouseEventKind::ScrollUp` → [`scroll_up`](ChatScroll::scroll_up) um 3 Zeilen
     /// - `MouseEventKind::ScrollDown` → [`scroll_down`](ChatScroll::scroll_down) um 3 Zeilen
     /// - Andere Events → [`ScrollAction::Passthrough`]
-    ///
-    /// # Arguments
-    /// - `ev` (`MouseEvent`): Das zu verarbeitende Maus-Event.
-    /// - `total_lines` (`usize`): Gesamtanzahl aller Zeilen in der Historie.
-    /// - `viewport` (`usize`): Höhe des sichtbaren Bereichs in Zeilen.
-    ///
-    /// # Returns
-    /// [`ScrollAction::Redraw`] wenn das Event konsumiert wurde,
-    /// [`ScrollAction::Passthrough`] sonst.
     pub fn handle_mouse(
         &mut self,
         ev: MouseEvent,
@@ -501,5 +587,178 @@ mod tests {
         s.force_follow();
         assert_eq!(s.offset(), 0, "force_follow muss offset auf 0 setzen");
         assert!(s.is_at_tail(), "force_follow muss Auto-Follow reaktivieren");
+    }
+
+    // ── Folgen nur am Ende (sync_layout) ────────────────────────────────
+
+    /// Erste sichtbare Zeile (Index von oben) für die aktuelle Geometrie.
+    fn first_visible(s: &ChatScroll, total: usize, viewport: usize) -> usize {
+        s.visible_range(total, viewport).0
+    }
+
+    #[test]
+    fn append_while_scrolled_up_keeps_first_visible_line() {
+        let mut s = ChatScroll::new();
+        s.sync_layout(100, 20, 80);
+        s.scroll_up(10, 100, 20);
+        let before = first_visible(&s, 100, 20);
+        assert_eq!(before, 70);
+
+        // Streaming/Werkzeugergebnisse hängen unten 7 Zeilen an.
+        let offset = s.sync_layout(107, 20, 80);
+        assert_eq!(offset, 17, "Offset vom Ende wächst um die neuen Zeilen");
+        assert_eq!(
+            first_visible(&s, 107, 20),
+            before,
+            "sichtbarer Text darf sich beim Anhängen nicht verschieben"
+        );
+        // Mehrere Frames hintereinander (Token für Token) bleiben stabil.
+        s.sync_layout(108, 20, 80);
+        s.sync_layout(130, 20, 80);
+        assert_eq!(first_visible(&s, 130, 20), before);
+        assert!(!s.is_following());
+    }
+
+    #[test]
+    fn append_at_bottom_follows() {
+        let s = ChatScroll::new();
+        s.sync_layout(100, 20, 80);
+        assert_eq!(s.sync_layout(150, 20, 80), 0);
+        assert!(s.is_following());
+        assert_eq!(s.visible_range(150, 20), (130, 150));
+        assert_eq!(s.unseen_lines(), 0);
+        assert_eq!(s.indicator_text("Strg+Ende"), None);
+    }
+
+    #[test]
+    fn user_submit_resets_to_follow() {
+        let mut s = ChatScroll::new();
+        s.sync_layout(100, 20, 80);
+        s.scroll_up(30, 100, 20);
+        s.sync_layout(120, 20, 80);
+        assert!(!s.is_following());
+        assert_eq!(s.unseen_lines(), 20);
+
+        s.force_follow();
+        assert!(s.is_following());
+        assert_eq!(s.unseen_lines(), 0);
+        assert_eq!(s.indicator_text("Strg+Ende"), None);
+        // Danach folgt die Ansicht wieder neuem Inhalt.
+        assert_eq!(s.sync_layout(140, 20, 80), 0);
+    }
+
+    #[test]
+    fn indicator_counts_new_lines() {
+        let mut s = ChatScroll::new();
+        s.sync_layout(100, 20, 80);
+        s.scroll_up(10, 100, 20);
+        assert_eq!(
+            s.indicator_text("Strg+Ende").as_deref(),
+            Some("↑ hochgescrollt · Strg+Ende springt ans Ende")
+        );
+        s.sync_layout(101, 20, 80);
+        assert_eq!(
+            s.indicator_text("Strg+Ende").as_deref(),
+            Some("↓ 1 neue Zeile · Strg+Ende springt ans Ende")
+        );
+        s.sync_layout(113, 20, 80);
+        assert_eq!(s.unseen_lines(), 13);
+        assert_eq!(
+            s.indicator_text("G").as_deref(),
+            Some("↓ 13 neue Zeilen · G springt ans Ende")
+        );
+        // Herunterscrollen macht neue Zeilen sichtbar: höchstens so viele
+        // bleiben ungesehen, wie unter der Ansicht liegen.
+        s.scroll_down(15);
+        assert_eq!(s.offset(), 8);
+        assert_eq!(s.unseen_lines(), 8);
+        s.jump_to_bottom();
+        assert_eq!(s.unseen_lines(), 0);
+        assert_eq!(s.indicator_text("G"), None);
+    }
+
+    #[test]
+    fn viewport_shrink_keeps_top_line_while_reading() {
+        // Ein Freigabe-Dialog ersetzt den Composer und verkleinert den
+        // Verlauf von 20 auf 12 Zeilen: die oberste Zeile bleibt stehen.
+        let mut s = ChatScroll::new();
+        s.sync_layout(100, 20, 80);
+        s.scroll_up(10, 100, 20);
+        let top = first_visible(&s, 100, 20);
+        s.sync_layout(100, 12, 80);
+        assert_eq!(first_visible(&s, 100, 12), top);
+        // Dialog schließt: wieder derselbe Ausschnitt, Folgen bleibt aus.
+        s.sync_layout(100, 20, 80);
+        assert_eq!(first_visible(&s, 100, 20), top);
+        assert_eq!(s.offset(), 10);
+    }
+
+    #[test]
+    fn viewport_shrink_while_following_stays_at_bottom() {
+        let s = ChatScroll::new();
+        s.sync_layout(100, 20, 80);
+        assert_eq!(s.sync_layout(100, 12, 80), 0);
+        assert!(s.is_following());
+    }
+
+    #[test]
+    fn shrink_below_view_does_not_silently_resume_following() {
+        let mut s = ChatScroll::new();
+        s.sync_layout(100, 20, 80);
+        s.scroll_up(2, 100, 20);
+        // Live-Stream-Zeilen verschwinden (z. B. Cursorzeile `▍`).
+        s.sync_layout(95, 20, 80);
+        assert!(!s.is_following());
+        assert_eq!(s.offset(), 1);
+    }
+
+    #[test]
+    fn content_fitting_viewport_resumes_following() {
+        let mut s = ChatScroll::new();
+        s.sync_layout(100, 20, 80);
+        s.scroll_up(10, 100, 20);
+        // `/clear` o. Ä.: alles passt in den Viewport.
+        assert_eq!(s.sync_layout(5, 20, 80), 0);
+        assert!(s.is_following());
+    }
+
+    #[test]
+    fn width_change_scales_offset_and_clamps() {
+        let mut s = ChatScroll::new();
+        s.sync_layout(100, 20, 80);
+        s.scroll_up(40, 100, 20);
+        // Halbe Breite → doppelt so viele umbrochene Zeilen.
+        assert_eq!(s.sync_layout(200, 20, 40), 80);
+        assert!(!s.is_following());
+    }
+
+    #[test]
+    fn plain_end_jumps_only_when_scrolled_up() {
+        let mut s = ChatScroll::new();
+        assert_eq!(
+            s.handle_key(key(KeyCode::End, KeyModifiers::NONE), 100, 20),
+            ScrollAction::Passthrough,
+            "am Ende gehört End dem Composer"
+        );
+        s.scroll_up(5, 100, 20);
+        assert_eq!(
+            s.handle_key(key(KeyCode::End, KeyModifiers::NONE), 100, 20),
+            ScrollAction::Redraw
+        );
+        assert!(s.is_following());
+    }
+
+    #[test]
+    fn measured_helpers_clamp_against_last_layout() {
+        let mut s = ChatScroll::new();
+        // Ohne Messung unbegrenzt; das nächste Zeichnen kappt.
+        s.scroll_up_measured(500);
+        assert_eq!(s.sync_layout(100, 20, 80), 80);
+        s.jump_to_bottom();
+        s.scroll_up_measured(500);
+        assert_eq!(s.offset(), 80);
+        s.jump_to_bottom();
+        s.jump_to_top_measured();
+        assert_eq!(s.offset(), 80);
     }
 }

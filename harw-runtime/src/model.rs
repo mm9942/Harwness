@@ -166,11 +166,44 @@ pub fn build_root_model_with_registry_and_resolver(
     source: ModelSource,
     resolver: Option<&dyn SecretResolver>,
 ) -> RuntimeResult<(Arc<dyn ModelProvider>, ProviderLoadRegistry)> {
+    build_root_model_with_backends(spec, config, source, resolver)
+        .map(|(model, registry, _backends)| (model, registry))
+}
+
+/// Rückgabe von [`build_root_model_with_backends`]: das Root-Modell, die
+/// Auslastungs-Registry und — nur bei [`ModelSource::Configured`] — die
+/// austauschbare Backend-Tabelle des Routers.
+pub type RootModelBuild = (
+    Arc<dyn ModelProvider>,
+    ProviderLoadRegistry,
+    Option<Arc<harw_provider_http::RoutingBackends>>,
+);
+
+/// Wie [`build_root_model_with_registry_and_resolver`], liefert zusätzlich
+/// die Backend-Tabelle des Vorgabe-Routers.
+///
+/// # Description
+/// Nur [`ModelSource::Configured`] baut einen
+/// [`harw_provider_http::RoutingModelProvider`]; dessen
+/// [`harw_provider_http::RoutingBackends`] braucht der Live-Modellwechsel
+/// ([`crate::live_model::LiveModelRouting`]), um einen beim Start nicht
+/// baubaren Provider-Client neu einzusetzen. Alle anderen Quellen liefern
+/// `None`.
+///
+/// # Errors
+/// Wie [`build_root_model_with_resolver`].
+pub fn build_root_model_with_backends(
+    spec: &RuntimeSpec,
+    config: &ResolvedConfig,
+    source: ModelSource,
+    resolver: Option<&dyn SecretResolver>,
+) -> RuntimeResult<RootModelBuild> {
     match source {
-        ModelSource::Override(provider) => Ok((provider, ProviderLoadRegistry::new())),
+        ModelSource::Override(provider) => Ok((provider, ProviderLoadRegistry::new(), None)),
         ModelSource::Echo(reply) => Ok((
             Arc::new(EchoModelProvider::new(reply)),
             ProviderLoadRegistry::new(),
+            None,
         )),
         ModelSource::Configured => {
             // Fallback-Speicherplatz: nur belegt, wenn `resolve_default_model`
@@ -210,11 +243,12 @@ pub fn build_root_model_with_registry_and_resolver(
                                 .to_owned(),
                         )),
                         ProviderLoadRegistry::new(),
+                        None,
                     ));
                 }
             };
-            let (provider, registry) =
-                harw_provider_http::build_provider_with_load_registry_and_home(
+            let (router, registry) =
+                harw_provider_http::build_routing_provider_with_load_registry_and_home(
                     effective_config,
                     spec.home.as_path(),
                     resolver,
@@ -222,7 +256,9 @@ pub fn build_root_model_with_registry_and_resolver(
                 .map_err(|error| RuntimeError::Provider {
                     detail: error.to_string(),
                 })?;
-            Ok((Arc::from(provider), registry))
+            let backends = router.backends();
+            let model: Arc<dyn ModelProvider> = Arc::new(router);
+            Ok((model, registry, Some(backends)))
         }
     }
 }
@@ -621,6 +657,12 @@ impl ModelProvider for UiaDefaultRouteProvider {
     /// `self.inner.pinned_model_id()`.
     fn pinned_model_id(&self) -> Option<String> {
         self.inner.pinned_model_id()
+    }
+
+    /// Reicht die gepinnte Provider-ID des inneren Routers durch (wie
+    /// [`Self::pinned_model_id`]: die UIA-Standardroute ist kein Pin).
+    fn pinned_provider_id(&self) -> Option<String> {
+        self.inner.pinned_provider_id()
     }
 }
 

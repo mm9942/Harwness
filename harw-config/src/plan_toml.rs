@@ -46,13 +46,14 @@ pub struct ToolsSection {
 ///
 /// let section: DocSection = toml::from_str("remote_ocr = \"off\"").expect("valid");
 /// assert_eq!(section.remote_ocr, RemoteOcrMode::Off);
-/// assert_eq!(DocSection::default().remote_ocr, RemoteOcrMode::Ask);
+/// assert_eq!(DocSection::default().remote_ocr, RemoteOcrMode::Off);
 /// ```
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct DocSection {
     /// Ob `doc.read_pdf` Workspace-PDFs an einen Remote-OCR-Dienst (Mistral)
-    /// schicken darf. Default [`RemoteOcrMode::Ask`].
+    /// schicken darf. Default [`RemoteOcrMode::Off`]: ohne Angabe bleibt
+    /// OCR lokal.
     #[serde(default)]
     pub remote_ocr: RemoteOcrMode,
 }
@@ -68,12 +69,12 @@ pub struct DocSection {
 #[serde(rename_all = "lowercase")]
 pub enum RemoteOcrMode {
     /// Nie remote: der OCR-Client wird gar nicht installiert, `doc.read_pdf`
-    /// extrahiert immer lokal.
+    /// extrahiert immer lokal. Default, wenn nichts angegeben ist.
+    #[default]
     Off,
     /// Remote nur nach Freigabe: jeder `doc.read_pdf`-Aufruf, der an den
     /// Remote-Dienst ginge, braucht eine Nutzer-Freigabe (auch im
     /// Vollzugriff).
-    #[default]
     Ask,
     /// Remote ohne Nachfrage, sobald ein Mistral-Provider konfiguriert ist
     /// (bisheriges Verhalten).
@@ -320,11 +321,11 @@ mod tests {
     }
 
     #[test]
-    fn test_tools_doc_remote_ocr_defaults_to_ask() -> TestResult {
+    fn test_tools_doc_remote_ocr_defaults_to_off() -> TestResult {
         let tools: ToolsSection = toml::from_str("").map_err(ctx("parse empty"))?;
-        assert_eq!(tools.doc.remote_ocr, RemoteOcrMode::Ask);
+        assert_eq!(tools.doc.remote_ocr, RemoteOcrMode::Off);
         let tools: ToolsSection = toml::from_str("[doc]\n").map_err(ctx("parse empty doc"))?;
-        assert_eq!(tools.doc.remote_ocr, RemoteOcrMode::Ask);
+        assert_eq!(tools.doc.remote_ocr, RemoteOcrMode::Off);
         Ok(())
     }
 

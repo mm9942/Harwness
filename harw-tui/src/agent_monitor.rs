@@ -21,9 +21,10 @@ use ratatui::{
     layout::Rect,
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, Paragraph, Widget, Wrap},
+    widgets::{Block, Borders, Clear, Paragraph, Widget, Wrap},
 };
 
+use crate::chat_scroll::ChatScroll;
 use crate::sanitize::{sanitize_display, sanitize_inline};
 use crate::style::{self, Theme};
 
@@ -397,6 +398,9 @@ pub(crate) struct AgentLive {
     pub role: String,
     /// Vom Kind angesprochenes Modell (aus `AgentOrchestrationEvent::model`).
     pub model: Option<String>,
+    /// Vom Kind angesprochener Provider (aus
+    /// `AgentOrchestrationEvent::provider`); Anzeige `<provider>/<modell>`.
+    pub provider: Option<String>,
     pub phase: AgentPhase,
     pub task: Option<String>,
     pub current_tool: Option<String>,
@@ -430,6 +434,7 @@ impl AgentLive {
             parent,
             role,
             model: None,
+            provider: None,
             phase: AgentPhase::Admitted,
             task: None,
             current_tool: None,
@@ -555,6 +560,11 @@ impl AgentMonitor {
                     && live.model.as_deref() != Some(model.as_str())
                 {
                     live.model = Some(model.clone());
+                }
+                if let Some(provider) = &orch.provider
+                    && live.provider.as_deref() != Some(provider.as_str())
+                {
+                    live.provider = Some(provider.clone());
                 }
                 let before = live.phase;
                 live.phase = match orch.status {
@@ -885,15 +895,18 @@ impl AgentMonitor {
     /// `∴`, Werkzeugaufrufe cyan, Ergebnisse grün bzw. rot, Text normal.
     ///
     /// # Argumente
-    /// - `scroll`: Abstand in (umbrochenen) Zeilen vom Ende der Spur; `0`
-    ///   folgt dem neuesten Eintrag. Zu große Werte werden am Anfang gekappt.
+    /// - `scroll`: Scroll-Zustand der Spur (Abstand in umbrochenen Zeilen vom
+    ///   Ende; `0` folgt dem neuesten Eintrag). Hochgescrollt bleibt der
+    ///   Ausschnitt bei neuen Spur-Einträgen stehen — der Anker wird hier über
+    ///   [`ChatScroll::sync_layout`] nachgeführt; zu große Werte werden am
+    ///   Anfang gekappt.
     /// - `show_reasoning`: `false` zeigt Reasoning nur als einzeiligen Hinweis.
     pub(crate) fn render_agent_detail(
         &self,
         agent: &SessionId,
         area: Rect,
         buf: &mut Buffer,
-        scroll: u16,
+        scroll: &ChatScroll,
         show_reasoning: bool,
     ) {
         let Some(live) = self.agents.get(agent.as_str()) else {
@@ -966,34 +979,44 @@ impl AgentMonitor {
         let trace =
             Paragraph::new(trace_lines(&live.trace, show_reasoning)).wrap(Wrap { trim: false });
         let total = trace.line_count(trace_area.width);
-        let max_top = total.saturating_sub(usize::from(trace_area.height));
-        let top = max_top.saturating_sub(usize::from(scroll));
+        let viewport = usize::from(trace_area.height);
+        let back = scroll.sync_layout(total, viewport, trace_area.width);
+        let max_top = total.saturating_sub(viewport);
+        let top = max_top.saturating_sub(back);
         trace
             .scroll((u16::try_from(top).unwrap_or(u16::MAX), 0))
             .render(trace_area, buf);
+        // Hinweis, solange die Spur nicht folgt (unterste Zeile, rechtsbündig).
+        if let Some(text) = scroll.indicator_text("G") {
+            let label = format!(" {text} ");
+            let label_width = u16::try_from(label.chars().count())
+                .unwrap_or(u16::MAX)
+                .min(trace_area.width);
+            let indicator_area = Rect {
+                x: trace_area.x + trace_area.width - label_width,
+                y: trace_area.y + trace_area.height - 1,
+                width: label_width,
+                height: 1,
+            };
+            Clear.render(indicator_area, buf);
+            Paragraph::new(label)
+                .style(
+                    Style::default()
+                        .fg(Color::Yellow)
+                        .add_modifier(Modifier::REVERSED),
+                )
+                .render(indicator_area, buf);
+        }
     }
 }
 
-/// Kurzform einer Modell-ID für die Panel-Zeile.
-///
-/// # Beschreibung
-/// Entfernt ein Provider-Präfix (`anthropic/claude-x` → `claude-x`) und ein
-/// angehängtes achtstelliges Datum (`claude-x-20250101` → `claude-x`).
-/// Liefert die Eingabe unverändert, wenn danach nichts übrig bliebe.
-fn short_model_name(model: &str) -> String {
-    let base = model.rsplit('/').next().unwrap_or(model);
-    let trimmed = match base.rsplit_once('-') {
-        Some((head, tail))
-            if !head.is_empty() && tail.len() == 8 && tail.bytes().all(|b| b.is_ascii_digit()) =>
-        {
-            head
-        }
-        _ => base,
-    };
-    if trimmed.is_empty() {
-        model.to_owned()
-    } else {
-        trimmed.to_owned()
+impl AgentLive {
+    /// Provider und Modell, die dieser Agent tatsächlich anspricht, als
+    /// `<provider>/<modell>` (aufgelöste Modell-ID, kein Alias, keine
+    /// gekürzte Form); ohne Provider nur das Modell.
+    #[must_use]
+    pub(crate) fn model_route(&self) -> Option<String> {
+        crate::app::live_model::route_label(self.provider.as_deref(), self.model.as_deref())
     }
 }
 
@@ -1023,10 +1046,10 @@ fn detail_header_lines(live: &AgentLive, width: usize) -> Vec<Line<'static>> {
             dim,
         ),
     ])];
-    if let Some(model) = &live.model {
+    if let Some(route) = live.model_route() {
         lines.push(Line::from(vec![
             Span::styled("Modell: ", dim),
-            Span::raw(sanitize_inline(model)),
+            Span::raw(sanitize_inline(&route)),
         ]));
     }
     if let Some(task) = &live.task {
@@ -1216,9 +1239,8 @@ pub(crate) fn render_agents_panel(
                 Style::default().add_modifier(Modifier::BOLD),
             ),
             Span::styled(
-                live.model
-                    .as_deref()
-                    .map(|model| format!(" · {}", sanitize_inline(&short_model_name(model))))
+                live.model_route()
+                    .map(|route| format!(" · {}", sanitize_inline(&route)))
                     .unwrap_or_default(),
                 style::dim_style(theme),
             ),
@@ -1720,6 +1742,18 @@ mod tests {
         scroll: u16,
         show_reasoning: bool,
     ) -> TestResult<String> {
+        let mut state = ChatScroll::new();
+        state.scroll_up_measured(usize::from(scroll));
+        render_with_state(monitor, width, height, &state, show_reasoning)
+    }
+
+    fn render_with_state(
+        monitor: &AgentMonitor,
+        width: u16,
+        height: u16,
+        scroll: &ChatScroll,
+        show_reasoning: bool,
+    ) -> TestResult<String> {
         let id = SessionId::try_from_str("a")?;
         let mut terminal =
             ratatui::Terminal::new(ratatui::backend::TestBackend::new(width, height))?;
@@ -1738,14 +1772,30 @@ mod tests {
         Ok(out)
     }
 
+    /// Agentenzeilen zeigen `<provider>/<modell>` mit der vollen Modell-ID
+    /// des Kindes (kein Alias, kein gekürztes Datum).
     #[test]
-    fn short_model_name_strips_provider_prefix_and_date_suffix() {
+    fn model_route_shows_provider_and_full_model_id() {
+        let mut live = AgentLive::new("a".into(), None, "explorer".into());
+        assert_eq!(live.model_route(), None);
+        live.model = Some("claude-sonnet-4-5-20250929".into());
         assert_eq!(
-            short_model_name("anthropic/claude-sonnet-4-5-20250929"),
-            "claude-sonnet-4-5"
+            live.model_route().as_deref(),
+            Some("claude-sonnet-4-5-20250929")
         );
-        assert_eq!(short_model_name("gpt-5-mini"), "gpt-5-mini");
-        assert_eq!(short_model_name("provider/"), "provider/");
+        live.provider = Some("anthropic".into());
+        assert_eq!(
+            live.model_route().as_deref(),
+            Some("anthropic/claude-sonnet-4-5-20250929")
+        );
+        let header: String = detail_header_lines(&live, 80)
+            .iter()
+            .flat_map(|line| line.spans.iter().map(|span| span.content.to_string()))
+            .collect();
+        assert!(
+            header.contains("Modell: anthropic/claude-sonnet-4-5-20250929"),
+            "{header}"
+        );
     }
 
     #[test]
@@ -1773,6 +1823,7 @@ mod tests {
                 detail: None,
                 tool_calls: None,
                 model: None,
+                provider: None,
             }),
         });
         let call_id = harw_types::ToolCallId::new();
@@ -1829,7 +1880,7 @@ mod tests {
         let id = SessionId::try_from_str("a")?;
         let area = Rect::new(0, 0, 70, 20);
         let mut buf = Buffer::empty(area);
-        monitor.render_agent_detail(&id, area, &mut buf, 0, true);
+        monitor.render_agent_detail(&id, area, &mut buf, &ChatScroll::new(), true);
         let find = |needle: char| -> Option<Style> {
             (0..area.height).find_map(|y| {
                 (0..area.width).find_map(|x| {
@@ -1862,6 +1913,51 @@ mod tests {
         let top = render_to_string(&monitor, 50, 16, u16::MAX, true)?;
         assert!(top.contains("Eintrag-00"), "{top}");
         assert!(!top.contains("Eintrag-39"), "{top}");
+        Ok(())
+    }
+
+    /// Erster sichtbarer `Eintrag-NN` in einer gerenderten Ansicht.
+    fn first_entry(shown: &str) -> Option<String> {
+        shown
+            .find("Eintrag-")
+            .map(|at| shown[at..at + 10].to_owned())
+    }
+
+    /// Hochgescrollt bleibt der Ausschnitt stehen, wenn der Kind-Agent neue
+    /// Spur-Einträge liefert; am Ende folgt die Ansicht.
+    #[test]
+    fn detail_view_keeps_position_when_scrolled_up_and_follows_at_bottom() -> TestResult {
+        let mut monitor = AgentMonitor::default();
+        apply_all(
+            &mut monitor,
+            vec![TurnEvent::TurnAborted { turn_id: t1()? }],
+        )?;
+        let live = monitor.agents.get_mut("a").ok_or("agent")?;
+        for index in 0..40 {
+            live.trace.push_status(&format!("Eintrag-{index:02}"));
+        }
+        let mut reading = ChatScroll::new();
+        let following = ChatScroll::new();
+        // Erstes Zeichnen misst die Spur, danach 5 Zeilen hochscrollen.
+        render_with_state(&monitor, 50, 16, &reading, true)?;
+        render_with_state(&monitor, 50, 16, &following, true)?;
+        reading.scroll_up_measured(5);
+        let before = render_with_state(&monitor, 50, 16, &reading, true)?;
+        let first_before = first_entry(&before).ok_or("kein Eintrag sichtbar")?;
+
+        let live = monitor.agents.get_mut("a").ok_or("agent")?;
+        for index in 40..46 {
+            live.trace.push_status(&format!("Eintrag-{index:02}"));
+        }
+        let after = render_with_state(&monitor, 50, 16, &reading, true)?;
+        assert_eq!(first_entry(&after), Some(first_before), "{after}");
+        assert!(!after.contains("Eintrag-45"), "{after}");
+        assert!(after.contains("neue Zeilen"), "{after}");
+        assert!(after.contains("G springt ans Ende"), "{after}");
+
+        let tail = render_with_state(&monitor, 50, 16, &following, true)?;
+        assert!(tail.contains("Eintrag-45"), "{tail}");
+        assert!(!tail.contains("springt ans Ende"), "{tail}");
         Ok(())
     }
 

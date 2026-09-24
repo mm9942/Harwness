@@ -26,6 +26,8 @@ pub mod handoff;
 // Runde 5, Teil N: Host-Mode-Anfrage aus dem Orchestrator-Baum.
 pub mod host_escalation_wiring;
 pub mod job_ledger;
+// Live-Modellwechsel: Kinder, Rollenwahl und Provider-Neubau ohne Neustart.
+pub mod live_model;
 pub mod mcp_wiring;
 pub mod memory_wiring;
 pub mod model;

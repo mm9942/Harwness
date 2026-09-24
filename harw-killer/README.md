@@ -21,9 +21,11 @@ exit is never selected.
    targets.
 2. **The agent tool `process.kill`** (crate `harw-tool-process`, see
    `harw-tool-process/src/provider.rs`) — used by the agent runtime through
-   `harw_killer::api::kill_own`. This path is always approval-gated: it is
-   listed in `ALWAYS_ASK_TOOLS` (`harw-registry-defaults`) and is never
-   auto-approved, even under `FullAccess` or a matching allow rule. It
+   `harw_killer::api::kill_own`. In the approval modes `ask` and `auto`
+   this path is always approval-gated: it is listed in `ALWAYS_ASK_TOOLS`
+   (`harw-registry-defaults`) and is never auto-approved, even with a
+   matching allow rule. Under `FullAccess` nothing asks, including this
+   tool (the user chose "no confirmations at all"). It
    **never invokes sudo**: only processes owned by the current effective UID
    can be killed. A process owned by another user is reported as an error
    result (`"fremder Prozess: sudo nicht erlaubt"`), never signalled, even

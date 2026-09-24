@@ -113,12 +113,12 @@ credential) or local. For running against a local model server (vLLM, LM
 Studio, Ollama), see
 [`docs/setup/local-models.md`](local-models.md).
 
-A configured Mistral provider (provider key `mistral` or base URL host
-`api.mistral.ai`) also enables remote OCR for `doc.read_pdf`: PDFs from the
-workspace can then be uploaded to the Mistral API for text extraction. This
-is controlled by `[tools.doc].remote_ocr` in `config.toml`: `"ask"` (the
-default) asks for approval before each upload, `"on"` uploads without
-asking, `"off"` always extracts locally. See
+Remote OCR for `doc.read_pdf` is off unless you turn it on. With a Mistral
+provider configured (provider key `mistral` or base URL host
+`api.mistral.ai`), set `[tools.doc].remote_ocr` in `config.toml` to upload
+workspace PDFs to the Mistral API for text extraction: `"ask"` asks for
+approval before each upload, `"on"` uploads without asking. Without the
+setting (`"off"`, the default) PDFs are always extracted locally. See
 [`docs/design/config-scopes.md`](../design/config-scopes.md) §1.8a.
 
 ## Optional: user services

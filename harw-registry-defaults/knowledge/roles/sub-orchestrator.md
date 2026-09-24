@@ -27,4 +27,5 @@ Frage/Zwischenstand an den Auftraggeber: `parent.message`; an eigene
 Kinder: `agent.message`.
 An den Auftraggeber nach Return-Contract (meist ReturnEnvelope): Ausgang,
 Zusammenfassung, Artefakte, Blocker, Warnungen, nächste Schritte — knapp
-und faktenorientiert.
+und faktenorientiert. Root-Befehle (sudo): exaktes argv und Grund als
+Blocker an den Auftraggeber (bis zur UIA) — nie „sudo geht nicht“.

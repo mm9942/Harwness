@@ -938,6 +938,131 @@ fn anthropic_error_for_status(
     }
 }
 
+/// Diagnose eines Anthropic-429 aus den `anthropic-ratelimit-*`-Headern.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+struct RateLimitDiagnosis {
+    /// Späteste Reset-Zeit (in Sekunden ab jetzt) der erschöpften Limits.
+    reset_secs: Option<u64>,
+    /// Kurzbeschreibung der erschöpften Limits, z. B.
+    /// „input-tokens 0/30000, Reset in 42 s".
+    summary: Option<String>,
+}
+
+/// Liest aus den Antwort-Headern eines Anthropic-429, **welches** Limit
+/// erschöpft ist und wann es zurückgesetzt wird.
+///
+/// # Description
+/// - Klassische API-Limits `anthropic-ratelimit-{requests,input-tokens,
+///   output-tokens,tokens}-{limit,remaining,reset}` (`reset` als RFC 3339):
+///   gemeldet wird jede Dimension mit `remaining == 0`.
+/// - Abo-/OAuth-Limits `anthropic-ratelimit-unified-{status,
+///   representative-claim,reset}` (`reset` als Unix-Sekunden): gemeldet,
+///   wenn `status` nicht `allowed` ist; bei `rejected` zählt `reset` auch
+///   als Wartehinweis.
+///
+/// # Arguments
+/// - `headers`: Antwort-Header.
+/// - `now_epoch` (`f64`): aktuelle Unix-Zeit in Sekunden (injizierbar).
+fn anthropic_rate_limit_diagnosis(
+    headers: &reqwest::header::HeaderMap,
+    now_epoch: f64,
+) -> RateLimitDiagnosis {
+    let header = |name: &str| super::header_string(headers, name);
+    let seconds_until = |epoch: f64| -> u64 {
+        let delta = (epoch - now_epoch).max(0.0).ceil();
+        // Gedeckelt auf einen Tag, wie `retry_after_hint`.
+        if delta >= 86_400.0 {
+            86_400
+        } else {
+            delta as u64
+        }
+    };
+    let mut parts: Vec<String> = Vec::new();
+    let mut reset_secs: Option<u64> = None;
+    for label in ["requests", "input-tokens", "output-tokens", "tokens"] {
+        let prefix = format!("anthropic-ratelimit-{label}");
+        let remaining = header(&format!("{prefix}-remaining"))
+            .and_then(|value| value.trim().parse::<u64>().ok());
+        if remaining != Some(0) {
+            continue;
+        }
+        let limit =
+            header(&format!("{prefix}-limit")).and_then(|value| value.trim().parse::<u64>().ok());
+        let reset = header(&format!("{prefix}-reset"))
+            .and_then(|value| crate::rate_limiter::parse_rfc3339_epoch_seconds(&value))
+            .map(seconds_until);
+        let mut part = match limit {
+            Some(limit) => format!("{label} 0/{limit}"),
+            None => format!("{label} erschöpft"),
+        };
+        if let Some(reset) = reset {
+            part.push_str(&format!(", Reset in {reset} s"));
+            reset_secs = Some(reset_secs.map_or(reset, |current| current.max(reset)));
+        }
+        parts.push(part);
+    }
+    if let Some(status) = header("anthropic-ratelimit-unified-status")
+        .map(|value| value.trim().to_owned())
+        .filter(|status| !status.is_empty() && status != "allowed")
+    {
+        let mut part = format!("Abo-Limit {status}");
+        if let Some(claim) = header("anthropic-ratelimit-unified-representative-claim")
+            .map(|value| value.trim().to_owned())
+            .filter(|claim| !claim.is_empty())
+        {
+            part.push_str(&format!(" ({claim})"));
+        }
+        let reset = header("anthropic-ratelimit-unified-reset")
+            .and_then(|value| value.trim().parse::<f64>().ok())
+            .map(seconds_until);
+        if let Some(reset) = reset {
+            part.push_str(&format!(", Reset in {reset} s"));
+            if status == "rejected" {
+                reset_secs = Some(reset_secs.map_or(reset, |current| current.max(reset)));
+            }
+        }
+        parts.push(part);
+    }
+    RateLimitDiagnosis {
+        reset_secs,
+        summary: (!parts.is_empty()).then(|| {
+            let joined: String = parts.join("; ").chars().take(300).collect();
+            format!("Limit: {joined}")
+        }),
+    }
+}
+
+/// Ergänzt einen [`ModelError::RateLimited`] um die Header-Diagnose.
+///
+/// # Description
+/// Die Meldung bekommt die Kurzbeschreibung angehängt. Fehlte ein
+/// expliziter Wartehinweis (`retry-after`/`retry-after-ms`,
+/// `has_header_hint == false`), wird die Reset-Zeit der erschöpften Limits
+/// statt des pauschalen 30-s-Fallbacks zum Wartehinweis. Andere Fehler
+/// bleiben unverändert.
+fn apply_rate_limit_diagnosis(
+    error: ModelError,
+    diagnosis: &RateLimitDiagnosis,
+    has_header_hint: bool,
+) -> ModelError {
+    match error {
+        ModelError::RateLimited {
+            retry_after_secs,
+            message,
+        } => ModelError::RateLimited {
+            retry_after_secs: match diagnosis.reset_secs {
+                Some(reset) if !has_header_hint && reset > 0 => reset,
+                _ => retry_after_secs,
+            },
+            message: match &diagnosis.summary {
+                Some(summary) => format!("{message} [{summary}]"),
+                None => message,
+            },
+        },
+        other => other,
+    }
+}
+
 impl AnthropicMessagesProvider {
     /// Sendet **einen** Versuch mit dem durch `credential_idx` gewählten
     /// Credential (siehe [`Self::request_target`]). Der eigentliche Körper
@@ -1036,6 +1161,9 @@ impl AnthropicMessagesProvider {
             .wait_for_slot_with_estimate(estimated_input)
             .await
             .map_err(crate::rate_budget_error)?;
+        // Laufende 429-Abkühlphase dieses Providers (UIA und Kinder teilen
+        // sich die Instanz) abwarten, bevor ein Slot belegt wird.
+        self.rate_limiter.wait_for_cooldown().await;
         // Hartes Nebenläufigkeits-Limit (siehe [`Self::concurrency_limiter`]):
         // blockiert, bis ein Slot frei wird, statt fehlzuschlagen. Der Guard
         // bleibt bis zum Ende dieser Funktion (also bis der Response-Body
@@ -1067,6 +1195,12 @@ impl AnthropicMessagesProvider {
         let retry_after_header = super::header_string(response.headers(), "retry-after");
         let retry_after_ms_header = super::header_string(response.headers(), "retry-after-ms");
         let request_id = super::provider_request_id(response.headers());
+        let rate_limit_diagnosis = (status.as_u16() == 429).then(|| {
+            let now_epoch = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0.0, |elapsed| elapsed.as_secs_f64());
+            anthropic_rate_limit_diagnosis(response.headers(), now_epoch)
+        });
         if status.is_success()
             && let Some(sink) = stream_sink
         {
@@ -1100,13 +1234,27 @@ impl AnthropicMessagesProvider {
                 );
                 self.budgets.penalize(model, hint.map(Duration::from_secs));
             }
-            let error = anthropic_error_for_status(
+            let mut error = anthropic_error_for_status(
                 status.as_u16(),
                 request_id.as_deref(),
                 retry_after_header.as_deref(),
                 retry_after_ms_header.as_deref(),
                 &body,
             );
+            if let Some(diagnosis) = &rate_limit_diagnosis {
+                let has_header_hint =
+                    retry_after_header.is_some() || retry_after_ms_header.is_some();
+                error = apply_rate_limit_diagnosis(error, diagnosis, has_header_hint);
+            }
+            if let ModelError::RateLimited {
+                retry_after_secs, ..
+            } = &error
+            {
+                // Gemeinsame Abkühlphase für alle Requests dieses Providers
+                // (siehe `ProviderRateLimiter::note_rate_limit_cooldown`).
+                self.rate_limiter
+                    .note_rate_limit_cooldown(Duration::from_secs(*retry_after_secs));
+            }
             tracing::debug!(
                 status = status.as_u16(),
                 retryable = error.is_retryable(),
@@ -2832,6 +2980,107 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    fn header_map(pairs: &[(&'static str, &str)]) -> TestResult<reqwest::header::HeaderMap> {
+        let mut headers = reqwest::header::HeaderMap::new();
+        for (name, value) in pairs {
+            headers.insert(
+                *name,
+                reqwest::header::HeaderValue::from_str(value).map_err(ctx("header value"))?,
+            );
+        }
+        Ok(headers)
+    }
+
+    /// Export 429: die Meldung nennt das erschöpfte Limit; ohne
+    /// `retry-after` wird dessen Reset zum Wartehinweis.
+    #[test]
+    fn test_rate_limit_diagnosis_names_exhausted_limits_and_reset() -> TestResult {
+        // 2026-09-24T19:40:00Z = 1790278800
+        let now = 1_790_278_800.0;
+        let headers = header_map(&[
+            ("anthropic-ratelimit-requests-limit", "50"),
+            ("anthropic-ratelimit-requests-remaining", "49"),
+            ("anthropic-ratelimit-input-tokens-limit", "30000"),
+            ("anthropic-ratelimit-input-tokens-remaining", "0"),
+            (
+                "anthropic-ratelimit-input-tokens-reset",
+                "2026-09-24T19:40:42Z",
+            ),
+        ])?;
+        let diagnosis = anthropic_rate_limit_diagnosis(&headers, now);
+        assert_eq!(diagnosis.reset_secs, Some(42));
+        assert_eq!(
+            diagnosis.summary.as_deref(),
+            Some("Limit: input-tokens 0/30000, Reset in 42 s")
+        );
+
+        let error = anthropic_error_for_status(
+            429,
+            None,
+            None,
+            None,
+            r#"{"type":"error","error":{"type":"rate_limit_error","message":"Error"}}"#,
+        );
+        let error = apply_rate_limit_diagnosis(error, &diagnosis, false);
+        let ModelError::RateLimited {
+            retry_after_secs,
+            message,
+        } = &error
+        else {
+            return Err(TestError::Unexpected(format!("{error:?}")));
+        };
+        assert_eq!(*retry_after_secs, 42);
+        assert!(message.contains("rate_limit_error: Error"), "{message}");
+        assert!(
+            message.contains("[Limit: input-tokens 0/30000"),
+            "{message}"
+        );
+
+        // Ein expliziter `retry-after` bleibt maßgeblich.
+        let hinted = apply_rate_limit_diagnosis(
+            ModelError::RateLimited {
+                retry_after_secs: 7,
+                message: "m".to_owned(),
+            },
+            &diagnosis,
+            true,
+        );
+        assert!(matches!(
+            hinted,
+            ModelError::RateLimited {
+                retry_after_secs: 7,
+                ..
+            }
+        ));
+        Ok(())
+    }
+
+    /// Abo-/OAuth-Limits (`anthropic-ratelimit-unified-*`).
+    #[test]
+    fn test_rate_limit_diagnosis_reports_unified_subscription_limit() -> TestResult {
+        let now = 1_000.0;
+        let headers = header_map(&[
+            ("anthropic-ratelimit-unified-status", "rejected"),
+            (
+                "anthropic-ratelimit-unified-representative-claim",
+                "five_hour",
+            ),
+            ("anthropic-ratelimit-unified-reset", "4600"),
+        ])?;
+        let diagnosis = anthropic_rate_limit_diagnosis(&headers, now);
+        assert_eq!(diagnosis.reset_secs, Some(3_600));
+        assert_eq!(
+            diagnosis.summary.as_deref(),
+            Some("Limit: Abo-Limit rejected (five_hour), Reset in 3600 s")
+        );
+        let allowed = header_map(&[("anthropic-ratelimit-unified-status", "allowed")])?;
+        assert_eq!(
+            anthropic_rate_limit_diagnosis(&allowed, now),
+            RateLimitDiagnosis::default()
+        );
+        Ok(())
     }
 
     #[test]

@@ -22,7 +22,8 @@
 //! Die aufrufende Sitzung kommt aus dem Ausführungskontext
 //! (`OpContext::session_id`), nie aus Modell-Argumenten. Fremde und
 //! unbekannte Kind-IDs bekommen dieselbe Meldung. `agent.cancel` deklariert
-//! `approval = always` und steht in `ALWAYS_ASK_TOOLS` — nie automatisch.
+//! `approval = always` und steht in `ALWAYS_ASK_TOOLS` — unter `ask`/`auto`
+//! nie automatisch (unter `full` fragt nichts).
 //!
 //! # Nebenläufigkeit
 //! Zustandslos; beide Operationen lesen nur kurz das Register des Spawners.

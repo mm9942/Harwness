@@ -94,7 +94,7 @@ use harw_plan_bridge::{FindingStore, register_plan_services};
 use harw_provider_http::ProviderLoadRegistry;
 use harw_sandbox::ExtraRootsCell;
 use harw_session_store::JobStore;
-use harw_tool_shell::HostPermitHandles;
+use harw_tool_shell::{HostLeaseUserControl, HostPermitHandles};
 use harw_types::{Principal, TenantId, WorkspaceId};
 
 use crate::job_ledger::JobStoreTransitions;
@@ -395,6 +395,9 @@ pub struct RuntimeServices {
     /// Runde 5, Teil P: Bestätigungskanal der `plan`-Operation zum
     /// Freigabefenster der TUI (nur TUI-Montage).
     plan_confirm: Option<harw_tool_plan::PlanConfirmChannel>,
+    /// Live-Modellwechsel: Provider-Neubau und Rollenwahl für `/model
+    /// switch`, `/uia-model switch` und `/models set|reset` (nur Slash).
+    live_model_control: Option<harw_ops::live_model::SharedLiveModelControl>,
 }
 
 /// Legt `service` in `map` ab und merkt sich seinen Typnamen in `names`.
@@ -438,7 +441,24 @@ impl RuntimeServices {
             dream_launcher: None,
             auto_decision_log: None,
             plan_confirm: None,
+            live_model_control: None,
         }
+    }
+
+    /// Bindet die Laufzeit-Seite eines Modellwechsels
+    /// ([`harw_ops::live_model::LiveModelControl`]).
+    ///
+    /// # Beschreibung
+    /// Liegt nur auf der Slash-Fläche — die Wechsel-Operationen sind reine
+    /// Operator-Kommandos. Ohne Aufruf verhalten sie sich wie bisher (kein
+    /// Provider-Neubau, Rollenwahl erst ab der nächsten Sitzung).
+    #[must_use]
+    pub fn with_live_model_control(
+        mut self,
+        control: harw_ops::live_model::SharedLiveModelControl,
+    ) -> Self {
+        self.live_model_control = Some(control);
+        self
     }
 
     /// Runde 5, Teil P: legt den Bestätigungskanal der `plan`-Operation auf
@@ -652,6 +672,7 @@ impl RuntimeServices {
     /// | `Arc<dyn Memory>` (falls vorhanden) | ✓ | ✓ | ✓ | ✓ |
     /// | `Arc<JobStore>` (falls vorhanden) | ✓ | ✓ | ✓ | ✓ |
     /// | `Arc<`[`HostPermitHandles`]`>` (falls vorhanden, Plan Teil B3) | ✓ | ✓ | ✓ | ✓ |
+    /// | [`HostLeaseUserControl`] (falls `HostPermitHandles` vorhanden; `/sandbox-lease revoke`) | ✓ | — | — | — |
     /// | Plan-Dienste (falls vorhanden) | ✓ | ✓ | ✓ | ✓ |
     /// | `Arc<ManagedAgentSpawner>` (falls vorhanden) | ✓ | ✓ | — | — |
     /// | [`SharedSessionController`] (falls vorhanden) | ✓ | ✓ | — | — |
@@ -659,6 +680,7 @@ impl RuntimeServices {
     /// | `Arc<dyn JobTransitions>` (Speicher + `JobStore` + Freigabe-Akteur) | ✓ | ✓ | — | — |
     /// | `Arc<AgentEventHub>` (falls gebunden, `/matrix`) | ✓ | ✓ | — | — |
     /// | `Arc<dyn DreamLauncher>` (falls gebunden, `/dream run`, Plan D5) | ✓ | — | — | — |
+    /// | `Arc<dyn LiveModelControl>` (falls gebunden, Live-Modellwechsel) | ✓ | — | — | — |
     ///
     /// Die Zeile [`OperationRegistry`] trägt in jeder Fläche dieselbe Menge —
     /// nämlich die, die [`crate::spec::EntryProfile::operations`] dem Einstieg
@@ -771,6 +793,13 @@ impl RuntimeServices {
         }
         if let Some(host_permit_handles) = &self.parts.host_permit_handles {
             insert_service(&mut map, &mut names, Arc::clone(host_permit_handles));
+            // Nutzerentscheidung 2026-09-24: nur eine vom Nutzer getippte
+            // Slash-Eingabe darf eine Host-Arbeitsphase beenden
+            // (`/sandbox-lease revoke`). Der Marker ist kein Argument, ein
+            // Modell kann ihn daher nicht fälschen.
+            if surface == ServiceSurface::Slash {
+                insert_service(&mut map, &mut names, HostLeaseUserControl);
+            }
         }
         // Runde 5, Teil P.
         if let Some(channel) = &self.plan_confirm {
@@ -813,6 +842,13 @@ impl RuntimeServices {
             .filter(|_| surface == ServiceSurface::Slash)
         {
             insert_service(&mut map, &mut names, Arc::clone(launcher));
+        }
+        if let Some(control) = self
+            .live_model_control
+            .as_ref()
+            .filter(|_| surface == ServiceSurface::Slash)
+        {
+            insert_service(&mut map, &mut names, Arc::clone(control));
         }
         if let Some(hub) = self
             .agent_events
@@ -910,7 +946,7 @@ mod tests {
     use harw_provider_http::ProviderLoadRegistry;
     use harw_sandbox::{ExtraRootsCell, HostPermitSessionRegistry, ProcessPermitLedger};
     use harw_session_store::JobStore;
-    use harw_tool_shell::HostPermitHandles;
+    use harw_tool_shell::{HostLeaseUserControl, HostPermitHandles};
     use harw_types::{IngressSurface, PermissionTier, Principal, PrincipalKind};
     use std::any::type_name;
     use std::path::Path;
@@ -1034,6 +1070,18 @@ mod tests {
         ]
     }
 
+    /// Die Slash-Dienste ohne [`HostLeaseUserControl`] — bei `full_parts`
+    /// der einzige Dienst, der Slash vom Modell-Werkzeug unterscheidet
+    /// (Nutzerentscheidung 2026-09-24: nur der Nutzer beendet eine
+    /// Host-Arbeitsphase).
+    fn slash_without_user_marker(services: &RuntimeServices) -> Vec<&'static str> {
+        services
+            .registered(ServiceSurface::Slash)
+            .into_iter()
+            .filter(|name| *name != type_name::<HostLeaseUserControl>())
+            .collect()
+    }
+
     fn sorted(mut names: Vec<&'static str>) -> Vec<&'static str> {
         names.sort_unstable();
         names.dedup();
@@ -1056,6 +1104,9 @@ mod tests {
         if surface.allows_session_controller() {
             names.push(type_name::<SharedSessionController>());
         }
+        if surface == ServiceSurface::Slash {
+            names.push(type_name::<HostLeaseUserControl>());
+        }
         sorted(names)
     }
 
@@ -1077,8 +1128,10 @@ mod tests {
     #[test]
     fn slash_and_model_tool_register_exactly_the_same_services() {
         let services = RuntimeServices::new(full_parts());
+        // Einzige deklarierte Differenz: der Nutzer-Marker für
+        // `/sandbox-lease revoke` liegt nur auf der Slash-Fläche.
         assert_eq!(
-            services.registered(ServiceSurface::Slash),
+            slash_without_user_marker(&services),
             services.registered(ServiceSurface::ModelTool),
             "G-061: /agent als Slash-Kommando darf nicht NotAvailable sein"
         );
@@ -1107,8 +1160,10 @@ mod tests {
                 sorted(vec![
                     type_name::<Arc<ManagedAgentSpawner>>(),
                     type_name::<SharedSessionController>(),
+                    type_name::<HostLeaseUserControl>(),
                 ]),
-                "Fläche {} darf sich nur um Spawner und Sitzungs-Controller unterscheiden",
+                "Fläche {} darf sich nur um Spawner, Sitzungs-Controller und den \
+                 Host-Lease-Nutzer-Marker unterscheiden",
                 surface.as_str()
             );
             assert!(
@@ -1340,6 +1395,32 @@ mod tests {
         }
     }
 
+    /// Nutzerentscheidung 2026-09-24: der Marker, der `/sandbox-lease
+    /// revoke` erlaubt, liegt ausschließlich auf der Slash-Fläche — nie auf
+    /// Model-Tool, Web oder Job.
+    #[test]
+    fn host_lease_user_control_reaches_the_slash_surface_only() {
+        let services = RuntimeServices::new(full_parts());
+        for surface in ServiceSurface::ALL {
+            assert_eq!(
+                services
+                    .service_map(surface)
+                    .get::<HostLeaseUserControl>()
+                    .is_some(),
+                surface == ServiceSurface::Slash,
+                "{}",
+                surface.as_str()
+            );
+        }
+        let bare = RuntimeServices::new(minimal_parts());
+        assert!(
+            bare.service_map(ServiceSurface::Slash)
+                .get::<HostLeaseUserControl>()
+                .is_none(),
+            "ohne HostPermitHandles gibt es auch keinen Marker"
+        );
+    }
+
     /// Ohne gesetzte Handles (`minimal_parts`) darf keine Fläche einen
     /// `HostPermitHandles`-Eintrag erfinden.
     #[test]
@@ -1395,6 +1476,37 @@ mod tests {
                     .iter()
                     .any(|name| name.contains("KnowledgeStore")),
                 "{} darf ohne gebundenen Speicher keinen KnowledgeStore tragen",
+                surface.as_str()
+            );
+        }
+    }
+
+    /// Live-Modellwechsel: der Dienst liegt nur auf der Slash-Fläche.
+    #[test]
+    fn live_model_control_reaches_the_slash_surface_only() {
+        struct NoopControl;
+        impl harw_ops::live_model::LiveModelControl for NoopControl {
+            fn ensure_provider_ready(&self, _provider: &str) -> Result<(), String> {
+                Ok(())
+            }
+            fn set_internal_model(
+                &self,
+                _point: harw_config::InternalModelPoint,
+                _choice: Option<harw_config::InternalModelChoice>,
+            ) -> bool {
+                false
+            }
+        }
+        let services =
+            RuntimeServices::new(full_parts()).with_live_model_control(Arc::new(NoopControl));
+        for surface in ServiceSurface::ALL {
+            assert_eq!(
+                services
+                    .service_map(surface)
+                    .get::<harw_ops::live_model::SharedLiveModelControl>()
+                    .is_some(),
+                surface == ServiceSurface::Slash,
+                "{}",
                 surface.as_str()
             );
         }
@@ -1464,7 +1576,7 @@ mod tests {
             }
         }
         assert_eq!(
-            services.registered(ServiceSurface::Slash),
+            slash_without_user_marker(&services),
             services.registered(ServiceSurface::ModelTool)
         );
         Ok(())
@@ -1515,7 +1627,7 @@ mod tests {
             }
         }
         assert_eq!(
-            services.registered(ServiceSurface::Slash),
+            slash_without_user_marker(&services),
             services.registered(ServiceSurface::ModelTool)
         );
         let slash = services.registered(ServiceSurface::Slash);
@@ -1532,6 +1644,7 @@ mod tests {
                     type_name::<Arc<ManagedAgentSpawner>>(),
                     type_name::<SharedSessionController>(),
                     type_name::<Arc<AgentEventHub>>(),
+                    type_name::<HostLeaseUserControl>(),
                 ]),
                 "Fläche {}",
                 surface.as_str()
@@ -1562,6 +1675,7 @@ mod tests {
                     type_name::<SharedSessionController>(),
                     type_name::<Arc<KnowledgeStore>>(),
                     type_name::<Arc<dyn JobTransitions>>(),
+                    type_name::<HostLeaseUserControl>(),
                 ]),
                 "Fläche {}",
                 surface.as_str()

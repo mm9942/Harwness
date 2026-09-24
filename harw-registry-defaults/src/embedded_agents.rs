@@ -3561,23 +3561,28 @@ mod tests {
         // Writer, Endkontrolle über Build-Bericht und PDF), ca. +400 Bytes.
         assert!(
             // Runde 7, Teil M: +Absatz „Matrix-Games“ (Game Master).
-            UIA_KNOWLEDGE.len() <= 4000,
-            "roles/uia.md: {} Bytes > 4000",
+            // sudo-Weg: +Abschnitt „sudo / Root-Befehle“ (Delegation an
+            // `uia-shell-worker`, Passwort nur im TUI-Fenster), ca. +870 Bytes.
+            UIA_KNOWLEDGE.len() <= 4800,
+            "roles/uia.md: {} Bytes > 4800",
             UIA_KNOWLEDGE.len()
         );
-        // Runde 5, Teil P: Umfangsregel der `uia-worker`-Rollen.
+        // Runde 5, Teil P: Umfangsregel der `uia-worker`-Rollen; dazu der
+        // Abschnitt „Root-Befehle (sudo)“.
         assert!(
-            UIA_WORKER_KNOWLEDGE.len() <= 2000,
-            "roles/uia-worker.md: {} Bytes > 2000",
+            UIA_WORKER_KNOWLEDGE.len() <= 2300,
+            "roles/uia-worker.md: {} Bytes > 2300",
             UIA_WORKER_KNOWLEDGE.len()
         );
+        // Orchestratoren: +ein Satz, wie Root-Befehle (sudo) als Blocker an
+        // die UIA zurückgehen.
         for (name, text) in [
             ("root-orchestrator.md", ROOT_ORCHESTRATOR_KNOWLEDGE),
             ("sub-orchestrator.md", SUB_ORCHESTRATOR_KNOWLEDGE),
         ] {
             assert!(
-                text.len() <= 1500,
-                "roles/{name}: {} Bytes > 1500",
+                text.len() <= 1700,
+                "roles/{name}: {} Bytes > 1700",
                 text.len()
             );
         }
@@ -3626,6 +3631,52 @@ mod tests {
         ] {
             assert!(text.contains(phrase), "uia.md: fehlt „{phrase}“");
         }
+    }
+
+    /// sudo ist möglich: die UIA delegiert Root-Befehle an
+    /// `uia-shell-worker` (`host.sudo_exec`), der Nutzer bestätigt und gibt
+    /// sein Passwort im TUI-Fenster ein. Realer Fehler davor: die UIA sagte
+    /// „sudo geht nicht“ oder reichte den Befehl an den Nutzer weiter.
+    #[test]
+    fn test_uia_knowledge_names_the_sudo_path() {
+        let text = UIA_KNOWLEDGE;
+        for phrase in [
+            "## sudo / Root-Befehle",
+            "sudo funktioniert",
+            "sag nie, es sei unmöglich",
+            "`transfer_to_uia-shell-worker`",
+            "`host.sudo_exec`",
+            "exakte argv",
+            "gibt dort sein Passwort ein",
+            "passwortloses sudo geht ebenso",
+            "nie `sudo -S`",
+            "Nur\nohne TUI (serve, telegram, one-shot)",
+            "Root-Befehle (sudo) → `uia-shell-worker`",
+        ] {
+            assert!(text.contains(phrase), "uia.md: fehlt „{phrase}“");
+        }
+        // Die übrigen Rollen geben auf, statt zu delegieren, wenn ihnen das
+        // niemand sagt: jede Rollenregel nennt den Rückweg.
+        for (name, text) in [
+            ("uia-worker.md", UIA_WORKER_KNOWLEDGE),
+            ("worker.md", WORKER_KNOWLEDGE),
+            ("root-orchestrator.md", ROOT_ORCHESTRATOR_KNOWLEDGE),
+            ("sub-orchestrator.md", SUB_ORCHESTRATOR_KNOWLEDGE),
+        ] {
+            assert!(
+                text.contains("Root-Befehle (sudo)"),
+                "{name}: sudo-Regel fehlt"
+            );
+            assert!(
+                text.contains("exakte") && text.contains("argv"),
+                "{name}: exaktes argv fehlt"
+            );
+            assert!(
+                text.contains("„sudo") && text.contains("geht nicht“"),
+                "{name}: „nie ‚sudo geht nicht‘“ fehlt"
+            );
+        }
+        assert!(UIA_WORKER_KNOWLEDGE.contains("`host.sudo_exec`"));
     }
 
     /// Runde 7, Teil T8: Aufträge an den LaTeX-Writer tragen Dokumenttyp,

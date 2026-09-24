@@ -54,7 +54,7 @@ const UIA_MODEL: &[SubcommandHint] = &[
     SubcommandHint::new(
         "switch",
         "<modell-id>",
-        "UIA-Modell pinnen (ab nächster Sitzung)",
+        "UIA-Modell wechseln (ab dem nächsten Turn)",
     ),
 ];
 
@@ -143,7 +143,7 @@ const MODELS: &[SubcommandHint] = &[
     SubcommandHint::new(
         "set",
         "<rolle> <ziel>",
-        "Modell einer Rolle setzen (ab nächster Sitzung)",
+        "Modell einer Rolle setzen (Kind-Rollen sofort für neue Agenten)",
     ),
     SubcommandHint::new("reset", "<rolle>", "Rolle auf Vorgabe zurücksetzen"),
     SubcommandHint::new("pick", "<rolle>", "Modellauswahl für eine Rolle öffnen"),

@@ -553,6 +553,7 @@ mod tests {
                 detail: None,
                 tool_calls: None,
                 model: None,
+                provider: None,
             }),
         });
         let mut rows = vec![row("child-5", Some("uia"))];

@@ -126,7 +126,7 @@ On every other command `harw` aborts with an error message pointing at
 | Flag | Effect |
 | --- | --- |
 | `--mode MODE` | Starts in the given interaction mode (`chat`, `plan`, `explore`, `work`, `shell`). |
-| `--approval ask\|auto\|full` | Approval mode for this session only: `ask` prompts on every tool call, `auto` lets uncritical calls through and checks the rest with a pre-filter and classifier, asking when in doubt, `full` never asks. Overrides the configured default. |
+| `--approval ask\|auto\|full` | Approval mode for this session only: `ask` prompts on every tool call, `auto` lets uncritical calls through and checks the rest with a pre-filter and classifier, asking when in doubt, `full` never asks (not even for `process.kill`, `host.sudo_exec` or remote OCR uploads; only an explicit deny rule refuses a call). Overrides the configured default. |
 | `--model ID` | Uses model `ID` for this session instead of the default model. |
 | `--goal TEXT` | Sets a goal for the session to work towards at startup. |
 | `--agent NAME` | Starts the session with agent definition `NAME` as its root (a built-in role such as `root-orchestrator`, or a custom definition) instead of the configured `active_agent_definition`. Applies to this session only; to make it permanent use `/agent use NAME` (remove with `/agent use --clear`), effective from the next session. |

@@ -169,7 +169,12 @@ jedem vorgeschlagenen Befehl kurz in einfachen Worten, was er tut. Du kannst \
 eine Host-Freigabe niemals selbst erteilen — nur `sandbox-lease` anfragen; \
 ausschließlich der Nutzer bestätigt sie in der Oberfläche. Bei Ablehnung \
 schlage eine Alternative vor: der Nutzer kann den Befehl selbst mit `!` \
-ausführen.";
+ausführen. Root-Befehle (sudo) gehen trotzdem — sag nie, sudo sei unmöglich: \
+delegiere sie mit exaktem Befehl und Grund an `transfer_to_uia-shell-worker`, \
+der sie über `host.sudo_exec` anfragt; der Nutzer bestätigt den exakten Befehl \
+im Freigabefenster und gibt dort sein Passwort ein, falls sudo eines verlangt. \
+Nie ein Passwort im Chat erfragen oder in einen Befehl schreiben, nie \
+`sudo -S`.";
 
 /// Betriebsmodus einer Session. Er bestimmt, welche Werkzeuge das Modell sieht
 /// und welche Autorität die Sandbox höchstens tragen darf.
@@ -850,11 +855,33 @@ mod tests {
             SHELL_PROMPT.contains("hermetisch"),
             "SHELL_PROMPT muss die Sandbox als hermetisch beschreiben"
         );
+        // Gewöhnliche Host-Befehle laufen über `sandbox-lease`, nicht mehr
+        // über eine Delegation an den `uia-shell-worker` (alter Wortlaut).
         assert!(
-            !SHELL_PROMPT.contains("uia-shell-worker"),
-            "SHELL_PROMPT darf nicht mehr auf den für die UIA unerreichbaren \
+            !SHELL_PROMPT.contains("Bevorzuge, Host-Befehle an den"),
+            "SHELL_PROMPT darf gewöhnliche Host-Befehle nicht mehr an den \
              uia-shell-worker verweisen"
         );
+    }
+
+    /// sudo ist möglich: Root-Befehle gehen per `transfer_to_uia-shell-worker`
+    /// an `host.sudo_exec`, der Nutzer bestätigt und gibt sein Passwort im
+    /// Freigabefenster ein. Realer Fehler davor: die UIA sagte „sudo geht
+    /// nicht“ bzw. reichte Root-Befehle zum Selbstausführen weiter.
+    #[test]
+    fn test_shell_prompt_names_the_sudo_path() {
+        for phrase in [
+            "sag nie, sudo sei unmöglich",
+            "`transfer_to_uia-shell-worker`",
+            "`host.sudo_exec`",
+            "gibt dort sein Passwort ein",
+            "nie `sudo -S`",
+        ] {
+            assert!(
+                SHELL_PROMPT.contains(phrase),
+                "SHELL_PROMPT muss „{phrase}“ enthalten"
+            );
+        }
     }
 
     /// Runde 5, Teil F: der Plan-Prompt ist ein Ablauf und nennt die

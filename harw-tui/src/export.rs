@@ -334,6 +334,12 @@ pub enum ExportEntry {
     },
     /// Systemmeldung außerhalb eines normalen Turns.
     System(String),
+    /// Vom System in den Verlauf eingespeiste Meldung (Ergebnis eines
+    /// Hintergrund-Agenten, Nachricht/Frage eines Kindes, die Anweisung eines
+    /// Auto-Turns). Steht in der Historie als Nutzernachricht, stammt aber
+    /// nicht von der Nutzerin und wird deshalb unter `## Hintergrund-Agent`
+    /// statt `## Du` gerendert.
+    Notice(String),
     /// Legacy-Kompatibilität: darf ausschließlich eine Reasoning-Zusammenfassung
     /// enthalten, niemals opaque oder rohe Chain-of-Thought-Blöcke.
     Reasoning(String),
@@ -359,7 +365,14 @@ enum Section {
     Harw,
     /// Zuletzt gerenderte Überschrift war `## System`.
     System,
+    /// Zuletzt gerenderte Überschrift war `## Hintergrund-Agent`.
+    Notice,
 }
+
+/// Vorgabewert der Vertrauensstufe eines Werkzeugergebnisses. Im Markdown
+/// wird nur eine davon **abweichende** Stufe gezeigt (sonst stünde unter
+/// jedem Werkzeug `Trust: untrusted`); JSON bleibt vollständig.
+const DEFAULT_TRUST: &str = "untrusted";
 
 /// Rendert Metadaten und Verlaufseinträge als Markdown-Dokument.
 ///
@@ -369,6 +382,9 @@ enum Section {
 /// Gesprächsabschnitte in der Reihenfolge von `entries`. Aufeinanderfolgende
 /// `User`- bzw. `Assistant`-Einträge teilen sich eine `## Du`- bzw.
 /// `## harw`-Überschrift; ein Rollenwechsel erzeugt eine neue Überschrift.
+/// Eingespeiste `Notice`-Einträge (Hintergrund-Agenten) stehen unter
+/// `## Hintergrund-Agent`. Die Vertrauensstufe eines Werkzeugs erscheint nur,
+/// wenn sie vom Vorgabewert `untrusted` abweicht.
 /// `ToolCall`-, `ToolResult`- und (bei `opts.include_reasoning`)
 /// `Reasoning`-Einträge schalten stets auf die `## harw`-Überschrift um,
 /// auch direkt nach einer Nutzernachricht — inhaltlich gehören sie zu harws
@@ -504,6 +520,16 @@ pub fn render_markdown_with_extensions(
                 if current != Some(Section::Harw) {
                     out.push_str("## harw\n\n");
                     current = Some(Section::Harw);
+                }
+                out.push_str(&sanitize_display(&redact_text(&demote_markdown_headings(
+                    text,
+                ))));
+                out.push_str("\n\n");
+            }
+            ExportEntry::Notice(text) => {
+                if current != Some(Section::Notice) {
+                    out.push_str("## Hintergrund-Agent\n\n");
+                    current = Some(Section::Notice);
                 }
                 out.push_str(&sanitize_display(&redact_text(&demote_markdown_headings(
                     text,
@@ -768,6 +794,10 @@ fn entry_to_json(entry: &ExportEntry, opts: &ExportOptions) -> Option<Value> {
         }),
         ExportEntry::System(text) => json!({
             "type": "system",
+            "text": redact_text(text),
+        }),
+        ExportEntry::Notice(text) => json!({
+            "type": "notice",
             "text": redact_text(text),
         }),
         ExportEntry::Tool { label, summary } => {
@@ -1097,7 +1127,7 @@ fn render_tool_metadata_markdown(
         out.push_str(&duration_ms.to_string());
         out.push_str(" ms\n");
     }
-    if let Some(trust) = trust {
+    if let Some(trust) = trust.filter(|trust| *trust != DEFAULT_TRUST) {
         out.push_str("  - Trust: ");
         out.push_str(&sanitize_inline(&redact_text(trust)));
         out.push('\n');
@@ -2189,6 +2219,62 @@ mod tests {
     // -----------------------------------------------------------------
     // A5: Abschnittszuordnung für ToolCall/ToolResult/Reasoning
     // -----------------------------------------------------------------
+
+    /// Export 429: eingespeiste Hintergrund-Meldungen stehen nicht unter
+    /// `## Du`, sondern unter einer eigenen Überschrift; JSON typisiert sie.
+    #[test]
+    fn test_notice_entries_render_under_their_own_heading() -> TestResult {
+        let entries = vec![
+            ExportEntry::User("Frage".to_owned()),
+            ExportEntry::Assistant("Gestartet.".to_owned()),
+            ExportEntry::Notice("[Hintergrund-Agent x y fehlgeschlagen nach 81 s]".to_owned()),
+            ExportEntry::Assistant("Zusammenfassung".to_owned()),
+        ];
+        let out = render_markdown(&meta_minimal(), &entries, &ExportOptions::default());
+        assert_eq!(out.matches("## Du\n\n").count(), 1, "{out}");
+        let notice_heading = out
+            .find("## Hintergrund-Agent\n\n[Hintergrund-Agent x y")
+            .ok_or(TestError::Missing("Hintergrund-Agent-Überschrift"))?;
+        let du = out.find("## Du").ok_or(TestError::Missing("Du"))?;
+        assert!(du < notice_heading);
+        let json = render_json(&meta_minimal(), &entries, &ExportOptions::default());
+        assert!(json.contains("\"type\": \"notice\""), "{json}");
+        Ok(())
+    }
+
+    /// Die Vorgabe `untrusted` wird im Markdown nicht bei jedem Werkzeug
+    /// wiederholt; abweichende Stufen und das JSON bleiben vollständig.
+    #[test]
+    fn test_markdown_omits_default_trust_but_keeps_other_levels() {
+        let result = |trust: &str| ExportEntry::ToolResult {
+            call_id: "call-1".to_owned(),
+            tool_name: Some("demo".to_owned()),
+            result: json!({}),
+            status: ExportStatus::Success,
+            error: None,
+            duration_ms: Some(1),
+            trust: Some(trust.to_owned()),
+            agent: None,
+        };
+        let default = render_markdown(
+            &meta_minimal(),
+            &[result("untrusted")],
+            &ExportOptions::default(),
+        );
+        assert!(!default.contains("Trust:"), "{default}");
+        let runtime = render_markdown(
+            &meta_minimal(),
+            &[result("runtime")],
+            &ExportOptions::default(),
+        );
+        assert!(runtime.contains("  - Trust: runtime"), "{runtime}");
+        let json = render_json(
+            &meta_minimal(),
+            &[result("untrusted")],
+            &ExportOptions::default(),
+        );
+        assert!(json.contains("\"trust\": \"untrusted\""), "{json}");
+    }
 
     /// ToolCall und ToolResult nach einer Nutzernachricht schalten auf die
     /// `## harw`-Überschrift um, statt unter `## Du` zu bleiben.

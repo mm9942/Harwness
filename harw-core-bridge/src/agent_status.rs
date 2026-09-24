@@ -48,6 +48,8 @@ pub fn status_entry(run: &BackgroundRun) -> Map<String, Value> {
     let mut entry = Map::new();
     entry.insert("child_id".to_owned(), json!(run.child.as_str()));
     entry.insert("role".to_owned(), json!(run.role));
+    // Provider und Modell, die das Kind tatsächlich anspricht.
+    entry.insert("model".to_owned(), json!(run.model_route));
     entry.insert("status".to_owned(), json!(run.status.as_str()));
     entry.insert("task".to_owned(), json!(run.task));
     entry.insert("elapsed_s".to_owned(), json!(run.elapsed().as_secs()));
@@ -72,8 +74,13 @@ pub fn status_entry(run: &BackgroundRun) -> Map<String, Value> {
 /// Eine Textzeile je Lauf (Erweiterungsstelle wie [`status_entry`]).
 #[must_use]
 pub fn status_line(run: &BackgroundRun) -> String {
+    let route = run
+        .model_route
+        .as_deref()
+        .map(|route| format!(" · {route}"))
+        .unwrap_or_default();
     let mut line = format!(
-        "- {} ({}) · {} · {} s · {} Werkzeugaufrufe · {} Tokens",
+        "- {} ({}){route} · {} · {} s · {} Werkzeugaufrufe · {} Tokens",
         run.role,
         run.child,
         run.status.label_de(),
@@ -280,6 +287,7 @@ mod tests {
         let parent = SessionId::new();
         let child = SessionId::new();
         registry.register(&child, &parent, "root-orchestrator", Some("Analyse"));
+        registry.set_model_route(&child, Some("anthropic/claude-opus-5-5".to_owned()));
         registry.record_progress(child.as_str(), |progress| {
             progress.tokens = 1_000;
             progress.live_round_tokens = 250;
@@ -295,9 +303,11 @@ mod tests {
         assert_eq!(entry["live_round_tokens"], json!(250));
         assert_eq!(entry["rounds"], json!(3));
         assert_eq!(entry["context_tokens"], json!(40_000));
+        assert_eq!(entry["model"], json!("anthropic/claude-opus-5-5"));
 
         let line = status_line(&run);
         assert!(line.contains("1250 Tokens"), "{line}");
+        assert!(line.contains(" · anthropic/claude-opus-5-5 · "), "{line}");
         assert!(line.contains("davon 250 in der laufenden Runde"), "{line}");
         assert!(line.contains("3 Runden"), "{line}");
         assert!(line.contains("Kontext 40000 Tokens"), "{line}");

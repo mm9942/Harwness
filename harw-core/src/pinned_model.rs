@@ -129,6 +129,15 @@ impl ModelProvider for PinnedModelProvider {
             None => self.inner.pinned_model_id(),
         }
     }
+
+    /// Liefert die gepinnte Provider-ID, sonst die des inneren Providers
+    /// (Anzeige `<provider>/<modell>` eines Kindes).
+    fn pinned_provider_id(&self) -> Option<String> {
+        match &self.provider_id {
+            Some(provider_id) => Some(provider_id.as_str().to_owned()),
+            None => self.inner.pinned_provider_id(),
+        }
+    }
 }
 
 #[cfg(test)]

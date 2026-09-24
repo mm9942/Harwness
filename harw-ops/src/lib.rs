@@ -176,6 +176,8 @@ pub mod knowledge_common;
 #[cfg(test)]
 pub(crate) mod knowledge_test_support;
 pub mod learn;
+// Live-Übernahme von Modellwechseln (Provider-Neubau, Rollenwahl).
+pub mod live_model;
 pub mod matrix;
 pub mod memory;
 pub mod mode;

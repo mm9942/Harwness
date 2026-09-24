@@ -123,18 +123,14 @@ const SETSID_FIXED_CANDIDATES: [&str; 2] = ["/usr/bin/setsid", "/bin/setsid"];
 /// echtes, aus der Worker-Konfiguration gespeistes Feld auf
 /// [`ShellToolProvider`]/[`ShellExecutor`] folgen.
 const HOST_WORKER_DEFINITION: &str = "host-process-worker@1";
-/// Dauer einer per lokaler UI bestätigten Host-Sitzungsfreigabe, bevor sie
-/// ohne explizites Sitzungsende automatisch verfällt (Verteidigungslinie
-/// gegen eine vergessene, nie beendete Sitzung). Öffentlich, weil `harw-ops`'
-/// `sandbox-lease`-Operation dieselbe TTL für
-/// [`harw_sandbox::HostPermitSessionRegistry::mark_session_approved`]
-/// verwendet, statt sie eigenständig zu duplizieren.
-pub const HOST_SESSION_LEASE_TTL: Duration = Duration::from_secs(12 * 60 * 60);
 /// Gültigkeitsdauer eines frisch über eine beantwortete
 /// [`HostPermitVariant::SingleExecution`]-Frage ausgestellten Permits, bis
-/// der genehmigte Auftrag tatsächlich läuft. Deutlich kürzer als
-/// [`HOST_SESSION_LEASE_TTL`]: eine Einzelfreigabe soll nicht als lange
-/// gültiges „stilles Ja" liegen bleiben.
+/// der genehmigte Auftrag tatsächlich läuft: eine Einzelfreigabe soll nicht
+/// als lange gültiges „stilles Ja" liegen bleiben. Eine Host-Arbeitsphase
+/// ([`HostPermitVariant::SessionLease`]) hat dagegen **keine** Ablaufzeit —
+/// weder in der [`HostPermitSessionRegistry`] noch für ihre Ledger-Permits
+/// (`ttl = None`): sie endet nur, wenn der Nutzer sie beendet (Strg+H oder
+/// `/sandbox-lease revoke`, Nutzerentscheidung 2026-09-24).
 const HOST_SINGLE_EXECUTION_TTL: Duration = Duration::from_secs(5 * 60);
 /// Vorgabe-Wartezeit auf **eine** Nutzerentscheidung auf eine offene
 /// [`HostPermitPrompt`]. Läuft sie ab, gilt das als Ablehnung
@@ -473,7 +469,7 @@ impl ShellExecutor {
                 registry,
                 request,
                 HostApprovalScope::SessionLease,
-                HOST_SESSION_LEASE_TTL,
+                None,
             );
         }
 
@@ -528,28 +524,28 @@ impl ShellExecutor {
         };
 
         if variant == HostPermitVariant::SessionLease {
-            registry.mark_session_approved(request.session.clone(), HOST_SESSION_LEASE_TTL);
+            registry.mark_session_approved(request.session.clone());
         }
         let (scope, ttl) = match variant {
             HostPermitVariant::SingleExecution => (
                 HostApprovalScope::SingleExecution,
-                HOST_SINGLE_EXECUTION_TTL,
+                Some(HOST_SINGLE_EXECUTION_TTL),
             ),
-            HostPermitVariant::SessionLease => {
-                (HostApprovalScope::SessionLease, HOST_SESSION_LEASE_TTL)
-            }
+            // Kein Zeitablauf: gilt bis Strg+H / `/sandbox-lease revoke`.
+            HostPermitVariant::SessionLease => (HostApprovalScope::SessionLease, None),
         };
         Self::issue_and_remember(ledger, registry, request, scope, ttl)
     }
 
     /// Stellt einen Permit für `request` aus, merkt ihn in `registry` und
-    /// autorisiert ihn sofort für den auslösenden Aufruf.
+    /// autorisiert ihn sofort für den auslösenden Aufruf. `ttl = None`: der
+    /// Permit gilt bis zum Widerruf (Host-Arbeitsphase).
     fn issue_and_remember(
         ledger: &Arc<ProcessPermitLedger>,
         registry: &Arc<HostPermitSessionRegistry>,
         request: ProcessPermitRequest,
         scope: HostApprovalScope,
-        ttl: Duration,
+        ttl: Option<Duration>,
     ) -> Result<(), String> {
         let id = ledger
             .issue_after_local_approval(request.clone(), scope, ttl)
@@ -2801,7 +2797,7 @@ mod tests {
         let tmp = make_temp_workspace()?;
         let sandbox = make_sandbox(&tmp, vec![Permission::ExecuteProcess])?;
         let registry = Arc::new(HostPermitSessionRegistry::default());
-        registry.mark_session_approved("s1", Duration::from_secs(60));
+        registry.mark_session_approved("s1");
         let mut executor = plain_executor(DEFAULT_TIMEOUT_SECS);
         executor.host_permit_registry = Some(Arc::clone(&registry));
         let args = ShellExecArgs {
@@ -2864,7 +2860,7 @@ mod tests {
         let tmp = make_temp_workspace()?;
         let sandbox = make_sandbox(&tmp, vec![Permission::ExecuteProcess])?;
         let registry = Arc::new(HostPermitSessionRegistry::default());
-        registry.mark_session_approved("s1", Duration::from_secs(60));
+        registry.mark_session_approved("s1");
         registry.mark_single_use("s1".to_owned());
         let mut executor = plain_executor(DEFAULT_TIMEOUT_SECS);
         executor.host_permit_registry = Some(Arc::clone(&registry));
@@ -2898,7 +2894,7 @@ mod tests {
         let call = make_call("pwd");
 
         let registry = Arc::new(HostPermitSessionRegistry::default());
-        registry.mark_session_approved(ctx.session_id().as_str(), Duration::from_secs(60));
+        registry.mark_session_approved(ctx.session_id().as_str());
 
         let provider = ShellToolProvider::default()
             .with_sandbox_profile(SandboxProfile::Strict)
@@ -3121,7 +3117,7 @@ mod tests {
 
         let ledger = Arc::new(ProcessPermitLedger::default());
         let registry = Arc::new(HostPermitSessionRegistry::default());
-        registry.mark_session_approved(ctx.session_id().as_str(), Duration::from_secs(60));
+        registry.mark_session_approved(ctx.session_id().as_str());
 
         let provider = ShellToolProvider::default()
             .with_sandbox_profile(SandboxProfile::Host)
@@ -3253,17 +3249,17 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_authorize_host_command_reuses_remembered_permit_after_session_approval_expires()
+    async fn test_authorize_host_command_session_lease_does_not_expire_until_user_revokes()
     -> TestResult {
-        // Die Sitzungszustimmung selbst darf verfallen (kurze TTL), ohne dass
-        // ein bereits ausgestellter, gemerkter Permit für exakt denselben
-        // Antrag verloren geht: `authorize_host_command` prüft `lookup_permit`
-        // zuerst und braucht dann keine erneute Zustimmung.
+        // Nutzerentscheidung 2026-09-24: weder die Sitzungszustimmung noch
+        // der dafür ausgestellte `SessionLease`-Permit verfallen mit der Zeit;
+        // erst der Widerruf durch den Nutzer (Strg+H: `forget_session` +
+        // `revoke_session`) beendet die Host-Arbeitsphase.
         let tmp = make_temp_workspace()?;
         let sandbox = make_sandbox(&tmp, vec![Permission::ExecuteProcess])?;
         let ledger = Arc::new(ProcessPermitLedger::default());
         let registry = Arc::new(HostPermitSessionRegistry::default());
-        registry.mark_session_approved("s1", Duration::from_millis(20));
+        registry.mark_session_approved("s1");
 
         let executor = host_executor(&ledger, &registry);
         let args = args_for("echo repeat_me");
@@ -3276,19 +3272,28 @@ mod tests {
             "first call must succeed via a fresh local-approval issuance"
         );
 
-        tokio::time::sleep(Duration::from_millis(60)).await;
+        tokio::time::sleep(Duration::from_millis(30)).await;
         assert!(
-            !registry.is_session_approved("s1"),
-            "the session-level approval must have expired by now"
+            registry.is_session_approved("s1"),
+            "the session-level approval must not expire over time"
         );
-
         assert!(
             executor
                 .authorize_host_command(&args, &sandbox, "s1")
                 .await
                 .is_ok(),
-            "an identical repeated request must succeed via the remembered permit, \
-             without requiring a fresh session approval"
+            "an identical repeated request must still succeed via the remembered permit"
+        );
+
+        // Nutzer beendet die Phase (dasselbe wie `ChatApp::end_host_mode`).
+        registry.forget_session("s1");
+        ledger.revoke_session("s1").map_err(ctx("revoke_session"))?;
+        assert!(
+            executor
+                .authorize_host_command(&args, &sandbox, "s1")
+                .await
+                .is_err(),
+            "after the user revoked the lease, host execution must need a fresh approval"
         );
         Ok(())
     }
@@ -3303,7 +3308,7 @@ mod tests {
         let sandbox = make_sandbox(&tmp, vec![Permission::ExecuteProcess])?;
         let ledger = Arc::new(ProcessPermitLedger::default());
         let registry = Arc::new(HostPermitSessionRegistry::default());
-        registry.mark_session_approved("s1", Duration::from_secs(60));
+        registry.mark_session_approved("s1");
 
         let executor = host_executor(&ledger, &registry);
         let first = args_for("echo first_command");
@@ -3358,7 +3363,7 @@ mod tests {
         let sandbox = make_sandbox(&tmp, vec![Permission::ExecuteProcess])?;
         let ledger = Arc::new(ProcessPermitLedger::default());
         let registry = Arc::new(HostPermitSessionRegistry::default());
-        registry.mark_session_approved("s1", Duration::from_secs(60));
+        registry.mark_session_approved("s1");
 
         let executor = host_executor(&ledger, &registry);
         let args = args_for("echo shared_command_text");

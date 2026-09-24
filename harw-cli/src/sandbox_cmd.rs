@@ -131,7 +131,7 @@ fn fresh_ledger() -> (Arc<ProcessPermitLedger>, Arc<HostPermitSessionRegistry>) 
     )
 }
 
-// Referenziert `HostApprovalScope`/`Duration`, damit die Importe erklärt
+// Referenziert `HostApprovalScope`, damit die Importe erklärt
 // bleiben, falls ein künftiger Patch hier tatsächlich Leases ausstellt
 // (z. B. sobald eine IPC-Anbindung an eine laufende Sitzung existiert).
 #[cfg(test)]
@@ -139,7 +139,6 @@ mod tests {
     use super::*;
     use crate::test_support::ctx;
     use harw_sandbox::HostApprovalScope;
-    use std::time::Duration;
 
     #[test]
     fn test_run_status_action_succeeds() {
@@ -178,7 +177,7 @@ mod tests {
     #[test]
     fn test_run_revoke_on_a_fresh_ledger_removes_nothing() -> crate::test_support::TestResult {
         let (ledger, registry) = fresh_ledger();
-        registry.mark_session_approved("s1", Duration::from_secs(1));
+        registry.mark_session_approved("s1");
         let request = harw_sandbox::request_for_workspace(
             "s1",
             "host-process-worker@1",
@@ -187,11 +186,7 @@ mod tests {
             harw_sandbox::ProcessEnvironment::LocalHost,
         );
         let id = ledger
-            .issue_after_local_approval(
-                request.clone(),
-                HostApprovalScope::SessionLease,
-                Duration::from_secs(60),
-            )
+            .issue_after_local_approval(request.clone(), HostApprovalScope::SessionLease, None)
             .map_err(ctx("issuing a valid request must succeed"))?;
         registry.remember_permit(request, id);
 

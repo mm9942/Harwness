@@ -4480,7 +4480,6 @@ mod tests {
         use harw_authority::{Permission, SandboxSpec, WorkspaceRegistration, WorkspaceRegistry};
         use harw_tools::{ToolCall, ToolExecutionContext, ToolOutput};
         use harw_types::{SessionId, TenantId, ToolCallId, TurnId, WorkspaceId};
-        use std::time::Duration;
 
         /// Baut eine eigenständige Workspace-Sandbox (unabhängig vom
         /// `ProjectContext`, den `discover_project` liefert) mit genau dem
@@ -4762,7 +4761,7 @@ mod tests {
             )?;
             let tmp = tempfile::tempdir().map_err(with_ctx("tempdir"))?;
             let ctx = make_ctx(make_sandbox(tmp.path(), vec![Permission::ExecuteProcess])?);
-            registry.mark_session_approved(ctx.session_id().as_str(), Duration::from_secs(60));
+            registry.mark_session_approved(ctx.session_id().as_str());
             let call = make_call("echo host_ok");
 
             let output = executor
@@ -4859,7 +4858,7 @@ mod tests {
             )?;
             let tmp = tempfile::tempdir().map_err(with_ctx("tempdir"))?;
             let ctx = make_ctx(make_sandbox(tmp.path(), vec![Permission::ExecuteProcess])?);
-            registry.mark_session_approved(ctx.session_id().as_str(), Duration::from_secs(60));
+            registry.mark_session_approved(ctx.session_id().as_str());
             let call = make_call("echo strict_lease_ok");
 
             let output = executor

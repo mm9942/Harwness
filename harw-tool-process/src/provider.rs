@@ -20,8 +20,10 @@
 //!   ausführen dürfen (wie `shell.exec`).
 //! - Freigabe: keines der beiden Werkzeuge gehört in
 //!   `AUTO_APPROVED_TOOLS`; `process.kill` ist destruktiv und gehört in
-//!   `ALWAYS_ASK_TOOLS` (`harw-registry-defaults`), damit es auch unter
-//!   `FullAccess` und trotz passender Allow-Regel immer rückfragt.
+//!   `ALWAYS_ASK_TOOLS` (`harw-registry-defaults`), damit es unter
+//!   `ask`/`auto` trotz passender Allow-Regel immer rückfragt. Unter
+//!   `FullAccess` fragt es wie alles andere nicht (Nutzerentscheidung
+//!   2026-09-24).
 //! - Eine leere Auswahl (weder `names` noch `pids`) wird abgewiesen, bevor
 //!   `harw-killer` überhaupt aufgerufen wird — nie „alles“ auswählen. `uid`
 //!   allein ist kein Selektor, sondern nur ein Filter.

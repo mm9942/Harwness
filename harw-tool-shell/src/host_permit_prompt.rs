@@ -65,10 +65,11 @@ use tokio::sync::{mpsc, oneshot};
 /// # Description
 /// [`Self::SingleExecution`] genehmigt genau den einen kanonischen Auftrag,
 /// der die Anfrage ausgelöst hat, und ist nach einer Ausführung verbraucht.
-/// [`Self::SessionLease`] genehmigt eine begrenzte Host-Arbeitsphase: weitere,
-/// auch abweichende Aufträge derselben Sitzung erhalten ohne erneute
-/// Rückfrage ihren eigenen Permit, bis die Phase abläuft oder ausdrücklich
-/// beendet wird.
+/// [`Self::SessionLease`] genehmigt eine Host-Arbeitsphase: weitere, auch
+/// abweichende Aufträge derselben Sitzung erhalten ohne erneute Rückfrage
+/// ihren eigenen Permit, bis der Nutzer die Phase beendet (Strg+H oder
+/// `/sandbox-lease revoke`) — es gibt keinen Zeitablauf, und das Modell kann
+/// sie nicht beenden (Nutzerentscheidung 2026-09-24).
 ///
 /// Welche Variante ein Aufrufer als [`HostPermitPrompt::preselected_variant`]
 /// vorschlägt, ändert nie, was tatsächlich genehmigt wird — das entscheidet
@@ -84,8 +85,8 @@ pub enum HostPermitVariant {
     /// ausgelöst hat; nach einer Ausführung verbraucht.
     #[default]
     SingleExecution,
-    /// Variante 2: genehmigt eine begrenzte Host-Arbeitsphase für die
-    /// laufende Sitzung.
+    /// Variante 2: genehmigt eine Host-Arbeitsphase für die laufende
+    /// Sitzung, bis der Nutzer sie beendet (kein Zeitablauf).
     SessionLease,
 }
 
@@ -95,7 +96,7 @@ impl HostPermitVariant {
     pub fn label(self) -> &'static str {
         match self {
             Self::SingleExecution => "Einmalig für diesen Auftrag",
-            Self::SessionLease => "Host-Arbeitsphase für diese Sitzung",
+            Self::SessionLease => "Host-Arbeitsphase für diese Sitzung (bis Strg+H)",
         }
     }
 }
@@ -177,6 +178,25 @@ impl fmt::Debug for HostPermitHandles {
             .finish()
     }
 }
+
+/// ServiceMap-Marker: dieser Operationsaufruf stammt aus einer vom
+/// **Nutzer getippten** Slash-Eingabe (Fläche `ServiceSurface::Slash` in
+/// `harw-runtime/src/services.rs`), nicht aus einem Modell-Werkzeug, einem
+/// Web- oder Job-Lauf.
+///
+/// # Description
+/// Nutzerentscheidung 2026-09-24: eine Host-Arbeitsphase endet nur durch den
+/// Nutzer — Strg+H in der TUI oder das getippte `/sandbox-lease revoke`. Die
+/// `sandbox-lease`-Operation (`harw-ops/src/sandbox_lease.rs`) bedient aber
+/// sowohl die Command- als auch die Model-Tool-Fläche mit demselben Rumpf;
+/// sie erkennt die Herkunft ausschließlich an diesem Marker. Er liegt nur in
+/// der Slash-`ServiceMap` (die Montage legt ihn dort ab, sofern
+/// [`HostPermitHandles`] verdrahtet sind) und ist kein Argumentfeld — ein
+/// Modell kann ihn also über keine Tool-Argumente erzeugen oder fälschen.
+/// Fehlt er (Model-Tool, Web, Job, Tests ohne Marker), wird `revoke`
+/// abgewiesen (fail-closed).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct HostLeaseUserControl;
 
 /// Eine einzelne Host-Permit-Frage auf dem Weg zum Renderer.
 ///

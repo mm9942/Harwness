@@ -554,6 +554,7 @@ fn prefilter_shell(
         ));
     }
 
+    let escalation = harw_tool_shell::sudo::escalation_program(command);
     for pipeline in split_command(command) {
         for (index, stage) in pipeline.iter().enumerate() {
             let tokens = effective_tokens(stage);
@@ -562,11 +563,12 @@ fn prefilter_shell(
             };
             let name = command_name(first);
 
-            if PRIVILEGE_COMMANDS.contains(&name) {
-                return Some(PrefilterHit::new(
-                    "privilege-escalation",
-                    format!("`{name}` erhöht Rechte (dafür gibt es host.sudo_exec)"),
-                ));
+            // Nur ein Treffer, wenn die anführungszeichengerechte Zerlegung
+            // ein Rechte-Werkzeug in Befehlsposition findet: `split_command`
+            // teilt auch an `|` innerhalb von Quotes (`rg 'x|sudo -'` ergäbe
+            // sonst eine Scheinstufe `sudo -`).
+            if escalation.is_some() && PRIVILEGE_COMMANDS.contains(&name) {
+                return Some(privilege_escalation_hit(name));
             }
 
             if matches!(name, "curl" | "wget") {
@@ -629,7 +631,27 @@ fn prefilter_shell(
             }
         }
     }
-    None
+    // `echo "$(sudo id)"`, `nice -n 5 sudo id`, `bash -c 'sudo id'`: die
+    // Stufenzerlegung sieht das Werkzeug nicht in Befehlsposition.
+    escalation.map(privilege_escalation_hit)
+}
+
+/// Vorfilter-Treffer für ein Rechte-Werkzeug in Befehlsposition.
+///
+/// # Beschreibung
+/// Der Grund sagt ausdrücklich, dass sudo **möglich** ist (über
+/// `host.sudo_exec` mit Freigabe und Passworteingabe im TUI-Fenster) — er
+/// landet beim Modell bzw. im Freigabedialog, und ein „sudo geht nicht“
+/// führte Modelle in die Irre.
+fn privilege_escalation_hit(name: &str) -> PrefilterHit {
+    PrefilterHit::new(
+        "privilege-escalation",
+        format!(
+            "`{name}` erhöht Rechte — nicht über shell.exec; sudo funktioniert über \
+             host.sudo_exec (uia-shell-worker): der Nutzer bestätigt den exakten Befehl im \
+             Freigabefenster und gibt dort sein Passwort ein, falls sudo eines verlangt"
+        ),
+    )
 }
 
 /// `rm` mit rekursivem Flag auf ein Ziel außerhalb des Workspace (oder auf
@@ -1065,9 +1087,11 @@ pub fn summarize_call(call: &ToolCall) -> String {
 pub struct ClassifierInput<'a> {
     /// Runde 6, Teil A2: die letzten Nutzernachrichten, älteste zuerst.
     pub goals: Vec<String>,
-    /// Runde 6, Teil A2: Restlaufzeit der Host-Arbeitsphase (Lease);
-    /// `None`, wenn keine aktiv ist.
-    pub host_lease: Option<Duration>,
+    /// Runde 6, Teil A2: `true`, solange eine Host-Arbeitsphase (Lease)
+    /// aktiv ist. Eine Phase hat keine Restlaufzeit mehr — sie läuft, bis die
+    /// Nutzerin sie beendet (Strg+H oder `/sandbox-lease revoke`,
+    /// Nutzerentscheidung 2026-09-24).
+    pub host_lease_active: bool,
     /// Aktiver Plan.
     pub plan: Option<String>,
     /// Letzte Werkzeugaufrufe (bereits bereinigte Kurzfassungen).
@@ -1119,16 +1143,11 @@ pub fn build_classifier_prompt(input: &ClassifierInput<'_>) -> String {
             .collect::<Vec<_>>()
             .join("\n")
     };
-    let lease = match input.host_lease {
-        Some(remaining) => format!(
-            "Host-Arbeitsphase aktiv: Die Nutzerin hat Zugriff außerhalb des Workspace freigegeben \
-             (noch etwa {} min).",
-            remaining.as_secs().div_ceil(60)
-        ),
-        None => {
-            "Host-Arbeitsphase nicht aktiv: Zugriff außerhalb des Workspace ist nicht freigegeben."
-                .to_owned()
-        }
+    let lease = if input.host_lease_active {
+        "Host-Arbeitsphase aktiv: Die Nutzerin hat Zugriff außerhalb des Workspace freigegeben \
+         (bis sie die Phase selbst beendet)."
+    } else {
+        "Host-Arbeitsphase nicht aktiv: Zugriff außerhalb des Workspace ist nicht freigegeben."
     };
     let plan = input
         .plan
@@ -1589,19 +1608,24 @@ impl AutoModeHandle {
         }
     }
 
-    /// Runde 6, Teil A2: Restlaufzeit der Host-Arbeitsphase.
+    /// Runde 6, Teil A2: ob eine Host-Arbeitsphase läuft.
     ///
     /// # Rückgabe
-    /// `Some(rest)`, solange eine sitzungseigene (bzw. ohne Sitzungs-Id eine
-    /// globale) Freigabe läuft; sonst `None` — auch ohne Registry oder bei
-    /// vergiftetem Lock (fail-closed: keine Lease angenommen).
+    /// `true`, solange eine sitzungseigene (bzw. ohne Sitzungs-Id eine
+    /// globale) Freigabe aktiv ist — ohne Zeitablauf, bis die Nutzerin sie
+    /// beendet; sonst `false` — auch ohne Registry oder bei vergiftetem Lock
+    /// (fail-closed: keine Lease angenommen).
     #[must_use]
-    pub fn host_lease_remaining(&self) -> Option<Duration> {
-        let source = self.host_lease.read().ok()?;
-        let registry = source.registry.as_ref()?;
+    pub fn host_lease_active(&self) -> bool {
+        let Ok(source) = self.host_lease.read() else {
+            return false;
+        };
+        let Some(registry) = source.registry.as_ref() else {
+            return false;
+        };
         match source.session.as_deref() {
-            Some(session) => registry.session_approval_remaining(session),
-            None => registry.global_approval_remaining(),
+            Some(session) => registry.is_session_approved(session),
+            None => registry.has_global_approval(),
         }
     }
 
@@ -1776,9 +1800,8 @@ impl AutoModeGate {
                 VerdictSource::Prefilter,
             );
         }
-        let host_lease = self.handle.host_lease_remaining();
-        if let Some(hit) = prefilter_with_lease(call, &self.handle.prefilter, host_lease.is_some())
-        {
+        let host_lease_active = self.handle.host_lease_active();
+        if let Some(hit) = prefilter_with_lease(call, &self.handle.prefilter, host_lease_active) {
             return AutoVerdict::new(
                 AutoDecision::Ask,
                 hit.category,
@@ -1792,7 +1815,7 @@ impl AutoModeGate {
         let context = &self.handle.context;
         let input = ClassifierInput {
             goals: context.recent_goals(),
-            host_lease,
+            host_lease_active,
             plan: context.plan(),
             recent_calls: self.recent_ring().recent_calls(RECENT_CALLS_IN_PROMPT),
             call,
@@ -2399,6 +2422,49 @@ mod tests {
         }
     }
 
+    /// `sudo` nur in Befehlsposition: ein gequotetes Suchmuster (realer
+    /// Fehlalarm: `rg -n 'sudo_exec|…|sudo -|…' …`) und Teilwörter sind kein
+    /// Treffer; echte Aufrufe hinter `;`, `|`, `&&`, `env` usw. schon.
+    #[test]
+    fn privilege_escalation_only_in_command_position() {
+        for harmless in [
+            "rg -n 'sudo_exec|passwordless|passwd|Command::new|sudo -|sudo-Freigabe|sudo wird|\
+             sudo.*abgelehnt' ~/Harwness/harw-tui/src/sudo_dialog.rs",
+            "grep -rn \"sudo -S\" src/",
+            "echo 'cd /; sudo -i'",
+            "git commit -m 'sudo | tee'",
+            "cat /etc/sudoers.d/x",
+        ] {
+            let hit = prefilter(&shell(harmless), &ctx());
+            assert_ne!(
+                hit.as_ref().map(|hit| hit.category),
+                Some("privilege-escalation"),
+                "{harmless}"
+            );
+        }
+        for risky in [
+            "sudo apt install x",
+            "cd /; sudo -i",
+            "echo x | sudo tee f",
+            "env FOO=1 sudo ls",
+            "nice -n 5 sudo id",
+            "echo \"$(sudo id)\"",
+            "bash -c 'sudo id'",
+        ] {
+            let hit = prefilter(&shell(risky), &ctx());
+            assert_eq!(
+                hit.as_ref().map(|hit| hit.category),
+                Some("privilege-escalation"),
+                "{risky}"
+            );
+            let reason = hit.map(|hit| hit.reason).unwrap_or_default();
+            assert!(
+                reason.contains("sudo funktioniert über"),
+                "{risky}: {reason}"
+            );
+        }
+    }
+
     /// Mit aktiver Host-Arbeitsphase ist „nur außerhalb des Workspace“ kein
     /// Vorfilter-Treffer mehr; Credential-Pfade, `.git`, nicht auflösbare
     /// Ziele, `rm -r` und `sudo` bleiben Treffer.
@@ -2457,9 +2523,9 @@ mod tests {
         let registry = Arc::new(HostPermitSessionRegistry::default());
         handle.install_host_lease(Arc::clone(&registry));
         handle.set_lease_session("sitzung-1");
-        assert_eq!(handle.host_lease_remaining(), None);
-        registry.mark_session_approved("sitzung-1", Duration::from_secs(600));
-        assert!(handle.host_lease_remaining().is_some());
+        assert!(!handle.host_lease_active());
+        registry.mark_session_approved("sitzung-1");
+        assert!(handle.host_lease_active());
 
         let verdict = run(handle.root_gate().decide(&shell("mv export.md ~")))?;
         assert_eq!(verdict.decision, AutoDecision::Allow);
@@ -2481,7 +2547,7 @@ mod tests {
         let probe = shell("cargo test");
         let prompt = build_classifier_prompt(&ClassifierInput {
             goals: vec!["Tests reparieren".to_owned()],
-            host_lease: None,
+            host_lease_active: false,
             plan: None,
             recent_calls: Vec::new(),
             call: &probe,
@@ -2716,7 +2782,7 @@ mod tests {
             );
         let prompt = build_classifier_prompt(&ClassifierInput {
             goals: vec!["Schreib mir ein Business-Paper".to_owned()],
-            host_lease: None,
+            host_lease_active: false,
             plan: None,
             recent_calls: Vec::new(),
             call: &probe,

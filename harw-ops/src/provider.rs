@@ -712,6 +712,12 @@ pub(crate) fn handle_switch_core(
         }
     };
 
+    // ── Step 3b: make sure the running assembly can actually reach it ────────
+    // A provider client that could not be built at startup (e.g. its
+    // credential was only resolvable later) is rebuilt now; if that still
+    // fails, the switch is rejected and the previous model stays active.
+    crate::live_model::ensure_provider_ready(ctx, &canonical_target)?;
+
     // ── Step 4: mutate the controller ─────────────────────────────────────────
     controller
         .set_active_provider(canonical_target.clone())
@@ -841,6 +847,10 @@ pub(crate) fn handle_uia_switch_core(
             },
         },
     };
+
+    // Wie beim generischen Wechsel: ein beim Start nicht baubarer Client
+    // wird jetzt gebaut, sonst bleibt die bisherige UIA-Auswahl aktiv.
+    crate::live_model::ensure_provider_ready(ctx, &canonical_target)?;
 
     let selection = UiaSelection::new(Some(canonical_target.clone()), resolved_model.clone());
     controller
@@ -1016,19 +1026,89 @@ async fn handle_test(ctx: &OpContext) -> Result<OpOutput, OpError> {
 /// - `provider` (`Option<String>`): the canonical provider ID/name (first
 ///   token). Required — [`provider_concurrency`] rejects a missing value.
 /// - `value` (`Option<String>`): either an unsigned integer (new hard
-///   nebenläufigkeits cap) or the literal `"unlimited"` (second token).
-///   Required — [`provider_concurrency`] rejects a missing or malformed
-///   value.
+///   concurrency cap) or the literal `"unlimited"` (second token). Optional:
+///   without it the operation only **shows** the provider's current load
+///   state (read-only form). The model-tool surface also accepts a JSON
+///   integer (`{"value": 1}`), see [`deserialize_concurrency_value`].
+///
+/// # Schema
+/// Hand-written [`harw_operations::OpArgsSchema`] (not derived): the derive
+/// can only say `value: string` without descriptions, and the model called
+/// the tool with `{}` and `{"provider": "anthropic"}` before guessing the
+/// field names (export 429). The schema now marks `provider` as required,
+/// types `value` as `integer ≥ 1 | "unlimited"` and describes both.
 ///
 /// # Spec Reference
 /// Plan v2, Welle 6b — UIA-Sichtbarkeit auf Provider-Concurrency/
 /// Rate-Limit-Zustand + Live-Anpassung.
-#[derive(Debug, Default, serde::Deserialize, harw_macros::OpArgs)]
+#[derive(Debug, Default, serde::Deserialize)]
 pub struct ProviderConcurrencyArgs {
     #[serde(default)]
     pub provider: Option<String>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_concurrency_value")]
     pub value: Option<String>,
+}
+
+/// Accepts `value` as JSON string (`"3"`, `"unlimited"`) **or** unsigned
+/// integer (`3`) and normalises it to the token form parsed by
+/// [`parse_concurrency_value`].
+///
+/// # Errors
+/// A serde error for any other JSON type (negative/fractional numbers,
+/// booleans, objects, …).
+fn deserialize_concurrency_value<'de, D>(deserializer: D) -> Result<Option<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    use serde::Deserialize as _;
+    match Option::<serde_json::Value>::deserialize(deserializer)? {
+        None | Some(serde_json::Value::Null) => Ok(None),
+        Some(serde_json::Value::String(text)) => Ok(Some(text)),
+        Some(serde_json::Value::Number(number)) => {
+            number.as_u64().map(|n| Some(n.to_string())).ok_or_else(|| {
+                serde::de::Error::custom("value must be a positive integer or \"unlimited\"")
+            })
+        }
+        Some(_) => Err(serde::de::Error::custom(
+            "value must be a positive integer or \"unlimited\"",
+        )),
+    }
+}
+
+impl harw_operations::OpArgsSchema for ProviderConcurrencyArgs {
+    /// `provider` (required string) plus `value` (`integer ≥ 1` or the
+    /// string `"unlimited"`, optional — omitted means "show only").
+    fn json_schema() -> harw_tools::JsonSchema {
+        use harw_operations::op_schema::{
+            described_object_schema, enum_string_schema, integer_schema, string_schema,
+        };
+        let value = harw_tools::JsonSchema {
+            description: Some(
+                "Neue harte Nebenläufigkeitsgrenze: positive Ganzzahl (z. B. 1) oder \
+                 \"unlimited\". Weglassen, um nur den aktuellen Zustand (Concurrency, \
+                 Rate-Limit-Wartezeit, beobachtete HTTP-429) anzuzeigen."
+                    .to_owned(),
+            ),
+            any_of: Some(vec![
+                integer_schema("Positive Ganzzahl (mindestens 1)."),
+                enum_string_schema("Grenze aufheben.", &["unlimited"]),
+            ]),
+            ..harw_tools::JsonSchema::default()
+        };
+        described_object_schema(
+            "Zeigt oder verstellt die harte Nebenläufigkeitsgrenze eines Providers. \
+             Nur `provider` → Zustand anzeigen; `provider` + `value` → Grenze setzen. \
+             Bei wiederholtem HTTP 429 senken, nicht erhöhen.",
+            vec![
+                (
+                    "provider",
+                    string_schema("Kanonischer Provider-Name, z. B. \"anthropic\"."),
+                ),
+                ("value", value),
+            ],
+            &["provider"],
+        )
+    }
 }
 
 impl harw_operations::FromRawArgs for ProviderConcurrencyArgs {
@@ -1103,15 +1183,17 @@ fn parse_concurrency_value(raw: &str) -> Result<Option<usize>, OpError> {
 /// # Arguments
 /// - `ctx` (`&OpContext`): execution context, used for `resolved_config` and
 ///   the `ProviderLoadRegistry` service lookup.
-/// - `args` (`ProviderConcurrencyArgs`): provider ID + `<n|unlimited>`.
+/// - `args` (`ProviderConcurrencyArgs`): provider ID + optional
+///   `<n|unlimited>`; without a value the call is read-only.
 ///
 /// # Returns
 /// [`OpOutput`] confirming the new target with the resulting load status
-/// (see [`format_load_status`]).
+/// (see [`format_load_status`]), or — without `value` — just the current
+/// load status.
 ///
 /// # Errors
-/// - [`OpError::InvalidArguments`]: missing provider/value, unknown provider,
-///   or a malformed value (see [`parse_concurrency_value`]).
+/// - [`OpError::InvalidArguments`]: missing provider, unknown provider, or a
+///   malformed value (see [`parse_concurrency_value`]).
 /// - [`OpError::NotAvailable`]: no [`harw_provider_http::ProviderLoadRegistry`]
 ///   is registered in the [`OpContext`] (the runtime registers one on every
 ///   surface, so this only happens in standalone/test contexts), or the
@@ -1141,22 +1223,21 @@ async fn provider_concurrency(
     let provider_arg = args
         .provider
         .as_deref()
-        .filter(|s| !s.trim().is_empty())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
         .ok_or_else(|| {
             OpError::InvalidArguments(
-                "usage: /provider-concurrency <provider> <n|unlimited>".to_owned(),
+                "usage: /provider-concurrency <provider> [<n|unlimited>] — `provider` is \
+                 required (e.g. {\"provider\": \"anthropic\", \"value\": 1}); without \
+                 `value` the current state is shown"
+                    .to_owned(),
             )
         })?;
-    let value_arg = args
-        .value
-        .as_deref()
-        .filter(|s| !s.trim().is_empty())
-        .ok_or_else(|| {
-            OpError::InvalidArguments(
-                "usage: /provider-concurrency <provider> <n|unlimited>".to_owned(),
-            )
-        })?;
-    let target = parse_concurrency_value(value_arg)?;
+    // Ohne `value`: nur anzeigen (Read-only-Form), nichts verstellen.
+    let target = match args.value.as_deref().map(str::trim) {
+        Some(value) if !value.is_empty() => Some(parse_concurrency_value(value)?),
+        _ => None,
+    };
 
     let config = resolved_config(ctx)?;
     let (canonical_id, _provider) = configured_provider(&config, provider_arg)
@@ -1178,6 +1259,14 @@ async fn provider_concurrency(
              registered)"
         ))
     })?;
+
+    let Some(target) = target else {
+        let text = format!(
+            "provider '{canonical_id}': current load state\n{status}",
+            status = format_load_status(&control.provider_status()),
+        );
+        return Ok(OpOutput::from(text));
+    };
 
     let applied = control.set_max_concurrency(target);
     if !applied {
@@ -1764,6 +1853,87 @@ mod tests {
             .map_err(ctx("from_raw_args must not fail"))?;
         assert_eq!(args.provider.as_deref(), Some("openai"));
         assert_eq!(args.value.as_deref(), Some("3"));
+        Ok(())
+    }
+
+    /// Export 429: das Modell riet die Feldnamen, weil das Schema weder
+    /// Pflichtfelder noch Beschreibungen nannte.
+    #[test]
+    fn provider_concurrency_schema_requires_provider_and_types_value() -> TestResult {
+        use harw_operations::OpArgsSchema as _;
+        let schema = super::ProviderConcurrencyArgs::json_schema();
+        assert_eq!(schema.required, Some(vec!["provider".to_owned()]));
+        let properties = schema
+            .properties
+            .as_ref()
+            .ok_or(TestError::Missing("properties"))?;
+        let provider = properties
+            .get("provider")
+            .ok_or(TestError::Missing("provider property"))?;
+        assert!(provider.description.is_some());
+        let value = properties
+            .get("value")
+            .ok_or(TestError::Missing("value property"))?;
+        assert!(
+            value
+                .description
+                .as_deref()
+                .is_some_and(|d| d.contains("unlimited"))
+        );
+        let variants = value.any_of.as_ref().ok_or(TestError::Missing("anyOf"))?;
+        assert!(
+            variants
+                .iter()
+                .any(|v| v.schema_type == Some(harw_tools::JsonSchemaType::Integer))
+        );
+        assert!(
+            variants.iter().any(|v| {
+                v.enum_values.as_deref() == Some(&[serde_json::json!("unlimited")][..])
+            })
+        );
+        Ok(())
+    }
+
+    /// `value` darf als JSON-Zahl oder als String kommen.
+    #[test]
+    fn provider_concurrency_args_accept_integer_and_string_values() -> TestResult {
+        let numeric: super::ProviderConcurrencyArgs =
+            serde_json::from_value(serde_json::json!({"provider": "anthropic", "value": 1}))
+                .map_err(ctx("integer value"))?;
+        assert_eq!(numeric.value.as_deref(), Some("1"));
+        let unlimited: super::ProviderConcurrencyArgs = serde_json::from_value(
+            serde_json::json!({"provider": "anthropic", "value": "unlimited"}),
+        )
+        .map_err(ctx("string value"))?;
+        assert_eq!(unlimited.value.as_deref(), Some("unlimited"));
+        let read_only: super::ProviderConcurrencyArgs =
+            serde_json::from_value(serde_json::json!({"provider": "anthropic"}))
+                .map_err(ctx("read-only form"))?;
+        assert!(read_only.value.is_none());
+        assert!(
+            serde_json::from_value::<super::ProviderConcurrencyArgs>(
+                serde_json::json!({"provider": "anthropic", "value": -1})
+            )
+            .is_err()
+        );
+        Ok(())
+    }
+
+    /// Nur `provider` ist die Read-only-Form: kein „usage"-Fehler mehr, sondern
+    /// (hier mangels Registry) `NotAvailable` wie beim Setzen.
+    #[tokio::test]
+    async fn provider_concurrency_without_value_is_read_only_not_a_usage_error() -> TestResult {
+        let config = Arc::new(openai_provider_config("openai"));
+        let (ctx, _tmp) = make_test_ctx(None, Some(config))?;
+        let args = super::ProviderConcurrencyArgs {
+            provider: Some("openai".to_owned()),
+            value: None,
+        };
+        let result = super::provider_concurrency(&ctx, args).await;
+        assert!(
+            matches!(result, Err(OpError::NotAvailable(_))),
+            "{result:?}"
+        );
         Ok(())
     }
 

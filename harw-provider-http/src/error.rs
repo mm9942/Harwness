@@ -181,16 +181,34 @@ impl HttpProviderError {
     ///
     /// Only documented JSON message fields are retained; arbitrary response
     /// bodies, echoed prompts, and HTML are discarded.
+    ///
+    /// Carries the body an `error.type` (Anthropic: `rate_limit_error`,
+    /// `overloaded_error`, …; OpenAI: `invalid_request_error`, …), it is put
+    /// in front of the message (`rate_limit_error: …`). Anthropic's 429 often
+    /// only says `"message": "Error"` — without the type the user could not
+    /// tell a rate limit from anything else.
     pub fn remote_response(status: u16, request_id: Option<String>, body: &str) -> Self {
         let message = serde_json::from_str::<serde_json::Value>(body)
             .ok()
             .and_then(|value| {
-                value
+                let message = value
                     .pointer("/error/message")
                     .or_else(|| value.get("message"))
                     .or_else(|| value.pointer("/error/detail"))
                     .and_then(serde_json::Value::as_str)
-                    .and_then(sanitize_diagnostic)
+                    .and_then(sanitize_diagnostic);
+                let error_type = value
+                    .pointer("/error/type")
+                    .and_then(serde_json::Value::as_str)
+                    .and_then(sanitize_diagnostic);
+                match (error_type, message) {
+                    (Some(error_type), Some(message)) if !message.starts_with(&error_type) => {
+                        sanitize_diagnostic(&format!("{error_type}: {message}"))
+                    }
+                    (_, Some(message)) => Some(message),
+                    (Some(error_type), None) => Some(error_type),
+                    (None, None) => None,
+                }
             });
         Self::RemoteResponse {
             status,
@@ -660,6 +678,30 @@ mod tests {
         assert_eq!(
             error.to_string(),
             "provider returned HTTP 429: retry shortly"
+        );
+    }
+
+    /// Export 429: Anthropic meldete nur `"message": "Error"`; der Typ
+    /// `rate_limit_error` muss in der Meldung stehen.
+    #[test]
+    fn remote_response_prefixes_error_type() {
+        let error = HttpProviderError::remote_response(
+            429,
+            Some("req_011".to_owned()),
+            r#"{"type":"error","error":{"type":"rate_limit_error","message":"Error"}}"#,
+        );
+        assert_eq!(
+            error.to_string(),
+            "provider returned HTTP 429 (request_id: req_011): rate_limit_error: Error"
+        );
+        let typed_only = HttpProviderError::remote_response(
+            529,
+            None,
+            r#"{"type":"error","error":{"type":"overloaded_error"}}"#,
+        );
+        assert_eq!(
+            typed_only.to_string(),
+            "provider returned HTTP 529: overloaded_error"
         );
     }
 

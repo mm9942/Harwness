@@ -444,6 +444,10 @@ fn chat_builder(inputs: &ChatRuntimeInputs, model: ModelSource) -> RuntimeAssemb
     if let Some(resolver) = inputs.secret_resolver.as_ref() {
         builder = builder.secret_resolver(Arc::clone(resolver));
     }
+    // Live-Modellwechsel: wechselt die Sitzung auf einen Provider mit
+    // `secrets:`-Referenz, öffnet die Montage den versiegelten Speicher
+    // nachträglich (beim Start wird er nur für den Vorgabe-Provider geöffnet).
+    builder = builder.secret_resolver_opener(secret_resolver_opener(&inputs.spec.home));
     if let Some(plan) = inputs.startup.plan.as_ref() {
         builder = builder.plan_services(plan.clone());
     }
@@ -457,6 +461,22 @@ fn chat_builder(inputs: &ChatRuntimeInputs, model: ModelSource) -> RuntimeAssemb
         }));
     }
     builder
+}
+
+// Öffner für den `secrets:`-Resolver eines Live-Modellwechsels: derselbe Weg
+// wie beim Start (`secret_store::open_configured_secret_resolver`), nur erst
+// dann, wenn ein Wechsel ihn braucht.
+fn secret_resolver_opener(home: &Path) -> Arc<harw_runtime::live_model::SecretResolverOpener> {
+    let home = home.to_path_buf();
+    Arc::new(
+        move |config: &ResolvedConfig| -> Result<Option<harw_runtime::live_model::SharedSecretResolver>, String> {
+            crate::secret_store::open_configured_secret_resolver(&home, config).map(|resolver| {
+                resolver.map(|resolver| {
+                    Arc::new(resolver) as harw_runtime::live_model::SharedSecretResolver
+                })
+            })
+        },
+    )
 }
 
 // Bildet einen Montagefehler auf eine menschenlesbare Meldung ab; ein

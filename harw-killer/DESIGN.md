@@ -71,8 +71,9 @@ semantics are unchanged from the standalone design above.
   `src/api.rs`. See `harw-tool-process/src/provider.rs` for the exact
   security contract: `process.kill` requires `Permission::ExecuteProcess`,
   is never in `AUTO_APPROVED_TOOLS`, and is always in `ALWAYS_ASK_TOOLS`
-  (`harw-registry-defaults`) — it asks for approval every time, even under
-  `FullAccess` and even with a matching allow rule.
+  (`harw-registry-defaults`) — in `ask` and `auto` it asks for approval
+  every time, even with a matching allow rule. Under `FullAccess` nothing
+  asks, including `process.kill`.
 
 ## Design principles
 

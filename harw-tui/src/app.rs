@@ -101,6 +101,8 @@ mod kanban_live;
 mod popup_keys;
 // Runde 5, Teil G: Modellwahl der UIA-Worker-Rollen (Worker-Bereich, Live-Wahl).
 mod uia_workers;
+// Live-Modellwechsel: Kinder folgen `/model switch`, Anzeige `<provider>/<modell>`.
+pub(crate) mod live_model;
 // Runde 5, Teil I: Einhängepunkte des Kind-Live-Streams (`crate::child_stream`).
 mod child_stream_glue;
 // Runde 5, Teil I: Live-Werte der Agentenbaum-Ansicht `/agent`.
@@ -415,8 +417,9 @@ struct AgentDetailState {
     /// Der angezeigte Agent.
     agent: SessionId,
     /// Abstand in umbrochenen Zeilen vom Ende der Spur; `0` folgt dem
-    /// neuesten Eintrag.
-    scroll: u16,
+    /// neuesten Eintrag, hochgescrollt bleibt der Ausschnitt bei neuen
+    /// Spur-Einträgen stehen (siehe [`ChatScroll::sync_layout`]).
+    scroll: ChatScroll,
     /// Reasoning-Einträge vollständig zeigen (`r` schaltet um).
     show_reasoning: bool,
     /// Vollbild-Zustand des Panels vor dem Öffnen (wird beim Schließen
@@ -425,7 +428,7 @@ struct AgentDetailState {
 }
 
 /// Seitenweite (Zeilen) für PageUp/PageDown in der Agenten-Detailansicht.
-const AGENT_DETAIL_PAGE: u16 = 10;
+const AGENT_DETAIL_PAGE: usize = 10;
 
 /// Kennung einer einzelnen oder gruppierten Werkzeugzelle, wie sie
 /// [`ChatApp`] für Ctrl+O „letzte bzw. alle aufklappen“ vorhält.
@@ -2267,7 +2270,7 @@ impl ChatApp {
             .map_or(self.panels.maximized, |detail| detail.prev_maximized);
         self.agent_detail = Some(AgentDetailState {
             agent,
-            scroll: 0,
+            scroll: ChatScroll::new(),
             show_reasoning: true,
             prev_maximized,
         });
@@ -2650,6 +2653,9 @@ impl ChatApp {
         let applied = self.session_controller.apply_to_session(session);
         // Runde 5, Teil G: „wie UIA“-Worker folgen der Live-Auswahl der UIA.
         uia_workers::sync_live_uia(self, session);
+        // Live-Modellwechsel: neu gestartete Kinder des Wurzel-Baums folgen
+        // der generischen Auswahl (`/model switch`) ohne Neustart.
+        live_model::sync_live_main(self);
         // Immer nachziehen, nicht nur bei `applied`: der Anzeigezustand soll
         // auch dann stimmen, wenn der Modus beim Aufbau der Session gesetzt
         // wurde oder ein anderer Pfad ihn verändert hat.
@@ -2713,10 +2719,11 @@ impl ChatApp {
     ///
     /// # Beschreibung
     /// Fragt direkt [`harw_sandbox::HostPermitSessionRegistry::is_session_approved`]
-    /// über die Runtime-Montage ab, statt einen eigenen Merker zu pflegen — der
-    /// Ablauf einer Phase (TTL) und ein `/`-seitiges Beenden
-    /// ([`Self::end_host_mode`]) wirken dadurch ohne einen zweiten
-    /// Wahrheitsort sofort auch hier. `false`, wenn keine Runtime-Montage
+    /// über die Runtime-Montage ab, statt einen eigenen Merker zu pflegen — ein
+    /// Beenden per Strg+H ([`Self::end_host_mode`]) oder per getipptem
+    /// `/sandbox-lease revoke` wirkt dadurch ohne einen zweiten Wahrheitsort
+    /// sofort auch hier. Eine Phase hat keinen Zeitablauf und kann vom Modell
+    /// nicht beendet werden (Nutzerentscheidung 2026-09-24). `false`, wenn keine Runtime-Montage
     /// vorliegt (z. B. in reinen Renderer-Tests).
     #[must_use]
     pub(crate) fn host_mode_active(&self) -> bool {
@@ -2793,7 +2800,9 @@ impl ChatApp {
     /// - [`Role::System`] → `PlainHistoryCell`
     ///
     /// Die erzeugte Zelle wird am Ende von `cells` angehängt.
-    /// `scroll_offset` wird auf 0 zurückgesetzt (Auto-Scroll zum neusten Eintrag).
+    /// Der Scroll-Zustand wird nicht verändert: am Ende folgt die Ansicht,
+    /// hochgescrollt bleibt der sichtbare Text stehen (Anker-Nachführung beim
+    /// Zeichnen, siehe [`ChatScroll::sync_layout`]).
     ///
     /// # Argumente
     /// - `role` ([`Role`]): Rolle der Nachricht; bestimmt das Rendering-Format.
@@ -2804,11 +2813,17 @@ impl ChatApp {
         // Lese-Gruppe (Plan Schritt 2 „Gruppierung": „sobald … Assistententext
         // kommt, wird die Gruppe geschlossen").
         self.close_tool_group();
-        self.export_entries.push(match role {
-            Role::User => ExportEntry::User(text.clone()),
-            Role::Assistant => ExportEntry::Assistant(text.clone()),
-            Role::System => ExportEntry::System(text.clone()),
-        });
+        match role {
+            // Eingespeiste Hintergrund-Meldungen stehen im Verlauf als
+            // Nutzernachricht, im Export aber nicht unter `## Du`.
+            Role::User => self
+                .export_entries
+                .extend(background_agents::user_text_export_entries(&text)),
+            Role::Assistant => self
+                .export_entries
+                .push(ExportEntry::Assistant(text.clone())),
+            Role::System => self.export_entries.push(ExportEntry::System(text.clone())),
+        }
         let cell: Box<dyn HistoryCell> = match role {
             Role::User => Box::new(UserHistoryCell { text }),
             Role::Assistant => Box::new(AssistantHistoryCell { source: text }),
@@ -2817,7 +2832,7 @@ impl ChatApp {
             }),
         };
         self.cells.push(cell);
-        // Neuer Inhalt: Chat-Scroll-State benachrichtigen (No-Op wenn User gescrollt hat).
+        // Neuer Inhalt: kein Scroll-Sprung (Anker folgt in `sync_layout`).
         self.scroll.on_new_content();
     }
 
@@ -2825,8 +2840,8 @@ impl ChatApp {
     ///
     /// # Beschreibung
     /// Wird intern verwendet, um mehrzeilige System-/Assistenten-Ausgaben direkt
-    /// als bereits berechnete [`Line`]-Vektoren anzuhängen. `scroll_offset` wird
-    /// auf 0 zurückgesetzt (Auto-Scroll zum neusten Eintrag).
+    /// als bereits berechnete [`Line`]-Vektoren anzuhängen. Kein Scroll-Sprung
+    /// (siehe [`ChatScroll::sync_layout`]).
     ///
     /// # Argumente
     /// - `lines` (`Vec<Line<'static>>`): Vorgerenderte Zeilen der Zelle.
@@ -3044,15 +3059,11 @@ impl ChatApp {
             })
     }
 
-    /// Live-Provider und -Modell der Sitzung: Controller-Snapshot, sonst das
-    /// zuletzt gemeldete Sitzungsmodell.
+    /// Live-Provider und -Modell der Sitzung: was die Wurzelsitzung
+    /// tatsächlich anspricht (inkl. eines noch nicht angewandten Wechsels),
+    /// als aufgelöste Kennungen — nie ein Alias wie `default`.
     fn live_model(&self) -> (Option<String>, Option<String>) {
-        let snap = self.session_controller.snapshot();
-        let model = snap
-            .active_model
-            .clone()
-            .or_else(|| self.export_session_model.clone());
-        (snap.active_provider, model)
+        live_model::resolved_root_route(self)
     }
 
     /// Öffnet eine generische Ansicht und reiht ihren Initial-Abruf ein.
@@ -5957,25 +5968,13 @@ fn export_timestamp_now() -> String {
 fn build_export_meta(app: &ChatApp) -> ExportMeta {
     let controller = SessionController::snapshot(app.session_controller.as_ref());
     let config = app.resolved_config();
-    let provider = controller.active_provider.or_else(|| {
-        config
-            .as_ref()
-            .and_then(|config| config.harness.default_provider.clone())
-    });
-    let model = controller
-        .active_model
-        .or_else(|| app.export_session_model.clone())
-        .or_else(|| {
-            config
-                .as_ref()
-                .and_then(|config| config.harness.default_model.clone())
-        });
-    let model = match (provider, model) {
-        (Some(provider), Some(model)) => Some(format!("{provider}/{model}")),
-        (None, Some(model)) => Some(model),
-        (Some(provider), None) => Some(provider),
-        (None, None) => None,
-    };
+    // Aufgelöstes Modell der UIA statt `anthropic/default` (siehe
+    // `export_capture::export_model_label`).
+    let model = export_capture::export_model_label(
+        &controller,
+        config.as_deref(),
+        app.export_session_model.as_deref(),
+    );
     ExportMeta {
         title: app.session_title().map(str::to_owned),
         session_id: app.session_id().to_string(),
@@ -6365,6 +6364,9 @@ fn handle_agent_tree_key(app: &mut ChatApp, key: KeyEvent) {
 ///   an Anfang/Ende ([`ChatScroll`]), sonst im Composer an Puffer-Anfang/-Ende
 ///   (siehe [`scroll_claims_key`] und `InputEditor::move_buffer_start`/
 ///   `move_buffer_end`).
+/// - Hochgescrollt (Hinweis „↓ N neue Zeilen · Strg+Ende springt ans Ende"):
+///   **Strg+Ende** springt immer ans Transkript-Ende, **Ende** bei leerem
+///   Composer ebenfalls; danach folgt die Ansicht wieder neuem Inhalt.
 /// - Bei offenem Popup: Pfeiltasten/Enter/Esc/Ziffern navigieren das Popup.
 /// - Alle übrigen Composer-Tasten (Pos1/Ende, Strg+Links/Rechts,
 ///   Strg+Backspace/Strg+W, Strg+A/Strg+E …) siehe
@@ -6474,12 +6476,12 @@ fn handle_agent_detail_key(app: &mut ChatApp, key: KeyEvent) -> Option<bool> {
     }
     let detail = app.agent_detail.as_mut()?;
     match key.code {
-        KeyCode::Down | KeyCode::Char('j') => detail.scroll = detail.scroll.saturating_sub(1),
-        KeyCode::Up | KeyCode::Char('k') => detail.scroll = detail.scroll.saturating_add(1),
-        KeyCode::PageDown => detail.scroll = detail.scroll.saturating_sub(AGENT_DETAIL_PAGE),
-        KeyCode::PageUp => detail.scroll = detail.scroll.saturating_add(AGENT_DETAIL_PAGE),
-        KeyCode::Home | KeyCode::Char('g') => detail.scroll = u16::MAX,
-        KeyCode::End | KeyCode::Char('G') => detail.scroll = 0,
+        KeyCode::Down | KeyCode::Char('j') => detail.scroll.scroll_down(1),
+        KeyCode::Up | KeyCode::Char('k') => detail.scroll.scroll_up_measured(1),
+        KeyCode::PageDown => detail.scroll.scroll_down(AGENT_DETAIL_PAGE),
+        KeyCode::PageUp => detail.scroll.scroll_up_measured(AGENT_DETAIL_PAGE),
+        KeyCode::Home | KeyCode::Char('g') => detail.scroll.jump_to_top_measured(),
+        KeyCode::End | KeyCode::Char('G') => detail.scroll.jump_to_bottom(),
         KeyCode::Char('r') => detail.show_reasoning = !detail.show_reasoning,
         _ => return None,
     }
@@ -6500,10 +6502,18 @@ fn handle_agent_detail_key(app: &mut ChatApp, key: KeyEvent) -> Option<bool> {
 /// (Transkript-Sprung) unverändert. Alle anderen von
 /// [`ChatScroll::handle_key`] behandelten Tasten (PageUp/PageDown,
 /// Shift+Up/Down) sind davon nicht betroffen.
+///
+/// Folgen nur am Ende: solange hochgescrollt ist, springt Strg+Ende immer
+/// ans Transkript-Ende (der Hinweis „… Strg+Ende springt ans Ende" muss
+/// stimmen), und ein bares Ende tut das bei leerem Composer ebenfalls. Bei
+/// nicht-leerer Eingabe gehören Pos1/Ende ohne Modifier dem Composer.
 fn scroll_claims_key(app: &ChatApp, key: &KeyEvent) -> bool {
-    let is_ctrl_home_end = key.modifiers.contains(KeyModifiers::CONTROL)
-        && matches!(key.code, KeyCode::Home | KeyCode::End);
-    !is_ctrl_home_end || app.input.is_empty()
+    let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+    match key.code {
+        KeyCode::End if ctrl && !app.scroll.is_following() => true,
+        KeyCode::Home | KeyCode::End if ctrl || key.modifiers.is_empty() => app.input.is_empty(),
+        _ => true,
+    }
 }
 
 fn scroll_and_composer_key(app: &mut ChatApp, key: KeyEvent, bus: &HarwEventSender) -> bool {
@@ -7135,7 +7145,10 @@ async fn drive_turn_animated(
                                     worker = prompt.worker_definition(),
                                     "tui.host_permit.prompt_shown"
                                 );
-                                host_permit_shown_at = Some(open_host_permit_prompt(app, prompt));
+                                // Full Access: Sitzungs-Lease ohne Dialog.
+                                if let Some(prompt) = auto_grant_host_permit(app, prompt) {
+                                    host_permit_shown_at = Some(open_host_permit_prompt(app, prompt));
+                                }
                                 draw_viewport(guard, app, spinner, app.pending_quit.map(|arm| arm.label))?;
                             }
                             None => {
@@ -7608,6 +7621,49 @@ fn quote_for_synthetic_command(value: &str) -> String {
     }
     out.push('"');
     out
+}
+
+/// Beantwortet eine Host-Permit-Frage unter „Full Access" selbst, ohne
+/// Dialog (Nutzerentscheidung 2026-09-24: Full Access fragt nie).
+///
+/// # Beschreibung
+/// Unter [`ApprovalMode::FullAccess`] wird die Frage sofort mit
+/// [`HostPermitVariant::SessionLease`] beantwortet: die Host-Arbeitsphase
+/// gilt dann ohne Zeitablauf, bis die Nutzerin sie mit Strg+H oder
+/// `/sandbox-lease revoke` beendet. In jedem anderen Modus (oder ohne
+/// Runtime-Montage) kommt die Frage unverändert zurück und der Aufrufer
+/// öffnet den Dialog wie bisher.
+///
+/// # Rückgabe
+/// `None`, wenn die Frage beantwortet wurde; sonst `Some(prompt)`.
+fn auto_grant_host_permit(app: &mut ChatApp, prompt: HostPermitPrompt) -> Option<HostPermitPrompt> {
+    let mode = app.current_approval();
+    auto_grant_host_permit_in_mode(app, prompt, mode)
+}
+
+/// [`auto_grant_host_permit`] mit ausdrücklich übergebenem Modus (testbar
+/// ohne Runtime-Montage).
+fn auto_grant_host_permit_in_mode(
+    app: &mut ChatApp,
+    prompt: HostPermitPrompt,
+    mode: Option<ApprovalMode>,
+) -> Option<HostPermitPrompt> {
+    if mode != Some(ApprovalMode::FullAccess) {
+        return Some(prompt);
+    }
+    tracing::info!(
+        session = prompt.session(),
+        worker = prompt.worker_definition(),
+        "tui.host_permit.full_access_auto_lease"
+    );
+    let delivered = prompt.approve(HostPermitVariant::SessionLease);
+    let message = if delivered {
+        "Full Access: Host-Arbeitsphase ohne Rückfrage freigegeben — HOST-MODUS AKTIV (Strg+H oder /sandbox-lease revoke beendet sie)."
+    } else {
+        "Full Access: Host-Arbeitsphase freigegeben, aber die Antwort kam nicht mehr an — der Auftrag ist bereits weitergelaufen."
+    };
+    app.push_line(Role::System, message);
+    None
 }
 
 /// Öffnet den Host-Permit-Dialog für eine frisch eingetroffene Frage (B6):
@@ -8260,16 +8316,19 @@ async fn drive_pauses_to_completion(
                             worker = prompt.worker_definition(),
                             "tui.host_permit.prompt_shown"
                         );
-                        // Dieselbe K3-Regel wie bei `approvals.recv()` oben:
-                        // eine noch offene ältere Host-Permit-Frage wird nicht
-                        // still überschrieben, sondern abgelehnt.
-                        if let Some(stale) = app.pending_host_permit.take() {
-                            tracing::warn!("tui.host_permit.stale_prompt_closed");
-                            stale.deny();
+                        // Full Access: Sitzungs-Lease ohne Dialog.
+                        if let Some(prompt) = auto_grant_host_permit(app, prompt) {
+                            // Dieselbe K3-Regel wie bei `approvals.recv()` oben:
+                            // eine noch offene ältere Host-Permit-Frage wird nicht
+                            // still überschrieben, sondern abgelehnt.
+                            if let Some(stale) = app.pending_host_permit.take() {
+                                tracing::warn!("tui.host_permit.stale_prompt_closed");
+                                stale.deny();
+                            }
+                            app.pending_host_permit_dialog = Some(build_host_permit_dialog(&prompt));
+                            app.pending_host_permit = Some(prompt);
+                            host_permit_shown_at = Some(Instant::now());
                         }
-                        app.pending_host_permit_dialog = Some(build_host_permit_dialog(&prompt));
-                        app.pending_host_permit = Some(prompt);
-                        host_permit_shown_at = Some(Instant::now());
                         draw_viewport(guard, app, spinner, app.pending_quit.map(|arm| arm.label))?;
                     }
                     None => {
@@ -8640,6 +8699,8 @@ fn route_busy_command(app: &mut ChatApp, raw: String) -> BusyKeyOutcome {
             return BusyKeyOutcome::Local;
         }
         if let LocalIntercept::Chat(text) = intercepted {
+            // Eigene Nachricht: ans Ende springen und wieder folgen.
+            app.scroll.force_follow();
             app.pending_turns.push_back(text);
             return BusyKeyOutcome::Redraw;
         }
@@ -8677,7 +8738,11 @@ fn route_busy_overlay_key(app: &mut ChatApp, key: KeyEvent) -> BusyKeyOutcome {
                     outcome = routed;
                 }
             }
-            HarwEvent::Submit(text) => app.pending_turns.push_back(text),
+            HarwEvent::Submit(text) => {
+                // Eigene Nachricht: ans Ende springen und wieder folgen.
+                app.scroll.force_follow();
+                app.pending_turns.push_back(text);
+            }
             // Runde 6, Teil C: Bus-Systemzeile auch in den Export.
             HarwEvent::SystemMessage(message) => app.push_system_text_exported(&message),
             HarwEvent::Quit => {
@@ -8717,6 +8782,8 @@ fn queue_busy_key(app: &mut ChatApp, key: KeyEvent) -> BusyKeyOutcome {
             app.mention_popup = None;
             match classify_line(&text) {
                 LineAction::Chat(text) => {
+                    // Eigene Nachricht: ans Ende springen und wieder folgen.
+                    app.scroll.force_follow();
                     app.pending_turns.push_back(text);
                     BusyKeyOutcome::Redraw
                 }
@@ -9156,7 +9223,7 @@ fn render_viewport(
                 &detail.agent,
                 agents_area,
                 frame.buffer_mut(),
-                detail.scroll,
+                &detail.scroll,
                 detail.show_reasoning,
             );
         } else {
@@ -9397,16 +9464,48 @@ fn render_viewport(
     app.last_history_total_lines.set(total_lines);
     app.last_history_visible_rows.set(visible_rows);
     // Rohes Offset (in Zeilen vom Anfang gesehen).
+    // Folgen nur am Ende: hochgescrollt bleibt der sichtbare Text stehen,
+    // auch wenn unten Zeilen dazukommen (Streaming, Werkzeugergebnisse,
+    // Kind-Agenten, Systemzeilen) oder ein Freigabe-Dialog den Verlauf
+    // verkleinert — `sync_layout` führt den Anker nach (siehe `chat_scroll`).
+    let back = app
+        .scroll
+        .sync_layout(usize::from(total_lines), usize::from(visible_rows), width);
     let scroll_from_top: u16 = if total_lines > visible_rows {
         let max_offset = total_lines - visible_rows;
-        // scroll.offset() zählt vom Ende → in „von oben" umrechnen.
-        let back = app.scroll.offset() as u16;
-        max_offset.saturating_sub(back)
+        // Offset zählt vom Ende → in „von oben" umrechnen.
+        max_offset.saturating_sub(u16::try_from(back).unwrap_or(u16::MAX))
     } else {
         0
     };
 
     frame.render_widget(history_widget.scroll((scroll_from_top, 0)), history_area);
+
+    // Hinweis, solange die Ansicht nicht folgt (unterste Verlaufszeile,
+    // rechtsbündig; ein offenes Popup zeichnet danach darüber).
+    if let Some(text) = app.scroll.indicator_text("Strg+Ende")
+        && history_area.height > 0
+    {
+        let label = format!(" {text} ");
+        let label_width = u16::try_from(label.chars().count())
+            .unwrap_or(u16::MAX)
+            .min(history_area.width);
+        let indicator_area = Rect {
+            x: history_area.x + history_area.width - label_width,
+            y: history_area.y + history_area.height - 1,
+            width: label_width,
+            height: 1,
+        };
+        frame.render_widget(Clear, indicator_area);
+        frame.render_widget(
+            Paragraph::new(label).style(
+                Style::default()
+                    .fg(style::warning_color(theme))
+                    .add_modifier(Modifier::REVERSED),
+            ),
+            indicator_area,
+        );
+    }
 
     // Popup überlagert den unteren Teil des History-Bereichs (falls offen).
     let popup_open = app
@@ -9824,7 +9923,7 @@ mod tests {
             .clone()
             .ok_or(TestError::Missing("agent detail"))?;
         assert_eq!(detail.agent.as_str(), "agent-1");
-        assert_eq!(detail.scroll, 0);
+        assert_eq!(detail.scroll.offset(), 0);
         assert!(app.panels.maximized, "Detailansicht maximiert das Panel");
 
         assert_eq!(
@@ -9832,16 +9931,30 @@ mod tests {
             Some(true)
         );
         assert_eq!(handle_panel_key(&mut app, key(KeyCode::PageUp)), Some(true));
-        assert_eq!(app.agent_detail.as_ref().map(|d| d.scroll), Some(11));
+        assert_eq!(
+            app.agent_detail.as_ref().map(|d| d.scroll.offset()),
+            Some(11)
+        );
         assert_eq!(
             handle_panel_key(&mut app, key(KeyCode::Char('j'))),
             Some(true)
         );
-        assert_eq!(app.agent_detail.as_ref().map(|d| d.scroll), Some(10));
+        assert_eq!(
+            app.agent_detail.as_ref().map(|d| d.scroll.offset()),
+            Some(10)
+        );
         assert_eq!(handle_panel_key(&mut app, key(KeyCode::Home)), Some(true));
-        assert_eq!(app.agent_detail.as_ref().map(|d| d.scroll), Some(u16::MAX));
+        // Vor dem ersten Zeichnen ist die Spurlänge unbekannt: „ganz oben"
+        // ist unbegrenzt und wird beim nächsten Zeichnen gekappt.
+        assert_eq!(
+            app.agent_detail.as_ref().map(|d| d.scroll.offset()),
+            Some(usize::MAX)
+        );
         assert_eq!(handle_panel_key(&mut app, key(KeyCode::End)), Some(true));
-        assert_eq!(app.agent_detail.as_ref().map(|d| d.scroll), Some(0));
+        assert_eq!(
+            app.agent_detail.as_ref().map(|d| d.scroll.offset()),
+            Some(0)
+        );
         let before = app.agent_detail.as_ref().map(|d| d.show_reasoning);
         assert_eq!(
             handle_panel_key(&mut app, key(KeyCode::Char('r'))),
@@ -13439,6 +13552,109 @@ forbidden = [{forbidden}]
         Ok(())
     }
 
+    /// Folgen nur am Ende: hochgescrollt verschiebt neuer Inhalt den
+    /// sichtbaren Verlauf nicht (Hinweis zählt die neuen Zeilen), eine eigene
+    /// Nachricht springt ans Ende und folgt wieder.
+    #[test]
+    fn scrolled_up_history_stays_put_and_own_message_resumes_follow() -> TestResult {
+        let mut app = test_chat_app()?;
+        let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(60, 20))
+            .map_err(ctx("test terminal"))?;
+        let screen = |terminal: &ratatui::Terminal<ratatui::backend::TestBackend>| {
+            let buffer = terminal.backend().buffer();
+            (0..buffer.area.height)
+                .map(|y| {
+                    (0..buffer.area.width)
+                        .map(|x| buffer[(x, y)].symbol())
+                        .collect::<String>()
+                })
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+        let first_line = |shown: &str| -> Option<String> {
+            shown.find("Zeile-").map(|at| shown[at..at + 8].to_owned())
+        };
+        for index in 0..60 {
+            app.push_line(Role::System, format!("Zeile-{index:02}"));
+        }
+        terminal
+            .draw(|frame| render_viewport(frame, &app, &Spinner::new(), None))
+            .map_err(ctx("draw"))?;
+        assert!(app.scroll.is_following());
+        assert!(screen(&terminal).contains("Zeile-59"));
+
+        assert_eq!(
+            handle_busy_event(
+                &mut app,
+                TuiEvent::Key(KeyEvent::new(KeyCode::PageUp, KeyModifiers::NONE))
+            ),
+            BusyKeyOutcome::Redraw
+        );
+        terminal
+            .draw(|frame| render_viewport(frame, &app, &Spinner::new(), None))
+            .map_err(ctx("draw"))?;
+        let before = screen(&terminal);
+        let first_before = first_line(&before).ok_or(TestError::Missing("Zeile"))?;
+
+        for index in 60..65 {
+            app.push_line(Role::System, format!("Zeile-{index:02}"));
+        }
+        terminal
+            .draw(|frame| render_viewport(frame, &app, &Spinner::new(), None))
+            .map_err(ctx("draw"))?;
+        let after = screen(&terminal);
+        assert_eq!(first_line(&after), Some(first_before), "{after}");
+        assert!(!after.contains("Zeile-64"), "{after}");
+        assert!(
+            after.contains("5 neue Zeilen · Strg+Ende springt ans Ende"),
+            "{after}"
+        );
+
+        // Eigene Nachricht während des Turns: ans Ende, wieder folgen.
+        app.input.insert_str("weiter");
+        assert_eq!(
+            queue_busy_key(&mut app, KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+            BusyKeyOutcome::Redraw
+        );
+        assert!(app.scroll.is_following());
+        terminal
+            .draw(|frame| render_viewport(frame, &app, &Spinner::new(), None))
+            .map_err(ctx("draw"))?;
+        let tail = screen(&terminal);
+        assert!(tail.contains("Zeile-64"), "{tail}");
+        assert!(!tail.contains("springt ans Ende"), "{tail}");
+        Ok(())
+    }
+
+    /// Strg+Ende springt hochgescrollt auch bei nicht-leerem Composer ans
+    /// Ende; bares Ende nur bei leerem Composer.
+    #[test]
+    fn end_keys_jump_to_bottom_while_scrolled_up() -> TestResult {
+        let mut app = test_chat_app()?;
+        app.last_history_total_lines.set(100);
+        app.last_history_visible_rows.set(10);
+        let ctrl_end = KeyEvent::new(KeyCode::End, KeyModifiers::CONTROL);
+        let end = KeyEvent::new(KeyCode::End, KeyModifiers::NONE);
+
+        app.input.insert_str("halb getippt");
+        assert!(
+            !scroll_claims_key(&app, &ctrl_end),
+            "am Ende bewegt Strg+Ende bei Text weiter den Composer-Cursor"
+        );
+        app.scroll.scroll_up(5, 100, 10);
+        assert!(scroll_claims_key(&app, &ctrl_end));
+        assert!(
+            !scroll_claims_key(&app, &end),
+            "Ende gehört bei Text dem Composer"
+        );
+
+        app.input.clear();
+        assert!(scroll_claims_key(&app, &end));
+        assert_eq!(app.scroll.handle_key(end, 100, 10), ScrollAction::Redraw);
+        assert!(app.scroll.is_following());
+        Ok(())
+    }
+
     #[test]
     fn workbench_command_detection() {
         assert!(is_workbench_command("/workbench"));
@@ -14095,6 +14311,47 @@ mod approval_arming_tests {
                 .any(|line| line_contains(line, "HOST-MODUS AKTIV"))),
             "a system line must confirm the session-lease approval"
         );
+        Ok(())
+    }
+
+    /// Nutzerentscheidung 2026-09-24: unter „Full Access" wird eine
+    /// Host-Permit-Frage (`request_host`, Sandbox-Lease) ohne Dialog mit einer
+    /// Sitzungs-Lease beantwortet; unter `ask`/`auto` kommt sie zurück und der
+    /// Dialog öffnet wie bisher.
+    #[tokio::test]
+    async fn full_access_grants_a_host_session_lease_without_a_dialog() -> TestResult {
+        let (prompt, answer) = build_host_permit_prompt(HostPermitVariant::SingleExecution);
+        let mut app = test_chat_app()?;
+        let handed_back =
+            auto_grant_host_permit_in_mode(&mut app, prompt, Some(ApprovalMode::FullAccess));
+        assert!(handed_back.is_none(), "Full Access beantwortet selbst");
+        assert!(app.pending_host_permit.is_none());
+        assert!(app.pending_host_permit_dialog.is_none());
+        assert_eq!(
+            answer
+                .await
+                .map_err(ctx("responder must deliver an answer"))?,
+            Some(HostPermitVariant::SessionLease)
+        );
+        assert!(
+            app.cells.iter().any(|cell| cell
+                .display_lines(80, app.theme)
+                .iter()
+                .any(|line| line_contains(line, "HOST-MODUS AKTIV"))),
+            "a system line must confirm the automatic session lease"
+        );
+
+        for mode in [
+            None,
+            Some(ApprovalMode::AlwaysAsk),
+            Some(ApprovalMode::Delegated),
+        ] {
+            let (prompt, _answer) = build_host_permit_prompt(HostPermitVariant::SingleExecution);
+            assert!(
+                auto_grant_host_permit_in_mode(&mut app, prompt, mode).is_some(),
+                "{mode:?} muss den Dialog zeigen"
+            );
+        }
         Ok(())
     }
 

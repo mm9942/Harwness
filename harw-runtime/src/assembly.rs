@@ -124,7 +124,7 @@ use crate::children::RuntimeChildRegistryFactory;
 use crate::config::{ConfigTrustReport, load_config};
 use crate::contributors::{AssemblyContributor, AssemblyInputs, AssemblyParts};
 use crate::error::{RuntimeError, RuntimeResult};
-use crate::model::{ModelSource, build_root_model_with_registry_and_resolver};
+use crate::model::ModelSource;
 use crate::sandbox::{root_network_scope, root_sandbox_with_network};
 use crate::services::{PlanServices, RuntimeServices, RuntimeServicesParts, ServiceSurface};
 use crate::spec::{
@@ -1260,6 +1260,10 @@ pub struct RuntimeAssemblyBuilder {
     /// Löst `secrets:`-Referenzen beim Bau von [`ModelSource::Configured`]
     /// auf; ohne ihn schlägt jedes `auth = "secrets:…"` fehl (Befund C2a).
     secret_resolver: Option<Arc<dyn SecretResolver + Send + Sync>>,
+    /// Öffnet den `secrets:`-Resolver nachträglich, wenn ein Live-
+    /// Modellwechsel einen beim Start nicht gebauten Provider braucht
+    /// ([`Self::secret_resolver_opener`]).
+    secret_resolver_opener: Option<Arc<crate::live_model::SecretResolverOpener>>,
     /// Verengung von Werkzeugsatz, Identität und Sandbox-Rechten durch den
     /// Aufrufer (CONTRACTS-W2d2 §1.1); `None` heißt „Profil unverändert".
     narrowing: Option<RuntimeNarrowing>,
@@ -1377,6 +1381,24 @@ impl RuntimeAssemblyBuilder {
     #[must_use]
     pub fn secret_resolver(mut self, resolver: Arc<dyn SecretResolver + Send + Sync>) -> Self {
         self.secret_resolver = Some(resolver);
+        self
+    }
+
+    /// Übergibt einen Öffner für den `secrets:`-Resolver (Live-Modellwechsel).
+    ///
+    /// # Beschreibung
+    /// Der Aufrufer öffnet beim Start nur dann einen Resolver, wenn der
+    /// Vorgabe-Provider ihn braucht. Wechselt die Sitzung später auf einen
+    /// Provider mit `secrets:`-Referenz, öffnet
+    /// [`crate::live_model::LiveModelRouting`] den Speicher über diesen
+    /// Öffner und baut den Provider-Client neu — ohne Neustart. Ohne Aufruf
+    /// scheitert ein solcher Wechsel mit einer klaren Meldung.
+    #[must_use]
+    pub fn secret_resolver_opener(
+        mut self,
+        opener: Arc<crate::live_model::SecretResolverOpener>,
+    ) -> Self {
+        self.secret_resolver_opener = Some(opener);
         self
     }
 
@@ -1530,6 +1552,7 @@ impl RuntimeAssemblyBuilder {
             contributors,
             root_session_id,
             secret_resolver,
+            secret_resolver_opener,
             narrowing,
             project_facts,
             global_facts,
@@ -2147,12 +2170,21 @@ impl RuntimeAssemblyBuilder {
         //    HTTP-Client bauen darf (siehe dessen Doku und
         //    [`crate::model::build_uia_model_with_resolver`]).
         let source_is_configured = matches!(&model_source, ModelSource::Configured);
-        let (default_tree_model, root_load_registry) = build_root_model_with_registry_and_resolver(
-            &spec,
-            &config,
-            model_source,
-            secret_resolver.as_deref().map(|r| r as &dyn SecretResolver),
-        )?;
+        let (default_tree_model, root_load_registry, root_backends) =
+            crate::model::build_root_model_with_backends(
+                &spec,
+                &config,
+                model_source,
+                secret_resolver.as_deref().map(|r| r as &dyn SecretResolver),
+            )?;
+        // Live-Modellwechsel: generische Auswahl und Rollenwahl für neu
+        // gestartete Kinder, Neubau eines beim Start nicht baubaren
+        // Provider-Clients (siehe `crate::live_model`).
+        let live_models = Arc::new(
+            crate::live_model::LiveModelRouting::new(Arc::clone(&config))
+                .with_backends(root_backends, spec.home.clone())
+                .with_secret_resolvers(secret_resolver.clone(), secret_resolver_opener),
+        );
         // Welle 3a: bei aktiver UIA bekommt sie ihr eigenes Provider-Modell
         // (`uia_client`), aus dem sich zusätzlich das Modell der gesamten
         // `uia-worker`-Rollenfamilie ableitet (`uia_worker_model`) — beide
@@ -2238,6 +2270,7 @@ impl RuntimeAssemblyBuilder {
                 uia_worker_model: &uia_worker_model,
                 // Runde 5, Teil G.
                 uia_worker_routing: Arc::clone(&uia_worker_routing),
+                live_models: Arc::clone(&live_models),
                 root_session_id: &root_session_id,
                 root_model_id: root_model_id.clone(),
                 spawn_context: &spawn_context,
@@ -2394,6 +2427,11 @@ impl RuntimeAssemblyBuilder {
         }
         .with_home_context(Arc::clone(&home_context))
         .with_agent_events(Arc::new(agent_events.clone()));
+        // Live-Modellwechsel: `/model switch` & Co. bauen darüber einen
+        // Provider-Client neu bzw. übernehmen die Rollenwahl.
+        let services = services.with_live_model_control(
+            Arc::clone(&live_models) as harw_ops::live_model::SharedLiveModelControl
+        );
         // Runde 5, Teil E: `/permissions log` liest das Auto-Modus-Protokoll.
         let services = match chain.auto_mode() {
             Some(auto) => services.with_auto_decision_log(auto.log().clone()),
@@ -2837,6 +2875,7 @@ impl RuntimeAssemblyBuilder {
             plan_ui_requests: Mutex::new(plan_ui_receiver),
             // Runde 5, Teil G.
             uia_worker_routing,
+            live_models,
         })
     }
 }
@@ -3698,6 +3737,26 @@ fn effective_root_model_id(config: &ResolvedConfig, uia_root: bool) -> Option<St
     config.harness.default_model.clone()
 }
 
+/// Der Provider des Modells, das die Wurzelsitzung dieses Laufs treibt —
+/// Gegenstück zu [`effective_root_model_id`] (dieselbe UIA-Rangfolge).
+///
+/// # Rückgabe
+/// `uia_provider` bei nutzbarer UIA-Auswahl einer UIA-Wurzel, sonst
+/// `default_provider`.
+fn effective_root_provider_id(config: &ResolvedConfig, uia_root: bool) -> Option<String> {
+    if uia_root
+        && config.harness.uia_model.is_some()
+        && let Some(provider) = config.harness.uia_provider.as_deref()
+        && config
+            .providers
+            .get(provider)
+            .is_some_and(|provider| provider.enabled)
+    {
+        return Some(provider.to_owned());
+    }
+    config.harness.default_provider.clone()
+}
+
 /// Die für das Kontext-/Ausgabebudget relevanten Grenzen eines Modells.
 ///
 /// Ergebnis von [`model_limits_for`]; alle Token-Angaben in Tokens.
@@ -4159,6 +4218,9 @@ struct SpawnerInputs<'a> {
     /// Runde 5, Teil G: eigene Modellwahl je UIA-Worker-Rolle; die
     /// UIA-Worker-Fabrik baut das Modell jedes Kindes beim Start daraus.
     uia_worker_routing: Arc<crate::uia_worker_routing::UiaWorkerRouting>,
+    /// Live-Modellwahl der Montage; die Fabrik des Wurzel-Baums gibt neu
+    /// gestarteten Kindern daraus Hauptmodell und Rollenwahl.
+    live_models: Arc<crate::live_model::LiveModelRouting>,
     /// Die Kennung der Wurzelsitzung, unter der der Spawner sie registriert.
     root_session_id: &'a SessionId,
     /// Das Modell, das die Wurzelsitzung treibt ([`effective_root_model_id`]);
@@ -4247,6 +4309,7 @@ fn build_spawner(
         model,
         uia_worker_model,
         uia_worker_routing,
+        live_models,
         root_session_id,
         root_model_id,
         spawn_context,
@@ -4304,6 +4367,9 @@ fn build_spawner(
         .with_internal_models(crate::children::resolve_internal_models_for_children(
             config,
         ))
+        // Live-Modellwechsel: neue Kinder folgen `/model switch` und
+        // `/models set` ohne Neustart.
+        .with_live_models(live_models)
         .with_profile_agents_dir(profile_agents_dir.clone())
         .with_browser_config(config.browser.clone())
         .with_spawner_slot(Arc::clone(&spawner_slot))
@@ -4411,6 +4477,11 @@ fn build_spawner(
         // Teil C: Rückfall für das Kind-Modell, wenn weder Rollen-Pin noch
         // Fabrik-Hauptmodell bekannt sind.
         .with_root_model(root_model_id.clone())
+        // Anzeige `<provider>/<modell>`: Provider der Wurzel als Rückfall.
+        .with_root_provider(effective_root_provider_id(
+            config,
+            spawn_context.organizational_role == AgentRoleId::UserInterface,
+        ))
         // Welle 3: dieselbe feste Verdichtungs-Obergrenze wie die Wurzel
         // (`[compaction] absolute_ceiling_tokens`, sonst Kern-Vorgabe).
         .with_compaction_ceiling(Some(configured_compaction_ceiling(config)))
@@ -4622,6 +4693,8 @@ pub struct RuntimeAssembly {
     /// Runde 5, Teil G: Modellwahl der UIA-Worker-Rollen (siehe
     /// [`Self::uia_worker_routing`]).
     uia_worker_routing: Arc<crate::uia_worker_routing::UiaWorkerRouting>,
+    /// Live-Modellwahl der Montage (siehe [`Self::live_models`]).
+    live_models: Arc<crate::live_model::LiveModelRouting>,
 }
 
 impl std::fmt::Debug for RuntimeAssembly {
@@ -4658,6 +4731,7 @@ impl RuntimeAssembly {
             contributors: crate::contributors::default_contributors(),
             root_session_id: None,
             secret_resolver: None,
+            secret_resolver_opener: None,
             narrowing: None,
             project_facts: None,
             global_facts: None,
@@ -4848,6 +4922,59 @@ impl RuntimeAssembly {
     #[must_use]
     pub fn uia_worker_routing(&self) -> &Arc<crate::uia_worker_routing::UiaWorkerRouting> {
         &self.uia_worker_routing
+    }
+
+    /// Die Live-Modellwahl dieses Laufs (Live-Modellwechsel).
+    ///
+    /// # Beschreibung
+    /// Die TUI meldet hierüber an jeder Turn-Grenze die generische Auswahl
+    /// des Controllers
+    /// ([`crate::live_model::LiveModelRouting::set_live_main`]); neu
+    /// gestartete Kinder des Wurzel-Baums nehmen sie, laufende behalten ihr
+    /// Modell.
+    #[must_use]
+    pub fn live_models(&self) -> &Arc<crate::live_model::LiveModelRouting> {
+        &self.live_models
+    }
+
+    /// Provider/Modell, das die Wurzelsitzung mit `active_model`/
+    /// `active_provider` tatsächlich anspricht, als aufgelöste Kennungen.
+    ///
+    /// # Beschreibung
+    /// Ohne eigene Wahl gilt das effektive Wurzelmodell des Starts
+    /// (UIA-Modell bei UIA-Wurzel, sonst Vorgabemodell) und dessen
+    /// Provider; ein Alias wird über den Modellkatalog zur Modell-ID
+    /// aufgelöst. Grundlage der Modellanzeige (`<provider>/<modell>`).
+    #[must_use]
+    pub fn resolved_root_route(
+        &self,
+        active_provider: Option<&str>,
+        active_model: Option<&str>,
+    ) -> (Option<String>, Option<String>) {
+        let model = active_model
+            .map(str::to_owned)
+            .or_else(|| self.root_model_id.clone());
+        let provider = active_provider.map(str::to_owned).or_else(|| {
+            match active_model {
+                // Eigene Modellwahl ohne Provider: Provider laut Katalog.
+                Some(model) => harw_config::catalog_provider_of(&self.config, model),
+                None => self.root_provider_id(),
+            }
+        });
+        let model = model.map(|model| crate::live_model::resolve_model_id(&self.config, &model));
+        (provider, model)
+    }
+
+    /// `true`, wenn die Wurzelsitzung dieses Laufs eine UIA ist (dann gilt
+    /// für sie die UIA-Auswahl des Controllers vor der generischen).
+    #[must_use]
+    pub fn root_is_uia(&self) -> bool {
+        self.spawn_context.organizational_role == AgentRoleId::UserInterface
+    }
+
+    /// Provider des effektiven Wurzelmodells des Starts.
+    fn root_provider_id(&self) -> Option<String> {
+        effective_root_provider_id(&self.config, self.root_is_uia())
     }
 
     /// Der Vertrauensbericht der Konfigurationsschichten.
@@ -5249,6 +5376,16 @@ impl RuntimeAssembly {
                     Arc::new(move |model: Option<&str>| {
                         model_limits_or_fallback(&config, model, root_model_id.as_deref())
                             .context_window
+                    })
+                })
+                // Live-Modellwechsel: die Ausgabereserve folgt dem neuen
+                // Modell (sonst bliebe die Reserve des Start-Modells stehen).
+                .with_output_reserve_resolver({
+                    let config = Arc::clone(&self.config);
+                    let root_model_id = self.root_model_id.clone();
+                    Arc::new(move |model: Option<&str>| {
+                        model_limits_or_fallback(&config, model, root_model_id.as_deref())
+                            .output_reserve_tokens()
                     })
                 })
                 .with_auto_compact(Some(

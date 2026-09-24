@@ -2162,9 +2162,9 @@ mod tests {
         use crate::plan_toml::RemoteOcrMode;
 
         let mut trusted = HarnessConfig::default();
-        assert_eq!(trusted.tools.doc.remote_ocr, RemoteOcrMode::Ask);
+        assert_eq!(trusted.tools.doc.remote_ocr, RemoteOcrMode::Off);
 
-        let home = "[tools.doc]\nremote_ocr = \"off\"";
+        let home = "[tools.doc]\nremote_ocr = \"ask\"";
         merge_layer_into(
             &mut trusted,
             toml::from_str(home).map_err(ctx("parse home"))?,
@@ -2172,7 +2172,7 @@ mod tests {
             LayerRole::Baseline,
             &layer_path(),
         );
-        assert_eq!(trusted.tools.doc.remote_ocr, RemoteOcrMode::Off);
+        assert_eq!(trusted.tools.doc.remote_ocr, RemoteOcrMode::Ask);
 
         // Ein vertrautes Profil darf lockern.
         let profile = "[tools.doc]\nremote_ocr = \"on\"";
@@ -2207,29 +2207,24 @@ mod tests {
         assert_eq!(trusted.tools.doc.remote_ocr, RemoteOcrMode::Ask);
         assert!(diagnostics.is_empty());
 
-        // Default `ask`: das Projekt darf nicht auf `on` lockern.
-        let mut fresh = HarnessConfig::default();
-        let loosen = "[tools.doc]\nremote_ocr = \"on\"";
-        let diagnostics = merge_layer_into(
-            &mut fresh,
-            toml::from_str(loosen).map_err(ctx("parse loosen"))?,
-            &raw_from(loosen)?,
-            LayerRole::UntrustedProject,
-            &layer_path(),
-        );
-        assert_eq!(fresh.tools.doc.remote_ocr, RemoteOcrMode::Ask);
-        assert_eq!(diagnostics.len(), 1, "Lockerung sichtbar abgelehnt");
-        assert_eq!(diagnostics[0].field, "tools.doc.remote_ocr");
-
-        let off = "[tools.doc]\nremote_ocr = \"off\"";
-        merge_layer_into(
-            &mut fresh,
-            toml::from_str(off).map_err(ctx("parse off"))?,
-            &raw_from(off)?,
-            LayerRole::UntrustedProject,
-            &layer_path(),
-        );
-        assert_eq!(fresh.tools.doc.remote_ocr, RemoteOcrMode::Off);
+        // Default `off`: das Projekt darf weder auf `ask` noch auf `on`
+        // lockern.
+        for loosen in [
+            "[tools.doc]\nremote_ocr = \"ask\"",
+            "[tools.doc]\nremote_ocr = \"on\"",
+        ] {
+            let mut fresh = HarnessConfig::default();
+            let diagnostics = merge_layer_into(
+                &mut fresh,
+                toml::from_str(loosen).map_err(ctx("parse loosen"))?,
+                &raw_from(loosen)?,
+                LayerRole::UntrustedProject,
+                &layer_path(),
+            );
+            assert_eq!(fresh.tools.doc.remote_ocr, RemoteOcrMode::Off);
+            assert_eq!(diagnostics.len(), 1, "Lockerung sichtbar abgelehnt");
+            assert_eq!(diagnostics[0].field, "tools.doc.remote_ocr");
+        }
         Ok(())
     }
 

@@ -58,7 +58,7 @@ indented block under its agent line. `/agents` no longer exists.
 | `agent.status` | `{child_id?}` | none (read-only) | running and recently finished background runs of the current session: tool calls, tokens, runtime, last step, journal excerpt, changed files |
 | `agent.result` | `{child_id, offset?, max_bytes?, part?}` | none (read-only) | unabridged response text of one's own finished child, paginated (at most 48 KiB per page); `part: "journal"` returns the activity journal, even for running or cancelled children |
 | `agent.message` | `{child_id, text}` | none | message to a running child of the current session |
-| `agent.cancel` | `{child_id}` | **always** (`ALWAYS_ASK_TOOLS`) | cancel a background run of the current session |
+| `agent.cancel` | `{child_id}` | **always** in `ask`/`auto` (`ALWAYS_ASK_TOOLS`); none under `full` | cancel a background run of the current session |
 
 All four only know about children of the current session. The calling
 session comes from the execution context, never from model arguments;
@@ -137,16 +137,26 @@ host mode:
 - Once approved, the command runs through the existing host path. The
   "for the session" choice applies process-wide: every shell-capable
   agent in that session then runs on the host without a new prompt.
-  `Ctrl+H` ends the phase, as does a session switch ("host mode ended
-  (new session).").
+  The phase has no expiry and the model cannot end it: only you end it,
+  with `Ctrl+H` or by typing `/sandbox-lease revoke`. A session switch
+  (`/new`, `/resume`) builds a fresh runtime and therefore also starts
+  without a phase ("host mode ended (new session)."), as does quitting
+  harw.
 - If a normal sandboxed run recognizably fails because of the sandbox,
   the model gets the fields `sandbox_denial` and `host_mode_hint`. This is
   only a hint, never an automatic retry on the host.
 - Outside the TUI, every such request ends with a hard error.
 
-Root commands are separate: only `uia-shell-worker` and
-`host-process-worker` may use `host.sudo_exec {argv, reason}`. The
-password is entered in its own TUI window and never reaches the model.
+Root commands are separate, and they work: only `uia-shell-worker` and
+`host-process-worker` may use `host.sudo_exec {argv, reason}`, so the UIA
+delegates a root command to `uia-shell-worker` with the exact command and
+a reason, and other agents hand the exact `argv` back to their parent. You
+see the exact argv in its own TUI window, approve it and type your
+password there if sudo asks for one (passwordless sudo only asks for
+approval). The password never reaches the model; agents never ask for it
+in chat or use `sudo -S`. Only without a TUI (`serve`, Telegram, one-shot)
+is there no such window — then harw names the command for you to run
+yourself. Details: [`mediated-process-execution.md`](../design/mediated-process-execution.md#root-commands-hostsudo_exec).
 
 ## 7. Approvals for child agents
 

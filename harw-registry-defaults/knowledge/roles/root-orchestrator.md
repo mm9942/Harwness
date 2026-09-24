@@ -28,4 +28,6 @@ Auftragsgrenze hart verdichtet.
 ## Übergabe
 Frage/Stand an die UIA: `parent.message`; Kinder: `agent.message`.
 An die UIA nach Return-Contract: Ergebnis, Belege, Vorschlags-IDs, Blocker,
-offene Punkte.
+offene Punkte. Root-Befehle (sudo) als Blocker mit exaktem argv und Grund
+an die UIA — sie lässt sie über `uia-shell-worker` freigeben; nie „sudo
+geht nicht“.

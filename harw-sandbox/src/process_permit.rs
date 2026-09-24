@@ -29,9 +29,11 @@ pub enum ProcessEnvironment {
 pub enum HostApprovalScope {
     /// Ein Permit darf nur genau einen Auftrag ausführen.
     SingleExecution,
-    /// Mehrere Aufträge derselben lokalen Sitzung dürfen bis Ablauf des Leases
-    /// Host-Ausführung beantragen. Jeder Auftrag wird trotzdem gegen Worker,
-    /// Workspace und Umgebung geprüft.
+    /// Mehrere Aufträge derselben lokalen Sitzung dürfen Host-Ausführung
+    /// beantragen, bis der Nutzer die Host-Arbeitsphase selbst beendet
+    /// (Strg+H oder `/sandbox-lease revoke`, Nutzerentscheidung 2026-09-24:
+    /// kein Zeitablauf). Jeder Auftrag wird trotzdem gegen Worker, Workspace
+    /// und Umgebung geprüft.
     SessionLease,
 }
 
@@ -100,7 +102,10 @@ impl GrantedProcessPermit {
 struct StoredPermit {
     request: ProcessPermitRequest,
     scope: HostApprovalScope,
-    expires_at: Instant,
+    /// `None`: gilt bis zum ausdrücklichen Widerruf ([`ProcessPermitLedger::revoke`]/
+    /// [`ProcessPermitLedger::revoke_session`]) — so stellen Aufrufer
+    /// `SessionLease`-Permits aus. `Some(t)`: verfällt ab `t`.
+    expires_at: Option<Instant>,
     consumed: bool,
 }
 
@@ -137,14 +142,22 @@ impl ProcessPermitLedger {
     /// `SessionLease` ist nur für `LocalHost` gültig. Damit kann eine normale
     /// Cargo- oder tmux-Modulfreigabe nicht versehentlich zur längeren
     /// Host-Arbeitsphase werden.
+    ///
+    /// `ttl`: `None` stellt einen Permit aus, der bis zum ausdrücklichen
+    /// Widerruf ([`Self::revoke`]/[`Self::revoke_session`]) gilt — so stellen
+    /// alle Aufrufer `SessionLease`-Permits aus, weil eine Host-Arbeitsphase
+    /// nur durch den Nutzer endet (Strg+H oder `/sandbox-lease revoke`,
+    /// Nutzerentscheidung 2026-09-24), nie durch Zeitablauf. `Some(ttl)`
+    /// begrenzt die Gültigkeit (z. B. eine Einmalfreigabe, die nicht als
+    /// „stilles Ja“ liegen bleiben soll).
     pub fn issue_after_local_approval(
         &self,
         request: ProcessPermitRequest,
         scope: HostApprovalScope,
-        ttl: Duration,
+        ttl: Option<Duration>,
     ) -> Result<ProcessPermitId, ProcessPermitError> {
         request.validate()?;
-        if ttl.is_zero() {
+        if ttl.is_some_and(|ttl| ttl.is_zero()) {
             return Err(ProcessPermitError::ZeroTtl);
         }
         if scope == HostApprovalScope::SessionLease
@@ -152,9 +165,14 @@ impl ProcessPermitLedger {
         {
             return Err(ProcessPermitError::SessionLeaseRequiresHost);
         }
-        let expires_at = Instant::now()
-            .checked_add(ttl)
-            .ok_or(ProcessPermitError::TtlOverflow)?;
+        let expires_at = match ttl {
+            Some(ttl) => Some(
+                Instant::now()
+                    .checked_add(ttl)
+                    .ok_or(ProcessPermitError::TtlOverflow)?,
+            ),
+            None => None,
+        };
         let mut state = self
             .state
             .lock()
@@ -178,7 +196,7 @@ impl ProcessPermitLedger {
 
     /// Prüft die vollständige Bindung und verbraucht Einmal-Permits atomar.
     ///
-    /// Bei `SessionLease` bleibt der Eintrag bis Ablauf erhalten, aber nur ein
+    /// Bei `SessionLease` bleibt der Eintrag bis zum Widerruf erhalten, aber nur ein
     /// exakt gleicher Auftrag darf ihn verwenden. Das verhindert, dass eine
     /// Zustimmung zu `tmux capture-pane` als allgemeines Host-Shell-Recht dient.
     pub fn authorize(
@@ -196,7 +214,7 @@ impl ProcessPermitLedger {
             .get(&id)
             .ok_or(ProcessPermitError::UnknownPermit)?
             .expires_at
-            <= Instant::now();
+            .is_some_and(|expires_at| expires_at <= Instant::now());
         if expired {
             state.permits.remove(&id);
             return Err(ProcessPermitError::Expired);
@@ -327,7 +345,7 @@ mod tests {
             .issue_after_local_approval(
                 request.clone(),
                 HostApprovalScope::SingleExecution,
-                Duration::from_secs(30),
+                Some(Duration::from_secs(30)),
             )
             .map_err(ctx("issue_after_local_approval failed"))?;
         assert!(ledger.authorize(id, &request).is_ok());
@@ -350,20 +368,12 @@ mod tests {
         let ledger = ProcessPermitLedger::default();
         let strict = request(ProcessEnvironment::StrictSandbox);
         assert_eq!(
-            ledger.issue_after_local_approval(
-                strict,
-                HostApprovalScope::SessionLease,
-                Duration::from_secs(30)
-            ),
+            ledger.issue_after_local_approval(strict, HostApprovalScope::SessionLease, None),
             Err(ProcessPermitError::SessionLeaseRequiresHost)
         );
         let host = request(ProcessEnvironment::LocalHost);
         let id = ledger
-            .issue_after_local_approval(
-                host.clone(),
-                HostApprovalScope::SessionLease,
-                Duration::from_secs(30),
-            )
+            .issue_after_local_approval(host.clone(), HostApprovalScope::SessionLease, None)
             .map_err(ctx("issue_after_local_approval failed"))?;
         assert!(ledger.authorize(id, &host).is_ok());
         assert!(ledger.authorize(id, &host).is_ok());
@@ -371,6 +381,37 @@ mod tests {
         assert_eq!(
             ledger.authorize(id, &host),
             Err(ProcessPermitError::UnknownPermit)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn session_lease_without_ttl_does_not_expire() -> TestResult {
+        let ledger = ProcessPermitLedger::default();
+        let host = request(ProcessEnvironment::LocalHost);
+        let id = ledger
+            .issue_after_local_approval(host.clone(), HostApprovalScope::SessionLease, None)
+            .map_err(ctx("issue_after_local_approval failed"))?;
+        std::thread::sleep(Duration::from_millis(30));
+        assert!(ledger.authorize(id, &host).is_ok());
+        Ok(())
+    }
+
+    #[test]
+    fn permit_with_ttl_still_expires() -> TestResult {
+        let ledger = ProcessPermitLedger::default();
+        let host = request(ProcessEnvironment::LocalHost);
+        let id = ledger
+            .issue_after_local_approval(
+                host.clone(),
+                HostApprovalScope::SingleExecution,
+                Some(Duration::from_millis(10)),
+            )
+            .map_err(ctx("issue_after_local_approval failed"))?;
+        std::thread::sleep(Duration::from_millis(40));
+        assert_eq!(
+            ledger.authorize(id, &host),
+            Err(ProcessPermitError::Expired)
         );
         Ok(())
     }

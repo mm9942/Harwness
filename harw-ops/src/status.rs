@@ -14,19 +14,22 @@
 //! Verdrahtung voll funktionsfähig. Anpassen lässt sich die Grenze über die
 //! separate Operation `/provider-concurrency` (siehe `crate::provider`).
 //!
-//! Zeigt außerdem (sofern verdrahtet) den Host-Lease-Zustand: „aktiv (noch N min)“,
-//! „Einmalfreigabe“ oder „aus“. Seit der Behebung „volle
+//! Zeigt außerdem (sofern verdrahtet) den Host-Lease-Zustand: „aktiv (bis
+//! Strg+H oder /sandbox-lease revoke)“, „Einmalfreigabe“ oder „aus“. Eine
+//! Host-Arbeitsphase hat keine Restlaufzeit (Nutzerentscheidung 2026-09-24):
+//! sie endet nur durch den Nutzer. Seit der Behebung „volle
 //! Sandbox-Deaktivierung“ (2026-09-21) meldet diese Zeile sowohl eine
 //! sitzungseigene als auch eine prozessweite Freigabe
 //! ([`harw_sandbox::HostPermitSessionRegistry::mark_global_approval`], über
-//! `/sandbox-lease` gesetzt) — `session_approval_remaining`/`has_single_use`
-//! liefern bereits das Maximum aus beiden, ein separater Blick auf
-//! `global_approval_remaining` ist hier deshalb nicht nötig. Die Zeile fehlt
+//! `/sandbox-lease` gesetzt) — `is_session_approved`/`has_single_use`
+//! berücksichtigen bereits beide, ein separater Blick auf
+//! `has_global_approval` ist hier deshalb nicht nötig. Die Zeile fehlt
 //! stillschweigend, wenn kein `Arc<harw_tool_shell::HostPermitHandles>` im
 //! `OpContext` registriert ist — `/status` bleibt ohne diese Verdrahtung voll
 //! funktionsfähig, genau wie bei der Provider-Concurrency-Zeile oben.
-//! Freigeben/widerrufen lässt sich der Lease über `/sandbox-lease` (siehe
-//! `crate::sandbox_lease`).
+//! Freigeben lässt sich der Lease über `/sandbox-lease` (siehe
+//! `crate::sandbox_lease`), beenden nur durch den Nutzer (Strg+H oder das
+//! getippte `/sandbox-lease revoke`).
 //!
 //! Zeigt außerdem (Welle 3, sofern verdrahtet) die Kontextfenster-Auslastung
 //! aus [`harw_operations::session_control::SessionController::context_usage`]:
@@ -240,16 +243,16 @@ async fn status(ctx: &OpContext, _args: StatusArgs) -> Result<OpOutput, OpError>
     // `Arc<HostPermitHandles>` in der ServiceMap registriert ist (siehe
     // `crate::sandbox_lease`). Fehlt sie, bleibt `/status` unverändert --
     // dieselbe "fehlt stillschweigend"-Regel wie bei der
-    // Provider-Concurrency-Zeile oben. `session_approval_remaining`/
-    // `has_single_use` liefern seit der "volle Sandbox-Deaktivierung"-
-    // Behebung (2026-09-21) bereits das Maximum aus sitzungseigener und
-    // prozessweiter Freigabe -- kein zusätzlicher Blick auf
-    // `global_approval_remaining` nötig.
+    // Provider-Concurrency-Zeile oben. `is_session_approved`/
+    // `has_single_use` berücksichtigen seit der "volle Sandbox-Deaktivierung"-
+    // Behebung (2026-09-21) bereits sitzungseigene und prozessweite
+    // Freigabe -- kein zusätzlicher Blick auf `has_global_approval` nötig.
+    // Keine Restlaufzeit: eine Phase endet nur durch den Nutzer
+    // (Nutzerentscheidung 2026-09-24).
     if let Some(handles) = ctx.service::<Arc<HostPermitHandles>>() {
         let session_id = ctx.session_id().as_str();
-        let label = if let Some(remaining) = handles.registry.session_approval_remaining(session_id)
-        {
-            format!("aktiv (noch {} min)", remaining.as_secs().div_ceil(60))
+        let label = if handles.registry.is_session_approved(session_id) {
+            "aktiv (bis Strg+H oder /sandbox-lease revoke)".to_owned()
         } else if handles.registry.has_single_use(session_id) {
             "Einmalfreigabe".to_owned()
         } else {
@@ -485,19 +488,26 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn status_shows_host_lease_active_with_remaining_minutes() -> TestResult {
+    async fn status_shows_host_lease_active_until_the_user_ends_it() -> TestResult {
         let handles = fresh_host_permit_handles();
         let (ctx, _tmp) = make_test_ctx(None, None, Some(Arc::clone(&handles)))?;
         handles
             .registry
-            .mark_session_approved(ctx.session_id().as_str(), Duration::from_secs(600));
+            .mark_session_approved(ctx.session_id().as_str());
 
         let output = status(&ctx, StatusArgs {})
             .await
             .map_err(crate::test_support::ctx("status must not fail"))?;
         assert!(
-            output.text.contains("Host-Lease: aktiv"),
-            "expected an active host-lease line: {}",
+            output
+                .text
+                .contains("Host-Lease: aktiv (bis Strg+H oder /sandbox-lease revoke)"),
+            "expected an active host-lease line without an expiry: {}",
+            output.text
+        );
+        assert!(
+            !output.text.contains("noch "),
+            "a host lease has no remaining time any more: {}",
             output.text
         );
         Ok(())
@@ -533,9 +543,7 @@ mod tests {
     -> TestResult {
         let handles = fresh_host_permit_handles();
         let (ctx, _tmp) = make_test_ctx(None, None, Some(Arc::clone(&handles)))?;
-        handles
-            .registry
-            .mark_global_approval(Duration::from_secs(600));
+        handles.registry.mark_global_approval();
 
         let output = status(&ctx, StatusArgs {})
             .await

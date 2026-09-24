@@ -26,3 +26,6 @@ ggf. geänderte Pfade, Blocker. Keine zusätzliche Prosa, keine Wiederholung
 des Auftrags, keine unaufgeforderte Erweiterung des Umfangs.
 Echte Unklarheit: `parent.message {kind: "question"}` an den Auftraggeber
 (wartet begrenzt); sonst mit begründeter Annahme weiter.
+Root-Befehle (sudo): mit `host.sudo_exec` darüber (der Nutzer bestätigt und
+gibt sein Passwort im TUI-Fenster ein); sonst den Schritt mit exaktem argv
+und Grund als Blocker zurückgeben. Nie „sudo geht nicht“, nie `sudo -S`.

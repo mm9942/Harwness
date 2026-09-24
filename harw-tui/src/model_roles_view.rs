@@ -55,6 +55,10 @@ const LIVE_EFFECT: &str = "sofort (/model)";
 /// Wirkungs-Spalte der Rollen-Zeilen.
 const ROLE_EFFECT: &str = "ab nächster Sitzung";
 
+/// Wirkungs-Spalte der Kind-Rollen (Live-Modellwechsel: neu gestartete
+/// Agenten nehmen die Wahl sofort).
+const CHILD_ROLE_EFFECT: &str = "neue Agenten sofort";
+
 /// Fußzeile.
 const FOOTER: &str = "j/k wählen · Enter Modell wählen · r zurücksetzen · Esc schließen";
 
@@ -115,7 +119,14 @@ impl RoleRow {
     fn effect(&self, mode: ViewMode) -> &'static str {
         match (mode, self.key.is_some()) {
             (ViewMode::UiaWorkers, _) => WORKER_EFFECT,
-            (ViewMode::Roles, true) => ROLE_EFFECT,
+            (ViewMode::Roles, true) => {
+                let live = self
+                    .key
+                    .as_deref()
+                    .and_then(harw_config::ModelRole::parse)
+                    .is_some_and(harw_config::ModelRole::applies_to_new_agents_live);
+                if live { CHILD_ROLE_EFFECT } else { ROLE_EFFECT }
+            }
             (ViewMode::Roles, false) => LIVE_EFFECT,
         }
     }
@@ -624,6 +635,7 @@ mod tests {
         assert!(text.contains(LIVE_LABEL));
         assert!(text.contains("claude-sonnet"));
         assert!(text.contains(ROLE_EFFECT));
+        assert!(text.contains(CHILD_ROLE_EFFECT));
         assert!(text.contains("kein Zugriff"));
     }
 

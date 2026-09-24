@@ -164,24 +164,26 @@ see Section 2 for the field's current, implemented rule.
 
 | TOML path | Type | Default | Allowed | Merge today |
 |---|---|---|---|---|
-| `tools.doc.remote_ocr` | `RemoteOcrMode` | `"ask"` | `off`/`ask`/`on` | `StricterOf` for the untrusted project (`merge_tools_doc`) — 🔒 |
+| `tools.doc.remote_ocr` | `RemoteOcrMode` | `"off"` | `off`/`ask`/`on` | `StricterOf` for the untrusted project (`merge_tools_doc`) — 🔒 |
 
 Controls whether `doc.read_pdf` may send workspace PDFs to a remote OCR
 service. Remote OCR is only possible when an enabled Mistral provider with a
 resolvable credential is configured; the file then goes to that provider's
 API host (normally `api.mistral.ai`), outside the `[network]` policy.
 
-- `off`: no OCR client is installed; `doc.read_pdf` always extracts locally.
-- `ask` (default): every `doc.read_pdf` call that would use remote OCR
-  (any `backend` other than `"native"`) needs an explicit approval, in every
-  approval mode including full access and regardless of allow rules. The
+- `off` (default when nothing is set): no OCR client is installed;
+  `doc.read_pdf` always extracts locally, even with a Mistral provider.
+- `ask`: every `doc.read_pdf` call that would use remote OCR
+  (any `backend` other than `"native"`) needs an explicit approval in the
+  approval modes `ask` and `auto`, regardless of allow rules. Full access
+  never asks, so under `full` the upload runs without a question. The
   approval dialog names the host. Entries where no one can answer (one-shot,
   jobs) deny the call with a hint to retry with `backend: "native"`.
 - `on`: remote OCR without asking (the behavior before this setting existed).
 
 ```toml
 [tools.doc]
-remote_ocr = "ask"   # "off" | "ask" | "on"
+remote_ocr = "ask"   # "off" (default) | "ask" | "on"
 ```
 
 ### 1.9 `[mode]` (`mode_toml.rs:19-38`)
@@ -505,7 +507,7 @@ This table now matches `FIELD_TABLE` in `harw-config/src/scope.rs`.
 | `uia_worker_models.*` (5 fields) | PROFILE | `ProfileReplaces` | Model choice per UIA-worker role is user preference, like `uia_worker_model`. | |
 | `agents.*` (4 fields) | PROFILE, untrusted project may only lower | `MinBound` | Cost and blow-up limit for orchestration; home and profile set freely, including upward. | 🔒 |
 | `shell.max_timeout_secs` | PROFILE, untrusted project may only lower | `MinBound` | Resource limit for shell commands; like `agents.*`. | 🔒 |
-| `tools.doc.remote_ocr` | PROFILE, untrusted project may only tighten | `StricterOf` (`off` < `ask` < `on`) | Data egress to a remote OCR service; home and profile set freely, a project may never move from `ask` to `on`. | 🔒 |
+| `tools.doc.remote_ocr` | PROFILE, untrusted project may only tighten | `StricterOf` (`off` < `ask` < `on`) | Data egress to a remote OCR service; home and profile set freely, a project may never loosen it (e.g. from the default `off` to `ask` or `on`). | 🔒 |
 
 ---
 
@@ -737,7 +739,8 @@ design:
 
 - **`permissions.default_mode`**: `["ask", "auto", "full"]` (index 0 =
   strictest value). `ask` asks on every action — no automatic approval
-  possible, hence the safest setting. `full` never asks — the most open
+  possible, hence the safest setting. `full` never asks (not even for
+  `process.kill`, `host.sudo_exec` or remote OCR uploads) — the most open
   setting. `auto` sits between them (only asks where
   `policy.require_approval_for`/`permissions.deny` requires it). Source of
   the value set: `ALLOWED_MODES` (`permissions_toml.rs:17`); the order there

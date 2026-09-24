@@ -154,7 +154,7 @@ In `auto`, the runtime releases whatever is listed in `AUTO_APPROVED_TOOLS`.
 For everything else, this order applies:
 
 1. `ALWAYS_ASK_TOOLS` (`process.kill`, `host.sudo_exec`, `agent.cancel`, …)
-   always ask.
+   always ask (in `ask` and `auto`; `full` never asks, see 3.0.2).
 2. Deny rules, then allow rules (`[[permissions.deny]]`/`[[permissions.allow]]`
    with `tool` and optionally `match` or `path`). Deny rules also apply in
    `ask`.
@@ -174,19 +174,38 @@ third similar manual approval on, the dialog offers "yes, and allow from
 now on: <pattern>" (session or project scope), never for `ALWAYS_ASK_TOOLS`
 or risky patterns.
 
-### 3.1 Children follow approval live, capped at `auto`
+### 3.0.2 Full access
+
+`full` means **no confirmations at all** (user decision 2026-09-24). The
+default policy returns `Allow` before anything else is evaluated: before
+`ALWAYS_ASK_TOOLS` (`process.kill`, `host.sudo_exec`, `agent.cancel`,
+`agents.write_uia`, `agents.commit_proposal`, `skills.commit_proposal`),
+before the remote-OCR question (`[tools.doc].remote_ocr = "ask"`), before
+`[policy].require_approval_for`, and without consulting the auto-mode
+pre-filter or classifier. Host escalation (`request_host`, sandbox-lease
+requests) is granted as a session lease without a dialog; it lasts until
+Ctrl+H or `/sandbox-lease revoke`. `host.sudo_exec` runs without a question;
+the TUI shows only the password field, and only when `sudo` needs a
+password (passwordless sudo shows nothing). The one thing `full` does not
+override is an explicit `/permissions deny` rule: it refuses the call
+(instead of asking, as it does in `ask`/`auto`). If you want prompts, use
+`ask` or `auto`.
+
+### 3.1 Children follow approval live
 
 `ApprovalChain::for_child` gives every child a **follower cell**
-(`ApprovalModeCell::follower(ApprovalMode::Delegated)`): on every check, the
-child reads the parent cell's current mode, capped at `auto`
-(`ApprovalMode::capped_at`). Consequences:
+(`ApprovalModeCell::follower(ApprovalMode::FullAccess)`, i.e. uncapped): on
+every check, the child reads the parent cell's current mode. Consequences:
 
-- Root `ask` → children `ask`; root `auto` or `full` → children `auto`.
+- Root `ask` → children `ask`; root `auto` → children `auto`; root `full` →
+  children `full` (since 2026-09-24; before, children were capped at `auto`
+  and could relay auto-mode questions to the TUI even under `full`).
 - A change at the root (command, F7, Shift+Tab) reaches already **running**
   children immediately.
-- A child never gets `full`.
-- A local `set` on a child's cell detaches that child; it stays capped,
-  and its parent and siblings are unaffected.
+- The inherited `[policy].require_approval_for` list reads the child's cell,
+  so it does not ask under `full` either.
+- A local `set` on a child's cell detaches that child; its parent and
+  siblings are unaffected.
 
 Allow rules (`AllowRuleSet`) are shared unchanged (a rule never lets a
 child do more than its own tool surface permits).

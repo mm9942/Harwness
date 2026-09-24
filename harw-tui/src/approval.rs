@@ -867,10 +867,9 @@ impl ChildTurnDriver for ManagedAgentSpawner {
                                 status = report.status.as_str(),
                                 "tui.child.ended_with_report"
                             );
-                            Ok(ToolCallResult::error(format!(
-                                "{}\n\n(Ursprüngliche Meldung: {})",
-                                report.to_parent_text(),
-                                error.message
+                            Ok(ToolCallResult::error(child_end_error_text(
+                                &report,
+                                &error.message,
                             )))
                         }
                         None => Err(error),
@@ -1407,6 +1406,25 @@ impl ApprovalDriver {
     }
 }
 
+/// Werkzeugfehler-Text eines nicht regulär beendeten Kindes: der Endbericht,
+/// die ursprüngliche Fehlermeldung nur, wenn sie etwas hinzufügt.
+///
+/// # Beschreibung
+/// Der Endbericht nennt den Grund bereits in seiner Kopfzeile
+/// (`[child_end …] Fehler: …`); ein angehängtes „(Ursprüngliche Meldung: …)"
+/// mit demselben Text wiederholte ihn nur (Export 429). Angehängt wird die
+/// Meldung deshalb nur, wenn sie im Bericht noch nicht vorkommt (z. B. weil
+/// der Grund dort gekürzt ist).
+fn child_end_error_text(report: &harw_core::ChildEndReport, message: &str) -> String {
+    let text = report.to_parent_text();
+    let message = message.trim();
+    if message.is_empty() || text.contains(message) {
+        text
+    } else {
+        format!("{text}\n\n(Ursprüngliche Meldung: {message})")
+    }
+}
+
 /// Kurzname einer Pauseart für Fehlermeldungen und Log-Felder.
 fn pause_label(outcome: &TurnOutcome) -> &'static str {
     match outcome {
@@ -1426,6 +1444,37 @@ fn pause_label(outcome: &TurnOutcome) -> &'static str {
 mod tests {
     use super::*;
     use crate::test_support::{TestError, TestResult, ctx};
+
+    fn end_report(reason: &str) -> harw_core::ChildEndReport {
+        harw_core::ChildEndReport {
+            child: SessionId::new(),
+            parent: SessionId::new(),
+            role: "matrix-game-master".to_owned(),
+            status: harw_core::ChildEndStatus::Failed,
+            reason: reason.to_owned(),
+            handoff: None,
+            handoff_note: None,
+            journal_summary: "Aktivitätsjournal · Status: failed · 1 Schritte\n".to_owned(),
+            steps: 1,
+            files: Vec::new(),
+            continuation: true,
+        }
+    }
+
+    /// Export 429: „(Ursprüngliche Meldung: …)" wiederholte den Grund aus
+    /// der Kopfzeile; angehängt wird nur noch, was neu ist.
+    #[test]
+    fn child_end_error_text_appends_the_original_message_only_when_new() {
+        let message = "rate limited by provider — retry after 30s: provider returned HTTP 429";
+        let text = child_end_error_text(&end_report(&format!("Fehler: {message}")), message);
+        assert_eq!(text.matches(message).count(), 1, "{text}");
+        assert!(!text.contains("Ursprüngliche Meldung"));
+        let other = child_end_error_text(&end_report("Fehler: gekürzt …"), message);
+        assert!(
+            other.contains("(Ursprüngliche Meldung: rate limited"),
+            "{other}"
+        );
+    }
 
     use std::collections::VecDeque;
     use std::path::PathBuf;

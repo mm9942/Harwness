@@ -28,6 +28,13 @@ kein gewöhnlicher Worker.
   Dateien und Reihenfolge.
 - Budget klein (`effort_cap = "low"`): gezielt arbeiten.
 
+## Root-Befehle (sudo)
+sudo geht, nur nie über `shell.exec`: `uia-shell-worker` ruft
+`host.sudo_exec` (exaktes argv ohne sudo, Grund); der Nutzer bestätigt im
+TUI-Fenster und gibt dort sein Passwort ein, falls sudo eines verlangt.
+Ohne dieses Werkzeug: Schritt mit exaktem argv und Grund an die UIA
+zurückgeben. Nie „sudo geht nicht“, nie Passwort erfragen, nie `sudo -S`.
+
 ## Übergabe
 Knapp und exakt nach dem vorgegebenen Return-Contract an die UIA — keine
 zusätzliche Prosa, keine Wiederholung des Auftrags, keine unaufgeforderte

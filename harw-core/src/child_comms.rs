@@ -433,8 +433,13 @@ pub enum ChildEndCause {
     /// Fehler des Turns (Provider, Modell, Werkzeugkette).
     TurnError(String),
     /// Terminales, nicht erfolgreiches Turn-Ergebnis (abgeschnitten,
-    /// abgelehnt, gescheitert, Wächter-Abbruch).
+    /// abgelehnt, gescheitert).
     Outcome(String),
+    /// Der Turn wurde an einer Turn-Grenze oder von einem Turn-Wächter
+    /// beendet (`CancelReason::Budget`); der Text nennt die konkrete Grenze
+    /// mit Wert und Verbrauch bzw. den Wächter (siehe
+    /// [`crate::turn_loop::TurnControl::stop_detail`]).
+    TurnStopped(String),
     /// Das Kind pausierte, obwohl sein Lebenszyklus das verbietet.
     PauseForbidden(String),
 }
@@ -463,6 +468,7 @@ impl ChildEndCause {
             Self::ToolBudget { .. }
             | Self::TurnError(_)
             | Self::Outcome(_)
+            | Self::TurnStopped(_)
             | Self::PauseForbidden(_) => ChildEndStatus::Failed,
         }
     }
@@ -484,6 +490,9 @@ impl ChildEndCause {
             Self::Released => "freigegeben, während der Lauf noch lief".to_owned(),
             Self::TurnError(message) => format!("Fehler: {}", excerpt(message, 240)),
             Self::Outcome(message) => excerpt(message, 240),
+            Self::TurnStopped(detail) => {
+                format!("Turn vorzeitig beendet: {}", excerpt(detail, 220))
+            }
             Self::PauseForbidden(message) => {
                 format!("unzulässige Pause: {}", excerpt(message, 200))
             }
@@ -497,12 +506,48 @@ impl ChildEndCause {
     /// bisherige Arbeit, scheitert er, bleiben Journal und letzter
     /// Assistententext). Nicht bei Abbruch (die Nutzerin will stoppen) und
     /// nicht bei Lease-Ablauf (die Sitzung ist bereits verworfen).
+    ///
+    /// Ausnahme: ein Provider-Rate-Limit (HTTP 429, [`Self::is_rate_limited`])
+    /// — die Verdichtung liefe gegen dasselbe Limit und verlängerte das Ende
+    /// nur um ihr Zeitlimit (Export 429: 61 s + 20 s).
     #[must_use]
     pub fn allows_compaction(&self) -> bool {
-        matches!(
-            self,
-            Self::WallTime { .. } | Self::ToolBudget { .. } | Self::TurnError(_)
-        )
+        match self {
+            Self::WallTime { .. } | Self::ToolBudget { .. } => true,
+            Self::TurnError(_) => !self.is_rate_limited(),
+            _ => false,
+        }
+    }
+
+    /// Ob der Turn an einem Provider-Rate-Limit (HTTP 429) scheiterte.
+    #[must_use]
+    pub fn is_rate_limited(&self) -> bool {
+        match self {
+            Self::TurnError(message) => {
+                message.contains("rate limited by provider") || message.contains("HTTP 429")
+            }
+            _ => false,
+        }
+    }
+
+    /// Wie ein Vorgänger mit dieser Ursache endete — für den Auftragstext
+    /// einer Fortsetzung ([`crate::child_handoff::continuation_task`]).
+    #[must_use]
+    pub fn predecessor_end(&self) -> crate::child_handoff::PredecessorEnd {
+        use crate::child_handoff::PredecessorEnd;
+        match self {
+            Self::WallTime { .. } | Self::ToolBudget { .. } => PredecessorEnd::BudgetExhausted,
+            Self::Cancelled { .. } | Self::Released => PredecessorEnd::Cancelled,
+            Self::TurnStopped(detail) => PredecessorEnd::Stopped {
+                reason: excerpt(detail, 220),
+            },
+            Self::LeaseExpired
+            | Self::TurnError(_)
+            | Self::Outcome(_)
+            | Self::PauseForbidden(_) => PredecessorEnd::Failed {
+                reason: self.reason_de(),
+            },
+        }
     }
 
     /// Ob der Elternteil mit `continue_from` fortsetzen darf (alles außer
@@ -855,20 +900,23 @@ impl ChildJournal {
         self.entries.back().map(JournalEntry::line)
     }
 
-    fn status_line(&self) -> String {
+    // `with_reason`: der Grund nur im vollständigen Journal; die Kurzfassung
+    // steckt im Endbericht, dessen Kopfzeile den Grund schon trägt.
+    fn status_line(&self, with_reason: bool) -> String {
         match (&self.end, self.running) {
-            (Some(end), _) => format!("{} ({})", end.status.as_str(), end.reason),
+            (Some(end), _) if with_reason => format!("{} ({})", end.status.as_str(), end.reason),
+            (Some(end), _) => end.status.as_str().to_owned(),
             (None, true) => "läuft".to_owned(),
             (None, false) => "beendet".to_owned(),
         }
     }
 
-    fn head_lines(&self) -> String {
+    fn head_lines(&self, with_reason: bool) -> String {
         let mut text = format!(
             "Aktivitätsjournal von {} ({}) · Status: {} · {} Schritte",
             self.role,
             self.child,
-            self.status_line(),
+            self.status_line(with_reason),
             self.steps()
         );
         if self.dropped > 0 {
@@ -892,7 +940,7 @@ impl ChildJournal {
     /// Das ganze Journal als Text (für `agent.result {part: "journal"}`).
     #[must_use]
     pub fn render_full(&self) -> String {
-        let mut text = self.head_lines();
+        let mut text = self.head_lines(true);
         if let Some(task) = &self.task {
             text.push_str(&format!("\nVollständiger Auftrag:\n{task}\n"));
         }
@@ -904,16 +952,15 @@ impl ChildJournal {
         if let Some(last) = &self.last_assistant {
             text.push_str(&format!("\nLetzter Assistententext:\n{last}\n"));
         }
-        if let Some(end) = &self.end {
-            text.push_str(&format!("\n{}\n", end.header()));
-        }
+        // Der Endgrund steht bereits in der Kopfzeile (`Status: … (Grund)`);
+        // kein zweiter `[child_end …]`-Block mit demselben Text.
         text
     }
 
     /// Kurzfassung mit den jüngsten Schritten, höchstens `max_bytes`.
     #[must_use]
     pub fn summary(&self, max_bytes: usize) -> String {
-        let head = self.head_lines();
+        let head = self.head_lines(false);
         let last = self
             .last_assistant
             .as_deref()
@@ -1145,12 +1192,13 @@ impl ChildComms {
     ) -> Option<ChildEndReport> {
         let mut state = self.state();
         let journal = state.journals.get_mut(child.as_str())?;
+        // Nur der Status: der Grund steht in der Kopfzeile des Berichts bzw.
+        // des vollständigen Journals (sonst erschiene er drei- bis viermal).
         journal.push(JournalEntryKind::Note(format!(
-            "Ende: {} — {}",
-            cause.status().as_str(),
-            cause.reason_de()
+            "Ende: {}",
+            cause.status().as_str()
         )));
-        let report = ChildEndReport {
+        let mut report = ChildEndReport {
             child: journal.child.clone(),
             parent: journal.parent.clone(),
             role: journal.role.clone(),
@@ -1158,11 +1206,15 @@ impl ChildComms {
             reason: cause.reason_de(),
             handoff,
             handoff_note,
-            journal_summary: journal.summary(END_SUMMARY_MAX_BYTES),
+            journal_summary: String::new(),
             steps: journal.steps(),
             files: journal.files(),
             continuation: false,
         };
+        // Erst das Ende hinterlegen, dann die Kurzfassung bilden — sonst
+        // meldet sie noch „Status: läuft" (Export 429).
+        journal.end = Some(report.clone());
+        report.journal_summary = journal.summary(END_SUMMARY_MAX_BYTES);
         journal.end = Some(report.clone());
         Some(report)
     }
@@ -1734,6 +1786,87 @@ mod tests {
         );
         assert!(parse_child_end("kein Bericht").is_none());
         Ok(())
+    }
+
+    /// Export 429: die Kurzfassung im Endbericht meldete „Status: läuft",
+    /// und der Fehlertext stand drei- bis viermal im Bericht.
+    #[test]
+    fn end_report_summary_shows_final_status_and_names_the_error_once() -> TestResult {
+        let comms = ChildComms::default();
+        let (child, parent) = ids();
+        comms.open_journal(&child, &parent, "matrix-game-master", Some("Spiel"));
+        comms.record_tool_outcome(
+            &child,
+            "fs.read",
+            &json!({ "path": "README.md" }),
+            true,
+            "ok",
+        );
+        let error = "rate limited by provider — retry after 30s: provider returned HTTP 429 \
+                     (request_id: req_1): rate_limit_error: Error";
+        let cause = ChildEndCause::TurnError(error.to_owned());
+        let report = comms
+            .finalize_end(&child, &cause, None, Some("Provider-Rate-Limit".to_owned()))
+            .ok_or(TestError::Missing("Endbericht"))?;
+        assert!(
+            report.journal_summary.contains("Status: failed ·"),
+            "{}",
+            report.journal_summary
+        );
+        assert!(!report.journal_summary.contains("läuft"));
+        let text = report.to_parent_text();
+        assert_eq!(
+            text.matches("rate limited by provider").count(),
+            1,
+            "{text}"
+        );
+        // Das vollständige Journal nennt den Grund ebenfalls genau einmal.
+        let journal = comms.journal(&child).ok_or(TestError::Missing("Journal"))?;
+        let full = journal.render_full();
+        assert!(
+            full.contains("Status: failed (Fehler: rate limited"),
+            "{full}"
+        );
+        assert_eq!(
+            full.matches("rate limited by provider").count(),
+            1,
+            "{full}"
+        );
+        Ok(())
+    }
+
+    /// Statt „Token-Budget oder Turn-Wächter" nennt der Grund die konkrete
+    /// Grenze bzw. den Wächter.
+    #[test]
+    fn turn_stopped_names_the_concrete_limit() {
+        let cause = ChildEndCause::TurnStopped(
+            "Rundenlimit des Turns erreicht (40/40 Modellrunden)".into(),
+        );
+        assert_eq!(cause.status(), ChildEndStatus::Failed);
+        assert_eq!(
+            cause.reason_de(),
+            "Turn vorzeitig beendet: Rundenlimit des Turns erreicht (40/40 Modellrunden)"
+        );
+        assert!(!cause.allows_compaction());
+        assert!(matches!(
+            cause.predecessor_end(),
+            crate::child_handoff::PredecessorEnd::Stopped { .. }
+        ));
+    }
+
+    #[test]
+    fn rate_limited_turn_errors_skip_the_compaction() {
+        let cause = ChildEndCause::TurnError(
+            "rate limited by provider — retry after 30s: provider returned HTTP 429".to_owned(),
+        );
+        assert!(cause.is_rate_limited());
+        assert!(!cause.allows_compaction());
+        assert!(cause.allows_continuation());
+        let openai = ChildEndCause::TurnError(
+            "transient provider error: provider returned HTTP 429: requests: slow down".to_owned(),
+        );
+        assert!(openai.is_rate_limited());
+        assert!(!ChildEndCause::TurnError("provider 529".to_owned()).is_rate_limited());
     }
 
     #[test]
