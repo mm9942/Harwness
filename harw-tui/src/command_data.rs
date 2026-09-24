@@ -62,8 +62,8 @@ pub(crate) async fn execute_command_with_data<F>(
 where
     F: FnOnce() -> ServiceMap,
 {
-    let invocation = crate::classify_input(raw_line)
-        .map_err(|error| format!("Eingabe abgelehnt: {error}"))?;
+    let invocation =
+        crate::classify_input(raw_line).map_err(|error| format!("Eingabe abgelehnt: {error}"))?;
     let typed = match &invocation {
         Invocation::Command { name, .. } => format!("/{name}"),
         _ => {
@@ -286,7 +286,10 @@ mod tests {
         let built = AtomicUsize::new(0);
         let result = run(&operation, PermissionTier::Owner, "/nichtda", &built).await?;
         let error = result.err().ok_or(TestError::Missing("error"))?;
-        assert!(error.starts_with("Unbekannter Command: /nichtda"), "{error}");
+        assert!(
+            error.starts_with("Unbekannter Command: /nichtda"),
+            "{error}"
+        );
         assert_eq!(built.load(Ordering::Relaxed), 0);
         Ok(())
     }

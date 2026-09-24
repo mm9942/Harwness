@@ -2,8 +2,12 @@
 //! (`docs/design/knowledge-surfaces.md` §6, `interaction-contract.md` §2.2).
 //!
 //! # Subcommands
-//! - (bare) / `list [--board=<b>] [--all]` — Karten je Spalte (`CardState`);
-//!   `--all` zeigt auch archivierte.
+//! - (bare) / `list [--board=<b>] [--all]` / `show` (ohne Karte) — Karten je
+//!   Spalte (`CardState`); `--all` zeigt im Text auch archivierte.
+//!   `OpOutput::data` = `{"board":{"id","name"},"lanes":[{"id","title",
+//!   "kind":"status|worker","state","worker_role"}],"cards":[{"id","lane_id",
+//!   "title","state","assignee","tags","retry_count","blocked_reason",
+//!   "work_id"}]}` (Kartenzustand `unknown` ohne Ledger).
 //! - `boards` — alle Boards.
 //! - `create <title> [--lane=<LaneRef>] [--assignee=<AgentRoleRef>]
 //!   [--parent=<CardRef>]… [--tag=<t>]… [--board=<b>]` — legt eine Karte an.
@@ -16,7 +20,13 @@
 //! - `todo <CardRef>` / `ready <CardRef>` — §6.3 `Triage -> Todo` bzw.
 //!   `Todo -> Ready` (Eltern-Gate). Nicht im Vertrag, aber ohne sie gäbe es
 //!   für Status-Lanes keinen Weg in die Warteschlange.
-//! - `claim|complete|unblock|archive <CardRef>`, `block <CardRef> --reason=<BlockKind>`.
+//! - `claim|complete|unblock|archive <CardRef>`,
+//!   `block <CardRef> [<BlockKind>] [--reason=<BlockKind>]` (Vorgabe `Dependency`
+//!   nur bei `move … blocked`; `block` verlangt einen Grund).
+//! - TUI-Aliasse: `add <title>` = `create`, `done <CardRef>` = `complete`,
+//!   `move <CardRef> <todo|ready|running|done|blocked|archived> [<BlockKind>]`
+//!   wählt den passenden §6.3-Übergang (`ready` aus `blocked` = `unblock`,
+//!   aus `running` = `reclaim`).
 //!
 //! `LaneRef` darf `board:<b>/<lane>` sein und wählt damit das Board.
 //!
@@ -127,22 +137,107 @@ pub fn run_kanban(
     let tail = rest.get(1..).unwrap_or_default();
     match sub {
         "list" => list(store, jobs, &board_id, tail),
+        "show" if tail.is_empty() => list(store, jobs, &board_id, tail),
         "boards" => boards(store),
-        "create" => create(store, jobs, caller, &mut board_id, tail, now),
+        "create" | "add" => create(store, jobs, caller, &mut board_id, tail, now),
         "show" => show(store, jobs, &board_id, tail),
-        "todo" | "ready" | "claim" | "complete" | "block" | "unblock" | "archive" => {
+        "todo" | "ready" | "claim" | "complete" | "done" | "block" | "unblock" | "archive"
+        | "move" => {
+            let request = parse_transition(sub, tail)?;
             let jobs = jobs.ok_or_else(|| {
                 OpError::NotAvailable(
                     "kein Job-Ledger (JobTransitions) im Kontext — Kartenübergänge laufen nur über das Ledger"
                         .to_owned(),
                 )
             })?;
-            transition(store, jobs, caller, &board_id, sub, tail, now)
+            transition(store, jobs, caller, &board_id, &request, now)
         }
         other => Err(OpError::InvalidArguments(format!(
-            "unbekannter /kanban-Subcommand: {other} (list, boards, create, show, todo, ready, claim, complete, block, unblock, archive)"
+            "unbekannter /kanban-Subcommand: {other} (list, boards, create|add, show, todo, ready, claim, complete|done, block, unblock, archive, move)"
         ))),
     }
+}
+
+/// Ein kanonischer §6.3-Übergang.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Action {
+    Todo,
+    Ready,
+    Claim,
+    Complete,
+    Block(BlockKind),
+    Unblock,
+    Archive,
+}
+
+/// Ein aufgelöster Übergangswunsch: Karte plus Aktion.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct TransitionRequest {
+    card: CardId,
+    action: Action,
+}
+
+/// Parst `todo|ready|claim|complete|done|unblock|archive <card>`,
+/// `block <card> [<kind>] [--reason=<kind>]` und `move <card> <state> [<kind>]`.
+fn parse_transition(sub: &str, tail: &[String]) -> Result<TransitionRequest, OpError> {
+    let (reason_flag, rest) = split_flag(tail, "--reason=");
+    let card = card_ref(&rest, &format!("/kanban {sub} <card>"))?;
+    let extra = rest.get(1..).unwrap_or_default();
+    let parse_reason = |raw: &str| {
+        BlockKind::parse(raw).ok_or_else(|| {
+            OpError::InvalidArguments(format!("unbekannter Grund '{raw}' ({})", reason_names()))
+        })
+    };
+    let action = match sub {
+        "todo" => Action::Todo,
+        "ready" => Action::Ready,
+        "claim" => Action::Claim,
+        "complete" | "done" => Action::Complete,
+        "unblock" => Action::Unblock,
+        "archive" => Action::Archive,
+        "block" => {
+            let raw = reason_flag.or_else(|| extra.first().cloned()).ok_or_else(|| {
+                OpError::InvalidArguments(format!(
+                    "Aufruf: /kanban block <card> <{}>",
+                    reason_names()
+                ))
+            })?;
+            Action::Block(parse_reason(&raw)?)
+        }
+        "move" => {
+            let target = extra.first().ok_or_else(|| {
+                OpError::InvalidArguments(
+                    "Aufruf: /kanban move <card> <todo|ready|running|done|blocked|archived>"
+                        .to_owned(),
+                )
+            })?;
+            match target.to_ascii_lowercase().as_str() {
+                "todo" => Action::Todo,
+                "ready" => Action::Ready,
+                "running" => Action::Claim,
+                "done" => Action::Complete,
+                "archived" => Action::Archive,
+                "blocked" => {
+                    let raw = reason_flag.or_else(|| extra.get(1).cloned());
+                    Action::Block(match raw {
+                        Some(raw) => parse_reason(&raw)?,
+                        None => BlockKind::Dependency,
+                    })
+                }
+                other => {
+                    return Err(OpError::InvalidArguments(format!(
+                        "unbekannter Zielzustand '{other}' (todo, ready, running, done, blocked, archived)"
+                    )));
+                }
+            }
+        }
+        other => {
+            return Err(OpError::InvalidArguments(format!(
+                "unbekannter Übergang: {other}"
+            )));
+        }
+    };
+    Ok(TransitionRequest { card, action })
 }
 
 // --- Lesen -------------------------------------------------------------------
@@ -172,6 +267,68 @@ fn state_text(state: &CardState) -> String {
     }
 }
 
+/// Nutzlast der Board-Ansicht für die TUI (siehe Moduldoku).
+fn board_data(
+    store: &KnowledgeStore,
+    board_id: &BoardId,
+    views: &[(CardRecord, Option<Card>)],
+) -> Result<serde_json::Value, OpError> {
+    let exists = board::list_board_ids(store)
+        .map_err(map_knowledge_error)?
+        .contains(board_id);
+    let (name, lanes) = if exists {
+        let (loaded, lanes) = board::load_board(store, board_id).map_err(map_knowledge_error)?;
+        (loaded.name, lanes)
+    } else {
+        (board_id.to_string(), default_lanes(board_id))
+    };
+    let lanes: Vec<serde_json::Value> = lanes
+        .iter()
+        .map(|lane| match &lane.kind {
+            LaneKind::Status(state) => serde_json::json!({
+                "id": lane.id.as_str(),
+                "title": lane.id.as_str(),
+                "kind": "status",
+                "state": state.label(),
+                "worker_role": serde_json::Value::Null,
+            }),
+            LaneKind::Worker { agent_role } => serde_json::json!({
+                "id": lane.id.as_str(),
+                "title": lane.id.as_str(),
+                "kind": "worker",
+                "state": serde_json::Value::Null,
+                "worker_role": agent_role.as_str(),
+            }),
+        })
+        .collect();
+    let cards: Vec<serde_json::Value> = views
+        .iter()
+        .map(|(record, card)| {
+            let state = card.as_ref().map_or("unknown", |card| card.state.label());
+            let blocked_reason = match card.as_ref().map(|card| card.state) {
+                Some(CardState::Blocked { reason_kind }) => Some(reason_kind.label()),
+                _ => None,
+            };
+            serde_json::json!({
+                "id": record.id.as_str(),
+                "lane_id": record.lane_id.as_str(),
+                "title": record.title,
+                "state": state,
+                "assignee": card.as_ref().and_then(|card| card.assignee.as_ref()).map(AgentId::as_str),
+                "tags": record.tags,
+                "retry_count": card.as_ref().map_or(0, |card| card.retry_count),
+                "blocked_reason": blocked_reason,
+                "work_id": record.work_id.as_ref().map(|work_id| work_id.as_str()),
+            })
+        })
+        .collect();
+    Ok(serde_json::json!({
+        "board": { "id": board_id.as_str(), "name": name },
+        "lanes": lanes,
+        "cards": cards,
+    }))
+}
+
 fn list(
     store: &KnowledgeStore,
     jobs: Option<&dyn JobTransitions>,
@@ -180,8 +337,16 @@ fn list(
 ) -> Result<OpOutput, OpError> {
     let show_archived = tail.iter().any(|token| token == "--all");
     let records = board::list_card_records(store, board_id).map_err(map_knowledge_error)?;
-    if records.is_empty() {
-        return Ok(OpOutput::from(format!("Board {board_id} hat keine Karten.")));
+    let views = records
+        .into_iter()
+        .map(|record| view(&record, jobs).map(|card| (record, card)))
+        .collect::<Result<Vec<_>, OpError>>()?;
+    let data = Some(board_data(store, board_id, &views)?);
+    if views.is_empty() {
+        return Ok(OpOutput {
+            text: format!("Board {board_id} hat keine Karten."),
+            data,
+        });
     }
     let columns = [
         "triage", "todo", "ready", "running", "blocked", "done", "archived",
@@ -189,9 +354,9 @@ fn list(
     let mut grouped: Vec<(&str, Vec<String>)> =
         columns.iter().map(|column| (*column, Vec::new())).collect();
     let mut unknown = Vec::new();
-    for record in &records {
+    for (record, card) in &views {
         let line = format!("{}  {}", record.id, record.title);
-        match view(record, jobs)? {
+        match card {
             Some(card) => {
                 let label = card.state.label();
                 if let Some((_, lines)) = grouped.iter_mut().find(|(column, _)| *column == label) {
@@ -224,7 +389,7 @@ fn list(
             out.push_str(&format!("  {line}\n"));
         }
     }
-    Ok(OpOutput::from(out))
+    Ok(OpOutput { text: out, data })
 }
 
 fn card_ref(tail: &[String], grammar: &str) -> Result<CardId, OpError> {
@@ -502,25 +667,30 @@ fn transition(
     jobs: &dyn JobTransitions,
     caller: &AgentId,
     board_id: &BoardId,
-    sub: &str,
-    tail: &[String],
+    request: &TransitionRequest,
     now: jiff::Timestamp,
 ) -> Result<OpOutput, OpError> {
-    let (reason_flag, rest) = split_flag(tail, "--reason=");
-    let card_id = card_ref(&rest, &format!("/kanban {sub} <card>"))?;
-    let record = load_record(store, board_id, &card_id)?;
+    let record = load_record(store, board_id, &request.card)?;
     let mut card = record.view_with(jobs).map_err(map_knowledge_error)?;
     let mut record_changed = false;
-    match sub {
-        "todo" => {
+    match request.action {
+        Action::Todo => {
             lifecycle::triage_to_todo(jobs, &mut card).map_err(map_knowledge_error)?;
             record_changed = true;
         }
-        "ready" => {
-            let states = parent_states(store, jobs, board_id, &card)?;
-            lifecycle::todo_to_ready(jobs, &mut card, &states).map_err(map_knowledge_error)?;
-        }
-        "claim" => {
+        Action::Ready => match card.state {
+            CardState::Blocked { .. } => {
+                lifecycle::unblock(jobs, &mut card).map_err(map_knowledge_error)?;
+            }
+            CardState::Running => {
+                lifecycle::reclaim(jobs, &mut card).map_err(map_knowledge_error)?;
+            }
+            _ => {
+                let states = parent_states(store, jobs, board_id, &card)?;
+                lifecycle::todo_to_ready(jobs, &mut card, &states).map_err(map_knowledge_error)?;
+            }
+        },
+        Action::Claim => {
             let worker_lane = board::list_board_ids(store)
                 .map_err(map_knowledge_error)?
                 .contains(board_id)
@@ -545,24 +715,12 @@ fn transition(
             lifecycle::claim(jobs, &mut card, caller, risk, proof.as_ref())
                 .map_err(map_knowledge_error)?;
         }
-        "complete" => lifecycle::complete(jobs, &mut card).map_err(map_knowledge_error)?,
-        "block" => {
-            let raw = reason_flag.ok_or_else(|| {
-                OpError::InvalidArguments(format!(
-                    "Aufruf: /kanban block <card> --reason=<{}>",
-                    reason_names()
-                ))
-            })?;
-            let reason = BlockKind::parse(&raw).ok_or_else(|| {
-                OpError::InvalidArguments(format!(
-                    "unbekannter Grund '{raw}' ({})",
-                    reason_names()
-                ))
-            })?;
+        Action::Complete => lifecycle::complete(jobs, &mut card).map_err(map_knowledge_error)?,
+        Action::Block(reason) => {
             lifecycle::block(jobs, &mut card, reason).map_err(map_knowledge_error)?;
         }
-        "unblock" => lifecycle::unblock(jobs, &mut card).map_err(map_knowledge_error)?,
-        "archive" => {
+        Action::Unblock => lifecycle::unblock(jobs, &mut card).map_err(map_knowledge_error)?,
+        Action::Archive => {
             let children = board::list_card_records(store, board_id)
                 .map_err(map_knowledge_error)?
                 .into_iter()
@@ -572,11 +730,6 @@ fn transition(
             let unresolved = children.iter().filter(|child| !child.is_terminal()).count();
             lifecycle::archive(jobs, &mut card, unresolved).map_err(map_knowledge_error)?;
             record_changed = true;
-        }
-        other => {
-            return Err(OpError::InvalidArguments(format!(
-                "unbekannter Übergang: {other}"
-            )));
         }
     }
     if record_changed {
@@ -688,6 +841,45 @@ mod tests {
     }
 
     #[test]
+    fn tui_aliases_and_board_data() -> TestResult {
+        let store = temporary_store("aliases")?;
+        let ledger = InMemoryJobTransitions::new();
+        let jobs: Option<&dyn JobTransitions> = Some(&ledger);
+        run(&store, jobs, &["add", "Alias", "Karte"]).map_err(ctx("add"))?;
+        assert_eq!(run(&store, jobs, &["move", "card-1", "todo"]).map_err(ctx("move todo"))?, "card-1 → todo");
+        run(&store, jobs, &["move", "card-1", "ready"]).map_err(ctx("move ready"))?;
+        run(&store, jobs, &["move", "card-1", "running"]).map_err(ctx("move running"))?;
+        assert_eq!(
+            run(&store, jobs, &["block", "card-1", "Capability"]).map_err(ctx("block"))?,
+            "card-1 → blocked (Capability)"
+        );
+        assert_eq!(
+            run(&store, jobs, &["move", "card-1", "ready"]).map_err(ctx("move ready from blocked"))?,
+            "card-1 → ready"
+        );
+        run(&store, jobs, &["claim", "card-1"]).map_err(ctx("claim"))?;
+        assert_eq!(run(&store, jobs, &["done", "card-1"]).map_err(ctx("done"))?, "card-1 → done");
+
+        let output = run_kanban(
+            &store,
+            jobs,
+            &AgentId::new("operator"),
+            &toks(&["show"]),
+            jiff::Timestamp::now(),
+        )
+        .map_err(ctx("board show"))?;
+        let data = output.data.ok_or(TestError::Missing("board data"))?;
+        assert_eq!(data["board"]["id"], "default");
+        assert_eq!(data["lanes"][0]["kind"], "status");
+        assert_eq!(data["cards"][0]["id"], "card-1");
+        assert_eq!(data["cards"][0]["state"], "done");
+        assert_eq!(data["cards"][0]["retry_count"], 0);
+        assert!(data["cards"][0]["work_id"].is_string());
+        std::fs::remove_dir_all(store.root()).ok();
+        Ok(())
+    }
+
+    #[test]
     fn worker_lane_cards_become_ready_work_immediately() -> TestResult {
         let store = temporary_store("worker")?;
         let ledger = InMemoryJobTransitions::new();
@@ -773,6 +965,8 @@ mod tests {
             vec!["claim", "card-1"],
             vec!["block", "card-1"],
             vec!["block", "card-1", "--reason=Bored"],
+            vec!["move", "card-1"],
+            vec!["move", "card-1", "sideways"],
         ] {
             match run(&store, jobs, &tokens) {
                 Err(OpError::InvalidArguments(_)) => {}

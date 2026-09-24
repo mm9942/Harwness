@@ -439,9 +439,7 @@ fn read_text_capped(path: &Path, max_bytes: usize) -> Result<String, String> {
         .read_to_end(&mut bytes)
         .map_err(|error| format!("nicht lesbar: {error}"))?;
     if bytes.len() > max_bytes {
-        return Err(format!(
-            "Datei zu groß (Grenze {max_bytes} Bytes je Datei)"
-        ));
+        return Err(format!("Datei zu groß (Grenze {max_bytes} Bytes je Datei)"));
     }
     if bytes.contains(&0) {
         return Err("Binärdatei wird nicht angehängt".to_owned());
@@ -513,7 +511,10 @@ mod tests {
             MentionLimits::default(),
         );
         assert_eq!(out.attached.len(), 1);
-        assert!(out.text.contains("<datei pfad=\"README.md\">\nHallo\n</datei>"));
+        assert!(
+            out.text
+                .contains("<datei pfad=\"README.md\">\nHallo\n</datei>")
+        );
         Ok(())
     }
 
@@ -578,7 +579,14 @@ mod tests {
     fn denylist_blocks_secrets_and_git() -> TestResult {
         let dir = project()?;
         fs::create_dir_all(dir.path().join(".git")).map_err(ctx("mkdir git"))?;
-        for name in [".env", ".env.local", "server.pem", "tls.key", "id_ed25519", ".git/config"] {
+        for name in [
+            ".env",
+            ".env.local",
+            "server.pem",
+            "tls.key",
+            "id_ed25519",
+            ".git/config",
+        ] {
             fs::write(dir.path().join(name), "x").map_err(ctx("write denied"))?;
         }
         let out = expand_file_mentions(
@@ -693,7 +701,10 @@ mod tests {
             classify_mention("@unbekannt", dir.path(), &roles),
             MentionTarget::Unknown
         );
-        assert_eq!(classify_mention("@", dir.path(), &roles), MentionTarget::Unknown);
+        assert_eq!(
+            classify_mention("@", dir.path(), &roles),
+            MentionTarget::Unknown
+        );
         Ok(())
     }
 
