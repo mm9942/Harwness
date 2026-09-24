@@ -261,10 +261,11 @@ fn run_list(home: &Path) -> Result<(), ModelsError> {
     }
     for name in provider_names {
         let provider = &config.providers[name];
-        let auth_ok =
-            discovery::resolve_provider_api_key(name, provider, &config, Some(home), resolver)
+        let auth_ok = discovery::resolve_provider_api_key(name, provider, &config, Some(home), resolver)
                 .is_some()
-                || provider.auth_header.as_deref() == Some("none");
+                || provider.auth_header.as_deref() == Some("none")
+                // Runde 7, Teil L1: lokale Provider ohne `auth` brauchen keinen Schlüssel.
+                || (provider.auth.is_none() && provider.is_local());
         println!(
             "{name}\tapi={}\thost={}\tauth={}\tenabled={}",
             provider.api,
@@ -896,6 +897,22 @@ fn write_discovered_model_file(
         path: models_dir.to_path_buf(),
         source,
     })?;
+    // Runde 7, Teil L3: Meldet der Server kein Kontextfenster (bzw. keine
+    // Werkzeug-Auskunft), bleibt ein von Hand eingetragener Wert der
+    // bisherigen Datei erhalten, statt beim erneuten Scan gelöscht zu werden.
+    let previous = fs::read_to_string(path)
+        .ok()
+        .and_then(|content| toml::from_str::<harw_config::ModelToml>(&content).ok());
+    let context_window = model.context_length.or_else(|| {
+        previous
+            .as_ref()
+            .and_then(|previous| previous.context_window)
+    });
+    let tool_calling = model.supports_tools.or_else(|| {
+        previous
+            .as_ref()
+            .and_then(|previous| previous.capabilities.tool_calling)
+    });
     let toml_model = harw_config::ModelToml {
         stream: None,
         rate_limit: None,
@@ -903,7 +920,7 @@ fn write_discovered_model_file(
         name: None,
         provider: provider_name.to_owned(),
         aliases: Vec::new(),
-        context_window: model.context_length,
+        context_window,
         max_tokens: None,
         prompt_caching: None,
         reasoning: false,
@@ -913,6 +930,9 @@ fn write_discovered_model_file(
             streaming: false,
             vision: false,
             json_mode: false,
+            // Runde 7, Teil L7: `supported_parameters` ohne `"tools"` →
+            // `tool_calling = false`; der Provider bietet dann keine Werkzeuge an.
+            tool_calling,
         },
         default_reasoning_effort: None,
     };
@@ -1226,6 +1246,41 @@ mod tests {
         let home = dir.path().join("harw-home");
         harw_home::ensure_home(&home).map_err(ctx("ensure_home"))?;
         Ok((dir, home))
+    }
+
+    /// Runde 7, Teil L3/L7: `harw provider scan` schreibt das gemeldete
+    /// Kontextfenster und `tool_calling`; ohne neue Angabe bleibt ein
+    /// vorhandener Wert erhalten.
+    #[test]
+    fn test_scan_writes_context_window_and_keeps_manual_value() -> TestResult {
+        let dir = tempfile::tempdir().map_err(ctx("tempdir"))?;
+        let path = dir.path().join("models").join("qwen3-8b.toml");
+        let scanned = DiscoveredModel {
+            id: "qwen3-8b".to_owned(),
+            context_length: Some(32_768),
+            input_price_per_mtok: None,
+            output_price_per_mtok: None,
+            supports_tools: Some(false),
+        };
+        write_discovered_model_file(&path, "lmstudio", &scanned).map_err(ctx("first scan"))?;
+        let written: harw_config::ModelToml =
+            toml::from_str(&fs::read_to_string(&path).map_err(ctx("read model"))?)
+                .map_err(ctx("parse model"))?;
+        assert_eq!(written.context_window, Some(32_768));
+        assert_eq!(written.capabilities.tool_calling, Some(false));
+
+        let rescanned = DiscoveredModel {
+            context_length: None,
+            supports_tools: None,
+            ..scanned
+        };
+        write_discovered_model_file(&path, "lmstudio", &rescanned).map_err(ctx("rescan"))?;
+        let kept: harw_config::ModelToml =
+            toml::from_str(&fs::read_to_string(&path).map_err(ctx("reread model"))?)
+                .map_err(ctx("reparse model"))?;
+        assert_eq!(kept.context_window, Some(32_768));
+        assert_eq!(kept.capabilities.tool_calling, Some(false));
+        Ok(())
     }
 
     #[test]
@@ -1681,6 +1736,14 @@ mod tests {
             max_concurrency: None,
             default_reasoning_effort: None,
             gateway_identity_headers: false,
+            request_timeout_secs: None,
+            stream_idle_timeout_secs: None,
+            retry_timeouts: None,
+            max_tokens_field: None,
+            send_reasoning_effort: None,
+            strict_tools: None,
+            parallel_tool_calls: None,
+            allow_insecure_lan: false,
         }
     }
 

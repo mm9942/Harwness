@@ -82,16 +82,43 @@ impl SseDecoder {
 
 /// Liest den Body eines `reqwest::Response` als SSE und reicht jeden Frame an
 /// `on_frame` weiter; `on_frame` liefert `true`, sobald der Stream fertig ist.
+///
+/// # Arguments
+/// - `response`: die Antwort mit SSE-Body.
+/// - `idle_timeout`: Runde 7, Teil L4 — höchstens so lange darf zwischen
+///   zwei empfangenen Chunks vergehen; `None` = unbegrenzt. Es gibt bewusst
+///   kein Gesamt-Zeitlimit: ein stetig fließender Stream läuft beliebig lange.
+/// - `on_frame`: Verarbeitung je Frame.
+///
+/// # Errors
+/// [`ModelError::Timeout`], wenn `idle_timeout` ohne ein Byte verstreicht;
+/// Transport-, Größen- und Frame-Fehler unverändert.
 pub(crate) async fn read_sse(
     mut response: reqwest::Response,
+    idle_timeout: Option<std::time::Duration>,
     mut on_frame: impl FnMut(SseFrame) -> Result<bool, ModelError>,
 ) -> Result<(), ModelError> {
     let mut decoder = SseDecoder::default();
-    while let Some(chunk) = response
-        .chunk()
-        .await
-        .map_err(|error| crate::error::model_error_for_transport(error, true))?
-    {
+    loop {
+        let next = match idle_timeout {
+            Some(idle) => match tokio::time::timeout(idle, response.chunk()).await {
+                Ok(next) => next,
+                Err(_elapsed) => {
+                    return Err(ModelError::Timeout {
+                        message: format!(
+                            "provider stream was idle for {} s (stream_idle_timeout_secs)",
+                            idle.as_secs()
+                        ),
+                    });
+                }
+            },
+            None => response.chunk().await,
+        };
+        let Some(chunk) =
+            next.map_err(|error| crate::error::model_error_for_transport(error, true))?
+        else {
+            break;
+        };
         for frame in decoder.push(&chunk)? {
             if on_frame(frame)? {
                 return Ok(());
@@ -391,6 +418,155 @@ fn append_str(block: &mut Value, key: &str, text: &str) {
 // OpenAI Chat Completions
 // ---------------------------------------------------------------------------
 
+/// Öffnender Denk-Marker lokaler Reasoning-Modelle (Qwen3, DeepSeek-R1, …).
+const THINK_OPEN: &str = "<think>";
+/// Schließender Denk-Marker.
+const THINK_CLOSE: &str = "</think>";
+/// Marker, ab denen der restliche Text Tool-Call-Syntax ist und nicht mehr
+/// live angezeigt wird (Hermes/Qwen, Mistral, Llama).
+const TOOL_CALL_MARKERS: [&str; 3] = ["<tool_call>", "[TOOL_CALLS]", "<|python_tag|>"];
+
+/// Ein Stück live weiterzugebender Ausgabe (siehe [`LiveTextFilter`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum LiveOut {
+    /// Sichtbarer Antworttext.
+    Text(String),
+    /// Denktext aus einem `<think>`-Block.
+    Reasoning(String),
+}
+
+/// Runde 7, Teil L7: Filtert den **Live**-Textstrom eines Chat-Streams.
+///
+/// # Description
+/// - `<think>…</think>` wird als Reasoning statt als Antworttext gemeldet;
+///   ein verwaistes `</think>` wird verschluckt.
+/// - Ab `<tool_call>`, `[TOOL_CALLS]` oder `<|python_tag|>` wird nichts mehr
+///   live angezeigt — das ist Tool-Call-Syntax, die erst am Ende
+///   (`interpret_chat`) geparst wird.
+/// - Ein Textende, das der Anfang eines Markers sein könnte (z. B. `<th`),
+///   wird bis zum nächsten Chunk zurückgehalten, damit über Chunk-Grenzen
+///   zerschnittene Marker nie sichtbar werden.
+///
+/// Der akkumulierte Rohtext (für die finale Antwort) bleibt unberührt.
+#[derive(Debug, Default)]
+struct LiveTextFilter {
+    pending: String,
+    in_think: bool,
+    suppressed: bool,
+}
+
+impl LiveTextFilter {
+    /// Nimmt ein Text-Delta auf und liefert das, was jetzt sicher live
+    /// weitergegeben werden kann.
+    fn push(&mut self, text: &str) -> Vec<LiveOut> {
+        let mut out = Vec::new();
+        if self.suppressed {
+            return out;
+        }
+        self.pending.push_str(text);
+        loop {
+            if self.suppressed {
+                self.pending.clear();
+                break;
+            }
+            if self.in_think {
+                if let Some(index) = self.pending.find(THINK_CLOSE) {
+                    push_out(
+                        &mut out,
+                        LiveOut::Reasoning(self.pending[..index].to_owned()),
+                    );
+                    self.pending.drain(..index + THINK_CLOSE.len());
+                    self.in_think = false;
+                    continue;
+                }
+                let keep = held_back_len(&self.pending, &[THINK_CLOSE]);
+                let emit_len = self.pending.len() - keep;
+                push_out(
+                    &mut out,
+                    LiveOut::Reasoning(self.pending[..emit_len].to_owned()),
+                );
+                self.pending.drain(..emit_len);
+                break;
+            }
+            let earliest = [THINK_OPEN, THINK_CLOSE]
+                .iter()
+                .chain(TOOL_CALL_MARKERS.iter())
+                .filter_map(|marker| self.pending.find(marker).map(|index| (index, *marker)))
+                .min_by_key(|(index, _)| *index);
+            if let Some((index, marker)) = earliest {
+                push_out(&mut out, LiveOut::Text(self.pending[..index].to_owned()));
+                self.pending.drain(..index + marker.len());
+                if marker == THINK_OPEN {
+                    self.in_think = true;
+                } else if marker != THINK_CLOSE {
+                    self.suppressed = true;
+                }
+                continue;
+            }
+            let mut markers = vec![THINK_OPEN, THINK_CLOSE];
+            markers.extend(TOOL_CALL_MARKERS);
+            let keep = held_back_len(&self.pending, &markers);
+            let emit_len = self.pending.len() - keep;
+            push_out(&mut out, LiveOut::Text(self.pending[..emit_len].to_owned()));
+            self.pending.drain(..emit_len);
+            break;
+        }
+        out
+    }
+
+    /// Gibt am Stream-Ende zurückgehaltenen Text frei.
+    fn flush(&mut self) -> Vec<LiveOut> {
+        let pending = std::mem::take(&mut self.pending);
+        let mut out = Vec::new();
+        if self.suppressed {
+            return out;
+        }
+        if self.in_think {
+            push_out(&mut out, LiveOut::Reasoning(pending));
+        } else {
+            push_out(&mut out, LiveOut::Text(pending));
+        }
+        out
+    }
+}
+
+/// Hängt `item` an, sofern es nicht leer ist.
+fn push_out(out: &mut Vec<LiveOut>, item: LiveOut) {
+    let empty = match &item {
+        LiveOut::Text(text) | LiveOut::Reasoning(text) => text.is_empty(),
+    };
+    if !empty {
+        out.push(item);
+    }
+}
+
+/// Länge des längsten Suffixes von `text`, das ein echter Präfix eines der
+/// `markers` ist (muss bis zum nächsten Chunk zurückgehalten werden).
+fn held_back_len(text: &str, markers: &[&str]) -> usize {
+    let longest = markers.iter().map(|marker| marker.len()).max().unwrap_or(0);
+    let upper = longest.saturating_sub(1).min(text.len());
+    (1..=upper)
+        .rev()
+        .find(|&len| {
+            let start = text.len() - len;
+            text.is_char_boundary(start)
+                && markers
+                    .iter()
+                    .any(|marker| marker.len() > len && marker.starts_with(&text[start..]))
+        })
+        .unwrap_or(0)
+}
+
+/// Gibt die Ausgaben des [`LiveTextFilter`] an den Sink weiter.
+fn emit_live(sink: Option<&StreamSink>, outputs: Vec<LiveOut>) {
+    for output in outputs {
+        match output {
+            LiveOut::Text(text) => emit(sink, ModelStreamEvent::TextDelta(text)),
+            LiveOut::Reasoning(text) => emit(sink, ModelStreamEvent::ReasoningDelta(text)),
+        }
+    }
+}
+
 /// Baut aus `chat.completion.chunk`-Events einen `chat.completion`-Body.
 #[derive(Debug, Default)]
 pub(crate) struct ChatStreamAccumulator {
@@ -403,6 +579,8 @@ pub(crate) struct ChatStreamAccumulator {
     finish_reason: Option<Value>,
     usage: Option<Value>,
     done: bool,
+    /// Runde 7, Teil L7: Live-Filter für `<think>`/Tool-Call-Marker.
+    live: LiveTextFilter,
 }
 
 impl ChatStreamAccumulator {
@@ -418,6 +596,7 @@ impl ChatStreamAccumulator {
         }
         if data == "[DONE]" {
             self.done = true;
+            emit_live(sink, self.live.flush());
             return Ok(true);
         }
         let chunk: Value = serde_json::from_str(data)?;
@@ -451,16 +630,23 @@ impl ChatStreamAccumulator {
         else {
             return Ok(false);
         };
-        if let Some(reason) = choice.get("finish_reason").filter(|r| !r.is_null()) {
+        let finished = choice.get("finish_reason").filter(|r| !r.is_null());
+        if let Some(reason) = finished {
             self.finish_reason = Some(reason.clone());
         }
         let Some(delta) = choice.get("delta") else {
+            if finished.is_some() {
+                emit_live(sink, self.live.flush());
+            }
             return Ok(false);
         };
         if let Some(text) = delta.get("content").and_then(Value::as_str) {
             self.has_content = true;
             self.content.push_str(text);
-            emit(sink, ModelStreamEvent::TextDelta(text.to_owned()));
+            emit_live(sink, self.live.push(text));
+        }
+        if finished.is_some() {
+            emit_live(sink, self.live.flush());
         }
         for key in ["reasoning_content", "reasoning"] {
             if let Some(text) = delta.get(key).and_then(Value::as_str) {
@@ -819,6 +1005,79 @@ mod tests {
         let events = seen.lock().map(|g| g.clone()).unwrap_or_default();
         assert!(events.contains(&ModelStreamEvent::TextDelta("Hi".into())));
         Ok(())
+    }
+
+    /// Runde 7, Teil L7: `<think>` und Tool-Call-Syntax erscheinen nicht im
+    /// Live-Stream, auch wenn die Marker über Chunk-Grenzen zerschnitten sind;
+    /// der finale Body behält den Rohtext.
+    #[test]
+    fn chat_stream_filters_think_and_tool_call_markers_live() -> TestResult {
+        let deltas = [
+            "<thi",
+            "nk>überlege",
+            " kurz</th",
+            "ink>Hallo ",
+            "Welt<to",
+            "ol_call>",
+            "fs.read{\"path\":\"a\"}",
+        ];
+        let mut raw = String::from(
+            "data: {\"id\":\"c1\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\"}}]}\n\n",
+        );
+        for delta in deltas {
+            let chunk = serde_json::json!({
+                "id": "c1",
+                "choices": [{"index": 0, "delta": {"content": delta}}]
+            });
+            raw.push_str(&format!("data: {chunk}\n\n"));
+        }
+        raw.push_str("data: {\"id\":\"c1\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n");
+        raw.push_str("data: [DONE]\n\n");
+        let (sink, seen) = recording_sink();
+        let mut acc = ChatStreamAccumulator::default();
+        for frame in decode_all(&raw)? {
+            acc.push(&frame, Some(&sink))?;
+        }
+        let body = acc.finish()?;
+        let events = seen.lock().map(|g| g.clone()).unwrap_or_default();
+        let text: String = events
+            .iter()
+            .filter_map(|e| match e {
+                ModelStreamEvent::TextDelta(t) => Some(t.as_str()),
+                _ => None,
+            })
+            .collect();
+        let reasoning: String = events
+            .iter()
+            .filter_map(|e| match e {
+                ModelStreamEvent::ReasoningDelta(t) => Some(t.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(text, "Hallo Welt");
+        assert_eq!(reasoning, "überlege kurz");
+        assert!(!text.contains("<"));
+        let content = body["choices"][0]["message"]["content"]
+            .as_str()
+            .ok_or("content")?;
+        assert!(content.contains("<tool_call>fs.read"));
+        Ok(())
+    }
+
+    #[test]
+    fn live_filter_releases_held_back_text_and_drops_orphan_close() {
+        let mut filter = LiveTextFilter::default();
+        assert_eq!(filter.push("a < b"), vec![LiveOut::Text("a < b".into())]);
+        assert_eq!(filter.push(" und <"), vec![LiveOut::Text(" und ".into())]);
+        assert_eq!(filter.flush(), vec![LiveOut::Text("<".into())]);
+        let mut filter = LiveTextFilter::default();
+        assert_eq!(
+            filter.push("denken</think>Antwort"),
+            vec![
+                LiveOut::Text("denken".into()),
+                LiveOut::Text("Antwort".into())
+            ]
+        );
     }
 
     #[test]

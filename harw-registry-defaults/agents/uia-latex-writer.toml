@@ -40,6 +40,26 @@
 # `not_installed`: sofort aufhoeren, nicht weiter probieren, `user_message`
 # woertlich unter „Hinweis fuer die Nutzerin“ zurueckgeben.
 #
+# ── Runde 7, Teil T5: Vorlage, Vorabpruefung, Skills, Budget ─────────────
+# `latex.template` (kopiert `harw-report.sty` plus Geruest bericht |
+# business-paper | handbuch in den Workspace, ueberschreibt nie, verlangt
+# `WriteWorkspace`, laeuft durch die Freigabe) und `latex.check` (prueft
+# Klasse, Pakete, Schriften und Babel-Sprachen per `kpsewhich`/`fc-list` in
+# derselben Sandbox wie `latex.build`, verlangt `ExecuteProcess`) kommen
+# dazu. Beide stellt `harw_tool_shell::LatexToolProvider` bereit.
+#
+# `skills` bindet die vier Skills fest an die Rolle; der Kind-Spawn
+# (`RuntimeChildRegistryFactory::skill_fragments_for_role`) injiziert sie
+# als Instruktionsfragmente und startet fail-closed nicht ohne sie. Der
+# Skill `latex-report` traegt zugleich Rolle, Grenzen und Uebergabeformat
+# des Writers (Abschnitt 0): Registry-Kinder bekommen kein `system.md` aus
+# `agents/latex-writer/`, sondern Rollenregel (`knowledge/roles/
+# uia-worker.md`) plus diese Skills.
+#
+# Budget: realistisch fuer Vorlage + Schreiben + Build + bis zu drei
+# Korrekturrunden + PDF-Stichprobe (greift seit Runde 7, Teil A1 auch im
+# Transfer-Pfad).
+#
 # ── Rueckgabevertrag ─────────────────────────────────────────────────────
 # `harwness.return.execution-summary@1`: geaenderte Dateien, Ergebnis der
 # statischen Pruefung, Build-Status (PDF-Pfad bzw. erste Log-Fehler) und
@@ -52,6 +72,7 @@ version = "1.0.0"
 extends = { id = "harwness.agent.worker-base@1" }
 role = "uia-worker"
 specialization = "uia-latex-writer"
+skills = ["latex-report", "latex-writing", "xelatex-compile", "business-writing-pyramid"]
 
 name = "UIA LaTeX Writer"
 description = "Schreibt und ueberarbeitet LaTeX-Quellen (.tex/.bib) im Workspace fuer die UIA und baut sie ueber das typisierte latex.build (Sandbox, ohne freie Shell und ohne Netz), unter der zugelassenen Organisationsrolle uia-worker."
@@ -72,6 +93,10 @@ admitted = [
   "fs.write",
   "fs.edit",
   "latex.build",
+  # Runde 7, Teil T5: Vorlage kopieren (WriteWorkspace, Freigabe) und
+  # Installation vorab pruefen (ExecuteProcess, Sandbox, Freigabe).
+  "latex.template",
+  "latex.check",
   # Runde 5, Teil M: Zwischenstand (info) oder Frage (question) an den direkten
   # Elternteil; nur Text, keine Rechte (siehe
   # `harw_registry_defaults::profile::parent_message_tools_for_role`).
@@ -97,9 +122,9 @@ forbidden = [
 max_depth = 0
 
 [spawn.budget]
-max_tokens = 60000
-max_tool_calls = 40
-max_wall_secs = 180
+max_tokens = 150000
+max_tool_calls = 60
+max_wall_secs = 600
 
 [return]
 contract = "harwness.return.execution-summary@1"

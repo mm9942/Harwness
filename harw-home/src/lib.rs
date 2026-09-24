@@ -13,6 +13,10 @@
 //! - **Startausstattung** ([`bundle`]): die mit dem Binary ausgelieferte
 //!   Agenten-Delegationshierarchie und ihre Skills, die das Scaffolding nach
 //!   `~/.harw/agents` bzw. `~/.harw/skills` schreibt.
+//! - **Bundle-Updates** ([`bundle_manifest`], Runde 7, Teil T6): Manifest
+//!   `~/.harw/.bundle-manifest.toml` mit dem SHA-256 je installierter
+//!   Bundle-Datei; unveränderte Dateien werden aktualisiert, geänderte
+//!   bekommen die neue Fassung als `<datei>.harw-neu` daneben.
 //! - **Layer-Zusammenstellung** ([`paths::config_layers`],
 //!   [`paths::config_layers_report`]): baut die aufsteigende Präzedenzkette
 //!   für `harw_config::discover_config`. Ein repo-lokales `./.harw` ist nur
@@ -45,6 +49,7 @@
 #![forbid(unsafe_code)]
 
 pub mod bundle;
+pub mod bundle_manifest;
 pub mod error;
 pub mod paths;
 pub mod project;

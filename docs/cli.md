@@ -26,6 +26,8 @@ Konfiguration
          | unallow INDEX | undeny INDEX
   config provider … | config model default ID
   provider list | add NAME --api DIALEKT --base-url URL [--auth REF] [--models A,B]
+                  [--auth-header bearer|x-api-key|api-key|none] [--no-auth]
+                  [--allow-insecure-lan]
            | remove NAME | enable NAME | disable NAME
            | scan [NAME] [--free-only] [--prune]
   model                                         Modelle auflisten (Alias: models)
@@ -62,6 +64,43 @@ System
 reichen alle folgenden Argumente unverändert weiter, auch solche mit
 führendem Bindestrich. Sie entsprechen den Chat-Befehlen `/skills`,
 `/plugins`, `/memory` und `/context-proposal`.
+
+## Anbieter (`harw provider`)
+
+`harw provider add NAME --api DIALEKT --base-url URL` legt
+`providers/NAME.toml` im aktiven Profil an oder überschreibt eine vorhandene
+Datei. Seit Runde 7 gelten diese Optionen:
+
+- `--auth REF` nennt eine Secret-Referenz (`env:VAR`, `secrets:NAME`, …).
+  Ein Klartext-Schlüssel wird abgelehnt.
+- `--auth-header bearer|x-api-key|api-key|none` wählt den Transport des
+  Schlüssels. Ohne Angabe gilt die Vorgabe des Dialekts (`bearer`).
+- `--no-auth` bedeutet: kein Schlüssel und kein Auth-Header, etwa für einen
+  lokalen vLLM- oder LM-Studio-Server. Die Option schließt `--auth` und
+  `--auth-header` aus.
+- `--allow-insecure-lan` erlaubt `http` zu einer privaten LAN-IP
+  (`10/8`, `172.16/12`, `192.168/16`). Sonst ist `http` nur für Loopback
+  zulässig.
+
+Zeigt die Basis-URL auf die eigene Maschine (oder mit
+`--allow-insecure-lan` ins LAN), schreibt `add` ohne `--auth` automatisch
+`auth_header = "none"` und `max_concurrency = 1`.
+
+`harw provider scan [NAME]` fragt `/models` ab und schreibt je Modell
+`models/<id>.toml`. Das Kontextfenster (`context_window`) kommt aus
+`context_length`, aus vLLMs `max_model_len` oder, bei lokalen Providern,
+zusätzlich aus LM Studios `GET /api/v0/models`. Meldet der Server
+`supported_parameters` ohne `"tools"`, setzt der Scan
+`[capabilities] tool_calling = false`. Ein vorhandenes `context_window` bleibt
+erhalten, wenn der Server keines meldet.
+
+Neue Felder in `providers/<name>.toml`, jeweils optional:
+`request_timeout_secs`, `stream_idle_timeout_secs`, `retry_timeouts`,
+`max_tokens_field` (`"max_tokens"`, `"max_completion_tokens"` oder `"both"`),
+`send_reasoning_effort`, `strict_tools`, `parallel_tool_calls` und
+`allow_insecure_lan`. Lokale Provider haben eigene Vorgaben. Die Übersicht und
+die Startbefehle für vLLM und LM Studio stehen in
+[setup/local-models.md](setup/local-models.md).
 
 ## Globale Flags
 
@@ -182,6 +221,10 @@ harw session resume 3f2a
 harw provider add lokal --api ollama --base-url http://localhost:11434
 harw provider scan lokal
 harw model default lokal/qwen3
+
+# Lokalen vLLM-Server ohne Schlüssel anbinden und Kontextfenster einlesen
+harw provider add vllm --api openai-chat --base-url http://localhost:8000/v1 --no-auth
+harw provider scan vllm
 
 # Anbieter-Katalog aus models.dev aktualisieren
 harw model catalog --refresh

@@ -320,6 +320,15 @@ fn business_context(b: &BusinessScenario, out: &mut String) {
         }
         out.push('\n');
     }
+    // Runde 7, Teil M5: die Geschäftsregeln des GameMasters erkennen die
+    // Aktionsart am Präfix `[art]`.
+    if !b.business.action_kinds.is_empty() {
+        let _ = writeln!(
+            out,
+            "## Aktionsarten\nBeginne die Aktion eines Arguments mit ihrer Art in eckigen Klammern, z. B. `[invest] …`. Erlaubt: {}. Geschäftsregeln des GameMasters können einzelne Arten sperren (z. B. bei negativer Kasse).\n",
+            b.business.action_kinds.join(", ")
+        );
+    }
 }
 
 fn own_brief(scenario: &Scenario, player: &PlayerId, out: &mut String) {

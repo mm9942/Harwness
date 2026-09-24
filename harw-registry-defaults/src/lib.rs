@@ -262,6 +262,18 @@ pub const AUTO_APPROVED_TOOLS: &[&str] = &[
     // Prozess, kein Netz — deshalb ohne Rückfrage unter `Delegated`/`Full`
     // (die Plan-Stufe nutzt `Delegated`). Unter `AlwaysAsk` fragt es weiter.
     "plan.write",
+    // Runde 7, Teil M: die beiden Game-Master-Werkzeuge ohne Freigabe-
+    // Deklaration (`model_tool(approval = "none")`, `harw-ops/src/matrix/
+    // game_master.rs`): `matrix.status` liest nur Laufstand bzw.
+    // Beispielszenarien, `matrix.draft_scenario` validiert ein Szenario und
+    // legt es ausschließlich im Matrix-Speicher des Profils ab
+    // (`<profil>/knowledge/matrix/scenarios/<slug>.toml`, Slug-Grammatik,
+    // kein Workspace, kein Prozess, kein Netz — dieselbe Klasse wie
+    // `plan.write`). Registriert nur für `matrix-game-master`
+    // (`profile::matrix_tools_for_role`). `matrix.start`/`matrix.run`/
+    // `matrix.finish` fragen immer und stehen bewusst NICHT hier.
+    "matrix.status",
+    "matrix.draft_scenario",
     // Bewusst entfernt (W1-05, Register F-014, G-003, G-004, F-043, G-068):
     // - `plan`, `goal`: deklarieren `model_tool(approval = "always")` und
     //   mutieren PlanStore bzw. Ziel; die Auto-Freigabe überstimmte die
@@ -745,6 +757,9 @@ mod tests {
         // (reiner Text, ohne Schreibwirkung).
         read_only_surface.extend_from_slice(crate::profile::CHILD_MESSAGE_TOOLS);
         read_only_surface.extend_from_slice(crate::profile::PARENT_MESSAGE_TOOLS);
+        // Runde 7, Teil M: Laufstand lesen bzw. Entwurf in den Matrix-Speicher
+        // (dokumentierte Ausnahme wie `plan.write`).
+        read_only_surface.extend_from_slice(crate::profile::MATRIX_GAME_MASTER_READ_TOOLS);
         for profile in RegistryProfile::ALL.iter().filter(|p| p.is_read_only()) {
             read_only_surface.extend(profile.registered_tool_names());
         }
@@ -798,6 +813,10 @@ mod tests {
             "analyze",
             "diff",
             "mode",
+            // Runde 7, Teil M: Game-Master-Werkzeuge mit Wirkung.
+            "matrix.start",
+            "matrix.run",
+            "matrix.finish",
         ] {
             assert!(
                 DefaultApprovalPolicy::requires_explicit_approval(&call(name)),

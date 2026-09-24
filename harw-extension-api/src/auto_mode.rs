@@ -731,6 +731,137 @@ impl std::fmt::Debug for AutoSessionContext {
     }
 }
 
+// ── Runde 7, Teil A6: Auftrag eines Kind-Agenten ───────────────────────────
+
+/// Obergrenze (Zeichen) des Auftrags im [`ChildMandate`].
+pub const MANDATE_TASK_MAX_CHARS: usize = 2_000;
+
+/// Obergrenze (Zeichen) des Kontextauszugs im [`ChildMandate`].
+pub const MANDATE_CONTEXT_MAX_CHARS: usize = 1_000;
+
+/// Argumentfelder eines Handoffs, die den Auftrag tragen (in dieser
+/// Reihenfolge gesucht).
+const MANDATE_TASK_FIELDS: &[&str] = &["task", "instructions", "objective", "question"];
+
+/// Der Auftrag, unter dem ein Kind-Agent läuft (Runde 7, Teil A6).
+///
+/// # Beschreibung
+/// Der Auto-Modus-Klassifizierer eines Kindes kannte bisher nur die letzten
+/// Nutzernachrichten der Wurzel und beurteilte Kind-Aufrufe deshalb gegen das
+/// falsche Ziel (z. B. „Zielabweichung" beim ausdrücklich bestellten PDF).
+/// Das Mandat wird bei der Admission aus dem [`crate::SpawnInput`] gebildet
+/// und im Klassifizierer-Prompt als „Auftrag dieses Kind-Agenten" gezeigt —
+/// bereinigt und gekürzt wie jeder andere Prompt-Bestandteil.
+///
+/// # Concurrency
+/// Reiner Datenhalter; `Clone + Send + Sync`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ChildMandate {
+    role: String,
+    task: String,
+    context_excerpt: Option<String>,
+}
+
+impl ChildMandate {
+    /// Erzeugt ein Mandat aus Rolle und Auftrag (auf
+    /// [`MANDATE_TASK_MAX_CHARS`] gekürzt).
+    ///
+    /// # Arguments
+    /// - `role` (`impl Into<String>`): Rollenname des Kindes.
+    /// - `task` (`impl Into<String>`): der Auftragstext.
+    #[must_use]
+    pub fn new(role: impl Into<String>, task: impl Into<String>) -> Self {
+        Self {
+            role: role.into(),
+            task: truncate_mandate(&task.into(), MANDATE_TASK_MAX_CHARS),
+            context_excerpt: None,
+        }
+    }
+
+    /// Setzt einen Kontextauszug (auf [`MANDATE_CONTEXT_MAX_CHARS`] gekürzt;
+    /// leer = kein Auszug).
+    #[must_use]
+    pub fn with_context_excerpt(mut self, excerpt: impl Into<String>) -> Self {
+        let excerpt = excerpt.into();
+        self.context_excerpt = (!excerpt.trim().is_empty())
+            .then(|| truncate_mandate(&excerpt, MANDATE_CONTEXT_MAX_CHARS));
+        self
+    }
+
+    /// Bildet das Mandat aus dem Spawn-Input eines Kindes.
+    ///
+    /// # Beschreibung
+    /// Der Auftrag ist `instructions`, sonst das erste Textfeld aus
+    /// `task`/`instructions`/`objective`/`question` des Handoff-Kontexts.
+    /// Ein Textfeld `context` wird zum Kontextauszug.
+    ///
+    /// # Arguments
+    /// - `role` (`&str`): Rollenname des Kindes.
+    /// - `input` (`&crate::SpawnInput`): der Spawn-Input.
+    ///
+    /// # Returns
+    /// `Some(mandat)`, wenn ein nicht leerer Auftrag vorliegt; sonst `None`
+    /// (dann beurteilt der Klassifizierer wie bisher ohne Mandat).
+    #[must_use]
+    pub fn from_spawn_input(role: &str, input: &crate::SpawnInput) -> Option<Self> {
+        let task = input
+            .instructions
+            .as_deref()
+            .filter(|text| !text.trim().is_empty())
+            .map(ToOwned::to_owned)
+            .or_else(|| {
+                MANDATE_TASK_FIELDS.iter().find_map(|field| {
+                    input
+                        .context
+                        .get(*field)
+                        .and_then(serde_json::Value::as_str)
+                        .filter(|text| !text.trim().is_empty())
+                        .map(ToOwned::to_owned)
+                })
+            })?;
+        let mandate = Self::new(role, task);
+        Some(
+            match input
+                .context
+                .get("context")
+                .and_then(serde_json::Value::as_str)
+            {
+                Some(excerpt) => mandate.with_context_excerpt(excerpt),
+                None => mandate,
+            },
+        )
+    }
+
+    /// Rollenname des Kindes.
+    #[must_use]
+    pub fn role(&self) -> &str {
+        &self.role
+    }
+
+    /// Der Auftragstext.
+    #[must_use]
+    pub fn task(&self) -> &str {
+        &self.task
+    }
+
+    /// Der Kontextauszug, falls vorhanden.
+    #[must_use]
+    pub fn context_excerpt(&self) -> Option<&str> {
+        self.context_excerpt.as_deref()
+    }
+}
+
+/// Kürzt `text` zeichengenau auf `max` Zeichen (mit „…").
+fn truncate_mandate(text: &str, max: usize) -> String {
+    let trimmed = text.trim();
+    if trimmed.chars().count() <= max {
+        return trimmed.to_owned();
+    }
+    let mut out: String = trimmed.chars().take(max.saturating_sub(1)).collect();
+    out.push('…');
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -994,5 +1125,53 @@ mod tests {
         log.reset_cap();
         assert_eq!(log.tripped_by(), None);
         Ok(())
+    }
+
+    // ── Runde 7, Teil A6 ──────────────────────────────────────────────────
+
+    fn spawn_input(instructions: Option<&str>, context: serde_json::Value) -> crate::SpawnInput {
+        crate::SpawnInput {
+            parent_session_id: harw_types::SessionId::new(),
+            handoff_call_id: harw_types::ToolCallId::new(),
+            instructions: instructions.map(ToOwned::to_owned),
+            context,
+            ceiling: None,
+        }
+    }
+
+    #[test]
+    fn mandate_prefers_instructions_then_task_fields() -> TestResult {
+        let from_instructions = ChildMandate::from_spawn_input(
+            "uia-latex-writer",
+            &spawn_input(Some("Baue das PDF"), serde_json::json!({"task": "anders"})),
+        )
+        .ok_or(TestError::Missing("Mandat aus instructions"))?;
+        assert_eq!(from_instructions.task(), "Baue das PDF");
+        assert_eq!(from_instructions.role(), "uia-latex-writer");
+
+        let from_task = ChildMandate::from_spawn_input(
+            "worker",
+            &spawn_input(
+                None,
+                serde_json::json!({"task": "Schreibe bericht.tex", "context": "Vorlage business-paper"}),
+            ),
+        )
+        .ok_or(TestError::Missing("Mandat aus task"))?;
+        assert_eq!(from_task.task(), "Schreibe bericht.tex");
+        assert_eq!(from_task.context_excerpt(), Some("Vorlage business-paper"));
+
+        assert!(
+            ChildMandate::from_spawn_input("worker", &spawn_input(None, serde_json::json!({})))
+                .is_none()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn mandate_is_truncated() {
+        let long = "x".repeat(MANDATE_TASK_MAX_CHARS + 50);
+        let mandate = ChildMandate::new("worker", long).with_context_excerpt("   ");
+        assert_eq!(mandate.task().chars().count(), MANDATE_TASK_MAX_CHARS);
+        assert!(mandate.context_excerpt().is_none());
     }
 }

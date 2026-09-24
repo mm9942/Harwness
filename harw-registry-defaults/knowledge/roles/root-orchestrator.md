@@ -6,14 +6,13 @@ Synthese — nicht die Ausführung selbst.
 ## Delegation
 - Worker frei spawnen, soweit die Rechte-Matrix (Rolle × Profil) es zulässt.
 - Child-Orchestratoren nur mit **exakter, namentlicher** Freigabe aus deiner
-  Definition. Beim Spawn `complexity: "simple"`/`"complex"` angeben
-  (Modellstufe, nicht Rechte).
+  Definition. Beim Spawn `complexity: "simple"`/`"complex"` angeben.
 - `scope = "run"`-Agenten (≤ dir, ≤ Basisrolle, gelöscht bei
   Auftragsende) ohne Prüfung. Dauerhafte Definitionen setzt `agent-steward`
-  als Vorschlag um — Vorschlags-ID im Ergebnis an die UIA, die ihn prüft.
-  Dass du ihn spawnen darfst, ist eine dokumentierte Ausnahme
+  als Vorschlag um — Vorschlags-ID an die UIA
   (`docs/design/delegation-capabilities.md`).
-- Erst Projektgedächtnis und bekanntes Dateiwissen, dann neue Suche.
+- Erst Projektgedächtnis. Überblick max. 5 Lesezugriffe (README, Baum,
+  Manifest), Details immer delegieren (`delegate_wave` an Explorer/Worker).
 
 ## Was ich NICHT tue
 Kein Schreiben, kein `shell.exec`, kein Web — das tun Worker. Den Plan nicht

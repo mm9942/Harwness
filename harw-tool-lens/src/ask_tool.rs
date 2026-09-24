@@ -59,7 +59,7 @@
 //! [`outcome_to_json`] reicht deshalb beide Felder unverändert in die
 //! JSON-Antwort durch -- kein Zusammenfassen zu einer einzelnen Zahl, kein
 //! Weglassen bei leerem `skipped`.
-use crate::provenance::{ask_descriptor, ask_embedder, ask_provenance};
+use crate::provenance::{ASK_EMBEDDING_MODEL, ask_descriptor, ask_embedder, ask_provenance};
 use crate::scope::{derive_read_scope, selectors_in_scope};
 use harw_lens::{CollapsePolicy, EdgeIndex, Ranked};
 use harw_lens_federation::{FederatedOutcome, SkipReason, SkippedIndex, federated_query};
@@ -92,7 +92,7 @@ pub const ASK_RRF_K: f32 = 60.0;
 #[serde(deny_unknown_fields)]
 #[tool(
     name = "lens.ask",
-    description = "Stellt eine Frage an alle für diesen Aufrufer sichtbaren Lens-Indizes und liefert verschmolzene Treffer samt übersprungener Indizes."
+    description = "Stellt eine Frage an alle für diesen Aufrufer sichtbaren Lens-Indizes und liefert verschmolzene Treffer samt übersprungener Indizes. Die Antwort nennt das Einbettungsmodell (`embedding_model`); ohne konfigurierten Remote-Endpunkt sind es Platzhalter-Einbettungen ohne semantischen Gehalt (`placeholder_embeddings: true`) -- Treffer dann nur als grobe Stichwortnähe werten."
 )]
 pub struct LensAskArgs {
     /// Die Frage im Klartext, unpräfixiert.
@@ -139,12 +139,32 @@ fn skipped_to_json(skipped: &SkippedIndex) -> serde_json::Value {
     })
 }
 
+/// `true`, wenn `model` der fest eingebaute Platzhalter ist (Runde 7, Teil B7).
+///
+/// # Arguments
+/// - `model` (`&str`): der Modellname aus [`ask_provenance`].
+///
+/// # Returns
+/// `true` für [`ASK_EMBEDDING_MODEL`] -- Einbettungen ohne semantischen
+/// Gehalt, weil kein Remote-Endpunkt konfiguriert ist.
+fn is_placeholder_model(model: &str) -> bool {
+    model == ASK_EMBEDDING_MODEL
+}
+
 /// Baut die vollständige JSON-Antwort aus einem [`FederatedOutcome`].
 ///
 /// # Description
 /// Reicht `queried` und `skipped` unverändert durch, zusätzlich zur
 /// verschmolzenen Rangliste `fused` -- siehe den `//!`-Block dieses Moduls.
-fn outcome_to_json(outcome: &FederatedOutcome) -> serde_json::Value {
+/// Runde 7, Teil B7: nennt außerdem das Einbettungsmodell
+/// (`embedding_model`) und ob es der Platzhalter ohne semantischen Gehalt
+/// ist (`placeholder_embeddings`), damit das Modell schwache Treffer richtig
+/// einordnet.
+///
+/// # Arguments
+/// - `outcome` (`&FederatedOutcome`): das Föderationsergebnis.
+/// - `embedding_model` (`&str`): der Modellname aus [`ask_provenance`].
+fn outcome_to_json(outcome: &FederatedOutcome, embedding_model: &str) -> serde_json::Value {
     let hits: Vec<serde_json::Value> = outcome.fused.iter().map(ranked_to_json).collect();
     let queried: Vec<serde_json::Value> = outcome
         .queried
@@ -162,6 +182,8 @@ fn outcome_to_json(outcome: &FederatedOutcome) -> serde_json::Value {
         "hits": hits,
         "queried": queried,
         "skipped": skipped,
+        "embedding_model": embedding_model,
+        "placeholder_embeddings": is_placeholder_model(embedding_model),
     })
 }
 
@@ -222,7 +244,10 @@ fn ask_with_home(
     );
 
     match outcome {
-        Ok(outcome) => Ok(ToolOutput::json(outcome_to_json(&outcome))),
+        Ok(outcome) => Ok(ToolOutput::json(outcome_to_json(
+            &outcome,
+            &provenance.model,
+        ))),
         Err(err) => Ok(ToolOutput::error(format!("lens.ask: {err}"))),
     }
 }
@@ -240,7 +265,7 @@ fn ask_with_home(
 /// `Ok(ToolOutput::error(...))` zurückgegeben.
 #[harw_macros::tool(
     name = "lens.ask",
-    description = "Stellt eine Frage an alle für diesen Aufrufer sichtbaren Lens-Indizes und liefert verschmolzene Treffer samt übersprungener Indizes.",
+    description = "Stellt eine Frage an alle für diesen Aufrufer sichtbaren Lens-Indizes und liefert verschmolzene Treffer samt übersprungener Indizes. Die Antwort nennt das Einbettungsmodell (`embedding_model`); ohne konfigurierten Remote-Endpunkt sind es Platzhalter-Einbettungen ohne semantischen Gehalt (`placeholder_embeddings: true`) -- Treffer dann nur als grobe Stichwortnähe werten.",
     permission = "read_workspace"
 )]
 async fn lens_ask(
@@ -419,6 +444,14 @@ mod tests {
                         .any(|s| s["index_name"] == DOCS_DESIGN_INDEX),
                     "docs.design haette befragt werden muessen: {content}"
                 );
+                // Runde 7, Teil B7: ohne Remote-Endpunkt nennt die Antwort
+                // den Platzhalter ausdrücklich.
+                assert_eq!(
+                    content["embedding_model"],
+                    crate::provenance::ASK_EMBEDDING_MODEL,
+                    "{content}"
+                );
+                assert_eq!(content["placeholder_embeddings"], true, "{content}");
             }
             other => {
                 return Err(TestError::Unexpected(format!(
@@ -429,6 +462,13 @@ mod tests {
 
         std::fs::remove_dir_all(&harness).ok();
         Ok(())
+    }
+
+    /// Runde 7, Teil B7: nur der eingebaute Platzhalter gilt als Platzhalter.
+    #[test]
+    fn test_placeholder_flag_only_for_the_builtin_placeholder() {
+        assert!(is_placeholder_model(crate::provenance::ASK_EMBEDDING_MODEL));
+        assert!(!is_placeholder_model("text-embedding-3-large"));
     }
 
     /// Modellname, mit dem der Test-Index gebaut wird -- muss

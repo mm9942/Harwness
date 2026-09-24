@@ -85,6 +85,12 @@ pub struct RetryPolicy {
     pub max_delay: Duration,
     /// Größter respektierter `retry_after`-Hinweis; darüber kein Retry.
     pub max_retry_after: Duration,
+    /// Runde 7, Teil L4: ob [`ModelError::Timeout`] wiederholt wird.
+    /// `false` für lokale Provider (siehe
+    /// `harw_config::ProviderToml::effective_retry_timeouts`): ein
+    /// überlasteter lokaler Server wird durch Wiederholen nur länger
+    /// blockiert. Übrige wiederholbare Fehler bleiben unberührt.
+    pub retry_timeouts: bool,
 }
 
 impl Default for RetryPolicy {
@@ -96,6 +102,7 @@ impl Default for RetryPolicy {
             base_delay: Duration::from_secs(10),
             max_delay: Duration::from_secs(30),
             max_retry_after: Duration::from_secs(60),
+            retry_timeouts: true,
         }
     }
 }
@@ -139,7 +146,8 @@ pub enum RetryDecision {
 /// Entscheidet rein funktional, ob und wann nach `error` wiederholt wird.
 ///
 /// # Description
-/// Siehe Moduldoku: nur [`ModelError::is_retryable`]; der vom Fehler
+/// Siehe Moduldoku: nur [`ModelError::is_retryable`] (und
+/// [`ModelError::Timeout`] nur bei `policy.retry_timeouts`); der vom Fehler
 /// gemeldete Wartehinweis (`Transient::retry_after_secs` oder
 /// `RateLimited::retry_after_secs`) ist Untergrenze, über
 /// `policy.max_retry_after` → [`RetryDecision::GiveUp`].
@@ -161,6 +169,9 @@ pub fn retry_decision(
     unit: f64,
 ) -> RetryDecision {
     if !error.is_retryable() {
+        return RetryDecision::GiveUp;
+    }
+    if !policy.retry_timeouts && matches!(error, ModelError::Timeout { .. }) {
         return RetryDecision::GiveUp;
     }
     let backoff = policy.backoff_delay(retry_index, unit);
@@ -479,6 +490,7 @@ mod tests {
             base_delay: Duration::from_millis(100),
             max_delay: Duration::from_secs(1),
             max_retry_after: Duration::from_secs(60),
+            retry_timeouts: true,
         }
     }
 
@@ -502,6 +514,27 @@ mod tests {
             Duration::from_millis(500)
         );
         assert_eq!(policy.backoff_delay(0, f64::NAN), Duration::from_millis(50));
+    }
+
+    /// Runde 7, Teil L4: lokale Provider wiederholen Zeitlimit-Fehler nicht,
+    /// wohl aber andere vorübergehende Fehler.
+    #[test]
+    fn test_retry_decision_skips_timeouts_when_disabled() {
+        let policy = RetryPolicy {
+            retry_timeouts: false,
+            ..policy()
+        };
+        let timeout = ModelError::Timeout {
+            message: "stream idle".to_owned(),
+        };
+        assert_eq!(
+            retry_decision(&policy, &timeout, 0, 0.0),
+            RetryDecision::GiveUp
+        );
+        assert!(matches!(
+            retry_decision(&policy, &transient(None), 0, 0.0),
+            RetryDecision::Retry(_)
+        ));
     }
 
     #[test]

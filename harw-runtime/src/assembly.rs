@@ -3939,10 +3939,18 @@ pub fn model_limits_for(config: &ResolvedConfig, model_id: &str) -> ModelLimits 
         })
     });
     let catalog = builtin_catalog();
-    let catalog_entry = configured
-        .and_then(|model| match_catalog_key(catalog.keys().map(String::as_str), &model.id))
-        .or_else(|| match_catalog_key(catalog.keys().map(String::as_str), model_id))
-        .and_then(|key| catalog.get(key));
+    // Runde 7, Teil L3: Ein lokal betriebenes Modell (vLLM/LM Studio/Ollama)
+    // hat das Fenster, mit dem der Server gestartet wurde — nicht das des
+    // Herstellers. Deshalb für lokale Provider kein Katalog-Präfix-Match.
+    let local = model_runs_locally(config, configured, model_id);
+    let catalog_entry = if local {
+        None
+    } else {
+        configured
+            .and_then(|model| match_catalog_key(catalog.keys().map(String::as_str), &model.id))
+            .or_else(|| match_catalog_key(catalog.keys().map(String::as_str), model_id))
+            .and_then(|key| catalog.get(key))
+    };
 
     let configured_window = configured
         .and_then(|model| model.context_window)
@@ -3954,7 +3962,15 @@ pub fn model_limits_for(config: &ResolvedConfig, model_id: &str) -> ModelLimits 
     let context_window = configured_window
         .or(catalog_window)
         .unwrap_or(UNKNOWN_MODEL_CONTEXT_WINDOW_TOKENS);
-    if !known {
+    if !known && local {
+        tracing::warn!(
+            model = model_id,
+            fallback_tokens = UNKNOWN_MODEL_CONTEXT_WINDOW_TOKENS,
+            "runtime.context_window.unknown_local_model: lokales Modell ohne \
+             [models.<id>].context_window; `harw provider scan` liest das Fenster vom \
+             Server, sonst gilt das konservative Rückfallfenster"
+        );
+    } else if !known {
         tracing::warn!(
             model = model_id,
             fallback_tokens = UNKNOWN_MODEL_CONTEXT_WINDOW_TOKENS,
@@ -3970,6 +3986,28 @@ pub fn model_limits_for(config: &ResolvedConfig, model_id: &str) -> ModelLimits 
             || catalog_entry.is_some_and(|entry| entry.thinking),
         known,
     }
+}
+
+/// Runde 7, Teil L3: `true`, wenn `model_id` über einen lokalen Provider
+/// läuft ([`harw_config::ProviderToml::is_local`]: Ollama, Loopback, LAN mit
+/// `allow_insecure_lan`). Maßgeblich ist der Provider des konfigurierten
+/// Modells; ohne Modelleintrag der Standard-Provider, wenn `model_id` das
+/// Standardmodell ist.
+fn model_runs_locally(
+    config: &ResolvedConfig,
+    configured: Option<&harw_config::ModelToml>,
+    model_id: &str,
+) -> bool {
+    let provider = match configured {
+        Some(model) => Some(model.provider.as_str()),
+        None if config.harness.default_model.as_deref() == Some(model_id) => {
+            config.harness.default_provider.as_deref()
+        }
+        None => None,
+    };
+    provider
+        .and_then(|name| config.providers.get(name))
+        .is_some_and(harw_config::ProviderToml::is_local)
 }
 
 /// Grenzen des Modells `model` oder, ohne Modell, des Rückfallmodells
@@ -5757,6 +5795,39 @@ mod tests {
         assert_eq!(limits.configured_max_output, Some(4_000));
     }
 
+    /// Runde 7, Teil L3: Ein Modell eines lokalen Providers bekommt nie das
+    /// Hersteller-Fenster aus dem Katalog — nur das konfigurierte bzw.
+    /// gescannte Fenster, sonst das Rückfallfenster.
+    #[test]
+    fn local_models_get_no_vendor_catalog_window() {
+        let mut config = two_provider_config();
+        config.models.insert(
+            "haiku-local".to_owned(),
+            model_toml("claude-haiku-4-5", None, None),
+        );
+        let limits = model_limits_for(&config, "haiku-local");
+        assert!(
+            !limits.known,
+            "lokales Modell darf den Katalog nicht treffen"
+        );
+        assert_eq!(limits.context_window, UNKNOWN_MODEL_CONTEXT_WINDOW_TOKENS);
+        assert_eq!(limits.catalog_max_output, None);
+
+        // Das gescannte Fenster gilt.
+        config.models.insert(
+            "haiku-local".to_owned(),
+            model_toml("claude-haiku-4-5", Some(16_384), None),
+        );
+        let limits = model_limits_for(&config, "haiku-local");
+        assert!(limits.known);
+        assert_eq!(limits.context_window, 16_384);
+
+        // Dasselbe Modell ohne lokalen Provider trifft den Katalog weiterhin.
+        let cloud = model_limits_for(&ResolvedConfig::default(), "claude-haiku-4-5");
+        assert!(cloud.known);
+        assert_ne!(cloud.context_window, UNKNOWN_MODEL_CONTEXT_WINDOW_TOKENS);
+    }
+
     #[test]
     fn effective_root_model_follows_the_uia_pair_only_for_uia_roots() -> TestResult {
         let mut config = two_provider_config();
@@ -5847,6 +5918,14 @@ mod tests {
                 originator: None,
                 default_reasoning_effort: None,
                 gateway_identity_headers: false,
+                request_timeout_secs: None,
+                stream_idle_timeout_secs: None,
+                retry_timeouts: None,
+                max_tokens_field: None,
+                send_reasoning_effort: None,
+                strict_tools: None,
+                parallel_tool_calls: None,
+                allow_insecure_lan: false,
             }
         }
 

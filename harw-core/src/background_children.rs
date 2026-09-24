@@ -294,10 +294,28 @@ impl BackgroundStatus {
 pub struct BackgroundProgress {
     /// Werkzeugaufrufe des Kindes und seiner direkten Kinder.
     pub tool_calls: u32,
-    /// Neue Tokens (ungecachte Eingabe plus Ausgabe) des Kindes.
+    /// Neue Tokens (ungecachte Eingabe plus Ausgabe) des Kindes aus
+    /// **abgeschlossenen** Modellrunden.
     pub tokens: u64,
     /// Zuletzt beobachteter Schritt (Werkzeugname oder gestartetes Kind).
     pub last_step: Option<String>,
+    /// Runde 7, Teil A4: neue Tokens der gerade **laufenden** Modellrunde
+    /// (aus `UsageUpdated { final_round: false }`); beim Rundenende in
+    /// [`Self::tokens`] übernommen und auf 0 gesetzt.
+    pub live_round_tokens: u64,
+    /// Runde 7, Teil A4: abgeschlossene Modellrunden des Kindes.
+    pub rounds: u32,
+    /// Runde 7, Teil A4: zuletzt gemeldete Kontextbelegung (Prompt-Tokens)
+    /// des Kindes; `None`, solange keine gemeldet wurde.
+    pub context_tokens: Option<u64>,
+}
+
+impl BackgroundProgress {
+    /// Tokens einschließlich der laufenden Runde (Runde 7, Teil A4).
+    #[must_use]
+    pub fn tokens_with_live(&self) -> u64 {
+        self.tokens.saturating_add(self.live_round_tokens)
+    }
 }
 
 /// Ein Hintergrund-Lauf, wie `/agent bg` und `agent.status` ihn zeigen.
@@ -616,6 +634,17 @@ impl BackgroundChildren {
                     progress.last_step = Some(step);
                 });
             }
+            // Runde 7, Teil A4: Zwischenstand der laufenden Runde live.
+            harw_protocol::TurnEvent::UsageUpdated {
+                round,
+                final_round: false,
+                ..
+            } if prefix.is_none() => {
+                let fresh = round.fresh_tokens();
+                self.record_progress(&target, |progress| {
+                    progress.live_round_tokens = fresh;
+                });
+            }
             harw_protocol::TurnEvent::UsageUpdated {
                 round,
                 final_round: true,
@@ -624,6 +653,14 @@ impl BackgroundChildren {
                 let fresh = round.fresh_tokens();
                 self.record_progress(&target, |progress| {
                     progress.tokens = progress.tokens.saturating_add(fresh);
+                    progress.live_round_tokens = 0;
+                    progress.rounds = progress.rounds.saturating_add(1);
+                });
+            }
+            harw_protocol::TurnEvent::ContextUpdated { used_tokens, .. } if prefix.is_none() => {
+                let used = *used_tokens;
+                self.record_progress(&target, |progress| {
+                    progress.context_tokens = Some(used);
                 });
             }
             harw_protocol::TurnEvent::ChildSpawned { role, .. } => {
@@ -1054,5 +1091,77 @@ mod tests {
                 .run_for(&SessionId::new(), child.as_str())
                 .is_none()
         );
+    }
+
+    // --- Runde 7, Teil A4: Live-Status ------------------------------------
+
+    fn usage_event(child: &SessionId, fresh_output: u64, final_round: bool) -> AgentEvent {
+        let round = harw_types::TokenUsage {
+            output_tokens: fresh_output,
+            ..harw_types::TokenUsage::default()
+        };
+        AgentEvent {
+            agent: child.clone(),
+            parent: None,
+            role: "root-orchestrator".to_owned(),
+            kind: crate::agent_events::AgentEventKind::Turn(
+                harw_protocol::TurnEvent::UsageUpdated {
+                    turn_id: harw_types::TurnId::new(),
+                    round: round.clone(),
+                    turn_total: round,
+                    final_round,
+                },
+            ),
+        }
+    }
+
+    #[test]
+    fn live_round_tokens_are_visible_during_a_round_and_taken_over_at_its_end() -> TestResult {
+        let registry = BackgroundChildren::default();
+        let parent = SessionId::new();
+        let child = SessionId::new();
+        assert!(registry.register(&child, &parent, "root-orchestrator", Some("Analyse")));
+
+        registry.observe_event(&usage_event(&child, 120, false));
+        let run = registry
+            .run_for(&parent, child.as_str())
+            .ok_or(TestError::Missing("laufender Lauf"))?;
+        assert_eq!(run.progress.tokens, 0);
+        assert_eq!(run.progress.live_round_tokens, 120);
+        assert_eq!(
+            run.progress.tokens_with_live(),
+            120,
+            "nicht mehr 0 während der Runde"
+        );
+
+        registry.observe_event(&usage_event(&child, 300, true));
+        let run = registry
+            .run_for(&parent, child.as_str())
+            .ok_or(TestError::Missing("laufender Lauf"))?;
+        assert_eq!(run.progress.tokens, 300);
+        assert_eq!(run.progress.live_round_tokens, 0);
+        assert_eq!(run.progress.rounds, 1);
+
+        registry.observe_event(&AgentEvent {
+            agent: child.clone(),
+            parent: None,
+            role: "root-orchestrator".to_owned(),
+            kind: crate::agent_events::AgentEventKind::Turn(
+                harw_protocol::TurnEvent::ContextUpdated {
+                    turn_id: harw_types::TurnId::new(),
+                    used_tokens: 42_000,
+                    window_tokens: 200_000,
+                    history_items_dropped: 0,
+                    estimated_next_tokens: None,
+                    threshold_tokens: None,
+                    reserve_tokens: None,
+                },
+            ),
+        });
+        let run = registry
+            .run_for(&parent, child.as_str())
+            .ok_or(TestError::Missing("laufender Lauf"))?;
+        assert_eq!(run.progress.context_tokens, Some(42_000));
+        Ok(())
     }
 }

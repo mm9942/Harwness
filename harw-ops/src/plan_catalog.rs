@@ -55,7 +55,8 @@ use harw_plan::goal::{Goal, GoalAction, GoalId, GoalStatus, GoalStore};
 use harw_plan::ids::{PlanId, TaskId};
 use harw_plan::types::{EvidenceKind, EvidenceRef, Plan, PlanNode, PlanNodeStatus};
 use harw_plan::{
-    PlanApproval, PlanStore, current_step, graph, has_blocked_step, plan_progress, progress_bar,
+    PlanApproval, PlanMeta, PlanStore, current_step, graph, has_blocked_step, plan_progress,
+    progress_bar,
 };
 use harw_plan_bridge::OpContextPlanExt;
 use harw_tool_plan::{PlanConfirmChannel, PlanConfirmKind, PlanConfirmOutcome};
@@ -141,14 +142,10 @@ pub(crate) fn switch(
 ) -> Result<String, OpError> {
     let id = parse_plan_id(&require_arg(id, "plan switch <plan-id>")?)?;
     let plan = store.switch_plan(&id, actor).map_err(map_plan_error)?;
-    let approval = store
-        .plan_meta(&id)
-        .map(|meta| meta.approval)
-        .unwrap_or_default();
+    let approval = approval_display(store, &id);
     let (done, total) = plan_progress(&plan);
     Ok(format!(
-        "Aktiver Plan ist jetzt '{id}' ({}) — Ziel: {}\nFortschritt {}",
-        approval.label(),
+        "Aktiver Plan ist jetzt '{id}' ({approval}) — Ziel: {}\nFortschritt {}",
         plan.goal_statement,
         progress_bar(done, total, BAR_WIDTH)
     ))
@@ -180,12 +177,25 @@ pub(crate) fn archive(
 /// Zusatzzeilen für `plan inspect`: Freigabe, Fortschritt, aktueller Schritt.
 #[must_use]
 pub(crate) fn inspect_status_lines(store: &dyn PlanStore, plan: &Plan) -> String {
-    let meta = store.plan_meta(&plan.id).unwrap_or_default();
+    // Runde 7, Teil B1: ein unlesbarer Katalog zeigt „unbekannt“ und wird wie
+    // ein Vorschlag behandelt, nie still als bestätigt.
+    let (meta, approval_label) = match store.plan_meta(&plan.id) {
+        Ok(meta) => (meta, meta.approval.label().to_owned()),
+        Err(error) => {
+            tracing::warn!(plan = %plan.id, %error, "Plan-Katalog nicht lesbar");
+            (
+                PlanMeta {
+                    archived: false,
+                    approval: PlanApproval::Proposed,
+                },
+                format!("unbekannt (Katalog nicht lesbar: {error})"),
+            )
+        }
+    };
     let active = store.current().is_ok_and(|current| current.id == plan.id);
     let (done, total) = plan_progress(plan);
     let mut lines = vec![format!(
-        "Freigabe: {}{}{}",
-        meta.approval.label(),
+        "Freigabe: {approval_label}{}{}",
         if active {
             " · aktiv"
         } else {
@@ -217,6 +227,25 @@ pub(crate) fn inspect_status_lines(store: &dyn PlanStore, plan: &Plan) -> String
         );
     }
     lines.join("\n")
+}
+
+/// Freigabe-Label für Anzeigen; ein Katalogfehler wird „unbekannt“, nie
+/// still „bestätigt“ (Runde 7, Teil B1).
+///
+/// # Arguments
+/// - `store` (`&dyn PlanStore`): Plan-Store mit Katalog.
+/// - `id` (`&PlanId`): der angezeigte Plan.
+///
+/// # Returns
+/// Das Label des Freigabestands oder `unbekannt (…)` mit Fehlertext.
+fn approval_display(store: &dyn PlanStore, id: &PlanId) -> String {
+    match store.plan_meta(id) {
+        Ok(meta) => meta.approval.label().to_owned(),
+        Err(error) => {
+            tracing::warn!(plan = %id, %error, "Plan-Katalog nicht lesbar");
+            format!("unbekannt (Katalog nicht lesbar: {error})")
+        }
+    }
 }
 
 /// Schritt-Status in Nutzersprache.
@@ -416,16 +445,28 @@ fn confirm_and_track(
 ///
 /// # Returns
 /// Eine Zeile für den Bericht; Fehler werden dort gemeldet, nicht geworfen.
+/// Ist das laufende Goal nicht lesbar (anderer Fehler als
+/// [`PlanError::GoalNotFound`]), wird nichts angelegt oder überschrieben.
 pub(crate) fn bind_goal(
     goals: &dyn GoalStore,
     store: &dyn PlanStore,
     plan: &Plan,
     actor: &str,
 ) -> String {
-    let existing = goals
-        .current()
-        .ok()
-        .filter(|goal| !is_terminal(goal.status));
+    // Runde 7, Teil B2: nur „noch kein Goal“ heißt „frei“. Jeder andere
+    // Lesefehler (I/O, Format) bricht die Bindung ab, statt ein bestehendes,
+    // nur gerade unlesbares Goal mit `goal-<plan-id>` zu überschreiben.
+    let existing = match goals.current() {
+        Ok(goal) => Some(goal).filter(|goal| !is_terminal(goal.status)),
+        Err(PlanError::GoalNotFound) => None,
+        Err(error) => {
+            tracing::warn!(plan = %plan.id, %error, "Goal-Store nicht lesbar; keine Goal-Bindung");
+            return format!(
+                "Goal-Bindung übersprungen: das laufende Goal ist nicht lesbar ({error}); es \
+                 wurde nichts überschrieben."
+            );
+        }
+    };
     let fits = |goal: &Goal| {
         goal.plan_id.as_ref().is_none_or(|bound| bound == &plan.id)
             || plan.goal_id.as_deref() == Some(goal.id.as_str())
@@ -563,6 +604,8 @@ fn is_execution(action: &PlanAction) -> bool {
 ///   mit dem gerenderten Plan nach der Änderung; nur „bestätigen“ lässt sie
 ///   durch.
 /// - Befehlsfläche, Vorschlag im Entwurf, ohne TUI → unverändert durch.
+/// - Freigabestand nicht lesbar (Katalogfehler) in der TUI → abgelehnt mit
+///   warn-Log; nie still als „bestätigt“ behandelt (Runde 7, Teil B1).
 ///
 /// # Errors
 /// [`OpError::Execution`] bei Turn-Abbruch während der Rückfrage.
@@ -583,10 +626,25 @@ pub(crate) async fn gate_change(
         // Kein aktiver Plan: der Store meldet das gleich selbst.
         return Ok(ChangeGate::Proceed);
     };
-    let approval = store
-        .plan_meta(&plan.id)
-        .map(|meta| meta.approval)
-        .unwrap_or_default();
+    // Runde 7, Teil B1: fail-closed. Ist der Freigabestand nicht lesbar,
+    // bleibt das Gate zu — früher machte `unwrap_or_default` daraus
+    // „bestätigt“ und ließ jede Mutation ungefragt durch.
+    let approval = match store.plan_meta(&plan.id) {
+        Ok(meta) => meta.approval,
+        Err(error) => {
+            tracing::warn!(
+                plan = %plan.id,
+                %error,
+                "Freigabestand des Plans nicht lesbar; Änderung wird nicht übernommen"
+            );
+            return Ok(ChangeGate::Refused(format!(
+                "Änderung an Plan '{}' NICHT übernommen ({label}): der Freigabestand ist nicht \
+                 lesbar ({error}). Ohne gesicherten Stand bleibt die Freigabe geschlossen; \
+                 melde das der Nutzerin.",
+                plan.id
+            )));
+        }
+    };
     if approval == PlanApproval::Proposed {
         if is_execution(action) {
             return Ok(ChangeGate::Refused(format!(
@@ -976,4 +1034,188 @@ pub(crate) fn goal_progress_line(ctx: &OpContext, goal: &Goal) -> Option<String>
         plan.id,
         progress_bar(done, total, BAR_WIDTH)
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    //! Runde 7, Teil B1/B2: Katalog- und Goal-Fehler machen nichts auf und
+    //! überschreiben nichts.
+
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use harw_operations::context::ServiceMap;
+    use harw_plan::actions::{PlanAction, PlanEvent};
+    use harw_plan::error::{PlanError, PlanResult};
+    use harw_plan::goal::{Goal, GoalAction, GoalEvent, GoalStore};
+    use harw_plan::ids::{PlanId, RevisionId, TaskId};
+    use harw_plan::types::{Plan, PlanNodeStatus};
+    use harw_plan::{InMemoryGoalStore, InMemoryPlanStore, PlanMeta, PlanRevision, PlanStore};
+
+    use super::{ChangeGate, bind_goal, gate_change, inspect_status_lines};
+    use crate::knowledge_test_support::op_context;
+    use crate::plan::CallSurface;
+    use crate::test_support::{TestError, TestResult, ctx};
+
+    /// Plan-Store, dessen Katalog (`plan_meta`) immer mit I/O-Fehler scheitert.
+    struct BrokenCatalog {
+        inner: InMemoryPlanStore,
+    }
+
+    fn io_error() -> PlanError {
+        PlanError::Io(std::io::Error::other("Index kaputt"))
+    }
+
+    impl PlanStore for BrokenCatalog {
+        fn current(&self) -> PlanResult<Plan> {
+            self.inner.current()
+        }
+        fn revision(&self) -> RevisionId {
+            self.inner.revision()
+        }
+        fn apply(&self, action: PlanAction, actor: &str) -> PlanResult<PlanEvent> {
+            self.inner.apply(action, actor)
+        }
+        fn history(&self, since: Option<RevisionId>) -> PlanResult<Vec<PlanEvent>> {
+            self.inner.history(since)
+        }
+        fn apply_batch(
+            &self,
+            plan: &PlanId,
+            actions: Vec<PlanAction>,
+            actor: &str,
+            expected_rev: RevisionId,
+        ) -> PlanResult<PlanRevision> {
+            self.inner.apply_batch(plan, actions, actor, expected_rev)
+        }
+        fn plan_by_id(&self, id: &PlanId) -> PlanResult<Plan> {
+            self.inner.plan_by_id(id)
+        }
+        fn plan_meta(&self, _id: &PlanId) -> PlanResult<PlanMeta> {
+            Err(io_error())
+        }
+    }
+
+    /// Goal-Store, dessen `current` mit I/O-Fehler scheitert; zählt `apply`.
+    #[derive(Default)]
+    struct BrokenGoals {
+        applies: AtomicUsize,
+    }
+
+    impl GoalStore for BrokenGoals {
+        fn current(&self) -> PlanResult<Goal> {
+            Err(io_error())
+        }
+        fn revision(&self) -> u64 {
+            0
+        }
+        fn apply(&self, _action: GoalAction, _actor: &str) -> PlanResult<GoalEvent> {
+            self.applies.fetch_add(1, Ordering::Relaxed);
+            Err(io_error())
+        }
+        fn history(&self, _since: Option<u64>) -> PlanResult<Vec<GoalEvent>> {
+            Ok(Vec::new())
+        }
+    }
+
+    fn store_with_plan(id: &str) -> TestResult<InMemoryPlanStore> {
+        let store = InMemoryPlanStore::new();
+        store
+            .apply(
+                PlanAction::Create {
+                    plan_id: PlanId::new(id),
+                    goal: "Ziel".to_owned(),
+                },
+                "test",
+            )
+            .map_err(ctx("Plan anlegen"))?;
+        Ok(store)
+    }
+
+    fn tui_context() -> TestResult<(harw_operations::OpContext, harw_tool_plan::PlanUiReceiver)> {
+        let (sender, receiver) = harw_tool_plan::plan_ui_channel();
+        let mut services = ServiceMap::new();
+        services.insert(harw_tool_plan::PlanConfirmChannel::new(sender));
+        Ok((op_context(services)?, receiver))
+    }
+
+    /// Unlesbarer Freigabestand: wesentliche Änderung und Umsetzung werden
+    /// abgelehnt, ohne Rückfrage und ohne Durchwinken.
+    #[tokio::test]
+    async fn gate_change_is_fail_closed_when_the_catalog_is_unreadable() -> TestResult {
+        let store = BrokenCatalog {
+            inner: store_with_plan("p-kaputt")?,
+        };
+        let (op, mut receiver) = tui_context()?;
+        let add = PlanAction::AddNode {
+            node: harw_plan::testing::base_node("t-neu"),
+        };
+        let start = PlanAction::SetStatus {
+            id: TaskId::new("t-neu"),
+            status: PlanNodeStatus::InProgress,
+            reason: None,
+        };
+        for action in [add, start] {
+            match gate_change(&op, &store, CallSurface::Model, &action, "Änderung")
+                .await
+                .map_err(ctx("gate_change"))?
+            {
+                ChangeGate::Refused(text) => {
+                    assert!(text.contains("nicht lesbar"), "{text}");
+                    assert!(text.contains("NICHT übernommen"), "{text}");
+                }
+                ChangeGate::Proceed => {
+                    return Err(TestError::Unexpected(format!("fail-open bei {action:?}")));
+                }
+            }
+        }
+        assert!(receiver.try_recv().is_err(), "keine Rückfrage bei Fehler");
+        Ok(())
+    }
+
+    /// Die Anzeige nennt einen unlesbaren Stand „unbekannt“, nie „bestätigt“.
+    #[test]
+    fn inspect_shows_unknown_approval_on_catalog_error() -> TestResult {
+        let store = BrokenCatalog {
+            inner: store_with_plan("p-anzeige")?,
+        };
+        let plan = store.current().map_err(ctx("current"))?;
+        let lines = inspect_status_lines(&store, &plan);
+        assert!(lines.contains("Freigabe: unbekannt"), "{lines}");
+        assert!(!lines.contains("bestätigt ·"), "{lines}");
+        assert!(lines.contains("Vorschlag"), "{lines}");
+        Ok(())
+    }
+
+    /// I/O-Fehler beim Lesen des Goals: Fehlerzeile, kein Überschreiben.
+    #[test]
+    fn bind_goal_reports_io_errors_instead_of_overwriting() -> TestResult {
+        let store = store_with_plan("p-goal")?;
+        let plan = store.current().map_err(ctx("current"))?;
+        let goals = BrokenGoals::default();
+        let line = bind_goal(&goals, &store, &plan, "test");
+        assert!(line.contains("nicht lesbar"), "{line}");
+        assert!(line.contains("nichts überschrieben"), "{line}");
+        assert_eq!(
+            goals.applies.load(Ordering::Relaxed),
+            0,
+            "kein Set/SetStatus"
+        );
+        let plan = store.current().map_err(ctx("current nach bind"))?;
+        assert_eq!(plan.goal_id, None, "der Plan bleibt ungebunden");
+        Ok(())
+    }
+
+    /// Ohne Goal (`GoalNotFound`) entsteht wie bisher `goal-<plan-id>`.
+    #[test]
+    fn bind_goal_creates_a_goal_when_none_exists() -> TestResult {
+        let store = store_with_plan("p-neu")?;
+        let plan = store.current().map_err(ctx("current"))?;
+        let goals: Arc<dyn GoalStore> = Arc::new(InMemoryGoalStore::new());
+        let line = bind_goal(goals.as_ref(), &store, &plan, "test");
+        assert!(line.contains("neues Goal 'goal-p-neu'"), "{line}");
+        let goal = goals.current().map_err(ctx("goal"))?;
+        assert_eq!(goal.id.as_str(), "goal-p-neu");
+        Ok(())
+    }
 }

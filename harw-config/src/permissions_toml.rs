@@ -22,6 +22,12 @@ const MIN_TIMEOUT_SECS: u64 = 10;
 /// Obere Grenze für [`PermissionsSection::approval_timeout_secs`] (24 h).
 const MAX_TIMEOUT_SECS: u64 = 86_400;
 
+/// Untergrenze für `auto_classifier_timeout_secs` (Runde 7, Teil L4).
+pub const MIN_CLASSIFIER_TIMEOUT_SECS: u64 = 1;
+
+/// Obergrenze für `auto_classifier_timeout_secs` (Runde 7, Teil L4).
+pub const MAX_CLASSIFIER_TIMEOUT_SECS: u64 = 600;
+
 /// Höchstzahl zusätzlicher Arbeitswurzeln (`extra_roots`), analog zur
 /// Grenze aus `harw-sandbox` (Contract §5 Zeile A8).
 const MAX_EXTRA_ROOTS: usize = 8;
@@ -47,6 +53,12 @@ pub struct PermissionsSection {
     /// abgelehnt wird. `None` bedeutet „von dieser Ebene nicht gesetzt“.
     #[serde(default)]
     pub approval_timeout_secs: Option<u64>,
+    /// Runde 7, Teil L4: Zeitlimit (Sekunden) je Aufruf des
+    /// Auto-Modus-Klassifizierers. `None`: 10 s, bzw. 60 s, wenn das
+    /// Klassifizierer-Modell über einen lokalen Provider läuft. Erlaubt
+    /// `1..=600`; ein Überschreiten ergibt immer `ask`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auto_classifier_timeout_secs: Option<u64>,
     /// Regeln, die eine Anfrage ohne Rückfrage erlauben.
     #[serde(default)]
     pub allow: Vec<RuleToml>,
@@ -98,6 +110,7 @@ impl PermissionsSection {
     /// Liefert `Err(String)` mit einer menschenlesbaren Begründung, wenn:
     /// - `default_mode` gesetzt, aber keiner von `ask`/`auto`/`full` ist;
     /// - `approval_timeout_secs` gesetzt, aber außerhalb `10..=86400` liegt;
+    /// - `auto_classifier_timeout_secs` gesetzt, aber außerhalb `1..=600` liegt;
     /// - eine `allow`- oder `deny`-Regel ein leeres `tool` hat;
     /// - `extra_roots` mehr als 8 Einträge hat, oder ein Eintrag relativ ist.
     pub fn validate(&self) -> Result<(), String> {
@@ -114,6 +127,14 @@ impl PermissionsSection {
                     "permissions.approval_timeout_secs muss zwischen {MIN_TIMEOUT_SECS} und {MAX_TIMEOUT_SECS} liegen, war {secs}"
                 ));
             }
+        }
+        if let Some(secs) = self.auto_classifier_timeout_secs
+            && !(MIN_CLASSIFIER_TIMEOUT_SECS..=MAX_CLASSIFIER_TIMEOUT_SECS).contains(&secs)
+        {
+            return Err(format!(
+                "permissions.auto_classifier_timeout_secs muss zwischen \
+                 {MIN_CLASSIFIER_TIMEOUT_SECS} und {MAX_CLASSIFIER_TIMEOUT_SECS} liegen, war {secs}"
+            ));
         }
         for rule in self.allow.iter().chain(self.deny.iter()) {
             rule.validate()?;
@@ -319,5 +340,16 @@ mod tests {
             defualt_mode = "auto"
         "#;
         assert!(toml::from_str::<PermissionsSection>(src).is_err());
+    }
+
+    #[test]
+    fn test_validate_checks_the_classifier_timeout_bounds() {
+        for (secs, ok) in [(0, false), (1, true), (600, true), (601, false)] {
+            let section = PermissionsSection {
+                auto_classifier_timeout_secs: Some(secs),
+                ..PermissionsSection::default()
+            };
+            assert_eq!(section.validate().is_ok(), ok, "{secs}");
+        }
     }
 }

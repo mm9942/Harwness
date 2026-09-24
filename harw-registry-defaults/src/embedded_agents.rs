@@ -1328,6 +1328,38 @@ const UIA_WORKER_KNOWLEDGE: &str = include_str!("../knowledge/roles/uia-worker.m
 /// Root-gestarteten Lauf als Vorschlag statt als sofortiger Commit.
 const AGENT_STEWARD_KNOWLEDGE: &str = include_str!("../knowledge/roles/agent-steward.md");
 
+/// Rollenregeln des Game Masters (`knowledge/roles/matrix-game-master.md`,
+/// Runde 7 Teil M). Anders als die Texte oben hängt er nicht an einer
+/// Organisationsrolle, sondern am Rollennamen: der Game Master ist
+/// organisatorisch ein Root-Orchestrator, braucht aber eigene Regeln.
+const MATRIX_GAME_MASTER_KNOWLEDGE: &str = include_str!("../knowledge/roles/matrix-game-master.md");
+
+/// Liefert die rollenspezifischen Regeln einer eingebauten Rolle, die über
+/// das Regelwerk ihrer Organisationsrolle hinausgehen (Runde 7, Teil M).
+///
+/// # Beschreibung
+/// Die Kind-Registry-Fabrik (`harw-runtime/src/children.rs`) stellt den Text
+/// als erstes Kontextfragment vor die Skill-Fragmente der Rolle.
+///
+/// # Argumente
+/// - `role` (`&str`): Rollenname.
+///
+/// # Rückgabe
+/// `Some(text)` für [`role_names::MATRIX_GAME_MASTER`], sonst `None`.
+///
+/// # Beispiele
+/// ```rust
+/// use harw_registry_defaults::embedded_agents::builtin_role_prompt;
+/// use harw_registry_defaults::profile::role_names;
+///
+/// assert!(builtin_role_prompt(role_names::MATRIX_GAME_MASTER).is_some());
+/// assert!(builtin_role_prompt(role_names::EXPLORER).is_none());
+/// ```
+#[must_use]
+pub fn builtin_role_prompt(role: &str) -> Option<&'static str> {
+    (role == role_names::MATRIX_GAME_MASTER).then_some(MATRIX_GAME_MASTER_KNOWLEDGE)
+}
+
 /// Organisationswissen (Addendum K): Hierarchie, Zuständigkeiten, Delegation.
 const ORGANIZATION_KNOWLEDGE: &str =
     include_str!("../knowledge/organization/agent-organization.md");
@@ -2358,7 +2390,7 @@ mod tests {
     /// Rolle → gebundenes Kontextprogramm (Dateistamm unter
     /// `agents/context-programs/`). Eine eigene `reviewer`-Rolle gibt es
     /// nicht; `analyst` trägt `review`.
-    const EXPECTED_CONTEXT_PROGRAM_BINDINGS: [(&str, &str); 14] = [
+    const EXPECTED_CONTEXT_PROGRAM_BINDINGS: [(&str, &str); 15] = [
         (role_names::EXPLORER, "explore"),
         (role_names::PLANNER, "plan"),
         (role_names::EXECUTOR, "implement"),
@@ -2371,6 +2403,8 @@ mod tests {
         (role_names::CODING_ORCHESTRATOR, "orchestrate"),
         (role_names::RESEARCH_ORCHESTRATOR, "orchestrate"),
         (role_names::ANALYSIS_ORCHESTRATOR, "orchestrate"),
+        // Runde 7, Teil M: der Game Master ist ein Orchestrator.
+        (role_names::MATRIX_GAME_MASTER, "orchestrate"),
         (role_names::RESEARCHER_DEPS, "research-deps"),
         (role_names::RESEARCHER_WEB, "research-web"),
     ];
@@ -3472,6 +3506,30 @@ mod tests {
     /// Dokumente sind Prompt-Präfixe, die bei jedem Lauf der jeweiligen Rolle
     /// mitgesendet werden — ein Budget hält sie knapp, statt unbegrenzt zu
     /// wachsen.
+    /// Runde 7, Teil M: der Game Master bekommt eigene Rollenregeln (am
+    /// Namen, nicht an der Organisationsrolle), knapp und mit seinen
+    /// Werkzeugen und Grenzen.
+    #[test]
+    fn test_game_master_role_prompt_names_its_tools_and_limits() {
+        let text = builtin_role_prompt(role_names::MATRIX_GAME_MASTER).unwrap_or_default();
+        for needle in [
+            "matrix.draft_scenario",
+            "matrix.run",
+            "matrix.finish",
+            "parent.message",
+            "höchstens drei Kernfragen",
+            "würfelst nie",
+        ] {
+            assert!(text.contains(needle), "fehlt: {needle}");
+        }
+        assert!(
+            text.len() <= 6000,
+            "matrix-game-master.md: {} Bytes",
+            text.len()
+        );
+        assert!(builtin_role_prompt(role_names::ROOT_ORCHESTRATOR).is_none());
+    }
+
     #[test]
     fn test_knowledge_documents_stay_within_their_byte_budget() {
         assert!(
@@ -3499,9 +3557,12 @@ mod tests {
         // Nutzeroberfläche ist.
         // Runde 5, Teil P: +„Pläne“ (Vorschlag → submit → Schritte mit
         // Beleg) und die Zuschnittsregel uia-worker/uia-writer/Root.
+        // Runde 7, Teil T8: +„LaTeX-Aufträge“ (Angaben im Auftrag an den
+        // Writer, Endkontrolle über Build-Bericht und PDF), ca. +400 Bytes.
         assert!(
-            UIA_KNOWLEDGE.len() <= 3100,
-            "roles/uia.md: {} Bytes > 3100",
+            // Runde 7, Teil M: +Absatz „Matrix-Games“ (Game Master).
+            UIA_KNOWLEDGE.len() <= 4000,
+            "roles/uia.md: {} Bytes > 4000",
             UIA_KNOWLEDGE.len()
         );
         // Runde 5, Teil P: Umfangsregel der `uia-worker`-Rollen.
@@ -3562,6 +3623,27 @@ mod tests {
             "`plan submit`",
             "`plan step <id> done <beleg>`",
             "anhand\ndes Plans berichten",
+        ] {
+            assert!(text.contains(phrase), "uia.md: fehlt „{phrase}“");
+        }
+    }
+
+    /// Runde 7, Teil T8: Aufträge an den LaTeX-Writer tragen Dokumenttyp,
+    /// Datum, Autorin und Sprache; Farben/Schriften nur auf Wunsch; die
+    /// Endkontrolle prüft Build-Bericht und PDF, nicht nur die `.tex`.
+    #[test]
+    fn test_uia_knowledge_briefs_the_latex_writer_and_checks_the_pdf() {
+        let text = UIA_KNOWLEDGE;
+        for phrase in [
+            "## LaTeX-Aufträge",
+            "`uia-latex-writer`",
+            "`bericht`/`business-paper`/`handbuch`",
+            "Datum, Autorin und Sprache",
+            "Farben/Schriften nur auf Wunsch",
+            "Vorgaben der Vorlage",
+            "Erst die `.md`, dann `.tex`/`.pdf`",
+            "`overfull`",
+            "nicht nur die `.tex`",
         ] {
             assert!(text.contains(phrase), "uia.md: fehlt „{phrase}“");
         }

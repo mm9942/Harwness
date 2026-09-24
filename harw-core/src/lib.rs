@@ -80,7 +80,7 @@ pub use child_controller::{
     ChildRegistryFactory, ChildRunError, ChildRunResult, ChildSessionObservers, ChildUsage,
     ContextWindowResolver, DEFAULT_CHILD_CONTEXT_WINDOW, ExpiredChild, FanoutRequest,
     JoinSemantics, ManagedAgentSpawner, ModelKnownProbe, OrchestrationObserver, ParentGrant,
-    RoleEffortWeights, TaskComplexity,
+    RoleEffortWeights, TRANSFER_BUDGET_NOTE, TaskComplexity,
 };
 pub use compaction::{
     CompactionObserver, CompactionOutcome, CompactionPlan, SUMMARY_MARKER, compact_session,

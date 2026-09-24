@@ -1578,6 +1578,14 @@ fn two_provider_config() -> harw_config::ResolvedConfig {
             originator: None,
             default_reasoning_effort: None,
             gateway_identity_headers: false,
+            request_timeout_secs: None,
+            stream_idle_timeout_secs: None,
+            retry_timeouts: None,
+            max_tokens_field: None,
+            send_reasoning_effort: None,
+            strict_tools: None,
+            parallel_tool_calls: None,
+            allow_insecure_lan: false,
         }
     }
 
@@ -1596,6 +1604,27 @@ fn two_provider_config() -> harw_config::ResolvedConfig {
         .providers
         .insert("local-b".to_owned(), loopback_provider("local-b"));
     config
+}
+
+/// Ein Config-Layer mit allen mitgelieferten Skills
+/// (`harw_home::bundled_files`, Präfix `skills/`) samt der daraus entdeckten
+/// Konfiguration — dieselben Dateien, die `harw init` nach `~/.harw/skills`
+/// schreibt (Runde 7, Teil T5).
+fn bundled_skill_layer() -> TestResult<(TempDir, harw_config::ResolvedConfig)> {
+    let layer = TempDir::new().map_err(ctx("Skill-Layer"))?;
+    for file in harw_home::bundled_files()
+        .iter()
+        .filter(|file| file.relative_path.starts_with("skills/"))
+    {
+        let target = file.target_in(layer.path());
+        if let Some(parent) = target.parent() {
+            std::fs::create_dir_all(parent).map_err(ctx("Skill-Verzeichnis"))?;
+        }
+        std::fs::write(&target, file.contents).map_err(ctx("Skill-Datei"))?;
+    }
+    let config = harw_config::discover_config(&[layer.path().to_path_buf()])
+        .map_err(ctx("Skills entdecken"))?;
+    Ok((layer, config))
 }
 
 /// Ende-zu-Ende-Beleg für Welle 3a, Teil A: die gesamte
@@ -1684,6 +1713,13 @@ async fn uia_worker_and_its_siblings_use_the_uia_provider_not_the_default_provid
         ),
     )
     .map_err(ctx("Fabrik"))?;
+    // Runde 7, Teil T5: `uia-latex-writer` verlangt die Skills seiner
+    // Definition und startet ohne Skill-Katalog fail-closed nicht — die
+    // Fabrik bekommt deshalb wie im echten Lauf die mitgelieferten Skills.
+    let (skill_layer, skill_config) = bundled_skill_layer()?;
+    let factory = factory
+        .with_skill_catalog(&skill_config, vec![skill_layer.path().to_path_buf()])
+        .map_err(ctx("Skill-Katalog"))?;
 
     for role in [
         role_names::UIA_WORKER,

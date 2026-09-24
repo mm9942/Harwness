@@ -256,9 +256,11 @@ pub async fn list_models(
         }
     };
 
-    let client = crate::http_client().map_err(|error| DiscoveryError::Network {
-        detail: error.to_string(),
-    })?;
+    // Runde 7, Teil L8: Loopback-Endpunkte ohne Proxy ansprechen.
+    let client =
+        crate::http_client_for_endpoint(base).map_err(|error| DiscoveryError::Network {
+            detail: error.to_string(),
+        })?;
 
     if provider.api == "anthropic-messages" {
         // `codex_route` ist für diese `api` immer `None` (siehe
@@ -325,7 +327,53 @@ pub async fn list_models(
         }
         return Ok(models);
     }
-    Ok(parse_models_response(&body))
+    let mut models = parse_models_response(&body);
+    // Runde 7, Teil L3: LM Studio meldet das Kontextfenster nur über seine
+    // eigene REST-API (`GET /api/v0/models`). Best effort für lokale
+    // OpenAI-kompatible Provider, deren `/models` kein Fenster nennt.
+    if provider.is_local()
+        && provider.api == "openai-chat"
+        && models.iter().any(|model| model.context_length.is_none())
+    {
+        merge_lmstudio_context_lengths(&client, base, api_key, &mut models).await;
+    }
+    Ok(models)
+}
+
+/// Runde 7, Teil L3: Ergänzt fehlende Kontextfenster aus LM Studios
+/// `GET {origin}/api/v0/models` (`loaded_context_length`, sonst
+/// `max_context_length`). Jeder Fehler (anderer Server, 404, kein JSON)
+/// wird still ignoriert — das ist nur eine Ergänzung.
+async fn merge_lmstudio_context_lengths(
+    client: &reqwest::Client,
+    base: &str,
+    api_key: Option<&str>,
+    models: &mut [DiscoveredModel],
+) {
+    let origin = base.trim_end_matches('/').trim_end_matches("/v1");
+    let url = format!("{origin}/api/v0/models");
+    let mut request = client.get(&url).timeout(DISCOVERY_TIMEOUT);
+    if let Some(key) = api_key {
+        request = request.bearer_auth(key);
+    }
+    let Ok(response) = request.send().await else {
+        return;
+    };
+    if !response.status().is_success() {
+        return;
+    }
+    let Ok(body) = response.json::<Value>().await else {
+        return;
+    };
+    let extra = parse_models_response(&body);
+    for model in models
+        .iter_mut()
+        .filter(|model| model.context_length.is_none())
+    {
+        if let Some(found) = extra.iter().find(|candidate| candidate.id == model.id) {
+            model.context_length = found.context_length;
+        }
+    }
 }
 
 /// Fragt `GET {base_url}` (bereits auf `/v1/models` aufgelöst) mit Anthropic-
@@ -503,7 +551,18 @@ fn parse_models_response(body: &Value) -> Vec<DiscoveredModel> {
 /// Parst ein einzelnes Modell-Objekt aus einer `/models`-Antwort.
 fn parse_one_model(entry: &Value) -> Option<DiscoveredModel> {
     let id = entry.get("id")?.as_str()?.to_owned();
-    let context_length = entry.get("context_length").and_then(Value::as_u64);
+    // Runde 7, Teil L3: OpenRouter `context_length`, vLLM `max_model_len`,
+    // LM Studio (`/api/v0/models`) `loaded_context_length` bzw.
+    // `max_context_length` — das tatsächlich geladene Fenster zuerst.
+    let context_length = [
+        "context_length",
+        "max_model_len",
+        "loaded_context_length",
+        "max_context_length",
+    ]
+    .iter()
+    .find_map(|key| entry.get(*key).and_then(Value::as_u64))
+    .filter(|length| *length > 0);
     let (input_price_per_mtok, output_price_per_mtok) = entry
         .get("pricing")
         .map(|pricing| {
@@ -600,6 +659,23 @@ mod tests {
         assert_eq!(models.len(), 1);
         assert_eq!(models[0].id, "claude-sonnet-4-6");
         assert_eq!(models[0].supports_tools, None);
+    }
+
+    /// Runde 7, Teil L3: vLLM meldet `max_model_len`, LM Studio
+    /// `max_context_length`/`loaded_context_length`.
+    #[test]
+    fn test_parse_models_response_reads_local_context_fields() {
+        let body = json!({"data": [
+            {"id": "Qwen/Qwen3-32B", "object": "model", "max_model_len": 40_960},
+            {"id": "qwen3-8b", "type": "llm", "max_context_length": 131_072},
+            {"id": "gemma", "max_context_length": 131_072, "loaded_context_length": 8_192},
+            {"id": "zero", "max_model_len": 0},
+        ]});
+        let models = parse_models_response(&body);
+        assert_eq!(models[0].context_length, Some(40_960));
+        assert_eq!(models[1].context_length, Some(131_072));
+        assert_eq!(models[2].context_length, Some(8_192));
+        assert_eq!(models[3].context_length, None);
     }
 
     #[test]

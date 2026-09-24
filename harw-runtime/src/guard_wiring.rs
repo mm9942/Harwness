@@ -77,8 +77,11 @@ impl DriftObserver for DriftTracer {
 /// Lädt [`FactStore::list`] **einmal**, gecacht in einem `OnceLock` (Doku
 /// F-RT-Brief: "Pitfall-Fakten … einmal laden, gecacht"), gefiltert auf
 /// [`FactType::Pitfall`]. [`Self::advise`] meldet einen Treffer, wenn ein
-/// Pitfall-Fakt `tool_name` **und** mindestens einen Argument-Schlüssel oder
-/// -Wert in seinem Text (Beschreibung + Body, kleingeschrieben) enthält.
+/// Pitfall-Fakt genau `tool_name` als sein Werkzeug speichert (Präfix
+/// `"<tool>: …"` der Beschreibung oder Schlagwort), mindestens
+/// [`MIN_PITFALL_CONFIDENCE`] Konfidenz hat **und** mindestens einen
+/// Argument-Schlüssel oder -Wert in seinem Text (Beschreibung + Body,
+/// kleingeschrieben) enthält (Runde 7, Teil B5).
 pub struct MemoryPitfallAdvisor {
     /// Die Projekt-Fakten-Wurzel, aus der Pitfall-Fakten geladen werden.
     store: Arc<FactStore>,
@@ -133,18 +136,70 @@ impl PitfallAdvisor for MemoryPitfallAdvisor {
     /// `Some(hint)` mit einem auf höchstens 300 Bytes gekürzten Hinweistext
     /// beim ersten Treffer; sonst `None`.
     fn advise(&self, tool_name: &str, arguments: &serde_json::Value) -> Option<String> {
-        let tool_needle = tool_name.to_ascii_lowercase();
-        for fact in self.pitfalls() {
-            let haystack = format!("{} {}", fact.description, fact.body).to_ascii_lowercase();
-            if !haystack.contains(&tool_needle) {
-                continue;
-            }
-            if argument_matches(&haystack, arguments) {
-                return Some(truncate_hint(&fact.description));
-            }
-        }
-        None
+        self.pitfalls()
+            .iter()
+            .find(|fact| pitfall_applies(fact, tool_name, arguments))
+            .map(|fact| truncate_hint(&fact.description))
     }
+}
+
+/// Mindest-Konfidenz, ab der ein Pitfall-Fakt als Wächter-Hinweis taugt
+/// (Runde 7, Teil B5). Schwächere Fakten bleiben im Gedächtnis, stören aber
+/// keine Werkzeugaufrufe.
+pub const MIN_PITFALL_CONFIDENCE: f32 = 0.5;
+
+/// Prüft, ob ein Pitfall-Fakt auf genau diesen Aufruf passt (Runde 7, Teil B5).
+///
+/// # Beschreibung
+/// - Konfidenz mindestens [`MIN_PITFALL_CONFIDENCE`].
+/// - Das **gespeicherte** Werkzeug des Fakts ist exakt `tool_name`
+///   ([`pitfall_names_tool`]); ein bloßes Vorkommen des Namens irgendwo im
+///   Text genügt nicht mehr (früher trafen so `fs.read`-Fallen auch
+///   `fs.read_many` oder Fallen fremder Werkzeuge, die es nur erwähnten).
+/// - Mindestens ein Argument-Schlüssel oder -Wert kommt im Text vor.
+///
+/// # Arguments
+/// - `fact` (`&Fact`): ein `pitfall`-Fakt.
+/// - `tool_name` (`&str`): der bevorstehende Aufruf.
+/// - `arguments` (`&serde_json::Value`): dessen Argumente.
+///
+/// # Returns
+/// `true`, wenn der Hinweis an diesen Aufruf gehört.
+fn pitfall_applies(fact: &Fact, tool_name: &str, arguments: &serde_json::Value) -> bool {
+    // NaN zählt als „zu schwach“.
+    if fact.confidence.is_nan()
+        || fact.confidence < MIN_PITFALL_CONFIDENCE
+        || !pitfall_names_tool(fact, tool_name)
+    {
+        return false;
+    }
+    let haystack = format!("{} {}", fact.description, fact.body).to_ascii_lowercase();
+    argument_matches(&haystack, arguments)
+}
+
+/// `true`, wenn der Fakt `tool_name` als sein Werkzeug speichert.
+///
+/// # Beschreibung
+/// Ein Pitfall nennt sein Werkzeug auf zwei Wegen (beide exakt, ohne
+/// Beachtung der Groß-/Kleinschreibung):
+/// - als Präfix der Beschreibung: `"<tool>: …"` (der Teil vor dem ersten
+///   `:` ohne Leerraum), und/oder
+/// - als Schlagwort in `tags`.
+fn pitfall_names_tool(fact: &Fact, tool_name: &str) -> bool {
+    let tool = tool_name.trim();
+    if tool.is_empty() {
+        return false;
+    }
+    let prefix_matches = fact
+        .description
+        .split_once(':')
+        .map(|(head, _)| head.trim())
+        .is_some_and(|head| !head.contains(char::is_whitespace) && head.eq_ignore_ascii_case(tool));
+    prefix_matches
+        || fact
+            .tags
+            .iter()
+            .any(|tag| tag.trim().eq_ignore_ascii_case(tool))
 }
 
 /// Prüft, ob mindestens ein Argument-Schlüssel oder -Wert in `haystack`
@@ -206,6 +261,13 @@ pub fn guard_policy_from_config(config: &ResolvedConfig) -> GuardPolicy {
             .no_progress_rounds_abort
             .unwrap_or(default.no_progress_rounds_abort),
         plan_stale_rounds: toml.plan_stale_rounds.unwrap_or(default.plan_stale_rounds),
+        // Runde 7, Teil A2.
+        orchestrator_read_warn: toml
+            .orchestrator_read_warn
+            .unwrap_or(default.orchestrator_read_warn),
+        orchestrator_read_limit: toml
+            .orchestrator_read_limit
+            .unwrap_or(default.orchestrator_read_limit),
     }
 }
 
@@ -491,5 +553,103 @@ mod resolve_default_reasoning_effort_tests {
     fn test_all_none_yields_none() {
         let result = resolve_default_reasoning_effort(None, None, None, None);
         assert_eq!(result, None);
+    }
+}
+
+#[cfg(test)]
+mod pitfall_advisor_tests {
+    //! Runde 7, Teil B5: Pitfall-Hinweise nur für das gespeicherte Werkzeug,
+    //! mit Mindest-Konfidenz.
+    use std::sync::Arc;
+
+    use harw_core::PitfallAdvisor;
+    use harw_memory::{FactScope, FactStore};
+    use serde_json::json;
+
+    use super::MemoryPitfallAdvisor;
+    use crate::test_support::{TestResult, ctx};
+
+    /// Schreibt einen Pitfall-Fakt im Frontmatter-Format von `FactStore`.
+    fn write_pitfall(
+        root: &std::path::Path,
+        name: &str,
+        description: &str,
+        tags: &str,
+        confidence: f32,
+    ) -> TestResult {
+        let text = format!(
+            "---\nname: {name}\ndescription: \"{description}\"\ntype: pitfall\nscope: project\n\
+             created: 2026-01-01T00:00:00Z\nupdated: 2026-01-01T00:00:00Z\n\
+             confidence: {confidence:.2}\nsources: []\ntags: [{tags}]\n---\n\nCargo.lock nie \
+             von Hand ändern.\n"
+        );
+        std::fs::write(root.join("facts").join(format!("{name}.md")), text)?;
+        Ok(())
+    }
+
+    fn advisor_with(
+        facts: &[(&str, &str, &str, f32)],
+    ) -> TestResult<(MemoryPitfallAdvisor, tempfile::TempDir)> {
+        let dir = tempfile::tempdir()?;
+        let store = FactStore::open(dir.path(), FactScope::Project).map_err(ctx("FactStore"))?;
+        for (name, description, tags, confidence) in facts {
+            write_pitfall(dir.path(), name, description, tags, *confidence)?;
+        }
+        Ok((MemoryPitfallAdvisor::new(Arc::new(store)), dir))
+    }
+
+    #[test]
+    fn pitfall_hint_only_for_the_exact_stored_tool() -> TestResult {
+        let (advisor, _dir) = advisor_with(&[(
+            "fs-write-lock",
+            "fs.write: Cargo.lock nicht überschreiben",
+            "fs.write",
+            0.9,
+        )])?;
+        let args = json!({ "path": "Cargo.lock" });
+        assert!(
+            advisor.advise("fs.write", &args).is_some(),
+            "gleiches Werkzeug trifft"
+        );
+        // Früher reichte der Substring: `fs.write` steckt in `fs.write_many`,
+        // und `shell.exec`-Aufrufe mit „Cargo.lock“ im Argument trafen, wenn
+        // der Text das Werkzeug nur erwähnte.
+        assert!(advisor.advise("fs.write_many", &args).is_none());
+        assert!(advisor.advise("shell.exec", &args).is_none());
+        assert!(advisor.advise("fs", &args).is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn pitfall_mentioning_a_tool_in_its_text_is_not_bound_to_it() -> TestResult {
+        let (advisor, _dir) = advisor_with(&[(
+            "shell-lock",
+            "shell.exec: nach fs.write Cargo.lock prüfen",
+            "shell.exec",
+            0.9,
+        )])?;
+        let args = json!({ "path": "Cargo.lock" });
+        assert!(advisor.advise("fs.write", &args).is_none());
+        assert!(
+            advisor
+                .advise("shell.exec", &json!({ "path": "Cargo.lock" }))
+                .is_some()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn pitfall_tag_binds_the_tool_and_low_confidence_is_ignored() -> TestResult {
+        let (advisor, _dir) = advisor_with(&[
+            ("tag-only", "Lockdatei-Falle", "fs.write, cargo", 0.8),
+            ("schwach", "fs.edit: Cargo.lock meiden", "fs.edit", 0.3),
+        ])?;
+        let args = json!({ "path": "Cargo.lock" });
+        assert!(advisor.advise("fs.write", &args).is_some(), "Tag bindet");
+        assert!(
+            advisor.advise("fs.edit", &args).is_none(),
+            "unter der Mindest-Konfidenz kein Hinweis"
+        );
+        Ok(())
     }
 }

@@ -385,6 +385,30 @@ static BUNDLED_FILES: &[BundledFile] = &[
         contents: include_str!("../assets/skills/interfaces-and-abstraction/skill.toml"),
     },
     BundledFile {
+        relative_path: "skills/latex-report/instructions.md",
+        contents: include_str!("../assets/skills/latex-report/instructions.md"),
+    },
+    BundledFile {
+        relative_path: "skills/latex-report/skill.toml",
+        contents: include_str!("../assets/skills/latex-report/skill.toml"),
+    },
+    BundledFile {
+        relative_path: "skills/latex-report/templates/bericht.tex",
+        contents: include_str!("../assets/skills/latex-report/templates/bericht.tex"),
+    },
+    BundledFile {
+        relative_path: "skills/latex-report/templates/business-paper.tex",
+        contents: include_str!("../assets/skills/latex-report/templates/business-paper.tex"),
+    },
+    BundledFile {
+        relative_path: "skills/latex-report/templates/handbuch.tex",
+        contents: include_str!("../assets/skills/latex-report/templates/handbuch.tex"),
+    },
+    BundledFile {
+        relative_path: "skills/latex-report/templates/harw-report.sty",
+        contents: include_str!("../assets/skills/latex-report/templates/harw-report.sty"),
+    },
+    BundledFile {
         relative_path: "skills/latex-writing/instructions.md",
         contents: include_str!("../assets/skills/latex-writing/instructions.md"),
     },
@@ -859,7 +883,8 @@ mod tests {
                 ))
             })?;
         }
-        assert_eq!(skills, 60, "das Bundle liefert 60 Skills");
+        // Runde 7, Teil T6/T7: +`latex-report`.
+        assert_eq!(skills, 61, "das Bundle liefert 61 Skills");
         Ok(())
     }
 
@@ -890,6 +915,81 @@ mod tests {
                     file.relative_path
                 );
             }
+        }
+        Ok(())
+    }
+
+    /// Runde 7, Teil T7: die Gerüste der Berichtsvorlage tragen genau die
+    /// Platzhalter, auf denen `latex.template` aufbaut; `harw-report.sty`
+    /// trägt keinen (sie ist ohne Ersetzung gültiges LaTeX) und alle
+    /// Vorlagendateien sind neutral (keine Firmen-, Produkt- oder
+    /// Personennamen aus dem Vorbild).
+    #[test]
+    fn test_latex_report_templates_carry_the_documented_placeholders() -> TestResult {
+        const PLACEHOLDERS: &[&str] = &[
+            "%%TITLE%%",
+            "%%SUBTITLE%%",
+            "%%AUTHOR%%",
+            "%%DATE%%",
+            "%%ACCENT%%",
+            "%%WARN%%",
+            "%%MAINFONT%%",
+            "%%SANSFONT%%",
+            "%%MONOFONT%%",
+            "%%LANGUAGE%%",
+        ];
+        let template = |name: &str| {
+            bundled_files()
+                .iter()
+                .find(|file| file.relative_path == format!("skills/latex-report/templates/{name}"))
+                .map(|file| file.contents)
+                .ok_or(crate::test_support::TestError::Missing(
+                    "latex-report template",
+                ))
+        };
+        for kind in ["bericht.tex", "business-paper.tex", "handbuch.tex"] {
+            let text = template(kind)?;
+            for placeholder in PLACEHOLDERS {
+                assert!(text.contains(placeholder), "{kind}: fehlt {placeholder}");
+            }
+            for building_block in [
+                "\\documentclass[11pt,a4paper]{scrartcl}",
+                "\\usepackage{harw-report}",
+                "\\begin{achtung}[Wichtig vorab]",
+                "\\begin{merke}[Die Idee in drei Sätzen]",
+                "\\begin{tikzpicture}",
+                "\\begin{longtable}",
+                "\\endhead",
+                "\\begin{thebibliography}",
+            ] {
+                assert!(
+                    text.contains(building_block),
+                    "{kind}: fehlt {building_block}"
+                );
+            }
+        }
+        let sty = template("harw-report.sty")?;
+        assert!(
+            !sty.contains("%%"),
+            "harw-report.sty darf keine Platzhalter tragen"
+        );
+        for needed in [
+            "\\babelprovide[import,main]",
+            "\\newcolumntype{L}",
+            "\\newtcolorbox{merke}",
+            "\\newtcolorbox{achtung}",
+            "\\newtcolorbox{beispiel}",
+            "harwbox/.style",
+            "harwpfeil/.style",
+            "harwlabel/.style",
+            "\\emergencystretch=3em",
+            "tocnumwidth",
+            "{harwaccent}{HTML}",
+            "714B67",
+            "C0392B",
+            "DejaVu Serif",
+        ] {
+            assert!(sty.contains(needed), "harw-report.sty: fehlt {needed}");
         }
         Ok(())
     }

@@ -40,6 +40,31 @@
 //! Installation außerhalb von `/usr` liegt — deren Wurzel. `PATH` in der
 //! Sandbox besteht aus den Verzeichnissen der gefundenen Programme plus dem
 //! Minimal-`PATH`.
+//!
+//! # Runde 7, Teil T
+//! - **Rückfall ohne `latexmk` (T3):** fehlt `latexmk`, aber die Engine ist
+//!   da, läuft die Engine direkt (`-interaction=nonstopmode -halt-on-error
+//!   -file-line-error -no-shell-escape <datei>.tex`, Arbeitsverzeichnis =
+//!   Ordner der Datei), dazwischen `biber`, wenn eine `.bcf` entstand und
+//!   `biber` vorhanden ist, danach die Engine ein zweites Mal (ein dritter
+//!   Lauf nur bei „Rerun“-Hinweis). Alle Läufe teilen sich eine Deadline.
+//!   Das Ergebnis nennt `builder` (`latexmk`|`direct`), die Seitenzahl,
+//!   Overfull-Boxen über 1 pt, die Zahl der Underfull-Boxen, fehlende
+//!   Zeichen und Trennmuster-Warnungen ([`log`]); `status =
+//!   "ok_with_warnings"`, wenn davon etwas zutrifft.
+//! - **`latex.template` (T2, [`template`]):** schreibt `harw-report.sty` und
+//!   das Gerüst der Hauptdatei (nie überschreibend, `WriteWorkspace`).
+//! - **`latex.check` (T4, [`check`]):** Vorabprüfung von Klasse, Paketen,
+//!   Schriften und Sprachen per `kpsewhich`/`fc-list` in derselben Sandbox
+//!   (`ExecuteProcess`).
+
+pub mod check;
+pub mod log;
+pub mod template;
+
+pub use self::log::{LogReport, OverfullBox, parse_build_log};
+pub use check::LATEX_CHECK_TOOL;
+pub use template::{LATEX_TEMPLATE_TOOL, TemplateKind, TemplateLanguage};
 
 use crate::capture::{BoundedCapture, DrainEnd};
 use crate::exec::{configure_stdio, terminate};
@@ -86,8 +111,14 @@ const MAX_EXCERPT_LINE_CHARS: usize = 300;
 const OUTPUT_TAIL_LINES: usize = 20;
 /// Minimal-`PATH` in der Sandbox, hinter den Programmverzeichnissen.
 const MINIMAL_PATH: &str = "/usr/local/bin:/usr/bin:/bin";
-/// Das Programm, das jeder Aufruf braucht (Bauen und Aufräumen).
+/// Das bevorzugte Build-Programm (Bauen und Aufräumen). Fehlt es, baut
+/// `latex.build` direkt mit der Engine (Runde 7, Teil T3).
 const LATEXMK: &str = "latexmk";
+/// Bibliographie-Programm für biblatex (nur im direkten Rückfall).
+const BIBER: &str = "biber";
+/// Höchstzahl der Engine-Läufe im direkten Rückfall (zwei feste Läufe plus
+/// einer bei „Rerun“-Hinweis).
+const MAX_DIRECT_ENGINE_RUNS: usize = 3;
 
 /// TeX- und Font-Pfade außerhalb von `/usr`, die `latex.build` nur lesend in
 /// die Sandbox bindet (`--ro-bind-try`, fehlende Pfade sind kein Fehler).
@@ -192,6 +223,33 @@ pub fn latexmk_args(engine: LatexEngine, clean: bool, file: &Path) -> Vec<OsStri
     args
 }
 
+/// Baut das feste argv (ohne Programm) für einen direkten Engine-Lauf
+/// (Rückfall ohne `latexmk`, Runde 7 Teil T3).
+///
+/// # Beschreibung
+/// Rein und ohne Prozessstart testbar. Es gibt kein `-cd` wie bei `latexmk`:
+/// der Lauf startet stattdessen im Ordner der Datei, deshalb steht hier nur
+/// der Dateiname.
+///
+/// # Argumente
+/// - `file_name` (`&OsStr`): Dateiname der `.tex`-Datei (ohne Ordner).
+///
+/// # Rückgabe
+/// Die Argumente in Startreihenfolge.
+#[must_use]
+pub fn direct_engine_args(file_name: &OsStr) -> Vec<OsString> {
+    let mut args: Vec<OsString> = [
+        "-interaction=nonstopmode",
+        "-halt-on-error",
+        "-file-line-error",
+        "-no-shell-escape",
+    ]
+    .map(OsString::from)
+    .to_vec();
+    args.push(file_name.to_owned());
+    args
+}
+
 /// Kanonisiert `file` und prüft die Workspace-Grenze.
 ///
 /// # Argumente
@@ -239,15 +297,78 @@ pub fn resolve_tex_file(root: &Path, file: &str) -> Result<PathBuf, String> {
 
 // ── Programmsuche ─────────────────────────────────────────────────────────────
 
-/// Ergebnis der Programmsuche.
+/// Sandbox-Umgebung für gefundene Programme: `PATH` und zusätzliche, nur
+/// lesend gebundene Installationswurzeln.
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct Toolchain {
-    /// Absoluter Pfad von `latexmk`.
-    latexmk: PathBuf,
+struct ProgramEnv {
     /// `PATH` für die Sandbox: Programmverzeichnisse plus [`MINIMAL_PATH`].
     sandbox_path: String,
     /// Zusätzliche, nur lesende Wurzeln (TeX-Live außerhalb von `/usr`).
     install_roots: Vec<PathBuf>,
+}
+
+impl ProgramEnv {
+    /// Baut `PATH` und Installationswurzeln aus den gefundenen Programmen.
+    ///
+    /// # Argumente
+    /// - `programs` (`&[&Path]`): absolute Pfade der gefundenen Programme.
+    ///
+    /// # Rückgabe
+    /// Die Umgebung; Verzeichnisse ohne Duplikate in Fundreihenfolge.
+    fn of(programs: &[&Path]) -> Self {
+        let mut dirs: Vec<String> = Vec::new();
+        let mut install_roots: Vec<PathBuf> = Vec::new();
+        for path in programs {
+            if let Some(dir) = path.parent().and_then(Path::to_str)
+                && !dirs.iter().any(|known| known == dir)
+            {
+                dirs.push(dir.to_owned());
+            }
+            if let Some(root) = install_root_of(path)
+                && !install_roots.contains(&root)
+            {
+                install_roots.push(root);
+            }
+        }
+        dirs.push(MINIMAL_PATH.to_owned());
+        Self {
+            sandbox_path: dirs.join(":"),
+            install_roots,
+        }
+    }
+}
+
+/// Womit gebaut wird (Runde 7, Teil T3).
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Builder {
+    /// `latexmk` (bevorzugt; beim Aufräumen Pflicht).
+    Latexmk(PathBuf),
+    /// Rückfall ohne `latexmk`: die Engine direkt, `biber` falls vorhanden.
+    Direct {
+        /// Absoluter Pfad der Engine.
+        engine: PathBuf,
+        /// Absoluter Pfad von `biber`, falls gefunden.
+        biber: Option<PathBuf>,
+    },
+}
+
+impl Builder {
+    /// Name für das Ergebnisfeld `builder`.
+    const fn label(&self) -> &'static str {
+        match self {
+            Self::Latexmk(_) => "latexmk",
+            Self::Direct { .. } => "direct",
+        }
+    }
+}
+
+/// Ergebnis der Programmsuche.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Toolchain {
+    /// Build-Weg samt Programmpfaden.
+    builder: Builder,
+    /// Sandbox-Umgebung der gefundenen Programme.
+    env: ProgramEnv,
 }
 
 /// `true`, wenn `path` eine reguläre, ausführbare Datei ist.
@@ -281,55 +402,65 @@ fn install_root_of(binary: &Path) -> Option<PathBuf> {
     Some(root.to_path_buf())
 }
 
-/// Sucht `latexmk` und (außer beim Aufräumen) die Engine.
+/// Sucht `latexmk`, die Engine und (im Rückfall) `biber`.
+///
+/// # Beschreibung
+/// - Aufräumen (`clean`) braucht `latexmk`; ohne gibt es keinen Rückfall.
+/// - Bauen braucht die Engine. Mit `latexmk` baut [`Builder::Latexmk`],
+///   ohne `latexmk` baut [`Builder::Direct`] (Runde 7, Teil T3); `biber`
+///   ist dort optional.
 ///
 /// # Rückgabe
 /// `Ok(toolchain)` oder `Err(missing)` mit den fehlenden Programmnamen in
-/// fester Reihenfolge (`latexmk` zuerst).
+/// fester Reihenfolge (`latexmk` zuerst, falls es mitfehlt).
 fn resolve_toolchain(
     search_path: &OsStr,
     engine: LatexEngine,
     clean: bool,
 ) -> Result<Toolchain, Vec<String>> {
-    let mut needed = vec![LATEXMK];
-    if !clean {
-        needed.push(engine.binary());
+    let latexmk = find_in_path(search_path, LATEXMK);
+    if clean {
+        let Some(latexmk) = latexmk else {
+            return Err(vec![LATEXMK.to_owned()]);
+        };
+        let env = ProgramEnv::of(&[latexmk.as_path()]);
+        return Ok(Toolchain {
+            builder: Builder::Latexmk(latexmk),
+            env,
+        });
     }
-    let mut found = Vec::new();
-    let mut missing = Vec::new();
-    for program in needed {
-        match find_in_path(search_path, program) {
-            Some(path) => found.push(path),
-            None => missing.push(program.to_owned()),
+    let Some(engine_path) = find_in_path(search_path, engine.binary()) else {
+        let mut missing = Vec::new();
+        if latexmk.is_none() {
+            missing.push(LATEXMK.to_owned());
         }
-    }
-    if !missing.is_empty() {
+        missing.push(engine.binary().to_owned());
         return Err(missing);
-    }
-    // `latexmk` steht immer an erster Stelle von `needed`.
-    let Some(latexmk) = found.first().cloned() else {
-        return Err(vec![LATEXMK.to_owned()]);
     };
-    let mut dirs: Vec<String> = Vec::new();
-    let mut install_roots: Vec<PathBuf> = Vec::new();
-    for path in &found {
-        if let Some(dir) = path.parent().and_then(Path::to_str)
-            && !dirs.iter().any(|known| known == dir)
-        {
-            dirs.push(dir.to_owned());
+    match latexmk {
+        Some(latexmk) => {
+            let env = ProgramEnv::of(&[latexmk.as_path(), engine_path.as_path()]);
+            Ok(Toolchain {
+                builder: Builder::Latexmk(latexmk),
+                env,
+            })
         }
-        if let Some(root) = install_root_of(path)
-            && !install_roots.contains(&root)
-        {
-            install_roots.push(root);
+        None => {
+            let biber = find_in_path(search_path, BIBER);
+            let mut programs = vec![engine_path.as_path()];
+            if let Some(biber) = &biber {
+                programs.push(biber.as_path());
+            }
+            let env = ProgramEnv::of(&programs);
+            Ok(Toolchain {
+                builder: Builder::Direct {
+                    engine: engine_path,
+                    biber,
+                },
+                env,
+            })
         }
     }
-    dirs.push(MINIMAL_PATH.to_owned());
-    Ok(Toolchain {
-        latexmk,
-        sandbox_path: dirs.join(":"),
-        install_roots,
-    })
 }
 
 /// Die Meldung für die Nutzerin, wenn Programme fehlen (Deutsch, nur Hinweis —
@@ -374,7 +505,7 @@ fn is_file_line_error(line: &str) -> bool {
 
 /// `true` für Zeilen, die für die Diagnose zählen.
 fn is_relevant_log_line(line: &str) -> bool {
-    const MARKERS: [&str; 11] = [
+    const MARKERS: [&str; 16] = [
         "Undefined reference",
         "undefined references",
         "Missing character",
@@ -386,6 +517,12 @@ fn is_relevant_log_line(line: &str) -> bool {
         "not found",
         "Please (re)run",
         "Rerun to get",
+        // Runde 7, Teil T3: Sprach-, Schrift- und Bibliographie-Hinweise.
+        "hyphenation patterns",
+        "babel Warning",
+        "polyglossia Warning",
+        "fontspec Warning",
+        "Font shape",
     ];
     line.starts_with('!') || is_file_line_error(line) || MARKERS.iter().any(|m| line.contains(m))
 }
@@ -405,9 +542,12 @@ fn clip_line(line: &str) -> String {
 /// # Beschreibung
 /// Behält `! …`-Zeilen (samt der folgenden `l.<n>`-Zeile), `datei:zeile:`-
 /// Zeilen, „Undefined reference“, „Missing character“ (fehlende Glyphen einer
-/// Schrift), `fontspec`-Fehler, „not found“ (Schrift/Datei) sowie
-/// `LaTeX Warning`/Rerun-Hinweise — in Log-Reihenfolge, ohne Duplikate,
-/// höchstens [`MAX_EXCERPT_LINES`] Zeilen.
+/// Schrift), `fontspec`-Fehler und -Warnungen, „Font shape“, „not found“
+/// (Schrift/Datei), babel-/polyglossia-Warnungen und fehlende Trennmuster
+/// (Runde 7, Teil T3) sowie `LaTeX Warning`/Rerun-Hinweise
+/// — in Log-Reihenfolge, ohne Duplikate, höchstens [`MAX_EXCERPT_LINES`]
+/// Zeilen. Overfull-/Underfull-Boxen stehen nicht im Auszug, sondern
+/// strukturiert im Ergebnis ([`parse_build_log`]).
 #[must_use]
 pub fn extract_log_excerpt(log: &str) -> Vec<String> {
     let lines: Vec<&str> = log.lines().collect();
@@ -487,7 +627,7 @@ fn relative(root: &Path, path: &Path) -> String {
 
 // ── Ausführung ────────────────────────────────────────────────────────────────
 
-/// Wie der Build-Prozess endete.
+/// Wie ein Prozess endete.
 enum RunEnd {
     /// Regulär beendet (oder wegen Ausgabeüberlauf getötet).
     Finished(Option<ExitStatus>),
@@ -495,42 +635,96 @@ enum RunEnd {
     TimedOut,
 }
 
-/// Ausführer eines `latex.build`-Aufrufs; Konfiguration vom Provider.
-struct LatexBuildExecutor {
-    timeout_secs: u64,
+impl RunEnd {
+    /// `true` für einen regulären Lauf mit Exit-Code 0.
+    fn succeeded(&self) -> bool {
+        matches!(self, Self::Finished(Some(status)) if status.success())
+    }
+}
+
+/// Ein fester Programmaufruf: absolutes Programm, argv, Arbeitsverzeichnis
+/// (Runde 7, Teil T3: verallgemeinert von „immer `latexmk`“).
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ProgramCall {
+    /// Absoluter Pfad des Programms.
+    program: PathBuf,
+    /// Argumente ohne Programm.
+    args: Vec<OsString>,
+    /// Arbeitsverzeichnis: die Workspace-Wurzel oder ein Ordner darunter.
+    cwd: PathBuf,
+}
+
+/// Ersetzt das Ziel von `--chdir` in einem Bubblewrap-argv.
+///
+/// # Beschreibung
+/// Der Sandbox-Plan wechselt immer in die Workspace-Wurzel. Der direkte
+/// Engine-Lauf (Runde 7, Teil T3) braucht den Ordner der `.tex`-Datei als
+/// Arbeitsverzeichnis, damit relative `\input`-Pfade und die Hilfsdateien
+/// wie bei `latexmk -cd` funktionieren. Gesucht wird nur vor dem Trenner
+/// `--` (danach folgt das Programm-argv).
+///
+/// # Argumente
+/// - `args` (`&[OsString]`): das argv des Plans (ohne `bwrap` selbst).
+/// - `dir` (`&Path`): neues Arbeitsverzeichnis (kanonisch, im Workspace).
+///
+/// # Rückgabe
+/// Das geänderte argv oder `None`, wenn kein `--chdir` vor `--` steht.
+fn retarget_chdir(args: &[OsString], dir: &Path) -> Option<Vec<OsString>> {
+    let separator = args.iter().position(|arg| arg == "--")?;
+    let chdir = args[..separator].iter().rposition(|arg| arg == "--chdir")?;
+    if chdir + 1 >= separator {
+        return None;
+    }
+    let mut retargeted = args.to_vec();
+    retargeted[chdir + 1] = dir.as_os_str().to_owned();
+    Some(retargeted)
+}
+
+/// Gemeinsame Startkonfiguration der LaTeX-Werkzeuge mit Prozessstart
+/// (`latex.build`, `latex.check`): Ausgabebudget, rlimits, zusätzliche
+/// Lesepfade.
+#[derive(Clone)]
+struct SandboxRunner {
     max_output_bytes: usize,
     limits: ShellLimits,
-    search_path: Option<OsString>,
     extra_read_only: Vec<PathBuf>,
     #[cfg(test)]
     launch_directly: bool,
 }
 
-impl LatexBuildExecutor {
-    /// Startet `command`, sammelt die Ausgabe gekappt und beachtet Zeitlimit
-    /// und Abbruch.
+impl SandboxRunner {
+    /// Startet `command`, sammelt die Ausgabe gekappt und beachtet die
+    /// gemeinsame `deadline` und den Abbruch.
+    ///
+    /// # Argumente
+    /// - `tool` (`&'static str`): Werkzeugname für Meldungen.
+    /// - `command` (`&mut TokioCommand`): der vorbereitete Befehl.
+    /// - `cancel` (`Option<&CancelToken>`): Abbruchsignal.
+    /// - `deadline` (`tokio::time::Instant`): gemeinsame Frist aller Läufe
+    ///   eines Aufrufs (Runde 7, Teil T3).
     ///
     /// # Errors
-    /// `Err(ToolOutput)` für Start-/I/O-Fehler, `Err(None)` bei Abbruch.
+    /// `Err(Some(ToolOutput))` für Start-/I/O-Fehler, `Err(None)` bei Abbruch.
     async fn collect(
         &self,
+        tool: &'static str,
         command: &mut TokioCommand,
         cancel: Option<&CancelToken>,
+        deadline: tokio::time::Instant,
     ) -> Result<(RunEnd, BoundedCapture), Option<ToolOutput>> {
         let mut child = configure_stdio(command).spawn().map_err(|err| {
-            warn!(error = %err, "latex.build spawn failed");
+            warn!(error = %err, tool, "LaTeX-Werkzeug: Start fehlgeschlagen");
             Some(ToolOutput::error(format!(
-                "latex.build: Start fehlgeschlagen: {err}"
+                "{tool}: Start fehlgeschlagen: {err}"
             )))
         })?;
         let (Some(mut stdout), Some(mut stderr)) = (child.stdout.take(), child.stderr.take())
         else {
             terminate(&mut child).await;
-            return Err(Some(ToolOutput::error(
-                "latex.build: stdout/stderr-Pipes fehlen",
-            )));
+            return Err(Some(ToolOutput::error(format!(
+                "{tool}: stdout/stderr-Pipes fehlen"
+            ))));
         };
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(self.timeout_secs);
         let mut capture = BoundedCapture::new(self.max_output_bytes);
         let drained = match cancel {
             Some(cancel) => {
@@ -554,12 +748,12 @@ impl LatexBuildExecutor {
             Ok(Err(err)) => {
                 terminate(&mut child).await;
                 Err(Some(ToolOutput::error(format!(
-                    "latex.build: I/O-Fehler: {err}"
+                    "{tool}: I/O-Fehler: {err}"
                 ))))
             }
             Ok(Ok(DrainEnd::LimitExceeded)) => {
-                // latexmk selbst schreibt wenig; wer das Budget sprengt, läuft
-                // aus dem Ruder — Baum beenden statt bis zum Zeitlimit warten.
+                // TeX-Programme schreiben begrenzt; wer das Budget sprengt,
+                // läuft aus dem Ruder — Baum beenden statt bis zur Frist warten.
                 let status = terminate(&mut child).await;
                 Ok((RunEnd::Finished(status), capture))
             }
@@ -581,7 +775,7 @@ impl LatexBuildExecutor {
                     Ok(Err(err)) => {
                         terminate(&mut child).await;
                         Err(Some(ToolOutput::error(format!(
-                            "latex.build: Warten fehlgeschlagen: {err}"
+                            "{tool}: Warten fehlgeschlagen: {err}"
                         ))))
                     }
                     Err(_elapsed) => {
@@ -593,54 +787,283 @@ impl LatexBuildExecutor {
         }
     }
 
-    /// Baut den Startbefehl: `prlimit … -- bwrap <plan> -- latexmk <args>`.
+    /// Baut den Startbefehl: `prlimit … -- bwrap <plan> -- <programm> <args>`.
+    ///
+    /// # Beschreibung
+    /// Liegt `call.cwd` nicht auf der Workspace-Wurzel, wird das `--chdir`
+    /// des Plans darauf umgelenkt ([`retarget_chdir`]); `cwd` muss dafür
+    /// kanonisch unter der Workspace-Wurzel liegen (dort ist der Workspace
+    /// unter demselben Pfad gebunden).
     ///
     /// # Errors
-    /// Eine Fehlermeldung, wenn Limits, `bwrap` oder der Plan scheitern — es
-    /// gibt keinen Rückfall auf den Host.
+    /// Eine Fehlermeldung, wenn Limits, `bwrap`, der Plan oder das
+    /// Arbeitsverzeichnis scheitern — es gibt keinen Rückfall auf den Host.
     fn sandboxed_command(
         &self,
+        tool: &'static str,
         sandbox: &SandboxSpec,
-        toolchain: &Toolchain,
-        args: &[OsString],
+        env: &ProgramEnv,
+        call: &ProgramCall,
     ) -> Result<TokioCommand, String> {
         self.limits
             .validate()
-            .map_err(|err| format!("latex.build: Ressourcengrenzen: {err}"))?;
+            .map_err(|err| format!("{tool}: Ressourcengrenzen: {err}"))?;
         let tmpfs_size = self
             .limits
             .tmpfs_size()
-            .map_err(|err| format!("latex.build: Ressourcengrenzen: {err}"))?;
+            .map_err(|err| format!("{tool}: Ressourcengrenzen: {err}"))?;
         let prlimit = self
             .limits
             .resolve_prlimit()
-            .map_err(|err| format!("latex.build: Ressourcengrenzen: {err}"))?;
+            .map_err(|err| format!("{tool}: Ressourcengrenzen: {err}"))?;
         let launcher = BwrapLauncher::discover()
-            .map_err(|err| format!("latex.build: Sandbox nicht verfügbar: {err}"))?;
+            .map_err(|err| format!("{tool}: Sandbox nicht verfügbar: {err}"))?;
         let mut read_only: Vec<PathBuf> = TEX_READ_ONLY_ROOTS.iter().map(PathBuf::from).collect();
-        read_only.extend(toolchain.install_roots.iter().cloned());
+        read_only.extend(env.install_roots.iter().cloned());
         read_only.extend(self.extra_read_only.iter().cloned());
         let launcher = launcher
             .with_tmpfs_size(tmpfs_size)
             .with_host_path(HostPathBinding {
-                path: toolchain.sandbox_path.clone(),
+                path: env.sandbox_path.clone(),
                 ..HostPathBinding::default()
             })
             .with_read_only_paths(read_only);
-        let mut command_line = vec![toolchain.latexmk.as_os_str().to_owned()];
-        command_line.extend(args.iter().cloned());
+        let mut command_line = vec![call.program.as_os_str().to_owned()];
+        command_line.extend(call.args.iter().cloned());
         let plan = launcher
             .plan(sandbox, &command_line)
-            .map_err(|err| format!("latex.build: Sandbox-Plan abgelehnt: {err}"))?;
+            .map_err(|err| format!("{tool}: Sandbox-Plan abgelehnt: {err}"))?;
+        let root = sandbox.workspace().canonical_root();
+        let plan_args = if call.cwd.as_path() == root {
+            plan.args().to_vec()
+        } else {
+            if !call.cwd.starts_with(root) {
+                return Err(format!(
+                    "{tool}: Arbeitsverzeichnis liegt außerhalb des Workspaces"
+                ));
+            }
+            retarget_chdir(plan.args(), &call.cwd).ok_or_else(|| {
+                format!("{tool}: Sandbox-Plan ohne --chdir, Arbeitsverzeichnis nicht setzbar")
+            })?
+        };
         let launch = launch_command(
             prlimit.as_deref(),
             &self.limits,
             launcher.executable(),
-            plan.args(),
+            &plan_args,
         );
         let mut command = TokioCommand::new(&launch.program);
         command.args(&launch.args);
         Ok(command)
+    }
+
+    /// Bereitet `call` vor (in Tests wahlweise ohne Sandbox) und führt ihn
+    /// bis zur `deadline` aus.
+    ///
+    /// # Errors
+    /// `Err(Some(ToolOutput))` für Vorbereitungs-, Start- und I/O-Fehler,
+    /// `Err(None)` bei Abbruch.
+    async fn run_program(
+        &self,
+        tool: &'static str,
+        sandbox: &SandboxSpec,
+        env: &ProgramEnv,
+        call: &ProgramCall,
+        cancel: Option<&CancelToken>,
+        deadline: tokio::time::Instant,
+    ) -> Result<(RunEnd, BoundedCapture), Option<ToolOutput>> {
+        #[cfg(test)]
+        let prepared = if self.launch_directly {
+            let mut command = TokioCommand::new(&call.program);
+            command
+                .args(&call.args)
+                .current_dir(&call.cwd)
+                .env("PATH", &env.sandbox_path);
+            Ok(command)
+        } else {
+            self.sandboxed_command(tool, sandbox, env, call)
+        };
+        #[cfg(not(test))]
+        let prepared = self.sandboxed_command(tool, sandbox, env, call);
+        let mut command = prepared.map_err(|message| {
+            warn!(%message, tool, "LaTeX-Werkzeug: Sandbox-Start nicht möglich");
+            Some(ToolOutput::error(message))
+        })?;
+        self.collect(tool, &mut command, cancel, deadline).await
+    }
+}
+
+/// Ergebnis aller Läufe eines Builds.
+struct BuildOutcome {
+    /// Ende des letzten Laufs.
+    end: RunEnd,
+    /// Ausgabe des letzten Laufs.
+    capture: BoundedCapture,
+    /// `true`, wenn irgendein Lauf das Ausgabebudget sprengte.
+    truncated: bool,
+    /// Die Läufe in Reihenfolge (`latexmk` bzw. Engine/`biber`).
+    runs: Vec<String>,
+    /// Hinweise für das Modell (z. B. fehlendes `biber`).
+    notes: Vec<String>,
+}
+
+/// Eingaben des direkten Rückfalls (Runde 7, Teil T3).
+struct DirectPlan {
+    /// Gewählte Engine (für die Laufnamen).
+    engine: LatexEngine,
+    /// Absoluter Pfad der Engine.
+    engine_path: PathBuf,
+    /// Absoluter Pfad von `biber`, falls gefunden.
+    biber: Option<PathBuf>,
+    /// Kanonische Workspace-Wurzel.
+    root: PathBuf,
+    /// Kanonische `.tex`-Datei.
+    file: PathBuf,
+    /// Startzeitpunkt (für „frische“ Log-Dateien).
+    started: SystemTime,
+}
+
+/// `true`, wenn das Log einen weiteren Engine-Lauf verlangt (Verweise,
+/// Inhaltsverzeichnis).
+fn needs_rerun(log: &str) -> bool {
+    ["Rerun to get", "Label(s) may have changed", "Rerun LaTeX"]
+        .iter()
+        .any(|marker| log.contains(marker))
+}
+
+/// Ausführer eines `latex.build`-Aufrufs; Konfiguration vom Provider.
+struct LatexBuildExecutor {
+    timeout_secs: u64,
+    search_path: Option<OsString>,
+    runner: SandboxRunner,
+}
+
+impl LatexBuildExecutor {
+    /// Rückfall ohne `latexmk`: Engine, ggf. `biber`, Engine (und ein
+    /// dritter Engine-Lauf bei „Rerun“-Hinweis), alle bis zur gemeinsamen
+    /// `deadline`. Ein fehlgeschlagener Engine-Lauf beendet die Kette.
+    ///
+    /// # Errors
+    /// `Err(Some(ToolOutput))` für Start-/I/O-Fehler, `Err(None)` bei Abbruch.
+    async fn run_direct(
+        &self,
+        sandbox: &SandboxSpec,
+        env: &ProgramEnv,
+        plan: &DirectPlan,
+        cancel: Option<&CancelToken>,
+        deadline: tokio::time::Instant,
+    ) -> Result<BuildOutcome, Option<ToolOutput>> {
+        let (Some(dir), Some(file_name), Some(stem)) = (
+            plan.file.parent(),
+            plan.file.file_name(),
+            plan.file.file_stem(),
+        ) else {
+            return Err(Some(ToolOutput::error(
+                "latex.build: Dateiname oder Ordner der .tex-Datei fehlt",
+            )));
+        };
+        let engine_call = ProgramCall {
+            program: plan.engine_path.clone(),
+            args: direct_engine_args(file_name),
+            cwd: dir.to_path_buf(),
+        };
+        let mut runs: Vec<String> = Vec::new();
+        let mut notes: Vec<String> = Vec::new();
+        let mut truncated = false;
+        let mut engine_runs = 0usize;
+        loop {
+            let (end, capture) = self
+                .runner
+                .run_program(
+                    LATEX_BUILD_TOOL,
+                    sandbox,
+                    env,
+                    &engine_call,
+                    cancel,
+                    deadline,
+                )
+                .await?;
+            engine_runs += 1;
+            runs.push(plan.engine.binary().to_owned());
+            truncated |= capture.limit_exceeded();
+            let continue_chain = end.succeeded() && !capture.limit_exceeded();
+            if !continue_chain || engine_runs >= MAX_DIRECT_ENGINE_RUNS {
+                return Ok(BuildOutcome {
+                    end,
+                    capture,
+                    truncated,
+                    runs,
+                    notes,
+                });
+            }
+            if engine_runs == 1 {
+                if plan.file.with_extension("bcf").is_file() {
+                    match &plan.biber {
+                        Some(biber) => {
+                            let biber_call = ProgramCall {
+                                program: biber.clone(),
+                                args: vec![stem.to_owned()],
+                                cwd: dir.to_path_buf(),
+                            };
+                            let (biber_end, biber_capture) = self
+                                .runner
+                                .run_program(
+                                    LATEX_BUILD_TOOL,
+                                    sandbox,
+                                    env,
+                                    &biber_call,
+                                    cancel,
+                                    deadline,
+                                )
+                                .await?;
+                            runs.push(BIBER.to_owned());
+                            truncated |= biber_capture.limit_exceeded();
+                            match biber_end {
+                                RunEnd::TimedOut => {
+                                    return Ok(BuildOutcome {
+                                        end: RunEnd::TimedOut,
+                                        capture: biber_capture,
+                                        truncated,
+                                        runs,
+                                        notes,
+                                    });
+                                }
+                                RunEnd::Finished(status) => {
+                                    if !status.is_some_and(|status| status.success()) {
+                                        let code =
+                                            status.and_then(|status| status.code()).unwrap_or(-1);
+                                        notes.push(format!(
+                                            "biber endete mit Code {code}; das \
+                                             Literaturverzeichnis ist unvollständig \
+                                             (Ausgabe: {}).",
+                                            output_tail(&biber_capture)
+                                        ));
+                                    }
+                                }
+                            }
+                        }
+                        None => notes.push(
+                            "biblatex verlangt biber, biber ist aber nicht installiert; \
+                             das Literaturverzeichnis bleibt leer."
+                                .to_owned(),
+                        ),
+                    }
+                }
+                continue;
+            }
+            // Zwei Engine-Läufe sind durch; ein dritter nur bei Rerun-Hinweis.
+            let rerun = read_fresh_log(&plan.root, &plan.file, plan.started)
+                .is_some_and(|log| needs_rerun(&log));
+            if !rerun {
+                return Ok(BuildOutcome {
+                    end,
+                    capture,
+                    truncated,
+                    runs,
+                    notes,
+                });
+            }
+        }
     }
 
     /// Der eigentliche Ablauf nach dem Parsen.
@@ -671,49 +1094,75 @@ impl LatexBuildExecutor {
             }
         };
 
-        let latexmk_argv = latexmk_args(engine, clean, &file);
-        #[cfg(test)]
-        let prepared = if self.launch_directly {
-            let mut command = TokioCommand::new(&toolchain.latexmk);
-            command
-                .args(&latexmk_argv)
-                .current_dir(&root)
-                .env("PATH", &toolchain.sandbox_path);
-            Ok(command)
-        } else {
-            self.sandboxed_command(sandbox, &toolchain, &latexmk_argv)
-        };
-        #[cfg(not(test))]
-        let prepared = self.sandboxed_command(sandbox, &toolchain, &latexmk_argv);
-        let mut command = match prepared {
-            Ok(command) => command,
-            Err(message) => {
-                warn!(%message, "latex.build: Sandbox-Start nicht möglich");
-                return Ok(ToolOutput::error(message));
-            }
-        };
-
         let started = SystemTime::now()
             .checked_sub(Duration::from_secs(1))
             .unwrap_or(SystemTime::UNIX_EPOCH);
-        let (end, capture) = match self.collect(&mut command, cancel).await {
-            Ok(result) => result,
+        // Runde 7, Teil T3: eine Frist für alle Läufe dieses Aufrufs.
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(self.timeout_secs);
+        let outcome = match &toolchain.builder {
+            Builder::Latexmk(latexmk) => {
+                let call = ProgramCall {
+                    program: latexmk.clone(),
+                    args: latexmk_args(engine, clean, &file),
+                    cwd: root.clone(),
+                };
+                self.runner
+                    .run_program(
+                        LATEX_BUILD_TOOL,
+                        sandbox,
+                        &toolchain.env,
+                        &call,
+                        cancel,
+                        deadline,
+                    )
+                    .await
+                    .map(|(end, capture)| BuildOutcome {
+                        truncated: capture.limit_exceeded(),
+                        end,
+                        capture,
+                        runs: vec![LATEXMK.to_owned()],
+                        notes: Vec::new(),
+                    })
+            }
+            Builder::Direct {
+                engine: engine_path,
+                biber,
+            } => {
+                let plan = DirectPlan {
+                    engine,
+                    engine_path: engine_path.clone(),
+                    biber: biber.clone(),
+                    root: root.clone(),
+                    file: file.clone(),
+                    started,
+                };
+                self.run_direct(sandbox, &toolchain.env, &plan, cancel, deadline)
+                    .await
+            }
+        };
+        let outcome = match outcome {
+            Ok(outcome) => outcome,
             Err(Some(output)) => return Ok(output),
             Err(None) => return Err(ToolsError::Cancelled),
         };
 
-        let tail = output_tail(&capture);
-        let truncated = capture.limit_exceeded();
-        let log_excerpt = read_fresh_log(&root, &file, started)
-            .map(|log| extract_log_excerpt(&log))
-            .unwrap_or_else(|| extract_log_excerpt(&tail));
+        let tail = output_tail(&outcome.capture);
+        let truncated = outcome.truncated;
+        let log = read_fresh_log(&root, &file, started);
+        let log_text = log.as_deref().unwrap_or(&tail);
+        let log_excerpt = extract_log_excerpt(log_text);
         let file_rel = relative(&root, &file);
         let mut result = BTreeMap::<&str, Value>::new();
         result.insert("engine", json!(engine.binary()));
+        result.insert("builder", json!(toolchain.builder.label()));
+        result.insert("runs", json!(outcome.runs));
         result.insert("file", json!(file_rel));
         result.insert("output_tail", json!(tail));
         result.insert("truncated", json!(truncated));
-        match end {
+        if !outcome.notes.is_empty() {
+            result.insert("notes", json!(outcome.notes));
+        }
+        match outcome.end {
             RunEnd::TimedOut => {
                 warn!(timeout_secs = self.timeout_secs, "latex.build timed out");
                 result.insert("status", json!("timeout"));
@@ -728,12 +1177,29 @@ impl LatexBuildExecutor {
                 if clean {
                     result.insert("status", json!(if ok { "cleaned" } else { "failed" }));
                 } else {
+                    let report = parse_build_log(log_text);
                     let pdf = file.with_extension("pdf");
                     let pdf_rel = (ok && pdf.is_file()).then(|| relative(&root, &pdf));
-                    result.insert("status", json!(if ok { "ok" } else { "failed" }));
+                    let status = match (ok, report.has_warnings()) {
+                        (false, _) => "failed",
+                        (true, true) => "ok_with_warnings",
+                        (true, false) => "ok",
+                    };
+                    result.insert("status", json!(status));
                     result.insert("pdf", json!(pdf_rel));
+                    result.insert("pages", json!(report.pages));
+                    result.insert("overfull", json!(report.overfull));
+                    result.insert("overfull_total", json!(report.overfull_total));
+                    result.insert("underfull_count", json!(report.underfull_count));
+                    result.insert("missing_chars", json!(report.missing_chars));
+                    result.insert("language_warnings", json!(report.language_warnings));
                 }
-                info!(exit_code, clean, "latex.build completed");
+                info!(
+                    exit_code,
+                    clean,
+                    builder = toolchain.builder.label(),
+                    "latex.build completed"
+                );
             }
         }
         Ok(ToolOutput::json(json!(result)))
@@ -784,16 +1250,20 @@ impl ToolExecutor for LatexBuildExecutor {
 
 // ── Provider ──────────────────────────────────────────────────────────────────
 
-/// Registriert das Werkzeug `latex.build`.
+/// Registriert die Werkzeuge `latex.build`, `latex.template` und
+/// `latex.check`.
 ///
 /// # Beschreibung
-/// Vorgaben: Zeitlimit 120 s, Ausgabebudget 64 KiB, [`ShellLimits`] mit
-/// 120 s CPU-Zeit und 4 GiB Adressraum (TeX-Läufe mit großen Schriften).
-/// Die Programmsuche nutzt den `PATH` des Harness-Prozesses.
+/// Vorgaben: Zeitlimit 120 s (`latex.check`: höchstens 30 s),
+/// Ausgabebudget 64 KiB je Lauf, [`ShellLimits`] mit 120 s CPU-Zeit und
+/// 4 GiB Adressraum (TeX-Läufe mit großen Schriften). Die Programmsuche
+/// nutzt den `PATH` des Harness-Prozesses. Die Vorlagen für
+/// `latex.template` sind eingebettet (Runde 7, Teil T2).
 ///
 /// # Nebenläufigkeit
-/// `Send + Sync`; [`ToolProvider::parallel_safe`] ist `false` (Builds
-/// schreiben in dieselben Hilfsdateien).
+/// `Send + Sync`; [`ToolProvider::parallel_safe`] ist für alle drei
+/// Werkzeuge `false` (Builds schreiben in dieselben Hilfsdateien,
+/// `latex.template` legt Dateien an).
 ///
 /// # Beispiele
 /// ```rust
@@ -802,13 +1272,15 @@ impl ToolExecutor for LatexBuildExecutor {
 /// use harw_tools::spec::ToolName;
 ///
 /// let provider = LatexToolProvider::new();
-/// assert_eq!(provider.tools().len(), 1);
+/// assert_eq!(provider.tools().len(), 3);
 /// assert!(provider.executor(&ToolName::new("latex.build")).is_some());
+/// assert!(provider.executor(&ToolName::new("latex.template")).is_some());
+/// assert!(provider.executor(&ToolName::new("latex.check")).is_some());
 /// ```
 pub struct LatexToolProvider {
-    /// Zeitlimit eines Aufrufs in Sekunden.
+    /// Zeitlimit eines Aufrufs in Sekunden (alle Läufe zusammen).
     pub timeout_secs: u64,
-    /// Gemeinsames Budget für stdout+stderr in Bytes.
+    /// Gemeinsames Budget für stdout+stderr in Bytes (je Lauf).
     pub max_output_bytes: usize,
     /// rlimits und tmpfs-Größe je Aufruf.
     pub limits: ShellLimits,
@@ -825,8 +1297,9 @@ impl LatexToolProvider {
         Self::default()
     }
 
-    /// Setzt den Suchpfad für `latexmk` und die Engine (statt `PATH` des
-    /// Prozesses) — für Betreiber mit TeX außerhalb des `PATH` und für Tests.
+    /// Setzt den Suchpfad für `latexmk`, die Engine, `biber`, `kpsewhich`
+    /// und `fc-list` (statt `PATH` des Prozesses) — für Betreiber mit TeX
+    /// außerhalb des `PATH` und für Tests.
     #[must_use]
     pub fn with_search_path(mut self, search_path: impl Into<OsString>) -> Self {
         self.search_path = Some(search_path.into());
@@ -839,6 +1312,17 @@ impl LatexToolProvider {
     pub fn with_read_only_paths(mut self, paths: Vec<PathBuf>) -> Self {
         self.extra_read_only = paths;
         self
+    }
+
+    /// Die gemeinsame Startkonfiguration für die Executor.
+    fn runner(&self) -> SandboxRunner {
+        SandboxRunner {
+            max_output_bytes: self.max_output_bytes,
+            limits: self.limits,
+            extra_read_only: self.extra_read_only.clone(),
+            #[cfg(test)]
+            launch_directly: self.launch_directly,
+        }
     }
 
     /// Das Parameterschema: `file` (Pflicht), `engine` (Enum), `clean`.
@@ -904,32 +1388,46 @@ impl Default for LatexToolProvider {
 
 impl ToolProvider for LatexToolProvider {
     fn tools(&self) -> Vec<ToolSpec> {
-        vec![ToolSpec::Function(FunctionToolSpec {
-            name: ToolName::new(LATEX_BUILD_TOOL),
-            description: "Build a LaTeX document with latexmk inside the isolated project \
-                sandbox (no network, no shell escape, .latexmkrc ignored). Only the .tex file, \
-                the engine (xelatex|pdflatex|lualatex) and clean are selectable. Returns status \
-                (ok|failed|timeout|cleaned|not_installed), the PDF path and the first log errors. \
-                On not_installed stop and pass user_message to the user verbatim. \
-                Requires ExecuteProcess and WriteWorkspace."
-                .to_owned(),
-            parameters: Self::parameter_schema(),
-            strict: true,
-        })]
+        vec![
+            ToolSpec::Function(FunctionToolSpec {
+                name: ToolName::new(LATEX_BUILD_TOOL),
+                description: "Build a LaTeX document inside the isolated project sandbox \
+                    (no network, no shell escape, .latexmkrc ignored). Uses latexmk; without \
+                    latexmk the engine runs directly twice (biber in between when needed). \
+                    Only the .tex file, the engine (xelatex|pdflatex|lualatex) and clean are \
+                    selectable. Returns status (ok|ok_with_warnings|failed|timeout|cleaned|\
+                    not_installed), builder, the PDF path, pages, overfull boxes > 1pt with \
+                    source line and context, underfull_count, missing_chars, \
+                    language_warnings (missing hyphenation patterns) and the first log errors. \
+                    Fix ok_with_warnings findings before reporting success. On not_installed \
+                    stop and pass user_message to the user verbatim. Requires ExecuteProcess \
+                    and WriteWorkspace."
+                    .to_owned(),
+                parameters: Self::parameter_schema(),
+                strict: true,
+            }),
+            template::tool_spec(),
+            check::tool_spec(),
+        ]
     }
 
     fn executor(&self, name: &ToolName) -> Option<Arc<dyn ToolExecutor>> {
-        (name.as_str() == LATEX_BUILD_TOOL).then(|| {
-            Arc::new(LatexBuildExecutor {
+        match name.as_str() {
+            LATEX_BUILD_TOOL => Some(Arc::new(LatexBuildExecutor {
                 timeout_secs: self.timeout_secs,
-                max_output_bytes: self.max_output_bytes,
-                limits: self.limits,
                 search_path: self.search_path.clone(),
-                extra_read_only: self.extra_read_only.clone(),
-                #[cfg(test)]
-                launch_directly: self.launch_directly,
-            }) as Arc<dyn ToolExecutor>
-        })
+                runner: self.runner(),
+            }) as Arc<dyn ToolExecutor>),
+            LATEX_TEMPLATE_TOOL => {
+                Some(Arc::new(template::LatexTemplateExecutor::bundled()) as Arc<dyn ToolExecutor>)
+            }
+            LATEX_CHECK_TOOL => Some(Arc::new(check::LatexCheckExecutor {
+                timeout_secs: self.timeout_secs.min(check::CHECK_TIMEOUT_SECS),
+                search_path: self.search_path.clone(),
+                runner: self.runner(),
+            }) as Arc<dyn ToolExecutor>),
+            _ => None,
+        }
     }
 
     fn parallel_safe(&self, _name: &ToolName) -> bool {
@@ -1102,6 +1600,21 @@ mod tests {
                 "LaTeX Warning: There were undefined references.",
             ]
         );
+    }
+
+    /// Runde 7, Teil T3: Sprach- und Schriftwarnungen landen im Auszug,
+    /// Overfull-Boxen nicht (die stehen strukturiert im Ergebnis).
+    #[test]
+    fn test_log_excerpt_keeps_language_and_font_warnings() {
+        let log = "Package babel Warning: No hyphenation patterns were preloaded for\n\
+                   LaTeX Font Warning: Font shape `TU/DejaVuSerif(0)/m/sc' undefined\n\
+                   Package fontspec Warning: Font \"Fehlschrift\" does not contain script\n\
+                   Overfull \\hbox (20.0pt too wide) in paragraph at lines 1--2\n";
+        let excerpt = extract_log_excerpt(log);
+        assert_eq!(excerpt.len(), 3, "{excerpt:?}");
+        assert!(excerpt[0].contains("hyphenation patterns"));
+        assert!(excerpt[1].contains("Font shape"));
+        assert!(excerpt[2].contains("fontspec Warning"));
     }
 
     #[test]
@@ -1311,14 +1824,14 @@ mod tests {
         fake_binary(&bin, "xelatex", "exit 0")?;
         let toolchain = resolve_toolchain(bin.as_os_str(), LatexEngine::Xelatex, false)
             .map_err(|missing| TestError::Unexpected(format!("{missing:?}")))?;
-        assert_eq!(toolchain.latexmk, bin.join("latexmk"));
-        assert!(toolchain.sandbox_path.ends_with(MINIMAL_PATH));
+        assert_eq!(toolchain.builder, Builder::Latexmk(bin.join("latexmk")));
+        assert!(toolchain.env.sandbox_path.ends_with(MINIMAL_PATH));
         let root = dir
             .path()
             .join("texlive/2025")
             .canonicalize()
             .map_err(ctx("canon"))?;
-        assert_eq!(toolchain.install_roots, vec![root]);
+        assert_eq!(toolchain.env.install_roots, vec![root]);
         // Aufräumen braucht die Engine nicht.
         let clean_bin = dir.path().join("clean-bin");
         fs::create_dir_all(&clean_bin).map_err(ctx("clean bin"))?;
@@ -1327,13 +1840,226 @@ mod tests {
         Ok(())
     }
 
+    /// Runde 7, Teil T3: ohne `latexmk` wählt die Suche den direkten Weg
+    /// (mit `biber`, falls vorhanden); Aufräumen braucht weiter `latexmk`.
     #[test]
-    fn test_provider_lists_one_strict_tool_and_is_not_parallel_safe() {
+    fn test_toolchain_falls_back_to_direct_engine_without_latexmk() -> TestResult {
+        let dir = tempfile::tempdir().map_err(ctx("tempdir"))?;
+        let bin = dir.path().join("bin");
+        fs::create_dir_all(&bin).map_err(ctx("bin"))?;
+        fake_binary(&bin, "xelatex", "exit 0")?;
+        let toolchain = resolve_toolchain(bin.as_os_str(), LatexEngine::Xelatex, false)
+            .map_err(|missing| TestError::Unexpected(format!("{missing:?}")))?;
+        assert_eq!(
+            toolchain.builder,
+            Builder::Direct {
+                engine: bin.join("xelatex"),
+                biber: None,
+            }
+        );
+        assert_eq!(toolchain.builder.label(), "direct");
+        fake_binary(&bin, "biber", "exit 0")?;
+        let toolchain = resolve_toolchain(bin.as_os_str(), LatexEngine::Xelatex, false)
+            .map_err(|missing| TestError::Unexpected(format!("{missing:?}")))?;
+        assert_eq!(
+            toolchain.builder,
+            Builder::Direct {
+                engine: bin.join("xelatex"),
+                biber: Some(bin.join("biber")),
+            }
+        );
+        assert_eq!(
+            resolve_toolchain(bin.as_os_str(), LatexEngine::Xelatex, true),
+            Err(vec!["latexmk".to_owned()])
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn test_direct_engine_argv_is_fixed_without_shell_escape() {
+        let args: Vec<String> = direct_engine_args(OsStr::new("main.tex"))
+            .iter()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(
+            args,
+            [
+                "-interaction=nonstopmode",
+                "-halt-on-error",
+                "-file-line-error",
+                "-no-shell-escape",
+                "main.tex",
+            ]
+        );
+    }
+
+    #[test]
+    fn test_retarget_chdir_replaces_only_the_bwrap_chdir() {
+        let args: Vec<OsString> = [
+            "--unshare-all",
+            "--chdir",
+            "/ws",
+            "--",
+            "/usr/bin/xelatex",
+            "--chdir",
+            "x",
+        ]
+        .map(OsString::from)
+        .to_vec();
+        let retargeted = retarget_chdir(&args, Path::new("/ws/doc"));
+        let expected: Vec<OsString> = [
+            "--unshare-all",
+            "--chdir",
+            "/ws/doc",
+            "--",
+            "/usr/bin/xelatex",
+            "--chdir",
+            "x",
+        ]
+        .map(OsString::from)
+        .to_vec();
+        assert_eq!(retargeted, Some(expected));
+        let without: Vec<OsString> = ["--unshare-all", "--", "/bin/true"]
+            .map(OsString::from)
+            .to_vec();
+        assert_eq!(retarget_chdir(&without, Path::new("/ws/doc")), None);
+    }
+
+    /// Runde 7, Teil T3: Build ohne `latexmk` über den Rückfall. Die
+    /// Fake-Engine protokolliert argv und Arbeitsverzeichnis, legt im ersten
+    /// Lauf eine `.bcf` an und schreibt Log und PDF; `biber` läuft zwischen
+    /// den beiden Engine-Läufen.
+    #[tokio::test]
+    async fn test_fake_engine_builds_without_latexmk_via_direct_fallback() -> TestResult {
+        let dir = tempfile::tempdir().map_err(ctx("tempdir"))?;
+        let spec = sandbox(&dir, &full_rights())?;
+        let root = spec.workspace().canonical_root().to_path_buf();
+        fs::create_dir_all(root.join("doc")).map_err(ctx("doc"))?;
+        fs::write(root.join("doc/main.tex"), "x").map_err(ctx("tex"))?;
+        let bin = dir.path().join("bin");
+        fs::create_dir_all(&bin).map_err(ctx("bin"))?;
+        let trace = dir.path().join("trace.txt");
+        fake_binary(
+            &bin,
+            "xelatex",
+            &format!(
+                "echo \"xelatex $(pwd) $*\" >> '{trace}'\n\
+                 for a in \"$@\"; do f=\"$a\"; done\n\
+                 base=\"${{f%.tex}}\"\n\
+                 printf 'x' > \"$base.bcf\"\n\
+                 printf 'Overfull \\\\hbox (12.5pt too wide) in paragraph at lines 7--8\\n[]Zu breit\\nOutput written on %s.pdf (3 pages).\\n' \"$base\" > \"$base.log\"\n\
+                 printf '%%%%PDF-1.5' > \"$base.pdf\"",
+                trace = trace.display()
+            ),
+        )?;
+        fake_binary(
+            &bin,
+            "biber",
+            &format!(
+                "echo \"biber $(pwd) $*\" >> '{trace}'",
+                trace = trace.display()
+            ),
+        )?;
+        let mut provider = LatexToolProvider::new().with_search_path(bin.as_os_str());
+        provider.launch_directly = true;
+        let output = run(&provider, spec, json!({ "file": "doc/main.tex" })).await?;
+        let value = json_of(&output)?;
+        assert_eq!(value["builder"], "direct", "{value}");
+        assert_eq!(value["runs"], json!(["xelatex", "biber", "xelatex"]));
+        assert_eq!(value["status"], "ok_with_warnings", "{value}");
+        assert_eq!(value["pdf"], "doc/main.pdf");
+        assert_eq!(value["pages"], 3);
+        assert_eq!(value["overfull"][0]["line"], 7);
+        assert_eq!(value["overfull"][0]["pt"], 12.5);
+        let trace = fs::read_to_string(&trace).map_err(ctx("trace"))?;
+        let doc_dir = root.join("doc");
+        let lines: Vec<&str> = trace.lines().collect();
+        assert_eq!(lines.len(), 3, "{trace}");
+        let expected_engine = format!(
+            "xelatex {} -interaction=nonstopmode -halt-on-error -file-line-error \
+             -no-shell-escape main.tex",
+            doc_dir.display()
+        );
+        assert_eq!(lines[0], expected_engine);
+        assert_eq!(lines[1], format!("biber {} main", doc_dir.display()));
+        assert_eq!(lines[2], expected_engine);
+        Ok(())
+    }
+
+    /// Ein fehlgeschlagener erster Engine-Lauf beendet die Kette; ohne
+    /// `biber` gibt es einen Hinweis statt eines Laufs.
+    #[tokio::test]
+    async fn test_direct_fallback_stops_after_failed_engine_run() -> TestResult {
+        let dir = tempfile::tempdir().map_err(ctx("tempdir"))?;
+        let spec = sandbox(&dir, &full_rights())?;
+        let root = spec.workspace().canonical_root().to_path_buf();
+        fs::write(root.join("main.tex"), "x").map_err(ctx("tex"))?;
+        let bin = dir.path().join("bin");
+        fs::create_dir_all(&bin).map_err(ctx("bin"))?;
+        fake_binary(
+            &bin,
+            "xelatex",
+            "echo './main.tex:3: Undefined control sequence.'\nexit 1",
+        )?;
+        let mut provider = LatexToolProvider::new().with_search_path(bin.as_os_str());
+        provider.launch_directly = true;
+        let output = run(&provider, spec, json!({ "file": "main.tex" })).await?;
+        let value = json_of(&output)?;
+        assert_eq!(value["status"], "failed", "{value}");
+        assert_eq!(value["builder"], "direct");
+        assert_eq!(value["runs"], json!(["xelatex"]));
+        assert_eq!(value["exit_code"], 1);
+        Ok(())
+    }
+
+    /// Mit `latexmk`: fehlende Zeichen im Log machen aus „ok“
+    /// „ok_with_warnings“; Seitenzahl und Underfull-Zählung stehen im
+    /// Ergebnis.
+    #[tokio::test]
+    async fn test_latexmk_build_reports_pages_and_warnings() -> TestResult {
+        let dir = tempfile::tempdir().map_err(ctx("tempdir"))?;
+        let spec = sandbox(&dir, &full_rights())?;
+        let root = spec.workspace().canonical_root().to_path_buf();
+        fs::write(root.join("main.tex"), "x").map_err(ctx("tex"))?;
+        let bin = dir.path().join("bin");
+        fs::create_dir_all(&bin).map_err(ctx("bin"))?;
+        fake_binary(&bin, "xelatex", "exit 0")?;
+        fake_binary(
+            &bin,
+            "latexmk",
+            "for a in \"$@\"; do f=\"$a\"; done\n\
+             base=\"${f%.tex}\"\n\
+             printf 'Underfull \\\\hbox (badness 10000) in paragraph at lines 1--2\\n\
+             Missing character: There is no \\342\\234\\223 (U+2713) in font cmr10!\\n\
+             Output written on main.pdf (2 pages).\\n' > \"$base.log\"\n\
+             printf '%%PDF-1.5' > \"$base.pdf\"",
+        )?;
+        let mut provider = LatexToolProvider::new().with_search_path(bin.as_os_str());
+        provider.launch_directly = true;
+        let output = run(&provider, spec, json!({ "file": "main.tex" })).await?;
+        let value = json_of(&output)?;
+        assert_eq!(value["builder"], "latexmk", "{value}");
+        assert_eq!(value["status"], "ok_with_warnings", "{value}");
+        assert_eq!(value["pages"], 2);
+        assert_eq!(value["underfull_count"], 1);
+        assert_eq!(value["missing_chars"], json!(["✓ (U+2713) in font cmr10"]));
+        assert_eq!(value["overfull"], json!([]));
+        Ok(())
+    }
+
+    #[test]
+    fn test_provider_lists_three_strict_tools_and_is_not_parallel_safe() {
         let provider = LatexToolProvider::new();
         let tools = provider.tools();
-        assert_eq!(tools.len(), 1);
-        assert_eq!(tools[0].name(), LATEX_BUILD_TOOL);
-        assert!(!provider.parallel_safe(&ToolName::new(LATEX_BUILD_TOOL)));
+        let names: Vec<&str> = tools.iter().map(ToolSpec::name).collect();
+        assert_eq!(
+            names,
+            [LATEX_BUILD_TOOL, LATEX_TEMPLATE_TOOL, LATEX_CHECK_TOOL]
+        );
+        for name in [LATEX_BUILD_TOOL, LATEX_TEMPLATE_TOOL, LATEX_CHECK_TOOL] {
+            assert!(!provider.parallel_safe(&ToolName::new(name)), "{name}");
+            assert!(provider.executor(&ToolName::new(name)).is_some(), "{name}");
+        }
         assert!(provider.executor(&ToolName::new("shell.exec")).is_none());
     }
 

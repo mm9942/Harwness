@@ -20,7 +20,7 @@ tracing = { workspace = true }
 # Pinned to the exact version already resolved elsewhere in this workspace
 # (harw-secrets/Cargo.toml) so this addition needs no new dependency
 # resolution; `cargo add sha2` is unavailable in this task's tool sandbox.
-sha2 = "0.10.9"
+sha2 = "0.11.0"
 
 [lints]
 workspace = true

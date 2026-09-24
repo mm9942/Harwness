@@ -51,7 +51,7 @@ jobs:
       - name: Filter changed paths
         id: filter
         if: github.event_name == 'pull_request'
-        uses: dorny/paths-filter@v3
+        uses: dorny/paths-filter@v4
         with:
           # Alle Muster eines Filters müssen zutreffen: `rust` ist damit
           # „alles außer“ den klar Rust-fremden Pfaden. Bewusst so breit, weil
@@ -85,7 +85,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: Install pinned Rust (rust-toolchain.toml)
         run: |
@@ -147,7 +147,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       # rustup findet `rust-toolchain.toml` im Elternordner auch für dod/.
       - name: Install pinned Rust (rust-toolchain.toml)
@@ -183,7 +183,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       # Uses the repo's existing deny.toml (root of the checkout) — no
       # separate config needed. Die Action bringt ihre eigene Toolchain im
@@ -203,7 +203,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       # Offizielles Image des actionlint-Autors (rhysd); prüft alle Workflows
       # unter .github/workflows inkl. shellcheck für `run:`-Blöcke.

@@ -239,11 +239,23 @@ pub mod role_names {
     pub const MATRIX_ROLES: [&str; 4] =
         [MATRIX_PLAYER, MATRIX_UMPIRE, MATRIX_MARKET, MATRIX_REDCELL];
 
+    /// Game Master des Matrix-Games (Runde 7, Teil M): spezialisierter
+    /// Orchestrator (`role = "root-orchestrator"`), den die UIA per
+    /// `transfer_to_matrix-game-master` als Hintergrund-Kind startet. Er
+    /// entwirft aus Freitext ein Szenario, lässt es freigeben, spielt es mit
+    /// den vier Sitz-Rollen und liefert AAR plus `report.md`. Werkzeuge:
+    /// lesende `fs.*`/`doc.read_pdf` ([`crate::profile::RegistryProfile::MatrixReader`],
+    /// Reducer `ReadOnly`, kein Netz), `parent.message` und genau die
+    /// Matrix-Werkzeuge aus [`crate::profile::MATRIX_GAME_MASTER_TOOLS`]
+    /// (`agents/matrix-game-master.toml`).
+    pub const MATRIX_GAME_MASTER: &str = "matrix-game-master";
+
     /// Führt Befehls- und Dateioperationen im Auftrag des Haupt-Agenten aus
     /// und liefert eine Zusammenfassung statt Rohausgaben (Slice B7). Die
     /// TUI delegiert damit Befehlsfolgen an einen eigenen Worker, statt sie
-    /// als viele einzelne Tool-Aufrufe im Hauptfenster zu zeigen. Einzige
-    /// eingebaute Rolle mit [`RegistryProfile::Full`] — siehe
+    /// als viele einzelne Tool-Aufrufe im Hauptfenster zu zeigen. Profil ist
+    /// [`RegistryProfile::ShellExecution`] (ausschließlich `shell.exec`, kein
+    /// Dateisystem-Werkzeug, nie `sudo`) — nicht `Full`; siehe
     /// [`profile_for_role`] und die Begründung in `agents/executor.toml`.
     pub const EXECUTOR: &str = "executor";
 
@@ -373,6 +385,7 @@ pub mod role_names {
         MATRIX_UMPIRE,
         MATRIX_MARKET,
         MATRIX_REDCELL,
+        MATRIX_GAME_MASTER,
         EXECUTOR,
         MEMORY_STEWARD,
         UIA_WORKER,
@@ -564,6 +577,8 @@ pub const PARENT_MESSAGE_ROLES: &[&str] = &[
     role_names::UIA_SHELL_WORKER,
     role_names::UIA_LATEX_WRITER,
     role_names::AGENT_STEWARD,
+    // Runde 7, Teil M: Zwischenstände und die bis zu drei Kernfragen an die UIA.
+    role_names::MATRIX_GAME_MASTER,
 ];
 
 /// Liefert [`PARENT_MESSAGE_TOOLS`] für die Rollen aus
@@ -627,6 +642,57 @@ pub const SUDO_ROLES: &[&str] = &[role_names::UIA_SHELL_WORKER, "host-process-wo
 pub fn sudo_tools_for_role(role: &str) -> &'static [&'static str] {
     if SUDO_ROLES.contains(&role) {
         SUDO_TOOLS
+    } else {
+        &[]
+    }
+}
+
+// ── Runde 7, Teil M: Werkzeuge des Game Masters ─────────────────────────────
+
+/// Die lesenden bzw. nur in den Matrix-Speicher schreibenden Werkzeuge des
+/// Game Masters: `matrix.draft_scenario` (validiert ein Szenario und legt es
+/// unter `<profil>/knowledge/matrix/scenarios/` ab — harness-eigener
+/// Speicher, wie `plan.write` die Plan-Datei) und `matrix.status` (rein
+/// lesend). Beide deklarieren `model_tool(approval = "none")` und stehen in
+/// [`crate::AUTO_APPROVED_TOOLS`].
+pub const MATRIX_GAME_MASTER_READ_TOOLS: &[&str] = &["matrix.draft_scenario", "matrix.status"];
+
+/// Alle Werkzeuge des Game Masters in Provider-Reihenfolge
+/// (`harw_ops::matrix::game_master::game_master_operations`).
+/// `matrix.start`, `matrix.run` und `matrix.finish` deklarieren
+/// `model_tool(approval = "always")` (Sitz-Agenten kosten Budget,
+/// `matrix.finish` legt eine Berichtskopie im Workspace an) und stehen nie in
+/// [`crate::AUTO_APPROVED_TOOLS`].
+///
+/// # Warum nicht Teil eines [`RegistryProfile`]
+/// Wie [`ORCHESTRATION_TOOLS`]: die Operationen brauchen den
+/// `ManagedAgentSpawner` (Sitz-Agenten) und leben in `harw-ops`. Die
+/// Composition-Root (`harw-runtime/src/children.rs`) hängt sie über einen
+/// rollengebundenen `ModelToolProvider` ausschließlich an die Rollen aus
+/// [`matrix_tools_for_role`].
+pub const MATRIX_GAME_MASTER_TOOLS: &[&str] = &[
+    "matrix.draft_scenario",
+    "matrix.status",
+    "matrix.start",
+    "matrix.run",
+    "matrix.finish",
+];
+
+/// Liefert [`MATRIX_GAME_MASTER_TOOLS`] für [`role_names::MATRIX_GAME_MASTER`],
+/// sonst nichts.
+///
+/// # Beispiele
+/// ```rust
+/// use harw_registry_defaults::profile::{matrix_tools_for_role, role_names};
+///
+/// assert!(matrix_tools_for_role(role_names::MATRIX_GAME_MASTER).contains(&"matrix.run"));
+/// assert!(matrix_tools_for_role(role_names::ROOT_ORCHESTRATOR).is_empty());
+/// assert!(matrix_tools_for_role(role_names::MATRIX_PLAYER).is_empty());
+/// ```
+#[must_use]
+pub fn matrix_tools_for_role(role: &str) -> &'static [&'static str] {
+    if role == role_names::MATRIX_GAME_MASTER {
+        MATRIX_GAME_MASTER_TOOLS
     } else {
         &[]
     }
@@ -934,13 +1000,32 @@ const AGENT_DEFINITION_TOOLS: &[&str] = &[
 /// Die Werkzeuge von `harw-tool-shell`.
 pub(crate) const SHELL_TOOLS: &[&str] = &["shell.exec"];
 
-/// Das typisierte LaTeX-Build-Werkzeug von `harw-tool-shell`
-/// (`harw_tool_shell::LatexToolProvider`, Runde 4 Teil E): startet
-/// ausschließlich `latexmk` mit festem argv in der Bubblewrap-Sandbox, ohne
-/// Netz und ohne Shell-Escape. Verlangt `Permission::ExecuteProcess`, steht
-/// nicht in der Auto-Freigabe. Nur [`RegistryProfile::UiaLatexWriter`]
-/// registriert es.
-pub(crate) const LATEX_TOOLS: &[&str] = &[harw_tool_shell::LATEX_BUILD_TOOL];
+/// Die typisierten LaTeX-Werkzeuge von `harw-tool-shell`
+/// (`harw_tool_shell::LatexToolProvider`), in Registrierungsreihenfolge des
+/// Providers:
+/// - `latex.build` (Runde 4, Teil E): startet `latexmk` bzw. (Runde 7, Teil
+///   T3) ohne latexmk die Engine direkt, mit festem argv in der
+///   Bubblewrap-Sandbox, ohne Netz und ohne Shell-Escape; verlangt
+///   `Permission::ExecuteProcess`.
+/// - `latex.template` (Runde 7, Teil T2): kopiert `harw-report.sty` und das
+///   Gerüst in den Workspace, überschreibt nie; verlangt
+///   `Permission::WriteWorkspace` (siehe
+///   [`crate::authority::tool_permission`]).
+/// - `latex.check` (Runde 7, Teil T4): prüft Pakete, Schriften und Sprachen
+///   per `kpsewhich`/`fc-list` in derselben Sandbox; verlangt
+///   `Permission::ExecuteProcess`.
+///
+/// Keines steht in der Auto-Freigabe. Nur [`RegistryProfile::UiaLatexWriter`]
+/// registriert sie.
+pub(crate) const LATEX_TOOLS: &[&str] = &[
+    harw_tool_shell::LATEX_BUILD_TOOL,
+    LATEX_TEMPLATE_TOOL,
+    "latex.check",
+];
+
+/// Name von `latex.template` (Runde 7, Teil T2) — das einzige LaTeX-Werkzeug
+/// mit `WriteWorkspace` statt `ExecuteProcess`.
+pub(crate) const LATEX_TEMPLATE_TOOL: &str = "latex.template";
 
 /// Die Werkzeuge von `harw-tool-process`: `process.list` (Vorschau, sendet
 /// nie ein Signal) und `process.kill` (destruktiv, immer freigabepflichtig
@@ -1327,7 +1412,8 @@ pub enum RegistryProfile {
     MatrixReader,
     /// LaTeX-Schreibspezialisierung der UIA: alle sieben `fs.*`-Werkzeuge
     /// inklusive `fs.write` ([`FS_FULL_TOOLS`]) plus [`DOC_TOOLS`]
-    /// (`doc.read_pdf`) plus [`LATEX_TOOLS`] (`latex.build`) — kein
+    /// (`doc.read_pdf`) plus [`LATEX_TOOLS`] (`latex.build`, `latex.template`,
+    /// `latex.check`) — kein
     /// `shell.*`, kein `process.*`, kein `web.*`, kein `deps.*`, kein
     /// `explore.*`, kein `lens.ask`. Rechte genau
     /// `{ReadWorkspace, WriteWorkspace, ExecuteProcess}`.
@@ -1794,6 +1880,11 @@ pub fn profile_for_role(role: &str) -> Option<RegistryProfile> {
         | role_names::MATRIX_UMPIRE
         | role_names::MATRIX_MARKET
         | role_names::MATRIX_REDCELL => Some(RegistryProfile::MatrixReader),
+        // Runde 7, Teil M: der Game Master liest höchstens einen Brief im
+        // Workspace (dieselbe lesende Fläche ohne Netz, Schreiben oder Exec);
+        // seine Matrix-Werkzeuge steuert die Composition-Root bei (siehe
+        // `matrix_tools_for_role`).
+        role_names::MATRIX_GAME_MASTER => Some(RegistryProfile::MatrixReader),
         // Einzige eingebaute Rolle mit der Prozessoberfläche: sie führt nur
         // beauftragte Sandbox-Prozesse aus. Das ist eine ausdrückliche,
         // dokumentierte Ausnahme (siehe `agents/executor.toml` und den Test
@@ -3571,10 +3662,11 @@ mod tests {
         Ok(())
     }
 
-    /// `UiaLatexWriter` (Runde 4, Teil E): exakt `fs.*` inklusive
-    /// `fs.write`, `doc.read_pdf` und `latex.build` — nie `shell.*`,
-    /// `process.*`, `web.*`, `deps.*`, `explore.*`, `lens.ask`; die montierte
-    /// Registry trägt tatsächlich einen Executor für `latex.build`.
+    /// `UiaLatexWriter` (Runde 4, Teil E; Runde 7, Teil T5): exakt `fs.*`
+    /// inklusive `fs.write`, `doc.read_pdf`, `latex.build`, `latex.template`
+    /// und `latex.check` — nie `shell.*`, `process.*`, `web.*`, `deps.*`,
+    /// `explore.*`, `lens.ask`; die montierte Registry trägt tatsächlich
+    /// einen Executor für jedes LaTeX-Werkzeug.
     #[test]
     fn test_uia_latex_writer_profile_exact_tool_surface() -> TestResult {
         let expected = vec![
@@ -3587,6 +3679,8 @@ mod tests {
             "fs.grep",
             "doc.read_pdf",
             "latex.build",
+            "latex.template",
+            "latex.check",
         ];
         assert_eq!(RegistryProfile::UiaLatexWriter.tool_names(), expected);
         assert_eq!(
@@ -3596,14 +3690,16 @@ mod tests {
         let assembled = assemble(RegistryProfile::UiaLatexWriter)?;
         let expected_owned: Vec<String> = expected.iter().map(|t| (*t).to_owned()).collect();
         assert_eq!(registered_names(&assembled), expected_owned);
-        assert!(
-            assembled
-                .registry
-                .tool_providers()
-                .iter()
-                .any(|provider| provider.executor(&ToolName::new("latex.build")).is_some()),
-            "latex.build braucht einen Executor"
-        );
+        for tool in ["latex.build", "latex.template", "latex.check"] {
+            assert!(
+                assembled
+                    .registry
+                    .tool_providers()
+                    .iter()
+                    .any(|provider| provider.executor(&ToolName::new(tool)).is_some()),
+                "{tool} braucht einen Executor"
+            );
+        }
         Ok(())
     }
 

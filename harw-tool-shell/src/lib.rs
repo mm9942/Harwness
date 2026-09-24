@@ -32,7 +32,11 @@
 //!   (`shell.exec` mit `request_host`, nur mit TUI-Freigabekanal; Runde 5,
 //!   Teil N)
 //! - [`latex`] — [`LatexToolProvider`]: typisiertes Werkzeug `latex.build`
-//!   (festes `latexmk`-argv in derselben Bubblewrap-Sandbox, Runde 4 Teil E)
+//!   (festes `latexmk`-argv in derselben Bubblewrap-Sandbox, Runde 4 Teil E;
+//!   Runde 7 Teil T3: Rückfall ohne `latexmk`, Seitenzahl, Overfull-Boxen,
+//!   `ok_with_warnings`), dazu `latex.template` (Vorlage `harw-report.sty`
+//!   plus Gerüst, Teil T2) und `latex.check` (Vorabprüfung per `kpsewhich`/
+//!   `fc-list`, Teil T4)
 //! - [`sudo`] — [`SudoToolProvider`]: Werkzeug `host.sudo_exec` (ein Root-Befehl
 //!   mit exaktem argv über festgepinntes `sudo`, freigegeben im eigenen
 //!   TUI-Fenster; Fragekanal [`SudoPrompt`]/[`SudoAnswer`], Runde 5 Teil B)
@@ -66,7 +70,9 @@ pub use host_permit_prompt::{
     HostPermitHandles, HostPermitPrompt, HostPermitPromptReceiver, HostPermitPromptSender,
     HostPermitVariant, SANDBOX_LEASE_WORKER_DEFINITION, host_permit_prompt_channel,
 };
-pub use latex::{LATEX_BUILD_TOOL, LatexEngine, LatexToolProvider};
+pub use latex::{
+    LATEX_BUILD_TOOL, LATEX_CHECK_TOOL, LATEX_TEMPLATE_TOOL, LatexEngine, LatexToolProvider,
+};
 pub use limits::{ShellLimits, ShellLimitsError};
 pub use sudo::{
     SUDO_EXEC_TOOL, SUDO_MAX_SECRET_BYTES, SUDO_PROMPT_TIMEOUT, SudoAnswer, SudoAuditRecord,

@@ -108,6 +108,24 @@ pub enum SettingsProviderAction {
         /// Modell-IDs dieses Providers, kommagetrennt.
         #[arg(long, value_delimiter = ',', value_hint = ValueHint::Other)]
         models: Vec<String>,
+        /// Credential-Transport: `bearer` (Standard bei Schlüssel), `x-api-key`,
+        /// `api-key` oder `none`. Ohne Angabe: `none` für lokale Endpunkte
+        /// ohne `--auth`, sonst die Vorgabe des Transports (Runde 7, Teil L1).
+        #[arg(
+            long = "auth-header",
+            value_parser = ["bearer", "x-api-key", "api-key", "none"],
+            conflicts_with = "no_auth"
+        )]
+        auth_header: Option<String>,
+        /// Kein Schlüssel und kein Auth-Header, z. B. für einen lokalen
+        /// vLLM- oder LM-Studio-Server (gleichbedeutend mit
+        /// `--auth-header none` ohne `--auth`).
+        #[arg(long = "no-auth", conflicts_with = "auth")]
+        no_auth: bool,
+        /// Erlaubt unverschlüsseltes `http` zu einer privaten LAN-IP
+        /// (`10/8`, `172.16/12`, `192.168/16`); sonst nur Loopback.
+        #[arg(long = "allow-insecure-lan")]
+        allow_insecure_lan: bool,
     },
     /// Entfernt einen Provider.
     Remove {

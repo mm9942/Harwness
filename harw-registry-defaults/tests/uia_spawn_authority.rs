@@ -225,3 +225,41 @@ fn test_matrix_roles_are_read_only_worker_roles_fit_for_the_uia_allowlist() -> T
     }
     Ok(())
 }
+
+/// Runde 7, Teil M: der Game Master ist organisatorisch ein
+/// Root-Orchestrator — die UIA darf ihn starten (Hintergrund-Kind), er selbst
+/// darf darunter nur Worker (die Sitz-Rollen) starten, und er trägt weder
+/// Netz noch Schreib- oder Ausführungsrecht.
+#[test]
+fn test_game_master_is_a_uia_spawnable_read_only_orchestrator() -> TestResult {
+    let roles = resolved_roles()?;
+    let role = role_names::MATRIX_GAME_MASTER;
+    let ir = roles.get(role).ok_or(TestError::Unexpected(format!(
+        "builtin role '{role}' must be registered"
+    )))?;
+    assert_eq!(ir.role(), AgentRoleId::RootOrchestrator);
+    assert!(can_spawn(AgentRoleId::UserInterface, ir.role()));
+    for seat in role_names::MATRIX_ROLES {
+        let seat_ir = roles.get(seat).ok_or(TestError::Unexpected(format!(
+            "builtin role '{seat}' must be registered"
+        )))?;
+        assert!(
+            can_spawn(ir.role(), seat_ir.role()),
+            "der Game Master muss {seat} starten dürfen"
+        );
+    }
+    assert_eq!(profile_for_role(role), Some(RegistryProfile::MatrixReader));
+    assert_eq!(
+        authority_reducer_for_role(role),
+        Some(AuthorityReducer::ReadOnly)
+    );
+    let required = RegistryProfile::MatrixReader.required_permissions();
+    for forbidden in [
+        Permission::NetworkAccess,
+        Permission::WriteWorkspace,
+        Permission::ExecuteProcess,
+    ] {
+        assert!(!required.contains(forbidden), "{forbidden:?}");
+    }
+    Ok(())
+}

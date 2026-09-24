@@ -482,7 +482,7 @@
 use crate::cancel::{CancelReason, CancelToken};
 use crate::capture::{ToolOutcome, ToolOutcomeStatus};
 use crate::error::{CoreError, CoreResult};
-use crate::guard::{DriftEvent, DriftKind, GuardVerdict, TurnGuard};
+use crate::guard::{DriftEvent, DriftKind, GuardVerdict, SessionGuardVerdict, TurnGuard};
 use crate::model::{ModelProvider, ModelRequest, RequestIdentity};
 use crate::session::{AgentSession, SpawnContext, TurnHandle};
 use crate::state_store::{StateStore, StateStoreError, UsageRound};
@@ -1813,7 +1813,90 @@ pub fn collect_tools(session: &AgentSession) -> CoreResult<Vec<ToolSpec>> {
     // byte-identisches Tool-Array über Runden hinweg; die Registrierungs-
     // reihenfolge der `ToolProvider` ist dafür kein verlässliches Kriterium.
     specs.sort_by(|a, b| a.name().cmp(b.name()));
+    // Runde 7, Teil L9: kleine Kontextfenster bekommen kompakte Schemas
+    // (deterministisch, damit der Prompt-Cache stabil bleibt).
+    if session.compact_tool_schemas() {
+        specs = specs.into_iter().map(compact_tool_spec).collect();
+    }
     Ok(specs)
+}
+
+/// Höchstlänge (Zeichen) einer Werkzeugbeschreibung im kompakten Schema.
+pub const COMPACT_TOOL_DESCRIPTION_CHARS: usize = 160;
+
+/// Höchstlänge (Zeichen) einer Parameterbeschreibung im kompakten Schema.
+pub const COMPACT_PARAMETER_DESCRIPTION_CHARS: usize = 80;
+
+/// Kompakte Form eines Werkzeugschemas für kleine Kontextfenster (Runde 7,
+/// Teil L9).
+///
+/// # Beschreibung
+/// Kürzt die Werkzeugbeschreibung auf ihren ersten Satz (höchstens
+/// [`COMPACT_TOOL_DESCRIPTION_CHARS`] Zeichen) und jede Parameter-
+/// beschreibung rekursiv auf [`COMPACT_PARAMETER_DESCRIPTION_CHARS`]
+/// Zeichen. Namen, Typen, `required`, `enum` und Vorgaben bleiben — der
+/// Vertrag des Werkzeugs ändert sich nicht.
+///
+/// # Arguments
+/// - `spec` (`ToolSpec`): das vollständige Schema.
+///
+/// # Returns
+/// Das kompakte Schema.
+#[must_use]
+pub fn compact_tool_spec(spec: ToolSpec) -> ToolSpec {
+    match spec {
+        ToolSpec::Function(mut function) => {
+            function.description = compact_text(
+                first_sentence(&function.description),
+                COMPACT_TOOL_DESCRIPTION_CHARS,
+            );
+            compact_schema_descriptions(&mut function.parameters);
+            ToolSpec::Function(function)
+        }
+    }
+}
+
+/// Der erste Satz eines Textes (bis einschließlich `. `, sonst alles).
+fn first_sentence(text: &str) -> &str {
+    let trimmed = text.trim();
+    match trimmed.find(". ") {
+        Some(index) => &trimmed[..=index],
+        None => trimmed,
+    }
+}
+
+/// Kürzt auf `max` Zeichen (mit „…").
+fn compact_text(text: &str, max: usize) -> String {
+    let single_line = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    if single_line.chars().count() <= max {
+        return single_line;
+    }
+    let mut out: String = single_line.chars().take(max.saturating_sub(1)).collect();
+    out.push('…');
+    out
+}
+
+/// Kürzt Parameterbeschreibungen rekursiv (Runde 7, Teil L9).
+fn compact_schema_descriptions(schema: &mut JsonSchema) {
+    if let Some(description) = schema.description.take() {
+        schema.description = Some(compact_text(
+            &description,
+            COMPACT_PARAMETER_DESCRIPTION_CHARS,
+        ));
+    }
+    if let Some(properties) = schema.properties.as_mut() {
+        for property in properties.values_mut() {
+            compact_schema_descriptions(property);
+        }
+    }
+    if let Some(items) = schema.items.as_mut() {
+        compact_schema_descriptions(items);
+    }
+    if let Some(variants) = schema.any_of.as_mut() {
+        for variant in variants.iter_mut() {
+            compact_schema_descriptions(variant);
+        }
+    }
 }
 
 /// Sucht den zuständigen `ToolExecutor` für einen Tool-Namen.
@@ -1845,6 +1928,95 @@ pub fn find_executor(session: &AgentSession, name: &ToolName) -> Option<Arc<dyn 
         .tool_providers()
         .iter()
         .find_map(|p| p.executor(name))
+}
+
+/// Entfernt Top-Level-Argumente mit dem String `"null"`, die im Schema des
+/// Werkzeugs **nicht** `required` sind (Runde 7, Teil B3).
+///
+/// # Beschreibung
+/// Manche Modelle füllen optionale Parameter mit dem String `"null"` statt
+/// sie wegzulassen (beobachtet bei `diary`, `fs.glob`, `deps.*`); die
+/// Ausführer lasen daraus einen echten Wert (Pfad „null", Filter „null").
+/// Nur Top-Level-Felder werden betrachtet; Pflichtfelder bleiben unberührt
+/// (dort ist „null" ein — wenn auch seltsamer — Wert des Modells). Ohne
+/// bekanntes Schema (Werkzeug unbekannt oder deaktiviert) bleibt der Aufruf
+/// unverändert.
+///
+/// # Arguments
+/// - `session` (`&AgentSession`): liefert die Werkzeugschemas.
+/// - `calls` (`&mut [ToolCall]`): die Aufrufe einer Modellantwort.
+pub(crate) fn normalize_null_string_arguments(session: &AgentSession, calls: &mut [ToolCall]) {
+    for call in calls.iter_mut() {
+        let has_null_string = call.arguments.as_object().is_some_and(|map| {
+            map.values()
+                .any(|value| value.as_str() == Some(NULL_STRING_ARGUMENT))
+        });
+        if !has_null_string {
+            continue;
+        }
+        let Some(schema) = tool_parameters_schema(session, &call.name) else {
+            continue;
+        };
+        let removed = strip_null_string_arguments(&mut call.arguments, &schema);
+        if !removed.is_empty() {
+            tracing::info!(
+                tool = %call.name,
+                fields = ?removed,
+                "turn_loop.null_string_arguments_removed"
+            );
+        }
+    }
+}
+
+/// Der String, den Modelle fälschlich für „nicht gesetzt" schicken.
+const NULL_STRING_ARGUMENT: &str = "null";
+
+/// Das Parameterschema eines aktivierten Werkzeugs (Runde 7, Teil B3).
+fn tool_parameters_schema(session: &AgentSession, name: &ToolName) -> Option<JsonSchema> {
+    if !session.activation().is_tool_enabled(name) {
+        return None;
+    }
+    session
+        .registry()
+        .tool_providers()
+        .iter()
+        .flat_map(|provider| provider.tools())
+        .find_map(|spec| match spec {
+            ToolSpec::Function(function) if &function.name == name => Some(function.parameters),
+            ToolSpec::Function(_) => None,
+        })
+}
+
+/// Entfernt aus `arguments` jedes Top-Level-Feld mit dem String `"null"`,
+/// das in `schema.required` nicht vorkommt (Runde 7, Teil B3).
+///
+/// # Arguments
+/// - `arguments` (`&mut serde_json::Value`): die Argumente (nur ein Objekt
+///   wird verändert).
+/// - `schema` (`&JsonSchema`): das Parameterschema des Werkzeugs.
+///
+/// # Returns
+/// Die Namen der entfernten Felder (sortiert).
+pub(crate) fn strip_null_string_arguments(
+    arguments: &mut serde_json::Value,
+    schema: &JsonSchema,
+) -> Vec<String> {
+    let Some(map) = arguments.as_object_mut() else {
+        return Vec::new();
+    };
+    let required = schema.required.as_deref().unwrap_or_default();
+    let mut removed: Vec<String> = map
+        .iter()
+        .filter(|(key, value)| {
+            value.as_str() == Some(NULL_STRING_ARGUMENT) && !required.iter().any(|r| r == *key)
+        })
+        .map(|(key, _)| key.clone())
+        .collect();
+    removed.sort();
+    for key in &removed {
+        map.remove(key);
+    }
+    removed
 }
 
 /// Resolve an executor only when its provider explicitly declares the tool
@@ -2187,6 +2359,82 @@ async fn apply_pitfall_advice(
     };
     report_drift(session, store, &event).await;
     Some(format!("[harw-Wächter] {hint}"))
+}
+
+/// Meldet, ob ein Aufruf von den sitzungsweiten Wächtern (Runde 7, Teile
+/// A2/A5) betroffen sein kann — dann läuft die Antwort sequenziell, damit
+/// Zählung, Ablehnung und Hinweis je Aufruf in Reihenfolge greifen.
+fn session_guard_applies(session: &AgentSession, tool_name: &str) -> bool {
+    session.guard_policy().enabled
+        && (tool_name == crate::guard::AGENT_STATUS_TOOL_NAME
+            || (session.is_read_budgeted_orchestrator()
+                && crate::guard::is_orchestrator_read_tool(tool_name)))
+}
+
+/// Befragt die sitzungsweiten Wächter **vor** einer Werkzeugausführung
+/// (Runde 7, Teile A2/A5).
+///
+/// # Beschreibung
+/// - **Lesebudget** (A2): nur für Orchestrator-Kindsitzungen
+///   ([`AgentSession::is_read_budgeted_orchestrator`]); ab dem
+///   `orchestrator_read_warn`-ten Lesezugriff ein Hinweis, über
+///   `orchestrator_read_limit` hinaus eine Ablehnung.
+/// - **Polling** (A5): `agent.status` auf dieselbe `child_id` binnen 30 s
+///   bekommt einen Hinweis.
+///
+/// Jeder Befund wird über [`report_drift`] gemeldet; ein Hinweis wird an
+/// `pending_hint` angehängt (und von [`apply_tool_guard`] an das Ergebnis
+/// dieses Aufrufs gehängt).
+///
+/// # Returns
+/// `Some(meldung)`, wenn der Aufruf abgelehnt werden muss (die Meldung ist
+/// sein Fehlerergebnis); sonst `None`.
+async fn apply_session_guard(
+    session: &mut AgentSession,
+    store: &dyn StateStore,
+    pending_hint: &mut Option<String>,
+    tool_name: &str,
+    arguments: &serde_json::Value,
+) -> Option<String> {
+    if !session_guard_applies(session, tool_name) {
+        return None;
+    }
+    let policy = session.guard_policy();
+    let session_id = session.id().clone();
+    let mut verdicts = Vec::with_capacity(2);
+    if session.is_read_budgeted_orchestrator() {
+        verdicts.push(session.guard_state_mut().observe_orchestrator_read(
+            &policy,
+            &session_id,
+            tool_name,
+        ));
+    }
+    verdicts.push(session.guard_state_mut().observe_status_poll(
+        &policy,
+        &session_id,
+        tool_name,
+        arguments,
+        Instant::now(),
+    ));
+    let mut denied = None;
+    for verdict in verdicts {
+        match verdict {
+            SessionGuardVerdict::Continue => {}
+            SessionGuardVerdict::Warn { event, hint } => {
+                report_drift(session, store, &event).await;
+                *pending_hint = Some(match pending_hint.take() {
+                    Some(existing) => format!("{existing}\n\n{hint}"),
+                    None => hint,
+                });
+            }
+            SessionGuardVerdict::Deny { event, message } => {
+                report_drift(session, store, &event).await;
+                tracing::warn!(tool = tool_name, "turn_loop.read_budget_denied");
+                denied = Some(message);
+            }
+        }
+    }
+    denied
 }
 
 /// Wendet die Turn-Wächter (Addendum F+G) auf ein einzelnes, bereits
@@ -3289,7 +3537,7 @@ async fn drive_turn(
         // itself (a cancel-aware provider observed the token before this
         // `select!` did) — routed through the identical `cancel_turn` path
         // rather than the ordinary `?`-propagated `CoreError::Model(...)`.
-        let response = match response {
+        let mut response = match response {
             Ok(response) => response,
             Err(crate::model::ModelError::Cancelled) => {
                 return cancel_turn(
@@ -3661,6 +3909,11 @@ async fn drive_turn(
             }
         }
 
+        // Runde 7, Teil B3: optionale Argumente, die das Modell als String
+        // `"null"` schickt, werden vor jeder Ausführung (und vor dem Eintrag
+        // in den Verlauf) entfernt — gilt für Wurzel- und Kind-Turns.
+        normalize_null_string_arguments(session, &mut response.tool_calls);
+
         // Prüfpunkt vor jeder Werkzeugausführung: Abbruch, Aufrufzahl, Wanduhr.
         // Trifft er zu, bekommt jeder noch offene Tool-Call dieser Antwort ein
         // synthetisches Fehlerergebnis, damit der Verlauf provider-gültig
@@ -3732,9 +3985,21 @@ async fn drive_turn(
             // a. Guardrail. Eine Entscheidung aus der Parallel-Vorprüfung wird
             // verbraucht statt neu eingeholt: ein Approval-Handler darf zu
             // demselben Call nicht zweimal befragt werden.
-            let decision = match prepared.take(position) {
-                Some(decision) => decision,
-                None => check_approval(session, &call).await,
+            // Runde 7, Teile A2/A5: sitzungsweite Wächter vor der Freigabe —
+            // ein über das Lesebudget hinausgehender Aufruf wird abgelehnt,
+            // ohne erst eine Freigabe einzuholen.
+            let session_denial = apply_session_guard(
+                session,
+                store,
+                &mut pending_guard_hint,
+                call.name.as_str(),
+                &call.arguments,
+            )
+            .await;
+            let decision = match (session_denial, prepared.take(position)) {
+                (Some(message), _) => ApprovalDecision::Deny(message),
+                (None, Some(decision)) => decision,
+                (None, None) => check_approval(session, &call).await,
             };
             match decision {
                 ApprovalDecision::Allow => {}
@@ -3943,14 +4208,14 @@ async fn drive_turn(
             // Wächter-Beratung vor der Ausführung (Addendum F+G): ein
             // Treffer wird sofort gemeldet, der Hinweis aber erst an das
             // Ergebnis DIESES Aufrufs angehängt, sobald es feststeht.
-            if let Some(hint) =
-                apply_pitfall_advice(session, store, &tool_name, &call.arguments).await
-            {
-                pending_guard_hint = Some(match pending_guard_hint.take() {
-                    Some(existing) => format!("{existing}\n\n{hint}"),
-                    None => hint,
-                });
-            }
+            // Runde 7, Teil B5: der Pitfall-Hinweis wird nicht mehr über
+            // `pending_guard_hint` weitergereicht (dort konnte er an das
+            // Ergebnis eines ANDEREN Werkzeugs rutschen, etwa wenn der Aufruf
+            // abgebrochen wurde oder kein `TurnGuard` aktiv ist), sondern
+            // unten direkt an das Ergebnis dieses Aufrufs gehängt — oder
+            // verworfen.
+            let pitfall_hint =
+                apply_pitfall_advice(session, store, &tool_name, &call.arguments).await;
             let tool_span = tracing::info_span!("tool.call", tool_name = %tool_name);
             // Zweites Feld: `true`, wenn der Ausführer `ToolsError::Cancelled`
             // meldete (der `ToolExecutionContext` unten trägt `control`s
@@ -4053,6 +4318,11 @@ async fn drive_turn(
                 .await;
             }
             let (mut result_value, result_duration_ms) = result;
+            // Runde 7, Teil B5: Pitfall-Hinweis nur an das Ergebnis desselben
+            // Aufrufs (gleiches Werkzeug).
+            if let Some(hint) = pitfall_hint.as_deref() {
+                append_hint(&mut result_value, hint);
+            }
             let abort_reason = apply_tool_guard(
                 session,
                 store,
@@ -4977,6 +5247,14 @@ async fn try_execute_parallel_calls(
     control: &TurnControl,
 ) -> CoreResult<ParallelOutcome> {
     if calls.len() < 2 || calls.iter().any(|call| handoff_role(&call.name).is_some()) {
+        return Ok(ParallelOutcome::NotApplicable);
+    }
+    // Runde 7, Teile A2/A5: Lesebudget und Polling-Erkennung zählen je
+    // Aufruf in Reihenfolge — solche Antworten laufen sequenziell.
+    if calls
+        .iter()
+        .any(|call| session_guard_applies(session, call.name.as_str()))
+    {
         return Ok(ParallelOutcome::NotApplicable);
     }
     let mut jobs = Vec::with_capacity(calls.len());
@@ -9463,5 +9741,342 @@ mod tests {
         assert!(budget.overflows(6_001));
         assert!(!budget.overflows(6_000));
         assert_eq!(budget.emergency_target(60), 3_600);
+    }
+
+    // --- Runde 7, Teile A2/A5: sitzungsweite Wächter ---------------------
+
+    /// Sitzung mit sechs identischen `fs.read`-Aufrufen in einer Antwort;
+    /// `parent` entscheidet, ob es eine Kind-Sitzung ist.
+    async fn run_six_reads(
+        parent: Option<harw_types::SessionId>,
+        organizational_role: harw_agent_dsl::roles::AgentRoleId,
+    ) -> TestResult<(usize, Vec<ToolCallResult>)> {
+        let executions = Arc::new(AtomicUsize::new(0));
+        let provider = StubParallelProvider::instant(&["fs.read"], Arc::clone(&executions));
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let registry = ExtensionRegistryBuilder::default()
+            .tool_provider(provider)
+            .build();
+        let mut context = test_spawn_context()?;
+        context.organizational_role = organizational_role;
+        let mut session = AgentSession::new(AgentRole::Assistant, parent, registry, tx)
+            .with_spawn_context(context);
+        let store = crate::state_store::InMemoryStateStore::new();
+        let calls: Vec<ToolCall> = (0..6)
+            .map(|index| ToolCall {
+                id: ToolCallId::new(),
+                name: ToolName::new("fs.read"),
+                arguments: serde_json::json!({ "path": format!("src/f{index}.rs") }),
+            })
+            .collect();
+        let model = ScriptedModel::new(vec![
+            response_with(calls),
+            crate::model::ModelResponse::text("fertig"),
+        ]);
+        let outcome = run_turn(&mut session, &model, &store, TurnInput::user("überblick"))
+            .await
+            .map_err(ctx("der Turn läuft durch"))?;
+        if !matches!(outcome, TurnOutcome::Completed) {
+            return Err(TestError::Unexpected(format!("outcome {outcome:?}")));
+        }
+        let results = session
+            .history()
+            .items()
+            .iter()
+            .filter_map(|item| match item {
+                TurnItem::ToolResult(result) => Some(result.result.clone()),
+                _ => None,
+            })
+            .collect();
+        Ok((executions.load(Ordering::SeqCst), results))
+    }
+
+    #[tokio::test]
+    async fn the_sixth_read_of_an_orchestrator_child_is_denied() -> TestResult {
+        let (executed, results) = run_six_reads(
+            Some(harw_types::SessionId::new()),
+            harw_agent_dsl::roles::AgentRoleId::RootOrchestrator,
+        )
+        .await?;
+        assert_eq!(executed, 5, "only five own reads may run");
+        assert_eq!(results.len(), 6);
+        let Some(ToolCallResult::Error { message }) = results.last() else {
+            return Err(TestError::Unexpected(format!(
+                "the sixth read must be an error: {results:?}"
+            )));
+        };
+        assert!(message.contains("Lesebudget erschöpft"), "{message}");
+        assert!(message.contains("delegate_wave"), "{message}");
+        let Some(ToolCallResult::Success { value }) = results.get(3) else {
+            return Err(TestError::Unexpected("the fourth read runs".to_owned()));
+        };
+        assert!(
+            value.to_string().contains("Lesezugriff 4 von 5"),
+            "the fourth read carries a warning: {value}"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn non_orchestrators_and_root_sessions_read_without_a_budget() -> TestResult {
+        let (worker, _) = run_six_reads(
+            Some(harw_types::SessionId::new()),
+            harw_agent_dsl::roles::AgentRoleId::Worker,
+        )
+        .await?;
+        assert_eq!(worker, 6, "a worker child reads freely");
+        let (root, _) =
+            run_six_reads(None, harw_agent_dsl::roles::AgentRoleId::RootOrchestrator).await?;
+        assert_eq!(root, 6, "a root session without parent reads freely");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn repeated_agent_status_on_the_same_child_carries_a_polling_hint() -> TestResult {
+        let executions = Arc::new(AtomicUsize::new(0));
+        let provider = StubParallelProvider::instant(&["agent.status"], Arc::clone(&executions));
+        let mut session =
+            guarded_session(provider, Arc::new(CountingApproval::allow_everything()))?;
+        let store = crate::state_store::InMemoryStateStore::new();
+        let status_call = || ToolCall {
+            id: ToolCallId::new(),
+            name: ToolName::new("agent.status"),
+            arguments: serde_json::json!({ "child_id": "kind-1" }),
+        };
+        let model = ScriptedModel::new(vec![
+            response_with(vec![status_call()]),
+            response_with(vec![status_call()]),
+            crate::model::ModelResponse::text("warte"),
+        ]);
+        let outcome = run_turn(&mut session, &model, &store, TurnInput::user("status"))
+            .await
+            .map_err(ctx("der Turn läuft durch"))?;
+        assert!(matches!(outcome, TurnOutcome::Completed));
+        let results: Vec<String> = session
+            .history()
+            .items()
+            .iter()
+            .filter_map(|item| match item {
+                TurnItem::ToolResult(result) => Some(format!("{:?}", result.result)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(results.len(), 2);
+        assert!(!results[0].contains("Benachrichtigung"), "{}", results[0]);
+        assert!(results[1].contains("Benachrichtigung"), "{}", results[1]);
+        assert_eq!(
+            executions.load(Ordering::SeqCst),
+            2,
+            "polling is not blocked"
+        );
+        Ok(())
+    }
+
+    // --- Runde 7, Teil B5: Pitfall-Hinweis nur am gleichen Werkzeug -------
+
+    /// Berater, der nur für `plan.update` einen Pitfall meldet.
+    struct PlanPitfall;
+
+    impl crate::guard::PitfallAdvisor for PlanPitfall {
+        fn advise(&self, tool_name: &str, _arguments: &serde_json::Value) -> Option<String> {
+            (tool_name == "plan.update")
+                .then(|| "PLAN-PITFALL: Plan nicht überschreiben".to_owned())
+        }
+    }
+
+    async fn pitfall_turn(
+        policy: crate::guard::GuardPolicy,
+        responses: Vec<crate::model::ModelResponse>,
+    ) -> TestResult<Vec<(String, String)>> {
+        let executions = Arc::new(AtomicUsize::new(0));
+        let provider = StubParallelProvider::with_serial_tool(
+            &["plan.update", "goal.set"],
+            "plan.update",
+            Arc::clone(&executions),
+        );
+        let mut session =
+            guarded_session(provider, Arc::new(CountingApproval::allow_everything()))?
+                .with_guard_policy(Some(policy))
+                .with_pitfall_advisor(Some(
+                    Arc::new(PlanPitfall) as Arc<dyn crate::guard::PitfallAdvisor>
+                ));
+        let store = crate::state_store::InMemoryStateStore::new();
+        let model = ScriptedModel::new(responses);
+        let outcome = run_turn(&mut session, &model, &store, TurnInput::user("plane"))
+            .await
+            .map_err(ctx("der Turn läuft durch"))?;
+        if !matches!(outcome, TurnOutcome::Completed) {
+            return Err(TestError::Unexpected(format!("outcome {outcome:?}")));
+        }
+        let mut names = std::collections::HashMap::new();
+        let mut results = Vec::new();
+        for item in session.history().items() {
+            match item {
+                TurnItem::ToolCall(call) => {
+                    names.insert(call.call_id.clone(), call.tool_name.clone());
+                }
+                TurnItem::ToolResult(result) => results.push((
+                    names.get(&result.call_id).cloned().unwrap_or_default(),
+                    format!("{:?}", result.result),
+                )),
+                _ => {}
+            }
+        }
+        Ok(results)
+    }
+
+    fn assert_pitfall_only_on_plan(results: &[(String, String)]) -> TestResult {
+        let plan = results
+            .iter()
+            .find(|(name, _)| name == "plan.update")
+            .ok_or(TestError::Missing("plan.update-Ergebnis"))?;
+        let goal = results
+            .iter()
+            .find(|(name, _)| name == "goal.set")
+            .ok_or(TestError::Missing("goal.set-Ergebnis"))?;
+        assert!(plan.1.contains("PLAN-PITFALL"), "{}", plan.1);
+        assert!(!goal.1.contains("PLAN-PITFALL"), "{}", goal.1);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_pitfall_hint_stays_on_the_same_tool_in_one_response() -> TestResult {
+        let results = pitfall_turn(
+            crate::guard::GuardPolicy::default(),
+            vec![
+                response_with(vec![
+                    call(&ToolCallId::new(), "plan.update"),
+                    call(&ToolCallId::new(), "goal.set"),
+                ]),
+                crate::model::ModelResponse::text("fertig"),
+            ],
+        )
+        .await?;
+        assert_pitfall_only_on_plan(&results)
+    }
+
+    #[tokio::test]
+    async fn a_pitfall_hint_is_attached_even_without_an_active_turn_guard() -> TestResult {
+        let results = pitfall_turn(
+            crate::guard::GuardPolicy {
+                enabled: false,
+                ..crate::guard::GuardPolicy::default()
+            },
+            vec![
+                response_with(vec![call(&ToolCallId::new(), "plan.update")]),
+                response_with(vec![call(&ToolCallId::new(), "goal.set")]),
+                crate::model::ModelResponse::text("fertig"),
+            ],
+        )
+        .await?;
+        assert_pitfall_only_on_plan(&results)
+    }
+
+    // --- Runde 7, Teil B3: "null"-Normalisierung --------------------------
+
+    #[test]
+    fn null_strings_are_removed_only_from_optional_top_level_fields() {
+        let schema = JsonSchema {
+            required: Some(vec!["path".to_owned()]),
+            ..JsonSchema::default()
+        };
+        let mut arguments = serde_json::json!({
+            "path": "null",
+            "pattern": "null",
+            "limit": 5,
+            "nested": { "inner": "null" },
+            "text": "kein null"
+        });
+        let removed = strip_null_string_arguments(&mut arguments, &schema);
+        assert_eq!(removed, vec!["pattern".to_owned()]);
+        assert_eq!(
+            arguments,
+            serde_json::json!({
+                "path": "null",
+                "limit": 5,
+                "nested": { "inner": "null" },
+                "text": "kein null"
+            })
+        );
+    }
+
+    #[test]
+    fn normalization_uses_the_tool_schema_and_skips_unknown_tools() {
+        let provider = StubToolProvider::with_names(&["fs.glob"]);
+        let session = make_session(provider, SessionActivation::new(ToolProfile::Full));
+        let mut calls = vec![
+            ToolCall {
+                id: ToolCallId::new(),
+                name: ToolName::new("fs.glob"),
+                arguments: serde_json::json!({ "pattern": "**/*.rs", "path": "null" }),
+            },
+            ToolCall {
+                id: ToolCallId::new(),
+                name: ToolName::new("unbekannt"),
+                arguments: serde_json::json!({ "path": "null" }),
+            },
+        ];
+        normalize_null_string_arguments(&session, &mut calls);
+        assert_eq!(
+            calls[0].arguments,
+            serde_json::json!({ "pattern": "**/*.rs" })
+        );
+        assert_eq!(
+            calls[1].arguments,
+            serde_json::json!({ "path": "null" }),
+            "ohne Schema bleibt der Aufruf unverändert"
+        );
+    }
+
+    // --- Runde 7, Teil L9: kompakte Werkzeugschemas -----------------------
+
+    #[test]
+    fn compact_tool_specs_shorten_descriptions_but_keep_the_contract() {
+        let mut properties = std::collections::BTreeMap::new();
+        properties.insert(
+            "path".to_owned(),
+            JsonSchema {
+                schema_type: Some(JsonSchemaType::String),
+                description: Some("x".repeat(200)),
+                ..JsonSchema::default()
+            },
+        );
+        let spec = ToolSpec::Function(FunctionToolSpec {
+            name: ToolName::new("fs.read"),
+            description: "Liest eine Datei. Weitere lange Erklärungen folgen hier.".to_owned(),
+            parameters: JsonSchema {
+                schema_type: Some(JsonSchemaType::Object),
+                properties: Some(properties),
+                required: Some(vec!["path".to_owned()]),
+                ..JsonSchema::default()
+            },
+            strict: false,
+        });
+        let ToolSpec::Function(compact) = compact_tool_spec(spec);
+        assert_eq!(compact.description, "Liest eine Datei.");
+        assert_eq!(compact.parameters.required, Some(vec!["path".to_owned()]));
+        let path = compact
+            .parameters
+            .properties
+            .as_ref()
+            .and_then(|properties| properties.get("path"))
+            .and_then(|path| path.description.clone())
+            .unwrap_or_default();
+        assert_eq!(path.chars().count(), COMPACT_PARAMETER_DESCRIPTION_CHARS);
+    }
+
+    #[test]
+    fn collect_tools_compacts_only_when_the_session_asks_for_it() -> TestResult {
+        let provider = StubToolProvider::with_names(&["fs.read"]);
+        let mut session = make_session(provider, SessionActivation::new(ToolProfile::Full));
+        let full = collect_tools(&session).map_err(ctx("collect_tools"))?;
+        session.set_compact_tool_schemas(true);
+        let compact = collect_tools(&session).map_err(ctx("collect_tools kompakt"))?;
+        assert_eq!(full.len(), compact.len());
+        assert_eq!(
+            compact.first().map(|spec| spec.name().to_owned()),
+            Some("fs.read".to_owned())
+        );
+        Ok(())
     }
 }

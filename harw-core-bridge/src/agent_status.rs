@@ -52,7 +52,18 @@ pub fn status_entry(run: &BackgroundRun) -> Map<String, Value> {
     entry.insert("task".to_owned(), json!(run.task));
     entry.insert("elapsed_s".to_owned(), json!(run.elapsed().as_secs()));
     entry.insert("tool_calls".to_owned(), json!(run.progress.tool_calls));
-    entry.insert("tokens".to_owned(), json!(run.progress.tokens));
+    // Runde 7, Teil A4: Tokens einschließlich der laufenden Runde — nicht
+    // mehr 0, solange die erste Modellrunde noch läuft.
+    entry.insert("tokens".to_owned(), json!(run.progress.tokens_with_live()));
+    entry.insert(
+        "live_round_tokens".to_owned(),
+        json!(run.progress.live_round_tokens),
+    );
+    entry.insert("rounds".to_owned(), json!(run.progress.rounds));
+    entry.insert(
+        "context_tokens".to_owned(),
+        json!(run.progress.context_tokens),
+    );
     entry.insert("last_step".to_owned(), json!(run.progress.last_step));
     entry.insert("summary".to_owned(), json!(run.summary));
     entry
@@ -68,8 +79,21 @@ pub fn status_line(run: &BackgroundRun) -> String {
         run.status.label_de(),
         run.elapsed().as_secs(),
         run.progress.tool_calls,
-        run.progress.tokens,
+        run.progress.tokens_with_live(),
     );
+    // Runde 7, Teil A4: Live-Anteil, Runden und Kontextbelegung.
+    if run.progress.live_round_tokens > 0 {
+        line.push_str(&format!(
+            " (davon {} in der laufenden Runde)",
+            run.progress.live_round_tokens
+        ));
+    }
+    if run.progress.rounds > 0 {
+        line.push_str(&format!(" · {} Runden", run.progress.rounds));
+    }
+    if let Some(context) = run.progress.context_tokens {
+        line.push_str(&format!(" · Kontext {context} Tokens"));
+    }
     if let Some(step) = &run.progress.last_step {
         line.push_str(&format!(" · letzter Schritt: {step}"));
     }
@@ -77,6 +101,26 @@ pub fn status_line(run: &BackgroundRun) -> String {
         line.push_str(&format!("\n  Ergebnis (Anfang): {summary}"));
     }
     line
+}
+
+/// Ergänzt den Token-Stand eines laufenden Laufs aus dem Admission-Record
+/// des Kindes (Runde 7, Teil A4).
+///
+/// # Beschreibung
+/// Der Record zählt jede abgeschlossene Modellrunde über den
+/// Fortschritts-Beobachter des Spawners — unabhängig vom Ereignisbus. Ist er
+/// höher als der Stand aus dem Bus, gilt er.
+fn with_record_tokens(
+    spawner: &harw_core::ManagedAgentSpawner,
+    mut run: BackgroundRun,
+) -> BackgroundRun {
+    if let Some(record) = spawner.child_record(&run.child) {
+        let recorded = record.live.usage.fresh_tokens();
+        if recorded > run.progress.tokens {
+            run.progress.tokens = recorded;
+        }
+    }
+    run
 }
 
 /// Führt `agent.status` aus.
@@ -120,6 +164,12 @@ pub fn agent_status(ctx: &OpContext, child_id: Option<&str>) -> Result<OpOutput,
             runs
         }
     };
+    // Runde 7, Teil A4: fehlt dem Ereignisbus ein Verbrauch (kein Bus,
+    // verpasste Ereignisse), zählt der Verbrauch aus dem Admission-Record.
+    let runs: Vec<BackgroundRun> = runs
+        .into_iter()
+        .map(|run| with_record_tokens(spawner.as_ref(), run))
+        .collect();
     let journal_of =
         |run: &BackgroundRun| spawner.child_journal_for(ctx.session_id(), run.child.as_str());
     let text = if runs.is_empty() && journal_only.is_empty() {
@@ -212,5 +262,45 @@ impl Operation for AgentStatusOperation {
             let child_id = parse_child_id(AGENT_STATUS_TOOL, input.invocation.json_args(), false)?;
             agent_status(ctx, child_id.as_deref())
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::test_support::{TestError, TestResult};
+    use harw_core::background_children::BackgroundChildren;
+    use harw_types::SessionId;
+
+    /// Runde 7, Teil A4: der Status zeigt die Tokens der laufenden Runde
+    /// (statt 0), die Rundenzahl und die Kontextbelegung.
+    #[test]
+    fn live_round_tokens_appear_in_the_status() -> TestResult {
+        let registry = BackgroundChildren::default();
+        let parent = SessionId::new();
+        let child = SessionId::new();
+        registry.register(&child, &parent, "root-orchestrator", Some("Analyse"));
+        registry.record_progress(child.as_str(), |progress| {
+            progress.tokens = 1_000;
+            progress.live_round_tokens = 250;
+            progress.rounds = 3;
+            progress.context_tokens = Some(40_000);
+        });
+        let run = registry
+            .run_for(&parent, child.as_str())
+            .ok_or(TestError::Missing("Lauf"))?;
+
+        let entry = status_entry(&run);
+        assert_eq!(entry["tokens"], json!(1_250));
+        assert_eq!(entry["live_round_tokens"], json!(250));
+        assert_eq!(entry["rounds"], json!(3));
+        assert_eq!(entry["context_tokens"], json!(40_000));
+
+        let line = status_line(&run);
+        assert!(line.contains("1250 Tokens"), "{line}");
+        assert!(line.contains("davon 250 in der laufenden Runde"), "{line}");
+        assert!(line.contains("3 Runden"), "{line}");
+        assert!(line.contains("Kontext 40000 Tokens"), "{line}");
+        Ok(())
     }
 }

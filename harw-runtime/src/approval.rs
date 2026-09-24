@@ -252,15 +252,21 @@ impl ApprovalHandler for AskResolutionPolicy {
 
 /// Runde 5, Teil E: die Standardpolitik eines Kindes — mit Kind-Gate, wenn
 /// die Elternkette den Auto-Modus trägt.
+///
+/// Runde 7, Teil A6: mit bekanntem Auftrag (`mandate`) bekommt das Kind
+/// [`AutoModeHandle::child_gate_with`] — der Klassifizierer beurteilt seine
+/// Aufrufe gegen den Auftrag statt nur gegen die Nutzernachrichten.
 fn child_default_policy(
     mode: ApprovalModeCell,
     rules: AllowRuleSet,
     auto: Option<&AutoModeHandle>,
+    mandate: Option<harw_extension_api::auto_mode::ChildMandate>,
 ) -> DefaultApprovalPolicy {
     let policy = DefaultApprovalPolicy::with_rules(mode, rules);
-    match auto {
-        Some(handle) => policy.with_auto_gate(handle.child_gate()),
-        None => policy,
+    match (auto, mandate) {
+        (Some(handle), Some(mandate)) => policy.with_auto_gate(handle.child_gate_with(mandate)),
+        (Some(handle), None) => policy.with_auto_gate(handle.child_gate()),
+        (None, _) => policy,
     }
 }
 
@@ -476,6 +482,24 @@ impl ApprovalChain {
     /// Die Kind-Kette; die Elternkette bleibt unberührt.
     #[must_use]
     pub fn for_child(&self) -> Self {
+        self.for_child_with_mandate(None)
+    }
+
+    /// Wie [`Self::for_child`], mit dem Auftrag des Kindes für den
+    /// Auto-Modus (Runde 7, Teil A6).
+    ///
+    /// # Arguments
+    /// - `mandate` (`Option<ChildMandate>`): Rolle, Auftrag und
+    ///   Kontextauszug des Kindes; `None` verhält sich wie
+    ///   [`Self::for_child`].
+    ///
+    /// # Rückgabe
+    /// Die Kind-Kette; die Elternkette bleibt unberührt.
+    #[must_use]
+    pub fn for_child_with_mandate(
+        &self,
+        mandate: Option<harw_extension_api::auto_mode::ChildMandate>,
+    ) -> Self {
         let child_mode = self.mode.follower(ApprovalMode::Delegated);
 
         Self {
@@ -500,6 +524,7 @@ impl ApprovalChain {
                 child_mode.clone(),
                 self.rules.clone(),
                 self.auto.as_ref(),
+                mandate,
             )),
             responder: None,
             mode: child_mode,
@@ -1564,6 +1589,50 @@ mod tests {
                 "erwartet Deny, war {other:?}"
             ))),
         }
+    }
+
+    /// Runde 7, Teil A6: Backend, das nur mit Kind-Auftrag im Prompt erlaubt.
+    struct MandateBackend;
+
+    impl ClassifierBackend for MandateBackend {
+        fn complete<'a>(&'a self, _system: &'a str, user: &'a str) -> ClassifierFuture<'a> {
+            let reply = if user.contains("Auftrag dieses Kind-Agenten") && user.contains("PDF") {
+                r#"{"decision":"allow","category":"mandate","reason":"vom Auftrag verlangt"}"#
+            } else {
+                r#"{"decision":"deny","category":"zielabweichung","reason":"Zielabweichung"}"#
+            };
+            Box::pin(async move { Ok(reply.to_owned()) })
+        }
+
+        fn label(&self) -> String {
+            "mandate".to_owned()
+        }
+    }
+
+    #[test]
+    fn a_child_chain_with_mandate_judges_against_the_childs_task() -> TestResult {
+        let chain = auto_chain(None);
+        let handle = chain
+            .auto_mode()
+            .ok_or(TestError::Missing("Auto-Modus der Kette"))?;
+        handle.install_backend(Arc::new(MandateBackend));
+        let build = shell_call("latexmk -pdf paper.tex");
+
+        let without = chain.for_child();
+        assert!(matches!(
+            run_on_runtime(without.handlers()[0].review(&build))?,
+            ApprovalDecision::Deny(_)
+        ));
+        let with =
+            chain.for_child_with_mandate(Some(harw_extension_api::auto_mode::ChildMandate::new(
+                "uia-latex-writer",
+                "Baue das PDF aus paper.tex",
+            )));
+        assert!(matches!(
+            run_on_runtime(with.handlers()[0].review(&build))?,
+            ApprovalDecision::Allow
+        ));
+        Ok(())
     }
 
     #[test]

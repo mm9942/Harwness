@@ -1247,6 +1247,17 @@ fn merge_permissions(
         layer_path,
         out,
     );
+    // Runde 7, Teil L4: Klassifizierer-Zeitlimit; wie das Freigabe-Zeitlimit
+    // darf eine spätere Ebene nur verkürzen.
+    merge_optional_min_bound(
+        &mut trusted.permissions.auto_classifier_timeout_secs,
+        incoming.auto_classifier_timeout_secs,
+        present("auto_classifier_timeout_secs"),
+        role,
+        "permissions.auto_classifier_timeout_secs",
+        layer_path,
+        out,
+    );
     intersection_list(
         &mut trusted.permissions.allow,
         &incoming.allow,
@@ -1733,6 +1744,25 @@ fn merge_guards(
         present("plan_stale_rounds"),
         role,
         "guards.plan_stale_rounds",
+        layer_path,
+        out,
+    );
+    // Runde 7, Teil A2.
+    merge_optional_min_bound(
+        &mut trusted.guards.orchestrator_read_warn,
+        incoming.orchestrator_read_warn,
+        present("orchestrator_read_warn"),
+        role,
+        "guards.orchestrator_read_warn",
+        layer_path,
+        out,
+    );
+    merge_optional_min_bound(
+        &mut trusted.guards.orchestrator_read_limit,
+        incoming.orchestrator_read_limit,
+        present("orchestrator_read_limit"),
+        role,
+        "guards.orchestrator_read_limit",
         layer_path,
         out,
     );

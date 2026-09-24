@@ -285,6 +285,7 @@ fn test_settings_provider_add_parses_all_flags() -> TestResult {
                         base_url,
                         auth,
                         models,
+                        ..
                     },
             }),
     }) = cli.command
@@ -1017,6 +1018,8 @@ fn test_provider_add_parses_all_flags() -> TestResult {
                 base_url,
                 auth,
                 models,
+                no_auth,
+                ..
             },
     }) = cli.command
     else {
@@ -1030,6 +1033,84 @@ fn test_provider_add_parses_all_flags() -> TestResult {
     assert_eq!(base_url, "http://localhost:11434");
     assert_eq!(auth, None);
     assert_eq!(models, vec!["a".to_owned(), "b".to_owned()]);
+    assert!(!no_auth);
+    Ok(())
+}
+
+/// Runde 7, Teil L1: `--no-auth` und `--auth-header` parsen; `--no-auth`
+/// schließt `--auth` aus.
+#[test]
+fn test_provider_add_parses_no_auth_and_auth_header() -> TestResult {
+    let cli = Cli::try_parse_from([
+        "harw",
+        "provider",
+        "add",
+        "vllm",
+        "--api",
+        "openai-chat",
+        "--base-url",
+        "http://localhost:8000/v1",
+        "--no-auth",
+    ])
+    .map_err(ctx("`harw provider add --no-auth` sollte parsen"))?;
+    let Some(Command::Provider {
+        action:
+            ProviderAction::Add {
+                no_auth,
+                auth_header,
+                ..
+            },
+    }) = cli.command
+    else {
+        return Err(TestError::Unexpected(format!(
+            "erwartete Provider(Add), bekam {:?}",
+            cli.command
+        )));
+    };
+    assert!(no_auth);
+    assert_eq!(auth_header, None);
+
+    let cli = Cli::try_parse_from([
+        "harw",
+        "provider",
+        "add",
+        "gw",
+        "--api",
+        "openai-chat",
+        "--base-url",
+        "https://gw.example/v1",
+        "--auth",
+        "env:GW_KEY",
+        "--auth-header",
+        "x-api-key",
+    ])
+    .map_err(ctx("`--auth-header x-api-key` sollte parsen"))?;
+    let Some(Command::Provider {
+        action: ProviderAction::Add { auth_header, .. },
+    }) = cli.command
+    else {
+        return Err(TestError::Unexpected("erwartete Provider(Add)".to_owned()));
+    };
+    assert_eq!(auth_header.as_deref(), Some("x-api-key"));
+
+    for conflicting in [
+        vec!["--no-auth", "--auth", "env:X"],
+        vec!["--no-auth", "--auth-header", "bearer"],
+        vec!["--auth-header", "basic"],
+    ] {
+        let mut args = vec![
+            "harw",
+            "provider",
+            "add",
+            "x",
+            "--api",
+            "openai-chat",
+            "--base-url",
+            "http://localhost:1/v1",
+        ];
+        args.extend(conflicting.iter().copied());
+        assert!(Cli::try_parse_from(args).is_err(), "{conflicting:?}");
+    }
     Ok(())
 }
 

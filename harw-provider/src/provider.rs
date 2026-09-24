@@ -20,6 +20,10 @@ use crate::model::ModelRecord;
 /// Provider-weite Settings (Note 12 §5).
 #[derive(Clone, Debug, Default)]
 pub struct ProviderSettings {
+    /// Typisierte Beschreibung des Request-Zeitlimits. Der produktive
+    /// HTTP-Pfad (`harw-provider-http`) liest das wirksame Zeitlimit aus
+    /// `harw_config::ProviderToml::request_timeout_secs` bzw.
+    /// `stream_idle_timeout_secs` (Runde 7, Teil L4), nicht aus diesem Feld.
     pub request_timeout: Option<std::time::Duration>,
     pub connect_timeout: Option<std::time::Duration>,
     pub max_retries: Option<u32>,

@@ -654,3 +654,77 @@ fn classify_outcome_reads_the_child_end_status() {
     )));
     assert_eq!(status, BackgroundStatus::Cancelled);
 }
+
+// ── Runde 7, Teil A7: Abbruch während des Starts ─────────────────────────────
+
+#[tokio::test]
+async fn a_turn_abort_during_the_start_does_not_end_the_background_transfer() -> TestResult {
+    let mut fx = fixture(false)?;
+    // Der startende UIA-Turn hat einen registrierten Eltern-Token; das Kind
+    // erbt `token.child()`.
+    let turn_token = harw_core::cancel::CancelToken::new();
+    fx.spawner
+        .register_parent_cancel_token(fx.session.id(), turn_token.clone())
+        .map_err(ctx("Eltern-Token registriert"))?;
+    let (child, call_id) = fx
+        .handoff(
+            "root-orchestrator",
+            json!({ "task": "Analysiere", "background": true }),
+        )
+        .await?;
+    // Eine neue Nachricht / Turn-Grenze bricht den startenden Turn ab,
+    // bevor der Start abgeschlossen ist.
+    turn_token.cancel(harw_core::cancel::CancelReason::User);
+    assert!(
+        fx.spawner
+            .child_cancel_token(&child)
+            .is_some_and(|token| token.is_cancelled()),
+        "Voraussetzung: der geerbte Token ist abgebrochen"
+    );
+
+    let result = fx
+        .launcher
+        .try_launch(&fx.session, &child, &call_id, "root-orchestrator")
+        .ok_or(TestError::Missing("Start im Hintergrund"))?;
+    let ToolCallResult::Success { value } = result else {
+        return Err(TestError::Unexpected(format!(
+            "erwartet Erfolg, nicht {result:?}"
+        )));
+    };
+    assert_eq!(value["status"], json!("running"));
+    assert!(
+        value["note"]
+            .as_str()
+            .is_some_and(|note| note.contains("trotzdem vollständig gestartet")),
+        "{value}"
+    );
+
+    wait_until_finished(&fx.spawner, fx.session.id()).await?;
+    let notices = fx
+        .spawner
+        .background_children()
+        .take_notices(fx.session.id());
+    let notice = notices
+        .first()
+        .ok_or(TestError::Missing("Abschlussmeldung"))?;
+    assert_eq!(
+        notice.status,
+        harw_core::background_children::BackgroundStatus::Completed,
+        "der Start überlebt den Turn-Abbruch: {}",
+        notice.text
+    );
+    Ok(())
+}
+
+#[test]
+fn the_launch_result_carries_the_note_only_after_an_interrupted_start() {
+    let child = SessionId::new();
+    let plain = launch_result(&child, "root-orchestrator", false);
+    assert!(plain.get("note").is_none());
+    let noted = launch_result(&child, "root-orchestrator", true);
+    assert!(
+        noted["note"]
+            .as_str()
+            .is_some_and(|note| note.contains(child.as_str()))
+    );
+}

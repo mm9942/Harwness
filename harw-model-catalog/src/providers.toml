@@ -849,6 +849,19 @@ base_url = "http://localhost:1234/v1"
 api = "openai-chat"
 auth = [{ method = "local-base-url" }]
 
+# Runde 7, Teil L2: vLLM (OpenAI-kompatibler Server, Standard-Port 8000).
+# Werkzeugaufrufe brauchen beim Serverstart
+#   --enable-auto-tool-choice --tool-call-parser <parser>
+# (z. B. `hermes` für Qwen2.5/Hermes, `qwen3_coder` für Qwen3-Coder,
+# `mistral`, `llama3_json`); das Kontextfenster setzt `--max-model-len`.
+# Siehe docs/setup/local-models.md.
+[[provider]]
+id = "vllm"
+name = "vLLM (lokal)"
+base_url = "http://localhost:8000/v1"
+api = "openai-chat"
+auth = [{ method = "local-base-url" }]
+
 [[provider]]
 id = "custom"
 name = "Custom (OpenAI-kompatibel)"

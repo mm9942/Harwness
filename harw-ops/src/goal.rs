@@ -361,7 +361,11 @@ async fn goal(ctx: &OpContext, call: GoalCall) -> Result<OpOutput, OpError> {
             let usage = "goal set <goal-id> <statement…>";
             let id = require_arg(id, usage)?;
             let statement = require_arg(statement, usage)?;
-            guard_replacement(store)?;
+            let replaced = guard_replacement(store)?;
+            let note = match &replaced {
+                Some(old) => supersede_empty(store, old, &id, &actor)?,
+                None => String::new(),
+            };
             let event = apply(
                 store,
                 GoalAction::Set {
@@ -369,7 +373,7 @@ async fn goal(ctx: &OpContext, call: GoalCall) -> Result<OpOutput, OpError> {
                 },
                 &actor,
             )?;
-            format!("Ziel '{id}' gesetzt (Revision {event}).")
+            format!("Ziel '{id}' gesetzt (Revision {event}).{note}")
         }
 
         GoalArgs::Refine { statement } => {
@@ -550,18 +554,35 @@ fn set_status(
 /// `Superseded`) darf dagegen von einem neuen abgelöst werden: dort ist nichts
 /// mehr zu verlieren.
 ///
+/// Runde 7, Teil B4: ein nicht-terminales Ziel **ohne** Kriterien und
+/// Invarianten verliert beim Ersetzen nichts außer seiner Formulierung. Es
+/// blockiert `goal set` nicht mehr; der Aufrufer markiert es vorher als
+/// `Superseded` ([`supersede_empty`]).
+///
+/// # Returns
+/// - `Ok(None)`: kein Ziel oder ein terminales — `Set` ist der reguläre Weg.
+/// - `Ok(Some(goal))`: ein leeres, nicht-terminales Ziel, das abgelöst wird.
+///
 /// # Errors
-/// [`OpError::InvalidArguments`], wenn ein nicht-terminales Ziel existiert.
-fn guard_replacement(store: &dyn GoalStore) -> Result<(), OpError> {
-    let Ok(existing) = store.current() else {
+/// - [`OpError::InvalidArguments`], wenn ein nicht-terminales Ziel mit
+///   Kriterien oder Invarianten existiert.
+/// - [`OpError::Execution`], wenn das laufende Ziel nicht lesbar ist (anderer
+///   Fehler als `GoalNotFound`): dann wird nichts überschrieben.
+fn guard_replacement(store: &dyn GoalStore) -> Result<Option<Goal>, OpError> {
+    let existing = match store.current() {
+        Ok(goal) => goal,
         // Kein Ziel vorhanden — `Set` ist der reguläre Weg.
-        return Ok(());
+        Err(PlanError::GoalNotFound) => return Ok(None),
+        Err(error) => return Err(map_goal_error(error)),
     };
     if matches!(
         existing.status,
         GoalStatus::Achieved | GoalStatus::Abandoned | GoalStatus::Superseded
     ) {
-        return Ok(());
+        return Ok(None);
+    }
+    if existing.acceptance_criteria.is_empty() && existing.invariants.is_empty() {
+        return Ok(Some(existing));
     }
     Err(OpError::InvalidArguments(format!(
         "es existiert bereits das Ziel '{}' ({}); `goal set` würde seine {} Kriterien und {} \
@@ -572,6 +593,55 @@ fn guard_replacement(store: &dyn GoalStore) -> Result<(), OpError> {
         existing.acceptance_criteria.len(),
         existing.invariants.len()
     )))
+}
+
+/// Löst ein leeres, nicht-terminales Ziel vor `goal set` ab (Runde 7, Teil B4).
+///
+/// # Beschreibung
+/// `Active`/`Blocked` werden als `Superseded` markiert, damit die History den
+/// Wechsel zeigt. Ein `Draft` kennt laut Status-Matrix keinen Übergang nach
+/// `Superseded`; er wird direkt ersetzt (die History behält ihn trotzdem).
+///
+/// # Arguments
+/// - `store` (`&dyn GoalStore`): Goal-Store.
+/// - `old` (`&Goal`): das abzulösende, leere Ziel.
+/// - `new_id` (`&str`): ID des neuen Ziels (für Begründung und Hinweis).
+/// - `actor` (`&str`): Akteur der Ablösung.
+///
+/// # Returns
+/// Den Hinweis für die Antwort (beginnt mit einem Zeilenumbruch).
+///
+/// # Errors
+/// [`OpError`] aus [`map_goal_error`], wenn der Store die Ablösung ablehnt.
+fn supersede_empty(
+    store: &dyn GoalStore,
+    old: &Goal,
+    new_id: &str,
+    actor: &str,
+) -> Result<String, OpError> {
+    if matches!(old.status, GoalStatus::Active | GoalStatus::Blocked) {
+        apply(
+            store,
+            GoalAction::SetStatus {
+                status: GoalStatus::Superseded,
+                reason: Some(format!(
+                    "ohne Kriterien und Invarianten, abgelöst durch `goal set {new_id}`"
+                )),
+            },
+            actor,
+        )?;
+        Ok(format!(
+            "\nHinweis: das bisherige Ziel '{}' hatte weder Kriterien noch Invarianten und ist \
+             jetzt als abgelöst (superseded) markiert.",
+            old.id
+        ))
+    } else {
+        Ok(format!(
+            "\nHinweis: der bisherige Entwurf '{}' hatte weder Kriterien noch Invarianten und \
+             wurde ersetzt.",
+            old.id
+        ))
+    }
 }
 
 /// Übersetzt einen [`PlanError`] aus dem Goal-Pfad in einen [`OpError`].
@@ -1600,6 +1670,42 @@ mod tests {
                 )));
             }
         }
+        Ok(())
+    }
+
+    /// Runde 7, Teil B4: ein aktives Ziel ohne Kriterien und Invarianten
+    /// blockiert `goal set` nicht; es wird als `superseded` abgelöst.
+    #[tokio::test]
+    async fn set_replaces_an_empty_live_goal_and_marks_it_superseded() -> TestResult {
+        let (op_ctx, store, _plan, root) = context_with_stores()?;
+        let set = run_command(&op_ctx, &["set", "g-leer", "Altes", "Ziel"]).await;
+        let replaced = run_command(&op_ctx, &["set", "g-neu", "Neues", "Ziel"]).await;
+        let current = store.current();
+        let superseded = store.history(None).map(|events| {
+            events.iter().any(|event| {
+                matches!(
+                    &event.action,
+                    GoalAction::SetStatus {
+                        status: GoalStatus::Superseded,
+                        ..
+                    }
+                )
+            })
+        });
+        cleanup(root);
+
+        assert!(set.is_ok(), "set: {set:?}");
+        let replaced = replaced.map_err(ctx("zweites set"))?;
+        assert!(replaced.contains("Ziel 'g-neu' gesetzt"), "{replaced}");
+        assert!(replaced.contains("g-leer"), "Hinweis fehlt: {replaced}");
+        assert!(replaced.contains("superseded"), "Hinweis fehlt: {replaced}");
+        let current = current.map_err(ctx("current"))?;
+        assert_eq!(current.id.as_str(), "g-neu");
+        assert_eq!(current.status, GoalStatus::Active);
+        assert!(
+            superseded.map_err(ctx("history"))?,
+            "das alte Ziel ist als superseded protokolliert"
+        );
         Ok(())
     }
 

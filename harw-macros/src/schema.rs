@@ -12,20 +12,44 @@ use syn::Type;
 
 /// Map a Rust type onto a JSON-Schema expression. Returns the schema token
 /// stream plus whether the field is optional (`Option<T>`).
+///
+/// Runde 7, Teil B3: ein `Option<T>`-Feld wird zusätzlich als **nullable**
+/// gekennzeichnet — `anyOf: [<T>, {"type": "null"}]`, Beschreibung und
+/// Vorgabe auf der äußeren Ebene (dieselbe Form wie
+/// `harw_tools::JsonSchema::into_strict`). Das sagt dem Modell, dass es ein
+/// optionales Feld weglassen oder mit JSON-`null` füllen darf — statt mit dem
+/// String `"null"`, den der Turn-Loop zusätzlich entfernt.
 pub(crate) fn schema_for_type(
     ty: &Type,
     description: Option<&str>,
     default: Option<&syn::Expr>,
 ) -> syn::Result<(proc_macro2::TokenStream, bool)> {
-    if let Some(inner) = option_inner(ty) {
-        let (schema, _) = schema_for_type(inner, description, default)?;
-        return Ok((schema, true));
-    }
-
     let desc_tokens = match description {
         Some(d) => quote! { description: ::core::option::Option::Some(#d.to_string()), },
         None => quote! {},
     };
+
+    if let Some(inner) = option_inner(ty) {
+        let (inner_schema, _) = schema_for_type(inner, None, None)?;
+        let default_tokens = json_schema_default(default);
+        let schema = quote! {
+            ::harw_tools::JsonSchema {
+                #desc_tokens
+                any_of: ::core::option::Option::Some(::std::vec![
+                    #inner_schema,
+                    ::harw_tools::JsonSchema {
+                        schema_type: ::core::option::Option::Some(
+                            ::harw_tools::JsonSchemaType::Null
+                        ),
+                        ..::core::default::Default::default()
+                    },
+                ]),
+                #default_tokens
+                ..::core::default::Default::default()
+            }
+        };
+        return Ok((schema, true));
+    }
 
     if let Some(inner) = vec_inner(ty) {
         let (item_schema, _) = schema_for_type(inner, None, None)?;
@@ -196,5 +220,34 @@ pub(crate) fn is_json_literal_expr(expr: &syn::Expr) -> bool {
         }
         syn::Expr::Array(expr) => expr.elems.iter().all(is_json_literal_expr),
         _ => false,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::test_support::{TestResult, ctx};
+
+    /// Runde 7, Teil B3: `Option<T>` wird nullable (`anyOf: [T, null]`), mit
+    /// Beschreibung außen; Pflichtfelder bleiben unverändert.
+    #[test]
+    fn option_fields_are_marked_nullable() -> TestResult {
+        let ty: Type = syn::parse_quote!(Option<String>);
+        let (schema, optional) = schema_for_type(&ty, Some("Pfad"), None)
+            .map_err(ctx("Option<String> erzeugt ein Schema"))?;
+        let schema = schema.to_string();
+        assert!(optional);
+        assert!(schema.contains("any_of"), "{schema}");
+        assert!(schema.contains("JsonSchemaType :: Null"), "{schema}");
+        assert!(schema.contains("JsonSchemaType :: String"), "{schema}");
+        assert!(schema.contains("\"Pfad\""), "{schema}");
+
+        let ty: Type = syn::parse_quote!(String);
+        let (schema, optional) =
+            schema_for_type(&ty, None, None).map_err(ctx("String erzeugt ein Schema"))?;
+        let schema = schema.to_string();
+        assert!(!optional);
+        assert!(!schema.contains("any_of"), "{schema}");
+        Ok(())
     }
 }

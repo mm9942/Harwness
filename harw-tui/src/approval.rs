@@ -819,7 +819,12 @@ pub trait ChildTurnDriver: Send + Sync {
 }
 
 impl ChildTurnDriver for ManagedAgentSpawner {
-    /// Führt das Kind über [`ManagedAgentSpawner::run_child`] aus.
+    /// Führt das Kind über
+    /// [`ManagedAgentSpawner::run_child_with_declared_budget`] aus.
+    ///
+    /// Runde 7, Teil A1: das Budget der Agent-TOML gilt auch für Transfers;
+    /// ein vom Token-Budget beendetes Kind liefert sein (markiertes)
+    /// Teilergebnis bzw. die Übergabe-Zusammenfassung als Erfolg.
     ///
     /// # Description
     /// Das Kind erhält [`TurnInput::default`]: bei leerer Eingabe setzt der
@@ -845,9 +850,16 @@ impl ChildTurnDriver for ManagedAgentSpawner {
             // Runde 5, Teil M: ein nicht reguläres Ende (Lease, Abbruch,
             // Provider-Fehler …) liefert statt eines nackten Fehlers den
             // Endbericht mit Journal und ggf. Übergabe.
-            let run = match self.run_child(child, store, TurnInput::default()).await {
+            // Runde 7, Teil A1: Transfers laufen unter dem Budget der
+            // Agent-TOML (`[spawn.budget]`) — Token-, Aufruf- und Zeitlimit,
+            // Abschlussrunde bei 80 % und Übergabe beim Budgetende.
+            let run = match self
+                .run_child_with_declared_budget(child, store, None, TurnInput::default())
+                .await
+            {
                 Ok(run) => run,
                 Err(error) => {
+                    let error = AgentSpawnError::from(error);
                     return match self.child_end_report(child) {
                         Some(report) => {
                             tracing::warn!(
@@ -865,6 +877,17 @@ impl ChildTurnDriver for ManagedAgentSpawner {
                     };
                 }
             };
+            // Runde 7, Teil A1: das Token-Budget endet mit Teilergebnis bzw.
+            // Übergabe-Zusammenfassung statt ohne Ergebnis.
+            if let Some(text) = run.budget_exhausted_parent_text() {
+                tracing::warn!(
+                    child = %child,
+                    handoff = ?run.budget_handoff,
+                    response_bytes = text.len(),
+                    "tui.child.budget_exhausted"
+                );
+                return Ok(ToolCallResult::success(text.into()));
+            }
             if !matches!(
                 run.outcome,
                 TurnOutcome::Completed

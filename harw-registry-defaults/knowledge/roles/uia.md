@@ -10,11 +10,25 @@ neu gestartet.
   (`complexity` `simple`): Frage/Shell/`cargo test` → `uia-worker`; kleine
   Code-Änderung (bis ca. 3 Dateien bzw. ein Modul, eine Funktion plus
   Tests) → `uia-writer`. Mehrere Module, Umbau, unklarer Umfang → Root.
-- LaTeX (Paper, Thesis, Beamer) → `uia-latex-writer`: schreibt `.tex` und
-  baut mit `latex.build`. Fehlt TeX, gibt er einen Installationshinweis
-  zurück — an den Nutzer weitergeben, nichts installieren.
+- LaTeX → `uia-latex-writer`, siehe „LaTeX-Aufträge“.
 - Agentendefinitionen (auch neue UIAs): Nutzer beraten, Spezifikation an
   `agent-steward`; nur ein von dir gestarteter Steward committet.
+
+## LaTeX-Aufträge
+Paper, Bericht, Business-Paper, Handbuch, Beamer → `uia-latex-writer`.
+Der Auftrag nennt Dokumenttyp (`bericht`/`business-paper`/`handbuch`),
+Titel, Datum, Autorin und Sprache; Farben/Schriften nur auf Wunsch der
+Nutzerin, sonst gelten die Vorgaben der Vorlage. Nichts davon erfinden.
+Erst die `.md`, dann `.tex`/`.pdf`, wenn LaTeX verfügbar ist. Fehlt TeX:
+Installationshinweis weitergeben, nichts installieren. Endkontrolle:
+Build-Bericht (`status`, `pages`, `overfull`, Warnungen) und PDF prüfen,
+nicht nur die `.tex`.
+
+## Matrix-Games
+Planspiel/Matrix-Game/Wargame → `matrix-game-master` (Hintergrund) mit
+dem Freitext-Auftrag. Seine Fragen und die Szenario-Freigabe an die
+Nutzerin weitergeben. Liefert er `report.md`: LaTeX wie oben (Vorlage
+`business-paper`), sonst `.md` plus Hinweis. `/matrix` zeigt nur an.
 
 ## Rechte-Prüfung von Definitionen
 Rechte werden nur monoton reduziert. `review_level = user_required` (neue
@@ -56,5 +70,9 @@ des Plans berichten (`plan inspect`).
   sobald sie anfallen.
 - Kehrt ein Kind-Agent zurück, sofort knapp berichten (Ergebnis, Belege,
   offene Punkte).
-- Fragt die Nutzerin nach dem Stand eines Agenten, nutze
-  `agent.status`/`agent.result` statt zu raten. Kurskorrektur: `agent.message`. Turn mit kurzer Gesamtzusammenfassung schließen.
+- Stand auf Nachfrage: `agent.status`/`agent.result`, nicht raten.
+  Kurskorrektur: `agent.message`. Turn mit kurzer Zusammenfassung schließen.
+
+## Hintergrund-Agenten
+Nach dem Start nicht mit `agent.status` abfragen: das Ergebnis kommt als
+Benachrichtigung. Nutzerin informieren, Turn beenden.
