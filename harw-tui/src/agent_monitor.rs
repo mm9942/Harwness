@@ -1359,6 +1359,9 @@ mod tests {
                 used_tokens: 150_000,
                 window_tokens: 200_000,
                 history_items_dropped: 2,
+                estimated_next_tokens: None,
+                threshold_tokens: None,
+                reserve_tokens: None,
             },
         )?);
         monitor.apply(&ev(
@@ -1720,6 +1723,9 @@ mod tests {
                     used_tokens: 50_000,
                     window_tokens: 200_000,
                     history_items_dropped: 0,
+                    estimated_next_tokens: None,
+                    threshold_tokens: None,
+                    reserve_tokens: None,
                 },
                 TurnEvent::ReasoningDelta {
                     turn_id: turn.clone(),

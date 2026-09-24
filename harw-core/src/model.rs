@@ -602,6 +602,21 @@ impl ModelResponse {
 /// Der Core hält nur `&dyn ModelProvider` im Turn-Loop.
 pub trait ModelProvider: Send + Sync {
     fn respond<'a>(&'a self, request: ModelRequest) -> ModelFuture<'a>;
+
+    /// Fest angeheftete Modell-ID dieses Providers, sofern er unabhängig vom
+    /// Request immer dasselbe Modell anspricht (z. B. ein auf ein Modell
+    /// gepinnter Kind-Provider).
+    ///
+    /// # Description
+    /// Dient der Auflösung des Kontextfensters für Kind-Sessions
+    /// (`context_window_for(model)`). Wrapper-Provider sollen den Wert ihres
+    /// inneren Providers weiterreichen. Default: `None` (kein Pin bekannt).
+    ///
+    /// # Returns
+    /// Die angeheftete Modell-ID oder `None`.
+    fn pinned_model_id(&self) -> Option<String> {
+        None
+    }
 }
 
 /// Fehler eines Modell-Aufrufs.
@@ -1130,6 +1145,14 @@ mod tests {
 
         assert_eq!(response.stop, StopReason::EndTurn);
         assert!(response.reasoning.is_none());
+    }
+
+    #[test]
+    fn test_model_provider_pinned_model_id_defaults_to_none() {
+        let provider = EchoModelProvider::default();
+        assert_eq!(provider.pinned_model_id(), None);
+        let as_dyn: &dyn ModelProvider = &provider;
+        assert_eq!(as_dyn.pinned_model_id(), None);
     }
 
     #[test]

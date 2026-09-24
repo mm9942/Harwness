@@ -54,6 +54,29 @@ pub struct TailOutcome {
     pub results_truncated: usize,
 }
 
+/// Absolute Obergrenze der pro-Ergebnis-Kappung für Tool-Ergebnisse in
+/// Bytes (Welle 3, Vertrag owner E): 64 KiB.
+pub const TOOL_RESULT_CAP_CEILING: usize = 64 * 1024;
+
+/// Standard-Kappungsgrenze für ein einzelnes Tool-Ergebnis:
+/// `min(64 KiB, max_history_bytes / 10)` (Welle 3).
+///
+/// # Description
+/// Bisher lag die Grenze bei `max_history_bytes / 2` — ein einziges
+/// Ergebnis durfte damit die halbe Historie belegen. Die neue Grenze hält
+/// jedes Einzelergebnis bei höchstens einem Zehntel des Budgets und nie
+/// über 64 KiB.
+///
+/// # Arguments
+/// - `max_history_bytes` (`usize`): das Gesamtbudget der Historie.
+///
+/// # Returns
+/// Die Kappungsgrenze in Bytes.
+#[must_use]
+pub fn default_tool_result_cap(max_history_bytes: usize) -> usize {
+    (max_history_bytes / 10).min(TOOL_RESULT_CAP_CEILING)
+}
+
 /// Akkumuliert Turn-Items über die Lebenszeit einer Session.
 ///
 /// `#[serde(transparent)]` ist hier bewusst NICHT gesetzt: die History wird als
@@ -337,10 +360,9 @@ impl ConversationHistory {
     /// `harw_core::model::ModelRequest::with_context_program`) kennen nur
     /// diese `(Self, usize, usize)`-Signatur und liegen außerhalb des
     /// Schreibbereichs dieses Knotens. Diese Methode leitet deshalb an
-    /// [`Self::tail_preserving_current_turn`] weiter — mit `max_bytes / 2`
-    /// als Ergebnis-Kappungsgrenze, demselben Wert, den
-    /// `harw_core::context_budget::ContextBudget::tool_result_cap` für
-    /// `max_history_bytes` liefert — statt die alte, fehleranfällige
+    /// [`Self::tail_preserving_current_turn`] weiter — mit
+    /// [`default_tool_result_cap`] (`min(64 KiB, max_bytes / 10)`) als
+    /// Ergebnis-Kappungsgrenze — statt die alte, fehleranfällige
     /// Nur-nach-Bytegröße-Auswahl zu behalten. Jeder bestehende Aufrufer
     /// profitiert dadurch automatisch vom Bugfix (die zuletzt gesendete
     /// `UserMessage` wird nicht mehr verdrängt), ohne seine Signatur ändern
@@ -353,7 +375,8 @@ impl ConversationHistory {
     /// vollständige Zählung inklusive gekürzter Ergebnisse.
     #[must_use]
     pub fn tail_within_estimated_bytes(&self, max_bytes: usize) -> (Self, usize, usize) {
-        let (history, outcome) = self.tail_preserving_current_turn(max_bytes, max_bytes / 2);
+        let (history, outcome) =
+            self.tail_preserving_current_turn(max_bytes, default_tool_result_cap(max_bytes));
         (history, outcome.used_bytes, outcome.items_dropped)
     }
 
@@ -386,12 +409,25 @@ impl ConversationHistory {
     ///    reicht, fallen die ältesten Paare dieses Bereichs komplett weg.
     /// 4. Mit dem verbleibenden Budget werden Gruppen **vor** der Nachricht
     ///    (abgeschlossene, ältere Turns) neueste zuerst aufgenommen, ganz
-    ///    oder gar nicht — hier wird nicht gekürzt, nur ausgelassen.
+    ///    oder gar nicht — hier wird nicht gekürzt, nur ausgelassen. Passt
+    ///    eine Gruppe nicht, wird sie übersprungen und die Auswahl mit der
+    ///    nächstälteren fortgesetzt (Welle 3: `continue` statt `break`), so
+    ///    dass ein einzelner übergroßer älterer Turn nicht alle noch älteren,
+    ///    kleinen Turns mitreißt.
+    ///
+    /// Zusätzlich gilt (Welle 3):
+    /// - **Reasoning-Items** zählen nicht zum Budget (sie gehen nie an den
+    ///   Provider, siehe [`Self::to_model_messages`]); sie bleiben aber an
+    ///   ihrem Platz, solange ihre Gruppe übernommen wird.
+    /// - **Angeheftete Zusammenfassungen**
+    ///   ([`crate::compaction::is_pinned_summary`]) werden nie entfernt —
+    ///   ihre Bytes werden vorab reserviert, bevor andere Gruppen gewählt
+    ///   werden.
     ///
     /// Enthält die Historie keine `UserMessage` (z. B. eine
-    /// Zwischenprojektion aus reinen Tool-Runden), verhält sich diese Methode
-    /// wie vor diesem Knoten: neueste Gruppen zuerst, ganz oder gar nicht,
-    /// nur über bereits global gekappte Items.
+    /// Zwischenprojektion aus reinen Tool-Runden), gilt dieselbe
+    /// Neueste-zuerst-Auswahl über alle Gruppen, wobei die neueste Gruppe
+    /// immer übernommen wird.
     ///
     /// In jedem Fall bleibt die chronologische Reihenfolge der Ausgabe
     /// erhalten, und ein Tool-Call/Ergebnis-Paar wird nie getrennt (siehe
@@ -401,7 +437,8 @@ impl ConversationHistory {
     /// - `max_bytes` (`usize`): das Gesamtbudget für die zurückgegebene
     ///   Historie (`ContextBudget::max_history_bytes`).
     /// - `tool_result_cap` (`usize`): die pro-Ergebnis-Kappungsgrenze
-    ///   (`ContextBudget::tool_result_cap`, standardmäßig `max_bytes / 2`).
+    ///   (`ContextBudget::tool_result_cap`; empfohlen ist
+    ///   [`default_tool_result_cap`], also `min(64 KiB, max_bytes / 10)`).
     ///
     /// # Returns
     /// Die neue, begrenzte Historie sowie ein [`TailOutcome`] mit den
@@ -421,8 +458,13 @@ impl ConversationHistory {
             .iter()
             .map(|item| match item {
                 TurnItem::ToolResult(result_item) if item_bytes(item) > tool_result_cap => {
-                    results_truncated += 1;
-                    TurnItem::ToolResult(head_tail_truncated_result(result_item, tool_result_cap))
+                    match head_tail_truncated_result(result_item, tool_result_cap) {
+                        Some(truncated) => {
+                            results_truncated += 1;
+                            TurnItem::ToolResult(truncated)
+                        }
+                        None => item.clone(),
+                    }
                 }
                 other => other.clone(),
             })
