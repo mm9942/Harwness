@@ -65,6 +65,7 @@ pub(crate) struct LocalCommandContext<'a> {
     pub live_model: Option<&'a str>,
     /// Projektwurzel (für spätere Dateiprüfungen; `@pfad` expandiert der
     /// Submit-Pfad).
+    #[allow(dead_code)]
     pub project_root: &'a Path,
     /// ID der laufenden Sitzung.
     pub session_id: &'a SessionId,
@@ -75,8 +76,10 @@ pub(crate) struct LocalCommandContext<'a> {
 }
 
 /// Umschaltbare Seitenpanels.
+// `Agents`/`Explorer` sind für Tasten-/Befehlsvarianten reserviert, die
+// `app.rs` (T21) verdrahtet; [`intercept`] erzeugt derzeit nur `Workbench`.
+#[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) enum PanelToggle {
     /// Agenten-Panel.
     Agents,
@@ -190,7 +193,8 @@ pub(crate) fn intercept(raw: &str, ctx: &LocalCommandContext<'_>) -> Option<Loca
         "models" => models_intercept(args, ctx),
         "mode" if bare => Some(LocalIntercept::OpenOverlay(Box::new(ModePicker::new(
             ctx.active_mode,
-            ctx.config.map(|config| config.harness.mode.default.as_str()),
+            ctx.config
+                .map(|config| config.harness.mode.default.as_str()),
             ctx.approval,
         )))),
         "help" if bare => Some(help(ctx, HelpTab::Commands)),
@@ -209,12 +213,12 @@ pub(crate) fn intercept(raw: &str, ctx: &LocalCommandContext<'_>) -> Option<Loca
         "rename" => Some(LocalIntercept::RenameSession(args.to_owned())),
         "sessions" if bare => Some(LocalIntercept::Rewrite("/resume".to_owned())),
         "sessions" => Some(LocalIntercept::Rewrite(format!("/resume {args}"))),
-        "plan" | "goal" if ctx.registry.find(name).is_none() => Some(LocalIntercept::System(
-            format!(
+        "plan" | "goal" if ctx.registry.find(name).is_none() => {
+            Some(LocalIntercept::System(format!(
                 "/{name} ist nicht verfügbar: Die Plan-Werkzeuge sind deaktiviert \
                  ([tools.plan] enabled = false)."
-            ),
-        )),
+            )))
+        }
         _ => None,
     }
 }
@@ -406,25 +410,21 @@ mod tests {
     fn overlay_debug(result: Option<LocalIntercept>) -> TestResult<String> {
         match result {
             Some(LocalIntercept::OpenOverlay(view)) => Ok(format!("{view:?}")),
-            other => Err(TestError::Missing(leak(format!("overlay, got {other:?}")))),
+            other => Err(TestError::Unexpected(format!("overlay, got {other:?}"))),
         }
-    }
-
-    fn leak(text: String) -> &'static str {
-        Box::leak(text.into_boxed_str())
     }
 
     fn rewrite(result: Option<LocalIntercept>) -> TestResult<String> {
         match result {
             Some(LocalIntercept::Rewrite(line)) => Ok(line),
-            other => Err(TestError::Missing(leak(format!("rewrite, got {other:?}")))),
+            other => Err(TestError::Unexpected(format!("rewrite, got {other:?}"))),
         }
     }
 
     fn system(result: Option<LocalIntercept>) -> TestResult<String> {
         match result {
             Some(LocalIntercept::System(text)) => Ok(text),
-            other => Err(TestError::Missing(leak(format!("system, got {other:?}")))),
+            other => Err(TestError::Unexpected(format!("system, got {other:?}"))),
         }
     }
 
@@ -569,9 +569,9 @@ mod tests {
     fn help_and_keys_open_help_overlay() -> TestResult {
         let fx = built_in()?;
         let commands = overlay_debug(fx.run("/help"))?;
-        assert!(commands.contains("HelpOverlay") && commands.contains("Commands"));
+        assert!(commands.contains("HelpOverlay") && commands.contains("tab: Commands"));
         let keys = overlay_debug(fx.run("/keys"))?;
-        assert!(keys.contains("HelpOverlay") && keys.contains("Keys"));
+        assert!(keys.contains("HelpOverlay") && keys.contains("tab: Keys"));
         assert!(fx.run("/help model").is_none());
         Ok(())
     }
@@ -587,7 +587,7 @@ mod tests {
             ("/diary", "Diary"),
         ] {
             let debug = overlay_debug(fx.run(raw))?;
-            assert!(debug.contains("KnowledgeBrowser") && debug.contains(kind));
+            assert!(debug.contains("KnowledgeBrowser") && debug.contains(&format!("kind: {kind}")));
         }
         assert!(fx.run("/diary note hallo").is_none());
         assert!(fx.run("/palace show x").is_none());
@@ -617,7 +617,7 @@ mod tests {
         assert!(who.contains(InteractionMode::default().as_str()));
         match fx.run("/rename  Mein Titel ") {
             Some(LocalIntercept::RenameSession(title)) => assert_eq!(title, "Mein Titel"),
-            other => panic!("expected rename, got {other:?}"),
+            other => return Err(TestError::Unexpected(format!("rename, got {other:?}"))),
         }
         assert!(system(fx.run("/rename"))?.contains("/rename"));
         assert_eq!(rewrite(fx.run("/sessions"))?, "/resume");
@@ -632,29 +632,27 @@ mod tests {
             "/diary note Idee festhalten"
         );
         let local_only = Fixture::new(CommandRegistry::new(vec![spec("diary")?.local()]));
-        assert_eq!(
-            rewrite(local_only.run("#Idee"))?,
-            "/memory record Idee"
-        );
+        assert_eq!(rewrite(local_only.run("#Idee"))?, "/memory record Idee");
         assert_eq!(rewrite(empty().run("#Idee"))?, "/memory record Idee");
         assert!(system(empty().run("#   "))?.contains("Leere Notiz"));
         Ok(())
     }
 
     #[test]
-    fn at_mention_routes_known_roles_else_plain_chat() {
+    fn at_mention_routes_known_roles_else_plain_chat() -> TestResult {
         let fx = empty();
         match fx.run("@Explorer finde die Konfig") {
             Some(LocalIntercept::Chat(text)) => {
                 assert_eq!(text, role_mention_text("explorer", "finde die Konfig"));
             }
-            other => panic!("expected chat, got {other:?}"),
+            other => return Err(TestError::Unexpected(format!("chat, got {other:?}"))),
         }
         match fx.run("@src/main.rs erkläre") {
             Some(LocalIntercept::Chat(text)) => assert_eq!(text, "@src/main.rs erkläre"),
-            other => panic!("expected chat, got {other:?}"),
+            other => return Err(TestError::Unexpected(format!("chat, got {other:?}"))),
         }
         assert!(fx.run("@").is_none());
+        Ok(())
     }
 
     #[test]

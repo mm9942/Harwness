@@ -762,3 +762,195 @@ levels plus a "Provider-Default (zurücksetzen)" entry that emits `clear`.
 6. **Chord timeout tunability per-action** vs. one global default — the
    TOML schema in §4.4 allows per-binding `within_ms`, but no design
    guidance yet on when a command author should override the default.
+
+---
+
+## 8. Ist-Stand der Befehlsfläche (2026-09-24)
+
+Dieser Abschnitt beschreibt, was der Code liefert, und hat bei Widerspruch
+Vorrang vor §§1–7. Quellen: `harw-ops/src/lib.rs` (`register_all`,
+`register_plan_tools`), `harw-tui/src/command_catalog.rs`
+(`local_command_specs`, `FALLBACK_COMMANDS`, `PLANNED_COMMANDS`,
+`HINT_TABLE`), `harw-tui/src/keybindings.rs`, `harw-tui/src/mention.rs`,
+`harw-cli/src/cli/global.rs`.
+
+### 8.1 Woher ein Befehl kommt
+
+Die TUI-Registry wird aus den Command-Adaptern der Operationen gebaut
+(`CommandRegistry::from_command_adapters`) und danach mit den lokalen
+Spezifikationen gemischt (`with_local_specs`). Bei Namensgleichheit gewinnt
+**immer die Operation**; der lokale Eintrag entfällt. Jede Spezifikation
+trägt `summary`, `usage`, `subcommands` (aus `HINT_TABLE`) und
+`origin: Operation | TuiLocal`; das `/`-Popup und die Hilfe (F1) zeigen sie.
+
+| Herkunft | Bedeutung |
+|---|---|
+| **Operation** | in `harw-ops` definiert und über `register_all` (37 Ops) bzw. hinter `[tools.plan] enabled` über `register_plan_tools` (6 Ops) registriert |
+| **TUI-lokal** | nur in der TUI abgefangen, keine Operation (`CommandScope::TuiOnly`) |
+| **Ersatz** | TUI-Spezifikation für einen Befehl, dessen Operation (noch) nicht registriert ist (`FALLBACK_COMMANDS`: `workbench`, `kanban`, `palace`, `dream`, `diary`, `models`, `mode`); entfällt automatisch, sobald die Operation registriert ist |
+| **geplant** | nur in der Hilfe gelistet (`PLANNED_COMMANDS`), nicht ausführbar |
+
+Stand der Registrierung: `workbench.rs`, `kanban.rs`, `palace.rs`,
+`diary.rs` und `models.rs` liegen in `harw-ops/src/`, sind aber noch nicht in
+`lib.rs`/`register_all` eingetragen — bis dahin greift der Ersatz. `mode` ist
+registriert (der Ersatz ist dann wirkungslos). Für `/dream` gibt es keine
+Operation.
+
+### 8.2 Inventar
+
+Spalten: Stufe laut `OperationMeta.permission` (Obs/Op/Maint), Sichtbarkeit
+(`Y` channel_parity, `R` channel_reduced, `-` tui_only), `busy`
+(`sofort` = `Immediate`, sonst bis Turn-Ende zurückgestellt).
+
+**Operationen (`register_all`)**
+
+| Befehl | Grammatik (Kurzform) | Stufe | Sicht | busy |
+|---|---|---|---|---|
+| `/help` | `[befehl]` | Obs | Y | sofort |
+| `/status` | — | Obs | Y | sofort |
+| `/quit` | — | Op | - | |
+| `/new` | — | Op | Y | |
+| `/work` | — (Job-Übersicht) | Obs | Y | sofort |
+| `/ps` | — | Obs | R | sofort |
+| `/attach` | — | Op | - | |
+| `/stop` | `[job-id]` | Op | Y | sofort |
+| `/diff` | — | Obs | Y | sofort |
+| `/agent` | `[list \| stop <agent-id> \| budget [agent-id]]` | Op | Y | sofort |
+| `/skills` | — | Op | R | |
+| `/plugins` | — | Maint | - | |
+| `/model` | `[show \| list \| switch <modell-id>]` — **live** | Op | - | sofort (nur `show`/`list`) |
+| `/provider` | `[show \| list \| test]` | Op | - | sofort (nur `show`/`list`) |
+| `/uia-model` | `[show \| list \| switch <modell-id>]` — ab nächster Sitzung | Op | - | |
+| `/uia-provider` | `[show \| list \| test]` (kein `switch`) | Op | - | |
+| `/uia-worker-model` | `[show \| list \| switch <modell-id>]` — ab nächster Sitzung, nur Modelle des UIA-Providers | Op | - | |
+| `/effort` | `[show \| minimal \| low \| medium \| high \| xhigh \| max \| clear]` | Op | - | |
+| `/uia-effort` | wie `/effort`, ab nächster Sitzung | Op | - | |
+| `/permissions` | `[show \| mode <ask\|auto\|full> [--session\|--project\|--global] \| allow <tool> [muster] … \| deny <tool> [muster] … \| remove <nr>]` | Op | - | |
+| `/mode` | `[show \| <modus> \| default <modus>]` | Op | - | |
+| `/compact` | — | Op | Y | |
+| `/memory` | siehe §2.6 | Op | Y | |
+| `/context-proposal` | `list \| view \| accept \| reject` | Op | Y | |
+| `/add-workdir` | `<pfad>` | Op | - | |
+| `/export` | `[--format md\|json] [--datei <pfad>] [--tools\|--no-tools] [--reasoning-summary] [--max-chars <n>]` | Op | - | |
+| `/usage` | — | Obs | Y | sofort |
+| `/bug-report` | — | Op | - | |
+| `/approve`, `/deny`, `/cancel` | `<id> …` | Op | Y | sofort |
+| `/review` | `<id>` | Obs | Y | sofort |
+| `/retry` | `<id>` | Op | Y | |
+| `/provider-concurrency` | — | Op | - | sofort |
+| `/sandbox-lease` | `[status \| revoke]` | Op | - | sofort |
+
+`approval.pending`/`approval.resolve` haben nur eine Web-Fläche, keinen
+Slash-Befehl.
+
+**Operationen hinter `[tools.plan] enabled`**: `/plan`, `/goal`, `/explore`,
+`/research-deps`, `/research-web`, `/analyze` (alle Op).
+
+**Operationen, noch nicht registriert (Ersatz aktiv)**
+
+| Befehl | Grammatik | Stufe laut Op | Sicht | busy |
+|---|---|---|---|---|
+| `/models` | `[show \| set <rolle> <ziel> \| reset <rolle>]`; `pick <rolle>` ist TUI-lokal (öffnet den Picker) | Op | - | sofort |
+| `/workbench`, `/kanban`, `/palace`, `/diary` | siehe §2.6 | Op | R / Y / Y / R | |
+
+`/models`: `<rolle>` ist ein Schlüssel aus `ModelRole::key`
+(`uia`, `uia-worker`, `orchestrator`, `sub-orchestrator`, `worker-simple`,
+`worker-complex`, `explorer`, `research`, `compaction`, `title`, `memory`,
+`dream`; `_`/`-` und Groß-/Kleinschreibung egal, auch Schlüssel der internen
+Modellstellen wie `session_title`). `<ziel>` ist eine Modell-ID/ein Alias/ein
+Katalogschlüssel oder `provider/modell` (Trennung am **ersten** `/`, Präfix
+muss ein aktivierter Provider sein). `set uia-worker` lehnt Modelle eines
+anderen Providers als dem der UIA ab. `reset` entfernt die explizite Wahl
+(UIA: `uia_provider`/`uia_model`; interne Stellen: ganze Tabelle
+`[internal_models.<stelle>]`). Kein Modell-Werkzeug. `data`-Vertrag:
+`show` → `{"roles":[{"role","label","provider","model","source","effort"}],"live":{"provider","model"}}`.
+
+`/mode default <modus>` schreibt `[mode] default` in die Profil-`config.toml`
+(bestes Bemühen, Fehler als Hinweis) und berührt die laufende Sitzung nicht;
+`/mode <modus>` wird vorgemerkt und an der nächsten Turn-Grenze angewandt
+(Antwort `requested`, nicht `applied`). Kein Modell-Werkzeug.
+
+**TUI-lokal** (`local_command_specs`, alle `tui_only`)
+
+| Befehl | Wirkung | Stufe | busy |
+|---|---|---|---|
+| `/tools` | `[on <name> \| off <name> \| reset [name] \| profile <minimal\|coding\|full>]` | Op | sofort |
+| `/resume` | `[sitzungs-id]`, ohne ID Auswahl | Op | |
+| `/sessions` | Sitzungsauswahl öffnen | Obs | |
+| `/exit` | TUI beenden (wie `/quit`) | Obs | sofort |
+| `/clear` | Anzeige leeren, Sitzung bleibt | Obs | |
+| `/verbose` | ausführliche Werkzeuganzeige umschalten | Obs | sofort |
+| `/keys` | Tastenbelegung anzeigen | Obs | sofort |
+| `/whoami` | Sitzung, Berechtigung, aktives Modell | Obs | sofort |
+| `/rename` | `<titel>` | Op | |
+| `/agents` | Agenten-Panel ein-/ausblenden | Obs | sofort |
+
+Die Ersatz-Spezifikationen (`/workbench`, `/kanban`, `/palace`, `/dream`,
+`/diary`, `/models`, `/mode`) sind lokal als Op/sofort geführt.
+
+Bare-Formen öffnen Ansichten statt Text: `/model`, `/uia-model`,
+`/uia-worker-model` → Modell-Picker; `/effort`, `/uia-effort` →
+Effort-Auswahl; `/models` → Rollen-Modell-Ansicht (F8); `/mode` →
+Modus-/Freigabe-Auswahl (F7); `/kanban` → Board (F6); `/workbench` →
+Werkbank-Panel (F5); `/palace`, `/dream`, `/diary` → Wissens-Browser.
+Ansichten schreiben nie selbst, sondern erzeugen Slash-Zeilen (die Ops
+prüfen und speichern); ihre Daten kommen aus `OpOutput.data`.
+
+**Geplant** (`PLANNED_COMMANDS`, nur Hilfe): `/rewind`, `/fork`, `/archive`,
+`/spawn`, `/mention`, `/kill`, `/logs`, `/doctor`, `/config`, `/mcp`,
+`/channels`, `/lease`, `/priority`, `/depends`, `/theme`.
+
+### 8.3 Präfixe
+
+| Eingabe | Ist-Verhalten |
+|---|---|
+| `/befehl` | Slash-Befehl; Popup vervollständigt Name und Unterkommando |
+| `!befehl` / `!!` | Shell-Befehl bzw. Wiederholung (siehe §3) |
+| `#text` | `/diary note text`, falls die `diary`-Operation registriert ist, sonst `/memory record text`. Kein Modell-Turn. |
+| `@rolle text` | Delegationswunsch an die UIA: Chattext wird zu „[Delegationswunsch an Rolle „rolle“] Bitte delegiere … Dies ist eine Bitte des Nutzers an dich (UIA), kein direktes Routing …“ + `text`. Rolle = exakter (case-insensitiver) Treffer in der Liste bekannter Agentenrollen; hat Vorrang vor Dateien. |
+| `@pfad` | Datei wird als `<datei pfad="rel/pfad">…</datei>` an die Nachricht angehängt. Grenzen (`MentionLimits::default`): **64 KiB je Datei, 256 KiB gesamt, höchstens 8 Dateien**. Pfad wird kanonisiert und muss unter der kanonischen Projektwurzel liegen (kein `..`, keine Symlinks nach außen). **Sperrliste**: `.env*`, `*.pem`, `*.key`, `id_*`, alles unter `.git/` — geprüft auf getipptem *und* aufgelöstem Pfad. Binärdateien (NUL-Byte) und ungültiges UTF-8 werden abgelehnt. Satzzeichen am Tokenende werden abgeschnitten, wenn das volle Token nicht auflösbar ist. Ablehnungen erscheinen mit deutschem Grund; eine gleichnamige Datei statt Rolle per `./name`. |
+| `\/`, `\!`, `\#`, `\@`, `\$` | Präfix maskieren, Rest als Chat |
+| `$` | reserviert |
+
+Beim Tippen von `@` öffnet ein Popup Kandidaten (Rollen und Projektdateien).
+
+### 8.4 Tastenbelegung (Standard)
+
+Umbelegbar über `[tui].keybindings_file` (flache TOML-Tabelle
+`aktion = "chord"` oder Liste; leere Liste hebt auf).
+
+| Taste | Aktion (`name`) |
+|---|---|
+| `F1` | Hilfe mit Reitern Befehle / Tasten / Präfixe (`show_help`) |
+| `F2` | Explorer ein/aus (`toggle_explorer`) |
+| `F3` | Agenten-Panel ein/aus (`toggle_agents`) |
+| `F4` | Fokus reihum (`cycle_focus`) |
+| `F5` | Werkbank-Panel ein/aus (`toggle_workbench`) |
+| `F6` | Kanban-Board öffnen (`open_kanban`) |
+| `F7` | Modus- und Freigabe-Auswahl (`open_mode_picker`) |
+| `F8` | Modelle je Rolle (`open_models`) |
+| `F11` | Panel im Vollbild (`maximize_panel`) |
+| `Ctrl+E` | Explorer fokussieren (`focus_explorer`) |
+| `Ctrl+O` | Werkzeugzellen auf/zu (`toggle_tool_cells`) |
+| `Ctrl+H` | Host-Arbeitsphase beenden (`end_host_mode`) |
+| `Ctrl+K` | Eingabezeile löschen (`delete_line`) |
+| `Ctrl+J` | neue Zeile (`insert_newline`) |
+| `Shift+Tab` | Freigabe-Zyklus `ask → auto → full → plan → ask` (`cycle_permission_mode`); nicht bei offenem `/`-Popup |
+
+Nicht umbelegbar: `Ctrl+C`/`Ctrl+D`, `Esc`, `Enter` samt `Shift/Alt+Enter`,
+Tasten in Dialogen/Overlays. Die Statuszeile zeigt
+`Modus: <modus> · Freigabe: <ask|auto|full>` (Zusatz „(ausstehend)“, solange
+ein Moduswechsel auf die Turn-Grenze wartet) und das aktive Modell.
+
+### 8.5 CLI-Flags für den Sitzungsstart
+
+Nur bei `harw`/`harw chat`, `harw exec` und `harw analyze` erlaubt (sonst
+Fehler; `--add-dir` nicht bei `analyze`).
+
+| Flag | Wirkung | Rangfolge |
+|---|---|---|
+| `--mode <modus>` | Interaktionsmodus der Wurzelsitzung | `--mode` > `[mode] default`; unbekannter Name ist in beiden Fällen ein Fehler |
+| `--approval <ask\|auto\|full>` | Freigabemodus der Sitzung (`RuntimeSpec.approval_override`) | `--approval` > Projekt-`[permissions].default_mode` > globales > Vorgabe des Einstiegs (`auto`) |
+| `--model <id>` | Modell der Sitzung (`RuntimeSpec.model_override`) | wird gegen `config.models` geprüft (Schlüssel, dann ID, dann Alias); unbekannt = Konfigurationsfehler. Setzt `default_model`/`default_provider` und hebt einen UIA-Pin für diesen Lauf auf |
+
+Details und Begründung: `tui-roles-models-modes.md`.
