@@ -1688,6 +1688,14 @@ fn open_serve_secret_resolver(
                 max_concurrency: None,
                 default_reasoning_effort: None,
                 gateway_identity_headers: false,
+                request_timeout_secs: None,
+                stream_idle_timeout_secs: None,
+                retry_timeouts: None,
+                max_tokens_field: None,
+                send_reasoning_effort: None,
+                strict_tools: None,
+                parallel_tool_calls: None,
+                allow_insecure_lan: false,
             },
         );
         needs_resolver = true;
@@ -3531,6 +3539,14 @@ mod tests {
             max_concurrency: None,
             default_reasoning_effort: None,
             gateway_identity_headers: false,
+            request_timeout_secs: None,
+            stream_idle_timeout_secs: None,
+            retry_timeouts: None,
+            max_tokens_field: None,
+            send_reasoning_effort: None,
+            strict_tools: None,
+            parallel_tool_calls: None,
+            allow_insecure_lan: false,
         };
         let mut config = ResolvedConfig::default();
         config.harness.default_provider = Some("gateway".to_owned());

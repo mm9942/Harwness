@@ -44,6 +44,17 @@ pub struct ProviderToml {
     /// Zähler, der zusätzliche Requests blockiert statt sie fehlschlagen
     /// zu lassen. `Some(0)` ist ungültig (siehe [`Self::validate`]) und
     /// würde jeden Request auf ewig blockieren.
+    ///
+    /// Runde 7, Teil L5: Für lokale Modell-Server (ein Modell, eine GPU) ist
+    /// `max_concurrency = 1` die empfohlene Einstellung; `harw provider add`
+    /// und der Katalog-Seed setzen sie für lokale Provider. Weitere Requests
+    /// (z. B. parallele Kinder) warten dann in der Warteschlange; die
+    /// Wartezeit zählt nicht zum Request-Zeitlimit. Verhältnis zu
+    /// `rate_limit.max_concurrent`: beide Grenzen gelten gleichzeitig, die
+    /// kleinere gewinnt. `max_concurrency` ist die Provider-weite, zur
+    /// Laufzeit verstellbare Grenze und der empfohlene Ort;
+    /// `rate_limit.max_concurrent` ist nur für Budget-Buckets je Modell
+    /// gedacht.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_concurrency: Option<usize>,
     /// Optionaler Wert für den `originator`-HTTP-Header, den `harw` auf der
@@ -84,6 +95,123 @@ pub struct ProviderToml {
     /// an eigene Cloudflare-Worker/AI-Gateway-Endpunkte. Standard: aus.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub gateway_identity_headers: bool,
+    /// Runde 7, Teil L4: Gesamt-Zeitlimit eines nicht gestreamten Requests
+    /// bzw. Wartezeit bis zu den Antwort-Headern eines gestreamten Requests,
+    /// in Sekunden. `None` = Vorgabe (120 s, lokale Provider 600 s, siehe
+    /// [`Self::effective_request_timeout_secs`]). `0` ist ungültig.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub request_timeout_secs: Option<u64>,
+    /// Runde 7, Teil L4: Leerlauf-Zeitlimit beim Streaming — so viele
+    /// Sekunden ohne ein einziges empfangenes Byte brechen den Stream ab.
+    /// Ein laufender Stream hat **kein** Gesamt-Zeitlimit mehr. `None` =
+    /// Vorgabe (lokal 120 s, sonst gleich dem Request-Zeitlimit, siehe
+    /// [`Self::effective_stream_idle_timeout_secs`]). `0` ist ungültig.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stream_idle_timeout_secs: Option<u64>,
+    /// Runde 7, Teil L4: ob ein Zeitlimit-Fehler automatisch wiederholt
+    /// wird. `None` = Vorgabe (Cloud: ja, lokale Provider: nein — ein
+    /// überlasteter lokaler Server wird durch Wiederholen nur noch
+    /// langsamer).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retry_timeouts: Option<bool>,
+    /// Runde 7, Teil L6 (nur `openai-chat`): welches Feld die
+    /// Ausgabe-Obergrenze trägt. `None` = Vorgabe (Cloud:
+    /// `max_completion_tokens`, lokal: `max_tokens`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_tokens_field: Option<MaxTokensField>,
+    /// Runde 7, Teil L6 (nur `openai-chat`): ob `reasoning_effort` gesendet
+    /// wird. `None` = Vorgabe (Cloud: ja, lokal: nein — viele lokale Server
+    /// lehnen unbekannte Felder ab).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub send_reasoning_effort: Option<bool>,
+    /// Runde 7, Teil L6 (nur `openai-chat`): ob Werkzeug-Schemas mit
+    /// `"strict"` gesendet werden. `None` = Vorgabe (Cloud: ja, lokal: nein).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub strict_tools: Option<bool>,
+    /// Runde 7, Teil L6 (nur `openai-chat`): Wert für `parallel_tool_calls`,
+    /// sobald Werkzeuge angeboten werden. `None` = Vorgabe (Cloud: Feld
+    /// weglassen, lokal: `false`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parallel_tool_calls: Option<bool>,
+    /// Runde 7, Teil L8: erlaubt unverschlüsseltes `http` zu einer privaten
+    /// LAN-Adresse (`10.0.0.0/8`, `172.16.0.0/12`, `192.168.0.0/16`,
+    /// IPv6-ULA `fc00::/7`). Standard `false`: `http` nur für Loopback.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub allow_insecure_lan: bool,
+}
+
+/// Runde 7, Teil L6: Name des Felds für die Ausgabe-Obergrenze im
+/// `chat/completions`-Body.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MaxTokensField {
+    /// Nur `max_tokens` (ältere bzw. lokale OpenAI-kompatible Server).
+    MaxTokens,
+    /// Nur `max_completion_tokens` (aktuelle OpenAI-API).
+    MaxCompletionTokens,
+    /// Beide Felder mit demselben Wert.
+    Both,
+}
+
+/// Vorgabe des Request-Zeitlimits für Cloud-Provider (Sekunden).
+pub const DEFAULT_REQUEST_TIMEOUT_SECS: u64 = 120;
+/// Vorgabe des Request-Zeitlimits für lokale Provider (Sekunden).
+pub const DEFAULT_LOCAL_REQUEST_TIMEOUT_SECS: u64 = 600;
+/// Vorgabe des Streaming-Leerlauf-Zeitlimits für lokale Provider (Sekunden).
+pub const DEFAULT_LOCAL_STREAM_IDLE_TIMEOUT_SECS: u64 = 120;
+
+/// Runde 7, Teil L1/L8: Host-Anteil einer Basis-URL (ohne Schema,
+/// Userinfo, Port und IPv6-Klammern), kleingeschrieben.
+///
+/// # Arguments
+/// - `base_url`: z. B. `http://[::1]:8000/v1`.
+///
+/// # Returns
+/// `Some(host)` oder `None`, wenn kein Host erkennbar ist.
+fn url_host(base_url: &str) -> Option<String> {
+    let rest = base_url.trim();
+    let rest = rest.split_once("://").map_or(rest, |(_, rest)| rest);
+    let authority = rest.split(['/', '?', '#']).next()?;
+    let authority = authority
+        .rsplit_once('@')
+        .map_or(authority, |(_, host)| host);
+    let host = if let Some(bracketed) = authority.strip_prefix('[') {
+        bracketed.split(']').next()?
+    } else {
+        authority.split(':').next()?
+    };
+    let host = host.trim_end_matches('.').to_ascii_lowercase();
+    if host.is_empty() { None } else { Some(host) }
+}
+
+/// Runde 7, Teil L1: `true`, wenn `host` die eigene Maschine bezeichnet
+/// (`localhost`, `*.localhost`, `127.0.0.0/8`, `::1`).
+fn host_is_loopback(host: &str) -> bool {
+    if host == "localhost" || host.ends_with(".localhost") {
+        return true;
+    }
+    match host.parse::<std::net::IpAddr>() {
+        Ok(std::net::IpAddr::V4(v4)) => v4.is_loopback(),
+        Ok(std::net::IpAddr::V6(v6)) => {
+            v6.is_loopback() || v6.to_ipv4_mapped().is_some_and(|v4| v4.is_loopback())
+        }
+        Err(_) => false,
+    }
+}
+
+/// Runde 7, Teil L8: `true`, wenn `host` eine private LAN-IP ist
+/// (`10/8`, `172.16/12`, `192.168/16`, IPv6-ULA `fc00::/7`). Hostnamen
+/// zählen bewusst nicht (DNS kann überallhin zeigen).
+#[must_use]
+pub fn host_is_private_lan(host: &str) -> bool {
+    match host.parse::<std::net::IpAddr>() {
+        Ok(std::net::IpAddr::V4(v4)) => v4.is_private(),
+        Ok(std::net::IpAddr::V6(v6)) => {
+            (v6.segments()[0] & 0xfe00) == 0xfc00
+                || v6.to_ipv4_mapped().is_some_and(|v4| v4.is_private())
+        }
+        Err(_) => false,
+    }
 }
 
 /// Höchstlänge des `originator`-Felds (siehe [`ProviderToml::validate`]).
@@ -102,6 +230,84 @@ impl ProviderToml {
     #[must_use]
     pub fn has_plaintext_secret(&self) -> bool {
         self.api_key.as_ref().is_some_and(|k| !k.is_empty())
+    }
+
+    /// Runde 7, Teil L1: `true`, wenn dieser Provider ein lokales
+    /// Modell-Backend anspricht — Transport `ollama`, eine Loopback-Basis-URL
+    /// oder eine private LAN-IP mit `allow_insecure_lan = true`.
+    ///
+    /// Lokale Provider bekommen andere Vorgaben (kein Auth-Header, längere
+    /// Zeitlimits, keine Timeout-Wiederholung, schlanker Chat-Body,
+    /// `max_concurrency = 1` beim Anlegen) und keinen Hersteller-Präfix-Match
+    /// für das Kontextfenster.
+    #[must_use]
+    pub fn is_local(&self) -> bool {
+        if self.api == "ollama" {
+            return true;
+        }
+        url_host(&self.base_url).is_some_and(|host| {
+            host_is_loopback(&host) || (self.allow_insecure_lan && host_is_private_lan(&host))
+        })
+    }
+
+    /// Runde 7, Teil L4: wirksames Request-Zeitlimit in Sekunden
+    /// (`request_timeout_secs`, sonst 600 lokal bzw. 120).
+    #[must_use]
+    pub fn effective_request_timeout_secs(&self) -> u64 {
+        self.request_timeout_secs.unwrap_or(if self.is_local() {
+            DEFAULT_LOCAL_REQUEST_TIMEOUT_SECS
+        } else {
+            DEFAULT_REQUEST_TIMEOUT_SECS
+        })
+    }
+
+    /// Runde 7, Teil L4: wirksames Streaming-Leerlauf-Zeitlimit in Sekunden
+    /// (`stream_idle_timeout_secs`, sonst 120 lokal bzw. das
+    /// Request-Zeitlimit).
+    #[must_use]
+    pub fn effective_stream_idle_timeout_secs(&self) -> u64 {
+        self.stream_idle_timeout_secs.unwrap_or(if self.is_local() {
+            DEFAULT_LOCAL_STREAM_IDLE_TIMEOUT_SECS
+        } else {
+            self.effective_request_timeout_secs()
+        })
+    }
+
+    /// Runde 7, Teil L4: ob Zeitlimit-Fehler wiederholt werden
+    /// (`retry_timeouts`, sonst nur bei Cloud-Providern).
+    #[must_use]
+    pub fn effective_retry_timeouts(&self) -> bool {
+        self.retry_timeouts.unwrap_or(!self.is_local())
+    }
+
+    /// Runde 7, Teil L6: wirksames Feld für die Ausgabe-Obergrenze.
+    #[must_use]
+    pub fn effective_max_tokens_field(&self) -> MaxTokensField {
+        self.max_tokens_field.unwrap_or(if self.is_local() {
+            MaxTokensField::MaxTokens
+        } else {
+            MaxTokensField::MaxCompletionTokens
+        })
+    }
+
+    /// Runde 7, Teil L6: ob `reasoning_effort` gesendet wird.
+    #[must_use]
+    pub fn effective_send_reasoning_effort(&self) -> bool {
+        self.send_reasoning_effort.unwrap_or(!self.is_local())
+    }
+
+    /// Runde 7, Teil L6: ob Werkzeug-Schemas `"strict"` tragen.
+    #[must_use]
+    pub fn effective_strict_tools(&self) -> bool {
+        self.strict_tools.unwrap_or(!self.is_local())
+    }
+
+    /// Runde 7, Teil L6: Wert für `parallel_tool_calls` (`None` = Feld
+    /// weglassen; lokal `Some(false)`).
+    #[must_use]
+    pub fn effective_parallel_tool_calls(&self) -> Option<bool> {
+        self.parallel_tool_calls
+            .or_else(|| self.is_local().then_some(false))
     }
 
     /// `true`, wenn ein Header dieses Namens Credentials trägt und daher nur
@@ -135,6 +341,8 @@ impl ProviderToml {
     /// - [`ConfigError::Invalid`]: `originator` ist gesetzt, aber leer, länger
     ///   als [`MAX_ORIGINATOR_CHARS`] Zeichen oder enthält Nicht-ASCII-/
     ///   Steuerzeichen (siehe [`is_printable_ascii`]).
+    /// - [`ConfigError::Invalid`]: `request_timeout_secs` oder
+    ///   `stream_idle_timeout_secs` ist `0` (Runde 7, Teil L4).
     /// - [`ConfigError::Invalid`]: `[rate_limit]` verletzt
     ///   [`RateLimitToml::validate`] (Budget-Feld `0`, Marge > 100,
     ///   `mode = "budget"` ohne Budget).
@@ -157,6 +365,17 @@ impl ProviderToml {
         }
         if let Some(rate_limit) = &self.rate_limit {
             rate_limit.validate(&format!("provider '{}'", self.name))?;
+        }
+        for (field, value) in [
+            ("request_timeout_secs", self.request_timeout_secs),
+            ("stream_idle_timeout_secs", self.stream_idle_timeout_secs),
+        ] {
+            if value == Some(0) {
+                return Err(ConfigError::Invalid(format!(
+                    "provider '{}': {field} = 0 would fail every request immediately; omit the field for the default or set a positive number of seconds",
+                    self.name
+                )));
+            }
         }
         if let Some(originator) = &self.originator {
             if originator.len() > MAX_ORIGINATOR_CHARS || !is_printable_ascii(originator) {
@@ -1002,6 +1221,161 @@ mod tests {
         let decoded: RateLimitToml =
             toml::from_str(&encoded).map_err(ctx("rate_limit erneut parsen"))?;
         assert_eq!(decoded, rate_limit);
+        Ok(())
+    }
+
+    // Runde 7, Teil L: lokale Vorgaben und neue Kompatibilitätsfelder.
+
+    fn provider_from(src: &str) -> TestResult<ProviderToml> {
+        toml::from_str(src).map_err(ctx("provider toml parsen"))
+    }
+
+    #[test]
+    fn test_loopback_provider_is_local_and_gets_local_defaults() -> TestResult {
+        let provider = provider_from(
+            r#"
+            name = "vllm"
+            api = "openai-chat"
+            base_url = "http://localhost:8000/v1"
+        "#,
+        )?;
+        assert!(provider.is_local());
+        assert_eq!(provider.effective_request_timeout_secs(), 600);
+        assert_eq!(provider.effective_stream_idle_timeout_secs(), 120);
+        assert!(!provider.effective_retry_timeouts());
+        assert_eq!(
+            provider.effective_max_tokens_field(),
+            MaxTokensField::MaxTokens
+        );
+        assert!(!provider.effective_send_reasoning_effort());
+        assert!(!provider.effective_strict_tools());
+        assert_eq!(provider.effective_parallel_tool_calls(), Some(false));
+        Ok(())
+    }
+
+    #[test]
+    fn test_cloud_provider_keeps_previous_defaults() -> TestResult {
+        let provider = provider_from(
+            r#"
+            name = "openai"
+            api = "openai-chat"
+            base_url = "https://api.openai.com/v1"
+        "#,
+        )?;
+        assert!(!provider.is_local());
+        assert_eq!(provider.effective_request_timeout_secs(), 120);
+        assert_eq!(provider.effective_stream_idle_timeout_secs(), 120);
+        assert!(provider.effective_retry_timeouts());
+        assert_eq!(
+            provider.effective_max_tokens_field(),
+            MaxTokensField::MaxCompletionTokens
+        );
+        assert!(provider.effective_send_reasoning_effort());
+        assert!(provider.effective_strict_tools());
+        assert_eq!(provider.effective_parallel_tool_calls(), None);
+        Ok(())
+    }
+
+    #[test]
+    fn test_explicit_compat_fields_override_local_defaults() -> TestResult {
+        let provider = provider_from(
+            r#"
+            name = "lmstudio"
+            api = "openai-chat"
+            base_url = "http://127.0.0.1:1234/v1"
+            request_timeout_secs = 900
+            stream_idle_timeout_secs = 45
+            retry_timeouts = true
+            max_tokens_field = "both"
+            send_reasoning_effort = true
+            strict_tools = true
+            parallel_tool_calls = true
+        "#,
+        )?;
+        assert_eq!(provider.effective_request_timeout_secs(), 900);
+        assert_eq!(provider.effective_stream_idle_timeout_secs(), 45);
+        assert!(provider.effective_retry_timeouts());
+        assert_eq!(provider.effective_max_tokens_field(), MaxTokensField::Both);
+        assert!(provider.effective_send_reasoning_effort());
+        assert!(provider.effective_strict_tools());
+        assert_eq!(provider.effective_parallel_tool_calls(), Some(true));
+        Ok(())
+    }
+
+    #[test]
+    fn test_lan_provider_is_local_only_with_opt_in() -> TestResult {
+        let mut provider = provider_from(
+            r#"
+            name = "gpu-box"
+            api = "openai-chat"
+            base_url = "http://192.168.1.20:8000/v1"
+        "#,
+        )?;
+        assert!(!provider.is_local());
+        provider.allow_insecure_lan = true;
+        assert!(provider.is_local());
+        assert!(host_is_private_lan("10.1.2.3"));
+        assert!(host_is_private_lan("172.16.0.1"));
+        assert!(host_is_private_lan("fd00::1"));
+        assert!(!host_is_private_lan("8.8.8.8"));
+        assert!(!host_is_private_lan("gpu-box.lan"));
+        Ok(())
+    }
+
+    #[test]
+    fn test_url_host_handles_ipv6_userinfo_and_ports() {
+        assert_eq!(url_host("http://[::1]:8000/v1").as_deref(), Some("::1"));
+        assert_eq!(
+            url_host("http://user@LocalHost:1234/v1").as_deref(),
+            Some("localhost")
+        );
+        assert_eq!(
+            url_host("https://api.example.com").as_deref(),
+            Some("api.example.com")
+        );
+        assert!(host_is_loopback("127.0.0.2"));
+        assert!(host_is_loopback("::ffff:127.0.0.1"));
+        assert!(!host_is_loopback("localhost.example.com"));
+    }
+
+    #[test]
+    fn test_validate_rejects_zero_timeouts() -> TestResult {
+        for field in ["request_timeout_secs", "stream_idle_timeout_secs"] {
+            let provider = provider_from(&format!(
+                "name = \"local\"\napi = \"openai-chat\"\nbase_url = \"http://localhost:8000/v1\"\n{field} = 0\n"
+            ))?;
+            let Err(error) = provider.validate() else {
+                return Err(TestError::Unexpected(format!(
+                    "{field} = 0 must be rejected"
+                )));
+            };
+            assert!(matches!(error, ConfigError::Invalid(ref msg) if msg.contains(field)));
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn test_new_compat_fields_are_omitted_when_unset() -> TestResult {
+        let provider = provider_from(
+            r#"
+            name = "openai"
+            api = "openai-chat"
+            base_url = "https://api.openai.com/v1"
+        "#,
+        )?;
+        let encoded = toml::to_string(&provider).map_err(ctx("provider toml serialisieren"))?;
+        for field in [
+            "request_timeout_secs",
+            "stream_idle_timeout_secs",
+            "retry_timeouts",
+            "max_tokens_field",
+            "send_reasoning_effort",
+            "strict_tools",
+            "parallel_tool_calls",
+            "allow_insecure_lan",
+        ] {
+            assert!(!encoded.contains(field), "{field} sollte fehlen: {encoded}");
+        }
         Ok(())
     }
 }

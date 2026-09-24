@@ -396,6 +396,7 @@ fn test_field_table_exhaustive_permissions_section() {
     let PermissionsSection {
         default_mode,
         approval_timeout_secs,
+        auto_classifier_timeout_secs,
         allow,
         deny,
         extra_roots,
@@ -403,6 +404,7 @@ fn test_field_table_exhaustive_permissions_section() {
     let _ = (
         default_mode,
         approval_timeout_secs,
+        auto_classifier_timeout_secs,
         allow,
         deny,
         extra_roots,
@@ -410,6 +412,7 @@ fn test_field_table_exhaustive_permissions_section() {
     for path in [
         "permissions.default_mode",
         "permissions.approval_timeout_secs",
+        "permissions.auto_classifier_timeout_secs",
         "permissions.allow",
         "permissions.deny",
         "permissions.extra_roots",
@@ -595,7 +598,7 @@ fn test_field_table_exhaustive_reasoning_weights_toml() {
 }
 
 // ---------------------------------------------------------------------
-// [guards] (Abschnitt 1.16, 6 Felder)
+// [guards] (Abschnitt 1.16, 8 Felder)
 // ---------------------------------------------------------------------
 
 #[test]
@@ -607,6 +610,8 @@ fn test_field_table_exhaustive_guards_toml() {
         no_progress_rounds_warn,
         no_progress_rounds_abort,
         plan_stale_rounds,
+        orchestrator_read_warn,
+        orchestrator_read_limit,
     } = GuardsToml::default();
     let _ = (
         enabled,
@@ -615,6 +620,8 @@ fn test_field_table_exhaustive_guards_toml() {
         no_progress_rounds_warn,
         no_progress_rounds_abort,
         plan_stale_rounds,
+        orchestrator_read_warn,
+        orchestrator_read_limit,
     );
     for path in [
         "guards.enabled",
@@ -623,6 +630,8 @@ fn test_field_table_exhaustive_guards_toml() {
         "guards.no_progress_rounds_warn",
         "guards.no_progress_rounds_abort",
         "guards.plan_stale_rounds",
+        "guards.orchestrator_read_warn",
+        "guards.orchestrator_read_limit",
     ] {
         assert_path_in_field_table_exactly_once(path);
     }

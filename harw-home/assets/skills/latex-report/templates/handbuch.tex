@@ -1,0 +1,123 @@
+% Handbuch -- Gerüst der Harwness-Vorlage (Skill latex-report).
+% Für Anleitungen und Nachschlagewerke: erst das Bild im Kopf (Überblick,
+% Abbildung, Glossar), dann Schritt für Schritt, dann Referenz und
+% Fehlerbehebung. Alle Texte unten sind kurze Platzhalter: ersetzen, kürzen
+% oder streichen. Nichts erfinden -- was der Auftrag nicht hergibt, bleibt als
+% % TODO: stehen und wird in der Übergabe genannt.
+\documentclass[11pt,a4paper]{scrartcl}
+
+% ── Anpassung: von latex.template gefüllt, Vorgaben in harw-report.sty ──
+\newcommand{\harwLanguage}{%%LANGUAGE%%}
+\newcommand{\harwAccentHex}{%%ACCENT%%}
+\newcommand{\harwWarnHex}{%%WARN%%}
+\newcommand{\harwMainFont}{%%MAINFONT%%}
+\newcommand{\harwSansFont}{%%SANSFONT%%}
+\newcommand{\harwMonoFont}{%%MONOFONT%%}
+\usepackage{harw-report}
+
+\title{%%TITLE%%}
+\subtitle{%%SUBTITLE%%}
+\author{%%AUTHOR%%}
+\date{%%DATE%%}
+
+\begin{document}
+\maketitle
+
+\begin{achtung}[Wichtig vorab]
+Was vor der ersten Benutzung gilt: Voraussetzungen, Grenzen oder ein
+bekannter Stolperstein.
+\end{achtung}
+
+\begin{merke}[Die Idee in drei Sätzen]
+Was das Beschriebene ist. Wofür man es benutzt. Wie der typische Ablauf
+aussieht.
+\end{merke}
+
+\tableofcontents
+\newpage
+
+\section{Überblick}\label{sec:ueberblick}
+
+Ein Absatz zum Zweck und zum Leserkreis. Die Abbildung zeigt die Teile und
+wie sie zusammenspielen.
+
+\begin{figure}[htbp]
+\centering
+\begin{tikzpicture}[node distance=1.6cm]
+  \node[harwbox,fill=harwgrau] (nutzer) {Nutzerin};
+  \node[harwbox,fill=harwaccent!15,right=of nutzer] (werkzeug)
+    {\textbf{Werkzeug}\\Oberfläche};
+  \node[harwbox,fill=harwgrau,right=of werkzeug] (daten) {Daten\\(Ablage)};
+  \draw[harwpfeil] (nutzer) -- node[harwlabel,above=2pt]{bedient} (werkzeug);
+  \draw[harwdoppelpfeil] (werkzeug) -- node[harwlabel,above=2pt]{liest,\\schreibt} (daten);
+\end{tikzpicture}
+\caption{Die Teile und ihr Zusammenspiel (Beispiel)}\label{fig:ueberblick}
+\end{figure}
+
+\subsection{Kleines Glossar}
+
+\begin{tabularx}{\textwidth}{@{}lL@{}}
+\toprule
+\textbf{Begriff} & \textbf{Bedeutung} \\
+\midrule
+Begriff A & Eine kurze Erklärung in einem Satz. \\
+Begriff B & Eine zweite Erklärung. \\
+\bottomrule
+\end{tabularx}
+
+\section{Schritt für Schritt}\label{sec:schritte}
+
+\begin{enumerate}[label=\arabic*.,itemsep=2pt]
+  \item Erster Schritt: was zu tun ist und woran man erkennt, dass er
+        geklappt hat.
+  \item Zweiter Schritt, zum Beispiel eine Einstellung in der Datei
+        \path{einstellungen/beispiel.toml}.
+  \item Dritter Schritt.
+\end{enumerate}
+
+\begin{beispiel}[Beispiel: eine Einstellung]
+\begin{lstlisting}
+[bereich]
+name = "Beispiel"
+aktiv = true
+\end{lstlisting}
+\end{beispiel}
+
+\section{Referenz}\label{sec:referenz}
+
+{\small
+\begin{longtable}{@{}>{\raggedright}p{3.6cm}>{\raggedright}p{2.6cm}>{\raggedright\arraybackslash}p{8.8cm}@{}}
+\toprule
+\textbf{Einstellung} & \textbf{Vorgabe} & \textbf{Bedeutung} \\
+\midrule
+\endhead
+\bottomrule
+\endlastfoot
+\code{name} & leer & Was die Einstellung bewirkt. \\
+\code{aktiv} & \code{false} & Was die Einstellung bewirkt. \\
+\end{longtable}
+}
+
+\section{Fehlerbehebung}\label{sec:fehler}
+
+\begin{description}[leftmargin=2.6cm,style=nextline,font=\sffamily\bfseries\small]
+  \item[Symptom] Was die Nutzerin sieht.
+  \item[Ursache] Warum es passiert.
+  \item[Abhilfe] Was sie tun kann.
+\end{description}
+
+\section{Stand}\label{sec:stand}
+
+\begin{description}[leftmargin=2.6cm,style=nextline,font=\sffamily\bfseries\small]
+  \item[Gilt für] Version oder Datum, auf das sich das Handbuch bezieht.
+  \item[Offen] Was noch nicht beschrieben ist.
+\end{description}
+
+\begin{thebibliography}{9}
+\addcontentsline{toc}{section}{\refname}
+\small
+\bibitem{quelle1} Nachname, Vorname: \emph{Titel der Quelle}. Verlag, Jahr.
+  \url{https://example.org/quelle}
+\end{thebibliography}
+
+\end{document}

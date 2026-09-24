@@ -1,0 +1,4 @@
+name = "latex-report"
+description = "Berichte, Business-Paper und Handbücher mit der mitgelieferten Harwness-Vorlage setzen: latex.check, latex.template, Bausteine (Wichtig vorab, Die Idee in drei Sätzen, Glossar, Stand, Quellen), Tabellen- und TikZ-Muster, Overfull-Boxen gezielt beheben, ehrlicher Build-Bericht mit PDF-Stichprobe."
+instructions_file = "instructions.md"
+tools = ["filesystem.read", "filesystem.write", "process.execute"]

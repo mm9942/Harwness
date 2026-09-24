@@ -31,19 +31,33 @@
 //! - [`precedents`]: Präzedenzregister und Auswahl einschlägiger Maßstäbe.
 //! - [`lessons`]: Design-Lehren im AAR, [`lessons::AarSummary`] und
 //!   [`lessons::compare_runs`] für Mehrfachläufe.
+//! - [`business`]: Geschäftsregeln (`when`/`effect`, z. B. `cash_floor`
+//!   sperrt `invest`/`acquisition`) und das Logit-Marktmodell
+//!   (`logit_share` mit Sättigung des Vertriebsinvests), Runde 7 Teil M5.
 //!
 //! # Concurrency
 //! Alle Typen sind reine Daten ohne interne Mutabilität. Parallele
 //! Child-Aufrufe sammelt der Aufrufer; eingefügt wird in kanonischer
 //! Sitzreihenfolge ([`phases::ArgumentBox`], [`phases::reveal_round`]).
 //!
-//! # Offene Punkte (bewusst nicht im ersten Schnitt)
-//! Business-Marktmodell (`logit_share`) und Auswertung von `when`-Prädikaten,
+//! # Umgesetzt in Runde 7 (Teil M5)
+//! - Marktmodell `logit_share` ([`business::apply_market_model`], am
+//!   Rundenende über [`phases::close_round_with_market`]).
+//! - `when`-Prädikate und Wirkungen der Geschäftsregeln
+//!   ([`business::evaluate_predicate`]; `restrict_actions` wird in
+//!   [`phases::resolve_argument`] zum Veto, `require_stakeholder` zum
+//!   Umpire-Vermerk).
+//! - Konfliktpaare der Adjudikation über [`dice::resolve_conflict`]
+//!   ([`phases::resolve_adjudication`]).
+//!
+//! # Offene Punkte
 //! Knock-out-Würfe der Schlussargumente, `argument_mode = "sequential"`,
-//! `deferred`-Effekte geheimer Argumente, Konflikt-Integration in
-//! [`phases::resolve_argument`] (Mathematik in [`dice::resolve_conflict`]).
+//! `deferred`-Effekte geheimer Argumente, `conditional`-Injects über
+//! [`business::evaluate_predicate`], weitere KPIs des Marktmodells
+//! (Umsatz, Deckungsbeitrag, EBIT, Cash).
 
 pub mod aar;
+pub mod business;
 pub mod commitments;
 pub mod dice;
 pub mod error;

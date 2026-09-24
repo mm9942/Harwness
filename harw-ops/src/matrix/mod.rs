@@ -1,35 +1,24 @@
-//! `/matrix` — Matrix Game live (`docs/design/matrix-game.md` §4, §7).
+//! `/matrix` — Ansicht vergangener und laufender Matrix-Game-Läufe
+//! (`docs/design/matrix-game.md` §4, §7) und gemeinsame Laufverwaltung für
+//! den Game Master.
 //!
-//! # Subcommands
-//! Alle Subcommands außer `start` und `list` wirken auf den aktuellen Lauf
-//! oder den per `--run=<id>` gewählten.
-//! - `start <szenario-id|pfad> [--seed N]` — lädt ein gebündeltes Szenario
-//!   (`karst-islands`, `cloud-sme-2027`, auch über die Szenario-ID) oder eine
-//!   TOML-Datei, eröffnet das Spiel (Setup) und legt
-//!   `<profil>/knowledge/matrix/<szenario>/<lauf>/` mit `scenario.toml`,
-//!   `journal.jsonl` und den Unterlagen-Kopien je Sitz (`materials/<sitz>/`)
-//!   an. Der Lauf wird zum aktuellen Lauf.
-//! - `step` — genau eine Phase (Sitz-Aufrufe über Kind-Agenten).
-//! - `auto N` — bis zu `N` (1–20) Runden ohne Halt; bricht bei Spielende,
-//!   Leak-Verdacht, Fehler oder `pause` ab.
-//! - `pause` — hält den Lauf an (während `auto`: nach dem laufenden Schritt).
-//! - `inject [--audience=<a>] [--attributed] [--effects=<json>] <text…>` —
-//!   Ereignis zur nächsten Phasengrenze (`a`: `public`, `umpire`, `seat:x`,
-//!   `seat+umpire:x`, `pair:a,b`; `--effects` als JSON-Liste ohne Leerzeichen).
-//! - `override <json>` — vor dem Wurf: Urteilsfelder eines offenen Arguments
-//!   ersetzen (`{"argument_id":"r2-a1","context_modifier":1,…}`); nach dem
-//!   Wurf: `{"argument_id","effects":[…],"text"}` als markierte Korrektur.
-//! - `veto <argument-id> [grund…]` — Argument in der Adjudikation verwerfen.
-//! - `reveal <geheimnis|argument-id>` — geheimes Argument offenlegen.
-//! - `fork <runde>` — neuer Lauf ab dem Rundenende `runde` (wird aktuell).
-//! - `end` — direkt zu Schlussargumenten/AAR; schreibt `aar.md`.
-//! - `replay` — prüft das Journal per Replay; `replay --seed N` startet
-//!   dasselbe Szenario neu mit Seed `N`.
-//! - `show` (auch bare `/matrix`) — Panel-Daten.
-//! - `list` — Läufe dieses Prozesses und gebündelte Szenarien.
+//! # Runde 7, Teil M: Start und Steuerung über den Game Master
+//! Matrix-Games startet und steuert die UIA über den spezialisierten
+//! Orchestrator `matrix-game-master` (Hintergrund-Kind der UIA, eigene
+//! Modell-Werkzeuge in [`game_master`]). Der Slash-Befehl startet und steuert
+//! **nicht** mehr: `/matrix start|step|auto|…` blockierte die
+//! TUI-Ereignisschleife, solange die Sitz-Agenten liefen (der Befehl wird im
+//! Event-Loop abgewartet, `harw-tui/src/app.rs`, Dispatch der
+//! `/command`-Zeile) — Freigabedialoge der Sitze konnten nicht erscheinen,
+//! Esc/Ctrl+C griffen nicht. Diese Unterbefehle antworten jetzt mit einem
+//! Hinweis auf den Game Master.
 //!
-//! Jeder Facilitator-Eingriff steht als `FacilitatorNote` (nur Beobachter)
-//! im Journal.
+//! # Subcommands (nur lesend)
+//! - `show` (auch bare `/matrix`) — Panel-Daten des aktuellen bzw. per
+//!   `--run=<id>` gewählten Laufs.
+//! - `list` — Läufe dieses Prozesses, gebündelte und gespeicherte Szenarien.
+//! - `replay` — prüft das Journal eines Laufs per Replay (ohne Neustart).
+//! - `compare <lauf> <lauf> …` — Vergleich mehrerer Läufe (Design-Lehren).
 //!
 //! # `show`-Daten
 //! `{"run_id","scenario","round","phase","status","seats":[{"id","name",
@@ -45,6 +34,15 @@
 //! `"seats"` (Sitz-Schlüssel, deren Projektion den Eintrag enthält) und
 //! `"events"` (serialisierte `MatrixGameEvent`s aus `events_for_entry`).
 //!
+//! # Szenarien
+//! `resolve_known_scenario` kennt gebündelte Szenarien (Dateiname oder ID)
+//! und gespeicherte Entwürfe unter
+//! `<profil>/knowledge/matrix/scenarios/<slug>.toml` (vom Game Master über
+//! `matrix.draft_scenario` angelegt). Pfade zu beliebigen Dateien löst es
+//! bewusst nicht auf: der Aufruf kommt vom Modell und darf nichts außerhalb
+//! des Matrix-Speichers lesen. Freitext mit Leerzeichen verweist auf den
+//! Entwurf.
+//!
 //! # Laufzustand
 //! Läufe leben prozessweit in `RUNS`. Für die Dauer eines Schritts wird der
 //! Lauf aus der Map genommen (kein `std::sync::Mutex` über ein `await`);
@@ -52,31 +50,35 @@
 //!
 //! # Fehler
 //! - [`OpError::InvalidArguments`] — Grammatik, unbekanntes Szenario/Lauf,
-//!   unzulässiger Eingriff.
-//! - [`OpError::NotAvailable`] — kein Agent-Spawner (nur `step`/`auto`).
+//!   Steuerbefehl über den Slash-Pfad.
+//! - [`OpError::NotAvailable`] — kein Agent-Spawner (Game-Master-Werkzeuge).
 //! - [`OpError::Execution`] — Kern-, Datei- oder Registry-Fehler.
 
+pub mod game_master;
+pub mod report;
 pub mod runner;
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, MutexGuard, OnceLock};
 
 use harw_macros::operation;
-use harw_matrix_game::phases::{EffectOp, Phase};
+use harw_matrix_game::phases::Phase;
 use harw_matrix_game::scenario::{LoadedScenario, load_scenario};
-use harw_matrix_game::state::Audience;
 use harw_operations::{OpContext, OpError, OpOutput};
 use serde_json::{Value, json};
 
-use runner::{AAR_FILE, EventSink, MatrixRun, NullDriver, RunStatus, master_seed_for};
+use runner::{EventSink, MatrixRun, NullDriver, RunStatus, master_seed_for};
 
-/// Obergrenze für `auto N` (Runden).
+/// Obergrenze für die Rundenzahl eines `matrix.run`-Aufrufs.
 pub const MAX_AUTO_ROUNDS: u32 = 20;
 
-/// Sicherheitsnetz: höchstens so viele Phasen je `auto`.
+/// Sicherheitsnetz: höchstens so viele Phasen je Durchlauf.
 const MAX_AUTO_STEPS: usize = 400;
+
+/// Unterordner gespeicherter Szenario-Entwürfe unter `<profil>/knowledge/matrix`.
+pub const SCENARIOS_DIR: &str = "scenarios";
 
 /// Gebündelte Szenarien (Dateiname ohne `.toml`, Quelltext).
 const BUNDLED: [(&str, &str); 2] = [
@@ -89,6 +91,11 @@ const BUNDLED: [(&str, &str); 2] = [
         include_str!("../../../harw-matrix-game/scenarios/cloud-sme-2027.toml"),
     ),
 ];
+
+/// Hinweis für Steuerbefehle über den Slash-Pfad (Runde 7, Teil M).
+pub const GAME_MASTER_HINT: &str = "Matrix-Games startet und steuert die UIA über den Game Master \
+(`matrix-game-master`, läuft im Hintergrund und blockiert den Chat nicht). Sag einfach z. B. \
+„spiel ein Matrix-Game zu …“. `/matrix` zeigt nur noch an: show, list, replay, compare.";
 
 // ── Argumente ────────────────────────────────────────────────────────────────
 
@@ -111,58 +118,17 @@ impl harw_operations::FromRawArgs for MatrixArgs {
 /// Ein geparster `/matrix`-Befehl.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum MatrixCommand {
-    /// `start <szenario> [--seed N]`.
-    Start {
-        /// Szenario-ID, Dateiname oder Pfad.
-        scenario: String,
-        /// Expliziter Seed.
-        seed: Option<u64>,
-        /// Inject-Paket der Szenario-Bibliothek (`--package <id>`).
-        package: Option<String>,
-    },
-    /// `step`.
-    Step,
-    /// `auto N` (Runden).
-    Auto(u32),
-    /// `pause`.
-    Pause,
-    /// `inject …`.
-    Inject {
-        /// Text.
-        text: String,
-        /// Audience in Textform.
-        audience: Option<String>,
-        /// Mit Urheber.
-        attributed: bool,
-        /// Effekt-Ops als JSON-Liste.
-        effects: Option<String>,
-    },
-    /// `override <json>`.
-    Override(String),
-    /// `veto <argument> [grund]`.
-    Veto {
-        /// Argument-ID.
-        argument: String,
-        /// Begründung.
-        reason: String,
-    },
-    /// `reveal <ziel>`.
-    Reveal(String),
-    /// `fork <runde>`.
-    Fork(u32),
-    /// `end`.
-    End,
-    /// `replay [--seed N]`.
-    Replay {
-        /// Neustart mit diesem Seed.
-        seed: Option<u64>,
-    },
     /// `show`.
     Show,
     /// `list`.
     List,
+    /// `replay` (nur Prüfung).
+    Replay,
     /// `compare <lauf> <lauf> …`: Vergleich mehrerer Läufe (Design-Lehren).
     Compare(Vec<String>),
+    /// Früherer Steuerbefehl (`start`, `step`, `auto`, …) — wird mit
+    /// [`GAME_MASTER_HINT`] abgewiesen.
+    Steering(String),
 }
 
 /// Befehl plus optional gewählter Lauf (`--run=<id>`).
@@ -174,7 +140,14 @@ pub struct ParsedCommand {
     pub command: MatrixCommand,
 }
 
-const USAGE: &str = "start <szenario> [--seed N], step, auto N, pause, inject <text>, override <json>, veto <arg> [grund], reveal <arg>, fork <runde>, end, replay [--seed N], show, list, compare <lauf> <lauf> …";
+const USAGE: &str = "show, list, replay, compare <lauf> <lauf> …";
+
+/// Frühere Steuerbefehle des Slash-Pfads (Runde 7, Teil M: nur noch über den
+/// Game Master).
+const STEERING: &[&str] = &[
+    "start", "step", "auto", "pause", "inject", "override", "veto", "reveal", "fork", "end",
+    "draft", "run",
+];
 
 fn invalid(message: impl Into<String>) -> OpError {
     OpError::InvalidArguments(message.into())
@@ -200,27 +173,6 @@ fn take_value_flag(tokens: &mut Vec<String>, name: &str) -> Result<Option<String
     Err(invalid(format!("`{long}` braucht einen Wert")))
 }
 
-fn take_switch(tokens: &mut Vec<String>, name: &str) -> bool {
-    let long = format!("--{name}");
-    match tokens.iter().position(|t| *t == long) {
-        Some(index) => {
-            tokens.remove(index);
-            true
-        }
-        None => false,
-    }
-}
-
-fn parse_seed(raw: Option<String>) -> Result<Option<u64>, OpError> {
-    raw.map(|value| {
-        value
-            .trim()
-            .parse::<u64>()
-            .map_err(|_| invalid(format!("Seed `{value}` ist keine nicht-negative Ganzzahl")))
-    })
-    .transpose()
-}
-
 /// Parst die Tokens eines `/matrix`-Aufrufs.
 ///
 /// # Errors
@@ -234,7 +186,7 @@ pub fn parse_command(tokens: &[String]) -> Result<ParsedCommand, OpError> {
             command: MatrixCommand::Show,
         });
     };
-    let mut rest: Vec<String> = tokens.get(1..).unwrap_or_default().to_vec();
+    let rest: Vec<String> = tokens.get(1..).unwrap_or_default().to_vec();
     let no_extra = |rest: &[String], sub: &str| -> Result<(), OpError> {
         if rest.is_empty() {
             Ok(())
@@ -250,6 +202,14 @@ pub fn parse_command(tokens: &[String]) -> Result<ParsedCommand, OpError> {
             no_extra(&rest, "show")?;
             MatrixCommand::Show
         }
+        "list" => {
+            no_extra(&rest, "list")?;
+            MatrixCommand::List
+        }
+        "replay" => {
+            no_extra(&rest, "replay")?;
+            MatrixCommand::Replay
+        }
         "compare" => {
             if rest.len() < 2 {
                 return Err(invalid(
@@ -258,111 +218,7 @@ pub fn parse_command(tokens: &[String]) -> Result<ParsedCommand, OpError> {
             }
             MatrixCommand::Compare(rest)
         }
-        "list" => {
-            no_extra(&rest, "list")?;
-            MatrixCommand::List
-        }
-        "start" => {
-            let seed = parse_seed(take_value_flag(&mut rest, "seed")?)?;
-            let package = take_value_flag(&mut rest, "package")?;
-            let scenario = match rest.as_slice() {
-                [one] => one.clone(),
-                [] => {
-                    return Err(invalid(
-                        "Szenario fehlt: /matrix start <szenario-id|pfad> [--seed N] [--package ID]",
-                    ));
-                }
-                more => {
-                    return Err(invalid(format!(
-                        "genau ein Szenario erwartet, erhalten: {}",
-                        more.join(" ")
-                    )));
-                }
-            };
-            MatrixCommand::Start {
-                scenario,
-                seed,
-                package,
-            }
-        }
-        "step" => {
-            no_extra(&rest, "step")?;
-            MatrixCommand::Step
-        }
-        "auto" => {
-            let n = match rest.as_slice() {
-                [n] => n
-                    .parse::<u32>()
-                    .map_err(|_| invalid(format!("`{n}` ist keine Rundenzahl")))?,
-                _ => return Err(invalid("Aufruf: /matrix auto N (1–20 Runden)")),
-            };
-            if !(1..=MAX_AUTO_ROUNDS).contains(&n) {
-                return Err(invalid(format!(
-                    "auto N: N muss zwischen 1 und {MAX_AUTO_ROUNDS} liegen"
-                )));
-            }
-            MatrixCommand::Auto(n)
-        }
-        "pause" => {
-            no_extra(&rest, "pause")?;
-            MatrixCommand::Pause
-        }
-        "inject" => {
-            let audience = take_value_flag(&mut rest, "audience")?;
-            let effects = take_value_flag(&mut rest, "effects")?;
-            let attributed = take_switch(&mut rest, "attributed");
-            let text = rest.join(" ");
-            if text.trim().is_empty() {
-                return Err(invalid(
-                    "Inject-Text fehlt: /matrix inject [--audience=<a>] [--attributed] <text>",
-                ));
-            }
-            MatrixCommand::Inject {
-                text,
-                audience,
-                attributed,
-                effects,
-            }
-        }
-        "override" => {
-            let json = rest.join(" ");
-            if json.trim().is_empty() {
-                return Err(invalid(
-                    "Override fehlt: /matrix override {\"argument_id\":\"r1-a1\",…}",
-                ));
-            }
-            MatrixCommand::Override(json)
-        }
-        "veto" => {
-            let Some(argument) = rest.first().cloned() else {
-                return Err(invalid("Aufruf: /matrix veto <argument-id> [grund]"));
-            };
-            MatrixCommand::Veto {
-                argument,
-                reason: rest.get(1..).unwrap_or_default().join(" "),
-            }
-        }
-        "reveal" => match rest.as_slice() {
-            [target] => MatrixCommand::Reveal(target.clone()),
-            _ => return Err(invalid("Aufruf: /matrix reveal <geheimnis|argument-id>")),
-        },
-        "fork" => match rest.as_slice() {
-            [round] => MatrixCommand::Fork(
-                round
-                    .parse::<u32>()
-                    .map_err(|_| invalid(format!("`{round}` ist keine Runde")))?,
-            ),
-            _ => return Err(invalid("Aufruf: /matrix fork <runde>")),
-        },
-        "end" => {
-            no_extra(&rest, "end")?;
-            MatrixCommand::End
-        }
-        "replay" => {
-            let seed = parse_seed(take_value_flag(&mut rest, "seed")?)?;
-            no_extra(&rest, "replay")?;
-            MatrixCommand::Replay { seed }
-        }
+        steering if STEERING.contains(&steering) => MatrixCommand::Steering(sub),
         other => {
             return Err(invalid(format!(
                 "unbekannter /matrix-Subcommand: {other} ({USAGE})"
@@ -376,12 +232,12 @@ pub fn parse_command(tokens: &[String]) -> Result<ParsedCommand, OpError> {
 
 /// Alle Läufe dieses Prozesses (Lauf-ID → Lauf).
 static RUNS: OnceLock<Mutex<HashMap<String, MatrixRun>>> = OnceLock::new();
-/// Aktueller Lauf.
+/// Aktueller Lauf (zuletzt gestartet, gleich welche Sitzung).
 static CURRENT: OnceLock<Mutex<Option<String>>> = OnceLock::new();
+/// Zuletzt gestarteter Lauf je Sitzung (Game Master: Session-ID → Lauf-ID).
+static SESSION_RUNS: OnceLock<Mutex<HashMap<String, String>>> = OnceLock::new();
 /// Läufe, die gerade einen Schritt ausführen (Lauf-ID → letzter `show`-Stand).
 static BUSY: OnceLock<Mutex<HashMap<String, Value>>> = OnceLock::new();
-/// Vorgemerkte Pausen laufender `auto`-Schleifen.
-static PAUSE: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
 /// Zähler für eindeutige Lauf-IDs.
 static RUN_COUNTER: AtomicU64 = AtomicU64::new(0);
 
@@ -396,13 +252,26 @@ fn current_id(explicit: Option<String>) -> Result<String, OpError> {
         return Ok(id);
     }
     lock(&CURRENT)?.clone().ok_or_else(|| {
-        invalid("kein aktueller Matrix-Lauf — erst /matrix start <szenario> (oder --run=<id>)")
+        invalid(
+            "kein aktueller Matrix-Lauf — Matrix-Games startet der Game Master (oder --run=<id>)",
+        )
     })
 }
 
-fn set_current(id: &str) -> Result<(), OpError> {
+fn set_current(id: &str, session: &str) -> Result<(), OpError> {
     *lock(&CURRENT)? = Some(id.to_owned());
+    lock(&SESSION_RUNS)?.insert(session.to_owned(), id.to_owned());
     Ok(())
+}
+
+/// Lauf einer Sitzung: explizit gewählt oder der zuletzt von ihr gestartete.
+fn session_run_id(explicit: Option<String>, session: &str) -> Result<String, OpError> {
+    if let Some(id) = explicit.filter(|id| !id.trim().is_empty()) {
+        return Ok(id);
+    }
+    lock(&SESSION_RUNS)?.get(session).cloned().ok_or_else(|| {
+        invalid("kein Matrix-Lauf in dieser Sitzung — erst matrix.start (oder run_id angeben)")
+    })
 }
 
 fn is_busy(id: &str) -> Result<bool, OpError> {
@@ -422,7 +291,7 @@ fn take_run(id: &str) -> Result<MatrixRun, OpError> {
             Ok(run)
         }
         None if is_busy(id)? => Err(invalid(format!(
-            "Lauf `{id}` führt gerade einen Schritt aus — bitte warten oder /matrix pause"
+            "Lauf `{id}` führt gerade einen Schritt aus — bitte warten"
         ))),
         None => Err(invalid(format!("unbekannter Matrix-Lauf `{id}`"))),
     }
@@ -456,10 +325,6 @@ fn with_run<T>(
     }
 }
 
-fn pause_requested(id: &str) -> Result<bool, OpError> {
-    Ok(lock(&PAUSE)?.remove(id))
-}
-
 // ── Szenarien und Pfade ──────────────────────────────────────────────────────
 
 /// Ein aufgelöstes Szenario: Quelltext, geladen, Pfad (bei Dateien).
@@ -479,8 +344,10 @@ fn load(source: String, path: Option<PathBuf>) -> Result<ResolvedScenario, OpErr
     })
 }
 
-/// Gebündeltes Szenario (Dateiname oder ID) oder TOML-Datei.
-fn resolve_scenario(name: &str) -> Result<ResolvedScenario, OpError> {
+/// Gebündeltes Szenario (Dateiname oder ID) oder gespeicherter Entwurf
+/// (`<root>/scenarios/<slug>.toml`, Runde 7 Teil M2). Freitext mit
+/// Leerzeichen ist nie ein Slug — die Meldung verweist dann auf den Entwurf.
+fn resolve_known_scenario(name: &str, root: Option<&Path>) -> Result<ResolvedScenario, OpError> {
     let name = name.trim();
     let stem = name.strip_suffix(".toml").unwrap_or(name);
     if let Some((_, source)) = BUNDLED.iter().find(|(file, _)| *file == stem) {
@@ -497,18 +364,54 @@ fn resolve_scenario(name: &str) -> Result<ResolvedScenario, OpError> {
             }
         }
     }
-    let path = Path::new(name);
-    if path.is_file() {
-        let source = std::fs::read_to_string(path)
-            .map_err(|e| invalid(format!("Szenario `{name}` nicht lesbar: {e}")))?;
-        let absolute = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
-        return load(source, Some(absolute));
+    if let Some(root) = root {
+        let slug = sanitize(stem);
+        if slug == stem {
+            let path = root.join(SCENARIOS_DIR).join(format!("{slug}.toml"));
+            if path.is_file() {
+                let source = std::fs::read_to_string(&path).map_err(|e| {
+                    OpError::Execution(format!(
+                        "gespeichertes Szenario `{}` nicht lesbar: {e}",
+                        path.display()
+                    ))
+                })?;
+                return load(source, Some(path));
+            }
+        }
     }
-    let bundled: Vec<&str> = BUNDLED.iter().map(|(file, _)| *file).collect();
+    let mut known: Vec<String> = BUNDLED.iter().map(|(file, _)| (*file).to_owned()).collect();
+    if let Some(root) = root {
+        known.extend(saved_scenarios(root));
+    }
+    if name.contains(char::is_whitespace) {
+        return Err(invalid(format!(
+            "`{name}` ist Freitext, kein Szenario — erst ein Szenario entwerfen \
+             (matrix.draft_scenario), dann mit dessen Slug starten (bekannt: {})",
+            known.join(", ")
+        )));
+    }
     Err(invalid(format!(
-        "unbekanntes Szenario `{name}` (gebündelt: {}; oder Pfad zu einer TOML-Datei)",
-        bundled.join(", ")
+        "unbekanntes Szenario `{name}` (bekannt: {})",
+        known.join(", ")
     )))
+}
+
+/// Slugs der gespeicherten Entwürfe unter `<root>/scenarios/`, sortiert.
+fn saved_scenarios(root: &Path) -> Vec<String> {
+    let Ok(entries) = std::fs::read_dir(root.join(SCENARIOS_DIR)) else {
+        return Vec::new();
+    };
+    let mut slugs: Vec<String> = entries
+        .flatten()
+        .filter_map(|entry| {
+            let path = entry.path();
+            (path.extension().and_then(|e| e.to_str()) == Some("toml"))
+                .then(|| path.file_stem().and_then(|s| s.to_str()).map(str::to_owned))
+                .flatten()
+        })
+        .collect();
+    slugs.sort();
+    slugs
 }
 
 /// `<profil>/knowledge/matrix`.
@@ -521,7 +424,7 @@ fn matrix_root() -> Result<PathBuf, OpError> {
     Ok(harw_home::matrix_dir(&dir))
 }
 
-/// Dateisystemtauglicher Name (ASCII-Alphanumerik, `-`, `_`, `.`).
+/// Dateisystemtauglicher Name (ASCII-Alphanumerik, `-`, `_`).
 fn sanitize(name: &str) -> String {
     let cleaned: String = name
         .chars()
@@ -556,13 +459,13 @@ fn new_run_location(root: &Path, scenario_id: &str) -> (String, PathBuf) {
 
 // ── Operation ────────────────────────────────────────────────────────────────
 
-/// Führt `/matrix` aus.
+/// Führt `/matrix` aus (nur lesende Ansichten, Runde 7 Teil M).
 ///
 /// # Fehler
 /// Siehe Moduldoku.
 #[operation(
     name = "matrix",
-    summary = "Matrix Game: start, step, auto, pause, inject, override, veto, reveal, fork, end, replay, show, list, compare.",
+    summary = "Matrix Game ansehen: show, list, replay, compare (Start und Steuerung über den Game Master).",
     domain = "knowledge",
     permission = "operator",
     command(
@@ -571,60 +474,27 @@ fn new_run_location(root: &Path, scenario_id: &str) -> (String, PathBuf) {
         busy_subcommands = "show=immediate, list=immediate"
     )
 )]
-async fn matrix(ctx: &OpContext, args: MatrixArgs) -> Result<OpOutput, OpError> {
+async fn matrix(_ctx: &OpContext, args: MatrixArgs) -> Result<OpOutput, OpError> {
     let parsed = parse_command(&args.tokens)?;
-    run_command(ctx, parsed).await
+    run_command(parsed)
 }
 
-async fn run_command(ctx: &OpContext, parsed: ParsedCommand) -> Result<OpOutput, OpError> {
+fn run_command(parsed: ParsedCommand) -> Result<OpOutput, OpError> {
     let ParsedCommand { run, command } = parsed;
     match command {
         MatrixCommand::List => list_output(),
         MatrixCommand::Compare(ids) => compare_output(&ids),
         MatrixCommand::Show => show_output(&current_id(run)?),
-        MatrixCommand::Start {
-            scenario,
-            seed,
-            package,
-        } => {
-            let resolved = resolve_scenario(&scenario)?;
-            start_run(ctx, resolved, seed, package.as_deref(), None)
-        }
-        MatrixCommand::Step => step_command(ctx, &current_id(run)?).await,
-        MatrixCommand::Auto(rounds) => auto_command(ctx, &current_id(run)?, rounds).await,
-        MatrixCommand::Pause => pause_command(&current_id(run)?),
-        MatrixCommand::Inject {
-            text,
-            audience,
-            attributed,
-            effects,
-        } => {
-            let audience = match audience {
-                Some(raw) => Audience::parse(&raw).map_err(invalid)?,
-                None => Audience::Public,
-            };
-            let effects: Vec<EffectOp> = match effects {
-                Some(raw) => serde_json::from_str(&raw).map_err(|e| {
-                    invalid(format!("`--effects` ist keine gültige Effektliste: {e}"))
-                })?,
-                None => Vec::new(),
-            };
+        MatrixCommand::Replay => {
             let id = current_id(run)?;
-            facilitator(&id, |r| {
-                let inject = r.queue_inject(&text, &audience, attributed, effects)?;
-                Ok(format!(
-                    "Inject `{inject}` vorgemerkt — wirkt an der nächsten Phasengrenze."
-                ))
+            with_run(&id, |r| {
+                let text = r.verify_replay()?;
+                Ok(output(r, format!("{}\n{text}", r.headline())))
             })
         }
-        MatrixCommand::Override(raw) => facilitator(&current_id(run)?, |r| r.apply_override(&raw)),
-        MatrixCommand::Veto { argument, reason } => {
-            facilitator(&current_id(run)?, |r| r.queue_veto(&argument, &reason))
+        MatrixCommand::Steering(sub) => {
+            Err(invalid(format!("`/matrix {sub}`: {GAME_MASTER_HINT}")))
         }
-        MatrixCommand::Reveal(target) => facilitator(&current_id(run)?, |r| r.reveal(&target)),
-        MatrixCommand::Fork(round) => fork_command(ctx, &current_id(run)?, round),
-        MatrixCommand::End => end_command(ctx, &current_id(run)?).await,
-        MatrixCommand::Replay { seed } => replay_command(ctx, &current_id(run)?, seed),
     }
 }
 
@@ -635,24 +505,13 @@ fn output(run: &MatrixRun, text: String) -> OpOutput {
     }
 }
 
-/// Synchroner Facilitator-Eingriff mit Panel-Daten.
-fn facilitator(
-    id: &str,
-    action: impl FnOnce(&mut MatrixRun) -> Result<String, OpError>,
-) -> Result<OpOutput, OpError> {
-    with_run(id, |run| {
-        let text = action(run)?;
-        Ok(output(run, format!("{}\n{text}", run.headline())))
-    })
-}
-
+/// Startet einen Lauf aus einem aufgelösten Szenario und macht ihn zum
+/// aktuellen Lauf der Sitzung.
 fn start_run(
     ctx: &OpContext,
     resolved: ResolvedScenario,
     seed: Option<u64>,
-    package: Option<&str>,
-    note: Option<String>,
-) -> Result<OpOutput, OpError> {
+) -> Result<(OpOutput, String), OpError> {
     let ResolvedScenario {
         source,
         loaded,
@@ -669,15 +528,12 @@ fn start_run(
         run_id.clone(),
         Some(dir.clone()),
         true,
-        package,
+        None,
     )?;
-    if let Some(note) = note {
-        run.note("replay", note)?;
-    }
     run.set_sink(EventSink::from_ctx(ctx));
     run.flush()?;
     let mut text = format!(
-        "{}\nSeed {}… · Verzeichnis {}\nWeiter mit /matrix step (eine Phase) oder /matrix auto N.",
+        "{}\nSeed {}… · Verzeichnis {}",
         run.headline(),
         run.seed_prefix(),
         dir.display()
@@ -687,17 +543,8 @@ fn start_run(
     }
     let out = output(&run, text);
     put_run(run)?;
-    set_current(&run_id)?;
-    Ok(out)
-}
-
-async fn step_command(ctx: &OpContext, id: &str) -> Result<OpOutput, OpError> {
-    let mut run = take_run(id)?;
-    let result = step_once(ctx, &mut run, "step").await;
-    let out =
-        result.map(|report| output(&run, format!("{}\n{}", run.headline(), report.summary())));
-    put_run(run)?;
-    out
+    set_current(&run_id, ctx.session_id().as_str())?;
+    Ok((out, run_id))
 }
 
 async fn step_once(
@@ -706,6 +553,7 @@ async fn step_once(
     label: &str,
 ) -> Result<runner::StepReport, OpError> {
     run.set_sink(EventSink::from_ctx(ctx));
+    run.set_cancel(ctx.cancel_token().cloned());
     run.set_status(RunStatus::Running);
     let cursor = run.cursor();
     run.note(
@@ -715,99 +563,77 @@ async fn step_once(
     run.step(ctx).await
 }
 
-async fn auto_command(ctx: &OpContext, id: &str, rounds: u32) -> Result<OpOutput, OpError> {
-    let mut run = take_run(id)?;
-    // Eine alte, nie abgeholte Pause gilt nicht für diesen Lauf.
-    let _ = pause_requested(id);
-    let result = auto_loop(ctx, &mut run, rounds).await;
-    let out = result.map(|lines| output(&run, format!("{}\n{}", run.headline(), lines.join("\n"))));
-    put_run(run)?;
-    out
+/// Grund, aus dem ein Durchlauf endete.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StopReason {
+    /// Gewünschte Rundenzahl erreicht.
+    Rounds,
+    /// Spiel beendet.
+    Ended,
+    /// Leak-Verdacht (Beobachter-Protokoll prüfen).
+    Leak,
+    /// Abbruch des aufrufenden Turns.
+    Cancelled,
+    /// Zeitbudget des Werkzeugaufrufs erschöpft.
+    Deadline,
+    /// Sicherheitsnetz der Phasenzahl.
+    StepCap,
 }
 
-async fn auto_loop(
+/// Spielt bis zu `rounds` Runden (bis zum Rundenende) bzw. bis Spielende,
+/// Leak-Verdacht, Abbruch oder `deadline`.
+async fn advance(
     ctx: &OpContext,
     run: &mut MatrixRun,
     rounds: u32,
-) -> Result<Vec<String>, OpError> {
-    run.note("auto", format!("{rounds} Runde(n)"))?;
+    deadline: Option<std::time::Instant>,
+) -> Result<(Vec<String>, StopReason), OpError> {
+    run.note("run", format!("{rounds} Runde(n)"))?;
     let mut lines = Vec::new();
     let mut closed = 0;
     for _ in 0..MAX_AUTO_STEPS {
-        if pause_requested(run.run_id())? {
+        if ctx.cancel_token().is_some_and(|c| c.is_cancelled()) {
             run.set_status(RunStatus::Paused);
-            run.note("pause", "Auto angehalten")?;
+            run.note("pause", "Durchlauf abgebrochen")?;
             run.flush()?;
-            lines.push("Pause: Auto angehalten.".to_owned());
-            break;
+            return Ok((lines, StopReason::Cancelled));
         }
-        let report = step_once(ctx, run, "auto-step").await?;
+        if deadline.is_some_and(|d| std::time::Instant::now() >= d) {
+            run.set_status(RunStatus::Paused);
+            run.note("pause", "Zeitbudget des Aufrufs erschöpft")?;
+            run.flush()?;
+            return Ok((lines, StopReason::Deadline));
+        }
+        let report = step_once(ctx, run, "run-step").await?;
         lines.push(report.summary());
         if report.ended {
-            break;
+            return Ok((lines, StopReason::Ended));
         }
         if report.leaks > 0 {
             run.set_status(RunStatus::Paused);
-            run.note("pause", "Auto wegen Leak-Verdacht angehalten")?;
+            run.note("pause", "Durchlauf wegen Leak-Verdacht angehalten")?;
             run.flush()?;
-            lines.push(
-                "Auto angehalten: Leak-Verdacht — bitte Beobachter-Protokoll prüfen.".to_owned(),
-            );
-            break;
+            return Ok((lines, StopReason::Leak));
         }
         if report.phase == Phase::Rundenende {
             closed += 1;
             if closed >= rounds {
-                break;
+                return Ok((lines, StopReason::Rounds));
             }
         }
     }
-    Ok(lines)
+    Ok((lines, StopReason::StepCap))
 }
 
-fn pause_command(id: &str) -> Result<OpOutput, OpError> {
-    if is_busy(id)? {
-        lock(&PAUSE)?.insert(id.to_owned());
-        let snapshot = lock(&BUSY)?.get(id).cloned();
-        return Ok(OpOutput {
-            text: format!(
-                "Pause für `{id}` vorgemerkt — der Lauf hält nach dem laufenden Schritt an."
-            ),
-            data: snapshot,
-        });
-    }
-    facilitator(id, |run| {
-        run.set_status(RunStatus::Paused);
-        run.note("pause", "Facilitator")?;
-        run.flush()?;
-        Ok("Lauf angehalten. /matrix step oder /matrix auto N setzt fort.".to_owned())
-    })
-}
-
-async fn end_command(ctx: &OpContext, id: &str) -> Result<OpOutput, OpError> {
-    let mut run = take_run(id)?;
-    let result = end_loop(ctx, &mut run).await;
-    let out = result.map(|lines| {
-        let mut text = format!("{}\n{}", run.headline(), lines.join("\n"));
-        if let Some(dir) = run.run_dir() {
-            text.push_str(&format!("\nAAR: {}", dir.join(AAR_FILE).display()));
-        }
-        output(&run, text)
-    });
-    put_run(run)?;
-    out
-}
-
+/// Direkt zu Schlussargumenten und AAR (schreibt `aar.md` und `report.md`).
 async fn end_loop(ctx: &OpContext, run: &mut MatrixRun) -> Result<Vec<String>, OpError> {
+    let mut lines = Vec::new();
     if run.status() == RunStatus::Ended {
-        return Err(invalid(format!(
-            "Lauf `{}` ist bereits beendet",
-            run.run_id()
-        )));
+        return Ok(lines);
     }
     run.set_sink(EventSink::from_ctx(ctx));
+    run.set_cancel(ctx.cancel_token().cloned());
     run.request_end()?;
-    let mut lines = Vec::new();
     // Höchstens Schlussargumente und AAR.
     for _ in 0..3 {
         if run.status() == RunStatus::Ended {
@@ -821,48 +647,6 @@ async fn end_loop(ctx: &OpContext, run: &mut MatrixRun) -> Result<Vec<String>, O
         lines.push(report.summary());
     }
     Ok(lines)
-}
-
-fn fork_command(ctx: &OpContext, id: &str, round: u32) -> Result<OpOutput, OpError> {
-    let root = matrix_root()?;
-    let forked = with_run(id, |run| {
-        let (new_id, dir) = new_run_location(&root, run.loaded().scenario.id());
-        run.fork(round, new_id, Some(dir))
-    })?;
-    let mut forked = forked;
-    forked.set_sink(EventSink::from_ctx(ctx));
-    forked.flush()?;
-    let new_id = forked.run_id().to_owned();
-    let out = output(
-        &forked,
-        format!(
-            "{}\nFork von `{id}` ab Rundenende {round}; der neue Lauf ist jetzt aktuell.",
-            forked.headline()
-        ),
-    );
-    put_run(forked)?;
-    set_current(&new_id)?;
-    Ok(out)
-}
-
-fn replay_command(ctx: &OpContext, id: &str, seed: Option<u64>) -> Result<OpOutput, OpError> {
-    let Some(seed) = seed else {
-        return facilitator(id, |run| run.verify_replay());
-    };
-    let (source, path) = with_run(id, |run| {
-        Ok((
-            run.source().to_owned(),
-            run.scenario_path().map(Path::to_path_buf),
-        ))
-    })?;
-    let resolved = load(source, path)?;
-    start_run(
-        ctx,
-        resolved,
-        Some(seed),
-        None,
-        Some(format!("Neustart von `{id}` mit Seed {seed}")),
-    )
 }
 
 /// Vergleicht mehrere Läufe dieser Sitzung (Kennzahlen je Lauf plus
@@ -949,7 +733,13 @@ fn list_output() -> Result<OpOutput, OpError> {
     runs.sort_by(|a, b| a["run_id"].as_str().cmp(&b["run_id"].as_str()));
     let current = lock(&CURRENT)?.clone();
     let scenarios: Vec<&str> = BUNDLED.iter().map(|(file, _)| *file).collect();
+    let saved = matrix_root()
+        .map(|root| saved_scenarios(&root))
+        .unwrap_or_default();
     let mut text = format!("Gebündelte Szenarien: {}", scenarios.join(", "));
+    if !saved.is_empty() {
+        text.push_str(&format!("\nGespeicherte Entwürfe: {}", saved.join(", ")));
+    }
     if runs.is_empty() {
         text.push_str("\nKeine Läufe in diesem Prozess.");
     }
@@ -970,7 +760,9 @@ fn list_output() -> Result<OpOutput, OpError> {
     }
     Ok(OpOutput {
         text,
-        data: Some(json!({ "runs": runs, "current": current, "scenarios": scenarios })),
+        data: Some(
+            json!({ "runs": runs, "current": current, "scenarios": scenarios, "saved": saved }),
+        ),
     })
 }
 
@@ -990,117 +782,50 @@ mod tests {
         assert_eq!(parse(&[])?, MatrixCommand::Show);
         assert_eq!(parse(&["show"])?, MatrixCommand::Show);
         assert_eq!(parse(&["list"])?, MatrixCommand::List);
-        Ok(())
-    }
-
-    #[test]
-    fn start_with_seed_forms() -> TestResult {
-        assert_eq!(
-            parse(&["start", "karst-islands"])?,
-            MatrixCommand::Start {
-                scenario: "karst-islands".to_owned(),
-                seed: None,
-                package: None
-            }
-        );
-        let expected = MatrixCommand::Start {
-            scenario: "karst-islands".to_owned(),
-            seed: Some(42),
-            package: None,
-        };
-        assert_eq!(
-            parse(&["start", "karst-islands", "--seed", "42"])?,
-            expected
-        );
-        assert_eq!(parse(&["start", "--seed=42", "karst-islands"])?, expected);
-        assert_eq!(
-            parse(&["start", "karst-islands", "--package", "sturm"])?,
-            MatrixCommand::Start {
-                scenario: "karst-islands".to_owned(),
-                seed: None,
-                package: Some("sturm".to_owned()),
-            }
-        );
+        assert_eq!(parse(&["replay"])?, MatrixCommand::Replay);
         assert_eq!(
             parse(&["compare", "a", "b"])?,
             MatrixCommand::Compare(vec!["a".to_owned(), "b".to_owned()])
         );
         assert!(parse(&["compare", "a"]).is_err());
-        assert!(parse(&["start"]).is_err());
-        assert!(parse(&["start", "a", "b"]).is_err());
-        assert!(parse(&["start", "a", "--seed", "x"]).is_err());
-        assert!(parse(&["start", "a", "--seed"]).is_err());
-        Ok(())
-    }
-
-    #[test]
-    fn auto_is_bounded() -> TestResult {
-        assert_eq!(parse(&["auto", "3"])?, MatrixCommand::Auto(3));
-        assert_eq!(parse(&["auto", "20"])?, MatrixCommand::Auto(20));
-        assert!(parse(&["auto", "0"]).is_err());
-        assert!(parse(&["auto", "21"]).is_err());
-        assert!(parse(&["auto"]).is_err());
-        assert!(parse(&["auto", "viel"]).is_err());
-        Ok(())
-    }
-
-    #[test]
-    fn facilitator_commands_parse() -> TestResult {
-        assert_eq!(parse(&["step"])?, MatrixCommand::Step);
-        assert_eq!(parse(&["pause"])?, MatrixCommand::Pause);
-        assert_eq!(parse(&["end"])?, MatrixCommand::End);
-        assert_eq!(
-            parse(&[
-                "inject",
-                "--audience=seat:rat",
-                "--attributed",
-                "Sturm",
-                "zieht",
-                "auf"
-            ])?,
-            MatrixCommand::Inject {
-                text: "Sturm zieht auf".to_owned(),
-                audience: Some("seat:rat".to_owned()),
-                attributed: true,
-                effects: None,
-            }
-        );
-        assert!(parse(&["inject"]).is_err());
-        assert_eq!(
-            parse(&["override", "{\"argument_id\":", "\"r1-a1\"}"])?,
-            MatrixCommand::Override("{\"argument_id\": \"r1-a1\"}".to_owned())
-        );
-        assert!(parse(&["override"]).is_err());
-        assert_eq!(
-            parse(&["veto", "r1-a2", "zu", "vage"])?,
-            MatrixCommand::Veto {
-                argument: "r1-a2".to_owned(),
-                reason: "zu vage".to_owned()
-            }
-        );
-        assert!(parse(&["veto"]).is_err());
-        assert_eq!(
-            parse(&["reveal", "s1"])?,
-            MatrixCommand::Reveal("s1".to_owned())
-        );
-        assert!(parse(&["reveal"]).is_err());
-        assert_eq!(parse(&["fork", "2"])?, MatrixCommand::Fork(2));
-        assert!(parse(&["fork", "zwei"]).is_err());
-        assert_eq!(parse(&["replay"])?, MatrixCommand::Replay { seed: None });
-        assert_eq!(
-            parse(&["replay", "--seed", "9"])?,
-            MatrixCommand::Replay { seed: Some(9) }
-        );
-        assert!(parse(&["step", "extra"]).is_err());
+        assert!(parse(&["show", "extra"]).is_err());
+        assert!(parse(&["replay", "--seed", "3"]).is_err());
         assert!(parse(&["tanzen"]).is_err());
+        Ok(())
+    }
+
+    /// Runde 7, Teil M: Start und Steuerung laufen über den Game Master —
+    /// der Slash-Pfad weist sie mit einem Hinweis ab, statt die TUI zu
+    /// blockieren.
+    #[test]
+    fn steering_commands_are_rejected_with_the_game_master_hint() -> TestResult {
+        let cases: [&[&str]; 6] = [
+            &["start", "karst-islands"],
+            &["start", "veröffentlichung", "von", "harwness"],
+            &["auto", "10"],
+            &["step"],
+            &["veto", "r1-a1"],
+            &["end"],
+        ];
+        for sub in cases {
+            let parsed = parse_command(&toks(sub))?;
+            assert!(
+                matches!(parsed.command, MatrixCommand::Steering(_)),
+                "{sub:?}"
+            );
+            let error = run_command(parsed)
+                .err()
+                .ok_or("Steuerbefehl muss abgewiesen werden")?;
+            assert!(error.to_string().contains("Game Master"), "{error}");
+        }
         Ok(())
     }
 
     #[test]
     fn run_flag_is_extracted_anywhere() -> TestResult {
-        let parsed = parse_command(&toks(&["step", "--run=abc"]))?;
+        let parsed = parse_command(&toks(&["show", "--run=abc"]))?;
         assert_eq!(parsed.run.as_deref(), Some("abc"));
-        assert_eq!(parsed.command, MatrixCommand::Step);
+        assert_eq!(parsed.command, MatrixCommand::Show);
         let parsed = parse_command(&toks(&["--run", "xyz"]))?;
         assert_eq!(parsed.run.as_deref(), Some("xyz"));
         assert_eq!(parsed.command, MatrixCommand::Show);
@@ -1109,13 +834,41 @@ mod tests {
 
     #[test]
     fn bundled_scenarios_resolve_by_file_and_id() -> TestResult {
-        let by_file = resolve_scenario("karst-islands")?;
+        let by_file = resolve_known_scenario("karst-islands", None)?;
         assert_eq!(by_file.loaded.scenario.id(), "karst-wasserkrise");
         assert!(by_file.path.is_none());
-        let by_id = resolve_scenario("karst-wasserkrise")?;
+        let by_id = resolve_known_scenario("karst-wasserkrise", None)?;
         assert_eq!(by_id.source, by_file.source);
-        assert!(resolve_scenario("cloud-sme-2027.toml").is_ok());
-        assert!(resolve_scenario("gibt-es-nicht").is_err());
+        assert!(resolve_known_scenario("cloud-sme-2027.toml", None).is_ok());
+        assert!(resolve_known_scenario("gibt-es-nicht", None).is_err());
+        Ok(())
+    }
+
+    /// Runde 7, Teil M2: gespeicherte Entwürfe werden über ihren Slug
+    /// gefunden; Freitext verweist auf den Entwurf; Pfade werden nie gelesen.
+    #[test]
+    fn saved_slug_is_resolved_and_freetext_points_to_draft() -> TestResult {
+        let tmp = tempfile::tempdir()?;
+        let dir = tmp.path().join(SCENARIOS_DIR);
+        std::fs::create_dir_all(&dir)?;
+        std::fs::write(dir.join("mein-spiel.toml"), BUNDLED[0].1)?;
+        let resolved = resolve_known_scenario("mein-spiel", Some(tmp.path()))?;
+        assert_eq!(resolved.path, Some(dir.join("mein-spiel.toml")));
+        assert_eq!(saved_scenarios(tmp.path()), vec!["mein-spiel".to_owned()]);
+        let freetext = resolve_known_scenario("veröffentlichung von harwness", Some(tmp.path()))
+            .err()
+            .ok_or("Freitext darf kein Szenario sein")?;
+        assert!(
+            freetext.to_string().contains("matrix.draft_scenario"),
+            "{freetext}"
+        );
+        let outside = tmp.path().join("fremd.toml");
+        std::fs::write(&outside, BUNDLED[0].1)?;
+        assert!(
+            resolve_known_scenario(&outside.display().to_string(), Some(tmp.path())).is_err(),
+            "Pfade außerhalb des Matrix-Speichers werden nicht gelesen"
+        );
+        assert!(resolve_known_scenario("../mein-spiel", Some(tmp.path())).is_err());
         Ok(())
     }
 
@@ -1127,8 +880,8 @@ mod tests {
     }
 
     #[test]
-    fn registry_show_busy_and_facilitator_roundtrip() -> TestResult {
-        let resolved = resolve_scenario("karst-islands")?;
+    fn registry_show_busy_and_list_roundtrip() -> TestResult {
+        let resolved = resolve_known_scenario("karst-islands", None)?;
         let seed = master_seed_for(&resolved.loaded, Some(1));
         let id = format!("test-registry-{}", std::process::id());
         let run = MatrixRun::start(
@@ -1149,20 +902,13 @@ mod tests {
         assert_eq!(data["scenario"], json!("karst-wasserkrise"));
         assert_eq!(data["status"], json!("running"));
 
-        let inject = facilitator(&id, |r| {
-            r.queue_inject("Sturm", &Audience::Public, false, Vec::new())
-        })?;
-        assert!(inject.text.contains("facilitator-1"));
-
-        // Während eines Schritts: show liefert den Schnappschuss, Eingriffe
-        // werden abgewiesen, pause wird vorgemerkt.
+        // Während eines Schritts: show liefert den Schnappschuss, ein zweiter
+        // Zugriff wird abgewiesen.
         let taken = take_run(&id)?;
         let busy = show_output(&id)?.data.ok_or("busy ohne Daten")?;
         assert_eq!(busy["status"], json!("busy"));
-        assert!(facilitator(&id, |r| r.reveal("s1")).is_err());
         assert!(take_run(&id).is_err());
-        pause_command(&id)?;
-        assert!(pause_requested(&id)?);
+        assert!(with_run(&id, |_| Ok(())).is_err());
         put_run(taken)?;
 
         let listed = list_output()?.data.ok_or("list ohne Daten")?;

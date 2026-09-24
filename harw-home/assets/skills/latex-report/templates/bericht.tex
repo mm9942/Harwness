@@ -1,0 +1,114 @@
+% Bericht -- Gerüst der Harwness-Vorlage (Skill latex-report).
+% Bauen: latex.build mit engine = xelatex; latex.build läuft so oft wie nötig
+% (Inhaltsverzeichnis). Alle Texte unten sind kurze Platzhalter: ersetzen,
+% kürzen oder streichen. Nichts erfinden -- was der Auftrag nicht hergibt,
+% bleibt als % TODO: stehen und wird in der Übergabe genannt.
+\documentclass[11pt,a4paper]{scrartcl}
+
+% ── Anpassung: von latex.template gefüllt, Vorgaben in harw-report.sty ──
+\newcommand{\harwLanguage}{%%LANGUAGE%%}
+\newcommand{\harwAccentHex}{%%ACCENT%%}
+\newcommand{\harwWarnHex}{%%WARN%%}
+\newcommand{\harwMainFont}{%%MAINFONT%%}
+\newcommand{\harwSansFont}{%%SANSFONT%%}
+\newcommand{\harwMonoFont}{%%MONOFONT%%}
+\usepackage{harw-report}
+
+\title{%%TITLE%%}
+\subtitle{%%SUBTITLE%%}
+\author{%%AUTHOR%%}
+\date{%%DATE%%}
+
+\begin{document}
+\maketitle
+
+\begin{achtung}[Wichtig vorab]
+Das Wichtigste, was die Leserin vor allem anderen wissen muss, in zwei bis
+drei Sätzen: eine Einschränkung, ein Status oder eine offene Entscheidung.
+Abschnitt~\ref{sec:stand} beschreibt den Stand genauer.
+\end{achtung}
+
+\begin{merke}[Die Idee in drei Sätzen]
+Erster Satz: worum es geht. Zweiter Satz: was dabei herauskommt. Dritter
+Satz: was die Leserin daraus machen kann.
+\end{merke}
+
+\tableofcontents
+\newpage
+
+\section{Worum es geht}\label{sec:ueberblick}
+
+Ein kurzer Absatz zu Anlass, Ziel und Leserkreis des Berichts. Dateien und
+Pfade stehen in \code{\textbackslash path}, etwa \path{daten/messwerte.csv};
+kurze Bezeichner in \code{\textbackslash code}, etwa \code{status}.
+
+\subsection{Kleines Glossar}
+
+\begin{tabularx}{\textwidth}{@{}lL@{}}
+\toprule
+\textbf{Begriff} & \textbf{Bedeutung} \\
+\midrule
+Begriff A & Eine kurze Erklärung in einem Satz. Längere Texte umbrechen in
+            der L-Spalte von selbst. \\
+Begriff B & Eine zweite Erklärung. \\
+\bottomrule
+\end{tabularx}
+
+\section{Aufbau}\label{sec:aufbau}
+
+Ein Satz, der die Abbildung einordnet: Was soll die Leserin darin sehen?
+
+\begin{figure}[htbp]
+\centering
+\begin{tikzpicture}[node distance=1.6cm]
+  \node[harwbox,fill=harwgrau] (eingang) {Eingang\\(Daten)};
+  \node[harwbox,fill=harwaccent!15,right=of eingang] (kern)
+    {\textbf{Verarbeitung}\\prüfen, aufbereiten};
+  \node[harwbox,fill=harwgrau,right=of kern] (ergebnis) {Ergebnis\\(Bericht)};
+  \node[harwbox,fill=harwgrau,below=1.2cm of kern] (ablage) {Ablage\\(Archiv)};
+  \draw[harwpfeil] (eingang) -- node[harwlabel,above=2pt]{liefert} (kern);
+  \draw[harwpfeil] (kern) -- node[harwlabel,above=2pt]{erzeugt} (ergebnis);
+  \draw[harwdoppelpfeil] (kern) -- node[harwlabel,right=2pt]{speichert,\\liest} (ablage);
+\end{tikzpicture}
+\caption{Die Bausteine und ihre Verbindungen (Beispiel)}\label{fig:aufbau}
+\end{figure}
+
+\section{Ergebnisse im Detail}\label{sec:ergebnisse}
+
+Ein Satz zur Tabelle. Lange Tabellen (ab etwa 15 Zeilen) als
+\code{longtable}; der Kopf wiederholt sich auf jeder Seite.
+
+{\small
+\begin{longtable}{@{}>{\raggedright}p{3.0cm}>{\raggedright}p{4.4cm}>{\raggedright\arraybackslash}p{7.6cm}@{}}
+\toprule
+\textbf{Bereich} & \textbf{Befund} & \textbf{Bedeutung} \\
+\midrule
+\endhead
+\bottomrule
+\endlastfoot
+Bereich 1 & Kurzer Befund. & Was der Befund für die Leserin heißt. \\
+Bereich 2 & Kurzer Befund. & Was der Befund für die Leserin heißt. \\
+Bereich 3 & Kurzer Befund. & Was der Befund für die Leserin heißt. \\
+\end{longtable}
+}
+
+\begin{beispiel}
+Ein kurzes, konkretes Beispiel macht einen abstrakten Befund greifbar.
+\end{beispiel}
+
+\section{Stand und nächste Schritte}\label{sec:stand}
+
+\begin{description}[leftmargin=2.6cm,style=nextline,font=\sffamily\bfseries\small]
+  \item[Stand] Was fertig ist und belegt werden kann.
+  \item[Offen] Was noch fehlt oder ungeklärt ist.
+  \item[Nächster Schritt] Wer was bis wann tut.
+\end{description}
+
+\begin{thebibliography}{9}
+\addcontentsline{toc}{section}{\refname}
+\small
+\bibitem{quelle1} Nachname, Vorname: \emph{Titel der Quelle}. Verlag, Jahr.
+  \url{https://example.org/quelle}
+\end{thebibliography}
+
+\end{document}

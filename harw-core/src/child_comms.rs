@@ -490,13 +490,19 @@ impl ChildEndCause {
         }
     }
 
-    /// Ob eine Übergabe-Verdichtung versucht wird: nur bei Budget-Enden
-    /// (Zeit, Werkzeuge) — nicht bei Provider-Fehlern (der Provider ist
-    /// gerade gescheitert), nicht bei Abbruch (die Nutzerin will stoppen)
-    /// und nicht bei Lease-Ablauf (die Sitzung ist bereits verworfen).
+    /// Ob eine Übergabe-Verdichtung versucht wird: bei Budget-Enden (Zeit,
+    /// Werkzeuge) und — seit Runde 7, Teil A3 — auch nach einem Provider-/
+    /// Turn-Fehler (ein Timeout oder 5xx ist oft vorübergehend; der kurze
+    /// Aufruf mit eigenem Zeitlimit [`END_HANDOFF_TIMEOUT`] rettet die
+    /// bisherige Arbeit, scheitert er, bleiben Journal und letzter
+    /// Assistententext). Nicht bei Abbruch (die Nutzerin will stoppen) und
+    /// nicht bei Lease-Ablauf (die Sitzung ist bereits verworfen).
     #[must_use]
     pub fn allows_compaction(&self) -> bool {
-        matches!(self, Self::WallTime { .. } | Self::ToolBudget { .. })
+        matches!(
+            self,
+            Self::WallTime { .. } | Self::ToolBudget { .. } | Self::TurnError(_)
+        )
     }
 
     /// Ob der Elternteil mit `continue_from` fortsetzen darf (alles außer
@@ -1731,7 +1737,7 @@ mod tests {
     }
 
     #[test]
-    fn only_budget_ends_are_compacted() {
+    fn budget_ends_and_turn_errors_are_compacted() {
         assert!(
             ChildEndCause::WallTime {
                 limit_ms: 1,
@@ -1740,7 +1746,8 @@ mod tests {
             .allows_compaction()
         );
         assert!(ChildEndCause::ToolBudget { limit: 1, used: 2 }.allows_compaction());
-        assert!(!ChildEndCause::TurnError("provider 529".to_owned()).allows_compaction());
+        // Runde 7, Teil A3: auch nach einem Providerfehler.
+        assert!(ChildEndCause::TurnError("provider 529".to_owned()).allows_compaction());
         assert!(
             !ChildEndCause::Cancelled {
                 reason: "User".to_owned()

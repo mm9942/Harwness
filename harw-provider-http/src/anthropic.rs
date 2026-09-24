@@ -134,6 +134,9 @@ pub struct AnthropicMessagesProvider {
     credential: AnthropicCredential,
     max_tokens: u32,
     request_timeout: Duration,
+    /// Runde 7, Teil L4: Leerlauf-Zeitlimit gestreamter Antworten (siehe
+    /// [`Self::configure_timeouts`]).
+    stream_idle_timeout: Duration,
     configured_headers: Option<reqwest::header::HeaderMap>,
     /// Client-seitiger Rate-Limiter (siehe
     /// [`crate::rate_limiter::ProviderRateLimiter`]); standardmäßig
@@ -193,6 +196,7 @@ impl AnthropicMessagesProvider {
             credential,
             max_tokens: DEFAULT_MAX_TOKENS,
             request_timeout: super::DEFAULT_REQUEST_TIMEOUT,
+            stream_idle_timeout: super::DEFAULT_REQUEST_TIMEOUT,
             configured_headers: None,
             rate_limiter: std::sync::Arc::new(crate::rate_limiter::ProviderRateLimiter::new(None)),
             concurrency_limiter: None,
@@ -248,6 +252,23 @@ impl AnthropicMessagesProvider {
     /// Ergebnis von `ProviderBudgetRegistry::configure_provider`.
     pub(crate) fn configure_budgets(&mut self, budgets: crate::budget::ProviderBudgets) {
         self.budgets = budgets;
+    }
+
+    /// Runde 7, Teil L4: Setzt Request- und Streaming-Leerlauf-Zeitlimit
+    /// (aus `ProviderToml::effective_request_timeout_secs` bzw.
+    /// `effective_stream_idle_timeout_secs`).
+    ///
+    /// # Arguments
+    /// - `request_timeout`: Gesamtlimit nicht gestreamter Requests bzw.
+    ///   Wartezeit bis zu den Headern gestreamter Requests.
+    /// - `stream_idle_timeout`: höchste Pause zwischen zwei Stream-Chunks.
+    pub(crate) fn configure_timeouts(
+        &mut self,
+        request_timeout: Duration,
+        stream_idle_timeout: Duration,
+    ) {
+        self.request_timeout = request_timeout;
+        self.stream_idle_timeout = stream_idle_timeout;
     }
 
     pub(crate) fn configure_rate_limit(&mut self, rate_limit: Option<harw_config::RateLimitToml>) {
@@ -1032,12 +1053,14 @@ impl AnthropicMessagesProvider {
         // Transportfehler laufen über dieselbe Klassifikation wie der
         // OpenAI-kompatible Pfad: Timeout → `Timeout`, Verbindungs-/Sendefehler
         // → `Transient` (beide vom `RetryingProvider` wiederholbar).
-        let response = builder
-            .json(&wire)
-            .timeout(self.request_timeout)
-            .send()
-            .await
-            .map_err(|error| crate::error::model_error_for_transport(error, false))?;
+        // Runde 7, Teil L4: gestreamt begrenzt `request_timeout` nur die
+        // Wartezeit bis zu den Headern (siehe `send_with_timeout`).
+        let response = crate::send_with_timeout(
+            builder.json(&wire),
+            self.request_timeout,
+            stream_sink.is_some(),
+        )
+        .await?;
 
         self.rate_limiter.observe_headers(response.headers());
         let status = response.status();
@@ -1048,7 +1071,10 @@ impl AnthropicMessagesProvider {
             && let Some(sink) = stream_sink
         {
             let mut accumulator = crate::sse::AnthropicStreamAccumulator::default();
-            crate::sse::read_sse(response, |frame| accumulator.push(&frame, Some(sink))).await?;
+            crate::sse::read_sse(response, Some(self.stream_idle_timeout), |frame| {
+                accumulator.push(&frame, Some(sink))
+            })
+            .await?;
             let value = accumulator.finish()?;
             let response = self.interpret_body(&request, model, &value)?;
             budget_permit.reconcile(&response.usage);

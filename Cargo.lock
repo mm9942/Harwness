@@ -2187,6 +2187,7 @@ dependencies = [
  "harw-config",
  "harw-fsutil",
  "serde",
+ "sha2 0.10.9",
  "toml 1.1.3+spec-1.1.0",
  "uuid",
 ]
@@ -3031,6 +3032,7 @@ dependencies = [
  "harw-sandbox",
  "harw-tools",
  "harw-types",
+ "jiff",
  "serde",
  "serde_json",
  "tempfile",

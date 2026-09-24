@@ -1,9 +1,16 @@
 //! Idempotentes Anlegen des `~/.harw`-Root-Space.
 //!
 //! [`ensure_home`] legt Verzeichnisse und Default-Dateien an, **überschreibt
-//! aber niemals** existierende Dateien (wie das im README dokumentierte
-//! `harw init`-Verhalten). Secrets landen ausschließlich in `auth.toml`
-//! (chmod 600 unter Unix); `config.toml` trägt nur Verhalten/Flags.
+//! aber niemals** von der Nutzerin geänderte Dateien (wie das im README
+//! dokumentierte `harw init`-Verhalten). Secrets landen ausschließlich in
+//! `auth.toml` (chmod 600 unter Unix); `config.toml` trägt nur
+//! Verhalten/Flags.
+//!
+//! Ausnahme seit Runde 7, Teil T6: die mitgelieferten Agenten- und
+//! Skill-Dateien (Bundle) werden über `<home>/.bundle-manifest.toml`
+//! aktualisiert, solange die Nutzerin sie nicht geändert hat; eine geänderte
+//! Datei bleibt, die neue Fassung landet als `<datei>.harw-neu` daneben
+//! (Regeln in [`crate::bundle_manifest`]).
 
 use std::path::{Path, PathBuf};
 
@@ -22,6 +29,14 @@ pub struct Scaffolded {
     pub profile_dir: PathBuf,
     /// Neu geschriebene Dateien (leer bei einem reinen Re-Run).
     pub written_files: Vec<PathBuf>,
+    /// Runde 7, Teil T6: mitgelieferte Dateien, die unverändert waren und auf
+    /// die neue Bundle-Fassung gehoben wurden.
+    pub updated_files: Vec<PathBuf>,
+    /// Runde 7, Teil T6: neu abgelegte `<datei>.harw-neu` neben
+    /// mitgelieferten Dateien, die die Nutzerin geändert hat. Der Aufrufer
+    /// sollte darauf hinweisen: die neue Fassung liegt daneben und kann von
+    /// Hand übernommen werden.
+    pub bundle_conflicts: Vec<PathBuf>,
 }
 
 /// Legt Root-Space und das effektive Profil an (idempotent).
@@ -55,6 +70,8 @@ fn ensure_home_with_profile(home: &Path, profile: &str) -> HomeResult<Scaffolded
         home: home.to_path_buf(),
         profile_dir: profile_dir.clone(),
         written_files: Vec::new(),
+        updated_files: Vec::new(),
+        bundle_conflicts: Vec::new(),
     };
 
     // Root-Verzeichnisse.
@@ -113,19 +130,27 @@ fn ensure_home_with_profile(home: &Path, profile: &str) -> HomeResult<Scaffolded
     Ok(report)
 }
 
-/// Schreibt die mit dem Binary ausgelieferte Agenten-/Skill-Startausstattung
-/// nach `~/.harw/agents` bzw. `~/.harw/skills`.
+/// Schreibt bzw. aktualisiert die mit dem Binary ausgelieferte
+/// Agenten-/Skill-Startausstattung unter `~/.harw/agents` bzw.
+/// `~/.harw/skills`.
 ///
 /// # Description
 /// Die Dateien landen auf der Home-Ebene, nicht im Profil: sie sind
 /// profilunabhängig und liegen damit im schwächsten Config-Layer
 /// ([`crate::paths::config_layers`]), sodass Profil und Projekt sie überstimmen
-/// können. Jede Datei wird über [`write_if_absent`] geschrieben — eine vom
-/// Nutzer angepasste Definition bleibt bei jedem Re-Run unangetastet.
+/// können. Runde 7, Teil T6: fehlende Dateien werden geschrieben, unveränderte
+/// auf die neue Bundle-Fassung gehoben, von der Nutzerin geänderte nie
+/// überschrieben — deren neue Fassung liegt als `<datei>.harw-neu` daneben
+/// (Manifest `<home>/.bundle-manifest.toml`, siehe
+/// [`crate::bundle_manifest::sync_bundle`]).
+///
+/// # Errors
+/// [`HomeError::Io`] bei jedem fehlgeschlagenen Datei-Zugriff.
 fn write_bundle(home: &Path, report: &mut Scaffolded) -> HomeResult<()> {
-    for file in crate::bundle::bundled_files() {
-        write_if_absent(&file.target_in(home), file.contents, report)?;
-    }
+    let sync = crate::bundle_manifest::sync_bundle(home, crate::bundle::bundled_files())?;
+    report.written_files.extend(sync.written);
+    report.updated_files.extend(sync.updated);
+    report.bundle_conflicts.extend(sync.conflicts);
     Ok(())
 }
 
@@ -441,6 +466,79 @@ mod tests {
 
         std::fs::remove_dir_all(&home).map_err(ctx("remove temporary scaffold"))?;
         Ok(())
+    }
+
+    /// Runde 7, Teil T6: eine unveränderte mitgelieferte Datei mit altem
+    /// Inhalt (simuliert über ein Manifest, das genau diesen alten Inhalt als
+    /// installiert führt) wird beim nächsten Lauf aktualisiert; eine von der
+    /// Nutzerin geänderte bleibt und bekommt eine `.harw-neu` daneben.
+    #[test]
+    fn rerun_updates_unchanged_bundle_files_and_protects_customized_ones() -> TestResult {
+        let home =
+            std::env::temp_dir().join(format!("harw-home-scaffold-{}", uuid::Uuid::now_v7()));
+        ensure_home_with_profile(&home, "foo").map_err(ctx("scaffold home"))?;
+
+        let stale = home.join("agents").join("debugger").join("agent.toml");
+        let customized = home.join("agents").join("debugger").join("system.md");
+        let old_contents = "# alte mitgelieferte Fassung\n";
+        std::fs::write(&stale, old_contents).map_err(ctx("simulate old bundle file"))?;
+        std::fs::write(&customized, "# meine eigene Fassung\n")
+            .map_err(ctx("simulate user customization"))?;
+        // Das Manifest führt für beide Dateien eine ältere Fassung als
+        // installiert: genau die Lage nach einem Update des Binarys. Für
+        // `agent.toml` ist das auch der aktuelle Inhalt (unverändert), für
+        // `system.md` nicht (von der Nutzerin geändert).
+        let manifest_path = home.join(crate::bundle_manifest::BUNDLE_MANIFEST_FILE);
+        let mut manifest =
+            std::fs::read_to_string(&manifest_path).map_err(ctx("read bundle manifest"))?;
+        let bundled = |path: &str| {
+            crate::bundle::bundled_files()
+                .iter()
+                .find(|file| file.relative_path == path)
+                .map(|file| file.contents)
+                .ok_or(crate::test_support::TestError::Missing(
+                    "bundled debugger file",
+                ))
+        };
+        let agent_toml = bundled("agents/debugger/agent.toml")?;
+        let system_md = bundled("agents/debugger/system.md")?;
+        manifest = manifest.replace(
+            &sha256_hex_for_test(agent_toml),
+            &sha256_hex_for_test(old_contents),
+        );
+        manifest = manifest.replace(
+            &sha256_hex_for_test(system_md),
+            &sha256_hex_for_test("# alte mitgelieferte system.md\n"),
+        );
+        std::fs::write(&manifest_path, manifest).map_err(ctx("rewrite bundle manifest"))?;
+
+        let rerun = ensure_home_with_profile(&home, "foo").map_err(ctx("re-scaffold home"))?;
+
+        assert_eq!(rerun.updated_files, vec![stale.clone()]);
+        assert_eq!(
+            std::fs::read_to_string(&stale).map_err(ctx("read updated"))?,
+            agent_toml
+        );
+        let sidecar = home
+            .join("agents")
+            .join("debugger")
+            .join("system.md.harw-neu");
+        assert_eq!(rerun.bundle_conflicts, vec![sidecar.clone()]);
+        assert_eq!(
+            std::fs::read_to_string(&customized).map_err(ctx("read customized"))?,
+            "# meine eigene Fassung\n"
+        );
+        assert!(sidecar.is_file());
+        assert!(rerun.written_files.is_empty());
+
+        std::fs::remove_dir_all(&home).map_err(ctx("remove temporary scaffold"))?;
+        Ok(())
+    }
+
+    /// SHA-256 als Hex, wie ihn das Bundle-Manifest führt.
+    fn sha256_hex_for_test(contents: &str) -> String {
+        use sha2::Digest;
+        format!("{:x}", sha2::Sha256::digest(contents.as_bytes()))
     }
 
     /// Das Bundle liegt auf der Home-Ebene und muss über die reguläre

@@ -16,6 +16,9 @@ harw-sandbox = { path = "../harw-sandbox" }
 harw-macros = { path = "../harw-macros" }
 harw-observe = { path = "../harw-observe" }
 blake3 = { workspace = true }
+# Runde 7, Teil T2 (`latex.template`): heutiges Datum in lokaler Zeitzone
+# (bereits im Cargo.lock, Workspace-Abhängigkeit).
+jiff = { workspace = true }
 zeroize = "1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

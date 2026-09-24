@@ -420,6 +420,55 @@ mod tests {
     ];
     const AEADS: [AeadAlgo; 2] = [AeadAlgo::XChaCha20Poly1305, AeadAlgo::AesGcmSiv];
 
+    /// Known-Answer-Vektoren der lokalen Payload-AEADs, erzeugt mit
+    /// chacha20poly1305 0.10.1 / aes-gcm-siv 0.11.1 **vor** dem Update auf
+    /// die aead-0.6-Generation (Runde 7, Dependabot #10/#12). Sie belegen,
+    /// dass bestehende Datensätze nach dem Crate-Update bitgleich
+    /// verschlüsselt und weiterhin entschlüsselt werden.
+    const KAT_DEK: [u8; DEK_LEN] = [0x42; DEK_LEN];
+    const KAT_AAD: &[u8] = b"harw-kat-aad";
+    const KAT_PLAINTEXT: &[u8] = b"harw aead known answer";
+    const KAT_XCHACHA_CT: &str =
+        "cd3fa5124e4529c7c60f545461ff63ea539ffdcd196d2fb45b04f59b649094625e26cf803015";
+    const KAT_AES_GCM_SIV_CT: &str =
+        "ebd31bb174392830519bb2848c754d5d80adbc418e3e84326944a869c4e28218d22cd62bb95c";
+
+    fn hex(bytes: &[u8]) -> String {
+        bytes.iter().map(|b| format!("{b:02x}")).collect()
+    }
+
+    fn unhex(text: &str) -> TestResult<Vec<u8>> {
+        (0..text.len())
+            .step_by(2)
+            .map(|i| {
+                text.get(i..i + 2)
+                    .and_then(|pair| u8::from_str_radix(pair, 16).ok())
+                    .ok_or(crate::test_support::TestError::Missing("gültiges Hex"))
+            })
+            .collect()
+    }
+
+    #[test]
+    fn test_payload_aeads_match_the_pre_update_known_answers() -> TestResult {
+        for (aead, nonce, expected) in [
+            (
+                AeadAlgo::XChaCha20Poly1305,
+                vec![0x24_u8; 24],
+                KAT_XCHACHA_CT,
+            ),
+            (AeadAlgo::AesGcmSiv, vec![0x12_u8; 12], KAT_AES_GCM_SIV_CT),
+        ] {
+            let ct = encrypt_payload(aead, &KAT_DEK, &nonce, KAT_AAD, KAT_PLAINTEXT)
+                .map_err(ctx("encrypt"))?;
+            assert_eq!(hex(&ct), expected, "{aead:?}: Chiffrat weicht ab");
+            let stored = unhex(expected)?;
+            let pt = decrypt_payload(aead, &KAT_DEK, &nonce, KAT_AAD, &stored)
+                .map_err(ctx("decrypt"))?;
+            assert_eq!(pt, KAT_PLAINTEXT, "{aead:?}: Klartext weicht ab");
+        }
+        Ok(())
+    }
+
     /// Recipient public key exactly as production derives it: root seed ->
     /// per-KEM domain-separated seed -> crypt_guard hybrid key.
     fn hybrid_public_key(kem: KemAlgo, seed: &[u8; 32]) -> TestResult<RecipientPublicKey> {

@@ -1,0 +1,110 @@
+# Eingebauter Game Master des Matrix-Games (Runde 7, Teil M).
+#
+# Die UIA startet ihn per `transfer_to_matrix-game-master` als Wurzel eines
+# eigenen Agentenbaums — als Organisationsrolle `root-orchestrator` läuft er im
+# Hintergrund (die TUI blockiert nie) und zählt gegen
+# `[agents] max_root_orchestrators`. Er ist ausschließlich Spielleitung:
+# Szenario aus Freitext entwerfen und validieren, Zusammenfassung zur
+# Freigabe vorlegen, das Spiel mit den vier Sitz-Rollen durchspielen (der
+# Runner startet sie als seine Kinder), AAR und paper-tauglichen `report.md`
+# liefern. Die Würfel wirft ausschließlich die Engine.
+#
+# ── Rechte ──────────────────────────────────────────────────────────────────
+# Registry-Profil `MatrixReader` (lesende `fs.*` plus `doc.read_pdf`, um einen
+# Brief im Workspace zu lesen), Reducer `ReadOnly` — kein Netz, kein
+# Schreiben, keine Ausführung. Die Matrix-Werkzeuge steuert die
+# Composition-Root über einen rollengebundenen `ModelToolProvider` bei
+# (`harw_registry_defaults::profile::matrix_tools_for_role`):
+# `matrix.draft_scenario`/`matrix.status` ohne Freigabe (nur Matrix-Speicher
+# bzw. lesend), `matrix.start`/`matrix.run`/`matrix.finish` immer mit
+# Freigabe. `parent.message` meldet Zwischenstände und die höchstens drei
+# Kernfragen an die UIA.
+#
+# ── Tiefe / Budget ──────────────────────────────────────────────────────────
+# `max_depth = 1`: unter ihm entstehen nur die Sitz-Agenten (Worker); er
+# startet keine Orchestratoren und übergibt an keinen anderen Worker (die
+# Übergaben sind unten ausdrücklich verboten).
+
+schema = "harwness.agent/v1"
+id = "harwness.agent.matrix-game-master@1"
+version = "1.0.0"
+role = "root-orchestrator"
+specialization = "matrix-game-master"
+
+name = "Matrix Game Master"
+description = "Spielleitung eines Matrix-Games: entwirft aus einem Freitext-Auftrag ein geprüftes Szenario, lässt es freigeben, spielt es mit Sitz-Agenten durch (Würfel nur aus der Engine) und liefert AAR und report.md."
+
+[work]
+mode = "orchestration"
+may_change_plan = false
+may_write_code = false
+may_research_web = false
+aggregates_child_returns = true
+
+[lifecycle]
+allow_pause = false
+allow_rerun = true
+max_attempts = 2
+
+[context]
+program = "orchestrate"
+must_include = ["task.objective", "task.read_scope", "new.trigger_return"]
+exclude = ["full_parent_transcript", "sibling_transcripts"]
+
+[tools]
+admitted = [
+  "fs.read",
+  "fs.list",
+  "fs.search",
+  "fs.glob",
+  "fs.grep",
+  "doc.read_pdf",
+  # Runde 7, Teil M: die Matrix-Werkzeuge des Game Masters (Composition-Root,
+  # siehe `harw_registry_defaults::profile::matrix_tools_for_role`).
+  "matrix.draft_scenario",
+  "matrix.status",
+  "matrix.start",
+  "matrix.run",
+  "matrix.finish",
+  # Zwischenstand (info) oder eine der höchstens drei Kernfragen (question)
+  # an die UIA (siehe `harw_registry_defaults::profile::parent_message_tools_for_role`).
+  "parent.message",
+]
+forbidden = [
+  "fs.write",
+  "fs.edit",
+  "shell.exec",
+  "process.kill",
+  "web.fetch",
+  "web.search",
+  "web.docs_rs",
+  "web.crates_io",
+  "delegate_wave",
+  # Keine Übergabe an andere Rollen: die Sitz-Agenten startet der Runner.
+  "transfer_to_executor",
+  "transfer_to_explorer",
+  "transfer_to_researcher",
+  "transfer_to_researcher-deps",
+  "transfer_to_dependency-researcher",
+  "transfer_to_researcher-web",
+  "transfer_to_planner",
+  "transfer_to_analyst",
+  "transfer_to_memory-steward",
+  "transfer_to_agent-steward",
+  "transfer_to_matrix-player",
+  "transfer_to_matrix-umpire",
+  "transfer_to_matrix-market",
+  "transfer_to_matrix-redcell",
+]
+
+[spawn]
+max_depth = 1
+child_orchestrators = []
+
+[spawn.budget]
+max_tokens = 120000
+max_tool_calls = 80
+max_wall_secs = 3600
+
+[return]
+contract = "harwness.matrix.game-report@1"

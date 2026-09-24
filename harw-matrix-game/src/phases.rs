@@ -2432,12 +2432,67 @@ pub fn resolve_argument(
     ruling: &UmpireRuling,
     at: Option<Timestamp>,
 ) -> MatrixResult<Outcome> {
+    resolve_argument_inner(log, scenario, arg, ruling, None, at)
+}
+
+/// Vorab entschiedener Wurf eines Konfliktpaars (Runde 7, Teil M5).
+#[derive(Debug, Clone)]
+struct ForcedRoll {
+    success: bool,
+    grade: dice::Grade,
+    rolls: Vec<dice::DiceRoll>,
+}
+
+/// Wendet Geschäftsregeln auf ein Urteil an (Business-Modus, Runde 7 Teil
+/// M5): sperrt eine `restrict_actions`-Regel die Aktionsart des Arguments,
+/// wird das Urteil zum Veto mit Begründung. Außerdem entstehen Vermerke
+/// (Stakeholder-Pflichten, nicht auswertbare Regeln).
+fn apply_business_rules(
+    log: &GameLog,
+    scenario: &Scenario,
+    arg: &RoundArgument,
+    ruling: &UmpireRuling,
+) -> (UmpireRuling, Vec<GameEntry>) {
+    let notes = crate::business::rule_notes(
+        &log.state,
+        scenario,
+        &arg.seat,
+        &arg.body.action,
+        &arg.id,
+        arg.round,
+    );
+    let mut ruling = ruling.clone();
+    if let Some((rule, kind)) =
+        crate::business::restriction_for(&log.state, scenario, &arg.seat, &arg.body.action)
+    {
+        let text = format!("Geschäftsregel `{rule}`: Aktionsart `{kind}` ist derzeit gesperrt.");
+        ruling.verdict = Verdict::Veto;
+        if arg.is_secret() {
+            ruling.private_notes = Some(text);
+        } else {
+            ruling.public_rationale = Some(text);
+        }
+    }
+    (ruling, notes)
+}
+
+fn resolve_argument_inner(
+    log: &mut GameLog,
+    scenario: &Scenario,
+    arg: &RoundArgument,
+    ruling: &UmpireRuling,
+    forced: Option<ForcedRoll>,
+    at: Option<Timestamp>,
+) -> MatrixResult<Outcome> {
     if ruling.argument_id != arg.id {
         return Err(MatrixError::Contract(vec![format!(
             "Urteil `{}` passt nicht zu Argument `{}`",
             ruling.argument_id, arg.id
         )]));
     }
+    let (ruling_owned, rule_notes) = apply_business_rules(log, scenario, arg, ruling);
+    let ruling = &ruling_owned;
+    log.record_all(rule_notes, at)?;
     let rules = scenario.rules();
     let master = log.state.master_seed()?;
     let round = arg.round;
@@ -2508,15 +2563,25 @@ pub fn resolve_argument(
             let chit_available = rules.fail_chits
                 && arg.body.use_fail_chit_if_failed
                 && log.state.fail_chits_of(&arg.seat) > 0;
-            let resolved = dice::resolve_roll(
-                &master,
-                round,
-                RollKind::Argument,
-                &arg.id,
-                system,
-                target,
-                chit_available,
-            );
+            // Konfliktpaar: der Ausgang steht bereits fest (dice::resolve_conflict,
+            // gewürfelt ausschließlich von der Engine); ein Fail-Chit greift dort nicht.
+            let resolved = match forced {
+                Some(forced) => dice::ResolvedRoll {
+                    success: forced.success,
+                    grade: forced.grade,
+                    rolls: forced.rolls,
+                    used_fail_chit: false,
+                },
+                None => dice::resolve_roll(
+                    &master,
+                    round,
+                    RollKind::Argument,
+                    &arg.id,
+                    system,
+                    target,
+                    chit_available,
+                ),
+            };
             for roll in &resolved.rolls {
                 entries.push(
                     GameEntry::new(
@@ -2620,6 +2685,193 @@ pub fn resolve_argument(
         reveal_secret(log, secret_id, RevealedBy::Trigger(arg.id.clone()), at)?;
     }
     Ok(outcome)
+}
+
+/// Ergebnis eines aufgelösten Arguments der Runde.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResolvedArgument {
+    /// Argument-ID.
+    pub argument_id: String,
+    /// Ergebnis.
+    pub outcome: Outcome,
+    /// Gegner, falls das Argument über ein Konfliktpaar entschieden wurde.
+    pub conflict_with: Option<String>,
+}
+
+/// Ob ein Argument mit seinem Urteil für einen Konfliktwurf taugt: offen,
+/// 2W6, würfelpflichtig, nicht durch eine Geschäftsregel gesperrt.
+fn conflict_eligible(
+    log: &GameLog,
+    scenario: &Scenario,
+    arg: &RoundArgument,
+    ruling: &UmpireRuling,
+) -> Option<u8> {
+    let rules = scenario.rules();
+    if arg.is_secret() || rules.adjudication != AdjudicationSystem::ProsCons2d6 {
+        return None;
+    }
+    let cons: Vec<u8> = ruling.con_weights.values().flatten().copied().collect();
+    let net = dice::net_value(&ruling.pro_weights, &cons, ruling.context_modifier).ok()?;
+    let rolls = match ruling.verdict {
+        Verdict::Roll => true,
+        Verdict::NoRoll => !dice::auto_success_allowed(net, rules),
+        Verdict::Veto => false,
+    };
+    if !rolls
+        || crate::business::restriction_for(&log.state, scenario, &arg.seat, &arg.body.action)
+            .is_some()
+    {
+        return None;
+    }
+    Some(dice::target_for(net))
+}
+
+fn forced_for(outcome: &dice::ConflictOutcome, id: &str) -> ForcedRoll {
+    let success = outcome.winner == id;
+    let rolls: Vec<dice::DiceRoll> = outcome
+        .rolls
+        .iter()
+        .filter(|r| r.argument_id == id)
+        .cloned()
+        .collect();
+    let grade = match (outcome.decided_by_cap, rolls.last()) {
+        (false, Some(last)) => last.grade,
+        _ if success => dice::Grade::Success,
+        _ => dice::Grade::Failure,
+    };
+    ForcedRoll {
+        success,
+        grade,
+        rolls,
+    }
+}
+
+/// Löst alle Argumente einer Runde auf und entscheidet Konfliktpaare
+/// (`UmpireAdjudication.conflicts`) über [`dice::resolve_conflict`]
+/// (matrix-game.md §4.2; Runde 7, Teil M5).
+///
+/// # Beschreibung
+/// Reihenfolge ist `args` (kanonische Auflösungsreihenfolge). Ein Paar wird
+/// als Konflikt gewürfelt, wenn beide Argumente offen, würfelpflichtig
+/// (2W6, kein Veto, kein zwingender Automatik-Erfolg), von verschiedenen
+/// Sitzen und nicht durch eine Geschäftsregel gesperrt sind; das in `args`
+/// frühere Argument ist `first` (gewinnt bei Gleichstand). Sieger ⇒
+/// Erfolg, Unterlegener ⇒ Misserfolg, beide mit ihren vorab festgelegten
+/// Effekt-Zweigen; alle Konfliktwürfe stehen im Journal. Jedes andere
+/// Argument (auch ein nicht taugliches Paar) wird einzeln über
+/// [`resolve_argument`] gewürfelt. Fehlt ein Urteil, liefert `fallback` es.
+///
+/// # Errors
+/// Wie [`resolve_argument`].
+pub fn resolve_adjudication(
+    log: &mut GameLog,
+    scenario: &Scenario,
+    args: &[RoundArgument],
+    adjudication: &UmpireAdjudication,
+    fallback: &dyn Fn(&RoundArgument) -> UmpireRuling,
+    at: Option<Timestamp>,
+) -> MatrixResult<Vec<ResolvedArgument>> {
+    let ruling_for = |arg: &RoundArgument| {
+        adjudication
+            .rulings
+            .iter()
+            .find(|r| r.argument_id == arg.id)
+            .cloned()
+            .unwrap_or_else(|| fallback(arg))
+    };
+    let mut done: BTreeSet<String> = BTreeSet::new();
+    let mut out = Vec::with_capacity(args.len());
+    for (index, arg) in args.iter().enumerate() {
+        if done.contains(&arg.id) {
+            continue;
+        }
+        let ruling = ruling_for(arg);
+        // Partner: ein noch offenes, späteres Argument aus einem Konfliktpaar.
+        let partner = adjudication.conflicts.iter().find_map(|pair| {
+            let other = if pair.a == arg.id {
+                &pair.b
+            } else if pair.b == arg.id {
+                &pair.a
+            } else {
+                return None;
+            };
+            args.iter()
+                .skip(index + 1)
+                .find(|a| &a.id == other && !done.contains(&a.id) && a.seat != arg.seat)
+        });
+        let view: &GameLog = log;
+        let pair = partner.and_then(|other| {
+            let other_ruling = ruling_for(other);
+            let target_a = conflict_eligible(view, scenario, arg, &ruling)?;
+            let target_b = conflict_eligible(view, scenario, other, &other_ruling)?;
+            Some((other, other_ruling, target_a, target_b))
+        });
+        match pair {
+            Some((other, other_ruling, target_a, target_b)) => {
+                let master = log.state.master_seed()?;
+                let conflict = dice::resolve_conflict(
+                    &master,
+                    arg.round,
+                    (arg.id.as_str(), target_a),
+                    (other.id.as_str(), target_b),
+                );
+                let outcome_a = resolve_argument_inner(
+                    log,
+                    scenario,
+                    arg,
+                    &ruling,
+                    Some(forced_for(&conflict, &arg.id)),
+                    at,
+                )?;
+                let outcome_b = resolve_argument_inner(
+                    log,
+                    scenario,
+                    other,
+                    &other_ruling,
+                    Some(forced_for(&conflict, &other.id)),
+                    at,
+                )?;
+                done.insert(arg.id.clone());
+                done.insert(other.id.clone());
+                out.push(ResolvedArgument {
+                    argument_id: arg.id.clone(),
+                    outcome: outcome_a,
+                    conflict_with: Some(other.id.clone()),
+                });
+                out.push(ResolvedArgument {
+                    argument_id: other.id.clone(),
+                    outcome: outcome_b,
+                    conflict_with: Some(arg.id.clone()),
+                });
+            }
+            None => {
+                let outcome = resolve_argument(log, scenario, arg, &ruling, at)?;
+                done.insert(arg.id.clone());
+                out.push(ResolvedArgument {
+                    argument_id: arg.id.clone(),
+                    outcome,
+                    conflict_with: None,
+                });
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// Rundenende mit Marktmodell (Business-Modus, Runde 7 Teil M5): wendet
+/// zuerst [`crate::business::apply_market_model`] an, dann
+/// [`close_round`] — die neuen Anteile stehen damit im `state_hash`.
+///
+/// # Errors
+/// Zustandsfehler.
+pub fn close_round_with_market(
+    log: &mut GameLog,
+    scenario: &Scenario,
+    at: Option<Timestamp>,
+) -> MatrixResult<String> {
+    let round = log.state.round;
+    crate::business::apply_market_model(log, scenario, round, at)?;
+    close_round(log, scenario.rules(), at)
 }
 
 /// Legt ein geheimes Argument offen: Inhalt, Salt und Commitment werden
@@ -3629,6 +3881,121 @@ mod tests {
                 _ => {}
             }
         }
+        Ok(())
+    }
+
+    fn public_argument(id: &str, seat: &str, action: &str) -> RoundArgument {
+        RoundArgument {
+            id: id.to_owned(),
+            round: 1,
+            seat: PlayerId::new(seat),
+            body: ArgumentBody {
+                action: action.to_owned(),
+                pros: vec!["Grund eins.".to_owned(), "Grund zwei.".to_owned()],
+                cites_negotiation: Vec::new(),
+                conflict_target: None,
+                project: None,
+                use_fail_chit_if_failed: false,
+            },
+            secret_id: None,
+            counters: BTreeMap::new(),
+        }
+    }
+
+    /// Runde 7, Teil M5: Konfliktpaare laufen über `dice::resolve_conflict`
+    /// — genau ein Sieger, Konfliktwürfe im Journal, Replay prüft sie nach.
+    #[test]
+    fn conflicts_are_resolved_through_resolve_conflict() -> TestResult {
+        let loaded = load_scenario(KARST)?;
+        let master = [21u8; 32];
+        let mut log = open_game(&loaded, &master, None)?;
+        let a = public_argument("r1-a1", "rat", "Der Rat sperrt den Hafen.");
+        let b = public_argument("r1-a3", "nord", "Das Nordreich läuft den Hafen an.");
+        let mut ruling_a = crate::test_support::ruling("r1-a1");
+        ruling_a.pro_weights = vec![1, 1];
+        ruling_a.public_rationale = Some("Plausibel.".to_owned());
+        let mut ruling_b = crate::test_support::ruling("r1-a3");
+        ruling_b.pro_weights = vec![1, 0];
+        ruling_b.public_rationale = Some("Möglich.".to_owned());
+        let adjudication = UmpireAdjudication {
+            rulings: vec![ruling_a.clone(), ruling_b.clone()],
+            conflicts: vec![ConflictPair {
+                a: "r1-a1".to_owned(),
+                b: "r1-a3".to_owned(),
+            }],
+            standing: Vec::new(),
+        };
+        let fallback = |arg: &RoundArgument| crate::test_support::ruling(&arg.id);
+        let resolved = resolve_adjudication(
+            &mut log,
+            &loaded.scenario,
+            &[a, b],
+            &adjudication,
+            &fallback,
+            None,
+        )?;
+        assert_eq!(resolved.len(), 2);
+        assert!(resolved.iter().all(|r| r.conflict_with.is_some()));
+        let winners: Vec<&ResolvedArgument> = resolved
+            .iter()
+            .filter(|r| r.outcome == Outcome::Success)
+            .collect();
+        assert_eq!(winners.len(), 1, "{resolved:?}");
+        assert!(
+            resolved.iter().any(|r| r.outcome == Outcome::Failure),
+            "{resolved:?}"
+        );
+        // Unabhängig nachgerechnet: derselbe Sieger.
+        let target = |r: &UmpireRuling| {
+            let cons: Vec<u8> = r.con_weights.values().flatten().copied().collect();
+            dice::net_value(&r.pro_weights, &cons, r.context_modifier).map(dice::target_for)
+        };
+        let expected = dice::resolve_conflict(
+            &master,
+            1,
+            ("r1-a1", target(&ruling_a)?),
+            ("r1-a3", target(&ruling_b)?),
+        );
+        assert_eq!(
+            winners.first().map(|w| w.argument_id.as_str()),
+            Some(expected.winner.as_str())
+        );
+        let conflict_rolls = log
+            .journal
+            .entries()
+            .filter(|e| matches!(&e.kind, EntryKind::DiceRolled { roll } if roll.kind == RollKind::Conflict))
+            .count();
+        assert_eq!(conflict_rolls, expected.rolls.len());
+        let replayed = replay(&loaded.scenario, &log.journal)?;
+        assert_eq!(replayed, log.state);
+        Ok(())
+    }
+
+    /// Ohne Konfliktpaar bleibt es beim Einzelwurf je Argument.
+    #[test]
+    fn arguments_without_conflict_roll_individually() -> TestResult {
+        let loaded = load_scenario(KARST)?;
+        let mut log = open_game(&loaded, &[22u8; 32], None)?;
+        let a = public_argument("r1-a1", "rat", "Der Rat sperrt den Hafen.");
+        let adjudication = UmpireAdjudication {
+            rulings: Vec::new(),
+            conflicts: Vec::new(),
+            standing: Vec::new(),
+        };
+        let fallback = |arg: &RoundArgument| crate::test_support::ruling(&arg.id);
+        let resolved = resolve_adjudication(
+            &mut log,
+            &loaded.scenario,
+            &[a],
+            &adjudication,
+            &fallback,
+            None,
+        )?;
+        assert_eq!(resolved.len(), 1);
+        assert!(resolved.iter().all(|r| r.conflict_with.is_none()));
+        assert!(log.journal.entries().any(
+            |e| matches!(&e.kind, EntryKind::DiceRolled { roll } if roll.kind == RollKind::Argument)
+        ));
         Ok(())
     }
 

@@ -1,0 +1,167 @@
+% harw-report.sty -- Stilpaket der Harwness-Berichtsvorlage (Skill latex-report)
+%
+% Für KOMA-Script scrartcl mit XeLaTeX oder LuaLaTeX (fontspec). Einbinden
+% in der Hauptdatei NACH \documentclass:
+%
+%   \documentclass[11pt,a4paper]{scrartcl}
+%   \newcommand{\harwLanguage}{german}     % optional, siehe unten
+%   \usepackage{harw-report}
+%
+% ── Anpassung (Farben, Schriften, Sprache) ───────────────────────────────
+% Diese Datei enthält KEINE Platzhalter und ist ohne jede Ersetzung gültiges
+% LaTeX. Anpassbar ist sie über sechs Makros, die die Hauptdatei VOR
+% \usepackage{harw-report} setzen darf. Fehlt ein Makro oder ist es leer,
+% gilt die Vorgabe:
+%
+%   Makro            Vorgabe             Platzhalter der Hauptdatei
+%   \harwLanguage    german              LANGUAGE  (german | english)
+%   \harwAccentHex   714B67              ACCENT    (Hex ohne #)
+%   \harwWarnHex     C0392B              WARN      (Hex ohne #)
+%   \harwMainFont    DejaVu Serif        MAINFONT
+%   \harwSansFont    DejaVu Sans         SANSFONT
+%   \harwMonoFont    DejaVu Sans Mono    MONOFONT  (Scale=0.85)
+%
+% Die Platzhalter stehen nur in den Gerüsten (bericht.tex, business-paper.tex,
+% handbuch.tex) in der Form NAME zwischen je zwei Prozentzeichen, zusammen
+% mit TITLE, SUBTITLE, AUTHOR und DATE. Das Werkzeug latex.template ersetzt
+% sie dort per Textersetzung; diese Datei kopiert es unverändert.
+%
+% ── Was das Paket bereitstellt ───────────────────────────────────────────
+% Farben     harwaccent, harwwarn, harwgrau (F2F2F2)
+% Kästen     merke, achtung, beispiel   (tcolorbox, optionaler Titel)
+% Tabellen   booktabs, longtable, tabularx, array, Spaltentyp L
+%            (linksbündiges X, für Fließtext in Tabellenzellen)
+% TikZ       Stile harwbox, harwpfeil, harwdoppelpfeil, harwlabel
+% Befehle    \code{...} für kurze Bezeichner; Dateinamen und Pfade mit
+%            \path{...} bzw. \url{...} (brechen an / und .)
+% Satz       \tolerance=2000, \emergencystretch=3em gegen Overfull-Boxen,
+%            breitere Nummernspalten im Inhaltsverzeichnis (kein „10.1Was“)
+\NeedsTeXFormat{LaTeX2e}
+\ProvidesPackage{harw-report}[2026/09/24 v1.0 Harwness Berichtsvorlage]
+
+% ── Vorgaben für nicht gesetzte oder leere Anpassungsmakros ──────────────
+% \edef statt direktem \ifx: ein per \newcommand gesetztes (\long) leeres
+% Makro soll ebenfalls als leer gelten.
+\newcommand\harw@default[2]{%
+  \ifdefined#1%
+    \edef\harw@val{#1}%
+    \ifx\harw@val\@empty\def#1{#2}\fi
+  \else
+    \def#1{#2}%
+  \fi}
+\harw@default{\harwLanguage}{german}
+\harw@default{\harwAccentHex}{714B67}
+\harw@default{\harwWarnHex}{C0392B}
+\harw@default{\harwMainFont}{DejaVu Serif}
+\harw@default{\harwSansFont}{DejaVu Sans}
+\harw@default{\harwMonoFont}{DejaVu Sans Mono}
+
+% ── Schriften und Sprache ────────────────────────────────────────────────
+\RequirePackage{fontspec}
+\setmainfont{\harwMainFont}
+\setsansfont{\harwSansFont}
+\setmonofont[Scale=0.85]{\harwMonoFont}
+
+% \babelprovide braucht den Sprachnamen als Text, nicht als Makro: erst
+% expandieren, dann aufrufen. Kommt ohne ngerman.ldf aus.
+\RequirePackage{babel}
+\begingroup
+  \edef\harw@tmp{\endgroup
+    \noexpand\babelprovide[import,main]{\harwLanguage}}%
+\harw@tmp
+\RequirePackage[autostyle]{csquotes}
+
+% Kastentitel passend zur Sprache.
+\def\harw@english{english}
+\edef\harw@lang{\harwLanguage}
+\ifx\harw@lang\harw@english
+  \providecommand\harwMerkeTitel{In short}
+  \providecommand\harwAchtungTitel{Caution}
+  \providecommand\harwBeispielTitel{Example}
+\else
+  \providecommand\harwMerkeTitel{Kurz gesagt}
+  \providecommand\harwAchtungTitel{Achtung}
+  \providecommand\harwBeispielTitel{Beispiel}
+\fi
+
+% ── Seite und Mikrotypografie ────────────────────────────────────────────
+\RequirePackage[a4paper,margin=2.4cm]{geometry}
+\RequirePackage{microtype}
+
+% ── Farben ───────────────────────────────────────────────────────────────
+\RequirePackage{xcolor}
+\begingroup
+  \edef\harw@tmp{\endgroup
+    \noexpand\definecolor{harwaccent}{HTML}{\harwAccentHex}%
+    \noexpand\definecolor{harwwarn}{HTML}{\harwWarnHex}}%
+\harw@tmp
+\definecolor{harwgrau}{HTML}{F2F2F2}
+
+% KOMA-Überschriften in der Akzentfarbe (nur unter KOMA-Klassen).
+\ifdefined\addtokomafont
+  \addtokomafont{section}{\color{harwaccent}}
+  \addtokomafont{subsection}{\color{harwaccent}}
+  \addtokomafont{subsubsection}{\color{harwaccent}}
+\fi
+
+% Inhaltsverzeichnis: breitere Nummernspalten, damit „10.1“ nicht in den
+% Titel läuft („10.1Was“).
+\ifdefined\RedeclareSectionCommand
+  \RedeclareSectionCommand[tocnumwidth=2.0em]{section}
+  \RedeclareSectionCommand[tocindent=2.0em,tocnumwidth=3.0em]{subsection}
+  \RedeclareSectionCommand[tocindent=5.0em,tocnumwidth=3.8em]{subsubsection}
+\fi
+
+% ── Tabellen ─────────────────────────────────────────────────────────────
+\RequirePackage{booktabs}
+\RequirePackage{longtable}
+\RequirePackage{array}
+\RequirePackage{tabularx}
+\newcolumntype{L}{>{\raggedright\arraybackslash}X}
+
+% ── Listen ───────────────────────────────────────────────────────────────
+\RequirePackage{enumitem}
+
+% ── Quelltext ────────────────────────────────────────────────────────────
+\RequirePackage{listings}
+\lstset{basicstyle=\ttfamily\small,backgroundcolor=\color{harwgrau},
+  frame=single,rulecolor=\color{gray!50},breaklines=true,columns=fullflexible,
+  keepspaces=true,showstringspaces=false,
+  literate={ä}{{\"a}}1 {ö}{{\"o}}1 {ü}{{\"u}}1 {Ä}{{\"A}}1 {Ö}{{\"O}}1
+           {Ü}{{\"U}}1 {ß}{{\ss}}1 {→}{{$\rightarrow$}}1 {—}{{---}}1}
+
+% ── Abbildungen mit TikZ ─────────────────────────────────────────────────
+\RequirePackage{tikz}
+\usetikzlibrary{arrows.meta,positioning,fit,backgrounds,calc}
+\tikzset{
+  harwbox/.style={draw,rounded corners=3pt,align=center,
+    minimum height=1.1cm,text width=3.2cm,font=\sffamily\small,fill=white},
+  harwpfeil/.style={-{Stealth[length=2.5mm]},thick},
+  harwdoppelpfeil/.style={{Stealth[length=2.5mm]}-{Stealth[length=2.5mm]},thick},
+  harwlabel/.style={font=\sffamily\scriptsize,align=center,fill=white,
+    inner sep=1pt},
+}
+
+% ── Hinweiskästen ────────────────────────────────────────────────────────
+\RequirePackage[most]{tcolorbox}
+\newtcolorbox{merke}[1][\harwMerkeTitel]{colback=harwaccent!6,
+  colframe=harwaccent,fonttitle=\bfseries\sffamily,title=#1,arc=2pt,
+  boxrule=0.8pt}
+\newtcolorbox{achtung}[1][\harwAchtungTitel]{colback=harwwarn!5,
+  colframe=harwwarn,fonttitle=\bfseries\sffamily,title=#1,arc=2pt,
+  boxrule=0.8pt}
+\newtcolorbox{beispiel}[1][\harwBeispielTitel]{colback=harwgrau,
+  colframe=gray!60,fonttitle=\bfseries\sffamily,title=#1,arc=2pt,
+  boxrule=0.6pt}
+
+% ── Kurzbefehle ──────────────────────────────────────────────────────────
+\providecommand{\code}[1]{\texttt{#1}}
+
+% ── Umbruch: lieber etwas weitere Wortabstände als Zeilen im Rand ────────
+\tolerance=2000
+\emergencystretch=3em
+
+% ── Verweise (möglichst spät laden) ──────────────────────────────────────
+\RequirePackage[hidelinks]{hyperref}
+
+\endinput

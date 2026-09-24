@@ -224,6 +224,14 @@ Weiteres das Hauptmodell; änderbar mit `harw models internal`."
         originator: None,
         default_reasoning_effort: None,
         gateway_identity_headers: false,
+        request_timeout_secs: None,
+        stream_idle_timeout_secs: None,
+        retry_timeouts: None,
+        max_tokens_field: None,
+        send_reasoning_effort: None,
+        strict_tools: None,
+        parallel_tool_calls: None,
+        allow_insecure_lan: false,
     };
     let providers_dir = profile.join("providers");
     create_dir_all(&providers_dir)?;
@@ -358,6 +366,14 @@ fn persist_outcome(home: &Path, outcome: &harw_tui::SetupOutcome) -> Result<(), 
         originator: None,
         default_reasoning_effort: None,
         gateway_identity_headers: false,
+        request_timeout_secs: None,
+        stream_idle_timeout_secs: None,
+        retry_timeouts: None,
+        max_tokens_field: None,
+        send_reasoning_effort: None,
+        strict_tools: None,
+        parallel_tool_calls: None,
+        allow_insecure_lan: false,
     };
     let providers_dir = profile.join("providers");
     create_dir_all(&providers_dir)?;

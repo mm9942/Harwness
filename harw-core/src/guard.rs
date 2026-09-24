@@ -78,6 +78,13 @@ pub enum DriftKind {
     ChildOverBudget,
     /// Die Lease eines Kindes ist abgelaufen, ohne dass es geerntet wurde.
     ChildLeaseExpired,
+    /// Runde 7, Teil A2: ein Orchestrator hat sein Lesebudget (eigene
+    /// Lesezugriffe über die ganze Kind-Sitzung) erreicht bzw. überschritten.
+    ReadBudget,
+    /// Runde 7, Teil A5: `agent.status` wurde für dieselbe `child_id`
+    /// innerhalb kurzer Zeit erneut abgefragt (Polling statt Warten auf die
+    /// Benachrichtigung).
+    StatusPolling,
 }
 
 impl DriftKind {
@@ -96,6 +103,8 @@ impl DriftKind {
             DriftKind::DuplicateDelegation => "duplicate_delegation",
             DriftKind::ChildOverBudget => "child_over_budget",
             DriftKind::ChildLeaseExpired => "child_lease_expired",
+            DriftKind::ReadBudget => "read_budget",
+            DriftKind::StatusPolling => "status_polling",
         }
     }
 }
@@ -189,11 +198,21 @@ pub struct GuardPolicy {
     pub no_progress_rounds_abort: u32,
     /// Anzahl Runden ohne `plan.*`-Aufruf, ab der einmal gewarnt wird.
     pub plan_stale_rounds: u32,
+    /// Runde 7, Teil A2: eigene Lesezugriffe eines Orchestrators (über die
+    /// ganze Kind-Sitzung), ab denen jeder weitere Lesezugriff einen Hinweis
+    /// bekommt. Gilt nur für Orchestrator-Rollen.
+    pub orchestrator_read_warn: u32,
+    /// Runde 7, Teil A2: höchstens so viele eigene Lesezugriffe darf ein
+    /// Orchestrator ausführen; jeder weitere wird abgelehnt. `0` schaltet das
+    /// Lesebudget ab.
+    pub orchestrator_read_limit: u32,
 }
 
 impl Default for GuardPolicy {
     /// Nutzerentscheidung (Addendum F+G): aktiviert, 2/3 für wiederholte
     /// Fehler, 4/8 für fehlenden Fortschritt, 6 Runden bis `PlanStale`.
+    /// Runde 7, Teil A2: Orchestratoren lesen höchstens 5-mal selbst
+    /// (Hinweis ab dem 4. Zugriff).
     fn default() -> Self {
         Self {
             enabled: true,
@@ -202,6 +221,8 @@ impl Default for GuardPolicy {
             no_progress_rounds_warn: 4,
             no_progress_rounds_abort: 8,
             plan_stale_rounds: 6,
+            orchestrator_read_warn: 4,
+            orchestrator_read_limit: 5,
         }
     }
 }
@@ -547,6 +568,213 @@ impl TurnGuard {
     }
 }
 
+// ── Runde 7, Teil A2/A5: sitzungsweite Wächter ──────────────────────────────
+
+/// Lese-Werkzeuge, die auf das Lesebudget eines Orchestrators zählen
+/// (Runde 7, Teil A2). Dazu kommen alle Werkzeuge mit einem Präfix aus
+/// [`ORCHESTRATOR_READ_TOOL_PREFIXES`].
+pub const ORCHESTRATOR_READ_TOOLS: &[&str] = &[
+    "fs.read",
+    "fs.search",
+    "fs.grep",
+    "fs.glob",
+    "fs.list",
+    "lens.ask",
+    "doc.read_pdf",
+];
+
+/// Präfixe von Lese-Werkzeugfamilien, die auf das Lesebudget zählen
+/// (`explore.*`, `deps.source_*`).
+pub const ORCHESTRATOR_READ_TOOL_PREFIXES: &[&str] = &["explore.", "deps.source_"];
+
+/// Ablehnungstext, sobald ein Orchestrator sein Lesebudget überschreitet.
+pub const READ_BUDGET_EXHAUSTED_MESSAGE: &str =
+    "[harw-Wächter] Lesebudget erschöpft – delegiere an Explorer/Worker (`delegate_wave`)";
+
+/// Name des Status-Werkzeugs für Hintergrund-Agenten (Runde 7, Teil A5).
+pub const AGENT_STATUS_TOOL_NAME: &str = "agent.status";
+
+/// Zeitfenster, in dem eine erneute `agent.status`-Abfrage derselben
+/// `child_id` als Polling gilt (Runde 7, Teil A5).
+pub const STATUS_POLL_WINDOW: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Hinweis bei `agent.status`-Polling (Runde 7, Teil A5).
+pub const STATUS_POLLING_HINT: &str = "[harw-Wächter] `agent.status` für denselben Agenten \
+     innerhalb von 30 s erneut abgefragt – das Ergebnis kommt als Benachrichtigung. Nicht \
+     abfragen, sondern auf die Benachrichtigung warten (oder die Nutzerin informieren und den \
+     Turn beenden).";
+
+/// Meldet, ob `tool_name` auf das Lesebudget eines Orchestrators zählt.
+///
+/// # Arguments
+/// - `tool_name` (`&str`): der Werkzeugname.
+///
+/// # Returns
+/// `true` für [`ORCHESTRATOR_READ_TOOLS`] und Werkzeuge mit einem Präfix aus
+/// [`ORCHESTRATOR_READ_TOOL_PREFIXES`].
+#[must_use]
+pub fn is_orchestrator_read_tool(tool_name: &str) -> bool {
+    ORCHESTRATOR_READ_TOOLS.contains(&tool_name)
+        || ORCHESTRATOR_READ_TOOL_PREFIXES
+            .iter()
+            .any(|prefix| tool_name.starts_with(prefix))
+}
+
+/// Ergebnis einer sitzungsweiten Wächter-Prüfung **vor** der Ausführung.
+#[derive(Debug)]
+pub enum SessionGuardVerdict {
+    /// Kein Befund; der Aufruf läuft normal.
+    Continue,
+    /// Der Aufruf läuft; `hint` wird an sein Ergebnis angehängt.
+    Warn { event: DriftEvent, hint: String },
+    /// Der Aufruf wird **nicht** ausgeführt; `message` ist sein
+    /// Fehlerergebnis. Der Turn läuft weiter.
+    Deny { event: DriftEvent, message: String },
+}
+
+/// Wächter-Zustand, der über **alle** Turns einer Sitzung lebt.
+///
+/// # Description
+/// Runde 7, Teile A2/A5: [`TurnGuard`] wird pro Turn neu gebaut; das
+/// Lesebudget eines Orchestrators und die Polling-Erkennung für
+/// `agent.status` müssen aber über die ganze (Kind-)Sitzung zählen. Die
+/// Sitzung besitzt deshalb genau einen `SessionGuardState`; der Turn-Loop
+/// befragt ihn vor jeder Werkzeugausführung.
+///
+/// # Concurrency
+/// Kein geteilter Zustand; lebt in der Sitzung und wird nur über `&mut`
+/// verändert.
+#[derive(Debug, Default)]
+pub struct SessionGuardState {
+    orchestrator_reads: u32,
+    status_polls: HashMap<String, std::time::Instant>,
+}
+
+impl SessionGuardState {
+    /// Bisher gezählte Lesezugriffe (einschließlich abgelehnter Versuche).
+    #[must_use]
+    pub fn orchestrator_reads(&self) -> u32 {
+        self.orchestrator_reads
+    }
+
+    /// Zählt einen Lesezugriff eines Orchestrators und entscheidet über ihn.
+    ///
+    /// # Description
+    /// Der Aufrufer stellt sicher, dass die Sitzung eine Orchestrator-Rolle
+    /// hat. Nicht-Lese-Werkzeuge, ein abgeschalteter Wächter und
+    /// `orchestrator_read_limit == 0` ergeben immer
+    /// [`SessionGuardVerdict::Continue`], ohne zu zählen. Sonst gilt für den
+    /// `n`-ten Lesezugriff: `n > limit` → [`SessionGuardVerdict::Deny`] mit
+    /// [`READ_BUDGET_EXHAUSTED_MESSAGE`]; `n >= warn` →
+    /// [`SessionGuardVerdict::Warn`]; sonst `Continue`.
+    ///
+    /// # Arguments
+    /// - `policy` (`&GuardPolicy`): Schwellen der Sitzung.
+    /// - `session_id` (`&harw_types::SessionId`): für das Drift-Ereignis.
+    /// - `tool_name` (`&str`): das angefragte Werkzeug.
+    ///
+    /// # Returns
+    /// Das Verdikt für diesen Aufruf.
+    pub fn observe_orchestrator_read(
+        &mut self,
+        policy: &GuardPolicy,
+        session_id: &harw_types::SessionId,
+        tool_name: &str,
+    ) -> SessionGuardVerdict {
+        if !policy.enabled
+            || policy.orchestrator_read_limit == 0
+            || !is_orchestrator_read_tool(tool_name)
+        {
+            return SessionGuardVerdict::Continue;
+        }
+        self.orchestrator_reads = self.orchestrator_reads.saturating_add(1);
+        let count = self.orchestrator_reads;
+        let limit = policy.orchestrator_read_limit;
+        let event = |detail: String| DriftEvent {
+            kind: DriftKind::ReadBudget,
+            session_id: session_id.to_string(),
+            detail,
+            tool_name: Some(tool_name.to_owned()),
+            child_role: None,
+        };
+        if count > limit {
+            return SessionGuardVerdict::Deny {
+                event: event(format!(
+                    "Lesezugriff {count} über dem Orchestrator-Lesebudget ({limit}) abgelehnt"
+                )),
+                message: format!(
+                    "{READ_BUDGET_EXHAUSTED_MESSAGE}. Bereits {limit} eigene Lesezugriffe; \
+                     Details liefern Explorer/Worker."
+                ),
+            };
+        }
+        if count >= policy.orchestrator_read_warn {
+            return SessionGuardVerdict::Warn {
+                event: event(format!("Lesezugriff {count} von {limit}")),
+                hint: format!(
+                    "[harw-Wächter] Lesezugriff {count} von {limit} – der eigene Überblick ist \
+                     fast ausgeschöpft. Details an Explorer/Worker delegieren (`delegate_wave`)."
+                ),
+            };
+        }
+        SessionGuardVerdict::Continue
+    }
+
+    /// Erkennt `agent.status`-Polling (Runde 7, Teil A5).
+    ///
+    /// # Description
+    /// Merkt sich je `child_id` (ohne Angabe: „alle") den Zeitpunkt der
+    /// letzten Abfrage. Folgt eine weitere Abfrage derselben ID innerhalb von
+    /// [`STATUS_POLL_WINDOW`], gibt es einen Hinweis — der Aufruf selbst läuft
+    /// trotzdem. Andere Werkzeuge und ein abgeschalteter Wächter ergeben
+    /// `Continue`.
+    ///
+    /// # Arguments
+    /// - `policy` (`&GuardPolicy`): Schwellen der Sitzung.
+    /// - `session_id` (`&harw_types::SessionId`): für das Drift-Ereignis.
+    /// - `tool_name` (`&str`): das angefragte Werkzeug.
+    /// - `arguments` (`&serde_json::Value`): seine Argumente.
+    /// - `now` (`std::time::Instant`): der Prüfzeitpunkt.
+    ///
+    /// # Returns
+    /// [`SessionGuardVerdict::Warn`] bei Polling, sonst `Continue`.
+    pub fn observe_status_poll(
+        &mut self,
+        policy: &GuardPolicy,
+        session_id: &harw_types::SessionId,
+        tool_name: &str,
+        arguments: &serde_json::Value,
+        now: std::time::Instant,
+    ) -> SessionGuardVerdict {
+        if !policy.enabled || tool_name != AGENT_STATUS_TOOL_NAME {
+            return SessionGuardVerdict::Continue;
+        }
+        let key = arguments
+            .get("child_id")
+            .and_then(serde_json::Value::as_str)
+            .filter(|id| !id.trim().is_empty() && *id != "null")
+            .unwrap_or("*")
+            .to_owned();
+        self.status_polls
+            .retain(|_, seen| now.saturating_duration_since(*seen) < STATUS_POLL_WINDOW);
+        let polled_recently = self.status_polls.contains_key(&key);
+        self.status_polls.insert(key.clone(), now);
+        if !polled_recently {
+            return SessionGuardVerdict::Continue;
+        }
+        SessionGuardVerdict::Warn {
+            event: DriftEvent {
+                kind: DriftKind::StatusPolling,
+                session_id: session_id.to_string(),
+                detail: format!("`agent.status` für `{key}` binnen 30 s erneut abgefragt"),
+                tool_name: Some(tool_name.to_owned()),
+                child_role: None,
+            },
+            hint: STATUS_POLLING_HINT.to_owned(),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -795,5 +1023,150 @@ mod tests {
             .map_err(ctx("DriftKind::PlanScopeDrift serialisieren"))?;
         assert_eq!(value, serde_json::json!("plan_scope_drift"));
         Ok(())
+    }
+
+    // --- Runde 7, Teile A2/A5 ------------------------------------------
+
+    #[test]
+    fn the_sixth_orchestrator_read_is_denied_after_a_warning_from_the_fourth() -> TestResult {
+        let session_id = sid();
+        let policy = GuardPolicy::default();
+        let mut state = SessionGuardState::default();
+        let tools = [
+            "fs.read",
+            "fs.list",
+            "explore.tree",
+            "fs.grep",
+            "deps.source_read",
+            "fs.read",
+        ];
+        let verdicts: Vec<SessionGuardVerdict> = tools
+            .iter()
+            .map(|tool| state.observe_orchestrator_read(&policy, &session_id, tool))
+            .collect();
+        assert!(matches!(verdicts[0], SessionGuardVerdict::Continue));
+        assert!(matches!(verdicts[2], SessionGuardVerdict::Continue));
+        assert!(matches!(verdicts[3], SessionGuardVerdict::Warn { .. }));
+        assert!(matches!(verdicts[4], SessionGuardVerdict::Warn { .. }));
+        match &verdicts[5] {
+            SessionGuardVerdict::Deny { event, message } => {
+                assert_eq!(event.kind, DriftKind::ReadBudget);
+                assert!(
+                    message.starts_with(READ_BUDGET_EXHAUSTED_MESSAGE),
+                    "{message}"
+                );
+            }
+            other => {
+                return Err(TestError::Unexpected(format!(
+                    "the sixth read must be denied, got {other:?}"
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn non_read_tools_and_a_zero_limit_do_not_touch_the_read_budget() {
+        let session_id = sid();
+        let mut state = SessionGuardState::default();
+        for _ in 0..10 {
+            assert!(matches!(
+                state.observe_orchestrator_read(
+                    &GuardPolicy::default(),
+                    &session_id,
+                    "delegate_wave"
+                ),
+                SessionGuardVerdict::Continue
+            ));
+        }
+        assert_eq!(state.orchestrator_reads(), 0);
+        let off = GuardPolicy {
+            orchestrator_read_limit: 0,
+            ..GuardPolicy::default()
+        };
+        for _ in 0..10 {
+            assert!(matches!(
+                state.observe_orchestrator_read(&off, &session_id, "fs.read"),
+                SessionGuardVerdict::Continue
+            ));
+        }
+    }
+
+    #[test]
+    fn read_tool_classification_covers_the_families() {
+        for tool in [
+            "fs.read",
+            "fs.search",
+            "fs.grep",
+            "fs.glob",
+            "fs.list",
+            "explore.find",
+            "lens.ask",
+            "deps.source_search",
+            "doc.read_pdf",
+        ] {
+            assert!(is_orchestrator_read_tool(tool), "{tool}");
+        }
+        for tool in ["fs.write", "delegate_wave", "agent.status", "shell.exec"] {
+            assert!(!is_orchestrator_read_tool(tool), "{tool}");
+        }
+    }
+
+    #[test]
+    fn agent_status_polling_on_the_same_child_warns_within_thirty_seconds() -> TestResult {
+        let session_id = sid();
+        let policy = GuardPolicy::default();
+        let mut state = SessionGuardState::default();
+        let start = std::time::Instant::now();
+        let args = serde_json::json!({ "child_id": "kind-1" });
+        assert!(matches!(
+            state.observe_status_poll(&policy, &session_id, "agent.status", &args, start),
+            SessionGuardVerdict::Continue
+        ));
+        let other = serde_json::json!({ "child_id": "kind-2" });
+        assert!(matches!(
+            state.observe_status_poll(
+                &policy,
+                &session_id,
+                "agent.status",
+                &other,
+                start + std::time::Duration::from_secs(1)
+            ),
+            SessionGuardVerdict::Continue
+        ));
+        match state.observe_status_poll(
+            &policy,
+            &session_id,
+            "agent.status",
+            &args,
+            start + std::time::Duration::from_secs(5),
+        ) {
+            SessionGuardVerdict::Warn { event, hint } => {
+                assert_eq!(event.kind, DriftKind::StatusPolling);
+                assert!(hint.contains("Benachrichtigung"), "{hint}");
+            }
+            other => {
+                return Err(TestError::Unexpected(format!(
+                    "polling must warn, got {other:?}"
+                )));
+            }
+        }
+        assert!(matches!(
+            state.observe_status_poll(
+                &policy,
+                &session_id,
+                "agent.status",
+                &args,
+                start + std::time::Duration::from_secs(60)
+            ),
+            SessionGuardVerdict::Continue
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn new_drift_kinds_have_stable_keys() {
+        assert_eq!(DriftKind::ReadBudget.key(), "read_budget");
+        assert_eq!(DriftKind::StatusPolling.key(), "status_polling");
     }
 }

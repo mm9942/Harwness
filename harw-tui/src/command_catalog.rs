@@ -361,32 +361,12 @@ const DIARY: &[SubcommandHint] = &[
 ];
 
 /// `/matrix`, Grammatik der Matrix-Game-Operation (`harw-ops/src/matrix`).
+/// Runde 7, Teil M: nur noch Ansicht — Start und Steuerung übernimmt der
+/// Game Master (`matrix-game-master`), den die UIA im Hintergrund startet.
 const MATRIX: &[SubcommandHint] = &[
-    SubcommandHint::new(
-        "start",
-        "<szenario> [--seed N] [--package ID]",
-        "Neues Matrix-Spiel starten",
-    ),
-    SubcommandHint::new("step", "", "Eine Phase weiter"),
-    SubcommandHint::new("auto", "<n>", "N Runden ohne Halt spielen"),
-    SubcommandHint::new("pause", "", "Nach laufenden Aufrufen anhalten"),
-    SubcommandHint::new("inject", "<text…>", "Ereignis einspielen (nächste Phase)"),
-    SubcommandHint::new(
-        "override",
-        "<argument> …",
-        "Adjudikation überschreiben (vor/nach dem Wurf)",
-    ),
-    SubcommandHint::new("veto", "<argument>", "Argument verwerfen (Neuversuch)"),
-    SubcommandHint::new("reveal", "<geheimnis>", "Geheimes Argument offenlegen"),
-    SubcommandHint::new("fork", "<runde>", "Neues Spiel ab Rundenende abzweigen"),
-    SubcommandHint::new("end", "", "Direkt zu Schlussargumenten und AAR"),
-    SubcommandHint::new(
-        "replay",
-        "[--seed <seed>]",
-        "Journal deterministisch nachspielen",
-    ),
     SubcommandHint::new("show", "", "Laufendes Spiel anzeigen (Panel: F9)"),
-    SubcommandHint::new("list", "", "Szenarien und Läufe auflisten"),
+    SubcommandHint::new("list", "", "Szenarien, Entwürfe und Läufe auflisten"),
+    SubcommandHint::new("replay", "", "Journal deterministisch nachprüfen"),
     SubcommandHint::new(
         "compare",
         "<lauf> <lauf> …",
@@ -496,7 +476,7 @@ const HINT_TABLE: &[(&str, &str, &[SubcommandHint])] = &[
     ),
     (
         "matrix",
-        "/matrix [start <szenario>|step|auto <n>|pause|inject|show|end|…]",
+        "/matrix [show|list|replay|compare <lauf> <lauf>] — Start über die UIA (Game Master)",
         MATRIX,
     ),
     (
@@ -754,7 +734,7 @@ pub(crate) fn local_command_specs() -> Vec<CommandSpec> {
             Misc,
             Operator,
             Deferred,
-            "Matrix-Game: Spiel starten, steuern und beobachten (bare: Panel)",
+            "Matrix-Game ansehen (Start und Steuerung über die UIA/Game Master; bare: Panel)",
             "",
         ),
         // Runde 5, Teil F: `/plan` (Plan-Modus an) und `/plan
@@ -888,13 +868,7 @@ mod tests {
         assert_eq!(names("sandbox-lease"), ["status", "revoke"]);
         assert!(names("mode").contains(&"default"));
         assert!(names("tools").contains(&"profile"));
-        assert_eq!(
-            names("matrix"),
-            [
-                "start", "step", "auto", "pause", "inject", "override", "veto", "reveal", "fork",
-                "end", "replay", "show", "list", "compare"
-            ]
-        );
+        assert_eq!(names("matrix"), ["show", "list", "replay", "compare"]);
         assert_eq!(names("dream"), ["list", "show", "run", "status", "review"]);
         assert_eq!(
             names("palace"),

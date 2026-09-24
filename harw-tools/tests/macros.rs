@@ -56,15 +56,24 @@ fn derive_tool_builds_spec() -> TestResult {
         Some("The query string")
     );
     assert_eq!(props["top_k"].schema_type, Some(JsonSchemaType::Integer));
-    assert_eq!(props["tags"].schema_type, Some(JsonSchemaType::Array));
+    // Runde 7, Teil B3: `Option<T>` ist nullable — `anyOf: [<T>, null]`,
+    // die Beschreibung steht außen.
+    assert_eq!(props["tags"].description.as_deref(), Some("Optional tags"));
+    let tags = props["tags"]
+        .any_of
+        .as_ref()
+        .ok_or(TestError::Missing("tags.anyOf"))?;
+    assert_eq!(tags.len(), 2);
+    assert_eq!(tags[0].schema_type, Some(JsonSchemaType::Array));
     assert_eq!(
-        props["tags"]
+        tags[0]
             .items
             .as_ref()
             .ok_or(TestError::Missing("tags.items"))?
             .schema_type,
         Some(JsonSchemaType::String)
     );
+    assert_eq!(tags[1].schema_type, Some(JsonSchemaType::Null));
 
     // `query` is required; `top_k` (default) and `tags` (Option) are not.
     let required = params

@@ -12,9 +12,17 @@
 //!   Hintergrund-Benachrichtigungen (`background_agents`). Bei einer Frage
 //!   nennt der Kontext `agent.message {child_id, text}` als Antwortweg.
 //!
+//! - Runde 7, Teil B6: eine Meldung eines Kindes, dessen Lauf beim Abholen
+//!   schon beendet ist (Journal geschlossen), ist veraltet — der Endbericht
+//!   ist maßgeblich. Sie wird mit „(veraltet – Lauf bereits beendet)“
+//!   gekennzeichnet, löst keinen Auto-Turn aus, und eine Frage verlangt
+//!   keine Antwort mehr.
+//!
 //! # Nebenläufigkeit
 //! Läuft auf dem Thread der Ereignisschleife; liest nur kurz den Eingang des
 //! Spawners.
+
+use harw_core::{ParentMessage, ParentMessageKind};
 
 use super::background_agents::enqueue_background_notice;
 use super::{ChatApp, Role};
@@ -28,15 +36,29 @@ pub(crate) fn collect_parent_messages(app: &mut ChatApp) -> bool {
     let Some(spawner) = app.managed_spawner().cloned() else {
         return false;
     };
-    let messages = spawner.child_comms().take_parent_messages(app.session_id());
+    let comms = spawner.child_comms();
+    let messages = comms.take_parent_messages(app.session_id());
     let any = !messages.is_empty();
     for message in messages {
+        // Runde 7, Teil B6: Lauf schon beendet → veraltet. Ein bereits
+        // verdrängtes Journal (unbekannt) gilt nicht als veraltet.
+        let stale = comms
+            .journal(&message.child)
+            .is_some_and(|journal| !journal.is_running());
         tracing::info!(
             child = %message.child,
             kind = message.kind.as_str(),
+            stale,
             "tui.parent_message.received"
         );
-        app.push_line(Role::System, message.display_line());
+        if stale {
+            app.push_line(
+                Role::System,
+                format!("{STALE_MARK} {}", message.display_line()),
+            );
+        } else {
+            app.push_line(Role::System, message.display_line());
+        }
         // Runde 6, Teil C: die volle Meldung (nicht nur der Anzeigeauszug)
         // als Agenten-Eintrag in den Export.
         super::export_capture::export_agent_event(
@@ -49,9 +71,35 @@ pub(crate) fn collect_parent_messages(app: &mut ChatApp) -> bool {
                 summary: Some(message.text.clone()),
             },
         );
-        enqueue_background_notice(app, message.to_model_text(), true);
+        if stale {
+            enqueue_background_notice(app, stale_model_text(&message), false);
+        } else {
+            enqueue_background_notice(app, message.to_model_text(), true);
+        }
     }
     any
+}
+
+/// Kennzeichnung veralteter Kind-Meldungen (Runde 7, Teil B6).
+const STALE_MARK: &str = "(veraltet – Lauf bereits beendet)";
+
+/// Modelltext einer veralteten Meldung: gekennzeichnet, ohne Antwortaufforderung.
+///
+/// # Arguments
+/// - `message` (`&ParentMessage`): die Meldung eines schon beendeten Kindes.
+///
+/// # Returns
+/// Den Kontexttext für den nächsten UIA-Turn.
+fn stale_model_text(message: &ParentMessage) -> String {
+    let what = match message.kind {
+        ParentMessageKind::Info => "Nachricht",
+        ParentMessageKind::Question => "Frage",
+    };
+    format!(
+        "[{what} von {} ({}) {STALE_MARK}] {}\nDer Lauf ist bereits beendet; maßgeblich ist \
+         sein Endbericht. Nicht beantworten.",
+        message.role, message.child, message.text
+    )
 }
 
 #[cfg(test)]
@@ -166,6 +214,32 @@ mod tests {
         assert!(turn.contains("[Frage von root-orchestrator"), "{turn}");
         assert!(turn.contains("agent.message"), "{turn}");
         assert!(turn.contains(child.as_str()), "{turn}");
+        Ok(())
+    }
+
+    /// Runde 7, Teil B6: eine Meldung, die erst nach dem Ende des Laufs
+    /// abgeholt wird, ist als veraltet gekennzeichnet, weckt die UIA nicht
+    /// und verlangt keine Antwort.
+    #[test]
+    fn a_message_of_a_finished_run_is_marked_stale() -> TestResult {
+        let root = SessionId::new();
+        let (mut app, spawner) = app_with_spawner(&root)?;
+        let child = SessionId::new();
+        let comms = spawner.child_comms();
+        comms.open_journal(&child, &root, "root-orchestrator", Some("Umsetzen"));
+        let _pending = comms
+            .ask_parent(&child, &root, "root-orchestrator", "Tabelle A oder B?")
+            .map_err(TestError::Unexpected)?;
+        comms.close_journal(&child);
+        assert!(collect_parent_messages(&mut app));
+        assert!(
+            take_auto_turn(&mut app).is_none(),
+            "veraltete Meldung löst keinen Auto-Turn aus"
+        );
+        let turn = attach_queued_notices(&mut app, String::new());
+        assert!(turn.contains("veraltet – Lauf bereits beendet"), "{turn}");
+        assert!(turn.contains("Nicht beantworten"), "{turn}");
+        assert!(!turn.contains("wartet auf eine Antwort"), "{turn}");
         Ok(())
     }
 }

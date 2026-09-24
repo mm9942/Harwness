@@ -4,6 +4,8 @@
 
 **Warum:** Ein LaTeX-Lauf bricht beim ersten harten Fehler ab. Die Meldung zeigt oft auf eine Folgezeile statt auf die Ursache. Wer vorher statisch prüft, spart Build-Runden und liefert der Nutzerin Quellen, die beim ersten Versuch durchlaufen.
 
+> **Berichte, Business-Paper, Handbücher:** zuerst die mitgelieferte Vorlage nutzen (Skill `latex-report`, Werkzeug `latex.template`). Vor dem ersten Build prüft `latex.check`, ob Klasse, Pakete, Schriften und Sprache in der Sandbox vorhanden sind.
+
 > Diese Anleitung ist in eigenen Worten geschrieben. Sie beschreibt Handwerk und übernimmt keine Handbuchtexte. Genaue Optionen eines Pakets stehen in dessen Dokumentation (`texdoc <paket>` auf dem Rechner der Nutzerin).
 
 ## Wann anwenden
@@ -87,7 +89,7 @@
 
 ## 3. Deutsch und Typografie
 
-- **Sprache:** mit XeLaTeX/LuaLaTeX `\usepackage[ngerman]{babel}` (heute die Empfehlung) oder `\usepackage{polyglossia}` mit `\setdefaultlanguage[spelling=new]{german}`. Nicht beides laden. Mit pdfLaTeX zusätzlich `\usepackage[T1]{fontenc}`; `inputenc` ist seit 2018 unnötig.
+- **Sprache:** robuste Vorgabe ist `\usepackage{babel}` plus `\babelprovide[import,main]{german}` (bzw. `{english}`). Das lädt die Sprache aus babels `.ini`-Dateien und braucht kein `ngerman.ldf`, das auf schlanken TeX-Installationen oft fehlt (Folge sonst: Abbruch oder englische Trennung im deutschen Text). `\usepackage[ngerman]{babel}` geht, wenn `texlive-lang-german` installiert ist; `polyglossia` ist die Alternative. Nicht babel und polyglossia zusammen laden. Mit pdfLaTeX zusätzlich `\usepackage[T1]{fontenc}`; `inputenc` ist seit 2018 unnötig.
 - **KOMA-Script:** `scrartcl` (Artikel, Paper), `scrreprt` (Thesis ohne Doppelseite-Logik), `scrbook` (Buch, doppelseitig). Nützliche Optionen: `paper=a4`, `fontsize=11pt`, `parskip=half` (Absatz mit Abstand statt Einzug), `DIV=12` (Satzspiegel), `bibliography=totoc`, `listof=totoc`.
 - **microtype:** `\usepackage{microtype}` verbessert den Randausgleich und reduziert Trennungen. Immer laden.
 - **Anführungszeichen:** `\usepackage[autostyle]{csquotes}` und `\enquote{…}`. Nie `"` oder ASCII-Anführungen von Hand setzen.
@@ -110,7 +112,8 @@
 
 ```latex
 \documentclass[paper=a4, fontsize=11pt, parskip=half]{scrartcl}
-\usepackage[ngerman]{babel}
+\usepackage{babel}
+\babelprovide[import,main]{german}
 \usepackage{microtype, csquotes, graphicx, booktabs}
 \usepackage[backend=biber, style=authoryear]{biblatex}
 \addbibresource{literatur.bib}
@@ -173,7 +176,7 @@ $out_dir = 'build';         # Hilfsdateien getrennt ablegen (optional)
 $clean_ext = 'bbl run.xml';
 ```
 
-**Kompilier-Hinweis für die Nutzerin:** `latexmk -xelatex main.tex` (bzw. `-pdf` für pdfLaTeX, `-lualatex` für LuaLaTeX) im Verzeichnis der Hauptdatei. Als Alternative ohne TeX-Installation lädt `tectonic main.tex` die Pakete bei Bedarf selbst. Aufräumen: `latexmk -c`.
+**Kompilier-Hinweis für die Nutzerin:** `latexmk -xelatex main.tex` (bzw. `-pdf` für pdfLaTeX, `-lualatex` für LuaLaTeX) im Verzeichnis der Hauptdatei. Ohne latexmk: `xelatex main.tex` zweimal, mit Literatur `xelatex main`, `biber main`, `xelatex main`, `xelatex main`. Als Alternative ohne TeX-Installation lädt `tectonic main.tex` die Pakete bei Bedarf selbst. Aufräumen: `latexmk -c`.
 
 ## 7. Häufige Log-Fehler und ihre Ursache
 
@@ -229,5 +232,7 @@ Mit den Datei-Werkzeugen (lesen, suchen) jede geänderte Datei durchgehen. Komme
 
 6. **Sonderzeichen im Fließtext:** `&`, `%`, `#`, `_`, `$`, `~`, `^` außerhalb von Mathematik und Befehlen maskieren (`\&`, `\%` …). Das betrifft besonders URLs, Dateinamen und Firmennamen.
 7. **Dateien:** Alle Pfade aus `\input`, `\include`, `\includegraphics`, `\addbibresource` müssen im Workspace existieren (relativ zur Hauptdatei). Bei Grafiken ohne Endung prüfen, ob `.pdf` oder `.png` vorhanden ist.
+
+8. **Installation:** Vor dem ersten Build `latex.check` auf die Hauptdatei anwenden. Meldet es fehlende Pakete oder Schriften, die `user_message` an die Nutzerin weitergeben und eine vorhandene Alternative wählen, statt auf gut Glück zu bauen.
 
 Das Ergebnis dieser Prüfung kommt in die Übergabe: „statisch geprüft: Klammern/Umgebungen ok, 14 Verweise ok, 9 Zitate ok, Pakete vollständig“ oder die konkreten Befunde mit Datei und Zeile.

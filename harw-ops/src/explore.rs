@@ -502,8 +502,9 @@ pub(crate) fn finding_output(
     command(path = "/explore", visibility = "channel_parity"),
     model_tool(readonly, approval = "none"),
     // Web-Fläche übernimmt dieselbe Achse wie das ModelTool: der Kindagent
-    // läuft mit `reduce_to_read_only`-Autorität, die Operation selbst
-    // schreibt nichts.
+    // läuft mit `reduce_to_read_explore`-Autorität (Workspace lesen,
+    // Registry-Quellen lesen und Netz — Netz nur, wenn der Elternteil es
+    // selbst trägt); die Operation selbst schreibt nichts.
     web(path = "/api/explore", method = "get", approval = "none"),
     agent_tool(
         child = "explorer",

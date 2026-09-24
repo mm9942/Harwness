@@ -342,6 +342,8 @@ pub static FIELD_TABLE: &[FieldScope] = &[
     // 1.11 [permissions] (7)
     FieldScope { path: "permissions.default_mode", scope: Scope::Global, merge: MergeRule::StricterOf, ordering: Some(PERMISSIONS_DEFAULT_MODE_ORDER), intersection_key: None, security_critical: true },
     FieldScope { path: "permissions.approval_timeout_secs", scope: Scope::Global, merge: MergeRule::MinBound, ordering: None, intersection_key: None, security_critical: true },
+    // Runde 7, Teil L4: Zeitlimit des Auto-Modus-Klassifizierers.
+    FieldScope { path: "permissions.auto_classifier_timeout_secs", scope: Scope::Global, merge: MergeRule::MinBound, ordering: None, intersection_key: None, security_critical: true },
     FieldScope { path: "permissions.allow", scope: Scope::Global, merge: MergeRule::Intersection, ordering: None, intersection_key: None, security_critical: true },
     FieldScope { path: "permissions.deny", scope: Scope::Global, merge: MergeRule::Union, ordering: None, intersection_key: None, security_critical: true },
     FieldScope { path: "permissions.extra_roots", scope: Scope::Global, merge: MergeRule::Intersection, ordering: None, intersection_key: None, security_critical: true },
@@ -381,13 +383,16 @@ pub static FIELD_TABLE: &[FieldScope] = &[
     FieldScope { path: "reasoning.sub_orchestrator", scope: Scope::Profile, merge: MergeRule::ProfileReplaces, ordering: None, intersection_key: None, security_critical: false },
     FieldScope { path: "reasoning.worker_complex", scope: Scope::Profile, merge: MergeRule::ProfileReplaces, ordering: None, intersection_key: None, security_critical: false },
     FieldScope { path: "reasoning.worker_simple", scope: Scope::Profile, merge: MergeRule::ProfileReplaces, ordering: None, intersection_key: None, security_critical: false },
-    // 1.16 [guards] (6)
+    // 1.16 [guards] (8)
     FieldScope { path: "guards.enabled", scope: Scope::Global, merge: MergeRule::OrBool, ordering: None, intersection_key: None, security_critical: false },
     FieldScope { path: "guards.repeated_failure_warn", scope: Scope::Global, merge: MergeRule::MinBound, ordering: None, intersection_key: None, security_critical: false },
     FieldScope { path: "guards.repeated_failure_abort", scope: Scope::Global, merge: MergeRule::MinBound, ordering: None, intersection_key: None, security_critical: false },
     FieldScope { path: "guards.no_progress_rounds_warn", scope: Scope::Global, merge: MergeRule::MinBound, ordering: None, intersection_key: None, security_critical: false },
     FieldScope { path: "guards.no_progress_rounds_abort", scope: Scope::Global, merge: MergeRule::MinBound, ordering: None, intersection_key: None, security_critical: false },
     FieldScope { path: "guards.plan_stale_rounds", scope: Scope::Global, merge: MergeRule::MinBound, ordering: None, intersection_key: None, security_critical: false },
+    // Runde 7, Teil A2: Orchestrator-Lesebudget; ein Profil darf nur verengen.
+    FieldScope { path: "guards.orchestrator_read_warn", scope: Scope::Global, merge: MergeRule::MinBound, ordering: None, intersection_key: None, security_critical: false },
+    FieldScope { path: "guards.orchestrator_read_limit", scope: Scope::Global, merge: MergeRule::MinBound, ordering: None, intersection_key: None, security_critical: false },
     // 1.17 [knowledge] (1) — Plan D3: Diary-Aufbewahrung; kein Sicherheitsbezug
     // (die Wartung verschiebt ins Rollup, sie löscht nichts).
     FieldScope { path: "knowledge.diary.retention_days", scope: Scope::Profile, merge: MergeRule::ProfileReplaces, ordering: None, intersection_key: None, security_critical: false },
@@ -434,7 +439,9 @@ mod merge_rule_tests {
         // Runde 5, Teil I: +1 für `tui.child_stream`.
         // Runde 5, Teil K: +4 für `agents.*`.
         // Runde 5, Teil N: +1 für `shell.max_timeout_secs`.
-        assert_eq!(FIELD_TABLE.len(), 111);
+        // Runde 7, Teil A2: +2 für `guards.orchestrator_read_*`.
+        // Runde 7, Teil L4: +1 für `permissions.auto_classifier_timeout_secs`.
+        assert_eq!(FIELD_TABLE.len(), 114);
     }
 
     #[test]
@@ -454,7 +461,9 @@ mod merge_rule_tests {
         assert_eq!(count(MergeRule::ProfileReplaces), 57);
         assert_eq!(count(MergeRule::GlobalOnly), 11);
         // Runde 5, Teil K: +4 (`agents.*`); Teil N: +1 (`shell.max_timeout_secs`).
-        assert_eq!(count(MergeRule::MinBound), 18);
+        // Runde 7: Teil A2 +2 (`guards.orchestrator_read_*`), Teil L4 +1
+        // (`permissions.auto_classifier_timeout_secs`).
+        assert_eq!(count(MergeRule::MinBound), 21);
         assert_eq!(count(MergeRule::CompositeMember), 11);
         assert_eq!(count(MergeRule::Intersection), 4);
         assert_eq!(count(MergeRule::OrBool), 3);

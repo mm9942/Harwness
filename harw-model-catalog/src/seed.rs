@@ -96,18 +96,36 @@ fn provider_toml_from(spec: &ProviderSpec) -> ProviderToml {
         api: api_name(spec),
         base_url: spec.base_url.clone(),
         auth: env_auth_ref(spec),
-        auth_header: None,
+        // Runde 7, Teil L1: lokale Endpunkte brauchen keinen Schlüssel.
+        auth_header: is_local_spec(spec).then(|| "none".to_owned()),
         api_key: None,
         headers: std::collections::HashMap::new(),
         models: spec.models.clone(),
         enabled: false,
         origin_allowlist: OriginAllowlistToml::default(),
         rate_limit: None,
-        max_concurrency: None,
+        // Runde 7, Teil L5: ein lokales Modell bedient Anfragen nacheinander.
+        max_concurrency: is_local_spec(spec).then_some(1),
         originator: None,
         default_reasoning_effort: None,
         gateway_identity_headers: false,
+        request_timeout_secs: None,
+        stream_idle_timeout_secs: None,
+        retry_timeouts: None,
+        max_tokens_field: None,
+        send_reasoning_effort: None,
+        strict_tools: None,
+        parallel_tool_calls: None,
+        allow_insecure_lan: false,
     }
+}
+
+/// Runde 7, Teil L1: `true` für Katalogeinträge mit
+/// [`AuthMethod::LocalBaseUrl`] (Ollama, LM Studio, vLLM).
+fn is_local_spec(spec: &ProviderSpec) -> bool {
+    spec.auth
+        .iter()
+        .any(|method| matches!(method, AuthMethod::LocalBaseUrl))
 }
 
 /// Liefert den serde-Namen des Transports (`"openai-responses"`, …).
@@ -228,7 +246,7 @@ mod tests {
 
         seed_profile_providers(&profile)?;
 
-        for id in ["ollama", "lmstudio", "custom", "cf-worker"] {
+        for id in ["ollama", "lmstudio", "vllm", "custom", "cf-worker"] {
             let provider: ProviderToml = toml::from_str(&std::fs::read_to_string(
                 profile.join("providers").join(format!("{id}.toml")),
             )?)?;
@@ -237,6 +255,37 @@ mod tests {
                 "{id} sollte keine auth-Referenz tragen"
             );
         }
+
+        std::fs::remove_dir_all(&profile)?;
+        Ok(())
+    }
+
+    /// Runde 7, Teil L1/L5: lokale Provider werden ohne Auth-Header und mit
+    /// `max_concurrency = 1` geseedet; `custom` bleibt unverändert.
+    #[test]
+    fn test_local_providers_are_seeded_keyless_and_serial() -> TestResult {
+        let profile = temporary_profile()?;
+
+        seed_profile_providers(&profile)?;
+
+        for id in ["ollama", "lmstudio", "vllm"] {
+            let provider: ProviderToml = toml::from_str(&std::fs::read_to_string(
+                profile.join("providers").join(format!("{id}.toml")),
+            )?)?;
+            assert_eq!(provider.auth_header.as_deref(), Some("none"), "{id}");
+            assert_eq!(provider.max_concurrency, Some(1), "{id}");
+            assert!(provider.is_local(), "{id} muss als lokal gelten");
+        }
+        let vllm: ProviderToml = toml::from_str(&std::fs::read_to_string(
+            profile.join("providers").join("vllm.toml"),
+        )?)?;
+        assert_eq!(vllm.base_url, "http://localhost:8000/v1");
+        assert_eq!(vllm.api, "openai-chat");
+        let custom: ProviderToml = toml::from_str(&std::fs::read_to_string(
+            profile.join("providers").join("custom.toml"),
+        )?)?;
+        assert_eq!(custom.auth_header, None);
+        assert_eq!(custom.max_concurrency, None);
 
         std::fs::remove_dir_all(&profile)?;
         Ok(())

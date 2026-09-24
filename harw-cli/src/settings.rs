@@ -93,6 +93,9 @@ pub enum SettingsError {
     InvalidBaseUrl(String),
     /// `--auth` war ein Klartext-Wert statt einer Secret-Referenz.
     PlaintextAuthRejected { name: String },
+    /// Runde 7, Teil L1: `--auth` zusammen mit `--no-auth` bzw.
+    /// `--auth-header none`.
+    ConflictingAuth { name: String },
     /// Ein ungültiger Freigabemodus wurde übergeben.
     InvalidMode { mode: String },
     /// Ein Regel-Index lag außerhalb der aktuellen Liste.
@@ -131,6 +134,10 @@ impl fmt::Display for SettingsError {
             Self::PlaintextAuthRejected { name } => write!(
                 f,
                 "--auth für Provider {name:?} muss eine Secret-Referenz sein (env:VAR, secrets:NAME, …), kein Klartext-Schlüssel; benutze `harw auth`, um Credentials sicher abzulegen"
+            ),
+            Self::ConflictingAuth { name } => write!(
+                f,
+                "Provider {name:?}: `--auth` widerspricht `--no-auth` bzw. `--auth-header none`; entweder einen Schlüssel angeben oder keinen"
             ),
             Self::InvalidMode { mode } => write!(
                 f,
@@ -311,7 +318,14 @@ fn run_provider(home: &Path, action: SettingsProviderAction) -> Result<(), Setti
             base_url,
             auth,
             models,
+            auth_header,
+            no_auth,
+            allow_insecure_lan,
         } => {
+            let options = ProviderAddOptions::default()
+                .with_auth_header(auth_header)
+                .with_no_auth(no_auth)
+                .with_allow_insecure_lan(allow_insecure_lan);
             add_provider(
                 home,
                 &name,
@@ -319,6 +333,7 @@ fn run_provider(home: &Path, action: SettingsProviderAction) -> Result<(), Setti
                 &base_url,
                 auth.as_deref(),
                 models,
+                &options,
             )?;
             print_validation_result(home);
             Ok(())
@@ -408,7 +423,49 @@ fn write_provider(home: &Path, provider: &ProviderToml) -> Result<(), SettingsEr
     write_atomic(&path, rendered.as_bytes())
 }
 
-#[allow(clippy::too_many_arguments)]
+/// Runde 7, Teil L1/L8: Zusatzoptionen von `harw provider add`.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct ProviderAddOptions {
+    /// Ausdrücklicher Credential-Transport (`bearer`/`x-api-key`/`api-key`/`none`).
+    auth_header: Option<String>,
+    /// `--no-auth`: kein Schlüssel, `auth_header = "none"`.
+    no_auth: bool,
+    /// `--allow-insecure-lan`: `http` zu privaten LAN-IPs erlauben.
+    allow_insecure_lan: bool,
+}
+
+impl ProviderAddOptions {
+    /// Setzt den Credential-Transport (`None` = Vorgabe).
+    #[must_use]
+    pub(crate) fn with_auth_header(mut self, auth_header: Option<impl Into<String>>) -> Self {
+        self.auth_header = auth_header.map(Into::into);
+        self
+    }
+
+    /// Schaltet `--no-auth`.
+    #[must_use]
+    pub(crate) fn with_no_auth(mut self, no_auth: bool) -> Self {
+        self.no_auth = no_auth;
+        self
+    }
+
+    /// Schaltet `--allow-insecure-lan`.
+    #[must_use]
+    pub(crate) fn with_allow_insecure_lan(mut self, allow_insecure_lan: bool) -> Self {
+        self.allow_insecure_lan = allow_insecure_lan;
+        self
+    }
+}
+
+/// Legt `providers/<name>.toml` an bzw. überschreibt sie.
+///
+/// Runde 7, Teil L1/L5: Für lokale Endpunkte (Loopback bzw. LAN mit
+/// `--allow-insecure-lan`) ohne `--auth` wird `auth_header = "none"`
+/// geschrieben und `max_concurrency = 1` vorbelegt.
+///
+/// # Errors
+/// Ungültiger Name, unbekannte API, abgelehnte Basis-URL, Klartext-`--auth`,
+/// widersprüchliche Auth-Angaben oder ein Schreibfehler.
 fn add_provider(
     home: &Path,
     name: &str,
@@ -416,6 +473,7 @@ fn add_provider(
     base_url: &str,
     auth: Option<&str>,
     models: Vec<String>,
+    options: &ProviderAddOptions,
 ) -> Result<(), SettingsError> {
     validate_provider_name(name)?;
     if !matches!(
@@ -426,11 +484,21 @@ fn add_provider(
             api: api.to_owned(),
         });
     }
-    harw_provider_http::validate_endpoint(base_url)
+    harw_provider_http::validate_endpoint_with(base_url, options.allow_insecure_lan)
         .map_err(|error| SettingsError::InvalidBaseUrl(error.to_string()))?;
     let auth_ref = parse_auth_ref(name, auth)?;
+    let auth_header = if options.no_auth {
+        Some("none".to_owned())
+    } else {
+        options.auth_header.clone()
+    };
+    if auth_ref.is_some() && auth_header.as_deref() == Some("none") {
+        return Err(SettingsError::ConflictingAuth {
+            name: name.to_owned(),
+        });
+    }
 
-    let provider = ProviderToml {
+    let mut provider = ProviderToml {
         stream: None,
         name: name.to_owned(),
         api: api.to_owned(),
@@ -447,7 +515,22 @@ fn add_provider(
         max_concurrency: None,
         default_reasoning_effort: None,
         gateway_identity_headers: false,
+        request_timeout_secs: None,
+        stream_idle_timeout_secs: None,
+        retry_timeouts: None,
+        max_tokens_field: None,
+        send_reasoning_effort: None,
+        strict_tools: None,
+        parallel_tool_calls: None,
+        allow_insecure_lan: options.allow_insecure_lan,
     };
+    provider.auth_header = auth_header;
+    if provider.is_local() {
+        if provider.auth.is_none() && provider.auth_header.is_none() {
+            provider.auth_header = Some("none".to_owned());
+        }
+        provider.max_concurrency = Some(1);
+    }
     write_provider(home, &provider)
 }
 
@@ -955,6 +1038,7 @@ fn interactive_add_provider(home: &Path) -> Result<(), SettingsError> {
             &base_url,
             auth.as_deref(),
             models.clone(),
+            &ProviderAddOptions::default(),
         )
     })?;
     print_validation_result(home);
@@ -1190,6 +1274,7 @@ mod tests {
             "https://api.acme.test/v1",
             Some("sk-plain"),
             vec![],
+            &ProviderAddOptions::default(),
         );
         let Err(error) = result else {
             return Err(TestError::Unexpected(
@@ -1198,6 +1283,103 @@ mod tests {
         };
         assert!(matches!(error, SettingsError::PlaintextAuthRejected { .. }));
         assert!(error.to_string().contains("harw auth"));
+        Ok(())
+    }
+
+    /// Runde 7, Teil L1/L5: `--no-auth` schreibt `auth_header = "none"`;
+    /// ein Loopback-Provider bekommt `max_concurrency = 1` und baut danach
+    /// ohne Schlüssel.
+    #[test]
+    fn test_add_provider_no_auth_for_local_vllm() -> TestResult {
+        let (_guard, home) = temp_home()?;
+        add_provider(
+            &home,
+            "vllm",
+            "openai-chat",
+            "http://localhost:8000/v1",
+            None,
+            vec!["qwen3".to_owned()],
+            &ProviderAddOptions::default().with_no_auth(true),
+        )
+        .map_err(ctx("add local provider"))?;
+        let provider = read_provider(&home, "vllm").map_err(ctx("read provider"))?;
+        assert_eq!(provider.auth, None);
+        assert_eq!(provider.auth_header.as_deref(), Some("none"));
+        assert_eq!(provider.max_concurrency, Some(1));
+
+        let mut config = harw_config::ResolvedConfig::default();
+        config.harness.default_provider = Some("vllm".to_owned());
+        config.harness.default_model = Some("qwen3".to_owned());
+        config.providers.insert("vllm".to_owned(), provider);
+        harw_provider_http::build_provider(&config).map_err(ctx("keyless provider builds"))?;
+
+        // Ohne `--no-auth` wirkt dieselbe Vorgabe für Loopback ohne `--auth`.
+        add_provider(
+            &home,
+            "lmstudio",
+            "openai-chat",
+            "http://127.0.0.1:1234/v1",
+            None,
+            vec![],
+            &ProviderAddOptions::default(),
+        )
+        .map_err(ctx("add lmstudio"))?;
+        let lmstudio = read_provider(&home, "lmstudio").map_err(ctx("read lmstudio"))?;
+        assert_eq!(lmstudio.auth_header.as_deref(), Some("none"));
+        Ok(())
+    }
+
+    #[test]
+    fn test_add_provider_auth_header_and_conflicts() -> TestResult {
+        let (_guard, home) = temp_home()?;
+        add_provider(
+            &home,
+            "gw",
+            "openai-chat",
+            "https://gw.example/v1",
+            Some("env:GW_KEY"),
+            vec![],
+            &ProviderAddOptions::default().with_auth_header(Some("x-api-key")),
+        )
+        .map_err(ctx("add gateway"))?;
+        let gateway = read_provider(&home, "gw").map_err(ctx("read gateway"))?;
+        assert_eq!(gateway.auth_header.as_deref(), Some("x-api-key"));
+        assert_eq!(gateway.max_concurrency, None);
+
+        let result = add_provider(
+            &home,
+            "bad",
+            "openai-chat",
+            "http://localhost:8000/v1",
+            Some("env:X"),
+            vec![],
+            &ProviderAddOptions::default().with_no_auth(true),
+        );
+        assert!(matches!(result, Err(SettingsError::ConflictingAuth { .. })));
+
+        let lan = add_provider(
+            &home,
+            "lan",
+            "openai-chat",
+            "http://192.168.1.20:8000/v1",
+            None,
+            vec![],
+            &ProviderAddOptions::default(),
+        );
+        assert!(matches!(lan, Err(SettingsError::InvalidBaseUrl(_))));
+        add_provider(
+            &home,
+            "lan",
+            "openai-chat",
+            "http://192.168.1.20:8000/v1",
+            None,
+            vec![],
+            &ProviderAddOptions::default().with_allow_insecure_lan(true),
+        )
+        .map_err(ctx("LAN with opt-in"))?;
+        let lan = read_provider(&home, "lan").map_err(ctx("read lan"))?;
+        assert!(lan.allow_insecure_lan);
+        assert_eq!(lan.max_concurrency, Some(1));
         Ok(())
     }
 
@@ -1211,6 +1393,7 @@ mod tests {
             "https://api.acme.test/v1",
             None,
             vec![],
+            &ProviderAddOptions::default(),
         );
         let Err(error) = result else {
             return Err(TestError::Unexpected(
@@ -1231,6 +1414,7 @@ mod tests {
             "https://api.acme.test/v1",
             None,
             vec![],
+            &ProviderAddOptions::default(),
         );
         let Err(error) = result else {
             return Err(TestError::Unexpected(
@@ -1251,6 +1435,7 @@ mod tests {
             "https://api.acme.test/v1",
             Some("env:ACME_KEY"),
             vec!["acme-large".to_owned()],
+            &ProviderAddOptions::default(),
         )
         .map_err(ctx("add provider"))?;
 

@@ -51,6 +51,7 @@ use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::sync::Arc;
+use std::task::Poll;
 use std::time::Duration;
 
 use harw_authority::{PermissionRequest, SandboxSpec, WorkspaceRegistration, WorkspaceRegistry};
@@ -69,12 +70,12 @@ use harw_matrix_game::phases::{
     ArgumentBox, ContractKind, CounterArgument, EffectOp, ExpectedCall, NegotiationRequest, Phase,
     PhaseConfig, PhaseOutput, PhaseStep, PlayerDebrief, RedCellObjection, RoundArgument,
     RoundCursor, UmpireAdjudication, UmpireNarration, UmpireRuling, UmpireSynthesis, Verdict,
-    apply_inject, close_negotiation, close_round, end_game, enter_phase, expected_calls,
-    open_channels, open_game, post_messages, record_briefing, record_narration, record_standing,
-    resolve_argument, reveal_round, reveal_secret, submit_counters, submit_red_cell,
-    validate_counter_argument, validate_negotiation_messages, validate_negotiation_request,
-    validate_player_argument, validate_red_cell_objection, validate_umpire_adjudication,
-    validate_umpire_narration,
+    apply_inject, close_negotiation, close_round_with_market, end_game, enter_phase,
+    expected_calls, open_channels, open_game, post_messages, record_briefing, record_narration,
+    record_standing, resolve_adjudication, reveal_round, reveal_secret, submit_counters,
+    submit_red_cell, validate_counter_argument, validate_negotiation_messages,
+    validate_negotiation_request, validate_player_argument, validate_red_cell_objection,
+    validate_umpire_adjudication, validate_umpire_narration,
 };
 use harw_matrix_game::prompts::{self, SeatRole};
 use harw_matrix_game::scenario::{
@@ -113,6 +114,16 @@ const SEAT_SLOT_WAIT: Duration = Duration::from_secs(120);
 
 /// Reparaturversuche nach einer ungültigen Antwort (danach `Forfeit`).
 const REPAIR_ATTEMPTS: u32 = 1;
+
+/// Hartes Zeitlimit eines Sitz-Aufrufs (Runde 7, Teil M): Admission-Warten
+/// ([`SEAT_SLOT_WAIT`]) plus Turn-Budget (300 s) plus Reserve. Danach gilt
+/// der Sitz für diesen Aufruf als gepasst, sein Kind wird abgebrochen und
+/// freigegeben — ein hängender Sitz (z. B. eine nie beantwortete Freigabe)
+/// blockiert den Lauf nicht mehr.
+pub const SEAT_TURN_TIMEOUT: Duration = Duration::from_secs(480);
+
+/// Dateiname des paper-tauglichen Berichts im Laufverzeichnis (Runde 7, Teil M4).
+pub const REPORT_FILE: &str = "report.md";
 
 /// Sitz-Schlüssel des Umpires in `views`/`seats`.
 pub const UMPIRE_KEY: &str = "umpire";
@@ -232,6 +243,11 @@ pub trait SeatDriver: Send {
     /// Gibt alle gehaltenen Sitze frei (Spielende).
     fn release_all(&mut self) {}
 
+    /// Bricht den laufenden Aufruf eines Sitzes ab und vergisst ihn
+    /// (Zeitlimit oder Abbruch des Laufs, Runde 7 Teil M); der nächste
+    /// Aufruf startet ein frisches Kind.
+    fn abandon(&mut self, _seat_key: &str) {}
+
     /// Hinweise seit dem letzten Aufruf (z. B. Unterlagen nicht einsehbar);
     /// der Runner journalisiert sie für den Beobachter.
     fn take_warnings(&mut self) -> Vec<String> {
@@ -282,7 +298,7 @@ impl SpawnerDriver {
     pub fn from_ctx(ctx: &OpContext) -> Result<Self, OpError> {
         let spawner = ctx.managed_spawner().ok_or_else(|| {
             OpError::NotAvailable(
-                "kein Agent-Spawner in diesem Kontext — /matrix step braucht die Slash-Oberfläche einer Sitzung"
+                "kein Agent-Spawner in diesem Kontext — Matrix-Games laufen über den Game Master (matrix-game-master)"
                     .to_owned(),
             )
         })?;
@@ -435,9 +451,57 @@ impl SeatDriver for SpawnerDriver {
         }
     }
 
+    fn abandon(&mut self, seat_key: &str) {
+        if let Some(child) = self.children.get(seat_key) {
+            let requested = self.spawner.request_cancellation(child);
+            tracing::info!(child = %child, requested, "matrix.seat_abandoned");
+        }
+        self.forget(seat_key);
+    }
+
     fn take_warnings(&mut self) -> Vec<String> {
         std::mem::take(&mut self.warnings)
     }
+}
+
+/// Ausgang eines bewachten Sitz-Aufrufs.
+#[derive(Debug)]
+enum Guarded<T> {
+    /// Antwort liegt vor.
+    Done(T),
+    /// Zeitlimit überschritten.
+    TimedOut,
+    /// Lauf abgebrochen.
+    Cancelled,
+}
+
+/// Wartet auf `future`, höchstens `limit` lang und nur bis `cancel`
+/// ausgelöst wird (Runde 7, Teil M). Ohne Token zählt nur das Zeitlimit.
+async fn guarded<F, T>(future: F, limit: Duration, cancel: Option<&CancelToken>) -> Guarded<T>
+where
+    F: Future<Output = T>,
+{
+    let mut future = std::pin::pin!(future);
+    let mut sleep = std::pin::pin!(tokio::time::sleep(limit));
+    let mut cancelled = std::pin::pin!(async move {
+        match cancel {
+            Some(token) => token.cancelled().await,
+            None => std::future::pending::<()>().await,
+        }
+    });
+    std::future::poll_fn(|cx| {
+        if let Poll::Ready(value) = future.as_mut().poll(cx) {
+            return Poll::Ready(Guarded::Done(value));
+        }
+        if cancelled.as_mut().poll(cx).is_ready() {
+            return Poll::Ready(Guarded::Cancelled);
+        }
+        if sleep.as_mut().poll(cx).is_ready() {
+            return Poll::Ready(Guarded::TimedOut);
+        }
+        Poll::Pending
+    })
+    .await
 }
 
 /// Live-Event-Senke eines Laufs (nur gesetzt, wenn der Kontext einen Hub trägt).
@@ -495,6 +559,16 @@ pub struct MatrixRun {
     timestamps: bool,
     sink: Option<EventSink>,
     aar: Option<String>,
+    /// Hartes Zeitlimit je Sitz-Aufruf (Runde 7, Teil M).
+    seat_timeout: Duration,
+    /// Abbruch des Laufs (Game-Master-Turn bzw. Aufrufer).
+    cancel: Option<CancelToken>,
+    /// Umpire-Synthese aus der AAR-Phase (für `report.md`).
+    synthesis: Option<UmpireSynthesis>,
+    /// Spieler-Debriefs aus der AAR-Phase (für `report.md`).
+    debriefs: BTreeMap<PlayerId, PlayerDebrief>,
+    /// Pfad von `report.md`, sobald geschrieben.
+    report_path: Option<PathBuf>,
 }
 
 impl std::fmt::Debug for MatrixRun {
@@ -693,6 +767,11 @@ impl MatrixRun {
             timestamps,
             sink: None,
             aar: None,
+            seat_timeout: SEAT_TURN_TIMEOUT,
+            cancel: None,
+            synthesis: None,
+            debriefs: BTreeMap::new(),
+            report_path: None,
         })
     }
 
@@ -762,6 +841,42 @@ impl MatrixRun {
     /// Setzt (oder löscht) die Live-Event-Senke.
     pub fn set_sink(&mut self, sink: Option<EventSink>) {
         self.sink = sink;
+    }
+
+    /// Setzt das harte Zeitlimit je Sitz-Aufruf (Vorgabe
+    /// [`SEAT_TURN_TIMEOUT`]).
+    pub fn set_seat_timeout(&mut self, limit: Duration) {
+        self.seat_timeout = limit;
+    }
+
+    /// Setzt (oder löscht) den Abbruch-Token des Laufs: ist er ausgelöst,
+    /// passt jeder weitere Sitz-Aufruf sofort, ein laufender wird abgebrochen.
+    pub fn set_cancel(&mut self, cancel: Option<CancelToken>) {
+        self.cancel = cancel;
+    }
+
+    /// `true`, wenn der Abbruch-Token des Laufs ausgelöst ist.
+    #[must_use]
+    pub fn is_cancelled(&self) -> bool {
+        self.cancel.as_ref().is_some_and(CancelToken::is_cancelled)
+    }
+
+    /// Pfad des paper-tauglichen Berichts (`report.md`), sobald geschrieben.
+    #[must_use]
+    pub fn report_path(&self) -> Option<&Path> {
+        self.report_path.as_deref()
+    }
+
+    /// Umpire-Synthese der AAR-Phase.
+    #[must_use]
+    pub fn synthesis(&self) -> Option<&UmpireSynthesis> {
+        self.synthesis.as_ref()
+    }
+
+    /// Spieler-Debriefs der AAR-Phase.
+    #[must_use]
+    pub fn debriefs(&self) -> &BTreeMap<PlayerId, PlayerDebrief> {
+        &self.debriefs
     }
 
     fn rules(&self) -> &Rules {
@@ -944,8 +1059,10 @@ impl MatrixRun {
             Phase::Gegenargumente => self.run_counters(driver, &mut report).await?,
             Phase::Adjudikation => self.run_adjudication(driver, &mut report).await?,
             Phase::Rundenende => {
+                // Runde 7, Teil M5: im Business-Modus zuerst das Marktmodell.
                 let at = self.at();
-                close_round(&mut self.log, self.loaded.scenario.rules(), at).map_err(matrix_err)?;
+                close_round_with_market(&mut self.log, &self.loaded.scenario, at)
+                    .map_err(matrix_err)?;
             }
             Phase::Schlussargumente => self.run_final_arguments(driver, &mut report).await?,
             Phase::Aar => self.run_aar(driver, &mut report).await?,
@@ -1012,14 +1129,35 @@ impl MatrixRun {
         report.calls += 1;
         let mut last_error = String::new();
         for attempt in 0..=REPAIR_ATTEMPTS {
-            let answer = driver
-                .ask(SeatRequest {
-                    seat_key: &key,
-                    role: role_name(role),
-                    system: &system,
-                    prompt: std::mem::take(&mut prompt),
-                })
+            let answer = if self.is_cancelled() {
+                Err("Lauf abgebrochen".to_owned())
+            } else {
+                let outcome = guarded(
+                    driver.ask(SeatRequest {
+                        seat_key: &key,
+                        role: role_name(role),
+                        system: &system,
+                        prompt: std::mem::take(&mut prompt),
+                    }),
+                    self.seat_timeout,
+                    self.cancel.as_ref(),
+                )
                 .await;
+                match outcome {
+                    Guarded::Done(answer) => answer,
+                    Guarded::TimedOut => {
+                        driver.abandon(&key);
+                        Err(format!(
+                            "Zeitlimit von {} s für den Zug überschritten",
+                            self.seat_timeout.as_secs()
+                        ))
+                    }
+                    Guarded::Cancelled => {
+                        driver.abandon(&key);
+                        Err("Lauf abgebrochen".to_owned())
+                    }
+                }
+            };
             for warning in driver.take_warnings() {
                 self.note("materials", warning)?;
             }
@@ -1359,17 +1497,29 @@ impl MatrixRun {
         self.apply_facilitator_rulings(&mut adjudication)?;
         let at = self.at();
         record_standing(&mut self.log, &adjudication.standing, at).map_err(matrix_err)?;
-        let args = self.args.clone();
-        for arg in &args {
-            let ruling = adjudication
-                .rulings
-                .iter()
-                .find(|r| r.argument_id == arg.id)
-                .cloned()
-                .unwrap_or_else(|| neutral_ruling(arg, self.rules()));
-            let at = self.at();
-            resolve_argument(&mut self.log, &self.loaded.scenario, arg, &ruling, at)
-                .map_err(matrix_err)?;
+        // Runde 7, Teil M5: Konfliktpaare über `dice::resolve_conflict`,
+        // Geschäftsregeln als Veto — beides im Kern (`resolve_adjudication`).
+        let rules = self.rules().clone();
+        let fallback = |arg: &RoundArgument| neutral_ruling(arg, &rules);
+        let at = self.at();
+        let resolved = resolve_adjudication(
+            &mut self.log,
+            &self.loaded.scenario,
+            &self.args,
+            &adjudication,
+            &fallback,
+            at,
+        )
+        .map_err(matrix_err)?;
+        let conflicts = resolved
+            .iter()
+            .filter(|r| r.conflict_with.is_some())
+            .count();
+        if conflicts > 0 {
+            self.note(
+                "conflict",
+                format!("{conflicts} Argument(e) über Konfliktwürfe entschieden"),
+            )?;
         }
         self.flush()?;
         // Aufruf B: Erzählung.
@@ -1576,9 +1726,19 @@ impl MatrixRun {
                 .map_err(|e| io_err("AAR nicht schreibbar", &path, &e))?;
         }
         self.aar = Some(markdown);
+        self.synthesis = synthesis;
+        self.debriefs = debriefs;
         self.status = RunStatus::Ended;
         driver.release_all();
         self.children.clear();
+        // Runde 7, Teil M4: paper-tauglicher Bericht neben dem AAR.
+        if let Some(dir) = self.run_dir.clone() {
+            let path = dir.join(REPORT_FILE);
+            let report = super::report::build_report(self);
+            std::fs::write(&path, report)
+                .map_err(|e| io_err("Bericht nicht schreibbar", &path, &e))?;
+            self.report_path = Some(path);
+        }
         Ok(())
     }
 
@@ -2228,8 +2388,13 @@ pub fn entry_text(kind: &EntryKind, scenario: &Scenario) -> String {
         }
         EntryKind::DiceRolled { roll } => {
             let dice: Vec<String> = roll.dice.iter().map(u8::to_string).collect();
+            let label = if roll.kind == harw_matrix_game::dice::RollKind::Conflict {
+                "Konfliktwurf"
+            } else {
+                "Wurf"
+            };
             format!(
-                "Wurf {} (Versuch {}): {} = {} gegen {} → {}",
+                "{label} {} (Versuch {}): {} = {} gegen {} → {}",
                 roll.argument_id,
                 roll.attempt,
                 dice.join("+"),
@@ -2758,6 +2923,61 @@ mod tests {
         assert_eq!(notes, 1, "genau ein Ersatzurteil");
         // Replay reproduziert den Zustand.
         run.verify_replay()?;
+        Ok(())
+    }
+
+    /// Treiber, dessen Sitze nie antworten (z. B. eine nie beantwortete
+    /// Freigabe im Kind) — merkt sich abgebrochene Sitze.
+    #[derive(Default)]
+    struct HangingDriver {
+        asked: usize,
+        abandoned: Vec<String>,
+    }
+
+    impl SeatDriver for HangingDriver {
+        fn ask<'a>(&'a mut self, _request: SeatRequest<'a>) -> SeatFuture<'a> {
+            self.asked += 1;
+            Box::pin(std::future::pending())
+        }
+
+        fn abandon(&mut self, seat_key: &str) {
+            self.abandoned.push(seat_key.to_owned());
+        }
+    }
+
+    /// Runde 7, Teil M: ein hängender Sitz blockiert den Lauf nicht — nach
+    /// dem Zeitlimit passt er, sein Kind wird abgebrochen, die Phase endet.
+    #[tokio::test]
+    async fn hanging_seat_times_out_and_forfeits() -> TestResult {
+        let mut run = run()?;
+        run.set_seat_timeout(Duration::from_millis(20));
+        let mut driver = HangingDriver::default();
+        let started = std::time::Instant::now();
+        let briefing = run.step_with(&mut driver).await?;
+        assert_eq!(briefing.phase, Phase::Briefing);
+        assert_eq!(briefing.forfeits.len(), driver.asked, "{briefing:?}");
+        assert_eq!(driver.abandoned.len(), driver.asked);
+        assert!(started.elapsed() < Duration::from_secs(30));
+        assert!(run.log().journal.entries().any(|e| matches!(
+            &e.kind,
+            EntryKind::FacilitatorNote { detail, .. } if detail.contains("Zeitlimit")
+        )));
+        Ok(())
+    }
+
+    /// Runde 7, Teil M: ein abgebrochener Lauf fragt keinen Sitz mehr und
+    /// bricht einen laufenden Aufruf sofort ab.
+    #[tokio::test]
+    async fn cancelled_run_asks_no_seat() -> TestResult {
+        let mut run = run()?;
+        let cancel = CancelToken::new();
+        cancel.cancel(harw_types::cancel::CancelReason::User);
+        run.set_cancel(Some(cancel));
+        assert!(run.is_cancelled());
+        let mut driver = HangingDriver::default();
+        let briefing = run.step_with(&mut driver).await?;
+        assert_eq!(driver.asked, 0);
+        assert!(!briefing.forfeits.is_empty());
         Ok(())
     }
 

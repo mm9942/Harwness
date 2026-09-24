@@ -5,7 +5,8 @@
 //! startet, blockiert den Chat nicht mehr: der [`BackgroundLauncher`] koppelt
 //! das bereits admittierte Kind ab (`ManagedAgentSpawner::detach_for_background`),
 //! treibt es als eigene Tokio-Task über denselben Weg wie den synchronen Fall
-//! (`ChildTurnDriver::drive_child` → `run_child`: dieselbe Sandbox, dasselbe
+//! (`ChildTurnDriver::drive_child` → `run_child_with_declared_budget`, seit
+//! Runde 7 Teil A1 mit Budgetprüfung: dieselbe Sandbox, dasselbe
 //! Budget, dieselbe Freigabekette, dieselbe Übergabe am Budget-Ende) und
 //! gibt dem Eltern-Turn sofort `{child_id, status: "running", hint}` zurück.
 //!
@@ -90,6 +91,13 @@ pub(crate) const IDLE_POLL_INTERVAL: Duration = Duration::from_millis(500);
 const RUNNING_HINT: &str = "Der Agent läuft im Hintergrund weiter. Sag der Nutzerin kurz, \
      dass er gestartet ist, und beende deinen Turn — sein Ergebnis kommt automatisch als \
      Benachrichtigung. Fortschritt: agent.status {child_id}; Abbruch: agent.cancel {child_id}.";
+
+/// Runde 7, Teil A7: Zusatz im sofortigen Werkzeugergebnis, wenn der
+/// startende Turn während des Starts abgebrochen wurde (neue Nachricht,
+/// Turn-Grenze, Esc) — der Start wurde trotzdem abgeschlossen.
+pub(crate) const START_SURVIVED_NOTE: &str = "Der startende Turn wurde während des Starts \
+     abgebrochen; der Hintergrund-Agent wurde trotzdem vollständig gestartet und läuft weiter. \
+     Nicht erneut starten. Abbruch nur ausdrücklich mit agent.cancel {child_id}.";
 
 /// Eine eingereihte Meldung an die UIA.
 #[derive(Debug, Clone)]
@@ -217,6 +225,14 @@ impl BackgroundLauncher {
                 .find_map(|field| args.get(*field).and_then(serde_json::Value::as_str))
                 .map(ToOwned::to_owned)
         });
+        // Runde 7, Teil A7: ein Abbruch des startenden Turns während des
+        // Starts (geerbter Grund am Token des Kindes) reißt den Start nicht
+        // mehr mit — `detach_for_background` schließt ihn mit frischem Token
+        // ab; die UIA bekommt dazu einen klaren Hinweis.
+        let start_interrupted = self
+            .spawner
+            .child_cancel_token(child)
+            .is_some_and(|token| token.is_cancelled());
         if let Err(error) = self.spawner.detach_for_background(child, task.as_deref()) {
             tracing::warn!(child = %child, error = %error.message, "tui.background.detach_failed");
             return None;
@@ -238,14 +254,40 @@ impl BackgroundLauncher {
         runtime.spawn(drive_in_background(
             spawner, store, events, child_id, completion,
         ));
-        tracing::info!(child = %child, role, "tui.background.started");
-        Some(ToolCallResult::success(json!({
-            "child_id": child.as_str(),
-            "role": role,
-            "status": "running",
-            "hint": RUNNING_HINT.replace("{child_id}", child.as_str()),
-        })))
+        tracing::info!(child = %child, role, start_interrupted, "tui.background.started");
+        Some(ToolCallResult::success(launch_result(
+            child,
+            role,
+            start_interrupted,
+        )))
     }
+}
+
+/// Das sofortige Werkzeugergebnis eines Hintergrund-Starts.
+///
+/// # Argumente
+/// - `child`: das gestartete Kind.
+/// - `role`: seine Rolle.
+/// - `start_interrupted`: Runde 7, Teil A7 — der startende Turn wurde
+///   während des Starts abgebrochen (dann mit [`START_SURVIVED_NOTE`]).
+pub(crate) fn launch_result(
+    child: &SessionId,
+    role: &str,
+    start_interrupted: bool,
+) -> serde_json::Value {
+    let mut value = json!({
+        "child_id": child.as_str(),
+        "role": role,
+        "status": "running",
+        "hint": RUNNING_HINT.replace("{child_id}", child.as_str()),
+    });
+    if start_interrupted && let Some(object) = value.as_object_mut() {
+        object.insert(
+            "note".to_owned(),
+            json!(START_SURVIVED_NOTE.replace("{child_id}", child.as_str())),
+        );
+    }
+    value
 }
 
 /// Die Argumente des Handoff-Aufrufs `call_id` aus dem Verlauf der Sitzung.
@@ -550,8 +592,12 @@ fn run_line(run: &BackgroundRun) -> String {
         run.status.label_de(),
         run.elapsed().as_secs(),
         run.progress.tool_calls,
-        run.progress.tokens
+        // Runde 7, Teil A4: einschließlich der laufenden Runde.
+        run.progress.tokens_with_live()
     );
+    if run.progress.rounds > 0 {
+        line.push_str(&format!(" · {} Runden", run.progress.rounds));
+    }
     if let Some(step) = &run.progress.last_step {
         line.push_str(&format!(" · {step}"));
     }

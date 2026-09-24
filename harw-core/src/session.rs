@@ -300,6 +300,13 @@ pub struct AgentSession {
     /// Berater, der vor jeder Werkzeugausführung dieser Session befragt wird,
     /// ob ein bekannter Pitfall zutrifft. `None`: keine Beratung.
     pitfall_advisor: Option<std::sync::Arc<dyn crate::guard::PitfallAdvisor>>,
+    /// Runde 7, Teile A2/A5: Wächter-Zustand, der über alle Turns dieser
+    /// Sitzung lebt (Lesebudget eines Orchestrators, `agent.status`-Polling).
+    guard_state: crate::guard::SessionGuardState,
+    /// Runde 7, Teil L9: `true` für Kinder mit kleinem Kontextfenster
+    /// (< 64k) — `collect_tools` liefert dann kompakte Werkzeugschemas
+    /// (gekürzte Beschreibungen).
+    compact_tool_schemas: bool,
     /// Beobachter, der nach jeder Modellrunde und jedem Tool-Ergebnis dieser
     /// Session über Fortschritt benachrichtigt wird (Lease-Erneuerung durch
     /// `ManagedAgentSpawner`). `None`: kein Beobachter registriert.
@@ -605,6 +612,8 @@ impl AgentSession {
             guard_policy: crate::guard::GuardPolicy::default(),
             drift_observer: None,
             pitfall_advisor: None,
+            guard_state: crate::guard::SessionGuardState::default(),
+            compact_tool_schemas: false,
             progress_observer: None,
             token_calibration: crate::context_budget::TokenCalibration::default(),
             max_output_tokens: None,
@@ -1090,6 +1099,51 @@ impl AgentSession {
     #[must_use]
     pub fn pitfall_advisor(&self) -> Option<&std::sync::Arc<dyn crate::guard::PitfallAdvisor>> {
         self.pitfall_advisor.as_ref()
+    }
+
+    /// Runde 7, Teil L9: schaltet kompakte Werkzeugschemas ein bzw. aus
+    /// (siehe `turn_loop::collect_tools`).
+    pub fn set_compact_tool_schemas(&mut self, compact: bool) {
+        self.compact_tool_schemas = compact;
+    }
+
+    /// Runde 7, Teil L9: ob diese Sitzung kompakte Werkzeugschemas bekommt.
+    #[must_use]
+    pub fn compact_tool_schemas(&self) -> bool {
+        self.compact_tool_schemas
+    }
+
+    /// Sitzungsweiter Wächter-Zustand (Runde 7, Teile A2/A5).
+    #[must_use]
+    pub fn guard_state(&self) -> &crate::guard::SessionGuardState {
+        &self.guard_state
+    }
+
+    /// Veränderbarer sitzungsweiter Wächter-Zustand (Runde 7, Teile A2/A5).
+    pub fn guard_state_mut(&mut self) -> &mut crate::guard::SessionGuardState {
+        &mut self.guard_state
+    }
+
+    /// Meldet, ob für diese Sitzung das Orchestrator-Lesebudget gilt.
+    ///
+    /// # Beschreibung
+    /// Runde 7, Teil A2: nur **Kind**-Sitzungen (mit Elternteil), die unter
+    /// einer Orchestrator-Organisationsrolle admittiert wurden
+    /// (`RootOrchestrator` — per `transfer_to_root-orchestrator` — oder
+    /// `ChildOrchestrator` — coding-/research-/analysis-orchestrator). Eine
+    /// Wurzelsitzung ohne Elternteil (UIA, `harw run`) liest unbegrenzt.
+    ///
+    /// # Returns
+    /// `true`, wenn das Lesebudget gilt.
+    #[must_use]
+    pub fn is_read_budgeted_orchestrator(&self) -> bool {
+        self.parent_session_id.is_some()
+            && self.spawn_context.as_ref().is_some_and(|context| {
+                matches!(
+                    context.organizational_role,
+                    AgentRoleId::RootOrchestrator | AgentRoleId::ChildOrchestrator
+                )
+            })
     }
 
     /// Setzt den Beobachter, der nach jeder Modellrunde und jedem

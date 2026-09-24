@@ -75,7 +75,7 @@ use harw_core::one_shot::complete_text;
 use harw_extension_api::approval_mode::{ApprovalMode, ApprovalModeCell};
 use harw_extension_api::auto_mode::{
     AutoApprovalGate, AutoDecision, AutoDecisionLog, AutoLogEntry, AutoSessionContext, AutoVerdict,
-    CapStatus, VerdictSource,
+    CapStatus, ChildMandate, VerdictSource,
 };
 use harw_extension_api::{ExtFuture, ToolCall};
 use harw_registry_defaults::ALWAYS_ASK_TOOLS;
@@ -88,6 +88,11 @@ use crate::permission_rules::{ApprovalLearner, LearnKey, LearnOffer};
 
 /// Zeitlimit eines Klassifizierer-Aufrufs; danach gilt `ask`.
 pub const CLASSIFIER_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Runde 7, Teil L4: Vorgabe-Zeitlimit, wenn das Klassifizierer-Modell über
+/// einen lokalen Provider läuft (vLLM, LM Studio, Ollama) — lokale Modelle
+/// brauchen für den ersten Token oft deutlich länger als 10 s.
+pub const LOCAL_CLASSIFIER_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// Obergrenze der Ausgabe-Tokens des Klassifizierers.
 const CLASSIFIER_MAX_OUTPUT_TOKENS: u32 = 300;
@@ -133,6 +138,9 @@ oder der Aufruf ist unklar, ungewöhnlich, schwer umkehrbar, außerhalb des erke
 Geheimnisse oder Zugangsdaten ins Netz bzw. an Dritte, Eingriffe in fremde Systeme, Zerstörung ohne Auftrag, \
 Umgehung von Sicherheitsgrenzen, Veröffentlichen/Deployen ohne Auftrag.\n\
 Eine ausdrückliche Bitte der Nutzerin um genau diese Aktion ergibt NIE \"deny\". \
+Enthält der Nutzerteil einen Abschnitt „Auftrag dieses Kind-Agenten“, beurteilst du den Aufruf eines \
+Kind-Agenten: dieser Auftrag ist sein Ziel. Eine Aktion, die der Auftrag ausdrücklich verlangt \
+(z. B. das bestellte PDF bauen), ist keine Zielabweichung; schädliche Aktionen bleiben \"deny\". \
 Im Zweifel \"ask\". Antworte ausschließlich mit einem JSON-Objekt ohne weiteren Text: \
 {\"decision\":\"allow|ask|deny\",\"category\":\"<kurze-kategorie>\",\"reason\":\"<ein Satz auf Deutsch>\"}";
 
@@ -1066,6 +1074,9 @@ pub struct ClassifierInput<'a> {
     pub recent_calls: Vec<String>,
     /// Der zu beurteilende Aufruf.
     pub call: &'a ToolCall,
+    /// Runde 7, Teil A6: Auftrag des Kind-Agenten, dessen Aufruf beurteilt
+    /// wird; `None` für die Wurzel bzw. ein Kind ohne Mandat.
+    pub mandate: Option<&'a ChildMandate>,
     /// Workspace-Wurzel.
     pub workspace_root: &'a Path,
     /// Modus (immer `auto`, zur Klarheit im Prompt).
@@ -1143,11 +1154,31 @@ pub fn build_classifier_prompt(input: &ClassifierInput<'_>) -> String {
         &redact_value(&input.call.arguments).to_string(),
         MAX_CALL_JSON_CHARS,
     );
+    // Runde 7, Teil A6: der Auftrag des Kindes — bereinigt wie alles andere.
+    let mandate = input
+        .mandate
+        .map(|mandate| {
+            let mut section = format!(
+                "Auftrag dieses Kind-Agenten (Rolle {}):\n{}\n",
+                redact_text(mandate.role()),
+                truncate_chars(&redact_text(mandate.task()), MAX_GOAL_CHARS)
+            );
+            if let Some(excerpt) = mandate.context_excerpt() {
+                section.push_str(&format!(
+                    "Kontext des Auftrags: {}\n",
+                    truncate_chars(&redact_text(excerpt), MAX_PLAN_CHARS)
+                ));
+            }
+            section.push('\n');
+            section
+        })
+        .unwrap_or_default();
     format!(
         "Modus: {mode}\n\
          Workspace-Wurzel: {root}\n\
          {lease}\n\
          Vorfilter: ohne Befund.\n\n\
+         {mandate}\
          Letzte Nutzernachrichten (Ziel der Sitzung, älteste zuerst):\n{goal}\n\n\
          Aktiver Plan:\n{plan}\n\n\
          Letzte Werkzeugaufrufe (älteste zuerst):\n{recent}\n\n\
@@ -1238,18 +1269,28 @@ pub trait ClassifierBackend: Send + Sync {
 
     /// Kurzname für Audit/Diagnose (z. B. die Modell-Id).
     fn label(&self) -> String;
+
+    /// Runde 7, Teil L4: eigenes Zeitlimit dieser Anbindung (aus der
+    /// Konfiguration bzw. lokal/entfernt abgeleitet). `None`: das Zeitlimit
+    /// des [`AutoModeHandle`] gilt.
+    fn timeout(&self) -> Option<Duration> {
+        None
+    }
 }
 
 /// [`ClassifierBackend`] über einen [`ModelProvider`].
 pub struct ModelClassifierBackend {
     provider: Arc<dyn ModelProvider>,
     model: String,
+    /// Runde 7, Teil L4: eigenes Zeitlimit (siehe [`classifier_timeout_for`]).
+    timeout: Option<Duration>,
 }
 
 impl std::fmt::Debug for ModelClassifierBackend {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ModelClassifierBackend")
             .field("model", &self.model)
+            .field("timeout", &self.timeout)
             .finish()
     }
 }
@@ -1261,7 +1302,15 @@ impl ModelClassifierBackend {
         Self {
             provider,
             model: model.into(),
+            timeout: None,
         }
+    }
+
+    /// Setzt das eigene Zeitlimit dieser Anbindung (Runde 7, Teil L4).
+    #[must_use]
+    pub fn with_timeout(mut self, timeout: Duration) -> Self {
+        self.timeout = Some(timeout);
+        self
     }
 
     /// Baut die Anbindung aus der Konfiguration (Rolle `auto-classifier`).
@@ -1282,7 +1331,10 @@ impl ModelClassifierBackend {
         root: Arc<dyn ModelProvider>,
         root_model: Option<&str>,
     ) -> Option<Self> {
-        match classifier_model_selection(config) {
+        let selection = classifier_model_selection(config);
+        let timeout =
+            classifier_timeout_for(config, selection.as_ref().and_then(|(p, _)| p.as_deref()));
+        let backend = match selection {
             Some((provider, model)) => {
                 let pinned = PinnedModelProvider::new(
                     root,
@@ -1294,7 +1346,8 @@ impl ModelClassifierBackend {
             None => root_model
                 .filter(|model| !model.trim().is_empty())
                 .map(|model| Self::new(root, model)),
-        }
+        };
+        backend.map(|backend| backend.with_timeout(timeout))
     }
 }
 
@@ -1315,6 +1368,47 @@ impl ClassifierBackend for ModelClassifierBackend {
 
     fn label(&self) -> String {
         self.model.clone()
+    }
+
+    fn timeout(&self) -> Option<Duration> {
+        self.timeout
+    }
+}
+
+/// Zeitlimit des Klassifizierers aus der Konfiguration (Runde 7, Teil L4).
+///
+/// # Beschreibung
+/// `permissions.auto_classifier_timeout_secs` gewinnt (auf `1..=600` s
+/// geklemmt). Sonst gilt [`LOCAL_CLASSIFIER_TIMEOUT`], wenn der Provider des
+/// Klassifizierer-Modells lokal ist (`ProviderToml::is_local`: Loopback,
+/// Ollama, freigegebenes LAN), und [`CLASSIFIER_TIMEOUT`] für alle anderen.
+/// Ohne eigene Provider-Wahl zählt der aktive Provider (`default_provider`).
+///
+/// # Arguments
+/// - `config` (`&ResolvedConfig`): die Konfiguration.
+/// - `provider` (`Option<&str>`): der gewählte Klassifizierer-Provider.
+///
+/// # Returns
+/// Das wirksame Zeitlimit je Klassifizierer-Aufruf.
+#[must_use]
+pub fn classifier_timeout_for(config: &ResolvedConfig, provider: Option<&str>) -> Duration {
+    if let Some(secs) = config.harness.permissions.auto_classifier_timeout_secs {
+        return Duration::from_secs(secs.clamp(
+            harw_config::permissions_toml::MIN_CLASSIFIER_TIMEOUT_SECS,
+            harw_config::permissions_toml::MAX_CLASSIFIER_TIMEOUT_SECS,
+        ));
+    }
+    let provider = provider
+        .map(ToOwned::to_owned)
+        .or_else(|| config.harness.default_provider.clone());
+    let local = provider
+        .as_deref()
+        .and_then(|name| config.providers.get(name))
+        .is_some_and(harw_config::ProviderToml::is_local);
+    if local {
+        LOCAL_CLASSIFIER_TIMEOUT
+    } else {
+        CLASSIFIER_TIMEOUT
     }
 }
 
@@ -1578,6 +1672,8 @@ impl AutoModeHandle {
         Arc::new(AutoModeGate {
             handle: self.clone(),
             can_pause: true,
+            mandate: None,
+            recent: None,
         })
     }
 
@@ -1587,6 +1683,29 @@ impl AutoModeHandle {
         Arc::new(AutoModeGate {
             handle: self.clone(),
             can_pause: false,
+            mandate: None,
+            recent: None,
+        })
+    }
+
+    /// Gate eines Kindes mit bekanntem Auftrag (Runde 7, Teil A6).
+    ///
+    /// # Beschreibung
+    /// Wie [`Self::child_gate`], aber der Klassifizierer bekommt den Auftrag
+    /// des Kindes als „Auftrag dieses Kind-Agenten" und das Kind einen
+    /// eigenen Ring der letzten Werkzeugaufrufe (die Aufrufe anderer Kinder
+    /// und der Wurzel verfälschen sein Urteil nicht). Protokoll, Deckel und
+    /// Nutzerziele bleiben geteilt.
+    ///
+    /// # Arguments
+    /// - `mandate` ([`ChildMandate`]): Rolle, Auftrag, Kontextauszug.
+    #[must_use]
+    pub fn child_gate_with(&self, mandate: ChildMandate) -> Arc<AutoModeGate> {
+        Arc::new(AutoModeGate {
+            handle: self.clone(),
+            can_pause: false,
+            mandate: Some(mandate),
+            recent: Some(AutoSessionContext::new()),
         })
     }
 
@@ -1629,12 +1748,18 @@ pub struct AutoModeGate {
     handle: AutoModeHandle,
     /// `false` für Kinder ohne Pausenrecht: `ask` → Ablehnung mit Grund.
     can_pause: bool,
+    /// Runde 7, Teil A6: Auftrag des Kindes (nur [`AutoModeHandle::child_gate_with`]).
+    mandate: Option<ChildMandate>,
+    /// Runde 7, Teil A6: eigener Ring der letzten Aufrufe dieses Kindes;
+    /// `None` = der geteilte Ring des Handles.
+    recent: Option<AutoSessionContext>,
 }
 
 impl std::fmt::Debug for AutoModeGate {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("AutoModeGate")
             .field("can_pause", &self.can_pause)
+            .field("has_mandate", &self.mandate.is_some())
             .finish()
     }
 }
@@ -1669,13 +1794,23 @@ impl AutoModeGate {
             goals: context.recent_goals(),
             host_lease,
             plan: context.plan(),
-            recent_calls: context.recent_calls(RECENT_CALLS_IN_PROMPT),
+            recent_calls: self.recent_ring().recent_calls(RECENT_CALLS_IN_PROMPT),
             call,
+            mandate: self.mandate.as_ref(),
             workspace_root: &self.handle.prefilter.workspace_root,
             mode: ApprovalMode::Delegated,
         };
         let prompt = build_classifier_prompt(&input);
-        classify_with(backend.as_ref(), &prompt, self.handle.classifier_timeout).await
+        // Runde 7, Teil L4: eine Anbindung mit eigenem Zeitlimit (lokales
+        // Modell bzw. `permissions.auto_classifier_timeout_secs`) gewinnt.
+        let timeout = backend.timeout().unwrap_or(self.handle.classifier_timeout);
+        classify_with(backend.as_ref(), &prompt, timeout).await
+    }
+
+    /// Der Ring der letzten Aufrufe dieses Gates (eigener Ring eines Kindes
+    /// mit Mandat, sonst der geteilte Ring).
+    fn recent_ring(&self) -> &AutoSessionContext {
+        self.recent.as_ref().unwrap_or(&self.handle.context)
     }
 
     /// Ob über diese Kette jemand gefragt werden kann (Wurzel, oder Kind
@@ -1775,7 +1910,7 @@ impl AutoApprovalGate for AutoModeGate {
                 format!("[Kind] {summary}")
             };
             self.record(call, logged_summary, &verdict);
-            self.handle.context.push_recent_call(summary);
+            self.recent_ring().push_recent_call(summary);
             verdict
         })
     }
@@ -2350,6 +2485,7 @@ mod tests {
             plan: None,
             recent_calls: Vec::new(),
             call: &probe,
+            mandate: None,
             workspace_root: Path::new("/work/project"),
             mode: ApprovalMode::Delegated,
         });
@@ -2480,5 +2616,179 @@ mod tests {
             classifier_model_selection(&config),
             Some((Some("local".to_owned()), "tiny".to_owned()))
         );
+    }
+
+    // ── Runde 7, Teil L4: Zeitlimit des Klassifizierers ───────────────────
+
+    fn provider_toml(name: &str, base_url: &str) -> TestResult<harw_config::ProviderToml> {
+        toml::from_str(&format!(
+            "name = \"{name}\"\napi = \"openai-chat\"\nbase_url = \"{base_url}\"\n"
+        ))
+        .map_err(|error| TestError::Unexpected(format!("Provider-TOML: {error}")))
+    }
+
+    #[test]
+    fn classifier_timeout_is_longer_for_local_models_and_configurable() -> TestResult {
+        let mut config = ResolvedConfig::default();
+        config.harness.default_provider = Some("cloud".to_owned());
+        config.providers.insert(
+            "cloud".to_owned(),
+            provider_toml("cloud", "https://api.example.invalid/v1")?,
+        );
+        config.providers.insert(
+            "lokal".to_owned(),
+            provider_toml("lokal", "http://127.0.0.1:8000/v1")?,
+        );
+        assert_eq!(classifier_timeout_for(&config, None), CLASSIFIER_TIMEOUT);
+        assert_eq!(
+            classifier_timeout_for(&config, Some("lokal")),
+            LOCAL_CLASSIFIER_TIMEOUT
+        );
+        config.harness.default_provider = Some("lokal".to_owned());
+        assert_eq!(
+            classifier_timeout_for(&config, None),
+            LOCAL_CLASSIFIER_TIMEOUT,
+            "ohne eigene Wahl zählt der aktive Provider"
+        );
+        config.harness.permissions.auto_classifier_timeout_secs = Some(90);
+        assert_eq!(
+            classifier_timeout_for(&config, Some("cloud")),
+            Duration::from_secs(90)
+        );
+        config.harness.permissions.auto_classifier_timeout_secs = Some(10_000);
+        assert_eq!(
+            classifier_timeout_for(&config, Some("cloud")),
+            Duration::from_secs(600),
+            "geklemmt"
+        );
+        Ok(())
+    }
+
+    /// Backend mit eigenem Zeitlimit, das erst nach 150 ms antwortet.
+    struct SlowBackend;
+
+    impl ClassifierBackend for SlowBackend {
+        fn complete<'a>(&'a self, _system: &'a str, _user: &'a str) -> ClassifierFuture<'a> {
+            Box::pin(async move {
+                tokio::time::sleep(Duration::from_millis(150)).await;
+                Ok(r#"{"decision":"allow","category":"c","reason":"r"}"#.to_owned())
+            })
+        }
+
+        fn label(&self) -> String {
+            "slow".to_owned()
+        }
+
+        fn timeout(&self) -> Option<Duration> {
+            Some(Duration::from_secs(5))
+        }
+    }
+
+    #[test]
+    fn a_backend_timeout_overrides_the_handle_timeout() -> TestResult {
+        let handle = AutoModeHandle::new(ApprovalModeCell::new(ApprovalMode::Delegated), ctx())
+            .with_classifier_timeout(Duration::from_millis(50));
+        handle.install_backend(Arc::new(SlowBackend));
+        run(handle
+            .root_gate()
+            .decide(&call("fs.write", json!({"path": "src/a.rs"}))))?;
+        let entry = handle
+            .log()
+            .entries()
+            .pop()
+            .ok_or(TestError::Missing("Protokolleintrag"))?;
+        assert_eq!(
+            entry.verdict.decision,
+            AutoDecision::Allow,
+            "das lokale Zeitlimit (5 s) gilt statt 50 ms"
+        );
+        Ok(())
+    }
+
+    // ── Runde 7, Teil A6: Kind-Mandat ─────────────────────────────────────
+
+    #[test]
+    fn the_classifier_prompt_carries_the_child_mandate() {
+        let probe = call("latex.build", json!({"file": "bericht.tex"}));
+        let mandate = ChildMandate::new("uia-latex-writer", "Baue das PDF aus bericht.tex")
+            .with_context_excerpt(
+                "Vorlage business-paper, Token ghp_abcdefghijklmnopqrstuvwxyz0123456789",
+            );
+        let prompt = build_classifier_prompt(&ClassifierInput {
+            goals: vec!["Schreib mir ein Business-Paper".to_owned()],
+            host_lease: None,
+            plan: None,
+            recent_calls: Vec::new(),
+            call: &probe,
+            mandate: Some(&mandate),
+            workspace_root: Path::new("/work/project"),
+            mode: ApprovalMode::Delegated,
+        });
+        assert!(
+            prompt.contains("Auftrag dieses Kind-Agenten (Rolle uia-latex-writer)"),
+            "{prompt}"
+        );
+        assert!(prompt.contains("Baue das PDF aus bericht.tex"), "{prompt}");
+        assert!(prompt.contains("Vorlage business-paper"), "{prompt}");
+        assert!(
+            !prompt.contains("ghp_abcdefghijklmnopqrstuvwxyz0123456789"),
+            "auch der Kontextauszug wird bereinigt"
+        );
+        assert!(CLASSIFIER_SYSTEM_PROMPT.contains("keine Zielabweichung"));
+    }
+
+    #[test]
+    fn a_mandated_child_gate_sends_the_mandate_and_keeps_its_own_ring() -> TestResult {
+        // Das Modell-Doppel verweigert, sobald das Mandat fehlt
+        // („Zielabweichung"), und erlaubt mit Mandat „baue PDF".
+        struct MandateAware {
+            seen: Mutex<Vec<String>>,
+        }
+        impl ClassifierBackend for MandateAware {
+            fn complete<'a>(&'a self, _system: &'a str, user: &'a str) -> ClassifierFuture<'a> {
+                if let Ok(mut seen) = self.seen.lock() {
+                    seen.push(user.to_owned());
+                }
+                let reply = if user.contains("Auftrag dieses Kind-Agenten")
+                    && user.contains("baue PDF")
+                {
+                    r#"{"decision":"allow","category":"mandate","reason":"vom Auftrag verlangt"}"#
+                } else {
+                    r#"{"decision":"deny","category":"zielabweichung","reason":"Zielabweichung"}"#
+                };
+                Box::pin(async move { Ok(reply.to_owned()) })
+            }
+            fn label(&self) -> String {
+                "mandate-aware".to_owned()
+            }
+        }
+        let backend = Arc::new(MandateAware {
+            seen: Mutex::new(Vec::new()),
+        });
+        let handle = AutoModeHandle::new(ApprovalModeCell::new(ApprovalMode::Delegated), ctx())
+            .with_classifier_timeout(Duration::from_millis(500));
+        handle.install_backend(Arc::clone(&backend) as Arc<dyn ClassifierBackend>);
+        handle.context().set_goal("Recherchiere den Markt");
+        let build = call("latex.build", json!({"file": "paper.tex"}));
+
+        let plain = run(handle.child_gate().decide(&build))?;
+        assert_eq!(
+            plain.decision,
+            AutoDecision::Deny,
+            "ohne Mandat: altes Verhalten"
+        );
+
+        let gate = handle.child_gate_with(ChildMandate::new("uia-latex-writer", "baue PDF"));
+        let verdict = run(gate.decide(&build))?;
+        assert_eq!(verdict.decision, AutoDecision::Allow);
+        assert_ne!(verdict.category, "zielabweichung");
+
+        let recent_root = handle.context().recent_calls(16);
+        assert_eq!(
+            recent_root.len(),
+            1,
+            "der Aufruf des Kindes mit Mandat landet in seinem eigenen Ring"
+        );
+        Ok(())
     }
 }

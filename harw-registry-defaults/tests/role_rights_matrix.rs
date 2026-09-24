@@ -198,6 +198,14 @@ fn expected_role_table() -> Vec<(&'static str, RegistryProfile, AuthorityReducer
             RegistryProfile::MatrixReader,
             AuthorityReducer::ReadOnly,
         ),
+        // Runde 7, Teil M: der Game Master liest höchstens einen Brief
+        // (`MatrixReader`), ohne Netz, Schreiben oder Exec; seine
+        // Matrix-Werkzeuge steuert die Composition-Root bei.
+        (
+            role_names::MATRIX_GAME_MASTER,
+            RegistryProfile::MatrixReader,
+            AuthorityReducer::ReadOnly,
+        ),
         // Behoben (Agent F-FIX, Addendum F+G): `authority_reducer_for_role`
         // in `harw-registry-defaults/src/authority.rs` trägt jetzt Match-Arme
         // für `MEMORY_STEWARD`, `UIA_WORKER` und `EXECUTOR`; die Reducer
@@ -414,6 +422,21 @@ fn test_profile_by_permission_matrix_never_registers_ungranted_tools() -> TestRe
                     && granted.contains(Permission::ExecuteProcess),
                 "{profile:?}: latex.build"
             );
+            // Runde 7, Teil T5: `latex.check` wie `latex.build` nur mit
+            // `ExecuteProcess`, `latex.template` nur mit `WriteWorkspace` —
+            // beide ausschließlich in `UiaLatexWriter`.
+            assert_eq!(
+                has("latex.check"),
+                *profile == RegistryProfile::UiaLatexWriter
+                    && granted.contains(Permission::ExecuteProcess),
+                "{profile:?}: latex.check"
+            );
+            assert_eq!(
+                has("latex.template"),
+                *profile == RegistryProfile::UiaLatexWriter
+                    && granted.contains(Permission::WriteWorkspace),
+                "{profile:?}: latex.template"
+            );
             if *profile == RegistryProfile::UiaLatexWriter {
                 assert!(
                     !tools.iter().any(|tool| tool.starts_with("shell.")
@@ -422,7 +445,7 @@ fn test_profile_by_permission_matrix_never_registers_ungranted_tools() -> TestRe
                         || tool.starts_with("deps.")
                         || tool.starts_with("explore.")
                         || *tool == "lens.ask"),
-                    "UiaLatexWriter darf nur fs.*, doc.read_pdf und latex.build führen: {tools:?}"
+                    "UiaLatexWriter darf nur fs.*, doc.read_pdf und latex.* führen: {tools:?}"
                 );
             }
             if *profile == RegistryProfile::WorkspaceEdit {
@@ -484,6 +507,8 @@ fn test_role_by_permission_matrix_after_reducer() {
                         && *tool != "fs.edit"
                         && *tool != "shell.exec"
                         && *tool != "latex.build"
+                        && *tool != "latex.template"
+                        && *tool != "latex.check"
                         && (is_uia_worker_browser_open || !BROWSER.contains(tool)),
                     "{role}: {tool} darf nie sichtbar sein"
                 );
@@ -969,4 +994,39 @@ fn test_agent_messaging_tools_grant_no_rights() {
     for role in role_names::MATRIX_ROLES {
         assert!(parent_message_tools_for_role(role).is_empty(), "{role}");
     }
+}
+
+/// Runde 7, Teil M: der Game Master trägt über seinen Reducer weder Netz
+/// noch Schreib- oder Ausführungsrecht weiter; seine Matrix-Werkzeuge sind
+/// nie Teil eines `RegistryProfile` und tragen keine Sandbox-Rechteklasse.
+#[test]
+fn test_game_master_is_read_only_without_network() -> TestResult {
+    let role = role_names::MATRIX_GAME_MASTER;
+    let reducer = authority_reducer_for_role(role).ok_or(TestError::Missing("Reducer"))?;
+    let ceiling = reducer.ceiling();
+    for forbidden in [
+        Permission::NetworkAccess,
+        Permission::WriteWorkspace,
+        Permission::ExecuteProcess,
+        Permission::ReadSecrets,
+        Permission::ManagePlugins,
+    ] {
+        assert!(!ceiling.contains(forbidden), "{role}: {forbidden:?}");
+    }
+    for tool in harw_registry_defaults::profile::MATRIX_GAME_MASTER_TOOLS {
+        assert_eq!(
+            harw_registry_defaults::tool_permission(tool),
+            None,
+            "{tool}"
+        );
+        for profile in RegistryProfile::ALL {
+            for granted in every_permission_subset() {
+                assert!(
+                    !profile.tool_names_for(&granted).contains(tool),
+                    "{profile:?} bewirbt {tool}"
+                );
+            }
+        }
+    }
+    Ok(())
 }

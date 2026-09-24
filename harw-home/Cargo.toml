@@ -15,6 +15,9 @@ uuid = { version = "1.23.5", features = ["v7"] }
 blake3 = { workspace = true }
 harw-fsutil = { path = "../harw-fsutil" }
 serde = { workspace = true }
+# Runde 7, Teil T6: SHA-256 der installierten Bundle-Dateien im Manifest
+# `<home>/.bundle-manifest.toml` (dieselbe Version wie harw-catalog).
+sha2 = "0.10.9"
 toml = { workspace = true }
 
 [dev-dependencies]

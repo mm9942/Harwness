@@ -95,6 +95,13 @@ pub struct ModelCapabilitiesToml {
     pub vision: bool,
     #[serde(default)]
     pub json_mode: bool,
+    /// Runde 7, Teil L7: `Some(false)` heißt, das Modell beherrscht keine
+    /// Werkzeugaufrufe — der Provider bietet ihm dann keine Werkzeuge an
+    /// und hängt stattdessen einen kurzen Hinweis an. `None` = unbekannt
+    /// (Werkzeuge werden angeboten). Anders als `tool_use` (Routing-Hinweis,
+    /// Vorgabe `false`) wirkt nur ein ausdrückliches `false` hier.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_calling: Option<bool>,
 }
 
 #[cfg(test)]

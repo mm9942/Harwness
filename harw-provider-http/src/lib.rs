@@ -472,6 +472,40 @@ fn network_retry_policy() -> RetryPolicy {
         base_delay: Duration::from_secs(10),
         max_delay: Duration::from_secs(20),
         max_retry_after: Duration::from_secs(60),
+        retry_timeouts: true,
+    }
+}
+
+/// Runde 7, Teil L4: [`network_retry_policy`] mit der Timeout-Einstellung
+/// des Providers ([`harw_config::ProviderToml::effective_retry_timeouts`]).
+///
+/// Bei lokalen Providern wird ein Zeitlimit-Fehler nicht wiederholt: ein
+/// überlasteter lokaler Server würde durch zwei weitere, je bis zu 600 s
+/// lange Versuche nur blockiert (dreifache Wartezeit ohne Aussicht auf
+/// Erfolg). Verbindungs- und 5xx-Fehler werden weiterhin wiederholt.
+fn network_retry_policy_for(provider: &harw_config::ProviderToml) -> RetryPolicy {
+    RetryPolicy {
+        retry_timeouts: provider.effective_retry_timeouts(),
+        ..network_retry_policy()
+    }
+}
+
+/// Runde 7, Teil L1: Vorgabe für `auth_header`, wenn die Provider-Datei
+/// keinen nennt.
+///
+/// # Returns
+/// - `"api-key"` für Foundry-Provider,
+/// - `"none"` für `ollama` sowie für lokale Provider
+///   ([`harw_config::ProviderToml::is_local`]) **ohne** `auth` — ein
+///   lokaler vLLM-/LM-Studio-Server braucht keinen Schlüssel,
+/// - sonst `"bearer"`.
+fn default_auth_header(provider_name: &str, provider: &harw_config::ProviderToml) -> &'static str {
+    if provider_name == "foundry" || provider_name.starts_with("foundry-") {
+        "api-key"
+    } else if provider.api == "ollama" || (provider.auth.is_none() && provider.is_local()) {
+        "none"
+    } else {
+        "bearer"
     }
 }
 
@@ -502,7 +536,7 @@ fn build_named_provider(
     sources: SecretSources<'_>,
     budgets: &budget::ProviderBudgetRegistry,
 ) -> HttpProviderResult<NamedProviderBuild> {
-    validate_endpoint(&provider.base_url)?;
+    validate_endpoint_with(&provider.base_url, provider.allow_insecure_lan)?;
     let sources = SecretSources {
         endpoint: Some(&provider.base_url),
         ..sources
@@ -557,7 +591,7 @@ fn build_named_provider(
         if let Some(pool) = &pool {
             for index in 0..pool.len() {
                 if let Some(url) = &pool.entry(index).base_url {
-                    validate_endpoint(url)?;
+                    validate_endpoint_with(url, provider.allow_insecure_lan)?;
                 }
             }
         }
@@ -626,6 +660,11 @@ fn build_named_provider(
         ));
         backend.configure_credential_pool(pool);
         backend.configure_concurrency(provider.max_concurrency);
+        // Runde 7, Teil L4: Request- und Streaming-Leerlauf-Zeitlimit.
+        backend.configure_timeouts(
+            Duration::from_secs(provider.effective_request_timeout_secs()),
+            Duration::from_secs(provider.effective_stream_idle_timeout_secs()),
+        );
         // Beide `Arc`s werden geklont, *bevor* `backend` unten per Wert in
         // `RetryingProvider::new` verschoben wird — siehe
         // [`ProviderLoadHandle`]-Doku (identisches Muster zum
@@ -638,7 +677,10 @@ fn build_named_provider(
                 budgets: anthropic_budgets,
             });
         return Ok((
-            Box::new(RetryingProvider::new(backend, network_retry_policy())),
+            Box::new(RetryingProvider::new(
+                backend,
+                network_retry_policy_for(provider),
+            )),
             Some(load_control),
         ));
     }
@@ -661,7 +703,10 @@ fn build_named_provider(
             budgets: http_provider.budgets(),
         });
     Ok((
-        Box::new(RetryingProvider::new(http_provider, network_retry_policy())),
+        Box::new(RetryingProvider::new(
+            http_provider,
+            network_retry_policy_for(provider),
+        )),
         Some(load_control),
     ))
 }
@@ -908,6 +953,31 @@ pub(crate) fn http_client() -> HttpProviderResult<reqwest::Client> {
         .map_err(HttpProviderError::ClientBuild)
 }
 
+/// Runde 7, Teil L8: Baut den HTTP-Client für einen konkreten Endpunkt.
+///
+/// # Description
+/// Wie [`http_client`]; zeigt `base_url` aber auf einen Loopback-Host
+/// (`localhost`, `127.0.0.0/8`, `::1`), wird **kein** Proxy verwendet —
+/// ein gesetztes `HTTP(S)_PROXY` würde lokale Modell-Server sonst über
+/// einen entfernten Proxy ansprechen, der sie nicht erreicht. Das
+/// entspricht einem automatischen `NO_PROXY` für Loopback.
+///
+/// # Errors
+/// [`HttpProviderError::ClientBuild`], wenn der Client nicht gebaut
+/// werden kann.
+pub(crate) fn http_client_for_endpoint(base_url: &str) -> HttpProviderResult<reqwest::Client> {
+    let is_loopback = EgressUrl::parse(base_url)
+        .map(|endpoint| endpoint.host().is_loopback())
+        .unwrap_or(false);
+    let builder = reqwest::Client::builder().redirect(redirect_policy());
+    let builder = if is_loopback {
+        builder.no_proxy()
+    } else {
+        builder
+    };
+    builder.build().map_err(HttpProviderError::ClientBuild)
+}
+
 /// Baut einen als sensitiv markierten Header-Wert für ein Credential.
 ///
 /// Sensitive Werte rendert `HeaderValue`s `Debug` als `Sensitive`; HTTP/2-
@@ -968,6 +1038,26 @@ struct DynamicConcurrencyLimiterState {
     /// Gewünschte Permit-Zahl. Kann während eines laufenden Schrumpfens
     /// kleiner sein als `total_permits`.
     target: AtomicUsize,
+    /// Runde 7, Teil L5: Anzahl Aufrufer, die gerade in
+    /// [`DynamicConcurrencyLimiter::acquire`] auf einen freien Slot warten.
+    waiting: AtomicUsize,
+}
+
+/// Runde 7, Teil L5: Zählt einen wartenden Aufrufer für die Dauer seines
+/// Wartens (auch bei Abbruch des Futures korrekt zurückgezählt).
+struct WaitingGuard<'a>(&'a AtomicUsize);
+
+impl<'a> WaitingGuard<'a> {
+    fn enter(counter: &'a AtomicUsize) -> Self {
+        counter.fetch_add(1, Ordering::SeqCst);
+        Self(counter)
+    }
+}
+
+impl Drop for WaitingGuard<'_> {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::SeqCst);
+    }
 }
 
 impl DynamicConcurrencyLimiterState {
@@ -1076,6 +1166,7 @@ impl DynamicConcurrencyLimiter {
                 semaphore: std::sync::Arc::new(tokio::sync::Semaphore::new(permits)),
                 total_permits: AtomicUsize::new(permits),
                 target: AtomicUsize::new(permits),
+                waiting: AtomicUsize::new(0),
             }),
         }
     }
@@ -1096,9 +1187,24 @@ impl DynamicConcurrencyLimiter {
     /// Sicher von mehreren Tasks gleichzeitig aufrufbar; wartet kooperativ
     /// (kein Busy-Loop) über `tokio::sync::Semaphore`.
     pub async fn acquire(&self) -> Result<ConcurrencyPermit, tokio::sync::AcquireError> {
-        let permit = std::sync::Arc::clone(&self.state.semaphore)
-            .acquire_owned()
-            .await?;
+        let permit = match std::sync::Arc::clone(&self.state.semaphore).try_acquire_owned() {
+            Ok(permit) => permit,
+            Err(_busy) => {
+                // Runde 7, Teil L5: Warten auf einen Modell-Slot sichtbar
+                // machen (z. B. `max_concurrency = 1` bei lokalen Modellen).
+                // Die Wartezeit zählt nicht zum Request-Zeitlimit, das erst
+                // beim Senden beginnt.
+                let _waiting = WaitingGuard::enter(&self.state.waiting);
+                tracing::info!(
+                    waiting = self.state.waiting.load(Ordering::SeqCst),
+                    target = ?self.target(),
+                    "provider.concurrency.waiting_for_slot"
+                );
+                std::sync::Arc::clone(&self.state.semaphore)
+                    .acquire_owned()
+                    .await?
+            }
+        };
         Ok(ConcurrencyPermit {
             permit: Some(permit),
             state: std::sync::Arc::clone(&self.state),
@@ -1200,6 +1306,13 @@ impl DynamicConcurrencyLimiter {
     #[must_use]
     pub fn available(&self) -> usize {
         self.state.semaphore.available_permits()
+    }
+
+    /// Runde 7, Teil L5: Anzahl Aufrufer, die gerade auf einen freien Slot
+    /// warten („wartet auf Modell-Slot“). Für Status-Anzeigen gedacht.
+    #[must_use]
+    pub fn waiting(&self) -> usize {
+        self.state.waiting.load(Ordering::SeqCst)
     }
 }
 
@@ -1472,6 +1585,18 @@ pub struct OpenAiResponsesProvider {
     /// Wird in [`Self::respond_once`] **vor** dem Nebenläufigkeits-Permit
     /// reserviert, nach der Antwort abgeglichen und bei 429 gesperrt.
     budgets: budget::ProviderBudgets,
+    /// Runde 7, Teil L4: Leerlauf-Zeitlimit gestreamter Antworten (keine
+    /// Bytes seit so langer Zeit → [`ModelError::Timeout`]). Ein laufender
+    /// Stream hat kein Gesamt-Zeitlimit; [`Self::request_timeout`] begrenzt
+    /// dort nur die Wartezeit bis zu den Antwort-Headern.
+    stream_idle_timeout: Duration,
+    /// Runde 7, Teil L6: Kompatibilitätsschalter für den
+    /// `chat/completions`-Body (siehe [`ChatCompat`]).
+    chat_compat: ChatCompat,
+    /// Runde 7, Teil L7: Modell-IDs und Aliase dieses Providers mit
+    /// `[capabilities] tool_calling = false` — ihnen werden keine Werkzeuge
+    /// angeboten (siehe [`strip_tools_for_toolless_model`]).
+    toolless_models: BTreeSet<String>,
 }
 
 /// Eine gemerkte Reasoning-Runde der Responses-API (W4a / A-OAI).
@@ -1589,9 +1714,10 @@ impl OpenAiResponsesProvider {
         api_key: SecretString,
         transport: Transport,
     ) -> HttpProviderResult<Self> {
+        let base_url: String = base_url.into();
         Ok(Self {
-            client: http_client()?,
-            base_url: base_url.into(),
+            client: http_client_for_endpoint(&base_url)?,
+            base_url,
             provider_id: "openai".to_owned(),
             model: model.into(),
             api_key,
@@ -1608,6 +1734,9 @@ impl OpenAiResponsesProvider {
             credential_pool: None,
             gateway_identity_headers: false,
             budgets: budget::ProviderBudgets::default(),
+            stream_idle_timeout: DEFAULT_REQUEST_TIMEOUT,
+            chat_compat: ChatCompat::default(),
+            toolless_models: BTreeSet::new(),
         })
     }
 
@@ -1728,17 +1857,13 @@ impl OpenAiResponsesProvider {
                 "provider '{provider_name}' has an empty base_url"
             )));
         }
-        // Auch der öffentliche `from_config`-Pfad erzwingt https (http nur Loopback).
-        validate_endpoint(&provider.base_url)?;
-        let auth_header = provider.auth_header.as_deref().unwrap_or_else(|| {
-            if provider_name == "foundry" || provider_name.starts_with("foundry-") {
-                "api-key"
-            } else if matches!(provider.api.as_str(), "ollama") {
-                "none"
-            } else {
-                "bearer"
-            }
-        });
+        // Auch der öffentliche `from_config`-Pfad erzwingt https (http nur
+        // Loopback bzw. mit `allow_insecure_lan` private LAN-IPs).
+        validate_endpoint_with(&provider.base_url, provider.allow_insecure_lan)?;
+        let auth_header = provider
+            .auth_header
+            .as_deref()
+            .unwrap_or_else(|| default_auth_header(provider_name, provider));
         // Primäres Credential: `provider.auth`, sonst bei `auth_header ==
         // "none"` ein leeres Secret (kein Credential nötig, z. B. Ollama).
         // Ein konfigurierter Credential-Pool ersetzt dies NICHT mehr — er
@@ -1764,7 +1889,7 @@ impl OpenAiResponsesProvider {
             if let Some(pool) = &pool {
                 for index in 0..pool.len() {
                     if let Some(url) = &pool.entry(index).base_url {
-                        validate_endpoint(url)?;
+                        validate_endpoint_with(url, provider.allow_insecure_lan)?;
                     }
                 }
             }
@@ -1857,6 +1982,14 @@ impl OpenAiResponsesProvider {
         http_provider.concurrency_limiter = Some(std::sync::Arc::new(
             DynamicConcurrencyLimiter::new(provider.max_concurrency),
         ));
+        // Runde 7, Teil L4/L6/L7: Zeitlimits, Chat-Kompatibilität und
+        // werkzeuglose Modelle aus der Provider-/Modellkonfiguration.
+        http_provider.request_timeout =
+            Duration::from_secs(provider.effective_request_timeout_secs());
+        http_provider.stream_idle_timeout =
+            Duration::from_secs(provider.effective_stream_idle_timeout_secs());
+        http_provider.chat_compat = ChatCompat::from_provider(provider);
+        http_provider.toolless_models = toolless_models(provider_name, config);
         Ok(http_provider)
     }
 
@@ -1975,17 +2108,42 @@ impl OpenAiResponsesProvider {
 /// # Errors
 /// [`HttpProviderError::Decode`] ohne Echo der Eingabe.
 pub fn validate_endpoint(value: &str) -> HttpProviderResult<()> {
+    validate_endpoint_with(value, false)
+}
+
+/// Wie [`validate_endpoint`], erlaubt aber auf ausdrücklichen Wunsch
+/// (`ProviderToml::allow_insecure_lan`, Runde 7, Teil L8) zusätzlich `http`
+/// zu einer privaten LAN-IP (`10/8`, `172.16/12`, `192.168/16`, IPv6-ULA).
+///
+/// # Arguments
+/// - `value`: die zu prüfende Basis-URL.
+/// - `allow_insecure_lan`: `true` lässt `http` zu privaten LAN-IPs zu;
+///   `false` entspricht exakt [`validate_endpoint`] (nur Loopback).
+///
+/// # Errors
+/// [`HttpProviderError::Decode`] ohne Echo der Eingabe; bei abgelehntem
+/// LAN-`http` mit Hinweis auf `allow_insecure_lan`.
+pub fn validate_endpoint_with(value: &str, allow_insecure_lan: bool) -> HttpProviderResult<()> {
     let endpoint = EgressUrl::parse(value)
         .map_err(|_| HttpProviderError::Decode("invalid provider endpoint".into()))?;
     let url = endpoint.as_url();
-    if value.contains(['<', '>'])
-        || url.query().is_some()
-        || url.fragment().is_some()
-        || !(endpoint.is_https() || endpoint.host().is_loopback())
-    {
+    if value.contains(['<', '>']) || url.query().is_some() || url.fragment().is_some() {
         return Err(HttpProviderError::Decode("provider endpoint must be an HTTPS base URL (HTTP only for loopback hosts) without placeholders, credentials or query parameters".into()));
     }
-    Ok(())
+    if endpoint.is_https() || endpoint.host().is_loopback() {
+        return Ok(());
+    }
+    let is_private_lan = harw_config::host_is_private_lan(&endpoint.host_str());
+    if is_private_lan && allow_insecure_lan {
+        tracing::warn!(
+            "provider endpoint uses unencrypted HTTP on a private LAN address (allow_insecure_lan = true)"
+        );
+        return Ok(());
+    }
+    if is_private_lan {
+        return Err(HttpProviderError::Decode("provider endpoint uses plain HTTP on a private LAN address; set allow_insecure_lan = true for this provider to allow it (HTTP is otherwise only accepted for loopback hosts)".into()));
+    }
+    Err(HttpProviderError::Decode("provider endpoint must be an HTTPS base URL (HTTP only for loopback hosts) without placeholders, credentials or query parameters".into()))
 }
 
 /// Resolves deterministic provider headers before any request can be sent.
@@ -3024,6 +3182,37 @@ fn interpret_chat(
         };
     }
 
+    // Runde 7, Teil L7: weitere Text-Formate lokaler Modelle — Mistral
+    // `[TOOL_CALLS]`, Llama `<|python_tag|>` und eine Antwort, die nur aus
+    // einem (ggf. umzäunten) JSON-Aufruf eines angebotenen Werkzeugs
+    // besteht. Gleiche Fail-closed-Regeln wie oben.
+    if !truncated
+        && tool_calls.is_empty()
+        && !offered_tools.is_empty()
+        && let Some(candidate) = text.as_deref()
+        && let Some((remaining, parsed)) =
+            text_tool_calls::parse_alternative_tool_calls(candidate, offered_tools)
+    {
+        tracing::debug!(
+            count = parsed.len(),
+            "parsed alternative text-embedded tool calls"
+        );
+        tool_calls = parsed
+            .into_iter()
+            .enumerate()
+            .map(|(index, call)| ToolCall {
+                id: ToolCallId::from_str(format!("call_text_{index}")),
+                name: ToolName::new(call.name),
+                arguments: call.arguments,
+            })
+            .collect();
+        text = if remaining.is_empty() {
+            None
+        } else {
+            Some(remaining)
+        };
+    }
+
     let stop = match finish {
         Some("length") => StopReason::MaxTokens,
         Some("content_filter") => StopReason::ContentFilter,
@@ -3037,10 +3226,16 @@ fn interpret_chat(
     if !truncated && text.is_none() && tool_calls.is_empty() && refusal.is_none() {
         return Err(ModelError::EmptyResponse);
     }
-    let field_reasoning = choice
-        .and_then(|choice| choice.pointer("/message/reasoning_content"))
-        .and_then(Value::as_str)
-        .filter(|content| !content.trim().is_empty());
+    // Runde 7, Teil L7: vLLM/LM Studio liefern Denktext je nach Version in
+    // `reasoning_content` oder `reasoning` — beide werden gelesen.
+    let field_reasoning = ["/message/reasoning_content", "/message/reasoning"]
+        .iter()
+        .find_map(|pointer| {
+            choice
+                .and_then(|choice| choice.pointer(pointer))
+                .and_then(Value::as_str)
+                .filter(|content| !content.trim().is_empty())
+        });
     let reasoning = if let Some(reasoning_content) = field_reasoning {
         Some(OpaqueReasoning {
             provider: provider.to_owned(),
@@ -3125,21 +3320,138 @@ fn extract_assistant_text(body: &Value) -> Option<String> {
     if text.is_empty() { None } else { Some(text) }
 }
 
+/// Runde 7, Teil L6: Kompatibilitätsschalter für den
+/// `chat/completions`-Body OpenAI-kompatibler Server.
+///
+/// # Description
+/// Die Vorgabe ([`Default`]) entspricht exakt dem bisherigen Cloud-Verhalten
+/// (`max_completion_tokens`, `reasoning_effort`, `"strict"` je Werkzeug, kein
+/// `parallel_tool_calls`). Für lokale Server (vLLM, LM Studio, llama.cpp)
+/// liefert [`Self::from_provider`] die schlanke Variante, weil diese Server
+/// unbekannte Felder oft mit HTTP 400 ablehnen oder `strict` falsch
+/// interpretieren.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ChatCompat {
+    /// Feld für die Ausgabe-Obergrenze.
+    max_tokens_field: harw_config::MaxTokensField,
+    /// `reasoning_effort` senden, wenn der Request einen trägt.
+    send_reasoning_effort: bool,
+    /// Werkzeug-Schemas strikt machen und `"strict"` senden.
+    strict_tools: bool,
+    /// Wert für `parallel_tool_calls`, sofern Werkzeuge angeboten werden.
+    parallel_tool_calls: Option<bool>,
+}
+
+impl Default for ChatCompat {
+    fn default() -> Self {
+        Self {
+            max_tokens_field: harw_config::MaxTokensField::MaxCompletionTokens,
+            send_reasoning_effort: true,
+            strict_tools: true,
+            parallel_tool_calls: None,
+        }
+    }
+}
+
+impl ChatCompat {
+    /// Liest die wirksamen Schalter eines Providers (explizite Felder,
+    /// sonst lokale bzw. Cloud-Vorgaben).
+    ///
+    /// # Arguments
+    /// - `provider`: die Provider-Konfiguration.
+    ///
+    /// # Returns
+    /// Die wirksamen [`ChatCompat`]-Schalter.
+    pub(crate) fn from_provider(provider: &harw_config::ProviderToml) -> Self {
+        Self {
+            max_tokens_field: provider.effective_max_tokens_field(),
+            send_reasoning_effort: provider.effective_send_reasoning_effort(),
+            strict_tools: provider.effective_strict_tools(),
+            parallel_tool_calls: provider.effective_parallel_tool_calls(),
+        }
+    }
+}
+
+/// Runde 7, Teil L7: Modell-IDs und Aliase von `provider_name`, deren
+/// Modelldatei `[capabilities] tool_calling = false` sagt.
+fn toolless_models(provider_name: &str, config: &harw_config::ResolvedConfig) -> BTreeSet<String> {
+    let mut models = BTreeSet::new();
+    for model in config
+        .models
+        .values()
+        .filter(|model| model.provider == provider_name)
+        .filter(|model| model.capabilities.tool_calling == Some(false))
+    {
+        models.insert(model.id.clone());
+        models.extend(model.aliases.iter().cloned());
+    }
+    models
+}
+
+/// Hinweis an ein Modell ohne Werkzeugaufrufe (Runde 7, Teil L7).
+const TOOLLESS_MODEL_NOTICE: &str = "Hinweis: Dieses Modell unterstützt keine Werkzeugaufrufe. Es stehen dir in dieser Runde keine Werkzeuge zur Verfügung; antworte ausschließlich mit Text und beschreibe gegebenenfalls, welche Werkzeuge du bräuchtest.";
+
+/// Runde 7, Teil L7: Entfernt die Werkzeuge aus `request`, wenn `model`
+/// laut Konfiguration keine Werkzeugaufrufe beherrscht, und hängt einen
+/// kurzen Hinweis an die Instruktionen an.
+///
+/// # Arguments
+/// - `request`: der ausgehende Request (wird verändert).
+/// - `model`: die wirksame Modell-ID.
+/// - `toolless`: Modell-IDs/Aliase mit `tool_calling = false`.
+///
+/// # Returns
+/// `true`, wenn Werkzeuge entfernt wurden.
+fn strip_tools_for_toolless_model(
+    request: &mut ModelRequest,
+    model: &str,
+    toolless: &BTreeSet<String>,
+) -> bool {
+    if request.tools.is_empty() || !toolless.contains(model) {
+        return false;
+    }
+    tracing::warn!(
+        model,
+        offered = request.tools.len(),
+        "model has tool_calling = false; tools are not offered for this request"
+    );
+    request.tools.clear();
+    request
+        .instruction_fragments
+        .push(TOOLLESS_MODEL_NOTICE.to_owned());
+    true
+}
+
 /// Übersetzt die dem Modell angebotenen [`ToolSpec`]s in das
 /// Chat-Completions-Wire-Format des `tools`-Arrays:
 /// `{type:"function", function:{name, description, parameters, strict}}`.
+#[cfg(test)]
 fn build_chat_tools(tools: &[ToolSpec]) -> Vec<Value> {
+    build_chat_tools_with(tools, true)
+}
+
+/// Wie `build_chat_tools`; `strict_tools = false` (Runde 7, Teil L6)
+/// sendet die Schemas unverändert und ohne `"strict"`-Feld.
+fn build_chat_tools_with(tools: &[ToolSpec], strict_tools: bool) -> Vec<Value> {
     let names = tool_names::ToolNameCodec::for_tools(tools);
     tools
         .iter()
         .map(|spec| match spec {
-            ToolSpec::Function(f) => serde_json::json!({
+            ToolSpec::Function(f) if strict_tools => serde_json::json!({
                 "type": "function",
                 "function": {
                     "name": names.encode(f.name.as_str()),
                     "description": f.description,
                     "parameters": strict_parameters(f),
                     "strict": f.strict,
+                },
+            }),
+            ToolSpec::Function(f) => serde_json::json!({
+                "type": "function",
+                "function": {
+                    "name": names.encode(f.name.as_str()),
+                    "description": f.description,
+                    "parameters": f.parameters,
                 },
             }),
         })
@@ -3170,7 +3482,17 @@ fn build_chat_tools(tools: &[ToolSpec]) -> Vec<Value> {
 ///
 /// # Returns
 /// Ein [`serde_json::Value`]-Objekt, direkt als Request-Body serialisierbar.
+/// Seit Runde 7 (Teil L6) nutzt der Sendepfad [`build_chat_body_with`];
+/// diese Fassung mit Cloud-Vorgaben bleibt für die bestehenden Tests.
+#[cfg(test)]
 fn build_chat_body(request: &ModelRequest, model: &str) -> Value {
+    build_chat_body_with(request, model, ChatCompat::default())
+}
+
+/// Baut den `chat/completions`-Body (siehe `build_chat_body`) mit den Kompatibilitätsschaltern `compat`
+/// (Runde 7, Teil L6): Feld der Ausgabe-Obergrenze, `reasoning_effort`,
+/// `"strict"` je Werkzeug und `parallel_tool_calls`.
+fn build_chat_body_with(request: &ModelRequest, model: &str, compat: ChatCompat) -> Value {
     let renderer = ToolResultRenderer::new(request);
     let names = tool_names::ToolNameCodec::for_request(request);
     let mut messages: Vec<Value> = Vec::new();
@@ -3225,13 +3547,28 @@ fn build_chat_body(request: &ModelRequest, model: &str) -> Value {
 
     let mut body = serde_json::json!({ "model": model, "messages": messages });
     if !request.tools.is_empty() {
-        body["tools"] = Value::Array(build_chat_tools(&request.tools));
+        body["tools"] = Value::Array(build_chat_tools_with(&request.tools, compat.strict_tools));
+        if let Some(parallel) = compat.parallel_tool_calls {
+            body["parallel_tool_calls"] = Value::Bool(parallel);
+        }
     }
-    if let Some(effort) = request.reasoning_effort {
+    if compat.send_reasoning_effort
+        && let Some(effort) = request.reasoning_effort
+    {
         body["reasoning_effort"] = Value::from(map_effort_to_openai(effort));
     }
     if let Some(max_output_tokens) = request.max_output_tokens {
-        body["max_completion_tokens"] = Value::from(max_output_tokens);
+        let (plain, completion) = match compat.max_tokens_field {
+            harw_config::MaxTokensField::MaxTokens => (true, false),
+            harw_config::MaxTokensField::MaxCompletionTokens => (false, true),
+            harw_config::MaxTokensField::Both => (true, true),
+        };
+        if plain {
+            body["max_tokens"] = Value::from(max_output_tokens);
+        }
+        if completion {
+            body["max_completion_tokens"] = Value::from(max_output_tokens);
+        }
     }
     body
 }
@@ -3664,7 +4001,12 @@ impl OpenAiResponsesProvider {
         credential_idx: Option<usize>,
     ) -> Result<ModelResponse, ModelError> {
         let (api_key, base_url) = self.credential_for(credential_idx);
-        let model = self.selected_model(&request)?;
+        let mut request = request;
+        let model = self.selected_model(&request)?.to_owned();
+        let model = model.as_str();
+        // Runde 7, Teil L7: Modelle ohne Werkzeugaufrufe bekommen keine
+        // Werkzeuge angeboten (plus Hinweis in den Instruktionen).
+        strip_tools_for_toolless_model(&mut request, model, &self.toolless_models);
         // Für `authorized_request` (Gateway-Identity-Header, siehe
         // [`Self::gateway_identity_headers`]) — geliehen von `request`, das
         // bis nach dem Response-Parsing im Scope bleibt.
@@ -3690,7 +4032,7 @@ impl OpenAiResponsesProvider {
                     model,
                     self.cache_overrides.get(model).copied(),
                 );
-                let mut body = build_chat_body(&request, model);
+                let mut body = build_chat_body_with(&request, model, self.chat_compat);
                 cache_strategy::apply_chat_cache_control(&mut body, strategy);
                 tracing::debug!(model, strategy = strategy.label(), "sending chat request");
                 (format!("{base_url}/chat/completions"), body)
@@ -3761,12 +4103,14 @@ impl OpenAiResponsesProvider {
         let mut codex_refreshed_after_401 = false;
         let response = loop {
             let builder = self.authorized_request(&url, api_key, identity).await?;
-            let response = builder
-                .json(&wire)
-                .timeout(self.request_timeout)
-                .send()
-                .await
-                .map_err(|error| model_error_for_transport(error, false))?;
+            // Runde 7, Teil L4: gestreamt begrenzt `request_timeout` nur die
+            // Wartezeit bis zu den Headern; der Body läuft mit Leerlauf-Limit.
+            let response = send_with_timeout(
+                builder.json(&wire),
+                self.request_timeout,
+                stream_sink.is_some(),
+            )
+            .await?;
 
             if response.status() == reqwest::StatusCode::UNAUTHORIZED
                 && !codex_refreshed_after_401
@@ -3790,7 +4134,7 @@ impl OpenAiResponsesProvider {
         } else if status.is_success()
             && let Some(sink) = stream_sink
         {
-            read_native_stream(response, self.transport, sink).await?
+            read_native_stream(response, self.transport, sink, self.stream_idle_timeout).await?
         } else {
             let body = response
                 .text()
@@ -3860,22 +4204,63 @@ impl OpenAiResponsesProvider {
     }
 }
 
+/// Runde 7, Teil L4: Sendet `builder` mit dem passenden Zeitlimit.
+///
+/// # Description
+/// - Nicht gestreamt: `timeout` gilt für den gesamten Request inklusive Body
+///   (bisheriges Verhalten, reqwest-`timeout`).
+/// - Gestreamt: `timeout` begrenzt nur die Wartezeit bis zu den
+///   Antwort-Headern (z. B. Prompt-Verarbeitung eines lokalen Modells); der
+///   Body wird danach mit dem Leerlauf-Zeitlimit gelesen (siehe
+///   [`sse::read_sse`]), sodass lange, aber stetig fließende Antworten nicht
+///   mehr nach einer festen Gesamtzeit abbrechen.
+///
+/// # Errors
+/// [`ModelError::Timeout`] bei Überschreitung, sonst die Transportfehler
+/// aus [`model_error_for_transport`].
+pub(crate) async fn send_with_timeout(
+    builder: reqwest::RequestBuilder,
+    timeout: Duration,
+    streaming: bool,
+) -> Result<reqwest::Response, ModelError> {
+    if !streaming {
+        return builder
+            .timeout(timeout)
+            .send()
+            .await
+            .map_err(|error| model_error_for_transport(error, false));
+    }
+    match tokio::time::timeout(timeout, builder.send()).await {
+        Ok(result) => result.map_err(|error| model_error_for_transport(error, false)),
+        Err(_elapsed) => Err(ModelError::Timeout {
+            message: format!(
+                "provider sent no response headers within {} s (request_timeout_secs)",
+                timeout.as_secs()
+            ),
+        }),
+    }
+}
+
 /// Liest eine gestreamte Responses-/Chat-Antwort und rekonstruiert daraus den
 /// nicht-gestreamten Body; Deltas gehen live an `sink`.
 async fn read_native_stream(
     response: reqwest::Response,
     transport: Transport,
     sink: &harw_core::StreamSink,
+    idle_timeout: Duration,
 ) -> Result<Value, ModelError> {
     match transport {
         Transport::Chat => {
             let mut accumulator = sse::ChatStreamAccumulator::default();
-            sse::read_sse(response, |frame| accumulator.push(&frame, Some(sink))).await?;
+            sse::read_sse(response, Some(idle_timeout), |frame| {
+                accumulator.push(&frame, Some(sink))
+            })
+            .await?;
             accumulator.finish()
         }
         Transport::Responses => {
             let mut terminal = None;
-            sse::read_sse(response, |frame| {
+            sse::read_sse(response, Some(idle_timeout), |frame| {
                 if frame.data.trim().is_empty() || frame.data.trim() == "[DONE]" {
                     return Ok(false);
                 }
@@ -4713,6 +5098,14 @@ mod tests {
             originator: None,
             default_reasoning_effort: None,
             gateway_identity_headers: false,
+            request_timeout_secs: None,
+            stream_idle_timeout_secs: None,
+            retry_timeouts: None,
+            max_tokens_field: None,
+            send_reasoning_effort: None,
+            strict_tools: None,
+            parallel_tool_calls: None,
+            allow_insecure_lan: false,
         }
     }
 
@@ -7263,6 +7656,14 @@ mod tests {
             originator: None,
             default_reasoning_effort: None,
             gateway_identity_headers: false,
+            request_timeout_secs: None,
+            stream_idle_timeout_secs: None,
+            retry_timeouts: None,
+            max_tokens_field: None,
+            send_reasoning_effort: None,
+            strict_tools: None,
+            parallel_tool_calls: None,
+            allow_insecure_lan: false,
         }
     }
 
@@ -8098,3 +8499,7 @@ mod tests {
 // Test-Fehlertyp (Bible R087/R165/R182), nur für Tests.
 #[cfg(test)]
 mod test_support;
+
+// Runde 7, Teil L: Tests für lokale Modell-Server gegen Fake-HTTP-Server.
+#[cfg(test)]
+mod local_model_tests;

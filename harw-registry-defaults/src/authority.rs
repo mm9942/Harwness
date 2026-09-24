@@ -475,6 +475,11 @@ pub fn authority_reducer_for_role(role: &str) -> Option<AuthorityReducer> {
         // Muster `executor`: kein Reducer trägt `WriteWorkspace` oder
         // `ExecuteProcess` weiter.
         role_names::UIA_LATEX_WRITER => Some(AuthorityReducer::ReadOnly),
+        // Runde 7, Teil M: der Game Master liest höchstens einen Brief im
+        // Workspace (`MatrixReader`) — kein Netz, kein Schreiben, keine
+        // Ausführung. Seine Sitz-Agenten bekommen ihre Unterlagen-Sicht vom
+        // Runner (`SandboxSpec::harness_read_view`), nie mehr als er selbst.
+        role_names::MATRIX_GAME_MASTER => Some(AuthorityReducer::ReadOnly),
         _ => None,
     }
 }
@@ -628,6 +633,9 @@ pub fn tool_permission(tool: &str) -> Option<Permission> {
     let listed = |list: &[&str]| list.contains(&tool);
     if tool == "fs.write"
         || tool == "fs.edit"
+        // Runde 7, Teil T2: `latex.template` schreibt Vorlage und Gerüst in
+        // den Workspace (kein Prozess) — vor dem `LATEX_TOOLS`-Zweig geprüft.
+        || tool == crate::profile::LATEX_TEMPLATE_TOOL
         || listed(AGENT_DEFINITION_WRITE_TOOLS)
         || listed(SKILL_PROPOSAL_PROPOSE_TOOLS)
         || listed(SKILL_PROPOSAL_DECIDE_TOOLS)
@@ -1153,6 +1161,16 @@ mod tests {
         );
         assert_eq!(
             tool_permission("latex.build"),
+            Some(Permission::ExecuteProcess)
+        );
+        // Runde 7, Teil T2/T4: `latex.template` schreibt nur (WriteWorkspace),
+        // `latex.check` startet `kpsewhich`/`fc-list` (ExecuteProcess).
+        assert_eq!(
+            tool_permission("latex.template"),
+            Some(Permission::WriteWorkspace)
+        );
+        assert_eq!(
+            tool_permission("latex.check"),
             Some(Permission::ExecuteProcess)
         );
         for role in [

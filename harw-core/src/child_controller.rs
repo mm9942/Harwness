@@ -129,6 +129,31 @@ use uuid::Uuid;
 /// abgebrochen wurde, weil ein anderes Kind zuerst fertig war.
 const CANCELLED_BY_SIBLING: &str = "cancelled: sibling completed first";
 
+/// Runde 7, Teil A7: ob der Start eines Hintergrund-Kindes einen bereits
+/// gesetzten Abbruch überlebt.
+///
+/// # Beschreibung
+/// Nur ein **geerbter** Abbruch ([`CancelReason::Parent`]) des startenden
+/// Turns, dessen Elternteil nicht herunterfährt bzw. seine Lease verlor.
+/// Ein Abbruch des Kindes selbst bleibt immer bestehen.
+///
+/// # Argumente
+/// - `child_reason` (`Option<CancelReason>`): Grund am Token des Kindes.
+/// - `parent_reason` (`Option<CancelReason>`): Grund am Token des Elternteils.
+///
+/// # Returns
+/// `true`, wenn der Start mit frischem Token abgeschlossen wird.
+fn detached_start_survives(
+    child_reason: Option<CancelReason>,
+    parent_reason: Option<CancelReason>,
+) -> bool {
+    matches!(child_reason, Some(CancelReason::Parent))
+        && !matches!(
+            parent_reason,
+            Some(CancelReason::Shutdown | CancelReason::LeaseLost)
+        )
+}
+
 /// Das Effort-Level, auf das ein Kind geklammert wird, wenn der Elternteil
 /// selbst keines gesetzt hat.
 ///
@@ -1005,6 +1030,43 @@ pub struct ChildRunResult {
     pub budget_handoff: Option<crate::child_handoff::BudgetHandoff>,
 }
 
+/// Hinweis, der ein budget-beendetes Teilergebnis für den Elternteil markiert
+/// (Runde 7, Teil A1).
+pub const TRANSFER_BUDGET_NOTE: &str =
+    "Budget des Kind-Agenten erschöpft – Teilergebnis bzw. Übergabe-Zusammenfassung";
+
+impl ChildRunResult {
+    /// Text für den Elternteil eines budget-beendeten Laufs.
+    ///
+    /// # Beschreibung
+    /// Runde 7, Teil A1: Transfers geben das Ergebnis eines vom Token-Budget
+    /// beendeten Kindes als Freitext zurück. Eine verdichtete Übergabe trägt
+    /// ihre Markierung selbst; eine rohe letzte Antwort bekommt den Präfix
+    /// `[budget_exhausted: true]`. Der Text ist wie im regulären Rückweg auf
+    /// [`CHILD_RETURN_MAX_BYTES`] gekappt (die Kürzungsmarke nennt
+    /// `agent.result`).
+    ///
+    /// # Returns
+    /// `Some(text)`, wenn [`Self::budget_exhausted`] gesetzt ist; sonst
+    /// `None`.
+    #[must_use]
+    pub fn budget_exhausted_parent_text(&self) -> Option<String> {
+        if !self.budget_exhausted {
+            return None;
+        }
+        let partial = self.full_text.as_deref().unwrap_or_default();
+        let partial = cap_child_return_text_for_child(partial, CHILD_RETURN_MAX_BYTES, &self.child);
+        if self.budget_handoff == Some(crate::child_handoff::BudgetHandoff::Compacted) {
+            return Some(partial);
+        }
+        Some(if partial.trim().is_empty() {
+            format!("[budget_exhausted: true] {TRANSFER_BUDGET_NOTE}; keine Antwort vorhanden.")
+        } else {
+            format!("[budget_exhausted: true] {TRANSFER_BUDGET_NOTE}.\n\n{partial}")
+        })
+    }
+}
+
 /// Lebenszyklus-Status eines admittierten Kindes.
 ///
 /// # Description
@@ -1048,6 +1110,10 @@ pub type ModelKnownProbe = dyn Fn(Option<&str>) -> bool + Send + Sync;
 
 /// Kontextfenster eines Kindes ohne Resolver (Addendum D).
 pub const DEFAULT_CHILD_CONTEXT_WINDOW: u64 = 200_000;
+
+/// Runde 7, Teil L9: unter diesem Kontextfenster (Tokens) bekommt ein Kind
+/// kompakte Werkzeugschemas.
+pub const COMPACT_TOOL_SCHEMA_WINDOW_TOKENS: u64 = 64_000;
 
 /// Höchster Anteil (Prozent) des Kind-Fensters, den der Auftrag
 /// (`task`/`context`) belegen darf (Teil C). Ein längerer Auftrag wird in
@@ -3223,20 +3289,58 @@ impl ManagedAgentSpawner {
     /// **vor** dem ersten Lauf aufgerufen werden: später admittierte
     /// Nachkommen leiten sich dann vom neuen Token ab.
     ///
+    /// Runde 7, Teil A7: traf den startenden UIA-Turn **während des
+    /// Starts** ein Abbruch (Turn-Grenze/Budget oder Esc), trägt der Token
+    /// des Kindes nur den geerbten Grund [`CancelReason::Parent`]. Der Start
+    /// wird dann trotzdem abgeschlossen (frischer Token) — das Kind gehört
+    /// ab jetzt nicht mehr zum Turn. Ein Abbruch des Kindes selbst
+    /// (`agent.cancel`, Budget, Lease) und ein geerbtes Herunterfahren
+    /// ([`CancelReason::Shutdown`]/[`CancelReason::LeaseLost`] am
+    /// Elternteil) werden nie zurückgenommen.
+    ///
     /// # Returns
     /// `true`, wenn der Token ersetzt wurde; `false` für unbekannte oder
-    /// bereits abgebrochene Kinder (ein Abbruch wird nie zurückgenommen).
+    /// selbst abgebrochene Kinder.
     pub(crate) fn detach_cancel_token(&self, child: &SessionId) -> bool {
+        let parent_reason = self
+            .child_record(child)
+            .and_then(|record| self.parent_cancel_reason(&record.parent));
         let Ok(mut tokens) = self.cancellations.lock() else {
             return false;
         };
-        match tokens.get(child.as_str()) {
-            Some(current) if !current.is_cancelled() => {
-                tokens.insert(child.as_str().to_owned(), CancelToken::new());
-                true
+        let (replace, revived) = match tokens.get(child.as_str()) {
+            Some(current) if !current.is_cancelled() => (true, false),
+            Some(current) => {
+                let survives = detached_start_survives(current.reason(), parent_reason);
+                (survives, survives)
             }
-            _ => false,
+            None => (false, false),
+        };
+        if revived {
+            tracing::warn!(
+                child = %child,
+                ?parent_reason,
+                "background_child.start_survives_turn_abort"
+            );
         }
+        if replace {
+            tokens.insert(child.as_str().to_owned(), CancelToken::new());
+        }
+        replace
+    }
+
+    /// Abbruchgrund des registrierten Tokens eines Elternteils (Wurzel)
+    /// bzw. eines admittierten Eltern-Kindes (Runde 7, Teil A7).
+    fn parent_cancel_reason(&self, parent: &SessionId) -> Option<CancelReason> {
+        if let Some(reason) = self.parent_tokens.lock().ok().and_then(|tokens| {
+            tokens
+                .get(parent.as_str())
+                .map(|entry| entry.token.reason())
+        }) {
+            return reason;
+        }
+        self.child_cancel_token(parent)
+            .and_then(|token| token.reason())
     }
 
     /// Registriert den Cancel-Token eines Elternteils, der kein admittiertes Kind ist.
@@ -4324,6 +4428,53 @@ impl ManagedAgentSpawner {
             .await
     }
 
+    /// Führt einen Kind-Turn unter dem **bei der Admission hinterlegten**
+    /// Budget aus.
+    ///
+    /// # Beschreibung
+    /// Runde 7, Teil A1: Transfers (`transfer_to_*`, synchron wie im
+    /// Hintergrund) liefen bisher über [`Self::run_child`] und damit ohne
+    /// jede Budgetprüfung — die Token-, Aufruf- und Zeitgrenzen aus
+    /// `[spawn.budget]` der Agent-TOML griffen nie, ebenso wenig die
+    /// Abschlussrunde bei 80 % und die Übergabe-Verdichtung. Diese Methode
+    /// liest den Deckel aus dem [`ChildRecord`] (dieselbe Quelle, die
+    /// `delegate_wave` über [`Self::child_budget`] nutzt) und läuft über
+    /// [`Self::run_child_with_budget`], also denselben
+    /// `enforce_child_budget`-Pfad. Ein Kind ohne Agent-IR hat
+    /// [`AgentBudget::default`] (kein Deckel) — das Verhalten ist dann
+    /// unverändert.
+    ///
+    /// # Argumente
+    /// - `child` (`&SessionId`): das admittierte Kind.
+    /// - `store` (`&dyn StateStore`): Transkript-Persistenz des Kind-Turns.
+    /// - `approvals` (`Option<&ApprovalStore>`): durabler Approval-Ledger oder
+    ///   `None`.
+    /// - `input` (`TurnInput`): der Turn-Input.
+    ///
+    /// # Returns
+    /// Das Ergebnis von [`Self::run_child_with_budget`].
+    ///
+    /// # Errors
+    /// Wie [`Self::run_child_with_budget`].
+    pub async fn run_child_with_declared_budget(
+        &self,
+        child: &SessionId,
+        store: &dyn StateStore,
+        approvals: Option<&ApprovalStore>,
+        input: TurnInput,
+    ) -> Result<ChildRunResult, ChildRunError> {
+        let budget = self.child_budget(child).unwrap_or_default();
+        tracing::info!(
+            child = %child,
+            max_tokens = ?budget.max_tokens,
+            max_tool_calls = ?budget.max_tool_calls,
+            max_wall_time_ms = ?budget.max_wall_time_ms,
+            "child_budget.transfer_enforced"
+        );
+        self.run_child_with_budget(child, store, approvals, input, budget)
+            .await
+    }
+
     /// Führt einen Kind-Turn unter einem Budget aus.
     ///
     /// # Beschreibung
@@ -5194,8 +5345,9 @@ impl ManagedAgentSpawner {
                 // werden unterschieden und nie als Erfolg verbucht.
                 // Runde 5, Teil M: in beiden Fällen ein Endbericht mit
                 // Journal; ein Budget-Abbruch (Zeitbudget) wird vom
-                // Budget-Pfad (`enforce_child_budget`) berichtet, ein
-                // Provider-/Turn-Fehler nie verdichtet.
+                // Budget-Pfad (`enforce_child_budget`) berichtet. Runde 7,
+                // Teil A3: ein Provider-/Turn-Fehler wird mit eigenem
+                // Zeitlimit verdichtet (sonst Journal + letzter Text).
                 let cause = if token.is_cancelled() {
                     self.set_status(child, ChildStatus::Cancelled);
                     Self::cancel_cause(token.reason())
@@ -5587,7 +5739,6 @@ impl ManagedAgentSpawner {
             }
         } else {
             let note = match &cause {
-                ChildEndCause::TurnError(_) => "Provider-/Turn-Fehler, kein weiterer Modellaufruf",
                 ChildEndCause::Cancelled { .. } | ChildEndCause::Released => "abgebrochen",
                 ChildEndCause::LeaseExpired => "die Sitzung ist nach dem Lease-Ablauf verworfen",
                 _ => "bei diesem Ende nicht vorgesehen",
@@ -6913,6 +7064,19 @@ impl ManagedAgentSpawner {
             // höchstens, was bis `CHILD_BASE_LOAD_MAX_WINDOW_PERCENT` % übrig
             // bleibt; bleibt dafür nicht einmal `CHILD_MIN_TASK_TOKENS`,
             // scheitert die Admission mit Zahlen statt später am Kontextlimit.
+            // Runde 7, Teil L9: kleine Kontextfenster (lokale Modelle)
+            // bekommen kompakte Werkzeugschemas, damit die Grundlast die
+            // 50-%-Prüfung nicht sprengt. Die Werkzeugauswahl ist bereits
+            // auf die Rolle geschnitten (Aktivierung, s. o.).
+            if window < COMPACT_TOOL_SCHEMA_WINDOW_TOKENS {
+                child_session.set_compact_tool_schemas(true);
+                tracing::info!(
+                    child = %child,
+                    role = role_name,
+                    window_tokens = window,
+                    "child_admission.compact_tool_schemas"
+                );
+            }
             let calibration = *child_session.token_calibration();
             let tool_tokens = crate::turn_loop::collect_tools(child_session)
                 .ok()
@@ -12494,6 +12658,28 @@ max_depth = 0
         Ok(())
     }
 
+    /// Runde 7, Teil L9: ein Kind mit Fenster < 64k bekommt kompakte
+    /// Werkzeugschemas, ein großes nicht.
+    #[test]
+    fn a_small_window_child_gets_compact_tool_schemas() -> TestResult {
+        for (window, expected) in [(32_000_u64, true), (200_000_u64, false)] {
+            let (spawner, parent, sandbox) =
+                window_test_spawner(Arc::new(EmptyChildRegistry), None)?;
+            let spawner =
+                spawner.with_context_window_resolver(Arc::new(move |_model: Option<&str>| window));
+            let child = spawner
+                .admit("worker", spawn_input(parent), sandbox, None)
+                .map_err(|error| TestError::Unexpected(error.message))?;
+            let manager = spawner
+                .manager
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let session = manager.get(&child).map_err(ctx("child is manager-owned"))?;
+            assert_eq!(session.compact_tool_schemas(), expected, "window {window}");
+        }
+        Ok(())
+    }
+
     #[test]
     fn a_base_load_beyond_half_the_window_is_a_typed_error_with_numbers() -> TestResult {
         let (spawner, parent, sandbox) = window_test_spawner(Arc::new(EmptyChildRegistry), None)?;
@@ -12643,6 +12829,131 @@ max_depth = 0
             Some(crate::child_handoff::BudgetHandoff::LastAnswer)
         );
         Ok(())
+    }
+
+    // --- Runde 7, Teil A7: Start überlebt einen geerbten Turn-Abbruch ---
+
+    #[test]
+    fn only_an_inherited_turn_abort_is_survived_by_a_background_start() {
+        use CancelReason::{Budget, LeaseLost, Parent, Shutdown, User};
+        assert!(detached_start_survives(Some(Parent), Some(User)));
+        assert!(detached_start_survives(Some(Parent), Some(Budget)));
+        assert!(detached_start_survives(Some(Parent), None));
+        assert!(!detached_start_survives(Some(Parent), Some(Shutdown)));
+        assert!(!detached_start_survives(Some(Parent), Some(LeaseLost)));
+        // Ein Abbruch des Kindes selbst bleibt bestehen.
+        assert!(!detached_start_survives(Some(User), None));
+        assert!(!detached_start_survives(Some(Budget), None));
+        assert!(!detached_start_survives(None, None));
+    }
+
+    // --- Runde 7, Teil A1: Budget auch für Transfers --------------------
+
+    /// Setzt den bei der Admission hinterlegten Budget-Deckel eines
+    /// Test-Kindes (wie ihn die Agent-IR liefern würde).
+    fn set_declared_budget(spawner: &ManagedAgentSpawner, child: &SessionId, budget: AgentBudget) {
+        if let Some(record) = spawner
+            .active
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .get_mut(child.as_str())
+        {
+            record.budget = budget;
+        }
+    }
+
+    #[tokio::test]
+    async fn a_transfer_child_keeps_its_declared_token_budget_with_a_wrap_up_round() -> TestResult {
+        let model = Arc::new(BudgetProbeModel {
+            rounds: AtomicUsize::new(0),
+            wrap_up_seen: Mutex::new(Vec::new()),
+        });
+        let (spawner, children) = runnable_children(
+            Arc::new(BudgetProbeRegistry {
+                model: model.clone(),
+            }),
+            true,
+            1,
+            empty_registry,
+        )?;
+        let spawner =
+            spawner.with_budget_handoff(crate::child_handoff::BudgetHandoffMode::LastAnswer);
+        let child = children[0].clone();
+        set_declared_budget(
+            &spawner,
+            &child,
+            AgentBudget {
+                max_tokens: Some(1_000),
+                ..AgentBudget::default()
+            },
+        );
+        let store = InMemoryStateStore::new();
+
+        let result = spawner
+            .run_child_with_declared_budget(&child, &store, None, TurnInput::user("erkunde"))
+            .await
+            .map_err(|error| TestError::Unexpected(format!("partial result expected: {error}")))?;
+
+        assert!(result.budget_exhausted, "the declared budget must apply");
+        assert_eq!(model.rounds.load(Ordering::SeqCst), 5);
+        let seen = model
+            .wrap_up_seen
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone();
+        assert_eq!(seen.last(), Some(&true), "wrap-up instruction at 80 %");
+        let text = result
+            .budget_exhausted_parent_text()
+            .ok_or(TestError::Missing("budget-ended text for the parent"))?;
+        assert!(text.starts_with("[budget_exhausted: true]"), "{text}");
+        assert!(text.contains("Zwischenstand 5"), "{text}");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_transfer_child_keeps_its_declared_wall_time_budget() -> TestResult {
+        let (spawner, children) =
+            runnable_children(Arc::new(HangingChildRegistry), true, 1, empty_registry)?;
+        let child = children[0].clone();
+        set_declared_budget(
+            &spawner,
+            &child,
+            AgentBudget {
+                max_wall_time_ms: Some(25),
+                ..AgentBudget::default()
+            },
+        );
+        let store = InMemoryStateStore::new();
+
+        let Err(error) = spawner
+            .run_child_with_declared_budget(&child, &store, None, TurnInput::user("work"))
+            .await
+        else {
+            return Err(TestError::Unexpected(
+                "the declared wall-time budget must stop the transfer child".to_owned(),
+            ));
+        };
+        assert!(matches!(error, ChildRunError::BudgetExhausted(_)));
+        assert!(
+            error.message().starts_with("budget_exceeded: wall_time"),
+            "{}",
+            error.message()
+        );
+        assert!(child_is_manager_owned(&spawner, &child));
+        Ok(())
+    }
+
+    #[test]
+    fn a_regular_run_has_no_budget_exhausted_parent_text() {
+        let result = ChildRunResult {
+            child: SessionId::new(),
+            outcome: TurnOutcome::Completed,
+            full_text: Some("fertig".to_owned()),
+            usage: ChildUsage::default(),
+            budget_exhausted: false,
+            budget_handoff: None,
+        };
+        assert!(result.budget_exhausted_parent_text().is_none());
     }
 
     // --- Runde 5, Teil J: Übergabe-Verdichtung am Budget-Ende ------------
@@ -13178,6 +13489,9 @@ max_depth = 0
         Hang,
         /// Provider-Fehler.
         Fail,
+        /// Runde 7, Teil A3: Provider-Fehler, und auch die Verdichtung
+        /// scheitert (Provider ganz weg).
+        FailEverything,
         /// Schließt mit einer Antwort ab.
         Finish,
     }
@@ -13211,6 +13525,11 @@ max_depth = 0
                     .contains(crate::child_handoff::HANDOFF_INSTRUCTION_MARKER)
                 {
                     self.compaction_calls.fetch_add(1, Ordering::SeqCst);
+                    if matches!(self.turn, EndProbeTurn::FailEverything) {
+                        return Err(crate::model::ModelError::RequestFailed(
+                            "provider unreachable".to_owned(),
+                        ));
+                    }
                     return Ok(ModelResponse {
                         message: Some(structured_handoff_reply()),
                         ..Default::default()
@@ -13238,9 +13557,11 @@ max_depth = 0
                         std::future::pending::<()>().await;
                         Ok(ModelResponse::text("unreachable"))
                     }
-                    EndProbeTurn::Fail => Err(crate::model::ModelError::RequestFailed(
-                        "provider 529 overloaded".to_owned(),
-                    )),
+                    EndProbeTurn::Fail | EndProbeTurn::FailEverything => {
+                        Err(crate::model::ModelError::RequestFailed(
+                            "provider 529 overloaded".to_owned(),
+                        ))
+                    }
                     EndProbeTurn::Finish => Ok(ModelResponse::text("fertig")),
                 }
             })
@@ -13357,10 +13678,11 @@ max_depth = 0
         Ok(())
     }
 
-    /// Provider-Fehler: Journal ja, Verdichtung nein (kein weiterer
-    /// Modellaufruf gegen einen gerade gescheiterten Provider).
+    /// Runde 7, Teil A3: Provider-Fehler — Journal **und** ein kurzer
+    /// Zusammenfassungsaufruf mit eigenem Zeitlimit; der Lauf endet nie mehr
+    /// ohne Ergebnis.
     #[tokio::test]
-    async fn a_provider_error_delivers_the_journal_without_compaction() -> TestResult {
+    async fn a_provider_error_delivers_the_journal_and_a_summary() -> TestResult {
         let (spawner, child, model) = end_probe_child(EndProbeTurn::Fail).await?;
         let store = InMemoryStateStore::new();
         let _result = spawner
@@ -13376,8 +13698,46 @@ max_depth = 0
             .child_end_report(&child)
             .ok_or(TestError::Missing("Endbericht"))?;
         assert_eq!(report.status, crate::child_comms::ChildEndStatus::Failed);
+        assert!(
+            report.handoff.is_some(),
+            "Zusammenfassung nach Providerfehler"
+        );
+        assert_eq!(model.compaction_calls.load(Ordering::SeqCst), 1);
+        assert!(report.journal_summary.contains("fs.read"));
+        let text = report.to_parent_text();
+        assert!(text.contains("--- Übergabe ---"), "{text}");
+        Ok(())
+    }
+
+    /// Runde 7, Teil A3: scheitert auch die Zusammenfassung, bleiben Journal
+    /// und letzter Assistententext.
+    #[tokio::test]
+    async fn a_provider_error_without_summary_keeps_journal_and_last_text() -> TestResult {
+        let (spawner, child, model) = end_probe_child(EndProbeTurn::FailEverything).await?;
+        let store = InMemoryStateStore::new();
+        let _result = spawner
+            .run_child_with_budget(
+                &child,
+                &store,
+                None,
+                TurnInput::user("Setze das Feature um"),
+                AgentBudget::default(),
+            )
+            .await;
+        let report = spawner
+            .child_end_report(&child)
+            .ok_or(TestError::Missing("Endbericht"))?;
+        assert_eq!(report.status, crate::child_comms::ChildEndStatus::Failed);
         assert!(report.handoff.is_none());
-        assert_eq!(model.compaction_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(model.compaction_calls.load(Ordering::SeqCst), 1);
+        assert!(
+            report
+                .handoff_note
+                .as_deref()
+                .is_some_and(|note| note.contains("Verdichtung")),
+            "{:?}",
+            report.handoff_note
+        );
         assert!(report.journal_summary.contains("fs.read"));
         assert!(
             report

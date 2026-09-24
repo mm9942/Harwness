@@ -1,0 +1,136 @@
+% Business-Paper -- Gerüst der Harwness-Vorlage (Skill latex-report).
+% Aufbau nach dem Pyramidenprinzip (Skill business-writing-pyramid):
+% Kernaussage zuerst, Einleitung aus Lage, Störung und Frage, darunter die
+% tragenden Gründe, jeder mit Belegen. Der Titel ist eine Aussage, kein Thema.
+% Alle Texte unten sind kurze Platzhalter: ersetzen, kürzen oder streichen.
+% Nichts erfinden -- fehlende Zahlen bleiben als % TODO: stehen.
+\documentclass[11pt,a4paper]{scrartcl}
+
+% ── Anpassung: von latex.template gefüllt, Vorgaben in harw-report.sty ──
+\newcommand{\harwLanguage}{%%LANGUAGE%%}
+\newcommand{\harwAccentHex}{%%ACCENT%%}
+\newcommand{\harwWarnHex}{%%WARN%%}
+\newcommand{\harwMainFont}{%%MAINFONT%%}
+\newcommand{\harwSansFont}{%%SANSFONT%%}
+\newcommand{\harwMonoFont}{%%MONOFONT%%}
+\usepackage{harw-report}
+
+\title{%%TITLE%%}
+\subtitle{%%SUBTITLE%%}
+\author{%%AUTHOR%%}
+\date{%%DATE%%}
+
+\begin{document}
+\maketitle
+
+\begin{merke}[Die Idee in drei Sätzen]
+Kernaussage: die Antwort auf die Frage der Leserin in einem Satz. Warum:
+die zwei oder drei tragenden Gründe in einem Satz. Was jetzt: die
+Entscheidung oder der nächste Schritt, den das Paper vorschlägt.
+\end{merke}
+
+\begin{achtung}[Wichtig vorab]
+Die eine Einschränkung, die die Leserin kennen muss, bevor sie entscheidet
+(etwa eine offene Annahme oder ein vorläufiger Datenstand).
+\end{achtung}
+
+\tableofcontents
+\newpage
+
+\section{Ausgangslage, Störung, Frage}\label{sec:einleitung}
+
+\begin{description}[leftmargin=2.6cm,style=nextline,font=\sffamily\bfseries\small]
+  \item[Lage] Was die Leserin schon weiß und für richtig hält.
+  \item[Störung] Was sich geändert hat oder nicht mehr passt.
+  \item[Frage] Die eine Frage, die daraus folgt und die dieses Paper beantwortet.
+\end{description}
+
+\section{Die Empfehlung}\label{sec:empfehlung}
+
+Die Antwort auf die Frage, ausführlicher als oben: ein Absatz, der die
+Kernaussage wiederholt und die drei Gründe ankündigt (Abschnitte
+\ref{sec:grund1} bis \ref{sec:grund3}).
+
+\begin{figure}[htbp]
+\centering
+\begin{tikzpicture}[node distance=0.9cm and 0.6cm]
+  \node[harwbox,fill=harwaccent!15,text width=6cm] (kern)
+    {\textbf{Kernaussage}\\ein Satz};
+  \node[harwbox,fill=harwgrau,below=of kern] (g2) {Grund 2};
+  \node[harwbox,fill=harwgrau,left=of g2] (g1) {Grund 1};
+  \node[harwbox,fill=harwgrau,right=of g2] (g3) {Grund 3};
+  \foreach \g in {g1,g2,g3} \draw[harwpfeil] (kern) -- (\g);
+\end{tikzpicture}
+\caption{Die Argumentation auf einen Blick (Beispiel)}\label{fig:pyramide}
+\end{figure}
+
+\section{Grund 1 als ganzer Satz}\label{sec:grund1}
+
+Die Aussage des Abschnitts steht im Titel. Der Text liefert die Belege,
+vom wichtigsten zum unwichtigsten.
+
+\section{Grund 2 als ganzer Satz}\label{sec:grund2}
+
+Belege zu Grund 2. Zahlen in Tabellen stehen rechtsbündig:
+
+\begin{tabularx}{\textwidth}{@{}Lrr@{}}
+\toprule
+\textbf{Posten} & \textbf{Jahr 1} & \textbf{Jahr 2} \\
+\midrule
+Posten A & 12\,000 & 9\,500 \\
+Posten B & 3\,400 & 3\,400 \\
+\midrule
+Summe & 15\,400 & 12\,900 \\
+\bottomrule
+\end{tabularx}
+
+\section{Grund 3 als ganzer Satz}\label{sec:grund3}
+
+Belege zu Grund 3.
+
+\begin{beispiel}
+Ein konkretes Beispiel, das den Grund greifbar macht.
+\end{beispiel}
+
+\section{Umsetzung und Risiken}\label{sec:umsetzung}
+
+{\small
+\begin{longtable}{@{}>{\raggedright}p{3.4cm}>{\raggedright}p{5.4cm}>{\raggedright\arraybackslash}p{6.2cm}@{}}
+\toprule
+\textbf{Schritt} & \textbf{Risiko} & \textbf{Gegenmaßnahme} \\
+\midrule
+\endhead
+\bottomrule
+\endlastfoot
+Schritt 1 & Was schiefgehen kann. & Wie das Risiko begrenzt wird. \\
+Schritt 2 & Was schiefgehen kann. & Wie das Risiko begrenzt wird. \\
+\end{longtable}
+}
+
+\section{Stand und Entscheidungsbedarf}\label{sec:stand}
+
+\begin{description}[leftmargin=2.6cm,style=nextline,font=\sffamily\bfseries\small]
+  \item[Stand] Was belegt ist.
+  \item[Offen] Welche Annahmen noch zu prüfen sind.
+  \item[Entscheidung] Was die Leserin bis wann entscheiden soll.
+\end{description}
+
+\appendix
+\section{Glossar}\label{sec:glossar}
+
+\begin{tabularx}{\textwidth}{@{}lL@{}}
+\toprule
+\textbf{Begriff} & \textbf{Bedeutung} \\
+\midrule
+Begriff A & Eine kurze Erklärung in einem Satz. \\
+\bottomrule
+\end{tabularx}
+
+\begin{thebibliography}{9}
+\addcontentsline{toc}{section}{\refname}
+\small
+\bibitem{quelle1} Nachname, Vorname: \emph{Titel der Quelle}. Verlag, Jahr.
+  \url{https://example.org/quelle}
+\end{thebibliography}
+
+\end{document}

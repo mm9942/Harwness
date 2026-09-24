@@ -1069,6 +1069,48 @@ impl RuntimeChildRegistryFactory {
         })
     }
 
+    /// Die Matrix-Werkzeuge des Game Masters (Runde 7, Teil M).
+    ///
+    /// # Description
+    /// Baut einen [`ModelToolProvider`] mit genau den fünf Operationen aus
+    /// `harw_ops::matrix::game_master::game_master_operations`
+    /// (`matrix.draft_scenario`, `matrix.status`, `matrix.start`,
+    /// `matrix.run`, `matrix.finish`) — nur für die Rolle
+    /// `matrix-game-master` montiert, nie über einen allgemeinen Provider
+    /// (Kind-Registries tragen sonst keine Operations-Werkzeuge). Die
+    /// Freigabe folgt der Deklaration der Operationen: `status`/`draft` sind
+    /// auto-freigegeben, `start`/`run`/`finish` laufen durch die Freigabekette
+    /// des Kindes. Der `OpContext` entsteht je Aufruf wie bei
+    /// [`Self::delegate_wave_provider`]: Spawner (schwach gehalten) und
+    /// `StateStore` für die Sitz-Agenten, Sandbox und `CancelToken` aus dem
+    /// Ausführungskontext.
+    fn matrix_game_master_provider(&self) -> ModelToolProvider {
+        let slot = Arc::clone(&self.spawner_slot);
+        let state_store = self.delegate_wave_store.clone();
+        ModelToolProvider::new(
+            harw_ops::matrix::game_master::game_master_operations(),
+            move |execution_context| {
+                let mut services = ServiceMap::new();
+                if let Some(spawner) = slot.get().and_then(Weak::upgrade) {
+                    services.insert(spawner);
+                }
+                if let Some(store) = &state_store {
+                    services.insert(Arc::clone(store));
+                }
+                let ctx = OpContext::new(
+                    execution_context.session_id().clone(),
+                    execution_context.turn_id().clone(),
+                    execution_context.sandbox().clone(),
+                    services,
+                );
+                match execution_context.cancel() {
+                    Some(cancel) => ctx.with_cancel_token(cancel.clone()),
+                    None => ctx,
+                }
+            },
+        )
+    }
+
     /// Die Skill-Fragmente einer Kind-Rolle: die direkt im Katalog
     /// (`agents/<rolle>/agent.toml`) konfigurierten Skills, vereinigt mit den
     /// Skills der eingebauten Agent-Definition der Rolle
@@ -1317,8 +1359,17 @@ impl ChildRegistryFactory for RuntimeChildRegistryFactory {
                 .get(role)
                 .map(ExecutableAgentIr::role),
             // Welle 4: die direkt konfigurierten Skills der Rolle als
-            // Instruktionsfragmente (leer ohne Skill-Katalog).
-            extra_context: self.skill_fragments_for_role(role)?,
+            // Instruktionsfragmente (leer ohne Skill-Katalog). Runde 7,
+            // Teil M: rollenspezifische Regeln (Game Master) stehen davor.
+            extra_context: {
+                let mut fragments = self.skill_fragments_for_role(role)?;
+                if let Some(prompt) =
+                    harw_registry_defaults::embedded_agents::builtin_role_prompt(role)
+                {
+                    fragments.insert(0, prompt.to_owned());
+                }
+                fragments
+            },
             ..IdentityOverrides::default()
         };
         // Eine Kette je Kind: `for_child` legt eine Folgezelle an
@@ -1327,7 +1378,11 @@ impl ChildRegistryFactory for RuntimeChildRegistryFactory {
         // laufende Kinder sofort; ein `set` im Kind koppelt nur dieses Kind ab
         // — Geschwister bleiben voneinander unabhängig, folgen aber weiter der
         // Wurzel.
-        let child_chain = self.chain.for_child();
+        // Runde 7, Teil A6: der Auftrag des Kindes geht an seinen
+        // Auto-Modus-Klassifizierer (eigener Ring der letzten Aufrufe).
+        let child_chain = self.chain.for_child_with_mandate(
+            harw_extension_api::auto_mode::ChildMandate::from_spawn_input(role, input),
+        );
         // Runde 5, Teil N: Elternteil und Rolle für den Baum-Pfad vormerken;
         // `child_session_observers` bindet danach die Kind-ID.
         crate::host_escalation_wiring::note_spawn(
@@ -1394,6 +1449,13 @@ impl ChildRegistryFactory for RuntimeChildRegistryFactory {
         if role_gets_delegate_wave(role) {
             registry_builder =
                 registry_builder.tool_provider(Arc::new(self.delegate_wave_provider()));
+        }
+        // Runde 7, Teil M: die Matrix-Werkzeuge ausschließlich für den Game
+        // Master (rollengebundener `ModelToolProvider`, siehe
+        // `matrix_game_master_provider`).
+        if !harw_registry_defaults::profile::matrix_tools_for_role(role).is_empty() {
+            registry_builder =
+                registry_builder.tool_provider(Arc::new(self.matrix_game_master_provider()));
         }
         // Runde 5, Teil H: `agent.result` für jede Rolle, die Kinder starten
         // darf; der Spawner wird wie bei `delegate_wave` nur schwach gehalten.
@@ -1692,7 +1754,10 @@ impl ChildRegistryFactory for RuntimeChildRegistryFactory {
             extra_context: self.skill_fragments_for_role(role)?,
             ..IdentityOverrides::default()
         };
-        let child_chain = self.chain.for_child();
+        // Runde 7, Teil A6: wie in `build_registry`.
+        let child_chain = self.chain.for_child_with_mandate(
+            harw_extension_api::auto_mode::ChildMandate::from_spawn_input(role, input),
+        );
 
         // Nachtrag K3: ohne bekannte Eltern-Rolle bleibt die Decke `None`
         // (fail-closed) — niemand verleiht Rechte, deren Urheber sich nicht
@@ -2119,6 +2184,14 @@ mod tests {
             originator: None,
             default_reasoning_effort,
             gateway_identity_headers: false,
+            request_timeout_secs: None,
+            stream_idle_timeout_secs: None,
+            retry_timeouts: None,
+            max_tokens_field: None,
+            send_reasoning_effort: None,
+            strict_tools: None,
+            parallel_tool_calls: None,
+            allow_insecure_lan: false,
         })
     }
 
@@ -2769,6 +2842,90 @@ mod tests {
         Ok(())
     }
 
+    /// Ein Config-Layer mit allen mitgelieferten Skills aus
+    /// [`harw_home::bundled_files`] und die daraus entdeckte Konfiguration —
+    /// dieselben Dateien, die `harw init` nach `~/.harw/skills` schreibt.
+    fn bundled_skill_layer() -> TestResult<(tempfile::TempDir, harw_config::ResolvedConfig)> {
+        let layer = tempfile::tempdir().map_err(ctx("tempdir"))?;
+        for file in harw_home::bundled_files()
+            .iter()
+            .filter(|file| file.relative_path.starts_with("skills/"))
+        {
+            let target = file.target_in(layer.path());
+            if let Some(parent) = target.parent() {
+                std::fs::create_dir_all(parent).map_err(ctx("mkdir bundled skill"))?;
+            }
+            std::fs::write(&target, file.contents).map_err(ctx("write bundled skill"))?;
+        }
+        let config = harw_config::discover_config(&[layer.path().to_path_buf()])
+            .map_err(ctx("discover bundled skills"))?;
+        Ok((layer, config))
+    }
+
+    /// Runde 7, Teil T5: der LaTeX-Writer der UIA bekommt über seine
+    /// eingebaute Definition genau die vier Skills `latex-report`,
+    /// `latex-writing`, `xelatex-compile`, `business-writing-pyramid` — in
+    /// dieser Reihenfolge und aus den mitgelieferten Skill-Dateien. Der Skill
+    /// `latex-report` trägt dabei Vorlage, Werkzeuge und Übergabeformat
+    /// (Registry-Kinder bekommen kein `system.md`).
+    #[test]
+    fn uia_latex_writer_receives_its_four_bundled_skills() -> TestResult {
+        let (layer, config) = bundled_skill_layer()?;
+        let factory = RuntimeChildRegistryFactory::new(
+            test_project(),
+            Arc::new(harw_core::EchoModelProvider::new("echo")),
+            test_chain(&config),
+        )
+        .map_err(ctx("factory builds"))?
+        .with_skill_catalog(&config, vec![layer.path().to_path_buf()])
+        .map_err(ctx("skill catalog"))?;
+
+        let fragments = factory
+            .skill_fragments_for_role(role_names::UIA_LATEX_WRITER)
+            .map_err(|error| crate::test_support::TestError::Unexpected(error.message))?;
+        let expected = [
+            "latex-report",
+            "latex-writing",
+            "xelatex-compile",
+            "business-writing-pyramid",
+        ];
+        assert_eq!(fragments.len(), expected.len(), "{fragments:?}");
+        for (fragment, name) in fragments.iter().zip(expected) {
+            assert!(
+                fragment.starts_with(&format!("# Skill: {name} (sha256 ")),
+                "{name}: {}",
+                fragment.lines().next().unwrap_or_default()
+            );
+        }
+        for phrase in ["latex.template", "latex.check", "doc.read_pdf", "Overfull"] {
+            assert!(
+                fragments[0].contains(phrase),
+                "latex-report muss {phrase} nennen"
+            );
+        }
+        Ok(())
+    }
+
+    /// Runde 7, Teil T5: ohne Skill-Katalog startet der LaTeX-Writer nicht
+    /// (fail-closed) — nie ein Kind ohne seine Skills.
+    #[test]
+    fn uia_latex_writer_without_skill_catalog_refuses_to_start() -> TestResult {
+        let config = harw_config::ResolvedConfig::default();
+        let factory = RuntimeChildRegistryFactory::new(
+            test_project(),
+            Arc::new(harw_core::EchoModelProvider::new("echo")),
+            test_chain(&config),
+        )
+        .map_err(ctx("factory builds"))?;
+        let Err(error) = factory.skill_fragments_for_role(role_names::UIA_LATEX_WRITER) else {
+            return Err(crate::test_support::TestError::Unexpected(
+                "uia-latex-writer must not start without its skills".to_owned(),
+            ));
+        };
+        assert!(error.message.contains("latex-report"), "{}", error.message);
+        Ok(())
+    }
+
     #[test]
     fn skill_fragment_helpers_serve_root_agents_and_fail_closed() -> TestResult {
         let (layer, config) = skill_fixture("emily")?;
@@ -3014,6 +3171,48 @@ mod tests {
                 .map(|spec| spec.name().to_owned())
                 .collect();
         assert_eq!(names, vec![harw_core_bridge::DELEGATE_WAVE_TOOL.to_owned()]);
+        Ok(())
+    }
+
+    /// Runde 7, Teil M: der rollengebundene Provider des Game Masters trägt
+    /// genau dessen Matrix-Werkzeuge; keine andere eingebaute Rolle bekommt
+    /// ihn, und nur der Game Master bekommt eigene Rollenregeln.
+    #[test]
+    fn matrix_tools_are_offered_only_to_the_game_master() -> TestResult {
+        let factory = RuntimeChildRegistryFactory::new(
+            test_project(),
+            Arc::new(harw_core::EchoModelProvider::new("echo")),
+            test_chain(&harw_config::ResolvedConfig::default()),
+        )
+        .map_err(ctx("factory builds"))?;
+        let names: Vec<String> =
+            harw_extension_api::ToolProvider::tools(&factory.matrix_game_master_provider())
+                .iter()
+                .map(|spec| spec.name().to_owned())
+                .collect();
+        assert_eq!(
+            names,
+            harw_registry_defaults::profile::MATRIX_GAME_MASTER_TOOLS
+                .iter()
+                .map(|tool| (*tool).to_owned())
+                .collect::<Vec<_>>()
+        );
+        for role in role_names::ALL {
+            let is_master = *role == role_names::MATRIX_GAME_MASTER;
+            assert_eq!(
+                !harw_registry_defaults::profile::matrix_tools_for_role(role).is_empty(),
+                is_master,
+                "{role}"
+            );
+            assert_eq!(
+                harw_registry_defaults::embedded_agents::builtin_role_prompt(role).is_some(),
+                is_master,
+                "{role}"
+            );
+            if is_master {
+                assert!(!role_gets_delegate_wave(role), "kein delegate_wave");
+            }
+        }
         Ok(())
     }
 

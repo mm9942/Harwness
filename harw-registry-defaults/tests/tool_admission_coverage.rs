@@ -62,6 +62,8 @@ use harw_registry_defaults::profile::{
     CHILD_MESSAGE_TOOLS, PARENT_MESSAGE_TOOLS, child_message_tools_for_role,
     parent_message_tools_for_role,
 };
+// Runde 7, Teil M: die Matrix-Werkzeuge des Game Masters ebenso.
+use harw_registry_defaults::profile::{MATRIX_GAME_MASTER_TOOLS, matrix_tools_for_role};
 
 mod common;
 use common::{TestError, TestResult, ctx};
@@ -112,6 +114,8 @@ fn every_role_admitted_tool_is_registered_by_its_profile() -> TestResult {
             // und `parent.message` (Kind-Rollen mit Elternteil).
             .chain(child_message_tools_for_role(role).iter().copied())
             .chain(parent_message_tools_for_role(role).iter().copied())
+            // Runde 7, Teil M: `matrix.*` (nur Game Master).
+            .chain(matrix_tools_for_role(role).iter().copied())
             .collect();
 
         for admitted in ir.tool_surface().admitted() {
@@ -567,7 +571,8 @@ fn workspace_edit_profile_never_includes_shell_or_web_tools() {
 }
 
 /// Runde 4, Teil E: `uia-latex-writer` admittiert genau lesende `fs.*`,
-/// `fs.write`/`fs.edit`, `doc.read_pdf` und das typisierte `latex.build` — und sein
+/// `fs.write`/`fs.edit`, `doc.read_pdf` und das typisierte `latex.build`
+/// (Runde 7, Teil T5: dazu `latex.template` und `latex.check`) — und sein
 /// Profil (`UiaLatexWriter`) registriert/bewirbt genau diese Menge. Freie
 /// Shell, Prozesswerkzeuge, Netz, `deps.*` und `lens.ask` sind ausdrücklich
 /// verboten; Rückgabevertrag `execution-summary`, keine Spawn-Tiefe.
@@ -591,6 +596,8 @@ fn uia_latex_writer_admits_exactly_files_pdf_and_latex_build() -> TestResult {
         "fs.grep",
         "doc.read_pdf",
         "latex.build",
+        "latex.template",
+        "latex.check",
     ]
     .into();
     let admitted: BTreeSet<&str> = ir
@@ -631,6 +638,25 @@ fn uia_latex_writer_admits_exactly_files_pdf_and_latex_build() -> TestResult {
         Some("harwness.return.execution-summary@1"),
         "{role}"
     );
+    // Runde 7, Teil T5: die vier Skills sind fest an die Rolle gebunden
+    // (Vorlage, Handwerk, Build, Pyramide), das Budget ist realistisch.
+    assert_eq!(
+        ir.skills(),
+        [
+            "latex-report",
+            "latex-writing",
+            "xelatex-compile",
+            "business-writing-pyramid"
+        ],
+        "{role}: skills"
+    );
+    let budget = ir
+        .spawn_contract()
+        .budget()
+        .ok_or(TestError::Unexpected(format!("{role} ohne [spawn.budget]")))?;
+    assert_eq!(budget.max_tokens(), Some(150_000), "{role}");
+    assert_eq!(budget.max_wall_secs(), Some(600), "{role}");
+    assert_eq!(budget.max_tool_calls(), Some(60), "{role}");
     Ok(())
 }
 
@@ -827,6 +853,73 @@ fn roles_admit_exactly_their_messaging_tools() -> TestResult {
                 "{role}: admitted({tool}) muss parent_message_tools_for_role entsprechen"
             );
         }
+    }
+    Ok(())
+}
+
+/// Runde 7, Teil M: der Game Master admittiert genau die lesenden
+/// Unterlagen-Werkzeuge, seine fünf Matrix-Werkzeuge und `parent.message` —
+/// kein Schreiben, keine Ausführung, kein Netz, keine Delegation; keine
+/// andere Rolle admittiert ein `matrix.*`-Werkzeug.
+#[test]
+fn game_master_admits_exactly_its_matrix_tools() -> TestResult {
+    let roles = resolved_roles()?;
+    let role = role_names::MATRIX_GAME_MASTER;
+    let ir = roles
+        .get(role)
+        .ok_or(TestError::Unexpected(format!("{role} fehlt")))?;
+    let admitted: BTreeSet<&str> = ir
+        .tool_surface()
+        .admitted()
+        .iter()
+        .map(String::as_str)
+        .collect();
+    let expected: BTreeSet<&str> = [
+        "fs.read",
+        "fs.list",
+        "fs.search",
+        "fs.glob",
+        "fs.grep",
+        "doc.read_pdf",
+        "parent.message",
+    ]
+    .into_iter()
+    .chain(MATRIX_GAME_MASTER_TOOLS.iter().copied())
+    .collect();
+    assert_eq!(admitted, expected, "{role}");
+    assert_eq!(profile_for_role(role), Some(RegistryProfile::MatrixReader));
+    assert!(
+        composition_tools_for_role(role).is_empty(),
+        "kein delegate_wave"
+    );
+    let forbidden: BTreeSet<&str> = ir
+        .tool_surface()
+        .forbidden()
+        .iter()
+        .map(String::as_str)
+        .collect();
+    for tool in [
+        "fs.write",
+        "shell.exec",
+        "web.fetch",
+        "web.search",
+        "transfer_to_executor",
+    ] {
+        assert!(forbidden.contains(tool), "{role} muss {tool} verbieten");
+    }
+    assert_eq!(ir.spawn_contract().max_depth(), Some(1), "{role}");
+    for other in role_names::ALL.iter().filter(|r| **r != role) {
+        let ir = roles
+            .get(*other)
+            .ok_or(TestError::Unexpected(format!("{other} fehlt")))?;
+        assert!(
+            !ir.tool_surface()
+                .admitted()
+                .iter()
+                .any(|t| t.starts_with("matrix.")),
+            "{other} darf kein matrix.*-Werkzeug admittieren"
+        );
+        assert!(matrix_tools_for_role(other).is_empty(), "{other}");
     }
     Ok(())
 }

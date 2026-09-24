@@ -388,7 +388,7 @@ fn apply_cache(cache: &ModelsDevCache, catalog: &mut [ProviderSpec]) {
         // These lists depend on the user's installed models or deployments.
         if matches!(
             provider.id.as_str(),
-            "ollama" | "lmstudio" | "custom" | "foundry"
+            "ollama" | "lmstudio" | "vllm" | "custom" | "foundry"
         ) {
             continue;
         }
