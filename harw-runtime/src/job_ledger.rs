@@ -13,20 +13,20 @@
 //! |---|---|
 //! | `snapshot` | `get` (`JobNotFound` → `None`) |
 //! | `create` | `admit` (neuer Job `Pending`, Art [`KANBAN_JOB_KIND`]) |
-//! | `mark_ready` | **keine** Entsprechung — nur `Ready → Ready` ist ein No-op, `Pending` schlägt fehl (fail closed) |
+//! | `mark_ready` | `mark_ready` (`Pending → Ready`, idempotent für `Ready`) |
 //! | `claim` | `claim` (Lease mit [`DEFAULT_KANBAN_LEASE_TTL`]) |
 //! | `complete` | `complete` mit `JobOutcome::Succeeded` und dem Token der gespeicherten Lease |
 //! | `block` | `complete` mit `JobOutcome::Blocked { reason: "kanban:<BlockKind>" }` |
 //! | `unblock` | `unblock` (`Blocked`) bzw. `retry` (`Failed`) |
-//! | `reclaim` | **keine** Entsprechung — schlägt immer fehl (fail closed) |
+//! | `reclaim` | `reclaim` (`Running → Ready`, zählt einen Versuch; bei erschöpfter Retry-Politik `Failed`) |
 //! | `cancel` | `cancel` (`Pending|Ready|Running`) bzw. `deny_blocked` (`Blocked`) |
 //!
-//! Der `JobStore` bietet weder `Pending → Ready` noch einen Einzel-Reclaim
-//! an (abgelaufene Leases räumt ausschließlich der Supervisor über
-//! `reconcile_expired` ab, und zwar für alle Jobs). Diese Crate darf den
-//! Speicher nicht an seiner öffentlichen API vorbei mutieren; beide
-//! Übergänge liefern darum einen [`KnowledgeError::Io`] mit
-//! `ErrorKind::Unsupported` und deutscher Meldung.
+//! `reclaim` verlangt keine abgelaufene Lease: der Store entzieht die Lease
+//! des Halters, schaltet die Fencing-Epoch weiter und zählt über
+//! `record_failure` einen Versuch — dieselben Schritte, die der Supervisor
+//! über `reconcile_expired` für abgelaufene Leases ausführt. Ist die
+//! Retry-Politik erschöpft, steht der Job danach `Failed`, und die Karte
+//! zeigt ihn über `snapshot` als blockiert.
 //!
 //! # Abgrenzung zu anderen Job-Arten
 //! Kanban-Jobs tragen `JobKind::Custom(`[`KANBAN_JOB_KIND`]`)`. Der
@@ -232,13 +232,12 @@ impl JobTransitions for JobStoreTransitions {
         let record = self.owned_record(work_id)?;
         match record.job.state {
             JobState::Ready => Ok(()),
-            JobState::Pending => Err(ledger_error(
-                ErrorKind::Unsupported,
-                format!(
-                    "Job {work_id}: der JobStore bietet keinen Übergang Pending → Ready an; \
-                     die Karte bleibt in Todo"
-                ),
-            )),
+            JobState::Pending => {
+                self.store
+                    .mark_ready(work_id, Timestamp::now())
+                    .map_err(map_store_error)?;
+                Ok(())
+            }
             other => Err(illegal(other, "ready")),
         }
     }
@@ -310,14 +309,14 @@ impl JobTransitions for JobStoreTransitions {
     }
 
     fn reclaim(&self, work_id: &WorkId) -> KnowledgeResult<()> {
-        self.owned_record(work_id)?;
-        Err(ledger_error(
-            ErrorKind::Unsupported,
-            format!(
-                "Job {work_id}: der JobStore bietet keinen Einzel-Reclaim an; abgelaufene \
-                 Leases räumt der Supervisor über reconcile_expired ab"
-            ),
-        ))
+        let record = self.owned_record(work_id)?;
+        if record.job.state != JobState::Running {
+            return Err(illegal(record.job.state, "ready (reclaim)"));
+        }
+        self.store
+            .reclaim(work_id, Timestamp::now(), self.actor())
+            .map_err(map_store_error)?;
+        Ok(())
     }
 
     fn cancel(&self, work_id: &WorkId) -> KnowledgeResult<()> {
@@ -470,8 +469,8 @@ mod tests {
         ))
     }
 
-    /// Legt einen Kanban-Job direkt im Zustand `Ready` an (der Adapter
-    /// selbst kann `Pending → Ready` nicht, siehe Moduldoku).
+    /// Legt einen Job beliebiger Art direkt im Zustand `Ready` an (für
+    /// fremde Arten, die der Adapter nicht anlegen kann).
     fn admit_ready(store: &JobStore, kind: JobKind) -> TestResult<WorkId> {
         let now = Timestamp::now();
         let mut job = Job::new(
@@ -543,20 +542,39 @@ mod tests {
     }
 
     #[test]
-    fn mark_ready_from_pending_fails_closed_and_leaves_the_job() -> TestResult {
+    fn mark_ready_moves_a_created_job_to_ready_and_is_idempotent() -> TestResult {
         let (ledger, store, _dir) = ledger()?;
         let work_id = ledger.create(&card()).map_err(ctx("create"))?;
-        let Err(KnowledgeError::Io(error)) = ledger.mark_ready(&work_id) else {
+        ledger.mark_ready(&work_id).map_err(ctx("mark ready"))?;
+        let stored = store.get(&work_id).map_err(ctx("get"))?;
+        assert_eq!(stored.job.state, JobState::Ready);
+        ledger
+            .mark_ready(&work_id)
+            .map_err(ctx("mark ready twice"))?;
+        assert_eq!(
+            store.get(&work_id).map_err(ctx("get again"))?.revision,
+            stored.revision
+        );
+        ledger
+            .claim(&work_id, &AgentId::new("worker-1"))
+            .map_err(ctx("claim"))?;
+        assert_eq!(state_of(&ledger, &work_id)?.state, JobState::Running);
+        Ok(())
+    }
+
+    #[test]
+    fn mark_ready_rejects_a_running_job() -> TestResult {
+        let (ledger, _store, _dir) = ledger()?;
+        let work_id = admit_ready(&ledger.store, kanban())?;
+        ledger
+            .claim(&work_id, &AgentId::new("worker-1"))
+            .map_err(ctx("claim"))?;
+        let Err(KnowledgeError::IllegalTransition { .. }) = ledger.mark_ready(&work_id) else {
             return Err(TestError::Unexpected(
-                "Pending → Ready muss fail-closed scheitern".to_owned(),
+                "Running → Ready über mark_ready muss abgelehnt werden".to_owned(),
             ));
         };
-        assert_eq!(error.kind(), ErrorKind::Unsupported);
-        assert!(error.to_string().contains("Pending → Ready"), "{error}");
-        assert_eq!(
-            store.get(&work_id).map_err(ctx("get"))?.job.state,
-            JobState::Pending
-        );
+        assert_eq!(state_of(&ledger, &work_id)?.state, JobState::Running);
         Ok(())
     }
 
@@ -629,17 +647,68 @@ mod tests {
     }
 
     #[test]
-    fn reclaim_always_fails_closed() -> TestResult {
+    fn reclaim_returns_a_running_job_to_ready_and_counts_an_attempt() -> TestResult {
         let (ledger, _store, _dir) = ledger()?;
-        let work_id = admit_ready(&ledger.store, kanban())?;
+        let work_id = ledger.create(&card()).map_err(ctx("create"))?;
+        ledger.mark_ready(&work_id).map_err(ctx("mark ready"))?;
         ledger
             .claim(&work_id, &AgentId::new("worker-1"))
             .map_err(ctx("claim"))?;
-        let Err(KnowledgeError::Io(error)) = ledger.reclaim(&work_id) else {
-            return Err(TestError::Unexpected("reclaim muss scheitern".to_owned()));
+        ledger.reclaim(&work_id).map_err(ctx("reclaim"))?;
+        let ready = state_of(&ledger, &work_id)?;
+        assert_eq!(ready.state, JobState::Ready);
+        assert_eq!(ready.holder, None);
+        assert_eq!(ready.attempts, 1);
+
+        // Der Kanban-Backoff ist null: die Karte ist sofort wieder beanspruchbar.
+        ledger
+            .claim(&work_id, &AgentId::new("worker-2"))
+            .map_err(ctx("claim again"))?;
+        assert_eq!(
+            state_of(&ledger, &work_id)?.holder,
+            Some(AgentId::new("worker-2"))
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn reclaim_rejects_a_job_that_is_not_running() -> TestResult {
+        let (ledger, _store, _dir) = ledger()?;
+        let work_id = admit_ready(&ledger.store, kanban())?;
+        let Err(KnowledgeError::IllegalTransition { .. }) = ledger.reclaim(&work_id) else {
+            return Err(TestError::Unexpected(
+                "reclaim eines Ready-Jobs muss abgelehnt werden".to_owned(),
+            ));
         };
-        assert_eq!(error.kind(), ErrorKind::Unsupported);
-        assert_eq!(state_of(&ledger, &work_id)?.state, JobState::Running);
+        assert_eq!(state_of(&ledger, &work_id)?.state, JobState::Ready);
+        Ok(())
+    }
+
+    #[test]
+    fn reclaim_and_mark_ready_never_move_a_foreign_job() -> TestResult {
+        let (ledger, store, _dir) = ledger()?;
+        let work_id = admit_ready(&ledger.store, JobKind::Worker)?;
+        store
+            .claim(
+                &work_id,
+                &ClaimRequest {
+                    worker_id: "worker-1".to_owned(),
+                    lease_ttl: SignedDuration::from_secs(60),
+                    now: Timestamp::now(),
+                },
+            )
+            .map_err(ctx("claim foreign"))?;
+        for result in [ledger.reclaim(&work_id), ledger.mark_ready(&work_id)] {
+            let Err(KnowledgeError::Io(error)) = result else {
+                return Err(TestError::Unexpected(
+                    "ein fremder Job darf nicht bewegt werden".to_owned(),
+                ));
+            };
+            assert_eq!(error.kind(), ErrorKind::PermissionDenied);
+        }
+        let stored = store.get(&work_id).map_err(ctx("get"))?;
+        assert_eq!(stored.job.state, JobState::Running);
+        assert_eq!(stored.job.attempts, 0);
         Ok(())
     }
 

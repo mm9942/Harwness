@@ -3101,6 +3101,42 @@ fn subcommand_query_is_empty(text: &str) -> bool {
         .is_none_or(|(_, query)| query.trim().is_empty())
 }
 
+/// Hängt per `@pfad` erwähnte Projektdateien an eine Chat-Nachricht an.
+///
+/// # Rückgabe
+/// `(modelltext, hinweis)`: der Text für das Modell (Original plus
+/// `<datei>`-Blöcke) und optional eine Systemzeile mit angehängten und
+/// abgelehnten Dateien. Ohne Projektwurzel bleibt der Text unverändert.
+fn expand_mentions_for_turn(project_root: &str, text: &str) -> (String, Option<String>) {
+    if project_root.is_empty() {
+        return (text.to_owned(), None);
+    }
+    let root = std::path::Path::new(project_root);
+    let expanded = expand_file_mentions(text, root, MentionLimits::default());
+    if expanded.attached.is_empty() && expanded.rejected.is_empty() {
+        return (expanded.text, None);
+    }
+    let mut lines = Vec::new();
+    if !expanded.attached.is_empty() {
+        let canonical_root = std::fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
+        let names: Vec<String> = expanded
+            .attached
+            .iter()
+            .map(|path| {
+                path.strip_prefix(&canonical_root)
+                    .unwrap_or(path)
+                    .display()
+                    .to_string()
+            })
+            .collect();
+        lines.push(format!("Angehängt: {}", names.join(", ")));
+    }
+    for (token, reason) in &expanded.rejected {
+        lines.push(format!("Nicht angehängt: @{token} — {reason}"));
+    }
+    (expanded.text, Some(lines.join("\n")))
+}
+
 /// `true` für jede `/workbench …`-Zeile (Werkbank danach neu laden).
 fn is_workbench_command(raw: &str) -> bool {
     raw.split_whitespace().next() == Some("/workbench")
@@ -4021,6 +4057,16 @@ pub(crate) async fn run_loop(
     let mut provider_error_streak = 0_u32;
 
     loop {
+        // Slash-Zeilen aus synchronen Pfaden (Werkbank-Tasten) laufen über
+        // denselben Command-Kanal wie getippte Befehle.
+        while let Some(command) = app.pending_commands.pop_front() {
+            harw_tx.send(HarwEvent::Command(command));
+        }
+        // Ausstehende Datenabrufe für Ansichten und Werkbank (nie in den Chat).
+        if process_pending_fetches(app).await {
+            frame_req.schedule_frame();
+        }
+
         // Eine während des vorherigen Turns abgeschickte Eingabe hat Vorrang.
         // Sie passiert denselben Pfad wie eine frische `HarwEvent::Submit`.
         let mut submitted: Option<String> = app.pending_turns.pop_front();
@@ -4419,11 +4465,24 @@ pub(crate) async fn run_loop(
         // bekommt weiterhin `text` in voller Länge (siehe `run_turn_streaming`
         // unten). Ohne Überschreibung (jede normal getippte Nachricht):
         // unverändertes Verhalten.
-        let displayed_text = app
-            .pending_turn_user_cell_override
-            .take()
-            .unwrap_or_else(|| text.clone());
+        let display_override = app.pending_turn_user_cell_override.take();
+        // `@pfad`-Anhänge nur für getippte Nachrichten expandieren — ein
+        // automatischer `!`-Folge-Turn (mit Anzeige-Überschreibung) trägt
+        // fremde Ausgabe, deren `@` keine Erwähnung ist.
+        let (turn_text, attachment_note) = if display_override.is_none() && text.contains('@') {
+            expand_mentions_for_turn(&app.project_root, &text)
+        } else {
+            (text.clone(), None)
+        };
+        let displayed_text = display_override.unwrap_or_else(|| text.clone());
         app.push_line(Role::User, displayed_text);
+        if let Some(note) = attachment_note {
+            app.push_lines(
+                note.split('\n')
+                    .map(|line| Line::from(line.to_owned()))
+                    .collect(),
+            );
+        }
         // Auto-Correction-Detection (harw-memory M3): reine Textregel,
         // kein LLM-Call. Bei Match: Signal explizit an das Backend geben.
         if let Some(mem) = app.memory() {
@@ -4448,7 +4507,7 @@ pub(crate) async fn run_loop(
             app,
             &mut spinner,
             gateway,
-            &text,
+            &turn_text,
             approval_driver,
             approvals,
             host_permit_prompts,
@@ -4457,6 +4516,8 @@ pub(crate) async fn run_loop(
             &mut turn_state,
         )
         .await;
+        // Werkzeuge des Turns können die Werkbank verändert haben.
+        app.workbench.mark_stale();
 
         // Welle 4c: ein zweiter Ctrl+C während des soeben beendeten Turns hat
         // `app.hard_quit_requested` gesetzt (siehe `handle_busy_event`) — der
