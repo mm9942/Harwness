@@ -13,14 +13,17 @@
 # ── Werkzeugoberflaeche ─────────────────────────────────────────────────────
 # `RegistryProfile::UiaWriter` (`harw-registry-defaults/src/profile.rs`):
 # alle sechs fs.*-Werkzeuge (inklusive `fs.write`) plus `doc.read_pdf` plus
-# die fuenf rein lesenden `deps.*`-Werkzeuge plus `web.fetch`/`web.search`
-# — kein `shell.exec`, kein `web.docs_rs`/`web.crates_io`, kein `lens.ask`,
-# kein `browser.*`.
+# die fuenf rein lesenden `deps.*`-Werkzeuge plus alle vier `web.*`-Werkzeuge
+# (`web.fetch`/`web.docs_rs`/`web.crates_io`/`web.search`,
+# `UIA_HELPER_WEB_TOOLS`) — kein `shell.exec`, kein `lens.ask`, kein
+# `browser.*`.
 #
 # Nutzerentscheidung: `uia-writer` recherchiert kurz online und fuegt
 # manchmal eine Abhaengigkeit hinzu — `web.search`/`web.fetch` fuer die
-# Recherche, `deps.*` (lesend), um `Cargo.lock` und vorhandene Quellen vor
-# der Aenderung am Manifest zu pruefen. Netz ist nie weiter als das des
+# Recherche, `web.docs_rs`/`web.crates_io` (Nutzerentscheidung, rein lesend,
+# egress-gebunden) fuer Crate-Metadaten und -Doku, `deps.*` (lesend), um
+# `Cargo.lock` und vorhandene Quellen vor der Aenderung am Manifest zu
+# pruefen. Netz ist nie weiter als das des
 # Elternteils: Reducer `reduce_to_read_explore`
 # (`AuthorityReducer::ReadExplore`), die Kind-Sandbox erbt Recht und
 # Host-Scope des Elternteils, und jeder Abruf laeuft zusaetzlich durch die
@@ -61,12 +64,12 @@ admitted = [
   "deps.source_search",
   "deps.source_list",
   "web.fetch",
+  "web.docs_rs",
+  "web.crates_io",
   "web.search",
 ]
 forbidden = [
   "shell.exec",
-  "web.docs_rs",
-  "web.crates_io",
   "lens.ask",
 ]
 

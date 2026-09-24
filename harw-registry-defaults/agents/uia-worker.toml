@@ -34,8 +34,9 @@
 # `web.search` und die fuenf rein lesenden `deps.*`-Werkzeuge
 # (`deps.graph`/`deps.locked` ueber `ReadWorkspace`, `deps.source_*` ueber
 # `ReadCargoRegistry`), um Versionen und Quellen vor dem Hinzufuegen zu
-# pruefen. `web.docs_rs`/`web.crates_io` bleiben `researcher-web`
-# vorbehalten. Netz ist nie weiter als das des Elternteils: Reducer
+# pruefen. Spaetere Nutzerentscheidung: auch `web.docs_rs`/`web.crates_io`
+# (rein lesend, egress-gebunden wie `web.fetch`/`web.search`,
+# `UIA_HELPER_WEB_TOOLS`). Netz ist nie weiter als das des Elternteils: Reducer
 # `reduce_to_read_explore` (`AuthorityReducer::ReadExplore`), die
 # Kind-Sandbox erbt Recht und Host-Scope des Elternteils, und jeder Abruf
 # laeuft zusaetzlich durch die Egress-Policy.
@@ -65,13 +66,13 @@ admitted = [
   "deps.source_search",
   "deps.source_list",
   "web.fetch",
+  "web.docs_rs",
+  "web.crates_io",
   "web.search",
   "browser.open",
 ]
 forbidden = [
   "fs.write",
-  "web.docs_rs",
-  "web.crates_io",
   "lens.ask",
   "browser.observe",
   "browser.find",
@@ -86,8 +87,10 @@ max_depth = 0
 
 [spawn.budget]
 max_tokens = 20000
-max_tool_calls = 6
-max_wall_secs = 90
+# Kurze Online-Recherche (Suche, zwei, drei Abrufe, Crate-Metadaten) braucht
+# mehr als die frueheren 6 Aufrufe/90 s; weiterhin ein Schnellhelfer.
+max_tool_calls = 16
+max_wall_secs = 180
 effort_cap = "low"
 
 [return]
