@@ -1,3 +1,4 @@
 name = "planning"
 description = "Create bounded, dependency-aware plans with acceptance criteria, risks, and ownership."
+instructions_file = "instructions.md"
 tools = ["filesystem.read"]

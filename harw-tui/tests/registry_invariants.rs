@@ -349,10 +349,10 @@ fn tui_registry_and_operation_registry_agree_on_count() -> TestResult {
 /// `mode` gehört zur Grundausstattung und **nicht** hinter das
 /// `[tools.plan]`-Gate: es steuert die Session, nicht die Planungsfläche.
 /// Läge es hinter dem Gate, könnte eine Laufzeit ohne Plan-Store den Modus
-/// nicht mehr wechseln — auch nicht zurück nach `work`. Die sechs gegateten
-/// Operationen (`plan`, `goal`, `explore`, `research_deps`, `research_web`,
-/// `analyze`) kommen über `register_plan_tools` und stehen deshalb bewusst
-/// nicht in dieser Liste.
+/// nicht mehr wechseln — auch nicht zurück nach `work`. Die sieben gegateten
+/// Operationen (`plan`, `goal`, `explore`, `research`, `research_deps`,
+/// `research_web`, `analyze`) kommen über `register_plan_tools` und stehen
+/// deshalb bewusst nicht in dieser Liste.
 #[test]
 fn all_registered_ops_are_reachable_by_name() {
     let ops = build_ops();
@@ -451,6 +451,10 @@ fn all_registered_ops_are_reachable_by_name() {
         "diary",
         "palace",
         "dream",
+        // Runde 3: `/learn` (nur Vorschläge, `channel_reduced`) und `/matrix`
+        // (Matrix-Game, `channel_reduced`), beide Surface::Command.
+        "learn",
+        "matrix",
     ];
 
     // Jede Operation muss mindestens eine Fläche tragen. Eine ohne wäre über

@@ -18,7 +18,8 @@
 //!
 //! # Schlüsseltypen
 //! - [`OverlayView`] — Trait der Ansichten (`render`/`on_key`, optional
-//!   Daten-Nachladen über `refresh_command`/`apply_data`/`apply_error`).
+//!   Daten-Nachladen über `refresh_command`/`apply_data`/`apply_error` und
+//!   Live-Ereignisse über `apply_event`).
 //! - [`OverlayOutcome`] — was nach einem Tastendruck geschehen soll.
 //!
 //! # Nebenläufigkeit
@@ -84,6 +85,10 @@ pub(crate) trait OverlayView: std::fmt::Debug {
 
     /// Übernimmt eine Fehlermeldung des [`Self::refresh_command`]-Befehls.
     fn apply_error(&mut self, _text: &str) {}
+
+    /// Übernimmt ein Live-Ereignis vom Agenten-Bus (z. B. ein Matrix-Spiel-
+    /// Ereignis als `{"run_id", "event"}`). Standard: ignorieren.
+    fn apply_event(&mut self, _event: &serde_json::Value) {}
 }
 
 /// `true` für „nach unten“: `↓` oder `j` (ohne Strg/Alt).

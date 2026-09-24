@@ -19,8 +19,9 @@ const ALLOWED_MODES: &[&str] = &["chat", "plan", "explore", "work", "shell"];
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ModeSection {
-    /// Einer von `chat`, `plan`, `explore`, `work`, `shell`. Default: `plan`,
-    /// damit Sessions mit einer nachvollziehbaren Planung beginnen.
+    /// Einer von `chat`, `plan`, `explore`, `work`, `shell`. Default: `chat`,
+    /// damit eine neue Session als Gespräch beginnt; Planung, Exploration
+    /// und Arbeit wählt man bewusst (`--mode`, `/mode`, `[mode] default`).
     #[serde(default = "default_mode")]
     pub default: String,
 }
@@ -34,7 +35,7 @@ impl Default for ModeSection {
 }
 
 fn default_mode() -> String {
-    "plan".to_owned()
+    "chat".to_owned()
 }
 
 impl ModeSection {
@@ -62,7 +63,7 @@ mod tests {
     #[test]
     fn test_mode_section_defaults_from_empty_toml() -> TestResult {
         let section: ModeSection = toml::from_str("").map_err(ctx("leeres mode-toml parsen"))?;
-        assert_eq!(section.default, "plan");
+        assert_eq!(section.default, "chat");
         assert_eq!(section, ModeSection::default());
         Ok(())
     }

@@ -1,0 +1,79 @@
+# Eingebaute Matrix-Game-Rolle `matrix-redcell` (Runde 3, Frank-Ideen) — der
+# optionale vierte Sitz-Typ des Matrix-Games (`harw-matrix-game`), neben
+# `matrix-player` (Spieler), `matrix-umpire` (Schiedsrichter) und
+# `matrix-market` (Markt). Die Red Cell sieht nur öffentliche Einträge und
+# widerspricht gezielt den tragenden Annahmen der Argumente einer Runde
+# (Vertrag `red_cell_objection`, nur bei `adjudication = "pros_cons"`).
+#
+# Namensableitung (AW6-00-Konvention): Dateistamm `matrix-redcell` unter
+# `agents/roles/matrix-redcell/` ergibt den Rollennamen `"matrix-redcell"`
+# (`role_names::MATRIX_REDCELL` in `src/profile.rs`).
+#
+# ── Warum nur lesende Werkzeuge ─────────────────────────────────────────────
+# Der Matrix-Runner (`harw-ops/src/matrix/runner.rs`) übergibt jedem Sitz
+# seine Sicht auf das Spiel (Szenario, Journal-Auszug, erwarteter Aufruf)
+# vollständig im Prompt und liest die Antwort als Text zurück. Zusätzlich
+# darf der Sitz seine Unterlagen lesen (Nutzerwunsch, Runde 3
+# „Matrix-Unterlagen“): der Runner kopiert je Sitz die für ihn sichtbaren
+# Dateien in einen eigenen Ordner und setzt ihn als Sandbox-Wurzel mit
+# genau `{ReadWorkspace}`. `[tools].admitted` sind deshalb genau die fünf
+# lesenden `fs.*`-Werkzeuge plus `doc.read_pdf`; das Registry-Profil ist
+# `RegistryProfile::MatrixReader`, der Reducer `AuthorityReducer::ReadOnly`
+# — kein Schreiben, keine Ausführung, kein Netz. `forbidden` benennt jedes
+# Schreib-, Ausführungs- und Netzwerkzeug ausdrücklich, damit eine
+# Ablehnung nachvollziehbar bleibt.
+#
+# ── Rückgabevertrag ──────────────────────────────────────────────────────────
+# `harwness.matrix.red-cell-objection@1` ist ein undurchsichtiges Label: `ChildReturnContract::parse`
+# kennt es nicht und reicht die Antwort als Freitext durch. Die Prüfung der
+# Antwortform übernimmt der Matrix-Runner selbst (Reparatur-Prompt bei
+# Vertragsbruch).
+
+schema = "harwness.agent/v1"
+id = "harwness.agent.matrix-redcell@1"
+version = "1.0.0"
+extends = { id = "harwness.agent.worker-base@1" }
+role = "worker"
+specialization = "matrix-redcell"
+
+name = "Matrix Red Cell"
+description = "Red Cell im Matrix-Game: widerspricht aus der öffentlichen Lage gezielt den tragenden Annahmen der Argumente einer Runde; liest nur ihre Unterlagen, ohne Netz, Schreiben oder Ausführung."
+
+[work]
+mode = "matrix-game-red-cell"
+may_write_code = false
+may_research_web = false
+
+# Nur lesende Werkzeuge für die Unterlagen — siehe Begründung oben.
+[tools]
+admitted = [
+    "fs.read",
+    "fs.list",
+    "fs.search",
+    "fs.glob",
+    "fs.grep",
+    "doc.read_pdf",
+]
+forbidden = [
+    "fs.write",
+    "shell.exec",
+    "process.kill",
+    "web.fetch",
+    "web.search",
+    "web.docs_rs",
+    "web.crates_io",
+]
+
+# Ein Sitz spielt seinen Zug selbst und startet keine Kind-Agenten.
+[spawn]
+max_depth = 0
+
+# Textzug mit großzügigem Token-Budget; wenige lesende Aufrufe für die
+# Unterlagen.
+[spawn.budget]
+max_tokens = 60000
+max_tool_calls = 16
+max_wall_secs = 300
+
+[return]
+contract = "harwness.matrix.red-cell-objection@1"

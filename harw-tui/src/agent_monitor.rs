@@ -586,6 +586,9 @@ impl AgentMonitor {
                 true
             }
             AgentEventKind::Turn(turn) => self.apply_turn(event, turn),
+            // Matrix-Spielereignisse gehören der Matrix-Ansicht (`app.rs`
+            // leitet sie dorthin weiter); der Monitor ignoriert sie.
+            AgentEventKind::Matrix { .. } => false,
         }
     }
 

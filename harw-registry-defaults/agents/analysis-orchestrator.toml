@@ -42,6 +42,9 @@ allow_rerun = true
 max_attempts = 2
 
 [context]
+# Kontextprogramm (Runde 3, Welle C2): `agents/context-programs/orchestrate.toml`;
+# die Selektoren darunter ergaenzen es (siehe `embedded_agents::bind_context_program`).
+program = "orchestrate"
 must_include = ["task.objective", "task.read_scope", "new.trigger_return"]
 exclude = ["full_parent_transcript", "sibling_transcripts"]
 

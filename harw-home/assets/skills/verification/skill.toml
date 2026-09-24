@@ -1,3 +1,4 @@
 name = "verification"
 description = "Run focused tests, checks, and reviews against explicit acceptance criteria."
+instructions_file = "instructions.md"
 tools = ["filesystem.read", "process.execute"]

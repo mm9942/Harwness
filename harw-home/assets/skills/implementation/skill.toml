@@ -1,3 +1,4 @@
 name = "implementation"
 description = "Make narrowly scoped code changes and retain an auditable verification record."
+instructions_file = "instructions.md"
 tools = ["filesystem.read", "filesystem.write", "process.execute"]

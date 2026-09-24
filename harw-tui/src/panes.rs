@@ -350,7 +350,7 @@ mod tests {
     #[test]
     fn custom_bindings_replace_defaults() -> Result<(), Box<dyn std::error::Error>> {
         let bindings =
-            KeyBindings::from_toml_str("cycle_focus = \"F9\"\n", std::path::Path::new("kb.toml"))?;
+            KeyBindings::from_toml_str("cycle_focus = \"F20\"\n", std::path::Path::new("kb.toml"))?;
         let mut state = PanelState::default();
         assert_eq!(
             state.handle_key(key(KeyCode::F(4)), &bindings),
@@ -358,7 +358,7 @@ mod tests {
         );
         assert_eq!(state.focus, PaneFocus::Chat);
         assert_eq!(
-            state.handle_key(key(KeyCode::F(9)), &bindings),
+            state.handle_key(key(KeyCode::F(20)), &bindings),
             PanelKey::Changed
         );
         assert_eq!(state.focus, PaneFocus::Agents);

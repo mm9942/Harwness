@@ -117,7 +117,7 @@ use harw_protocol::{AgentOrchestrationEvent, AgentOrchestrationStatus, TurnEvent
 use harw_session_store::{ApprovalStore, ChildLeaseRecord, ChildLeaseStore};
 use harw_types::{AgentRole, ReasoningEffort, SessionId, TokenUsage, ToolCallId, TurnId};
 use jiff::{SignedDuration, Timestamp};
-use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashSet, VecDeque};
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
@@ -1660,6 +1660,11 @@ pub struct ManagedAgentSpawner {
     /// re-checking admission, the same lost-wakeup-safe pattern as
     /// `admission::SubmissionLimiter::freed`, plus a bounded fallback sleep.
     freed: tokio::sync::Notify,
+    /// Exakte Rollennamen, die ein `UserInterface`-Elternteil trotz
+    /// `can_spawn(UserInterface, Worker) == false` als `Worker`-Kind
+    /// admittieren darf ([`Self::with_uia_spawnable_roles`]). Leer, solange
+    /// nichts explizit gesetzt wurde — dann gilt die Spawn-Matrix unverändert.
+    uia_spawnable_roles: HashSet<String>,
 }
 
 /// Anzahl der pro Elternteil vorgehaltenen Delegations-Brief-Hashes
@@ -2171,7 +2176,93 @@ impl ManagedAgentSpawner {
             child_tasks: Mutex::new(BTreeMap::new()),
             progress_sinks: Arc::new(Mutex::new(BTreeMap::new())),
             freed: tokio::sync::Notify::new(),
+            uia_spawnable_roles: HashSet::new(),
         }
+    }
+
+    /// Erlaubt einem `UserInterface`-Elternteil (der UIA-Wurzelsitzung), die
+    /// hier exakt benannten Rollen als `Worker`-Kind zu admittieren — eine
+    /// enge, explizite Ausnahme von
+    /// `harw_agent_dsl::roles::can_spawn(UserInterface, Worker) == false`.
+    ///
+    /// # Beschreibung
+    /// Die Ausnahme greift ausschließlich, wenn **alle drei** Bedingungen
+    /// gelten: Elternrolle `UserInterface`, Kindrolle `Worker` und der exakte
+    /// registrierte Rollenname des Kindes steht in dieser Liste. Jede andere
+    /// Kombination (anderer Elternteil, andere Kindrolle, nicht gelisteter
+    /// Name) läuft unverändert durch [`can_delegate_to`] — die allgemeine
+    /// Spawn-Matrix wird nicht aufgeweicht. Mehrfache Aufrufe ergänzen die
+    /// Liste.
+    ///
+    /// Die Ausnahme wirkt nur auf die Admission, nicht auf die dem Modell
+    /// gezeigte Delegationszielliste (`delegation_visibility`): gedacht ist
+    /// sie für Runtime-Operationen wie `/matrix`, die aus der UIA-Wurzel
+    /// heraus je Sitz genau ein Kind mit fester Rolle erzeugen.
+    ///
+    /// # Sicherheit
+    /// Die UIA-Wurzel darf regulär keine `Worker` erzeugen, weil ein Worker
+    /// Werkzeuge (Schreiben, Shell, Netz) tragen kann, die die UIA selbst
+    /// bewusst nicht direkt delegieren soll. In diese Liste gehören daher
+    /// **nur lesende Rollen ohne Netz, Schreiben oder Exec** (für die
+    /// Matrix-Sitze Registry-Profil `MatrixReader`: höchstens lesende
+    /// Datei-Werkzeuge wie `fs.read`/`fs.list`/`fs.search`/`fs.glob`/
+    /// `fs.grep`/`doc.read_pdf`; Authority-Reducer `ReadOnly`), deren
+    /// Kind-Sitzung nichts schreiben, ausführen oder ins Netz tragen kann.
+    /// Diese Eigenschaft prüft der Controller nicht selbst — er kennt nur
+    /// Namen und Organisationsrollen. Sie sicherzustellen ist Verantwortung des
+    /// Aufrufers (Runtime-Montage); für die Matrix-Rollen belegt das
+    /// `harw-registry-defaults/tests/uia_spawn_authority.rs`.
+    ///
+    /// # Arguments
+    /// - `roles` (`impl IntoIterator<Item = String>`): exakte Rollennamen.
+    ///
+    /// # Returns
+    /// Den Spawner mit ergänzter Freigabeliste.
+    ///
+    /// # Beispiel
+    /// ```ignore
+    /// let spawner = spawner.with_uia_spawnable_roles(
+    ///     role_names::MATRIX_ROLES.iter().map(|s| (*s).to_owned()),
+    /// );
+    /// ```
+    #[must_use]
+    pub fn with_uia_spawnable_roles(mut self, roles: impl IntoIterator<Item = String>) -> Self {
+        self.uia_spawnable_roles.extend(roles);
+        self
+    }
+
+    /// Prüft die Spawn-Berechtigung für eine Admission: die allgemeine
+    /// [`can_delegate_to`]-Regel, ergänzt nur um die enge UIA-Freigabeliste
+    /// aus [`Self::with_uia_spawnable_roles`].
+    ///
+    /// # Arguments
+    /// - `caller_role`: Organisationsrolle des Elternteils.
+    /// - `target_role`: Organisationsrolle des Kindes.
+    /// - `target_role_name`: exakter registrierter Rollenname des Kindes.
+    /// - `allowed_child_orchestrators`: Kind-Orchestrator-Freigabeliste des
+    ///   Elternteils.
+    ///
+    /// # Returns
+    /// `true`, wenn die Admission organisatorisch erlaubt ist.
+    fn spawn_permitted(
+        &self,
+        caller_role: harw_agent_dsl::roles::AgentRoleId,
+        target_role: harw_agent_dsl::roles::AgentRoleId,
+        target_role_name: &str,
+        allowed_child_orchestrators: &[String],
+    ) -> bool {
+        if caller_role == harw_agent_dsl::roles::AgentRoleId::UserInterface
+            && target_role == harw_agent_dsl::roles::AgentRoleId::Worker
+            && self.uia_spawnable_roles.contains(target_role_name)
+        {
+            return true;
+        }
+        can_delegate_to(
+            caller_role,
+            target_role,
+            target_role_name,
+            allowed_child_orchestrators,
+        )
     }
 
     /// Installs the runtime-owned lifecycle sink. The controller retains no
@@ -4736,8 +4827,11 @@ impl ManagedAgentSpawner {
         // `can_delegate_to`, dieselbe Hilfsfunktion, die auch
         // `delegation_visibility::visible_delegation_targets` verwendet —
         // damit kann die dem Modell gezeigte Zielliste nie von der
-        // tatsächlichen Admission abweichen.
-        if !can_delegate_to(
+        // tatsächlichen Admission abweichen. Einzige Ergänzung: die enge
+        // UIA-Freigabeliste für nur lesende Worker-Rollen ohne Netz,
+        // Schreiben oder Exec (`Self::with_uia_spawnable_roles`, z. B.
+        // `/matrix`-Sitze).
+        if !self.spawn_permitted(
             parent_context.organizational_role,
             definition.organizational_role,
             role_name,
@@ -6211,6 +6305,127 @@ specialization = "child-controller-test"
             "no delegation capability is available for this request"
         );
         Ok(())
+    }
+
+    // --- UIA-Freigabeliste (`with_uia_spawnable_roles`) ---------------------
+
+    /// Spawner mit den Worker-Rollen `matrix-player` (gelistet) und
+    /// `worker` (nicht gelistet) unter einer `UserInterface`-Wurzel.
+    fn uia_allowlist_spawner(
+        manager: Arc<Mutex<SessionManager>>,
+        parent: SessionId,
+        sandbox: SandboxSpec,
+    ) -> TestResult<ManagedAgentSpawner> {
+        worker_spawner(manager)
+            .with_role(
+                "matrix-player",
+                AgentRole::Agent {
+                    name: "matrix-player".to_owned(),
+                },
+                harw_agent_dsl::roles::AgentRoleId::Worker,
+                Arc::new(EmptyChildRegistry),
+            )
+            .with_uia_spawnable_roles(["matrix-player".to_owned()])
+            .with_external_root_parent(
+                parent,
+                external_root_context(sandbox, harw_agent_dsl::roles::AgentRoleId::UserInterface),
+                None,
+                SessionActivation::default(),
+            )
+            .map_err(ctx("trusted external root registers during construction"))
+    }
+
+    #[test]
+    fn uia_allowlist_admits_a_listed_worker_role() -> TestResult {
+        let (events, _receiver) = mpsc::unbounded_channel();
+        let manager = Arc::new(Mutex::new(SessionManager::new(events)));
+        let sandbox = test_sandbox(PermissionSet::from_policy([Permission::ReadWorkspace]))?;
+        let parent = SessionId::new();
+        let spawner = uia_allowlist_spawner(manager, parent.clone(), sandbox.clone())?;
+
+        let child = spawner
+            .admit("matrix-player", spawn_input(parent.clone()), sandbox, None)
+            .map_err(ctx(
+                "listed read-only worker role is admitted for a UIA parent",
+            ))?;
+
+        let record = spawner
+            .child_record(&child)
+            .ok_or(TestError::Missing("child is tracked"))?;
+        assert_eq!(record.parent, parent);
+        assert_eq!(record.role, "matrix-player");
+        Ok(())
+    }
+
+    #[test]
+    fn uia_allowlist_still_refuses_an_unlisted_worker_role() -> TestResult {
+        let (events, _receiver) = mpsc::unbounded_channel();
+        let manager = Arc::new(Mutex::new(SessionManager::new(events)));
+        let sandbox = test_sandbox(PermissionSet::from_policy([Permission::ReadWorkspace]))?;
+        let parent = SessionId::new();
+        let spawner = uia_allowlist_spawner(manager, parent.clone(), sandbox.clone())?;
+
+        let Err(error) = spawner.admit("worker", spawn_input(parent), sandbox, None) else {
+            return Err(TestError::Unexpected(
+                "an unlisted worker role must stay refused for a UIA parent".to_owned(),
+            ));
+        };
+
+        assert_eq!(
+            error.message,
+            "no delegation capability is available for this request"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn uia_allowlist_leaves_other_role_combinations_unchanged() {
+        use harw_agent_dsl::roles::AgentRoleId;
+        let (events, _receiver) = mpsc::unbounded_channel();
+        let manager = Arc::new(Mutex::new(SessionManager::new(events)));
+        let spawner = ManagedAgentSpawner::new(manager, ChildLimits::conservative())
+            .with_uia_spawnable_roles(["matrix-player".to_owned()]);
+        let all = [
+            AgentRoleId::RootOrchestrator,
+            AgentRoleId::ChildOrchestrator,
+            AgentRoleId::UserInterface,
+            AgentRoleId::Worker,
+            AgentRoleId::UiaWorker,
+            AgentRoleId::AgentSteward,
+        ];
+        let allowed_orchestrators = ["matrix-player".to_owned()];
+
+        for caller in all {
+            for target in all {
+                for name in ["matrix-player", "worker"] {
+                    let listed_uia_worker = caller == AgentRoleId::UserInterface
+                        && target == AgentRoleId::Worker
+                        && name == "matrix-player";
+                    let expected = listed_uia_worker
+                        || can_delegate_to(caller, target, name, &allowed_orchestrators);
+                    assert_eq!(
+                        spawner.spawn_permitted(caller, target, name, &allowed_orchestrators),
+                        expected,
+                        "{caller:?} -> {target:?} ({name})"
+                    );
+                }
+            }
+        }
+        // Die Ausnahme ist wirklich eine Ausnahme: ohne Liste bleibt
+        // UserInterface -> Worker verboten.
+        assert!(!can_delegate_to(
+            AgentRoleId::UserInterface,
+            AgentRoleId::Worker,
+            "matrix-player",
+            &[],
+        ));
+        // Ein Worker-Elternteil gewinnt durch die Liste nichts.
+        assert!(!spawner.spawn_permitted(
+            AgentRoleId::Worker,
+            AgentRoleId::Worker,
+            "matrix-player",
+            &[],
+        ));
     }
 
     // --- W2-16: `ChildLimits`-Ableitung ------------------------------------

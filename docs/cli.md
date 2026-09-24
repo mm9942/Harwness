@@ -92,6 +92,7 @@ ignorieren.
 | `--approval ask\|auto\|full` | Freigabemodus nur für diese Sitzung: `ask` fragt bei jedem Werkzeugaufruf, `auto` lässt unkritische Aufrufe durch und fragt beim Rest, `full` fragt nie. Überschreibt den konfigurierten Standard. |
 | `--model ID` | Verwendet für diese Sitzung das Modell `ID` statt des Standardmodells. |
 | `--goal TEXT` | Setzt beim Start ein Ziel, auf das die Sitzung hinarbeitet. |
+| `--agent NAME` | Startet die Sitzung mit der Agentendefinition `NAME` als Wurzel (eingebaute Rolle wie `root-orchestrator` oder eine eigene Definition) statt der konfigurierten `active_agent_definition`. Nur für diese Sitzung; dauerhaft setzt man sie mit `/agent use NAME` (Entfernen: `/agent use --clear`), wirksam ab der nächsten Sitzung. |
 | `--add-dir PFAD` | Erlaubt Dateizugriffe ohne Rückfrage zusätzlich unter `PFAD` (mehrfach angebbar). |
 
 Nicht global sind die Chat-Flags `-r/--resume` und `--all`: sie gelten nur für

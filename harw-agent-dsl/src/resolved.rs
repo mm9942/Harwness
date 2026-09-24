@@ -85,6 +85,25 @@ pub struct ResolvedAgentDefinition {
     pub config: toml::Table,
 }
 
+impl ResolvedAgentDefinition {
+    /// Die aufgelösten Skills dieser Definition (Vereinigung über
+    /// `extends`/Mixins/Schichten, siehe [`crate::skills`]).
+    ///
+    /// # Beschreibung
+    /// Liegt unter dem reservierten Schlüssel
+    /// [`SKILLS_CONFIG_KEY`](crate::skills::SKILLS_CONFIG_KEY) in
+    /// [`Self::config`], damit bestehende Struktur-Literale dieses Typs
+    /// quellkompatibel bleiben. Diese Lesart ist nachsichtig (Nicht-Strings
+    /// fallen weg); die strenge, fail-closed Prüfung macht [`crate::lower`].
+    ///
+    /// # Rückgabe
+    /// Die Skill-Namen in Auflösungsreihenfolge; leer, wenn keine Ebene
+    /// Skills führt.
+    pub fn skills(&self) -> Vec<String> {
+        crate::skills::skills_from_config_lenient(&self.config)
+    }
+}
+
 /// Auditpfad der Definition-Auflösung.
 ///
 /// # Beschreibung

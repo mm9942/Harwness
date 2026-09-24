@@ -303,9 +303,13 @@ Modul-Doc-Kommentar:
 - **`/mode`** — Anzeige und Wechselabsicht des Interaktionsmodus (`chat`,
   `plan`, `explore`, `work`, `shell`); TUI-only, kein Modell-Tool, damit ein
   Modell nicht sein eigenes Werkzeug-Ceiling anheben kann.
-- **`/research-deps`** und **`/research-web`** — gebundene Recherche durch
-  read-only Kinder; gleiche Struktur, unterscheiden sich nur in Kindrolle und
-  Vorgabe-Quellklassen.
+- **`/research`**, **`/research-deps`** und **`/research-web`** — gebundene
+  Recherche durch Kinder; gleiche Struktur, unterscheiden sich nur in Kindrolle
+  und Vorgabe-Quellklassen. `/research` ist die allgemeine Recherche
+  (`researcher`), `/research-deps` prüft Rust-Abhängigkeiten
+  (`researcher-deps`, mit `--generic` sprachneutral über
+  `dependency-researcher`), `/research-web` recherchiert egress-gebunden im
+  Netz.
 - **`/plan`** — Plan-Operation über `harw-plan`/`harw-plan-bridge`, Command
   und Modell-Tool, jede Mutation läuft über `PlanStore::apply`.
 - **`/usage`** — zeigt aufgezeichnete Token-Nutzung und Wächter-Ereignisse der

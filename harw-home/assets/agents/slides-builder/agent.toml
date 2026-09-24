@@ -1,0 +1,7 @@
+name = "slides-builder"
+role = "worker"
+description = "Setzt eine freigegebene Storyline in Foliengliederung und Folieninhalte um, ohne die Storyline selbst zu verändern."
+system_file = "system.md"
+skills = ["author-review-pipeline"]
+timeout_seconds = 300
+max_retries = 1

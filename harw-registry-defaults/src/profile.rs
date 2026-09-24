@@ -166,7 +166,8 @@ pub mod role_names {
     /// Startbarer Orchestrator, den die UIA als Wurzel eines Agentenbaums
     /// einsetzen kann.
     pub const ROOT_ORCHESTRATOR: &str = "root-orchestrator";
-    /// Read-only Erkundung von Workspace und Dependency-Quellen.
+    /// Read-only Erkundung eines Verzeichnisbaums: Projekte, Dateien,
+    /// Dokumente und ihre Beziehungen (sprach- und ökosystemneutral).
     pub const EXPLORER: &str = "explorer";
     /// Rust/Cargo-Spezialist der Dependency-Recherche: belegt Verhalten aus
     /// `Cargo.lock`, dem lokalen Registry-Quellcache, docs.rs und crates.io.
@@ -185,9 +186,9 @@ pub mod role_names {
     /// Wahrscheinlichkeit getrennt von Konfidenz) im `ResearchFinding`
     /// ([`crate::profile::RegistryProfile::ReadOnlyResearch`]).
     pub const RESEARCHER: &str = "researcher";
-    /// Dokumentations-Web-Recherche über die Host-Allowlist der Sandbox —
-    /// ausschließlich Netz, kein Workspace-Lesen (A5), einschließlich der
-    /// Crate-Werkzeuge `web.docs_rs`/`web.crates_io`.
+    /// Web-Recherche in Dokumentation, Release Notes und Paket-Metadaten über
+    /// die Host-Allowlist der Sandbox — ausschließlich Netz, kein
+    /// Workspace-Lesen (A5); für Rust zusätzlich `web.docs_rs`/`web.crates_io`.
     pub const RESEARCHER_WEB: &str = "researcher-web";
     /// Erzeugt Planvorschläge, ohne den autoritativen Plan zu mutieren.
     pub const PLANNER: &str = "planner";
@@ -211,6 +212,30 @@ pub mod role_names {
     /// (`ProcessExec`, `FileWrite`, `AuthEvent`); parametergetrieben, keine
     /// eigene Werkzeugoberfläche.
     pub const SECURITY_ENDPOINT_TRIAGE: &str = "security-endpoint-triage";
+
+    /// Spieler-Sitz des Matrix-Games (Runde 3, Welle E): formuliert aus der
+    /// eigenen Sicht einen Zug. Liest nur die eigenen Unterlagen (ohne Netz,
+    /// ohne Schreiben/Exec) — der Matrix-Runner übergibt die Sicht im Prompt
+    /// (`agents/roles/matrix-player/matrix-player.toml`).
+    pub const MATRIX_PLAYER: &str = "matrix-player";
+    /// Schiedsrichter-Sitz des Matrix-Games: bewertet Züge und schreibt den
+    /// Lagebericht. Liest nur Unterlagen (ohne Netz, ohne Schreiben/Exec)
+    /// (`agents/roles/matrix-umpire/matrix-umpire.toml`).
+    pub const MATRIX_UMPIRE: &str = "matrix-umpire";
+    /// Markt-Sitz des Matrix-Games: schätzt Wahrscheinlichkeiten offener
+    /// Entwicklungen. Liest nur Unterlagen (ohne Netz, ohne Schreiben/Exec)
+    /// (`agents/roles/matrix-market/matrix-market.toml`).
+    pub const MATRIX_MARKET: &str = "matrix-market";
+    /// Red-Cell-Sitz des Matrix-Games: widerspricht aus der öffentlichen Lage
+    /// den tragenden Annahmen der Argumente einer Runde. Liest nur Unterlagen
+    /// (ohne Netz, ohne Schreiben/Exec)
+    /// (`agents/roles/matrix-redcell/matrix-redcell.toml`).
+    pub const MATRIX_REDCELL: &str = "matrix-redcell";
+    /// Die vier Sitz-Rollen des Matrix-Games. Alle bekommen
+    /// [`crate::profile::RegistryProfile::MatrixReader`] und den Reducer
+    /// [`crate::authority::AuthorityReducer::ReadOnly`].
+    pub const MATRIX_ROLES: [&str; 4] =
+        [MATRIX_PLAYER, MATRIX_UMPIRE, MATRIX_MARKET, MATRIX_REDCELL];
 
     /// Führt Befehls- und Dateioperationen im Auftrag des Haupt-Agenten aus
     /// und liefert eine Zusammenfassung statt Rohausgaben (Slice B7). Die
@@ -330,6 +355,10 @@ pub mod role_names {
         SECURITY_BASELINE_TRIAGE,
         SECURITY_STRUCTURE_TRIAGE,
         SECURITY_ENDPOINT_TRIAGE,
+        MATRIX_PLAYER,
+        MATRIX_UMPIRE,
+        MATRIX_MARKET,
+        MATRIX_REDCELL,
         EXECUTOR,
         MEMORY_STEWARD,
         UIA_WORKER,
@@ -695,6 +724,13 @@ pub(crate) const BROWSER_TOOLS: &[&str] = &[
 ///   (siehe deren Begründung bei [`RegistryProfile::MemoryStewardship`]
 ///   unten für den Grund, warum `Full` dafür zu weit wäre).
 /// - `NoTools` — registriert und bewirbt gar nichts.
+/// - `MatrixReader` — nur die lesenden `fs.*` plus `doc.read_pdf`; Rechte
+///   genau `{ReadWorkspace}` (Matrix-Game-Sitze, siehe
+///   [`RegistryProfile::MatrixReader`]).
+/// - `WorkspaceEdit` — Workspace lesen und schreiben (`fs.*` inklusive
+///   `fs.write`), aber kein `shell.*`, kein `web.*`, kein `lens.ask`; Rechte
+///   genau `{ReadWorkspace, WriteWorkspace}` (siehe
+///   [`RegistryProfile::WorkspaceEdit`]).
 ///
 /// # Warum `NoTools` und nicht `ReadOnlyExplore` für die Triage-Rollen
 /// Die vier `security-*-triage`-Rollen (siehe [`role_names`]) haben
@@ -923,6 +959,41 @@ pub enum RegistryProfile {
     /// nur, wenn der Elternteil es trägt, und nur zu dessen
     /// (egress-gebundenen) Hosts.
     ReadOnlyResearch,
+    /// Workspace lesen und schreiben, aber weder ausführen noch ins Netz:
+    /// alle sechs `fs.*`-Werkzeuge (inklusive `fs.write`) plus
+    /// `doc.read_pdf` plus `explore.*` plus die workspace-lesenden
+    /// `deps.graph`/`deps.locked` — kein `shell.*`, kein `process.*`, kein
+    /// `web.*`, kein `lens.ask`, kein `deps.source_*`.
+    ///
+    /// # Warum dieses Profil existiert (Runde 3, Welle D)
+    /// Ein Telegram-Chat mit gebundenem Workspace soll Dateien lesen und
+    /// (mit Freigabe) ändern können, aber keine Shell bekommen. `Full` wäre
+    /// zu weit (`shell.exec`, `process.*`), `ReadOnlyExplore` kann nicht
+    /// schreiben und bringt Netz-Werkzeuge mit, `UiaWriter` bringt `web.*`
+    /// und den Registry-Quellcache mit. Die Rechte bleiben deshalb exakt
+    /// `{ReadWorkspace, WriteWorkspace}`: `deps.source_*`
+    /// (`ReadCargoRegistry`) ist bewusst nicht dabei. `fs.edit` gibt es in
+    /// `harw-tool-fs` (noch) nicht; kommt es hinzu, gehört es hierher.
+    /// Keine eingebaute Rolle bekommt dieses Profil — es ist ein reines
+    /// Einstiegsprofil.
+    WorkspaceEdit,
+    /// Nur lesende Unterlagen: [`FS_READ_ONLY_TOOLS`] (`fs.read`, `fs.list`,
+    /// `fs.search`, `fs.glob`, `fs.grep`) plus [`DOC_TOOLS`]
+    /// (`doc.read_pdf`) — kein `fs.write`, kein `shell.*`, kein
+    /// `process.*`, kein `web.*`, kein `explore.*`, kein `deps.*`, kein
+    /// `lens.ask`. Rechte genau `{ReadWorkspace}`.
+    ///
+    /// # Warum dieses Profil existiert (Runde 3, Matrix-Unterlagen)
+    /// Nutzerwunsch: die Sitze des Matrix-Games ([`role_names::MATRIX_ROLES`])
+    /// sollen Dateien aus einem Unterlagen-Ordner lesen können. Der
+    /// Matrix-Runner kopiert je Sitz nur die für ihn sichtbaren Unterlagen in
+    /// einen eigenen Ordner und setzt ihn als Sandbox-Wurzel des Kindes; das
+    /// Profil liefert genau die Werkzeuge, um diesen Ordner zu lesen.
+    /// `ReadOnlyExplore` wäre zu weit (`explore.*` sieht den ganzen Baum,
+    /// `deps.*` den Registry-Cache, dazu `web.*`), `NoTools` zu eng. Der
+    /// Reducer der Rollen bleibt
+    /// [`crate::authority::AuthorityReducer::ReadOnly`] — kein Netz.
+    MatrixReader,
 }
 
 impl RegistryProfile {
@@ -943,6 +1014,8 @@ impl RegistryProfile {
         RegistryProfile::UiaWriter,
         RegistryProfile::UiaShellWorker,
         RegistryProfile::ReadOnlyResearch,
+        RegistryProfile::WorkspaceEdit,
+        RegistryProfile::MatrixReader,
     ];
 
     /// Liefert die Rollenbeschreibung, die im System-Prompt erscheint.
@@ -979,6 +1052,8 @@ impl RegistryProfile {
                 "host shell execution specialization of the user interface agent"
             }
             RegistryProfile::ReadOnlyResearch => "read-only research agent",
+            RegistryProfile::WorkspaceEdit => "workspace editing agent without shell",
+            RegistryProfile::MatrixReader => "matrix game seat reading its materials",
         }
     }
 
@@ -992,8 +1067,9 @@ impl RegistryProfile {
     /// [`RegistryProfile::AgentStewardship`] (registriert die schreibenden
     /// Agentendefinitions-Werkzeuge `agents.write_definition`/
     /// `agents.write_uia`), [`RegistryProfile::UiaWriter`] (registriert
-    /// `fs.write`) und [`RegistryProfile::UiaShellWorker`] (registriert
-    /// `shell.exec`). Alle übrigen Profile — inklusive
+    /// `fs.write`), [`RegistryProfile::UiaShellWorker`] (registriert
+    /// `shell.exec`) und [`RegistryProfile::WorkspaceEdit`] (registriert
+    /// `fs.write`). Alle übrigen Profile — inklusive
     /// [`RegistryProfile::UiaExplorer`] — sind read-only und dürfen weder
     /// `fs.write` noch `shell.exec` sehen.
     ///
@@ -1016,6 +1092,7 @@ impl RegistryProfile {
                 | RegistryProfile::AgentStewardship
                 | RegistryProfile::UiaWriter
                 | RegistryProfile::UiaShellWorker
+                | RegistryProfile::WorkspaceEdit
         )
     }
 
@@ -1161,6 +1238,25 @@ impl RegistryProfile {
                 .chain(DOC_TOOLS.iter())
                 .chain(EXPLORER_TOOLS.iter())
                 .chain(EXPLORER_WEB_TOOLS.iter())
+                .copied()
+                .collect(),
+            // Workspace lesen und schreiben ohne Shell und ohne Netz (siehe
+            // die Begründung bei `RegistryProfile::WorkspaceEdit`): alle
+            // sechs `fs.*` plus `doc.read_pdf` plus `explore.*` plus die
+            // workspace-lesenden `deps.graph`/`deps.locked`.
+            RegistryProfile::WorkspaceEdit => FS_FULL_TOOLS
+                .iter()
+                .chain(DOC_TOOLS.iter())
+                .chain(EXPLORER_TOOLS.iter())
+                .chain(DEPS_WORKSPACE_TOOLS.iter())
+                .copied()
+                .collect(),
+            // Nur lesende Unterlagen der Matrix-Sitze (siehe die Begründung
+            // bei `RegistryProfile::MatrixReader`): lesender fs.*-Kern plus
+            // `doc.read_pdf` — kein Netz, kein Schreiben, keine Ausführung.
+            RegistryProfile::MatrixReader => FS_READ_ONLY_TOOLS
+                .iter()
+                .chain(DOC_TOOLS.iter())
                 .copied()
                 .collect(),
         }
@@ -1312,6 +1408,15 @@ pub fn profile_for_role(role: &str) -> Option<RegistryProfile> {
         | role_names::SECURITY_BASELINE_TRIAGE
         | role_names::SECURITY_STRUCTURE_TRIAGE
         | role_names::SECURITY_ENDPOINT_TRIAGE => Some(RegistryProfile::NoTools),
+        // Die vier Matrix-Game-Sitze lesen nur ihre Unterlagen (lesende
+        // `fs.*` plus `doc.read_pdf`, ohne Netz, Schreiben oder Exec); der
+        // Matrix-Runner übergibt jedem Sitz seine Sicht im Prompt und liest
+        // die Antwort als Text (`agents/roles/matrix-*/matrix-*.toml`). Siehe
+        // die Begründung bei `RegistryProfile::MatrixReader`.
+        role_names::MATRIX_PLAYER
+        | role_names::MATRIX_UMPIRE
+        | role_names::MATRIX_MARKET
+        | role_names::MATRIX_REDCELL => Some(RegistryProfile::MatrixReader),
         // Einzige eingebaute Rolle mit der Prozessoberfläche: sie führt nur
         // beauftragte Sandbox-Prozesse aus. Das ist eine ausdrückliche,
         // dokumentierte Ausnahme (siehe `agents/executor.toml` und den Test
@@ -1915,6 +2020,34 @@ fn profile_tool_providers(
                 EXPLORER_WEB_TOOLS,
             ));
             vec![filesystem, doc, explorer, web]
+        }
+        // Workspace lesen und schreiben ohne Shell und ohne Netz: voller,
+        // ungefilterter FS-Provider (alle sechs `fs.*`, inklusive
+        // `fs.write`) + lesender Doc-Provider + Explorer-Provider + auf
+        // `deps.graph`/`deps.locked` gefilterter Deps-Provider — kein
+        // `ShellToolProvider`, kein `WebToolProvider`. Siehe die Begründung
+        // bei `RegistryProfile::WorkspaceEdit`.
+        RegistryProfile::WorkspaceEdit => {
+            let filesystem: Arc<dyn ToolProvider> = Arc::new(FsToolProvider::default());
+            let doc: Arc<dyn ToolProvider> = Arc::new(DocToolProvider);
+            let explorer: Arc<dyn ToolProvider> = Arc::new(ExplorerToolProvider::new());
+            let dependencies: Arc<dyn ToolProvider> = Arc::new(RestrictedToolProvider::new(
+                Arc::new(DepsToolProvider::new()),
+                DEPS_WORKSPACE_TOOLS,
+            ));
+            vec![filesystem, doc, explorer, dependencies]
+        }
+        // Nur lesende Unterlagen: gefilterter, lesender FS-Provider +
+        // lesender Doc-Provider — kein Explorer-, Deps-, Web- oder
+        // Shell-Provider. Siehe die Begründung bei
+        // `RegistryProfile::MatrixReader`.
+        RegistryProfile::MatrixReader => {
+            let filesystem: Arc<dyn ToolProvider> = Arc::new(RestrictedToolProvider::new(
+                Arc::new(FsToolProvider::default()),
+                FS_READ_ONLY_TOOLS,
+            ));
+            let doc: Arc<dyn ToolProvider> = Arc::new(DocToolProvider);
+            vec![filesystem, doc]
         }
     }
 }
@@ -2920,6 +3053,94 @@ mod tests {
             RegistryProfile::NoTools.required_permissions(),
             PermissionSet::empty()
         );
+        assert_eq!(
+            RegistryProfile::WorkspaceEdit.required_permissions(),
+            set(&[Permission::ReadWorkspace, Permission::WriteWorkspace])
+        );
+        assert_eq!(
+            RegistryProfile::MatrixReader.required_permissions(),
+            set(&[Permission::ReadWorkspace])
+        );
+    }
+
+    /// `MatrixReader` (Runde 3, Matrix-Unterlagen): exakt die lesenden
+    /// `fs.*` plus `doc.read_pdf`, read-only, registriert wie beworben.
+    #[test]
+    fn test_matrix_reader_profile_exact_tool_surface() -> TestResult {
+        let expected = vec![
+            "fs.read",
+            "fs.list",
+            "fs.search",
+            "fs.glob",
+            "fs.grep",
+            "doc.read_pdf",
+        ];
+        assert_eq!(RegistryProfile::MatrixReader.tool_names(), expected);
+        assert!(RegistryProfile::MatrixReader.is_read_only());
+        let assembled = assemble(RegistryProfile::MatrixReader)?;
+        assert_eq!(registered_names(&assembled), expected);
+        Ok(())
+    }
+
+    /// `WorkspaceEdit` (Runde 3, Welle D): exakt `fs.*` inklusive
+    /// `fs.write`, `doc.read_pdf`, `explore.*` und `deps.graph`/
+    /// `deps.locked` — nie `shell.*`, `process.*`, `web.*`, `lens.ask`,
+    /// `browser.*` oder `deps.source_*`; registriert wie beworben.
+    #[test]
+    fn test_workspace_edit_profile_exact_tool_surface() -> TestResult {
+        let expected = vec![
+            "fs.read",
+            "fs.write",
+            "fs.list",
+            "fs.search",
+            "fs.glob",
+            "fs.grep",
+            "doc.read_pdf",
+            "explore.tree",
+            "explore.projects",
+            "explore.relations",
+            "explore.find",
+            "deps.graph",
+            "deps.locked",
+        ];
+        assert_eq!(RegistryProfile::WorkspaceEdit.tool_names(), expected);
+        for tool in RegistryProfile::WorkspaceEdit.tool_names() {
+            assert!(
+                !tool.starts_with("shell.")
+                    && !tool.starts_with("process.")
+                    && !tool.starts_with("web.")
+                    && !tool.starts_with("browser.")
+                    && !tool.starts_with("deps.source_")
+                    && tool != "lens.ask",
+                "WorkspaceEdit darf {tool} nicht registrieren"
+            );
+        }
+        let assembled = assemble(RegistryProfile::WorkspaceEdit)?;
+        let expected_owned: Vec<String> = expected.iter().map(|t| (*t).to_owned()).collect();
+        assert_eq!(registered_names(&assembled), expected_owned);
+        assert_eq!(assembled.identity.tools_available, expected_owned);
+        Ok(())
+    }
+
+    /// Die Wurzel der UIA-Sitzung (Einstieg `Tui` → `RegistryProfile::Full`)
+    /// registriert nie ein `web.*`-Werkzeug — Netz-Recherche bleibt den
+    /// UIA-Helfern vorbehalten, auch wenn die Wurzel egress-gebundenes Netz
+    /// trägt (Runde 3, Welle A).
+    #[test]
+    fn test_uia_root_profile_full_registers_no_web_tools() -> TestResult {
+        let advertised = RegistryProfile::Full.tool_names();
+        assert!(
+            !advertised.iter().any(|tool| tool.starts_with("web.")),
+            "Full bewirbt web.*: {advertised:?}"
+        );
+        let assembled = assemble(RegistryProfile::Full)?;
+        assert!(
+            !registered_names(&assembled)
+                .iter()
+                .any(|tool| tool.starts_with("web.")),
+            "Full registriert web.*"
+        );
+        Ok(())
     }
 
     #[test]
@@ -3314,6 +3535,14 @@ mod tests {
                 "Triage-Rolle {role} muss NoTools bekommen"
             );
         }
+        for role in role_names::MATRIX_ROLES {
+            assert!(role_names::ALL.contains(&role), "{role} fehlt in ALL");
+            assert_eq!(
+                profile_for_role(role),
+                Some(RegistryProfile::MatrixReader),
+                "Matrix-Rolle {role} muss MatrixReader bekommen"
+            );
+        }
         for role in role_names::ALL {
             assert!(profile_for_role(role).is_some(), "unbekannt: {role}");
         }
@@ -3415,6 +3644,7 @@ mod tests {
         assert!(!RegistryProfile::AgentStewardship.is_read_only());
         assert!(!RegistryProfile::UiaWriter.is_read_only());
         assert!(!RegistryProfile::UiaShellWorker.is_read_only());
+        assert!(!RegistryProfile::WorkspaceEdit.is_read_only());
         for profile in RegistryProfile::ALL.iter().filter(|profile| {
             !matches!(
                 **profile,
@@ -3425,6 +3655,7 @@ mod tests {
                     | RegistryProfile::AgentStewardship
                     | RegistryProfile::UiaWriter
                     | RegistryProfile::UiaShellWorker
+                    | RegistryProfile::WorkspaceEdit
             )
         }) {
             assert!(profile.is_read_only(), "{profile:?} muss read-only sein");
@@ -3473,6 +3704,13 @@ mod tests {
                     Some(RegistryProfile::AgentStewardship)
                 );
             }
+            // `WorkspaceEdit` ist ein reines Einstiegsprofil (Telegram mit
+            // Workspace): keine eingebaute Rolle bekommt es.
+            assert_ne!(
+                profile_for_role(role),
+                Some(RegistryProfile::WorkspaceEdit),
+                "{role}"
+            );
         }
         assert_eq!(profile_for_role("unbekannt"), None);
     }

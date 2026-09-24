@@ -5,7 +5,7 @@
 //! - [`local_command_specs`]: Spezifikationen der rein TUI-lokal abgefangenen
 //!   Befehle (`/tools`, `/exit`, …) plus Ersatz-Spezifikationen für Befehle,
 //!   deren Operation (noch) nicht registriert ist (`/workbench`, `/kanban`,
-//!   `/palace`, `/dream`, `/diary`, `/models`, `/mode`). Beim Einmischen über
+//!   `/palace`, `/dream`, `/diary`, `/models`, `/mode`, `/matrix`). Beim Einmischen über
 //!   `CommandRegistry::with_local_specs` gewinnt immer die Operation; der
 //!   Ersatz entfällt dann.
 //! - [`enrich`]: ergänzt eine aus einer Operation abgeleitete Spezifikation um
@@ -239,6 +239,21 @@ const DREAM: &[SubcommandHint] = &[
     SubcommandHint::new("show", "<id>", "Traumbericht anzeigen"),
 ];
 
+/// `/learn`, Grammatik aus `harw-ops/src/learn.rs`: schlägt nur vor, jede
+/// Übernahme braucht ein ausdrückliches `accept`.
+const LEARN: &[SubcommandHint] = &[
+    SubcommandHint::new("scan", "", "Sitzung nach Lernkandidaten durchsuchen"),
+    SubcommandHint::new(
+        "note",
+        "<text> [--target memory|skill|agent]",
+        "Vorschlag aus eigenem Text anlegen",
+    ),
+    SubcommandHint::new("list", "[--all]", "Vorschläge auflisten"),
+    SubcommandHint::new("show", "<id>", "Vorschlag anzeigen"),
+    SubcommandHint::new("accept", "<id>", "Vorschlag annehmen"),
+    SubcommandHint::new("reject", "<id> [grund]", "Vorschlag ablehnen"),
+];
+
 /// `/diary`, Grammatik aus `harw-ops/src/diary.rs` plus `today` (Vertrag).
 const DIARY: &[SubcommandHint] = &[
     SubcommandHint::new("today", "", "Heutige Einträge anzeigen"),
@@ -248,6 +263,40 @@ const DIARY: &[SubcommandHint] = &[
         "Einträge eines Tages anzeigen",
     ),
     SubcommandHint::new("note", "<text>", "Tagebuchnotiz schreiben"),
+];
+
+/// `/matrix`, Grammatik der Matrix-Game-Operation (`harw-ops/src/matrix`).
+const MATRIX: &[SubcommandHint] = &[
+    SubcommandHint::new(
+        "start",
+        "<szenario> [--seed N] [--package ID]",
+        "Neues Matrix-Spiel starten",
+    ),
+    SubcommandHint::new("step", "", "Eine Phase weiter"),
+    SubcommandHint::new("auto", "<n>", "N Runden ohne Halt spielen"),
+    SubcommandHint::new("pause", "", "Nach laufenden Aufrufen anhalten"),
+    SubcommandHint::new("inject", "<text…>", "Ereignis einspielen (nächste Phase)"),
+    SubcommandHint::new(
+        "override",
+        "<argument> …",
+        "Adjudikation überschreiben (vor/nach dem Wurf)",
+    ),
+    SubcommandHint::new("veto", "<argument>", "Argument verwerfen (Neuversuch)"),
+    SubcommandHint::new("reveal", "<geheimnis>", "Geheimes Argument offenlegen"),
+    SubcommandHint::new("fork", "<runde>", "Neues Spiel ab Rundenende abzweigen"),
+    SubcommandHint::new("end", "", "Direkt zu Schlussargumenten und AAR"),
+    SubcommandHint::new(
+        "replay",
+        "[--seed <seed>]",
+        "Journal deterministisch nachspielen",
+    ),
+    SubcommandHint::new("show", "", "Laufendes Spiel anzeigen (Panel: F9)"),
+    SubcommandHint::new("list", "", "Szenarien und Läufe auflisten"),
+    SubcommandHint::new(
+        "compare",
+        "<lauf> <lauf> …",
+        "Läufe vergleichen (Design-Lehren)",
+    ),
 ];
 
 /// `/tools`, Grammatik aus `crate::tools_command`.
@@ -330,7 +379,17 @@ const HINT_TABLE: &[(&str, &str, &[SubcommandHint])] = &[
         PALACE,
     ),
     ("dream", "/dream [list|show <id>]", DREAM),
+    (
+        "learn",
+        "/learn [scan|note <text>|list [--all]|show <id>|accept <id>|reject <id>]",
+        LEARN,
+    ),
     ("diary", "/diary [today|show [agent]|note <text>]", DIARY),
+    (
+        "matrix",
+        "/matrix [start <szenario>|step|auto <n>|pause|inject|show|end|…]",
+        MATRIX,
+    ),
     (
         "tools",
         "/tools [on <name>|off <name>|reset [name]|profile <p>]",
@@ -471,7 +530,7 @@ fn local_spec(
 
 /// Namen der Ersatz-Spezifikationen für (noch) fehlende Operationen.
 #[cfg_attr(not(test), allow(dead_code))]
-pub(crate) const FALLBACK_COMMANDS: &[&str] = &["mode"];
+pub(crate) const FALLBACK_COMMANDS: &[&str] = &["mode", "matrix"];
 
 /// Spezifikationen aller TUI-lokalen Befehle plus Ersatz-Spezifikationen
 /// ([`FALLBACK_COMMANDS`]).
@@ -578,6 +637,14 @@ pub(crate) fn local_command_specs() -> Vec<CommandSpec> {
             "Interaktionsmodus anzeigen oder wechseln",
             "",
         ),
+        local_spec(
+            "matrix",
+            Misc,
+            Operator,
+            Deferred,
+            "Matrix-Game: Spiel starten, steuern und beobachten (bare: Panel)",
+            "",
+        ),
     ]
     .into_iter()
     .flatten()
@@ -597,8 +664,8 @@ mod tests {
         "agents",
     ];
 
-    /// Befehle, deren Operation fehlen darf. Leer: alle Wissens-Ops und
-    /// `/models` sind inzwischen Operationen.
+    /// Befehle, deren Operation fehlen darf. Seit `/matrix` registriert ist,
+    /// ist die Liste leer; `matrix` behält nur seine Ersatz-Spezifikation.
     const ALLOWED_MISSING: &[&str] = &[];
 
     #[test]
@@ -694,6 +761,13 @@ mod tests {
         assert_eq!(names("sandbox-lease"), ["status", "revoke"]);
         assert!(names("mode").contains(&"default"));
         assert!(names("tools").contains(&"profile"));
+        assert_eq!(
+            names("matrix"),
+            [
+                "start", "step", "auto", "pause", "inject", "override", "veto", "reveal", "fork",
+                "end", "replay", "show", "list", "compare"
+            ]
+        );
         assert!(subcommand_hints("no-such-command").is_empty());
     }
 

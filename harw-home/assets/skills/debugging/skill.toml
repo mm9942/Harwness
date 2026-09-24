@@ -1,3 +1,4 @@
 name = "debugging"
 description = "Reproduce, diagnose, minimally remediate, and verify failures."
+instructions_file = "instructions.md"
 tools = ["filesystem.read", "process.inspect", "process.execute"]

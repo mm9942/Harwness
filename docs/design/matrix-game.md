@@ -19,6 +19,7 @@
 8. [Lernwerte aus beiden Büchern](#8-lernwerte-aus-beiden-büchern)
 9. [Testbare Invarianten](#9-testbare-invarianten)
 10. [Nicht im ersten Schnitt](#10-nicht-im-ersten-schnitt)
+11. [Erweiterungen: Verhalten, Red Cell, Verdacht, Präzedenz, Varianz](#11-erweiterungen-verhalten-red-cell-verdacht-präzedenz-varianz)
 
 ---
 
@@ -650,3 +651,31 @@ harw-matrix-game/
 ```
 
 Abhängigkeiten: `harw-core` (ChildController), `harw-types`, `serde`, `toml`, `sha2`, `rand_chacha`; `harw-tui` hängt von `harw-matrix-game` nur über einen Beobachter-Stream (`project(Observer)`) plus Befehlskanal ab.
+
+---
+
+## 11. Erweiterungen: Verhalten, Red Cell, Verdacht, Präzedenz, Varianz
+
+Alle fünf Bausteine sind optional; ein Szenario ohne sie verhält sich byte-gleich wie zuvor (neue Zustandsfelder werden leer nicht serialisiert, `state_hash` älterer Journale bleibt gültig). Jede Wirkung läuft über Journal-Einträge; Prompts entstehen weiterhin nur aus `SeatView`.
+
+### 11.1 Verhaltensprofil je Fraktion/Team
+
+`[factions.behavior]` bzw. `[teams.behavior]` direkt unter dem jeweiligen Eintrag: `rules` (≤ 6 Handlungsregeln), `risk` (0 = meidet Risiko … 1 = sucht es; Default 0,5), `loss_framing` (Lage als drohender Verlust gegenüber dem Bezugspunkt erlebt), `anchor` (Bezugspunkt), `red_lines` (2–5, Pflicht, sobald ein Profil existiert). Das Profil ist privat: ausführlich im System-Prompt dieses Sitzes, als `BehaviorBriefing` mit Audience `Seat(p)` im Journal und daraus als Kurz-Erinnerung (Risiko, Rahmung, Anker, rote Linien) am Anfang **jedes** Zug-Prompts dieses Sitzes — auch im reinen Delta. Umpire, Red Cell und andere Sitze sehen es nie; das AAR legt es offen.
+
+### 11.2 Red Cell
+
+`[red_cell] enabled = true, sharpness = 0..1` (nur mit `argument_system = "pros_cons"`). Neuer Sitz `Seat::RedCell` (Agentenrolle `matrix-redcell`): sieht ausschließlich Öffentliches, hat keine Ziele und keine Siegbedingung. In der Gegenargument-Phase folgt nach allen Spielern ein Aufruf mit Vertrag `red_cell_objection`: `{target, assumption, cons}` gegen die tragende Annahme des führenden öffentlichen Arguments — oder ausdrücklich `{"no_objection": true}`. Die Schärfe bestimmt Ton und Höchstzahl der Contras (1/2/3). `submit_red_cell` journalisiert öffentlich (`RedCellObjection`) und hängt die Contras unter dem reservierten Schlüssel `red_cell` an das Ziel; der Umpire gewichtet sie in `con_weights["red_cell"]` wie jedes Contra (`red_cell` ist als Sitz-ID gesperrt und kein Eintrag in `standing`).
+
+### 11.3 Verdachtsleiter für geheime Argumente
+
+Stufen je Geheimnis: unbemerkt → Gerücht → Verdacht → Belege → aufgeflogen. Effekt-Op `{"op": "raise_suspicion", "secret_id", "by": 1|2}` — nur in Urteilen über öffentliche Argumente oder in Injects, nicht in `each_round`, höchstens zwei Stufen je Effekt-Zweig und Geheimnis. Öffentlich erscheint ausschließlich eine feste Rust-Vorlage (`SuspicionRaised`), die außer der ohnehin angekündigten Geheimnis-ID nichts enthält. Auf der obersten Stufe folgt die reguläre Offenlegung mit Salt (`RevealedBy::Suspicion`). Die Lage steht im Lagebild aller Sitze und im Adjudikations-Auftrag des Umpires.
+
+### 11.4 Präzedenzregister
+
+Der Umpire markiert ein Urteil über ein **öffentliches** Argument mit `precedent: {principle, tags}` (1–5 Schlagworte; bei geheimen Argumenten ein Contract-Fehler). Rust journalisiert es öffentlich als `PrecedentSet` (`p1`, `p2` …, mit Netto und Wahrscheinlichkeit). Spätere Adjudikations-Prompts nennen bis zu fünf einschlägige Maßstäbe früherer Runden — deterministisch gewählt über Schlagworttreffer und Überlappung langer Stichwörter mit den Argumenten der Runde, ausschließlich aus der Umpire-Projektion. `principle` ist öffentlicher Text und läuft wie `public_rationale` durch den Leak-Guard. Das AAR führt ein Präzedenzregister samt späteren Fällen, auf die ein Maßstab gepasst hätte.
+
+### 11.5 Inject-Bibliothek, Mehrfachläufe, Design-Lehren
+
+`[[inject_packages]]` mit `id`, `label`, `max_injects` (1–3) und Kandidaten `[[inject_packages.injects]]` (`id`, `text`, `audience`, `effects`, optional `earliest`/`latest`, `attributed`). Ein Lauf wählt ein Paket (vorgegeben oder per Seed) und zieht daraus höchstens drei Injects, nie zwei in derselben Runde und nie in einer Runde mit festem Szenario-Inject. Die Auswahl hängt nur von Master-Seed und Szenario ab, steht als `InjectPackageSelected` (nur Beobachter) im Journal und wird beim Replay nachgerechnet; fällig werdende Injects liefert `package_injects_for_round`.
+
+Das AAR erhält den Abschnitt **Design-Lehren**: Zeitpunkt der geheimen Argumente (und ob sie erst zum Spielende aufflogen), Klumpung der Zielwerte/Leiterstufen, Plausibilität der Würfel (erste Würfe: mittlere Augensumme und Erfolge gegen Erwartung als z-Wert) sowie daraus abgeleitete Hinweise an das Szenario-Design. Für Mehrfachläufe über Seeds verdichtet `summarize_run` jeden Lauf zu einer `AarSummary`; die reine Funktion `compare_runs(&[AarSummary])` stellt Kennzahlen und Endwerte nebeneinander und trennt robuste von empfindlichen Größen. In der Oberfläche vergleicht `/matrix compare <lauf> <lauf> …` die Läufe der Sitzung und legt den Bericht als `compare-<läufe>.md` neben die Laufverzeichnisse; `/matrix start <szenario> --package <id>` wählt ein Inject-Paket ausdrücklich (ohne Angabe wählt der Seed).

@@ -20,8 +20,10 @@
 //! Für `/models` und `/mode default` kommen [`persist_internal_model`]
 //! (`[internal_models.<stelle>]`, inkl. Orchestrator/Sub-Orchestrator),
 //! [`clear_uia_selection`] (entfernt `uia_provider`/`uia_model`) und
-//! [`persist_default_interaction_mode`] (`[mode] default`) hinzu — alle
-//! ebenfalls bestes Bemühen und erst ab der nächsten Sitzung wirksam.
+//! [`persist_default_interaction_mode`] (`[mode] default`) hinzu, für
+//! `/agent use` außerdem [`persist_active_agent`]
+//! (`active_agent_definition`) — alle ebenfalls bestes Bemühen und erst ab
+//! der nächsten Sitzung wirksam.
 //!
 //! Zusätzlich stellt dieses Modul [`SelectionPersistence`] bereit: einen
 //! austauschbaren Dienst-Trait, der die `persist_*`-/`clear_*`-Funktionen hinter
@@ -51,7 +53,7 @@
 //! - [`persist_default_selection`]/[`persist_uia_selection`]/
 //!   [`persist_uia_worker_model`]/[`persist_uia_reasoning_effort`]/
 //!   [`persist_internal_model`]/[`clear_uia_selection`]/
-//!   [`persist_default_interaction_mode`] (und ihre
+//!   [`persist_default_interaction_mode`]/[`persist_active_agent`] (und ihre
 //!   [`SelectionPersistence`]-Trait-Pendants) liefern nie `Err` —
 //!   Persistenzfehler werden als menschenlesbare Notiz zurückgegeben, nicht
 //!   propagiert.
@@ -621,6 +623,62 @@ fn write_default_interaction_mode(
         .map_err(|error| error.to_string())
 }
 
+/// Verankert die Wurzel-Agentendefinition (`active_agent_definition`)
+/// bestes Bemühen in der Profil-`config.toml` oder entfernt sie.
+///
+/// # Description
+/// Wird von `/agent use <name>` (nach Validierung des Namens) bzw.
+/// `/agent use --clear` aufgerufen. `Some(name)` setzt den Top-Level-Schlüssel
+/// `active_agent_definition` (Feld `harness.active_agent_definition`),
+/// `None` entfernt ihn — dann entscheidet wieder die UIA bzw. die Vorgabe.
+/// Wirkt erst ab der nächsten Sitzung; die laufende Sitzung bleibt
+/// unberührt. Ein `--agent` beim Start gewinnt weiterhin über diesen Wert.
+/// **Niemals fehlschlagend** für den Aufrufer.
+///
+/// # Arguments
+/// - `name` (`Option<&str>`): Agentenname oder `None` zum Entfernen.
+///
+/// # Returns
+/// `None` bei Erfolg; `Some(note)` bei einem Persistenzfehler.
+///
+/// # Panics
+/// Nie.
+///
+/// # Concurrency
+/// Rein synchron; kein Datei-Lock.
+pub(crate) fn persist_active_agent(name: Option<&str>) -> Option<String> {
+    let result = open_profile_config_writer().and_then(|mut writer| {
+        write_active_agent(&mut writer, name)?;
+        writer.save().map_err(|error| error.to_string())
+    });
+    match result {
+        Ok(()) => None,
+        Err(reason) => Some(format!(
+            "Hinweis: konnte den aktiven Agenten nicht dauerhaft speichern ({reason})."
+        )),
+    }
+}
+
+/// Reiner Schreibkern von [`persist_active_agent`] (ohne `save`).
+///
+/// # Errors
+/// Menschenlesbarer Grund, wenn [`harw_config::ConfigWriter::set_value`]
+/// scheitert.
+fn write_active_agent(
+    writer: &mut harw_config::ConfigWriter,
+    name: Option<&str>,
+) -> Result<(), String> {
+    match name {
+        Some(name) => writer
+            .set_value("active_agent_definition", toml_edit::value(name))
+            .map_err(|error| error.to_string()),
+        None => {
+            writer.remove_value("active_agent_definition");
+            Ok(())
+        }
+    }
+}
+
 // ── Pluggable Persistenz-Dienst ─────────────────────────────────────────────
 //
 // Motivation: `try_persist_default_selection`/`try_persist_uia_selection`/
@@ -687,6 +745,9 @@ pub trait SelectionPersistence: Send + Sync {
 
     /// Siehe [`clear_uia_selection`].
     fn clear_uia_selection(&self) -> Option<String>;
+
+    /// Siehe [`persist_active_agent`].
+    fn persist_active_agent(&self, name: Option<&str>) -> Option<String>;
 }
 
 /// Standard-Implementierung von [`SelectionPersistence`]: ruft unverändert
@@ -739,6 +800,10 @@ impl SelectionPersistence for FileSelectionPersistence {
     fn clear_uia_selection(&self) -> Option<String> {
         clear_uia_selection()
     }
+
+    fn persist_active_agent(&self, name: Option<&str>) -> Option<String> {
+        persist_active_agent(name)
+    }
 }
 
 /// Ein einzelner aufgezeichneter Aufruf auf [`RecordingSelectionPersistence`].
@@ -771,6 +836,8 @@ pub enum RecordedSelectionPersistCall {
     },
     /// Aufzeichnung von [`SelectionPersistence::clear_uia_selection`].
     ClearUia,
+    /// Aufzeichnung von [`SelectionPersistence::persist_active_agent`].
+    ActiveAgent { name: Option<String> },
 }
 
 /// No-op-Aufzeichnungs-Implementierung von [`SelectionPersistence`] für Tests.
@@ -873,6 +940,13 @@ impl SelectionPersistence for RecordingSelectionPersistence {
         self.record(RecordedSelectionPersistCall::ClearUia);
         None
     }
+
+    fn persist_active_agent(&self, name: Option<&str>) -> Option<String> {
+        self.record(RecordedSelectionPersistCall::ActiveAgent {
+            name: name.map(str::to_owned),
+        });
+        None
+    }
 }
 
 /// Löst den für `ctx` zu verwendenden [`SelectionPersistence`]-Dienst auf.
@@ -908,7 +982,7 @@ mod tests {
     use super::{
         FileSelectionPersistence, OpError, RecordedSelectionPersistCall,
         RecordingSelectionPersistence, SelectionPersistence, clear_uia_keys, execution_error,
-        write_default_interaction_mode, write_internal_model,
+        write_active_agent, write_default_interaction_mode, write_internal_model,
     };
     use crate::test_support::{TestResult, ctx};
     use harw_config::InternalModelPoint;
@@ -1243,5 +1317,47 @@ mod tests {
         let content = std::fs::read_to_string(&config_path).map_err(ctx("read back"))?;
         assert!(content.contains("[mode]"), "{content}");
         Ok(())
+    }
+
+    #[test]
+    fn write_active_agent_sets_and_removes_the_top_level_key() -> TestResult {
+        let dir = tempfile::tempdir().map_err(ctx("tempdir"))?;
+        let config_path = dir.path().join("config.toml");
+
+        let mut writer = harw_config::ConfigWriter::open(&config_path).map_err(ctx("open"))?;
+        write_active_agent(&mut writer, Some("root-orchestrator")).map_err(ctx("Schreibkern"))?;
+        writer.save().map_err(ctx("save"))?;
+
+        let reopened = harw_config::ConfigWriter::open(&config_path).map_err(ctx("reopen"))?;
+        assert_eq!(
+            reopened.get_value("active_agent_definition"),
+            Some("root-orchestrator".to_owned())
+        );
+
+        let mut writer =
+            harw_config::ConfigWriter::open(&config_path).map_err(ctx("reopen for removal"))?;
+        write_active_agent(&mut writer, None).map_err(ctx("Entfernen"))?;
+        writer.save().map_err(ctx("save after removal"))?;
+
+        let reopened =
+            harw_config::ConfigWriter::open(&config_path).map_err(ctx("reopen after removal"))?;
+        assert_eq!(reopened.get_value("active_agent_definition"), None);
+        Ok(())
+    }
+
+    #[test]
+    fn recording_selection_persistence_records_active_agent() {
+        let recorder = RecordingSelectionPersistence::new();
+        assert!(recorder.persist_active_agent(Some("planner")).is_none());
+        assert!(recorder.persist_active_agent(None).is_none());
+        assert_eq!(
+            recorder.calls(),
+            vec![
+                RecordedSelectionPersistCall::ActiveAgent {
+                    name: Some("planner".to_owned()),
+                },
+                RecordedSelectionPersistCall::ActiveAgent { name: None },
+            ]
+        );
     }
 }

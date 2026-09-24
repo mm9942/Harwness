@@ -1,0 +1,4 @@
+name = "author-review-pipeline"
+description = "Dreistufige Autor-Pipeline Entwurf → Review → Endfassung mit festen Übergabeformaten und Review-Rubrik."
+instructions_file = "instructions.md"
+tools = ["filesystem.read"]

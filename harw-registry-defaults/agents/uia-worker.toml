@@ -13,12 +13,16 @@
 #
 # Vorher war diese Rolle reine Netz-Recherche
 # (`RegistryProfile::Research`, identisch zu `researcher-web`). Addendum I
-# korrigiert das auf `RegistryProfile::UiaQuickHelper`: lesender
+# korrigierte das auf `RegistryProfile::UiaQuickHelper`: lesender
 # Workspace-Zugriff (`fs.read/list/search/glob/grep`) plus `shell.exec`
-# (laeuft wie ueberall ueber Sandbox+Freigabe) plus ausschliesslich
-# `web.fetch` — kein `fs.write`, kein `deps.*`, kein `lens.ask`. Die
-# tatsaechlich erreichbaren Netz-Hosts bestimmt weiterhin die Egress-Policy
-# aus `[network].researcher_web_hosts`.
+# (laeuft wie ueberall ueber Sandbox+Freigabe), kein `fs.write`, kein
+# `lens.ask`. Die damalige Beschraenkung auf `web.fetch` ohne `deps.*` gilt
+# nicht mehr: heute admittiert die Rolle alle vier `web.*`-Werkzeuge
+# (`UIA_HELPER_WEB_TOOLS`) und die fuenf lesenden `deps.*`-Werkzeuge, siehe
+# die Nutzerentscheidungen unten und `[tools].admitted`. Die tatsaechlich
+# erreichbaren Netz-Hosts stammen aus dem egress-gebundenen Netz der
+# UIA-Wurzel, das der Helfer erbt (nie breiter als beim Elternteil); jeder
+# Abruf laeuft zusaetzlich durch die Egress-Policy.
 #
 # Nutzerentscheidung (ersetzt den letzten Satz von Addendum I): `uia-worker`
 # darf zusaetzlich `browser.open` benutzen — `RegistryProfile::UiaQuickHelper`

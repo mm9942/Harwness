@@ -235,6 +235,25 @@ pub fn events_for_entry(entry: &GameEntry) -> Vec<MatrixGameEvent> {
                 verified,
             }]
         }
+        EntryKind::RedCellObjection {
+            target, assumption, ..
+        } => vec![message(
+            Some(Seat::RedCell),
+            None,
+            match target {
+                Some(t) => format!(
+                    "Einwand gegen {t}: {}",
+                    assumption.as_deref().unwrap_or("—")
+                ),
+                None => "Kein Einwand.".to_owned(),
+            },
+        )],
+        EntryKind::SuspicionRaised { text, .. } => vec![message(None, None, text.clone())],
+        EntryKind::PrecedentSet { precedent } => vec![message(
+            Some(Seat::Umpire),
+            None,
+            format!("Präzedenzfall {}: {}", precedent.id, precedent.principle),
+        )],
         EntryKind::GameEnded { reason } => vec![MatrixGameEvent::GameEnded {
             round,
             reason: reason.clone(),

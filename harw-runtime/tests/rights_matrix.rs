@@ -195,7 +195,15 @@ struct Expected {
 /// Die Erwartungstabelle. Das `match` ist erschöpfend: eine neue
 /// [`EntryKind`]-Variante bricht diesen Test beim Kompilieren.
 fn expected(entry: EntryKind) -> Expected {
-    // Sortiert, wie `rights_snapshot` sie sortiert.
+    // Sortiert, wie `rights_snapshot` sie sortiert. `Tui`/`OneShot` tragen
+    // Netz, weil die Vorgabe-Konfiguration eine nicht leere Egress-Allowlist
+    // hat (`[research].network_allow_hosts`, Runde 3 Welle A2).
+    const RWXN: &[&str] = &[
+        "ExecuteProcess",
+        "NetworkAccess",
+        "ReadWorkspace",
+        "WriteWorkspace",
+    ];
     const RWX: &[&str] = &["ExecuteProcess", "ReadWorkspace", "WriteWorkspace"];
     const R: &[&str] = &["ReadWorkspace"];
     const RW: &[&str] = &["ReadWorkspace", "WriteWorkspace"];
@@ -203,9 +211,10 @@ fn expected(entry: EntryKind) -> Expected {
     // Ohne `[policy].require_approval_for` entsteht keine Config-Politik
     // (W2B-03: ein Handler, der alles durchwinkt, wäre nur Rauschen); ohne
     // Responder — den erst `new_root_session` anhängt — bleibt die
-    // Default-Politik allein. Nur `Tui` löst Rückfragen interaktiv auf; jeder
-    // andere Einstieg trägt zusätzlich seine `AskResolutionPolicy`
-    // ([`ApprovalHandlerKind::Other`], Befund Z2c-02).
+    // Default-Politik allein. Nur `Tui` und `GatewayTelegram` (Freigabe-
+    // Buttons) lösen Rückfragen interaktiv auf; jeder andere Einstieg trägt
+    // zusätzlich seine `AskResolutionPolicy` ([`ApprovalHandlerKind::Other`],
+    // Befund Z2c-02).
     const DEFAULT_ONLY: &[ApprovalHandlerKind] = &[ApprovalHandlerKind::DefaultPolicy];
     const DEFAULT_AND_ASK: &[ApprovalHandlerKind] = &[
         ApprovalHandlerKind::DefaultPolicy,
@@ -214,13 +223,20 @@ fn expected(entry: EntryKind) -> Expected {
 
     match entry {
         EntryKind::Tui => Expected {
-            permissions: RWX,
+            permissions: RWXN,
             tools_empty: false,
             approval_chain: DEFAULT_ONLY,
             ceiling_empty: false,
             spawner_empty: false,
         },
-        EntryKind::OneShot | EntryKind::Analyze => Expected {
+        EntryKind::OneShot => Expected {
+            permissions: RWXN,
+            tools_empty: false,
+            approval_chain: DEFAULT_AND_ASK,
+            ceiling_empty: false,
+            spawner_empty: false,
+        },
+        EntryKind::Analyze => Expected {
             permissions: RWX,
             tools_empty: false,
             approval_chain: DEFAULT_AND_ASK,
@@ -248,10 +264,16 @@ fn expected(entry: EntryKind) -> Expected {
             ceiling_empty: false,
             spawner_empty: true,
         },
-        EntryKind::McpServe
-        | EntryKind::JobPrompt
-        | EntryKind::GatewayTelegram
-        | EntryKind::GatewayDream => Expected {
+        // Runde 3, Welle D: Telegram liest und schreibt im Workspace, ohne
+        // Shell und ohne Netz; Rückfragen beantwortet die Person im Chat.
+        EntryKind::GatewayTelegram => Expected {
+            permissions: RW,
+            tools_empty: false,
+            approval_chain: DEFAULT_ONLY,
+            ceiling_empty: true,
+            spawner_empty: true,
+        },
+        EntryKind::McpServe | EntryKind::JobPrompt | EntryKind::GatewayDream => Expected {
             permissions: NONE,
             tools_empty: true,
             approval_chain: DEFAULT_AND_ASK,
@@ -309,24 +331,145 @@ fn every_entry_matches_its_row_of_the_rights_table() -> TestResult {
     Ok(())
 }
 
+/// Runde 3, Welle A2: nur die Nutzeroberflächen (`Tui`, `OneShot`) tragen
+/// Netz, und ihr Host-Scope ist genau die Egress-Allowlist der Konfiguration
+/// ([`harw_runtime::sandbox::root_network_scope`]). Jeder andere Einstieg
+/// bleibt ohne Netzrecht und ohne Hosts; Contributor-Scopes bleiben leer.
 #[test]
-fn no_entry_carries_network() -> TestResult {
+fn only_the_user_interfaces_carry_egress_bound_network() -> TestResult {
     for entry in ALL_ENTRIES {
         let fixture = fixture()?;
         let assembled = assemble(entry, &fixture)?;
         let snapshot = assembled.assembly.rights_snapshot();
-        assert!(
-            !snapshot.permissions.iter().any(|p| p == "NetworkAccess"),
-            "{entry:?} darf bis W5 kein Netzrecht tragen"
+        let sandbox = assembled.assembly.sandbox();
+        let networked = matches!(entry, EntryKind::Tui | EntryKind::OneShot);
+        assert_eq!(
+            snapshot.permissions.iter().any(|p| p == "NetworkAccess"),
+            networked,
+            "{entry:?}: Netzrecht"
         );
         assert!(
             assembled.assembly.network_scope().is_empty(),
-            "{entry:?} darf bis W5 keinen Netz-Scope tragen"
+            "{entry:?}: kein Contributor-Scope"
         );
+        let expected_scope =
+            harw_runtime::sandbox::root_network_scope(entry, assembled.assembly.config());
+        assert_eq!(sandbox.network_scope(), &expected_scope, "{entry:?}");
+        if networked {
+            // Vorgabe `[research].network_allow_hosts`.
+            assert!(sandbox.network_scope().allows("docs.rs"), "{entry:?}");
+            assert!(!sandbox.network_scope().allows("evil.example"), "{entry:?}");
+        } else {
+            assert!(sandbox.network_scope().is_empty(), "{entry:?}");
+        }
+    }
+    Ok(())
+}
+
+/// Ohne Egress-Allowlist entsteht kein Host — auch nicht der Host des
+/// Such-Backends —, und damit auch kein Netzrecht der Wurzel (fail-closed).
+#[test]
+fn without_an_allowlist_the_root_gets_no_hosts() -> TestResult {
+    let mut config = harw_config::ResolvedConfig::default();
+    config.network.allow_hosts.clear();
+    config.network.researcher_web_hosts.clear();
+    config.harness.research.network_allow_hosts.clear();
+    let fixture = fixture()?;
+    for entry in ALL_ENTRIES {
+        let scope = harw_runtime::sandbox::root_network_scope(entry, &config);
+        assert!(scope.is_empty(), "{entry:?}");
+        assert_eq!(scope.hosts().count(), 0, "{entry:?}");
+        let sandbox =
+            harw_runtime::sandbox::root_sandbox_with_network(entry, &fixture.project, scope)
+                .map_err(ctx("Sandbox bindet"))?;
         assert!(
-            assembled.assembly.sandbox().network_scope().is_empty(),
-            "{entry:?}: auch die Sandbox selbst trägt keinen Scope"
+            !sandbox
+                .permissions()
+                .contains(harw_authority::Permission::NetworkAccess),
+            "{entry:?}: ohne Host kein Netzrecht"
         );
+        assert!(sandbox.network_scope().is_empty(), "{entry:?}");
+    }
+    Ok(())
+}
+
+/// Runde 3, Welle D: ein montierter Telegram-Lauf liest und schreibt im
+/// Workspace (`fs.write`), führt aber weder `shell.*`/`process.*` noch
+/// `web.*`, trägt kein Netz, und sein Freigabemodus ist unabhängig von der
+/// Konfiguration immer `ask`.
+#[test]
+fn telegram_reads_and_writes_without_shell_network_or_relaxed_approval() -> TestResult {
+    use harw_extension_api::approval_mode::ApprovalMode;
+
+    let fixture = fixture()?;
+    let assembled = assemble(EntryKind::GatewayTelegram, &fixture)?;
+    let snapshot = assembled.assembly.rights_snapshot();
+    assert_eq!(snapshot.permissions, ["ReadWorkspace", "WriteWorkspace"]);
+    assert!(assembled.assembly.sandbox().network_scope().is_empty());
+    let tools = snapshot.tools;
+    for expected in ["fs.read", "fs.write"] {
+        assert!(
+            tools.iter().any(|tool| tool == expected),
+            "{expected} fehlt: {tools:?}"
+        );
+    }
+    for tool in &tools {
+        assert!(
+            !tool.starts_with("shell.")
+                && !tool.starts_with("process.")
+                && !tool.starts_with("web.")
+                && tool != "lens.ask",
+            "Telegram darf {tool} nicht führen: {tools:?}"
+        );
+    }
+    // Lesen läuft ohne Button durch, jedes Schreiben fragt (erzwungen).
+    assert_eq!(
+        assembled.assembly.approval_mode().get(),
+        ApprovalMode::Delegated
+    );
+
+    // Auch ein expliziter Aufrufer-Override lockert den Modus nicht.
+    let mut spec = spec_for(EntryKind::GatewayTelegram, &fixture);
+    spec.approval_override = Some(ApprovalMode::FullAccess);
+    let relaxed = build_with_spec(spec).map_err(ctx("Telegram mit Override montiert"))?;
+    assert_eq!(relaxed.approval_mode().get(), ApprovalMode::Delegated);
+    Ok(())
+}
+
+/// Die Read-only-Rollen (analyst, researcher-deps, planner, die vier
+/// security-*-triage-Rollen) bekommen auch unter einer vernetzten
+/// UIA-Wurzel kein Netz, kein Schreiben und keine Ausführung: ihr Reducer
+/// schneidet die Rechte der Wurzel entsprechend.
+#[test]
+fn read_only_roles_stay_network_free_under_a_networked_root() -> TestResult {
+    use harw_authority::Permission;
+    use harw_registry_defaults::authority::authority_reducer_for_role;
+
+    let fixture = fixture()?;
+    let assembled = assemble(EntryKind::Tui, &fixture)?;
+    let root = assembled.assembly.sandbox().permissions().clone();
+    assert!(
+        root.contains(Permission::NetworkAccess),
+        "precondition: die UIA-Wurzel trägt Netz"
+    );
+    for role in [
+        role_names::ANALYST,
+        role_names::RESEARCHER_DEPS,
+        role_names::PLANNER,
+        role_names::SECURITY_EGRESS_TRIAGE,
+        role_names::SECURITY_BASELINE_TRIAGE,
+        role_names::SECURITY_STRUCTURE_TRIAGE,
+        role_names::SECURITY_ENDPOINT_TRIAGE,
+    ] {
+        let reducer = authority_reducer_for_role(role).ok_or(TestError::Missing("reducer"))?;
+        let child = reducer.reduce(&root);
+        for forbidden in [
+            Permission::NetworkAccess,
+            Permission::WriteWorkspace,
+            Permission::ExecuteProcess,
+        ] {
+            assert!(!child.contains(forbidden), "{role}: {forbidden:?}");
+        }
     }
     Ok(())
 }
@@ -565,13 +708,10 @@ fn a_foreign_session_id_is_refused() -> TestResult {
 
 #[test]
 fn root_activation_matches_the_session_base_activation() -> TestResult {
-    // `EntryKind::Tui` (und `OneShot`) montieren seit dem UIA-Vertrag
-    // ausschließlich über `harness.active_uia_definition`
-    // (`resolve_active_uia`, `harw-runtime/src/assembly.rs`) — dort ersetzt
-    // die UIA jede `active_agent`-Auswahl vollständig (`agent_ir` bleibt
-    // `None`, sobald `uia_ir` gesetzt ist). `EntryKind::Analyze` ist kein
-    // UI-Einstieg: `resolve_active_uia` liefert für ihn immer `Ok(None)`,
-    // also bestimmt `active_agent` hier weiterhin die Wurzelaktivierung.
+    // `active_agent` bestimmt die Wurzelaktivierung (seit Runde 3, Welle C1
+    // auch in `Tui`/`OneShot`, wo ein expliziter Agent die UIA ersetzt;
+    // siehe `an_explicit_root_agent_makes_the_uia_optional`).
+    // `EntryKind::Analyze` ist kein UI-Einstieg und kennt keine UIA-Pflicht.
     // Zugleich führt `Analyze` — wie `Tui`/`OneShot` — einen
     // `SpawnerPolicy::BuiltinRoles`-Spawner, den `new_root_session`
     // braucht, um überhaupt eine Sitzung zu eröffnen (sonst
@@ -614,12 +754,10 @@ fn root_activation_matches_the_session_base_activation() -> TestResult {
 
 #[test]
 fn an_unknown_active_agent_fails_closed() -> TestResult {
-    // `active_agent` bestimmt die Wurzelaktivierung nur für Nicht-UI-
-    // Einstiege (`resolve_active_uia` in `harw-runtime/src/assembly.rs`
-    // gibt für alles außer `Tui`/`OneShot` `Ok(None)` zurück, also greift
-    // dort `resolve_active_agent(spec.active_agent, ...)`). `Analyze` ist
-    // ein solcher Nicht-UI-Einstieg. Fail-closed bei unbekannter Rolle
-    // bleibt die geprüfte Absicht — nur der Einstieg wechselt.
+    // `active_agent` bestimmt die Wurzelaktivierung jedes Einstiegs
+    // (`resolve_explicit_root_agent` in `harw-runtime/src/assembly.rs`).
+    // Fail-closed bei unbekannter Rolle bleibt die geprüfte Absicht; den
+    // `Tui`-Fall prüft `tui_fails_closed_on_an_unknown_explicit_root_agent`.
     let fixture = fixture()?;
     let (events, _event_rx) = tokio::sync::mpsc::unbounded_channel::<SessionEventAlias>();
     let state_store: Arc<dyn StateStore> = Arc::new(InMemoryStateStore::new());
@@ -639,21 +777,28 @@ fn an_unknown_active_agent_fails_closed() -> TestResult {
     Ok(())
 }
 
+/// Runde 3, Welle C1: ein explizit gewählter Wurzel-Agent gewinnt über die
+/// UIA — also scheitert ein unbekannter Name jetzt auch in `Tui`
+/// fail-closed, statt von der UIA überschattet zu werden.
 #[test]
-fn tui_ignores_an_unknown_active_agent_because_the_uia_governs() -> TestResult {
-    // In `Tui` (und `OneShot`) bestimmt ausschließlich die konfigurierte
-    // UIA die Root-Aktivierung; `resolve_active_agent` wird für
-    // `spec.active_agent` gar nicht erst aufgerufen, sobald `uia_ir`
-    // aufgelöst ist (`agent_ir` bleibt `None`). Eine unbekannte
-    // `active_agent`-Rolle darf die UIA daher weder ersetzen noch die
-    // Montage zu Fall bringen — die Fixture-UIA aus `write_fixture_uia`
-    // montiert unverändert.
+fn tui_fails_closed_on_an_unknown_explicit_root_agent() -> TestResult {
     let fixture = fixture()?;
-    let (events, _event_rx) = tokio::sync::mpsc::unbounded_channel::<SessionEventAlias>();
-    let state_store: Arc<dyn StateStore> = Arc::new(InMemoryStateStore::new());
     let mut spec = spec_for(EntryKind::Tui, &fixture);
     spec.active_agent = Some("definitely-not-a-role".to_owned());
-    let built = RuntimeAssembly::builder(spec)
+    let built = build_with_spec(spec);
+    assert!(
+        matches!(built, Err(RuntimeError::Registry { .. })),
+        "ein unbekannter --agent muss scheitern: {:?}",
+        built.err()
+    );
+    Ok(())
+}
+
+/// Montiert eine beliebige Eingangsbeschreibung mit Echo-Modell.
+fn build_with_spec(spec: RuntimeSpec) -> Result<RuntimeAssembly, RuntimeError> {
+    let (events, _event_rx) = tokio::sync::mpsc::unbounded_channel::<SessionEventAlias>();
+    let state_store: Arc<dyn StateStore> = Arc::new(InMemoryStateStore::new());
+    RuntimeAssembly::builder(spec)
         .model(ModelSource::Echo("echo".to_owned()))
         .stores(RuntimeStores {
             state_store,
@@ -661,12 +806,80 @@ fn tui_ignores_an_unknown_active_agent_because_the_uia_governs() -> TestResult {
             approval_store: None,
         })
         .session_events(events)
-        .build();
+        .build()
+}
 
-    assert!(
-        built.is_ok(),
-        "die UIA muss eine unbekannte active_agent-Rolle in Tui überschatten: {built:?}"
-    );
+/// Ein Projekt, dessen Root-Space **keine** UIA konfiguriert.
+fn fixture_without_uia() -> TestResult<Fixture> {
+    let dir = tempfile::tempdir()?;
+    let home = dir.path().join("home");
+    let project = dir.path().join("project");
+    std::fs::create_dir_all(&home).map_err(ctx("home"))?;
+    std::fs::create_dir_all(&project).map_err(ctx("project"))?;
+    std::fs::write(project.join("Cargo.toml"), "[workspace]\n").map_err(ctx("marker"))?;
+    Ok(Fixture {
+        _dir: dir,
+        home,
+        project,
+    })
+}
+
+/// Runde 3, Welle C1: mit explizitem Wurzel-Agenten ist die UIA nicht Pflicht.
+/// `Tui` und `OneShot` montieren ohne `active_uia_definition`, die Wurzel
+/// trägt die Organisationsrolle des gewählten Agenten (`explorer` →
+/// `Worker`), und ohne Agent bleibt die UIA-Pflicht bestehen.
+#[test]
+fn an_explicit_root_agent_makes_the_uia_optional() -> TestResult {
+    for entry in [EntryKind::Tui, EntryKind::OneShot] {
+        let fixture = fixture_without_uia()?;
+
+        let without_agent = build_with_spec(spec_for(entry, &fixture));
+        assert!(
+            matches!(without_agent, Err(RuntimeError::Registry { .. })),
+            "{entry:?}: ohne Agent bleibt die UIA Pflicht"
+        );
+
+        let mut spec = spec_for(entry, &fixture);
+        spec.active_agent = Some(role_names::EXPLORER.to_owned());
+        let assembly = build_with_spec(spec).map_err(|error| {
+            TestError::Unexpected(format!("{entry:?} mit --agent explorer: {error}"))
+        })?;
+        assert_eq!(
+            assembly.spawn_context().organizational_role,
+            AgentRoleId::Worker,
+            "{entry:?}"
+        );
+        // Die Wurzelaktivierung folgt der Definition des Agenten
+        // (`Minimal` + `admitted` − `forbidden`), nicht der Vorgabe.
+        assert_eq!(
+            assembly.root_activation().profile(),
+            harw_core::ToolProfile::Minimal,
+            "{entry:?}"
+        );
+    }
+    Ok(())
+}
+
+/// Runde 3, Welle C1: als Wurzel sind nur Root-/Child-Orchestrator und
+/// Worker zulässig. Eine UIA (`user-interface`) oder ein UIA-Helfer als
+/// `--agent` ist ein Konfigurationsfehler — auch wenn eine UIA konfiguriert
+/// ist, gewinnt der explizite Agent und wird geprüft.
+#[test]
+fn an_explicit_root_agent_with_a_foreign_role_is_a_config_error() -> TestResult {
+    let fixture = fixture()?;
+    for agent in [
+        "harwness.agent.fixture-uia@1".to_owned(),
+        role_names::UIA_WORKER.to_owned(),
+    ] {
+        let mut spec = spec_for(EntryKind::Tui, &fixture);
+        spec.active_agent = Some(agent.clone());
+        let built = build_with_spec(spec);
+        assert!(
+            matches!(built, Err(RuntimeError::Config { .. })),
+            "{agent}: {:?}",
+            built.err()
+        );
+    }
     Ok(())
 }
 
@@ -819,7 +1032,8 @@ fn the_operation_surface_reaches_the_assembled_run() -> TestResult {
 /// Die Namen der Plan-Werkzeuge, die `register_plan_tools`
 /// (`harw-ops/src/lib.rs`) unter das volle Werkzeugprofil mischt:
 /// `PlanOperation`, `GoalOperation`, `ExploreOperation`,
-/// `ResearchDepsOperation`, `ResearchWebOperation`, `AnalyzeOperation`
+/// `ResearchDepsOperation`, `ResearchWebOperation`, `AnalyzeOperation` und
+/// die allgemeine Recherche `research` (Runde 3, Welle B)
 /// (`OperationMeta::name` je Datei in `harw-ops/src/{plan,goal,explore,
 /// research,analyze}.rs`).
 const PLAN_TOOL_NAMES: &[&str] = &[
@@ -829,6 +1043,7 @@ const PLAN_TOOL_NAMES: &[&str] = &[
     "research_deps",
     "research_web",
     "analyze",
+    "research",
 ];
 
 /// Z2c-01, zweite Hälfte: **nur** [`OperationSurface::AllWithModelTools`]
@@ -1157,13 +1372,13 @@ async fn uia_root_session_is_admitted_its_uia_explorer_and_uia_writer_specializa
 /// Crate-Werkzeuge `web.docs_rs`/`web.crates_io`, `UIA_HELPER_WEB_TOOLS`)
 /// und die fünf lesenden `deps.*`-Werkzeuge — nie `lens.ask`.
 ///
-/// Das Netz selbst ist nie breiter als das des Elternteils: das Kind erbt
-/// über den Handoff die Sandbox des Elternteils (`ManagedAgentSpawner::admit`
-/// prüft `ensure_child_of`), und die UIA-Wurzel eines `EntryKind::Tui`-Laufs
-/// trägt heute weder `NetworkAccess` noch Hosts (`spec.rs`:
-/// „Netzrechte vergibt kein Einstieg“). Die Web-Werkzeuge sind damit zwar
-/// registriert, scheitern aber am Rechte-Prolog, bis ein Elternteil Netz
-/// tatsächlich trägt.
+/// Runde 3, Welle A2: die UIA-Wurzel eines `EntryKind::Tui`-Laufs trägt
+/// `NetworkAccess` mit genau den Hosts der Egress-Allowlist, registriert
+/// selbst aber **kein** `web.*`-Werkzeug — das Netz ist reine Durchreichung
+/// an ihre Helfer. Das Netz eines Helfers ist nie breiter als das des
+/// Elternteils: das Kind erbt über den Handoff die Sandbox des Elternteils
+/// (`ManagedAgentSpawner::admit` prüft `ensure_child_of`), und jede
+/// Verengung ist eine Schnittmenge — ein fremder Host kommt nie hinzu.
 #[tokio::test]
 async fn uia_helpers_get_web_search_and_deps_tools_but_never_more_network_than_the_parent()
 -> TestResult {
@@ -1171,12 +1386,39 @@ async fn uia_helpers_get_web_search_and_deps_tools_but_never_more_network_than_t
     let assembled = assemble(EntryKind::Tui, &fixture)?;
     let (spawner, sandbox, parent) = uia_spawner_fixture(&assembled).await?;
     assert!(
-        !sandbox
+        sandbox
             .permissions()
             .contains(harw_authority::Permission::NetworkAccess),
-        "precondition: the UIA root carries no network today"
+        "precondition: the UIA root carries egress-bound network"
     );
-    assert!(sandbox.network_scope().is_empty());
+    assert!(!sandbox.network_scope().is_empty());
+    assert!(!sandbox.network_scope().allows("evil.example"));
+
+    // Die UIA-Wurzel selbst registriert kein einziges `web.*`-Werkzeug.
+    let root_tools = assembled.assembly.rights_snapshot().tools;
+    assert!(
+        !root_tools.iter().any(|tool| tool.starts_with("web.")),
+        "die UIA-Wurzel darf kein web.* registrieren: {root_tools:?}"
+    );
+
+    // Eine Verengung um einen fremden Host verbreitert das Netz nie: die
+    // Schnittmenge behält nur Hosts, die schon die Wurzel trägt.
+    let widened = sandbox.restrict(
+        &harw_authority::PermissionRequest::from_permissions(sandbox.permissions().iter())
+            .with_network_scope(harw_authority::NetworkScope::from_hosts([
+                "docs.rs".to_owned(),
+                "evil.example".to_owned(),
+            ])),
+    );
+    widened
+        .ensure_child_of(&sandbox)
+        .map_err(ctx("jede Verengung ist ein Kind der Wurzel"))?;
+    assert!(!widened.network_scope().allows("evil.example"));
+    assert!(
+        widened
+            .network_scope()
+            .is_subset_of(sandbox.network_scope())
+    );
 
     let factory = RuntimeChildRegistryFactory::new(
         assembled.assembly.project().clone(),

@@ -99,6 +99,7 @@ const PLAN_TOOLS: &[&str] = &[
     "web.docs_rs",
     "web.crates_io",
     "explore",
+    "research",
     "research_deps",
     "research_web",
 ];
@@ -665,6 +666,7 @@ mod tests {
             "web.docs_rs",
             "web.crates_io",
             "explore",
+            "research",
             "research_deps",
             "research_web",
         ];
@@ -692,6 +694,7 @@ mod tests {
             "web.docs_rs",
             "web.crates_io",
             "explore",
+            "research",
             "research_deps",
             "research_web",
         ] {
@@ -701,7 +704,7 @@ mod tests {
             !plan.contains(&"fs.write") && !plan.contains(&"shell.exec"),
             "Plan bleibt mutationsfrei"
         );
-        assert_eq!(plan.len(), explore.len() + 8);
+        assert_eq!(plan.len(), explore.len() + 9);
         Ok(())
     }
 

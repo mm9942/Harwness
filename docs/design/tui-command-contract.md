@@ -17,7 +17,7 @@ either source.
 > **Ist-Stand (2026-09-24, deutsch):** Die §§1–7 sind der ursprüngliche
 > Zielentwurf. Was der Code heute tatsächlich anbietet — Befehlsinventar
 > (Operationen, TUI-lokale Befehle, Ersatz-Spezifikationen, geplante
-> Befehle), Präfixe `#`/`@`, Tastenbelegung F1/F5–F8, `/models`,
+> Befehle), Präfixe `#`/`@`, Tastenbelegung F1/F5–F9, `/models`,
 > `/mode default` und die CLI-Flags `--mode`/`--approval`/`--model` — steht
 > verbindlich in **§8**. Modelle je Rolle, Modus vs. Freigabe und die
 > Start-Rangfolge beschreibt `tui-roles-models-modes.md`. Bei Widerspruch
@@ -844,7 +844,7 @@ Spalten: Stufe laut `OperationMeta.permission` (Obs/Op/Maint), Sichtbarkeit
 Slash-Befehl.
 
 **Operationen hinter `[tools.plan] enabled`**: `/plan`, `/goal`, `/explore`,
-`/research-deps`, `/research-web`, `/analyze` (alle Op).
+`/research`, `/research-deps`, `/research-web`, `/analyze` (alle Op).
 
 **Operationen, noch nicht registriert (Ersatz aktiv)**
 
@@ -929,6 +929,7 @@ Umbelegbar über `[tui].keybindings_file` (flache TOML-Tabelle
 | `F6` | Kanban-Board öffnen (`open_kanban`) |
 | `F7` | Modus- und Freigabe-Auswahl (`open_mode_picker`) |
 | `F8` | Modelle je Rolle (`open_models`) |
+| `F9` | Matrix-Game-Panel öffnen (`open_matrix`) |
 | `F11` | Panel im Vollbild (`maximize_panel`) |
 | `Ctrl+E` | Explorer fokussieren (`focus_explorer`) |
 | `Ctrl+O` | Werkzeugzellen auf/zu (`toggle_tool_cells`) |

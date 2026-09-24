@@ -416,3 +416,89 @@ fn orchestrators_admit_exactly_their_composition_tools() -> TestResult {
     }
     Ok(())
 }
+
+/// Runde 3, Welle E + Matrix-Unterlagen: die drei Matrix-Game-Sitze
+/// admittieren genau die lesenden Unterlagen-Werkzeuge (fünf lesende `fs.*`
+/// plus `doc.read_pdf`), und ihr Profil (`MatrixReader`) bewirbt genau
+/// diese — Inventar und Aufrufrecht bleiben deckungsgleich, ohne Netz,
+/// Schreiben oder Exec.
+#[test]
+fn matrix_roles_admit_and_advertise_exactly_the_read_tools() -> TestResult {
+    let expected: BTreeSet<&str> = [
+        "fs.read",
+        "fs.list",
+        "fs.search",
+        "fs.glob",
+        "fs.grep",
+        "doc.read_pdf",
+    ]
+    .into();
+    let roles = resolved_roles()?;
+    for role in role_names::MATRIX_ROLES {
+        let ir = roles
+            .get(role)
+            .ok_or(TestError::Unexpected(format!("{role} fehlt")))?;
+        let profile =
+            profile_for_role(role).ok_or(TestError::Unexpected(format!("{role} ohne Profil")))?;
+        assert_eq!(profile, RegistryProfile::MatrixReader, "{role}");
+        let advertised: BTreeSet<&str> = profile.tool_names().into_iter().collect();
+        assert_eq!(advertised, expected, "{role}: {profile:?}");
+        assert!(
+            composition_tools_for_role(role).is_empty(),
+            "{role} ist kein Orchestrator"
+        );
+        let admitted: BTreeSet<&str> = ir
+            .tool_surface()
+            .admitted()
+            .iter()
+            .map(String::as_str)
+            .collect();
+        assert_eq!(admitted, expected, "{role} admittiert {admitted:?}");
+        for tool in &admitted {
+            assert!(
+                *tool != "fs.write"
+                    && !tool.starts_with("shell.")
+                    && !tool.starts_with("process.")
+                    && !tool.starts_with("web.")
+                    && !tool.starts_with("browser."),
+                "{role} admittiert {tool}"
+            );
+        }
+        assert_eq!(ir.spawn_contract().max_depth(), Some(0), "{role}");
+    }
+    Ok(())
+}
+
+/// Runde 3, Welle D: `RegistryProfile::WorkspaceEdit` (Telegram mit
+/// Workspace) bewirbt Lese- und Schreibwerkzeuge, aber nie `shell.*`,
+/// `process.*`, `web.*`, `browser.*` oder `lens.ask` — und verlangt genau
+/// `{ReadWorkspace, WriteWorkspace}`. Keine eingebaute Rolle bekommt es.
+#[test]
+fn workspace_edit_profile_never_includes_shell_or_web_tools() {
+    use harw_authority::{Permission, PermissionSet};
+
+    let tools = RegistryProfile::WorkspaceEdit.tool_names();
+    assert!(tools.contains(&"fs.write"), "{tools:?}");
+    assert!(tools.contains(&"fs.read"), "{tools:?}");
+    for tool in &tools {
+        assert!(
+            !tool.starts_with("shell.")
+                && !tool.starts_with("process.")
+                && !tool.starts_with("web.")
+                && !tool.starts_with("browser.")
+                && *tool != "lens.ask",
+            "WorkspaceEdit bewirbt {tool}"
+        );
+    }
+    assert_eq!(
+        RegistryProfile::WorkspaceEdit.required_permissions(),
+        PermissionSet::from_policy([Permission::ReadWorkspace, Permission::WriteWorkspace])
+    );
+    for role in role_names::ALL {
+        assert_ne!(
+            profile_for_role(role),
+            Some(RegistryProfile::WorkspaceEdit),
+            "{role} darf WorkspaceEdit nicht bekommen"
+        );
+    }
+}

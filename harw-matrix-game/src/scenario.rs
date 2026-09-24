@@ -15,13 +15,17 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
+use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
 use crate::commitments::{DOMAIN, from_hex, sha256_parts, to_hex};
 use crate::error::{MatrixError, MatrixResult};
 use crate::phases::{EffectContext, EffectOp, validate_effects};
-use crate::state::{Audience, AudienceSpec, Ongoing, PlayerId, SecretRecord, VarValue, WorldVar};
+use crate::state::{
+    Audience, AudienceSpec, Ongoing, PlayerId, Seat, SecretRecord, SuspicionLevel, VarValue,
+    WorldVar,
+};
 
 /// Schema-Kennung, die jedes Szenario tragen muss.
 pub const SCHEMA: &str = "harwness.matrix-scenario/v1";
@@ -31,6 +35,21 @@ pub const PLAYER_SEATS: usize = 4;
 
 /// Höchstzahl Ziele je Kategorie und Fraktion.
 pub const MAX_GOALS: usize = 4;
+
+/// Reservierte Kennung der Red Cell (Schlüssel ihrer Contras in
+/// `con_weights`); keine Fraktion und kein Team darf so heißen.
+pub const RED_CELL_KEY: &str = "red_cell";
+
+/// Höchstzahl Verhaltensregeln je Profil.
+pub const MAX_BEHAVIOR_RULES: usize = 6;
+/// Mindestzahl roter Linien eines Verhaltensprofils.
+pub const MIN_RED_LINES: usize = 2;
+/// Höchstzahl roter Linien eines Verhaltensprofils.
+pub const MAX_RED_LINES: usize = 5;
+/// Zeichenlimit je Profiltext.
+pub const MAX_BEHAVIOR_TEXT: usize = 300;
+/// Höchstzahl Injects, die ein Lauf aus einem Paket zieht.
+pub const MAX_PACKAGE_INJECTS: usize = 3;
 
 /// Ab dieser Track-Zahl warnt die Validierung (Sabin: einfach halten).
 pub const TRACK_WARNING_THRESHOLD: usize = 10;
@@ -430,6 +449,201 @@ pub struct ModelSettings {
 }
 
 // ---------------------------------------------------------------------------
+// Verhaltensprofil, Red Cell, Inject-Bibliothek
+// ---------------------------------------------------------------------------
+
+fn default_risk() -> f64 {
+    0.5
+}
+
+/// Verhaltensprofil einer Fraktion bzw. eines Teams
+/// (`[factions.behavior]` bzw. `[teams.behavior]` direkt unter dem
+/// jeweiligen Eintrag). Es ist privat: Es steht im System-Prompt dieses
+/// Sitzes, als Kurz-Erinnerung in jedem seiner Zug-Prompts und im AAR —
+/// sonst nirgends.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BehaviorProfile {
+    /// Handlungsregeln („Wir eskalieren nie als Erste.“).
+    #[serde(default)]
+    pub rules: Vec<String>,
+    /// Risikoneigung 0 (meidet jedes Risiko) bis 1 (sucht das Risiko).
+    #[serde(default = "default_risk")]
+    pub risk: f64,
+    /// Verlustrahmung: Die Lage wird als drohender Verlust gegenüber dem
+    /// Bezugspunkt erlebt; Verluste wiegen schwerer als gleich große Gewinne.
+    #[serde(default)]
+    pub loss_framing: bool,
+    /// Bezugspunkt, an dem die Fraktion Erfolg und Verlust misst.
+    #[serde(default)]
+    pub anchor: Option<String>,
+    /// Rote Linien, die die Fraktion nicht überschreitet (mindestens 2).
+    #[serde(default)]
+    pub red_lines: Vec<String>,
+}
+
+// `risk` wird auf einen endlichen Wert in [0, 1] validiert (kein NaN).
+impl Eq for BehaviorProfile {}
+
+impl BehaviorProfile {
+    /// Deutsche Einordnung der Risikoneigung.
+    #[must_use]
+    pub fn risk_label(&self) -> &'static str {
+        match self.risk {
+            r if r < 0.2 => "sehr vorsichtig",
+            r if r < 0.4 => "vorsichtig",
+            r if r <= 0.6 => "abwägend",
+            r if r <= 0.8 => "risikobereit",
+            _ => "sehr risikobereit",
+        }
+    }
+}
+
+fn check_behavior_text(text: &str, label: &str, errors: &mut Vec<String>) {
+    if text.trim().is_empty() {
+        errors.push(format!("{label}: leer"));
+    }
+    let n = text.chars().count();
+    if n > MAX_BEHAVIOR_TEXT {
+        errors.push(format!("{label}: {n} Zeichen (max. {MAX_BEHAVIOR_TEXT})"));
+    }
+}
+
+fn validate_behavior(profile: &BehaviorProfile, context: &str, errors: &mut Vec<String>) {
+    if !profile.risk.is_finite() || !(0.0..=1.0).contains(&profile.risk) {
+        errors.push(format!(
+            "{context}: behavior.risk = {} (erlaubt 0..=1)",
+            profile.risk
+        ));
+    }
+    if profile.rules.len() > MAX_BEHAVIOR_RULES {
+        errors.push(format!(
+            "{context}: behavior.rules hat mehr als {MAX_BEHAVIOR_RULES} Einträge"
+        ));
+    }
+    for (i, rule) in profile.rules.iter().enumerate() {
+        check_behavior_text(rule, &format!("{context}: behavior.rules[{i}]"), errors);
+    }
+    if let Some(anchor) = &profile.anchor {
+        check_behavior_text(anchor, &format!("{context}: behavior.anchor"), errors);
+    }
+    if !(MIN_RED_LINES..=MAX_RED_LINES).contains(&profile.red_lines.len()) {
+        errors.push(format!(
+            "{context}: behavior.red_lines braucht {MIN_RED_LINES}–{MAX_RED_LINES} Einträge, gefunden {}",
+            profile.red_lines.len()
+        ));
+    }
+    for (i, line) in profile.red_lines.iter().enumerate() {
+        check_behavior_text(line, &format!("{context}: behavior.red_lines[{i}]"), errors);
+    }
+}
+
+fn default_sharpness() -> f64 {
+    0.5
+}
+
+/// Optionaler Red-Cell-Sitz (`[red_cell]`).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct RedCellSettings {
+    /// Aktiv.
+    pub enabled: bool,
+    /// Schärfe 0 (sachlich-knapp) bis 1 (bohrend); bestimmt Ton und die
+    /// Höchstzahl Contras (1–3).
+    #[serde(default = "default_sharpness")]
+    pub sharpness: f64,
+}
+
+impl Default for RedCellSettings {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            sharpness: default_sharpness(),
+        }
+    }
+}
+
+// `sharpness` wird auf einen endlichen Wert in [0, 1] validiert (kein NaN).
+impl Eq for RedCellSettings {}
+
+impl RedCellSettings {
+    /// Höchstzahl Contras eines Einwands: 1 bei geringer, 3 bei hoher Schärfe.
+    #[must_use]
+    pub fn max_cons(&self) -> usize {
+        let s = if self.sharpness.is_finite() {
+            self.sharpness.clamp(0.0, 1.0)
+        } else {
+            0.0
+        };
+        if s < 1.0 / 3.0 {
+            1
+        } else if s < 2.0 / 3.0 {
+            2
+        } else {
+            3
+        }
+    }
+
+    /// Deutsche Einordnung der Schärfe.
+    #[must_use]
+    pub fn sharpness_label(&self) -> &'static str {
+        match self.max_cons() {
+            1 => "sachlich und knapp",
+            2 => "direkt und fordernd",
+            _ => "bohrend und unnachgiebig",
+        }
+    }
+}
+
+/// Ein Inject der Bibliothek.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PackageInject {
+    /// Kennung (eindeutig über alle Injects des Szenarios).
+    pub id: String,
+    /// Audience (`public`, `seat:x`, `seat+umpire:x`, `pair:a,b`, `umpire`).
+    #[serde(default)]
+    pub audience: AudienceSpec,
+    /// Text.
+    pub text: String,
+    /// Effekte.
+    #[serde(default)]
+    pub effects: Vec<EffectOp>,
+    /// Früheste Runde (Default 1).
+    #[serde(default)]
+    pub earliest: Option<u32>,
+    /// Späteste Runde (Default letzte Runde).
+    #[serde(default)]
+    pub latest: Option<u32>,
+    /// Öffentlich mit Urheber „Facilitator“.
+    #[serde(default)]
+    pub attributed: bool,
+}
+
+fn default_package_max() -> usize {
+    MAX_PACKAGE_INJECTS
+}
+
+/// Varianz-Paket der Inject-Bibliothek (`[[inject_packages]]`). Ein Lauf
+/// zieht seed-deterministisch höchstens drei Injects daraus, nie zwei in
+/// derselben Runde ([`crate::library`]).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct InjectPackage {
+    /// Kennung.
+    pub id: String,
+    /// Anzeigename.
+    #[serde(default)]
+    pub label: Option<String>,
+    /// Höchstzahl gezogener Injects (1–3).
+    #[serde(default = "default_package_max")]
+    pub max_injects: usize,
+    /// Kandidaten.
+    #[serde(default)]
+    pub injects: Vec<PackageInject>,
+}
+
+// ---------------------------------------------------------------------------
 // Klassischer Modus
 // ---------------------------------------------------------------------------
 
@@ -552,6 +766,9 @@ pub struct Faction {
     /// Machtmittel.
     #[serde(default)]
     pub assets: Vec<String>,
+    /// Verhaltensprofil (optional, privat).
+    #[serde(default)]
+    pub behavior: Option<BehaviorProfile>,
 }
 
 /// Sitzordnung (`[seating]`).
@@ -629,6 +846,15 @@ pub struct ClassicScenario {
     /// Injects.
     #[serde(default)]
     pub injects: Vec<ClassicInject>,
+    /// Unterlagen-Ordner (optional).
+    #[serde(default)]
+    pub materials: Option<MaterialsSpec>,
+    /// Red-Cell-Sitz (optional).
+    #[serde(default)]
+    pub red_cell: Option<RedCellSettings>,
+    /// Inject-Bibliothek mit Varianz-Paketen (optional).
+    #[serde(default)]
+    pub inject_packages: Vec<InjectPackage>,
 }
 
 fn default_rounds() -> u32 {
@@ -905,6 +1131,9 @@ pub struct Team {
     /// Bewertungsskala des Marktteams.
     #[serde(default)]
     pub assessment_scale: Option<Vec<i64>>,
+    /// Verhaltensprofil (optional, privat).
+    #[serde(default)]
+    pub behavior: Option<BehaviorProfile>,
 }
 
 /// `[channels]`.
@@ -1032,6 +1261,121 @@ pub struct BusinessScenario {
     /// Modelle.
     #[serde(default)]
     pub models: Option<ModelSettings>,
+    /// Unterlagen-Ordner (optional).
+    #[serde(default)]
+    pub materials: Option<MaterialsSpec>,
+    /// Red-Cell-Sitz (optional).
+    #[serde(default)]
+    pub red_cell: Option<RedCellSettings>,
+    /// Inject-Bibliothek mit Varianz-Paketen (optional).
+    #[serde(default)]
+    pub inject_packages: Vec<InjectPackage>,
+}
+
+// ---------------------------------------------------------------------------
+// Unterlagen (`[materials]`)
+// ---------------------------------------------------------------------------
+
+/// `[materials]`: Ordner mit Unterlagen, die Sitze lesend einsehen dürfen.
+///
+/// Quell-Layout unter `dir`:
+/// - `geteilt/**` → alle Sitze (gemeinsamer Ordner),
+/// - `<seat_id>/**` → nur dieser Sitz,
+/// - `paare/<a>+<b>/**` → nur die Sitze `a` und `b` (alphabetisch, siehe
+///   [`pair_folder_members`]),
+/// - `umpire/**` → nur der Schiedsrichter.
+///
+/// Der Schiedsrichter sieht alles. Dieses Crate liest **keine** Dateien; der
+/// Runner kopiert gemäß [`materials_for_seat`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MaterialsSpec {
+    /// Ordner: relativ zur Szenario-Datei, absolut oder mit führendem `~`.
+    pub dir: PathBuf,
+}
+
+/// Welche Teile des Unterlagen-Ordners ein Sitz erhält (rein, ohne IO).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MaterialsSelection {
+    /// `geteilt/` (für alle).
+    pub shared: bool,
+    /// Eigener Sitz-Ordner `<seat_id>/` → Kopie `eigene/`.
+    pub own: Option<String>,
+    /// Paarordner, in denen der Sitz Mitglied ist → Kopie `mit-<partner>/`.
+    pub pairs_with: bool,
+    /// Alle Sitz-Ordner (Schiedsrichter) → Kopie `sitze/<id>/`.
+    pub all_seats: bool,
+    /// Alle Paarordner (Schiedsrichter) → Kopie `paare/<a>+<b>/`.
+    pub all_pairs: bool,
+    /// `umpire/` → Kopie `schiedsrichter/`.
+    pub umpire: bool,
+}
+
+/// Auswahl der Unterlagen für einen Sitz: Spieler erhalten `geteilt/`, den
+/// eigenen Ordner und ihre Paarordner; der Schiedsrichter erhält alles.
+#[must_use]
+pub fn materials_for_seat(seat: &Seat) -> MaterialsSelection {
+    match seat {
+        Seat::Player(p) => MaterialsSelection {
+            shared: true,
+            own: Some(p.as_str().to_owned()),
+            pairs_with: true,
+            all_seats: false,
+            all_pairs: false,
+            umpire: false,
+        },
+        Seat::Umpire => MaterialsSelection {
+            shared: true,
+            own: None,
+            pairs_with: false,
+            all_seats: true,
+            all_pairs: true,
+            umpire: true,
+        },
+        Seat::RedCell => MaterialsSelection {
+            shared: true,
+            own: None,
+            pairs_with: false,
+            all_seats: false,
+            all_pairs: false,
+            umpire: false,
+        },
+    }
+}
+
+/// Zerlegt den Namen eines Paarordners `a+b` in seine beiden Sitze.
+///
+/// Gültig nur, wenn genau ein `+` vorkommt, beide Teile nicht leer sind,
+/// keine Pfadtrenner oder `.`/`..` enthalten und `a < b` (alphabetisch,
+/// damit jedes Paar genau einen Ordnernamen hat).
+#[must_use]
+pub fn pair_folder_members(name: &str) -> Option<(String, String)> {
+    let (a, b) = name.split_once('+')?;
+    let ok = |part: &str| {
+        !part.is_empty() && !part.contains(['+', '/', '\\', '\0']) && part != "." && part != ".."
+    };
+    (ok(a) && ok(b) && a < b).then(|| (a.to_owned(), b.to_owned()))
+}
+
+/// Löst `dir` auf: absolut bleibt, `~`/`~/…` über `home`, sonst relativ zum
+/// Ordner der Szenario-Datei (ohne Datei: unverändert). `None`, wenn `~`
+/// verwendet wird, aber kein Home-Verzeichnis bekannt ist.
+fn resolve_materials_dir(
+    dir: &Path,
+    scenario_path: Option<&Path>,
+    home: Option<&Path>,
+) -> Option<PathBuf> {
+    if let Ok(rest) = dir.strip_prefix("~") {
+        let home = home.filter(|h| !h.as_os_str().is_empty())?;
+        return Some(home.join(rest));
+    }
+    if dir.is_absolute() {
+        return Some(dir.to_path_buf());
+    }
+    match scenario_path.and_then(Path::parent) {
+        Some(base) => Some(base.join(dir)),
+        None => Some(dir.to_path_buf()),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1066,6 +1410,8 @@ pub struct FactionInfo {
     pub assets: Vec<String>,
     /// Private Zusatzinformation (Gamebook-Verweis).
     pub private_brief: Option<String>,
+    /// Verhaltensprofil (privat).
+    pub behavior: Option<BehaviorProfile>,
 }
 
 /// Für eine Runde fälliges Inject in modusunabhängiger Form.
@@ -1158,6 +1504,43 @@ impl Scenario {
         }
     }
 
+    /// Unterlagen-Ordner (`[materials]`), falls angegeben.
+    #[must_use]
+    pub fn materials(&self) -> Option<&MaterialsSpec> {
+        match self {
+            Self::Classic(s) => s.materials.as_ref(),
+            Self::Business(s) => s.materials.as_ref(),
+        }
+    }
+
+    /// Red-Cell-Einstellungen, nur wenn `[red_cell] enabled = true`.
+    #[must_use]
+    pub fn red_cell(&self) -> Option<&RedCellSettings> {
+        let settings = match self {
+            Self::Classic(s) => s.red_cell.as_ref(),
+            Self::Business(s) => s.red_cell.as_ref(),
+        };
+        settings.filter(|r| r.enabled)
+    }
+
+    /// Inject-Bibliothek (`[[inject_packages]]`).
+    #[must_use]
+    pub fn inject_packages(&self) -> &[InjectPackage] {
+        match self {
+            Self::Classic(s) => &s.inject_packages,
+            Self::Business(s) => &s.inject_packages,
+        }
+    }
+
+    /// Verhaltensprofil eines Sitzes.
+    #[must_use]
+    pub fn behavior_of(&self, player: &PlayerId) -> Option<BehaviorProfile> {
+        self.factions()
+            .into_iter()
+            .find(|f| &f.id == player)
+            .and_then(|f| f.behavior)
+    }
+
     /// Sichtbarkeitsoptionen.
     #[must_use]
     pub fn visibility(&self) -> &VisibilitySettings {
@@ -1217,6 +1600,7 @@ impl Scenario {
                             secret_goals: f.goals.secret.clone(),
                             assets: f.assets.clone(),
                             private_brief: None,
+                            behavior: f.behavior.clone(),
                         });
                     }
                 }
@@ -1234,6 +1618,7 @@ impl Scenario {
                     secret_goals: Vec::new(),
                     assets: Vec::new(),
                     private_brief: t.strategy_brief.clone(),
+                    behavior: t.behavior.clone(),
                 })
                 .collect(),
         }
@@ -1306,7 +1691,13 @@ impl Scenario {
             Self::Business(s) => validate_business(s, &mut errors, &mut warnings),
         }
         validate_rules(self.rules(), &mut errors);
+        if let Some(m) = self.materials() {
+            if m.dir.as_os_str().to_string_lossy().trim().is_empty() {
+                errors.push("materials.dir ist leer".to_owned());
+            }
+        }
         self.validate_injects_effects(&mut errors);
+        self.validate_extensions(&mut errors, &mut warnings);
         if errors.is_empty() {
             Ok(warnings)
         } else {
@@ -1322,6 +1713,7 @@ impl Scenario {
             .collect();
         let ongoing: BTreeMap<String, Ongoing> = BTreeMap::new();
         let secrets: BTreeMap<String, SecretRecord> = BTreeMap::new();
+        let suspicion: BTreeMap<String, SuspicionLevel> = BTreeMap::new();
         let players = self.seat_order();
         for round in 1..=self.rounds() {
             for inject in self.injects_for_round(round) {
@@ -1330,6 +1722,7 @@ impl Scenario {
                         vars: &vars,
                         ongoing: &ongoing,
                         secrets: &secrets,
+                        suspicion: &suspicion,
                         players: &players,
                         rules: self.rules(),
                         argument_audience: audience.clone(),
@@ -1341,6 +1734,120 @@ impl Scenario {
                             inject.id, violation.index, violation.reason
                         ));
                     }
+                }
+            }
+        }
+    }
+}
+
+impl Scenario {
+    /// Verhaltensprofile, Red Cell und Inject-Bibliothek.
+    fn validate_extensions(&self, errors: &mut Vec<String>, warnings: &mut Vec<String>) {
+        let players = self.seat_order();
+        for f in self.factions() {
+            if f.id.as_str() == RED_CELL_KEY {
+                errors.push(format!(
+                    "Sitz-ID `{RED_CELL_KEY}` ist für die Red Cell reserviert"
+                ));
+            }
+            if let Some(profile) = &f.behavior {
+                validate_behavior(profile, &format!("Fraktion `{}`", f.id), errors);
+            }
+        }
+        let red_cell = match self {
+            Self::Classic(s) => s.red_cell.as_ref(),
+            Self::Business(s) => s.red_cell.as_ref(),
+        };
+        if let Some(rc) = red_cell {
+            if !rc.sharpness.is_finite() || !(0.0..=1.0).contains(&rc.sharpness) {
+                errors.push(format!(
+                    "red_cell.sharpness = {} (erlaubt 0..=1)",
+                    rc.sharpness
+                ));
+            }
+            if rc.enabled && self.rules().argument_system != ArgumentSystem::ProsCons {
+                errors.push(
+                    "red_cell braucht argument_system = \"pros_cons\" (Gegenargument-Phase)"
+                        .to_owned(),
+                );
+            }
+        }
+
+        let mut inject_ids: BTreeSet<String> = match self {
+            Self::Classic(s) => s.injects.iter().map(|i| i.id.clone()).collect(),
+            Self::Business(s) => s.injects.iter().map(|i| i.id.clone()).collect(),
+        };
+        let mut package_ids = BTreeSet::new();
+        let rounds = self.rounds();
+        let vars: BTreeMap<String, WorldVar> = self
+            .initial_vars()
+            .into_iter()
+            .map(|v| (v.id.clone(), v))
+            .collect();
+        let ongoing: BTreeMap<String, Ongoing> = BTreeMap::new();
+        let secrets: BTreeMap<String, SecretRecord> = BTreeMap::new();
+        let suspicion: BTreeMap<String, SuspicionLevel> = BTreeMap::new();
+        for package in self.inject_packages() {
+            let ctx_label = format!("inject_packages `{}`", package.id);
+            check_id(&package.id, "inject_packages.id", errors);
+            if !package_ids.insert(package.id.as_str()) {
+                errors.push(format!("{ctx_label} doppelt"));
+            }
+            if !(1..=MAX_PACKAGE_INJECTS).contains(&package.max_injects) {
+                errors.push(format!(
+                    "{ctx_label}: max_injects = {} (erlaubt 1..={MAX_PACKAGE_INJECTS})",
+                    package.max_injects
+                ));
+            }
+            if package.injects.is_empty() {
+                errors.push(format!("{ctx_label}: keine Injects"));
+            } else if package.injects.len() < package.max_injects {
+                warnings.push(format!(
+                    "{ctx_label}: nur {} Kandidaten für max_injects = {} — keine Varianz in der Auswahl",
+                    package.injects.len(),
+                    package.max_injects
+                ));
+            }
+            for inject in &package.injects {
+                let label = format!("{ctx_label} Inject `{}`", inject.id);
+                check_id(&inject.id, &label, errors);
+                if !inject_ids.insert(inject.id.clone()) {
+                    errors.push(format!("{label}: ID doppelt"));
+                }
+                if inject.text.trim().is_empty() {
+                    errors.push(format!("{label}: text leer"));
+                }
+                let earliest = inject.earliest.unwrap_or(1);
+                let latest = inject.latest.unwrap_or(rounds);
+                if earliest == 0 || latest > rounds || earliest > latest {
+                    errors.push(format!(
+                        "{label}: Rundenfenster {earliest}..={latest} liegt nicht in 1..={rounds}"
+                    ));
+                }
+                let audience = &inject.audience.0;
+                if matches!(audience, Audience::ObserverOnly) {
+                    errors.push(format!("{label}: audience `observer` ist unzulässig"));
+                }
+                for p in audience.players() {
+                    if !players.contains(p) {
+                        errors.push(format!("{label}: unbekannter Sitz `{p}`"));
+                    }
+                }
+                let ctx = EffectContext {
+                    vars: &vars,
+                    ongoing: &ongoing,
+                    secrets: &secrets,
+                    suspicion: &suspicion,
+                    players: &players,
+                    rules: self.rules(),
+                    argument_audience: audience.clone(),
+                    secret_owner: None,
+                };
+                for violation in validate_effects(&ctx, &inject.effects) {
+                    errors.push(format!(
+                        "{label} effects[{}]: {}",
+                        violation.index, violation.reason
+                    ));
                 }
             }
         }
@@ -1449,6 +1956,19 @@ pub struct LoadedScenario {
     pub warnings: Vec<String>,
     /// SHA-256 des TOML-Quelltexts (Hex).
     pub source_hash: String,
+}
+
+impl LoadedScenario {
+    /// Aufgelöster Unterlagen-Ordner: relativ zum Ordner der Szenario-Datei
+    /// (`scenario_path`), absolut unverändert, führendes `~` über `HOME`.
+    /// `None` ohne `[materials]` oder wenn `~` ohne gesetztes `HOME` steht.
+    /// Prüft nicht, ob der Ordner existiert (kein IO).
+    #[must_use]
+    pub fn materials_dir(&self, scenario_path: Option<&Path>) -> Option<PathBuf> {
+        let spec = self.scenario.materials()?;
+        let home = std::env::var_os("HOME").map(PathBuf::from);
+        resolve_materials_dir(&spec.dir, scenario_path, home.as_deref())
+    }
 }
 
 /// Parst und validiert ein Szenario aus TOML.
@@ -2319,5 +2839,156 @@ mod tests {
         assert!(VarVisibility::parse("seat:").is_err());
         assert!(VarVisibility::parse("everyone").is_err());
         Ok(())
+    }
+
+    #[test]
+    fn materials_parse_in_both_modes() -> TestResult {
+        assert!(load_scenario(KARST)?.scenario.materials().is_none());
+        assert!(load_scenario(CLOUD)?.scenario.materials().is_none());
+
+        let classic = format!("{KARST}\n[materials]\ndir = \"unterlagen/karst\"\n");
+        let loaded = load_scenario(&classic)?;
+        assert_eq!(
+            loaded.scenario.materials(),
+            Some(&MaterialsSpec {
+                dir: PathBuf::from("unterlagen/karst")
+            })
+        );
+        let business = format!("{CLOUD}\n[materials]\ndir = \"/srv/cloud\"\n");
+        let loaded = load_scenario(&business)?;
+        assert_eq!(
+            loaded.scenario.materials().map(|m| m.dir.clone()),
+            Some(PathBuf::from("/srv/cloud"))
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn materials_reject_empty_and_unknown_fields() {
+        for src in [KARST, CLOUD] {
+            let empty = format!("{src}\n[materials]\ndir = \"  \"\n");
+            let errs = invalid_errors(&empty);
+            assert!(errs.iter().any(|e| e.contains("materials.dir")), "{errs:?}");
+
+            let unknown = format!("{src}\n[materials]\ndir = \"x\"\nwrite = true\n");
+            assert!(matches!(
+                load_scenario(&unknown),
+                Err(MatrixError::ScenarioParse(_))
+            ));
+            let missing = format!("{src}\n[materials]\n");
+            assert!(matches!(
+                load_scenario(&missing),
+                Err(MatrixError::ScenarioParse(_))
+            ));
+        }
+    }
+
+    #[test]
+    fn materials_dir_resolution() -> TestResult {
+        let scen = Path::new("/spiele/karst/szenario.toml");
+        let home = Path::new("/home/nutzerin");
+        let r = |dir: &str, sp: Option<&Path>, h: Option<&Path>| {
+            resolve_materials_dir(Path::new(dir), sp, h)
+        };
+        assert_eq!(
+            r("unterlagen", Some(scen), Some(home)),
+            Some(PathBuf::from("/spiele/karst/unterlagen"))
+        );
+        assert_eq!(
+            r("../gemeinsam", Some(scen), None),
+            Some(PathBuf::from("/spiele/karst/../gemeinsam"))
+        );
+        assert_eq!(
+            r("/abs/ordner", Some(scen), Some(home)),
+            Some(PathBuf::from("/abs/ordner"))
+        );
+        assert_eq!(
+            r("~/unterlagen/karst", Some(scen), Some(home)),
+            Some(PathBuf::from("/home/nutzerin/unterlagen/karst"))
+        );
+        assert_eq!(
+            r("~", None, Some(home)),
+            Some(PathBuf::from("/home/nutzerin"))
+        );
+        assert_eq!(r("~/x", Some(scen), None), None);
+        assert_eq!(r("~/x", Some(scen), Some(Path::new(""))), None);
+        // `~name` ist kein Home-Verweis, sondern ein relativer Name.
+        assert_eq!(
+            r("~name", Some(scen), Some(home)),
+            Some(PathBuf::from("/spiele/karst/~name"))
+        );
+        // Ohne Szenario-Pfad bleibt ein relativer Pfad unverändert.
+        assert_eq!(
+            r("unterlagen", None, None),
+            Some(PathBuf::from("unterlagen"))
+        );
+        assert_eq!(
+            r("unterlagen", Some(Path::new("szenario.toml")), None),
+            Some(PathBuf::from("unterlagen"))
+        );
+
+        // Über LoadedScenario: ohne [materials] → None; absolut → unverändert.
+        assert_eq!(load_scenario(KARST)?.materials_dir(Some(scen)), None);
+        let src = format!("{KARST}\n[materials]\ndir = \"/abs/ordner\"\n");
+        assert_eq!(
+            load_scenario(&src)?.materials_dir(Some(scen)),
+            Some(PathBuf::from("/abs/ordner"))
+        );
+        let src = format!("{KARST}\n[materials]\ndir = \"unterlagen\"\n");
+        assert_eq!(
+            load_scenario(&src)?.materials_dir(Some(scen)),
+            Some(PathBuf::from("/spiele/karst/unterlagen"))
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn materials_selection_per_seat() {
+        let gilde = materials_for_seat(&Seat::player("gilde"));
+        assert_eq!(
+            gilde,
+            MaterialsSelection {
+                shared: true,
+                own: Some("gilde".to_owned()),
+                pairs_with: true,
+                all_seats: false,
+                all_pairs: false,
+                umpire: false,
+            }
+        );
+        let umpire = materials_for_seat(&Seat::Umpire);
+        assert_eq!(
+            umpire,
+            MaterialsSelection {
+                shared: true,
+                own: None,
+                pairs_with: false,
+                all_seats: true,
+                all_pairs: true,
+                umpire: true,
+            }
+        );
+    }
+
+    #[test]
+    fn pair_folder_names() {
+        assert_eq!(
+            pair_folder_members("gilde+nord"),
+            Some(("gilde".to_owned(), "nord".to_owned()))
+        );
+        for bad in [
+            "nord+gilde",
+            "gilde+gilde",
+            "gilde",
+            "+nord",
+            "gilde+",
+            "a+b+c",
+            "../x+y",
+            "a/b+c",
+            "..+rat",
+            "",
+        ] {
+            assert_eq!(pair_folder_members(bad), None, "`{bad}` akzeptiert");
+        }
     }
 }

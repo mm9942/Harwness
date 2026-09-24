@@ -16,9 +16,10 @@
 //! Welche dieser Provider tatsächlich registriert werden, entscheidet das
 //! [`profile::RegistryProfile`]: `Full` ist der bisherige Coding-Satz,
 //! `ReadOnlyExplore`/`Research`/`Planning` sind die Profile der eingebauten
-//! Kind-Agenten. Ein read-only Profil sieht `fs.write` und `shell.exec` nicht
-//! einmal im Inventar — die Beschränkung ist keine Prompt-Bitte, sondern ein
-//! Filter über dem Provider (siehe [`profile::RestrictedToolProvider`]).
+//! Kind-Agenten, `WorkspaceEdit` ist das Lese-/Schreibprofil ohne Shell und
+//! ohne Netz (Telegram mit Workspace). Ein read-only Profil sieht `fs.write`
+//! und `shell.exec` nicht einmal im Inventar — die Beschränkung ist keine
+//! Prompt-Bitte, sondern ein Filter über dem Provider (siehe [`profile::RestrictedToolProvider`]).
 //!
 //! # Key types
 //! - [`AssembledRegistry`]: registry + discovered project context + identity.

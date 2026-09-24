@@ -24,7 +24,7 @@ role = "worker"
 specialization = "researcher-deps"
 
 name = "Rust/Cargo Dependency Researcher"
-description = "Rust-Spezialist fuer Rust/Cargo-Abhaengigkeiten (Cargo.lock, Registry-Cache, docs.rs, crates.io): belegt Version, MSRV, Features und Verhalten je Crate aus Cargo.lock und dem lokalen Registry-Quellcache. Andere Oekosysteme uebernimmt dependency-researcher."
+description = "Rust-Spezialist fuer Rust/Cargo-Abhaengigkeiten, offline: belegt Version, MSRV, Features und Verhalten je Crate aus Cargo.lock und dem lokalen Registry-Quellcache, ohne Netzzugang (docs.rs/crates.io fragt researcher-web ab). Andere Oekosysteme uebernimmt dependency-researcher."
 
 [research]
 ecosystems = ["cargo"]
@@ -73,3 +73,11 @@ max_wall_secs = 180
 
 [return]
 contract = "harwness.return.research-finding@1"
+
+# Kontextprogramm (Runde 3, Welle C2): bindet `agents/context-programs/research-deps.toml`.
+# `embedded_agents::bind_context_program` liest diese Zeile aus der eigenen
+# Tabelle der Rolle (die Aufloesung verwirft das `[context]` des Kindes, weil
+# `worker-base` eines fuehrt) und ergaenzt das geerbte `[context]` um das
+# Programm. Ein unbekannter Name bricht das Laden der Rolle hart ab.
+[context]
+program = "research-deps"

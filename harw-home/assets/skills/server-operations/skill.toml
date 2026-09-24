@@ -1,3 +1,4 @@
 name = "server-operations"
 description = "Safe server administration: observe first, explain impact, and require approval for state changes."
+instructions_file = "instructions.md"
 tools = ["filesystem.read", "process.inspect"]

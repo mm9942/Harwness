@@ -22,8 +22,10 @@
 //! 1. [`load_config`] — Konfiguration **mit** Vertrauensbericht.
 //! 2. [`discover_project`] — **genau einmal**; jeder spätere Bedarf
 //!    (Kind-Registries) benutzt das Ergebnis.
-//! 3. [`root_sandbox`] — Rechte ausschließlich aus [`EntryKind::profile`],
-//!    gegebenenfalls geschnitten mit [`RuntimeNarrowing::permissions`];
+//! 3. [`root_sandbox_with_network`] — Rechte ausschließlich aus
+//!    [`EntryKind::profile`], Netz-Hosts nur aus der Egress-Allowlist
+//!    ([`root_network_scope`]), gegebenenfalls geschnitten mit
+//!    [`RuntimeNarrowing::permissions`];
 //!    gebunden an den erkannten Projekt-Root oder an den engeren
 //!    [`RuntimeNarrowing::workspace_root`].
 //! 4. [`root_ceiling`] — eine Wurzeldecke je [`CeilingPolicy`].
@@ -123,7 +125,7 @@ use crate::config::{ConfigTrustReport, load_config};
 use crate::contributors::{AssemblyContributor, AssemblyInputs, AssemblyParts};
 use crate::error::{RuntimeError, RuntimeResult};
 use crate::model::{ModelSource, build_root_model_with_registry_and_resolver};
-use crate::sandbox::root_sandbox;
+use crate::sandbox::{root_network_scope, root_sandbox_with_network};
 use crate::services::{PlanServices, RuntimeServices, RuntimeServicesParts, ServiceSurface};
 use crate::spec::{
     AskResolution, EntryKind, EntryProfile, OperationSurface, RootBudget, RuntimeSpec,
@@ -300,18 +302,57 @@ impl std::fmt::Debug for RootSession {
 ///   sondern ein *funktionsloser* Zustand: jede Rückfrage liefe sofort in die
 ///   [`crate::spec::AskResolution`] des Einstiegs.
 ///
-/// Die Funktion existiert trotz einheitlichem Ergebnis als **eine** benannte
-/// Stelle: die Unterscheidung nach Einstieg ist damit vorbereitet, ohne dass
-/// heute ein Einstieg eine Sonderregel bekommt, die niemand begründet hat.
+/// Besonders ist [`EntryKind::GatewayTelegram`] (Runde 3, Welle D): der Chat
+/// liest und schreibt im gebundenen Workspace, und die Person beantwortet jede
+/// Rückfrage über Freigabe-Buttons. Lesende Werkzeuge laufen durch, jedes
+/// Schreiben (`fs.write`/`fs.edit`) fragt. Der Modus ist dort
+/// [`ApprovalMode::Delegated`] — und zwar nicht nur als Vorgabe, sondern
+/// **erzwungen**: [`forced_approval_mode`] übersteuert Konfiguration und
+/// Aufrufer-Override, damit kein `full` das Schreiben freischaltet.
 ///
 /// # Argumente
 /// - `entry` ([`EntryKind`]): der Einstieg.
 ///
 /// # Rückgabe
-/// [`ApprovalMode::Delegated`].
+/// Immer [`ApprovalMode::Delegated`]; für `GatewayTelegram` zusätzlich
+/// erzwungen (siehe [`forced_approval_mode`]).
 #[must_use]
 pub const fn default_approval_mode(entry: EntryKind) -> ApprovalMode {
     match entry {
+        EntryKind::GatewayTelegram
+        | EntryKind::Tui
+        | EntryKind::OneShot
+        | EntryKind::LocalEcho
+        | EntryKind::Analyze
+        | EntryKind::Doctor
+        | EntryKind::Web
+        | EntryKind::McpServe
+        | EntryKind::JobPrompt
+        | EntryKind::JobPlanNode
+        | EntryKind::GatewayDream => ApprovalMode::Delegated,
+    }
+}
+
+/// Der Freigabemodus, den ein Einstieg unabhängig von Konfiguration und
+/// Aufrufer-Override führen muss.
+///
+/// # Beschreibung
+/// [`EntryKind::GatewayTelegram`] schreibt im Workspace eines entfernten
+/// Chats; `fs.write`/`fs.edit` (und jeder andere nicht lesende Aufruf)
+/// stehen dort immer unter Freigabe, auch wenn `[permissions].default_mode`
+/// oder ein `--approval` etwas anderes sagt (Runde 3, Welle D). Lesende
+/// Werkzeuge laufen ohne Button durch. Alle anderen Einstiege haben keinen
+/// erzwungenen Modus.
+///
+/// # Argumente
+/// - `entry` ([`EntryKind`]): der Einstieg.
+///
+/// # Rückgabe
+/// `Some(ApprovalMode::Delegated)` für `GatewayTelegram`, sonst `None`.
+#[must_use]
+pub const fn forced_approval_mode(entry: EntryKind) -> Option<ApprovalMode> {
+    match entry {
+        EntryKind::GatewayTelegram => Some(ApprovalMode::Delegated),
         EntryKind::Tui
         | EntryKind::OneShot
         | EntryKind::LocalEcho
@@ -321,8 +362,7 @@ pub const fn default_approval_mode(entry: EntryKind) -> ApprovalMode {
         | EntryKind::McpServe
         | EntryKind::JobPrompt
         | EntryKind::JobPlanNode
-        | EntryKind::GatewayTelegram
-        | EntryKind::GatewayDream => ApprovalMode::Delegated,
+        | EntryKind::GatewayDream => None,
     }
 }
 
@@ -429,12 +469,17 @@ fn sandbox_profile_from_config(
 ///   ihn leer, weil `load_config` diesen Layer bereits eingemergt hat.
 ///
 /// # Returns
-/// Den effektiven [`ApprovalMode`].
+/// Den effektiven [`ApprovalMode`]; für einen Einstieg mit
+/// [`forced_approval_mode`] immer dessen Modus, unabhängig von der
+/// Konfiguration.
 fn effective_approval_mode(
     entry: EntryKind,
     global: &PermissionsSection,
     project: &PermissionsSection,
 ) -> ApprovalMode {
+    if let Some(forced) = forced_approval_mode(entry) {
+        return forced;
+    }
     project
         .default_mode
         .as_deref()
@@ -764,7 +809,7 @@ pub struct RuntimeNarrowing {
 /// Mandant und Alias der reinen Enthaltenseins-Prüfung in [`sandbox_root`].
 ///
 /// Die Registry dieser Prüfung lebt nur für die Dauer des Aufrufs; die
-/// eigentliche Bindung entsteht danach über [`root_sandbox`] mit dem
+/// eigentliche Bindung entsteht danach über [`crate::sandbox::root_sandbox`] mit dem
 /// Mandanten des Einstiegs.
 const NARROWED_ROOT_TENANT: &str = "narrowing";
 /// Workspace-Alias der Enthaltenseins-Prüfung (siehe [`NARROWED_ROOT_TENANT`]).
@@ -931,7 +976,7 @@ fn sandbox_root(
 /// Stellt sicher, dass die gebaute Sandbox genau an `expected` gebunden ist.
 ///
 /// # Beschreibung
-/// [`root_sandbox`] kanonisiert den übergebenen, bereits kanonischen Pfad
+/// [`crate::sandbox::root_sandbox`] kanonisiert den übergebenen, bereits kanonischen Pfad
 /// erneut. Wurde zwischen beiden Schritten eine Pfadkomponente ausgetauscht,
 /// wiche die Bindung ab; das wird hier fail-closed abgefangen.
 ///
@@ -956,8 +1001,9 @@ fn ensure_bound_to(sandbox: &SandboxSpec, expected: &Path) -> RuntimeResult<()> 
 ///
 /// # Beschreibung
 /// Fail-closed Whitelist (CONTRACTS-W2d2 §1.1): Einstieg `Full` erlaubt
-/// `Full | ShellExecution | ReadOnlyExplore | NoTools | MemoryStewardship`,
-/// Einstieg `NoTools` nur `NoTools`, Einstieg `MemoryStewardship` nur
+/// `Full | ShellExecution | ReadOnlyExplore | NoTools | MemoryStewardship |
+/// WorkspaceEdit` (dazu die UIA-Spezialisierungen), Einstieg `WorkspaceEdit`
+/// nur `WorkspaceEdit | NoTools`, Einstieg `NoTools` nur `NoTools`, Einstieg `MemoryStewardship` nur
 /// `MemoryStewardship` (identisch, kein Aufweiten), jede andere Kombination
 /// wird abgelehnt. Das `match` ist bewusst ohne Auffang-Arm im ersten
 /// Tupelelement: eine neue [`RegistryProfile`]-Variante bricht den Compiler,
@@ -971,10 +1017,12 @@ fn ensure_bound_to(sandbox: &SandboxSpec, expected: &Path) -> RuntimeResult<()> 
 /// gilt für `UiaQuickHelper`/`UiaWriter`, die seit der Nutzerentscheidung
 /// „die UIA-Helfer recherchieren kurz online und fügen manchmal
 /// Abhängigkeiten hinzu“ ebenfalls `deps.*` und `web.fetch`/`web.search`
-/// registrieren: kein Einstiegsprofil trägt
-/// [`harw_authority::Permission::NetworkAccess`] oder `ReadCargoRegistry`,
-/// die Werkzeuge fallen bei einer Verengung also über
-/// `tool_names_for(granted)` bzw. am Rechte-Prolog heraus.
+/// registrieren: kein Einstiegsprofil trägt `ReadCargoRegistry`, und die
+/// einzigen Einstiege mit [`harw_authority::Permission::NetworkAccess`]
+/// (`Tui`, `OneShot`) führen Modell-Tool-Operationen und dürfen deshalb nur
+/// auf `Full` verengen ([`ensure_narrowing_fits_operations`]); die Werkzeuge
+/// fallen bei einer Verengung also über `tool_names_for(granted)` bzw. am
+/// Rechte-Prolog heraus.
 ///
 /// # Fehler
 /// [`RuntimeError::Registry`] für jede nicht zugelassene Kombination.
@@ -984,9 +1032,9 @@ fn narrowed_registry_profile(
     requested: RegistryProfile,
 ) -> RuntimeResult<RegistryProfile> {
     use RegistryProfile::{
-        AgentStewardship, Full, MemoryStewardship, NoTools, Planning, ReadOnlyExplore,
-        ReadOnlyResearch, Research, ShellExecution, UiaExplorer, UiaQuickHelper, UiaShellWorker,
-        UiaWriter,
+        AgentStewardship, Full, MatrixReader, MemoryStewardship, NoTools, Planning,
+        ReadOnlyExplore, ReadOnlyResearch, Research, ShellExecution, UiaExplorer, UiaQuickHelper,
+        UiaShellWorker, UiaWriter, WorkspaceEdit,
     };
 
     match (entry_profile, requested) {
@@ -1021,11 +1069,18 @@ fn narrowed_registry_profile(
         // konnte, kann auch UiaShellWorker nicht erreichen; die
         // Host-Sandbox-Bindung selbst erzwingt ausschließlich der
         // ProcessPermitLedger, nicht dieses Match.
+        //
+        // `WorkspaceEdit` (Runde 3, Welle D; Einstiegsprofil von
+        // `GatewayTelegram`) folgt demselben Muster: Full darf zu ihm
+        // verengen (seine `deps.*` sind wie bei ReadOnlyExplore über die
+        // Sandbox abgesichert), und als Einstieg narrowt er nur auf sich
+        // selbst oder auf `NoTools` — eine reine Reduktion.
         (
             Full,
             Full | ShellExecution | ReadOnlyExplore | NoTools | MemoryStewardship | UiaQuickHelper
-            | AgentStewardship | UiaExplorer | UiaWriter | UiaShellWorker,
+            | AgentStewardship | UiaExplorer | UiaWriter | UiaShellWorker | WorkspaceEdit,
         )
+        | (WorkspaceEdit, WorkspaceEdit | NoTools)
         | (ShellExecution, ShellExecution)
         | (UiaQuickHelper, UiaQuickHelper)
         | (NoTools, NoTools)
@@ -1038,48 +1093,62 @@ fn narrowed_registry_profile(
         | (
             ShellExecution,
             Full | ReadOnlyExplore | Research | Planning | NoTools | MemoryStewardship
-            | UiaQuickHelper | AgentStewardship | UiaExplorer | UiaWriter | UiaShellWorker,
+            | UiaQuickHelper | AgentStewardship | UiaExplorer | UiaWriter | UiaShellWorker
+            | WorkspaceEdit,
         )
         | (
             UiaQuickHelper,
             Full | ShellExecution | ReadOnlyExplore | Research | Planning | NoTools
-            | MemoryStewardship | AgentStewardship | UiaExplorer | UiaWriter | UiaShellWorker,
+            | MemoryStewardship | AgentStewardship | UiaExplorer | UiaWriter | UiaShellWorker
+            | WorkspaceEdit,
         )
         | (
             NoTools,
             Full | ShellExecution | ReadOnlyExplore | Research | Planning | MemoryStewardship
-            | UiaQuickHelper | AgentStewardship | UiaExplorer | UiaWriter | UiaShellWorker,
+            | UiaQuickHelper | AgentStewardship | UiaExplorer | UiaWriter | UiaShellWorker
+            | WorkspaceEdit,
         )
         | (
             MemoryStewardship,
             Full | ShellExecution | ReadOnlyExplore | Research | Planning | NoTools
-            | UiaQuickHelper | AgentStewardship | UiaExplorer | UiaWriter | UiaShellWorker,
+            | UiaQuickHelper | AgentStewardship | UiaExplorer | UiaWriter | UiaShellWorker
+            | WorkspaceEdit,
         )
         | (
             AgentStewardship,
             Full | ShellExecution | ReadOnlyExplore | Research | Planning | NoTools
-            | MemoryStewardship | UiaQuickHelper | UiaExplorer | UiaWriter | UiaShellWorker,
+            | MemoryStewardship | UiaQuickHelper | UiaExplorer | UiaWriter | UiaShellWorker
+            | WorkspaceEdit,
         )
         | (
             UiaExplorer,
             Full | ShellExecution | ReadOnlyExplore | Research | Planning | NoTools
-            | MemoryStewardship | UiaQuickHelper | AgentStewardship | UiaWriter | UiaShellWorker,
+            | MemoryStewardship | UiaQuickHelper | AgentStewardship | UiaWriter | UiaShellWorker
+            | WorkspaceEdit,
         )
         | (
             UiaWriter,
             Full | ShellExecution | ReadOnlyExplore | Research | Planning | NoTools
-            | MemoryStewardship | UiaQuickHelper | AgentStewardship | UiaExplorer | UiaShellWorker,
+            | MemoryStewardship | UiaQuickHelper | AgentStewardship | UiaExplorer | UiaShellWorker
+            | WorkspaceEdit,
         )
         | (
             UiaShellWorker,
             Full | ShellExecution | ReadOnlyExplore | Research | Planning | NoTools
-            | MemoryStewardship | UiaQuickHelper | AgentStewardship | UiaExplorer | UiaWriter,
+            | MemoryStewardship | UiaQuickHelper | AgentStewardship | UiaExplorer | UiaWriter
+            | WorkspaceEdit,
+        )
+        | (
+            WorkspaceEdit,
+            Full | ShellExecution | ReadOnlyExplore | Research | Planning | MemoryStewardship
+            | UiaQuickHelper | AgentStewardship | UiaExplorer | UiaWriter | UiaShellWorker,
         )
         // `ReadOnlyResearch` (researcher / dependency-researcher) ist wie
         // `Research` ein reines Kind-Profil mit Netz: kein Einstieg darf
-        // auf es verengen, und es selbst verengt nie.
-        | (ReadOnlyExplore | Research | ReadOnlyResearch | Planning, _)
-        | (_, ReadOnlyResearch) => Err(RuntimeError::Registry {
+        // auf es verengen, und es selbst verengt nie. `MatrixReader`
+        // (Matrix-Sitze) ist ebenso ein reines Kind-Profil.
+        | (ReadOnlyExplore | Research | ReadOnlyResearch | Planning | MatrixReader, _)
+        | (_, ReadOnlyResearch | MatrixReader) => Err(RuntimeError::Registry {
             detail: format!(
                 "refusing to narrow entry {entry:?} from registry profile {entry_profile:?} \
                  to {requested:?}: a narrowing may only reduce the tool set"
@@ -1094,7 +1163,7 @@ fn narrowed_registry_profile(
 /// Ohne Verengung bleibt `sandbox` unverändert. Mit Verengung entsteht
 /// `sandbox.restrict(&narrowing.permissions)`; das Ergebnis wird zusätzlich
 /// gegen die Profilrechte geprüft, damit auch eine künftige Änderung an
-/// [`root_sandbox`] oder [`SandboxSpec::restrict`] nie still mehr Rechte
+/// [`crate::sandbox::root_sandbox`] oder [`SandboxSpec::restrict`] nie still mehr Rechte
 /// ergibt, als die Tabelle dem Einstieg zuspricht.
 ///
 /// # Fehler
@@ -1105,9 +1174,36 @@ fn narrowed_sandbox(
     narrowing: Option<&RuntimeNarrowing>,
 ) -> RuntimeResult<SandboxSpec> {
     let sandbox = match narrowing {
-        Some(narrowing) => sandbox.restrict(&PermissionRequest::from_permissions(
-            narrowing.permissions.iter(),
-        )),
+        Some(narrowing) => {
+            // Das Netz (Hosts) bleibt nur erhalten, wenn die Verengung
+            // `NetworkAccess` selbst weiterträgt — so entsteht nie ein
+            // Netzrecht ohne Hosts und nie Hosts ohne Netzrecht.
+            let keeps_network = narrowing
+                .permissions
+                .contains(harw_authority::Permission::NetworkAccess);
+            let scope = if keeps_network {
+                sandbox.network_scope().clone()
+            } else {
+                NetworkScope::empty()
+            };
+            let narrowed = sandbox.restrict(
+                &PermissionRequest::from_permissions(narrowing.permissions.iter())
+                    .with_network_scope(scope),
+            );
+            if narrowed.network_scope().is_empty()
+                && narrowed
+                    .permissions()
+                    .contains(harw_authority::Permission::NetworkAccess)
+            {
+                narrowed.restrict(&PermissionRequest::from_permissions(
+                    narrowed.permissions().iter().filter(|permission| {
+                        *permission != harw_authority::Permission::NetworkAccess
+                    }),
+                ))
+            } else {
+                narrowed
+            }
+        }
         None => sandbox,
     };
     if sandbox.permissions().is_subset_of(&profile.permissions) {
@@ -1400,7 +1496,7 @@ impl RuntimeAssemblyBuilder {
     /// - [`RuntimeError::Config`] / [`RuntimeError::Trust`] aus
     ///   [`load_config`].
     /// - [`RuntimeError::Discovery`], wenn die Projekterkennung scheitert.
-    /// - [`RuntimeError::Sandbox`] aus [`root_sandbox`], oder wenn
+    /// - [`RuntimeError::Sandbox`] aus [`crate::sandbox::root_sandbox`], oder wenn
     ///   [`RuntimeNarrowing::workspace_root`] relativ ist, nicht existiert oder
     ///   außerhalb des erkannten Projekt-Roots liegt.
     /// - [`RuntimeError::Registry`], wenn die Registry nicht montiert, ein
@@ -1586,8 +1682,14 @@ impl RuntimeAssemblyBuilder {
         // 3./4. Sandbox und Decke aus dem Einstiegsprofil.
         //      Eine Verengung schneidet die Sandbox, sie ersetzt sie nie; ein
         //      `workspace_root` bindet sie enger (nie außerhalb des Projekts).
+        //      Netz (nur `Tui`/`OneShot`): Hosts ausschließlich aus der
+        //      Egress-Allowlist; ohne Allowlist kein Host und kein Netzrecht.
         let bound_root = sandbox_root(&project.project_root, narrowing.as_ref())?;
-        let unrestricted = root_sandbox(spec.entry, &bound_root)?;
+        let unrestricted = root_sandbox_with_network(
+            spec.entry,
+            &bound_root,
+            root_network_scope(spec.entry, &config),
+        )?;
         if narrowing
             .as_ref()
             .is_some_and(|narrowing| narrowing.workspace_root.is_some())
@@ -1613,8 +1715,9 @@ impl RuntimeAssemblyBuilder {
         // sandbox specification.
 
         // Agent-Definitionen werden einmal gesenkt. Ein interaktiver Einstieg
-        // besitzt zwingend eine konfigurierte UIA; fehlende oder falsch gerollte
-        // Auswahl ist ein Startfehler, nie ein stiller Full-Tool-Fallback.
+        // ohne explizit gewählten Wurzel-Agenten besitzt zwingend eine
+        // konfigurierte UIA; fehlende oder falsch gerollte Auswahl ist ein
+        // Startfehler, nie ein stiller Full-Tool-Fallback.
         let needs_definitions = spec.active_agent.is_some()
             || config.harness.active_uia_definition.is_some()
             || matches!(profile.spawner, SpawnerPolicy::BuiltinRoles);
@@ -1623,15 +1726,19 @@ impl RuntimeAssemblyBuilder {
         } else {
             HashMap::new()
         };
-        let uia_ir = resolve_active_uia(spec.entry, &config, &agent_definitions)?;
-        // Ein UI-Einstieg hat genau einen Root: die UIA. Die frühere
-        // `active_agent`-Auswahl bleibt für nicht-interaktive Einstiege
-        // erhalten, darf aber die UIA weder ersetzen noch ihre Tool-Decke
-        // überlagern.
-        let agent_ir = if uia_ir.is_some() {
+        // Runde 3, Welle C1: ein explizit gewählter Wurzel-Agent
+        // (`--agent`, `harness.active_agent_definition`) gewinnt über die UIA;
+        // die UIA ist dann nicht Pflicht. Als Wurzel zugelassen sind nur
+        // `root-orchestrator`, `child-orchestrator` und `worker`
+        // ([`resolve_explicit_root_agent`]). Ohne expliziten Agenten hat ein
+        // UI-Einstieg genau einen Root: die UIA. Die Werkzeuge bleiben in
+        // jedem Fall durch Einstiegsprofil und Sandbox gedeckelt.
+        let agent_ir =
+            resolve_explicit_root_agent(spec.active_agent.as_deref(), &config, &agent_definitions)?;
+        let uia_ir = if agent_ir.is_some() {
             None
         } else {
-            resolve_active_agent(spec.active_agent.as_deref(), &config, &agent_definitions)?
+            resolve_active_uia(spec.entry, &config, &agent_definitions)?
         };
         // Die Kind-Decke ist die *tatsächliche* Aktivierung der Root-Session:
         // `new_root_session` wendet ausschließlich `agent_ir` an (bei aktiver
@@ -1661,7 +1768,10 @@ impl RuntimeAssemblyBuilder {
             suggestions: None,
             capability_snapshot: None,
             approval_actor: spec.principal.approval_actor(),
-            organizational_role: uia_ir.as_ref().map_or_else(
+            // Die Rolle der Wurzel ist die der aktiven UIA bzw. des explizit
+            // gewählten Wurzel-Agenten; ohne beide entscheidet die
+            // Spawner-Politik.
+            organizational_role: uia_ir.as_ref().or(agent_ir.as_ref()).map_or_else(
                 || root_organizational_role(profile.spawner),
                 ExecutableAgentIr::role,
             ),
@@ -1670,6 +1780,7 @@ impl RuntimeAssemblyBuilder {
             // means no such delegation grant.
             allowed_child_orchestrators: uia_ir
                 .as_ref()
+                .or(agent_ir.as_ref())
                 .map(|ir| ir.spawn_contract().child_orchestrators().to_vec())
                 .unwrap_or_default(),
             trace: Some(trace),
@@ -1678,9 +1789,15 @@ impl RuntimeAssemblyBuilder {
 
         // 6. Freigabekette. Der Responder kommt erst mit `new_root_session`:
         //    er gehört zur Oberfläche, nicht zur Montage.
-        let approval_mode = ApprovalModeCell::new(spec.approval_override.unwrap_or_else(|| {
-            effective_approval_mode(spec.entry, &global_permissions, &project_permissions)
-        }));
+        // Ein erzwungener Modus (`GatewayTelegram`: immer `ask`) schlägt auch
+        // einen expliziten Aufrufer-Override.
+        let approval_mode = ApprovalModeCell::new(
+            forced_approval_mode(spec.entry)
+                .or(spec.approval_override)
+                .unwrap_or_else(|| {
+                    effective_approval_mode(spec.entry, &global_permissions, &project_permissions)
+                }),
+        );
         let allow_rules = seed_allow_rule_set(&global_permissions, &project_permissions);
         let approval_timeout =
             effective_approval_timeout(&global_permissions, &project_permissions);
@@ -2148,7 +2265,8 @@ impl RuntimeAssemblyBuilder {
                     prompts: Some(host_permit_prompt_sender.clone()),
                 })),
             })
-            .with_home_context(home_context),
+            .with_home_context(home_context)
+            .with_agent_events(Arc::new(agent_events.clone())),
         );
 
         // 12. Modell-Tool-Fläche der Operationen — **nur** für
@@ -2167,7 +2285,14 @@ impl RuntimeAssemblyBuilder {
         //      (ggf. verengte) Sandbox muss jede Rechteklasse der Werkzeuge
         //      (`WorkbenchToolProvider::TOOL_PERMISSIONS`, `ReadWorkspace`)
         //      tragen — sonst wäre die Rechte-Tabelle der Einstiege gebrochen.
-        let workbench_allowed = registry_profile != RegistryProfile::NoTools
+        //      `WorkspaceEdit` (`GatewayTelegram`) bleibt ebenfalls ohne
+        //      Workbench: ein entfernter Chat bekommt genau die Lese- und
+        //      Schreibwerkzeuge seines Profils, keine Notizablage im
+        //      Profil-Home.
+        let workbench_allowed = !matches!(
+            registry_profile,
+            RegistryProfile::NoTools | RegistryProfile::WorkspaceEdit
+        )
             && harw_registry_defaults::WorkbenchToolProvider::TOOL_PERMISSIONS
                 .iter()
                 .flatten()
@@ -2323,11 +2448,14 @@ fn lower_agent_definitions(
     })
 }
 
-/// Löst die obligatorische UIA eines interaktiven Einstiegs auf.
+/// Löst die UIA eines interaktiven Einstiegs auf.
 ///
-/// TUI und One-shot sind Nutzeroberflächen. Sie starten ausschließlich mit
-/// `harness.active_uia_definition`, deren gesenkte DSL-Rolle
-/// `user-interface` sein muss. Andere Einstiege haben keine UIA-Pflicht.
+/// TUI und One-shot sind Nutzeroberflächen. Ohne explizit gewählten
+/// Wurzel-Agenten ([`resolve_explicit_root_agent`]) starten sie
+/// ausschließlich mit `harness.active_uia_definition`, deren gesenkte
+/// DSL-Rolle `user-interface` sein muss. Die Montage ruft diese Funktion nur
+/// auf, wenn kein expliziter Wurzel-Agent gesetzt ist — dann (und nur dann)
+/// ist die UIA Pflicht. Andere Einstiege haben keine UIA-Pflicht.
 fn resolve_active_uia(
     entry: EntryKind,
     config: &ResolvedConfig,
@@ -2353,6 +2481,52 @@ fn resolve_active_uia(
         });
     }
     Ok(Some(ir))
+}
+
+/// Löst einen explizit gewählten Wurzel-Agenten auf und prüft seine Rolle.
+///
+/// # Beschreibung
+/// Runde 3, Welle C1: `spec.active_agent` (`--agent`, bzw. die persistierte
+/// Auswahl `harness.active_agent_definition`) gewinnt über die UIA. Als
+/// Wurzel zugelassen sind nur die Organisationsrollen
+/// [`AgentRoleId::RootOrchestrator`], [`AgentRoleId::ChildOrchestrator`] und
+/// [`AgentRoleId::Worker`]. Eine UIA gehört nach
+/// `harness.active_uia_definition`, UIA-Helfer und der Agent-Steward sind
+/// keine eigenständigen Wurzeln.
+///
+/// # Argumente
+/// - `name` (`Option<&str>`): der explizit gewählte Agent; `None` heißt
+///   „keiner“.
+/// - `config` / `builtin`: wie [`resolve_active_agent`].
+///
+/// # Rückgabe
+/// `Ok(None)` ohne Namen, sonst `Ok(Some(ir))`.
+///
+/// # Fehler
+/// - [`RuntimeError::Registry`], wenn der Name unbekannt ist (siehe
+///   [`resolve_active_agent`]).
+/// - [`RuntimeError::Config`], wenn der Agent eine nicht zugelassene Rolle
+///   trägt.
+fn resolve_explicit_root_agent(
+    name: Option<&str>,
+    config: &ResolvedConfig,
+    builtin: &HashMap<String, ExecutableAgentIr>,
+) -> RuntimeResult<Option<ExecutableAgentIr>> {
+    let Some(ir) = resolve_active_agent(name, config, builtin)? else {
+        return Ok(None);
+    };
+    match ir.role() {
+        AgentRoleId::RootOrchestrator | AgentRoleId::ChildOrchestrator | AgentRoleId::Worker => {
+            Ok(Some(ir))
+        }
+        other => Err(RuntimeError::Config {
+            detail: format!(
+                "Der Agent „{}“ hat die Rolle {other:?} und kann nicht als Wurzel starten; \
+                 zulässig sind nur Root-Orchestrator, Child-Orchestrator und Worker.",
+                name.unwrap_or_default()
+            ),
+        }),
+    }
 }
 
 /// Löst Provider-/Modell-/Agenten-Reasoning-Effort-Vorgaben der Wurzel-UIA
@@ -3716,7 +3890,14 @@ fn build_spawner(
         // diesen Spawner gebaute Kind — die Kind-Fabrik baut keine eigene
         // Session, [`ManagedAgentSpawner`] tut das.
         .with_guard_policy(guard_policy)
-        .with_pitfall_advisor(pitfall_advisor.clone());
+        .with_pitfall_advisor(pitfall_advisor.clone())
+        // Runde 3, Welle E: die werkzeug- und netzlosen Matrix-Sitzrollen
+        // dürfen auch aus UIA-Sitzungen gestartet werden.
+        .with_uia_spawnable_roles(
+            role_names::MATRIX_ROLES
+                .iter()
+                .map(|role| (*role).to_owned()),
+        );
     let mut roles: Vec<String> = Vec::with_capacity(role_names::ALL.len());
     for role in role_names::ALL {
         // Welle 3a, Teil A, Schritt 5: dieselbe Organisationsrolle, die
@@ -4604,8 +4785,9 @@ mod tests {
         );
     }
 
-    /// Der Rustdoc von [`default_approval_mode`] sagt „immer `Delegated`" —
-    /// dann ist das auch die Zusage, die der Test prüft (Befund Z2c-12).
+    /// Der Rustdoc von [`default_approval_mode`] sagt „immer `Delegated`“ —
+    /// auch Telegram, dort zusätzlich erzwungen (Befund Z2c-12, Runde 3
+    /// Welle D: Lesen läuft durch, Schreiben fragt).
     #[test]
     fn every_entry_starts_delegated() {
         for entry in ALL_ENTRIES {
@@ -4615,6 +4797,81 @@ mod tests {
                 "{entry:?}"
             );
         }
+    }
+
+    /// Telegram fragt bei jedem Schreiben — auch wenn Global- und
+    /// Projekt-Konfiguration `full` verlangen. Kein anderer Einstieg hat einen
+    /// erzwungenen Modus.
+    #[test]
+    fn telegram_approval_mode_is_forced_to_delegated_regardless_of_config() {
+        let global = PermissionsSection {
+            default_mode: Some("full".to_owned()),
+            ..PermissionsSection::default()
+        };
+        let project = PermissionsSection {
+            default_mode: Some("full".to_owned()),
+            ..PermissionsSection::default()
+        };
+        assert_eq!(
+            effective_approval_mode(EntryKind::GatewayTelegram, &global, &project),
+            ApprovalMode::Delegated
+        );
+        for entry in ALL_ENTRIES {
+            let expected = (entry == EntryKind::GatewayTelegram).then_some(ApprovalMode::Delegated);
+            assert_eq!(forced_approval_mode(entry), expected, "{entry:?}");
+        }
+    }
+
+    #[test]
+    fn an_explicit_root_agent_must_be_an_orchestrator_or_worker() -> TestResult {
+        let (config, definitions) = builtin()?;
+        assert!(resolve_explicit_root_agent(None, &config, &definitions)?.is_none());
+
+        let explorer =
+            resolve_explicit_root_agent(Some(role_names::EXPLORER), &config, &definitions)?
+                .ok_or(TestError::Missing("explorer"))?;
+        assert_eq!(explorer.role(), AgentRoleId::Worker);
+
+        let Err(unknown) =
+            resolve_explicit_root_agent(Some("definitely-not-a-role"), &config, &definitions)
+        else {
+            return Err(TestError::Unexpected(
+                "unbekannter Agent muss scheitern".into(),
+            ));
+        };
+        assert!(
+            matches!(unknown, RuntimeError::Registry { .. }),
+            "{unknown}"
+        );
+
+        // Jede eingebaute Definition mit einer anderen Rolle als
+        // Root-/Child-Orchestrator oder Worker wird mit einem
+        // Konfigurationsfehler abgelehnt.
+        let mut rejected = 0_usize;
+        for (name, ir) in &definitions {
+            let allowed = matches!(
+                ir.role(),
+                AgentRoleId::RootOrchestrator
+                    | AgentRoleId::ChildOrchestrator
+                    | AgentRoleId::Worker
+            );
+            let result = resolve_explicit_root_agent(Some(name), &config, &definitions);
+            if allowed {
+                assert!(result.is_ok(), "{name}");
+            } else {
+                rejected += 1;
+                assert!(
+                    matches!(result, Err(RuntimeError::Config { .. })),
+                    "{name}: {:?}",
+                    result.err()
+                );
+            }
+        }
+        assert!(
+            rejected > 0,
+            "mindestens die UIA-Helfer tragen eine andere Rolle"
+        );
+        Ok(())
     }
 
     #[test]
@@ -5763,10 +6020,37 @@ mod tests {
                 );
             }
         }
-        for requested in [Full, ReadOnlyExplore, NoTools] {
+        for requested in [
+            Full,
+            ReadOnlyExplore,
+            NoTools,
+            RegistryProfile::WorkspaceEdit,
+        ] {
             assert_eq!(
                 narrowed_registry_profile(entry, Full, requested).ok(),
                 Some(requested)
+            );
+        }
+        // `WorkspaceEdit` (Telegram) narrowt nur auf sich selbst oder auf
+        // `NoTools`; kein anderes Profil darf zu ihm aufweiten.
+        let telegram = EntryKind::GatewayTelegram;
+        for requested in RegistryProfile::ALL {
+            let allowed = matches!(requested, RegistryProfile::WorkspaceEdit | NoTools);
+            assert_eq!(
+                narrowed_registry_profile(telegram, RegistryProfile::WorkspaceEdit, *requested)
+                    .is_ok(),
+                allowed,
+                "WorkspaceEdit → {requested:?}"
+            );
+        }
+        for entry_profile in RegistryProfile::ALL {
+            if matches!(entry_profile, Full | RegistryProfile::WorkspaceEdit) {
+                continue;
+            }
+            assert!(
+                narrowed_registry_profile(entry, *entry_profile, RegistryProfile::WorkspaceEdit)
+                    .is_err(),
+                "{entry_profile:?} → WorkspaceEdit"
             );
         }
 
@@ -5793,6 +6077,7 @@ mod tests {
             EntryKind::Web,
             EntryKind::McpServe,
             EntryKind::JobPlanNode,
+            EntryKind::GatewayTelegram,
         ] {
             let profile = entry.profile();
             let assembly = fixture_builder(entry, &fixture)

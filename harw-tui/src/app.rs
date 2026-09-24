@@ -176,6 +176,7 @@ use crate::input_editor::{InputAction, InputEditor};
 use crate::input_history::InputHistoryStore;
 use crate::kanban_board::KanbanBoard;
 use crate::local_commands::{self, LocalCommandContext, LocalIntercept, PanelToggle};
+use crate::matrix_view::MatrixView;
 use crate::mention::{MentionLimits, expand_file_mentions, scan_mention_candidates};
 use crate::mention_popup::{
     MentionCandidate, MentionPopup, MentionPopupAction, current_mention_query,
@@ -2245,15 +2246,28 @@ impl ChatApp {
     }
 
     /// Leert den Live-Bus nicht-blockierend in den [`crate::agent_monitor::AgentMonitor`].
+    /// Matrix-Spielereignisse gehen stattdessen an eine offene generische
+    /// Ansicht ([`OverlayView::apply_event`]); ist das die Matrix-Ansicht,
+    /// wird ihr Zustand nachgeladen.
     /// Liefert `true`, wenn sich Sichtbares geändert hat.
     pub(crate) fn drain_agent_events(&mut self) -> bool {
         let mut changed = self.poll_explorer();
         let Some(rx) = self.agent_rx.as_mut() else {
             return changed;
         };
+        let mut matrix_events: Vec<serde_json::Value> = Vec::new();
         loop {
             match rx.try_recv() {
-                Ok(event) => changed |= self.agent_monitor.apply(&event),
+                Ok(event) => {
+                    if let harw_core::AgentEventKind::Matrix { run_id, event } = &event.kind {
+                        matrix_events.push(serde_json::json!({
+                            "run_id": run_id,
+                            "event": event,
+                        }));
+                    } else {
+                        changed |= self.agent_monitor.apply(&event);
+                    }
+                }
                 Err(tokio::sync::broadcast::error::TryRecvError::Lagged(skipped)) => {
                     tracing::debug!(skipped, "tui.agent_events.lagged");
                 }
@@ -2264,7 +2278,30 @@ impl ChatApp {
                 }
             }
         }
+        if !matrix_events.is_empty() {
+            changed |= self.apply_matrix_events(&matrix_events);
+        }
         changed
+    }
+
+    /// Reicht Matrix-Ereignisse an die offene generische Ansicht weiter und
+    /// reiht bei der Matrix-Ansicht deren Nachladen ein.
+    ///
+    /// # Rückgabe
+    /// `true`, wenn eine Ansicht die Ereignisse erhielt (Redraw nötig).
+    fn apply_matrix_events(&mut self, events: &[serde_json::Value]) -> bool {
+        let Some(Overlay::View(view)) = self.overlay.as_mut() else {
+            return false;
+        };
+        for event in events {
+            view.apply_event(event);
+        }
+        let is_matrix =
+            view.refresh_command().as_deref() == Some(crate::matrix_view::REFRESH_COMMAND);
+        if is_matrix {
+            self.queue_overlay_refresh();
+        }
+        true
     }
 
     /// Legt das Explorer-Panel beim ersten Einblenden an und startet die
@@ -3368,7 +3405,8 @@ fn apply_overlay_outcome(app: &mut ChatApp, outcome: OverlayOutcome, bus: &HarwE
 }
 
 /// Globale Ansichtstasten (Standard `F1` Hilfe, `F6` Kanban, `F7`
-/// Modus/Freigabe, `F8` Modelle je Rolle), unabhängig vom Panel-Fokus.
+/// Modus/Freigabe, `F8` Modelle je Rolle, `F9` Matrix-Game), unabhängig vom
+/// Panel-Fokus.
 ///
 /// # Beschreibung
 /// Greift nicht, solange eine Freigabefrage oder ein anderes als ein
@@ -3390,6 +3428,7 @@ fn handle_view_hotkey(app: &mut ChatApp, key: KeyEvent) -> Option<bool> {
     }
     let view: Box<dyn OverlayView> = match app.key_bindings.action_for(&key)? {
         KeyAction::OpenKanban => Box::new(KanbanBoard::new()),
+        KeyAction::OpenMatrix => Box::new(MatrixView::new()),
         KeyAction::OpenModePicker => Box::new(app.mode_picker_view()),
         KeyAction::OpenModels => Box::new(app.model_roles_view()),
         KeyAction::ShowHelp => Box::new(HelpOverlay::new(
@@ -11643,6 +11682,54 @@ forbidden = [{forbidden}]
         );
         assert!(app.pending_fetches.is_empty());
         assert!(!process_pending_fetches(&mut app).await);
+        Ok(())
+    }
+
+    /// F9 öffnet das Matrix-Panel; Matrix-Ereignisse vom Bus gehen an die
+    /// Ansicht (nicht an den Agenten-Monitor) und reihen ihr Nachladen ein.
+    #[test]
+    fn matrix_hotkey_and_live_events_queue_refresh() -> TestResult {
+        let mut app = test_chat_app()?;
+        let (bus, _receiver) = harw_event_channel();
+        let hub = harw_core::AgentEventHub::default();
+        app.attach_agent_events(&hub);
+
+        // Ohne offene Ansicht: kein Abruf, kein Monitor-Eintrag.
+        hub.publish_matrix(
+            app.session_id.clone(),
+            "run-1",
+            serde_json::json!({"round": 1, "text": "x"}),
+        );
+        app.drain_agent_events();
+        assert!(app.pending_fetches.is_empty());
+
+        assert!(handle_key(
+            &mut app,
+            KeyEvent::new(KeyCode::F(9), KeyModifiers::NONE),
+            &bus
+        ));
+        assert!(matches!(app.overlay, Some(Overlay::View(_))));
+        let fetch = DataFetch::Overlay {
+            command: crate::matrix_view::REFRESH_COMMAND.to_owned(),
+            generation: app.overlay_generation,
+        };
+        assert!(app.pending_fetches.contains(&fetch));
+        app.pending_fetches.clear();
+
+        hub.publish_matrix(
+            app.session_id.clone(),
+            "run-1",
+            serde_json::json!({"round": 2, "kind": "roll", "text": "Würfel"}),
+        );
+        assert!(app.drain_agent_events());
+        assert_eq!(app.pending_fetches, vec![fetch]);
+
+        // Andere Ansichten erhalten das Ereignis, laden aber nicht nach.
+        app.open_overlay_view(Box::new(KanbanBoard::new()));
+        app.pending_fetches.clear();
+        hub.publish_matrix(app.session_id.clone(), "run-1", serde_json::json!({}));
+        app.drain_agent_events();
+        assert!(app.pending_fetches.is_empty());
         Ok(())
     }
 

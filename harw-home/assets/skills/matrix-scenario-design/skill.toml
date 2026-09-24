@@ -1,0 +1,4 @@
+name = "matrix-scenario-design"
+description = "Matrix-Game-Szenarien im Interview erarbeiten, als matrix-scenario/v1-TOML entwerfen und gegen eine Qualitäts-Checkliste prüfen."
+instructions_file = "instructions.md"
+tools = ["filesystem.read", "filesystem.write"]

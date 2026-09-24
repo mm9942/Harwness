@@ -6,7 +6,8 @@
 //!    erwartete Profil und den erwarteten Reducer.
 //! 2. **Profil × Rechtesatz** (`RegistryProfile::ALL.len()` × 2⁷):
 //!    `tool_names_for(granted)` registriert nie ein Werkzeug ohne gewährtes
-//!    Recht; `fs.write` nur in `Full`/`MemoryStewardship`/`UiaWriter`,
+//!    Recht; `fs.write` nur in `Full`/`MemoryStewardship`/`UiaWriter`/
+//!    `WorkspaceEdit` (Runde 3, Welle D: nie mit `shell.*`/`web.*`),
 //!    `shell.exec` nur in `Full`/`ShellExecution`/`UiaQuickHelper`
 //!    (Addendum I)/`UiaShellWorker`, jeweils nur mit dem passenden Recht;
 //!    `deps.source_*` nur mit `ReadCargoRegistry`; `web.*` nur in `Research`
@@ -24,7 +25,8 @@
 //!    nach dem Reducer nur `explorer`, `uia-explorer`, `uia-worker`,
 //!    `uia-writer` und `researcher-web`, nie mehr als der Elternteil trägt;
 //!    die read-only Rollen (`analyst`, `researcher-deps`, `planner`,
-//!    `root-orchestrator`, Triage …) nie. `researcher-web` sieht nie `fs.*`,
+//!    `root-orchestrator`, Triage, Matrix-Sitze …) nie. Die Matrix-Sitze
+//!    (`MatrixReader`) sehen höchstens die lesenden `fs.*` plus `doc.read_pdf`. `researcher-web` sieht nie `fs.*`,
 //!    `deps.*` oder `lens.ask`.
 //! 4. **TOML-Seite** (andere Quelle): keine Rolle admittiert `fs.write`,
 //!    `shell.exec` oder `browser.*` — außer `uia-worker`, die einzige Rolle
@@ -74,6 +76,17 @@ const BROWSER: &[&str] = &[
     "browser.wait",
     "browser.events",
     "browser.close",
+];
+
+/// Die Werkzeuge von `RegistryProfile::MatrixReader` in
+/// Registrierungsreihenfolge: die fünf lesenden `fs.*` plus `doc.read_pdf`.
+const MATRIX_READ_TOOLS: &[&str] = &[
+    "fs.read",
+    "fs.list",
+    "fs.search",
+    "fs.glob",
+    "fs.grep",
+    "doc.read_pdf",
 ];
 
 /// Alle 128 Teilmengen der sieben Rechte.
@@ -157,6 +170,29 @@ fn expected_role_table() -> Vec<(&'static str, RegistryProfile, AuthorityReducer
         (
             role_names::SECURITY_ENDPOINT_TRIAGE,
             RegistryProfile::NoTools,
+            AuthorityReducer::ReadOnly,
+        ),
+        // Runde 3, Welle E + Matrix-Unterlagen: die vier Matrix-Game-Sitze
+        // lesen nur ihre Unterlagen (`MatrixReader`: lesende `fs.*` plus
+        // `doc.read_pdf`) — ohne Netz, Schreiben oder Exec.
+        (
+            role_names::MATRIX_PLAYER,
+            RegistryProfile::MatrixReader,
+            AuthorityReducer::ReadOnly,
+        ),
+        (
+            role_names::MATRIX_UMPIRE,
+            RegistryProfile::MatrixReader,
+            AuthorityReducer::ReadOnly,
+        ),
+        (
+            role_names::MATRIX_MARKET,
+            RegistryProfile::MatrixReader,
+            AuthorityReducer::ReadOnly,
+        ),
+        (
+            role_names::MATRIX_REDCELL,
+            RegistryProfile::MatrixReader,
             AuthorityReducer::ReadOnly,
         ),
         // Behoben (Agent F-FIX, Addendum F+G): `authority_reducer_for_role`
@@ -289,11 +325,14 @@ fn test_profile_by_permission_matrix_never_registers_ungranted_tools() -> TestRe
             // `RegistryProfile::UiaWriter` in `harw-registry-defaults/src/
             // profile.rs`); `shell.exec` zu `Full`, `ShellExecution`,
             // `UiaQuickHelper` (Addendum I) und `UiaShellWorker`.
+            // `WorkspaceEdit` (Runde 3, Welle D): Workspace schreiben ohne
+            // Shell und ohne Netz.
             let may_write = matches!(
                 *profile,
                 RegistryProfile::Full
                     | RegistryProfile::MemoryStewardship
                     | RegistryProfile::UiaWriter
+                    | RegistryProfile::WorkspaceEdit
             );
             let may_exec = matches!(
                 *profile,
@@ -346,6 +385,23 @@ fn test_profile_by_permission_matrix_never_registers_ungranted_tools() -> TestRe
                     );
                 }
                 assert!(granted.contains(Permission::NetworkAccess));
+            }
+            if *profile == RegistryProfile::WorkspaceEdit {
+                assert!(
+                    !tools.iter().any(|tool| tool.starts_with("shell.")
+                        || tool.starts_with("process.")
+                        || tool.starts_with("web.")
+                        || *tool == "lens.ask"),
+                    "WorkspaceEdit darf weder shell.* noch web.* führen: {tools:?}"
+                );
+            }
+            if *profile == RegistryProfile::MatrixReader {
+                let expected: Vec<&str> = MATRIX_READ_TOOLS
+                    .iter()
+                    .copied()
+                    .filter(|_| granted.contains(Permission::ReadWorkspace))
+                    .collect();
+                assert_eq!(tools, expected, "MatrixReader unter {granted:?}");
             }
             if *profile == RegistryProfile::Research {
                 assert!(
@@ -643,6 +699,148 @@ fn test_assembled_registry_matches_the_matrix_for_every_profile_and_permission_s
             assert_eq!(registered, expected, "{profile:?} unter {granted:?}");
             assert_eq!(assembled.identity.tools_available, expected, "{profile:?}");
         }
+    }
+    Ok(())
+}
+
+/// Runde 3, Welle E + Matrix-Unterlagen: die drei Matrix-Game-Sitze lesen
+/// genau ihre Unterlagen (lesende `fs.*` plus `doc.read_pdf`), ohne Netz,
+/// ohne Schreiben/Exec und ohne Spawn-Tiefe — auf allen drei Seiten
+/// (Rust-Profil, Reducer, eingebettete TOML) und unter allen 128
+/// Rechtesätzen des Elternteils.
+#[test]
+fn test_matrix_roles_read_only_materials_no_network_and_zero_depth() -> TestResult {
+    let roles: HashMap<String, harw_agent_dsl::ExecutableAgentIr> =
+        builtin_agent_definitions(&HashMap::new()).map_err(ctx(
+            "eingebaute Rollendefinitionen müssen sich auflösen lassen",
+        ))?;
+    assert_eq!(
+        RegistryProfile::MatrixReader.registered_tool_names(),
+        MATRIX_READ_TOOLS,
+        "MatrixReader registriert genau die lesenden Unterlagen-Werkzeuge"
+    );
+    assert_eq!(
+        RegistryProfile::MatrixReader.required_permissions(),
+        PermissionSet::from_policy([Permission::ReadWorkspace]),
+        "MatrixReader braucht genau ReadWorkspace"
+    );
+    assert!(RegistryProfile::MatrixReader.is_read_only());
+    for role in role_names::MATRIX_ROLES {
+        assert!(role_names::ALL.contains(&role), "{role} fehlt in ALL");
+        let profile =
+            profile_for_role(role).ok_or(TestError::Missing("Matrix-Rolle braucht ein Profil"))?;
+        assert_eq!(profile, RegistryProfile::MatrixReader, "{role}");
+        let reducer = authority_reducer_for_role(role)
+            .ok_or(TestError::Missing("Matrix-Rolle braucht einen Reducer"))?;
+        assert_eq!(reducer, AuthorityReducer::ReadOnly, "{role}");
+        for parent in every_permission_subset() {
+            let child = reducer.reduce(&parent);
+            assert!(!child.contains(Permission::NetworkAccess), "{role}: Netz");
+            assert!(
+                !child.contains(Permission::WriteWorkspace),
+                "{role}: Schreiben"
+            );
+            assert!(
+                !child.contains(Permission::ExecuteProcess),
+                "{role}: Ausführen"
+            );
+            let tools = profile.tool_names_for(&child);
+            for tool in &tools {
+                assert!(
+                    MATRIX_READ_TOOLS.contains(tool),
+                    "{role}: {tool} ist kein lesendes Unterlagen-Werkzeug"
+                );
+                assert!(
+                    *tool != "fs.write"
+                        && !tool.starts_with("shell.")
+                        && !tool.starts_with("process.")
+                        && !tool.starts_with("web.")
+                        && !tool.starts_with("browser."),
+                    "{role}: {tool} unter {parent:?}"
+                );
+            }
+            let expected: Vec<&str> = if parent.contains(Permission::ReadWorkspace) {
+                MATRIX_READ_TOOLS.to_vec()
+            } else {
+                Vec::new()
+            };
+            assert_eq!(tools, expected, "{role} unter {parent:?}");
+        }
+        let ir = roles.get(role).ok_or(TestError::Unexpected(format!(
+            "Rolle {role} fehlt in den aufgelösten Definitionen"
+        )))?;
+        let admitted: BTreeSet<&str> = ir
+            .tool_surface()
+            .admitted()
+            .iter()
+            .map(String::as_str)
+            .collect();
+        let expected_admitted: BTreeSet<&str> = MATRIX_READ_TOOLS.iter().copied().collect();
+        assert_eq!(
+            admitted, expected_admitted,
+            "{role} admittiert genau die lesenden Unterlagen-Werkzeuge"
+        );
+        let forbidden = ir.tool_surface().forbidden();
+        for tool in [
+            "fs.write",
+            "shell.exec",
+            "process.kill",
+            "web.fetch",
+            "web.search",
+            "web.docs_rs",
+            "web.crates_io",
+        ] {
+            assert!(
+                forbidden.iter().any(|name| name == tool),
+                "{role} muss {tool} ausdrücklich verbieten"
+            );
+        }
+        assert_eq!(
+            ir.spawn_contract().max_depth(),
+            Some(0),
+            "{role}: Spawn-Tiefe"
+        );
+        assert_eq!(
+            ir.role(),
+            harw_agent_dsl::roles::AgentRoleId::Worker,
+            "{role}: Organisationsrolle"
+        );
+    }
+    Ok(())
+}
+
+/// Die UIA-Wurzel (Einstieg `Tui` → `RegistryProfile::Full`) registriert
+/// unter keinem Rechtesatz ein `web.*`-Werkzeug — auch nicht mit
+/// `NetworkAccess` (Runde 3: die Wurzel trägt egress-gebundenes Netz nur zur
+/// Durchreichung an ihre Helfer).
+#[test]
+fn test_uia_root_profile_never_registers_web_tools() -> TestResult {
+    let cwd = std::env::current_dir().map_err(ctx("cwd"))?;
+    let project = discover_project(&cwd, &DiscoveryConfig::default())
+        .map_err(ctx("Discovery im Crate-Verzeichnis"))?;
+    for granted in every_permission_subset() {
+        let tools = RegistryProfile::Full.tool_names_for(&granted);
+        assert!(
+            !tools.iter().any(|tool| tool.starts_with("web.")),
+            "Full bewirbt web.* unter {granted:?}"
+        );
+        let assembled = assemble_registry_for_sandbox(
+            RegistryProfile::Full,
+            &project,
+            IdentityOverrides::default(),
+            ApprovalModeCell::default(),
+            &granted,
+        )
+        .map_err(ctx("assemble"))?;
+        assert!(
+            !assembled
+                .registry
+                .tool_providers()
+                .iter()
+                .flat_map(|provider| provider.tools())
+                .any(|spec| spec.name().starts_with("web.")),
+            "Full registriert web.* unter {granted:?}"
+        );
     }
     Ok(())
 }

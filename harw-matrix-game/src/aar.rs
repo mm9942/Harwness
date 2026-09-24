@@ -14,8 +14,11 @@ use serde::{Deserialize, Serialize};
 use crate::commitments::{Commitment, Salt, verify};
 use crate::dice::{DiceRoll, Grade, Outcome};
 use crate::error::MatrixResult;
+pub use crate::lessons::{AarSummary, compare_runs, summarize_run};
+use crate::lessons::{design_lessons, render_design_lessons};
 use crate::phases::{ArgumentBody, PlayerDebrief, UmpireRuling, UmpireSynthesis};
-use crate::scenario::{LoadedScenario, Scenario};
+use crate::precedents::later_matches;
+use crate::scenario::{LoadedScenario, RED_CELL_KEY, Scenario};
 use crate::state::{EntryKind, GameState, Journal, PlayerId, VarValue};
 
 /// Höchstwert einer Zielbewertung.
@@ -199,6 +202,7 @@ struct ArgInfo {
     outcome: Option<(Outcome, Option<Grade>)>,
     narrations: Vec<String>,
     rejected: Vec<String>,
+    red_cell_assumption: Option<String>,
 }
 
 fn cell(text: &str) -> String {
@@ -260,7 +264,18 @@ fn collect_arguments(journal: &Journal) -> Vec<ArgInfo> {
                 outcome: None,
                 narrations: Vec::new(),
                 rejected: Vec::new(),
+                red_cell_assumption: None,
             }),
+            EntryKind::RedCellObjection {
+                target: Some(target),
+                assumption,
+                cons,
+            } => {
+                if let Some(a) = index(&args, target).and_then(|i| args.get_mut(i)) {
+                    a.counters.push((PlayerId::new(RED_CELL_KEY), cons.clone()));
+                    a.red_cell_assumption.clone_from(assumption);
+                }
+            }
             EntryKind::CountersSubmitted { seat, counters } => {
                 for c in counters.iter().filter(|c| !c.cons.is_empty()) {
                     if let Some(i) = index(&args, &c.argument_id) {
@@ -343,6 +358,12 @@ fn write_argument(out: &mut String, scenario: &Scenario, a: &ArgInfo) {
             .and_then(|r| r.pro_weights.get(i))
             .map_or_else(|| "–".to_owned(), ToString::to_string);
         push_line(out, &format!("- Pro {}: {pro} (Gewicht {w})", i + 1));
+    }
+    if let Some(assumption) = &a.red_cell_assumption {
+        push_line(
+            out,
+            &format!("- Red Cell — angegriffene Kernannahme: {assumption}"),
+        );
     }
     for (seat, cons) in &a.counters {
         for (j, con) in cons.iter().enumerate() {
@@ -625,6 +646,32 @@ pub fn build_aar(input: &AarInput<'_>) -> MatrixResult<String> {
         }
     }
     push_line(&mut out, "");
+    let steps: Vec<String> = journal
+        .entries()
+        .filter_map(|e| match &e.kind {
+            EntryKind::SuspicionRaised {
+                secret_id,
+                from,
+                to,
+                cause,
+                ..
+            } => Some(format!(
+                "- r{} #{secret_id}: {} → {} (ausgelöst durch `{cause}`)",
+                e.round,
+                from.label(),
+                to.label()
+            )),
+            _ => None,
+        })
+        .collect();
+    if !steps.is_empty() {
+        push_line(&mut out, "### Verdachtsleiter");
+        push_line(&mut out, "");
+        for line in &steps {
+            push_line(&mut out, line);
+        }
+        push_line(&mut out, "");
+    }
 
     push_line(&mut out, "### Private Kanäle");
     push_line(&mut out, "");
@@ -706,6 +753,27 @@ pub fn build_aar(input: &AarInput<'_>) -> MatrixResult<String> {
                 seat,
                 intent: Some(intent),
             } => Some(format!("- r{} Absicht {seat}: {intent}", entry.round)),
+            EntryKind::BehaviorBriefing { faction, profile } => {
+                let mut parts = vec![format!(
+                    "Risiko {} ({:.2})",
+                    profile.risk_label(),
+                    profile.risk
+                )];
+                if profile.loss_framing {
+                    parts.push("Verlustrahmung".to_owned());
+                }
+                if let Some(anchor) = &profile.anchor {
+                    parts.push(format!("Bezugspunkt: {anchor}"));
+                }
+                if !profile.rules.is_empty() {
+                    parts.push(format!("Regeln: {}", profile.rules.join("; ")));
+                }
+                parts.push(format!("rote Linien: {}", profile.red_lines.join("; ")));
+                Some(format!(
+                    "- {faction} Verhaltensprofil: {}",
+                    parts.join(" — ")
+                ))
+            }
             EntryKind::SecretBriefing {
                 faction,
                 secret_goals,
@@ -731,6 +799,69 @@ pub fn build_aar(input: &AarInput<'_>) -> MatrixResult<String> {
         push_line(&mut out, "Keine.");
     }
     push_line(&mut out, "");
+
+    // 4b. Präzedenzregister und Red Cell
+    push_line(&mut out, "## Präzedenzregister");
+    push_line(&mut out, "");
+    let precedents = later_matches(journal);
+    if precedents.is_empty() {
+        push_line(&mut out, "Keine Präzedenzfälle markiert.");
+    } else {
+        push_line(
+            &mut out,
+            "| Fall | Runde | Argument | Maßstab | Schlagworte | Netto / % | Später einschlägig für |",
+        );
+        push_line(&mut out, "|---|---|---|---|---|---|---|");
+        for r in &precedents {
+            let p = &r.precedent;
+            let later = if r.arguments.is_empty() {
+                "—".to_owned()
+            } else {
+                r.arguments.join(", ")
+            };
+            push_line(
+                &mut out,
+                &format!(
+                    "| {} | {} | {} | {} | {} | {:+} / {} % | {later} |",
+                    p.id,
+                    p.round,
+                    p.argument_id,
+                    cell(&p.principle),
+                    cell(&p.tags.join(", ")),
+                    p.net,
+                    p.probability_pct
+                ),
+            );
+        }
+    }
+    push_line(&mut out, "");
+    let red_cell: Vec<String> = journal
+        .entries()
+        .filter_map(|e| match &e.kind {
+            EntryKind::RedCellObjection {
+                target: Some(t),
+                assumption,
+                cons,
+            } => Some(format!(
+                "- r{} gegen {t}: Kernannahme „{}“ — {} Contra(s)",
+                e.round,
+                assumption.as_deref().unwrap_or("—"),
+                cons.len()
+            )),
+            EntryKind::RedCellObjection { target: None, .. } => {
+                Some(format!("- r{} kein Einwand", e.round))
+            }
+            _ => None,
+        })
+        .collect();
+    if !red_cell.is_empty() {
+        push_line(&mut out, "## Red Cell");
+        push_line(&mut out, "");
+        for line in &red_cell {
+            push_line(&mut out, line);
+        }
+        push_line(&mut out, "");
+    }
 
     // 5. Zielerreichung
     push_line(&mut out, "## Zielerreichung");
@@ -831,6 +962,10 @@ pub fn build_aar(input: &AarInput<'_>) -> MatrixResult<String> {
             .unwrap_or("— (keine Einschätzung geliefert)"),
     );
     push_line(&mut out, "");
+    out.push_str(&render_design_lessons(&design_lessons(
+        input.loaded,
+        journal,
+    )));
     push_line(&mut out, "## Facilitator-Eingriffe und Leak-Guard");
     push_line(&mut out, "");
     let mut interventions = Vec::new();
@@ -844,6 +979,20 @@ pub fn build_aar(input: &AarInput<'_>) -> MatrixResult<String> {
             }
             EntryKind::FacilitatorNote { command, detail } => {
                 interventions.push(format!("- r{} {command}: {detail}", entry.round));
+            }
+            EntryKind::InjectPackageSelected { package_id, plan } => {
+                let picks: Vec<String> = plan
+                    .iter()
+                    .map(|p| format!("`{}` (R{})", p.inject_id, p.round))
+                    .collect();
+                interventions.push(format!(
+                    "- Inject-Paket `{package_id}` (Seed-Auswahl): {}",
+                    if picks.is_empty() {
+                        "keine Ziehung".to_owned()
+                    } else {
+                        picks.join(", ")
+                    }
+                ));
             }
             EntryKind::LeakSuspect {
                 source, findings, ..

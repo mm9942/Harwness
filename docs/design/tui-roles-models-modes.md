@@ -89,7 +89,7 @@ Zwei unabhängige Achsen:
 | Steuert | welche Werkzeuge das Modell sieht und die Sandbox-Obergrenze | ob ein erlaubter Werkzeugaufruf nachfragt |
 | Ändern | `/mode <modus>`, F7 (Abschnitt „Modus“) | `/permissions mode <ask\|auto\|full> [--session\|--project\|--global]`, F7 (Abschnitt „Freigabe“, Scope `--session`) |
 | Wirkt | an der **nächsten Turn-Grenze** (vorgemerkt; Statuszeile „(ausstehend)“) | **sofort**, auch während eines Turns |
-| Standard | `[mode] default` (Vorgabe `plan`), persistierbar per `/mode default <modus>` bzw. `d` in F7 | `[permissions].default_mode`, sonst `auto` |
+| Standard | `[mode] default` (Vorgabe `chat`), persistierbar per `/mode default <modus>` bzw. `d` in F7 | `[permissions].default_mode`, sonst `auto` |
 
 `Shift+Tab` ist ein Schnellzyklus über beide Achsen:
 `ask → auto → full → plan → ask`. Die Stufe `plan` merkt sich den bisherigen
@@ -121,7 +121,8 @@ Gilt für `harw`/`harw chat`, `harw exec` und `harw analyze`.
 
 | Größe | Rangfolge (höchste zuerst) | Fehlerfall |
 |---|---|---|
-| Interaktionsmodus | `--mode` > `[mode] default` | unbekannter Name in **beiden** Fällen ein Fehler (kein stiller Rückfall auf `chat`) |
+| Interaktionsmodus | `--mode` > `[mode] default` (Vorgabe `chat`) | unbekannter Name in **beiden** Fällen ein Fehler (kein stiller Rückfall auf `chat`) |
+| Wurzel-Agent | `--agent` > `active_agent_definition` (persistierbar per `/agent use <name>`, entfernbar per `/agent use --clear`, beides ab nächster Sitzung) | unbekannter Name: Startfehler (fail-closed); `/agent use` prüft Name und Rolle (Wurzel-, Kind-Orchestrator oder Worker) vor dem Speichern |
 | Freigabemodus | `--approval` > Projekt-`[permissions].default_mode` > globales `[permissions].default_mode` > Vorgabe der Einstiegsart (für alle Einstiege `auto`) | ungültiger `--approval`-Wert: Parser-Fehler; ungültiger Config-Wert wird übersprungen |
 | Modell | `--model` > `default_provider`/`default_model` (bzw. UIA-Pin) | `--model` wird gegen `config.models` geprüft: zuerst Katalogschlüssel, dann Modell-ID, dann Alias (bei mehreren Treffern der alphabetisch erste Schlüssel); kein Treffer = Konfigurationsfehler |
 
@@ -133,7 +134,9 @@ die interaktive Sitzung gilt. Die übrigen Rollen folgen daraus nach §1
 
 ## 5. Offen
 
-- `[mode] default` = `plan` → `chat`: Nutzerentscheid ausstehend, nicht
-  umgesetzt.
+- ~~`[mode] default` = `plan` → `chat`~~: entschieden und umgesetzt —
+  die Vorgabe ist jetzt `chat` (`harw-config/src/mode_toml.rs`,
+  `default_mode`). Wer mit Planung starten will, setzt
+  `[mode] default = "plan"` bzw. `/mode default plan`.
 - Modell im Agenten-Ereignis (`AgentOrchestrationEvent.model`,
   `ChildRecord.model`) für die Anzeige des Kind-Modells: geplant.

@@ -30,6 +30,14 @@
 //! Eine Budget-*Anpassung* (`/agent budget <id> <wert>`) bietet der Controller
 //! nicht an; sie bleibt fail-closed [`OpError::NotAvailable`].
 //!
+//! `use` braucht keinen Spawner: `/agent use <name>` prüft den Namen gegen
+//! die eingebauten Rollen (`harw_registry_defaults::role_names::ALL`) und die
+//! konfigurierten Agentendefinitionen und verankert ihn über
+//! [`crate::config_util::SelectionPersistence::persist_active_agent`] als
+//! `active_agent_definition` in der Profil-`config.toml`;
+//! `/agent use --clear` entfernt den Eintrag. Beides gilt ab der nächsten
+//! Sitzung.
+//!
 //! # Beispiel
 //! ```rust,no_run
 //! use harw_ops::agent::AgentArgs;
@@ -57,9 +65,10 @@ use harw_operations::{OpContext, OpError, OpOutput};
 ///
 /// # Felder
 /// - `action` (`Option<String>`): Token 0 — Sub-Kommando. Gültige Werte:
-///   `"list"` (Standard), `"stop"`, `"budget"`. `None` wird intern als `"list"` behandelt.
-/// - `target` (`Option<String>`): Token 1 — Ziel-Agent-ID (z. B. `"abc-42"`).
-///   Relevant für `stop` und `budget`; bei `list` ignoriert.
+///   `"list"` (Standard), `"stop"`, `"budget"`, `"use"`. `None` wird intern als `"list"` behandelt.
+/// - `target` (`Option<String>`): Token 1 — Ziel-Agent-ID (z. B. `"abc-42"`),
+///   bei `use` der Agentenname oder `--clear`.
+///   Relevant für `stop`, `budget` und `use`; bei `list` ignoriert.
 /// - `value` (`Option<String>`): Token 2 — dritter Parameter (z. B. Budget-Grenze).
 ///   Relevant für `budget`; bei `list` und `stop` ignoriert.
 ///
@@ -81,7 +90,7 @@ use harw_operations::{OpContext, OpError, OpOutput};
 /// ```
 #[derive(Default, serde::Deserialize, harw_macros::FromRawArgs)]
 pub struct AgentArgs {
-    /// Sub-Kommando: `"list"` (Standard), `"stop"`, `"budget"`. Token 0.
+    /// Sub-Kommando: `"list"` (Standard), `"stop"`, `"budget"`, `"use"`. Token 0.
     #[serde(default)]
     #[raw(first)]
     pub action: Option<String>,
@@ -104,7 +113,8 @@ pub struct AgentArgs {
 /// Abbruchwirkung beim Controller. `budget` zeigt Limits, Budget-Deckel und
 /// Live-Verbrauch für den gesamten Teilbaum oder — mit `target` — für genau
 /// einen besessenen Knoten. Fehlt der Dienst, bleibt die Operation
-/// fail-closed mit [`OpError::NotAvailable`].
+/// fail-closed mit [`OpError::NotAvailable`]. `use` wählt ohne Spawner die
+/// Wurzel-Agentendefinition für künftige Sitzungen (siehe [`agent_use`]).
 ///
 /// **Command only**: Das Modell darf diese Operation nicht selbst aufrufen, da
 /// sich das Modell nicht selbst manipulieren darf. Kein `model_tool`-Attribut.
@@ -135,12 +145,15 @@ pub struct AgentArgs {
 /// ```
 #[operation(
     name = "agent",
-    summary = "Child-Agent-Management: list/stop/budget gegen den registrierten ManagedAgentSpawner.",
+    summary = "Child-Agent-Management: list/stop/budget gegen den registrierten ManagedAgentSpawner; use wählt den Wurzel-Agenten ab der nächsten Sitzung.",
     domain = "agents",
     permission = "operator",
     command(path = "/agent", visibility = "channel_parity", busy = "immediate")
 )]
 async fn agent(ctx: &OpContext, args: AgentArgs) -> Result<OpOutput, OpError> {
+    if args.action.as_deref() == Some("use") {
+        return agent_use(ctx, args.target.as_deref());
+    }
     let Some(spawner) = ctx.service::<std::sync::Arc<harw_core::ManagedAgentSpawner>>() else {
         return Err(OpError::NotAvailable(
             "child-agent management is not available".to_owned(),
@@ -224,6 +237,120 @@ async fn agent(ctx: &OpContext, args: AgentArgs) -> Result<OpOutput, OpError> {
             "unknown /agent action '{unknown}'"
         ))),
     }
+}
+
+/// Rollen, die als Wurzel einer Sitzung starten dürfen (`--agent`,
+/// `active_agent_definition`).
+const ROOT_CAPABLE_ROLES: [harw_agent_dsl::roles::AgentRoleId; 3] = [
+    harw_agent_dsl::roles::AgentRoleId::RootOrchestrator,
+    harw_agent_dsl::roles::AgentRoleId::ChildOrchestrator,
+    harw_agent_dsl::roles::AgentRoleId::Worker,
+];
+
+/// Aufrufhilfe für `/agent use`.
+const AGENT_USE_USAGE: &str = "/agent use <name> | /agent use --clear";
+
+/// `/agent use <name>` bzw. `/agent use --clear`.
+///
+/// # Beschreibung
+/// Mit `--clear` wird `active_agent_definition` aus der Profil-`config.toml`
+/// entfernt. Sonst wird `name` gegen die konfigurierten Agentendefinitionen
+/// (`ResolvedConfig::executable_agents`, Vorrang) und die eingebauten Rollen
+/// geprüft ([`validate_root_agent`]) und erst danach gespeichert. Beides
+/// wirkt ab der nächsten Sitzung; die laufende Sitzung bleibt unverändert.
+///
+/// # Fehler
+/// - [`OpError::InvalidArguments`]: Name fehlt, ist unbekannt oder hat eine
+///   Rolle, die nicht als Wurzel starten darf.
+/// - [`OpError::Execution`]: Config-Discovery oder das Senken der
+///   eingebauten Definitionen schlägt fehl.
+fn agent_use(ctx: &OpContext, target: Option<&str>) -> Result<OpOutput, OpError> {
+    let target = target.map(str::trim).filter(|target| !target.is_empty());
+    let Some(target) = target else {
+        return Err(OpError::InvalidArguments(format!(
+            "Agentenname fehlt. Aufruf: {AGENT_USE_USAGE}."
+        )));
+    };
+    let persistence = crate::config_util::selection_persistence(ctx);
+    let (mut text, note) = if target == "--clear" {
+        (
+            "Aktiver Agent entfernt – gilt ab nächster Sitzung.".to_owned(),
+            persistence.persist_active_agent(None),
+        )
+    } else {
+        let config = crate::provider::resolved_config(ctx)?;
+        let builtin = harw_registry_defaults::embedded_agents::builtin_agent_definitions(
+            &config.executable_agents,
+        )
+        .map_err(|error| {
+            OpError::Execution(format!(
+                "eingebaute Agentendefinitionen nicht ladbar: {error}"
+            ))
+        })?;
+        validate_root_agent(target, &config.executable_agents, &builtin)?;
+        (
+            format!("Aktiver Agent: {target} – gilt ab nächster Sitzung."),
+            persistence.persist_active_agent(Some(target)),
+        )
+    };
+    if let Some(note) = note {
+        text.push('\n');
+        text.push_str(&note);
+    }
+    Ok(OpOutput::from(text))
+}
+
+/// Prüft, ob `name` eine bekannte, als Wurzel startbare Agentendefinition ist.
+///
+/// # Beschreibung
+/// Konfigurierte Definitionen (`configured`) haben Vorrang vor den
+/// eingebauten (`builtin`) — dieselbe Reihenfolge wie
+/// `harw-runtime::assembly::resolve_active_agent`. Erlaubt sind nur die
+/// Rollen aus [`ROOT_CAPABLE_ROLES`].
+///
+/// # Fehler
+/// [`OpError::InvalidArguments`] mit deutschem Text und der Liste der
+/// zulässigen Namen, wenn der Name unbekannt ist oder seine Rolle nicht als
+/// Wurzel starten darf.
+fn validate_root_agent(
+    name: &str,
+    configured: &std::collections::HashMap<String, harw_agent_dsl::ExecutableAgentIr>,
+    builtin: &std::collections::HashMap<String, harw_agent_dsl::ExecutableAgentIr>,
+) -> Result<(), OpError> {
+    let known = configured.get(name).or_else(|| builtin.get(name));
+    match known {
+        Some(ir) if ROOT_CAPABLE_ROLES.contains(&ir.role()) => Ok(()),
+        Some(ir) => Err(OpError::InvalidArguments(format!(
+            "Agent '{name}' hat die Rolle {:?} und kann nicht als Wurzel starten. \
+             Zulässig: {}.",
+            ir.role(),
+            root_capable_names(configured, builtin)
+        ))),
+        None => Err(OpError::InvalidArguments(format!(
+            "Unbekannter Agent '{name}'. Zulässig: {}.",
+            root_capable_names(configured, builtin)
+        ))),
+    }
+}
+
+/// Sortierte, kommagetrennte Liste aller als Wurzel startbaren Namen.
+fn root_capable_names(
+    configured: &std::collections::HashMap<String, harw_agent_dsl::ExecutableAgentIr>,
+    builtin: &std::collections::HashMap<String, harw_agent_dsl::ExecutableAgentIr>,
+) -> String {
+    let mut names: Vec<&str> = configured
+        .iter()
+        .chain(
+            builtin
+                .iter()
+                .filter(|(name, _)| !configured.contains_key(*name)),
+        )
+        .filter(|(_, ir)| ROOT_CAPABLE_ROLES.contains(&ir.role()))
+        .map(|(name, _)| name.as_str())
+        .collect();
+    names.sort_unstable();
+    names.dedup();
+    names.join(", ")
 }
 
 /// Formatiert den Budget-Bericht für `/agent budget`.
@@ -346,14 +473,21 @@ fn usage_against_limit(used: u64, limit: Option<u64>, unit: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::AgentArgs;
+    use crate::config_util::RecordedSelectionPersistCall;
+    use crate::test_support::ctx as ctx_err;
     use crate::test_support::{TestError, TestResult, ctx};
     use crate::testutil::toks;
     use harw_authority::{PermissionSet, SandboxSpec, WorkspaceRegistration, WorkspaceRegistry};
     use harw_operations::{FromRawArgs, OpContext, OpError, context::ServiceMap};
+    use harw_registry_defaults::role_names::{ROOT_ORCHESTRATOR, UIA_WORKER};
     use harw_types::{SessionId, TenantId, TurnId, WorkspaceId};
     use std::sync::atomic::{AtomicU64, Ordering};
 
     fn test_context() -> TestResult<(OpContext, std::path::PathBuf)> {
+        test_context_with(ServiceMap::new())
+    }
+
+    fn test_context_with(services: ServiceMap) -> TestResult<(OpContext, std::path::PathBuf)> {
         static COUNTER: AtomicU64 = AtomicU64::new(0);
         let id = COUNTER.fetch_add(1, Ordering::Relaxed);
         let root =
@@ -376,7 +510,7 @@ mod tests {
             .map_err(ctx("resolve workspace binding"))?;
         let sandbox = SandboxSpec::from_resolved(binding, PermissionSet::empty());
         Ok((
-            OpContext::new(SessionId::new(), TurnId::new(), sandbox, ServiceMap::new()),
+            OpContext::new(SessionId::new(), TurnId::new(), sandbox, services),
             root,
         ))
     }
@@ -791,6 +925,106 @@ mod tests {
                 )));
             }
         }
+        Ok(())
+    }
+
+    // ── /agent use ──────────────────────────────────────────────────────────
+
+    type Recorder = std::sync::Arc<crate::config_util::RecordingSelectionPersistence>;
+
+    /// Kontext mit leerer Konfiguration und aufzeichnender Persistenz, damit
+    /// `/agent use` weder `HARW_HOME` liest noch schreibt.
+    fn use_context() -> TestResult<(OpContext, std::path::PathBuf, Recorder)> {
+        let recorder: Recorder =
+            std::sync::Arc::new(crate::config_util::RecordingSelectionPersistence::new());
+        let persistence: std::sync::Arc<dyn crate::config_util::SelectionPersistence> =
+            recorder.clone();
+        let mut services = ServiceMap::new();
+        services.insert(persistence);
+        services.insert(std::sync::Arc::new(harw_config::ResolvedConfig::default()));
+        let (ctx, root) = test_context_with(services)?;
+        Ok((ctx, root, recorder))
+    }
+
+    fn use_args(target: Option<&str>) -> AgentArgs {
+        AgentArgs {
+            action: Some("use".to_owned()),
+            target: target.map(str::to_owned),
+            value: None,
+        }
+    }
+
+    #[test]
+    fn test_agent_args_from_raw_args_use_clear() -> TestResult {
+        let args = AgentArgs::from_raw_args(&toks(&["use", "--clear"]))
+            .map_err(|e| TestError::Unexpected(format!("Unerwarteter Fehler: {e}")))?;
+        assert_eq!(args.action.as_deref(), Some("use"));
+        assert_eq!(args.target.as_deref(), Some("--clear"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn agent_use_persists_builtin_root_agent_without_spawner() -> TestResult {
+        let (ctx, root, recorder) = use_context()?;
+        let result = super::agent(&ctx, use_args(Some(ROOT_ORCHESTRATOR))).await;
+        std::fs::remove_dir_all(root).map_err(ctx_err("remove test workspace"))?;
+        let output = result.map_err(|e| TestError::Unexpected(format!("{e:?}")))?;
+        let text = output.text;
+        assert!(text.contains("gilt ab nächster Sitzung"), "{text}");
+        assert_eq!(
+            recorder.calls(),
+            vec![RecordedSelectionPersistCall::ActiveAgent {
+                name: Some(ROOT_ORCHESTRATOR.to_owned()),
+            }]
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn agent_use_clear_removes_the_selection() -> TestResult {
+        let (ctx, root, recorder) = use_context()?;
+        let result = super::agent(&ctx, use_args(Some("--clear"))).await;
+        std::fs::remove_dir_all(root).map_err(ctx_err("remove test workspace"))?;
+        let output = result.map_err(|e| TestError::Unexpected(format!("{e:?}")))?;
+        assert!(
+            output.text.contains("gilt ab nächster Sitzung"),
+            "{}",
+            output.text
+        );
+        assert_eq!(
+            recorder.calls(),
+            vec![RecordedSelectionPersistCall::ActiveAgent { name: None }]
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn agent_use_rejects_unknown_missing_and_non_root_agents() -> TestResult {
+        let (ctx, root, recorder) = use_context()?;
+        let unknown = super::agent(&ctx, use_args(Some("gibt-es-nicht"))).await;
+        let missing = super::agent(&ctx, use_args(None)).await;
+        let non_root = super::agent(&ctx, use_args(Some(UIA_WORKER))).await;
+        std::fs::remove_dir_all(root).map_err(ctx_err("remove test workspace"))?;
+
+        assert!(
+            matches!(&unknown, Err(OpError::InvalidArguments(message))
+                if message.contains("Unbekannter Agent") && message.contains(ROOT_ORCHESTRATOR)),
+            "{unknown:?}"
+        );
+        assert!(
+            matches!(&missing, Err(OpError::InvalidArguments(message))
+                if message.contains("/agent use")),
+            "{missing:?}"
+        );
+        assert!(
+            matches!(&non_root, Err(OpError::InvalidArguments(message))
+                if message.contains("nicht als Wurzel")),
+            "{non_root:?}"
+        );
+        assert!(
+            recorder.calls().is_empty(),
+            "ungültige Namen dürfen nichts speichern"
+        );
         Ok(())
     }
 }

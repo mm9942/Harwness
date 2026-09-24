@@ -73,7 +73,7 @@ pub fn cited_channels(state: &GameState, args: &[RoundArgument]) -> BTreeSet<Str
 pub fn var_visible_to(visibility: &VarVisibility, seat: &Seat) -> bool {
     match (visibility, seat) {
         (VarVisibility::Public, _) | (_, Seat::Umpire) => true,
-        (VarVisibility::Umpire, Seat::Player(_)) => false,
+        (_, Seat::RedCell) | (VarVisibility::Umpire, Seat::Player(_)) => false,
         (VarVisibility::Seat(owner), Seat::Player(p)) => owner == p,
         (VarVisibility::Seats(owners), Seat::Player(p)) => owners.contains(p),
     }
@@ -122,7 +122,9 @@ pub fn visible_to(
         },
         (Audience::UmpireOnly | Audience::SeatAndUmpire(_), Seat::Umpire) => true,
         (Audience::Seat(q) | Audience::SeatAndUmpire(q), Seat::Player(p)) => p == q,
-        (Audience::UmpireOnly, Seat::Player(_))
+        // Die Red Cell sieht ausschließlich Öffentliches.
+        (_, Seat::RedCell)
+        | (Audience::UmpireOnly, Seat::Player(_))
         | (Audience::Seat(_), Seat::Umpire)
         | (Audience::ObserverOnly, _) => false,
     }

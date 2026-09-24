@@ -456,7 +456,9 @@ impl HarwnessBuilder {
         };
         let (config, _trust) =
             harw_runtime::load_config(&spec_inputs.spec()).map_err(SdkError::from_runtime)?;
-        if config.harness.active_uia_definition.is_none() {
+        // Ein explizit gewählter Agent ersetzt die UIA als Wurzel; nur ohne ihn
+        // ist eine aktive UIA Pflicht.
+        if spec_inputs.agent.is_none() && config.harness.active_uia_definition.is_none() {
             return Err(SdkError::Config {
                 detail: "no active UIA is configured (harness.active_uia_definition); \
                          run `harw` once interactively or set it in the profile config"
