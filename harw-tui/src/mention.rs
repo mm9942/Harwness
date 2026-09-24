@@ -37,6 +37,7 @@ use std::path::{Component, Path, PathBuf};
 // ---------------------------------------------------------------------------
 
 /// Ergebnis der Klassifikation eines `@`-Tokens.
+#[cfg_attr(not(test), allow(dead_code))]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum MentionTarget {
     /// Eine reguläre Datei im Projekt; enthält den **kanonischen** absoluten
@@ -97,6 +98,7 @@ pub(crate) struct ExpandedChat {
 /// aufgelöst und nur dann als [`MentionTarget::File`] gemeldet, wenn alle
 /// Sicherheitsregeln (Wurzel, Sperrliste, reguläre Datei) erfüllt sind.
 /// Größe und Inhalt prüft erst [`expand_file_mentions`].
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn classify_mention(token: &str, root: &Path, roles: &[&str]) -> MentionTarget {
     let token = token.strip_prefix('@').unwrap_or(token);
     if token.is_empty() {

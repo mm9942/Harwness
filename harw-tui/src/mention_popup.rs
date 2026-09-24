@@ -118,11 +118,6 @@ impl MentionPopup {
         popup
     }
 
-    /// Aktueller Suchtext.
-    pub(crate) fn query(&self) -> &str {
-        &self.query
-    }
-
     /// Filtert die Kandidaten nach `query` (case-insensitive, Unicode).
     ///
     /// # Beschreibung

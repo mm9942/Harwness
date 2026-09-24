@@ -159,6 +159,7 @@ impl KnowledgeBrowser {
     }
 
     /// Angezeigte Quelle.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn kind(&self) -> KnowledgeKind {
         self.kind
     }

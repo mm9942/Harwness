@@ -149,6 +149,7 @@ impl ModePicker {
 
     /// Öffnet direkt im angegebenen Abschnitt.
     #[must_use]
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn with_section(mut self, section: ModeSection) -> Self {
         self.section = section;
         self
@@ -156,6 +157,7 @@ impl ModePicker {
 
     /// Aktiver Abschnitt.
     #[must_use]
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn section(&self) -> ModeSection {
         self.section
     }

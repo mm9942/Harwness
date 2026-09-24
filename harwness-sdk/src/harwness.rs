@@ -106,6 +106,10 @@ impl SpecInputs {
             mode_override: self.mode.map(Mode::to_core),
             active_agent: self.agent.clone(),
             reasoning_effort: self.reasoning_effort.map(ReasoningEffort::to_core),
+            // Freigabe und Modell setzt das SDK über seine eigenen Wege
+            // (ApprovalPolicy bzw. Builder-Overrides), nicht über die Spec.
+            approval_override: None,
+            model_override: None,
         }
     }
 }

@@ -284,6 +284,7 @@ impl HelpOverlay {
 
     /// Aktiver Reiter.
     #[must_use]
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn tab(&self) -> HelpTab {
         self.tab
     }
