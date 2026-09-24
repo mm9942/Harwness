@@ -1715,6 +1715,91 @@ fn telegram_offset_root(channel_state: &Path, binding_id: &str) -> PathBuf {
     legacy.join(encoded)
 }
 
+/// Gültigkeit der Freigabe-Schaltflächen (Approval-Tokens) und Obergrenze
+/// der Wartezeit geparkter Turn-Freigaben.
+const TELEGRAM_APPROVAL_TTL: SignedDuration = SignedDuration::from_secs(24 * 60 * 60);
+
+/// Höchstzahl gleichzeitig laufender Chat-Sitzungen je Bindung.
+const TELEGRAM_MAX_PARALLEL_SESSIONS: usize = 4;
+
+/// Hex-Kodierung einer Bindungs-ID: kollisionsfrei und dateisystemsicher.
+fn telegram_binding_dir_name(binding_id: &str) -> String {
+    binding_id
+        .bytes()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>()
+}
+
+/// Chat-Zustand (Workspace-Wahl, Sitzungsgeneration) einer Bindung:
+/// `<channel-state>/telegram-chats/<hex(binding id)>`.
+fn telegram_chat_state_root(channel_state: &Path, binding_id: &str) -> PathBuf {
+    channel_state
+        .join("telegram-chats")
+        .join(telegram_binding_dir_name(binding_id))
+}
+
+/// Über Transport-Neustarts hinweg stabile Dienste einer Telegram-Bindung.
+struct TelegramBindingServices {
+    /// Autoritative Workspace-Auflösung aus `binding.workspaces`.
+    workspaces: Arc<harw_authority::WorkspaceRegistry>,
+    /// Chat-Zustand; geteilt von Befehlsverarbeitung und Sitzungs-Dispatcher.
+    chat_state: Arc<ChatStateStore>,
+    /// Telegram-User-IDs aus `security.admin_identities`.
+    admin_sender_ids: HashSet<String>,
+    unknown_command_fallback: UnknownCommandFallback,
+    /// Alias des Workspaces mit `default = true`, falls vorhanden.
+    default_workspace_alias: Option<String>,
+}
+
+/// Baut die bindungsbezogenen Dienste aus der Konfiguration.
+///
+/// # Errors
+/// Eine deutsche Begründung (ohne Geheimnisse), wenn die Workspace-Registry
+/// nicht gebaut werden kann (Wurzel fehlt, liegt außerhalb des Harness-Homes,
+/// doppelte Registrierung) oder `commands.unknown_command_fallback`
+/// unbekannt ist. Die Bindung bleibt dann fail-closed deaktiviert.
+fn telegram_binding_services(
+    home: &Path,
+    binding: &TelegramChannelToml,
+    profile: &Path,
+) -> Result<TelegramBindingServices, String> {
+    let registrations = binding
+        .workspaces
+        .iter()
+        .map(|workspace| harw_authority::WorkspaceRegistration {
+            tenant: TenantId::from_str(workspace.tenant.trim()),
+            workspace: WorkspaceId::from_str(workspace.alias.trim()),
+            root: PathBuf::from(workspace.root.trim()),
+        })
+        .collect::<Vec<_>>();
+    let workspaces = harw_authority::WorkspaceRegistry::build(home, registrations)
+        .map_err(|error| format!("Arbeitsbereiche nicht auflösbar: {error}"))?;
+    let unknown_command_fallback =
+        UnknownCommandFallback::parse(&binding.commands.unknown_command_fallback)?;
+    let default_workspace_alias = binding
+        .workspaces
+        .iter()
+        .find(|workspace| workspace.default)
+        .map(|workspace| workspace.alias.trim().to_owned());
+    let admin_sender_ids = binding
+        .security
+        .admin_identities
+        .iter()
+        .map(ToString::to_string)
+        .collect::<HashSet<_>>();
+    let chat_state = Arc::new(ChatStateStore::new(&telegram_chat_state_root(
+        &profile.join("channel-state"),
+        &binding.id,
+    )));
+    Ok(TelegramBindingServices {
+        workspaces: Arc::new(workspaces),
+        chat_state,
+        admin_sender_ids,
+        unknown_command_fallback,
+        default_workspace_alias,
+    })
+}
+
 /// Startet Admission, Runtime-Handoff und Transport einer Bindung.
 ///
 /// # Description
