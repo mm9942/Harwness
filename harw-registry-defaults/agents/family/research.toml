@@ -35,11 +35,13 @@ invariants = [
   "findings_carry_sources",
 ]
 
-# Der Analyst ist die einzige eingebaute Rolle mit `max_depth = 2`: nur er darf
-# read-only Kinder starten und deren Rückgaben verdichten. Damit ist er der
-# einzige Kandidat für die Leader-Position eines Research-Clans.
+# `research-orchestrator` ist der eingebaute Child-Orchestrator
+# (`role = "child-orchestrator"`) und Leader des Research-Clans der
+# Default-Organisation. `analyst` bleibt als verdichtender Worker mit
+# `max_depth = 2` zugelassen (Rückwärtskompatibilität für lokale
+# Organisationen, die ihn als Leader nennen).
 [orchestrators]
-allowed = ["harwness.agent.analyst@1"]
+allowed = ["harwness.agent.research-orchestrator@1", "harwness.agent.analyst@1"]
 
 # Die drei read-only Rechercheure. `explorer` liest Workspace und
 # Dependency-Quellen, `researcher-deps` belegt Dependency-Verhalten aus

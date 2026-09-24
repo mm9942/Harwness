@@ -1,0 +1,96 @@
+# Eingebauter Child-Orchestrator der Recherche-Spur (Sub-Orchestrator, Plan
+# Punkt 1; `agent-definition-dsl.md` §11.1, `docs/design/
+# delegation-capabilities.md`).
+#
+# Führt den Clan `research` der Default-Organisation (Zelle `research-wave`,
+# `fanout`/`all-terminal`): startet read-only Rechercheure nebeneinander und
+# verdichtet deren belegte Funde zu EINER ReturnEnvelope an den
+# Root-Orchestrator. Die eigentliche Verdichtung eines Einzelthemas kann er an
+# `analyst` delegieren.
+#
+# ── Rechte ──────────────────────────────────────────────────────────────────
+# Werkzeugoberfläche wie `root-orchestrator` (`RegistryProfile::Planning`,
+# read-only, KEIN eigenes `web.*`) plus `delegate_wave` (Composition-Root,
+# siehe `profile::composition_tools_for_role`).
+#
+# Reducer `ReadExplore` statt `ReadRegistry` (siehe
+# `authority::authority_reducer_for_role`): dieser Orchestrator startet
+# `researcher-web`/`researcher`/`dependency-researcher`, und deren Sandbox ist
+# immer eine Teilmenge SEINER Sandbox. Ohne `NetworkAccess` im eigenen
+# Rechtesatz bekämen seine Netz-Rechercheure nie Netz. Er selbst führt kein
+# Netz-Werkzeug (`web.*` in `forbidden`, `Planning` registriert keins) — das
+# Recht ist reine, egress-gebundene Durchreichung.
+#
+# ── Tiefe / Budget ──────────────────────────────────────────────────────────
+# `max_depth = 1` (nur Worker darunter); Budget unter dem des
+# `root-orchestrator` (monoton).
+
+schema = "harwness.agent/v1"
+id = "harwness.agent.research-orchestrator@1"
+version = "1.0.0"
+role = "child-orchestrator"
+specialization = "research-orchestrator"
+
+name = "Research Orchestrator"
+description = "Fächert einen Recherche-Teilauftrag auf read-only Rechercheure auf, prüft deren belegte Funde und liefert dem Root-Orchestrator eine verdichtete ReturnEnvelope."
+
+[work]
+mode = "orchestration"
+may_change_plan = false
+may_write_code = false
+may_research_web = false
+aggregates_child_returns = true
+
+[lifecycle]
+allow_pause = false
+allow_rerun = true
+max_attempts = 2
+
+[context]
+must_include = ["task.objective", "task.read_scope", "new.trigger_return"]
+exclude = ["full_parent_transcript", "sibling_transcripts"]
+
+[tools]
+admitted = [
+  "fs.read",
+  "fs.list",
+  "fs.search",
+  "fs.glob",
+  "fs.grep",
+  "doc.read_pdf",
+  "deps.graph",
+  "deps.locked",
+  "deps.source_read",
+  "deps.source_search",
+  "deps.source_list",
+  "lens.ask",
+  "explore.tree",
+  "explore.projects",
+  "explore.relations",
+  "explore.find",
+  "delegate_wave",
+]
+forbidden = ["fs.write", "shell.exec", "web.fetch", "web.search", "web.docs_rs", "web.crates_io"]
+
+# Zugelassene Delegationsziele (siehe `coding-orchestrator.toml`).
+[delegation]
+targets = [
+  "explorer",
+  "researcher",
+  "researcher-deps",
+  "dependency-researcher",
+  "researcher-web",
+  "analyst",
+]
+
+[spawn]
+max_depth = 1
+child_orchestrators = []
+
+[spawn.budget]
+max_tokens = 100000
+max_tool_calls = 70
+max_wall_secs = 900
+
+[return]
+contract = "harwness.return.envelope@1"

@@ -1,33 +1,51 @@
-//! Typed board, lane, and card state, plus their durable persistence (§1.2,
-//! §6.1). Lifecycle execution (the §6.3 transitions and §6.4 gates) lives in
-//! [`crate::kanban::lifecycle`]; this module owns only the data shapes and
-//! how they round-trip through [`crate::store::KnowledgeStore`] — `Board`
-//! metadata (plus its full `Lane` records) as `kanban/boards/<board-id>/
-//! board.toml`, and each `Card` as a `KnowledgeArtifact` of kind
-//! [`crate::artifact::ArtifactKind::KanbanCard`] at
-//! `kanban/boards/<board-id>/cards/<card-id>.md` — frontmatter for the
-//! structured fields, markdown body for the card's free-form description,
-//! exactly the split `diary.rs` already uses for its day files.
+//! Typed board, lane and card model plus durable persistence (§1.2, §6.1).
 //!
-//! # Warum die kartenspezifischen Felder in `frontmatter.extra` liegen
-//! `Frontmatter` (§1.2) ist bewusst *ein* Schema für jede Surface dieser
-//! Crate; ein card-eigenes Frontmatter-Schema daneben würde diese Garantie
-//! brechen. Wie `diary.rs`s `entry_count`/`date` landen `title`, `lane_id`,
-//! `state`, `work_id`, `parents`, `assignee` und `retry_count` deshalb im
-//! `extra`-Escape-Hatch — der Body bleibt reiner Freitext (`Card::body`).
+//! # Karte = Sicht über den Job-Zustand (§6.3)
+//! „The card is a view over `WorkId` state plus kanban-specific fields
+//! (`title`, `body`, `parents`), never an independent source of truth that
+//! could drift from the job ledger." Dieses Modul setzt genau das um:
+//! - [`CardRecord`] ist das, was **gespeichert** wird: Id, Lane, `title`,
+//!   `body`, `parents`, `tags`, Sichtbarkeit und die Bindung `work_id`. Kein
+//!   Zustand, kein Halter, kein Retry-Zähler.
+//! - [`Card`] ist die **Sicht**: ein [`CardRecord`] plus der aus dem
+//!   Job-Ledger abgeleitete [`CardState`], Halter (`assignee`) und
+//!   `retry_count` (= `attempts` des Jobs). Erzeugt wird sie nur über
+//!   [`CardRecord::view`] aus einem [`JobSnapshot`].
+//!
+//! Zustandsableitung ([`CardRecord::view`]):
+//! 1. Trägt die Karte das Tag [`ARCHIVED_TAG`] → `Archived` (Archivieren ist
+//!    ein Board-Konzept, kein Job-Zustand; siehe [`CardState::from_job_state`]).
+//! 2. Ohne `work_id` → `Triage` (noch keine Arbeit im Governance-Sinn).
+//! 3. Mit `work_id` → [`CardState::from_job_state`] über den Snapshot.
+//! 4. Mit `work_id`, aber ohne Snapshot → Fehler: die Karte zeigt nie einen
+//!    Zustand, dem das Ledger widerspricht — auch keinen geratenen.
+//!
+//! # Persistenz
+//! `Board` samt `Lane`s als `kanban/boards/<board-id>/board.toml`, jede Karte
+//! als `KnowledgeArtifact` der Art [`ArtifactKind::KanbanCard`] unter
+//! `kanban/boards/<board-id>/cards/<card-id>.md`. Die kartenspezifischen
+//! Felder liegen im `frontmatter.extra`-Escape-Hatch (ein Frontmatter-Schema
+//! für jede Surface, §1.2); `tags`/`visibility` in den kanonischen Feldern,
+//! der Body ist reiner Freitext. Ältere Dateien mit `state`/`assignee`/
+//! `retry_count` im `extra` werden gelesen (die Felder ignoriert) und beim
+//! nächsten [`save_card`] bereinigt.
 
 use serde::{Deserialize, Serialize};
 
-use harw_job_runtime::WorkId;
+use harw_job_runtime::{JobState, WorkId};
 
 use crate::artifact::{ArtifactId, ArtifactKind, Frontmatter, KnowledgeArtifact};
 use crate::error::{KnowledgeError, KnowledgeResult};
+use crate::kanban::lifecycle::JobTransitions;
 use crate::store::KnowledgeStore;
 use crate::visibility::{AgentId, AgentRoleRef, VisibilityScope};
 
 id_newtype!(BoardId);
 id_newtype!(LaneId);
 id_newtype!(CardId);
+
+/// Tag, das eine Karte als archiviert markiert (Board-Konzept, §6.3 archive).
+pub const ARCHIVED_TAG: &str = "archived";
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum LaneKind {
@@ -47,6 +65,60 @@ pub enum CardState {
     Archived,
 }
 
+impl CardState {
+    /// Leitet den Kartenzustand aus dem Job-Zustand ab (§6.3).
+    ///
+    /// # Beschreibung
+    /// | `JobState` | `CardState` |
+    /// |---|---|
+    /// | `Pending` | `Todo` |
+    /// | `Ready` | `Ready` |
+    /// | `Running` | `Running` |
+    /// | `Completed` | `Done` |
+    /// | `Blocked` | `Blocked { block_reason \|\| Dependency }` |
+    /// | `Failed` | `Blocked { block_reason \|\| Transient }` |
+    /// | `Cancelled` | `Archived` |
+    ///
+    /// `Failed` (Retries erschöpft) wird als blockiert gezeigt, weil beide
+    /// Folge-Pfeile aus §6.3 passen: `unblock` (erneut versuchen) oder
+    /// `archive` (aufgeben).
+    ///
+    /// # Argumente
+    /// - `state` ([`JobState`]): Zustand laut Ledger.
+    /// - `block_reason` (`Option<BlockKind>`): vom Ledger mitgeführter Grund
+    ///   eines `Blocked`/`Failed`-Jobs, falls bekannt.
+    #[must_use]
+    pub fn from_job_state(state: JobState, block_reason: Option<BlockKind>) -> Self {
+        match state {
+            JobState::Pending => Self::Todo,
+            JobState::Ready => Self::Ready,
+            JobState::Running => Self::Running,
+            JobState::Completed => Self::Done,
+            JobState::Blocked => Self::Blocked {
+                reason_kind: block_reason.unwrap_or(BlockKind::Dependency),
+            },
+            JobState::Failed => Self::Blocked {
+                reason_kind: block_reason.unwrap_or(BlockKind::Transient),
+            },
+            JobState::Cancelled => Self::Archived,
+        }
+    }
+
+    /// Kurze, stabile Bezeichnung (Spaltenname, Fehlermeldungen).
+    #[must_use]
+    pub const fn label(&self) -> &'static str {
+        match self {
+            Self::Triage => "triage",
+            Self::Todo => "todo",
+            Self::Ready => "ready",
+            Self::Running => "running",
+            Self::Blocked { .. } => "blocked",
+            Self::Done => "done",
+            Self::Archived => "archived",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum BlockKind {
@@ -55,6 +127,37 @@ pub enum BlockKind {
     Capability,
     Transient,
     ReviewRequired,
+}
+
+impl BlockKind {
+    /// Alle Varianten in stabiler Reihenfolge.
+    pub const ALL: [Self; 5] = [
+        Self::Dependency,
+        Self::NeedsInput,
+        Self::Capability,
+        Self::Transient,
+        Self::ReviewRequired,
+    ];
+
+    /// Bezeichnung in der Kommandogrammatik (`--reason=`).
+    #[must_use]
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Dependency => "Dependency",
+            Self::NeedsInput => "NeedsInput",
+            Self::Capability => "Capability",
+            Self::Transient => "Transient",
+            Self::ReviewRequired => "ReviewRequired",
+        }
+    }
+
+    /// Umkehrung von [`Self::label`], ohne Groß-/Kleinschreibung.
+    #[must_use]
+    pub fn parse(raw: &str) -> Option<Self> {
+        Self::ALL
+            .into_iter()
+            .find(|kind| kind.label().eq_ignore_ascii_case(raw.trim()))
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -73,6 +176,120 @@ pub struct Lane {
     pub bound_worker: Option<AgentId>,
 }
 
+/// Was von einer Karte gespeichert wird — ausschließlich Kanban-Felder plus
+/// die `work_id`-Bindung, nie ein Zustand (siehe Moduldoku).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CardRecord {
+    pub id: CardId,
+    pub lane_id: LaneId,
+    pub title: String,
+    pub body: String,
+    /// Bindung an den Job im Ledger; `None` solange die Karte in Triage ist.
+    pub work_id: Option<WorkId>,
+    pub parents: Vec<CardId>,
+    pub tags: Vec<String>,
+    pub visibility: VisibilityScope,
+}
+
+/// Was das Job-Ledger über den gebundenen Job einer Karte weiß.
+///
+/// # Beschreibung
+/// Wird von [`JobTransitions::snapshot`] geliefert; ein Adapter über
+/// `harw-job-runtime` füllt `state`/`attempts` aus dem `Job`, `holder` aus
+/// dem aktiven `Lease` und `block_reason` aus seiner eigenen Buchführung
+/// (der `JobState` selbst trägt keinen Grund).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct JobSnapshot {
+    /// Zustand laut Ledger.
+    pub state: JobState,
+    /// Aktueller Lease-Halter, falls der Job läuft.
+    pub holder: Option<AgentId>,
+    /// Anzahl bisheriger Fehlversuche/Reclaims.
+    pub attempts: u32,
+    /// Grund eines `Blocked`/`Failed`-Jobs, falls bekannt.
+    pub block_reason: Option<BlockKind>,
+}
+
+impl JobSnapshot {
+    /// Snapshot eines frischen Jobs im Zustand `state`.
+    #[must_use]
+    pub fn new(state: JobState) -> Self {
+        Self {
+            state,
+            holder: None,
+            attempts: 0,
+            block_reason: None,
+        }
+    }
+}
+
+impl CardRecord {
+    /// `true`, wenn die Karte das Tag [`ARCHIVED_TAG`] trägt.
+    #[must_use]
+    pub fn is_archived(&self) -> bool {
+        self.tags.iter().any(|tag| tag == ARCHIVED_TAG)
+    }
+
+    /// Baut die Sicht aus diesem Datensatz und dem Ledger-Snapshot.
+    ///
+    /// # Argumente
+    /// - `job` (`Option<&JobSnapshot>`): Snapshot des gebundenen Jobs; muss
+    ///   `Some` sein, wenn `work_id` gesetzt ist.
+    ///
+    /// # Fehler
+    /// [`KnowledgeError::ArtifactNotFound`], wenn `work_id` gesetzt ist, das
+    /// Ledger den Job aber nicht kennt — die Karte zeigt dann keinen Zustand.
+    pub fn view(&self, job: Option<&JobSnapshot>) -> KnowledgeResult<Card> {
+        let (state, assignee, retry_count) = match (&self.work_id, job) {
+            (None, _) => (CardState::Triage, None, 0),
+            (Some(_), Some(job)) => (
+                CardState::from_job_state(job.state, job.block_reason),
+                job.holder.clone(),
+                job.attempts,
+            ),
+            (Some(work_id), None) => {
+                return Err(KnowledgeError::ArtifactNotFound(format!(
+                    "job {work_id} of card {}",
+                    self.id
+                )));
+            }
+        };
+        let state = if self.is_archived() {
+            CardState::Archived
+        } else {
+            state
+        };
+        Ok(Card {
+            id: self.id.clone(),
+            lane_id: self.lane_id.clone(),
+            title: self.title.clone(),
+            body: self.body.clone(),
+            work_id: self.work_id.clone(),
+            state,
+            parents: self.parents.clone(),
+            assignee,
+            tags: self.tags.clone(),
+            visibility: self.visibility.clone(),
+            retry_count,
+        })
+    }
+
+    /// Wie [`Self::view`], liest den Snapshot aber selbst über `jobs`.
+    ///
+    /// # Fehler
+    /// Wie [`Self::view`], plus jeder Fehler aus [`JobTransitions::snapshot`].
+    pub fn view_with(&self, jobs: &dyn JobTransitions) -> KnowledgeResult<Card> {
+        let snapshot = match &self.work_id {
+            Some(work_id) => jobs.snapshot(work_id)?,
+            None => None,
+        };
+        self.view(snapshot.as_ref())
+    }
+}
+
+/// Die Sicht auf eine Karte: gespeicherte Kanban-Felder plus der aus dem
+/// Job-Ledger abgeleitete Zustand. Nie direkt persistiert — siehe
+/// [`Card::record`].
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Card {
     pub id: CardId,
@@ -80,15 +297,14 @@ pub struct Card {
     pub title: String,
     pub body: String,
     pub work_id: Option<WorkId>,
+    /// Abgeleitet (siehe [`CardRecord::view`]).
     pub state: CardState,
     pub parents: Vec<CardId>,
+    /// Abgeleitet: aktueller Lease-Halter laut Ledger.
     pub assignee: Option<AgentId>,
     pub tags: Vec<String>,
     pub visibility: VisibilityScope,
-    /// How many times [`crate::kanban::lifecycle::reclaim`] has moved this
-    /// card back from `Running` to `Ready` after a dead/timed-out holder
-    /// (§6.3 "reclaim: dead/timeout ... [retry-counted]"). Zero for a card
-    /// that has never been reclaimed.
+    /// Abgeleitet: `attempts` des gebundenen Jobs (§6.3 "retry-counted").
     pub retry_count: u32,
 }
 
@@ -97,6 +313,21 @@ impl Card {
     #[must_use]
     pub fn is_terminal(&self) -> bool {
         matches!(self.state, CardState::Done | CardState::Archived)
+    }
+
+    /// Der speicherbare Teil dieser Sicht (ohne abgeleitete Felder).
+    #[must_use]
+    pub fn record(&self) -> CardRecord {
+        CardRecord {
+            id: self.id.clone(),
+            lane_id: self.lane_id.clone(),
+            title: self.title.clone(),
+            body: self.body.clone(),
+            work_id: self.work_id.clone(),
+            parents: self.parents.clone(),
+            tags: self.tags.clone(),
+            visibility: self.visibility.clone(),
+        }
     }
 }
 
@@ -266,86 +497,76 @@ fn kanban_card_artifact_id(board_id: &BoardId, card_id: &CardId) -> ArtifactId {
     ))
 }
 
-/// Frontmatter-`extra`-Schlüssel, unter denen `save_card`/`card_from_artifact`
+/// Frontmatter-`extra`-Schlüssel, unter denen `save_card`/`record_from_artifact`
 /// die kartenspezifischen Felder ablegen bzw. wiederfinden (siehe Moduldoku).
 const TITLE_KEY: &str = "title";
 const LANE_ID_KEY: &str = "lane_id";
-const STATE_KEY: &str = "state";
 const WORK_ID_KEY: &str = "work_id";
 const PARENTS_KEY: &str = "parents";
-const ASSIGNEE_KEY: &str = "assignee";
-const RETRY_COUNT_KEY: &str = "retry_count";
 
-/// Persist `card` as a `KanbanCard` [`KnowledgeArtifact`] at
-/// `kanban/boards/<board_id>/cards/<card.id>.md`.
+/// Abgeleitete Felder früherer Fassungen; werden beim Speichern entfernt,
+/// damit keine veraltete Zweitwahrheit neben dem Ledger liegen bleibt.
+const LEGACY_DERIVED_KEYS: [&str; 3] = ["state", "assignee", "retry_count"];
+
+/// Persistiert einen [`CardRecord`] als `KanbanCard`-[`KnowledgeArtifact`]
+/// unter `kanban/boards/<board_id>/cards/<record.id>.md`.
 ///
 /// # Beschreibung
-/// Liest zunächst eine bestehende Kartendatei (falls vorhanden), um deren
-/// `created_at`/`author_agent_id` zu erhalten — dieselbe Read-Modify-Write-
-/// Konvention, die [`crate::diary::append`] für Tagesdateien nutzt. Für eine
-/// neue Karte wird `author_agent_id` frisch mit `now` gesetzt. Die
-/// kartenspezifischen Felder (`title`, `lane_id`, `state`, `work_id`,
-/// `parents`, `assignee`, `retry_count`) werden in `frontmatter.extra`
-/// geschrieben; `card.tags`/`card.visibility` landen in den entsprechenden
-/// Frontmatter-Feldern; `card.body` wird unverändert als Markdown-Body
-/// übernommen. Geschrieben wird ausschließlich über
-/// [`crate::store::KnowledgeStore::write_artifact`] (atomar).
-///
-/// # Argumente
-/// - `store` (`&KnowledgeStore`): der Wissensspeicher.
-/// - `board_id` (`&BoardId`): das Board, dem die Karte gehört.
-/// - `card` (`&Card`): der zu persistierende Kartenzustand.
-/// - `author_agent_id` (`&AgentId`): Autor, falls die Karte neu angelegt wird
-///   (bei einer bestehenden Karte bleibt der ursprüngliche Autor erhalten).
-/// - `now` (`jiff::Timestamp`): Zeitstempel für `created_at`/`updated_at`.
+/// Read-Modify-Write wie [`crate::diary::append`]: `created_at`/Autor einer
+/// bestehenden Datei bleiben erhalten; für eine neue Karte wird
+/// `author_agent_id` mit `now` gesetzt. Geschrieben werden nur `title`,
+/// `lane_id`, `work_id`, `parents` (im `extra`), `tags`/`visibility` (in den
+/// kanonischen Feldern) und der Body — nie ein Zustand. Atomar über
+/// [`KnowledgeStore::write_artifact`].
 ///
 /// # Rückgabe
-/// Das vollständige, geschriebene [`KnowledgeArtifact`].
+/// Das geschriebene [`KnowledgeArtifact`].
 ///
 /// # Fehler
-/// - [`KnowledgeError::Io`]\: Lese-/Schreib-/Rename-Fehler.
+/// - [`KnowledgeError::Io`]: unsichere Board-/Karten-Id oder Lese-/Schreibfehler.
 /// - [`KnowledgeError::Frontmatter`]/[`KnowledgeError::MalformedFrontmatter`]:
 ///   eine bestehende Kartendatei ließ sich nicht parsen.
-/// - [`KnowledgeError::Json`]: `card.state` ließ sich nicht als JSON kodieren
-///   (bei den vorhandenen `CardState`-Varianten praktisch ausgeschlossen).
 ///
 /// # Nebenläufigkeit
-/// Kein eigenes Locking; parallele `save_card`-Aufrufe für dieselbe Karte
-/// muss der Aufrufer serialisieren.
+/// Kein eigenes Locking; parallele Aufrufe für dieselbe Karte serialisiert
+/// der Aufrufer.
 pub fn save_card(
     store: &KnowledgeStore,
     board_id: &BoardId,
-    card: &Card,
+    record: &CardRecord,
     author_agent_id: &AgentId,
     now: jiff::Timestamp,
 ) -> KnowledgeResult<KnowledgeArtifact> {
-    let path = store.kanban_card_path(board_id.as_str(), card.id.as_str());
-    let id = kanban_card_artifact_id(board_id, &card.id);
+    ensure_component(board_id.as_str())?;
+    ensure_component(record.id.as_str())?;
+    let path = store.kanban_card_path(board_id.as_str(), record.id.as_str());
+    let id = kanban_card_artifact_id(board_id, &record.id);
 
     let mut frontmatter = if path.is_file() {
         store
             .read_artifact(&path, id.clone(), ArtifactKind::KanbanCard)?
             .frontmatter
     } else {
-        Frontmatter::new(author_agent_id.clone(), card.visibility.clone(), now)
+        Frontmatter::new(author_agent_id.clone(), record.visibility.clone(), now)
     };
     frontmatter.touch(now);
-    frontmatter.visibility = card.visibility.clone();
-    frontmatter.tags = card.tags.clone();
+    frontmatter.visibility = record.visibility.clone();
+    frontmatter.tags = record.tags.clone();
+    for key in LEGACY_DERIVED_KEYS {
+        frontmatter.extra.remove(key);
+    }
     frontmatter.extra.insert(
         TITLE_KEY.to_owned(),
-        serde_json::Value::String(card.title.clone()),
+        serde_json::Value::String(record.title.clone()),
     );
     frontmatter.extra.insert(
         LANE_ID_KEY.to_owned(),
-        serde_json::Value::String(card.lane_id.as_str().to_owned()),
+        serde_json::Value::String(record.lane_id.as_str().to_owned()),
     );
-    frontmatter
-        .extra
-        .insert(STATE_KEY.to_owned(), serde_json::to_value(card.state)?);
     frontmatter.extra.insert(
         WORK_ID_KEY.to_owned(),
-        card.work_id
+        record
+            .work_id
             .as_ref()
             .map_or(serde_json::Value::Null, |work_id| {
                 serde_json::Value::String(work_id.as_str().to_owned())
@@ -354,65 +575,73 @@ pub fn save_card(
     frontmatter.extra.insert(
         PARENTS_KEY.to_owned(),
         serde_json::Value::Array(
-            card.parents
+            record
+                .parents
                 .iter()
                 .map(|parent| serde_json::Value::String(parent.as_str().to_owned()))
                 .collect(),
         ),
     );
-    frontmatter.extra.insert(
-        ASSIGNEE_KEY.to_owned(),
-        card.assignee
-            .as_ref()
-            .map_or(serde_json::Value::Null, |assignee| {
-                serde_json::Value::String(assignee.as_str().to_owned())
-            }),
-    );
-    frontmatter.extra.insert(
-        RETRY_COUNT_KEY.to_owned(),
-        serde_json::Value::from(card.retry_count),
-    );
 
-    let artifact =
-        KnowledgeArtifact::new(id, ArtifactKind::KanbanCard, frontmatter, card.body.clone());
+    let artifact = KnowledgeArtifact::new(
+        id,
+        ArtifactKind::KanbanCard,
+        frontmatter,
+        record.body.clone(),
+    );
     store.write_artifact(&path, &artifact)?;
     Ok(artifact)
 }
 
-/// Read one card back from `kanban/boards/<board_id>/cards/<card_id>.md`.
+/// Liest den gespeicherten Datensatz einer Karte (ohne Ledger-Zugriff).
 ///
 /// # Fehler
-/// - [`KnowledgeError::Io`]: die Datei existiert nicht oder ist nicht lesbar.
+/// - [`KnowledgeError::Io`]: unsichere Id, Datei fehlt oder ist nicht lesbar.
 /// - [`KnowledgeError::Frontmatter`]/[`KnowledgeError::MalformedFrontmatter`]:
-///   ein kaputter Fence bzw. YAML-Fehler.
-/// - [`KnowledgeError::MalformedFrontmatter`]: ein von [`save_card`]
-///   geschriebenes `extra`-Feld fehlt oder hat den falschen Typ.
-/// - [`KnowledgeError::Json`]: `state` ließ sich nicht aus JSON dekodieren.
+///   kaputter Fence, YAML-Fehler oder fehlendes Pflichtfeld (`title`, `lane_id`).
+pub fn load_card_record(
+    store: &KnowledgeStore,
+    board_id: &BoardId,
+    card_id: &CardId,
+) -> KnowledgeResult<CardRecord> {
+    ensure_component(board_id.as_str())?;
+    ensure_component(card_id.as_str())?;
+    let path = store.kanban_card_path(board_id.as_str(), card_id.as_str());
+    let id = kanban_card_artifact_id(board_id, card_id);
+    let artifact = store.read_artifact(&path, id, ArtifactKind::KanbanCard)?;
+    record_from_artifact(card_id, &artifact)
+}
+
+/// Liest eine Karte als Sicht über den Ledger-Zustand.
+///
+/// # Fehler
+/// Wie [`load_card_record`] und [`CardRecord::view_with`].
 pub fn load_card(
     store: &KnowledgeStore,
     board_id: &BoardId,
     card_id: &CardId,
+    jobs: &dyn JobTransitions,
 ) -> KnowledgeResult<Card> {
-    let path = store.kanban_card_path(board_id.as_str(), card_id.as_str());
-    let id = kanban_card_artifact_id(board_id, card_id);
-    let artifact = store.read_artifact(&path, id, ArtifactKind::KanbanCard)?;
-    card_from_artifact(card_id, &artifact)
+    load_card_record(store, board_id, card_id)?.view_with(jobs)
 }
 
-/// List every card of a board, sorted by [`CardId`].
+/// Alle gespeicherten Karten-Datensätze eines Boards, nach [`CardId`] sortiert.
 ///
-/// A board with no `cards/` directory yet is a valid, empty result rather
-/// than an error (the board may simply have no cards yet).
+/// Ein Board ohne `cards/`-Verzeichnis ist ein gültiger, leerer Zustand.
 ///
 /// # Fehler
-/// [`KnowledgeError::Io`] auf einen Verzeichnis-/Lesefehler, sowie jeder
-/// Fehler, den [`load_card`] für eine einzelne Kartendatei liefern kann.
-pub fn list_cards(store: &KnowledgeStore, board_id: &BoardId) -> KnowledgeResult<Vec<Card>> {
+/// [`KnowledgeError::Io`] auf einen Verzeichnis-/Lesefehler sowie jeder
+/// Fehler aus [`load_card_record`].
+pub fn list_card_records(
+    store: &KnowledgeStore,
+    board_id: &BoardId,
+) -> KnowledgeResult<Vec<CardRecord>> {
+    ensure_component(board_id.as_str())?;
     let cards_dir = store.kanban_board_dir(board_id.as_str()).join("cards");
     if !cards_dir.is_dir() {
         return Ok(Vec::new());
     }
-    let mut cards = Vec::new();
+    let mut records = Vec::new();
     for entry in std::fs::read_dir(&cards_dir)? {
         let entry = entry?;
         let path = entry.path();
@@ -422,15 +651,63 @@ pub fn list_cards(store: &KnowledgeStore, board_id: &BoardId) -> KnowledgeResult
         let Some(stem) = path.file_stem().and_then(|stem| stem.to_str()) else {
             continue;
         };
-        cards.push(load_card(store, board_id, &CardId::new(stem))?);
+        records.push(load_card_record(store, board_id, &CardId::new(stem))?);
     }
-    cards.sort_by(|a, b| a.id.cmp(&b.id));
-    Ok(cards)
+    records.sort_by(|a, b| a.id.cmp(&b.id));
+    Ok(records)
 }
 
-/// Reconstruct a [`Card`] from a stored `KanbanCard` artifact (inverse of the
-/// `frontmatter.extra` half of [`save_card`]).
-fn card_from_artifact(card_id: &CardId, artifact: &KnowledgeArtifact) -> KnowledgeResult<Card> {
+/// Alle Karten eines Boards als Sicht über den Ledger-Zustand.
+///
+/// # Fehler
+/// Wie [`list_card_records`] und [`CardRecord::view_with`].
+pub fn list_cards(
+    store: &KnowledgeStore,
+    board_id: &BoardId,
+    jobs: &dyn JobTransitions,
+) -> KnowledgeResult<Vec<Card>> {
+    list_card_records(store, board_id)?
+        .iter()
+        .map(|record| record.view_with(jobs))
+        .collect()
+}
+
+/// Die nächste freie `card-<n>`-Id eines Boards (größtes vorhandenes `n` + 1).
+///
+/// # Fehler
+/// Wie [`list_card_records`].
+pub fn next_card_id(store: &KnowledgeStore, board_id: &BoardId) -> KnowledgeResult<CardId> {
+    let highest = list_card_records(store, board_id)?
+        .iter()
+        .filter_map(|record| record.id.as_str().strip_prefix("card-"))
+        .filter_map(|suffix| suffix.parse::<u64>().ok())
+        .max()
+        .unwrap_or(0);
+    Ok(CardId::new(format!("card-{}", highest.saturating_add(1))))
+}
+
+/// Lehnt Ids ab, die als Pfadkomponente unter dem Store-Root entkommen könnten.
+fn ensure_component(component: &str) -> KnowledgeResult<()> {
+    let unsafe_component = component.is_empty()
+        || component == "."
+        || component == ".."
+        || component
+            .chars()
+            .any(|c| c == '/' || c == '\\' || c.is_control());
+    if unsafe_component {
+        return Err(KnowledgeError::Io(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("unsafe kanban id: {component:?}"),
+        )));
+    }
+    Ok(())
+}
+
+/// Rekonstruiert einen [`CardRecord`] aus einem gespeicherten `KanbanCard`-Artefakt.
+fn record_from_artifact(
+    card_id: &CardId,
+    artifact: &KnowledgeArtifact,
+) -> KnowledgeResult<CardRecord> {
     let extra = &artifact.frontmatter.extra;
     let missing_field = |field: &str| KnowledgeError::MalformedFrontmatter {
         detail: format!(
@@ -448,10 +725,6 @@ fn card_from_artifact(card_id: &CardId, artifact: &KnowledgeArtifact) -> Knowled
         .get(LANE_ID_KEY)
         .and_then(serde_json::Value::as_str)
         .ok_or_else(|| missing_field(LANE_ID_KEY))?;
-    let state_value = extra
-        .get(STATE_KEY)
-        .ok_or_else(|| missing_field(STATE_KEY))?;
-    let state: CardState = serde_json::from_value(state_value.clone())?;
     let work_id = extra
         .get(WORK_ID_KEY)
         .and_then(serde_json::Value::as_str)
@@ -467,54 +740,24 @@ fn card_from_artifact(card_id: &CardId, artifact: &KnowledgeArtifact) -> Knowled
                 .collect()
         })
         .unwrap_or_default();
-    let assignee = extra
-        .get(ASSIGNEE_KEY)
-        .and_then(serde_json::Value::as_str)
-        .map(AgentId::new);
-    let retry_count = extra
-        .get(RETRY_COUNT_KEY)
-        .and_then(serde_json::Value::as_u64)
-        .unwrap_or(0)
-        .try_into()
-        .unwrap_or(u32::MAX);
 
-    Ok(Card {
+    Ok(CardRecord {
         id: card_id.clone(),
         lane_id: LaneId::new(lane_id),
         title,
         body: artifact.body.clone(),
         work_id,
-        state,
         parents,
-        assignee,
         tags: artifact.frontmatter.tags.clone(),
         visibility: artifact.frontmatter.visibility.clone(),
-        retry_count,
     })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::kanban::lifecycle::InMemoryJobTransitions;
     use crate::test_support::{TestError, TestResult};
-
-    #[test]
-    fn terminal_cards_are_done_or_archived_only() {
-        let card = Card {
-            id: CardId::new("card-1"),
-            lane_id: LaneId::new("done"),
-            title: "verify".to_owned(),
-            body: String::new(),
-            work_id: None,
-            state: CardState::Done,
-            parents: Vec::new(),
-            assignee: None,
-            tags: Vec::new(),
-            visibility: VisibilityScope::SelfOnly,
-            retry_count: 0,
-        };
-        assert!(card.is_terminal());
-    }
 
     fn temporary_root(label: &str) -> TestResult<std::path::PathBuf> {
         let nonce = std::time::SystemTime::now()
@@ -527,20 +770,102 @@ mod tests {
         Ok(root)
     }
 
-    fn sample_card(id: &str, lane: &str, state: CardState) -> Card {
-        Card {
+    fn sample_record(id: &str, lane: &str) -> CardRecord {
+        CardRecord {
             id: CardId::new(id),
             lane_id: LaneId::new(lane),
             title: "Implement kanban persistence".to_owned(),
             body: "Detailed description of the work.".to_owned(),
             work_id: None,
-            state,
             parents: Vec::new(),
-            assignee: None,
             tags: Vec::new(),
             visibility: VisibilityScope::SelfOnly,
-            retry_count: 0,
         }
+    }
+
+    #[test]
+    fn job_states_map_onto_card_states() {
+        assert_eq!(
+            CardState::from_job_state(JobState::Pending, None),
+            CardState::Todo
+        );
+        assert_eq!(
+            CardState::from_job_state(JobState::Ready, None),
+            CardState::Ready
+        );
+        assert_eq!(
+            CardState::from_job_state(JobState::Running, None),
+            CardState::Running
+        );
+        assert_eq!(
+            CardState::from_job_state(JobState::Completed, None),
+            CardState::Done
+        );
+        assert_eq!(
+            CardState::from_job_state(JobState::Blocked, Some(BlockKind::NeedsInput)),
+            CardState::Blocked {
+                reason_kind: BlockKind::NeedsInput
+            }
+        );
+        assert_eq!(
+            CardState::from_job_state(JobState::Failed, None),
+            CardState::Blocked {
+                reason_kind: BlockKind::Transient
+            }
+        );
+        assert_eq!(
+            CardState::from_job_state(JobState::Cancelled, None),
+            CardState::Archived
+        );
+    }
+
+    #[test]
+    fn a_card_without_work_is_triage_and_an_archived_tag_wins() -> TestResult {
+        let mut record = sample_record("card-1", "triage");
+        assert_eq!(record.view(None)?.state, CardState::Triage);
+        record.tags.push(ARCHIVED_TAG.to_owned());
+        assert_eq!(record.view(None)?.state, CardState::Archived);
+        Ok(())
+    }
+
+    #[test]
+    fn a_bound_card_without_a_ledger_entry_has_no_state() -> TestResult {
+        let mut record = sample_record("card-1", "todo");
+        record.work_id = Some(WorkId::from_str("work-1"));
+        let Err(error) = record.view(None) else {
+            return Err(TestError::Unexpected(
+                "a bound card must never guess its state".to_owned(),
+            ));
+        };
+        assert!(matches!(error, KnowledgeError::ArtifactNotFound(_)));
+        Ok(())
+    }
+
+    #[test]
+    fn the_view_takes_state_holder_and_attempts_from_the_ledger() -> TestResult {
+        let mut record = sample_record("card-1", "worker/coding");
+        record.work_id = Some(WorkId::from_str("work-1"));
+        let snapshot = JobSnapshot {
+            state: JobState::Running,
+            holder: Some(AgentId::new("worker-1")),
+            attempts: 2,
+            block_reason: None,
+        };
+        let card = record.view(Some(&snapshot))?;
+        assert_eq!(card.state, CardState::Running);
+        assert_eq!(card.assignee, Some(AgentId::new("worker-1")));
+        assert_eq!(card.retry_count, 2);
+        assert_eq!(card.record(), record);
+        Ok(())
+    }
+
+    #[test]
+    fn block_kind_labels_round_trip() {
+        for kind in BlockKind::ALL {
+            assert_eq!(BlockKind::parse(kind.label()), Some(kind));
+        }
+        assert_eq!(BlockKind::parse("needsinput"), Some(BlockKind::NeedsInput));
+        assert_eq!(BlockKind::parse("nope"), None);
     }
 
     #[test]
@@ -583,7 +908,6 @@ mod tests {
             visibility: VisibilityScope::SelfOnly,
         };
         save_board(&store, &board, &[]).map_err(crate::test_support::ctx("save board"))?;
-        // A stray directory without a board.toml must not appear.
         std::fs::create_dir_all(
             store
                 .root()
@@ -604,37 +928,59 @@ mod tests {
     fn test_list_board_ids_on_missing_root_is_empty() -> TestResult {
         let root = temporary_root("harw-knowledge-kanban-list-boards-missing")?;
         let store = KnowledgeStore::new(&root);
-
         let ids = list_board_ids(&store).map_err(crate::test_support::ctx(
             "missing boards dir is not an error",
         ))?;
-
         assert!(ids.is_empty());
         std::fs::remove_dir_all(root).map_err(crate::test_support::ctx("remove temporary root"))?;
         Ok(())
     }
 
     #[test]
-    fn test_save_and_load_card_round_trips_every_field() -> TestResult {
+    fn test_save_and_load_record_round_trips_every_stored_field() -> TestResult {
         let root = temporary_root("harw-knowledge-kanban-card-roundtrip")?;
         let store = KnowledgeStore::new(&root);
         let board_id = BoardId::new("board-1");
         let author = AgentId::new("agent-1");
-        let mut card = sample_card("card-1", "worker-lane", CardState::Running);
-        card.work_id = Some(WorkId::from_str("work-1"));
-        card.parents = vec![CardId::new("card-0")];
-        card.assignee = Some(AgentId::new("agent-2"));
-        card.tags = vec!["review-required".to_owned()];
-        card.retry_count = 2;
-        let now = jiff::Timestamp::from_second(1_700_000_000)
-            .map_err(crate::test_support::ctx("valid timestamp"))?;
+        let mut record = sample_record("card-1", "worker-lane");
+        record.work_id = Some(WorkId::from_str("work-1"));
+        record.parents = vec![CardId::new("card-0")];
+        record.tags = vec!["review-required".to_owned()];
+        let now = jiff::Timestamp::from_second(1_700_000_000)?;
 
-        save_card(&store, &board_id, &card, &author, now)
-            .map_err(crate::test_support::ctx("save card"))?;
-        let loaded = load_card(&store, &board_id, &card.id)
-            .map_err(crate::test_support::ctx("load card"))?;
+        let artifact = save_card(&store, &board_id, &record, &author, now)?;
+        let loaded = load_card_record(&store, &board_id, &record.id)?;
 
-        assert_eq!(loaded, card);
+        assert_eq!(loaded, record);
+        for key in LEGACY_DERIVED_KEYS {
+            assert!(
+                !artifact.frontmatter.extra.contains_key(key),
+                "{key} is derived from the ledger and must not be stored"
+            );
+        }
+        std::fs::remove_dir_all(root).map_err(crate::test_support::ctx("remove temporary root"))?;
+        Ok(())
+    }
+
+    #[test]
+    fn test_save_card_strips_legacy_derived_fields() -> TestResult {
+        let root = temporary_root("harw-knowledge-kanban-card-legacy")?;
+        let store = KnowledgeStore::new(&root);
+        let board_id = BoardId::new("board-1");
+        let author = AgentId::new("agent-1");
+        let record = sample_record("card-1", "todo");
+        let now = jiff::Timestamp::from_second(1_700_000_000)?;
+        let mut artifact = save_card(&store, &board_id, &record, &author, now)?;
+        artifact
+            .frontmatter
+            .extra
+            .insert("state".to_owned(), serde_json::json!("done"));
+        let path = store.kanban_card_path(board_id.as_str(), record.id.as_str());
+        store.write_artifact(&path, &artifact)?;
+
+        assert_eq!(load_card_record(&store, &board_id, &record.id)?, record);
+        let resaved = save_card(&store, &board_id, &record, &author, now)?;
+        assert!(!resaved.frontmatter.extra.contains_key("state"));
         std::fs::remove_dir_all(root).map_err(crate::test_support::ctx("remove temporary root"))?;
         Ok(())
     }
@@ -645,19 +991,14 @@ mod tests {
         let store = KnowledgeStore::new(&root);
         let board_id = BoardId::new("board-1");
         let author = AgentId::new("agent-1");
-        let card = sample_card("card-1", "todo", CardState::Todo);
-        let created = jiff::Timestamp::from_second(1_700_000_000)
-            .map_err(crate::test_support::ctx("valid timestamp"))?;
-        let updated = created
-            .checked_add(jiff::SignedDuration::from_secs(3600))
-            .map_err(crate::test_support::ctx("valid later timestamp"))?;
+        let record = sample_record("card-1", "todo");
+        let created = jiff::Timestamp::from_second(1_700_000_000)?;
+        let updated = created.checked_add(jiff::SignedDuration::from_secs(3600))?;
 
-        let first = save_card(&store, &board_id, &card, &author, created)
-            .map_err(crate::test_support::ctx("first save"))?;
-        let mut moved = card.clone();
-        moved.state = CardState::Ready;
-        let second = save_card(&store, &board_id, &moved, &author, updated)
-            .map_err(crate::test_support::ctx("second save"))?;
+        let first = save_card(&store, &board_id, &record, &author, created)?;
+        let mut moved = record.clone();
+        moved.title = "renamed".to_owned();
+        let second = save_card(&store, &board_id, &moved, &author, updated)?;
 
         assert_eq!(second.frontmatter.created_at, first.frontmatter.created_at);
         assert_eq!(second.frontmatter.updated_at, updated);
@@ -667,67 +1008,97 @@ mod tests {
     }
 
     #[test]
-    fn test_list_cards_returns_all_cards_sorted_by_id() -> TestResult {
+    fn test_list_cards_views_every_card_through_the_ledger() -> TestResult {
         let root = temporary_root("harw-knowledge-kanban-list-cards")?;
         let store = KnowledgeStore::new(&root);
         let board_id = BoardId::new("board-1");
         let author = AgentId::new("agent-1");
         let now = jiff::Timestamp::now();
-        let card_b = sample_card("card-b", "todo", CardState::Todo);
-        let card_a = sample_card("card-a", "todo", CardState::Todo);
-        save_card(&store, &board_id, &card_b, &author, now)
-            .map_err(crate::test_support::ctx("save card b"))?;
-        save_card(&store, &board_id, &card_a, &author, now)
-            .map_err(crate::test_support::ctx("save card a"))?;
+        let jobs = InMemoryJobTransitions::new();
+        let work_id = WorkId::from_str("work-b");
+        jobs.insert(work_id.clone(), JobSnapshot::new(JobState::Ready));
 
-        let cards =
-            list_cards(&store, &board_id).map_err(crate::test_support::ctx("list cards"))?;
+        let mut card_b = sample_record("card-b", "todo");
+        card_b.work_id = Some(work_id);
+        let card_a = sample_record("card-a", "todo");
+        save_card(&store, &board_id, &card_b, &author, now)?;
+        save_card(&store, &board_id, &card_a, &author, now)?;
+
+        let cards = list_cards(&store, &board_id, &jobs)?;
 
         assert_eq!(cards.len(), 2);
         assert_eq!(cards[0].id, CardId::new("card-a"));
+        assert_eq!(cards[0].state, CardState::Triage);
         assert_eq!(cards[1].id, CardId::new("card-b"));
+        assert_eq!(cards[1].state, CardState::Ready);
         std::fs::remove_dir_all(root).map_err(crate::test_support::ctx("remove temporary root"))?;
         Ok(())
     }
 
     #[test]
-    fn test_list_cards_on_board_with_no_cards_dir_is_empty() -> TestResult {
+    fn test_list_card_records_on_board_with_no_cards_dir_is_empty() -> TestResult {
         let root = temporary_root("harw-knowledge-kanban-list-cards-missing")?;
         let store = KnowledgeStore::new(&root);
-        let board_id = BoardId::new("board-1");
-
-        let cards = list_cards(&store, &board_id).map_err(crate::test_support::ctx(
-            "missing cards dir is not an error",
-        ))?;
-
-        assert!(cards.is_empty());
+        let records = list_card_records(&store, &BoardId::new("board-1"))?;
+        assert!(records.is_empty());
         std::fs::remove_dir_all(root).map_err(crate::test_support::ctx("remove temporary root"))?;
         Ok(())
     }
 
     #[test]
-    fn test_load_card_rejects_a_frontmatter_missing_the_state_extra_key() -> TestResult {
-        let root = temporary_root("harw-knowledge-kanban-card-missing-state")?;
+    fn test_next_card_id_counts_past_the_highest_numbered_card() -> TestResult {
+        let root = temporary_root("harw-knowledge-kanban-next-id")?;
         let store = KnowledgeStore::new(&root);
         let board_id = BoardId::new("board-1");
         let author = AgentId::new("agent-1");
-        let card = sample_card("card-1", "todo", CardState::Todo);
         let now = jiff::Timestamp::now();
-        let artifact = save_card(&store, &board_id, &card, &author, now)
-            .map_err(crate::test_support::ctx("save card"))?;
-        let mut broken = artifact;
-        broken.frontmatter.extra.remove(STATE_KEY);
-        store
-            .write_artifact(
-                &store.kanban_card_path(board_id.as_str(), card.id.as_str()),
-                &broken,
-            )
-            .map_err(crate::test_support::ctx(
-                "overwrite with broken frontmatter",
-            ))?;
+        assert_eq!(next_card_id(&store, &board_id)?, CardId::new("card-1"));
+        save_card(
+            &store,
+            &board_id,
+            &sample_record("card-7", "todo"),
+            &author,
+            now,
+        )?;
+        save_card(
+            &store,
+            &board_id,
+            &sample_record("custom", "todo"),
+            &author,
+            now,
+        )?;
+        assert_eq!(next_card_id(&store, &board_id)?, CardId::new("card-8"));
+        std::fs::remove_dir_all(root).map_err(crate::test_support::ctx("remove temporary root"))?;
+        Ok(())
+    }
 
-        let Err(error) = load_card(&store, &board_id, &card.id) else {
-            return Err(TestError::Unexpected("missing state must error".to_owned()));
+    #[test]
+    fn test_unsafe_ids_are_refused() -> TestResult {
+        let root = temporary_root("harw-knowledge-kanban-unsafe")?;
+        let store = KnowledgeStore::new(&root);
+        let result = load_card_record(&store, &BoardId::new("board-1"), &CardId::new("../x"));
+        assert!(matches!(result, Err(KnowledgeError::Io(_))));
+        std::fs::remove_dir_all(root).map_err(crate::test_support::ctx("remove temporary root"))?;
+        Ok(())
+    }
+
+    #[test]
+    fn test_load_record_rejects_a_frontmatter_missing_the_title_extra_key() -> TestResult {
+        let root = temporary_root("harw-knowledge-kanban-card-missing-title")?;
+        let store = KnowledgeStore::new(&root);
+        let board_id = BoardId::new("board-1");
+        let author = AgentId::new("agent-1");
+        let record = sample_record("card-1", "todo");
+        let now = jiff::Timestamp::now();
+        let mut broken = save_card(&store, &board_id, &record, &author, now)?;
+        broken.frontmatter.extra.remove(TITLE_KEY);
+        store.write_artifact(
+            &store.kanban_card_path(board_id.as_str(), record.id.as_str()),
+            &broken,
+        )?;
+
+        let Err(error) = load_card_record(&store, &board_id, &record.id) else {
+            return Err(TestError::Unexpected("missing title must error".to_owned()));
         };
 
         assert!(matches!(error, KnowledgeError::MalformedFrontmatter { .. }));

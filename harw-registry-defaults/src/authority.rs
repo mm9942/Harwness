@@ -385,6 +385,20 @@ pub fn reduce_to_read_workspace_network(granted: &PermissionSet) -> PermissionSe
 pub fn authority_reducer_for_role(role: &str) -> Option<AuthorityReducer> {
     match role {
         role_names::ROOT_ORCHESTRATOR => Some(AuthorityReducer::ReadRegistry),
+        // Child-Orchestratoren (Plan Punkt 1) teilen das Profil `Planning`
+        // des Root-Orchestrators: read-only, `deps.source_*` braucht
+        // `ReadCargoRegistry`, kein eigenes `web.*`.
+        role_names::CODING_ORCHESTRATOR | role_names::ANALYSIS_ORCHESTRATOR => {
+            Some(AuthorityReducer::ReadRegistry)
+        }
+        // Dokumentierte Durchreichung: `research-orchestrator` startet
+        // `researcher-web`/`researcher`/`dependency-researcher`, deren Sandbox
+        // stets eine Teilmenge SEINER Sandbox ist. Ohne `NetworkAccess` im
+        // eigenen Satz bekämen seine Netz-Rechercheure nie Netz. Er selbst
+        // registriert kein Netz-Werkzeug (`Planning`) und verbietet `web.*` in
+        // seiner TOML — das Recht ist reine, egress-gebundene Durchreichung
+        // (`test_research_orchestrator_passes_network_through_without_web_tools`).
+        role_names::RESEARCH_ORCHESTRATOR => Some(AuthorityReducer::ReadExplore),
         // Explorer-Netz: die TOML admittiert `web.fetch`/`web.search`.
         role_names::EXPLORER => Some(AuthorityReducer::ReadExplore),
         role_names::ANALYST | role_names::RESEARCHER_DEPS | role_names::PLANNER => {
@@ -432,6 +446,87 @@ pub fn authority_reducer_for_role(role: &str) -> Option<AuthorityReducer> {
         role_names::UIA_SHELL_WORKER => Some(AuthorityReducer::ReadOnly),
         _ => None,
     }
+}
+
+/// Liefert die in `[delegation].targets` einer eingebauten Agentendefinition
+/// zugelassenen Delegationsziele (Plan Punkt 1, `delegate_wave`).
+///
+/// # Beschreibung
+/// Die Liste ist eine **zusätzliche** Schnittmenge zur Laufzeit-Sichtbarkeit
+/// (`harw_core::delegation_visibility`, `docs/design/
+/// delegation-capabilities.md`: „DefinitionDeclaredTargets ∩
+/// RoleMatrixTargets ∩ …“) — sie erweitert nie, sie verengt nur. Gelesen wird
+/// ausschließlich die eingebaute Schicht (`agents/**/*.toml`, über
+/// [`crate::embedded_agents::builtin_agent_toml`]); das Ergebnis wird einmal
+/// pro Prozess gecacht.
+///
+/// # Argumente
+/// - `role` (`&str`): Rollenname der delegierenden Sitzung.
+///
+/// # Rückgabe
+/// `Some(targets)`, wenn die eingebaute Definition von `role` eine
+/// `[delegation]`-Tabelle mit `targets` trägt (auch eine leere Liste — dann
+/// ist KEIN Ziel zugelassen); `None`, wenn es keine eingebaute Definition oder
+/// keine solche Tabelle gibt. Ein Aufrufer, der daraus eine Admission ableitet,
+/// behandelt `None` fail-closed (kein Ziel).
+///
+/// # Fehler
+/// Keine: eine Definition, die nicht parst, trägt schlicht keine Liste — die
+/// Parse-Prüfung selbst gehört `builtin_agent_definitions`.
+///
+/// # Nebenläufigkeit
+/// Die Tabelle entsteht höchstens einmal (`OnceLock`); danach reine Lesesicht.
+///
+/// # Beispiele
+/// ```rust
+/// use harw_registry_defaults::authority::delegation_targets_for_role;
+/// use harw_registry_defaults::profile::role_names;
+///
+/// let targets = delegation_targets_for_role(role_names::CODING_ORCHESTRATOR)
+///     .unwrap_or_default();
+/// assert!(targets.iter().any(|target| target == role_names::EXECUTOR));
+/// assert!(delegation_targets_for_role(role_names::EXPLORER).is_none());
+/// ```
+#[must_use]
+pub fn delegation_targets_for_role(role: &str) -> Option<Vec<String>> {
+    builtin_delegation_targets().get(role).cloned()
+}
+
+/// Die gecachte Tabelle `Rolle → [delegation].targets` der eingebauten Schicht.
+fn builtin_delegation_targets() -> &'static std::collections::HashMap<String, Vec<String>> {
+    static TABLE: std::sync::OnceLock<std::collections::HashMap<String, Vec<String>>> =
+        std::sync::OnceLock::new();
+    TABLE.get_or_init(|| {
+        let mut table = std::collections::HashMap::new();
+        for (name, source) in crate::embedded_agents::builtin_agent_toml() {
+            let Ok(raw) = harw_agent_dsl::parse::parse_toml(source) else {
+                continue;
+            };
+            if let Some(targets) = delegation_targets_of(&raw.tables) {
+                table.insert((*name).to_owned(), targets);
+            }
+        }
+        table
+    })
+}
+
+/// Liest `[delegation].targets` aus den freien Tabellen einer Definition.
+///
+/// # Rückgabe
+/// `Some(liste)` nur, wenn `targets` ein Array ist; Nicht-String-Einträge
+/// werden verworfen (sie können kein Rollenname sein).
+fn delegation_targets_of(tables: &toml::Table) -> Option<Vec<String>> {
+    let targets = tables
+        .get("delegation")?
+        .as_table()?
+        .get("targets")?
+        .as_array()?;
+    Some(
+        targets
+            .iter()
+            .filter_map(|value| value.as_str().map(str::to_owned))
+            .collect(),
+    )
 }
 
 /// Liefert das Recht, das der Prolog eines eingebauten Werkzeugs verlangt.
@@ -662,6 +757,10 @@ mod tests {
             role_names::RESEARCHER_WEB,
             role_names::DEPENDENCY_RESEARCHER,
             role_names::RESEARCHER,
+            // Dokumentierte Durchreichung (Plan Punkt 1): kein eigenes
+            // `web.*`, siehe
+            // `test_research_orchestrator_passes_network_through_without_web_tools`.
+            role_names::RESEARCH_ORCHESTRATOR,
         ];
         for role in role_names::ALL {
             let carries_network = authority_reducer_for_role(role)
@@ -870,6 +969,127 @@ mod tests {
             authority_reducer_for_role(role_names::UIA_SHELL_WORKER),
             Some(AuthorityReducer::ReadOnly)
         );
+        for role in [
+            role_names::ROOT_ORCHESTRATOR,
+            role_names::CODING_ORCHESTRATOR,
+            role_names::ANALYSIS_ORCHESTRATOR,
+        ] {
+            assert_eq!(
+                authority_reducer_for_role(role),
+                Some(AuthorityReducer::ReadRegistry),
+                "{role}"
+            );
+        }
+        assert_eq!(
+            authority_reducer_for_role(role_names::RESEARCH_ORCHESTRATOR),
+            Some(AuthorityReducer::ReadExplore)
+        );
+        Ok(())
+    }
+
+    /// Die Netz-Durchreichung des `research-orchestrator` ist KEIN eigenes
+    /// Netz-Werkzeug: sein Profil registriert unter vollem Netz kein `web.*`,
+    /// und der Reducer gibt nie Schreib- oder Ausführungsrecht weiter.
+    #[test]
+    fn test_research_orchestrator_passes_network_through_without_web_tools()
+    -> crate::test_support::TestResult {
+        let role = role_names::RESEARCH_ORCHESTRATOR;
+        let reducer = authority_reducer_for_role(role).ok_or(
+            crate::test_support::TestError::Missing("research-orchestrator braucht einen Reducer"),
+        )?;
+        let profile = crate::profile::profile_for_role(role).ok_or(
+            crate::test_support::TestError::Missing("research-orchestrator braucht ein Profil"),
+        )?;
+        let child = reducer.reduce(&every_permission());
+        assert!(child.contains(Permission::NetworkAccess));
+        assert!(!child.contains(Permission::WriteWorkspace));
+        assert!(!child.contains(Permission::ExecuteProcess));
+        assert!(
+            !profile
+                .tool_names_for(&child)
+                .iter()
+                .any(|tool| tool.starts_with("web.") || tool.starts_with("browser.")),
+            "{role}: {profile:?} darf trotz Netzrecht kein Netz-Werkzeug registrieren"
+        );
+        Ok(())
+    }
+
+    /// `[delegation].targets` der Orchestratoren: jede genannte Rolle ist eine
+    /// eingebaute Rolle; Child-Orchestratoren nennen ausschließlich Worker
+    /// (keinen Orchestrator, keinen `agent-steward`, keine UIA-Rolle), und
+    /// Worker tragen gar keine Liste.
+    #[test]
+    fn test_delegation_targets_are_builtin_and_child_orchestrators_only_name_workers()
+    -> crate::test_support::TestResult {
+        let forbidden_for_children: Vec<&str> = std::iter::once(role_names::ROOT_ORCHESTRATOR)
+            .chain(role_names::CHILD_ORCHESTRATORS.iter().copied())
+            .chain([
+                role_names::AGENT_STEWARD,
+                role_names::UIA_WORKER,
+                role_names::UIA_EXPLORER,
+                role_names::UIA_WRITER,
+                role_names::UIA_SHELL_WORKER,
+            ])
+            .collect();
+        for role in role_names::CHILD_ORCHESTRATORS {
+            let targets = delegation_targets_for_role(role).ok_or(
+                crate::test_support::TestError::Unexpected(format!(
+                    "{role} braucht [delegation].targets"
+                )),
+            )?;
+            assert!(!targets.is_empty(), "{role}: leere Zielliste");
+            for target in &targets {
+                assert!(
+                    role_names::ALL.contains(&target.as_str()),
+                    "{role}: unbekanntes Ziel {target}"
+                );
+                assert!(
+                    !forbidden_for_children.contains(&target.as_str()),
+                    "{role}: {target} ist kein Worker-Ziel eines Child-Orchestrators"
+                );
+            }
+        }
+        let root = delegation_targets_for_role(role_names::ROOT_ORCHESTRATOR).ok_or(
+            crate::test_support::TestError::Missing("root-orchestrator braucht [delegation]"),
+        )?;
+        for child in role_names::CHILD_ORCHESTRATORS {
+            assert!(
+                root.iter().any(|target| target == child),
+                "root-orchestrator muss {child} als Ziel führen"
+            );
+        }
+        for target in &root {
+            assert!(role_names::ALL.contains(&target.as_str()), "{target}");
+        }
+        for worker in [
+            role_names::EXPLORER,
+            role_names::PLANNER,
+            role_names::ANALYST,
+            role_names::EXECUTOR,
+        ] {
+            assert!(
+                delegation_targets_for_role(worker).is_none(),
+                "{worker}: Worker tragen keine Delegationsliste"
+            );
+        }
+        assert!(delegation_targets_for_role("unbekannt").is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn test_delegation_targets_of_reads_only_string_arrays() -> crate::test_support::TestResult {
+        let tables: toml::Table = toml::from_str(
+            "[delegation]\ntargets = [\"explorer\", 3, \"planner\"]\n",
+        )
+        .map_err(crate::test_support::ctx("Test-TOML muss parsen"))?;
+        assert_eq!(
+            delegation_targets_of(&tables),
+            Some(vec!["explorer".to_owned(), "planner".to_owned()])
+        );
+        let without: toml::Table = toml::from_str("[delegation]\ntargets = \"explorer\"\n")
+            .map_err(crate::test_support::ctx("Test-TOML muss parsen"))?;
+        assert_eq!(delegation_targets_of(&without), None);
+        assert_eq!(delegation_targets_of(&toml::Table::new()), None);
         Ok(())
     }
 }

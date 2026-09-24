@@ -1,0 +1,93 @@
+# Eingebauter Child-Orchestrator der Analyse-/Verdichtungsspur
+# (Sub-Orchestrator, Plan Punkt 1; `agent-definition-dsl.md` §11.1,
+# `docs/design/delegation-capabilities.md`).
+#
+# Führt in der Default-Organisation die Clans `synthesis` (Zelle
+# `synthesis-join`, `barrier`/`explicit-join`) und `security` (Zelle
+# `security-triage-wave`, `fanout`/`all-terminal`). Bisher lag beides bei
+# `analyst` (`role = "worker"`): ein Worker hat laut Rollenmatrix keine
+# dauerhafte Delegation, die vier Triage-Rollen (`max_depth = 0`) könnten
+# ihre eigene Welle ohnehin nicht starten. Dieser Orchestrator trägt
+# `role = "child-orchestrator"` und darf genau diese Worker starten.
+#
+# ── Rechte ──────────────────────────────────────────────────────────────────
+# Werkzeugoberfläche wie `root-orchestrator` (`RegistryProfile::Planning`,
+# read-only, kein Netz) plus `delegate_wave` (Composition-Root, siehe
+# `profile::composition_tools_for_role`). Reducer `ReadRegistry` — alle
+# seine Ziele kommen ohne Netz aus.
+#
+# ── Tiefe / Budget ──────────────────────────────────────────────────────────
+# `max_depth = 1` (nur Worker darunter); Budget unter dem des
+# `root-orchestrator` (monoton).
+
+schema = "harwness.agent/v1"
+id = "harwness.agent.analysis-orchestrator@1"
+version = "1.0.0"
+role = "child-orchestrator"
+specialization = "analysis-orchestrator"
+
+name = "Analysis Orchestrator"
+description = "Führt Verdichtungs- und Triage-Wellen: startet Analysten bzw. die parametergetriebenen Security-Triage-Rollen, joint deren Ergebnisse und liefert dem Root-Orchestrator eine ReturnEnvelope."
+
+[work]
+mode = "orchestration"
+may_change_plan = false
+may_write_code = false
+may_research_web = false
+aggregates_child_returns = true
+
+[lifecycle]
+allow_pause = false
+allow_rerun = true
+max_attempts = 2
+
+[context]
+must_include = ["task.objective", "task.read_scope", "new.trigger_return"]
+exclude = ["full_parent_transcript", "sibling_transcripts"]
+
+[tools]
+admitted = [
+  "fs.read",
+  "fs.list",
+  "fs.search",
+  "fs.glob",
+  "fs.grep",
+  "doc.read_pdf",
+  "deps.graph",
+  "deps.locked",
+  "deps.source_read",
+  "deps.source_search",
+  "deps.source_list",
+  "lens.ask",
+  "explore.tree",
+  "explore.projects",
+  "explore.relations",
+  "explore.find",
+  "delegate_wave",
+]
+forbidden = ["fs.write", "shell.exec", "web.fetch", "web.search", "web.docs_rs", "web.crates_io"]
+
+# Zugelassene Delegationsziele (siehe `coding-orchestrator.toml`).
+[delegation]
+targets = [
+  "analyst",
+  "explorer",
+  "researcher-deps",
+  "planner",
+  "security-egress-triage",
+  "security-baseline-triage",
+  "security-structure-triage",
+  "security-endpoint-triage",
+]
+
+[spawn]
+max_depth = 1
+child_orchestrators = []
+
+[spawn.budget]
+max_tokens = 80000
+max_tool_calls = 60
+max_wall_secs = 600
+
+[return]
+contract = "harwness.return.envelope@1"

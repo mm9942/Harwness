@@ -278,6 +278,33 @@ pub mod role_names {
     /// siehe `agents/agent-steward.toml` und die Begründung dort.
     pub const AGENT_STEWARD: &str = "agent-steward";
 
+    /// Eingebauter Child-Orchestrator der Coding-Spur (`role =
+    /// "child-orchestrator"`, Plan Punkt 1): Leader des Clans `coding`,
+    /// delegiert Planung, Erkundung und Ausführung an Worker und schreibt
+    /// selbst nicht. Profil wie [`ROOT_ORCHESTRATOR`]
+    /// ([`crate::profile::RegistryProfile::Planning`]); siehe
+    /// `agents/coding-orchestrator.toml`.
+    pub const CODING_ORCHESTRATOR: &str = "coding-orchestrator";
+
+    /// Eingebauter Child-Orchestrator der Recherche-Spur: Leader des Clans
+    /// `research`, fächert auf read-only Rechercheure auf. Siehe
+    /// `agents/research-orchestrator.toml`.
+    pub const RESEARCH_ORCHESTRATOR: &str = "research-orchestrator";
+
+    /// Eingebauter Child-Orchestrator der Verdichtungs-/Triage-Spur: Leader
+    /// der Clans `synthesis` und `security`. Siehe
+    /// `agents/analysis-orchestrator.toml`.
+    pub const ANALYSIS_ORCHESTRATOR: &str = "analysis-orchestrator";
+
+    /// Die eingebauten Child-Orchestratoren (`AgentRoleId::ChildOrchestrator`)
+    /// — genau die Namen, die `agents/root-orchestrator.toml` in
+    /// `[spawn].child_orchestrators` exakt freigibt.
+    pub const CHILD_ORCHESTRATORS: &[&str] = &[
+        CODING_ORCHESTRATOR,
+        RESEARCH_ORCHESTRATOR,
+        ANALYSIS_ORCHESTRATOR,
+    ];
+
     /// Alle bekannten eingebauten Rollen.
     ///
     /// Siehe die Moduldokumentation oben: `context-steward`, `intel-scout`,
@@ -306,7 +333,73 @@ pub mod role_names {
         UIA_WRITER,
         UIA_SHELL_WORKER,
         AGENT_STEWARD,
+        CODING_ORCHESTRATOR,
+        RESEARCH_ORCHESTRATOR,
+        ANALYSIS_ORCHESTRATOR,
     ];
+}
+
+// ---------------------------------------------------------------------------
+// Werkzeuge der Composition-Root für Orchestrator-Sitzungen
+// ---------------------------------------------------------------------------
+
+/// Die Werkzeuge, die eine Orchestrator-Sitzung über die Werkzeugoberfläche
+/// ihres Registry-Profils hinaus admittiert: heute genau `delegate_wave`
+/// (`harw-core-bridge::delegate_wave`, Plan Punkt 1).
+///
+/// # Warum nicht Teil eines [`RegistryProfile`]
+/// `delegate_wave` braucht den `ManagedAgentSpawner` aus `harw-core`; dieses
+/// Crate hängt bewusst nicht von `harw-core` ab. Die Composition-Root
+/// (`harw-runtime`, Kind-Registry-Fabrik) hängt den Provider deshalb selbst
+/// an die Registry einer Orchestrator-Rolle an. Ein eigenes
+/// `RegistryProfile::Orchestration` hätte zudem jede erschöpfende
+/// `match`-Stelle über `RegistryProfile` außerhalb dieses Crates gebrochen.
+/// Die Deckungstests (`tests/tool_admission_coverage.rs`) vergleichen die
+/// TOML-Seite deshalb gegen `profile.tool_names()` ∪
+/// [`composition_tools_for_role`].
+pub const ORCHESTRATION_TOOLS: &[&str] = &["delegate_wave"];
+
+/// Liefert die Werkzeuge, die die Composition-Root für `role` zusätzlich zur
+/// Profil-Registry beisteuert.
+///
+/// # Argumente
+/// - `role` (`&str`): Rollenname, üblicherweise aus [`role_names`].
+///
+/// # Rückgabe
+/// [`ORCHESTRATION_TOOLS`] für [`role_names::ROOT_ORCHESTRATOR`] und jeden
+/// Eintrag aus [`role_names::CHILD_ORCHESTRATORS`], sonst eine leere Liste —
+/// Worker bekommen nie eine Delegationsoberfläche.
+///
+/// # Nebenläufigkeit
+/// Rein.
+///
+/// # Beispiele
+/// ```rust
+/// use harw_registry_defaults::profile::{composition_tools_for_role, role_names};
+///
+/// assert_eq!(
+///     composition_tools_for_role(role_names::CODING_ORCHESTRATOR),
+///     &["delegate_wave"]
+/// );
+/// assert!(composition_tools_for_role(role_names::EXPLORER).is_empty());
+/// ```
+#[must_use]
+pub fn composition_tools_for_role(role: &str) -> &'static [&'static str] {
+    if is_orchestrator_role(role) {
+        ORCHESTRATION_TOOLS
+    } else {
+        &[]
+    }
+}
+
+/// Ob `role` eine eingebaute Orchestrator-Rolle ist (Root oder Child).
+///
+/// # Rückgabe
+/// `true` für [`role_names::ROOT_ORCHESTRATOR`] und jeden Eintrag aus
+/// [`role_names::CHILD_ORCHESTRATORS`].
+#[must_use]
+pub fn is_orchestrator_role(role: &str) -> bool {
+    role == role_names::ROOT_ORCHESTRATOR || role_names::CHILD_ORCHESTRATORS.contains(&role)
 }
 
 // ---------------------------------------------------------------------------
@@ -1179,7 +1272,14 @@ impl RegistryProfile {
 #[must_use]
 pub fn profile_for_role(role: &str) -> Option<RegistryProfile> {
     match role {
-        role_names::ROOT_ORCHESTRATOR => Some(RegistryProfile::Planning),
+        // Orchestratoren (Root und die drei Child-Orchestratoren) teilen die
+        // read-only Planungsoberfläche ohne Netz; ihr Fan-out-Werkzeug
+        // `delegate_wave` steuert die Composition-Root bei (siehe
+        // `composition_tools_for_role`).
+        role_names::ROOT_ORCHESTRATOR
+        | role_names::CODING_ORCHESTRATOR
+        | role_names::RESEARCH_ORCHESTRATOR
+        | role_names::ANALYSIS_ORCHESTRATOR => Some(RegistryProfile::Planning),
         role_names::EXPLORER | role_names::RESEARCHER_DEPS | role_names::ANALYST => {
             Some(RegistryProfile::ReadOnlyExplore)
         }
@@ -3166,6 +3266,54 @@ mod tests {
         for role in role_names::ALL {
             assert!(profile_for_role(role).is_some(), "unbekannt: {role}");
         }
+        // Plan Punkt 1: Root- und Child-Orchestratoren teilen die read-only
+        // Planungsoberfläche ohne Netz.
+        for role in [role_names::ROOT_ORCHESTRATOR]
+            .iter()
+            .chain(role_names::CHILD_ORCHESTRATORS.iter())
+        {
+            assert_eq!(
+                profile_for_role(role),
+                Some(RegistryProfile::Planning),
+                "Orchestrator {role} muss Planning bekommen"
+            );
+        }
+    }
+
+    /// `delegate_wave` steuert die Composition-Root bei — ausschließlich für
+    /// Orchestratoren, nie für Worker oder UIA-Rollen, und nie als Teil eines
+    /// Registry-Profils (sonst bewürbe `Planning` es auch dem `planner`).
+    #[test]
+    fn test_composition_tools_are_granted_only_to_orchestrators() {
+        let orchestrators: Vec<&str> = std::iter::once(role_names::ROOT_ORCHESTRATOR)
+            .chain(role_names::CHILD_ORCHESTRATORS.iter().copied())
+            .collect();
+        for role in role_names::ALL {
+            let expected: &[&str] = if orchestrators.contains(role) {
+                ORCHESTRATION_TOOLS
+            } else {
+                &[]
+            };
+            assert_eq!(composition_tools_for_role(role), expected, "{role}");
+            assert_eq!(is_orchestrator_role(role), orchestrators.contains(role));
+        }
+        for profile in RegistryProfile::ALL {
+            for tool in ORCHESTRATION_TOOLS {
+                assert!(
+                    !profile.registered_tool_names().contains(tool),
+                    "{profile:?} darf {tool} nicht selbst registrieren"
+                );
+            }
+        }
+        assert!(composition_tools_for_role("unbekannt").is_empty());
+    }
+
+    #[test]
+    fn test_child_orchestrators_are_listed_in_all() {
+        for role in role_names::CHILD_ORCHESTRATORS {
+            assert!(role_names::ALL.contains(role), "{role} fehlt in ALL");
+        }
+        assert_eq!(role_names::CHILD_ORCHESTRATORS.len(), 3);
     }
 
     #[test]
