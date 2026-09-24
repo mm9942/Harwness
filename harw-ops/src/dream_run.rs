@@ -959,7 +959,7 @@ fn diary_section(store: &KnowledgeStore) -> String {
             }
         }
     }
-    lines.sort_by(|left, right| right.0.cmp(&left.0));
+    lines.sort_by_key(|(at, _)| std::cmp::Reverse(*at));
     capped(lines.into_iter().map(|(_, line)| line))
 }
 

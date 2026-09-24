@@ -173,10 +173,8 @@ impl WorkbenchScope {
     pub fn from_path_component(component: &str) -> Option<Self> {
         let scope = if let Some(id) = component.strip_prefix("session:") {
             Self::Session(id.to_owned())
-        } else if let Some(slug) = component.strip_prefix("project:") {
-            Self::Project(slug.to_owned())
         } else {
-            return None;
+            Self::Project(component.strip_prefix("project:")?.to_owned())
         };
         scope.validate().ok().map(|()| scope)
     }
