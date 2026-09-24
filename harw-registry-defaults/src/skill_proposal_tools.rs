@@ -480,8 +480,7 @@ impl SkillBenchmark {
             pass_rate: self.with_skill.pass_rate.mean - self.baseline_stats.pass_rate.mean,
             duration_seconds: self.with_skill.duration_seconds.mean
                 - self.baseline_stats.duration_seconds.mean,
-            total_tokens: self.with_skill.total_tokens.mean
-                - self.baseline_stats.total_tokens.mean,
+            total_tokens: self.with_skill.total_tokens.mean - self.baseline_stats.total_tokens.mean,
         }
     }
 }
@@ -512,7 +511,11 @@ fn check_stats(label: &str, stats: &BenchmarkStats, errors: &mut Vec<String>) {
         &stats.duration_seconds,
         errors,
     );
-    check_mean_stddev(&format!("{label}.total_tokens"), &stats.total_tokens, errors);
+    check_mean_stddev(
+        &format!("{label}.total_tokens"),
+        &stats.total_tokens,
+        errors,
+    );
 }
 
 /// Ob `path` ein relativer Pfad ohne `..`-, Wurzel- oder Präfix-Komponente ist.
@@ -631,9 +634,7 @@ pub fn validate_eval_plan(
         return;
     };
     if evals.is_empty() {
-        errors.push(
-            "benchmark: ohne evals ist ein Benchmark nicht nachvollziehbar".to_owned(),
-        );
+        errors.push("benchmark: ohne evals ist ein Benchmark nicht nachvollziehbar".to_owned());
     }
     if benchmark.iteration == 0 {
         errors.push("benchmark.iteration muss ≥ 1 sein".to_owned());
@@ -741,7 +742,9 @@ pub fn validate_skill_candidate(candidate: &SkillCandidate) -> SkillValidation {
     let skill = match toml::from_str::<SkillToml>(&candidate.skill_toml) {
         Ok(skill) => Some(skill),
         Err(error) => {
-            errors.push(format!("skill_toml ist kein gültiges Skill-Manifest: {error}"));
+            errors.push(format!(
+                "skill_toml ist kein gültiges Skill-Manifest: {error}"
+            ));
             None
         }
     };
@@ -1173,7 +1176,9 @@ impl SkillProposalStore {
 
     fn write_meta(&self, meta: &SkillProposalMeta) -> Result<(), SkillProposalError> {
         let bytes = serde_json::to_vec_pretty(meta).map_err(|error| {
-            SkillProposalError::Io(format!("Vorschlags-Metadaten nicht serialisierbar: {error}"))
+            SkillProposalError::Io(format!(
+                "Vorschlags-Metadaten nicht serialisierbar: {error}"
+            ))
         })?;
         let path = self.proposal_dir(&meta.proposal_id).join(PROPOSAL_FILE);
         write_atomic(&path, &bytes).map_err(|error| {
@@ -1611,7 +1616,10 @@ fn stats_schema(description: &str) -> JsonSchema {
                 "pass_rate",
                 mean_stddev_schema("Anteil bestandener Assertions, 0.0..=1.0."),
             ),
-            ("duration_seconds", mean_stddev_schema("Laufzeit in Sekunden.")),
+            (
+                "duration_seconds",
+                mean_stddev_schema("Laufzeit in Sekunden."),
+            ),
             ("total_tokens", mean_stddev_schema("Verbrauchte Token.")),
         ],
         &["pass_rate", "duration_seconds", "total_tokens"],
@@ -1650,7 +1658,10 @@ fn evals_schema() -> JsonSchema {
     );
     let case = object(
         vec![
-            ("id", typed(JsonSchemaType::String, "Eindeutige ID ([a-z0-9-]).")),
+            (
+                "id",
+                typed(JsonSchemaType::String, "Eindeutige ID ([a-z0-9-])."),
+            ),
             (
                 "prompt",
                 typed(
@@ -1660,7 +1671,10 @@ fn evals_schema() -> JsonSchema {
             ),
             (
                 "expected_output",
-                typed(JsonSchemaType::String, "Beschreibung des erwarteten Ergebnisses."),
+                typed(
+                    JsonSchemaType::String,
+                    "Beschreibung des erwarteten Ergebnisses.",
+                ),
             ),
             (
                 "files",
@@ -1669,7 +1683,10 @@ fn evals_schema() -> JsonSchema {
                     "Eingabedateien des Falls.",
                 ),
             ),
-            ("assertions", array_of(assertion, "Prüfaussagen (dürfen anfangs fehlen).")),
+            (
+                "assertions",
+                array_of(assertion, "Prüfaussagen (dürfen anfangs fehlen)."),
+            ),
         ],
         &["id", "prompt"],
         "",
@@ -1697,7 +1714,10 @@ fn benchmark_schema() -> JsonSchema {
     };
     object(
         vec![
-            ("iteration", typed(JsonSchemaType::Integer, "Iteration (≥ 1).")),
+            (
+                "iteration",
+                typed(JsonSchemaType::Integer, "Iteration (≥ 1)."),
+            ),
             (
                 "runs_per_configuration",
                 typed(JsonSchemaType::Integer, "Läufe je Konfiguration (≥ 1)."),
@@ -1709,7 +1729,10 @@ fn benchmark_schema() -> JsonSchema {
                 "non_discriminating_assertions",
                 texts("Assertions ohne Unterscheidungskraft."),
             ),
-            ("flaky_assertions", texts("Assertions mit schwankendem Ergebnis.")),
+            (
+                "flaky_assertions",
+                texts("Assertions mit schwankendem Ergebnis."),
+            ),
             (
                 "notes",
                 array_of(
@@ -1797,10 +1820,7 @@ fn skills_commit_proposal_spec() -> ToolSpec {
             vec![
                 (
                     "proposal_id",
-                    typed(
-                        JsonSchemaType::String,
-                        "ID aus skills.list_proposals.",
-                    ),
+                    typed(JsonSchemaType::String, "ID aus skills.list_proposals."),
                 ),
                 (
                     "user_confirmed",
@@ -2331,7 +2351,9 @@ mod tests {
     fn json_of(output: ToolOutput) -> TestResult<serde_json::Value> {
         match output {
             ToolOutput::Json { content } => Ok(content),
-            other => Err(TestError::Unexpected(format!("expected JSON, got {other:?}"))),
+            other => Err(TestError::Unexpected(format!(
+                "expected JSON, got {other:?}"
+            ))),
         }
     }
 
@@ -2358,7 +2380,10 @@ mod tests {
     #[test]
     fn validate_rejects_bad_manifests() {
         for (toml, needle) in [
-            ("name = \"Bad Name\"\ndescription = \"x\"\n", "name 'Bad Name'"),
+            (
+                "name = \"Bad Name\"\ndescription = \"x\"\n",
+                "name 'Bad Name'",
+            ),
             ("name = \"ok\"\n", "description"),
             (
                 "name = \"ok\"\ndescription = \"d\"\ninstructions_file = \"../x.md\"\n",
@@ -2368,7 +2393,10 @@ mod tests {
                 "name = \"ok\"\ndescription = \"d\"\ntools = [\"fs.read\", \"fs.read\"]\n",
                 "doppelt",
             ),
-            ("name = \"ok\"\ndescription = \"d\"\nsurprise = 1\n", "skill_toml"),
+            (
+                "name = \"ok\"\ndescription = \"d\"\nsurprise = 1\n",
+                "skill_toml",
+            ),
         ] {
             let validation = validate_skill_candidate(&SkillCandidate {
                 skill_toml: toml.to_owned(),
@@ -2437,7 +2465,11 @@ mod tests {
                 "missing {needle} in {errors:?}"
             );
         }
-        assert!(warnings.iter().any(|warning| warning.contains("ohne Assertions")));
+        assert!(
+            warnings
+                .iter()
+                .any(|warning| warning.contains("ohne Assertions"))
+        );
     }
 
     #[test]
@@ -2462,10 +2494,8 @@ mod tests {
         assert_eq!(delta.added_tools, vec!["shell.exec".to_owned()]);
         assert_eq!(delta.added_mcps, vec!["docs".to_owned()]);
         assert_eq!(ReviewLevel::for_delta(&delta), ReviewLevel::UserRequired);
-        let none = SkillCapabilityDelta::compute(
-            &skill,
-            &ceiling(&["fs.read", "shell.exec"], &["docs"]),
-        );
+        let none =
+            SkillCapabilityDelta::compute(&skill, &ceiling(&["fs.read", "shell.exec"], &["docs"]));
         assert!(none.is_empty());
         assert_eq!(ReviewLevel::for_delta(&none), ReviewLevel::Uia);
         Ok(())
@@ -2481,15 +2511,23 @@ mod tests {
             .map_err(ctx("propose"))?;
         assert_eq!(meta.status, SkillProposalStatus::PendingReview);
         assert_eq!(meta.review_level, ReviewLevel::UserRequired);
-        assert_eq!(meta.capability_delta.added_tools, vec!["shell.exec".to_owned()]);
+        assert_eq!(
+            meta.capability_delta.added_tools,
+            vec!["shell.exec".to_owned()]
+        );
         assert_eq!(meta.eval_status(), "benchmarked");
         assert_eq!(meta.author_role.as_deref(), Some("user-interface"));
         assert!(!meta.replaces_existing);
-        let dir = skills.join(SKILL_PROPOSALS_DIR_NAME).join(&meta.proposal_id);
+        let dir = skills
+            .join(SKILL_PROPOSALS_DIR_NAME)
+            .join(&meta.proposal_id);
         for file in [PROPOSAL_FILE, SKILL_MANIFEST, INSTRUCTIONS_FILE] {
             assert!(dir.join(file).is_file(), "{file} fehlt");
         }
-        assert!(!skills.join("release-notes").exists(), "propose darf nie aktivieren");
+        assert!(
+            !skills.join("release-notes").exists(),
+            "propose darf nie aktivieren"
+        );
         let loaded = store.load(&meta.proposal_id).map_err(ctx("load"))?;
         assert_eq!(loaded.meta.proposal_id, meta.proposal_id);
         assert_eq!(loaded.meta.evals, meta.evals);
@@ -2518,7 +2556,9 @@ mod tests {
         let skills = temp.path().join("skills");
         let store = SkillProposalStore::new(skills.clone());
         let author = ceiling(&["fs.read"], &[]);
-        let meta = store.propose(&candidate(), &author).map_err(ctx("propose"))?;
+        let meta = store
+            .propose(&candidate(), &author)
+            .map_err(ctx("propose"))?;
         let refused = store.commit(
             &meta.proposal_id,
             CommitAuthority::Ceiling {
@@ -2562,7 +2602,9 @@ mod tests {
         let temp = tempfile::tempdir().map_err(ctx("tempdir"))?;
         let store = SkillProposalStore::new(temp.path().join("skills"));
         let author = ceiling(&["fs.read", "shell.exec"], &[]);
-        let first = store.propose(&candidate(), &author).map_err(ctx("propose"))?;
+        let first = store
+            .propose(&candidate(), &author)
+            .map_err(ctx("propose"))?;
         assert_eq!(first.review_level, ReviewLevel::Uia);
         store
             .commit(&first.proposal_id, CommitAuthority::Operator)
@@ -2570,7 +2612,9 @@ mod tests {
 
         let mut update = candidate();
         update.instructions.push_str("Neue Zeile.\n");
-        let second = store.propose(&update, &author).map_err(ctx("propose update"))?;
+        let second = store
+            .propose(&update, &author)
+            .map_err(ctx("propose update"))?;
         assert!(second.replaces_existing);
         assert_eq!(second.manifest_diff, "no changes");
         assert!(second.instructions_diff.contains("+Neue Zeile."));
@@ -2592,7 +2636,10 @@ mod tests {
             .reject(&meta.proposal_id, "zu allgemein")
             .map_err(ctx("reject"))?;
         assert_eq!(rejected.status, SkillProposalStatus::Rejected);
-        assert_eq!(only_proposal(&store)?.reason.as_deref(), Some("zu allgemein"));
+        assert_eq!(
+            only_proposal(&store)?.reason.as_deref(),
+            Some("zu allgemein")
+        );
         assert!(matches!(
             store.commit(&meta.proposal_id, CommitAuthority::Operator),
             Err(SkillProposalError::Conflict(_))
@@ -2649,7 +2696,10 @@ mod tests {
                 .collect()
         };
         let read_only = SkillProposalToolProvider::new(None, DefinitionWriteMode::Commit, None);
-        assert_eq!(names(&read_only), ["skills.validate", "skills.list_proposals"]);
+        assert_eq!(
+            names(&read_only),
+            ["skills.validate", "skills.list_proposals"]
+        );
         assert!(
             read_only
                 .executor(&ToolName::new("skills.commit_proposal"))
@@ -2726,7 +2776,11 @@ mod tests {
         )))?;
         assert_eq!(committed["written"], serde_json::json!(true), "{committed}");
         assert_eq!(committed["activated"], serde_json::json!(false));
-        assert!(temp.path().join("skills/release-notes/skill.toml").is_file());
+        assert!(
+            temp.path()
+                .join("skills/release-notes/skill.toml")
+                .is_file()
+        );
         Ok(())
     }
 }

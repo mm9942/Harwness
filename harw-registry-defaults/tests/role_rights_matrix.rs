@@ -126,6 +126,19 @@ fn expected_role_table() -> Vec<(&'static str, RegistryProfile, AuthorityReducer
             RegistryProfile::Research,
             AuthorityReducer::ReadNetwork,
         ),
+        // Ökosystem-neutrale bzw. allgemeine Recherche
+        // (`RegistryProfile::ReadOnlyResearch`): Workspace lesen plus
+        // egress-gebundenes Netz, kein Registry-Quellcache.
+        (
+            role_names::DEPENDENCY_RESEARCHER,
+            RegistryProfile::ReadOnlyResearch,
+            AuthorityReducer::ReadWorkspaceNetwork,
+        ),
+        (
+            role_names::RESEARCHER,
+            RegistryProfile::ReadOnlyResearch,
+            AuthorityReducer::ReadWorkspaceNetwork,
+        ),
         (
             role_names::SECURITY_EGRESS_TRIAGE,
             RegistryProfile::NoTools,
@@ -319,6 +332,7 @@ fn test_profile_by_permission_matrix_never_registers_ungranted_tools() -> TestRe
                         &["web.fetch", "web.docs_rs", "web.crates_io", "web.search"]
                     }
                     RegistryProfile::ReadOnlyExplore
+                    | RegistryProfile::ReadOnlyResearch
                     | RegistryProfile::UiaExplorer
                     | RegistryProfile::UiaQuickHelper
                     | RegistryProfile::UiaWriter => &["web.fetch", "web.search"],
@@ -387,6 +401,8 @@ fn test_role_by_permission_matrix_after_reducer() {
                 role_names::UIA_WORKER,
                 role_names::UIA_WRITER,
                 role_names::RESEARCHER_WEB,
+                role_names::DEPENDENCY_RESEARCHER,
+                role_names::RESEARCHER,
                 role_names::RESEARCH_ORCHESTRATOR,
             ];
             let web_tool_roles = [
@@ -395,6 +411,8 @@ fn test_role_by_permission_matrix_after_reducer() {
                 role_names::UIA_WORKER,
                 role_names::UIA_WRITER,
                 role_names::RESEARCHER_WEB,
+                role_names::DEPENDENCY_RESEARCHER,
+                role_names::RESEARCHER,
             ];
             assert_eq!(
                 child.contains(Permission::NetworkAccess),
