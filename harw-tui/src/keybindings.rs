@@ -11,6 +11,11 @@
 //! maximize_panel = "F11"
 //! focus_explorer = "ctrl+e"
 //! toggle_tool_cells = "ctrl+o"
+//! toggle_workbench = "F5"
+//! open_kanban = "F6"
+//! open_mode_picker = "F7"
+//! open_models = "F8"
+//! show_help = "F1"
 //! end_host_mode = []
 //! ```
 //!
@@ -54,9 +59,9 @@ const COMMAND_MODIFIERS: KeyModifiers = KeyModifiers::CONTROL
 
 /// Eine per Tastenbelegung auslösbare Aktion.
 ///
-/// Panel-Aktionen (Explorer/Agenten umschalten, Fokus, Vollbild) wertet
-/// `PanelState::handle_key` aus, die übrigen der Chat-/Composer-Zweig in
-/// `app.rs`.
+/// Panel-Aktionen (Explorer/Agenten/Workbench umschalten, Fokus, Vollbild)
+/// wertet `PanelState::handle_key` aus, die übrigen (auch Kanban,
+/// Modus-Auswahl, Modelle, Hilfe) der Chat-/Composer-Zweig in `app.rs`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub(crate) enum KeyAction {
     /// Explorer-Panel ein-/ausblenden (Standard `F2`).
@@ -79,11 +84,21 @@ pub(crate) enum KeyAction {
     InsertNewline,
     /// Berechtigungsmodus ask → auto → full → plan (Standard `Shift+Tab`).
     CyclePermissionMode,
+    /// Workbench-Panel ein-/ausblenden (Standard `F5`).
+    ToggleWorkbench,
+    /// Kanban-Board öffnen (Standard `F6`).
+    OpenKanban,
+    /// Modus-/Freigabe-Auswahl öffnen (Standard `F7`).
+    OpenModePicker,
+    /// Modelle je Rolle anzeigen (Standard `F8`).
+    OpenModels,
+    /// Hilfe (Befehle, Tasten, Präfixe) öffnen (Standard `F1`).
+    ShowHelp,
 }
 
 impl KeyAction {
     /// Alle Aktionen in fester Reihenfolge (auch Vorrang bei Gleichstand).
-    pub(crate) const ALL: [Self; 10] = [
+    pub(crate) const ALL: [Self; 15] = [
         Self::ToggleExplorer,
         Self::ToggleAgents,
         Self::CycleFocus,
@@ -94,6 +109,11 @@ impl KeyAction {
         Self::DeleteLine,
         Self::InsertNewline,
         Self::CyclePermissionMode,
+        Self::ToggleWorkbench,
+        Self::OpenKanban,
+        Self::OpenModePicker,
+        Self::OpenModels,
+        Self::ShowHelp,
     ];
 
     /// Name der Aktion in der Keybindings-Datei.
@@ -109,6 +129,32 @@ impl KeyAction {
             Self::DeleteLine => "delete_line",
             Self::InsertNewline => "insert_newline",
             Self::CyclePermissionMode => "cycle_permission_mode",
+            Self::ToggleWorkbench => "toggle_workbench",
+            Self::OpenKanban => "open_kanban",
+            Self::OpenModePicker => "open_mode_picker",
+            Self::OpenModels => "open_models",
+            Self::ShowHelp => "show_help",
+        }
+    }
+
+    /// Deutsche Kurzbeschreibung für Hilfe und Tastenübersicht.
+    pub(crate) const fn label_de(self) -> &'static str {
+        match self {
+            Self::ToggleExplorer => "Explorer ein-/ausblenden",
+            Self::ToggleAgents => "Agenten-Panel ein-/ausblenden",
+            Self::CycleFocus => "Fokus reihum wechseln",
+            Self::MaximizePanel => "Fokussiertes Panel im Vollbild",
+            Self::FocusExplorer => "Explorer fokussieren",
+            Self::ToggleToolCells => "Werkzeugzellen auf-/zuklappen",
+            Self::EndHostMode => "Host-Arbeitsphase beenden",
+            Self::DeleteLine => "Eingabezeile löschen",
+            Self::InsertNewline => "Neue Zeile in der Eingabe",
+            Self::CyclePermissionMode => "Freigabemodus wechseln",
+            Self::ToggleWorkbench => "Workbench ein-/ausblenden",
+            Self::OpenKanban => "Kanban-Board öffnen",
+            Self::OpenModePicker => "Modus und Freigabe wählen",
+            Self::OpenModels => "Modelle je Rolle anzeigen",
+            Self::ShowHelp => "Hilfe anzeigen",
         }
     }
 
@@ -130,6 +176,11 @@ impl KeyAction {
             Self::DeleteLine => (KeyCode::Char('k'), KeyModifiers::CONTROL),
             Self::InsertNewline => (KeyCode::Char('j'), KeyModifiers::CONTROL),
             Self::CyclePermissionMode => (KeyCode::BackTab, KeyModifiers::NONE),
+            Self::ToggleWorkbench => (KeyCode::F(5), KeyModifiers::NONE),
+            Self::OpenKanban => (KeyCode::F(6), KeyModifiers::NONE),
+            Self::OpenModePicker => (KeyCode::F(7), KeyModifiers::NONE),
+            Self::OpenModels => (KeyCode::F(8), KeyModifiers::NONE),
+            Self::ShowHelp => (KeyCode::F(1), KeyModifiers::NONE),
         };
         vec![KeyChord { code, modifiers }]
     }
@@ -424,6 +475,23 @@ impl KeyBindings {
             .unwrap_or_default()
     }
 
+    /// Alle Aktionen in [`KeyAction::ALL`]-Reihenfolge mit ihren Chords in
+    /// Anzeigeform (z. B. `f5`, `ctrl+e`); aufgehobene Aktionen haben eine
+    /// leere Liste. Grundlage für Hilfe und Tastenübersicht.
+    pub(crate) fn describe(&self) -> Vec<(KeyAction, Vec<String>)> {
+        KeyAction::ALL
+            .into_iter()
+            .map(|action| {
+                let chords = self
+                    .bindings
+                    .get(&action)
+                    .map(|chords| chords.iter().map(ToString::to_string).collect())
+                    .unwrap_or_default();
+                (action, chords)
+            })
+            .collect()
+    }
+
     /// Welche Aktion löst `key` aus?
     ///
     /// Bei mehreren passenden Chords gewinnt der mit den meisten
@@ -685,6 +753,26 @@ mod tests {
                 event(KeyCode::Tab, KeyModifiers::SHIFT),
                 KeyAction::CyclePermissionMode,
             ),
+            (
+                event(KeyCode::F(5), KeyModifiers::NONE),
+                KeyAction::ToggleWorkbench,
+            ),
+            (
+                event(KeyCode::F(6), KeyModifiers::NONE),
+                KeyAction::OpenKanban,
+            ),
+            (
+                event(KeyCode::F(7), KeyModifiers::NONE),
+                KeyAction::OpenModePicker,
+            ),
+            (
+                event(KeyCode::F(8), KeyModifiers::NONE),
+                KeyAction::OpenModels,
+            ),
+            (
+                event(KeyCode::F(1), KeyModifiers::NONE),
+                KeyAction::ShowHelp,
+            ),
         ];
         for (key, expected) in cases {
             assert_eq!(bindings.action_for(&key), Some(expected), "{key:?}");
@@ -709,13 +797,107 @@ mod tests {
             assert_eq!(KeyAction::from_name(action.name()), Some(action));
         }
         assert_eq!(KeyAction::from_name("nope"), None);
+        for (name, action) in [
+            ("toggle_workbench", KeyAction::ToggleWorkbench),
+            ("open_kanban", KeyAction::OpenKanban),
+            ("open_mode_picker", KeyAction::OpenModePicker),
+            ("open_models", KeyAction::OpenModels),
+            ("show_help", KeyAction::ShowHelp),
+        ] {
+            assert_eq!(KeyAction::from_name(name), Some(action));
+        }
+    }
+
+    #[test]
+    fn every_action_has_a_german_label_and_a_default() {
+        for action in KeyAction::ALL {
+            assert!(!action.label_de().is_empty(), "{action}");
+            assert_eq!(action.default_chords().len(), 1, "{action}");
+        }
+        assert!(
+            KeyBindings::default().conflicts().is_empty(),
+            "default bindings must not conflict"
+        );
+    }
+
+    #[test]
+    fn describe_lists_all_actions_in_order() -> TestResult {
+        let bindings = KeyBindings::from_toml_str(
+            "show_help = []\nopen_models = [\"F8\", \"ctrl+m\"]\n",
+            Path::new("kb.toml"),
+        )?;
+        let described = bindings.describe();
+        assert_eq!(described.len(), KeyAction::ALL.len());
+        for ((action, _), expected) in described.iter().zip(KeyAction::ALL) {
+            assert_eq!(*action, expected);
+        }
+        let lookup = |wanted: KeyAction| {
+            described
+                .iter()
+                .find(|(action, _)| *action == wanted)
+                .map(|(_, chords)| chords.clone())
+                .unwrap_or_default()
+        };
+        assert_eq!(lookup(KeyAction::ToggleWorkbench), vec!["f5".to_owned()]);
+        assert_eq!(
+            lookup(KeyAction::OpenModels),
+            vec!["f8".to_owned(), "ctrl+m".to_owned()]
+        );
+        assert!(lookup(KeyAction::ShowHelp).is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn keybindings_file_accepts_new_action_names() -> TestResult {
+        let text = r#"
+toggle_workbench = "ctrl+w"
+open_kanban = "F9"
+open_mode_picker = "alt+m"
+open_models = "F10"
+show_help = "F12"
+"#;
+        let bindings = KeyBindings::from_toml_str(text, Path::new("kb.toml"))?;
+        for (key, action) in [
+            (
+                event(KeyCode::Char('w'), KeyModifiers::CONTROL),
+                KeyAction::ToggleWorkbench,
+            ),
+            (
+                event(KeyCode::F(9), KeyModifiers::NONE),
+                KeyAction::OpenKanban,
+            ),
+            (
+                event(KeyCode::Char('m'), KeyModifiers::ALT),
+                KeyAction::OpenModePicker,
+            ),
+            (
+                event(KeyCode::F(10), KeyModifiers::NONE),
+                KeyAction::OpenModels,
+            ),
+            (
+                event(KeyCode::F(12), KeyModifiers::NONE),
+                KeyAction::ShowHelp,
+            ),
+        ] {
+            assert_eq!(bindings.action_for(&key), Some(action), "{key:?}");
+        }
+        assert_eq!(
+            bindings.action_for(&event(KeyCode::F(5), KeyModifiers::NONE)),
+            None
+        );
+        let problems = invalid_problems(KeyBindings::from_toml_str(
+            r#"show_help = "F2""#,
+            Path::new("kb.toml"),
+        ));
+        assert_eq!(problems.len(), 1, "{problems:?}");
+        Ok(())
     }
 
     #[test]
     fn overrides_replace_only_named_actions() -> TestResult {
         let text = r#"
-toggle_explorer = "F6"
-toggle_agents = ["F7", "ctrl+g"]
+toggle_explorer = "F9"
+toggle_agents = ["F10", "ctrl+g"]
 end_host_mode = []
 "#;
         let bindings = KeyBindings::from_toml_str(text, Path::new("kb.toml"))?;
@@ -724,7 +906,7 @@ end_host_mode = []
             None
         );
         assert_eq!(
-            bindings.action_for(&event(KeyCode::F(6), KeyModifiers::NONE)),
+            bindings.action_for(&event(KeyCode::F(9), KeyModifiers::NONE)),
             Some(KeyAction::ToggleExplorer)
         );
         assert_eq!(
@@ -781,7 +963,7 @@ delete_line = "ctrl+shift+x"
     fn collects_all_problems() {
         let text = r#"
 toggle_explorer = "hyper+q"
-launch_rockets = "F9"
+launch_rockets = "F12"
 cycle_focus = 5
 "#;
         let problems = invalid_problems(KeyBindings::from_toml_str(text, Path::new("kb.toml")));
