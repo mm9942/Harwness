@@ -30,7 +30,7 @@
 //! [`harw_home::ResolvedHomeContext`] gebaut ([`RuntimeServices::with_home_context`])
 //! und — dritte deklarierte Differenz, [`ServiceSurface::allows_knowledge_store`]
 //! — nur auf Slash und Modell-Werkzeug gelegt. Damit finden `/workbench`,
-//! `/kanban`, `/diary`, `/palace` und `/context-proposal` ihren Speicher.
+//! `/kanban`, `/diary`, `/palace`, `/dream` und `/context-proposal` ihren Speicher.
 //! Web und Job bekommen ihn bewusst noch nicht: beide haben keine Sitzung,
 //! deren Workbench sie beschreiben dürften, und die Sichtbarkeitsprüfung der
 //! Wissensfläche kennt noch keinen Web-/Job-Aufrufer.
