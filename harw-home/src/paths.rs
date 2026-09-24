@@ -433,6 +433,31 @@ pub fn knowledge_dir(profile_dir: &Path) -> PathBuf {
     profile_dir.join("knowledge")
 }
 
+/// Ablage für Matrix-Spiele (Szenarien, Laufprotokolle) eines Profils.
+///
+/// # Description
+/// Liegt unterhalb des Knowledge-Stores ([`knowledge_dir`]) als
+/// `knowledge/matrix`. Die Funktion löst nur auf und legt nichts an.
+///
+/// # Arguments
+/// - `profile_dir` (`&Path`): bereits per [`profile_dir`] aufgelöstes
+///   Profilverzeichnis.
+///
+/// # Examples
+/// ```rust
+/// use std::path::Path;
+///
+/// let profile = Path::new("/tmp/harw/profiles/default");
+/// assert_eq!(
+///     harw_home::matrix_dir(profile),
+///     profile.join("knowledge").join("matrix")
+/// );
+/// ```
+#[must_use]
+pub fn matrix_dir(profile_dir: &Path) -> PathBuf {
+    knowledge_dir(profile_dir).join("matrix")
+}
+
 /// Ergebnis von [`config_layers_report`]: vertraute Layer plus Auskunft über
 /// einen ausgeschlossenen repo-lokalen `.harw`.
 ///
@@ -659,6 +684,16 @@ mod tests {
         // Plans und Goals dürfen sich nicht denselben Speicherort teilen —
         // Goals überleben Plan-Revisionen und müssen unabhängig löschbar sein.
         assert_ne!(plans_dir(&home), goals_dir(&home));
+    }
+
+    #[test]
+    fn matrix_dir_is_below_the_knowledge_dir() -> TestResult {
+        let home = PathBuf::from("/tmp/harw-test-home");
+        let profile = profile_dir(&home, "analysis")?;
+        let matrix = matrix_dir(&profile);
+        assert_eq!(matrix, home.join("profiles/analysis/knowledge/matrix"));
+        assert_eq!(matrix.parent(), Some(knowledge_dir(&profile).as_path()));
+        Ok(())
     }
 
     #[test]

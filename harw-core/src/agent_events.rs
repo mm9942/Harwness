@@ -32,6 +32,18 @@ pub enum AgentEventKind {
         purpose: String,
         usage: TokenUsage,
     },
+    /// Live-Ereignis eines laufenden Matrix-Spiels (`/matrix`).
+    ///
+    /// Die Nutzlast ist bewusst untypisiert (`serde_json::Value`), damit
+    /// `harw-core` nicht vom Matrix-Crate abhängt; Form typisch
+    /// `{"round","kind","audience","from","text"}`. Beobachter (TUI-
+    /// Matrix-Ansicht) filtern über `run_id`.
+    Matrix {
+        /// Kennung des Matrix-Laufs.
+        run_id: String,
+        /// Ereignis-Nutzlast als JSON.
+        event: serde_json::Value,
+    },
 }
 
 /// Ein Event mit Absender-Kennung.
@@ -75,6 +87,34 @@ impl AgentEventHub {
     /// Veröffentlicht ein Event (No-op ohne Beobachter).
     pub fn publish(&self, event: AgentEvent) {
         let _ = self.tx.send(event);
+    }
+
+    /// Veröffentlicht ein Matrix-Ereignis ([`AgentEventKind::Matrix`]).
+    ///
+    /// # Description
+    /// Bequemlichkeits-Hülle um [`Self::publish`]: `agent` ist die Session,
+    /// die den Lauf treibt; die Rolle wird fest als `matrix` gemeldet, ein
+    /// Eltern-Verweis entfällt. No-op ohne Beobachter.
+    ///
+    /// # Arguments
+    /// - `agent` (`SessionId`): treibende Session.
+    /// - `run_id` (`impl Into<String>`): Kennung des Matrix-Laufs.
+    /// - `event` (`serde_json::Value`): Ereignis-Nutzlast.
+    pub fn publish_matrix(
+        &self,
+        agent: SessionId,
+        run_id: impl Into<String>,
+        event: serde_json::Value,
+    ) {
+        self.publish(AgentEvent {
+            agent,
+            parent: None,
+            role: "matrix".into(),
+            kind: AgentEventKind::Matrix {
+                run_id: run_id.into(),
+                event,
+            },
+        });
     }
 
     /// Anzahl aktiver Beobachter.
@@ -236,6 +276,29 @@ mod tests {
             event.kind,
             AgentEventKind::InternalUsage { ref purpose, .. } if purpose == "title"
         ));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn publish_matrix_delivers_run_id_and_payload() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let hub = AgentEventHub::new(4);
+        let mut rx = hub.subscribe();
+        hub.publish_matrix(
+            SessionId::try_from_str("s-4")?,
+            "run-1",
+            serde_json::json!({"round": 1, "kind": "move", "text": "Zug"}),
+        );
+        let event = rx.recv().await?;
+        assert_eq!(event.role, "matrix");
+        assert!(event.parent.is_none());
+        match event.kind {
+            AgentEventKind::Matrix { run_id, event } => {
+                assert_eq!(run_id, "run-1");
+                assert_eq!(event["kind"], "move");
+            }
+            other => return Err(format!("unerwartetes Event: {other:?}").into()),
+        }
         Ok(())
     }
 

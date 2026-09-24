@@ -2,7 +2,7 @@
 //!
 //! [`GlobalArgs`] wird in [`super::Cli`] geflattet; alle Felder sind
 //! `global`, gelten also auch hinter jedem Subcommand. Die Sitzungs-Flags
-//! (`--mode`, `--approval`, `--model`, `--goal`, `--add-dir`) sind zwar
+//! (`--mode`, `--approval`, `--model`, `--goal`, `--agent`, `--add-dir`) sind zwar
 //! ebenfalls global, wirken aber nur bei `chat`, `exec` und `analyze`; welche
 //! davon gesetzt sind, meldet [`GlobalArgs::session_flags_used`], damit der
 //! Aufrufer sie bei anderen Befehlen als Fehler ablehnen kann.
@@ -11,9 +11,9 @@
 //! nicht global.
 //!
 //! # Argument-IDs
-//! Die Sitzungs-Flags `--mode`, `--approval`, `--model` und `--goal` tragen
-//! eigene IDs (`session_mode`, `session_approval`, `session_model`,
-//! `session_goal`). clap überträgt Werte globaler Argumente anhand der ID aus
+//! Die Sitzungs-Flags `--mode`, `--approval`, `--model`, `--goal` und
+//! `--agent` tragen eigene IDs (`session_mode`, `session_approval`,
+//! `session_model`, `session_goal`, `session_agent`). clap überträgt Werte globaler Argumente anhand der ID aus
 //! Subcommands nach oben; ohne eigene ID würde etwa ein positionales `model`
 //! eines Subcommands als globales `--model` erscheinen.
 
@@ -120,6 +120,16 @@ pub struct GlobalArgs {
         help_heading = "Sitzung"
     )]
     pub goal: Option<String>,
+    /// Startet die Sitzung mit dieser Agentendefinition als Wurzel statt der konfigurierten.
+    #[arg(
+        id = "session_agent",
+        long = "agent",
+        global = true,
+        value_name = "NAME",
+        value_hint = ValueHint::Other,
+        help_heading = "Sitzung"
+    )]
+    pub agent: Option<String>,
     /// Erlaubt Dateizugriffe ohne Rückfrage zusätzlich unter diesem Verzeichnis (mehrfach angebbar).
     #[arg(
         long = "add-dir",
@@ -146,6 +156,7 @@ impl Default for GlobalArgs {
             approval: None,
             model: None,
             goal: None,
+            agent: None,
             add_dir: Vec::new(),
         }
     }
@@ -156,7 +167,8 @@ impl GlobalArgs {
     ///
     /// # Rückgabe
     /// Die Flag-Namen (z. B. `"--mode"`) in fester Reihenfolge
-    /// `--mode`, `--approval`, `--model`, `--goal`, `--add-dir`; leer, wenn
+    /// `--mode`, `--approval`, `--model`, `--goal`, `--agent`, `--add-dir`;
+    /// leer, wenn
     /// keines gesetzt ist.
     #[must_use]
     pub fn session_flags_used(&self) -> Vec<&'static str> {
@@ -172,6 +184,9 @@ impl GlobalArgs {
         }
         if self.goal.is_some() {
             used.push("--goal");
+        }
+        if self.agent.is_some() {
+            used.push("--agent");
         }
         if !self.add_dir.is_empty() {
             used.push("--add-dir");

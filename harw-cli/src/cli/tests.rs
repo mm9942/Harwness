@@ -1608,6 +1608,8 @@ fn test_session_flags_used_lists_every_set_flag_in_order() -> TestResult {
         "/tmp/a",
         "--goal",
         "Ziel",
+        "--agent",
+        "uia",
         "--model",
         "m",
         "--approval",
@@ -1618,8 +1620,44 @@ fn test_session_flags_used_lists_every_set_flag_in_order() -> TestResult {
     .map_err(ctx("alle Sitzungs-Flags sollten parsen"))?;
     assert_eq!(
         cli.global.session_flags_used(),
-        vec!["--mode", "--approval", "--model", "--goal", "--add-dir"]
+        vec![
+            "--mode",
+            "--approval",
+            "--model",
+            "--goal",
+            "--agent",
+            "--add-dir"
+        ]
     );
+    Ok(())
+}
+
+#[test]
+fn test_agent_flag_sets_the_session_agent() -> TestResult {
+    let cli = Cli::try_parse_from(["harw", "--agent", "planner"])
+        .map_err(ctx("`harw --agent planner` sollte parsen"))?;
+    assert_eq!(cli.global.agent.as_deref(), Some("planner"));
+    assert_eq!(cli.global.session_flags_used(), vec!["--agent"]);
+    assert!(cli.command.is_none());
+
+    for argv in [
+        vec!["harw", "chat", "--agent", "uia"],
+        vec!["harw", "exec", "--agent", "uia", "hallo"],
+        vec!["harw", "analyze", "--agent", "uia"],
+    ] {
+        let cli = Cli::try_parse_from(argv.clone()).map_err(ctx("--agent hinter Subcommand"))?;
+        assert_eq!(cli.global.agent.as_deref(), Some("uia"), "{argv:?}");
+    }
+    Ok(())
+}
+
+#[test]
+fn test_agent_flag_does_not_capture_agent_subcommand() -> TestResult {
+    // Der Subcommand `harw agent …` darf nicht als `--agent` erscheinen.
+    let cli = Cli::try_parse_from(["harw", "agent", "skills"])
+        .map_err(ctx("`harw agent skills` sollte parsen"))?;
+    assert_eq!(cli.global.agent, None);
+    assert!(cli.global.session_flags_used().is_empty());
     Ok(())
 }
 

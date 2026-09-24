@@ -50,6 +50,7 @@
 //!     goal_context: None,
 //!     approval: None,
 //!     model: None,
+//!     agent: None,
 //! };
 //! chat::run_chat(None, Some("Hallo".to_owned()), None, startup, chat::ChatOptions::default())?;
 //! ```
@@ -129,6 +130,11 @@ pub(crate) struct ChatStartup {
     /// Explizit gewähltes Modell (`--model`, `RuntimeSpec::model_override`)
     /// als Schlüssel, Modell-ID oder Alias; `None` lässt die Vorgabe stehen.
     pub(crate) model: Option<String>,
+    /// Explizit gewählte Wurzel-Agentendefinition (`--agent`,
+    /// `RuntimeSpec::active_agent`); gewinnt über
+    /// `harness.active_agent_definition`. `None` lässt die Konfiguration
+    /// entscheiden.
+    pub(crate) agent: Option<String>,
 }
 
 /// Zusätzliche Chat-Flags, die `harw-cli/src/cli.rs::ChatArgs` heute noch
@@ -386,7 +392,11 @@ impl ChatRuntimeInputs {
                  laufen in dieser Sitzung ohne Rückfrage."
             );
         }
-        spec.active_agent = config.harness.active_agent_definition.clone();
+        // `--agent` gewinnt über `harness.active_agent_definition`.
+        spec.active_agent = startup
+            .agent
+            .clone()
+            .or_else(|| config.harness.active_agent_definition.clone());
 
         let home = spec.home.clone();
         let state_store =
@@ -1135,6 +1145,7 @@ mod tests {
             goal_context: None,
             approval: None,
             model: None,
+            agent: None,
         }
     }
 
@@ -1607,6 +1618,36 @@ mod tests {
         )?;
         assert_eq!(plain.spec.approval_override, None);
         assert_eq!(plain.spec.model_override, None);
+        Ok(())
+    }
+
+    #[test]
+    fn test_chat_inputs_agent_flag_overrides_configured_agent() -> TestResult {
+        let fixture = chat_fixture()?;
+        let plain = fixture_inputs(
+            &fixture,
+            EntryKind::OneShot,
+            IngressSurface::Cli,
+            startup(InteractionMode::Chat),
+        )?;
+        let configured = plain.spec.active_agent.clone();
+
+        let with_agent = ChatStartup {
+            agent: Some("planner".to_owned()),
+            ..startup(InteractionMode::Chat)
+        };
+        let inputs = fixture_inputs(
+            &fixture,
+            EntryKind::OneShot,
+            IngressSurface::Cli,
+            with_agent,
+        )?;
+        assert_eq!(inputs.spec.active_agent.as_deref(), Some("planner"));
+        assert_ne!(
+            configured.as_deref(),
+            Some("planner"),
+            "die Fixture darf `planner` nicht schon konfigurieren"
+        );
         Ok(())
     }
 

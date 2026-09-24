@@ -596,7 +596,7 @@ fn command_label(command: Option<&Command>) -> String {
 /// Lehnt Sitzungs-Flags bei Befehlen ab, die keine Sitzung starten.
 ///
 /// # Description
-/// `--mode`, `--approval`, `--model`, `--goal` und `--add-dir` wirken nur
+/// `--mode`, `--approval`, `--model`, `--goal`, `--agent` und `--add-dir` wirken nur
 /// bei `harw`/`harw chat`, `harw exec` und `harw analyze`. Bei jedem anderen
 /// Befehl würden sie still ignoriert; stattdessen bricht der Aufruf mit
 /// einem Hinweis ab. `analyze` startet keine Sitzung mit zusätzlichen
@@ -705,6 +705,7 @@ fn run_chat_entry(global: &GlobalArgs, chat_args: ChatArgs) -> Result<(), String
         goal_context: startup.goal_context,
         approval: global.approval,
         model: global.model.clone(),
+        agent: global.agent.clone(),
     };
     chat::run_chat(
         global.home.clone(),
@@ -2707,7 +2708,8 @@ fn analyze_assembly(
 /// Spawner-Wurzel registrierten Kennung.
 ///
 /// `--mode`, `--approval` und `--model` gehen als Overrides in die
-/// [`RuntimeSpec`] (`mode_override`, `approval_override`, `model_override`).
+/// [`RuntimeSpec`] (`mode_override`, `approval_override`, `model_override`);
+/// `--agent` setzt `RuntimeSpec::active_agent`.
 ///
 /// # Arguments
 /// - `global` (`&GlobalArgs`): globale Flags (`--home`, `--mode`, `--goal`,
@@ -2740,6 +2742,9 @@ fn cmd_analyze(global: &GlobalArgs, args: &AnalyzeArgs) -> Result<(), String> {
     spec.mode_override = Some(startup.mode);
     spec.approval_override = global.approval;
     spec.model_override = global.model.clone();
+    if let Some(agent) = &global.agent {
+        spec.active_agent = Some(agent.clone());
+    }
 
     let (model, secret_resolver) = if args.dry_run {
         (ModelSource::Echo("harw analyze --dry-run".to_owned()), None)
@@ -4188,6 +4193,8 @@ mod tests {
             vec!["harw", "chat", "--model", "m1"],
             vec!["harw", "exec", "--approval", "ask", "hallo", "welt"],
             vec!["harw", "analyze", "--goal", "Ziel"],
+            vec!["harw", "analyze", "--agent", "uia"],
+            vec!["harw", "--agent", "planner"],
             vec!["harw", "--add-dir", "/tmp"],
         ] {
             let cli = Cli::try_parse_from(argv).map_err(ctx("session flags parse"))?;
@@ -4216,6 +4223,15 @@ mod tests {
         let analyze = Cli::try_parse_from(["harw", "analyze", "--add-dir", "/tmp"])
             .map_err(ctx("analyze with --add-dir parses"))?;
         assert!(reject_misplaced_session_flags(analyze.command.as_ref(), &analyze.global).is_err());
+
+        let doctor_agent = Cli::try_parse_from(["harw", "doctor", "--agent", "uia"])
+            .map_err(ctx("doctor with --agent parses"))?;
+        let result =
+            reject_misplaced_session_flags(doctor_agent.command.as_ref(), &doctor_agent.global);
+        assert!(
+            matches!(&result, Err(error) if error.contains("--agent")),
+            "--agent bei doctor muss abgelehnt werden, bekam {result:?}"
+        );
         Ok(())
     }
 
