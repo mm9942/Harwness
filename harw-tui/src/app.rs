@@ -2683,26 +2683,6 @@ fn resume_request(raw: &str) -> Option<TuiRunOutcome> {
     }
 }
 
-/// Erkennt die bare Form eines Befehls **oder** dessen argloses `switch`
-/// (Welle 4a/7b: `/model`, `/model switch`, `/uia-effort switch`, …).
-///
-/// # Beschreibung
-/// `raw.trim() == command` oder `raw.trim() == format!("{command} switch")`
-/// — jeweils exakt, kein zusätzliches Argument. `/model switch <id>` bleibt
-/// unberührt (bleibt Text-Dispatch); nur die beiden argumentlosen Formen
-/// öffnen den jeweiligen Picker.
-///
-/// # Argumente
-/// - `raw` (`&str`): die unveränderte Befehlszeile.
-/// - `command` (`&str`): der zu erkennende Befehl, z. B. `"/model"`.
-///
-/// # Rückgabe
-/// `true` für die bare Form oder das arglose `switch`, sonst `false`.
-fn is_bare_or_argless_switch(raw: &str, command: &str) -> bool {
-    let trimmed = raw.trim();
-    trimmed == command || trimmed == format!("{command} switch")
-}
-
 /// Appends the controller-owned descendants of `parent` in pre-order.
 ///
 /// The `seen` guard makes a malformed controller snapshot harmless for the
@@ -3413,78 +3393,24 @@ pub(crate) async fn run_loop(
                             if let Some(request) = resume_request(&raw) {
                                 return Ok(request);
                             }
-                            // Die bare Form ist eine interaktive Projektion;
-                            // `/agent list` bleibt der textuelle Slash-Befehl.
-                            if raw.trim() == "/agent" {
-                                app.open_agent_tree();
-                                frame_req.schedule_frame();
-                                continue;
+                            // Eine offene Ansicht lädt nach jedem Befehl (z. B.
+                            // ihrem eigenen `Run`) neu; die Generationsprüfung
+                            // verwirft das Ergebnis, falls der Befehl die
+                            // Ansicht ersetzt.
+                            app.queue_overlay_refresh();
+                            if is_workbench_command(&raw) {
+                                app.workbench.mark_stale();
                             }
-                            // `/model`/`/uia-model`/`/uia-worker-model` ohne
-                            // Argument (oder als argloses `switch`) öffnen den
-                            // konsolidierten Provider/Modell-Picker statt der
-                            // Text-Ausgabe (`show`) — vor dem regulären
-                            // `/command`-Dispatch abgefangen, damit `show`
-                            // nicht zusätzlich läuft. `/model switch <id>` mit
-                            // Argument bleibt unberührt und läuft unverändert
-                            // weiter unten. Bare `/provider`/`/uia-provider`
-                            // öffnen seit der Picker-Konsolidierung (Welle 4a)
-                            // **keinen** Picker mehr — sie laufen unverändert
-                            // auf `show` durch den regulären Dispatch.
-                            if is_bare_or_argless_switch(&raw, "/model") {
-                                app.open_model_switch_picker(PickerTarget::Orchestrator);
-                                frame_req.schedule_frame();
-                                continue;
-                            }
-                            if is_bare_or_argless_switch(&raw, "/uia-model") {
-                                app.open_model_switch_picker(PickerTarget::Uia);
-                                frame_req.schedule_frame();
-                                continue;
-                            }
-                            if is_bare_or_argless_switch(&raw, "/uia-worker-model") {
-                                match app.resolved_config() {
-                                    // Der Worker ist zwingend an den effektiven
-                                    // UIA-Provider gebunden (UIA-Pin, sonst der
-                                    // aktive/Standard-Provider) — keine eigene
-                                    // `uia_worker_provider`-Konzeption.
-                                    Some(config) => {
-                                        let provider = config
-                                            .harness
-                                            .uia_provider
-                                            .clone()
-                                            .or_else(|| app.active_or_default_provider(&config));
-                                        match provider {
-                                            Some(fixed_provider) => app.open_model_switch_picker(
-                                                PickerTarget::UiaWorker { fixed_provider },
-                                            ),
-                                            None => app.push_line(
-                                                Role::System,
-                                                "UIA-Worker-Modell-Auswahl nicht verfügbar: kein \
-                                                 UIA-Pin-, aktiver oder Standard-Provider bekannt.",
-                                            ),
-                                        }
-                                    }
-                                    None => app.push_line(
-                                        Role::System,
-                                        "UIA-Worker-Modell-Auswahl nicht verfügbar: keine \
-                                         Konfiguration geladen.",
-                                    ),
+                            // TUI-lokale Befehle und Präfixe (`/model`, `/mode`,
+                            // `/help`, `#notiz`, `@rolle` …) — vor dem regulären
+                            // `/command`-Dispatch abgefangen. `/tools` und
+                            // `/compact` bleiben darunter unverändert.
+                            if let Some(intercepted) = local_intercept_for(app, &raw) {
+                                if let Some(outcome) =
+                                    apply_local_intercept(app, intercepted, harw_tx)
+                                {
+                                    return Ok(outcome);
                                 }
-                                frame_req.schedule_frame();
-                                continue;
-                            }
-                            // `/effort`/`/uia-effort` ohne Argument (oder als
-                            // argloses `switch`) öffnen die einstufige
-                            // Effort-Auswahl (Welle 7b) — dieselbe
-                            // Abfang-Reihenfolge wie beim Modell-Picker.
-                            // `/effort <level>` mit Argument bleibt unberührt.
-                            if is_bare_or_argless_switch(&raw, "/effort") {
-                                app.open_effort_choice(EffortTarget::Session);
-                                frame_req.schedule_frame();
-                                continue;
-                            }
-                            if is_bare_or_argless_switch(&raw, "/uia-effort") {
-                                app.open_effort_choice(EffortTarget::Uia);
                                 frame_req.schedule_frame();
                                 continue;
                             }
@@ -3608,16 +3534,22 @@ pub(crate) async fn run_loop(
                                     match app.runtime() {
                                         Some(rt) => {
                                             let caller_tier = runtime_commands::caller_tier(rt.principal());
-                                            match execute_export_command_with_data(
-                                                app.adapters(),
-                                                app.sandbox(),
-                                                app.session_id(),
-                                                caller_tier,
-                                                &raw,
-                                                || runtime_commands::slash_service_map(rt.services()),
-                                            )
-                                            .await
-                                            {
+                                            let export_output = if export_request_for_command(&raw).is_some() {
+                                                Some(
+                                                    command_data::execute_command_with_data(
+                                                        app.adapters(),
+                                                        app.sandbox(),
+                                                        app.session_id(),
+                                                        caller_tier,
+                                                        &raw,
+                                                        || runtime_commands::slash_service_map(rt.services()),
+                                                    )
+                                                    .await,
+                                                )
+                                            } else {
+                                                None
+                                            };
+                                            match export_output {
                                                 Some(Ok(output)) => (output.text, output.data),
                                                 Some(Err(error)) => (error, None),
                                                 None => {
@@ -4497,69 +4429,6 @@ struct ExportRequest {
     /// Exports in Unicode-Zeichen (nicht je Eintrag). Fehlt der Schlüssel im
     /// Marker, bleibt es `None` — keine Begrenzung.
     max_chars: Option<usize>,
-}
-
-/// Führt den strukturierten `/export`-Command bis zum `OpOutput` aus.
-///
-/// `execute_command_as` liefert aus Kompatibilitätsgründen nur den
-/// Anzeigetext zurück. Für `/export` muss die TUI zusätzlich `data` behalten;
-/// deshalb wird hier ausschließlich dieser eine Command über dieselbe
-/// Registry-/Admission-/Adapter-Pipeline ausgeführt. Für alle anderen Commands
-/// gibt die Funktion `None` zurück, sodass der bestehende Pfad unverändert
-/// verwendet werden kann.
-async fn execute_export_command_with_data<F>(
-    adapters: &[CommandAdapter],
-    sandbox: &SandboxSpec,
-    session_id: &SessionId,
-    caller_tier: crate::PermissionTier,
-    raw_line: &str,
-    services: F,
-) -> Option<Result<OpOutput, String>>
-where
-    F: FnOnce() -> harw_operations::ServiceMap,
-{
-    let invocation = crate::classify_input(raw_line).ok()?;
-    let Invocation::Command { name, .. } = &invocation else {
-        return None;
-    };
-    if name != "export" {
-        return None;
-    }
-
-    let registry = CommandRegistry::from_command_adapters(adapters);
-    let action = match registry.dispatch(
-        DispatchContext {
-            caller_tier,
-            surface: InvocationSurface::Tui,
-            capabilities: CapabilitySet::with(ShellCapability::CommandsShell),
-        },
-        invocation,
-    ) {
-        Ok(action) => action,
-        Err(error) => return Some(Err(format!("Eingabe abgelehnt: {error}"))),
-    };
-
-    let CommandAction::Command(spec, raw_args) = action else {
-        return Some(Err(
-            "Eingabe abgelehnt: /export ist kein ausführbarer Command.".to_owned(),
-        ));
-    };
-    let path = format!("/{}", spec.name.as_str());
-    let Some(adapter) = adapters.iter().find(|adapter| adapter.path() == path) else {
-        return Some(Err(format!("Unbekannter Command: /{}", spec.name.as_str())));
-    };
-    let ctx = harw_operations::OpContext::new(
-        session_id.clone(),
-        harw_types::TurnId::new(),
-        sandbox.clone(),
-        services(),
-    );
-    Some(
-        adapter
-            .dispatch(&ctx, raw_args)
-            .await
-            .map_err(|error| format!("Fehler: {error}")),
-    )
 }
 
 /// Erkennt `/export [--tools] [--datei <pfad>]` in der rohen Befehlszeile.
@@ -10655,31 +10524,6 @@ forbidden = [{forbidden}]
 
     // ── Welle 4a/7b: Picker-Konsolidierung (`/model`, `/uia-model`,
     // `/uia-worker-model`, `/effort`, `/uia-effort`) ──────────────────────
-
-    /// Bare Form und argloses `switch` öffnen den Picker; `switch <id>` mit
-    /// Argument bleibt Text-Dispatch (kein Picker).
-    #[test]
-    fn is_bare_or_argless_switch_matches_bare_and_argless_switch_only() -> TestResult {
-        assert!(is_bare_or_argless_switch("/model", "/model"));
-        assert!(is_bare_or_argless_switch("  /model  ", "/model"));
-        assert!(is_bare_or_argless_switch("/model switch", "/model"));
-        assert!(is_bare_or_argless_switch(
-            "/uia-effort switch",
-            "/uia-effort"
-        ));
-
-        assert!(!is_bare_or_argless_switch("/model switch x", "/model"));
-        assert!(!is_bare_or_argless_switch("/model list", "/model"));
-        assert!(!is_bare_or_argless_switch("/provider", "/model"));
-        // Bare `/provider` selbst öffnet seit der Konsolidierung (Welle 4a)
-        // keinen Picker mehr — es gibt schlicht keinen `is_bare_or_argless_switch`-
-        // Aufruf mehr für `/provider`/`/uia-provider` im Trigger-Zweig
-        // (siehe `run_loop`s `HarwEvent::Command`-Arm); diese Zeile hält nur
-        // fest, dass der Prädikat selbst `/provider` nicht fälschlich matcht,
-        // falls er versehentlich doch wieder verdrahtet würde.
-        assert!(!is_bare_or_argless_switch("/provider switch", "/model"));
-        Ok(())
-    }
 
     /// Ohne Konfiguration (Test-`ChatApp` ohne Runtime-Montage) wird kein
     /// leerer Dialog geöffnet, sondern eine klare Systemzeile angehängt —

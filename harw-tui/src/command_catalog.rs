@@ -471,15 +471,7 @@ fn local_spec(
 
 /// Namen der Ersatz-Spezifikationen für (noch) fehlende Operationen.
 #[cfg_attr(not(test), allow(dead_code))]
-pub(crate) const FALLBACK_COMMANDS: &[&str] = &[
-    "workbench",
-    "kanban",
-    "palace",
-    "dream",
-    "diary",
-    "models",
-    "mode",
-];
+pub(crate) const FALLBACK_COMMANDS: &[&str] = &["mode"];
 
 /// Spezifikationen aller TUI-lokalen Befehle plus Ersatz-Spezifikationen
 /// ([`FALLBACK_COMMANDS`]).
@@ -492,9 +484,7 @@ pub(crate) const FALLBACK_COMMANDS: &[&str] = &[
 /// sobald die Operation registriert ist.
 pub(crate) fn local_command_specs() -> Vec<CommandSpec> {
     use BusyAvailability::{DeferredUntilTurnEnd as Deferred, Immediate};
-    use CommandDomain::{
-        AgentTopology, CatalogConfig, Execution, Knowledge, Misc, SessionLifecycle,
-    };
+    use CommandDomain::{AgentTopology, Execution, Misc, SessionLifecycle};
     use PermissionTier::{Observer, Operator};
 
     [
@@ -581,54 +571,6 @@ pub(crate) fn local_command_specs() -> Vec<CommandSpec> {
         ),
         // ── Ersatz, solange die Operation fehlt ───────────────────────────
         local_spec(
-            "workbench",
-            Knowledge,
-            Operator,
-            Immediate,
-            "Arbeitsfläche: angeheftete Dateien, Notizen, Hypothesen",
-            "",
-        ),
-        local_spec(
-            "kanban",
-            Knowledge,
-            Operator,
-            Immediate,
-            "Kanban-Board der Aufgaben",
-            "",
-        ),
-        local_spec(
-            "palace",
-            Knowledge,
-            Operator,
-            Immediate,
-            "Gedächtnispalast: Wissensknoten durchsuchen",
-            "",
-        ),
-        local_spec(
-            "dream",
-            Knowledge,
-            Operator,
-            Immediate,
-            "Traumberichte (nächtliche Reflexion) ansehen",
-            "",
-        ),
-        local_spec(
-            "diary",
-            Knowledge,
-            Operator,
-            Immediate,
-            "Tagebuch: Einträge ansehen, Notiz schreiben",
-            "",
-        ),
-        local_spec(
-            "models",
-            CatalogConfig,
-            Operator,
-            Immediate,
-            "Modelle je Rolle anzeigen und setzen",
-            "",
-        ),
-        local_spec(
             "mode",
             SessionLifecycle,
             Operator,
@@ -655,8 +597,9 @@ mod tests {
         "agents",
     ];
 
-    /// Befehle, deren Operation fehlen darf (Wissens-Ops und `/models`).
-    const ALLOWED_MISSING: &[&str] = &["workbench", "kanban", "palace", "dream", "diary", "models"];
+    /// Befehle, deren Operation fehlen darf. Leer: alle Wissens-Ops und
+    /// `/models` sind inzwischen Operationen.
+    const ALLOWED_MISSING: &[&str] = &[];
 
     #[test]
     fn local_specs_cover_every_local_and_fallback_name_once() {
@@ -704,7 +647,7 @@ mod tests {
     }
 
     /// Drift: jeder Befehl mit Hinweisen existiert als Operation oder als
-    /// echter lokaler Befehl; nur Wissens-Ops und `/models` dürfen fehlen.
+    /// echter lokaler Befehl (Ausnahmen nur über `ALLOWED_MISSING`).
     #[test]
     fn every_hinted_command_exists_as_operation_or_local() -> TestResult {
         let built_in = CommandRegistry::built_in().map_err(ctx("built_in"))?;

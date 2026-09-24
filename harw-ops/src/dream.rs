@@ -235,9 +235,9 @@ fn resolve(reports: Vec<KnowledgeArtifact>, raw: &str) -> Result<KnowledgeArtifa
         0 => Err(OpError::InvalidArguments(format!(
             "kein sichtbarer Traumbericht '{raw}'"
         ))),
-        1 => matches
-            .pop()
-            .ok_or_else(|| OpError::InvalidArguments(format!("kein sichtbarer Traumbericht '{raw}'"))),
+        1 => matches.pop().ok_or_else(|| {
+            OpError::InvalidArguments(format!("kein sichtbarer Traumbericht '{raw}'"))
+        }),
         _ => {
             let ids: Vec<&str> = matches.iter().map(|report| report.id.as_str()).collect();
             Err(OpError::InvalidArguments(format!(
@@ -272,9 +272,9 @@ mod tests {
     use crate::test_support::{TestError, TestResult, ctx};
     use crate::testutil::toks;
     use harw_job_runtime::WorkId;
+    use harw_knowledge::KnowledgeStore;
     use harw_knowledge::artifact::ArtifactId;
     use harw_knowledge::dream::{DreamProposal, DreamReport};
-    use harw_knowledge::KnowledgeStore;
     use harw_operations::operation::{CommandVisibility, Surface};
     use harw_operations::{FromRawArgs, OpError, Operation};
 
@@ -292,8 +292,7 @@ mod tests {
     }
 
     fn report(work_id: &str, second: i64, topics: usize) -> TestResult<DreamReport> {
-        let created_at =
-            jiff::Timestamp::from_second(second).map_err(ctx("valid timestamp"))?;
+        let created_at = jiff::Timestamp::from_second(second).map_err(ctx("valid timestamp"))?;
         Ok(DreamReport {
             work_id: WorkId::from_str(work_id),
             created_at,
@@ -376,7 +375,11 @@ mod tests {
         assert_eq!(newest[0]["summary"], "Thema 0 ergänzen");
         assert_eq!(newest[2]["section"], "Palace-Promotionen");
         assert_eq!(data["reports"][1]["id"], "dream/1970-01-01/dream-old");
-        assert!(output.text.starts_with("2 Traumberichte:"), "{}", output.text);
+        assert!(
+            output.text.starts_with("2 Traumberichte:"),
+            "{}",
+            output.text
+        );
         std::fs::remove_dir_all(store.root()).ok();
         Ok(())
     }

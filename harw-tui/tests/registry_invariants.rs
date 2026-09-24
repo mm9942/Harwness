@@ -442,14 +442,15 @@ fn all_registered_ops_are_reachable_by_name() {
         // `/models` (`harw-ops/src/models.rs`): rollenbezogene Modellwahl,
         // `command(visibility = "tui_only")` und damit Surface::Command.
         "models",
-        // Wissensfläche (`harw-ops/src/{workbench,kanban,diary,palace}.rs`):
-        // `workbench`/`diary` deklarieren `visibility = "channel_reduced"`,
-        // `kanban`/`palace` `visibility = "channel_parity"` -- alle vier sind
+        // Wissensfläche (`harw-ops/src/{workbench,kanban,diary,palace,dream}.rs`):
+        // `workbench`/`diary`/`dream` deklarieren `visibility = "channel_reduced"`,
+        // `kanban`/`palace` `visibility = "channel_parity"` -- alle fünf sind
         // Surface::Command und stehen in `CommandRegistry::built_in()`.
         "workbench",
         "kanban",
         "diary",
         "palace",
+        "dream",
     ];
 
     // Jede Operation muss mindestens eine Fläche tragen. Eine ohne wäre über
