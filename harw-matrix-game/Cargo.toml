@@ -12,7 +12,7 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 toml = { workspace = true }
 # Gleiche Fassungen wie `harw-secrets` (Cargo.lock: sha2 0.10.9, rand_chacha 0.10.0 / rand_core 0.10.1).
-sha2 = "0.10.9"
+sha2 = "0.11.0"
 rand_chacha = "0.10"
 
 [lints]
