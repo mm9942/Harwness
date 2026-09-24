@@ -112,10 +112,15 @@ current code, not just historical rationale:
   authorization can only happen through the facade that names the specific
   action being authorized — never by constructing `Action`/`Authorized`
   directly.
-- **CI gates over prose.** Structural invariants (forbidden dependency edges,
-  a per-binary privilege/dependency budget, disjoint write scopes) are
-  enforced by generated gates (`xtask/src/gates.rs`) reading the dependency
-  graph, not by documentation asking contributors to remember a rule.
+- **CI gates over prose.** Structural invariants (forbidden dependency edges
+  and pure-crate hulls, a per-binary privilege budget for the four DoD
+  binaries, the Warden's runtime-dependency budget and its no-C-build rule)
+  are enforced by `cargo run -p xtask -- gates` (`xtask/src/gates.rs`),
+  which reads the dependency graph of the product workspace and the separate
+  `dod/` workspace together, not by documentation asking contributors to
+  remember a rule. CI runs the gates in the root job. A gate that checked
+  nothing counts as red, not green. The earlier write-scope gate was retired
+  together with the build plan's write-scope table.
 - **No C build in the Warden's dependency hull.** The privileged enforcement
   binary's transitive dependencies were checked to confirm none carry a
   native build script; this is verified, not assumed.

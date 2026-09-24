@@ -2081,6 +2081,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "harw-digest"
+version = "0.3.0"
+dependencies = [
+ "blake3",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "harw-dod-cap"
 version = "0.3.0"
 dependencies = [
@@ -2421,8 +2430,8 @@ dependencies = [
 name = "harw-lens-types"
 version = "0.3.0"
 dependencies = [
+ "harw-digest",
  "harw-macros",
- "harw-types",
  "serde",
  "serde_json",
 ]
@@ -2432,7 +2441,6 @@ name = "harw-macros"
 version = "0.3.0"
 dependencies = [
  "blake3",
- "harw-authority",
  "harw-dod-cap",
  "harw-dod-readfs",
  "harw-dod-signals",
@@ -3157,7 +3165,7 @@ dependencies = [
 name = "harw-types"
 version = "0.3.0"
 dependencies = [
- "blake3",
+ "harw-digest",
  "jiff",
  "serde",
  "serde_json",

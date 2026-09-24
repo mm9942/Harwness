@@ -1,0 +1,38 @@
+[package]
+publish.workspace = true
+name = "harw-digest"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+# `ContentDigest::of` hasht mit blake3 (mit `ContentDigest` aus
+# `harw-types` hierher verschoben, samt Befund):
+# BEFUND (Gate-Lauf, `warden-no-c-build`): `blake3` 1.8.7 verlangt in seiner
+# eigenen, gepinnten Quelle (`~/.cargo/registry/src/.../blake3-1.8.7/Cargo.toml`)
+# `[build-dependencies.cc]` **ohne** `optional = true` — diese Kante ist
+# bedingungslos, für jede Feature-Kombination. Geprüft: das Feature `pure`
+# (`pure = []`) schaltet in `build.rs` nur die SIMD-Assembly-/C-Intrinsics-
+# Pfade ab (reine Rust-Intrinsics werden gebaut) — es hebt weder die
+# `cc`-Build-Dependency im Manifest auf, noch verhindert es den
+# C-Compiler-Sondierungsaufruf `c_compiler_support()` in `build.rs`, der auf
+# x86/x86_64-Targets unabhängig von `pure` ausgeführt wird (nur der
+# *Fehlschlag* dieser Sondierung ist bei `pure` unschädlich, siehe dortige
+# `main()`-Logik). Damit gibt es **kein** Merkmal, dessen Abwahl diesen Fund
+# beseitigt, ohne die Version zu wechseln (verboten laut Auftrag) — ein
+# echter, mit den erlaubten Mitteln nicht behebbarer Verstoß. `ContentDigest`
+# bleibt unverändert auf `blake3` mit Default-Features (`std`), da eine
+# Featureänderung hier keinen Nutzen hätte und ungeprüfte Abwahl verboten
+# ist.
+# Datierte Ausnahme dazu: `C_BUILD_EXCEPTIONS` in `xtask/src/gate_warden.rs`.
+blake3 = { workspace = true }
+# Hex-Zeichenkette als Drahtformat (`Serialize`/`Deserialize` von Hand).
+serde = { workspace = true }
+
+[dev-dependencies]
+serde_json = { workspace = true }
+
+[lints]
+workspace = true

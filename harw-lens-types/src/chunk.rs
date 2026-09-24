@@ -3,7 +3,7 @@
 //! # Verantwortungsbereich
 //! Besitzt [`SourceRef`] (woher ein Chunk stammt), [`ByteSpan`] (welcher
 //! Byte-Bereich in der Quelle), [`ChunkDigest`] (das Newtype über
-//! [`harw_types::ContentDigest`] für Chunk-Inhalte) und [`Chunk`] selbst.
+//! [`harw_digest::ContentDigest`] für Chunk-Inhalte) und [`Chunk`] selbst.
 //! Dieses Modul tut kein I/O: das Einlesen von Quellen und das Zerlegen von
 //! Text in Chunks lebt in `harw-lens-chunk` (AW0-... nachgelagert), nicht
 //! hier. `harw-lens-types` liefert nur das Vokabular, in dem jene Crate
@@ -158,16 +158,16 @@ impl ByteSpan {
 /// Der Digest eines Chunks.
 ///
 /// # Description
-/// Ein Newtype über [`harw_types::ContentDigest`] statt eines Alias: ein
+/// Ein Newtype über [`harw_digest::ContentDigest`] statt eines Alias: ein
 /// Chunk-Digest und ein Nachweis-Digest sind beide 32 Bytes und dürfen
 /// trotzdem nie verwechselt werden. Das Hashen selbst lebt an genau einer
-/// Stelle ([`harw_types::ContentDigest::of`]). Serde delegiert transparent an
+/// Stelle ([`harw_digest::ContentDigest::of`]). Serde delegiert transparent an
 /// die innere Serialisierung des gewickelten Wertes (Hex-Zeichenkette).
 ///
 /// # Examples
 /// ```rust
 /// use harw_lens_types::ChunkDigest;
-/// use harw_types::ContentDigest;
+/// use harw_digest::ContentDigest;
 ///
 /// let digest = ChunkDigest(ContentDigest::of(b"chunk text"));
 /// let json = serde_json::to_string(&digest).unwrap();
@@ -175,7 +175,7 @@ impl ByteSpan {
 /// assert_eq!(round_tripped, digest);
 /// ```
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
-pub struct ChunkDigest(pub harw_types::ContentDigest);
+pub struct ChunkDigest(pub harw_digest::ContentDigest);
 
 /// Ein Stück Text mit Herkunft.
 ///
@@ -203,7 +203,7 @@ pub struct Chunk {
 mod tests {
     use super::*;
     use crate::test_support::{TestResult, ctx};
-    use harw_types::ContentDigest;
+    use harw_digest::ContentDigest;
 
     #[test]
     fn test_byte_span_new_accepts_start_less_than_end() {

@@ -43,6 +43,22 @@ pub enum CodeGraphError {
         name: String,
     },
 
+    /// Beim Zusammenführen mehrerer Workspaces (siehe
+    /// `WorkspaceGraph::load_many`) trägt ein Crate-Name zwei verschiedene
+    /// Manifeste. Ein stilles „erstes gewinnt" hieße, eine der beiden Kanten-
+    /// listen ungeprüft fallen zu lassen.
+    #[msg(
+        "Crate '{name}' ist in mehreren Workspaces verschieden definiert: '{first}' und '{second}'"
+    )]
+    DuplicateMember {
+        /// Der doppelt vergebene Crate-Name.
+        name: String,
+        /// Manifest-Pfad des zuerst geladenen Crates.
+        first: String,
+        /// Manifest-Pfad des zweiten, abweichenden Crates.
+        second: String,
+    },
+
     /// Der interne Abhängigkeitsgraph enthält einen Zyklus; die Ebenen-
     /// Berechnung (Kahn) konnte keinen weiteren Fortschritt machen.
     #[msg("Abhängigkeitszyklus erkannt: {crates:?}")]

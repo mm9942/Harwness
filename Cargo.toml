@@ -12,6 +12,8 @@ members = [
     "harw-home",
     "harw-plan",
     "harw-types",
+    # Leaf-Crate für ContentDigest (nur blake3 + serde), re-exportiert von harw-types.
+    "harw-digest",
     "harw-protocol",
     "harw-research",
     "harw-matrix-game",

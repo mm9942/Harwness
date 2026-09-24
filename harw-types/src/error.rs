@@ -64,36 +64,6 @@ impl fmt::Display for ImpactAssessmentError {
 impl std::error::Error for ImpactAssessmentError {}
 
 /// Error returned when a [`crate::digest::ContentDigest`] cannot be parsed
-/// from a string.
-///
-/// The rejected input's characters are deliberately not retained: a digest
-/// string may originate from untrusted evidence or manifest files, and
-/// echoing arbitrary attacker-controlled bytes back into a log or error
-/// message is worth avoiding. Only the character count that caused the
-/// rejection is kept, which is enough to distinguish a truncated value from
-/// garbage of the right length.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct InvalidDigest {
-    input_len: usize,
-}
-
-impl InvalidDigest {
-    /// Creates an invalid-digest error recording the rejected input's
-    /// character count.
-    #[must_use]
-    pub(crate) const fn new(input_len: usize) -> Self {
-        Self { input_len }
-    }
-}
-
-impl fmt::Display for InvalidDigest {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(
-            f,
-            "content digest must be exactly 64 hexadecimal characters, got {} characters",
-            self.input_len
-        )
-    }
-}
-
-impl std::error::Error for InvalidDigest {}
+/// from a string. Defined in `harw-digest` next to the digest itself and
+/// re-exported here so `harw_types::error::InvalidDigest` keeps working.
+pub use harw_digest::InvalidDigest;

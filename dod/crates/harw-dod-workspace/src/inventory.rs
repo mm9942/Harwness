@@ -336,6 +336,7 @@ fn map_code_graph_error(err: CodeGraphError) -> WorkspaceError {
         | CodeGraphError::ManifestMissing { .. }
         | CodeGraphError::NoWorkspaceSection { .. }
         | CodeGraphError::MemberMissing { .. }
+        | CodeGraphError::DuplicateMember { .. }
         | CodeGraphError::CycleDetected { .. } => WorkspaceError::MalformedSource,
         CodeGraphError::InvalidPath { .. }
         | CodeGraphError::CargoHomeUnavailable

@@ -192,7 +192,7 @@ impl EdgeIndex {
     /// # Examples
     /// ```rust
     /// use harw_lens_types::{ChunkDigest, EdgeIndex, EdgeKind};
-    /// use harw_types::ContentDigest;
+    /// use harw_digest::ContentDigest;
     ///
     /// let a = ChunkDigest(ContentDigest::of(b"a"));
     /// let b = ChunkDigest(ContentDigest::of(b"b"));
@@ -328,7 +328,7 @@ mod tests {
     use super::*;
     use crate::chunk::{ByteSpan, SourceRef};
     use crate::test_support::{TestResult, ctx};
-    use harw_types::ContentDigest;
+    use harw_digest::ContentDigest;
 
     fn sample_chunk(text: &str) -> TestResult<Chunk> {
         Ok(Chunk {

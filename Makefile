@@ -6,7 +6,8 @@
 # outside of these targets.
 #
 # `gates` invokes `xtask gates` — the dependency-graph, privilege and warden
-# structure gates, built on top of `WorkspaceGraph::load`. It does NOT
+# structure gates, built on top of `WorkspaceGraph::load_many` over the
+# product workspace and the separate `dod/` workspace. It does NOT
 # hang off `check`: `check` is meant to stay a fast type check that can be
 # run repeatedly on its own, and a gate that slows down every `check` gets
 # bypassed in practice (e.g. by calling `cargo check` directly). It hangs

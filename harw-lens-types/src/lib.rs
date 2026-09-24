@@ -29,7 +29,7 @@
 //! # Examples
 //! ```rust
 //! use harw_lens_types::{ByteSpan, Chunk, ChunkDigest, SourceRef};
-//! use harw_types::ContentDigest;
+//! use harw_digest::ContentDigest;
 //!
 //! let span = ByteSpan::new(0, 5).expect("start <= end");
 //! let chunk = Chunk {
