@@ -164,6 +164,24 @@ const DEFAULT_APPROVAL_TIMEOUT_SECS: u64 = 1800;
 /// Jeder Rückfall wird mit `tracing::warn!` gemeldet ([`model_limits_for`]).
 pub const UNKNOWN_MODEL_CONTEXT_WINDOW_TOKENS: u64 = 32_768;
 
+/// Kontextfenster (Token) des eingebauten Offline-Echos
+/// ([`ModelSource::Echo`]), wenn weder Konfiguration noch Katalog ein Fenster
+/// für das (optionale) Wurzelmodell nennen.
+///
+/// Der Echo ist kein echtes Modell: er hat kein Fenster, das eine Anfrage
+/// überschreiten könnte, und ruft keinen Provider. Das konservative
+/// [`UNKNOWN_MODEL_CONTEXT_WINDOW_TOKENS`] schützt ein *unbekanntes echtes*
+/// Modell vor einer Ablehnung durch den Provider; beim Echo würde es nur den
+/// Offline-Pfad (`harw run`, SDK `offline_echo`, Tests) an die zufällige Größe
+/// von System-Prompt und Werkzeugschemata koppeln. 200k entspricht dem
+/// verbreiteten Fenster großer Cloud-Modelle (und dem früheren Rückfallwert);
+/// die Verdichtungs-Obergrenze (`[compaction] absolute_ceiling_tokens`) gilt
+/// unverändert. Ein konfiguriertes/katalogisiertes Fenster hat weiterhin
+/// Vorrang (Tests, die mit Echo bewusst ein kleines Fenster setzen, bleiben
+/// gültig). [`ModelSource::Override`] bekommt diesen Wert **nicht**: dahinter
+/// steht in Produktion ein echter Provider (Jobs, Telegram).
+pub const OFFLINE_ECHO_CONTEXT_WINDOW_TOKENS: u64 = 200_000;
+
 /// Fester Token-Aufschlag für System-Prompt, Werkzeugschemata und
 /// Kontextfragmente, den die Auto-Verdichtung zusätzlich zur Ausgabereserve
 /// vom Fenster abzieht ([`harw_core::AutoCompactPolicy::with_fixed_overhead`]).
@@ -2170,6 +2188,11 @@ impl RuntimeAssemblyBuilder {
         //    HTTP-Client bauen darf (siehe dessen Doku und
         //    [`crate::model::build_uia_model_with_resolver`]).
         let source_is_configured = matches!(&model_source, ModelSource::Configured);
+        // Der Offline-Echo ist kein echtes Modell: Wurzel und Kinder bekommen
+        // ohne bekanntes Fenster [`OFFLINE_ECHO_CONTEXT_WINDOW_TOKENS`] statt
+        // des 32k-Rückfalls für unbekannte echte Modelle
+        // ([`session_model_limits`]).
+        let offline_echo = matches!(&model_source, ModelSource::Echo(_));
         let (default_tree_model, root_load_registry, root_backends) =
             crate::model::build_root_model_with_backends(
                 &spec,
@@ -2273,6 +2296,7 @@ impl RuntimeAssemblyBuilder {
                 live_models: Arc::clone(&live_models),
                 root_session_id: &root_session_id,
                 root_model_id: root_model_id.clone(),
+                offline_echo,
                 spawn_context: &spawn_context,
                 reasoning_effort: spec.reasoning_effort,
                 activation: &activation,
@@ -2863,6 +2887,7 @@ impl RuntimeAssemblyBuilder {
             root_uia_reasoning_effort_defaults,
             pitfall_advisor,
             root_model_id,
+            offline_echo,
             registry: Mutex::new(Some(registry)),
             responder: Mutex::new(None),
             host_permit_ledger,
@@ -3763,7 +3788,8 @@ fn effective_root_provider_id(config: &ResolvedConfig, uia_root: bool) -> Option
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ModelLimits {
     /// Effektives Kontextfenster (nie 0; unbekannt →
-    /// [`UNKNOWN_MODEL_CONTEXT_WINDOW_TOKENS`]).
+    /// [`UNKNOWN_MODEL_CONTEXT_WINDOW_TOKENS`], beim Offline-Echo
+    /// [`OFFLINE_ECHO_CONTEXT_WINDOW_TOKENS`]).
     pub context_window: u64,
     /// `[models.<id>].max_tokens`, falls konfiguriert.
     pub configured_max_output: Option<u64>,
@@ -3992,6 +4018,32 @@ fn version_dots_to_dashes(id: &str) -> String {
 /// Die [`ModelLimits`] des Modells.
 #[must_use]
 pub fn model_limits_for(config: &ResolvedConfig, model_id: &str) -> ModelLimits {
+    let (limits, local) = lookup_model_limits(config, model_id);
+    if !limits.known && local {
+        tracing::warn!(
+            model = model_id,
+            fallback_tokens = UNKNOWN_MODEL_CONTEXT_WINDOW_TOKENS,
+            "runtime.context_window.unknown_local_model: lokales Modell ohne \
+             [models.<id>].context_window; `harw provider scan` liest das Fenster vom \
+             Server, sonst gilt das konservative Rückfallfenster"
+        );
+    } else if !limits.known {
+        tracing::warn!(
+            model = model_id,
+            fallback_tokens = UNKNOWN_MODEL_CONTEXT_WINDOW_TOKENS,
+            "runtime.context_window.unknown_model: weder [models.<id>].context_window noch \
+             der Modellkatalog kennen dieses Modell; konservatives Rückfallfenster aktiv"
+        );
+    }
+    limits
+}
+
+/// Die Nachschlage-Logik von [`model_limits_for`] ohne Warnung.
+///
+/// # Rückgabe
+/// `(limits, local)` — `local` ist `true`, wenn das Modell über einen lokalen
+/// Provider läuft ([`model_runs_locally`]).
+fn lookup_model_limits(config: &ResolvedConfig, model_id: &str) -> (ModelLimits, bool) {
     let configured = config.models.get(model_id).or_else(|| {
         config.models.values().find(|model| {
             model.id == model_id || model.aliases.iter().any(|alias| alias.as_str() == model_id)
@@ -4021,30 +4073,15 @@ pub fn model_limits_for(config: &ResolvedConfig, model_id: &str) -> ModelLimits 
     let context_window = configured_window
         .or(catalog_window)
         .unwrap_or(UNKNOWN_MODEL_CONTEXT_WINDOW_TOKENS);
-    if !known && local {
-        tracing::warn!(
-            model = model_id,
-            fallback_tokens = UNKNOWN_MODEL_CONTEXT_WINDOW_TOKENS,
-            "runtime.context_window.unknown_local_model: lokales Modell ohne \
-             [models.<id>].context_window; `harw provider scan` liest das Fenster vom \
-             Server, sonst gilt das konservative Rückfallfenster"
-        );
-    } else if !known {
-        tracing::warn!(
-            model = model_id,
-            fallback_tokens = UNKNOWN_MODEL_CONTEXT_WINDOW_TOKENS,
-            "runtime.context_window.unknown_model: weder [models.<id>].context_window noch \
-             der Modellkatalog kennen dieses Modell; konservatives Rückfallfenster aktiv"
-        );
-    }
-    ModelLimits {
+    let limits = ModelLimits {
         context_window,
         configured_max_output: configured.and_then(|model| model.max_tokens),
         catalog_max_output: catalog_entry.and_then(|entry| entry.max_output),
         thinking: configured.is_some_and(|model| model.reasoning)
             || catalog_entry.is_some_and(|entry| entry.thinking),
         known,
-    }
+    };
+    (limits, local)
 }
 
 /// Runde 7, Teil L3: `true`, wenn `model_id` über einen lokalen Provider
@@ -4093,6 +4130,45 @@ fn model_limits_or_fallback(
             }
         }
     }
+}
+
+/// Grenzen für Wurzel und Kinder einer Montage mit Modellquelle
+/// `offline_echo` ([`ModelSource::Echo`]) bzw. einem echten Provider.
+///
+/// # Beschreibung
+/// Ohne Echo exakt [`model_limits_or_fallback`] (unbekanntes echtes Modell →
+/// [`UNKNOWN_MODEL_CONTEXT_WINDOW_TOKENS`] mit Warnung). Mit Echo gilt ein
+/// konfiguriertes oder katalogisiertes Fenster weiterhin; nur der Rückfall
+/// ist [`OFFLINE_ECHO_CONTEXT_WINDOW_TOKENS`] — ohne Warnung, denn der Echo
+/// hat kein Fenster, das überschritten werden könnte.
+///
+/// # Argumente
+/// - `config` (`&ResolvedConfig`): die aufgelöste Konfiguration.
+/// - `offline_echo` (`bool`): `true`, wenn die Montage den Offline-Echo fährt.
+/// - `model` / `fallback` (`Option<&str>`): wie bei [`model_limits_or_fallback`].
+///
+/// # Rückgabe
+/// Die [`ModelLimits`] für Fenster und Ausgabereserve.
+fn session_model_limits(
+    config: &ResolvedConfig,
+    offline_echo: bool,
+    model: Option<&str>,
+    fallback: Option<&str>,
+) -> ModelLimits {
+    if !offline_echo {
+        return model_limits_or_fallback(config, model, fallback);
+    }
+    model
+        .or(fallback)
+        .map(|model| lookup_model_limits(config, model).0)
+        .filter(|limits| limits.known)
+        .unwrap_or(ModelLimits {
+            context_window: OFFLINE_ECHO_CONTEXT_WINDOW_TOKENS,
+            configured_max_output: None,
+            catalog_max_output: None,
+            thinking: false,
+            known: false,
+        })
 }
 
 /// Kontextfenster eines Modells in Tokens.
@@ -4227,6 +4303,9 @@ struct SpawnerInputs<'a> {
     /// Teil C: Rückfall für das Kind-Modell und Hauptmodell der
     /// UIA-Worker-Fabrik.
     root_model_id: Option<String>,
+    /// `true` bei [`ModelSource::Echo`]: Kind-Fenster ohne bekanntes Modell
+    /// sind dann [`OFFLINE_ECHO_CONTEXT_WINDOW_TOKENS`] ([`session_model_limits`]).
+    offline_echo: bool,
     /// Der eine Spawn-Kontext des Laufs (Sandbox, Trace, Decke).
     spawn_context: &'a SpawnContext,
     /// Der gewählte Reasoning-Effort, falls einer gesetzt ist.
@@ -4312,6 +4391,7 @@ fn build_spawner(
         live_models,
         root_session_id,
         root_model_id,
+        offline_echo,
         spawn_context,
         reasoning_effort,
         activation,
@@ -4464,8 +4544,13 @@ fn build_spawner(
         // (Teil C: ohne Modell das effektive Vorgabemodell des Wurzel-Baums,
         // nicht das rohe `default_model`).
         .with_context_window_resolver(Arc::new(move |model: Option<&str>| {
-            model_limits_or_fallback(&window_config, model, window_default.as_deref())
-                .context_window
+            session_model_limits(
+                &window_config,
+                offline_echo,
+                model,
+                window_default.as_deref(),
+            )
+            .context_window
         }))
         // Teil C: ein unbekanntes Kind-Modell (Rückfallfenster) meldet die
         // Admission laut im Trace und im Agent-Panel.
@@ -4660,6 +4745,10 @@ pub struct RuntimeAssembly {
     /// [`Self::new_root_session`] leitet daraus Kontextfenster und
     /// Ausgabereserve ab.
     root_model_id: Option<String>,
+    /// `true`, wenn die Montage den Offline-Echo fährt ([`ModelSource::Echo`]);
+    /// ohne bekanntes Wurzelmodell gilt dann
+    /// [`OFFLINE_ECHO_CONTEXT_WINDOW_TOKENS`] ([`session_model_limits`]).
+    offline_echo: bool,
     registry: Mutex<Option<ExtensionRegistry>>,
     responder: Mutex<Option<Arc<dyn ApprovalHandler>>>,
     /// Einmal je Montage instanziierter Permit-Ledger für Host-Profil-Worker
@@ -5327,8 +5416,13 @@ impl RuntimeAssembly {
         // Aufschlag für System-Prompt/Werkzeuge werden vom Fenster abgezogen.
         // Der Handoff-Beobachter schreibt bei jeder Verdichtung
         // `<project>/.harw/handoff.json` (Contract §"harw-runtime/src/handoff.rs").
-        let root_limits =
-            model_limits_or_fallback(&self.config, self.root_model_id.as_deref(), None);
+        let offline_echo = self.offline_echo;
+        let root_limits = session_model_limits(
+            &self.config,
+            offline_echo,
+            self.root_model_id.as_deref(),
+            None,
+        );
         let context_window = root_limits.context_window;
         let output_reserve = root_limits.output_reserve_tokens();
         // Addendum F+G / Welle 8: eine UIA-Wurzel ohne expliziten Effort
@@ -5374,7 +5468,7 @@ impl RuntimeAssembly {
                     let config = Arc::clone(&self.config);
                     let root_model_id = self.root_model_id.clone();
                     Arc::new(move |model: Option<&str>| {
-                        model_limits_or_fallback(&config, model, root_model_id.as_deref())
+                        session_model_limits(&config, offline_echo, model, root_model_id.as_deref())
                             .context_window
                     })
                 })
@@ -5384,7 +5478,7 @@ impl RuntimeAssembly {
                     let config = Arc::clone(&self.config);
                     let root_model_id = self.root_model_id.clone();
                     Arc::new(move |model: Option<&str>| {
-                        model_limits_or_fallback(&config, model, root_model_id.as_deref())
+                        session_model_limits(&config, offline_echo, model, root_model_id.as_deref())
                             .output_reserve_tokens()
                     })
                 })
@@ -5882,6 +5976,51 @@ mod tests {
         assert_eq!(
             model_limits_or_fallback(&config, None, None).context_window,
             UNKNOWN_MODEL_CONTEXT_WINDOW_TOKENS
+        );
+    }
+
+    /// Der Offline-Echo ist kein echtes Modell: ohne bekanntes Fenster gilt
+    /// [`OFFLINE_ECHO_CONTEXT_WINDOW_TOKENS`], während ein unbekanntes Modell
+    /// hinter einem echten Provider beim konservativen 32k-Rückfall bleibt.
+    #[test]
+    fn offline_echo_gets_a_large_window_while_unknown_real_models_keep_32k() {
+        const _: () =
+            assert!(OFFLINE_ECHO_CONTEXT_WINDOW_TOKENS > UNKNOWN_MODEL_CONTEXT_WINDOW_TOKENS);
+        let config = ResolvedConfig::default();
+
+        // Echo ohne Modell (SDK `offline_echo`) und mit unbekanntem Modell.
+        for (model, fallback) in [(None, None), (Some("my-local-model"), None)] {
+            let echo = session_model_limits(&config, true, model, fallback);
+            assert_eq!(echo.context_window, OFFLINE_ECHO_CONTEXT_WINDOW_TOKENS);
+            assert!(!echo.known);
+            assert!(
+                echo.output_reserve_tokens() < echo.context_window / 2,
+                "Reserve muss deutlich unter dem Fenster bleiben"
+            );
+        }
+
+        // Echter Provider: unverändert der konservative Rückfall.
+        for (model, fallback) in [(None, None), (Some("my-local-model"), None)] {
+            let real = session_model_limits(&config, false, model, fallback);
+            assert_eq!(real.context_window, UNKNOWN_MODEL_CONTEXT_WINDOW_TOKENS);
+            assert_eq!(real.context_window, 32_768);
+            assert!(!real.known);
+        }
+
+        // Ein bekanntes Fenster gewinnt auch beim Echo (Verdichtungstests
+        // setzen bewusst kleine Fenster).
+        let mut small = ResolvedConfig::default();
+        small.models.insert(
+            "tiny".to_owned(),
+            model_toml("tiny-model", Some(8_000), None),
+        );
+        let echo_small = session_model_limits(&small, true, None, Some("tiny"));
+        assert!(echo_small.known);
+        assert_eq!(echo_small.context_window, 8_000);
+        let echo_catalog = session_model_limits(&config, true, Some("claude-haiku-4-5"), None);
+        assert_eq!(
+            echo_catalog.context_window,
+            model_limits_for(&config, "claude-haiku-4-5").context_window
         );
     }
 

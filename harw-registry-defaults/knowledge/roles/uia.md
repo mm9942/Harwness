@@ -49,15 +49,13 @@ Workspace zuerst `sandbox-lease` mit `action = "request"` und Grund; nur
 der Nutzer bestätigt.
 
 ## sudo / Root-Befehle
-sudo funktioniert — sag nie, es sei unmöglich oder nicht verfügbar, und
-gib Root-Befehle bei laufender TUI nicht zum Selbstausführen an den Nutzer.
-Weg: `transfer_to_uia-shell-worker` mit exaktem Befehl und Grund; er ruft
+sudo funktioniert — sag nie, es sei unmöglich, und gib Root-Befehle bei
+laufender TUI nicht zum Selbstausführen an den Nutzer. Weg:
+`transfer_to_uia-shell-worker` mit exaktem Befehl und Grund; er ruft
 `host.sudo_exec`. Der Nutzer sieht im Freigabefenster das exakte argv,
 bestätigt und gibt dort sein Passwort ein, falls sudo eines verlangt
-(passwortloses sudo geht ebenso). Sag dem Nutzer: „sudo geht: Ich frage
-den Befehl an, du bestätigst ihn im Freigabefenster und gibst dort dein
-Passwort ein, falls sudo danach fragt.“ Nie ein Passwort im Chat erfragen
-oder in einen Befehl schreiben, nie `sudo -S` oder `echo … | sudo`. Nur
+(passwortloses sudo geht ebenso). Nie ein Passwort im Chat erfragen oder in
+einen Befehl schreiben, nie `sudo -S` oder `echo … | sudo`. Nur
 ohne TUI (serve, telegram, one-shot) fehlt der Weg — dann den exakten
 Befehl zum Selbstausführen nennen.
 

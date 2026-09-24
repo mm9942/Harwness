@@ -57,6 +57,7 @@ use ratatui::{
 };
 
 use crate::ask_user_dialog::{AskStep, AskUserDialog};
+use crate::dialog_frame::{self, BodyScroll, DialogContent, PinnedRow};
 use crate::sanitize::sanitize_inline;
 use crate::style::{self, Theme};
 use crate::tui_event::TuiEvent;
@@ -393,6 +394,8 @@ pub(crate) struct PlanExitDialog {
     feedback: String,
     editing: bool,
     shown_at: Instant,
+    /// Scroll-Zustand des Kopfes im Optionsfenster (lange Titel/Zusammenfassung).
+    body_scroll: BodyScroll,
 }
 
 impl fmt::Debug for PlanExitDialog {
@@ -428,6 +431,7 @@ impl PlanExitDialog {
             feedback: String::new(),
             editing: false,
             shown_at: now,
+            body_scroll: BodyScroll::default(),
         }
     }
 
@@ -445,6 +449,7 @@ impl PlanExitDialog {
             feedback: String::new(),
             editing: false,
             shown_at: now,
+            body_scroll: BodyScroll::default(),
         }
     }
 
@@ -547,11 +552,30 @@ impl PlanExitDialog {
                 return PlanStep::Stay(true);
             }
             TuiEvent::Resize(..) | TuiEvent::Draw => return PlanStep::Stay(true),
-            TuiEvent::Paste(_) | TuiEvent::Mouse(_) => return PlanStep::Stay(false),
+            // Das Mausrad scrollt den Plan (über Plan und Optionsfenster).
+            TuiEvent::Mouse(mouse) => {
+                return match mouse.kind {
+                    crossterm::event::MouseEventKind::ScrollUp => {
+                        self.scroll_by(-3);
+                        PlanStep::Stay(true)
+                    }
+                    crossterm::event::MouseEventKind::ScrollDown => {
+                        self.scroll_by(3);
+                        PlanStep::Stay(true)
+                    }
+                    _ => PlanStep::Stay(false),
+                };
+            }
+            TuiEvent::Paste(_) => return PlanStep::Stay(false),
         };
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
         if ctrl && matches!(key.code, KeyCode::Char('c' | 'C')) {
             return self.close();
+        }
+        // `Strg+↑↓` scrollt den Plan zeilenweise, ohne die Auswahl zu ändern.
+        if BodyScroll::is_scroll_key(&key) {
+            self.scroll_by(if key.code == KeyCode::Up { -1 } else { 1 });
+            return PlanStep::Stay(true);
         }
         match key.code {
             KeyCode::PageDown => {
@@ -637,7 +661,8 @@ impl PlanExitDialog {
         PlanStep::Done(PlanDialogAction::Closed)
     }
 
-    fn option_lines(&self, theme: Theme, now: Instant) -> Vec<Line<'static>> {
+    /// Kopf (Körper) und angeheftete Optionen/Fußzeile des Optionsfensters.
+    fn content(&self, theme: Theme, now: Instant, width: u16) -> DialogContent {
         let dim = style::dim_style(theme);
         let accent = plan_style(theme);
         let title = match self.confirm {
@@ -653,16 +678,17 @@ impl PlanExitDialog {
             ),
             None => format!("Plan umsetzen? · {}", sanitize_inline(&self.display_path)),
         };
-        let mut lines = vec![Line::styled(
+        let mut body = vec![Line::styled(
             title,
             Style::default().add_modifier(Modifier::BOLD),
         )];
         if self.empty {
-            lines.push(Line::styled(
+            body.push(Line::styled(
                 "⚠ Der Plan ist leer — eine Freigabe setzt nichts Konkretes um.",
                 style::warning_style(theme),
             ));
         }
+        let mut pinned = Vec::new();
         let options = self.options();
         let last = options.len().saturating_sub(1);
         for (index, label) in options.iter().enumerate() {
@@ -685,33 +711,57 @@ impl PlanExitDialog {
                     if self.editing { Style::default() } else { dim },
                 ));
             }
-            lines.push(Line::from(spans));
+            pinned.push(PinnedRow::content(Line::from(spans)));
         }
-        let footer = if !self.armed(now) {
-            "Fenster wird gleich scharf … · Bild↑/↓ scrollt · Esc schließt"
+        let footers: &[&str] = if !self.armed(now) {
+            &[
+                "Fenster wird gleich scharf … · Bild↑/↓ scrollt · Esc schließt",
+                "gleich scharf … · Esc schließt",
+            ]
         } else if self.editing {
-            "Rückmeldung tippen · Enter senden · Shift+Enter neue Zeile · Esc zurück"
+            &[
+                "Rückmeldung tippen · Enter senden · Shift+Enter neue Zeile · Esc zurück",
+                "Enter senden · Shift+Enter Zeile · Esc zurück",
+                "Enter · Esc",
+            ]
         } else if self.confirm.is_some() {
-            "↑↓ wählen · 1/2 direkt · Enter bestätigen · Bild↑/↓ scrollt den Plan · Esc schließt"
+            &[
+                "↑↓ wählen · 1/2 direkt · Enter bestätigen · Bild↑/↓ scrollt den Plan · Esc schließt",
+                "↑↓ wählen · Enter ok · Bild↑/↓ Plan · Esc schließt",
+                "↑↓ · Enter · Bild↑/↓ · Esc",
+            ]
         } else {
-            "↑↓ wählen · 1–3 direkt · Enter bestätigen · Bild↑/↓ scrollt den Plan · Esc schließt"
+            &[
+                "↑↓ wählen · 1–3 direkt · Enter bestätigen · Bild↑/↓ scrollt den Plan · Esc schließt",
+                "↑↓ wählen · Enter ok · Bild↑/↓ Plan · Esc schließt",
+                "↑↓ · Enter · Bild↑/↓ · Esc",
+            ]
         };
-        lines.push(Line::styled(footer, dim));
+        pinned.push(PinnedRow::content(Line::styled(
+            dialog_frame::pick_fitting(footers, width),
+            dim,
+        )));
+        DialogContent { body, pinned }
+    }
+
+    /// Alle Zeilen des Optionsfensters (Kopf, Optionen, Fußzeile) — für Tests.
+    #[cfg(test)]
+    fn option_lines(&self, theme: Theme, now: Instant) -> Vec<Line<'static>> {
+        let content = self.content(theme, now, u16::MAX);
+        let mut lines = content.body;
+        lines.extend(content.pinned.into_iter().map(|row| row.line));
         lines
     }
 
     fn desired_height(&self, width: u16, theme: Theme) -> u16 {
         let inner = width.saturating_sub(2).max(1);
-        let rows = Paragraph::new(self.option_lines(theme, Instant::now()))
-            .wrap(Wrap { trim: false })
-            .line_count(inner);
-        u16::try_from(rows)
-            .unwrap_or(u16::MAX)
-            .saturating_add(2)
+        self.content(theme, Instant::now(), inner)
+            .desired_height(width)
             .clamp(6, 14)
     }
 
     fn render(&self, input: Rect, history: Rect, buf: &mut Buffer, theme: Theme) {
+        let history = history.intersection(buf.area);
         if history.height > 2 && history.width > 2 {
             Clear.render(history, buf);
             let block = Block::default()
@@ -746,10 +796,16 @@ impl PlanExitDialog {
                 },
                 plan_style(theme),
             ));
-        Paragraph::new(self.option_lines(theme, Instant::now()))
-            .wrap(Wrap { trim: false })
-            .block(block)
-            .render(input, buf);
+        let width = block.inner(input.intersection(buf.area)).width.max(1);
+        let content = self.content(theme, Instant::now(), width);
+        dialog_frame::render_dialog(
+            block,
+            input,
+            buf,
+            &content,
+            &self.body_scroll,
+            style::dim_style(theme),
+        );
     }
 }
 
@@ -761,6 +817,8 @@ pub(crate) struct PlanEnterDialog {
     reason: String,
     cursor: usize,
     shown_at: Instant,
+    /// Scroll-Zustand des Körpers (Vorschlag und Grund).
+    body_scroll: BodyScroll,
 }
 
 impl fmt::Debug for PlanEnterDialog {
@@ -779,6 +837,7 @@ impl PlanEnterDialog {
             prompt: Some(prompt),
             cursor: 1,
             shown_at: now,
+            body_scroll: BodyScroll::default(),
         }
     }
 
@@ -799,12 +858,19 @@ impl PlanEnterDialog {
         let key = match event {
             TuiEvent::Key(key) => key,
             TuiEvent::Resize(..) | TuiEvent::Draw => return PlanStep::Stay(true),
-            TuiEvent::Paste(_) | TuiEvent::Mouse(_) => return PlanStep::Stay(false),
+            TuiEvent::Mouse(mouse) => {
+                return PlanStep::Stay(self.body_scroll.handle_wheel(mouse.kind));
+            }
+            TuiEvent::Paste(_) => return PlanStep::Stay(false),
         };
         let ctrl_c = key.modifiers.contains(KeyModifiers::CONTROL)
             && matches!(key.code, KeyCode::Char('c' | 'C'));
         if ctrl_c || key.code == KeyCode::Esc {
             return self.answer(false);
+        }
+        // `Strg+↑↓` scrollt den Körper, ohne die Auswahl zu ändern.
+        if self.body_scroll.handle_key(&key) {
+            return PlanStep::Stay(true);
         }
         if now.saturating_duration_since(self.shown_at) < PLAN_ARMING_DELAY {
             return PlanStep::Stay(false);
@@ -821,21 +887,21 @@ impl PlanEnterDialog {
         }
     }
 
-    fn lines(&self, theme: Theme) -> Vec<Line<'static>> {
+    fn content(&self, theme: Theme, width: u16) -> DialogContent {
         let dim = style::dim_style(theme);
         let accent = plan_style(theme);
         let option = |index: usize, label: &str| {
             let selected = self.cursor == index;
-            Line::styled(
+            PinnedRow::content(Line::styled(
                 format!(
                     "{} {}. {label}",
                     if selected { "›" } else { " " },
                     index + 1
                 ),
                 if selected { accent } else { Style::default() },
-            )
+            ))
         };
-        vec![
+        let body = vec![
             Line::styled(
                 "Der Agent schlägt vor, zuerst zu planen (Plan-Modus: nichts wird verändert).",
                 Style::default().add_modifier(Modifier::BOLD),
@@ -844,10 +910,29 @@ impl PlanEnterDialog {
                 Span::styled("Grund: ", dim),
                 Span::raw(sanitize_inline(&self.reason)),
             ]),
+        ];
+        let pinned = vec![
             option(0, "Ja, in den Plan-Modus wechseln"),
             option(1, "Nein, weiter wie bisher"),
-            Line::styled("←→ wählen · 1/2 · Enter bestätigen · Esc = Nein", dim),
-        ]
+            PinnedRow::content(Line::styled(
+                dialog_frame::pick_fitting(
+                    &[
+                        "←→ wählen · 1/2 · Enter bestätigen · Esc = Nein",
+                        "←→ · 1/2 · Enter · Esc = Nein",
+                    ],
+                    width,
+                ),
+                dim,
+            )),
+        ];
+        DialogContent { body, pinned }
+    }
+
+    fn desired_height(&self, width: u16, theme: Theme) -> u16 {
+        let inner = width.saturating_sub(2).max(1);
+        self.content(theme, inner)
+            .desired_height(width)
+            .clamp(6, 12)
     }
 
     fn render(&self, area: Rect, buf: &mut Buffer, theme: Theme) {
@@ -858,10 +943,15 @@ impl PlanEnterDialog {
                 " Plan-Modus vorgeschlagen · plan.enter ",
                 plan_style(theme),
             ));
-        Paragraph::new(self.lines(theme))
-            .wrap(Wrap { trim: false })
-            .block(block)
-            .render(area, buf);
+        let width = block.inner(area.intersection(buf.area)).width.max(1);
+        dialog_frame::render_dialog(
+            block,
+            area,
+            buf,
+            &self.content(theme, width),
+            &self.body_scroll,
+            style::dim_style(theme),
+        );
     }
 }
 
@@ -1015,6 +1105,41 @@ impl PlanUi {
         }
     }
 
+    /// Scrollt den Inhalt des offenen Fensters um `lines` Zeilen: bei der
+    /// Plan-Freigabe den Plan, sonst den Körper. Ändert nie die Auswahl.
+    ///
+    /// # Returns
+    /// `true`, wenn ein Fenster offen ist (neu zeichnen).
+    pub(crate) fn scroll_body(&mut self, up: bool, lines: usize) -> bool {
+        let delta = i32::try_from(lines).unwrap_or(i32::MAX);
+        match self.open.as_mut() {
+            None => false,
+            Some(OpenDialog::Exit(dialog)) => {
+                dialog.scroll_by(if up { -delta } else { delta });
+                true
+            }
+            Some(OpenDialog::Enter(dialog)) => {
+                if up {
+                    dialog.body_scroll.scroll_up(lines);
+                } else {
+                    dialog.body_scroll.scroll_down(lines);
+                }
+                true
+            }
+            Some(OpenDialog::Ask(dialog)) => {
+                dialog.scroll_body(up, lines);
+                true
+            }
+        }
+    }
+
+    /// `true`, solange das offene Fenster den Plan über dem Verlauf zeigt
+    /// (Plan-Freigabe); das Mausrad über dem Verlauf scrollt dann den Plan.
+    #[must_use]
+    pub(crate) fn covers_history(&self) -> bool {
+        matches!(self.open, Some(OpenDialog::Exit(_)))
+    }
+
     /// Schließt jedes offene und wartende Fenster ohne Entscheidung
     /// (Turn-Ende, Leerlauf).
     ///
@@ -1041,7 +1166,7 @@ impl PlanUi {
     pub(crate) fn desired_height(&self, width: u16, theme: Theme) -> Option<u16> {
         match self.open.as_ref()? {
             OpenDialog::Exit(dialog) => Some(dialog.desired_height(width, theme)),
-            OpenDialog::Enter(_) => Some(7),
+            OpenDialog::Enter(dialog) => Some(dialog.desired_height(width, theme)),
             OpenDialog::Ask(dialog) => Some(dialog.desired_height(width, theme)),
         }
     }

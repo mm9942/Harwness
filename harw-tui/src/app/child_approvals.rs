@@ -357,7 +357,7 @@ pub(crate) fn route_event(app: &mut ChatApp, event: TuiEvent) -> Result<bool, Tu
         return Ok(false);
     };
     match dialog.handle_key(key, armed) {
-        DialogAction::Stay | DialogAction::ToggleDetails => Ok(true),
+        DialogAction::Stay | DialogAction::ToggleDetails | DialogAction::Scrolled => Ok(true),
         DialogAction::Decided(choice) => {
             decide(app, choice);
             Ok(true)

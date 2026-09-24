@@ -1711,12 +1711,10 @@ const SUDO_HANDOFF_ROLE: &str = "uia-shell-worker";
 /// bekommt einen leeren Zusatz (Beschreibung unverändert).
 fn handoff_role_hint(role: &str) -> &'static str {
     if role == SUDO_HANDOFF_ROLE {
-        " Host-Befehle und Root-Befehle (sudo): sudo funktioniert über diesen Agenten — er \
-         fragt `host.sudo_exec` an, der Nutzer bestätigt den exakten Befehl im \
-         Freigabefenster der TUI und gibt dort sein Passwort ein, falls sudo eines verlangt. \
-         Im Auftrag den exakten Befehl und den Grund nennen, nie ein Passwort. / Host and \
-         root (sudo) commands: sudo works through this agent — the user confirms the exact \
-         command in the TUI approval window and enters their password there if sudo asks."
+        " Host- und Root-Befehle (sudo): sudo funktioniert über diesen Agenten — er fragt \
+         `host.sudo_exec` an, der Nutzer bestätigt den exakten Befehl im Freigabefenster der \
+         TUI und gibt dort sein Passwort ein, falls sudo eines verlangt. Im Auftrag exakten \
+         Befehl und Grund nennen, nie ein Passwort."
     } else {
         ""
     }
@@ -1744,27 +1742,20 @@ fn handoff_tool_spec(role: &str) -> ToolSpec {
     let mut properties = BTreeMap::new();
     properties.insert(
         "task".to_owned(),
-        string_property(
-            "Konkreter, eigenständig verständlicher Arbeitsauftrag für den Unteragenten. / \
-             Concrete, self-contained task for the sub-agent.",
-        ),
+        string_property("Konkreter, eigenständig verständlicher Arbeitsauftrag."),
     );
     properties.insert(
         "context".to_owned(),
-        string_property(
-            "Optionaler Zusatzkontext (Fakten, Pfade, Randbedingungen). / \
-             Optional extra context (facts, paths, constraints).",
-        ),
+        string_property("Optionaler Zusatzkontext (Fakten, Pfade, Randbedingungen)."),
     );
     // Runde 5, Teil J: Fortsetzung eines am Budget beendeten eigenen Kindes
     // derselben Rolle; geprüft von `ManagedAgentSpawner::admit`.
     properties.insert(
         "continue_from".to_owned(),
         string_property(
-            "Optional: ID eines eigenen Kindes dieser Rolle, das am Token-Budget endete. Das \
-             neue Kind bekommt dessen Übergabe als Kontext und ein frisches Budget (höchstens 3 \
-             Fortsetzungen je ursprünglichem Kind). / Optional: id of an own child of this role \
-             that ended at its token budget; the new child continues from its handoff.",
+            "Optional: ID eines eigenen, am Token-Budget beendeten Kindes dieser Rolle; das \
+             neue Kind setzt mit dessen Übergabe und frischem Budget fort (höchstens 3 \
+             Fortsetzungen je ursprünglichem Kind).",
         ),
     );
     // Runde 5, Teil K: Hintergrundlauf. Ausgewertet nur von der TUI für
@@ -1776,10 +1767,8 @@ fn handoff_tool_spec(role: &str) -> ToolSpec {
             schema_type: Some(JsonSchemaType::Boolean),
             description: Some(
                 "Optional: im Hintergrund laufen lassen (nur Orchestratoren der UIA in der TUI; \
-                 Vorgabe dort true). Das Werkzeug kehrt dann sofort mit {child_id, status, hint} \
-                 zurück, das Ergebnis kommt später als Benachrichtigung. false erzwingt \
-                 synchrones Warten. / Optional: run in the background (UIA orchestrators in the \
-                 TUI only; default true there); false forces a synchronous wait."
+                 Vorgabe dort true): sofortige Rückkehr mit {child_id, status, hint}, das \
+                 Ergebnis kommt als Benachrichtigung. false erzwingt synchrones Warten."
                     .to_owned(),
             ),
             ..JsonSchema::default()
@@ -1789,8 +1778,7 @@ fn handoff_tool_spec(role: &str) -> ToolSpec {
         name: ToolName::new(format!("{HANDOFF_PREFIX}{role}")),
         description: format!(
             "Delegiert eine Aufgabe an den Unteragenten '{role}' und wartet auf sein Ergebnis \
-             (ein Orchestrator der UIA läuft in der TUI im Hintergrund). / \
-             Delegates a task to the '{role}' sub-agent and waits for its result.{}",
+             (ein Orchestrator der UIA läuft in der TUI im Hintergrund).{}",
             handoff_role_hint(role)
         ),
         parameters: JsonSchema {

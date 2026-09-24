@@ -73,11 +73,12 @@ use ratatui::{
     layout::Rect,
     style::{Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, Widget},
+    widgets::{Block, Borders},
 };
 
 use harw_extension_api::ToolCall;
 
+use crate::dialog_frame::{self, BodyScroll, DialogContent, PinnedRow};
 use crate::history_cell::{
     APPROVAL_COLLAPSED_ARGUMENT_LINES, ApprovalArgument, ApprovalArgumentValue, wrap_plain,
 };
@@ -88,6 +89,18 @@ use crate::style::{self, Theme};
 
 /// Fußzeilen-Hinweis mit der Tastaturbelegung des Panels.
 const FOOTER_HINT: &str = "↑↓ wählen · Enter bestätigen · v Details · Esc = Nein";
+
+/// Varianten des Fußzeilen-Hinweises, von lang nach kurz; gezeigt wird die
+/// längste, die in die Innenbreite passt (nie abgeschnitten).
+const FOOTER_HINTS: &[&str] = &[
+    FOOTER_HINT,
+    "↑↓ wählen · Enter ok · v Details · Esc Nein",
+    "↑↓ · Enter · v Details · Esc Nein",
+    "↑↓ Enter v Esc",
+];
+
+/// Endung der verdichteten Vorschauzeile des Hauptarguments.
+const DETAILS_MARKER: &str = "… v Details";
 
 /// Hinweis auf `Esc` in der Beschriftung der Ablehnungs-Option.
 const REJECT_HINT_PLAIN: &str = "(Esc)";
@@ -153,6 +166,10 @@ pub enum DialogAction {
     Decided(ApprovalChoice),
     /// Der Aufklapp-Zustand der Argumente wurde umgeschaltet.
     ToggleDetails,
+    /// Der Körper (Befehl, Info-Zeilen) wurde gescrollt (`Strg+↑↓`); die
+    /// Auswahl ist unverändert. Nur neu zeichnen — die Taste darf nicht
+    /// weitergereicht werden.
+    Scrolled,
 }
 
 /// Eingaben für [`ApprovalDialog::new`].
@@ -307,6 +324,8 @@ pub struct ApprovalDialog {
     reason_editing: bool,
     /// Bisher getippter Text der Freitext-Eingabe.
     reason_text: String,
+    /// Scroll-Zustand des Körpers (Befehl, Info-Zeilen, übrige Argumente).
+    body_scroll: BodyScroll,
 }
 
 impl ApprovalDialog {
@@ -339,6 +358,7 @@ impl ApprovalDialog {
             expanded: false,
             reason_editing: false,
             reason_text: String::new(),
+            body_scroll: BodyScroll::default(),
         }
     }
 
@@ -507,6 +527,10 @@ impl ApprovalDialog {
         if !armed {
             return DialogAction::Stay;
         }
+        // `Strg+↑↓` scrollt den Körper und verändert nie die Auswahl.
+        if self.body_scroll.handle_key(&key) {
+            return DialogAction::Scrolled;
+        }
         if self.reason_editing {
             return self.handle_reason_key(key);
         }
@@ -545,6 +569,7 @@ impl ApprovalDialog {
             }
             KeyCode::Char('v') | KeyCode::Char('V') => {
                 self.expanded = !self.expanded;
+                self.body_scroll.reset();
                 DialogAction::ToggleDetails
             }
             KeyCode::Tab if self.reason_input_enabled => {
@@ -590,12 +615,14 @@ impl ApprovalDialog {
     }
 
     /// Berechnet die Höhe (in Zeilen, inklusive Rahmen), die [`Self::render`]
-    /// bei der gegebenen Breite benötigt.
+    /// bei der gegebenen Breite benötigt, damit nichts scrollen muss.
     ///
     /// # Beschreibung
     /// Der Aufrufer nutzt dies, um die Fläche zu bemessen, die den Composer
-    /// ersetzt (Plan Schritt 3). Wächst mit ausgeklappten Argumenten
-    /// (`v`) und mit aktiver Freitext-Eingabe.
+    /// ersetzt (Plan Schritt 3), und kappt sie auf die verfügbare Höhe; ist
+    /// die Fläche kleiner, verdichtet [`Self::render`] das Hauptargument und
+    /// lässt den Körper scrollen (siehe [`crate::dialog_frame`]). Wächst mit
+    /// ausgeklappten Argumenten (`v`) und mit aktiver Freitext-Eingabe.
     ///
     /// # Argumente
     /// - `width` (`u16`): Gesamtbreite in Spalten (inklusive Rahmen).
@@ -605,18 +632,49 @@ impl ApprovalDialog {
     #[must_use]
     pub fn desired_height(&self, width: u16) -> u16 {
         let inner_width = width.saturating_sub(2).max(1);
-        let rows = self.layout_rows(inner_width).len();
-        u16::try_from(rows.saturating_add(2)).unwrap_or(u16::MAX)
+        self.content(inner_width, false, Theme::Dark)
+            .desired_height(width)
+    }
+
+    /// Scrollt den Körper per Mausrad.
+    ///
+    /// # Rückgabe
+    /// `true`, wenn neu gezeichnet werden soll.
+    pub fn scroll_wheel(&self, kind: crossterm::event::MouseEventKind) -> bool {
+        self.body_scroll.handle_wheel(kind)
+    }
+
+    /// Scrollt den Körper um `lines` Zeilen (Scroll-Aktionen der
+    /// Tastenbelegung); ändert nie die Auswahl.
+    ///
+    /// # Rückgabe
+    /// Immer `true` (neu zeichnen).
+    pub fn scroll_body(&self, up: bool, lines: usize) -> bool {
+        if up {
+            self.body_scroll.scroll_up(lines);
+        } else {
+            self.body_scroll.scroll_down(lines);
+        }
+        true
+    }
+
+    /// Aktueller Scroll-Abstand des Körpers (für Tests und Diagnose).
+    #[must_use]
+    pub fn body_offset(&self) -> usize {
+        self.body_scroll.offset()
     }
 
     /// Zeichnet das Panel (Rahmen, Titel, Inhalt) in den angegebenen
     /// `Buffer`-Bereich.
     ///
     /// # Beschreibung
-    /// Rahmen und Titel in der Warnfarbe des Themes; Inhalt darunter gemäß
-    /// [`Self::layout_rows`], zeilenweise abgeschnitten, sobald `area` nicht
-    /// ausreicht (der Aufrufer sollte vorher [`Self::desired_height`]
-    /// nutzen, damit das nie nötig ist).
+    /// Rahmen und Titel in der Warnfarbe des Themes, der Countdown rechts im
+    /// oberen Rahmen. Optionen, Freitext-Eingabe und Hinweiszeile sind
+    /// angeheftet und immer vollständig sichtbar; reicht `area` nicht, wird
+    /// zuerst das Hauptargument auf eine Vorschauzeile „… v Details“
+    /// verdichtet, dann scrollt der Körper (Info-Zeilen) innerhalb des
+    /// Panels (`Strg+↑↓`, Mausrad), dann entfallen Leerzeilen. Gezeichnet
+    /// wird nie außerhalb von `area ∩ buf.area`.
     ///
     /// # Argumente
     /// - `area` (`Rect`): der Zeichenbereich im Terminal-Buffer.
@@ -641,26 +699,38 @@ impl ApprovalDialog {
         let title_style = Style::default()
             .fg(border_color)
             .add_modifier(Modifier::BOLD);
+        let title = self.title_text();
+        let title_width = unicode_width::UnicodeWidthStr::width(title.as_str());
         let block = Block::default()
             .borders(Borders::ALL)
             .border_style(Style::default().fg(border_color))
-            .title(Span::styled(self.title_text(), title_style));
+            .title(Span::styled(title, title_style));
+        let area = area.intersection(buf.area);
         let inner = block.inner(area);
-        Widget::render(block, area, buf);
-
-        if inner.width == 0 || inner.height == 0 {
-            return;
+        let mut content = self.content(inner.width.max(1), false, theme);
+        if !self.expanded && !content.fits(inner) {
+            content = self.content(inner.width.max(1), true, theme);
         }
-
-        for (row_idx, (kind, text)) in self
-            .layout_rows(inner.width)
-            .into_iter()
-            .enumerate()
-            .take(inner.height as usize)
-        {
-            let row_area = Rect::new(inner.x, inner.y + row_idx as u16, inner.width, 1);
-            Widget::render(Line::styled(text, kind.resolve(theme)), row_area, buf);
+        dialog_frame::render_dialog(
+            block,
+            area,
+            buf,
+            &content,
+            &self.body_scroll,
+            style::dim_style(theme),
+        );
+        let remaining = self.remaining();
+        let countdown_style = RowStyle::Countdown {
+            warn: remaining.as_secs() < COUNTDOWN_WARNING_THRESHOLD_SECS,
         }
+        .resolve(theme);
+        dialog_frame::render_top_right(
+            area,
+            buf,
+            &format!(" {} ", format_countdown(remaining)),
+            title_width,
+            countdown_style,
+        );
     }
 
     /// Wählt den Titel anhand des Werkzeugnamens (Plan Schritt 3).
@@ -674,65 +744,77 @@ impl ApprovalDialog {
         }
     }
 
-    /// Baut alle Inhaltszeilen (ohne Rahmen) in Anzeigereihenfolge.
+    /// Baut Körper und angeheftete Zeilen (ohne Rahmen).
     ///
-    /// Gemeinsam von [`Self::desired_height`] (nur Anzahl) und
-    /// [`Self::render`] (Text + Stil-Kategorie) genutzt, damit beide nie
-    /// auseinanderlaufen.
-    fn layout_rows(&self, width: u16) -> Vec<(RowStyle, String)> {
-        let mut rows: Vec<(RowStyle, String)> = Vec::new();
-
-        let remaining = self.remaining();
-        let countdown = right_align(&format_countdown(remaining), width);
-        rows.push((
-            RowStyle::Countdown {
-                warn: remaining.as_secs() < COUNTDOWN_WARNING_THRESHOLD_SECS,
-            },
-            countdown,
-        ));
-
-        for line in self.primary_argument_strings(width) {
-            rows.push((RowStyle::Primary, line));
+    /// Gemeinsam von [`Self::desired_height`] und [`Self::render`] genutzt,
+    /// damit beide nie auseinanderlaufen.
+    ///
+    /// # Argumente
+    /// - `width`: Innenbreite.
+    /// - `compact_primary`: Hauptargument als eine Vorschauzeile
+    ///   („… v Details“), wenn der Platz nicht reicht.
+    fn content(&self, width: u16, compact_primary: bool, theme: Theme) -> DialogContent {
+        let mut body: Vec<Line<'static>> = Vec::new();
+        let primary_style = RowStyle::Primary.resolve(theme);
+        let dim = RowStyle::Dim.resolve(theme);
+        let primary = self.primary_argument_strings(width);
+        if compact_primary && primary.len() > 1 {
+            body.push(Line::styled(
+                compact_preview(&primary.join(" "), width),
+                primary_style,
+            ));
+        } else {
+            for line in primary {
+                body.push(Line::styled(line, primary_style));
+            }
         }
 
         for (label, value) in self.info_fields() {
             let text = format!("{label}: {}", sanitize_inline(&value));
             for line in wrapped_strings(&text, width) {
-                rows.push((RowStyle::Dim, line));
+                body.push(Line::styled(line, dim));
             }
         }
 
         let rest = self.other_argument_strings(width);
         if !rest.is_empty() {
-            rows.push((RowStyle::Plain, String::new()));
+            body.push(Line::default());
             for line in rest {
-                rows.push((RowStyle::Dim, line));
+                body.push(Line::styled(line, dim));
             }
         }
 
-        rows.push((RowStyle::Plain, String::new()));
+        let mut pinned = vec![PinnedRow::padding()];
         for (idx, kind) in self.visible_options().into_iter().enumerate() {
             let selected = idx == self.selected;
             let marker = if selected { "❯ " } else { "  " };
             let text = format!("{marker}{}. {}", idx + 1, self.option_label(kind));
+            let row_style = RowStyle::Option { selected }.resolve(theme);
             for line in wrapped_strings(&text, width) {
-                rows.push((RowStyle::Option { selected }, line));
+                pinned.push(PinnedRow::content(Line::styled(line, row_style)));
             }
         }
 
         if self.reason_editing {
             let text = format!("{REASON_PROMPT}{}", self.reason_text);
             for line in wrapped_strings(&text, width) {
-                rows.push((RowStyle::ReasonInput, line));
+                pinned.push(PinnedRow::content(Line::styled(
+                    line,
+                    RowStyle::ReasonInput.resolve(theme),
+                )));
             }
         }
 
-        rows.push((RowStyle::Plain, String::new()));
-        for line in wrapped_strings(FOOTER_HINT, width) {
-            rows.push((RowStyle::Plain, line));
+        pinned.push(PinnedRow::padding());
+        let hint = dialog_frame::pick_fitting(FOOTER_HINTS, width);
+        for line in wrapped_strings(hint, width) {
+            pinned.push(PinnedRow::content(Line::styled(
+                line,
+                RowStyle::Plain.resolve(theme),
+            )));
         }
 
-        rows
+        DialogContent { body, pinned }
     }
 
     /// Zusatzfelder (Herkunft, Auto-Modus-Grund, cwd, Risiko, Begründung) in
@@ -873,16 +955,30 @@ fn format_countdown(remaining: Duration) -> String {
     format!("noch {}:{:02}", total_secs / 60, total_secs % 60)
 }
 
-/// Polstert `text` links mit Leerzeichen, bis es genau `width` Zeichen breit
-/// ist (rechtsbündig); ist `text` bereits mindestens so breit, bleibt es
-/// unverändert.
-fn right_align(text: &str, width: u16) -> String {
-    let text_len = text.chars().count();
-    let width = width as usize;
-    if text_len >= width {
-        return text.to_owned();
+/// Einzeilige Vorschau des Hauptarguments, die mit „… v Details“ endet
+/// und genau in `width` Spalten passt.
+fn compact_preview(text: &str, width: u16) -> String {
+    use unicode_width::UnicodeWidthChar;
+    let marker_width = unicode_width::UnicodeWidthStr::width(DETAILS_MARKER);
+    let budget = usize::from(width).saturating_sub(marker_width + 1);
+    let mut out = String::new();
+    let mut used = 0;
+    for ch in text.chars() {
+        let ch = if ch == '\n' { ' ' } else { ch };
+        let w = ch.width().unwrap_or(0);
+        if used + w > budget {
+            break;
+        }
+        used += w;
+        out.push(ch);
     }
-    format!("{}{text}", " ".repeat(width - text_len))
+    if usize::from(width) > marker_width {
+        out.push(' ');
+        out.push_str(DETAILS_MARKER);
+    } else {
+        out = "…".to_owned();
+    }
+    out
 }
 
 // ─── Tests ───────────────────────────────────────────────────────────────────
@@ -1426,5 +1522,120 @@ mod tests {
                 scope: LearnScope::Project,
             })
         );
+    }
+
+    // ── Kleine Fenster: Optionen angeheftet, Körper scrollt ─────────────
+
+    /// Ein Dialog mit langem Befehl und allen Info-Zeilen (wie im
+    /// Screenshot: cwd, angefragt von, Auto-Modus-Grund, Risiko).
+    fn crowded_dialog() -> ApprovalDialog {
+        let command = (0..12)
+            .map(|i| format!("schritt-{i} --mit-langem-argument"))
+            .collect::<Vec<_>>()
+            .join(" && ");
+        ApprovalDialog::new(ApprovalDialogRequest {
+            call: tool_call(
+                "shell.exec",
+                harw_tools::serde_json::json!({ "command": command }),
+            ),
+            cwd: Some("/home/u/ein/ziemlich/langes/projekt/verzeichnis".to_owned()),
+            justification: Some("baut und prüft das Projekt".to_owned()),
+            risk: Some("mittel — schreibt in target/".to_owned()),
+            origin: Some("uia-worker (uia › root-orchestrator › uia-worker)".to_owned()),
+            remember_rule: None,
+            deadline: Instant::now() + Duration::from_secs(300),
+            reason_input_enabled: true,
+        })
+        .with_auto_reason(Some("shell – unbekannter Befehl".to_owned()))
+    }
+
+    fn rows_of(rendered: &str) -> Vec<&str> {
+        rendered.lines().collect()
+    }
+
+    #[test]
+    fn test_small_panels_keep_options_and_hint_fully_visible() {
+        let dialog = crowded_dialog();
+        for (width, height) in [(40u16, 10u16), (60, 12), (80, 14), (120, 14)] {
+            let rendered = render_dialog(&dialog, width, height);
+            assert!(rendered.contains("1. Ja"), "{width}x{height}: {rendered}");
+            assert!(
+                rendered.contains("Nein (Esc)"),
+                "{width}x{height}: {rendered}"
+            );
+            let inner = width - 2;
+            let hint = dialog_frame::pick_fitting(FOOTER_HINTS, inner);
+            assert!(
+                rows_of(&rendered).iter().any(|row| row.contains(hint)),
+                "{width}x{height}: Hinweis {hint:?} fehlt: {rendered}"
+            );
+            // Die erste Zeile verdichtet den Befehl („… v Details“).
+            assert!(
+                rendered.contains(DETAILS_MARKER),
+                "{width}x{height}: {rendered}"
+            );
+            // Nichts ragt über den Rahmen hinaus.
+            for row in rows_of(&rendered) {
+                assert_eq!(row.chars().count(), usize::from(width), "{row}");
+            }
+        }
+    }
+
+    #[test]
+    fn test_body_scrolls_by_ctrl_arrows_without_changing_the_selection() {
+        let mut dialog = crowded_dialog();
+        dialog.handle_key(make_key(KeyCode::Down), true);
+        assert_eq!(dialog.selected, 1);
+        let before = render_dialog(&dialog, 60, 12);
+        assert_eq!(dialog.body_offset(), 0);
+        let ctrl_down = KeyEvent::new(KeyCode::Down, KeyModifiers::CONTROL);
+        assert_eq!(dialog.handle_key(ctrl_down, true), DialogAction::Scrolled);
+        assert_eq!(dialog.handle_key(ctrl_down, true), DialogAction::Scrolled);
+        assert_eq!(dialog.selected, 1, "Scrollen ändert die Auswahl nicht");
+        assert_eq!(dialog.body_offset(), 2);
+        let after = render_dialog(&dialog, 60, 12);
+        assert_ne!(before, after, "der Körper hat sich bewegt");
+        assert!(after.contains("1. Ja"), "{after}");
+        assert!(after.contains("❯ 2."), "Auswahl bleibt sichtbar: {after}");
+        let ctrl_up = KeyEvent::new(KeyCode::Up, KeyModifiers::CONTROL);
+        assert_eq!(dialog.handle_key(ctrl_up, true), DialogAction::Scrolled);
+        assert_eq!(dialog.body_offset(), 1);
+        assert_eq!(dialog.selected, 1);
+    }
+
+    #[test]
+    fn test_mouse_wheel_scrolls_the_body_and_options_stay() {
+        let dialog = crowded_dialog();
+        let top = render_dialog(&dialog, 60, 12);
+        assert!(dialog.scroll_wheel(crossterm::event::MouseEventKind::ScrollDown));
+        assert_eq!(dialog.body_offset(), dialog_frame::WHEEL_LINES);
+        let scrolled = render_dialog(&dialog, 60, 12);
+        assert_ne!(top, scrolled);
+        for needle in ["1. Ja", "Nein (Esc)"] {
+            assert!(scrolled.contains(needle), "{needle}: {scrolled}");
+        }
+    }
+
+    #[test]
+    fn test_expanded_details_scroll_to_the_full_command() {
+        let mut dialog = crowded_dialog();
+        dialog.handle_key(make_key(KeyCode::Char('v')), true);
+        let rendered = render_dialog(&dialog, 60, 12);
+        assert!(!rendered.contains(DETAILS_MARKER), "{rendered}");
+        // Bis ans Ende scrollen: der letzte Befehlsteil wird erreichbar.
+        for _ in 0..40 {
+            dialog.scroll_wheel(crossterm::event::MouseEventKind::ScrollDown);
+            let _ = render_dialog(&dialog, 60, 12);
+        }
+        let end = render_dialog(&dialog, 60, 12);
+        assert!(end.contains("Begründung"), "{end}");
+        assert!(end.contains("1. Ja"), "{end}");
+    }
+
+    #[test]
+    fn test_compact_preview_fits_the_width() {
+        let preview = compact_preview("git status --short && cargo build", 20);
+        assert!(preview.ends_with(DETAILS_MARKER), "{preview}");
+        assert!(unicode_width::UnicodeWidthStr::width(preview.as_str()) <= 20);
     }
 }

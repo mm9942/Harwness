@@ -188,7 +188,7 @@ impl FromRawArgs for SandboxLeaseArgs {
 /// abgewiesen.
 #[operation(
     name = "sandbox-lease",
-    summary = "Fordert eine Sandbox-Aufhebung für shell.exec dieser harw-Sitzung inkl. aller Kind-Agenten an — nutzen, wenn eine Aufgabe cargo/rustc, Nutzer-Toolchains, Netzzugriff oder Dateien außerhalb des Workspace braucht; nicht versuchen, Toolchains in der Sandbox nachzuinstallieren. action=\"request\" (mit Grund) zeigt einen Bestätigungsdialog, in dem der Nutzer die Freigabe erteilt oder ablehnt (Dialog ist die Freigabe) und zwischen einer Host-Arbeitsphase (aktiv, bis der Nutzer sie beendet) oder einer einmaligen Freigabe wählt; danach laufen shell.exec-Aufrufe dieser harw-Sitzung inkl. aller Kind-Agenten auf dem Host. action=\"status\" zeigt eine bestehende Freigabe (rein lesend). Beenden kann die Freigabe nur der Nutzer (Strg+H oder getipptes /sandbox-lease revoke), nicht das Modell.",
+    summary = "Fordert eine Sandbox-Aufhebung für shell.exec dieser harw-Sitzung inkl. aller Kind-Agenten an — nutzen, wenn eine Aufgabe cargo/rustc, Nutzer-Toolchains, Netzzugriff oder Dateien außerhalb des Workspace braucht; Toolchains nie in der Sandbox nachinstallieren. action=\"request\" (mit Grund) öffnet den Bestätigungsdialog: der Nutzer erteilt oder verweigert die Freigabe und wählt Host-Arbeitsphase (aktiv, bis er sie beendet) oder einmalige Freigabe; danach laufen die shell.exec-Aufrufe auf dem Host. action=\"status\" zeigt die Freigabe (rein lesend). Beenden kann sie nur der Nutzer (Strg+H oder getipptes /sandbox-lease revoke), nicht das Modell.",
     domain = "execution",
     permission = "operator",
     command(path = "/sandbox-lease", visibility = "tui_only", busy = "immediate"),

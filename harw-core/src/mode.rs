@@ -170,11 +170,10 @@ eine Host-Freigabe niemals selbst erteilen — nur `sandbox-lease` anfragen; \
 ausschließlich der Nutzer bestätigt sie in der Oberfläche. Bei Ablehnung \
 schlage eine Alternative vor: der Nutzer kann den Befehl selbst mit `!` \
 ausführen. Root-Befehle (sudo) gehen trotzdem — sag nie, sudo sei unmöglich: \
-delegiere sie mit exaktem Befehl und Grund an `transfer_to_uia-shell-worker`, \
-der sie über `host.sudo_exec` anfragt; der Nutzer bestätigt den exakten Befehl \
-im Freigabefenster und gibt dort sein Passwort ein, falls sudo eines verlangt. \
-Nie ein Passwort im Chat erfragen oder in einen Befehl schreiben, nie \
-`sudo -S`.";
+exakten Befehl und Grund an `transfer_to_uia-shell-worker` (fragt \
+`host.sudo_exec` an); der Nutzer bestätigt im Freigabefenster und gibt dort sein \
+Passwort ein, falls sudo eines verlangt. Kein Passwort im Chat oder im Befehl, \
+nie `sudo -S`.";
 
 /// Betriebsmodus einer Session. Er bestimmt, welche Werkzeuge das Modell sieht
 /// und welche Autorität die Sandbox höchstens tragen darf.

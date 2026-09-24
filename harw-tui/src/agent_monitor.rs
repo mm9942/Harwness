@@ -10,6 +10,7 @@
 //! Detailansicht eines einzelnen Agenten; die Statuszeile liest
 //! [`AgentMonitor::totals`].
 
+use std::cell::Cell;
 use std::collections::{BTreeMap, VecDeque};
 use std::time::Instant;
 
@@ -21,11 +22,15 @@ use ratatui::{
     layout::Rect,
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, Clear, Paragraph, Widget, Wrap},
+    widgets::{
+        Block, Borders, Clear, Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState,
+        StatefulWidget, Widget, Wrap,
+    },
 };
 
 use crate::chat_scroll::ChatScroll;
 use crate::sanitize::{sanitize_display, sanitize_inline};
+use crate::status_line::{display_width, fit_width, model_segment};
 use crate::style::{self, Theme};
 
 /// Maximale Länge der Live-Text-Vorschau je Agent (Zeichen).
@@ -424,6 +429,11 @@ pub(crate) struct AgentLive {
     pub tokens_per_sec: f64,
     /// Begrenzte Spur für die Detailansicht.
     pub trace: AgentTrace,
+    /// Kurzer Fehlergrund (aus `TurnFailed` bzw. dem `Failed`-Detail).
+    pub failure_reason: Option<String>,
+    /// Ein Fehlschlag wurde gesehen (Detailansicht geöffnet oder mit `c`
+    /// quittiert); danach fällt er in die Sammelzeile der fertigen Agenten.
+    pub failure_seen: bool,
 }
 
 impl AgentLive {
@@ -452,6 +462,8 @@ impl AgentLive {
             rate_mark: (now, 0),
             tokens_per_sec: 0.0,
             trace: AgentTrace::default(),
+            failure_reason: None,
+            failure_seen: false,
         }
     }
 
@@ -475,6 +487,29 @@ impl AgentLive {
             .unwrap_or_else(Instant::now)
             .duration_since(self.started)
             .as_secs()
+    }
+
+    /// Fehlgeschlagen und noch nicht gesehen (bleibt einzeln im Panel).
+    pub(crate) fn is_unseen_failure(&self) -> bool {
+        self.phase == AgentPhase::Failed && !self.failure_seen
+    }
+
+    /// Beendet (fertig, abgebrochen oder gesehener Fehlschlag) — gehört in
+    /// die Sammelzeile.
+    pub(crate) fn is_finished_quietly(&self) -> bool {
+        !self.phase.is_active() && !self.is_unseen_failure()
+    }
+
+    /// Beginnt einen neuen Lauf desselben Agenten (dieselbe Kind-ID läuft
+    /// erneut, bzw. die Wurzel startet ihren nächsten Turn): Dauer und
+    /// Fehlerzustand gelten ab jetzt, die Token-Summen bleiben.
+    fn begin_run(&mut self) {
+        let now = Instant::now();
+        self.started = now;
+        self.finished = None;
+        self.failure_reason = None;
+        self.failure_seen = false;
+        self.rate_mark = (now, self.usage().output_tokens);
     }
 
     fn push_preview(&mut self, text: &str) {
@@ -507,6 +542,24 @@ fn push_tail(target: &mut String, text: &str) {
     }
 }
 
+/// Ab so vielen fertigen Agenten fasst das Panel sie zu einer Sammelzeile
+/// zusammen (ein einzelner fertiger Agent braucht ohnehin nur eine Zeile).
+pub(crate) const FINISHED_COLLAPSE_MIN: usize = 2;
+
+/// Eine auswählbare Zeile des Agenten-Panels.
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum PanelEntry<'a> {
+    /// Ein einzelner Agent-Lauf (Schlüssel: Kind-ID).
+    Agent {
+        /// Tiefe im Agentenbaum.
+        depth: usize,
+        /// Live-Zustand.
+        live: &'a AgentLive,
+    },
+    /// Sammelzeile der fertigen Agenten (Enter/`f` klappt auf/zu).
+    Finished,
+}
+
 /// Zustand aller beobachteten Agenten plus interne Nutzung.
 #[derive(Debug, Default)]
 pub(crate) struct AgentMonitor {
@@ -515,8 +568,16 @@ pub(crate) struct AgentMonitor {
     order: Vec<String>,
     /// Nutzung interner Aufrufe (Kompaktierung, Titel …) nach Zweck.
     internal: BTreeMap<String, TokenUsage>,
-    /// Ausgewählter Agent im Panel (Index in [`Self::rows`]).
+    /// Ausgewählte Panelzeile (Index in [`Self::panel_entries`]).
     pub selected: usize,
+    /// Fertige Agenten einzeln statt als Sammelzeile zeigen (Taste `f`).
+    pub finished_expanded: bool,
+    /// Erste sichtbare Zeile der Panelliste (Mausrad, Bild↑↓, Pos1/Ende).
+    panel_scroll: Cell<usize>,
+    /// Beim nächsten Zeichnen die Auswahl in den sichtbaren Bereich holen.
+    follow_selection: Cell<bool>,
+    /// Innenhöhe des Panels beim letzten Zeichnen (Seitengröße für Bild↑↓).
+    panel_height: Cell<usize>,
 }
 
 impl AgentMonitor {
@@ -567,9 +628,22 @@ impl AgentMonitor {
                     live.provider = Some(provider.clone());
                 }
                 let before = live.phase;
+                // Ein neuer Lauf derselben Kind-ID (`Running` nach einem
+                // Endzustand) zählt als eigener Lauf: Dauer und Fehler gelten
+                // neu, statt den alten Endzustand stehen zu lassen. `Progress`
+                // reaktiviert bewusst nicht (ein verspätetes Fortschritts-
+                // Ereignis darf einen fertigen Agenten nicht „laufen“ lassen).
+                if orch.status == AgentOrchestrationStatus::Running && !before.is_active() {
+                    live.begin_run();
+                    live.trace.push_status("Neuer Lauf");
+                }
                 live.phase = match orch.status {
                     AgentOrchestrationStatus::Admitted => AgentPhase::Admitted,
-                    AgentOrchestrationStatus::Running | AgentOrchestrationStatus::Progress => {
+                    AgentOrchestrationStatus::Running => match live.phase {
+                        AgentPhase::Thinking | AgentPhase::Tool => live.phase,
+                        _ => AgentPhase::Thinking,
+                    },
+                    AgentOrchestrationStatus::Progress => {
                         if live.phase == AgentPhase::Admitted {
                             AgentPhase::Thinking
                         } else {
@@ -583,6 +657,12 @@ impl AgentMonitor {
                 };
                 if let Some(detail) = &orch.detail {
                     live.trace.push_status(detail);
+                }
+                if live.phase == AgentPhase::Failed && before != AgentPhase::Failed {
+                    live.failure_seen = false;
+                    if let Some(detail) = &orch.detail {
+                        live.failure_reason = Some(detail.clone());
+                    }
                 }
                 if !live.phase.is_active() {
                     live.finished.get_or_insert_with(Instant::now);
@@ -630,6 +710,10 @@ impl AgentMonitor {
         let live = self.entry(event);
         match turn {
             TurnEvent::TurnStarted { .. } => {
+                // Nach einem Endzustand beginnt ein neuer Lauf (eigene Dauer).
+                if live.finished.is_some() || !live.phase.is_active() {
+                    live.begin_run();
+                }
                 live.phase = AgentPhase::Thinking;
                 live.finished = None;
                 live.usage_turn = TokenUsage::default();
@@ -759,6 +843,8 @@ impl AgentMonitor {
                 live.usage_done.add(&live.usage_turn.clone());
                 live.usage_turn = TokenUsage::default();
                 live.phase = AgentPhase::Failed;
+                live.failure_reason = Some(reason.clone());
+                live.failure_seen = false;
                 live.finished = Some(Instant::now());
                 live.trace.close_streams();
                 live.trace
@@ -861,24 +947,185 @@ impl AgentMonitor {
         self.internal.iter()
     }
 
-    pub(crate) fn select_next(&mut self) {
-        let len = self.agents.len();
-        if len > 0 {
-            self.selected = (self.selected + 1) % len;
+    /// Zeilen des Panels in Anzeigereihenfolge (Auswahl-Einheiten).
+    ///
+    /// # Beschreibung
+    /// 1. laufende und wartende Agenten (Baumordnung);
+    /// 2. fehlgeschlagene, noch nicht gesehene Agenten (einzeln, rot);
+    /// 3. fertige Agenten (inkl. abgebrochener und gesehener Fehlschläge):
+    ///    ab [`FINISHED_COLLAPSE_MIN`] als eine Sammelzeile
+    ///    ([`PanelEntry::Finished`]), ausgeklappt (`f`) danach einzeln.
+    ///
+    /// Jeder Lauf ist eine eigene Zeile, geschlüsselt nach Kind-ID — ein
+    /// fertiger früherer Lauf derselben Rolle verdeckt nie einen laufenden.
+    #[must_use]
+    pub(crate) fn panel_entries(&self) -> Vec<PanelEntry<'_>> {
+        let rows = self.rows();
+        let mut entries: Vec<PanelEntry<'_>> = rows
+            .iter()
+            .filter(|(_, live)| live.phase.is_active())
+            .map(|&(depth, live)| PanelEntry::Agent { depth, live })
+            .collect();
+        entries.extend(
+            rows.iter()
+                .filter(|(_, live)| live.is_unseen_failure())
+                .map(|&(depth, live)| PanelEntry::Agent { depth, live }),
+        );
+        let finished: Vec<PanelEntry<'_>> = rows
+            .iter()
+            .filter(|(_, live)| live.is_finished_quietly())
+            .map(|&(depth, live)| PanelEntry::Agent { depth, live })
+            .collect();
+        if finished.len() >= FINISHED_COLLAPSE_MIN {
+            entries.push(PanelEntry::Finished);
+            if self.finished_expanded {
+                entries.extend(finished);
+            }
+        } else {
+            entries.extend(finished);
         }
+        entries
+    }
+
+    /// Bewegt die Auswahl um eine Zeile (umlaufend).
+    fn move_selection(&mut self, forward: bool) {
+        let len = self.panel_entries().len();
+        if len == 0 {
+            self.selected = 0;
+            return;
+        }
+        let current = self.selected.min(len - 1);
+        self.selected = if forward {
+            (current + 1) % len
+        } else {
+            (current + len - 1) % len
+        };
+        self.follow_selection.set(true);
+    }
+
+    pub(crate) fn select_next(&mut self) {
+        self.move_selection(true);
     }
 
     pub(crate) fn select_prev(&mut self) {
-        let len = self.agents.len();
-        if len > 0 {
-            self.selected = (self.selected + len - 1) % len;
+        self.move_selection(false);
+    }
+
+    /// Bild↑/Bild↓: Auswahl um eine Panelseite, an den Rändern begrenzt.
+    pub(crate) fn select_page(&mut self, down: bool) {
+        let len = self.panel_entries().len();
+        if len == 0 {
+            return;
         }
+        let page = self.panel_height.get().max(2) - 1;
+        self.selected = if down {
+            (self.selected + page).min(len - 1)
+        } else {
+            self.selected.min(len - 1).saturating_sub(page)
+        };
+        self.follow_selection.set(true);
+    }
+
+    /// Pos1/Ende: erste bzw. letzte Panelzeile wählen.
+    pub(crate) fn select_edge(&mut self, last: bool) {
+        let len = self.panel_entries().len();
+        self.selected = if last { len.saturating_sub(1) } else { 0 };
+        self.follow_selection.set(true);
+    }
+
+    /// Scrollt die Panelliste ohne die Auswahl zu ändern (Mausrad,
+    /// `scroll_panel_up`/`scroll_panel_down`); negativ = nach oben.
+    pub(crate) fn scroll_panel(&self, delta: isize) {
+        let current = self.panel_scroll.get();
+        let next = if delta < 0 {
+            current.saturating_sub(delta.unsigned_abs())
+        } else {
+            current.saturating_add(delta.unsigned_abs())
+        };
+        // Obergrenze kappt das nächste Zeichnen.
+        self.panel_scroll.set(next);
+        self.follow_selection.set(false);
+    }
+
+    /// Erste sichtbare Zeile der Panelliste (für Tests und Diagnose).
+    #[must_use]
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn panel_scroll_offset(&self) -> usize {
+        self.panel_scroll.get()
+    }
+
+    /// `f`: Sammelzeile der fertigen Agenten auf-/zuklappen.
+    pub(crate) fn toggle_finished(&mut self) {
+        self.finished_expanded = !self.finished_expanded;
+        let len = self.panel_entries().len();
+        self.selected = self.selected.min(len.saturating_sub(1));
+        self.follow_selection.set(true);
+    }
+
+    /// Ist die Sammelzeile der fertigen Agenten ausgewählt?
+    #[must_use]
+    pub(crate) fn selected_is_summary(&self) -> bool {
+        matches!(
+            self.panel_entries().get(self.selected),
+            Some(PanelEntry::Finished)
+        )
+    }
+
+    /// Markiert den Fehlschlag eines Agenten als gesehen (Detailansicht).
+    pub(crate) fn mark_seen(&mut self, id: &str) {
+        if let Some(live) = self.agents.get_mut(id) {
+            live.failure_seen = true;
+        }
+    }
+
+    /// `c`: alle Fehlschläge quittieren (sie wandern in die Sammelzeile).
+    ///
+    /// # Rückgabe
+    /// `true`, wenn sich etwas geändert hat.
+    pub(crate) fn acknowledge_failures(&mut self) -> bool {
+        let mut changed = false;
+        for live in self.agents.values_mut() {
+            if live.is_unseen_failure() {
+                live.failure_seen = true;
+                changed = true;
+            }
+        }
+        if changed {
+            let len = self.panel_entries().len();
+            self.selected = self.selected.min(len.saturating_sub(1));
+        }
+        changed
+    }
+
+    /// Kennzahlen des Panels: (aktiv, ungesehene Fehler, fertig).
+    #[must_use]
+    pub(crate) fn panel_counts(&self) -> (usize, usize, usize) {
+        let mut counts = (0, 0, 0);
+        for live in self.agents.values() {
+            if live.phase.is_active() {
+                counts.0 += 1;
+            } else if live.is_unseen_failure() {
+                counts.1 += 1;
+            } else {
+                counts.2 += 1;
+            }
+        }
+        counts
+    }
+
+    /// `true`, sobald mindestens ein Kind-Agent (mit Elternteil) bekannt ist.
+    #[must_use]
+    pub(crate) fn has_children(&self) -> bool {
+        self.agents.values().any(|live| live.parent.is_some())
     }
 
     /// Live-Zustand des ausgewählten Agenten.
     #[must_use]
     pub(crate) fn selected_live(&self) -> Option<&AgentLive> {
-        self.rows().get(self.selected).map(|(_, a)| *a)
+        match self.panel_entries().get(self.selected) {
+            Some(PanelEntry::Agent { live, .. }) => Some(*live),
+            _ => None,
+        }
     }
 
     /// Kennung des ausgewählten Agenten (für die Detailansicht).
@@ -1188,7 +1435,519 @@ pub(crate) fn gauge(pct: u8, width: usize) -> String {
     format!("{}{}", "█".repeat(filled), "░".repeat(width - filled))
 }
 
+/// Kompakte Dauer: `42s`, `3m05s`, `1h02m`.
+#[must_use]
+pub(crate) fn compact_elapsed(secs: u64) -> String {
+    match secs {
+        0..=59 => format!("{secs}s"),
+        60..=3599 => format!("{}m{:02}s", secs / 60, secs % 60),
+        _ => format!("{}h{:02}m", secs / 3600, (secs % 3600) / 60),
+    }
+}
+
+/// Symbol vor einer Agentenzeile.
+fn phase_glyph(phase: AgentPhase) -> &'static str {
+    match phase {
+        AgentPhase::Admitted | AgentPhase::Thinking => "●",
+        AgentPhase::Tool => "⚙",
+        AgentPhase::Waiting => "○",
+        AgentPhase::Done => "✓",
+        AgentPhase::Failed => "✗",
+        AgentPhase::Cancelled => "⊘",
+    }
+}
+
+fn phase_style(phase: AgentPhase, theme: Theme) -> Style {
+    match phase {
+        AgentPhase::Done => style::success_style(theme),
+        AgentPhase::Failed | AgentPhase::Cancelled => style::error_style(theme),
+        AgentPhase::Tool => style::tool_style(theme),
+        AgentPhase::Waiting => style::warning_style(theme),
+        AgentPhase::Admitted | AgentPhase::Thinking => {
+            Style::default().fg(style::accent_color(theme))
+        }
+    }
+}
+
+/// Kurzer Zustandstext (Werkzeugname statt „Werkzeug“).
+fn state_label(live: &AgentLive) -> String {
+    match (live.phase, live.current_tool.as_deref()) {
+        (AgentPhase::Tool, Some(tool)) => fit_width(&sanitize_inline(tool), 14),
+        (AgentPhase::Admitted, _) => "startet".to_owned(),
+        (phase, _) => phase.label().to_owned(),
+    }
+}
+
+/// Kurz-ID eines Laufs (letzte vier Zeichen der Kind-ID) zur
+/// Unterscheidung gleicher Rollen.
+fn short_id(id: &str) -> String {
+    let tail: Vec<char> = id.chars().rev().take(4).collect();
+    tail.into_iter().rev().collect()
+}
+
+/// Anzeigename einer Zeile: Rolle, bei mehrfach sichtbarer Rolle mit
+/// Kurz-ID (`root-orchestrator#3f2a`), damit zwei Läufe derselben Rolle
+/// unterscheidbar bleiben.
+fn row_label(live: &AgentLive, duplicate: bool) -> String {
+    let role = sanitize_inline(&live.role);
+    if duplicate {
+        format!("{role}#{}", short_id(&live.id))
+    } else {
+        role
+    }
+}
+
+/// Eine Agentenzeile, exakt `width` Spalten breit (nie umgebrochen).
+///
+/// Links Marker, Einrückung, Symbol, Rolle und — soweit Platz ist —
+/// `provider/modell` (zuerst ohne Anbieter, dann gekürzt); rechtsbündig
+/// Zustand und Dauer. Reicht der Platz nicht, entfallen zuerst Modell, dann
+/// Dauer, dann Zustand; die Rolle wird zuletzt mit `…` gekürzt.
+fn agent_line(
+    live: &AgentLive,
+    label: &str,
+    depth: usize,
+    selected: bool,
+    width: usize,
+    theme: Theme,
+) -> Line<'static> {
+    let marker = if selected { "▸" } else { " " };
+    let indent = " ".repeat(depth.min(3));
+    let glyph = phase_glyph(live.phase);
+    let prefix = format!("{marker}{indent}{glyph} ");
+    let available = width.saturating_sub(display_width(&prefix));
+    let state = state_label(live);
+    let elapsed = compact_elapsed(live.elapsed_secs());
+    let label_width = display_width(label);
+    let full_right = format!(" {state} {elapsed}");
+    let short_right = format!(" {state}");
+    let right = if label_width + display_width(&full_right) <= available {
+        full_right
+    } else if label_width.min(8) + display_width(&short_right) <= available {
+        short_right
+    } else {
+        String::new()
+    };
+    let right_width = display_width(&right);
+    let label = fit_width(label, available.saturating_sub(right_width));
+    let label_width = display_width(&label);
+    let route_room = available
+        .saturating_sub(right_width)
+        .saturating_sub(label_width)
+        .saturating_sub(3);
+    let route = match live.model.as_deref() {
+        Some(_) if route_room >= 6 => format!(
+            " · {}",
+            sanitize_inline(&model_segment(
+                live.provider.as_deref(),
+                live.model.as_deref(),
+                route_room
+            ))
+        ),
+        _ => String::new(),
+    };
+    let route = fit_width(&route, available.saturating_sub(right_width + label_width));
+    let used = label_width + display_width(&route) + right_width;
+    let pad = " ".repeat(available.saturating_sub(used));
+    let phase_style = phase_style(live.phase, theme);
+    let line = Line::from(vec![
+        Span::raw(format!("{marker}{indent}")),
+        Span::styled(format!("{glyph} "), phase_style),
+        Span::styled(label, Style::default().add_modifier(Modifier::BOLD)),
+        Span::styled(route, style::dim_style(theme)),
+        Span::raw(pad),
+        Span::styled(right, phase_style),
+    ]);
+    clip_line(line, width)
+}
+
+/// Fehlerzeile: `✗ rolle · grund`, rot, auf `width` gekürzt.
+fn failure_line(
+    live: &AgentLive,
+    label: &str,
+    depth: usize,
+    selected: bool,
+    width: usize,
+    theme: Theme,
+) -> Line<'static> {
+    let marker = if selected { "▸" } else { " " };
+    let indent = " ".repeat(depth.min(3));
+    let reason = live
+        .failure_reason
+        .as_deref()
+        .map(|reason| {
+            format!(
+                " · {}",
+                sanitize_inline(reason.lines().next().unwrap_or(""))
+            )
+        })
+        .unwrap_or_default();
+    let text = format!("{marker}{indent}✗ {label}{reason}");
+    Line::styled(fit_width(&text, width), style::error_style(theme))
+}
+
+/// Sammelzeile der fertigen Agenten:
+/// `✓ 6 fertig · uia-worker×3 · uia-explorer×2 · root-orchestrator · Σ 180.0k Tok`.
+fn finished_summary_line(
+    finished: &[&AgentLive],
+    expanded: bool,
+    selected: bool,
+    width: usize,
+    theme: Theme,
+) -> Line<'static> {
+    let marker = if selected { "▸" } else { " " };
+    let arrow = if expanded { "▾" } else { "▸" };
+    let head = format!("{marker}✓ {} fertig {arrow}", finished.len());
+    let total: u64 = finished.iter().map(|live| live.usage().total()).sum();
+    let sigma = format!(" · Σ {} Tok", human_tokens(total));
+    let mut roles: Vec<(String, usize)> = Vec::new();
+    for live in finished {
+        let role = sanitize_inline(&live.role);
+        match roles.iter().position(|(name, _)| *name == role) {
+            Some(index) => {
+                if let Some(entry) = roles.get_mut(index) {
+                    entry.1 += 1;
+                }
+            }
+            None => roles.push((role, 1)),
+        }
+    }
+    roles.sort_by_key(|entry| std::cmp::Reverse(entry.1));
+    let roles_text: String = if expanded {
+        String::new()
+    } else {
+        roles
+            .iter()
+            .map(|(role, count)| {
+                if *count > 1 {
+                    format!(" · {role}×{count}")
+                } else {
+                    format!(" · {role}")
+                }
+            })
+            .collect()
+    };
+    let head_width = display_width(&head);
+    let sigma = if head_width + display_width(&sigma) <= width {
+        sigma
+    } else {
+        String::new()
+    };
+    let roles_text = fit_width(
+        &roles_text,
+        width.saturating_sub(head_width + display_width(&sigma)),
+    );
+    let line = Line::from(vec![
+        Span::styled(head, style::success_style(theme)),
+        Span::styled(roles_text, style::dim_style(theme)),
+        Span::styled(sigma, style::dim_style(theme)),
+    ]);
+    clip_line(line, width)
+}
+
+/// Dünne Kontextanzeige unter einem laufenden Agenten:
+/// `   ctx ███░░░ 11% · 22.1k/202.8k`, auf `width` begrenzt.
+fn gauge_line(live: &AgentLive, depth: usize, width: usize, theme: Theme) -> Option<Line<'static>> {
+    let pct = live.context_percent()?;
+    let indent = " ".repeat(depth.min(3) + 3);
+    let tail_full = format!(
+        " {pct}% · {}/{}",
+        human_tokens(live.context_used),
+        human_tokens(live.context_window)
+    );
+    let tail_short = format!(" {pct}%");
+    let fixed = display_width(&indent) + display_width("ctx ");
+    let tail = if fixed + 4 + display_width(&tail_full) <= width {
+        tail_full
+    } else {
+        tail_short
+    };
+    let bar_width = width.saturating_sub(fixed + display_width(&tail)).min(12);
+    if bar_width < 3 {
+        return None;
+    }
+    let ctx_style = if pct >= 85 {
+        style::error_style(theme)
+    } else if pct >= 70 {
+        style::warning_style(theme)
+    } else {
+        style::dim_style(theme)
+    };
+    let mut text = format!("{indent}ctx {}{tail}", gauge(pct, bar_width));
+    if live.compactions > 0 {
+        text.push_str(&format!(" · {}× verdichtet", live.compactions));
+    }
+    Some(Line::styled(fit_width(&text, width), ctx_style))
+}
+
+/// Kürzt eine gestylte Zeile auf `width` Spalten (Sicherheitsnetz: keine
+/// Zeile des Panels darf umbrechen).
+fn clip_line(line: Line<'static>, width: usize) -> Line<'static> {
+    if line.width() <= width {
+        return line;
+    }
+    let mut remaining = width;
+    let mut spans = Vec::new();
+    for span in line.spans {
+        if remaining == 0 {
+            break;
+        }
+        let span_width = display_width(&span.content);
+        if span_width <= remaining {
+            remaining -= span_width;
+            spans.push(span);
+        } else {
+            spans.push(Span::styled(
+                fit_width(&span.content, remaining),
+                span.style,
+            ));
+            remaining = 0;
+        }
+    }
+    Line::from(spans)
+}
+
+/// Einzeilige Zusammenfassung des Agenten-Panels für schmale Terminals
+/// (siehe [`crate::panes::AGENTS_PANEL_MIN_TERMINAL_WIDTH`]):
+/// `Agenten: ● 1 aktiv (uia-worker) · ✗ 1 fehlgeschlagen · ✓ 6 fertig · …`.
+/// `F4` fokussiert das (unsichtbare) Panel, `Enter` öffnet die Details im
+/// Vollbild.
+///
+/// # Rückgabe
+/// `None`, solange es keine Kind-Agenten gibt (dann kostet die Zeile nichts).
+#[must_use]
+pub(crate) fn render_collapsed_summary(
+    monitor: &AgentMonitor,
+    width: u16,
+    theme: Theme,
+    focused: bool,
+) -> Option<Line<'static>> {
+    if !monitor.has_children() {
+        return None;
+    }
+    let width = usize::from(width);
+    let (active, failed, finished) = monitor.panel_counts();
+    let running: Vec<String> = monitor
+        .rows()
+        .into_iter()
+        .filter(|(_, live)| live.phase.is_active())
+        .map(|(_, live)| sanitize_inline(&live.role))
+        .collect();
+    let marker = if focused { "▸ " } else { "" };
+    let mut spans = vec![Span::styled(
+        format!("{marker}Agenten: "),
+        style::dim_style(theme),
+    )];
+    let mut text = format!("● {active} aktiv");
+    if !running.is_empty() {
+        text.push_str(&format!(" ({})", running.join(", ")));
+    }
+    spans.push(Span::styled(
+        text,
+        Style::default().fg(style::accent_color(theme)),
+    ));
+    if failed > 0 {
+        spans.push(Span::styled(
+            format!(" · ✗ {failed} fehlgeschlagen"),
+            style::error_style(theme),
+        ));
+    }
+    if finished > 0 {
+        spans.push(Span::styled(
+            format!(" · ✓ {finished} fertig"),
+            style::success_style(theme),
+        ));
+    }
+    spans.push(Span::styled(
+        " · breiteres Fenster für das Panel",
+        style::dim_style(theme),
+    ));
+    Some(clip_line(Line::from(spans), width))
+}
+
+/// Eine gerenderte Panelzeile und die Auswahl-Einheit, zu der sie gehört.
+struct PanelRow {
+    line: Line<'static>,
+    entry: Option<usize>,
+}
+
+/// Baut alle Zeilen des Panels (ohne Rahmen) für `width` × `height`.
+///
+/// Pflichtzeilen: eine Zeile je Auswahl-Einheit. Nur wenn danach Platz
+/// bleibt, kommen (in dieser Reihenfolge) Kontextbalken laufender Agenten,
+/// interne Nutzung und die Live-Vorschau des ausgewählten Agenten dazu.
+fn panel_rows(
+    monitor: &AgentMonitor,
+    width: usize,
+    height: usize,
+    theme: Theme,
+    focused: bool,
+) -> Vec<PanelRow> {
+    let entries = monitor.panel_entries();
+    let finished: Vec<&AgentLive> = monitor
+        .rows()
+        .into_iter()
+        .filter(|(_, live)| live.is_finished_quietly())
+        .map(|(_, live)| live)
+        .collect();
+    // Rollen, die mehrfach als Einzelzeile sichtbar sind, bekommen eine Kurz-ID.
+    let mut role_counts: BTreeMap<&str, usize> = BTreeMap::new();
+    for entry in &entries {
+        if let PanelEntry::Agent { live, .. } = entry {
+            *role_counts.entry(live.role.as_str()).or_default() += 1;
+        }
+    }
+    let selected = monitor.selected.min(entries.len().saturating_sub(1));
+    let mut rows: Vec<PanelRow> = Vec::new();
+    let mut gauges: Vec<Option<Line<'static>>> = Vec::new();
+    for (index, entry) in entries.iter().enumerate() {
+        let is_selected = focused && index == selected;
+        match entry {
+            PanelEntry::Agent { depth, live } => {
+                let duplicate = role_counts.get(live.role.as_str()).copied().unwrap_or(0) > 1;
+                let label = row_label(live, duplicate);
+                let line = if live.is_unseen_failure() {
+                    failure_line(live, &label, *depth, is_selected, width, theme)
+                } else {
+                    agent_line(live, &label, *depth, is_selected, width, theme)
+                };
+                rows.push(PanelRow {
+                    line,
+                    entry: Some(index),
+                });
+                let running = matches!(
+                    live.phase,
+                    AgentPhase::Admitted | AgentPhase::Thinking | AgentPhase::Tool
+                );
+                gauges.push(if running {
+                    gauge_line(live, *depth, width, theme)
+                } else {
+                    None
+                });
+            }
+            PanelEntry::Finished => {
+                rows.push(PanelRow {
+                    line: finished_summary_line(
+                        &finished,
+                        monitor.finished_expanded,
+                        is_selected,
+                        width,
+                        theme,
+                    ),
+                    entry: Some(index),
+                });
+                gauges.push(None);
+            }
+        }
+    }
+    if entries.is_empty() {
+        rows.push(PanelRow {
+            line: Line::styled(
+                fit_width("Noch keine Agenten aktiv.", width),
+                style::dim_style(theme),
+            ),
+            entry: None,
+        });
+        gauges.push(None);
+    }
+
+    // Optionale Zeilen nur, solange alles ohne Scrollen passt.
+    let mut room = height.saturating_sub(rows.len());
+    let mut with_gauges = Vec::with_capacity(rows.len());
+    for (row, gauge) in rows.into_iter().zip(gauges) {
+        with_gauges.push(row);
+        if let Some(gauge) = gauge
+            && room > 0
+        {
+            with_gauges.push(PanelRow {
+                line: gauge,
+                entry: None,
+            });
+            room -= 1;
+        }
+    }
+    let mut rows = with_gauges;
+    let internal: Vec<_> = monitor.internal_usage().collect();
+    if !internal.is_empty() && room >= internal.len() + 2 {
+        rows.push(PanelRow {
+            line: Line::default(),
+            entry: None,
+        });
+        rows.push(PanelRow {
+            line: Line::styled("intern", style::dim_style(theme)),
+            entry: None,
+        });
+        for (purpose, usage) in internal {
+            rows.push(PanelRow {
+                line: Line::styled(
+                    fit_width(
+                        &format!(
+                            "  {purpose}: ↑{} ↓{}",
+                            human_tokens(usage.prompt_tokens()),
+                            human_tokens(usage.output_tokens)
+                        ),
+                        width,
+                    ),
+                    style::dim_style(theme),
+                ),
+                entry: None,
+            });
+        }
+        room = height.saturating_sub(rows.len());
+    }
+    if focused
+        && room >= 3
+        && let Some(live) = monitor.selected_live()
+        && (!live.preview.is_empty() || !live.reasoning_preview.is_empty())
+    {
+        rows.push(PanelRow {
+            line: Line::default(),
+            entry: None,
+        });
+        rows.push(PanelRow {
+            line: Line::styled(
+                fit_width(
+                    &format!("── {} live · Enter Details ──", sanitize_inline(&live.role)),
+                    width,
+                ),
+                style::dim_style(theme),
+            ),
+            entry: None,
+        });
+        let (text, line_style) = if live.preview.is_empty() {
+            (
+                format!("∴ {}", sanitize_inline(&live.reasoning_preview)),
+                style::dim_style(theme).add_modifier(Modifier::ITALIC),
+            )
+        } else {
+            (sanitize_inline(&live.preview), Style::default())
+        };
+        // Die Vorschau zeigt das Ende des Texts (neueste Zeichen).
+        let count = text.chars().count();
+        let tail: String = text.chars().skip(count.saturating_sub(width)).collect();
+        rows.push(PanelRow {
+            line: Line::styled(fit_width(&tail, width), line_style),
+            entry: None,
+        });
+    }
+    rows
+}
+
 /// Zeichnet das Agenten-Panel.
+///
+/// # Beschreibung
+/// Kompakt, eine Zeile je Lauf (Schlüssel: Kind-ID), nichts bricht um:
+/// - laufende/wartende Agenten zuerst: Rolle, `provider/modell` (gekürzt),
+///   Zustand, Dauer; ein dünner Kontextbalken nur für laufende Agenten und
+///   nur, wenn Platz ist;
+/// - fehlgeschlagene Agenten einzeln in Rot mit Kurzgrund, bis sie gesehen
+///   (Detailansicht) oder mit `c` quittiert sind;
+/// - fertige Agenten als eine Sammelzeile (`f`/Enter klappt auf).
+///
+/// Der Titel zählt genau, was gezeigt wird („Agenten · 1 aktiv · 6 fertig“).
+/// Ist die Liste höher als das Panel, scrollt sie (Mausrad,
+/// `scroll_panel_up/down`, im Fokus Bild↑↓/Pos1/Ende); eine
+/// Bildlaufleiste auf dem rechten Rahmen zeigt den Ausschnitt.
 pub(crate) fn render_agents_panel(
     monitor: &AgentMonitor,
     area: Rect,
@@ -1196,8 +1955,20 @@ pub(crate) fn render_agents_panel(
     theme: Theme,
     focused: bool,
 ) {
-    let active = monitor.active_count();
-    let title = format!(" Agenten · {active} aktiv ");
+    let area = area.intersection(buf.area);
+    if area.width < 3 || area.height < 3 {
+        return;
+    }
+    let (active, failed, finished) = monitor.panel_counts();
+    let mut title = format!(" Agenten · {active} aktiv ");
+    if failed > 0 {
+        title.push_str(&format!("· ✗ {failed} "));
+    }
+    if finished > 0 {
+        title.push_str(&format!("· {finished} fertig "));
+    }
+    let inner_width = usize::from(area.width.saturating_sub(2));
+    let title = fit_width(&title, inner_width);
     let border = if focused {
         Style::default().fg(style::accent_color(theme))
     } else {
@@ -1207,138 +1978,53 @@ pub(crate) fn render_agents_panel(
         .borders(Borders::ALL)
         .border_style(border)
         .title(title);
-    let inner_width = usize::from(area.width.saturating_sub(2));
-    let mut lines: Vec<Line<'static>> = Vec::new();
-    let rows = monitor.rows();
-    if rows.is_empty() {
-        lines.push(Line::styled(
-            "Noch keine Agenten aktiv.",
-            style::dim_style(theme),
-        ));
-    }
-    for (index, (depth, live)) in rows.iter().enumerate() {
-        let indent = "  ".repeat(*depth);
-        let marker = if focused && index == monitor.selected {
-            "▸ "
-        } else {
-            "  "
-        };
-        let phase_style = match live.phase {
-            AgentPhase::Done => style::success_style(theme),
-            AgentPhase::Failed | AgentPhase::Cancelled => style::error_style(theme),
-            AgentPhase::Tool => style::tool_style(theme),
-            AgentPhase::Waiting => style::warning_style(theme),
-            AgentPhase::Admitted | AgentPhase::Thinking => {
-                Style::default().fg(style::accent_color(theme))
+    let inner = block.inner(area);
+    block.render(area, buf);
+    let height = usize::from(inner.height);
+    monitor.panel_height.set(height);
+    let rows = panel_rows(monitor, inner_width, height, theme, focused);
+
+    // Ausschnitt: Auswahl sichtbar halten (nach Tastennavigation), sonst den
+    // gescrollten Abstand respektieren; immer auf den Inhalt begrenzt.
+    let max_offset = rows.len().saturating_sub(height);
+    let mut offset = monitor.panel_scroll.get().min(max_offset);
+    if monitor.follow_selection.get() {
+        let selected = monitor.selected;
+        if let Some(line_index) = rows.iter().position(|row| row.entry == Some(selected)) {
+            if line_index < offset {
+                offset = line_index;
+            } else if line_index >= offset + height {
+                offset = line_index + 1 - height;
             }
-        };
-        lines.push(Line::from(vec![
-            Span::raw(format!("{marker}{indent}")),
-            Span::styled(
-                sanitize_inline(&live.role),
-                Style::default().add_modifier(Modifier::BOLD),
-            ),
-            Span::styled(
-                live.model_route()
-                    .map(|route| format!(" · {}", sanitize_inline(&route)))
-                    .unwrap_or_default(),
-                style::dim_style(theme),
-            ),
-            Span::raw(" "),
-            Span::styled(live.phase.label(), phase_style),
-            Span::styled(
-                format!(" {}s", live.elapsed_secs()),
-                style::dim_style(theme),
-            ),
-        ]));
-        let usage = live.usage();
-        let mut stats = format!(
-            "{indent}    ↑{} ↓{}",
-            human_tokens(usage.prompt_tokens()),
-            human_tokens(usage.output_tokens)
+        }
+        monitor.follow_selection.set(false);
+    }
+    monitor.panel_scroll.set(offset);
+    let visible: Vec<Line<'static>> = rows
+        .into_iter()
+        .skip(offset)
+        .take(height)
+        .map(|row| row.line)
+        .collect();
+    Paragraph::new(visible).render(inner, buf);
+    if max_offset > 0 {
+        let bar_area = Rect {
+            width: inner.width.saturating_add(1),
+            ..inner
+        }
+        .intersection(area);
+        let mut state = ScrollbarState::new(max_offset.saturating_add(1))
+            .position(offset)
+            .viewport_content_length(height);
+        StatefulWidget::render(
+            Scrollbar::new(ScrollbarOrientation::VerticalRight)
+                .begin_symbol(None)
+                .end_symbol(None),
+            bar_area,
+            buf,
+            &mut state,
         );
-        if let Some(cached) = usage.cached_tokens.filter(|c| *c > 0) {
-            stats.push_str(&format!(" ⟳{}", human_tokens(cached)));
-        }
-        stats.push_str(&format!(" · {} Tools", live.tool_calls));
-        if live.phase.is_active() && live.tokens_per_sec > 0.5 {
-            stats.push_str(&format!(" · {:.0} tok/s", live.tokens_per_sec));
-        }
-        lines.push(Line::styled(stats, style::dim_style(theme)));
-        if let Some(pct) = live.context_percent() {
-            let bar_width = inner_width.saturating_sub(indent.len() + 18).clamp(4, 20);
-            let ctx_style = if pct >= 85 {
-                style::error_style(theme)
-            } else if pct >= 70 {
-                style::warning_style(theme)
-            } else {
-                style::dim_style(theme)
-            };
-            let mut ctx = format!(
-                "{indent}    ctx {} {pct}% / {}",
-                gauge(pct, bar_width),
-                human_tokens(live.context_window)
-            );
-            if live.compactions > 0 {
-                ctx.push_str(&format!(" · {}× verdichtet", live.compactions));
-            }
-            lines.push(Line::styled(ctx, ctx_style));
-        }
-        if let Some(tool) = &live.current_tool {
-            lines.push(Line::styled(
-                format!("{indent}    ⚙ {}", sanitize_inline(tool)),
-                style::tool_style(theme),
-            ));
-        } else if let Some(task) = &live.task
-            && live.phase.is_active()
-        {
-            let task: String = sanitize_inline(task)
-                .chars()
-                .take(inner_width.max(8))
-                .collect();
-            lines.push(Line::styled(
-                format!("{indent}    „{task}“"),
-                style::dim_style(theme),
-            ));
-        }
     }
-    let internal: Vec<_> = monitor.internal_usage().collect();
-    if !internal.is_empty() {
-        lines.push(Line::raw(""));
-        lines.push(Line::styled("intern", style::dim_style(theme)));
-        for (purpose, usage) in internal {
-            lines.push(Line::styled(
-                format!(
-                    "  {purpose}: ↑{} ↓{}",
-                    human_tokens(usage.prompt_tokens()),
-                    human_tokens(usage.output_tokens)
-                ),
-                style::dim_style(theme),
-            ));
-        }
-    }
-    if focused
-        && let Some(live) = monitor.selected_live()
-        && (!live.preview.is_empty() || !live.reasoning_preview.is_empty())
-    {
-        lines.push(Line::raw(""));
-        lines.push(Line::styled(
-            format!("── {} live · Enter Details ──", sanitize_inline(&live.role)),
-            style::dim_style(theme),
-        ));
-        if live.preview.is_empty() {
-            lines.push(Line::styled(
-                format!("∴ {}", sanitize_inline(&live.reasoning_preview)),
-                style::dim_style(theme).add_modifier(Modifier::ITALIC),
-            ));
-        } else {
-            lines.push(Line::raw(sanitize_inline(&live.preview)));
-        }
-    }
-    Paragraph::new(lines)
-        .block(block)
-        .wrap(Wrap { trim: false })
-        .render(area, buf);
 }
 
 #[cfg(test)]
@@ -1967,5 +2653,299 @@ mod tests {
         let shown = render_to_string(&monitor, 40, 5, 0, true)?;
         assert!(shown.contains("Agent nicht gefunden"), "{shown}");
         Ok(())
+    }
+
+    // ── Kompaktes Panel ──────────────────────────────────────────────────
+
+    fn orch(child: &str, role: &str, status: AgentOrchestrationStatus) -> TestResult<AgentEvent> {
+        let child_id = SessionId::try_from_str(child)?;
+        let parent_id = SessionId::try_from_str("root")?;
+        Ok(AgentEvent {
+            agent: child_id.clone(),
+            parent: Some(parent_id.clone()),
+            role: role.into(),
+            kind: AgentEventKind::Orchestration(harw_protocol::AgentOrchestrationEvent {
+                schema_version: harw_protocol::AgentOrchestrationEvent::CURRENT_SCHEMA_VERSION,
+                event_id: format!("{child}-{status:?}"),
+                root_session_id: parent_id.clone(),
+                parent_session_id: parent_id,
+                child_session_id: child_id,
+                turn_id: None,
+                role: role.into(),
+                depth: 1,
+                task: None,
+                status,
+                usage: None,
+                duration_ms: None,
+                progress: None,
+                detail: None,
+                tool_calls: None,
+                model: Some("glm-5.3-flash-preview-2026".into()),
+                provider: Some("zai-coding-plan".into()),
+            }),
+        })
+    }
+
+    fn context(agent: &str, role: &str) -> TestResult<AgentEvent> {
+        ev(
+            agent,
+            Some("root"),
+            role,
+            TurnEvent::ContextUpdated {
+                turn_id: t1()?,
+                used_tokens: 22_280,
+                window_tokens: 202_800,
+                history_items_dropped: 0,
+                estimated_next_tokens: None,
+                threshold_tokens: None,
+                reserve_tokens: None,
+            },
+        )
+    }
+
+    /// Wie im Screenshot: ein laufender Worker, sechs fertige Läufe.
+    fn busy_monitor() -> TestResult<AgentMonitor> {
+        let mut monitor = AgentMonitor::default();
+        for (id, role) in [
+            ("w1", "uia-worker"),
+            ("w2", "uia-worker"),
+            ("w3", "uia-worker"),
+            ("e1", "uia-explorer"),
+            ("e2", "uia-explorer"),
+            ("o1", "root-orchestrator"),
+        ] {
+            monitor.apply(&orch(id, role, AgentOrchestrationStatus::Running)?);
+            monitor.apply(&orch(id, role, AgentOrchestrationStatus::Completed)?);
+        }
+        monitor.apply(&orch(
+            "w7",
+            "uia-worker",
+            AgentOrchestrationStatus::Running,
+        )?);
+        monitor.apply(&context("w7", "uia-worker")?);
+        Ok(monitor)
+    }
+
+    fn panel_screen(
+        monitor: &AgentMonitor,
+        width: u16,
+        height: u16,
+        focused: bool,
+    ) -> TestResult<Vec<String>> {
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(width, height))?;
+        terminal.draw(|frame| {
+            let area = frame.area();
+            render_agents_panel(monitor, area, frame.buffer_mut(), Theme::Dark, focused);
+        })?;
+        let buffer = terminal.backend().buffer();
+        Ok((0..buffer.area.height)
+            .map(|y| {
+                (0..buffer.area.width)
+                    .map(|x| buffer[(x, y)].symbol())
+                    .collect::<String>()
+            })
+            .collect())
+    }
+
+    #[test]
+    fn finished_agents_collapse_into_one_summary_line() -> TestResult {
+        let mut monitor = busy_monitor()?;
+        let rows = panel_screen(&monitor, 44, 20, false)?;
+        let shown = rows.join("\n");
+        assert!(rows[0].contains("1 aktiv"), "{shown}");
+        assert!(rows[0].contains("6 fertig"), "{shown}");
+        let summary: Vec<&String> = rows
+            .iter()
+            .filter(|row| row.contains("✓ 6 fertig"))
+            .collect();
+        assert_eq!(summary.len(), 1, "{shown}");
+        assert!(summary[0].contains("uia-worker×3"), "{shown}");
+        assert_eq!(
+            rows.iter()
+                .filter(|row| row.contains("uia-explorer") && !row.contains("fertig"))
+                .count(),
+            0,
+            "fertige Explorer stehen nur in der Sammelzeile: {shown}"
+        );
+        // Der laufende Worker steht zuerst, mit Modell und Zustand.
+        let running = rows
+            .iter()
+            .position(|row| row.contains("uia-worker") && row.contains("denkt"))
+            .ok_or("laufender Worker fehlt")?;
+        let summary_row = rows
+            .iter()
+            .position(|row| row.contains("✓ 6 fertig"))
+            .ok_or("Sammelzeile fehlt")?;
+        assert!(running < summary_row, "{shown}");
+        // Genug Platz: dünner Kontextbalken unter dem laufenden Agenten.
+        assert!(rows[running + 1].contains("ctx"), "{shown}");
+
+        monitor.toggle_finished();
+        let expanded = panel_screen(&monitor, 44, 20, false)?.join("\n");
+        assert_eq!(expanded.matches("uia-explorer").count(), 2, "{expanded}");
+        Ok(())
+    }
+
+    #[test]
+    fn panel_lines_never_wrap_at_any_width() -> TestResult {
+        let mut monitor = busy_monitor()?;
+        monitor.apply(&ev(
+            "f1",
+            Some("root"),
+            "uia-worker-mit-sehr-langem-rollennamen",
+            TurnEvent::TurnFailed {
+                turn_id: t1()?,
+                reason: "Budget erschöpft nach 40 Werkzeugaufrufen und 3 Wiederholungen".into(),
+                retryable: false,
+            },
+        )?);
+        for width in [16u16, 24, 30, 44, 60, 100] {
+            for height in [6u16, 12, 30] {
+                let inner = usize::from(width - 2);
+                for row in panel_rows(&monitor, inner, usize::from(height - 2), Theme::Dark, true) {
+                    assert!(
+                        row.line.width() <= inner,
+                        "{width}x{height}: {:?}",
+                        row.line
+                    );
+                }
+                let rows = panel_screen(&monitor, width, height, true)?;
+                for row in &rows {
+                    let content = row.trim_matches(|c: char| c == '│' || c.is_whitespace());
+                    assert_ne!(content, "202.8k", "{width}x{height}: {rows:?}");
+                }
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn failed_agent_stays_red_with_reason_until_seen() -> TestResult {
+        let mut monitor = busy_monitor()?;
+        monitor.apply(&ev(
+            "f1",
+            Some("root"),
+            "uia-tester",
+            TurnEvent::TurnFailed {
+                turn_id: t1()?,
+                reason: "Budget erschöpft".into(),
+                retryable: false,
+            },
+        )?);
+        let shown = panel_screen(&monitor, 60, 20, false)?.join("\n");
+        assert!(shown.contains("✗ uia-tester · Budget erschöpft"), "{shown}");
+        assert!(shown.contains("✗ 1"), "Titel zählt den Fehler: {shown}");
+        monitor.mark_seen("f1");
+        let seen = panel_screen(&monitor, 60, 20, false)?.join("\n");
+        assert!(!seen.contains("Budget erschöpft"), "{seen}");
+        assert!(seen.contains("✓ 7 fertig"), "{seen}");
+        Ok(())
+    }
+
+    /// Ein neuer Lauf derselben Rolle ist eine eigene Zeile (Kind-ID) und
+    /// wird von einem fertigen früheren Lauf nicht verdeckt — auch nicht in
+    /// einem niedrigen Panel.
+    #[test]
+    fn newer_running_run_of_the_same_role_is_never_masked() -> TestResult {
+        let mut monitor = busy_monitor()?;
+        monitor.apply(&orch(
+            "o2",
+            "root-orchestrator",
+            AgentOrchestrationStatus::Running,
+        )?);
+        let rows = panel_screen(&monitor, 44, 6, false)?;
+        let shown = rows.join("\n");
+        assert!(rows[0].contains("2 aktiv"), "{shown}");
+        assert!(
+            rows.iter()
+                .any(|row| row.contains("root-orchestrator") && row.contains("denkt")),
+            "{shown}"
+        );
+        assert_eq!(
+            monitor.agent("o1").map(|live| live.phase),
+            Some(AgentPhase::Done)
+        );
+        Ok(())
+    }
+
+    /// Läuft dieselbe Kind-ID nach einem Endzustand erneut, ist sie wieder
+    /// aktiv; Dauer und Endzeit gelten ab dem neuen Lauf.
+    #[test]
+    fn running_after_done_starts_a_fresh_run() -> TestResult {
+        let mut monitor = AgentMonitor::default();
+        monitor.apply(&orch(
+            "o1",
+            "root-orchestrator",
+            AgentOrchestrationStatus::Running,
+        )?);
+        monitor.apply(&orch(
+            "o1",
+            "root-orchestrator",
+            AgentOrchestrationStatus::Completed,
+        )?);
+        assert!(
+            monitor
+                .agent("o1")
+                .is_some_and(|live| live.finished.is_some())
+        );
+        monitor.apply(&orch(
+            "o1",
+            "root-orchestrator",
+            AgentOrchestrationStatus::Running,
+        )?);
+        let live = monitor.agent("o1").ok_or("o1")?;
+        assert_eq!(live.phase, AgentPhase::Thinking);
+        assert!(live.finished.is_none());
+        assert_eq!(monitor.panel_counts(), (1, 0, 0));
+        // Ein verspätetes `Progress` nach dem Ende reaktiviert dagegen nicht.
+        monitor.apply(&orch(
+            "o1",
+            "root-orchestrator",
+            AgentOrchestrationStatus::Completed,
+        )?);
+        monitor.apply(&orch(
+            "o1",
+            "root-orchestrator",
+            AgentOrchestrationStatus::Progress,
+        )?);
+        assert_eq!(
+            monitor.agent("o1").map(|live| live.phase),
+            Some(AgentPhase::Done)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn panel_scrolls_by_wheel_and_keeps_the_selection_visible() -> TestResult {
+        let mut monitor = AgentMonitor::default();
+        for index in 0..12 {
+            monitor.apply(&context(
+                &format!("a{index:02}"),
+                &format!("rolle-{index:02}"),
+            )?);
+        }
+        let top = panel_screen(&monitor, 44, 8, true)?.join("\n");
+        assert!(top.contains("rolle-00"), "{top}");
+        monitor.scroll_panel(3);
+        let scrolled = panel_screen(&monitor, 44, 8, true)?.join("\n");
+        assert_eq!(monitor.panel_scroll_offset(), 3);
+        assert!(!scrolled.contains("rolle-00"), "{scrolled}");
+        assert!(scrolled.contains("rolle-03"), "{scrolled}");
+        assert_eq!(monitor.selected, 0, "Scrollen ändert die Auswahl nicht");
+        monitor.select_edge(true);
+        let bottom = panel_screen(&monitor, 44, 8, true)?.join("\n");
+        assert!(bottom.contains("▸● rolle-11"), "{bottom}");
+        monitor.select_page(false);
+        assert!(monitor.selected < 11);
+        Ok(())
+    }
+
+    #[test]
+    fn compact_elapsed_formats() {
+        assert_eq!(compact_elapsed(42), "42s");
+        assert_eq!(compact_elapsed(185), "3m05s");
+        assert_eq!(compact_elapsed(1404), "23m24s");
+        assert_eq!(compact_elapsed(3720), "1h02m");
     }
 }

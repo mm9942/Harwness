@@ -17,8 +17,23 @@
 //! open_models = "F8"
 //! open_matrix = "F9"
 //! show_help = "F1"
+//! scroll_panel_up = "ctrl+up"
+//! scroll_panel_down = "ctrl+down"
 //! end_host_mode = []
 //! ```
+//!
+//! `scroll_panel_up`/`scroll_panel_down` (Standard `Ctrl+↑`/`Ctrl+↓`)
+//! scrollen ohne Fokuswechsel: bei offenem Dialog (Freigabe, sudo,
+//! Host-Permit, Plan, `ask_user`) dessen Text, sonst das sichtbare
+//! Agenten-Panel (bzw. dessen Detailansicht). Ist beides nicht sichtbar,
+//! geht die Taste normal an den Composer. `Alt+↑` bleibt dem Zurückholen
+//! eingereihter Nachrichten, `Shift+↑↓`/`Bild↑↓` dem Verlauf vorbehalten.
+//!
+//! Fest (nicht umbelegbar) im fokussierten Agenten-Panel (`F4`): `↑`/`↓`,
+//! `k`/`j` und `w`/`s` wählen, `Bild↑`/`Bild↓` blättern, `Pos1`/`Ende`
+//! springen, `Enter` öffnet Details bzw. klappt die Sammelzeile der
+//! fertigen Agenten auf, `f` klappt sie auf/zu, `c` quittiert Fehlschläge.
+//! `w`/`s` gelten nur dort — im Composer bleiben es normale Buchstaben.
 //!
 //! Nicht genannte Aktionen behalten ihre Voreinstellung
 //! ([`KeyBindings::default`], identisch zur bisher fest verdrahteten
@@ -97,11 +112,17 @@ pub(crate) enum KeyAction {
     ShowHelp,
     /// Matrix-Game-Panel öffnen (Standard `F9`).
     OpenMatrix,
+    /// Agenten-Panel bzw. Text eines offenen Dialogs nach oben scrollen,
+    /// ohne den Fokus zu wechseln (Standard `Ctrl+↑`).
+    ScrollPanelUp,
+    /// Agenten-Panel bzw. Text eines offenen Dialogs nach unten scrollen,
+    /// ohne den Fokus zu wechseln (Standard `Ctrl+↓`).
+    ScrollPanelDown,
 }
 
 impl KeyAction {
     /// Alle Aktionen in fester Reihenfolge (auch Vorrang bei Gleichstand).
-    pub(crate) const ALL: [Self; 16] = [
+    pub(crate) const ALL: [Self; 18] = [
         Self::ToggleExplorer,
         Self::ToggleAgents,
         Self::CycleFocus,
@@ -118,6 +139,8 @@ impl KeyAction {
         Self::OpenModels,
         Self::ShowHelp,
         Self::OpenMatrix,
+        Self::ScrollPanelUp,
+        Self::ScrollPanelDown,
     ];
 
     /// Name der Aktion in der Keybindings-Datei.
@@ -139,6 +162,8 @@ impl KeyAction {
             Self::OpenModels => "open_models",
             Self::ShowHelp => "show_help",
             Self::OpenMatrix => "open_matrix",
+            Self::ScrollPanelUp => "scroll_panel_up",
+            Self::ScrollPanelDown => "scroll_panel_down",
         }
     }
 
@@ -162,6 +187,8 @@ impl KeyAction {
             Self::OpenModels => "Modelle je Rolle anzeigen",
             Self::ShowHelp => "Hilfe anzeigen",
             Self::OpenMatrix => "Matrix-Game-Panel öffnen",
+            Self::ScrollPanelUp => "Agenten-Panel/Dialogtext nach oben scrollen",
+            Self::ScrollPanelDown => "Agenten-Panel/Dialogtext nach unten scrollen",
         }
     }
 
@@ -189,6 +216,8 @@ impl KeyAction {
             Self::OpenModels => (KeyCode::F(8), KeyModifiers::NONE),
             Self::ShowHelp => (KeyCode::F(1), KeyModifiers::NONE),
             Self::OpenMatrix => (KeyCode::F(9), KeyModifiers::NONE),
+            Self::ScrollPanelUp => (KeyCode::Up, KeyModifiers::CONTROL),
+            Self::ScrollPanelDown => (KeyCode::Down, KeyModifiers::CONTROL),
         };
         vec![KeyChord { code, modifiers }]
     }
@@ -785,6 +814,14 @@ mod tests {
                 event(KeyCode::F(9), KeyModifiers::NONE),
                 KeyAction::OpenMatrix,
             ),
+            (
+                event(KeyCode::Up, KeyModifiers::CONTROL),
+                KeyAction::ScrollPanelUp,
+            ),
+            (
+                event(KeyCode::Down, KeyModifiers::CONTROL),
+                KeyAction::ScrollPanelDown,
+            ),
         ];
         for (key, expected) in cases {
             assert_eq!(bindings.action_for(&key), Some(expected), "{key:?}");
@@ -801,6 +838,49 @@ mod tests {
             bindings.action_for(&event(KeyCode::Char('c'), KeyModifiers::CONTROL)),
             None
         );
+        // Plain ↑/↓ und w/s gehören weiter Auswahl bzw. Composer.
+        for code in [
+            KeyCode::Up,
+            KeyCode::Down,
+            KeyCode::Char('w'),
+            KeyCode::Char('s'),
+        ] {
+            assert_eq!(
+                bindings.action_for(&event(code, KeyModifiers::NONE)),
+                None,
+                "{code:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn scroll_panel_actions_are_rebindable() -> TestResult {
+        let bindings = KeyBindings::from_toml_str(
+            "scroll_panel_up = \"alt+k\"\nscroll_panel_down = [\"alt+j\", \"ctrl+down\"]\n",
+            Path::new("kb.toml"),
+        )?;
+        assert_eq!(
+            bindings.action_for(&event(KeyCode::Char('k'), KeyModifiers::ALT)),
+            Some(KeyAction::ScrollPanelUp)
+        );
+        assert_eq!(
+            bindings.action_for(&event(KeyCode::Up, KeyModifiers::CONTROL)),
+            None,
+            "die Voreinstellung ist ersetzt"
+        );
+        assert_eq!(
+            bindings.action_for(&event(KeyCode::Char('j'), KeyModifiers::ALT)),
+            Some(KeyAction::ScrollPanelDown)
+        );
+        assert_eq!(
+            bindings.action_for(&event(KeyCode::Down, KeyModifiers::CONTROL)),
+            Some(KeyAction::ScrollPanelDown)
+        );
+        let described = bindings.describe();
+        assert!(described.iter().any(|(action, chords)| {
+            *action == KeyAction::ScrollPanelUp && chords == &vec!["alt+k".to_owned()]
+        }));
+        Ok(())
     }
 
     #[test]

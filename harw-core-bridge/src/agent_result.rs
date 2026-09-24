@@ -563,8 +563,11 @@ mod tests {
             .await
             .map_err(ctx("eigenes Journal ist lesbar"))?;
         assert!(output.text.contains("fs.edit(lib.rs)"), "{}", output.text);
+        // Der Endgrund steht genau einmal, im Kopf des Journals.
         assert!(
-            output.text.contains("[child_end status=cancelled"),
+            output
+                .text
+                .contains("Status: cancelled (abgebrochen (Nutzerin))"),
             "{}",
             output.text
         );

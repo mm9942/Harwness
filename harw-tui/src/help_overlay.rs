@@ -49,6 +49,30 @@ const FOOTER_COMMANDS: &str = "Tab Reiter · j/k wählen · Enter vorbelegen · 
 /// Fußzeile der Reiter „Tasten“/„Präfixe“.
 const FOOTER_SCROLL: &str = "Tab Reiter · j/k scrollen · Esc schließen";
 
+/// Feste (nicht umbelegbare) Tasten, die der Reiter „Tasten“ nach den
+/// umbelegbaren Aktionen zeigt.
+const FIXED_KEYS: &[(&str, &str)] = &[
+    ("Agenten-Panel (fokussiert): Auswahl", "↑/↓, k/j, w/s"),
+    (
+        "Agenten-Panel (fokussiert): blättern / springen",
+        "Bild↑/Bild↓, Pos1/Ende",
+    ),
+    (
+        "Agenten-Panel (fokussiert): Details / Sammelzeile öffnen",
+        "Enter",
+    ),
+    ("Agenten-Panel (fokussiert): fertige auf-/zuklappen", "f"),
+    ("Agenten-Panel (fokussiert): Fehlschläge quittieren", "c"),
+    (
+        "Dialog: Text scrollen (Optionen bleiben sichtbar)",
+        "Strg+↑/↓ (scroll_panel_up/down), Mausrad",
+    ),
+    (
+        "Mausrad",
+        "scrollt Dialog, Agenten-Panel oder Verlauf unter dem Zeiger",
+    ),
+];
+
 /// Erklärungen der Eingabe-Präfixe (Präfix, Erklärung).
 const PREFIXES: &[(&str, &str)] = &[
     (
@@ -259,7 +283,7 @@ impl HelpOverlay {
         });
         commands.dedup_by(|left, right| left.name == right.name);
 
-        let keys = keys
+        let mut keys: Vec<(String, String)> = keys
             .describe()
             .into_iter()
             .map(|(action, chords)| {
@@ -271,6 +295,11 @@ impl HelpOverlay {
                 (action.label_de().to_owned(), chords)
             })
             .collect();
+        keys.extend(
+            FIXED_KEYS
+                .iter()
+                .map(|(label, chords)| ((*label).to_owned(), (*chords).to_owned())),
+        );
 
         Self {
             tab,
@@ -711,6 +740,39 @@ mod tests {
         let text = buffer_text(&buf);
         assert!(text.contains("!!"));
         assert!(text.contains("@rolle"));
+        Ok(())
+    }
+
+    /// Die Scroll-Aktionen (umbelegbar) und die festen Panel-Tasten
+    /// (inkl. `w`/`s`) erscheinen im Reiter „Tasten“ — mit der aktuellen
+    /// Belegung.
+    #[test]
+    fn test_keys_tab_lists_scroll_actions_and_panel_keys() -> TestResult {
+        let rebound = KeyBindings::from_toml_str(
+            "scroll_panel_up = \"alt+k\"\n",
+            std::path::Path::new("kb.toml"),
+        )
+        .map_err(ctx("keybindings"))?;
+        let help = HelpOverlay::new(&registry()?, &rebound, HelpTab::Keys);
+        let text: String = help
+            .key_lines(Theme::Dark)
+            .iter()
+            .map(|line| {
+                line.spans
+                    .iter()
+                    .map(|span| span.content.as_ref())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            text.contains("Agenten-Panel/Dialogtext nach oben scrollen"),
+            "{text}"
+        );
+        assert!(text.contains("alt+k"), "{text}");
+        assert!(text.contains("ctrl+down"), "{text}");
+        assert!(text.contains("w/s"), "{text}");
+        assert!(text.contains("Mausrad"), "{text}");
         Ok(())
     }
 }

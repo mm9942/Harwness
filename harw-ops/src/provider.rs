@@ -1084,21 +1084,18 @@ impl harw_operations::OpArgsSchema for ProviderConcurrencyArgs {
         };
         let value = harw_tools::JsonSchema {
             description: Some(
-                "Neue harte Nebenläufigkeitsgrenze: positive Ganzzahl (z. B. 1) oder \
-                 \"unlimited\". Weglassen, um nur den aktuellen Zustand (Concurrency, \
-                 Rate-Limit-Wartezeit, beobachtete HTTP-429) anzuzeigen."
+                "Neue Grenze: positive Ganzzahl (z. B. 1) oder \"unlimited\". Weglassen = \
+                 nur den Zustand (Concurrency, 429-Wartezeit) anzeigen."
                     .to_owned(),
             ),
             any_of: Some(vec![
-                integer_schema("Positive Ganzzahl (mindestens 1)."),
+                integer_schema("Mindestens 1."),
                 enum_string_schema("Grenze aufheben.", &["unlimited"]),
             ]),
             ..harw_tools::JsonSchema::default()
         };
         described_object_schema(
-            "Zeigt oder verstellt die harte Nebenläufigkeitsgrenze eines Providers. \
-             Nur `provider` → Zustand anzeigen; `provider` + `value` → Grenze setzen. \
-             Bei wiederholtem HTTP 429 senken, nicht erhöhen.",
+            "Nur `provider` → Zustand anzeigen; `provider` + `value` → Grenze setzen.",
             vec![
                 (
                     "provider",

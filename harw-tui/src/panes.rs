@@ -9,7 +9,13 @@
 //! ```
 //!
 //! Panels erscheinen nur, wenn die Fläche breit genug ist
-//! ([`MIN_CHAT_WIDTH`] bleibt immer für den Chat reserviert). Agenten und
+//! ([`MIN_CHAT_WIDTH`] bleibt immer für den Chat reserviert). Die rechte
+//! Spalte (Agenten/Workbench) braucht zusätzlich mindestens
+//! [`AGENTS_PANEL_MIN_TERMINAL_WIDTH`] Spalten Terminalbreite; darunter
+//! klappt das Agenten-Panel zu einer Zeile über der Statuszeile zusammen
+//! (ab [`AGENTS_SUMMARY_MIN_HEIGHT`] Zeilen Höhe, darunter entfällt es ganz),
+//! damit der Chat in kleinen Kacheln seine Breite behält. Im Vollbild
+//! (`F11`, Detailansicht) gilt die Schwelle nicht. Agenten und
 //! Workbench teilen sich die rechte Spalte: sind beide sichtbar, bekommen
 //! die Agenten oben 60 %, die Workbench unten 40 % (mindestens
 //! [`WORKBENCH_MIN_ROWS`] Zeilen). In der Standard-Belegung wechselt `F4`
@@ -23,6 +29,14 @@ use crate::keybindings::{KeyAction, KeyBindings};
 
 /// Mindestbreite, die der Chat neben den Panels behält.
 pub(crate) const MIN_CHAT_WIDTH: u16 = 48;
+/// Kleinste Terminalbreite, ab der die rechte Spalte (Agenten-Panel,
+/// Workbench) neben dem Chat erscheint. Darunter behält der Chat die ganze
+/// Breite (100 = 44 Panel + 56 Chat; bei 80–99 Spalten wäre der Chat sonst
+/// auf 36–55 Spalten gequetscht).
+pub(crate) const AGENTS_PANEL_MIN_TERMINAL_WIDTH: u16 = 100;
+/// Kleinste Terminalhöhe, ab der das zusammengeklappte Agenten-Panel als
+/// eigene Zeile über der Statuszeile erscheint; darunter entfällt es ganz.
+pub(crate) const AGENTS_SUMMARY_MIN_HEIGHT: u16 = 16;
 /// Breite des Agenten-Panels.
 pub(crate) const AGENTS_WIDTH: u16 = 44;
 /// Breite des Explorer-Panels.
@@ -205,7 +219,8 @@ pub(crate) fn split(area: Rect, state: &PanelState) -> PaneAreas {
         };
     }
     let mut budget = area.width.saturating_sub(MIN_CHAT_WIDTH);
-    let right_visible = state.agents_visible || state.workbench_visible;
+    let right_visible = (state.agents_visible || state.workbench_visible)
+        && area.width >= AGENTS_PANEL_MIN_TERMINAL_WIDTH;
     let agents_w = if right_visible && budget >= AGENTS_WIDTH {
         budget -= AGENTS_WIDTH;
         AGENTS_WIDTH
@@ -291,6 +306,22 @@ mod tests {
         let areas = split(Rect::new(0, 0, 80, 20), &PanelState::default());
         assert!(areas.agents.is_none());
         assert_eq!(areas.chat.map(|r| r.width), Some(80));
+    }
+
+    /// Unter der Schwelle klappt die rechte Spalte weg, auch wenn das alte
+    /// Budget (Chat 48 + Panel 44 = 92) noch gereicht hätte.
+    #[test]
+    fn right_column_collapses_below_the_width_threshold() {
+        for width in [60u16, 80, 92, AGENTS_PANEL_MIN_TERMINAL_WIDTH - 1] {
+            let areas = split(Rect::new(0, 0, width, 30), &PanelState::default());
+            assert!(areas.agents.is_none(), "{width}");
+            assert_eq!(areas.chat.map(|r| r.width), Some(width));
+        }
+        let areas = split(
+            Rect::new(0, 0, AGENTS_PANEL_MIN_TERMINAL_WIDTH, 30),
+            &PanelState::default(),
+        );
+        assert_eq!(areas.agents.map(|r| r.width), Some(AGENTS_WIDTH));
     }
 
     #[test]

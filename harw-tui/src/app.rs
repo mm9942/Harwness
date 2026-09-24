@@ -125,6 +125,8 @@ mod final_reply;
 pub(crate) mod export_capture;
 // Runde 6, Teil B: `!`-Befehle sofort und asynchron auf dem Host.
 mod operator_shell;
+// Kleine Fenster: Mausrad nach Position, `scroll_panel_up/down`.
+pub(crate) mod scroll_routing;
 
 use std::cell::Cell;
 use std::collections::{HashMap, HashSet};
@@ -1129,6 +1131,9 @@ pub struct ChatApp {
     /// History-Bereichs (`history_area.height`). Fallback vor dem ersten
     /// Draw ist `20`, passend zum früheren hartcodierten Platzhalterwert.
     last_history_visible_rows: Cell<u16>,
+    /// Flächen des letzten Frames (Agenten-Panel, Dialog, Plan) für das
+    /// Maus-Routing ([`scroll_routing::route_scroll_input`]).
+    last_regions: Cell<scroll_routing::FrameRegions>,
     /// Kind-Spawn-Autorität dieser Session, falls konfiguriert. Wird als
     /// [`ChildTurnDriver`] an [`ApprovalDriver::drive_to_completion`] gereicht,
     /// damit ein `TurnOutcome::AwaitingChild` real weitergetrieben wird statt
@@ -1440,6 +1445,7 @@ impl ChatApp {
             session_controller: Arc::new(TuiSessionController::new()),
             last_history_total_lines: Cell::new(0),
             last_history_visible_rows: Cell::new(20),
+            last_regions: Cell::new(scroll_routing::FrameRegions::default()),
             managed_spawner: None,
             historic_agent_events: Vec::new(),
             active_mode: InteractionMode::default(),
@@ -2264,6 +2270,8 @@ impl ChatApp {
         let Some(agent) = self.agent_monitor.selected_agent() else {
             return false;
         };
+        // Ein angesehener Fehlschlag wandert in die Sammelzeile.
+        self.agent_monitor.mark_seen(agent.as_str());
         let prev_maximized = self
             .agent_detail
             .as_ref()
@@ -4528,6 +4536,14 @@ pub(crate) async fn run_loop(
                     }
                     // Runde 5, Teil K: ein im Leerlauf offenes sudo- oder
                     // Host-Permit-Fenster (Hintergrund-Agent) bekommt die Eingabe.
+                    // Mausrad nach Position und `scroll_panel_up/down` —
+                    // vor allen Fenstern, weil Scrollen nichts entscheidet.
+                    if let Some(redraw) = scroll_routing::route_scroll_input(app, &tev) {
+                        if redraw {
+                            frame_req.schedule_frame();
+                        }
+                        continue;
+                    }
                     let tev = match background_agents::route_idle_prompt_event(app, tev) {
                         Ok(redraw) => {
                             if redraw {
@@ -6434,22 +6450,69 @@ fn handle_panel_key(app: &mut ChatApp, key: KeyEvent) -> Option<bool> {
         // die Listennavigation).
         crate::panes::PanelKey::ForFocused(_) if app.agent_detail.is_some() => Some(false),
         crate::panes::PanelKey::ForFocused(key) => Some(match app.panels.focus {
-            crate::panes::PaneFocus::Agents => match key.code {
-                KeyCode::Down | KeyCode::Char('j') => {
-                    app.agent_monitor.select_next();
-                    true
-                }
-                KeyCode::Up | KeyCode::Char('k') => {
-                    app.agent_monitor.select_prev();
-                    true
-                }
-                KeyCode::Enter => app.open_agent_detail(),
-                _ => false,
-            },
+            crate::panes::PaneFocus::Agents => handle_agents_list_key(app, key),
             crate::panes::PaneFocus::Explorer => handle_explorer_key(app, key),
             crate::panes::PaneFocus::Workbench => app.handle_workbench_key(key),
             crate::panes::PaneFocus::Chat => false,
         }),
+    }
+}
+
+/// Tasten der Agenten-Liste bei fokussiertem Panel (fest, nicht umbelegbar).
+///
+/// # Beschreibung
+/// `↑`/`↓`, `k`/`j` und — spieletypisch — `w`/`s` wählen; `Bild↑`/`Bild↓`
+/// blättern seitenweise, `Pos1`/`Ende` springen an Anfang/Ende; `Enter`
+/// öffnet die Detailansicht bzw. klappt die Sammelzeile der fertigen
+/// Agenten auf; `f` klappt sie auf/zu; `c` quittiert Fehlschläge. `w`/`s`
+/// gelten nur hier — im Composer bleiben es Buchstaben (der Chat-Fokus
+/// erreicht diese Funktion nie).
+///
+/// # Rückgabe
+/// `true`, wenn neu gezeichnet werden soll.
+fn handle_agents_list_key(app: &mut ChatApp, key: KeyEvent) -> bool {
+    if key
+        .modifiers
+        .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
+    {
+        return false;
+    }
+    match key.code {
+        KeyCode::Down | KeyCode::Char('j' | 's') => {
+            app.agent_monitor.select_next();
+            true
+        }
+        KeyCode::Up | KeyCode::Char('k' | 'w') => {
+            app.agent_monitor.select_prev();
+            true
+        }
+        KeyCode::PageDown => {
+            app.agent_monitor.select_page(true);
+            true
+        }
+        KeyCode::PageUp => {
+            app.agent_monitor.select_page(false);
+            true
+        }
+        KeyCode::Home => {
+            app.agent_monitor.select_edge(false);
+            true
+        }
+        KeyCode::End => {
+            app.agent_monitor.select_edge(true);
+            true
+        }
+        KeyCode::Char('f') => {
+            app.agent_monitor.toggle_finished();
+            true
+        }
+        KeyCode::Char('c') => app.agent_monitor.acknowledge_failures(),
+        KeyCode::Enter if app.agent_monitor.selected_is_summary() => {
+            app.agent_monitor.toggle_finished();
+            true
+        }
+        KeyCode::Enter => app.open_agent_detail(),
+        _ => false,
     }
 }
 
@@ -7158,6 +7221,16 @@ async fn drive_turn_animated(
                         }
                     }
                     event = tui_rx.recv(), if input_open => {
+                        // Mausrad nach Position und `scroll_panel_up/down`
+                        // vor allen Fenstern (Scrollen entscheidet nichts).
+                        if let Some(scroll_event) = event.as_ref()
+                            && let Some(redraw) = scroll_routing::route_scroll_input(app, scroll_event)
+                        {
+                            if redraw {
+                                draw_viewport(guard, app, spinner, app.pending_quit.map(|arm| arm.label))?;
+                            }
+                            continue;
+                        }
                         match event {
                             // Runde 5, Teil B: ein offenes sudo-Fenster fängt
                             // JEDES Ereignis ab — nichts erreicht Composer,
@@ -8338,6 +8411,16 @@ async fn drive_pauses_to_completion(
                 }
             }
             maybe_event = tui_rx.recv(), if input_open => {
+                // Mausrad nach Position und `scroll_panel_up/down` vor allen
+                // Fenstern (Scrollen entscheidet nichts).
+                if let Some(scroll_event) = maybe_event.as_ref()
+                    && let Some(redraw) = scroll_routing::route_scroll_input(app, scroll_event)
+                {
+                    if redraw {
+                        draw_viewport(guard, app, spinner, app.pending_quit.map(|arm| arm.label))?;
+                    }
+                    continue;
+                }
                 match maybe_event {
                     // Runde 5, Teil B: ein offenes sudo-Fenster fängt JEDES
                     // Ereignis ab (vor Freigabe-Panel, Host-Permit und Busy-Pfad).
@@ -8413,7 +8496,7 @@ async fn drive_pauses_to_completion(
                                     let outcome = queue_busy_key(app, key);
                                     settle_busy_outcome(guard, app, spinner, outcome)?;
                                 }
-                                DialogAction::ToggleDetails => {
+                                DialogAction::ToggleDetails | DialogAction::Scrolled => {
                                     draw_viewport(guard, app, spinner, app.pending_quit.map(|arm| arm.label))?;
                                 }
                                 DialogAction::Decided(choice) => {
@@ -8911,7 +8994,11 @@ fn handle_busy_event(app: &mut ChatApp, event: TuiEvent) -> BusyKeyOutcome {
             BusyKeyOutcome::Idle
         }
         TuiEvent::Mouse(mouse) => {
-            if app.scroll.handle_mouse(mouse, total, rows) == ScrollAction::Redraw {
+            let redraw = match scroll_routing::route_wheel(app, mouse) {
+                Some(redraw) => redraw,
+                None => app.scroll.handle_mouse(mouse, total, rows) == ScrollAction::Redraw,
+            };
+            if redraw {
                 BusyKeyOutcome::Redraw
             } else {
                 BusyKeyOutcome::Idle
@@ -9112,6 +9199,10 @@ fn render_viewport(
 ) {
     let theme = app.theme;
     let area = frame.area();
+    // Flächen für das Maus-Routing; Overlays lassen sie leer (dann scrollt
+    // das Rad wie bisher den Verlauf).
+    app.last_regions
+        .set(scroll_routing::FrameRegions::default());
 
     // Vollflächige Overlays (Session-Picker, `/export`-, Modell/Provider-,
     // Effort-Auswahl) ersetzen die gesamte Viewport (Plan Schritt 6/7) —
@@ -9172,12 +9263,47 @@ fn render_viewport(
         // Werkzeugfreigabe offen ist (siehe `drive_pauses_to_completion`:
         // `y`/`n` gehen zuerst an eine offene `ApprovalDialog`-Frage) — die
         // beiden Panels ersetzen den Composer deshalb nie gleichzeitig.
-        (None, Some(dialog)) => dialog.desired_height(),
+        (None, Some(dialog)) => dialog.desired_height_for(area.width),
         (None, None) => {
             let input_line_count = app.input.visible_lines(input_width).len().clamp(1, 8) as u16;
             input_line_count + 2
         }
     };
+    // Ein Dialog ersetzt den Composer: er darf den Verlauf bis auf eine
+    // Zeile verdrängen, aber nie über den Bildschirm hinauswachsen — passt
+    // er nicht, scrollt sein Körper, Optionen und Hinweis bleiben sichtbar
+    // (siehe `crate::dialog_frame`).
+    let dialog_open = sudo_height.is_some()
+        || plan_height.is_some()
+        || app.pending_approval_dialog.is_some()
+        || app.pending_host_permit_dialog.is_some();
+    let history_min: u16 = if dialog_open { 1 } else { 3 };
+    let input_height = if dialog_open {
+        input_height.min(area.height.saturating_sub(1 + history_min))
+    } else {
+        input_height
+    };
+
+    // Schmale Terminals: das Agenten-Panel klappt zu einer Zeile über der
+    // Statuszeile zusammen (ab `AGENTS_SUMMARY_MIN_HEIGHT` Zeilen, darunter
+    // entfällt es ganz), damit der Chat seine Breite behält.
+    let agents_collapsed = app.panels.agents_visible
+        && !app.panels.maximized
+        && area.width < crate::panes::AGENTS_PANEL_MIN_TERMINAL_WIDTH;
+    let agents_summary = if agents_collapsed
+        && area.height >= crate::panes::AGENTS_SUMMARY_MIN_HEIGHT
+        && area.height > input_height + history_min + 2
+    {
+        crate::agent_monitor::render_collapsed_summary(
+            &app.agent_monitor,
+            area.width,
+            theme,
+            app.panels.focus == crate::panes::PaneFocus::Agents,
+        )
+    } else {
+        None
+    };
+    let summary_height = u16::from(agents_summary.is_some());
 
     // Runde 4, Teil H: während eines Turns abgeschickte Nachrichten und
     // zurückgestellte Befehle stehen sichtbar über dem Composer, bis sie
@@ -9191,7 +9317,10 @@ fn render_viewport(
         area.width,
     );
     // Der Block darf den Verlauf nie ganz verdrängen.
-    let queue_height = (queue_lines.len() as u16).min(area.height.saturating_sub(input_height + 4));
+    let queue_height = (queue_lines.len() as u16).min(
+        area.height
+            .saturating_sub(input_height + summary_height + 4),
+    );
 
     // History | Warteschlange | permanente Statuszeile | Eingabe. Der
     // Sicherheitsmodus muss sichtbar bleiben und darf nicht vom Verlauf
@@ -9199,15 +9328,20 @@ fn render_viewport(
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Min(3),
+            Constraint::Min(history_min),
             Constraint::Length(queue_height),
+            Constraint::Length(summary_height),
             Constraint::Length(1),
             Constraint::Length(input_height),
         ])
         .split(area);
     let queue_area = chunks[1];
-    let status_area = chunks[2];
-    let input_area = chunks[3];
+    let summary_area = chunks[2];
+    let status_area = chunks[3];
+    let input_area = chunks[4];
+    if let Some(summary) = agents_summary {
+        frame.render_widget(Paragraph::new(summary), summary_area);
+    }
     if queue_height > 0 {
         frame.render_widget(
             Paragraph::new(queue_lines).style(Style::default().fg(style::border_color(theme))),
@@ -9217,6 +9351,18 @@ fn render_viewport(
     // Seitenpanels (Explorer links, Agenten rechts) teilen sich die obere
     // Fläche mit dem Verlauf; auf schmalen Terminals bleibt nur der Chat.
     let pane_areas = crate::panes::split(chunks[0], &app.panels);
+    let history_area_for_regions =
+        pane_areas
+            .chat
+            .unwrap_or(Rect::new(chunks[0].x, chunks[0].y, 0, 0));
+    app.last_regions.set(scroll_routing::FrameRegions {
+        agents: pane_areas.agents,
+        dialog: dialog_open.then_some(input_area),
+        plan: app
+            .plan_ui
+            .covers_history()
+            .then_some(history_area_for_regions),
+    });
     if let Some(agents_area) = pane_areas.agents {
         if let Some(detail) = app.agent_detail.as_ref() {
             app.agent_monitor.render_agent_detail(
@@ -9269,6 +9415,10 @@ fn render_viewport(
         String::new()
     };
     // Kontextfenster der Wurzel als Balken (aus `ContextUpdated`).
+    let context_percent = app
+        .agent_monitor
+        .agent(app.session_id().as_str())
+        .and_then(crate::agent_monitor::AgentLive::context_percent);
     let context_suffix = app
         .agent_monitor
         .agent(app.session_id().as_str())
@@ -9361,7 +9511,9 @@ fn render_viewport(
                     " · {entries} Spureinträge · Esc: Liste | j/k/Bild↑↓: scrollen | g/G: Anfang/Ende | r: Reasoning"
                 )
             }
-            None => " · Enter: Agentendetails".to_owned(),
+            None => {
+                " · Enter: Details · w/s/j/k wählen · f: fertige · c: Fehler quittieren".to_owned()
+            }
         }
     } else {
         String::new()
@@ -9381,12 +9533,90 @@ fn render_viewport(
         live_model.as_deref(),
         STATUS_MODEL_MAX_CHARS,
     );
-    let status = format!(
-        " {spinner_prefix}Shift+Tab: {permission} | {mode_segment} | {model_segment} | Σ Tokens: {} (in {}, out {}{cache_suffix}){context_suffix}{agents_suffix}{explorer_suffix}{cancel_suffix}{queue_cleared_suffix}{quit_suffix}{queue_suffix}{tool_suffix}{agents_hint}{pending_permission_suffix}",
-        crate::agent_monitor::human_tokens(usage.total()),
-        crate::agent_monitor::human_tokens(usage.prompt_tokens()),
-        crate::agent_monitor::human_tokens(usage.output_tokens),
+    // Kurzformen für schmale Fenster: die Statuszeile kürzt nach Vorrang
+    // statt am rechten Rand abgeschnitten zu werden — zuerst Token-Details,
+    // dann Kontextbalken und Hinweise; Modus, Freigabe und Modell bleiben.
+    let model_short = status_line::model_segment(
+        live_provider.as_deref(),
+        live_model.as_deref(),
+        STATUS_MODEL_MAX_CHARS / 2,
     );
+    let total_tokens = crate::agent_monitor::human_tokens(usage.total());
+    let context_short = context_percent
+        .map(|pct| format!(" | ctx {pct}%"))
+        .unwrap_or_default();
+    let agents_hint_short = if agents_hint.is_empty() {
+        String::new()
+    } else if app.agent_detail.is_some() {
+        " · Esc: Liste".to_owned()
+    } else {
+        " · Enter: Details".to_owned()
+    };
+    let mode_short = status_line::mode_segment_short(
+        app.active_mode(),
+        app.current_approval(),
+        app.pending_permission_stage().is_some(),
+    );
+    use status_line::StatusSegment as Seg;
+    let segments = vec![
+        Seg::new(
+            150,
+            vec![
+                format!(" {spinner_prefix}Shift+Tab: {permission}"),
+                format!(" {spinner_prefix}{permission}"),
+            ],
+        ),
+        Seg::new(
+            180,
+            vec![format!(" | {mode_segment}"), format!(" | {mode_short}")],
+        ),
+        Seg::new(
+            200,
+            vec![format!(" | {model_segment}"), format!(" | {model_short}")],
+        ),
+        Seg::new(
+            10,
+            vec![
+                format!(
+                    " | Σ Tokens: {total_tokens} (in {}, out {}{cache_suffix})",
+                    crate::agent_monitor::human_tokens(usage.prompt_tokens()),
+                    crate::agent_monitor::human_tokens(usage.output_tokens),
+                ),
+                format!(" | Σ {total_tokens}"),
+                String::new(),
+            ],
+        ),
+        Seg::new(20, vec![context_suffix, context_short, String::new()]),
+        Seg::optional(60, agents_suffix),
+        Seg::optional(30, explorer_suffix),
+        Seg::optional(240, cancel_suffix),
+        Seg::optional(230, queue_cleared_suffix),
+        Seg::optional(250, quit_suffix),
+        Seg::optional(70, queue_suffix),
+        Seg::optional(5, tool_suffix),
+        Seg::new(15, vec![agents_hint, agents_hint_short, String::new()]),
+        Seg::optional(220, pending_permission_suffix),
+    ];
+    // Breite der Marken vor/nach dem Text (Plan, Goal, Host-Modus) abziehen.
+    const HOST_MODE_SUFFIX: &str = " · HOST-MODUS AKTIV (Strg+H beendet)";
+    let goal_width: usize = app
+        .goal_status_spans(theme, status_area.width)
+        .iter()
+        .map(Span::width)
+        .sum();
+    let plan_width = if app.current_permission_stage() == PermissionCycleStage::Plan {
+        crate::plan_dialog::plan_status_span(theme).width()
+    } else {
+        0
+    };
+    let host_width = if app.host_mode_active() {
+        status_line::display_width(HOST_MODE_SUFFIX)
+    } else {
+        0
+    };
+    let status_width =
+        usize::from(status_area.width).saturating_sub(goal_width + plan_width + host_width);
+    let status = status_line::fit_segments(&segments, status_width);
     // Solange eine Host-Arbeitsphase läuft, muss die Statuszeile das gemäß
     // `docs/design/mediated-process-execution.md` („permanent und
     // unübersehbar `HOST-MODUS AKTIV`") in einer eigenen, hervorgehobenen
@@ -9398,7 +9628,7 @@ fn render_viewport(
         goal_spans.extend([
             Span::styled(status, Style::default().fg(style::border_color(theme))),
             Span::styled(
-                " · HOST-MODUS AKTIV (Strg+H beendet)",
+                HOST_MODE_SUFFIX,
                 Style::default()
                     .fg(style::warning_color(theme))
                     .add_modifier(Modifier::BOLD),

@@ -980,6 +980,23 @@ Rebindable via `[tui].keybindings_file` (a flat TOML table `action =
 | `Ctrl+K` | delete the input line (`delete_line`) |
 | `Ctrl+J` | insert a newline (`insert_newline`) |
 | `Shift+Tab` | approval cycle `ask → auto → full → plan → ask` (`cycle_permission_mode`); the `plan` step is plan mode (marker "⏸ plan mode on (shift+tab to cycle)", the lock is immediate); has no effect while a `/`-popup is open |
+| `Ctrl+↑` / `Ctrl+↓` | scroll without changing focus (`scroll_panel_up` / `scroll_panel_down`): the body of an open dialog (approval, sudo, host permit, plan, `ask_user`), otherwise the visible agent panel (or its detail view); with neither visible the key goes to the composer |
+
+Agent panel, when focused (`F4`, fixed): `↑`/`↓`, `k`/`j` and `w`/`s`
+select, `PageUp`/`PageDown` page, `Home`/`End` jump, `Enter` opens the
+detail view or expands the finished-agents summary line, `f` expands/
+collapses it, `c` acknowledges failed agents. `w`/`s` only apply there;
+in the composer they stay plain letters. The mouse wheel scrolls whatever
+is under the pointer: an open dialog's body, the agent panel, otherwise
+the chat history. Dialog options and the key-hint line stay pinned and
+always visible; the dialog body scrolls (`Ctrl+↑↓`, wheel), and `↑`/`↓`
+stay option selection.
+
+Small windows: below 100 columns the agent panel collapses to a one-line
+summary above the status line (from 16 rows up; below that it is hidden),
+so the chat keeps its width. The status line drops token details first,
+then the context gauge and hints, and keeps mode, approval and model.
+Dialogs keep options and hints visible down to 40×12.
 
 Not rebindable: `Ctrl+C`/`Ctrl+D`, `Esc`, `Enter` including
 `Shift/Alt+Enter`, and keys inside dialogs/overlays. The `/`-popup also

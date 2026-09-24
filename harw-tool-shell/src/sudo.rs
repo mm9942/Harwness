@@ -1825,16 +1825,14 @@ impl ToolProvider for SudoToolProvider {
     fn tools(&self) -> Vec<ToolSpec> {
         vec![ToolSpec::Function(FunctionToolSpec {
             name: ToolName::new(SUDO_EXEC_TOOL),
-            description: "Run ONE command as root on the local host via sudo. sudo works this \
-                way: you request it, the user sees the exact argv and your reason in a dedicated \
-                TUI approval window, confirms it and types their sudo password there if sudo asks \
-                for one (passwordless sudo works too; the window then only asks for approval). \
-                The password never reaches you — never ask for it in chat, never put it into a \
-                command, never use `sudo -S` or `echo … | sudo`. argv runs exactly as given, \
-                without a shell and without the word sudo. Returns exit_code/stdout/stderr, or an \
-                error if the user denied it or authentication failed — then do not retry on your \
-                own, ask the user. Never call sudo via shell.exec, and never tell the user that \
-                sudo is impossible while this tool is available."
+            description: "Run ONE command as root on the local host via sudo. sudo works: the \
+                user sees the exact argv and your reason in a TUI approval window, confirms and \
+                types their sudo password there if sudo asks (passwordless sudo works too). The \
+                password never reaches you — never ask for it in chat, put it into a command or \
+                use `sudo -S`/`echo … | sudo`. Returns exit_code/stdout/stderr, or an error if \
+                the user denied it or authentication failed — then do not retry on your own, ask \
+                the user. Never call sudo via shell.exec; never say sudo is impossible while this \
+                tool is available."
                 .to_owned(),
             parameters: Self::parameter_schema(),
             strict: true,
