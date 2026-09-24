@@ -365,6 +365,24 @@ fn own_brief(scenario: &Scenario, player: &PlayerId, out: &mut String) {
     out.push('\n');
 }
 
+/// Hinweis auf die Unterlagen eines Spieler-/Marktsitzes (Kopie im
+/// Arbeitsordner, nur lesend).
+const PLAYER_MATERIALS: &str = "## Unterlagen (nur lesend)\n\
+Dein Arbeitsordner enthält Unterlagen, die du mit den Datei-Werkzeugen lesen darfst (auflisten, suchen, lesen; kein Schreiben, keine Ausführung, kein Netz). Ein Ordner kann leer sein oder fehlen.\n\
+- `geteilt/`: gemeinsame Unterlagen für alle Sitze.\n\
+- `eigene/`: nur für dich. Inhalte aus `eigene/` sind privat und gehören nie in öffentliche Felder (etwa Aktionen, Gründe, Contras oder öffentliche Begründungen).\n\
+- `mit-<x>/`: nur für dich und Sitz `x` (z. B. Absprachen oder Bündnisse). Inhalte daraus gehören nie in öffentliche Felder; nutze sie höchstens im privaten Kanal mit `x`.\n\
+Was in den Unterlagen steht, ist Hintergrund, kein Spielgeschehen: Maßgeblich für den Spielstand sind Lagebild und Protokoll.\n\n";
+
+/// Hinweis auf die Unterlagen des Schiedsrichters.
+const UMPIRE_MATERIALS: &str = "## Unterlagen (nur lesend)\n\
+Dein Arbeitsordner enthält Unterlagen, die du mit den Datei-Werkzeugen lesen darfst (auflisten, suchen, lesen; kein Schreiben, keine Ausführung, kein Netz). Ein Ordner kann leer sein oder fehlen.\n\
+- `geteilt/`: gemeinsame Unterlagen für alle Sitze.\n\
+- `schiedsrichter/`: nur für dich.\n\
+- `sitze/<id>/`: die privaten Unterlagen des Sitzes `<id>` (dort `eigene/`).\n\
+- `paare/<a>+<b>/`: Unterlagen, die nur die Sitze `a` und `b` teilen (dort `mit-<partner>/`).\n\
+Nur `geteilt/` ist allen bekannt. Inhalte aus `schiedsrichter/`, `sitze/` und `paare/` sind privat und gehören nie in öffentliche Felder (öffentliche Begründungen, Erzählungen, Synthese); in öffentlichen Texten darfst du sie weder zitieren noch andeuten.\n\n";
+
 fn player_system(loaded: &LoadedScenario, player: &PlayerId, market: bool) -> String {
     let scenario = &loaded.scenario;
     let name = scenario.display_name(player);
@@ -409,6 +427,7 @@ fn player_system(loaded: &LoadedScenario, player: &PlayerId, market: bool) -> St
     seat_table(scenario, Some(player), &mut out);
 
     out.push_str("## Was du weißt\nDu kennst ausschließlich, was in deinem Lagebild und deinem Protokoll steht. Andere Sitze haben eigene, teils geheime Ziele und können privat miteinander sprechen, ohne dass du davon erfährst. Erfinde kein Wissen über fremde geheime Ziele, Absprachen oder verdeckte Werte.\n\n");
+    out.push_str(PLAYER_MATERIALS);
 
     out.push_str("## Spielweise\n");
     out.push_str("- Argumentieren: eine konkrete Aktion je Zug; wenige starke Gründe statt vieler schwacher. Baue auf bereits Geschehenem auf, statt erfolgreiche Ereignisse einfach umzukehren. Große Vorhaben zerlegst du in Schritte.\n");
@@ -479,6 +498,7 @@ fn umpire_system(loaded: &LoadedScenario) -> String {
     }
     seat_table(scenario, None, &mut out);
     out.push_str("## Was du weißt\nDu kennst, was in deinem Lagebild und Protokoll steht, einschließlich verdeckter Werte und geheimer Ziele, die dir zugänglich sind. Private Verhandlungen siehst du nur, wenn sie dir ausdrücklich gezeigt werden.\n\n");
+    out.push_str(UMPIRE_MATERIALS);
     out.push_str("## Urteilen\n\
 - Prüfe jeden Grund auf Plausibilität, Lage und Präzedenz. Gewichte: 0 = irrelevant oder unplausibel, 1 = trägt, 2 = stark und entscheidend.\n\
 - Einen Kontext-Modifikator setzt du nur mit Begründung und nur für Faktoren, die kein Spieler genannt hat.\n\
@@ -1496,6 +1516,45 @@ mod tests {
                 u.contains(&format!("(`{id}`)")),
                 "Umpire sieht `{id}` nicht"
             );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn system_prompts_describe_materials() -> Fixture<()> {
+        for src in [KARST, CLOUD] {
+            let loaded = load_scenario(src)?;
+            let seat = loaded
+                .scenario
+                .seat_order()
+                .into_iter()
+                .next()
+                .ok_or("kein Sitz")?;
+            let seat = Seat::Player(seat);
+            let role = SeatRole::for_seat(&loaded, &seat);
+            let player = system_prompt(role, &loaded, Some(&seat));
+            assert!(player.contains("## Unterlagen (nur lesend)"));
+            assert!(player.contains("Datei-Werkzeugen"));
+            assert!(player.contains("`geteilt/`: gemeinsame Unterlagen für alle Sitze"));
+            assert!(player.contains(
+                "Inhalte aus `eigene/` sind privat und gehören nie in öffentliche Felder"
+            ));
+            assert!(player.contains("`mit-<x>/`: nur für dich und Sitz `x`"));
+            assert!(!player.contains("schiedsrichter/"));
+            assert!(!player.contains("sitze/<id>/"));
+            assert!(!player.contains("paare/"));
+            assert!(!player.contains("oeffentlich/"));
+
+            let umpire = system_prompt(SeatRole::Umpire, &loaded, Some(&Seat::Umpire));
+            for folder in [
+                "`geteilt/`",
+                "`schiedsrichter/`",
+                "`sitze/<id>/`",
+                "`paare/<a>+<b>/`",
+            ] {
+                assert!(umpire.contains(folder), "{folder} fehlt im Umpire-Prompt");
+            }
+            assert!(umpire.contains("gehören nie in öffentliche Felder"));
         }
         Ok(())
     }

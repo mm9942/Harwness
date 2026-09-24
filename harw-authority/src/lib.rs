@@ -783,6 +783,30 @@ impl SandboxSpec {
         }
     }
 
+    /// Wie [`Self::from_resolved`], aber mit einem code-definierten Netz-Scope
+    /// (der Egress-Allowlist der Konfiguration).
+    ///
+    /// # Beschreibung
+    /// Nur für Runtime-Einstiegsprofile gedacht, deren Profil
+    /// `NetworkAccess` trägt. Der Aufrufer ist dafür verantwortlich, dass der
+    /// Scope ausschließlich aus der konfigurierten Allowlist stammt; ein
+    /// leerer Scope bedeutet „kein Host“ (fail-closed).
+    #[must_use]
+    pub fn from_resolved_with_network(
+        workspace: WorkspaceBinding,
+        permissions: PermissionSet,
+        network_scope: NetworkScope,
+    ) -> Self {
+        Self {
+            authority: AuthorityContext {
+                workspace,
+                permissions,
+                network_scope,
+                origin: AuthorityOrigin::Runtime,
+            },
+        }
+    }
+
     #[must_use]
     pub fn from_authority(authority: AuthorityContext) -> Self {
         Self { authority }

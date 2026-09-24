@@ -25,7 +25,8 @@
 //!    nach dem Reducer nur `explorer`, `uia-explorer`, `uia-worker`,
 //!    `uia-writer` und `researcher-web`, nie mehr als der Elternteil trägt;
 //!    die read-only Rollen (`analyst`, `researcher-deps`, `planner`,
-//!    `root-orchestrator`, Triage, Matrix-Sitze …) nie. `researcher-web` sieht nie `fs.*`,
+//!    `root-orchestrator`, Triage, Matrix-Sitze …) nie. Die Matrix-Sitze
+//!    (`MatrixReader`) sehen höchstens die lesenden `fs.*` plus `doc.read_pdf`. `researcher-web` sieht nie `fs.*`,
 //!    `deps.*` oder `lens.ask`.
 //! 4. **TOML-Seite** (andere Quelle): keine Rolle admittiert `fs.write`,
 //!    `shell.exec` oder `browser.*` — außer `uia-worker`, die einzige Rolle
@@ -75,6 +76,17 @@ const BROWSER: &[&str] = &[
     "browser.wait",
     "browser.events",
     "browser.close",
+];
+
+/// Die Werkzeuge von `RegistryProfile::MatrixReader` in
+/// Registrierungsreihenfolge: die fünf lesenden `fs.*` plus `doc.read_pdf`.
+const MATRIX_READ_TOOLS: &[&str] = &[
+    "fs.read",
+    "fs.list",
+    "fs.search",
+    "fs.glob",
+    "fs.grep",
+    "doc.read_pdf",
 ];
 
 /// Alle 128 Teilmengen der sieben Rechte.
@@ -160,21 +172,22 @@ fn expected_role_table() -> Vec<(&'static str, RegistryProfile, AuthorityReducer
             RegistryProfile::NoTools,
             AuthorityReducer::ReadOnly,
         ),
-        // Runde 3, Welle E: die drei Matrix-Game-Sitze sind werkzeuglos und
-        // ohne Netz — wie die Triage-Rollen.
+        // Runde 3, Welle E + Matrix-Unterlagen: die drei Matrix-Game-Sitze
+        // lesen nur ihre Unterlagen (`MatrixReader`: lesende `fs.*` plus
+        // `doc.read_pdf`) — ohne Netz, Schreiben oder Exec.
         (
             role_names::MATRIX_PLAYER,
-            RegistryProfile::NoTools,
+            RegistryProfile::MatrixReader,
             AuthorityReducer::ReadOnly,
         ),
         (
             role_names::MATRIX_UMPIRE,
-            RegistryProfile::NoTools,
+            RegistryProfile::MatrixReader,
             AuthorityReducer::ReadOnly,
         ),
         (
             role_names::MATRIX_MARKET,
-            RegistryProfile::NoTools,
+            RegistryProfile::MatrixReader,
             AuthorityReducer::ReadOnly,
         ),
         // Behoben (Agent F-FIX, Addendum F+G): `authority_reducer_for_role`
@@ -376,6 +389,14 @@ fn test_profile_by_permission_matrix_never_registers_ungranted_tools() -> TestRe
                         || *tool == "lens.ask"),
                     "WorkspaceEdit darf weder shell.* noch web.* führen: {tools:?}"
                 );
+            }
+            if *profile == RegistryProfile::MatrixReader {
+                let expected: Vec<&str> = MATRIX_READ_TOOLS
+                    .iter()
+                    .copied()
+                    .filter(|_| granted.contains(Permission::ReadWorkspace))
+                    .collect();
+                assert_eq!(tools, expected, "MatrixReader unter {granted:?}");
             }
             if *profile == RegistryProfile::Research {
                 assert!(
@@ -677,22 +698,33 @@ fn test_assembled_registry_matches_the_matrix_for_every_profile_and_permission_s
     Ok(())
 }
 
-/// Runde 3, Welle E: die drei Matrix-Game-Sitze sind werkzeuglos, ohne Netz
-/// und ohne Spawn-Tiefe — auf allen drei Seiten (Rust-Profil, Reducer,
-/// eingebettete TOML).
+/// Runde 3, Welle E + Matrix-Unterlagen: die drei Matrix-Game-Sitze lesen
+/// genau ihre Unterlagen (lesende `fs.*` plus `doc.read_pdf`), ohne Netz,
+/// ohne Schreiben/Exec und ohne Spawn-Tiefe — auf allen drei Seiten
+/// (Rust-Profil, Reducer, eingebettete TOML) und unter allen 128
+/// Rechtesätzen des Elternteils.
 #[test]
-fn test_matrix_roles_have_no_tools_no_network_and_zero_depth() -> TestResult {
+fn test_matrix_roles_read_only_materials_no_network_and_zero_depth() -> TestResult {
     let roles: HashMap<String, harw_agent_dsl::ExecutableAgentIr> =
         builtin_agent_definitions(&HashMap::new()).map_err(ctx(
             "eingebaute Rollendefinitionen müssen sich auflösen lassen",
         ))?;
+    assert_eq!(
+        RegistryProfile::MatrixReader.registered_tool_names(),
+        MATRIX_READ_TOOLS,
+        "MatrixReader registriert genau die lesenden Unterlagen-Werkzeuge"
+    );
+    assert_eq!(
+        RegistryProfile::MatrixReader.required_permissions(),
+        PermissionSet::from_policy([Permission::ReadWorkspace]),
+        "MatrixReader braucht genau ReadWorkspace"
+    );
+    assert!(RegistryProfile::MatrixReader.is_read_only());
     for role in role_names::MATRIX_ROLES {
         assert!(role_names::ALL.contains(&role), "{role} fehlt in ALL");
-        assert_eq!(
-            profile_for_role(role),
-            Some(RegistryProfile::NoTools),
-            "{role}"
-        );
+        let profile =
+            profile_for_role(role).ok_or(TestError::Missing("Matrix-Rolle braucht ein Profil"))?;
+        assert_eq!(profile, RegistryProfile::MatrixReader, "{role}");
         let reducer = authority_reducer_for_role(role)
             .ok_or(TestError::Missing("Matrix-Rolle braucht einen Reducer"))?;
         assert_eq!(reducer, AuthorityReducer::ReadOnly, "{role}");
@@ -707,16 +739,52 @@ fn test_matrix_roles_have_no_tools_no_network_and_zero_depth() -> TestResult {
                 !child.contains(Permission::ExecuteProcess),
                 "{role}: Ausführen"
             );
+            let tools = profile.tool_names_for(&child);
+            for tool in &tools {
+                assert!(
+                    MATRIX_READ_TOOLS.contains(tool),
+                    "{role}: {tool} ist kein lesendes Unterlagen-Werkzeug"
+                );
+                assert!(
+                    *tool != "fs.write"
+                        && !tool.starts_with("shell.")
+                        && !tool.starts_with("process.")
+                        && !tool.starts_with("web.")
+                        && !tool.starts_with("browser."),
+                    "{role}: {tool} unter {parent:?}"
+                );
+            }
+            let expected: Vec<&str> = if parent.contains(Permission::ReadWorkspace) {
+                MATRIX_READ_TOOLS.to_vec()
+            } else {
+                Vec::new()
+            };
+            assert_eq!(tools, expected, "{role} unter {parent:?}");
         }
         let ir = roles.get(role).ok_or(TestError::Unexpected(format!(
             "Rolle {role} fehlt in den aufgelösten Definitionen"
         )))?;
-        assert!(
-            ir.tool_surface().admitted().is_empty(),
-            "{role} darf kein Werkzeug admittieren"
+        let admitted: BTreeSet<&str> = ir
+            .tool_surface()
+            .admitted()
+            .iter()
+            .map(String::as_str)
+            .collect();
+        let expected_admitted: BTreeSet<&str> = MATRIX_READ_TOOLS.iter().copied().collect();
+        assert_eq!(
+            admitted, expected_admitted,
+            "{role} admittiert genau die lesenden Unterlagen-Werkzeuge"
         );
         let forbidden = ir.tool_surface().forbidden();
-        for tool in ["fs.write", "shell.exec", "web.fetch", "web.search"] {
+        for tool in [
+            "fs.write",
+            "shell.exec",
+            "process.kill",
+            "web.fetch",
+            "web.search",
+            "web.docs_rs",
+            "web.crates_io",
+        ] {
             assert!(
                 forbidden.iter().any(|name| name == tool),
                 "{role} muss {tool} ausdrücklich verbieten"

@@ -417,11 +417,22 @@ fn orchestrators_admit_exactly_their_composition_tools() -> TestResult {
     Ok(())
 }
 
-/// Runde 3, Welle E: die drei Matrix-Game-Sitze admittieren kein Werkzeug,
-/// und ihr Profil (`NoTools`) bewirbt keines — Inventar und Aufrufrecht
-/// bleiben deckungsgleich leer, wie bei den `security-*-triage`-Rollen.
+/// Runde 3, Welle E + Matrix-Unterlagen: die drei Matrix-Game-Sitze
+/// admittieren genau die lesenden Unterlagen-Werkzeuge (fünf lesende `fs.*`
+/// plus `doc.read_pdf`), und ihr Profil (`MatrixReader`) bewirbt genau
+/// diese — Inventar und Aufrufrecht bleiben deckungsgleich, ohne Netz,
+/// Schreiben oder Exec.
 #[test]
-fn matrix_roles_admit_and_advertise_no_tools() -> TestResult {
+fn matrix_roles_admit_and_advertise_exactly_the_read_tools() -> TestResult {
+    let expected: BTreeSet<&str> = [
+        "fs.read",
+        "fs.list",
+        "fs.search",
+        "fs.glob",
+        "fs.grep",
+        "doc.read_pdf",
+    ]
+    .into();
     let roles = resolved_roles()?;
     for role in role_names::MATRIX_ROLES {
         let ir = roles
@@ -429,17 +440,30 @@ fn matrix_roles_admit_and_advertise_no_tools() -> TestResult {
             .ok_or(TestError::Unexpected(format!("{role} fehlt")))?;
         let profile =
             profile_for_role(role).ok_or(TestError::Unexpected(format!("{role} ohne Profil")))?;
-        assert_eq!(profile, RegistryProfile::NoTools, "{role}");
-        assert!(profile.tool_names().is_empty(), "{role}: {profile:?}");
+        assert_eq!(profile, RegistryProfile::MatrixReader, "{role}");
+        let advertised: BTreeSet<&str> = profile.tool_names().into_iter().collect();
+        assert_eq!(advertised, expected, "{role}: {profile:?}");
         assert!(
             composition_tools_for_role(role).is_empty(),
             "{role} ist kein Orchestrator"
         );
-        assert!(
-            ir.tool_surface().admitted().is_empty(),
-            "{role} admittiert {:?}",
-            ir.tool_surface().admitted()
-        );
+        let admitted: BTreeSet<&str> = ir
+            .tool_surface()
+            .admitted()
+            .iter()
+            .map(String::as_str)
+            .collect();
+        assert_eq!(admitted, expected, "{role} admittiert {admitted:?}");
+        for tool in &admitted {
+            assert!(
+                *tool != "fs.write"
+                    && !tool.starts_with("shell.")
+                    && !tool.starts_with("process.")
+                    && !tool.starts_with("web.")
+                    && !tool.starts_with("browser."),
+                "{role} admittiert {tool}"
+            );
+        }
         assert_eq!(ir.spawn_contract().max_depth(), Some(0), "{role}");
     }
     Ok(())
