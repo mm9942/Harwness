@@ -1,0 +1,5 @@
+name = "loops-and-control-flow"
+description = "Use when du eine Schleife schreibst oder reviewst — Index-Schleife `for (i = 0; i < xs.length; i++)`/`range(len(xs))`, verschachtelte Schleifen mit `found`-Flag, Retry-Schleife mit Hilfsvariable + späterem null-Check, `while True` mit manuellem break beim Konsumieren eines Iterators/Channels/Streams — in TypeScript, Python, Go, Java oder Rust. Lehrt Element-Iteration statt Index, map/filter/Comprehensions für Transformationen, gelabelte breaks oder extrahierte Funktion statt Flag, Retry-Schleifen die einen Wert liefern, und Konsum-Schleifen bis zum Ende der Quelle. Sprachunabhängige Variante von rust-loops-and-labels / rust-while-let."
+enabled = true
+instructions_file = "instructions.md"
+tools = ["filesystem.read"]

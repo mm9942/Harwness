@@ -1146,6 +1146,96 @@ async fn uia_root_session_is_admitted_its_uia_explorer_and_uia_writer_specializa
     Ok(())
 }
 
+/// Nutzerentscheidung „die UIA-Helfer recherchieren kurz online und fügen
+/// manchmal Abhängigkeiten hinzu“: `uia-worker` und `uia-writer` werden von
+/// der UIA über denselben `ManagedAgentSpawner` admittiert, den ein
+/// montierter `EntryKind::Tui`-Lauf registriert, und ihre Kind-Registry
+/// (dieselbe [`RuntimeChildRegistryFactory::build_registry`]-Kette) trägt
+/// `web.fetch`/`web.search` plus die fünf lesenden `deps.*`-Werkzeuge — nie
+/// `web.docs_rs`/`web.crates_io`.
+///
+/// Das Netz selbst ist nie breiter als das des Elternteils: das Kind erbt
+/// über den Handoff die Sandbox des Elternteils (`ManagedAgentSpawner::admit`
+/// prüft `ensure_child_of`), und die UIA-Wurzel eines `EntryKind::Tui`-Laufs
+/// trägt heute weder `NetworkAccess` noch Hosts (`spec.rs`:
+/// „Netzrechte vergibt kein Einstieg“). Die Web-Werkzeuge sind damit zwar
+/// registriert, scheitern aber am Rechte-Prolog, bis ein Elternteil Netz
+/// tatsächlich trägt.
+#[tokio::test]
+async fn uia_helpers_get_web_search_and_deps_tools_but_never_more_network_than_the_parent()
+-> TestResult {
+    let fixture = fixture()?;
+    let assembled = assemble(EntryKind::Tui, &fixture)?;
+    let (spawner, sandbox, parent) = uia_spawner_fixture(&assembled).await?;
+    assert!(
+        !sandbox
+            .permissions()
+            .contains(harw_authority::Permission::NetworkAccess),
+        "precondition: the UIA root carries no network today"
+    );
+    assert!(sandbox.network_scope().is_empty());
+
+    let factory = RuntimeChildRegistryFactory::new(
+        assembled.assembly.project().clone(),
+        Arc::new(EchoModelProvider::new("echo")),
+        ApprovalChain::for_root(
+            assembled.assembly.config(),
+            AskResolution::Interactive,
+            ApprovalModeCell::default(),
+            None,
+            AllowRuleSet::new(),
+        ),
+    )
+    .map_err(ctx("Fabrik"))?;
+
+    for uia_role in [role_names::UIA_WORKER, role_names::UIA_WRITER] {
+        let registry = factory
+            .build_registry(uia_role, &spawn_input(), None)
+            .map_err(ctx("UIA-Helfer-Registry montiert"))?;
+        let tools: Vec<String> = registry
+            .tool_providers()
+            .iter()
+            .flat_map(|provider| provider.tools())
+            .map(|spec| spec.name().to_owned())
+            .collect();
+        for expected in [
+            "web.fetch",
+            "web.search",
+            "deps.graph",
+            "deps.locked",
+            "deps.source_read",
+            "deps.source_search",
+            "deps.source_list",
+        ] {
+            assert!(
+                tools.iter().any(|tool| tool == expected),
+                "{uia_role}: {expected} fehlt in {tools:?}"
+            );
+        }
+        for deeper in ["web.docs_rs", "web.crates_io", "lens.ask"] {
+            assert!(
+                !tools.iter().any(|tool| tool == deeper),
+                "{uia_role}: {deeper} darf nicht registriert sein"
+            );
+        }
+
+        spawner
+            .spawn_child(
+                uia_role,
+                uia_child_input(parent.clone()),
+                sandbox.clone(),
+                None,
+            )
+            .await
+            .map_err(|error| {
+                TestError::Unexpected(format!(
+                    "a UIA root session must admit '{uia_role}': {error:?}"
+                ))
+            })?;
+    }
+    Ok(())
+}
+
 // ── Welle 3a, Teil A: die uia-worker-Rollenfamilie bekommt die UIA nicht die
 //    Vorgabe-Provider (`harw-runtime/src/{children,assembly}.rs`) ──────────
 

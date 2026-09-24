@@ -2036,8 +2036,10 @@ mod tests {
     ///   ausschließlich `web.fetch`/`web.search` (`EXPLORER_WEB_TOOLS`) —
     ///   Nutzerentscheidung „der Explorer durchsucht alles … auch das
     ///   Internet“.
-    /// - `uia-worker` (Addendum I) und `uia-writer`: ausschließlich
-    ///   `web.fetch` (`UIA_QUICK_HELPER_WEB_TOOLS`).
+    /// - `uia-worker` (`UiaQuickHelper`) und `uia-writer` (`UiaWriter`):
+    ///   ebenfalls genau `web.fetch`/`web.search` (`EXPLORER_WEB_TOOLS`) —
+    ///   Nutzerentscheidung „die UIA-Helfer recherchieren kurz online und
+    ///   fügen manchmal Abhängigkeiten hinzu“.
     ///
     /// Jede andere Rolle — insbesondere `analyst`/`researcher-deps`, die sich
     /// das Profil `ReadOnlyExplore` mit dem `explorer` teilen — admittiert
@@ -2055,10 +2057,15 @@ mod tests {
                 .collect();
             let expected: BTreeSet<&str> = if role == role_names::RESEARCHER_WEB {
                 ["web.fetch", "web.docs_rs", "web.crates_io", "web.search"].into()
-            } else if role == role_names::EXPLORER || role == role_names::UIA_EXPLORER {
+            } else if [
+                role_names::EXPLORER,
+                role_names::UIA_EXPLORER,
+                role_names::UIA_WORKER,
+                role_names::UIA_WRITER,
+            ]
+            .contains(&role.as_str())
+            {
                 ["web.fetch", "web.search"].into()
-            } else if role == role_names::UIA_WORKER || role == role_names::UIA_WRITER {
-                ["web.fetch"].into()
             } else {
                 BTreeSet::new()
             };

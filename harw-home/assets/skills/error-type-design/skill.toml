@@ -1,0 +1,5 @@
+name = "error-type-design"
+description = "Use when Code in IRGENDEINER Sprache (TypeScript, Python, Go, Java, C#, Rust, …) einen eigenen Fehler-/Exception-Typ braucht, ein Modul neue Fehlerfälle bekommt, oder du `throw new Error(\"…\")`, `raise Exception(\"…\")`, `errors.New` mit String-Vergleich, `catch (Exception e)` oder generische Fehler-Sammeltypen siehst — lehrt typisierte Fehlerhierarchien pro Modul/Grenze mit strukturierten Feldern, erhaltener Ursache (cause/__cause__/Unwrap/source) und expliziter NotImplemented-Variante statt Crash. Auch verwenden, wenn der Nutzer nur \"Fehlerbehandlung verbessern\" sagt. Sprachunabhängige Variante von rust-error-enum-design / rust-error-from-impls / rust-result-type-alias."
+enabled = true
+instructions_file = "instructions.md"
+tools = ["filesystem.read"]

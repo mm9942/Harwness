@@ -171,7 +171,8 @@ pub const AUTO_APPROVED_TOOLS: &[&str] = &[
     // Web-Recherche (`harw-tool-web`) — alle vier im Profil `Research` (Rolle
     // `researcher-web`, ohne `fs.*`/`deps.*`); `web.fetch`/`web.search`
     // zusätzlich in den Erkundungsprofilen (`explorer`, `uia-explorer`,
-    // Nutzerentscheidung) und `web.fetch` in den übrigen UIA-Profilen. Die
+    // Nutzerentscheidung) und in den UIA-Helferprofilen (`uia-worker`,
+    // `uia-writer`, Nutzerentscheidung „kurz online recherchieren“). Die
     // Netzgrenze zieht jeweils der `NetworkScope` der Sandbox bzw. die
     // `EgressPolicy` (W5 RD), nicht die Freigabe — rein lesend.
     "web.fetch",
@@ -622,7 +623,8 @@ mod tests {
             // `crate::authority::tests::test_authority_reducer_for_role_covers_every_role_and_bounds_its_profile`
             // (dort `exempt_from_subset_bound`), statt einer zweiten,
             // handgepflegten Rollenliste: `executor`, `memory-steward`,
-            // `uia-worker` und `agent-steward` bekommen ihr freigabepflichtiges
+            // `uia-worker`, `uia-writer`, `uia-shell-worker` und
+            // `agent-steward` bekommen ihr freigabepflichtiges
             // Werkzeug (`shell.exec`/`fs.write`/die schreibenden
             // Agentendefinitions-Werkzeuge) über ihre feste Profilzuweisung bei
             // der Registry-Montage, nicht über den `AuthorityReducer` — siehe

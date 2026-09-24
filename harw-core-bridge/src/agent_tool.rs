@@ -1813,12 +1813,16 @@ const KNOWN_AUTHORITY_REDUCERS: &[&str] = &[
 /// `reduce_to_read_network` liest den Workspace absichtlich nicht: ein Kind mit
 /// Netz und Workspace-Lesezugriff könnte Workspace-Daten über Anfrageparameter
 /// hinaustragen (Plan-Annahme A5). Die zwei Explorer-Kennungen sind die
-/// bewusste Ausnahme (Nutzerentscheidung „der Explorer durchsucht auch das
-/// Internet“) für genau die Rollen, deren TOML `web.fetch`/`web.search`
-/// admittiert (`explorer`, `uia-explorer`); ihr Host-Scope bleibt wie bei
-/// `reduce_to_read_network` an den egress-gebundenen Scope des Parents
-/// gebunden. `reduce_to_read_registry` (`analyst`, `researcher-deps`,
-/// `planner`) bleibt ohne Netz.
+/// bewusste Ausnahme (Nutzerentscheidungen „der Explorer durchsucht auch das
+/// Internet“ und „die UIA-Helfer recherchieren kurz online und fügen
+/// manchmal Abhängigkeiten hinzu“) für genau die Rollen, deren TOML
+/// `web.fetch`/`web.search` admittiert: `reduce_to_read_explore` für
+/// `explorer`, `uia-worker` und `uia-writer`,
+/// `reduce_to_read_workspace_network` für `uia-explorer`. Ihr Host-Scope
+/// bleibt wie bei `reduce_to_read_network` an den egress-gebundenen Scope
+/// des Parents gebunden, `NetworkAccess` nur, wenn der Parent es selbst
+/// trägt. `reduce_to_read_registry` (`analyst`, `researcher-deps`,
+/// `planner`) und `reduce_to_read_only` bleiben ohne Netz.
 ///
 /// # Returns
 /// `Some(PermissionSet)` für eine bekannte Kennung, sonst `None`.
@@ -1938,7 +1942,9 @@ fn reduce_to_read_network(parent: &SandboxSpec) -> SandboxSpec {
 }
 
 /// Reduziert eine Sandbox auf lesende Workspace- und Registry-Quellen plus
-/// ausgehendes Netz (explorer mit Websuche).
+/// ausgehendes Netz (explorer mit Websuche; weitergebbarer Lese-/Netzanteil
+/// von uia-worker und uia-writer — deren `ExecuteProcess`/`WriteWorkspace`
+/// gibt dieser Reducer nie weiter).
 ///
 /// Schnittmenge mit `{ ReadWorkspace, ReadCargoRegistry, NetworkAccess }`;
 /// der Host-Scope des Parents (egress-gebunden) bleibt Obergrenze, wie bei
@@ -4450,6 +4456,66 @@ contract = "{contract}"
                 child.network_scope().is_empty(),
                 "{name}: Host-Scope muss leer sein"
             );
+        }
+        Ok(())
+    }
+
+    /// Die Netz-Kennungen (`reduce_to_read_explore` für `explorer`,
+    /// `uia-worker`, `uia-writer`; `reduce_to_read_workspace_network` für
+    /// `uia-explorer`; `reduce_to_read_network` für `researcher-web`)
+    /// gewähren nie Netz, das der Parent nicht selbst trägt, und nie
+    /// Schreib-/Ausführungsrecht — auch nicht einem voll berechtigten
+    /// Parent.
+    #[test]
+    fn test_network_reducers_never_grant_network_the_parent_lacks() -> TestResult {
+        let (ctx, tmp) = make_test_ctx()?;
+        let binding = ctx.sandbox().workspace().clone();
+        std::fs::remove_dir_all(tmp).ok();
+        let without_network: Vec<Permission> = ALL_PERMISSIONS
+            .iter()
+            .copied()
+            .filter(|permission| *permission != Permission::NetworkAccess)
+            .collect();
+        let offline_parent = SandboxSpec::from_resolved_for_test(
+            binding.clone(),
+            PermissionSet::from_policy(without_network),
+            NetworkScope::empty(),
+        );
+        let online_parent = SandboxSpec::from_resolved_for_test(
+            binding,
+            PermissionSet::from_policy(ALL_PERMISSIONS),
+            NetworkScope::from_hosts(["crates.io".to_owned()]),
+        );
+        for name in [
+            "reduce_to_read_network",
+            "reduce_to_read_explore",
+            "reduce_to_read_workspace_network",
+        ] {
+            let offline = resolve_authority_reducer(name)(&offline_parent);
+            assert!(
+                !offline.permissions().contains(Permission::NetworkAccess),
+                "{name}: Netz ohne Netz beim Parent"
+            );
+            assert!(offline.network_scope().is_empty(), "{name}");
+            let online = resolve_authority_reducer(name)(&online_parent);
+            assert!(
+                online
+                    .permissions()
+                    .is_subset_of(online_parent.permissions())
+            );
+            assert!(
+                online.network_scope().allows("crates.io")
+                    && !online.network_scope().allows("example.org"),
+                "{name}: Host-Scope nie breiter als beim Parent"
+            );
+            for gated in [
+                Permission::WriteWorkspace,
+                Permission::ExecuteProcess,
+                Permission::ReadSecrets,
+                Permission::ManagePlugins,
+            ] {
+                assert!(!online.permissions().contains(gated), "{name}: {gated:?}");
+            }
         }
         Ok(())
     }

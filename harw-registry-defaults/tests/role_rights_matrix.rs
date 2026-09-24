@@ -10,18 +10,22 @@
 //!    `shell.exec` nur in `Full`/`ShellExecution`/`UiaQuickHelper`
 //!    (Addendum I)/`UiaShellWorker`, jeweils nur mit dem passenden Recht;
 //!    `deps.source_*` nur mit `ReadCargoRegistry`; `web.*` nur in `Research`
-//!    (alle vier Werkzeuge), `ReadOnlyExplore`/`UiaExplorer` (nur
-//!    `web.fetch`/`web.search`, Nutzerentscheidung: der Explorer durchsucht
-//!    auch das Internet) oder `UiaQuickHelper`/`UiaWriter` (nur `web.fetch`),
-//!    jeweils nur mit `NetworkAccess`; `browser.*` in
-//!    keinem Profil — **außer** `browser.open` in `UiaQuickHelper`
+//!    (alle vier Werkzeuge) oder in `ReadOnlyExplore`/`UiaExplorer`/
+//!    `UiaQuickHelper`/`UiaWriter` (nur `web.fetch`/`web.search`,
+//!    Nutzerentscheidungen: der Explorer durchsucht auch das Internet, die
+//!    UIA-Helfer recherchieren kurz online und fügen manchmal Abhängigkeiten
+//!    hinzu), jeweils nur mit `NetworkAccess`; `browser.*` in keinem
+//!    Profil — **außer** `browser.open` in `UiaQuickHelper`
 //!    (Nutzerentscheidung, siehe `UIA_QUICK_HELPER_BROWSER_TOOLS`).
 //! 3. **Rolle × Rechtesatz**: nach dem Rollen-Reducer sieht keine Rolle
-//!    `fs.write`, `shell.exec` oder `browser.*` — auch `uia-worker` nicht:
-//!    ihre `browser.open`-Ausnahme kommt aus der festen Profilzuweisung
-//!    (`UiaQuickHelper`) bei der Registry-Montage, nie aus dem Reducer;
-//!    `ReadOnly` (ihr Reducer) deckelt `NetworkAccess` ohnehin weg.
-//!    `researcher-web` sieht nie `fs.*`, `deps.*` oder `lens.ask`.
+//!    `fs.write` oder `shell.exec`, und `browser.*` höchstens `uia-worker`
+//!    das eine `browser.open` — und nur, wenn ihr Reducer
+//!    (`ReadExplore`) `NetworkAccess` vom Elternteil übernimmt. Netz sehen
+//!    nach dem Reducer nur `explorer`, `uia-explorer`, `uia-worker`,
+//!    `uia-writer` und `researcher-web`, nie mehr als der Elternteil trägt;
+//!    die read-only Rollen (`analyst`, `researcher-deps`, `planner`,
+//!    `root-orchestrator`, Triage …) nie. `researcher-web` sieht nie `fs.*`,
+//!    `deps.*` oder `lens.ask`.
 //! 4. **TOML-Seite** (andere Quelle): keine Rolle admittiert `fs.write`,
 //!    `shell.exec` oder `browser.*` — außer `uia-worker`, die einzige Rolle
 //!    mit der einzigen `browser.*`-Ausnahme `browser.open`;
@@ -95,10 +99,12 @@ fn expected_role_table() -> Vec<(&'static str, RegistryProfile, AuthorityReducer
             RegistryProfile::Planning,
             AuthorityReducer::ReadRegistry,
         ),
+        // Nutzerentscheidung „der Explorer durchsucht auch das Internet“:
+        // `ReadExplore` trägt zusätzlich `NetworkAccess`.
         (
             role_names::EXPLORER,
             RegistryProfile::ReadOnlyExplore,
-            AuthorityReducer::ReadRegistry,
+            AuthorityReducer::ReadExplore,
         ),
         (
             role_names::RESEARCHER_DEPS,
@@ -156,14 +162,16 @@ fn expected_role_table() -> Vec<(&'static str, RegistryProfile, AuthorityReducer
             AuthorityReducer::ReadRegistry,
         ),
         // Addendum I (korrigiert REG-DE): `uia-worker` ist der exklusive
-        // Schnellhelfer der UIA — nicht mehr reine Netz-Recherche
-        // (`RegistryProfile::Research`), sondern
-        // `RegistryProfile::UiaQuickHelper` mit dem `executor`-Muster als
-        // Reducer-Ausnahme (siehe `authority_reducer_for_role`).
+        // Schnellhelfer der UIA — `RegistryProfile::UiaQuickHelper`. Seit der
+        // Nutzerentscheidung „kurz online recherchieren, manchmal
+        // Abhängigkeiten hinzufügen“ `ReadExplore` (Workspace,
+        // Registry-Quellcache, egress-gebundenes Netz); `shell.exec` bleibt
+        // die Reducer-Ausnahme nach dem `executor`-Muster (siehe
+        // `authority_reducer_for_role`).
         (
             role_names::UIA_WORKER,
             RegistryProfile::UiaQuickHelper,
-            AuthorityReducer::ReadOnly,
+            AuthorityReducer::ReadExplore,
         ),
         // Addendum K: `agent-steward` ist die einzige Rolle mit
         // `RegistryProfile::AgentStewardship`, ebenfalls mit dem
@@ -183,19 +191,21 @@ fn expected_role_table() -> Vec<(&'static str, RegistryProfile, AuthorityReducer
             AuthorityReducer::ReadOnly,
         ),
         // Read-only Erkundungsspezialisierung der UIA: `RegistryProfile::
-        // UiaExplorer` mit dem `uia-worker`-Muster als Reducer-Ausnahme
-        // (siehe `authority_reducer_for_role`).
+        // UiaExplorer` mit `ReadWorkspaceNetwork` (Workspace lesen plus
+        // egress-gebundenes Netz, kein Registry-Quellcache) — trägt ihr
+        // ganzes Profil, keine Ausnahme.
         (
             role_names::UIA_EXPLORER,
             RegistryProfile::UiaExplorer,
-            AuthorityReducer::ReadOnly,
+            AuthorityReducer::ReadWorkspaceNetwork,
         ),
         // Schreibende Erkundungsspezialisierung der UIA: `RegistryProfile::
-        // UiaWriter` mit demselben Reducer-Muster.
+        // UiaWriter` mit `ReadExplore` (dieselbe Nutzerentscheidung wie
+        // `uia-worker`); `fs.write` bleibt die Reducer-Ausnahme.
         (
             role_names::UIA_WRITER,
             RegistryProfile::UiaWriter,
-            AuthorityReducer::ReadOnly,
+            AuthorityReducer::ReadExplore,
         ),
     ]
 }
@@ -283,18 +293,16 @@ fn test_profile_by_permission_matrix_never_registers_ungranted_tools() -> TestRe
                 .collect();
             if !web.is_empty() {
                 // `Research` führt alle vier `web.*`-Werkzeuge;
-                // `ReadOnlyExplore`/`UiaExplorer` (Explorer-Netz,
-                // `EXPLORER_WEB_TOOLS`) nur `web.fetch`/`web.search`;
-                // `UiaQuickHelper` (Addendum I) und `UiaWriter` ausschließlich
-                // `web.fetch` (`UIA_QUICK_HELPER_WEB_TOOLS`).
+                // `ReadOnlyExplore`/`UiaExplorer`/`UiaQuickHelper`/`UiaWriter`
+                // (`EXPLORER_WEB_TOOLS`) nur `web.fetch`/`web.search`.
                 let allowed_web: &[&str] = match *profile {
                     RegistryProfile::Research => {
                         &["web.fetch", "web.docs_rs", "web.crates_io", "web.search"]
                     }
-                    RegistryProfile::ReadOnlyExplore | RegistryProfile::UiaExplorer => {
-                        &["web.fetch", "web.search"]
-                    }
-                    RegistryProfile::UiaQuickHelper | RegistryProfile::UiaWriter => &["web.fetch"],
+                    RegistryProfile::ReadOnlyExplore
+                    | RegistryProfile::UiaExplorer
+                    | RegistryProfile::UiaQuickHelper
+                    | RegistryProfile::UiaWriter => &["web.fetch", "web.search"],
                     _ => &[],
                 };
                 for tool in &web {
@@ -337,9 +345,36 @@ fn test_role_by_permission_matrix_after_reducer() {
 
             let tools = profile.tool_names_for(&child);
             for tool in &tools {
+                // Einzige `browser.*`-Ausnahme: `browser.open` für
+                // `uia-worker`, und nur mit vom Elternteil übernommenem Netz.
+                let is_uia_worker_browser_open = role == role_names::UIA_WORKER
+                    && *tool == "browser.open"
+                    && child.contains(Permission::NetworkAccess);
                 assert!(
-                    *tool != "fs.write" && *tool != "shell.exec" && !BROWSER.contains(tool),
+                    *tool != "fs.write"
+                        && *tool != "shell.exec"
+                        && (is_uia_worker_browser_open || !BROWSER.contains(tool)),
                     "{role}: {tool} darf nie sichtbar sein"
+                );
+            }
+            // Netz sehen nach dem Reducer nur die freigegebenen Rollen, und
+            // nur, wenn der Elternteil selbst Netz trägt (nie breiter).
+            let networked_roles = [
+                role_names::EXPLORER,
+                role_names::UIA_EXPLORER,
+                role_names::UIA_WORKER,
+                role_names::UIA_WRITER,
+                role_names::RESEARCHER_WEB,
+            ];
+            assert_eq!(
+                child.contains(Permission::NetworkAccess),
+                networked_roles.contains(&role) && parent.contains(Permission::NetworkAccess),
+                "{role}: Netz nach dem Reducer"
+            );
+            if !networked_roles.contains(&role) {
+                assert!(
+                    !tools.iter().any(|tool| tool.starts_with("web.")),
+                    "{role}: read-only Rolle sieht web.*"
                 );
             }
             if role == role_names::RESEARCHER_WEB {
@@ -358,7 +393,7 @@ fn test_role_by_permission_matrix_after_reducer() {
             assert_eq!(
                 sees_source,
                 parent.contains(Permission::ReadCargoRegistry)
-                    && reducer == AuthorityReducer::ReadRegistry
+                    && reducer.ceiling().contains(Permission::ReadCargoRegistry)
                     && profile
                         .registered_tool_names()
                         .contains(&"deps.source_read"),
@@ -385,8 +420,9 @@ fn test_role_tomls_never_admit_write_shell_or_browser_and_researcher_web_is_web_
         // test_authority_reducer_for_role_covers_every_role_and_bounds_its_profile`
         // (dort `exempt_from_subset_bound`) statt einer zweiten,
         // handgepflegten Rollenliste: `executor`, `memory-steward`,
-        // `uia-worker` und `agent-steward` sind dokumentierte Ausnahmen —
-        // ihr Profil braucht ein Recht (`WriteWorkspace`/`ExecuteProcess`),
+        // `uia-worker`, `uia-writer`, `uia-shell-worker` und `agent-steward`
+        // sind dokumentierte Ausnahmen — ihr Profil braucht ein Recht
+        // (`WriteWorkspace`/`ExecuteProcess`),
         // das der `AuthorityReducer` ihrer Rolle nie trägt, weil sie es über
         // ihre feste Profilzuweisung bei der Registry-Montage bekommen (siehe
         // `authority_reducer_for_role`), nicht über den Reducer.

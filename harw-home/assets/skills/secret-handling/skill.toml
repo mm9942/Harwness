@@ -1,0 +1,5 @@
+name = "secret-handling"
+description = "Use when Code in IRGENDEINER Sprache Passwörter, API-Keys, Tokens, private Schlüssel, Session-Cookies oder anderes Geheimmaterial liest, speichert, vergleicht, loggt oder weitergibt — Python, TypeScript/Node, Go, Java, C#, Rust. Trigger: Secret landet in Log/Exception-Message/`repr`/`toString`/JSON, Secret als CLI-Argument oder in URL, Vergleich mit `==`, Secret als immutable String im Speicher, Config-Dump beim Start. Lehrt Redaction-Wrapper-Typen, Log- und Fehler-Hygiene, konstante Vergleichszeit, möglichst kurzes Leben im Speicher mit Überschreiben (zeroize/`clear`/`Arrays.fill`/`bytearray`) und ehrliche Grenzen dieser Maßnahmen. Sprachunabhängige Variante von rust-zeroize-secrets."
+enabled = true
+instructions_file = "instructions.md"
+tools = ["filesystem.read"]

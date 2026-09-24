@@ -668,6 +668,20 @@ impl ChildRegistryFactory for RuntimeChildRegistryFactory {
     /// `Ok(ExtensionRegistry)` mit genau den Tool-Providern des Profils aus
     /// [`profile_for_role`], erweitert um die Kind-Freigabekette.
     ///
+    /// # Rechte und Netz
+    /// Die Registry legt nur fest, welche Werkzeuge das Kind **sieht**; was
+    /// es tatsächlich darf, entscheidet die Sandbox, mit der
+    /// [`ManagedAgentSpawner`] das Kind admittiert — über den Handoff die
+    /// Sandbox des Elternteils, geprüft mit `ensure_child_of`, also nie mehr
+    /// Rechte und nie mehr Hosts als der Elternteil. Das gilt insbesondere
+    /// für `uia-worker`/`uia-writer`, deren Profile seit der
+    /// Nutzerentscheidung „kurz online recherchieren, manchmal
+    /// Abhängigkeiten hinzufügen“ `web.fetch`/`web.search` und die lesenden
+    /// `deps.*` registrieren: `NetworkAccess` samt Host-Scope kommt nur vom
+    /// Elternteil (registry-seitiger Reducer `ReadExplore`), und jeder Abruf
+    /// läuft zusätzlich durch die prozessweite Egress-Policy
+    /// (`harw_registry_defaults::install_web_tools`).
+    ///
     /// # Fehler
     /// [`AgentSpawnError`], wenn `role` **keine** bekannte Rolle ist
     /// (fail-closed, kein `unwrap_or_default`) oder die Montage scheitert.

@@ -961,7 +961,14 @@ fn ensure_bound_to(sandbox: &SandboxSpec, expected: &Path) -> RuntimeResult<()> 
 /// `deps.*` mit, das `Full` nicht registriert. Die Whitelist bleibt trotzdem
 /// wie vertraglich festgelegt; abgesichert wird über die Sandbox, weil kein
 /// Einstiegsprofil [`harw_authority::Permission::ReadCargoRegistry`] trägt und
-/// die geschnittene Sandbox dieses Recht deshalb nie erhalten kann.
+/// die geschnittene Sandbox dieses Recht deshalb nie erhalten kann. Dasselbe
+/// gilt für `UiaQuickHelper`/`UiaWriter`, die seit der Nutzerentscheidung
+/// „die UIA-Helfer recherchieren kurz online und fügen manchmal
+/// Abhängigkeiten hinzu“ ebenfalls `deps.*` und `web.fetch`/`web.search`
+/// registrieren: kein Einstiegsprofil trägt
+/// [`harw_authority::Permission::NetworkAccess`] oder `ReadCargoRegistry`,
+/// die Werkzeuge fallen bei einer Verengung also über
+/// `tool_names_for(granted)` bzw. am Rechte-Prolog heraus.
 ///
 /// # Fehler
 /// [`RuntimeError::Registry`] für jede nicht zugelassene Kombination.

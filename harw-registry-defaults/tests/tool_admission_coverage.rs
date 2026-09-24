@@ -298,3 +298,61 @@ fn agent_definition_tool_provider_without_access_registers_only_read_and_list_to
     let names = harw_registry_defaults::agent_definition_tool_names_for_access(None);
     assert_eq!(names, vec!["agents.validate", "agents.list_proposals"]);
 }
+
+/// Nutzerentscheidung „die UIA-Helfer recherchieren kurz online und fügen
+/// manchmal Abhängigkeiten hinzu“: `uia-worker` und `uia-writer` admittieren
+/// `web.fetch`/`web.search` und die fünf lesenden `deps.*`-Werkzeuge — und
+/// ihr Profil (`UiaQuickHelper` bzw. `UiaWriter`) registriert/bewirbt genau
+/// diese auch, sonst wäre der TOML-Eintrag toter Text. Die tiefere
+/// Crate-Recherche (`web.docs_rs`/`web.crates_io`) bleibt beiden verboten.
+#[test]
+fn uia_helpers_admit_and_register_web_search_and_read_only_deps_tools() -> TestResult {
+    let roles = resolved_roles()?;
+    const RESEARCH_TOOLS: [&str; 7] = [
+        "web.fetch",
+        "web.search",
+        "deps.graph",
+        "deps.locked",
+        "deps.source_read",
+        "deps.source_search",
+        "deps.source_list",
+    ];
+    for (role, expected_profile) in [
+        (role_names::UIA_WORKER, RegistryProfile::UiaQuickHelper),
+        (role_names::UIA_WRITER, RegistryProfile::UiaWriter),
+    ] {
+        let ir = roles
+            .get(role)
+            .ok_or(TestError::Unexpected(format!("{role} fehlt")))?;
+        let profile =
+            profile_for_role(role).ok_or(TestError::Unexpected(format!("{role} ohne Profil")))?;
+        assert_eq!(profile, expected_profile, "{role}");
+        let advertised: BTreeSet<&str> = profile.tool_names().into_iter().collect();
+        let admitted: BTreeSet<&str> = ir
+            .tool_surface()
+            .admitted()
+            .iter()
+            .map(String::as_str)
+            .collect();
+        let forbidden: BTreeSet<&str> = ir
+            .tool_surface()
+            .forbidden()
+            .iter()
+            .map(String::as_str)
+            .collect();
+        for tool in RESEARCH_TOOLS {
+            assert!(admitted.contains(tool), "{role} muss {tool} admittieren");
+            assert!(
+                advertised.contains(tool),
+                "{profile:?} muss {tool} registrieren"
+            );
+            assert!(!forbidden.contains(tool), "{role} verbietet {tool}");
+        }
+        for tool in ["web.docs_rs", "web.crates_io", "lens.ask"] {
+            assert!(!admitted.contains(tool), "{role} admittiert {tool}");
+            assert!(!advertised.contains(tool), "{profile:?} registriert {tool}");
+            assert!(forbidden.contains(tool), "{role} muss {tool} verbieten");
+        }
+    }
+    Ok(())
+}

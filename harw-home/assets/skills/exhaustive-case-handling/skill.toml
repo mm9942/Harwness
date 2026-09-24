@@ -1,0 +1,5 @@
+name = "exhaustive-case-handling"
+description = "Use when du ein switch/match/if-else-Kaskade über ein Enum, eine Union, einen Status oder eine Kombination (Status × Rolle, Algorithmus × Modus) schreibst oder eine neue Enum-Variante/einen neuen Union-Fall hinzufügst — in TypeScript (`never`-Check), Python (`match` + `assert_never`), Java (sealed + switch), C# (switch expression), Go (exhaustive-Linter) oder Rust (`match` ohne `_`). Lehrt, wie der Compiler/Typechecker fehlende Fälle meldet, warum `default: throw`/`_ => unreachable!()` Lücken versteckt und wie nicht unterstützte Fälle als Fehler statt Crash enden. Sprachunabhängige Variante von rust-match-exhaustive."
+enabled = true
+instructions_file = "instructions.md"
+tools = ["filesystem.read"]

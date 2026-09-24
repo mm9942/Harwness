@@ -1,0 +1,5 @@
+name = "function-signature-design"
+description = "Use when du eine Funktions-/Methodensignatur schreibst oder reviewst und entscheidest, welche Parametertypen du annimmst und was du zurückgibst — in TypeScript, Python, Go, Java, C# oder Rust. Trigger: Parameter vom Typ `List`/`list`/`string[]` obwohl nur iteriert wird, `ArrayList`/`String` statt `Collection`/`CharSequence`, Go-Funktion nimmt `*os.File` statt `io.Reader`, Aufrufer muss erst konvertieren/kopieren, Funktion kopiert defensiv obwohl sie nur liest, Funktion alloziert immer neu obwohl die Eingabe meist unverändert bleibt. Lehrt: nimm die allgemeinste lesende Abstraktion an, gib den konkreten Typ zurück, borge statt zu besitzen, kopiere nur bei Bedarf (copy-on-write). Sprachunabhängige Variante von rust-borrow-vs-owned-params / rust-as-ref / rust-deref-coercion / rust-cow."
+enabled = true
+instructions_file = "instructions.md"
+tools = ["filesystem.read"]
