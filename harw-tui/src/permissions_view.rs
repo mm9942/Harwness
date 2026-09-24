@@ -6,6 +6,9 @@
 //! - [`auto_note_for`] — der kompakte Vermerk an der Werkzeugzelle:
 //!   „auto ✓ <Grund>“ für automatisch freigegebene, „Vom Auto-Modus
 //!   abgelehnt · <Kategorie>“ für abgelehnte Aufrufe.
+//! - [`auto_ask_reason_for`] — Runde 6, Teil A1: der Grund, aus dem der
+//!   Auto-Modus die Person fragt („<Kategorie> – <Grund>“); der
+//!   Freigabedialog zeigt ihn als Zeile „Auto-Modus: …“.
 //! - [`LearnOfferView`] — das Lern-Angebot des Freigabedialogs („Ja, und
 //!   künftig erlauben: `<muster>`“) mit Scope-Wahl Sitzung oder Projekt,
 //!   dazu die anzulegende Regel ([`LearnOfferView::rule`]) und der
@@ -136,6 +139,28 @@ pub fn auto_note_for(verdict: &AutoVerdict) -> Option<String> {
     }
 }
 
+/// Höchstlänge (Zeichen) des Auto-Modus-Grundes im Freigabedialog.
+const MAX_DIALOG_REASON_CHARS: usize = 240;
+
+/// Runde 6, Teil A1: der Grund einer Auto-Modus-Rückfrage für den
+/// Freigabedialog.
+///
+/// # Beschreibung
+/// Nur für `ask`-Urteile (auch aus `deny` umgewandelte); bereinigt
+/// Steuerzeichen und kürzt. Der Dialog stellt „Auto-Modus: “ voran.
+///
+/// # Rückgabe
+/// `Some("<Kategorie> – <Grund>")` bei `ask`, sonst `None`.
+#[must_use]
+pub fn auto_ask_reason_for(verdict: &AutoVerdict) -> Option<String> {
+    (verdict.decision == AutoDecision::Ask).then(|| {
+        truncate(
+            &sanitize_inline(&verdict.dialog_reason()),
+            MAX_DIALOG_REASON_CHARS,
+        )
+    })
+}
+
 /// Kürzt zeichensicher mit `…`.
 fn truncate(text: &str, max: usize) -> String {
     if text.chars().count() <= max {
@@ -200,6 +225,29 @@ mod tests {
         let note = auto_note_for(&verdict).unwrap_or_default();
         assert!(!note.contains('\u{1b}'), "{note:?}");
         assert!(!note.contains('\n'), "{note:?}");
+    }
+
+    /// Runde 6, Teil A1: ein aus `deny` umgewandeltes `ask` liefert den
+    /// Grund für den Dialog; `allow`/`deny` liefern keinen.
+    #[test]
+    fn ask_verdicts_yield_a_dialog_reason() {
+        let escalated = AutoVerdict::new(
+            AutoDecision::Deny,
+            "exfiltration",
+            "verschiebt nach ~\u{1b}[2J",
+            VerdictSource::Classifier,
+        )
+        .escalate_to_ask();
+        let reason = auto_ask_reason_for(&escalated).unwrap_or_default();
+        assert!(
+            reason.starts_with("exfiltration – verschiebt nach ~"),
+            "{reason}"
+        );
+        assert!(!reason.contains('\u{1b}'), "{reason:?}");
+        let allow = AutoVerdict::new(AutoDecision::Allow, "c", "r", VerdictSource::Classifier);
+        assert_eq!(auto_ask_reason_for(&allow), None);
+        let deny = AutoVerdict::new(AutoDecision::Deny, "c", "r", VerdictSource::Classifier);
+        assert_eq!(auto_ask_reason_for(&deny), None);
     }
 
     #[test]

@@ -374,6 +374,22 @@ async fn a_finished_background_agent_starts_an_auto_turn_when_idle() -> TestResu
     assert!(fx.spawner.child_record(&child).is_none());
 
     assert!(collect_finished(&mut fx.app));
+    // Runde 6, Teil C: Hintergrund-Ende samt Benachrichtigungstext im Export.
+    let markdown = crate::app::build_export(
+        &fx.app,
+        &crate::export::ExportOptions::default(),
+        crate::app::ExportOutputFormat::Markdown,
+    );
+    assert!(
+        markdown.contains("Ergebnis des Orchestrators"),
+        "Hintergrund-Ende fehlt im Export: {markdown}"
+    );
+    assert!(fx.app.export_entries.iter().any(|entry| matches!(
+        entry,
+        crate::export::ExportEntry::Agent(agent)
+            if agent.agent_id == child.as_str()
+                && agent.summary.as_deref().is_some_and(|text| text.contains("fertig"))
+    )));
     let auto = take_auto_turn(&mut fx.app).ok_or(TestError::Missing("Auto-Turn im Leerlauf"))?;
     assert_eq!(auto, AUTO_TURN_PROMPT);
     let turn_text = attach_queued_notices(&mut fx.app, auto);

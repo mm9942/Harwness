@@ -1534,6 +1534,38 @@ mod tests {
         }
     }
 
+    /// Runde 6, Teil A1: an der Wurzel (TUI, darf fragen) wird ein `deny`
+    /// des Klassifizierers zur Rückfrage; der Grund steht im Protokoll unter
+    /// der Id des Aufrufs (der Freigabedialog zeigt ihn). Ein Kind ohne
+    /// Freigabe-Kanal bekommt weiter ein hartes `Deny` mit Grund.
+    #[test]
+    fn a_classifier_deny_asks_in_the_root_and_denies_in_a_child_without_relay() -> TestResult {
+        let reply = r#"{"decision":"deny","category":"exfiltration","reason":"verschiebt nach ~"}"#;
+        let chain = auto_chain(Some(reply));
+        let root_call = shell_call("cargo publish");
+        assert!(matches!(
+            run_on_runtime(chain.handlers()[0].review(&root_call))?,
+            ApprovalDecision::AskUser(_)
+        ));
+        let logged = chain
+            .auto_mode()
+            .and_then(|auto| auto.log().verdict_for(root_call.id.as_str()))
+            .ok_or(TestError::Missing("Protokolleintrag der Wurzel"))?;
+        assert_eq!(logged.dialog_reason(), "exfiltration – verschiebt nach ~");
+        assert!(logged.escalated);
+
+        let child = chain.for_child();
+        match run_on_runtime(child.handlers()[0].review(&shell_call("cargo publish")))? {
+            ApprovalDecision::Deny(reason) => {
+                assert!(reason.contains("verschiebt nach ~"), "{reason}");
+                Ok(())
+            }
+            other => Err(TestError::Unexpected(format!(
+                "erwartet Deny, war {other:?}"
+            ))),
+        }
+    }
+
     #[test]
     fn always_ask_tools_stay_ask_with_auto_mode() -> TestResult {
         let chain = auto_chain(Some(r#"{"decision":"allow"}"#));

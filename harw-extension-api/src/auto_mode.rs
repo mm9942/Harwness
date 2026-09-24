@@ -16,10 +16,13 @@
 //!   **Sicherheitsdeckel**: nach [`CONSECUTIVE_DENIAL_CAP`] Ablehnungen in
 //!   Folge oder [`TOTAL_DENIAL_CAP`] Ablehnungen insgesamt meldet
 //!   [`AutoDecisionLog::record`] [`CapStatus::Tripped`], und der Aufrufer
-//!   schaltet den Modus auf `ask` zurück.
-//! - [`AutoSessionContext`] — das „Ziel der Sitzung" (letzte
-//!   Nutzernachricht, aktiver Plan) und die letzten Werkzeugaufrufe, die der
-//!   Klassifizierer als Kontext bekommt.
+//!   schaltet den Modus auf `ask` zurück. Runde 6, Teil A5: gezählt werden
+//!   nur Ablehnungen, die nach der Umwandlung deny → ask übrig bleiben;
+//!   dieselbe Aufruf-Signatur zählt binnen [`DENIAL_DEDUP_WINDOW_SECS`]
+//!   Sekunden nur einmal ([`AutoDecisionLog::record_with_signature`]).
+//! - [`AutoSessionContext`] — das „Ziel der Sitzung" (die letzten
+//!   [`RECENT_GOALS_CAPACITY`] Nutzernachrichten, aktiver Plan) und die
+//!   letzten Werkzeugaufrufe, die der Klassifizierer als Kontext bekommt.
 //!
 //! # Sicherheitsregeln (fail-closed)
 //! - Ein Urteil, das nicht ausdrücklich `allow` lautet, gibt **nie** frei.
@@ -62,6 +65,14 @@ pub const CONSECUTIVE_DENIAL_CAP: u32 = 3;
 /// zurückfällt.
 pub const TOTAL_DENIAL_CAP: u32 = 20;
 
+/// Runde 6, Teil A5: Zeitfenster (Sekunden), in dem dieselbe
+/// Aufruf-Signatur nur einmal als Ablehnung zählt.
+pub const DENIAL_DEDUP_WINDOW_SECS: i64 = 60;
+
+/// Runde 6, Teil A2: wie viele der letzten Nutzernachrichten
+/// [`AutoSessionContext`] als „Ziel der Sitzung" behält.
+pub const RECENT_GOALS_CAPACITY: usize = 3;
+
 /// Wie viele Entscheidungen [`AutoDecisionLog`] höchstens behält.
 pub const DECISION_LOG_CAPACITY: usize = 100;
 
@@ -86,6 +97,10 @@ pub enum AutoDecision {
     /// Die Person fragen (bzw. im Kind ohne Pausenrecht: mit Grund ablehnen).
     Ask,
     /// Ohne Rückfrage ablehnen; der Agent bekommt den Grund als Werkzeugfehler.
+    ///
+    /// Runde 6, Teil A1: das Gate wandelt ein `deny` des Klassifizierers in
+    /// `ask` um, wo jemand gefragt werden kann (Wurzel, Kind mit
+    /// Freigabe-Kanal); ein hartes `Deny` bleibt nur, wo niemand fragen kann.
     Deny,
 }
 
@@ -165,6 +180,11 @@ pub struct AutoVerdict {
     pub reason: String,
     /// Woher das Urteil stammt.
     pub source: VerdictSource,
+    /// Runde 6, Teil A1: `true`, wenn dieses `ask` aus einem `deny` des
+    /// Klassifizierers bzw. Vorfilters entstanden ist, weil die Person
+    /// gefragt werden kann. Zählt nicht für den Sicherheitsdeckel.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub escalated: bool,
 }
 
 impl AutoVerdict {
@@ -185,7 +205,37 @@ impl AutoVerdict {
             category: category.into(),
             reason: reason.into(),
             source,
+            escalated: false,
         }
+    }
+
+    /// Runde 6, Teil A1: macht aus einem `deny` eine Rückfrage an die Person.
+    ///
+    /// # Beschreibung
+    /// Kategorie, Grund und Herkunft bleiben erhalten, damit der
+    /// Freigabedialog sie als „Auto-Modus: <Kategorie> – <Grund>" zeigen
+    /// kann; [`Self::escalated`] wird gesetzt. Jede andere Entscheidung
+    /// bleibt unverändert (ein `allow` wird nie berührt).
+    ///
+    /// # Rückgabe
+    /// Das umgewandelte Urteil.
+    #[must_use]
+    pub fn escalate_to_ask(mut self) -> Self {
+        if self.decision == AutoDecision::Deny {
+            self.decision = AutoDecision::Ask;
+            self.escalated = true;
+        }
+        self
+    }
+
+    /// Runde 6, Teil A1: der Grund für den Freigabedialog.
+    ///
+    /// # Rückgabe
+    /// `"<Kategorie> – <Grund>"` (die Oberfläche stellt „Auto-Modus: "
+    /// voran und bereinigt Steuerzeichen).
+    #[must_use]
+    pub fn dialog_reason(&self) -> String {
+        format!("{} – {}", self.category.trim(), self.reason.trim())
     }
 
     /// Das Urteil für Fehler, Zeitlimit, unparsebare Antwort oder fehlendes
@@ -221,6 +271,12 @@ impl AutoVerdict {
     ///
     /// # Beschreibung
     /// `allow` → `Allow`, `ask` → `AskUser`, `deny` → `Deny(`[`Self::denial_text`]`)`.
+    ///
+    /// Runde 6, Teil A1: `ApprovalDecision::AskUser` trägt nur eine
+    /// Anfrage-Id (Vertrag mit `harw-core`). Den Kontext der Rückfrage
+    /// (Kategorie, Grund) liest die Oberfläche über
+    /// [`AutoDecisionLog::verdict_for`] mit der Id des Werkzeugaufrufs — das
+    /// Gate protokolliert das Urteil **nach** der Umwandlung deny → ask.
     #[must_use]
     pub fn into_approval(self) -> ApprovalDecision {
         match self.decision {
@@ -264,6 +320,27 @@ pub enum CapStatus {
     Tripped,
 }
 
+/// Runde 6, Teil A5: welche Grenze des Sicherheitsdeckels gegriffen hat.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CapLimit {
+    /// [`CONSECUTIVE_DENIAL_CAP`] Ablehnungen in Folge.
+    Consecutive,
+    /// [`TOTAL_DENIAL_CAP`] Ablehnungen in dieser Sitzung.
+    Total,
+}
+
+impl CapLimit {
+    /// Die Grenze als Satzteil („3 Ablehnungen in Folge" bzw. „20
+    /// Ablehnungen in dieser Sitzung").
+    #[must_use]
+    pub fn describe(self) -> String {
+        match self {
+            Self::Consecutive => format!("{CONSECUTIVE_DENIAL_CAP} Ablehnungen in Folge"),
+            Self::Total => format!("{TOTAL_DENIAL_CAP} Ablehnungen in dieser Sitzung"),
+        }
+    }
+}
+
 /// Ein Eintrag im [`AutoDecisionLog`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AutoLogEntry {
@@ -290,6 +367,11 @@ struct LogState {
     total_denials: u32,
     /// Ob der Deckel ausgelöst ist (bis [`AutoDecisionLog::reset_cap`]).
     tripped: bool,
+    /// Runde 6, Teil A5: welche Grenze zuletzt gegriffen hat.
+    tripped_by: Option<CapLimit>,
+    /// Runde 6, Teil A5: zuletzt **gezählte** Ablehnung je Signatur
+    /// (nur ein Hash, nie Argumente — kein Geheimnis im Speicher).
+    counted_signatures: VecDeque<(u64, jiff::Timestamp)>,
     /// Ein noch nicht angezeigter Hinweis für die Oberfläche.
     pending_notice: Option<String>,
 }
@@ -299,7 +381,10 @@ struct LogState {
 /// # Beschreibung
 /// Klone teilen denselben Zustand. Gezählt werden nur **Ablehnungen**
 /// (`deny`): jede Ablehnung erhöht beide Zähler, jede Freigabe (`allow`)
-/// setzt den Folgezähler zurück, ein `ask` lässt beide unverändert.
+/// setzt den Folgezähler zurück, ein `ask` lässt beide unverändert — auch
+/// ein aus `deny` umgewandeltes `ask` (Runde 6, Teil A5). Mit Signatur
+/// ([`Self::record_with_signature`]) zählt dieselbe Signatur binnen
+/// [`DENIAL_DEDUP_WINDOW_SECS`] Sekunden nur einmal.
 #[derive(Clone, Default)]
 pub struct AutoDecisionLog(Arc<Mutex<LogState>>);
 
@@ -328,28 +413,62 @@ impl AutoDecisionLog {
     /// erstmals erreicht ([`CONSECUTIVE_DENIAL_CAP`] in Folge oder
     /// [`TOTAL_DENIAL_CAP`] insgesamt); sonst [`CapStatus::Ok`].
     pub fn record(&self, entry: AutoLogEntry) -> CapStatus {
+        self.record_inner(entry, None)
+    }
+
+    /// Runde 6, Teil A5: wie [`Self::record`], aber eine Ablehnung mit
+    /// derselben `signature` zählt binnen [`DENIAL_DEDUP_WINDOW_SECS`]
+    /// Sekunden (gemessen an [`AutoLogEntry::at`]) nur einmal.
+    ///
+    /// # Beschreibung
+    /// Das Fenster gleitet bewusst **nicht**: eine Wiederholung innerhalb
+    /// des Fensters verlängert es nicht. Ein Agent, der denselben Aufruf in
+    /// Schleife wiederholt, erreicht den Deckel dadurch trotzdem (einmal je
+    /// Fenster), nur nicht in Sekunden. Protokolliert wird jede Entscheidung.
+    ///
+    /// # Arguments
+    /// - `entry` ([`AutoLogEntry`]): die Entscheidung.
+    /// - `signature` (`u64`): Hash aus Werkzeug und normalisierten
+    ///   Argumenten (vom Aufrufer gebildet).
+    ///
+    /// # Rückgabe
+    /// Wie [`Self::record`].
+    pub fn record_with_signature(&self, entry: AutoLogEntry, signature: u64) -> CapStatus {
+        self.record_inner(entry, Some(signature))
+    }
+
+    fn record_inner(&self, entry: AutoLogEntry, signature: Option<u64>) -> CapStatus {
         self.with_state(|state| {
             match entry.verdict.decision {
                 AutoDecision::Deny => {
-                    state.consecutive_denials = state.consecutive_denials.saturating_add(1);
-                    state.total_denials = state.total_denials.saturating_add(1);
+                    if state.should_count(signature, entry.at) {
+                        state.consecutive_denials = state.consecutive_denials.saturating_add(1);
+                        state.total_denials = state.total_denials.saturating_add(1);
+                    }
                 }
                 AutoDecision::Allow => state.consecutive_denials = 0,
                 AutoDecision::Ask => {}
             }
+            let last_denial = (entry.verdict.decision == AutoDecision::Deny).then(|| entry.clone());
             state.entries.push_back(entry);
             while state.entries.len() > DECISION_LOG_CAPACITY {
                 state.entries.pop_front();
             }
-            let reached = state.consecutive_denials >= CONSECUTIVE_DENIAL_CAP
-                || state.total_denials >= TOTAL_DENIAL_CAP;
-            if reached && !state.tripped {
-                state.tripped = true;
-                state.pending_notice =
-                    Some(cap_notice(state.consecutive_denials, state.total_denials));
-                CapStatus::Tripped
+            let limit = if state.consecutive_denials >= CONSECUTIVE_DENIAL_CAP {
+                Some(CapLimit::Consecutive)
+            } else if state.total_denials >= TOTAL_DENIAL_CAP {
+                Some(CapLimit::Total)
             } else {
-                CapStatus::Ok
+                None
+            };
+            match limit {
+                Some(limit) if !state.tripped => {
+                    state.tripped = true;
+                    state.tripped_by = Some(limit);
+                    state.pending_notice = Some(cap_notice(limit, last_denial.as_ref()));
+                    CapStatus::Tripped
+                }
+                _ => CapStatus::Ok,
             }
         })
     }
@@ -397,12 +516,21 @@ impl AutoDecisionLog {
         self.with_state(|state| state.tripped)
     }
 
+    /// Runde 6, Teil A5: welche Grenze den Deckel ausgelöst hat (`None`,
+    /// solange er nicht ausgelöst ist).
+    #[must_use]
+    pub fn tripped_by(&self) -> Option<CapLimit> {
+        self.with_state(|state| state.tripped.then_some(state.tripped_by).flatten())
+    }
+
     /// Setzt Deckel und Zähler zurück (die Person hat `auto` wieder gewählt).
     pub fn reset_cap(&self) {
         self.with_state(|state| {
             state.tripped = false;
+            state.tripped_by = None;
             state.consecutive_denials = 0;
             state.total_denials = 0;
+            state.counted_signatures.clear();
             state.pending_notice = None;
         });
     }
@@ -426,20 +554,71 @@ impl std::fmt::Debug for AutoDecisionLog {
     }
 }
 
+impl LogState {
+    /// Runde 6, Teil A5: ob eine Ablehnung mit `signature` zum Zeitpunkt
+    /// `at` zählt; merkt sich gezählte Signaturen (nicht gleitend).
+    fn should_count(&mut self, signature: Option<u64>, at: jiff::Timestamp) -> bool {
+        let Some(signature) = signature else {
+            return true;
+        };
+        let window = jiff::SignedDuration::from_secs(DENIAL_DEDUP_WINDOW_SECS);
+        // Abgelaufene Einträge verwerfen (Zeit rückwärts: behalten, damit
+        // eine verstellte Uhr nicht mehr zählen lässt als vorgesehen).
+        self.counted_signatures
+            .retain(|(_, counted_at)| at.duration_since(*counted_at) < window);
+        if self
+            .counted_signatures
+            .iter()
+            .any(|(existing, _)| *existing == signature)
+        {
+            return false;
+        }
+        self.counted_signatures.push_back((signature, at));
+        while self.counted_signatures.len() > DECISION_LOG_CAPACITY {
+            self.counted_signatures.pop_front();
+        }
+        true
+    }
+}
+
 /// Der Hinweis beim Auslösen des Deckels (sinngemäß wie in Claude Code).
-fn cap_notice(consecutive: u32, total: u32) -> String {
+///
+/// # Beschreibung
+/// Runde 6, Teil A5: nennt genau die Grenze, die gegriffen hat, und — falls
+/// bekannt — die letzte Ablehnung mit Werkzeug, Kategorie und Grund
+/// (bereits bereinigt; Grund einzeilig gekürzt).
+fn cap_notice(limit: CapLimit, last_denial: Option<&AutoLogEntry>) -> String {
+    let last = last_denial
+        .map(|entry| {
+            let reason: String = entry
+                .verdict
+                .reason
+                .chars()
+                .map(|c| if c.is_control() { ' ' } else { c })
+                .take(200)
+                .collect();
+            format!(
+                " Letzte Ablehnung: {} · {}: {}.",
+                entry.tool,
+                entry.verdict.category.trim(),
+                reason.trim()
+            )
+        })
+        .unwrap_or_default();
     format!(
-        "Auto-Modus pausiert: {consecutive} Ablehnungen in Folge bzw. {total} insgesamt. \
+        "Auto-Modus pausiert: {} erreicht.{last} \
          Der Freigabemodus steht wieder auf „ask“ — jeder weitere Aufruf wird erfragt. \
-         Mit `/permissions mode auto` bzw. Umschalt+Tab lässt sich der Auto-Modus wieder einschalten."
+         Mit `/permissions mode auto` bzw. Umschalt+Tab lässt sich der Auto-Modus wieder einschalten.",
+        limit.describe()
     )
 }
 
 /// Innerer Zustand des [`AutoSessionContext`].
 #[derive(Debug, Default)]
 struct ContextState {
-    /// Letzte Nutzernachricht.
-    goal: Option<String>,
+    /// Runde 6, Teil A2: die letzten [`RECENT_GOALS_CAPACITY`]
+    /// Nutzernachrichten, älteste zuerst (Ringpuffer).
+    goals: VecDeque<String>,
     /// Aktiver Plan (Kurzfassung).
     plan: Option<String>,
     /// Zuletzt angefragte Werkzeugaufrufe (bereinigte Kurzfassungen).
@@ -450,7 +629,10 @@ struct ContextState {
 ///
 /// # Beschreibung
 /// Die Oberfläche setzt das Ziel ([`Self::set_goal`]) bei jeder abgeschickten
-/// Nutzernachricht, optional den aktiven Plan ([`Self::set_plan`]); das Gate
+/// Nutzernachricht — Runde 6, Teil A2: als Ringpuffer der letzten
+/// [`RECENT_GOALS_CAPACITY`] Nachrichten, damit ein kurzes „ja, mach" den
+/// eigentlichen Auftrag nicht verdrängt —, optional den aktiven Plan
+/// ([`Self::set_plan`]); das Gate
 /// hängt jeden beurteilten Aufruf an ([`Self::push_recent_call`]). Klone
 /// teilen denselben Zustand.
 #[derive(Clone, Default)]
@@ -477,16 +659,28 @@ impl AutoSessionContext {
         }
     }
 
-    /// Setzt das Ziel der Sitzung (letzte Nutzernachricht).
+    /// Hängt eine Nutzernachricht an das Ziel der Sitzung an.
+    ///
+    /// # Beschreibung
+    /// Runde 6, Teil A2: Ringpuffer der letzten [`RECENT_GOALS_CAPACITY`]
+    /// Nachrichten; eine leere Nachricht wird ignoriert.
     pub fn set_goal(&self, goal: impl Into<String>) {
         let goal = goal.into();
+        if goal.trim().is_empty() {
+            return;
+        }
         self.write(|state| {
-            state.goal = if goal.trim().is_empty() {
-                None
-            } else {
-                Some(goal)
-            };
+            state.goals.push_back(goal);
+            while state.goals.len() > RECENT_GOALS_CAPACITY {
+                state.goals.pop_front();
+            }
         });
+    }
+
+    /// Runde 6, Teil A2: die letzten Nutzernachrichten, älteste zuerst.
+    #[must_use]
+    pub fn recent_goals(&self) -> Vec<String> {
+        self.read(|state| state.goals.iter().cloned().collect())
     }
 
     /// Setzt den aktiven Plan (oder entfernt ihn mit `None`).
@@ -494,10 +688,10 @@ impl AutoSessionContext {
         self.write(|state| state.plan = plan);
     }
 
-    /// Das Ziel der Sitzung.
+    /// Die letzte Nutzernachricht.
     #[must_use]
     pub fn goal(&self) -> Option<String> {
-        self.read(|state| state.goal.clone())
+        self.read(|state| state.goals.back().cloned())
     }
 
     /// Der aktive Plan.
@@ -673,7 +867,132 @@ mod tests {
         assert_eq!(context.plan().as_deref(), Some("1. cargo test"));
         assert_eq!(context.recent_calls(100).len(), RECENT_CALLS_CAPACITY);
         assert_eq!(context.recent_calls(2).len(), 2);
+        // Runde 6, Teil A2: eine leere Nachricht verdrängt das Ziel nicht.
         context.set_goal("   ");
-        assert!(context.goal().is_none());
+        assert_eq!(context.goal().as_deref(), Some("Tests reparieren"));
+    }
+
+    // ── Runde 6, Teil A ─────────────────────────────────────────────────
+
+    fn entry_at(decision: AutoDecision, secs: i64) -> TestResult<AutoLogEntry> {
+        let mut item = entry(decision);
+        item.at = jiff::Timestamp::from_second(secs)
+            .map_err(|error| TestError::Unexpected(format!("Zeitstempel: {error}")))?;
+        Ok(item)
+    }
+
+    /// Runde 6, Teil A2: ein kurzes „ja, mach" verdrängt den eigentlichen
+    /// Auftrag nicht; es bleiben die letzten drei Nachrichten.
+    #[test]
+    fn session_goal_is_a_ring_buffer_of_the_last_three_messages() {
+        let context = AutoSessionContext::new();
+        for message in ["alt", "Verschieb export.md nach ~", "ja, mach", "bitte"] {
+            context.set_goal(message);
+        }
+        assert_eq!(
+            context.recent_goals(),
+            vec![
+                "Verschieb export.md nach ~".to_owned(),
+                "ja, mach".to_owned(),
+                "bitte".to_owned()
+            ]
+        );
+        assert_eq!(context.goal().as_deref(), Some("bitte"));
+        assert_eq!(RECENT_GOALS_CAPACITY, 3);
+    }
+
+    /// Runde 6, Teil A1: `deny` → `ask` behält Kategorie und Grund; ein
+    /// `allow` bleibt unberührt.
+    #[test]
+    fn escalate_to_ask_keeps_category_and_reason() {
+        let verdict = AutoVerdict::new(
+            AutoDecision::Deny,
+            "exfiltration",
+            "verschiebt nach ~",
+            VerdictSource::Classifier,
+        )
+        .escalate_to_ask();
+        assert_eq!(verdict.decision, AutoDecision::Ask);
+        assert!(verdict.escalated);
+        assert_eq!(verdict.dialog_reason(), "exfiltration – verschiebt nach ~");
+        assert!(matches!(
+            verdict.into_approval(),
+            ApprovalDecision::AskUser(_)
+        ));
+        let allow = AutoVerdict::new(AutoDecision::Allow, "c", "r", VerdictSource::Classifier)
+            .escalate_to_ask();
+        assert_eq!(allow.decision, AutoDecision::Allow);
+        assert!(!allow.escalated);
+    }
+
+    /// Runde 6, Teil A5: ein umgewandeltes `ask` zählt nicht als Ablehnung.
+    #[test]
+    fn escalated_asks_never_count_towards_the_cap() {
+        let log = AutoDecisionLog::new();
+        for _ in 0..10 {
+            let mut item = entry(AutoDecision::Deny);
+            item.verdict = item.verdict.escalate_to_ask();
+            assert_eq!(log.record(item), CapStatus::Ok);
+        }
+        assert_eq!(log.denial_counters(), (0, 0));
+        assert!(!log.is_tripped());
+    }
+
+    /// Runde 6, Teil A5: dieselbe Signatur zählt binnen 60 s nur einmal,
+    /// danach wieder; andere Signaturen zählen sofort.
+    #[test]
+    fn same_signature_within_the_window_counts_once() -> TestResult {
+        let log = AutoDecisionLog::new();
+        for secs in [0, 10, 30, 59] {
+            assert_eq!(
+                log.record_with_signature(entry_at(AutoDecision::Deny, secs)?, 7),
+                CapStatus::Ok
+            );
+        }
+        assert_eq!(log.denial_counters(), (1, 1));
+        assert_eq!(
+            log.entries().len(),
+            4,
+            "protokolliert wird jede Entscheidung"
+        );
+        log.record_with_signature(entry_at(AutoDecision::Deny, DENIAL_DEDUP_WINDOW_SECS)?, 7);
+        assert_eq!(log.denial_counters(), (2, 2), "nach 60 s zählt sie wieder");
+        let status = log.record_with_signature(entry_at(AutoDecision::Deny, 61)?, 8);
+        assert_eq!(status, CapStatus::Tripped, "andere Signatur zählt sofort");
+        assert_eq!(log.tripped_by(), Some(CapLimit::Consecutive));
+        Ok(())
+    }
+
+    /// Runde 6, Teil A5: der Hinweis nennt die Grenze, die gegriffen hat,
+    /// und die letzte Ablehnung mit Grund.
+    #[test]
+    fn cap_notice_names_the_limit_that_tripped() -> TestResult {
+        let log = AutoDecisionLog::new();
+        for _ in 0..CONSECUTIVE_DENIAL_CAP {
+            log.record(entry(AutoDecision::Deny));
+        }
+        let notice = log.take_notice().ok_or(TestError::Missing("Hinweis"))?;
+        assert!(notice.contains("3 Ablehnungen in Folge"), "{notice}");
+        assert!(!notice.contains("insgesamt"), "{notice}");
+        assert!(
+            notice.contains("Letzte Ablehnung: shell.exec · test: grund"),
+            "{notice}"
+        );
+
+        let log = AutoDecisionLog::new();
+        for _ in 0..TOTAL_DENIAL_CAP {
+            log.record(entry(AutoDecision::Deny));
+            log.record(entry(AutoDecision::Allow));
+        }
+        assert_eq!(log.tripped_by(), Some(CapLimit::Total));
+        let notice = log.take_notice().ok_or(TestError::Missing("Hinweis"))?;
+        assert!(
+            notice.contains("20 Ablehnungen in dieser Sitzung"),
+            "{notice}"
+        );
+        assert!(!notice.contains("in Folge"), "{notice}");
+        log.reset_cap();
+        assert_eq!(log.tripped_by(), None);
+        Ok(())
     }
 }

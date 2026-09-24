@@ -34,7 +34,7 @@
 //!     title: Some("Testlauf".to_owned()),
 //!     session_id: "abc123".to_owned(),
 //!     started_at: Some("2026-09-14T05:30:00".to_owned()),
-//!     cwd: Some("/home/mia/projects/harwness".to_owned()),
+//!     cwd: Some("/home/nutzerin/projects/harwness".to_owned()),
 //!     model: Some("groq/llama".to_owned()),
 //! };
 //! let entries = vec![ExportEntry::User("Hallo".to_owned())];
@@ -1508,7 +1508,57 @@ fn truncate_markdown(text: &str, max_chars: usize) -> String {
 /// ```
 #[must_use]
 pub fn default_export_path(now: &str, dir: &Path) -> PathBuf {
-    dir.join(format!("harw-export-{now}.md"))
+    default_export_path_with_extension(now, dir, "md")
+}
+
+/// Baut den Standard-Exportpfad `<dir>/harw-export-<now>.<extension>`
+/// (Runde 6, Teil C: die Endung folgt dem Format, `.json` bei JSON).
+///
+/// # Argumente
+/// - `now` (`&str`): Zeitstempel für den Dateinamen.
+/// - `dir` (`&Path`): Zielverzeichnis.
+/// - `extension` (`&str`): Dateiendung ohne Punkt, z. B. `md` oder `json`.
+///
+/// # Rückgabe
+/// `<dir>/harw-export-<now>.<extension>`.
+#[must_use]
+pub fn default_export_path_with_extension(now: &str, dir: &Path, extension: &str) -> PathBuf {
+    dir.join(format!("harw-export-{now}.{extension}"))
+}
+
+/// Expandiert `~` bzw. `$HOME`/`${HOME}` am Anfang eines Exportpfads
+/// (Runde 6, Teil C).
+///
+/// # Beschreibung
+/// Reine Pfadkonstruktion ohne Dateisystemzugriff. Nur ein Präfix, das für
+/// sich steht (`~`, `$HOME`) oder von `/` gefolgt wird, zählt; `~nutzer`
+/// oder `$HOMEX` bleiben unverändert. Ohne bekanntes Home bleibt der Pfad
+/// unverändert. Die Traversal-Prüfung ([`write_export_path`]) gilt danach
+/// unverändert, `~/../x` wird also weiterhin abgelehnt.
+///
+/// # Argumente
+/// - `raw` (`&str`): der eingegebene Pfad.
+/// - `home` (`Option<&Path>`): das Home-Verzeichnis.
+///
+/// # Rückgabe
+/// Der expandierte Pfad.
+#[must_use]
+pub fn expand_home_prefix(raw: &str, home: Option<&Path>) -> PathBuf {
+    let Some(home) = home else {
+        return PathBuf::from(raw);
+    };
+    for prefix in ["~", "${HOME}", "$HOME"] {
+        let Some(rest) = raw.strip_prefix(prefix) else {
+            continue;
+        };
+        if rest.is_empty() {
+            return home.to_path_buf();
+        }
+        if rest.starts_with('/') {
+            return home.join(rest.trim_start_matches('/'));
+        }
+    }
+    PathBuf::from(raw)
 }
 
 /// Prüft `path` auf Traversal-Komponenten (`..`).
@@ -1650,7 +1700,7 @@ mod tests {
             title: Some("Mein Export".to_owned()),
             session_id: "sess-42".to_owned(),
             started_at: Some("2026-09-14T05:30:00".to_owned()),
-            cwd: Some("/home/mia/projects/harwness".to_owned()),
+            cwd: Some("/home/nutzerin/projects/harwness".to_owned()),
             model: Some("groq/llama".to_owned()),
         };
         let entries = vec![
@@ -1663,7 +1713,7 @@ mod tests {
         assert!(out.starts_with("# Mein Export\n\n"));
         assert!(out.contains("- **Session-ID:** sess-42"));
         assert!(out.contains("- **Datum:** 2026-09-14T05:30:00"));
-        assert!(out.contains("- **Verzeichnis:** /home/mia/projects/harwness"));
+        assert!(out.contains("- **Verzeichnis:** /home/nutzerin/projects/harwness"));
         assert!(out.contains("- **Modell:** groq/llama"));
 
         let du_first = out
@@ -1886,6 +1936,59 @@ mod tests {
         assert_eq!(value["nested"]["api-key"], REDACTED);
         assert!(value.get("system_instructions").is_none());
         assert_eq!(value["nested"]["normal"], "three");
+    }
+
+    /// Runde 6, Teil C: `~` und `$HOME` werden nur als eigenständiges
+    /// Präfix expandiert; Traversal bleibt abgelehnt.
+    #[test]
+    fn test_expand_home_prefix() -> TestResult {
+        let home = Path::new("/home/nutzerin");
+        assert_eq!(
+            expand_home_prefix("~", Some(home)),
+            PathBuf::from("/home/nutzerin")
+        );
+        assert_eq!(
+            expand_home_prefix("~/a/b.md", Some(home)),
+            PathBuf::from("/home/nutzerin/a/b.md")
+        );
+        assert_eq!(
+            expand_home_prefix("$HOME/x.json", Some(home)),
+            PathBuf::from("/home/nutzerin/x.json")
+        );
+        assert_eq!(
+            expand_home_prefix("${HOME}/x.md", Some(home)),
+            PathBuf::from("/home/nutzerin/x.md")
+        );
+        assert_eq!(
+            expand_home_prefix("~bob/x", Some(home)),
+            PathBuf::from("~bob/x")
+        );
+        assert_eq!(
+            expand_home_prefix("$HOMEX/x", Some(home)),
+            PathBuf::from("$HOMEX/x")
+        );
+        assert_eq!(
+            expand_home_prefix("rel/x.md", Some(home)),
+            PathBuf::from("rel/x.md")
+        );
+        assert_eq!(expand_home_prefix("~/x.md", None), PathBuf::from("~/x.md"));
+        let escaped = expand_home_prefix("~/../etc/x.md", Some(home));
+        assert!(matches!(
+            write_export_path(&escaped, "x"),
+            Err(ExportError::PathRejected(_))
+        ));
+        Ok(())
+    }
+
+    /// Runde 6, Teil C: die Standardendung folgt dem Format.
+    #[test]
+    fn test_default_export_path_with_json_extension() {
+        let path = default_export_path_with_extension("5", Path::new("/tmp"), "json");
+        assert_eq!(path, PathBuf::from("/tmp/harw-export-5.json"));
+        assert_eq!(
+            default_export_path("5", Path::new("/tmp")),
+            PathBuf::from("/tmp/harw-export-5.md")
+        );
     }
 
     /// `default_export_path` baut `<dir>/harw-export-<now>.md`.

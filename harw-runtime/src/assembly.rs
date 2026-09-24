@@ -1920,6 +1920,12 @@ impl RuntimeAssemblyBuilder {
         // `ShellToolProvider`.
         let host_permit_ledger = Arc::new(ProcessPermitLedger::default());
         let host_permit_registry = Arc::new(HostPermitSessionRegistry::default());
+        // Runde 6, Teil A2: der Auto-Modus liest den Status der
+        // Host-Arbeitsphase aus derselben Registry (Vorfilter und
+        // Klassifizierer-Prompt); die Sitzungs-Id setzt die TUI.
+        if let Some(auto) = chain.auto_mode() {
+            auto.install_host_lease(Arc::clone(&host_permit_registry));
+        }
         // Derselbe Fragekanal-Vertrag wie `harw_tool_shell::exec::ShellExecutor`
         // ihn sendet (siehe [`harw_tool_shell::host_permit_prompt`]): die Sende-
         // seite gehört, sobald ein `ShellToolProvider` mit `SandboxProfile::Host`

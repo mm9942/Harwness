@@ -6,6 +6,61 @@ Semantic Versioning within the 0.x pre-release range.
 
 ## [Unreleased]
 
+### Runde 6 (2026-09-24)
+
+**Auto-Modus fragt statt zu blocken**
+- Ein `deny` des Klassifizierers wird zur Rückfrage, wenn jemand gefragt werden
+  kann (TUI-Wurzel, Kind mit Relay-Kanal). Der Freigabedialog zeigt
+  „Auto-Modus: <Kategorie> – <Grund>“. Ein hartes `deny` bleibt nur dort, wo
+  niemand fragen kann.
+- Der Klassifizierer kennt die aktive Host-Lease und die letzten drei
+  Nutzernachrichten. Eine ausdrückliche Bitte ergibt mit Lease `allow`, sonst
+  `ask`, aber nie `deny`.
+- Der Vorfilter erkennt `mv`/`cp`/`rsync`/`install` mit Ziel außerhalb des
+  Workspace (`transfer-outside-workspace`). Mit aktiver Lease entscheidet der
+  Klassifizierer.
+- Deckel: Gezählt werden nur echte Ablehnungen, gleiche Aufrufe innerhalb von
+  60 s nur einmal. Die Meldung nennt die Grenze, die gegriffen hat, und die
+  letzte Ablehnung.
+- `/permissions log` markiert eine Ablehnung, die zur Rückfrage wurde, mit
+  „(Ablehnung → Rückfrage)“.
+
+**`!`-Befehle laufen auf dem Host**
+- `!` und `!!` laufen immer auf dem Host, nicht mehr in bwrap mit einem
+  flüchtigen `HOME`:
+  - echtes `HOME`, cwd ist die Projektwurzel
+  - großzügige rlimits, Zeitlimit `[shell] max_timeout_secs`
+  - keine Freigabe nötig, dafür ein Audit-Ereignis `shell.operator_exec`
+  - `sudo`/`doas`/`pkexec` bleiben abgelehnt; dafür gibt es das sudo-Fenster
+- Ein getipptes `!` bekommt automatisch ein Leerzeichen. `!cmd`, `! cmd`, `!!`
+  und `! !` werden alle erkannt.
+- `!` läuft auch während eines Agenten-Turns sofort. Das Ergebnis geht erst
+  nach dem Ende an den Chat: im Leerlauf als Folge-Turn, während eines Turns
+  als Kontext des nächsten. Die Nachricht nennt „auf dem Host ausgeführt“, cwd
+  und Exit-Code.
+- Ctrl+C bricht laufende `!`-Befehle ab: Der Prozessbaum wird beendet, die
+  Teilausgabe bleibt erhalten. Ein laufender Agenten-Turn arbeitet weiter;
+  erst das nächste Ctrl+C gilt wieder dem Turn bzw. dem Beenden.
+- `shell.exec` des Modells bleibt unverändert in der Sandbox.
+
+**Schlussantwort und Export**
+- Die Schlussantwort geht nach einer Auto-Verdichtung mitten im Turn nicht
+  mehr verloren. Sie wird aus den Turn-Ereignissen gesammelt, nicht mehr per
+  Index aus dem Verlauf.
+- Der Export enthält jetzt auch:
+  - Befehlsausgaben und `!`-Ergebnisse
+  - Systemzeilen
+  - Busy-Ergebnisse
+  - das Ende von Hintergrund-Agenten und `parent.message`
+- `/export --datei` expandiert `~` und `$HOME`. Die Dateiendung folgt dem
+  Format (`.json`).
+
+**CI**
+- `actionlint`: `release.yml` übergibt Globs mit `--` (SC2035).
+- Test `discovery_runs_exactly_once_per_assembly`: Das Projekt wird
+  umbenannt statt gelöscht; damit gibt es kein `ENOTEMPTY` mehr durch
+  Schreibzugriffe im Hintergrund.
+
 ### Runde 5 (2026-09-24)
 
 **CI und Toolchain**

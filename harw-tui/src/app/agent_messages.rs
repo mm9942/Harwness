@@ -37,6 +37,18 @@ pub(crate) fn collect_parent_messages(app: &mut ChatApp) -> bool {
             "tui.parent_message.received"
         );
         app.push_line(Role::System, message.display_line());
+        // Runde 6, Teil C: die volle Meldung (nicht nur der Anzeigeauszug)
+        // als Agenten-Eintrag in den Export.
+        super::export_capture::export_agent_event(
+            app,
+            crate::export::ExportAgentEntry {
+                agent_id: message.child.as_str().to_owned(),
+                role: Some(message.role.clone()),
+                parent_id: Some(message.parent.as_str().to_owned()),
+                status: Some(format!("parent.message:{}", message.kind.as_str())),
+                summary: Some(message.text.clone()),
+            },
+        );
         enqueue_background_notice(app, message.to_model_text(), true);
     }
     any
@@ -125,6 +137,16 @@ mod tests {
             "{turn}"
         );
         assert!(turn.contains("3 von 5 Dateien"));
+        // Runde 6, Teil C: die Meldung steht als Agenten-Eintrag im Export.
+        assert!(
+            app.export_entries.iter().any(|entry| matches!(
+                entry,
+                crate::export::ExportEntry::Agent(agent)
+                    if agent.summary.as_deref() == Some("Tests laufen, 3 von 5 Dateien fertig")
+                        && agent.status.as_deref() == Some("parent.message:info")
+            )),
+            "parent.message fehlt im Export"
+        );
         Ok(())
     }
 

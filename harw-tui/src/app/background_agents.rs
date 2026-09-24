@@ -437,7 +437,19 @@ pub(crate) fn collect_finished(app: &mut ChatApp) -> bool {
                 notice.status.label_de()
             ),
         );
-        enqueue_background_notice(app, format_notice(&notice), true);
+        let text = format_notice(&notice);
+        // Runde 6, Teil C: Ende samt Benachrichtigungstext in den Export.
+        super::export_capture::export_agent_event(
+            app,
+            crate::export::ExportAgentEntry {
+                agent_id: notice.child.as_str().to_owned(),
+                role: Some(notice.role.clone()),
+                parent_id: Some(notice.parent.as_str().to_owned()),
+                status: Some(notice.status.as_str().to_owned()),
+                summary: Some(text.clone()),
+            },
+        );
+        enqueue_background_notice(app, text, true);
     }
     any
 }

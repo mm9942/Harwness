@@ -1223,6 +1223,14 @@ impl InputEditor {
                     self.collapse_burst_if_any();
                 }
                 self.insert_char(ch);
+                // Runde 6, Teil B: ein `!` als erstes Zeichen im leeren
+                // Composer bekommt automatisch ein Leerzeichen dahinter
+                // (Form `! <cmd>`). Nur für getippte Zeichen außerhalb eines
+                // Paste-Bursts; echte Pastes (`insert_paste`) bleiben
+                // unverändert.
+                if ch == '!' && self.buffer == "!" && self.burst_start.is_none() {
+                    self.insert_char(' ');
+                }
                 InputAction::Redraw
             }
 
@@ -2493,5 +2501,52 @@ mod tests {
             "Esc war Anfang einer aufgelösten CSI-Sequenz"
         );
         assert!(!ed.take_swallowed_escape(), "Einmal-Signal");
+    }
+
+    // 43. Runde 6, Teil B: `!` im leeren Composer bekommt ein Leerzeichen.
+    #[test]
+    fn test_bang_in_empty_composer_inserts_space() {
+        let mut ed = InputEditor::new();
+        let mut t = Instant::now();
+        for ch in "!ls".chars() {
+            ed.handle_key_at(key(KeyCode::Char(ch)), t);
+            t += Duration::from_millis(50);
+        }
+        assert_eq!(ed.text(), "! ls");
+        let action = ed.handle_key_at(key(KeyCode::Enter), t);
+        assert_eq!(action, InputAction::Submit("! ls".to_owned()));
+    }
+
+    // 44. Runde 6, Teil B: nur am Anfang eines leeren Composers; `!!`
+    // ergibt `! !` (vom Parser als Wiederholung erkannt), ein `!` mitten im
+    // Text bleibt unverändert, ein Paste wird nicht verfälscht.
+    #[test]
+    fn test_bang_space_only_at_start_and_not_for_pastes() {
+        let mut ed = InputEditor::new();
+        let mut t = Instant::now();
+        for ch in "!!".chars() {
+            ed.handle_key_at(key(KeyCode::Char(ch)), t);
+            t += Duration::from_millis(50);
+        }
+        assert_eq!(ed.text(), "! !");
+
+        let mut ed = InputEditor::new();
+        for ch in "a!b".chars() {
+            ed.handle_key_at(key(KeyCode::Char(ch)), t);
+            t += Duration::from_millis(50);
+        }
+        assert_eq!(ed.text(), "a!b");
+
+        let mut ed = InputEditor::new();
+        ed.insert_paste("!echo hi");
+        assert_eq!(ed.text(), "!echo hi");
+
+        // Backspace entfernt das automatische Leerzeichen; danach bleibt die
+        // Form `!cmd` erhalten (der Parser akzeptiert beide).
+        let mut ed = InputEditor::new();
+        ed.handle_key_at(key(KeyCode::Char('!')), t);
+        ed.handle_key_at(key(KeyCode::Backspace), t + Duration::from_millis(50));
+        ed.handle_key_at(key(KeyCode::Char('x')), t + Duration::from_millis(100));
+        assert_eq!(ed.text(), "!x");
     }
 }

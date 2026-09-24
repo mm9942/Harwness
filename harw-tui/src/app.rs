@@ -117,6 +117,12 @@ mod turn_safety;
 pub(crate) mod child_approvals;
 // Runde 5, Teil P: Goal-Marke (Statuszeile) und Goal-/Schritt-Verlaufszeilen.
 mod goal_marker_glue;
+// Runde 6, Teil C: Schlussantwort ohne Historie-Index (Auto-Verdichtung).
+mod final_reply;
+// Runde 6, Teil C: Export-Einträge für Befehls-/System-/`!`-/Agentenzeilen.
+pub(crate) mod export_capture;
+// Runde 6, Teil B: `!`-Befehle sofort und asynchron auf dem Host.
+mod operator_shell;
 
 use std::cell::Cell;
 use std::collections::{HashMap, HashSet};
@@ -360,6 +366,12 @@ struct TurnEventState {
     /// Ein Turn-Abbruch markiert nur offene Aufrufe **seines** Turns als
     /// unvollständig, nie ältere (etwa einen längst beendeten Handoff).
     tool_call_turns: HashMap<harw_types::ToolCallId, harw_types::TurnId>,
+    /// Runde 6, Teil C: Schlussantwort und Verdichtung des laufenden Turns
+    /// (zu Turn-Beginn zurückgesetzt, siehe `app/final_reply.rs`).
+    final_reply: final_reply::FinalReplyCapture,
+    /// Runde 6, Teil C: die zuletzt enthüllte Schlussantwort; der Rückfall
+    /// nach einer Verdichtung zeigt sie nie ein zweites Mal.
+    last_revealed_reply: Option<String>,
 }
 
 impl TurnEventState {
@@ -891,18 +903,30 @@ fn truncate_chars_with_marker(text: &str, max_chars: usize) -> String {
 /// [`SHELL_TURN_OUTPUT_MAX_CHARS`] Zeichen gekappt.
 ///
 /// # Argumente
-/// - `command` (`&str`): der ausgeführte Befehlstext, ohne führendes `!`.
-/// - `exit_code` (`i64`): Exit-Code des Prozesses.
-/// - `output` (`&str`): `stdout` und `stderr` zusammengeführt.
+/// - `shell` (`&ShellRunOutcome`): Befehl (ohne führendes `!`), Exit-Code,
+///   zusammengeführte Ausgabe, cwd und Endhinweis.
 ///
 /// # Rückgabe
 /// Die vollständige Nutzereingabe-Nachricht für den Folge-Turn, im Format
-/// „Ich habe `!<command>` ausgeführt (Exit <n>):" gefolgt von einem
-/// Markdown-Codeblock (Sprache `text`) mit der (ggf. gekappten) Ausgabe.
+/// „Ich habe `! <command>` auf dem Host ausgeführt (cwd `<cwd>`, Exit <n>):"
+/// (Runde 6, Teil B: „auf dem Host“ und cwd, damit der Agent nicht rät,
+/// wo eine Datei gelandet ist), ggf. mit Endhinweis (Zeitlimit, Kappung),
+/// gefolgt von einem Markdown-Codeblock (Sprache `text`) mit der (ggf.
+/// gekappten) Ausgabe.
 #[must_use]
-fn build_shell_turn_message(command: &str, exit_code: i64, output: &str) -> String {
-    let truncated = truncate_chars_with_marker(output, SHELL_TURN_OUTPUT_MAX_CHARS);
-    format!("Ich habe `!{command}` ausgeführt (Exit {exit_code}):\n```text\n{truncated}\n```")
+fn build_shell_turn_message(shell: &ShellRunOutcome) -> String {
+    let truncated = truncate_chars_with_marker(&shell.combined_output, SHELL_TURN_OUTPUT_MAX_CHARS);
+    let note = shell
+        .note
+        .as_deref()
+        .map(|note| format!("; {note}"))
+        .unwrap_or_default();
+    format!(
+        "Ich habe `! {}` auf dem Host ausgeführt (cwd `{}`, Exit {}{note}):\n```text\n{truncated}\n```",
+        shell.command,
+        shell.cwd.display(),
+        shell.exit_code,
+    )
 }
 
 /// Reiht nach einem tatsächlich gelaufenen `!`/`!!`-Befehl den automatischen
@@ -933,10 +957,11 @@ fn queue_shell_follow_up_turn(
     shell: ShellRunOutcome,
 ) {
     app.pending_turn_user_cell_override = Some(format!(
-        "↳ Ausgabe von !{} an den Agenten übergeben",
+        "↳ Ausgabe von ! {} an den Agenten übergeben",
         shell.command
     ));
-    let message = build_shell_turn_message(&shell.command, shell.exit_code, &shell.combined_output);
+    // Runde 6, Teil B: Nachricht nennt Host, cwd und Exit-Code.
+    let message = build_shell_turn_message(&shell);
     app.last_shell_command = Some(shell.command);
     if submitted.is_some() {
         app.pending_turns.push_back(message);
@@ -995,6 +1020,9 @@ pub struct ChatApp {
     /// Runde 5, Teil L: `/btw`-Nebenfrage (Schnappschuss, laufender Auftrag;
     /// siehe [`btw`]).
     btw: btw::BtwState,
+    /// Runde 6, Teil B: laufende `!`-Befehle (Host) und ihr Ergebniskanal
+    /// (siehe [`operator_shell`]).
+    operator_shell: operator_shell::OperatorShellJobs,
     /// Kooperativer Abbruchgriff für den gerade laufenden Turn. `Ctrl+C`
     /// löst ihn auch dann aus, wenn kein Freigabe-Dialog sichtbar ist.
     active_cancel: Option<CancelToken>,
@@ -1378,6 +1406,8 @@ impl ChatApp {
             busy_jobs: BusyJobs::new(),
             // Runde 5, Teil L.
             btw: btw::BtwState::new(),
+            // Runde 6, Teil B.
+            operator_shell: operator_shell::OperatorShellJobs::new(),
             active_cancel: None,
             cancel_requested_at: None,
             queue_kept_at: None,
@@ -2393,6 +2423,12 @@ impl ChatApp {
         changed |= self.poll_kanban_live();
         // Runde 5, Teil L: Abschluss einer `/btw`-Nebenfrage im Spinner-Takt.
         changed |= self.poll_btw();
+        // Runde 6, Teil B: fertige `!`-Befehle während eines Turns anzeigen
+        // und als Kontext des nächsten Turns einreihen (im Leerlauf holt sie
+        // `run_loop` ab und startet den Folge-Turn).
+        if self.active_cancel.is_some() {
+            changed |= operator_shell::poll_busy(self);
+        }
         // Runde 5, Teil P: Goal-Marke und Schritt-Verlaufszeilen (max. 1×/s).
         changed |= self.poll_goal_marker();
         let Some(rx) = self.agent_rx.as_mut() else {
@@ -3496,13 +3532,8 @@ fn apply_local_intercept(
             app.scroll.force_follow();
             app.pending_turns.push_back(text);
         }
-        LocalIntercept::System(text) => {
-            app.push_lines(
-                text.split('\n')
-                    .map(|line| Line::from(line.to_owned()))
-                    .collect(),
-            );
-        }
+        // Runde 6, Teil C: lokale Befehlsausgaben auch in den Export.
+        LocalIntercept::System(text) => app.push_system_text_exported(&text),
         // Runde 5, Teil F: `/plan`, `/plan show|edit|list|open`.
         LocalIntercept::Plan(command) => plan_mode::apply_plan_command(app, &command),
         // Runde 5, Teil I: `/agent stream <orchestrators|all|none>`.
@@ -4385,6 +4416,8 @@ pub(crate) async fn run_loop(
     app.busy_jobs.set_waker(frame_req.clone());
     // Runde 5, Teil L: eine fertige `/btw`-Nebenfrage weckt die Schleife.
     app.btw.set_waker(frame_req.clone());
+    // Runde 6, Teil B: ein fertiger `!`-Befehl weckt die Schleife.
+    app.operator_shell.set_waker(frame_req.clone());
 
     loop {
         // Runde 5, Teil B: außerhalb eines Turns darf kein sudo-Fenster offen
@@ -4454,6 +4487,11 @@ pub(crate) async fn run_loop(
         // Eine während des vorherigen Turns abgeschickte Eingabe hat Vorrang.
         // Sie passiert denselben Pfad wie eine frische `HarwEvent::Submit`.
         let mut submitted: Option<String> = app.pending_turns.pop_front();
+        // Runde 6, Teil B: fertige `!`-Befehle (Host) anzeigen und erst
+        // jetzt, nach ihrem Ende, den Folge-Turn einreihen.
+        if operator_shell::poll_idle(app, &mut submitted) {
+            frame_req.schedule_frame();
+        }
         // Runde 5, Teil K: im Leerlauf startet eine Hintergrund-Meldung
         // selbst einen UIA-Turn.
         if submitted.is_none() {
@@ -4557,11 +4595,8 @@ pub(crate) async fn run_loop(
                         }
                         HarwEvent::SystemMessage(message) => {
                             // Mehrzeilige Ausgaben (z. B. `/help`) an `\n` aufteilen.
-                            let lines: Vec<Line<'static>> = message
-                                .split('\n')
-                                .map(|line| Line::from(line.to_owned()))
-                                .collect();
-                            app.push_lines(lines);
+                            // Runde 6, Teil C: auch in den Export.
+                            app.push_system_text_exported(&message);
                             frame_req.schedule_frame();
                         }
                         HarwEvent::Submit(text) => {
@@ -4577,6 +4612,13 @@ pub(crate) async fn run_loop(
                         HarwEvent::Command(raw) => {
                             if let Some(request) = resume_request(&raw) {
                                 return Ok(request);
+                            }
+                            // Runde 6, Teil B: `!`/`!!` läuft asynchron auf
+                            // dem Host; Ausgabe und Folge-Turn kommen erst
+                            // nach dem Ende (oben, `operator_shell::poll_idle`).
+                            if operator_shell::intercept(app, &raw) {
+                                frame_req.schedule_frame();
+                                continue;
                             }
                             // Eine offene Ansicht lädt nach jedem Befehl (z. B.
                             // ihrem eigenen `Run`) neu; die Generationsprüfung
@@ -4661,7 +4703,12 @@ pub(crate) async fn run_loop(
                                     .into_iter()
                                     .map(Line::from)
                                     .collect();
-                                app.push_lines(lines);
+                                // Runde 6, Teil C: `/tools`-Ausgabe auch in den Export.
+                                let text = export_capture::command_export_text(
+                                    &raw,
+                                    &export_capture::lines_plain_text(&lines),
+                                );
+                                app.push_system_lines_exported(lines, text);
                                 frame_req.schedule_frame();
                             } else {
                                 // `/compact` mutiert die aktive TUI-Sitzung direkt. Die
@@ -4778,7 +4825,24 @@ pub(crate) async fn run_loop(
                                     .split('\n')
                                     .map(|line| Line::from(line.to_owned()))
                                     .collect();
-                                app.push_lines(lines);
+                                // Runde 6, Teil C: Befehlsausgabe (auch „Export
+                                // angefordert") in den Export; ein gelaufener
+                                // `!`-Befehl bekommt seinen eigenen Eintrag.
+                                match shell_result.as_ref() {
+                                    Some(shell) => {
+                                        app.push_lines(lines);
+                                        export_capture::export_shell_result(
+                                            app,
+                                            &shell.command,
+                                            Some(shell.exit_code),
+                                            &shell.combined_output,
+                                        );
+                                    }
+                                    None => app.push_system_lines_exported(
+                                        lines,
+                                        export_capture::command_export_text(&raw, &output),
+                                    ),
+                                }
                                 // Register „CSI-Sicherheitsnetz und Paste-
                                 // Platzhalter", Punkt 7: ein tatsächlich
                                 // gelaufener `!`/`!!`-Host-Befehl kann
@@ -4938,11 +5002,8 @@ pub(crate) async fn run_loop(
         let displayed_text = display_override.unwrap_or_else(|| text.clone());
         app.push_line(Role::User, displayed_text);
         if let Some(note) = attachment_note {
-            app.push_lines(
-                note.split('\n')
-                    .map(|line| Line::from(line.to_owned()))
-                    .collect(),
-            );
+            // Runde 6, Teil C: Anhang-Hinweis auch in den Export.
+            app.push_system_text_exported(&note);
         }
         // Auto-Correction-Detection (harw-memory M3): reine Textregel,
         // kein LLM-Call. Bei Match: Signal explizit an das Backend geben.
@@ -5334,6 +5395,8 @@ fn handle_turn_event(app: &mut ChatApp, state: &mut TurnEventState, event: TurnE
             // `turn_event_rx` trägt nur die Ereignisse der Root-Session
             // (Kind-Sessions melden über den Agenten-Bus) — die Momentaufnahme
             // für `/status` und `/usage` bleibt damit root-exklusiv.
+            // Runde 6, Teil C: Verdichtung merken (Rückfall der Schlussantwort).
+            state.final_reply.record_compaction();
             app.session_controller
                 .record_compaction(harw_operations::LastCompaction {
                     reason: reason.clone(),
@@ -5388,6 +5451,11 @@ fn handle_turn_event(app: &mut ChatApp, state: &mut TurnEventState, event: TurnE
             // am Turn-Ende vorbehalten (sonst erschiene sie doppelt: einmal
             // hier, einmal beim Abschluss).
             if message.phase != Some(harw_types::MessagePhase::Commentary) {
+                // Runde 6, Teil C: die Schlussantwort aus dem Ereignis merken —
+                // unabhängig davon, was eine Verdichtung mit dem Verlauf macht.
+                state
+                    .final_reply
+                    .record_final(visible_message_text(&message.content));
                 return false;
             }
             let text = visible_message_text(&message.content);
@@ -5995,7 +6063,10 @@ fn resolve_export_request(app: &mut ChatApp, request: &ExportRequest) {
     if let Some(path) = request.path.as_deref() {
         app.pending_export_options = None;
         let content = build_export(app, &opts, request.format);
-        match export::write_export_path(std::path::Path::new(path), &content) {
+        // Runde 6, Teil C: `~`/`$HOME` expandieren, Verzeichnis → Standardname
+        // mit Format-Endung; die Traversal-Prüfung bleibt in `write_export_path`.
+        let target = export_capture::export_target_path(path, request.format);
+        match export::write_export_path(&target, &content) {
             Ok(written_path) => app.push_line(
                 Role::System,
                 format!("Export gespeichert: {}", written_path.display()),
@@ -6074,6 +6145,7 @@ fn resolve_export_choice(app: &mut ChatApp, _bus: &HarwEventSender, index: usize
                         app,
                         &content,
                         "Keine Zwischenablage — Export gespeichert unter ",
+                        format,
                     );
                 }
                 Err(error) => {
@@ -6086,7 +6158,7 @@ fn resolve_export_choice(app: &mut ChatApp, _bus: &HarwEventSender, index: usize
         }
         1 => {
             let content = build_export(app, &opts, format);
-            write_export_to_default_path(app, &content, "Export gespeichert: ");
+            write_export_to_default_path(app, &content, "Export gespeichert: ", format);
         }
         _ => {}
     }
@@ -6106,10 +6178,15 @@ fn resolve_export_choice(app: &mut ChatApp, _bus: &HarwEventSender, index: usize
 /// - `app` (`&mut ChatApp`): nimmt die Ergebniszeile auf.
 /// - `content` (`&str`): der bereits gerenderte Exportinhalt.
 /// - `success_prefix` (`&str`): Text vor dem geschriebenen Pfad bei Erfolg.
-fn write_export_to_default_path(app: &mut ChatApp, content: &str, success_prefix: &str) {
-    let now = export_timestamp_now();
-    let dir = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
-    let path = export::default_export_path(&now, &dir);
+/// - `format` (`ExportOutputFormat`): bestimmt die Dateiendung (Runde 6, Teil C).
+fn write_export_to_default_path(
+    app: &mut ChatApp,
+    content: &str,
+    success_prefix: &str,
+    format: ExportOutputFormat,
+) {
+    // Runde 6, Teil C: die Dateiendung folgt dem Format (`.json` bei JSON).
+    let path = export_capture::default_export_target(format);
     match export::write_export_path(&path, content) {
         Ok(written_path) => app.push_line(
             Role::System,
@@ -6438,6 +6515,12 @@ fn scroll_and_composer_key(app: &mut ChatApp, key: KeyEvent, bus: &HarwEventSend
 
     // Ctrl+C — Doppeldruck beendet (unabhängig vom Eingabeinhalt).
     if ctrl && matches!(key.code, KeyCode::Char('c' | 'C')) {
+        // Runde 6, Teil B: Laufende `!`-Befehle bricht Ctrl+C zuerst ab —
+        // ohne Beenden-Scharfstellung.
+        if operator_shell::cancel_on_ctrl_c(app) {
+            app.pending_quit = None;
+            return true;
+        }
         if matches!(
             app.pending_quit,
             Some(QuitArm {
@@ -6787,7 +6870,10 @@ async fn run_turn_streaming(
     // den Auto-Modus-Klassifizierer (Geheimnisse entfernt er selbst).
     if let Some(rt) = app.runtime() {
         if let Some(auto) = rt.auto_mode() {
+            // Runde 6, Teil A: `set_goal` ist ein Ringpuffer der letzten drei
+            // Nachrichten; die Sitzungs-Id bestimmt, wessen Host-Lease zählt.
             auto.context().set_goal(text);
+            auto.set_lease_session(app.session_id().to_string());
             // Runde 5 (Integration E/F): der angeheftete, freigegebene Plan ist
             // Kontext für den Klassifizierer (gekürzt, ohne Geheimnis-Pfad —
             // Redaction übernimmt der Klassifizierer selbst).
@@ -6901,6 +6987,10 @@ fn rate_limit_retry_input() -> TurnInput {
 /// gleicht [`suppress_if_matches_commentary`] das Ergebnis zusätzlich gegen
 /// `turn_state.last_commentary_text` ab (siehe dortige Doku).
 ///
+/// Runde 6, Teil C: Vorrang hat jetzt die Schlussantwort aus
+/// `TurnEvent::ItemAdded`; der Index-Weg gilt nur noch ohne Verdichtung, sonst
+/// greift ein Rückfall ohne Index (siehe `app/final_reply.rs`).
+///
 /// Wenn der Provider HTTP 429 zurückgibt ([`ModelError::RateLimited`]), läuft
 /// eine budgetierte Retry-Schleife: bis zu [`RATE_LIMIT_MAX_ATTEMPTS`]
 /// Versuche, je Wartephase `retry_after_secs` (gedeckelt auf
@@ -6979,6 +7069,8 @@ async fn drive_turn_animated(
     // `turn_state` sonst über Turns hinweg unverändert lässt.
     let history_len_before = gateway.session_mut().history().len();
     turn_state.last_commentary_text = None;
+    // Runde 6, Teil C: Schlussantwort/Verdichtung gelten je Turn.
+    turn_state.final_reply = final_reply::FinalReplyCapture::default();
 
     // Rate-Limit-Retry-Schleife: Erstversuch plus bis zu
     // RATE_LIMIT_MAX_ATTEMPTS-1 Wiederholungen. Jeder Versuch läuft durch
@@ -7270,11 +7362,28 @@ async fn drive_turn_animated(
     // frei — wir dürfen sie erneut ausleihen, um die Turn-Antwort zu
     // extrahieren. Siehe Bugfix-Abschnitt der Funktionsdoku oben: nur Items
     // ab `history_len_before` gehören zu DIESEM Turn.
-    let reply = latest_final_reply(gateway.session_mut().history(), history_len_before);
-    Ok(suppress_if_matches_commentary(
-        reply,
-        turn_state.last_commentary_text.as_deref(),
-    ))
+    //
+    // Runde 6, Teil C: zuerst noch gepufferte Turn-Ereignisse verarbeiten
+    // (die Schlussantwort kommt als `ItemAdded`), dann ohne Historie-Index
+    // wählen — eine Auto-Verdichtung im Turn verkleinert den Verlauf, dann
+    // fände `latest_final_reply` ab `history_len_before` nichts mehr.
+    while let Ok(event) = turn_event_rx.try_recv() {
+        handle_turn_event(app, turn_state, event);
+        if app.take_needs_terminal_reassert() {
+            guard.reassert_terminal_modes();
+        }
+    }
+    let reply = final_reply::select_final_reply(
+        &turn_state.final_reply,
+        gateway.session_mut().history(),
+        history_len_before,
+        turn_state.last_revealed_reply.as_deref(),
+    );
+    let reply = suppress_if_matches_commentary(reply, turn_state.last_commentary_text.as_deref());
+    if let Some(reply) = &reply {
+        turn_state.last_revealed_reply = Some(reply.clone());
+    }
+    Ok(reply)
 }
 
 /// Wählt die zu enthüllende Turn-Antwort aus den Items, die seit `since_len`
@@ -7693,6 +7802,15 @@ fn build_approval_dialog(
         deadline: Instant::now() + timeout,
         reason_input_enabled: true,
     });
+    // Runde 6, Teil A: fragt der Auto-Modus (auch statt einer Ablehnung),
+    // steht sein Grund als „Auto-Modus: <Kategorie> – <Grund>“ im Dialog.
+    let dialog = dialog.with_auto_reason(
+        app.runtime()
+            .and_then(|rt| rt.auto_mode())
+            .and_then(|auto| auto.log().verdict_for(call.id.as_str()))
+            .as_ref()
+            .and_then(crate::permissions_view::auto_ask_reason_for),
+    );
     match learning.flatten() {
         Some(offer) => dialog.with_learning_offer(LearnOfferView::from(&offer)),
         None => dialog,
@@ -8431,7 +8549,8 @@ fn apply_busy_job_done(app: &mut ChatApp, done: BusyJobDone) {
             succeeded,
         } => {
             tracing::debug!(command = %command.raw, succeeded, "tui.busy.command_finished");
-            app.push_lines(busy_queue::command_result_lines(&command, &text, succeeded));
+            // Runde 6, Teil C: Busy-Ergebnis auch in den Export.
+            app.push_lines_exported(busy_queue::command_result_lines(&command, &text, succeeded));
             app.queue_overlay_refresh();
             if is_workbench_command(&command.raw) {
                 app.workbench.mark_stale();
@@ -8502,6 +8621,11 @@ fn defer_busy_command(app: &mut ChatApp, raw: String) {
 /// Änderung nur im Controller vor, angewendet wird sie an der nächsten
 /// Turn-Grenze.
 fn route_busy_command(app: &mut ChatApp, raw: String) -> BusyKeyOutcome {
+    // Runde 6, Teil B: `!`/`!!` läuft sofort (immediate) auf dem Host, nie
+    // hinter dem Turn; das Ergebnis wird erst nach dem Ende eingereiht.
+    if operator_shell::intercept(app, &raw) {
+        return BusyKeyOutcome::Redraw;
+    }
     if let Some(intercepted) = local_intercept_for(app, &raw) {
         if is_busy_safe_intercept(&intercepted) {
             // Busy-sichere Abfänge senden nichts auf den Bus (nur `Rewrite`
@@ -8549,12 +8673,8 @@ fn route_busy_overlay_key(app: &mut ChatApp, key: KeyEvent) -> BusyKeyOutcome {
                 }
             }
             HarwEvent::Submit(text) => app.pending_turns.push_back(text),
-            HarwEvent::SystemMessage(message) => app.push_lines(
-                message
-                    .split('\n')
-                    .map(|line| Line::from(line.to_owned()))
-                    .collect(),
-            ),
+            // Runde 6, Teil C: Bus-Systemzeile auch in den Export.
+            HarwEvent::SystemMessage(message) => app.push_system_text_exported(&message),
             HarwEvent::Quit => {
                 tracing::debug!("tui.busy.overlay_quit_ignored");
             }
@@ -8691,6 +8811,12 @@ fn handle_busy_event(app: &mut ChatApp, event: TuiEvent) -> BusyKeyOutcome {
             if key.modifiers.contains(KeyModifiers::CONTROL)
                 && matches!(key.code, KeyCode::Char('c' | 'C')) =>
         {
+            // Runde 6, Teil B: Laufende `!`-Befehle bricht Ctrl+C zuerst
+            // ab; der Turn arbeitet weiter, erst das nächste Ctrl+C gilt ihm.
+            if operator_shell::cancel_on_ctrl_c(app) {
+                app.pending_quit = None;
+                return BusyKeyOutcome::Redraw;
+            }
             // Zweiter Druck innerhalb des Fensters: harter Abbruch statt
             // eines weiteren kooperativen Cancels.
             if matches!(
@@ -8828,8 +8954,8 @@ async fn reveal_reply(
     // Vollständige Antwort in genau EINE finalisierte Zelle. Der live
     // gestreamte Vorschautext (`live_stream`) war nur transient und wird hier
     // durch die finale Zelle ersetzt — so entsteht keine Doppelanzeige.
-    app.clear_live_stream();
-    app.push_line(Role::Assistant, reply);
+    // Runde 6, Teil C: Anzeige und Export über dieselbe Stelle.
+    final_reply::commit_final_reply(app, reply);
     draw_viewport(guard, app, &Spinner::new(), None)?;
     Ok(())
 }
@@ -9929,8 +10055,15 @@ mod tests {
 
     #[test]
     fn build_shell_turn_message_includes_command_and_exit_code() -> TestResult {
-        let message = build_shell_turn_message("ls -la", 0, "total 0\n");
-        assert!(message.starts_with("Ich habe `!ls -la` ausgeführt (Exit 0):"));
+        let message = build_shell_turn_message(&shell_outcome("ls -la", 0, "total 0\n"));
+        // Runde 6, Teil B: die Folge-Nachricht nennt „Host“ und cwd.
+        assert!(
+            message.starts_with(
+                "Ich habe `! ls -la` auf dem Host ausgeführt (cwd `/projekt`, Exit 0):"
+            ),
+            "{message}"
+        );
+        assert!(message.contains("Host"));
         assert!(message.contains("```text\ntotal 0\n\n```"));
         Ok(())
     }
@@ -9938,7 +10071,7 @@ mod tests {
     #[test]
     fn build_shell_turn_message_truncates_long_output() -> TestResult {
         let output: String = "x".repeat(SHELL_TURN_OUTPUT_MAX_CHARS + 500);
-        let message = build_shell_turn_message("yes | head", 0, &output);
+        let message = build_shell_turn_message(&shell_outcome("yes | head", 0, &output));
         assert!(message.contains("[gekürzt]"));
         // Nur die (gekürzte) Ausgabe zählt gegen die Obergrenze, nicht die
         // umgebende Nachricht (Header + Codeblock-Markierungen).
@@ -9960,6 +10093,9 @@ mod tests {
             command: command.to_owned(),
             exit_code,
             combined_output: combined_output.to_owned(),
+            // Runde 6, Teil B.
+            cwd: PathBuf::from("/projekt"),
+            note: None,
         }
     }
 
@@ -9978,12 +10114,13 @@ mod tests {
         );
 
         let text = submitted.ok_or(TestError::Missing("turn queued immediately"))?;
-        assert!(text.starts_with("Ich habe `!echo hi` ausgeführt (Exit 0):"));
+        assert!(text.starts_with("Ich habe `! echo hi` auf dem Host ausgeführt"));
+        assert!(text.contains("Exit 0"));
         assert!(app.pending_turns.is_empty());
         assert_eq!(app.last_shell_command.as_deref(), Some("echo hi"));
         assert_eq!(
             app.pending_turn_user_cell_override.as_deref(),
-            Some("↳ Ausgabe von !echo hi an den Agenten übergeben")
+            Some("↳ Ausgabe von ! echo hi an den Agenten übergeben")
         );
         Ok(())
     }
@@ -10004,7 +10141,7 @@ mod tests {
             app.pending_turns
                 .front()
                 .ok_or(TestError::Missing("queued follow-up turn"))?
-                .starts_with("Ich habe `!pwd` ausgeführt (Exit 1):")
+                .starts_with("Ich habe `! pwd` auf dem Host ausgeführt (cwd `/projekt`, Exit 1):")
         );
         Ok(())
     }
