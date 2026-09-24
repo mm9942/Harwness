@@ -1284,7 +1284,10 @@ mod tests {
                 "with_home_context muss den Speicher binden",
             ));
         };
-        assert_eq!(store.root(), harw_home::knowledge_dir(&context.profile_dir));
+        assert_eq!(
+            store.root(),
+            harw_home::knowledge_dir(&context.profile_dir).as_path()
+        );
 
         let explicit = Arc::new(KnowledgeStore::new(Path::new("/nonexistent/explicit")));
         let services = RuntimeServices::new(minimal_parts())

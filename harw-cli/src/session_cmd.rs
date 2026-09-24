@@ -5,7 +5,7 @@
 //! Liste, Detailansicht und Fortsetzen dieselben Sitzungen und denselben
 //! Projektfilter sehen.
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::time::SystemTime;
 
 use crate::cli::{GlobalArgs, SessionAction};
@@ -36,7 +36,7 @@ pub fn run(g: &GlobalArgs, a: SessionAction) -> Result<Option<String>, String> {
     let printer = Printer::new(g.output());
     match a {
         SessionAction::List { all } => {
-            let cwd = working_dir(g)?;
+            let cwd = crate::jobs_cmd::working_dir(g)?;
             list(&printer, g.json, &sessions_root, &cwd, all)?;
             Ok(None)
         }
@@ -50,17 +50,6 @@ pub fn run(g: &GlobalArgs, a: SessionAction) -> Result<Option<String>, String> {
                 .map_err(|error| format!("Sitzung kann nicht fortgesetzt werden: {error}"))?;
             Ok(Some(resolved.as_str().to_owned()))
         }
-    }
-}
-
-/// Arbeitsverzeichnis für den Projektfilter: `-C/--cwd`, sonst das
-/// aktuelle Prozessverzeichnis.
-fn working_dir(g: &GlobalArgs) -> Result<PathBuf, String> {
-    match &g.cwd {
-        Some(dir) => Ok(dir.clone()),
-        None => std::env::current_dir().map_err(|error| {
-            format!("Aktuelles Arbeitsverzeichnis nicht ermittelbar: {error}")
-        }),
     }
 }
 
@@ -133,7 +122,11 @@ fn show(printer: &Printer, sessions_root: &Path, selector: &str) -> Result<(), S
     push_line(&mut text, "ID", session.id.as_str());
     push_line(&mut text, "Titel", &title(session));
     push_line(&mut text, "Erstellt", created.as_deref().unwrap_or(MISSING));
-    push_line(&mut text, "Zuletzt aktiv", &format_time(last_active(session)));
+    push_line(
+        &mut text,
+        "Zuletzt aktiv",
+        &format_time(last_active(session)),
+    );
     push_line(&mut text, "Projekt", &project(session));
     push_line(
         &mut text,
@@ -145,11 +138,7 @@ fn show(printer: &Printer, sessions_root: &Path, selector: &str) -> Result<(), S
         "Turns",
         &turns.map_or_else(|| MISSING.to_owned(), |turns| turns.to_string()),
     );
-    push_line(
-        &mut text,
-        "Transcript",
-        &session.path.display().to_string(),
-    );
+    push_line(&mut text, "Transcript", &session.path.display().to_string());
     if let Some(message) = &first_message {
         push_line(&mut text, "Erste Nachricht", message);
     }
@@ -184,7 +173,11 @@ fn title(session: &DiscoveredSession) -> String {
     let Some(meta) = session.meta.as_ref() else {
         return MISSING.to_owned();
     };
-    if let Some(title) = meta.title.as_deref().filter(|title| !title.trim().is_empty()) {
+    if let Some(title) = meta
+        .title
+        .as_deref()
+        .filter(|title| !title.trim().is_empty())
+    {
         return title.trim().to_owned();
     }
     match meta.first_user_message.as_deref() {

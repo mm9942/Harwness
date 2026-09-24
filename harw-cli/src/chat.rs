@@ -1580,6 +1580,37 @@ mod tests {
     }
 
     #[test]
+    fn test_chat_inputs_carry_approval_and_model_overrides() -> TestResult {
+        let fixture = chat_fixture()?;
+        let with_overrides = ChatStartup {
+            approval: Some(ApprovalMode::AlwaysAsk),
+            model: Some("irgendein-modell".to_owned()),
+            ..startup(InteractionMode::Chat)
+        };
+        let inputs = fixture_inputs(
+            &fixture,
+            EntryKind::OneShot,
+            IngressSurface::Cli,
+            with_overrides,
+        )?;
+        assert_eq!(inputs.spec.approval_override, Some(ApprovalMode::AlwaysAsk));
+        assert_eq!(
+            inputs.spec.model_override.as_deref(),
+            Some("irgendein-modell")
+        );
+
+        let plain = fixture_inputs(
+            &fixture,
+            EntryKind::OneShot,
+            IngressSurface::Cli,
+            startup(InteractionMode::Chat),
+        )?;
+        assert_eq!(plain.spec.approval_override, None);
+        assert_eq!(plain.spec.model_override, None);
+        Ok(())
+    }
+
+    #[test]
     fn test_goal_context_contributor_registers_provider() -> TestResult {
         let fixture = chat_fixture()?;
         let goal_context: Arc<dyn ContextProvider> = Arc::new(TestGoalContext);

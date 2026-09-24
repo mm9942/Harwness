@@ -29,6 +29,9 @@ harw-extension-api = { path = "../harw-extension-api" }
 harw-fsutil = { path = "../harw-fsutil" }
 harw-home = { path = "../harw-home" }
 harw-job-runtime = { path = "../harw-job-runtime" }
+# L6: `Arc<KnowledgeStore>` für Slash/Modell-Werkzeug (`services.rs`). Kein
+# Zyklus: `harw-knowledge` hängt nicht von `harw-runtime` ab.
+harw-knowledge = { path = "../harw-knowledge" }
 harw-lens-types = { path = "../harw-lens-types" }
 harw-macros = { path = "../harw-macros" }
 harw-memory = { path = "../harw-memory" }
