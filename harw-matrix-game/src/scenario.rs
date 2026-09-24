@@ -2035,7 +2035,7 @@ mod tests {
         assert!(loaded.scenario.rules().epilogue);
         assert_eq!(loaded.scenario.initial_vars().len(), 7 + 1 + 1 + 1);
         // uneinheitliche Ebenen sind nur eine Warnung
-        assert!(loaded.warnings.iter().any(|w| w.contains("Ebenen")));
+        assert!(loaded.warnings.iter().any(|w| w.contains("Fraktionsebenen")));
         assert_eq!(loaded.source_hash.len(), 64);
         assert_eq!(loaded.scenario.injects_for_round(3).len(), 1);
         Ok(())
