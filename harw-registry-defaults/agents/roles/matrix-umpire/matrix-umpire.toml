@@ -6,16 +6,19 @@
 # `agents/roles/matrix-umpire/` ergibt den Rollennamen `"matrix-umpire"`
 # (`role_names::MATRIX_UMPIRE` in `src/profile.rs`).
 #
-# ── Warum keine Werkzeuge ───────────────────────────────────────────────────
+# ── Warum nur lesende Werkzeuge ─────────────────────────────────────────────
 # Der Matrix-Runner (`harw-ops/src/matrix/runner.rs`) übergibt jedem Sitz
 # seine Sicht auf das Spiel (Szenario, Journal-Auszug, erwarteter Aufruf)
-# vollständig im Prompt und liest die Antwort als Text zurück. Die Rolle
-# ruft deshalb selbst nichts auf: `[tools].admitted` bleibt leer, das
-# Registry-Profil ist `RegistryProfile::NoTools`, der Reducer
-# `AuthorityReducer::ReadOnly` — kein Schreiben, keine Ausführung, kein Netz.
-# `forbidden` benennt jedes Schreib-, Ausführungs- und Netzwerkzeug
-# trotzdem ausdrücklich, damit eine Ablehnung nachvollziehbar bleibt
-# (dieselbe Disziplin wie bei den `security-*-triage`-Rollen).
+# vollständig im Prompt und liest die Antwort als Text zurück. Zusätzlich
+# darf der Sitz seine Unterlagen lesen (Nutzerwunsch, Runde 3
+# „Matrix-Unterlagen“): der Runner kopiert je Sitz die für ihn sichtbaren
+# Dateien in einen eigenen Ordner und setzt ihn als Sandbox-Wurzel mit
+# genau `{ReadWorkspace}`. `[tools].admitted` sind deshalb genau die fünf
+# lesenden `fs.*`-Werkzeuge plus `doc.read_pdf`; das Registry-Profil ist
+# `RegistryProfile::MatrixReader`, der Reducer `AuthorityReducer::ReadOnly`
+# — kein Schreiben, keine Ausführung, kein Netz. `forbidden` benennt jedes
+# Schreib-, Ausführungs- und Netzwerkzeug ausdrücklich, damit eine
+# Ablehnung nachvollziehbar bleibt.
 #
 # ── Rückgabevertrag ──────────────────────────────────────────────────────────
 # `harwness.matrix.umpire-ruling@1` ist ein undurchsichtiges Label: `ChildReturnContract::parse`
@@ -31,16 +34,23 @@ role = "worker"
 specialization = "matrix-umpire"
 
 name = "Matrix Umpire"
-description = "Schiedsrichter im Matrix-Game: bewertet die Züge der Spieler nach Plausibilität, entscheidet über Ergebnisse und schreibt den Lagebericht; ohne Werkzeuge und ohne Netz."
+description = "Schiedsrichter im Matrix-Game: bewertet die Züge der Spieler nach Plausibilität, entscheidet über Ergebnisse und schreibt den Lagebericht; liest nur seine Unterlagen, ohne Netz, Schreiben oder Ausführung."
 
 [work]
 mode = "matrix-game-umpire"
 may_write_code = false
 may_research_web = false
 
-# Keine Werkzeugoberfläche — siehe Begründung oben.
+# Nur lesende Werkzeuge für die Unterlagen — siehe Begründung oben.
 [tools]
-admitted = []
+admitted = [
+    "fs.read",
+    "fs.list",
+    "fs.search",
+    "fs.glob",
+    "fs.grep",
+    "doc.read_pdf",
+]
 forbidden = [
     "fs.write",
     "shell.exec",
@@ -55,10 +65,11 @@ forbidden = [
 [spawn]
 max_depth = 0
 
-# Reiner Textzug: großzügiges Token-Budget, kein einziger Werkzeugaufruf.
+# Textzug mit großzügigem Token-Budget; wenige lesende Aufrufe für die
+# Unterlagen.
 [spawn.budget]
 max_tokens = 60000
-max_tool_calls = 0
+max_tool_calls = 16
 max_wall_secs = 300
 
 [return]

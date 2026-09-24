@@ -2454,4 +2454,155 @@ mod tests {
         assert!(VarVisibility::parse("everyone").is_err());
         Ok(())
     }
+
+    #[test]
+    fn materials_parse_in_both_modes() -> TestResult {
+        assert!(load_scenario(KARST)?.scenario.materials().is_none());
+        assert!(load_scenario(CLOUD)?.scenario.materials().is_none());
+
+        let classic = format!("{KARST}\n[materials]\ndir = \"unterlagen/karst\"\n");
+        let loaded = load_scenario(&classic)?;
+        assert_eq!(
+            loaded.scenario.materials(),
+            Some(&MaterialsSpec {
+                dir: PathBuf::from("unterlagen/karst")
+            })
+        );
+        let business = format!("{CLOUD}\n[materials]\ndir = \"/srv/cloud\"\n");
+        let loaded = load_scenario(&business)?;
+        assert_eq!(
+            loaded.scenario.materials().map(|m| m.dir.clone()),
+            Some(PathBuf::from("/srv/cloud"))
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn materials_reject_empty_and_unknown_fields() {
+        for src in [KARST, CLOUD] {
+            let empty = format!("{src}\n[materials]\ndir = \"  \"\n");
+            let errs = invalid_errors(&empty);
+            assert!(errs.iter().any(|e| e.contains("materials.dir")), "{errs:?}");
+
+            let unknown = format!("{src}\n[materials]\ndir = \"x\"\nwrite = true\n");
+            assert!(matches!(
+                load_scenario(&unknown),
+                Err(MatrixError::ScenarioParse(_))
+            ));
+            let missing = format!("{src}\n[materials]\n");
+            assert!(matches!(
+                load_scenario(&missing),
+                Err(MatrixError::ScenarioParse(_))
+            ));
+        }
+    }
+
+    #[test]
+    fn materials_dir_resolution() -> TestResult {
+        let scen = Path::new("/spiele/karst/szenario.toml");
+        let home = Path::new("/home/nutzerin");
+        let r = |dir: &str, sp: Option<&Path>, h: Option<&Path>| {
+            resolve_materials_dir(Path::new(dir), sp, h)
+        };
+        assert_eq!(
+            r("unterlagen", Some(scen), Some(home)),
+            Some(PathBuf::from("/spiele/karst/unterlagen"))
+        );
+        assert_eq!(
+            r("../gemeinsam", Some(scen), None),
+            Some(PathBuf::from("/spiele/karst/../gemeinsam"))
+        );
+        assert_eq!(
+            r("/abs/ordner", Some(scen), Some(home)),
+            Some(PathBuf::from("/abs/ordner"))
+        );
+        assert_eq!(
+            r("~/unterlagen/karst", Some(scen), Some(home)),
+            Some(PathBuf::from("/home/nutzerin/unterlagen/karst"))
+        );
+        assert_eq!(
+            r("~", None, Some(home)),
+            Some(PathBuf::from("/home/nutzerin"))
+        );
+        assert_eq!(r("~/x", Some(scen), None), None);
+        assert_eq!(r("~/x", Some(scen), Some(Path::new(""))), None);
+        // `~name` ist kein Home-Verweis, sondern ein relativer Name.
+        assert_eq!(
+            r("~name", Some(scen), Some(home)),
+            Some(PathBuf::from("/spiele/karst/~name"))
+        );
+        // Ohne Szenario-Pfad bleibt ein relativer Pfad unverändert.
+        assert_eq!(
+            r("unterlagen", None, None),
+            Some(PathBuf::from("unterlagen"))
+        );
+        assert_eq!(
+            r("unterlagen", Some(Path::new("szenario.toml")), None),
+            Some(PathBuf::from("unterlagen"))
+        );
+
+        // Über LoadedScenario: ohne [materials] → None; absolut → unverändert.
+        assert_eq!(load_scenario(KARST)?.materials_dir(Some(scen)), None);
+        let src = format!("{KARST}\n[materials]\ndir = \"/abs/ordner\"\n");
+        assert_eq!(
+            load_scenario(&src)?.materials_dir(Some(scen)),
+            Some(PathBuf::from("/abs/ordner"))
+        );
+        let src = format!("{KARST}\n[materials]\ndir = \"unterlagen\"\n");
+        assert_eq!(
+            load_scenario(&src)?.materials_dir(Some(scen)),
+            Some(PathBuf::from("/spiele/karst/unterlagen"))
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn materials_selection_per_seat() {
+        let gilde = materials_for_seat(&Seat::player("gilde"));
+        assert_eq!(
+            gilde,
+            MaterialsSelection {
+                shared: true,
+                own: Some("gilde".to_owned()),
+                pairs_with: true,
+                all_seats: false,
+                all_pairs: false,
+                umpire: false,
+            }
+        );
+        let umpire = materials_for_seat(&Seat::Umpire);
+        assert_eq!(
+            umpire,
+            MaterialsSelection {
+                shared: true,
+                own: None,
+                pairs_with: false,
+                all_seats: true,
+                all_pairs: true,
+                umpire: true,
+            }
+        );
+    }
+
+    #[test]
+    fn pair_folder_names() {
+        assert_eq!(
+            pair_folder_members("gilde+nord"),
+            Some(("gilde".to_owned(), "nord".to_owned()))
+        );
+        for bad in [
+            "nord+gilde",
+            "gilde+gilde",
+            "gilde",
+            "+nord",
+            "gilde+",
+            "a+b+c",
+            "../x+y",
+            "a/b+c",
+            "..+rat",
+            "",
+        ] {
+            assert_eq!(pair_folder_members(bad), None, "`{bad}` akzeptiert");
+        }
+    }
 }
