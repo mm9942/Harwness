@@ -807,6 +807,34 @@ sensors = ["exec", "tcp-connect"]
 egress_allow_cidrs = []
 "#;
 
+    /// Die mitgelieferten Konfigurationsdateien müssen den eigenen, strengen
+    /// Parser bestehen (`deny_unknown_fields`) — sonst startet dod mit genau
+    /// der Datei nicht, die wir ausliefern (Tippfehler `egotiation_allow_cidrs`).
+    /// Die Beispieldatei lässt `active_profile` absichtlich auskommentiert
+    /// (keine implizite Profilwahl); geprüft wird sie mit einkommentierter
+    /// Auswahl, damit trotzdem jedes Feld gegen den Parser läuft.
+    #[test]
+    fn shipped_config_files_parse() -> TestResult {
+        let example = include_str!("../../../packaging/config.example.toml");
+        let unselected = Config::from_toml(example).map_err(ctx("example parses"))?;
+        assert!(
+            unselected.resolve_active().is_err(),
+            "Beispiel darf ohne ausdrückliche Profilwahl nicht aktivierbar sein"
+        );
+        let selected = example.replace(
+            "# active_profile = \"selected-services\"",
+            "active_profile = \"selected-services\"",
+        );
+        for (name, input) in [
+            ("dod/config.toml", include_str!("../../../config.toml")),
+            ("dod/packaging/config.example.toml", selected.as_str()),
+        ] {
+            let config = Config::from_toml(input).map_err(ctx(name))?;
+            config.resolve_active().map_err(ctx(name))?;
+        }
+        Ok(())
+    }
+
     #[test]
     fn cgroup_ancestry_is_component_aware() -> TestResult {
         let config = Config::from_toml(

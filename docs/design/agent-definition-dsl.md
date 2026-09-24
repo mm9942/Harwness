@@ -1,10 +1,10 @@
-##### agent-definition-dsl.md
+##### docs/design/agent-definition-dsl.md
 
 # Harwness Agent Definition DSL
 
 **Status:** Normative design draft  
 **Scope:** User-extensible TOML definitions for roles, specializations, families, clans, cells, context policies, return contracts, and organization templates  
-**Companion documents:** `philosophy.md`, `coding-philosophy.md`, `agents-systemdesign-philosophy.md`
+**Companion documents:** [`philosophy.md`](../philosophy/philosophy.md), [`coding-philosophy.md`](../philosophy/coding-philosophy.md), `agents-systemdesign-philosophy.md`
 
 > Users may extend behavior, composition, models, context policies, families, clans, and organization templates.  
 > Users may never extend authority beyond the runtime maximum or violate the role hierarchy.

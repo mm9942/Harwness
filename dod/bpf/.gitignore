@@ -1,1 +1,6 @@
 /out/
+# Build-Ausgaben von `make build-bpf` (OUT=dod/bpf): werden aus den Quellen
+# unter src/ mit der gepinnten Toolchain erzeugt und nie eingecheckt.
+/*.bpf.o
+/manifest.json
+/include/vmlinux.h

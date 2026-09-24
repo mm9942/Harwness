@@ -317,7 +317,11 @@ impl harw_operations::OpArgsSchema for GoalCall {
     summary = "Ziel verwalten: setzen, schärfen, Kriterien und Invarianten ergänzen, gegen den Plan bewerten.",
     domain = "execution",
     permission = "operator",
-    command(path = "/goal", visibility = "channel_parity"),
+    command(
+        path = "/goal",
+        visibility = "channel_parity",
+        busy_subcommands = "-=immediate, show=immediate, check=immediate"
+    ),
     model_tool(approval = "always"),
     // Web-Fläche übernimmt dieselbe Achse wie das ModelTool: aus demselben
     // Grund wie `/plan` (siehe dortiger Kommentar) — gemischte Lese-/

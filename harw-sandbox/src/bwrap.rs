@@ -177,6 +177,10 @@ pub struct BwrapLauncher {
     /// Ohne [`Self::with_identity`] ermittelt `plan` die echte uid/gid des
     /// laufenden `harw`-Prozesses aus `/proc/self`.
     identity: Option<(u32, u32)>,
+    /// Zusätzliche, nur lesend eingebundene Host-Pfade (`--ro-bind-try`),
+    /// z. B. die TeX-Bäume und die Font-Konfiguration für `latex.build`
+    /// (Runde 4, Teil E). Leer = Plan byte-identisch zu vorher.
+    read_only_paths: Vec<PathBuf>,
 }
 
 impl Default for BwrapLauncher {
@@ -202,6 +206,7 @@ impl BwrapLauncher {
             tmux_profile: None,
             host_path: None,
             identity: None,
+            read_only_paths: Vec::new(),
         }
     }
 
@@ -350,6 +355,32 @@ impl BwrapLauncher {
     #[must_use]
     pub fn identity(&self) -> Option<(u32, u32)> {
         self.identity
+    }
+
+    /// Bindet zusätzliche Host-Pfade nur lesend in die Sandbox ein.
+    ///
+    /// # Beschreibung
+    /// Jeder Pfad wird als `--ro-bind-try <pfad> <pfad>` eingetragen — ein
+    /// fehlender Pfad bricht den Start nicht ab. Relative oder nicht normale
+    /// Pfade (`..`, `.`) sowie Pfade unter `/usr`, `/bin`, `/lib`, `/lib64`
+    /// (ohnehin gebunden) oder gleich/unter dem Workspace (folgt selbst,
+    /// ggf. beschreibbar) werden übersprungen. Nie beschreibbar, nie Netz.
+    /// Gedacht für typisierte Werkzeuge wie `latex.build`, die fest
+    /// installierte Bäume außerhalb von `/usr` lesen müssen (TeX Live unter
+    /// `/opt`, `/var/lib/texmf`, `/etc/fonts`).
+    ///
+    /// # Argumente
+    /// - `paths` (`Vec<PathBuf>`): absolute Host-Pfade.
+    #[must_use]
+    pub fn with_read_only_paths(mut self, paths: Vec<PathBuf>) -> Self {
+        self.read_only_paths = paths;
+        self
+    }
+
+    /// Die per [`Self::with_read_only_paths`] gesetzten Zusatzpfade.
+    #[must_use]
+    pub fn read_only_paths(&self) -> &[PathBuf] {
+        &self.read_only_paths
     }
 
     /// Setzt ein gebündeltes [`SandboxProfile`] und konfiguriert damit alle
@@ -594,6 +625,35 @@ impl BwrapLauncher {
                 OsString::from(nss_file),
                 OsString::from(nss_file),
             ]);
+        }
+        // Runde 4, Teil E: zusätzliche, nur lesende Host-Pfade (z. B. TeX-Bäume
+        // für `latex.build`). `/usr`, `/bin`, `/lib`, `/lib64` sind oben
+        // bereits gebunden, der Workspace folgt unten selbst.
+        if !self.read_only_paths.is_empty() {
+            let mut created_dirs: HashSet<PathBuf> = HashSet::new();
+            created_dirs.insert(PathBuf::from("/etc"));
+            for path in &self.read_only_paths {
+                let normal = path.is_absolute()
+                    && path.components().all(|component| {
+                        matches!(component, Component::RootDir | Component::Normal(_))
+                    });
+                if !normal
+                    || path == Path::new("/")
+                    || ["/usr", "/bin", "/lib", "/lib64"]
+                        .iter()
+                        .any(|prefix| path.starts_with(prefix))
+                    || path.starts_with(workspace)
+                    || workspace.starts_with(path)
+                {
+                    continue;
+                }
+                append_destination_dirs_dedup(&mut args, path, &mut created_dirs)?;
+                args.extend([
+                    OsString::from("--ro-bind-try"),
+                    path.as_os_str().to_owned(),
+                    path.as_os_str().to_owned(),
+                ]);
+            }
         }
         if let Some(profile) = &self.cargo_profile {
             let cargo_dir = profile.cargo_bin().parent().ok_or_else(|| {
@@ -1341,6 +1401,48 @@ mod tests {
         assert!(!args.contains(&SANDBOX_RELAY_PATH.to_owned()));
         assert!(!args.contains(&SANDBOX_PROXY_SOCKET_PATH.to_owned()));
         assert!(args.contains(&"--die-with-parent".to_owned()));
+        Ok(())
+    }
+
+    /// Runde 4, Teil E: Zusatzpfade landen nur als `--ro-bind-try`, nie
+    /// beschreibbar; relative, nicht normale, bereits gebundene und
+    /// Workspace-Pfade werden übersprungen.
+    #[test]
+    fn test_plan_read_only_paths_are_bound_read_only_and_filtered() -> TestResult {
+        let spec = networked_sandbox()?;
+        let workspace = spec.workspace().canonical_root().to_path_buf();
+        let launcher =
+            BwrapLauncher::new(PathBuf::from("/usr/bin/bwrap")).with_read_only_paths(vec![
+                PathBuf::from("/opt/texlive"),
+                PathBuf::from("/etc/fonts"),
+                PathBuf::from("relative/texmf"),
+                PathBuf::from("/opt/../etc/shadow"),
+                PathBuf::from("/usr/share/texlive"),
+                workspace.join("sub"),
+            ]);
+        let args = strings(
+            &launcher
+                .plan(&spec, &[OsString::from("/bin/true")])
+                .map_err(TestError::Sandbox)?,
+        );
+        let window = |source: &str| {
+            args.windows(3)
+                .any(|w| w[0] == "--ro-bind-try" && w[1] == source && w[2] == source)
+        };
+        assert!(window("/opt/texlive"), "{args:?}");
+        assert!(window("/etc/fonts"), "{args:?}");
+        for skipped in ["relative/texmf", "/opt/../etc/shadow", "/usr/share/texlive"] {
+            assert!(!args.iter().any(|a| a == skipped), "{skipped}: {args:?}");
+        }
+        let sub = workspace.join("sub").display().to_string();
+        assert!(!window(&sub), "{args:?}");
+        assert!(
+            !args
+                .windows(2)
+                .any(|w| w[0] == "--bind" && (w[1] == "/opt/texlive" || w[1] == "/etc/fonts")),
+            "Zusatzpfade dürfen nie beschreibbar sein: {args:?}"
+        );
+        assert_eq!(args.iter().filter(|a| *a == "--unshare-net").count(), 1);
         Ok(())
     }
 

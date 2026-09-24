@@ -185,6 +185,14 @@ static BUNDLED_FILES: &[BundledFile] = &[
         contents: include_str!("../assets/agents/incident-triager/system.md"),
     },
     BundledFile {
+        relative_path: "agents/latex-writer/agent.toml",
+        contents: include_str!("../assets/agents/latex-writer/agent.toml"),
+    },
+    BundledFile {
+        relative_path: "agents/latex-writer/system.md",
+        contents: include_str!("../assets/agents/latex-writer/system.md"),
+    },
+    BundledFile {
         relative_path: "agents/log-analyst/agent.toml",
         contents: include_str!("../assets/agents/log-analyst/agent.toml"),
     },
@@ -375,6 +383,14 @@ static BUNDLED_FILES: &[BundledFile] = &[
     BundledFile {
         relative_path: "skills/interfaces-and-abstraction/skill.toml",
         contents: include_str!("../assets/skills/interfaces-and-abstraction/skill.toml"),
+    },
+    BundledFile {
+        relative_path: "skills/latex-writing/instructions.md",
+        contents: include_str!("../assets/skills/latex-writing/instructions.md"),
+    },
+    BundledFile {
+        relative_path: "skills/latex-writing/skill.toml",
+        contents: include_str!("../assets/skills/latex-writing/skill.toml"),
     },
     BundledFile {
         relative_path: "skills/learning-loop/instructions.md",
@@ -736,6 +752,14 @@ static BUNDLED_FILES: &[BundledFile] = &[
         relative_path: "skills/version-bump/skill.toml",
         contents: include_str!("../assets/skills/version-bump/skill.toml"),
     },
+    BundledFile {
+        relative_path: "skills/xelatex-compile/instructions.md",
+        contents: include_str!("../assets/skills/xelatex-compile/instructions.md"),
+    },
+    BundledFile {
+        relative_path: "skills/xelatex-compile/skill.toml",
+        contents: include_str!("../assets/skills/xelatex-compile/skill.toml"),
+    },
 ];
 
 #[cfg(test)]
@@ -816,7 +840,7 @@ mod tests {
                 file.relative_path
             );
         }
-        assert_eq!(agents, 21, "das Bundle liefert 21 Agentendefinitionen");
+        assert_eq!(agents, 22, "das Bundle liefert 22 Agentendefinitionen");
         Ok(())
     }
 
@@ -835,7 +859,7 @@ mod tests {
                 ))
             })?;
         }
-        assert_eq!(skills, 58, "das Bundle liefert 58 Skills");
+        assert_eq!(skills, 60, "das Bundle liefert 60 Skills");
         Ok(())
     }
 

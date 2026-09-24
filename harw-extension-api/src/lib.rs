@@ -28,7 +28,9 @@ pub use harw_tools::{
 // Typ gehört damit zur Fläche dieser Crate, nicht zu ihrer Innerei.
 pub use allow_rules::{AllowRuleSet, ApprovalRule, RuleDecision, RuleScope, derive_shell_rule};
 pub use approval_mode::ApprovalMode;
-pub use capabilities::{AgentSpawnError, AgentSpawner, SpawnFuture, SpawnInput};
+pub use capabilities::{
+    AgentSpawnError, AgentSpawner, ChildBudgetExhausted, SpawnFuture, SpawnInput,
+};
 pub use contributors::{
     ApprovalDecision, ApprovalHandler, ContextProvider, ExtFuture, InstructionsProvider,
     ToolProvider, TurnObserver,

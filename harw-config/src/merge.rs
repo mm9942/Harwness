@@ -75,9 +75,9 @@
 use std::path::Path;
 
 use crate::harness_config::{
-    CompactionToml, GuardsToml, HarnessConfig, McpListenerSection, McpPrincipalToml,
-    OnboardingSection, PolicySection, ReasoningWeightsToml, SandboxSection, SessionSection,
-    TuiSection,
+    CompactionToml, DreamToml, GuardsToml, HarnessConfig, KnowledgeToml, McpListenerSection,
+    McpPrincipalToml, OnboardingSection, PolicySection, ReasoningWeightsToml, SandboxSection,
+    SessionSection, TuiSection,
 };
 use crate::internal_models::InternalModelsToml;
 use crate::mode_toml::ModeSection;
@@ -1364,6 +1364,74 @@ fn merge_compaction(
     );
 }
 
+// `[knowledge]` (Abschnitt 1.17) — `diary.retention_days` `ProfileReplaces`.
+fn merge_knowledge(
+    trusted: &mut HarnessConfig,
+    incoming: KnowledgeToml,
+    raw: &toml::Value,
+    role: LayerRole,
+    layer_path: &Path,
+) {
+    profile_replaces(
+        &mut trusted.knowledge.diary.retention_days,
+        incoming.diary.retention_days,
+        field_present(raw, &["knowledge", "diary", "retention_days"]),
+        role,
+        "knowledge.diary.retention_days",
+        layer_path,
+    );
+}
+
+// `[dream]` (Abschnitt 1.18) — alle fünf Felder `ProfileReplaces`.
+fn merge_dream(
+    trusted: &mut HarnessConfig,
+    incoming: DreamToml,
+    raw: &toml::Value,
+    role: LayerRole,
+    layer_path: &Path,
+) {
+    profile_replaces(
+        &mut trusted.dream.enabled,
+        incoming.enabled,
+        field_present(raw, &["dream", "enabled"]),
+        role,
+        "dream.enabled",
+        layer_path,
+    );
+    profile_replaces(
+        &mut trusted.dream.budget,
+        incoming.budget,
+        field_present(raw, &["dream", "budget"]),
+        role,
+        "dream.budget",
+        layer_path,
+    );
+    profile_replaces(
+        &mut trusted.dream.idle_minutes,
+        incoming.idle_minutes,
+        field_present(raw, &["dream", "idle_minutes"]),
+        role,
+        "dream.idle_minutes",
+        layer_path,
+    );
+    profile_replaces(
+        &mut trusted.dream.cooldown_minutes,
+        incoming.cooldown_minutes,
+        field_present(raw, &["dream", "cooldown_minutes"]),
+        role,
+        "dream.cooldown_minutes",
+        layer_path,
+    );
+    profile_replaces(
+        &mut trusted.dream.schedule,
+        incoming.schedule,
+        field_present(raw, &["dream", "schedule"]),
+        role,
+        "dream.schedule",
+        layer_path,
+    );
+}
+
 // `[reasoning]` (Abschnitt 1.15) — alle sechs Felder `ProfileReplaces`.
 fn merge_reasoning(
     trusted: &mut HarnessConfig,
@@ -1592,6 +1660,8 @@ pub fn merge_layer_into(
     );
     merge_reasoning(trusted, incoming.reasoning, raw, role, layer_path);
     merge_guards(trusted, incoming.guards, raw, role, layer_path, &mut out);
+    merge_knowledge(trusted, incoming.knowledge, raw, role, layer_path);
+    merge_dream(trusted, incoming.dream, raw, role, layer_path);
 
     // `base_dir`: `#[serde(skip)]`, kein TOML-Feld, kein `FIELD_TABLE`-
     // Eintrag (Abschnitt 1.1, "89. Zeile"). Reine Buchführung, die dem
@@ -1640,6 +1710,73 @@ mod tests {
         );
         assert_eq!(trusted.logging.level, "debug");
         assert!(diagnostics.is_empty());
+        Ok(())
+    }
+
+    // knowledge.diary.retention_days (Abschnitt 1.17): ProfileReplaces —
+    // ein vertrautes Profil ersetzt, ein nicht vertrautes Projekt nicht.
+    #[test]
+    fn test_diary_retention_days_is_profile_replaces() -> TestResult {
+        let src = "[knowledge.diary]\nretention_days = 30";
+        let incoming: HarnessConfig = toml::from_str(src).map_err(ctx("parse layer"))?;
+        let raw = raw_from(src)?;
+        let mut trusted = HarnessConfig::default();
+        assert_eq!(trusted.knowledge.diary.effective_retention_days(), 90);
+        merge_layer_into(
+            &mut trusted,
+            incoming.clone(),
+            &raw,
+            LayerRole::Refinement,
+            &layer_path(),
+        );
+        assert_eq!(trusted.knowledge.diary.retention_days, Some(30));
+
+        let mut untouched = HarnessConfig::default();
+        merge_layer_into(
+            &mut untouched,
+            incoming,
+            &raw,
+            LayerRole::UntrustedProject,
+            &layer_path(),
+        );
+        assert_eq!(untouched.knowledge.diary.retention_days, None);
+        Ok(())
+    }
+
+    // [dream] (Abschnitt 1.18): ProfileReplaces — ein vertrautes Profil
+    // ersetzt, ein nicht vertrautes Projekt nicht.
+    #[test]
+    fn test_dream_section_is_profile_replaces() -> TestResult {
+        let src = "[dream]\nenabled = false\nbudget = 4000\nidle_minutes = 5\n\
+                   cooldown_minutes = 30\nschedule = \"0 3 * * 1\"";
+        let incoming: HarnessConfig = toml::from_str(src).map_err(ctx("parse layer"))?;
+        let raw = raw_from(src)?;
+        let mut trusted = HarnessConfig::default();
+        assert!(trusted.dream.effective_enabled());
+        assert_eq!(trusted.dream.effective_budget(), 16_384);
+        assert_eq!(trusted.dream.effective_schedule(), None);
+        merge_layer_into(
+            &mut trusted,
+            incoming.clone(),
+            &raw,
+            LayerRole::Refinement,
+            &layer_path(),
+        );
+        assert!(!trusted.dream.effective_enabled());
+        assert_eq!(trusted.dream.effective_budget(), 4000);
+        assert_eq!(trusted.dream.effective_idle_minutes(), 5);
+        assert_eq!(trusted.dream.effective_cooldown_minutes(), 30);
+        assert_eq!(trusted.dream.effective_schedule(), Some("0 3 * * 1"));
+
+        let mut untouched = HarnessConfig::default();
+        merge_layer_into(
+            &mut untouched,
+            incoming,
+            &raw,
+            LayerRole::UntrustedProject,
+            &layer_path(),
+        );
+        assert_eq!(untouched.dream, DreamToml::default());
         Ok(())
     }
 

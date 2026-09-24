@@ -62,7 +62,10 @@ mod error;
 
 pub mod agent_definition_tools;
 pub mod authority;
+pub mod diary_tools;
 pub mod embedded_agents;
+pub mod kanban_tools;
+pub mod palace_tools;
 pub mod profile;
 pub mod research_web;
 pub mod skill_proposal_tools;
@@ -88,7 +91,10 @@ pub use agent_definition_tools::{
 pub use authority::{
     AuthorityReducer, authority_reducer_for_role, delegation_targets_for_role, tool_permission,
 };
+pub use diary_tools::DiaryToolProvider;
 pub use error::{RegistryDefaultsError, RegistryDefaultsResult};
+pub use kanban_tools::KanbanReadToolProvider;
+pub use palace_tools::PalaceToolProvider;
 pub use profile::{
     AgentDefinitionAccess, HostPermitWiring, IdentityOverrides, RegistryProfile,
     RestrictedToolProvider, agent_definition_tool_names_for_access, assemble_registry,
@@ -98,7 +104,9 @@ pub use profile::{
 };
 pub use research_web::{install_web_tools, researcher_web_network_scope, researcher_web_policy};
 pub use skill_proposal_tools::{SkillAuthorCeiling, SkillProposalStore, SkillProposalToolProvider};
-pub use workbench_tools::WorkbenchToolProvider;
+pub use workbench_tools::{
+    WorkbenchContextProvider, WorkbenchReadToolProvider, WorkbenchToolProvider,
+};
 
 /// Die Werkzeuge, die ohne Nutzerrückfrage ausgeführt werden dürfen.
 ///
@@ -202,6 +210,20 @@ pub const AUTO_APPROVED_TOOLS: &[&str] = &[
     // (`profile::composition_tools_for_role`), nie über ein
     // `RegistryProfile`.
     "delegate_wave",
+    // Lesende Wissenswerkzeuge (Plan Teil D, „Sicherheit“): nur lesend,
+    // `Permission::ReadWorkspace`, ohne Freigabe-Deklaration und mit eigenem,
+    // vom Modell nicht erweiterbaren Scope — `workbench.show` zeigt nur die
+    // Workbench des gebundenen Projekts ([`WorkbenchReadToolProvider`]),
+    // `diary.read` nur die eigenen Einträge des Agenten
+    // ([`DiaryToolProvider`], Agent-Id fest beim Bau), `palace.search`/
+    // `palace.recall` nur `established`-Knoten mit gedeckelten Hops
+    // ([`PalaceToolProvider`]). Registriert werden sie nicht über ein
+    // `RegistryProfile`, sondern von der Composition-Root (Wurzel) bzw.
+    // für Kind-Rollen, deren Definition sie zulässt.
+    "workbench.show",
+    "diary.read",
+    "palace.search",
+    "palace.recall",
     // Bewusst entfernt (W1-05, Register F-014, G-003, G-004, F-043, G-068):
     // - `plan`, `goal`: deklarieren `model_tool(approval = "always")` und
     //   mutieren PlanStore bzw. Ziel; die Auto-Freigabe überstimmte die
@@ -213,6 +235,9 @@ pub const AUTO_APPROVED_TOOLS: &[&str] = &[
     //   dessen Freigabe; `git diff` wertet zudem Repo-Konfiguration aus.
     // - `mode`: hat keine Modell-Tool-Fläche; der Eintrag war wirkungslos und
     //   hätte ein gleichnamiges Fremdwerkzeug (Plugin/MCP) freigeschaltet.
+    // - `kanban.list`, `kanban.show` (Plan D2): zwar rein lesend, aber auf
+    //   Wunsch der Nutzerin fragt **jeder** Aufruf — Kanban nur, wenn sie
+    //   ausdrücklich darum bittet.
 ];
 
 /// Werkzeuge, die **immer** eine Rückfrage auslösen — auch unter
@@ -594,6 +619,13 @@ mod tests {
         // nachweislich read-only sein“.
         let mut read_only_surface: Vec<&str> = READ_ONLY_ROOT_OPERATIONS.to_vec();
         read_only_surface.extend_from_slice(NON_PAUSING_ORCHESTRATION_OPERATIONS);
+        // Lesende Wissenswerkzeuge (Plan Teil D): von der Composition-Root
+        // registriert, nicht über ein Profil — die Rechteklasse jedes Namens
+        // ist `ReadWorkspace` (siehe die `TOOL_PERMISSIONS` der Provider).
+        read_only_surface
+            .extend_from_slice(crate::workbench_tools::WorkbenchReadToolProvider::TOOL_NAMES);
+        read_only_surface.extend_from_slice(crate::diary_tools::DiaryToolProvider::TOOL_NAMES);
+        read_only_surface.extend_from_slice(crate::palace_tools::PalaceToolProvider::TOOL_NAMES);
         for profile in RegistryProfile::ALL.iter().filter(|p| p.is_read_only()) {
             read_only_surface.extend(profile.registered_tool_names());
         }
@@ -613,6 +645,19 @@ mod tests {
                     "{tool} registriert nur Full und darf nicht auto-freigegeben sein"
                 );
             }
+        }
+    }
+
+    /// Plan D2, Entscheidung der Nutzerin „Kanban nur auf ausdrücklichen
+    /// Wunsch“: die lesenden Kanban-Werkzeuge fragen bei jedem Aufruf.
+    #[test]
+    fn kanban_read_tools_always_require_an_approval() {
+        for tool in crate::kanban_tools::KanbanReadToolProvider::TOOL_NAMES {
+            assert!(!AUTO_APPROVED_TOOLS.contains(tool), "{tool}");
+            assert!(
+                DefaultApprovalPolicy::requires_explicit_approval(&call(tool)),
+                "{tool} darf nicht auto-freigegeben sein"
+            );
         }
     }
 

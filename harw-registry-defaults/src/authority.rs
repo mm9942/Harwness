@@ -69,15 +69,18 @@
 
 use harw_authority::{Permission, PermissionSet};
 
+use crate::diary_tools::DiaryToolProvider;
+use crate::kanban_tools::KanbanReadToolProvider;
+use crate::palace_tools::PalaceToolProvider;
 use crate::profile::{
     AGENT_DEFINITION_LIST_TOOLS, AGENT_DEFINITION_READ_TOOLS, AGENT_DEFINITION_WRITE_TOOLS,
     BROWSER_TOOLS, DEPS_SOURCE_TOOLS, DEPS_WORKSPACE_TOOLS, DOC_TOOLS, EXPLORER_TOOLS,
-    FS_READ_ONLY_TOOLS, LENS_TOOLS, PROCESS_TOOLS, SHELL_TOOLS, WEB_TOOLS, role_names,
+    FS_READ_ONLY_TOOLS, LATEX_TOOLS, LENS_TOOLS, PROCESS_TOOLS, SHELL_TOOLS, WEB_TOOLS, role_names,
 };
 use crate::skill_proposal_tools::{
     SKILL_PROPOSAL_DECIDE_TOOLS, SKILL_PROPOSAL_PROPOSE_TOOLS, SKILL_PROPOSAL_READ_TOOLS,
 };
-use crate::workbench_tools::WorkbenchToolProvider;
+use crate::workbench_tools::{WorkbenchReadToolProvider, WorkbenchToolProvider};
 
 /// Kennung des Reducers „nur Workspace lesen“.
 pub const REDUCE_TO_READ_ONLY: &str = "reduce_to_read_only";
@@ -349,6 +352,10 @@ pub fn reduce_to_read_workspace_network(granted: &PermissionSet) -> PermissionSe
 ///   Rolle registriert `fs.read/list/search/glob/grep` **und** `shell.exec`,
 ///   kein Reducer trägt je `ExecuteProcess` gemeinsam mit `ReadWorkspace`
 ///   weiter).
+/// - `uia-latex-writer` → [`AuthorityReducer::ReadOnly`] (Profil
+///   `UiaLatexWriter`, Runde 4 Teil E): Workspace lesen, nie Netz.
+///   `fs.write` (`WriteWorkspace`) und `latex.build` (`ExecuteProcess`)
+///   bleiben die dokumentierte **Ausnahme nach Muster `executor`**.
 ///
 /// Invariante (Test): Für jede eingebaute Rolle gilt
 /// `profile.required_permissions() ⊆ reducer.ceiling()` — keine Rolle bewirbt
@@ -369,13 +376,15 @@ pub fn reduce_to_read_workspace_network(granted: &PermissionSet) -> PermissionSe
 /// `agents.commit_proposal`/`agents.reject_proposal`), `uia-writer` (braucht
 /// über `ReadExplore` hinaus nur noch `WriteWorkspace` für `fs.write`) und
 /// `uia-shell-worker` (braucht
-/// zusätzlich zu `ReadWorkspace` auch `ExecuteProcess` für `shell.exec`) —
+/// zusätzlich zu `ReadWorkspace` auch `ExecuteProcess` für `shell.exec`)
+/// und `uia-latex-writer` (braucht über `ReadOnly` hinaus nur
+/// `WriteWorkspace` für `fs.write` und `ExecuteProcess` für `latex.build`) —
 /// kein Reducer trägt je `WriteWorkspace` oder `ExecuteProcess` weiter
 /// (siehe `test_reduce_never_exceeds_parent_or_ceiling`, das ist Absicht:
 /// Delegation gibt nie Schreib-/Ausführungsrecht weiter), und
 /// `NetworkAccess` gemeinsam mit `ReadWorkspace` tragen nur `ReadExplore`
 /// und `ReadWorkspaceNetwork` (siehe
-/// `test_only_web_admitting_roles_get_network_access`). Diese sechs Rollen
+/// `test_only_web_admitting_roles_get_network_access`). Diese sieben Rollen
 /// erhalten die fehlenden Rechte nicht über diesen Reducer-Mechanismus,
 /// sondern über ihre feste Profilzuweisung bei der Registry-Montage
 /// ([`crate::profile::assemble_registry_for_sandbox`]); der hier vergebene
@@ -460,6 +469,12 @@ pub fn authority_reducer_for_role(role: &str) -> Option<AuthorityReducer> {
         // Reducer trägt je `ExecuteProcess` zusammen mit `ReadWorkspace`
         // weiter.
         role_names::UIA_SHELL_WORKER => Some(AuthorityReducer::ReadOnly),
+        // Runde 4, Teil E: `UiaLatexWriter` registriert lesende `fs.*`,
+        // `fs.write`, `doc.read_pdf` und `latex.build` — kein Netz.
+        // `fs.write`/`latex.build` bleiben die dokumentierte Ausnahme nach dem
+        // Muster `executor`: kein Reducer trägt `WriteWorkspace` oder
+        // `ExecuteProcess` weiter.
+        role_names::UIA_LATEX_WRITER => Some(AuthorityReducer::ReadOnly),
         _ => None,
     }
 }
@@ -571,6 +586,14 @@ fn delegation_targets_of(tables: &toml::Table) -> Option<Vec<String>> {
 ///   `WriteWorkspace` (`crate::skill_proposal_tools::SkillProposalToolProvider`).
 /// - `workbench.note`, `workbench.hypothesis` → `ReadWorkspace`
 ///   (`crate::workbench_tools::WorkbenchToolProvider::TOOL_PERMISSIONS`).
+/// - Lesende Wissenswerkzeuge (Plan Teil D) → `ReadWorkspace`:
+///   `workbench.show` (`crate::workbench_tools::WorkbenchReadToolProvider`),
+///   `diary.read` (`crate::diary_tools::DiaryToolProvider`, nur eigene
+///   Einträge), `palace.search`/`palace.recall`
+///   (`crate::palace_tools::PalaceToolProvider`, nur `established`),
+///   `kanban.list`/`kanban.show` (`crate::kanban_tools::KanbanReadToolProvider`,
+///   nur Kartendaten, kein Übergang). Damit
+///   dürfen auch read-only Rollen ohne Netz sie tragen — keines schreibt.
 /// - `delegate_wave` (und die übrigen Operationen der Composition-Root wie
 ///   `plan`/`goal`/`explore`) → `None`: keine Provider-Werkzeuge, sondern
 ///   `harw-ops`-/`harw-core-bridge`-Operationen mit eigenem
@@ -608,7 +631,7 @@ pub fn tool_permission(tool: &str) -> Option<Permission> {
         || listed(SKILL_PROPOSAL_DECIDE_TOOLS)
     {
         Some(Permission::WriteWorkspace)
-    } else if listed(SHELL_TOOLS) || listed(PROCESS_TOOLS) {
+    } else if listed(SHELL_TOOLS) || listed(PROCESS_TOOLS) || listed(LATEX_TOOLS) {
         Some(Permission::ExecuteProcess)
     } else if listed(FS_READ_ONLY_TOOLS)
         || listed(DOC_TOOLS)
@@ -619,6 +642,10 @@ pub fn tool_permission(tool: &str) -> Option<Permission> {
         || listed(AGENT_DEFINITION_LIST_TOOLS)
         || listed(SKILL_PROPOSAL_READ_TOOLS)
         || listed(WorkbenchToolProvider::TOOL_NAMES)
+        || listed(WorkbenchReadToolProvider::TOOL_NAMES)
+        || listed(DiaryToolProvider::TOOL_NAMES)
+        || listed(PalaceToolProvider::TOOL_NAMES)
+        || listed(KanbanReadToolProvider::TOOL_NAMES)
     {
         Some(Permission::ReadWorkspace)
     } else if listed(DEPS_SOURCE_TOOLS) {
@@ -715,6 +742,35 @@ mod tests {
         assert_eq!(names.len(), declared.len());
         for (name, permission) in names.iter().zip(declared.iter()) {
             assert_eq!(tool_permission(name), *permission, "{name}");
+        }
+    }
+
+    #[test]
+    fn test_tool_permission_matches_knowledge_read_provider_declarations() {
+        let providers: [(&[&str], &[Option<Permission>]); 4] = [
+            (
+                WorkbenchReadToolProvider::TOOL_NAMES,
+                WorkbenchReadToolProvider::TOOL_PERMISSIONS,
+            ),
+            (
+                DiaryToolProvider::TOOL_NAMES,
+                DiaryToolProvider::TOOL_PERMISSIONS,
+            ),
+            (
+                PalaceToolProvider::TOOL_NAMES,
+                PalaceToolProvider::TOOL_PERMISSIONS,
+            ),
+            (
+                KanbanReadToolProvider::TOOL_NAMES,
+                KanbanReadToolProvider::TOOL_PERMISSIONS,
+            ),
+        ];
+        for (names, declared) in providers {
+            assert_eq!(names.len(), declared.len());
+            for (name, permission) in names.iter().zip(declared.iter()) {
+                assert_eq!(tool_permission(name), *permission, "{name}");
+                assert_eq!(*permission, Some(Permission::ReadWorkspace), "{name}");
+            }
         }
     }
 
@@ -950,10 +1006,11 @@ mod tests {
         // Nutzerentscheidung `ReadExplore`), `agent-steward`
         // (WriteWorkspace, Addendum K), `uia-writer` (WriteWorkspace; Netz
         // ebenfalls über `ReadExplore`) und `uia-shell-worker`
-        // (ExecuteProcess) sind dokumentierte Ausnahmen von der
+        // (ExecuteProcess) und `uia-latex-writer` (WriteWorkspace und
+        // ExecuteProcess, ohne Netz) sind dokumentierte Ausnahmen von der
         // Untermengen-Invariante: kein Reducer trägt je Schreib- oder
         // Ausführungsrecht weiter (siehe
-        // `test_reduce_never_exceeds_parent_or_ceiling`); alle sechs Rollen
+        // `test_reduce_never_exceeds_parent_or_ceiling`); alle sieben Rollen
         // bekommen diese Rechte über ihre feste Profilzuweisung, nicht über
         // diesen Reducer (siehe Doku bei `authority_reducer_for_role`).
         // `uia-explorer` ist keine Ausnahme mehr: `ReadWorkspaceNetwork`
@@ -965,6 +1022,7 @@ mod tests {
             role_names::AGENT_STEWARD,
             role_names::UIA_WRITER,
             role_names::UIA_SHELL_WORKER,
+            role_names::UIA_LATEX_WRITER,
         ];
         for role in role_names::ALL {
             let reducer = authority_reducer_for_role(role).ok_or(
@@ -1039,6 +1097,26 @@ mod tests {
             authority_reducer_for_role(role_names::UIA_SHELL_WORKER),
             Some(AuthorityReducer::ReadOnly)
         );
+        assert_eq!(
+            authority_reducer_for_role(role_names::UIA_LATEX_WRITER),
+            Some(AuthorityReducer::ReadOnly)
+        );
+        // `uia-latex-writer` überschreitet `ReadOnly` genau um
+        // `WriteWorkspace` (`fs.write`) und `ExecuteProcess`
+        // (`latex.build`) — nie Netz, nie Registry-Quellcache.
+        let latex = crate::profile::RegistryProfile::UiaLatexWriter.required_permissions();
+        assert_eq!(
+            latex,
+            PermissionSet::from_policy([
+                Permission::ReadWorkspace,
+                Permission::WriteWorkspace,
+                Permission::ExecuteProcess,
+            ])
+        );
+        assert_eq!(
+            tool_permission("latex.build"),
+            Some(Permission::ExecuteProcess)
+        );
         for role in [
             role_names::ROOT_ORCHESTRATOR,
             role_names::CODING_ORCHESTRATOR,
@@ -1099,6 +1177,7 @@ mod tests {
                 role_names::UIA_EXPLORER,
                 role_names::UIA_WRITER,
                 role_names::UIA_SHELL_WORKER,
+                role_names::UIA_LATEX_WRITER,
             ])
             .collect();
         for role in role_names::CHILD_ORCHESTRATORS {

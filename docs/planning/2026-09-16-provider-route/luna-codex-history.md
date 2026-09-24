@@ -23,7 +23,7 @@ Der Log enthält außerdem einen erneuten OpenAI-Wire-Fehler durch ungültige To
 
 ### `18-48-47`
 
-Der Nutzer wollte fünf Bild-/Dokumentdateien aus Git entfernen. Die Dateien waren bereits im Commit `68478bc`; sie wurden aus dem Index entfernt, lokal aber bewusst behalten. Das ist relevant für die heutige Dokumentationslage: `docs/session-transcript-2026-09-14.md` und `emily-harw-config/README.md` können lokal vorhanden, aber absichtlich nicht mehr versioniert sein. Ein späterer Inventarlauf darf „lokal vorhanden“ nicht mit „Git-Quelle“ verwechseln.
+Der Nutzer wollte fünf Bild-/Dokumentdateien aus Git entfernen. Die Dateien waren bereits im Commit `68478bc`; sie wurden aus dem Index entfernt, lokal aber bewusst behalten. Das ist relevant für die heutige Dokumentationslage: `docs/sessions/session-transcript-2026-09-14.md` und `emily-harw-config/README.md` können lokal vorhanden, aber absichtlich nicht mehr versioniert sein. Ein späterer Inventarlauf darf „lokal vorhanden“ nicht mit „Git-Quelle“ verwechseln.
 
 ## Codex- und Providerbefunde
 

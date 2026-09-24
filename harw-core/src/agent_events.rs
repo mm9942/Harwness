@@ -44,6 +44,21 @@ pub enum AgentEventKind {
         /// Ereignis-Nutzlast als JSON.
         event: serde_json::Value,
     },
+    /// Eine Wissensfläche wurde geschrieben (`/workbench`, `/kanban`,
+    /// `/diary`, `/palace`, `/dream`).
+    ///
+    /// Reines Invalidierungssignal ohne Inhalt: Beobachter (TUI-Panels)
+    /// markieren die betroffene Ansicht als veraltet und laden sie über die
+    /// normale, sichtbarkeitsgeprüfte Op neu — das Event selbst trägt nie
+    /// Wissensinhalt an der Sichtbarkeitsprüfung vorbei.
+    Knowledge {
+        /// Betroffene Fläche: `workbench`, `kanban`, `diary`, `palace`
+        /// oder `dream`.
+        area: String,
+        /// Optional die betroffene Einheit (Scope, Karten-, Knoten-,
+        /// Berichts-Id bzw. `<agent>/<datum>`).
+        id: Option<String>,
+    },
 }
 
 /// Ein Event mit Absender-Kennung.
@@ -113,6 +128,29 @@ impl AgentEventHub {
             kind: AgentEventKind::Matrix {
                 run_id: run_id.into(),
                 event,
+            },
+        });
+    }
+
+    /// Veröffentlicht eine Wissensänderung ([`AgentEventKind::Knowledge`]).
+    ///
+    /// # Description
+    /// Bequemlichkeits-Hülle um [`Self::publish`]: `agent` ist die Session,
+    /// in der geschrieben wurde; die Rolle wird fest als `knowledge`
+    /// gemeldet, ein Eltern-Verweis entfällt. No-op ohne Beobachter.
+    ///
+    /// # Arguments
+    /// - `agent` (`SessionId`): schreibende Session.
+    /// - `area` (`impl Into<String>`): Fläche (`workbench`, `kanban`, …).
+    /// - `id` (`Option<String>`): betroffene Einheit, falls bekannt.
+    pub fn publish_knowledge(&self, agent: SessionId, area: impl Into<String>, id: Option<String>) {
+        self.publish(AgentEvent {
+            agent,
+            parent: None,
+            role: "knowledge".into(),
+            kind: AgentEventKind::Knowledge {
+                area: area.into(),
+                id,
             },
         });
     }
@@ -276,6 +314,28 @@ mod tests {
             event.kind,
             AgentEventKind::InternalUsage { ref purpose, .. } if purpose == "title"
         ));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn publish_knowledge_delivers_area_and_id() -> Result<(), Box<dyn std::error::Error>> {
+        let hub = AgentEventHub::new(4);
+        let mut rx = hub.subscribe();
+        hub.publish_knowledge(
+            SessionId::try_from_str("s-5")?,
+            "kanban",
+            Some("default/card-1".to_owned()),
+        );
+        let event = rx.recv().await?;
+        assert_eq!(event.role, "knowledge");
+        assert!(event.parent.is_none());
+        match event.kind {
+            AgentEventKind::Knowledge { area, id } => {
+                assert_eq!(area, "kanban");
+                assert_eq!(id.as_deref(), Some("default/card-1"));
+            }
+            other => return Err(format!("unerwartetes Event: {other:?}").into()),
+        }
         Ok(())
     }
 

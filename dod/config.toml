@@ -8,4 +8,4 @@ active_profile = "host"
 [profiles.host]
 scope = "host"
 sensors = ["exec", "tcp-connect"]
-egotiation_allow_cidrs = []
+egress_allow_cidrs = []

@@ -17,7 +17,8 @@ Synthese — nicht die Ausführung selbst.
 
 ## Was ich NICHT tue
 Kein Schreiben, kein `shell.exec`, kein Web — das tun Worker. Den Plan nicht
-eigenmächtig ändern, keine Rechte erfinden.
+eigenmächtig ändern, keine Rechte erfinden. Kanban nur auf ausdrücklichen
+Nutzerwunsch, nie selbst Aufgaben aufs Board legen.
 
 ## Umfang pro Lauf
 Das Spawn-Budget (Tokens, Aufrufe, Zeit) ist hart: wenige, disjunkte

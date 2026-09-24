@@ -28,7 +28,40 @@ pub fn run(home_override: Option<PathBuf>, action: AuthAction) -> Result<(), Str
         AuthAction::Token { provider } => token(&home, provider.as_str()),
         AuthAction::Import { source } => import(source.as_str()),
         AuthAction::Status => status(&home),
+        AuthAction::Prune { provider } => prune(&home, provider.as_deref()),
     }
+}
+
+/// `harw auth prune [provider]`: veraltete Pool-Einträge aus `auth.toml`
+/// entfernen.
+///
+/// # Beschreibung
+/// Liest die Provider-Konfiguration (`provider.auth`, `base_url`) über die
+/// normale Config-Kette und die rohe `auth.toml` des Homes, entfernt je Pool
+/// die Einträge aus [`crate::onboarding::stale_pool_indices`] und schreibt
+/// `auth.toml` nur, wenn sich etwas geändert hat. Ausgegeben werden Provider,
+/// Index und Label — nie ein Secret oder ein Verweis.
+///
+/// # Errors
+/// Config-/`auth.toml`-Lese- oder Schreibfehler; ein ausdrücklich genannter
+/// Provider ohne Pool ist kein Fehler (Meldung „nichts zu tun“).
+fn prune(home: &Path, provider: Option<&str>) -> Result<(), String> {
+    let layers = harw_home::config_layers(home).map_err(|error| error.to_string())?;
+    let config = harw_config::discover_config(&layers).map_err(|error| error.to_string())?;
+    let auth_path = harw_home::auth_path(home);
+    let removed = crate::onboarding::prune_credential_pools(&auth_path, &config, provider)?;
+    if removed.is_empty() {
+        println!("Keine veralteten Pool-Einträge gefunden.");
+        return Ok(());
+    }
+    for (provider, entries) in &removed {
+        for (index, label) in entries {
+            let label = label.as_deref().unwrap_or("ohne Label");
+            println!("credential_pool.{provider}: Eintrag #{index} ({label}) entfernt");
+        }
+    }
+    println!("auth.toml aktualisiert: {}", auth_path.display());
+    Ok(())
 }
 
 /// PKCE-Paste-Flow: URL zeigen, Code von `stdin` lesen, Token holen + speichern.

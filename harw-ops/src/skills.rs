@@ -653,7 +653,11 @@ fn run_proposal_action(
     summary = "Skill-Katalog (list/show/activate/deactivate) und Skill-Vorschläge (proposals/review/accept/reject).",
     domain = "catalog_config",
     permission = "operator",
-    command(path = "/skills", visibility = "channel_reduced")
+    command(
+        path = "/skills",
+        visibility = "channel_reduced",
+        busy_subcommands = "-=immediate, list=immediate, show=immediate"
+    )
 )]
 async fn skills(ctx: &OpContext, args: SkillsArgs) -> Result<OpOutput, OpError> {
     if let Some(action @ ("proposals" | "review" | "accept" | "reject")) = args.action.as_deref() {

@@ -31,7 +31,7 @@ Konfiguration
   model                                         Modelle auflisten (Alias: models)
   model list | scan [NAME] [--free-only] [--prune] | add [PROVIDER/MODELL]
         | remove PROVIDER/MODELL | default ID | internal … | catalog [--refresh]
-  auth login | token | import | status
+  auth login | token | import | status | prune [PROVIDER]
   project trust | untrust | status [DIR]
 
 Agenten und Wissen

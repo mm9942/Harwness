@@ -459,8 +459,8 @@ mod tests {
         assert!(resolved.agents.contains_key("rust-implementer"));
         assert_eq!(
             resolved.agents.len(),
-            22,
-            "21 Bundle-Agenten plus der Profil-Default-Worker"
+            23,
+            "22 Bundle-Agenten plus der Profil-Default-Worker"
         );
 
         std::fs::remove_dir_all(&home).map_err(ctx("remove temporary scaffold"))?;

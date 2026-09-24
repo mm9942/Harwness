@@ -2,13 +2,30 @@
 //! Schreibaktionen über Slash-Zeilen.
 //!
 //! [`KanbanBoard`] implementiert [`OverlayView`]. Die Daten kommen aus
-//! `OpOutput.data` von [`REFRESH_COMMAND`] (`/kanban show`) und werden
-//! tolerant geparst. Verschieben (`>`/`<`) nutzt die Reihenfolge der
-//! Status-Lanes: Ziel ist der `state` der nächsten bzw. vorigen Lane.
+//! `OpOutput.data` von [`REFRESH_COMMAND`] (`/kanban show`, nach einer
+//! Board-Auswahl `/kanban --board=<id> show`) und werden tolerant geparst.
+//! Verschieben (`>`/`<`) nutzt die Reihenfolge der Status-Lanes: Ziel ist der
+//! `state` der nächsten bzw. vorigen Lane.
+//!
+//! # Plan D2
+//! - **Board-Auswahl** (`B`): lädt `/kanban boards` (`{"boards":[{"id","name"}]}`)
+//!   und zeigt eine Liste; `Enter` wechselt das Board. Danach tragen alle
+//!   Befehle `--board=<id>`.
+//! - **Worker-Lanes nach Rolle gruppiert**: erst die Status-Lanes in
+//!   Datenreihenfolge, dann die Worker-Lanes nach Rolle sortiert, mit Risiko.
+//! - **Freigabe an der Karte**: wartende Karten (`awaiting_approval`) tragen
+//!   `⏳`; `f` löst `/kanban approve <karte>` aus, `x` belegt
+//!   `/kanban reject <karte> ` vor.
+//! - **Vorbelegungen**: `c` Kommentar, `e` Text (mit dem bisherigen Text,
+//!   sofern vollständig geliefert), `v` Belegverweis.
+//! - **Live-Update**: `app.rs` lädt eine offene Ansicht bei
+//!   `AgentEventKind::Knowledge { area: "kanban" }` über
+//!   [`OverlayView::refresh_command`] nach (Präfix `/kanban`).
 //!
 //! Erwartetes JSON:
-//! `{"board":{"id","name"},"lanes":[{"id","title","kind","state","worker_role"}],`
-//! `"cards":[{"id","lane_id","title","state","assignee","tags","retry_count","blocked_reason","work_id"}]}`
+//! `{"board":{"id","name"},"lanes":[{"id","title","kind","state","worker_role","risk"}],`
+//! `"cards":[{"id","lane_id","title","state","assignee","tags","retry_count","blocked_reason","work_id",`
+//! `"body","body_complete","awaiting_approval","comment_count","evidence","result_status"}]}`
 
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use ratatui::{
@@ -39,10 +56,24 @@ pub(crate) const ARCHIVE_COMMAND: &str = "/kanban archive";
 pub(crate) const BLOCK_COMMAND: &str = "/kanban block";
 /// Vorbelegung für eine neue Karte.
 pub(crate) const ADD_PREFILL: &str = "/kanban add ";
+/// Listet die Boards (Board-Auswahl).
+pub(crate) const BOARDS_COMMAND: &str = "/kanban boards";
+/// Gibt eine wartende Worker-Karte frei (`<cmd> <karte>`).
+pub(crate) const APPROVE_COMMAND: &str = "/kanban approve";
+/// Lehnt eine wartende Worker-Karte ab (`<cmd> <karte> <grund>`), wird vorbelegt.
+pub(crate) const REJECT_COMMAND: &str = "/kanban reject";
+/// Kommentar (`<cmd> <karte> <text>`), wird vorbelegt.
+pub(crate) const COMMENT_COMMAND: &str = "/kanban comment";
+/// Kartentext ersetzen (`<cmd> <karte> <text>`), wird vorbelegt.
+pub(crate) const EDIT_COMMAND: &str = "/kanban edit";
+/// Belegverweis (`<cmd> <karte> <pfad|url>`), wird vorbelegt.
+pub(crate) const EVIDENCE_COMMAND: &str = "/kanban evidence";
+/// Höhe der Board-Auswahl (inklusive Rahmen).
+const PICKER_MAX_HEIGHT: u16 = 12;
 /// Mindestbreite einer Spalte in Zellen.
 const MIN_LANE_WIDTH: u16 = 18;
 /// Höhe der Detailansicht (inklusive Rahmen).
-const DETAIL_HEIGHT: u16 = 10;
+const DETAIL_HEIGHT: u16 = 12;
 
 /// Eine Spalte des Boards.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -53,6 +84,8 @@ pub(crate) struct Lane {
     pub kind: String,
     pub state: String,
     pub worker_role: Option<String>,
+    /// Risiko der Worker-Rolle (`low|medium|high`), nur an Worker-Lanes.
+    pub risk: Option<String>,
 }
 
 impl Lane {
@@ -79,8 +112,9 @@ impl Lane {
         } else {
             &self.title
         };
-        match &self.worker_role {
-            Some(role) if !self.is_status() => format!("{base} @{role}"),
+        match (&self.worker_role, &self.risk) {
+            (Some(role), Some(risk)) if !self.is_status() => format!("{base} @{role} [{risk}]"),
+            (Some(role), None) if !self.is_status() => format!("{base} @{role}"),
             _ => base.clone(),
         }
     }
@@ -98,6 +132,23 @@ pub(crate) struct Card {
     pub retry_count: u64,
     pub blocked_reason: Option<String>,
     pub work_id: Option<String>,
+    /// Kartentext (ggf. gekürzt, siehe `body_complete`).
+    pub body: String,
+    /// `true`, wenn `body` vollständig ist (nur dann wird er für `e` vorbelegt).
+    pub body_complete: bool,
+    /// Die Karte wartet auf die Freigabe des Operators.
+    pub awaiting_approval: bool,
+    pub comment_count: u64,
+    pub evidence: Vec<String>,
+    /// Ausgang des letzten Worker-Laufs (`succeeded|partial|failed`).
+    pub result_status: Option<String>,
+}
+
+/// Ein Eintrag der Board-Auswahl.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub(crate) struct BoardEntry {
+    pub id: String,
+    pub name: String,
 }
 
 /// Kanban-Overlay.
@@ -113,6 +164,13 @@ pub(crate) struct KanbanBoard {
     loaded: bool,
     error: Option<String>,
     hint: Option<String>,
+    /// Vom Nutzer gewähltes Board; `None` = Vorgabe der Op (`default`).
+    selected_board: Option<String>,
+    /// Offene Board-Auswahl (Liste aus `/kanban boards`).
+    picker: Option<Vec<BoardEntry>>,
+    picker_index: usize,
+    /// `true`, solange die Board-Liste geladen wird.
+    picker_loading: bool,
 }
 
 impl KanbanBoard {
@@ -131,6 +189,99 @@ impl KanbanBoard {
     #[cfg(test)]
     pub(crate) fn cards(&self) -> &[Card] {
         &self.cards
+    }
+
+    /// Baut `/kanban [--board=<id>] <rest>` aus einer `/kanban <rest>`-Konstante.
+    fn command(&self, base: &str) -> String {
+        match (&self.selected_board, base.strip_prefix("/kanban ")) {
+            (Some(board), Some(rest)) => format!("/kanban --board={board} {rest}"),
+            _ => base.to_owned(),
+        }
+    }
+
+    /// Gewähltes Board (für Tests).
+    #[cfg(test)]
+    pub(crate) fn selected_board(&self) -> Option<&str> {
+        self.selected_board.as_deref()
+    }
+
+    fn with_selected_card(
+        &mut self,
+        make: impl FnOnce(&Self, &Card) -> OverlayOutcome,
+    ) -> OverlayOutcome {
+        match self.selected_card().cloned() {
+            Some(card) if !card.id.is_empty() => {
+                self.hint = None;
+                make(self, &card)
+            }
+            _ => {
+                self.hint = Some("Keine Karte ausgewählt.".to_owned());
+                OverlayOutcome::Stay
+            }
+        }
+    }
+
+    fn approve_card(&mut self) -> OverlayOutcome {
+        match self.selected_card().cloned() {
+            Some(card) if card.awaiting_approval && !card.id.is_empty() => {
+                self.hint = None;
+                OverlayOutcome::Run(format!("{} {}", self.command(APPROVE_COMMAND), card.id))
+            }
+            Some(_) => {
+                self.hint = Some("Diese Karte wartet nicht auf Freigabe.".to_owned());
+                OverlayOutcome::Stay
+            }
+            None => {
+                self.hint = Some("Keine Karte ausgewählt.".to_owned());
+                OverlayOutcome::Stay
+            }
+        }
+    }
+
+    fn picker_key(&mut self, key: KeyEvent) -> OverlayOutcome {
+        let count = self.picker.as_ref().map_or(0, Vec::len);
+        match key.code {
+            KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('B') => {
+                self.picker = None;
+                self.picker_loading = false;
+                OverlayOutcome::Stay
+            }
+            KeyCode::Up | KeyCode::Char('k') => {
+                self.picker_index = self.picker_index.saturating_sub(1);
+                OverlayOutcome::Stay
+            }
+            KeyCode::Down | KeyCode::Char('j') => {
+                if self.picker_index + 1 < count {
+                    self.picker_index += 1;
+                }
+                OverlayOutcome::Stay
+            }
+            KeyCode::Enter => {
+                let chosen = self
+                    .picker
+                    .as_ref()
+                    .and_then(|boards| boards.get(self.picker_index))
+                    .map(|entry| entry.id.clone());
+                self.picker = None;
+                match chosen {
+                    Some(id) if !id.is_empty() => {
+                        self.selected_board = Some(id);
+                        self.lane_index = 0;
+                        self.card_index = 0;
+                        self.detail = false;
+                        self.loaded = false;
+                        OverlayOutcome::Fetch(self.refresh())
+                    }
+                    _ => OverlayOutcome::Stay,
+                }
+            }
+            _ => OverlayOutcome::Stay,
+        }
+    }
+
+    /// Der aktuelle Nachlade-Befehl.
+    fn refresh(&self) -> String {
+        self.command(REFRESH_COMMAND)
     }
 
     /// Indizes der Karten einer Lane in Datenreihenfolge.
@@ -215,6 +366,7 @@ impl KanbanBoard {
     }
 
     fn card_action(&mut self, command: &str) -> OverlayOutcome {
+        let command = self.command(command);
         match self.selected_card().map(|card| card.id.clone()) {
             Some(id) if !id.is_empty() => {
                 self.hint = None;
@@ -235,7 +387,11 @@ impl KanbanBoard {
         match self.move_target(&card, forward) {
             Some(state) if !card.id.is_empty() => {
                 self.hint = None;
-                OverlayOutcome::Run(format!("{MOVE_COMMAND} {} {state}", card.id))
+                OverlayOutcome::Run(format!(
+                    "{} {} {state}",
+                    self.command(MOVE_COMMAND),
+                    card.id
+                ))
             }
             _ => {
                 self.hint = Some(if forward {
@@ -286,6 +442,8 @@ impl KanbanBoard {
             let marker = if selected { "▸ " } else { "  " };
             let title_style = if selected {
                 style::selected_style(theme)
+            } else if card.awaiting_approval {
+                style::warning_style(theme)
             } else if card.blocked_reason.is_some() {
                 style::error_style(theme)
             } else {
@@ -301,8 +459,16 @@ impl KanbanBoard {
                 Span::styled(truncate(&title, width.saturating_sub(2)), title_style),
             ]));
             let mut meta = Vec::new();
-            if card.blocked_reason.is_some() {
+            if card.awaiting_approval {
+                meta.push("⏳ Freigabe (f)".to_owned());
+            } else if card.blocked_reason.is_some() {
                 meta.push("⛔".to_owned());
+            }
+            if let Some(status) = &card.result_status {
+                meta.push(result_marker(status).to_owned());
+            }
+            if card.comment_count > 0 {
+                meta.push(format!("💬{}", card.comment_count));
             }
             if let Some(assignee) = &card.assignee {
                 meta.push(format!("@{}", sanitize_inline(assignee)));
@@ -357,14 +523,34 @@ impl KanbanBoard {
                 if card.retry_count > 0 {
                     lines.push(field("Wiederholungen", card.retry_count.to_string()));
                 }
-                if let Some(reason) = &card.blocked_reason {
+                if card.awaiting_approval {
+                    lines.push(Line::styled(
+                        "Wartet auf Freigabe: f freigeben · x ablehnen",
+                        style::warning_style(theme),
+                    ));
+                } else if let Some(reason) = &card.blocked_reason {
                     lines.push(Line::from(vec![
                         Span::styled("Blockiert: ", style::error_style(theme)),
                         Span::raw(sanitize_inline(reason)),
                     ]));
                 }
+                if let Some(status) = &card.result_status {
+                    lines.push(field("Ergebnis", result_label(status).to_owned()));
+                }
+                if card.comment_count > 0 {
+                    lines.push(field("Kommentare", card.comment_count.to_string()));
+                }
+                if !card.evidence.is_empty() {
+                    lines.push(field("Belege", sanitize_inline(&card.evidence.join(", "))));
+                }
                 if let Some(work_id) = &card.work_id {
                     lines.push(field("Arbeit", sanitize_inline(work_id)));
+                }
+                if !card.body.trim().is_empty() {
+                    lines.push(Line::styled(
+                        sanitize_inline(card.body.lines().next().unwrap_or_default()),
+                        dim,
+                    ));
                 }
             }
         }
@@ -372,6 +558,66 @@ impl KanbanBoard {
             .block(block)
             .wrap(Wrap { trim: false })
             .render(area, buf);
+    }
+}
+
+impl KanbanBoard {
+    fn render_picker(&self, area: Rect, buf: &mut Buffer, theme: Theme) {
+        let entries = self.picker.as_deref().unwrap_or_default();
+        let height = u16::try_from(entries.len())
+            .unwrap_or(u16::MAX)
+            .saturating_add(2)
+            .clamp(3, PICKER_MAX_HEIGHT)
+            .min(area.height);
+        let width = area.width.min(48);
+        let popup = Rect {
+            x: area.x + (area.width - width) / 2,
+            y: area.y,
+            width,
+            height,
+        };
+        Clear.render(popup, buf);
+        let block = Block::default()
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(style::accent_color(theme)))
+            .title(" Board wählen (Enter) ");
+        let dim = style::dim_style(theme);
+        let mut lines: Vec<Line<'static>> = Vec::new();
+        if self.picker_loading && entries.is_empty() {
+            lines.push(Line::styled("Lade Boards …", dim));
+        } else if entries.is_empty() {
+            lines.push(Line::styled("Keine Boards.", dim));
+        }
+        let current = self
+            .selected_board
+            .as_deref()
+            .unwrap_or(self.board_id.as_str());
+        for (index, entry) in entries.iter().enumerate() {
+            let selected = index == self.picker_index;
+            let marker = if selected { "▸ " } else { "  " };
+            let active = if entry.id == current { " •" } else { "" };
+            let label = if entry.name.is_empty() || entry.name == entry.id {
+                sanitize_inline(&entry.id)
+            } else {
+                format!(
+                    "{} ({})",
+                    sanitize_inline(&entry.name),
+                    sanitize_inline(&entry.id)
+                )
+            };
+            let line_style = if selected {
+                style::selected_style(theme)
+            } else {
+                Style::default()
+            };
+            lines.push(Line::styled(format!("{marker}{label}{active}"), line_style));
+        }
+        let inner_height = usize::from(height.saturating_sub(2));
+        let scroll = (self.picker_index + 1).saturating_sub(inner_height);
+        Paragraph::new(lines)
+            .block(block)
+            .scroll((u16::try_from(scroll).unwrap_or(u16::MAX), 0))
+            .render(popup, buf);
     }
 }
 
@@ -405,7 +651,7 @@ impl OverlayView for KanbanBoard {
 
         let dim = style::dim_style(theme);
         Line::styled(
-            "←/→ Spalte · ↑/↓ Karte · Enter Details · >/< verschieben · d erledigt · b blockieren · u lösen · a archivieren · n neu · R neu laden · Esc",
+            "←/→ ↑/↓ · Enter Details · >/< · d/b/u/a · f freigeben · x ablehnen · c Kommentar · e Text · v Beleg · B Board · n neu · R · Esc",
             dim,
         )
         .render(footer, buf);
@@ -419,6 +665,10 @@ impl OverlayView for KanbanBoard {
             Line::styled(hint.clone(), style::warning_style(theme)).render(status, buf);
         }
 
+        if self.picker.is_some() || self.picker_loading {
+            self.render_picker(body, buf, theme);
+            return;
+        }
         if !self.loaded {
             if self.error.is_none() {
                 Line::styled("Lade Board …", dim).render(body, buf);
@@ -469,6 +719,9 @@ impl OverlayView for KanbanBoard {
         {
             return OverlayOutcome::Stay;
         }
+        if self.picker.is_some() || self.picker_loading {
+            return self.picker_key(key);
+        }
         match key.code {
             KeyCode::Esc | KeyCode::Char('q') => {
                 if self.detail {
@@ -515,24 +768,77 @@ impl OverlayView for KanbanBoard {
             KeyCode::Char('a') => self.card_action(ARCHIVE_COMMAND),
             KeyCode::Char('b') => match self.selected_card().map(|card| card.id.clone()) {
                 Some(id) if !id.is_empty() => {
-                    OverlayOutcome::Prefill(format!("{BLOCK_COMMAND} {id} "))
+                    OverlayOutcome::Prefill(format!("{} {id} ", self.command(BLOCK_COMMAND)))
                 }
                 _ => {
                     self.hint = Some("Keine Karte ausgewählt.".to_owned());
                     OverlayOutcome::Stay
                 }
             },
-            KeyCode::Char('n') => OverlayOutcome::Prefill(ADD_PREFILL.to_owned()),
-            KeyCode::Char('R') => OverlayOutcome::Fetch(REFRESH_COMMAND.to_owned()),
+            KeyCode::Char('f') => self.approve_card(),
+            KeyCode::Char('x') => self.with_selected_card(|board, card| {
+                OverlayOutcome::Prefill(format!("{} {} ", board.command(REJECT_COMMAND), card.id))
+            }),
+            KeyCode::Char('c') => self.with_selected_card(|board, card| {
+                OverlayOutcome::Prefill(format!("{} {} ", board.command(COMMENT_COMMAND), card.id))
+            }),
+            KeyCode::Char('e') => self.with_selected_card(|board, card| {
+                let body = if card.body_complete {
+                    card.body.trim()
+                } else {
+                    ""
+                };
+                OverlayOutcome::Prefill(format!(
+                    "{} {} {body}",
+                    board.command(EDIT_COMMAND),
+                    card.id
+                ))
+            }),
+            KeyCode::Char('v') => self.with_selected_card(|board, card| {
+                OverlayOutcome::Prefill(format!("{} {} ", board.command(EVIDENCE_COMMAND), card.id))
+            }),
+            KeyCode::Char('B') => {
+                self.picker = None;
+                self.picker_loading = true;
+                self.picker_index = 0;
+                OverlayOutcome::Fetch(BOARDS_COMMAND.to_owned())
+            }
+            KeyCode::Char('n') => OverlayOutcome::Prefill(self.command(ADD_PREFILL)),
+            KeyCode::Char('R') => OverlayOutcome::Fetch(self.refresh()),
             _ => OverlayOutcome::Stay,
         }
     }
 
     fn refresh_command(&self) -> Option<String> {
-        Some(REFRESH_COMMAND.to_owned())
+        Some(self.refresh())
     }
 
     fn apply_data(&mut self, data: &Value) {
+        if let Some(boards) = data.get("boards").filter(|_| data.get("lanes").is_none()) {
+            let entries: Vec<BoardEntry> = boards
+                .as_array()
+                .map_or(&[][..], Vec::as_slice)
+                .iter()
+                .filter(|entry| entry.is_object())
+                .map(|entry| BoardEntry {
+                    id: str_field(entry, "id"),
+                    name: str_field(entry, "name"),
+                })
+                .filter(|entry| !entry.id.is_empty())
+                .collect();
+            let current = self
+                .selected_board
+                .clone()
+                .unwrap_or_else(|| self.board_id.clone());
+            self.picker_index = entries
+                .iter()
+                .position(|entry| entry.id == current)
+                .unwrap_or(0);
+            self.picker = Some(entries);
+            self.picker_loading = false;
+            self.error = None;
+            return;
+        }
         let board = data.get("board").unwrap_or(&Value::Null);
         self.board_id = str_field(board, "id");
         self.board_name = str_field(board, "name");
@@ -545,9 +851,22 @@ impl OverlayView for KanbanBoard {
                 kind: str_field(lane, "kind"),
                 state: str_field(lane, "state"),
                 worker_role: opt_str_field(lane, "worker_role"),
+                risk: opt_str_field(lane, "risk"),
             })
             .filter(|lane| !lane.id.is_empty() || !lane.state.is_empty())
             .collect();
+        // Worker-Lanes nach Rolle gruppiert hinter die Status-Lanes (stabil).
+        let (mut ordered, mut workers): (Vec<Lane>, Vec<Lane>) = std::mem::take(&mut self.lanes)
+            .into_iter()
+            .partition(Lane::is_status);
+        workers.sort_by(|a, b| {
+            a.worker_role
+                .as_deref()
+                .unwrap_or_default()
+                .cmp(b.worker_role.as_deref().unwrap_or_default())
+        });
+        ordered.append(&mut workers);
+        self.lanes = ordered;
         self.cards = array_field(data, "cards")
             .iter()
             .filter(|card| card.is_object())
@@ -568,6 +887,21 @@ impl OverlayView for KanbanBoard {
                     .unwrap_or(0),
                 blocked_reason: opt_str_field(card, "blocked_reason"),
                 work_id: opt_str_field(card, "work_id"),
+                body: str_field(card, "body"),
+                body_complete: card
+                    .get("body_complete")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false),
+                awaiting_approval: card
+                    .get("awaiting_approval")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false),
+                comment_count: card
+                    .get("comment_count")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(0),
+                evidence: string_list(card.get("evidence")),
+                result_status: opt_str_field(card, "result_status"),
             })
             .collect();
         self.loaded = true;
@@ -577,7 +911,28 @@ impl OverlayView for KanbanBoard {
     }
 
     fn apply_error(&mut self, text: &str) {
+        self.picker_loading = false;
         self.error = Some(text.to_owned());
+    }
+}
+
+/// Kurzes Zeichen für den Ausgang des letzten Worker-Laufs.
+fn result_marker(status: &str) -> &'static str {
+    match status {
+        "succeeded" => "✔",
+        "partial" => "◐",
+        "failed" => "✘",
+        _ => "?",
+    }
+}
+
+/// Deutsche Bezeichnung für den Ausgang des letzten Worker-Laufs.
+fn result_label(status: &str) -> &'static str {
+    match status {
+        "succeeded" => "erledigt",
+        "partial" => "teilweise erledigt",
+        "failed" => "fehlgeschlagen",
+        _ => "unbekannt",
     }
 }
 
@@ -724,11 +1079,13 @@ mod tests {
         assert_eq!(board.cards()[0].tags, vec!["a", "b"]);
         assert_eq!(board.cards()[2].tags, vec!["x", "y"]);
         assert_eq!(board.cards()[2].retry_count, 3);
+        // Status-Lanes zuerst, die Worker-Lane dahinter (nach Rolle gruppiert).
         assert_eq!(board.lane_cards(0), vec![0, 1]);
-        assert_eq!(board.lane_cards(1), vec![3]);
-        assert!(board.lane_cards(2).is_empty());
+        assert!(board.lane_cards(1).is_empty());
         // Karte ohne lane_id landet über ihren Status in der Status-Lane.
-        assert_eq!(board.lane_cards(3), vec![2]);
+        assert_eq!(board.lane_cards(2), vec![2]);
+        assert_eq!(board.lane_cards(3), vec![3]);
+        assert_eq!(board.lanes()[3].id, "l-w");
         assert_eq!(board.refresh_command().as_deref(), Some("/kanban show"));
     }
 
@@ -760,8 +1117,8 @@ mod tests {
             OverlayOutcome::Stay
         ));
         assert!(board.hint.is_some());
-        // Zur Fertig-Lane (Worker-Lane und leere Lane überspringen).
-        for _ in 0..3 {
+        // Zur Fertig-Lane (leere Lane überspringen).
+        for _ in 0..2 {
             board.on_key(key(KeyCode::Right));
         }
         assert_eq!(
@@ -824,7 +1181,6 @@ mod tests {
         ));
         // Leere Lane: kein Detail.
         board.on_key(key(KeyCode::Right));
-        board.on_key(key(KeyCode::Right));
         board.on_key(key(KeyCode::Enter));
         assert!(!board.detail);
     }
@@ -846,6 +1202,146 @@ mod tests {
         // Schmales Terminal zeigt nur ein Fenster der Spalten.
         let narrow = render_to_string(&board, 30, 20)?;
         assert!(narrow.contains("Offen"));
+        Ok(())
+    }
+
+    fn d2_sample() -> Value {
+        json!({
+            "board": {"id": "default", "name": "default"},
+            "lanes": [
+                {"id": "worker/writer", "kind": "worker", "worker_role": "writer", "risk": "medium"},
+                {"id": "todo", "kind": "status", "state": "todo"},
+                {"id": "worker/explorer", "kind": "worker", "worker_role": "explorer", "risk": "low"}
+            ],
+            "cards": [
+                {"id": "card-1", "lane_id": "worker/explorer", "title": "Lesen", "state": "blocked",
+                 "blocked_reason": "AwaitingApproval", "awaiting_approval": true,
+                 "body": "Alter Text", "body_complete": true, "comment_count": 2,
+                 "evidence": ["docs/a.md"], "result_status": "partial"},
+                {"id": "card-2", "lane_id": "todo", "title": "Offen", "state": "todo",
+                 "body": "lang…", "body_complete": false}
+            ]
+        })
+    }
+
+    #[test]
+    fn worker_lanes_are_grouped_by_role_after_status_lanes() {
+        let mut board = KanbanBoard::new();
+        board.apply_data(&d2_sample());
+        let ids: Vec<&str> = board.lanes().iter().map(|lane| lane.id.as_str()).collect();
+        assert_eq!(ids, vec!["todo", "worker/explorer", "worker/writer"]);
+        assert_eq!(
+            board.lanes()[1].display_title(),
+            "worker/explorer @explorer [low]"
+        );
+        let card = &board.cards()[0];
+        assert!(card.awaiting_approval);
+        assert_eq!(card.comment_count, 2);
+        assert_eq!(card.evidence, vec!["docs/a.md"]);
+        assert_eq!(card.result_status.as_deref(), Some("partial"));
+    }
+
+    #[test]
+    fn approve_reject_and_note_prefills() {
+        let mut board = KanbanBoard::new();
+        board.apply_data(&d2_sample());
+        // Todo-Lane: Karte wartet nicht → Hinweis statt Befehl.
+        assert!(matches!(
+            board.on_key(key(KeyCode::Char('f'))),
+            OverlayOutcome::Stay
+        ));
+        assert!(board.hint.is_some());
+        // Unvollständiger Text wird nicht vorbelegt.
+        assert_eq!(
+            prefill_text(board.on_key(key(KeyCode::Char('e')))).as_deref(),
+            Some("/kanban edit card-2 ")
+        );
+        board.on_key(key(KeyCode::Right));
+        assert_eq!(
+            run_text(board.on_key(key(KeyCode::Char('f')))).as_deref(),
+            Some("/kanban approve card-1")
+        );
+        assert_eq!(
+            prefill_text(board.on_key(key(KeyCode::Char('x')))).as_deref(),
+            Some("/kanban reject card-1 ")
+        );
+        assert_eq!(
+            prefill_text(board.on_key(key(KeyCode::Char('c')))).as_deref(),
+            Some("/kanban comment card-1 ")
+        );
+        assert_eq!(
+            prefill_text(board.on_key(key(KeyCode::Char('e')))).as_deref(),
+            Some("/kanban edit card-1 Alter Text")
+        );
+        assert_eq!(
+            prefill_text(board.on_key(key(KeyCode::Char('v')))).as_deref(),
+            Some("/kanban evidence card-1 ")
+        );
+    }
+
+    #[test]
+    fn board_picker_switches_the_board_and_scopes_commands() -> TestResult {
+        let mut board = KanbanBoard::new();
+        board.apply_data(&d2_sample());
+        assert!(matches!(
+            board.on_key(key(KeyCode::Char('B'))),
+            OverlayOutcome::Fetch(ref cmd) if cmd == "/kanban boards"
+        ));
+        assert!(render_to_string(&board, 80, 20)?.contains("Lade Boards"));
+        board.apply_data(&json!({"boards": [
+            {"id": "default", "name": "default"},
+            {"id": "sprint", "name": "Sprint 7"}
+        ]}));
+        let out = render_to_string(&board, 80, 20)?;
+        assert!(out.contains("Board wählen"));
+        assert!(out.contains("Sprint 7 (sprint)"));
+        // Während der Auswahl lösen Kartentasten nichts aus.
+        assert!(matches!(
+            board.on_key(key(KeyCode::Char('d'))),
+            OverlayOutcome::Stay
+        ));
+        board.on_key(key(KeyCode::Down));
+        assert!(matches!(
+            board.on_key(key(KeyCode::Enter)),
+            OverlayOutcome::Fetch(ref cmd) if cmd == "/kanban --board=sprint show"
+        ));
+        assert_eq!(board.selected_board(), Some("sprint"));
+        assert_eq!(
+            board.refresh_command().as_deref(),
+            Some("/kanban --board=sprint show")
+        );
+        board.apply_data(&d2_sample());
+        assert_eq!(
+            run_text(board.on_key(key(KeyCode::Char('d')))).as_deref(),
+            Some("/kanban --board=sprint done card-2")
+        );
+        assert_eq!(
+            prefill_text(board.on_key(key(KeyCode::Char('n')))).as_deref(),
+            Some("/kanban --board=sprint add ")
+        );
+        // Esc schließt eine offene Auswahl, ohne das Board zu wechseln.
+        board.on_key(key(KeyCode::Char('B')));
+        board.apply_data(&json!({"boards": []}));
+        assert!(matches!(
+            board.on_key(key(KeyCode::Esc)),
+            OverlayOutcome::Stay
+        ));
+        assert_eq!(board.selected_board(), Some("sprint"));
+        Ok(())
+    }
+
+    #[test]
+    fn waiting_cards_render_the_approval_marker() -> TestResult {
+        let mut board = KanbanBoard::new();
+        board.apply_data(&d2_sample());
+        board.on_key(key(KeyCode::Right));
+        let out = render_to_string(&board, 120, 20)?;
+        assert!(out.contains("Freigabe (f)"), "{out}");
+        board.on_key(key(KeyCode::Enter));
+        let out = render_to_string(&board, 120, 30)?;
+        assert!(out.contains("Wartet auf Freigabe"), "{out}");
+        assert!(out.contains("teilweise erledigt"), "{out}");
+        assert!(out.contains("docs/a.md"), "{out}");
         Ok(())
     }
 

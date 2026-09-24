@@ -18,6 +18,7 @@
 //! | `complete` | `complete` mit `JobOutcome::Succeeded` und dem Token der gespeicherten Lease |
 //! | `block` | `complete` mit `JobOutcome::Blocked { reason: "kanban:<BlockKind>" }` |
 //! | `unblock` | `unblock` (`Blocked`) bzw. `retry` (`Failed`) |
+//! | `approve` | `unblock` mit Freigabe-Notiz [`KANBAN_APPROVAL_NOTE_PREFIX`] (nur `Blocked`) |
 //! | `reclaim` | `reclaim` (`Running → Ready`, zählt einen Versuch; bei erschöpfter Retry-Politik `Failed`) |
 //! | `cancel` | `cancel` (`Pending|Ready|Running`) bzw. `deny_blocked` (`Blocked`) |
 //!
@@ -30,14 +31,24 @@
 //!
 //! # Abgrenzung zu anderen Job-Arten
 //! Kanban-Jobs tragen `JobKind::Custom(`[`KANBAN_JOB_KIND`]`)`. Der
-//! CLI-Job-Worker (`harw-cli/src/job_worker.rs`, `is_supported_kind`)
-//! beansprucht nur ihm bekannte Arten und lässt diese Jobs daher in Ruhe.
-//! Umgekehrt mutiert dieser Adapter nur Jobs seiner eigenen Art; eine Karte,
-//! deren `work_id` auf einen fremden Job zeigt, darf dessen Zustand lesen
-//! (`snapshot`), aber nie bewegen (fail closed, `PermissionDenied`). Weil
-//! nur dieser Adapter Kanban-Jobs beansprucht, stammt jede Lease eines
-//! Kanban-Jobs von ihm; `complete`/`block` verwenden deshalb das Token der
-//! gespeicherten Lease — auch über einen Prozessneustart hinweg.
+//! CLI-Job-Worker (`harw-cli/src/job_worker.rs`) beansprucht sie seit Plan
+//! D2 ebenfalls — aber nur mit einer Freigabe des Operators
+//! ([`is_kanban_approval`]); ohne sie blockiert er den Job mit
+//! `kanban:AwaitingApproval`, ohne einen Agenten zu starten. Umgekehrt
+//! mutiert dieser Adapter nur Jobs seiner eigenen Art; eine Karte, deren
+//! `work_id` auf einen fremden Job zeigt, darf dessen Zustand lesen
+//! (`snapshot`), aber nie bewegen (fail closed, `PermissionDenied`).
+//! `complete`/`block` verwenden das Token der gespeicherten Lease — auch
+//! über einen Prozessneustart hinweg; hält der Worker die Lease, geht das
+//! Beenden über ihn (die Lease wird dann laufend verlängert).
+//!
+//! # Freigabe (Plan D2)
+//! `approve` ist `JobStore::unblock` mit einer Notiz, die mit
+//! [`KANBAN_APPROVAL_NOTE_PREFIX`] beginnt. Der Freigabe-Sidecar
+//! (`JobApproval`) trägt die Revision, die das Freigeben erzeugt hat; der
+//! Worker startet nur, wenn diese Revision der aktuellen entspricht, die
+//! Notiz das Präfix trägt und ein Operator freigegeben hat. Ein bloßes
+//! `unblock` (`/kanban unblock`, `/approve`) ist keine Kanban-Freigabe.
 //!
 //! # Sperrgrund
 //! `JobState::Blocked` trägt keinen Grund. Der [`BlockKind`] wird im
@@ -66,7 +77,8 @@ use harw_knowledge::kanban::board::{BlockKind, CardRecord, JobSnapshot};
 use harw_knowledge::kanban::lifecycle::JobTransitions;
 use harw_knowledge::{AgentId, KnowledgeError, KnowledgeResult};
 use harw_session_store::{
-    CancelRequest, ClaimRequest, CompleteRequest, JobStore, RetryRequest, SessionStoreError,
+    CancelRequest, ClaimRequest, CompleteRequest, JobApproval, JobStore, RetryRequest,
+    SessionStoreError,
 };
 use harw_types::ApprovalActor;
 use jiff::{SignedDuration, Timestamp};
@@ -76,6 +88,32 @@ pub const KANBAN_JOB_KIND: &str = "kanban_card";
 
 /// Präfix des `JobOutcome::Blocked`-Grunds, hinter dem das [`BlockKind`]-Label steht.
 pub const KANBAN_BLOCK_REASON_PREFIX: &str = "kanban:";
+
+/// Präfix der Freigabe-Notiz, an der der Worker eine Kanban-Freigabe erkennt.
+pub const KANBAN_APPROVAL_NOTE_PREFIX: &str = "kanban-freigabe:";
+
+/// `true`, wenn `approval` eine gültige Kanban-Freigabe für den Job in der
+/// Revision `current_revision` ist (siehe Moduldoku „Freigabe").
+///
+/// # Argumente
+/// - `approval` (`&JobApproval`): der Freigabe-Sidecar des Jobs.
+/// - `current_revision` (`u64`): die Revision des Jobs, wie der Worker ihn
+///   gerade gelesen hat (`Ready`).
+#[must_use]
+pub fn is_kanban_approval(approval: &JobApproval, current_revision: u64) -> bool {
+    approval.revision == current_revision
+        && matches!(approval.approved_by, ApprovalActor::Operator { .. })
+        && approval
+            .note
+            .as_deref()
+            .is_some_and(|note| note.starts_with(KANBAN_APPROVAL_NOTE_PREFIX))
+}
+
+/// `true` für die Job-Art, die der Kanban-Adapter anlegt.
+#[must_use]
+pub fn is_kanban_job_kind(kind: &JobKind) -> bool {
+    is_kanban_kind(kind)
+}
 
 /// Lease-Dauer eines Kanban-Claims (24 h): Karten sind langlebige Arbeit,
 /// die nicht an einem Worker-Heartbeat hängt.
@@ -306,6 +344,26 @@ impl JobTransitions for JobStoreTransitions {
             }
             other => Err(illegal(other, "ready")),
         }
+    }
+
+    fn approve(
+        &self,
+        work_id: &WorkId,
+        approved_by: &AgentId,
+        note: Option<&str>,
+    ) -> KnowledgeResult<()> {
+        let record = self.owned_record(work_id)?;
+        if record.job.state != JobState::Blocked {
+            return Err(illegal(record.job.state, "ready (approve)"));
+        }
+        let note = match note.map(str::trim).filter(|note| !note.is_empty()) {
+            Some(note) => format!("{KANBAN_APPROVAL_NOTE_PREFIX} {approved_by}: {note}"),
+            None => format!("{KANBAN_APPROVAL_NOTE_PREFIX} {approved_by}"),
+        };
+        self.store
+            .unblock(work_id, Timestamp::now(), self.actor(), Some(note))
+            .map_err(map_store_error)?;
+        Ok(())
     }
 
     fn reclaim(&self, work_id: &WorkId) -> KnowledgeResult<()> {
@@ -623,6 +681,56 @@ mod tests {
         let ready = state_of(&ledger, &work_id)?;
         assert_eq!(ready.state, JobState::Ready);
         assert_eq!(ready.block_reason, None);
+        Ok(())
+    }
+
+    #[test]
+    fn approve_marks_a_kanban_approval_that_plain_unblock_does_not() -> TestResult {
+        let (ledger, store, _dir) = ledger()?;
+        let work_id = admit_ready(&ledger.store, kanban())?;
+        ledger
+            .claim(&work_id, &AgentId::new("worker-1"))
+            .map_err(ctx("claim"))?;
+        ledger
+            .block(&work_id, BlockKind::AwaitingApproval)
+            .map_err(ctx("block"))?;
+        assert_eq!(
+            state_of(&ledger, &work_id)?.block_reason,
+            Some(BlockKind::AwaitingApproval)
+        );
+        ledger
+            .approve(&work_id, &AgentId::new("operator"), Some("los"))
+            .map_err(ctx("approve"))?;
+        let stored = store.get(&work_id).map_err(ctx("get"))?;
+        assert_eq!(stored.job.state, JobState::Ready);
+        let approval = store
+            .get_approval(&work_id)
+            .map_err(ctx("approval"))?
+            .ok_or(TestError::Missing("approval sidecar"))?;
+        assert!(is_kanban_approval(&approval, stored.revision));
+        assert!(!is_kanban_approval(&approval, stored.revision + 1));
+        let Err(KnowledgeError::IllegalTransition { .. }) =
+            ledger.approve(&work_id, &AgentId::new("operator"), None)
+        else {
+            return Err(TestError::Unexpected(
+                "approve außerhalb von Blocked muss abgelehnt werden".to_owned(),
+            ));
+        };
+
+        // Ein bloßes unblock ist keine Kanban-Freigabe.
+        ledger
+            .claim(&work_id, &AgentId::new("worker-1"))
+            .map_err(ctx("claim again"))?;
+        ledger
+            .block(&work_id, BlockKind::NeedsInput)
+            .map_err(ctx("block again"))?;
+        ledger.unblock(&work_id).map_err(ctx("unblock"))?;
+        let stored = store.get(&work_id).map_err(ctx("get again"))?;
+        let approval = store
+            .get_approval(&work_id)
+            .map_err(ctx("approval again"))?
+            .ok_or(TestError::Missing("approval sidecar"))?;
+        assert!(!is_kanban_approval(&approval, stored.revision));
         Ok(())
     }
 

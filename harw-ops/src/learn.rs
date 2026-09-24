@@ -810,6 +810,47 @@ fn file_candidate(
     Ok(Filed::New(proposal))
 }
 
+/// Legt einen Vorschlag aus einer anderen Vorschlagsquelle ab (etwa einen
+/// angenommenen Traum-Vorschlag, `source = "dream:<work-id>/<p-id>"`) —
+/// derselbe Weg wie `/learn note`, schreibt also nur in die
+/// Vorschlagsablagen und übernimmt nie selbst.
+///
+/// # Rückgabe
+/// Den Vorschlag und `true`, wenn er neu angelegt wurde (`false`: gab es
+/// schon).
+///
+/// # Errors
+/// [`OpError::InvalidArguments`] bei leerem Text oder Geheimnis-Muster,
+/// sonst wie das Ablegen selbst.
+pub(crate) fn file_external_proposal(
+    learn_store: &LearnProposalStore,
+    skills: &dyn Fn() -> Result<Arc<SkillProposalStore>, OpError>,
+    target: LearnTarget,
+    text: &str,
+    source: &str,
+) -> Result<(LearnProposal, bool), OpError> {
+    let text = text.trim();
+    if text.is_empty() {
+        return Err(OpError::InvalidArguments("Vorschlagstext fehlt".to_owned()));
+    }
+    let lower = text.to_lowercase();
+    if SECRET_MARKERS.iter().any(|marker| lower.contains(marker)) {
+        return Err(OpError::InvalidArguments(
+            "Der Text enthält ein Geheimnis-Muster und wird nicht als Vorschlag abgelegt"
+                .to_owned(),
+        ));
+    }
+    let candidate = LearnCandidate {
+        target,
+        signal: LearnSignal::Note,
+        text: text.to_owned(),
+    };
+    match file_candidate(learn_store, skills, &candidate, source)? {
+        Filed::New(proposal) => Ok((proposal, true)),
+        Filed::Known(proposal) => Ok((proposal, false)),
+    }
+}
+
 /// Manifest eines aus `/learn` vorgeschlagenen Skills.
 #[derive(Serialize)]
 struct LearnedSkillManifest {
@@ -1174,7 +1215,7 @@ fn profile_dir() -> Result<PathBuf, OpError> {
 }
 
 /// Injizierte Lern-Ablage oder `<HARW_HOME>/profiles/<aktiv>/learn/proposals`.
-fn learn_store(ctx: &OpContext) -> Result<Arc<LearnProposalStore>, OpError> {
+pub(crate) fn learn_store(ctx: &OpContext) -> Result<Arc<LearnProposalStore>, OpError> {
     if let Some(store) = ctx.service::<Arc<LearnProposalStore>>() {
         return Ok(Arc::clone(store));
     }
@@ -1185,7 +1226,7 @@ fn learn_store(ctx: &OpContext) -> Result<Arc<LearnProposalStore>, OpError> {
 
 /// Injizierte Skill-Vorschlagsablage oder die des aktiven Profils (wie
 /// `/skills`).
-fn skill_store(ctx: &OpContext) -> Result<Arc<SkillProposalStore>, OpError> {
+pub(crate) fn skill_store(ctx: &OpContext) -> Result<Arc<SkillProposalStore>, OpError> {
     if let Some(store) = ctx.service::<Arc<SkillProposalStore>>() {
         return Ok(Arc::clone(store));
     }

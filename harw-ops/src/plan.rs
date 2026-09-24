@@ -691,7 +691,11 @@ impl harw_operations::OpArgsSchema for PlanCall {
     summary = "Plan verwalten: anlegen, Knoten pflegen, Wellen und Bereitschaft lesen, abgleichen.",
     domain = "execution",
     permission = "operator",
-    command(path = "/plan", visibility = "channel_parity"),
+    command(
+        path = "/plan",
+        visibility = "channel_parity",
+        busy_subcommands = "-=immediate, inspect=immediate, ready=immediate, waves=immediate"
+    ),
     model_tool(approval = "always"),
     // Web-Fläche übernimmt dieselbe Achse wie das ModelTool: die Operation
     // deckt sowohl lesende (Wellen/Bereitschaft anzeigen) als auch

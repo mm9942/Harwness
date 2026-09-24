@@ -11,6 +11,27 @@
 //! - `search <query> [--max-hops=n] [--max=n]` — graphbewusster Recall über
 //!   Palace-Knoten; begrenzt durch `RecallQuery::validate` (§2.3).
 //! - `promote <topic-ref>` — Thema → Palace-Knoten (§2.5).
+//! - `supersede <alt> <neu> [--confirm]` — `alt` wird `superseded` und
+//!   verweist über `extra.superseded_by` (plus Frontmatter-Link) auf `neu`.
+//! - `edit <id> <text…> [--confirm]` — ersetzt den Body; `[[wikilinks]]`
+//!   werden zu Frontmatter-Links.
+//! - `link <a> <b> [--confirm]` — ergänzt in `a` einen `[[palace/b]]`-Verweis.
+//!
+//! # Review-Gate der Schreibpfade (D4)
+//! `supersede`, `edit` und `link` sind nur für den Operator (Sicht
+//! `OperatorOnly`) erreichbar; ein Agenten-Principal bekommt
+//! [`OpError::NotAvailable`]. Ein `provisional` Knoten darf frei geändert
+//! werden. Jede Änderung an einem `established` Knoten ist eine neue
+//! Revision und verlangt die ausdrückliche Bestätigung `--confirm` (wie das
+//! ausdrückliche `/palace promote`, §2.5); die Vorfassung wird dabei an
+//! `palace/<slug>.history.jsonl` angehängt und `extra.revision` hochgezählt.
+//! Ein `superseded` Knoten ist eingefroren. Alle Schreibpfade halten die
+//! Dateisperre des Knotens ([`KnowledgeLock::for_target`]) über den ganzen
+//! Read-Modify-Write-Zyklus. Knoten werden nie gelöscht.
+//!
+//! # Index
+//! Lesepfade nutzen [`KnowledgeIndex::cached`] (prozessweiter Cache mit
+//! mtime-Signatur) statt bei jedem Aufruf neu aufzubauen.
 //!
 //! # Promotion-Gate
 //! `promote` ist nur als Operator-Kommando erreichbar (kein Modell-Werkzeug,
@@ -25,12 +46,16 @@
 //!
 //! # Sichtbarkeit
 //! Alle Lesepfade laufen über `harw_knowledge::memory::recall::search_with`
-//! mit `VisibilityScope::OperatorOnly` (dieselbe Disziplin wie
-//! `/context-proposal`); `KnowledgeIndex::get` wird nur mit Ids aufgerufen,
-//! die der Recall bereits als sichtbar bestätigt hat. Backlinks werden auf
-//! sichtbare Quellen gefiltert. Ein Thema wird nur promotet, wenn es für
-//! einen `OperatorOnly`-Aufrufer sichtbar ist; der Knoten erbt seine
-//! Sichtbarkeit (nie eine Ausweitung).
+//! mit der Sicht des echten Aufrufers
+//! ([`crate::knowledge_common::KnowledgeCaller`]: Operator → `OperatorOnly`,
+//! Agent → `SelfOnly`; dieselbe Disziplin wie `/context-proposal`);
+//! `KnowledgeIndex::get` wird nur mit Ids aufgerufen, die der Recall bereits
+//! als sichtbar bestätigt hat. Backlinks werden auf sichtbare Quellen
+//! gefiltert. Ein Thema wird nur promotet, wenn es für den Aufrufer sichtbar
+//! ist; der Knoten erbt seine Sichtbarkeit (nie eine Ausweitung). Nach
+//! `promote`, `supersede`, `edit` und `link` geht
+//! `AgentEventKind::Knowledge { area: "palace", id: "palace/<slug>" }` über
+//! den Hub.
 //!
 //! # Fehler
 //! - [`OpError::NotAvailable`] — kein Knowledge-Store im Kontext.
@@ -42,15 +67,31 @@ use harw_knowledge::artifact::{
     ArtifactId, ArtifactKind, Frontmatter, KnowledgeArtifact, MAX_RECALL_ARTIFACTS,
     MAX_RECALL_HOPS, RecallQuery,
 };
+use std::io::Write as _;
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
+
 use harw_knowledge::index::KnowledgeIndex;
-use harw_knowledge::memory::palace::{PalaceStatus, ensure_promotion_reviewed, scan_wikilinks};
+use harw_knowledge::memory::palace::{
+    PalaceStatus, REVISION_KEY, SUPERSEDED_BY_KEY, artifact_status, ensure_promotion_reviewed,
+    scan_wikilinks, set_status,
+};
 use harw_knowledge::memory::recall::{ListAllRanker, search, search_with};
 use harw_knowledge::memory::topic;
-use harw_knowledge::{AgentId, KnowledgeStore, VisibilityScope};
+use harw_knowledge::{AgentId, KnowledgeLock, KnowledgeStore, VisibilityScope};
 use harw_macros::operation;
 use harw_operations::{OpContext, OpError, OpOutput};
 
-use crate::workbench::{caller_agent, knowledge_store, map_knowledge_error, split_flag};
+use crate::knowledge_args::{FlagSpec, KnowledgeArgs};
+use crate::knowledge_common::{
+    AREA_PALACE, KnowledgeCaller, knowledge_store, map_knowledge_error, publish_knowledge,
+};
+
+/// Flags von `search`.
+const SEARCH_FLAGS: &[FlagSpec] = &[FlagSpec::value("max-hops"), FlagSpec::value("max")];
+
+/// Flags der Schreib-Subcommands `supersede`/`edit`/`link`.
+const WRITE_FLAGS: &[FlagSpec] = &[FlagSpec::switch("confirm")];
 
 /// Vorgabe für `--max` bei `search`.
 const DEFAULT_SEARCH_MAX: usize = 10;
@@ -85,22 +126,45 @@ impl harw_operations::FromRawArgs for PalaceArgs {
 /// Siehe Moduldoku.
 #[operation(
     name = "palace",
-    summary = "Palace-Graph: show <id>, search <query> [--max-hops=n] [--max=n], promote <topic>.",
+    summary = "Palace-Graph: show <id>, search <query> [--max-hops=n] [--max=n], promote <topic>, supersede <alt> <neu>, edit <id> <text>, link <a> <b> [--confirm].",
     domain = "knowledge",
     permission = "operator",
-    command(path = "/palace", visibility = "channel_parity")
+    command(
+        path = "/palace",
+        visibility = "channel_parity",
+        busy_subcommands = "-=immediate, list=immediate, show=immediate, search=immediate"
+    )
 )]
 async fn palace(ctx: &OpContext, args: PalaceArgs) -> Result<OpOutput, OpError> {
     let store = knowledge_store(ctx)?;
-    run_palace(
-        &store,
-        &caller_agent(ctx),
-        &args.tokens,
-        jiff::Timestamp::now(),
+    let caller = KnowledgeCaller::from_context(ctx);
+    let output = run_palace_as(&store, &caller, &args.tokens, jiff::Timestamp::now())?;
+    if let Some(id) = written_node_id(&args.tokens) {
+        publish_knowledge(ctx, AREA_PALACE, id);
+    }
+    Ok(output)
+}
+
+/// Für schreibende Subcommands die Id des geänderten Knotens
+/// (`Some(Some(id))`), sonst `None` (nichts zu melden).
+fn written_node_id(tokens: &[String]) -> Option<Option<String>> {
+    let parsed = KnowledgeArgs::parse(tokens, WRITE_FLAGS).ok()?;
+    let sub = parsed.subcommand()?;
+    if !matches!(sub, "promote" | "supersede" | "edit" | "link") {
+        return None;
+    }
+    Some(
+        parsed
+            .positionals()
+            .get(1)
+            .and_then(|raw| topic_slug(raw.trim_start_matches("palace/")).ok())
+            .map(|slug| format!("palace/{slug}")),
     )
 }
 
-/// Der reine Kern von `/palace` (testbar ohne `OpContext`).
+/// Der reine Kern von `/palace` aus Operator-Sicht (testbar ohne
+/// `OpContext`); gleichbedeutend mit [`run_palace_as`] und
+/// [`KnowledgeCaller::operator`].
 ///
 /// # Fehler
 /// Siehe Moduldoku.
@@ -110,14 +174,37 @@ pub fn run_palace(
     tokens: &[String],
     now: jiff::Timestamp,
 ) -> Result<OpOutput, OpError> {
-    let tail = tokens.get(1..).unwrap_or_default();
-    match tokens.first().map(String::as_str) {
-        None | Some("list") => list(store),
-        Some("show") => show(store, tail),
-        Some("search") => search_nodes(store, tail),
+    run_palace_as(
+        store,
+        &KnowledgeCaller::operator(caller.clone()),
+        tokens,
+        now,
+    )
+}
+
+/// Der reine Kern von `/palace` für einen beliebigen Aufrufer.
+///
+/// # Fehler
+/// Siehe Moduldoku.
+pub fn run_palace_as(
+    store: &KnowledgeStore,
+    caller: &KnowledgeCaller,
+    tokens: &[String],
+    now: jiff::Timestamp,
+) -> Result<OpOutput, OpError> {
+    let args = KnowledgeArgs::parse(tokens, &[])?;
+    let tail = args.rest();
+    let viewer = &caller.viewer;
+    match args.subcommand() {
+        None | Some("list") => list(store, viewer),
+        Some("show") => show(store, viewer, tail),
+        Some("search") => search_nodes(store, viewer, tail),
         Some("promote") => promote(store, caller, tail, now),
+        Some("supersede") => supersede(store, caller, tail, now),
+        Some("edit") => edit(store, caller, tail, now),
+        Some("link") => link(store, caller, tail, now),
         Some(other) => Err(OpError::InvalidArguments(format!(
-            "unbekannter /palace-Subcommand: {other} (list, show, search, promote)"
+            "unbekannter /palace-Subcommand: {other} (list, show, search, promote, supersede, edit, link)"
         ))),
     }
 }
@@ -165,9 +252,9 @@ fn node_summary(node: &KnowledgeArtifact) -> serde_json::Value {
     })
 }
 
-fn list(store: &KnowledgeStore) -> Result<OpOutput, OpError> {
+fn list(store: &KnowledgeStore, viewer: &VisibilityScope) -> Result<OpOutput, OpError> {
     let index = rebuild(store)?;
-    let nodes = visible_nodes(&index)?;
+    let nodes = visible_nodes(&index, viewer)?;
     let summaries: Vec<serde_json::Value> = nodes.iter().map(node_summary).collect();
     let data = serde_json::json!({ "nodes": summaries });
     if nodes.is_empty() {
@@ -201,15 +288,18 @@ fn node_id(raw: &str) -> ArtifactId {
     }
 }
 
-fn rebuild(store: &KnowledgeStore) -> Result<KnowledgeIndex, OpError> {
-    KnowledgeIndex::rebuild(store).map_err(|error| {
+fn rebuild(store: &KnowledgeStore) -> Result<Arc<KnowledgeIndex>, OpError> {
+    KnowledgeIndex::cached(store).map_err(|error| {
         OpError::Execution(format!("Knowledge-Index-Aufbau fehlgeschlagen: {error}"))
     })
 }
 
-/// Alle für einen Operator sichtbaren Palace-Knoten (einziger Lesepfad).
-fn visible_nodes(index: &KnowledgeIndex) -> Result<Vec<KnowledgeArtifact>, OpError> {
-    let mut query = RecallQuery::new(String::new(), VisibilityScope::OperatorOnly);
+/// Alle für `viewer` sichtbaren Palace-Knoten (einziger Lesepfad).
+fn visible_nodes(
+    index: &KnowledgeIndex,
+    viewer: &VisibilityScope,
+) -> Result<Vec<KnowledgeArtifact>, OpError> {
+    let mut query = RecallQuery::new(String::new(), viewer.clone());
     query.kinds = vec![ArtifactKind::PalaceNode];
     query.max_hops = 0;
     let result = search_with(index, &query, &ListAllRanker).map_err(map_knowledge_error)?;
@@ -220,13 +310,17 @@ fn visible_nodes(index: &KnowledgeIndex) -> Result<Vec<KnowledgeArtifact>, OpErr
         .collect())
 }
 
-fn show(store: &KnowledgeStore, tail: &[String]) -> Result<OpOutput, OpError> {
+fn show(
+    store: &KnowledgeStore,
+    viewer: &VisibilityScope,
+    tail: &[String],
+) -> Result<OpOutput, OpError> {
     let raw = tail
         .first()
         .ok_or_else(|| OpError::InvalidArguments("Aufruf: /palace show <id>".to_owned()))?;
     let target = node_id(raw);
     let index = rebuild(store)?;
-    let node = visible_nodes(&index)?
+    let node = visible_nodes(&index, viewer)?
         .into_iter()
         .find(|artifact| artifact.id == target)
         .ok_or_else(|| {
@@ -239,11 +333,7 @@ fn show(store: &KnowledgeStore, tail: &[String]) -> Result<OpOutput, OpError> {
     let backlinks: Vec<String> = index
         .backlinks(&node.id)
         .into_iter()
-        .filter(|source| {
-            source
-                .visibility
-                .visible_to_caller(&VisibilityScope::OperatorOnly)
-        })
+        .filter(|source| source.visibility.visible_to_caller(viewer))
         .map(|source| source.id.to_string())
         .collect();
 
@@ -272,35 +362,66 @@ fn show(store: &KnowledgeStore, tail: &[String]) -> Result<OpOutput, OpError> {
     })
 }
 
-fn search_nodes(store: &KnowledgeStore, tail: &[String]) -> Result<OpOutput, OpError> {
-    let (hops_flag, rest) = split_flag(tail, "--max-hops=");
-    let (max_flag, rest) = split_flag(&rest, "--max=");
-    let text = rest.join(" ");
+fn search_nodes(
+    store: &KnowledgeStore,
+    viewer: &VisibilityScope,
+    tail: &[String],
+) -> Result<OpOutput, OpError> {
+    let args = KnowledgeArgs::parse(tail, SEARCH_FLAGS)?;
+    let hops_flag = args.value("max-hops");
+    let max_flag = args.value("max");
+    let text = args.positionals().join(" ");
     if text.trim().is_empty() {
         return Err(OpError::InvalidArguments(
             "Aufruf: /palace search <query> [--max-hops=n] [--max=n]".to_owned(),
         ));
     }
     let max_hops = match hops_flag {
-        Some(raw) => parse_bound::<u8>(&raw, "--max-hops", MAX_RECALL_HOPS)?,
+        Some(raw) => parse_bound::<u8>(raw, "--max-hops", MAX_RECALL_HOPS)?,
         None => DEFAULT_SEARCH_HOPS,
     };
     let max_artifacts = match max_flag {
-        Some(raw) => parse_bound::<usize>(&raw, "--max", MAX_RECALL_ARTIFACTS)?,
+        Some(raw) => parse_bound::<usize>(raw, "--max", MAX_RECALL_ARTIFACTS)?,
         None => DEFAULT_SEARCH_MAX,
     };
 
     let index = rebuild(store)?;
-    let mut query = RecallQuery::new(text.trim(), VisibilityScope::OperatorOnly);
+    let mut query = RecallQuery::new(text.trim(), viewer.clone());
     query.kinds = vec![ArtifactKind::PalaceNode];
     query.max_hops = max_hops;
     query.max_artifacts = max_artifacts;
     let result = search(&index, &query).map_err(map_knowledge_error)?;
+    // Strukturierte Nutzlast für den Wissensbrowser der TUI: Titel und
+    // Status kommen aus dem vollen Knoten des Index (Treffer tragen nur die
+    // leichte `ArtifactRef`).
+    let hits: Vec<serde_json::Value> = result
+        .hits
+        .iter()
+        .map(|hit| {
+            let node = index.get(&hit.artifact.id);
+            serde_json::json!({
+                "id": hit.artifact.id.as_str(),
+                "title": node.map_or(hit.artifact.id.as_str(), node_title),
+                "status": node.map_or("provisional", node_status),
+                "score": hit.score,
+                "hop_path": hit
+                    .hop_path
+                    .iter()
+                    .map(|id| id.as_str())
+                    .collect::<Vec<_>>(),
+            })
+        })
+        .collect();
+    let data = serde_json::json!({
+        "query": text.trim(),
+        "truncated": result.truncated,
+        "hits": hits,
+    });
     if result.hits.is_empty() {
-        return Ok(OpOutput::from(format!(
-            "Keine Palace-Treffer für '{}'.",
-            text.trim()
-        )));
+        return Ok(OpOutput {
+            text: format!("Keine Palace-Treffer für '{}'.", text.trim()),
+            data: Some(data),
+        });
     }
     let mut out = format!("{} Palace-Treffer:\n", result.hits.len());
     for hit in &result.hits {
@@ -314,7 +435,10 @@ fn search_nodes(store: &KnowledgeStore, tail: &[String]) -> Result<OpOutput, OpE
     if result.truncated {
         out.push_str("(gekürzt — --max erhöhen)\n");
     }
-    Ok(OpOutput::from(out))
+    Ok(OpOutput {
+        text: out,
+        data: Some(data),
+    })
 }
 
 /// Parst eine Schranke und prüft sie gegen die harte Obergrenze.
@@ -354,7 +478,7 @@ fn topic_slug(raw: &str) -> Result<String, OpError> {
 
 fn promote(
     store: &KnowledgeStore,
-    caller: &AgentId,
+    caller: &KnowledgeCaller,
     tail: &[String],
     now: jiff::Timestamp,
 ) -> Result<OpOutput, OpError> {
@@ -375,11 +499,7 @@ fn promote(
         )));
     }
     let topic_artifact = topic::read(store, &slug).map_err(map_knowledge_error)?;
-    if !topic_artifact
-        .frontmatter
-        .visibility
-        .visible_to_caller(&VisibilityScope::OperatorOnly)
-    {
+    if !caller.can_read(&topic_artifact.frontmatter.visibility) {
         return Err(OpError::InvalidArguments(format!(
             "kein sichtbares Thema 'topic/{slug}'"
         )));
@@ -394,7 +514,7 @@ fn promote(
         .and_then(serde_json::Value::as_str)
         .map_or_else(|| slug.clone(), str::to_owned);
     let mut frontmatter = Frontmatter::new(
-        caller.clone(),
+        caller.agent.clone(),
         topic_artifact.frontmatter.visibility.clone(),
         now,
     );
@@ -430,28 +550,320 @@ fn promote(
     )))
 }
 
+// ── Schreibpfade supersede / edit / link (D4) ──────────────────────────────
+
+/// Ein geladener Knoten samt Dateipfad.
+struct LoadedNode {
+    id: ArtifactId,
+    path: PathBuf,
+    artifact: KnowledgeArtifact,
+}
+
+/// Review-Gate der Schreibpfade: nur der Operator darf Palace-Knoten ändern.
+fn require_operator(caller: &KnowledgeCaller, sub: &str) -> Result<(), OpError> {
+    if caller.viewer.is_operator_only() {
+        Ok(())
+    } else {
+        Err(OpError::NotAvailable(format!(
+            "/palace {sub} ist dem Operator vorbehalten"
+        )))
+    }
+}
+
+/// Lädt einen für den Aufrufer sichtbaren Knoten (`palace/<slug>` oder `<slug>`).
+fn load_node(
+    store: &KnowledgeStore,
+    caller: &KnowledgeCaller,
+    raw: &str,
+) -> Result<LoadedNode, OpError> {
+    let slug = topic_slug(raw.trim().trim_start_matches("palace/"))?;
+    let id = ArtifactId::new(format!("palace/{slug}"));
+    let path = store.palace_path(&ArtifactId::new(slug.as_str()));
+    if !path.is_file() {
+        return Err(OpError::InvalidArguments(format!(
+            "kein sichtbarer Palace-Knoten '{id}'"
+        )));
+    }
+    let artifact = store
+        .read_artifact(&path, id.clone(), ArtifactKind::PalaceNode)
+        .map_err(map_knowledge_error)?;
+    if !caller.can_read(&artifact.frontmatter.visibility) {
+        return Err(OpError::InvalidArguments(format!(
+            "kein sichtbarer Palace-Knoten '{id}'"
+        )));
+    }
+    Ok(LoadedNode { id, path, artifact })
+}
+
+/// Prüft, ob der Knoten geändert werden darf, und liefert, ob die Änderung
+/// eine neue Revision ist (`established`).
+fn ensure_editable(node: &LoadedNode, confirmed: bool, sub: &str) -> Result<bool, OpError> {
+    match artifact_status(&node.artifact) {
+        PalaceStatus::Provisional => Ok(false),
+        PalaceStatus::Superseded => Err(OpError::InvalidArguments(format!(
+            "{} ist superseded und eingefroren; Änderungen gehören an den Nachfolger",
+            node.id
+        ))),
+        PalaceStatus::Established if confirmed => Ok(true),
+        PalaceStatus::Established => Err(OpError::InvalidArguments(format!(
+            "{} ist established: /palace {sub} erzeugt eine neue Revision und braucht \
+             die ausdrückliche Bestätigung --confirm",
+            node.id
+        ))),
+    }
+}
+
+/// Sidecar mit den Vorfassungen eines Knotens (`palace/<slug>.history.jsonl`;
+/// kein `.md`, also nie im Index).
+fn history_path(node_path: &Path) -> PathBuf {
+    node_path.with_extension("history.jsonl")
+}
+
+/// Hängt die aktuelle Fassung an die History und zählt `extra.revision` hoch.
+fn start_revision(
+    node: &mut LoadedNode,
+    reason: &str,
+    now: jiff::Timestamp,
+) -> Result<u64, OpError> {
+    let current = node
+        .artifact
+        .frontmatter
+        .extra
+        .get(REVISION_KEY)
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or(1);
+    let entry = serde_json::json!({
+        "revision": current,
+        "replaced_at": now.to_string(),
+        "reason": reason,
+        "status": artifact_status(&node.artifact).label(),
+        "updated_at": node.artifact.frontmatter.updated_at.to_string(),
+        "links": node.artifact.frontmatter.links,
+        "body": node.artifact.body,
+    });
+    let mut line = serde_json::to_string(&entry)
+        .map_err(|error| OpError::Execution(format!("History kodieren: {error}")))?;
+    line.push('\n');
+    let mut file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(history_path(&node.path))
+        .map_err(|error| OpError::Execution(format!("History öffnen: {error}")))?;
+    file.write_all(line.as_bytes())
+        .map_err(|error| OpError::Execution(format!("History schreiben: {error}")))?;
+    let next = current.saturating_add(1);
+    node.artifact
+        .frontmatter
+        .extra
+        .insert(REVISION_KEY.to_owned(), serde_json::Value::from(next));
+    Ok(next)
+}
+
+/// Schreibt den geänderten Knoten zurück (`updated_at` = `now`).
+fn store_node(
+    store: &KnowledgeStore,
+    node: &mut LoadedNode,
+    now: jiff::Timestamp,
+) -> Result<(), OpError> {
+    node.artifact.frontmatter.touch(now);
+    store
+        .write_artifact(&node.path, &node.artifact)
+        .map_err(map_knowledge_error)
+}
+
+/// Fügt `target` den Frontmatter-Links hinzu, falls noch nicht vorhanden.
+fn push_link(frontmatter: &mut Frontmatter, target: &ArtifactId) {
+    if !frontmatter.links.contains(target) {
+        frontmatter.links.push(target.clone());
+    }
+}
+
+/// Schreib-Argumente: Positionale plus `--confirm`.
+fn write_args(tail: &[String]) -> Result<(Vec<String>, bool), OpError> {
+    let args = KnowledgeArgs::parse(tail, WRITE_FLAGS)?;
+    Ok((args.positionals().to_vec(), args.switch("confirm")))
+}
+
+fn supersede(
+    store: &KnowledgeStore,
+    caller: &KnowledgeCaller,
+    tail: &[String],
+    now: jiff::Timestamp,
+) -> Result<OpOutput, OpError> {
+    require_operator(caller, "supersede")?;
+    let (positionals, confirmed) = write_args(tail)?;
+    let [old_raw, new_raw] = positionals.as_slice() else {
+        return Err(OpError::InvalidArguments(
+            "Aufruf: /palace supersede <alt> <neu> [--confirm]".to_owned(),
+        ));
+    };
+    let replacement = load_node(store, caller, new_raw)?;
+    if artifact_status(&replacement.artifact) == PalaceStatus::Superseded {
+        return Err(OpError::InvalidArguments(format!(
+            "Nachfolger {} ist selbst superseded",
+            replacement.id
+        )));
+    }
+    let probe = load_node(store, caller, old_raw)?;
+    if probe.id == replacement.id {
+        return Err(OpError::InvalidArguments(
+            "ein Knoten kann sich nicht selbst ersetzen".to_owned(),
+        ));
+    }
+    let _lock = KnowledgeLock::for_target(&probe.path).map_err(map_knowledge_error)?;
+    // Unter der Sperre frisch lesen: der Stand vor der Sperre kann veraltet sein.
+    let mut node = load_node(store, caller, old_raw)?;
+    let revision = ensure_editable(&node, confirmed, "supersede")?;
+    if revision {
+        start_revision(&mut node, "supersede", now)?;
+    }
+    set_status(&mut node.artifact.frontmatter, PalaceStatus::Superseded);
+    node.artifact.frontmatter.extra.insert(
+        SUPERSEDED_BY_KEY.to_owned(),
+        serde_json::Value::String(replacement.id.to_string()),
+    );
+    push_link(&mut node.artifact.frontmatter, &replacement.id);
+    store_node(store, &mut node, now)?;
+    Ok(OpOutput {
+        text: format!(
+            "{} → superseded, ersetzt durch {}.",
+            node.id, replacement.id
+        ),
+        data: Some(serde_json::json!({
+            "id": node.id.as_str(),
+            "status": PalaceStatus::Superseded.label(),
+            "superseded_by": replacement.id.as_str(),
+        })),
+    })
+}
+
+fn edit(
+    store: &KnowledgeStore,
+    caller: &KnowledgeCaller,
+    tail: &[String],
+    now: jiff::Timestamp,
+) -> Result<OpOutput, OpError> {
+    require_operator(caller, "edit")?;
+    let (positionals, confirmed) = write_args(tail)?;
+    let Some((raw, words)) = positionals.split_first() else {
+        return Err(OpError::InvalidArguments(
+            "Aufruf: /palace edit <id> <text…> [--confirm]".to_owned(),
+        ));
+    };
+    let text = words.join(" ");
+    if text.trim().is_empty() {
+        return Err(OpError::InvalidArguments(
+            "Aufruf: /palace edit <id> <text…> [--confirm] (Text fehlt)".to_owned(),
+        ));
+    }
+    let probe = load_node(store, caller, raw)?;
+    let _lock = KnowledgeLock::for_target(&probe.path).map_err(map_knowledge_error)?;
+    let mut node = load_node(store, caller, raw)?;
+    let revision = ensure_editable(&node, confirmed, "edit")?;
+    let number = if revision {
+        Some(start_revision(&mut node, "edit", now)?)
+    } else {
+        None
+    };
+    // Frontmatter-Links: ausdrückliche Links bleiben, Wikilinks folgen dem Body.
+    let old_wikilinks: Vec<ArtifactId> = scan_wikilinks(&node.artifact.body)
+        .into_iter()
+        .map(ArtifactId::new)
+        .collect();
+    let mut links: Vec<ArtifactId> = node
+        .artifact
+        .frontmatter
+        .links
+        .iter()
+        .filter(|link| !old_wikilinks.contains(link))
+        .cloned()
+        .collect();
+    for link in scan_wikilinks(&text).into_iter().map(ArtifactId::new) {
+        if !links.contains(&link) {
+            links.push(link);
+        }
+    }
+    node.artifact.frontmatter.links = links;
+    node.artifact.body = format!("{}\n", text.trim());
+    store_node(store, &mut node, now)?;
+    let text = match number {
+        Some(number) => format!("{} bearbeitet (neue Revision {number}).", node.id),
+        None => format!("{} bearbeitet (provisional).", node.id),
+    };
+    Ok(OpOutput {
+        text,
+        data: Some(serde_json::json!({
+            "id": node.id.as_str(),
+            "status": artifact_status(&node.artifact).label(),
+            "revision": number,
+        })),
+    })
+}
+
+fn link(
+    store: &KnowledgeStore,
+    caller: &KnowledgeCaller,
+    tail: &[String],
+    now: jiff::Timestamp,
+) -> Result<OpOutput, OpError> {
+    require_operator(caller, "link")?;
+    let (positionals, confirmed) = write_args(tail)?;
+    let [from_raw, to_raw] = positionals.as_slice() else {
+        return Err(OpError::InvalidArguments(
+            "Aufruf: /palace link <a> <b> [--confirm]".to_owned(),
+        ));
+    };
+    let target = load_node(store, caller, to_raw)?;
+    let probe = load_node(store, caller, from_raw)?;
+    if probe.id == target.id {
+        return Err(OpError::InvalidArguments(
+            "ein Knoten kann nicht auf sich selbst verlinken".to_owned(),
+        ));
+    }
+    let _lock = KnowledgeLock::for_target(&probe.path).map_err(map_knowledge_error)?;
+    let mut node = load_node(store, caller, from_raw)?;
+    let already = scan_wikilinks(&node.artifact.body)
+        .iter()
+        .any(|existing| existing == target.id.as_str());
+    if already {
+        return Ok(OpOutput::from(format!(
+            "{} verlinkt bereits auf {}.",
+            node.id, target.id
+        )));
+    }
+    let revision = ensure_editable(&node, confirmed, "link")?;
+    if revision {
+        start_revision(&mut node, "link", now)?;
+    }
+    let mut body = node.artifact.body.trim_end().to_owned();
+    body.push_str(&format!("\n\nSiehe auch: [[{}]]\n", target.id));
+    node.artifact.body = body;
+    push_link(&mut node.artifact.frontmatter, &target.id);
+    store_node(store, &mut node, now)?;
+    Ok(OpOutput {
+        text: format!("{} → {} verlinkt.", node.id, target.id),
+        data: Some(serde_json::json!({
+            "id": node.id.as_str(),
+            "link": target.id.as_str(),
+        })),
+    })
+}
+
 #[cfg(test)]
 mod tests {
-    use super::run_palace;
+    use super::{run_palace, run_palace_as, written_node_id};
+    use crate::knowledge_common::KnowledgeCaller;
+    use crate::knowledge_test_support::temporary_store;
     use crate::test_support::{TestError, TestResult, ctx};
     use crate::testutil::toks;
+    use harw_knowledge::memory::palace::{PalaceStatus, artifact_status, set_status};
     use harw_knowledge::memory::topic;
-    use harw_knowledge::{AgentId, Frontmatter, KnowledgeStore, VisibilityScope};
+    use harw_knowledge::{
+        AgentId, ArtifactId, ArtifactKind, Frontmatter, KnowledgeArtifact, KnowledgeStore,
+        VisibilityScope,
+    };
     use harw_operations::operation::Surface;
     use harw_operations::{OpError, Operation};
-
-    fn temporary_store(label: &str) -> TestResult<KnowledgeStore> {
-        let nonce = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map_err(ctx("system clock is after epoch"))?
-            .as_nanos();
-        let root = std::env::temp_dir().join(format!(
-            "harw-ops-palace-{label}-{}-{nonce}",
-            std::process::id()
-        ));
-        std::fs::create_dir_all(&root).map_err(ctx("create temporary knowledge root"))?;
-        Ok(KnowledgeStore::new(&root))
-    }
 
     fn write_topic(
         store: &KnowledgeStore,
@@ -520,6 +932,32 @@ mod tests {
         let hits = run(&store, &["search", "canary", "--max=5"]).map_err(ctx("search"))?;
         assert!(hits.contains("palace/deploy-pipeline"), "{hits}");
 
+        // Strukturierte Treffer für den Wissensbrowser der TUI.
+        let searched = run_palace(
+            &store,
+            &AgentId::new("operator"),
+            &toks(&["search", "canary", "--max=5"]),
+            jiff::Timestamp::UNIX_EPOCH,
+        )
+        .map_err(ctx("search data"))?;
+        let data = searched.data.ok_or(TestError::Missing("search data"))?;
+        assert_eq!(data["query"], "canary");
+        assert_eq!(data["truncated"], false);
+        assert_eq!(data["hits"][0]["id"], "palace/deploy-pipeline");
+        assert_eq!(data["hits"][0]["status"], "established");
+        assert!(data["hits"][0]["title"].is_string());
+        assert!(data["hits"][0]["score"].is_number());
+        assert!(data["hits"][0]["hop_path"].is_array());
+        let empty = run_palace(
+            &store,
+            &AgentId::new("operator"),
+            &toks(&["search", "gibtesnicht"]),
+            jiff::Timestamp::UNIX_EPOCH,
+        )
+        .map_err(ctx("empty search"))?;
+        let data = empty.data.ok_or(TestError::Missing("empty search data"))?;
+        assert_eq!(data["hits"].as_array().map(Vec::len), Some(0));
+
         let listed = run_palace(
             &store,
             &AgentId::new("operator"),
@@ -574,5 +1012,224 @@ mod tests {
         }
         std::fs::remove_dir_all(store.root()).ok();
         Ok(())
+    }
+
+    fn write_node(
+        store: &KnowledgeStore,
+        slug: &str,
+        status: PalaceStatus,
+        body: &str,
+    ) -> TestResult {
+        let mut frontmatter = Frontmatter::new(
+            AgentId::new("operator"),
+            VisibilityScope::OperatorOnly,
+            jiff::Timestamp::UNIX_EPOCH,
+        );
+        set_status(&mut frontmatter, status);
+        let artifact = KnowledgeArtifact::new(
+            ArtifactId::new(format!("palace/{slug}")),
+            ArtifactKind::PalaceNode,
+            frontmatter,
+            body,
+        );
+        store
+            .write_artifact(&store.palace_path(&ArtifactId::new(slug)), &artifact)
+            .map_err(ctx("write node"))
+    }
+
+    fn read_node(store: &KnowledgeStore, slug: &str) -> TestResult<KnowledgeArtifact> {
+        store
+            .read_artifact(
+                &store.palace_path(&ArtifactId::new(slug)),
+                ArtifactId::new(format!("palace/{slug}")),
+                ArtifactKind::PalaceNode,
+            )
+            .map_err(ctx("read node"))
+    }
+
+    fn expect_invalid(result: Result<String, OpError>, what: &str) -> TestResult {
+        match result {
+            Err(OpError::InvalidArguments(_)) => Ok(()),
+            other => Err(TestError::Unexpected(format!(
+                "{what} must be InvalidArguments, got {other:?}"
+            ))),
+        }
+    }
+
+    #[test]
+    fn edit_is_free_for_provisional_and_needs_confirm_for_established() -> TestResult {
+        let store = temporary_store("edit")?;
+        write_node(&store, "draft", PalaceStatus::Provisional, "alt\n")?;
+        write_node(
+            &store,
+            "truth",
+            PalaceStatus::Established,
+            "alt [[palace/x]]\n",
+        )?;
+
+        run(&store, &["edit", "draft", "neu", "mit", "[[palace/truth]]"])
+            .map_err(ctx("edit provisional"))?;
+        let draft = read_node(&store, "draft")?;
+        assert_eq!(draft.body.trim(), "neu mit [[palace/truth]]");
+        assert_eq!(
+            draft.frontmatter.links,
+            vec![ArtifactId::new("palace/truth")]
+        );
+        assert_eq!(artifact_status(&draft), PalaceStatus::Provisional);
+        assert!(!store.root().join("palace/draft.history.jsonl").exists());
+
+        expect_invalid(
+            run(&store, &["edit", "truth", "anders"]),
+            "unconfirmed edit",
+        )?;
+        assert_eq!(read_node(&store, "truth")?.body.trim(), "alt [[palace/x]]");
+
+        let out = run(&store, &["edit", "truth", "anders", "--confirm"])
+            .map_err(ctx("confirmed edit"))?;
+        assert!(out.contains("Revision 2"), "{out}");
+        let truth = read_node(&store, "truth")?;
+        assert_eq!(truth.body.trim(), "anders");
+        assert!(truth.frontmatter.links.is_empty(), "stale wikilink dropped");
+        assert_eq!(truth.frontmatter.extra["revision"], 2);
+        assert_eq!(artifact_status(&truth), PalaceStatus::Established);
+        let history = std::fs::read_to_string(store.root().join("palace/truth.history.jsonl"))
+            .map_err(ctx("read history"))?;
+        assert_eq!(history.lines().count(), 1);
+        assert!(history.contains("alt [[palace/x]]"), "{history}");
+
+        // Die History-Datei ist kein Palace-Knoten.
+        let listed = run(&store, &["list"]).map_err(ctx("list"))?;
+        assert!(listed.starts_with("2 Palace-Knoten"), "{listed}");
+        std::fs::remove_dir_all(store.root()).ok();
+        Ok(())
+    }
+
+    #[test]
+    fn supersede_retires_the_old_node_and_points_to_the_new_one() -> TestResult {
+        let store = temporary_store("supersede")?;
+        write_node(&store, "old", PalaceStatus::Established, "alt\n")?;
+        write_node(&store, "new", PalaceStatus::Provisional, "neu\n")?;
+        write_node(&store, "draft", PalaceStatus::Provisional, "entwurf\n")?;
+
+        expect_invalid(run(&store, &["supersede", "old", "new"]), "unconfirmed")?;
+        expect_invalid(
+            run(&store, &["supersede", "old", "old", "--confirm"]),
+            "self",
+        )?;
+        expect_invalid(
+            run(&store, &["supersede", "old", "missing", "--confirm"]),
+            "missing",
+        )?;
+        expect_invalid(run(&store, &["supersede", "old"]), "arity")?;
+
+        run(&store, &["supersede", "palace/old", "new", "--confirm"]).map_err(ctx("supersede"))?;
+        let old = read_node(&store, "old")?;
+        assert_eq!(artifact_status(&old), PalaceStatus::Superseded);
+        assert_eq!(old.frontmatter.extra["superseded_by"], "palace/new");
+        assert!(
+            old.frontmatter
+                .links
+                .contains(&ArtifactId::new("palace/new"))
+        );
+        assert_eq!(old.body.trim(), "alt", "history stays readable");
+
+        // Eingefroren: weder edit noch link noch ein zweites supersede.
+        expect_invalid(
+            run(&store, &["edit", "old", "x", "--confirm"]),
+            "edit superseded",
+        )?;
+        expect_invalid(
+            run(&store, &["link", "old", "new", "--confirm"]),
+            "link superseded",
+        )?;
+        // Ein superseded Knoten taugt nicht als Nachfolger.
+        expect_invalid(
+            run(&store, &["supersede", "draft", "old"]),
+            "superseded successor",
+        )?;
+        // Provisional ohne --confirm.
+        run(&store, &["supersede", "draft", "new"]).map_err(ctx("supersede provisional"))?;
+
+        let shown = run(&store, &["show", "new"]).map_err(ctx("show new"))?;
+        assert!(shown.contains("← palace/old"), "{shown}");
+        std::fs::remove_dir_all(store.root()).ok();
+        Ok(())
+    }
+
+    #[test]
+    fn link_appends_a_wikilink_once() -> TestResult {
+        let store = temporary_store("link")?;
+        write_node(&store, "a", PalaceStatus::Provisional, "A\n")?;
+        write_node(&store, "b", PalaceStatus::Established, "B\n")?;
+
+        run(&store, &["link", "a", "b"]).map_err(ctx("link"))?;
+        let a = read_node(&store, "a")?;
+        assert!(a.body.contains("[[palace/b]]"), "{}", a.body);
+        assert_eq!(a.frontmatter.links, vec![ArtifactId::new("palace/b")]);
+        let again = run(&store, &["link", "a", "palace/b"]).map_err(ctx("link again"))?;
+        assert!(again.contains("bereits"), "{again}");
+        assert_eq!(
+            read_node(&store, "a")?.body.matches("[[palace/b]]").count(),
+            1
+        );
+
+        let shown = run(&store, &["show", "b"]).map_err(ctx("show b"))?;
+        assert!(shown.contains("← palace/a"), "{shown}");
+
+        expect_invalid(
+            run(&store, &["link", "b", "a"]),
+            "established link unconfirmed",
+        )?;
+        run(&store, &["link", "b", "a", "--confirm"]).map_err(ctx("confirmed link"))?;
+        expect_invalid(run(&store, &["link", "a", "a"]), "self link")?;
+        expect_invalid(run(&store, &["link", "a", "nope"]), "missing target")?;
+        std::fs::remove_dir_all(store.root()).ok();
+        Ok(())
+    }
+
+    #[test]
+    fn write_subcommands_are_operator_only() -> TestResult {
+        let store = temporary_store("gate")?;
+        write_node(&store, "a", PalaceStatus::Provisional, "A\n")?;
+        write_node(&store, "b", PalaceStatus::Provisional, "B\n")?;
+        let agent = KnowledgeCaller {
+            agent: AgentId::new("root-explorer"),
+            viewer: VisibilityScope::SelfOnly,
+        };
+        for tokens in [
+            vec!["edit", "a", "x"],
+            vec!["link", "a", "b"],
+            vec!["supersede", "a", "b"],
+        ] {
+            match run_palace_as(&store, &agent, &toks(&tokens), jiff::Timestamp::UNIX_EPOCH) {
+                Err(OpError::NotAvailable(_)) => {}
+                other => {
+                    return Err(TestError::Unexpected(format!(
+                        "{tokens:?} must be NotAvailable for an agent, got {other:?}"
+                    )));
+                }
+            }
+        }
+        assert_eq!(read_node(&store, "a")?.body.trim(), "A");
+        std::fs::remove_dir_all(store.root()).ok();
+        Ok(())
+    }
+
+    #[test]
+    fn written_node_id_names_the_changed_node() {
+        assert_eq!(
+            written_node_id(&toks(&["edit", "--confirm", "palace/x", "t"])),
+            Some(Some("palace/x".to_owned()))
+        );
+        assert_eq!(
+            written_node_id(&toks(&["promote", "topic/y"])),
+            Some(Some("palace/y".to_owned()))
+        );
+        assert_eq!(
+            written_node_id(&toks(&["supersede", "a", "b"])),
+            Some(Some("palace/a".to_owned()))
+        );
+        assert_eq!(written_node_id(&toks(&["show", "x"])), None);
+        assert_eq!(written_node_id(&toks(&[])), None);
     }
 }

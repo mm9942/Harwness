@@ -1733,3 +1733,33 @@ fn test_hidden_order_flags_conflict_with_order() {
         );
     }
 }
+
+#[test]
+fn auth_prune_parses_with_and_without_provider() -> TestResult {
+    let all = Cli::try_parse_from(["harw", "auth", "prune"]).map_err(ctx("auth prune"))?;
+    assert!(
+        matches!(
+            all.command,
+            Some(Command::Auth {
+                action: AuthAction::Prune { provider: None },
+                ..
+            })
+        ),
+        "{:?}",
+        all.command
+    );
+    let one = Cli::try_parse_from(["harw", "auth", "prune", "openai"])
+        .map_err(ctx("auth prune openai"))?;
+    assert!(
+        matches!(
+            one.command,
+            Some(Command::Auth {
+                action: AuthAction::Prune { provider: Some(ref name) },
+                ..
+            }) if name == "openai"
+        ),
+        "{:?}",
+        one.command
+    );
+    Ok(())
+}

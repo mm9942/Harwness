@@ -615,6 +615,18 @@ impl AgentToolAdapter {
                 })?;
 
             match &run_result.outcome {
+                TurnOutcome::Completed if run_result.budget_exhausted => {
+                    // Teil C: Teilergebnis statt Fehler, ausdrücklich markiert.
+                    let value = budget_exhausted_value(contract, &run_result, &role, &args);
+                    let text = match &value {
+                        Value::String(text) => text.clone(),
+                        other => other.to_string(),
+                    };
+                    Ok(OpOutput {
+                        text,
+                        data: Some(json!({ "budget_exhausted": true })),
+                    })
+                }
                 TurnOutcome::Completed => {
                     tracing::info!(
                         child = %run_result.child,
@@ -2492,6 +2504,14 @@ async fn fanout_child_value(
         ));
     }
 
+    // Teil C: ein vom Token-Budget beendetes Kind liefert ein Teilergebnis,
+    // keinen Fehler — ohne Reparatur-Turn (dafür ist kein Budget mehr da).
+    if result.budget_exhausted {
+        return Ok(FanoutValue::Final(budget_exhausted_value(
+            contract, result, &role, question,
+        )));
+    }
+
     // Typisierte Contracts parsen den ungekürzten Text (`full_text`), damit
     // ein langes, gültiges JSON nicht an der Rückgabe-Kappung zerbricht.
     let text = full_child_return_text(spawner, result).map_err(|error| {
@@ -2506,6 +2526,91 @@ async fn fanout_child_value(
         bind_finding_to_question(&value, question)?;
     }
     Ok(FanoutValue::Final(value))
+}
+
+/// Hinweistext eines Teilergebnisses nach erschöpftem Token-Budget.
+const BUDGET_EXHAUSTED_NOTE: &str =
+    "Token-Budget erschöpft — das Ergebnis ist ein Teilergebnis und unvollständig";
+
+/// Baut das Fan-out-Ergebnis eines vom Token-Budget beendeten Kindes
+/// (Teil C: Teilergebnis statt Fehler).
+///
+/// # Beschreibung
+/// Die letzte Assistant-Antwort des Kindes (`full_text`) wird zuerst gegen
+/// den Contract geprüft (ohne Reparatur- und Belegungsprüfung); ist sie
+/// gültig, geht sie mit `"budget_exhausted": true` zurück. Sonst:
+/// - [`ChildReturnContract::ResearchFinding`]: ein ausdrücklich als
+///   Teilergebnis gekennzeichnetes Finding (Konfidenz `low`, der Budgethinweis
+///   unter `unresolved_questions`, die Antwort des Kindes als
+///   `conclusion`), an die gestellte Frage gebunden — damit Aufrufer wie
+///   `/explore` es wie jedes Finding weiterverarbeiten können;
+/// - [`ChildReturnContract::Text`]: der Freitext mit vorangestelltem Hinweis;
+/// - sonst ein Objekt `{"budget_exhausted": true, "partial_result": …}`.
+fn budget_exhausted_value(
+    contract: ChildReturnContract,
+    result: &ChildRunResult,
+    role: &str,
+    question: &Value,
+) -> Value {
+    let partial = result.full_text.clone().unwrap_or_default();
+    let partial = cap_child_return_text(&partial, CHILD_RETURN_MAX_BYTES);
+    tracing::warn!(
+        child = %result.child,
+        role,
+        contract = contract.as_label(),
+        partial_bytes = partial.len(),
+        "agent_fanout.budget_exhausted_partial_result"
+    );
+    if contract != ChildReturnContract::Text
+        && let Ok(Value::Object(mut map)) = evaluate_child_return(contract, &partial)
+    {
+        map.insert("budget_exhausted".to_owned(), Value::Bool(true));
+        return Value::Object(map);
+    }
+    match contract {
+        ChildReturnContract::Text => Value::String(if partial.is_empty() {
+            format!("[budget_exhausted: true] {BUDGET_EXHAUSTED_NOTE}; keine Antwort vorhanden.")
+        } else {
+            format!("[budget_exhausted: true] {BUDGET_EXHAUSTED_NOTE}.\n\n{partial}")
+        }),
+        ChildReturnContract::ResearchFinding => {
+            let conclusion = if partial.trim().is_empty() {
+                format!("{BUDGET_EXHAUSTED_NOTE}; das Kind hat noch keine Antwort geliefert.")
+            } else {
+                format!("Teilergebnis ({BUDGET_EXHAUSTED_NOTE}):\n{partial}")
+            };
+            let finding = harw_research::ResearchFinding {
+                question_id: harw_research::QuestionId::new(
+                    open_question_id(question).unwrap_or("unbekannt"),
+                ),
+                conclusion,
+                evidence: Vec::new(),
+                verified_versions: Vec::new(),
+                constraints: Vec::new(),
+                compatibility_notes: Vec::new(),
+                unresolved_questions: vec![BUDGET_EXHAUSTED_NOTE.to_owned()],
+                confidence: harw_research::Confidence::Low,
+                produced_by: role.to_owned(),
+                produced_at: harw_types::Clock::now(&harw_types::SystemClock),
+                likelihood: None,
+                confidence_rationale: BUDGET_EXHAUSTED_NOTE.to_owned(),
+                hypotheses: Vec::new(),
+                key_assumptions: Vec::new(),
+                indicators: Vec::new(),
+                dissent: Vec::new(),
+            };
+            match serde_json::to_value(&finding) {
+                Ok(Value::Object(mut map)) => {
+                    map.insert("budget_exhausted".to_owned(), Value::Bool(true));
+                    Value::Object(map)
+                }
+                _ => json!({ "budget_exhausted": true, "partial_result": partial }),
+            }
+        }
+        ChildReturnContract::ReturnEnvelope | ChildReturnContract::SecurityVerdict => {
+            json!({ "budget_exhausted": true, "partial_result": partial })
+        }
+    }
 }
 
 // ── Contract-/Belegungsauswertung mit Ein-Versuch-Reparatur ─────────────────
@@ -2738,7 +2843,7 @@ async fn evaluate_with_repair(
                 violation.to_message()
             )
         })?;
-    if !matches!(repair_run.outcome, TurnOutcome::Completed) {
+    if !matches!(repair_run.outcome, TurnOutcome::Completed) || repair_run.budget_exhausted {
         return Err(format!(
             "{} (nach 1 Reparaturversuch: der Reparatur-Turn schloss nicht regulär ab, \
              Outcome: {:?})",
@@ -4658,5 +4763,53 @@ contract = "{contract}"
     fn agent_tool_adapter_is_send_and_sync() {
         fn assert_send_sync<T: Send + Sync>() {}
         assert_send_sync::<AgentToolAdapter>();
+    }
+
+    // --- Teil C: Teilergebnis nach erschöpftem Token-Budget ---------------
+
+    fn exhausted_run(text: Option<&str>) -> harw_core::child_controller::ChildRunResult {
+        harw_core::child_controller::ChildRunResult {
+            child: SessionId::new(),
+            outcome: TurnOutcome::Completed,
+            full_text: text.map(ToOwned::to_owned),
+            usage: harw_core::child_controller::ChildUsage::default(),
+            budget_exhausted: true,
+        }
+    }
+
+    #[test]
+    fn a_budget_exhausted_research_child_yields_a_marked_partial_finding() -> TestResult {
+        let question = serde_json::json!({ "question": { "id": "q-7", "text": "Wo?" } });
+        let value = super::budget_exhausted_value(
+            super::ChildReturnContract::ResearchFinding,
+            &exhausted_run(Some("Bisher gefunden: src/lib.rs")),
+            "explorer",
+            &question,
+        );
+        assert_eq!(
+            value.get("budget_exhausted"),
+            Some(&serde_json::Value::Bool(true))
+        );
+        super::bind_finding_to_question(&value, &question).map_err(TestError::Unexpected)?;
+        let finding: harw_research::ResearchFinding = serde_json::from_value(value)
+            .map_err(|error| TestError::Unexpected(error.to_string()))?;
+        assert!(finding.conclusion.contains("Bisher gefunden: src/lib.rs"));
+        assert!(finding.conclusion.contains("Teilergebnis"));
+        assert_eq!(finding.confidence, harw_research::Confidence::Low);
+        assert!(!finding.unresolved_questions.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn a_budget_exhausted_text_child_keeps_its_answer_with_a_marker() {
+        let value = super::budget_exhausted_value(
+            super::ChildReturnContract::Text,
+            &exhausted_run(Some("halbe Antwort")),
+            "worker",
+            &serde_json::Value::Null,
+        );
+        let text = value.as_str().unwrap_or_default();
+        assert!(text.starts_with("[budget_exhausted: true]"), "{text}");
+        assert!(text.ends_with("halbe Antwort"), "{text}");
     }
 }

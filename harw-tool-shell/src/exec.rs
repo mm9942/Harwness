@@ -1161,7 +1161,7 @@ fn host_shell_argv(setsid: Option<&Path>, command: &str) -> (PathBuf, Vec<OsStri
 
 /// Setzt die Standard-Streams für den Sandbox-Start: stdin `/dev/null` (nie das geerbte
 /// Terminal), stdout/stderr als Pipes, SIGKILL beim Drop des `Child`.
-fn configure_stdio(command: &mut TokioCommand) -> &mut TokioCommand {
+pub(crate) fn configure_stdio(command: &mut TokioCommand) -> &mut TokioCommand {
     command
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -1185,7 +1185,7 @@ fn configure_stdio(command: &mut TokioCommand) -> &mut TokioCommand {
 /// Signalauswahl jenseits von [`tokio::process::Child::start_kill`] (immer SIGKILL) —
 /// dafür gibt es in diesem `forbid(unsafe_code)`-Crate ohne neue Abhängigkeit (kein
 /// `nix`/`libc`) keinen sicheren Weg, also bleibt es bei SIGKILL.
-async fn terminate(child: &mut Child) -> Option<ExitStatus> {
+pub(crate) async fn terminate(child: &mut Child) -> Option<ExitStatus> {
     if let Err(err) = child.start_kill() {
         warn!(error = %err, "shell.exec kill failed");
     }

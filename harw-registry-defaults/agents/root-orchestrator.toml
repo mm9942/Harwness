@@ -52,6 +52,21 @@ admitted = [
   # (`harw-core-bridge::delegate_wave`), nicht dieses Crate — siehe
   # `harw_registry_defaults::profile::composition_tools_for_role`.
   "delegate_wave",
+  # Lesende Wissenswerkzeuge (Plan Teil D, Entscheidung der Nutzerin
+  # „Agenten dürfen Workbench, Palace und Diary lesen“): nur lesend,
+  # `ReadWorkspace`. Die Composition-Root montiert sie, sobald ein
+  # Wissensspeicher existiert — siehe
+  # `harw_registry_defaults::profile::knowledge_tools_for_role`.
+  "workbench.show",
+  "diary.read",
+  "palace.search",
+  "palace.recall",
+  # Kanban lesen (Plan D2) — nur UIA-Wurzel und Root-Orchestrator, nicht
+  # auto-freigegeben (jeder Aufruf fragt), und nur auf ausdrücklichen
+  # Wunsch der Nutzerin: nie von selbst Aufgaben aufs Board legen oder
+  # daraus ableiten.
+  "kanban.list",
+  "kanban.show",
 ]
 forbidden = ["fs.write", "shell.exec", "web.fetch", "web.search", "web.docs_rs", "web.crates_io"]
 

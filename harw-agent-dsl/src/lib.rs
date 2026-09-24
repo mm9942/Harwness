@@ -1,7 +1,7 @@
 //! Harwness Agent Definition DSL — Kern-Datentypen, Parser, Loader und Resolver.
 //!
 //! Dieses Crate implementiert den Vertical Slice der Agent-Definition-DSL gemäß
-//! der normativen Spezifikation `agent-definition-dsl.md`.
+//! der normativen Spezifikation `docs/design/agent-definition-dsl.md`.
 //!
 //! # Scope
 //! Enthält: Kern-Datentypen, Parser, Layered-Resolver, Authority-Validator,

@@ -103,7 +103,7 @@ use harw_extension_api::contributors::ToolProvider;
 #[cfg(test)]
 use harw_operations::SharedSessionController;
 use harw_operations::adapter::CommandAdapter;
-use harw_operations::operation::BusyAvailability;
+use harw_operations::operation::{BusyAvailability, BusySubcommand};
 #[cfg(test)]
 use harw_operations::registry::OperationRegistry;
 use harw_operations::{OpContext, PermissionTier, ServiceMap};
@@ -347,50 +347,35 @@ pub(crate) async fn dispatch_slash_command(
 }
 
 /// Klassifiziert eine rohe Eingabezeile in ihre
-/// [`harw_operations::operation::BusyAvailability`] für den Busy-Sofort-Dispatch
-/// (Welle 4b).
+/// [`harw_operations::operation::BusyAvailability`] für den Busy-Dispatch
+/// (Runde 4, Teil H).
 ///
 /// # Beschreibung
 /// Nutzt [`crate::classify_input`] (denselben Parser wie jeder andere
-/// Dispatch-Pfad). Nur [`Invocation::Command`] kann `Immediate` liefern:
+/// Dispatch-Pfad). Nur [`Invocation::Command`] kann `Immediate`/`Staged`
+/// liefern:
 /// - Kein Befehl (`Shell`, `ShellRepeat`, `Note`, `Mention`, `Chat`) →
-///   `DeferredUntilTurnEnd` (diese Formen haben keine `busy`-Metadaten und
-///   sind während eines laufenden Turns ohnehin nicht sicher sofort
-///   ausführbar).
+///   `DeferredUntilTurnEnd`.
 /// - Unbekannter Befehlsname (`registry.find` liefert `None`) →
 ///   `DeferredUntilTurnEnd` — die ehrliche „unbekannter Befehl"-Meldung
 ///   entsteht weiterhin erst im eigentlichen Dispatch, nicht hier.
-/// - Bekannter Befehl (kanonischer Name oder Alias, via [`CommandRegistry::find`]) →
-///   grundsätzlich `spec.busy`.
-///
-/// **Sonderfall `model`/`provider`** (§Auftrag Punkt 3): beide Operationen
-/// sind als `busy = Immediate` markiert, aber nur ihre Anzeige (`show`/
-/// `list`) darf während eines laufenden Turns sofort laufen — `/model
-/// switch ...`, ein bare `/model`/`/model switch` (öffnet den
-/// `ModelSwitchPicker`, der eine Änderung vornimmt) und `/provider test`
-/// müssen weiterhin bis zum Turn-Ende warten. Geprüft wird der **kanonische**
-/// Befehlsname (nach Alias-Auflösung über `spec.name`, nicht der getippte
-/// Alias) gegen das erste Argument-Token aus `Invocation::Command::raw_args`:
-/// - `provider`: `show`/`list` **oder kein Argument** (bare `/provider` ≡
-///   `show`, siehe 4a) → `Immediate`; jedes andere erste Token (z. B. `test`)
-///   → `Deferred`.
-/// - `model`: `show`/`list` → `Immediate`; **kein Argument** (bare `/model`
-///   öffnet den Picker) oder jedes andere erste Token (u. a. `switch`,
-///   egal ob mit oder ohne weiteres Argument) → `Deferred`.
-///
-/// Alle anderen `Immediate`-Befehle (`status, ps, usage, help, diff, work,
-/// review, approve, deny, cancel, stop`, Welle 2d/3d) behalten unverändert
-/// `spec.busy`.
+/// - TUI-lokaler Befehl ohne Operation dahinter → `DeferredUntilTurnEnd`:
+///   einen busy-sicheren lokalen Abfang behandelt der Aufrufer vorher
+///   (`local_intercept_for` in `app.rs`); was dort nicht abgefangen wird, hat
+///   keinen Adapter und kann nur nach dem Turn laufen.
+/// - Bekannter Befehl (kanonischer Name oder Alias) →
+///   [`BusySubcommand::resolve`] über `spec.busy` und die
+///   Unterbefehls-Tabelle `spec.busy_subcommands` mit dem ersten
+///   Argument-Token. Die früher hier fest verdrahteten Sonderfälle für
+///   `model`/`provider` stehen jetzt als `busy_subcommands` an den
+///   `#[operation]`-Deklarationen.
 ///
 /// # Argumente
-/// - `registry` (`&CommandRegistry`): der Dispatch-Katalog, z. B.
-///   `CommandRegistry::from_command_adapters(app.adapters())` bzw.
-///   `CommandRegistry::built_in()`.
-/// - `raw` (`&str`): die rohe, noch nicht abgeschickte oder gerade
-///   abgeschickte Eingabezeile.
+/// - `registry` (`&CommandRegistry`): der Dispatch-Katalog.
+/// - `raw` (`&str`): die abgeschickte Eingabezeile.
 ///
 /// # Rückgabe
-/// Die [`BusyAvailability`] dieser Eingabe für den Busy-Sofort-Dispatch.
+/// Die [`BusyAvailability`] dieser Eingabe.
 #[must_use]
 pub(crate) fn busy_availability_for(registry: &CommandRegistry, raw: &str) -> BusyAvailability {
     let Ok(Invocation::Command { name, raw_args }) = crate::classify_input(raw) else {
@@ -401,18 +386,15 @@ pub(crate) fn busy_availability_for(registry: &CommandRegistry, raw: &str) -> Bu
         return BusyAvailability::DeferredUntilTurnEnd;
     };
 
-    if spec.busy != BusyAvailability::Immediate {
-        return spec.busy;
+    if spec.origin == crate::CommandOrigin::TuiLocal {
+        return BusyAvailability::DeferredUntilTurnEnd;
     }
 
-    let first_arg = raw_args.first().map(String::as_str);
-    match (spec.name.as_str(), first_arg) {
-        ("provider", None | Some("show") | Some("list")) => BusyAvailability::Immediate,
-        ("provider", Some(_)) => BusyAvailability::DeferredUntilTurnEnd,
-        ("model", Some("show") | Some("list")) => BusyAvailability::Immediate,
-        ("model", None | Some(_)) => BusyAvailability::DeferredUntilTurnEnd,
-        (_, _) => BusyAvailability::Immediate,
-    }
+    BusySubcommand::resolve(
+        spec.busy,
+        spec.busy_subcommands,
+        raw_args.first().map(String::as_str),
+    )
 }
 
 /// Baut den [`DispatchContext`] der lokalen TUI.
@@ -2080,10 +2062,10 @@ mod tests {
     }
 
     #[test]
-    fn busy_availability_for_mode_plan_is_deferred() -> TestResult {
+    fn busy_availability_for_mode_plan_is_staged() -> TestResult {
         assert_eq!(
             super::busy_availability_for(&built_in_registry()?, "/mode plan"),
-            BusyAvailability::DeferredUntilTurnEnd
+            BusyAvailability::Staged
         );
         Ok(())
     }
@@ -2098,19 +2080,21 @@ mod tests {
     }
 
     #[test]
-    fn busy_availability_for_model_switch_with_argument_is_deferred() -> TestResult {
+    fn busy_availability_for_model_switch_with_argument_is_staged() -> TestResult {
         assert_eq!(
             super::busy_availability_for(&built_in_registry()?, "/model switch x"),
-            BusyAvailability::DeferredUntilTurnEnd
+            BusyAvailability::Staged
         );
         Ok(())
     }
 
     #[test]
-    fn busy_availability_for_bare_model_is_deferred() -> TestResult {
+    fn busy_availability_for_bare_model_is_staged() -> TestResult {
+        // Getippt öffnet bare `/model` den Picker (lokaler Abfang in `app.rs`);
+        // die Klasse der Operation selbst ist `Staged`.
         assert_eq!(
             super::busy_availability_for(&built_in_registry()?, "/model"),
-            BusyAvailability::DeferredUntilTurnEnd
+            BusyAvailability::Staged
         );
         Ok(())
     }
@@ -2185,6 +2169,206 @@ mod tests {
             super::busy_availability_for(&registry, &format!("/{alias}")),
             BusyAvailability::Immediate
         );
+        Ok(())
+    }
+
+    /// Kurzform einer Busy-Klasse für die Tabelle unten.
+    fn busy_class_name(class: BusyAvailability) -> &'static str {
+        match class {
+            BusyAvailability::Immediate => "immediate",
+            BusyAvailability::Staged => "staged",
+            BusyAvailability::DeferredUntilTurnEnd => "deferred",
+        }
+    }
+
+    /// Erwartete Busy-Klasse **jedes** Befehls im vollständigen TUI-Katalog
+    /// (Operationen plus TUI-lokale Befehle): `(name, klasse, unterbefehle)`,
+    /// `unterbefehle` im Format `sub=klasse` (`-` = bare Form). Jede
+    /// Abweichung — auch ein neuer Befehl ohne Eintrag — bricht die CI
+    /// (Runde 4, Teil H).
+    const EXPECTED_BUSY_CLASSES: &[(&str, &str, &str)] = &[
+        ("add-workdir", "deferred", ""),
+        ("agent", "immediate", ""),
+        ("agents", "immediate", ""),
+        ("approve", "immediate", ""),
+        ("attach", "immediate", ""),
+        ("bug-report", "deferred", ""),
+        ("cancel", "immediate", ""),
+        ("clear", "deferred", ""),
+        ("compact", "deferred", ""),
+        ("context-proposal", "deferred", ""),
+        ("deny", "immediate", ""),
+        (
+            "diary",
+            "deferred",
+            "-=immediate,show=immediate,today=immediate,search=immediate,agents=immediate",
+        ),
+        ("diff", "immediate", ""),
+        (
+            "dream",
+            "deferred",
+            "-=immediate,list=immediate,show=immediate,status=immediate",
+        ),
+        ("effort", "staged", "-=immediate,show=immediate"),
+        ("exit", "deferred", ""),
+        ("export", "deferred", ""),
+        ("help", "immediate", ""),
+        (
+            "kanban",
+            "deferred",
+            "-=immediate,list=immediate,show=immediate,boards=immediate",
+        ),
+        ("keys", "immediate", ""),
+        ("learn", "deferred", ""),
+        ("matrix", "deferred", "show=immediate,list=immediate"),
+        ("memory", "deferred", ""),
+        ("mode", "staged", "-=immediate,show=immediate"),
+        ("model", "staged", "show=immediate,list=immediate"),
+        ("models", "immediate", ""),
+        ("new", "deferred", ""),
+        (
+            "palace",
+            "deferred",
+            "-=immediate,list=immediate,show=immediate,search=immediate",
+        ),
+        (
+            "permissions",
+            "deferred",
+            "-=immediate,show=immediate,mode=immediate,set=immediate",
+        ),
+        (
+            "plugins",
+            "immediate",
+            "install=deferred,activate=deferred,uninstall=deferred",
+        ),
+        ("provider", "immediate", "test=deferred"),
+        ("provider-concurrency", "immediate", ""),
+        ("ps", "immediate", ""),
+        ("quit", "deferred", ""),
+        ("rename", "immediate", ""),
+        ("resume", "deferred", ""),
+        ("retry", "deferred", ""),
+        ("review", "immediate", ""),
+        ("sandbox-lease", "immediate", ""),
+        ("sessions", "deferred", ""),
+        (
+            "skills",
+            "deferred",
+            "-=immediate,list=immediate,show=immediate",
+        ),
+        ("status", "immediate", ""),
+        ("stop", "immediate", ""),
+        ("tools", "deferred", ""),
+        ("uia-effort", "staged", "-=immediate,show=immediate"),
+        (
+            "uia-model",
+            "staged",
+            "-=immediate,show=immediate,list=immediate",
+        ),
+        (
+            "uia-provider",
+            "staged",
+            "-=immediate,show=immediate,list=immediate,test=deferred",
+        ),
+        (
+            "uia-worker-model",
+            "staged",
+            "-=immediate,show=immediate,list=immediate",
+        ),
+        ("usage", "immediate", ""),
+        ("verbose", "immediate", ""),
+        ("whoami", "immediate", ""),
+        ("work", "immediate", ""),
+        ("workbench", "deferred", "-=immediate,show=immediate"),
+    ];
+
+    #[test]
+    fn busy_class_table_covers_every_registered_command() -> TestResult {
+        let registry =
+            built_in_registry()?.with_local_specs(crate::command_catalog::local_command_specs());
+        let mut actual: Vec<(String, &'static str, String)> = registry
+            .specs()
+            .iter()
+            .map(|spec| {
+                let subs = spec
+                    .busy_subcommands
+                    .iter()
+                    .map(|entry| {
+                        format!(
+                            "{}={}",
+                            entry.subcommand.unwrap_or("-"),
+                            busy_class_name(entry.busy)
+                        )
+                    })
+                    .collect::<Vec<_>>()
+                    .join(",");
+                (
+                    spec.name.as_str().to_owned(),
+                    busy_class_name(spec.busy),
+                    subs,
+                )
+            })
+            .collect();
+        actual.sort();
+        let mut expected: Vec<(String, &'static str, String)> = EXPECTED_BUSY_CLASSES
+            .iter()
+            .map(|(name, class, subs)| ((*name).to_owned(), *class, (*subs).to_owned()))
+            .collect();
+        expected.sort();
+        let rendered = actual
+            .iter()
+            .map(|(name, class, subs)| format!("        (\"{name}\", \"{class}\", \"{subs}\"),"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert_eq!(
+            actual, expected,
+            "Busy-Klassen weichen ab; aktueller Stand:\n{rendered}"
+        );
+        Ok(())
+    }
+
+    /// Stichproben über den echten Klassifizierer (inkl. Unterbefehlen).
+    #[test]
+    fn busy_availability_for_resolves_subcommand_tables() -> TestResult {
+        let registry =
+            built_in_registry()?.with_local_specs(crate::command_catalog::local_command_specs());
+        let cases: &[(&str, BusyAvailability)] = &[
+            ("/permissions", BusyAvailability::Immediate),
+            ("/permissions mode auto", BusyAvailability::Immediate),
+            (
+                "/permissions allow shell",
+                BusyAvailability::DeferredUntilTurnEnd,
+            ),
+            ("/skills list", BusyAvailability::Immediate),
+            ("/skills activate x", BusyAvailability::DeferredUntilTurnEnd),
+            ("/workbench show", BusyAvailability::Immediate),
+            (
+                "/workbench pin a.rs",
+                BusyAvailability::DeferredUntilTurnEnd,
+            ),
+            ("/palace search x", BusyAvailability::Immediate),
+            ("/palace promote x", BusyAvailability::DeferredUntilTurnEnd),
+            ("/diary today", BusyAvailability::Immediate),
+            ("/diary note x", BusyAvailability::DeferredUntilTurnEnd),
+            ("/matrix show", BusyAvailability::Immediate),
+            ("/matrix start", BusyAvailability::DeferredUntilTurnEnd),
+            ("/effort show", BusyAvailability::Immediate),
+            ("/effort high", BusyAvailability::Staged),
+            ("/uia-model switch x", BusyAvailability::Staged),
+            ("/plugins list", BusyAvailability::Immediate),
+            ("/plugins install x", BusyAvailability::DeferredUntilTurnEnd),
+            ("/tools", BusyAvailability::DeferredUntilTurnEnd),
+            ("/whoami", BusyAvailability::DeferredUntilTurnEnd),
+            ("/compact", BusyAvailability::DeferredUntilTurnEnd),
+            ("/new", BusyAvailability::DeferredUntilTurnEnd),
+        ];
+        for (raw, expected) in cases {
+            assert_eq!(
+                super::busy_availability_for(&registry, raw),
+                *expected,
+                "{raw}"
+            );
+        }
         Ok(())
     }
 
@@ -2335,12 +2519,9 @@ mod tests {
 
     /// `busy_availability_for_sandbox_lease_is_immediate_without_special_casing`:
     /// bare `/sandbox-lease` and `/sandbox-lease status`/`/sandbox-lease
-    /// revoke` must all classify as `Immediate` via the generic `(_, _) =>
-    /// BusyAvailability::Immediate` fallthrough in
-    /// [`super::busy_availability_for`] — unlike `model`/`provider`, no
-    /// first-argument rule is needed, because every `/sandbox-lease`
-    /// sub-command is safe to dispatch immediately (Contract §Auftrag
-    /// Punkt 3: "sollte nicht" nötig sein).
+    /// revoke` must all classify as `Immediate` via `spec.busy` — without a
+    /// `busy_subcommands` table every sub-command inherits the operation's
+    /// class.
     #[test]
     fn busy_availability_for_sandbox_lease_is_immediate_without_special_casing() {
         let operation = Arc::new(CountingOperation::sandbox_lease_stub());

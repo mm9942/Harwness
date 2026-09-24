@@ -37,6 +37,7 @@ use harw_job_runtime::{JobState, WorkId};
 use crate::artifact::{ArtifactId, ArtifactKind, Frontmatter, KnowledgeArtifact};
 use crate::error::{KnowledgeError, KnowledgeResult};
 use crate::kanban::lifecycle::JobTransitions;
+use crate::lock::KnowledgeLock;
 use crate::store::KnowledgeStore;
 use crate::visibility::{AgentId, AgentRoleRef, VisibilityScope};
 
@@ -127,16 +128,20 @@ pub enum BlockKind {
     Capability,
     Transient,
     ReviewRequired,
+    /// Eine Worker-Karte wartet auf die Freigabe des Operators, bevor der
+    /// Kanban-Worker ihren Rollen-Agenten startet (Plan D2).
+    AwaitingApproval,
 }
 
 impl BlockKind {
     /// Alle Varianten in stabiler Reihenfolge.
-    pub const ALL: [Self; 5] = [
+    pub const ALL: [Self; 6] = [
         Self::Dependency,
         Self::NeedsInput,
         Self::Capability,
         Self::Transient,
         Self::ReviewRequired,
+        Self::AwaitingApproval,
     ];
 
     /// Bezeichnung in der Kommandogrammatik (`--reason=`).
@@ -148,6 +153,7 @@ impl BlockKind {
             Self::Capability => "Capability",
             Self::Transient => "Transient",
             Self::ReviewRequired => "ReviewRequired",
+            Self::AwaitingApproval => "AwaitingApproval",
         }
     }
 
@@ -489,7 +495,7 @@ fn board_toml_path(store: &KnowledgeStore, board_id: &BoardId) -> std::path::Pat
 /// `"kanban"` yields `kanban/<board-id>/cards/<card-id>` — see
 /// [`crate::store::KnowledgeStore::context_proposal_path`]'s doc for the same
 /// convention spelled out on another surface).
-fn kanban_card_artifact_id(board_id: &BoardId, card_id: &CardId) -> ArtifactId {
+pub(crate) fn kanban_card_artifact_id(board_id: &BoardId, card_id: &CardId) -> ArtifactId {
     ArtifactId::new(format!(
         "kanban/{}/cards/{}",
         board_id.as_str(),
@@ -528,8 +534,11 @@ const LEGACY_DERIVED_KEYS: [&str; 3] = ["state", "assignee", "retry_count"];
 ///   eine bestehende Kartendatei ließ sich nicht parsen.
 ///
 /// # Nebenläufigkeit
-/// Kein eigenes Locking; parallele Aufrufe für dieselbe Karte serialisiert
-/// der Aufrufer.
+/// Der Read-Modify-Write-Zyklus läuft unter einer prozessübergreifenden
+/// [`KnowledgeLock`] auf der Kartendatei (`cards/.<card-id>.md.lock`).
+/// Wer eine *neue* Karte anlegt, hält zusätzlich [`lock_board`] um
+/// [`next_card_id`] und `save_card`, damit zwei Prozesse nicht dieselbe Id
+/// vergeben (die Board- und die Kartensperre sind verschiedene Dateien).
 pub fn save_card(
     store: &KnowledgeStore,
     board_id: &BoardId,
@@ -541,6 +550,7 @@ pub fn save_card(
     ensure_component(record.id.as_str())?;
     let path = store.kanban_card_path(board_id.as_str(), record.id.as_str());
     let id = kanban_card_artifact_id(board_id, &record.id);
+    let _lock = KnowledgeLock::for_target(&path)?;
 
     let mut frontmatter = if path.is_file() {
         store
@@ -549,6 +559,26 @@ pub fn save_card(
     } else {
         Frontmatter::new(author_agent_id.clone(), record.visibility.clone(), now)
     };
+    apply_record(&mut frontmatter, record, now);
+
+    let artifact = KnowledgeArtifact::new(
+        id,
+        ArtifactKind::KanbanCard,
+        frontmatter,
+        record.body.clone(),
+    );
+    store.write_artifact(&path, &artifact)?;
+    Ok(artifact)
+}
+
+/// Schreibt die gespeicherten Kartenfelder von `record` in `frontmatter`
+/// (ohne Body) und bereinigt abgeleitete Altfelder; andere `extra`-Schlüssel
+/// (etwa die Anmerkungen aus [`crate::kanban::notes`]) bleiben erhalten.
+pub(crate) fn apply_record(
+    frontmatter: &mut Frontmatter,
+    record: &CardRecord,
+    now: jiff::Timestamp,
+) {
     frontmatter.touch(now);
     frontmatter.visibility = record.visibility.clone();
     frontmatter.tags = record.tags.clone();
@@ -582,15 +612,26 @@ pub fn save_card(
                 .collect(),
         ),
     );
+}
 
-    let artifact = KnowledgeArtifact::new(
-        id,
-        ArtifactKind::KanbanCard,
-        frontmatter,
-        record.body.clone(),
-    );
-    store.write_artifact(&path, &artifact)?;
-    Ok(artifact)
+/// Sperrt ein Board prozessübergreifend (`kanban/boards/<id>/.board.lock`).
+///
+/// # Beschreibung
+/// Für Zyklen über mehrere Dateien eines Boards: `board.toml` lesen und
+/// erweitern ([`save_board`]), eine neue Karten-Id vergeben
+/// ([`next_card_id`]) und die Karte anlegen ([`save_card`], das intern nur
+/// die Kartensperre nimmt). Nicht wiedereintrittsfähig.
+///
+/// # Fehler
+/// [`KnowledgeError::Io`] für eine unsichere Board-Id, `TimedOut` bei
+/// dauerhaft gehaltener Sperre, sonst Anlege-/Sperrfehler.
+pub fn lock_board(store: &KnowledgeStore, board_id: &BoardId) -> KnowledgeResult<KnowledgeLock> {
+    ensure_component(board_id.as_str())?;
+    KnowledgeLock::acquire(
+        &store
+            .kanban_board_dir(board_id.as_str())
+            .join(".board.lock"),
+    )
 }
 
 /// Liest den gespeicherten Datensatz einer Karte (ohne Ledger-Zugriff).
@@ -687,7 +728,7 @@ pub fn next_card_id(store: &KnowledgeStore, board_id: &BoardId) -> KnowledgeResu
 }
 
 /// Lehnt Ids ab, die als Pfadkomponente unter dem Store-Root entkommen könnten.
-fn ensure_component(component: &str) -> KnowledgeResult<()> {
+pub(crate) fn ensure_component(component: &str) -> KnowledgeResult<()> {
     let unsafe_component = component.is_empty()
         || component == "."
         || component == ".."
@@ -704,7 +745,7 @@ fn ensure_component(component: &str) -> KnowledgeResult<()> {
 }
 
 /// Rekonstruiert einen [`CardRecord`] aus einem gespeicherten `KanbanCard`-Artefakt.
-fn record_from_artifact(
+pub(crate) fn record_from_artifact(
     card_id: &CardId,
     artifact: &KnowledgeArtifact,
 ) -> KnowledgeResult<CardRecord> {

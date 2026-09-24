@@ -1,0 +1,99 @@
+# LaTeX-Schreibspezialisierung der UIA (Runde 4, Teil E).
+#
+# Dieselbe Begruendung wie bei `agents/uia-writer.toml`: die Spawn-Matrix
+# (`harw-agent-dsl/src/roles.rs::can_spawn`) laesst die UIA
+# (`AgentRoleId::UserInterface`) ausschliesslich
+# `RootOrchestrator`/`UiaWorker`/`AgentSteward` spawnen — niemals den
+# regulaeren `Worker`. Diese Rolle traegt deshalb `role = "uia-worker"`.
+#
+# ── Werkzeugoberflaeche (Nutzerentscheidung) ─────────────────────────────
+# `RegistryProfile::UiaLatexWriter` (`harw-registry-defaults/src/profile.rs`):
+# alle sechs fs.*-Werkzeuge (inklusive `fs.write`) plus `doc.read_pdf` plus
+# das typisierte `latex.build` (`harw_tool_shell::LatexToolProvider`) —
+# kein `shell.exec`, kein `process.*`, kein `web.*`, kein `deps.*`, kein
+# `explore.*`, kein `lens.ask`, kein `browser.*`. `fs.edit` gibt es in
+# `harw-tool-fs` (noch) nicht; kommt es hinzu, gehoert es in Profil und
+# `admitted`.
+#
+# `latex.build` startet ausschliesslich `latexmk -norc -<engine>
+# -interaction=nonstopmode -halt-on-error -file-line-error
+# -no-shell-escape -cd <datei.tex>` in der Bubblewrap-Sandbox (kein Netz,
+# kein Host-Pfad, Zeitlimit, Ausgabebudget); die Datei muss kanonisch im
+# Workspace liegen. Es verlangt `ExecuteProcess`, steht nicht in der
+# Auto-Freigabe (Freigabe je Aufruf) und installiert nie etwas: fehlt
+# `latexmk` oder die Engine, liefert es `status = "not_installed"` samt
+# `user_message` fuer die Nutzerin.
+#
+# Reducer `reduce_to_read_only` (`AuthorityReducer::ReadOnly`): die Rolle
+# reicht nie Netz, Registry-Quellcache, Schreib- oder Ausfuehrungsrecht
+# weiter. `fs.write` (`WriteWorkspace`) und `latex.build`
+# (`ExecuteProcess`) kommen wie bei `uia-writer`/`uia-shell-worker` allein
+# ueber die feste Profilzuweisung; jede Schreibung und jeder Build laeuft
+# durch die Freigabekette.
+#
+# ── Ablauf ───────────────────────────────────────────────────────────────
+# Erst statisch pruefen (Checkliste im Skill `latex-writing`: Klammer- und
+# `\begin`/`\end`-Balance, `\label`/`\ref`, `\cite`-Keys gegen die `.bib`,
+# fehlende Pakete), dann bauen (Skill `xelatex-compile`), bei Fehler gezielt
+# fixen, hoechstens drei Build-Versuche. Meldet `latex.build`
+# `not_installed`: sofort aufhoeren, nicht weiter probieren, `user_message`
+# woertlich unter „Hinweis fuer die Nutzerin“ zurueckgeben.
+#
+# ── Rueckgabevertrag ─────────────────────────────────────────────────────
+# `harwness.return.execution-summary@1`: geaenderte Dateien, Ergebnis der
+# statischen Pruefung, Build-Status (PDF-Pfad bzw. erste Log-Fehler) und
+# ein Abschnitt „Hinweis fuer die Nutzerin“ (z. B. fehlendes LaTeX), den
+# die UIA weiterreicht.
+
+schema = "harwness.agent/v1"
+id = "harwness.agent.uia-latex-writer@1"
+version = "1.0.0"
+extends = { id = "harwness.agent.worker-base@1" }
+role = "uia-worker"
+specialization = "uia-latex-writer"
+
+name = "UIA LaTeX Writer"
+description = "Schreibt und ueberarbeitet LaTeX-Quellen (.tex/.bib) im Workspace fuer die UIA und baut sie ueber das typisierte latex.build (Sandbox, ohne freie Shell und ohne Netz), unter der zugelassenen Organisationsrolle uia-worker."
+
+[work]
+mode = "delegated-execution"
+may_write_code = true
+may_research_web = false
+
+[tools]
+admitted = [
+  "fs.read",
+  "fs.list",
+  "fs.search",
+  "fs.glob",
+  "fs.grep",
+  "doc.read_pdf",
+  "fs.write",
+  "latex.build",
+]
+forbidden = [
+  "shell.exec",
+  "process.list",
+  "process.kill",
+  "web.fetch",
+  "web.docs_rs",
+  "web.crates_io",
+  "web.search",
+  "deps.graph",
+  "deps.locked",
+  "deps.source_read",
+  "deps.source_search",
+  "deps.source_list",
+  "lens.ask",
+]
+
+[spawn]
+max_depth = 0
+
+[spawn.budget]
+max_tokens = 60000
+max_tool_calls = 40
+max_wall_secs = 180
+
+[return]
+contract = "harwness.return.execution-summary@1"

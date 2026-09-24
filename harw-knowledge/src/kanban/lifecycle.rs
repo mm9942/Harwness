@@ -118,6 +118,31 @@ pub trait JobTransitions: Send + Sync {
     /// Wenn der Job weder `Blocked` noch `Failed` ist.
     fn unblock(&self, work_id: &WorkId) -> KnowledgeResult<()>;
 
+    /// `Blocked { AwaitingApproval } -> Ready` als ausdrückliche Freigabe
+    /// des Operators (Plan D2, Kanban-Worker).
+    ///
+    /// # Beschreibung
+    /// Die Vorgabe ist [`Self::unblock`]. Ein durables Ledger überschreibt
+    /// die Methode und hält die Freigabe so fest, dass ein Worker sie von
+    /// einem bloßen `unblock` unterscheiden kann (`harw-runtime`
+    /// `JobStoreTransitions`: Freigabe-Sidecar mit Kanban-Präfix).
+    ///
+    /// # Argumente
+    /// - `approved_by` (`&AgentId`): wer freigibt (Audit).
+    /// - `note` (`Option<&str>`): optionaler Freitext.
+    ///
+    /// # Fehler
+    /// Wie [`Self::unblock`].
+    fn approve(
+        &self,
+        work_id: &WorkId,
+        approved_by: &AgentId,
+        note: Option<&str>,
+    ) -> KnowledgeResult<()> {
+        let _ = (approved_by, note);
+        self.unblock(work_id)
+    }
+
     /// `Running -> Ready` nach totem/abgelaufenem Halter; zählt einen Versuch.
     ///
     /// # Fehler
@@ -313,6 +338,42 @@ pub fn unblock(jobs: &dyn JobTransitions, card: &mut Card) -> KnowledgeResult<()
     }
     jobs.unblock(&bound_work_id(card)?)?;
     refresh(jobs, card)
+}
+
+/// `Blocked { AwaitingApproval } -> Ready` (Plan D2): die Freigabe einer
+/// Worker-Karte durch den Operator; danach darf der Kanban-Worker den
+/// Rollen-Agenten starten.
+///
+/// # Errors
+/// [`KnowledgeError::IllegalTransition`] unless `card.state` is
+/// `Blocked { AwaitingApproval }`; Fehler aus [`JobTransitions::approve`].
+pub fn approve(
+    jobs: &dyn JobTransitions,
+    card: &mut Card,
+    approved_by: &AgentId,
+    note: Option<&str>,
+) -> KnowledgeResult<()> {
+    if !matches!(
+        card.state,
+        CardState::Blocked {
+            reason_kind: BlockKind::AwaitingApproval
+        }
+    ) {
+        return Err(illegal_transition(card, "ready (approve)"));
+    }
+    jobs.approve(&bound_work_id(card)?, approved_by, note)?;
+    refresh(jobs, card)
+}
+
+/// `true`, wenn die Karte auf die Freigabe des Operators wartet.
+#[must_use]
+pub fn awaits_approval(card: &Card) -> bool {
+    matches!(
+        card.state,
+        CardState::Blocked {
+            reason_kind: BlockKind::AwaitingApproval
+        }
+    )
 }
 
 /// `Running -> Ready` on reclaim (§6.3, "dead/timeout ... [retry-counted]").
@@ -596,6 +657,29 @@ mod tests {
 
         todo_to_ready(&jobs, &mut card, &[CardState::Done])?;
         assert_eq!(card.state, CardState::Ready);
+        Ok(())
+    }
+
+    #[test]
+    fn test_approve_only_frees_a_card_awaiting_approval() -> TestResult {
+        let jobs = InMemoryJobTransitions::new();
+        let mut card = card_in(&jobs, JobState::Blocked)?;
+        let Err(error) = approve(&jobs, &mut card, &holder(), None) else {
+            return Err(TestError::Unexpected(
+                "approve without AwaitingApproval must be illegal".to_owned(),
+            ));
+        };
+        assert!(matches!(error, KnowledgeError::IllegalTransition { .. }));
+
+        let work_id = card.work_id.clone().ok_or(TestError::Missing("work_id"))?;
+        let mut waiting = JobSnapshot::new(JobState::Blocked);
+        waiting.block_reason = Some(BlockKind::AwaitingApproval);
+        jobs.insert(work_id, waiting);
+        let mut card = card.record().view_with(&jobs)?;
+        assert!(awaits_approval(&card));
+        approve(&jobs, &mut card, &holder(), Some("passt"))?;
+        assert_eq!(card.state, CardState::Ready);
+        assert!(!awaits_approval(&card));
         Ok(())
     }
 

@@ -243,7 +243,56 @@ Section-Default zurückgesetzt (Bug); **ÜBERNOMMEN** = explizite Ausnahme
 | `guards.no_progress_rounds_abort` | `Option<u32>` | `None` → `8` | `harness_config.rs:171` | ERSETZT |
 | `guards.plan_stale_rounds` | `Option<u32>` | `None` → `6` | `harness_config.rs:174` | ERSETZT |
 
-**Gesamtzahl dokumentierter `HarnessConfig`-Felder: 92** (Blattfelder inkl.
+### 1.17 `[knowledge]` (`harness_config.rs`, `KnowledgeToml`/`DiaryToml`, Runde 4 Plan D3)
+
+| TOML-Pfad | Typ | Default | Datei:Zeile | Merge heute |
+|---|---|---|---|---|
+| `knowledge.diary.retention_days` | `Option<u32>` | `None` → `90` (`DEFAULT_DIARY_RETENTION_DAYS`) | `harness_config.rs:163` | `ProfileReplaces` (`merge.rs`, `merge_knowledge`) |
+
+Tage, die eine Diary-Tagesdatei bestehen bleibt, bevor die Wartung
+(`harw_knowledge::diary::maintain`, Teil jedes Traumlaufs) sie ins
+Monats-Rollup übernimmt. Die Wartung verdichtet, sie löscht keine Inhalte
+ohne Rollup; darum kein Sicherheitsbezug.
+
+```toml
+[knowledge.diary]
+retention_days = 90
+```
+
+### 1.18 `[dream]` (`harness_config.rs`, `DreamToml`, Runde 4 Plan D5)
+
+| TOML-Pfad | Typ | Default | Datei:Zeile | Merge heute |
+|---|---|---|---|---|
+| `dream.enabled` | `Option<bool>` | `None` → `true` (`DEFAULT_DREAM_ENABLED`) | `harness_config.rs:199` | `ProfileReplaces` |
+| `dream.budget` | `Option<u64>` | `None` → `16384` Token je Lauf (`DEFAULT_DREAM_BUDGET_TOKENS`, mindestens 1) | `harness_config.rs:202` | `ProfileReplaces` |
+| `dream.idle_minutes` | `Option<u32>` | `None` → `15` | `harness_config.rs:205` | `ProfileReplaces` |
+| `dream.cooldown_minutes` | `Option<u32>` | `None` → `60` | `harness_config.rs:208` | `ProfileReplaces` |
+| `dream.schedule` | `Option<String>` | `None` (Leerlauf-Auslösung) | `harness_config.rs:211` | `ProfileReplaces` |
+
+- `enabled` steuert nur den selbständigen Gateway-Scheduler; `/dream run`
+  (TUI, One-Shot) läuft unabhängig davon.
+- `schedule` ist ein optionaler 5-Feld-Cron-Ausdruck in UTC. Gesetzt ersetzt
+  er die Leerlauf-Auslösung (`idle_minutes`); der Mindestabstand
+  (`cooldown_minutes`) gilt weiter. Geprüft wird der Ausdruck erst beim
+  Scheduler (`harw_knowledge::context_steward::DreamSchedule`); ein leerer
+  Wert gilt als nicht gesetzt.
+- Der Scheduler-Zustand (letzter Lauf, laufender Lauf) liegt in
+  `<profile>/knowledge/dreams/state.json` und übersteht einen Neustart;
+  `/dream status` zeigt ihn zusammen mit diesen Werten.
+- Kein Sicherheitsbezug: ein Traumlauf schreibt nur Berichte mit
+  Vorschlägen; jede Übernahme läuft über `/dream review … accept`.
+
+```toml
+[dream]
+enabled = true
+budget = 16384
+idle_minutes = 15
+cooldown_minutes = 60
+# schedule = "0 3 * * *"   # optional, UTC; ersetzt die Leerlauf-Auslösung
+```
+
+**Gesamtzahl dokumentierter `HarnessConfig`-Felder: 98** (Stand Runde 4:
+92 + `knowledge.diary.retention_days` + fünf `[dream]`-Felder; Blattfelder inkl.
 verschachtelter Typen wie `McpPrincipalToml`, `RuleToml`,
 `CargoSandboxToml`/`TmuxSandboxToml`, `InternalModelChoice`,
 `OnboardingSeen`; dazu `base_dir` als zusätzliche Tabellenzeile in Abschnitt 1.1,
@@ -607,7 +656,7 @@ festgelegt**, da sie im heutigen Code an keiner Stelle kodiert sind:
   dritter Wert nie stillschweigend in die Ordnung einsortiert wird;
   abgesichert durch Test #24 (Abschnitt 7h).
 
-### 6.3 Vollständige Feld-für-Feld-Zuordnung (alle 92 Felder)
+### 6.3 Vollständige Feld-für-Feld-Zuordnung (alle 98 Felder, Stand Runde 4)
 
 Eine Zeile je Blattfeld aus Abschnitt 1, in derselben Reihenfolge und mit
 denselben Unterabschnittsnummern, damit die Tabelle 1:1 gegen Abschnitt 1
@@ -753,6 +802,18 @@ Variante.
 | `guards.no_progress_rounds_warn` | Global | `MinBound` |
 | `guards.no_progress_rounds_abort` | Global | `MinBound` |
 | `guards.plan_stale_rounds` | Global | `MinBound` |
+
+**1.17 `[knowledge]`** (1): `knowledge.diary.retention_days` — Profil /
+`ProfileReplaces`.
+
+**1.18 `[dream]`** (5): `dream.enabled`, `.budget`, `.idle_minutes`,
+`.cooldown_minutes`, `.schedule` — alle Profil / `ProfileReplaces`, keines
+sicherheitskritisch (`scope.rs`, `FIELD_TABLE`).
+
+**Nachtrag Runde 4 (Kontrollsumme = 98):** Die sechs neuen Felder aus 1.17
+und 1.18 sind alle `ProfileReplaces`; damit `ProfileReplaces` 50, alle
+übrigen Varianten unverändert. Die folgende Aufstellung beschreibt den Stand
+vor Runde 4.
 
 **Verteilung (Kontrollsumme = 92, Stand 2026-09-24 nach R1/R2-Entscheidung
 plus Ergänzungen `uia_worker_model`, `compaction.max_history_bytes` und

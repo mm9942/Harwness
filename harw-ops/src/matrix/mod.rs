@@ -565,7 +565,11 @@ fn new_run_location(root: &Path, scenario_id: &str) -> (String, PathBuf) {
     summary = "Matrix Game: start, step, auto, pause, inject, override, veto, reveal, fork, end, replay, show, list, compare.",
     domain = "knowledge",
     permission = "operator",
-    command(path = "/matrix", visibility = "channel_reduced")
+    command(
+        path = "/matrix",
+        visibility = "channel_reduced",
+        busy_subcommands = "show=immediate, list=immediate"
+    )
 )]
 async fn matrix(ctx: &OpContext, args: MatrixArgs) -> Result<OpOutput, OpError> {
     let parsed = parse_command(&args.tokens)?;

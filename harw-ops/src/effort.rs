@@ -135,7 +135,12 @@ pub struct EffortArgs {
     domain = "catalog_config",
     permission = "operator",
     category = "model",
-    command(path = "/effort", visibility = "tui_only"),
+    command(
+        path = "/effort",
+        visibility = "tui_only",
+        busy = "staged",
+        busy_subcommands = "-=immediate, show=immediate"
+    ),
 )]
 async fn effort(ctx: &OpContext, args: EffortArgs) -> Result<OpOutput, OpError> {
     let sub = args.level.as_deref().unwrap_or("show");
@@ -316,7 +321,12 @@ fn handle_uia_effort_clear(persist: impl FnOnce(Option<&str>) -> Option<String>)
     domain = "catalog_config",
     permission = "operator",
     category = "model",
-    command(path = "/uia-effort", visibility = "tui_only")
+    command(
+        path = "/uia-effort",
+        visibility = "tui_only",
+        busy = "staged",
+        busy_subcommands = "-=immediate, show=immediate"
+    )
 )]
 async fn uia_effort(ctx: &OpContext, args: EffortArgs) -> Result<OpOutput, OpError> {
     let sub = args.level.as_deref().unwrap_or("show");

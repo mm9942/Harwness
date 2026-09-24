@@ -393,6 +393,49 @@ fn command_without_busy_key_defaults_to_deferred_until_turn_end() {
     assert_eq!(op.meta().busy, BusyAvailability::DeferredUntilTurnEnd);
 }
 
+#[operation(
+    name = "test_busy_subcommands",
+    summary = "Befehl mit Unterbefehls-Klassen.",
+    domain = "misc",
+    permission = "observer",
+    command(
+        path = "/test_busy_subcommands",
+        visibility = "tui_only",
+        busy = "staged",
+        busy_subcommands = "show=immediate, -=immediate, test=deferred"
+    )
+)]
+async fn test_busy_subcommands(
+    _ctx: &OpContext,
+    _args: BusyDefaultArgs,
+) -> Result<OpOutput, OpError> {
+    Ok(OpOutput::from("ok".to_owned()))
+}
+
+#[test]
+fn command_busy_subcommands_override_busy_per_invocation() {
+    use harw_operations::operation::BusyAvailability;
+
+    let op = TestBusySubcommandsOperation;
+    let args = |tokens: &[&str]| -> Vec<String> {
+        tokens.iter().map(|token| (*token).to_owned()).collect()
+    };
+    assert_eq!(op.meta().busy, BusyAvailability::Staged);
+    assert_eq!(op.busy_subcommands().len(), 3);
+    assert_eq!(op.busy_for(&args(&[])), BusyAvailability::Immediate);
+    assert_eq!(op.busy_for(&args(&["show"])), BusyAvailability::Immediate);
+    assert_eq!(
+        op.busy_for(&args(&["switch", "x"])),
+        BusyAvailability::Staged
+    );
+    assert_eq!(
+        op.busy_for(&args(&["test"])),
+        BusyAvailability::DeferredUntilTurnEnd
+    );
+    // Ohne Überschreibung liefert die Trait-Vorgabe eine leere Tabelle.
+    assert!(TestBusyDefaultOperation.busy_subcommands().is_empty());
+}
+
 #[test]
 fn command_model_tool_and_web_surfaces_all_coexist() {
     use harw_operations::{ApprovalPolicy, CommandVisibility, Surface, WebMethod};

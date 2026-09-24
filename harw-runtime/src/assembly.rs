@@ -1033,8 +1033,8 @@ fn narrowed_registry_profile(
 ) -> RuntimeResult<RegistryProfile> {
     use RegistryProfile::{
         AgentStewardship, Full, MatrixReader, MemoryStewardship, NoTools, Planning,
-        ReadOnlyExplore, ReadOnlyResearch, Research, ShellExecution, UiaExplorer, UiaQuickHelper,
-        UiaShellWorker, UiaWriter, WorkspaceEdit,
+        ReadOnlyExplore, ReadOnlyResearch, Research, ShellExecution, UiaExplorer, UiaLatexWriter,
+        UiaQuickHelper, UiaShellWorker, UiaWriter, WorkspaceEdit,
     };
 
     match (entry_profile, requested) {
@@ -1146,9 +1146,15 @@ fn narrowed_registry_profile(
         // `ReadOnlyResearch` (researcher / dependency-researcher) ist wie
         // `Research` ein reines Kind-Profil mit Netz: kein Einstieg darf
         // auf es verengen, und es selbst verengt nie. `MatrixReader`
-        // (Matrix-Sitze) ist ebenso ein reines Kind-Profil.
-        | (ReadOnlyExplore | Research | ReadOnlyResearch | Planning | MatrixReader, _)
-        | (_, ReadOnlyResearch | MatrixReader) => Err(RuntimeError::Registry {
+        // (Matrix-Sitze) ist ebenso ein reines Kind-Profil, genauso
+        // `UiaLatexWriter` (Runde 4, Teil E: `latex.build` gibt es nur als
+        // gespawntes UIA-Kind, nie als Einstiegsverengung).
+        | (
+            ReadOnlyExplore | Research | ReadOnlyResearch | Planning | MatrixReader
+            | UiaLatexWriter,
+            _,
+        )
+        | (_, ReadOnlyResearch | MatrixReader | UiaLatexWriter) => Err(RuntimeError::Registry {
             detail: format!(
                 "refusing to narrow entry {entry:?} from registry profile {entry_profile:?} \
                  to {requested:?}: a narrowing may only reduce the tool set"
@@ -1961,9 +1967,23 @@ impl RuntimeAssemblyBuilder {
             let default_model_id = config.harness.default_model.as_deref().unwrap_or_default();
             let ceiling = harw_registry_defaults::agent_definition_tools::DefinitionAuthorCeiling {
                 role: AgentRoleId::UserInterface,
+                // Plan Teil D: die lesenden Wissenswerkzeuge trägt die UIA
+                // selbst (Schritt 12a–12a'''), also darf sie sie auch in
+                // Definitionen vergeben — nur mit `ReadWorkspace` in der
+                // Sandbox. Kanban bleibt außen vor (nur auf Nutzerwunsch).
                 tools: registry_profile
                     .tool_names_for(sandbox.permissions())
                     .into_iter()
+                    .chain(
+                        harw_registry_defaults::profile::KNOWLEDGE_READ_TOOLS
+                            .iter()
+                            .copied()
+                            .filter(|_| {
+                                sandbox
+                                    .permissions()
+                                    .contains(harw_authority::Permission::ReadWorkspace)
+                            }),
+                    )
                     .map(str::to_owned)
                     .collect(),
                 permissions: sandbox.permissions().clone(),
@@ -2112,6 +2132,23 @@ impl RuntimeAssemblyBuilder {
         let mut provider_load_registry: ProviderLoadRegistry = uia_load_registry;
         provider_load_registry.extend(root_load_registry);
         let root_session_id = root_session_id.unwrap_or_else(SessionId::new);
+        // Plan Teil D: der Wissensspeicher des Profils entsteht **vor** dem
+        // Spawner, damit Wurzel (Schritt 11/12a) und Kind-Registries
+        // dieselbe Instanz teilen. Er legt nichts an; ohne auflösbares
+        // Profilverzeichnis bleibt er `None` (die Dienste bauen ihn dann wie
+        // bisher aus dem Home-Kontext, und Kinder bekommen keine
+        // Wissenswerkzeuge).
+        let knowledge_store = profile_dir(&spec.home, &profile_name).ok().map(|dir| {
+            Arc::new(harw_knowledge::KnowledgeStore::new(
+                &harw_home::knowledge_dir(&dir),
+            ))
+        });
+        let child_knowledge = knowledge_store.as_ref().map(|store| {
+            (
+                Arc::clone(store),
+                crate::services::kanban_transitions(stores.job_store.as_ref(), &spec.principal),
+            )
+        });
         let (spawner, spawner_roles) = build_spawner(
             profile.spawner,
             SpawnerInputs {
@@ -2121,6 +2158,7 @@ impl RuntimeAssemblyBuilder {
                 model: &default_tree_model,
                 uia_worker_model: &uia_worker_model,
                 root_session_id: &root_session_id,
+                root_model_id: root_model_id.clone(),
                 spawn_context: &spawn_context,
                 reasoning_effort: spec.reasoning_effort,
                 activation: &activation,
@@ -2147,6 +2185,8 @@ impl RuntimeAssemblyBuilder {
                 // Welle 4: die vertrauten Config-Layer, aus denen die
                 // Kind-Fabriken die Skill-Verzeichnisse auflösen.
                 skill_roots: trust_report.layers.clone(),
+                // Plan Teil D: lesende Wissenswerkzeuge der Kinder.
+                knowledge: child_knowledge,
             },
             session_events,
         )?;
@@ -2238,36 +2278,66 @@ impl RuntimeAssemblyBuilder {
                 detail: error.to_string(),
             })?,
         );
-        let services = Arc::new(
-            RuntimeServices::new(RuntimeServicesParts {
-                operations: Arc::clone(&operations),
-                state_store: Arc::clone(&stores.state_store),
-                job_store: stores.job_store.clone(),
-                spawner: spawner.clone(),
-                memory,
-                config: Arc::clone(&config),
-                plan: plan_services,
-                approval_mode: approval_mode.clone(),
-                allow_rules: allow_rules.clone(),
-                extra_roots: extra_roots.clone(),
-                principal: spec.principal.clone(),
-                session_controller,
-                provider_load_registry: provider_load_registry.clone(),
-                // Teil B3: derselbe Wurzel-Ledger/-Registry/-Sender wie
-                // `Self::host_permit_ledger`/`host_permit_session_registry`/
-                // `host_permit_prompt_sender` (siehe deren Accessoren unten) —
-                // nur `Arc::clone`/Sender-Klon, kein zweiter Ledger. Der
-                // `RuntimeAssembly`-Literal am Ende dieser Funktion bewegt die
-                // ungeklonten Originale, darum wird hier geklont statt bewegt.
-                host_permit_handles: Some(Arc::new(HostPermitHandles {
-                    ledger: Arc::clone(&host_permit_ledger),
-                    registry: Arc::clone(&host_permit_registry),
-                    prompts: Some(host_permit_prompt_sender.clone()),
-                })),
-            })
-            .with_home_context(home_context)
-            .with_agent_events(Arc::new(agent_events.clone())),
-        );
+        let services = RuntimeServices::new(RuntimeServicesParts {
+            operations: Arc::clone(&operations),
+            state_store: Arc::clone(&stores.state_store),
+            job_store: stores.job_store.clone(),
+            spawner: spawner.clone(),
+            memory,
+            config: Arc::clone(&config),
+            plan: plan_services,
+            approval_mode: approval_mode.clone(),
+            allow_rules: allow_rules.clone(),
+            extra_roots: extra_roots.clone(),
+            principal: spec.principal.clone(),
+            session_controller,
+            provider_load_registry: provider_load_registry.clone(),
+            // Teil B3: derselbe Wurzel-Ledger/-Registry/-Sender wie
+            // `Self::host_permit_ledger`/`host_permit_session_registry`/
+            // `host_permit_prompt_sender` (siehe deren Accessoren unten) —
+            // nur `Arc::clone`/Sender-Klon, kein zweiter Ledger. Der
+            // `RuntimeAssembly`-Literal am Ende dieser Funktion bewegt die
+            // ungeklonten Originale, darum wird hier geklont statt bewegt.
+            host_permit_handles: Some(Arc::new(HostPermitHandles {
+                ledger: Arc::clone(&host_permit_ledger),
+                registry: Arc::clone(&host_permit_registry),
+                prompts: Some(host_permit_prompt_sender.clone()),
+            })),
+        });
+        // Plan Teil D: dieselbe Speicher-Instanz wie die Kind-Registries;
+        // `with_home_context` legt nur dann einen eigenen an, wenn hier
+        // keiner gesetzt wurde.
+        let services = match &knowledge_store {
+            Some(store) => services.with_knowledge_store(Arc::clone(store)),
+            None => services,
+        }
+        .with_home_context(Arc::clone(&home_context))
+        .with_agent_events(Arc::new(agent_events.clone()));
+        // 11a. Traum-Starter für `/dream run` (Plan D5) — nur für die
+        //      interaktiven Einstiege (TUI, One-Shot). Der Gateway-Traum
+        //      (`EntryKind::GatewayDream`) hat seinen eigenen Scheduler; alle
+        //      übrigen Einstiege bekommen keinen Starter, `/dream run` meldet
+        //      dort sauber „nicht verfügbar“. Ohne `KnowledgeStore` gibt es
+        //      nichts zu träumen.
+        let services = match (
+            matches!(spec.entry, EntryKind::Tui | EntryKind::OneShot),
+            services.knowledge_store().cloned(),
+        ) {
+            (true, Some(knowledge)) => {
+                services.with_dream_launcher(Arc::new(crate::dream_run::RuntimeDreamLauncher::new(
+                    Arc::clone(&model),
+                    knowledge,
+                    stores.job_store.clone(),
+                    crate::dream_run::transcript_root_for_profile(
+                        &home_context.profile_dir,
+                        &config,
+                    ),
+                    Arc::clone(&config),
+                )))
+            }
+            _ => services,
+        };
+        let services = Arc::new(services);
 
         // 12. Modell-Tool-Fläche der Operationen — **nur** für
         //     `OperationSurface::AllWithModelTools`.
@@ -2297,12 +2367,114 @@ impl RuntimeAssemblyBuilder {
                 .iter()
                 .flatten()
                 .all(|needed| sandbox.permissions().contains(*needed));
+        //      Neben den beiden Schreib-Notizwerkzeugen bekommt die Wurzel
+        //      das lesende `workbench.show` (auf das gebundene Projekt
+        //      gedeckelt) und den Workbench-Kontext (Plan D1).
         let registry_builder = match services.knowledge_store() {
-            Some(store) if workbench_allowed => registry_builder.tool_provider(Arc::new(
-                harw_registry_defaults::WorkbenchToolProvider::new(Arc::clone(store)),
+            Some(store) if workbench_allowed => registry_builder
+                .tool_provider(Arc::new(
+                    harw_registry_defaults::WorkbenchToolProvider::new(Arc::clone(store)),
+                ))
+                .tool_provider(Arc::new(
+                    harw_registry_defaults::WorkbenchReadToolProvider::new(Arc::clone(store))
+                        .with_project(harw_knowledge::workbench::WorkbenchScope::project_for_path(
+                            &bound_root,
+                        )),
+                ))
+                .context_provider(Arc::new(
+                    harw_registry_defaults::WorkbenchContextProvider::new(Arc::clone(store)),
+                ))
+                .map_err(|error| RuntimeError::Registry {
+                    detail: format!("could not register the workbench context provider: {error}"),
+                })?,
+            _ => registry_builder,
+        };
+
+        // 12a'. Palace-Lesewerkzeuge (Plan D4): `palace.search`/`palace.recall`
+        //       zeigen nur `established`-Knoten mit gedeckelten Hops. Dieselbe
+        //       Zulassung wie die Workbench (Rechteklasse `ReadWorkspace`,
+        //       kein `NoTools`, kein Telegram-`WorkspaceEdit` — ein entfernter
+        //       Chat liest kein Palace).
+        let palace_allowed = !matches!(
+            registry_profile,
+            RegistryProfile::NoTools | RegistryProfile::WorkspaceEdit
+        ) && harw_registry_defaults::PalaceToolProvider::TOOL_PERMISSIONS
+            .iter()
+            .flatten()
+            .all(|needed| sandbox.permissions().contains(*needed));
+        let registry_builder = match services.knowledge_store() {
+            Some(store) if palace_allowed => registry_builder.tool_provider(Arc::new(
+                harw_registry_defaults::PalaceToolProvider::new(Arc::clone(store)),
             )),
             _ => registry_builder,
         };
+
+        // 12a''. Kanban-Lesewerkzeuge (Plan D2): `kanban.list`/`kanban.show`
+        //        lesen Boards und Karten; der Kartenzustand kommt nur lesend
+        //        aus dem Job-Ledger (`JobTransitions::snapshot`). Entscheidung
+        //        der Nutzerin: Kanban nur auf ihren ausdrücklichen Wunsch —
+        //        deshalb nur für die interaktive TUI-Wurzel (UIA) oder einen
+        //        explizit gewählten Wurzel-Agenten, dessen Definition die
+        //        Werkzeuge admittiert (heute nur `root-orchestrator`), und nie
+        //        auto-freigegeben (jeder Aufruf fragt). Sonst wie die
+        //        Workbench (kein Telegram, `ReadWorkspace`).
+        let kanban_root = match agent_ir.as_ref() {
+            Some(_) => harw_registry_defaults::KanbanReadToolProvider::TOOL_NAMES
+                .iter()
+                .all(|tool| activation.is_tool_enabled(&ToolName::new((*tool).to_owned()))),
+            None => spec.entry == EntryKind::Tui,
+        };
+        let kanban_allowed = kanban_root
+            && !matches!(
+                registry_profile,
+                RegistryProfile::NoTools | RegistryProfile::WorkspaceEdit
+            )
+            && harw_registry_defaults::KanbanReadToolProvider::TOOL_PERMISSIONS
+                .iter()
+                .flatten()
+                .all(|needed| sandbox.permissions().contains(*needed));
+        let registry_builder = match services.knowledge_store() {
+            Some(store) if kanban_allowed => registry_builder.tool_provider(Arc::new(
+                harw_registry_defaults::KanbanReadToolProvider::new(Arc::clone(store))
+                    .with_ledger(services.kanban_ledger(ServiceSurface::ModelTool)),
+            )),
+            _ => registry_builder,
+        };
+
+        // 12a'''. Diary (Plan D3): automatische Einträge über den
+        //         `DiaryRecorder` (Sitzungsende, Verdichtung) und das lesende
+        //         `diary.read`, das nur die Einträge des Wurzel-Agenten zeigt —
+        //         dieselbe Agent-Id bekommen Recorder und Werkzeug. Der
+        //         Recorder schreibt unabhängig von der Werkzeugfläche, sobald
+        //         ein `KnowledgeStore` existiert; das Werkzeug folgt der
+        //         Workbench-Zulassung (gleiche Rechteklasse, kein Telegram).
+        let diary_agent = harw_knowledge::AgentId::new(
+            root_skill_agent
+                .clone()
+                .unwrap_or_else(|| "root".to_owned()),
+        );
+        let diary_recorder = services.knowledge_store().map(|store| {
+            Arc::new(
+                crate::diary_wiring::DiaryRecorder::new(Arc::clone(store), diary_agent.clone())
+                    .with_agent_events(agent_events.clone()),
+            )
+        });
+        let diary_allowed = !matches!(
+            registry_profile,
+            RegistryProfile::NoTools | RegistryProfile::WorkspaceEdit
+        ) && harw_registry_defaults::DiaryToolProvider::TOOL_PERMISSIONS
+            .iter()
+            .flatten()
+            .all(|needed| sandbox.permissions().contains(*needed));
+        let registry_builder = match services.knowledge_store() {
+            Some(store) if diary_allowed => registry_builder.tool_provider(Arc::new(
+                harw_registry_defaults::DiaryToolProvider::new(Arc::clone(store), diary_agent),
+            )),
+            _ => registry_builder,
+        };
+        if let Some(recorder) = &diary_recorder {
+            lifecycle_hooks.push(Arc::clone(recorder) as Arc<dyn SessionLifecycleHook>);
+        }
 
         // 12b. Handoff-Kontext: liest, falls vorhanden,
         //     `<home_project>/.harw/handoff.json` (siehe
@@ -2414,6 +2586,7 @@ impl RuntimeAssemblyBuilder {
             tools,
             root_session_id,
             memory_capture,
+            diary_recorder,
             guard_policy,
             role_effort_weights,
             root_uia_reasoning_effort_defaults,
@@ -2611,9 +2784,9 @@ fn resolve_root_uia_reasoning_effort_defaults(
 /// ist oder kein abweichender `uia_provider`/`uia_model` konfiguriert ist),
 /// und leitet daraus über [`crate::model::build_uia_worker_model`] das
 /// Modell der gesamten `uia-worker`-Rollenfamilie ab (`uia-worker`,
-/// `uia-explorer`, `uia-writer`, `uia-shell-worker`) — dieselbe Ableitung,
-/// die `build_spawner`s `uia_worker_factory` (Teil A, Schritt 4) anschließend
-/// registriert.
+/// `uia-explorer`, `uia-writer`, `uia-shell-worker`, `uia-latex-writer`) —
+/// dieselbe Ableitung, die `build_spawner`s `uia_worker_factory` (Teil A,
+/// Schritt 4) anschließend registriert.
 ///
 /// # Arguments
 /// - `spec` / `config` / `resolver`: wie
@@ -3417,9 +3590,13 @@ fn normalize_model_id(model_id: &str) -> String {
 /// 1. exakter Treffer;
 /// 2. Treffer nach [`normalize_model_id`] auf beiden Seiten (Provider-Präfix,
 ///    Datums-/`-latest`-Suffix, Groß-/Kleinschreibung);
-/// 3. längster Katalogschlüssel, dessen normalisierte Form ein Präfix der
+/// 3. Treffer, wenn beide Seiten nach [`version_dots_to_dashes`] gleich sind
+///    (Teil C: OpenRouter-Schreibweise `anthropic/claude-sonnet-4.5` →
+///    `claude-sonnet-4-5-20250929`);
+/// 4. längster Katalogschlüssel, dessen normalisierte Form ein Präfix der
 ///    normalisierten Kennung ist und an einer Trennstelle (`-`, `.`, `:`,
-///    `@`, `_`, `[`) endet (`gpt-4o-mini-high` → `gpt-4o-mini`).
+///    `@`, `_`, `[`) endet (`gpt-4o-mini-high` → `gpt-4o-mini`); verglichen
+///    wird dabei ebenfalls in der Form mit `-` statt Versionspunkt.
 ///
 /// Bei gleich langen Präfix-Treffern gewinnt der lexikografisch kleinste
 /// Schlüssel, damit das Ergebnis nicht von der `HashMap`-Reihenfolge abhängt.
@@ -3438,7 +3615,9 @@ where
     if wanted.is_empty() {
         return None;
     }
+    let wanted_dashed = version_dots_to_dashes(&wanted);
     let mut normalized_hit: Option<&'a str> = None;
+    let mut dashed_hit: Option<&'a str> = None;
     let mut prefix_hit: Option<(usize, &'a str)> = None;
     for key in keys {
         let normalized = normalize_model_id(key);
@@ -3451,8 +3630,15 @@ where
             }
             continue;
         }
-        let at_boundary = wanted
-            .strip_prefix(normalized.as_str())
+        let dashed = version_dots_to_dashes(&normalized);
+        if dashed == wanted_dashed {
+            if dashed_hit.is_none_or(|current| key < current) {
+                dashed_hit = Some(key);
+            }
+            continue;
+        }
+        let at_boundary = wanted_dashed
+            .strip_prefix(dashed.as_str())
             .is_some_and(|rest| rest.starts_with(['-', '.', ':', '@', '_', '[']));
         if at_boundary {
             let better = match prefix_hit {
@@ -3466,7 +3652,26 @@ where
             }
         }
     }
-    normalized_hit.or(prefix_hit.map(|(_, key)| key))
+    normalized_hit
+        .or(dashed_hit)
+        .or(prefix_hit.map(|(_, key)| key))
+}
+
+/// Ersetzt jeden Punkt zwischen zwei Ziffern durch `-` (`claude-sonnet-4.5`
+/// → `claude-sonnet-4-5`, `gpt-5.4` → `gpt-5-4`). Anbieter schreiben
+/// Versionsnummern mal mit Punkt, mal mit Bindestrich; der Katalogabgleich
+/// ([`match_catalog_key`]) vergleicht deshalb zusätzlich in dieser Form.
+fn version_dots_to_dashes(id: &str) -> String {
+    let bytes = id.as_bytes();
+    id.char_indices()
+        .map(|(index, character)| {
+            let between_digits = character == '.'
+                && index > 0
+                && bytes.get(index - 1).is_some_and(u8::is_ascii_digit)
+                && bytes.get(index + 1).is_some_and(u8::is_ascii_digit);
+            if between_digits { '-' } else { character }
+        })
+        .collect()
 }
 
 /// Kontext-/Ausgabegrenzen eines Modells.
@@ -3668,13 +3873,18 @@ struct SpawnerInputs<'a> {
     /// trägt deren ggf. abweichendes Modell separat).
     model: &'a Arc<dyn ModelProvider>,
     /// Das Modell der `uia-worker`-Rollenfamilie (Welle 3a, Teil A):
-    /// `uia-worker`, `uia-explorer`, `uia-writer`, `uia-shell-worker`. Ohne
+    /// `uia-worker`, `uia-explorer`, `uia-writer`, `uia-shell-worker`,
+    /// `uia-latex-writer`. Ohne
     /// aktive UIA identisch zu [`Self::model`] (`Arc::clone`); mit aktiver
     /// UIA das über [`crate::model::build_uia_worker_model`] abgeleitete
     /// Modell (siehe [`split_root_and_uia_worker_models`]).
     uia_worker_model: &'a Arc<dyn ModelProvider>,
     /// Die Kennung der Wurzelsitzung, unter der der Spawner sie registriert.
     root_session_id: &'a SessionId,
+    /// Das Modell, das die Wurzelsitzung treibt ([`effective_root_model_id`]);
+    /// Teil C: Rückfall für das Kind-Modell und Hauptmodell der
+    /// UIA-Worker-Fabrik.
+    root_model_id: Option<String>,
     /// Der eine Spawn-Kontext des Laufs (Sandbox, Trace, Decke).
     spawn_context: &'a SpawnContext,
     /// Der gewählte Reasoning-Effort, falls einer gesetzt ist.
@@ -3724,6 +3934,11 @@ struct SpawnerInputs<'a> {
     /// [`RuntimeChildRegistryFactory::with_skill_catalog`] an `factory`
     /// **und** `uia_worker_factory` durch (Welle 4, Skills erreichen Kinder).
     skill_roots: Vec<PathBuf>,
+    /// Wissensspeicher und Kanban-Ledger für die lesenden Wissenswerkzeuge
+    /// der Kinder (Plan Teil D); reicht über
+    /// [`RuntimeChildRegistryFactory::with_knowledge`] an `factory` **und**
+    /// `uia_worker_factory`. `None` → kein Kind bekommt sie.
+    knowledge: Option<crate::children::ChildKnowledgeSource>,
 }
 
 /// Montiert den Spawner eines Laufs nach seiner [`SpawnerPolicy`].
@@ -3752,6 +3967,7 @@ fn build_spawner(
         model,
         uia_worker_model,
         root_session_id,
+        root_model_id,
         spawn_context,
         reasoning_effort,
         activation,
@@ -3765,6 +3981,7 @@ fn build_spawner(
         state_store,
         agent_events,
         skill_roots,
+        knowledge,
     } = inputs;
 
     let events = session_events.ok_or_else(|| RuntimeError::Spawner {
@@ -3774,6 +3991,16 @@ fn build_spawner(
     })?;
 
     let spawner_slot = Arc::new(std::sync::OnceLock::new());
+    // Teil C: die Modelle, die ungepinnte Kinder tatsächlich rufen. Der
+    // Wurzel-Baum spricht das effektive Vorgabemodell an (inklusive Rückfall
+    // auf das erste nutzbare Katalogmodell); die Wurzel selbst ggf. das
+    // UIA-Modell. Ist das Wurzelmodell nur das rohe Vorgabemodell, gilt
+    // dessen effektive Auflösung.
+    let default_model_id = crate::model::effective_default_model_id(config);
+    let root_model_id = match root_model_id {
+        Some(model) if Some(&model) != config.harness.default_model.as_ref() => Some(model),
+        _ => default_model_id.clone(),
+    };
     let factory: Arc<dyn ChildRegistryFactory> = Arc::new(
         RuntimeChildRegistryFactory::with_definitions(
             project.clone(),
@@ -3800,11 +4027,14 @@ fn build_spawner(
             config.harness.default_provider.clone(),
             config.harness.default_model.clone(),
         )
+        // Teil C: das Modell, das ein ungepinntes Kind dieser Fabrik ruft.
+        .with_effective_main_model(default_model_id.clone())
         // B: `delegate_wave` der Orchestrator-Kinder braucht denselben
         // StateStore wie die Wurzel (den Spawner löst die Fabrik selbst über
         // den Spawner-Slot auf).
         .with_delegate_wave_store(Arc::clone(&state_store))
-        .with_skill_catalog(config, skill_roots.clone())?,
+        .with_skill_catalog(config, skill_roots.clone())?
+        .with_optional_knowledge(knowledge.clone()),
     );
     // Welle 3a, Teil A: eine zweite Fabrik-Instanz, ausschließlich für die
     // `uia-worker`-Rollenfamilie (`AgentRoleId::UiaWorker`). Gleiches Projekt,
@@ -3849,7 +4079,11 @@ fn build_spawner(
         // `uia-worker`-Familie).
         .with_host_permits(sandbox_profile.clone(), host_permit_wiring.clone())
         .with_main_model_selection(uia_worker_provider, uia_worker_model_id)
-        .with_skill_catalog(config, skill_roots.clone())?,
+        // Teil C: ohne gültigen `uia_worker_model`-Pin ruft die Familie das
+        // Modell der UIA-Sitzung (ohne aktive UIA: das Vorgabemodell).
+        .with_effective_main_model(root_model_id.clone())
+        .with_skill_catalog(config, skill_roots.clone())?
+        .with_optional_knowledge(knowledge),
     );
 
     let model_id = config.harness.default_model.as_deref().unwrap_or_default();
@@ -3857,16 +4091,27 @@ fn build_spawner(
         SessionManager::new(events).with_agent_events(agent_events.clone()),
     ));
     let window_config = Arc::new(config.clone());
+    let probe_config = Arc::clone(&window_config);
+    let window_default = default_model_id.clone();
+    let probe_default = default_model_id.clone();
     let mut spawner = ManagedAgentSpawner::new(manager, child_limits(config, model_id))
-        // Jedes Kind bekommt das Kontextfenster seines tatsächlichen Modells.
+        // Jedes Kind bekommt das Kontextfenster seines tatsächlichen Modells
+        // (Teil C: ohne Modell das effektive Vorgabemodell des Wurzel-Baums,
+        // nicht das rohe `default_model`).
         .with_context_window_resolver(Arc::new(move |model: Option<&str>| {
-            model_limits_or_fallback(
-                &window_config,
-                model,
-                window_config.harness.default_model.as_deref(),
-            )
-            .context_window
+            model_limits_or_fallback(&window_config, model, window_default.as_deref())
+                .context_window
         }))
+        // Teil C: ein unbekanntes Kind-Modell (Rückfallfenster) meldet die
+        // Admission laut im Trace und im Agent-Panel.
+        .with_model_known_probe(Arc::new(move |model: Option<&str>| {
+            model
+                .or(probe_default.as_deref())
+                .is_some_and(|model| model_limits_for(&probe_config, model).known)
+        }))
+        // Teil C: Rückfall für das Kind-Modell, wenn weder Rollen-Pin noch
+        // Fabrik-Hauptmodell bekannt sind.
+        .with_root_model(root_model_id.clone())
         // Welle 3: dieselbe feste Verdichtungs-Obergrenze wie die Wurzel
         // (`[compaction] absolute_ceiling_tokens`, sonst Kern-Vorgabe).
         .with_compaction_ceiling(Some(configured_compaction_ceiling(config)))
@@ -4004,6 +4249,11 @@ pub struct RuntimeAssembly {
     /// [`Self::new_root_session`] hängt daraus, falls gesetzt, einen
     /// [`crate::memory_wiring::MemoryCaptureObserver`] an die Wurzelsitzung.
     memory_capture: Option<Arc<harw_memory::capture::ProjectMemoryCapture>>,
+    /// Automatische Diary-Einträge der Wurzelsitzung (Plan D3), `None` ohne
+    /// `KnowledgeStore`. Steht zusätzlich in [`Self::lifecycle_hooks`]
+    /// (Sitzungsende); [`Self::new_root_session`] kettet daraus die
+    /// Verdichtungs- und Turn-Beobachter und meldet den Sitzungsstart.
+    diary_recorder: Option<Arc<crate::diary_wiring::DiaryRecorder>>,
     /// Wächter-Schwellen dieses Laufs (Addendum F+G), aus `[guards]`
     /// aufgelöst über [`crate::guard_wiring::guard_policy_from_config`].
     /// [`Self::new_root_session`] hängt sie über `with_guard_policy` an die
@@ -4592,6 +4842,9 @@ impl RuntimeAssembly {
             } else {
                 self.spec.reasoning_effort
             };
+        if let Some(recorder) = &self.diary_recorder {
+            recorder.session_started(&id, None);
+        }
         let mut session =
             AgentSession::new_with_id(id, AgentRole::Assistant, None, registry, events)
                 .with_spawn_context(self.spawn_context.clone())
@@ -4618,13 +4871,28 @@ impl RuntimeAssembly {
                         .with_output_reserve(output_reserve)
                         .with_fixed_overhead(FIXED_CONTEXT_OVERHEAD_TOKENS),
                 ))
-                .with_compaction_observer(Some(Arc::new(crate::handoff::HandoffWriter::new(
-                    self.home_project.clone(),
-                ))))
-                .with_tool_outcome_observer(self.memory_capture.clone().map(|capture| {
-                    Arc::new(crate::memory_wiring::MemoryCaptureObserver::new(capture))
-                        as Arc<dyn harw_core::capture::ToolOutcomeObserver>
-                }))
+                // Plan D3: der Diary-Recorder hängt sich hinter Handoff bzw.
+                // Gedächtnis-Erfassung in dieselben Slots (Kette, kein
+                // Ersatz) und zählt Verdichtungen und Runden mit.
+                .with_compaction_observer({
+                    let handoff: Arc<dyn harw_core::compaction::CompactionObserver> = Arc::new(
+                        crate::handoff::HandoffWriter::new(self.home_project.clone()),
+                    );
+                    Some(match &self.diary_recorder {
+                        Some(recorder) => recorder.compaction_observer(Some(handoff)),
+                        None => handoff,
+                    })
+                })
+                .with_tool_outcome_observer({
+                    let memory = self.memory_capture.clone().map(|capture| {
+                        Arc::new(crate::memory_wiring::MemoryCaptureObserver::new(capture))
+                            as Arc<dyn harw_core::capture::ToolOutcomeObserver>
+                    });
+                    match &self.diary_recorder {
+                        Some(recorder) => Some(recorder.tool_outcome_observer(memory)),
+                        None => memory,
+                    }
+                })
                 // Addendum F+G: Wächter-Verdrahtung der Wurzel-(UIA-)Sitzung.
                 .with_guard_policy(Some(self.guard_policy))
                 .with_drift_observer(Some(
@@ -5003,10 +5271,41 @@ mod tests {
             Some("gpt-4o-mini")
         );
         assert_eq!(match_catalog_key(keys, "gpt-4o:thinking"), Some("gpt-4o"));
+        // Teil C: Versionspunkt statt Bindestrich (OpenRouter-Schreibweise).
+        assert_eq!(
+            match_catalog_key(keys, "anthropic/claude-haiku-4.5"),
+            Some("claude-haiku-4-5-20251001")
+        );
+        assert_eq!(
+            match_catalog_key(keys, "anthropic/claude-haiku-4.5:beta"),
+            Some("claude-haiku-4-5-20251001")
+        );
         // Kein Präfix ohne Trennstelle, kein Treffer für Fremdes.
         assert_eq!(match_catalog_key(keys, "gpt-4ox"), None);
         assert_eq!(match_catalog_key(keys, "my-local-model"), None);
         assert_eq!(match_catalog_key(keys, ""), None);
+    }
+
+    #[test]
+    fn version_dots_become_dashes_only_between_digits() {
+        assert_eq!(
+            version_dots_to_dashes("claude-sonnet-4.5"),
+            "claude-sonnet-4-5"
+        );
+        assert_eq!(version_dots_to_dashes("gpt-5.4-mini"), "gpt-5-4-mini");
+        assert_eq!(version_dots_to_dashes("a.b-1."), "a.b-1.");
+    }
+
+    #[test]
+    fn dotted_openrouter_ids_resolve_to_the_catalog_window() {
+        let config = ResolvedConfig::default();
+        let dashed = model_limits_for(&config, "claude-haiku-4-5-20251001");
+        let dotted = model_limits_for(&config, "anthropic/claude-haiku-4.5");
+        assert!(
+            dotted.known,
+            "OpenRouter-Schreibweise muss den Katalog treffen"
+        );
+        assert_eq!(dotted.context_window, dashed.context_window);
     }
 
     #[test]
@@ -5592,7 +5891,7 @@ mod tests {
     ///
     /// # Beschreibung
     /// Seit dem UIA-Vertrag (siehe `resolve_active_uia`,
-    /// `docs/session-transcript-2026-09-14.md`) montieren `EntryKind::Tui`
+    /// `docs/sessions/session-transcript-2026-09-14.md`) montieren `EntryKind::Tui`
     /// und `EntryKind::OneShot` nur mit einer konfigurierten UIA
     /// (fail-closed, `RuntimeError::Registry`). Test-Fixtures müssen deshalb
     /// selbst eine bereitstellen, statt implizit auf einen Bootstrap
@@ -5954,15 +6253,23 @@ mod tests {
         assert!(!snapshot.tools.iter().any(|tool| tool == "shell.exec"));
         assert!(snapshot.tools.iter().any(|tool| tool == "fs.read"));
         // Neben dem Profil darf die Wurzel nur die sitzungsgebundenen
-        // Workbench-Werkzeuge führen (Schritt 12a, Rechteklasse
-        // `ReadWorkspace`, keine Workspace-Schreibrechte).
+        // Wissenswerkzeuge führen (Schritt 12a–12a''': Workbench, Palace,
+        // Kanban, Diary; Rechteklasse `ReadWorkspace`, keine
+        // Workspace-Schreibrechte).
         let read_only = RegistryProfile::ReadOnlyExplore.registered_tool_names();
-        let workbench = harw_registry_defaults::WorkbenchToolProvider::TOOL_NAMES;
+        let knowledge: Vec<&str> = [
+            harw_registry_defaults::WorkbenchToolProvider::TOOL_NAMES,
+            harw_registry_defaults::WorkbenchReadToolProvider::TOOL_NAMES,
+            harw_registry_defaults::PalaceToolProvider::TOOL_NAMES,
+            harw_registry_defaults::KanbanReadToolProvider::TOOL_NAMES,
+            harw_registry_defaults::DiaryToolProvider::TOOL_NAMES,
+        ]
+        .concat();
         assert!(
             snapshot.tools.iter().all(|tool| {
-                read_only.contains(&tool.as_str()) || workbench.contains(&tool.as_str())
+                read_only.contains(&tool.as_str()) || knowledge.contains(&tool.as_str())
             }),
-            "nur Werkzeuge des Profils ReadOnlyExplore (plus Workbench): {:?}",
+            "nur Werkzeuge des Profils ReadOnlyExplore (plus Wissenswerkzeuge): {:?}",
             snapshot.tools
         );
         assert_eq!(snapshot.permissions, vec!["ReadWorkspace".to_owned()]);

@@ -130,7 +130,12 @@ pub struct PluginsArgs {
     summary = "Plugin-Katalog: list/show gegen die geladene ResolvedConfig.plugins.",
     domain = "catalog_config",
     permission = "maintainer",
-    command(path = "/plugins", visibility = "tui_only")
+    command(
+        path = "/plugins",
+        visibility = "tui_only",
+        busy = "immediate",
+        busy_subcommands = "install=deferred, activate=deferred, uninstall=deferred"
+    )
 )]
 async fn plugins(ctx: &OpContext, args: PluginsArgs) -> Result<OpOutput, OpError> {
     let Some(config) = ctx.service::<Arc<ResolvedConfig>>() else {

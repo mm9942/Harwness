@@ -1622,6 +1622,15 @@ mod tests {
             // Notizen und Hypothesen der Sitzung, Recht `ReadWorkspace`.
             "workbench.note",
             "workbench.hypothesis",
+            // Lesende Wissenswerkzeuge der Wurzel (Plan Teil D, assembly.rs
+            // Schritt 12a–12a'''): Workbench, Palace, Diary — alle
+            // `ReadWorkspace`, auto-freigegeben. `kanban.*` bekommt nur die
+            // TUI-Wurzel bzw. ein Root-Orchestrator (Schritt 12a''), nicht
+            // `Doctor`.
+            "workbench.show",
+            "palace.search",
+            "palace.recall",
+            "diary.read",
         ]
         .into_iter()
         .collect();

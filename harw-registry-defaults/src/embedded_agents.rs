@@ -2083,8 +2083,16 @@ mod tests {
         // `RootOrchestrator`/`AgentSteward` umzuleiten (siehe
         // `agents/uia-writer.toml`) —, verbietet aber weiterhin ausdrücklich
         // `shell.exec`.
-        const ALLOWED_TO_WRITE_ONLY: &[&str] =
-            &[role_names::MEMORY_STEWARD, role_names::UIA_WRITER];
+        //
+        // `uia-latex-writer` (`RegistryProfile::UiaLatexWriter`, Runde 4
+        // Teil E) admittiert `fs.write` für `.tex`/`.bib` und baut nur über
+        // das typisierte `latex.build` — `shell.exec` bleibt ausdrücklich
+        // verboten (siehe `agents/uia-latex-writer.toml`).
+        const ALLOWED_TO_WRITE_ONLY: &[&str] = &[
+            role_names::MEMORY_STEWARD,
+            role_names::UIA_WRITER,
+            role_names::UIA_LATEX_WRITER,
+        ];
 
         for (role, ir) in builtin()? {
             if ALLOWED_TO_WRITE_AND_EXEC.contains(&role.as_str()) {
@@ -2163,6 +2171,19 @@ mod tests {
                 assert!(
                     admitted.iter().any(|name| name == "fs.write"),
                     "{role} must admit fs.write to consolidate memory facts"
+                );
+            } else if role == role_names::UIA_LATEX_WRITER {
+                // `uia-latex-writer` (`RegistryProfile::UiaLatexWriter`)
+                // admits fs.write for its `.tex`/`.bib` sources and builds only
+                // through the typed `latex.build`, see
+                // `agents/uia-latex-writer.toml`.
+                assert!(
+                    admitted.iter().any(|name| name == "fs.write"),
+                    "{role} must admit fs.write (RegistryProfile::UiaLatexWriter)"
+                );
+                assert!(
+                    admitted.iter().any(|name| name == "latex.build"),
+                    "{role} must admit latex.build (RegistryProfile::UiaLatexWriter)"
                 );
             } else if role == role_names::UIA_WRITER {
                 // `uia-writer` (`RegistryProfile::UiaWriter`) admits fs.write
@@ -2700,6 +2721,11 @@ mod tests {
                 // Nutzerentscheidung: der Explorer durchsucht auch das Netz.
                 "web.search",
                 "web.fetch",
+                // Plan Teil D: lesende Wissenswerkzeuge.
+                "workbench.show",
+                "diary.read",
+                "palace.search",
+                "palace.recall",
             ]
         );
         for tool in ["fs.write", "shell.exec", "web.docs_rs", "web.crates_io"] {
@@ -2853,8 +2879,11 @@ mod tests {
         // `agents/executor.toml` `[spawn] max_depth = 0`) plus die drei
         // Matrix-Game-Sitze (Runde 3, Welle E: ein Zug, ein Urteil bzw. eine
         // Schätzung ist eine einzelne Textantwort, kein Fan-out — siehe
-        // `agents/roles/matrix-*/matrix-*.toml`, jeweils `[spawn] max_depth = 0`).
-        const ZERO_DEPTH_ROLES: [&str; 15] = [
+        // `agents/roles/matrix-*/matrix-*.toml`, jeweils `[spawn] max_depth = 0`)
+        // plus `uia-latex-writer` (Runde 4, Teil E: ein Schreib- und
+        // Build-Auftrag ist ein einzelner, in sich geschlossener Lauf — siehe
+        // `agents/uia-latex-writer.toml`, `[spawn] max_depth = 0`).
+        const ZERO_DEPTH_ROLES: [&str; 16] = [
             role_names::SECURITY_EGRESS_TRIAGE,
             role_names::SECURITY_BASELINE_TRIAGE,
             role_names::SECURITY_STRUCTURE_TRIAGE,
@@ -2865,6 +2894,7 @@ mod tests {
             role_names::UIA_EXPLORER,
             role_names::UIA_WRITER,
             role_names::UIA_SHELL_WORKER,
+            role_names::UIA_LATEX_WRITER,
             role_names::EXECUTOR,
             role_names::MATRIX_PLAYER,
             role_names::MATRIX_UMPIRE,

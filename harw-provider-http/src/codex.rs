@@ -35,6 +35,43 @@ const PROACTIVE_REFRESH_WINDOW_SECONDS: i64 = 5 * 60;
 /// [`harw_config::ProviderToml::originator`] nicht gesetzt (oder leer) ist.
 const DEFAULT_ORIGINATOR: &str = "harw";
 
+/// Relativer Pfad der Codex-CLI-Anmeldedatei unter `$HOME`.
+const CODEX_AUTH_RELATIVE: &str = ".codex/auth.json";
+
+/// Prüft, ob eine Secret-Referenz auf das Codex-Login-Token zeigt.
+///
+/// # Description
+/// Trifft genau auf `file-json:<…>/.codex/auth.json#/tokens/access_token` zu —
+/// das ChatGPT-access_token, das nur für die Codex-Route
+/// (`https://chatgpt.com/backend-api/codex`) auflösbar ist. Der API-Key aus
+/// derselben Datei (`#/OPENAI_API_KEY`) zählt **nicht** dazu. Die Prüfung ist
+/// rein syntaktisch (kein Dateizugriff, kein `$HOME`-Vergleich), damit sie
+/// auch für Einträge aus einer fremden Umgebung stabil bleibt.
+///
+/// # Arguments
+/// - `secret` (`&SecretRef`): zu prüfende Referenz.
+///
+/// # Returns
+/// `true` für einen Codex-Login-Verweis, sonst `false`.
+pub fn is_codex_login_reference(secret: &SecretRef) -> bool {
+    matches!(
+        secret,
+        SecretRef::FileJson { path, pointer }
+            if pointer == ACCESS_POINTER && Path::new(path).ends_with(CODEX_AUTH_RELATIVE)
+    )
+}
+
+/// Prüft, ob eine Basis-URL die offizielle Codex-Route ist.
+///
+/// # Arguments
+/// - `base_url` (`&str`): Basis-URL eines Providers (abschließende `/` egal).
+///
+/// # Returns
+/// `true` genau für `https://chatgpt.com/backend-api/codex`.
+pub fn is_codex_base_url(base_url: &str) -> bool {
+    base_url.trim_end_matches('/') == BASE_URL
+}
+
 /// An endpoint-bound, read-only reference to the Codex login.
 pub(crate) struct CodexRoute {
     path: String,
@@ -52,7 +89,7 @@ impl CodexRoute {
         let Some(home) = std::env::var_os("HOME").filter(|home| !home.is_empty()) else {
             return Ok(None);
         };
-        if Path::new(path) != PathBuf::from(home).join(".codex/auth.json")
+        if Path::new(path) != PathBuf::from(home).join(CODEX_AUTH_RELATIVE)
             || pointer != ACCESS_POINTER
         {
             return Ok(None);

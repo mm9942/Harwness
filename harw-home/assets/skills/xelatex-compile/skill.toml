@@ -1,0 +1,4 @@
+name = "xelatex-compile"
+description = "LaTeX-Dokumente mit XeLaTeX bauen: fontspec/unicode-math-Präambel, deutsche Sprache, System- vs. TeX-Schriften, .latexmkrc, biber-Ablauf, typische XeLaTeX-Fehler aus der latex.build-Rückgabe diagnostizieren; erst statisch prüfen, höchstens drei Build-Versuche, bei not_installed sofort melden."
+instructions_file = "instructions.md"
+tools = ["filesystem.read", "filesystem.write", "process.execute"]

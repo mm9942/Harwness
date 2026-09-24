@@ -241,6 +241,12 @@ pub fn run_chat(
         crate::onboarding::run_wizard(&home)?;
         config = load_chat_config(&spec)?;
     }
+    // Veraltete Credential-Pool-Einträge überspringt der Provider-Aufbau nur
+    // mit `tracing::warn!` — zusätzlich sichtbar auf stderr, mit dem Befehl
+    // zum Aufräumen (nie mit Verweis oder Secret).
+    if let Some(hint) = crate::onboarding::stale_pool_hint(&config) {
+        eprintln!("{hint}");
+    }
 
     match initial_prompt {
         Some(prompt) => {
@@ -371,6 +377,9 @@ struct ChatRuntimeInputs {
     // wird über `ChatTuiFactory::verbose_tools` als
     // `TuiRunOptions::verbose_tools` an die TUI gereicht.
     verbose: bool,
+    // `harness.default_provider` zum Startzeitpunkt; nur für den Hinweis in
+    // `assembly_error` (welcher Provider, welche `auth.toml`).
+    default_provider: Option<String>,
 }
 
 impl ChatRuntimeInputs {
@@ -416,6 +425,7 @@ impl ChatRuntimeInputs {
             project_facts,
             global_facts,
             verbose,
+            default_provider: config.harness.default_provider.clone(),
         })
     }
 }
@@ -450,14 +460,29 @@ fn chat_builder(inputs: &ChatRuntimeInputs, model: ModelSource) -> RuntimeAssemb
 }
 
 // Bildet einen Montagefehler auf eine menschenlesbare Meldung ab; ein
-// Provider-Fehler verweist wie bisher auf das Onboarding.
-fn assembly_error(error: RuntimeError) -> String {
+// Provider-Fehler nennt den Provider und die `auth.toml` des Homes (dort
+// liegt `credential_pool.<provider>`) und verweist auf das Onboarding.
+fn assembly_error(inputs: &ChatRuntimeInputs, error: RuntimeError) -> String {
     match error {
-        RuntimeError::Provider { detail } => {
-            format!("Provider-Einrichtung unvollständig: {detail}. Prüfe harw onboard.")
-        }
+        RuntimeError::Provider { detail } => provider_setup_error(
+            &detail,
+            inputs.default_provider.as_deref(),
+            &harw_home::auth_path(&inputs.spec.home),
+        ),
         other => other.to_string(),
     }
+}
+
+// Text der Provider-Startfehlermeldung; getrennt, damit er ohne Montage
+// testbar ist.
+fn provider_setup_error(detail: &str, provider: Option<&str>, auth_path: &Path) -> String {
+    let provider = provider.unwrap_or("<default_provider>");
+    format!(
+        "Provider-Einrichtung unvollständig: {detail}. Prüfe den Verweis in \
+         providers/{provider}.toml und den Eintrag credential_pool.{provider} in {} \
+         oder führe harw onboard erneut aus.",
+        auth_path.display()
+    )
 }
 
 /// Hängt den Ziel-Kontext der Composition-Root in die Wurzel-Registry.
@@ -538,7 +563,9 @@ impl TuiAssemblyFactory for ChatTuiFactory {
         if let Some(id) = root_session_id {
             builder = builder.root_session_id(id);
         }
-        let assembly = builder.build().map_err(assembly_error)?;
+        let assembly = builder
+            .build()
+            .map_err(|error| assembly_error(&self.inputs, error))?;
         apply_extra_dirs(&assembly, &self.add_dirs);
         tag_session_project(
             &self.inputs.spec.home,
@@ -928,7 +955,7 @@ fn one_shot_assembly(
     chat_builder(inputs, model)
         .session_events(events)
         .build()
-        .map_err(assembly_error)
+        .map_err(|error| assembly_error(inputs, error))
 }
 
 // Führt genau einen Turn über die One-shot-Montage aus und druckt die Antwort.
@@ -953,7 +980,7 @@ fn run_one_shot(
     tag_session_project(&inputs.spec.home, &inputs.spec.cwd, &root_id);
     let RootSession { mut session, .. } = assembly
         .new_root_session(root_id.clone(), event_tx, turn_tx, None)
-        .map_err(assembly_error)?;
+        .map_err(|error| assembly_error(inputs, error))?;
 
     let result = runtime.block_on(async {
         let model = assembly.model().as_ref();
@@ -1038,6 +1065,19 @@ mod tests {
     use std::io::Write as _;
 
     const TEST_GOAL_NAMESPACE: &str = "chat-test.goal";
+
+    #[test]
+    fn provider_setup_error_names_provider_and_auth_toml() {
+        let message = provider_setup_error(
+            "could not resolve credential",
+            Some("openai"),
+            Path::new("/tmp/harw-home/auth.toml"),
+        );
+        assert!(message.contains("credential_pool.openai"));
+        assert!(message.contains("/tmp/harw-home/auth.toml"));
+        assert!(message.contains("providers/openai.toml"));
+        assert!(message.contains("harw onboard"));
+    }
 
     /// Kontext-Provider ohne Beitrag, erkennbar an seinem Namensraum.
     struct TestGoalContext;

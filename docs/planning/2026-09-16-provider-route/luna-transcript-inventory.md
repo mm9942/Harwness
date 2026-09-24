@@ -5,7 +5,7 @@
 
 ## Abdeckung und Grenzen
 
-Im Workspace liegen 16 zugewiesene Transkriptdateien: 15 `harw-export-*.md` sowie das Claude-Transkript `2026-09-16-010759-hilf-mir-nochmal-dabei-das-wir-die-internen-model.txt`; zusätzlich wurde `docs/session-transcript-2026-09-14.md` als verbindliche Zusammenfassung herangezogen. Die Dateien wurden nach Dateigröße/Zeilenanzahl inventarisiert und die vollständigen Gesprächsblöcke der relevanten Provider-, Modell-, Routing-, TUI-, Persistenz- und Abschlussabschnitte gelesen. Die drei langen, weitgehend duplizierten Exporte `1789519086`, `1789523460` und `1789524310` sind hier dedupliziert; ihre abweichenden Ergänzungen sind separat erfasst. Eine semantische Einzelprüfung sämtlicher 44.205 Dokumentationszeilen ist nicht behauptet.
+Im Workspace liegen 16 zugewiesene Transkriptdateien: 15 `harw-export-*.md` sowie das Claude-Transkript `2026-09-16-010759-hilf-mir-nochmal-dabei-das-wir-die-internen-model.txt`; zusätzlich wurde `docs/sessions/session-transcript-2026-09-14.md` als verbindliche Zusammenfassung herangezogen. Die Dateien wurden nach Dateigröße/Zeilenanzahl inventarisiert und die vollständigen Gesprächsblöcke der relevanten Provider-, Modell-, Routing-, TUI-, Persistenz- und Abschlussabschnitte gelesen. Die drei langen, weitgehend duplizierten Exporte `1789519086`, `1789523460` und `1789524310` sind hier dedupliziert; ihre abweichenden Ergänzungen sind separat erfasst. Eine semantische Einzelprüfung sämtlicher 44.205 Dokumentationszeilen ist nicht behauptet.
 
 ## Quelleninventar
 
@@ -27,7 +27,7 @@ Im Workspace liegen 16 zugewiesene Transkriptdateien: 15 `harw-export-*.md` sowi
 | `harw-export-1789523460.md` | 4.540 | gleiche TUI-/Sandbox-Linie plus vollständige Transcript-/Tool-Persistenz, Delegationsvorschriften und `/mode`; mehrfach abgebrochen/fortgesetzt. |
 | `harw-export-1789524310.md` | 5.623 | nahezu Duplikat der vorherigen Quelle; zusätzliche Forderung nach Orchestrator-Nutzung und Status-Transparenz. |
 | `2026-09-16-010759-hilf-mir-nochmal-dabei-das-wir-die-internen-model.txt` | 354 | interne Modelle auf Byteplus, `gpt-6.5-terra` korrigieren, echte Agentenanzeige, Greeting/Persona/Resume-Orchestrierung. |
-| `docs/session-transcript-2026-09-14.md` | 199 | normative UIA-/TUI-/Bootstrap-Zusammenfassung; Provider-/Modellerkennung und Auswahlpersistenz bleiben offen. |
+| `docs/sessions/session-transcript-2026-09-14.md` | 199 | normative UIA-/TUI-/Bootstrap-Zusammenfassung; Provider-/Modellerkennung und Auswahlpersistenz bleiben offen. |
 
 ## Deduplizierte Anforderungen
 
@@ -61,6 +61,6 @@ Im OpenAI-Abschnitt werden 169 Provider-HTTP-Tests (15 neu) als grün behauptet.
 
 ## Dokumentationsbestand im Workspace
 
-Der Bestand wurde zusätzlich per Dateiinventar geprüft: 206 Dateien unter `docs/` (ohne diesen neuen Planungsordner), davon 34 Design-, 141 Remediation-, 3 Architektur-, 1 Audit-, 2 Setup-, 1 Migration-, 1 Research-, 1 Session- und 1 Superpowers-Datei sowie die übergeordneten `aw-*`-Dokumente. Die Remediation-Ledger enthalten überwiegend abgeschlossene Nachweise mit einzelnen „Offen/nicht verifiziert“-Abschnitten. Für die Route besonders maßgeblich sind `docs/architecture/model-provider-routing.md`, `docs/design/provider-tui-setup.md`, `docs/design/model-catalog-v2.md`, `docs/design/config-structure.md`, `docs/design/secrets-and-audit.md`, `docs/design/delegation-capabilities.md`, `docs/design/mediated-process-execution.md`, `docs/session-transcript-2026-09-14.md` sowie `harw/README.md`.
+Der Bestand wurde zusätzlich per Dateiinventar geprüft: 206 Dateien unter `docs/` (ohne diesen neuen Planungsordner), davon 34 Design-, 141 Remediation-, 3 Architektur-, 1 Audit-, 2 Setup-, 1 Migration-, 1 Research-, 1 Session- und 1 Superpowers-Datei sowie die übergeordneten `aw-*`-Dokumente. Die Remediation-Ledger enthalten überwiegend abgeschlossene Nachweise mit einzelnen „Offen/nicht verifiziert“-Abschnitten. Für die Route besonders maßgeblich sind `docs/architecture/model-provider-routing.md`, `docs/design/provider-tui-setup.md`, `docs/design/model-catalog-v2.md`, `docs/design/config-structure.md`, `docs/design/secrets-and-audit.md`, `docs/design/delegation-capabilities.md`, `docs/design/mediated-process-execution.md`, `docs/sessions/session-transcript-2026-09-14.md` sowie `harw/README.md`.
 
 Die breiteren Dokumente enthalten zusätzliche offene Entscheidungen (u. a. Budget-/Spawn-Abrechnung, Kanal- und Workbench-Details, Skill-Runtime, MCP-Tool-Registry und Live-Roundtrips). Sie dürfen die P0-Provider-Reparatur nicht als erledigt markieren; sie gehören in spätere Plan-Knoten.

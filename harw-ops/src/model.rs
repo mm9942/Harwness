@@ -367,7 +367,12 @@ pub(crate) fn effective_uia_selection(
     domain = "catalog_config",
     permission = "operator",
     category = "model",
-    command(path = "/model", visibility = "tui_only", busy = "immediate"),
+    command(
+        path = "/model",
+        visibility = "tui_only",
+        busy = "staged",
+        busy_subcommands = "show=immediate, list=immediate"
+    ),
 )]
 async fn model(ctx: &OpContext, args: ModelArgs) -> Result<OpOutput, OpError> {
     let action = args.action.as_deref().unwrap_or("show");
@@ -650,7 +655,12 @@ fn format_uia_list(selection: &UiaSelection, config: &harw_config::ResolvedConfi
     domain = "catalog_config",
     permission = "operator",
     category = "model",
-    command(path = "/uia-model", visibility = "tui_only")
+    command(
+        path = "/uia-model",
+        visibility = "tui_only",
+        busy = "staged",
+        busy_subcommands = "-=immediate, show=immediate, list=immediate"
+    )
 )]
 async fn uia_model(ctx: &OpContext, args: ModelArgs) -> Result<OpOutput, OpError> {
     let action = args.action.as_deref().unwrap_or("show");
@@ -908,7 +918,12 @@ fn format_uia_worker_list(
     domain = "catalog_config",
     permission = "operator",
     category = "model",
-    command(path = "/uia-worker-model", visibility = "tui_only")
+    command(
+        path = "/uia-worker-model",
+        visibility = "tui_only",
+        busy = "staged",
+        busy_subcommands = "-=immediate, show=immediate, list=immediate"
+    )
 )]
 async fn uia_worker_model(ctx: &OpContext, args: ModelArgs) -> Result<OpOutput, OpError> {
     let action = args.action.as_deref().unwrap_or("show");

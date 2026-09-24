@@ -39,16 +39,20 @@ either unit.
 
 The service templates use the planned system CLI contract:
 `harw-sentinel --config --state-dir --telemetry-dir --runtime-dir` and
-`harw-probe-bpf --config`. The checked-in binaries currently still expose the
+`harw-probe-bpf --config`. The current binaries still expose the
 legacy `--home`/socket-only interface. The config owner must add these options
 and resolve/verify the immutable profile before program load; packaging does
 not silently substitute a personal home path. Until that integration lands,
 the units are an installable contract, not a claim of live service readiness.
 
-The expected BPF artefacts are
-`bpf/harw-dod-exec.bpf.o`, `bpf/harw-dod-flow.bpf.o`, and `bpf/manifest.json`.
-The BPF builder may override `BPF_ARTIFACT_DIR` or rename the files together
-with the packaging variables when its pinned build layout is finalized.
+The BPF artefacts are build outputs and are never checked in: `make build-bpf`
+compiles `bpf/src/*.bpf.c` with the pinned toolchain and writes
+`bpf/exec.bpf.o`, `bpf/exit.bpf.o`, `bpf/tcp_v4_connect.bpf.o`,
+`bpf/tcp_v6_connect.bpf.o`, `bpf/manifest.json` and the generated
+`bpf/include/vmlinux.h` (all ignored by `bpf/.gitignore`). `install` refuses to
+run until they exist. The builder may override `BPF_ARTIFACT_DIR` or rename the
+files together with the packaging variables when its pinned build layout is
+finalized.
 
 ## Targets
 

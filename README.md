@@ -8,22 +8,7 @@
 
 Most agent loops give a model a prompt and a collection of tools. Harwness starts from a different boundary: a prompt is not authority. A model cannot grant itself filesystem access, process execution, network access, child-agent privileges, secret access, or a privileged host action. Those decisions belong to typed runtime components.
 
-The `harw` binary provides an interactive terminal UI, one-shot runs, durable plans and jobs, an optional local web surface, an MCP listener, and a gateway for external channels. The workspace also includes an embeddable SDK and a Defense-on-Device subsystem for collecting and acting on host-security findings under separate privilege boundaries.
-
-### Cloudflare MCP
-
-The managed Cloudflare API MCP server can be configured and checked from the
-CLI. Set `CLOUDFLARE_API_TOKEN` in the environment, then run:
-
-```text
-harw mcp setup cloudflare
-harw mcp check cloudflare
-```
-
-The setup writes only a declarative `streamable_http` entry under the active
-profile's `mcps/` directory. The check performs MCP `initialize` and
-`tools/list` against `https://mcp.cloudflare.com/mcp` and prints the advertised
-tool names without printing the token.
+The `harw` binary provides an interactive terminal UI, one-shot runs, durable plans and jobs, an optional local web surface, an MCP listener and MCP client connections, and a gateway for external channels. The workspace also includes an embeddable SDK and a Defense-on-Device subsystem for collecting and acting on host-security findings under separate privilege boundaries.
 
 The current workspace version is **0.3.0**.
 
@@ -90,6 +75,8 @@ Definitions resolve in ordered layers. A derived definition may remove or inters
 
 Roles are a closed Rust enum. The spawn matrix is enforced by the runtime and cannot be expanded from TOML. A worker therefore cannot become a root orchestrator because a prompt, plugin, or local config says so.
 
+The full specification is in [docs/design/agent-definition-dsl.md](docs/design/agent-definition-dsl.md).
+
 ## Context and model interaction
 
 Context is assembled as a typed program. Sections identify their source, trust class, strength, and detail level. This lets the runtime distinguish instructions from evidence and ordinary data, apply context ceilings, and reduce context predictably when budgets are tight.
@@ -127,7 +114,7 @@ cargo run -p harw-cli -- onboard
 cargo run -p harw-cli --
 ```
 
-`harw init` creates the local root space. `harw onboard` configures a provider and model. Running `harw` (or `harw chat`) without further arguments starts the interactive terminal client, optionally with a first prompt; `harw exec PROMPT` runs a single non-interactive request and exits.
+`harw init` creates the local root space. `harw onboard` configures a provider and model. Running `harw` (or `harw chat`) without further arguments starts the interactive terminal client in `chat` mode, optionally with a first prompt; `harw exec PROMPT` runs a single non-interactive request and exits. Pick another start mode with `--mode` (or `[mode] default` in the profile configuration), and another root agent definition with `--agent NAME`; `/agent use NAME` inside the TUI stores that choice for the next session.
 
 Shell completions: `harw completions --install` (detects the shell from `$SHELL`; pass `bash`, `zsh`, `fish`, `elvish` or `powershell` explicitly, add `--dry-run` to preview). Open a new shell afterwards.
 
@@ -144,9 +131,52 @@ harw analyze --order top-down --dry-run
 harw gateway
 ```
 
-Global flags (`--home`, `--profile`, `-C/--cwd`, `--log`, `-v`, `--json`) work with every command. Session flags (`--mode`, `--approval ask|auto|full`, `--model`, `--goal`, `--add-dir`) apply only to `chat`, `exec` and `analyze` and are rejected elsewhere. Commands without a JSON form fail with `--json` instead of ignoring it. Older spellings such as `harw settings`, `harw models`, `harw connect`, `harw lens` or `harw run` still work and print a hint to the new name.
+Global flags (`--home`, `--profile`, `-C/--cwd`, `--log`, `-v`, `--json`) work with every command. Session flags (`--mode`, `--approval ask|auto|full`, `--model`, `--goal`, `--agent`, `--add-dir`) apply only to `chat`, `exec` and `analyze` and are rejected elsewhere. Commands without a JSON form fail with `--json` instead of ignoring it. Older spellings such as `harw settings`, `harw models`, `harw connect`, `harw lens` or `harw run` still work and print a hint to the new name.
 
 The full command reference (in German), including the old-to-new mapping, is in [docs/cli.md](docs/cli.md). Run `harw --help` and `harw <subcommand> --help` for the exact grammar supported by the checked-out version.
+
+## Working in the terminal UI
+
+Slash commands are typed operations with the same permission checks on every front-end; `/help` (or `F1`) lists what the checked-out version registers. A few behaviors worth knowing:
+
+- **Commands during a running turn.** Read-only commands such as `/status`, `/usage`, `/diff` or `/agent` run immediately without blocking the turn. Changes such as `/model`, `/effort` or `/mode` are accepted during the turn but take effect from the next turn. Everything else waits until the turn ends. Messages you send while a turn runs are shown above the composer as "Wartet auf den nächsten Turn" until they are delivered.
+- **Interrupting.** `Ctrl+C` or `Esc` stops the running turn (model call, shell subprocesses, child agents). Messages and commands already queued are kept and delivered right afterwards. `Esc` closes an open popup first and never quits; pressing `Ctrl+C` twice quits.
+- **Research.** `/research QUESTION` hands a bounded question to a read-only child agent and validates the result against a typed finding contract. `/research-deps` checks Rust dependencies; `/research-deps --generic` uses an ecosystem-neutral dependency researcher. These commands are available when the planning surface (`[tools.plan] enabled`) is on.
+- **Child agents.** A child agent gets the context window of the model it actually calls, falling back to the parent's model rather than a small default. Its token budget counts only new, uncached input plus output. Near the limit the child is asked to wrap up; at the limit its last answer is returned as a partial result (`budget_exhausted`) instead of being lost.
+- **Learning loop.** `/learn` scans the session for durable insights and files them as proposals only. Nothing is written to memory, skills or agent definitions until you accept a proposal and apply it yourself.
+
+## Knowledge surfaces
+
+Harwness keeps local knowledge in one store under the active profile (`<profile>/knowledge`), with one visibility model and file locks for concurrent processes. Agents can read these surfaces through read-only tools (`workbench.show`, `diary.read` for their own entries, `palace.search`/`palace.recall` for established nodes). `kanban.list`/`kanban.show` are offered only to the UIA root and the root orchestrator, always ask for approval, and are used only when the user explicitly asks — nothing is put on the board automatically. All writes are operator commands or go through a review step.
+
+- **Workbench** (`/workbench`, `F5`): pinned files, notes and hypotheses for the current session or project (`--scope`). Notes can be edited or removed (`note edit|rm`), and each scope has its own retention (`retention`).
+- **Kanban** (`/kanban`, `F6`): cards on boards with comments, evidence links and history. Cards in a worker lane are picked up by the job worker of `harw serve`, but a worker agent starts only after the card has been approved (`/kanban approve`); the result is written back to the card.
+- **Diary** (`/diary`): a per-agent log. Entries are written automatically after a compaction and at the end of a session, and can be added by hand (`/diary note` or the `#` prefix). It supports date ranges and search. Retention is configured with `[knowledge.diary] retention_days`.
+- **Palace** (`/palace`): a linked long-term memory graph. `/memory promote FACT-ID` turns a stored fact into a provisional topic; `/palace promote` makes it established. `supersede`, `edit` and `link` change nodes behind an operator review gate; nodes are never deleted.
+- **Dream** (`/dream run|status|review`): an idle-time reflection run without tools. It produces structured suggestions (topics, diary reflections, skill or agent ideas, follow-ups) and does knowledge maintenance. Suggestions only take effect when accepted with `/dream review`. The gateway schedules runs according to the `[dream]` section (`enabled`, `budget`, `idle_minutes`, `cooldown_minutes`, `schedule`).
+
+The design and its remaining open points are described in [docs/design/knowledge-surfaces.md](docs/design/knowledge-surfaces.md); the full command grammar is in [docs/design/interaction-contract.md](docs/design/interaction-contract.md) §2.2.
+
+## Matrix game
+
+`/matrix` runs an umpired, multi-seat matrix game with agents in the seats. A deterministic game master in Rust owns turns, dice, visibility and the journal; seats only see their own projection of the game. Scenarios can include behavior profiles, a Red Cell seat and inject packages (`/matrix start SCENARIO --package ID`); `/matrix compare` compares runs. `F9` opens the matrix panel. Design notes: [docs/design/matrix-game.md](docs/design/matrix-game.md).
+
+## Bundled roles and skills
+
+The binary ships a starter set of agent definitions and skills that `harw init` writes into the Harwness home. Recent additions include:
+
+- **LaTeX worker.** The role `uia-latex-writer` (and the bundle agent `latex-writer`) writes and edits LaTeX in the workspace. It has no shell, network or dependency tools. It can build only through the typed `latex.build` tool, which runs `latexmk` inside the sandbox without shell escape and asks for approval on every call. TeX must already be installed; if it is missing, the tool reports which programs are missing and how to install them, and installs nothing itself.
+- **Skills:** `business-writing-pyramid`, `latex-writing`, `xelatex-compile`, `learning-loop`, `author-review-pipeline` and `matrix-scenario-design`.
+
+## MCP connectors
+
+Besides the MCP listener (`harw serve`), Harwness can act as an MCP client. Each connector is a declarative file under the active profile's `mcps/` directory with a transport (`stdio` or `streamable_http`), a command or URL, an optional credential reference such as `env:NAME`, and an allowlist of tools. Enabled connectors are connected when the runtime is assembled, and their tools appear as `mcp.<server>.<tool>`. They are governed like any other tool: HTTP connectors need network access to that host, stdio connectors need process execution. A server that cannot be reached is left out and logged; it does not stop the session.
+
+`harw mcp setup NAME` writes a connector file and `harw mcp check NAME` performs MCP `initialize` and `tools/list` and prints the advertised tool names without printing the credential. At present these two helpers know one preset:
+
+- `cloudflare` (Cloudflare's managed MCP server, token from `CLOUDFLARE_API_TOKEN`).
+
+Other servers are configured by writing their file under `mcps/` directly.
 
 ## Telegram setup and pairing
 
@@ -180,6 +210,8 @@ harw gateway
 Keep the bot token environment variable available to the gateway process as well. If it is started by a service manager, configure the environment in the service context rather than relying on an interactive shell. During the manual pairing step, do not let another gateway instance consume the bot updates.
 
 Local TUI shell commands use the `!command` syntax and are enabled by default for the local operator console. They execute only through the Bubblewrap-bound `shell.exec` executor and still require the runtime sandbox to grant process execution. To disable this surface for one Harwness process, start it with `HARW_DISABLE_SHELL=1 harw`. External channels remain unable to invoke the local shell unless their separate channel policy explicitly grants that capability.
+
+A Telegram chat bound to a workspace gets a narrow tool profile: reading files runs without asking, every write asks for approval through an inline button in the chat, and there is no shell, process, network or knowledge-surface tool.
 
 The spelling is `telegram`; `telegaram` is intentionally rejected rather than silently configuring an unexpected channel.
 
@@ -223,6 +255,14 @@ The project has substantial inline documentation and tests. When changing a publ
 - `harw-secrets` implements protected secret storage and audit-chain support.
 - `harw-dod-*`, `harw-sentinel`, `harw-probe-*`, and `harw-warden` implement the optional host-security plane.
 - `docs` contains design notes, operational documentation, and remediation material.
+
+## Further reading
+
+- [docs/philosophy/philosophy.md](docs/philosophy/philosophy.md) — the principles behind the harness.
+- [docs/philosophy/coding-philosophy.md](docs/philosophy/coding-philosophy.md) — how code in this repository is written.
+- [docs/design/agent-definition-dsl.md](docs/design/agent-definition-dsl.md) — the agent definition DSL in full.
+- [docs/cli.md](docs/cli.md) — command-line reference (German).
+- `docs/sessions/` — transcripts and reports of past working sessions.
 
 ## Contributing
 

@@ -91,7 +91,7 @@ fn fixture() -> TestResult<Fixture> {
 /// # Beschreibung
 /// `EntryKind::Tui` und `EntryKind::OneShot` montieren seit dem UIA-Vertrag
 /// (`harw-runtime/src/assembly.rs::resolve_active_uia`,
-/// `docs/session-transcript-2026-09-14.md`) nur noch mit einer konfigurierten
+/// `docs/sessions/session-transcript-2026-09-14.md`) nur noch mit einer konfigurierten
 /// UIA — fail-closed, ohne stillen Full-Tool-Fallback. Diese Tabellen-Tests
 /// prüfen genau diese acht (bzw. elf) Einstiege in einem leeren
 /// Tempverzeichnis, das ohne diese Funktion keine UIA kennt. Layout und
@@ -1619,6 +1619,7 @@ async fn uia_worker_and_its_siblings_use_the_uia_provider_not_the_default_provid
         role_names::UIA_EXPLORER,
         role_names::UIA_WRITER,
         role_names::UIA_SHELL_WORKER,
+        role_names::UIA_LATEX_WRITER,
     ] {
         // Beweisschritt 1: die Rolle spawnt tatsächlich.
         factory
