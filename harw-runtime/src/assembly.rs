@@ -4753,17 +4753,94 @@ mod tests {
         );
     }
 
-    /// Der Rustdoc von [`default_approval_mode`] sagt „immer `Delegated`" —
-    /// dann ist das auch die Zusage, die der Test prüft (Befund Z2c-12).
+    /// Der Rustdoc von [`default_approval_mode`] sagt „`Delegated`, nur
+    /// `GatewayTelegram` fragt immer" — dann ist das auch die Zusage, die der
+    /// Test prüft (Befund Z2c-12, Runde 3 Welle D).
     #[test]
-    fn every_entry_starts_delegated() {
+    fn every_entry_but_telegram_starts_delegated() {
         for entry in ALL_ENTRIES {
-            assert_eq!(
-                default_approval_mode(entry),
-                ApprovalMode::Delegated,
-                "{entry:?}"
-            );
+            let expected = if entry == EntryKind::GatewayTelegram {
+                ApprovalMode::AlwaysAsk
+            } else {
+                ApprovalMode::Delegated
+            };
+            assert_eq!(default_approval_mode(entry), expected, "{entry:?}");
         }
+    }
+
+    /// Telegram fragt immer — auch wenn Global- und Projekt-Konfiguration
+    /// `full` bzw. `auto` verlangen. Kein anderer Einstieg hat einen
+    /// erzwungenen Modus.
+    #[test]
+    fn telegram_approval_mode_is_forced_to_ask_regardless_of_config() {
+        let global = PermissionsSection {
+            default_mode: Some("full".to_owned()),
+            ..PermissionsSection::default()
+        };
+        let project = PermissionsSection {
+            default_mode: Some("auto".to_owned()),
+            ..PermissionsSection::default()
+        };
+        assert_eq!(
+            effective_approval_mode(EntryKind::GatewayTelegram, &global, &project),
+            ApprovalMode::AlwaysAsk
+        );
+        for entry in ALL_ENTRIES {
+            let expected = (entry == EntryKind::GatewayTelegram).then_some(ApprovalMode::AlwaysAsk);
+            assert_eq!(forced_approval_mode(entry), expected, "{entry:?}");
+        }
+    }
+
+    #[test]
+    fn an_explicit_root_agent_must_be_an_orchestrator_or_worker() -> TestResult {
+        let (config, definitions) = builtin()?;
+        assert!(resolve_explicit_root_agent(None, &config, &definitions)?.is_none());
+
+        let explorer =
+            resolve_explicit_root_agent(Some(role_names::EXPLORER), &config, &definitions)?
+                .ok_or(TestError::Missing("explorer"))?;
+        assert_eq!(explorer.role(), AgentRoleId::Worker);
+
+        let Err(unknown) =
+            resolve_explicit_root_agent(Some("definitely-not-a-role"), &config, &definitions)
+        else {
+            return Err(TestError::Unexpected(
+                "unbekannter Agent muss scheitern".into(),
+            ));
+        };
+        assert!(
+            matches!(unknown, RuntimeError::Registry { .. }),
+            "{unknown}"
+        );
+
+        // Jede eingebaute Definition mit einer anderen Rolle als
+        // Root-/Child-Orchestrator oder Worker wird mit einem
+        // Konfigurationsfehler abgelehnt.
+        let mut rejected = 0_usize;
+        for (name, ir) in &definitions {
+            let allowed = matches!(
+                ir.role(),
+                AgentRoleId::RootOrchestrator
+                    | AgentRoleId::ChildOrchestrator
+                    | AgentRoleId::Worker
+            );
+            let result = resolve_explicit_root_agent(Some(name), &config, &definitions);
+            if allowed {
+                assert!(result.is_ok(), "{name}");
+            } else {
+                rejected += 1;
+                assert!(
+                    matches!(result, Err(RuntimeError::Config { .. })),
+                    "{name}: {:?}",
+                    result.err()
+                );
+            }
+        }
+        assert!(
+            rejected > 0,
+            "mindestens die UIA-Helfer tragen eine andere Rolle"
+        );
+        Ok(())
     }
 
     #[test]
@@ -5912,10 +5989,37 @@ mod tests {
                 );
             }
         }
-        for requested in [Full, ReadOnlyExplore, NoTools] {
+        for requested in [
+            Full,
+            ReadOnlyExplore,
+            NoTools,
+            RegistryProfile::WorkspaceEdit,
+        ] {
             assert_eq!(
                 narrowed_registry_profile(entry, Full, requested).ok(),
                 Some(requested)
+            );
+        }
+        // `WorkspaceEdit` (Telegram) narrowt nur auf sich selbst oder auf
+        // `NoTools`; kein anderes Profil darf zu ihm aufweiten.
+        let telegram = EntryKind::GatewayTelegram;
+        for requested in RegistryProfile::ALL {
+            let allowed = matches!(requested, RegistryProfile::WorkspaceEdit | NoTools);
+            assert_eq!(
+                narrowed_registry_profile(telegram, RegistryProfile::WorkspaceEdit, *requested)
+                    .is_ok(),
+                allowed,
+                "WorkspaceEdit → {requested:?}"
+            );
+        }
+        for entry_profile in RegistryProfile::ALL {
+            if matches!(entry_profile, Full | RegistryProfile::WorkspaceEdit) {
+                continue;
+            }
+            assert!(
+                narrowed_registry_profile(entry, *entry_profile, RegistryProfile::WorkspaceEdit)
+                    .is_err(),
+                "{entry_profile:?} → WorkspaceEdit"
             );
         }
 

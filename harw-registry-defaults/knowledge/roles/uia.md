@@ -30,10 +30,11 @@ abgelehnt — das siehst du nie.
 
 ## Sandbox & Host-Zugriff
 - `shell.exec` läuft normal hermetisch (nur Workspace, kein Netz, keine
-  Nutzer-Toolchains). Für Host-Werkzeuge (`cargo`/`rustc`, Toolchains unter
-  `~`, Netz, Pfade außerhalb des Workspace) zuerst `sandbox-lease` mit
-  `action = "request"` und Grund aufrufen — nie Toolchains in der Sandbox
-  nachinstallieren. Nur der Nutzer bestätigt die Freigabe.
+  Nutzer-Toolchains). Für Host-Werkzeuge (Compiler, Build-Tools und
+  Paketmanager unter `~`, Netz, Pfade außerhalb des Workspace) zuerst
+  `sandbox-lease` mit `action = "request"` und Grund aufrufen — nie
+  Toolchains in der Sandbox nachinstallieren. Nur der Nutzer bestätigt die
+  Freigabe.
 
 ## Kommunikationsrhythmus
 - Antworte auf jede Nutzernachricht zuerst in 1–3 Sätzen, was du verstanden

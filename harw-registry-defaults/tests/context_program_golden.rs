@@ -28,6 +28,13 @@
 //! Test-Fixture-Zugriff, keine Verletzung der Reinheitszusage des Renderers
 //! selbst (§ Moduldoku von `context_program.rs`).
 //!
+//! Seit Runde 3 (Welle C2) bettet `embedded_agents` dieselbe Bibliothek ein
+//! (`builtin_context_program_toml`) und bindet sie an Rollen
+//! (`[context] program = "<name>"`). Die beiden Tests am Ende dieser Datei
+//! halten fest, dass die eingebettete Bibliothek exakt die Dateien dieses
+//! Verzeichnisses trägt und dass eine gebundene Rolle das golden-getestete
+//! Programm tatsächlich als `context_policy` führt.
+//!
 //! [`ResolvedContextProgramDefinition`]: harw_agent_dsl::context_program::ResolvedContextProgramDefinition
 
 use std::collections::HashMap;
@@ -338,5 +345,86 @@ fn ten_context_program_ids_are_pairwise_distinct() -> TestResult {
         );
     }
     assert_eq!(seen.len(), 10);
+    Ok(())
+}
+
+/// Die eingebettete Bibliothek (`embedded_agents::builtin_context_program_toml`)
+/// ist byte-genau die Menge der `.toml`-Dateien, die dieser Golden-Test vom
+/// Dateisystem liest — sonst prüfte der Golden-Test andere Programme, als die
+/// Rollen tatsächlich binden.
+#[test]
+fn embedded_library_matches_the_files_on_disk() -> TestResult {
+    let dir = context_programs_dir();
+    let mut on_disk: Vec<(String, String)> = Vec::new();
+    let entries = fs::read_dir(&dir).map_err(|error| TestError::Context {
+        context: "agents/context-programs/ nicht lesbar",
+        source: format!("{dir:?}: {error}"),
+    })?;
+    for entry in entries {
+        let path = entry
+            .map_err(ctx("Verzeichniseintrag sollte lesbar sein"))?
+            .path();
+        if path.extension().and_then(|ext| ext.to_str()) != Some("toml") {
+            continue;
+        }
+        let stem = path
+            .file_stem()
+            .and_then(|stem| stem.to_str())
+            .ok_or(TestError::Missing("Dateistamm muss UTF-8 sein"))?
+            .to_owned();
+        let src = fs::read_to_string(&path).map_err(|error| TestError::Context {
+            context: "Quelldatei nicht lesbar",
+            source: format!("{path:?}: {error}"),
+        })?;
+        on_disk.push((stem, src));
+    }
+    on_disk.sort();
+
+    let mut embedded: Vec<(String, String)> =
+        harw_registry_defaults::embedded_agents::builtin_context_program_toml()
+            .iter()
+            .map(|(name, src)| ((*name).to_owned(), (*src).to_owned()))
+            .collect();
+    embedded.sort();
+    assert_eq!(embedded, on_disk);
+    Ok(())
+}
+
+/// Eine gebundene Rolle führt das golden-getestete Programm: die kanonische
+/// ID des aufgelösten Programms steht als `context_policy` in ihrer IR, und
+/// jeder Ausschluss des Programms ist übernommen.
+#[test]
+fn bound_roles_carry_the_golden_tested_program() -> TestResult {
+    let layers = load_layers()?;
+    let definitions =
+        harw_registry_defaults::embedded_agents::builtin_agent_definitions(&HashMap::new())
+            .map_err(ctx("eingebaute Definitionen müssen lowern"))?;
+    for (role, program) in [
+        ("explorer", "explore"),
+        ("planner", "plan"),
+        ("executor", "implement"),
+        ("analyst", "review"),
+        ("security-egress-triage", "triage"),
+        ("root-orchestrator", "orchestrate"),
+        ("researcher-deps", "research-deps"),
+        ("researcher-web", "research-web"),
+    ] {
+        let resolved = resolve(&layers, program)?;
+        let ir = definitions
+            .get(role)
+            .ok_or_else(|| TestError::Unexpected(format!("Rolle '{role}' fehlt")))?;
+        let expected = resolved.id.to_string();
+        assert_eq!(
+            ir.context_program().context_policy(),
+            Some(expected.as_str()),
+            "{role} muss {program} binden"
+        );
+        for selector in &resolved.exclude {
+            assert!(
+                ir.context_program().exclude().contains(selector),
+                "{role}: Ausschluss {selector} aus {program} fehlt"
+            );
+        }
+    }
     Ok(())
 }

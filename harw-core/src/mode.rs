@@ -99,6 +99,7 @@ const PLAN_TOOLS: &[&str] = &[
     "web.docs_rs",
     "web.crates_io",
     "explore",
+    "research",
     "research_deps",
     "research_web",
 ];
@@ -665,6 +666,7 @@ mod tests {
             "web.docs_rs",
             "web.crates_io",
             "explore",
+            "research",
             "research_deps",
             "research_web",
         ];
@@ -692,6 +694,7 @@ mod tests {
             "web.docs_rs",
             "web.crates_io",
             "explore",
+            "research",
             "research_deps",
             "research_web",
         ] {
