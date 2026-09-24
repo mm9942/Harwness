@@ -3093,6 +3093,275 @@ fn resume_request(raw: &str) -> Option<TuiRunOutcome> {
     }
 }
 
+/// `true` für jede `/workbench …`-Zeile (Werkbank danach neu laden).
+fn is_workbench_command(raw: &str) -> bool {
+    raw.split_whitespace().next() == Some("/workbench")
+}
+
+/// `true`, wenn `raw` ein TUI-lokaler Befehl ist (keine Operation dahinter).
+fn is_tui_local_command(registry: &CommandRegistry, raw: &str) -> bool {
+    let Some(name) = raw
+        .trim()
+        .strip_prefix('/')
+        .and_then(|rest| rest.split_whitespace().next())
+    else {
+        return false;
+    };
+    registry
+        .find(name)
+        .is_some_and(|spec| spec.origin == crate::CommandOrigin::TuiLocal)
+}
+
+/// Baut den [`LocalCommandContext`] aus dem App-Zustand und fragt
+/// [`local_commands::intercept`]. Das Ergebnis besitzt keine Borrows auf
+/// `app`, der Aufrufer darf danach mutieren.
+fn local_intercept_for(app: &ChatApp, raw: &str) -> Option<LocalIntercept> {
+    let config = app.resolved_config();
+    let (live_provider, live_model) = app.live_model();
+    let project_root = std::path::PathBuf::from(&app.project_root);
+    let ctx = LocalCommandContext {
+        registry: &app.command_registry,
+        config: config.as_deref(),
+        key_bindings: &app.key_bindings,
+        active_mode: app.active_mode,
+        approval: app.current_approval(),
+        live_provider: live_provider.as_deref(),
+        live_model: live_model.as_deref(),
+        project_root: &project_root,
+        session_id: app.session_id(),
+        tier: app.caller_tier(),
+        known_roles: KNOWN_ROLES,
+    };
+    local_commands::intercept(raw, &ctx)
+}
+
+/// Wendet ein [`LocalIntercept`] an.
+///
+/// # Rückgabe
+/// `Some(outcome)`, wenn die TUI-Schleife mit diesem Ergebnis enden soll
+/// (bare `/resume`); sonst `None`.
+fn apply_local_intercept(
+    app: &mut ChatApp,
+    intercepted: LocalIntercept,
+    bus: &HarwEventSender,
+) -> Option<TuiRunOutcome> {
+    match intercepted {
+        LocalIntercept::OpenOverlay(view) => app.open_overlay_view(view),
+        LocalIntercept::OpenModelPicker(target) => app.open_model_switch_picker(target),
+        LocalIntercept::OpenUiaWorkerPicker => app.open_uia_worker_picker(),
+        LocalIntercept::OpenEffortChoice(target) => app.open_effort_choice(target),
+        LocalIntercept::OpenAgentTree => app.open_agent_tree(),
+        LocalIntercept::OpenSessionPicker => {
+            return Some(TuiRunOutcome::Resume { selector: None });
+        }
+        LocalIntercept::TogglePanel(PanelToggle::Workbench) => app.toggle_workbench(),
+        LocalIntercept::TogglePanel(PanelToggle::Agents) => {
+            app.panels.agents_visible = !app.panels.agents_visible;
+            if !app.panels.agents_visible && app.panels.focus == crate::panes::PaneFocus::Agents {
+                app.panels.focus = crate::panes::PaneFocus::Chat;
+                app.panels.maximized = false;
+            }
+            app.sync_agent_detail();
+        }
+        LocalIntercept::TogglePanel(PanelToggle::Explorer) => {
+            app.panels.explorer_visible = !app.panels.explorer_visible;
+            if !app.panels.explorer_visible && app.panels.focus == crate::panes::PaneFocus::Explorer
+            {
+                app.panels.focus = crate::panes::PaneFocus::Chat;
+                app.panels.maximized = false;
+            }
+            app.ensure_explorer();
+        }
+        LocalIntercept::ToggleVerbose => {
+            let text = if app.toggle_verbose() {
+                "Ausführliche Werkzeuganzeige: an"
+            } else {
+                "Ausführliche Werkzeuganzeige: aus"
+            };
+            app.push_lines(vec![Line::from(text)]);
+        }
+        LocalIntercept::ClearTranscript => {
+            app.clear_transcript();
+            app.push_lines(vec![Line::from(
+                "Anzeige geleert — Sitzung und Modellkontext bleiben erhalten.",
+            )]);
+        }
+        LocalIntercept::RenameSession(title) => {
+            let title = title.trim().to_owned();
+            app.set_session_title(title.clone());
+            app.push_lines(vec![Line::from(format!(
+                "Sitzungstitel (Anzeige) gesetzt: „{title}“"
+            ))]);
+        }
+        LocalIntercept::Rewrite(line) => bus.send(HarwEvent::Command(line)),
+        LocalIntercept::Chat(text) => {
+            app.scroll.force_follow();
+            app.pending_turns.push_back(text);
+        }
+        LocalIntercept::System(text) => {
+            app.push_lines(
+                text.split('\n')
+                    .map(|line| Line::from(line.to_owned()))
+                    .collect(),
+            );
+        }
+    }
+    None
+}
+
+/// Führt `raw` über [`command_data::execute_command_with_data`] aus, ohne
+/// etwas in den Chat zu schreiben.
+async fn fetch_command_data(app: &ChatApp, raw: &str) -> Result<OpOutput, String> {
+    let Some(rt) = app.runtime() else {
+        return Err("Fehler: keine Runtime-Montage".to_owned());
+    };
+    command_data::execute_command_with_data(
+        app.adapters(),
+        app.sandbox(),
+        app.session_id(),
+        runtime_commands::caller_tier(rt.principal()),
+        raw,
+        || runtime_commands::slash_service_map(rt.services()),
+    )
+    .await
+}
+
+/// Arbeitet alle ausstehenden Datenabrufe ab (siehe [`DataFetch`]); lädt
+/// zusätzlich das Werkbank-Panel, wenn es sichtbar und veraltet ist.
+///
+/// # Rückgabe
+/// `true`, wenn mindestens ein Abruf lief (Redraw nötig).
+async fn process_pending_fetches(app: &mut ChatApp) -> bool {
+    let mut fetches = std::mem::take(&mut app.pending_fetches);
+    if app.workbench_needs_refresh() && !fetches.contains(&DataFetch::Workbench) {
+        fetches.push(DataFetch::Workbench);
+    }
+    if fetches.is_empty() {
+        return false;
+    }
+    for fetch in fetches {
+        match fetch {
+            DataFetch::Overlay {
+                command,
+                generation,
+            } => {
+                if generation != app.overlay_generation
+                    || !matches!(app.overlay, Some(Overlay::View(_)))
+                {
+                    continue;
+                }
+                let result = fetch_command_data(app, &command).await;
+                if generation != app.overlay_generation {
+                    continue;
+                }
+                if let Some(Overlay::View(view)) = app.overlay.as_mut() {
+                    match result {
+                        Ok(output) => match output.data {
+                            Some(data) => view.apply_data(&data),
+                            None => view.apply_error(&output.text),
+                        },
+                        Err(error) => view.apply_error(&error),
+                    }
+                }
+            }
+            DataFetch::Workbench => {
+                let result = fetch_command_data(app, WorkbenchPane::REFRESH_COMMAND).await;
+                match result {
+                    Ok(output) => match output.data {
+                        Some(data) => app.workbench.apply_data(&data),
+                        None => app.workbench.apply_error(output.text),
+                    },
+                    Err(error) => app.workbench.apply_error(error),
+                }
+            }
+        }
+    }
+    true
+}
+
+/// Wendet das Ergebnis einer Taste in einer generischen Ansicht an.
+fn apply_overlay_outcome(app: &mut ChatApp, outcome: OverlayOutcome, bus: &HarwEventSender) {
+    match outcome {
+        OverlayOutcome::Stay => {}
+        OverlayOutcome::Close => app.overlay = None,
+        // Der `HarwEvent::Command`-Zweig lädt die offene Ansicht danach neu
+        // (`queue_overlay_refresh`).
+        OverlayOutcome::Run(command) => bus.send(HarwEvent::Command(command)),
+        OverlayOutcome::RunAndClose(command) => {
+            app.overlay = None;
+            bus.send(HarwEvent::Command(command));
+        }
+        OverlayOutcome::Fetch(command) => app.queue_overlay_fetch(command),
+        OverlayOutcome::Prefill(text) => {
+            app.overlay = None;
+            app.prefill_composer(&text);
+        }
+    }
+}
+
+/// Globale Ansichtstasten (Standard `F1` Hilfe, `F6` Kanban, `F7`
+/// Modus/Freigabe, `F8` Modelle je Rolle), unabhängig vom Panel-Fokus.
+///
+/// # Beschreibung
+/// Greift nicht, solange eine Freigabefrage oder ein anderes als ein
+/// generisches Overlay offen ist; eine offene generische Ansicht wird
+/// ersetzt.
+///
+/// # Rückgabe
+/// `Some(true)`, wenn eine Ansicht geöffnet wurde; `None` sonst.
+fn handle_view_hotkey(app: &mut ChatApp, key: KeyEvent) -> Option<bool> {
+    if app.pending_approval_dialog.is_some() || app.pending_host_permit_dialog.is_some() {
+        return None;
+    }
+    if app
+        .overlay
+        .as_ref()
+        .is_some_and(|overlay| !matches!(overlay, Overlay::View(_)))
+    {
+        return None;
+    }
+    let view: Box<dyn OverlayView> = match app.key_bindings.action_for(&key)? {
+        KeyAction::OpenKanban => Box::new(KanbanBoard::new()),
+        KeyAction::OpenModePicker => Box::new(app.mode_picker_view()),
+        KeyAction::OpenModels => Box::new(app.model_roles_view()),
+        KeyAction::ShowHelp => Box::new(HelpOverlay::new(
+            &app.command_registry,
+            &app.key_bindings,
+            HelpTab::Commands,
+        )),
+        _ => return None,
+    };
+    app.open_overlay_view(view);
+    Some(true)
+}
+
+/// Tasten des `@`-Erwähnungs-Popups (↑/↓, Enter/Tab übernehmen, Esc).
+///
+/// # Rückgabe
+/// `Some(redraw)`, wenn das Popup die Taste verarbeitet hat; `None` gibt sie
+/// an den Composer weiter (auch bei leerer Trefferliste, damit Enter weiter
+/// absendet).
+fn handle_mention_popup_key(app: &mut ChatApp, key: KeyEvent) -> Option<bool> {
+    let popup = app.mention_popup.as_mut()?;
+    if popup.is_empty()
+        || key
+            .modifiers
+            .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::SHIFT)
+        || !matches!(
+            key.code,
+            KeyCode::Up | KeyCode::Down | KeyCode::Enter | KeyCode::Tab | KeyCode::Esc
+        )
+    {
+        return None;
+    }
+    match popup.handle_key(key) {
+        MentionPopupAction::Stay => {}
+        MentionPopupAction::Cancel => app.mention_popup = None,
+        MentionPopupAction::Accept(insert) => app.accept_mention(&insert),
+    }
+    Some(true)
+}
+
 /// Appends the controller-owned descendants of `parent` in pre-order.
 ///
 /// The `seen` guard makes a malformed controller snapshot harmless for the

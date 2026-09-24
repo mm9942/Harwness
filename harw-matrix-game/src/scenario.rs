@@ -110,10 +110,11 @@ impl SeedSpec {
 
 /// Sichtbarkeit einer Weltvariablen: `public`, `umpire`, `seat:<id>`,
 /// `seats:<id>,<id>` (auch `seats:[a,b]`).
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(try_from = "String", into = "String")]
 pub enum VarVisibility {
     /// Alle Sitze.
+    #[default]
     Public,
     /// Nur der Umpire.
     Umpire,
@@ -237,12 +238,6 @@ impl TryFrom<String> for VarVisibility {
 impl From<VarVisibility> for String {
     fn from(value: VarVisibility) -> Self {
         value.to_string()
-    }
-}
-
-impl Default for VarVisibility {
-    fn default() -> Self {
-        Self::Public
     }
 }
 
@@ -2035,7 +2030,12 @@ mod tests {
         assert!(loaded.scenario.rules().epilogue);
         assert_eq!(loaded.scenario.initial_vars().len(), 7 + 1 + 1 + 1);
         // uneinheitliche Ebenen sind nur eine Warnung
-        assert!(loaded.warnings.iter().any(|w| w.contains("Fraktionsebenen")));
+        assert!(
+            loaded
+                .warnings
+                .iter()
+                .any(|w| w.contains("Fraktionsebenen"))
+        );
         assert_eq!(loaded.source_hash.len(), 64);
         assert_eq!(loaded.scenario.injects_for_round(3).len(), 1);
         Ok(())

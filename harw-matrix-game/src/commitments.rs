@@ -42,7 +42,7 @@ pub fn to_hex(bytes: &[u8]) -> String {
 #[must_use]
 pub fn from_hex(text: &str) -> Option<Vec<u8>> {
     let bytes = text.as_bytes();
-    if bytes.len() % 2 != 0 {
+    if bytes.len() & 1 == 1 {
         return None;
     }
     let mut out = Vec::with_capacity(bytes.len() / 2);

@@ -1027,7 +1027,7 @@ fn validate_ruling(
         ));
     }
     if let Some(secret) = &ruling.triggers_secret {
-        if !state.secrets.get(secret).is_some_and(|s| !s.revealed) {
+        if state.secrets.get(secret).is_none_or(|s| s.revealed) {
             errors.push(format!(
                 "{label}: triggers_secret `{secret}` unbekannt oder offen"
             ));
@@ -1607,7 +1607,7 @@ impl Scratch {
                 if nested {
                     return Err("reveal_secret nicht in each_round".to_owned());
                 }
-                if !ctx.secrets.get(secret_id).is_some_and(|s| !s.revealed) {
+                if ctx.secrets.get(secret_id).is_none_or(|s| s.revealed) {
                     return Err(format!(
                         "Geheimnis `{secret_id}` unbekannt oder bereits offen"
                     ));
