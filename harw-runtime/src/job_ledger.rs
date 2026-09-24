@@ -688,8 +688,9 @@ mod tests {
         reference.insert(in_memory.clone(), JobSnapshot::new(JobState::Ready));
 
         let holder = AgentId::new("worker-1");
-        let pairs: [(&dyn JobTransitions, &WorkId); 2] =
-            [(&ledger, &durable), (&reference, &in_memory)];
+        let durable_jobs: &dyn JobTransitions = &ledger;
+        let reference_jobs: &dyn JobTransitions = &reference;
+        let pairs = [(durable_jobs, &durable), (reference_jobs, &in_memory)];
         for (jobs, work_id) in pairs {
             jobs.claim(work_id, &holder).map_err(ctx("claim"))?;
             jobs.block(work_id, BlockKind::Capability)
