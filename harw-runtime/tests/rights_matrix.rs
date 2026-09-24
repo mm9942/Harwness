@@ -195,7 +195,15 @@ struct Expected {
 /// Die Erwartungstabelle. Das `match` ist erschöpfend: eine neue
 /// [`EntryKind`]-Variante bricht diesen Test beim Kompilieren.
 fn expected(entry: EntryKind) -> Expected {
-    // Sortiert, wie `rights_snapshot` sie sortiert.
+    // Sortiert, wie `rights_snapshot` sie sortiert. `Tui`/`OneShot` tragen
+    // Netz, weil die Vorgabe-Konfiguration eine nicht leere Egress-Allowlist
+    // hat (`[research].network_allow_hosts`, Runde 3 Welle A2).
+    const RWXN: &[&str] = &[
+        "ExecuteProcess",
+        "NetworkAccess",
+        "ReadWorkspace",
+        "WriteWorkspace",
+    ];
     const RWX: &[&str] = &["ExecuteProcess", "ReadWorkspace", "WriteWorkspace"];
     const R: &[&str] = &["ReadWorkspace"];
     const RW: &[&str] = &["ReadWorkspace", "WriteWorkspace"];
@@ -203,9 +211,10 @@ fn expected(entry: EntryKind) -> Expected {
     // Ohne `[policy].require_approval_for` entsteht keine Config-Politik
     // (W2B-03: ein Handler, der alles durchwinkt, wäre nur Rauschen); ohne
     // Responder — den erst `new_root_session` anhängt — bleibt die
-    // Default-Politik allein. Nur `Tui` löst Rückfragen interaktiv auf; jeder
-    // andere Einstieg trägt zusätzlich seine `AskResolutionPolicy`
-    // ([`ApprovalHandlerKind::Other`], Befund Z2c-02).
+    // Default-Politik allein. Nur `Tui` und `GatewayTelegram` (Freigabe-
+    // Buttons) lösen Rückfragen interaktiv auf; jeder andere Einstieg trägt
+    // zusätzlich seine `AskResolutionPolicy` ([`ApprovalHandlerKind::Other`],
+    // Befund Z2c-02).
     const DEFAULT_ONLY: &[ApprovalHandlerKind] = &[ApprovalHandlerKind::DefaultPolicy];
     const DEFAULT_AND_ASK: &[ApprovalHandlerKind] = &[
         ApprovalHandlerKind::DefaultPolicy,
@@ -214,13 +223,20 @@ fn expected(entry: EntryKind) -> Expected {
 
     match entry {
         EntryKind::Tui => Expected {
-            permissions: RWX,
+            permissions: RWXN,
             tools_empty: false,
             approval_chain: DEFAULT_ONLY,
             ceiling_empty: false,
             spawner_empty: false,
         },
-        EntryKind::OneShot | EntryKind::Analyze => Expected {
+        EntryKind::OneShot => Expected {
+            permissions: RWXN,
+            tools_empty: false,
+            approval_chain: DEFAULT_AND_ASK,
+            ceiling_empty: false,
+            spawner_empty: false,
+        },
+        EntryKind::Analyze => Expected {
             permissions: RWX,
             tools_empty: false,
             approval_chain: DEFAULT_AND_ASK,
@@ -248,10 +264,16 @@ fn expected(entry: EntryKind) -> Expected {
             ceiling_empty: false,
             spawner_empty: true,
         },
-        EntryKind::McpServe
-        | EntryKind::JobPrompt
-        | EntryKind::GatewayTelegram
-        | EntryKind::GatewayDream => Expected {
+        // Runde 3, Welle D: Telegram liest und schreibt im Workspace, ohne
+        // Shell und ohne Netz; Rückfragen beantwortet die Person im Chat.
+        EntryKind::GatewayTelegram => Expected {
+            permissions: RW,
+            tools_empty: false,
+            approval_chain: DEFAULT_ONLY,
+            ceiling_empty: true,
+            spawner_empty: true,
+        },
+        EntryKind::McpServe | EntryKind::JobPrompt | EntryKind::GatewayDream => Expected {
             permissions: NONE,
             tools_empty: true,
             approval_chain: DEFAULT_AND_ASK,
@@ -309,24 +331,102 @@ fn every_entry_matches_its_row_of_the_rights_table() -> TestResult {
     Ok(())
 }
 
+/// Runde 3, Welle A2: nur die Nutzeroberflächen (`Tui`, `OneShot`) tragen
+/// Netz, und ihr Host-Scope ist genau die Egress-Allowlist der Konfiguration
+/// ([`harw_runtime::sandbox::root_network_scope`]). Jeder andere Einstieg
+/// bleibt ohne Netzrecht und ohne Hosts; Contributor-Scopes bleiben leer.
 #[test]
-fn no_entry_carries_network() -> TestResult {
+fn only_the_user_interfaces_carry_egress_bound_network() -> TestResult {
     for entry in ALL_ENTRIES {
         let fixture = fixture()?;
         let assembled = assemble(entry, &fixture)?;
         let snapshot = assembled.assembly.rights_snapshot();
-        assert!(
-            !snapshot.permissions.iter().any(|p| p == "NetworkAccess"),
-            "{entry:?} darf bis W5 kein Netzrecht tragen"
+        let sandbox = assembled.assembly.sandbox();
+        let networked = matches!(entry, EntryKind::Tui | EntryKind::OneShot);
+        assert_eq!(
+            snapshot.permissions.iter().any(|p| p == "NetworkAccess"),
+            networked,
+            "{entry:?}: Netzrecht"
         );
         assert!(
             assembled.assembly.network_scope().is_empty(),
-            "{entry:?} darf bis W5 keinen Netz-Scope tragen"
+            "{entry:?}: kein Contributor-Scope"
         );
+        let expected_scope =
+            harw_runtime::sandbox::root_network_scope(entry, assembled.assembly.config());
+        assert_eq!(sandbox.network_scope(), &expected_scope, "{entry:?}");
+        if networked {
+            // Vorgabe `[research].network_allow_hosts`.
+            assert!(sandbox.network_scope().allows("docs.rs"), "{entry:?}");
+            assert!(!sandbox.network_scope().allows("evil.example"), "{entry:?}");
+        } else {
+            assert!(sandbox.network_scope().is_empty(), "{entry:?}");
+        }
+    }
+    Ok(())
+}
+
+/// Ohne Egress-Allowlist entsteht kein Host — auch nicht der Host des
+/// Such-Backends —, und damit auch kein Netzrecht der Wurzel (fail-closed).
+#[test]
+fn without_an_allowlist_the_root_gets_no_hosts() -> TestResult {
+    let mut config = harw_config::ResolvedConfig::default();
+    config.network.allow_hosts.clear();
+    config.network.researcher_web_hosts.clear();
+    config.harness.research.network_allow_hosts.clear();
+    let fixture = fixture()?;
+    for entry in ALL_ENTRIES {
+        let scope = harw_runtime::sandbox::root_network_scope(entry, &config);
+        assert!(scope.is_empty(), "{entry:?}");
+        assert_eq!(scope.hosts().count(), 0, "{entry:?}");
+        let sandbox =
+            harw_runtime::sandbox::root_sandbox_with_network(entry, &fixture.project, scope)
+                .map_err(ctx("Sandbox bindet"))?;
         assert!(
-            assembled.assembly.sandbox().network_scope().is_empty(),
-            "{entry:?}: auch die Sandbox selbst trägt keinen Scope"
+            !sandbox
+                .permissions()
+                .contains(harw_authority::Permission::NetworkAccess),
+            "{entry:?}: ohne Host kein Netzrecht"
         );
+        assert!(sandbox.network_scope().is_empty(), "{entry:?}");
+    }
+    Ok(())
+}
+
+/// Die Read-only-Rollen (analyst, researcher-deps, planner, die vier
+/// security-*-triage-Rollen) bekommen auch unter einer vernetzten
+/// UIA-Wurzel kein Netz, kein Schreiben und keine Ausführung: ihr Reducer
+/// schneidet die Rechte der Wurzel entsprechend.
+#[test]
+fn read_only_roles_stay_network_free_under_a_networked_root() -> TestResult {
+    use harw_authority::Permission;
+    use harw_registry_defaults::authority::authority_reducer_for_role;
+
+    let fixture = fixture()?;
+    let assembled = assemble(EntryKind::Tui, &fixture)?;
+    let root = assembled.assembly.sandbox().permissions().clone();
+    assert!(
+        root.contains(Permission::NetworkAccess),
+        "precondition: die UIA-Wurzel trägt Netz"
+    );
+    for role in [
+        role_names::ANALYST,
+        role_names::RESEARCHER_DEPS,
+        role_names::PLANNER,
+        role_names::SECURITY_EGRESS_TRIAGE,
+        role_names::SECURITY_BASELINE_TRIAGE,
+        role_names::SECURITY_STRUCTURE_TRIAGE,
+        role_names::SECURITY_ENDPOINT_TRIAGE,
+    ] {
+        let reducer = authority_reducer_for_role(role).ok_or(TestError::Missing("reducer"))?;
+        let child = reducer.reduce(&root);
+        for forbidden in [
+            Permission::NetworkAccess,
+            Permission::WriteWorkspace,
+            Permission::ExecuteProcess,
+        ] {
+            assert!(!child.contains(forbidden), "{role}: {forbidden:?}");
+        }
     }
     Ok(())
 }
@@ -1159,13 +1259,13 @@ async fn uia_root_session_is_admitted_its_uia_explorer_and_uia_writer_specializa
 /// Crate-Werkzeuge `web.docs_rs`/`web.crates_io`, `UIA_HELPER_WEB_TOOLS`)
 /// und die fünf lesenden `deps.*`-Werkzeuge — nie `lens.ask`.
 ///
-/// Das Netz selbst ist nie breiter als das des Elternteils: das Kind erbt
-/// über den Handoff die Sandbox des Elternteils (`ManagedAgentSpawner::admit`
-/// prüft `ensure_child_of`), und die UIA-Wurzel eines `EntryKind::Tui`-Laufs
-/// trägt heute weder `NetworkAccess` noch Hosts (`spec.rs`:
-/// „Netzrechte vergibt kein Einstieg“). Die Web-Werkzeuge sind damit zwar
-/// registriert, scheitern aber am Rechte-Prolog, bis ein Elternteil Netz
-/// tatsächlich trägt.
+/// Runde 3, Welle A2: die UIA-Wurzel eines `EntryKind::Tui`-Laufs trägt
+/// `NetworkAccess` mit genau den Hosts der Egress-Allowlist, registriert
+/// selbst aber **kein** `web.*`-Werkzeug — das Netz ist reine Durchreichung
+/// an ihre Helfer. Das Netz eines Helfers ist nie breiter als das des
+/// Elternteils: das Kind erbt über den Handoff die Sandbox des Elternteils
+/// (`ManagedAgentSpawner::admit` prüft `ensure_child_of`), und jede
+/// Verengung ist eine Schnittmenge — ein fremder Host kommt nie hinzu.
 #[tokio::test]
 async fn uia_helpers_get_web_search_and_deps_tools_but_never_more_network_than_the_parent()
 -> TestResult {
@@ -1173,12 +1273,39 @@ async fn uia_helpers_get_web_search_and_deps_tools_but_never_more_network_than_t
     let assembled = assemble(EntryKind::Tui, &fixture)?;
     let (spawner, sandbox, parent) = uia_spawner_fixture(&assembled).await?;
     assert!(
-        !sandbox
+        sandbox
             .permissions()
             .contains(harw_authority::Permission::NetworkAccess),
-        "precondition: the UIA root carries no network today"
+        "precondition: the UIA root carries egress-bound network"
     );
-    assert!(sandbox.network_scope().is_empty());
+    assert!(!sandbox.network_scope().is_empty());
+    assert!(!sandbox.network_scope().allows("evil.example"));
+
+    // Die UIA-Wurzel selbst registriert kein einziges `web.*`-Werkzeug.
+    let root_tools = assembled.assembly.rights_snapshot().tools;
+    assert!(
+        !root_tools.iter().any(|tool| tool.starts_with("web.")),
+        "die UIA-Wurzel darf kein web.* registrieren: {root_tools:?}"
+    );
+
+    // Eine Verengung um einen fremden Host verbreitert das Netz nie: die
+    // Schnittmenge behält nur Hosts, die schon die Wurzel trägt.
+    let widened = sandbox.restrict(
+        &harw_authority::PermissionRequest::from_permissions(sandbox.permissions().iter())
+            .with_network_scope(harw_authority::NetworkScope::from_hosts([
+                "docs.rs".to_owned(),
+                "evil.example".to_owned(),
+            ])),
+    );
+    widened
+        .ensure_child_of(&sandbox)
+        .map_err(ctx("jede Verengung ist ein Kind der Wurzel"))?;
+    assert!(!widened.network_scope().allows("evil.example"));
+    assert!(
+        widened
+            .network_scope()
+            .is_subset_of(sandbox.network_scope())
+    );
 
     let factory = RuntimeChildRegistryFactory::new(
         assembled.assembly.project().clone(),

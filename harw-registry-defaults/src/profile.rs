@@ -166,7 +166,8 @@ pub mod role_names {
     /// Startbarer Orchestrator, den die UIA als Wurzel eines Agentenbaums
     /// einsetzen kann.
     pub const ROOT_ORCHESTRATOR: &str = "root-orchestrator";
-    /// Read-only Erkundung von Workspace und Dependency-Quellen.
+    /// Read-only Erkundung eines Verzeichnisbaums: Projekte, Dateien,
+    /// Dokumente und ihre Beziehungen (sprach- und ökosystemneutral).
     pub const EXPLORER: &str = "explorer";
     /// Rust/Cargo-Spezialist der Dependency-Recherche: belegt Verhalten aus
     /// `Cargo.lock`, dem lokalen Registry-Quellcache, docs.rs und crates.io.
@@ -185,9 +186,9 @@ pub mod role_names {
     /// Wahrscheinlichkeit getrennt von Konfidenz) im `ResearchFinding`
     /// ([`crate::profile::RegistryProfile::ReadOnlyResearch`]).
     pub const RESEARCHER: &str = "researcher";
-    /// Dokumentations-Web-Recherche über die Host-Allowlist der Sandbox —
-    /// ausschließlich Netz, kein Workspace-Lesen (A5), einschließlich der
-    /// Crate-Werkzeuge `web.docs_rs`/`web.crates_io`.
+    /// Web-Recherche in Dokumentation, Release Notes und Paket-Metadaten über
+    /// die Host-Allowlist der Sandbox — ausschließlich Netz, kein
+    /// Workspace-Lesen (A5); für Rust zusätzlich `web.docs_rs`/`web.crates_io`.
     pub const RESEARCHER_WEB: &str = "researcher-web";
     /// Erzeugt Planvorschläge, ohne den autoritativen Plan zu mutieren.
     pub const PLANNER: &str = "planner";
