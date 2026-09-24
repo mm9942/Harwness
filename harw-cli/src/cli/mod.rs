@@ -1,31 +1,41 @@
 //! clap-basierte Kommandozeilen-Grammatik für `harw`.
 //!
-//! Spiegelt das codex-Muster: ein Root-Parser mit optionalem Subcommand und
-//! geflatteten Chat-Flags. Fehlt ein Subcommand, startet der interaktive Chat
-//! (`Cli::command == None`); `--help`/`-h`/`--version` behandelt clap selbst.
+//! Ein Root-Parser mit optionalem Subcommand: globale Flags ([`GlobalArgs`])
+//! gelten hinter jedem Befehl, die Chat-Flags ([`ChatArgs`]) sind an der
+//! Wurzel geflattet, sodass `harw [PROMPT]` ohne Subcommand den Chat startet
+//! (`Cli::command == None`). `--help`/`-h`/`--version` behandelt clap selbst.
 //!
 //! Die Grammatik ist nach Domänen auf Untermodule verteilt; alle Typen werden
 //! hier per Glob re-exportiert, sodass jeder Pfad `crate::cli::X` stabil bleibt.
-//! Typisierte Werte (`ValueEnum`s, Wert-Parser für `--log`/`--mode`) liegen in
-//! [`values`] und speisen sowohl die Parse-Validierung als auch die
-//! Shell-Completions.
+//! Typisierte Werte (`ValueEnum`s, Wert-Parser für `--log`/`--mode`/
+//! `--approval`) liegen in [`values`] und speisen sowohl die
+//! Parse-Validierung als auch die Shell-Completions. Den fertigen
+//! clap-Befehl (inklusive deutscher Hilfe für `completions`) liefert
+//! [`command`].
 
 use std::ffi::OsString;
 use std::path::PathBuf;
 
-use clap::{Parser, Subcommand, ValueHint};
+use clap::{CommandFactory, Parser, Subcommand, ValueHint};
 
+mod agent;
 mod analyze;
 mod auth;
+mod channel;
 mod completions;
+mod debug;
 mod gateway;
 mod global;
+mod jobs;
+mod knowledge;
 mod lens;
 mod mcp;
 mod models;
 mod project;
+mod provider;
 mod sandbox;
 mod service;
+mod session;
 mod settings;
 mod uia;
 pub mod values;
@@ -33,17 +43,24 @@ pub mod values;
 #[cfg(test)]
 mod tests;
 
+pub use agent::*;
 pub use analyze::*;
 pub use auth::*;
+pub use channel::*;
 pub use completions::*;
+pub use debug::*;
 pub use gateway::*;
 pub use global::*;
+pub use jobs::*;
+pub use knowledge::*;
 pub use lens::*;
 pub use mcp::*;
 pub use models::*;
 pub use project::*;
+pub use provider::*;
 pub use sandbox::*;
 pub use service::*;
+pub use session::*;
 pub use settings::*;
 pub use uia::*;
 pub use values::*;
@@ -59,25 +76,55 @@ pub use values::*;
     subcommand_precedence_over_arg = true
 )]
 pub struct Cli {
-    /// Chat-Flags am Root, damit `harw [PROMPT]` ohne Subcommand funktioniert.
+    /// Globale Flags, die hinter jedem Befehl gelten.
+    #[command(flatten)]
+    pub global: GlobalArgs,
+    /// Chat-Flags an der Wurzel, damit `harw [PROMPT]` ohne Subcommand funktioniert.
     #[command(flatten)]
     pub chat: ChatArgs,
-    /// Interaktionsmodus beim Start: chat, plan, explore, work oder shell.
-    /// Ohne Angabe gilt der Wert aus `[mode] default` der Harness-Konfiguration.
-    ///
-    /// Der Wert wird beim Parsen über [`ModeParser`] geprüft, der ausschließlich
-    /// `harw_core::InteractionMode::parse` bzw. `InteractionMode::names`
-    /// befragt und den kanonischen Namen (`InteractionMode::as_str`) liefert.
-    /// `harw-cli` führt die Modusliste damit nicht ein zweites Mal — die in
-    /// `harw-core` bleibt die maßgebliche.
-    #[arg(long, value_name = "MODE", global = true, value_parser = ModeParser)]
-    pub mode: Option<String>,
-    /// Ziel-Statement, das beim Start gesetzt und an den Plan gebunden wird.
-    #[arg(long, value_name = "TEXT", global = true, value_hint = ValueHint::Other)]
-    pub goal: Option<String>,
     /// Optionaler Subcommand; ohne diesen startet der Chat.
     #[command(subcommand)]
     pub command: Option<Command>,
+}
+
+/// Liefert den vollständigen clap-Befehl von `harw`.
+///
+/// Entspricht [`Cli::command`], ergänzt um deutsche Hilfetexte für die
+/// Argumente von `completions`, die aus dem gemeinsamen Completions-Crate
+/// stammen. Hilfe-Ausgabe, Parse-Fehler und Shell-Completions sollten diesen
+/// Befehl verwenden.
+///
+/// # Returns
+/// Den fertig konfigurierten [`clap::Command`].
+#[must_use]
+pub fn command() -> clap::Command {
+    Cli::command().mut_subcommand("completions", |sub| {
+        sub.about("Erzeugt oder installiert Shell-Vervollständigungen.")
+            .long_about(
+                "Erzeugt oder installiert Shell-Vervollständigungen \
+                 (bash, zsh, fish, elvish, powershell).",
+            )
+            .mut_arg("shell", |arg| {
+                arg.help("Ziel-Shell; ohne Angabe wird sie aus $SHELL ermittelt.")
+            })
+            .mut_arg("install", |arg| {
+                arg.help(
+                    "Installiert das Vervollständigungsskript (ersetzt ältere Installationen).",
+                )
+            })
+            .mut_arg("uninstall", |arg| {
+                arg.help("Entfernt alle von harw angelegten Vervollständigungsdateien.")
+            })
+            .mut_arg("dry_run", |arg| {
+                arg.help("Zeigt nur, was --install bzw. --uninstall ändern würde.")
+            })
+            .mut_arg("all_binaries", |arg| {
+                arg.help(
+                    "Installiert bzw. entfernt die Vervollständigungen auch für alle \
+                     weiteren harw-Programme im PATH.",
+                )
+            })
+    })
 }
 
 /// Alle Subcommands von `harw`.

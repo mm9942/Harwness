@@ -134,7 +134,7 @@ pub fn load_config(spec: &RuntimeSpec) -> RuntimeResult<(ResolvedConfig, ConfigT
         layers.push(settings_dir);
     }
 
-    let config = harw_config::discover_config_with_restricted_and_project_settings(
+    let mut config = harw_config::discover_config_with_restricted_and_project_settings(
         &layers,
         untrusted_repo.as_deref(),
         settings_path.is_file().then_some(settings_path.as_path()),
@@ -145,6 +145,9 @@ pub fn load_config(spec: &RuntimeSpec) -> RuntimeResult<(ResolvedConfig, ConfigT
     config.validate().map_err(|error| RuntimeError::Config {
         detail: error.to_string(),
     })?;
+    if let Some(requested) = spec.model_override.as_deref() {
+        apply_model_override(&mut config, requested)?;
+    }
     log_config_diagnostics(&config);
 
     let trust = ConfigTrustReport {
@@ -153,6 +156,65 @@ pub fn load_config(spec: &RuntimeSpec) -> RuntimeResult<(ResolvedConfig, ConfigT
         trust_status: status,
     };
     Ok((config, trust))
+}
+
+/// Setzt ein explizit gewähltes Modell ([`RuntimeSpec::model_override`]) als
+/// Vorgabe des Laufs.
+///
+/// # Beschreibung
+/// Sucht `requested` im Modellkatalog (`config.models`): zuerst als
+/// Katalogschlüssel, danach als Modell-ID und zuletzt als Alias; bei mehreren
+/// Treffern gewinnt der alphabetisch erste Schlüssel, damit das Ergebnis
+/// nicht von der Reihenfolge der Hash-Tabelle abhängt. Der Treffer wird als
+/// `default_model` (Katalogschlüssel) mit seinem Anbieter als
+/// `default_provider` gesetzt. Eine UIA-Festlegung (`uia_provider`/
+/// `uia_model`) wird dabei aufgehoben, damit die explizite Wahl auch für die
+/// interaktive Sitzung gilt.
+///
+/// # Argumente
+/// - `config` (`&mut ResolvedConfig`): bereits gemergte und validierte
+///   Konfiguration des Laufs.
+/// - `requested` (`&str`): Schlüssel, Modell-ID oder Alias.
+///
+/// # Errors
+/// [`RuntimeError::Config`], wenn kein Katalogeintrag passt.
+fn apply_model_override(config: &mut ResolvedConfig, requested: &str) -> RuntimeResult<()> {
+    let mut keys: Vec<&String> = config.models.keys().collect();
+    keys.sort();
+    let found = keys
+        .iter()
+        .find(|key| key.as_str() == requested)
+        .or_else(|| {
+            keys.iter()
+                .find(|key| config.models[key.as_str()].id == requested)
+        })
+        .or_else(|| {
+            keys.iter().find(|key| {
+                config.models[key.as_str()]
+                    .aliases
+                    .iter()
+                    .any(|alias| alias == requested)
+            })
+        })
+        .map(|key| {
+            (
+                key.to_string(),
+                config.models[key.as_str()].provider.clone(),
+            )
+        });
+    let Some((model_key, provider)) = found else {
+        return Err(RuntimeError::Config {
+            detail: format!(
+                "unbekanntes Modell '{requested}' (weder Schlüssel, Modell-ID noch Alias \
+                 eines konfigurierten Modells; siehe `harw model list`)"
+            ),
+        });
+    };
+    config.harness.default_model = Some(model_key);
+    config.harness.default_provider = Some(provider);
+    config.harness.uia_provider = None;
+    config.harness.uia_model = None;
+    Ok(())
 }
 
 /// Protokolliert nicht-fatale Katalog-Diagnosen (`config.diagnostics`,
@@ -434,6 +496,55 @@ mod tests {
                     && diagnostic.reference == "missing"),
             "expected a diagnostic for the dangling default_provider, got {:?}",
             config.diagnostics
+        );
+        Ok(())
+    }
+
+    /// Root-Space mit einem Katalogmodell (Schlüssel `fast`, ID
+    /// `gpt-fast-1`, Alias `schnell`) beim Anbieter `openai`.
+    fn home_with_model(home: &Path) -> TestResult {
+        trusted_home(home)?;
+        write_layer_file(
+            home,
+            "models/fast.toml",
+            "id = \"gpt-fast-1\"\nprovider = \"openai\"\naliases = [\"schnell\"]\n",
+        )
+    }
+
+    #[test]
+    fn model_override_resolves_key_id_and_alias() -> TestResult {
+        let home = TempDir::new()?;
+        let cwd = TempDir::new()?;
+        home_with_model(home.path())?;
+
+        for requested in ["fast", "gpt-fast-1", "schnell"] {
+            let mut spec = spec_for(home.path(), cwd.path());
+            spec.model_override = Some(requested.to_owned());
+            let (config, _trust) = load_config(&spec).map_err(ctx("load_config"))?;
+            assert_eq!(config.harness.default_model.as_deref(), Some("fast"));
+            assert_eq!(config.harness.default_provider.as_deref(), Some("openai"));
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn unknown_model_override_is_a_config_error() -> TestResult {
+        let home = TempDir::new()?;
+        let cwd = TempDir::new()?;
+        home_with_model(home.path())?;
+        let mut spec = spec_for(home.path(), cwd.path());
+        spec.model_override = Some("gibt-es-nicht".to_owned());
+
+        let result = load_config(&spec);
+
+        let Err(RuntimeError::Config { detail }) = result else {
+            return Err(TestError::Unexpected(
+                "an unknown model override must be a config error".into(),
+            ));
+        };
+        assert!(
+            detail.contains("unbekanntes Modell 'gibt-es-nicht'"),
+            "{detail}"
         );
         Ok(())
     }

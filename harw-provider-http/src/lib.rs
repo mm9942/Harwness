@@ -77,6 +77,7 @@
 
 pub mod anthropic;
 mod anthropic_caps;
+pub mod budget;
 pub mod cache_strategy;
 pub mod discovery;
 mod error;
@@ -1172,6 +1173,20 @@ pub struct ProviderLoadStatus {
     /// Wiederholte 429 sind das primäre Signal, die Concurrency für diesen
     /// Provider zu **senken** — nicht zu erhöhen.
     pub recent_rate_limited: u64,
+    /// Momentaufnahmen der client-seitigen RPM/TPM-Budgets dieses Providers
+    /// (Provider-Bucket zuerst, dann Modell-Overrides; siehe
+    /// [`budget::BudgetSnapshot`]). Leer, wenn keine Budgets konfiguriert
+    /// sind.
+    pub budgets: Vec<budget::BudgetSnapshot>,
+}
+
+impl ProviderLoadStatus {
+    /// Ergänzt die Budget-Momentaufnahmen aus `budgets`.
+    #[must_use]
+    pub fn with_budgets(mut self, budgets: &budget::ProviderBudgets) -> Self {
+        self.budgets = budgets.snapshot();
+        self
+    }
 }
 
 /// Provider-neutrale Steuer- und Beobachtungsfläche für Nebenläufigkeit und
@@ -1251,6 +1266,7 @@ pub(crate) fn provider_load_status(
             .unwrap_or(usize::MAX),
         rate_limit_wait: rate_limiter.pending_wait(),
         recent_rate_limited: rate_limiter.rate_limited_count(),
+        budgets: Vec::new(),
     }
 }
 
@@ -1278,6 +1294,7 @@ struct ProviderLoadHandle {
     provider_id: String,
     concurrency_limiter: Option<std::sync::Arc<DynamicConcurrencyLimiter>>,
     rate_limiter: std::sync::Arc<rate_limiter::ProviderRateLimiter>,
+    budgets: budget::ProviderBudgets,
 }
 
 impl ProviderLoadControl for ProviderLoadHandle {
@@ -1287,6 +1304,7 @@ impl ProviderLoadControl for ProviderLoadHandle {
             self.concurrency_limiter.as_deref(),
             &self.rate_limiter,
         )
+        .with_budgets(&self.budgets)
     }
 
     fn set_max_concurrency(&self, target: Option<usize>) -> bool {
@@ -1363,6 +1381,11 @@ pub struct OpenAiResponsesProvider {
     /// [`Self::authorized_request`], [`identity_headers`]). Andere Provider
     /// bleiben unberührt, solange dieses Feld `false` ist.
     gateway_identity_headers: bool,
+    /// Client-seitige RPM/TPM-Budgets dieses Providers und seiner
+    /// Modell-Overrides (siehe [`budget`]); leer ohne `[rate_limit]`-Budgets.
+    /// Wird in [`Self::respond_once`] **vor** dem Nebenläufigkeits-Permit
+    /// reserviert, nach der Antwort abgeglichen und bei 429 gesperrt.
+    budgets: budget::ProviderBudgets,
 }
 
 /// Eine gemerkte Reasoning-Runde der Responses-API (W4a / A-OAI).
@@ -1498,6 +1521,7 @@ impl OpenAiResponsesProvider {
             concurrency_limiter: None,
             credential_pool: None,
             gateway_identity_headers: false,
+            budgets: budget::ProviderBudgets::default(),
         })
     }
 
@@ -1582,6 +1606,26 @@ impl OpenAiResponsesProvider {
         config: &harw_config::ResolvedConfig,
         model: &str,
         sources: SecretSources<'_>,
+    ) -> HttpProviderResult<Self> {
+        Self::from_named_config_with_budgets(
+            provider_name,
+            provider,
+            config,
+            model,
+            sources,
+            &budget::ProviderBudgetRegistry::global(),
+        )
+    }
+
+    /// Wie [`Self::from_named_config`], aber mit injizierter
+    /// [`budget::ProviderBudgetRegistry`] statt der prozessweiten.
+    fn from_named_config_with_budgets(
+        provider_name: &str,
+        provider: &harw_config::ProviderToml,
+        config: &harw_config::ResolvedConfig,
+        model: &str,
+        sources: SecretSources<'_>,
+        budgets: &budget::ProviderBudgetRegistry,
     ) -> HttpProviderResult<Self> {
         let codex_route = codex::CodexRoute::from_provider(provider)?;
         let base_url = if codex_route.is_some() {
@@ -1718,8 +1762,12 @@ impl OpenAiResponsesProvider {
         http_provider.stream_policy =
             sse::StreamPolicy::from_config(provider_name, provider, config);
         http_provider.rate_limiter = std::sync::Arc::new(rate_limiter::ProviderRateLimiter::new(
-            provider.rate_limit.clone(),
+            provider
+                .rate_limit
+                .as_ref()
+                .map(harw_config::RateLimitToml::header_pacer_config),
         ));
+        http_provider.budgets = budgets.configure_provider(provider_name, provider, config);
         http_provider.concurrency_limiter = Some(std::sync::Arc::new(
             DynamicConcurrencyLimiter::new(provider.max_concurrency),
         ));
@@ -1787,6 +1835,20 @@ impl OpenAiResponsesProvider {
             self.concurrency_limiter.as_deref(),
             &self.rate_limiter,
         )
+        .with_budgets(&self.budgets)
+    }
+
+    /// Liefert die client-seitigen Budgets dieses Providers (billiger Klon
+    /// aus `Arc`s), z. B. für einen [`ProviderLoadHandle`].
+    #[must_use]
+    pub fn budgets(&self) -> budget::ProviderBudgets {
+        self.budgets.clone()
+    }
+
+    /// Ersetzt die client-seitigen Budgets (Tests/Composition Roots, die
+    /// eine eigene [`budget::ProviderBudgetRegistry`] injizieren).
+    pub fn set_budgets(&mut self, budgets: budget::ProviderBudgets) {
+        self.budgets = budgets;
     }
 
     /// Resolves the model for one request after checking its provider affinity.
