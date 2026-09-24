@@ -3471,6 +3471,103 @@ transport = "carrier_pigeon"
     }
 
     #[test]
+    fn telegram_binding_services_map_workspaces_admins_and_default_alias() -> TestResult {
+        let home = tempfile::tempdir().map_err(ctx("temp home"))?;
+        fs::create_dir_all(home.path().join("ws").join("ops")).map_err(ctx("workspace root"))?;
+        let config = telegram_test_config(
+            r#"
+[[channel.telegram]]
+id = "telegram:ops"
+bot_token_ref = "env:HARW_GW_TEST_SERVICES_TOKEN"
+[channel.telegram.security]
+pinned_identities = [1]
+admin_identities = [42]
+[[channel.telegram.workspaces]]
+alias = "ops"
+tenant = "default"
+root = "ws/ops"
+default = true
+"#,
+            &[("HARW_GW_TEST_SERVICES_TOKEN", "444:token")],
+        )?;
+        let binding = first_telegram_binding(&config)?;
+        let services = telegram_binding_services(home.path(), binding, home.path())
+            .map_err(TestError::Unexpected)?;
+        assert_eq!(services.default_workspace_alias.as_deref(), Some("ops"));
+        assert!(services.admin_sender_ids.contains("42"));
+        assert_eq!(services.admin_sender_ids.len(), 1);
+        services
+            .workspaces
+            .resolve(
+                &TenantId::from_str("default"),
+                &WorkspaceId::from_str("ops"),
+            )
+            .map_err(ctx("configured workspace resolves"))?;
+        Ok(())
+    }
+
+    #[test]
+    fn telegram_binding_services_fail_closed_on_unresolvable_workspace_or_fallback() -> TestResult {
+        let home = tempfile::tempdir().map_err(ctx("temp home"))?;
+        let missing_root = telegram_test_config(
+            r#"
+[[channel.telegram]]
+id = "telegram:ops"
+bot_token_ref = "env:HARW_GW_TEST_SERVICES_TOKEN"
+[channel.telegram.security]
+pinned_identities = [1]
+[[channel.telegram.workspaces]]
+alias = "ops"
+tenant = "default"
+root = "does-not-exist"
+"#,
+            &[("HARW_GW_TEST_SERVICES_TOKEN", "444:token")],
+        )?;
+        assert!(
+            telegram_binding_services(
+                home.path(),
+                first_telegram_binding(&missing_root)?,
+                home.path()
+            )
+            .is_err()
+        );
+        let bogus_fallback = telegram_test_config(
+            r#"
+[[channel.telegram]]
+id = "telegram:ops"
+bot_token_ref = "env:HARW_GW_TEST_SERVICES_TOKEN"
+[channel.telegram.security]
+pinned_identities = [1]
+[channel.telegram.commands]
+unknown_command_fallback = "bogus"
+"#,
+            &[("HARW_GW_TEST_SERVICES_TOKEN", "444:token")],
+        )?;
+        assert!(
+            telegram_binding_services(
+                home.path(),
+                first_telegram_binding(&bogus_fallback)?,
+                home.path()
+            )
+            .is_err()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn telegram_chat_state_roots_are_per_binding() {
+        let state = Path::new("/state");
+        assert_eq!(
+            telegram_chat_state_root(state, "telegram:a"),
+            Path::new("/state/telegram-chats/74656c656772616d3a61")
+        );
+        assert_ne!(
+            telegram_chat_state_root(state, "telegram:a"),
+            telegram_chat_state_root(state, "telegram:b")
+        );
+    }
+
+    #[test]
     fn telegram_offset_roots_are_per_binding_and_keep_the_legacy_default() {
         let state = Path::new("/state");
         assert_eq!(
