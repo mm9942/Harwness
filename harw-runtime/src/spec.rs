@@ -14,6 +14,7 @@ use std::time::Duration;
 
 use harw_authority::{Permission, PermissionSet};
 use harw_core::mode::InteractionMode;
+use harw_extension_api::approval_mode::ApprovalMode;
 use harw_extension_api::contributors::ApprovalHandlerKind;
 use harw_registry_defaults::profile::RegistryProfile;
 use harw_types::{ApprovalActor, Principal, ReasoningEffort};
@@ -261,6 +262,15 @@ pub struct RuntimeSpec {
     pub active_agent: Option<String>,
     /// Explizit gewählter Reasoning-Effort.
     pub reasoning_effort: Option<ReasoningEffort>,
+    /// Explizit gewählter Freigabemodus (z. B. `--approval`). `Some` hat
+    /// Vorrang vor `[permissions].default_mode` aus der Konfiguration und der
+    /// Vorgabe der Einstiegsart; `None` lässt die Konfiguration entscheiden.
+    pub approval_override: Option<ApprovalMode>,
+    /// Explizit gewähltes Modell (z. B. `--model`) als Schlüssel, Modell-ID
+    /// oder Alias aus der Modellkonfiguration. `load_config` prüft den Wert
+    /// und setzt daraus Vorgabemodell und -anbieter des Laufs; ein unbekanntes
+    /// Modell ist ein Konfigurationsfehler. `None` lässt die Vorgabe stehen.
+    pub model_override: Option<String>,
 }
 
 /// Seiteneffektfreie Momentaufnahme der effektiven Rechte eines montierten
@@ -621,6 +631,8 @@ mod tests {
             mode_override: Some(InteractionMode::Work),
             active_agent: None,
             reasoning_effort: Some(ReasoningEffort::High),
+            approval_override: None,
+            model_override: None,
         };
         let perms = spec.entry.profile().permissions;
         let names: Vec<String> = perms.iter().map(|p| format!("{p:?}")).collect();

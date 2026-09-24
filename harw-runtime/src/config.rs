@@ -264,6 +264,8 @@ mod tests {
             mode_override: None,
             active_agent: None,
             reasoning_effort: None,
+            approval_override: None,
+            model_override: None,
         }
     }
 

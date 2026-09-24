@@ -224,7 +224,10 @@ impl fmt::Display for BudgetError {
                 requested,
                 limit,
             } => {
-                write!(f, "request needs ~{requested} tokens but provider '{provider}'")?;
+                write!(
+                    f,
+                    "request needs ~{requested} tokens but provider '{provider}'"
+                )?;
                 if let Some(model) = model {
                     write!(f, " model '{model}'")?;
                 }
@@ -277,7 +280,9 @@ impl TokenBucket {
         if self.level >= amount {
             return None;
         }
-        Some(duration_from_secs((amount - self.level) / self.per_second()))
+        Some(duration_from_secs(
+            (amount - self.level) / self.per_second(),
+        ))
     }
 
     fn take(&mut self, amount: f64) {
@@ -596,7 +601,7 @@ impl ProviderBudget {
             // Prüfung und Schlaf verloren geht.
             let notified = self.notify.notified();
             let mut notified = std::pin::pin!(notified);
-            notified.as_mut().enable();
+            let _registered = notified.as_mut().enable();
             let Some(wait) = self.try_admit(&charge, &mut waiting) else {
                 break;
             };
@@ -875,7 +880,12 @@ impl ProviderBudgets {
 
     /// Ergänzt einen Modell-Bucket unter `model` und `aliases`.
     #[must_use]
-    pub fn with_model(mut self, model: &str, aliases: &[String], budget: Arc<ProviderBudget>) -> Self {
+    pub fn with_model(
+        mut self,
+        model: &str,
+        aliases: &[String],
+        budget: Arc<ProviderBudget>,
+    ) -> Self {
         self.models.insert(model.to_owned(), Arc::clone(&budget));
         for alias in aliases {
             self.models
@@ -1102,7 +1112,7 @@ impl ProviderBudgetRegistry {
 mod tests {
     use super::*;
 
-    type TestResult = Result<(), Box<dyn std::error::Error>>;
+    type TestResult<T = ()> = Result<T, Box<dyn std::error::Error>>;
 
     /// Manuell vorgestellte Uhr für deterministische Tests.
     #[derive(Debug)]
@@ -1156,6 +1166,13 @@ mod tests {
         Err(format!("expected {expected} waiting callers").into())
     }
 
+    /// Gibt geweckten Tasks Gelegenheit, ihren Zustand neu zu prüfen.
+    async fn settle() {
+        for _ in 0..20 {
+            tokio::task::yield_now().await;
+        }
+    }
+
     const SHORT: Duration = Duration::from_millis(50);
     const LONG: Duration = Duration::from_secs(5);
 
@@ -1201,8 +1218,12 @@ mod tests {
 
         clock.advance(Duration::from_secs(30));
         budget.wake_waiters();
+        settle().await;
         wait_for_waiters(&budget, 1).await?;
-        assert!(!waiter.is_finished(), "half a minute refills only half a request");
+        assert!(
+            !waiter.is_finished(),
+            "half a minute refills only half a request"
+        );
 
         clock.advance(Duration::from_secs(30));
         budget.wake_waiters();
@@ -1349,6 +1370,7 @@ mod tests {
         wait_for_waiters(&budget, 1).await?;
         clock.advance(Duration::from_secs(29));
         budget.wake_waiters();
+        settle().await;
         wait_for_waiters(&budget, 1).await?;
         assert!(!waiter.is_finished(), "still inside the 429 back-off");
 
@@ -1417,7 +1439,9 @@ mod tests {
         Ok(())
     }
 
-    fn provider_toml(rate_limit: Option<harw_config::RateLimitToml>) -> TestResult<harw_config::ProviderToml> {
+    fn provider_toml(
+        rate_limit: Option<harw_config::RateLimitToml>,
+    ) -> TestResult<harw_config::ProviderToml> {
         let mut provider: harw_config::ProviderToml = toml_like_provider()?;
         provider.rate_limit = rate_limit;
         Ok(provider)

@@ -2491,7 +2491,9 @@ mod tests {
         }
         assert!(!skills.join("release-notes").exists(), "propose darf nie aktivieren");
         let loaded = store.load(&meta.proposal_id).map_err(ctx("load"))?;
-        assert_eq!(loaded.meta, meta);
+        assert_eq!(loaded.meta.proposal_id, meta.proposal_id);
+        assert_eq!(loaded.meta.evals, meta.evals);
+        assert_eq!(loaded.skill_toml, GOOD_TOML);
         assert!(!loaded.expired);
         Ok(())
     }

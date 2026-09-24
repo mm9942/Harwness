@@ -1321,6 +1321,8 @@ mod tests {
             mode_override,
             active_agent: None,
             reasoning_effort: None,
+            approval_override: None,
+            model_override: None,
         };
         let state_store: Arc<dyn StateStore> = Arc::new(harw_core::InMemoryStateStore::new());
         RuntimeAssembly::builder(spec)

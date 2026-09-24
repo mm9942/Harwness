@@ -1078,10 +1078,9 @@ mod tests {
 
     #[test]
     fn test_delegation_targets_of_reads_only_string_arrays() -> crate::test_support::TestResult {
-        let tables: toml::Table = toml::from_str(
-            "[delegation]\ntargets = [\"explorer\", 3, \"planner\"]\n",
-        )
-        .map_err(crate::test_support::ctx("Test-TOML muss parsen"))?;
+        let tables: toml::Table =
+            toml::from_str("[delegation]\ntargets = [\"explorer\", 3, \"planner\"]\n")
+                .map_err(crate::test_support::ctx("Test-TOML muss parsen"))?;
         assert_eq!(
             delegation_targets_of(&tables),
             Some(vec!["explorer".to_owned(), "planner".to_owned()])

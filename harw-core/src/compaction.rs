@@ -1692,7 +1692,7 @@ fn elide_current_turn(
             result.result = tool_result_with_text(&result.result, cut);
             affected.insert(result.call_id.clone());
         }
-        if fits(&groups) {
+        if fits(groups.as_slice()) {
             return Some(finish(groups, &affected, false));
         }
     }
@@ -1723,7 +1723,7 @@ fn elide_current_turn(
             result.result = tool_result_with_text(&result.result, placeholder);
             affected.insert(result.call_id.clone());
         }
-        if fits(&groups) {
+        if fits(groups.as_slice()) {
             return Some(finish(groups, &affected, false));
         }
     }

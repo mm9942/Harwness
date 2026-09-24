@@ -1,21 +1,20 @@
-//! Grammatik von `harw models`: Modelle entdecken/verwalten und interne
-//! Modellstellen konfigurieren.
+//! Grammatik von `harw model` (Alias `models`): Modelle entdecken/verwalten
+//! und interne Modellstellen konfigurieren.
 
 use clap::{Subcommand, ValueHint};
 
 use super::values::OnOff;
 
-/// Aktionen des `harw models`-Subcommands (Addendum C).
+/// Aktionen des `harw model`-Subcommands.
 ///
-/// Ohne diesen Subcommand (`Cli::command == Some(Command::Models { action:
-/// None })`) entspricht das dem `list`-Zweig (siehe `crate::models::run`).
+/// Ohne Unterbefehl (`Command::Model { action: None }`) entspricht das dem
+/// `list`-Zweig (siehe `crate::models::run`).
 #[derive(Debug, Subcommand)]
 pub enum ModelsAction {
     /// Listet aktivierte Provider, konfigurierte Modelle (mit markiertem
     /// Standardmodell) und die internen Modellstellen samt Auflösung.
     List,
-    /// Fragt die `/models`-Endpunkte konfigurierter Provider ab
-    /// (`harw_provider_http::discovery::list_models`).
+    /// Fragt die verfügbaren Modelle der konfigurierten Anbieter ab.
     Scan {
         /// Nur diesen Provider abfragen; ohne Angabe alle aktivierten
         /// Provider.
@@ -23,7 +22,7 @@ pub enum ModelsAction {
         provider: Option<String>,
         /// Veraltet und nur noch zur Rückwärtskompatibilität akzeptiert:
         /// jeder erfolgreiche Scan synchronisiert Modell-Dateien ohnehin.
-        #[arg(long)]
+        #[arg(long, hide = true)]
         add: bool,
         /// Zeigt/übernimmt nur kostenlose Modelle (Preis 0 oder
         /// `:free`-Suffix der Modell-ID).
@@ -46,7 +45,8 @@ pub enum ModelsAction {
         target: Option<String>,
     },
     /// Entfernt ein Modell aus der sichtbaren Auswahl und dem lokalen Cache.
-    Delete {
+    #[command(alias = "delete")]
+    Remove {
         /// `provider/modell`.
         #[arg(value_hint = ValueHint::Other)]
         target: String,
@@ -58,16 +58,21 @@ pub enum ModelsAction {
         #[command(subcommand)]
         action: Option<InternalAction>,
     },
-    /// Setzt das globale Standardmodell — derselbe Schreibpfad wie `harw
-    /// settings model default`.
+    /// Setzt das globale Standardmodell.
     Default {
         /// Modell-ID, wie in `models/<id>.toml` deklariert.
         #[arg(value_hint = ValueHint::Other)]
         id: String,
     },
+    /// Zeigt den Anbieter-Katalog oder aktualisiert ihn aus models.dev.
+    Catalog {
+        /// Modell-Listen aus models.dev aktualisieren.
+        #[arg(long)]
+        refresh: bool,
+    },
 }
 
-/// Aktionen des `harw models internal`-Subcommands.
+/// Aktionen des `harw model internal`-Subcommands.
 #[derive(Debug, Subcommand)]
 pub enum InternalAction {
     /// Zeigt jede interne Modellstelle mit ihrer effektiven Auflösung
@@ -76,8 +81,7 @@ pub enum InternalAction {
     /// Setzt eine interne Modellstelle explizit auf `model`, optional bei
     /// einem anderen Provider als `harness.default_provider`.
     Set {
-        /// Stellen-Schlüssel, z. B. `session_title` oder `session-title`
-        /// (siehe `harw_config::InternalModelPoint::parse`).
+        /// Stellen-Schlüssel, z. B. `session_title` oder `session-title`.
         #[arg(value_hint = ValueHint::Other)]
         point: String,
         /// Modell-ID beim gewählten Provider.

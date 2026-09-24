@@ -207,6 +207,25 @@ fn expected_role_table() -> Vec<(&'static str, RegistryProfile, AuthorityReducer
             RegistryProfile::UiaWriter,
             AuthorityReducer::ReadExplore,
         ),
+        // Plan Punkt 1: die drei eingebauten Child-Orchestratoren teilen das
+        // read-only Profil des Root-Orchestrators. `research-orchestrator`
+        // bekommt `ReadExplore` als reine Netz-Durchreichung an seine
+        // Netz-Rechercheure — `Planning` registriert kein `web.*`.
+        (
+            role_names::CODING_ORCHESTRATOR,
+            RegistryProfile::Planning,
+            AuthorityReducer::ReadRegistry,
+        ),
+        (
+            role_names::RESEARCH_ORCHESTRATOR,
+            RegistryProfile::Planning,
+            AuthorityReducer::ReadExplore,
+        ),
+        (
+            role_names::ANALYSIS_ORCHESTRATOR,
+            RegistryProfile::Planning,
+            AuthorityReducer::ReadRegistry,
+        ),
     ]
 }
 
@@ -359,7 +378,18 @@ fn test_role_by_permission_matrix_after_reducer() {
             }
             // Netz sehen nach dem Reducer nur die freigegebenen Rollen, und
             // nur, wenn der Elternteil selbst Netz trägt (nie breiter).
+            // `research-orchestrator` trägt Netz nur zur Durchreichung an
+            // seine Kinder; sein Profil `Planning` registriert kein `web.*`
+            // (unten geprüft über `web_tool_roles`).
             let networked_roles = [
+                role_names::EXPLORER,
+                role_names::UIA_EXPLORER,
+                role_names::UIA_WORKER,
+                role_names::UIA_WRITER,
+                role_names::RESEARCHER_WEB,
+                role_names::RESEARCH_ORCHESTRATOR,
+            ];
+            let web_tool_roles = [
                 role_names::EXPLORER,
                 role_names::UIA_EXPLORER,
                 role_names::UIA_WORKER,
@@ -371,7 +401,7 @@ fn test_role_by_permission_matrix_after_reducer() {
                 networked_roles.contains(&role) && parent.contains(Permission::NetworkAccess),
                 "{role}: Netz nach dem Reducer"
             );
-            if !networked_roles.contains(&role) {
+            if !web_tool_roles.contains(&role) {
                 assert!(
                     !tools.iter().any(|tool| tool.starts_with("web.")),
                     "{role}: read-only Rolle sieht web.*"

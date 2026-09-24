@@ -1678,11 +1678,9 @@ impl RuntimeAssemblyBuilder {
 
         // 6. Freigabekette. Der Responder kommt erst mit `new_root_session`:
         //    er gehört zur Oberfläche, nicht zur Montage.
-        let approval_mode = ApprovalModeCell::new(effective_approval_mode(
-            spec.entry,
-            &global_permissions,
-            &project_permissions,
-        ));
+        let approval_mode = ApprovalModeCell::new(spec.approval_override.unwrap_or_else(|| {
+            effective_approval_mode(spec.entry, &global_permissions, &project_permissions)
+        }));
         let allow_rules = seed_allow_rule_set(&global_permissions, &project_permissions);
         let approval_timeout =
             effective_approval_timeout(&global_permissions, &project_permissions);
@@ -4789,6 +4787,8 @@ mod tests {
             mode_override: None,
             active_agent: None,
             reasoning_effort: None,
+            approval_override: None,
+            model_override: None,
         }
     }
 
@@ -5167,6 +5167,8 @@ mod tests {
             mode_override: None,
             active_agent: None,
             reasoning_effort: None,
+            approval_override: None,
+            model_override: None,
         };
 
         let builder = RuntimeAssembly::builder(spec).secret_resolver(Arc::new(FakeResolver));
@@ -5333,6 +5335,8 @@ mod tests {
             mode_override: None,
             active_agent: None,
             reasoning_effort: None,
+            approval_override: None,
+            model_override: None,
         };
         let state_store: Arc<dyn StateStore> = Arc::new(harw_core::InMemoryStateStore::new());
         RuntimeAssembly::builder(spec)

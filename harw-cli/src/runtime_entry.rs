@@ -51,8 +51,9 @@ use tokio::sync::mpsc::UnboundedSender;
 /// Baut die Eingangsbeschreibung eines Laufs ohne explizite Overrides.
 ///
 /// # Beschreibung
-/// `mode_override`, `active_agent` und `reasoning_effort` bleiben `None`: sie
-/// sind Sache des Einstiegs (`--agent`, `--effort`, expliziter Modus), nicht
+/// `mode_override`, `active_agent`, `reasoning_effort`, `approval_override`
+/// und `model_override` bleiben `None`: sie sind Sache des Einstiegs
+/// (`--agent`, `--effort`, `--approval`, `--model`, expliziter Modus), nicht
 /// dieser Vorlage. `home`/`cwd` werden über [`Path::to_path_buf`] übernommen.
 ///
 /// # Argumente
@@ -79,6 +80,8 @@ pub(crate) fn runtime_spec(
         mode_override: None,
         active_agent: None,
         reasoning_effort: None,
+        approval_override: None,
+        model_override: None,
     }
 }
 
@@ -455,6 +458,8 @@ mod tests {
         assert_eq!(spec.mode_override, None);
         assert_eq!(spec.active_agent, None);
         assert_eq!(spec.reasoning_effort, None);
+        assert_eq!(spec.approval_override, None);
+        assert_eq!(spec.model_override, None);
     }
 
     #[test]

@@ -132,6 +132,8 @@ fn spec_for(entry: EntryKind, fixture: &Fixture) -> RuntimeSpec {
         mode_override: None,
         active_agent: None,
         reasoning_effort: None,
+        approval_override: None,
+        model_override: None,
     }
 }
 
