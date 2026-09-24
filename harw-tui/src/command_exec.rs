@@ -299,21 +299,12 @@ where
 /// Services-Closure — identisch zum bestehenden `execute_command_as`-Zweig in
 /// `app.rs`.
 ///
-/// **Bewusst ausgeklammert:** die `/export`-Sonderbehandlung
-/// (`execute_export_command_with_data` in `app.rs`, liefert zusätzlich
-/// `OpOutput::data` für den Export-Dateischreiber) ist in `app.rs` als
-/// private `async fn` deklariert und von hier — anderes Modul, kein
-/// `pub(crate)` — nicht erreichbar. Für den Sofort-Dispatch-Anwendungsfall
-/// (Welle 4b) ist das folgenlos: `/export` trägt `busy =
-/// DeferredUntilTurnEnd` (Standard, nicht Teil der in Welle 2d/3d/4a auf
-/// `Immediate` gesetzten Befehle) und läuft daher nie über diesen Helfer.
-/// Falls Welle 5 auch den *Idle*-Pfad vollständig hierher verlagern will,
-/// müsste `app.rs` zuerst `execute_export_command_with_data` auf
-/// `pub(crate)` heben (oder die Funktion nach `command_exec.rs`
-/// verschieben); dieser Helfer bräuchte dann einen zusätzlichen
-/// `/export`-Vorabschritt, der bei `Some(Ok(..))`/`Some(Err(..))` Vorrang vor
-/// `execute_command_as` erhält (siehe app.rs, `HarwEvent::Command`-Zweig) —
-/// bis dahin bleibt die Export-Sonderbehandlung ausschließlich in `app.rs`.
+/// **Bewusst ausgeklammert:** die `/export`-Sonderbehandlung. `app.rs`
+/// führt `/export` über [`crate::command_data::execute_command_with_data`]
+/// aus, weil es zusätzlich `OpOutput::data` für den Export-Dateischreiber
+/// braucht. Für den Sofort-Dispatch (Welle 4b) ist das folgenlos: `/export`
+/// trägt `busy = DeferredUntilTurnEnd` und läuft daher nie über diesen
+/// Helfer.
 ///
 /// # Argumente
 /// - `runtime` (`Option<&std::sync::Arc<harw_runtime::RuntimeAssembly>>`):
