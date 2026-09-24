@@ -1,301 +1,264 @@
-# Sensorik erweitern: Vertrag, Harness und Kochbuch
+# Extending Sensors: Contract, Harness and Cookbook
 
-**Status:** Entwurf zur Diskussion, noch nicht normativ
-**Zweck:** Sicherstellen, dass der fünfzehnte Sensor genauso billig ist wie
-der dritte
-**Verwandt:** `harw-dod-crate-decomposition.md` (C1 bis C8),
+> Status: partially implemented · Last reviewed: 2026-09-24
+
+**Purpose:** make sure the fifteenth sensor is as cheap to add as the third.
+**Related:** `harw-dod-crate-decomposition.md` (C1–C8),
 `harw-dod-integration-and-dependencies.md`
 
 ---
 
-## 0. Was Erweiterbarkeit hier bedeutet
+## 0. What extensibility means here
 
-Die Zerlegung in eine Crate pro Quelle liefert Erweiterbarkeit auf dem
-Papier: eine neue Quelle ist eine neue Crate, und keine bestehende wird
-angefasst. Damit das in der Praxis stimmt, müssen vier Dinge zutreffen, und
-drei davon fallen aus der bisherigen Architektur:
+Splitting into one crate per source gives extensibility on paper: a new
+source is a new crate, and no existing one is touched. For that to hold in
+practice, four things need to be true, and three of them fall out of the
+architecture directly:
 
-**Der Trait ist schmal.** `Sensor` verlangt Identität, Berechtigung, Takt,
-plus `poll` oder `subscribe`. Mehr nicht.
+**The trait is narrow.** `Sensor` requires identity, permission, cadence,
+plus `poll` or `subscribe`. Nothing more.
 
-**Die Fehler komponieren nicht nach oben.** Jede Crate hat ihren eigenen
-reichen Fehlertyp und verdichtet erst an der Trait-Grenze auf `SensorError`.
-Ein neuer Sensor berührt damit kein fremdes Enum.
+**Errors don't compose upward.** Every crate has its own rich error type and
+only collapses to `SensorError` at the trait boundary, so a new sensor never
+touches a foreign enum.
 
-**Ausfall ist ein Zustand.** Ein neuer Sensor darf scheitern, ohne etwas
-mitzureißen. Man kann einen experimentellen Sensor in Produktion mitlaufen
-lassen; bindet er auf einem Kernel nicht, ist das eine Metrik und kein
-Vorfall.
+**Failure is a state.** A new sensor may fail without taking anything else
+down. An experimental sensor can run in production; if it fails to bind on
+some kernel, that's a metric, not an incident.
 
-**Die Verarbeitungskette wird geerbt.** Weil beide Ströme typisiert sind,
-steht ein neuer Sensor sofort der Regelschicht zur Verfügung, erscheint in
-der Telemetrie, ist über Selektoren im Triage-Kontext adressierbar und kann
-über den Ringpuffer Evidenz liefern. Einmal `HostSample` und
-`SecurityEvent` festgelegt, erbt jede neue Quelle alles Weitere.
+**The processing chain is inherited.** Because both event streams are
+typed, a new sensor is immediately available to the rules layer, shows up
+in telemetry, is addressable via selectors in triage context, and can
+supply evidence through the ring buffer.
 
-Das vierte Ding fällt nicht von selbst und ist der eigentliche Inhalt dieses
-Plans: **die Fixture-Last.** Sie ist es, die Erweiterbarkeit langfristig
-auffrisst, nicht die Crate-Zahl.
+The fourth thing does not fall out automatically, and is this document's
+actual subject: **fixture load.** It's what erodes extensibility over time,
+not the crate count.
 
 ---
 
-## 1. Die Regel: offene Menge, geschlossenes Vokabular
+## 1. The rule: open set, closed vocabulary
 
-**Offen:** die Menge der Sensoren. Eine neue Quelle kostet eine Crate und
-niemanden sonst.
+**Open:** the set of sensors. A new source costs one crate and touches no
+one else.
 
-**Geschlossen:** `Capability`, `EventKind`, `SampleScope`, `Hardness`. Eine
-Quelle mit einer wirklich neuen Privilegienklasse oder einer wirklich neuen
-Ereignisform berührt das Vokabular, und dann zeigt der Compiler jede Regel,
-jeden Renderer und jede Zuordnung, die die neue Variante noch nicht
-behandelt.
+**Closed:** `Capability`, `EventKind`, `SampleScope`/`Hardness`. A source
+that genuinely needs a new privilege class or a genuinely new event shape
+touches the vocabulary, and then the compiler surfaces every rule, renderer
+and mapping that doesn't yet handle the new variant.
 
-Das ist dieselbe Trennung wie bei Rollen und Spezialisierungen, eine Ebene
-tiefer: neue Quellen kosten nichts, neue Autoritätsklassen kosten eine
-bewusste Entscheidung. Wenn ein Vorschlag für einen neuen Sensor eine neue
-`Capability`-Variante verlangt, ist das das Signal, innezuhalten. Meistens
-ist die richtige Antwort dann ein zweiter Prozess, keine zwölfte
-Berechtigung.
+If a proposed sensor needs a new `Capability` variant, that's the signal to
+pause — usually the right answer is a second process, not a twelfth
+permission.
 
-**Verfahren bei Vokabularänderung.** Kein stilles Hinzufügen. Eine neue
-`EventKind`-Variante durchläuft: Eintrag in dieses Dokument mit Begründung,
-Prüfung, ob eine bestehende Variante genügt, Erweiterung der
-Zulässigkeitsmatrix in der Leiter, und ein Testfall, der beweist, dass die
-Regelschicht sie nicht stillschweigend als `Informational` durchreicht.
+**Procedure for a vocabulary change.** No silent addition. A new
+`EventKind` variant goes through: an entry in this document with rationale,
+a check whether an existing variant suffices, an extension of the ladder's
+admission matrix, and a test proving the rules layer doesn't silently pass
+it through as `Informational`.
 
 ---
 
-## 2. Der Erweiterungsvertrag
+## 2. The extension contract
 
-Was eine neue Sensor-Crate liefern muss. Sechs Punkte, jeder prüfbar.
+What a new sensor crate must deliver — six points, each checkable:
 
-1. **Genau eine Quelle, genau eine `Capability`.** Braucht sie zwei, sind es
-   zwei Backends hinter einem Trait (Präzedenz `harw-dod-authlog`) oder zwei
-   Crates.
-2. **Konstruktor nimmt einen `ReadScope`.** Kein Sensor öffnet je einen Pfad
-   an ihm vorbei. Kein `std::fs::read` im Crate, durchgesetzt per Lint.
-3. **Eigener Fehlertyp plus `From` auf `SensorError`.** Die Abbildung ist
-   inhaltsfrei: Offsets und Längen, keine geparsten Werte.
-4. **Kein Abhängigkeit auf eine andere Sensor-Crate** (C7). Geprüft in CI
-   über `harw-code-graph`.
-5. **Ein Fixture-Verzeichnis** nach der Konvention aus §3, mit mindestens
-   drei Kernelständen und einem Fehlerfall.
-6. **Ein Eintrag in der Rechtematrix** des Zerlegungsplans: was sie liest,
-   in welchem Prozess sie läuft, was sie ausdrücklich nicht darf.
+1. **Exactly one source, exactly one `Capability`.** Two sources means two
+   backends behind a trait (precedent: `harw-dod-authlog`) or two crates.
+2. **Constructor takes a `ReadScope`.** No sensor opens a path around it —
+   no direct filesystem read outside the scope mechanism.
+3. **Own error type plus a `From` mapping onto `SensorError`.** The mapping
+   is content-free: offsets and lengths, never parsed values.
+4. **No dependency on another sensor crate** (C7), checked in CI.
+5. **A fixture directory** per the convention in §3, with at least three
+   kernel snapshots and one error case.
+6. **An entry in the rights matrix** of the decomposition plan: what it
+   reads, which process it runs in, what it explicitly may not do.
 
-Punkt 6 ist der, der am ehesten vergessen wird und am meisten wert ist. Die
-Zeile "darf nicht" ist oft aufschlussreicher als die Zeile "liefert".
+Point 6 is the one most often forgotten and the most valuable: the "may
+not" line is often more informative than the "delivers" line.
 
 ---
 
-## 3. Der Fixture-Harness
+## 3. The fixture harness
 
-Bei vierzehn Sensoren mal drei Kernelständen sind das zweiundvierzig
-Verzeichnisse. Ohne gemeinsamen Harness baut jeder Sensor seine eigene
-Testmechanik nach, und ab dem achten macht das niemand mehr sorgfältig.
+**Implemented:** `dod/crates/harw-dod-fixtures` is a dev-dependency shared
+by the sensor crates, providing the `sensor_suite!` macro
+(`src/macros.rs`) and the underlying assertion functions (`src/harness.rs`).
+The harness currently runs **nine** checks per sensor, more than originally
+scoped here: determinism, content freedom (no byte of the fixture tree
+appears in a `SensorError`), scope containment, scope tightness, correct
+behavior on an empty scope, redaction, label cardinality, a declared error
+case, and — importantly — that an adversarial fixture "survives" as a
+`Data`-trust fragment rather than being treated as an instruction. See
+`dod/crates/harw-dod-fixtures/src/harness.rs` for the current, authoritative
+list; §3.2 below is illustrative and may not match every macro parameter
+name.
 
-**Ein Crate, `harw-dod-fixtures`, dev-dependency für alle Sensoren.**
-
-### 3.1 Verzeichniskonvention
+### 3.1 Directory convention
 
 ```
 fixtures/
   <sensor-id>/
-    <kernel>/            z. B. 6.11-fedora, 6.6-lts, 5.14-rhel9
-      tree/              Auszug der Quelle, pfadgetreu
+    <kernel>/            e.g. 6.11-fedora, 6.6-lts, 5.14-rhel9
+      tree/              path-faithful excerpt of the source
         proc/stat
         sys/class/hwmon/hwmon0/temp1_input
-      expect.json        erwartete Samples oder Events, normalisiert
+      expect.json        expected samples/events, normalized
     malformed/
-      tree/              abgeschnitten, leer, unerwartete Spalten
-      expect.json        erwarteter SensorError, ohne Inhalt
+      tree/              truncated, empty, unexpected columns
+      expect.json        expected SensorError, content-free
     adversarial/
-      tree/              Werte, die wie Anweisungen aussehen
-      expect.json        muss als Data-Fragment enden, nie als Instruktion
+      tree/              values that look like instructions
+      expect.json        must end up as a Data fragment, never an instruction
 ```
 
-Der `tree`-Ordner ist pfadgetreu, weil der Sensor über einen `ReadScope` auf
-genau dieses Verzeichnis zeigt. Damit läuft derselbe Codepfad wie in
-Produktion, inklusive Scope-Prüfung und Symlink-Auflösung.
+The `tree` directory is path-faithful because the sensor's `ReadScope`
+points at exactly that directory in tests — the same code path as
+production, including the scope check and symlink resolution.
 
-### 3.2 Der Tabellentest
+### 3.2 The table test
 
 ```rust
 harw_dod_fixtures::sensor_suite! {
     sensor: harw_dod_thermal::Thermal,
     id: "thermal",
-    // findet alle Kernelstände automatisch, führt drei Klassen aus:
-    // parse (tree gegen expect), malformed (Fehler ohne Inhalt),
-    // adversarial (Vertrauensklasse Data, Redaktion greift)
+    // discovers every kernel snapshot automatically and runs the harness
+    // checks described in §3 above against each.
 }
 ```
 
-Ein Makroaufruf, kein Testcode. Der Harness prüft zusätzlich, ohne dass es
-jemand hinschreibt:
+### 3.3 Fixture provenance and upkeep
 
-- **Determinismus:** zweimal auf demselben Baum liefert dasselbe.
-- **Inhaltsfreiheit:** kein Byte aus `tree` erscheint in einem
-  `SensorError` (C5). Property-Test über den Fehlerpfad.
-- **Scope-Dichtheit:** ein Symlink aus `tree` heraus liefert
-  `OutsideScope`, nicht die Zieldatei.
-- **Redaktion:** jedes Feld des erzeugten Samples oder Events geht durch
-  `Redact` und erzeugt keinen `Plain`-Wert, der nicht deklariert ist.
-- **Kardinalität:** die erzeugten Labels liegen unter der deklarierten
-  Grenze.
+Excerpts should be captured, not hand-typed: `harw-dod-fixtures` provides
+capture support (`src/capture.rs`, `src/capture_manifest.rs`) to copy a
+sensor's declared paths from a running system into a fixture directory and
+redact what needs redacting (hostnames, serial numbers, usernames). Upkeep
+rule: keep three snapshots current — the latest Fedora kernel, an LTS
+kernel, and the oldest supported enterprise line — and add a fourth only
+when a format actually diverges.
 
-Damit erbt ein neuer Sensor sechs Prüfungen, für die er null Zeilen
-schreibt. Genau das hält den fünfzehnten so billig wie den dritten.
+### 3.4 Noticing format drift before it hurts
 
-### 3.3 Herkunft und Pflege der Fixtures
-
-Auszüge werden erzeugt, nicht getippt: ein kleines Werkzeug
-`harw-dod-fixtures --capture <sensor> --label 6.11-fedora` kopiert die vom
-Sensor deklarierten Pfade aus dem laufenden System in ein Verzeichnis und
-redigiert dabei, was redigiert werden muss (Hostnamen, Seriennummern,
-Benutzernamen).
-
-Pflegeregel: drei Stände dauerhaft, nämlich der aktuelle Fedora-Kernel, ein
-LTS-Stand und die älteste unterstützte Enterprise-Linie. Ein vierter kommt
-nur dazu, wenn ein Format tatsächlich abweicht.
-
-### 3.4 Formatdrift bemerken, bevor sie weh tut
-
-Kernel ändern Formate. Der Sensor merkt das als Parse-Fehler, aber ein
-einzelner Parse-Fehler ist im Rauschen unsichtbar. Deshalb ist die
-Fehlerrate pro Sensor eine Metrik mit Baseline:
-`sensor_parse_errors_total` je `SensorId`. Ein sprunghafter Anstieg nach
-einem Systemupdate ist ein Befund über den `ScanReport`-Weg, kein stiller
-Datenverlust. Blindheit ist ein Befund, und Formatdrift ist die häufigste
-Ursache von Blindheit.
+Kernels change formats. The sensor sees this as a parse error, but a single
+parse error is invisible in the noise. `sensor_parse_errors_total`, per
+`SensorId`, is a metric with a baseline for exactly this reason: a spike
+after a system update is a finding, not silent data loss.
 
 ---
 
-## 4. Vier Archetypen und ihr Aufwand
+## 4. Four archetypes and their cost
 
-Fast jeder Sensor fällt in eine dieser vier Formen. Der Aufwand ist deshalb
-gut schätzbar.
-
-| Archetyp | Beispiel | Mechanik | Aufwand | Fixtures |
+| Archetype | Example | Mechanism | Approx. size | Fixtures |
 |---|---|---|---|---|
-| **A: sysfs-Einzelwert** | thermal, gpu | Glob über Pfade, Zahl je Datei, Skalierung | 50 bis 100 Zeilen, meist ganz per `#[derive(SensorSource)]` | trivial |
-| **B: procfs-Tabelle** | cpu, blockio, netcounters | zeilenweise Tabelle mit fester Spaltenordnung, Delta gegen Vorlauf | 100 bis 200 Zeilen | mittel, Spalten variieren nach Version |
-| **C: Netlink-Abo** | authlog | Socket, Rahmen, Recordtypen, Feldzerlegung | 200 bis 300 Zeilen plus Recordfixtures | aufwendig |
-| **D: eBPF-Map** | procmon, flow | Programm laden, Map oder Ringpuffer lesen, Ereignisse formen | 150 Zeilen Rust plus BPF-Seite | aufwendig, braucht VM |
+| **A: single sysfs value** | thermal, gpu | glob over paths, one number per file, scaling | ~100–300 lines, hand-written (see note below) | trivial |
+| **B: procfs table** | cpu, blockio, netcounters | fixed-column table, delta against the previous poll | ~100–300 lines | moderate, columns vary by version |
+| **C: netlink subscription** | authlog | socket, framing, record types, field decoding | ~500–700 lines total across module files | involved |
+| **D: eBPF map** | procmon, flow | load program, read map/ring buffer, shape events | Rust glue plus a BPF side | involved, needs a VM |
 
-**Archetyp A ist praktisch kostenlos.** Das ist Absicht: die meisten
-Erweiterungswünsche für Hostgesundheit fallen dort hinein, und das Derive
-macht daraus eine Deklaration.
-
-```rust
-#[derive(SensorSource)]
-#[sensor(id = "thermal", capability = SysfsRead, cadence = "5s")]
-struct Thermal {
-    #[read(glob = "class/hwmon/*/temp*_input", scale = 0.001)]
-    #[metric(TEMP_CELSIUS, scope = Host)]
-    temperature: Vec<f64>,
-}
-```
-
-Der Glob ist relativ zum `ReadScope`, nicht absolut. Das Derive erzeugt
-`poll`, die Metrikemission, die `Capability`-Deklaration und die
-`From`-Abbildung auf `SensorError`. Was bleibt, ist die Deklaration selbst.
+**Correction to the original plan:** this document originally proposed that
+archetype A would be essentially free via a `#[derive(SensorSource)]` macro.
+That derive does exist (`harw-macros`'s `sensor_source` module) but the
+shipped sensors (`harw-dod-thermal` and siblings) deliberately do **not**
+use it — their own module docs explain why: the derive has no attribute for
+value scaling, no way to attach a second, per-match read (needed when a
+sensor reads both a value and a companion field per matched entry), and its
+glob path is not scope-relative (it always resolves from `/`, using the
+`ReadScope` only as a post-hoc filter, not as the search root). Archetype A
+sensors are therefore hand-written today, at roughly the sizes shown above,
+not derive-generated. Revisiting the derive to close those three gaps is an
+open item (see §8).
 
 ---
 
-## 5. Durchgerechnetes Beispiel: `harw-dod-usb`
+## 5. Worked example: a hypothetical `harw-dod-usb`
 
-Ein realistischer neuer Sensor, um den Aufwand konkret zu machen. USB-Geräte
-sind ein echtes Sicherheitssignal: ein neu angestecktes Massenspeichergerät
-oder ein Gerät, das sich als Tastatur ausgibt, ist genau die Art von
-Ereignis, die man sehen will.
+A realistic new sensor, to make the cost concrete. USB devices are a real
+security signal: a newly attached mass-storage device, or a device that
+identifies itself as a keyboard, is exactly the kind of event worth seeing.
+No such crate exists yet; this section is illustrative of how the contract
+in §2 applies to a new source.
 
-**Vertrag.** Quelle `/sys/bus/usb/devices`, Capability `SysfsRead`, Prozess
-`harw-sentinel`, Archetyp A mit einem Ereignisanteil.
+**Contract.** Source `/sys/bus/usb/devices`, an unprivileged sysfs-read
+capability, runs in `harw-sentinel`, archetype A with an event component.
 
-**Liefert.** Beim Poll die aktuelle Geräteliste mit Vendor, Produkt,
-Geräteklasse und Portpfad. Als Ereignis die Differenz gegen den vorigen
-Poll.
+**Delivers.** On poll, the current device list (vendor, product, device
+class, port path). As an event, the diff against the previous poll.
 
-**Darf nicht.** Geräteinhalte lesen, Mounts auflösen, Prozesse zuordnen.
+**May not.** Read device contents, resolve mounts, attribute processes.
 
-**Vokabularfrage.** Braucht es eine neue `EventKind`-Variante? Ja, und
-genau deshalb ist das ein gutes Beispiel: `DeviceAttached` und
-`DeviceDetached` sind neu. Nach §1 heißt das: Eintrag mit Begründung,
-Prüfung ob `StructureDrift` genügt (tut es nicht, das ist Workspace), und
-ein Testfall gegen stillschweigendes `Informational`.
+**Vocabulary question.** Does it need a new `EventKind` variant? Yes —
+`DeviceAttached`/`DeviceDetached` would be new, which per §1 means: an entry
+with rationale, a check whether `StructureDrift` suffices (it doesn't,
+that's for workspace structure), and a test against silent
+`Informational` fallthrough.
 
-**Regelanbindung ohne neue Mechanik.** Eine Baseline vom Typ
-`Expectation::AllowedSet` über die bekannten Vendor-Produkt-Paare. Ein
-Gerät außerhalb der Menge ist `Anomaly`, weil die Baseline
-`Provisional` sein kann. Wird die Menge per Review nach `Established`
-befördert, wird dasselbe Ereignis `RuleTriggered`. Ein
-Massenspeichergerät oder ein HID-Gerät außerhalb der Menge kann per Regel
-höhere `Severity` bekommen.
+**Rule wiring without new mechanism.** An allow-list baseline over known
+vendor/product pairs; a device outside the set is `Anomaly` while the
+baseline is provisional, and becomes `RuleTriggered` once the set is
+promoted to established.
 
-**Aufwand insgesamt.** Rund achtzig Zeilen Rust, ein Fixture-Verzeichnis mit
-drei Ständen plus einem Adversarial-Fall (ein Gerät, dessen Produktname wie
-eine Anweisung aussieht, denn Produktstrings sind angreiferkontrolliert),
-zwei Zeilen Vokabular, eine Zeile Rechtematrix, eine Baseline-Definition.
-Ein Nachmittag, ohne dass eine bestehende Crate angefasst wird.
-
-Der Adversarial-Fall ist hier kein Formalismus: ein USB-Produktstring ist
-frei wählbar und landet im Triage-Kontext. Ohne die Vertrauensklasse `Data`
-und den Zwei-Block-Renderer wäre das ein Injection-Vektor über Hardware.
+**Total estimated cost.** Roughly a hand-written sensor of a couple hundred
+lines, a fixture directory with three snapshots plus an adversarial case (a
+device whose product string looks like an instruction — USB product strings
+are attacker-controlled and land in triage context), two lines of
+vocabulary, one rights-matrix row, one baseline definition. Without the
+`Data` trust class and the two-block renderer, that adversarial case would
+be an injection vector via hardware.
 
 ---
 
-## 6. Sensoren von außen
+## 6. Sensors from outside
 
-Kann ein Plugin einen Sensor mitbringen? Ja, mit einer harten Grenze.
+Can a plugin bring its own sensor? Yes, with a hard boundary: an externally
+registered sensor cannot acquire a `Capability` the process doesn't already
+have. It runs inside the sentinel, unprivileged, with a `ReadScope` assigned
+by the composition root that can only shrink. A plugin sensor claiming
+`FanotifyMark` isn't expressible, because the sentinel doesn't hold that
+permission and `bind()`'s real probe access fails. Same rule as for agents:
+plugins may bring programs, never privileges.
 
-**Die Grenze:** ein von außen registrierter Sensor kann keine `Capability`
-erlangen, die der Prozess nicht ohnehin hat. Er läuft im Sentinel, also
-unprivilegiert, mit einem `ReadScope`, den die Composition-Root vergibt und
-der nur schrumpfen kann. Ein Plugin-Sensor mit `FanotifyMark` ist nicht
-ausdrückbar, weil der Sentinel diese Berechtigung nicht besitzt und `bind()`
-den echten Probe-Zugriff nicht bestanden bekommt.
-
-Das ist dieselbe Regel wie bei den Agenten: Plugins dürfen Programme
-mitbringen, keine Privilegien.
-
-**Was ein externer Sensor zusätzlich erfüllen muss:** denselben
-Erweiterungsvertrag aus §2, plus Registrierung mit deklarierter
-`Capability`, die die Registry gegen die Prozessberechtigung prüft und bei
-Überschreitung ablehnt. Eine höhere Behauptung ist ein
-Registrierungsfehler, kein Laufzeitfehler.
+An external sensor must additionally meet the §2 contract, plus
+registration with a declared `Capability` that the registry checks against
+the process's actual permission and rejects on overreach — a registration
+error, not a runtime one. **Status: Open** — no plugin sensor registration
+mechanism was found in the current codebase; the sensor set today is
+compiled in, not dynamically registered.
 
 ---
 
-## 7. Prüfungen
+## 7. Checks
 
-- **Vertragsprüfung.** Ein CI-Schritt, der für jede Crate mit Präfix
-  `harw-dod-` und einer `Sensor`-Implementierung die sechs Punkte aus §2
-  prüft, soweit maschinell möglich: eine `Capability`, keine
-  Sensor-Geschwister-Abhängigkeit, Fixture-Verzeichnis vorhanden, kein
-  direkter `std::fs`-Aufruf.
-- **Harness-Vollständigkeit.** Jeder Sensor ruft `sensor_suite!` auf; ein
-  fehlender Aufruf bricht den Build.
-- **Vokabular-Gate.** Eine Änderung an `Capability` oder `EventKind` ohne
-  begleitenden Eintrag in diesem Dokument scheitert im Review-Checkliste;
-  maschinell prüfbar über einen Doc-Test, der die Variantenzahl gegen eine
-  Konstante hält.
-- **Driftmetrik.** `sensor_parse_errors_total` hat eine Baseline und ist an
-  die Regelschicht angebunden.
+- **Contract check.** A CI step verifying, for every `harw-dod-*` crate
+  implementing `Sensor`, the mechanically checkable parts of §2 (one
+  capability, no sensor-sibling dependency, fixture directory present, no
+  raw filesystem call bypassing the scope). **Status: Open** as a single
+  automated gate — the individual properties are enforced piecemeal
+  (`facade.rs`, the fixture harness, C7 isolation), but no one CI step
+  currently walks every `harw-dod-*` crate against the full six-point list.
+- **Harness completeness.** Every sensor calls `sensor_suite!`. Implemented
+  for the shipped sensors listed in `harw-dod-crate-decomposition.md` §4/§5.
+- **Vocabulary gate.** A `Capability`/`EventKind` change without an
+  accompanying entry here should fail review; a machine-checkable variant
+  count test is proposed but not confirmed present — Open.
+- **Drift metric.** `sensor_parse_errors_total` — confirmed present as a
+  sensor-degradation signal (see `harw-dod-crate-decomposition.md` §9).
 
 ---
 
-## 8. Offene Punkte
+## 8. Open items
 
-1. **Capture-Werkzeug und Redaktion.** Welche Felder beim Erfassen
-   redigiert werden, muss pro Archetyp festgelegt werden. Hostnamen und
-   Seriennummern sind offensichtlich, Gerätepfade weniger.
-2. **Fixture-Größe.** Vollständige `/proc`-Auszüge können groß werden.
-   Vorschlag: nur die vom Sensor deklarierten Pfade erfassen, was das
-   Werkzeug ohnehin weiß.
-3. **Archetyp D ohne VM.** Für eBPF-Sensoren gibt es keinen billigen
-   Fixture-Weg; die Map-Inhalte lassen sich synthetisch erzeugen, das
-   Laden nicht. Vorschlag: Trennung in einen testbaren Formungsteil und
-   einen ungetesteten Ladeteil, der in der VM-Suite läuft.
-4. **Wer entscheidet über neue `EventKind`-Varianten.** Vorschlag: dieselbe
-   Schwelle wie bei einer neuen Warden-Aktion, also eine bewusste
-   Entscheidung mit Eintrag, nicht ein Pull Request nebenbei.
+1. **`SensorSource` derive gaps.** Add scaling, per-match companion reads,
+   and scope-relative globbing, or retire the derive if hand-written
+   sensors remain the norm.
+2. **Capture tool and redaction.** Which fields get redacted on capture
+   needs pinning down per archetype.
+3. **Fixture size.** Full `/proc` excerpts can get large; capture only the
+   sensor's declared paths.
+4. **Archetype D without a VM.** eBPF sensors have no cheap fixture path;
+   map contents can be synthesized, loading cannot. Proposal: split a
+   testable shaping part from an untested loading part that only runs in
+   the VM suite.
+5. **Who decides on new `EventKind` variants.** Proposal: the same bar as a
+   new warden action — a deliberate decision with a written entry, not an
+   incidental part of a pull request.

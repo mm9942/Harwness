@@ -290,7 +290,7 @@ impl GoalStore for InMemoryGoalStore {
     /// # Arguments
     /// - `action` (`GoalAction`): anzuwendende Aktion (übernimmt Eigentum, weil
     ///   sie unverändert in das Event wandert).
-    /// - `actor` (`&str`): Akteur, z. B. `"human:mia"` oder `"model:gpt"`.
+    /// - `actor` (`&str`): Akteur, z. B. `"human:alice"` oder `"model:gpt"`.
     ///
     /// # Returns
     /// Das persistierte [`GoalEvent`] mit der neu vergebenen Revision.
@@ -692,7 +692,7 @@ impl GoalStore for FileGoalStore {
     /// # Arguments
     /// - `action` (`GoalAction`): anzuwendende Aktion (übernimmt Eigentum, weil
     ///   sie unverändert in das persistierte Event wandert).
-    /// - `actor` (`&str`): Akteur, z. B. `"human:mia"` oder `"model:gpt"`.
+    /// - `actor` (`&str`): Akteur, z. B. `"human:alice"` oder `"model:gpt"`.
     ///
     /// # Returns
     /// Das dauerhaft geschriebene [`GoalEvent`] mit der neu vergebenen Revision.
@@ -904,7 +904,7 @@ mod tests {
             GoalAction::Set {
                 goal: make_goal(GoalStatus::Active),
             },
-            "human:mia",
+            "human:alice",
         )?;
         Ok(store)
     }
@@ -951,12 +951,12 @@ mod tests {
                     verification: Vec::new(),
                 },
             },
-            "human:mia",
+            "human:alice",
         )?;
         assert_eq!(second.revision, 2);
         assert_eq!(store.revision(), 2);
 
-        let third = apply_ok(&store, GoalAction::Inspect, "human:mia")?;
+        let third = apply_ok(&store, GoalAction::Inspect, "human:alice")?;
         assert_eq!(third.revision, 3);
         assert_eq!(current_ok(&store)?.revision, 3);
         Ok(())
@@ -965,13 +965,13 @@ mod tests {
     #[test]
     fn test_history_returns_all_events_and_filters_from_since() -> TestResult {
         let store = seeded_memory_store()?;
-        apply_ok(&store, GoalAction::Inspect, "human:mia")?;
+        apply_ok(&store, GoalAction::Inspect, "human:alice")?;
         apply_ok(
             &store,
             GoalAction::Condense {
                 summary: "verdichtet".to_owned(),
             },
-            "human:mia",
+            "human:alice",
         )?;
 
         let all = history_ok(&store, None)?;
@@ -1034,7 +1034,7 @@ mod tests {
                 status: GoalStatus::Achieved,
                 reason: None,
             },
-            "human:mia",
+            "human:alice",
         )?;
 
         assert_eq!(event.revision, 2);
@@ -1057,7 +1057,7 @@ mod tests {
                     ..GoalPatch::default()
                 },
             },
-            "human:mia",
+            "human:alice",
         )?;
 
         let after = current_ok(&store)?;
@@ -1079,7 +1079,7 @@ mod tests {
     fn test_apply_non_set_action_without_goal_returns_goal_not_found() {
         let store = InMemoryGoalStore::new();
 
-        let result = store.apply(GoalAction::Inspect, "human:mia");
+        let result = store.apply(GoalAction::Inspect, "human:alice");
 
         assert!(matches!(result, Err(PlanError::GoalNotFound)));
         assert_eq!(store.revision(), 0);
@@ -1114,7 +1114,7 @@ mod tests {
             GoalAction::Set {
                 goal: make_goal(GoalStatus::Active),
             },
-            "human:mia",
+            "human:alice",
         )?;
 
         let snapshot = dir.path().join("rev-1.json");
@@ -1149,7 +1149,7 @@ mod tests {
                 GoalAction::Set {
                     goal: make_goal(GoalStatus::Active),
                 },
-                "human:mia",
+                "human:alice",
             )?;
             apply_ok(
                 &store,
@@ -1159,7 +1159,7 @@ mod tests {
                         verification: Vec::new(),
                     },
                 },
-                "human:mia",
+                "human:alice",
             )?;
         }
 
@@ -1178,7 +1178,7 @@ mod tests {
         );
         assert_eq!(history_ok(&reloaded, None)?.len(), 2);
         assert_eq!(
-            apply_ok(&reloaded, GoalAction::Inspect, "human:mia")?.revision,
+            apply_ok(&reloaded, GoalAction::Inspect, "human:alice")?.revision,
             3,
             "nach dem Reload muss die nächste Revision fortsetzen, nicht neu beginnen"
         );
@@ -1205,10 +1205,10 @@ mod tests {
             GoalAction::Set {
                 goal: make_goal(GoalStatus::Active),
             },
-            "human:mia",
+            "human:alice",
         )?;
-        apply_ok(&store, GoalAction::Inspect, "human:mia")?;
-        apply_ok(&store, GoalAction::Inspect, "human:mia")?;
+        apply_ok(&store, GoalAction::Inspect, "human:alice")?;
+        apply_ok(&store, GoalAction::Inspect, "human:alice")?;
 
         assert_eq!(history_ok(&store, None)?.len(), 3);
         assert_eq!(
@@ -1230,7 +1230,7 @@ mod tests {
             GoalAction::Set {
                 goal: make_goal(GoalStatus::Active),
             },
-            "human:mia",
+            "human:alice",
         )?;
 
         let result = store.apply(
@@ -1273,7 +1273,7 @@ mod tests {
             GoalAction::Set {
                 goal: make_goal(GoalStatus::Active),
             },
-            "human:mia",
+            "human:alice",
         )?;
 
         apply_ok(
@@ -1284,7 +1284,7 @@ mod tests {
                     ..GoalPatch::default()
                 },
             },
-            "human:mia",
+            "human:alice",
         )?;
 
         let reloaded = file_store(&dir)?;
@@ -1308,13 +1308,13 @@ mod tests {
             GoalAction::Set {
                 goal: make_goal(GoalStatus::Draft),
             },
-            "human:mia",
+            "human:alice",
         )?;
         let created_at = current_ok(&store)?.created_at;
 
         let mut replacement = make_goal(GoalStatus::Active);
         replacement.statement = "ersetztes Ziel".to_owned();
-        apply_ok(&store, GoalAction::Set { goal: replacement }, "human:mia")?;
+        apply_ok(&store, GoalAction::Set { goal: replacement }, "human:alice")?;
 
         let goal = current_ok(&store)?;
         assert_eq!(goal.statement, "ersetztes Ziel");
@@ -1357,7 +1357,7 @@ mod tests {
             GoalAction::Set {
                 goal: make_goal(GoalStatus::Active),
             },
-            "human:mia",
+            "human:alice",
         );
 
         assert!(
@@ -1385,7 +1385,7 @@ mod tests {
                 GoalAction::Set {
                     goal: make_goal(GoalStatus::Active),
                 },
-                "human:mia",
+                "human:alice",
             )?;
         }
         assert!(dir.path().join("rev-1.seal").exists(), "Siegel geschrieben");
@@ -1417,7 +1417,7 @@ mod tests {
                 GoalAction::Set {
                     goal: make_goal(GoalStatus::Active),
                 },
-                "human:mia",
+                "human:alice",
             )?;
         }
         std::fs::remove_file(dir.path().join("rev-1.seal"))?;
@@ -1429,7 +1429,7 @@ mod tests {
             GoalAction::Set {
                 goal: make_goal(GoalStatus::Active),
             },
-            "human:mia",
+            "human:alice",
         )?;
         assert!(dir.path().join("rev-2.seal").exists());
         drop(legacy);

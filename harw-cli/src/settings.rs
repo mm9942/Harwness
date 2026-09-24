@@ -1,6 +1,6 @@
 //! `harw settings` — Provider, Standardmodell, Freigaben und einzelne
-//! Konfigurationswerte verwalten (Plan `nope-permissions-gibt-es-wild-lobster.md`
-//! Schritt 8; Contract `harw-scopes-contract.md` §2, Zeile B5a).
+//! Konfigurationswerte verwalten (Contract
+//! `docs/design/config-scopes.md` §2).
 //!
 //! # Verantwortung
 //! Dieses Modul führt die Unterbefehle von [`crate::cli::SettingsAction`]

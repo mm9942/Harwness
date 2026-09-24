@@ -1,8 +1,7 @@
 //! `/add-workdir` — zusätzliche Arbeitsverzeichnisse für die Sitzung freigeben.
 //!
-//! Spec-Quelle: Contract `harw-scopes-contract.md` §2 (Slice A8,
-//! `harw_sandbox::ExtraRootsCell`) und Schritt 6 des Plans
-//! `nope-permissions-gibt-es-wild-lobster.md` (Slice B4).
+//! Spec-Quelle: Contract `docs/design/config-scopes.md` §2 (Slice A8,
+//! `harw_sandbox::ExtraRootsCell`).
 //!
 //! # Verantwortung
 //! Diese Operation validiert einen Verzeichnis-Kandidaten über

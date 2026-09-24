@@ -41,7 +41,7 @@
 //! `harw-dod-netpolicy` (AW3-02) hat die Nahtstelle bereits richtig
 //! geschnitten (`NetBackend::apply(&self, plan: &NetPlan)`) und verweist die
 //! echte Mechanik ausdrücklich auf diesen Knoten (AW5-04a). Diese Crate
-//! prüfte deshalb, ob `rustables` — die im Plan (`docs/aw-plan.md`)
+//! prüfte deshalb, ob `rustables` — die im Plan (`docs/design/build-history.md`)
 //! genannte Kandidaten-Crate für die echte Netlink-Mechanik — in das
 //! Abhängigkeitsbudget passt:
 //!

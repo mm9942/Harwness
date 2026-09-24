@@ -1,4 +1,4 @@
-//! Ereignis-Bus für harw-tui (Spec: `docs/design/codex-tui-study/00-harw-tui-redesign-spec.md`,
+//! Ereignis-Bus für harw-tui (Spec: `docs/design/tui-architecture.md`,
 //! Abschnitt 2.2 und SLICE 3).
 //!
 //! Dieses Modul definiert den zentralen `HarwEvent`-Kanal, über den Widgets und

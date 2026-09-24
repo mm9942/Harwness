@@ -31,7 +31,7 @@ fn first_word(s: &str) -> &str {
 }
 
 // Regel 3: &self → Rückgabe lebt so lange wie self.
-// Real: apps/sgh-flow/src/iceberg/handler.rs:316
+// Real: apps/acme-app/src/iceberg/handler.rs:316
 pub fn pipeline_run_id(&self) -> &str {
     &self.pipeline_run_id
 }
@@ -42,7 +42,7 @@ pub fn pipeline_run_id(&self) -> &str {
 ```rust
 // Rückgabe gehört zu `root`, nicht zu `path` (der &str-Schlüsselpfad).
 // Explizit, weil Regel 2 bei zwei Parametern nicht greift.
-// Real: apps/sgh-flow/src/runtime.rs:482
+// Real: apps/acme-app/src/runtime.rs:482
 fn toml_path<'a>(root: &'a toml::Value, path: &str) -> Option<&'a toml::Value> {
     path.split('.')
         .try_fold(root, |value, segment| value.get(segment))

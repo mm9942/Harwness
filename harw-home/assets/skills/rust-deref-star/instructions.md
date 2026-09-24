@@ -24,7 +24,7 @@ use std::sync::Arc;
 
 /// Copy a `u64` counter value out of a `MutexGuard` using `*deref`.
 ///
-/// Real code: apps/sgh-flow/src/db/repositories/cost_center_approvers.rs:212-213
+/// Real code: apps/acme-app/src/db/repositories/cost_center_approvers.rs:212-213
 ///   let mut id_guard = self.next_id.lock().await;  // Mutex<u64>
 ///   let id = *id_guard;                            // copy the u64 out
 ///   *id_guard += 1;                                // then mutate through the guard

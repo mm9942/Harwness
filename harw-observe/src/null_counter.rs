@@ -2,7 +2,7 @@
 //!
 //! # Verantwortungsbereich
 //! Trägt [`NullCounter`], [`NullCounterRegistry`] und [`assert_all_zero`]
-//! (Knoten AW1-07, Vertrag `docs/aw-contract-master.md`). Baut die
+//! (Knoten AW1-07, Vertrag `docs/design/build-history.md`). Baut die
 //! **Mechanik** eines Nullzählers — Registrierung, Erhöhung, Prüfung. Die
 //! konkreten Zähler selbst (`trust_block_violation`,
 //! `steward_ceiling_violation`, `lens_remote_embed_on_operator_only`)

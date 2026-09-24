@@ -1,40 +1,42 @@
-# Harwness DoD × Context: Integrationsplan und Abhängigkeits-Doktrin
+# Harwness DoD × Context: Integration Plan and Dependency Doctrine
 
-**Status:** Entwurf zur Diskussion, noch nicht normativ
-**Basis:** 46 Member, 205 Kanten, Tiefe 8
-**Bündelt:** `harw-security-observability-plan.md` (S-Invarianten, acht Crates)
-und `harw-context-plan.md` (K-Invarianten, `harw-context`)
-**Ergänzt:** `harw-dod-charter.md` (Name, Fassade, Absicht)
-**Recherchestand:** August 2026
+> Status: partially implemented · Last reviewed: 2026-09-24
 
----
-
-## 0. Warum diese beiden Pläne einen gemeinsamen haben müssen
-
-Sie sind nicht benachbart, sie greifen ineinander. Vier Berührungen sind so
-eng, dass getrennte Umsetzung doppelte Mechanik erzeugen würde:
-
-1. **S6 (Netz und Sicherheitskontext disjunkt) ist ohne die
-   `ContextCeiling` nicht durchsetzbar.** Eine Ceiling über Permissions sagt,
-   was ein Agent *tun* darf. S6 verlangt eine Aussage darüber, was er *sehen*
-   darf. Genau das ist K2.
-2. **Die Injection-Grenze des DoD-Plans (§7.4) und die Vertrauensklassen des
-   Kontextplans (K4) sind derselbe Mechanismus.** Zweimal gebaut wären es zwei
-   Renderpfade und zwei Fixture-Sätze.
-3. **`harw-observe` gehört beiden.** Es entstand im DoD-Plan, die
-   Kontextmetriken leben darin, und die Kalibrierschleife (K7) speist den
-   Layer-4-Rückkanal des DoD-Plans.
-4. **Sicherheitsbefunde sind der schwerste Kontextfall, den es gibt.** Große
-   Evidenz, hohe Sensibilität, lokale Inferenz. `DetailMode::References` ist
-   für sie gebaut, nicht nebenbei.
-
-Deshalb: eine Wellenfolge, ein Vokabularsatz, ein Fixture-Korpus.
+**Bundles:** the security invariants behind `harw-dod-*` (see
+`harw-security-observability-plan.md`) and the context invariants behind
+`harw-context` (see `docs/design/runtime-contracts.md` for the current
+context/ceiling contract).
+**Complements:** `harw-dod-charter.md` (name, facade, intent).
 
 ---
 
-## 1. Die vier Nahtstellen im Detail
+## 0. Why these two areas share one plan
 
-### 1.1 S6 wird eine Mengenaussage über Sichtbarkeit
+Security and context are not adjacent concerns, they interlock. Four points
+of contact are close enough that building them separately would duplicate
+mechanism:
+
+1. **Disjointness between network and security context is not enforceable
+   without a `ContextCeiling`.** A ceiling over permissions says what an
+   agent may *do*. Disjointness requires a statement about what it may
+   *see* — that is what `ContextCeiling` (`harw-context/src/ceiling.rs`)
+   provides.
+2. **The injection boundary for security findings and the trust classes of
+   the context plan are the same mechanism.** Built twice, it would be two
+   render paths and two fixture sets.
+3. **`harw-observe` belongs to both.** Context metrics live in it, and its
+   calibration loop feeds the security system's feedback channel.
+4. **Security findings are the hardest context case there is.** Large
+   evidence, high sensitivity, local inference. Reference-mode context
+   loading exists for them, not incidentally.
+
+Hence one vocabulary set and one fixture corpus, described together.
+
+---
+
+## 1. The four seams, in detail
+
+### 1.1 Network/security disjointness as a set statement
 
 ```toml
 # harwness.ceiling.security@1
@@ -51,237 +53,219 @@ forbidden = ["security.*", "goal.*", "plan.*", "memory.*", "secrets.*"]
 budget_max = { tokens_total = 4000 }
 ```
 
-`ContextCeiling::intersect` ist monoton, `admits` prüft beim Auflösen. Damit
-ist die Disjunktheit weder Prompt-Konvention noch Reviewregel, sondern eine
-Eigenschaft, die der Resolver abweist. Die Attacker-Fixture
-`context_escalation_attacker.toml` prüft genau das für beide Richtungen.
+`ContextCeiling::intersect` is monotonic; `admits` checks at resolution
+time. Disjointness is therefore not a prompting convention or a review
+rule, it's a property the resolver rejects violations of. Implemented:
+`harw-context/src/ceiling.rs`.
 
-### 1.2 Eine Injection-Grenze für beide Pläne
+### 1.2 One injection boundary for both areas
 
-`TrustClass` aus `harw-context` ist der Träger. Ereignisdaten des DoD-Plans
-sind `Data`, digest-gesicherte Nachweise `Evidence`, Instruktionen kommen
-ausschließlich aus Definitionen. Der Zwei-Block-Renderer (K4) ist der einzige
-Ort, an dem entschieden wird, was in den Instruktionsteil darf.
+`TrustClass` in `harw-context` is the carrier. Security event data is
+`Data`, digest-secured evidence is `Evidence`, instructions come
+exclusively from definitions. The two-block renderer is the only place that
+decides what may enter the instruction part.
 
-Ein Fixture-Korpus, zwei Prüfungen: die Injection-Fixtures des DoD-Plans
-laufen zusätzlich durch den Renderer und müssen im Datenblock landen, und der
-Nullzähler `trust_block_violation` ist die gemeinsame Metrik.
+### 1.3 One digest type
 
-### 1.3 Ein Digest-Typ
+`ContentDigest` (blake3) lives in `harw-types` and is used consistently for
+fragment cache stability, tamper detection on security evidence, and plan
+evidence references — one type, several call sites, no conversion.
 
-`ContentDigest` (blake3, wie `SnapshotId`) lebt in `harw-types` und wird
-dreifach benutzt: `Fragment.digest` für Cache-Stabilität, `SecurityEvidence`
-für Manipulationserkennung, `EvidenceRef.digest` (die additive Erweiterung in
-`harw-plan`) für Plan-Nachweise. Ein Typ, drei Verwendungen, keine
-Konvertierung.
+### 1.4 Reference mode as a security mechanism
 
-### 1.4 Referenzmodus als Sicherheitsmechanismus
-
-`SampleRing::freeze()` liefert eine `SecurityEvidence` mit Digest, nicht
-Rohdaten. Im Kontext erscheint sie als Referenz, das Nachladen läuft über
-`context.load` mit Kappe. Damit ist die hochauflösende Evidenz vorhanden,
-verlässt aber nie ungefragt die Platte, und der Triage-Turn bleibt bei
-wenigen tausend Token, was lokale Inferenz überhaupt erst ermöglicht.
+Freezing a sample ring yields evidence with a digest, not raw data. In
+context it appears as a reference; reloading goes through capped
+`context.load`. High-resolution evidence stays available without leaving
+disk unasked, and a triage turn stays within a few thousand tokens, which
+is what makes local inference feasible at all.
 
 ---
 
-## 2. Verschmolzene Wellenfolge
+## 2. Merged rollout sequence
 
-Ersetzt die getrennten S- und K-Wellen. Jede Welle ist als Zelle
-formulierbar, Schreibbereiche crate-disjunkt, keine hängt an einer späteren.
+The phases below were the original build sequence for this combined work.
+They are recorded here for the rationale they carry (why context primitives
+had to land before security agents, for example), not as a live tracker.
 
-| Welle | Thema | Enthält |
+| Phase | Theme | Contains |
 |---|---|---|
-| **W0** | Vokabular | `harw-observe`, `harw-context`, `harw-signals`, IDs in `harw-types`, `metrics!`, `field!`, `Redact`, `Fragment::from_v1` |
-| **W1** | Selbstbeobachtung und Assembly v2 | `TraceContext` in `StoredJob`/`ChildLeaseRecord`, `#[traced]`, Typestate-Assembly, **die IR wird erstmals konsumiert**, `must_include` fail-closed, Plan-Schleifen-Metriken |
-| **W2** | Programme und Beobachter | Kontextprogramme als Definitionen, `ContextCeiling` im Resolver und im Handoff, `harw-sensor` sysfs/procfs/journald plus `WorkspaceSensor` |
-| **W3** | Mengen | `EgressSet` in `harw-sandbox`, `harw-netpolicy` als reiner Plan, Quellenbindungen (Plan-, Memory-, Knowledge-Provider) |
-| **W4** | Grenze und Regeln | Zwei-Block-Rendering, Vertrauensklassen, `harw-rules` mit Vertragsregeln, `FileSensor` mit loginuid, Baselines, `EvidenceRef`-Digest |
-| **W5** | Durchsetzung und Referenzen | `harw-warden-proto`, `harw-warden`, `harw-escalate`, `FreezeStore`, `warden_actions!`, `DetailMode::References` mit `context.load`, Historie als Sektion |
-| **W6** | Agenten | Security-Familie und Clan, vier Spezialisierungen, Programmbibliothek, Plan-Andockung, Layer-4-Schreiber |
-| **W7** | Betrieb | eBPF-Backends, systemd-Units, Off-Host-Spiegel, Out-of-Band-Meldeweg, Intel-Scout, Kettenprüfung |
+| 0 | Vocabulary | `harw-observe`, `harw-context`, `harw-dod-signals`, IDs in `harw-types`, metrics/field macros, redaction, fragment conversion |
+| 1 | Self-observation and assembly | trace context on stored jobs/leases, typestate assembly, context IR enforcement (`must_include` fail-closed), plan-loop metrics |
+| 2 | Programs and observers | context programs as definitions, `ContextCeiling` in the resolver and handoff, sysfs/procfs/journald sensors, workspace drift sensor |
+| 3 | Sets | `EgressSet` in `harw-sandbox`, `harw-dod-netpolicy` as a pure plan, source bindings (plan/memory/knowledge providers) |
+| 4 | Boundary and rules | two-block rendering, trust classes, `harw-dod-rules` with contract rules, file-watch sensor with loginuid, baselines, evidence-ref digests |
+| 5 | Enforcement and references | `harw-dod-warden-proto`, `harw-dod-warden`, `harw-dod-escalate`, freeze store, reference-mode context loading, history as a section |
+| 6 | Agents | security agent family, triage specializations, program library, plan attachment |
+| 7 | Operations | eBPF backends, systemd units, off-host mirroring, out-of-band alerting |
 
-**Die kritische Reihenfolge:** W1 vor allem anderen, weil dort das
-`ContextProgram` der `ExecutableAgentIr` zum ersten Mal durchgesetzt wird.
-Solange `must_include` still wegfallen kann, ist jede Sicherheitszusage über
-Kontextinhalte wertlos. Und W4 vor W6, weil ein Triage-Agent ohne
-Zwei-Block-Rendering ein Injection-Ziel wäre.
+**The critical ordering:** context-IR enforcement had to land before
+anything else, because as long as `must_include` could silently be dropped,
+any security guarantee about context contents was worthless. And the
+two-block boundary had to land before the triage agents, because a triage
+agent without it would be an injection target.
+
+Phases 0–6 are implemented in the current codebase (`harw-context`,
+`harw-observe*`, the `dod/` workspace's sensor/rules/escalate/warden
+crates). Phase 7 operational items (off-host mirroring, out-of-band
+alerting) are Open — see `docs/design/harw-security-observability-plan.md`
+for current operational status.
 
 ---
 
-## 3. Abhängigkeits-Doktrin
+## 3. Dependency doctrine
 
-### 3.1 Die Regeln
+### 3.1 The rules
 
-**D1. Im privilegierten Pfad nur reines Rust.** Der Warden und alles, was er
-linkt, enthält keinen C-Code, keine `*-sys`-Crate, kein `bindgen`, kein
-`pkg-config`. Eine C-Bibliothek im Warden wäre genau die
-Speichersicherheitslücke, gegen die das ganze System gebaut ist.
+**D1. Pure Rust only on the privileged path.** The warden and everything it
+links contains no C code, no `*-sys` crate, no `bindgen`, no `pkg-config`. A
+C library in the warden would be exactly the memory-safety hole the whole
+system is built against. **Implemented** — verified: `dod/crates/harw-warden/Cargo.toml`
+depends only on Rust crates (`rustix`, `landlock`, `sd-listen-fds`, `serde`,
+`clap`, `tracing`) plus in-house crates; network enforcement shells out to
+the `nft` binary as a subprocess rather than linking a C netfilter library
+(see §3.3).
 
-**D2. Kein `build.rs`, das einen C-Compiler startet.** Nicht im Warden-Baum,
-nicht in seinen Abhängigkeiten. Build-Skripte laufen mit den Rechten des
-Bauenden und sind der meistgenutzte Supply-Chain-Vektor.
+**D2. No `build.rs` that invokes a C compiler**, not in the warden tree, not
+in its dependencies.
 
-**D3. Syscall-Boden ist `rustix` mit `linux_raw`.** Direkte Syscalls über
-`asm!`, ohne libc, ohne `errno`, ohne pthread-Cancellation, mit erhaltener
-Speicher- und I/O-Sicherheit bis zum Syscall hinunter. `libc` nur dort, wo
-`rustix` nicht hinreicht, und dann isoliert in einem Modul.
+**D3. Syscall floor is `rustix` with `linux_raw`.** `libc` only where
+`rustix` doesn't suffice, isolated in its own module. **Implemented** in
+`harw-warden`, `harw-sentinel`, `harw-probe-fs`, `harw-probe-bpf`.
 
-**D4. Jede externe Abhängigkeit liegt hinter einem eigenen Trait.** Präzedenz
-ist die Provider-Schicht: der Katalog kennt 22 Anbieter, der Code kennt einen
-Trait. Ein Sensor-Backend, ein Netzwerk-Backend, ein Telemetrie-Sink sind
-austauschbar, ohne dass ein Typ der Fassade sich ändert.
+**D4. Every external dependency sits behind its own trait.** A sensor
+backend, a network backend, a telemetry sink are swappable without a facade
+type changing.
 
-**D5. Pre-1.0-Abhängigkeiten erscheinen nie in einem öffentlichen Typ.** Sie
-dürfen hinter einem Adapter leben, aber kein `pub fn` der Fassade gibt sie
-zurück oder nimmt sie an. Sonst wird ein fremder Minor-Bruch zu einem Bruch
-deiner API.
+**D5. Pre-1.0 dependencies never appear in a public type.** They may live
+behind an adapter, but no facade `pub fn` returns or accepts them directly.
 
-**D6. Selbst bauen, wenn die Syscall-Fläche klein und die Crate schwach ist.**
-Faustregel: unter etwa 500 Zeilen Bindungscode und eine Crate mit wenig
-Verkehr oder ohne aktive Pflege bedeutet: selbst bauen auf `rustix`. Eine
-schwach gepflegte Abhängigkeit ist teurer als der Code, den sie ersetzt.
+**D6. Build it yourself when the syscall surface is small and the crate is
+weak.** Rule of thumb: under roughly 500 lines of binding code and a
+low-traffic or unmaintained crate means: build it on `rustix`.
 
-**D7. Die Abhängigkeitszahl des Wardens ist eine Zahl mit Obergrenze.** Sie
-steht im Doc, wird in CI geprüft und ist eine Metrik. Ein Durchsetzer, den
-man vollständig lesen kann, muss auch einen Abhängigkeitsbaum haben, den man
-vollständig lesen kann. Vorschlag: höchstens zwölf transitive Crates.
+**D7. The warden's dependency count is a number with a ceiling**, documented
+and checked in CI. A enforcer that can be fully read should have a
+dependency tree that can be fully read too. **Status: Open as an enforced
+CI check** — `dod/crates/harw-warden/Cargo.toml` currently lists roughly a
+dozen direct dependencies, consistent with the doctrine's intent, but no CI
+step currently counts and gates the transitive total.
 
-**D8. Lieferketten-Gates in CI.** `cargo deny` für Advisories, Quellen,
-Lizenzen und Bans als Basisgate; `cargo vet` zusätzlich, aber nur für den
-DoD-Teilbaum, weil sein Aufwand nur bei sicherheitskritischem Code
-gerechtfertigt ist; `cargo auditable` für ausgelieferte Binaries, damit der
-Abhängigkeitsbaum im Binary steckt und nachträglich prüfbar ist. Jeder
-`ignore`-Eintrag ist zeitlich befristet und begründet.
+**D8. Supply-chain gates in CI.** `cargo deny` for advisories, sources,
+licenses and bans as the baseline gate — **implemented**
+(`deny.toml`, `.github/workflows/ci.yml` `cargo-deny` job). `cargo vet`,
+scoped to the `dod/` subtree only — **Open**, not yet wired into CI (no
+`vet` config or audit store in the repository as of this review). `cargo
+auditable` for shipped binaries — **Open**, not found in the build/release
+tooling.
 
-**D9. Die Doktrin ist selbst eine Regel.** `harw-code-graph` liest
-`Cargo.lock`, der `WorkspaceSensor` erzeugt `StructureDrift`, und
-`harw-rules` prüft neue Abhängigkeiten gegen das kuratierte Inventar. Eine
-Abhängigkeit außerhalb der Doktrin ist damit kein Reviewversäumnis, sondern
-ein Befund mit Härte `RuleTriggered`.
+**D9. The doctrine is itself a checked rule.** `harw-code-graph` reads
+`Cargo.lock`, the workspace-drift sensor (`harw-dod-workspace`) produces
+structure/dependency drift findings, and `harw-dod-rules` checks new
+dependencies against a curated inventory. **Implemented** as a mechanism
+(`harw-dod-workspace`, `harw-dod-rules`'s `StructureDriftRule`); the
+curated-inventory content itself should be reviewed periodically as
+dependencies change.
 
-### 3.2 Bewertete Auswahl
+### 3.2 Evaluated choices
 
-**Tier A, reines Rust, empfohlen.**
+**Tier A, pure Rust, in use.**
 
-| Zweck | Crate | Begründung | Risiko |
-|---|---|---|---|
-| Syscalls | `rustix` (linux_raw) | Bytecode Alliance, kein libc, I/O-Safety bis zum Syscall, Feature-gated, breit im Ökosystem verankert | pre-1.0, aber sehr stabil und weit verbreitet; hinter D5 halten |
-| eBPF | `aya` | Von Grund auf in Rust, ohne libbpf und bcc, nur libc für Syscalls; BTF und CO-RE, kein C-Toolchain, mit musl ein einziges portables Binary | pre-1.0 (0.13.x); Verifier fängt Programmfehler ab, Ladefehler statt Absturz |
-| seccomp | `seccompiler` | rust-vmm, in Firecracker im Einsatz; Filter als Rust-IR, Kompilierung zur Bauzeit über Build-Skript und `include_bytes!` | reine Rust-Codegen, kein libseccomp |
-| Pfadbeschränkung | `landlock` | Unprivilegiert, nur `no_new_privs` nötig; ABI-Versionierung erlaubt Best-Effort-Kompatibilität über Kernelversionen | ABI-Abfrage ist Pflicht, sonst bricht es auf älteren Kerneln |
-| Netfilter | `rustables` | Fork von `nftnl-rs`, spricht Netlink direkt, **ohne** libnftnl und libmnl | Doku nennt die API selbst rau und in Teilen durch Ausprobieren entstanden; hinter D4 kapseln, Plan-Ebene testbar halten |
-| Netlink-Transport | `netlink-sys`, `netlink-packet-core`, `netlink-packet-route`, `netlink-packet-audit` | Bausteinfamilie, reine Paketzerlegung, tokio-Integration optional | viele kleine Crates; Versionsdrift im Auge behalten |
-| procfs | `procfs` | reines Parsen von `/proc` | Alternative: selbst parsen, siehe unten |
-| Zeit, Hash, Serde | `jiff`, `blake3`, `serde` | bereits im Baum, Konvention gesetzt | jiff pre-1.0, Naht dokumentiert |
-
-**Tier B, C-Abhängigkeit, vermeiden oder isolieren.**
-
-| Zweck | Kandidat | Urteil |
+| Purpose | Crate | Status |
 |---|---|---|
-| Netfilter | `nftnl` / `nftnl-sys` | **Abgelehnt.** Bindgen auf libnftnl plus libmnl, pkg-config, Versionsfeatures pro libnftnl-Version. Verstößt gegen D1 und D2. |
-| seccomp | libseccomp-Bindungen | **Abgelehnt** zugunsten von `seccompiler`. |
-| GPU | `nvml-wrapper` | **Nur hinter Feature und Trait.** NVML ist NVIDIAs C-Bibliothek und für NVIDIA-Metriken unumgänglich; AMD und Intel laufen über sysfs ohne jede Abhängigkeit. Der Warden linkt sie nie. |
+| Syscalls | `rustix` (`linux_raw`) | Implemented, used throughout the privileged binaries |
+| eBPF | `aya` | Implemented — `dod/crates/harw-dod-bpf` |
+| Path confinement | `landlock` | Implemented — `harw-sentinel`, `harw-probe-fs`, `harw-warden` all apply a landlock rule |
+| Netlink transport | `netlink-*` family | Implemented — `harw-dod-netlink`, `harw-dod-authlog` |
+| procfs | in-house parsing | Implemented per-sensor (see `harw-dod-crate-decomposition.md` §4/§5), rather than an external `procfs` crate |
+| Time, hash, serde | `jiff`, `blake3`, `serde` | Implemented, workspace-pinned |
 
-**Tier C, selbst bauen.**
+**Tier B/candidates, reconsidered against the actual implementation.**
 
-| Zweck | Warum selbst | Aufwandsschätzung |
+| Purpose | Original candidate | Current status |
 |---|---|---|
-| fanotify | Verfügbare Crates sind dünn und wenig frequentiert; die Fläche ist klein: `fanotify_init`, `fanotify_mark`, Event-Read, `loginuid`-Auflösung über procfs | 300 bis 400 Zeilen auf `rustix` |
-| auditd-Records | Transport über `netlink-packet-audit`, aber das Zerlegen der Recordfelder für `USER_AUTH` und `USER_LOGIN` ist die eigentliche Arbeit und soll typisiert und getestet sein | 200 bis 300 Zeilen plus Fixtures |
-| sysfs, hwmon, cgroup v2, diskstats, PSI | Zeilenweises Parsen fester Formate; jede Abhängigkeit hier ist teurer als der Code | je 50 bis 150 Zeilen, gemeinsam über `#[derive(SensorSource)]` |
-| Metrik-Registry und Sink | `harw-observe` ist ohnehin der Vertrag; ein eigenes Registry-Slice ist trivial | bereits im Plan |
+| Netfilter | `rustables` (pure-Rust netlink) | **Not used.** `dod/crates/harw-warden/src/isolation.rs` instead shells out to the `nft` CLI binary as a child process, with a fixed argument grammar and no shell interpolation. This is a deliberate deviation from the original doctrine's D1 preference for pure Rust over an external binary; it avoids depending on a less-mature netlink-nftables crate at the cost of a subprocess dependency. Worth revisiting once/if the nftables Rust ecosystem matures. |
+| seccomp | `seccompiler` | **Not implemented.** No seccomp filtering was found in the codebase; process confinement currently relies on landlock plus capability dropping, not syscall filtering. Open. |
+| GPU | `nvml-wrapper` | Behind a feature/trait as planned; AMD/Intel go through sysfs with no extra dependency (`harw-dod-gpu`). |
 
-**Tier D, bewusst außen vor.**
+**Tier D, deliberately excluded — still holds.**
 
-`opentelemetry` und `opentelemetry-otlp` sind ausdrücklich **keine**
-Kernabhängigkeit. Stand Mitte 2026 auf der 0.32-Linie sind Logs und Metriken
-stabil, Traces noch Beta, alle Erstanbieter-Crates weiterhin pre-1.0 mit
-Brüchen in Minor-Releases und gemeinsamer Versionierung im Gleichschritt.
-Genau dafür existiert `TelemetrySink`: die OTel-Bindung lebt in einem
-optionalen Adapter-Crate hinter dem Trait, und der Kern kennt sie nicht.
-Dasselbe gilt für Prometheus. Wenn OTel-Rust 1.0 erreicht, ist der Wechsel
-ein Adapter, kein Umbau.
+`opentelemetry`/`opentelemetry-otlp` are not a core dependency; confirmed —
+no OTel dependency appears anywhere in the workspace. The telemetry sink
+trait (`harw-observe`) keeps any future OTel binding behind an optional
+adapter crate (`harw-observe-otlp`), never in the core. The same applies to
+Prometheus (`harw-observe-prom`).
 
-Ebenfalls außen vor: jede Crate, die einen Scanner-Prozess für uns startet.
-Scanner laufen per systemd-Timer mit festen Argumenten, wir lesen Reports.
+Also excluded, as designed: any crate that would start a scanner process on
+our behalf. Scanners run on a systemd timer with fixed arguments; this
+system only reads their reports.
 
-### 3.3 Der Warden als Härtefall
+### 3.3 The warden as the hard case
 
-Der Warden ist der Ort, an dem die Doktrin am striktesten gilt. Sein
-Zielbild: `rustix` für Syscalls, `rustables` für die Regelseite, ein
-Netlink-Transport, `serde` plus ein kompaktes Format für das Protokoll,
-`harw-warden-proto` und `harw-observe` aus dem eigenen Haus. Kein tokio, wenn
-ein blockierender Socket-Loop reicht. Kein Logging-Framework, das dynamisch
-formatiert. Kein Netzwerkzugang außer dem Unix-Socket. Kein `String`-Feld,
-das je als Befehl gelesen wird.
-
-Ein systemd-aktivierter Socket bedeutet außerdem: der Warden läuft gar nicht,
-solange niemand ihn braucht. Die kleinste Angriffsfläche ist ein Prozess, der
-nicht existiert.
+The warden is where the doctrine applies most strictly. Confirmed in
+`dod/crates/harw-warden/Cargo.toml`: `rustix` for syscalls, no async
+runtime (no tokio — a blocking socket loop is sufficient), a
+systemd-activated `SOCK_SEQPACKET` socket via `sd-listen-fds` (0 further
+dependencies of its own), `landlock` for path confinement, and network
+enforcement via the `nft` CLI rather than a linked netfilter library (see
+§3.2 above — a deviation from the original all-Rust vision, kept narrow: a
+fixed table/chain name, argument-list invocation, no shell). A
+systemd-activated socket also means the warden isn't running at all until
+something needs it — the smallest attack surface is a process that doesn't
+exist.
 
 ---
 
-## 4. Fassade und Grenzziehung
+## 4. Facade and boundary
 
-`harw-dod` ist die Fassade des Sicherheitssubsystems und wird in
-`harw-dod-charter.md` begründet. Für die Integration zählt vor allem, was
-**nicht** darunter liegt:
+`harw-dod` is the security subsystem's facade (see `harw-dod-charter.md`).
+For integration, what matters most is what is **not** under it:
 
-`harw-context` gehört **nicht** zu `harw-dod`. Es ist allgemeine
-Infrastruktur, die jeder Agent nutzt, vom UIA bis zum Verifier. Läge es unter
-der Sicherheitsfassade, würde jede Kontextänderung wie eine
-Sicherheitsänderung aussehen und umgekehrt. `harw-observe` liegt aus
-demselben Grund darunter im Sinne der Abhängigkeit, aber nicht darin im Sinne
-der Fassade: Telemetrie ist für alle da.
+`harw-context` is **not** part of `harw-dod`. It is general infrastructure
+every agent uses. Putting it under the security facade would make every
+context change look like a security change and vice versa. `harw-observe`
+sits beside the subsystem in dependency terms for the same reason —
+telemetry is for everyone.
 
-Die Grenze in einem Satz: **`harw-dod` reexportiert, was mit Verteidigung zu
-tun hat; `harw-context` und `harw-observe` sind Infrastruktur und stehen
-daneben, nicht darunter.**
+The boundary in one sentence: **`harw-dod` re-exports what concerns
+defense; `harw-context` and `harw-observe` are infrastructure standing
+beside it, not under it.**
 
 ---
 
-## 5. Prüfungen für diesen Integrationsplan
+## 5. Checks for this integration plan
 
-Zusätzlich zu den Teststrategien beider Einzelpläne:
-
-**Doktrin-Gate.** Ein CI-Schritt zählt die transitiven Abhängigkeiten des
-Warden-Binaries und schlägt oberhalb der Obergrenze fehl. Ein zweiter prüft,
-dass im Warden-Teilbaum keine Crate mit `links`-Attribut oder `build.rs` mit
-C-Compiler vorkommt.
-
-**Disjunktheits-Test.** Ein Test lädt die Security-Ceiling und die
-Scout-Ceiling und prüft, dass der Schnitt ihrer `universe`-Mengen leer ist.
-Das ist S6 als Zeile.
-
-**Gemeinsame Fixtures.** Die Injection-Fixtures liegen in einem Verzeichnis
-und werden von zwei Testsuiten gelesen: der Rendering-Suite in `harw-core`
-und der Triage-Suite in `harw-escalate`. Ein Fixture, zwei Prüfungen.
-
-**Golden Renders für Sicherheitsprogramme.** Der eingefrorene Render von
-`security-triage@1` ist Teil der Regression: wenn sich der Prompt eines
-Sicherheitsagenten ändert, ist das eine sichtbare Änderung mit Diff, nicht
-ein stiller Drift.
+- **Disjointness test.** A test loads the security ceiling and the scout
+  ceiling and checks that the intersection of their `universe` sets is
+  empty.
+- **Shared fixtures.** Injection fixtures live in one directory and are
+  read by both the context-rendering test suite and the security-triage
+  test suite.
+- **Golden renders for security programs.** A frozen render of the
+  security-triage prompt is part of regression testing, so a prompt change
+  is a visible diff, not a silent drift.
+- **Doctrine gate (Open).** A CI step that counts the warden binary's
+  transitive dependencies and fails above a ceiling, and a second step that
+  checks the warden subtree contains no crate with a `links` attribute or a
+  `build.rs` invoking a C compiler — neither is wired into CI yet; `cargo
+  deny` covers advisories/licenses/bans but not this specific doctrine
+  check.
 
 ---
 
-## 6. Offene Punkte dieses Plans
+## 6. Open items
 
-1. **`rustables`-Reife.** Die Doku ist ungewöhnlich offen über die rauen
-   Kanten. Vorschlag: die Regelseite in `harw-netpolicy` so schneiden, dass
-   der `NetPlan` rein und vollständig testbar ist und der Anwendungsteil
-   klein bleibt; falls sich die Crate als zu unzuverlässig erweist, ist der
-   Ersatz durch eigene Netlink-Nachrichten auf `netlink-packet-*` ein
-   begrenzter Umbau hinter D4.
-2. **`aya`-Version.** Vor W7 den Stand prüfen; falls 1.0 bis dahin da ist,
-   direkt darauf. Bis dahin gilt D5: keine `aya`-Typen in öffentlichen
-   Signaturen.
-3. **Obergrenze der Warden-Deps.** Zwölf ist ein Vorschlag, keine Messung.
-   Nach dem ersten Prototyp festzurren.
-4. **`cargo vet`-Umfang.** Nur DoD-Teilbaum ist die Empfehlung; die
-   Alternative, den ganzen Workspace zu vetten, ist bei 46 Membern
-   wahrscheinlich zu teuer.
-5. **Fallback ohne eBPF.** Auf Kerneln ohne `CAP_BPF` oder ohne BTF muss der
-   Sentinel lauffähig bleiben, nur mit weniger Sensoren. Das ist bereits über
-   `SensorHandle<Unbound>` ausdrückbar, muss aber als Betriebsfall
-   dokumentiert werden.
+1. **`nft`-subprocess vs. a pure-Rust netlink-nftables crate.** The current
+   implementation shells out to `nft`. Revisit if the ecosystem's pure-Rust
+   options mature, per D1's original preference.
+2. **seccomp filtering.** Not implemented; process confinement currently
+   relies on landlock and capability separation. Whether syscall filtering
+   is added later, or the doctrine is revised to state landlock+caps as
+   sufficient, is open.
+3. **Ceiling on warden dependencies.** Not yet a CI-enforced number.
+4. **`cargo vet` scope and `cargo auditable`.** Neither is wired into CI
+   yet; both remain part of the doctrine's intent (D8) but are Open.
+5. **Fallback without eBPF.** On kernels without `CAP_BPF` or without BTF,
+   the sentinel must stay operational with fewer sensors. This is already
+   expressible via the sensor typestate (an unbound handle simply never
+   binds); it should be documented as a supported operating mode rather
+   than left implicit.

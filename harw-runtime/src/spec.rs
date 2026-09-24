@@ -6,7 +6,7 @@
 //! seine [`EntryKind`]; welche Sandbox-Rechte, welches Registry-Profil, welche
 //! Operations-Fläche, welche Ask-Auflösung, welcher Spawner und welche
 //! Kontext-Decke daraus folgen, legt ausschließlich [`EntryKind::profile`] fest
-//! (Vertrag: `docs/remediation/CONTRACTS.md` §runtime-spec).
+//! (Vertrag: `docs/design/runtime-contracts.md` §runtime-spec).
 //!
 //! # Netz
 //! Nur die beiden Nutzeroberflächen [`EntryKind::Tui`] und
@@ -127,7 +127,7 @@ pub struct EntryProfile {
 impl EntryKind {
     /// Die **einzige** Reduktionstabelle Einstieg → Profil.
     ///
-    /// # Tabelle (CONTRACTS.md §runtime-spec)
+    /// # Tabelle (docs/design/runtime-contracts.md §runtime-spec)
     /// | Entry | Rechte | Registry / Ops | Ask | Spawner | Decke | Projektkontext |
     /// |---|---|---|---|---|---|---|
     /// | Tui | {R, W, X, N} | Full + AllWithModelTools | Interactive | BuiltinRoles | LocalRoot | ja |
@@ -705,14 +705,14 @@ mod tests {
     fn rights_snapshot_carries_principal_actor() {
         let principal = Principal::trusted_ingress(
             PrincipalKind::Human,
-            "mia",
+            "alice",
             IngressSurface::Tui,
             PermissionTier::Owner,
         );
         let spec = RuntimeSpec {
             entry: EntryKind::Tui,
-            home: PathBuf::from("/home/mia/.harw"),
-            cwd: PathBuf::from("/home/mia/projects/harwness"),
+            home: PathBuf::from("/home/user/.harw"),
+            cwd: PathBuf::from("/home/user/projects/harwness"),
             principal,
             mode_override: Some(InteractionMode::Work),
             active_agent: None,

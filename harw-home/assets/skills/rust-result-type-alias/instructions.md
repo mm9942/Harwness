@@ -20,7 +20,7 @@ fn parse_positions(raw: &str) -> std::result::Result<Vec<Position>, InvoiceError
 ## Richtig
 
 ```rust
-// Datei: sgh-secureHUB/crates/securehub-error/src/error.rs:39
+// Datei: acme-secure-hub/crates/securehub-error/src/error.rs:39
 pub type Result<T> = std::result::Result<T, Error>;
 
 // parser.rs — kurzer Import, lesbare Signaturen

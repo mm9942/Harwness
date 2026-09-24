@@ -2,7 +2,7 @@
 //! Sitzungsgrenzen hinweg.
 //!
 //! # Verantwortungsbereich
-//! Trägt [`TraceContext`] (Vertrag A.4, `docs/aw-contract-master.md`) —
+//! Trägt [`TraceContext`] (Vertrag A.4, `docs/design/build-history.md`) —
 //! ein eingefrorener Wire-Typ, seit AW1-01 ihn in `StoredJob` und
 //! `ChildLeaseRecord` schreibt. Jede Feldänderung nach diesem Punkt bricht
 //! Bestandsdateien; die Serde-Form (drei Felder, `deny_unknown_fields`)

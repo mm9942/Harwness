@@ -520,7 +520,7 @@ pub fn discover_project(
 /// it. Without this, a dotfiles bare repo's `~/.git` or a stray
 /// `~/package.json` would silently turn the user's entire home directory
 /// into a read/write/execute sandbox for any `cwd` started underneath it —
-/// see the module-level docs and `docs/remediation/ledger/W1/W1-07.md`.
+/// see the module-level docs.
 fn find_project_root(cwd: &Path, config: &DiscoveryConfig) -> PathBuf {
     // Kanonisieren, damit der Komponentenvergleich mit dem bereits
     // kanonisierten `cwd`-Pfad exakt ist (Symlinks in `$HOME` selbst wären
@@ -583,8 +583,8 @@ fn has_any_marker(dir: &Path, markers: &[String]) -> bool {
 /// Returns the current process's real user id, or `None` if it cannot be
 /// determined without adding a new dependency.
 ///
-/// `harw-project-discovery`'s `Cargo.toml` is out of scope for this change
-/// (see `docs/remediation/ledger/W1/W1-07.md`), so this does not use
+/// `harw-project-discovery`'s `Cargo.toml` is out of scope for this change,
+/// so this does not use
 /// `rustix::process::geteuid()` the way `harw-fsutil::perm` does. On Linux,
 /// `/proc/self` is a symlink whose owning uid is the process's real uid
 /// (`proc(5)`), so a plain `std::fs::metadata` stat gives an exact answer
@@ -1248,7 +1248,7 @@ mod tests {
         Ok(())
     }
 
-    // ── W1-07 (F-028/S1): $HOME-Grenze ───────────────────────────────────────
+    // ── $HOME-Grenze ───────────────────────────────────────
 
     #[test]
     fn test_home_dir_with_git_is_not_promoted_to_root_for_descendant_cwd() -> TestResult {
@@ -1322,7 +1322,7 @@ mod tests {
         Ok(())
     }
 
-    // ── W1-07 (F-028/S1): Eigentümer/Weltschreibbarkeit ──────────────────────
+    // ── Eigentümer/Weltschreibbarkeit ──────────────────────
 
     #[cfg(unix)]
     #[test]
@@ -1364,7 +1364,7 @@ mod tests {
         Ok(())
     }
 
-    // ── W1-07 (F-165/S2): einzelne Dokumente überspringen statt abbrechen ───
+    // ── Einzelne Dokumente überspringen statt abbrechen ───
 
     #[cfg(unix)]
     #[test]

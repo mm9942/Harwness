@@ -2,7 +2,7 @@
 //! er bereits abgerufene [`crate::context_proposal::ContextProposal`]- und
 //! [`crate::model_behavior_proposal::ModelBehaviorProposal`]-Bestände
 //! aufbereitet, ordnet und zusammenfasst. Trägt außerdem die drei
-//! `steward_*`-Nullzähler, die der Plan (`docs/aw-plan.md`, K7) diesem
+//! `steward_*`-Nullzähler, die der Plan (`docs/design/build-history.md`, K7) diesem
 //! Knoten zuweist, ohne sie zu benennen.
 //!
 //! # Warum es keine `apply`-Funktion gibt

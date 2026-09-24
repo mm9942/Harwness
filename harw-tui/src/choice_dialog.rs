@@ -1,7 +1,7 @@
 //! Wiederverwendbarer nummerierter Auswahldialog im Stil des Freigabe-Panels.
 //!
-//! Spec-Quelle: `nope-permissions-gibt-es-wild-lobster.md` Schritt 3
-//! (Freigabe-Panel, nummerierte Optionen) und `harw-scopes-contract.md`
+//! Spec-Quelle: Freigabe-Panel mit nummerierten Optionen,
+//! `docs/design/tui-command-contract.md`
 //! Slice E1 (`/export`-Auswahl: Zwischenablage / Datei / Abbrechen).
 //!
 //! # Verantwortung

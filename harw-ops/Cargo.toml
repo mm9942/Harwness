@@ -3,6 +3,8 @@ publish.workspace = true
 name = "harw-ops"
 version.workspace = true
 edition.workspace = true
+license.workspace = true
+repository.workspace = true
 rust-version.workspace = true
 
 [dependencies]
@@ -31,7 +33,7 @@ harw-job-runtime = { path = "../harw-job-runtime" }
 harw-extension-api = { path = "../harw-extension-api" }
 harw-tool-shell = { path = "../harw-tool-shell" }
 harw-tools = { path = "../harw-tools" }
-# `sandbox-lease` (Plan `recursive-cooking-lobster.md` Teil B5) wartet mit
+# `sandbox-lease` wartet mit
 # `tokio::time::timeout` auf die Antwort eines `HostPermitPrompt` (dieselbe
 # Frist wie `harw_tool_shell::HOST_PERMIT_PROMPT_TIMEOUT`). `tokio` stand
 # bislang nur unter `[dev-dependencies]` (für `#[tokio::test]`); das reicht

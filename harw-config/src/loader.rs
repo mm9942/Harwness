@@ -84,15 +84,15 @@ fn user_name_from_line(line: &str) -> Option<String> {
     let line = line.trim();
     let line = line.strip_prefix('-').map_or(line, str::trim_start);
     let (label, value) = line.split_once(':')?;
-    // USER.md ist Markdown: neben `Name: Mia` ist daher auch der übliche
-    // Listenpunkt `- **Name:** Mia` ein explizites Namensfeld.
+    // USER.md ist Markdown: neben `Name: Alice` ist daher auch der übliche
+    // Listenpunkt `- **Name:** Alice` ein explizites Namensfeld.
     let label = label.trim().trim_matches('*').trim();
     if !label.eq_ignore_ascii_case("name") {
         return None;
     }
 
     // Der Wert kann das schließende `**` der Markdown-Hervorhebung tragen
-    // (z. B. `- **Name:** Mia` → Wert `** Mia`, da der erste `:` bereits
+    // (z. B. `- **Name:** Alice` → Wert `** Alice`, da der erste `:` bereits
     // innerhalb der Hervorhebung liegt) — deshalb dieselbe `*`-Bereinigung
     // wie beim Label.
     let value = value
@@ -356,11 +356,11 @@ mod tests {
     #[test]
     fn load_uia_identity_present_returns_content() -> TestResult {
         let directory = test_directory()?;
-        fs::write(directory.join("identity.md"), "Ich bin Emily.")
+        fs::write(directory.join("identity.md"), "Ich bin Assistant.")
             .map_err(ctx("identity.md schreiben"))?;
         assert_eq!(
             load_uia_identity(&directory).map_err(ctx("identity.md laden"))?,
-            "Ich bin Emily."
+            "Ich bin Assistant."
         );
         fs::remove_dir_all(directory).map_err(ctx("Testverzeichnis entfernen"))?;
         Ok(())
@@ -391,13 +391,13 @@ mod tests {
     #[test]
     fn uia_personalization_includes_identity_fragment_when_present() -> TestResult {
         let directory = test_directory()?;
-        fs::write(directory.join("identity.md"), "Ich bin Emily.")
+        fs::write(directory.join("identity.md"), "Ich bin Assistant.")
             .map_err(ctx("identity.md schreiben"))?;
 
         let fragments = load_uia_personalization(&directory).map_err(ctx("load UIA files"))?;
         assert_eq!(fragments.len(), 1);
         assert!(fragments[0].contains("UIA-Identität"));
-        assert!(fragments[0].contains("Ich bin Emily."));
+        assert!(fragments[0].contains("Ich bin Assistant."));
         fs::remove_dir_all(directory).map_err(ctx("Testverzeichnis entfernen"))?;
         Ok(())
     }
@@ -441,7 +441,7 @@ mod tests {
         let directory = test_directory()?;
         fs::write(
             directory.join("USER.md"),
-            "# Nutzerkontext\n- Name: Mia\nprefers German",
+            "# Nutzerkontext\n- Name: Alice\nprefers German",
         )
         .map_err(ctx("USER.md schreiben"))?;
 
@@ -449,7 +449,7 @@ mod tests {
             load_uia_user_name(&directory)
                 .map_err(ctx("USER.md laden"))?
                 .as_deref(),
-            Some("Mia")
+            Some("Alice")
         );
         fs::remove_dir_all(directory).map_err(ctx("Testverzeichnis entfernen"))?;
         Ok(())
@@ -460,7 +460,7 @@ mod tests {
         let directory = test_directory()?;
         fs::write(
             directory.join("USER.md"),
-            "# Nutzerprofil: Mia\n\n- **Name:** Mia",
+            "# Nutzerprofil: Alice\n\n- **Name:** Alice",
         )
         .map_err(ctx("USER.md schreiben"))?;
 
@@ -468,7 +468,7 @@ mod tests {
             load_uia_user_name(&directory)
                 .map_err(ctx("USER.md laden"))?
                 .as_deref(),
-            Some("Mia")
+            Some("Alice")
         );
         fs::remove_dir_all(directory).map_err(ctx("Testverzeichnis entfernen"))?;
         Ok(())
@@ -477,7 +477,7 @@ mod tests {
     #[test]
     fn uia_user_name_ignores_unstructured_context() -> TestResult {
         let directory = test_directory()?;
-        fs::write(directory.join("USER.md"), "Mia prefers German")
+        fs::write(directory.join("USER.md"), "Alice prefers German")
             .map_err(ctx("USER.md schreiben"))?;
 
         assert_eq!(

@@ -44,7 +44,7 @@
 //! [`assert_empty_scope_is_ok`] andererseits prüfen zwei **verschiedene**
 //! Dinge, die vor diesem Umbau in einer einzigen Zusicherung steckten
 //! (`assert_scope_tightness` maß beides zugleich und war dabei für einen
-//! Teil der Sensoren falsch — siehe Knoten K48 in `docs/aw-plan.md`):
+//! Teil der Sensoren falsch — siehe Knoten K48 in `docs/design/build-history.md`):
 //!
 //! - **Bereichsdichtheit** ist die Sicherheitszusage des gesamten
 //!   Sensor-Teilbaums und die eigentliche Frage: *liest der Sensor

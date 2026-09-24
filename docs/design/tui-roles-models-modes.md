@@ -1,8 +1,9 @@
-# Rollen, Modelle, Modi und Freigabe in der TUI
+# Roles, Models, Modes, and Approval in the TUI
 
-Status: Ist-Stand 2026-09-24 (Runde 5), verbindlich für TUI und `harw-ops`.
-Zugehörig: `tui-command-contract.md` §8 (Befehle, Tasten, Präfixe).
-Quellen: `harw-config/src/role_models.rs`, `harw-config/src/internal_models.rs`,
+> Status: implemented · Last reviewed: 2026-09-24
+
+Binding for the TUI and `harw-ops`. Related: `tui-command-contract.md` §8 (commands, keys, prefixes).
+Sources: `harw-config/src/role_models.rs`, `harw-config/src/internal_models.rs`,
 `harw-config/src/uia_worker_models.rs`,
 `harw-ops/src/{models,model,mode,effort}.rs`,
 `harw-extension-api/src/approval_mode.rs`, `harw-runtime/src/approval.rs`
@@ -12,205 +13,203 @@ Quellen: `harw-config/src/role_models.rs`, `harw-config/src/internal_models.rs`,
 
 ---
 
-## 1. Modell je Rolle
+## 1. Model per role
 
-`harw_config::resolve_role_models(&config)` liefert pro `ModelRole` genau
-eine Zeile `RoleModelRow { role, provider, model, source, reasoning_effort }`.
-`/models show` und die Ansicht F8 zeigen genau diese Tabelle, dazu das
-Live-Modell der laufenden Sitzung.
+`harw_config::resolve_role_models(&config)` returns exactly one row per
+`ModelRole`: `RoleModelRow { role, provider, model, source, reasoning_effort }`.
+`/models show` and the F8 view display exactly this table, plus the running
+session's live model.
 
-| Rolle (`key`) | Label | Konfiguration | Mögliche Herkunft (`RoleModelSource`) |
+| Role (`key`) | Label | Configuration | Possible origin (`RoleModelSource`) |
 |---|---|---|---|
-| `uia` | Benutzeroberfläche (UIA) | `uia_provider` + `uia_model` | `UiaPin` (beide gesetzt **und** Provider vorhanden und aktiviert), sonst `DefaultModel`, sonst `Unset` |
-| `uia-worker` | UIA-Worker | `[uia_worker_models] uia_worker`, sonst alter Pin `uia_worker_model` | feste Wahl (`provider/modell`) oder `InheritsUia` (Wert `"uia"`). Seit Runde 5 **ohne** Kopplung an den UIA-Provider, Einzelheiten §1.1 |
-| `orchestrator` | Orchestrator | `[internal_models.root_orchestrator]` | `Explicit`, sonst `DefaultModel`/`Unset` — **nie** OpenRouter-Standard |
-| `sub-orchestrator` | Sub-Orchestrator | `[internal_models.sub_orchestrator]` | `Explicit`, sonst `InheritsOrchestrator` (Provider/Modell der Orchestrator-Zeile) — nie OpenRouter-Standard |
-| `worker-simple` | Worker (einfach) | `[internal_models.worker_simple]` | `Explicit` / `OpenRouterDefault` / `DefaultModel` / `Unset` |
-| `worker-complex` | Worker (komplex) | `[internal_models.worker_complex]` | wie oben |
-| `explorer` | Explorer | `[internal_models.explorer]` | wie oben |
-| `research` | Recherche | `[internal_models.research]` | wie oben |
-| `compaction` | Verdichtung | `[internal_models.compaction_summary]` | wie oben |
-| `title` | Sitzungstitel | `[internal_models.session_title]` (Legacy: `session.title_model`) | wie oben |
-| `memory` | Gedächtnis-Konsolidierung | `[internal_models.memory_consolidation]` | wie oben |
-| `dream` | Traum-Reflexion | `[internal_models.dream_reflection]` | wie oben |
-| `auto-classifier` | Auto-Modus-Klassifizierer | `[internal_models.auto_classifier]` | `Explicit`, sonst das schnelle Modell des aktiven Providers (Anthropic: `claude-haiku-4-5`; sonst nach Namensmerkmalen wie `haiku`, `mini`, `flash`); nie OpenRouter-Standard |
+| `uia` | User Interaction Agent (UIA) | `uia_provider` + `uia_model` | `UiaPin` (both set **and** the provider exists and is enabled), else `DefaultModel`, else `Unset` |
+| `uia-worker` | UIA worker | `[uia_worker_models] uia_worker`, else the older pin `uia_worker_model` | a fixed choice (`provider/model`) or `InheritsUia` (value `"uia"`). No longer coupled to the UIA provider — see §1.1 |
+| `orchestrator` | Orchestrator | `[internal_models.root_orchestrator]` | `Explicit`, else `DefaultModel`/`Unset` — **never** the OpenRouter default |
+| `sub-orchestrator` | Sub-orchestrator | `[internal_models.sub_orchestrator]` | `Explicit`, else `InheritsOrchestrator` (the orchestrator row's provider/model) — never the OpenRouter default |
+| `worker-simple` | Worker (simple) | `[internal_models.worker_simple]` | `Explicit` / `OpenRouterDefault` / `DefaultModel` / `Unset` |
+| `worker-complex` | Worker (complex) | `[internal_models.worker_complex]` | as above |
+| `explorer` | Explorer | `[internal_models.explorer]` | as above |
+| `research` | Research | `[internal_models.research]` | as above |
+| `compaction` | Compaction | `[internal_models.compaction_summary]` | as above |
+| `title` | Session title | `[internal_models.session_title]` (legacy: `session.title_model`) | as above |
+| `memory` | Memory consolidation | `[internal_models.memory_consolidation]` | as above |
+| `dream` | Dream reflection | `[internal_models.dream_reflection]` | as above |
+| `auto-classifier` | Auto-mode classifier | `[internal_models.auto_classifier]` | `Explicit`, else the active provider's fast model (Anthropic: `claude-haiku-4-5`; otherwise by name markers like `haiku`, `mini`, `flash`); never the OpenRouter default |
 
-Herkunft im Einzelnen:
+Origin in detail:
 
-| `RoleModelSource` | Label | Bedeutung |
+| `RoleModelSource` | Label | Meaning |
 |---|---|---|
-| `Explicit` | explizit gewählt | `[internal_models.<stelle>]` mit gesetztem `model` |
-| `OpenRouterDefault` | OpenRouter-Standard | keine explizite Wahl, `use_openrouter_defaults = true` (Standard) und ein Provider `openrouter` ist aktiviert und hat Auth. Modell: `nvidia/nemotron-3-super-120b-a12b` für Explorer, Recherche, Worker (komplex); `nvidia/nemotron-3.5-lightning` für Titel, Verdichtung, Gedächtnis, Traum, Worker (einfach) |
-| `UiaPin` | UIA-Pin | `uia_provider`/`uia_model` |
-| `UiaWorkerPin` | UIA-Worker-Pin | `uia_worker_model` |
-| `InheritsUia` | erbt von UIA | UIA-Worker ohne eigenen Pin |
-| `InheritsOrchestrator` | erbt vom Orchestrator | Sub-Orchestrator ohne eigene Wahl |
-| `DefaultModel` | Standardmodell | `default_provider`/`default_model`. Für interne Stellen heißt das zur Laufzeit: der Aufrufer nutzt sein aktives Modell (bei Kindern das Elternmodell) |
-| `Unset` | nicht gesetzt | kein `default_model` konfiguriert |
+| `Explicit` | explicitly chosen | `[internal_models.<slot>]` with `model` set |
+| `OpenRouterDefault` | OpenRouter default | no explicit choice, `use_openrouter_defaults = true` (the default) and a provider named `openrouter` is enabled and authenticated. Model: `nvidia/nemotron-3-super-120b-a12b` for explorer, research, worker (complex); `nvidia/nemotron-3.5-lightning` for title, compaction, memory, dream, worker (simple) |
+| `UiaPin` | UIA pin | `uia_provider`/`uia_model` |
+| `UiaWorkerPin` | UIA worker pin | `uia_worker_model` |
+| `InheritsUia` | inherits from UIA | a UIA worker with no pin of its own |
+| `InheritsOrchestrator` | inherits from the orchestrator | a sub-orchestrator with no choice of its own |
+| `DefaultModel` | default model | `default_provider`/`default_model`. For internal slots this means, at runtime: the caller uses its own active model (for children, the parent's model) |
+| `Unset` | unset | no `default_model` configured |
 
-Sonderfall: ein `[internal_models.<stelle>]`-Eintrag **ohne** `model` (auch
-mit `provider`) erzwingt das Hauptmodell (`DefaultModel`), unabhängig von
+Special case: an `[internal_models.<slot>]` entry **without** `model` (even
+with `provider` set) forces the main model (`DefaultModel`), regardless of
 `use_openrouter_defaults`.
 
-Reasoning-Effort je Zeile: rollenspezifisches `[reasoning]`-Feld (`uia`,
+Reasoning effort per row: a role-specific `[reasoning]` field (`uia`,
 `root_orchestrator`, `sub_orchestrator`, `worker_simple`, `worker_complex`),
-sonst `default_reasoning_effort` des Modells, sonst des Providers, sonst leer.
+else the model's `default_reasoning_effort`, else the provider's, else empty.
 
-Laufzeit-Zuordnung von Kindrollen: `explorer` → Explorer; `researcher-web`,
-`researcher-deps`, `analyst` → Recherche; `memory-steward` → Gedächtnis;
-`agent-steward` → Worker (komplex); Orchestrator-Definitionen über ihre
-Organisationsrolle (`root-orchestrator` → Orchestrator, `child-orchestrator`
-→ Sub-Orchestrator); Worker nach Aufgabenkomplexität (einfach/komplex); die
-`uia-worker`-Familie (`uia-worker`, `uia-explorer`, `uia-writer`,
-`uia-shell-worker`) bekommt ihr Modell aus der UIA-Sitzung.
+Runtime mapping of child roles: `explorer` → Explorer; `researcher-web`,
+`researcher-deps`, `analyst` → Research; `memory-steward` → Memory;
+`agent-steward` → Worker (complex); orchestrator definitions via their
+organizational role (`root-orchestrator` → Orchestrator, `child-orchestrator`
+→ Sub-orchestrator); workers by task complexity (simple/complex); the
+`uia-worker` family (`uia-worker`, `uia-explorer`, `uia-writer`,
+`uia-shell-worker`) gets its model from the UIA session.
 
-### 1.1 Eigene Modellwahl je UIA-Worker-Rolle (Runde 5, Teil G)
+### 1.1 Per-role model choice for UIA workers
 
-Jede Rolle der `uia-worker`-Familie hat eine eigene Wahl unter
-`[uia_worker_models]` (TOML-Schlüssel mit `_` statt `-`):
+Every role in the `uia-worker` family has its own choice under
+`[uia_worker_models]` (TOML keys use `_` instead of `-`):
 
 ```toml
 [uia_worker_models]
-uia_worker       = "uia"                       # wie UIA (folgt auch einem Live-Wechsel)
-uia_shell_worker = "anthropic/claude-sonnet-5" # feste Wahl, Trennung am ersten `/`
+uia_worker       = "uia"                       # follows the UIA (also follows a live switch)
+uia_shell_worker = "anthropic/claude-sonnet-5" # fixed choice, split at the first `/`
 # uia_writer, uia_latex_writer, uia_explorer
 ```
 
-- Ohne Eintrag gilt der alte Pin `uia_worker_model` als feste Wahl, jetzt mit
-  dem Provider, dem das Modell im Katalog gehört, sonst „wie UIA“.
-- Eine feste Wahl bleibt nur, solange ihr Provider angemeldet ist; sonst fällt
-  die Rolle mit einem Hinweis auf „wie UIA“ zurück. Ein Wechsel des
-  UIA-Providers scheitert damit nie an einer Worker-Bindung.
-- Laufende Worker behalten ihr Modell bis zum Ende ihres Laufs, neue Worker
-  nehmen die neue Wahl.
-- Setzen: `/models worker [<rolle|all> <uia|ziel>]` oder in `/models` (F8):
-  nach der UIA-Wahl öffnet sich direkt der Bereich „UIA-Worker-Modelle“
-  (Enter wählt das Modell einer Rolle, `a` setzt alle auf „wie UIA“, Esc
-  beendet).
+- Without an entry, the older pin `uia_worker_model` is treated as a fixed
+  choice, now paired with the provider that owns the model in the catalog,
+  otherwise "same as UIA."
+- A fixed choice holds only as long as its provider is authenticated;
+  otherwise the role falls back to "same as UIA" with a notice. A switch of
+  the UIA provider therefore never gets stuck on a worker binding.
+- A running worker keeps its model until its run ends; new workers pick up
+  the new choice.
+- Set via `/models worker [<role|all> <uia|target>]` or in `/models` (F8):
+  after the UIA choice, the "UIA worker models" section opens directly
+  (Enter picks a role's model, `a` sets all to "same as UIA", Esc closes).
 
-## 2. Wann eine Modelländerung wirkt
+## 2. When a model change takes effect
 
-**Regel: jede Modell- und Effort-Wahl wirkt ab der nächsten Sitzung — außer
-`/model` (und `/effort`), die die laufende Sitzung live ändern.**
+**Rule: every model and effort choice takes effect from the next session —
+except `/model` (and `/effort`), which change the running session live.**
 
-| Befehl | Schreibt | Wirkung |
+| Command | Writes | Effect |
 |---|---|---|
-| `/model switch <id>` | Live-Zustand der Sitzung (Provider + Modell atomar, auch providerübergreifend) | **sofort** (ab nächstem Turn) |
-| `/effort <stufe>` | Live-Zustand der Sitzung | sofort |
-| `/models set <rolle> <ziel>` | Profil-`config.toml` (`uia_*`, `uia_worker_model` bzw. `[internal_models.*]`) | ab nächster Sitzung |
-| `/models reset <rolle>` | entfernt die explizite Wahl | ab nächster Sitzung |
-| `/models worker <rolle\|all> <uia\|ziel>` | Profil-`config.toml` (`[uia_worker_models]`) | neue Worker ab sofort, laufende behalten ihr Modell |
-| `/uia-model`, `/uia-worker-model`, `/uia-effort` | Profil-`config.toml` | ab nächster Sitzung |
+| `/model switch <id>` | the session's live state (provider + model, atomically, even across providers) | **immediately** (from the next turn) |
+| `/effort <level>` | the session's live state | immediately |
+| `/models set <role> <target>` | the profile's `config.toml` (`uia_*`, `uia_worker_model`, or `[internal_models.*]`) | from the next session |
+| `/models reset <role>` | removes the explicit choice | from the next session |
+| `/models worker <role\|all> <uia\|target>` | the profile's `config.toml` (`[uia_worker_models]`) | new workers immediately, running ones keep their model |
+| `/uia-model`, `/uia-worker-model`, `/uia-effort` | the profile's `config.toml` | from the next session |
 
-`/models set uia-worker` akzeptiert seit Runde 5 auch Modelle anderer
-Provider. `/mode` ändert das Modell nicht (mehr). Keiner dieser Befehle hat ein
-Modell-Werkzeug: das Modell darf weder sein eigenes noch das Modell seiner
-Kinder wählen.
+`/models set uia-worker` also accepts models from other providers. `/mode`
+no longer changes the model. None of these commands has a model tool: a
+model may choose neither its own model nor its children's.
 
-## 3. Modus, Freigabe und Shift+Tab
+## 3. Mode, approval, and Shift+Tab
 
-Zwei unabhängige Achsen:
+Two independent axes:
 
-| | Interaktionsmodus (`InteractionMode`) | Freigabemodus (`ApprovalMode`) |
+| | Interaction mode (`InteractionMode`) | Approval mode (`ApprovalMode`) |
 |---|---|---|
-| Werte | `chat`, `plan`, `explore`, `work`, `shell` | `ask` (`AlwaysAsk`), `auto` (`Delegated`), `full` (`FullAccess`) |
-| Steuert | welche Werkzeuge das Modell sieht und die Sandbox-Obergrenze | ob ein erlaubter Werkzeugaufruf nachfragt |
-| Ändern | `/mode <modus>`, F7 (Abschnitt „Modus“) | `/permissions mode <ask\|auto\|full> [--session\|--project\|--global]`, F7 (Abschnitt „Freigabe“, Scope `--session`) |
-| Wirkt | an der **nächsten Turn-Grenze** (vorgemerkt; Statuszeile „(ausstehend)“) | **sofort**, auch während eines Turns |
-| Standard | `[mode] default` (Vorgabe `chat`), persistierbar per `/mode default <modus>` bzw. `d` in F7 | `[permissions].default_mode`, sonst `auto` |
+| Values | `chat`, `plan`, `explore`, `work`, `shell` | `ask` (`AlwaysAsk`), `auto` (`Delegated`), `full` (`FullAccess`) |
+| Controls | which tools the model sees, and the sandbox ceiling | whether an otherwise-allowed tool call still asks |
+| Change | `/mode <mode>`, F7 ("Mode" section) | `/permissions mode <ask\|auto\|full> [--session\|--project\|--global]`, F7 ("Approval" section, `--session` scope) |
+| Takes effect | at the **next turn boundary** (queued; status line shows "(pending)") | **immediately**, even mid-turn |
+| Default | `[mode] default` (defaults to `chat`), persisted via `/mode default <mode>` or `d` in F7 | `[permissions].default_mode`, else `auto` |
 
-`Shift+Tab` ist ein Schnellzyklus über beide Achsen:
-`ask → auto → full → plan → ask`. Die Stufe `plan` merkt sich den bisherigen
-Modus, setzt Freigabe `ask` und fordert Modus `plan` an; die nächste Stufe
-setzt wieder nur die Freigabe und stellt den gemerkten Modus wieder her.
-Bei offenem `/`-Popup wirkt `Shift+Tab` nicht. Statuszeile:
-`Modus: <modus> · Freigabe: <ask|auto|full>`.
+`Shift+Tab` quick-cycles both axes:
+`ask → auto → full → plan → ask`. The `plan` step remembers the current
+mode, sets approval to `ask`, and requests mode `plan`; the next step sets
+only the approval back and restores the remembered mode. `Shift+Tab` has no
+effect while a `/`-popup is open. Status line:
+`Mode: <mode> · Approval: <ask|auto|full>`.
 
-### 3.0 Plan-Modus (Runde 5, Teil F)
+### 3.0 Plan mode
 
-Die Stufe `plan` ist ein vollwertiger Plan-Modus:
+The `plan` step is a full-fledged plan mode:
 
-- Statuszeile „⏸ plan mode on (shift+tab to cycle)“ in eigener Farbe;
-  Composer-Hinweis „Plan-Modus – es wird nichts verändert“.
-- Die Sperre wirkt **sofort**, auch mitten im Turn (`PlanModeGate`): nichts
-  Schreibendes, keine Ausführung. Das einzige Schreibwerkzeug ist
-  `plan.write`, und es schreibt nur unter `.harw/plans/<slug>.md`.
-- Der Agent darf schreibgeschützte Kinder (`explorer`/`researcher`,
-  höchstens 3 parallel) starten und mit `ask_user` strukturierte Rückfragen
-  stellen (nur Wurzel, nur TUI).
-- `plan.exit` öffnet ein Fenster mit dem gerenderten Plan und drei Optionen:
-  1. umsetzen im Auto-Modus → Modus `work`, Freigabe `auto`;
-  2. umsetzen, Änderungen einzeln freigeben → `work`, `ask`;
-  3. weiter planen, mit Freitext-Rückmeldung an den Agenten.
-- `plan.enter` ist nur ein Vorschlag des Agenten; erst „Ja“ schaltet um.
-- Der freigegebene Plan bleibt als angehefteter Kontext in jeder Anfrage und
-  übersteht die Verdichtung. `/plan show|list|open|edit` verwaltet die
-  Plan-Dateien; `/plan` bzw. `/mode plan` schalten ein.
+- Status line "⏸ plan mode on (shift+tab to cycle)" in its own color;
+  a composer hint "Plan mode – nothing will be changed."
+- The lock takes effect **immediately**, even mid-turn (`PlanModeGate`):
+  nothing that writes, no execution. The only write tool is `plan.write`,
+  and it writes only under `.harw/plans/<slug>.md`.
+- The agent may start read-only children (`explorer`/`researcher`, at most
+  3 in parallel) and ask structured follow-up questions via `ask_user`
+  (root only, TUI only).
+- `plan.exit` opens a window with the rendered plan and three options:
+  1. implement in auto mode → mode `work`, approval `auto`;
+  2. implement, approve changes individually → `work`, `ask`;
+  3. keep planning, with free-text feedback to the agent.
+- `plan.enter` is only a suggestion from the agent; only "yes" switches
+  the mode.
+- The approved plan stays as pinned context on every request and survives
+  compaction. `/plan show|list|open|edit` manages plan files; `/plan` or
+  `/mode plan` switches into it.
 
-### 3.0.1 Auto-Modus (Runde 5, Teil E)
+### 3.0.1 Auto mode
 
-In `auto` gibt die Runtime frei, was in `AUTO_APPROVED_TOOLS` steht. Für die
-übrigen Aufrufe gilt diese Reihenfolge:
+In `auto`, the runtime releases whatever is listed in `AUTO_APPROVED_TOOLS`.
+For everything else, this order applies:
 
 1. `ALWAYS_ASK_TOOLS` (`process.kill`, `host.sudo_exec`, `agent.cancel`, …)
-   fragen immer.
-2. Deny-Regeln, dann Allow-Regeln (`[[permissions.deny]]`/`[[permissions.allow]]`
-   mit `tool` und optional `match` bzw. `path`). Deny-Regeln gelten auch in
+   always ask.
+2. Deny rules, then allow rules (`[[permissions.deny]]`/`[[permissions.allow]]`
+   with `tool` and optionally `match` or `path`). Deny rules also apply in
    `ask`.
-3. Ein deterministischer Vorfilter: Schreiben außerhalb des Workspace, in
-   `.git`/`.harw` oder an Credential-Pfaden, `rm -rf` außerhalb,
-   `git push --force`, `curl … | sh`, Netz außerhalb der Policy — ein Treffer
-   ist nie eine Freigabe.
-4. Der Klassifizierer (Rolle `auto-classifier`, ohne Werkzeuge, Geheimnisse
-   vorher entfernt) entscheidet `allow|ask|deny` mit Kategorie und Grund.
-   Fehler, Parsefehler oder mehr als 10 s → Rückfrage.
+3. A deterministic pre-filter: writes outside the workspace, into `.git`/
+   `.harw`, or to credential paths; `rm -rf` outside the workspace;
+   `git push --force`; `curl … | sh`; network access outside policy — a
+   match is never an approval.
+4. The classifier (role `auto-classifier`, no tools, secrets stripped
+   beforehand) decides `allow|ask|deny` with a category and a reason.
+   An error, a parse failure, or taking more than 10s → falls back to
+   asking.
 
-Die Werkzeugzelle zeigt „auto ✓ <Grund>“ bzw. „Vom Auto-Modus abgelehnt ·
-<Kategorie>“; `/permissions log` listet die letzten Entscheidungen. Nach 3
-Ablehnungen in Folge oder 20 in der Sitzung fällt die Sitzung auf `ask`
-zurück. Ab der dritten gleichartigen manuellen Freigabe bietet der Dialog
-„Ja, und künftig erlauben: <muster>“ (Sitzung oder Projekt) an, nie für
-`ALWAYS_ASK_TOOLS` oder riskante Muster.
+The tool cell shows "auto ✓ <reason>" or "rejected by auto mode ·
+<category>"; `/permissions log` lists recent decisions. After 3 consecutive
+rejections, or 20 in the session, the session falls back to `ask`. From the
+third similar manual approval on, the dialog offers "yes, and allow from
+now on: <pattern>" (session or project scope), never for `ALWAYS_ASK_TOOLS`
+or risky patterns.
 
-### 3.1 Kinder folgen der Freigabe live, gedeckelt auf `auto`
+### 3.1 Children follow approval live, capped at `auto`
 
-`ApprovalChain::for_child` gibt jedem Kind eine **Folgezelle**
-(`ApprovalModeCell::follower(ApprovalMode::Delegated)`): das Kind liest bei
-jeder Prüfung den aktuellen Modus der Elternzelle, höchstens aber `auto`
-(`ApprovalMode::capped_at`). Folgen:
+`ApprovalChain::for_child` gives every child a **follower cell**
+(`ApprovalModeCell::follower(ApprovalMode::Delegated)`): on every check, the
+child reads the parent cell's current mode, capped at `auto`
+(`ApprovalMode::capped_at`). Consequences:
 
-- Wurzel `ask` → Kinder `ask`; Wurzel `auto` oder `full` → Kinder `auto`.
-- Eine Umstellung an der Wurzel (Befehl, F7, Shift+Tab) erreicht auch
-  bereits **laufende** Kinder sofort.
-- Ein Kind erhält nie `full`.
-- Ein lokales `set` auf der Kindzelle koppelt dieses Kind ab; es bleibt
-  gedeckelt, Eltern und Geschwister sind unberührt.
+- Root `ask` → children `ask`; root `auto` or `full` → children `auto`.
+- A change at the root (command, F7, Shift+Tab) reaches already **running**
+  children immediately.
+- A child never gets `full`.
+- A local `set` on a child's cell detaches that child; it stays capped,
+  and its parent and siblings are unaffected.
 
-Freigaberegeln (`AllowRuleSet`) werden unverändert geteilt (eine Regel
-erlaubt einem Kind nie mehr, als seine eigene Werkzeugfläche zulässt).
+Allow rules (`AllowRuleSet`) are shared unchanged (a rule never lets a
+child do more than its own tool surface permits).
 
-## 4. Rangfolge beim Start
+## 4. Precedence at startup
 
-Gilt für `harw`/`harw chat`, `harw exec` und `harw analyze`.
+Applies to `harw`/`harw chat`, `harw exec`, and `harw analyze`.
 
-| Größe | Rangfolge (höchste zuerst) | Fehlerfall |
+| Setting | Precedence (highest first) | On error |
 |---|---|---|
-| Interaktionsmodus | `--mode` > `[mode] default` (Vorgabe `chat`) | unbekannter Name in **beiden** Fällen ein Fehler (kein stiller Rückfall auf `chat`) |
-| Wurzel-Agent | `--agent` > `active_agent_definition` (persistierbar per `/agent use <name>`, entfernbar per `/agent use --clear`, beides ab nächster Sitzung) | unbekannter Name: Startfehler (fail-closed); `/agent use` prüft Name und Rolle (Wurzel-, Kind-Orchestrator oder Worker) vor dem Speichern |
-| Freigabemodus | `--approval` > Projekt-`[permissions].default_mode` > globales `[permissions].default_mode` > Vorgabe der Einstiegsart (für alle Einstiege `auto`) | ungültiger `--approval`-Wert: Parser-Fehler; ungültiger Config-Wert wird übersprungen |
-| Modell | `--model` > `default_provider`/`default_model` (bzw. UIA-Pin) | `--model` wird gegen `config.models` geprüft: zuerst Katalogschlüssel, dann Modell-ID, dann Alias (bei mehreren Treffern der alphabetisch erste Schlüssel); kein Treffer = Konfigurationsfehler |
+| Interaction mode | `--mode` > `[mode] default` (defaults to `chat`) | an unknown name is an error in **both** cases (no silent fallback to `chat`) |
+| Root agent | `--agent` > `active_agent_definition` (persisted via `/agent use <name>`, cleared via `/agent use --clear`, both from the next session) | an unknown name is a startup error (fail-closed); `/agent use` checks the name and role (root, child orchestrator, or worker) before saving |
+| Approval mode | `--approval` > project `[permissions].default_mode` > global `[permissions].default_mode` > the entry point's default (`auto` for all entry points) | an invalid `--approval` value is a parser error; an invalid config value is skipped |
+| Model | `--model` > `default_provider`/`default_model` (or a UIA pin) | `--model` is checked against `config.models`: first as a catalog key, then a model ID, then an alias (with multiple matches, the alphabetically first key wins); no match is a configuration error |
 
-`--model` setzt `default_model` (Katalogschlüssel) und `default_provider`
-(Provider des Eintrags) für diesen Lauf und hebt einen UIA-Pin
-(`uia_provider`/`uia_model`) für diesen Lauf auf, damit die Wahl auch für
-die interaktive Sitzung gilt. Die übrigen Rollen folgen daraus nach §1
-(z. B. `DefaultModel`, `InheritsUia`). Nichts davon wird persistiert.
+`--model` sets `default_model` (a catalog key) and `default_provider` (that
+entry's provider) for this run, and lifts a UIA pin (`uia_provider`/
+`uia_model`) for this run, so the choice also applies to the interactive
+session. The remaining roles follow from that per §1 (e.g. `DefaultModel`,
+`InheritsUia`). None of this is persisted.
 
-## 5. Offen
+## 5. Open
 
-- ~~`[mode] default` = `plan` → `chat`~~: entschieden und umgesetzt —
-  die Vorgabe ist jetzt `chat` (`harw-config/src/mode_toml.rs`,
-  `default_mode`). Wer mit Planung starten will, setzt
-  `[mode] default = "plan"` bzw. `/mode default plan`.
-- Modell im Agenten-Ereignis (`AgentOrchestrationEvent.model`,
-  `ChildRecord.model`) für die Anzeige des Kind-Modells: geplant.
+- Showing the model in agent orchestration events
+  (`AgentOrchestrationEvent.model`, `ChildRecord.model`) for displaying a
+  child's model: planned, not yet implemented.

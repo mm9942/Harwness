@@ -32,8 +32,6 @@
 //! konkretes entferntes HTTPS-Ziel) durch Dokumentationsadressen aus
 //! `192.0.2.0/24` (RFC 5737) ersetzt; `0.0.0.0`-Wildcards und `127.0.0.1`
 //! blieben unverändert, da sie nichts über den aufgenommenen Host verraten.
-//! Siehe `docs/remediation/ledger/W3/C-FIXT.md` für die vollständige
-//! Zuordnungstabelle.
 //!
 //! # Nebenläufigkeit
 //! [`materialize`] und [`load`] sind zustandslose freie Funktionen ohne
@@ -43,8 +41,7 @@
 //! sind — wie bei [`crate::capture::capture`] — nicht vorgesehen.
 //!
 //! # Fehler
-//! [`materialize`] gibt `std::io::Result<()>` zurück (siehe Signaturvorgabe
-//! in `docs/remediation/AGENT-BRIEF.md`): ein abgelehnter Pfad (`..`-Segment)
+//! [`materialize`] gibt `std::io::Result<()>` zurück: ein abgelehnter Pfad (`..`-Segment)
 //! wird als `io::Error` mit `ErrorKind::InvalidInput` gemeldet, alle anderen
 //! Fehler sind durchgereichte Dateisystemfehler. [`load`] gibt
 //! [`crate::error::FixturesResult`] zurück und nutzt dafür die bereits
@@ -53,10 +50,8 @@
 //! Modul führt bewusst keinen dritten Fehlertyp ein.
 //!
 //! # Folgearbeit (nicht Teil dieses Auftrags)
-//! `harw-dod-fixtures/src/lib.rs` ist nicht Eigentum dieses Agents und
-//! bekommt deshalb weder `mod capture_manifest;` noch einen `pub use`
-//! davon — siehe Ledger-Eintrag `docs/remediation/ledger/W3/C-FIXT.md`,
-//! Abschnitt „Folgearbeit".
+//! `harw-dod-fixtures/src/lib.rs` bekommt deshalb weder `mod capture_manifest;`
+//! noch einen `pub use` davon.
 //!
 //! # Examples
 //! ```rust,no_run

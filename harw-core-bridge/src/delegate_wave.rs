@@ -9,7 +9,7 @@
 //! Handoff `transfer_to_<rolle>`: ein Handoff übergibt den Turn an das Kind
 //! (`TurnOutcome::AwaitingChild`), `delegate_wave` ist ein gewöhnlicher,
 //! blockierender Werkzeugaufruf (Agent-as-Tool, `docs/design/
-//! wave-4-agents-as-tools.md` §3).
+//! docs/design/agents-as-tools.md` §3).
 //!
 //! ```text
 //! delegate_wave {

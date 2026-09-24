@@ -2568,14 +2568,14 @@ mod tests {
         let p1 = McpPrincipalToml {
             id: "p1".to_owned(),
             credential_ref: SecretRef::from_str("env:P1_TOKEN").map_err(ctx("env:P1_TOKEN"))?,
-            tenant: "mia".to_owned(),
+            tenant: "alice".to_owned(),
             workspace: "harwness".to_owned(),
             job_capabilities: vec![],
         };
         let p2 = McpPrincipalToml {
             id: "p2".to_owned(),
             credential_ref: SecretRef::from_str("env:P2_TOKEN").map_err(ctx("env:P2_TOKEN"))?,
-            tenant: "mia".to_owned(),
+            tenant: "alice".to_owned(),
             workspace: "harwness".to_owned(),
             job_capabilities: vec![],
         };
@@ -2589,7 +2589,7 @@ mod tests {
                 [[mcp_listener.principals]]
                 id = "p1"
                 credential_ref = "env:P1_TOKEN"
-                tenant = "mia"
+                tenant = "alice"
                 workspace = "harwness"
             "#,
         )?;

@@ -1211,8 +1211,7 @@ pub struct ChatApp {
     /// `.meta.json`-Sidecars), sofern der Composition-Root (`runtime_root.rs`)
     /// sie kennt — anders als [`Self::title_job_context`]s
     /// `session_store_root` wird dieses Feld **unabhängig** davon gesetzt,
-    /// ob `[session] title_generation` aktiv ist (siehe Aufgabe 2, Plan
-    /// `recursive-cooking-lobster.md` Teil F: Export-Datum bei Resume für
+    /// ob `[session] title_generation` aktiv ist (Export-Datum bei Resume für
     /// jede Session). `None`, wenn `/resume` in diesem Lauf gar nicht
     /// konfiguriert ist. Genutzt von [`apply_session_store_started_at`].
     session_store_root: Option<std::path::PathBuf>,
@@ -1680,8 +1679,7 @@ impl ChatApp {
     }
 
     /// Hinterlegt die Wurzel des Session-Stores für jede Sitzung, bei der sie
-    /// bekannt ist (Aufgabe 2, Plan `recursive-cooking-lobster.md` Teil F:
-    /// Export-Datum bei Resume für jede Session).
+    /// bekannt ist (Export-Datum bei Resume für jede Session).
     ///
     /// # Beschreibung
     /// Wird von der Composition-Root (`crate::runtime_root::build_root_runtime`)
@@ -9670,11 +9668,10 @@ mod tests {
     // `registry_with_approval_handler`, `build_tui_managed_spawner`,
     // `TuiChildRegistryFactory`, `tui_child_limits`, `TuiModelToolServices`,
     // `LOCAL_TUI_OPERATION_PERMISSION`, die Projekt-Wurzel-Session-ID-Ableitung).
-    // Seit W2d-2 montiert app.rs nichts mehr selbst (`crate::runtime_root`,
+    // app.rs montiert nichts mehr selbst (`crate::runtime_root`,
     // `harw_runtime::RuntimeAssembly`). Tests, die ausschließlich das Verhalten
     // dieser gelöschten Montage-Helfer prüften, sind entfernt — ihre Abdeckung
-    // steht jetzt in harw-runtime/harw-registry-defaults/harw-core (siehe
-    // docs/remediation/ledger/W2d2/T2b.md). Tests, die echtes TUI-Verhalten
+    // steht jetzt in harw-runtime/harw-registry-defaults/harw-core. Tests, die echtes TUI-Verhalten
     // prüfen (Popup, Tastatur, Freigabefluss, `/mode`, Zellen-Rendering),
     // bleiben erhalten; wo sie eine Session brauchten, bauen sie sie jetzt
     // direkt über `AgentSession::new_with_id(..).with_spawn_context(..)`.
@@ -9934,9 +9931,8 @@ mod tests {
         Ok(())
     }
 
-    /// Aufgabe 2 (Plan `recursive-cooking-lobster.md` Teil F): eine über
-    /// [`ChatApp::with_session_store_root`] gesetzte Wurzel wird auch OHNE
-    /// jeden Titel-Job-Kontext ausgewertet — anders als vor Aufgabe 2, wo nur
+    /// Eine über [`ChatApp::with_session_store_root`] gesetzte Wurzel wird
+    /// auch OHNE jeden Titel-Job-Kontext ausgewertet — anders als zuvor, wo nur
     /// `title_job_context.session_store_root` (nur bei aktiver
     /// Titelerzeugung gesetzt) zur Verfügung stand.
     #[test]
@@ -12197,7 +12193,7 @@ forbidden = [{forbidden}]
         Ok(())
     }
 
-    /// Teil 1 (`recursive-cooking-lobster.md`): der kurze Ack-Text vor einem
+    /// Der kurze Ack-Text vor einem
     /// Tool-Aufruf (`MessagePhase::Commentary`) muss sofort als sichtbare
     /// Assistant-Zelle erscheinen, statt erst am Turn-Ende über
     /// `reveal_reply`.

@@ -1,8 +1,7 @@
 //! `/permissions` — Übersicht, Freigabemodus und Allow-/Deny-Regeln.
 //!
-//! Spec-Quelle: `harw-scopes-contract.md` §2–§4 und „Nachträgliche
-//! Entscheidungen“, sowie Schritt 4 des Plans
-//! `nope-permissions-gibt-es-wild-lobster.md` (Slice B4).
+//! Spec-Quelle: `docs/design/config-scopes.md` §2–§4 und „Nachträgliche
+//! Entscheidungen“.
 //!
 //! Die Operation zeigt Workspace-Identität, kanonischen Root, die erteilten
 //! (unveränderlichen) Sandbox-Rechte, den aktuellen Freigabemodus samt

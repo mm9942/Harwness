@@ -99,7 +99,7 @@ pub enum IngressSurface {
 ///
 /// let root = Principal::trusted_ingress(
 ///     PrincipalKind::Human,
-///     "mia",
+///     "alice",
 ///     IngressSurface::Tui,
 ///     PermissionTier::Owner,
 /// );
@@ -232,7 +232,7 @@ impl Principal {
     ///
     /// let human = Principal::trusted_ingress(
     ///     PrincipalKind::Human,
-    ///     "mia",
+    ///     "alice",
     ///     IngressSurface::Tui,
     ///     PermissionTier::Owner,
     /// );
@@ -336,7 +336,7 @@ mod tests {
         for kind in [PrincipalKind::Model, PrincipalKind::Operation] {
             for surface in SURFACES {
                 let principal =
-                    Principal::trusted_ingress(kind, "mia", surface, PermissionTier::Owner);
+                    Principal::trusted_ingress(kind, "alice", surface, PermissionTier::Owner);
                 assert_eq!(
                     principal.actor_id(),
                     None,
@@ -372,7 +372,7 @@ mod tests {
         for (parent_tier, child_tier) in expected {
             let parent = Principal::trusted_ingress(
                 PrincipalKind::Human,
-                "mia",
+                "alice",
                 IngressSurface::Tui,
                 parent_tier,
             );
@@ -403,13 +403,13 @@ mod tests {
     fn child_of_is_monotone_across_generations() {
         let root = Principal::trusted_ingress(
             PrincipalKind::Human,
-            "mia",
+            "alice",
             IngressSurface::Cli,
             PermissionTier::Owner,
         );
         let grandchild = root.child_of("a").child_of("b");
         assert_eq!(grandchild.tier(), PermissionTier::Operator);
-        assert_eq!(grandchild.id(), "mia/a/b");
+        assert_eq!(grandchild.id(), "alice/a/b");
     }
 
     #[test]

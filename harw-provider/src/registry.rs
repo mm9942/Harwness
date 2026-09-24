@@ -259,7 +259,7 @@ mod tests {
     use url::Url;
 
     use super::{HashMapProviderRegistry, ProviderRegistry};
-    use crate::auth::{ApiKeyConfig, SghAuth};
+    use crate::auth::{ApiKeyConfig, ProviderAuth};
     use crate::provider::{ProviderBuilder, ProviderRecord};
     use crate::test_support::TestResult;
     use harw_types::{ProviderId, ProviderName};
@@ -269,7 +269,7 @@ mod tests {
             .id(ProviderId::from(name))
             .name(ProviderName::from(name))
             .base_url(Url::parse("https://api.example.com/v1")?)
-            .auth(SghAuth::ApiKey(ApiKeyConfig {
+            .auth(ProviderAuth::ApiKey(ApiKeyConfig {
                 api_key: SecretString::new("test-key".to_owned()),
             }));
 

@@ -16,7 +16,7 @@
 //!
 //! [`macro@field`] und [`macro@metrics`] sind funktionsartige Makros für den
 //! Telemetrie-Vertrag aus `harw-observe` (Vertragsabschnitt A in
-//! `docs/aw-contract-master.md`): validierte Feldnamen bzw. registrierte
+//! `docs/design/build-history.md`): validierte Feldnamen bzw. registrierte
 //! Metrikschlüssel, beide zur Compile-Zeit geprüft, damit ein ungültiger
 //! Name oder ein falscher Metrikname den Build bricht statt erst einen
 //! Golden-Test oder eine Laufzeitprüfung drei Wellen später.

@@ -2,7 +2,7 @@
 //!
 //! # Verantwortungsbereich
 //! Trägt [`Redacted`] und [`Redact`] (Vertrag A.5,
-//! `docs/aw-contract-master.md`). Legt fest, wie ein Wert in Logs und
+//! `docs/design/build-history.md`). Legt fest, wie ein Wert in Logs und
 //! Diagnosen erscheinen darf — nie, wie er intern verarbeitet wird. Ein
 //! künftiges Ableitungsmakro (außerhalb dieser Crate) wird
 //! `Redacted::Omitted` als Voreinstellung erzeugen: ein Feld, über das

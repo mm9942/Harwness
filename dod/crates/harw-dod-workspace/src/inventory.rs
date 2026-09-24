@@ -202,8 +202,7 @@ pub enum StructureChange {
     ///
     /// Trägt bewusst keine `source`/`checksum`-Felder — ein gleichzeitiger
     /// Wechsel von Version **und** Herkunft bei ansonsten unverändertem
-    /// Bestand ist eine offene Annahme dieser Korrektur, siehe Ledger
-    /// `docs/remediation/ledger/W5/D-SEC.md`, Abschnitt „Offene Annahmen".
+    /// Bestand ist eine offene Annahme.
     VersionChanged {
         /// Name der betroffenen Abhängigkeit.
         name: String,

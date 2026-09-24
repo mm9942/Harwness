@@ -1,5 +1,5 @@
 //! Signal-Promotion-Auswertung (Track A), siehe
-//! `docs/design/track-a-memory-promotion.md` §1/§2 und `philosophy.md` §4
+//! `docs/design/memory-promotion.md` §1/§2 und `philosophy.md` §4
 //! („Memory-Konsolidierung ist ein langlebiger Workflow").
 //!
 //! # Verantwortungsbereich
@@ -11,7 +11,7 @@
 //!   wie bei [`crate::file_store::FileMemoryStore`]s bestehender
 //!   Muster-Promotion).
 //!
-//! # Design-Abweichung von `track-a-memory-promotion.md` §1
+//! # Design-Abweichung von `docs/design/memory-promotion.md` §1
 //! Die dortige Skizze schreibt `evaluate_signals(signals: &[Signal], ...)`.
 //! [`crate::types::Signal`] trägt jedoch **keinen** Zeitstempel (es ist ein
 //! reines Nutzinhalt-Enum, append-only ins Signal-Log geschrieben ohne

@@ -24,7 +24,7 @@
 //!
 //! # Vertragslücke gegenüber Contract-Master Abschnitt C
 //! Diese Datei ruft drei Methoden auf [`harw_lens_types::EdgeIndex`] auf, die
-//! in `docs/aw-contract-master.md` Abschnitt C (Stand dieses Knotens) noch
+//! in `docs/design/build-history.md` Abschnitt C (Stand dieses Knotens) noch
 //! nicht aufgeführt sind — dort ist `EdgeIndex` nur als `Default`-fähiger
 //! Typ mit privaten Feldern gezeigt, ohne Konstruktor mit konkreten Kanten
 //! und ohne Abfragemethoden:

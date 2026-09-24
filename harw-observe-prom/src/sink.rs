@@ -4,7 +4,7 @@
 //! # Verantwortungsbereich
 //! Trägt [`PromSink`], den zweiten echten Implementierer von
 //! [`harw_observe::TelemetrySink`] nach `harw-observe-file::FileSink`
-//! (Vertrag A.3/A.6, `docs/aw-contract-master.md`). Hält für jede
+//! (Vertrag A.3/A.6, `docs/design/build-history.md`). Hält für jede
 //! Kombination aus Metrikname und Label-Belegung den zuletzt gemeldeten
 //! Wert im Speicher und rendert sie auf Abruf ([`PromSink::render`]) als
 //! flaches Textdokument. Kennt kein Netzwerk — das übernimmt

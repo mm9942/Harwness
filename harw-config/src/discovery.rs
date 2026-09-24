@@ -91,20 +91,20 @@ pub struct ResolvedConfig {
     /// konsultiert, wenn die Variable in der Prozess-Umgebung nicht gesetzt ist.
     /// Nie in `std::env` geschrieben; verbleibt ausschließlich in dieser Map.
     pub env_layer: BTreeMap<String, String>,
-    /// `[network]` — Netz-Policy für egress-fähige Werkzeuge/Rollen (W3
-    /// `C-CFG`, siehe `network_toml`). Geparst unabhängig von
+    /// `[network]` — Netz-Policy für egress-fähige Werkzeuge/Rollen
+    /// (siehe `network_toml`). Geparst unabhängig von
     /// [`HarnessConfig`] (siehe [`extract_section`]/[`strip_new_sections`]),
     /// da `harness_config.rs` diese Sektion (noch) nicht als eigenes Feld
-    /// kennt — Folgearbeit, siehe `docs/remediation/ledger/W3/C-CFG.md`.
+    /// kennt (Folgearbeit).
     pub network: NetworkSection,
     /// `[browser]` — Aktivierungs- und Limits-Policy für das Browser-Werkzeug
-    /// (W3 `C-CFG`, siehe `browser_toml`).
+    /// (siehe `browser_toml`).
     pub browser: BrowserSection,
-    /// `[dod]` — Eskalations-Policy für die DoD-Kette (W3 `C-CFG`, siehe
+    /// `[dod]` — Eskalations-Policy für die DoD-Kette (siehe
     /// `dod_toml`).
     pub dod: DodSection,
-    /// `[web]` — Bind- und Token-Policy für die eingebettete Web-UI (W3
-    /// `C-CFG`, siehe `web_toml`). Wird von einem nicht vertrauten Repo-Layer
+    /// `[web]` — Bind- und Token-Policy für die eingebettete Web-UI
+    /// (siehe `web_toml`). Wird von einem nicht vertrauten Repo-Layer
     /// **nie** beeinflusst (siehe [`apply_restricted_layer`]).
     pub web: WebSection,
     /// Nicht-fatale Katalog-Diagnosen aus [`Self::compute_diagnostics`],
@@ -602,7 +602,7 @@ pub fn discover_config(layers: &[PathBuf]) -> ConfigResult<ResolvedConfig> {
 /// use harw_config::discover_config_with_restricted;
 /// use std::path::{Path, PathBuf};
 ///
-/// let layers = vec![PathBuf::from("/home/mia/.harw")];
+/// let layers = vec![PathBuf::from("/home/user/.harw")];
 /// let config = discover_config_with_restricted(&layers, Some(Path::new("/repo/.harw")))?;
 /// assert!(config.providers.values().all(|p| !p.base_url.contains("evil")));
 /// # Ok::<(), harw_config::ConfigError>(())
@@ -863,8 +863,7 @@ fn apply_restricted_layer(base: &Path, resolved: &mut ResolvedConfig) -> ConfigR
 
 /// Keys, die dieses Modul unabhängig von [`HarnessConfig`] parst (siehe
 /// [`extract_section`]). `harness_config.rs` kennt diese vier Tabellen
-/// (noch) nicht als eigene Felder — Folgearbeit, siehe
-/// `docs/remediation/ledger/W3/C-CFG.md`. Ohne das Entfernen dieser Keys vor
+/// (noch) nicht als eigene Felder (Folgearbeit). Ohne das Entfernen dieser Keys vor
 /// der `HarnessConfig`-Deserialisierung würde
 /// `#[serde(deny_unknown_fields)]` jede `config.toml` ablehnen, die eine
 /// dieser Sektionen enthält.

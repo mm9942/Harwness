@@ -39,7 +39,7 @@
 //! die das entscheiden, sind [`TuiApprovalHandler::await_resolution`] und
 //! [`TuiApprovalHandler::open_prompt`]; beide tragen den Hinweis erneut.
 //!
-//! # Vertrag: `review` ist seiteneffektfrei (CONTRACTS.md §extension, W0B-07)
+//! # Vertrag: `review` ist seiteneffektfrei (docs/design/runtime-contracts.md §extension, W0B-07)
 //! [`ApprovalHandler::review`] **stellt keine Frage**. Es meldet nur, ob der
 //! Aufruf eine Nutzerentscheidung braucht ([`ApprovalDecision::AskUser`]),
 //! ob er ohne Entscheidung vorbeikommt (`Allow`) oder ob gar niemand mehr
@@ -717,7 +717,7 @@ impl fmt::Debug for TuiApprovalHandler {
 }
 
 impl ApprovalHandler for TuiApprovalHandler {
-    /// Prüft einen Werkzeugaufruf **seiteneffektfrei** (CONTRACTS.md §extension).
+    /// Prüft einen Werkzeugaufruf **seiteneffektfrei** (docs/design/runtime-contracts.md §extension).
     ///
     /// # Description
     /// Liegt der Aufruf außerhalb von [`Self::scope`], lautet die Antwort

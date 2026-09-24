@@ -17,7 +17,7 @@
 //!
 //! Defaults sind bewusst restriktiv (`Default = sicher/aus`): `enabled =
 //! false`, leere Origin-Allowlist. Ein nicht vertrauter Repo-Layer darf diese
-//! Sektion laut `docs/remediation/ledger/W3/C-CFG.md` nur verengen
+//! Sektion nur verengen
 //! (`enabled` nur `true` → `false`, `allowed_origins`/`max_actions` nur
 //! kleiner); `geckodriver_path`/`geckodriver_sha256` werden aus einem Repo-
 //! Layer **nie** übernommen (Umlenkung auf ein fremdes Binary wäre eine

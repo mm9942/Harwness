@@ -1,6 +1,7 @@
 # Harwness Interaction Contract — Master Document
 
-Status: draft design document, normative
+> Status: implemented · Last reviewed: 2026-09-24
+
 Role: this is the single entry point for "how does a human (or another
 system) talk to Harwness." It does not redefine anything the three annexes
 already specify in detail; it states the unified model, resolves the seams
@@ -117,14 +118,14 @@ ones in §5.1/§5.3 of the TUI annex, following the same "structured
 Supersedes TUI annex §2.6 (which reserved the names only). Tiers use the
 TUI annex's `PermissionTier`; parity uses `CommandScope`.
 
-> **Ist-Stand Runde 4 (2026-09-24).** The tables below describe the grammar
+> **Current state (2026-09-24).** The tables below describe the grammar
 > the operations in `harw-ops/src/{memory,diary,dream,palace,workbench,kanban,learn,matrix}/…`
 > actually parse. Every operation is declared `permission = "operator"`; the
 > Tier column keeps the finer read/write/maintenance distinction of the
 > original contract. Parity is declared **per operation** in code (one
 > `visibility` per `#[operation]`), so a per-subcommand `-` below means
 > "meaningless or refused from a channel", not a separate registry entry.
-> The `busy` column uses the classes from §2.6.3 (`sofort` = `Immediate`,
+> The `busy` column uses the classes from §2.6.3 (`immediate` = `Immediate`,
 > `—` = deferred until the running turn ends). Model-facing read tools for
 > the same surfaces are listed at the end of this section.
 >
@@ -143,7 +144,7 @@ plus the v3 fact store; `harw-ops/src/memory.rs`). Op parity: `Y`.
 | `/memory recall` | `<stichwort…>` | Obs | Y | — | Searches project facts before global facts, with provenance |
 | `/memory record` | `<text…> [--project\|--global]` | Op | Y | — | Writes a fact (default `--project`) |
 | `/memory forget` | `<name>` | Op | Y | — | Removes the fact from project and global roots |
-| `/memory promote` | `<fact-id> [--project\|--global] [--slug <slug>]` | Op | Y | — | **Runde 4, bridge fact → topic.** Writes `knowledge/topics/<slug>.md` as palace status `provisional` with origin `{kind: "fact", …}`; never overwrites an existing topic (use `--slug`). `established` only via `/palace promote`. |
+| `/memory promote` | `<fact-id> [--project\|--global] [--slug <slug>]` | Op | Y | — | **Bridge fact → topic.** Writes `knowledge/topics/<slug>.md` as palace status `provisional` with origin `{kind: "fact", …}`; never overwrites an existing topic (use `--slug`). `established` only via `/palace promote`. |
 | `/memory maintain` | — | Maint | Y | — | Idempotent v2 consolidation |
 | `/memory consolidate` | `[--project\|--global]` | Maint | Y | — | Deterministic phase-2 consolidation only |
 | `/memory topics` | — | Obs | Y | — | `provisional` topics visible to the caller as `{slug, title, status, origin}` (source for the promote offer) |
@@ -156,18 +157,18 @@ dream suggestion, and read through `/palace show`.
 
 | Subcommand | Args | Tier | Parity | busy | Notes |
 |---|---|---|---|---|---|
-| `/diary` / `today` | — | Obs | R | sofort | Caller's own diary, today (UTC) |
-| `/diary show` | `[AgentRef] [--date=YYYY-MM-DD]` | Obs | R | sofort | One day |
-| `/diary show` | `[AgentRef] --from=YYYY-MM-DD [--to=YYYY-MM-DD]` | Obs | R | sofort | **Runde 4.** Range view (bounded number of days); not combinable with `--date` |
-| `/diary search` | `<text> [--agent=<id>] [--from=…] [--to=…]` | Obs | R | sofort | **Runde 4.** Case-insensitive full-text search over the structured entries of all visible diaries; bounded hits, newest first |
+| `/diary` / `today` | — | Obs | R | immediate | Caller's own diary, today (UTC) |
+| `/diary show` | `[AgentRef] [--date=YYYY-MM-DD]` | Obs | R | immediate | One day |
+| `/diary show` | `[AgentRef] --from=YYYY-MM-DD [--to=YYYY-MM-DD]` | Obs | R | immediate | Range view (bounded number of days); not combinable with `--date` |
+| `/diary search` | `<text> [--agent=<id>] [--from=…] [--to=…]` | Obs | R | immediate | Case-insensitive full-text search over the structured entries of all visible diaries; bounded hits, newest first |
 | `/diary note` | `<text>` | Op | R | — | Out-of-band entry (`DiaryTrigger::Manual`) |
-| `/diary agents` | — | Obs | R | sofort | Agents with diary entries (`{"agents":[…]}`); a non-operator caller only sees itself. Used by the browser's agent picker |
+| `/diary agents` | — | Obs | R | immediate | Agents with diary entries (`{"agents":[…]}`); a non-operator caller only sees itself. Used by the browser's agent picker |
 
 The `#` prefix shortcut (§3, TUI annex) is sugar for `/diary note` on both
 front-ends — this document confirms that mapping is exact, not merely
 similar, so `#` and `/diary note` share one code path and one audit trail.
 
-Automatic entries (Runde 4, D3) do not go through the command:
+Automatic entries  do not go through the command:
 `harw-runtime/src/diary_wiring.rs` records `compaction` (after a
 model-summarised compaction) and `end-of-session` (close, quit, `/new`,
 `/resume`, one-shot end) for the root session's agent; a dream run adds
@@ -180,12 +181,12 @@ accepted. Visibility is the real caller's (operator → `OperatorOnly`, agent
 
 | Subcommand | Args | Tier | Parity | busy | Notes |
 |---|---|---|---|---|---|
-| `/dream` / `list` | — | Obs | R | sofort | Visible dream reports, newest first, with proposal counts |
-| `/dream show` | `<id>` | Obs | R | sofort | One report; `<id>` = `dream/<date>/<work-id>`, `<date>/<work-id>` or an unambiguous work id |
-| `/dream run` | — | Maint | R | — | **Runde 4.** Starts one run through the same core as the gateway scheduler (lock, `JobKind::Dream` in the job ledger, structured JSON output with one repair turn, budget from `[dream] budget`, maintenance). Only where the runtime provides a dream launcher (TUI, one-shot) |
-| `/dream status` | — | Obs | R | sofort | **Runde 4.** Scheduler state from `dreams/state.json` and `[dream]`: enabled, trigger, last/next run, running?, ledger state of the last job, open suggestions |
-| `/dream review` | `[<id>]` | Obs | R | — | **Runde 4.** Open suggestions of all reports or one report |
-| `/dream review` | `<id> accept\|reject <p-id> [grund…]` | Maint | R | — | **Runde 4.** Decides one suggestion. `accept` runs the write path: `topic`/`palace` → topic `provisional` (as `/memory promote`), `diary_reflection` → diary entry, `skill_idea`/`agent_idea` → a `/learn` proposal (never live), `follow_up`/`maintenance` → status only |
+| `/dream` / `list` | — | Obs | R | immediate | Visible dream reports, newest first, with proposal counts |
+| `/dream show` | `<id>` | Obs | R | immediate | One report; `<id>` = `dream/<date>/<work-id>`, `<date>/<work-id>` or an unambiguous work id |
+| `/dream run` | — | Maint | R | — | Starts one run through the same core as the gateway scheduler (lock, `JobKind::Dream` in the job ledger, structured JSON output with one repair turn, budget from `[dream] budget`, maintenance). Only where the runtime provides a dream launcher (TUI, one-shot) |
+| `/dream status` | — | Obs | R | immediate | Scheduler state from `dreams/state.json` and `[dream]`: enabled, trigger, last/next run, running?, ledger state of the last job, open suggestions |
+| `/dream review` | `[<id>]` | Obs | R | — | Open suggestions of all reports or one report |
+| `/dream review` | `<id> accept\|reject <p-id> [reason…]` | Maint | R | — | Decides one suggestion. `accept` runs the write path: `topic`/`palace` → topic `provisional` (as `/memory promote`), `diary_reflection` → diary entry, `skill_idea`/`agent_idea` → a `/learn` proposal (never live), `follow_up`/`maintenance` → status only |
 
 The earlier sketch `/dream run [--now] [--budget=Duration]` and
 `/dream review <WorkId> [--approve=…] [--reject=…]` is replaced by the grammar
@@ -198,15 +199,15 @@ Op parity: `Y`.
 
 | Subcommand | Args | Tier | Parity | busy | Notes |
 |---|---|---|---|---|---|
-| `/palace` / `list` | — | Obs | Y | sofort | All visible nodes |
-| `/palace show` | `<ArtifactRef>` | Obs | Y | sofort | Node body + outgoing links + computed backlinks (filtered to visible sources) |
-| `/palace search` | `<query> [--max-hops=n] [--max=n]` | Obs | Y | sofort | Graph-aware recall; bounded per §2.3 of the knowledge annex |
+| `/palace` / `list` | — | Obs | Y | immediate | All visible nodes |
+| `/palace show` | `<ArtifactRef>` | Obs | Y | immediate | Node body + outgoing links + computed backlinks (filtered to visible sources) |
+| `/palace search` | `<query> [--max-hops=n] [--max=n]` | Obs | Y | immediate | Graph-aware recall; bounded per §2.3 of the knowledge annex |
 | `/palace promote` | `<topic-ref>` | Maint | Y | — | Topic → palace node, lands `established` (the explicit command is the review) |
-| `/palace supersede` | `<alt> <neu> [--confirm]` | Maint | Y | — | **Runde 4.** `alt` becomes `superseded` and points to `neu` |
-| `/palace edit` | `<id> <text…> [--confirm]` | Maint | Y | — | **Runde 4.** Replaces the body; `[[wikilinks]]` become frontmatter links |
-| `/palace link` | `<a> <b> [--confirm]` | Maint | Y | — | **Runde 4.** Adds a `[[palace/b]]` reference to `a` |
+| `/palace supersede` | `<alt> <neu> [--confirm]` | Maint | Y | — | `alt` becomes `superseded` and points to `neu` |
+| `/palace edit` | `<id> <text…> [--confirm]` | Maint | Y | — | Replaces the body; `[[wikilinks]]` become frontmatter links |
+| `/palace link` | `<a> <b> [--confirm]` | Maint | Y | — | Adds a `[[palace/b]]` reference to `a` |
 
-Review gate for the Runde-4 write paths: operator only (an agent principal
+Review gate for the review-gated write paths: operator only (an agent principal
 gets `NotAvailable`); a `provisional` node may change freely; a change to an
 `established` node is a new revision and requires `--confirm` (the previous
 version is appended to `palace/<slug>.history.jsonl`); a `superseded` node is
@@ -218,14 +219,14 @@ visibility; `pin` and the bare panel are still meaningless from a channel).
 
 | Subcommand | Args | Tier | Parity | busy | Notes |
 |---|---|---|---|---|---|
-| `/workbench` / `show` | `[--scope=session\|project\|project:<slug>]` | Obs | - | sofort | Panel text plus structured data: pins with status (`present\|changed\|missing\|not_a_file`) and preview, hypotheses, notes |
+| `/workbench` / `show` | `[--scope=session\|project\|project:<slug>]` | Obs | - | immediate | Panel text plus structured data: pins with status (`present\|changed\|missing\|not_a_file`) and preview, hypotheses, notes |
 | `/workbench pin` | `<path> [note]` | Op | - | — | Resolved against the TUI's working directory |
 | `/workbench unpin` | `<path>` | Op | - | — | |
 | `/workbench note` | `<text>` | Op | R | — | Appends to `NOTES.md` |
-| `/workbench note edit` | `<n> <text>` | Op | R | — | **Runde 4.** `<n>` = `#<n>`/`<n>` (1-based) or the note's timestamp |
-| `/workbench note rm` | `<n>` | Op | R | — | **Runde 4.** |
+| `/workbench note edit` | `<n> <text>` | Op | R | — | `<n>` = `#<n>`/`<n>` (1-based) or the note's timestamp |
+| `/workbench note rm` | `<n>` | Op | R | — | |
 | `/workbench hypothesis` | `add\|confirm\|reject <text>` | Op | R | — | `confirm`/`reject` by exact text or `#<n>` |
-| `/workbench retention` | `[keep\|<tage>d]` | Op | R | — | **Runde 4.** Shows or sets the scope's retention; defaults: session scopes expire after 14 days without change, project scopes `keep` |
+| `/workbench retention` | `[keep\|<days>d]` | Op | R | — | Shows or sets the scope's retention; defaults: session scopes expire after 14 days without change, project scopes `keep` |
 
 Every subcommand accepts `--scope=` (also `--scope <s>`); without it the
 active session is meant, `--scope=project` without a slug means the project
@@ -238,15 +239,15 @@ globally; `LaneRef` may be `board:<b>/<lane>`.
 
 | Subcommand | Args | Tier | Parity | busy | Notes |
 |---|---|---|---|---|---|
-| `/kanban` / `list` / `show` | `[--board=<b>] [--all]` | Obs | Y | sofort | Cards per lane (worker lanes carry role and risk); `--all` includes archived |
-| `/kanban boards` | — | Obs | Y | sofort | All boards |
+| `/kanban` / `list` / `show` | `[--board=<b>] [--all]` | Obs | Y | immediate | Cards per lane (worker lanes carry role and risk); `--all` includes archived |
+| `/kanban boards` | — | Obs | Y | immediate | All boards |
 | `/kanban create` (`add`) | `<title> [--lane=<LaneRef>] [--assignee=<AgentRoleRef>] [--parent=<CardRef>]… [--tag=<t>]… [--board=<b>]` | Op | Y | — | Without `--lane` → `triage`; `--assignee=<role>` routes to `worker/<role>` and creates the job (`Todo`, `Ready` once all parents are `Done`) |
-| `/kanban show` | `<CardRef>` | Obs | Y | sofort | Full card state, ledger snapshot, comments, evidence, history, result |
-| `/kanban edit` | `<CardRef> <text…>` | Op | Y | — | **Runde 4.** Replaces the card body |
-| `/kanban comment` | `<CardRef> <text…>` | Op | Y | — | **Runde 4.** Comment with time and author |
-| `/kanban evidence` | `<CardRef> <pfad\|url>` | Op | Y | — | **Runde 4.** Evidence reference (`evidence: [..]`) |
-| `/kanban approve` | `<CardRef> [notiz…]` | Op | Y | — | **Runde 4.** Releases a worker card waiting in `blocked (AwaitingApproval)`; the job worker then starts the role agent |
-| `/kanban reject` | `<CardRef> [grund…]` | Op | Y | — | **Runde 4.** Archives the waiting card (job cancelled) |
+| `/kanban show` | `<CardRef>` | Obs | Y | immediate | Full card state, ledger snapshot, comments, evidence, history, result |
+| `/kanban edit` | `<CardRef> <text…>` | Op | Y | — | Replaces the card body |
+| `/kanban comment` | `<CardRef> <text…>` | Op | Y | — | Comment with time and author |
+| `/kanban evidence` | `<CardRef> <path|url>` | Op | Y | — | Evidence reference (`evidence: [..]`) |
+| `/kanban approve` | `<CardRef> [note…]` | Op | Y | — | Releases a worker card waiting in `blocked (AwaitingApproval)`; the job worker then starts the role agent |
+| `/kanban reject` | `<CardRef> [reason…]` | Op | Y | — | Archives the waiting card (job cancelled) |
 | `/kanban todo` / `ready` | `<CardRef>` | Op | Y | — | `Triage → Todo`, `Todo → Ready` (parent gate) |
 | `/kanban claim` | `<CardRef>` | Op | Y | — | Explicit operator claim; the command itself is the approval (`ApprovedOnce`), risk from the role table |
 | `/kanban complete` (`done`) | `<CardRef>` | Op | Y | — | |
@@ -255,9 +256,9 @@ globally; `LaneRef` may be `board:<b>/<lane>`.
 | `/kanban archive` | `<CardRef>` | Maint | Y | — | |
 | `/kanban move` | `<CardRef> <todo\|ready\|running\|done\|blocked\|archived> [<BlockKind>]` | Op | Y | — | TUI alias that picks the matching lifecycle transition |
 
-Kanban worker (Runde 4, D2): the job worker of `harw serve` picks up `Ready`
+Kanban worker : the job worker of `harw serve` picks up `Ready`
 cards in worker lanes but **never starts an agent without approval**: it
-blocks the card with `AwaitingApproval` and records "Freigabe angefragt" in
+blocks the card with `AwaitingApproval` and records "approval requested" in
 the history. Risk per role comes from the role's registry profile (read-only
 roles `Low`, writing roles `Medium`, process/secret/plugin rights and unknown
 roles `High`, fail-closed). Result and job history are written to the card.
@@ -268,8 +269,7 @@ request. `kanban.list`/`kanban.show` are offered only to the UIA root and the
 root orchestrator, always ask for approval, and their tool descriptions carry
 that usage rule.
 
-**`/learn`** — learning loop, proposals only (`harw-ops/src/learn.rs`,
-Runde 3). Op parity: `R`.
+**`/learn`** — learning loop, proposals only (`harw-ops/src/learn.rs`). Op parity: `R`.
 
 | Subcommand | Args | Tier | Parity | busy | Notes |
 |---|---|---|---|---|---|
@@ -277,20 +277,20 @@ Runde 3). Op parity: `R`.
 | `/learn note` | `<text…> [--target memory\|skill\|agent]` | Op | R | — | Proposal from text; `skill` goes through the skill-proposal store (`/skills accept`) |
 | `/learn list` | `[--all]` | Obs | R | — | Open (or all) proposals |
 | `/learn show` | `<id>` | Obs | R | — | |
-| `/learn accept` / `reject` | `<id> [grund…]` | Op | R | — | **Marks only** (targets `memory`/`agent`) and names the command the operator runs to apply it; `/learn` never writes a fact, skill, agent or context program itself |
+| `/learn accept` / `reject` | `<id> [reason…]` | Op | R | — | **Marks only** (targets `memory`/`agent`) and names the command the operator runs to apply it; `/learn` never writes a fact, skill, agent or context program itself |
 
-**`/matrix`** — matrix game (`harw-ops/src/matrix/mod.rs`, Runde 3; design in
-`matrix-game.md`). Op parity: `R`. Only the Runde-3 additions are listed;
+**`/matrix`** — matrix game (`harw-ops/src/matrix/mod.rs`; design in
+`matrix-game.md`). Op parity: `R`. Only the later additions are listed;
 the full grammar (`step`, `auto N`, `pause`, `inject`, `override`, `veto`,
 `reveal`, `fork`, `end`, `replay`, `show`, `list`) is in the module doc.
 
 | Subcommand | Args | Tier | Parity | busy | Notes |
 |---|---|---|---|---|---|
-| `/matrix start` | `<szenario-id\|pfad> [--seed N] [--package <id>]` | Op | R | — | `--package` loads an inject package from the scenario library |
-| `/matrix compare` | `<lauf> <lauf> […]` | Obs | R | — | Compares two or more runs (e.g. with and without a package) |
-| `/matrix show` / `list` | — | Obs | R | sofort | Panel data (also F9) |
+| `/matrix start` | `<scenario-id|path> [--seed N] [--package <id>]` | Op | R | — | `--package` loads an inject package from the scenario library |
+| `/matrix compare` | `<run> <run> […]` | Obs | R | — | Compares two or more runs (e.g. with and without a package) |
+| `/matrix show` / `list` | — | Obs | R | immediate | Panel data (also F9) |
 
-**Model-facing read tools (Runde 4).** Agents may *read* the knowledge
+**Model-facing read tools.** Agents may *read* the knowledge
 surfaces through read-only tools; all writes stay operator commands or pass
 through review:
 
@@ -410,387 +410,374 @@ grammar, up from the TUI annex's headline count of 56 (which undercounted
 the knowledge surfaces at one line each and left both catalog domains as
 flag-based placeholders rather than full subcommand sets).
 
-### 2.6 Ist-Stand (2026-09) — im Code vorhanden, Vertrag nachgezogen
+### 2.6 Current state (2026-09) — present in code, contract caught up
 
-Die folgenden Commands existieren bereits in `harw-ops/src/`, sind in diesem
-Vertrag aber (noch) nicht erfasst. Je eine Zeile, Zweck aus dem
-Modul-Doc-Kommentar:
+The following commands already exist in `harw-ops/src/` and are now captured
+here, one line each, purpose from the module doc comment:
 
-- **`/analyze`** — Bottom-up-Analyse eines Workspace über Analyst-Kindagenten,
-  fan-out von Crate-Ebene zu Crate-Ebene mit abschließender Synthese.
-- **`/add-workdir`** — gibt zusätzliche Arbeitsverzeichnisse für die laufende
-  Sitzung frei (registriert sie in der geteilten `ExtraRootsCell`).
-- **`/bug-report`** — löst manuell einen lokalen Bug-Report aus und schreibt
-  ihn über `harw_ops::bug_report::write_bug_report`.
-- **`/diff`** — read-only Git-Diff-Operation, delegiert ausschließlich an
-  `shell.exec` über einen gehärteten `GitDiffPlan`.
-- **`/explore`** — stellt eine gebundene Frage an ein read-only Kind
-  (`explorer`) und validiert das Ergebnis gegen den `ResearchFinding`-Vertrag.
-- **`/context-proposal`** — Prüffläche für `ContextProposal`: auflisten,
-  ansehen, annehmen, ablehnen (Annehmen markiert nur, ändert kein
-  Kontextprogramm).
-- **`/goal`** — Ziel-Operation über `harw-plan`; beschreibt den gewünschten
-  Endzustand, `achieve`/`abandon` sind command-only (nicht modellseitig).
-- **`/mode`** — Anzeige und Wechselabsicht des Interaktionsmodus (`chat`,
-  `plan`, `explore`, `work`, `shell`); TUI-only, kein Modell-Tool, damit ein
-  Modell nicht sein eigenes Werkzeug-Ceiling anheben kann.
-- **`/research`**, **`/research-deps`** und **`/research-web`** — gebundene
-  Recherche durch Kinder; gleiche Struktur, unterscheiden sich nur in Kindrolle
-  und Vorgabe-Quellklassen. `/research` ist die allgemeine Recherche
-  (`researcher`), `/research-deps` prüft Rust-Abhängigkeiten
-  (`researcher-deps`, mit `--generic` sprachneutral über
-  `dependency-researcher`), `/research-web` recherchiert egress-gebunden im
-  Netz.
-- **`/plan`** — Plan-Operation über `harw-plan`/`harw-plan-bridge`, Command
-  und Modell-Tool, jede Mutation läuft über `PlanStore::apply`. Seit Runde 5
-  (Teil P) hält der Store mehrere Pläne, genau einer ist aktiv (`list` bzw.
-  in der TUI `/plan plans`, `switch`, `archive`, `inspect [id]`). Ein Plan der
-  Modell-Fläche ist zunächst ein Vorschlag; `submit` legt ihn in der TUI zur
-  Bestätigung vor, erst danach ist er verbindlich und an ein Goal gebunden.
-  `step <id> <open|running|done|blocked> [beleg]` meldet Fortschritt, `done`
-  nur mit Beleg. Daneben fängt die TUI die Plan-**Dateien** des Plan-Modus
-  lokal ab (Teil F): `/plan` (Plan-Modus an), `/plan show|list|open|edit`
-  über `.harw/plans/<slug>.md`.
-- **`/btw`** (Runde 5, Teil L, TUI-lokal) — flüchtige Nebenfrage zum
-  Gespräch: ein einzelner Modellaufruf auf einem Schnappschuss des Verlaufs,
-  ohne Werkzeuge, ohne den laufenden Turn zu berühren. Frage und Antwort
-  landen weder im Verlauf noch in der Eingabe-Historie; Esc bricht ab,
-  Zeitlimit 60 s. Andere Einstiege (Telegram) antworten mit einer Absage.
-- **`/usage`** — zeigt aufgezeichnete Token-Nutzung und Wächter-Ereignisse der
-  aktuellen Sitzung aus dem `StateStore`-Snapshot.
-- **`/stop`** — bricht einen laufenden Job kontrolliert ab; Command und
-  Modell-Tool mit `approval = "always"`.
-- **`/sandbox-lease`** (neu, Nutzerentscheidung 2026-09-21) — Command **und**
-  Modell-Tool für die direkte Host-Freigabe von `shell.exec`. Das Modell-Tool
-  (`harw-ops/src/sandbox_lease.rs`, `model_tool` ohne Zusatz-Approval, denn
-  der Dialog *ist* die Freigabe; Argument `reason`) löst einen
-  `HostPermitPrompt` aus (Vorauswahl `SessionLease`) und wartet bis zu 300 s:
-  `SessionLease` → `mark_session_approved` (TTL-befristet, alle
-  `shell.exec`-Aufrufe der Sitzung laufen danach auf dem Host); `SingleExecution`
-  → `mark_single_use` (nur der nächste Aufruf); Ablehnung/Timeout liefern
-  einen Fehlertext. Der Command `/sandbox-lease [status|revoke]`
-  (`busy = "immediate"`) ist rein lokal: `status` zeigt die aktive Freigabe,
-  `revoke` beendet eine Sitzungsfreigabe sofort über
-  `revoke_session_approval` + `ledger.revoke_session`. `/status`
-  (`harw-ops/src/status.rs`) zeigt zusätzlich die Zeile „Host-Lease: aktiv
-  bis … / Einzelfreigabe / aus". Details zur Host-Ausführung selbst stehen in
-  `mediated-process-execution.md`.
-- **`/permissions`** — Übersicht über Workspace-Identität, Sandbox-Rechte,
-  Freigabemodus und Allow-/Deny-Regeln. Seit Runde 5 (Teil E):
-  `allow|deny <tool> [muster] [--session|--project|--user]` (`--user` =
-  `--global`; Muster als `match` für Shell bzw. `path` für Dateien),
-  `rules` (Regeln mit Herkunft), `rm <nr>` (Kurzform von `remove`) und
-  `log [anzahl]` (letzte Auto-Modus-Entscheidungen samt Stand des
-  Sicherheitsdeckels). Reihenfolge der Prüfung: `ALWAYS_ASK_TOOLS` vorn,
-  dann Deny vor Allow vor Klassifizierer; Deny-Regeln gelten auch in `ask`.
-  Allow-Regeln für ein Werkzeug aus `ALWAYS_ASK_TOOLS` werden abgelehnt.
-- **`/agent`** — Agentenbaum mit Live-Werten (Wurzel „UIA · <name>“),
-  `list`, `stop`, `budget`, `use`. Seit Runde 5 fängt die TUI lokal ab:
-  `stream <orchestrators|all|none>` (Live-Stream der Kinder im Verlauf,
-  Teil I), `bg` (Hintergrund-Agenten mit Fortschritt) und `cancel <id>`
-  (eigenen Hintergrund-Agenten abbrechen, Teil K). Den früheren TUI-Befehl
-  `/agents` gibt es nicht mehr.
-- **`/effort`** — setzt die providerneutrale Reasoning-Stärke für nachfolgende
-  Turns, live, für die laufende Sitzung; operator-only, TUI-only, kein
-  Modell-Tool. Grammatik: `show | clear | minimal | low | medium | high |
-  xhigh | max` (Alias `/reasoning`) — hat einen strukturellen Zwilling,
-  `/uia-effort` (siehe §2.6.1).
+- **`/analyze`** — bottom-up analysis of a workspace via analyst child
+  agents, fanning out crate-level by crate-level with a final synthesis.
+- **`/add-workdir`** — grants additional working directories for the running
+  session (registers them in the shared `ExtraRootsCell`).
+- **`/bug-report`** — manually triggers a local bug report, written via
+  `harw_ops::bug_report::write_bug_report`.
+- **`/diff`** — a read-only git-diff operation, delegating exclusively to
+  `shell.exec` through a hardened `GitDiffPlan`.
+- **`/explore`** — asks a bounded question of a read-only child
+  (`explorer`) and validates the result against the `ResearchFinding`
+  contract.
+- **`/context-proposal`** — review surface for `ContextProposal`: list, view,
+  accept, reject (accepting only marks it; it does not change a context
+  program).
+- **`/goal`** — a goal operation over `harw-plan`; describes the desired end
+  state, `achieve`/`abandon` are command-only (not exposed to the model).
+- **`/mode`** — shows and requests a change of interaction mode (`chat`,
+  `plan`, `explore`, `work`, `shell`); TUI-only, not a model tool, so a
+  model cannot raise its own tool ceiling.
+- **`/research`**, **`/research-deps`**, and **`/research-web`** — bounded
+  research through children; same structure, differing only in the child
+  role and default source classes. `/research` is general research
+  (`researcher`), `/research-deps` checks Rust dependencies
+  (`researcher-deps`, or language-neutral via `dependency-researcher` with
+  `--generic`), `/research-web` does egress-bound research on the network.
+- **`/plan`** — a plan operation over `harw-plan`/`harw-plan-bridge`, both a
+  command and a model tool; every mutation runs through `PlanStore::apply`.
+  The store holds multiple plans, exactly one active (`list`, or in the TUI
+  `/plan plans`, `switch`, `archive`, `inspect [id]`). A plan proposed from
+  the model surface starts as a proposal; `submit` presents it in the TUI
+  for confirmation, only after which it is binding and tied to a goal.
+  `step <id> <open|running|done|blocked> [evidence]` reports progress,
+  `done` requires evidence. The TUI separately intercepts plan **files** in
+  plan mode locally: `/plan` (enters plan mode), `/plan show|list|open|edit`
+  over `.harw/plans/<slug>.md`.
+- **`/btw`** (TUI-local) — a throwaway side question about the
+  conversation: a single model call over a snapshot of the history, no
+  tools, without touching the running turn. Neither the question nor the
+  answer lands in the history or the input history; Esc cancels, 60s time
+  limit. Other entry points (Telegram) reply with a decline.
+- **`/usage`** — shows recorded token usage and guard events for the current
+  session from the `StateStore` snapshot.
+- **`/stop`** — aborts a running job in a controlled way; a command and a
+  model tool with `approval = "always"`.
+- **`/sandbox-lease`** (user decision 2026-09-21) — a command **and** a
+  model tool for direct host approval of `shell.exec`. The model tool
+  (`harw-ops/src/sandbox_lease.rs`, `model_tool` without extra approval,
+  since the dialog itself *is* the approval; argument `reason`) triggers a
+  `HostPermitPrompt` (pre-selected `SessionLease`) and waits up to 300s:
+  `SessionLease` -> `mark_session_approved` (TTL-bound, all `shell.exec`
+  calls for the session then run on the host); `SingleExecution` ->
+  `mark_single_use` (only the next call); rejection/timeout return an error
+  text. The command `/sandbox-lease [status|revoke]` (`busy = "immediate"`)
+  is purely local: `status` shows the active grant, `revoke` ends a session
+  grant immediately via `revoke_session_approval` +
+  `ledger.revoke_session`. `/status` (`harw-ops/src/status.rs`) additionally
+  shows a "Host lease: active until … / single-use / off" line. Details of
+  host execution itself live in `mediated-process-execution.md`.
+- **`/permissions`** — an overview of workspace identity, sandbox rights,
+  approval mode, and allow/deny rules: `allow|deny <tool> [pattern]
+  [--session|--project|--user]` (`--user` = `--global`; a pattern is a
+  `match` for shell or a `path` for files), `rules` (rules with their
+  origin), `rm <n>` (short for `remove`), and `log [count]` (the most recent
+  auto-mode decisions, along with the current security-ceiling state).
+  Check order: `ALWAYS_ASK_TOOLS` first, then deny before allow before the
+  classifier; deny rules also apply in `ask` mode. An allow rule for a tool
+  in `ALWAYS_ASK_TOOLS` is rejected.
+- **`/agent`** — the agent tree with live values (root "UIA · <name>"),
+  `list`, `stop`, `budget`, `use`. The TUI intercepts locally:
+  `stream <orchestrators|all|none>` (live-stream children into the
+  history), `bg` (background agents with progress), and `cancel <id>`
+  (cancel one's own background agent). The earlier TUI command `/agents` no
+  longer exists.
+- **`/effort`** — sets the provider-neutral reasoning strength for
+  subsequent turns, live, for the running session; operator-only, TUI-only,
+  not a model tool. Grammar: `show | clear | minimal | low | medium | high
+  | xhigh | max` (alias `/reasoning`) — has a structural twin,
+  `/uia-effort` (see §2.6.1).
 
-### 2.6.1 Modell-/Provider-/Effort-Befehle (Ist-Stand 2026-09, Welle 1–2)
+### 2.6.1 Model/provider/effort commands (current, 2026-09)
 
-Vollständiges Befehlsinventar für die Modell-, Provider- und
-Reasoning-Effort-Achse, wie in `harw-ops/src/model.rs`, `provider.rs` und
-`effort.rs` implementiert. `/provider switch` und `/uia-provider switch`
-**existieren nicht mehr** — ein Provider+Modell-Wechsel läuft ausschließlich
-atomar über `/model switch <id>` bzw. `/uia-model switch <id>`, die den
-konfigurierten Provider des Ziel-Modells auflösen und an
-`provider::handle_switch_core`/`handle_uia_switch_core` delegieren, auch wenn
-das Ziel-Modell zu einem anderen Provider gehört als der aktuell aktive.
+Complete command inventory for the model, provider, and reasoning-effort
+axis, as implemented in `harw-ops/src/model.rs`, `provider.rs`, and
+`effort.rs`. `/provider switch` and `/uia-provider switch` **no longer
+exist** — a provider+model switch runs exclusively, atomically, through
+`/model switch <id>` or `/uia-model switch <id>`, which resolve the target
+model's configured provider and delegate to
+`provider::handle_switch_core`/`handle_uia_switch_core`, even when the
+target model belongs to a different provider than the currently active one.
 
-| Befehl | Grammatik | Wirkung | Sichtbarkeit | Permission |
+| Command | Grammar | Effect | Visibility | Permission |
 |---|---|---|---|---|
-| `/model` (Alias `/m`) | `show \| list \| switch <id>` | `switch` wechselt Provider+Modell **atomar**, live, über den `SessionController` | `tui_only` | `operator` |
-| `/uia-model` | `show \| list \| switch <id>` | wie `/model`, aber für die gepinnte UIA-Auswahl (`uia_provider`/`uia_model`); `switch` ist live | `tui_only` | `operator` |
-| `/uia-worker-model` (neu) | `show \| list \| switch <id>` | `switch` validiert die Modell-ID gegen den *effektiven* UIA-Provider und persistiert nur `uia_worker_model` in der Profil-`config.toml` — **kein** Live-Wechsel, kein eigenes `uia_worker_provider`-Konzept (der Worker teilt sich den Provider mit der UIA); wirkt ab der nächsten Sitzung | `tui_only` | `operator` |
-| `/effort` (Alias `/reasoning`) | `show \| clear \| minimal \| low \| medium \| high \| xhigh \| max` | Live-Sitzungseinstellung über den `SessionController`, wirkt sofort auf nachfolgende Turns | `tui_only` | `operator` |
-| `/uia-effort` (neu) | dieselbe Grammatik wie `/effort` | persistiert `reasoning.uia` in der Profil-`config.toml`, **kein** Live-Override (bewusster Unterschied zu `/effort`), wirkt ab der nächsten Sitzung | `tui_only` | `operator` |
-| `/provider` (Alias `/p`) | `show \| list \| test` | rein lesend; `switch` fällt in den Unbekannt-Unterbefehl-Zweig und verweist auf `/model` | `tui_only` | `operator` |
-| `/uia-provider` | `show \| list \| test` | wie `/provider`, für die UIA-Pin-Auswahl; `switch` verweist auf `/uia-model` | `tui_only` | `operator` |
-| `/provider-concurrency` | `<ProviderRef> <n \| unlimited>` | verstellt `max_concurrency` eines Providers **live** über den `DynamicConcurrencyLimiter`: Erhöhen gibt Permits sofort frei, Senken ist lazy (laufende Requests werden nie abgebrochen, nur die Wiederauffüllung gedrosselt, bis das Ziel erreicht ist); Empfehlung bei wiederholten HTTP-429-Antworten: senken, nicht erhöhen | `tui_only` **und** `model_tool` (die UIA kann sich selbst drosseln) | `operator` (Command); `approval = "always"` für den Tool-Aufruf (die Macro unterstützt nur eine statische Freigabestufe je `model_tool`, daher gilt sie auch fürs Senken) |
+| `/model` (alias `/m`) | `show \| list \| switch <id>` | `switch` changes provider+model **atomically**, live, via the `SessionController` | `tui_only` | `operator` |
+| `/uia-model` | `show \| list \| switch <id>` | like `/model`, but for the pinned UIA selection (`uia_provider`/`uia_model`); `switch` is live | `tui_only` | `operator` |
+| `/uia-worker-model` | `show \| list \| switch <id>` | `switch` validates the model ID against the *effective* UIA provider and only persists `uia_worker_model` in the profile `config.toml` — **no** live switch, no separate `uia_worker_provider` concept (the worker shares its provider with the UIA); takes effect from the next session | `tui_only` | `operator` |
+| `/effort` (alias `/reasoning`) | `show \| clear \| minimal \| low \| medium \| high \| xhigh \| max` | a live session setting via the `SessionController`, applies immediately to subsequent turns | `tui_only` | `operator` |
+| `/uia-effort` | same grammar as `/effort` | persists `reasoning.uia` in the profile `config.toml`, **no** live override (a deliberate difference from `/effort`), takes effect from the next session | `tui_only` | `operator` |
+| `/provider` (alias `/p`) | `show \| list \| test` | read-only; `switch` falls into the unknown-subcommand branch and points to `/model` | `tui_only` | `operator` |
+| `/uia-provider` | `show \| list \| test` | like `/provider`, for the UIA pin selection; `switch` points to `/uia-model` | `tui_only` | `operator` |
+| `/provider-concurrency` | `<ProviderRef> <n \| unlimited>` | adjusts a provider's `max_concurrency` **live** via the `DynamicConcurrencyLimiter`: raising it releases permits immediately, lowering it is lazy (running requests are never aborted, only refill is throttled until the target is reached); recommendation on repeated HTTP 429s: lower, don't raise | `tui_only` **and** `model_tool` (the UIA can throttle itself) | `operator` (command); `approval = "always"` for the tool call (the macro only supports one static approval level per `model_tool`, so it applies to lowering too) |
 
-**Sichtbarkeit der Concurrency-Grenze:** `/provider show` (über die geteilte
-`format_load_status`-Hilfsfunktion, `harw-ops/src/provider.rs`) und `/status`
-(`harw-ops/src/status.rs`) zeigen beide dieselben vier Werte aus
-`harw_provider_http::ProviderLoadStatus`: die Concurrency-Grenze (`unlimited`,
-falls kein Limiter installiert), die Anzahl freier Permits, die aktuelle
-Rate-Limit-Wartezeit und die Anzahl seit Start beobachteter HTTP-429-Antworten
-(inkl. Hinweis, bei wiederholten 429ern zu senken statt zu erhöhen). Der
-`DynamicConcurrencyLimiter` ist für den OpenAI-kompatiblen **und** den
-Anthropic-Pfad derselbe Mechanismus — `AnthropicMessagesProvider::
-configure_concurrency` installiert denselben Limiter-Typ wie der
-OpenAI-kompatible Provider (`harw-provider-http/src/anthropic.rs`).
+**Visibility of the concurrency limit:** `/provider show` (via the shared
+`format_load_status` helper, `harw-ops/src/provider.rs`) and `/status`
+(`harw-ops/src/status.rs`) both show the same four values from
+`harw_provider_http::ProviderLoadStatus`: the concurrency limit
+(`unlimited` if no limiter is installed), the number of free permits, the
+current rate-limit wait, and the number of HTTP 429 responses observed
+since start (with a note to lower rather than raise on repeated 429s). The
+`DynamicConcurrencyLimiter` is the same mechanism for the OpenAI-compatible
+**and** the Anthropic path —
+`AnthropicMessagesProvider::configure_concurrency` installs the same
+limiter type as the OpenAI-compatible provider
+(`harw-provider-http/src/anthropic.rs`).
 
-**Anmerkung zur Granularität:** `OperationMeta.busy` ist eine Eigenschaft der
-gesamten Operation, nicht des Unterbefehls — `/model` und `/provider` sind
-auf dieser Ebene als Ganzes `busy = "immediate"`. Die TUI verfeinert das
-jedoch zur Laufzeit über `busy_availability_for`
-(`harw-tui/src/command_exec.rs`): nur `show`/`list` (und das bare
-`/provider`, das äquivalent zu `show` ist) lösen tatsächlich sofortigen
-Dispatch während eines laufenden Turns aus; `/model switch <id>`, bare
-`/model` (öffnet den Picker) und `/provider test` werden trotz
-`OperationMeta.busy = "immediate"` bis Turn-Ende eingereiht. Das entspricht
-der ursprünglich engeren Nutzerentscheidung 4 ("nur `show`") — nicht jeder
-Unterbefehl dieser beiden Operationen ist sofort verfügbar, siehe §2.6.3.
+**Note on granularity:** `OperationMeta.busy` is a property of the whole
+operation, not of the subcommand — at that level `/model` and `/provider`
+are `busy = "immediate"` as a whole. The TUI refines this at runtime via
+`busy_availability_for` (`harw-tui/src/command_exec.rs`): only `show`/`list`
+(and the bare `/provider`, equivalent to `show`) actually dispatch
+immediately during a running turn; `/model switch <id>`, bare `/model`
+(opens the picker), and `/provider test` are queued until turn end despite
+`OperationMeta.busy = "immediate"`. This matches the originally narrower
+scope of the user decision ("only `show`") — not every subcommand of these
+two operations is immediately available, see §2.6.3.
 
-### 2.6.2 Trennung UIA / Orchestrator (Provider-Ebene)
+### 2.6.2 UIA / orchestrator separation (provider level)
 
-- Korrektur (war zuvor als "zwei unabhängige Provider-Clients" beschrieben):
-  Es gibt **einen** Router über alle aktivierten Provider
-  (`RoutingModelProvider`, gebaut einmal in
-  `harw-provider-http/src/lib.rs::build_provider_with_load_registry`, mit
-  genau einem HTTP-Client je aktiviertem Provider). Die UIA bekommt darüber
-  **keinen** eigenen Client mehr, sondern nur eine eigene Standardroute:
-  `build_uia_model`/`build_uia_worker_model`
-  (`harw-runtime/src/model.rs`) umhüllen den gemeinsamen Router mit
-  `UiaDefaultRouteProvider`, der `provider_id`/`model_id` eines Requests
-  **nur dann** mit `uia_provider`/`uia_model` auffüllt, wenn der Request sie
-  noch nicht selbst trägt — eine Live-Wahl über `/uia-model switch`
-  (die den Request explizit mit ihrer eigenen `provider_id`/`model_id`
-  versieht) hat also stets Vorrang vor der Standardroute. Der
-  `build_uia_model`-Doc-Kommentar hält fest: "seit der Vereinheitlichung mit
-  dem Vorgabe-Router kann [der Aufbau] nicht mehr fehlschlagen — es wird kein
-  zweiter HTTP-Client gebaut." Weicht `uia_provider` vom `default_provider`
-  ab, scheitern UIA-Anfragen dadurch nicht mehr zur Laufzeit. Die
-  Concurrency-Grenze (`DynamicConcurrencyLimiter`, §2.6.1) ist **eine**
-  Grenze je Provider, nicht je Route — eine UIA-Anfrage über die
-  Standardroute und eine Orchestrator-Anfrage an denselben Provider teilen
-  sich dasselbe Kontingent.
-- `uia_worker_model` pinnt ausschließlich die `model_id` über einen
-  `PinnedModelProvider`, **nie** die `provider_id` — der Provider bleibt
-  zwingend derselbe wie der effektive `uia_provider`.
-- Die gesamte `uia-worker`-Rollenfamilie läuft **immer als genau eine
-  Instanz, nie parallel**: `harw-core/src/child_controller.rs` und
-  `harw-core-bridge/src/agent_tool.rs` deckeln `slots`/`max_parallel` für
-  diese Rollen intern auf `1`, unabhängig vom Aufrufer-Parameter (ein
-  `analyze(max_parallel: 4)` darf das nicht umgehen). Die UIA-Root-Session
-  selbst kann heute ohnehin nicht als Kind-Session ein zweites Mal
-  gleichzeitig entstehen (kein passender Spawn-Codepfad).
+- Correction (previously described as "two independent provider clients"):
+  there is **one** router across every enabled provider
+  (`RoutingModelProvider`, built once in
+  `harw-provider-http/src/lib.rs::build_provider_with_load_registry`, with
+  exactly one HTTP client per enabled provider). The UIA no longer gets its
+  own client through this, only its own default route:
+  `build_uia_model`/`build_uia_worker_model` (`harw-runtime/src/model.rs`)
+  wrap the shared router with `UiaDefaultRouteProvider`, which fills in a
+  request's `provider_id`/`model_id` from `uia_provider`/`uia_model` **only
+  when** the request doesn't already carry them — a live choice via
+  `/uia-model switch` (which sets the request's own `provider_id`/`model_id`
+  explicitly) always takes precedence over the default route. The
+  `build_uia_model` doc comment notes: "since unification with the default
+  router, [construction] can no longer fail — no second HTTP client is
+  built." When `uia_provider` diverges from `default_provider`, UIA requests
+  no longer fail at runtime as a result. The concurrency limit
+  (`DynamicConcurrencyLimiter`, §2.6.1) is **one** limit per provider, not
+  per route — a UIA request over the default route and an orchestrator
+  request to the same provider share the same quota.
+- `uia_worker_model` pins only the `model_id` via a `PinnedModelProvider`,
+  **never** the `provider_id` — the provider always stays the same as the
+  effective `uia_provider`.
+- The entire `uia-worker` role family always runs as **exactly one
+  instance, never in parallel**: `harw-core/src/child_controller.rs` and
+  `harw-core-bridge/src/agent_tool.rs` cap `slots`/`max_parallel` for these
+  roles internally at `1`, regardless of the caller's parameter (an
+  `analyze(max_parallel: 4)` cannot bypass this). The UIA root session
+  itself cannot currently spawn a second concurrent instance as a child
+  session anyway (there is no matching spawn code path).
 
-### 2.6.3 Busy-Verfügbarkeit während eines laufenden Turns
+### 2.6.3 Busy availability during a running turn
 
-Stand Runde 5 (Einstufung aus Runde 4, Teil H; `harw-operations/src/operation.rs`,
-`harw-tui/src/command_exec.rs`, `harw-tui/src/app.rs`,
-`harw-tui/src/app/busy_queue.rs`).
+(`harw-operations/src/operation.rs`, `harw-tui/src/command_exec.rs`,
+`harw-tui/src/app.rs`, `harw-tui/src/app/busy_queue.rs`.)
 
-**Drei Klassen** (`BusyAvailability`):
+**Three classes** (`BusyAvailability`):
 
-| Klasse | Verhalten während eines Turns |
+| Class | Behavior during a turn |
 |---|---|
-| `Immediate` | läuft sofort; reine Lese- oder Steuerbefehle ohne Sitzungsänderung über die Turn-Grenze |
-| `Staged` | läuft sofort, die Änderung wird aber nur im `SessionController` bzw. in einer Config-Zelle vorgemerkt und gilt **ab dem nächsten Turn**; Rückmeldung „— gilt ab nächstem Turn“ |
-| `DeferredUntilTurnEnd` (Vorgabe) | wird eingereiht und nach Turn-Ende über denselben autorisierten Befehlskanal ausgeführt |
+| `Immediate` | runs right away; pure read or control commands with no session change across the turn boundary |
+| `Staged` | runs right away, but the change is only queued in the `SessionController` or a config cell and takes effect **from the next turn**; feedback: "— applies from the next turn" |
+| `DeferredUntilTurnEnd` (default) | queued and executed after turn end through the same authorized command channel |
 
-**Deklaration an der Operation.** `#[operation(command(busy = "…",
-busy_subcommands = "…"))]`: `busy` ist die Klasse der Operation,
-`busy_subcommands` überschreibt sie je Unterbefehl (erstes Argument-Token),
-z. B. `busy_subcommands = "show=immediate, list=immediate, -=immediate"`
-(`-` steht für die bare Form). `Operation::busy_for(args)` und
-`BusySubcommand::resolve` werten das aus; die früher in
-`busy_availability_for` fest verdrahteten Sonderfälle für `/model` und
-`/provider` sind damit entfallen.
+**Declared on the operation.** `#[operation(command(busy = "…",
+busy_subcommands = "…"))]`: `busy` is the operation's class,
+`busy_subcommands` overrides it per subcommand (first argument token), e.g.
+`busy_subcommands = "show=immediate, list=immediate, -=immediate"` (`-`
+stands for the bare form). `Operation::busy_for(args)` and
+`BusySubcommand::resolve` evaluate this; the special cases for `/model` and
+`/provider` that used to be hardcoded in `busy_availability_for` are gone as
+a result.
 
-**Einstufung (Auszug, maßgeblich ist `EXPECTED_BUSY_CLASSES` in
-`harw-tui/src/command_exec.rs`, ein Tabellentest über den ganzen Katalog):**
+**Classification (excerpt; authoritative is `EXPECTED_BUSY_CLASSES` in
+`harw-tui/src/command_exec.rs`, a table test over the whole catalog):**
 
-| Klasse | Befehle |
+| Class | Commands |
 |---|---|
-| `Immediate` | `/help` `/status` `/ps` `/usage` `/diff` `/work` `/review` `/approve` `/deny` `/cancel` `/stop` `/agent` `/models` `/attach` `/sandbox-lease` `/provider-concurrency`; `/provider` (außer `test`); `/plugins` (außer `install`/`activate`/`uninstall`); lesende Formen: `/permissions` bare/`show`/`mode`/`set`, `/skills` bare/`list`/`show`, `/workbench` bare/`show`, `/diary` bare/`show`/`today`/`search`, `/palace` bare/`list`/`show`/`search`, `/matrix show`/`list`, `/model show`/`list`, `/effort`/`/mode`/`/uia-*` bare bzw. `show`/`list`; `/permissions rules`/`log`; bei aktivem Planungs-Gate `/plan` bare/`inspect`/`ready`/`waves`/`list` und `/goal` bare/`show`/`check`; ohne Plan-Operation die lokale `/plan`-Ersatzspezifikation. TUI-lokal: `/keys` `/whoami` `/verbose` `/rename` `/btw`, `/agent stream`/`bg`/`cancel` |
-| `Staged` | `/model` (bare mit Picker und `switch <id>`), `/effort`, `/mode`, `/uia-model`, `/uia-worker-model`, `/uia-provider`, `/uia-effort` — jeweils die ändernden Formen |
-| `DeferredUntilTurnEnd` | `/compact` `/tools` `/new` `/resume` `/sessions` `/clear` `/quit` `/exit` `/export` `/add-workdir` `/retry` `/memory` `/learn` `/context-proposal` `/bug-report`; `/provider test`; `/permissions allow`/`deny`/`remove`; `/matrix` außer `show`/`list`; `/research*`, `/explore`, `/analyze`; alle schreibenden Unterbefehle von `/workbench`, `/kanban`, `/diary`, `/palace`, `/dream` |
+| `Immediate` | `/help` `/status` `/ps` `/usage` `/diff` `/work` `/review` `/approve` `/deny` `/cancel` `/stop` `/agent` `/models` `/attach` `/sandbox-lease` `/provider-concurrency`; `/provider` (except `test`); `/plugins` (except `install`/`activate`/`uninstall`); read forms: `/permissions` bare/`show`/`mode`/`set`, `/skills` bare/`list`/`show`, `/workbench` bare/`show`, `/diary` bare/`show`/`today`/`search`, `/palace` bare/`list`/`show`/`search`, `/matrix show`/`list`, `/model show`/`list`, `/effort`/`/mode`/`/uia-*` bare or `show`/`list`; `/permissions rules`/`log`; with an active planning gate, `/plan` bare/`inspect`/`ready`/`waves`/`list` and `/goal` bare/`show`/`check`; without a plan operation, the local `/plan` fallback spec. TUI-local: `/keys` `/whoami` `/verbose` `/rename` `/btw`, `/agent stream`/`bg`/`cancel` |
+| `Staged` | `/model` (bare with picker and `switch <id>`), `/effort`, `/mode`, `/uia-model`, `/uia-worker-model`, `/uia-provider`, `/uia-effort` — the mutating forms of each |
+| `DeferredUntilTurnEnd` | `/compact` `/tools` `/new` `/resume` `/sessions` `/clear` `/quit` `/exit` `/export` `/add-workdir` `/retry` `/memory` `/learn` `/context-proposal` `/bug-report`; `/provider test`; `/permissions allow`/`deny`/`remove`; `/matrix` except `show`/`list`; `/research*`, `/explore`, `/analyze`; every write subcommand of `/workbench`, `/kanban`, `/diary`, `/palace`, `/dream` |
 
-Ein `/provider switch` gibt es nicht (nur `show`/`list`/`test`); der
-Anbieterwechsel läuft über `/model` bzw. den Modell-Picker.
+There is no `/provider switch` (only `show`/`list`/`test`); a provider
+switch runs through `/model` or the model picker.
 
-**Nachzügler (beim Schreiben noch offen):** Für `/kanban`
-(`list`/`show`/`boards`/bare) und `/dream` (`list`/`show`/`status`/bare) sind
-laut Plan die lesenden Formen `Immediate`; die `busy_subcommands` waren an den
-beiden Operationen noch nicht gesetzt, beide wurden deshalb vollständig
-zurückgestellt.
+**Known gap (open at time of writing):** for `/kanban`
+(`list`/`show`/`boards`/bare) and `/dream` (`list`/`show`/`status`/bare) the
+read forms are meant to be `Immediate` per the design, but
+`busy_subcommands` had not yet been set on either operation, so both were
+left fully deferred.
 
-**TUI-Ablauf** (`route_busy_command` in `harw-tui/src/app.rs`):
+**TUI flow** (`route_busy_command` in `harw-tui/src/app.rs`):
 
-1. Zuerst der lokale Abfang (`local_intercept_for`). Busy-sichere Abfänge
-   wirken sofort: Overlays und Ansichten, Modell- und Effort-Picker,
-   UIA-Worker-Picker, Agentenbaum, Panels, ausführliche Anzeige,
-   Systemzeilen, Umbenennen. Zurückgestellt bleiben Sitzungsauswahl,
-   Transkript leeren und `Rewrite`.
-2. Sonst `busy_availability_for`: `Immediate`/`Staged` laufen als eigener
-   Tokio-Task mit geklonten `Arc`s (`BusyJobs`), Zeitlimit 60 s; der
-   Busy-`select!` wartet nie auf sie, Streaming und Freigaben laufen weiter.
-   Das Ergebnis erscheint als Systemzeile „<befehl> (während Turn)“, bei
-   `Staged` mit dem Zusatz „— gilt ab nächstem Turn“. Ansichten öffnen als
-   Overlay bzw. Panel.
-3. Alles andere wird als Paste+Enter in `deferred_input` zurückgestellt.
+1. Local interception first (`local_intercept_for`). Busy-safe intercepts
+   apply immediately: overlays and views, model and effort pickers, the UIA
+   worker picker, the agent tree, panels, verbose display, system lines,
+   rename. Deferred: session selection, clearing the transcript, and
+   `Rewrite`.
+2. Otherwise `busy_availability_for`: `Immediate`/`Staged` run as their own
+   Tokio task with cloned `Arc`s (`BusyJobs`), a 60s time limit; the busy
+   `select!` never waits on them, streaming and approvals keep running. The
+   result shows as a system line "<command> (during turn)", with `Staged`
+   adding "— applies from the next turn". Views open as an overlay or
+   panel.
+3. Everything else is deferred into `deferred_input` as paste+enter.
 
-Während eines Turns bekommen offene Overlays die Tasten
-(`route_busy_overlay_key`); ein aus einem Overlay oder Picker erzeugter
-Befehl wird neu eingestuft (`Staged` → Controller sofort vormerken, nie
-`apply_to_session` mitten im Turn). Esc schließt dort zuerst das Overlay,
-ohne den Turn abzubrechen. Ausstehende Datenabrufe offener Ansichten laufen
-auch im Busy-Pfad (`spawn_busy_fetches`), damit sich Ansichten füllen.
+While a turn is running, open overlays get the keypresses
+(`route_busy_overlay_key`); a command generated from an overlay or picker is
+re-classified (`Staged` -> queue it in the controller immediately, never
+`apply_to_session` mid-turn). There, Esc first closes the overlay without
+aborting the turn. Pending data fetches for open views also run on the busy
+path (`spawn_busy_fetches`) so views get populated.
 
-**Sichtbare Warteschlange.** Während eines Turns abgeschickte Nachrichten
-(`pending_turns`) stehen als Block „Wartet auf den nächsten Turn (N)“ über dem
-Composer (je Nachricht höchstens 3 Zeilen, insgesamt höchstens 10). Sie
-bleiben dort, bis sie im nächsten Turn ausgeliefert werden, und erscheinen
-dann normal im Verlauf; das gilt auch nach einem Abbruch (§2.6.4). Alt+↑ holt
-die zuletzt eingereihte Nachricht zurück in den Composer.
+**Visible queue.** Messages sent during a turn (`pending_turns`) show as a
+"Waiting for the next turn (N)" block above the composer (at most 3 lines
+per message, 10 total). They stay there until delivered on the next turn,
+then appear normally in the history; this also holds after a cancel
+(§2.6.4). Alt+↑ pulls the most recently queued message back into the
+composer.
 
-`/cancel` und `/stop` wirken auf den `JobStore` (Hintergrund-Jobs), **nicht**
-auf den laufenden Turn selbst — dafür sind Ctrl+C und Esc zuständig (siehe
+`/cancel` and `/stop` act on the `JobStore` (background jobs), **not** on
+the running turn itself — Ctrl+C and Esc are responsible for that (see
 §2.6.4).
 
-### 2.6.4 Ctrl+C und Esc — Interrupt ohne Verlust der Warteschlange
+### 2.6.4 Ctrl+C and Esc — interrupt without losing the queue
 
-Nutzerauftrag: Ctrl+C soll ein echter harter Interrupt sein (Modellaufruf,
-Shell-/Sandbox-Prozesse, Kind-Agenten), nicht nur ein kooperativ geprüftes
-Signal. Runde 4 (Teil F): Ein Abbruch verwirft keine bereits abgeschickten
-Nachrichten mehr.
+User requirement: Ctrl+C should be a real hard interrupt (model call,
+shell/sandbox processes, child agents), not just a cooperatively-checked
+signal. A cancel no longer discards already-sent messages.
 
-- **Warteschlange bleibt (Runde 4, Teil F):** Ctrl+C und Esc brechen nur den
-  laufenden Turn ab (`interrupt_turn` in `harw-tui/src/app.rs`). Während des
-  Turns abgeschickte Nachrichten und Befehle (`pending_turns`,
-  `deferred_input`) bleiben eingereiht und werden direkt nach dem Abbruch an
-  der Turn-Grenze ausgeliefert; die Statuszeile zeigt kurz „Warteschlange
-  wird gesendet“ (`queue_kept_at`). Das gilt auch, wenn beim Abbruch ein
-  Freigabe- oder Host-Permit-Dialog offen ist. Bis Runde 3 verwarf Ctrl+C
-  die Warteschlange.
-- **Esc:** schließt zuerst ein offenes Popup bzw. Overlay und lässt den
-  Composer-Text stehen; eine wartende `/btw`-Nebenfrage bricht Esc als
-  Erstes ab. Ist nichts offen und läuft ein Turn, unterbricht Esc
-  ihn wie ein erster Ctrl+C-Druck, scharft aber **kein** Beenden — Esc
-  schließt nie die App.
-- **Esc mit laufenden Kindern (Runde 5, Teil O):** Laufen synchrone
-  Kind-Agenten, zeigt das erste Esc nur „Esc bricht den Turn und N laufende
-  Agenten ab – nochmal Esc zum Bestätigen“; erst das zweite Esc bricht ab.
-  Hintergrund-Agenten und bereits beendete Kinder zählen nicht mit. Ohne
-  Kinder bricht Esc wie bisher sofort ab. `Enter` reiht während eines Turns
-  nur ein und bricht nie ab.
-- **Modellaufruf:** `harw-core/src/turn_loop.rs` racet den Modellaufruf
-  gegen `CancelToken::cancelled()` (`tokio::select!`, `biased`); ein Treffer
-  **und** ein `Err(ModelError::Cancelled)` aus dem Provider (racet dort
-  ebenfalls gegen den `CancelToken` aus `ModelRequest`) münden beide in
-  denselben `cancel_turn(...)`-Pfad. **Fertig.**
-- **Shell-/Subprozesse:** `harw-tool-shell/src/exec.rs` racet beide
-  `timeout_at`-Wartepunkte zusätzlich gegen `cancel.cancelled()`; ein Treffer
-  löst SIGKILL über die bestehende `terminate()`-Funktion aus und liefert
-  `Err(ToolsError::Cancelled)`. **Fertig.**
-- **Kind-Agenten:** `ManagedAgentSpawner::register_parent_cancel_token` (in
-  `harw-core/src/child_controller.rs`) ist verdrahtet — `harw-tui/src/app.rs`
-  ruft es beim Start jedes Turns auf (kurz vor `drive_turn_animated`, mit
-  demselben `CancelToken`, der auch `TurnControl::with_cancel` mitgegeben
-  wird), sodass danach admittierte Kinder `cancel.child()` erben. Ein
-  Registrierungsfehler (z. B. weil die Session selbst ein admittiertes Kind
-  ist) ist nicht fatal für den Turn, sondern wird nur geloggt
-  (`tui.turn.register_parent_cancel_token_failed`). **Fertig.**
-- **Doppel-Tap Idle/Busy:** `ChatApp::pending_quit`/`hard_quit_requested`
-  (`harw-tui/src/app.rs`) vereinheitlichen den `QuitArm`/
-  `QUIT_HINT_WINDOW`-Mechanismus (2 Sekunden Fenster) über Idle- und
-  Busy-Pfad: der erste Ctrl+C-Druck im Busy-Pfad bricht den laufenden Turn
-  kooperativ ab und armt `pending_quit`; ein zweiter Druck derselben Taste
-  binnen des Fensters setzt `hard_quit_requested`, das `run_loop` direkt
-  nach dem laufenden Turn prüft und dann sofort beendet — derselbe Ausgang
-  wie `HarwEvent::Quit` im Idle-Pfad. **Fertig.**
+- **The queue stays:** Ctrl+C and Esc only abort the running turn
+  (`interrupt_turn` in `harw-tui/src/app.rs`). Messages and commands sent
+  during the turn (`pending_turns`, `deferred_input`) stay queued and are
+  delivered right after the cancel at the turn boundary; the status line
+  briefly shows "sending queue" (`queue_kept_at`). This also holds when an
+  approval or host-permit dialog is open at cancel time. Earlier, Ctrl+C
+  used to discard the queue.
+- **Esc:** first closes an open popup or overlay and leaves the composer
+  text in place; a pending `/btw` side question is the first thing Esc
+  cancels. If nothing is open and a turn is running, Esc interrupts it like
+  a first Ctrl+C press, but does **not** arm a quit — Esc never closes the
+  app.
+- **Esc with running children:** while synchronous child agents are
+  running, the first Esc only shows "Esc aborts the turn and N running
+  agents — press Esc again to confirm"; only the second Esc actually
+  aborts. Background agents and already-finished children don't count.
+  Without children, Esc aborts immediately as before. `Enter` only queues
+  during a turn and never aborts.
+- **Model call:** `harw-core/src/turn_loop.rs` races the model call against
+  `CancelToken::cancelled()` (`tokio::select!`, `biased`); either a hit
+  there **or** an `Err(ModelError::Cancelled)` from the provider (which also
+  races against the `CancelToken` from `ModelRequest`) lead into the same
+  `cancel_turn(...)` path.
+- **Shell/subprocesses:** `harw-tool-shell/src/exec.rs` additionally races
+  both `timeout_at` wait points against `cancel.cancelled()`; a hit triggers
+  SIGKILL via the existing `terminate()` function and returns
+  `Err(ToolsError::Cancelled)`.
+- **Child agents:** `ManagedAgentSpawner::register_parent_cancel_token` (in
+  `harw-core/src/child_controller.rs`) is wired up —
+  `harw-tui/src/app.rs` calls it at the start of every turn (just before
+  `drive_turn_animated`, with the same `CancelToken` also passed to
+  `TurnControl::with_cancel`), so children admitted afterward inherit
+  `cancel.child()`. A registration failure (e.g. because the session itself
+  is an admitted child) is not fatal to the turn, only logged
+  (`tui.turn.register_parent_cancel_token_failed`).
+- **Double-tap idle/busy:** `ChatApp::pending_quit`/`hard_quit_requested`
+  (`harw-tui/src/app.rs`) unify the `QuitArm`/`QUIT_HINT_WINDOW` mechanism
+  (a 2-second window) across the idle and busy paths: the first Ctrl+C press
+  on the busy path cooperatively aborts the running turn and arms
+  `pending_quit`; a second press of the same key within the window sets
+  `hard_quit_requested`, which `run_loop` checks right after the running
+  turn and then exits immediately — the same outcome as `HarwEvent::Quit` on
+  the idle path.
 
-### 2.6.5 Reasoning-Effort-Standards (Rangfolge)
+### 2.6.5 Reasoning-effort defaults (precedence)
 
-Nutzerentscheidung: Standard-Reasoning-Effort ist zusätzlich pro Provider,
-pro Modell und pro Agenten-Definition konfigurierbar; bei Konflikt gilt die
-Rangfolge **Provider > Modell > Agenten-Definition > Rolle** (`reasoning.*`
-bleibt der Boden-Fallback).
+User decision: the default reasoning effort is additionally configurable
+per provider, per model, and per agent definition; on conflict the
+precedence is **provider > model > agent definition > role**
+(`reasoning.*` stays the bottom-level fallback).
 
-- **Fertig:** die Config-Felder — `ProviderToml.default_reasoning_effort`
-  (`harw-config/src/provider_toml.rs`) und
-  `ModelToml.default_reasoning_effort` (`harw-config/src/model_toml.rs`)
-  existieren mit rundtrip-getesteter TOML-Serialisierung.
-- **Fertig:** die vierstufige Auflösungsfunktion, die die Rangfolge zur
-  Spawn-Zeit anwendet, existiert in zwei bewusst identischen Ausprägungen
-  (Schichtungsregel: `harw-core` darf nicht von `harw-runtime` abhängen):
+- The config fields — `ProviderToml.default_reasoning_effort`
+  (`harw-config/src/provider_toml.rs`) and
+  `ModelToml.default_reasoning_effort` (`harw-config/src/model_toml.rs`) —
+  exist with round-trip-tested TOML serialization.
+- The four-level resolution function that applies this precedence at spawn
+  time exists in two deliberately identical forms (layering rule:
+  `harw-core` may not depend on `harw-runtime`):
   `harw_runtime::guard_wiring::resolve_default_reasoning_effort`
-  (`harw-runtime/src/guard_wiring.rs`) für die UIA-Root-Session (aufgerufen
-  aus `harw-runtime/src/assembly.rs`, nur wenn
-  `organizational_role == AgentRoleId::UserInterface` und `spec.reasoning_effort`
-  keine explizite Live-Einstellung trägt) und eine gespiegelte Fassung in
+  (`harw-runtime/src/guard_wiring.rs`) for the UIA root session (called from
+  `harw-runtime/src/assembly.rs`, only when `organizational_role ==
+  AgentRoleId::UserInterface` and `spec.reasoning_effort` carries no
+  explicit live setting), and a mirrored version in
   `harw-core/src/child_controller.rs`
-  (`resolve_child_default_reasoning_effort`) für Kind-Agenten, die über
-  `ChildRegistryFactory::reasoning_effort_defaults_for_role(_task)` bedient
-  werden — `harw-runtime/src/children.rs`s `RuntimeChildRegistryFactory`
-  überschreibt diese Methode mit den tatsächlich für die aufgelöste
-  Provider-/Modell-ID hinterlegten `default_reasoning_effort`-Werten.
-  `role_effort_weights_from_config` bleibt weiterhin nur die unterste Ebene
-  (Rolle) und dient beiden Auflösungsfunktionen als Boden-Fallback.
-  **Bestehende Einschränkung (kein Bug, dokumentiert):** Ein Kind ohne eigene
-  interne Modellstelle (`internal_point_for_role` liefert `None`, d. h. kein
-  passender `internal_models`-Eintrag) läuft auf dem geerbten
-  Eltern-Hauptmodell; dessen Provider-/Modell-ID ist der
-  `RuntimeChildRegistryFactory` nicht bekannt, daher liefert
-  `reasoning_effort_defaults_for_role(_task)` für ein solches Kind `(None,
-  None)` und die Rangfolge fällt direkt auf die Rollen-Ebene durch — Provider-
-  und Modell-Standard greifen nur für Kinder mit einer aufgelösten internen
-  Modellstelle.
+  (`resolve_child_default_reasoning_effort`) for child agents, served via
+  `ChildRegistryFactory::reasoning_effort_defaults_for_role(_task)` —
+  `harw-runtime/src/children.rs`'s `RuntimeChildRegistryFactory` overrides
+  this method with the `default_reasoning_effort` values actually stored
+  for the resolved provider/model ID. `role_effort_weights_from_config`
+  remains just the bottom level (role) and serves as the fallback for both
+  resolution functions.
+  **Existing limitation (not a bug, documented):** a child with no own
+  internal model slot (`internal_point_for_role` returns `None`, i.e. no
+  matching `internal_models` entry) runs on the inherited parent's main
+  model; the `RuntimeChildRegistryFactory` doesn't know that model's
+  provider/model ID, so `reasoning_effort_defaults_for_role(_task)` returns
+  `(None, None)` for such a child and precedence falls straight through to
+  the role level — provider and model defaults only apply to children with
+  a resolved internal model slot.
 
-### 2.6.6 Reasoning-Sichtbarkeit (UIA)
+### 2.6.6 Reasoning visibility (UIA)
 
-Nutzerauftrag: Denkinhalt der UIA soll sichtbar werden, vor allem in der
-UIA-Sitzung.
+User requirement: the UIA's reasoning content should be visible, above all
+in the UIA session.
 
-**Fertig, Ende-zu-Ende verdrahtet:** `harw-core/src/turn_loop.rs` liest
-`response.reasoning: Option<OpaqueReasoning>` nach jedem Modellaufruf aus.
-Für Anthropic-Blöcke extrahiert `extract_thinking_text` das lesbare
-`"thinking"`-Textfeld; `"redacted_thinking"`-Blöcke und verschlüsseltes
-OpenAI-Reasoning liefern keinen Text und erzeugen bewusst **kein**
-`TurnItem::Reasoning` (kein Fehler). Der extrahierte Text wird als
-`ReasoningItem` in `session.history_mut()` gepusht und als
-`TurnEvent::ItemAdded { item: TurnItem::Reasoning(...) }` emittiert — **nur**
-für Sessions mit `organizational_role == AgentRoleId::UserInterface` (dasselbe
-Kriterium wie `is_uia_root_session`); Nicht-UIA-Sessions verwerfen Reasoning
-weiterhin unverändert. `harw-tui/src/app.rs` rendert das Item bereits über
-die vollständig verdrahtete `ReasoningHistoryCell` (gedimmter Text,
-`·`-Präfix). `to_model_messages` (`history.rs`) überspringt
-`TurnItem::Reasoning` beim nächsten Modellaufruf.
+**Done, wired end to end:** `harw-core/src/turn_loop.rs` reads
+`response.reasoning: Option<OpaqueReasoning>` after every model call. For
+Anthropic blocks, `extract_thinking_text` extracts the readable `"thinking"`
+text field; `"redacted_thinking"` blocks and encrypted OpenAI reasoning
+return no text and deliberately produce **no** `TurnItem::Reasoning` (not an
+error). The extracted text is pushed as a `ReasoningItem` into
+`session.history_mut()` and emitted as `TurnEvent::ItemAdded {
+item: TurnItem::Reasoning(...) }` — **only** for sessions with
+`organizational_role == AgentRoleId::UserInterface` (the same criterion as
+`is_uia_root_session`); non-UIA sessions still discard reasoning as before.
+`harw-tui/src/app.rs` already renders the item via the fully wired
+`ReasoningHistoryCell` (dimmed text, `·` prefix). `to_model_messages`
+(`history.rs`) skips `TurnItem::Reasoning` on the next model call.
 
-### 2.6.7 Export-Lesbarkeit (Ist-Stand 2026-09-21)
+### 2.6.7 Export readability (as of 2026-09-21)
 
-`/export` (§2.1 der TUI-Annex) ist um mehrere Lesbarkeits-Korrekturen
-ergänzt, ohne die Grammatik zu ändern:
+`/export` (§2.1 of the TUI annex) gained several readability fixes without
+changing its grammar:
 
-- Das Startdatum (`ExportMeta.started_at`) wird lesbar formatiert
-  (`jiff::Timestamp`, lokaler Offset, RFC-3339-Stil) statt als rohe
-  Unix-Sekunde ausgegeben; der Dateiname behält weiterhin den
-  Sekunden-Token. Bei fortgesetzter Session (`-r`) stammt das Datum vom
-  Session-Start aus dem Session-Store, nicht vom TUI-Start.
-- Tool-Argumente und -Ergebnisse werden über einen neuen Helfer
-  `render_json_block` dargestellt: ist ein String-Blatt (vor allem `value`)
-  selbst JSON, wird es geparst und als verschachteltes Pretty-JSON
-  ausgegeben; sonst kommt ein eigener ` ```text ` -Block mit echten
-  Zeilenumbrüchen statt einer einzelnen, potenziell zehntausende Zeichen
-  langen Zeile.
-- Jeder Eintrag ist zusätzlich auf `ExportOptions.max_chars_per_entry`
-  (Default 4000 Zeichen) gekappt, mit Marker `_[gekürzt: N Zeichen]_`,
-  zeichengrenzen-sicher wie das bestehende `truncate_markdown`; die globale
-  `--max-chars`-Kappung des gesamten Exports bleibt zusätzlich bestehen.
-- Überschriften (`#…`-Zeilen) in User- und Assistant-Text werden um zwei
-  Ebenen herabgestuft (maximal `######`), Fenced-Code-Blöcke werden dabei
-  übersprungen.
-- Tool-Einträge (ToolCall/ToolResult/Reasoning), die auf eine
-  Nutzernachricht folgen, landen jetzt unter der Überschrift „## harw" statt
-  fälschlich unter „## Du".
-- Scheitert das Kopieren in die Zwischenablage beim reinen `/export` (z. B.
-  weil harw in tmux ohne Zwischenablage läuft), schreibt es stattdessen die
-  Datei über den bestehenden `default_export_path` und meldet den Pfad. Die
-  OSC-52-Ausgabe wird in tmux zusätzlich mit einer
-  DCS-Passthrough-Hülle (`\ePtmux;…\e\\`) umschlossen, wenn `TMUX` gesetzt
-  ist.
+- The start date (`ExportMeta.started_at`) is formatted readably
+  (`jiff::Timestamp`, local offset, RFC-3339 style) instead of printed as a
+  raw Unix second; the filename still keeps the seconds token. For a
+  resumed session (`-r`), the date comes from the session start in the
+  session store, not from the TUI start.
+- Tool arguments and results are rendered through a new helper
+  `render_json_block`: if a string leaf (mainly `value`) is itself JSON, it
+  is parsed and printed as nested pretty JSON; otherwise a dedicated
+  ` ```text ` block is used with real line breaks instead of a single line
+  that could run to tens of thousands of characters.
+- Every entry is additionally capped at `ExportOptions.max_chars_per_entry`
+  (default 4000 characters), with a `_[truncated: N characters]_` marker,
+  character-boundary-safe like the existing `truncate_markdown`; the
+  overall export's global `--max-chars` cap still applies on top.
+- Headings (`#…` lines) in user and assistant text are demoted by two
+  levels (capped at `######`); fenced code blocks are skipped.
+- Tool entries (ToolCall/ToolResult/Reasoning) that follow a user message
+  now land under the "## harw" heading instead of incorrectly under "## You".
+- If copying to the clipboard fails for a plain `/export` (e.g. because harw
+  is running in tmux without clipboard access), it instead writes the file
+  via the existing `default_export_path` and reports the path. The OSC-52
+  output is additionally wrapped in a DCS passthrough envelope
+  (`\ePtmux;…\e\\`) in tmux when `TMUX` is set.
 
 ---
 

@@ -1,9 +1,8 @@
 //! Ein einziger Modell-Aufruf ohne Werkzeuge und ohne Turn-Schleife.
 //!
-//! Spec: `/home/mia/.claude/plans/nope-permissions-gibt-es-wild-lobster.md`
-//! „Schritt 7" (Session-Titel und Resume-Picker) — dieser Knoten liefert den
-//! zugrunde liegenden One-Shot-Baustein, den `harw-runtime/src/session_title.rs`
-//! für die Titelgenerierung nutzt.
+//! Dieser Knoten liefert den zugrunde liegenden One-Shot-Baustein, den
+//! `harw-runtime/src/session_title.rs` für die Titelgenerierung (Session-Titel
+//! und Resume-Picker) nutzt.
 //!
 //! # Kein Werkzeugpfad, keine Freigabekette
 //! [`complete_text`] baut einen [`ModelRequest`] mit einer **leeren**

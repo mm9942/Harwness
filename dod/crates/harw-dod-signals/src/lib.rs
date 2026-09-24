@@ -1,6 +1,6 @@
 //! Daten-Vokabular für Host-Sicherheitsbeobachtung: Messwerte, Ereignisse,
 //! Belege und der eine `Sensor`-Trait, an dem elf Sensor-Crates gleichzeitig
-//! hängen (Contract-Master `docs/aw-contract-master.md` §G, Knoten AW0-07).
+//! hängen (Contract-Master `docs/design/build-history.md` §G, Knoten AW0-07).
 //!
 //! # Verantwortungsbereich
 //! Diese Crate deklariert Vokabular; sie liest keine Quelle selbst und

@@ -4,7 +4,7 @@
 //! # Verantwortungsbereich
 //! Der dritte echte Implementierer von [`harw_observe::TelemetrySink`] nach
 //! `harw-observe-file::FileSink` und `harw-observe-prom::PromSink` (Vertrag
-//! A.3/A.6, `docs/aw-contract-master.md`). Besitzt [`OtlpSink`] (Pufferung,
+//! A.3/A.6, `docs/design/build-history.md`). Besitzt [`OtlpSink`] (Pufferung,
 //! Stapelbildung, die `security.*`/`warden.*`-Sperre), [`OtlpConfig`] +
 //! [`HeaderEntry`] (Konfiguration), [`OtlpClock`] + [`FixedClock`]
 //! (injizierte Zeitquelle), [`OtlpTransport`] + [`RecordingTransport`]

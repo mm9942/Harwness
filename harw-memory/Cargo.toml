@@ -3,11 +3,13 @@ publish.workspace = true
 name = "harw-memory"
 version.workspace = true
 edition.workspace = true
+license.workspace = true
+repository.workspace = true
 rust-version.workspace = true
 
 [dependencies]
 harw-types = { path = "../harw-types" }
-# F-006: symlinkfestes Öffnen (korrektes O_NOFOLLOW je Architektur, CONTRACTS.md §fsutil).
+# F-006: symlinkfestes Öffnen (korrektes O_NOFOLLOW je Architektur, `harw-fsutil`).
 harw-fsutil = { path = "../harw-fsutil" }
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.150"

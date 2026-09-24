@@ -1,8 +1,7 @@
 //! Strukturierter Markdown-/JSON-Export einer Chat-Historie für den
 //! `/export`-Befehl der TUI.
 //!
-//! Spec-Quelle: `harw-scopes-contract.md` Slice E1 und
-//! `nope-permissions-gibt-es-wild-lobster.md` (UI-Stil der Dialoge).
+//! Spec-Quelle: `docs/design/tui-command-contract.md` (Export).
 //!
 //! # Verantwortung
 //! Dieses Modul rendert eine gegebene Menge von [`ExportEntry`]-Werten als
@@ -34,7 +33,7 @@
 //!     title: Some("Testlauf".to_owned()),
 //!     session_id: "abc123".to_owned(),
 //!     started_at: Some("2026-09-14T05:30:00".to_owned()),
-//!     cwd: Some("/home/nutzerin/projects/harwness".to_owned()),
+//!     cwd: Some("/home/user/projects/harwness".to_owned()),
 //!     model: Some("groq/llama".to_owned()),
 //! };
 //! let entries = vec![ExportEntry::User("Hallo".to_owned())];
@@ -1700,7 +1699,7 @@ mod tests {
             title: Some("Mein Export".to_owned()),
             session_id: "sess-42".to_owned(),
             started_at: Some("2026-09-14T05:30:00".to_owned()),
-            cwd: Some("/home/nutzerin/projects/harwness".to_owned()),
+            cwd: Some("/home/user/projects/harwness".to_owned()),
             model: Some("groq/llama".to_owned()),
         };
         let entries = vec![
@@ -1713,7 +1712,7 @@ mod tests {
         assert!(out.starts_with("# Mein Export\n\n"));
         assert!(out.contains("- **Session-ID:** sess-42"));
         assert!(out.contains("- **Datum:** 2026-09-14T05:30:00"));
-        assert!(out.contains("- **Verzeichnis:** /home/nutzerin/projects/harwness"));
+        assert!(out.contains("- **Verzeichnis:** /home/user/projects/harwness"));
         assert!(out.contains("- **Modell:** groq/llama"));
 
         let du_first = out
@@ -1942,22 +1941,22 @@ mod tests {
     /// Präfix expandiert; Traversal bleibt abgelehnt.
     #[test]
     fn test_expand_home_prefix() -> TestResult {
-        let home = Path::new("/home/nutzerin");
+        let home = Path::new("/home/user");
         assert_eq!(
             expand_home_prefix("~", Some(home)),
-            PathBuf::from("/home/nutzerin")
+            PathBuf::from("/home/user")
         );
         assert_eq!(
             expand_home_prefix("~/a/b.md", Some(home)),
-            PathBuf::from("/home/nutzerin/a/b.md")
+            PathBuf::from("/home/user/a/b.md")
         );
         assert_eq!(
             expand_home_prefix("$HOME/x.json", Some(home)),
-            PathBuf::from("/home/nutzerin/x.json")
+            PathBuf::from("/home/user/x.json")
         );
         assert_eq!(
             expand_home_prefix("${HOME}/x.md", Some(home)),
-            PathBuf::from("/home/nutzerin/x.md")
+            PathBuf::from("/home/user/x.md")
         );
         assert_eq!(
             expand_home_prefix("~bob/x", Some(home)),

@@ -1,7 +1,6 @@
 //! Session-Titel per Modell (`generate_title`/`ensure_title`/`spawn_title_job`).
 //!
-//! Spec: `/home/mia/.claude/plans/nope-permissions-gibt-es-wild-lobster.md`
-//! „Schritt 7" (Session-Titel und Resume-Picker). Der Titel-Aufruf selbst
+//! Deckt Session-Titel und Resume-Picker ab. Der Titel-Aufruf selbst
 //! läuft über [`harw_core::one_shot::complete_text`] — ein einzelner
 //! Modell-Aufruf ohne Werkzeuge und ohne Turn-Schleife (siehe dessen
 //! Moduldoku), deshalb ist auch hier keine Freigabekette beteiligt.

@@ -209,4 +209,4 @@ Synthetische CII-Fixtures unter `xmlinvoice/tests/fixtures/`:
 
 ## Constraint
 
-Änderungen nur in `xmlinvoice/` — niemals in `../apps/sgh-flow/` oder anderen Workspace-Crates.
+Änderungen nur in `xmlinvoice/` — niemals in `../apps/acme-app/` oder anderen Workspace-Crates.

@@ -2928,10 +2928,10 @@ mod tests {
 
     #[test]
     fn skill_fragment_helpers_serve_root_agents_and_fail_closed() -> TestResult {
-        let (layer, config) = skill_fixture("emily")?;
+        let (layer, config) = skill_fixture("assistant")?;
         let roots = vec![layer.path().to_path_buf()];
         let fragments =
-            agent_skill_fragments(&config, &roots, "emily").map_err(ctx("agent fragments"))?;
+            agent_skill_fragments(&config, &roots, "assistant").map_err(ctx("agent fragments"))?;
         assert_eq!(fragments.len(), 1);
         assert!(
             agent_skill_fragments(&config, &roots, "nobody")

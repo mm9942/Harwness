@@ -1,291 +1,224 @@
-# Telemetrie-Export: OTLP, Prometheus und die Sink-Grenze
+# Telemetry Export: OTLP, Prometheus and the Sink Boundary
 
-**Status:** Entwurf zur Diskussion, noch nicht normativ
-**Zweck:** Wie Telemetrie das System verlässt, welche Abhängigkeiten das
-kostet, und warum keine davon im Kern liegt
-**Recherchestand:** August 2026
-**Verwandt:** `harw-context-plan.md` (Metrikfamilie Kontext),
-`harw-security-observability-plan.md` §6,
-`harw-dod-integration-and-dependencies.md` (Doktrin D1 bis D9)
+> Status: implemented · Last reviewed: 2026-09-24
 
----
-
-## 0. Die Grundentscheidung
-
-`harw-observe` definiert `TelemetrySink` und kennt kein Backend. Das ist
-keine Vorsicht, sondern eine Recherche-Entscheidung: OpenTelemetry-Rust ist
-Mitte 2026 auf der 0.32-Linie, Logs und Metriken sind stabil, Traces noch
-Beta, sämtliche Erstanbieter-Crates weiterhin pre-1.0, mit Brüchen in
-Minor-Releases und Versionierung im Gleichschritt über die ganze Familie.
-Bemerkenswert dabei: die Reihenfolge ist umgekehrt zu Go und Java, wo Traces
-zuerst stabil wurden. Wer aus anderen Sprachen Erwartungen mitbringt, liegt
-hier falsch.
-
-Eine solche Abhängigkeit im Kern eines Systems, das auf Jahre gebaut wird,
-wäre ein wiederkehrender Umbau. Hinter einem eigenen Trait ist sie ein
-Adapter, den man austauscht.
-
-**Regel:** Kein Typ aus einer Backend-Crate erscheint jemals in einer
-öffentlichen Signatur von `harw-observe`, `harw-dod` oder `harw`. Das ist
-Doktrin D5, und hier ist ihr wichtigster Anwendungsfall.
+**Purpose:** how telemetry leaves the system, what dependencies that costs,
+and why none of them sit in the core.
+**Related:** `harw-dod-integration-and-dependencies.md` (dependency
+doctrine D1–D9)
 
 ---
 
-## 1. Drei Sinks, drei Crates
+## 0. The base decision
 
-| Crate | Transport | Abhängigkeiten | Zweck |
+`harw-observe` defines `TelemetrySink` (`harw-observe/src/sink.rs`) and
+knows no backend. This was a deliberate research decision: as of this
+review, OpenTelemetry-Rust's first-party crates (`opentelemetry`,
+`opentelemetry_sdk`, `opentelemetry-otlp`) are still pre-1.0, version-locked
+across the family, with breaks in minor releases — and traces trail logs
+and metrics to stability, the reverse of the order in Go and Java.
+
+A dependency like that in the core of a system built for years would be a
+recurring rebuild. Behind its own trait, it's an adapter you swap.
+
+**Rule:** no type from a backend crate ever appears in a public signature
+of `harw-observe`, `harw-dod` or `harw`. This is dependency doctrine D5, and
+this is its most important application.
+
+---
+
+## 1. Three sinks, three crates
+
+| Crate | Transport | Dependencies | Purpose |
 |---|---|---|---|
-| `harw-observe-file` | JSONL auf Platte | keine über `serde_json` hinaus | Standard. Immer verfügbar, airgap-tauglich, forensisch nutzbar |
-| `harw-observe-prom` | Pull, Text-Exposition | eigenes Rendering, minimaler HTTP-Server | Klassische Betriebsintegration ohne Collector |
-| `harw-observe-otlp` | Push, OTLP | OpenTelemetry-Familie | Wenn ein Collector existiert und Traces gewünscht sind |
+| `harw-observe-file` | JSONL on disk | none beyond `serde_json` | default; always available, air-gap-friendly, forensically usable |
+| `harw-observe-prom` | pull, text exposition | hand-written rendering, minimal HTTP handler | classic ops integration without a collector |
+| `harw-observe-otlp` | push, OTLP/JSON over HTTP | hand-written OTLP/JSON body construction over `hyper` — **not** the `opentelemetry`/`opentelemetry-otlp` crates | when a collector exists and export is wanted |
 
-Alle drei implementieren `TelemetrySink`. Keine kennt die andere. Der Kern
-kennt keine.
+All three implement `TelemetrySink`. None knows about the others. The core
+knows about none of them. All three are implemented.
 
-### 1.1 `harw-observe-file` ist der Standard, nicht der Notnagel
+### 1.1 `harw-observe-file` is the default, not the fallback
 
-Ein zeilenweises JSONL mit Zeitstempel, Metrikschlüssel, Labels und Wert
-kostet praktisch nichts, hat keine Abhängigkeit, läuft ohne Netz und ist
-genau das, was man bei einem Sicherheitsvorfall haben will: eine lokale,
-append-only Datei, die man mitnehmen kann. Sie liegt unter `harw-home`,
-rotiert nach Größe, und die Rotation schreibt eine Prüfsumme der
-abgeschlossenen Datei.
+A line-oriented JSONL file with timestamp, metric key, labels and value
+costs almost nothing, has no dependency, runs with no network, and is
+exactly what you want during a security incident: a local, append-only file
+you can take with you. Implemented under `harw-home`, rotating by size,
+with a checksum written for each closed file.
 
-Für den Sentinel ist das der einzige Sink, der per Voreinstellung aktiv ist.
+For the sentinel, this is the only sink active by default.
 
-### 1.2 `harw-observe-prom` wird selbst gebaut
+### 1.2 `harw-observe-prom` is hand-built
 
-Das Prometheus-Textformat ist ein Zeilenformat mit `# HELP`, `# TYPE` und
-Metrikzeilen. Es zu erzeugen sind wenige hundert Zeilen, und `MetricKey`
-enthält bereits alles Nötige: Name, Art, Einheit, Labels. Eine
-Client-Bibliothek würde ein zweites Metrikmodell mitbringen, das gegen
-deines abgeglichen werden müsste.
+**Implemented as planned:** `harw-observe-prom` has no client-library
+dependency beyond `harw-observe`/`harw-macros` — see `Cargo.toml`. The
+Prometheus text format (`# HELP`, `# TYPE`, metric lines) is rendered
+directly from `MetricKey` (`format.rs`); a client library would have
+introduced a second metric model to reconcile against Harwness' own. The
+endpoint itself (`endpoint.rs`) is a minimal HTTP handler bound to loopback
+or a Unix socket, never `0.0.0.0` — treated as an operator-tier surface,
+since an open metrics endpoint is a map of the system.
 
-Das gilt nach Doktrin D6: kleine Fläche, eigene Datenstruktur schon
-vorhanden, also selbst bauen. Konkret entsteht dabei zusätzlich die
-Namenskonvention als Code statt als Absprache:
+### 1.3 `harw-observe-otlp`: implemented, and more conservative than planned
 
-```rust
-/// Prometheus-Namensregeln, aus MetricKey abgeleitet, nicht getippt.
-fn prom_name(key: &MetricKey) -> String {
-    // Counter enden auf _total; Basiseinheiten sind Sekunden und Bytes;
-    // Gauges tragen die Einheit im Suffix. Verstöße sind Compile-Zeit-
-    // Fehler in `metrics!`, nicht Laufzeit-Warnungen des Scrapers.
-}
-```
+This document originally proposed wrapping the OpenTelemetry crate family
+behind an adapter (via `opentelemetry`/`opentelemetry-otlp`, with an HTTP
+transport preferred over gRPC/tonic to keep the tree small). **The actual
+implementation goes further: it does not depend on the OpenTelemetry crate
+family at all.** `harw-observe-otlp/src/lib.rs` builds the OTLP/JSON
+request bodies itself (module doc: "the OTel adapter isolation, and why it
+exists" — citing doctrine D5 by name as the reason) and ships them over a
+hand-written HTTP transport built on `hyper`/`hyper-util` (reusing feature
+flags already resolved elsewhere in the workspace, so this adds no new
+crate to the lockfile beyond feature unions). This sidesteps the
+version-churn risk entirely rather than merely isolating it behind an
+adapter — there is no OTel dependency to isolate.
 
-Der Endpunkt selbst ist eine Sicherheitsfläche: er bindet auf Loopback oder
-einen Unix-Socket, nie auf `0.0.0.0`, und ist damit
-`PermissionTier::Operator`. Ein offener Metrikendpunkt ist eine Landkarte
-des Systems.
-
-### 1.3 `harw-observe-otlp` ist optional und gekapselt
-
-Nur diese Crate kennt die OpenTelemetry-Familie. Sie ist ein optionales
-Feature, sie erscheint in keiner öffentlichen Signatur, und ihr
-Abhängigkeitsbaum wird gegen die Doktrin geprüft wie jeder andere.
-
-Zwei Transportvarianten stehen zur Wahl: gRPC über tonic oder HTTP mit
-Protobuf. Empfehlung ist HTTP, weil der Baum deutlich kleiner ist und
-Harwness ohnehin einen HTTP-Client für die Provider fährt. gRPC lohnt sich
-erst bei sehr hohen Raten, die hier nicht anliegen.
-
-**Der Warden linkt diese Crate nie.** Sein Abhängigkeitsbudget nach D7 lässt
-das nicht zu, und er braucht sie auch nicht: er schreibt in den File-Sink,
-der Sentinel exportiert.
+**The warden never links this crate.** It writes to the file sink; the
+sentinel exports.
 
 ---
 
-## 2. Routing nach Namensraum
+## 2. Routing by namespace
 
-Der Punkt, an dem S6 auf die Telemetrie trifft. Nicht jede Metrik darf
-überall hin.
+Where network/security disjointness meets telemetry — not every metric may
+go everywhere. Implemented in `harw-observe/src/routing.rs`.
 
-```rust
-pub struct SinkRouting {
-    default: SinkId,
-    by_namespace: BTreeMap<&'static str, SinkSet>,
-}
-```
-
-| Namensraum | Voreinstellung | Begründung |
+| Namespace | Default | Rationale |
 |---|---|---|
-| `context.*`, `plan.*`, `goal.*`, `model.*` | alle konfigurierten Sinks | Betriebsdaten, unkritisch |
-| `sensor.*`, `host.*` | alle konfigurierten Sinks | Hostgesundheit, unkritisch |
-| `security.*` | **nur File-Sink** | Befundraten und Regeltreffer sind eine Landkarte der Schwachstellen |
-| `warden.*` | **nur File-Sink** | dito, plus Aktionshistorie |
-| Meta-Nullzähler | alle Sinks | ihr Wert ist null; ihre Existenz ist keine Information |
+| `context.*`, `plan.*`, `goal.*`, `model.*` | all configured sinks | operational data, non-sensitive |
+| `sensor.*`, `host.*` | all configured sinks | host health, non-sensitive |
+| `security.*` | **file sink only** | finding rates and rule hits map out the system's weak points |
+| `warden.*` | **file sink only** | same, plus the action history |
+| meta zero-counters | all sinks | their value is zero; their existence isn't information |
 
-Der Export von `security.*` ist ein bewusster Konfigurationsschritt mit
-Operator-Bestätigung, kein Standard. Ein Angreifer, der die Metriken
-mitliest, sieht sonst genau, welche Regeln feuern und welche blind sind.
-
----
-
-## 3. Kardinalität als Vertrag
-
-Das Feld `Cardinality` in `MetricKey` ist nicht Dokumentation, es ist die
-Durchsetzung.
-
-**Verboten als Label, ausnahmslos:** vollständige Pfade, PIDs, Session-IDs,
-Turn-IDs, IP-Adressen, Benutzernamen, Dateinamen, Prozessargumente,
-Modell-Antworttexte. Alles davon ist entweder unbegrenzt kardinal oder
-personenbezogen oder beides.
-
-**Erlaubt:** geschlossene Enums (Rolle, Schrittart, Auslassungsgrund,
-Härtegrad, Sensorstatus), begrenzte Aufzählungen (Modell-ID, Provider-ID,
-Sektionsname, Sensor-ID), kleine Zahlbereiche (Kernnummer).
-
-**Grenzfälle mit Regel:** cgroup-Identität wird als Rolle plus Tiefe
-gelabelt, nicht als voller Pfad. Ein `exe_digest` wird nicht gelabelt,
-sondern erscheint nur im Ereignisstrom. Plan-Knoten werden nach Art
-gelabelt, nicht nach `TaskId`.
-
-Die Durchsetzung ist zweistufig: `metrics!` lehnt zur Compile-Zeit ein Label
-ab, das nicht per `field!` deklariert ist, und der Sink lehnt zur Laufzeit
-eine Labelmenge ab, die die deklarierte Obergrenze überschreitet, mit dem
-Zähler `context_label_cardinality_exceeded`. Was nicht gemessen werden kann,
-ohne die Zeitreihendatenbank zu sprengen, wird als Ereignis geführt, nicht
-als Metrik. Das ist die eigentliche Trennlinie zwischen den beiden Strömen.
+Exporting `security.*` is a deliberate, operator-confirmed configuration
+step, never a default — otherwise an attacker reading the metrics sees
+exactly which rules fire and which are blind.
 
 ---
 
-## 4. Traces, Spans und die Brücke
+## 3. Cardinality as a contract
 
-Die vorhandenen `tracing`-Aufrufstellen bleiben, was sie sind. Die Brücke
-ist eine Layer-Registrierung in genau einer Datei:
+`Cardinality`, a field on `MetricKey`, is enforcement, not documentation.
 
-```
-tracing (bestehend)
-  └─ #[traced] normalisiert Felder und Redaktion
-     └─ harw-observe: FieldName, MetricKey, TraceContext
-        ├─ harw-observe-file   (immer)
-        ├─ harw-observe-prom   (optional, pull)
-        └─ harw-observe-otlp   (optional, push)
-             └─ tracing-opentelemetry Layer
-```
+**Forbidden as a label, without exception:** full paths, PIDs, session IDs,
+turn IDs, IP addresses, usernames, filenames, process arguments, model
+response text — each of these is unbounded-cardinality, personally
+identifying, or both.
 
-Zwei Punkte aus der Recherche, die die Reihenfolge bestimmen:
+**Allowed:** closed enums (role, step kind, omission reason, severity,
+sensor status), bounded enumerations (model ID, provider ID, section name,
+sensor ID), small numeric ranges (core number).
 
-**Traces sind auf der Rust-Seite noch Beta, Metriken stabil.** Deshalb ist
-die Metrikbrücke Welle W1 und die Trace-Brücke Welle W7. Umgekehrt wäre die
-naheliegende Reihenfolge, aber sie wäre für Rust falsch.
+**Edge cases with a rule:** cgroup identity is labeled as role plus depth,
+never a full path. An executable digest is never a label, only ever an
+event field. Plan nodes are labeled by kind, never by task ID.
 
-**`tracing-opentelemetry` versioniert eigenständig gegen die
-OpenTelemetry-Crates.** Das ist eine Kopplung, die man beim Aktualisieren
-prüfen muss. Sie steht deshalb im Doktrin-Inventar mit einem expliziten
-Kompatibilitätsvermerk, damit ein Update nicht still zwei Versionen mischt.
-
-**Was propagiert wird**, ist bereits geplant: `TraceContext` in
-`StoredJob`, `ChildLeaseRecord` und `WardenRequest`. Ohne diese drei Felder
-zerfällt jede lange Ausführung in Fragmente, egal welches Backend darunter
-liegt. Deshalb gehören sie in W1 und nicht in die Exportwelle.
-
-**Exemplars**, also die Verknüpfung eines Histogrammpunkts mit einer
-konkreten Trace-ID, sind der eigentliche Gewinn einer OTLP-Anbindung: aus
-"die Turn-Latenz hat einen Ausreißer" wird "hier ist der Turn". Sie sind
-optional und an das Vorhandensein des OTLP-Sinks gebunden.
+Enforcement is two-tiered: the metric macro rejects an undeclared label at
+compile time, and the sink rejects an oversized label set at runtime, with
+a dedicated exceeded-cardinality counter. What can't be measured without
+overloading a time-series store is carried as an event, not a metric — the
+actual dividing line between the two streams.
 
 ---
 
-## 5. Abhängigkeitsanalyse
+## 4. Traces, spans and the bridge
 
-### 5.1 Was der OTLP-Sink kostet
+Existing `tracing` call sites stay as they are. Implemented pieces:
+`TraceContext` (`harw-observe/src/trace.rs`) carries only `String`/
+`Option<String>` fields (no OTel type), with validating constructors.
 
-| Ebene | Crates | Charakter | Risiko |
+**Open:** a `tracing-opentelemetry` layer bridging Rust `tracing` spans
+into OTLP traces. No dependency on `tracing-opentelemetry` exists in the
+workspace as of this review. This is consistent with §1.3: since
+`harw-observe-otlp` deliberately avoids the OTel crate family for metrics
+export, a trace bridge through `tracing-opentelemetry` (which pulls in that
+family) would reintroduce the dependency this design avoided. If a trace
+export path is wanted, either OTLP/JSON traces would need to be hand-built
+the same way metrics export is, or the OTel-family dependency would need to
+be reconsidered — this decision has not been made.
+
+**Exemplars** (linking a histogram point to a specific trace ID) remain the
+main payoff of a trace bridge and stay open along with it.
+
+---
+
+## 5. Dependency analysis (updated against the actual implementation)
+
+### 5.1 What the OTLP sink costs — actual, not the originally planned cost
+
+| Layer | Crates | Character |
+|---|---|---|
+| Body construction | none (hand-written OTLP/JSON) | in-house, `harw-observe-otlp/src/schema.rs` and friends |
+| Transport | `hyper`, `hyper-util`, `http-body-util`, `bytes`, `tokio` | pure Rust; these crates and versions were already resolved elsewhere in the workspace, so no net-new crate enters the lockfile |
+| Serialization | `serde`, `serde_json` | already in the tree |
+
+This is meaningfully cheaper than the `opentelemetry`/`opentelemetry-otlp`
+route originally evaluated in this document — no pre-1.0, family-versioned
+dependency at all.
+
+### 5.2 What the Prometheus sink costs
+
+Confirmed near-zero: `harw-observe`/`harw-macros` only.
+
+### 5.3 What the file sink costs
+
+Confirmed: `serde_json`, `blake3`, `jiff` — all already in the tree.
+
+### 5.4 Assessment against the doctrine
+
+| Rule | OTLP | Prom (hand-built) | File |
 |---|---|---|---|
-| API und SDK | `opentelemetry`, `opentelemetry_sdk` | reines Rust | pre-1.0, Gleichschritt-Versionierung, Brüche in Minors |
-| Exporter | `opentelemetry-otlp` | reines Rust | dito, plus Transportwahl |
-| Serialisierung | `prost` | reines Rust | stabil, breit verankert |
-| Transport HTTP | vorhandener HTTP-Client | bereits im Baum | keine neue Fläche |
-| Transport gRPC | `tonic`, `hyper`, `tower` | reines Rust | großer Baum, deshalb nicht empfohlen |
-| Brücke | `tracing-opentelemetry` | reines Rust | eigene Versionsachse gegen die OTel-Crates |
-| Semantik | `opentelemetry-semantic-conventions` | Namenskonstanten | harmlos, aber optional |
-
-Alles davon ist reines Rust, verletzt also D1 und D2 nicht. Das Risiko ist
-nicht Speichersicherheit, sondern Versionschurn. Genau dagegen hilft die
-Kapselung.
-
-### 5.2 Was der Prometheus-Sink kostet
-
-Nahezu nichts, wenn selbst gebaut: Formatierung aus `MetricKey`, ein
-minimaler HTTP-Handler auf Loopback oder Unix-Socket. Eine
-Client-Bibliothek würde ein zweites Metrikmodell einführen, das mit deinem
-abgeglichen werden müsste, und genau diese Doppelung ist der Fehler, den die
-Registry vermeiden soll.
-
-### 5.3 Was der File-Sink kostet
-
-`serde_json`, bereits im Baum. Null neue Fläche.
-
-### 5.4 Bewertung gegen die Doktrin
-
-| Regel | OTLP | Prom (selbst) | File |
-|---|---|---|---|
-| D1 reines Rust | erfüllt | erfüllt | erfüllt |
-| D2 kein C-Build | erfüllt | erfüllt | erfüllt |
-| D5 nicht in öffentlichen Typen | erfüllt durch Kapselung | erfüllt | erfüllt |
-| D6 selbst bauen bei kleiner Fläche | nein, Fläche zu groß | **ja, deshalb selbst** | ja |
-| D7 Warden-Budget | linkt es nie | linkt es nie | linkt es |
-| D8 CI-Gates | volle Prüfung | trivial | trivial |
+| D1 pure Rust | met | met | met |
+| D2 no C build | met | met | met |
+| D5 not in public types | met — there is nothing OTel to isolate | met | met |
+| D6 build it yourself for a small surface | met, more thoroughly than originally proposed | met | met |
+| D7 warden budget | never linked | never linked | linked |
+| D8 CI gates | `cargo deny` covers it like any crate | trivial | trivial |
 
 ---
 
-## 6. Wellen
+## 6. Build history (informational)
 
-**T0, im Rahmen von W0.** `TelemetrySink`, `MetricKey`, `Cardinality`,
-`SinkRouting`, `NullSink`. Kein Export.
-
-**T1, im Rahmen von W1.** `harw-observe-file` und die Metrikemission der
-Selbstbeobachtung. Ab hier existieren Zahlen, lokal, ohne Abhängigkeit. Das
-ist der Punkt, an dem die Plan-Arbeit bereits profitiert.
-
-**T2, im Rahmen von W3.** `harw-observe-prom` mit Loopback-Endpunkt und
-Namensregeln aus `MetricKey`. Klassische Betriebsintegration ohne Collector.
-
-**T3, im Rahmen von W5.** Routing nach Namensraum scharf gestellt, also
-`security.*` und `warden.*` auf File-Sink beschränkt, Export nur nach
-Operator-Bestätigung.
-
-**T4, im Rahmen von W7.** `harw-observe-otlp` mit HTTP-Transport,
-Metrikbrücke zuerst. Trace-Brücke danach, mit Exemplars, sobald die
-Rust-Trace-Seite stabil ist. Vorher Kompatibilitätsmatrix prüfen.
+The subsystem was built in this order: sink trait and routing vocabulary
+first (no export); the file sink and self-observation metric emission
+next, giving local numbers with no dependency; the Prometheus sink with its
+loopback endpoint after that; namespace routing tightened (`security.*`/
+`warden.*` restricted to the file sink) once the security subsystem needed
+it; the OTLP sink last, built hand-rolled rather than via the OTel crate
+family per §1.3/§5.1. All of the above is implemented; the tracing-to-OTLP
+trace bridge (§4) remains open.
 
 ---
 
-## 7. Prüfungen
+## 7. Checks
 
-**Inhaltsfreiheit.** Ein Property-Test über alle `Redact`-Implementierungen:
-kein Sink-Output enthält je einen Wert der Klasse `Omitted` oder den
-Klartext eines `Digest`-Feldes.
-
-**Kardinalitätsgrenze.** Ein Lasttest, der einen Sensor mit hoher
-Wertevielfalt fährt und prüft, dass der Sink ablehnt statt zu wachsen.
-
-**Routing.** Ein Test, dass eine `security.*`-Metrik ohne
-Operator-Bestätigung ausschließlich im File-Sink landet.
-
-**Namensregeln.** Golden-Test der Prometheus-Ausgabe gegen einen
-eingefrorenen Erwartungswert, damit Namens- und Einheitenkonventionen nicht
-driften.
-
-**Adapter-Isolation.** Ein CI-Schritt prüft, dass keine öffentliche Signatur
-in `harw-observe`, `harw-dod` oder `harw` einen Typ aus der
-OpenTelemetry-Familie nennt.
+- **Content freedom.** A property test over every redaction
+  implementation: no sink output ever contains an omitted-class value or
+  the plaintext of a digest field.
+- **Cardinality limit.** A load test that drives a high-cardinality sensor
+  and checks the sink rejects rather than grows unbounded.
+- **Routing.** A test that a `security.*` metric without operator
+  confirmation lands only in the file sink.
+- **Naming rules.** A golden test of the Prometheus output against a
+  frozen expectation, so naming/unit conventions don't drift.
+- **Adapter isolation.** A CI step checking that no public signature in
+  `harw-observe`, `harw-dod` or `harw` names a type from the OpenTelemetry
+  family — trivially true today since no such dependency exists at all.
 
 ---
 
-## 8. Offene Punkte
+## 8. Open items
 
-1. **Exporterwahl bei hohen Ereignisraten.** Falls `procmon` und `flow`
-   mehr liefern, als ein Push-Exporter verträgt, wird vorverdichtet, nicht
-   der Transport gewechselt. Die Verdichtungsschwelle fehlt noch.
-2. **Retention des File-Sinks.** Rotation nach Größe ist gesetzt, die
-   Aufbewahrungsdauer nicht. Sie hängt an der Frage, wie weit forensisch
-   zurückgeschaut werden soll.
-3. **Histogramm-Buckets.** Für Turn-Latenz und Kontextgrößen sind
-   sinnvolle Grenzen erst nach den ersten Messungen aus T1 festzulegen.
-   Vorher geraten wäre wertlos.
-4. **OTel-Versionsdisziplin.** Vorschlag: die ganze Familie zusammen
-   aktualisieren, nie einzeln, und `tracing-opentelemetry` als Leitversion
-   nehmen, weil sie die engste Kopplung hat.
+1. **Exporter choice at high event rates.** If sensors like `procmon`/
+   `flow` produce more than a push exporter can carry, the answer is
+   pre-aggregation, not a transport change. The aggregation threshold is
+   still undefined.
+2. **File-sink retention.** Rotation by size is set; retention duration is
+   not, and depends on how far back forensic lookback needs to reach.
+3. **Histogram buckets** for turn latency and context sizes need real
+   measurements before sensible bounds can be set.
+4. **Trace bridge decision.** Whether to hand-build OTLP/JSON trace export
+   (consistent with the metrics sink) or accept the OTel-family dependency
+   via `tracing-opentelemetry` for traces only.

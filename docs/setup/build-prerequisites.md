@@ -91,12 +91,11 @@ security-relevant ways. All three affect the privileged warden/sentinel
 binaries, not a normal `cargo build`:
 
 - **No Landlock.** The kernel shipped with Raspberry Pi OS does not
-  include Landlock support by default. This is handled as an explicit
-  case (`docs/aw-plan.md`, decision #4, "Landlock without kernel
-  support"): handled **asymmetrically** — a hard startup failure for the
-  three privileged binaries, degradation with `SensorDegraded` for the
-  sentinel. A build on a Pi 5 with the default kernel must expect exactly
-  this behavior, not a silent fallback.
+  include Landlock support by default. This is handled **asymmetrically**:
+  a hard startup failure for the three privileged binaries, degradation
+  with `SensorDegraded` for the sentinel. A build on a Pi 5 with the
+  default kernel must expect exactly this behavior, not a silent
+  fallback.
 - **No BTF** (BPF Type Format) in the default kernel image. Any
   BPF-backed observation (`harw-probe-bpf`, `harw-dod-bpf`) that relies on
   `CO-RE` (Compile Once – Run Everywhere) via BTF needs either a

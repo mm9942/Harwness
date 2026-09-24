@@ -7,7 +7,7 @@
 ## Falsch
 ```rust
 // String-Felder in HashMap eintragen via .clone() — verdeckt, was passiert
-// (Muster aus apps/sgh-flow/src/iceberg/config.rs:258-265)
+// (Muster aus apps/acme-app/src/iceberg/config.rs:258-265)
 fn to_catalog_props(&self) -> HashMap<String, String> {
     let mut props = HashMap::new();
     props.insert("credential".to_string(), self.credential.clone());     // ❌
@@ -23,7 +23,7 @@ let repo2 = audit_repo.clone();  // ❌ — liest sich wie Inhalt-Klon
 ## Richtig
 ```rust
 // Slice-Element zu owned String: .to_owned() auf &str
-// (aus apps/sgh-flow/src/iceberg/handler.rs:484)
+// (aus apps/acme-app/src/iceberg/handler.rs:484)
 let table_name = parts[parts.len() - 1].to_owned(); // &str → String ✅
 
 // Error-Variante mit owned String bauen: .to_owned() auf &str-Literal
@@ -46,7 +46,7 @@ let p: &std::path::Path   = std::path::Path::new("/tmp");
 let pb: std::path::PathBuf = p.to_path_buf(); // &Path → PathBuf ✅
 
 // Arc-Zeiger duplizieren: Arc::clone(&x) — kein Heap-Klon, nur Refcount++
-// (Muster aus apps/sgh-flow/src/app.rs:359, :366, :367, …)
+// (Muster aus apps/acme-app/src/app.rs:359, :366, :367, …)
 let handler_ref = Arc::clone(&audit_repo);  // ✅ explizit: Zeiger, nicht Inhalt
 let handler_ref2 = Arc::clone(&users_repo); // ✅
 

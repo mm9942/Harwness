@@ -1,6 +1,6 @@
 //! Der Nullzähler `audit_chain_break`: macht [`ChainAuditMirror`]s internen
 //! `chain_break_count` (`crate::audit::mirror`) unter einem benannten
-//! Telemetrieschlüssel auffindbar (Knoten AW7-04, Plan `docs/aw-plan.md`).
+//! Telemetrieschlüssel auffindbar (Knoten AW7-04, Plan `docs/design/build-history.md`).
 //!
 //! # Warum ein zweiter Zähler zur selben Zahl
 //! [`ChainAuditMirror::chain_break_count`](crate::audit::mirror::ChainAuditMirror::chain_break_count)

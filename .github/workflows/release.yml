@@ -52,11 +52,11 @@ jobs:
 
       - name: Build (cargo)
         if: ${{ !matrix.use_cross }}
-        run: cargo build --release --locked -p harw-cli --target ${{ matrix.target }}
+        run: cargo build --release --locked -p harw-cli -p harw-killer --target ${{ matrix.target }}
 
       - name: Build (cross)
         if: matrix.use_cross
-        run: cross build --release --locked -p harw-cli --target ${{ matrix.target }}
+        run: cross build --release --locked -p harw-cli -p harw-killer --target ${{ matrix.target }}
 
       - name: Package
         run: |
@@ -65,8 +65,8 @@ jobs:
           stage="harw-${tag}-${{ matrix.target }}"
           mkdir -p "$stage"
           cp "target/${{ matrix.target }}/release/${BIN_NAME}" "$stage/"
-          [ -f README.md ] && cp README.md "$stage/"
-          [ -f LICENSE ] && cp LICENSE "$stage/"
+          cp "target/${{ matrix.target }}/release/killer" "$stage/"
+          cp README.md LICENSE-MIT LICENSE-APACHE "$stage/"
           tar -czf "${stage}.tar.gz" "$stage"
           sha256sum "${stage}.tar.gz" > "${stage}.tar.gz.sha256"
 

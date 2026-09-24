@@ -29,7 +29,7 @@ fn longest<'a>(x: &'a str, y: &'a str) -> &'a str {
 ```rust
 // 'a bindet batch an die Ausgabe; col_name ist nur zum Nachschlagen,
 // beeinflusst die Ausgabe-Lifetime nicht.
-// Real: apps/sgh-flow/src/iceberg/handler.rs:983
+// Real: apps/acme-app/src/iceberg/handler.rs:983
 fn read_str_col<'a>(batch: &'a RecordBatch, col_name: &str, row: usize) -> Option<&'a str> {
     let col = batch.column_by_name(col_name)?;
     let arr = col.as_any().downcast_ref::<arrow_array::StringArray>()?;
@@ -39,7 +39,7 @@ fn read_str_col<'a>(batch: &'a RecordBatch, col_name: &str, row: usize) -> Optio
 
 ```rust
 // 'a bindet payload an Vec<&'a JsonValue>; key ist nur ein Schlüssel-String.
-// Real: apps/sgh-flow/src/db/repositories/invoice_read.rs:375
+// Real: apps/acme-app/src/db/repositories/invoice_read.rs:375
 fn section_entries<'a>(payload: &'a JsonValue, key: &str) -> Option<Vec<&'a JsonValue>> {
     match payload.get(key) {
         Some(JsonValue::Array(items)) => Some(items.iter().collect()),

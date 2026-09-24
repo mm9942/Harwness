@@ -27,7 +27,7 @@ use tokio::io::{AsyncRead, BufReader, AsyncBufReadExt};
 ///
 /// # Concurrency
 /// `R` muss `Send + 'static` sein, da der Stream in einem Tokio-Task läuft.
-// apps/sgh-flow/src/services/python_agent.rs:110-112
+// apps/acme-app/src/services/python_agent.rs:110-112
 async fn forward_python_stream<R>(reader: R, stream: &'static str, log_path: PathBuf)
 where
     R: AsyncRead + Unpin + Send + 'static,

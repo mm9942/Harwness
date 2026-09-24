@@ -38,7 +38,7 @@ fn first_sentence(text: &str) -> ImportantExcerpt<'_> {
 ```rust
 use std::borrow::Cow;
 
-// Real: apps/sgh-flow/src/services/python_agent.rs:43
+// Real: apps/acme-app/src/services/python_agent.rs:43
 // Enthält ein Log-Zeile keine ANSI-Sequenzen, wird der original &str
 // zurückgegeben (Cow::Borrowed). Enthält sie Sequenzen, entsteht ein
 // neuer String (Cow::Owned) — nur dann wird alloziert.
@@ -55,7 +55,7 @@ fn strip_ansi(s: &str) -> Cow<'_, str> {
 ```rust
 use std::borrow::Cow;
 
-// Real: apps/sgh-flow/src/api/invoice_validate.rs:187
+// Real: apps/acme-app/src/api/invoice_validate.rs:187
 // PDF-Bytes brauchen XML-Extraktion (Owned); plain XML kann direkt
 // weiterverarbeitet werden (Borrowed).
 let xml_bytes: Cow<'_, [u8]> = if bytes.starts_with(b"%PDF") {

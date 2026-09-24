@@ -1,7 +1,7 @@
 //! Relative Zeitangaben ("vor 5 min") für den Session-Picker.
 //!
 //! Spec-Quelle: Slice A6 des Kontraktdokuments
-//! `~/.claude/workspace/coding/planning/harw-scopes-contract.md`
+//! `docs/design/tui-command-contract.md`
 //! ("Schritt 7" / Session-Picker).
 //!
 //! # Verantwortung

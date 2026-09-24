@@ -2,7 +2,7 @@
 //!
 //! Spec: AW0-02-Brief, Abschnitt 2 (`metrics!`); Vertragsabschnitt A.2
 //! (`harw-observe`, `MetricKey`/`MetricKind`/`Unit`/`Cardinality`) in
-//! `docs/aw-contract-master.md`.
+//! `docs/design/build-history.md`.
 //!
 //! # Grammatik
 //!

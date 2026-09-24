@@ -4,7 +4,7 @@
 //! # Verantwortungsbereich
 //! Trägt [`FileSink`], den ersten echten Implementierer von
 //! [`harw_observe::TelemetrySink`] (Vertrag A.6,
-//! `docs/aw-contract-master.md`). Schreibt jeden `record()`-Aufruf als
+//! `docs/design/build-history.md`). Schreibt jeden `record()`-Aufruf als
 //! eine JSON-Zeile in eine anhängende Datei unter dem übergebenen
 //! Verzeichnis; sobald die aktive Datei `max_bytes` erreicht oder
 //! überschreitet, wird sie geschlossen, umbenannt und bekommt eine
@@ -309,7 +309,7 @@ impl TelemetrySink for FileSink {
 /// Liest die Systemuhr über `jiff::Timestamp::now()`: `record()` ist eine
 /// I/O-tragende Sink-Methode ohne injizierbaren `now`-Parameter (die
 /// Trait-Signatur ist in Vertrag A.3 eingefroren), keine "reine Funktion"
-/// im Sinn der Zeit-Doktrin im Kopfteil von `docs/aw-contract-master.md`.
+/// im Sinn der Zeit-Doktrin im Kopfteil von `docs/design/build-history.md`.
 fn build_jsonl_record(
     key: &MetricKey,
     value: MetricValue,

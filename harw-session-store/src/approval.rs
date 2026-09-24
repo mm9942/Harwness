@@ -24,8 +24,7 @@
 //!
 //! `ApprovalRecord::actor` ist der bei Ausstellung gebundene *Beantworter*,
 //! nicht der Anfragende. Eine Selbstgenehmigungsprüfung (Anfragender ==
-//! Beantworter) ist ohne neues Feld nicht möglich; siehe Ledger
-//! `docs/remediation/ledger/W3/C-APPR.md` (Folgearbeit A-APPR/WB-SRV).
+//! Beantworter) ist ohne neues Feld nicht möglich (Folgearbeit).
 //!
 //! # Nebenläufigkeit
 //! `ApprovalStore` ist zustandslos bis auf Pfad und TTL (`Send + Sync`).

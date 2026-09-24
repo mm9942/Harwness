@@ -16,7 +16,7 @@ cargo add tokio
 cargo add tokio --features rt-multi-thread,macros,net
 
 # In ein bestimmtes Workspace-Member (nicht cwd-abhängig)
-cargo add axum --features json -p sgh-s3iced
+cargo add axum --features json -p acme-s3iced
 
 # Genaue Version erzwingen (nur wenn Kompatibilität es verlangt — mit Kommentar begründen)
 cargo add serde@1.0.150 --features derive
@@ -57,7 +57,7 @@ Ursache: `axum 0.8.0` pinnt `matchit` **exakt** (`=0.8.4`), aber `vectory-api` v
 
 ```bash
 # axum auf die neueste 0.8.x heben — die nutzt matchit 0.9 statt =0.8.4
-cargo add axum -p sgh-s3iced
+cargo add axum -p acme-s3iced
 # → schreibt z.B. axum = "0.8.6"; Konflikt verschwindet, weil 0.8.6 den harten Pin gelockert hat
 ```
 

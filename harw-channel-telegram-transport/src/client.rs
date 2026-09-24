@@ -758,7 +758,7 @@ mod tests {
         );
 
         let private: SentMessage = serde_json::from_str(
-            r#"{"message_id":5,"from":{"id":1,"is_bot":true,"first_name":"Harw"},"chat":{"id":42,"first_name":"Mia","type":"private"},"date":1758700001,"text":"ok"}"#,
+            r#"{"message_id":5,"from":{"id":1,"is_bot":true,"first_name":"Harw"},"chat":{"id":42,"first_name":"Alice","type":"private"},"date":1758700001,"text":"ok"}"#,
         )
         .map_err(ctx("private sendMessage result must deserialize"))?;
         assert_eq!(private.chat_id, 42);

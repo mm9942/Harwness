@@ -1,8 +1,7 @@
 //! Session-Picker: filterbare Liste vergangener Sitzungen zum Fortsetzen.
 //!
 //! Spec-Quelle: Slice A6 des Kontraktdokuments
-//! `~/.claude/workspace/coding/planning/harw-scopes-contract.md`
-//! ("Schritt 7" von `~/.claude/plans/nope-permissions-gibt-es-wild-lobster.md`).
+//! `docs/design/tui-command-contract.md`.
 //! Struktur und Rendering-Stil sind bewusst an [`crate::command_popup`]
 //! angelehnt (selbstzeichnendes Widget, `on_key`/`handle_key`-Muster,
 //! theme-abhängige Stile aus [`crate::style`]).

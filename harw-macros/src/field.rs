@@ -1,7 +1,7 @@
 //! `field!`-Expansion — validierte Feldnamen für `harw-observe`.
 //!
 //! Spec: AW0-02-Brief, Abschnitt 1 (`field!`); Vertragsabschnitt A.1
-//! (`harw-observe`, `FieldName`) in `docs/aw-contract-master.md`.
+//! (`harw-observe`, `FieldName`) in `docs/design/build-history.md`.
 //!
 //! # Zweck
 //! `::harw_observe::FieldName` hat bewusst keinen öffentlichen validierenden

@@ -463,7 +463,7 @@ pub struct ResolvedFamily {
 /// Ein Layer, der die Basis patches, trägt Einträge in seiner `patch`-Tabelle:
 /// ```toml
 /// [patch.orchestrators.allowed]
-/// append = ["mia.agent.custom-orchestrator@1"]
+/// append = ["alice.agent.custom-orchestrator@1"]
 ///
 /// [patch.workers.allowed]
 /// remove = ["harwness.agent.focused-docs-update@1"]
@@ -1000,7 +1000,7 @@ context_policy = "harwness.context.coding-orchestrator@1"
         allowed_table.insert(
             "append".to_owned(),
             toml::Value::Array(vec![toml::Value::String(
-                "mia.agent.rust-pqc-pure-coder@1".to_owned(),
+                "alice.agent.rust-pqc-pure-coder@1".to_owned(),
             )]),
         );
         workers_table.insert("allowed".to_owned(), toml::Value::Table(allowed_table));
@@ -1017,7 +1017,7 @@ context_policy = "harwness.context.coding-orchestrator@1"
         assert!(
             resolved
                 .workers
-                .contains(&def_ref("mia.agent.rust-pqc-pure-coder@1")?)
+                .contains(&def_ref("alice.agent.rust-pqc-pure-coder@1")?)
         );
         Ok(())
     }
@@ -1294,7 +1294,7 @@ name = "Minimal Family"
             allowed_table.insert(
                 "append".to_owned(),
                 toml::Value::Array(vec![toml::Value::String(
-                    "mia.agent.rust-pqc-pure-coder@1".to_owned(),
+                    "alice.agent.rust-pqc-pure-coder@1".to_owned(),
                 )]),
             );
             workers_table.insert("allowed".to_owned(), toml::Value::Table(allowed_table));
@@ -1324,7 +1324,7 @@ name = "Minimal Family"
         assert!(
             resolved
                 .workers
-                .contains(&def_ref("mia.agent.rust-pqc-pure-coder@1")?)
+                .contains(&def_ref("alice.agent.rust-pqc-pure-coder@1")?)
         );
         // Trace: 1 base + 2 patches
         assert_eq!(resolved.trace.steps.len(), 3);

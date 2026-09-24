@@ -141,7 +141,7 @@ impl AtomicWriteOptions {
 /// use std::path::Path;
 ///
 /// write_atomic(
-///     Path::new("/home/mia/.harw/state.json"),
+///     Path::new("/home/user/.harw/state.json"),
 ///     br#"{"version":1}"#,
 ///     AtomicWriteOptions { mode: 0o644, fsync_dir: false },
 /// )?;

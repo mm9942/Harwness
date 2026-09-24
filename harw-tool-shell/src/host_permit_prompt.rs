@@ -1,8 +1,7 @@
 //! Fragekanal für Host-Profil-Permit-Anfragen zwischen [`crate::exec::ShellExecutor`]
 //! und einer anzeigenden Oberfläche (z. B. `harw-tui`).
 //!
-//! Spec source: `/home/mia/.claude/plans/recursive-cooking-lobster.md`, Teil B5
-//! (`SANDBOX_LEASE_WORKER_DEFINITION`) und Teil B3 (`HostPermitHandles`).
+//! Covers `SANDBOX_LEASE_WORKER_DEFINITION` and `HostPermitHandles`.
 //!
 //! # Verantwortungsbereich
 //! Dieses Modul besitzt genau den Vertrag, über den [`crate::exec::ShellExecutor`]
@@ -119,8 +118,8 @@ pub fn host_permit_prompt_channel() -> (HostPermitPromptSender, HostPermitPrompt
     mpsc::unbounded_channel()
 }
 
-/// Einzige Worker-Definition der `sandbox-lease`-Operation (Plan
-/// `recursive-cooking-lobster.md` Teil B5, `harw-ops/src/sandbox_lease.rs`):
+/// Einzige Worker-Definition der `sandbox-lease`-Operation
+/// (`harw-ops/src/sandbox_lease.rs`):
 /// eine über das Modell-Tool direkt angefragte Host-Freigabe trägt diesen
 /// Wert als [`HostPermitPrompt::worker_definition`], statt eines
 /// eingebetteten Host-Profil-Workers wie [`HostPermitPrompt`] es sonst

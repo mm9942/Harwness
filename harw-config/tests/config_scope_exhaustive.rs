@@ -238,7 +238,7 @@ fn test_field_table_exhaustive_mcp_principal_toml() -> TestResult {
         id: "p1".to_owned(),
         credential_ref: SecretRef::from_str("env:P1_TOKEN")
             .map_err(ctx("env:P1_TOKEN secret ref"))?,
-        tenant: "mia".to_owned(),
+        tenant: "alice".to_owned(),
         workspace: "harwness".to_owned(),
         job_capabilities: vec![],
     };

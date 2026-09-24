@@ -199,7 +199,7 @@ pub struct SecurityVerdict {
 }
 
 impl SecurityVerdict {
-    /// Stabiles Label dieses Vertrags (`docs/aw-plan.md`, Knoten AW6-02;
+    /// Stabiles Label dieses Vertrags (`docs/design/build-history.md`, Knoten AW6-02;
     /// `harw-registry-defaults/agents/families/security/security.toml`,
     /// `[defaults] return_contract`). Wortwörtlich übernommen — eine
     /// Abweichung im Namen würde die dortige Vorgabe wirkungslos machen,

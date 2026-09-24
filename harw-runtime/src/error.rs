@@ -1,7 +1,7 @@
 //! Fehler der Runtime-Montage (`RuntimeError`).
 //!
 //! # Beschreibung
-//! Eine Variante je Montagephase (Vertrag `docs/remediation/CONTRACTS.md`
+//! Eine Variante je Montagephase (Vertrag `docs/design/runtime-contracts.md`
 //! §runtime-spec). Jede Variante trägt eine menschenlesbare `detail`-Angabe;
 //! die Montage-Wellen (W2b/W2c) übersetzen die Fehler der jeweiligen
 //! Fach-Crates an der Aufrufstelle in diese Form. `Display`,

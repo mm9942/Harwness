@@ -1,6 +1,5 @@
 //! `[permissions]` — persistente Freigabe-Policy (Contract
-//! `harw-scopes-contract.md` §2/§5 Zeile A2; Plan
-//! `nope-permissions-gibt-es-wild-lobster.md` Schritt 4).
+//! `docs/design/config-scopes.md` §2/§5).
 //!
 //! `default_mode` liegt üblicherweise in der User-Ebene
 //! (`~/.harw/config.toml`), `[[permissions.allow]]`/`[[permissions.deny]]`
@@ -177,7 +176,7 @@ mod tests {
         let src = r#"
             default_mode = "auto"
             approval_timeout_secs = 60
-            extra_roots = ["/home/mia/scratch"]
+            extra_roots = ["/home/user/scratch"]
 
             [[allow]]
             tool = "shell.exec"
@@ -197,7 +196,7 @@ mod tests {
         assert!(section.deny[0].pattern.is_none());
         assert_eq!(
             section.extra_roots,
-            vec![PathBuf::from("/home/mia/scratch")]
+            vec![PathBuf::from("/home/user/scratch")]
         );
         assert!(section.validate().is_ok());
 

@@ -25,7 +25,7 @@ use std::borrow::Cow;
 // Gibt Cow::Borrowed zurück wenn nichts zu tun — null Allokation.
 // Gibt Cow::Owned zurück wenn ANSI entfernt werden musste.
 //
-// Realer Code: apps/sgh-flow/src/services/python_agent.rs:43
+// Realer Code: apps/acme-app/src/services/python_agent.rs:43
 fn strip_ansi(s: &str) -> Cow<'_, str> {
     if !s.contains('\x1b') {
         return Cow::Borrowed(s);   // ✅ kein Alloc — nur Pointer
@@ -54,7 +54,7 @@ tracing::debug!(line = %line, "processed log");
 
 ```rust
 // Bytes: entweder PDF-embedded XML direkt oder konvertiert
-// Realer Code: apps/sgh-flow/src/api/invoice_validate.rs:187
+// Realer Code: apps/acme-app/src/api/invoice_validate.rs:187
 let xml_bytes: Cow<'_, [u8]> = if bytes.starts_with(b"%PDF") {
     Cow::Owned(extract_xml_from_pdf(bytes)?)   // ✅ alloziert nur für PDFs
 } else {

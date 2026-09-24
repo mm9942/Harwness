@@ -103,6 +103,8 @@ version = "0.3.0"
 publish = false
 edition = "2024"
 rust-version = "1.85"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/mm9942/harwness"
 
 # Genau eine Fassung je geteilter Abhängigkeit. Ohne diesen Abschnitt stand
 # `jiff` in fünf Schreibweisen und drei Fassungen im Baum (0.2 / 0.2.28 /

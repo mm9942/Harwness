@@ -104,8 +104,7 @@ const FENCED_LINE_BREAK: &str = "\n| ";
 /// Model-facing rendering of one tool result.
 ///
 /// # Description
-/// Produced only by [`render_tool_result`]. Field set frozen by W3 C-PROTO
-/// (ledger `docs/remediation/ledger/W3/C-PROTO.md`).
+/// Produced only by [`render_tool_result`]. Field set is frozen (wire format).
 ///
 /// # Concurrency
 /// Plain owned value, `Send + Sync`.

@@ -2,7 +2,7 @@
 
 **Regel:** Nutze Generics (`<T: Trait>`) wenn alle Werte denselben konkreten Typ haben und Performance wichtig ist; nutze `Arc<dyn Trait>` / `Box<dyn Trait>` wenn eine Sammlung verschiedene Implementierungen halten muss (Plugin-Muster, Dependency Injection, Test-Mocks).
 
-**Warum:** Generics werden zur Compile-Zeit monomorphisiert — der Compiler emittiert eine Kopie der Funktion pro konkretem Typ. Das erlaubt Inlining und hat null vtable-Overhead, erzwingt aber Homogenität. `dyn Trait` hingegen löst den Methodenaufruf per vtable zur Laufzeit auf: geringe Kosten (~ns), dafür ist jede Implementierung einzeln austauschbar ohne Recompilierung des Aufrufers. Im sgh-flow-Stil sind Repositories genau dieser Fall: ein `AppState` hält viele verschiedene Repos als `Arc<dyn …>` damit Tests Mock-Implementierungen einstecken können.
+**Warum:** Generics werden zur Compile-Zeit monomorphisiert — der Compiler emittiert eine Kopie der Funktion pro konkretem Typ. Das erlaubt Inlining und hat null vtable-Overhead, erzwingt aber Homogenität. `dyn Trait` hingegen löst den Methodenaufruf per vtable zur Laufzeit auf: geringe Kosten (~ns), dafür ist jede Implementierung einzeln austauschbar ohne Recompilierung des Aufrufers. Im acme-app-Stil sind Repositories genau dieser Fall: ein `AppState` hält viele verschiedene Repos als `Arc<dyn …>` damit Tests Mock-Implementierungen einstecken können.
 
 ## Falsch
 
@@ -27,7 +27,7 @@ use std::sync::Arc;
 /// # Concurrency
 /// Alle `Arc<dyn …>`-Felder sind `Send + Sync` (durch den Trait-Bound sichergestellt).
 /// Clone des `AppState` ist billig: es werden nur Arc-Pointer kopiert.
-// apps/sgh-flow/src/app.rs:180-207
+// apps/acme-app/src/app.rs:180-207
 struct AppState {
     pub invoice_read: Arc<dyn InvoiceReadRepository>,
     pub invoice_list: Arc<dyn InvoiceListRepository>,

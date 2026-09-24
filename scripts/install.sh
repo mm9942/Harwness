@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# Harwness installer — installs `harw` either by building from source or by
-# downloading a prebuilt release binary.
+# Harwness installer — installs `harw` and `killer` either by building from
+# source or by downloading a prebuilt release tarball.
 #
 # Usage:
 #   scripts/install.sh [--help]
@@ -8,12 +8,18 @@
 #   scripts/install.sh --binary [--version TAG] # download a prebuilt release tarball
 #
 # Modes:
-#   --source   Build `harw` with `cargo build --release` (needs a Rust toolchain).
-#              This is the default when `cargo` is on PATH.
+#   --source   Build `harw` and `killer` with `cargo build --release` (needs
+#              a Rust toolchain). This is the default when `cargo` is on
+#              PATH. If `make` is also available, this delegates to
+#              `make install BINDIR=…` (the repo's single entry point,
+#              see the root Makefile) instead of calling cargo directly.
 #   --binary   Download a release tarball instead of building. This is the
 #              default when `cargo` is NOT on PATH. Requires HARW_REPO (see
 #              below) unless run inside a git checkout of the Harwness repo,
-#              in which case the origin remote is used to find it.
+#              in which case the origin remote is used to find it. The
+#              tarball contains `harw`, `killer`, `LICENSE-MIT`,
+#              `LICENSE-APACHE` and `README.md`; only the two binaries are
+#              installed.
 #
 # Environment:
 #   HARW_INSTALL_DIR   Target bin directory (default: $HOME/.local/bin)
@@ -26,7 +32,7 @@
 #
 # The installer is idempotent: it never duplicates PATH entries, never
 # overwrites an existing ~/.harw configuration (that is `harw`'s own job on
-# first run), and re-running it simply re-installs the same binary.
+# first run), and re-running it simply re-installs the same binaries.
 set -euo pipefail
 
 usage() {
@@ -83,15 +89,24 @@ fi
 install_from_source() {
   command -v cargo >/dev/null 2>&1 || die "cargo not found — install Rust via https://rustup.rs and re-run, or use --binary"
 
-  log "Building harw (release)…"
-  ( cd "$repo_root" && cargo build -p harw-cli --release )
+  if command -v make >/dev/null 2>&1 && [ -f "$repo_root/Makefile" ]; then
+    log "Building and installing harw + killer via 'make install'…"
+    ( cd "$repo_root" && make install BINDIR="$install_dir" )
+    return 0
+  fi
 
-  built="$repo_root/target/release/harw"
-  [ -x "$built" ] || die "build did not produce $built"
+  log "Building harw + killer (release)…"
+  ( cd "$repo_root" && cargo build --release --bin harw --bin killer )
+
+  built_harw="$repo_root/target/release/harw"
+  built_killer="$repo_root/target/release/killer"
+  [ -x "$built_harw" ] || die "build did not produce $built_harw"
+  [ -x "$built_killer" ] || die "build did not produce $built_killer"
 
   mkdir -p "$install_dir"
-  install -m 0755 "$built" "$install_dir/harw"
-  log "Installed $install_dir/harw"
+  install -m 0755 "$built_harw" "$install_dir/harw"
+  install -m 0755 "$built_killer" "$install_dir/killer"
+  log "Installed $install_dir/harw and $install_dir/killer"
 }
 
 # --- Mode: binary --------------------------------------------------------------
@@ -211,13 +226,18 @@ install_from_binary() {
   log "Extracting…"
   tar -xzf "$work_dir/$asset" -C "$work_dir"
 
-  extracted_bin="$(find "$work_dir" -type f -name harw -perm -u+x | head -n1)"
-  [ -n "$extracted_bin" ] || extracted_bin="$(find "$work_dir" -type f -name harw | head -n1)"
-  [ -n "$extracted_bin" ] || die "downloaded archive did not contain a 'harw' binary"
+  extracted_harw="$(find "$work_dir" -type f -name harw -perm -u+x | head -n1)"
+  [ -n "$extracted_harw" ] || extracted_harw="$(find "$work_dir" -type f -name harw | head -n1)"
+  [ -n "$extracted_harw" ] || die "downloaded archive did not contain a 'harw' binary"
+
+  extracted_killer="$(find "$work_dir" -type f -name killer -perm -u+x | head -n1)"
+  [ -n "$extracted_killer" ] || extracted_killer="$(find "$work_dir" -type f -name killer | head -n1)"
+  [ -n "$extracted_killer" ] || die "downloaded archive did not contain a 'killer' binary"
 
   mkdir -p "$install_dir"
-  install -m 0755 "$extracted_bin" "$install_dir/harw"
-  log "Installed $install_dir/harw ($tag, $target)"
+  install -m 0755 "$extracted_harw" "$install_dir/harw"
+  install -m 0755 "$extracted_killer" "$install_dir/killer"
+  log "Installed $install_dir/harw and $install_dir/killer ($tag, $target)"
 }
 
 # --- Run ----------------------------------------------------------------------

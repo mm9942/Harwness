@@ -148,7 +148,7 @@ struct PendingDir {
 /// use std::path::Path;
 ///
 /// let limits = WalkLimits { max_depth: 4, max_entries: 1_000, deadline: None };
-/// let mut walk = walk_beneath(Path::new("/home/mia/.harw/memory"), limits)?;
+/// let mut walk = walk_beneath(Path::new("/home/user/.harw/memory"), limits)?;
 /// for entry in walk.by_ref() {
 ///     let entry = entry?;
 ///     if entry.entry_type == EntryType::File {

@@ -1,7 +1,6 @@
 //! Shell-execution tool provider and executor for Harwness.
 //!
-//! Spec source: `/home/nutzerin/.claude/plans/recursive-cooking-lobster.md`, Teil B1
-//! ("Echte Host-Ausführung") and Teil C2 (`ShellToolProvider::with_host_path`).
+//! Covers real host execution and `ShellToolProvider::with_host_path`.
 //!
 //! **Security note**: By default this executor launches `/bin/sh -c` only through a
 //! Bubblewrap plan derived from the per-call sandbox; failure to build or spawn that
@@ -126,8 +125,7 @@ const SETSID_FIXED_CANDIDATES: [&str; 2] = ["/usr/bin/setsid", "/bin/setsid"];
 const HOST_WORKER_DEFINITION: &str = "host-process-worker@1";
 /// Dauer einer per lokaler UI bestätigten Host-Sitzungsfreigabe, bevor sie
 /// ohne explizites Sitzungsende automatisch verfällt (Verteidigungslinie
-/// gegen eine vergessene, nie beendete Sitzung). Öffentlich (Plan
-/// `recursive-cooking-lobster.md` Teil B5), weil `harw-ops`'
+/// gegen eine vergessene, nie beendete Sitzung). Öffentlich, weil `harw-ops`'
 /// `sandbox-lease`-Operation dieselbe TTL für
 /// [`harw_sandbox::HostPermitSessionRegistry::mark_session_approved`]
 /// verwendet, statt sie eigenständig zu duplizieren.
@@ -141,8 +139,8 @@ const HOST_SINGLE_EXECUTION_TTL: Duration = Duration::from_secs(5 * 60);
 /// Vorgabe-Wartezeit auf **eine** Nutzerentscheidung auf eine offene
 /// [`HostPermitPrompt`]. Läuft sie ab, gilt das als Ablehnung
 /// (fail-closed) — deckt sich mit
-/// `harw_tui::host_permit_dialog::DEFAULT_HOST_PERMIT_TIMEOUT`. Öffentlich
-/// (Plan `recursive-cooking-lobster.md` Teil B5), weil `harw-ops`'
+/// `harw_tui::host_permit_dialog::DEFAULT_HOST_PERMIT_TIMEOUT`. Öffentlich,
+/// weil `harw-ops`'
 /// `sandbox-lease`-Operation dieselbe Wartezeit für ihre eigene
 /// [`HostPermitPrompt`] verwendet.
 pub const HOST_PERMIT_PROMPT_TIMEOUT: Duration = Duration::from_secs(300);
@@ -1379,14 +1377,13 @@ pub struct ShellToolProvider {
     /// Wartezeit auf eine einzelne Nutzerentscheidung auf eine offene Frage,
     /// bevor sie fail-closed als Ablehnung gilt.
     pub host_permit_timeout: Duration,
-    /// Host-PATH-Bindung für den `bwrap`-Sandbox-Pfad (Plan
-    /// `recursive-cooking-lobster.md` Teil C2, gesetzt über
-    /// [`Self::with_host_path`]). Reicht unverändert an
+    /// Host-PATH-Bindung für den `bwrap`-Sandbox-Pfad, gesetzt über
+    /// [`Self::with_host_path`]. Reicht unverändert an
     /// [`harw_sandbox::BwrapLauncher::with_host_path`] durch, sobald
     /// `run_command` tatsächlich einen `bwrap`-Plan baut; wirkungslos für den
-    /// Host-Pfad aus Plan Teil B1, der ohnehin ohne `bwrap` läuft.
+    /// Host-Pfad, der ohnehin ohne `bwrap` läuft.
     pub host_path: Option<HostPathBinding>,
-    /// Runde 5, Teil N: Verdrahtung für Host-Mode-Anfragen (`request_host`)
+    /// Verdrahtung für Host-Mode-Anfragen (`request_host`)
     /// aus dem Agentenbaum; nur die TUI setzt sie
     /// ([`Self::with_host_escalation`]). `None` heißt: jede Anfrage endet
     /// fail-closed mit [`crate::HOST_MODE_REQUIRES_TUI_MSG`].
@@ -1478,8 +1475,7 @@ impl ShellToolProvider {
         self
     }
 
-    /// Setzt die Host-PATH-Bindung für den `bwrap`-Sandbox-Pfad (Plan
-    /// `recursive-cooking-lobster.md` Teil C2).
+    /// Setzt die Host-PATH-Bindung für den `bwrap`-Sandbox-Pfad.
     ///
     /// # Description
     /// Reicht `binding` unverändert an
@@ -2755,7 +2751,7 @@ mod tests {
         cancel_none_behaves_exactly_as_before
     );
 
-    // ── Host-Pfad-Tests (Plan `recursive-cooking-lobster.md` Teil B1) ──────
+    // ── Host-Pfad-Tests ──────────────────────────────────────────────────
 
     #[tokio::test]
     async fn test_determine_effective_host_strict_without_registry_is_false() -> TestResult {

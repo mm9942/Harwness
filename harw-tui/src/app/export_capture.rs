@@ -325,18 +325,18 @@ mod tests {
     /// `~` und `$HOME` werden expandiert, die JSON-Endung stimmt.
     #[test]
     fn tilde_and_home_expand_and_json_gets_its_extension() -> TestResult {
-        let home = Path::new("/home/nutzerin");
+        let home = Path::new("/home/user");
         assert_eq!(
             export_target_path_with("~/x.md", ExportOutputFormat::Markdown, Some(home), "1"),
-            PathBuf::from("/home/nutzerin/x.md")
+            PathBuf::from("/home/user/x.md")
         );
         assert_eq!(
             export_target_path_with("$HOME/d/x.json", ExportOutputFormat::Json, Some(home), "1"),
-            PathBuf::from("/home/nutzerin/d/x.json")
+            PathBuf::from("/home/user/d/x.json")
         );
         assert_eq!(
             export_target_path_with("~/exporte/", ExportOutputFormat::Json, Some(home), "42"),
-            PathBuf::from("/home/nutzerin/exporte/harw-export-42.json")
+            PathBuf::from("/home/user/exporte/harw-export-42.json")
         );
         let dir = tempfile::tempdir().map_err(ctx("tempdir"))?;
         let raw = dir.path().to_string_lossy().into_owned();

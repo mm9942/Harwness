@@ -1791,7 +1791,7 @@ mod tests {
                 harw_types::TenantId::from_str("test-tenant"),
                 harw_types::WorkspaceId::from_str("test-workspace"),
                 ApprovalActor::Operator {
-                    id: "mia".to_owned(),
+                    id: "alice".to_owned(),
                 },
             ),
             input: json!({"task": "review"}),
@@ -1818,9 +1818,9 @@ mod tests {
         let mut principals = PrincipalRegistry::new();
         principals
             .try_insert(
-                "mia-owner".to_owned(),
+                "alice-owner".to_owned(),
                 test_principal(
-                    "mia",
+                    "alice",
                     vec![
                         McpJobCapability::SubmitOwn,
                         McpJobCapability::ReadOwn,
@@ -1834,7 +1834,7 @@ mod tests {
         principals
             .try_insert(
                 "someone-else".to_owned(),
-                test_principal("not-mia", vec![McpJobCapability::ReadOwn]),
+                test_principal("not-alice", vec![McpJobCapability::ReadOwn]),
             )
             .map_err(ctx("unique principal id registers"))?;
 
@@ -1847,7 +1847,7 @@ mod tests {
                 session_ttl: SignedDuration::from_secs(60),
             },
             Arc::new(StaticBearerAuthenticator::new(vec![
-                ("mia-owner".to_owned(), b"mia-token".to_vec()),
+                ("alice-owner".to_owned(), b"alice-token".to_vec()),
                 ("someone-else".to_owned(), b"other-token".to_vec()),
             ])),
             principals,
@@ -1865,7 +1865,7 @@ mod tests {
         let initialize = round_trip(
             address,
             post_request_as(
-                "mia-token",
+                "alice-token",
                 &json!({
                     "jsonrpc": "2.0",
                     "id": 1,
@@ -1883,7 +1883,7 @@ mod tests {
         round_trip(
             address,
             post_request_as(
-                "mia-token",
+                "alice-token",
                 &json!({"jsonrpc":"2.0", "method":"notifications/initialized"}),
                 &format!("Mcp-Session-Id: {id}\r\nMcp-Protocol-Version: {VERSION}\r\n"),
             ),
@@ -1896,7 +1896,7 @@ mod tests {
         let tool_catalog = round_trip(
             address,
             post_request_as(
-                "mia-token",
+                "alice-token",
                 &json!({"jsonrpc":"2.0", "id":2, "method":"tools/list"}),
                 &format!("Mcp-Session-Id: {id}\r\nMcp-Protocol-Version: {VERSION}\r\n"),
             ),
@@ -1909,7 +1909,7 @@ mod tests {
         let submitted = round_trip(
             address,
             post_request_as(
-                "mia-token",
+                "alice-token",
                 &json!({
                     "jsonrpc": "2.0",
                     "id": 3,
@@ -2020,7 +2020,7 @@ mod tests {
             let invalid_submit = round_trip(
                 address,
                 post_request_as(
-                    "mia-token",
+                    "alice-token",
                     &json!({
                         "jsonrpc": "2.0",
                         "id": request_id,
@@ -2044,7 +2044,7 @@ mod tests {
         let status_call = round_trip(
             address,
             post_request_as(
-                "mia-token",
+                "alice-token",
                 &json!({
                     "jsonrpc": "2.0",
                     "id": 8,
@@ -2062,7 +2062,7 @@ mod tests {
         let cancelled = round_trip(
             address,
             post_request_as(
-                "mia-token",
+                "alice-token",
                 &json!({
                     "jsonrpc": "2.0",
                     "id": 9,
@@ -2120,7 +2120,7 @@ mod tests {
         let submitted_without_subscriber = round_trip(
             address,
             post_request_as(
-                "mia-token",
+                "alice-token",
                 &json!({
                     "jsonrpc": "2.0",
                     "id": 10,
@@ -2279,7 +2279,7 @@ mod tests {
             Some(json!(1)),
             &McpSupervisorError::JobStore(SessionStoreError::CorruptJob {
                 work_id: harw_types::WorkId::from_str("work-secret-path"),
-                detail: "/home/mia/.harw/profiles/default/jobs/work-secret-path.json".to_owned(),
+                detail: "/home/user/.harw/profiles/default/jobs/work-secret-path.json".to_owned(),
             }),
         );
         let corrupt = body_of(corrupt).await?;

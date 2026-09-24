@@ -2,7 +2,7 @@
 //!
 //! # Verantwortungsbereich
 //! Trägt [`OtlpError`], den einen Fehlertyp dieser Crate (Vertrag §H.1,
-//! `docs/aw-contract-master.md`). Alle drei Varianten entstehen ausschließlich
+//! `docs/design/build-history.md`). Alle drei Varianten entstehen ausschließlich
 //! intern, in `crate::schema` (Zeitumrechnung, JSON-Serialisierung) und
 //! [`crate::OtlpTransport`]-Implementierungen (Zustellfehler);
 //! [`crate::OtlpSink::record`] und `::flush` geben `()` zurück (Vertrag

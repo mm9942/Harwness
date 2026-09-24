@@ -23,7 +23,7 @@ fn seal(pk: &[u8], pt: &[u8]) -> anyhow::Result<Vec<u8>> { /* ... */ }
 ## Richtig
 
 ```rust
-// Datei: sgh-secureHUB/crates/securehub-crypto/src/dispatch.rs:40-47
+// Datei: acme-secure-hub/crates/securehub-crypto/src/dispatch.rs:40-47
 macro_rules! seal_arm {
     ($kem:ty, $aead:ty, $pk:expr, $pt:expr) => {
         Encryptor::<$kem, $aead>::new()

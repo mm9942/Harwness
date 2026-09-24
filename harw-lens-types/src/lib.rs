@@ -15,7 +15,7 @@
 //! - [`error`]: der eine Fehlertyp dieser Crate.
 //!
 //! `#![forbid(unsafe_code)]` kommt bereits aus `[workspace.lints]`
-//! (`docs/aw-contract-master.md`) und wird hier nicht erneut gesetzt.
+//! (`docs/design/build-history.md`) und wird hier nicht erneut gesetzt.
 //!
 //! # Nebenläufigkeit
 //! Alle exportierten Typen sind reine Daten; [`CostEstimator`] ist

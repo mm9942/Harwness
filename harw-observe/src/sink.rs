@@ -2,7 +2,7 @@
 //!
 //! # Verantwortungsbereich
 //! Trägt [`TelemetrySink`] und [`NullSink`] (Vertrag A.3,
-//! `docs/aw-contract-master.md`). Kennt kein Backend — jeder echte Sink
+//! `docs/design/build-history.md`). Kennt kein Backend — jeder echte Sink
 //! (Datei, Prometheus, OTLP) lebt in einer eigenen Crate und implementiert
 //! diesen Trait. `harw-observe-file` ist der erste echte Implementierer.
 //!

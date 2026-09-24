@@ -47,7 +47,7 @@ document containing, for every file being migrated:
   pull these from CLAUDE.md/AGENTS.md so every subagent inherits them without re-deriving).
 
 Store it at a stable path subagents can all read (e.g.
-`~/.claude/workspace/coding/development/<task>-contract.md`). This document is the only thing
+`docs/contracts/<task>-contract.md` in the repository). This document is the only thing
 that lets 15+ agents who never see each other's output produce mutually-compatible code.
 
 ## 2. Spawn file-orchestrators, not subagents, directly
@@ -87,7 +87,7 @@ where signature drift between subagents likes to hide.
 
 - Don't reach for this pattern by default — it costs roughly 4x the agent-spawns of a single
   development-orchestrator pass for the same LOC. Confirm with the user first if the task size
-  doesn't obviously justify it (see `[[sgh-s3iced-axum-migration-fanout]]` memory for a concrete
+  doesn't obviously justify it (see `[[acme-s3iced-axum-migration-fanout]]` memory for a concrete
   precedent where the user confirmed the full pattern despite the small LOC count).
 - If a file-orchestrator's subagents disagree on a signature the Contract Master didn't specify,
   that's a Contract Master gap — the file-orchestrator resolves it by following the majority/most

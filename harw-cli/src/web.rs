@@ -76,7 +76,7 @@
 //!   [`crate::runtime_web::narrow_web_sandbox`] `assembly.sandbox()` auf das
 //!   Tier des Peers. Ein `Observer`-Peer bekommt damit nur `ReadWorkspace` —
 //!   und, weil die Web-Decke laut Reduktionstabelle ([`EntryKind::Web`],
-//!   `docs/remediation/CONTRACTS.md:106`) für **alle** Tiers `{ReadWorkspace}`
+//!   `docs/design/runtime-contracts.md` §runtime-spec) für **alle** Tiers `{ReadWorkspace}`
 //!   ist, bekommt selbst ein `Owner`-Peer nie mehr als das: das Tier verengt
 //!   nur innerhalb dieser Decke, es hebt sie nie an. Eine Anhebung der Decke
 //!   (z. B. Schreibrechte für `Owner` im Web) ist keine Entscheidung dieses

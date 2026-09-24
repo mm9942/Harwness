@@ -31,7 +31,7 @@
 //!   Crate-Root re-exportiert, siehe unten).
 //!
 //! `#![forbid(unsafe_code)]` kommt bereits aus `[workspace.lints]`
-//! (`docs/aw-contract-master.md`) und wird hier nicht erneut gesetzt.
+//! (`docs/design/build-history.md`) und wird hier nicht erneut gesetzt.
 //!
 //! # Nebenläufigkeit
 //! Alle vier öffentlichen Funktionen sind reine Funktionen ohne interne

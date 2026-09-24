@@ -20,7 +20,7 @@ fn load(path: &str) -> Result<Config, AppError> {
 ## Richtig
 
 ```rust
-// Datei: apps/sgh-flow/src/error.rs:389–437
+// Datei: apps/acme-app/src/error.rs:389–437
 // Einmalig in error.rs definieren:
 
 impl From<io::Error> for AppError {
@@ -59,14 +59,14 @@ async fn load_and_store(path: &str, pool: &sqlx::PgPool) -> Result<(), AppError>
 Verschachtelte Fehlertypen (`IcebergError` → `AppError`) folgen demselben Muster:
 
 ```rust
-// Datei: apps/sgh-flow/src/error.rs:461
+// Datei: apps/acme-app/src/error.rs:461
 impl From<IcebergError> for AppError {
     fn from(value: IcebergError) -> Self {
         Self::Iceberg(value)
     }
 }
 
-// Datei: apps/sgh-flow/src/iceberg/error.rs:86–100
+// Datei: apps/acme-app/src/iceberg/error.rs:86–100
 impl From<iceberg::Error> for IcebergError {
     fn from(e: iceberg::Error) -> Self { IcebergError::Catalog(e) }
 }
@@ -83,7 +83,7 @@ impl From<serde_json::Error> for IcebergError {
 Sonderfall: wenn ein fremder Fehler keine sinnvolle Variante hat (z.B. ein Channel-Send-Fehler, der immer bedeutet "Empfänger tot"), kann `From` den Kontext verwerfen:
 
 ```rust
-// Datei: apps/sgh-flow/src/error.rs:407–410
+// Datei: apps/acme-app/src/error.rs:407–410
 impl From<broadcast::error::SendError<crate::events::InvoiceEvent>> for AppError {
     fn from(_: broadcast::error::SendError<crate::events::InvoiceEvent>) -> Self {
         Self::BroadcastClosed  // Kontext unwichtig — Variante trägt genug Bedeutung

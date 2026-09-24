@@ -48,13 +48,13 @@
 //!
 //! Es bleibt also bei einer **handgepflegten Tabelle**
 //! ([`CRATE_PRIVILEGE`]) — ausdrücklich benannt, nicht versteckt: das ist
-//! genau die Machtstruktur, gegen die `gate_writescopes.rs` mit gutem Grund
+//! genau die Machtstruktur, gegen die das frühere Schreibbereichs-Gate mit gutem Grund
 //! antritt ("ein unvollständiges Prüfinstrument ist schlechter als keins,
 //! weil es Sicherheit suggeriert"). Der Unterschied, der diese Tabelle
 //! rechtfertigt, ist die nächste Sektion.
 //!
 //! # Warum eine unbekannte Crate ein Verstoß ist
-//! Die Schreibbereichstabelle in `gate_writescopes.rs` scheiterte, weil eine
+//! Die Schreibbereichstabelle des früheren Schreibbereichs-Gates scheiterte, weil eine
 //! **fehlende Zeile als "kein Problem" galt** — sechzehn Lücken blieben
 //! unbemerkt, weil Schweigen dort Zustimmung bedeutete. Diese Tabelle macht
 //! das Gegenteil zur Regel: [`lookup_privilege`] liefert `None` für jede

@@ -290,7 +290,7 @@ pub fn open_nofollow(path: &Path, mode: OpenMode) -> io::Result<File> {
 /// use harw_fsutil::open_dir_nofollow;
 /// use std::path::Path;
 ///
-/// let root = open_dir_nofollow(Path::new("/home/mia/.harw"))?;
+/// let root = open_dir_nofollow(Path::new("/home/user/.harw"))?;
 /// # Ok::<(), std::io::Error>(())
 /// ```
 pub fn open_dir_nofollow(path: &Path) -> io::Result<OwnedFd> {
@@ -339,7 +339,7 @@ pub fn open_dir_nofollow(path: &Path) -> io::Result<OwnedFd> {
 /// use std::os::fd::AsFd;
 /// use std::path::Path;
 ///
-/// let root = open_dir_nofollow(Path::new("/home/mia/.harw"))?;
+/// let root = open_dir_nofollow(Path::new("/home/user/.harw"))?;
 /// let file = open_beneath(root.as_fd(), Path::new("sessions/abc.jsonl"), OpenMode::read_only())?;
 /// # Ok::<(), std::io::Error>(())
 /// ```

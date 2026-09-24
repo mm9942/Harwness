@@ -6354,8 +6354,7 @@ mod tests {
     /// `harness.active_uia_definition`.
     ///
     /// # Beschreibung
-    /// Seit dem UIA-Vertrag (siehe `resolve_active_uia`,
-    /// `docs/sessions/session-transcript-2026-09-14.md`) montieren `EntryKind::Tui`
+    /// Seit dem UIA-Vertrag (siehe `resolve_active_uia`) montieren `EntryKind::Tui`
     /// und `EntryKind::OneShot` nur mit einer konfigurierten UIA
     /// (fail-closed, `RuntimeError::Registry`). Test-Fixtures müssen deshalb
     /// selbst eine bereitstellen, statt implizit auf einen Bootstrap

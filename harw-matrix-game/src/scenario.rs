@@ -2886,7 +2886,7 @@ mod tests {
     #[test]
     fn materials_dir_resolution() -> TestResult {
         let scen = Path::new("/spiele/karst/szenario.toml");
-        let home = Path::new("/home/nutzerin");
+        let home = Path::new("/home/user");
         let r = |dir: &str, sp: Option<&Path>, h: Option<&Path>| {
             resolve_materials_dir(Path::new(dir), sp, h)
         };
@@ -2904,12 +2904,9 @@ mod tests {
         );
         assert_eq!(
             r("~/unterlagen/karst", Some(scen), Some(home)),
-            Some(PathBuf::from("/home/nutzerin/unterlagen/karst"))
+            Some(PathBuf::from("/home/user/unterlagen/karst"))
         );
-        assert_eq!(
-            r("~", None, Some(home)),
-            Some(PathBuf::from("/home/nutzerin"))
-        );
+        assert_eq!(r("~", None, Some(home)), Some(PathBuf::from("/home/user")));
         assert_eq!(r("~/x", Some(scen), None), None);
         assert_eq!(r("~/x", Some(scen), Some(Path::new(""))), None);
         // `~name` ist kein Home-Verweis, sondern ein relativer Name.

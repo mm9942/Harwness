@@ -1,7 +1,6 @@
 //! Systemzwischenablage für den `/export`-Befehl mit OSC-52-Fallback.
 //!
-//! Spec-Quelle: `harw-scopes-contract.md` Slice E1 und
-//! `nope-permissions-gibt-es-wild-lobster.md` (UI-Stil der Dialoge).
+//! Spec-Quelle: `docs/design/tui-command-contract.md` (Export).
 //!
 //! # Verantwortung
 //! Kopiert Text in die Systemzwischenablage über externe Werkzeuge

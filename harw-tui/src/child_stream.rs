@@ -1622,7 +1622,7 @@ mod tests {
         reg.apply(
             &root,
             None,
-            "emily-ui",
+            "assistant-ui",
             &spawned(&child, role_names::EXPLORER),
         );
         assert_eq!(reg.task_for(child.as_str()).as_deref(), Some("Teilauftrag"));

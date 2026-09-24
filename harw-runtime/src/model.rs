@@ -108,9 +108,8 @@ impl ModelSource {
 /// [`RuntimeError::Provider`], wenn der konfigurierte Provider nicht gebaut
 /// werden kann (fehlender Default, unauflösbares Credential, ungültiger
 /// Endpoint). Der Fehlertext ist der `Display` von
-/// [`harw_provider_http::HttpProviderError`]; dieser nennt laut Ledger
-/// `docs/remediation/ledger/W1/W1-06b.md` §2.3 nur redigierte Referenzen
-/// (`file:<redacted>`) und statische Gründe, nie Credential-Werte.
+/// [`harw_provider_http::HttpProviderError`]; dieser nennt nur redigierte
+/// Referenzen (`file:<redacted>`) und statische Gründe, nie Credential-Werte.
 pub fn build_root_model(
     spec: &RuntimeSpec,
     config: &ResolvedConfig,

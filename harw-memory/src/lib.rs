@@ -14,7 +14,7 @@
 //!   Workflow-State-Machine für idempotente `maintain()`-Läufe.
 //! - [`promote::evaluate_signals`], [`promote::apply_promotion`] — gefensterte
 //!   Signal-Promotion-Auswertung (Track A, `docs/design/
-//!   track-a-memory-promotion.md`); bewusst nicht in `FileMemoryStore::maintain`
+//!   docs/design/memory-promotion.md`); bewusst nicht in `FileMemoryStore::maintain`
 //!   verdrahtet, siehe die Moduldoku von [`promote`].
 //!
 //! # Nebenläufigkeit

@@ -1007,7 +1007,7 @@ child_depth_cost = 3
     fn resolve_missing_base_errors() -> TestResult {
         let toml_str = r#"
 schema = "harwness.organization/v1"
-id = "mia.organization.derived@1"
+id = "alice.organization.derived@1"
 version = "1.0.0"
 name = "Derived"
 extends = { id = "harwness.organization.nonexistent@1" }
@@ -1017,7 +1017,7 @@ agent = { id = "harwness.agent.focused-coding-orchestrator@1" }
 family = { id = "harwness.family.focused-coding@1" }
 "#;
         let raw: RawOrganizationDefinition = toml::from_str(toml_str)?;
-        let id = DefinitionId::parse("mia.organization.derived@1")?;
+        let id = DefinitionId::parse("alice.organization.derived@1")?;
         let layers = vec![(DefinitionLayer::BuiltIn, raw)];
         let result = resolve_organization(&id, &layers, now());
         assert!(
@@ -1130,7 +1130,7 @@ plan_scope = "research/*"
 
         let derived_toml = r#"
 schema = "harwness.organization/v1"
-id = "mia.organization.derived@1"
+id = "alice.organization.derived@1"
 version = "1.0.0"
 name = "Derived Org"
 extends = { id = "harwness.organization.base@1" }
@@ -1149,7 +1149,7 @@ append = [
         let base_def: RawOrganizationDefinition = toml::from_str(base_toml)?;
         let derived_def: RawOrganizationDefinition = toml::from_str(derived_toml)?;
 
-        let id = DefinitionId::parse("mia.organization.derived@1")?;
+        let id = DefinitionId::parse("alice.organization.derived@1")?;
         let layers = vec![
             (DefinitionLayer::BuiltIn, base_def),
             (DefinitionLayer::UserGlobal, derived_def),
@@ -1190,7 +1190,7 @@ plan_scope = "implementation/*"
 
         let derived_toml = r#"
 schema = "harwness.organization/v1"
-id = "mia.organization.derived2@1"
+id = "alice.organization.derived2@1"
 version = "1.0.0"
 name = "Derived Org 2"
 extends = { id = "harwness.organization.base2@1" }
@@ -1209,7 +1209,7 @@ append = [
         let base_def: RawOrganizationDefinition = toml::from_str(base_toml)?;
         let derived_def: RawOrganizationDefinition = toml::from_str(derived_toml)?;
 
-        let id = DefinitionId::parse("mia.organization.derived2@1")?;
+        let id = DefinitionId::parse("alice.organization.derived2@1")?;
         let layers = vec![
             (DefinitionLayer::BuiltIn, base_def),
             (DefinitionLayer::UserGlobal, derived_def),
@@ -1229,7 +1229,7 @@ append = [
         let base_toml = minimal_org_toml("harwness.organization.trace-base@1", "Trace Base");
         let derived_toml = r#"
 schema = "harwness.organization/v1"
-id = "mia.organization.trace-derived@1"
+id = "alice.organization.trace-derived@1"
 version = "1.0.0"
 name = "Trace Derived"
 extends = { id = "harwness.organization.trace-base@1" }
@@ -1241,7 +1241,7 @@ family = { id = "harwness.family.focused-coding@1" }
         let base_def = parse_org(&base_toml)?;
         let derived_def: RawOrganizationDefinition = toml::from_str(derived_toml)?;
 
-        let id = DefinitionId::parse("mia.organization.trace-derived@1")?;
+        let id = DefinitionId::parse("alice.organization.trace-derived@1")?;
         let layers = vec![
             (DefinitionLayer::BuiltIn, base_def),
             (DefinitionLayer::Workspace, derived_def),

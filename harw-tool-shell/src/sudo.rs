@@ -1910,7 +1910,7 @@ mod tests {
     #[test]
     fn test_clean_stderr_drops_marker_and_prompt_lines() {
         let cleaned = clean_stderr(
-            b"harw-sudo-x:Sorry, try again.\n[sudo] password for mia: \nreal error\n",
+            b"harw-sudo-x:Sorry, try again.\n[sudo] password for alice: \nreal error\n",
             b"harw-sudo-x:",
         );
         assert_eq!(cleaned, "real error");
@@ -1919,7 +1919,7 @@ mod tests {
     #[test]
     fn test_audit_record_redacts_to_fields_without_any_secret_field() -> TestResult {
         let record = SudoAuditRecord {
-            operator: "mia".to_owned(),
+            operator: "alice".to_owned(),
             session: "s1".to_owned(),
             worker: "uia-shell-worker".to_owned(),
             argv: display_argv(&["apt-get".to_owned(), "install".to_owned(), "a b".to_owned()]),

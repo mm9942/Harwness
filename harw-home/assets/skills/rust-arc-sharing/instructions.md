@@ -28,14 +28,14 @@ let kek: Arc<MasterKek> = Arc::new(MasterKek::new(raw_key));
 let kek_for_handler = Arc::clone(&kek);   // ✅
 let kek_for_task    = Arc::clone(&kek);   // ✅
 
-// Realer Einsatz in sgh-secureHUB:
+// Realer Einsatz in acme-secure-hub:
 // securehub-service/src/service.rs:100
 //   master_kek: Arc<MasterKek>,
 // securehub-service/src/service.rs:137
 //   pub fn new(pool: PgPool, master_kek: Arc<MasterKek>, ...) -> Self { ... }
 //
-// Realer Einsatz in sgh-flow:
-// apps/sgh-flow/src/app.rs:113
+// Realer Einsatz in acme-app:
+// apps/acme-app/src/app.rs:113
 //   pub type AppState = Arc<AppContext>;
 tokio::spawn(async move { use_kek(kek_for_handler).await });
 tokio::spawn(async move { use_kek(kek_for_task).await });

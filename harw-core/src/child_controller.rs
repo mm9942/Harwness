@@ -160,8 +160,8 @@ fn detached_start_survives(
 /// # Beschreibung
 /// F-017/E3b. Ein fehlendes Eltern-Level (`None`) heißt **nicht** „unbegrenzt":
 /// ohne diesen Deckel hob ein `None` beim Elternteil auch den `effort_cap` der
-/// Agent-IR auf, und das Kind lief mit dem Provider-Default — genau der
-/// Befund E3(b) aus `w3-core-child-jobs-mcp.md`. Statt eines Provider-Defaults
+/// Agent-IR auf, und das Kind lief mit dem Provider-Default — ein früherer
+/// Befund. Statt eines Provider-Defaults
 /// klammert [`ManagedAgentSpawner::clamp_child_reasoning_effort`] dann auf
 /// diesen Wert.
 ///
@@ -174,8 +174,7 @@ fn detached_start_survives(
 const DEFAULT_CHILD_REASONING_EFFORT: ReasoningEffort = ReasoningEffort::Medium;
 
 /// Löst den Kind-Default-Reasoning-Effort nach der Nutzerentscheidung-Rangfolge
-/// **Provider > Modell > Agent > Rolle** auf (Welle 8,
-/// `recursive-cooking-lobster.md`).
+/// **Provider > Modell > Agent > Rolle** auf.
 ///
 /// # Beschreibung
 /// Spiegelt absichtlich dieselbe Rangfolgen-Logik wie

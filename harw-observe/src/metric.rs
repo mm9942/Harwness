@@ -3,7 +3,7 @@
 //!
 //! # Verantwortungsbereich
 //! Trägt [`MetricKind`], [`Unit`], [`Cardinality`], [`MetricKey`] und
-//! [`MetricValue`] (Vertrag A.2, `docs/aw-contract-master.md`). Reine
+//! [`MetricValue`] (Vertrag A.2, `docs/design/build-history.md`). Reine
 //! Werttypen ohne Verhalten — die Emission übernimmt
 //! [`crate::sink::TelemetrySink`].
 //!

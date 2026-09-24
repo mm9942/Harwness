@@ -24,7 +24,7 @@
 # Diese Rollen-Definition kann den Schreibzugriff nicht selbst auf die
 # Memory-Wurzel (`<projekt>/.harw/memories/` bzw.
 # `~/.harw/profiles/<p>/memories/`) einschränken — Rechte und Workdirs liegen
-# laut `harw-scopes-contract.md` §2 außerhalb einer Agent-Definition, in der
+# laut `docs/design/config-scopes.md` §2 außerhalb einer Agent-Definition, in der
 # Session-/Workdir-Konfiguration der Composition-Root. `fs.write` in
 # `admitted` ist nur die Werkzeugoberfläche; dass ein Aufruf dieses Kindes
 # tatsächlich nur unterhalb der ihm zugewiesenen Memory-Wurzel schreiben kann,

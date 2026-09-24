@@ -78,7 +78,7 @@ const DEFAULT_COMMONDIR_RELATIVE: &str = "../..";
 /// use harw_home::project::{ProjectKind, ProjectRoot};
 /// use std::path::PathBuf;
 ///
-/// let root = PathBuf::from("/home/mia/projects/beispiel");
+/// let root = PathBuf::from("/home/user/projects/beispiel");
 /// let project = ProjectRoot {
 ///     trust_key: root.clone(),
 ///     root,
@@ -335,9 +335,9 @@ fn read_small_file_nofollow(path: &Path) -> Option<Vec<u8>> {
 /// use harw_home::project::project_key;
 /// use std::path::Path;
 ///
-/// let key = project_key(Path::new("/home/mia/projects/beispiel"));
+/// let key = project_key(Path::new("/home/user/projects/beispiel"));
 /// assert!(key.starts_with("beispiel-"));
-/// assert_eq!(key, project_key(Path::new("/home/mia/projects/beispiel")));
+/// assert_eq!(key, project_key(Path::new("/home/user/projects/beispiel")));
 /// ```
 #[must_use]
 pub fn project_key(root: &Path) -> String {
@@ -800,7 +800,7 @@ mod tests {
 
     #[test]
     fn project_key_is_stable_and_sanitized() -> TestResult {
-        let root = Path::new("/home/mia/projects/Beispiel Projekt!");
+        let root = Path::new("/home/user/projects/Beispiel Projekt!");
         let key = project_key(root);
         let again = project_key(root);
         assert_eq!(key, again, "project_key must be deterministic");

@@ -600,7 +600,7 @@ mod tests {
         serde_json::from_value(json!({
             "message_id": 7,
             "chat": { "id": -10042, "type": "supergroup", "title": "Ops" },
-            "from": { "id": 99, "is_bot": false, "first_name": "Mia", "username": "mia" },
+            "from": { "id": 99, "is_bot": false, "first_name": "Alice", "username": "alice" },
             "text": "hello @HarwBot",
             "entities": [{ "type": "mention", "offset": 6, "length": 8 }],
             "message_thread_id": 33,
@@ -630,7 +630,7 @@ mod tests {
         );
         assert_eq!(
             event.sender.and_then(|sender| sender.display_name),
-            Some("Mia".to_owned())
+            Some("Alice".to_owned())
         );
         assert_eq!(event.text.as_deref(), Some("hello @HarwBot"));
         assert!(event.mentioned);

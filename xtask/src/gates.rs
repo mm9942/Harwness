@@ -7,7 +7,11 @@
 //!
 //! - [`edges`] — verbotene Kanten im Abhängigkeitsgraphen (Knoten AW0-10a)
 //! - [`privileges`] — Privilegienbudget je Binary (Knoten AW0-10b)
-//! - [`writescopes`] — Schreibbereichstabelle aus dem Plan (Knoten AW0-10c)
+//!
+//! Ein früheres drittes Gate prüfte die Schreibbereichstabelle des
+//! Ausbauplans auf Kollisionen paralleler Arbeitsknoten. Mit dem Abschluss des
+//! Ausbauprogramms (siehe `docs/design/build-history.md`) entfiel die Tabelle
+//! und damit dieses Gate.
 //!
 //! # Warum die Aufteilung
 //! Der ursprüngliche Zuschnitt hatte alle drei Gates in einer Datei. Er ist
@@ -30,8 +34,6 @@
 pub mod edges;
 #[path = "gate_privileges.rs"]
 pub mod privileges;
-#[path = "gate_writescopes.rs"]
-pub mod writescopes;
 // Die zwei Warden-Gates aus dem Verifikationsplan, nachgetragen: sie standen
 // als Abnahmebestandteil im Plan und waren nie gebaut worden. Beide teilen
 // eine Huellenberechnung, sind aber einzeln aufrufbar, weil sie verschiedene
@@ -100,7 +102,7 @@ impl GateReport {
 ///
 /// # Arguments
 /// - `args` (`&[String]`): Namen einzelner Gates (`edges`, `privileges`,
-///   `writescopes`); leer bedeutet alle.
+///   `warden-deps`, `warden-cbuild`); leer bedeutet alle.
 ///
 /// # Returns
 /// `Ok(())`, wenn jedes ausgeführte Gate grün ist.
@@ -112,13 +114,7 @@ impl GateReport {
 /// Tippfehler rot werden, nicht still alles überspringen.
 pub fn run(args: &[String]) -> Result<(), String> {
     let selected: Vec<&str> = if args.is_empty() {
-        vec![
-            "edges",
-            "privileges",
-            "writescopes",
-            "warden-deps",
-            "warden-cbuild",
-        ]
+        vec!["edges", "privileges", "warden-deps", "warden-cbuild"]
     } else {
         args.iter().map(String::as_str).collect()
     };
@@ -128,7 +124,6 @@ pub fn run(args: &[String]) -> Result<(), String> {
         let report = match name {
             "edges" => edges::run()?,
             "privileges" => privileges::run()?,
-            "writescopes" => writescopes::run()?,
             "warden-deps" => warden::dependency_budget::run()?,
             "warden-cbuild" => warden::c_build::run()?,
             other => return Err(format!("unbekanntes Gate '{other}'")),

@@ -3,10 +3,12 @@ publish.workspace = true
 name = "harw-fsutil"
 version.workspace = true
 edition.workspace = true
+license.workspace = true
+repository.workspace = true
 rust-version.workspace = true
 
 [dependencies]
-# Einzige Abhängigkeit (CONTRACTS.md §fsutil): `fs` liefert `openat`/`openat2`,
+# Einzige Abhängigkeit (`harw-fsutil`): `fs` liefert `openat`/`openat2`,
 # `OFlags::NOFOLLOW` plattformkorrekt (aarch64: 0o100000, nicht 0o400000),
 # `statat`/`fstat`/`Dir`/`renameat`; `process` liefert `geteuid`.
 rustix = { workspace = true, features = ["fs", "process"] }

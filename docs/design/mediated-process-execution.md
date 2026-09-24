@@ -1,40 +1,42 @@
-# Vermittelte Prozessausführung und Sandbox-Module
+# Mediated Process Execution and Sandbox Modules
 
-## Ziel
+> Status: implemented · Last reviewed: 2026-09-24
 
-`/bin/sh`, Cargo und tmux sind keine normalen Modellwerkzeuge. Sie werden nur
-durch dedizierte Ausführungsworker benutzt, deren Prozessrecht der Parent
-fallweise und mit einem begrenzten Auftrag ausstellt. Ein Planer,
-Explorer, UIA-Agent oder gewöhnlicher Coding-Worker erhält niemals direkt
-`shell.exec`.
+## Goal
 
-Die Trennung ist absichtlich zweistufig:
+`/bin/sh`, Cargo and tmux are not ordinary model tools. They are only ever
+used by dedicated execution workers whose process right the parent issues
+case by case, with a bounded mandate. A planner, explorer, UIA agent or
+ordinary coding worker never gets `shell.exec` directly.
 
-1. Die **Delegationscapability** bestimmt, ob ein Parent einen bestimmten
-   Ausführungsworker anfordern darf.
-2. Ein **ExecutionPermit** bestimmt, welchen einzelnen Prozessauftrag dieses
-   Kind ausführen darf.
+The separation is deliberately two-stage:
 
-Eine Rolle allein und eine Parent-Behauptung im Modelltext reichen niemals aus.
+1. A **delegation capability** determines whether a parent may request a
+   given execution worker at all.
+2. An **`ExecutionPermit`** determines which single process mandate that
+   child may carry out.
 
-## Worker-Klassen
+A role alone, or a parent's claim in model text, is never sufficient.
 
-| Definition | Umgebung | Erlaubter Zweck | Direkter Hostzugriff |
+## Worker classes
+
+| Definition | Environment | Permitted purpose | Direct host access |
 | --- | --- | --- | --- |
-| `sandbox-shell-worker` | strikte Bubblewrap-Sandbox | begrenzte Shell-Aufträge im Projekt | nie |
-| `cargo-worker` | Bubblewrap mit ausdrücklich aktiviertem Toolchain-Modul | Cargo/Rustfmt/Rustc innerhalb des Projekts | nie |
-| `tmux-inspector-worker` | Bubblewrap mit einem einzelnen, validierten tmux-User-Socket | `list-sessions`, `capture-pane`, ausdrücklich zugelassene tmux-Abfragen | nie |
-| `host-process-worker` | separat, lokal und nur nach bestätigtem Host-Prozess-Modus | unvermeidbare lokale Host-Prozesse | nur für den genehmigten Auftrag |
+| `sandbox-shell-worker` | strict bubblewrap sandbox | bounded shell mandates inside the project | never |
+| `cargo-worker` | bubblewrap with the toolchain module explicitly enabled | cargo/rustfmt/rustc inside the project | never |
+| `tmux-inspector-worker` | bubblewrap with a single, validated tmux user socket | `list-sessions`, `capture-pane`, explicitly allowed tmux queries | never |
+| `host-process-worker` | separate, local, only after a confirmed host-process mode | unavoidable local host processes | only for the approved mandate |
+| `uia-shell-worker` | role `uia-worker`; `shell.exec` plus read-only `fs.*`; always `SandboxProfile::Host`; permit still required | host-side shell work delegated by the UIA | only for the approved mandate |
 
-Der `host-process-worker` ist kein allgemeiner Fluchtweg aus der Sandbox. Er
-wird weder an Remote-/Gateway-/MCP-Einstiegen noch durch Child-Worker
-registriert. Seine Capability kann ausschließlich die lokale UIA nach einer
-klaren Nutzerbestätigung an den Root weiterreichen.
+`host-process-worker` is not a general escape hatch from the sandbox. It is
+never registered at remote/gateway/MCP entry points or by a child worker.
+Its capability can only be handed to the root by the local UIA, after clear
+user confirmation.
 
-## ExecutionPermit
+## `ExecutionPermit`
 
-Vor einer Prozessausführung prüft die Runtime einen nicht vom Modell
-konstruierbaren Permit:
+Before a process runs, the runtime checks a permit the model cannot
+construct:
 
 ```text
 ExecutionPermit {
@@ -50,307 +52,256 @@ ExecutionPermit {
 }
 ```
 
-Der Permit wird an die konkrete kanonische Befehlsanfrage gebunden. Ein
-Ausführungsworker darf weder einen zweiten noch einen abgewandelten Befehl
-unter demselben Permit starten. Ablauf, Wiederverwendung, andere
-Worker-Definition, anderes Workspace oder breiteres Sandboxprofil werden
-fail-closed abgewiesen.
+The permit is bound to the concrete, canonical command request. An
+execution worker may not start a second or modified command under the same
+permit. Expiry, reuse, a different worker definition, a different
+workspace, or a broader sandbox profile are all rejected fail-closed.
 
-Ein Parent kann den Permit nur erzeugen, wenn seine eigene Sandbox und
-Authority alle angefragten Rechte bereits enthalten. Der Child-Sandboxplan
-bleibt ein echter Kind-Schnitt des Parent-Plans.
+A parent can only create a permit if its own sandbox and authority already
+contain every right requested — the child's sandbox plan remains a true
+narrowing of the parent's.
 
-## Cargo-Modul
+## Cargo module
 
-Das Cargo-Modul bindet nur die validierte Toolchain sowie die erforderlichen
-Cargo-/Rustup-Verzeichnisse unter festen Sandbox-Zielen ein. Es erweitert weder
-Home noch `/tmp` noch Netzwerk pauschal. Fetch benötigt zusätzlich den bereits
-gesondert geprüften Proxy-Netzmodus und einen begrenzten Network-Scope.
+Binds only the validated toolchain plus the required cargo/rustup
+directories, at fixed sandbox targets. It does not broadly widen `$HOME`,
+`/tmp`, or network access. Fetching additionally requires the
+separately-checked proxy network mode and a bounded network scope.
 
-## tmux-Modul
+## tmux module
 
-Das tmux-Modul akzeptiert ausschließlich einen beim lokalen UIA-Approval
-validierten Socket des aktuellen Benutzers. Es bindet nicht ganz `/tmp` und
-nicht `$HOME`. Der Permit enthält Socket-Identität, erlaubte tmux-Operationen
-und eine kurze Laufzeit. Schreibende tmux-Aktionen sind ein eigener,
-zustimmungspflichtiger Modulmodus; der Standard ist Inspektion.
+Accepts only a single socket of the current user, validated during local
+UIA approval. It does not bind all of `/tmp` or `$HOME`. The permit carries
+socket identity, allowed tmux operations, and a short lifetime. Write-mode
+tmux actions are a separate, consent-gated module mode; the default is
+inspection.
 
-## Semantisch angefragter Host-Modus
+## Host mode
 
-> **Ist-Stand (2026-09)**: Es gibt inzwischen einen neuen Ausführungsworker
-> `uia-shell-worker` (Rolle `uia-worker`, `shell.exec` plus read-only
-> `fs.*`, immer `SandboxProfile::Host`, Permit weiterhin erforderlich) sowie
-> `InteractionMode::Shell` (`--mode shell`, `/mode shell`). Dieser
-> Interaktionsmodus **gewährt keine Berechtigung** — er wählt in der lokalen
-> Permit-Ansicht nur die Sitzungsphasen-Variante (Variante 2 unten) vor. Die
-> untenstehende Aussage, der Host-Modus sei „kein Slash-Befehl", gilt damit
-> mit einer Einschränkung fort: der **Modus** ist über `/mode shell`
-> auswählbar, die **Berechtigung** selbst bleibt weiterhin ausschließlich an
-> die unveränderbare lokale Bestätigungsansicht gebunden, nicht an den
-> Slash-Befehl.
+Host mode is **not** a CLI flag or a startup option. A process cannot
+preselect it at program start or via a repeatable command line.
 
-Der Host-Modus ist **kein** CLI-Flag und keine Startoption. Ein Prozess kann
-ihn daher weder beim Programmstart noch durch eine wiederholbare
-Kommandozeile voreinstellen.
+**Direct request path (implemented):** the `sandbox-lease` model tool
+(`harw-ops/src/sandbox_lease.rs`, a `model_tool` with no extra approval
+step of its own — the confirmation dialog itself *is* the approval) offers
+actions `request`/`status`/`revoke` with a `reason` argument. A `request`
+triggers a `HostPermitPrompt` in the local UI
+(`worker_definition = "sandbox-lease"`, `command = reason`, preselecting
+the session-lease variant) and waits up to 300 seconds for a decision:
 
-> **Nutzerentscheidung (2026-09-21)**: Seither existiert ein direktes
-> Modell-Tool, `sandbox-lease` (`harw-ops/src/sandbox_lease.rs`,
-> `model_tool` ohne Zusatz-Approval — der Dialog *ist* die Freigabe;
-> Aktionen `request`/`status`/`revoke`, Argument `reason`). Ein `request`
-> löst einen `HostPermitPrompt` an die lokale UI aus (`worker_definition =
-> "sandbox-lease"`, `command = reason`, Vorauswahl `SessionLease`) und
-> wartet bis zu 300 s auf eine Entscheidung:
->
-> - **`SessionLease`** — `mark_global_approval` (TTL-befristet): ab
->   Bestätigung laufen alle `shell.exec`-Aufrufe dieser harw-Sitzung **und
->   aller ihrer Kind-Agenten** auf dem Host — ohne bwrap, mit der von harw
->   geerbten Nutzerumgebung (inklusive PATH, HOME,
->   `CARGO_HOME`/`RUSTUP_HOME`), `cwd` = Workspace-Wurzel, weiterhin unter
->   den bestehenden `prlimit`-Limits; die Tool-Ausgabe trägt zur
->   Unterscheidung `"executed_on": "host"`. Der Slash-Befehl
->   `/sandbox-lease revoke` (`busy = "immediate"`) beendet die Freigabe
->   sofort — prozessweit, siehe „Nachtrag (2026-09-21) — prozessweite
->   Freigabe" unten —, danach läuft der nächste Aufruf wieder in der
->   strikten Sandbox.
-> - **`SingleExecution`** — `mark_global_single_use`: nur der unmittelbar
->   nächste `shell.exec`-Aufruf **einer beliebigen Session dieses
->   Prozesses** läuft auf dem Host, danach gilt automatisch wieder das
->   strikte Standardprofil.
-> - Ablehnung oder Timeout liefern dem Modell einen Fehlertext statt einer
->   Freigabe; es entsteht keine Berechtigung.
->
-> Damit gilt die Aussage „auch ein Modell besitzt keine Operation, die den
-> Modus unmittelbar aktiviert" nur noch für jeden anderen Weg (CLI-Flag,
-> Startoption, ein `/mode`-artiger, selbst aktivierender Slash-Befehl);
-> `sandbox-lease` ist der eine bewusst geschaffene direkte Weg. Das Tool
-> aktiviert dabei selbst nichts — es sendet nur die strukturierte Anfrage an
-> dieselbe unveränderbare lokale Bestätigungsansicht, die auch die indirekte
-> Klassifikation weiter unten auslöst; die Freigabe bleibt ausschließlich
-> ein bewusstes UI-`Ja` (siehe „Nutzerzustimmung" unten). `/sandbox-lease`
-> selbst (Command `status`/`revoke`) aktiviert ebenfalls nichts — es liest
-> nur den Status oder beendet eine bestehende Freigabe.
->
-> Kind-Registries (`build_registry`, `harw-runtime/src/children.rs`)
-> bekommen dieselbe Permit-Verdrahtung jetzt auch als Kinder, nicht nur an
-> der Root — `uia-shell-worker` und `host-process-worker` können also selbst
-> unter einem aktiven Lease auf dem Host ausführen. Die TUI pollt
-> `host_permit_prompts` jetzt auch während eines laufenden Turns
-> (`drive_turn_animated`s `select!`), der Dialog erscheint also nicht mehr
-> ausschließlich zwischen Turns.
->
-> **Nachtrag (2026-09-21) — prozessweite Freigabe statt nur Host-Profil:**
-> Ein realer Lauf zeigte zwei Lücken. Erstens hängte
-> `harw-registry-defaults/src/profile.rs::build_shell_provider` Ledger,
-> Sitzungs-Registry und Fragekanal-Sender nur an einen `ShellToolProvider`
-> mit `sandbox_profile.is_host()` — die Root-Session läuft aber mit
-> `SandboxProfile::Strict`, sodass ihr `ShellExecutor.host_permit_registry`
-> immer `None` blieb und `determine_effective_host`
-> (`harw-tool-shell/src/exec.rs`) für sie nie `true` liefern konnte, egal
-> welche Freigabe erteilt wurde. Behoben: `build_shell_provider` hängt die
-> Verdrahtung jetzt an **jeden** gebauten `ShellToolProvider`, unabhängig vom
-> `sandbox_profile` — für Strict/Cargo/Tmux bleibt die Sandbox trotzdem die
-> Grenze, weil `determine_effective_host` für ein nicht-Host-Profil
-> weiterhin ausschließlich die Registry-Freigabe prüft, nie den Ledger
-> selbst. Zweitens galt eine Freigabe bis dahin nur für exakt die
-> Session-ID, die sie beantragt hatte — `shell.exec`-Aufrufe aus einer
-> Kind-Session (anderer Session-ID, z. B. `uia-shell-worker`) sahen sie
-> nicht. Nutzerwunsch: die Freigabe soll für den **ganzen harw-Prozess**
-> gelten (Root-Session **und** alle Kind-Agenten), bis TTL-Ablauf oder
-> `/sandbox-lease revoke`. Dazu trägt
-> [`harw_sandbox::HostPermitSessionRegistry`] jetzt zusätzlich einen
-> *globalen* Freigabezustand (`mark_global_approval`/
-> `global_approval_remaining`/`mark_global_single_use`/
-> `has_global_single_use`/`revoke_global_approval`), den `is_session_approved`,
-> `take_single_use`, `has_single_use` und `session_approval_remaining`
-> zusätzlich zur sitzungseigenen Freigabe berücksichtigen (globale
-> Einmalfreigabe wird atomar zuerst nach der sitzungseigenen verbraucht).
-> `/sandbox-lease request` setzt seither ausschließlich noch die globale
-> Freigabe (nicht mehr `mark_session_approved`/`mark_single_use`), `revoke`
-> entfernt beide Zustände.
+- **`SessionLease`** (`mark_global_approval`, TTL-bound): from confirmation
+  onward, every `shell.exec` call in this harw session **and all its child
+  agents** runs on the host — no bubblewrap, with the user environment
+  inherited from harw (including `PATH`, `HOME`, `CARGO_HOME`/`RUSTUP_HOME`),
+  `cwd` at the workspace root, still under the existing `prlimit` limits;
+  tool output carries `"executed_on": "host"` to distinguish it. The
+  `/sandbox-lease revoke` slash command ends the lease immediately and
+  process-wide (see below); the next call then runs in the strict sandbox
+  again.
+- **`SingleExecution`** (`mark_global_single_use`): only the immediately
+  next `shell.exec` call, from **any session of this process**, runs on the
+  host; the strict default profile applies automatically afterward.
+- Rejection or timeout return an error to the model instead of a grant; no
+  permission is created.
 
-Der Benutzer darf den Wunsch natürlichsprachlich und indirekt äußern, etwa
-„zeig mir bitte meine laufende tmux-Session“ oder „das muss auf meinem echten
-System laufen“. Die UIA beziehungsweise der Root-Orchestrator darf diese
-Äußerung als **Host-Modus-Kandidaten** klassifizieren. Diese Klassifikation hat
-aber ausschließlich die Wirkung, eine strukturierte Anfrage an die lokale UI
-zu senden; sie ist keine Berechtigung und schaltet noch nichts um.
+The tool itself activates nothing — it only sends the structured request to
+the same unchangeable local confirmation view that indirect classification
+(below) also triggers; the grant remains exclusively a deliberate "yes" in
+the UI. `/sandbox-lease status`/`revoke` likewise activate nothing; they
+only read status or end an existing grant.
 
-Die lokale UI bietet bei jeder solchen Anfrage zwei auswählbare
-Freigabevarianten an. Der Agent darf eine passende Variante **vorschlagen**,
-aber weder auswählen noch aktivieren. Bei indirekter oder mehrdeutiger
-Nutzerabsicht darf er ausschließlich Variante 1 anfragen. Variante 2 darf er
-nur vorschlagen, wenn die Nutzeräußerung die längere Host-Arbeitsphase
-unmissverständlich verlangt; sie ist niemals seine erste oder automatische
-Empfehlung:
+The lease wiring reaches child registries too (`build_registry`,
+`harw-runtime/src/children.rs`), not only the root — `uia-shell-worker` and
+`host-process-worker` can execute on the host under an active lease as
+children as well. The TUI polls `host_permit_prompts` during a running turn
+too, so the dialog is not limited to appearing only between turns.
 
-1. **Einmalig für diesen Auftrag.** Ein `ExecutionPermit` ist an einen
-   kanonischen Auftrag beziehungsweise Befehls-Hash gebunden und nach einer
-   Nutzung verbraucht.
-2. **Begrenzte Host-Arbeitsphase.** Ein sitzungsgebundener
-   `HostModeLease` erlaubt mehrere einzeln durch Approval und Scope geprüfte
-   `host-process-worker`-Aufträge bis zum Ende der lokalen Sitzung oder bis der
-   Benutzer die Isolation ausdrücklich wieder aktiviert. Der Lease ist nicht
-   auf andere Sessions, Parents, Worker, Workspaces oder Remote-Einstiege
-   übertragbar.
+**Grant scope is process-wide, not just profile-wide.** A grant is not
+scoped to the single session that requested it: `shell.exec` calls from a
+child session (a different session ID, e.g. `uia-shell-worker`) are covered
+too, for the whole harw process (root session and all child agents), until
+TTL expiry or `/sandbox-lease revoke`. `HostPermitSessionRegistry`
+(`harw-sandbox/src/host_permit_session.rs`) carries this as a *global*
+approval state (`mark_global_approval`/`global_approval_remaining`/
+`mark_global_single_use`/`has_global_single_use`/`revoke_global_approval`),
+consulted by `is_session_approved`, `take_single_use`,
+`has_single_use` and `session_approval_remaining` in addition to any
+per-session grant (a global single-use grant is consumed atomically only
+after the per-session one). `/sandbox-lease request` sets only the global
+grant; `revoke` clears both.
 
-Auch Variante 2 ist kein globales „Sandbox aus“: Sie erlaubt nur die schon
-bestätigte Klasse lokaler Host-Ausführungsworker. Dateisystem-, Netz-,
-Secrets- und Prozessgrenzen werden weiterhin pro Auftrag geprüft; ein
-HostModeLease kann keinen Zugriff über die Rechte des lokalen Benutzers hinaus
-und keine neue Delegationscapability schaffen. Die UI zeigt während der Phase
-permanent und unübersehbar `HOST-MODUS AKTIV` sowie die verbleibende Scope- und
-Sitzungsbindung.
+The wiring reaches every constructed `ShellToolProvider`, not only ones
+built with `SandboxProfile::Host` — the root session runs with
+`SandboxProfile::Strict`, so without this the registry/ledger/question
+channel would never reach it and a lease granted at the root could never
+take effect there. For Strict/Cargo/Tmux profiles, the sandbox remains the
+actual boundary regardless: `determine_effective_host`
+(`harw-tool-shell/src/exec.rs`) checks only the registry grant for a
+non-host profile, never the permit ledger itself.
 
-Nur ein bewusstes UI-`Ja` erzeugt einen einmaligen,
-sitzungsgebundenen Host-ExecutionPermit oder HostModeLease. Abbruch, Timeout,
-Disconnect, Auftragsende (Variante 1) und Sitzungsende verwerfen die Anfrage
-beziehungsweise die Freigabe. Der Benutzer kann Variante 2 jederzeit über die
-UI ausdrücklich beenden; danach gilt sofort wieder das strikte
-Standard-Sandboxprofil.
+### Indirect (natural-language) requests
 
-Damit gilt die gewünschte Sicherheitskette:
+A user may express the need naturally and indirectly — "show me my running
+tmux session," or "this has to run on my real system." The UIA or root
+orchestrator may classify such a statement as a **host-mode candidate**.
+That classification has exactly one effect: sending a structured request to
+the local UI. It is not itself a permission and switches nothing on.
+
+The local UI offers two selectable grant variants for any such request. The
+agent may **suggest** a fitting variant but never select or activate one.
+On indirect or ambiguous user intent, it may only request variant 1.
+Variant 2 may only be suggested when the user's statement unambiguously
+calls for an extended host work phase — it is never the agent's first or
+automatic recommendation:
+
+1. **One-time, for this mandate.** An `ExecutionPermit` bound to a
+   canonical mandate/command hash, consumed after one use.
+2. **Bounded host work phase.** A session-bound `HostModeLease` allows
+   several individually approval- and scope-checked `host-process-worker`
+   mandates until the local session ends or the user explicitly
+   re-enables isolation. The lease does not transfer to other sessions,
+   parents, workers, workspaces, or remote entry points.
+
+Even variant 2 is not a global "sandbox off": it only permits the
+already-confirmed class of local host execution workers. Filesystem,
+network, secrets and process boundaries are still checked per mandate; a
+`HostModeLease` cannot grant access beyond the local user's own rights and
+cannot create a new delegation capability. The UI shows `HOST MODE ACTIVE`
+continuously and unmissably during the phase, along with the remaining
+scope and session binding.
+
+Only a deliberate "yes" in the UI creates a one-time, session-bound host
+`ExecutionPermit` or `HostModeLease`. Cancellation, timeout, disconnect,
+mandate completion (variant 1), and session end all discard the request or
+grant. The user can end variant 2 explicitly via the UI at any time; the
+strict default sandbox profile applies immediately afterward.
+
+The resulting security chain:
 
 ```text
-natürliche Nutzerabsicht
-→ Agent erkennt Host-Bedarf und schlägt eine Freigabevariante vor
-→ unveränderbare lokale Bestätigungsansicht
-→ Benutzer wählt einmalig oder Host-Arbeitsphase und bestätigt explizit
-→ begrenzter Permit beziehungsweise Lease
-→ spezialisierter Host-Worker
+natural user intent
+→ agent recognizes a possible host need and suggests a grant variant
+→ unchangeable local confirmation view
+→ user selects one-time or host work phase and confirms explicitly
+→ bounded permit or lease
+→ specialized host worker
 ```
 
-Der Agent darf also Unsicherheit offenlegen und um die Bestätigung bitten, kann
-aber eine Fehlklassifikation niemals selbst in Host-Ausführung verwandeln.
+The agent may surface uncertainty and ask for confirmation, but can never
+turn a misclassification into host execution itself.
 
-## Nutzerzustimmung
+## User consent
 
-Das Aktivieren eines Moduls zeigt vor der Freigabe mindestens:
+Activating a module shows, before granting, at minimum:
 
-- den Worker-Typ;
-- die effektive Sandbox (strikt, Cargo oder tmux-Socket);
-- die genaue Ressource, etwa Toolchain-Pfade oder Socket;
-- die erlaubte Operation und Laufzeit;
-- ob ein Host-Prozessmodus verlangt wird.
+- the worker type;
+- the effective sandbox (strict, cargo, or tmux socket);
+- the exact resource, e.g. toolchain paths or socket;
+- the permitted operation and its lifetime;
+- whether a host process mode is being requested.
 
-Jede Freigabe wird als Sitzungsereignis persistiert. Sie ist nicht auf andere
-Sitzungen, Geschwister oder Remote-Einstiege übertragbar und kann von Kindern
-niemals erweitert werden.
+Every grant is persisted as a session event. It does not transfer to other
+sessions, siblings, or remote entry points, and can never be widened by a
+child.
 
-## Umsetzung
+## Implementation
 
-Die modulare Sandbox ist wie folgt umgesetzt:
+### `SandboxProfile` (`harw-sandbox/src/profile.rs`)
 
-### SandboxProfile (harw-sandbox/src/profile.rs)
+An enum with four variants:
 
-`SandboxProfile` ist ein Enum mit vier Varianten:
+- `Strict` — hermetic bubblewrap sandbox, the default.
+- `Cargo(CargoSandboxProfile)` — isolated sandbox with the toolchain.
+- `Tmux(TmuxSandboxProfile)` — isolated sandbox with one socket.
+- `Host` — local host execution, requires a process permit.
 
-- `Strict` — hermetische Bubblewrap-Sandbox, Standard.
-- `Cargo(CargoSandboxProfile)` — isolierte Sandbox mit Toolchain.
-- `Tmux(TmuxSandboxProfile)` — isolierte Sandbox mit einem Socket.
-- `Host` — lokale Host-Ausführung, erfordert ProcessPermit.
+The profile is a trusted runtime input: built from configuration and UI
+grants when the runtime is assembled, never from a tool call.
 
-Das Profil ist ein vertrauenswürdiger Runtime-Input: es wird beim Aufbau der
-Runtime aus Konfiguration und UI-Freigaben gebildet, nie aus einem Tool-Aufruf.
+### `TmuxSandboxProfile` (`harw-sandbox/src/tmux.rs`)
 
-### TmuxSandboxProfile (harw-sandbox/src/tmux.rs)
+Validates a single socket path (absolute, normalized, existing, a Unix
+socket). Binds only that socket at `/run/harw/tmux.sock` inside the
+sandbox. `Inspect` binds read-only; `Write` binds read-write.
 
-Validiert einen einzelnen Socket-Pfad (absolut, normal, existent, Unix-Socket).
-Bindet nur diesen Socket unter `/run/harw/tmux.sock` in die Sandbox. `Inspect`
-bindet read-only, `Write` bindet read-write.
+### `BwrapLauncher` (`harw-sandbox/src/bwrap.rs`)
 
-### BwrapLauncher (harw-sandbox/src/bwrap.rs)
+- `with_profile(&SandboxProfile)` sets all modules in one call;
+  `with_cargo_profile()`/`with_tmux_profile()` remain for individual use.
+- `plan()` binds the cargo toolchain and/or tmux socket per the profile.
+- `plan()` sets `--unshare-user` plus `--uid`/`--gid` to the harw process's
+  effective IDs (from `/proc/self` metadata, injectable for tests) for
+  **every** profile, and binds `/etc/passwd`, `/etc/group` and
+  `/etc/nsswitch.conf` read-only via `--ro-bind-try`; `USER`/`LOGNAME` are
+  set from the harw environment. This makes `whoami`/`id` work inside the
+  strict sandbox too. Host execution already runs as a normal user process
+  and is unaffected by this.
+- `with_host_path(path: &str)` binds, for each directory that exists in the
+  given `PATH` and is not already under `/usr /bin /lib /lib64` or the
+  workspace, a `--ro-bind-try dir dir` (excluding `/` and exactly `$HOME`)
+  and sets `--setenv PATH <host PATH>`. If the `PATH` includes
+  `~/.cargo/bin`, `$RUSTUP_HOME`/`$CARGO_HOME` are also bound and set. Not
+  calling it leaves the hermetic minimal-`PATH` behavior unchanged. Used by
+  the TUI's `!` command; ordinary model `shell.exec` in the project sandbox
+  never calls this and stays hermetic.
 
-- `with_profile(&SandboxProfile)` setzt alle Module in einem Aufruf.
-- `with_cargo_profile()` und `with_tmux_profile()` bleiben für einzelnen Zugriff.
-- `plan()` bindet Cargo-Toolchain und/oder tmux-Socket anhand des Profils.
-- **Nutzerwunsch (2026-09-21):** `plan()` setzt für **alle** Profile
-  `--unshare-user` sowie `--uid`/`--gid` auf die effektiven IDs des
-  harw-Prozesses (aus `metadata("/proc/self")`, injizierbar für Tests) und
-  bindet `/etc/passwd`, `/etc/group` sowie `/etc/nsswitch.conf` read-only per
-  `--ro-bind-try`; `USER`/`LOGNAME` werden aus der harw-Umgebung gesetzt.
-  Damit funktionieren `whoami` und `id` auch in der strikten Sandbox. Die
-  Host-Ausführung (siehe „Semantisch angefragter Host-Modus" oben) läuft
-  ohnehin bereits als Nutzerprozess und ist davon nicht betroffen.
-- Neuer Builder `with_host_path(path: &str)`: bindet für jedes im
-  übergebenen PATH existierende Verzeichnis, das nicht bereits unter
-  `/usr /bin /lib /lib64` oder dem Workspace liegt, `--ro-bind-try dir dir`
-  (ausgenommen `/` und exakt `$HOME`) und setzt `--setenv PATH <host PATH>`.
-  Enthält der PATH `~/.cargo/bin`, wird zusätzlich `$RUSTUP_HOME` (Default
-  `~/.rustup`) und `$CARGO_HOME` (Default `~/.cargo`) per `--ro-bind-try`
-  gebunden und `RUSTUP_HOME`/`CARGO_HOME` gesetzt, damit die
-  rustup-Proxy-Binaries funktionieren. Ohne Aufruf bleibt das Verhalten
-  unverändert (hermetischer Minimal-PATH). Genutzt vom `!`-Befehl der TUI
-  (Teil C, siehe ShellExecutor/ShellToolProvider unten) — die normale
-  Modell-`shell.exec` in der Projekt-Sandbox ruft `with_host_path` nicht auf
-  und bleibt hermetisch.
+### `ShellExecutor`/`ShellToolProvider` (`harw-tool-shell/src/exec.rs`)
 
-### ShellExecutor/ShellToolProvider (harw-tool-shell/src/exec.rs)
+- `sandbox_profile: SandboxProfile` and
+  `permit_ledger: Option<Arc<ProcessPermitLedger>>` fields.
+- Host profile with no ledger → fail-closed. Strict/Cargo/Tmux with no
+  ledger → normal (the sandbox is the boundary).
+- `run_command` computes `effective_host = sandbox_profile.is_host() ||
+  registry.is_session_approved(session_id) || registry.take_single_use(session_id)`.
+  When true, the call runs, after `authorize_host_command`, **without
+  bubblewrap**: `tokio::process::Command::new("/bin/sh").args(["-c", cmd])`,
+  `cwd` at the workspace root, the harw environment fully inherited
+  (including the user's shell context — `PATH`/`HOME`/`CARGO_HOME`), still
+  under the existing `prlimit` limits. Timeout, cancel and
+  `terminate()`/output truncation follow the same paths as the sandboxed
+  case. Model `shell.exec` with no active session or single-use grant stays
+  hermetic in bubblewrap with a minimal `PATH` — `effective_host` becomes
+  true only via `SandboxProfile::Host`, an active `sandbox-lease`, or a
+  consumed single-use grant, never via the tool call itself.
+  `is_session_approved`/`take_single_use` also consult the process-wide
+  global grant state described above; `ShellExecutor` itself doesn't
+  distinguish global from per-session, it only asks "is this session_id
+  allowed" — whether it can ask at all depends on
+  `self.host_permit_registry.is_some()` (see the registry wiring note
+  below).
+- `with_host_path()` on `ShellToolProvider` passes through to
+  `BwrapLauncher::with_host_path`. Called by the TUI's `!` command
+  (`harw-tui/src/command_exec.rs::execute_shell`), which supplies the
+  `PATH` read from harw's own shell environment at startup, independent of
+  any `sandbox-lease`. `!` commands therefore always run with harw's shell
+  `PATH` bound in, but still inside bubblewrap — never on the host, even
+  under an active lease.
 
-- `sandbox_profile: SandboxProfile` und `permit_ledger: Option<Arc<ProcessPermitLedger>>`
-  als Felder von ShellExecutor und ShellToolProvider.
-- `with_sandbox_profile()` und `with_permit_ledger()` Builder.
-- Host-Profil ohne Ledger → fail-closed.
-- Strict/Cargo/Tmux ohne Ledger → normal (Sandbox ist die Grenze).
-- **Nutzerentscheidung (2026-09-21):** `run_command` bildet
-  `effective_host = sandbox_profile.is_host() ||
-  registry.is_session_approved(session_id) ||
-  registry.take_single_use(session_id)`. Ist `effective_host` wahr, startet
-  der Aufruf nach `authorize_host_command` **ohne bwrap**:
-  `tokio::process::Command::new("/bin/sh").args(["-c", cmd])`, `cwd` =
-  Workspace-Wurzel, Umgebung von harw vollständig geerbt (also der
-  zsh-Kontext des Nutzers inklusive PATH/HOME/CARGO_HOME), weiterhin unter
-  den bestehenden `prlimit`-Limits. Timeout, Cancel und
-  `terminate()`/Output-Kappung bleiben dieselben Pfade wie im
-  Sandbox-Fall. Modell-`shell.exec` **ohne** aktive Sitzungs- oder
-  Einzelfreigabe bleibt weiterhin hermetisch in bwrap mit Minimal-PATH —
-  `effective_host` wird nur durch `SandboxProfile::Host`, einen aktiven
-  `sandbox-lease` oder eine verbrauchte Einzelfreigabe wahr, nie durch den
-  Tool-Aufruf selbst. Diese Formel selbst ist unverändert; `is_session_approved`
-  und `take_single_use` fragen seit dem Nachtrag unten intern zusätzlich
-  einen *prozessweiten* Freigabezustand ab (`HostPermitSessionRegistry`), den
-  `session_id` gar nicht selbst gesetzt haben muss — `ShellExecutor` kennt
-  diesen Unterschied nicht, er fragt nur "ist diese `session_id` erlaubt".
-  Ob er die Frage überhaupt stellen kann, hängt an
-  `self.host_permit_registry.is_some()` — siehe „Nachtrag (2026-09-21) —
-  prozessweite Freigabe" oben für die zugehörige Verdrahtungslücke in
-  `profile.rs`.
-- Neuer Builder `with_host_path()` auf `ShellToolProvider`, reicht an
-  `BwrapLauncher::with_host_path` durch (siehe oben). Aufrufer ist der
-  `!`-Befehl der TUI (`harw-tui/src/command_exec.rs::execute_shell`), der
-  den beim Programmstart gelesenen `PATH` der harw-eigenen zsh-Umgebung
-  übergibt — unabhängig von einem `sandbox-lease`. `!`-Befehle laufen also
-  immer mit dem zsh-PATH des harw-Prozesses (PATH-Verzeichnisse per
-  `--ro-bind-try`, `~/.cargo/bin` zusätzlich mit
-  `RUSTUP_HOME`/`CARGO_HOME`), bleiben aber in bwrap — sie laufen nicht auf
-  dem Host, auch nicht bei aktivem Lease.
+### Registry (`harw-registry-defaults/src/profile.rs`)
 
-### Registry (harw-registry-defaults/src/profile.rs)
-
-- `profile_tool_providers()` erhält `sandbox_profile: &SandboxProfile`.
+- `profile_tool_providers()` takes `sandbox_profile: &SandboxProfile`.
 - `assemble_registry_for_sandbox_with_definition_access_and_sandbox_profile()`
-  nimmt das Profil explizit entgegen; die bestehende Funktion delegiert mit
-  `Strict` als Default.
-- **Nachtrag (2026-09-21):** `build_shell_provider` (in
-  `profile_tool_providers`) hängt Ledger, Sitzungs-Registry und
-  Fragekanal-Sender aus `HostPermitWiring` jetzt an **jeden** gebauten
-  `ShellToolProvider`, sobald `host_permits` übergeben wurde — unabhängig
-  davon, ob `sandbox_profile.is_host()` gilt. Vorher geschah das nur für ein
-  `SandboxProfile::Host`-Profil; die Root-Session läuft aber mit `Strict`,
-  sodass ein `/sandbox-lease` sie nie erreichte
-  (`ShellExecutor.host_permit_registry` blieb `None`,
-  `determine_effective_host` lieferte immer `false`). Sicherheitsgrenze
-  bleibt unverändert: für Strict/Cargo/Tmux prüft `determine_effective_host`
-  weiterhin ausschließlich die Registry-Freigabe (nie den Permit-Ledger
-  selbst), ohne aktive Freigabe bleibt die Sandbox die Grenze.
+  takes the profile explicitly; the existing function delegates with
+  `Strict` as the default.
+- `build_shell_provider` wires the permit ledger, session registry and
+  question-channel sender from `HostPermitWiring` onto **every** constructed
+  `ShellToolProvider` whenever `host_permits` is supplied, regardless of
+  whether `sandbox_profile.is_host()` — previously this only happened for a
+  `SandboxProfile::Host` profile, which meant a `/sandbox-lease` grant never
+  reached the root session (which runs `Strict`). The security boundary is
+  unchanged by this: for Strict/Cargo/Tmux, `determine_effective_host`
+  still checks only the registry grant, never the permit ledger itself, and
+  with no active grant the sandbox remains the boundary.
 
-### Runtime (harw-runtime/src/assembly.rs)
+### Runtime (`harw-runtime/src/assembly.rs`)
 
-- `sandbox_profile_from_config()` baut das Profil aus `[sandbox]`-Konfiguration.
+- `sandbox_profile_from_config()` builds the profile from `[sandbox]`
+  configuration.
 - Cargo → `Cargo(CargoSandboxProfile::new(...))`, Tmux →
-  `Tmux(TmuxSandboxProfile::new(...))`, sonst `Strict`.
-- Bei Validierungsfehler: warn! und Rückfall auf Strict (fail-safe).
+  `Tmux(TmuxSandboxProfile::new(...))`, otherwise `Strict`.
+- On a validation error: warns and falls back to `Strict` (fail-safe).
 
-### Konfiguration (harw-config/src/harness_config.rs)
+### Configuration (`harw-config/src/harness_config.rs`)
 
 ```toml
 [sandbox.cargo]
@@ -364,15 +315,17 @@ mode = "inspect"
 socket_path = "/tmp/tmux-1000/default"
 ```
 
-Alle Sektionen mit `deny_unknown_fields`. Fehlt eine Sektion, bleibt die Sandbox
-hermetisch.
+All sections use `deny_unknown_fields`. A missing section leaves the
+sandbox hermetic.
 
-### Worker-Definitionen (harw-registry-defaults/agents/)
+### Worker definitions (`harw-registry-defaults/agents/`)
 
-- `sandbox-shell-worker.toml` — Strict-Profil.
-- `cargo-worker.toml` — Cargo-Profil.
-- `tmux-inspector-worker.toml` — Tmux-Profil.
-- `host-process-worker.toml` — Host-Profil, Permit-Pflicht.
+- `sandbox-shell-worker.toml` — strict profile.
+- `cargo-worker.toml` — cargo profile.
+- `tmux-inspector-worker.toml` — tmux profile.
+- `host-process-worker.toml` — host profile, permit required.
+- `uia-shell-worker.toml` — host profile, `shell.exec` plus read-only
+  `fs.*`, permit required.
 
-Alle extenden `worker-base@1`, haben `shell.exec` als einziges Werkzeug und
-`max_depth = 0`.
+All extend `worker-base@1`, have `shell.exec` as their only tool (plus
+read-only `fs.*` for `uia-shell-worker`), and `max_depth = 0`.

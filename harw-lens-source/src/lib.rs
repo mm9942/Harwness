@@ -34,7 +34,7 @@
 //! Sicherheitsbefunde, Code. Geprüft gegen das, was der Baum tatsächlich
 //! hergibt:
 //!
-//! - **Plan → kein neuer Index.** `docs/aw-plan.md` ist eine
+//! - **Plan → kein neuer Index.** `docs/design/build-history.md` ist eine
 //!   Markdown-Datei unterhalb des von [`collect_design_docs`] durchsuchten
 //!   Wurzelverzeichnisses und damit bereits Teil von [`DOCS_DESIGN_INDEX`] —
 //!   dessen eigene Beschreibung nennt ausdrücklich „Planungs- **und**
@@ -59,7 +59,7 @@
 //!   das wäre eine Annahme über eine noch nicht existierende Persistenz,
 //!   keine Ableitung aus etwas Gelandetem. Dieser Knoten baut deshalb
 //!   **keinen** `security.findings`-Index; siehe „Später fällig" in
-//!   `docs/aw-plan.md`, sobald `harw-dod-escalate`/`harw-dod-warden` einen
+//!   `docs/design/build-history.md`, sobald `harw-dod-escalate`/`harw-dod-warden` einen
 //!   iterierbaren Befund-Bestand liefern.
 //! - **Code → [`CODE_RUST_INDEX`].** `harw-lens-chunk` trägt mit
 //!   `chunk_rust` bereits eine dritte, code-spezifische Zerlegungsstrategie

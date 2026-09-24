@@ -2,8 +2,10 @@
 name = "harw-killer"
 version.workspace = true
 edition.workspace = true
+license.workspace = true
+repository.workspace = true
 rust-version.workspace = true
-description = "Linux-Prozessterminator mit pidfd-Identität und wiederholtem SIGKILL (Bibliothek, `killer`-Binary und Grundlage für `harw kill` sowie das Agent-Werkzeug `process.kill`)."
+description = "Linux process terminator with pidfd identity and repeated SIGKILL (library, `killer` binary, and foundation for `harw kill` and the `process.kill` agent tool)."
 publish.workspace = true
 
 [lib]

@@ -617,7 +617,7 @@ fn test_security_critical_mcp_listener_principals_intersection_rejects_addition(
     let p1 = McpPrincipalToml {
         id: "p1".to_owned(),
         credential_ref: SecretRef::from_str("env:P1_TOKEN").map_err(ctx("secret ref p1"))?,
-        tenant: "mia".to_owned(),
+        tenant: "alice".to_owned(),
         workspace: "harwness".to_owned(),
         job_capabilities: vec![],
     };
@@ -639,7 +639,7 @@ fn test_security_critical_mcp_listener_principals_intersection_rejects_addition(
             [[mcp_listener.principals]]
             id = "p1"
             credential_ref = "env:P1_TOKEN"
-            tenant = "mia"
+            tenant = "alice"
             workspace = "harwness"
             [[mcp_listener.principals]]
             id = "intruder"
@@ -1049,7 +1049,7 @@ fn test_discover_config_with_restricted_untrusted_project_cannot_reach_mcp_liste
             [[mcp_listener.principals]]
             id = "p1"
             credential_ref = "env:P1_TOKEN"
-            tenant = "mia"
+            tenant = "alice"
             workspace = "harwness"
 
             [sandbox.cargo]
@@ -1069,7 +1069,7 @@ fn test_discover_config_with_restricted_untrusted_project_cannot_reach_mcp_liste
             [[mcp_listener.principals]]
             id = "p1"
             credential_ref = "env:P1_TOKEN"
-            tenant = "mia"
+            tenant = "alice"
             workspace = "harwness"
             [[mcp_listener.principals]]
             id = "intruder"
@@ -1156,14 +1156,14 @@ fn test_merge_layer_into_mcp_listener_principals_removal_is_silent() -> TestResu
     let p1 = McpPrincipalToml {
         id: "p1".to_owned(),
         credential_ref: SecretRef::from_str("env:P1_TOKEN").map_err(ctx("secret ref p1"))?,
-        tenant: "mia".to_owned(),
+        tenant: "alice".to_owned(),
         workspace: "harwness".to_owned(),
         job_capabilities: vec![],
     };
     let p2 = McpPrincipalToml {
         id: "p2".to_owned(),
         credential_ref: SecretRef::from_str("env:P2_TOKEN").map_err(ctx("secret ref p2"))?,
-        tenant: "mia".to_owned(),
+        tenant: "alice".to_owned(),
         workspace: "harwness".to_owned(),
         job_capabilities: vec![],
     };
@@ -1177,7 +1177,7 @@ fn test_merge_layer_into_mcp_listener_principals_removal_is_silent() -> TestResu
             [[mcp_listener.principals]]
             id = "p1"
             credential_ref = "env:P1_TOKEN"
-            tenant = "mia"
+            tenant = "alice"
             workspace = "harwness"
         "#,
     )?;
@@ -1207,14 +1207,14 @@ fn test_merge_layer_into_mcp_listener_principals_addition_is_rejected() -> TestR
     let p1 = McpPrincipalToml {
         id: "p1".to_owned(),
         credential_ref: SecretRef::from_str("env:P1_TOKEN").map_err(ctx("secret ref p1"))?,
-        tenant: "mia".to_owned(),
+        tenant: "alice".to_owned(),
         workspace: "harwness".to_owned(),
         job_capabilities: vec![],
     };
     let p3 = McpPrincipalToml {
         id: "p3".to_owned(),
         credential_ref: SecretRef::from_str("env:P3_TOKEN").map_err(ctx("secret ref p3"))?,
-        tenant: "mia".to_owned(),
+        tenant: "alice".to_owned(),
         workspace: "harwness".to_owned(),
         job_capabilities: vec![],
     };
@@ -1228,12 +1228,12 @@ fn test_merge_layer_into_mcp_listener_principals_addition_is_rejected() -> TestR
             [[mcp_listener.principals]]
             id = "p1"
             credential_ref = "env:P1_TOKEN"
-            tenant = "mia"
+            tenant = "alice"
             workspace = "harwness"
             [[mcp_listener.principals]]
             id = "p3"
             credential_ref = "env:P3_TOKEN"
-            tenant = "mia"
+            tenant = "alice"
             workspace = "harwness"
         "#,
     )?;
@@ -1266,14 +1266,14 @@ fn test_merge_layer_into_mcp_listener_principals_field_change_is_rejected_home_w
     let home_p1 = McpPrincipalToml {
         id: "p1".to_owned(),
         credential_ref: SecretRef::from_str("env:P1_TOKEN").map_err(ctx("secret ref home"))?,
-        tenant: "mia".to_owned(),
+        tenant: "alice".to_owned(),
         workspace: "harwness".to_owned(),
         job_capabilities: vec![McpJobCapabilityToml::ReadOwn],
     };
     let profile_p1 = McpPrincipalToml {
         id: "p1".to_owned(),
         credential_ref: SecretRef::from_str("env:P1_TOKEN").map_err(ctx("secret ref profile"))?,
-        tenant: "mia".to_owned(),
+        tenant: "alice".to_owned(),
         workspace: "harwness".to_owned(),
         job_capabilities: vec![
             McpJobCapabilityToml::ReadOwn,
@@ -1290,7 +1290,7 @@ fn test_merge_layer_into_mcp_listener_principals_field_change_is_rejected_home_w
             [[mcp_listener.principals]]
             id = "p1"
             credential_ref = "env:P1_TOKEN"
-            tenant = "mia"
+            tenant = "alice"
             workspace = "harwness"
             job_capabilities = ["read_own", "cancel_workspace"]
         "#,

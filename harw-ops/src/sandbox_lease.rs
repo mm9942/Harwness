@@ -1,8 +1,7 @@
 //! `/sandbox-lease` — Modell-getriebene Aufhebung der Sandbox für `shell.exec`.
 //!
-//! Spec-Quelle: `/home/mia/.claude/plans/recursive-cooking-lobster.md`, Teil
-//! B5 ("Neue Operation `sandbox-lease`") und Teil B3
-//! (`Arc<harw_tool_shell::HostPermitHandles>`-ServiceMap-Eintrag).
+//! Neue Operation `sandbox-lease` mit einem
+//! `Arc<harw_tool_shell::HostPermitHandles>`-ServiceMap-Eintrag.
 //!
 //! # Verantwortungsbereich
 //! Diese Operation ist der **einzige** Weg, über den ein Modell selbst eine

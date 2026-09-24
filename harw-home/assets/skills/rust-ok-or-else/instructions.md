@@ -29,7 +29,7 @@ fn get_secret(config: &AppConfig) -> Result<&str> {
 ## Richtig
 
 ```rust
-// Datei: sgh-secureHUB/crates/securehub-api/src/auth.rs:209-221
+// Datei: acme-secure-hub/crates/securehub-api/src/auth.rs:209-221
 use securehub_error::{Error, Result};
 
 fn bearer_token(headers: &hyper::HeaderMap) -> Result<&str> {

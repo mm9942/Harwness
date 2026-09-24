@@ -14,8 +14,8 @@
 //! - [`exec`] — [`ShellToolProvider`], [`ShellExecutor`], [`ShellExecError`],
 //!   [`HOST_SESSION_LEASE_TTL`], [`HOST_PERMIT_PROMPT_TIMEOUT`]: Host-Ausführung
 //!   ohne `bwrap` läuft für Modell-Aufrufe ausschließlich über
-//!   [`ShellExecutor::run_command`] (Plan `recursive-cooking-lobster.md` Teil B1).
-//!   Runde 6, Teil B: [`run_operator_command`]/[`OperatorCommand`] — `!`-Befehle
+//!   [`ShellExecutor::run_command`].
+//!   [`run_operator_command`]/[`OperatorCommand`] — `!`-Befehle
 //!   der Nutzerin immer auf dem Host (ohne Freigabe, sudo bleibt abgelehnt,
 //!   Audit `shell.operator_exec`)
 //! - [`limits`] — [`ShellLimits`], [`ShellLimitsError`]: rlimits über festgepinntes `prlimit`

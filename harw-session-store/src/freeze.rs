@@ -25,7 +25,7 @@
 //! legitimately be frozen for more than one concurrent finding (a memory
 //! violation and a network-policy violation are independent facts about the
 //! same cgroup) — collapsing those into one record would silently drop one
-//! of them. This is spelled out in `docs/aw-contract-master.md` §B.1:
+//! of them. This is spelled out in `docs/design/build-history.md` §B.1:
 //! `Freeze` is keyed by `(CgroupId, FindingId, frozen_at)`, never by
 //! `CgroupId` alone.
 //!

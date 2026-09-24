@@ -72,7 +72,7 @@
 //! Dieses Modul erzeugt keine Fehler.
 //!
 //! # Spec
-//! `docs/remediation/CONTRACTS.md` §runtime-spec (Reduktionstabelle je
+//! `docs/design/runtime-contracts.md` §runtime-spec (Reduktionstabelle je
 //! [`crate::EntryKind`]) — die Spawner-Spalte dort begründet die einzige
 //! Spawner-Differenz dieser Fabrik.
 
@@ -178,7 +178,7 @@ impl ServiceSurface {
     ///
     /// # Beschreibung
     /// Erste der beiden **deklarierten** Differenzen der Fabrik. Begründung aus
-    /// `CONTRACTS.md` §runtime-spec: die Spawner-Spalte gibt `BuiltinRoles` nur
+    /// `docs/design/runtime-contracts.md` §runtime-spec: die Spawner-Spalte gibt `BuiltinRoles` nur
     /// für `Tui`, `OneShot` und `Analyze` — also für Slash und Modell-Werkzeug;
     /// `Web`, `JobPrompt` und `JobPlanNode` stehen dort auf `SpawnerPolicy::None`.
     ///
@@ -1136,7 +1136,7 @@ mod tests {
             );
             assert!(
                 map.get::<Arc<ManagedAgentSpawner>>().is_none(),
-                "CONTRACTS.md §runtime-spec: {} hat SpawnerPolicy::None",
+                "docs/design/runtime-contracts.md §runtime-spec: {} hat SpawnerPolicy::None",
                 surface.as_str()
             );
             assert!(

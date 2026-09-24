@@ -207,7 +207,7 @@ allowed = [
 # `harw-agent-dsl/src/executable.rs::ReturnPipeline`, "diese IR prüft weder
 # Existenz noch Form des Schemas") — dieselbe Konvention, die `coding.toml`
 # und `research.toml` bereits nutzen. Der Wert ist keine Erfindung dieser
-# Datei: `docs/aw-plan.md` benennt `harwness.security-verdict/v1` bereits als
+# Datei: `docs/design/build-history.md` benennt `harwness.security-verdict/v1` bereits als
 # Ziel-ID von AW6-02 ("Verdict-Vertrag"). AW6-02 hängt an AW6-01 (dieser
 # Knoten) — diese Familie legt die ID als forward-declared Label fest, AW6-02
 # implementiert den Vertrag dahinter.

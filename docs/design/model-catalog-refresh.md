@@ -1,5 +1,7 @@
 # Provider model refresh and persistent setup
 
+> Status: implemented · Last reviewed: 2026-09-24
+
 The bundled provider lists were refreshed from https://models.dev/api.json on
 2026-09-11. Both interactive onboarding and `harw catalog` load current lists
 through the models.dev cache. The cache lives at `<HARW_HOME>/cache/models_dev.json`

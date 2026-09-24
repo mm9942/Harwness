@@ -3,6 +3,8 @@ publish.workspace = true
 name = "harw-secrets"
 version.workspace = true
 edition.workspace = true
+license.workspace = true
+repository.workspace = true
 rust-version.workspace = true
 
 [dependencies]
@@ -13,7 +15,7 @@ chacha20poly1305 = "0.11.0"
 # and ship a migration plan (see `kek.rs` KAT tests).
 crypt_guard = "=3.0.2"
 getrandom = { version = "0.4.2", features = ["std"] }
-# F-006: symlinkfestes Öffnen (korrektes O_NOFOLLOW je Architektur, CONTRACTS.md §fsutil).
+# F-006: symlinkfestes Öffnen (korrektes O_NOFOLLOW je Architektur, `harw-fsutil`).
 harw-fsutil = { path = "../harw-fsutil" }
 harw-macros = { path = "../harw-macros" }
 harw-observe = { path = "../harw-observe" }

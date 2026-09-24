@@ -1,40 +1,34 @@
-# Tool-Kanon v1 — Rust-idiomatische Umsetzung
+# Tool Canon v1 — a Rust-idiomatic design
 
-**Status:** Design-Anker.
-**Bindet an:** `philosophy.md` §10 (Operations ≠ Tools ≠ Permissions), §11 (Tool-Design als eigene UI), §12 (monotone Authority-Reduktion), §16 Invarianten 14 & 15.
-**Inspirationen (siehe `docs/research/tool-inventory.md`):** codex-rs, Hermes, OpenClaw.
+> Status: proposal · Last reviewed: 2026-09-24
 
-> **Ist-Stand (2026-09)**: `harw-tool-canon` wurde nie gebaut. Das reale
-> Tool-Vokabular im Baum ist stattdessen `fs.*` (`read`/`write`/`list`/
-> `search`/`glob`/`grep`), `shell.exec`, `web.fetch`/`web.docs_rs`/
-> `web.crates_io`, `lens.ask`, `deps.*`, `browser.*`. Das `#[tool]`-Makro
-> existiert; Typestate-Approval, `ToolHandle` und `SyscallBoundary` aus diesem
-> Dokument existieren nicht. Kanon-Tools ohne Gegenstück im Ist-Code:
-> `apply_patch`, `web_search`, `tool_search`, `request_user_input`,
-> `request_permissions`, `cron_schedule`, `execute_code`.
+**Ties into**: [`philosophy.md`](../philosophy/philosophy.md) §10 (operations ≠ tools ≠ permissions), §11 (tool design as its own UI), §12 (monotone authority reduction), §16 invariants 14 & 15.
+**Inspiration** (see [`docs/research/tool-inventory.md`](../research/tool-inventory.md)): studying other open-source coding-agent projects' tool vocabularies (their own naming, not reproduced verbatim here).
+
+> **Current state**: `harw-tool-canon`, the crate this document designs, was never built. The tool vocabulary that actually exists in the tree instead lives across several crates — `harw-tool-fs` (`fs.read`/`write`/`list`/`search`/`glob`/`grep`), `harw-tool-shell` (`shell.exec`), `harw-tool-web` (`web.fetch`/`web.docs_rs`/`web.crates_io`), `harw-tool-lens`, `harw-tool-deps`, `harw-tool-browser`, `harw-tool-doc`, `harw-tool-process`, `harw-tool-explorer`, `harw-tool-plan`, on top of the shared boundary crate `harw-tools`. The `#[tool]` proc-macro described in §2.4 does not exist; neither does the typestate approval, `ToolHandle`, or `SyscallBoundary` design below. None of the canon tool names in §2–§3 (`apply_patch`, `web_search`, `tool_search`, `request_user_input`, `request_permissions`, `cron_schedule`, `execute_code`) have a counterpart in the real code. This document is kept as a design reference for that possible future direction, not as a description of the current tool layer.
 
 ---
 
-## 1. Was Harwness heute schon richtig macht
+## 1. What Harwness already gets right
 
-Bereits im Workspace:
+Already in the workspace:
 
-- `harw-tools` — reine Vokabular-Boundary (`ToolCall`, `ToolExecutor`, `ToolExecutionContext`, `ToolSpec`, `JsonSchema`, `ToolOutput`, `TracedToolExecutor`). Redaction-Regel für Tracing bereits durchgesetzt.
-- `harw-operations` — `Operation`-Trait + Adapter (`command.rs`, `model_tool.rs`) → philosophy.md §10 („eine Operation, mehrere Oberflächen").
-- `harw-sandbox` — `SandboxSpec` als serverseitig aufgelöste Authority-Boundary.
-- `harw-macros` — Proc-Macros für Operation-Deklaration (bereits vorhanden, verifizieren).
-- `harw-job-runtime` — Lease/Fencing/Heartbeat für langlebige Jobs (philosophy.md §7).
-- `harw-memory` — HOT/WARM/COLD-Store + Heartbeat + STM + Context-Rendering (Wave 1–3).
+- `harw-tools` — a pure vocabulary boundary (`ToolCall`, `ToolExecutor`, `ToolExecutionContext`, `ToolSpec`, `JsonSchema`, `ToolOutput`, `TracedToolExecutor`). A redaction rule for tracing is already enforced.
+- `harw-operations` — the `Operation` trait plus adapters (`command.rs`, `model_tool.rs`) → philosophy.md §10 ("one operation, several surfaces").
+- `harw-sandbox` — `SandboxSpec` as a server-side-resolved authority boundary.
+- `harw-macros` — proc-macros for operation declaration.
+- `harw-job-runtime` — lease/fencing/heartbeat for long-lived jobs (philosophy.md §7).
+- `harw-memory` — HOT/WARM/COLD store plus heartbeat, STM, and context rendering.
 
-Das ist die Grundlage, die Codex/Hermes/OpenClaw so nicht besitzen. Der Rest sind konkrete Executor-Impls für die Kanon-Tools.
+That foundation is already in place. What's proposed below is a set of concrete executor implementations for a fixed canon of tools, built on top of it.
 
 ---
 
-## 2. Rust-Idiome, mit denen wir Codex/Hermes/OpenClaw schlagen
+## 2. Rust idioms this design would use
 
-### 2.1 Typestate für Approval-Stufen
+### 2.1 Typestate for approval tiers
 
-Codex kodiert Approval als Runtime-Flag, Hermes über Python-Decorators, OpenClaw über `ToolAvailabilityExpression`. Rust erlaubt Compile-Time:
+Rust allows encoding approval tiers at compile time rather than as a runtime flag or decorator:
 
 ```rust
 pub struct AutoApprove;
@@ -52,16 +46,16 @@ pub struct Tool<Approval: ApprovalTier, In, Out> {
 }
 
 impl<In, Out> Tool<NeedsApproval, In, Out> {
-    // execute-Signatur zwingt Approval-Callback zur Compile-Zeit
+    // the execute signature forces an approval callback at compile time
     pub async fn execute(&self, input: In, approval: ApprovalGranted) -> Out { … }
 }
 ```
 
-Ein `Tool<NeedsApproval, …>` **kann nicht** ohne `ApprovalGranted`-Token ausgeführt werden. Kein Vergessen, kein Bypass.
+A `Tool<NeedsApproval, …>` **cannot** run without an `ApprovalGranted` token. No forgetting, no bypass.
 
-### 2.2 Zero-Copy Tool-Schema
+### 2.2 Zero-copy tool schema
 
-Codex und Hermes bauen JSON-Schemas jedes Mal zur Laufzeit auf. Rust kann sie `const`-inline haben:
+Rather than building a JSON schema at runtime on every call, it can be `const`-inline:
 
 ```rust
 pub const APPLY_PATCH_SCHEMA: &str = include_str!("../schemas/apply_patch.json");
@@ -74,11 +68,11 @@ pub const SPEC: ToolSpecStatic = ToolSpecStatic {
 };
 ```
 
-Dann `serde_json::value::RawValue` als Grenze; erst der Dispatch parst gezielt in das getypte Input-Struct.
+Then `serde_json::value::RawValue` as the boundary; only dispatch parses it into the typed input struct.
 
-### 2.3 Enum-Dispatch statt trait objects
+### 2.3 Enum dispatch instead of trait objects
 
-Für den Hot-Path (12 Kanon-Tools) ist Monomorphisierung günstiger als `Box<dyn ToolExecutor>`:
+For the hot path (a fixed set of canon tools), monomorphization is cheaper than `Box<dyn ToolExecutor>`:
 
 ```rust
 pub enum CanonExecutor {
@@ -104,11 +98,11 @@ impl CanonExecutor {
 }
 ```
 
-Registry ist dann `HashMap<ToolName, CanonExecutor>` (kein `Box<dyn>` in der Hot-Loop). Für Plugin-Tools bleibt `Box<dyn ToolExecutor>` verfügbar — hybrides Modell.
+The registry would then be `HashMap<ToolName, CanonExecutor>` (no `Box<dyn>` in the hot loop). Plugin tools would keep using `Box<dyn ToolExecutor>` — a hybrid model.
 
-### 2.4 `#[tool]`-Proc-Macro
+### 2.4 A `#[tool]` proc-macro
 
-`harw-macros` erweitert um:
+`harw-macros` would gain:
 
 ```rust
 #[tool(
@@ -122,17 +116,11 @@ pub async fn shell(ctx: &ToolExecutionContext, args: ShellArgs) -> Result<ShellO
 }
 ```
 
-Macro erzeugt:
-- `ToolSpec`-Konstante
-- `impl ToolExecutor for ShellExecutor`
-- Registry-Eintrag via inventory-Pattern
-- Compile-Time-Check, dass `args`-Typ ein `#[derive(JsonSchema)]` trägt
+The macro would generate: a `ToolSpec` constant, an `impl ToolExecutor for ShellExecutor`, a registry entry via an inventory pattern, and a compile-time check that the `args` type derives `JsonSchema`.
 
-Codex hat solche Macros nicht (freie Rust-Handler mit manueller Registry). Hermes hat Python-Decorators ohne Compile-Time-Garantie.
+### 2.5 Deferred loading as `enum ToolHandle`
 
-### 2.5 Deferred Loading als `enum ToolHandle`
-
-Hermes 3-stufiges Loading (`tool_search`, `tool_describe`, `tool_call`) lässt sich in Rust als:
+A three-stage loading model (search → describe → call, as several coding-agent tool layers use) can be expressed in Rust as:
 
 ```rust
 pub enum ToolHandle {
@@ -141,96 +129,96 @@ pub enum ToolHandle {
 }
 ```
 
-`Deferred` gibt dem Modell nur den Namen (billige Katalog-Antwort), der eigentliche Executor wird erst bei `tool_call` materialisiert. Kein Reflection-Overhead — Rust-`fn`-Pointer.
+`Deferred` gives the model only the name (a cheap catalog entry); the actual executor materializes only on `tool_call` — no reflection overhead, a plain Rust `fn` pointer.
 
-### 2.6 `Cow<'a, str>` für Tool-Inputs
+### 2.6 `Cow<'a, str>` for tool inputs
 
-Viele Tool-Inputs sind kurze Referenzen (Pfade, IDs). Aktuelle Codex-Executor allokieren neue `String`. Wir können mit `Cow<'a, str>` sowohl Borrow als auch Owned akzeptieren — spart Alloc auf dem Hot-Path.
+Many tool inputs are short references (paths, IDs). Using `Cow<'a, str>` lets an executor accept either a borrow or an owned value — saving an allocation on the hot path.
 
-### 2.7 `#[non_exhaustive]` auf Output-Enums
+### 2.7 `#[non_exhaustive]` on output enums
 
-Codex bricht bei Updates seiner ToolResult-Variante regelmäßig Konsumenten. Rust-Enum `#[non_exhaustive]` erzwingt beim Consumer explizites `_ => …`, das Erweiterungen ohne SemVer-Break erlaubt.
+A `#[non_exhaustive]` enum forces consumers to write an explicit `_ => …` arm, which lets the tool-output shape grow without a semver break.
 
-### 2.8 Sandbox als Trait-Bound
+### 2.8 Sandbox as a trait bound
 
-`ExecuteCodeExecutor` und `ShellExecutor` sollen ausschließlich mit einem `Sandbox: SyscallBoundary` arbeiten. Kein „unsandboxed Fallback in Debug-Builds":
+`ExecuteCodeExecutor` and `ShellExecutor` would work exclusively with a `Sandbox: SyscallBoundary`. No "unsandboxed fallback in debug builds":
 
 ```rust
 pub struct ShellExecutor<S: SyscallBoundary + Send + Sync> { sandbox: S }
 ```
 
-Compile-Time-Garantie, dass ein Test-Sandbox nicht in Produktion landet, wenn der Feature-Flag anders steht.
+A compile-time guarantee that a test sandbox can't end up in production behind a differently-set feature flag.
 
-### 2.9 Lease-getragene Agent-Spawns
+### 2.9 Lease-carried agent spawns
 
-`DelegateTaskExecutor` liefert kein reines `ChildAgentId` zurück, sondern ein `LeaseToken<ChildAgent>` (aus `harw-job-runtime`). Das Typsystem verhindert, dass ein Caller den Child ansprechen kann, ohne ihn geleased zu halten (philosophy.md §7).
+`DelegateTaskExecutor` would return not a plain `ChildAgentId` but a `LeaseToken<ChildAgent>` (from `harw-job-runtime`). The type system then prevents a caller from addressing the child without holding its lease (philosophy.md §7).
 
-### 2.10 `tracing`-Spans als Compile-Time-Contract
+### 2.10 `tracing` spans as a compile-time contract
 
-Wir haben schon `TracedToolExecutor` als Blanket-Impl. Ausbaustufe: `#[tool]`-Macro deklariert Spans als `const &'static str`-Namen, sodass Konsumenten keine „ad-hoc"-Spans schreiben und Log-Aggregation stabil bleibt.
+`TracedToolExecutor` already exists as a blanket impl. A further step: the `#[tool]` macro would declare span names as `const &'static str`s, so consumers never write ad-hoc spans and log aggregation stays stable.
 
 ---
 
-## 3. Zielarchitektur
+## 3. Target architecture
 
 ```
-harw-tools (Boundary, existiert)
+harw-tools (boundary, exists)
     ├── ToolSpec / ToolCall / ToolOutput / ToolExecutor
     └── TracedToolExecutor (redaction)
 
-harw-operations (Semantische Ops, existiert)
-    ├── Operation-Trait
+harw-operations (semantic ops, exists)
+    ├── Operation trait
     └── Adapter { command, model_tool, channel }
 
-harw-tool-canon (NEU — dieser Fanout)
-    ├── canon.rs                 → enum CanonExecutor + Registry
+harw-tool-canon (proposed — not built)
+    ├── canon.rs                 → enum CanonExecutor + registry
     ├── shell.rs                 → shell_command
     ├── patch.rs                 → apply_patch
     ├── web.rs                   → web_search + web_fetch
-    ├── discovery.rs             → tool_search (Deferred-Handles)
+    ├── discovery.rs             → tool_search (deferred handles)
     ├── plan.rs                  → update_plan
     ├── approval.rs              → request_user_input + request_permissions
-    ├── memory_tools.rs          → memory_read + memory_write (nutzt harw-memory)
-    ├── cron.rs                  → cron_schedule (nutzt harw-job-runtime)
-    ├── agent_spawn.rs           → delegate_task (LeaseToken-Rückgabe)
-    └── exec_code.rs             → execute_code (Sandbox-Trait-Bound)
+    ├── memory_tools.rs          → memory_read + memory_write (uses harw-memory)
+    ├── cron.rs                  → cron_schedule (uses harw-job-runtime)
+    ├── agent_spawn.rs           → delegate_task (returns a LeaseToken)
+    └── exec_code.rs             → execute_code (sandbox trait bound)
 ```
 
-Jede Tool-Datei ist **file-scoped** — perfekter Fanout-Kandidat, disjunkte WriteSets.
+Each tool file would be file-scoped — a natural candidate for splitting the implementation work across disjoint write sets, one file at a time.
 
 ---
 
-## 4. Effizienz-Gewinne gegenüber Referenz
+## 4. Expected efficiency gains
 
-| Aspekt | Codex | Hermes | OpenClaw | harw-tool-canon |
-|---|---|---|---|---|
-| Approval-Fehler zur Compile-Zeit | nein | nein | teilweise (DSL) | **ja** (typestate) |
-| Zero-Copy Schema | nein | nein | nein | **ja** (`include_str!`) |
-| Enum-Dispatch Hot-Path | nein (dyn) | n/a | nein | **ja** |
-| Deferred-Loading als `fn`-Pointer | ähnlich | Python-lazy | nein | **schneller** |
-| Sandbox als Trait-Bound | Runtime-Check | Runtime | Runtime | **Compile-Time** |
-| Lease-getragener Agent-Spawn | manuell | manuell | manuell | **typgetragen** |
-| Redaction-Contract | Konvention | Konvention | Konvention | **Blanket-Trait** (bereits) |
-| Tool-Descriptor als `const` | nein | nein | nein | **ja** |
-
----
-
-## 5. Fanout-Plan (Wave 5)
-
-Diese Datei ist der Vertrag. Der eigentliche Fanout in `harw-tool-canon` läuft in Wave 5 mit einem Focused-Coding-Task-Agent pro Tool-Datei (12 Agents), plus 1 Agent für `canon.rs` (Enum + Registry).
-
-**Voraussetzung vor Wave 5:**
-- Neues Crate `harw-tool-canon` mit `Cargo.toml` (Deps: `harw-tools`, `harw-sandbox`, `harw-memory`, `harw-job-runtime`, `harw-macros`, `serde`, `serde_json`, `tokio` per feature).
-- Skeleton-`lib.rs` mit `pub mod canon;` — die konkreten Module werden erst vom Fanout angelegt.
-- Ein Beispiel-Tool (`shell.rs`) als Referenz-Contract für die anderen Agents.
-
-**WriteSet-Disjunktheit:** je Tool exakt eine Datei; `lib.rs` und `canon.rs` bleiben beim Orchestrator.
+| Aspect | Typical dynamic-dispatch tool layer | `harw-tool-canon` (proposed) |
+|---|---|---|
+| Approval errors caught at compile time | no | **yes** (typestate) |
+| Zero-copy schema | no | **yes** (`include_str!`) |
+| Enum dispatch on the hot path | no (`dyn`) | **yes** |
+| Deferred loading as an `fn` pointer | varies | **yes**, no reflection |
+| Sandbox as a trait bound | runtime check | **compile time** |
+| Lease-carried agent spawn | manual | **type-carried** |
+| Redaction contract | convention | **blanket trait** (already true today) |
+| Tool descriptor as a `const` | no | **yes** |
 
 ---
 
-## 6. Nicht-Ziele
+## 5. Build plan, if taken up
 
-- Kein Ersatz für `harw-operations` — der `Operation`-Layer bleibt semantische Boundary.
-- Kein Plugin/MCP-Adapter in Wave 5 — Kanon-Tools sind Rust-nativ. MCP-Bridge kommt separat.
-- Keine Browser-/Computer-Use-Tools in Wave 5 — die brauchen platform-specific Backends.
-- Keine Vision/TTS/Smart-Home-Tools — Provider-spezifisch, gehören zu `harw-provider-*`.
+This document is the contract; the actual build of `harw-tool-canon` would split naturally into one focused task per tool file (roughly a dozen), plus one for `canon.rs` (the enum and registry).
+
+**Prerequisites before starting**:
+- A new crate `harw-tool-canon` with its own `Cargo.toml` (deps: `harw-tools`, `harw-sandbox`, `harw-memory`, `harw-job-runtime`, `harw-macros`, `serde`, `serde_json`, `tokio` behind a feature).
+- A skeleton `lib.rs` with `pub mod canon;` — the concrete modules would be added one at a time.
+- One example tool (`shell.rs`) as the reference contract for the rest.
+
+**Write-set discipline**: exactly one file per tool; `lib.rs` and `canon.rs` stay with whoever coordinates the build.
+
+---
+
+## 6. Non-goals
+
+- Not a replacement for `harw-operations` — the `Operation` layer remains the semantic boundary.
+- No plugin/MCP adapter in this design — canon tools are Rust-native; an MCP bridge would be separate.
+- No browser/computer-use tools here — those need platform-specific backends.
+- No vision/TTS/smart-home tools — provider-specific, and belong in `harw-provider-*`.

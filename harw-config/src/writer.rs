@@ -1,7 +1,6 @@
 //! `ConfigWriter` — editiert genau eine `config.toml` mit `toml_edit` und
 //! erhält dabei Kommentare/Formatierung (Contract
-//! `harw-scopes-contract.md` §5 Zeile A2; Plan
-//! `nope-permissions-gibt-es-wild-lobster.md` Schritt 4).
+//! `docs/design/config-scopes.md` §5).
 //!
 //! # Verantwortung
 //! Dieses Modul kennt nur das `[permissions]`-Schema
@@ -746,7 +745,7 @@ mod tests {
         let path = temp_config_path(&dir, "config.toml");
         let mut writer = ConfigWriter::open(&path).map_err(ctx("open"))?;
 
-        let root = Path::new("/home/mia/scratch");
+        let root = Path::new("/home/user/scratch");
         assert!(
             writer
                 .append_extra_root(root)
@@ -760,7 +759,7 @@ mod tests {
         writer.save().map_err(ctx("save"))?;
 
         let reopened_content = fs::read_to_string(&path).map_err(ctx("read back"))?;
-        assert!(reopened_content.contains("/home/mia/scratch"));
+        assert!(reopened_content.contains("/home/user/scratch"));
 
         let mut writer = ConfigWriter::open(&path).map_err(ctx("reopen"))?;
         assert!(
@@ -776,7 +775,7 @@ mod tests {
         writer.save().map_err(ctx("save after removal"))?;
 
         let final_content = fs::read_to_string(&path).map_err(ctx("read back again"))?;
-        assert!(!final_content.contains("/home/mia/scratch"));
+        assert!(!final_content.contains("/home/user/scratch"));
         Ok(())
     }
 

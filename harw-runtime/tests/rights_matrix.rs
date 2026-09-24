@@ -1,7 +1,7 @@
 //! Tabellengetriebener Rechte-Snapshot je [`EntryKind`].
 //!
 //! # Beschreibung
-//! Der Vertrag `docs/remediation/CONTRACTS.md` §runtime-spec nennt für jeden
+//! Der Vertrag `docs/design/runtime-contracts.md` §runtime-spec nennt für jeden
 //! der elf Einstiege genau eine Zeile: Rechte, Registry-Profil, Ask-Auflösung,
 //! Spawner, Decke. `harw-runtime/src/spec.rs` prüft, dass
 //! [`EntryKind::profile`] diese Tabelle wiedergibt — das ist die *Deklaration*.
@@ -90,8 +90,7 @@ fn fixture() -> TestResult<Fixture> {
 ///
 /// # Beschreibung
 /// `EntryKind::Tui` und `EntryKind::OneShot` montieren seit dem UIA-Vertrag
-/// (`harw-runtime/src/assembly.rs::resolve_active_uia`,
-/// `docs/sessions/session-transcript-2026-09-14.md`) nur noch mit einer konfigurierten
+/// (`harw-runtime/src/assembly.rs::resolve_active_uia`) nur noch mit einer konfigurierten
 /// UIA — fail-closed, ohne stillen Full-Tool-Fallback. Diese Tabellen-Tests
 /// prüfen genau diese acht (bzw. elf) Einstiege in einem leeren
 /// Tempverzeichnis, das ohne diese Funktion keine UIA kennt. Layout und

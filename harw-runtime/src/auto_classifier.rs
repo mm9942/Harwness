@@ -1929,7 +1929,7 @@ mod tests {
             PathBuf::from("/work/project"),
             ExtraRootsCell::new(),
             NetworkScope::from_hosts(["crates.io".to_owned(), "github.com".to_owned()]),
-            Some(PathBuf::from("/home/nutzerin")),
+            Some(PathBuf::from("/home/user")),
         )
     }
 

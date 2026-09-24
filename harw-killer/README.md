@@ -1,136 +1,185 @@
-# killer
+# harw-killer
 
-Ein Linux-CLI in Rust mit Clap: Prozesse präzise auswählen, Vorschau ansehen,
-**sofort SIGKILL senden**, auf Exit warten und noch laufenden Zielinstanzen
-**erneut SIGKILL** senden. Genau diese doppelte KILL-Logik ist beabsichtigt.
+A Linux process terminator built around **pidfd identity**: send SIGKILL
+immediately, wait for exit, and send a second SIGKILL to any survivors on the
+same pidfd. There is no SIGTERM phase — this double-KILL behavior is
+intentional, not a bug.
 
-Beide Signalversuche verwenden denselben **pidfd**. Es gibt keine SIGTERM-Phase.
+Both signal attempts use the same kernel `pidfd`, opened once at selection
+time. Comparing the process start time before and after opening the pidfd
+prevents accidentally signalling a reused PID; a pidfd that already reports
+exit is never selected.
 
-## Voraussetzungen und Installation
+## Entry points
 
-- Linux, gemountetes `/proc`, Kernel **5.3+** für die normale pidfd-Nutzung.
-- Kernel **5.6+**, `sudo` und passende Ptrace-Berechtigung für den automatischen
-  Fremdbenutzer-Helfer. Seccomp, Yama, Container-Capabilities oder sudo-Regeln
-  können diesen Weg blockieren. Dann gibt es einen Fehler, keinen PID-Fallback.
-- Rust mit Cargo, rustfmt, Clippy; Make. Projektedition 2024, deklarierte MSRV 1.85.
-  Den tatsächlich geprüften Toolchain-Stand dokumentiert `VALIDATION.md`.
-- Python 3 nur für die ausdrücklich aktivierten Systemtests.
+`harw-killer` reaches users and agents through three paths:
+
+1. **`harw kill …`** — the `harw` CLI forwards its `kill` subcommand
+   arguments unchanged to `harw_killer::run_cli` (see
+   `harw-cli/src/main.rs`). This is the interactive/manual path with the
+   full CLI surface below, including the sudo helper for foreign-owned
+   targets.
+2. **The agent tool `process.kill`** (crate `harw-tool-process`, see
+   `harw-tool-process/src/provider.rs`) — used by the agent runtime through
+   `harw_killer::api::kill_own`. This path is always approval-gated: it is
+   listed in `ALWAYS_ASK_TOOLS` (`harw-registry-defaults`) and is never
+   auto-approved, even under `FullAccess` or a matching allow rule. It
+   **never invokes sudo**: only processes owned by the current effective UID
+   can be killed. A process owned by another user is reported as an error
+   result (`"fremder Prozess: sudo nicht erlaubt"`), never signalled, even
+   when the caller runs as root — root only kills targets with effective UID
+   0 through this API. The companion read-only tool `process.list` previews
+   the same selection without sending any signal.
+3. **The standalone `killer` binary** (`harw-killer/src/main.rs`, built from
+   this crate's `[[bin]]` target) — the same CLI as `harw kill`, usable
+   independently of `harw`.
+
+## Requirements
+
+- Linux with a mounted `/proc`. Kernel **5.3+** for ordinary pidfd use.
+- Kernel **5.6+**, `sudo`, and suitable ptrace permission for the automatic
+  cross-user helper (`harw kill` / `killer` CLI path only — the agent tool
+  never uses this). Seccomp, Yama, container capabilities, or sudo rules can
+  block this path; that produces an explicit error, never a PID-based
+  fallback.
+- Python 3, only for the opt-in system tests (see `TESTING.md`).
+
+## CLI flags (`harw kill` / `killer`)
+
+Defined in `src/cli.rs`:
+
+| Flag | Meaning |
+| --- | --- |
+| `-p, --process NAME...` | Exact executable basenames to match (repeatable, multiple values). Falls back to `comm` when `/proc/PID/exe` is unreadable. |
+| `--pid PID...` | Explicit positive PIDs (repeatable, multiple values). |
+| `--uid UID` | Restrict the selection to this effective UID. Not a selector on its own — at least one of `--process`/`--pid` is required. |
+| `-t, --timeout SECS` | Seconds to wait after the first SIGKILL before retrying survivors (default 5, 0..86400). |
+| `--kill-wait SECS` | Seconds to wait after the second SIGKILL before reporting a survivor (default 2, 0..86400). |
+| `-n, --dry-run` | Preview the selection without signalling, confirmation, or sudo. |
+| `-y, --yes` | Skip the interactive confirmation prompt. |
+| `--json` | Machine-readable report on stdout; diagnostics stay on stderr. |
+| `--no-sudo` | Never invoke sudo for foreign-owned processes. |
+| `--log LEVEL` | Diagnostic verbosity: `error`, `warn`, `info`, `debug`, or `trace`. |
+
+`-p`/`--process` and `--pid` are a union: a process must match at least one
+name or PID; `--uid` then filters the whole selection. Multiple matches are
+deduplicated. No regex, globs, or positional arguments; a name like `rustc`
+does not match `rustc-wrapper`. Without any selector, `killer` reports an
+argument error — it never falls back to "select everything".
+
+## Examples
 
 ```sh
-unzip killer-rust-project.zip
-cd killer
-make clippy-tests
-make test
-make test-system
-make install                 # ~/.local/bin/killer
+killer -p rustc rust-analyzer cargo -n     # preview several names
+killer --process node python3              # preview, then confirm interactively
+killer -p rustc rust-analyzer -y           # kill immediately
+killer -p cargo -y -t 3                    # 3 seconds before the second KILL
+killer --pid 12345 12346 -y                # multiple explicit PIDs
+killer -p cargo --pid 12345 -n             # names OR pids, combined
+killer -p node -p python3 -n               # -p may repeat
+killer -p cargo --uid 1000 -n --json       # filter all matches by UID
+killer -p cargo --no-sudo -y               # never escalate to sudo
 ```
 
-`~/.local/bin` muss in deinem PATH liegen. `make install PREFIX=/usr/local` ist
-für eine systemweite, bewusst mit passenden Schreibrechten ausgeführte Installation
-möglich. Keine automatische Installation oder Änderung an sudoers.
-`Cargo.lock` wird mitgeliefert; alle Make-Builds verwenden `--locked`.
+The same subcommand works through `harw`, e.g. `harw kill -p cargo -y`.
 
-## Beispiele
+## Output and exit codes
+
+JSON output (`--json`) stays on stdout; structured tracing diagnostics go to
+stderr. The report schema carries `schema_version`, `dry_run`, `targets`, and
+`results`. Per-target results are one of `killed`, `killed_after_retry`,
+`already_exited`, `survived`, or `error`. A fatal error before the report is
+built is printed to stderr only — no full JSON report is promised in that
+case.
+
+| Code | Meaning |
+| --- | --- |
+| 0 | Preview succeeded, or every selected process is confirmed terminated |
+| 1 | An error occurred, or at least one target was not observed as terminated |
+| 2 | No valid selector (clap also uses 2 for invalid arguments) |
+| 3 | Interactively aborted |
+
+## Behavior and limits
+
+1. One-shot snapshot of visible processes. PID 1, `killer` itself, and all
+   discoverable ancestors (e.g. the invoking shell) are always protected.
+2. Selection conditions and start time are compared before/after
+   `pidfd_open`; already-exited handles are discarded. Kernel handles then
+   stay open for the rest of the run.
+3. Preview and confirmation are the default; `--yes` is required in
+   pipes/scripts. JSON termination also requires `--yes`; JSON preview needs
+   no confirmation.
+4. Own targets get KILL first, followed by a shared wait phase (`--timeout`,
+   default 5s). Only survivors get a second KILL, followed by `--kill-wait`
+   (default 2s). Already-exited targets are not re-signalled; the wait phase
+   ends early once all targets are gone.
+5. Foreign-owned targets (`harw kill`/`killer` only, never the agent tool)
+   are then handled as their own group through sudo, so the timeout applies
+   **per group**, not as a single ceiling that also covers the password
+   prompt. A caller already running as root needs no helper.
+6. The root helper takes ownership of the already-open target handles via
+   `pidfd_getfd` from the waiting parent process. It never re-searches for
+   targets by name/PID, and it duplicates every handle it receives before
+   sending its first signal.
+
+A zombie is never treated as still running. KILL success does not mean a
+process returns immediately from an uninterruptible kernel operation;
+`survived` therefore only reports that no exit was observed within the wait
+window. `killed` reports an observed exit after the first attempt,
+`killed_after_retry` after the second. An exit between the two phases cannot
+be causally attributed to one signal. The retry is a deliberate second
+delivery — it does not make SIGKILL stronger and does not skip
+uninterruptible kernel work.
+
+A pidfd pins a process instance, not its current program image: a later
+`exec` or credential change on the same instance can still happen. There is
+no recursive child-process selection, no process-group kill, and no
+automatic retry for newly started processes. `/proc` visibility is limited
+by namespace, `hidepid`, and permissions. Windows and macOS are not
+implemented.
+
+`sudo` runs the installed `killer` binary as root. Use a trusted binary; do
+not add a blanket `NOPASSWD` rule to a file that other users can write.
+Blocked `pidfd_getfd` permissions surface as a clearly reported error.
+
+## Project layout
+
+| File | Responsibility |
+| --- | --- |
+| `src/cli.rs` | Clap parsing and argument validation |
+| `src/process.rs` | Procfs, matching, protection, and snapshotting |
+| `src/pidfd.rs` | Safe rustix handles, signalling, exit observation |
+| `src/engine.rs` | KILL/wait/KILL; a replaceable boundary for tests |
+| `src/privilege.rs` | sudo protocol and a replaceable `CommandRunner` |
+| `src/types.rs` | Metadata and typed results |
+| `src/error.rs` | Handwritten error domain and source chains |
+| `src/typestate/` | `Plan<Selected>` → `Plan<Approved>` |
+| `src/api.rs` | Programmatic interface for agents (`preview`, `kill_own`); never invokes sudo |
+| `src/lib.rs` | CLI orchestration (`run_cli`, `HelperInvocation`) shared by `harw kill` and the standalone binary |
+| `src/main.rs` | Thin entry point for the `killer` binary |
+
+Details: `DESIGN.md`, `TESTING.md`.
+
+## Build and test
+
+`harw-killer` is a regular workspace member. `make install` in the repository
+root builds and installs `killer` together with `harw` (see
+[the installation guide](../docs/setup/install.md)). For work on the crate
+itself, the usual workspace commands apply:
 
 ```sh
-killer -p rustc rust-analyzer cargo -n     # Vorschau für mehrere Namen
-killer --process node python3             # Vorschau und Bestätigung
-killer -p rustc rust-analyzer -y           # direkt ausführen
-killer -p cargo -y -t 3                    # 3 Sekunden bis zweitem KILL
-killer --pid 12345 12346 -y                # mehrere explizite PIDs
-killer -p cargo --pid 12345 -n             # Namen ODER PIDs
-killer -p node -p python3 -n               # -p darf wiederholt werden
-killer -p cargo --uid 1000 -n --json       # UID-Filter für alle Treffer
-killer -p cargo --no-sudo -y
+cargo build -p harw-killer
+cargo test -p harw-killer
 ```
 
-`-p/--process` akzeptiert einen oder mehrere **exakte ausführbare Dateinamen**.
-`--pid` akzeptiert eine oder mehrere positive PIDs. Beide sind kombinierbar:
-ein Prozess muss mindestens einen Namen oder eine PID treffen; `--uid` schränkt
-anschließend die gesamte Auswahl ein. Mehrfachtreffer werden dedupliziert.
-Optionen beenden die jeweilige Werteliste. Namen mit Leerzeichen quotieren.
-`-n` ist Vorschau, `-y` überspringt die Bestätigung, `-t` setzt die Wartezeit.
-Ohne Selektor zeigt Killer einen Argumentfehler, niemals eine Auswahl aller Prozesse.
+The unit tests run by default. The Linux system tests in `tests/cli.rs` are
+`#[ignore]`d and need Python 3 plus the ability to spawn/signal owned child
+processes; opt in explicitly:
 
-Keine speziellen Compiler-Flags, Regex, Globs oder Positionsargumente. Ein Name
-wie `rustc` trifft `rustc-wrapper` nicht. `-p` bedeutet nun **process**, nicht PID;
-für PIDs ausdrücklich `--pid` verwenden.
+```sh
+cargo test -p harw-killer -- --ignored
+```
 
-Verglichen wird der Basename von `/proc/PID/exe`. Ist dieser nicht lesbar, wird
-`comm` verwendet (normalerweise auf 15 Bytes begrenzt). Scripts laufen häufig
-unter dem Namen ihres Interpreters; verwende dessen Namen oder eine explizite PID.
-
-Die Tabelle zeigt PID, PPID, effektive UID, Name und Kommandozeile. Pfad und
-Startzeit in Kernel-Ticks stehen zusätzlich im JSON-Snapshot. Kontrollzeichen
-werden für Terminalausgabe escaped. Kommandozeilen können sensible Argumente
-enthalten: entsprechende Vorschauen/JSON nicht unbedacht weitergeben.
-
-## Verhalten und Grenzen
-
-1. Einmaliger Snapshot sichtbarer Prozesse. Init/PID 1, killer selbst und alle
-   ermittelbaren Vorfahren (z.B. die aufrufende Shell) bleiben geschützt.
-2. Auswahlbedingungen und Startzeit werden vor/nach `pidfd_open` verglichen;
-   bereits beendete Handles werden verworfen. Kernelhandles bleiben ab dann offen.
-3. Vorschau und Rückfrage. In Pipes/Skripten ist `--yes` nötig. JSON-Terminierung
-   verlangt ebenfalls `--yes`; JSON-Vorschau benötigt keine Bestätigung.
-4. Eigene Ziele erhalten zuerst alle KILL; danach folgt eine gemeinsame Wartephase
-   (`--timeout`, Standard 5 Sekunden). Nur Überlebende erhalten erneut KILL,
-   gefolgt von `--kill-wait` (Standard 2 Sekunden). Bereits beendete Ziele werden
-   nicht erneut signalisiert. Sind alle beendet, endet die Wartephase frühzeitig.
-5. Fremde Ziele werden anschließend als eigene Gruppe über sudo behandelt.
-   Damit gilt der Timeout **je Gruppe**, nicht als globale Obergrenze inklusive
-   Passwortabfrage. Ein bereits als root gestarteter Aufruf benötigt keinen Helfer.
-6. Der root-Helfer übernimmt die offenen Zielhandles mit `pidfd_getfd` aus dem
-   wartenden Elternprozess. Er sucht keine Zielprozesse erneut anhand von Namen/PIDs.
-   Er dupliziert alle übergebenen Handles vor dem ersten Signal.
-
-Kein Zombie wird als noch laufender Prozess behandelt. KILL-Erfolg bedeutet nicht,
- dass ein Prozess sofort aus einer nicht unterbrechbaren Kerneloperation zurückkehrt;
-`survived` meldet deshalb nur, dass innerhalb der Nachwartezeit kein Exit sichtbar war.
-`killed` meldet beobachteten Exit nach dem ersten Versuch, `killed_after_retry`
-nach dem zweiten Versuch. Ein Exit zwischen zwei Phasen kann nicht kausal einem
-Signal bewiesen werden. Die Wiederholung ist eine bewusste zweite Zustellung;
-sie macht SIGKILL nicht stärker und überspringt keine ununterbrechbare Kernelarbeit.
-
-Ein pidfd hält eine Prozessinstanz fest, nicht ihren aktuellen Programmcode.
-Ein späteres `exec` oder ein Credential-Wechsel derselben Instanz kann stattfinden.
-Keine rekursive Kindprozessauswahl, kein Prozessgruppen-Kill, keine automatische
-Wiederholung für neu gestartete Prozesse. `/proc`-Sichtbarkeit ist durch Namespace,
-hidepid und Rechte begrenzt. Windows und macOS sind hier nicht implementiert.
-
-`sudo` führt das installierte killer-Binary als root aus. Verwende ein vertrautes
-Binary; keine pauschale NOPASSWD-Regel auf eine von anderen beschreibbare Datei.
-Blockierte `pidfd_getfd`-Berechtigungen bleiben ein klar gemeldeter Fehler.
-
-## Ausgabe und Exitcodes
-
-JSON-Ausgabe (`--json`) bleibt auf stdout; strukturierte Tracing-Diagnose auf stderr.
-Das Report-Schema enthält `schema_version`, `dry_run`, `targets` und `results`.
-Ergebnisse: `killed`, `killed_after_retry`, `already_exited`, `survived`, `error`.
-Fatale Fehler vor Report-Erzeugung erscheinen auf stderr; es wird dann kein
-vollständiger JSON-Report versprochen.
-
-| Code | Bedeutung |
-| --- | --- |
-| 0 | Vorschau erfolgreich oder alle ausgewählten Prozesse beendet |
-| 1 | Fehler oder mindestens ein nicht als beendet beobachtetes Ziel |
-| 2 | Keine zulässigen Treffer; auch Clap verwendet 2 für ungültige Argumente |
-| 3 | Interaktiv abgebrochen |
-
-## Projektstruktur
-
-| Datei | Verantwortung |
-| --- | --- |
-| `src/cli.rs` | Clap und Argumentvalidierung |
-| `src/process.rs` | Procfs, Matching, Schutz und Snapshot |
-| `src/pidfd.rs` | Sichere rustix-Handles, Signale, Exit-Beobachtung |
-| `src/engine.rs` | KILL/Wartezeit/KILL; austauschbare Testgrenze |
-| `src/privilege.rs` | sudo-Protokoll und austauschbarer CommandRunner |
-| `src/types.rs` | Metadaten und typisierte Ergebnisse |
-| `src/error.rs` | Handgeschriebene Fehlerdomäne und Ursachenketten |
-| `src/typestate/` | Ausgewählter → bestätigter Plan |
-| `src/main.rs` | CLI-Orchestrierung, Datenansicht und Reports |
-
-Details: `DESIGN.md`, `RULES_APPLIED.md`, `TESTING.md`, `VALIDATION.md` und
-`DEPENDENCIES.md`. Kein Lizenzmodell wird ohne deine Entscheidung vorausgesetzt;
-`publish = false` verhindert versehentliches Veröffentlichen auf crates.io.
+See `TESTING.md` for what each layer covers and what remains
+environment-dependent (foreign-owner sudo paths, a kernel without pidfd
+support, and similar cases that need an isolated test VM).

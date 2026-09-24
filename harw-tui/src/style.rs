@@ -1,8 +1,8 @@
 //! Theme-Erkennung und zentrale Stil-Definitionen für `harw-tui`.
 //!
-//! Spec-Quelle: `docs/design/codex-tui-study/00-harw-tui-redesign-spec.md`
+//! Spec-Quelle: `docs/design/tui-architecture.md`
 //! Abschnitt 2.10 + SLICE 8 sowie
-//! `docs/design/codex-tui-study/04-rendering-style-dynamic.md`.
+//! `docs/design/tui-architecture.md`.
 //!
 //! # Verantwortung
 //! Dieses Modul ist die einzige Stelle, die `ratatui`-Stile und Farben
@@ -101,7 +101,7 @@ pub(crate) fn detect_theme() -> Theme {
 /// # Description
 /// Dünnschichtige Abfrage-Funktion; vermeidet direkte `match`-Verzweigungen
 /// in Rendering-Code und wird von [`accent_color`] genutzt.
-/// Spec-Quelle: `04-rendering-style-dynamic.md`.
+/// Spec-Quelle: `docs/design/tui-architecture.md`.
 ///
 /// # Arguments
 /// - `theme` (`Theme`): das zu prüfende Farbschema.
@@ -365,7 +365,7 @@ pub(crate) fn warning_style(theme: Theme) -> Style {
 ///
 /// Diese Funktion ist für die spätere RGB-Hintergrunderkennung vorgesehen
 /// (z. B. wenn das Terminal echte RGB-Hintergrundfarben meldet).
-/// Spec-Quelle: `04-rendering-style-dynamic.md` (blend-Muster).
+/// Spec-Quelle: `docs/design/tui-architecture.md` (blend-Muster).
 ///
 /// # Arguments
 /// - `r` (`u8`): Rotanteil (0–255).
@@ -385,7 +385,7 @@ pub(crate) fn warning_style(theme: Theme) -> Style {
 /// assert_eq!(luminance(255, 255, 255), 255);
 /// ```
 // Vorgesehen für die RGB-Hintergrunderkennung in einem späteren Rendering-Slice
-// (04-rendering-style-dynamic.md). Bis dahin nur intern in Tests genutzt.
+// (`docs/design/tui-architecture.md`). Bis dahin nur intern in Tests genutzt.
 #[allow(dead_code)]
 pub(crate) fn luminance(r: u8, g: u8, b: u8) -> u16 {
     // Multiplikation mit Skalierungsfaktor 1000, dann durch 1000 dividieren,

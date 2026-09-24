@@ -47,7 +47,7 @@ use crate::error::DslError;
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(try_from = "String", into = "String")]
 pub struct DefinitionId {
-    /// Namespace, z. B. `"harwness"` oder `"mia"`.
+    /// Namespace, z. B. `"harwness"` oder `"alice"`.
     pub namespace: String,
     /// Definitionstyp, z. B. `"agent"`, `"family"`, `"mixin"`.
     pub kind: String,
@@ -77,7 +77,7 @@ impl DefinitionId {
     /// ```rust
     /// use harw_agent_dsl::ids::DefinitionId;
     ///
-    /// let id = DefinitionId::parse("mia.agent.rust-pqc-worker@1").unwrap();
+    /// let id = DefinitionId::parse("alice.agent.rust-pqc-worker@1").unwrap();
     /// assert_eq!(id.major, 1);
     /// ```
     pub fn parse(s: &str) -> Result<Self, DslError> {
@@ -333,7 +333,7 @@ mod tests {
 
     #[test]
     fn test_display_roundtrip() -> TestResult {
-        let original = "mia.agent.rust-pqc-worker@2";
+        let original = "alice.agent.rust-pqc-worker@2";
         let id = DefinitionId::parse(original)?;
         assert_eq!(id.to_string(), original);
         Ok(())

@@ -14,8 +14,7 @@
 //! Verdrahtung voll funktionsfähig. Anpassen lässt sich die Grenze über die
 //! separate Operation `/provider-concurrency` (siehe `crate::provider`).
 //!
-//! Zeigt außerdem (Welle 2, Plan `recursive-cooking-lobster.md` Teil B5,
-//! sofern verdrahtet) den Host-Lease-Zustand: „aktiv (noch N min)“,
+//! Zeigt außerdem (sofern verdrahtet) den Host-Lease-Zustand: „aktiv (noch N min)“,
 //! „Einmalfreigabe“ oder „aus“. Seit der Behebung „volle
 //! Sandbox-Deaktivierung“ (2026-09-21) meldet diese Zeile sowohl eine
 //! sitzungseigene als auch eine prozessweite Freigabe

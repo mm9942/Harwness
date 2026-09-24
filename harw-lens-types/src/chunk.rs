@@ -19,7 +19,7 @@
 //! [`crate::LensTypesError::SpanOutOfBounds`] entstehen ausschließlich hier,
 //! über [`ByteSpan::new`] und [`ByteSpan::validate`].
 //!
-//! Contract-Master Abschnitt C (AW0-08, `docs/aw-contract-master.md`).
+//! Contract-Master Abschnitt C (AW0-08, `docs/design/build-history.md`).
 
 use serde::{Deserialize, Serialize};
 

@@ -73,7 +73,7 @@ pub struct HarnessConfig {
     pub research: ResearchSection,
     /// `[permissions]` — persistenter Freigabemodus, Timeout sowie
     /// Allow/Deny-Regeln und zusätzliche Arbeitswurzeln (Contract
-    /// `harw-scopes-contract.md` §2/§5 Zeile A2). Siehe `permissions_toml.rs`.
+    /// `docs/design/config-scopes.md` §2/§5 Zeile A2). Siehe `permissions_toml.rs`.
     #[serde(default)]
     pub permissions: PermissionsSection,
     /// `[sandbox]` — hostseitig vertrauenswürdige Laufzeitvorgaben für
@@ -856,9 +856,9 @@ mod tests {
             path = "/mcp"
 
             [[mcp_listener.principals]]
-            id = "mia-local"
+            id = "alice-local"
             credential_ref = "env:HARW_MCP_TOKEN"
-            tenant = "mia"
+            tenant = "alice"
             workspace = "harwness"
             job_capabilities = ["read_own", "cancel_own"]
         "#;
@@ -893,9 +893,9 @@ mod tests {
     fn test_mcp_principal_has_no_default_job_capabilities() -> TestResult {
         let principal: McpPrincipalToml = toml::from_str(
             r#"
-                id = "mia-local"
+                id = "alice-local"
                 credential_ref = "env:HARW_MCP_TOKEN"
-                tenant = "mia"
+                tenant = "alice"
                 workspace = "harwness"
             "#,
         )

@@ -83,8 +83,8 @@
 //! assert!(!lines.is_empty());
 //! ```
 //!
-//! Spec-Quelle: `docs/design/codex-tui-study/00-harw-tui-redesign-spec.md` §2.10 / SLICE 7
-//! und `docs/design/codex-tui-study/04-rendering-style-dynamic.md` §3 sowie
+//! Spec-Quelle: `docs/design/tui-architecture.md` §2.10 / SLICE 7
+//! und `docs/design/tui-architecture.md` §3 sowie
 //! AP W5-01 / W5-10a.
 
 use std::sync::{Arc, Mutex};
@@ -171,7 +171,7 @@ pub(crate) trait HistoryCell: Send + Sync + std::fmt::Debug {
 /// - `lines` (`Vec<Line<'static>>`): Vorgerenderte Zeilen.
 ///
 /// # Spec-Referenz
-/// `00-harw-tui-redesign-spec.md` SLICE 7 / `04-rendering-style-dynamic.md` §3.
+/// `docs/design/tui-architecture.md`.
 #[derive(Debug)]
 pub(crate) struct PlainHistoryCell {
     /// Vorgerenderte, breitenunabhängige Ausgabezeilen.
@@ -211,7 +211,7 @@ impl HistoryCell for PlainHistoryCell {
 /// - `text` (`String`): Rohtext der Nutzereingabe.
 ///
 /// # Spec-Referenz
-/// `00-harw-tui-redesign-spec.md` SLICE 7 / `04-rendering-style-dynamic.md` §3.
+/// `docs/design/tui-architecture.md`.
 #[derive(Debug)]
 pub(crate) struct UserHistoryCell {
     /// Rohtext der Nutzereingabe vor der Darstellung.
@@ -281,7 +281,7 @@ impl HistoryCell for UserHistoryCell {
 /// da `String` beide Bounds erfüllt.
 ///
 /// # Spec-Referenz
-/// `00-harw-tui-redesign-spec.md` SLICE 7 / `04-rendering-style-dynamic.md` §3
+/// `docs/design/tui-architecture.md`
 /// ("`AgentMarkdownCell { source }` — Re-rendert bei jeder `display_lines(width)`-Anfrage").
 #[derive(Debug)]
 pub(crate) struct AssistantHistoryCell {
@@ -1212,7 +1212,7 @@ impl HistoryCell for GoalCell {
 /// assert!(lines.len() >= 2);
 /// ```
 ///
-/// Spec-Quelle: `00-harw-tui-redesign-spec.md` SLICE 7.
+/// Spec-Quelle: `docs/design/tui-architecture.md`.
 pub(crate) fn wrap_plain(text: &str, width: u16) -> Vec<Line<'static>> {
     let col_width = (width as usize).max(1);
     let mut result: Vec<Line<'static>> = Vec::new();

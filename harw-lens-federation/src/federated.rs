@@ -11,7 +11,7 @@
 //! beide vorhandenen Funktionen auf.
 //!
 //! # Warum Assembly und Lens dieselbe `pack`-Funktion aufrufen sollten
-//! `harw_lens_rank::pack` ist nach `docs/aw-contract-master.md` (Abschnitt D)
+//! `harw_lens_rank::pack` ist nach `docs/design/build-history.md` (Abschnitt D)
 //! der einzige echte Cross-Subsystem-Vertrag zwischen dem Retrieval-Layer
 //! (Lens) und der Kontextmontage (`harw-core::Assembly`): beide füllen ein
 //! Kostenbudget mit einer Rangliste. Riefe jede Seite eine eigene
@@ -31,7 +31,7 @@
 //! zu übernehmen, und kennt nur ein flaches Gesamtbudget statt Budgets je
 //! Sektion plus einen `must_include`-Hart-Fehler-Pfad. `Assembly::budget`
 //! trägt deshalb eine eigene, mit derselben Grundidee neu geschriebene
-//! Greedy-Füllung. Der in `docs/aw-contract-master.md` beschriebene Vertrag
+//! Greedy-Füllung. Der in `docs/design/build-history.md` beschriebene Vertrag
 //! „Assembly ruft dieselbe `pack`-Funktion wie Lens" hält also **heute noch
 //! nicht vollständig** -- diese Crate kann das nicht selbst schließen, weil
 //! `harw-core` außerhalb ihres Schreibbereichs liegt (ein anderer Knoten

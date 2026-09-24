@@ -1,7 +1,6 @@
 //! Freigabe-Panel: hervorgehobener Dialog anstelle des Composers.
 //!
-//! Spec-Quelle: `nope-permissions-gibt-es-wild-lobster.md` Schritt 3
-//! (Freigabe als Dialog) und `harw-scopes-contract.md` §2/§5 Slice B2.
+//! Spec-Quelle: `docs/design/tui-command-contract.md` (Freigabe als Dialog).
 //!
 //! # Verantwortung
 //! Dieses Modul besitzt ausschließlich die Darstellung und Tastaturlogik des

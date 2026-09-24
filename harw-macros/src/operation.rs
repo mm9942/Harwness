@@ -835,9 +835,6 @@ fn map_visibility(lit: &LitStr) -> syn::Result<proc_macro2::TokenStream> {
 /// # Errors
 /// Returns `syn::Error` when the string is not `"immediate"`, `"staged"` or
 /// `"deferred"`.
-///
-/// # Design-doc reference
-/// Plan-Referenz: `recursive-cooking-lobster.md`, Abschnitt "Welle 1 — 1b".
 fn map_busy_availability(lit: &LitStr) -> syn::Result<proc_macro2::TokenStream> {
     busy_class_tokens(&lit.value()).ok_or_else(|| {
         syn::Error::new_spanned(

@@ -1,7 +1,8 @@
 # Harwness TUI Interaction Contract
 
-Status: draft design document
-Owning crates (planned): `harw-tui` (new), `harw-config`, `harw-types`, `harw-protocol`
+> Status: partially implemented · Last reviewed: 2026-09-24
+
+Owning crates: `harw-tui`, `harw-config`, `harw-types`, `harw-ops`
 Scope: the typed contract for slash commands, prefix shortcuts, keybindings, and the
 command registry architecture that the Harwness TUI (and, where noted, channel
 front-ends) must implement. This document defines the *contract*, not the
@@ -14,14 +15,13 @@ prior art surveyed under `inspirations/openclaw` and Hermes's
 semantic below is Harwness-original and must not be assumed compatible with
 either source.
 
-> **Ist-Stand (2026-09-24, deutsch):** Die §§1–7 sind der ursprüngliche
-> Zielentwurf. Was der Code heute tatsächlich anbietet — Befehlsinventar
-> (Operationen, TUI-lokale Befehle, Ersatz-Spezifikationen, geplante
-> Befehle), Präfixe `#`/`@`, Tastenbelegung F1/F5–F9, `/models`,
-> `/mode default` und die CLI-Flags `--mode`/`--approval`/`--model` — steht
-> verbindlich in **§8**. Modelle je Rolle, Modus vs. Freigabe und die
-> Start-Rangfolge beschreibt `tui-roles-models-modes.md`. Bei Widerspruch
-> gilt §8.
+> **Current state**: §§1–7 are the original target design. What the code
+> actually provides today — the command inventory (operations, TUI-local
+> commands, fallback specs, planned commands), the `#`/`@` prefixes, the
+> F1/F5–F9 key bindings, `/models`, `/mode default`, and the CLI flags
+> `--mode`/`--approval`/`--model` — is authoritative in **§8**. Models per
+> role, mode vs. approval, and startup precedence are described in
+> `tui-roles-models-modes.md`. On any conflict, §8 wins.
 
 ---
 
@@ -147,7 +147,7 @@ Legend for **Tier**: `Obs` `Op` `Maint` `Own`.
 | `/fork` | `[--from=turn-id]` | Branch a new session from current or a past turn | Op | Y |
 | `/archive` | `<SessionKey>` | Move a session out of the active list | Op | Y |
 | `/sessions` | `[--all] [--agent=AgentRef]` | List sessions, optionally across agents | Obs | Y |
-| `/export` | `[--format md\|markdown\|json] [--tools\|--no-tools] [--reasoning-summary] [--datei <pfad>] [--max-chars <n>]` | Export a session transcript; `--max-chars <n>` caps the total rendered export length at `n` Unicode characters (whole export, not per entry) — implemented in `harw-ops/src/export.rs` (`ExportArgs::max_chars`) and consumed by `harw_tui::export::ExportOptions::max_chars`. **Ist-Stand 2026-09-21:** lesbares Startdatum (`jiff`, RFC-3339-Stil statt Unix-Sekunden); Tool-Argumente/-Ergebnisse als verschachteltes Pretty-JSON bzw. als ` ```text ` -Block statt einer einzelnen Riesenzeile, pro Eintrag gekappt auf `ExportOptions.max_chars_per_entry` (Default 4000 Zeichen, zusätzlich zur globalen `--max-chars`-Kappung); Überschriften in User-/Assistant-Text um zwei Ebenen herabgestuft; Tool-Einträge (ToolCall/ToolResult/Reasoning) gruppiert unter „## harw" statt „## Du"; scheitert das Kopieren in die Zwischenablage, schreibt `/export` stattdessen die Datei (`default_export_path`) und meldet den Pfad, die OSC-52-Ausgabe wird in tmux zusätzlich mit einer DCS-Passthrough-Hülle umschlossen — siehe `interaction-contract.md` §2.6.7 | Op | R |
+| `/export` | `[--format md\|markdown\|json] [--tools\|--no-tools] [--reasoning-summary] [--file <path>] [--max-chars <n>]` | Export a session transcript; `--max-chars <n>` caps the total rendered export length at `n` Unicode characters (whole export, not per entry) — implemented in `harw-ops/src/export.rs` (`ExportArgs::max_chars`) and consumed by `harw_tui::export::ExportOptions::max_chars`. **Current state**: a readable start date (`jiff`, RFC-3339 style instead of Unix seconds); tool arguments/results render as nested pretty JSON or as a ` ```text ` block instead of one giant line, each entry capped at `ExportOptions.max_chars_per_entry` (default 4000 characters, on top of the global `--max-chars` cap); headings inside user/assistant text are demoted by two levels; tool entries (ToolCall/ToolResult/Reasoning) are grouped under "## harw" rather than "## You"; if copying to the clipboard fails, `/export` writes the file instead (`default_export_path`) and reports the path — under tmux the OSC-52 output is additionally wrapped in a DCS passthrough envelope — see `interaction-contract.md` §2.6.7 | Op | R |
 
 ### 2.2 Agent & topology
 
@@ -188,9 +188,9 @@ Legend for **Tier**: `Obs` `Op` `Maint` `Own`.
 | Command | Args | Description | Tier | Parity |
 |---|---|---|---|---|
 | `/doctor` | `[--fix] [--section=catalog\|config\|provider\|mcp\|sandbox\|policy]` | Health check across catalog/config/provider/MCP/sandbox/policy | Obs (plain), Maint (`--fix`) | Y |
-| `/model` | `show \| list \| switch <id>` | Inspect the active model, or atomically switch provider+model together (implemented grammar; see `interaction-contract.md` §2.6.1 for the full Ist-Stand table, including the new `/uia-model`, `/uia-worker-model`, `/effort`, `/uia-effort`, `/provider-concurrency` siblings) | Op | Y |
-| `/models` (neu) | `[show \| set <rolle> <ziel> \| reset <rolle> \| pick <rolle> \| worker [<rolle\|all> <uia\|ziel>]]` | Modelle **je Rolle** (12 Rollen, siehe `tui-roles-models-modes.md`) anzeigen/setzen/zurücksetzen; wirkt **ab nächster Sitzung** — nur `/model` wechselt live. `pick` öffnet TUI-lokal den Modell-Picker der Rolle. Details §8.2 | Op | - |
-| `/mode` (aktualisiert) | `[show \| <modus> \| default <modus>]` | Interaktionsmodus (`chat\|plan\|explore\|work\|shell`) anzeigen, für die laufende Sitzung anfordern (wirkt an der nächsten Turn-Grenze) oder als `[mode] default` persistieren (neue Sitzungen). Bare `/mode` öffnet in der TUI die Modus-/Freigabe-Auswahl (F7) | Op | - |
+| `/model` | `show \| list \| switch <id>` | Inspect the active model, or atomically switch provider+model together (implemented grammar; see `interaction-contract.md` §2.6.1 for the full current-state table, including the `/uia-model`, `/uia-worker-model`, `/effort`, `/uia-effort`, `/provider-concurrency` siblings) | Op | Y |
+| `/models` | `[show \| set <role> <target> \| reset <role> \| pick <role> \| worker [<role\|all> <uia\|target>]]` | Show/set/reset models **per role** (12 roles, see `tui-roles-models-modes.md`); takes effect **from the next session** — only `/model` switches live. `pick` opens the role's model picker locally in the TUI. Details in §8.2 | Op | - |
+| `/mode` | `[show \| <mode> \| default <mode>]` | Show the interaction mode (`chat\|plan\|explore\|work\|shell`), request it for the running session (takes effect at the next turn boundary), or persist it as `[mode] default` (new sessions). Bare `/mode` opens the mode/approval picker in the TUI (F7) | Op | - |
 | `/provider` | `show \| list \| test` | Inspect provider status and credentials only — **`/provider switch` no longer exists**; a provider (and model) switch is exclusively driven by `/model switch <id>` (atomic, works even across providers) | Op | R |
 | `/skills` | `[SkillRef] [--search=text] [--install]` | Browse, search, or install skills | Op (browse), Maint (`--install`) | R |
 | `/tools` | `[ToolRef] [--enable \| --disable]` | Show or toggle tool availability for the session | Op | R |
@@ -198,32 +198,32 @@ Legend for **Tier**: `Obs` `Op` `Maint` `Own`.
 | `/config` | `<path> [value]` | Read or write a config key on disk | Maint | - |
 | `/policy` | `<PolicyRef> [value]` | Inspect or set a policy value | Maint (read: Op) | - |
 | `/sandbox` | `[--status] [--profile=name]` | Inspect or switch the active sandbox profile | Maint | - |
-| `/sandbox-lease` (neu, Nutzerentscheidung 2026-09-21) | `[status \| revoke]` | Host-Freigabe für `shell.exec`: `status` zeigt die aktive Freigabe (Sitzung/Einzelaufruf/aus), `revoke` beendet eine aktive Sitzungsfreigabe sofort (`busy = "immediate"`); die Freigabe selbst wird nicht über den Command, sondern über das gleichnamige Modell-Tool `sandbox-lease` (Argument `reason`) angefordert und im `HostPermitDialog` bestätigt — siehe `interaction-contract.md` §2.6 und `mediated-process-execution.md` | Maint | - |
+| `/sandbox-lease` | `[status \| revoke]` | Host permission for `shell.exec`: `status` shows the active grant (session/single-call/off), `revoke` ends an active session grant immediately (`busy = "immediate"`); the grant itself is not requested through this command but through the identically named model tool `sandbox-lease` (argument `reason`) and confirmed in the `HostPermitDialog` — see `interaction-contract.md` §2.6 and `mediated-process-execution.md` | Maint | - |
 | `/plugins` | `[--list \| --enable=name \| --disable=name]` | Manage extension-api plugins | Maint | - |
 
 ### 2.6 Knowledge surfaces
 
-Ist-Grammatik Runde 4 (aus `harw-ops/src/{memory,diary,dream,palace,workbench,kanban,learn}.rs`
-und `harw-ops/src/matrix/mod.rs`). Stufe laut `OperationMeta` ist bei allen
-`operator`. Die volle Tabelle je Unterbefehl (Stufe, Sicht, busy, Hinweise)
-steht in `interaction-contract.md` §2.2.
+Current grammar (from `harw-ops/src/{memory,diary,dream,palace,workbench,kanban,learn}.rs`
+and `harw-ops/src/matrix/mod.rs`). The tier per `OperationMeta` is `operator`
+for all of them. The full table per subcommand (tier, visibility, busy
+class, notes) is in `interaction-contract.md` §2.2.
 
-| Command | Ist-Grammatik | Tier | Parity |
+| Command | Current grammar | Tier | Parity |
 |---|---|---|---|
-| `/memory` | `list \| stats \| recall <stichwort…> \| record <text…> [--project\|--global] \| forget <name> \| promote <fakt-id> [--project\|--global] [--slug <slug>] \| maintain \| consolidate [--project\|--global]` \| topics | Op | Y |
-| `/diary` | `today \| show [agent] [--date=YYYY-MM-DD \| --from=YYYY-MM-DD [--to=YYYY-MM-DD]] \| search <text> [--agent=<id>] [--from=…] [--to=…] \| note <text>`; `#text` ist Zucker für `note` (§3) \| agents | Op | R |
-| `/dream` | `list \| show <id> \| run \| status \| review [<id>] \| review <id> accept\|reject <vorschlag-id> [grund…]` | Op | R |
-| `/palace` | `list \| show <id> \| search <anfrage> [--max-hops=n] [--max=n] \| promote <thema> \| supersede <alt> <neu> [--confirm] \| edit <id> <text…> [--confirm] \| link <a> <b> [--confirm]` | Op | Y |
-| `/workbench` | `show \| pin <pfad> [notiz] \| unpin <pfad> \| note <text> \| note edit <n> <text> \| note rm <n> \| hypothesis add\|confirm\|reject <text> \| retention [keep\|<tage>d]`; jeder Unterbefehl mit `[--scope=session\|project\|project:<slug>]` | Op | R |
-| `/kanban` | `[--board=<id>] show [karte] \| list [--all] \| boards \| add\|create <titel> … \| edit <karte> <text…> \| comment <karte> <text…> \| evidence <karte> <pfad\|url> \| approve <karte> [notiz…] \| reject <karte> [grund…] \| move <karte> <todo\|ready\|running\|done\|blocked\|archived> \| todo\|ready\|claim\|unblock\|done\|archive <karte> \| block <karte> <grund>` | Op | Y |
-| `/learn` | `[scan] \| note <text…> [--target memory\|skill\|agent] \| list [--all] \| show <id> \| accept <id> \| reject <id> [grund…]` — schlägt nur vor, übernimmt nie selbst | Op | R |
-| `/matrix` | `start <szenario> [--seed N] [--package <id>] \| step \| auto N \| pause \| inject … \| override <json> \| veto <arg-id> [grund] \| reveal <id> \| fork <runde> \| end \| replay [--seed N] \| show \| list \| compare <lauf> <lauf> […]`; Panel mit F9 | Op | R |
+| `/memory` | `list \| stats \| recall <keyword…> \| record <text…> [--project\|--global] \| forget <name> \| promote <fact-id> [--project\|--global] [--slug <slug>] \| maintain \| consolidate [--project\|--global]` \| topics | Op | Y |
+| `/diary` | `today \| show [agent] [--date=YYYY-MM-DD \| --from=YYYY-MM-DD [--to=YYYY-MM-DD]] \| search <text> [--agent=<id>] [--from=…] [--to=…] \| note <text>`; `#text` is sugar for `note` (§3) \| agents | Op | R |
+| `/dream` | `list \| show <id> \| run \| status \| review [<id>] \| review <id> accept\|reject <proposal-id> [reason…]` | Op | R |
+| `/palace` | `list \| show <id> \| search <query> [--max-hops=n] [--max=n] \| promote <topic> \| supersede <old> <new> [--confirm] \| edit <id> <text…> [--confirm] \| link <a> <b> [--confirm]` | Op | Y |
+| `/workbench` | `show \| pin <path> [note] \| unpin <path> \| note <text> \| note edit <n> <text> \| note rm <n> \| hypothesis add\|confirm\|reject <text> \| retention [keep\|<days>d]`; every subcommand takes `[--scope=session\|project\|project:<slug>]` | Op | R |
+| `/kanban` | `[--board=<id>] show [card] \| list [--all] \| boards \| add\|create <title> … \| edit <card> <text…> \| comment <card> <text…> \| evidence <card> <path\|url> \| approve <card> [note…] \| reject <card> [reason…] \| move <card> <todo\|ready\|running\|done\|blocked\|archived> \| todo\|ready\|claim\|unblock\|done\|archive <card> \| block <card> <reason>` | Op | Y |
+| `/learn` | `[scan] \| note <text…> [--target memory\|skill\|agent] \| list [--all] \| show <id> \| accept <id> \| reject <id> [reason…]` — only suggests, never applies on its own | Op | R |
+| `/matrix` | `show \| list \| replay [--seed N] \| compare <run> <run> […]`; panel via F9. Read-only — see §7 of `matrix-game.md` for why `start`/`step`/`auto`/`inject`/`override`/`veto`/`reveal`/`fork`/`end` are no longer part of this command's grammar (game control now goes through the `matrix-game-master` orchestrator) | Op | R |
 
-Sichtbarkeit `/workbench`: die Operation trägt genau eine Sichtbarkeit,
-`channel_reduced`. `pin`/`unpin` und die bare Panel-Form sind trotzdem nur
-lokal sinnvoll (Pfadauflösung gegen das Arbeitsverzeichnis der TUI bzw. das
-Panel); `note` und `hypothesis` sind die eigentlich reduziert freigegebenen
-Formen. §6 ist entsprechend angeglichen.
+Visibility of `/workbench`: the operation carries exactly one visibility,
+`channel_reduced`. `pin`/`unpin` and the bare panel form are nonetheless
+only meaningful locally (path resolution against the TUI's working
+directory or the panel); `note` and `hypothesis` are the forms actually
+usable in reduced form. §6 is aligned accordingly.
 
 ### 2.7 Channels
 
@@ -262,10 +262,10 @@ ordinary chat input routed to the active agent.
 | Prefix | Name | Behavior |
 |---|---|---|
 | `/` | **Command** | Structured command per §1–§2. |
-| `!` | **Shell** | Runs the remainder as a host shell command through the sandboxed execution surface; output streams to an Inline or Pager surface depending on length. Requires `Operator` tier and an enabled `commands.shell` capability flag. **Ist-Stand 2026-09-21:** läuft mit dem beim Programmstart gelesenen zsh-PATH des harw-Prozesses — jedes existierende PATH-Verzeichnis außerhalb von `/usr /bin /lib /lib64` und dem Workspace wird per `--ro-bind-try` in die Sandbox gebunden (ausgenommen `/` und exakt `$HOME`), `~/.cargo/bin` zieht zusätzlich `RUSTUP_HOME`/`CARGO_HOME` nach sich; der Prozess läuft weiterhin in bwrap, nicht auf dem Host, und zwar unabhängig von einem aktiven `sandbox-lease`. **Seit Runde 6 (2026-09-24):** `!` läuft immer auf dem Host (`harw_tool_shell::run_operator_command`). Dabei gilt: echtes `HOME`, cwd ist die Projektwurzel, großzügige rlimits, Zeitlimit `[shell] max_timeout_secs`. Es gibt keine Freigabe, aber ein Audit-Ereignis `shell.operator_exec`; `sudo`/`doas`/`pkexec` sind abgelehnt. Ein getipptes `!` bekommt automatisch ein Leerzeichen. Der Befehl läuft auch während eines Turns sofort (Busy-Klasse Immediate), das Ergebnis geht erst nach dem Ende an den Chat. Die bwrap-Beschreibung davor ist überholt. Die normale Modell-`shell.exec` in der Projekt-Sandbox bleibt ohne Lease hermetisch mit Minimal-PATH — siehe `mediated-process-execution.md`. |
+| `!` | **Shell** | Runs the remainder as a host shell command through the sandboxed execution surface; output streams to an Inline or Pager surface depending on length. Requires `Operator` tier and an enabled `commands.shell` capability flag. **Current state**: `!` always runs on the host (`harw_tool_shell::run_operator_command`): real `HOME`, cwd is the project root, generous rlimits, timeout `[shell] max_timeout_secs`. There is no approval prompt, but there is an audit event `shell.operator_exec`; `sudo`/`doas`/`pkexec` are rejected. A typed `!` automatically gets a trailing space. The command also runs immediately during a turn (busy class Immediate); the result reaches the chat only after the turn ends. This is different from the model's own `shell.exec`, which stays sandboxed inside the project sandbox with a minimal PATH and no host access, independent of any active `sandbox-lease` — see `mediated-process-execution.md`. |
 | `!!` | **Shell-repeat** | Re-runs the last `!` shell command verbatim. Bare `!!` with no trailing text; any trailing text after `!!` is an error (`CommandError::TrailingTokens`), to avoid ambiguity with `!! <new cmd>` meaning something else. |
-| `#` | **Notiz** (Ist) | `#text` wird zu `/diary note text`, wenn die `diary`-Operation registriert ist, sonst zu `/memory record text`. Kein Modell-Turn; läuft über denselben Op-Pfad (eine Audit-Spur). Details §8.3. |
-| `@` | **Erwähnung** (Ist) | `@rolle text`: **Delegationswunsch an die UIA** — der Text geht als normaler Chat an die UIA, eingeleitet mit „[Delegationswunsch an Rolle „rolle“]“; die UIA entscheidet, ob sie delegiert (kein direktes Routing). `@pfad` hängt eine Projektdatei als `<datei pfad="…">…</datei>`-Block an (64 KiB je Datei, 256 KiB gesamt, max. 8 Dateien, Sperrliste). Eine bekannte Rolle hat Vorrang; eine gleichnamige Datei per `./name`. Details §8.3. |
+| `#` | **Note** (current) | `#text` becomes `/diary note text` if the `diary` operation is registered, otherwise `/memory record text`. No model turn; runs through the same operation path (a single audit trail). Details in §8.3. |
+| `@` | **Mention** (current) | `@role text`: **a delegation request to the UIA** — the text goes to the UIA as ordinary chat, prefixed with "[Delegation request for role "role"]"; the UIA decides whether to delegate (no direct routing). `@path` attaches a project file as a `<file path="…">…</file>` block (64 KiB per file, 256 KiB total, at most 8 files, a blocklist). A known role takes precedence; a same-named file is reached via `./name`. Details in §8.3. |
 
 Two forms deliberately **not** used, to keep the prefix set minimal and
 unambiguous: no `?` prefix (help is `/help` or the dedicated `Help` key, §4)
@@ -301,18 +301,17 @@ plain chat text.
 Harwness TUI keybindings follow a ratatui-style global/view-local split with
 optional two-key chords, entirely configurable via TOML in `harw-config`.
 
-> **Ist-Stand:** Die tatsächliche Standardbelegung (u. a. `Ctrl+K` = Zeile
-> löschen, `Shift+Tab` = Freigabe-Zyklus, F1 Hilfe, F5 Werkbank, F6 Kanban,
-> F7 Modusauswahl, F8 Modelle) und das reale Dateiformat
-> (`[tui].keybindings_file`, flache Tabelle `aktion = "chord"`) stehen in
-> §8.4. Die folgenden Tabellen und das TOML-Schema in §4.4 sind der
-> ursprüngliche Entwurf.
+> **Current state**: the actual default bindings (`Ctrl+K` = delete line,
+> `Shift+Tab` = approval cycle, F1 help, F5 workbench, F6 kanban, F7 mode
+> picker, F8 models, among others) and the real file format
+> (`[tui].keybindings_file`, a flat table `action = "chord"`) are in §8.4.
+> The tables below and the TOML schema in §4.4 are the original design.
 
 ### 4.1 Global keys (active in every view)
 
 | Key | Action |
 |---|---|
-| `Ctrl+C` (×2 within 2s) | Idle: quit (double-tap guard against accidental exit). Busy (during a running turn): **hard interrupt** — first press cancels the running model call, shell/sandbox subprocesses (SIGKILL), and child agents, and arms the same double-tap state as idle; a second press within the window quits. Model-call and subprocess cancellation (`harw-core/src/turn_loop.rs`, `harw-tool-shell/src/exec.rs`), child-agent cancellation wiring (`register_parent_cancel_token` called from `run_turn_streaming` in `harw-tui/src/app.rs`), and the unified idle/busy double-tap state (`pending_quit`/`hard_quit_requested`, `QuitArm`/`QUIT_HINT_WINDOW`) are all implemented — see `interaction-contract.md` §2.6.4. **Runde 4 (Teil F):** interrupting no longer drops the queue — messages and commands submitted during the turn stay queued and are delivered right after the interrupt (status line: „Warteschlange wird gesendet“), also when an approval or host-permit dialog was open. |
+| `Ctrl+C` (×2 within 2s) | Idle: quit (double-tap guard against accidental exit). Busy (during a running turn): **hard interrupt** — first press cancels the running model call, shell/sandbox subprocesses (SIGKILL), and child agents, and arms the same double-tap state as idle; a second press within the window quits. Model-call and subprocess cancellation (`harw-core/src/turn_loop.rs`, `harw-tool-shell/src/exec.rs`), child-agent cancellation wiring (`register_parent_cancel_token` called from `run_turn_streaming` in `harw-tui/src/app.rs`), and the unified idle/busy double-tap state (`pending_quit`/`hard_quit_requested`, `QuitArm`/`QUIT_HINT_WINDOW`) are all implemented — see `interaction-contract.md` §2.6.4. Interrupting no longer drops the queue — messages and commands submitted during the turn stay queued and are delivered right after the interrupt (status line: "sending queue"), including when an approval or host-permit dialog was open. |
 | `Ctrl+K` | Open command palette (fuzzy `/` command search) |
 | `Ctrl+L` | Clear visible transcript pane |
 | `F1` | Toggle help overlay (keybinding + command cheat sheet) |
@@ -700,8 +699,8 @@ terminal, presentation-facing type rather than a propagation type.
 | `/provider`, `/skills`, `/tools` | Y | Reduced | Browsing is safe remotely; installs/credential entry require Maintainer+ and stay TUI-first |
 | `/mcp`, `/config`, `/policy`, `/sandbox`, `/plugins` | Y | TUI-only | Root-of-trust config surfaces; remote mutation risk outweighs convenience |
 | `/memory`, `/kanban`, `/palace` | Y | Y | Read/append operations with clear, bounded blast radius; palace writes on `established` nodes need `--confirm`, kanban workers start only after `/kanban approve` |
-| `/diary`, `/workbench`, `/learn`, `/matrix` | Y | Reduced (one visibility per operation; `/workbench pin`/`unpin` and the bare panel are only meaningful locally) | Ist-Stand Runde 3/4, see §2.6 and `interaction-contract.md` §2.2 |
-| `/dream` | Y | Reduced | Ist-Stand Runde 4: `list`/`show`/`status`/`review` are safe to read remotely; `run` needs a dream launcher, which only interactive entries (TUI, one-shot) provide |
+| `/diary`, `/workbench`, `/learn`, `/matrix` | Y | Reduced (one visibility per operation; `/workbench pin`/`unpin` and the bare panel are only meaningful locally) | see §2.6 and `interaction-contract.md` §2.2 |
+| `/dream` | Y | Reduced | `list`/`show`/`status`/`review` are safe to read remotely; `run` needs a dream launcher, which only interactive entries (TUI, one-shot) provide |
 | `/bind`, `/unbind`, `/broadcast` | Y | TUI-only | Channel topology itself must not be mutable from within a channel it controls |
 | `/help`, `/status`, `/quit`, `/feedback` | Y | Y | Universal, low-risk |
 | `/keys`, `/clear`, `/theme` | Y | TUI-only | Terminal-rendering concerns only |
@@ -715,11 +714,11 @@ Independent of channel parity, every `CommandSpec` also carries a
 `busy: BusyAvailability` plus optional per-subcommand overrides
 (`busy_subcommands`), both taken from the operation's `#[operation]`
 declaration (`busy = "immediate|staged"`,
-`busy_subcommands = "show=immediate, -=immediate"`, `-` = bare form). Since
-Runde 4 (Teil H) there are three classes:
+`busy_subcommands = “show=immediate, -=immediate”`, `-` = bare form). There
+are three classes:
 
 - **Immediate** — runs during a running turn as its own task (60 s limit);
-  output appears as a system line „<befehl> (während Turn)“.
+  output appears as a system line “<command> (during turn)”.
 - **Staged** — runs during the turn but only records the change in the
   session controller/config cell; it takes effect from the next turn
   (`/model` including the bare picker form, `/effort`, `/mode`,
@@ -732,7 +731,7 @@ panels, verbose, system lines, rename) apply immediately; session picker,
 There is no `/provider switch`. `/cancel`/`/stop` act on the `JobStore`
 (background jobs), not the running turn itself — `Ctrl+C` and `Esc` (§4.1)
 interrupt a turn in progress. Messages submitted during a turn are shown in
-a „Wartet auf den nächsten Turn“ block above the composer until delivered.
+a “waiting for the next turn” block above the composer until delivered.
 Full table and status: `interaction-contract.md` §2.6.3; the CI table test
 is `EXPECTED_BUSY_CLASSES` in `harw-tui/src/command_exec.rs`.
 
@@ -751,7 +750,7 @@ the UIA's own provider. `/model switch <id>` with an explicit argument stays
 a plain text dispatch. Bare `/provider`/`/uia-provider` no longer open any
 picker — they run `show`. A parallel single-stage `Overlay::EffortChoice`
 opens for bare `/effort`/`/uia-effort`, listing all six reasoning-effort
-levels plus a "Provider-Default (zurücksetzen)" entry that emits `clear`.
+levels plus a "provider default (reset)" entry that emits `clear`.
 
 ---
 
@@ -765,9 +764,9 @@ levels plus a "Provider-Default (zurücksetzen)" entry that emits `clear`.
    is charged against the parent's is a `harw-job-runtime` concern not yet
    designed; the command surface above assumes a `--budget=Duration` flag
    but the semantics (hard cap vs. soft warning) are undecided.
-3. ~~Knowledge-surface commands~~ — erledigt: Grammatik in §2.6, Speicher-
-   modell in `knowledge-surfaces.md`. Seit Runde 4 ist auch `/dream` eine
-   registrierte Operation (`list|show|run|status|review`).
+3. ~~Knowledge-surface commands~~ — done: grammar in §2.6, storage model in
+   `knowledge-surfaces.md`. `/dream` is a registered operation
+   (`list|show|run|status|review`).
 4. **Command versioning across channel native-command registration** (e.g.
    if Harwness later registers native Telegram bot commands) is not
    addressed; this document only defines the internal contract that any
@@ -781,227 +780,226 @@ levels plus a "Provider-Default (zurücksetzen)" entry that emits `clear`.
 
 ---
 
-## 8. Ist-Stand der Befehlsfläche (2026-09-24, Runde 5)
+## 8. Current state of the command surface (2026-09-24)
 
-Dieser Abschnitt beschreibt, was der Code liefert, und hat bei Widerspruch
-Vorrang vor §§1–7. Quellen: `harw-ops/src/lib.rs` (`register_all`,
+This section describes what the code delivers and, on any conflict, wins
+over §§1–7. Sources: `harw-ops/src/lib.rs` (`register_all`,
 `register_plan_tools`), `harw-tui/src/command_catalog.rs`
 (`local_command_specs`, `FALLBACK_COMMANDS`, `PLANNED_COMMANDS`,
 `HINT_TABLE`), `harw-tui/src/keybindings.rs`, `harw-tui/src/mention.rs`,
 `harw-cli/src/cli/global.rs`.
 
-### 8.1 Woher ein Befehl kommt
+### 8.1 Where a command comes from
 
-Die TUI-Registry wird aus den Command-Adaptern der Operationen gebaut
-(`CommandRegistry::from_command_adapters`) und danach mit den lokalen
-Spezifikationen gemischt (`with_local_specs`). Bei Namensgleichheit gewinnt
-**immer die Operation**; der lokale Eintrag entfällt. Jede Spezifikation
-trägt `summary`, `usage`, `subcommands` (aus `HINT_TABLE`) und
-`origin: Operation | TuiLocal`; das `/`-Popup und die Hilfe (F1) zeigen sie.
+The TUI registry is built from the operations' command adapters
+(`CommandRegistry::from_command_adapters`) and then merged with the local
+specs (`with_local_specs`). On a name collision, **the operation always
+wins**; the local entry is dropped. Every spec carries `summary`, `usage`,
+`subcommands` (from `HINT_TABLE`), and `origin: Operation | TuiLocal`; the
+`/`-popup and help (F1) display them.
 
-| Herkunft | Bedeutung |
+| Origin | Meaning |
 |---|---|
-| **Operation** | in `harw-ops` definiert und über `register_all` (45 Ops) bzw. hinter `[tools.plan] enabled` über `register_plan_tools` (7 Ops) registriert |
-| **TUI-lokal** | nur in der TUI abgefangen, keine Operation (`CommandScope::TuiOnly`) |
-| **Ersatz** | TUI-Spezifikation für einen Befehl, dessen Operation (noch) nicht registriert ist (`FALLBACK_COMMANDS`: `mode`, `matrix`); entfällt automatisch, sobald die Operation registriert ist |
-| **geplant** | nur in der Hilfe gelistet (`PLANNED_COMMANDS`), nicht ausführbar |
+| **Operation** | defined in `harw-ops` and registered via `register_all` (45 ops) or, behind `[tools.plan] enabled`, via `register_plan_tools` (7 ops) |
+| **TUI-local** | intercepted only in the TUI, no operation behind it (`CommandScope::TuiOnly`) |
+| **Fallback** | a TUI spec for a command whose operation is not (yet) registered (`FALLBACK_COMMANDS`: `mode`, `matrix`); automatically drops out once the operation is registered |
+| **Planned** | listed only in help (`PLANNED_COMMANDS`), not runnable |
 
-Stand der Registrierung (Runde 4): `workbench`, `kanban`, `diary`,
-`palace`, `dream`, `learn`, `matrix` und `models` sind in `register_all`
-eingetragen; `mode` und `matrix` sind registriert, ihr Ersatz ist damit
-wirkungslos.
+Registration status: `workbench`, `kanban`, `diary`, `palace`, `dream`,
+`learn`, `matrix`, and `models` are entered in `register_all`; `mode` and
+`matrix` are registered, so their fallback specs have no effect.
 
-### 8.2 Inventar
+### 8.2 Inventory
 
-Spalten: Stufe laut `OperationMeta.permission` (Obs/Op/Maint), Sichtbarkeit
+Columns: tier per `OperationMeta.permission` (Obs/Op/Maint), visibility
 (`Y` channel_parity, `R` channel_reduced, `-` tui_only), `busy`
-(`sofort` = `Immediate`, `vorgemerkt` = `Staged`, gilt ab dem nächsten
-Turn; sonst bis Turn-Ende zurückgestellt; Einzelheiten §6.1).
+(`immediate` = `Immediate`, `staged` = `Staged`, takes effect from the next
+turn; otherwise deferred until the turn ends; details in §6.1).
 
-**Operationen (`register_all`)**
+**Operations (`register_all`)**
 
-| Befehl | Grammatik (Kurzform) | Stufe | Sicht | busy |
+| Command | Grammar (short form) | Tier | Parity | busy |
 |---|---|---|---|---|
-| `/help` | `[befehl]` | Obs | Y | sofort |
-| `/status` | — | Obs | Y | sofort |
+| `/help` | `[command]` | Obs | Y | immediate |
+| `/status` | — | Obs | Y | immediate |
 | `/quit` | — | Op | - | |
 | `/new` | — | Op | Y | |
-| `/work` | — (Job-Übersicht) | Obs | Y | sofort |
-| `/ps` | — | Obs | R | sofort |
-| `/attach` | — | Op | - | sofort |
-| `/stop` | `[job-id]` | Op | Y | sofort |
-| `/diff` | — | Obs | Y | sofort |
-| `/agent` | `[list \| stop <agent-id> \| budget [agent-id] \| use <name> \| use --clear \| stream <orchestrators\|all\|none> \| bg \| cancel <agent-id>]`; bare öffnet den Agentenbaum mit Live-Werten (Wurzel „UIA · <name>“); `use` setzt den Wurzel-Agenten ab der nächsten Sitzung (Profil-`active_agent_definition`); `stream`, `bg` und `cancel` fängt die TUI lokal ab (Runde 5, siehe unten) | Op | Y | sofort (auch `stream`/`bg`/`cancel`) |
-| `/skills` | `[list \| show <name> \| …]` | Op | R | sofort (bare/`list`/`show`) |
-| `/plugins` | — | Maint | - | sofort (außer `install`/`activate`/`uninstall`) |
-| `/model` | `[show \| list \| switch <modell-id>]` — **live** ab dem nächsten Turn | Op | - | sofort (`show`/`list`), sonst vorgemerkt |
-| `/provider` | `[show \| list \| test]` (kein `switch`) | Op | - | sofort (außer `test`) |
-| `/uia-model` | `[show \| list \| switch <modell-id>]` — ab nächster Sitzung | Op | - | sofort (bare/`show`/`list`), sonst vorgemerkt |
-| `/uia-provider` | `[show \| list \| test]` (kein `switch`) | Op | - | sofort (bare/`show`/`list`), `test` zurückgestellt |
-| `/uia-worker-model` | `[show \| list \| switch <modell-id>]` — alter Familien-Pin `uia_worker_model`, ab nächster Sitzung; seit Runde 5 ohne Kopplung an den UIA-Provider (Provider aus dem Katalog). Je Rolle: `/models worker` | Op | - | sofort (bare/`show`/`list`), sonst vorgemerkt |
-| `/effort` | `[show \| minimal \| low \| medium \| high \| xhigh \| max \| clear]` | Op | - | sofort (bare/`show`), sonst vorgemerkt |
-| `/uia-effort` | wie `/effort`, ab nächster Sitzung | Op | - | sofort (bare/`show`), sonst vorgemerkt |
-| `/permissions` | `[show \| mode <ask\|auto\|full> [--session\|--project\|--global] \| allow <tool> [muster] [--session\|--project\|--user] \| deny <tool> [muster] [--session\|--project\|--user] \| rules \| remove <nr> \| rm <nr> \| log [anzahl]]`; `--user` ist Alias von `--global`; `rules` listet die Regeln mit Herkunft, `log` die letzten Auto-Modus-Entscheidungen samt Deckelstand; Allow-Regeln für `ALWAYS_ASK_TOOLS` werden abgelehnt | Op | - | sofort (bare/`show`/`mode`/`set`/`rules`/`log`) |
-| `/mode` | `[show \| <modus> \| default <modus>]` | Op | - | sofort (bare/`show`), sonst vorgemerkt |
+| `/work` | — (job overview) | Obs | Y | immediate |
+| `/ps` | — | Obs | R | immediate |
+| `/attach` | — | Op | - | immediate |
+| `/stop` | `[job-id]` | Op | Y | immediate |
+| `/diff` | — | Obs | Y | immediate |
+| `/agent` | `[list \| stop <agent-id> \| budget [agent-id] \| use <name> \| use --clear \| stream <orchestrators\|all\|none> \| bg \| cancel <agent-id>]`; bare opens the agent tree with live values (root "UIA · <name>"); `use` sets the root agent from the next session (profile `active_agent_definition`); `stream`, `bg`, and `cancel` are intercepted locally by the TUI (see below) | Op | Y | immediate (including `stream`/`bg`/`cancel`) |
+| `/skills` | `[list \| show <name> \| …]` | Op | R | immediate (bare/`list`/`show`) |
+| `/plugins` | — | Maint | - | immediate (except `install`/`activate`/`uninstall`) |
+| `/model` | `[show \| list \| switch <model-id>]` — **live** from the next turn | Op | - | immediate (`show`/`list`), otherwise staged |
+| `/provider` | `[show \| list \| test]` (no `switch`) | Op | - | immediate (except `test`) |
+| `/uia-model` | `[show \| list \| switch <model-id>]` — from the next session | Op | - | immediate (bare/`show`/`list`), otherwise staged |
+| `/uia-provider` | `[show \| list \| test]` (no `switch`) | Op | - | immediate (bare/`show`/`list`), `test` deferred |
+| `/uia-worker-model` | `[show \| list \| switch <model-id>]` — the older family pin `uia_worker_model`, from the next session; no longer coupled to the UIA provider (a provider comes from the catalog). Per-role: `/models worker` | Op | - | immediate (bare/`show`/`list`), otherwise staged |
+| `/effort` | `[show \| minimal \| low \| medium \| high \| xhigh \| max \| clear]` | Op | - | immediate (bare/`show`), otherwise staged |
+| `/uia-effort` | like `/effort`, from the next session | Op | - | immediate (bare/`show`), otherwise staged |
+| `/permissions` | `[show \| mode <ask\|auto\|full> [--session\|--project\|--global] \| allow <tool> [pattern] [--session\|--project\|--user] \| deny <tool> [pattern] [--session\|--project\|--user] \| rules \| remove <n> \| rm <n> \| log [count]]`; `--user` is an alias for `--global`; `rules` lists the rules with their origin, `log` the most recent auto-mode decisions plus the cap state; allow rules for `ALWAYS_ASK_TOOLS` are rejected | Op | - | immediate (bare/`show`/`mode`/`set`/`rules`/`log`) |
+| `/mode` | `[show \| <mode> \| default <mode>]` | Op | - | immediate (bare/`show`), otherwise staged |
 | `/compact` | — | Op | Y | |
-| `/memory` | siehe §2.6 | Op | Y | |
-| `/workbench` | siehe §2.6 | Op | R | sofort (bare/`show`) |
-| `/kanban` | siehe §2.6 | Op | Y | geplant sofort (bare/`list`/`show`/`boards`), beim Schreiben noch zurückgestellt |
-| `/diary` | siehe §2.6 | Op | R | sofort (bare/`show`/`today`/`search`) |
-| `/palace` | siehe §2.6 | Op | Y | sofort (bare/`list`/`show`/`search`) |
-| `/dream` | siehe §2.6 | Op | R | geplant sofort (bare/`list`/`show`/`status`), beim Schreiben noch zurückgestellt |
-| `/learn` | siehe §2.6 | Op | R | |
-| `/matrix` | siehe §2.6 | Op | R | sofort (`show`/`list`) |
-| `/models` | `[show \| set <rolle> <ziel> \| reset <rolle> \| worker [<rolle\|all> <uia\|ziel>]]`; `pick <rolle>` ist TUI-lokal (öffnet den Picker); `worker` zeigt bzw. setzt die Wahl je UIA-Worker-Rolle (`uia` = wie UIA) | Op | - | sofort |
+| `/memory` | see §2.6 | Op | Y | |
+| `/workbench` | see §2.6 | Op | R | immediate (bare/`show`) |
+| `/kanban` | see §2.6 | Op | Y | immediate (bare/`list`/`show`/`boards`), still deferred for writes |
+| `/diary` | see §2.6 | Op | R | immediate (bare/`show`/`today`/`search`) |
+| `/palace` | see §2.6 | Op | Y | immediate (bare/`list`/`show`/`search`) |
+| `/dream` | see §2.6 | Op | R | immediate (bare/`list`/`show`/`status`), still deferred for writes |
+| `/learn` | see §2.6 | Op | R | |
+| `/matrix` | see §2.6 | Op | R | immediate (`show`/`list`) |
+| `/models` | `[show \| set <role> <target> \| reset <role> \| worker [<role\|all> <uia\|target>]]`; `pick <role>` is TUI-local (opens the picker); `worker` shows or sets the choice per UIA-worker role (`uia` = same as UIA) | Op | - | immediate |
 | `/context-proposal` | `list \| view \| accept \| reject` | Op | Y | |
-| `/add-workdir` | `<pfad>` | Op | - | |
-| `/export` | `[--format md\|json] [--datei <pfad>] [--tools\|--no-tools] [--reasoning-summary] [--max-chars <n>]` | Op | - | |
-| `/usage` | — | Obs | Y | sofort |
+| `/add-workdir` | `<path>` | Op | - | |
+| `/export` | `[--format md\|json] [--file <path>] [--tools\|--no-tools] [--reasoning-summary] [--max-chars <n>]` | Op | - | |
+| `/usage` | — | Obs | Y | immediate |
 | `/bug-report` | — | Op | - | |
-| `/approve`, `/deny`, `/cancel` | `<id> …` | Op | Y | sofort |
-| `/review` | `<id>` | Obs | Y | sofort |
+| `/approve`, `/deny`, `/cancel` | `<id> …` | Op | Y | immediate |
+| `/review` | `<id>` | Obs | Y | immediate |
 | `/retry` | `<id>` | Op | Y | |
-| `/provider-concurrency` | — | Op | - | sofort |
-| `/sandbox-lease` | `[status \| revoke]` | Op | - | sofort |
+| `/provider-concurrency` | — | Op | - | immediate |
+| `/sandbox-lease` | `[status \| revoke]` | Op | - | immediate |
 
-`approval.pending`/`approval.resolve` haben nur eine Web-Fläche, keinen
-Slash-Befehl.
+`approval.pending`/`approval.resolve` have only a web surface, no slash
+command.
 
-**Operationen hinter `[tools.plan] enabled`**: `/plan`, `/goal`, `/explore`,
-`/research`, `/research-deps` (mit `--generic` bzw. `ecosystem=<x>`
-ökosystem-neutral über `dependency-researcher`), `/research-web`, `/analyze`
-(alle Op). `/plan` (bare/`inspect`/`ready`/`waves`/`list`) und `/goal`
-(bare/`show`/`check`) laufen während eines Turns sofort.
+**Operations behind `[tools.plan] enabled`**: `/plan`, `/goal`, `/explore`,
+`/research`, `/research-deps` (with `--generic` or `ecosystem=<x>` for
+ecosystem-neutral use through `dependency-researcher`), `/research-web`,
+`/analyze` (all Op). `/plan` (bare/`inspect`/`ready`/`waves`/`list`) and
+`/goal` (bare/`show`/`check`) run immediately during a turn.
 
-`/plan` hat seit Runde 5 zwei Bereiche. Die Plan-**Dateien** des Plan-Modus
-fängt die TUI lokal ab: `/plan` (Plan-Modus an), `/plan show` (aktueller bzw.
-angehefteter Plan), `/plan list` (Pläne unter `.harw/plans`), `/plan open
-<name>` (früheren Plan zum Weiterplanen laden), `/plan edit` (im `$EDITOR`).
-Die Plan-**Graphen** der `plan`-Operation (Teil P): `/plan plans` (alle
-Graphen des Plan-Stores), `/plan switch <id>` (anderen Graphen aktiv machen),
-`/plan archive <id>` (ausblenden, nicht löschen), `/plan inspect [id]`,
-`/plan submit [id]` (öffnet in der TUI das Bestätigungsfenster; erst danach
-ist der Plan verbindlich und an ein Goal gebunden) und `/plan step <id>
-<open|running|done|blocked> [beleg]` (`done` nur mit Beleg). Modellseitig
-heißt die Graphen-Liste `plan list`. Ein bestätigter, gebundener Plan zeigt in
-der Statuszeile „◎ Goal: … · n/m“.
+`/plan` has two areas. The plan **files** of plan mode are intercepted
+locally by the TUI: `/plan` (turns plan mode on), `/plan show` (the current
+or pinned plan), `/plan list` (plans under `.harw/plans`), `/plan open
+<name>` (load an earlier plan to keep planning), `/plan edit` (in
+`$EDITOR`). The plan **graphs** of the `plan` operation: `/plan plans` (all
+graphs in the plan store), `/plan switch <id>` (make another graph active),
+`/plan archive <id>` (hide, not delete), `/plan inspect [id]`, `/plan
+submit [id]` (opens the confirmation window in the TUI; only after that is
+the plan binding and tied to a goal), and `/plan step <id>
+<open|running|done|blocked> [evidence]` (`done` only with evidence). On the
+model side the graph list is called `plan list`. A confirmed, bound plan
+shows "◎ Goal: … · n/m" in the status line.
 
-`/models`: `<rolle>` ist ein Schlüssel aus `ModelRole::key`
-(`uia`, `uia-worker`, `orchestrator`, `sub-orchestrator`, `worker-simple`,
-`worker-complex`, `explorer`, `research`, `compaction`, `title`, `memory`,
-`dream`; `_`/`-` und Groß-/Kleinschreibung egal, auch Schlüssel der internen
-Modellstellen wie `session_title`). `<ziel>` ist eine Modell-ID/ein Alias/ein
-Katalogschlüssel oder `provider/modell` (Trennung am **ersten** `/`, Präfix
-muss ein aktivierter Provider sein). `set uia-worker` lehnt Modelle eines
-anderen Providers als dem der UIA ab. `reset` entfernt die explizite Wahl
-(UIA: `uia_provider`/`uia_model`; interne Stellen: ganze Tabelle
-`[internal_models.<stelle>]`). Kein Modell-Werkzeug. `data`-Vertrag:
-`show` → `{"roles":[{"role","label","provider","model","source","effort"}],"live":{"provider","model"}}`.
+`/models`: `<role>` is a key from `ModelRole::key` (`uia`, `uia-worker`,
+`orchestrator`, `sub-orchestrator`, `worker-simple`, `worker-complex`,
+`explorer`, `research`, `compaction`, `title`, `memory`, `dream`; `_`/`-`
+and case don't matter, including keys of internal model slots like
+`session_title`). `<target>` is a model ID/alias/catalog key, or
+`provider/model` (split at the **first** `/`; the prefix must be an
+enabled provider). `set uia-worker` rejects models from a provider other
+than the UIA's own. `reset` removes the explicit choice (UIA:
+`uia_provider`/`uia_model`; internal slots: the whole
+`[internal_models.<slot>]` table). No model tool. `data` contract: `show` →
+`{"roles":[{"role","label","provider","model","source","effort"}],"live":{"provider","model"}}`.
 
-`/mode default <modus>` schreibt `[mode] default` in die Profil-`config.toml`
-(bestes Bemühen, Fehler als Hinweis) und berührt die laufende Sitzung nicht;
-`/mode <modus>` wird vorgemerkt und an der nächsten Turn-Grenze angewandt
-(Antwort `requested`, nicht `applied`). Kein Modell-Werkzeug.
+`/mode default <mode>` writes `[mode] default` to the profile's
+`config.toml` (best effort, an error becomes a notice) and doesn't touch
+the running session; `/mode <mode>` is staged and applied at the next turn
+boundary (the response says `requested`, not `applied`). No model tool.
 
-**TUI-lokal** (`local_command_specs`, alle `tui_only`)
+**TUI-local** (`local_command_specs`, all `tui_only`)
 
-| Befehl | Wirkung | Stufe | busy |
+| Command | Effect | Tier | busy |
 |---|---|---|---|
 | `/tools` | `[on <name> \| off <name> \| reset [name] \| profile <minimal\|coding\|full>]` | Op | |
-| `/resume` | `[sitzungs-id]`, ohne ID Auswahl | Op | |
-| `/sessions` | Sitzungsauswahl öffnen | Obs | |
-| `/exit` | TUI beenden (wie `/quit`) | Obs | |
-| `/clear` | Anzeige leeren, Sitzung bleibt | Obs | |
-| `/verbose` | ausführliche Werkzeuganzeige umschalten | Obs | sofort |
-| `/keys` | Tastenbelegung anzeigen | Obs | sofort |
-| `/whoami` | Sitzung, Berechtigung, aktives Modell | Obs | sofort |
-| `/rename` | `<titel>` | Op | sofort |
-| `/btw` | `<frage>` — flüchtige Nebenfrage zum Gespräch ohne Werkzeuge; unterbricht den Agenten nicht, landet weder im Verlauf noch in der Historie; Esc bricht ab, Zeitlimit 60 s | Op | sofort |
-| `/plan` | Plan-Modus an; `show \| list \| open <name> \| edit` (Plan-Dateien, siehe oben); Ersatz-Spezifikation, solange die `plan`-Operation fehlt | Op | sofort (`edit` wartet auf das Terminal) |
-| `/agent stream` | `<orchestrators\|all\|none>` — Live-Stream der Kind-Agenten im Verlauf für diese Sitzung (Vorgabe aus `[tui] child_stream`) | Obs | sofort |
-| `/agent bg` | Hintergrund-Agenten mit Fortschritt auflisten | Obs | sofort |
-| `/agent cancel` | `<agent-id>` — eigenen Hintergrund-Agenten abbrechen | Op | sofort |
+| `/resume` | `[session-id]`, without an ID opens a picker | Op | |
+| `/sessions` | opens the session picker | Obs | |
+| `/exit` | quits the TUI (like `/quit`) | Obs | |
+| `/clear` | clears the display, the session stays | Obs | |
+| `/verbose` | toggles verbose tool display | Obs | immediate |
+| `/keys` | shows the keybinding map | Obs | immediate |
+| `/whoami` | session, permission, active model | Obs | immediate |
+| `/rename` | `<title>` | Op | immediate |
+| `/btw` | `<question>` — an off-the-record side question with no tools; doesn't interrupt the agent, lands in neither the transcript nor the history; Esc cancels, 60s timeout | Op | immediate |
+| `/plan` | turns plan mode on; `show \| list \| open <name> \| edit` (plan files, see above); a fallback spec while the `plan` operation is absent | Op | immediate (`edit` waits on the terminal) |
+| `/agent stream` | `<orchestrators\|all\|none>` — a live stream of child agents into the transcript for this session (default from `[tui] child_stream`) | Obs | immediate |
+| `/agent bg` | lists background agents with progress | Obs | immediate |
+| `/agent cancel` | `<agent-id>` — cancel your own background agent | Op | immediate |
 
-`/agents` gibt es seit Runde 5 nicht mehr; die Eingabe zeigt den Hinweis
-„/agents gibt es nicht mehr – nutze /agent“ und wird nicht weitergeleitet.
-`/btw` gibt es nur in der TUI; Telegram antwortet mit einer klaren Absage.
+`/agents` no longer exists; typing it shows a hint ("/agents no longer
+exists – use /agent") and is not forwarded. `/btw` exists only in the TUI;
+a channel like Telegram answers with a plain refusal.
 
-Die Ersatz-Spezifikationen (`/mode`, `/matrix`, `/plan`) sind wirkungslos, solange die
-Operationen registriert sind; die lokalen `/plan`-Formen für Plan-Dateien
-bleiben davon unberührt.
+The fallback specs (`/mode`, `/matrix`, `/plan`) have no effect as long as
+their operations are registered; the local `/plan` forms for plan files
+are unaffected by that.
 
-Bare-Formen öffnen Ansichten statt Text: `/model`, `/uia-model`,
-`/uia-worker-model` → Modell-Picker; `/effort`, `/uia-effort` →
-Effort-Auswahl; `/models` → Rollen-Modell-Ansicht (F8); `/mode` →
-Modus-/Freigabe-Auswahl (F7); `/kanban` → Board (F6); `/workbench` →
-Werkbank-Panel (F5); `/palace`, `/dream`, `/diary` → Wissens-Browser
-(Diary nach Datum/Agent mit Suche und Bereichsansicht, Palace mit
-Links/Backlinks, Suche und Promote/Supersede mit Bestätigung, Dream-Review
-mit Annehmen/Ablehnen je Vorschlag); `/matrix` → Matrix-Panel (F9).
-Ansichten schreiben nie selbst, sondern erzeugen Slash-Zeilen (die Ops
-prüfen und speichern); ihre Daten kommen aus `OpOutput.data`.
+Bare forms open views instead of text: `/model`, `/uia-model`,
+`/uia-worker-model` → model picker; `/effort`, `/uia-effort` → effort
+picker; `/models` → the per-role model view (F8); `/mode` → the mode/
+approval picker (F7); `/kanban` → the board (F6); `/workbench` → the
+workbench panel (F5); `/palace`, `/dream`, `/diary` → the knowledge
+browser (diary by date/agent with search and a range view; palace with
+links/backlinks, search, and promote/supersede with confirmation;
+dream review with accept/reject per proposal); `/matrix` → the matrix
+panel (F9). Views never write on their own; they emit slash lines (which
+the operations validate and save); their data comes from `OpOutput.data`.
 
-**Geplant** (`PLANNED_COMMANDS`, nur Hilfe): `/rewind`, `/fork`, `/archive`,
+**Planned** (`PLANNED_COMMANDS`, help only): `/rewind`, `/fork`, `/archive`,
 `/spawn`, `/mention`, `/kill`, `/logs`, `/doctor`, `/config`, `/mcp`,
 `/channels`, `/lease`, `/priority`, `/depends`, `/theme`.
 
-### 8.3 Präfixe
+### 8.3 Prefixes
 
-| Eingabe | Ist-Verhalten |
+| Input | Current behavior |
 |---|---|
-| `/befehl` | Slash-Befehl; Popup vervollständigt Name und Unterkommando |
-| `! befehl` / `!!` | Shell-Befehl auf dem Host bzw. Wiederholung (siehe §3) |
-| `#text` | `/diary note text`, falls die `diary`-Operation registriert ist, sonst `/memory record text`. Kein Modell-Turn. |
-| `@rolle text` | Delegationswunsch an die UIA: Chattext wird zu „[Delegationswunsch an Rolle „rolle“] Bitte delegiere … Dies ist eine Bitte des Nutzers an dich (UIA), kein direktes Routing …“ + `text`. Rolle = exakter (case-insensitiver) Treffer in der Liste bekannter Agentenrollen; hat Vorrang vor Dateien. |
-| `@pfad` | Datei wird als `<datei pfad="rel/pfad">…</datei>` an die Nachricht angehängt. Grenzen (`MentionLimits::default`): **64 KiB je Datei, 256 KiB gesamt, höchstens 8 Dateien**. Pfad wird kanonisiert und muss unter der kanonischen Projektwurzel liegen (kein `..`, keine Symlinks nach außen). **Sperrliste**: `.env*`, `*.pem`, `*.key`, `id_*`, alles unter `.git/` — geprüft auf getipptem *und* aufgelöstem Pfad. Binärdateien (NUL-Byte) und ungültiges UTF-8 werden abgelehnt. Satzzeichen am Tokenende werden abgeschnitten, wenn das volle Token nicht auflösbar ist. Ablehnungen erscheinen mit deutschem Grund; eine gleichnamige Datei statt Rolle per `./name`. |
-| `\/`, `\!`, `\#`, `\@`, `\$` | Präfix maskieren, Rest als Chat |
-| `$` | reserviert |
+| `/command` | a slash command; the popup completes the name and subcommand |
+| `! command` / `!!` | a shell command on the host, or a repeat (see §3) |
+| `#text` | `/diary note text` if the `diary` operation is registered, else `/memory record text`. No model turn. |
+| `@role text` | a delegation request to the UIA: the chat text becomes "[Delegation request for role "role"] Please delegate … This is a request from the user to you (the UIA), not direct routing …" + `text`. Role = an exact (case-insensitive) match in the list of known agent roles; takes precedence over files. |
+| `@path` | a file is attached to the message as `<file path="rel/path">…</file>`. Limits (`MentionLimits::default`): **64 KiB per file, 256 KiB total, at most 8 files**. The path is canonicalized and must stay under the canonical project root (no `..`, no symlinks pointing outside). **Blocklist**: `.env*`, `*.pem`, `*.key`, `id_*`, anything under `.git/` — checked on both the typed and the resolved path. Binary files (a NUL byte) and invalid UTF-8 are rejected. Trailing punctuation on a token is stripped if the full token doesn't resolve. Rejections show a reason; a same-named file instead of a role is reached via `./name`. |
+| `\/`, `\!`, `\#`, `\@`, `\$` | escapes the prefix, the rest is chat |
+| `$` | reserved |
 
-Beim Tippen von `@` öffnet ein Popup Kandidaten (Rollen und Projektdateien).
+Typing `@` opens a popup with candidates (roles and project files).
 
-### 8.4 Tastenbelegung (Standard)
+### 8.4 Keybindings (default)
 
-Umbelegbar über `[tui].keybindings_file` (flache TOML-Tabelle
-`aktion = "chord"` oder Liste; leere Liste hebt auf).
+Rebindable via `[tui].keybindings_file` (a flat TOML table `action =
+"chord"`, or a list; an empty list clears a binding).
 
-| Taste | Aktion (`name`) |
+| Key | Action (`name`) |
 |---|---|
-| `F1` | Hilfe mit Reitern Befehle / Tasten / Präfixe (`show_help`) |
-| `F2` | Explorer ein/aus (`toggle_explorer`) |
-| `F3` | Agenten-Panel ein/aus (`toggle_agents`) |
-| `F4` | Fokus reihum (`cycle_focus`) |
-| `F5` | Werkbank-Panel ein/aus (`toggle_workbench`) |
-| `F6` | Kanban-Board öffnen (`open_kanban`) |
-| `F7` | Modus- und Freigabe-Auswahl (`open_mode_picker`) |
-| `F8` | Modelle je Rolle (`open_models`) |
-| `F9` | Matrix-Game-Panel öffnen (`open_matrix`) |
-| `F11` | Panel im Vollbild (`maximize_panel`) |
-| `Ctrl+E` | Explorer fokussieren (`focus_explorer`) |
-| `Ctrl+O` | Werkzeugzellen auf/zu (`toggle_tool_cells`), auch während eines Turns |
-| `Ctrl+H` | Host-Arbeitsphase beenden (`end_host_mode`), auch eine prozessweite aus `/sandbox-lease` oder `request_host` |
-| `Ctrl+K` | Eingabezeile löschen (`delete_line`) |
-| `Ctrl+J` | neue Zeile (`insert_newline`) |
-| `Shift+Tab` | Freigabe-Zyklus `ask → auto → full → plan → ask` (`cycle_permission_mode`); die Stufe `plan` ist der Plan-Modus (Marke „⏸ plan mode on (shift+tab to cycle)“, Sperre sofort); nicht bei offenem `/`-Popup |
+| `F1` | help, with tabs for commands / keys / prefixes (`show_help`) |
+| `F2` | toggle the explorer (`toggle_explorer`) |
+| `F3` | toggle the agent panel (`toggle_agents`) |
+| `F4` | cycle focus (`cycle_focus`) |
+| `F5` | toggle the workbench panel (`toggle_workbench`) |
+| `F6` | open the kanban board (`open_kanban`) |
+| `F7` | mode and approval picker (`open_mode_picker`) |
+| `F8` | models per role (`open_models`) |
+| `F9` | open the matrix-game panel (`open_matrix`) |
+| `F11` | maximize the panel (`maximize_panel`) |
+| `Ctrl+E` | focus the explorer (`focus_explorer`) |
+| `Ctrl+O` | toggle tool cells (`toggle_tool_cells`), also mid-turn |
+| `Ctrl+H` | end a host work phase (`end_host_mode`), also a process-wide one from `/sandbox-lease` or `request_host` |
+| `Ctrl+K` | delete the input line (`delete_line`) |
+| `Ctrl+J` | insert a newline (`insert_newline`) |
+| `Shift+Tab` | approval cycle `ask → auto → full → plan → ask` (`cycle_permission_mode`); the `plan` step is plan mode (marker "⏸ plan mode on (shift+tab to cycle)", the lock is immediate); has no effect while a `/`-popup is open |
 
-Nicht umbelegbar: `Ctrl+C`/`Ctrl+D`, `Esc`, `Enter` samt `Shift/Alt+Enter`,
-Tasten in Dialogen/Overlays. Das `/`-Popup reagiert seit Runde 5 auch während
-eines Turns auf Hoch/Runter/Tab/Esc/Enter; die Eingabe-Historie enthält auch
-`/`-Befehle (nie `/btw`). Laufen Kind-Agenten, fragt `Esc` im Turn zuerst nach
-(„nochmal Esc zum Bestätigen“); `Enter` reiht während eines Turns ein und
-bricht nie ab. Die Statuszeile zeigt
-`Modus: <modus> · Freigabe: <ask|auto|full>` (Zusatz „(ausstehend)“, solange
-ein Moduswechsel auf die Turn-Grenze wartet) und das aktive Modell.
+Not rebindable: `Ctrl+C`/`Ctrl+D`, `Esc`, `Enter` including
+`Shift/Alt+Enter`, and keys inside dialogs/overlays. The `/`-popup also
+responds to up/down/Tab/Esc/Enter mid-turn; the input history also
+contains `/`-commands (never `/btw`). While child agents are running,
+`Esc` mid-turn asks for confirmation first ("press Esc again to confirm");
+`Enter` queues during a turn and never aborts one. The status line shows
+`Mode: <mode> · Approval: <ask|auto|full>` (with "(pending)" appended while
+a mode change is waiting for the turn boundary) and the active model.
 
-### 8.5 CLI-Flags für den Sitzungsstart
+### 8.5 CLI flags for session startup
 
-Nur bei `harw`/`harw chat`, `harw exec` und `harw analyze` erlaubt (sonst
-Fehler; `--add-dir` nicht bei `analyze`).
+Allowed only for `harw`/`harw chat`, `harw exec`, and `harw analyze`
+(otherwise an error; `--add-dir` is not allowed for `analyze`).
 
-| Flag | Wirkung | Rangfolge |
+| Flag | Effect | Precedence |
 |---|---|---|
-| `--mode <modus>` | Interaktionsmodus der Wurzelsitzung | `--mode` > `[mode] default` (Vorgabe `chat`); unbekannter Name ist in beiden Fällen ein Fehler |
-| `--agent <name>` | Startet die Sitzung mit dieser Agentendefinition als Wurzel (`RuntimeSpec::active_agent`) statt der konfigurierten; `/agent use <name>` setzt dieselbe Wahl dauerhaft ab der nächsten Sitzung | `--agent` > Profil-`active_agent_definition` |
-| `--approval <ask\|auto\|full>` | Freigabemodus der Sitzung (`RuntimeSpec.approval_override`) | `--approval` > Projekt-`[permissions].default_mode` > globales > Vorgabe des Einstiegs (`auto`) |
-| `--model <id>` | Modell der Sitzung (`RuntimeSpec.model_override`) | wird gegen `config.models` geprüft (Schlüssel, dann ID, dann Alias); unbekannt = Konfigurationsfehler. Setzt `default_model`/`default_provider` und hebt einen UIA-Pin für diesen Lauf auf |
+| `--mode <mode>` | the root session's interaction mode | `--mode` > `[mode] default` (defaults to `chat`); an unknown name is an error in both cases |
+| `--agent <name>` | starts the session with this agent definition as root (`RuntimeSpec::active_agent`) instead of the configured one; `/agent use <name>` sets the same choice persistently from the next session | `--agent` > the profile's `active_agent_definition` |
+| `--approval <ask\|auto\|full>` | the session's approval mode (`RuntimeSpec.approval_override`) | `--approval` > project `[permissions].default_mode` > global > the entry point's default (`auto`) |
+| `--model <id>` | the session's model (`RuntimeSpec.model_override`) | checked against `config.models` (key, then ID, then alias); unknown = a configuration error. Sets `default_model`/`default_provider` and lifts a UIA pin for this run |
 
-Details und Begründung: `tui-roles-models-modes.md`.
+Details and rationale: `tui-roles-models-modes.md`.

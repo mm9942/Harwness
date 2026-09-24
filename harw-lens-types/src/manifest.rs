@@ -14,7 +14,7 @@
 //! [`crate::LensTypesError::ManifestMismatch`] entsteht ausschließlich über
 //! [`IndexManifest::compatible_with`].
 //!
-//! Contract-Master Abschnitt C (AW0-08, `docs/aw-contract-master.md`).
+//! Contract-Master Abschnitt C (AW0-08, `docs/design/build-history.md`).
 
 use serde::{Deserialize, Serialize};
 

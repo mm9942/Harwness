@@ -1,5 +1,5 @@
 //! `SettingScope` — die drei Lebensdauern einer Einstellung (Contract
-//! `harw-scopes-contract.md` §2, Zeile A2).
+//! `docs/design/config-scopes.md` §2, Zeile A2).
 //!
 //! Eine Einstellung kann auf drei Ebenen mit steigender Präzedenz gelten:
 //! `Global` (dauerhaft für den User, `~/.harw/config.toml`), `Project`

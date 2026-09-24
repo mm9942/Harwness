@@ -59,10 +59,9 @@
 //! Einfrieren verändert wurden, abgelehnt wird.
 //!
 //! **Offene Restlücke (F-023):** [`triage`] mit frei wählbarem [`Verdict`]
-//! ist weiterhin `pub`, weil `src/lib.rs` sie re-exportiert und diese Datei
-//! außerhalb der Zuständigkeit von C-FIND liegt. Neue Aufrufer müssen
-//! [`triage_record`] verwenden; `triage` wird entfernt, sobald die Aufrufer
-//! (siehe Ledger `docs/remediation/ledger/W3/C-FIND.md`) migriert sind.
+//! ist weiterhin `pub`, weil `src/lib.rs` sie re-exportiert. Neue Aufrufer
+//! müssen [`triage_record`] verwenden; `triage` wird entfernt, sobald die
+//! Aufrufer migriert sind.
 //!
 //! # Reinheitsauflage
 //! [`Finding::raw`] führt kein I/O aus, liest keine Systemuhr und ruft

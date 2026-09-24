@@ -1,162 +1,180 @@
-# Memory v3 — Langzeitgedächtnis (LTM) mit Scopes, Fakten und Konsolidierung
+# Memory v3 — Long-Term Memory (LTM) with Scopes, Facts, and Consolidation
 
-**Status:** Design-Anker (Vertrag für die Umsetzung).
-**Baut auf:** `docs/design/memory-v2.md` (STM/LTM-Tiers HOT/WARM/COLD, Signale, Heartbeat — bereits in `harw-memory` umgesetzt).
-**Vorbilder (geprüft):**
-- `~/codex/codex-rs/memories/` — zweistufige Pipeline: Phase 1 extrahiert pro Session eine strukturierte Erinnerung per Modell, Phase 2 konsolidiert global durch einen eigenen Agenten; Artefakte liegen als Dateien mit git-Baseline; Auswahl nach `usage_count` und `last_usage`, Verfall über `max_unused_days`.
-- `~/.annabel/projects/<projekt>/memory/` bzw. Claude Code — eine Datei pro Fakt, YAML-Frontmatter (`name`, `description`, `metadata.type`), ein `MEMORY.md` als Index, Querverweise über `[[name]]`.
-- `docs/design/config-structure.md` und `harw-scopes-contract.md` — Lebensdauern Session / Projekt / Global.
+> Status: implemented · Last reviewed: 2026-09-24
 
----
+Builds on `docs/design/memory-v2.md` (the STM/LTM HOT/WARM/COLD tiers,
+signals, and heartbeat).
 
-## 1. Warum v3
+## 1. Why v3
 
-v2 liefert Tiers, Signale und einen deterministischen Heartbeat, aber:
+v2 provides tiers, signals, and a deterministic heartbeat, but:
 
-1. **Kein Projektbezug.** Alles landet im Profil; Erinnerungen aus Projekt A tauchen in Projekt B auf.
-2. **Keine adressierbaren Fakten.** HOT/WARM sind Zeilenlisten; ein Fakt kann nicht einzeln geändert, verlinkt, belegt oder gelöscht werden.
-3. **Kein Modell im Spiel.** Erinnerungen entstehen nur aus expliziten Signalen; eine Session, in der niemand `/memory record` tippt, hinterlässt nichts.
-4. **Kein Verfall nach Nutzen.** Es gibt keine Nutzungszähler, also auch keine begründete Verdrängung.
+1. **No project scoping.** Everything lands in the profile; memories from
+   project A show up in project B.
+2. **No addressable facts.** HOT/WARM are line lists; a single fact cannot be
+   individually edited, linked, sourced, or deleted.
+3. **No model in the loop.** Memories only arise from explicit signals; a
+   session where nobody runs `/memory record` leaves nothing behind.
+4. **No usage-based decay.** There are no usage counters, so no justified
+   eviction either.
 
-v3 ergänzt genau diese vier Punkte und lässt v2 als schnelle, LLM-freie Leseschicht bestehen.
+v3 adds these four while leaving v2 in place as a fast, LLM-free read layer.
 
----
+## 2. Storage locations by lifetime
 
-## 2. Speicherorte nach Lebensdauer
-
-| Scope | Ort | Inhalt |
+| Scope | Location | Content |
 |---|---|---|
-| Session | Prozess (`short_term.rs`) | Ring-Buffer des laufenden Gesprächs, kein I/O |
-| Projekt | `<projekt>/.harw/memories/` | Fakten zu diesem Repo: Architektur, Konventionen, Entscheidungen, offene Punkte |
-| Global | `~/.harw/profiles/<p>/memories/` | Fakten über den Nutzer, wiederkehrende Vorlieben, projektübergreifende Werkzeuge |
+| Session | Process (`short_term.rs`) | Ring buffer of the running conversation, no I/O |
+| Project | `<project>/.harw/memories/` | Facts about this repo: architecture, conventions, decisions, open points |
+| Global | `~/.harw/profiles/<p>/memories/` | Facts about the user, recurring preferences, cross-project tools |
 
-Beide persistenten Wurzeln haben dasselbe Layout (bestehendes `FileMemoryStore`-Layout bleibt erhalten, `facts/` und `MEMORY.md` kommen hinzu):
+Both persistent roots share the same layout (the existing `FileMemoryStore`
+layout is unchanged; `facts/` and `MEMORY.md` are added):
 
 ```text
 <root>/
-  MEMORY.md              ← Index: eine Zeile je Fakt, wird generiert
-  facts/<slug>.md        ← ein Fakt je Datei (Frontmatter + Text)
-  HOT.md  INDEX.md       ← v2, unverändert
+  MEMORY.md              <- index: one line per fact, generated
+  facts/<slug>.md        <- one fact per file (frontmatter + text)
+  HOT.md  INDEX.md       <- v2, unchanged
   warm/<namespace>.md  cold/<namespace>.md
   signals/*.jsonl  state.json  workflow.json
-  usage.json             ← Nutzungszähler je Fakt
+  usage.json              <- usage counters per fact
 ```
 
-Das Projekt-`.harw/memories` ist bewusst **im Repo** und damit versionierbar und teilbar. Es gewährt keine Rechte — Rechte (Allow-Regeln, Workdirs) liegen laut `harw-scopes-contract.md` §2 außerhalb des Repos.
+The project's `.harw/memories` is deliberately **inside the repo**, so it is
+versioned and shared. It grants no rights — permissions (allow rules, work
+directories) live outside the repo per `docs/design/config-scopes.md` §2.
 
----
-
-## 3. Der Fakt
+## 3. The fact
 
 ```markdown
 ---
 name: tui-approval-arming
-description: Warum der Freigabe-Dialog eine Arming-Verzögerung hat
+description: Why the approval dialog has an arming delay
 type: decision            # fact | decision | preference | pitfall | reference
-scope: project            # project | global
+scope: project             # project | global
 created: 2026-09-14T05:12:00Z
 updated: 2026-09-14T05:12:00Z
-confidence: 0.9           # 0.0–1.0
-sources:                  # Belege, optional
-  - session:01H…          # Transcript
+confidence: 0.9            # 0.0-1.0
+sources:                   # evidence, optional
+  - session:01H…           # transcript
   - file:harw-tui/src/app.rs#L2402
 tags: [tui, approval]
 ---
 
-Tastendrücke gelten erst nach 250 ms und nur bei sichtbarem Panel.
+Keypresses only count after 250ms and only while the panel is visible.
 
-**Warum:** Ein Turn kann genau in dem Moment ein Panel öffnen, in dem der
-Nutzer tippt — ohne Verzögerung wäre das eine unbeabsichtigte Freigabe.
+**Why:** a turn can open a panel at exactly the moment the user is typing —
+without the delay that would be an unintended approval.
 
-Verwandt: [[tui-tool-cell]], [[permissions-scopes]]
+Related: [[tui-tool-cell]], [[permissions-scopes]]
 ```
 
-Regeln:
-- Ein Fakt ist **ein** Sachverhalt, höchstens ~15 Zeilen. Längeres gehört in `docs/`.
-- `name` ist der Dateiname ohne `.md`, kebab-case, stabil — Umbenennen bricht `[[links]]`.
-- `[[name]]` darf auf noch nicht existierende Fakten zeigen; das markiert eine Lücke.
-- `type` steuert die Auswahl: `preference` und `decision` werden bevorzugt geladen, `reference` nur bei Stichworttreffern.
-- Kein Geheimnis im Fakt. Vor dem Schreiben läuft die bestehende Redaction über Muster für Schlüssel und Token.
+Rules:
+- A fact is **one** thing, at most ~15 lines. Anything longer belongs in `docs/`.
+- `name` is the filename without `.md`, kebab-case, stable — renaming breaks
+  `[[links]]`.
+- `[[name]]` may point at a fact that doesn't exist yet; that marks a gap.
+- `type` steers selection: `preference` and `decision` are loaded by
+  default, `reference` only on a keyword match.
+- No secrets in a fact. Redaction runs over key/token patterns before write.
 
-`MEMORY.md` ist ein generierter Index (`- [Titel](facts/<slug>.md) — description`), damit ein Mensch und ein kleines Modell die Menge überblicken, ohne alle Dateien zu lesen.
+`MEMORY.md` is a generated index (`- [Title](facts/<slug>.md) — description`)
+so a human or a small model can survey the set without reading every file.
 
----
+## 4. Read path (hot path, no model)
 
-## 4. Lesepfad (Hot Path, ohne Modell)
+`MemoryContextProvider` delivers at most `memory_token_budget` (default 1500
+tokens) per turn:
 
-`MemoryContextProvider` liefert pro Turn höchstens `memory_token_budget` (Default 1500 Token):
+1. **Always:** the project's `MEMORY.md` index, truncated to 40 lines.
+2. **Always:** all facts with `type = preference` (global and project),
+   sorted by `updated`.
+3. **As needed:** facts with keyword matches against the user message
+   (existing `context_selector`, BM25-like over `name`, `description`,
+   `tags`, text) — project before global.
+4. **Then:** `HOT.md` as in v2.
 
-1. **Immer:** `MEMORY.md`-Index des Projekts, gekürzt auf 40 Zeilen.
-2. **Immer:** alle Fakten mit `type = preference` (global und Projekt), sortiert nach `updated`.
-3. **Nach Bedarf:** Fakten mit Stichworttreffern gegen die Nutzernachricht (bestehender `context_selector`, BM25-artig über `name`, `description`, `tags`, Text) — Projekt vor Global.
-4. **Dann:** HOT.md wie in v2.
+Every delivered fact increments `usage.json[slug].count` and sets
+`last_used`. This costs one buffered write per turn, no read in the hot path.
 
-Jeder ausgelieferte Fakt erhöht `usage.json[slug].count` und setzt `last_used`. Das kostet einen gepufferten Schreibvorgang pro Turn, kein Lesen im Hot Path.
+No model call. Order and budget are deterministic and testable.
 
-Kein Modellaufruf. Reihenfolge und Budget sind deterministisch und testbar.
+## 5. Write path
 
----
+### 5.1 Immediate (deterministic)
+- `/memory record <text> [--global]` writes a fact directly (default:
+  project).
+- Existing signals (`correction`, `reflection`, `pattern_hint`) are
+  unchanged and still flow into HOT/WARM.
 
-## 5. Schreibpfad
+### 5.2 Post-session extraction (phase 1, model)
+Triggered when a new session starts, in the background, never in the hot
+path — so the running session pays nothing.
 
-### 5.1 Sofort (deterministisch)
-- `/memory record <text> [--global]` schreibt direkt einen Fakt (Default: Projekt).
-- Bestehende Signale (`correction`, `reflection`, `pattern_hint`) bleiben und fließen unverändert in HOT/WARM.
+- Selection: completed project transcripts older than `idle_min_secs`
+  (default 300), younger than `max_age_days` (default 30), not yet
+  extracted (marker in `state.json`).
+- Input: filtered turn items (user text, assistant conclusions, errors, file
+  and command names), at most 30 KiB.
+- The prompt requires strict structure: `facts: [{name, description, type,
+  body, confidence, sources}]`, at most 5 per session, "nothing that is
+  readable from the code or git log".
+- The result is redacted, then stored as a **candidate** under
+  `facts/_incoming/<slug>.md`.
 
-### 5.2 Extraktion nach der Session (Phase 1, Modell)
-Ausgelöst beim Start einer neuen Session, im Hintergrund, nie im Hot Path — wie bei Codex, damit die laufende Session nichts bezahlt.
+### 5.3 Consolidation (phase 2, agent)
+- Runs when `_incoming/` is non-empty, under a lock (one consolidation per
+  root at a time).
+- A dedicated agent (`memory-steward`, read-only tools plus write access
+  below the memory root, no network, no approvals) receives: the index,
+  affected existing facts, all candidates, and the diff since the last
+  baseline.
+- Task: merge rather than accumulate — merge duplicates, flag and resolve
+  contradictions via `contradiction_index`, lower `confidence` on or delete
+  stale facts, rewrite `MEMORY.md`.
+- Afterward: reset the memory root's git baseline (project: a normal commit
+  candidate, not auto-committed; global: its own `.git` in the root).
 
-- Auswahl: abgeschlossene Transcripts des Projekts, älter als `idle_min_secs` (Default 300), jünger als `max_age_days` (Default 30), noch nicht extrahiert (Marker in `state.json`).
-- Eingabe: gefilterte Turn-Items (Nutzertext, Assistenz-Fazit, Fehler, Datei- und Befehlsnamen), höchstens 30 KiB.
-- Prompt verlangt strenge Struktur: `facts: [{name, description, type, body, confidence, sources}]`, höchstens 5 pro Session, „nichts, was aus dem Code oder git-Log ablesbar ist".
-- Ergebnis wird redigiert, dann als **Kandidat** unter `facts/_incoming/<slug>.md` abgelegt.
+### 5.4 Eviction
+On heartbeat (`maintain()`):
+- `last_used` older than `max_unused_days` (default 90) and `usage_count ==
+  0` -> `confidence *= 0.5`; below 0.2 -> moved to `cold/`.
+- A fact whose `sources` have all disappeared (file deleted, transcript
+  gone) is flagged, not automatically deleted.
 
-### 5.3 Konsolidierung (Phase 2, Agent)
-- Läuft, wenn `_incoming/` nicht leer ist, unter einem Lock (eine Konsolidierung je Wurzel).
-- Ein eigener Agent (`memory-steward`, Werkzeuge nur lesend plus Schreiben unterhalb der Memory-Wurzel, kein Netz, keine Freigaben) bekommt: Index, betroffene bestehende Fakten, alle Kandidaten, den Diff seit der letzten Baseline.
-- Auftrag: zusammenführen statt anhäufen — Duplikate verschmelzen, Widersprüche über `contradiction_index` markieren und auflösen, veraltete Fakten senken (`confidence`) oder löschen, `MEMORY.md` neu schreiben.
-- Danach: git-Baseline der Memory-Wurzel zurücksetzen (Projekt: normaler Repo-Commit-Kandidat, kein automatischer Commit; Global: eigenes `.git` in der Wurzel wie bei Codex).
+## 6. Commands
 
-### 5.4 Verdrängung
-Beim Heartbeat (`maintain()`):
-- `last_used` älter als `max_unused_days` (Default 90) und `usage_count == 0` → `confidence *= 0.5`; unter 0.2 → nach `cold/` verschoben.
-- Ein Fakt, dessen `sources` alle verschwunden sind (Datei gelöscht, Transcript weg), wird markiert, nicht automatisch gelöscht.
-
----
-
-## 6. Bedienung
-
-| Befehl | Wirkung |
+| Command | Effect |
 |---|---|
-| `/memory` | Index mit Anzahl je Scope und Typ |
-| `/memory record <text> [--global]` | Fakt schreiben |
-| `/memory recall <stichwort>` | Suche über beide Scopes, zeigt Herkunft |
-| `/memory forget <name>` | Fakt löschen (Projekt oder Global), mit Rückfrage |
-| `/memory consolidate` | Phase 2 sofort anstoßen |
-| `/memory stats` | Nutzung, Verfall, Kandidaten |
+| `/memory` | Index with counts per scope and type |
+| `/memory record <text> [--global]` | Write a fact |
+| `/memory recall <keyword>` | Search both scopes, shows provenance |
+| `/memory forget <name>` | Delete a fact (project or global), with confirmation |
+| `/memory consolidate` | Trigger phase 2 immediately |
+| `/memory stats` | Usage, decay, candidates |
 
-Config `[memory]`: `enabled`, `project_enabled`, `extraction = true|false`, `extraction_model`, `token_budget`, `max_unused_days`, `max_facts_per_session`.
+Config `[memory]`: `enabled`, `project_enabled`, `extraction = true|false`,
+`extraction_model`, `token_budget`, `max_unused_days`, `max_facts_per_session`.
 
----
+## 7. Invariants
 
-## 7. Invarianten
+1. No model call in the read path.
+2. A fact is a file; the file is the source of truth. The index and usage
+   counters are always re-derivable.
+3. Project memories never leave the project; global memories carry no
+   project secrets (redaction plus a path check on write).
+4. Extraction and consolidation are idempotent and never lose work to each
+   other via markers and locks.
+5. Every auto-generated fact carries its source; no source, no automatic
+   fact.
+6. Deletion is always possible and complete — including from the index and
+   the counters.
 
-1. Kein Modellaufruf im Lesepfad.
-2. Ein Fakt ist eine Datei; die Datei ist die Wahrheit. Index und Nutzungszähler sind jederzeit neu ableitbar.
-3. Projekt-Erinnerungen verlassen nie das Projekt; globale enthalten keine Projektgeheimnisse (Redaction plus Pfadprüfung beim Schreiben).
-4. Extraktion und Konsolidierung sind idempotent und nehmen sich über Marker und Locks nichts weg.
-5. Jeder automatisch erzeugte Fakt trägt seine Quelle; ohne Quelle kein automatischer Fakt.
-6. Löschen ist immer möglich und vollständig — auch aus dem Index und den Zählern.
+## Implementation
 
----
-
-## 8. Umsetzung in Scheiben
-
-| Scheibe | Inhalt |
-|---|---|
-| M1 | `harw-memory/src/facts.rs`: Fakt-Typ, Frontmatter, Laden/Schreiben/Löschen, Slug, Redaction, `MEMORY.md`-Generierung, Nutzungszähler |
-| M2 | Zwei Wurzeln (Projekt + Global) im `MemoryContextProvider`, Auswahlreihenfolge aus §4, Budget, Zählerpflege |
-| M3 | `/memory`-Unterbefehle aus §6 |
-| M4 | Phase 1: Extraktion über den One-Shot-Modellaufruf (`harw-runtime/src/one_shot.rs`), Marker, Redaction, `_incoming/` |
-| M5 | Phase 2: Rolle `memory-steward` plus Konsolidierungslauf, git-Baseline |
-| M6 | Verfall im Heartbeat, `/memory stats` |
+Implemented: `harw-memory/src/facts.rs` (fact type, frontmatter, load/write/
+delete, slug, redaction, `MEMORY.md` generation, usage counters),
+`context_provider.rs` / `context_selector.rs` (read path and budget),
+`extraction.rs` (phase 1), `consolidation.rs` and `contradiction_index.rs`
+(phase 2), `outcome_tracker.rs` and `heartbeat.rs` (decay).

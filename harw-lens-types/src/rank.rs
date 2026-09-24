@@ -23,7 +23,7 @@
 //! Veränderlichkeit; [`EdgeIndex`] wird über `&mut self` befüllt und danach
 //! nur noch gelesen.
 //!
-//! Contract-Master Abschnitt C (AW0-08, `docs/aw-contract-master.md`).
+//! Contract-Master Abschnitt C (AW0-08, `docs/design/build-history.md`).
 
 use std::collections::{HashMap, HashSet};
 

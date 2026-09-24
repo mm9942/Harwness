@@ -1,8 +1,6 @@
 //! Zweistufiger Provider/Modell-Umschalt-Picker für `/model`- und
 //! `/uia model`-artige Befehle.
 //!
-//! Spec-Quelle: `recursive-cooking-lobster.md`, Abschnitt "Welle 1 — 1d".
-//!
 //! # Verantwortung
 //! Kapselt die Zwei-Stufen-Navigation (Provider auswählen → Modell
 //! auswählen) hinter einem einzigen Widget, das intern zwei
