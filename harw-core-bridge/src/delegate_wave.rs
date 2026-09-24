@@ -512,13 +512,11 @@ pub fn admit_targets(
 /// Der Budgetdeckel jedes Kindes einer Welle.
 ///
 /// # Beschreibung
-/// Heute: das Budget aus dem Admission-Record des Aufrufers (`None` für die
-/// Wurzelsitzung → kein zusätzlicher Deckel). `fanout_children` verschneidet
-/// ihn je Kind mit dessen Agent-IR, je Dimension gewinnt die strengere Grenze.
-///
-/// Sobald der Kind-Controller das **Restbudget** eines Parents führt
-/// (Verbrauch seiner Kinder abgezogen), ist hier nur die Quelle zu tauschen:
-/// `remaining_budget(parent)` statt `child_budget(parent)`.
+/// Quelle ist das **Restbudget** des Aufrufers
+/// (`ManagedAgentSpawner::remaining_budget`: Budget minus Verbrauch seiner
+/// Kinder; `None` für die Wurzelsitzung → kein zusätzlicher Deckel).
+/// `fanout_children` verschneidet ihn je Kind mit dessen Agent-IR, je
+/// Dimension gewinnt die strengere Grenze.
 #[must_use]
 pub fn wave_budget_cap(caller_budget: Option<AgentBudget>) -> AgentBudget {
     caller_budget.unwrap_or_default()

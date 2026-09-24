@@ -31,9 +31,10 @@
 //! [`resume_after_approval`] mit `ApprovalActor::ChannelPeer`. Ein Sweeper
 //! prüft alle [`SWEEP_INTERVAL`] (30 s) abgelaufene Freigaben
 //! (`ApprovalResolution::timed_out`), räumt abgelaufene Tokens und
-//! Anhänge auf. Die Freigabe-Nachricht wird beim Abschluss (Entscheidung
-//! oder Ablauf) durch den Wiederaufnahme-Job geschlossen
-//! (`close_approval_async`).
+//! Anhänge auf. Nach einem Klick schließt der Callback-Worker die
+//! Freigabe-Nachricht; bei Ablauf oder Zustellfehler schließt sie der
+//! Wiederaufnahme-Job (`close_approval_async`). Offene Tokens der Anfrage
+//! werden in jedem Fall widerrufen.
 //!
 //! # Sicherheit / Logging
 //! Nachrichtentexte, Modellantworten und Tokens werden nie geloggt.
@@ -327,8 +328,9 @@ struct ResumeJob {
     parked: Parked,
     actor: ApprovalActor,
     resolution: ApprovalResolution,
-    /// Text, mit dem die Freigabe-Nachricht geschlossen wird.
-    outcome_text: &'static str,
+    /// Text, mit dem die Freigabe-Nachricht geschlossen wird; `None`, wenn
+    /// der Callback-Worker sie bereits geschlossen hat (Klick-Entscheidung).
+    outcome_text: Option<&'static str>,
 }
 
 enum Job {
@@ -602,7 +604,7 @@ impl Engine {
             .renderer
             .approval_tokens()
             .revoke_request(&request_id);
-        if let Some(message_id) = message_id {
+        if let (Some(message_id), Some(outcome_text)) = (message_id, outcome_text) {
             let text = format!("{summary}\n\n{outcome_text}");
             if let Err(error) = runtime.block_on(self.config.renderer.close_approval_async(
                 target.chat_id,
@@ -851,7 +853,7 @@ impl Engine {
                                 resolution: ApprovalResolution::Reject {
                                     reason: APPROVAL_UNDELIVERABLE.to_owned(),
                                 },
-                                outcome_text: "Freigabe nicht zustellbar – abgelehnt.",
+                                outcome_text: Some("Freigabe nicht zustellbar – abgelehnt."),
                             })),
                         );
                     });
@@ -877,19 +879,16 @@ impl Engine {
                 None => return Err("Diese Freigabe ist nicht mehr offen.".to_owned()),
             }
         };
-        let (resolution, outcome_text, reply) = if approve {
-            (
-                ApprovalResolution::Approve,
-                "Entscheidung: freigegeben.",
-                "Freigegeben – der Turn läuft weiter.",
-            )
+        // Der Callback-Worker schließt die Freigabe-Nachricht selbst
+        // („<Verdikt>: <reply>“); die Wiederaufnahme lässt sie daher stehen.
+        let (resolution, reply) = if approve {
+            (ApprovalResolution::Approve, "der Turn läuft weiter.")
         } else {
             (
                 ApprovalResolution::Reject {
                     reason: REJECTED_BY_USER.to_owned(),
                 },
-                "Entscheidung: abgelehnt.",
-                "Abgelehnt.",
+                "der Turn wird ohne die Aktion fortgesetzt.",
             )
         };
         let key = parked.key.clone();
@@ -904,7 +903,7 @@ impl Engine {
                     parked,
                     actor,
                     resolution,
-                    outcome_text,
+                    outcome_text: None,
                 })),
             );
         });
@@ -932,7 +931,7 @@ impl Engine {
                         parked,
                         actor,
                         resolution: ApprovalResolution::timed_out(),
-                        outcome_text: "Freigabe abgelaufen – abgelehnt.",
+                        outcome_text: Some("Freigabe abgelaufen – abgelehnt."),
                     })),
                 );
             });
@@ -1085,9 +1084,8 @@ fn run_sweeper(engine: &Weak<Engine>, stop: &std_mpsc::Receiver<()>) {
 ///
 /// `resolve` prüft, dass `actor` der gebundene Entscheider ist, und stellt
 /// die Wiederaufnahme vorn in die FIFO des Chats; die eigentliche
-/// Fortsetzung (inkl. Schließen der Freigabe-Nachricht) läuft asynchron auf
-/// einem Worker. Der Rückgabetext ist für den Chat bzw. die Callback-Antwort
-/// gedacht.
+/// Fortsetzung läuft asynchron auf einem Worker. Der Rückgabetext ergänzt
+/// das Verdikt, mit dem der Callback-Worker die Freigabe-Nachricht schließt.
 struct TurnApprovals {
     engine: Weak<Engine>,
 }

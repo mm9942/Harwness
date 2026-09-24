@@ -56,7 +56,7 @@ pub use auto_compact::{
 pub use capture::{ToolOutcome, ToolOutcomeObserver, ToolOutcomeStatus};
 pub use child_controller::{
     AgentBudget, BudgetDimension, ChildLimits, ChildRecord, ChildRegistryFactory, ChildRunResult,
-    ContextWindowResolver, DEFAULT_CHILD_CONTEXT_WINDOW, ExpiredChild, FanoutRequest,
+    ChildUsage, ContextWindowResolver, DEFAULT_CHILD_CONTEXT_WINDOW, ExpiredChild, FanoutRequest,
     JoinSemantics, ManagedAgentSpawner, OrchestrationObserver, ParentGrant, RoleEffortWeights,
     TaskComplexity,
 };
