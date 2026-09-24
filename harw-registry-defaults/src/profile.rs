@@ -376,19 +376,20 @@ pub(crate) const DEPS_SOURCE_TOOLS: &[&str] =
 /// Die Werkzeuge von `harw-tool-web`, in Provider-Reihenfolge.
 pub(crate) const WEB_TOOLS: &[&str] = &["web.fetch", "web.docs_rs", "web.crates_io", "web.search"];
 
-/// Die Netz-Werkzeuge der Erkundungsprofile [`RegistryProfile::ReadOnlyExplore`]
-/// und [`RegistryProfile::UiaExplorer`] sowie der UIA-Helfer
-/// [`RegistryProfile::UiaQuickHelper`] und [`RegistryProfile::UiaWriter`]:
+/// Die Netz-Werkzeuge der Erkundungsprofile [`RegistryProfile::ReadOnlyExplore`],
+/// [`RegistryProfile::UiaExplorer`] und [`RegistryProfile::ReadOnlyResearch`]:
 /// `web.fetch` und `web.search`, in Provider-Reihenfolge — kein
-/// `web.docs_rs`/`web.crates_io` (die tiefere Crate-Recherche bleibt bei
-/// [`RegistryProfile::Research`]).
+/// `web.docs_rs`/`web.crates_io` (die Crate-Werkzeuge bleiben bei
+/// [`RegistryProfile::Research`] und den UIA-Helfern, siehe
+/// [`UIA_HELPER_WEB_TOOLS`]).
 ///
 /// # Warum diese Profile Netz bekommen (Nutzerentscheidungen)
 /// „Der Explorer durchsucht alles … auch das Internet“: `explorer` und
 /// `uia-explorer` admittieren beide Werkzeuge in ihrer TOML. Dasselbe gilt
 /// für `uia-worker` und `uia-writer` (Nutzerentscheidung „die UIA-Helfer
-/// recherchieren kurz online und fügen manchmal Abhängigkeiten hinzu“).
-/// Jeder Abruf braucht weiterhin `Permission::NetworkAccess` im
+/// recherchieren kurz online und fügen manchmal Abhängigkeiten hinzu“),
+/// die dafür über [`UIA_HELPER_WEB_TOOLS`] zusätzlich die Crate-Werkzeuge
+/// bekommen. Jeder Abruf braucht weiterhin `Permission::NetworkAccess` im
 /// Sandbox-Scope der Rolle (Prolog, Host-Allowlist); ohne dieses Recht fallen
 /// beide Werkzeuge über [`RegistryProfile::tool_names_for`] heraus. Die
 /// übrigen Rollen auf `ReadOnlyExplore` (`analyst`, `researcher-deps`)
@@ -396,6 +397,21 @@ pub(crate) const WEB_TOOLS: &[&str] = &["web.fetch", "web.docs_rs", "web.crates_
 /// [`RegistryProfile::ReadOnlyResearch`] (`researcher`,
 /// `dependency-researcher`) führt dieselben zwei Werkzeuge.
 pub(crate) const EXPLORER_WEB_TOOLS: &[&str] = &["web.fetch", "web.search"];
+
+/// Die Netz-Werkzeuge der UIA-Helfer [`RegistryProfile::UiaQuickHelper`]
+/// (`uia-worker`) und [`RegistryProfile::UiaWriter`] (`uia-writer`): alle
+/// vier `web.*`-Werkzeuge in Provider-Reihenfolge — `web.fetch`,
+/// `web.docs_rs`, `web.crates_io`, `web.search`.
+///
+/// # Warum eine eigene Konstante (Nutzerentscheidung)
+/// Die UIA-Helfer prüfen vor dem Hinzufügen einer Abhängigkeit auch deren
+/// crates.io-Metadaten und docs.rs-Dokumentation. Die beiden Crate-Werkzeuge
+/// sind rein lesend und laufen wie `web.fetch`/`web.search` durch die
+/// Egress-Policy und den Host-Scope des Elternteils. Der `explorer` (und
+/// jedes andere Profil mit [`EXPLORER_WEB_TOOLS`]) bekommt sie ausdrücklich
+/// **nicht** — deshalb keine Wiederverwendung von [`EXPLORER_WEB_TOOLS`].
+pub(crate) const UIA_HELPER_WEB_TOOLS: &[&str] =
+    &["web.fetch", "web.docs_rs", "web.crates_io", "web.search"];
 
 /// Das einzige Browser-Werkzeug von [`RegistryProfile::UiaQuickHelper`]
 /// (Nutzerentscheidung, ersetzt Addendum I in diesem Punkt): `uia-worker`
@@ -658,11 +674,11 @@ pub enum RegistryProfile {
     /// Workspace-Zugriff (`FS_READ_ONLY_TOOLS`) plus `doc.read_pdf`
     /// (`DOC_TOOLS`) plus `shell.exec` (`SHELL_TOOLS`, läuft wie überall über
     /// Sandbox+Freigabe) plus die fünf lesenden `deps.*`-Werkzeuge
-    /// ([`DEPS_TOOLS`]) plus `web.fetch`/`web.search`
-    /// ([`EXPLORER_WEB_TOOLS`]) plus ausschließlich `browser.open`
+    /// ([`DEPS_TOOLS`]) plus alle vier `web.*`-Werkzeuge
+    /// ([`UIA_HELPER_WEB_TOOLS`]) plus ausschließlich `browser.open`
     /// (Nutzerentscheidung, siehe [`UIA_QUICK_HELPER_BROWSER_TOOLS`]) — kein
-    /// `fs.write`, kein `web.docs_rs`/`web.crates_io`, kein `lens.ask`, keine
-    /// der übrigen sechs `browser.*`-Werkzeuge.
+    /// `fs.write`, kein `lens.ask`, keine der übrigen sechs
+    /// `browser.*`-Werkzeuge.
     ///
     /// # Warum dieses Profil existiert (Addendum I)
     /// [`role_names::UIA_WORKER`] war zuvor auf [`RegistryProfile::Research`]
@@ -679,9 +695,10 @@ pub enum RegistryProfile {
     /// lesenden Dependency-Werkzeuge ([`DEPS_TOOLS`]: `deps.graph`/
     /// `deps.locked` über `ReadWorkspace`, `deps.source_*` über
     /// `ReadCargoRegistry`), um vorhandene Versionen und Quellen zu prüfen,
-    /// bevor eine Abhängigkeit dazukommt. `web.docs_rs`/`web.crates_io`
-    /// bleiben der tieferen Recherche vorbehalten
-    /// (`RegistryProfile::Research`). Das Netz ist dabei nie weiter als das
+    /// bevor eine Abhängigkeit dazukommt. Seit einer weiteren
+    /// Nutzerentscheidung kommen `web.docs_rs`/`web.crates_io` hinzu
+    /// ([`UIA_HELPER_WEB_TOOLS`]): rein lesend, egress-gebunden wie
+    /// `web.fetch`/`web.search`. Das Netz ist dabei nie weiter als das
     /// des Elternteils: der Reducer der Rolle ist
     /// [`crate::authority::AuthorityReducer::ReadExplore`], die Kind-Sandbox
     /// erbt Recht und Host-Scope des Elternteils, und jeder Abruf läuft
@@ -739,9 +756,9 @@ pub enum RegistryProfile {
     /// Schreibende Erkundungsspezialisierung der UIA: alle sechs
     /// `fs.*`-Werkzeuge inklusive `fs.write` ([`FS_FULL_TOOLS`]) plus
     /// [`DOC_TOOLS`] (`doc.read_pdf`) plus die fünf lesenden
-    /// `deps.*`-Werkzeuge ([`DEPS_TOOLS`]) plus `web.fetch`/`web.search`
-    /// ([`EXPLORER_WEB_TOOLS`]) — kein `shell.exec`, kein
-    /// `web.docs_rs`/`web.crates_io`, kein `lens.ask`, kein `explore.*`.
+    /// `deps.*`-Werkzeuge ([`DEPS_TOOLS`]) plus alle vier `web.*`-Werkzeuge
+    /// ([`UIA_HELPER_WEB_TOOLS`]) — kein `shell.exec`, kein `lens.ask`, kein
+    /// `explore.*`.
     ///
     /// # Warum dieses Profil existiert
     /// Dieselbe Begründung wie bei [`RegistryProfile::UiaExplorer`]: ein
@@ -753,6 +770,7 @@ pub enum RegistryProfile {
     /// # Warum `web.search` und `deps.*` (Nutzerentscheidung)
     /// `uia-writer` fügt manchmal eine Abhängigkeit hinzu und recherchiert
     /// dafür kurz online: `web.search`/`web.fetch` für die Recherche,
+    /// `web.docs_rs`/`web.crates_io` für Crate-Metadaten und -Dokumentation,
     /// `deps.*` (rein lesend), um `Cargo.lock` und vorhandene Quellen zu
     /// prüfen, bevor `fs.write` das Manifest ändert. Netz bleibt an den
     /// Elternteil gebunden — siehe dieselbe Begründung bei
@@ -975,7 +993,7 @@ impl RegistryProfile {
                 .chain(DOC_TOOLS.iter())
                 .chain(SHELL_TOOLS.iter())
                 .chain(DEPS_TOOLS.iter())
-                .chain(EXPLORER_WEB_TOOLS.iter())
+                .chain(UIA_HELPER_WEB_TOOLS.iter())
                 .chain(UIA_QUICK_HELPER_BROWSER_TOOLS.iter())
                 .copied()
                 .collect(),
@@ -1015,7 +1033,7 @@ impl RegistryProfile {
                 .iter()
                 .chain(DOC_TOOLS.iter())
                 .chain(DEPS_TOOLS.iter())
-                .chain(EXPLORER_WEB_TOOLS.iter())
+                .chain(UIA_HELPER_WEB_TOOLS.iter())
                 .copied()
                 .collect(),
             // Host-Shell-Spezialisierung der UIA (siehe die Begründung bei
@@ -1645,7 +1663,7 @@ fn profile_tool_providers(
             let dependencies: Arc<dyn ToolProvider> = Arc::new(DepsToolProvider::new());
             let web: Arc<dyn ToolProvider> = Arc::new(RestrictedToolProvider::new(
                 Arc::new(WebToolProvider::new()),
-                EXPLORER_WEB_TOOLS,
+                UIA_HELPER_WEB_TOOLS,
             ));
             vec![filesystem, doc, shell, dependencies, web]
         }
@@ -1711,7 +1729,7 @@ fn profile_tool_providers(
             let dependencies: Arc<dyn ToolProvider> = Arc::new(DepsToolProvider::new());
             let web: Arc<dyn ToolProvider> = Arc::new(RestrictedToolProvider::new(
                 Arc::new(WebToolProvider::new()),
-                EXPLORER_WEB_TOOLS,
+                UIA_HELPER_WEB_TOOLS,
             ));
             vec![filesystem, doc, dependencies, web]
         }
@@ -2622,20 +2640,23 @@ mod tests {
     /// Nutzerentscheidung „UIA-Helfer recherchieren kurz online und fügen
     /// manchmal Abhängigkeiten hinzu“: `UiaQuickHelper` (`uia-worker`) und
     /// `UiaWriter` (`uia-writer`) registrieren tatsächlich die fünf lesenden
-    /// `deps.*`-Werkzeuge und `web.fetch`/`web.search` — nie
-    /// `web.docs_rs`/`web.crates_io` — und brauchen dafür genau
-    /// `ReadCargoRegistry` und `NetworkAccess` zusätzlich.
+    /// `deps.*`-Werkzeuge und alle vier `web.*`-Werkzeuge (seit der
+    /// Nutzerentscheidung auch `web.docs_rs`/`web.crates_io`) — nie
+    /// `lens.ask` — und brauchen dafür genau `ReadCargoRegistry` und
+    /// `NetworkAccess` zusätzlich.
     #[test]
     fn test_uia_helpers_register_web_search_and_read_only_deps_tools() -> TestResult {
         use harw_authority::Permission;
 
-        const DEPS_AND_WEB: [&str; 7] = [
+        const DEPS_AND_WEB: [&str; 9] = [
             "deps.graph",
             "deps.locked",
             "deps.source_read",
             "deps.source_search",
             "deps.source_list",
             "web.fetch",
+            "web.docs_rs",
+            "web.crates_io",
             "web.search",
         ];
         let quick = registered_names(&assemble(RegistryProfile::UiaQuickHelper)?);
@@ -2659,9 +2680,7 @@ mod tests {
 
         for profile in [RegistryProfile::UiaQuickHelper, RegistryProfile::UiaWriter] {
             let names = profile.registered_tool_names();
-            for deeper in ["web.docs_rs", "web.crates_io", "lens.ask"] {
-                assert!(!names.contains(&deeper), "{profile:?}: {deeper}");
-            }
+            assert!(!names.contains(&"lens.ask"), "{profile:?}: lens.ask");
             let required = profile.required_permissions();
             assert!(required.contains(Permission::NetworkAccess), "{profile:?}");
             assert!(

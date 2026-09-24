@@ -660,6 +660,8 @@ mod tests {
             role_names::UIA_WORKER,
             role_names::UIA_WRITER,
             role_names::RESEARCHER_WEB,
+            role_names::DEPENDENCY_RESEARCHER,
+            role_names::RESEARCHER,
         ];
         for role in role_names::ALL {
             let carries_network = authority_reducer_for_role(role)
