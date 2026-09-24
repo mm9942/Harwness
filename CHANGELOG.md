@@ -6,6 +6,98 @@ Semantic Versioning within the 0.x pre-release range.
 
 ## [Unreleased]
 
+### Runde 7 (2026-09-24)
+
+**Orchestrierung: delegieren statt selbst lesen**
+- `transfer_to_*` hält jetzt das Budget der Agent-TOML ein, synchron wie im
+  Hintergrund: Abschlussrunde bei 80 %, Übergabe-Zusammenfassung am
+  Budgetende. Bisher liefen Transfers ohne Budget.
+- Orchestratoren lesen höchstens fünfmal selbst (`[guards]
+  orchestrator_read_warn = 4`, `orchestrator_read_limit = 5`, `0` schaltet
+  ab), danach delegieren sie über `delegate_wave`. Die UIA-Wurzel ist
+  ausgenommen.
+- Nach einem Providerfehler gibt es eine kurze Zusammenfassung (20 s), sonst
+  Journal und letzten Text. Ein Lauf endet nie mehr ohne Ergebnis.
+- `agent.status` zeigt Live-Tokens der laufenden Runde, Rundenzahl und
+  Kontextbelegung. Fragt jemand denselben Agenten binnen 30 s erneut ab,
+  hängt ein Hinweis am Ergebnis.
+- Auto-Modus: Der Klassifizierer kennt den Auftrag eines Kind-Agenten; eine
+  ausdrücklich bestellte Aktion ist keine Zielabweichung mehr. Neu:
+  `[permissions] auto_classifier_timeout_secs` (Vorgabe 10 s, bei lokalem
+  Klassifizierer 60 s).
+- Ein Hintergrund-Start übersteht eine neue Nachricht während des Starts.
+- Optionale Werkzeugargumente mit dem String `"null"` werden entfernt;
+  `Option`-Felder sind im Schema nullable. Kinder mit Kontextfenster unter
+  64k bekommen kompakte Werkzeugschemas.
+
+**TeX-Agent mit Vorlage**
+- Neuer Skill `latex-report` mit der Vorlage `harw-report.sty` (KOMA,
+  `\babelprovide[import,main]{german}` ohne `ngerman.ldf`, Boxen
+  `merke`/`achtung`/`beispiel`, `L`-Spalten, TikZ-Stile) und den Gerüsten
+  bericht, business-paper und handbuch. Farben, Schriften und Sprache nur auf
+  Wunsch.
+- Neue Werkzeuge `latex.template` (legt Vorlage und Gerüst an, überschreibt
+  nie) und `latex.check` (prüft Klasse, Pakete, Schriften und Sprachen vorab,
+  mit Paketvorschlägen).
+- `latex.build` baut auch ohne latexmk (Engine direkt, biber bei Bedarf) und
+  meldet Seiten, Overfull-Boxen über 1 pt mit Zeile, Underfull, fehlende
+  Zeichen und Trennmuster-Warnungen (`ok_with_warnings`).
+- `uia-latex-writer` bekommt endlich seine Skills (latex-report,
+  latex-writing, xelatex-compile, business-writing-pyramid) und ein
+  realistisches Budget.
+- Mitgelieferte Agenten und Skills werden aktualisiert, solange sie
+  unverändert sind (`~/.harw/.bundle-manifest.toml`). Geänderte Dateien
+  bleiben, die neue Fassung liegt als `*.harw-neu` daneben.
+
+**Matrix-Game über den Game Master**
+- Matrix-Games startet die UIA über den neuen Hintergrund-Orchestrator
+  `matrix-game-master`: Szenario aus Freitext entwerfen, freigeben lassen,
+  durchspielen, `aar.md` und `report.md` liefern, Kopie unter
+  `matrix/<szenario>-<lauf>.md` im Workspace. Werkzeuge:
+  `matrix.draft_scenario`, `matrix.status`, `matrix.start`, `matrix.run`,
+  `matrix.finish`.
+- `/matrix` zeigt nur noch an (`show|list|replay|compare`). Damit blockiert
+  die TUI nicht mehr (Ursache des Hängers bei `/matrix auto`).
+- Jeder Sitz-Aufruf hat ein hartes Zeitlimit (480 s) und ist abbrechbar.
+- Engine: Konfliktpaare über `dice::resolve_conflict`, Logit-Marktmodell am
+  Rundenende, Geschäftsregeln (z. B. sperrt `cash_floor` Investitionen).
+
+**Lokale Modelle (vLLM, LM Studio, Ollama)**
+- Neuer Katalogeintrag `vllm`. Lokale Provider brauchen keinen Schlüssel,
+  sind mit `max_concurrency = 1` vorbelegt und bekommen kein
+  Hersteller-Kontextfenster mehr. `harw provider add --no-auth |
+  --auth-header … | --allow-insecure-lan`.
+- Neue `providers/<name>.toml`-Felder: `request_timeout_secs`,
+  `stream_idle_timeout_secs`, `retry_timeouts`, `max_tokens_field`,
+  `send_reasoning_effort`, `strict_tools`, `parallel_tool_calls`,
+  `allow_insecure_lan`, jeweils mit eigenen Vorgaben für lokale Provider.
+- Streams brechen nur noch nach Leerlauf ab, nicht nach Gesamtzeit;
+  Zeitüberschreitungen werden lokal nicht wiederholt.
+- `harw provider scan` liest `max_model_len` (vLLM) und LM Studios
+  `/api/v0/models` und behält von Hand gesetzte `context_window`.
+- Kein `<think>`- und Tool-Call-Text mehr im Live-Stream; neue
+  Text-Tool-Call-Formate (Mistral `[TOOL_CALLS]`, Llama `<|python_tag|>`,
+  JSON-Aufrufe), fail-closed. Anleitung: `docs/setup/local-models.md`.
+
+**Fehlerbehebungen**
+- Plan-Freigabe ist fail-closed: Ist der Freigabestand nicht lesbar, werden
+  Plan-Änderungen abgelehnt; die Anzeige sagt „unbekannt“.
+- `bind_goal` überschreibt bei Lesefehlern kein Goal mehr; `goal set`
+  ersetzt ein laufendes Ziel ohne Kriterien und Invarianten (`superseded`).
+- Pitfall-Hinweise des Wächters kommen nur noch für das exakt gespeicherte
+  Werkzeug und ab Konfidenz 0,5.
+- Meldungen bereits beendeter Kind-Läufe erscheinen als „veraltet“ und
+  wecken die UIA nicht.
+- `lens.ask` meldet `embedding_model` und `placeholder_embeddings`.
+
+**Abhängigkeiten (Dependabot)**
+- Toolchain 1.98.1; GitHub-Actions-Gruppe; base64 0.23; 24 Minor-/Patch-Updates.
+- sha2 0.11 im ganzen Workspace (Hex-Formatierung und `finalize_into` an
+  hybrid-array angepasst).
+- chacha20poly1305 0.11 und aes-gcm-siv 0.12 in `harw-secrets`. Ein neuer
+  Known-Answer-Test mit Vektoren aus den alten Versionen belegt, dass
+  bestehende Datensätze bitgleich ver- und entschlüsselt werden.
+
 ### Runde 6 (2026-09-24)
 
 **Auto-Modus fragt statt zu blocken**

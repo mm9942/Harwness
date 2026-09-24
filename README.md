@@ -1,16 +1,117 @@
 # Harwness
 
-**A local, security-first agent runtime written in Rust.** Harwness runs language-model agents as supervised work: models propose messages, tool calls, plans and sub-tasks; Rust code decides what is permitted, records what happened, and owns every side effect.
+**Your local AI team for code and for business, with Rust holding the reins.**
 
-> **Status: early development.** Harwness is intended for developers who want to inspect, embed, or contribute to a security-oriented harness. Interfaces and configuration may change. Treat it as a local development system, not as an unattended production service.
+Harwness (`harw`) runs a team of language-model agents on your machine: a user interface agent you talk to, orchestrators that split the work, and specialised workers that read, write, research, build and report. It works just as well on a Rust workspace as on a market strategy. Every side effect goes through typed Rust code that decides what is allowed, asks you when it matters, and records what happened.
 
-## What Harwness is for
+> **Status: early development (0.3.x).** Harwness is used daily by its author, but interfaces and configuration still change. Treat it as a local tool you supervise, not as an unattended production service.
 
-Most agent loops give a model a prompt and a collection of tools. Harwness starts from a different boundary: a prompt is not authority. A model cannot grant itself filesystem access, process execution, network access, child-agent privileges, secret access, or a privileged host action. Those decisions belong to typed runtime components.
+## What you can do with it
 
-The `harw` binary provides an interactive terminal UI, one-shot runs, durable plans and jobs, an optional local web surface, an MCP listener and MCP client connections, and a gateway for external channels. The workspace also includes an embeddable SDK and a Defense-on-Device subsystem for collecting and acting on host-security findings under separate privilege boundaries.
+### For coding
 
-The current workspace version is **0.3.0**.
+- **Delegate real work to an agent team.** Describe the goal; the UIA hands it to a background orchestrator that plans, fans out read-only explorers and writing workers, and reports back while you keep talking.
+- **Plan first, then build.** Plan mode (`Shift+Tab`) lets the agent explore and ask structured questions without touching anything; you approve the plan before a single file changes.
+- **Stay in control of side effects.** Edits, shell commands and network access go through approvals (`ask`, a classifier-backed `auto` mode, or `full`). Shell commands run in a Bubblewrap sandbox; root commands need their own password window and never reach the model.
+- **Research and review.** Dependency research against crates.io and docs.rs, security inspection, code review and debugging roles, plus a library of Rust skills on ownership, error design, typestate and more.
+- **Your own commands.** `! cmd` runs your own shell commands on the host, right away, even while an agent is busy; the output goes back to the conversation afterwards.
+
+### For business and analysis
+
+- **Strategic matrix games.** Say „play a matrix game about launching product X“. The `matrix-game-master` drafts a scenario with actors, goals and rules, asks for your approval and plays it through with isolated agents in the seats. Dice come from the Rust engine, not from the model. The result is an after-action review and a paper-ready report.
+- **Business papers and reports as PDF.** The LaTeX writer turns results into a structured document (Minto pyramid for business papers) using a bundled template with German or English typography, and builds it with XeLaTeX, including a check for overfull lines and missing packages.
+- **Research with sources.** `/research` hands a question to a read-only researcher and validates the answer against a typed finding contract.
+
+### Every day
+
+- **Knowledge that stays yours:** a workbench for the current task, a kanban board, a per-agent diary, a long-term memory palace and optional idle-time „dream“ reflections, all local and reviewable.
+- **Talk to it from your phone** through a paired Telegram bot with per-write approvals.
+- **Use the models you want:** Anthropic, OpenAI, OpenRouter and others, or local models via vLLM, LM Studio and Ollama. Mix them per role, for example local explorers with a cloud orchestrator ([docs/setup/local-models.md](docs/setup/local-models.md)).
+- **Extend it:** MCP connectors, your own agent definitions and skills, or embed the runtime with the `harwness-sdk` crate.
+
+## What a session looks like
+
+```text
+# illustrative
+› Analyse this workspace and harden the key-file permissions, with tests.
+
+  harw  I'll hand this to an orchestrator in the background.
+  ▸ root-orchestrator · running · 3 tool calls · 12.4k tokens
+    ├ explorer   „map key handling in src/key_control“      done
+    └ worker     „write 0600 permissions + regression test“  waiting for approval
+
+  ┌ Approval · fs.edit · src/key_control/file.rs ─────────────┐
+  │ +  permissions.set_mode(0o600);                            │
+  │ [y] once   [s] this session   [n] deny                      │
+  └────────────────────────────────────────────────────────────┘
+
+› ! cargo test -p key_control
+  ! cargo test -p key_control  → exit 0 · ran on the host
+
+  harw  Done: permissions are now 0600, one new test, all 214 tests pass.
+        Changed: src/key_control/file.rs, tests/key_permissions.rs
+```
+
+`/export` writes the whole session, including tool calls, command output and background activity, to Markdown or JSON.
+
+## Why it is built this way
+
+Most agent loops give a model a prompt and a collection of tools. Harwness starts from a different boundary: **a prompt is not authority.** A model cannot grant itself filesystem access, process execution, network access, child-agent privileges, secret access or a privileged host action. Those decisions belong to typed runtime components, and privileges only ever shrink on the way down to child agents.
+
+The `harw` binary provides the interactive terminal UI, one-shot runs, durable plans and jobs, an optional local web surface, an MCP listener and MCP client connections, and a gateway for external channels. The workspace also includes an embeddable SDK and an optional Defense-on-Device subsystem for host-security findings under separate privilege boundaries.
+
+## Install
+
+### Download a release
+
+Tagged releases (`v*`) publish prebuilt binaries for Linux on GitHub Releases:
+
+- `harw-<version>-x86_64-unknown-linux-gnu.tar.gz`
+- `harw-<version>-aarch64-unknown-linux-gnu.tar.gz` (for example Raspberry Pi 4/5, 64-bit)
+
+```bash
+# pick the archive for your machine from the Releases page, then:
+sha256sum -c SHA256SUMS --ignore-missing
+tar -xzf harw-<version>-x86_64-unknown-linux-gnu.tar.gz
+install -m 0755 harw-<version>-x86_64-unknown-linux-gnu/harw ~/.local/bin/harw
+harw init && harw onboard
+```
+
+Runtime requirements: `bubblewrap` (`bwrap`) for the shell sandbox, `util-linux` (`prlimit`, `setsid`); optionally a TeX Live installation with XeLaTeX (and `texlive-lang-german` for German documents) for PDF reports.
+
+### Build from source
+
+```bash
+git clone https://github.com/mm9942/Harwness.git
+cd Harwness
+cargo install --locked --path harw-cli   # installs `harw` into ~/.cargo/bin
+harw init && harw onboard
+```
+
+The toolchain is pinned in `rust-toolchain.toml`; rustup installs it automatically.
+
+## First steps
+
+`harw init` creates the local root space. `harw onboard` configures a provider and model. Running `harw` (or `harw chat`) without further arguments starts the interactive terminal client in `chat` mode, optionally with a first prompt; `harw exec PROMPT` runs a single non-interactive request and exits. Pick another start mode with `--mode` (or `[mode] default` in the profile configuration), and another root agent definition with `--agent NAME`; `/agent use NAME` inside the TUI stores that choice for the next session.
+
+Shell completions: `harw completions --install` (detects the shell from `$SHELL`; pass `bash`, `zsh`, `fish`, `elvish` or `powershell` explicitly, add `--dry-run` to preview). Open a new shell afterwards.
+
+Useful commands include:
+
+```bash
+harw doctor
+harw config                          # interactive settings menu (alias: settings)
+harw session list                    # saved sessions; resume with `harw session resume ID` or `harw -r`
+harw provider scan                   # query providers for available models
+harw model default ID                # set the default model (alias: models)
+harw jobs list                       # background jobs; approve/deny with --note/--reason
+harw analyze --order top-down --dry-run
+harw gateway
+```
+
+Global flags (`--home`, `--profile`, `-C/--cwd`, `--log`, `-v`, `--json`) work with every command. Session flags (`--mode`, `--approval ask|auto|full`, `--model`, `--goal`, `--agent`, `--add-dir`) apply only to `chat`, `exec` and `analyze` and are rejected elsewhere. Commands without a JSON form fail with `--json` instead of ignoring it. Older spellings such as `harw settings`, `harw models`, `harw connect`, `harw lens` or `harw run` still work and print a hint to the new name.
+
+The full command reference (in German), including the old-to-new mapping, is in [docs/cli.md](docs/cli.md). Run `harw --help` and `harw <subcommand> --help` for the exact grammar supported by the checked-out version.
 
 ## Core principles
 
@@ -105,38 +206,6 @@ A finding follows typed states such as raw, rule-checked, and triaged. Only the 
 
 Secrets use a hybrid cryptographic policy, while the audit system maintains tamper-evident chained records with signed checkpoints. The repository forbids `unsafe` workspace-wide.
 
-## Quick start
-
-The toolchain is pinned to Rust **1.98.0** in `rust-toolchain.toml`; rustup installs it on the first `cargo` call, and CI uses the same file. The manifest MSRV floor stays at 1.85. Details: [docs/setup/build-prerequisites.md](docs/setup/build-prerequisites.md).
-
-```bash
-cargo build -p harw-cli
-cargo run -p harw-cli -- init
-cargo run -p harw-cli -- onboard
-cargo run -p harw-cli --
-```
-
-`harw init` creates the local root space. `harw onboard` configures a provider and model. Running `harw` (or `harw chat`) without further arguments starts the interactive terminal client in `chat` mode, optionally with a first prompt; `harw exec PROMPT` runs a single non-interactive request and exits. Pick another start mode with `--mode` (or `[mode] default` in the profile configuration), and another root agent definition with `--agent NAME`; `/agent use NAME` inside the TUI stores that choice for the next session.
-
-Shell completions: `harw completions --install` (detects the shell from `$SHELL`; pass `bash`, `zsh`, `fish`, `elvish` or `powershell` explicitly, add `--dry-run` to preview). Open a new shell afterwards.
-
-Useful commands include:
-
-```bash
-harw doctor
-harw config                          # interactive settings menu (alias: settings)
-harw session list                    # saved sessions; resume with `harw session resume ID` or `harw -r`
-harw provider scan                   # query providers for available models
-harw model default ID                # set the default model (alias: models)
-harw jobs list                       # background jobs; approve/deny with --note/--reason
-harw analyze --order top-down --dry-run
-harw gateway
-```
-
-Global flags (`--home`, `--profile`, `-C/--cwd`, `--log`, `-v`, `--json`) work with every command. Session flags (`--mode`, `--approval ask|auto|full`, `--model`, `--goal`, `--agent`, `--add-dir`) apply only to `chat`, `exec` and `analyze` and are rejected elsewhere. Commands without a JSON form fail with `--json` instead of ignoring it. Older spellings such as `harw settings`, `harw models`, `harw connect`, `harw lens` or `harw run` still work and print a hint to the new name.
-
-The full command reference (in German), including the old-to-new mapping, is in [docs/cli.md](docs/cli.md). Run `harw --help` and `harw <subcommand> --help` for the exact grammar supported by the checked-out version.
-
 ## Working in the terminal UI
 
 Slash commands are typed operations with the same permission checks on every front-end; `/help` (or `F1`) lists what the checked-out version registers. A few behaviors worth knowing:
@@ -166,14 +235,14 @@ The design and its remaining open points are described in [docs/design/knowledge
 
 ## Matrix game
 
-`/matrix` runs an umpired, multi-seat matrix game with agents in the seats. A deterministic game master in Rust owns turns, dice, visibility and the journal; seats only see their own projection of the game. Scenarios can include behavior profiles, a Red Cell seat and inject packages (`/matrix start SCENARIO --package ID`); `/matrix compare` compares runs. `F9` opens the matrix panel. Design notes: [docs/design/matrix-game.md](docs/design/matrix-game.md).
+Matrix games are run by the `matrix-game-master`, a background orchestrator the UIA starts when you ask for one (for example „spiel ein Matrix-Game zu …“). It drafts a scenario from your brief, asks for approval, plays it with agents in the seats and returns `aar.md` and a paper-ready `report.md`. A deterministic engine in Rust owns turns, dice, visibility and the journal; seats only see their own projection of the game. Scenarios can include behavior profiles, a Red Cell seat and inject packages. `/matrix` is read-only (`show`, `list`, `replay`, `compare`); `F9` opens the matrix panel. Design notes: [docs/design/matrix-game.md](docs/design/matrix-game.md).
 
 ## Bundled roles and skills
 
 The binary ships a starter set of agent definitions and skills that `harw init` writes into the Harwness home. Recent additions include:
 
-- **LaTeX worker.** The role `uia-latex-writer` (and the bundle agent `latex-writer`) writes and edits LaTeX in the workspace. It has no shell, network or dependency tools. It can build only through the typed `latex.build` tool, which runs `latexmk` inside the sandbox without shell escape and asks for approval on every call. TeX must already be installed; if it is missing, the tool reports which programs are missing and how to install them, and installs nothing itself.
-- **Skills:** `business-writing-pyramid`, `latex-writing`, `xelatex-compile`, `learning-loop`, `author-review-pipeline` and `matrix-scenario-design`.
+- **LaTeX worker.** The role `uia-latex-writer` writes and edits LaTeX in the workspace. It has no shell, network or dependency tools; it works with the typed tools `latex.check` (checks packages, fonts and languages before writing), `latex.template` (creates the bundled `harw-report.sty` template with a report, business-paper or handbook skeleton; colours and fonts only on request) and `latex.build` (builds inside the sandbox without shell escape, with or without `latexmk`, and reports pages, overfull lines and missing characters). Every call asks for approval. TeX must already be installed; missing programs or packages are reported with install hints, never installed.
+- **Skills:** `latex-report`, `business-writing-pyramid`, `latex-writing`, `xelatex-compile`, `learning-loop`, `author-review-pipeline` and `matrix-scenario-design`, plus a library of Rust skills.
 
 ## MCP connectors
 
@@ -216,7 +285,7 @@ harw gateway
 
 Keep the bot token environment variable available to the gateway process as well. If it is started by a service manager, configure the environment in the service context rather than relying on an interactive shell. During the manual pairing step, do not let another gateway instance consume the bot updates.
 
-Local TUI shell commands use the `!command` syntax and are enabled by default for the local operator console. They execute only through the Bubblewrap-bound `shell.exec` executor and still require the runtime sandbox to grant process execution. To disable this surface for one Harwness process, start it with `HARW_DISABLE_SHELL=1 harw`. External channels remain unable to invoke the local shell unless their separate channel policy explicitly grants that capability.
+Local TUI shell commands (`! command`) are your own commands: they run directly on the host with your real `HOME`, in the project root, with resource limits and a timeout, and are recorded in the audit log. `sudo`, `doas` and `pkexec` are refused there too. To disable this surface for one Harwness process, start it with `HARW_DISABLE_SHELL=1 harw`. External channels such as Telegram cannot run local shell commands.
 
 A Telegram chat bound to a workspace gets a narrow tool profile: reading files runs without asking, every write asks for approval through an inline button in the chat, and there is no shell, process, network or knowledge-surface tool.
 

@@ -11,10 +11,10 @@ Raspberry Pi 5 als Zielplattform, Kernel-Eigenschaften, die kein
 hält fest, **welche** Voraussetzungen gelten und **warum**, damit ein
 Abweichen sichtbar und nicht stillschweigend ist.
 
-## 1. Rust-Toolchain: `1.98.0` (gepinnt)
+## 1. Rust-Toolchain: `1.98.1` (gepinnt)
 
 Die Toolchain ist in **`rust-toolchain.toml`** im Repo-Wurzelverzeichnis
-gepinnt (`channel = "1.98.0"`, Komponenten `rustfmt` und `clippy`, Profil
+gepinnt (`channel = "1.98.1"`, Komponenten `rustfmt` und `clippy`, Profil
 `minimal`). rustup liest die Datei automatisch – auch im eigenständigen
 `dod/`-Workspace, der deshalb keine eigene Datei hat – und installiert die
 Version beim ersten `cargo`-Aufruf nach. Die CI (`.github/workflows/ci.yml`,
@@ -29,7 +29,7 @@ Manifest kompilieren muss, keine Aussage über die geprüfte Toolchain.
 
 ```
 $ rustup show active-toolchain
-1.98.0-x86_64-unknown-linux-gnu (overridden by '…/rust-toolchain.toml')
+1.98.1-x86_64-unknown-linux-gnu (overridden by '…/rust-toolchain.toml')
 ```
 
 ## 2. `crypt_guard` `3.0.1` (crates.io, Hybrid-KEM)
