@@ -1,0 +1,4 @@
+name = "link-and-pattern-analysis"
+description = "Verbindungen, Zeitlinien und Muster in Objektmengen finden: Verknüpfungsmatrix, Netzwerk- und Beziehungsanalyse, Ereignisabfolgen, Cluster, Anomalien, Datumsbezüge, Heuristik Fähigkeit-Motiv-Zugang (link analysis, association matrix, timeline, clustering, anomaly, capability motive access)."
+instructions_file = "instructions.md"
+tools = ["filesystem.read"]

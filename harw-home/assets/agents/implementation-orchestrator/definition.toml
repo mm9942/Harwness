@@ -1,0 +1,29 @@
+# Mitgelieferter Agent `implementation-orchestrator` (Plan R9, Teil B: migriert aus dem
+# Legacy-Format `agent.toml`; `system.md` bleibt die Arbeitsanweisung und
+# wird per `instructions_file` in den Kontext des Kindes gelegt).
+#
+# Benutzerdefinierter Child-Orchestrator auf `child-orchestrator-base@1`:
+# die Basis besitzt Werkzeuge, Tiefe (`max_depth = 1`) und Budget; hier
+# stehen nur Identität, Skills und die namentlichen Delegationsziele.
+
+schema = "harwness.agent/v1"
+id = "harwness.agent.implementation-orchestrator@1"
+version = "1.0.0"
+extends = { id = "harwness.agent.child-orchestrator-base@1" }
+role = "child-orchestrator"
+specialization = "implementation-orchestrator"
+
+name = "Implementation Orchestrator"
+description = "Partitions an approved implementation plan into independently verifiable, non-overlapping worker tasks."
+instructions_file = "system.md"
+
+skills = ["planning", "implementation", "verification"]
+
+[delegation]
+targets = [
+  "rust-implementer",
+  "refactorer",
+  "test-engineer",
+  "explorer",
+  "executor",
+]

@@ -454,6 +454,8 @@ fn all_registered_ops_are_reachable_by_name() {
         // (Matrix-Game, `channel_reduced`), beide Surface::Command.
         "learn",
         "matrix",
+        // Plan R9, Teil F: `/jobs` (`tui_only`, Surface::Command).
+        "jobs",
     ];
 
     // Jede Operation muss mindestens eine Fläche tragen. Eine ohne wäre über

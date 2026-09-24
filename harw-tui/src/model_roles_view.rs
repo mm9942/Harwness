@@ -7,9 +7,11 @@
 //! zwölf [`ModelRole`]s Provider, Modell, Herkunft (Quelle), Reasoning-
 //! Effort und ab wann eine Änderung wirkt. Die Ansicht schreibt nichts
 //! selbst: `Enter` öffnet über `/models pick <rolle>` den Modell-Picker
-//! (bzw. `/model` für die Live-Zeile), `r` setzt über `/models reset <rolle>`
-//! zurück. Frische Daten kommen über [`OverlayView::refresh_command`]
-//! (`/models show`) und [`OverlayView::apply_data`].
+//! (bzw. `/model` für die Live-Zeile, bei einer UIA-Wurzel `/uia-model`),
+//! `r` setzt über `/models reset <rolle>` zurück. Frische Daten kommen über
+//! [`OverlayView::refresh_command`] (`/models show`) und
+//! [`OverlayView::apply_data`]; die TUI baut die Ansicht zudem bei jedem
+//! Öffnen aus dem Live-Stand der Montage (`ChatApp::model_roles_view`).
 //!
 //! Runde 5, Teil G: [`ModelRolesView::uia_workers`] zeigt denselben
 //! Tabellenrahmen als Bereich „UIA-Worker-Modelle“ — je UIA-Worker-Rolle
@@ -51,6 +53,9 @@ const LIVE_LABEL: &str = "Aktive Sitzung (live)";
 
 /// Wirkungs-Spalte der Live-Zeile.
 const LIVE_EFFECT: &str = "sofort (/model)";
+
+/// Standard-Befehl für `Enter` auf der Live-Zeile.
+const LIVE_COMMAND: &str = "/model";
 
 /// Wirkungs-Spalte der Rollen-Zeilen.
 const ROLE_EFFECT: &str = "ab nächster Sitzung";
@@ -164,6 +169,14 @@ pub(crate) struct ModelRolesView {
     mode: ViewMode,
     /// Runde 5, Teil G: Hinweise (Rückfall auf „wie UIA“), unter der Tabelle.
     notices: Vec<String>,
+    /// Die Live-Zeile stammt aus der aufgelösten Wurzel-Route der TUI
+    /// (`<provider>/<modell>`, wie die Statuszeile) und wird von
+    /// [`OverlayView::apply_data`] nicht durch die rohe Controller-Auswahl
+    /// aus `/models show` ersetzt (siehe [`Self::with_resolved_live`]).
+    live_resolved: bool,
+    /// Befehl, den `Enter` auf der Live-Zeile öffnet (`/model`, bei einer
+    /// UIA-Wurzel `/uia-model`).
+    live_command: String,
 }
 
 impl ModelRolesView {
@@ -193,6 +206,8 @@ impl ModelRolesView {
             error: None,
             mode: ViewMode::Roles,
             notices: Vec::new(),
+            live_resolved: false,
+            live_command: LIVE_COMMAND.to_owned(),
         }
     }
 
@@ -215,6 +230,8 @@ impl ModelRolesView {
             error: None,
             mode: ViewMode::Roles,
             notices: Vec::new(),
+            live_resolved: false,
+            live_command: LIVE_COMMAND.to_owned(),
         }
     }
 
@@ -244,7 +261,29 @@ impl ModelRolesView {
                 .iter()
                 .filter_map(|resolved| resolved.notice.clone())
                 .collect(),
+            live_resolved: false,
+            live_command: LIVE_COMMAND.to_owned(),
         }
+    }
+
+    /// Markiert die Live-Zeile als von der TUI aufgelöst und legt fest,
+    /// welcher Picker sie ändert.
+    ///
+    /// # Beschreibung
+    /// Die TUI baut die Ansicht bei jedem Öffnen aus dem Live-Stand (Wurzel-
+    /// Route, Live-Konfiguration). Die Live-Zeile zeigt dann dasselbe wie
+    /// die Statuszeile; ein späteres `/models show` meldet nur die rohe
+    /// generische Controller-Auswahl und darf sie nicht überschreiben (bei
+    /// einer UIA-Wurzel wäre das das falsche Modell).
+    ///
+    /// # Argumente
+    /// - `command`: Befehl für `Enter` auf der Live-Zeile — `/model`, bei
+    ///   einer UIA-Wurzel `/uia-model` (nur er ändert, was die Zeile zeigt).
+    #[must_use]
+    pub(crate) fn with_resolved_live(mut self, command: &str) -> Self {
+        self.live_resolved = true;
+        command.clone_into(&mut self.live_command);
+        self
     }
 
     /// Schlüssel der ausgewählten Rolle (`None` auf der Live-Zeile).
@@ -296,9 +335,15 @@ impl ModelRolesView {
                     cell(&row.source, WIDTHS[3]),
                     cell(row.effort.as_deref().unwrap_or(dash), WIDTHS[4]),
                 );
+                // Die Live-Zeile nennt den Befehl, der sie tatsächlich ändert.
+                let effect = if row.key.is_none() && self.mode == ViewMode::Roles {
+                    format!("sofort ({})", self.live_command)
+                } else {
+                    row.effect(self.mode).to_owned()
+                };
                 Line::from(vec![
                     Span::styled(text, row_style),
-                    Span::styled(row.effect(self.mode).to_owned(), style::dim_style(theme)),
+                    Span::styled(effect, style::dim_style(theme)),
                 ])
             })
             .collect();
@@ -456,7 +501,7 @@ impl OverlayView for ModelRolesView {
             KeyCode::Char('q') if plain(&key) => OverlayOutcome::Close,
             KeyCode::Enter => match self.selected_key() {
                 Some(role) => OverlayOutcome::RunAndClose(format!("/models pick {role}")),
-                None => OverlayOutcome::RunAndClose("/model".to_owned()),
+                None => OverlayOutcome::RunAndClose(self.live_command.clone()),
             },
             KeyCode::Char('r') if plain(&key) => match self.selected_key() {
                 Some(role) => OverlayOutcome::Run(format!("/models reset {role}")),
@@ -482,12 +527,18 @@ impl OverlayView for ModelRolesView {
             return;
         }
         let live = data.get("live");
-        let live_row = match live {
-            Some(live) => RoleRow::live(
+        let resolved_live = self
+            .rows
+            .first()
+            .filter(|row| self.live_resolved && row.key.is_none())
+            .cloned();
+        let live_row = match (resolved_live, live) {
+            (Some(row), _) => row,
+            (None, Some(live)) => RoleRow::live(
                 json_str(live, "provider").as_deref(),
                 json_str(live, "model").as_deref(),
             ),
-            None => self
+            (None, None) => self
                 .rows
                 .first()
                 .cloned()
@@ -614,6 +665,24 @@ mod tests {
         assert_eq!(view.rows[1].effort.as_deref(), Some("high"));
         assert_eq!(view.rows[2].model, None);
         assert_eq!(view.error, None);
+    }
+
+    /// Eine von der TUI aufgelöste Live-Zeile bleibt stehen; die Rollen
+    /// kommen trotzdem frisch aus `/models show`.
+    #[test]
+    fn test_apply_data_keeps_a_resolved_live_row() {
+        let mut view = view().with_resolved_live("/uia-model");
+        view.apply_data(&serde_json::json!({
+            "roles": [{"role": "explorer", "provider": "openrouter", "model": "neu"}],
+            "live": {"provider": null, "model": "roh"}
+        }));
+        assert_eq!(view.rows[0].provider.as_deref(), Some("anthropic"));
+        assert_eq!(view.rows[0].model.as_deref(), Some("claude-sonnet"));
+        assert_eq!(view.rows[1].model.as_deref(), Some("neu"));
+        assert_eq!(
+            view.on_key(key(KeyCode::Enter)),
+            OverlayOutcome::RunAndClose("/uia-model".to_owned())
+        );
     }
 
     #[test]

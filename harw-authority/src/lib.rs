@@ -192,6 +192,90 @@ pub enum EgressTarget {
     DnsSuffix(String),
     /// An IP address range.
     Cidr(IpNet),
+    /// Any public DNS name ([`is_public_dns_name`]): never an IP literal,
+    /// never `localhost`, a single-label or a reserved local name. Resolved
+    /// addresses are still classified by the egress resolver, which admits
+    /// only public address classes for such names. Used for the open
+    /// research web (`[network].research_web = "open"`); wire form
+    /// [`PUBLIC_DNS_WIRE`].
+    PublicDns,
+}
+
+/// Wire form of [`EgressTarget::PublicDns`] (never a valid host name).
+pub const PUBLIC_DNS_WIRE: &str = "*public-dns";
+
+/// Reserved or local-only DNS suffixes that [`is_public_dns_name`] rejects.
+const NON_PUBLIC_SUFFIXES: &[&str] = &[
+    "localhost",
+    "local",
+    "localdomain",
+    "internal",
+    "intranet",
+    "lan",
+    "home",
+    "corp",
+    "private",
+    "arpa",
+    "test",
+    "invalid",
+    "example",
+    "onion",
+];
+
+/// Whether `host` is a public DNS name that the open research web may reach.
+///
+/// Rejects IP literals (IPv4, IPv6 with or without brackets), empty labels,
+/// single-label names (search-domain expansion could reach internal hosts),
+/// characters outside `[a-z0-9-.]` and every name at or below a reserved or
+/// local-only suffix ([`NON_PUBLIC_SUFFIXES`], e.g. `localhost`, `local`,
+/// `internal`, `home.arpa`). This is a name check only; the egress resolver
+/// additionally rejects every non-public resolved address.
+///
+/// # Examples
+/// ```rust
+/// use harw_authority::is_public_dns_name;
+///
+/// assert!(is_public_dns_name("www.bund.de"));
+/// assert!(is_public_dns_name("Docs.RS."));
+/// assert!(!is_public_dns_name("127.0.0.1"));
+/// assert!(!is_public_dns_name("[::1]"));
+/// assert!(!is_public_dns_name("localhost"));
+/// assert!(!is_public_dns_name("printer.local"));
+/// assert!(!is_public_dns_name("intranet"));
+/// ```
+#[must_use]
+pub fn is_public_dns_name(host: &str) -> bool {
+    let host = normalize_host(host);
+    let host = host.strip_suffix('.').unwrap_or(&host);
+    if host.is_empty() || host.len() > 253 {
+        return false;
+    }
+    let bare = host.trim_start_matches('[').trim_end_matches(']');
+    if bare.parse::<std::net::IpAddr>().is_ok() || host.contains(':') {
+        return false;
+    }
+    let labels: Vec<&str> = host.split('.').collect();
+    if labels.len() < 2
+        || labels.iter().any(|label| {
+            label.is_empty()
+                || label.len() > 63
+                || !label
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+        })
+    {
+        return false;
+    }
+    // Ein rein numerisches letztes Label ist keine TLD (verkürzte IPv4-Formen).
+    if labels
+        .last()
+        .is_some_and(|tld| tld.bytes().all(|b| b.is_ascii_digit()))
+    {
+        return false;
+    }
+    !NON_PUBLIC_SUFFIXES
+        .iter()
+        .any(|suffix| host_matches_suffix(suffix, host))
 }
 
 impl Serialize for EgressTarget {
@@ -203,6 +287,7 @@ impl Serialize for EgressTarget {
             Self::Host(host) => serializer.serialize_str(&format!("={host}")),
             Self::DnsSuffix(suffix) => serializer.serialize_str(suffix),
             Self::Cidr(net) => serializer.collect_str(net),
+            Self::PublicDns => serializer.serialize_str(PUBLIC_DNS_WIRE),
         }
     }
 }
@@ -213,6 +298,9 @@ impl<'de> Deserialize<'de> for EgressTarget {
         D: Deserializer<'de>,
     {
         let raw = String::deserialize(deserializer)?;
+        if raw == PUBLIC_DNS_WIRE {
+            return Ok(Self::PublicDns);
+        }
         if let Some(host) = raw.strip_prefix('=') {
             return Ok(Self::Host(host.to_owned()));
         }
@@ -267,8 +355,15 @@ impl NetworkScope {
     pub fn hosts(&self) -> impl Iterator<Item = &str> + '_ {
         self.allowed.iter().filter_map(|target| match target {
             EgressTarget::Host(host) | EgressTarget::DnsSuffix(host) => Some(host.as_str()),
-            EgressTarget::Cidr(_) => None,
+            EgressTarget::Cidr(_) | EgressTarget::PublicDns => None,
         })
+    }
+
+    /// `true`, wenn der Scope jeden öffentlichen DNS-Namen zulässt
+    /// ([`EgressTarget::PublicDns`], offenes Recherche-Netz).
+    #[must_use]
+    pub fn allows_public_dns(&self) -> bool {
+        self.allowed.contains(&EgressTarget::PublicDns)
     }
 
     pub fn targets(&self) -> impl Iterator<Item = &EgressTarget> + '_ {
@@ -326,6 +421,7 @@ impl EgressTarget {
             Self::Host(allowed) => host_matches_exact(allowed, host),
             Self::DnsSuffix(allowed) => host_matches_suffix(allowed, host),
             Self::Cidr(_) => false,
+            Self::PublicDns => is_public_dns_name(host),
         }
     }
 
@@ -392,6 +488,15 @@ fn intersect_targets(left: &EgressTarget, right: &EgressTarget) -> Option<Egress
         (EgressTarget::Cidr(a), EgressTarget::Cidr(b)) if b.contains(a) => {
             Some(EgressTarget::Cidr(*a))
         }
+        (EgressTarget::PublicDns, EgressTarget::PublicDns) => Some(EgressTarget::PublicDns),
+        (
+            EgressTarget::PublicDns,
+            name @ (EgressTarget::Host(host) | EgressTarget::DnsSuffix(host)),
+        )
+        | (
+            name @ (EgressTarget::Host(host) | EgressTarget::DnsSuffix(host)),
+            EgressTarget::PublicDns,
+        ) if is_public_dns_name(host) => Some(name.clone()),
         _ => None,
     }
 }
@@ -405,6 +510,10 @@ fn target_is_subset(child: &EgressTarget, parent: &EgressTarget) -> bool {
         }
         (EgressTarget::Cidr(child), EgressTarget::Cidr(parent)) => {
             child == parent || parent.contains(child)
+        }
+        (EgressTarget::PublicDns, EgressTarget::PublicDns) => true,
+        (EgressTarget::Host(host) | EgressTarget::DnsSuffix(host), EgressTarget::PublicDns) => {
+            is_public_dns_name(host)
         }
         _ => false,
     }
@@ -1412,6 +1521,86 @@ const _COMPILE_FAIL_INTENT: () = ();
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn public_dns_name_rejects_literals_local_and_single_label_names() {
+        for public in [
+            "www.bund.de",
+            "docs.rs",
+            "Example.ORG.",
+            "a-b.co.uk",
+            "xn--bcher-kva.de",
+        ] {
+            assert!(is_public_dns_name(public), "{public}");
+        }
+        for local in [
+            "",
+            "localhost",
+            "api.localhost",
+            "printer.local",
+            "svc.internal",
+            "router.home.arpa",
+            "intranet",
+            "127.0.0.1",
+            "10.0.0.1",
+            "169.254.169.254",
+            "::1",
+            "[::1]",
+            "0x7f.1",
+            "1.2.3",
+            "a..b",
+            "evil.com:80",
+            "user@evil.com",
+        ] {
+            assert!(!is_public_dns_name(local), "{local}");
+        }
+    }
+
+    #[test]
+    fn public_dns_target_matches_names_but_never_addresses() {
+        let open = NetworkScope::from_targets([EgressTarget::PublicDns]);
+        assert!(open.allows_public_dns());
+        assert!(open.allows("www.destatis.de"));
+        assert!(!open.allows("localhost"));
+        assert!(!open.allows("127.0.0.1"));
+        assert!(!open.allows_addr(std::net::IpAddr::from([10, 0, 0, 1])));
+        assert!(open.hosts().next().is_none());
+    }
+
+    #[test]
+    fn public_dns_intersection_never_widens_either_side() {
+        let open = NetworkScope::from_targets([EgressTarget::PublicDns]);
+        let listed = NetworkScope::from_hosts(["docs.rs".to_owned(), "printer.local".to_owned()]);
+        let narrowed = open.intersection(&listed);
+        assert!(narrowed.allows("docs.rs"));
+        assert!(!narrowed.allows("printer.local"));
+        assert!(!narrowed.allows_public_dns());
+        assert!(narrowed.is_subset_of(&open));
+        assert!(narrowed.is_subset_of(&listed));
+        assert!(
+            !open.is_subset_of(&listed),
+            "offen ist nie Teilmenge einer Liste"
+        );
+        assert!(listed.intersection(&NetworkScope::empty()).is_empty());
+        assert_eq!(open.intersection(&open), open);
+        let both = NetworkScope::from_targets([
+            EgressTarget::PublicDns,
+            EgressTarget::DnsSuffix("docs.rs".to_owned()),
+        ]);
+        assert!(open.is_subset_of(&both));
+    }
+
+    #[test]
+    fn public_dns_target_round_trips_through_its_wire_form() {
+        let open = NetworkScope::from_targets([
+            EgressTarget::PublicDns,
+            EgressTarget::DnsSuffix("docs.rs".to_owned()),
+        ]);
+        let encoded = toml::to_string(&open).unwrap_or_default();
+        assert!(encoded.contains(PUBLIC_DNS_WIRE), "{encoded}");
+        let back: NetworkScope = toml::from_str(&encoded).unwrap_or_default();
+        assert_eq!(back, open);
+    }
 
     #[test]
     fn every_permission_request_restricts_every_parent_set() {

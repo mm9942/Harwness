@@ -33,6 +33,9 @@ pub struct PlanModeGate {
     allowed: Vec<String>,
 }
 
+/// Präfix der Übergabe-Werkzeuge (`harw_core::turn_loop::HANDOFF_PREFIX`).
+const HANDOFF_TOOL_PREFIX: &str = "transfer_to_";
+
 impl PlanModeGate {
     /// Baut den Handler.
     ///
@@ -54,7 +57,14 @@ impl PlanModeGate {
     /// `None` für „kein Einwand“, sonst die Ablehnungsbegründung.
     #[must_use]
     pub fn denial_for(&self, tool: &str) -> Option<String> {
-        if !self.lock.is_locked() || self.allowed.iter().any(|name| name == tool) {
+        // Plan R9, E1: eine Übergabe `transfer_to_<ziel>` ist im Plan-Modus
+        // erlaubt — welche Ziele (nur lesende) entscheiden Sichtbarkeit und
+        // Admission des Spawners (`harw_core::delegation_visibility::
+        // delegable_in_mode`), nicht diese Namensliste.
+        if !self.lock.is_locked()
+            || tool.starts_with(HANDOFF_TOOL_PREFIX)
+            || self.allowed.iter().any(|name| name == tool)
+        {
             return None;
         }
         Some(format!(
@@ -132,6 +142,9 @@ mod tests {
                 "{allowed}"
             );
         }
+        // Plan R9, E1: Übergaben passieren das Tor; die Zielauswahl (nur
+        // lesende Ziele) trifft der Spawner.
+        assert!(gate.denial_for("transfer_to_explorer").is_none());
         // Zurück: wieder offen.
         lock.set(false);
         assert!(gate.denial_for("fs.write").is_none());

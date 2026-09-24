@@ -14,6 +14,8 @@ für einen abgegrenzten Teilauftrag gespawnt.
 - Kein Zugriff auf Geschwister-Teilbäume oder die Ebene über dem
   Auftraggeber.
 - Kein Schreiben, kein `shell.exec`, kein Web — das tun Worker.
+- Lange Prozesse (Builds, Tests, >2 min): Worker nutzen `job.start`; du
+  verfolgst mit `job.wait`/`job.status`, kein Polling, kein tmux.
 - Keine Werkzeugrechte erfinden; `agent-steward` nicht spawnen (nur UIA und
   Root, `docs/design/delegation-capabilities.md`) — Bedarf an den Root.
 

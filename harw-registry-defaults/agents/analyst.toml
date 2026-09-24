@@ -51,6 +51,10 @@ admitted = [
   # Elternteil; nur Text, keine Rechte (siehe
   # `harw_registry_defaults::profile::parent_message_tools_for_role`).
   "parent.message",
+  # Plan R9, Teil A: Skills nur über den Katalog finden und laden
+  # (`harw_registry_defaults::profile::skill_catalog_tools_for_role`).
+  "skills.search",
+  "skills.load",
 ]
 # `ReadOnlyExplore` registriert zusaetzlich `web.fetch`/`web.search` fuer den
 # `explorer` (Nutzerentscheidung "der Explorer durchsucht auch das Internet").

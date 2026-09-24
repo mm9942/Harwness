@@ -253,6 +253,17 @@ The design and its remaining open points are described in [docs/design/knowledge
 
 Matrix games are run by the `matrix-game-master`, a background orchestrator the UIA starts when you ask for one (for example „spiel ein Matrix-Game zu …“). It drafts a scenario from your brief, asks for approval, plays it with agents in the seats and returns `aar.md` and a paper-ready `report.md`. A deterministic engine in Rust owns turns, dice, visibility and the journal; seats only see their own projection of the game. Scenarios can include behavior profiles, a Red Cell seat and inject packages. `/matrix` is read-only (`show`, `list`, `replay`, `compare`); `F9` opens the matrix panel. Design notes: [docs/design/matrix-game.md](docs/design/matrix-game.md).
 
+Before drafting a scenario the game master grounds it in the real situation: it hands bounded questions to `intel-web-researcher` (open web, primary sources first, every claim with URL, retrieval date and a source/information rating) and to `evidence-collector` / `evidence-critic` (licence, `SECURITY.md`, CI, changelog and git history in the workspace). Sourced facts enter the game through `matrix.add_fact` as public situation, between rounds as a bounded "research inject"; seats stay offline, and `report.md` shows each fact as "Fakt: … (Quelle: URL, abgerufen …)".
+
+Research needs network. By default (`[network].research_web = "allowlist"`) only the hosts in `[network].researcher_web_hosts` / `allow_hosts` are reachable, and an empty list means no network. With
+
+```toml
+[network]
+research_web = "open"
+```
+
+the research roles (`researcher-web`, `researcher`, `dependency-researcher` and agents built on them, such as `intel-web-researcher`) may read any public host with `GET`, without credentials or cookies. Private, loopback and link-local targets stay blocked, also through DNS. In `ask` and `auto` mode the first request to each new domain asks you (the dialog names the domain) and the answer is remembered for the session; in `full` mode it does not ask. Other roles keep the allowlist. An untrusted project layer can switch `open` off but never on.
+
 ## Bundled roles and skills
 
 The binary ships a starter set of agent definitions and skills that `harw init` writes into the Harwness home. Recent additions include:

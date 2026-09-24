@@ -35,7 +35,18 @@ may_write_code = false
 may_research_web = false
 
 [tools]
-admitted = ["shell.exec"]
+admitted = [
+  "shell.exec",
+  # Plan R9, Teil F: lang laufende/verfolgbare Prozesse (Builds, Restores,
+  # Testläufe, alles über ~2 min) als Job statt tmux; gleicher Rechte- und
+  # Freigabeweg wie `shell.exec` (`harw_registry_defaults::profile::JOB_TOOLS`).
+  "job.start",
+  "job.status",
+  "job.logs",
+  "job.stop",
+  "job.list",
+  "job.wait",
+]
 forbidden = [
   "fs.read",
   "fs.search",

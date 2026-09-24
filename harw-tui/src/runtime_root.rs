@@ -131,6 +131,24 @@ fn uia_selection_from_config(config: &harw_config::ResolvedConfig) -> UiaSelecti
     )
 }
 
+/// Anfangsauswahl der UIA-Wurzel im Sitzungs-Controller.
+///
+/// # Beschreibung
+/// Nur eine **eigene** UIA-Wahl (`uia_provider`/`uia_model`) pinnt die
+/// UIA-Wurzel ([`uia_selection_from_config`], je Achse mit `default_*` als
+/// Rückfall). Ohne sie bleibt die Auswahl leer: die Wurzel folgt dann der
+/// generischen Auswahl, und ein `/model switch` wechselt sie sofort — genau
+/// wie nach einem Neustart, weil der gespeicherte `default_*`-Wert dann
+/// derselbe ist. Vorher kopierte der Start `default_*` in die UIA-Auswahl;
+/// die hatte danach Vorrang, so dass `/model switch` Wurzel und Statuszeile
+/// bis zum Neustart beim alten Modell ließ.
+fn root_uia_selection(config: &harw_config::ResolvedConfig) -> UiaSelection {
+    if config.harness.uia_provider.is_none() && config.harness.uia_model.is_none() {
+        return UiaSelection::empty();
+    }
+    uia_selection_from_config(config)
+}
+
 /// Sie ist reine Anzeige und wird nie als Nutzereingabe oder persistierte
 /// Conversation-History behandelt. Die Uhrzeit wird explizit als UTC markiert,
 /// damit die Ausgabe auch ohne verfügbare lokale Zeitzonendaten eindeutig bleibt.
@@ -949,7 +967,9 @@ fn build_root_runtime(
     // Die Assembly hat ihre Config beim Bau aus der Persistenz geladen. Die
     // UIA-Auswahl wird deshalb hier pro Root-Montage neu gesetzt — sowohl beim
     // frischen Start als auch bei `/resume` — ohne `default_*` umzudeuten.
-    let uia_selection = uia_selection_from_config(assembly.config());
+    // Live-Stand: bei `/resume` in derselben Montage gilt eine inzwischen
+    // gespeicherte UIA-Wahl, nicht der Stand des Starts.
+    let uia_selection = root_uia_selection(&assembly.current_config());
     controller
         .initialize_uia_selection(uia_selection)
         .map_err(|error| {
@@ -1351,7 +1371,7 @@ impl crate::gateway::ChatGateway for ResumableGateway {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     use crate::test_support::{TestError, TestResult, ctx};
@@ -1460,6 +1480,31 @@ mod tests {
         Ok((Arc::new(assembly), wiring))
     }
 
+    /// Eine TUI-App auf einer echten Echo-Montage (Temp-Home, UIA-Wurzel),
+    /// für Tests anderer Module (etwa `app::live_views_tests`).
+    pub(crate) struct RuntimeBackedApp {
+        /// Die App der Wurzelsitzung, mit Montage und Controller verdrahtet.
+        pub(crate) app: ChatApp,
+        /// Die Montage (Live-Konfiguration, Controller, Dienste).
+        pub(crate) assembly: Arc<RuntimeAssembly>,
+        /// Hält Temp-Home und -Projekt am Leben (zuletzt verworfen).
+        _fixture: Fixture,
+    }
+
+    /// Baut eine [`RuntimeBackedApp`] über denselben Weg wie der echte
+    /// Start ([`build_root_runtime`]).
+    pub(crate) fn runtime_backed_app() -> TestResult<RuntimeBackedApp> {
+        let fixture = fixture()?;
+        let (assembly, wiring) = tui_assembly(&fixture, None)?;
+        let runtime = build_root_runtime(&assembly, wiring, None, false)
+            .map_err(ctx("root runtime builds"))?;
+        Ok(RuntimeBackedApp {
+            app: runtime.app,
+            assembly,
+            _fixture: fixture,
+        })
+    }
+
     #[test]
     fn test_tui_session_wiring_install_sets_controller_and_events() -> TestResult {
         let fixture = fixture()?;
@@ -1515,10 +1560,30 @@ mod tests {
         assert_eq!(runtime.app.session_id(), assembly.root_session_id());
         assert_eq!(
             controller.uia_selection(),
-            uia_selection_from_config(assembly.config()),
-            "the root controller must receive the effective persisted UIA selection"
+            root_uia_selection(assembly.config()),
+            "the root controller must receive the persisted UIA selection"
         );
         Ok(())
+    }
+
+    /// Ohne eigene UIA-Wahl pinnt der Start die UIA-Wurzel nicht auf
+    /// `default_*` (sonst ließe `/model switch` sie bis zum Neustart beim
+    /// alten Modell); mit eigener Wahl gilt sie je Achse samt Rückfall.
+    #[test]
+    fn root_uia_selection_pins_only_an_own_uia_choice() {
+        let mut config = harw_config::ResolvedConfig::default();
+        config.harness.default_provider = Some("default-provider".to_owned());
+        config.harness.default_model = Some("default-model".to_owned());
+        assert_eq!(root_uia_selection(&config), UiaSelection::empty());
+
+        config.harness.uia_model = Some("uia-model".to_owned());
+        assert_eq!(
+            root_uia_selection(&config),
+            UiaSelection::new(
+                Some("default-provider".to_owned()),
+                Some("uia-model".to_owned())
+            )
+        );
     }
 
     #[test]
@@ -1547,6 +1612,37 @@ mod tests {
 
         assert_eq!(runtime.session.mode(), InteractionMode::Plan);
         assert_eq!(runtime.app.active_mode(), InteractionMode::Plan);
+        Ok(())
+    }
+
+    /// Runde 9, E6: der Modus der Wurzel liegt ab dem Start im Live-Modus
+    /// des Agentenbaums, und jeder Wechsel der TUI (hier Shift+Tab aus dem
+    /// Start-Plan-Modus) wird sofort dorthin veröffentlicht — laufende und
+    /// neue Kinder folgen ihm.
+    #[test]
+    fn test_mode_changes_reach_the_live_mode_of_the_agent_tree() -> TestResult {
+        let fixture = fixture()?;
+        let (assembly, wiring) = tui_assembly(&fixture, Some(InteractionMode::Plan))?;
+        let mut runtime = build_root_runtime(&assembly, wiring, None, false)
+            .map_err(ctx("root runtime builds"))?;
+        let live = assembly
+            .spawner()
+            .ok_or(TestError::Missing("a Tui assembly mounts a spawner"))?
+            .live_mode()
+            .clone();
+        assert_eq!(live.current(), Some(InteractionMode::Plan));
+
+        let mut follower = live.follower();
+        runtime.app.cycle_permission_stage(false);
+        assert_eq!(runtime.app.active_mode(), InteractionMode::Work);
+        assert_eq!(follower.poll(), Some(InteractionMode::Work));
+
+        // Zurück in den Plan-Modus: ask → auto → full → plan.
+        for _ in 0..3 {
+            runtime.app.cycle_permission_stage(false);
+        }
+        assert_eq!(runtime.app.active_mode(), InteractionMode::Plan);
+        assert_eq!(live.current(), Some(InteractionMode::Plan));
         Ok(())
     }
 

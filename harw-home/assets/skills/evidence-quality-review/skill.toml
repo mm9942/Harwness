@@ -1,0 +1,4 @@
+name = "evidence-quality-review"
+description = "Belege und Quellen kritisch bewerten: Zuverlässigkeit der Quelle, Glaubwürdigkeit der Information, Auswahlverzerrung, plausibel aber unbelegt, Wirksamkeitsbehauptungen, wer bestimmt was als Evidenz zählt; Behalten/Verwerfen-Liste (evidence quality, source reliability, selection bias, cherry picking, issue framing)."
+instructions_file = "instructions.md"
+tools = ["filesystem.read"]

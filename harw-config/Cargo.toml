@@ -12,6 +12,12 @@ harw-agent-dsl = { path = "../harw-agent-dsl" }
 harw-fsutil = { path = "../harw-fsutil" }
 harw-types = { path = "../harw-types" }
 harw-macros = { path = "../harw-macros" }
+# Plan R9, Teil B: die eingebauten Agentendefinitionen aus
+# `harw-registry-defaults/agents/` als unterste Aufloesungsschicht, damit
+# Profil-/Projektdefinitionen `extends = { id = "harwness.agent.worker-base@1" }`
+# aufloesen. Die Crate kann `harw-registry-defaults` nicht selbst nutzen
+# (Zyklus), bettet den Baum deshalb direkt ein.
+include_dir = { workspace = true }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 time = { version = "0.3.53", features = ["serde-well-known", "formatting", "parsing"] }

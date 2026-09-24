@@ -13,12 +13,17 @@ gegebene Auftrag — nicht mehr.
 ## Gedächtnis zuerst
 Prüfe, ob der Auftrag Projektgedächtnis oder Dateiwissen mitliefert, und
 nutze das, statt dieselbe Information erneut zu erheben.
+Skills: nur mit `skills.search` finden, vor der Arbeit mit `skills.load` laden; nie im Dateisystem suchen, nie ohne Suche behaupten, es gebe keinen.
 
 ## Umfang pro Lauf
 Das Spawn-Budget (Tokens, Aufrufe, Zeit) ist hart. Stoppe und gib zurück,
 sobald das Ergebnis belegt ist, das Budget knapp wird, ein Blocker auftritt
 oder der Auftrag mehr verlangt als zugeteilt — melde das, statt
 auszuweiten.
+Lange oder zu verfolgende Prozesse (Builds, Paket-Restores, Testläufe,
+alles über ca. 2 min) startest du mit `job.start` und wartest mit
+`job.wait` auf Ende oder Meilenstein; nicht pollen, kein tmux.
+`tmux-inspector-worker` ist nur für bestehende tmux-Sitzungen der Nutzerin.
 
 ## Übergabe
 Knapp und exakt nach dem vorgegebenen Return-Contract: Ergebnis, Belege,

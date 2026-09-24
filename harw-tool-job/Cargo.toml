@@ -1,0 +1,32 @@
+[package]
+publish.workspace = true
+name = "harw-tool-job"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "Eingebautes Job-System für lang laufende Prozesse (job.start/status/logs/stop/list/wait) statt tmux: Logs unter <state>/jobs/<id>/, Fortschrittserkennung und gedrosselte Meldungen an den besitzenden Agenten."
+
+[dependencies]
+harw-authority = { path = "../harw-authority" }
+harw-extension-api = { path = "../harw-extension-api" }
+harw-tools = { path = "../harw-tools" }
+harw-types = { path = "../harw-types" }
+# Derselbe Rechte-/Freigabeweg wie `shell.exec` (Sandbox/Host-Lease/Permit,
+# sudo-Verbot, rlimits): `ShellToolProvider::prepare_background_launch`.
+harw-tool-shell = { path = "../harw-tool-shell" }
+jiff = { workspace = true }
+# Signale an die ganze Prozessgruppe (`kill(-pgid, …)`) ohne `unsafe`/libc.
+rustix = { workspace = true, features = ["process"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["process", "time", "io-util", "rt", "macros", "sync"] }
+tracing = "0.1"
+
+[dev-dependencies]
+tempfile = "3"
+tokio = { version = "1", features = ["process", "time", "io-util", "rt", "macros", "sync"] }
+
+[lints]
+workspace = true

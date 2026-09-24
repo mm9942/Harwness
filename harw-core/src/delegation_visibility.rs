@@ -18,6 +18,8 @@
 //! - [`DelegationTarget`] — ein einzelnes sichtbares Ziel.
 //! - [`DelegationTargetKind`] — unterscheidet Worker von Kind-Orchestratoren.
 //! - [`visible_delegation_targets`] — die reine Projektionsfunktion.
+//! - [`delegable_in_mode`] — die eine Plan-Modus-Regel (Plan R9, E1): im
+//!   Plan-Modus bleiben nur lesende Ziele delegierbar.
 //!
 //! # Nebenläufigkeit
 //! Rein, synchron, zustandslos — keine Locks, kein IO.
@@ -139,10 +141,132 @@ pub fn visible_delegation_targets(
     targets
 }
 
+/// Ab dieser Zahl sichtbarer Ziele (strikt größer) bietet der Turn-Loop statt
+/// je eines `transfer_to_<name>` nur noch das eine Werkzeug `agents.delegate`
+/// an (Plan R9, Teil C) — jedes `transfer_to_*` kostet rund 300 Tokens.
+pub const DELEGATE_TOOL_THRESHOLD: usize = 8;
+
+/// Plan R9, E1: die **eine** Plan-Modus-Regel für Delegationsziele.
+///
+/// # Beschreibung
+/// Im Plan-Modus bleiben nur lesende Ziele delegierbar (sie erben den
+/// Plan-Modus); schreibende oder ausführende Ziele erst nach der
+/// Planfreigabe. Außerhalb des Plan-Modus ändert die Regel nichts.
+/// Dieselbe Funktion filtern `ManagedAgentSpawner` (Sichtbarkeit und
+/// Admission), der Turn-Loop (`transfer_to_*`, `agents.delegate`,
+/// `agents.catalog`) und damit auch `delegate_wave`.
+///
+/// # Arguments
+/// - `plan_mode`: ob der Aufrufer (selbst oder geerbt) im Plan-Modus ist.
+/// - `target_read_only`: ob das Ziel weder schreibt noch Prozesse startet.
+#[must_use]
+pub const fn delegable_in_mode(plan_mode: bool, target_read_only: bool) -> bool {
+    !plan_mode || target_read_only
+}
+
+/// Das kebab-case-Label einer Organisationsrolle (wie in der
+/// Agentendefinition, z. B. `child-orchestrator`).
+#[must_use]
+pub const fn role_label(role: AgentRoleId) -> &'static str {
+    match role {
+        AgentRoleId::UserInterface => "user-interface",
+        AgentRoleId::RootOrchestrator => "root-orchestrator",
+        AgentRoleId::ChildOrchestrator => "child-orchestrator",
+        AgentRoleId::Worker => "worker",
+        AgentRoleId::UiaWorker => "uia-worker",
+        AgentRoleId::AgentSteward => "agent-steward",
+    }
+}
+
+/// Die Ablehnung eines schreibenden/ausführenden Ziels im Plan-Modus.
+///
+/// # Arguments
+/// - `read_only_targets`: die im Plan-Modus delegierbaren (lesenden) Ziele
+///   des Aufrufers — nur Namen, die er ohnehin sieht.
+#[must_use]
+pub fn plan_mode_refusal(read_only_targets: &[String]) -> String {
+    let listed = if read_only_targets.is_empty() {
+        "keines sichtbar".to_owned()
+    } else {
+        read_only_targets.join(", ")
+    };
+    format!(
+        "{PLAN_MODE_REFUSAL_PREFIX} ({listed}); Schreib-/Ausführungsziele erst nach \
+         Planfreigabe."
+    )
+}
+
+/// Anfang jeder Plan-Modus-Ablehnung ([`plan_mode_refusal`]).
+pub const PLAN_MODE_REFUSAL_PREFIX: &str = "Plan-Modus: nur lesende Ziele delegierbar";
+
+/// Ob eine Spawn-Meldung die Plan-Modus-Ablehnung ist — der Turn-Loop gibt
+/// sie dem Modell als Werkzeugfehler zurück, statt den Turn abzubrechen.
+#[must_use]
+pub fn is_plan_mode_refusal(message: &str) -> bool {
+    message.contains(PLAN_MODE_REFUSAL_PREFIX)
+}
+
+/// Die Ablehnung eines Ziels, das der Aufrufer nicht delegieren darf.
+///
+/// # Beschreibung
+/// Nennt ausschließlich die Ziele, die der Aufrufer ohnehin sieht — kein
+/// Orakel über verborgene Agenten. `target` ist der vom Modell genannte Name.
+#[must_use]
+pub fn not_delegable_message(target: &str, visible: &[String]) -> String {
+    let listed = if visible.is_empty() {
+        "keine".to_owned()
+    } else {
+        visible.join(", ")
+    };
+    format!("Ziel {target} ist für dich nicht delegierbar; delegierbar sind: {listed}")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::test_support::{TestError, TestResult};
+
+    /// Plan R9: ein benutzerdefinierter Child-Orchestrator (etwa
+    /// `intel-analysis-orchestrator`) sieht die Worker seiner Familie
+    /// (`evidence-critic`) — dieselbe Spawn-Matrix wie für eingebaute Rollen.
+    #[test]
+    fn custom_child_orchestrator_sees_its_family_workers() {
+        let candidates = vec![
+            ("evidence-critic".to_owned(), AgentRoleId::Worker),
+            ("synthesis-writer".to_owned(), AgentRoleId::Worker),
+        ];
+        let targets =
+            visible_delegation_targets(AgentRoleId::ChildOrchestrator, &candidates, &[], 1);
+        let names: Vec<&str> = targets.iter().map(|t| t.name.as_str()).collect();
+        assert_eq!(names, vec!["evidence-critic", "synthesis-writer"]);
+    }
+
+    #[test]
+    fn plan_mode_keeps_only_read_only_targets() {
+        assert!(delegable_in_mode(false, false));
+        assert!(delegable_in_mode(false, true));
+        assert!(delegable_in_mode(true, true));
+        assert!(!delegable_in_mode(true, false));
+    }
+
+    #[test]
+    fn refusal_messages_name_only_visible_targets() {
+        let message = plan_mode_refusal(&["explorer".to_owned(), "planner".to_owned()]);
+        assert_eq!(
+            message,
+            "Plan-Modus: nur lesende Ziele delegierbar (explorer, planner); \
+             Schreib-/Ausführungsziele erst nach Planfreigabe."
+        );
+        assert_eq!(
+            not_delegable_message("executor", &["explorer".to_owned()]),
+            "Ziel executor ist für dich nicht delegierbar; delegierbar sind: explorer"
+        );
+        assert!(not_delegable_message("x", &[]).ends_with("delegierbar sind: keine"));
+        assert!(is_plan_mode_refusal(&format!(
+            "agent spawn failed: {message}"
+        )));
+        assert!(!is_plan_mode_refusal("no delegation capability"));
+    }
 
     fn candidates() -> Vec<(String, AgentRoleId)> {
         vec![

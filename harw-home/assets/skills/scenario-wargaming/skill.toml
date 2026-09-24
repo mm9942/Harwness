@@ -1,0 +1,4 @@
+name = "scenario-wargaming"
+description = "Szenario-Planspiel mit mehreren Welten: Rollen und Teams, Spielleitung, Züge und Rückmeldung, Gegenspieler-Zelle, Schocks, Überraschungskandidaten, Auswertung als Lerngewinn statt Sieger (wargaming, scenario planning, multi-world, red cell, role play, surprise, strategy test)."
+instructions_file = "instructions.md"
+tools = ["filesystem.read"]

@@ -24,8 +24,9 @@
 //! # Fehler
 //! Permission-Fehler → `Ok(ToolOutput::error(...))`. Kein Panic.
 
+use crate::symlink::open_start;
 use crate::tree::{
-    HARD_MAX_RESULTS, MAX_OUTPUT_BYTES, MAX_SCAN_FILE_BYTES, StopReason, WalkOptions, Workspace,
+    HARD_MAX_RESULTS, MAX_OUTPUT_BYTES, MAX_SCAN_FILE_BYTES, StopReason, WalkOptions,
     normalize_relative, open_file_in, read_bounded, truncate_line, walk_tree,
 };
 use harw_authority::Permission;
@@ -229,18 +230,24 @@ impl FsSearchExecutor {
             .min(self.max_matches)
             .clamp(1, HARD_MAX_RESULTS);
 
-        let opened =
-            Workspace::open(ctx.sandbox().workspace().canonical_root()).and_then(|workspace| {
-                let start = workspace.open_any(&start_rel)?;
-                let is_dir = start.metadata()?.is_dir();
-                Ok((workspace, start, is_dir))
-            });
-        let (workspace, start, is_dir) = match opened {
+        // Symlinks im Startpfad: nach innen frei, nach außen nur mit Freigabe
+        // (siehe `crate::symlink`); gewalkt wird unter der passenden Wurzel.
+        let opened = open_start(
+            ctx.sandbox().workspace().canonical_root(),
+            &start_rel,
+            "fs.search",
+            start_input,
+        )
+        .and_then(|opened| {
+            let start = opened.workspace.open_any(&opened.rel)?;
+            let is_dir = start.metadata()?.is_dir();
+            Ok((opened.workspace, start, opened.rel, is_dir))
+        });
+        let (workspace, start, start_rel, is_dir) = match opened {
             Ok(opened) => opened,
             Err(err) => {
                 return Ok(ToolOutput::error(format!(
-                    "fs.search: '{start_input}' kann nicht geöffnet werden \
-                     (Symlinks werden nicht verfolgt): {err}"
+                    "fs.search: '{start_input}' kann nicht geöffnet werden: {err}"
                 )));
             }
         };

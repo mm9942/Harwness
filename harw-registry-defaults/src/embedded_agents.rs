@@ -105,12 +105,18 @@
 //! und `test_family_discovery_also_recurses_into_the_pluralized_future_root`
 //! belegen das an einem synthetischen Baum, ohne `agents/` selbst anzufassen.
 //!
-//! # Vorrang lokaler Definitionen
-//! Eine lokale Definition gewinnt immer: Namen, die bereits in `existing`
-//! vorkommen, überspringt [`builtin_agent_definitions`] vollständig — es wird
-//! nichts zusammengeführt und nichts überschrieben. Wer eine eingebaute Rolle
-//! anpassen will, ersetzt sie damit als Ganzes, statt eine halb gemischte
-//! Definition zu erhalten.
+//! # Eingebaute Rollen gewinnen (Plan R9, Teil B)
+//! Bis Plan R9 sollte eine lokale Definition eine eingebaute Rolle gleichen
+//! Namens ersetzen. Der Vergleich lief aber gegen die Schlüssel von
+//! `existing` — und die sind `DefinitionId`s (`ResolvedConfig::executable_agents`),
+//! nie Rollennamen; er traf deshalb nie. Jetzt wird konsistent über
+//! Spezialisierung **und** volle ID verglichen, und die Richtung ist
+//! umgekehrt: eine eingebaute Rolle ist sicherheitsrelevant (Profil,
+//! Reducer, Freigabepfade hängen an ihrem Namen) und wird von einer lokalen
+//! Definition nie still ersetzt. Eine Kollision wird mit `tracing::warn`
+//! gemeldet; die eingebaute Rolle bleibt im Ergebnis. Eigene Agenten
+//! erweitern eine eingebaute Rolle per `extends` unter einem eigenen Namen
+//! (siehe `crate::roster`).
 //!
 //! # Die Basis ist ein eigener Layer
 //! `worker-base.toml` ist selbst keine startbare Rolle, wird aber als Layer
@@ -182,6 +188,16 @@ pub use harw_agent_dsl::organization::{RawCellSpec, RawClanSpec, ResolvedOrganiz
 /// — ihr Sonderstatus entsteht erst durch den Namensvergleich in
 /// [`builtin_agent_definitions`].
 pub const WORKER_BASE_NAME: &str = "worker-base";
+
+/// Der Name der gemeinsamen Basis benutzerdefinierter Child-Orchestratoren
+/// (`agents/child-orchestrator-base.toml`, Plan R9, Teil B).
+///
+/// Wie [`WORKER_BASE_NAME`] ein reiner `extends`-Layer, keine startbare
+/// Rolle.
+pub const CHILD_ORCHESTRATOR_BASE_NAME: &str = "child-orchestrator-base";
+
+/// Alle eingebauten Basis-Layer, die selbst keine startbare Rolle sind.
+pub const BASE_DEFINITION_NAMES: &[&str] = &[WORKER_BASE_NAME, CHILD_ORCHESTRATOR_BASE_NAME];
 
 // ─── Verzeichnis-Sammlung ────────────────────────────────────────────────
 
@@ -592,19 +608,23 @@ pub fn builtin_agent_toml() -> &'static [(&'static str, &'static str)] {
 /// # Beschreibung
 /// Parst alle eingebetteten Definitionen (inklusive der Basis) zu einem
 /// gemeinsamen [`DefinitionLayer::BuiltIn`]-Schichtstapel und löst daraus jede
-/// Rolle aus [`role_names::ALL`] auf. Lokale Definitionen aus `.harw/agents/`
-/// gewinnen: Namen, die in `existing` vorkommen, werden übersprungen.
+/// Rolle aus [`role_names::ALL`] auf. Eine lokale Definition aus `existing`,
+/// deren Spezialisierung oder volle ID einer eingebauten Rolle gleicht,
+/// ersetzt diese **nicht**: die eingebaute Rolle gewinnt, die Kollision wird
+/// mit `tracing::warn` gemeldet (siehe Modul-Dokumentation, „Eingebaute
+/// Rollen gewinnen“).
 ///
 /// Die Basis `worker-base` erscheint nie im Ergebnis — sie ist ein Layer, keine
 /// startbare Rolle.
 ///
 /// # Argumente
 /// - `existing` (`&HashMap<String, ExecutableAgentIr>`): bereits geladene
-///   lokale Definitionen, geschlüsselt nach Rollennamen. Nur gelesen.
+///   lokale Definitionen (`ResolvedConfig::executable_agents`, geschlüsselt
+///   nach `DefinitionId`). Nur gelesen, nur für die Kollisionswarnung.
 ///
 /// # Rückgabe
-/// `Ok(map)` mit einem Eintrag je eingebauter Rolle, die `existing` nicht
-/// bereits belegt.
+/// `Ok(map)` mit einem Eintrag je eingebauter Rolle, geschlüsselt nach
+/// Rollennamen.
 ///
 /// # Fehler
 /// - [`RegistryDefaultsError::AgentDefinition`]: `worker-base.toml` fehlt im
@@ -669,12 +689,12 @@ pub fn builtin_agent_definitions(
     }
 
     // 2. Nur die startbaren Rollen auflösen, ihr Kontextprogramm binden und
-    //    senken — und nur, wenn keine lokale Definition denselben Namen belegt.
+    //    senken. Eine lokale Definition gleicher Spezialisierung oder ID
+    //    ersetzt die eingebaute Rolle nie (Plan R9, Teil B) — sie wird nur
+    //    gemeldet.
     let mut definitions = HashMap::with_capacity(targets.len());
     for (name, id, own_tables) in targets {
-        if existing.contains_key(name) {
-            continue;
-        }
+        warn_on_local_collision(name, &id, existing);
         let mut resolved =
             resolve_definition(&id, &layers, now).map_err(|error| definition_error(name, error))?;
         bind_context_program(&own_tables, &mut resolved.config, &programs, now)
@@ -683,6 +703,71 @@ pub fn builtin_agent_definitions(
         definitions.insert(name.to_owned(), ir);
     }
 
+    Ok(definitions)
+}
+
+/// Meldet lokale Definitionen, die eine eingebaute Rolle über Spezialisierung
+/// oder volle ID belegen (Plan R9, Teil B). Die eingebaute Rolle gewinnt.
+///
+/// # Returns
+/// Die IDs der kollidierenden lokalen Definitionen, sortiert (für Tests).
+fn warn_on_local_collision(
+    name: &str,
+    builtin_id: &DefinitionId,
+    existing: &HashMap<String, ExecutableAgentIr>,
+) -> Vec<String> {
+    let mut colliding: Vec<String> = existing
+        .iter()
+        .filter(|(key, ir)| {
+            ir.specialization() == name || ir.id() == builtin_id || key.as_str() == name
+        })
+        .map(|(_, ir)| ir.id().to_string())
+        .collect();
+    colliding.sort();
+    for local_id in &colliding {
+        tracing::warn!(
+            role = name,
+            local_definition = %local_id,
+            "registry.builtin_role_collision: the built-in role wins, the local definition does not replace it"
+        );
+    }
+    colliding
+}
+
+/// Senkt die eingebauten Basis-Layer ([`BASE_DEFINITION_NAMES`]) zu
+/// [`ExecutableAgentIr`] (Plan R9, Teil B).
+///
+/// # Beschreibung
+/// Die Basen sind keine startbaren Rollen, dienen aber als Rechtedecke für
+/// benutzerdefinierte Agenten, die nur eine Basis erweitern
+/// (`crate::roster::AgentRoster`). Kontextprogramme werden wie bei den Rollen
+/// gebunden.
+///
+/// # Fehler
+/// Wie [`builtin_agent_definitions`].
+pub fn builtin_base_definitions()
+-> Result<HashMap<String, ExecutableAgentIr>, RegistryDefaultsError> {
+    let now = OffsetDateTime::now_utc();
+    let programs = ContextProgramLibrary::parse(builtin_context_program_toml())?;
+    let mut layers: Vec<(DefinitionLayer, RawAgentDefinition)> =
+        Vec::with_capacity(builtin_agent_toml().len());
+    let mut targets = Vec::with_capacity(BASE_DEFINITION_NAMES.len());
+    for (name, source) in builtin_agent_toml() {
+        let raw = parse_toml(source).map_err(|error| definition_error(name, error))?;
+        if BASE_DEFINITION_NAMES.contains(name) {
+            targets.push((*name, raw.id.clone(), raw.tables.clone()));
+        }
+        layers.push((DefinitionLayer::BuiltIn, raw));
+    }
+    let mut definitions = HashMap::with_capacity(targets.len());
+    for (name, id, own_tables) in targets {
+        let mut resolved =
+            resolve_definition(&id, &layers, now).map_err(|error| definition_error(name, error))?;
+        bind_context_program(&own_tables, &mut resolved.config, &programs, now)
+            .map_err(|error| definition_error(name, error))?;
+        let ir = lower(&resolved).map_err(|error| definition_error(name, error))?;
+        definitions.insert(name.to_owned(), ir);
+    }
     Ok(definitions)
 }
 
@@ -2171,10 +2256,24 @@ mod tests {
         for (role, ir) in builtin()? {
             let admitted = ir.tool_surface().admitted();
             if role == role_names::EXECUTOR {
+                // Plan R9, Teil A: plus the read-only skill catalog, which
+                // carries no sandbox permission class.
+                // Plan R9, Teil F: plus the six `job.*` tools that belong to
+                // `shell.exec` (same permission and approval path).
                 assert_eq!(
                     admitted.iter().map(String::as_str).collect::<Vec<_>>(),
-                    vec!["shell.exec"],
-                    "executor must expose only shell.exec"
+                    vec![
+                        "shell.exec",
+                        "job.start",
+                        "job.status",
+                        "job.logs",
+                        "job.stop",
+                        "job.list",
+                        "job.wait",
+                        "skills.search",
+                        "skills.load",
+                    ],
+                    "executor must expose only shell.exec and job.* (plus the skill catalog)"
                 );
             } else if role == role_names::UIA_WORKER {
                 // Addendum I: `uia-worker` admits `shell.exec` too, but as
@@ -2779,6 +2878,9 @@ mod tests {
                 "palace.recall",
                 // Runde 5, Teil M: Zwischenstand/Frage an den Elternteil.
                 "parent.message",
+                // Plan R9, Teil A: Skill-Katalog.
+                "skills.search",
+                "skills.load",
             ]
         );
         for tool in [
@@ -3012,29 +3114,67 @@ mod tests {
     }
 
     #[test]
-    fn test_local_definition_overrides_builtin_role() -> TestResult {
-        // Eine bereits geladene lokale Definition belegt den Namen; die
-        // eingebaute Rolle wird komplett übersprungen, nicht gemischt.
+    fn test_local_definition_never_replaces_a_builtin_role() -> TestResult {
+        // Plan R9, Teil B: `existing` ist nach `DefinitionId` geschlüsselt
+        // (`ResolvedConfig::executable_agents`). Eine lokale Definition mit
+        // derselben Spezialisierung wie eine eingebaute Rolle ersetzt sie
+        // nicht — die eingebaute Rolle bleibt, die Kollision wird gemeldet.
         let local_explorer = builtin()?
             .remove(role_names::EXPLORER)
             .ok_or(TestError::Missing("explorer muss eingebaut existieren"))?;
         let mut existing = HashMap::new();
-        existing.insert(role_names::EXPLORER.to_owned(), local_explorer);
+        existing.insert(local_explorer.id().to_string(), local_explorer);
 
         let definitions =
-            builtin_agent_definitions(&existing).map_err(ctx("Restrollen müssen weiter lowern"))?;
+            builtin_agent_definitions(&existing).map_err(ctx("Rollen müssen weiter lowern"))?;
+        assert_eq!(definitions.len(), role_names::ALL.len());
+        assert!(definitions.contains_key(role_names::EXPLORER));
 
-        assert!(
-            !definitions.contains_key(role_names::EXPLORER),
-            "die lokale Definition gewinnt; die eingebaute wird übersprungen"
+        let explorer_id = definitions[role_names::EXPLORER].id().clone();
+        assert_eq!(
+            warn_on_local_collision(role_names::EXPLORER, &explorer_id, &existing),
+            vec![explorer_id.to_string()]
         );
-        assert_eq!(definitions.len(), role_names::ALL.len() - 1);
-        for role in role_names::ALL
-            .iter()
-            .filter(|r| **r != role_names::EXPLORER)
-        {
-            assert!(definitions.contains_key(*role), "fehlt: {role}");
-        }
+        assert!(
+            warn_on_local_collision(role_names::PLANNER, &explorer_id, &HashMap::new()).is_empty()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn test_child_orchestrator_base_exists_as_a_layer_not_a_role() -> TestResult {
+        assert!(
+            builtin_agent_toml()
+                .iter()
+                .any(|(name, _)| *name == CHILD_ORCHESTRATOR_BASE_NAME)
+        );
+        assert!(!role_names::ALL.contains(&CHILD_ORCHESTRATOR_BASE_NAME));
+        assert!(!builtin()?.contains_key(CHILD_ORCHESTRATOR_BASE_NAME));
+        let bases = builtin_base_definitions().map_err(ctx("Basen müssen lowern"))?;
+        let base = bases
+            .get(CHILD_ORCHESTRATOR_BASE_NAME)
+            .ok_or(TestError::Missing("child-orchestrator-base"))?;
+        assert_eq!(
+            base.id().to_string(),
+            "harwness.agent.child-orchestrator-base@1"
+        );
+        assert_eq!(base.role(), AgentRoleId::ChildOrchestrator);
+        assert_eq!(base.spawn_contract().max_depth(), Some(1));
+        assert!(base.spawn_contract().child_orchestrators().is_empty());
+        assert!(
+            base.tool_surface()
+                .admitted()
+                .iter()
+                .any(|tool| tool == "delegate_wave")
+        );
+        assert!(
+            !base
+                .tool_surface()
+                .admitted()
+                .iter()
+                .any(|tool| tool == "fs.write" || tool == "shell.exec")
+        );
+        assert!(bases.contains_key(WORKER_BASE_NAME));
         Ok(())
     }
 
@@ -3530,6 +3670,45 @@ mod tests {
         assert!(builtin_role_prompt(role_names::ROOT_ORCHESTRATOR).is_none());
     }
 
+    /// Plan R9 (Matrix-Game mit Internet): die Spielleitung grundiert das
+    /// Szenario vor dem Entwurf mit einer Recherche-Welle (Web und Repo),
+    /// darf zwischen Runden eine Recherche-Frage stellen und trägt belegte
+    /// Fakten mit `matrix.add_fact` ein; die Sitze bleiben offline.
+    #[test]
+    fn test_game_master_grounds_the_scenario_with_sourced_research() {
+        for needle in [
+            "`intel-web-researcher`",
+            "`evidence-collector`",
+            "`evidence-critic`",
+            "matrix.add_fact",
+            "Lage recherchieren (vor dem Entwurf)",
+            "SECURITY.md",
+            "Git-Historie",
+            "Recherche-Inject",
+            "Ohne Quelle kein Fakt",
+            "Die Sitze bleiben offline",
+        ] {
+            assert!(
+                MATRIX_GAME_MASTER_KNOWLEDGE.contains(needle),
+                "matrix-game-master.md: fehlt {needle}"
+            );
+        }
+    }
+
+    /// Runde 9, E4: die Spielleitung nimmt die vorab erteilte Freigabe aus dem
+    /// Auftrag an (Zeile aus `harw_core::user_approval`), die UIA setzt
+    /// `user_approved` nur auf ausdrückliche Aussage der Nutzerin.
+    #[test]
+    fn test_user_approval_is_accepted_by_the_game_master_and_gated_in_the_uia() {
+        assert!(
+            MATRIX_GAME_MASTER_KNOWLEDGE.contains("„Die Nutzerin hat vorab freigegeben: scenario“"),
+            "Regel §3 kennt die Vorab-Freigabe nicht"
+        );
+        assert!(MATRIX_GAME_MASTER_KNOWLEDGE.contains("du fragst nicht erneut"));
+        assert!(UIA_KNOWLEDGE.contains("`user_approved` nur setzen"));
+        assert!(UIA_KNOWLEDGE.contains("ausdrücklich"));
+    }
+
     #[test]
     fn test_knowledge_documents_stay_within_their_byte_budget() {
         assert!(
@@ -3586,6 +3765,24 @@ mod tests {
                 text.len()
             );
         }
+    }
+
+    /// Plan R9, Teil F: jede Rolle, die lange Prozesse startet oder
+    /// verfolgt, kennt `job.start`/`job.wait` statt tmux und Polling.
+    #[test]
+    fn test_role_knowledge_routes_long_processes_to_jobs() {
+        for (name, text) in [
+            ("worker.md", WORKER_KNOWLEDGE),
+            ("uia-worker.md", UIA_WORKER_KNOWLEDGE),
+            ("uia.md", UIA_KNOWLEDGE),
+            ("root-orchestrator.md", ROOT_ORCHESTRATOR_KNOWLEDGE),
+            ("sub-orchestrator.md", SUB_ORCHESTRATOR_KNOWLEDGE),
+        ] {
+            for needle in ["`job.start`", "`job.wait`", "tmux"] {
+                assert!(text.contains(needle), "{name}: fehlt {needle}");
+            }
+        }
+        assert!(WORKER_KNOWLEDGE.contains("`tmux-inspector-worker` ist nur für bestehende"));
     }
 
     /// Runde 5, Teil P: ein `uia-worker` lehnte „0600 + Regressionstest,
@@ -3740,6 +3937,18 @@ mod tests {
                 builtin_organization_knowledge(role),
                 builtin_role_knowledge(role)
             );
+        }
+    }
+
+    /// Plan R9, E1: die UIA gibt Orchestratoren im Plan-Modus nur
+    /// Recherche- und Planungsaufträge (nur lesende Ziele laufen dort).
+    #[test]
+    fn uia_knowledge_names_the_plan_mode_delegation_rule() {
+        for phrase in [
+            "Plan-Modus: Orchestratoren nur Recherche- und Planungsaufträge",
+            "Schreiben/Bauen erst nach Planfreigabe",
+        ] {
+            assert!(UIA_KNOWLEDGE.contains(phrase), "uia.md: fehlt „{phrase}“");
         }
     }
 }

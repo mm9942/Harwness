@@ -1,7 +1,0 @@
-name = "debug-orchestrator"
-role = "child-orchestrator"
-description = "Coordinates reproducible incident triage, diagnosis, remediation, and regression verification."
-system_file = "system.md"
-skills = ["debugging", "incident-response", "verification"]
-timeout_seconds = 300
-max_retries = 1

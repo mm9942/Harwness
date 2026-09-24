@@ -7,6 +7,13 @@ use clap::{Subcommand, ValueHint};
 pub enum AgentAction {
     /// Richtet interaktiv eine neue Benutzeroberflächen-Agentin ein.
     UiaNew,
+    /// Listet die startbaren Agenten (eingebaut und benutzerdefiniert) mit
+    /// Rolle, Herkunft und Beschreibung; optional gefiltert.
+    List {
+        /// Optionaler Suchbegriff (Name oder Beschreibung).
+        #[arg(value_name = "SUCHE", value_hint = ValueHint::Other)]
+        query: Option<String>,
+    },
     /// Verwaltet die Skills des aktiven Profils.
     Skills {
         /// Argumente für die Skill-Verwaltung (z. B. `list`).

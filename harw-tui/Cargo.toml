@@ -34,6 +34,9 @@ harw-tool-shell = { path = "../harw-tool-shell" }
 # Runde 5, Teil F: Plan-Fragekanal (`plan.exit`/`plan.enter`/`ask_user`) und
 # geteilter Plan-Zustand (`/plan show|edit|list|open`, Shift+Tab-Sperre).
 harw-tool-plan = { path = "../harw-tool-plan" }
+# Plan R9, Teil F: Jobs-Gruppe im Agenten-Panel, Detailansicht mit Log-Ende,
+# Beenden-Dialog (stoppen oder ablösen).
+harw-tool-job = { path = "../harw-tool-job" }
 harw-tools = { path = "../harw-tools" }
 harw-session-store = { path = "../harw-session-store" }
 harw-types = { path = "../harw-types" }

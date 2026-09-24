@@ -1,0 +1,108 @@
+# Gemeinsame Basis benutzerdefinierter Child-Orchestratoren (Plan R9, Teil B).
+#
+# Gegenstueck zu `worker-base.toml` fuer die Rolle `child-orchestrator`:
+# Profil- und Projektdefinitionen schreiben
+#
+#   extends = { id = "harwness.agent.child-orchestrator-base@1" }
+#   role = "child-orchestrator"
+#
+# und bekommen damit die read-only Planungsoberflaeche der eingebauten
+# Child-Orchestratoren (`RegistryProfile::Planning` plus `delegate_wave`),
+# `max_depth = 1` (unter ihnen nur Worker) und dasselbe Budget wie
+# `research-orchestrator`/`coding-orchestrator`.
+#
+# Die Basis ist selbst KEINE startbare Rolle (sie steht nicht in
+# `role_names::ALL`); sie ist ein Layer fuer `extends`, genau wie
+# `worker-base`.
+#
+# WICHTIG — Aufgabenteilung zwischen Basis und Kind (siehe `worker-base.toml`):
+# `harw_agent_dsl::resolve` laesst eine Sektion der Basis gewinnen; die
+# gleichnamige Sektion des Kindes wird verworfen. Diese Basis besitzt deshalb
+# `[work]`, `[lifecycle]`, `[context]`, `[tools]`, `[spawn]` und `[return]` —
+# die Rechtedecke ist damit fest; eine gleichnamige Sektion des Kindes wird
+# verworfen. Ein Kind traegt seine Delegationsziele in einer eigenen
+# `[delegation]`-Tabelle, seine Skills im Top-Level-Feld `skills` und seine
+# Arbeitsanweisung per `instructions_file = "system.md"`. Die Laufzeit klemmt
+# jeden benutzerdefinierten
+# Agenten zusaetzlich unter diese Basis (`ExecutableAgentIr::clamped_to`):
+# eine Definition kann ihre Rechte nur verengen, nie erweitern.
+
+schema = "harwness.agent/v1"
+id = "harwness.agent.child-orchestrator-base@1"
+version = "1.0.0"
+role = "child-orchestrator"
+specialization = "child-orchestrator-base"
+
+name = "Harwness Child Orchestrator Base"
+description = "Gemeinsame Planungsoberflaeche, Tiefe und Budget benutzerdefinierter Child-Orchestratoren."
+
+[work]
+mode = "orchestration"
+may_change_plan = false
+may_write_code = false
+may_research_web = false
+aggregates_child_returns = true
+
+[lifecycle]
+allow_pause = false
+allow_rerun = true
+max_attempts = 2
+
+[context]
+program = "orchestrate"
+must_include = ["task.objective", "task.read_scope", "new.trigger_return"]
+exclude = ["full_parent_transcript", "sibling_transcripts"]
+
+[tools]
+admitted = [
+  "fs.read",
+  "fs.list",
+  "fs.search",
+  "fs.glob",
+  "fs.grep",
+  "doc.read_pdf",
+  "deps.graph",
+  "deps.locked",
+  "deps.source_read",
+  "deps.source_search",
+  "deps.source_list",
+  "lens.ask",
+  "explore.tree",
+  "explore.projects",
+  "explore.relations",
+  "explore.find",
+  "delegate_wave",
+  "agent.result",
+  "workbench.show",
+  "diary.read",
+  "palace.search",
+  "palace.recall",
+  "agent.message",
+  "parent.message",
+  # Plan R9, Teil A: Skills nur über den Katalog finden und laden
+  # (`harw_registry_defaults::profile::skill_catalog_tools_for_role`).
+  "skills.search",
+  "skills.load",
+  # Plan R9, Teil F: Jobs der eigenen Worker verfolgen und stoppen (kein
+  # `job.start`; siehe `harw_registry_defaults::profile::job_control_tools_for_role`).
+  "job.status",
+  "job.logs",
+  "job.stop",
+  "job.list",
+  "job.wait",
+]
+forbidden = ["fs.write", "fs.edit", "shell.exec", "web.fetch", "web.search", "web.docs_rs", "web.crates_io"]
+
+[spawn]
+max_depth = 1
+child_orchestrators = []
+
+# Plan R9, Teil C: der Verbrauch der Nachkommen wird angerechnet (siehe
+# `root-orchestrator.toml`); die Deckel bleiben unter denen des Roots.
+[spawn.budget]
+max_tokens = 1000000
+max_tool_calls = 400
+max_wall_secs = 7200
+
+[return]
+contract = "harwness.return.envelope@1"

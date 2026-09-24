@@ -1,7 +1,0 @@
-name = "source-researcher"
-role = "worker"
-description = "Finds primary-source documentation, release notes, and repository evidence."
-system_file = "system.md"
-skills = ["dependency-research"]
-timeout_seconds = 240
-max_retries = 1

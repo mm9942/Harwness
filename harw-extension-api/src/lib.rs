@@ -31,7 +31,8 @@ pub use harw_tools::{
 pub use allow_rules::{AllowRuleSet, ApprovalRule, RuleDecision, RuleScope, derive_shell_rule};
 pub use approval_mode::ApprovalMode;
 pub use capabilities::{
-    AgentSpawnError, AgentSpawner, ChildBudgetExhausted, SpawnFuture, SpawnInput,
+    AgentSpawnError, AgentSpawner, ChildBudgetExhausted, DelegationTargetInfo, DelegationTargets,
+    DelegationUnavailable, SpawnFuture, SpawnInput,
 };
 pub use contributors::{
     ApprovalDecision, ApprovalHandler, ContextProvider, ExtFuture, InstructionsProvider,

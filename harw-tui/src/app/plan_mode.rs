@@ -57,11 +57,20 @@ impl ChatApp {
 
     /// Spiegelt den angezeigten Interaktionsmodus sofort in die Plan-Sperre
     /// (`true` genau in der Stufe `plan`).
+    ///
+    /// Runde 9, E6: zugleich in den Live-Modus des Agentenbaums
+    /// (`ManagedAgentSpawner::live_mode`) — laufende Kinder, auch
+    /// Hintergrund-Kinder, übernehmen ihn an ihrer nächsten Runden-Grenze,
+    /// neue Kinder starten darin. Jeder Moduswechsel der TUI (Shift+Tab,
+    /// `/mode`, Planfreigabe, Start und `/resume`) läuft hier durch.
     pub(crate) fn sync_plan_lock(&self) {
         if let Some(session) = self.plan_ui.session() {
             session
                 .lock()
                 .set(self.active_mode == InteractionMode::Plan);
+        }
+        if let Some(spawner) = self.runtime.as_ref().and_then(|rt| rt.spawner()) {
+            spawner.live_mode().publish(self.active_mode);
         }
     }
 
@@ -396,6 +405,22 @@ mod tests {
         app.cycle_permission_stage(true);
         assert_eq!(app.current_permission_stage(), PermissionCycleStage::Ask);
         assert_ne!(app.active_mode(), InteractionMode::Plan);
+        assert!(!session.lock().is_locked());
+        Ok(())
+    }
+
+    /// Runde 9, E6: startet die Sitzung bereits im Plan-Modus (`--mode plan`,
+    /// `/resume`), fehlt der gemerkte Vormodus. Shift+Tab verlässt `plan`
+    /// trotzdem — nach `work` — statt dort hängen zu bleiben.
+    #[test]
+    fn shift_tab_leaves_a_plan_mode_that_was_active_from_the_start() -> TestResult {
+        let (_temp, mut app, session) = app_with_plan_session()?;
+        app.set_active_mode(InteractionMode::Plan);
+        assert!(session.lock().is_locked());
+
+        app.cycle_permission_stage(false);
+        assert_eq!(app.current_permission_stage(), PermissionCycleStage::Ask);
+        assert_eq!(app.active_mode(), InteractionMode::Work);
         assert!(!session.lock().is_locked());
         Ok(())
     }

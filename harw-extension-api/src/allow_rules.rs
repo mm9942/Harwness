@@ -234,6 +234,9 @@ impl AllowRuleSet {
     ///   token-endständiges `&`, passt er **niemals** auf eine `Allow`-Regel;
     ///   eine `Deny`-Regel prüft in diesem Fall nur das erste, ungefährliche
     ///   Teilstück des Befehls.
+    /// - `tool == "job.start"` (Plan R9, Teil F): wie `shell.exec`, über
+    ///   `command` bzw. das gequotete `argv`; mit gesetztem `env` trifft
+    ///   keine `Allow`-Regel.
     /// - `tool` beginnt mit `"fs."`: `pattern` ist ein Datei-Glob (`*`
     ///   innerhalb eines Pfadsegments, `**` über Segmente hinweg, `?` für ein
     ///   einzelnes Zeichen), ausgewertet gegen das Argument `path`. Enthält
@@ -323,6 +326,22 @@ fn rule_matches_call(rule: &ApprovalRule, tool: &str, arguments: &serde_json::Va
             Some(command) => shell_pattern_matches(pattern, command, rule.decision),
             None => false,
         }
+    } else if tool == JOB_START_TOOL {
+        // Plan R9, Teil F: `job.start` startet einen Shell-Befehl wie
+        // `shell.exec` — dieselbe Präfix-Auswertung über `command` bzw. das
+        // gequotete `argv`. Gesetzte Umgebungsvariablen (`env`) können das
+        // Verhalten des Befehls ändern: eine `Allow`-Regel trifft dann nie.
+        let has_env = arguments
+            .get("env")
+            .and_then(|v| v.as_array())
+            .is_some_and(|env| !env.is_empty());
+        if has_env && rule.decision == RuleDecision::Allow {
+            return false;
+        }
+        match job_start_command(arguments) {
+            Some(command) => shell_pattern_matches(pattern, &command, rule.decision),
+            None => false,
+        }
     } else if tool.starts_with("fs.") {
         match arguments.get("path").and_then(|v| v.as_str()) {
             Some(path) => {
@@ -337,6 +356,55 @@ fn rule_matches_call(rule: &ApprovalRule, tool: &str, arguments: &serde_json::Va
     } else {
         // Andere Werkzeuge: nur pattern=None-Regeln treffen zu, siehe oben.
         false
+    }
+}
+
+/// Name des Job-Startwerkzeugs (`harw-tool-job`, Plan R9 Teil F); hier
+/// dupliziert, weil `harw-tool-job` von diesem Crate abhängt.
+const JOB_START_TOOL: &str = "job.start";
+
+/// Befehlstext eines `job.start`-Aufrufs: `command` oder das mit
+/// Shell-Quoting verbundene `argv` — wortgleich zu
+/// `harw_tool_job::job_start_command_text` (ein Test in `harw-tool-job`
+/// prüft die Übereinstimmung über [`AllowRuleSet::evaluate`]).
+fn job_start_command(arguments: &serde_json::Value) -> Option<String> {
+    let command = arguments
+        .get("command")
+        .and_then(|v| v.as_str())
+        .filter(|command| !command.trim().is_empty());
+    let argv: Option<Vec<&str>> = arguments
+        .get("argv")
+        .and_then(|v| v.as_array())
+        .map(|words| {
+            words
+                .iter()
+                .filter_map(|word| word.as_str())
+                .collect::<Vec<_>>()
+        })
+        .filter(|words| !words.is_empty());
+    match (command, argv) {
+        (Some(command), None) => Some(command.to_owned()),
+        (None, Some(words)) => Some(
+            words
+                .into_iter()
+                .map(quote_word)
+                .collect::<Vec<_>>()
+                .join(" "),
+        ),
+        _ => None,
+    }
+}
+
+/// POSIX-Quoting eines argv-Worts (wie `harw_tool_job::shell_quote`).
+fn quote_word(word: &str) -> String {
+    let safe = !word.is_empty()
+        && word
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || b"_@%+=:,./-".contains(&byte));
+    if safe {
+        word.to_owned()
+    } else {
+        format!("'{}'", word.replace('\'', r"'\''"))
     }
 }
 
@@ -548,6 +616,44 @@ mod tests {
             decision,
             scope,
         }
+    }
+
+    /// Plan R9, Teil F: `job.start` wird wie `shell.exec` ausgewertet —
+    /// über `command` oder das gequotete `argv`; `env` verhindert Allow.
+    #[test]
+    fn test_evaluate_job_start_like_shell_exec() {
+        let rules = AllowRuleSet::new();
+        rules.add(rule(
+            "job.start",
+            Some("cargo build"),
+            RuleDecision::Allow,
+            RuleScope::Session,
+        ));
+        assert_eq!(
+            rules.evaluate("job.start", &json!({"command": "cargo build --release"})),
+            Some(RuleDecision::Allow)
+        );
+        assert_eq!(
+            rules.evaluate("job.start", &json!({"argv": ["cargo", "build", "-p", "x"]})),
+            Some(RuleDecision::Allow)
+        );
+        assert_eq!(
+            rules.evaluate("job.start", &json!({"command": "cargo build; rm -rf /"})),
+            None
+        );
+        assert_eq!(
+            rules.evaluate(
+                "job.start",
+                &json!({"command": "cargo build", "env": ["RUSTC_WRAPPER=/tmp/x"]})
+            ),
+            None
+        );
+        assert_eq!(rules.evaluate("job.start", &json!({"name": "x"})), None);
+        // Eine `shell.exec`-Regel gilt nicht für `job.start`.
+        assert_eq!(
+            rules.evaluate("shell.exec", &json!({"command": "cargo build"})),
+            None
+        );
     }
 
     #[test]

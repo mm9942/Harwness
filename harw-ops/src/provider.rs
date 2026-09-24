@@ -281,6 +281,11 @@ fn configured_auth_status_label(provider: &harw_config::ProviderToml) -> &'stati
 pub(crate) fn resolved_config(
     ctx: &OpContext,
 ) -> Result<Arc<harw_config::ResolvedConfig>, OpError> {
+    // Live-Stand zuerst: er enthält alle seit dem Start gespeicherten
+    // Änderungen (auch solche aus demselben Kontext).
+    if let Some(live) = ctx.service::<crate::live_config::SharedLiveConfig>() {
+        return Ok(live.current());
+    }
     if let Some(config) = ctx.service::<Arc<harw_config::ResolvedConfig>>() {
         return Ok(Arc::clone(config));
     }

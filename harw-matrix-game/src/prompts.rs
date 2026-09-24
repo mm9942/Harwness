@@ -984,7 +984,9 @@ fn render_kind(kind: &EntryKind, me: &Seat) -> String {
         EntryKind::WorldDelta { var, from, to, .. } => {
             format!("`{var}`: {} → {}", from.display(), to.display())
         }
-        EntryKind::FactAdded { text } => format!("Lage: {}", text.trim()),
+        EntryKind::FactAdded { text, sources } => {
+            format!("Lage: {}", crate::state::sourced_fact_text(text, sources))
+        }
         EntryKind::OngoingStarted { ongoing } => {
             format!("Fortwirkender Effekt `{}`: {}", ongoing.id, ongoing.text)
         }
@@ -1156,11 +1158,13 @@ fn situation_section(view: &SeatView, me: &Seat, out: &mut String) {
             var_scope(&var.visibility, me)
         );
     }
-    let situation: Vec<&str> = view
+    let situation: Vec<String> = view
         .entries()
         .iter()
         .filter_map(|e| match &e.kind {
-            EntryKind::FactAdded { text } if e.round == 0 => Some(text.trim()),
+            EntryKind::FactAdded { text, sources } if e.round == 0 => {
+                Some(crate::state::sourced_fact_text(text, sources))
+            }
             _ => None,
         })
         .collect();

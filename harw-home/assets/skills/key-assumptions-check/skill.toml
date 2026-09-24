@@ -1,0 +1,4 @@
+name = "key-assumptions-check"
+description = "Tragende Annahmen einer Analyse offenlegen und prüfen: stillschweigende Voraussetzungen finden, Belastbarkeit bewerten, Kipp-Annahmen markieren, Beobachtungspunkte festlegen (key assumptions check, hidden premises, mindset, linchpin assumptions)."
+instructions_file = "instructions.md"
+tools = ["filesystem.read"]

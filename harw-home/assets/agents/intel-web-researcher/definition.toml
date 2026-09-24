@@ -1,0 +1,33 @@
+# Web-Rechercheur der Analyse-Familie (Plan R9, Matrix-Game mit Internet).
+#
+# Benutzerdefinierter Worker auf der eingebauten Rolle `researcher-web@1`.
+# Die Laufzeit klemmt ihn unter deren Rechtedecke
+# (`harw_registry_defaults::roster`): Registry-Profil `Research`, nur
+# `web.search`/`web.fetch`/`web.docs_rs`/`web.crates_io`, `parent.message`
+# und der Skill-Katalog — kein Workspace-Zugriff (`fs.*`, `deps.*`,
+# `lens.ask` sind in der Basis verboten), keine Shell, keine Kinder. Werkzeuge,
+# Spawn-Tiefe, Budget, Rückgabevertrag und Kontextprogramm besitzt die Basis;
+# eigene Tabellen gleichen Namens würden beim Auflösen verworfen.
+#
+# Netz: egress-gebunden an `[network]` — im Modus `allowlist` nur die
+# gelisteten Hosts (leer = kein Netz), mit `[network].research_web = "open"`
+# jeder öffentliche Host, nur lesend; die erste Anfrage je Domain fragt unter
+# `ask`/`auto` die Nutzerin. Private, Loopback- und Link-Local-Ziele nie.
+#
+# Die Arbeitsanweisung steht in `system.md` (`instructions_file`); fest
+# gebunden ist nur `evidence-quality-review`, die übrigen Methoden-Skills
+# (`osint-web-research`, `competing-hypotheses`, `confidence-and-uncertainty`,
+# `key-assumptions-check`) lädt der Agent bei Bedarf über `skills.load`.
+
+schema = "harwness.agent/v1"
+id = "harwness.agent.intel-web-researcher@1"
+version = "1.0.0"
+extends = { id = "harwness.agent.researcher-web@1" }
+role = "worker"
+specialization = "intel-web-researcher"
+
+name = "Intel Web Researcher"
+description = "Beantwortet eine eng gefasste Rechercheaufgabe aus dem offenen Web: Primärquellen zuerst, jede Aussage mit URL, Abrufdatum und Einstufung von Quelle und Information, Gegenquellen benannt, Fakt/Behauptung/Annahme getrennt, keine erfundenen Zahlen; liefert ein kompaktes Evidenzpaket. Kein Workspace-Zugriff."
+instructions_file = "system.md"
+
+skills = ["evidence-quality-review"]

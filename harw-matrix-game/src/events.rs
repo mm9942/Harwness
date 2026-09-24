@@ -190,8 +190,12 @@ pub fn events_for_entry(entry: &GameEntry) -> Vec<MatrixGameEvent> {
         )],
         EntryKind::SecretArgumentAnnounced { text, .. }
         | EntryKind::Forfeit { text, .. }
-        | EntryKind::FactAdded { text }
         | EntryKind::InjectApplied { text, .. } => vec![message(None, None, text.clone())],
+        EntryKind::FactAdded { text, sources } => vec![message(
+            None,
+            None,
+            crate::state::sourced_fact_text(text, sources),
+        )],
         EntryKind::Narrated { text, .. } => vec![message(Some(Seat::Umpire), None, text.clone())],
         EntryKind::DiceRolled { roll } => vec![MatrixGameEvent::DiceRolled {
             round,

@@ -43,6 +43,7 @@ pub mod list;
 pub mod provider;
 pub mod read;
 pub mod search;
+pub mod symlink;
 #[cfg(test)]
 mod test_support;
 mod tree;

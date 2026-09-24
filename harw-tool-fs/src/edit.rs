@@ -35,6 +35,7 @@
 //! Kein Panic.
 
 use crate::error::FsToolError;
+use crate::symlink::resolve_for_write;
 use crate::tree::{MAX_SCAN_FILE_BYTES, Workspace, normalize_relative, open_file_in, read_bounded};
 use crate::write::protected_component;
 use harw_authority::Permission;
@@ -138,6 +139,19 @@ impl FsEditExecutor {
             Ok(rel) => rel,
             Err(reason) => return Ok(ToolOutput::error(format!("fs.edit: {reason}"))),
         };
+        // Symlinks im Pfad nur folgen, wenn das Ziel im Workspace bleibt
+        // (siehe `crate::symlink`); der Schutzbereich gilt für das Ziel.
+        let relative =
+            match resolve_for_write(ctx.sandbox().workspace().canonical_root(), &relative) {
+                Ok(resolved) => resolved,
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => relative,
+                Err(err) => {
+                    return Ok(ToolOutput::error(format!(
+                        "fs.edit: '{}': {err}",
+                        args.path
+                    )));
+                }
+            };
         if let Some(protected) = protected_component(&relative) {
             return Ok(ToolOutput::error(format!(
                 "fs.edit: '{}' liegt im geschützten Bereich '{protected}/' und wird nicht \
@@ -161,8 +175,7 @@ impl FsEditExecutor {
             Ok(parent) => parent,
             Err(err) => {
                 return Ok(ToolOutput::error(format!(
-                    "fs.edit: Elternverzeichnis von '{}' ist nicht nutzbar \
-                     (Symlinks werden nicht verfolgt): {err}",
+                    "fs.edit: Elternverzeichnis von '{}' ist nicht nutzbar: {err}",
                     args.path
                 )));
             }
@@ -172,7 +185,7 @@ impl FsEditExecutor {
             Err(err) => {
                 return Ok(ToolOutput::error(format!(
                     "fs.edit: '{}' kann nicht geöffnet werden (die Datei muss existieren und \
-                     eine reguläre Datei sein; Symlinks werden nicht verfolgt): {err}",
+                     eine reguläre Datei sein): {err}",
                     args.path
                 )));
             }
@@ -548,7 +561,12 @@ mod tests {
                 &fixture,
                 serde_json::json!({ "path": path, "old_string": SECRET, "new_string": "x" }),
             )?;
-            assert!(!render(&output)?.contains(&outside), "{path}: {output:?}");
+            let rendered = render(&output)?;
+            assert!(
+                rendered.contains("Symlink zeigt außerhalb des Arbeitsbereichs")
+                    && rendered.contains(&outside),
+                "{path}: die Ablehnung nennt das Ziel: {rendered}"
+            );
             expect_error(output)?;
         }
         assert_eq!(

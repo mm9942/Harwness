@@ -35,6 +35,7 @@
 //! Permission-Fehler → `Ok(ToolOutput::error(...))`. Kein Panic.
 
 use crate::error::FsToolError;
+use crate::symlink::resolve_for_write;
 use crate::tree::{Workspace, normalize_relative};
 use harw_authority::Permission;
 use harw_fsutil::{AtomicWriteOptions, write_atomic};
@@ -134,6 +135,21 @@ impl FsWriteExecutor {
             Ok(rel) => rel,
             Err(reason) => return Ok(ToolOutput::error(format!("fs.write: {reason}"))),
         };
+        // Symlinks im Pfad (auch als letztes Glied) nur folgen, wenn das Ziel
+        // im Workspace bleibt (siehe `crate::symlink`); der Schutzbereich gilt
+        // danach für das aufgelöste Ziel. Ein fehlendes Glied fällt unten in
+        // die bisherige Meldung („Verzeichnisse werden nicht angelegt“).
+        let relative =
+            match resolve_for_write(ctx.sandbox().workspace().canonical_root(), &relative) {
+                Ok(resolved) => resolved,
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => relative,
+                Err(err) => {
+                    return Ok(ToolOutput::error(format!(
+                        "fs.write: '{}': {err}",
+                        args.path
+                    )));
+                }
+            };
         if let Some(protected) = protected_component(&relative) {
             return Ok(ToolOutput::error(format!(
                 "fs.write: '{}' liegt im geschützten Bereich '{protected}/' und wird nicht \
@@ -158,7 +174,7 @@ impl FsWriteExecutor {
             Err(err) => {
                 return Ok(ToolOutput::error(format!(
                     "fs.write: Elternverzeichnis von '{}' ist nicht nutzbar \
-                     (Symlinks werden nicht verfolgt, Verzeichnisse nicht angelegt): {err}",
+                     (Verzeichnisse werden nicht angelegt): {err}",
                     args.path
                 )));
             }
@@ -429,12 +445,9 @@ mod tests {
     }
 
     #[test]
-    fn test_fs_write_replaces_target_symlink_without_following() -> TestResult {
-        use std::os::unix::fs::PermissionsExt;
-
+    fn test_fs_write_refuses_target_symlink_pointing_outside() -> TestResult {
         let fixture = Fixture::new()?;
         let secret = fixture.outside.join("secret.txt");
-        fs::set_permissions(&secret, fs::Permissions::from_mode(0o600))?;
         fixture.plant_escapes()?;
         let ctx = fixture.ctx(vec![Permission::WriteWorkspace])?;
 
@@ -443,24 +456,76 @@ mod tests {
             serde_json::json!({ "path": "link_file", "content": "neu" }),
         );
         let output = FsWriteExecutor.write_file(&ctx, &call)?;
-        assert!(matches!(output, ToolOutput::Text { .. }), "{output:?}");
+        assert!(matches!(output, ToolOutput::Error { .. }), "{output:?}");
+        let rendered = render(&output)?;
+        assert!(
+            rendered.contains("Symlink zeigt außerhalb des Arbeitsbereichs"),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains(&secret.display().to_string()),
+            "die Meldung nennt das Ziel: {rendered}"
+        );
         assert_eq!(
             fs::read_to_string(&secret)?,
             SECRET,
             "Ziel darf unberührt bleiben"
         );
-        let replaced = fixture.ws.join("link_file");
-        let meta = fs::symlink_metadata(&replaced)?;
         assert!(
-            meta.file_type().is_file(),
-            "Symlink muss durch Datei ersetzt sein"
+            fs::symlink_metadata(fixture.ws.join("link_file"))?
+                .file_type()
+                .is_symlink(),
+            "der Symlink bleibt unangetastet"
         );
-        assert_eq!(fs::read_to_string(&replaced)?, "neu");
-        assert_eq!(
-            meta.permissions().mode() & 0o777,
-            0o644,
-            "keine Mode-Kopie vom Symlink-Ziel"
+        Ok(())
+    }
+
+    #[test]
+    fn test_fs_write_follows_symlink_inside_workspace() -> TestResult {
+        let fixture = Fixture::new()?;
+        fs::create_dir_all(fixture.ws.join("real"))?;
+        fs::write(fixture.ws.join("real/target.txt"), "alt")?;
+        std::os::unix::fs::symlink("real/target.txt", fixture.ws.join("file_link"))?;
+        std::os::unix::fs::symlink("real", fixture.ws.join("dir_link"))?;
+        let ctx = fixture.ctx(vec![Permission::WriteWorkspace])?;
+
+        for (path, file) in [("file_link", "target.txt"), ("dir_link/new.txt", "new.txt")] {
+            let call = call(
+                "fs.write",
+                serde_json::json!({ "path": path, "content": "neu" }),
+            );
+            let output = FsWriteExecutor.write_file(&ctx, &call)?;
+            assert!(
+                matches!(output, ToolOutput::Text { .. }),
+                "{path}: {output:?}"
+            );
+            assert_eq!(
+                fs::read_to_string(fixture.ws.join("real").join(file))?,
+                "neu"
+            );
+        }
+        assert!(
+            fs::symlink_metadata(fixture.ws.join("file_link"))?
+                .file_type()
+                .is_symlink(),
+            "der Symlink selbst bleibt ein Symlink"
         );
+        Ok(())
+    }
+
+    #[test]
+    fn test_fs_write_through_symlink_into_protected_area_is_refused() -> TestResult {
+        let fixture = Fixture::new()?;
+        fs::create_dir_all(fixture.ws.join(".git"))?;
+        std::os::unix::fs::symlink(".git", fixture.ws.join("gitlink"))?;
+        let ctx = fixture.ctx(vec![Permission::WriteWorkspace])?;
+        let call = call(
+            "fs.write",
+            serde_json::json!({ "path": "gitlink/config", "content": "x" }),
+        );
+        let output = FsWriteExecutor.write_file(&ctx, &call)?;
+        assert!(matches!(output, ToolOutput::Error { .. }), "{output:?}");
+        assert!(!fixture.ws.join(".git/config").exists());
         Ok(())
     }
 
@@ -470,10 +535,10 @@ mod tests {
         fixture.plant_escapes()?;
         let ctx = fixture.ctx(vec![Permission::WriteWorkspace])?;
 
+        // `loop` (-> `.`) und `nested/up` (-> `..`) bleiben im Workspace und
+        // werden gefolgt; alles andere führt hinaus oder fehlt.
         let escapes = [
             "link_dir/planted.txt",
-            "loop/planted.txt",
-            "nested/up/planted.txt",
             "../planted.txt",
             "/tmp/planted.txt",
             "missing/planted.txt",
@@ -488,14 +553,23 @@ mod tests {
                 matches!(output, ToolOutput::Error { .. }),
                 "{path}: {output:?}"
             );
-            let outside = fixture
-                .outside
-                .to_str()
-                .ok_or(TestError::Missing("outside as str"))?;
-            assert!(!render(&output)?.contains(outside));
+            assert!(!render(&output)?.contains(SECRET));
         }
         assert!(!fixture.outside.join("planted.txt").exists());
         assert!(!fixture.ws.join("planted.txt").exists());
+        for path in ["loop/planted.txt", "nested/up/planted.txt"] {
+            let call = call(
+                "fs.write",
+                serde_json::json!({ "path": path, "content": "x" }),
+            );
+            let output = FsWriteExecutor.write_file(&ctx, &call)?;
+            assert!(
+                matches!(output, ToolOutput::Text { .. }),
+                "{path}: {output:?}"
+            );
+        }
+        assert!(fixture.ws.join("planted.txt").exists(), "innen gefolgt");
+        assert!(!fixture.outside.join("planted.txt").exists());
         assert!(
             !fixture.ws.join("missing").exists(),
             "Elternverzeichnisse werden nicht angelegt"

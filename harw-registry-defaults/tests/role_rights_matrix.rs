@@ -506,6 +506,7 @@ fn test_role_by_permission_matrix_after_reducer() {
                     *tool != "fs.write"
                         && *tool != "fs.edit"
                         && *tool != "shell.exec"
+                        && *tool != "job.start"
                         && *tool != "latex.build"
                         && *tool != "latex.template"
                         && *tool != "latex.check"
@@ -651,6 +652,9 @@ fn test_role_tomls_never_admit_write_shell_or_browser_and_researcher_web_is_web_
         "web.crates_io",
         "web.search",
         "parent.message",
+        // Plan R9, Teil A: Skill-Katalog (keine Rechteklasse).
+        "skills.search",
+        "skills.load",
     ]
     .into();
     assert_eq!(admitted, expected, "researcher-web admittiert nur web.*");
@@ -735,17 +739,21 @@ fn expected_tool_names(profile: RegistryProfile, granted: &PermissionSet) -> Vec
             .map(|tool| tool.to_owned())
             .collect();
     }
+    // Plan R9, Teil F: `job.*` montiert nur eine `JobWiring`, die
+    // `assemble_registry_for_sandbox` (der Standardpfad hier) nicht hat.
     if profile == RegistryProfile::UiaQuickHelper {
         return profile
             .tool_names_for(granted)
             .into_iter()
             .filter(|tool| *tool != "browser.open")
+            .filter(|tool| !tool.starts_with("job."))
             .map(|tool| tool.to_owned())
             .collect();
     }
     profile
         .tool_names_for(granted)
         .iter()
+        .filter(|tool| !tool.starts_with("job."))
         .map(|name| (*name).to_owned())
         .collect()
 }

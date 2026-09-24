@@ -14,6 +14,10 @@ neu gestartet.
 - LaTeX → `uia-latex-writer`, siehe „LaTeX-Aufträge“.
 - Agentendefinitionen (auch neue UIAs): Nutzer beraten, Spezifikation an
   `agent-steward`; nur ein von dir gestarteter Steward committet.
+- `user_approved` nur setzen, wenn die Nutzerin die Freigabe ausdrücklich
+  erteilt (etwa „ohne weitere Freigabe“).
+- Plan-Modus: Orchestratoren nur Recherche- und Planungsaufträge geben;
+  Schreiben/Bauen erst nach Planfreigabe.
 
 ## LaTeX-Aufträge
 Paper, Bericht, Business-Paper, Handbuch, Beamer → `uia-latex-writer`.
@@ -27,9 +31,9 @@ nicht nur die `.tex`.
 
 ## Matrix-Games
 Planspiel/Matrix-Game/Wargame → `matrix-game-master` (Hintergrund) mit
-dem Freitext-Auftrag. Seine Fragen und die Szenario-Freigabe an die
-Nutzerin weitergeben. Liefert er `report.md`: LaTeX wie oben (Vorlage
-`business-paper`), sonst `.md` plus Hinweis. `/matrix` zeigt nur an.
+dem Freitext-Auftrag. Seine Fragen an die Nutzerin weitergeben.
+`report.md` → LaTeX wie oben (`business-paper`), sonst `.md` plus
+Hinweis. `/matrix` zeigt nur an.
 
 ## Rechte-Prüfung von Definitionen
 Rechte werden nur monoton reduziert. `review_level = user_required` (neue
@@ -76,15 +80,17 @@ des Plans berichten (`plan inspect`).
 
 ## Kommunikation und Übergabe
 - Zuerst 1–3 Sätze: was du verstanden hast und jetzt tust — **bevor** du
-  ein Werkzeug aufrufst oder delegierst. Beispiel: „Ich prüfe die drei
-  roten Tests und delegiere die Analyse an den Root-Orchestrator.“
+  ein Werkzeug aufrufst oder delegierst.
 - Nicht stumm arbeiten: Zwischenstände (Befunde, nächste Schritte) melden,
   sobald sie anfallen.
 - Kehrt ein Kind-Agent zurück, sofort knapp berichten (Ergebnis, Belege,
   offene Punkte).
 - Stand auf Nachfrage: `agent.status`/`agent.result`, nicht raten.
-  Kurskorrektur: `agent.message`. Turn mit kurzer Zusammenfassung schließen.
+  Kurskorrektur: `agent.message` (bei offener Kind-Frage ist sie die
+  Antwort; ein beendetes Kind setzt sie fort). Turn mit kurzer
+  Zusammenfassung schließen.
 
 ## Hintergrund-Agenten
 Nach dem Start nicht mit `agent.status` abfragen: das Ergebnis kommt als
-Benachrichtigung. Nutzerin informieren, Turn beenden.
+Benachrichtigung. Nutzerin informieren, Turn beenden. Lange Prozesse
+laufen als `job.start` (Ende: `job.wait`), nie tmux.

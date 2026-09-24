@@ -1,0 +1,4 @@
+name = "feedback-loops-and-thresholds"
+description = "Komplexe Systeme strukturell analysieren: verstärkende und ausgleichende Rückkopplungen, Kipppunkte und Schwellen, Kaskaden, Verschiedenartigkeit der Akteure, kompliziert vs. komplex, Hebelpunkte; Struktur statt Simulation (feedback loops, tipping points, thresholds, heterogeneity, emergence, systems thinking)."
+instructions_file = "instructions.md"
+tools = ["filesystem.read"]

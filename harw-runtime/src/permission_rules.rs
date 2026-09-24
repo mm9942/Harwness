@@ -51,7 +51,9 @@ impl LearnKey {
     #[must_use]
     pub fn display(&self) -> String {
         match (&self.pattern, self.tool.as_str()) {
-            (Some(pattern), "shell.exec") => format!("{} {pattern} *", self.tool),
+            (Some(pattern), "shell.exec" | harw_tool_job::JOB_START_TOOL) => {
+                format!("{} {pattern} *", self.tool)
+            }
             (Some(pattern), _) => format!("{} {pattern}", self.tool),
             (None, _) => format!("{} (alle Aufrufe)", self.tool),
         }
@@ -97,6 +99,20 @@ pub fn learn_key_for(call: &ToolCall) -> Option<LearnKey> {
     let pattern = if tool == "shell.exec" {
         let command = call.arguments.get("command").and_then(|v| v.as_str())?;
         Some(derive_shell_rule(command)?)
+    } else if tool == harw_tool_job::JOB_START_TOOL {
+        // Plan R9, Teil F: `job.start` wie `shell.exec` — Muster aus
+        // `command` bzw. dem gequotetem `argv`. Mit gesetztem `env` gibt es
+        // kein Angebot (eine Allow-Regel träfe solche Aufrufe ohnehin nie).
+        let has_env = call
+            .arguments
+            .get("env")
+            .and_then(|v| v.as_array())
+            .is_some_and(|env| !env.is_empty());
+        if has_env {
+            return None;
+        }
+        let command = harw_tool_job::job_start_command_text(&call.arguments)?;
+        Some(derive_shell_rule(&command)?)
     } else if tool.starts_with("fs.") {
         let path = call.arguments.get("path").and_then(|v| v.as_str())?;
         Some(directory_glob(path)?)
@@ -189,6 +205,49 @@ mod tests {
 
     fn shell(command: &str) -> ToolCall {
         call("shell.exec", json!({ "command": command }))
+    }
+
+    /// Plan R9, Teil F: `job.start` lernt wie `shell.exec` — aus `command`
+    /// oder dem gequoteten `argv`; mit `env` gibt es kein Angebot.
+    #[test]
+    fn job_start_is_learned_like_shell_exec() {
+        let by_command = learn_key_for(&call(
+            "job.start",
+            json!({"command": "cargo test -p a", "name": "t"}),
+        ));
+        let by_argv = learn_key_for(&call(
+            "job.start",
+            json!({"argv": ["cargo", "test", "--workspace"], "name": "t"}),
+        ));
+        let shell_key = learn_key_for(&shell("cargo test -p a"));
+        assert_eq!(
+            by_command.as_ref().map(|key| key.pattern.clone()),
+            shell_key.as_ref().map(|key| key.pattern.clone())
+        );
+        assert_eq!(
+            by_command.as_ref().map(LearnKey::display),
+            Some("job.start cargo test *".to_owned())
+        );
+        assert_eq!(by_argv, by_command);
+        assert_eq!(
+            learn_key_for(&call(
+                "job.start",
+                json!({"command": "cargo test", "env": ["RUSTFLAGS=-Cx"], "name": "t"})
+            )),
+            None
+        );
+        // Die angebotene Regel trifft danach tatsächlich `job.start`.
+        let rules = harw_extension_api::allow_rules::AllowRuleSet::new();
+        if let Some(key) = by_command {
+            rules.add(LearnOffer { key, approvals: 3 }.rule(RuleScope::Session));
+        }
+        assert_eq!(
+            rules.evaluate(
+                "job.start",
+                &json!({"command": "cargo test -p z", "name": "t"})
+            ),
+            Some(RuleDecision::Allow)
+        );
     }
 
     /// Das Angebot erscheint erst beim dritten gleichartigen Aufruf.

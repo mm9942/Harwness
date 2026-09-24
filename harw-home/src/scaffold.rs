@@ -478,7 +478,7 @@ mod tests {
             std::env::temp_dir().join(format!("harw-home-scaffold-{}", uuid::Uuid::now_v7()));
         ensure_home_with_profile(&home, "foo").map_err(ctx("scaffold home"))?;
 
-        let stale = home.join("agents").join("debugger").join("agent.toml");
+        let stale = home.join("agents").join("debugger").join("definition.toml");
         let customized = home.join("agents").join("debugger").join("system.md");
         let old_contents = "# alte mitgelieferte Fassung\n";
         std::fs::write(&stale, old_contents).map_err(ctx("simulate old bundle file"))?;
@@ -486,8 +486,8 @@ mod tests {
             .map_err(ctx("simulate user customization"))?;
         // Das Manifest führt für beide Dateien eine ältere Fassung als
         // installiert: genau die Lage nach einem Update des Binarys. Für
-        // `agent.toml` ist das auch der aktuelle Inhalt (unverändert), für
-        // `system.md` nicht (von der Nutzerin geändert).
+        // `definition.toml` ist das auch der aktuelle Inhalt (unverändert),
+        // für `system.md` nicht (von der Nutzerin geändert).
         let manifest_path = home.join(crate::bundle_manifest::BUNDLE_MANIFEST_FILE);
         let mut manifest =
             std::fs::read_to_string(&manifest_path).map_err(ctx("read bundle manifest"))?;
@@ -500,7 +500,7 @@ mod tests {
                     "bundled debugger file",
                 ))
         };
-        let agent_toml = bundled("agents/debugger/agent.toml")?;
+        let agent_toml = bundled("agents/debugger/definition.toml")?;
         let system_md = bundled("agents/debugger/system.md")?;
         manifest = manifest.replace(
             &sha256_hex_for_test(agent_toml),
@@ -552,13 +552,38 @@ mod tests {
         let resolved = harw_config::discover_config(&[home.clone(), report.profile_dir.clone()])
             .map_err(ctx("discovery over home and profile layer must succeed"))?;
 
+        // Plan R9, Teil B: die mitgelieferten Agenten sind DSL-Definitionen
+        // (`definition.toml`, erweitern eingebaute Basen); nur
+        // `coding-orchestrator` bleibt ein Legacy-`agent.toml` (Skill-Bindung
+        // der gleichnamigen eingebauten Rolle).
         assert!(resolved.agents.contains_key("coding-orchestrator"));
-        assert!(resolved.agents.contains_key("rust-implementer"));
         assert_eq!(
             resolved.agents.len(),
-            23,
-            "22 Bundle-Agenten plus der Profil-Default-Worker"
+            2,
+            "coding-orchestrator plus der Profil-Default-Worker"
         );
+        let implementer = resolved
+            .executable_agents
+            .get("harwness.agent.rust-implementer@1")
+            .ok_or(crate::test_support::TestError::Missing("rust-implementer"))?;
+        assert_eq!(implementer.specialization(), "rust-implementer");
+        let meta = resolved
+            .agent_definition_meta
+            .get("harwness.agent.rust-implementer@1")
+            .ok_or(crate::test_support::TestError::Missing(
+                "rust-implementer meta",
+            ))?;
+        assert!(
+            meta.instructions
+                .as_deref()
+                .is_some_and(|text| !text.trim().is_empty()),
+            "system.md wird über instructions_file geladen"
+        );
+        let bundled_definitions = crate::bundle::bundled_files()
+            .iter()
+            .filter(|file| file.relative_path.ends_with("/definition.toml"))
+            .count();
+        assert_eq!(resolved.executable_agents.len(), bundled_definitions);
 
         std::fs::remove_dir_all(&home).map_err(ctx("remove temporary scaffold"))?;
         Ok(())

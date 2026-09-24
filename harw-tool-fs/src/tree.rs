@@ -5,6 +5,10 @@
 //!   werden **relativ zu diesem Deskriptor** über
 //!   [`harw_fsutil::open_beneath`] geöffnet (`RESOLVE_BENEATH |
 //!   RESOLVE_NO_SYMLINKS`). Kein Pfadglied darf ein Symlink sein.
+//!   Den vom Modell genannten **Startpfad** lösen die Tools vorher über
+//!   [`crate::symlink`] auf (Symlinks nach innen frei, nach außen nur mit
+//!   Freigabe, Schreiben nur nach innen); geöffnet wird danach wieder strikt
+//!   symlinkfrei (Details und TOCTOU-Argument dort).
 //! - [`walk_tree`]: begrenzter Tiefensuche-Walk auf Basis von
 //!   [`harw_fsutil::walk_beneath`]. Jedes Verzeichnis wird einzeln mit
 //!   `max_depth = 1` gelesen; Unterverzeichnisse werden relativ zum
@@ -173,6 +177,20 @@ impl Workspace {
     /// Fehler von [`open_beneath`] (z. B. `ELOOP` bei Symlinks).
     pub fn open_any(&self, rel: &Path) -> io::Result<File> {
         open_beneath(self.dir.as_fd(), beneath_arg(rel), OpenMode::read_only())
+    }
+
+    /// Kanonischer Pfad dieser Wurzel.
+    #[must_use]
+    pub fn root(&self) -> &Path {
+        &self.root
+    }
+
+    /// Metadaten des geöffneten Wurzel-Deskriptors (`fstat`).
+    ///
+    /// # Errors
+    /// Fehler von `fstat`.
+    pub fn root_metadata(&self) -> io::Result<std::fs::Metadata> {
+        self.dir.metadata()
     }
 
     /// Öffnet das Verzeichnis `rel` symlinkfrei unterhalb der Wurzel.

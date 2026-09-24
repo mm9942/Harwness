@@ -11,6 +11,7 @@ rust-version.workspace = true
 tracing = "0.1"
 harw-authority = { path = "../harw-authority" }
 harw-agent-dsl = { path = "../harw-agent-dsl" }
+harw-catalog = { path = "../harw-catalog" }
 # `[network]`-Sektion (`NetworkSection::researcher_web_hosts`) als einzige
 # Quelle des Netz-Scopes der Rolle `researcher-web` (W5 RD, Annahme A5).
 harw-config = { path = "../harw-config" }
@@ -31,6 +32,9 @@ harw-tool-doc = { version = "0.3.0", path = "../harw-tool-doc" }
 harw-tool-fs = { path = "../harw-tool-fs" }
 harw-tool-lens = { path = "../harw-tool-lens" }
 harw-tool-shell = { path = "../harw-tool-shell" }
+# Plan R9, Teil F: `job.*` (Hintergrund-Jobs statt tmux) neben `shell.exec`,
+# mit geklontem `ShellToolProvider` (gleiche Rechte, Freigaben, Host-Lease).
+harw-tool-job = { path = "../harw-tool-job" }
 # Runde 5, Teil F: Namen und Rechteklasse der Plan-Werkzeuge (`plan.*`,
 # `ask_user`) für `authority::tool_permission` und die Standardpolitik.
 # Kein Zyklus: `harw-tool-plan` hängt nicht von dieser Crate ab.

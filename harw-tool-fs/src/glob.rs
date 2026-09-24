@@ -37,9 +37,9 @@
 //! alle in `Ok(ToolOutput::error(...))`. Kein Panic.
 
 use crate::blocking::run_blocking;
+use crate::symlink::open_start;
 use crate::tree::{
-    HARD_MAX_RESULTS, MAX_OUTPUT_BYTES, StopReason, WalkOptions, Workspace, normalize_relative,
-    walk_tree,
+    HARD_MAX_RESULTS, MAX_OUTPUT_BYTES, StopReason, WalkOptions, normalize_relative, walk_tree,
 };
 use globset::GlobBuilder;
 use harw_fsutil::EntryType;
@@ -148,9 +148,15 @@ fn glob_blocking(root: &Path, args: &GlobArgs) -> ToolOutput {
         }
     };
 
-    let workspace = match Workspace::open(root) {
-        Ok(workspace) => workspace,
-        Err(err) => return ToolOutput::error(format!("fs.glob: Workspace nicht lesbar: {err}")),
+    // Symlinks im Startpfad: nach innen frei, nach außen nur mit Freigabe
+    // (siehe `crate::symlink`); der Walk startet am aufgelösten Pfad.
+    let (workspace, start_rel) = match open_start(root, &start_rel, "fs.glob", start_input) {
+        Ok(start) => (start.workspace, start.rel),
+        Err(err) => {
+            return ToolOutput::error(format!(
+                "fs.glob: '{start_input}' ist kein lesbares Verzeichnis: {err}"
+            ));
+        }
     };
     // `clamp(1, HARD_MAX_RESULTS)`: mindestens ein Treffer, höchstens die
     // harte Obergrenze — auch wenn der Aufrufer etwas Riesiges angibt.
@@ -188,9 +194,8 @@ fn glob_blocking(root: &Path, args: &GlobArgs) -> ToolOutput {
         Ok(stop) => stop,
         Err(err) => {
             return ToolOutput::error(format!(
-                "fs.glob: '{start_input}' ist kein lesbares Verzeichnis \
-                 (Symlinks werden nicht verfolgt): {err}; erwartet ein Verzeichnis; für \
-                 einzelne Dateien fs.read oder fs.grep verwenden"
+                "fs.glob: '{start_input}' ist kein lesbares Verzeichnis: {err}; erwartet ein \
+                 Verzeichnis; für einzelne Dateien fs.read oder fs.grep verwenden"
             ));
         }
     };
@@ -476,7 +481,7 @@ mod tests {
         let matches = extract_matches(output)?;
         assert_eq!(matches, vec!["nested/own.rs".to_owned()]);
 
-        for path in ["link_dir", "loop", "nested/up", "../outside"] {
+        for path in ["link_dir", "../outside"] {
             let args = glob_args("**/*", Some(path), None);
             let output = fs_glob(&ctx, args).await?;
             assert!(
@@ -484,6 +489,14 @@ mod tests {
                 "{path}: {output:?}"
             );
             assert!(!render(&output)?.contains(SECRET));
+        }
+        // Startpfade, deren Symlink-Ziel im Workspace bleibt (`loop` -> `.`,
+        // `nested/up` -> `..` = Wurzel), werden aufgelöst; der Walk selbst
+        // folgt weiterhin keinem Symlink.
+        for path in ["loop", "nested/up"] {
+            let args = glob_args("**/*", Some(path), None);
+            let matches = extract_matches(fs_glob(&ctx, args).await?)?;
+            assert_eq!(matches, vec!["nested/own.rs".to_owned()], "{path}");
         }
         Ok(())
     }

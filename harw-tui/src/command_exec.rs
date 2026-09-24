@@ -2363,6 +2363,8 @@ mod tests {
         ("exit", "deferred", ""),
         ("export", "deferred", ""),
         ("help", "immediate", ""),
+        // Plan R9, Teil F: `/jobs` (lesen, stoppen) läuft sofort.
+        ("jobs", "immediate", ""),
         (
             "kanban",
             "deferred",

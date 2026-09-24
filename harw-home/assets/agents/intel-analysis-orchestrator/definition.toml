@@ -1,0 +1,34 @@
+# Analyse-Familie (Plan R9, Teil D): Intel Analysis Orchestrator.
+#
+# Benutzerdefinierter Child-Orchestrator auf `child-orchestrator-base@1`.
+# Die Basis besitzt `[work]`, `[lifecycle]`, `[context]`, `[tools]`,
+# `[spawn]` (`max_depth = 1`, `child_orchestrators = []`, Budget) und
+# `[return]`; eigene Sektionen gleichen Namens würden verworfen und stehen
+# deshalb hier nicht. Diese Datei trägt nur Identität, feste Skills und die
+# namentliche Liste ihrer Delegationsziele (`[delegation].targets`), die
+# die sichtbaren Ziele auf die Familie verengt.
+# Die Arbeitsanweisung steht in `system.md` neben dieser Datei
+# (`instructions_file`).
+
+schema = "harwness.agent/v1"
+id = "harwness.agent.intel-analysis-orchestrator@1"
+version = "1.0.0"
+extends = { id = "harwness.agent.child-orchestrator-base@1" }
+role = "child-orchestrator"
+specialization = "intel-analysis-orchestrator"
+
+name = "Intel Analysis Orchestrator"
+description = "Führt eine belegte Analyse in vier Wellen: Sammel-Fan-out an evidence-collector (plus pattern-analyst/systems-modeller), Prüfung durch evidence-critic und method-auditor, Verdichtung durch synthesis-writer, Belegcheck vor Abschluss."
+instructions_file = "system.md"
+
+skills = ["analysis-workflow"]
+
+[delegation]
+targets = [
+  "evidence-collector",
+  "pattern-analyst",
+  "systems-modeller",
+  "evidence-critic",
+  "method-auditor",
+  "synthesis-writer",
+]

@@ -56,9 +56,8 @@
 //! Tool-Output; Meldungen nennen nur den vom Modell übergebenen relativen Pfad.
 
 use crate::error::FsToolError;
-use crate::tree::{
-    MAX_LINE_BYTES, MAX_OUTPUT_BYTES, MAX_SCAN_FILE_BYTES, Workspace, normalize_relative,
-};
+use crate::symlink::open_start;
+use crate::tree::{MAX_LINE_BYTES, MAX_OUTPUT_BYTES, MAX_SCAN_FILE_BYTES, normalize_relative};
 use harw_authority::Permission;
 use harw_tools::{
     ToolCall, ToolOutput,
@@ -320,16 +319,21 @@ impl FsReadExecutor {
             Err(reason) => return Ok(ToolOutput::error(format!("fs.read: {reason}"))),
         };
 
-        // Symlinkfreies Öffnen relativ zum Wurzel-Deskriptor: kein TOCTOU
-        // zwischen Prüfen und Öffnen, kein Folgen von Symlinks.
-        let opened = Workspace::open(ctx.sandbox().workspace().canonical_root())
-            .and_then(|workspace| workspace.open_any(&relative));
+        // Symlinks im Pfad: nach innen frei, nach außen nur mit Freigabe;
+        // geöffnet wird danach strikt symlinkfrei (kein TOCTOU, siehe
+        // `crate::symlink`). Eine Ablehnung nennt Link und Ziel.
+        let opened = open_start(
+            ctx.sandbox().workspace().canonical_root(),
+            &relative,
+            "fs.read",
+            &args.path,
+        )
+        .and_then(|start| start.workspace.open_any(&start.rel));
         let mut file = match opened {
             Ok(file) => file,
             Err(err) => {
                 return Ok(ToolOutput::error(format!(
-                    "fs.read: '{}' kann nicht geöffnet werden \
-                     (Symlinks werden nicht verfolgt): {err}",
+                    "fs.read: '{}' kann nicht geöffnet werden: {err}",
                     args.path
                 )));
             }
@@ -960,12 +964,112 @@ mod tests {
             );
             let rendered = render(&output)?;
             assert!(!rendered.contains(SECRET), "{path}: {rendered}");
-            let outside = fixture
-                .outside
-                .to_str()
-                .ok_or(TestError::Missing("outside as str"))?;
-            assert!(!rendered.contains(outside), "{rendered}");
         }
+        Ok(())
+    }
+
+    #[test]
+    fn test_fs_read_follows_symlink_inside_workspace() -> TestResult {
+        let fixture = Fixture::new()?;
+        fs::create_dir_all(fixture.ws.join("real/sub"))?;
+        fs::write(fixture.ws.join("real/sub/header.h"), "inside")?;
+        // Relativer Datei-Link, absoluter Verzeichnis-Link und eine Kette.
+        std::os::unix::fs::symlink("real/sub/header.h", fixture.ws.join("file_link.h"))?;
+        std::os::unix::fs::symlink(fixture.ws.join("real"), fixture.ws.join("dir_link"))?;
+        fs::create_dir_all(fixture.ws.join("gen"))?;
+        std::os::unix::fs::symlink("../file_link.h", fixture.ws.join("gen/chain.h"))?;
+        let executor = FsReadExecutor { max_bytes: 65_536 };
+        let ctx = fixture.ctx(vec![Permission::ReadWorkspace])?;
+
+        for path in ["file_link.h", "dir_link/sub/header.h", "gen/chain.h"] {
+            let call = call("fs.read", serde_json::json!({ "path": path, "offset": 0 }));
+            match executor.read_file(&ctx, &call)? {
+                ToolOutput::Text { content } => assert_eq!(content, "inside", "{path}"),
+                other => {
+                    return Err(TestError::Unexpected(format!("{path}: {other:?}")));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Ein Ziel außerhalb fragt (Politik vor dem Dispatch), wird nach der
+    /// Freigabe gelesen, und das Verzeichnis ist danach gemerkt.
+    #[test]
+    fn test_fs_read_outside_symlink_reads_after_approval_and_remembers_the_directory() -> TestResult
+    {
+        let fixture = Fixture::new()?;
+        fixture.plant_escapes()?;
+        let executor = FsReadExecutor { max_bytes: 65_536 };
+        let ctx = fixture.ctx(vec![Permission::ReadWorkspace])?;
+        let access = crate::symlink::global();
+        let args = serde_json::json!({ "path": "link_dir/secret.txt", "offset": 0 });
+
+        // Ohne Freigabe abgelehnt; die Wurzel ist danach registriert.
+        let first = executor.read_file(&ctx, &call("fs.read", args.clone()))?;
+        assert!(matches!(first, ToolOutput::Error { .. }), "{first:?}");
+        assert!(!render(&first)?.contains(SECRET));
+
+        // Die Freigabepolitik sieht den Aufruf vor dem Dispatch und fragt.
+        let target = access
+            .review_call("fs.read", &args)
+            .ok_or(TestError::Missing("an outside target must ask"))?;
+        assert_eq!(target.grant_dir, fixture.outside);
+
+        // Freigabe erteilt (Dialog bestätigt oder Full Access) → gelesen.
+        access.approve_call("fs.read", &args, &target);
+        match executor.read_file(&ctx, &call("fs.read", args.clone()))? {
+            ToolOutput::Text { content } => assert_eq!(content, SECRET),
+            other => return Err(TestError::Unexpected(format!("{other:?}"))),
+        }
+
+        // Gemerkt: dasselbe Verzeichnis fragt nicht noch einmal.
+        let deeper = serde_json::json!({ "path": "link_dir/deep/more.txt", "offset": 0 });
+        assert!(access.review_call("fs.read", &deeper).is_none());
+        match executor.read_file(&ctx, &call("fs.read", deeper))? {
+            ToolOutput::Text { content } => assert_eq!(content, SECRET),
+            other => return Err(TestError::Unexpected(format!("{other:?}"))),
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn test_fs_read_symlink_outside_names_target() -> TestResult {
+        let fixture = Fixture::new()?;
+        fixture.plant_escapes()?;
+        let executor = FsReadExecutor { max_bytes: 65_536 };
+        let ctx = fixture.ctx(vec![Permission::ReadWorkspace])?;
+        let outside = fixture
+            .outside
+            .to_str()
+            .ok_or(TestError::Missing("outside as str"))?;
+
+        for path in ["link_file", "link_dir/secret.txt"] {
+            let call = call("fs.read", serde_json::json!({ "path": path }));
+            let output = executor.read_file(&ctx, &call)?;
+            assert!(
+                matches!(output, ToolOutput::Error { .. }),
+                "{path}: {output:?}"
+            );
+            let rendered = render(&output)?;
+            assert!(
+                rendered.contains("Symlink zeigt außerhalb des Arbeitsbereichs"),
+                "{path}: {rendered}"
+            );
+            assert!(rendered.contains(outside), "{path}: Ziel fehlt: {rendered}");
+            assert!(!rendered.contains(SECRET), "{path}: {rendered}");
+        }
+
+        // Relativer Ausbruch über `..` wird ebenso abgelehnt.
+        std::os::unix::fs::symlink("../outside/secret.txt", fixture.ws.join("rel_escape"))?;
+        let call = call("fs.read", serde_json::json!({ "path": "rel_escape" }));
+        let rendered = render(&executor.read_file(&ctx, &call)?)?;
+        assert!(
+            rendered.contains("Symlink zeigt außerhalb des Arbeitsbereichs")
+                && rendered.contains("../outside/secret.txt"),
+            "{rendered}"
+        );
+        assert!(!rendered.contains(SECRET), "{rendered}");
         Ok(())
     }
 

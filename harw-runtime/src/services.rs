@@ -398,6 +398,11 @@ pub struct RuntimeServices {
     /// Live-Modellwechsel: Provider-Neubau und Rollenwahl für `/model
     /// switch`, `/uia-model switch` und `/models set|reset` (nur Slash).
     live_model_control: Option<harw_ops::live_model::SharedLiveModelControl>,
+    /// Live-Stand der Konfiguration (siehe [`Self::with_live_config`]).
+    live_config: Option<harw_ops::live_config::SharedLiveConfig>,
+    /// Plan R9, Teil F: die Job-Verwaltung der Sitzung (nur TUI), für
+    /// `/jobs` auf der Slash-Fläche.
+    job_manager: Option<Arc<harw_tool_job::JobManager>>,
 }
 
 /// Legt `service` in `map` ab und merkt sich seinen Typnamen in `names`.
@@ -442,7 +447,51 @@ impl RuntimeServices {
             auto_decision_log: None,
             plan_confirm: None,
             live_model_control: None,
+            live_config: None,
+            job_manager: None,
         }
+    }
+
+    /// Plan R9, Teil F: legt die Job-Verwaltung der Sitzung als
+    /// `Arc<harw_tool_job::JobManager>` auf die Slash-Fläche (`/jobs`
+    /// handelt als Bedienerin, `Caller::Operator`). Modelle erreichen Jobs
+    /// ausschließlich über die `job.*`-Werkzeuge mit Besitzprüfung.
+    #[must_use]
+    pub fn with_job_manager(mut self, manager: Arc<harw_tool_job::JobManager>) -> Self {
+        self.job_manager = Some(manager);
+        self
+    }
+
+    /// Bindet den Live-Stand der Konfiguration
+    /// ([`harw_ops::live_config::LiveConfig`]).
+    ///
+    /// # Beschreibung
+    /// Mit Zelle legt jede [`ServiceMap`] (jede Fläche) statt des
+    /// Start-Standes [`harw_ops::live_config::LiveConfig::current`] als
+    /// `Arc<ResolvedConfig>` ab, und die Slash-Fläche trägt zusätzlich die
+    /// Zelle selbst: die Operator-Kommandos spiegeln darüber jede gelungene
+    /// Persistenz (`/models set`, `/model switch`, `/mode default`, …), so
+    /// dass Folge-Kommandos und die Ansichten der TUI sofort den neuen Stand
+    /// sehen. Ohne Aufruf bleibt es beim Start-Stand.
+    #[must_use]
+    pub fn with_live_config(mut self, live: harw_ops::live_config::SharedLiveConfig) -> Self {
+        self.live_config = Some(live);
+        self
+    }
+
+    /// Die gebundene Live-Konfiguration, falls vorhanden.
+    #[must_use]
+    pub fn live_config(&self) -> Option<&harw_ops::live_config::SharedLiveConfig> {
+        self.live_config.as_ref()
+    }
+
+    /// Der aktuelle Stand der Konfiguration: der Live-Stand, sonst der des
+    /// Starts.
+    #[must_use]
+    pub fn current_config(&self) -> Arc<ResolvedConfig> {
+        self.live_config
+            .as_ref()
+            .map_or_else(|| Arc::clone(&self.parts.config), |live| live.current())
     }
 
     /// Bindet die Laufzeit-Seite eines Modellwechsels
@@ -681,6 +730,7 @@ impl RuntimeServices {
     /// | `Arc<AgentEventHub>` (falls gebunden, `/matrix`) | ✓ | ✓ | — | — |
     /// | `Arc<dyn DreamLauncher>` (falls gebunden, `/dream run`, Plan D5) | ✓ | — | — | — |
     /// | `Arc<dyn LiveModelControl>` (falls gebunden, Live-Modellwechsel) | ✓ | — | — | — |
+    /// | `Arc<LiveConfig>` (falls gebunden; `Arc<ResolvedConfig>` ist dann überall der Live-Stand) | ✓ | — | — | — |
     ///
     /// Die Zeile [`OperationRegistry`] trägt in jeder Fläche dieselbe Menge —
     /// nämlich die, die [`crate::spec::EntryProfile::operations`] dem Einstieg
@@ -766,7 +816,7 @@ impl RuntimeServices {
         insert_service(&mut map, &mut names, registry);
 
         insert_service(&mut map, &mut names, Arc::clone(&self.parts.state_store));
-        insert_service(&mut map, &mut names, Arc::clone(&self.parts.config));
+        insert_service(&mut map, &mut names, self.current_config());
         insert_service(&mut map, &mut names, self.parts.approval_mode.clone());
         insert_service(&mut map, &mut names, self.parts.allow_rules.clone());
         insert_service(&mut map, &mut names, self.parts.extra_roots.clone());
@@ -809,6 +859,15 @@ impl RuntimeServices {
         if let Some(log) = &self.auto_decision_log {
             insert_service(&mut map, &mut names, log.clone());
         }
+        // Plan R9, Teil F: `/jobs` — nur die getippte Slash-Eingabe handelt
+        // als Bedienerin über alle Jobs der Sitzung.
+        if let Some(manager) = self
+            .job_manager
+            .as_ref()
+            .filter(|_| surface == ServiceSurface::Slash)
+        {
+            insert_service(&mut map, &mut names, Arc::clone(manager));
+        }
         // Die vier deklarierten Differenzen — und nur sie.
         if let Some(spawner) = self
             .parts
@@ -849,6 +908,13 @@ impl RuntimeServices {
             .filter(|_| surface == ServiceSurface::Slash)
         {
             insert_service(&mut map, &mut names, Arc::clone(control));
+        }
+        if let Some(live) = self
+            .live_config
+            .as_ref()
+            .filter(|_| surface == ServiceSurface::Slash)
+        {
+            insert_service(&mut map, &mut names, Arc::clone(live));
         }
         if let Some(hub) = self
             .agent_events
@@ -1200,6 +1266,51 @@ mod tests {
                 surface.as_str()
             );
         }
+    }
+
+    // ── Live-Konfiguration ───────────────────────────────────────────────────
+
+    /// Jede neu gebaute Map trägt den Live-Stand; nur die Slash-Fläche trägt
+    /// die Zelle selbst (die Operator-Kommandos spiegeln darüber).
+    #[test]
+    fn live_config_reaches_every_map_and_only_slash_gets_the_cell() {
+        let live = Arc::new(harw_ops::live_config::LiveConfig::new(Arc::new(
+            ResolvedConfig::default(),
+        )));
+        let services = RuntimeServices::new(minimal_parts()).with_live_config(Arc::clone(&live));
+        live.update(|config| config.harness.default_model = Some("live-model".to_owned()));
+
+        for surface in ServiceSurface::ALL {
+            let map = services.service_map(surface);
+            let config = map.get::<Arc<ResolvedConfig>>();
+            assert_eq!(
+                config.and_then(|config| config.harness.default_model.clone()),
+                Some("live-model".to_owned()),
+                "Fläche {} muss den Live-Stand tragen",
+                surface.as_str()
+            );
+            assert_eq!(
+                map.get::<harw_ops::live_config::SharedLiveConfig>()
+                    .is_some(),
+                surface == ServiceSurface::Slash,
+                "Fläche {}",
+                surface.as_str()
+            );
+        }
+        assert_eq!(
+            services.current_config().harness.default_model.as_deref(),
+            Some("live-model")
+        );
+    }
+
+    /// Ohne Zelle bleibt es beim Stand des Starts.
+    #[test]
+    fn without_live_config_the_start_snapshot_is_served() {
+        let parts = minimal_parts();
+        let start = Arc::clone(&parts.config);
+        let services = RuntimeServices::new(parts);
+        assert!(Arc::ptr_eq(&services.current_config(), &start));
+        assert!(services.live_config().is_none());
     }
 
     // ── Plan ──────────────────────────────────────────────────────────────────
@@ -1887,6 +1998,39 @@ mod tests {
                 surface.as_str()
             );
         }
+    }
+
+    /// Plan R9, Teil F: die Job-Verwaltung liegt nur auf der Slash-Fläche
+    /// (`/jobs`), und nur, wenn die (TUI-)Montage sie gebunden hat.
+    #[test]
+    fn job_manager_is_slash_only_once_bound() -> TestResult {
+        use crate::test_support::ctx;
+        use harw_tool_job::{JobManager, JobManagerConfig, NoopNotifier};
+        use std::sync::Arc;
+
+        let dir = tempfile::tempdir().map_err(ctx("tempdir"))?;
+        let manager = JobManager::new(JobManagerConfig::new(dir.path()), Arc::new(NoopNotifier))
+            .map_err(ctx("job manager"))?;
+        let unbound = RuntimeServices::new(full_parts());
+        let bound = RuntimeServices::new(full_parts()).with_job_manager(manager);
+        for surface in ServiceSurface::ALL {
+            assert!(
+                unbound
+                    .service_map(surface)
+                    .get::<Arc<JobManager>>()
+                    .is_none()
+            );
+            assert_eq!(
+                bound
+                    .service_map(surface)
+                    .get::<Arc<JobManager>>()
+                    .is_some(),
+                surface == ServiceSurface::Slash,
+                "{}",
+                surface.as_str()
+            );
+        }
+        Ok(())
     }
 
     /// Runde 5, Teil P: die `plan`-Operation findet den Bestätigungskanal

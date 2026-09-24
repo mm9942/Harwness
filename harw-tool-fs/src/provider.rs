@@ -323,8 +323,9 @@ fn fs_write_spec() -> ToolSpec {
         name: ToolName::new("fs.write"),
         description: "Write content to a file relative to the workspace root, atomically. \
              Creates the file if it does not exist; overwrites if it does. Parent directories \
-             are not created. Requires WriteWorkspace permission. Path traversal, symlinked \
-             path components and the protected areas .git/ and .harw/ are rejected."
+             are not created. Requires WriteWorkspace permission. Symlinks in the path are \
+             followed only when their target stays inside the workspace; path traversal, \
+             symlinks leading outside and the protected areas .git/ and .harw/ are rejected."
             .to_owned(),
         parameters: JsonSchema {
             schema_type: Some(JsonSchemaType::Object),
@@ -387,9 +388,10 @@ fn fs_edit_spec() -> ToolSpec {
              atomically. old_string must occur exactly once unless replace_all is true; \
              otherwise the call fails and reports the match count. Returns {path, \
              replacements, diff_excerpt}. Prefer fs.edit over fs.write for changes to \
-             existing files. Requires WriteWorkspace permission. Path traversal, symlinks \
-             and the protected areas .git/ and .harw/ are rejected; files larger than 8 MiB \
-             are not edited."
+             existing files. Requires WriteWorkspace permission. Symlinks in the path are \
+             followed only inside the workspace; path traversal, symlinks leading outside and \
+             the protected areas .git/ and .harw/ are rejected; files larger than 8 MiB are \
+             not edited."
             .to_owned(),
         parameters: JsonSchema {
             schema_type: Some(JsonSchemaType::Object),
@@ -432,9 +434,10 @@ fn fs_list_spec() -> ToolSpec {
         name: ToolName::new("fs.list"),
         description: "List the contents of a directory relative to the workspace root. \
              Returns {entries: [{name, kind, size}], stopped?}, sorted by name. \
-             'kind' is 'file', 'dir', or 'other' (symlinks are reported as 'other' and are \
-             never followed). 'stopped' names the limit that cut the listing short. \
-             Requires ReadWorkspace permission."
+             'kind' is 'file', 'dir', or 'other' (symlinks inside the listing are reported as \
+             'other'). A symlink in 'path' itself is followed: freely inside the workspace, \
+             after user approval outside it. 'stopped' names the limit that cut the listing \
+             short. Requires ReadWorkspace permission."
             .to_owned(),
         parameters: JsonSchema {
             schema_type: Some(JsonSchemaType::Object),

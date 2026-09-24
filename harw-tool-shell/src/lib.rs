@@ -53,8 +53,8 @@ pub mod limits;
 pub mod sudo;
 
 pub use exec::{
-    BUILD_COMMAND_DEFAULT_TIMEOUT_SECS, DEFAULT_MAX_TIMEOUT_SECS, HOST_PERMIT_PROMPT_TIMEOUT,
-    ShellExecError, ShellExecutor, ShellToolProvider,
+    BUILD_COMMAND_DEFAULT_TIMEOUT_SECS, BackgroundLaunch, DEFAULT_MAX_TIMEOUT_SECS,
+    HOST_PERMIT_PROMPT_TIMEOUT, ShellExecError, ShellExecutor, ShellToolProvider,
 };
 // Runde 6, Teil B: Operator-Weg für `!`-Befehle der Nutzerin (immer Host).
 pub use exec::{
@@ -74,7 +74,7 @@ pub use host_permit_prompt::{
 pub use latex::{
     LATEX_BUILD_TOOL, LATEX_CHECK_TOOL, LATEX_TEMPLATE_TOOL, LatexEngine, LatexToolProvider,
 };
-pub use limits::{ShellLimits, ShellLimitsError};
+pub use limits::{RLIMIT_UNLIMITED, ShellLimits, ShellLimitsError};
 pub use sudo::{
     SUDO_EXEC_TOOL, SUDO_MAX_SECRET_BYTES, SUDO_PROMPT_TIMEOUT, SudoAnswer, SudoAuditRecord,
     SudoAuditSink, SudoAuthFailureHook, SudoPrompt, SudoPromptReceiver, SudoPromptSender,

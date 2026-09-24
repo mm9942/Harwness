@@ -1289,6 +1289,16 @@ fn test_agent_skills_and_plugins_pass_hyphen_arguments_through() -> TestResult {
         }) if args == vec!["list".to_owned()]
     ));
 
+    // Plan R9, Teil C: `harw agent list [SUCHE]` zeigt den Agenten-Roster.
+    let cli = Cli::try_parse_from(["harw", "agent", "list", "analyse"])
+        .map_err(ctx("`harw agent list analyse` sollte parsen"))?;
+    assert!(matches!(
+        cli.command,
+        Some(Command::Agent {
+            action: AgentAction::List { query }
+        }) if query.as_deref() == Some("analyse")
+    ));
+
     let cli = Cli::try_parse_from(["harw", "agent", "uia-new"])
         .map_err(ctx("`harw agent uia-new` sollte parsen"))?;
     assert!(matches!(

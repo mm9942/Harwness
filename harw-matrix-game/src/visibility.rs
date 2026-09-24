@@ -542,6 +542,7 @@ mod tests {
             },
             _ => EntryKind::FactAdded {
                 text: format!("{marker} eine Tatsache der Welt"),
+                sources: Vec::new(),
             },
         };
         GameEntry::new(1, audience, kind)

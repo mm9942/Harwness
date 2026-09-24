@@ -1,7 +1,0 @@
-name = "rust-implementer"
-role = "worker"
-description = "Implements one bounded change with focused tests and no unrelated refactoring."
-system_file = "system.md"
-skills = ["implementation"]
-timeout_seconds = 240
-max_retries = 1

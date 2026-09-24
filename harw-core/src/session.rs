@@ -260,6 +260,9 @@ pub struct AgentSession {
     /// Quelle der Tool-Aktivierung und der Sandbox-Obergrenze; gewechselt wird
     /// er ausschließlich über [`AgentSession::set_mode`].
     mode: InteractionMode,
+    /// Runde 9, E6: Empfänger des Live-Modus des Agentenbaums (nur bei
+    /// Kind-Sitzungen gesetzt, siehe [`AgentSession::attach_live_mode`]).
+    live_mode: Option<crate::live_mode::LiveModeFollower>,
     /// Content-addressable identifier of the frozen executable policy that
     /// configured this session, when one was supplied at construction.
     executable_snapshot_id: Option<SnapshotId>,
@@ -602,6 +605,7 @@ impl AgentSession {
             base_sandbox: None,
             total_usage: TokenUsage::default(),
             mode: InteractionMode::default(),
+            live_mode: None,
             executable_snapshot_id: None,
             context_program: None,
             auto_compact: None,
@@ -646,6 +650,11 @@ impl AgentSession {
 
         for name in executable.tool_surface().admitted() {
             activation.enable_tool(ToolName::new(name.clone()));
+        }
+        // Plan R9, Teil A: der lesende Skill-Katalog ist nie von einem
+        // Zuschnitt der `admitted`-Liste abhängig (`forbidden` gewinnt).
+        for name in crate::activation::ALWAYS_AVAILABLE_TOOLS {
+            activation.enable_tool(ToolName::new(*name));
         }
         for name in executable.tool_surface().forbidden() {
             activation.disable_tool(ToolName::new(name.clone()));
@@ -789,6 +798,60 @@ impl AgentSession {
                 mode: mode.as_str().to_owned(),
             });
         }
+    }
+
+    /// Runde 9, E6: bindet die Sitzung an den Live-Modus ihres Agentenbaums.
+    ///
+    /// # Beschreibung
+    /// Ein bereits veröffentlichter Modus gilt sofort (ohne Notiz — beim
+    /// Start hat kein Wechsel stattgefunden): ein neues Kind startet damit
+    /// im **aktuellen** Modus, nicht in dem vom Sitzungsstart. Spätere
+    /// Wechsel übernimmt [`Self::sync_live_mode`] an der Runden-Grenze.
+    ///
+    /// # Arguments
+    /// - `follower` ([`crate::live_mode::LiveModeFollower`]): der Empfänger,
+    ///   frisch aus `LiveModeBroadcast::follower`.
+    pub fn attach_live_mode(&mut self, follower: crate::live_mode::LiveModeFollower) {
+        if let Some(mode) = follower.current()
+            && mode != self.mode
+        {
+            self.mode = mode;
+            self.apply_mode();
+        }
+        self.live_mode = Some(follower);
+    }
+
+    /// Runde 9, E6: übernimmt einen seit der letzten Runde veröffentlichten
+    /// Live-Modus.
+    ///
+    /// # Beschreibung
+    /// Aufgerufen vor jedem Modellaufruf ([`crate::turn_loop`]), also an der
+    /// nächsten Turn- bzw. Runden-Grenze. Der Wechsel läuft über
+    /// [`Self::set_mode`] — Werkzeugfläche und Sandbox werden **von der
+    /// Basis** neu geschnitten, nie über das Profil des Kindes hinaus.
+    /// Das Modell bekommt die Notiz „Modus geändert: alt → neu".
+    ///
+    /// # Rückgabe
+    /// `Some((alt, neu))`, wenn der Modus gewechselt hat; sonst `None`
+    /// (keine Bindung, nichts Neues oder derselbe Modus).
+    pub fn sync_live_mode(&mut self) -> Option<(InteractionMode, InteractionMode)> {
+        let next = self.live_mode.as_mut()?.poll()?;
+        let previous = self.mode;
+        if next == previous {
+            return None;
+        }
+        self.set_mode(next);
+        let note = crate::live_mode::mode_change_note(previous, next);
+        if !self.history.append_hint_to_last(&note) {
+            let _ = self.history.push_user_text(note);
+        }
+        tracing::info!(
+            session = %self.id,
+            from = previous.as_str(),
+            to = next.as_str(),
+            "session.live_mode_applied"
+        );
+        Some((previous, next))
     }
 
     // Setzt den bereits in `self.mode` hinterlegten Modus durch: Activation und
@@ -1408,6 +1471,14 @@ impl AgentSession {
     #[must_use]
     pub fn base_activation(&self) -> &SessionActivation {
         &self.base_activation
+    }
+
+    /// Plan R9, E1: die Basis-Sandbox dieser Session (vor dem Schnitt mit der
+    /// Modus-Decke, siehe [`Self::with_spawn_context`]); `None` ohne
+    /// Spawn-Kontext.
+    #[must_use]
+    pub fn base_sandbox(&self) -> Option<&SandboxSpec> {
+        self.base_sandbox.as_ref()
     }
 
     /// Liefert die Modus-Decke: die Obergrenze, gegen die Laufzeit-Toggles wie
@@ -2356,6 +2427,39 @@ forbidden = [{forbidden}]
             !session
                 .activation()
                 .is_tool_enabled(&ToolName::new("shell.exec"))
+        );
+        Ok(())
+    }
+
+    /// Plan R9, Teil A: der Skill-Katalog ist ohne Eintrag in `admitted`
+    /// freigeschaltet (kein Zuschnitt entfernt ihn); `forbidden` gewinnt.
+    #[test]
+    fn executable_policy_always_enables_the_skill_catalog_unless_forbidden() -> TestResult {
+        let executable = executable_agent_ir(&["fs.read"], &[])?;
+        let session = test_session().with_executable_agent_ir(&executable);
+        for tool in crate::activation::ALWAYS_AVAILABLE_TOOLS {
+            assert!(
+                session.activation().is_tool_enabled(&ToolName::new(*tool)),
+                "{tool}"
+            );
+        }
+        assert!(
+            !session
+                .activation()
+                .is_tool_enabled(&ToolName::new("fs.write"))
+        );
+
+        let executable = executable_agent_ir(&[], &["skills.load"])?;
+        let session = test_session().with_executable_agent_ir(&executable);
+        assert!(
+            session
+                .activation()
+                .is_tool_enabled(&ToolName::new("skills.search"))
+        );
+        assert!(
+            !session
+                .activation()
+                .is_tool_enabled(&ToolName::new("skills.load"))
         );
         Ok(())
     }

@@ -19,20 +19,25 @@
 //! }
 //! ```
 //!
-//! # Admission — Schnittmenge, nie Vereinigung
-//! Jedes Ziel läuft nur, wenn es in **allen** folgenden Mengen liegt
-//! (`docs/design/delegation-capabilities.md`, „Sichtbarkeit“):
-//! 1. der Laufzeit-Sichtbarkeit des Aufrufers
-//!    (`AgentSpawner::delegation_target_names` → `delegation_visibility`:
-//!    Rollenmatrix, exakte `child_orchestrators`-Freigabe, Resttiefe),
-//! 2. den in seiner Definition deklarierten Zielen (`[delegation].targets`,
-//!    über [`DelegateWavePolicy`] von der Composition-Root geliefert),
-//! 3. den Rollen mit bekanntem Autoritäts-Reducer (fail-closed: ohne Reducer
-//!    kein Spawn).
+//! # Admission (Plan R9, Teil C/E1)
+//! Die Ziele sind die **sichtbaren** Ziele des Aufrufers
+//! (`AgentSpawner::delegation_targets` → `delegation_visibility`:
+//! Rollenmatrix, exakte `child_orchestrators`-Freigabe, Resttiefe und die
+//! Plan-Modus-Regel — im Plan-Modus nur lesende Ziele). Davon bleiben die
+//! Rollen mit bekanntem Autoritäts-Reducer (fail-closed). Die in der
+//! Definition deklarierten Ziele (`[delegation].targets`, über
+//! [`DelegateWavePolicy`]) verengen nur optional:
+//! - eine Deklaration, die ausschließlich eingebaute Rollen nennt (die
+//!   eingebauten Autoritätslisten), verengt nur eingebaute Ziele —
+//!   benutzerdefinierte Agenten bleiben sichtbar;
+//! - eine Deklaration, die benutzerdefinierte Agenten nennt (etwa die
+//!   eigene Liste einer Analyse-Familie), ist vollständig;
+//! - bliebe nach der Verengung nichts übrig, gilt die sichtbare Menge.
 //!
-//! Ein abgelehntes Ziel erscheint als `"unavailable"` mit immer derselben
-//! Meldung — gleich, ob die Rolle unbekannt, verborgen, nicht deklariert oder
-//! ohne Reducer ist. Die Antwort darf kein Agentenkatalog-Orakel sein.
+//! Ein abgelehntes Ziel erscheint als `"unavailable"` mit einer benannten,
+//! aufruferbezogenen Meldung: „Ziel X ist für dich nicht delegierbar;
+//! delegierbar sind: …“ bzw. die Plan-Modus-Meldung. Genannt werden nur Ziele,
+//! die der Aufrufer ohnehin sieht — kein Agentenkatalog-Orakel.
 //!
 //! # Ausführung
 //! Die zugelassenen Ziele laufen in einem rollierenden Pool mit höchstens
@@ -77,7 +82,9 @@
 //! # Fehler
 //! Nur Gesamtausfälle sind `Err`: ungültige Argumente
 //! ([`OpError::InvalidArguments`]), fehlender Spawner/StateStore oder eine
-//! Sitzung ohne jede Delegationsoberfläche ([`OpError::NotAvailable`]). Das
+//! Sitzung ohne delegierbares Ziel ([`OpError::NotAvailable`] mit benanntem
+//! Grund: „Restliche Spawn-Tiefe 0“, „Kein Spawn-Kontext (interner
+//! Fehler)“, die Plan-Modus-Meldung oder „keine delegierbaren Ziele“). Das
 //! Scheitern einzelner Kinder ist immer ein Eintrag der Ergebnismenge.
 
 use std::collections::{BTreeSet, VecDeque};
@@ -119,16 +126,24 @@ pub const DEFAULT_MAX_PARALLEL: usize = 4;
 /// Höchstlänge einer vom Modell vergebenen Ziel-ID.
 const MAX_TARGET_ID_CHARS: usize = 64;
 
-/// Einheitliche Ablehnung — wortgleich mit der Admission-Meldung des
-/// Kind-Controllers, damit keine Ablehnung mehr verrät als eine andere.
-const NO_CAPABILITY: &str = "no delegation capability is available for this request";
+/// Meldung, wenn der Aufrufer sichtbare Ziele hat, aber keines davon für
+/// `delegate_wave` taugt oder überhaupt keines sieht.
+const NO_TARGETS: &str = "keine delegierbaren Ziele für dich";
 
 /// Erlaubte Felder auf oberster Ebene.
 const TOP_LEVEL_FIELDS: &[&str] = &["targets", "join", "max_parallel"];
 
 /// Erlaubte Felder je Ziel.
 /// Runde 5, Teil J: `continue_from` setzt ein budget-beendetes Kind fort.
-const TARGET_FIELDS: &[&str] = &["id", "role", "task", "complexity", "continue_from"];
+/// Plan R9, Teil C: `user_approved` wie bei `transfer_to_*` (Runde 9, E4).
+const TARGET_FIELDS: &[&str] = &[
+    "id",
+    "role",
+    "task",
+    "complexity",
+    "continue_from",
+    harw_core::user_approval::USER_APPROVED_FIELD,
+];
 
 // ── Anfrage ───────────────────────────────────────────────────────────────────
 
@@ -364,6 +379,13 @@ fn parse_target(raw: &Value, index: usize) -> Result<WaveTarget, OpError> {
         (Some(_), Some(Value::String(text))) => text.trim().to_owned(),
         _ => required_text(object, "task", index)?,
     };
+    // Plan R9, Teil C: vorab erteilte Freigaben der Nutzerin führen den
+    // Auftrag an — dieselbe Zeile wie bei `transfer_to_*` (Runde 9, E4).
+    let task = harw_core::user_approval::with_user_approval(
+        Some(task).filter(|task| !task.is_empty()),
+        raw,
+    )
+    .unwrap_or_default();
     let id = match object.get("id") {
         None | Some(Value::Null) => format!("t{}", index + 1),
         Some(Value::String(id)) => {
@@ -456,6 +478,9 @@ pub type TargetsForCaller = Arc<dyn Fn(&str) -> Option<Vec<String>> + Send + Syn
 pub struct DelegateWavePolicy {
     reducer_for_role: ReducerForRole,
     targets_for_caller: TargetsForCaller,
+    /// Plan R9, Teil C: ob ein Ziel ein benutzerdefinierter Agent ist (siehe
+    /// Moduldoku, „Admission“). Vorgabe: keines.
+    is_custom_target: Arc<dyn Fn(&str) -> bool + Send + Sync>,
 }
 
 impl DelegateWavePolicy {
@@ -476,7 +501,19 @@ impl DelegateWavePolicy {
         Self {
             reducer_for_role: Arc::new(reducer_for_role),
             targets_for_caller: Arc::new(targets_for_caller),
+            is_custom_target: Arc::new(|_| false),
         }
+    }
+
+    /// Plan R9, Teil C: kennzeichnet benutzerdefinierte Agenten. Eine
+    /// Deklaration, die nur eingebaute Rollen nennt, verengt sie nicht.
+    #[must_use]
+    pub fn with_custom_targets(
+        mut self,
+        is_custom_target: impl Fn(&str) -> bool + Send + Sync + 'static,
+    ) -> Self {
+        self.is_custom_target = Arc::new(is_custom_target);
+        self
     }
 }
 
@@ -517,41 +554,97 @@ impl DeclaredTargets {
         }
     }
 
-    fn admits(&self, role: &str) -> bool {
+    /// Ob die Deklaration `role` durchlässt (siehe Moduldoku, „Admission“):
+    /// genannt, oder ein benutzerdefinierter Agent, solange die Deklaration
+    /// selbst keinen benutzerdefinierten Agenten nennt.
+    fn admits(&self, role: &str, policy: &DelegateWavePolicy) -> bool {
         match self {
             Self::Unrestricted => true,
-            Self::Only(roles) => roles.contains(role),
+            Self::Only(roles) => {
+                roles.contains(role)
+                    || ((policy.is_custom_target)(role)
+                        && !roles
+                            .iter()
+                            .any(|named| (policy.is_custom_target)(named.as_str())))
+            }
         }
     }
 }
 
-/// Entscheidet je Ziel über die Zulassung (reine Schnittmenge).
+/// Die für `delegate_wave` delegierbaren Rollen des Aufrufers.
+///
+/// # Beschreibung
+/// Sichtbare Rollen mit Reducer, optional verengt durch die Deklaration;
+/// bliebe nach der Verengung nichts übrig, gelten alle sichtbaren Rollen mit
+/// Reducer (Plan R9, Teil C: die Deklaration ist nur ein Filter).
+///
+/// # Returns
+/// Sortiert (Cache-stabil, deterministische Meldungen).
+#[must_use]
+pub fn delegable_roles(
+    visible: &BTreeSet<String>,
+    declared: &DeclaredTargets,
+    policy: &DelegateWavePolicy,
+) -> Vec<String> {
+    let with_reducer: Vec<String> = visible
+        .iter()
+        .filter(|role| (policy.reducer_for_role)(role.as_str()).is_some())
+        .cloned()
+        .collect();
+    let narrowed: Vec<String> = with_reducer
+        .iter()
+        .filter(|role| declared.admits(role.as_str(), policy))
+        .cloned()
+        .collect();
+    if narrowed.is_empty() {
+        with_reducer
+    } else {
+        narrowed
+    }
+}
+
+/// Entscheidet je Ziel über die Zulassung.
 ///
 /// # Argumente
 /// - `request`: die geprüfte Anfrage.
-/// - `visible`: die Laufzeit-Sichtbarkeit des Aufrufers.
+/// - `visible`: die Laufzeit-Sichtbarkeit des Aufrufers (bereits nach
+///   Plan-Modus gefiltert).
+/// - `withheld`: sichtbare Ziele, die allein der Plan-Modus zurückhält.
 /// - `declared`: die deklarierte Zielmenge des Aufrufers.
 /// - `policy`: liefert die Reducer-Kennungen.
 ///
 /// # Returns
-/// Positionsgleich zu `request.targets`: `Some(reducer)` für ein zugelassenes
-/// Ziel, `None` für ein abgelehntes.
+/// Positionsgleich zu `request.targets`: `Ok(reducer)` für ein zugelassenes
+/// Ziel, `Err(meldung)` für ein abgelehntes — die Plan-Modus-Meldung oder
+/// „Ziel X ist für dich nicht delegierbar; delegierbar sind: …“ (nur Ziele,
+/// die der Aufrufer ohnehin sieht).
 #[must_use]
 pub fn admit_targets(
     request: &DelegateWaveRequest,
     visible: &BTreeSet<String>,
+    withheld: &BTreeSet<String>,
     declared: &DeclaredTargets,
     policy: &DelegateWavePolicy,
-) -> Vec<Option<&'static str>> {
+) -> Vec<Result<&'static str, String>> {
+    let delegable = delegable_roles(visible, declared, policy);
     request
         .targets
         .iter()
         .map(|target| {
             let role = target.role.as_str();
-            if !visible.contains(role) || !declared.admits(role) {
-                return None;
+            if withheld.contains(role) {
+                return Err(harw_core::delegation_visibility::plan_mode_refusal(
+                    &delegable,
+                ));
             }
-            (policy.reducer_for_role)(role)
+            if !delegable.iter().any(|allowed| allowed == role) {
+                return Err(harw_core::delegation_visibility::not_delegable_message(
+                    role, &delegable,
+                ));
+            }
+            (policy.reducer_for_role)(role).ok_or_else(|| {
+                harw_core::delegation_visibility::not_delegable_message(role, &delegable)
+            })
         })
         .collect()
 }
@@ -582,8 +675,8 @@ pub enum TargetStatus {
     Failed(String),
     /// Nicht gestartet oder abgebrochen, weil ein Geschwister gewann (`any`).
     Cancelled,
-    /// Nicht zugelassen (siehe Moduldoku, „Admission“).
-    Unavailable,
+    /// Nicht zugelassen, mit benanntem Grund (siehe Moduldoku, „Admission“).
+    Unavailable(String),
 }
 
 impl TargetStatus {
@@ -595,7 +688,7 @@ impl TargetStatus {
             Self::Paused(_) => "paused",
             Self::Failed(_) => "failed",
             Self::Cancelled => "cancelled",
-            Self::Unavailable => "unavailable",
+            Self::Unavailable(_) => "unavailable",
         }
     }
 
@@ -692,8 +785,8 @@ impl DelegateWaveReport {
                         TargetStatus::Failed(message) => {
                             object.insert("error".to_owned(), json!(message));
                         }
-                        TargetStatus::Unavailable => {
-                            object.insert("error".to_owned(), json!(NO_CAPABILITY));
+                        TargetStatus::Unavailable(message) => {
+                            object.insert("error".to_owned(), json!(message));
                         }
                         TargetStatus::Cancelled => {}
                     }
@@ -761,21 +854,38 @@ pub async fn delegate_wave(
         ));
     }
 
-    let visible: BTreeSet<String> = harw_extension_api::AgentSpawner::delegation_target_names(
+    // Plan R9, Teil C/E1: die sichtbaren Ziele samt Plan-Modus-Regel; ein
+    // Aufrufer ohne Ziele bekommt den benannten Grund (Resttiefe 0, kein
+    // Spawn-Kontext, Plan-Modus), nie eine Pauschalmeldung.
+    let delegation = harw_extension_api::AgentSpawner::delegation_targets(
         spawner.as_ref(),
         ctx.session_id(),
+        false,
     )
-    .into_iter()
-    .collect();
-    if visible.is_empty() {
-        return Err(OpError::NotAvailable(format!(
-            "delegate_wave: {NO_CAPABILITY}"
-        )));
-    }
+    .map_err(|error| OpError::NotAvailable(format!("delegate_wave: {error}")))?;
+    let visible: BTreeSet<String> = delegation
+        .targets
+        .iter()
+        .map(|target| target.name.clone())
+        .collect();
+    let withheld: BTreeSet<String> = delegation
+        .withheld_by_plan_mode
+        .iter()
+        .map(|target| target.name.clone())
+        .collect();
     let caller = spawner.child_record(ctx.session_id());
     let declared =
         DeclaredTargets::for_caller(policy, caller.as_ref().map(|record| record.role.as_str()));
-    let admission = admit_targets(request, &visible, &declared, policy);
+    let delegable = delegable_roles(&visible, &declared, policy);
+    if delegable.is_empty() {
+        let reason = if withheld.is_empty() {
+            NO_TARGETS.to_owned()
+        } else {
+            harw_core::delegation_visibility::plan_mode_refusal(&[])
+        };
+        return Err(OpError::NotAvailable(format!("delegate_wave: {reason}")));
+    }
+    let admission = admit_targets(request, &visible, &withheld, &declared, policy);
     let budget = wave_budget_cap(spawner.remaining_budget(ctx.session_id()));
 
     let size = request.targets.len();
@@ -786,8 +896,8 @@ pub async fn delegate_wave(
     let mut seeds: Vec<Option<ContinuationSeed>> = (0..size).map(|_| None).collect();
     let mut payloads: Vec<Value> = Vec::with_capacity(size);
     for (position, target) in request.targets.iter().enumerate() {
-        let continuation = match (&target.continue_from, admission[position]) {
-            (Some(from), Some(_)) => Some(prepare_continuation(ctx, &spawner, target, from)),
+        let continuation = match (&target.continue_from, &admission[position]) {
+            (Some(from), Ok(_)) => Some(prepare_continuation(ctx, &spawner, target, from)),
             _ => None,
         };
         payloads.push(match continuation {
@@ -815,12 +925,12 @@ pub async fn delegate_wave(
         .collect();
 
     let mut queue: VecDeque<(usize, &'static str)> = VecDeque::new();
-    for (position, reducer) in admission.iter().enumerate() {
+    for (position, reducer) in admission.into_iter().enumerate() {
         match reducer {
             // Eine abgelehnte Fortsetzung steht schon als `failed` fest.
-            Some(_) if statuses[position].is_some() => {}
-            Some(reducer) => queue.push_back((position, *reducer)),
-            None => statuses[position] = Some(TargetStatus::Unavailable),
+            Ok(_) if statuses[position].is_some() => {}
+            Ok(reducer) => queue.push_back((position, reducer)),
+            Err(message) => statuses[position] = Some(TargetStatus::Unavailable(message)),
         }
     }
     tracing::info!(
@@ -988,7 +1098,10 @@ const DELEGATE_WAVE_ARGS_SCHEMA: ArgsSchemaFn = || {
                         ),
                         (
                             "role",
-                            string_schema("Exakter Rollenname eines sichtbaren Delegationsziels."),
+                            string_schema(
+                                "Sichtbares Delegationsziel (die Liste steht als Enum hier; \
+                                 Details: agents.catalog).",
+                            ),
                         ),
                         (
                             "task",
@@ -1013,6 +1126,11 @@ const DELEGATE_WAVE_ARGS_SCHEMA: ArgsSchemaFn = || {
                                  die Übergabe als Kontext und ein frisches Budget; höchstens 3 \
                                  Fortsetzungen je ursprünglichem Kind.",
                             ),
+                        ),
+                        // Plan R9, Teil C: wie bei `transfer_to_*` (Runde 9, E4).
+                        (
+                            harw_core::user_approval::USER_APPROVED_FIELD,
+                            harw_core::user_approval::user_approved_schema(),
                         ),
                     ],
                     &["role"],
@@ -1069,6 +1187,11 @@ impl Operation for DelegateWaveOperation {
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
 
+// Plan R9, Teil C/E1: echte Kette UIA → Root-Orchestrator → `delegate_wave`
+// mitten im Turn (`delegate_wave/chain_tests.rs`).
+#[cfg(test)]
+mod chain_tests;
+
 #[cfg(test)]
 mod tests {
     use std::path::PathBuf;
@@ -1088,10 +1211,11 @@ mod tests {
     use super::{
         DeclaredTargets, DelegateWaveOperation, DelegateWavePolicy, DelegateWaveReport,
         DelegateWaveRequest, TargetReport, TargetStatus, WaveComplexity, WaveJoin, admit_targets,
-        delegate_wave, is_pause_report, wave_budget_cap,
+        delegable_roles, delegate_wave, is_pause_report, wave_budget_cap,
     };
     use crate::context_ext::OpContextCoreExt;
     use crate::test_support::{TestError, TestResult, ctx};
+    use std::collections::BTreeSet;
 
     fn policy() -> DelegateWavePolicy {
         DelegateWavePolicy::new(
@@ -1247,8 +1371,14 @@ mod tests {
         Ok(())
     }
 
+    fn set(names: &[&str]) -> BTreeSet<String> {
+        names.iter().map(|name| (*name).to_owned()).collect()
+    }
+
+    /// Plan R9, Teil C: sichtbar ∩ Reducer, optional verengt durch die
+    /// Deklaration; jede Ablehnung nennt nur sichtbare Ziele.
     #[test]
-    fn test_admission_is_an_intersection_of_visibility_declaration_and_reducer() -> TestResult {
+    fn test_admission_uses_visibility_reducer_and_optional_declaration() -> TestResult {
         let request = parse(json!({ "targets": [
             { "role": "explorer", "task": "a" },
             { "role": "planner", "task": "b" },
@@ -1256,46 +1386,158 @@ mod tests {
             { "role": "gibt-es-nicht", "task": "d" },
             { "role": "executor", "task": "e" },
         ] }))?;
-        let visible = ["explorer", "researcher-web", "executor", "planner"]
-            .into_iter()
-            .map(str::to_owned)
-            .collect();
+        let visible = set(&["explorer", "researcher-web", "executor", "planner"]);
         let policy = policy();
 
-        // Child-Orchestrator: nur seine deklarierten Ziele.
+        // Child-Orchestrator: seine Deklaration verengt.
         let declared = DeclaredTargets::for_caller(&policy, Some("coding-orchestrator"));
+        let refusal = |role: &str| {
+            format!(
+                "Ziel {role} ist für dich nicht delegierbar; delegierbar sind: explorer, planner"
+            )
+        };
         assert_eq!(
-            admit_targets(&request, &visible, &declared, &policy),
+            admit_targets(&request, &visible, &BTreeSet::new(), &declared, &policy),
             vec![
-                Some("reduce_to_read_explore"),
-                Some("reduce_to_read_registry"),
-                None, // sichtbar, aber nicht deklariert
-                None, // unbekannt
-                None, // sichtbar, aber ohne Reducer
+                Ok("reduce_to_read_explore"),
+                Ok("reduce_to_read_registry"),
+                Err(refusal("researcher-web")),
+                Err(refusal("gibt-es-nicht")),
+                Err(refusal("executor")),
             ]
         );
 
         // Wurzelsitzung: allein die Sichtbarkeit (plus Reducer).
         let unrestricted = DeclaredTargets::for_caller(&policy, None);
         assert_eq!(unrestricted, DeclaredTargets::Unrestricted);
+        let admitted = admit_targets(&request, &visible, &BTreeSet::new(), &unrestricted, &policy);
         assert_eq!(
-            admit_targets(&request, &visible, &unrestricted, &policy),
-            vec![
-                Some("reduce_to_read_explore"),
-                Some("reduce_to_read_registry"),
-                Some("reduce_to_read_network"),
-                None,
-                None,
+            admitted[..3],
+            [
+                Ok("reduce_to_read_explore"),
+                Ok("reduce_to_read_registry"),
+                Ok("reduce_to_read_network"),
             ]
         );
-
-        // Bekannte Rolle ohne Deklaration (ein Worker): fail-closed.
-        let worker = DeclaredTargets::for_caller(&policy, Some("explorer"));
-        assert!(
-            admit_targets(&request, &visible, &worker, &policy)
-                .iter()
-                .all(Option::is_none)
+        assert_eq!(
+            admitted[4],
+            Err(
+                "Ziel executor ist für dich nicht delegierbar; delegierbar sind: explorer, \
+                 planner, researcher-web"
+                    .to_owned()
+            ),
+            "ohne Reducer nicht delegierbar"
         );
+
+        // Eine Deklaration, die nichts Sichtbares übrig ließe, fällt auf die
+        // sichtbare Menge zurück (sie ist nur ein Filter).
+        let nothing = DeclaredTargets::Only(set(&["gibt-es-nicht"]));
+        assert_eq!(
+            delegable_roles(&visible, &nothing, &policy),
+            vec!["explorer", "planner", "researcher-web"]
+        );
+        // Ohne sichtbare Ziele (ein Worker) bleibt es leer.
+        assert!(delegable_roles(&BTreeSet::new(), &nothing, &policy).is_empty());
+        Ok(())
+    }
+
+    /// Plan R9, E1: ein allein vom Plan-Modus zurückgehaltenes Ziel wird mit
+    /// der Plan-Modus-Meldung abgelehnt, die nur lesende Ziele nennt.
+    #[test]
+    fn test_admission_refuses_withheld_targets_with_the_plan_mode_message() -> TestResult {
+        let request = parse(json!({ "targets": [
+            { "role": "explorer", "task": "a" },
+            { "role": "executor", "task": "b" },
+        ] }))?;
+        let admitted = admit_targets(
+            &request,
+            &set(&["explorer", "planner"]),
+            &set(&["executor"]),
+            &DeclaredTargets::Unrestricted,
+            &policy(),
+        );
+        assert_eq!(
+            admitted,
+            vec![
+                Ok("reduce_to_read_explore"),
+                Err(
+                    "Plan-Modus: nur lesende Ziele delegierbar (explorer, planner); \
+                     Schreib-/Ausführungsziele erst nach Planfreigabe."
+                        .to_owned()
+                ),
+            ]
+        );
+        Ok(())
+    }
+
+    /// Plan R9, Teil C: benutzerdefinierte Agenten. Eine eingebaute
+    /// Deklaration (nur eingebaute Rollen) verengt sie nicht; die eigene
+    /// Liste eines benutzerdefinierten Orchestrators (nennt benutzerdefinierte
+    /// Agenten) ist vollständig — `evidence-critic` ist aus
+    /// `intel-analysis-orchestrator` delegierbar, `explorer` nicht.
+    #[test]
+    fn test_custom_targets_pass_builtin_declarations_and_custom_lists_are_complete() -> TestResult {
+        let custom = [
+            "evidence-critic",
+            "synthesis-writer",
+            "intel-analysis-orchestrator",
+        ];
+        let policy = DelegateWavePolicy::new(
+            |role| match role {
+                "explorer" | "evidence-critic" => Some("reduce_to_read_explore"),
+                "synthesis-writer" => Some("reduce_to_read_only"),
+                _ => None,
+            },
+            |caller| match caller {
+                "root-orchestrator" => Some(vec!["explorer".to_owned()]),
+                "intel-analysis-orchestrator" => Some(vec![
+                    "evidence-critic".to_owned(),
+                    "synthesis-writer".to_owned(),
+                ]),
+                _ => None,
+            },
+        )
+        .with_custom_targets(move |role| custom.contains(&role));
+        let visible = set(&["evidence-critic", "explorer", "synthesis-writer"]);
+
+        let root = DeclaredTargets::for_caller(&policy, Some("root-orchestrator"));
+        assert_eq!(
+            delegable_roles(&visible, &root, &policy),
+            vec!["evidence-critic", "explorer", "synthesis-writer"]
+        );
+
+        let intel = DeclaredTargets::for_caller(&policy, Some("intel-analysis-orchestrator"));
+        let request = parse(json!({ "targets": [
+            { "role": "evidence-critic", "task": "prüfe die Belege" },
+            { "role": "explorer", "task": "x" },
+        ] }))?;
+        assert_eq!(
+            admit_targets(&request, &visible, &BTreeSet::new(), &intel, &policy),
+            vec![
+                Ok("reduce_to_read_explore"),
+                Err(
+                    "Ziel explorer ist für dich nicht delegierbar; delegierbar sind: \
+                     evidence-critic, synthesis-writer"
+                        .to_owned()
+                ),
+            ]
+        );
+        Ok(())
+    }
+
+    /// Plan R9, Teil C: `user_approved` je Ziel führt den Auftrag an (wie
+    /// bei `transfer_to_*`); unbekannte Werte fallen weg.
+    #[test]
+    fn test_parse_accepts_user_approved_per_target() -> TestResult {
+        let request = parse(json!({ "targets": [
+            { "role": "explorer", "task": "Spiele", "user_approved": ["scenario"] },
+            { "role": "explorer", "task": "Plane", "user_approved": ["alles"] },
+        ] }))?;
+        assert_eq!(
+            request.targets[0].task,
+            "Die Nutzerin hat vorab freigegeben: scenario.\n\nSpiele"
+        );
+        assert_eq!(request.targets[1].task, "Plane");
         Ok(())
     }
 
@@ -1348,13 +1590,16 @@ mod tests {
         );
     }
 
+    /// Plan R9, Teil C: ein abgelehntes Ziel trägt seinen benannten Grund.
     #[test]
-    fn test_report_json_never_names_why_a_target_was_unavailable() {
+    fn test_report_json_names_why_a_target_was_unavailable() {
         let rendered = report(
             WaveJoin::Collect,
             vec![
                 TargetStatus::Completed(json!("Antwort")),
-                TargetStatus::Unavailable,
+                TargetStatus::Unavailable(
+                    "Ziel x ist für dich nicht delegierbar; delegierbar sind: explorer".to_owned(),
+                ),
                 TargetStatus::Cancelled,
             ],
         )
@@ -1365,7 +1610,7 @@ mod tests {
         assert_eq!(rendered["results"][1]["status"], json!("unavailable"));
         assert_eq!(
             rendered["results"][1]["error"],
-            json!("no delegation capability is available for this request")
+            json!("Ziel x ist für dich nicht delegierbar; delegierbar sind: explorer")
         );
         assert!(rendered["results"][2].get("error").is_none());
         assert_eq!(rendered["satisfied"], json!(false));
@@ -1490,11 +1735,11 @@ mod tests {
         Ok(())
     }
 
-    /// Eine Sitzung, die der Spawner nicht kennt, sieht kein Ziel — der
-    /// Aufruf scheitert als Ganzes mit der einheitlichen Meldung, ohne eine
-    /// einzige Rolle zu nennen.
+    /// Eine Sitzung, die der Spawner nicht kennt, hat keinen Spawn-Kontext —
+    /// der Aufruf scheitert als Ganzes mit dem benannten Grund, ohne eine
+    /// einzige Rolle zu nennen (Plan R9, Teil C).
     #[tokio::test]
-    async fn test_delegate_wave_without_visible_targets_names_no_role() -> TestResult {
+    async fn test_delegate_wave_without_spawn_context_names_the_reason() -> TestResult {
         let (runtime, tmp, _events) = runtime_ctx()?;
         let operation = DelegateWaveOperation::new(policy());
         let result = operation
@@ -1505,7 +1750,10 @@ mod tests {
             .await;
         match result {
             Err(OpError::NotAvailable(message)) => {
-                assert!(message.contains("no delegation capability"), "{message}");
+                assert!(
+                    message.contains("Kein Spawn-Kontext (interner Fehler)"),
+                    "{message}"
+                );
                 assert!(!message.contains("explorer"), "{message}");
             }
             other => {

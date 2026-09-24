@@ -154,6 +154,11 @@ async fn agent(ctx: &OpContext, args: AgentArgs) -> Result<OpOutput, OpError> {
     if args.action.as_deref() == Some("use") {
         return agent_use(ctx, args.target.as_deref());
     }
+    // Plan R9, Teil C: die startbaren Definitionen (Roster: eingebaut und
+    // benutzerdefiniert) brauchen keinen Spawner.
+    if matches!(args.action.as_deref(), Some("defs" | "definitions")) {
+        return agent_definitions(ctx, args.target.as_deref());
+    }
     let Some(spawner) = ctx.service::<std::sync::Arc<harw_core::ManagedAgentSpawner>>() else {
         return Err(OpError::NotAvailable(
             "child-agent management is not available".to_owned(),
@@ -164,7 +169,9 @@ async fn agent(ctx: &OpContext, args: AgentArgs) -> Result<OpOutput, OpError> {
         "list" => {
             let children = spawner.list_descendants_for(ctx.session_id());
             if children.is_empty() {
-                return Ok(OpOutput::from("Keine aktiven Child-Agents.".to_owned()));
+                return Ok(OpOutput::from(
+                    "Keine aktiven Child-Agents. Startbare Agenten: /agent defs".to_owned(),
+                ));
             }
             let mut lines = vec![format!("{} aktive(r) Child-Agent(s):", children.len())];
             for record in &children {
@@ -237,6 +244,90 @@ async fn agent(ctx: &OpContext, args: AgentArgs) -> Result<OpOutput, OpError> {
             "unknown /agent action '{unknown}'"
         ))),
     }
+}
+
+/// `/agent defs [suchbegriff]`: die startbaren Agentendefinitionen des
+/// Laufs (Plan R9, Teil C).
+///
+/// # Beschreibung
+/// Liest denselben Roster wie die Laufzeit
+/// ([`harw_registry_defaults::AgentRoster::from_config`]): die eingebauten
+/// Rollen und jede gültige benutzerdefinierte Definition aus Profil und
+/// vertrautem Projekt — auch die aus `agent.toml` migrierten Agenten, die die
+/// alte Liste über `config.agents` nicht mehr zeigte. Je Agent: Name,
+/// Organisationsrolle, Herkunft, lesend/schreibend und die Beschreibung.
+/// `query` filtert (Groß-/Kleinschreibung egal) nach Name und Beschreibung.
+///
+/// # Fehler
+/// [`OpError::Execution`], wenn die eingebauten Definitionen oder der Roster
+/// nicht gebaut werden können.
+fn agent_definitions(ctx: &OpContext, query: Option<&str>) -> Result<OpOutput, OpError> {
+    let config = crate::provider::resolved_config(ctx)?;
+    let builtin = harw_registry_defaults::embedded_agents::builtin_agent_definitions(
+        &config.executable_agents,
+    )
+    .map_err(|error| {
+        OpError::Execution(format!(
+            "eingebaute Agentendefinitionen nicht ladbar: {error}"
+        ))
+    })?;
+    let roster = harw_registry_defaults::AgentRoster::from_config(&builtin, &config)
+        .map_err(|error| OpError::Execution(format!("Agenten-Roster nicht baubar: {error}")))?;
+    Ok(OpOutput::from(format_definitions(&roster, query)))
+}
+
+/// Die Textform von `/agent defs` (rein, testbar).
+fn format_definitions(roster: &harw_registry_defaults::AgentRoster, query: Option<&str>) -> String {
+    let query = query
+        .map(str::trim)
+        .filter(|query| !query.is_empty())
+        .map(str::to_lowercase);
+    let entries: Vec<&harw_registry_defaults::RosterEntry> = roster
+        .entries()
+        .filter(|entry| {
+            query.as_deref().is_none_or(|query| {
+                entry.name.to_lowercase().contains(query)
+                    || entry
+                        .description
+                        .as_deref()
+                        .is_some_and(|text| text.to_lowercase().contains(query))
+            })
+        })
+        .collect();
+    if entries.is_empty() {
+        return "Keine passenden Agentendefinitionen.".to_owned();
+    }
+    let custom = entries.iter().filter(|entry| entry.is_custom()).count();
+    let mut lines = vec![format!(
+        "{} Agenten ({} eingebaut, {custom} benutzerdefiniert):",
+        entries.len(),
+        entries.len() - custom
+    )];
+    for entry in entries {
+        let source = match &entry.source {
+            harw_registry_defaults::RosterSource::BuiltIn => "eingebaut".to_owned(),
+            harw_registry_defaults::RosterSource::Custom { layer, .. } => match layer {
+                Some(layer) => format!("benutzerdefiniert, {layer:?}"),
+                None => "benutzerdefiniert".to_owned(),
+            },
+        };
+        let description = entry
+            .description
+            .as_deref()
+            .and_then(|text| text.lines().next())
+            .unwrap_or("-");
+        lines.push(format!(
+            "- {} [{}; {source}; {}] — {description}",
+            entry.name,
+            harw_core::delegation_visibility::role_label(entry.role),
+            if entry.read_only {
+                "lesend"
+            } else {
+                "schreibend"
+            },
+        ));
+    }
+    lines.join("\n")
 }
 
 /// Rollen, die als Wurzel einer Sitzung starten dürfen (`--agent`,
@@ -1025,6 +1116,61 @@ mod tests {
         assert!(
             recorder.calls().is_empty(),
             "ungültige Namen dürfen nichts speichern"
+        );
+        Ok(())
+    }
+
+    /// Plan R9, Teil C: `/agent defs` zeigt den Roster — eingebaute und
+    /// benutzerdefinierte Agenten mit Rolle, Herkunft und Beschreibung (die
+    /// alte Liste über `config.agents` kannte die migrierten nicht).
+    #[test]
+    fn agent_defs_lists_builtin_and_custom_agents() -> TestResult {
+        let home = tempfile::tempdir().map_err(ctx_err("tempdir"))?;
+        let dir = home.path().join("agents").join("zettel-sammler");
+        std::fs::create_dir_all(&dir).map_err(ctx_err("Agentenordner"))?;
+        std::fs::write(
+            dir.join("definition.toml"),
+            r#"schema = "harwness.agent/v1"
+id = "user.agent.zettel-sammler@1"
+version = "1.0.0"
+extends = { id = "harwness.agent.worker-base@1" }
+role = "worker"
+specialization = "zettel-sammler"
+description = "Sammelt Zettelkasten-Einträge"
+
+[tools]
+admitted = ["fs.read"]
+"#,
+        )
+        .map_err(ctx_err("definition.toml"))?;
+        let config = harw_config::discover_config(&[home.path().to_path_buf()])
+            .map_err(ctx_err("Discovery"))?;
+        let builtin = harw_registry_defaults::embedded_agents::builtin_agent_definitions(
+            &config.executable_agents,
+        )
+        .map_err(ctx_err("eingebaute Rollen"))?;
+        let roster = harw_registry_defaults::AgentRoster::from_config(&builtin, &config)
+            .map_err(ctx_err("Roster"))?;
+
+        let text = super::format_definitions(&roster, None);
+        assert!(
+            text.contains("- explorer [worker; eingebaut; lesend] — "),
+            "{text}"
+        );
+        assert!(
+            text.contains("- zettel-sammler [worker; benutzerdefiniert"),
+            "{text}"
+        );
+        assert!(text.contains("Sammelt Zettelkasten-Einträge"), "{text}");
+
+        let filtered = super::format_definitions(&roster, Some("ZETTEL"));
+        assert!(
+            filtered.starts_with("1 Agenten (0 eingebaut, 1 benutzerdefiniert):"),
+            "{filtered}"
+        );
+        assert_eq!(
+            super::format_definitions(&roster, Some("gibt-es-nicht-xyz")),
+            "Keine passenden Agentendefinitionen."
         );
         Ok(())
     }

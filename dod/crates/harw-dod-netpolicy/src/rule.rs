@@ -68,6 +68,11 @@ pub enum NetRule {
         /// Der aus dem Bereich ererbte Adressbereich.
         cidr: IpNet,
     },
+    /// Erlaubt jeden öffentlichen DNS-Namen (offenes Recherche-Netz,
+    /// `harw_authority::EgressTarget::PublicDns`) — nie IP-Literale, lokale
+    /// oder reservierte Namen (`harw_authority::is_public_dns_name`).
+    /// Namensbasiert; die Adressklassen prüft der Egress-Resolver.
+    AllowPublicDns,
 }
 
 impl From<EgressTarget> for NetRule {
@@ -89,6 +94,7 @@ impl From<EgressTarget> for NetRule {
             EgressTarget::Host(host) => Self::AllowHost { host },
             EgressTarget::DnsSuffix(suffix) => Self::AllowDnsSuffix { suffix },
             EgressTarget::Cidr(cidr) => Self::AllowCidr { cidr },
+            EgressTarget::PublicDns => Self::AllowPublicDns,
         }
     }
 }
@@ -116,6 +122,7 @@ impl NetRule {
         match self {
             Self::AllowHost { host } => needle.eq_ignore_ascii_case(host),
             Self::AllowDnsSuffix { suffix } => host_matches(suffix, needle),
+            Self::AllowPublicDns => harw_authority::is_public_dns_name(needle),
             Self::AllowCidr { .. } => false,
         }
     }
@@ -132,7 +139,7 @@ impl NetRule {
     pub(crate) fn allows_addr(&self, addr: IpAddr) -> bool {
         match self {
             Self::AllowCidr { cidr } => cidr.contains(&addr),
-            Self::AllowHost { .. } | Self::AllowDnsSuffix { .. } => false,
+            Self::AllowHost { .. } | Self::AllowDnsSuffix { .. } | Self::AllowPublicDns => false,
         }
     }
 }

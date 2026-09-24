@@ -510,11 +510,21 @@ impl ChildEndCause {
     /// Ausnahme: ein Provider-Rate-Limit (HTTP 429, [`Self::is_rate_limited`])
     /// — die Verdichtung liefe gegen dasselbe Limit und verlängerte das Ende
     /// nur um ihr Zeitlimit (Export 429: 61 s + 20 s).
+    ///
+    /// Runde 9, Teil E2: auch ein Ende an einer Turn-Grenze oder durch einen
+    /// Turn-Wächter ([`Self::TurnStopped`]) wird verdichtet, damit
+    /// `continue_from` mit einer Übergabe statt von vorn beginnt (Export:
+    /// `uia-latex-writer` dreimal ohne Verdichtung). Ausgenommen ist das
+    /// Token-Budget ([`crate::turn_loop::TOKEN_BUDGET_STOP_PREFIX`]): dort
+    /// verdichtet der Budget-Pfad aus seiner Reserve — sonst doppelt.
     #[must_use]
     pub fn allows_compaction(&self) -> bool {
         match self {
             Self::WallTime { .. } | Self::ToolBudget { .. } => true,
             Self::TurnError(_) => !self.is_rate_limited(),
+            Self::TurnStopped(detail) => !detail
+                .trim_start()
+                .starts_with(crate::turn_loop::TOKEN_BUDGET_STOP_PREFIX),
             _ => false,
         }
     }
@@ -595,6 +605,32 @@ impl ChildEndReport {
             if self.handoff.is_some() { "yes" } else { "no" },
             self.reason
         )
+    }
+
+    /// Die Übergabe für eine Fortsetzung (`continue_from`, Runde 9, E2).
+    ///
+    /// # Returns
+    /// Kopfzeile mit dem konkreten Endgrund, die geänderten Dateien und dann
+    /// die Verdichtung — ohne Verdichtung die Journal-Kurzfassung (sie nennt
+    /// die Dateien selbst).
+    #[must_use]
+    pub fn continuation_text(&self) -> String {
+        let header = self.header();
+        match &self.handoff {
+            Some(handoff) => {
+                let files = if self.files.is_empty() {
+                    "Geänderte Dateien: keine erkannt.".to_owned()
+                } else {
+                    format!(
+                        "Geänderte Dateien ({}): {}",
+                        self.files.len(),
+                        self.files.join(", ")
+                    )
+                };
+                format!("{header}\n{files}\n\n{handoff}")
+            }
+            None => format!("{header}\n\n{}", self.journal_summary),
+        }
     }
 
     /// Der Text für das Modell des Elternteils.
@@ -1023,8 +1059,10 @@ impl ParentMessage {
             ),
             ParentMessageKind::Question => format!(
                 "[Frage von {} ({})] {}\nDas Kind wartet auf eine Antwort: agent.message \
-                 {{\"child_id\": \"{}\", \"text\": …}} (frage bei Bedarf zuerst die Nutzerin). \
-                 Ohne Antwort arbeitet es nach {} min mit einer begründeten Annahme weiter.",
+                 {{\"child_id\": \"{}\", \"text\": …}}. Deine nächste Nachricht an dieses Kind \
+                 gilt als Antwort auf genau diese Frage — frage bei Bedarf zuerst die Nutzerin und \
+                 gib ihre Antwort wörtlich weiter, keine anderen Hinweise vorher. Ohne Antwort \
+                 arbeitet es nach {} min mit einer begründeten Annahme weiter.",
                 self.role,
                 self.child,
                 self.text,
@@ -1088,6 +1126,12 @@ pub fn validate_message(text: &str) -> Result<String, String> {
 struct PendingQuestion {
     id: u64,
     reply: oneshot::Sender<String>,
+    /// Runde 9, E3: seit wann die Frage offen ist (die Wartezeit zählt nicht
+    /// zum Zeitbudget des Kindes, [`ChildComms::question_wait`]).
+    asked_at: Instant,
+    /// Runde 9, E3: Auszug der Frage (für den Zustellhinweis an den
+    /// Elternteil, [`ChildComms::pending_question_excerpt`]).
+    excerpt: String,
 }
 
 #[derive(Debug, Default)]
@@ -1099,6 +1143,20 @@ struct CommsState {
     inbox: BTreeMap<String, VecDeque<ParentMessage>>,
     last_info: BTreeMap<String, Instant>,
     next_question: u64,
+    /// Runde 9, E3: bereits abgeschlossene Wartezeit je Kind auf Antworten
+    /// des Elternteils.
+    question_waited: BTreeMap<String, Duration>,
+}
+
+impl CommsState {
+    /// Entfernt die offene Frage von `child` und verbucht ihre Wartezeit.
+    fn take_question(&mut self, child: &str) -> Option<PendingQuestion> {
+        let question = self.questions.remove(child)?;
+        let waited = question.asked_at.elapsed();
+        let total = self.question_waited.entry(child.to_owned()).or_default();
+        *total = total.saturating_add(waited);
+        Some(question)
+    }
 }
 
 /// Register für Journale, Endberichte und Nachrichten eines Spawners.
@@ -1251,6 +1309,7 @@ impl ChildComms {
         let mut state = self.state();
         state.mailboxes.remove(child.as_str());
         state.questions.remove(child.as_str());
+        state.question_waited.remove(child.as_str());
         state.last_info.remove(child.as_str());
         let Some(journal) = state.journals.get_mut(child.as_str()) else {
             return;
@@ -1317,7 +1376,7 @@ impl ChildComms {
                 text: excerpt(text, ENTRY_DETAIL_MAX_CHARS),
             });
         }
-        if let Some(question) = state.questions.remove(child.as_str()) {
+        if let Some(question) = state.take_question(child.as_str()) {
             match question.reply.send(text.to_owned()) {
                 Ok(()) => return Ok(MessageDelivery::AnsweredQuestion),
                 // Der Wartende ist schon weg (Zeitlimit): ins Postfach.
@@ -1336,6 +1395,55 @@ impl ChildComms {
         }
         mailbox.push_back(format!("[Nachricht von {from_role}] {text}"));
         Ok(MessageDelivery::Queued)
+    }
+
+    /// Plan R9, Teil F: legt eine Systemnotiz (z. B. ein Job-Ereignis) in
+    /// das Postfach eines **laufenden** Kindes; sie erreicht das Modell an
+    /// seiner nächsten Runden-Grenze wie eine Elternnachricht
+    /// ([`Self::take_inbound`]).
+    ///
+    /// # Beschreibung
+    /// Anders als [`Self::deliver_to_child`] beantwortet die Notiz nie eine
+    /// wartende Frage und wird unverändert (ohne Absenderpräfix) abgelegt.
+    /// Ist das Postfach voll, fällt die älteste Nachricht heraus.
+    ///
+    /// # Returns
+    /// `true`, wenn das Kind läuft und die Notiz abgelegt wurde; `false` für
+    /// ein beendetes oder unbekanntes Kind (der Aufrufer leitet dann an den
+    /// Elternteil weiter).
+    pub fn deliver_note_to_running_child(&self, child: &SessionId, text: &str) -> bool {
+        let mut guard = self.state();
+        let state = &mut *guard;
+        let Some(journal) = state
+            .journals
+            .get_mut(child.as_str())
+            .filter(|journal| journal.running)
+        else {
+            return false;
+        };
+        journal.push(JournalEntryKind::Note(excerpt(
+            text,
+            ENTRY_DETAIL_MAX_CHARS,
+        )));
+        let mailbox = state
+            .mailboxes
+            .entry(child.as_str().to_owned())
+            .or_default();
+        if mailbox.len() >= MAILBOX_MAX_MESSAGES {
+            mailbox.pop_front();
+        }
+        mailbox.push_back(text.to_owned());
+        true
+    }
+
+    /// Plan R9, Teil F: der direkte Elternteil von `child`, solange dessen
+    /// Journal noch vorrätig ist (laufende und die zuletzt beendeten Kinder).
+    #[must_use]
+    pub fn parent_of(&self, child: &SessionId) -> Option<SessionId> {
+        self.state()
+            .journals
+            .get(child.as_str())
+            .map(|journal| journal.parent.clone())
     }
 
     /// Entnimmt die wartenden Nachrichten von `child` (Runden-Grenze).
@@ -1361,6 +1469,35 @@ impl ChildComms {
     #[must_use]
     pub fn has_pending_question(&self, child: &SessionId) -> bool {
         self.state().questions.contains_key(child.as_str())
+    }
+
+    /// Runde 9, E3: Auszug der offenen Frage von `child`, falls eine wartet.
+    #[must_use]
+    pub fn pending_question_excerpt(&self, child: &SessionId) -> Option<String> {
+        self.state()
+            .questions
+            .get(child.as_str())
+            .map(|question| question.excerpt.clone())
+    }
+
+    /// Runde 9, E3: wie lange `child` insgesamt auf Antworten des
+    /// Elternteils gewartet hat bzw. gerade wartet. Diese Zeit zählt nicht
+    /// zum Zeitbudget des Kindes: ein fragendes Kind bleibt am Leben, bis
+    /// die Frage beantwortet, abgebrochen oder abgelaufen ist.
+    #[must_use]
+    pub fn question_wait(&self, child: &SessionId) -> Duration {
+        let state = self.state();
+        let done = state
+            .question_waited
+            .get(child.as_str())
+            .copied()
+            .unwrap_or_default();
+        let open = state
+            .questions
+            .get(child.as_str())
+            .map(|question| question.asked_at.elapsed())
+            .unwrap_or_default();
+        done.saturating_add(open)
     }
 
     // ── Kind → Eltern ──
@@ -1464,9 +1601,15 @@ impl ChildComms {
         state.next_question = state.next_question.saturating_add(1);
         let id = state.next_question;
         let (reply, receiver) = oneshot::channel();
-        state
-            .questions
-            .insert(child.as_str().to_owned(), PendingQuestion { id, reply });
+        state.questions.insert(
+            child.as_str().to_owned(),
+            PendingQuestion {
+                id,
+                reply,
+                asked_at: Instant::now(),
+                excerpt: excerpt(text, 160),
+            },
+        );
         if let Some(journal) = state.journals.get_mut(child.as_str()) {
             journal.push(JournalEntryKind::MessageOut {
                 kind: ParentMessageKind::Question,
@@ -1499,7 +1642,7 @@ impl ChildComms {
             .get(child.as_str())
             .is_some_and(|question| question.id == id)
         {
-            state.questions.remove(child.as_str());
+            let _ = state.take_question(child.as_str());
             if let Some(journal) = state.journals.get_mut(child.as_str()) {
                 journal.push(JournalEntryKind::Note(
                     "Frage an den Elternteil ohne Antwort (Zeitlimit)".to_owned(),
@@ -1847,11 +1990,52 @@ mod tests {
             cause.reason_de(),
             "Turn vorzeitig beendet: Rundenlimit des Turns erreicht (40/40 Modellrunden)"
         );
-        assert!(!cause.allows_compaction());
+        // Runde 9, E2: Turn-Grenzen und Wächter werden verdichtet …
+        assert!(cause.allows_compaction());
+        assert!(cause.allows_continuation());
+        assert!(
+            ChildEndCause::TurnStopped("Turn-Wächter (no_progress_rounds): 4 Runden".into())
+                .allows_compaction()
+        );
+        // … das Token-Budget nicht (das verdichtet der Budget-Pfad selbst).
+        let budget = ChildEndCause::TurnStopped(format!(
+            "{} (150 von 100 neuen Tokens; Cache-Lesungen zählen nicht)",
+            crate::turn_loop::TOKEN_BUDGET_STOP_PREFIX
+        ));
+        assert!(!budget.allows_compaction());
+        assert!(budget.reason_de().contains("150 von 100"));
         assert!(matches!(
             cause.predecessor_end(),
             crate::child_handoff::PredecessorEnd::Stopped { .. }
         ));
+    }
+
+    /// Runde 9, E2: die Übergabe an eine Fortsetzung nennt Endgrund und
+    /// geänderte Dateien, auch wenn eine Verdichtung vorliegt.
+    #[test]
+    fn continuation_text_carries_reason_files_and_handoff() {
+        let cause = ChildEndCause::TurnStopped("Turn-Wächter (no_progress_rounds): 4".into());
+        let mut report = ChildEndReport {
+            child: SessionId::new(),
+            parent: SessionId::new(),
+            role: "uia-latex-writer".to_owned(),
+            status: cause.status(),
+            reason: cause.reason_de(),
+            handoff: Some("## Auftrag\nLayout".to_owned()),
+            handoff_note: None,
+            journal_summary: "Journal …".to_owned(),
+            steps: 19,
+            files: vec!["paper.tex".to_owned()],
+            continuation: true,
+        };
+        let text = report.continuation_text();
+        assert!(text.contains("Turn-Wächter (no_progress_rounds)"), "{text}");
+        assert!(text.contains("Geänderte Dateien (1): paper.tex"), "{text}");
+        assert!(text.ends_with("## Auftrag\nLayout"), "{text}");
+        report.handoff = None;
+        let text = report.continuation_text();
+        assert!(text.ends_with("Journal …"), "{text}");
+        assert!(text.contains("handoff=no"), "{text}");
     }
 
     #[test]
@@ -1916,6 +2100,33 @@ mod tests {
         let taken = comms.take_inbound(&child);
         assert_eq!(taken.len(), MAILBOX_MAX_MESSAGES);
         assert_eq!(taken[0], "[Nachricht von uia] Hinweis 0");
+        assert!(comms.take_inbound(&child).is_empty());
+    }
+
+    /// Plan R9, Teil F: Systemnotizen (Job-Ereignisse) erreichen nur
+    /// laufende Kinder, ohne Präfix und ohne eine offene Frage zu
+    /// beantworten; nach dem Ende meldet die Zustellung `false`.
+    #[test]
+    fn system_notes_reach_only_running_children() {
+        let comms = ChildComms::default();
+        let (child, parent) = ids();
+        assert!(!comms.deliver_note_to_running_child(&child, "[job x] started"));
+        comms.open_journal(&child, &parent, "executor", None);
+        assert_eq!(comms.parent_of(&child), Some(parent.clone()));
+        // Der Empfänger der Antwort bleibt bis zum Testende am Leben.
+        let asked = comms.ask_parent(&child, &parent, "executor", "Frage?");
+        assert!(asked.is_ok(), "Frage an den Elternteil");
+        assert!(comms.deliver_note_to_running_child(&child, "[job x] finished"));
+        assert!(
+            comms.has_pending_question(&child),
+            "Notiz beantwortet keine Frage"
+        );
+        assert_eq!(
+            comms.take_inbound(&child),
+            vec!["[job x] finished".to_owned()]
+        );
+        comms.close_journal(&child);
+        assert!(!comms.deliver_note_to_running_child(&child, "[job x] late"));
         assert!(comms.take_inbound(&child).is_empty());
     }
 
@@ -2017,6 +2228,53 @@ mod tests {
             comms.take_inbound(&child).is_empty(),
             "Antwort geht nicht ins Postfach"
         );
+        Ok(())
+    }
+
+    /// Runde 9, E3: die Wartezeit auf eine Antwort wird gezählt (sie ruht
+    /// im Zeitbudget des Kindes), der Auszug der Frage ist abrufbar, und die
+    /// Frage an die Wurzel sagt, dass die nächste Nachricht die Antwort ist.
+    #[tokio::test]
+    async fn a_pending_question_counts_its_wait_and_names_the_routing() -> TestResult {
+        let comms = ChildComms::default();
+        let (child, root) = ids();
+        comms.open_journal(&child, &root, "matrix-game-master", None);
+        assert_eq!(comms.question_wait(&child), Duration::ZERO);
+        assert_eq!(comms.pending_question_excerpt(&child), None);
+        let (_id, receiver) = comms
+            .ask_parent(&child, &root, "matrix-game-master", "Szenario freigeben?")
+            .map_err(TestError::Unexpected)?;
+        assert_eq!(
+            comms.pending_question_excerpt(&child).as_deref(),
+            Some("Szenario freigeben?")
+        );
+        let message = comms
+            .take_parent_messages(&root)
+            .pop()
+            .ok_or(TestError::Missing("Frage im Eingang der Wurzel"))?;
+        let text = message.to_model_text();
+        assert!(
+            text.contains("gilt als Antwort auf genau diese Frage"),
+            "{text}"
+        );
+        assert!(text.contains("wörtlich"), "{text}");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        let open = comms.question_wait(&child);
+        assert!(open >= Duration::from_millis(20), "{open:?}");
+        assert_eq!(
+            comms.deliver_to_child(&child, "uia", "freigegeben"),
+            Ok(MessageDelivery::AnsweredQuestion)
+        );
+        assert_eq!(
+            receiver.await.map_err(|_| TestError::Missing("Antwort"))?,
+            "freigegeben"
+        );
+        // Beantwortet: die Wartezeit bleibt verbucht, wächst aber nicht mehr.
+        let done = comms.question_wait(&child);
+        assert!(done >= open, "{done:?} < {open:?}");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        assert_eq!(comms.question_wait(&child), done);
+        assert!(!comms.has_pending_question(&child));
         Ok(())
     }
 

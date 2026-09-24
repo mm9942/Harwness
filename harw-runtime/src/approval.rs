@@ -198,6 +198,11 @@ impl AskResolutionPolicy {
         if harw_registry_defaults::call_needs_remote_ocr_approval(call) {
             return true;
         }
+        // Wie in `DefaultApprovalPolicy::review`: ein Symlink nach außerhalb
+        // des Workspace fragt unter `ask`/`auto` unabhängig von Regeln.
+        if harw_registry_defaults::call_needs_symlink_approval(call) {
+            return true;
+        }
         if self
             .config
             .as_ref()
@@ -1006,6 +1011,36 @@ mod tests {
         let grandchild = child.for_child();
         root.mode().set(ApprovalMode::AlwaysAsk);
         assert_eq!(grandchild.mode().get(), ApprovalMode::AlwaysAsk);
+    }
+
+    /// Runde 9, E6: `full → ask` erreicht ein bereits laufendes Kind — seine
+    /// schon montierten Handler fragen danach wieder, ohne Neustart.
+    #[test]
+    fn a_running_child_asks_again_after_full_to_ask() -> TestResult {
+        let root = root_chain(&["shell.exec"], ApprovalMode::FullAccess);
+        let child = root.for_child();
+        let handlers = child.handlers();
+        for tool in ["fs.write", "shell.exec"] {
+            for handler in &handlers {
+                assert!(
+                    matches!(
+                        block_on(handler.review(&call(tool)))?,
+                        ApprovalDecision::Allow
+                    ),
+                    "{tool} fragt unter FullAccess nicht"
+                );
+            }
+        }
+
+        root.mode().set(ApprovalMode::AlwaysAsk);
+        for tool in ["fs.write", "shell.exec"] {
+            let asks = handlers.iter().try_fold(false, |asks, handler| {
+                block_on(handler.review(&call(tool)))
+                    .map(|decision| asks || matches!(decision, ApprovalDecision::AskUser(_)))
+            })?;
+            assert!(asks, "{tool} fragt nach full → ask wieder");
+        }
+        Ok(())
     }
 
     /// Ein `set` im Kind läuft weder zur Wurzel noch zu Geschwistern über.

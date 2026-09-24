@@ -1,7 +1,0 @@
-name = "security-inspection-orchestrator"
-role = "child-orchestrator"
-description = "Coordinates evidence-led security inspection and reports risk without making unsupported claims."
-system_file = "system.md"
-skills = ["security-inspection", "dependency-research", "verification"]
-timeout_seconds = 300
-max_retries = 1

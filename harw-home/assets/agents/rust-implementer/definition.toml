@@ -1,0 +1,67 @@
+# Mitgelieferter Agent `rust-implementer` (Plan R9, Teil B: migriert aus dem
+# Legacy-Format `agent.toml`; `system.md` bleibt die Arbeitsanweisung und
+# wird per `instructions_file` in den Kontext des Kindes gelegt).
+#
+# Benutzerdefinierter Worker auf `worker-base@1`. Die Laufzeit klemmt ihn
+# unter die Decke des generischen schreibenden Workers (Workspace
+# lesen/schreiben ohne Shell und ohne Netz) — siehe
+# `harw_registry_defaults::roster`.
+
+schema = "harwness.agent/v1"
+id = "harwness.agent.rust-implementer@1"
+version = "1.0.0"
+extends = { id = "harwness.agent.worker-base@1" }
+role = "worker"
+specialization = "rust-implementer"
+
+name = "Rust Implementer"
+description = "Implements one bounded change with focused tests and no unrelated refactoring."
+instructions_file = "system.md"
+
+skills = ["implementation"]
+
+[work]
+mode = "implementation"
+may_write_code = true
+may_research_web = false
+
+[tools]
+admitted = [
+  "fs.read",
+  "fs.list",
+  "fs.search",
+  "fs.glob",
+  "fs.grep",
+  "doc.read_pdf",
+  "explore.tree",
+  "explore.projects",
+  "explore.relations",
+  "explore.find",
+  "workbench.show",
+  "diary.read",
+  "palace.search",
+  "palace.recall",
+  "parent.message",
+  "skills.search",
+  "skills.load",
+  "fs.write",
+  "fs.edit",
+]
+forbidden = [
+  "shell.exec",
+  "web.fetch",
+  "web.search",
+  "web.docs_rs",
+  "web.crates_io",
+]
+
+[spawn]
+max_depth = 0
+
+[spawn.budget]
+max_tokens = 100000
+max_tool_calls = 50
+max_wall_secs = 300
+
+[return]
+contract = "harwness.return.execution-summary@1"

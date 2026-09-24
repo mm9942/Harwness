@@ -472,6 +472,9 @@ pub enum PredecessorEnd {
     },
     /// Abgebrochen (Nutzerin, Elternteil, Herunterfahren).
     Cancelled,
+    /// Runde 9, E3: regulär abgeschlossen; der Elternteil nimmt es mit einem
+    /// neuen Auftrag wieder auf (z. B. `agent.message` an ein beendetes Kind).
+    Completed,
 }
 
 impl PredecessorEnd {
@@ -495,6 +498,10 @@ impl PredecessorEnd {
             ),
             Self::Cancelled => "Du setzt die Arbeit eines Vorgängers derselben Rolle fort, der \
                                 abgebrochen wurde."
+                .to_owned(),
+            Self::Completed => "Du setzt die Arbeit eines Vorgängers derselben Rolle fort, der \
+                                regulär abgeschlossen hatte; der Auftrag oben ist die neue \
+                                Nachricht des Elternteils."
                 .to_owned(),
         }
     }
@@ -631,7 +638,7 @@ impl HandoffLedger {
             .filter(|record| &record.parent == caller)
             .ok_or_else(|| {
                 ContinuationError(format!(
-                    "continue_from: kein eigenes, am Budget beendetes Kind mit der ID {from} \
+                    "continue_from: kein eigenes, beendetes Kind mit der ID {from} \
                      (nur solche Kinder lassen sich fortsetzen)"
                 ))
             })?;
@@ -1062,10 +1069,26 @@ mod tests {
         Ok(())
     }
 
+    /// Runde 9, E3: die Fortsetzung eines regulär beendeten Kindes nennt die
+    /// Nachricht des Elternteils als neuen Auftrag und trägt die Übergabe.
+    #[test]
+    fn a_completed_predecessor_is_resumed_with_the_message_as_task() {
+        let of = SessionId::new();
+        let text = continuation_task(
+            &of,
+            &PredecessorEnd::Completed,
+            "Letzte Antwort:\nEntwurf validiert",
+            Some("Szenario ist freigegeben, starte."),
+        );
+        assert!(text.starts_with(&format!("Fortsetzung von {of}: Szenario ist freigegeben")));
+        assert!(text.contains("regulär abgeschlossen"), "{text}");
+        assert!(text.contains("Entwurf validiert"), "{text}");
+    }
+
     #[test]
     fn continuation_rejections_are_recognisable_by_their_prefix() {
         assert!(is_continuation_rejection(
-            "continue_from: kein eigenes, am Budget beendetes Kind"
+            "continue_from: kein eigenes, beendetes Kind"
         ));
         assert!(!is_continuation_rejection(
             "child role 'x' is not registered"

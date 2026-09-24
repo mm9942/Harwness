@@ -663,10 +663,19 @@ async fn skills(ctx: &OpContext, args: SkillsArgs) -> Result<OpOutput, OpError> 
     if let Some(action @ ("proposals" | "review" | "accept" | "reject")) = args.action.as_deref() {
         return run_proposal_action(ctx, action, &args);
     }
-    let Some(config) = ctx.service::<Arc<ResolvedConfig>>() else {
-        return Err(OpError::NotAvailable(
-            "skill catalog integration is not available".to_owned(),
-        ));
+    // Live-Stand zuerst, damit `list`/`show` einen eben umgeschalteten Skill
+    // sofort mit dem neuen Zustand zeigen.
+    let config: Arc<ResolvedConfig> = match (
+        ctx.service::<crate::live_config::SharedLiveConfig>(),
+        ctx.service::<Arc<ResolvedConfig>>(),
+    ) {
+        (Some(live), _) => live.current(),
+        (None, Some(config)) => Arc::clone(config),
+        (None, None) => {
+            return Err(OpError::NotAvailable(
+                "skill catalog integration is not available".to_owned(),
+            ));
+        }
     };
 
     match args.action.as_deref().unwrap_or("list") {
@@ -717,6 +726,11 @@ async fn skills(ctx: &OpContext, args: SkillsArgs) -> Result<OpOutput, OpError> 
                 )));
             }
             let outcome = skill_state_persistence(ctx)?.set_skill_enabled(target, enabled)?;
+            crate::live_config::mirror(ctx, |live| {
+                if let Some(skill) = live.skills.get_mut(target) {
+                    skill.enabled = enabled;
+                }
+            });
             let state = if enabled { "aktiviert" } else { "deaktiviert" };
             let text = if outcome.changed {
                 format!(
@@ -980,6 +994,45 @@ mod tests {
             ),
             root,
         ))
+    }
+
+    /// Live-Schnappschuss: nach `deactivate` zeigt `list` im selben Kontext
+    /// den Skill sofort als `disabled`.
+    #[tokio::test]
+    async fn deactivate_is_visible_in_the_following_list() -> TestResult {
+        let recorder = Arc::new(RecordingPersistence::default());
+        let persistence: Arc<dyn SkillStatePersistence> = recorder.clone();
+        let (base, root) = test_context()?;
+        let live: crate::live_config::SharedLiveConfig = Arc::new(
+            crate::live_config::LiveConfig::new(Arc::new(review_config())),
+        );
+        let mut services = ServiceMap::new();
+        services.insert(Arc::new(review_config()));
+        services.insert(persistence);
+        services.insert(Arc::clone(&live));
+        let op_ctx = OpContext::new(
+            base.session_id().clone(),
+            base.turn_id().clone(),
+            base.sandbox().clone(),
+            services,
+        );
+
+        let switched = super::skills(&op_ctx, args("deactivate", Some("review"))).await;
+        let listed = super::skills(&op_ctx, args("list", None)).await;
+        std::fs::remove_dir_all(root).map_err(ctx("remove test workspace"))?;
+
+        assert!(switched.is_ok(), "{switched:?}");
+        let text = listed
+            .map_err(|error| TestError::Unexpected(format!("/skills list: {error}")))?
+            .text;
+        assert!(text.contains("review (disabled)"), "{text}");
+        assert!(
+            live.current()
+                .skills
+                .get("review")
+                .is_some_and(|skill| !skill.enabled)
+        );
+        Ok(())
     }
 
     fn args(action: &str, target: Option<&str>) -> SkillsArgs {

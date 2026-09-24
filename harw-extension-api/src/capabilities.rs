@@ -85,7 +85,175 @@ pub trait AgentSpawner: Send + Sync {
     fn child_runs_in_background(&self, _child: &SessionId) -> bool {
         false
     }
+
+    /// Runde 9, E3: die Rolle, mit der `caller` sein eigenes, bereits
+    /// beendetes Kind `child_id` fortsetzen kann (`continue_from`). Der Kern
+    /// macht daraus bei `agent.message` an ein beendetes Kind eine
+    /// Fortsetzung mit der Nachricht als Auftrag. `None` für fremde,
+    /// unbekannte, laufende oder nicht fortsetzbare Kinder; der Default
+    /// `None` lässt jede andere Implementierung unverändert.
+    fn resumable_child_role(&self, _caller: &SessionId, _child_id: &str) -> Option<String> {
+        None
+    }
+
+    /// Plan R9, Teil C/E1: die sichtbaren Delegationsziele von
+    /// `parent_session_id` samt Katalogdaten, gefiltert nach Plan-Modus.
+    ///
+    /// # Description
+    /// Dieselbe Sichtbarkeit wie [`Self::delegation_target_names`], zusätzlich
+    /// die Plan-Modus-Regel: im Plan-Modus bleiben nur lesende Ziele
+    /// delegierbar; die übrigen sichtbaren Ziele stehen in
+    /// [`DelegationTargets::withheld_by_plan_mode`] (nur für eine benannte
+    /// Ablehnung, nie als Angebot). `plan_mode` ist der Modus, den der
+    /// Aufrufer selbst kennt (die Sitzung der Wurzel); eine Implementierung
+    /// darf zusätzlich einen geerbten Plan-Modus berücksichtigen.
+    ///
+    /// Der Default kennt weder Lese-Eigenschaft noch Katalogdaten: außerhalb
+    /// des Plan-Modus liefert er die Namen aus
+    /// [`Self::delegation_target_names`], im Plan-Modus kein Ziel (das
+    /// Verhalten vor Plan R9).
+    ///
+    /// # Errors
+    /// [`DelegationUnavailable`] mit benanntem Grund (Resttiefe 0, fehlender
+    /// Spawn-Kontext) — nie ein Katalog-Orakel: der Grund betrifft allein den
+    /// Aufrufer.
+    fn delegation_targets(
+        &self,
+        parent_session_id: &SessionId,
+        plan_mode: bool,
+    ) -> Result<DelegationTargets, DelegationUnavailable> {
+        let names = self.delegation_target_names(parent_session_id);
+        let infos = names.into_iter().map(DelegationTargetInfo::named).collect();
+        Ok(if plan_mode {
+            DelegationTargets {
+                targets: Vec::new(),
+                plan_mode,
+                withheld_by_plan_mode: infos,
+            }
+        } else {
+            DelegationTargets {
+                targets: infos,
+                plan_mode,
+                withheld_by_plan_mode: Vec::new(),
+            }
+        })
+    }
+
+    /// Plan R9, E1: der Aufrufer meldet seinen aktuellen Interaktionsmodus
+    /// (`plan_mode = true` im Plan-Modus), damit eine Implementierung ihn an
+    /// Kinder vererben kann, deren Elternteil sie sonst nicht beobachtet (die
+    /// extern gefahrene Wurzelsitzung). Der Default ignoriert die Meldung.
+    fn note_caller_mode(&self, _caller: &SessionId, _plan_mode: bool) {}
 }
+
+/// Katalogdaten eines sichtbaren Delegationsziels (Plan R9, Teil C).
+///
+/// # Beschreibung
+/// Reine Daten für `agents.catalog`, die Beschreibungen der
+/// `transfer_to_*`-Werkzeuge und die Plan-Modus-Regel. Sie verleihen keine
+/// Rechte; die Admission prüft jedes Ziel unabhängig davon.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct DelegationTargetInfo {
+    /// Exakter Spawn-Name.
+    pub name: String,
+    /// Organisationsrolle als Label (`worker`, `child-orchestrator`, …).
+    pub role: String,
+    /// Einzeilige Beschreibung, falls bekannt.
+    pub description: Option<String>,
+    /// Fest gebundene Skills der Definition.
+    pub skills: Vec<String>,
+    /// Einzeilige Rechte-Zusammenfassung (Profil, lesend/schreibend, Werkzeuge).
+    pub profile_summary: String,
+    /// `true`, wenn das Ziel weder schreibt noch Prozesse startet.
+    pub read_only: bool,
+    /// Token-Budget des Ziels, falls es eines trägt.
+    pub budget_tokens: Option<u64>,
+    /// `true` für einen benutzerdefinierten Agenten, `false` für eine
+    /// eingebaute Rolle.
+    pub custom: bool,
+}
+
+impl DelegationTargetInfo {
+    /// Ein Ziel, von dem nur der Name bekannt ist (lesend: unbekannt, also
+    /// `false` — fail-closed für den Plan-Modus).
+    #[must_use]
+    pub fn named(name: String) -> Self {
+        Self {
+            name,
+            ..Self::default()
+        }
+    }
+}
+
+/// Die sichtbaren Delegationsziele eines Aufrufers (Plan R9, Teil C/E1).
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct DelegationTargets {
+    /// Die delegierbaren Ziele, nach Name sortiert (Cache-stabil).
+    pub targets: Vec<DelegationTargetInfo>,
+    /// `true`, wenn der Aufrufer (selbst oder geerbt) im Plan-Modus ist.
+    pub plan_mode: bool,
+    /// Sichtbare Ziele, die allein der Plan-Modus zurückhält (schreibend oder
+    /// ausführend), nach Name sortiert. Nur für die benannte Ablehnung.
+    pub withheld_by_plan_mode: Vec<DelegationTargetInfo>,
+}
+
+impl DelegationTargets {
+    /// Die Namen der delegierbaren Ziele in Katalogreihenfolge.
+    #[must_use]
+    pub fn names(&self) -> Vec<String> {
+        self.targets
+            .iter()
+            .map(|target| target.name.clone())
+            .collect()
+    }
+
+    /// Das delegierbare Ziel `name`, falls vorhanden.
+    #[must_use]
+    pub fn get(&self, name: &str) -> Option<&DelegationTargetInfo> {
+        self.targets.iter().find(|target| target.name == name)
+    }
+
+    /// `true`, wenn `name` sichtbar ist, aber allein der Plan-Modus es
+    /// zurückhält.
+    #[must_use]
+    pub fn is_withheld_by_plan_mode(&self, name: &str) -> bool {
+        self.withheld_by_plan_mode
+            .iter()
+            .any(|target| target.name == name)
+    }
+}
+
+/// Warum ein Aufrufer gerade gar nicht delegieren kann (Plan R9, Teil C).
+///
+/// # Beschreibung
+/// Die Meldungen nennen nur den Zustand des Aufrufers selbst, nie ein Ziel.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DelegationUnavailable {
+    /// Die Spawn-Tiefe des Aufrufers ist ausgeschöpft.
+    DepthExhausted,
+    /// Für den Aufrufer liegt kein vertrauenswürdiger Spawn-Kontext vor
+    /// (interner Fehler: unbekannte Sitzung, fehlender Kontext, Sperre).
+    NoSpawnContext {
+        /// Technisches Detail für Log und Meldung.
+        detail: String,
+    },
+}
+
+impl std::fmt::Display for DelegationUnavailable {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::DepthExhausted => write!(
+                f,
+                "Restliche Spawn-Tiefe 0: du darfst keine weiteren Agenten starten"
+            ),
+            Self::NoSpawnContext { detail } => {
+                write!(f, "Kein Spawn-Kontext (interner Fehler): {detail}")
+            }
+        }
+    }
+}
+
+impl std::error::Error for DelegationUnavailable {}
 
 #[derive(Debug, Clone)]
 pub struct SpawnInput {

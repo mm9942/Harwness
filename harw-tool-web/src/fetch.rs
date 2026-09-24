@@ -1432,6 +1432,13 @@ async fn web_fetch(
         )));
     };
 
+    // Plan R9 (offenes Recherche-Netz): eine noch nicht freigegebene Domain
+    // läuft nur mit dem vor dem Dispatch vermerkten, genehmigten Aufruf
+    // (`crate::open_web`); im Modus `allowlist` ändert das nichts.
+    if let Err(message) = crate::open_web::global().admit_fetch(&args.url) {
+        return Ok(ToolOutput::error(message));
+    }
+
     let fetcher = match scoped_fetcher(context, args.max_bytes) {
         Ok(fetcher) => fetcher,
         Err(err) => return Ok(ToolOutput::error(err.to_string())),

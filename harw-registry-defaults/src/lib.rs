@@ -68,7 +68,9 @@ pub mod kanban_tools;
 pub mod palace_tools;
 pub mod profile;
 pub mod research_web;
+pub mod roster;
 pub mod skill_proposal_tools;
+pub mod skill_tools;
 pub mod workbench_tools;
 
 #[cfg(test)]
@@ -102,14 +104,19 @@ pub use error::{RegistryDefaultsError, RegistryDefaultsResult};
 pub use kanban_tools::KanbanReadToolProvider;
 pub use palace_tools::PalaceToolProvider;
 pub use profile::{
-    AgentDefinitionAccess, HostPermitWiring, IdentityOverrides, RegistryProfile,
+    AgentDefinitionAccess, HostPermitWiring, IdentityOverrides, JobWiring, RegistryProfile,
     RestrictedToolProvider, agent_definition_tool_names_for_access, assemble_registry,
     assemble_registry_for_project, assemble_registry_for_project_with_definition_access,
     assemble_registry_for_sandbox, assemble_registry_for_sandbox_with_definition_access,
     profile_for_role, role_names,
 };
-pub use research_web::{install_web_tools, researcher_web_network_scope, researcher_web_policy};
+pub use research_web::{
+    OpenWebApprovalPolicy, install_web_tools, open_web_approval_notice,
+    researcher_web_network_scope, researcher_web_policy, role_may_use_open_web,
+};
+pub use roster::{AgentRoster, CustomAgentWiring, RosterEntry, RosterSource};
 pub use skill_proposal_tools::{SkillAuthorCeiling, SkillProposalStore, SkillProposalToolProvider};
+pub use skill_tools::{SkillCatalogToolProvider, skill_catalog_hint};
 pub use workbench_tools::{
     WorkbenchContextProvider, WorkbenchReadToolProvider, WorkbenchToolProvider,
 };
@@ -256,6 +263,27 @@ pub const AUTO_APPROVED_TOOLS: &[&str] = &[
     // Freigabepflicht, nie in `ALWAYS_ASK_TOOLS`.
     "agent.message",
     "parent.message",
+    // Plan R9, Teil A: `skills.search`/`skills.load`
+    // (`crate::skill_tools::SkillCatalogToolProvider`) lesen nur den bei der
+    // Montage eingefrorenen Skill-Katalog (vertraute Layer plus eingebettetes
+    // Bündel) im Host-Prozess — kein Workspace, kein Netz, kein Prozess, keine
+    // Rechteklasse. Ein Skill verleiht keine Rechte. Registriert von der
+    // Composition-Root für jede Rolle aus
+    // `profile::skill_catalog_tools_for_role`, nie über ein `RegistryProfile`.
+    "skills.search",
+    "skills.load",
+    // Plan R9, Teil F: die lesenden Job-Werkzeuge (`harw-tool-job`,
+    // `JOB_READ_TOOLS`): `job.status`/`job.logs`/`job.list` lesen nur
+    // Zustand und Logdateien eigener Jobs bzw. der Jobs von Nachfahren
+    // (Besitzprüfung über die Sitzung aus dem Ausführungskontext);
+    // `job.wait` wartet begrenzt (höchstens 600 s) auf deren Ende. Keine
+    // Schreibwirkung, kein Prozessstart. `job.start` fragt wie `shell.exec`,
+    // `job.stop` wie jedes andere Werkzeug mit Wirkung (nicht in
+    // `ALWAYS_ASK_TOOLS`, eine Allow-Regel greift).
+    "job.status",
+    "job.logs",
+    "job.list",
+    "job.wait",
     // Runde 5, Teil F: `ask_user` (`harw-tool-plan`) liest nur die Antwort der
     // Nutzerin aus einem eigenen Auswahlfenster; es schreibt nichts, startet
     // nichts und geht nicht ins Netz. Nur Wurzel, nur TUI (sonst
@@ -280,6 +308,10 @@ pub const AUTO_APPROVED_TOOLS: &[&str] = &[
     // `matrix.finish` fragen immer und stehen bewusst NICHT hier.
     "matrix.status",
     "matrix.draft_scenario",
+    // Plan R9: `matrix.add_fact` trägt einen recherchierten Fakt mit Belegen
+    // ins Journal des eigenen Laufs ein (nur Matrix-Speicher, dieselbe Klasse
+    // wie `matrix.draft_scenario`; `model_tool(approval = "none")`).
+    "matrix.add_fact",
     // Bewusst entfernt (W1-05, Register F-014, G-003, G-004, F-043, G-068):
     // - `plan`, `goal`: deklarieren `model_tool(approval = "always")` und
     //   mutieren PlanStore bzw. Ziel; die Auto-Freigabe überstimmte die
@@ -456,6 +488,50 @@ pub fn remote_ocr_host<'a>(
 #[must_use]
 pub fn call_needs_remote_ocr_approval(call: &ToolCall) -> bool {
     remote_ocr_requires_approval(call, harw_tool_doc::remote_ocr_target().as_ref())
+}
+
+/// Ob `call` ein lesendes fs-Werkzeug ist, dessen `path` über einen Symlink
+/// in ein noch nicht freigegebenes Verzeichnis **außerhalb** des Workspace
+/// führt (siehe [`harw_tool_fs::symlink`]). Reine Prüfung ohne
+/// Zustandsänderung — für die Vorhersage der Ask-Auflösung.
+#[must_use]
+pub fn call_needs_symlink_approval(call: &ToolCall) -> bool {
+    harw_tool_fs::symlink::global()
+        .review_call(call.name.as_str(), &call.arguments)
+        .is_some()
+}
+
+/// Hinweistext für den Freigabe-Dialog, wenn `call` einem Symlink nach
+/// außen folgen würde: nennt Link, Ziel und das Verzeichnis, für das die
+/// Freigabe bis zum Sitzungsende gemerkt wird.
+#[must_use]
+pub fn symlink_approval_notice(call: &ToolCall) -> Option<String> {
+    harw_tool_fs::symlink::global()
+        .review_call(call.name.as_str(), &call.arguments)
+        .map(|target| {
+            format!(
+                "{}. Eine Freigabe gilt für {} bis zum Sitzungsende.",
+                target.describe(),
+                target.grant_dir.display()
+            )
+        })
+}
+
+/// Vermerkt für `call` die Freigabe eines Symlink-Ziels außerhalb des
+/// Workspace, die [`DefaultApprovalPolicy::review`] gerade erteilt (Full
+/// Access) oder dem Menschen vorlegt: sie wirkt erst, wenn genau dieser
+/// Aufruf ausgeführt wird — ein abgelehnter Aufruf läuft nie
+/// ([`harw_tool_fs::symlink::SymlinkAccess::approve_call`]).
+///
+/// # Returns
+/// `true`, wenn `call` ein solches Ziel betrifft.
+fn note_symlink_approval(call: &ToolCall) -> bool {
+    let access = harw_tool_fs::symlink::global();
+    let Some(target) = access.review_call(call.name.as_str(), &call.arguments) else {
+        return false;
+    };
+    access.approve_call(call.name.as_str(), &call.arguments, &target);
+    true
 }
 
 /// Hinweistext für den Freigabe-Dialog, wenn `call` die Datei an einen
@@ -749,6 +825,10 @@ impl ApprovalHandler for DefaultApprovalPolicy {
                 Some(RuleDecision::Deny) => ApprovalDecision::Deny(full_access_deny_reason(call)),
                 Some(RuleDecision::Allow) | None => ApprovalDecision::Allow,
             };
+            // Symlink nach außen: unter Full Access ohne Rückfrage freigegeben.
+            if matches!(decision, ApprovalDecision::Allow) {
+                note_symlink_approval(call);
+            }
             return Box::pin(async move { decision });
         }
         // Nachtrag K3, „Freigabe-Härtung“: gewinnt über jede Regel und die
@@ -760,6 +840,12 @@ impl ApprovalHandler for DefaultApprovalPolicy {
         // Das ist keine Ausführungsfrage, deshalb fragt es unter `ask`/`auto`
         // trotz Allow-Regel; unter `FullAccess` (oben) fragt es nicht.
         if remote_ocr_requires_approval(call, (self.remote_ocr)().as_ref()) {
+            return Box::pin(async { ApprovalDecision::AskUser(Default::default()) });
+        }
+        // Ein lesendes fs-Werkzeug folgt einem Symlink nach außerhalb des
+        // Workspace: fragt unter `ask`/`auto` trotz Allow-Regel (wie ein
+        // Lesen außerhalb); die Freigabe gilt danach für das Zielverzeichnis.
+        if note_symlink_approval(call) {
             return Box::pin(async { ApprovalDecision::AskUser(Default::default()) });
         }
         let rule_decision = self.rules.evaluate(call.name.as_str(), &call.arguments);
@@ -992,9 +1078,14 @@ mod tests {
         // (reiner Text, ohne Schreibwirkung).
         read_only_surface.extend_from_slice(crate::profile::CHILD_MESSAGE_TOOLS);
         read_only_surface.extend_from_slice(crate::profile::PARENT_MESSAGE_TOOLS);
+        // Plan R9, Teil A: Skill-Katalog lesen (`skills.search`/`skills.load`).
+        read_only_surface.extend_from_slice(crate::profile::SKILL_CATALOG_TOOLS);
         // Runde 7, Teil M: Laufstand lesen bzw. Entwurf in den Matrix-Speicher
         // (dokumentierte Ausnahme wie `plan.write`).
         read_only_surface.extend_from_slice(crate::profile::MATRIX_GAME_MASTER_READ_TOOLS);
+        // Plan R9, Teil F: lesende Job-Werkzeuge (eigene Jobs, begrenztes
+        // Warten), registriert neben `shell.exec` bzw. für Orchestratoren.
+        read_only_surface.extend_from_slice(&harw_tool_job::JOB_READ_TOOLS);
         for profile in RegistryProfile::ALL.iter().filter(|p| p.is_read_only()) {
             read_only_surface.extend(profile.registered_tool_names());
         }
@@ -1014,6 +1105,30 @@ mod tests {
                     "{tool} registriert nur Full und darf nicht auto-freigegeben sein"
                 );
             }
+        }
+    }
+
+    /// Plan R9, Teil F: die lesenden Job-Werkzeuge laufen ohne Rückfrage,
+    /// `job.start` fragt wie `shell.exec`, `job.stop` fragt (Modus-Logik),
+    /// ist aber nie „immer fragen“.
+    #[test]
+    fn job_read_tools_are_auto_approved_and_start_is_treated_like_shell_exec() {
+        for tool in harw_tool_job::JOB_READ_TOOLS {
+            assert!(AUTO_APPROVED_TOOLS.contains(&tool), "{tool}");
+            assert!(!ALWAYS_ASK_TOOLS.contains(&tool), "{tool}");
+            assert!(
+                !DefaultApprovalPolicy::requires_explicit_approval(&call(tool)),
+                "{tool} muss ohne Rückfrage laufen"
+            );
+        }
+        for tool in [harw_tool_job::JOB_START_TOOL, harw_tool_job::JOB_STOP_TOOL] {
+            assert!(!AUTO_APPROVED_TOOLS.contains(&tool), "{tool}");
+            assert!(!ALWAYS_ASK_TOOLS.contains(&tool), "{tool}");
+            assert_eq!(
+                DefaultApprovalPolicy::requires_explicit_approval(&call(tool)),
+                DefaultApprovalPolicy::requires_explicit_approval(&call("shell.exec")),
+                "{tool}"
+            );
         }
     }
 
@@ -1274,6 +1389,77 @@ mod tests {
     /// Allow-Regel. `backend: "native"`, Modus `on` und „kein Client
     /// installiert“ bleiben ohne Rückfrage. `FullAccess` fragt nie (siehe
     /// `review_allows_remote_ocr_under_full_access`).
+    /// Symlink nach außerhalb des Workspace: `auto` fragt, Full Access fragt
+    /// nicht, ein gemerktes Verzeichnis fragt nicht noch einmal.
+    #[test]
+    fn review_asks_for_symlinks_leaving_the_workspace_and_remembers_the_directory() -> TestResult {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::TempDir::new().map_err(ctx("tempdir"))?;
+        let base = dir.path().canonicalize().map_err(ctx("canonicalize"))?;
+        let ws = base.join("ws");
+        for sub in ["a", "b"] {
+            let target = base.join("outside").join(sub);
+            std::fs::create_dir_all(&target).map_err(ctx("mkdir"))?;
+            std::fs::write(target.join("f.txt"), "x").map_err(ctx("write"))?;
+        }
+        std::fs::create_dir_all(&ws).map_err(ctx("mkdir ws"))?;
+        symlink(base.join("outside/a"), ws.join("share_a")).map_err(ctx("symlink a"))?;
+        symlink(base.join("outside/b"), ws.join("share_b")).map_err(ctx("symlink b"))?;
+        let access = harw_tool_fs::symlink::global();
+        access.register_root(&ws);
+        let fs_read = |path: &str| ToolCall {
+            id: Default::default(),
+            name: harw_extension_api::ToolName::new("fs.read"),
+            arguments: serde_json::json!({ "path": path }),
+        };
+
+        // `auto`: fragt, und der Dialog nennt Link und Ziel.
+        let auto = DefaultApprovalPolicy::new(ApprovalModeCell::new(ApprovalMode::Delegated));
+        let call_a = fs_read("share_a/f.txt");
+        assert!(call_needs_symlink_approval(&call_a));
+        let notice = symlink_approval_notice(&call_a).ok_or(TestError::Missing("notice"))?;
+        assert!(
+            notice.contains("Symlink zeigt außerhalb des Arbeitsbereichs")
+                && notice.contains(&base.join("outside/a").display().to_string()),
+            "{notice}"
+        );
+        assert!(matches!(
+            block_on(auto.review(&call_a))?,
+            ApprovalDecision::AskUser(_)
+        ));
+        // Innerhalb des Workspace fragt `fs.read` unter `auto` nicht.
+        assert!(matches!(
+            block_on(auto.review(&fs_read("share_a_missing")))?,
+            ApprovalDecision::Allow
+        ));
+
+        // Full Access: keine Rückfrage, die Freigabe ist für den Aufruf vermerkt.
+        let full = DefaultApprovalPolicy::new(ApprovalModeCell::new(ApprovalMode::FullAccess));
+        let call_b = fs_read("share_b/f.txt");
+        assert!(matches!(
+            block_on(full.review(&call_b))?,
+            ApprovalDecision::Allow
+        ));
+        let target_b = access
+            .review_call("fs.read", &call_b.arguments)
+            .ok_or(TestError::Missing("share_b target"))?;
+        assert!(access.allows(&target_b, "fs.read", "share_b/f.txt"));
+
+        // Nach der Ausführung des freigegebenen Aufrufs (das Werkzeug verbraucht
+        // die Freigabe) ist das Verzeichnis gemerkt: keine zweite Frage.
+        let target_a = access
+            .review_call("fs.read", &call_a.arguments)
+            .ok_or(TestError::Missing("share_a target"))?;
+        assert!(access.allows(&target_a, "fs.read", "share_a/f.txt"));
+        assert!(!call_needs_symlink_approval(&call_a));
+        assert!(matches!(
+            block_on(auto.review(&fs_read("share_a")))?,
+            ApprovalDecision::Allow
+        ));
+        Ok(())
+    }
+
     #[test]
     fn review_asks_for_remote_ocr_in_ask_mode_outside_full_access() -> TestResult {
         use harw_extension_api::allow_rules::{ApprovalRule, RuleScope};

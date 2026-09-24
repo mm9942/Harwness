@@ -2,8 +2,10 @@
 //!
 //! # Verantwortung
 //! Dieses Modul besitzt die eingebettete Startausstattung des Root-Space: die
-//! Delegationshierarchie (ein Root-Orchestrator, vier Child-Orchestratoren,
-//! zwölf Worker), die Skills, auf die deren `agent.toml` verweist, sowie
+//! Delegationshierarchie (Child-Orchestratoren und Worker als
+//! DSL-Definitionen `agents/<name>/definition.toml` mit `system.md` als
+//! Arbeitsanweisung, Plan R9 Teil B; nur `coding-orchestrator` bleibt ein
+//! Legacy-`agent.toml`), die Skills, auf die diese Agenten verweisen, sowie
 //! eigenständige Anleitungs-Skills (`skill.toml` + `instructions.md`, u. a.
 //! `rust-*`, deren sprachunabhängige Varianten wie
 //! `error-type-design`, `version-bump`). Es besitzt **nicht** das Schreiben — das leistet
@@ -105,16 +107,16 @@ pub fn bundled_files() -> &'static [BundledFile] {
 /// eingetragen werden; `test_every_asset_file_is_embedded` erzwingt das.
 static BUNDLED_FILES: &[BundledFile] = &[
     BundledFile {
-        relative_path: "agents/business-author/agent.toml",
-        contents: include_str!("../assets/agents/business-author/agent.toml"),
+        relative_path: "agents/business-author/definition.toml",
+        contents: include_str!("../assets/agents/business-author/definition.toml"),
     },
     BundledFile {
         relative_path: "agents/business-author/system.md",
         contents: include_str!("../assets/agents/business-author/system.md"),
     },
     BundledFile {
-        relative_path: "agents/business-reviewer/agent.toml",
-        contents: include_str!("../assets/agents/business-reviewer/agent.toml"),
+        relative_path: "agents/business-reviewer/definition.toml",
+        contents: include_str!("../assets/agents/business-reviewer/definition.toml"),
     },
     BundledFile {
         relative_path: "agents/business-reviewer/system.md",
@@ -129,152 +131,152 @@ static BUNDLED_FILES: &[BundledFile] = &[
         contents: include_str!("../assets/agents/coding-orchestrator/system.md"),
     },
     BundledFile {
-        relative_path: "agents/debugger/agent.toml",
-        contents: include_str!("../assets/agents/debugger/agent.toml"),
+        relative_path: "agents/debugger/definition.toml",
+        contents: include_str!("../assets/agents/debugger/definition.toml"),
     },
     BundledFile {
         relative_path: "agents/debugger/system.md",
         contents: include_str!("../assets/agents/debugger/system.md"),
     },
     BundledFile {
-        relative_path: "agents/debug-orchestrator/agent.toml",
-        contents: include_str!("../assets/agents/debug-orchestrator/agent.toml"),
+        relative_path: "agents/debug-orchestrator/definition.toml",
+        contents: include_str!("../assets/agents/debug-orchestrator/definition.toml"),
     },
     BundledFile {
         relative_path: "agents/debug-orchestrator/system.md",
         contents: include_str!("../assets/agents/debug-orchestrator/system.md"),
     },
     BundledFile {
-        relative_path: "agents/dependency-analyst/agent.toml",
-        contents: include_str!("../assets/agents/dependency-analyst/agent.toml"),
+        relative_path: "agents/dependency-analyst/definition.toml",
+        contents: include_str!("../assets/agents/dependency-analyst/definition.toml"),
     },
     BundledFile {
         relative_path: "agents/dependency-analyst/system.md",
         contents: include_str!("../assets/agents/dependency-analyst/system.md"),
     },
     BundledFile {
-        relative_path: "agents/dependency-research-orchestrator/agent.toml",
-        contents: include_str!("../assets/agents/dependency-research-orchestrator/agent.toml"),
+        relative_path: "agents/dependency-research-orchestrator/definition.toml",
+        contents: include_str!("../assets/agents/dependency-research-orchestrator/definition.toml"),
     },
     BundledFile {
         relative_path: "agents/dependency-research-orchestrator/system.md",
         contents: include_str!("../assets/agents/dependency-research-orchestrator/system.md"),
     },
     BundledFile {
-        relative_path: "agents/dependency-security-reviewer/agent.toml",
-        contents: include_str!("../assets/agents/dependency-security-reviewer/agent.toml"),
+        relative_path: "agents/dependency-security-reviewer/definition.toml",
+        contents: include_str!("../assets/agents/dependency-security-reviewer/definition.toml"),
     },
     BundledFile {
         relative_path: "agents/dependency-security-reviewer/system.md",
         contents: include_str!("../assets/agents/dependency-security-reviewer/system.md"),
     },
     BundledFile {
-        relative_path: "agents/implementation-orchestrator/agent.toml",
-        contents: include_str!("../assets/agents/implementation-orchestrator/agent.toml"),
+        relative_path: "agents/implementation-orchestrator/definition.toml",
+        contents: include_str!("../assets/agents/implementation-orchestrator/definition.toml"),
     },
     BundledFile {
         relative_path: "agents/implementation-orchestrator/system.md",
         contents: include_str!("../assets/agents/implementation-orchestrator/system.md"),
     },
     BundledFile {
-        relative_path: "agents/incident-triager/agent.toml",
-        contents: include_str!("../assets/agents/incident-triager/agent.toml"),
+        relative_path: "agents/incident-triager/definition.toml",
+        contents: include_str!("../assets/agents/incident-triager/definition.toml"),
     },
     BundledFile {
         relative_path: "agents/incident-triager/system.md",
         contents: include_str!("../assets/agents/incident-triager/system.md"),
     },
     BundledFile {
-        relative_path: "agents/latex-writer/agent.toml",
-        contents: include_str!("../assets/agents/latex-writer/agent.toml"),
+        relative_path: "agents/latex-writer/definition.toml",
+        contents: include_str!("../assets/agents/latex-writer/definition.toml"),
     },
     BundledFile {
         relative_path: "agents/latex-writer/system.md",
         contents: include_str!("../assets/agents/latex-writer/system.md"),
     },
     BundledFile {
-        relative_path: "agents/log-analyst/agent.toml",
-        contents: include_str!("../assets/agents/log-analyst/agent.toml"),
+        relative_path: "agents/log-analyst/definition.toml",
+        contents: include_str!("../assets/agents/log-analyst/definition.toml"),
     },
     BundledFile {
         relative_path: "agents/log-analyst/system.md",
         contents: include_str!("../assets/agents/log-analyst/system.md"),
     },
     BundledFile {
-        relative_path: "agents/matrix-scenario-author/agent.toml",
-        contents: include_str!("../assets/agents/matrix-scenario-author/agent.toml"),
+        relative_path: "agents/matrix-scenario-author/definition.toml",
+        contents: include_str!("../assets/agents/matrix-scenario-author/definition.toml"),
     },
     BundledFile {
         relative_path: "agents/matrix-scenario-author/system.md",
         contents: include_str!("../assets/agents/matrix-scenario-author/system.md"),
     },
     BundledFile {
-        relative_path: "agents/refactorer/agent.toml",
-        contents: include_str!("../assets/agents/refactorer/agent.toml"),
+        relative_path: "agents/refactorer/definition.toml",
+        contents: include_str!("../assets/agents/refactorer/definition.toml"),
     },
     BundledFile {
         relative_path: "agents/refactorer/system.md",
         contents: include_str!("../assets/agents/refactorer/system.md"),
     },
     BundledFile {
-        relative_path: "agents/rust-implementer/agent.toml",
-        contents: include_str!("../assets/agents/rust-implementer/agent.toml"),
+        relative_path: "agents/rust-implementer/definition.toml",
+        contents: include_str!("../assets/agents/rust-implementer/definition.toml"),
     },
     BundledFile {
         relative_path: "agents/rust-implementer/system.md",
         contents: include_str!("../assets/agents/rust-implementer/system.md"),
     },
     BundledFile {
-        relative_path: "agents/secret-scanner/agent.toml",
-        contents: include_str!("../assets/agents/secret-scanner/agent.toml"),
+        relative_path: "agents/secret-scanner/definition.toml",
+        contents: include_str!("../assets/agents/secret-scanner/definition.toml"),
     },
     BundledFile {
         relative_path: "agents/secret-scanner/system.md",
         contents: include_str!("../assets/agents/secret-scanner/system.md"),
     },
     BundledFile {
-        relative_path: "agents/security-auditor/agent.toml",
-        contents: include_str!("../assets/agents/security-auditor/agent.toml"),
+        relative_path: "agents/security-auditor/definition.toml",
+        contents: include_str!("../assets/agents/security-auditor/definition.toml"),
     },
     BundledFile {
         relative_path: "agents/security-auditor/system.md",
         contents: include_str!("../assets/agents/security-auditor/system.md"),
     },
     BundledFile {
-        relative_path: "agents/security-inspection-orchestrator/agent.toml",
-        contents: include_str!("../assets/agents/security-inspection-orchestrator/agent.toml"),
+        relative_path: "agents/security-inspection-orchestrator/definition.toml",
+        contents: include_str!("../assets/agents/security-inspection-orchestrator/definition.toml"),
     },
     BundledFile {
         relative_path: "agents/security-inspection-orchestrator/system.md",
         contents: include_str!("../assets/agents/security-inspection-orchestrator/system.md"),
     },
     BundledFile {
-        relative_path: "agents/slides-builder/agent.toml",
-        contents: include_str!("../assets/agents/slides-builder/agent.toml"),
+        relative_path: "agents/slides-builder/definition.toml",
+        contents: include_str!("../assets/agents/slides-builder/definition.toml"),
     },
     BundledFile {
         relative_path: "agents/slides-builder/system.md",
         contents: include_str!("../assets/agents/slides-builder/system.md"),
     },
     BundledFile {
-        relative_path: "agents/source-researcher/agent.toml",
-        contents: include_str!("../assets/agents/source-researcher/agent.toml"),
+        relative_path: "agents/source-researcher/definition.toml",
+        contents: include_str!("../assets/agents/source-researcher/definition.toml"),
     },
     BundledFile {
         relative_path: "agents/source-researcher/system.md",
         contents: include_str!("../assets/agents/source-researcher/system.md"),
     },
     BundledFile {
-        relative_path: "agents/system-observer/agent.toml",
-        contents: include_str!("../assets/agents/system-observer/agent.toml"),
+        relative_path: "agents/system-observer/definition.toml",
+        contents: include_str!("../assets/agents/system-observer/definition.toml"),
     },
     BundledFile {
         relative_path: "agents/system-observer/system.md",
         contents: include_str!("../assets/agents/system-observer/system.md"),
     },
     BundledFile {
-        relative_path: "agents/test-engineer/agent.toml",
-        contents: include_str!("../assets/agents/test-engineer/agent.toml"),
+        relative_path: "agents/test-engineer/definition.toml",
+        contents: include_str!("../assets/agents/test-engineer/definition.toml"),
     },
     BundledFile {
         relative_path: "agents/test-engineer/system.md",
@@ -784,6 +786,188 @@ static BUNDLED_FILES: &[BundledFile] = &[
         relative_path: "skills/xelatex-compile/skill.toml",
         contents: include_str!("../assets/skills/xelatex-compile/skill.toml"),
     },
+    // ── Analyse-Familie (Plan R9, Teil D) ─────────────────────────────────
+    // Zehn Agenten (`definition.toml` + `system.md`) und ihre Methoden-Skills
+    // als ein zusammenhängender Block; `tests/analysis_family.rs` prüft sie.
+    BundledFile {
+        relative_path: "agents/evidence-collector/definition.toml",
+        contents: include_str!("../assets/agents/evidence-collector/definition.toml"),
+    },
+    BundledFile {
+        relative_path: "agents/evidence-collector/system.md",
+        contents: include_str!("../assets/agents/evidence-collector/system.md"),
+    },
+    BundledFile {
+        relative_path: "agents/evidence-critic/definition.toml",
+        contents: include_str!("../assets/agents/evidence-critic/definition.toml"),
+    },
+    BundledFile {
+        relative_path: "agents/evidence-critic/system.md",
+        contents: include_str!("../assets/agents/evidence-critic/system.md"),
+    },
+    BundledFile {
+        relative_path: "agents/evidence-review-orchestrator/definition.toml",
+        contents: include_str!("../assets/agents/evidence-review-orchestrator/definition.toml"),
+    },
+    BundledFile {
+        relative_path: "agents/evidence-review-orchestrator/system.md",
+        contents: include_str!("../assets/agents/evidence-review-orchestrator/system.md"),
+    },
+    BundledFile {
+        relative_path: "agents/intel-analysis-orchestrator/definition.toml",
+        contents: include_str!("../assets/agents/intel-analysis-orchestrator/definition.toml"),
+    },
+    BundledFile {
+        relative_path: "agents/intel-analysis-orchestrator/system.md",
+        contents: include_str!("../assets/agents/intel-analysis-orchestrator/system.md"),
+    },
+    BundledFile {
+        relative_path: "agents/method-auditor/definition.toml",
+        contents: include_str!("../assets/agents/method-auditor/definition.toml"),
+    },
+    BundledFile {
+        relative_path: "agents/method-auditor/system.md",
+        contents: include_str!("../assets/agents/method-auditor/system.md"),
+    },
+    BundledFile {
+        relative_path: "agents/pattern-analyst/definition.toml",
+        contents: include_str!("../assets/agents/pattern-analyst/definition.toml"),
+    },
+    BundledFile {
+        relative_path: "agents/pattern-analyst/system.md",
+        contents: include_str!("../assets/agents/pattern-analyst/system.md"),
+    },
+    BundledFile {
+        relative_path: "agents/scenario-player/definition.toml",
+        contents: include_str!("../assets/agents/scenario-player/definition.toml"),
+    },
+    BundledFile {
+        relative_path: "agents/scenario-player/system.md",
+        contents: include_str!("../assets/agents/scenario-player/system.md"),
+    },
+    BundledFile {
+        relative_path: "agents/synthesis-writer/definition.toml",
+        contents: include_str!("../assets/agents/synthesis-writer/definition.toml"),
+    },
+    BundledFile {
+        relative_path: "agents/synthesis-writer/system.md",
+        contents: include_str!("../assets/agents/synthesis-writer/system.md"),
+    },
+    BundledFile {
+        relative_path: "agents/systems-modeller/definition.toml",
+        contents: include_str!("../assets/agents/systems-modeller/definition.toml"),
+    },
+    BundledFile {
+        relative_path: "agents/systems-modeller/system.md",
+        contents: include_str!("../assets/agents/systems-modeller/system.md"),
+    },
+    BundledFile {
+        relative_path: "agents/wargaming-orchestrator/definition.toml",
+        contents: include_str!("../assets/agents/wargaming-orchestrator/definition.toml"),
+    },
+    BundledFile {
+        relative_path: "agents/wargaming-orchestrator/system.md",
+        contents: include_str!("../assets/agents/wargaming-orchestrator/system.md"),
+    },
+    BundledFile {
+        relative_path: "skills/analysis-workflow/instructions.md",
+        contents: include_str!("../assets/skills/analysis-workflow/instructions.md"),
+    },
+    BundledFile {
+        relative_path: "skills/analysis-workflow/skill.toml",
+        contents: include_str!("../assets/skills/analysis-workflow/skill.toml"),
+    },
+    BundledFile {
+        relative_path: "skills/competing-hypotheses/instructions.md",
+        contents: include_str!("../assets/skills/competing-hypotheses/instructions.md"),
+    },
+    BundledFile {
+        relative_path: "skills/competing-hypotheses/skill.toml",
+        contents: include_str!("../assets/skills/competing-hypotheses/skill.toml"),
+    },
+    BundledFile {
+        relative_path: "skills/confidence-and-uncertainty/instructions.md",
+        contents: include_str!("../assets/skills/confidence-and-uncertainty/instructions.md"),
+    },
+    BundledFile {
+        relative_path: "skills/confidence-and-uncertainty/skill.toml",
+        contents: include_str!("../assets/skills/confidence-and-uncertainty/skill.toml"),
+    },
+    BundledFile {
+        relative_path: "skills/evidence-quality-review/instructions.md",
+        contents: include_str!("../assets/skills/evidence-quality-review/instructions.md"),
+    },
+    BundledFile {
+        relative_path: "skills/evidence-quality-review/skill.toml",
+        contents: include_str!("../assets/skills/evidence-quality-review/skill.toml"),
+    },
+    BundledFile {
+        relative_path: "skills/feedback-loops-and-thresholds/instructions.md",
+        contents: include_str!("../assets/skills/feedback-loops-and-thresholds/instructions.md"),
+    },
+    BundledFile {
+        relative_path: "skills/feedback-loops-and-thresholds/skill.toml",
+        contents: include_str!("../assets/skills/feedback-loops-and-thresholds/skill.toml"),
+    },
+    BundledFile {
+        relative_path: "skills/key-assumptions-check/instructions.md",
+        contents: include_str!("../assets/skills/key-assumptions-check/instructions.md"),
+    },
+    BundledFile {
+        relative_path: "skills/key-assumptions-check/skill.toml",
+        contents: include_str!("../assets/skills/key-assumptions-check/skill.toml"),
+    },
+    BundledFile {
+        relative_path: "skills/link-and-pattern-analysis/instructions.md",
+        contents: include_str!("../assets/skills/link-and-pattern-analysis/instructions.md"),
+    },
+    BundledFile {
+        relative_path: "skills/link-and-pattern-analysis/skill.toml",
+        contents: include_str!("../assets/skills/link-and-pattern-analysis/skill.toml"),
+    },
+    BundledFile {
+        relative_path: "skills/method-validation/instructions.md",
+        contents: include_str!("../assets/skills/method-validation/instructions.md"),
+    },
+    BundledFile {
+        relative_path: "skills/method-validation/skill.toml",
+        contents: include_str!("../assets/skills/method-validation/skill.toml"),
+    },
+    BundledFile {
+        relative_path: "skills/premortem-and-red-team/instructions.md",
+        contents: include_str!("../assets/skills/premortem-and-red-team/instructions.md"),
+    },
+    BundledFile {
+        relative_path: "skills/premortem-and-red-team/skill.toml",
+        contents: include_str!("../assets/skills/premortem-and-red-team/skill.toml"),
+    },
+    BundledFile {
+        relative_path: "skills/scenario-wargaming/instructions.md",
+        contents: include_str!("../assets/skills/scenario-wargaming/instructions.md"),
+    },
+    BundledFile {
+        relative_path: "skills/scenario-wargaming/skill.toml",
+        contents: include_str!("../assets/skills/scenario-wargaming/skill.toml"),
+    },
+    // ── Web-Recherche mit Quellen (Plan R9, Matrix-Game mit Internet) ─────
+    // `intel-web-researcher` (auf `researcher-web`) und sein Quellen-Skill;
+    // `tests/analysis_family.rs` prüft beide.
+    BundledFile {
+        relative_path: "agents/intel-web-researcher/definition.toml",
+        contents: include_str!("../assets/agents/intel-web-researcher/definition.toml"),
+    },
+    BundledFile {
+        relative_path: "agents/intel-web-researcher/system.md",
+        contents: include_str!("../assets/agents/intel-web-researcher/system.md"),
+    },
+    BundledFile {
+        relative_path: "skills/osint-web-research/instructions.md",
+        contents: include_str!("../assets/skills/osint-web-research/instructions.md"),
+    },
+    BundledFile {
+        relative_path: "skills/osint-web-research/skill.toml",
+        contents: include_str!("../assets/skills/osint-web-research/skill.toml"),
+    },
 ];
 
 #[cfg(test)]
@@ -864,7 +1048,66 @@ mod tests {
                 file.relative_path
             );
         }
-        assert_eq!(agents, 22, "das Bundle liefert 22 Agentendefinitionen");
+        // Plan R9, Teil B: 21 der 22 Legacy-Agenten sind nach
+        // `definition.toml` migriert (siehe
+        // `test_migrated_agents_ship_a_definition_and_no_agent_toml`); nur
+        // `coding-orchestrator` bleibt `agent.toml` — er bindet Skills an die
+        // gleichnamige eingebaute Rolle, eine Definition gleichen Namens würde
+        // als Kollision mit der eingebauten Rolle verworfen.
+        assert_eq!(
+            agents, 1,
+            "das Bundle liefert nur noch ein Legacy-agent.toml"
+        );
+        Ok(())
+    }
+
+    /// Plan R9, Teil B: jeder Agent-Ordner des Bundles trägt entweder eine
+    /// `definition.toml` oder (nur `coding-orchestrator`) ein Legacy-
+    /// `agent.toml`, nie beides; jede Definition verweist per
+    /// `instructions_file` auf ihr mitgeliefertes `system.md`.
+    #[test]
+    fn test_migrated_agents_ship_a_definition_and_no_agent_toml() -> TestResult {
+        let mut dirs: Vec<&str> = bundled_files()
+            .iter()
+            .filter_map(|file| file.relative_path.strip_prefix("agents/"))
+            .filter_map(|rest| rest.split('/').next())
+            .collect();
+        dirs.sort_unstable();
+        dirs.dedup();
+        let has = |dir: &str, file: &str| {
+            let path = format!("agents/{dir}/{file}");
+            bundled_files()
+                .iter()
+                .find(|entry| entry.relative_path == path)
+                .map(|entry| entry.contents)
+        };
+        for dir in dirs {
+            let definition = has(dir, "definition.toml");
+            let legacy = has(dir, "agent.toml");
+            if dir == "coding-orchestrator" {
+                assert!(legacy.is_some() && definition.is_none(), "{dir}");
+                continue;
+            }
+            let definition = definition.ok_or(crate::test_support::TestError::Missing(
+                "definition.toml eines mitgelieferten Agenten",
+            ))?;
+            assert!(legacy.is_none(), "{dir}: kein Legacy-agent.toml mehr");
+            let table: toml::Table =
+                toml::from_str(definition).map_err(ctx("definition.toml parst"))?;
+            assert_eq!(
+                table.get("specialization").and_then(toml::Value::as_str),
+                Some(dir),
+                "{dir}: specialization = Ordnername"
+            );
+            let instructions = table
+                .get("instructions_file")
+                .and_then(toml::Value::as_str)
+                .ok_or(crate::test_support::TestError::Missing("instructions_file"))?;
+            assert!(
+                has(dir, instructions).is_some(),
+                "{dir}: {instructions} fehlt"
+            );
+        }
         Ok(())
     }
 
@@ -884,7 +1127,9 @@ mod tests {
             })?;
         }
         // Runde 7, Teil T6/T7: +`latex-report`.
-        assert_eq!(skills, 61, "das Bundle liefert 61 Skills");
+        // Plan R9, Teil D: +10 Methoden-Skills der Analyse-Familie.
+        // Plan R9, Web-Recherche: +`osint-web-research`.
+        assert_eq!(skills, 72, "das Bundle liefert 72 Skills");
         Ok(())
     }
 

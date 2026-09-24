@@ -37,6 +37,7 @@ pub mod execution_registry;
 pub mod guard;
 pub mod history;
 pub mod history_tail;
+pub mod live_mode;
 pub mod mode;
 pub mod model;
 pub mod one_shot;
@@ -50,6 +51,8 @@ pub mod stream;
 mod test_support;
 pub mod testing;
 pub mod turn_loop;
+// Runde 9, Teil E4: vorab erteilte Freigaben der Nutzerin im Handoff.
+pub mod user_approval;
 
 pub use activation::{SessionActivation, ToolProfile};
 pub use admission::{

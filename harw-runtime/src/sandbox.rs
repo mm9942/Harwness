@@ -215,6 +215,13 @@ pub fn root_sandbox_with_network(
 /// Leere Allowlist heißt kein Host (fail-closed): der Such-Host allein
 /// öffnet nie Netz.
 ///
+/// Plan R9, offenes Recherche-Netz: mit `[network].research_web = "open"`
+/// trägt der Scope zusätzlich [`harw_authority::EgressTarget::PublicDns`]
+/// (jeder öffentliche DNS-Name, nie IP-Literale oder lokale Namen) und den
+/// Such-Host — auch bei leerer Allowlist. Kinder erben das nur über die
+/// Schnittmenge; ob eine Rolle offenes Web liest und welche Domain gefragt
+/// wird, entscheiden `OpenWebApprovalPolicy` und `harw_tool_web::open_web`.
+///
 /// # Argumente
 /// - `entry` ([`EntryKind`]): der Einstieg.
 /// - `config` (`&ResolvedConfig`): die aufgelöste Konfiguration des Laufs.
@@ -240,7 +247,8 @@ pub fn root_network_scope(entry: EntryKind, config: &ResolvedConfig) -> NetworkS
         .map(|host| host.trim().to_owned())
         .filter(|host| !host.is_empty())
         .collect();
-    if hosts.is_empty() {
+    let open = config.network.research_web.is_open();
+    if hosts.is_empty() && !open {
         return NetworkScope::empty();
     }
     if let Some(search_host) = search_backend_host(config) {
@@ -248,7 +256,16 @@ pub fn root_network_scope(entry: EntryKind, config: &ResolvedConfig) -> NetworkS
     }
     hosts.sort();
     hosts.dedup();
-    NetworkScope::from_hosts(hosts)
+    let listed = NetworkScope::from_hosts(hosts);
+    if !open {
+        return listed;
+    }
+    NetworkScope::from_targets(
+        listed
+            .targets()
+            .cloned()
+            .chain(std::iter::once(harw_authority::EgressTarget::PublicDns)),
+    )
 }
 
 /// Der Host des konfigurierten Such-Backends (`[web.search]`).
@@ -535,6 +552,31 @@ mod tests {
             }
             assert!(!scope.allows("evil.example"), "{entry:?}");
         }
+    }
+
+    /// Plan R9: `research_web = "open"` öffnet der Wurzel jeden öffentlichen
+    /// DNS-Namen (auch ohne Allowlist), nie Loopback, IP-Literale oder lokale
+    /// Namen; `allowlist` bleibt unverändert.
+    #[test]
+    fn root_network_scope_in_open_mode_allows_public_names_only() {
+        let mut config = config_without_allowlist();
+        config.network.research_web = harw_config::ResearchWebMode::Open;
+        for entry in [EntryKind::Tui, EntryKind::OneShot] {
+            let scope = root_network_scope(entry, &config);
+            assert!(scope.allows_public_dns(), "{entry:?}");
+            assert!(scope.allows("www.destatis.de"), "{entry:?}");
+            assert!(scope.allows("html.duckduckgo.com"), "{entry:?}");
+            for local in ["localhost", "127.0.0.1", "10.0.0.1", "printer.local"] {
+                assert!(!scope.allows(local), "{entry:?} {local}");
+            }
+        }
+        for entry in ALL_ENTRIES {
+            if !matches!(entry, EntryKind::Tui | EntryKind::OneShot) {
+                assert!(root_network_scope(entry, &config).is_empty(), "{entry:?}");
+            }
+        }
+        config.network.research_web = harw_config::ResearchWebMode::Allowlist;
+        assert!(root_network_scope(EntryKind::Tui, &config).is_empty());
     }
 
     #[test]

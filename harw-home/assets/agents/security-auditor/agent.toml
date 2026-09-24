@@ -1,7 +1,0 @@
-name = "security-auditor"
-role = "worker"
-description = "Inspects authentication, authorization, input handling, and trust boundaries."
-system_file = "system.md"
-skills = ["security-inspection"]
-timeout_seconds = 240
-max_retries = 1

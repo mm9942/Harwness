@@ -1,7 +1,0 @@
-name = "secret-scanner"
-role = "worker"
-description = "Searches approved scopes for credential exposure and reports safe remediation."
-system_file = "system.md"
-skills = ["security-inspection"]
-timeout_seconds = 240
-max_retries = 1

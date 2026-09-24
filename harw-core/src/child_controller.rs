@@ -533,6 +533,15 @@ fn task_tokens_to_bytes(
 
 /// Kürzt einen Auftrag in der Mitte auf höchstens `max_bytes` (Kopf 60 %,
 /// Ende 40 %), mit sichtbarer Markierung der Auslassung (Teil C).
+/// Runde 9, E3: kleinste Wartezeit, nach der das Zeitbudget eines Kindes
+/// erneut gegen seine Fragen-Wartezeit geprüft wird (verhindert ein
+/// Leerlaufen der Schleife in `enforce_child_budget`).
+const QUESTION_BUDGET_RECHECK: Duration = Duration::from_millis(10);
+
+/// Runde 9, E3: Deckel der letzten Antwort in der Übergabe eines regulär
+/// beendeten Kindes (Fortsetzungs-Buch).
+const COMPLETED_HANDOFF_ANSWER_MAX_BYTES: usize = 8 * 1024;
+
 fn cap_task_text(text: &str, max_bytes: usize) -> String {
     const NOTICE: &str = "[Hinweis: Der Auftrag war zu lang für das Kontextfenster und wurde \
                           in der Mitte gekürzt.]\n";
@@ -2047,6 +2056,70 @@ struct ExternalRootParent {
     activation: SessionActivation,
 }
 
+/// Runde 9, E7: Eltern-Sicht einer admittierten Kind-Sitzung, deren Session
+/// für einen laufenden Turn aus dem [`SessionManager`] entnommen ist.
+///
+/// # Beschreibung
+/// [`ManagedAgentSpawner::run_child`] nimmt die Session eines Kindes für die
+/// Dauer seines Turns aus dem Manager. Startet dieses Kind **während** seines
+/// Turns selbst Kinder (ein Werkzeug wie `matrix.run`, das Sitz-Agenten
+/// startet, oder ein Handoff), fand die Admission den Elternteil nicht mehr
+/// und lehnte jedes Enkelkind sofort mit „unknown child parent“ ab — der
+/// Matrix-Game-Master als Kind der UIA ließ so jeden Sitz passen.
+///
+/// Der Schnappschuss entsteht unter dem Manager-Lock im selben Schritt wie
+/// die Entnahme und verschwindet in `return_session` wieder; er enthält genau
+/// die Felder, die die Admission sonst aus der Eltern-Session liest. Er ist
+/// vertrauenswürdig wie die Session selbst (dieselbe Quelle, kein
+/// Modell-Output) und kann die Autorität nie erweitern: Sandbox, Aktivierung,
+/// Kontextdecke und Tiefe werden unverändert weiter geschnitten.
+#[derive(Debug, Clone)]
+struct CheckedOutParent {
+    parent_session_id: Option<SessionId>,
+    spawn_context: Option<SpawnContext>,
+    reasoning_effort: Option<ReasoningEffort>,
+    activation: SessionActivation,
+    active_model: Option<String>,
+    active_provider: Option<String>,
+    /// Alle Werkzeugnamen der Registry (ungefiltert; die Admission filtert
+    /// wie bei einer Manager-Session über `activation`).
+    tool_names: Vec<String>,
+    /// Plan R9, E1: der Interaktionsmodus der Session bei der Entnahme
+    /// (Plan-Modus-Vererbung an ihre Kinder).
+    mode: crate::mode::InteractionMode,
+    /// Plan R9, E1/E6: Basis-Aktivierung und Basis-Sandbox (ohne Modus-
+    /// Schnitt) für den Eltern-Schnitt eines Kindes, das dem Live-Modus folgt.
+    base_activation: SessionActivation,
+    base_sandbox: Option<SandboxSpec>,
+}
+
+impl CheckedOutParent {
+    fn of(session: &AgentSession) -> Self {
+        Self {
+            parent_session_id: session.parent_session_id().cloned(),
+            spawn_context: session.spawn_context().cloned(),
+            reasoning_effort: session.reasoning_effort(),
+            activation: session.activation().clone(),
+            active_model: session
+                .active_model()
+                .map(|model| model.as_str().to_owned()),
+            active_provider: session
+                .active_provider()
+                .map(|provider| provider.as_str().to_owned()),
+            tool_names: session
+                .registry()
+                .tool_providers()
+                .iter()
+                .flat_map(|provider| provider.tools())
+                .map(|spec| spec.name().to_string())
+                .collect(),
+            mode: session.mode(),
+            base_activation: session.base_activation().clone(),
+            base_sandbox: session.base_sandbox().cloned(),
+        }
+    }
+}
+
 /// The production-shaped [`AgentSpawner`] implementation. It is shared by
 /// registries but admits children only into its owned [`SessionManager`].
 pub struct ManagedAgentSpawner {
@@ -2101,6 +2174,13 @@ pub struct ManagedAgentSpawner {
     /// (Rolle + Anweisung, whitespace-normalisiert, kleingeschrieben) —
     /// erkennt eine doppelt vergebene Delegation (Addendum F+G).
     recent_delegation_hashes: Mutex<BTreeMap<String, VecDeque<u64>>>,
+    /// Runde 9, E7: Eltern-Sicht der Kinder, deren Session gerade für einen
+    /// Turn aus dem Manager entnommen ist (Schlüssel: Kind-ID), siehe
+    /// [`CheckedOutParent`]. Lock-Reihenfolge: stets nach `manager`.
+    checked_out: Mutex<BTreeMap<String, CheckedOutParent>>,
+    /// Runde 9, E6: Live-Modus des Baums; jedes admittierte Kind folgt ihm
+    /// (siehe [`Self::live_mode`]).
+    live_mode: crate::live_mode::LiveModeBroadcast,
     /// Kontextfenster (Tokens) je Modell-ID des Kindes; `None`-Argument =
     /// Vorgabemodell. Ohne Resolver gilt [`DEFAULT_CHILD_CONTEXT_WINDOW`].
     context_window_resolver: Option<Arc<ContextWindowResolver>>,
@@ -2144,6 +2224,16 @@ pub struct ManagedAgentSpawner {
     /// admittieren darf ([`Self::with_uia_spawnable_roles`]). Leer, solange
     /// nichts explizit gesetzt wurde — dann gilt die Spawn-Matrix unverändert.
     uia_spawnable_roles: HashSet<String>,
+    /// Plan R9, Teil C/E1: Katalogdaten der registrierten Rollen
+    /// ([`Self::with_delegation_catalog`]) — Beschreibung, Skills, Profil und
+    /// vor allem die Lese-Eigenschaft für die Plan-Modus-Regel
+    /// ([`crate::delegation_visibility::delegable_in_mode`]). Eine Rolle ohne
+    /// Eintrag gilt als nicht lesend (fail-closed im Plan-Modus).
+    delegation_catalog: BTreeMap<String, harw_extension_api::DelegationTargetInfo>,
+    /// Plan R9, E1: der zuletzt gemeldete Plan-Modus der extern gefahrenen
+    /// Wurzelsitzung ([`AgentSpawner::note_caller_mode`]); sie liegt nicht im
+    /// Manager, ihr Modus ist sonst unsichtbar.
+    external_root_plan_mode: std::sync::atomic::AtomicBool,
     /// Runde 5, Teil H: die ungekürzten Antworttexte abgeschlossener
     /// Kind-Läufe samt Elternteil (älteste zuerst), für
     /// [`Self::child_result_text`] bzw. das Werkzeug [`AGENT_RESULT_TOOL`].
@@ -2845,6 +2935,8 @@ impl ManagedAgentSpawner {
             guard_policy: crate::guard::GuardPolicy::default(),
             pitfall_advisor: None,
             recent_delegation_hashes: Mutex::new(BTreeMap::new()),
+            checked_out: Mutex::new(BTreeMap::new()),
+            live_mode: crate::live_mode::LiveModeBroadcast::default(),
             context_window_resolver: None,
             model_known_probe: None,
             root_model: None,
@@ -2855,6 +2947,8 @@ impl ManagedAgentSpawner {
             progress_sinks: Arc::new(Mutex::new(BTreeMap::new())),
             freed: tokio::sync::Notify::new(),
             uia_spawnable_roles: HashSet::new(),
+            delegation_catalog: BTreeMap::new(),
+            external_root_plan_mode: std::sync::atomic::AtomicBool::new(false),
             child_results: Mutex::new(VecDeque::new()),
             budget_handoff_mode: crate::child_handoff::BudgetHandoffMode::default(),
             handoff_ledger: Mutex::new(crate::child_handoff::HandoffLedger::default()),
@@ -2916,6 +3010,47 @@ impl ManagedAgentSpawner {
     pub fn with_uia_spawnable_roles(mut self, roles: impl IntoIterator<Item = String>) -> Self {
         self.uia_spawnable_roles.extend(roles);
         self
+    }
+
+    /// Plan R9, Teil C/E1: hinterlegt die Katalogdaten der registrierten
+    /// Rollen (aus dem Agenten-Roster der Runtime).
+    ///
+    /// # Beschreibung
+    /// Die Daten verleihen keine Rechte. Sie speisen `agents.catalog`, die
+    /// Beschreibungen der `transfer_to_*`-Werkzeuge und die Plan-Modus-Regel:
+    /// nur Einträge mit `read_only = true` bleiben im Plan-Modus delegierbar.
+    /// Ohne Katalog (Tests, eingebettete Spawner) gilt im Plan-Modus kein
+    /// Ziel als lesend — die Sichtbarkeit ist dann leer wie vor Plan R9, und
+    /// die Admission prüft den Plan-Modus nicht zusätzlich (die Sandbox des
+    /// Elternteils im Plan-Modus schneidet das Kind ohnehin).
+    ///
+    /// # Arguments
+    /// - `entries`: Katalogdaten; der Schlüssel ist `DelegationTargetInfo::name`.
+    #[must_use]
+    pub fn with_delegation_catalog(
+        mut self,
+        entries: impl IntoIterator<Item = harw_extension_api::DelegationTargetInfo>,
+    ) -> Self {
+        for entry in entries {
+            self.delegation_catalog.insert(entry.name.clone(), entry);
+        }
+        self
+    }
+
+    /// Katalogdaten eines registrierten Ziels; ohne Katalogeintrag nur der
+    /// Name und die Organisationsrolle (nicht lesend).
+    fn delegation_target_info(
+        &self,
+        name: &str,
+        role: harw_agent_dsl::roles::AgentRoleId,
+    ) -> harw_extension_api::DelegationTargetInfo {
+        self.delegation_catalog
+            .get(name)
+            .cloned()
+            .unwrap_or_else(|| harw_extension_api::DelegationTargetInfo {
+                role: crate::delegation_visibility::role_label(role).to_owned(),
+                ..harw_extension_api::DelegationTargetInfo::named(name.to_owned())
+            })
     }
 
     /// Prüft die Spawn-Berechtigung für eine Admission: die allgemeine
@@ -3083,6 +3218,20 @@ impl ManagedAgentSpawner {
             activation: parent_activation,
         });
         Ok(self)
+    }
+
+    /// Runde 9, E6: der Live-Modus dieses Agentenbaums.
+    ///
+    /// # Beschreibung
+    /// Die Oberfläche veröffentlicht darüber jeden Moduswechsel der Wurzel
+    /// (`/mode`, Shift+Tab, Planfreigabe). Jedes über diesen Spawner
+    /// admittierte Kind startet im zuletzt veröffentlichten Modus und
+    /// übernimmt spätere Wechsel an seiner nächsten Runden-Grenze — auch
+    /// Hintergrund-Kinder und Enkel. Ohne Veröffentlichung behalten Kinder
+    /// ihren eigenen Modus.
+    #[must_use]
+    pub fn live_mode(&self) -> &crate::live_mode::LiveModeBroadcast {
+        &self.live_mode
     }
 
     /// Attaches the restart-safe lease ledger before the runtime is exposed.
@@ -3708,6 +3857,8 @@ impl ManagedAgentSpawner {
             .manager
             .lock()
             .map_err(|_| Self::reject("session manager lock is poisoned"))?;
+        // Runde 9, E7: die Eltern-Sicht gilt nur, solange die Session fehlt.
+        self.check_in(&child);
         let released = self
             .released
             .lock()
@@ -4763,6 +4914,15 @@ impl ManagedAgentSpawner {
                         used_before,
                     ));
         }
+        // Werkzeug-Budget vor dem Dispatch (Ladybird-Export: „25 von 16“):
+        // der Turn führt aus einer Antwort höchstens den Rest aus.
+        if let Some(limit) = budget.max_tool_calls {
+            let used_before = self.child_tool_call_count(child).unwrap_or(0);
+            input.control = input
+                .control
+                .clone()
+                .with_tool_call_budget(limit, used_before);
+        }
         // Klon mit geteiltem Zähler: Modellrunden und Werkzeugaufrufe dieses
         // Laufs für die Kopfzeile der Übergabe.
         let control = input.control.clone();
@@ -4773,8 +4933,30 @@ impl ManagedAgentSpawner {
                 // Das Ergebnis wird gebunden, damit der `timeout`-Temporary vor
                 // den Armen fällt — sonst bliebe `turn` bis zum Ende des
                 // `match` ausgeliehen und wäre unten nicht mehr erwartbar.
-                let timed =
-                    tokio::time::timeout(Duration::from_millis(limit_ms), turn.as_mut()).await;
+                //
+                // Runde 9, E3: die Wartezeit auf eine Antwort des Elternteils
+                // (`parent.message {kind: "question"}`) ruht im Zeitbudget —
+                // ein fragendes Kind bleibt am Leben, bis die Frage
+                // beantwortet, abgebrochen oder abgelaufen ist.
+                let limit = Duration::from_millis(limit_ms);
+                let timed = loop {
+                    let waited = self.comms.question_wait(child);
+                    let remaining = limit
+                        .saturating_add(waited)
+                        .saturating_sub(started.elapsed())
+                        .max(QUESTION_BUDGET_RECHECK);
+                    match tokio::time::timeout(remaining, turn.as_mut()).await {
+                        Ok(outcome) => break Ok(outcome),
+                        Err(elapsed) => {
+                            if self.comms.has_pending_question(child)
+                                || self.comms.question_wait(child) > waited
+                            {
+                                continue;
+                            }
+                            break Err(elapsed);
+                        }
+                    }
+                };
                 match timed {
                     Ok(outcome) => outcome,
                     Err(_elapsed) => {
@@ -4793,8 +4975,13 @@ impl ManagedAgentSpawner {
                             );
                             drop(turn);
                         }
-                        let used_ms =
-                            u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
+                        let used_ms = u64::try_from(
+                            started
+                                .elapsed()
+                                .saturating_sub(self.comms.question_wait(child))
+                                .as_millis(),
+                        )
+                        .unwrap_or(u64::MAX);
                         let error =
                             Self::budget_exhausted(BudgetDimension::WallTime, limit_ms, used_ms);
                         self.set_failed(child, &error.to_string());
@@ -4821,8 +5008,11 @@ impl ManagedAgentSpawner {
         let outcome = outcome.map_err(ChildRunError::Spawn)?;
 
         if let Some(limit) = budget.max_tool_calls {
-            let used = self.child_tool_call_count(child)?;
-            if used > limit {
+            // Nicht ausgeführte (budgetbedingt beantwortete) Aufrufe stehen im
+            // Verlauf, zählen aber nicht als verbraucht.
+            let skipped = control.tool_budget_skipped();
+            let used = self.child_tool_call_count(child)?.saturating_sub(skipped);
+            if used > limit || skipped > 0 {
                 tracing::warn!(
                     child = %child,
                     dimension = BudgetDimension::ToolCalls.as_str(),
@@ -5298,7 +5488,16 @@ impl ManagedAgentSpawner {
             self.observe_orchestration(root, &record, None, AgentOrchestrationStatus::Running);
         }
         let session = match self.manager.lock() {
-            Ok(mut manager) => manager.remove(child),
+            Ok(mut manager) => {
+                let session = manager.remove(child);
+                // Runde 9, E7: unter demselben Lock die Eltern-Sicht ablegen,
+                // damit Kinder dieses Kindes während seines Turns admittiert
+                // werden können (siehe `CheckedOutParent`).
+                if let Some(session) = &session {
+                    self.check_out(child, session);
+                }
+                session
+            }
             Err(_) => {
                 self.set_status(child, previous_status);
                 return Err(Self::reject("session manager lock is poisoned"));
@@ -5491,6 +5690,11 @@ impl ManagedAgentSpawner {
                 // Runde 5, Teil H: den ungekürzten Text für `agent.result`
                 // aufheben, bevor der Aufrufer das Kind freigibt.
                 self.archive_completed_child(child, full_text.as_deref());
+                // Runde 9, E3: auch ein regulär beendetes Kind lässt sich
+                // fortsetzen (`agent.message` an ein eigenes, beendetes Kind).
+                if matches!(outcome, TurnOutcome::Completed) {
+                    self.record_completed_continuation(child, full_text.as_deref());
+                }
                 Ok(ChildRunResult {
                     child: child.clone(),
                     outcome,
@@ -5822,9 +6026,7 @@ impl ManagedAgentSpawner {
             (None, Some(note.to_owned()))
         };
         let handoff_available = handoff.is_some();
-        let report = self
-            .comms
-            .finalize_end(child, &cause, handoff.clone(), note)?;
+        let report = self.comms.finalize_end(child, &cause, handoff, note)?;
         tracing::warn!(
             child = %child,
             status = report.status.as_str(),
@@ -5837,8 +6039,9 @@ impl ManagedAgentSpawner {
         if cause.allows_continuation()
             && let Some(sandbox) = self.child_sandbox(child)
         {
-            let text = handoff
-                .unwrap_or_else(|| format!("{}\n\n{}", report.header(), report.journal_summary));
+            // Runde 9, E2: Endgrund, geänderte Dateien und Verdichtung bzw.
+            // Journal — die Fortsetzung beginnt nicht von vorn.
+            let text = report.continuation_text();
             let entry = crate::child_handoff::HandoffRecord {
                 child: child.clone(),
                 parent: report.parent.clone(),
@@ -6009,6 +6212,64 @@ impl ManagedAgentSpawner {
             Ok(mut ledger) => ledger.record(entry),
             Err(_) => tracing::warn!(child = %child, "child_handoff_ledger.lock_poisoned"),
         }
+    }
+
+    /// Runde 9, E3: legt ein regulär beendetes Kind im Fortsetzungs-Buch ab
+    /// (Übergabe: letzte Antwort, gekappt, plus Journal-Kurzfassung mit den
+    /// geänderten Dateien), damit der Elternteil es mit `continue_from` bzw.
+    /// `agent.message` wieder aufnehmen kann. Best-effort wie
+    /// [`Self::record_budget_handoff`].
+    fn record_completed_continuation(&self, child: &SessionId, text: Option<&str>) {
+        let Some(record) = self.child_record(child) else {
+            return;
+        };
+        let answer = text.map_or_else(
+            || "(keine Antwort)".to_owned(),
+            |text| cap_task_text(text, COMPLETED_HANDOFF_ANSWER_MAX_BYTES),
+        );
+        let journal = self
+            .comms
+            .journal(child)
+            .map(|journal| journal.summary(crate::child_comms::END_SUMMARY_MAX_BYTES))
+            .unwrap_or_default();
+        let entry = crate::child_handoff::HandoffRecord {
+            child: child.clone(),
+            parent: record.parent.clone(),
+            role: record.role.clone(),
+            sandbox: self.child_sandbox(child),
+            handoff: format!("Letzte Antwort:\n{answer}\n\n{journal}"),
+            kind: crate::child_handoff::BudgetHandoff::LastAnswer,
+            origin: self.continuation_origin(child),
+            end: crate::child_handoff::PredecessorEnd::Completed,
+        };
+        match self.handoff_ledger.lock() {
+            Ok(mut ledger) => ledger.record(entry),
+            Err(_) => tracing::warn!(child = %child, "child_handoff_ledger.lock_poisoned"),
+        }
+    }
+
+    /// Runde 9, E3: die Rolle, mit der `caller` sein beendetes Kind
+    /// `child_id` fortsetzen kann (`agent.message` wird dann zur Fortsetzung
+    /// über `continue_from`).
+    ///
+    /// # Returns
+    /// `None`, wenn das Kind nicht `caller` gehört, noch läuft, abgebrochen
+    /// wurde, unbekannt ist oder seine Kette voll ist — dieselbe Antwort in
+    /// allen Fällen, kein Orakel über fremde Kinder.
+    #[must_use]
+    pub fn resumable_child_role(&self, caller: &SessionId, child_id: &str) -> Option<String> {
+        let child = SessionId::try_from_str(child_id.trim().to_owned()).ok()?;
+        if let Some(record) = self.child_record(&child)
+            && (&record.parent != caller || !record.status.is_terminal())
+        {
+            return None;
+        }
+        if self.background.is_detached(&child) {
+            return None;
+        }
+        let ledger = self.handoff_ledger.lock().ok()?;
+        let entry = ledger.get(&child).filter(|entry| &entry.parent == caller)?;
+        (ledger.continuations_left(&entry.origin) > 0).then(|| entry.role.clone())
     }
 
     /// Runde 5, Teil J: prüft, ob `caller` das budget-beendete Kind `from`
@@ -6229,30 +6490,90 @@ impl ManagedAgentSpawner {
         }
     }
 
-    fn parent_depth(
+    // ── Runde 9, E7: Eltern mit laufendem Turn ─────────────────────────────
+
+    /// Legt die Eltern-Sicht eines eben für seinen Turn entnommenen Kindes
+    /// ab. Der Aufrufer hält den Manager-Lock (Lock-Reihenfolge `manager` →
+    /// `checked_out`).
+    fn check_out(&self, child: &SessionId, session: &AgentSession) {
+        match self.checked_out.lock() {
+            Ok(mut checked_out) => {
+                checked_out.insert(child.as_str().to_owned(), CheckedOutParent::of(session));
+            }
+            Err(_) => tracing::warn!(child = %child, "child_checkout.lock_poisoned"),
+        }
+    }
+
+    /// Entfernt die Eltern-Sicht wieder (Session zurückgelegt oder verworfen).
+    fn check_in(&self, child: &SessionId) {
+        match self.checked_out.lock() {
+            Ok(mut checked_out) => {
+                checked_out.remove(child.as_str());
+            }
+            Err(_) => tracing::warn!(child = %child, "child_checkin.lock_poisoned"),
+        }
+    }
+
+    /// Eltern-Sicht eines Kindes, dessen Session gerade für einen Turn
+    /// entnommen ist; `None` für jede andere Session und für ein Kind, das
+    /// inzwischen freigegeben wurde (kein Admission-Record mehr — ein
+    /// freigegebenes Kind darf keine Kinder mehr bekommen).
+    ///
+    /// # Concurrency
+    /// Nimmt kurz `checked_out` und `active`; der Aufrufer darf `active`
+    /// nicht halten.
+    fn checked_out_parent(&self, session: &SessionId) -> Option<CheckedOutParent> {
+        let view = self
+            .checked_out
+            .lock()
+            .ok()
+            .and_then(|checked_out| checked_out.get(session.as_str()).cloned())?;
+        self.child_record(session).map(|_| view)
+    }
+
+    /// Tiefe von `parent` unterhalb der Wurzel (Zahl der Kanten bis zur
+    /// Wurzel). Runde 5: eine extern registrierte Wurzel (die UIA-Sitzung der
+    /// TUI) liegt nicht im `SessionManager`; die Kette endet dort — sonst
+    /// scheiterte jeder Enkel unter der UIA mit „unknown child parent“.
+    /// Runde 9, E7: die Kette darf außerdem durch Sitzungen mit laufendem
+    /// Turn führen (ihre Eltern-Sicht aus [`CheckedOutParent`]). Der Aufrufer
+    /// hält den Manager-Lock.
+    ///
+    /// # Errors
+    /// „unknown child parent“, wenn ein Glied weder im Manager noch
+    /// entnommen ist, oder bei einer (nie erwarteten) zyklischen Kette.
+    fn lineage_depth(
+        &self,
         manager: &SessionManager,
         parent: &SessionId,
-        external_root: Option<&SessionId>,
     ) -> Result<u32, AgentSpawnError> {
+        const MAX_HOPS: u32 = 256;
+        let external_root = self
+            .external_root_parent
+            .as_ref()
+            .map(|root| &root.session_id);
         let mut depth = 0_u32;
         let mut cursor = parent.clone();
-        loop {
-            // Runde 5: eine extern registrierte Wurzel (die UIA-Sitzung der
-            // TUI) liegt nicht im `SessionManager`; die Kette endet dort mit
-            // Tiefe `depth` — sonst scheiterte jeder Enkel unter der UIA
-            // (z. B. Worker eines Root-Orchestrators) mit „unknown child parent“.
+        while depth <= MAX_HOPS {
             if depth > 0 && external_root == Some(&cursor) {
                 return Ok(depth);
             }
-            let session = manager
-                .get(&cursor)
-                .map_err(|error| Self::reject(format!("unknown child parent: {error}")))?;
-            let Some(next) = session.parent_session_id() else {
+            let next = match manager.get(&cursor) {
+                Ok(session) => session.parent_session_id().cloned(),
+                Err(error) => match self.checked_out_parent(&cursor) {
+                    Some(view) => view.parent_session_id,
+                    None => {
+                        return Err(Self::reject(format!("unknown child parent: {error}")));
+                    }
+                },
+            };
+            let Some(next) = next else {
                 return Ok(depth);
             };
             depth = depth.saturating_add(1);
-            cursor = next.clone();
+            cursor = next;
         }
+        Err(Self::reject("child parent lineage contains a cycle"))
     }
 
     /// Die vollständig geschlossene Decke: keine Sektion, die niedrigste
@@ -6420,86 +6741,189 @@ impl ManagedAgentSpawner {
         Ok(cut)
     }
 
-    /// Kern von [`AgentSpawner::delegation_target_names`] für
-    /// [`ManagedAgentSpawner`] (Addendum F+G, Nachtrag F).
+    /// Kern von [`AgentSpawner::delegation_targets`] (und damit von
+    /// [`AgentSpawner::delegation_target_names`]) für [`ManagedAgentSpawner`]
+    /// (Addendum F+G, Nachtrag F; Plan R9, Teil C/E1).
     ///
     /// # Beschreibung
-    /// Holt den Eltern-`SpawnContext` genau wie [`Self::admit`] (Manager
-    /// bzw. `external_root_parent`), baut die Kandidatenliste aus allen
-    /// registrierten Rollen (Name + `organizational_role`) und berechnet die
-    /// verbleibende Tiefe als `depth_ceiling(parent) − depth(parent)` —
-    /// dieselbe Größe, gegen die [`Self::admit`] die Tiefe eines
-    /// tatsächlichen Kindes prüft. Delegiert die eigentliche Projektion an
-    /// [`crate::delegation_visibility::visible_delegation_targets`].
+    /// Holt den Eltern-`SpawnContext` genau wie [`Self::admit`] — aus dem
+    /// Manager, aus der Eltern-Sicht einer Sitzung mit laufendem Turn
+    /// ([`CheckedOutParent`], Runde 9 E7: ohne sie sah jedes Kind **während**
+    /// seines eigenen Turns kein einziges Ziel, `delegate_wave` meldete dann
+    /// „no delegation capability“) oder von der externen Wurzel. Die
+    /// Kandidaten sind alle registrierten Rollen (Name +
+    /// `organizational_role`), die Resttiefe ist
+    /// `depth_ceiling(parent) − depth(parent)` wie bei der Admission. Die
+    /// Projektion leistet
+    /// [`crate::delegation_visibility::visible_delegation_targets`], danach
+    /// teilt [`crate::delegation_visibility::delegable_in_mode`] im
+    /// Plan-Modus (angefragt oder geerbt, [`Self::lineage_in_plan_mode`]) in
+    /// delegierbare und zurückgehaltene Ziele.
     ///
     /// # Errors
-    /// [`AgentSpawnError`] bei unbekanntem Elternteil oder vergifteter
-    /// Sperre; der öffentliche Trait-Pfad übersetzt das in eine leere Liste.
-    fn visible_delegation_target_names(
+    /// - [`harw_extension_api::DelegationUnavailable::NoSpawnContext`]:
+    ///   unbekannter Aufrufer, Aufrufer ohne vertrauenswürdigen Kontext oder
+    ///   vergiftete Sperre.
+    /// - [`harw_extension_api::DelegationUnavailable::DepthExhausted`]:
+    ///   Resttiefe 0.
+    fn delegation_targets_for(
         &self,
         parent_session_id: &SessionId,
-    ) -> Result<Vec<String>, AgentSpawnError> {
+        plan_requested: bool,
+    ) -> Result<harw_extension_api::DelegationTargets, harw_extension_api::DelegationUnavailable>
+    {
+        use harw_extension_api::DelegationUnavailable;
+        let no_context = |detail: String| DelegationUnavailable::NoSpawnContext { detail };
         let manager = self
             .manager
             .lock()
-            .map_err(|_| Self::reject("session manager lock is poisoned"))?;
-        let (caller_role, allowed_child_orchestrators, parent_depth) =
-            match manager.get(parent_session_id) {
-                Ok(parent) => {
-                    let context = parent.spawn_context().ok_or_else(|| {
-                        Self::reject("delegation caller has no trusted sandbox context")
+            .map_err(|_| no_context("session manager lock is poisoned".to_owned()))?;
+        let external_root = self
+            .external_root_parent
+            .as_ref()
+            .filter(|root| &root.session_id == parent_session_id);
+        let (caller_role, allowed_child_orchestrators, parent_depth) = match manager
+            .get(parent_session_id)
+        {
+            Ok(parent) => {
+                let context = parent.spawn_context().ok_or_else(|| {
+                    no_context("delegation caller has no trusted sandbox context".to_owned())
+                })?;
+                let depth = self
+                    .lineage_depth(&manager, parent_session_id)
+                    .map_err(|error| no_context(error.message))?;
+                (
+                    context.organizational_role,
+                    context.allowed_child_orchestrators.clone(),
+                    depth,
+                )
+            }
+            Err(_) => match (self.checked_out_parent(parent_session_id), external_root) {
+                // Runde 9, E7 / Plan R9: Aufrufer mit laufendem Turn.
+                (Some(view), _) => {
+                    let context = view.spawn_context.ok_or_else(|| {
+                        no_context("delegation caller has no trusted sandbox context".to_owned())
                     })?;
-                    let depth = Self::parent_depth(
-                        &manager,
-                        parent_session_id,
-                        self.external_root_parent
-                            .as_ref()
-                            .map(|root| &root.session_id),
-                    )?;
+                    let depth = self
+                        .lineage_depth(&manager, parent_session_id)
+                        .map_err(|error| no_context(error.message))?;
                     (
                         context.organizational_role,
-                        context.allowed_child_orchestrators.clone(),
+                        context.allowed_child_orchestrators,
                         depth,
                     )
                 }
-                Err(_) => {
-                    let external_root = self
-                        .external_root_parent
-                        .as_ref()
-                        .filter(|root| &root.session_id == parent_session_id)
-                        .ok_or_else(|| {
-                            Self::reject(format!("unknown delegation caller: {parent_session_id}"))
-                        })?;
-                    (
-                        external_root.spawn_context.organizational_role,
-                        external_root
-                            .spawn_context
-                            .allowed_child_orchestrators
-                            .clone(),
-                        0,
-                    )
+                (None, Some(root)) => (
+                    root.spawn_context.organizational_role,
+                    root.spawn_context.allowed_child_orchestrators.clone(),
+                    0,
+                ),
+                (None, None) => {
+                    return Err(no_context(format!(
+                        "unknown delegation caller: {parent_session_id}"
+                    )));
                 }
-            };
+            },
+        };
+        let plan_mode = plan_requested || self.lineage_in_plan_mode(&manager, parent_session_id);
         drop(manager);
         let inherited_depth_ceiling = self
             .active
             .lock()
-            .map_err(|_| Self::reject("child registry lock is poisoned"))?
+            .map_err(|_| no_context("child registry lock is poisoned".to_owned()))?
             .get(parent_session_id.as_str())
             .map_or(self.limits.max_depth, |record| record.depth_ceiling);
         let remaining_depth = inherited_depth_ceiling.saturating_sub(parent_depth);
+        if remaining_depth == 0 {
+            return Err(DelegationUnavailable::DepthExhausted);
+        }
         let candidates: Vec<(String, harw_agent_dsl::roles::AgentRoleId)> = self
             .roles
             .iter()
             .map(|(name, definition)| (name.clone(), definition.organizational_role))
             .collect();
-        let targets = crate::delegation_visibility::visible_delegation_targets(
+        let visible = crate::delegation_visibility::visible_delegation_targets(
             caller_role,
             &candidates,
             &allowed_child_orchestrators,
             remaining_depth,
         );
-        Ok(targets.into_iter().map(|target| target.name).collect())
+        let mut result = harw_extension_api::DelegationTargets {
+            plan_mode,
+            ..harw_extension_api::DelegationTargets::default()
+        };
+        for target in visible {
+            let info = self.delegation_target_info(&target.name, target.role);
+            if crate::delegation_visibility::delegable_in_mode(plan_mode, info.read_only) {
+                result.targets.push(info);
+            } else {
+                result.withheld_by_plan_mode.push(info);
+            }
+        }
+        Ok(result)
+    }
+
+    /// Die Namen aus [`Self::delegation_targets_for`] (ohne angefragten
+    /// Plan-Modus) mit dem Grund als [`AgentSpawnError`] — für Tests, die
+    /// einen fehlenden Spawn-Kontext nicht verschlucken dürfen.
+    ///
+    /// # Errors
+    /// Der benannte Grund aus [`Self::delegation_targets_for`].
+    #[cfg(test)]
+    fn visible_delegation_target_names(
+        &self,
+        parent_session_id: &SessionId,
+    ) -> Result<Vec<String>, AgentSpawnError> {
+        self.delegation_targets_for(parent_session_id, false)
+            .map(|targets| targets.names())
+            .map_err(|error| Self::reject(error.to_string()))
+    }
+
+    /// Plan R9, E1: ob `session` selbst oder einer ihrer Vorfahren im
+    /// Plan-Modus ist — Kinder erben den Plan-Modus ihres Elternteils.
+    ///
+    /// # Beschreibung
+    /// Hat die Oberfläche einen Live-Modus veröffentlicht (Runde 9, E6,
+    /// [`Self::live_mode`]), ist er die Antwort für den ganzen Baum — so
+    /// können Sichtbarkeit und Live-Modus der Kinder nie auseinanderlaufen
+    /// (eine entnommene Eltern-Sicht trüge sonst einen veralteten Modus).
+    /// Ohne Veröffentlichung läuft die Kette wie [`Self::lineage_depth`] über Manager-Sitzungen und
+    /// Eltern-Sichten laufender Turns bis zur externen Wurzel, deren Modus
+    /// über [`AgentSpawner::note_caller_mode`] gemeldet wird. Ein Modus-
+    /// wechsel (auch ein live weitergereichter) wirkt damit sofort auf alle
+    /// Nachkommen. Eine unbekannte Sitzung beendet die Suche (kein
+    /// Plan-Modus bekannt). Der Aufrufer hält den Manager-Lock.
+    fn lineage_in_plan_mode(&self, manager: &SessionManager, session: &SessionId) -> bool {
+        const MAX_HOPS: u32 = 256;
+        if let Some(mode) = self.live_mode.current() {
+            return mode == crate::mode::InteractionMode::Plan;
+        }
+        let external_root = self
+            .external_root_parent
+            .as_ref()
+            .map(|root| &root.session_id);
+        let root_in_plan = || {
+            self.external_root_plan_mode
+                .load(std::sync::atomic::Ordering::Acquire)
+        };
+        let mut cursor = session.clone();
+        for _ in 0..MAX_HOPS {
+            let (mode, next) = match manager.get(&cursor) {
+                Ok(current) => (current.mode(), current.parent_session_id().cloned()),
+                Err(_) => match self.checked_out_parent(&cursor) {
+                    Some(view) => (view.mode, view.parent_session_id),
+                    None => return external_root == Some(&cursor) && root_in_plan(),
+                },
+            };
+            if mode == crate::mode::InteractionMode::Plan {
+                return true;
+            }
+            match next {
+                Some(next) => cursor = next,
+                None => return false,
+            }
+        }
+        false
     }
 
     /// Admits a child. Unchanged public behavior and error messages — a thin
@@ -6661,6 +7085,13 @@ impl ManagedAgentSpawner {
         // extern gefahrenen Wurzel `Self::root_model`) ist der Rückfall für
         // das Kind-Modell, wenn weder Pin noch Factory-Hauptmodell bekannt
         // sind.
+        // Runde 9, E7: Eltern-Sicht, falls der Elternteil gerade selbst einen
+        // Turn fährt (seine Session ist dann nicht im Manager).
+        let checked_out_parent = if manager.contains(&input.parent_session_id) {
+            None
+        } else {
+            self.checked_out_parent(&input.parent_session_id)
+        };
         let (
             parent_context,
             parent_reasoning_effort,
@@ -6675,15 +7106,28 @@ impl ManagedAgentSpawner {
                     .ok_or_else(|| Self::reject("child parent has no trusted sandbox context"))?,
                 parent.reasoning_effort(),
                 parent.activation().clone(),
-                Self::parent_depth(
-                    &manager,
-                    &input.parent_session_id,
-                    self.external_root_parent
-                        .as_ref()
-                        .map(|root| &root.session_id),
-                )?,
+                // Runde 9, E7: die Kette darf durch Vorfahren mit laufendem
+                // Turn führen (`lineage_depth`).
+                self.lineage_depth(&manager, &input.parent_session_id)?,
                 parent.active_model().map(|model| model.as_str().to_owned()),
             ),
+            // Runde 9, E7: der Elternteil ist ein Kind, dessen Turn gerade
+            // läuft (Session entnommen) — z. B. der Matrix-Game-Master, der
+            // aus `matrix.run` heraus seine Sitz-Agenten startet.
+            Err(_) if checked_out_parent.is_some() => {
+                let view = checked_out_parent.clone().ok_or_else(|| {
+                    Self::reject(format!("unknown child parent: {}", input.parent_session_id))
+                })?;
+                (
+                    view.spawn_context.ok_or_else(|| {
+                        Self::reject("child parent has no trusted sandbox context")
+                    })?,
+                    view.reasoning_effort,
+                    view.activation,
+                    self.lineage_depth(&manager, &input.parent_session_id)?,
+                    view.active_model,
+                )
+            }
             Err(_) => {
                 let external_root = self
                     .external_root_parent
@@ -6700,6 +7144,45 @@ impl ManagedAgentSpawner {
                     self.root_model.clone(),
                 )
             }
+        };
+        // Plan R9, E1 (mit E6): folgt der Baum einem veröffentlichten
+        // Live-Modus, schneidet das Kind gegen die **Basis** des Elternteils
+        // (Aktivierung und Sandbox ohne Modus-Schnitt) — der Live-Modus
+        // schneidet dann das Kind selbst dynamisch. Sonst behielte ein im
+        // Plan-Modus gestarteter (lesender) Orchestrator nach dem Wechsel zu
+        // `work` für immer die Plan-Decke und könnte seinen schreibenden
+        // Kindern nichts mehr geben. Ohne Live-Modus folgt das Kind keinem
+        // Wechsel; dann bleibt der Schnitt gegen den aktuellen Stand.
+        let follows_live_mode = self.live_mode.current().is_some();
+        let (parent_base_activation, parent_base_sandbox) = if follows_live_mode {
+            match manager.get(&input.parent_session_id) {
+                Ok(parent) => (
+                    Some(parent.base_activation().clone()),
+                    parent.base_sandbox().cloned(),
+                ),
+                Err(_) => checked_out_parent.as_ref().map_or((None, None), |view| {
+                    (
+                        Some(view.base_activation.clone()),
+                        view.base_sandbox.clone(),
+                    )
+                }),
+            }
+        } else {
+            (None, None)
+        };
+        let parent_activation = parent_base_activation.unwrap_or(parent_activation);
+        // Nur eine unverändert durchgereichte Eltern-Sandbox (Handoff) wird auf
+        // die Basis gehoben; eine bewusst engere Anfrage (Reducer, Sitz-
+        // Sandbox) bleibt, wie sie ist, und wird gegen den aktuellen Stand
+        // geprüft. Grenzfall: schneidet der Plan-Modus die Eltern-Sandbox
+        // schon auf genau das, was ein Reducer ergäbe, ist die Anfrage davon
+        // nicht zu unterscheiden und wird ebenfalls gehoben. Das bleibt in
+        // der Basis des Elternteils (Kind ⊆ Eltern-Basis), und die Werkzeuge
+        // des Kindes begrenzt weiter seine eigene Rolle (Registry-Profil,
+        // Agent-IR) — ein lesendes Kind bekommt dadurch kein Schreibwerkzeug.
+        let (sandbox, parent_sandbox_ceiling) = match parent_base_sandbox {
+            Some(base) if sandbox == parent_context.sandbox => (base.clone(), base),
+            _ => (sandbox, parent_context.sandbox.clone()),
         };
         // Beide Prüfungen (geschlossene Rollenmatrix inkl. `uia-worker`,
         // Addendum J + exakte `ChildOrchestrator`-Freigabeliste) laufen über
@@ -6724,6 +7207,40 @@ impl ManagedAgentSpawner {
             return Err(AdmitRejection::Other(Self::reject(
                 "no delegation capability is available for this request",
             )));
+        }
+        // Plan R9, E1: im Plan-Modus (eigener oder geerbter) nur lesende
+        // Ziele — dieselbe Regel wie die Sichtbarkeit
+        // (`delegation_visibility::delegable_in_mode`). Ohne Katalog kennt der
+        // Controller keine Lese-Eigenschaft und prüft nicht zusätzlich (siehe
+        // `with_delegation_catalog`). Die Meldung nennt nur lesende Ziele,
+        // die der Aufrufer laut Spawn-Matrix ohnehin sieht.
+        if !self.delegation_catalog.is_empty()
+            && self.lineage_in_plan_mode(&manager, &input.parent_session_id)
+        {
+            let read_only = |name: &str| {
+                self.delegation_catalog
+                    .get(name)
+                    .is_some_and(|entry| entry.read_only)
+            };
+            if !crate::delegation_visibility::delegable_in_mode(true, read_only(role_name)) {
+                let allowed: Vec<String> = self
+                    .roles
+                    .iter()
+                    .filter(|(name, role)| {
+                        read_only(name.as_str())
+                            && can_delegate_to(
+                                parent_context.organizational_role,
+                                role.organizational_role,
+                                name.as_str(),
+                                &parent_context.allowed_child_orchestrators,
+                            )
+                    })
+                    .map(|(name, _)| name.clone())
+                    .collect();
+                return Err(AdmitRejection::Other(Self::reject(
+                    crate::delegation_visibility::plan_mode_refusal(&allowed),
+                )));
+            }
         }
 
         // Addendum F+G: doppelte Delegation erkennen — nicht blockieren, nur
@@ -6780,6 +7297,11 @@ impl ManagedAgentSpawner {
             .get(&input.parent_session_id)
             .ok()
             .and_then(|parent| parent.active_provider().map(|p| p.as_str().to_owned()))
+            .or_else(|| {
+                checked_out_parent
+                    .as_ref()
+                    .and_then(|view| view.active_provider.clone())
+            })
             .or_else(|| {
                 active
                     .get(input.parent_session_id.as_str())
@@ -6871,7 +7393,7 @@ impl ManagedAgentSpawner {
         };
 
         sandbox
-            .ensure_child_of(&parent_context.sandbox)
+            .ensure_child_of(&parent_sandbox_ceiling)
             .map_err(|error| Self::reject(format!("child sandbox escalation rejected: {error}")))?;
         let approval_actor = parent_context.approval_actor.clone();
         // AW1-01b: Trace wird vererbt, nie neu erzeugt — dieselbe `trace_id`,
@@ -6958,12 +7480,26 @@ impl ManagedAgentSpawner {
                 })
                 .map(|spec| spec.name().to_string())
                 .collect(),
-            Err(_) => BTreeSet::new(),
+            // Runde 9, E7: Elternteil mit laufendem Turn — dieselbe Filterung
+            // über die Werkzeugnamen seiner Eltern-Sicht.
+            Err(_) => checked_out_parent
+                .as_ref()
+                .map(|view| {
+                    view.tool_names
+                        .iter()
+                        .filter(|name| {
+                            parent_activation
+                                .is_tool_enabled(&harw_tools::ToolName::new(name.as_str()))
+                        })
+                        .cloned()
+                        .collect()
+                })
+                .unwrap_or_default(),
         };
         let parent_grant = ParentGrant {
             role: Some(parent_context.organizational_role),
             tools: parent_tools,
-            permissions: parent_context.sandbox.permissions().clone(),
+            permissions: parent_sandbox_ceiling.permissions().clone(),
             max_depth: inherited_depth_ceiling.saturating_sub(parent_depth),
             budget_tokens: active
                 .get(input.parent_session_id.as_str())
@@ -7066,6 +7602,9 @@ impl ManagedAgentSpawner {
             // gesetztes Verbot fiele dabei weg. Eine Autoritätsgrenze darf
             // keinen Moduswechsel überleben müssen — sie muss ihn überleben.
             child_session.narrow_base_activation(&parent_activation);
+            // Runde 9, E6: das Kind startet im aktuellen Live-Modus des
+            // Baums und folgt späteren Wechseln (von seiner Basis aus).
+            child_session.attach_live_mode(self.live_mode.follower());
         }
         // Welle 3: das Modell, das der Kind-Provider fest anspricht (z. B. ein
         // `PinnedModelProvider` für Explorer/Worker). Die Factory ist die
@@ -7684,13 +8223,54 @@ impl AgentSpawner for ManagedAgentSpawner {
     }
 
     fn delegation_target_names(&self, parent_session_id: &SessionId) -> Vec<String> {
-        self.visible_delegation_target_names(parent_session_id)
-            .unwrap_or_default()
+        // Plan R9, Teil C: früher `unwrap_or_default()` — ein fehlender
+        // Spawn-Kontext verschwand dabei spurlos in einer leeren Liste. Die
+        // Liste bleibt leer, aber der benannte Grund landet im Log; wer den
+        // Grund dem Modell zeigen muss, nutzt `delegation_targets`.
+        match self.delegation_targets_for(parent_session_id, false) {
+            Ok(targets) => targets.names(),
+            Err(harw_extension_api::DelegationUnavailable::DepthExhausted) => Vec::new(),
+            Err(error) => {
+                tracing::warn!(
+                    caller = %parent_session_id,
+                    reason = %error,
+                    "child_spawner.delegation_targets_unavailable"
+                );
+                Vec::new()
+            }
+        }
+    }
+
+    fn delegation_targets(
+        &self,
+        parent_session_id: &SessionId,
+        plan_mode: bool,
+    ) -> Result<harw_extension_api::DelegationTargets, harw_extension_api::DelegationUnavailable>
+    {
+        self.delegation_targets_for(parent_session_id, plan_mode)
+    }
+
+    fn note_caller_mode(&self, caller: &SessionId, plan_mode: bool) {
+        // Nur die extern gefahrene Wurzel braucht die Meldung: jede andere
+        // Sitzung liegt im Manager (oder als Eltern-Sicht vor) und trägt
+        // ihren Modus selbst.
+        if self
+            .external_root_parent
+            .as_ref()
+            .is_some_and(|root| &root.session_id == caller)
+        {
+            self.external_root_plan_mode
+                .store(plan_mode, std::sync::atomic::Ordering::Release);
+        }
     }
 
     // Runde 5, Teil K.
     fn child_runs_in_background(&self, child: &SessionId) -> bool {
         self.background.is_detached(child)
+    }
+
+    fn resumable_child_role(&self, caller: &SessionId, child_id: &str) -> Option<String> {
+        ManagedAgentSpawner::resumable_child_role(self, caller, child_id)
     }
 }
 
@@ -7720,6 +8300,19 @@ mod tests {
     // Runde 5, Teil O: Kind-Freigaben, Lease-Herzschlag, Hintergrund-Token
     // (`child_controller/tests/teil_o.rs`).
     mod teil_o;
+
+    // Runde 9, E7: Kinder eines Kindes mit laufendem Turn
+    // (`child_controller/tests/running_parent.rs`).
+    mod running_parent;
+
+    // Runde 9, E6: Live-Moduswechsel erreichen laufende Kinder
+    // (`child_controller/tests/live_mode.rs`).
+    mod live_mode;
+
+    // Plan R9, Teil C/E1: Sichtbarkeit mit Plan-Modus-Regel, benannte
+    // Gründe, Eltern-Schnitt gegen die Basis
+    // (`child_controller/tests/plan_delegation.rs`).
+    mod plan_delegation;
 
     // ── cap_child_return_text (Vertrag CHILD_RETURN_MAX_BYTES) ─────────────
 
@@ -13977,6 +14570,35 @@ max_depth = 0
             finished.is_err_and(|error| error.message.starts_with("kein eigenes, laufendes Kind")),
             "ein beendetes Kind nimmt keine Nachricht mehr an"
         );
+        // Runde 9, E3: … aber es lässt sich fortsetzen — nur vom eigenen
+        // Elternteil, mit derselben Rolle; die Übergabe trägt die letzte
+        // Antwort und das Journal.
+        let role = spawner
+            .child_record(&child)
+            .ok_or(TestError::Missing("record"))?
+            .role;
+        assert_eq!(
+            spawner.resumable_child_role(&parent, child.as_str()),
+            Some(role.clone())
+        );
+        assert_eq!(
+            spawner.resumable_child_role(&SessionId::new(), child.as_str()),
+            None,
+            "fremde Aufrufer setzen nicht fort"
+        );
+        assert_eq!(
+            spawner.resumable_child_role(&parent, SessionId::new().as_str()),
+            None
+        );
+        let seed = spawner
+            .prepare_continuation(&parent, &child, &role)
+            .map_err(|error| TestError::Unexpected(error.message))?;
+        assert_eq!(seed.end, crate::child_handoff::PredecessorEnd::Completed);
+        assert!(
+            seed.handoff.starts_with("Letzte Antwort:"),
+            "{}",
+            seed.handoff
+        );
         // Längendeckel.
         let (spawner, child, _model) = end_probe_child(EndProbeTurn::Finish).await?;
         let parent = spawner
@@ -14033,6 +14655,54 @@ max_depth = 0
         assert!(!answered);
         assert_eq!(reply, crate::child_comms::NO_ANSWER_REPLY);
         assert!(!spawner.comms.has_pending_question(&child));
+        Ok(())
+    }
+
+    /// Runde 9, E3: solange eine Frage an den Elternteil offen ist, ruht das
+    /// Zeitbudget — das Kind bleibt am Leben, bis die Frage beantwortet,
+    /// abgebrochen oder abgelaufen ist; danach greift das Budget wieder.
+    #[tokio::test]
+    async fn a_pending_question_pauses_the_wall_time_budget() -> TestResult {
+        let (spawner, child, _model) = end_probe_child(EndProbeTurn::Hang).await?;
+        let parent = spawner
+            .child_record(&child)
+            .ok_or(TestError::Missing("record"))?
+            .parent;
+        let (id, _receiver) = spawner
+            .comms
+            .ask_parent(&child, &parent, "root-orchestrator", "Szenario freigeben?")
+            .map_err(TestError::Unexpected)?;
+        let store = InMemoryStateStore::new();
+        let started = std::time::Instant::now();
+        let run = spawner.run_child_with_budget(
+            &child,
+            &store,
+            None,
+            TurnInput::user("Setze das Feature um"),
+            AgentBudget {
+                max_wall_time_ms: Some(150),
+                ..AgentBudget::default()
+            },
+        );
+        let release = async {
+            tokio::time::sleep(Duration::from_millis(500)).await;
+            let waiting = spawner.comms.has_pending_question(&child);
+            spawner.comms.drop_question(&child, id);
+            waiting
+        };
+        let (result, waiting) = tokio::join!(run, release);
+        assert!(
+            waiting,
+            "die Frage wartete noch nach mehr als dem Zeitbudget"
+        );
+        assert!(
+            matches!(result, Err(ChildRunError::BudgetExhausted(_))),
+            "{result:?}"
+        );
+        assert!(
+            started.elapsed() >= Duration::from_millis(500),
+            "das Budget lief nicht während der offenen Frage ab"
+        );
         Ok(())
     }
 

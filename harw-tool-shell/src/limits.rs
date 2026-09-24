@@ -44,6 +44,12 @@ pub const PRLIMIT_CANDIDATES: [&str; 2] = ["/usr/bin/prlimit", "/bin/prlimit"];
 const GIB: u64 = 1024 * 1024 * 1024;
 const MIB: u64 = 1024 * 1024;
 
+/// Wert eines Byte-Limits in [`ShellLimits`], der „keine Grenze“ bedeutet
+/// (`RLIM_INFINITY`); [`ShellLimits::prlimit_args`] schreibt dafür
+/// `unlimited`. Nur für `as_bytes` und `fsize_bytes` vorgesehen
+/// ([`ShellLimits::for_jobs`]).
+pub const RLIMIT_UNLIMITED: u64 = u64::MAX;
+
 /// Ressourcengrenzen je `shell.exec`-Aufruf.
 ///
 /// Alle Zahlenwerte müssen größer als null sein. `require_rlimits = true`
@@ -125,6 +131,38 @@ impl fmt::Display for ShellLimitsError {
 impl std::error::Error for ShellLimitsError {}
 
 impl ShellLimits {
+    /// Großzügige Grenzen für Hintergrund-Jobs (`job.start` in
+    /// `harw-tool-job`, Nutzerentscheidung Plan R9 Teil F).
+    ///
+    /// # Beschreibung
+    /// Builds, Paket-Restores und Testläufe brauchen mehr als ein einzelner
+    /// `shell.exec`-Aufruf: **kein** Adressraum-Deckel (`RLIMIT_AS`, Linker
+    /// und JIT-lastige Werkzeuge reservieren viel virtuellen Speicher) und
+    /// **kein** Dateigrößen-Deckel (`RLIMIT_FSIZE`, Logs und Artefakte können
+    /// groß werden) — beide [`RLIMIT_UNLIMITED`]. Offene Dateien 4096 statt
+    /// 256 (parallele Compiler/Linker). Die CPU-Grenze bleibt die Vorgabe und
+    /// wächst wie bei `shell.exec` mit dem Budget des Aufrufs
+    /// (`exec::timeouts::limits_for`); `nproc`, tmpfs und
+    /// `require_rlimits` bleiben unverändert.
+    ///
+    /// # Beispiele
+    /// ```rust
+    /// use harw_tool_shell::ShellLimits;
+    ///
+    /// let jobs = ShellLimits::for_jobs();
+    /// assert!(jobs.validate().is_ok());
+    /// assert_eq!(jobs.cpu_secs, ShellLimits::default().cpu_secs);
+    /// ```
+    #[must_use]
+    pub fn for_jobs() -> Self {
+        Self {
+            as_bytes: RLIMIT_UNLIMITED,
+            fsize_bytes: RLIMIT_UNLIMITED,
+            nofile: 4096,
+            ..Self::default()
+        }
+    }
+
     /// Prüft, dass alle Zahlenwerte größer als null sind.
     ///
     /// # Errors
@@ -160,9 +198,9 @@ impl ShellLimits {
     #[must_use]
     pub fn prlimit_args(&self) -> Vec<OsString> {
         vec![
-            OsString::from(format!("--as={}", self.as_bytes)),
+            OsString::from(format!("--as={}", rlimit_value(self.as_bytes))),
             OsString::from(format!("--cpu={}", self.cpu_secs)),
-            OsString::from(format!("--fsize={}", self.fsize_bytes)),
+            OsString::from(format!("--fsize={}", rlimit_value(self.fsize_bytes))),
             OsString::from(format!("--nofile={}", self.nofile)),
             OsString::from(format!("--nproc={}", self.nproc)),
             OsString::from("--"),
@@ -198,6 +236,17 @@ impl ShellLimits {
             }),
             None => Ok(None),
         }
+    }
+}
+
+/// Zahlenwert für `prlimit`; [`RLIMIT_UNLIMITED`] wird zu `unlimited`
+/// (prlimit(1) versteht beides, das Wort ist unabhängig von der Breite von
+/// `rlim_t`).
+fn rlimit_value(value: u64) -> String {
+    if value == RLIMIT_UNLIMITED {
+        "unlimited".to_owned()
+    } else {
+        value.to_string()
     }
 }
 
@@ -364,6 +413,25 @@ mod tests {
                 "--cpu=60",
                 "--fsize=268435456",
                 "--nofile=256",
+                "--nproc=4096",
+                "--",
+            ]
+        );
+    }
+
+    /// Plan R9, Teil F: Jobs laufen ohne Adressraum- und Dateigrößen-Deckel.
+    #[test]
+    fn prlimit_args_for_jobs_are_unlimited_for_as_and_fsize() {
+        let jobs = ShellLimits::for_jobs();
+        assert!(jobs.validate().is_ok());
+        assert!(jobs.require_rlimits);
+        assert_eq!(
+            strings(&jobs.prlimit_args()),
+            [
+                "--as=unlimited",
+                "--cpu=60",
+                "--fsize=unlimited",
+                "--nofile=4096",
                 "--nproc=4096",
                 "--",
             ]

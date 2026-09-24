@@ -340,6 +340,72 @@ impl WorldVar {
     }
 }
 
+/// Beleg eines recherchierten Fakts (Plan R9, „Recherche-Inject“): woher
+/// der Fakt stammt, wann er abgerufen wurde und wie belastbar er ist.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FactSource {
+    /// Fundstelle: eine `http(s)`-URL oder eine Workspace-Fundstelle
+    /// (`pfad:zeile`, `git:<commit>`).
+    pub url: String,
+    /// Abrufdatum (ISO, z. B. `2026-09-24`).
+    pub retrieved: String,
+    /// Einstufung von Quelle und Information (z. B. `B2`), falls bewertet.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rating: Option<String>,
+}
+
+impl FactSource {
+    /// Eine Zeile `Quelle: <url>, abgerufen <datum>[, Einstufung <x>]`.
+    #[must_use]
+    pub fn citation(&self) -> String {
+        let mut out = format!(
+            "Quelle: {}, abgerufen {}",
+            self.url.trim(),
+            self.retrieved.trim()
+        );
+        if let Some(rating) = self
+            .rating
+            .as_deref()
+            .map(str::trim)
+            .filter(|r| !r.is_empty())
+        {
+            out.push_str(", Einstufung ");
+            out.push_str(rating);
+        }
+        out
+    }
+}
+
+/// Ein Fakt samt Belegen als Text: `text (Quelle: …; Quelle: …)`; ohne
+/// Belege nur `text`.
+///
+/// # Examples
+/// ```rust
+/// use harw_matrix_game::state::{FactSource, sourced_fact_text};
+///
+/// let text = sourced_fact_text(
+///     "Das Projekt steht unter MIT/Apache-2.0.",
+///     &[FactSource {
+///         url: "https://example.org/LICENSE".to_owned(),
+///         retrieved: "2026-09-24".to_owned(),
+///         rating: None,
+///     }],
+/// );
+/// assert_eq!(
+///     text,
+///     "Das Projekt steht unter MIT/Apache-2.0. (Quelle: https://example.org/LICENSE, abgerufen 2026-09-24)"
+/// );
+/// ```
+#[must_use]
+pub fn sourced_fact_text(text: &str, sources: &[FactSource]) -> String {
+    let text = text.trim();
+    if sources.is_empty() {
+        return text.to_owned();
+    }
+    let citations: Vec<String> = sources.iter().map(FactSource::citation).collect();
+    format!("{text} ({})", citations.join("; "))
+}
+
 /// Erzählfakt der Welt.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Fact {
@@ -733,6 +799,11 @@ pub enum EntryKind {
     FactAdded {
         /// Text.
         text: String,
+        /// Belege eines recherchierten Fakts (Plan R9, „Recherche-Inject“ des
+        /// Game Masters); leer bei Szenario- und Effekt-Fakten. Fehlt in
+        /// älteren Journalen und wird leer nicht geschrieben.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        sources: Vec<FactSource>,
     },
     /// Fortwirkender Effekt gestartet.
     OngoingStarted {
@@ -899,7 +970,7 @@ impl EntryKind {
             }
             Self::PrivateNote { text, .. }
             | Self::Narrated { text, .. }
-            | Self::FactAdded { text }
+            | Self::FactAdded { text, .. }
             | Self::InjectApplied { text, .. } => out.push(text),
             Self::CountersSubmitted { counters, .. } => {
                 for c in counters {
@@ -1349,7 +1420,7 @@ impl GameState {
                 }
                 current.value = to.clone();
             }
-            EntryKind::FactAdded { text } => self.facts.push(Fact {
+            EntryKind::FactAdded { text, .. } => self.facts.push(Fact {
                 round: entry.round,
                 text: text.clone(),
                 audience: entry.audience.clone(),

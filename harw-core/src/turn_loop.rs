@@ -80,6 +80,11 @@
 //!   sie nicht ausdrücklich abschaltet. Beim Aufruf wird
 //!   `SpawnInput::instructions` aus `task`/`instructions`/`objective`/
 //!   `question` (plus optionalem `context`) bzw. dem Argument-JSON gefüllt.
+//!   Plan R9, Teil C: bei mehr als acht Zielen ersetzt das eine Werkzeug
+//!   `agents.delegate {agent, …}` die Einzelwerkzeuge (derselbe Spawn-Weg);
+//!   `agents.catalog` beschreibt die Ziele. Im Plan-Modus bleiben nur
+//!   lesende Ziele delegierbar (E1), ein anderes Ziel bekommt eine benannte
+//!   Ablehnung als Werkzeugergebnis.
 //!
 //! # AW1-03: warum Schritt 1 noch der alte Pfad ist
 //!
@@ -487,8 +492,8 @@ use crate::model::{ModelProvider, ModelRequest, RequestIdentity};
 use crate::session::{AgentSession, SpawnContext, TurnHandle};
 use crate::state_store::{StateStore, StateStoreError, UsageRound};
 use harw_extension_api::{
-    ApprovalDecision, LoadedInstructions, SpawnInput, ToolExecutor, TurnInputContext,
-    TurnStartInput, TurnStopInput,
+    ApprovalDecision, DelegationTargetInfo, LoadedInstructions, SpawnInput, ToolExecutor,
+    TurnInputContext, TurnStartInput, TurnStopInput,
 };
 use harw_protocol::events::TurnEvent;
 use harw_protocol::items::{
@@ -510,6 +515,12 @@ use tracing::Instrument as _;
 /// Präfix, an dem ein Tool-Call als Handoff erkannt wird (Agents-SDK-Muster
 /// `transfer_to_<role>`).
 pub const HANDOFF_PREFIX: &str = "transfer_to_";
+
+/// Anfang des Endgrunds ([`TurnControl::stop_detail`]) eines Turns, den das
+/// Token-Budget beendet hat. Der Kind-Spawner erkennt daran, dass die
+/// Budget-Übergabe (`enforce_child_budget`) statt der Endbericht-Verdichtung
+/// greift.
+pub const TOKEN_BUDGET_STOP_PREFIX: &str = "Token-Budget erschöpft";
 
 /// Ergebnis-Slot für einen parallelen Tool-Call: (ID, Ergebnis, Wandzeit ms).
 // Letztes Feld: `true`, wenn dieser Call mit `ToolsError::Cancelled`
@@ -601,7 +612,17 @@ struct TurnMeter {
     /// Wert und Verbrauch bzw. welcher Turn-Wächter); der erste gewinnt.
     /// Siehe [`TurnControl::stop_detail`].
     stop_detail: Option<String>,
+    /// Sitzungsweites Werkzeug-Budget eines Kindes als `(limit, used_before)`
+    /// (siehe [`TurnControl::with_tool_call_budget`]); `None` = keins.
+    tool_call_budget: Option<(u32, u32)>,
+    /// Werkzeugaufrufe, die wegen des Werkzeug-Budgets nicht ausgeführt,
+    /// sondern mit [`TOOL_BUDGET_SKIP_PREFIX`] beantwortet wurden.
+    tool_budget_skipped: u32,
 }
+
+/// Präfix des synthetischen Ergebnisses eines Werkzeugaufrufs, der wegen
+/// eines erschöpften Werkzeug-Budgets nicht ausgeführt wurde.
+pub const TOOL_BUDGET_SKIP_PREFIX: &str = "nicht ausgeführt: Werkzeug-Budget erschöpft";
 
 /// Vorgabe-Schwelle (Prozent des Limits), ab der ein Turn mit
 /// [`TurnTokenBudget`] die Abschluss-Anweisung
@@ -897,6 +918,57 @@ impl TurnControl {
         meter.model_rounds = meter.model_rounds.saturating_add(1);
     }
 
+    /// Setzt ein sitzungsweites Werkzeug-Budget (Kind-`max_tool_calls`):
+    /// `limit` Aufrufe insgesamt, davon `used_before` vor diesem Turn.
+    ///
+    /// # Beschreibung
+    /// Anders als [`TurnLimits::max_tool_calls`] (verwirft eine zu große
+    /// Antwort ganz) wird eine Antwort mit mehr Aufrufen als dem Rest
+    /// **vor** dem Dispatch geteilt: höchstens der Rest wird ausgeführt, die
+    /// übrigen bekommen ein Ergebnis mit [`TOOL_BUDGET_SKIP_PREFIX`], und der
+    /// Turn endet nach dieser Runde mit `CancelReason::Budget`. Der Zähler
+    /// liegt im geteilten Meter, gilt also für alle Klone.
+    #[must_use]
+    pub fn with_tool_call_budget(self, limit: u32, used_before: u32) -> Self {
+        self.meter().tool_call_budget = Some((limit, used_before));
+        self
+    }
+
+    /// Anzahl der wegen des Werkzeug-Budgets nicht ausgeführten Aufrufe.
+    #[must_use]
+    pub fn tool_budget_skipped(&self) -> u32 {
+        self.meter().tool_budget_skipped
+    }
+
+    // Teilt `calls` am Rest des Werkzeug-Budgets: behält die ersten
+    // `rest` Aufrufe und liefert die übrigen samt Ergebnistext.
+    fn split_over_tool_budget(&self, calls: &mut Vec<ToolCall>) -> Option<(Vec<ToolCall>, String)> {
+        let mut meter = self.meter();
+        let (limit, used_before) = meter.tool_call_budget?;
+        let used = used_before.saturating_add(meter.tool_calls);
+        let rest = usize::try_from(limit.saturating_sub(used)).unwrap_or(usize::MAX);
+        if calls.len() <= rest {
+            return None;
+        }
+        let skipped = calls.split_off(rest);
+        let count = u32::try_from(skipped.len()).unwrap_or(u32::MAX);
+        meter.tool_budget_skipped = meter.tool_budget_skipped.saturating_add(count);
+        let executed = used.saturating_add(u32::try_from(rest).unwrap_or(u32::MAX));
+        meter.stop_detail.get_or_insert_with(|| {
+            format!("Werkzeug-Budget erschöpft ({executed} von {limit} Aufrufen)")
+        });
+        tracing::warn!(
+            limit,
+            executed,
+            skipped = count,
+            "turn_loop.tool_budget_split"
+        );
+        Some((
+            skipped,
+            format!("{TOOL_BUDGET_SKIP_PREFIX} ({limit} von {limit})"),
+        ))
+    }
+
     // Zählt `count` ausgelöste Werkzeugaufrufe.
     fn record_tool_calls(&self, count: usize) {
         let mut meter = self.meter();
@@ -938,7 +1010,7 @@ impl TurnControl {
             ))
         } else if fresh_exhausted {
             Some(format!(
-                "Token-Budget erschöpft ({}/{} Tokens)",
+                "{TOKEN_BUDGET_STOP_PREFIX} ({} von {} neuen Tokens; Cache-Lesungen zählen nicht)",
                 fresh_used.unwrap_or(0),
                 self.token_budget.map_or(0, |budget| budget.limit)
             ))
@@ -1188,18 +1260,37 @@ pub async fn gather_context(
 ///
 /// # Arguments
 /// - `names` (`&[String]`): exakte, sortierte Rollennamen aus
-///   [`harw_extension_api::AgentSpawner::delegation_target_names`].
+///   [`harw_extension_api::AgentSpawner::delegation_targets`].
+/// - `via_delegate_tool` (`bool`): ob die Ziele über `agents.delegate`
+///   (statt `transfer_to_<name>`) angeboten werden.
+/// - `catalog` (`bool`): ob `agents.catalog` angeboten wird.
 ///
 /// # Returns
 /// `None` bei leerer Liste oder wenn die (statischen, stets gültigen)
 /// Label-/Sektionsnamen unerwartet nicht konstruierbar wären — dann bleibt
 /// der Turn ohne diesen Block, statt zu scheitern.
-fn delegation_targets_fragment(names: &[String]) -> Option<harw_context::Fragment> {
+fn delegation_targets_fragment(
+    names: &[String],
+    via_delegate_tool: bool,
+    catalog: bool,
+) -> Option<harw_context::Fragment> {
     if names.is_empty() {
         return None;
     }
+    // Plan R9, Teil C: nur Namen (Cache-stabil sortiert) plus Verweis auf
+    // den Katalog; Beschreibungen stehen in `transfer_to_*` bzw. im Katalog.
+    let tool = if via_delegate_tool {
+        "agents.delegate"
+    } else {
+        "transfer_to_<name>"
+    };
+    let details = if catalog {
+        " Details: `agents.catalog`."
+    } else {
+        ""
+    };
     let body = format!(
-        "Delegierbare Ziele (transfer_to_<name>): {}",
+        "Delegierbare Ziele ({tool}): {}.{details}",
         names.join(", ")
     );
     let label = harw_context::FragmentLabel::try_new("delegation.targets").ok()?;
@@ -1655,6 +1746,13 @@ const HANDOFF_TASK_FIELDS: [&str; 4] = ["task", "instructions", "objective", "qu
 /// # Returns
 /// `Some(auftrag)` oder `None`, wenn die Argumente nichts Verwertbares tragen.
 fn handoff_instructions(arguments: &serde_json::Value) -> Option<String> {
+    // Runde 9, E4: vorab erteilte Freigaben der Nutzerin führen den Auftrag an.
+    crate::user_approval::with_user_approval(handoff_task_text(arguments), arguments)
+}
+
+/// Der Auftragstext eines Handoff-Calls ohne Freigabe-Zeile (siehe
+/// [`handoff_instructions`]).
+fn handoff_task_text(arguments: &serde_json::Value) -> Option<String> {
     let non_empty_field = |field: &str| {
         arguments
             .get(field)
@@ -1720,20 +1818,43 @@ fn handoff_role_hint(role: &str) -> &'static str {
     }
 }
 
-/// Baut die Werkzeugdefinition `transfer_to_<role>` für ein Delegationsziel.
+/// Plan R9, Teil C: das eine Delegationswerkzeug für große Ziellisten
+/// (mehr als [`crate::delegation_visibility::DELEGATE_TOOL_THRESHOLD`]
+/// sichtbare Ziele). Es läuft durch dieselbe Handoff-Erkennung wie
+/// `transfer_to_<name>` ([`delegate_tool_role`]).
+pub const AGENTS_DELEGATE_TOOL: &str = "agents.delegate";
+
+/// Plan R9, Teil C: der Katalog der sichtbaren Delegationsziele
+/// ([`agents_catalog_result`]); nur angeboten, wenn der Aufrufer Ziele sieht.
+pub const AGENTS_CATALOG_TOOL: &str = "agents.catalog";
+
+/// Höchstlänge (Zeichen) der Einzeilen-Beschreibung eines Ziels in der
+/// Beschreibung von `transfer_to_<name>`.
+pub const HANDOFF_DESCRIPTION_CHARS: usize = 90;
+
+/// Die erste Zeile bzw. der erste Satz von `text`, auf `max` Zeichen gekappt
+/// (mit `…`). Leer bleibt leer.
+fn one_line(text: &str, max: usize) -> String {
+    let line = text.trim().lines().next().unwrap_or_default().trim();
+    let sentence = match line.find(". ") {
+        Some(index) => &line[..=index],
+        None => line,
+    };
+    if sentence.chars().count() <= max {
+        return sentence.to_owned();
+    }
+    let mut capped: String = sentence.chars().take(max.saturating_sub(1)).collect();
+    capped.push('…');
+    capped
+}
+
+/// Die gemeinsamen Felder von `transfer_to_<name>` und `agents.delegate`
+/// (`task`, `context`, `continue_from`, `background`, `user_approved`).
 ///
 /// # Beschreibung
-/// Schema: `{"task": string (Pflicht), "context": string (optional),
-/// "background": bool (optional, Runde 5 Teil K), "continue_from": string
-/// (optional, Runde 5 Teil J)}`, keine weiteren Felder. Die Ausführung übernimmt die Handoff-Erkennung in
-/// `drive_turn` ([`handoff_role`]), nicht ein `ToolExecutor`.
-///
-/// # Arguments
-/// - `role` (`&str`): exakter Rollenname des Delegationsziels.
-///
-/// # Returns
-/// Die Function-Tool-Spezifikation.
-fn handoff_tool_spec(role: &str) -> ToolSpec {
+/// Plan R9, Teil C: die Beschreibungen sind bewusst knapp — sie stehen in
+/// jeder Delegationsdefinition und damit in jedem Prompt.
+fn handoff_properties() -> BTreeMap<String, JsonSchema> {
     let string_property = |description: &str| JsonSchema {
         schema_type: Some(JsonSchemaType::String),
         description: Some(description.to_owned()),
@@ -1746,17 +1867,21 @@ fn handoff_tool_spec(role: &str) -> ToolSpec {
     );
     properties.insert(
         "context".to_owned(),
-        string_property("Optionaler Zusatzkontext (Fakten, Pfade, Randbedingungen)."),
+        string_property("Optional: Fakten, Pfade, Randbedingungen."),
     );
-    // Runde 5, Teil J: Fortsetzung eines am Budget beendeten eigenen Kindes
-    // derselben Rolle; geprüft von `ManagedAgentSpawner::admit`.
+    // Runde 5, Teil J: Fortsetzung eines beendeten eigenen Kindes derselben
+    // Rolle; geprüft von `ManagedAgentSpawner::admit`.
     properties.insert(
         "continue_from".to_owned(),
         string_property(
-            "Optional: ID eines eigenen, am Token-Budget beendeten Kindes dieser Rolle; das \
-             neue Kind setzt mit dessen Übergabe und frischem Budget fort (höchstens 3 \
-             Fortsetzungen je ursprünglichem Kind).",
+            "Optional: ID eines eigenen beendeten Kindes dieser Rolle; setzt mit dessen \
+             Übergabe fort (max. 3×).",
         ),
+    );
+    // Runde 9, Teil E4: vorab erteilte Freigaben der Nutzerin.
+    properties.insert(
+        crate::user_approval::USER_APPROVED_FIELD.to_owned(),
+        crate::user_approval::user_approved_schema(),
     );
     // Runde 5, Teil K: Hintergrundlauf. Ausgewertet nur von der TUI für
     // Orchestrator-Ziele der UIA-Wurzel (Vorgabe dort `true`); jeder andere
@@ -1766,83 +1891,521 @@ fn handoff_tool_spec(role: &str) -> ToolSpec {
         JsonSchema {
             schema_type: Some(JsonSchemaType::Boolean),
             description: Some(
-                "Optional: im Hintergrund laufen lassen (nur Orchestratoren der UIA in der TUI; \
-                 Vorgabe dort true): sofortige Rückkehr mit {child_id, status, hint}, das \
-                 Ergebnis kommt als Benachrichtigung. false erzwingt synchrones Warten."
+                "Optional (nur UIA-Orchestratoren in der TUI, dort Vorgabe true): sofort \
+                 zurück, Ergebnis kommt als Benachrichtigung; false wartet."
+                    .to_owned(),
+            ),
+            ..JsonSchema::default()
+        },
+    );
+    properties
+}
+
+/// Ein geschlossenes Objekt-Schema mit Pflichtfeldern.
+fn closed_object(properties: BTreeMap<String, JsonSchema>, required: &[&str]) -> JsonSchema {
+    JsonSchema {
+        schema_type: Some(JsonSchemaType::Object),
+        properties: Some(properties),
+        required: Some(required.iter().map(|field| (*field).to_owned()).collect()),
+        additional_properties: Some(Box::new(AdditionalProperties::Bool(false))),
+        ..JsonSchema::default()
+    }
+}
+
+/// Baut die Werkzeugdefinition `transfer_to_<role>` für ein Delegationsziel.
+///
+/// # Beschreibung
+/// Schema: [`handoff_properties`] (`task` Pflicht), keine weiteren Felder.
+/// Die Ausführung übernimmt die Handoff-Erkennung in `drive_turn`
+/// ([`handoff_role`]), nicht ein `ToolExecutor`. Plan R9, Teil C: die
+/// Beschreibung trägt die Einzeilen-Beschreibung des Ziels (höchstens
+/// [`HANDOFF_DESCRIPTION_CHARS`] Zeichen), damit das Modell ohne Katalog
+/// weiß, wofür der Agent da ist.
+///
+/// # Arguments
+/// - `role` (`&str`): exakter Rollenname des Delegationsziels.
+/// - `description` (`Option<&str>`): Beschreibung des Ziels, falls bekannt.
+///
+/// # Returns
+/// Die Function-Tool-Spezifikation.
+fn handoff_tool_spec(role: &str, description: Option<&str>) -> ToolSpec {
+    let summary = description
+        .map(|text| one_line(text, HANDOFF_DESCRIPTION_CHARS))
+        .filter(|text| !text.is_empty())
+        .map(|text| format!(" {text}"))
+        .unwrap_or_default();
+    ToolSpec::Function(FunctionToolSpec {
+        name: ToolName::new(format!("{HANDOFF_PREFIX}{role}")),
+        description: format!(
+            "Delegiert an '{role}' und wartet auf das Ergebnis.{summary}{}",
+            handoff_role_hint(role)
+        ),
+        parameters: closed_object(handoff_properties(), &["task"]),
+        strict: false,
+    })
+}
+
+/// Plan R9, Teil C: die Werkzeugdefinition `agents.delegate` —
+/// `{agent, task, context?, continue_from?, background?, user_approved?}`,
+/// `agent` als Enum der sichtbaren Ziele (sortiert, Cache-stabil).
+fn agents_delegate_tool_spec(names: &[String]) -> ToolSpec {
+    let mut properties = handoff_properties();
+    properties.insert(
+        "agent".to_owned(),
+        JsonSchema {
+            schema_type: Some(JsonSchemaType::String),
+            description: Some("Ziel-Agent; Details: `agents.catalog`.".to_owned()),
+            enum_values: Some(
+                names
+                    .iter()
+                    .map(|name| serde_json::Value::String(name.clone()))
+                    .collect(),
+            ),
+            ..JsonSchema::default()
+        },
+    );
+    ToolSpec::Function(FunctionToolSpec {
+        name: ToolName::new(AGENTS_DELEGATE_TOOL),
+        description: "Delegiert an einen sichtbaren Agenten und wartet auf das Ergebnis \
+                      (wie transfer_to_<name>)."
+            .to_owned(),
+        parameters: closed_object(properties, &["agent", "task"]),
+        strict: false,
+    })
+}
+
+/// Plan R9, Teil C: die Werkzeugdefinition `agents.catalog {query?, role?}`.
+fn agents_catalog_tool_spec() -> ToolSpec {
+    let mut properties = BTreeMap::new();
+    properties.insert(
+        "query".to_owned(),
+        JsonSchema {
+            schema_type: Some(JsonSchemaType::String),
+            description: Some("Optional: Suchbegriffe (Name, Beschreibung, Skills).".to_owned()),
+            ..JsonSchema::default()
+        },
+    );
+    properties.insert(
+        "role".to_owned(),
+        JsonSchema {
+            schema_type: Some(JsonSchemaType::String),
+            description: Some(
+                "Optional: nur diese Organisationsrolle (worker, child-orchestrator, …)."
                     .to_owned(),
             ),
             ..JsonSchema::default()
         },
     );
     ToolSpec::Function(FunctionToolSpec {
-        name: ToolName::new(format!("{HANDOFF_PREFIX}{role}")),
-        description: format!(
-            "Delegiert eine Aufgabe an den Unteragenten '{role}' und wartet auf sein Ergebnis \
-             (ein Orchestrator der UIA läuft in der TUI im Hintergrund).{}",
-            handoff_role_hint(role)
-        ),
-        parameters: JsonSchema {
-            schema_type: Some(JsonSchemaType::Object),
-            properties: Some(properties),
-            required: Some(vec!["task".to_owned()]),
-            additional_properties: Some(Box::new(AdditionalProperties::Bool(false))),
-            ..JsonSchema::default()
-        },
+        name: ToolName::new(AGENTS_CATALOG_TOOL),
+        description: "Listet die Agenten, an die du delegieren darfst: Rolle, Beschreibung, \
+                      Skills, Rechte, Budget, eingebaut/benutzerdefiniert."
+            .to_owned(),
+        parameters: closed_object(properties, &[]),
         strict: false,
     })
 }
 
-/// Ergänzt die Werkzeugliste einer Modellanfrage um `transfer_to_<role>` für
-/// jedes sichtbare Delegationsziel.
+/// Ob die Session ein erzeugtes Werkzeug `name` anbieten darf.
+///
+/// # Beschreibung
+/// Wie für `transfer_to_*`: ausgelassen wird es nur, wenn ein registriertes
+/// Werkzeug gleichen Namens existiert (die Registry gewinnt) oder die
+/// Session-Aktivierung genau dieses Werkzeug ausdrücklich abgeschaltet hat
+/// (das Profil ließe es zu, `is_tool_enabled` verneint).
+fn may_offer_generated_tool(session: &AgentSession, tools: &[ToolSpec], name: &ToolName) -> bool {
+    if tools.iter().any(|spec| spec.name() == name.as_str()) {
+        return false;
+    }
+    let activation = session.activation();
+    let profile_admits = activation
+        .profile()
+        .allowlist()
+        .as_ref()
+        .is_none_or(|allowlist| allowlist.contains(name));
+    !(profile_admits && !activation.is_tool_enabled(name))
+}
+
+/// Ergänzt die Werkzeugliste einer Modellanfrage um die Delegationswerkzeuge
+/// der sichtbaren Ziele.
 ///
 /// # Beschreibung
 /// Delegationsziele liefert der Spawner
-/// ([`harw_extension_api::AgentSpawner::delegation_target_names`]); dessen
-/// Sichtbarkeitsregeln sind die Autorität, nicht das Werkzeugprofil der
-/// Session — `Minimal`/`Coding`-Profile kennen keine `transfer_to_*`-Namen
-/// und würden Handoffs sonst stets verbergen. Ausgelassen wird ein Ziel nur,
-/// wenn (a) ein registriertes Werkzeug gleichen Namens existiert (die
-/// Registry gewinnt), (b) der Name ungültig ist ([`is_valid_handoff_role`])
-/// oder (c) die Session-Aktivierung genau dieses Werkzeug ausdrücklich
-/// abgeschaltet hat (das Profil ließe es zu, `is_tool_enabled` verneint).
+/// ([`harw_extension_api::AgentSpawner::delegation_targets`]) — bereits nach
+/// Sichtbarkeit **und** Plan-Modus gefiltert
+/// ([`crate::delegation_visibility::delegable_in_mode`]); dessen Regeln sind
+/// die Autorität, nicht das Werkzeugprofil der Session (`Minimal`/`Coding`
+/// kennen keine `transfer_to_*`-Namen und würden Handoffs sonst stets
+/// verbergen).
+///
+/// Plan R9, Teil C:
+/// - höchstens [`crate::delegation_visibility::DELEGATE_TOOL_THRESHOLD`]
+///   Ziele: je Ziel ein `transfer_to_<name>` mit Einzeilen-Beschreibung;
+/// - mehr Ziele: nur `agents.delegate` mit `agent` als Enum;
+/// - in beiden Fällen `agents.catalog`.
+///
+/// Ein einzelnes Werkzeug entfällt, wenn ein registriertes Werkzeug gleichen
+/// Namens existiert, der Name ungültig ist ([`is_valid_handoff_role`]) oder
+/// die Aktivierung es ausdrücklich abschaltet ([`may_offer_generated_tool`]).
 /// Danach wird wieder stabil nach Namen sortiert (Prompt-Cache, siehe
 /// [`collect_tools`]).
 ///
 /// # Arguments
 /// - `session` (`&AgentSession`): liefert die Aktivierung.
 /// - `tools` (`&mut Vec<ToolSpec>`): Ergebnis von [`collect_tools`].
-/// - `targets` (`&[String]`): sortierte Rollennamen der Delegationsziele.
-fn append_handoff_tools(session: &AgentSession, tools: &mut Vec<ToolSpec>, targets: &[String]) {
-    // Runde 5 (Integration Teil F): im Plan-Modus keine Übergaben anbieten —
-    // Erkundung läuft dort über die lesenden `explore`/`research`-Werkzeuge;
-    // ein `transfer_to_*` würde erst an der Plan-Sperre scheitern.
-    if targets.is_empty() || session.mode() == crate::mode::InteractionMode::Plan {
+/// - `targets` (`&[DelegationTargetInfo]`): nach Namen sortierte Ziele.
+fn append_handoff_tools(
+    session: &AgentSession,
+    tools: &mut Vec<ToolSpec>,
+    targets: &[DelegationTargetInfo],
+) {
+    let valid: Vec<&DelegationTargetInfo> = targets
+        .iter()
+        .filter(|target| {
+            let valid = is_valid_handoff_role(&target.name);
+            if !valid {
+                tracing::warn!(role = %target.name, "turn_loop.handoff_tool_invalid_role");
+            }
+            valid
+        })
+        .collect();
+    if valid.is_empty() {
         return;
     }
-    let activation = session.activation();
-    let profile_allowlist = activation.profile().allowlist();
     let mut added = false;
-    for role in targets {
-        if !is_valid_handoff_role(role) {
-            tracing::warn!(role = %role, "turn_loop.handoff_tool_invalid_role");
-            continue;
+    if valid.len() > crate::delegation_visibility::DELEGATE_TOOL_THRESHOLD {
+        let name = ToolName::new(AGENTS_DELEGATE_TOOL);
+        if may_offer_generated_tool(session, tools, &name) {
+            let names: Vec<String> = valid.iter().map(|target| target.name.clone()).collect();
+            tools.push(agents_delegate_tool_spec(&names));
+            added = true;
         }
-        let name = ToolName::new(format!("{HANDOFF_PREFIX}{role}"));
-        if tools.iter().any(|spec| spec.name() == name.as_str()) {
-            continue;
+    } else {
+        for target in &valid {
+            let name = ToolName::new(format!("{HANDOFF_PREFIX}{}", target.name));
+            if !may_offer_generated_tool(session, tools, &name) {
+                continue;
+            }
+            tools.push(handoff_tool_spec(
+                &target.name,
+                target.description.as_deref(),
+            ));
+            added = true;
         }
-        let profile_admits = profile_allowlist
-            .as_ref()
-            .is_none_or(|allowlist| allowlist.contains(&name));
-        if profile_admits && !activation.is_tool_enabled(&name) {
-            continue;
-        }
-        tools.push(handoff_tool_spec(role));
+    }
+    let catalog = ToolName::new(AGENTS_CATALOG_TOOL);
+    if may_offer_generated_tool(session, tools, &catalog) {
+        tools.push(agents_catalog_tool_spec());
         added = true;
     }
     if added {
         tools.sort_by(|a, b| a.name().cmp(b.name()));
     }
+}
+
+/// Plan R9, Teil C: schränkt `targets[].role` eines vorhandenen
+/// `delegate_wave`-Werkzeugs auf die sichtbaren Ziele ein (Enum).
+///
+/// # Beschreibung
+/// Das Schema von `delegate_wave` ist statisch (die Operation kennt ihren
+/// Aufrufer erst beim Aufruf); die Sichtbarkeit kennt nur der Turn-Loop je
+/// Anfrage. Ohne Ziele bleibt das Schema unverändert (ein leeres Enum wäre
+/// ungültig) — der Aufruf scheitert dann mit einer benannten Meldung.
+fn restrict_delegate_wave_roles(tools: &mut [ToolSpec], names: &[String]) {
+    if names.is_empty() {
+        return;
+    }
+    for spec in tools.iter_mut() {
+        let ToolSpec::Function(function) = spec;
+        if function.name.as_str() != DELEGATE_WAVE_TOOL_NAME {
+            continue;
+        }
+        let role = function
+            .parameters
+            .properties
+            .as_mut()
+            .and_then(|properties| properties.get_mut("targets"))
+            .and_then(|targets| targets.items.as_deref_mut())
+            .and_then(|item| item.properties.as_mut())
+            .and_then(|properties| properties.get_mut("role"));
+        if let Some(role) = role {
+            role.enum_values = Some(
+                names
+                    .iter()
+                    .map(|name| serde_json::Value::String(name.clone()))
+                    .collect(),
+            );
+        }
+    }
+}
+
+/// Name des Fan-out-Werkzeugs der Orchestratoren
+/// (`harw_core_bridge::DELEGATE_WAVE_TOOL`; `harw-core` hängt nicht von der
+/// Bridge ab, deshalb als Literal).
+const DELEGATE_WAVE_TOOL_NAME: &str = "delegate_wave";
+
+/// Plan R9, Teil C: Ergebnis von `agents.catalog {query?, role?}` über den
+/// sichtbaren Zielen des Aufrufers.
+///
+/// # Beschreibung
+/// Zeigt nur, was der Aufrufer ohnehin delegieren darf (dieselbe
+/// Sichtbarkeit wie Spawn, inklusive Plan-Modus) — kein Orakel. `role`
+/// filtert exakt nach Organisationsrolle; `query` rankt wie `skills.search`
+/// nach einfachen Token-Treffern (Name zählt doppelt, dann Beschreibung,
+/// Skills, Rolle) und lässt Ziele ohne Treffer weg. Ohne `query` bleibt die
+/// Namensreihenfolge.
+fn agents_catalog_result(
+    targets: &harw_extension_api::DelegationTargets,
+    arguments: &serde_json::Value,
+) -> ToolCallResult {
+    let text_field = |name: &str| {
+        arguments
+            .get(name)
+            .and_then(serde_json::Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_lowercase)
+    };
+    let role_filter = text_field("role");
+    let tokens: Vec<String> = text_field("query")
+        .map(|query| {
+            query
+                .split(|c: char| !c.is_alphanumeric())
+                .filter(|token| !token.is_empty())
+                .map(str::to_owned)
+                .collect()
+        })
+        .unwrap_or_default();
+    let mut ranked: Vec<(usize, &DelegationTargetInfo)> = targets
+        .targets
+        .iter()
+        .filter(|target| {
+            role_filter
+                .as_deref()
+                .is_none_or(|role| target.role.eq_ignore_ascii_case(role))
+        })
+        .filter_map(|target| {
+            if tokens.is_empty() {
+                return Some((0, target));
+            }
+            let name = target.name.to_lowercase();
+            let rest = format!(
+                "{} {} {}",
+                target.description.as_deref().unwrap_or_default(),
+                target.skills.join(" "),
+                target.role
+            )
+            .to_lowercase();
+            let score: usize = tokens
+                .iter()
+                .map(|token| {
+                    usize::from(name.contains(token.as_str())) * 2
+                        + usize::from(rest.contains(token.as_str()))
+                })
+                .sum();
+            (score > 0).then_some((score, target))
+        })
+        .collect();
+    ranked.sort_by(|(left_score, left), (right_score, right)| {
+        right_score
+            .cmp(left_score)
+            .then_with(|| left.name.cmp(&right.name))
+    });
+    let agents: Vec<serde_json::Value> = ranked
+        .iter()
+        .map(|(_, target)| {
+            serde_json::json!({
+                "name": target.name,
+                "role": target.role,
+                "description": target
+                    .description
+                    .as_deref()
+                    .map(|text| one_line(text, 160)),
+                "skills": target.skills,
+                "profile": target.profile_summary,
+                "read_only": target.read_only,
+                "budget_tokens": target.budget_tokens,
+                "source": if target.custom { "custom" } else { "built-in" },
+            })
+        })
+        .collect();
+    let mut result = serde_json::json!({
+        "count": agents.len(),
+        "agents": agents,
+    });
+    if targets.plan_mode
+        && let Some(object) = result.as_object_mut()
+    {
+        object.insert(
+            "note".to_owned(),
+            serde_json::Value::String(
+                "Plan-Modus: nur lesende Ziele; Schreib-/Ausführungsziele erst nach \
+                 Planfreigabe."
+                    .to_owned(),
+            ),
+        );
+    }
+    ToolCallResult::success(result)
+}
+
+/// Plan R9, Teil C: die Rolle eines `agents.delegate`-Aufrufs und die
+/// Handoff-Argumente ohne das Feld `agent` (damit Auftrag, Fortsetzung,
+/// Hintergrund und Freigaben exakt wie bei `transfer_to_<agent>` wirken).
+///
+/// # Returns
+/// `None` für jeden anderen Werkzeugnamen; `Some(Err(meldung))` für einen
+/// `agents.delegate`-Aufruf ohne gültiges `agent`.
+fn delegate_tool_role(call: &ToolCall) -> Option<Result<(String, serde_json::Value), String>> {
+    if call.name.as_str() != AGENTS_DELEGATE_TOOL {
+        return None;
+    }
+    let agent = call
+        .arguments
+        .get("agent")
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|agent| !agent.is_empty());
+    let Some(agent) = agent else {
+        return Some(Err(
+            "agents.delegate: `agent` fehlt (Name eines sichtbaren Ziels, siehe agents.catalog)"
+                .to_owned(),
+        ));
+    };
+    let mut arguments = call.arguments.clone();
+    if let Some(object) = arguments.as_object_mut() {
+        object.remove("agent");
+    }
+    Some(Ok((agent.to_owned(), arguments)))
+}
+
+/// Plan R9, Teil C/E1: prüft ein Delegationsziel vor dem Spawn gegen die
+/// Sichtbarkeit des Aufrufers und liefert eine benannte Ablehnung.
+///
+/// # Beschreibung
+/// - Ziel im Plan-Modus zurückgehalten → Plan-Modus-Meldung
+///   ([`crate::delegation_visibility::plan_mode_refusal`]).
+/// - `strict` (für `agents.delegate`) und Ziel nicht sichtbar → „Ziel X ist
+///   für dich nicht delegierbar; delegierbar sind: …“ (nur sichtbare Namen).
+/// - sonst `None`: der Spawner entscheidet wie bisher (für `transfer_to_*`
+///   bleibt die Admission die Autorität, auch bei Spawnern ohne
+///   Sichtbarkeitsprojektion).
+fn delegation_refusal(
+    targets: &Result<
+        harw_extension_api::DelegationTargets,
+        harw_extension_api::DelegationUnavailable,
+    >,
+    role: &str,
+    strict: bool,
+) -> Option<String> {
+    match targets {
+        Ok(targets) if targets.get(role).is_some() => None,
+        Ok(targets) if targets.is_withheld_by_plan_mode(role) => Some(
+            crate::delegation_visibility::plan_mode_refusal(&targets.names()),
+        ),
+        Ok(targets) if strict => Some(crate::delegation_visibility::not_delegable_message(
+            role,
+            &targets.names(),
+        )),
+        Ok(_) => None,
+        Err(error) if strict => Some(error.to_string()),
+        Err(_) => None,
+    }
+}
+
+/// Plan R9, Teil C: Rolle und Handoff-Argumente eines Delegationsaufrufs —
+/// `transfer_to_<rolle>` (Argumente unverändert) oder ein gültiges
+/// `agents.delegate` (Argumente ohne `agent`).
+fn delegation_call(call: &ToolCall) -> Option<(String, serde_json::Value)> {
+    if let Some(role) = handoff_role(&call.name) {
+        return Some((role, call.arguments.clone()));
+    }
+    delegate_tool_role(call).and_then(Result::ok)
+}
+
+/// Plan R9, Teil C: die Delegationsziele der Session ohne die, deren
+/// `transfer_to_<name>` die Aktivierung ausdrücklich abschaltet (etwa
+/// `forbidden = ["transfer_to_executor"]` des Matrix-Game-Masters).
+///
+/// # Beschreibung
+/// Ein abgeschaltetes Ziel bleibt so auch über `agents.delegate`,
+/// `agents.catalog` und den Kontextblock unerreichbar — sonst wäre das
+/// Einzelwerkzeug-Verbot über das Sammelwerkzeug umgehbar.
+fn session_delegation_targets(
+    session: &AgentSession,
+    plan_mode: bool,
+) -> Option<Result<harw_extension_api::DelegationTargets, harw_extension_api::DelegationUnavailable>>
+{
+    let spawner = session.registry().spawner()?;
+    let activation = session.activation();
+    let allowlist = activation.profile().allowlist();
+    let disabled = |name: &str| {
+        let tool = ToolName::new(format!("{HANDOFF_PREFIX}{name}"));
+        let profile_admits = allowlist
+            .as_ref()
+            .is_none_or(|allowlist| allowlist.contains(&tool));
+        profile_admits && !activation.is_tool_enabled(&tool)
+    };
+    Some(
+        spawner
+            .delegation_targets(session.id(), plan_mode)
+            .map(|mut targets| {
+                targets.targets.retain(|target| !disabled(&target.name));
+                targets
+                    .withheld_by_plan_mode
+                    .retain(|target| !disabled(&target.name));
+                targets
+            }),
+    )
+}
+
+/// Plan R9, Teil C/E1: der Delegationsschritt eines Werkzeugaufrufs im
+/// Turn-Loop.
+///
+/// # Returns
+/// `(handoff, lokales_ergebnis)`:
+/// - `(Some((rolle, argumente)), None)`: spawnen wie `transfer_to_<rolle>`
+///   (auch `agents.delegate` und `agent.message` an ein beendetes eigenes
+///   Kind, Runde 9 E3).
+/// - `(None, Some(ergebnis))`: sofort als Werkzeugergebnis beantworten —
+///   `agents.catalog`, ein `agents.delegate` ohne `agent`, ein nicht
+///   delegierbares Ziel oder die Plan-Modus-Ablehnung.
+/// - `(None, None)`: kein Delegationsaufruf; normale Ausführung.
+fn delegation_step(
+    session: &AgentSession,
+    call: &ToolCall,
+) -> (Option<(String, serde_json::Value)>, Option<ToolCallResult>) {
+    let plan_mode = session.mode() == crate::mode::InteractionMode::Plan;
+    if call.name.as_str() == AGENTS_CATALOG_TOOL && find_executor(session, &call.name).is_none() {
+        let result = match session_delegation_targets(session, plan_mode) {
+            Some(Ok(targets)) => agents_catalog_result(&targets, &call.arguments),
+            Some(Err(error)) => ToolCallResult::error(error.to_string()),
+            None => ToolCallResult::error(
+                "agents.catalog: kein Agent-Spawner in dieser Sitzung".to_owned(),
+            ),
+        };
+        return (None, Some(result));
+    }
+    let (role, arguments, strict) = if let Some(role) = handoff_role(&call.name) {
+        (role, call.arguments.clone(), false)
+    } else if find_executor(session, &call.name).is_none()
+        && let Some(delegate) = delegate_tool_role(call)
+    {
+        match delegate {
+            Ok((role, arguments)) => (role, arguments, true),
+            Err(message) => return (None, Some(ToolCallResult::error(message))),
+        }
+    } else if let Some((role, arguments)) = message_resume_handoff(session, call) {
+        (role, arguments, false)
+    } else {
+        return (None, None);
+    };
+    if let Some(targets) = session_delegation_targets(session, plan_mode)
+        && let Some(message) = delegation_refusal(&targets, &role, strict)
+    {
+        tracing::info!(role = %role, reason = %message, "turn_loop.delegation_refused");
+        return (None, Some(ToolCallResult::error(message)));
+    }
+    (Some((role, arguments)), None)
 }
 
 /// Sammelt alle Tool-Specs über alle `ToolProvider` und filtert nach der
@@ -2204,6 +2767,45 @@ fn seed_context_load_ledger(session: &AgentSession, turn_id: &harw_types::TurnId
     context_load_executor.seed_turn(turn_id.clone(), spent_per_section);
 }
 
+/// Runde 9, E3: `agent.message` an ein eigenes, bereits **beendetes** Kind
+/// wird zur Fortsetzung dieses Kindes über `continue_from` — mit der
+/// Nachricht als neuem Auftrag — statt mit „kein eigenes, laufendes Kind"
+/// zu scheitern (Export: die UIA konnte der Spielleitung nach ihrer Frage
+/// nicht mehr antworten).
+///
+/// # Returns
+/// `(rolle, handoff-argumente)` für den Handoff-Pfad; `None` für jeden
+/// anderen Aufruf, ein laufendes, fremdes, unbekanntes oder nicht
+/// fortsetzbares Kind (dann läuft `agent.message` normal und meldet
+/// dieselbe Ablehnung wie bisher). Die Eigentumsprüfung liegt beim Spawner
+/// ([`harw_extension_api::AgentSpawner::resumable_child_role`]); der
+/// Aufrufer kommt aus der Sitzung, nie aus Modell-Argumenten.
+fn message_resume_handoff(
+    session: &AgentSession,
+    call: &ToolCall,
+) -> Option<(String, serde_json::Value)> {
+    if call.name.as_str() != crate::child_comms::AGENT_MESSAGE_TOOL {
+        return None;
+    }
+    let field = |name: &str| {
+        call.arguments
+            .get(name)
+            .and_then(serde_json::Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+    };
+    let child_id = field("child_id")?;
+    let text = field("text")?;
+    let role = session
+        .registry()
+        .spawner()?
+        .resumable_child_role(session.id(), child_id)?;
+    Some((
+        role,
+        serde_json::json!({ "task": text, "continue_from": child_id }),
+    ))
+}
+
 /// Erkennt, ob ein Tool-Call ein Handoff ist (`transfer_to_<role>`).
 #[must_use]
 pub fn handoff_role(name: &ToolName) -> Option<String> {
@@ -2255,6 +2857,13 @@ fn notify_tool_outcome(
     result: &ToolCallResult,
 ) {
     emit_plan_update(session, tool_name, arguments, result);
+    // Runde 9, E3: ein Erfolg löst passende Pitfalls (kein veralteter
+    // `[harw-Wächter]`-Hinweis an späteren Ergebnissen desselben Werkzeugs).
+    if matches!(result, ToolCallResult::Success { .. })
+        && let Some(advisor) = session.pitfall_advisor()
+    {
+        advisor.resolved(tool_name, arguments);
+    }
     let Some(observer) = session.tool_outcome_observer().cloned() else {
         return;
     };
@@ -3182,7 +3791,9 @@ async fn resume_after_approval_with_store(
                 drive_turn(session, model, store, approvals, &ctx, handle, control).await
             }
             ApprovalResolution::Approve => {
-                if let Some(role) = handoff_role(&pending.call.name) {
+                // Plan R9, Teil C: `agents.delegate` wird wie
+                // `transfer_to_<agent>` gespawnt (Argumente ohne `agent`).
+                if let Some((role, handoff_arguments)) = delegation_call(&pending.call) {
                     let spawner = session.registry().spawner().cloned().ok_or_else(|| {
                         CoreError::HandoffFailed {
                             role: role.clone(),
@@ -3190,12 +3801,12 @@ async fn resume_after_approval_with_store(
                         }
                     })?;
                     // Vor dem Verschieben der Argumente in den SpawnInput lesen.
-                    let question = child_question(&pending.call.arguments);
+                    let question = child_question(&handoff_arguments);
                     let input = SpawnInput {
                         parent_session_id: session.id().clone(),
                         handoff_call_id: pending.call.id.clone(),
-                        instructions: handoff_instructions(&pending.call.arguments),
-                        context: pending.call.arguments,
+                        instructions: handoff_instructions(&handoff_arguments),
+                        context: handoff_arguments,
                         // Hereditär, nie neu erfunden: dieser Handoff deklariert
                         // selbst keine eigene Kontextdecke (`call.arguments`
                         // trägt keine), also reicht dieses Feld exakt die bereits
@@ -3233,6 +3844,8 @@ async fn resume_after_approval_with_store(
                             if crate::background_children::is_orchestration_limit_rejection(
                                 &error.message,
                             ) || crate::child_handoff::is_continuation_rejection(
+                                &error.message,
+                            ) || crate::delegation_visibility::is_plan_mode_refusal(
                                 &error.message,
                             ) =>
                         {
@@ -3504,7 +4117,22 @@ async fn drive_turn(
     // Turns bereits verbuchte `context.load`-Aufrufe verwerfen.
     seed_context_load_ledger(session, &ctx.turn_id);
 
+    // Werkzeug-Budget (Kind): Aufrufe einer Antwort über dem Rest werden
+    // nicht ausgeführt; nach der Runde mit den erlaubten endet der Turn.
+    let mut over_tool_budget: Option<(Vec<ToolCall>, String)> = None;
+
     loop {
+        if let Some((calls, message)) = over_tool_budget.take() {
+            return skip_calls_over_tool_budget(
+                session,
+                store,
+                handle,
+                total_usage,
+                calls,
+                &message,
+            )
+            .await;
+        }
         // Prüfpunkt vor jedem Modellaufruf (Moduldoku „W4a A-LOOP"): Abbruch,
         // Modellrunden, Ausgabe-Tokens, Wanduhr. Vor der Context-/Instructions-
         // Montage, damit ein bereits erschöpftes Budget diese Arbeit nicht
@@ -3512,6 +4140,9 @@ async fn drive_turn(
         if let Some(reason) = control.model_checkpoint() {
             return cancel_turn(session, handle, total_usage, reason).await;
         }
+        // Runde 9, E6: ein live gewechselter Modus des Baums gilt ab dieser
+        // Runde (Werkzeugfläche neu geschnitten, Notiz im Verlauf).
+        let _ = session.sync_live_mode();
 
         // 1./2./4a. Context + Instructions + Request-Montage (siehe
         // `assemble_round_request`). Eine Wiederholung nach Notfall-
@@ -4006,6 +4637,22 @@ async fn drive_turn(
         // in den Verlauf) entfernt — gilt für Wurzel- und Kind-Turns.
         normalize_null_string_arguments(session, &mut response.tool_calls);
 
+        // Werkzeug-Budget vor dem Dispatch: höchstens den Rest ausführen.
+        over_tool_budget = control.split_over_tool_budget(&mut response.tool_calls);
+        if response.tool_calls.is_empty() {
+            if let Some((calls, message)) = over_tool_budget.take() {
+                return skip_calls_over_tool_budget(
+                    session,
+                    store,
+                    handle,
+                    total_usage,
+                    calls,
+                    &message,
+                )
+                .await;
+            }
+        }
+
         // Prüfpunkt vor jeder Werkzeugausführung: Abbruch, Aufrufzahl, Wanduhr.
         // Trifft er zu, bekommt jeder noch offene Tool-Call dieser Antwort ein
         // synthetisches Fehlerergebnis, damit der Verlauf provider-gültig
@@ -4173,8 +4820,45 @@ async fn drive_turn(
                 }
             }
 
-            // b. Handoff-Detection.
-            if let Some(role) = handoff_role(&call.name) {
+            // b. Handoff-Detection (Runde 9, E3: auch `agent.message` an ein
+            // eigenes, beendetes Kind — als Fortsetzung, [`message_resume_handoff`];
+            // Plan R9, Teil C: auch `agents.delegate` über denselben Weg).
+            // Plan R9, Teil C/E1: `agents.catalog` und eine benannte
+            // Ablehnung (nicht delegierbar, Plan-Modus) sind Antworten an das
+            // Modell, kein Turn-Abbruch.
+            let (handoff, local_result) = delegation_step(session, &call);
+            if let Some(mut result) = local_result {
+                let abort_reason = apply_tool_guard(
+                    session,
+                    store,
+                    guard.as_mut(),
+                    &mut turn_seen_success_signatures,
+                    &mut pending_guard_hint,
+                    &mut round_progressed_by_tools,
+                    call.name.as_str(),
+                    &call.arguments,
+                    &mut result,
+                )
+                .await;
+                notify_tool_outcome(session, call.name.as_str(), &call.arguments, &result);
+                notify_tool_progress(session);
+                session.history_mut().push_tool_result(call.id, result, 0);
+                persist_last(session, store).await?;
+                if let Some(abort_reason) = abort_reason {
+                    let remaining: Vec<ToolCall> = tool_call_iter.map(|(_, call)| call).collect();
+                    return cancel_turn_with_pending_calls(
+                        session,
+                        store,
+                        handle,
+                        total_usage,
+                        abort_reason,
+                        remaining,
+                    )
+                    .await;
+                }
+                continue;
+            }
+            if let Some((role, handoff_arguments)) = handoff {
                 let spawner = session.registry().spawner().cloned().ok_or_else(|| {
                     CoreError::HandoffFailed {
                         role: role.clone(),
@@ -4184,8 +4868,8 @@ async fn drive_turn(
                 let spawn_input = SpawnInput {
                     parent_session_id: session.id().clone(),
                     handoff_call_id: call.id.clone(),
-                    instructions: handoff_instructions(&call.arguments),
-                    context: call.arguments.clone(),
+                    instructions: handoff_instructions(&handoff_arguments),
+                    context: handoff_arguments.clone(),
                     // Siehe die Begründung an der Schwester-Konstruktionsstelle
                     // in `resume_after_approval_with_store`: hereditär, nie
                     // neu erfunden.
@@ -4239,7 +4923,8 @@ async fn drive_turn(
                 if let Err(error) = &spawned
                     && (crate::background_children::is_orchestration_limit_rejection(
                         &error.message,
-                    ) || crate::child_handoff::is_continuation_rejection(&error.message))
+                    ) || crate::child_handoff::is_continuation_rejection(&error.message)
+                        || crate::delegation_visibility::is_plan_mode_refusal(&error.message))
                 {
                     let mut result = ToolCallResult::error(error.message.clone());
                     let abort_reason = apply_tool_guard(
@@ -4285,7 +4970,7 @@ async fn drive_turn(
                         turn_id: handle.turn_id.clone(),
                         child: child.clone(),
                         role: role.clone(),
-                        question: child_question(&call.arguments),
+                        question: child_question(&handoff_arguments),
                     },
                 );
                 return Ok(TurnOutcome::AwaitingChild {
@@ -4825,11 +5510,34 @@ async fn assemble_round_request(
     // Dieselben Ziele werden zusätzlich als echte Werkzeugdefinitionen
     // `transfer_to_<role>` angeboten — erst damit kann das Modell den
     // Handoff tatsächlich aufrufen (siehe `append_handoff_tools`).
+    //
+    // Plan R9, Teil C/E1: der Spawner liefert die Ziele samt Katalogdaten,
+    // bereits nach Plan-Modus gefiltert (nur lesende Ziele). Der eigene
+    // Modus wird vorher gemeldet, damit Kinder einer extern gefahrenen
+    // Wurzel ihn erben. Ein benannter Grund ohne Ziele (Resttiefe 0, kein
+    // Spawn-Kontext) lässt die Anfrage ohne Delegationswerkzeuge.
     if let Some(spawner) = session.registry().spawner() {
-        let delegation_targets = spawner.delegation_target_names(session.id());
-        append_handoff_tools(session, &mut tools, &delegation_targets);
-        if let Some(fragment) = delegation_targets_fragment(&delegation_targets) {
-            fragments.push(fragment);
+        let plan_mode = session.mode() == crate::mode::InteractionMode::Plan;
+        spawner.note_caller_mode(session.id(), plan_mode);
+        match session_delegation_targets(session, plan_mode)
+            .unwrap_or_else(|| Ok(harw_extension_api::DelegationTargets::default()))
+        {
+            Ok(delegation) => {
+                append_handoff_tools(session, &mut tools, &delegation.targets);
+                let names = delegation.names();
+                restrict_delegate_wave_roles(&mut tools, &names);
+                let via_delegate_tool =
+                    tools.iter().any(|spec| spec.name() == AGENTS_DELEGATE_TOOL);
+                let catalog = tools.iter().any(|spec| spec.name() == AGENTS_CATALOG_TOOL);
+                if let Some(fragment) =
+                    delegation_targets_fragment(&names, via_delegate_tool, catalog)
+                {
+                    fragments.push(fragment);
+                }
+            }
+            Err(error) => {
+                tracing::debug!(reason = %error, "turn_loop.delegation_targets_unavailable");
+            }
         }
     }
 
@@ -5265,6 +5973,35 @@ async fn cancel_turn_with_pending_calls(
     cancel_turn(session, handle, total_usage, reason).await
 }
 
+/// Beantwortet Werkzeugaufrufe über dem Werkzeug-Budget, ohne sie
+/// auszuführen, und beendet den Turn mit `CancelReason::Budget` (siehe
+/// [`TurnControl::with_tool_call_budget`]). Jeder `tool_call` bekommt sein
+/// `tool_result`, der Verlauf bleibt provider-gültig.
+async fn skip_calls_over_tool_budget(
+    session: &mut AgentSession,
+    store: &dyn StateStore,
+    handle: TurnHandle,
+    total_usage: harw_types::TokenUsage,
+    calls: Vec<ToolCall>,
+    message: &str,
+) -> CoreResult<TurnOutcome> {
+    for call in calls {
+        session.history_mut().push_tool_call(
+            call.id.clone(),
+            call.name.to_string(),
+            call.arguments.clone(),
+        );
+        persist_last(session, store).await?;
+        session.history_mut().push_tool_result(
+            call.id,
+            ToolCallResult::error(message.to_owned()),
+            0,
+        );
+        persist_last(session, store).await?;
+    }
+    cancel_turn(session, handle, total_usage, CancelReason::Budget).await
+}
+
 /// Execute a complete model response concurrently only when every call is an
 /// explicitly parallel-safe ordinary tool and every guardrail allows it. Any
 /// ambiguity falls back to the sequential path below; handoffs and approvals
@@ -5339,7 +6076,14 @@ async fn try_execute_parallel_calls(
     round_progressed: &mut bool,
     control: &TurnControl,
 ) -> CoreResult<ParallelOutcome> {
-    if calls.len() < 2 || calls.iter().any(|call| handoff_role(&call.name).is_some()) {
+    if calls.len() < 2
+        || calls.iter().any(|call| {
+            handoff_role(&call.name).is_some()
+                || call.name.as_str() == AGENTS_DELEGATE_TOOL
+                || call.name.as_str() == AGENTS_CATALOG_TOOL
+                || message_resume_handoff(session, call).is_some()
+        })
+    {
         return Ok(ParallelOutcome::NotApplicable);
     }
     // Runde 7, Teile A2/A5: Lesebudget und Polling-Erkennung zählen je
@@ -5689,7 +6433,7 @@ mod tests {
         assert_eq!(budget.model_checkpoint(), Some(CancelReason::Budget));
         assert_eq!(
             budget.stop_detail().as_deref(),
-            Some("Token-Budget erschöpft (150/100 Tokens)")
+            Some("Token-Budget erschöpft (150 von 100 neuen Tokens; Cache-Lesungen zählen nicht)")
         );
     }
     use crate::activation::{SessionActivation, ToolProfile};
@@ -6993,6 +7737,98 @@ mod tests {
 
         assert!(matches!(outcome, TurnOutcome::Completed));
         assert_eq!(executions.load(Ordering::SeqCst), 2);
+        Ok(())
+    }
+
+    /// Ladybird-Export „Werkzeug-Budget erschöpft (25 von 16 Aufrufen)“: eine
+    /// Antwort mit mehr Aufrufen als dem Rest des Werkzeug-Budgets führt nur
+    /// den Rest aus (parallel und sequenziell), beantwortet die übrigen mit
+    /// „nicht ausgeführt: …“ und beendet den Turn mit `Budget`.
+    #[tokio::test]
+    async fn batch_larger_than_remaining_tool_budget_executes_only_the_remainder() -> TestResult {
+        // (Vorverbrauch, Aufrufe in der Antwort, erwartet ausgeführt)
+        for (used_before, batch, expected) in [(13_u32, 5_usize, 3_usize), (15, 3, 1), (16, 2, 0)] {
+            let ids: Vec<ToolCallId> = (0..batch).map(|_| ToolCallId::new()).collect();
+            let executions = Arc::new(AtomicUsize::new(0));
+            let handler = Arc::new(CountingApproval::allow_everything());
+            let provider = StubParallelProvider::instant(&["lookup"], Arc::clone(&executions));
+            let mut session = guarded_session(provider, Arc::clone(&handler))?;
+            let store = crate::state_store::InMemoryStateStore::new();
+            let model = ScriptedModel::new(vec![
+                response_with(ids.iter().map(|id| call(id, "lookup")).collect()),
+                crate::model::ModelResponse::text("darf nicht mehr angefragt werden"),
+            ]);
+            let control = TurnControl::new().with_tool_call_budget(16, used_before);
+            let check = control.clone();
+
+            let outcome = run_turn(
+                &mut session,
+                &model,
+                &store,
+                TurnInput::user("viele Aufrufe").with_control(control),
+            )
+            .await
+            .map_err(ctx("das Budget beendet den Turn regulär"))?;
+
+            assert!(
+                matches!(
+                    outcome,
+                    TurnOutcome::Cancelled {
+                        reason: CancelReason::Budget
+                    }
+                ),
+                "{used_before}/{batch}: {outcome:?}"
+            );
+            assert_eq!(
+                executions.load(Ordering::SeqCst),
+                expected,
+                "{used_before}/{batch}"
+            );
+            assert_eq!(
+                check.tool_calls(),
+                u32::try_from(expected).unwrap_or(u32::MAX)
+            );
+            let skipped = batch - expected;
+            assert_eq!(
+                check.tool_budget_skipped(),
+                u32::try_from(skipped).unwrap_or(0)
+            );
+            assert_eq!(
+                check.stop_detail().as_deref(),
+                Some("Werkzeug-Budget erschöpft (16 von 16 Aufrufen)")
+            );
+            // Jeder Aufruf hat ein Ergebnis; die übersprungenen nennen das Budget.
+            let skip_messages: Vec<String> = session
+                .history()
+                .items()
+                .iter()
+                .filter_map(|item| match item {
+                    TurnItem::ToolResult(result) => match &result.result {
+                        ToolCallResult::Error { message }
+                            if message.starts_with(TOOL_BUDGET_SKIP_PREFIX) =>
+                        {
+                            Some(message.clone())
+                        }
+                        _ => None,
+                    },
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(skip_messages.len(), skipped, "{used_before}/{batch}");
+            assert!(
+                skip_messages
+                    .iter()
+                    .all(|message| message.ends_with("(16 von 16)")),
+                "{skip_messages:?}"
+            );
+            let results = session
+                .history()
+                .items()
+                .iter()
+                .filter(|item| matches!(item, TurnItem::ToolResult(_)))
+                .count();
+            assert_eq!(results, batch, "jeder tool_call hat sein tool_result");
+        }
         Ok(())
     }
 
@@ -9378,6 +10214,152 @@ mod tests {
         assert!(properties.contains_key("background"));
         // Runde 5, Teil J: optionale Fortsetzung, der Auftrag bleibt Pflicht.
         assert!(properties.contains_key("continue_from"));
+        // Runde 9, E4: optionale Freigaben der Nutzerin.
+        assert!(properties.contains_key("user_approved"));
+        Ok(())
+    }
+
+    /// Runde 9, E4: `user_approved` wird zur ersten Zeile des Auftrags; ohne
+    /// das Feld bleibt der Auftrag unverändert.
+    #[test]
+    fn handoff_instructions_lead_with_the_user_approval() {
+        assert_eq!(
+            handoff_instructions(&serde_json::json!({
+                "task": "Spiele das Szenario harw-oss-fuenfjahre",
+                "user_approved": ["scenario"],
+            }))
+            .as_deref(),
+            Some(
+                "Die Nutzerin hat vorab freigegeben: scenario.\n\n\
+                 Spiele das Szenario harw-oss-fuenfjahre"
+            )
+        );
+        assert_eq!(
+            handoff_instructions(&serde_json::json!({
+                "task": "Spiele",
+                "user_approved": ["alles"],
+            }))
+            .as_deref(),
+            Some("Spiele")
+        );
+    }
+
+    /// Spawner, der ein beendetes eigenes Kind als fortsetzbar meldet
+    /// (Runde 9, E3), den fragenden Aufrufer und den `SpawnInput` festhält.
+    struct ResumingSpawner {
+        finished: SessionId,
+        spawned: SessionId,
+        callers: Mutex<Vec<SessionId>>,
+        captured: Mutex<Option<(String, SpawnInput)>>,
+    }
+
+    impl AgentSpawner for ResumingSpawner {
+        fn spawn_child<'a>(
+            &'a self,
+            role: &'a str,
+            input: SpawnInput,
+            _sandbox: SandboxSpec,
+            _suggestions: Option<AgentSuggestions>,
+        ) -> SpawnFuture<'a> {
+            *self
+                .captured
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some((role.to_owned(), input));
+            let child = self.spawned.clone();
+            Box::pin(async move { Ok(child) })
+        }
+
+        fn resumable_child_role(&self, caller: &SessionId, child_id: &str) -> Option<String> {
+            self.callers
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .push(caller.clone());
+            (child_id == self.finished.as_str()).then(|| "matrix-game-master".to_owned())
+        }
+    }
+
+    /// Runde 9, E3: `agent.message` an ein eigenes, beendetes Kind wird zur
+    /// Fortsetzung über `continue_from` mit der Nachricht als Auftrag; der
+    /// Aufrufer kommt aus der Sitzung, nie aus den Argumenten.
+    #[tokio::test]
+    async fn agent_message_to_a_finished_own_child_resumes_it() -> TestResult {
+        let finished = SessionId::new();
+        let spawner = Arc::new(ResumingSpawner {
+            finished: finished.clone(),
+            spawned: SessionId::new(),
+            callers: Mutex::new(Vec::new()),
+            captured: Mutex::new(None),
+        });
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let registry = ExtensionRegistryBuilder::default()
+            .tool_provider(StubToolProvider::with_names(&["agent.message"]))
+            .spawner(spawner.clone())
+            .build();
+        let mut session = AgentSession::new(AgentRole::Assistant, None, registry, tx)
+            .with_activation(SessionActivation::new(ToolProfile::Minimal))
+            .with_spawn_context(test_spawn_context()?);
+        let store = crate::state_store::InMemoryStateStore::new();
+        let model = RecordingModel::new(vec![response_with(vec![ToolCall {
+            id: ToolCallId::new(),
+            name: ToolName::new(crate::child_comms::AGENT_MESSAGE_TOOL),
+            arguments: serde_json::json!({
+                "child_id": finished.as_str(),
+                "text": "Die Nutzerin gibt das Szenario frei.",
+            }),
+        }])]);
+
+        let outcome = run_turn(&mut session, &model, &store, TurnInput::user("antworte"))
+            .await
+            .map_err(ctx("die Fortsetzung pausiert den Turn"))?;
+        let TurnOutcome::AwaitingChild { role, .. } = outcome else {
+            return Err(TestError::Unexpected(format!("{outcome:?}")));
+        };
+        assert_eq!(role, "matrix-game-master");
+        let (spawned_role, input) = spawner
+            .captured
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .take()
+            .ok_or(TestError::Missing("der Spawner muss aufgerufen werden"))?;
+        assert_eq!(spawned_role, "matrix-game-master");
+        assert_eq!(
+            input.context,
+            serde_json::json!({
+                "task": "Die Nutzerin gibt das Szenario frei.",
+                "continue_from": finished.as_str(),
+            })
+        );
+        assert_eq!(
+            input.instructions.as_deref(),
+            Some("Die Nutzerin gibt das Szenario frei.")
+        );
+        assert_eq!(&input.parent_session_id, session.id());
+        let callers = spawner
+            .callers
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone();
+        assert!(callers.iter().all(|caller| caller == session.id()));
+
+        // Andere Aufrufe bleiben unberührt.
+        let other = ToolCall {
+            id: ToolCallId::new(),
+            name: ToolName::new(crate::child_comms::AGENT_MESSAGE_TOOL),
+            arguments: serde_json::json!({ "child_id": SessionId::new().as_str(), "text": "x" }),
+        };
+        assert!(message_resume_handoff(&session, &other).is_none());
+        let not_message = ToolCall {
+            id: ToolCallId::new(),
+            name: ToolName::new("agent.status"),
+            arguments: serde_json::json!({ "child_id": finished.as_str(), "text": "x" }),
+        };
+        assert!(message_resume_handoff(&session, &not_message).is_none());
+        let empty = ToolCall {
+            id: ToolCallId::new(),
+            name: ToolName::new(crate::child_comms::AGENT_MESSAGE_TOOL),
+            arguments: serde_json::json!({ "child_id": finished.as_str(), "text": "  " }),
+        };
+        assert!(message_resume_handoff(&session, &empty).is_none());
         Ok(())
     }
 
@@ -9386,7 +10368,7 @@ mod tests {
     /// Handoff-Beschreibungen bleiben ohne Zusatz.
     #[test]
     fn uia_shell_worker_handoff_names_the_sudo_path() {
-        let ToolSpec::Function(shell) = handoff_tool_spec("uia-shell-worker");
+        let ToolSpec::Function(shell) = handoff_tool_spec("uia-shell-worker", None);
         for phrase in [
             "sudo funktioniert über diesen Agenten",
             "`host.sudo_exec`",
@@ -9399,7 +10381,7 @@ mod tests {
                 shell.description
             );
         }
-        let ToolSpec::Function(explorer) = handoff_tool_spec("explorer");
+        let ToolSpec::Function(explorer) = handoff_tool_spec("explorer", None);
         assert!(
             !explorer.description.contains("sudo"),
             "{}",
@@ -9413,25 +10395,37 @@ mod tests {
         activation.disable_tool(ToolName::new("transfer_to_worker"));
         let session = make_session(StubToolProvider::with_names(&[]), activation);
         let mut tools = Vec::new();
-        append_handoff_tools(
-            &session,
-            &mut tools,
-            &["explorer".to_owned(), "worker".to_owned()],
-        );
+        append_handoff_tools(&session, &mut tools, &target_infos(&["explorer", "worker"]));
         let names: Vec<&str> = tools.iter().map(ToolSpec::name).collect();
-        assert_eq!(names, vec!["transfer_to_explorer"]);
+        assert_eq!(names, vec![AGENTS_CATALOG_TOOL, "transfer_to_explorer"]);
     }
 
+    /// Plan R9, E1: ein Spawner ohne Lese-Kenntnis (Default des Traits)
+    /// bietet im Plan-Modus weiterhin kein Ziel an — erst der Katalog des
+    /// `ManagedAgentSpawner` hält lesende Ziele sichtbar.
     #[test]
-    fn plan_mode_offers_no_handoff_tools() {
-        let mut session = make_session(
+    fn plan_mode_without_read_only_knowledge_offers_no_handoff_tools() -> TestResult {
+        let spawner = CapturingSpawner {
+            child: SessionId::new(),
+            targets: vec!["worker".to_owned()],
+            captured: Mutex::new(None),
+        };
+        let delegation = spawner
+            .delegation_targets(&SessionId::new(), true)
+            .map_err(|error| TestError::Unexpected(error.to_string()))?;
+        assert!(delegation.targets.is_empty());
+        assert!(delegation.is_withheld_by_plan_mode("worker"));
+        let session = make_session(
             StubToolProvider::with_names(&[]),
             SessionActivation::new(ToolProfile::Full),
         );
-        session.set_mode(crate::mode::InteractionMode::Plan);
         let mut tools = Vec::new();
-        append_handoff_tools(&session, &mut tools, &["worker".to_owned()]);
-        assert!(tools.is_empty(), "Plan-Modus bietet keine transfer_to_* an");
+        append_handoff_tools(&session, &mut tools, &delegation.targets);
+        assert!(
+            tools.is_empty(),
+            "ohne lesende Ziele keine Delegationswerkzeuge"
+        );
+        Ok(())
     }
 
     #[test]
@@ -9441,9 +10435,657 @@ mod tests {
             SessionActivation::new(ToolProfile::Full),
         );
         let mut tools = collect_tools(&session).map_err(ctx("Werkzeuge sammeln"))?;
-        let before = tools.clone();
-        append_handoff_tools(&session, &mut tools, &["worker".to_owned()]);
-        assert_eq!(tools, before, "kein Duplikat neben dem Registry-Werkzeug");
+        append_handoff_tools(&session, &mut tools, &target_infos(&["worker"]));
+        let handoffs = tools
+            .iter()
+            .filter(|spec| spec.name() == "transfer_to_worker")
+            .count();
+        assert_eq!(handoffs, 1, "kein Duplikat neben dem Registry-Werkzeug");
+        Ok(())
+    }
+
+    // ── Plan R9, Teil C/E1: Katalog, agents.delegate, Schwelle, Plan-Modus ──
+
+    fn target_infos(names: &[&str]) -> Vec<DelegationTargetInfo> {
+        names
+            .iter()
+            .map(|name| DelegationTargetInfo::named((*name).to_owned()))
+            .collect()
+    }
+
+    fn catalog_entry(
+        name: &str,
+        role: &str,
+        read_only: bool,
+        custom: bool,
+        description: &str,
+    ) -> DelegationTargetInfo {
+        DelegationTargetInfo {
+            name: name.to_owned(),
+            role: role.to_owned(),
+            description: Some(description.to_owned()),
+            skills: vec!["evidence-quality-review".to_owned()],
+            profile_summary: if read_only {
+                "read-only; 12 tools".to_owned()
+            } else {
+                "writes/executes; 20 tools".to_owned()
+            },
+            read_only,
+            budget_tokens: Some(200_000),
+            custom,
+        }
+    }
+
+    /// Katalog wie im Lauf: lesende und schreibende Ziele gemischt.
+    fn analysis_catalog() -> Vec<DelegationTargetInfo> {
+        vec![
+            catalog_entry(
+                "evidence-critic",
+                "worker",
+                true,
+                true,
+                "Prüft Belege eines Analyseprodukts. Read-only.",
+            ),
+            catalog_entry(
+                "executor",
+                "worker",
+                false,
+                false,
+                "Führt Befehle aus und schreibt Dateien.",
+            ),
+            catalog_entry(
+                "explorer",
+                "worker",
+                true,
+                false,
+                "Erkundet den Workspace lesend.",
+            ),
+        ]
+    }
+
+    /// Spawner mit Katalogdaten und derselben Plan-Modus-Regel wie der
+    /// `ManagedAgentSpawner` ([`crate::delegation_visibility::delegable_in_mode`]).
+    struct CatalogSpawner {
+        child: SessionId,
+        catalog: Vec<DelegationTargetInfo>,
+        captured: Mutex<Option<(String, SpawnInput)>>,
+    }
+
+    impl CatalogSpawner {
+        fn new(catalog: Vec<DelegationTargetInfo>) -> Arc<Self> {
+            Arc::new(Self {
+                child: SessionId::new(),
+                catalog,
+                captured: Mutex::new(None),
+            })
+        }
+
+        fn take(&self) -> Option<(String, SpawnInput)> {
+            self.captured
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .take()
+        }
+    }
+
+    impl AgentSpawner for CatalogSpawner {
+        fn spawn_child<'a>(
+            &'a self,
+            role: &'a str,
+            input: SpawnInput,
+            _sandbox: SandboxSpec,
+            _suggestions: Option<AgentSuggestions>,
+        ) -> SpawnFuture<'a> {
+            *self
+                .captured
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some((role.to_owned(), input));
+            let child = self.child.clone();
+            Box::pin(async move { Ok(child) })
+        }
+
+        fn delegation_target_names(&self, _parent_session_id: &SessionId) -> Vec<String> {
+            self.catalog
+                .iter()
+                .map(|target| target.name.clone())
+                .collect()
+        }
+
+        fn delegation_targets(
+            &self,
+            _parent_session_id: &SessionId,
+            plan_mode: bool,
+        ) -> Result<harw_extension_api::DelegationTargets, harw_extension_api::DelegationUnavailable>
+        {
+            let mut result = harw_extension_api::DelegationTargets {
+                plan_mode,
+                ..harw_extension_api::DelegationTargets::default()
+            };
+            for target in &self.catalog {
+                if crate::delegation_visibility::delegable_in_mode(plan_mode, target.read_only) {
+                    result.targets.push(target.clone());
+                } else {
+                    result.withheld_by_plan_mode.push(target.clone());
+                }
+            }
+            Ok(result)
+        }
+    }
+
+    fn catalog_session(spawner: Arc<CatalogSpawner>) -> TestResult<AgentSession> {
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let registry = ExtensionRegistryBuilder::default()
+            .tool_provider(StubToolProvider::with_names(&["fs.read"]))
+            .spawner(spawner)
+            .build();
+        Ok(AgentSession::new(AgentRole::Assistant, None, registry, tx)
+            .with_activation(SessionActivation::new(ToolProfile::Minimal))
+            .with_spawn_context(test_spawn_context()?))
+    }
+
+    fn tool_results(session: &AgentSession) -> Vec<ToolCallResult> {
+        session
+            .history()
+            .items()
+            .iter()
+            .filter_map(|item| match item {
+                TurnItem::ToolResult(result) => Some(result.result.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Genau ein Werkzeugergebnis, ein Fehler, der mit `expected` beginnt
+    /// (ein Wächter-Hinweis dürfte angehängt sein).
+    fn expect_single_error(session: &AgentSession, expected: &str) -> TestResult {
+        match tool_results(session).as_slice() {
+            [ToolCallResult::Error { message }] if message.starts_with(expected) => Ok(()),
+            other => Err(TestError::Unexpected(format!(
+                "erwartet genau den Fehler „{expected}“, bekommen {other:?}"
+            ))),
+        }
+    }
+
+    fn find_function<'a>(tools: &'a [ToolSpec], name: &str) -> TestResult<&'a FunctionToolSpec> {
+        tools
+            .iter()
+            .find_map(|spec| {
+                let ToolSpec::Function(function) = spec;
+                (function.name.as_str() == name).then_some(function)
+            })
+            .ok_or_else(|| TestError::Unexpected(format!("Werkzeug {name} fehlt")))
+    }
+
+    /// Mehr als 8 Ziele: nur `agents.delegate` (Enum der Ziele, sortiert)
+    /// plus `agents.catalog`, kein einziges `transfer_to_*`.
+    #[test]
+    fn more_than_eight_targets_switch_to_agents_delegate() -> TestResult {
+        let session = make_session(
+            StubToolProvider::with_names(&[]),
+            SessionActivation::new(ToolProfile::Minimal),
+        );
+        let names: Vec<String> = (0..9).map(|index| format!("agent-{index}")).collect();
+        let infos: Vec<DelegationTargetInfo> = names
+            .iter()
+            .map(|name| DelegationTargetInfo::named(name.clone()))
+            .collect();
+        let mut tools = Vec::new();
+        append_handoff_tools(&session, &mut tools, &infos);
+        let offered: Vec<&str> = tools.iter().map(ToolSpec::name).collect();
+        assert_eq!(offered, vec![AGENTS_CATALOG_TOOL, AGENTS_DELEGATE_TOOL]);
+        let delegate = find_function(&tools, AGENTS_DELEGATE_TOOL)?;
+        let properties = delegate
+            .parameters
+            .properties
+            .as_ref()
+            .ok_or(TestError::Missing("Properties"))?;
+        let agent = properties.get("agent").ok_or(TestError::Missing("agent"))?;
+        let expected: Vec<serde_json::Value> = names
+            .iter()
+            .map(|name| serde_json::Value::String(name.clone()))
+            .collect();
+        assert_eq!(agent.enum_values.as_ref(), Some(&expected));
+        for field in [
+            "task",
+            "context",
+            "continue_from",
+            "background",
+            "user_approved",
+        ] {
+            assert!(properties.contains_key(field), "{field}");
+        }
+        assert_eq!(
+            delegate.parameters.required,
+            Some(vec!["agent".to_owned(), "task".to_owned()])
+        );
+
+        // Genau 8 Ziele: die Einzelwerkzeuge bleiben.
+        let mut tools = Vec::new();
+        append_handoff_tools(&session, &mut tools, &infos[..8]);
+        assert_eq!(
+            tools
+                .iter()
+                .filter(|spec| spec.name().starts_with(HANDOFF_PREFIX))
+                .count(),
+            8
+        );
+        assert!(!tools.iter().any(|spec| spec.name() == AGENTS_DELEGATE_TOOL));
+        Ok(())
+    }
+
+    /// Die UIA (≤ 8 Ziele) behält `transfer_to_*`; jede Beschreibung trägt
+    /// die Einzeilen-Beschreibung des Ziels, gekappt auf 90 Zeichen.
+    #[test]
+    fn uia_keeps_transfer_tools_with_one_line_descriptions() -> TestResult {
+        let session = make_session(
+            StubToolProvider::with_names(&[]),
+            SessionActivation::new(ToolProfile::Minimal),
+        );
+        let long = "Sehr lange Beschreibung ".repeat(10);
+        let targets = vec![
+            catalog_entry(
+                "root-orchestrator",
+                "root-orchestrator",
+                true,
+                false,
+                "Plant und verteilt größere Aufgaben. Zweiter Satz bleibt draußen.",
+            ),
+            catalog_entry("uia-writer", "uia-worker", false, false, &long),
+        ];
+        let mut tools = Vec::new();
+        append_handoff_tools(&session, &mut tools, &targets);
+        let root = find_function(&tools, "transfer_to_root-orchestrator")?;
+        assert!(
+            root.description
+                .contains("Plant und verteilt größere Aufgaben."),
+            "{}",
+            root.description
+        );
+        assert!(!root.description.contains("Zweiter Satz"));
+        let writer = find_function(&tools, "transfer_to_uia-writer")?;
+        let summary = writer
+            .description
+            .split("Ergebnis. ")
+            .nth(1)
+            .ok_or(TestError::Missing("Einzeiler"))?;
+        assert!(
+            summary.chars().count() <= HANDOFF_DESCRIPTION_CHARS,
+            "{summary}"
+        );
+        assert!(summary.ends_with('…'));
+        assert!(tools.iter().any(|spec| spec.name() == AGENTS_CATALOG_TOOL));
+        Ok(())
+    }
+
+    /// `agents.delegate` spawnt über denselben Handoff-Weg wie
+    /// `transfer_to_*`: gleiche Rolle, Auftrag samt Freigabe-Zeile, Argumente
+    /// ohne `agent`, Turn pausiert mit `AwaitingChild`.
+    #[tokio::test]
+    async fn agents_delegate_spawns_through_the_handoff_path() -> TestResult {
+        let spawner = CatalogSpawner::new(analysis_catalog());
+        let mut session = catalog_session(Arc::clone(&spawner))?;
+        let store = crate::state_store::InMemoryStateStore::new();
+        let model = RecordingModel::new(vec![response_with(vec![ToolCall {
+            id: ToolCallId::new(),
+            name: ToolName::new(AGENTS_DELEGATE_TOOL),
+            arguments: serde_json::json!({
+                "agent": "evidence-critic",
+                "task": "Prüfe die Quellen",
+                "background": false,
+                "user_approved": ["plan"],
+            }),
+        }])]);
+        let outcome = run_turn(&mut session, &model, &store, TurnInput::user("delegiere"))
+            .await
+            .map_err(ctx("agents.delegate pausiert den Turn"))?;
+        let TurnOutcome::AwaitingChild { role, .. } = outcome else {
+            return Err(TestError::Unexpected(format!("{outcome:?}")));
+        };
+        assert_eq!(role, "evidence-critic");
+        let (spawned_role, input) = spawner
+            .take()
+            .ok_or(TestError::Missing("der Spawner muss aufgerufen werden"))?;
+        assert_eq!(spawned_role, "evidence-critic");
+        assert_eq!(
+            input.instructions.as_deref(),
+            Some("Die Nutzerin hat vorab freigegeben: plan.\n\nPrüfe die Quellen")
+        );
+        assert!(input.context.get("agent").is_none());
+        assert_eq!(input.context["background"], serde_json::json!(false));
+        assert_eq!(&input.parent_session_id, session.id());
+        Ok(())
+    }
+
+    /// Ein nicht sichtbares Ziel über `agents.delegate` ist ein benannter
+    /// Werkzeugfehler (nur sichtbare Namen), kein Turn-Abbruch und kein Spawn.
+    #[tokio::test]
+    async fn agents_delegate_names_the_visible_targets_for_an_unknown_agent() -> TestResult {
+        let spawner = CatalogSpawner::new(analysis_catalog());
+        let mut session = catalog_session(Arc::clone(&spawner))?;
+        let store = crate::state_store::InMemoryStateStore::new();
+        let model = RecordingModel::new(vec![
+            response_with(vec![ToolCall {
+                id: ToolCallId::new(),
+                name: ToolName::new(AGENTS_DELEGATE_TOOL),
+                arguments: serde_json::json!({ "agent": "geheim", "task": "x" }),
+            }]),
+            crate::model::ModelResponse::text("verstanden"),
+        ]);
+        let outcome = run_turn(&mut session, &model, &store, TurnInput::user("delegiere"))
+            .await
+            .map_err(ctx("der Turn läuft weiter"))?;
+        assert!(matches!(outcome, TurnOutcome::Completed), "{outcome:?}");
+        assert!(spawner.take().is_none(), "kein Spawn");
+        expect_single_error(
+            &session,
+            "Ziel geheim ist für dich nicht delegierbar; delegierbar sind: \
+             evidence-critic, executor, explorer",
+        )?;
+        Ok(())
+    }
+
+    /// `agents.catalog` zeigt nur sichtbare Ziele (mit Rolle, Skills, Rechten,
+    /// Budget, Herkunft), filtert nach Rolle und rankt nach Suchbegriffen.
+    #[tokio::test]
+    async fn agents_catalog_lists_only_visible_targets() -> TestResult {
+        let spawner = CatalogSpawner::new(analysis_catalog());
+        let mut session = catalog_session(Arc::clone(&spawner))?;
+        session.set_mode(crate::mode::InteractionMode::Plan);
+        let store = crate::state_store::InMemoryStateStore::new();
+        let model = RecordingModel::new(vec![
+            response_with(vec![ToolCall {
+                id: ToolCallId::new(),
+                name: ToolName::new(AGENTS_CATALOG_TOOL),
+                arguments: serde_json::json!({}),
+            }]),
+            crate::model::ModelResponse::text("ok"),
+        ]);
+        run_turn(&mut session, &model, &store, TurnInput::user("wer?"))
+            .await
+            .map_err(ctx("Katalog"))?;
+        let results = tool_results(&session);
+        let Some(ToolCallResult::Success { value }) = results.first() else {
+            return Err(TestError::Unexpected(format!("{results:?}")));
+        };
+        let names: Vec<&str> = value["agents"]
+            .as_array()
+            .ok_or(TestError::Missing("agents"))?
+            .iter()
+            .filter_map(|agent| agent["name"].as_str())
+            .collect();
+        // Plan-Modus: der schreibende `executor` ist nicht sichtbar.
+        assert_eq!(names, vec!["evidence-critic", "explorer"]);
+        assert_eq!(value["agents"][0]["source"], serde_json::json!("custom"));
+        assert_eq!(value["agents"][1]["source"], serde_json::json!("built-in"));
+        assert_eq!(value["agents"][0]["read_only"], serde_json::json!(true));
+        assert_eq!(
+            value["agents"][0]["budget_tokens"],
+            serde_json::json!(200_000)
+        );
+        assert!(
+            value["note"]
+                .as_str()
+                .is_some_and(|note| note.contains("Plan-Modus"))
+        );
+
+        // Außerhalb des Plan-Modus: Suche und Rollenfilter.
+        let all = spawner
+            .delegation_targets(session.id(), false)
+            .map_err(|error| TestError::Unexpected(error.to_string()))?;
+        let ToolCallResult::Success { value } =
+            agents_catalog_result(&all, &serde_json::json!({ "query": "Belege prüfen" }))
+        else {
+            return Err(TestError::Unexpected("Katalog-Fehler".to_owned()));
+        };
+        assert_eq!(value["count"], serde_json::json!(1));
+        assert_eq!(
+            value["agents"][0]["name"],
+            serde_json::json!("evidence-critic")
+        );
+        let ToolCallResult::Success { value } =
+            agents_catalog_result(&all, &serde_json::json!({ "role": "child-orchestrator" }))
+        else {
+            return Err(TestError::Unexpected("Katalog-Fehler".to_owned()));
+        };
+        assert_eq!(value["count"], serde_json::json!(0));
+        Ok(())
+    }
+
+    /// Plan R9, E1: im Plan-Modus bleiben lesende Ziele delegierbar
+    /// (`transfer_to_explorer` wird angeboten und spawnt), ein schreibendes
+    /// Ziel wird mit der Plan-Modus-Meldung abgelehnt — als Werkzeugfehler.
+    #[tokio::test]
+    async fn plan_mode_keeps_read_only_targets_and_refuses_writers() -> TestResult {
+        let spawner = CatalogSpawner::new(analysis_catalog());
+        let mut session = catalog_session(Arc::clone(&spawner))?;
+        session.set_mode(crate::mode::InteractionMode::Plan);
+        let store = crate::state_store::InMemoryStateStore::new();
+        let model = RecordingModel::new(vec![
+            response_with(vec![ToolCall {
+                id: ToolCallId::new(),
+                name: ToolName::new("transfer_to_executor"),
+                arguments: serde_json::json!({ "task": "baue es" }),
+            }]),
+            response_with(vec![ToolCall {
+                id: ToolCallId::new(),
+                name: ToolName::new("transfer_to_explorer"),
+                arguments: serde_json::json!({ "task": "erkunde es" }),
+            }]),
+        ]);
+        let outcome = run_turn(&mut session, &model, &store, TurnInput::user("plane"))
+            .await
+            .map_err(ctx("Plan-Modus-Delegation"))?;
+        let TurnOutcome::AwaitingChild { role, .. } = outcome else {
+            return Err(TestError::Unexpected(format!("{outcome:?}")));
+        };
+        assert_eq!(role, "explorer");
+        expect_single_error(
+            &session,
+            "Plan-Modus: nur lesende Ziele delegierbar (evidence-critic, explorer); \
+             Schreib-/Ausführungsziele erst nach Planfreigabe.",
+        )?;
+        let requests = model.take_requests();
+        let first = requests
+            .first()
+            .ok_or(TestError::Missing("ein Modell-Request"))?;
+        let offered: Vec<&str> = first.tools.iter().map(ToolSpec::name).collect();
+        assert!(offered.contains(&"transfer_to_explorer"));
+        assert!(offered.contains(&"transfer_to_evidence-critic"));
+        assert!(!offered.contains(&"transfer_to_executor"));
+        Ok(())
+    }
+
+    /// `delegate_wave` bekommt `targets[].role` als Enum der sichtbaren Ziele.
+    #[test]
+    fn delegate_wave_role_becomes_an_enum_of_visible_targets() -> TestResult {
+        let role = JsonSchema {
+            schema_type: Some(JsonSchemaType::String),
+            ..JsonSchema::default()
+        };
+        let item = closed_object(BTreeMap::from([("role".to_owned(), role)]), &["role"]);
+        let targets = JsonSchema {
+            schema_type: Some(JsonSchemaType::Array),
+            items: Some(Box::new(item)),
+            ..JsonSchema::default()
+        };
+        let mut tools = vec![ToolSpec::Function(FunctionToolSpec {
+            name: ToolName::new(DELEGATE_WAVE_TOOL_NAME),
+            description: String::new(),
+            parameters: closed_object(BTreeMap::from([("targets".to_owned(), targets)]), &[]),
+            strict: false,
+        })];
+        restrict_delegate_wave_roles(&mut tools, &["explorer".to_owned(), "planner".to_owned()]);
+        let ToolSpec::Function(wave) = &tools[0];
+        let enum_values = wave
+            .parameters
+            .properties
+            .as_ref()
+            .and_then(|properties| properties.get("targets"))
+            .and_then(|targets| targets.items.as_deref())
+            .and_then(|item| item.properties.as_ref())
+            .and_then(|properties| properties.get("role"))
+            .and_then(|role| role.enum_values.clone());
+        assert_eq!(
+            enum_values,
+            Some(vec![
+                serde_json::json!("explorer"),
+                serde_json::json!("planner")
+            ])
+        );
+        Ok(())
+    }
+
+    /// Das Werkzeugschema vor Plan R9 (Kopie des alten `handoff_tool_spec`),
+    /// nur für den Größenvergleich.
+    fn legacy_handoff_tool_spec(role: &str) -> ToolSpec {
+        let string_property = |description: &str| JsonSchema {
+            schema_type: Some(JsonSchemaType::String),
+            description: Some(description.to_owned()),
+            ..JsonSchema::default()
+        };
+        let mut properties = BTreeMap::new();
+        properties.insert(
+            "task".to_owned(),
+            string_property("Konkreter, eigenständig verständlicher Arbeitsauftrag."),
+        );
+        properties.insert(
+            "context".to_owned(),
+            string_property("Optionaler Zusatzkontext (Fakten, Pfade, Randbedingungen)."),
+        );
+        properties.insert(
+            "continue_from".to_owned(),
+            string_property(
+                "Optional: ID eines eigenen, beendeten Kindes dieser Rolle; das neue Kind setzt \
+                 mit dessen Übergabe und frischem Budget fort (höchstens 3 Fortsetzungen).",
+            ),
+        );
+        properties.insert(
+            crate::user_approval::USER_APPROVED_FIELD.to_owned(),
+            crate::user_approval::user_approved_schema(),
+        );
+        properties.insert(
+            "background".to_owned(),
+            JsonSchema {
+                schema_type: Some(JsonSchemaType::Boolean),
+                description: Some(
+                    "Optional: im Hintergrund laufen lassen (nur Orchestratoren der UIA in der \
+                     TUI; Vorgabe dort true): sofortige Rückkehr mit {child_id, status, hint}, \
+                     das Ergebnis kommt als Benachrichtigung. false erzwingt synchrones Warten."
+                        .to_owned(),
+                ),
+                ..JsonSchema::default()
+            },
+        );
+        ToolSpec::Function(FunctionToolSpec {
+            name: ToolName::new(format!("{HANDOFF_PREFIX}{role}")),
+            description: format!(
+                "Delegiert eine Aufgabe an den Unteragenten '{role}' und wartet auf sein \
+                 Ergebnis (ein Orchestrator der UIA läuft in der TUI im Hintergrund).{}",
+                handoff_role_hint(role)
+            ),
+            parameters: closed_object(properties, &["task"]),
+            strict: false,
+        })
+    }
+
+    fn schema_bytes(tools: &[ToolSpec]) -> TestResult<usize> {
+        serde_json::to_vec(tools)
+            .map(|bytes| bytes.len())
+            .map_err(|error| TestError::Unexpected(error.to_string()))
+    }
+
+    /// Plan R9, Teil C, Prompt-Messung: Bytes der Delegationswerkzeuge vorher
+    /// (je Ziel ein altes `transfer_to_*`, nur eingebaute Rollen) und nachher
+    /// (neuer Zuschnitt, eingebaute plus benutzerdefinierte Ziele) für UIA,
+    /// Root-Orchestrator und einen Child-Orchestrator. Der Root-Orchestrator
+    /// muss schrumpfen, obwohl er jetzt mehr Ziele sieht.
+    #[test]
+    #[allow(clippy::print_stderr)]
+    fn delegation_tool_schema_bytes_before_and_after() -> TestResult {
+        let session = make_session(
+            StubToolProvider::with_names(&[]),
+            SessionActivation::new(ToolProfile::Minimal),
+        );
+        let description = "Erledigt einen klar umrissenen Auftrag und liefert ein belegtes \
+                           Ergebnis an den Auftraggeber zurück.";
+        let uia = [
+            "agent-steward",
+            "matrix-game-master",
+            "root-orchestrator",
+            "uia-explorer",
+            "uia-latex-writer",
+            "uia-shell-worker",
+            "uia-worker",
+            "uia-writer",
+        ];
+        // 21 eingebaute Ziele des Root-Orchestrators (vorher), dazu die rund
+        // 31 benutzerdefinierten Agenten des Rosters (nachher).
+        let root_builtin: Vec<String> = (0..21)
+            .map(|index| format!("builtin-role-{index:02}"))
+            .collect();
+        let root_custom: Vec<String> = (0..31)
+            .map(|index| format!("custom-agent-{index:02}"))
+            .collect();
+        let child = [
+            "evidence-collector",
+            "evidence-critic",
+            "method-auditor",
+            "pattern-analyst",
+            "synthesis-writer",
+            "systems-modeller",
+        ];
+        let infos = |names: &[String]| -> Vec<DelegationTargetInfo> {
+            names
+                .iter()
+                .map(|name| DelegationTargetInfo {
+                    description: Some(description.to_owned()),
+                    ..DelegationTargetInfo::named(name.clone())
+                })
+                .collect()
+        };
+        let before = |names: &[String]| -> TestResult<usize> {
+            schema_bytes(
+                &names
+                    .iter()
+                    .map(|name| legacy_handoff_tool_spec(name))
+                    .collect::<Vec<_>>(),
+            )
+        };
+        let after = |names: &[String]| -> TestResult<usize> {
+            let mut tools = Vec::new();
+            append_handoff_tools(&session, &mut tools, &infos(names));
+            schema_bytes(&tools)
+        };
+        let owned = |names: &[&str]| -> Vec<String> {
+            names.iter().map(|name| (*name).to_owned()).collect()
+        };
+        let root_all: Vec<String> = root_builtin.iter().chain(&root_custom).cloned().collect();
+
+        let uia_before = before(&owned(&uia))?;
+        let uia_after = after(&owned(&uia))?;
+        let root_before = before(&root_builtin)?;
+        let root_after = after(&root_all)?;
+        let child_before = before(&owned(&child))?;
+        let child_after = after(&owned(&child))?;
+        eprintln!(
+            "Delegationswerkzeuge (Bytes JSON-Schema) vorher → nachher: \
+             UIA {uia_before} → {uia_after}, Root-Orchestrator {root_before} → {root_after} \
+             ({} → {} Ziele), Child-Orchestrator {child_before} → {child_after}",
+            root_builtin.len(),
+            root_all.len()
+        );
+        assert!(
+            root_after * 4 < root_before,
+            "der Root-Orchestrator muss deutlich schrumpfen: {root_before} → {root_after}"
+        );
+        assert!(
+            uia_after <= uia_before + 1024,
+            "die UIA darf höchstens um Katalog und Einzeiler wachsen: {uia_before} → {uia_after}"
+        );
+        assert!(
+            child_after <= child_before + 1024,
+            "Child-Orchestrator: {child_before} → {child_after}"
+        );
         Ok(())
     }
 

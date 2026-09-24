@@ -1,0 +1,20 @@
+# Mitgelieferter Agent `dependency-security-reviewer` (Plan R9, Teil B: migriert aus dem
+# Legacy-Format `agent.toml`; `system.md` bleibt die Arbeitsanweisung und
+# wird per `instructions_file` in den Kontext des Kindes gelegt).
+#
+# Erweitert die eingebaute Rolle `dependency-researcher`: deren Werkzeuge, Budget und
+# Rückgabevertrag gelten unverändert (eigene Sektionen gleichen Namens
+# würden verworfen); hier stehen nur Identität, Skills und Anweisung.
+
+schema = "harwness.agent/v1"
+id = "harwness.agent.dependency-security-reviewer@1"
+version = "1.0.0"
+extends = { id = "harwness.agent.dependency-researcher@1" }
+role = "worker"
+specialization = "dependency-security-reviewer"
+
+name = "Dependency Security Reviewer"
+description = "Checks dependencies against advisory, provenance, and maintenance evidence."
+instructions_file = "system.md"
+
+skills = ["security-inspection"]

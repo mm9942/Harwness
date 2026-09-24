@@ -156,7 +156,9 @@ fn boxed(err: EgressError) -> BoxError {
     Box::new(err)
 }
 
-// Filtert aufgelöste Adressen durch `EgressPolicy::check_addr`.
+// Filtert aufgelöste Adressen durch `EgressPolicy::check_resolved` (für
+// Namen, die nur das offene öffentliche Web zulässt: nur öffentliche
+// Adressen; sonst wie `EgressPolicy::check_addr`).
 //
 // Liefert die zulässigen Adressen in Auflösungsreihenfolge. Verworfene
 // Adressen werden mit ihrer Klasse geloggt; bleibt keine Adresse übrig (auch
@@ -174,7 +176,7 @@ where
     let mut permitted = Vec::new();
     let mut denied = Vec::new();
     for addr in resolved {
-        if policy.check_addr(addr).is_ok() {
+        if policy.check_resolved(host, addr).is_ok() {
             permitted.push(addr);
         } else {
             let class = classify(addr.ip());

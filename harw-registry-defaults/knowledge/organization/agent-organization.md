@@ -53,6 +53,9 @@ Kind-Ergebnisse werden strukturiert verdichtet zurückgegeben — keine
 Rohtranskripte zwischen Geschwistern, keine unaufgeforderte Erweiterung des
 Auftrags.
 
+## Skills
+Skills: nur mit `skills.search` finden, vor der Arbeit mit `skills.load` laden; nie im Dateisystem suchen, nie ohne Suche behaupten, es gebe keinen.
+
 ## Spawn-Kontext
 Beim Spawn eines Kindes wird `complexity: "simple"` oder `"complex"`
 angegeben — steuert die Modellstufe des Kindes, nie dessen Rechte.

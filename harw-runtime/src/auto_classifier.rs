@@ -355,6 +355,16 @@ pub fn prefilter_with_lease(
             }
         }
     }
+    // Plan R9, Teil F: `job.start` führt einen Shell-Befehl aus wie
+    // `shell.exec` — dieselben Prüfungen über `command` bzw. das gequotete
+    // `argv`, mit den gesetzten Umgebungsvariablen als `NAME=wert`-Präfix.
+    if tool == harw_tool_job::JOB_START_TOOL {
+        if let Some(command) = job_start_prefilter_text(&call.arguments) {
+            if let Some(hit) = prefilter_shell(&command, ctx, lease_active) {
+                return Some(hit);
+            }
+        }
+    }
     if is_write_tool(tool) {
         for raw in path_arguments(&call.arguments) {
             if let Some(hit) = check_write_target(raw, ctx) {
@@ -365,7 +375,7 @@ pub fn prefilter_with_lease(
     // Netzziele anderer Werkzeuge (MCP, Plugins): nur ausdrückliche
     // Adressfelder, nicht jeder Text — sonst wäre jede Datei mit Link ein
     // Treffer.
-    if tool != "shell.exec" && !tool.starts_with("fs.") {
+    if tool != "shell.exec" && tool != harw_tool_job::JOB_START_TOOL && !tool.starts_with("fs.") {
         for raw in NETWORK_ARGUMENT_KEYS
             .iter()
             .filter_map(|key| call.arguments.get(*key).and_then(|value| value.as_str()))
@@ -532,6 +542,33 @@ fn effective_tokens(stage: &[String]) -> &[String] {
 }
 
 /// Vorfilter für `shell.exec` (`lease_active`: siehe [`prefilter_with_lease`]).
+/// Plan R9, Teil F: der Befehlstext eines `job.start`-Aufrufs für den
+/// Vorfilter und den Klassifizierer — `command` bzw. das gequotete `argv`
+/// (`harw_tool_job::job_start_command_text`), davor die Umgebungsvariablen
+/// aus `env` als `NAME=wert` (gequotet), wie die Shell sie sähe.
+#[must_use]
+pub fn job_start_prefilter_text(arguments: &serde_json::Value) -> Option<String> {
+    let command = harw_tool_job::job_start_command_text(arguments)?;
+    let assignments: Vec<String> = arguments
+        .get("env")
+        .and_then(|v| v.as_array())
+        .map(|env| {
+            env.iter()
+                .filter_map(|entry| entry.as_str())
+                .map(|entry| match entry.split_once('=') {
+                    Some((name, value)) => format!("{name}={}", harw_tool_job::shell_quote(value)),
+                    None => harw_tool_job::shell_quote(entry),
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    if assignments.is_empty() {
+        Some(command)
+    } else {
+        Some(format!("{} {command}", assignments.join(" ")))
+    }
+}
+
 fn prefilter_shell(
     command: &str,
     ctx: &PrefilterContext,
@@ -1069,7 +1106,14 @@ fn truncate_chars(text: &str, max: usize) -> String {
 #[must_use]
 pub fn summarize_call(call: &ToolCall) -> String {
     let tool = call.name.as_str();
-    let detail = if let Some(command) = call.arguments.get("command").and_then(|v| v.as_str()) {
+    // Plan R9, Teil F: `job.start` zeigt den Befehl wie `shell.exec` (auch
+    // bei `argv` und mit den gesetzten Umgebungsvariablen).
+    let job_command = (tool == harw_tool_job::JOB_START_TOOL)
+        .then(|| job_start_prefilter_text(&call.arguments))
+        .flatten();
+    let detail = if let Some(command) = job_command {
+        redact_text(&command)
+    } else if let Some(command) = call.arguments.get("command").and_then(|v| v.as_str()) {
         redact_text(command)
     } else if let Some(path) = path_arguments(&call.arguments).first() {
         redact_text(path)
@@ -1966,6 +2010,46 @@ mod tests {
 
     fn shell(command: &str) -> ToolCall {
         call("shell.exec", json!({ "command": command }))
+    }
+
+    /// Plan R9, Teil F: `job.start` durchläuft denselben Vorfilter wie
+    /// `shell.exec` — über `command`, das gequotete `argv` und `env`.
+    #[test]
+    fn job_start_is_prefiltered_like_shell_exec() {
+        for command in ["sudo apt install x", "git push origin main", "rm -rf /"] {
+            let job = call("job.start", json!({"command": command, "name": "j"}));
+            assert_eq!(
+                prefilter(&job, &ctx()).map(|hit| hit.category),
+                prefilter(&shell(command), &ctx()).map(|hit| hit.category),
+                "{command}"
+            );
+        }
+        let argv = call(
+            "job.start",
+            json!({"argv": ["git", "push", "origin", "main"], "name": "j"}),
+        );
+        assert_eq!(
+            prefilter(&argv, &ctx()).map(|hit| hit.category),
+            prefilter(&shell("git push origin main"), &ctx()).map(|hit| hit.category)
+        );
+        assert!(
+            prefilter(
+                &call("job.start", json!({"command": "sudo id", "name": "s"})),
+                &ctx()
+            )
+            .is_some(),
+            "sudo im Job trifft den Vorfilter"
+        );
+        let harmless = call("job.start", json!({"command": "cargo build", "name": "b"}));
+        assert_eq!(
+            prefilter(&harmless, &ctx()),
+            prefilter(&shell("cargo build"), &ctx())
+        );
+        assert_eq!(
+            job_start_prefilter_text(&json!({"command": "make", "env": ["A=b c"]})).as_deref(),
+            Some("A='b c' make")
+        );
+        assert!(summarize_call(&argv).contains("git push origin main"));
     }
 
     /// Treibt eine Zukunft auf einer eigenen Laufzeit mit Zeitgeber.

@@ -1,0 +1,4 @@
+name = "premortem-and-red-team"
+description = "Ergebnisse und Pläne gezielt angreifen: Vorab-Obduktion (angenommen, es ist gescheitert: warum?), Gegenspieler-Perspektive, Advocatus Diaboli, Gegenthese mit stärkstem Argument, Schwachstellenliste (premortem, red team, devil's advocate, adversarial review, what could go wrong)."
+instructions_file = "instructions.md"
+tools = ["filesystem.read"]

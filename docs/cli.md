@@ -38,7 +38,7 @@ Configuration
   project trust | untrust | status [DIR]
 
 Agents and knowledge
-  agent uia-new | skills [ARGS…] | plugins [ARGS…]
+  agent uia-new | list [QUERY] | skills [ARGS…] | plugins [ARGS…]
   knowledge index [build [--source docs|knowledge] [--force] | status]
             | memory [ARGS…] | proposals [ARGS…]
   jobs list [FILTER] | show ID | approve ID [--note TEXT]

@@ -1,0 +1,30 @@
+# Mitgelieferter Agent `dependency-research-orchestrator` (Plan R9, Teil B: migriert aus dem
+# Legacy-Format `agent.toml`; `system.md` bleibt die Arbeitsanweisung und
+# wird per `instructions_file` in den Kontext des Kindes gelegt).
+#
+# Benutzerdefinierter Child-Orchestrator auf `child-orchestrator-base@1`:
+# die Basis besitzt Werkzeuge, Tiefe (`max_depth = 1`) und Budget; hier
+# stehen nur Identität, Skills und die namentlichen Delegationsziele.
+
+schema = "harwness.agent/v1"
+id = "harwness.agent.dependency-research-orchestrator@1"
+version = "1.0.0"
+extends = { id = "harwness.agent.child-orchestrator-base@1" }
+role = "child-orchestrator"
+specialization = "dependency-research-orchestrator"
+
+name = "Dependency Research Orchestrator"
+description = "Coordinates evidence-based dependency, compatibility, licensing, and upgrade research."
+instructions_file = "system.md"
+
+skills = ["dependency-research", "planning"]
+
+[delegation]
+targets = [
+  "dependency-analyst",
+  "dependency-security-reviewer",
+  "source-researcher",
+  "researcher-deps",
+  "dependency-researcher",
+  "researcher-web",
+]

@@ -19,6 +19,13 @@
 //!   auch nicht, wenn die Adresse wörtlich in der Allowlist steht.
 //! - **Lokale Namen:** `localhost`/`*.localhost` gelten ohne `allow_private`
 //!   als abgelehnt, bevor überhaupt aufgelöst wird.
+//! - **Offenes öffentliches Web** ([`EgressPolicy::with_open_public`],
+//!   `[network].research_web = "open"`): zusätzlich zur Allowlist ist jeder
+//!   öffentliche DNS-Name erlaubt ([`harw_authority::is_public_dns_name`]:
+//!   nie IP-Literale, lokale oder reservierte Namen). Für einen solchen,
+//!   **nicht** gelisteten Namen lässt der Resolver ausschließlich
+//!   [`AddrClass::Public`] zu — auch mit `allow_private`, das nur für
+//!   ausdrücklich gelistete Hosts gilt (kein SSRF über DNS ins eigene Netz).
 //!
 //! # Kanonische Form
 //! Allowlist-Einträge werden beim Bau normalisiert (WHATWG-Host-Parser wie
@@ -32,7 +39,7 @@
 
 use std::net::{IpAddr, Ipv6Addr, SocketAddr};
 
-use harw_authority::host_matches_suffix;
+use harw_authority::{host_matches_suffix, is_public_dns_name};
 use harw_sandbox::{EgressHost, EgressUrl};
 
 use crate::classify::{AddrClass, classify};
@@ -41,6 +48,9 @@ use crate::error::EgressError;
 // Domänentrenner des Digests; eine neue kanonische Form bekommt eine neue
 // Versionsnummer.
 const DIGEST_DOMAIN: &[u8] = b"harw:egress-policy:v1\0";
+
+// Anhang des Digests bei offenem öffentlichem Web.
+const OPEN_PUBLIC_MARKER: &[u8] = b"\0open-public";
 
 /// Unveränderliche Egress-Policy aus Host-Allowlist und Privat-Schalter.
 ///
@@ -52,6 +62,8 @@ const DIGEST_DOMAIN: &[u8] = b"harw:egress-policy:v1\0";
 pub struct EgressPolicy {
     allow_hosts: Vec<String>,
     allow_private: bool,
+    /// Offenes öffentliches Web (siehe Moduldoku); `false` = nur Allowlist.
+    open_public: bool,
 }
 
 impl EgressPolicy {
@@ -99,7 +111,47 @@ impl EgressPolicy {
         Ok(Self {
             allow_hosts: normalized,
             allow_private,
+            open_public: false,
         })
+    }
+
+    /// Schaltet das offene öffentliche Web ein oder aus (siehe Moduldoku).
+    ///
+    /// # Description
+    /// Mit `open = true` besteht jeder öffentliche DNS-Name
+    /// ([`harw_authority::is_public_dns_name`]) die Host-Prüfung, auch ohne
+    /// Allowlist-Eintrag. IP-Literale, `localhost` und lokale bzw.
+    /// reservierte Namen bleiben abgelehnt, und die aufgelösten Adressen
+    /// eines nicht gelisteten Namens müssen [`AddrClass::Public`] sein.
+    ///
+    /// # Examples
+    /// ```rust
+    /// use harw_egress::EgressPolicy;
+    ///
+    /// let open = EgressPolicy::new(Vec::new(), true).unwrap().with_open_public(true);
+    /// assert!(open.check_url("https://www.destatis.de/DE/Home/").is_ok());
+    /// assert!(open.check_url("http://127.0.0.1/").is_err());
+    /// assert!(open.check_url("http://printer.local/").is_err());
+    /// assert!(EgressPolicy::new(Vec::new(), false).unwrap().check_url("https://example.org/").is_err());
+    /// ```
+    #[must_use]
+    pub fn with_open_public(mut self, open: bool) -> Self {
+        self.open_public = open;
+        self
+    }
+
+    /// Ob das offene öffentliche Web eingeschaltet ist.
+    #[must_use]
+    pub fn open_public(&self) -> bool {
+        self.open_public
+    }
+
+    /// Ob `host` (normalisiert) ausdrücklich auf der Allowlist steht.
+    #[must_use]
+    pub fn is_allowlisted(&self, host: &str) -> bool {
+        self.allow_hosts
+            .iter()
+            .any(|allowed| host_matches_suffix(allowed, host))
     }
 
     /// Die normalisierten, sortierten Allowlist-Einträge.
@@ -231,7 +283,32 @@ impl EgressPolicy {
             hasher.update(&len_le(entry.len()));
             hasher.update(entry.as_bytes());
         }
+        // Nur bei offenem Web angehängt: bestehende Digests bleiben gleich.
+        if self.open_public {
+            hasher.update(OPEN_PUBLIC_MARKER);
+        }
         hasher.finalize().into()
+    }
+
+    /// Prüft eine aufgelöste Adresse **zu ihrem Namen**: für einen nur über
+    /// das offene Web zugelassenen Namen ausschließlich [`AddrClass::Public`],
+    /// sonst wie [`Self::check_addr`].
+    ///
+    /// # Errors
+    /// [`EgressError::AddressDenied`], wenn die Klasse nicht zulässig ist.
+    pub fn check_resolved(&self, host: &str, addr: SocketAddr) -> Result<(), EgressError> {
+        if self.open_public && !self.is_allowlisted(host) {
+            let class = classify(addr.ip());
+            return if class == AddrClass::Public {
+                Ok(())
+            } else {
+                Err(EgressError::AddressDenied {
+                    addr: addr.ip(),
+                    class,
+                })
+            };
+        }
+        self.check_addr(addr)
     }
 
     // Allowlist- und Lokalnamen-Prüfung für einen bereits normalisierten Host
@@ -243,11 +320,7 @@ impl EgressPolicy {
                 host: host.to_owned(),
             });
         }
-        if self
-            .allow_hosts
-            .iter()
-            .any(|allowed| host_matches_suffix(allowed, host))
-        {
+        if self.is_allowlisted(host) || (self.open_public && is_public_dns_name(host)) {
             Ok(())
         } else {
             Err(EgressError::HostNotAllowed {
@@ -585,6 +658,65 @@ mod tests {
             assert_eq!(strict.check_addr(addr).is_ok(), strict_ok, "strict {raw}");
             assert_eq!(open.check_addr(addr).is_ok(), open_ok, "open {raw}");
         }
+        Ok(())
+    }
+
+    #[test]
+    fn test_open_public_admits_public_names_but_never_local_targets() -> TestResult {
+        let open = policy(&["intranet.example.test"], true)?.with_open_public(true);
+        assert!(open.open_public());
+        for url in [
+            "https://www.destatis.de/DE/Home/",
+            "https://docs.rs/serde",
+            "https://github.com/rust-lang/rust/blob/master/LICENSE-MIT",
+        ] {
+            assert!(open.check_url(url).is_ok(), "{url}");
+        }
+        for url in [
+            "http://127.0.0.1/",
+            "http://10.0.0.1/",
+            "http://169.254.169.254/latest/meta-data/",
+            "http://[::1]/",
+            "http://printer.local/",
+            "http://svc.internal/",
+            "http://intranet/",
+        ] {
+            assert!(open.check_url(url).is_err(), "{url}");
+        }
+        // Ohne `with_open_public` bleibt alles wie bisher.
+        let closed = policy(&[], false)?;
+        assert!(!closed.open_public());
+        assert!(closed.check_url("https://www.destatis.de/").is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn test_open_public_names_resolve_only_to_public_addresses() -> TestResult {
+        // `allow_private` gilt nur für gelistete Hosts, nie für offene Namen.
+        let open = policy(&["intranet.example.test"], true)?.with_open_public(true);
+        let private: SocketAddr = "10.0.0.7:443".parse().map_err(ctx("Adresse"))?;
+        let loopback: SocketAddr = "127.0.0.1:443".parse().map_err(ctx("Adresse"))?;
+        let public: SocketAddr = "8.8.8.8:443".parse().map_err(ctx("Adresse"))?;
+        assert!(open.check_resolved("www.destatis.de", public).is_ok());
+        assert!(open.check_resolved("rebind.example.org", private).is_err());
+        assert!(open.check_resolved("rebind.example.org", loopback).is_err());
+        assert!(
+            open.check_resolved("intranet.example.test", private)
+                .is_ok()
+        );
+        let resolved = crate::client::filter_resolved(&open, "rebind.example.org", [private]);
+        assert!(matches!(
+            resolved,
+            Err(EgressError::NoPermittedAddress { .. })
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn test_open_public_changes_the_digest_only_when_on() -> TestResult {
+        let base = policy(&["docs.rs"], false)?;
+        assert_eq!(base.digest(), base.clone().with_open_public(false).digest());
+        assert_ne!(base.digest(), base.clone().with_open_public(true).digest());
         Ok(())
     }
 

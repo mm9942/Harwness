@@ -87,6 +87,10 @@ admitted = [
   "doc.read_pdf",
   "fs.write",
   "fs.edit",
+  # Plan R9, Teil A: Skills nur über den Katalog finden und laden
+  # (`harw_registry_defaults::profile::skill_catalog_tools_for_role`).
+  "skills.search",
+  "skills.load",
 ]
 forbidden = [
   "shell.exec",

@@ -179,6 +179,7 @@ fn target_wire_form(target: &EgressTarget) -> String {
         EgressTarget::Host(host) => format!("={host}"),
         EgressTarget::DnsSuffix(suffix) => suffix.to_owned(),
         EgressTarget::Cidr(net) => net.to_string(),
+        EgressTarget::PublicDns => harw_authority::PUBLIC_DNS_WIRE.to_owned(),
     }
 }
 

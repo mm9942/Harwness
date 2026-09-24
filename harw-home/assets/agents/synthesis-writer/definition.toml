@@ -1,0 +1,68 @@
+# Analyse-Familie (Plan R9, Teil D): Synthesis Writer.
+#
+# Benutzerdefinierter Worker auf `worker-base@1`. Die Basis besitzt
+# `[lifecycle]` und `[context]`; diese Datei besitzt `[work]`, `[tools]`,
+# `[spawn]` und `[return]`. Die Laufzeit klemmt die Definition unter die
+# Rechtedecke ihrer Basisrolle: `[tools]` kann nur verengen, nie erweitern.
+#
+# Einziges schreibendes Mitglied der Familie: `fs.write`/`fs.edit` sind nur
+# für den EINEN Ausgabepfad gedacht, den der Auftrag nennt (siehe
+# `system.md`). Trägt die Decke der Basisrolle kein Schreibrecht, fällt der
+# Agent auf Rückgabe als Text zurück; kein Prozess, kein Netz.
+# Die Arbeitsanweisung steht in `system.md` neben dieser Datei
+# (`instructions_file`).
+
+schema = "harwness.agent/v1"
+id = "harwness.agent.synthesis-writer@1"
+version = "1.0.0"
+extends = { id = "harwness.agent.worker-base@1" }
+role = "worker"
+specialization = "synthesis-writer"
+
+name = "Synthesis Writer"
+description = "Verdichtet geprüfte Befunde der Analyse-Familie zu einem Produkt mit Kernaussage zuerst und kalibrierter Sicherheitsangabe; schreibt ausschließlich an den im Auftrag zugewiesenen Ausgabepfad."
+instructions_file = "system.md"
+
+skills = ["confidence-and-uncertainty"]
+
+[work]
+mode = "synthesis"
+may_write_code = false
+may_research_web = false
+
+[tools]
+admitted = [
+  "fs.read",
+  "fs.list",
+  "fs.search",
+  "fs.glob",
+  "fs.grep",
+  "doc.read_pdf",
+  "fs.write",
+  "fs.edit",
+  "workbench.show",
+  "diary.read",
+  "palace.search",
+  "palace.recall",
+  "parent.message",
+  "skills.search",
+  "skills.load",
+]
+forbidden = [
+  "shell.exec",
+  "web.fetch",
+  "web.search",
+  "web.docs_rs",
+  "web.crates_io",
+]
+
+[spawn]
+max_depth = 0
+
+[spawn.budget]
+max_tokens = 120000
+max_tool_calls = 50
+max_wall_secs = 900
+
+[return]
+contract = "harwness.return.execution-summary@1"

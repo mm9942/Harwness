@@ -1,0 +1,4 @@
+name = "confidence-and-uncertainty"
+description = "Sicherheit und Unsicherheit sauber ausdrücken: kalibrierte Wahrscheinlichkeitsbegriffe, Tabelle Wort zu Prozent, Einschätzungssprache, Trennung von Wahrscheinlichkeit und Vertrauen in die Grundlage, Wissenslücken benennen (confidence levels, estimative language, calibration, probability words, uncertainty)."
+instructions_file = "instructions.md"
+tools = ["filesystem.read"]

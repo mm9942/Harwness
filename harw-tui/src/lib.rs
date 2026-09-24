@@ -42,6 +42,8 @@ mod input;
 pub(crate) mod input_editor;
 pub(crate) mod input_history;
 pub(crate) mod input_reader;
+// Plan R9, Teil F: Jobs-Gruppe des Agenten-Panels und Job-Detailansicht.
+pub(crate) mod jobs_panel;
 pub(crate) mod kanban_board;
 pub(crate) mod keybindings;
 pub(crate) mod knowledge_view;

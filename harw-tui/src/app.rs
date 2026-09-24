@@ -127,6 +127,12 @@ pub(crate) mod export_capture;
 mod operator_shell;
 // Kleine Fenster: Mausrad nach Position, `scroll_panel_up/down`.
 pub(crate) mod scroll_routing;
+// Plan R9, Teil F: Hintergrund-Jobs (Jobs-Gruppe, Notizen an die Wurzel,
+// Beenden-Dialog).
+pub(crate) mod jobs_glue;
+// Ansichten zeigen nach einer Änderung sofort den Live-Stand (Tests).
+#[cfg(test)]
+mod live_views_tests;
 
 use std::cell::Cell;
 use std::collections::{HashMap, HashSet};
@@ -427,6 +433,12 @@ struct AgentDetailState {
     /// Vollbild-Zustand des Panels vor dem Öffnen (wird beim Schließen
     /// wiederhergestellt).
     prev_maximized: bool,
+    /// Plan R9, Teil F: gesetzt, wenn die Ansicht einen Hintergrund-Job statt
+    /// eines Agenten zeigt (Kennung).
+    job: Option<String>,
+    /// Plan R9, Teil F: Kopf und Log-Ende des Jobs, im Takt neu gebaut
+    /// (`jobs_glue::refresh`); `None` für einen unbekannten Job.
+    job_view: Option<crate::jobs_panel::JobDetail>,
 }
 
 /// Seitenweite (Zeilen) für PageUp/PageDown in der Agenten-Detailansicht.
@@ -631,6 +643,10 @@ enum Overlay {
     /// Wissensbrowser). Schreibaktionen erzeugen Slash-Zeilen; Daten kommen
     /// über [`OverlayView::refresh_command`] bzw. `Fetch` aus `OpOutput.data`.
     View(Box<dyn OverlayView>),
+    /// Plan R9, Teil F: Beenden mit laufenden Hintergrund-Jobs — „Jobs
+    /// stoppen“ / „Weiterlaufen lassen“ / „Abbrechen“
+    /// ([`jobs_glue::before_quit`]).
+    JobsQuitChoice(ChoiceDialog),
 }
 
 /// Ausstehender Datenabruf (`OpOutput.data`) für eine Ansicht oder das
@@ -1250,6 +1266,8 @@ pub struct ChatApp {
     /// `handle_busy_event` selbst keinen Zugriff auf den Ereigniskanal hat
     /// (siehe Plan „Ctrl+C-Hard-Interrupt, UI-Teil", Punkt 6).
     hard_quit_requested: bool,
+    /// Plan R9, Teil F: Takt der Jobs-Gruppe und Wahl im Beenden-Dialog.
+    jobs_ui: jobs_glue::JobsUi,
     /// Zuletzt in dieser Sitzung tatsächlich gestartete `!`-Befehl (ohne
     /// führendes `!`), für `!!` (Plan Teil F: `!`-Modus wie in Claude Code).
     /// `None`, solange noch kein `!`-Befehl gelaufen ist. Wird nach jedem
@@ -1477,6 +1495,7 @@ impl ChatApp {
             pending_export_format: ExportOutputFormat::Markdown,
             pending_quit: None,
             hard_quit_requested: false,
+            jobs_ui: jobs_glue::JobsUi::default(),
             last_shell_command: None,
             pending_turn_user_cell_override: None,
             needs_terminal_reassert: false,
@@ -1776,18 +1795,22 @@ impl ChatApp {
     /// Config-Discovery.
     ///
     /// # Beschreibung
-    /// Baut die Slash-`ServiceMap` über [`crate::runtime_commands::slash_service_map`]
-    /// (dieselbe Fabrik, die `/command`-Dispatches benutzen) und liest daraus
-    /// `Arc<harw_config::ResolvedConfig>`. `None` ohne Runtime-Montage oder
-    /// wenn die Fläche den Dienst nicht bestückt hat.
+    /// Liefert den Live-Stand der Montage
+    /// ([`harw_runtime::RuntimeAssembly::current_config`]): den Stand des
+    /// Starts plus alle seither gespeicherten Änderungen — derselbe `Arc`,
+    /// den jede über [`crate::runtime_commands::slash_service_map`] gebaute
+    /// `ServiceMap` trägt. `None` ohne Runtime-Montage.
     ///
     /// # Rückgabe
     /// `Some(Arc<ResolvedConfig>)`, sofern verfügbar; sonst `None`.
     #[must_use]
     fn resolved_config(&self) -> Option<Arc<harw_config::ResolvedConfig>> {
+        // Live-Stand der Montage (Start + alle seither gespeicherten
+        // Änderungen) — derselbe `Arc`, den jede frisch gebaute Slash-
+        // `ServiceMap` trägt. Nie der Start-Schnappschuss: sonst zeigten
+        // F7/F8 und die Picker nach einer Änderung weiter den alten Wert.
         let rt = self.runtime.as_ref()?;
-        let services = runtime_commands::slash_service_map(rt.services());
-        services.get::<Arc<harw_config::ResolvedConfig>>().cloned()
+        Some(rt.current_config())
     }
 
     /// Löst eine konfigurierte Provider-ID oder einen konfigurierten Namen zu
@@ -1921,16 +1944,18 @@ impl ChatApp {
                     .clone()
                     .or_else(|| config.harness.default_model.clone()),
             ),
+            // Live-Auswahl der UIA zuerst (`/uia-model switch` wirkt sofort),
+            // dann der gespeicherte Stand.
             PickerTarget::Uia => (
-                config
-                    .harness
-                    .uia_provider
-                    .clone()
+                snap.uia_selection
+                    .provider()
+                    .map(str::to_owned)
+                    .or_else(|| config.harness.uia_provider.clone())
                     .or_else(|| self.active_or_default_provider(&config)),
-                config
-                    .harness
-                    .uia_model
-                    .clone()
+                snap.uia_selection
+                    .model()
+                    .map(str::to_owned)
+                    .or_else(|| config.harness.uia_model.clone())
                     .or_else(|| snap.active_model.clone()),
             ),
             PickerTarget::UiaWorker { fixed_provider } => (
@@ -2152,7 +2177,15 @@ impl ChatApp {
     // eigenen Match-Arm mit fixem `approval`-Wert hat).
     fn finish_permission_stage(&mut self, approval: ApprovalMode) {
         self.set_approval_mode(approval);
-        if let Some(previous) = self.mode_before_plan.take() {
+        // Runde 9, E6: stand die Sitzung schon beim Start im Plan-Modus
+        // (`--mode plan`, `/resume`), gibt es keinen gemerkten Vormodus — der
+        // Zyklus blieb dann in `plan` hängen, obwohl die Statuszeile eine
+        // Freigabestufe zeigte. Verlassen wird `plan` dann nach `work`, wie
+        // bei der Planfreigabe.
+        let previous = self.mode_before_plan.take().or_else(|| {
+            (self.active_mode == InteractionMode::Plan).then_some(InteractionMode::Work)
+        });
+        if let Some(previous) = previous {
             self.active_mode = previous;
             if let Err(error) = self.session_controller.request_mode(previous.as_str()) {
                 tracing::warn!(
@@ -2267,6 +2300,11 @@ impl ChatApp {
     /// # Rückgabe
     /// `true`, wenn ein Agent ausgewählt war (Redraw nötig).
     fn open_agent_detail(&mut self) -> bool {
+        // Plan R9, Teil F: ein gewählter Job öffnet seine Detailansicht
+        // (Kopf und Log-Ende).
+        if self.agent_monitor.selected_job().is_some() {
+            return jobs_glue::open_detail(self);
+        }
         let Some(agent) = self.agent_monitor.selected_agent() else {
             return false;
         };
@@ -2281,6 +2319,8 @@ impl ChatApp {
             scroll: ChatScroll::new(),
             show_reasoning: true,
             prev_maximized,
+            job: None,
+            job_view: None,
         });
         self.panels.maximized = true;
         true
@@ -2440,6 +2480,8 @@ impl ChatApp {
         }
         // Runde 5, Teil P: Goal-Marke und Schritt-Verlaufszeilen (max. 1×/s).
         changed |= self.poll_goal_marker();
+        // Plan R9, Teil F: Job-Ereignisse und Jobs-Gruppe (gedrosselt).
+        changed |= jobs_glue::poll(self);
         let Some(rx) = self.agent_rx.as_mut() else {
             return changed;
         };
@@ -3204,10 +3246,14 @@ impl ChatApp {
     fn open_uia_worker_picker(&mut self) {
         match self.resolved_config() {
             Some(config) => {
-                let provider = config
-                    .harness
-                    .uia_provider
-                    .clone()
+                // Live-UIA-Auswahl vor dem gespeicherten Pin.
+                let provider = self
+                    .session_controller
+                    .snapshot()
+                    .uia_selection
+                    .provider()
+                    .map(str::to_owned)
+                    .or_else(|| config.harness.uia_provider.clone())
                     .or_else(|| self.active_or_default_provider(&config));
                 match provider {
                     Some(fixed_provider) => {
@@ -3241,14 +3287,26 @@ impl ChatApp {
     }
 
     /// Modelle je Rolle (`F8`, `/models`).
+    ///
+    /// Bei jedem Öffnen neu aus dem Live-Stand gebaut: Rollen aus der
+    /// Live-Konfiguration, die Live-Zeile aus der aufgelösten Wurzel-Route
+    /// (wie die Statuszeile). `Enter` auf der Live-Zeile öffnet den Picker,
+    /// der die Wurzel tatsächlich wechselt — bei einer UIA-Wurzel
+    /// `/uia-model`, sonst `/model`.
     fn model_roles_view(&self) -> ModelRolesView {
         let (provider, model) = self.live_model();
-        match self.resolved_config() {
+        let view = match self.resolved_config() {
             Some(config) => {
                 ModelRolesView::from_config(&config, provider.as_deref(), model.as_deref())
             }
             None => ModelRolesView::empty(provider.as_deref(), model.as_deref()),
-        }
+        };
+        let live_command = if self.runtime().is_some_and(|rt| rt.root_is_uia()) {
+            "/uia-model"
+        } else {
+            "/model"
+        };
+        view.with_resolved_live(live_command)
     }
 }
 
@@ -3495,6 +3553,14 @@ fn apply_local_intercept(
     bus: &HarwEventSender,
 ) -> Option<TuiRunOutcome> {
     match intercepted {
+        // `/models` baut dieselbe Übersicht wie F8 aus dem Live-Stand.
+        LocalIntercept::OpenOverlay(view)
+            if view.refresh_command().as_deref()
+                == Some(crate::model_roles_view::REFRESH_COMMAND) =>
+        {
+            let view = app.model_roles_view();
+            app.open_overlay_view(Box::new(view));
+        }
         LocalIntercept::OpenOverlay(view) => app.open_overlay_view(view),
         LocalIntercept::OpenModelPicker(target) => app.open_model_switch_picker(target),
         LocalIntercept::OpenUiaWorkerPicker => app.open_uia_worker_picker(),
@@ -4500,6 +4566,11 @@ pub(crate) async fn run_loop(
         if agent_messages::collect_parent_messages(app) {
             frame_req.schedule_frame();
         }
+        // Plan R9, Teil F: Job-Ereignisse (Systemzeilen, Notizen an die UIA
+        // mit Auto-Turn beim Ende eines Jobs) und die Jobs-Gruppe.
+        if jobs_glue::poll(app) {
+            frame_req.schedule_frame();
+        }
 
         // Eine während des vorherigen Turns abgeschickte Eingabe hat Vorrang.
         // Sie passiert denselben Pfad wie eine frische `HarwEvent::Submit`.
@@ -4524,6 +4595,10 @@ pub(crate) async fn run_loop(
             let kanban_tick = app.kanban_live_active();
             // Runde 5, Teil I: Leerlauf-Takt bei offener Agentenbaum-Ansicht.
             let agent_tree_tick = app.agent_tree_live_active();
+            // Plan R9, Teil F: Wecker für Job-Ereignisse und ein Takt für
+            // Laufzeit/Fortschritt, solange Jobs laufen.
+            let jobs_wake = jobs_glue::waker(app);
+            let jobs_tick = jobs_glue::has_running(app);
             tokio::select! {
                 maybe_tev = async { match app.deferred_input.pop_front() { Some(event) => Some(event), None => tui_rx.recv().await } } => {
                     let Some(tev) = maybe_tev else { return Ok(TuiRunOutcome::Quit) };
@@ -4613,7 +4688,11 @@ pub(crate) async fn run_loop(
                         // Runde 5, Teil K: bei laufenden Hintergrund-Agenten
                         // fragt `/quit` einmal nach.
                         HarwEvent::Quit => {
-                            if background_agents::confirm_quit(app) {
+                            // Plan R9, Teil F: laufende Jobs stoppen oder
+                            // ablösen (Dialog beim ersten Beenden).
+                            if background_agents::confirm_quit(app)
+                                && jobs_glue::before_quit(app).await
+                            {
                                 return Ok(TuiRunOutcome::Quit);
                             }
                             frame_req.schedule_frame();
@@ -4998,6 +5077,16 @@ pub(crate) async fn run_loop(
                     app.drain_agent_events();
                     frame_req.schedule_frame();
                 }
+                // Plan R9, Teil F: ein Job-Ereignis — der Schleifenanfang
+                // holt es ab (und startet beim Ende ggf. den Auto-Turn).
+                _ = jobs_glue::wait_for_event(jobs_wake) => {
+                    frame_req.schedule_frame();
+                }
+                _ = tokio::time::sleep(jobs_glue::JOBS_REFRESH_INTERVAL), if jobs_tick => {
+                    if jobs_glue::refresh(app, true) {
+                        frame_req.schedule_frame();
+                    }
+                }
             }
         }
 
@@ -5072,6 +5161,8 @@ pub(crate) async fn run_loop(
         // erfolgreich war oder mit einem Fehler zurückkam (derselbe Ausgang
         // wie `HarwEvent::Quit` im Idle-Pfad oben).
         if app.hard_quit_requested {
+            // Plan R9, Teil F: harw endet sofort — laufende Jobs ablösen.
+            jobs_glue::detach_for_exit(app);
             return Ok(TuiRunOutcome::Quit);
         }
 
@@ -6312,6 +6403,16 @@ fn handle_overlay_key(app: &mut ChatApp, key: KeyEvent, bus: &HarwEventSender) -
             let outcome = view.on_key(key);
             apply_overlay_outcome(app, outcome, bus);
         }
+        // Plan R9, Teil F: Beenden mit laufenden Jobs.
+        Some(Overlay::JobsQuitChoice(dialog)) => match jobs_glue::handle_quit_choice(dialog, key) {
+            None => {}
+            Some(None) => app.overlay = None,
+            Some(Some(choice)) => {
+                app.overlay = None;
+                app.jobs_ui.quit_choice = Some(choice);
+                bus.send(HarwEvent::Quit);
+            }
+        },
         Some(Overlay::EffortChoice { target, dialog }) => {
             let target = *target;
             match dialog.handle_key(key) {
@@ -7895,7 +7996,11 @@ fn apply_host_permit_decision(app: &mut ChatApp, prompt: HostPermitPrompt, optio
 /// `doc.read_pdf` die Datei unter `[tools.doc].remote_ocr = "ask"` an einen
 /// externen Dienst schicken würde; sonst `None`.
 pub(crate) fn approval_risk(call: &ToolCall) -> Option<String> {
+    // Auch ein Symlink nach außerhalb des Workspace: der Dialog nennt Link und Ziel.
     harw_registry_defaults::remote_ocr_approval_notice(call)
+        .or_else(|| harw_registry_defaults::symlink_approval_notice(call))
+        // Plan R9: erster Abruf einer Domain im offenen Recherche-Netz.
+        .or_else(|| harw_registry_defaults::open_web_approval_notice(call))
 }
 
 fn build_approval_dialog(
@@ -9226,7 +9331,9 @@ fn render_viewport(
             picker.render(area, frame.buffer_mut(), theme);
             return;
         }
-        Some(Overlay::ExportChoice(dialog)) | Some(Overlay::EffortChoice { dialog, .. }) => {
+        Some(Overlay::ExportChoice(dialog))
+        | Some(Overlay::EffortChoice { dialog, .. })
+        | Some(Overlay::JobsQuitChoice(dialog)) => {
             frame.render_widget(Clear, area);
             dialog.render(area, frame.buffer_mut(), theme);
             return;
@@ -9365,13 +9472,24 @@ fn render_viewport(
     });
     if let Some(agents_area) = pane_areas.agents {
         if let Some(detail) = app.agent_detail.as_ref() {
-            app.agent_monitor.render_agent_detail(
-                &detail.agent,
-                agents_area,
-                frame.buffer_mut(),
-                &detail.scroll,
-                detail.show_reasoning,
-            );
+            if detail.job.is_some() {
+                // Plan R9, Teil F: Job-Detailansicht (Kopf und Log-Ende).
+                crate::jobs_panel::render_job_detail(
+                    detail.job_view.as_ref(),
+                    agents_area,
+                    frame.buffer_mut(),
+                    &detail.scroll,
+                    theme,
+                );
+            } else {
+                app.agent_monitor.render_agent_detail(
+                    &detail.agent,
+                    agents_area,
+                    frame.buffer_mut(),
+                    &detail.scroll,
+                    detail.show_reasoning,
+                );
+            }
         } else {
             crate::agent_monitor::render_agents_panel(
                 &app.agent_monitor,
@@ -9502,6 +9620,9 @@ fn render_viewport(
     // Kontexthinweis für das fokussierte Agenten-Panel.
     let agents_hint = if app.panels.focus == crate::panes::PaneFocus::Agents {
         match app.agent_detail.as_ref() {
+            Some(detail) if detail.job.is_some() => {
+                " · Job-Log · Esc: Liste | j/k/Bild↑↓: scrollen | g/G: Anfang/Ende".to_owned()
+            }
             Some(detail) => {
                 let entries = app
                     .agent_monitor

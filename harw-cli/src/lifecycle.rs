@@ -1632,6 +1632,12 @@ mod tests {
             "palace.search",
             "palace.recall",
             "diary.read",
+            // Plan R9, Teil A: der lesende Skill-Katalog der Wurzel
+            // (`SkillCatalogToolProvider`, ohne Rechteklasse,
+            // auto-freigegeben) — jeder Einstieg mit Werkzeugen außer
+            // `NoTools`/`WorkspaceEdit`.
+            "skills.search",
+            "skills.load",
             // Runde 5, Teil F: Plan-Modus-Werkzeuge der Wurzel (Schritt 12e,
             // `AllWithModelTools`); ohne TUI-Kanal schlagen sie fail-closed
             // mit klarer Meldung fehl.

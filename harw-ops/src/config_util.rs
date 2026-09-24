@@ -799,6 +799,18 @@ pub trait SelectionPersistence: Send + Sync {
 
     /// Runde 5, Teil G: siehe [`persist_uia_worker_role_model`].
     fn persist_uia_worker_role_model(&self, role: &str, value: Option<&str>) -> Option<String>;
+
+    /// Siehe [`persist_default_interaction_mode`] (`/mode default <modus>`).
+    ///
+    /// # Beschreibung
+    /// Mit Standard-Implementierung (schreibt wie bisher in die Profil-
+    /// `config.toml`), damit bestehende Implementierungen unverändert
+    /// bleiben; über den Dienst läuft der Aufruf, damit
+    /// [`crate::live_config::MirroringSelectionPersistence`] ihn im
+    /// Live-Schnappschuss spiegeln kann.
+    fn persist_default_interaction_mode(&self, mode: &str) -> Option<String> {
+        persist_default_interaction_mode(mode)
+    }
 }
 
 /// Standard-Implementierung von [`SelectionPersistence`]: ruft unverändert
@@ -896,6 +908,9 @@ pub enum RecordedSelectionPersistCall {
     /// Aufzeichnung von [`SelectionPersistence::persist_uia_worker_role_model`]
     /// (Runde 5, Teil G).
     UiaWorkerRoleModel { role: String, value: Option<String> },
+    /// Aufzeichnung von
+    /// [`SelectionPersistence::persist_default_interaction_mode`].
+    DefaultInteractionMode { mode: String },
 }
 
 /// No-op-Aufzeichnungs-Implementierung von [`SelectionPersistence`] für Tests.
@@ -1013,6 +1028,13 @@ impl SelectionPersistence for RecordingSelectionPersistence {
         });
         None
     }
+
+    fn persist_default_interaction_mode(&self, mode: &str) -> Option<String> {
+        self.record(RecordedSelectionPersistCall::DefaultInteractionMode {
+            mode: mode.to_owned(),
+        });
+        None
+    }
 }
 
 /// Löst den für `ctx` zu verwendenden [`SelectionPersistence`]-Dienst auf.
@@ -1034,12 +1056,22 @@ impl SelectionPersistence for RecordingSelectionPersistence {
 /// # Concurrency
 /// Zustandslos abgesehen vom `Arc`-Klon; sicher von mehreren Threads aus aufrufbar.
 pub(crate) fn selection_persistence(ctx: &OpContext) -> Arc<dyn SelectionPersistence> {
-    match ctx.service::<Arc<dyn SelectionPersistence>>() {
+    let persistence = match ctx.service::<Arc<dyn SelectionPersistence>>() {
         Some(persistence) => Arc::clone(persistence),
         // Explicit unsizing cast — a closure/`unwrap_or_else` return position
         // does not reliably coerce `Arc<FileSelectionPersistence>` to
         // `Arc<dyn SelectionPersistence>` without it.
         None => Arc::new(FileSelectionPersistence) as Arc<dyn SelectionPersistence>,
+    };
+    // Live-Schnappschuss: mit registrierter Zelle wird jede gelungene
+    // Persistenz auch im Speicher gespiegelt, damit Ansichten und
+    // Folge-Operationen sofort den neuen Stand sehen.
+    match ctx.service::<crate::live_config::SharedLiveConfig>() {
+        Some(live) => Arc::new(crate::live_config::MirroringSelectionPersistence::new(
+            persistence,
+            Arc::clone(live),
+        )) as Arc<dyn SelectionPersistence>,
+        None => persistence,
     }
 }
 
