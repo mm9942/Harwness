@@ -1,0 +1,5 @@
+name = "ownership-and-resource-lifetimes"
+description = "Use when unklar ist, WER Daten besitzt, verändert oder schließt — in jeder Sprache: Aufrufer sieht unerwartete Mutation (geteilte Liste/Dict/Slice), Python-Mutable-Default-Argument, Go-`append`-Aliasing oder wiederverwendeter `Scanner.Bytes()`-Puffer, \"dictionary changed size during iteration\", ConcurrentModificationException, Datei/Connection/Lock nicht geschlossen, `with`/`defer`/`using`/try-with-resources fehlt, unnötige deep copies, oder Rust-Borrow-Checker-Fehler (E0382/E0505, Lifetimes). Lehrt einen klaren Owner pro Datum und Ressource, bewusste Kopien vs. Referenzen, keine Referenz in etwas halten, das man gleichzeitig verändert/weitergibt, und deterministische Freigabe. Sprachunabhängige Variante von rust-move-semantics, rust-to-owned-vs-clone, rust-borrow-checker-e0505, rust-*-lifetimes, rust-deref-star."
+enabled = true
+instructions_file = "instructions.md"
+tools = ["filesystem.read"]

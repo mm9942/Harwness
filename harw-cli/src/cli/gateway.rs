@@ -43,4 +43,6 @@ pub enum GatewayAction {
     Enable,
     /// Gateway-Dienst beim Login deaktivieren.
     Disable,
+    /// Status des Gateway-Dienstes anzeigen.
+    Status,
 }

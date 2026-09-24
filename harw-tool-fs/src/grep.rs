@@ -701,7 +701,9 @@ fn grep_with_engine(root: &Path, args: &GrepArgs, rg: Option<&Path>) -> ToolOutp
 mod tests {
     use super::*;
     use crate::test_support::{Fixture, SECRET, TestError, TestResult, ctx, render};
-    use harw_authority::{Permission, PermissionSet, SandboxSpec, WorkspaceRegistration, WorkspaceRegistry};
+    use harw_authority::{
+        Permission, PermissionSet, SandboxSpec, WorkspaceRegistration, WorkspaceRegistry,
+    };
     use harw_tools::ToolExecutor;
     use harw_types::{SessionId, TenantId, ToolCallId, TurnId, WorkspaceId};
     use std::fs;
@@ -726,7 +728,10 @@ mod tests {
         let binding = registry
             .resolve(&TenantId::from_str("t"), &WorkspaceId::from_str("w"))
             .map_err(ctx("binding"))?;
-        Ok(SandboxSpec::from_resolved(binding, PermissionSet::from_policy(permissions)))
+        Ok(SandboxSpec::from_resolved(
+            binding,
+            PermissionSet::from_policy(permissions),
+        ))
     }
 
     fn make_ctx(sandbox: SandboxSpec) -> ToolExecutionContext {
@@ -747,7 +752,9 @@ mod tests {
     fn text_of(output: ToolOutput) -> TestResult<String> {
         match output {
             ToolOutput::Text { content } => Ok(content),
-            other => Err(TestError::Unexpected(format!("expected text output, got: {other:?}"))),
+            other => Err(TestError::Unexpected(format!(
+                "expected text output, got: {other:?}"
+            ))),
         }
     }
 
@@ -857,7 +864,10 @@ mod tests {
             .filter(|l| !l.starts_with('#') && l.contains(':'))
             .count();
 
-        assert_eq!(match_line_count, 3, "expected exactly 3 match lines: {text}");
+        assert_eq!(
+            match_line_count, 3,
+            "expected exactly 3 match lines: {text}"
+        );
         assert!(
             text.contains("# Hinweis") && text.contains("begrenzt"),
             "expected a truncation hint: {text}"
@@ -880,7 +890,11 @@ mod tests {
             ToolOutput::Error { message } => {
                 assert!(message.contains("ungültiges Muster"), "got: {message}");
             }
-            other => return Err(TestError::Unexpected(format!("expected error output, got: {other:?}"))),
+            other => {
+                return Err(TestError::Unexpected(format!(
+                    "expected error output, got: {other:?}"
+                )));
+            }
         }
         Ok(())
     }
@@ -905,7 +919,11 @@ mod tests {
             ToolOutput::Error { message } => {
                 assert!(message.contains("ReadWorkspace"), "unexpected: {message}");
             }
-            other => return Err(TestError::Unexpected(format!("expected error output, got: {other:?}"))),
+            other => {
+                return Err(TestError::Unexpected(format!(
+                    "expected error output, got: {other:?}"
+                )));
+            }
         }
         Ok(())
     }
@@ -919,14 +937,21 @@ mod tests {
 
         let output = fs_grep(&ctx, grep_args(SECRET)).await?;
         let text = text_of(output)?;
-        assert_eq!(text.lines().count(), 1, "nur die eigene Datei darf treffen: {text}");
+        assert_eq!(
+            text.lines().count(),
+            1,
+            "nur die eigene Datei darf treffen: {text}"
+        );
         assert!(text.starts_with("nested/own.txt:1:"), "{text}");
 
         for path in ["link_dir", "loop", "nested/up", "../outside"] {
             let mut args = grep_args(SECRET);
             args.path = Some(path.to_owned());
             let output = fs_grep(&ctx, args).await?;
-            assert!(matches!(output, ToolOutput::Error { .. }), "{path}: {output:?}");
+            assert!(
+                matches!(output, ToolOutput::Error { .. }),
+                "{path}: {output:?}"
+            );
             assert!(!render(&output)?.contains("secret.txt"));
         }
         Ok(())
@@ -945,21 +970,37 @@ mod tests {
         let mut args = grep_args("MATCHME");
         args.max_matches = Some(usize::MAX);
         let text = text_of(fs_grep(&ctx, args).await?)?;
-        assert!(text.contains("# stopped: output_limit"), "{}", &text[..text.len().min(400)]);
-        assert!(text.contains("übersprungen"), "Größenlimit muss gemeldet werden");
-        assert!(!text.contains("big.log:"), "übergroße Datei darf nicht durchsucht werden");
+        assert!(
+            text.contains("# stopped: output_limit"),
+            "{}",
+            &text[..text.len().min(400)]
+        );
+        assert!(
+            text.contains("übersprungen"),
+            "Größenlimit muss gemeldet werden"
+        );
+        assert!(
+            !text.contains("big.log:"),
+            "übergroße Datei darf nicht durchsucht werden"
+        );
         for line in text.lines().filter(|line| !line.starts_with('#')) {
             let max_line = crate::tree::MAX_LINE_BYTES + 32;
             assert!(line.len() <= max_line, "Zeile zu lang: {}", line.len());
         }
-        assert!(text.len() <= MAX_OUTPUT_BYTES + 4096, "Ausgabe zu groß: {}", text.len());
+        assert!(
+            text.len() <= MAX_OUTPUT_BYTES + 4096,
+            "Ausgabe zu groß: {}",
+            text.len()
+        );
         Ok(())
     }
 
     #[tokio::test]
     async fn test_fs_grep_caps_matches_at_hard_limit() -> TestResult {
         let fixture = Fixture::new()?;
-        let lines: String = (0..(HARD_MAX_RESULTS + 20)).map(|i| format!("m{i}\n")).collect();
+        let lines: String = (0..(HARD_MAX_RESULTS + 20))
+            .map(|i| format!("m{i}\n"))
+            .collect();
         fs::write(fixture.ws.join("many.txt"), lines)?;
         let ctx = fixture.ctx(vec![Permission::ReadWorkspace])?;
         let mut args = grep_args("^m");
@@ -1019,13 +1060,22 @@ mod tests {
         assert_eq!(matched.line_number, 42);
         assert_eq!(matched.text, "fn matchme() {}\n");
 
-        assert!(parse_rg_match_line(begin_line).is_none(), "begin event must not parse as match");
-        assert!(parse_rg_match_line(end_line).is_none(), "end event must not parse as match");
+        assert!(
+            parse_rg_match_line(begin_line).is_none(),
+            "begin event must not parse as match"
+        );
+        assert!(
+            parse_rg_match_line(end_line).is_none(),
+            "end event must not parse as match"
+        );
         assert!(
             parse_rg_match_line(summary_line).is_none(),
             "summary event must not parse as match"
         );
-        assert!(parse_rg_match_line("not json").is_none(), "garbage line must not parse");
+        assert!(
+            parse_rg_match_line("not json").is_none(),
+            "garbage line must not parse"
+        );
         Ok(())
     }
 

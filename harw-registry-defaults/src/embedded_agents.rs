@@ -1157,9 +1157,11 @@ mod tests {
                         | harw_agent_dsl::roles::AgentRoleId::UiaWorker
                         | harw_agent_dsl::roles::AgentRoleId::AgentSteward
                         | harw_agent_dsl::roles::AgentRoleId::RootOrchestrator
+                        | harw_agent_dsl::roles::AgentRoleId::ChildOrchestrator
                 ),
                 "{name}: eingebaute Rollen tragen organisatorisch Worker, UiaWorker, \
-                 AgentSteward oder RootOrchestrator (Addenda J + K)"
+                 AgentSteward, RootOrchestrator oder ChildOrchestrator (Addenda J + K, \
+                 Plan Punkt 1)"
             );
             assert_eq!(raw.specialization, *name, "{name}");
         }
@@ -1699,6 +1701,7 @@ mod tests {
                         | harw_agent_dsl::roles::AgentRoleId::UiaWorker
                         | harw_agent_dsl::roles::AgentRoleId::AgentSteward
                         | harw_agent_dsl::roles::AgentRoleId::RootOrchestrator
+                        | harw_agent_dsl::roles::AgentRoleId::ChildOrchestrator
                 ),
                 "{role} muss eine zulässige organisatorische Rolle tragen"
             );
@@ -1988,13 +1991,31 @@ mod tests {
                 "fs.search",
                 "fs.glob",
                 "fs.grep",
+                "doc.read_pdf",
                 "deps.graph",
                 "deps.locked",
                 "deps.source_read",
                 "deps.source_search",
                 "deps.source_list",
+                "explore.tree",
+                "explore.projects",
+                "explore.relations",
+                "explore.find",
+                // Nutzerentscheidung: der Explorer durchsucht auch das Netz.
+                "web.search",
+                "web.fetch",
             ]
         );
+        for tool in ["fs.write", "shell.exec", "web.docs_rs", "web.crates_io"] {
+            assert!(
+                explorer
+                    .tool_surface()
+                    .forbidden()
+                    .iter()
+                    .any(|t| t == tool),
+                "explorer muss {tool} ausdruecklich verbieten"
+            );
+        }
         assert_eq!(explorer.spawn_contract().max_depth(), Some(1));
         let budget = explorer
             .spawn_contract()
@@ -2010,33 +2031,60 @@ mod tests {
         Ok(())
     }
 
+    /// Welche Rollen `web.*` admittieren — und welche davon genau.
+    ///
+    /// - `researcher-web` (`RegistryProfile::Research`): alle vier
+    ///   Netz-Werkzeuge, ohne Workspace-Zugriff (A5).
+    /// - `explorer` (`ReadOnlyExplore`) und `uia-explorer` (`UiaExplorer`):
+    ///   ausschließlich `web.fetch`/`web.search` (`EXPLORER_WEB_TOOLS`) —
+    ///   Nutzerentscheidung „der Explorer durchsucht alles … auch das
+    ///   Internet“.
+    /// - `researcher` und `dependency-researcher` (`ReadOnlyResearch`):
+    ///   genau `web.fetch`/`web.search` — allgemeine bzw.
+    ///   ökosystem-neutrale Recherche über die offiziellen Quellen, ohne die
+    ///   Crate-Werkzeuge.
+    /// - `uia-worker` (`UiaQuickHelper`) und `uia-writer` (`UiaWriter`):
+    ///   alle vier Netz-Werkzeuge (`UIA_HELPER_WEB_TOOLS`) — Nutzerentscheidung
+    ///   „die UIA-Helfer recherchieren kurz online und fügen manchmal
+    ///   Abhängigkeiten hinzu“ (crates.io-Metadaten, docs.rs).
+    ///
+    /// Jede andere Rolle — insbesondere `analyst`/`researcher-deps`, die sich
+    /// das Profil `ReadOnlyExplore` mit dem `explorer` teilen, sowie
+    /// `planner` und die Orchestratoren — admittiert kein `web.*`.
     #[test]
-    fn test_researcher_web_is_the_only_role_with_web_tools() -> TestResult {
-        // Addendum I: `uia-worker` (`RegistryProfile::UiaQuickHelper`)
-        // admittiert seit der Korrektur ebenfalls ein Netz-Werkzeug —
-        // ausschließlich `web.fetch`, siehe `agents/uia-worker.toml`.
-        //
-        // `uia-explorer` (`RegistryProfile::UiaExplorer`) und `uia-writer`
-        // (`RegistryProfile::UiaWriter`) admittieren dieselbe alleinige
-        // `web.fetch`-Konstante wie `uia-worker`
-        // (`UIA_QUICK_HELPER_WEB_TOOLS`, `harw-registry-defaults/src/profile.rs`)
-        // — beide sind UIA-Erkundungsspezialisierungen mit derselben
-        // Begründung, siehe `agents/uia-explorer.toml` und
-        // `agents/uia-writer.toml`.
+    fn test_web_tools_are_admitted_only_by_researcher_web_explorers_and_uia_roles() -> TestResult {
         let definitions = builtin()?;
         for (role, ir) in &definitions {
-            let has_web = ir
+            let web: BTreeSet<&str> = ir
                 .tool_surface()
                 .admitted()
                 .iter()
-                .any(|name| name.starts_with("web."));
-            let expects_web = role == role_names::RESEARCHER_WEB
-                || role == role_names::UIA_WORKER
-                || role == role_names::UIA_EXPLORER
-                || role == role_names::UIA_WRITER;
+                .map(String::as_str)
+                .filter(|name| name.starts_with("web."))
+                .collect();
+            let expected: BTreeSet<&str> = if [
+                role_names::RESEARCHER_WEB,
+                role_names::UIA_WORKER,
+                role_names::UIA_WRITER,
+            ]
+            .contains(&role.as_str())
+            {
+                ["web.fetch", "web.docs_rs", "web.crates_io", "web.search"].into()
+            } else if [
+                role_names::EXPLORER,
+                role_names::UIA_EXPLORER,
+                role_names::RESEARCHER,
+                role_names::DEPENDENCY_RESEARCHER,
+            ]
+            .contains(&role.as_str())
+            {
+                ["web.fetch", "web.search"].into()
+            } else {
+                BTreeSet::new()
+            };
             assert_eq!(
-                has_web, expects_web,
-                "{role}: web.* darf nur der Web-Rechercheur und die UIA-Erkundungsrollen führen"
+                web, expected,
+                "{role}: web.* führen nur die Rechercheure, die Explorer und die UIA-Rollen"
             );
         }
         Ok(())
@@ -2291,8 +2339,9 @@ mod tests {
         );
         assert_eq!(
             role_names_of(&resolved.orchestrators),
-            vec![role_names::ANALYST],
-            "nur der Analyst darf zwei Ebenen tief delegieren"
+            vec![role_names::RESEARCH_ORCHESTRATOR, role_names::ANALYST],
+            "der Research-Orchestrator führt, der Analyst bleibt als \
+             verdichtender Zwei-Ebenen-Worker zugelassen"
         );
         Ok(())
     }
@@ -2480,6 +2529,120 @@ mod tests {
                 "die Organisation verweist auf die unbekannte Rolle '{}'",
                 reference.id.name
             );
+        }
+        Ok(())
+    }
+
+    /// Plan Punkt 1 / §15 („a clan leader must be a ChildOrchestrator“):
+    /// jeder Clan der Default-Organisation wird von einem eingebauten
+    /// Child-Orchestrator geführt, den der Root-Orchestrator über seine
+    /// exakte Freigabeliste (`[spawn].child_orchestrators`) auch starten
+    /// darf.
+    #[test]
+    fn test_every_clan_leader_is_a_child_orchestrator() -> TestResult {
+        let resolved = organization()?;
+        let definitions = builtin()?;
+        let root = definitions
+            .get(role_names::ROOT_ORCHESTRATOR)
+            .ok_or(TestError::Missing("root-orchestrator ist eingebaut"))?;
+        let granted = root.spawn_contract().child_orchestrators();
+        for clan in &resolved.clans {
+            let leader = clan.leader.id.name.as_str();
+            let ir = definitions.get(leader).ok_or_else(|| {
+                TestError::Unexpected(format!("Clan {}: Leader {leader} fehlt", clan.id))
+            })?;
+            assert_eq!(
+                ir.role(),
+                harw_agent_dsl::roles::AgentRoleId::ChildOrchestrator,
+                "Clan {}: Leader {leader} muss ein Child-Orchestrator sein",
+                clan.id
+            );
+            assert!(
+                granted.iter().any(|name| name == leader),
+                "Clan {}: root-orchestrator gibt {leader} nicht frei",
+                clan.id
+            );
+            assert_eq!(clan.child_depth_cost, 1, "Clan {}", clan.id);
+        }
+        Ok(())
+    }
+
+    /// Die drei eingebauten Child-Orchestratoren: organisatorisch
+    /// `ChildOrchestrator`, darunter ausschließlich Worker (`max_depth = 1`,
+    /// leere eigene Freigabeliste), ein ReturnEnvelope-Vertrag und ein
+    /// Budget, das in keiner Dimension über dem des Root-Orchestrators liegt.
+    #[test]
+    fn test_child_orchestrators_are_bounded_by_the_root_orchestrator() -> TestResult {
+        let definitions = builtin()?;
+        let root = definitions
+            .get(role_names::ROOT_ORCHESTRATOR)
+            .ok_or(TestError::Missing("root-orchestrator ist eingebaut"))?;
+        let root_budget = root.spawn_contract().budget().ok_or(TestError::Missing(
+            "root-orchestrator braucht [spawn.budget]",
+        ))?;
+        let mut granted: Vec<&str> = root
+            .spawn_contract()
+            .child_orchestrators()
+            .iter()
+            .map(String::as_str)
+            .collect();
+        granted.sort_unstable();
+        let mut expected: Vec<&str> = role_names::CHILD_ORCHESTRATORS.to_vec();
+        expected.sort_unstable();
+        assert_eq!(granted, expected, "exakte Freigabeliste des Roots");
+
+        for role in role_names::CHILD_ORCHESTRATORS {
+            let ir = definitions
+                .get(*role)
+                .ok_or_else(|| TestError::Unexpected(format!("{role} fehlt")))?;
+            assert_eq!(
+                ir.role(),
+                harw_agent_dsl::roles::AgentRoleId::ChildOrchestrator,
+                "{role}"
+            );
+            assert_eq!(ir.spawn_contract().max_depth(), Some(1), "{role}");
+            assert!(
+                ir.spawn_contract().child_orchestrators().is_empty(),
+                "{role}: keine verschachtelten Sub-Orchestratoren ohne Freigabe"
+            );
+            assert_eq!(
+                ir.return_pipeline().contract(),
+                Some("harwness.return.envelope@1"),
+                "{role}"
+            );
+            let budget = ir
+                .spawn_contract()
+                .budget()
+                .ok_or_else(|| TestError::Unexpected(format!("{role} ohne [spawn.budget]")))?;
+            for (dimension, child, parent) in [
+                ("max_tokens", budget.max_tokens(), root_budget.max_tokens()),
+                (
+                    "max_wall_secs",
+                    budget.max_wall_secs(),
+                    root_budget.max_wall_secs(),
+                ),
+            ] {
+                let (Some(child), Some(parent)) = (child, parent) else {
+                    return Err(TestError::Unexpected(format!(
+                        "{role}: {dimension} muss bei Kind und Root gesetzt sein"
+                    )));
+                };
+                assert!(child <= parent, "{role}: {dimension} {child} > {parent}");
+            }
+            let (Some(child_calls), Some(root_calls)) =
+                (budget.max_tool_calls(), root_budget.max_tool_calls())
+            else {
+                return Err(TestError::Unexpected(format!(
+                    "{role}: max_tool_calls muss bei Kind und Root gesetzt sein"
+                )));
+            };
+            assert!(child_calls <= root_calls, "{role}: max_tool_calls");
+            for tool in ["fs.write", "shell.exec", "web.fetch", "web.search"] {
+                assert!(
+                    !ir.tool_surface().admitted().iter().any(|name| name == tool),
+                    "{role} darf {tool} nicht admittieren"
+                );
+            }
         }
         Ok(())
     }

@@ -8,6 +8,11 @@ on:
 
 env:
   CARGO_TERM_COLOR: always
+  # ~80 workspace crates produce hundreds of test binaries; full debuginfo
+  # (debuginfo=2) fills the hosted runner's disk. Line tables keep panic
+  # backtraces useful at a fraction of the size.
+  CARGO_PROFILE_DEV_DEBUG: line-tables-only
+  CARGO_PROFILE_TEST_DEBUG: line-tables-only
 
 jobs:
   check:
@@ -28,11 +33,20 @@ jobs:
           workspaces: "."
 
       # The sandbox tests (harw-sandbox and friends) exec bubblewrap directly,
-      # so it must be present before `cargo test` runs.
-      - name: Install bubblewrap
+      # so it must be present before `cargo test` runs. libdbus-1-dev and
+      # pkg-config are needed by the OS-keyring backend (`keyring` feature ->
+      # libdbus-sys) that harw-secrets builds with.
+      # Hosted runners ship toolchains we never use; reclaim ~20 GB for the
+      # target directory.
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+          df -h /
+
+      - name: Install system dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y bubblewrap
+          sudo apt-get install -y bubblewrap libdbus-1-dev pkg-config
 
       - name: cargo fmt --check
         run: cargo fmt --all -- --check
@@ -58,10 +72,12 @@ jobs:
         with:
           workspaces: "dod -> target"
 
-      - name: Install bubblewrap
+      # bubblewrap for the sandbox tests; libdbus-1-dev + pkg-config for the
+      # OS-keyring backend (`keyring` feature -> libdbus-sys) used by harw-secrets.
+      - name: Install system dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y bubblewrap
+          sudo apt-get install -y bubblewrap libdbus-1-dev pkg-config
 
       - name: cargo test --workspace --locked
         working-directory: dod

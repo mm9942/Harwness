@@ -17,8 +17,8 @@
 //! ohne Dateisystem-Umweg prüfen; diese Datei bindet nur die Harness ein.
 
 use harw_dod_cap::Capability;
-use harw_dod_cpu::sensor::MAX_CARDINALITY;
 use harw_dod_cpu::CpuSensor;
+use harw_dod_cpu::sensor::MAX_CARDINALITY;
 
 harw_dod_fixtures::sensor_suite! {
     sensor: CpuSensor,

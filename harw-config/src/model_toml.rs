@@ -2,6 +2,9 @@ use serde::{Deserialize, Serialize};
 
 use harw_types::ReasoningEffort;
 
+use crate::error::ConfigResult;
+use crate::provider_toml::RateLimitToml;
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ModelToml {
@@ -41,6 +44,30 @@ pub struct ModelToml {
     /// (z. B. für Gateways ohne SSE-Unterstützung).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub stream: Option<bool>,
+    /// Client-seitiges Budget nur für dieses Modell (Sektion `[rate_limit]`).
+    /// Die Budget-Felder bilden einen eigenen Bucket je (Provider, Modell),
+    /// der **zusätzlich** zum Provider-Bucket aus
+    /// `ProviderToml::rate_limit` gilt; `enabled`/`safety_margin_pct`
+    /// (Header-Pacing) sind hier ohne Wirkung. `None` = kein Modell-Bucket.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rate_limit: Option<RateLimitToml>,
+}
+
+impl ModelToml {
+    /// Prüft Invarianten, die die TOML-Deserialisierung nicht ausdrücken kann.
+    ///
+    /// # Errors
+    /// [`crate::ConfigError::Invalid`], wenn `[rate_limit]` gegen
+    /// [`RateLimitToml::validate`] verstößt (z. B. ein Budget-Feld `0`).
+    pub fn validate(&self) -> ConfigResult<()> {
+        if let Some(rate_limit) = &self.rate_limit {
+            rate_limit.validate(&format!(
+                "model '{}' (provider '{}')",
+                self.id, self.provider
+            ))?;
+        }
+        Ok(())
+    }
 }
 
 /// Steuert, wie Prompt-Caching für ein Modell angewendet wird.
@@ -186,5 +213,61 @@ mod tests {
             default_reasoning_effort = "ultra"
         "#;
         assert!(toml::from_str::<ModelToml>(src).is_err());
+    }
+
+    #[test]
+    fn test_model_with_rate_limit_override_parses_and_validates() -> TestResult {
+        let src = r#"
+            id = "gpt-5"
+            provider = "openai"
+
+            [rate_limit]
+            tokens_per_minute = 40000
+            requests_per_minute = 100
+        "#;
+        let model: ModelToml = toml::from_str(src).map_err(ctx("model-toml parsen"))?;
+        model
+            .validate()
+            .map_err(ctx("positive model budget is valid"))?;
+        let rate_limit = model
+            .rate_limit
+            .as_ref()
+            .ok_or(crate::test_support::TestError::Missing("model rate_limit"))?;
+        assert_eq!(rate_limit.tokens_per_minute, Some(40_000));
+        assert!(rate_limit.budget_enabled());
+        Ok(())
+    }
+
+    #[test]
+    fn test_model_rate_limit_zero_budget_is_rejected() -> TestResult {
+        let src = r#"
+            id = "gpt-5"
+            provider = "openai"
+
+            [rate_limit]
+            requests_per_minute = 0
+        "#;
+        let model: ModelToml = toml::from_str(src).map_err(ctx("model-toml parsen"))?;
+        let Err(error) = model.validate() else {
+            return Err(crate::test_support::TestError::Unexpected(
+                "requests_per_minute = 0 must be rejected".into(),
+            ));
+        };
+        assert!(error.to_string().contains("model 'gpt-5'"));
+        Ok(())
+    }
+
+    #[test]
+    fn test_model_without_rate_limit_is_none_and_not_serialized() -> TestResult {
+        let src = r#"
+            id = "gpt-5"
+            provider = "openai"
+        "#;
+        let model: ModelToml = toml::from_str(src).map_err(ctx("model-toml parsen"))?;
+        assert!(model.rate_limit.is_none());
+        model.validate().map_err(ctx("no rate_limit is valid"))?;
+        let encoded = toml::to_string(&model).map_err(ctx("model-toml serialisieren"))?;
+        assert!(!encoded.contains("rate_limit"));
+        Ok(())
     }
 }

@@ -1,74 +1,145 @@
 //! §6.3 card-lifecycle transitions and the §6.4 approval/structural gates.
 //!
 //! # Verantwortung
-//! Dieses Modul besitzt genau die acht Pfeile aus dem §6.3-Diagramm, je eine
-//! `pub fn` pro Pfeil, und die drei §6.4-Vorbedingungen an genau den
-//! Übergängen, die sie betreffen (`claim`, `complete`, `archive`). Jede
-//! Funktion prüft den Ausgangszustand der übergebenen [`Card`] explizit und
-//! liefert bei einem unzulässigen Ausgangszustand
-//! [`KnowledgeError::IllegalTransition`] — nie ein stilles No-op. Dieses
-//! Modul persistiert nichts selbst (das bleibt Sache von
-//! [`crate::kanban::board::save_card`]) und ruft **keine**
-//! `harw-job-runtime`-Funktion auf: die Karte trägt zwar einen `WorkId`, aber
-//! das eigentliche Claim/Lease/Retry der Governed-Work-Maschinerie bleibt
-//! vollständig beim Aufrufer (siehe §6.2 — diese Crate ist nicht von
-//! `harw-job-runtime`s Laufzeitverhalten abhängig, nur von dessen `WorkId`-Typ).
+//! Je Pfeil des §6.3-Diagramms eine `pub fn`, plus die drei §6.4-Gates an
+//! genau den Übergängen, die sie betreffen (`claim`, `complete`, `archive`).
+//! Jede Funktion prüft den **abgeleiteten** Ausgangszustand der übergebenen
+//! [`Card`]-Sicht explizit und liefert bei unzulässigem Ausgangszustand
+//! [`KnowledgeError::IllegalTransition`] — nie ein stilles No-op.
+//!
+//! # Job-Übergang zuerst, Karte danach (§6.3)
+//! „Every transition is a `harw-job-runtime` state transition first and a
+//! card render second." Darum ändert keine Funktion hier `card.state`
+//! selbst: sie ruft den passenden Übergang auf [`JobTransitions`] auf und
+//! baut die Sicht danach **neu aus dem Ledger** ([`CardRecord::view_with`]).
+//! Lehnt das Ledger ab, bleibt die Karte unverändert. Der Trait wird gegen
+//! `harw-job-runtime` (Job + Lease + Retry) implementiert; diese Crate
+//! liefert nur die Referenz [`InMemoryJobTransitions`] (Tests,
+//! Einzelprozess-Betrieb ohne durablen Ledger).
+//!
+//! # Was der Aufrufer persistieren muss
+//! Der Kartenzustand wird nie gespeichert. Nur zwei Übergänge ändern den
+//! gespeicherten [`CardRecord`]: [`triage_to_todo`] (neue `work_id`) und
+//! [`archive`] (Tag [`ARCHIVED_TAG`]). Nach ihnen muss der Aufrufer
+//! `card.record()` über [`crate::kanban::board::save_card`] speichern.
 //!
 //! # Die drei §6.4-Gates, und was hier NICHT geprüft wird
-//! - **Ready -> Running** ([`claim`]): verlangt bei
-//!   `RiskLevel::High`/`RiskLevel::Critical` einen positiven [`ApprovalProof`]
-//!   als Parameter. Woher der Aufrufer das Risiko der gebundenen Rolle kennt
-//!   (Lane -> `AgentRoleRef` -> `RiskLevel`) und wie ein `ApprovalRequest`
-//!   tatsächlich aufgelöst wird, ist **nicht** Sache dieser Crate — das ist
-//!   `harw-policy`s/`harw_types::roles::ReviewDecision`s Domäne. Dieses Modul
-//!   prüft nur: liegt ein `ApprovalProof` vor, und ist seine `decision`
-//!   positiv.
-//! - **Running -> Done|Blocked** ([`complete`]): eine Karte mit dem Tag
-//!   [`REVIEW_REQUIRED_TAG`] wird nie `Done`, sondern
-//!   `Blocked { reason_kind: BlockKind::ReviewRequired }`.
-//! - **Blocked|Done -> Archived** ([`archive`]): verlangt vom Aufrufer die
-//!   Anzahl noch nicht abgeschlossener Kindkarten (`unresolved_children`) —
-//!   das Aufsuchen der Kindkarten selbst (Graphtraversal über `parents`)
-//!   bleibt bewusst beim Aufrufer, der bereits Zugriff auf
-//!   [`crate::kanban::board::list_cards`] hat.
+//! - **Ready -> Running** ([`claim`]): bei `RiskLevel::High`/`Critical` ist
+//!   ein positiver [`ApprovalProof`] Pflicht. Woher das Risiko der Lane-Rolle
+//!   stammt und wie eine Freigabe aufgelöst wird, entscheidet der Aufrufer.
+//! - **Running -> Done|Blocked** ([`complete`]): eine Karte mit
+//!   [`REVIEW_REQUIRED_TAG`] wird nie `Done`, sondern der Job wird mit
+//!   [`BlockKind::ReviewRequired`] blockiert.
+//! - **Blocked|Done -> Archived** ([`archive`]): der Aufrufer liefert die
+//!   Anzahl offener Kindkarten; > 0 wird abgelehnt.
 //!
-//! # Concurrency
-//! Reine, threadsichere Funktionen auf `&mut Card` ohne I/O und ohne inneres
-//! Locking. Ein `Card`-Wert darf nicht gleichzeitig von zwei Aufrufern
-//! mutiert werden; das Serialisieren bleibt — wie überall in dieser Crate —
-//! Sache des Aufrufers.
+//! # Nebenläufigkeit
+//! Die Funktionen halten keine Sperren; [`JobTransitions`]-Implementierungen
+//! müssen ihre Übergänge selbst atomar machen (die Referenz nutzt einen
+//! Mutex). Ein `Card`-Wert darf nicht gleichzeitig von zwei Aufrufern
+//! mutiert werden.
 //!
 //! # Errors
-//! Jeder fehlschlagende Pfad liefert [`crate::error::KnowledgeError`] /
-//! [`crate::error::KnowledgeResult`].
+//! Jeder fehlschlagende Pfad liefert [`KnowledgeError`] / [`KnowledgeResult`].
 
+use std::collections::HashMap;
+use std::sync::{Mutex, PoisonError};
+
+use harw_job_runtime::{JobRuntimeError, JobState};
 use harw_types::{ReviewDecision, RiskLevel};
 
 use crate::error::{KnowledgeError, KnowledgeResult};
 use crate::visibility::AgentId;
 
-use super::board::{BlockKind, Card, CardState};
+use super::board::{ARCHIVED_TAG, BlockKind, Card, CardRecord, CardState, JobSnapshot};
 
 pub use harw_job_runtime::WorkId;
 
 /// Tag that routes [`complete`] to `Blocked { reason_kind: ReviewRequired }`
-/// instead of `Done` (§6.4, "Running -> Done ... doesn't auto-flip ... on a
-/// card tagged `review-required`").
+/// instead of `Done` (§6.4).
 pub const REVIEW_REQUIRED_TAG: &str = "review-required";
+
+/// Die Job-Übergänge, über die jede Kartenbewegung läuft (§6.2/§6.3).
+///
+/// # Beschreibung
+/// Wird später gegen `harw-job-runtime` implementiert (`Job::mark_ready`,
+/// `Job::claim` + `Lease`, `Job::complete`, Retry über `record_failure`).
+/// Jede Methode ist ein **Ledger**-Übergang; lehnt das Ledger ihn ab, meldet
+/// die Implementierung einen Fehler (üblich: [`KnowledgeError::Job`]) und
+/// ändert nichts.
+///
+/// # Nebenläufigkeit
+/// `Send + Sync`, damit eine Implementierung als
+/// `Arc<dyn JobTransitions>` in einer `ServiceMap` liegen kann. Jeder
+/// Übergang muss für sich atomar sein.
+pub trait JobTransitions: Send + Sync {
+    /// Aktueller Ledger-Stand eines Jobs; `None`, wenn das Ledger ihn nicht kennt.
+    ///
+    /// # Fehler
+    /// Nur bei Lesefehlern des Ledgers selbst.
+    fn snapshot(&self, work_id: &WorkId) -> KnowledgeResult<Option<JobSnapshot>>;
+
+    /// Legt für eine Triage-Karte einen neuen Job im Zustand `Pending` an.
+    ///
+    /// # Rückgabe
+    /// Die `WorkId` des neuen Jobs.
+    ///
+    /// # Fehler
+    /// Wenn das Ledger keinen Job anlegen kann.
+    fn create(&self, card: &CardRecord) -> KnowledgeResult<WorkId>;
+
+    /// `Pending -> Ready`.
+    ///
+    /// # Fehler
+    /// Wenn der Job nicht `Pending`/`Ready` ist.
+    fn mark_ready(&self, work_id: &WorkId) -> KnowledgeResult<()>;
+
+    /// `Ready -> Running` für `holder` (Lease).
+    ///
+    /// # Fehler
+    /// Wenn der Job nicht `Ready` ist oder die Lease umkämpft ist.
+    fn claim(&self, work_id: &WorkId, holder: &AgentId) -> KnowledgeResult<()>;
+
+    /// `Running -> Completed`.
+    ///
+    /// # Fehler
+    /// Wenn der Job nicht `Running` ist.
+    fn complete(&self, work_id: &WorkId) -> KnowledgeResult<()>;
+
+    /// `Running -> Blocked` mit Grund.
+    ///
+    /// # Fehler
+    /// Wenn der Job nicht `Running` ist.
+    fn block(&self, work_id: &WorkId, reason: BlockKind) -> KnowledgeResult<()>;
+
+    /// `Blocked|Failed -> Ready`.
+    ///
+    /// # Fehler
+    /// Wenn der Job weder `Blocked` noch `Failed` ist.
+    fn unblock(&self, work_id: &WorkId) -> KnowledgeResult<()>;
+
+    /// `Running -> Ready` nach totem/abgelaufenem Halter; zählt einen Versuch.
+    ///
+    /// # Fehler
+    /// Wenn der Job nicht `Running` ist oder die Retry-Politik erschöpft ist.
+    fn reclaim(&self, work_id: &WorkId) -> KnowledgeResult<()>;
+
+    /// Beendet einen nicht abgeschlossenen Job endgültig (`-> Cancelled`).
+    ///
+    /// # Fehler
+    /// Wenn der Job bereits `Completed` ist.
+    fn cancel(&self, work_id: &WorkId) -> KnowledgeResult<()>;
+}
 
 /// Evidence that the §6.4 approval gate on a high-risk claim was resolved.
 ///
 /// # Description
 /// This crate never contacts an approval service itself — the caller obtains
-/// this proof from wherever [`ReviewDecision`]s are actually adjudicated
-/// (`harw-policy`, an operator-facing `/kanban claim` command, ...) and
-/// passes it into [`claim`]. [`claim`] only checks that the proof exists and
-/// that its `decision` is positive ([`ApprovalProof::is_positive`]); it never
-/// re-derives or re-requests the decision.
+/// this proof from wherever [`ReviewDecision`]s are adjudicated and passes it
+/// into [`claim`], which only checks that it exists and is positive.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ApprovalProof {
-    /// The resolved decision (matches `harw-types::roles::ReviewDecision`,
-    /// §6.4: "same `ReviewDecision` type ... used elsewhere in the harness").
+    /// The resolved decision.
     pub decision: ReviewDecision,
     /// Identity of whoever resolved the approval (audit trail).
     pub approved_by: AgentId,
@@ -94,25 +165,10 @@ impl ApprovalProof {
     }
 }
 
-/// Short, stable label for a [`CardState`], used only in
-/// [`KnowledgeError::IllegalTransition`] messages.
-fn state_label(state: &CardState) -> &'static str {
-    match state {
-        CardState::Triage => "triage",
-        CardState::Todo => "todo",
-        CardState::Ready => "ready",
-        CardState::Running => "running",
-        CardState::Blocked { .. } => "blocked",
-        CardState::Done => "done",
-        CardState::Archived => "archived",
-    }
-}
-
-/// Build an [`KnowledgeError::IllegalTransition`] from a card's current state
-/// to the attempted target.
+/// Build an [`KnowledgeError::IllegalTransition`] from a card's current state.
 fn illegal_transition(card: &Card, to: &str) -> KnowledgeError {
     KnowledgeError::IllegalTransition {
-        from: state_label(&card.state).to_owned(),
+        from: card.state.label().to_owned(),
         to: to.to_owned(),
     }
 }
@@ -122,30 +178,51 @@ fn requires_approval(risk_level: RiskLevel) -> bool {
     matches!(risk_level, RiskLevel::High | RiskLevel::Critical)
 }
 
-/// `Triage -> Todo` (§6.3, "decompose, optional").
+/// Die `WorkId` einer Karte, deren Zustand einen Job voraussetzt.
+fn bound_work_id(card: &Card) -> KnowledgeResult<WorkId> {
+    card.work_id.clone().ok_or_else(|| {
+        KnowledgeError::ArtifactNotFound(format!("job of card {} (no work_id)", card.id))
+    })
+}
+
+/// Baut die Sicht nach einem Ledger-Übergang neu aus dem Ledger.
+fn refresh(jobs: &dyn JobTransitions, card: &mut Card) -> KnowledgeResult<()> {
+    *card = card.record().view_with(jobs)?;
+    Ok(())
+}
+
+/// `Triage -> Todo` (§6.3 "decompose"): legt den Job an (`Pending`).
+///
+/// Der Aufrufer muss danach `card.record()` speichern (neue `work_id`).
 ///
 /// # Errors
-/// [`KnowledgeError::IllegalTransition`] unless `card.state == Triage`.
-pub fn triage_to_todo(card: &mut Card) -> KnowledgeResult<()> {
+/// [`KnowledgeError::IllegalTransition`] unless `card.state == Triage`;
+/// Fehler aus [`JobTransitions::create`].
+pub fn triage_to_todo(jobs: &dyn JobTransitions, card: &mut Card) -> KnowledgeResult<()> {
     if !matches!(card.state, CardState::Triage) {
         return Err(illegal_transition(card, "todo"));
     }
-    card.state = CardState::Todo;
+    let work_id = jobs.create(&card.record())?;
+    let mut record = card.record();
+    record.work_id = Some(work_id);
+    *card = record.view_with(jobs)?;
     Ok(())
 }
 
 /// `Todo -> Ready` (§6.3), gated on every parent in `parent_states` being `Done`.
 ///
 /// # Description
-/// `parent_states` must be exactly the current states of `card.parents`, in
-/// any order — this function does not load them itself (see the module doc's
-/// "what is NOT checked here"). An empty `parent_states` (a card with no
-/// parents) trivially satisfies the gate.
+/// `parent_states` must be exactly the current (ledger-derived) states of
+/// `card.parents`. An empty slice trivially satisfies the gate.
 ///
 /// # Errors
-/// - [`KnowledgeError::IllegalTransition`] if `card.state != Todo`, or if any
-///   entry of `parent_states` is not `Done`.
-pub fn todo_to_ready(card: &mut Card, parent_states: &[CardState]) -> KnowledgeResult<()> {
+/// [`KnowledgeError::IllegalTransition`] if `card.state != Todo` or a parent
+/// is not `Done`; Fehler aus [`JobTransitions::mark_ready`].
+pub fn todo_to_ready(
+    jobs: &dyn JobTransitions,
+    card: &mut Card,
+    parent_states: &[CardState],
+) -> KnowledgeResult<()> {
     if !matches!(card.state, CardState::Todo) {
         return Err(illegal_transition(card, "ready"));
     }
@@ -155,120 +232,103 @@ pub fn todo_to_ready(card: &mut Card, parent_states: &[CardState]) -> KnowledgeR
     {
         return Err(illegal_transition(card, "ready (parents not all done)"));
     }
-    card.state = CardState::Ready;
-    Ok(())
+    jobs.mark_ready(&bound_work_id(card)?)?;
+    refresh(jobs, card)
 }
 
 /// `Ready -> Running` (§6.3 claim), gated by §6.4's high-risk approval rule.
-///
-/// # Description
-/// `lane_role_risk` is the `RiskLevel` of the worker lane's bound
-/// `AgentRoleRef` (the caller resolves this — see module doc). When it is
-/// `High` or `Critical`, `approval` must be `Some` and
-/// [`ApprovalProof::is_positive`] must hold, or the claim is refused. On
-/// success the card records `work_id` and `holder` and moves to `Running`.
 ///
 /// # Errors
 /// - [`KnowledgeError::IllegalTransition`] if `card.state != Ready`.
 /// - [`KnowledgeError::ClaimRequiresApproval`] if the risk gate applies and
 ///   `approval` is missing or not positive.
+/// - Fehler aus [`JobTransitions::claim`].
 pub fn claim(
+    jobs: &dyn JobTransitions,
     card: &mut Card,
-    work_id: WorkId,
-    holder: AgentId,
+    holder: &AgentId,
     lane_role_risk: RiskLevel,
     approval: Option<&ApprovalProof>,
 ) -> KnowledgeResult<()> {
     if !matches!(card.state, CardState::Ready) {
         return Err(illegal_transition(card, "running"));
     }
-    if requires_approval(lane_role_risk) {
-        let positively_approved = approval.is_some_and(ApprovalProof::is_positive);
-        if !positively_approved {
-            return Err(KnowledgeError::ClaimRequiresApproval {
-                card_id: card.id.to_string(),
-                risk_level: lane_role_risk.to_string(),
-            });
-        }
+    if requires_approval(lane_role_risk) && !approval.is_some_and(ApprovalProof::is_positive) {
+        return Err(KnowledgeError::ClaimRequiresApproval {
+            card_id: card.id.to_string(),
+            risk_level: lane_role_risk.to_string(),
+        });
     }
-    card.work_id = Some(work_id);
-    card.assignee = Some(holder);
-    card.state = CardState::Running;
-    Ok(())
+    jobs.claim(&bound_work_id(card)?, holder)?;
+    refresh(jobs, card)
 }
 
-/// `Running -> Done` or `Running -> Blocked { ReviewRequired }` (§6.3 complete,
-/// §6.4 review-required gate).
-///
-/// A card carrying [`REVIEW_REQUIRED_TAG`] in `card.tags` never reaches
-/// `Done` directly from this call — it lands in
-/// `Blocked { reason_kind: BlockKind::ReviewRequired }` pending explicit
-/// operator sign-off, per §6.4.
+/// `Running -> Done`, or `Running -> Blocked { ReviewRequired }` for a card
+/// tagged [`REVIEW_REQUIRED_TAG`] (§6.3 complete, §6.4).
 ///
 /// # Errors
-/// [`KnowledgeError::IllegalTransition`] unless `card.state == Running`.
-pub fn complete(card: &mut Card) -> KnowledgeResult<()> {
+/// [`KnowledgeError::IllegalTransition`] unless `card.state == Running`;
+/// Fehler aus [`JobTransitions::complete`]/[`JobTransitions::block`].
+pub fn complete(jobs: &dyn JobTransitions, card: &mut Card) -> KnowledgeResult<()> {
     if !matches!(card.state, CardState::Running) {
         return Err(illegal_transition(card, "done"));
     }
+    let work_id = bound_work_id(card)?;
     if card.tags.iter().any(|tag| tag == REVIEW_REQUIRED_TAG) {
-        card.state = CardState::Blocked {
-            reason_kind: BlockKind::ReviewRequired,
-        };
+        jobs.block(&work_id, BlockKind::ReviewRequired)?;
     } else {
-        card.state = CardState::Done;
+        jobs.complete(&work_id)?;
     }
-    Ok(())
+    refresh(jobs, card)
 }
 
-/// `Running -> Blocked { reason_kind }` (§6.3 block), for every non-review
-/// block reason (`Dependency`, `NeedsInput`, `Capability`, `Transient`). A
-/// review-required block is produced only by [`complete`], never by this
-/// function, so callers cannot bypass the §6.4 completion gate by blocking
-/// with `ReviewRequired` directly... except that nothing here stops a caller
-/// from passing `BlockKind::ReviewRequired` explicitly; callers that need the
-/// review gate must go through [`complete`] instead.
+/// `Running -> Blocked { reason_kind }` (§6.3 block).
+///
+/// Callers that need the review gate must go through [`complete`]; nothing
+/// here stops an explicit `BlockKind::ReviewRequired`.
 ///
 /// # Errors
-/// [`KnowledgeError::IllegalTransition`] unless `card.state == Running`.
-pub fn block(card: &mut Card, reason_kind: BlockKind) -> KnowledgeResult<()> {
+/// [`KnowledgeError::IllegalTransition`] unless `card.state == Running`;
+/// Fehler aus [`JobTransitions::block`].
+pub fn block(
+    jobs: &dyn JobTransitions,
+    card: &mut Card,
+    reason_kind: BlockKind,
+) -> KnowledgeResult<()> {
     if !matches!(card.state, CardState::Running) {
         return Err(illegal_transition(card, "blocked"));
     }
-    card.state = CardState::Blocked { reason_kind };
-    Ok(())
+    jobs.block(&bound_work_id(card)?, reason_kind)?;
+    refresh(jobs, card)
 }
 
 /// `Blocked -> Ready` (§6.3 unblock).
 ///
 /// # Errors
-/// [`KnowledgeError::IllegalTransition`] unless `card.state` is `Blocked { .. }`.
-pub fn unblock(card: &mut Card) -> KnowledgeResult<()> {
+/// [`KnowledgeError::IllegalTransition`] unless `card.state` is `Blocked { .. }`;
+/// Fehler aus [`JobTransitions::unblock`].
+pub fn unblock(jobs: &dyn JobTransitions, card: &mut Card) -> KnowledgeResult<()> {
     if !matches!(card.state, CardState::Blocked { .. }) {
         return Err(illegal_transition(card, "ready"));
     }
-    card.state = CardState::Ready;
-    Ok(())
+    jobs.unblock(&bound_work_id(card)?)?;
+    refresh(jobs, card)
 }
 
 /// `Running -> Ready` on reclaim (§6.3, "dead/timeout ... [retry-counted]").
 ///
-/// Clears `work_id`/`assignee` (the previous holder is gone) and increments
-/// `card.retry_count`.
-///
 /// # Returns
-/// The card's new `retry_count`.
+/// The card's new `retry_count` (= the job's `attempts` per the ledger).
 ///
 /// # Errors
-/// [`KnowledgeError::IllegalTransition`] unless `card.state == Running`.
-pub fn reclaim(card: &mut Card) -> KnowledgeResult<u32> {
+/// [`KnowledgeError::IllegalTransition`] unless `card.state == Running`;
+/// Fehler aus [`JobTransitions::reclaim`].
+pub fn reclaim(jobs: &dyn JobTransitions, card: &mut Card) -> KnowledgeResult<u32> {
     if !matches!(card.state, CardState::Running) {
         return Err(illegal_transition(card, "ready (reclaim)"));
     }
-    card.state = CardState::Ready;
-    card.work_id = None;
-    card.assignee = None;
-    card.retry_count = card.retry_count.saturating_add(1);
+    jobs.reclaim(&bound_work_id(card)?)?;
+    refresh(jobs, card)?;
     Ok(card.retry_count)
 }
 
@@ -276,19 +336,22 @@ pub fn reclaim(card: &mut Card) -> KnowledgeResult<u32> {
 /// child-card invariant.
 ///
 /// # Description
-/// `unresolved_children` is the number of this card's children (cards whose
-/// `parents` include `card.id`) that are not themselves `Done`/`Archived` —
-/// the caller computes this (typically via
-/// [`crate::kanban::board::list_cards`] plus [`Card::is_terminal`]), since
-/// this module never loads other cards itself.
+/// Ein blockierter Job wird im Ledger beendet ([`JobTransitions::cancel`]),
+/// ein abgeschlossener bleibt, wie er ist. Die Karte bekommt das Tag
+/// [`ARCHIVED_TAG`]; der Aufrufer muss `card.record()` danach speichern.
 ///
 /// # Errors
-/// - [`KnowledgeError::IllegalTransition`] unless `card.state` is
-///   `Done` or `Blocked { .. }`.
+/// - [`KnowledgeError::IllegalTransition`] unless `card.state` is `Done` or
+///   `Blocked { .. }`.
 /// - [`KnowledgeError::ArchiveBlockedByChildren`] if `unresolved_children > 0`.
-pub fn archive(card: &mut Card, unresolved_children: usize) -> KnowledgeResult<()> {
-    let from_a_terminal_state = matches!(card.state, CardState::Done | CardState::Blocked { .. });
-    if !from_a_terminal_state {
+/// - Fehler aus [`JobTransitions::cancel`].
+pub fn archive(
+    jobs: &dyn JobTransitions,
+    card: &mut Card,
+    unresolved_children: usize,
+) -> KnowledgeResult<()> {
+    let blocked = matches!(card.state, CardState::Blocked { .. });
+    if !(blocked || matches!(card.state, CardState::Done)) {
         return Err(illegal_transition(card, "archived"));
     }
     if unresolved_children > 0 {
@@ -297,133 +360,261 @@ pub fn archive(card: &mut Card, unresolved_children: usize) -> KnowledgeResult<(
             blocking_children: unresolved_children,
         });
     }
-    card.state = CardState::Archived;
+    if blocked {
+        jobs.cancel(&bound_work_id(card)?)?;
+    }
+    let mut record = card.record();
+    if !record.is_archived() {
+        record.tags.push(ARCHIVED_TAG.to_owned());
+    }
+    *card = record.view_with(jobs)?;
     Ok(())
+}
+
+// --- Referenz-Ledger ----------------------------------------------------------
+
+/// Prozesslokales Referenz-Ledger für [`JobTransitions`].
+///
+/// # Beschreibung
+/// Hält je `WorkId` einen [`JobSnapshot`] hinter einem Mutex und erzwingt
+/// dieselben Zustandsregeln wie `harw_job_runtime::Job` (`mark_ready` nur aus
+/// `Pending|Ready`, `claim` nur aus `Ready`, …). Nicht durabel und ohne
+/// Lease-Ablauf/Budget — gedacht für Tests und als Vorlage für den Adapter
+/// über `harw-job-runtime`, nicht als Governance-Ledger.
+#[derive(Debug, Default)]
+pub struct InMemoryJobTransitions {
+    jobs: Mutex<HashMap<WorkId, JobSnapshot>>,
+}
+
+impl InMemoryJobTransitions {
+    /// Ein leeres Ledger.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Setzt (oder ersetzt) den Snapshot eines Jobs direkt.
+    pub fn insert(&self, work_id: WorkId, snapshot: JobSnapshot) {
+        self.jobs
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .insert(work_id, snapshot);
+    }
+
+    /// Führt `change` atomar auf dem Snapshot von `work_id` aus.
+    fn update(
+        &self,
+        work_id: &WorkId,
+        change: impl FnOnce(&mut JobSnapshot) -> KnowledgeResult<()>,
+    ) -> KnowledgeResult<()> {
+        let mut jobs = self.jobs.lock().unwrap_or_else(PoisonError::into_inner);
+        let snapshot = jobs
+            .get_mut(work_id)
+            .ok_or_else(|| KnowledgeError::ArtifactNotFound(format!("job {work_id}")))?;
+        change(snapshot)
+    }
+}
+
+/// Fehler für einen Übergang aus einem unpassenden Job-Zustand.
+fn invalid_state(work_id: &WorkId, expected: JobState, actual: JobState) -> KnowledgeError {
+    KnowledgeError::Job(JobRuntimeError::InvalidState {
+        work_id: work_id.clone(),
+        expected,
+        actual,
+    })
+}
+
+impl JobTransitions for InMemoryJobTransitions {
+    fn snapshot(&self, work_id: &WorkId) -> KnowledgeResult<Option<JobSnapshot>> {
+        Ok(self
+            .jobs
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .get(work_id)
+            .cloned())
+    }
+
+    fn create(&self, _card: &CardRecord) -> KnowledgeResult<WorkId> {
+        let work_id = WorkId::new();
+        self.insert(work_id.clone(), JobSnapshot::new(JobState::Pending));
+        Ok(work_id)
+    }
+
+    fn mark_ready(&self, work_id: &WorkId) -> KnowledgeResult<()> {
+        self.update(work_id, |job| {
+            if !matches!(job.state, JobState::Pending | JobState::Ready) {
+                return Err(invalid_state(work_id, JobState::Pending, job.state));
+            }
+            job.state = JobState::Ready;
+            Ok(())
+        })
+    }
+
+    fn claim(&self, work_id: &WorkId, holder: &AgentId) -> KnowledgeResult<()> {
+        self.update(work_id, |job| {
+            if job.state != JobState::Ready {
+                return Err(invalid_state(work_id, JobState::Ready, job.state));
+            }
+            job.state = JobState::Running;
+            job.holder = Some(holder.clone());
+            Ok(())
+        })
+    }
+
+    fn complete(&self, work_id: &WorkId) -> KnowledgeResult<()> {
+        self.update(work_id, |job| {
+            if job.state != JobState::Running {
+                return Err(invalid_state(work_id, JobState::Running, job.state));
+            }
+            job.state = JobState::Completed;
+            job.holder = None;
+            Ok(())
+        })
+    }
+
+    fn block(&self, work_id: &WorkId, reason: BlockKind) -> KnowledgeResult<()> {
+        self.update(work_id, |job| {
+            if job.state != JobState::Running {
+                return Err(invalid_state(work_id, JobState::Running, job.state));
+            }
+            job.state = JobState::Blocked;
+            job.holder = None;
+            job.block_reason = Some(reason);
+            Ok(())
+        })
+    }
+
+    fn unblock(&self, work_id: &WorkId) -> KnowledgeResult<()> {
+        self.update(work_id, |job| {
+            if !matches!(job.state, JobState::Blocked | JobState::Failed) {
+                return Err(invalid_state(work_id, JobState::Blocked, job.state));
+            }
+            job.state = JobState::Ready;
+            job.block_reason = None;
+            Ok(())
+        })
+    }
+
+    fn reclaim(&self, work_id: &WorkId) -> KnowledgeResult<()> {
+        self.update(work_id, |job| {
+            if job.state != JobState::Running {
+                return Err(invalid_state(work_id, JobState::Running, job.state));
+            }
+            job.state = JobState::Ready;
+            job.holder = None;
+            job.attempts = job.attempts.saturating_add(1);
+            Ok(())
+        })
+    }
+
+    fn cancel(&self, work_id: &WorkId) -> KnowledgeResult<()> {
+        self.update(work_id, |job| {
+            if job.state == JobState::Completed {
+                return Err(invalid_state(work_id, JobState::Running, job.state));
+            }
+            job.state = JobState::Cancelled;
+            job.holder = None;
+            Ok(())
+        })
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    // `CardId`/`LaneId` sind nur in Tests nötig (`card()`-Fixture unten); die
-    // acht öffentlichen Übergänge dieses Moduls adressieren Karten
-    // ausschließlich über `&mut Card` (siehe Moduldoc), deshalb kein
-    // Top-Level-Import.
     use crate::kanban::board::{CardId, LaneId};
     use crate::test_support::{TestError, TestResult};
     use crate::visibility::VisibilityScope;
 
-    fn card(state: CardState) -> Card {
-        Card {
+    fn record() -> CardRecord {
+        CardRecord {
             id: CardId::new("card-1"),
             lane_id: LaneId::new("lane-1"),
             title: "test".to_owned(),
             body: String::new(),
             work_id: None,
-            state,
             parents: Vec::new(),
-            assignee: None,
             tags: Vec::new(),
             visibility: VisibilityScope::SelfOnly,
-            retry_count: 0,
         }
     }
 
-    #[test]
-    fn test_triage_to_todo_succeeds_from_triage() -> TestResult {
-        let mut c = card(CardState::Triage);
-        triage_to_todo(&mut c).map_err(crate::test_support::ctx("triage -> todo succeeds"))?;
-        assert_eq!(c.state, CardState::Todo);
-        Ok(())
+    /// Eine Karte, deren Job im Ledger im Zustand `state` steht.
+    fn card_in(jobs: &InMemoryJobTransitions, state: JobState) -> TestResult<Card> {
+        let work_id = WorkId::new();
+        jobs.insert(work_id.clone(), JobSnapshot::new(state));
+        let mut stored = record();
+        stored.work_id = Some(work_id);
+        Ok(stored.view_with(jobs)?)
+    }
+
+    fn holder() -> AgentId {
+        AgentId::new("worker-1")
     }
 
     #[test]
-    fn test_triage_to_todo_rejects_non_triage_source() -> TestResult {
-        let mut c = card(CardState::Done);
-        let Err(error) = triage_to_todo(&mut c) else {
-            return Err(TestError::Unexpected(
-                "done -> todo must be illegal".to_owned(),
-            ));
-        };
-        assert!(matches!(error, KnowledgeError::IllegalTransition { .. }));
+    fn test_triage_to_todo_creates_a_pending_job() -> TestResult {
+        let jobs = InMemoryJobTransitions::new();
+        let mut card = record().view(None)?;
+        assert_eq!(card.state, CardState::Triage);
+        triage_to_todo(&jobs, &mut card)?;
+        assert_eq!(card.state, CardState::Todo);
+        let work_id = card.work_id.clone().ok_or(TestError::Missing("work_id"))?;
         assert_eq!(
-            c.state,
-            CardState::Done,
-            "a rejected transition must not mutate the card"
+            jobs.snapshot(&work_id)?.map(|job| job.state),
+            Some(JobState::Pending)
         );
         Ok(())
     }
 
     #[test]
-    fn test_todo_to_ready_succeeds_when_all_parents_done() -> TestResult {
-        let mut c = card(CardState::Todo);
-        todo_to_ready(&mut c, &[CardState::Done, CardState::Done])
-            .map_err(crate::test_support::ctx("all parents done"))?;
-        assert_eq!(c.state, CardState::Ready);
+    fn test_triage_to_todo_rejects_non_triage_source() -> TestResult {
+        let jobs = InMemoryJobTransitions::new();
+        let mut card = card_in(&jobs, JobState::Completed)?;
+        let Err(error) = triage_to_todo(&jobs, &mut card) else {
+            return Err(TestError::Unexpected(
+                "done -> todo must be illegal".to_owned(),
+            ));
+        };
+        assert!(matches!(error, KnowledgeError::IllegalTransition { .. }));
+        assert_eq!(card.state, CardState::Done);
         Ok(())
     }
 
     #[test]
-    fn test_todo_to_ready_succeeds_with_no_parents() -> TestResult {
-        let mut c = card(CardState::Todo);
-        todo_to_ready(&mut c, &[]).map_err(crate::test_support::ctx(
-            "no parents trivially satisfies the gate",
-        ))?;
-        assert_eq!(c.state, CardState::Ready);
-        Ok(())
-    }
-
-    #[test]
-    fn test_todo_to_ready_rejects_when_a_parent_is_not_done() -> TestResult {
-        let mut c = card(CardState::Todo);
-        let Err(error) = todo_to_ready(&mut c, &[CardState::Done, CardState::Running]) else {
+    fn test_todo_to_ready_respects_the_parent_gate() -> TestResult {
+        let jobs = InMemoryJobTransitions::new();
+        let mut card = card_in(&jobs, JobState::Pending)?;
+        let Err(error) = todo_to_ready(&jobs, &mut card, &[CardState::Done, CardState::Running])
+        else {
             return Err(TestError::Unexpected(
                 "an unfinished parent must block readiness".to_owned(),
             ));
         };
         assert!(matches!(error, KnowledgeError::IllegalTransition { .. }));
-        assert_eq!(c.state, CardState::Todo);
+        assert_eq!(card.state, CardState::Todo);
+
+        todo_to_ready(&jobs, &mut card, &[CardState::Done])?;
+        assert_eq!(card.state, CardState::Ready);
         Ok(())
     }
 
     #[test]
-    fn test_todo_to_ready_rejects_non_todo_source() -> TestResult {
-        let mut c = card(CardState::Triage);
-        let Err(error) = todo_to_ready(&mut c, &[]) else {
-            return Err(TestError::Unexpected(
-                "triage -> ready must be illegal".to_owned(),
-            ));
-        };
-        assert!(matches!(error, KnowledgeError::IllegalTransition { .. }));
+    fn test_claim_low_risk_needs_no_approval_and_records_the_holder() -> TestResult {
+        let jobs = InMemoryJobTransitions::new();
+        let mut card = card_in(&jobs, JobState::Ready)?;
+        claim(&jobs, &mut card, &holder(), RiskLevel::Low, None)?;
+        assert_eq!(card.state, CardState::Running);
+        assert_eq!(card.assignee, Some(holder()));
         Ok(())
     }
 
     #[test]
-    fn test_claim_succeeds_without_approval_when_risk_is_low() -> TestResult {
-        let mut c = card(CardState::Ready);
-        claim(
-            &mut c,
-            WorkId::from_str("work-1"),
-            AgentId::new("worker-1"),
-            RiskLevel::Low,
-            None,
-        )
-        .map_err(crate::test_support::ctx("low-risk claim needs no approval"))?;
-        assert_eq!(c.state, CardState::Running);
-        assert_eq!(c.work_id, Some(WorkId::from_str("work-1")));
-        assert_eq!(c.assignee, Some(AgentId::new("worker-1")));
-        Ok(())
-    }
-
-    #[test]
-    fn test_claim_on_high_risk_lane_without_approval_is_refused() -> TestResult {
-        let mut c = card(CardState::Ready);
-        let Err(error) = claim(
-            &mut c,
-            WorkId::from_str("work-1"),
-            AgentId::new("worker-1"),
-            RiskLevel::High,
-            None,
-        ) else {
+    fn test_claim_on_high_risk_lane_without_approval_is_refused_and_ledger_untouched() -> TestResult
+    {
+        let jobs = InMemoryJobTransitions::new();
+        let mut card = card_in(&jobs, JobState::Ready)?;
+        let Err(error) = claim(&jobs, &mut card, &holder(), RiskLevel::High, None) else {
             return Err(TestError::Unexpected(
                 "high-risk claim without approval must be refused".to_owned(),
             ));
@@ -432,126 +623,89 @@ mod tests {
             error,
             KnowledgeError::ClaimRequiresApproval { .. }
         ));
+        let work_id = card.work_id.clone().ok_or(TestError::Missing("work_id"))?;
         assert_eq!(
-            c.state,
-            CardState::Ready,
-            "a refused claim must not mutate the card"
+            jobs.snapshot(&work_id)?.map(|job| job.state),
+            Some(JobState::Ready)
         );
-        assert!(c.work_id.is_none());
         Ok(())
     }
 
     #[test]
-    fn test_claim_on_high_risk_lane_with_rejected_proof_is_refused() -> TestResult {
-        let mut c = card(CardState::Ready);
-        let proof = ApprovalProof::new(ReviewDecision::Rejected, AgentId::new("operator-1"));
-        let Err(error) = claim(
-            &mut c,
-            WorkId::from_str("work-1"),
-            AgentId::new("worker-1"),
-            RiskLevel::Critical,
-            Some(&proof),
-        ) else {
-            return Err(TestError::Unexpected(
-                "a rejected decision must not satisfy the gate".to_owned(),
-            ));
-        };
-        assert!(matches!(
-            error,
-            KnowledgeError::ClaimRequiresApproval { .. }
-        ));
-        Ok(())
-    }
-
-    #[test]
-    fn test_claim_on_high_risk_lane_with_approved_proof_succeeds() -> TestResult {
-        let mut c = card(CardState::Ready);
-        let proof = ApprovalProof::new(ReviewDecision::Approved, AgentId::new("operator-1"));
+    fn test_claim_with_rejected_proof_is_refused_and_approved_proof_passes() -> TestResult {
+        let jobs = InMemoryJobTransitions::new();
+        let mut card = card_in(&jobs, JobState::Ready)?;
+        let rejected = ApprovalProof::new(ReviewDecision::Rejected, AgentId::new("op"));
+        assert!(
+            claim(
+                &jobs,
+                &mut card,
+                &holder(),
+                RiskLevel::Critical,
+                Some(&rejected)
+            )
+            .is_err()
+        );
+        let approved = ApprovalProof::new(ReviewDecision::Approved, AgentId::new("op"));
         claim(
-            &mut c,
-            WorkId::from_str("work-1"),
-            AgentId::new("worker-1"),
+            &jobs,
+            &mut card,
+            &holder(),
             RiskLevel::High,
-            Some(&proof),
-        )
-        .map_err(crate::test_support::ctx(
-            "approved proof satisfies the gate",
-        ))?;
-        assert_eq!(c.state, CardState::Running);
-        Ok(())
-    }
-
-    #[test]
-    fn test_claim_rejects_non_ready_source() -> TestResult {
-        let mut c = card(CardState::Triage);
-        let Err(error) = claim(
-            &mut c,
-            WorkId::from_str("work-1"),
-            AgentId::new("worker-1"),
-            RiskLevel::Low,
-            None,
-        ) else {
-            return Err(TestError::Unexpected(
-                "triage -> running must be illegal".to_owned(),
-            ));
-        };
-        assert!(matches!(error, KnowledgeError::IllegalTransition { .. }));
+            Some(&approved),
+        )?;
+        assert_eq!(card.state, CardState::Running);
         Ok(())
     }
 
     #[test]
     fn test_complete_moves_a_plain_card_to_done() -> TestResult {
-        let mut c = card(CardState::Running);
-        complete(&mut c).map_err(crate::test_support::ctx("complete succeeds"))?;
-        assert_eq!(c.state, CardState::Done);
+        let jobs = InMemoryJobTransitions::new();
+        let mut card = card_in(&jobs, JobState::Running)?;
+        complete(&jobs, &mut card)?;
+        assert_eq!(card.state, CardState::Done);
         Ok(())
     }
 
     #[test]
-    fn test_complete_moves_a_review_required_card_to_blocked_instead_of_done() -> TestResult {
-        let mut c = card(CardState::Running);
-        c.tags.push(REVIEW_REQUIRED_TAG.to_owned());
-        complete(&mut c).map_err(crate::test_support::ctx("complete succeeds"))?;
+    fn test_complete_blocks_a_review_required_card_in_the_ledger() -> TestResult {
+        let jobs = InMemoryJobTransitions::new();
+        let work_id = WorkId::new();
+        jobs.insert(work_id.clone(), JobSnapshot::new(JobState::Running));
+        let mut stored = record();
+        stored.work_id = Some(work_id.clone());
+        stored.tags.push(REVIEW_REQUIRED_TAG.to_owned());
+        let mut card = stored.view_with(&jobs)?;
+
+        complete(&jobs, &mut card)?;
+
+        let expected = CardState::Blocked {
+            reason_kind: BlockKind::ReviewRequired,
+        };
+        assert_eq!(card.state, expected);
         assert_eq!(
-            c.state,
-            CardState::Blocked {
-                reason_kind: BlockKind::ReviewRequired
-            }
+            jobs.snapshot(&work_id)?.map(|job| job.state),
+            Some(JobState::Blocked)
         );
         Ok(())
     }
 
     #[test]
-    fn test_complete_rejects_non_running_source() -> TestResult {
-        let mut c = card(CardState::Ready);
-        let Err(error) = complete(&mut c) else {
-            return Err(TestError::Unexpected(
-                "ready -> done must be illegal".to_owned(),
-            ));
-        };
-        assert!(matches!(error, KnowledgeError::IllegalTransition { .. }));
-        Ok(())
-    }
-
-    #[test]
-    fn test_block_moves_running_to_blocked_with_given_reason() -> TestResult {
-        let mut c = card(CardState::Running);
-        block(&mut c, BlockKind::Dependency).map_err(crate::test_support::ctx("block succeeds"))?;
+    fn test_block_and_unblock_round_trip() -> TestResult {
+        let jobs = InMemoryJobTransitions::new();
+        let mut card = card_in(&jobs, JobState::Running)?;
+        block(&jobs, &mut card, BlockKind::NeedsInput)?;
         assert_eq!(
-            c.state,
+            card.state,
             CardState::Blocked {
-                reason_kind: BlockKind::Dependency
+                reason_kind: BlockKind::NeedsInput
             }
         );
-        Ok(())
-    }
-
-    #[test]
-    fn test_block_rejects_non_running_source() -> TestResult {
-        let mut c = card(CardState::Todo);
-        let Err(error) = block(&mut c, BlockKind::Transient) else {
+        unblock(&jobs, &mut card)?;
+        assert_eq!(card.state, CardState::Ready);
+        let Err(error) = unblock(&jobs, &mut card) else {
             return Err(TestError::Unexpected(
-                "todo -> blocked must be illegal".to_owned(),
+                "ready -> ready must be illegal".to_owned(),
             ));
         };
         assert!(matches!(error, KnowledgeError::IllegalTransition { .. }));
@@ -559,121 +713,93 @@ mod tests {
     }
 
     #[test]
-    fn test_unblock_moves_blocked_to_ready() -> TestResult {
-        let mut c = card(CardState::Blocked {
-            reason_kind: BlockKind::NeedsInput,
-        });
-        unblock(&mut c).map_err(crate::test_support::ctx("unblock succeeds"))?;
-        assert_eq!(c.state, CardState::Ready);
+    fn test_reclaim_counts_attempts_from_the_ledger() -> TestResult {
+        let jobs = InMemoryJobTransitions::new();
+        let mut card = card_in(&jobs, JobState::Running)?;
+        assert_eq!(reclaim(&jobs, &mut card)?, 1);
+        assert_eq!(card.state, CardState::Ready);
+        assert!(card.assignee.is_none());
+        claim(&jobs, &mut card, &holder(), RiskLevel::Low, None)?;
+        assert_eq!(reclaim(&jobs, &mut card)?, 2);
         Ok(())
     }
 
     #[test]
-    fn test_unblock_rejects_non_blocked_source() -> TestResult {
-        let mut c = card(CardState::Done);
-        let Err(error) = unblock(&mut c) else {
-            return Err(TestError::Unexpected(
-                "done -> ready must be illegal".to_owned(),
-            ));
-        };
-        assert!(matches!(error, KnowledgeError::IllegalTransition { .. }));
-        Ok(())
-    }
-
-    #[test]
-    fn test_reclaim_moves_running_to_ready_and_increments_retry_count() -> TestResult {
-        let mut c = card(CardState::Running);
-        c.work_id = Some(WorkId::from_str("work-1"));
-        c.assignee = Some(AgentId::new("worker-1"));
-
-        let first = reclaim(&mut c).map_err(crate::test_support::ctx("first reclaim succeeds"))?;
-        assert_eq!(first, 1);
-        assert_eq!(c.state, CardState::Ready);
-        assert!(c.work_id.is_none());
-        assert!(c.assignee.is_none());
-
-        // A second claim-then-reclaim cycle keeps counting.
-        claim(
-            &mut c,
-            WorkId::from_str("work-2"),
-            AgentId::new("worker-2"),
-            RiskLevel::Low,
-            None,
-        )
-        .map_err(crate::test_support::ctx("re-claim after reclaim"))?;
-        let second =
-            reclaim(&mut c).map_err(crate::test_support::ctx("second reclaim succeeds"))?;
-        assert_eq!(second, 2);
-        Ok(())
-    }
-
-    #[test]
-    fn test_reclaim_rejects_non_running_source() -> TestResult {
-        let mut c = card(CardState::Ready);
-        let Err(error) = reclaim(&mut c) else {
-            return Err(TestError::Unexpected(
-                "ready -> ready (reclaim) must be illegal".to_owned(),
-            ));
-        };
-        assert!(matches!(error, KnowledgeError::IllegalTransition { .. }));
-        Ok(())
-    }
-
-    #[test]
-    fn test_archive_succeeds_from_done_with_no_unresolved_children() -> TestResult {
-        let mut c = card(CardState::Done);
-        archive(&mut c, 0).map_err(crate::test_support::ctx("archive succeeds"))?;
-        assert_eq!(c.state, CardState::Archived);
-        Ok(())
-    }
-
-    #[test]
-    fn test_archive_succeeds_from_blocked_with_no_unresolved_children() -> TestResult {
-        let mut c = card(CardState::Blocked {
-            reason_kind: BlockKind::Dependency,
-        });
-        archive(&mut c, 0).map_err(crate::test_support::ctx("archive succeeds"))?;
-        assert_eq!(c.state, CardState::Archived);
-        Ok(())
-    }
-
-    #[test]
-    fn test_archive_rejects_unresolved_children() -> TestResult {
-        let mut c = card(CardState::Done);
-        let Err(error) = archive(&mut c, 2) else {
+    fn test_archive_gate_and_blocked_jobs_are_cancelled() -> TestResult {
+        let jobs = InMemoryJobTransitions::new();
+        let mut done = card_in(&jobs, JobState::Completed)?;
+        let Err(error) = archive(&jobs, &mut done, 2) else {
             return Err(TestError::Unexpected(
                 "unresolved children must block archival".to_owned(),
             ));
         };
-        match error {
+        assert!(matches!(
+            error,
             KnowledgeError::ArchiveBlockedByChildren {
-                blocking_children, ..
-            } => {
-                assert_eq!(blocking_children, 2);
+                blocking_children: 2,
+                ..
             }
-            other => {
-                return Err(TestError::Unexpected(format!(
-                    "expected ArchiveBlockedByChildren, got {other:?}"
-                )));
-            }
-        }
+        ));
+        archive(&jobs, &mut done, 0)?;
+        assert_eq!(done.state, CardState::Archived);
+        assert!(done.record().is_archived());
+
+        let mut blocked = card_in(&jobs, JobState::Blocked)?;
+        archive(&jobs, &mut blocked, 0)?;
+        let work_id = blocked
+            .work_id
+            .clone()
+            .ok_or(TestError::Missing("work_id"))?;
         assert_eq!(
-            c.state,
-            CardState::Done,
-            "a rejected archive must not mutate the card"
+            jobs.snapshot(&work_id)?.map(|job| job.state),
+            Some(JobState::Cancelled)
         );
+
+        let mut running = card_in(&jobs, JobState::Running)?;
+        assert!(matches!(
+            archive(&jobs, &mut running, 0),
+            Err(KnowledgeError::IllegalTransition { .. })
+        ));
+        Ok(())
+    }
+
+    /// §6.3: die Karte zeigt nie einen Zustand, dem das Ledger widerspricht —
+    /// ändert sich der Job außerhalb der Karte, folgt die nächste Sicht.
+    #[test]
+    fn test_the_card_follows_the_ledger_not_its_own_memory() -> TestResult {
+        let jobs = InMemoryJobTransitions::new();
+        let card = card_in(&jobs, JobState::Running)?;
+        let work_id = card.work_id.clone().ok_or(TestError::Missing("work_id"))?;
+        let mut failed = JobSnapshot::new(JobState::Failed);
+        failed.attempts = 3;
+        jobs.insert(work_id, failed);
+
+        let fresh = card.record().view_with(&jobs)?;
+        assert_eq!(
+            fresh.state,
+            CardState::Blocked {
+                reason_kind: BlockKind::Transient
+            }
+        );
+        assert_eq!(fresh.retry_count, 3);
         Ok(())
     }
 
     #[test]
-    fn test_archive_rejects_non_terminal_source() -> TestResult {
-        let mut c = card(CardState::Running);
-        let Err(error) = archive(&mut c, 0) else {
+    fn test_a_ledger_refusal_leaves_the_card_unchanged() -> TestResult {
+        let jobs = InMemoryJobTransitions::new();
+        let mut card = card_in(&jobs, JobState::Ready)?;
+        let work_id = card.work_id.clone().ok_or(TestError::Missing("work_id"))?;
+        // Das Ledger ist inzwischen weiter als die (veraltete) Sicht.
+        jobs.insert(work_id, JobSnapshot::new(JobState::Completed));
+        let before = card.clone();
+        let Err(error) = claim(&jobs, &mut card, &holder(), RiskLevel::Low, None) else {
             return Err(TestError::Unexpected(
-                "running -> archived must be illegal".to_owned(),
+                "the ledger must refuse a stale claim".to_owned(),
             ));
         };
-        assert!(matches!(error, KnowledgeError::IllegalTransition { .. }));
+        assert!(matches!(error, KnowledgeError::Job(_)));
+        assert_eq!(card, before);
         Ok(())
     }
 }

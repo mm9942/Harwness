@@ -313,9 +313,9 @@ checksum = "f2032f911046de80f0a198e0901378627c33f59ea0ac00e363d481118bd70a53"
 
 [[package]]
 name = "aws-lc-rs"
-version = "1.17.1"
+version = "1.18.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4342d8937fc7e5dd9b1c60292261c0670c882a2cd1719cfc11b1af41731e32ad"
+checksum = "b281d307588d634de920874890732659e2e7672f72b5e10e81badc1a8a83621e"
 dependencies = [
  "aws-lc-sys",
  "zeroize",
@@ -323,9 +323,9 @@ dependencies = [
 
 [[package]]
 name = "aws-lc-sys"
-version = "0.42.0"
+version = "0.45.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6d9ceb1da931507a12f4fccea479dccd00da1943e1b4ae72d8e502d707361444"
+checksum = "9bff6c3b54fad79a2e60b8102caf565819711497c1f5f092f49508e2f5c31b27"
 dependencies = [
  "cc",
  "cmake",
@@ -587,9 +587,9 @@ dependencies = [
 
 [[package]]
 name = "chacha20"
-version = "0.10.1"
+version = "0.10.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d524456ba66e72eb8b115ff89e01e497f8e6d11d78b70b1aa13c0fbd97540a81"
+checksum = "65c35e4b699c7e15ccbe7ee35c005e4fc0a278d22238a2857e6ce2dadeda1b06"
 dependencies = [
  "cfg-if",
  "cpufeatures 0.3.0",
@@ -1907,6 +1907,7 @@ dependencies = [
  "harw-home",
  "harw-install",
  "harw-job-runtime",
+ "harw-killer",
  "harw-knowledge",
  "harw-lens",
  "harw-lens-types",
@@ -2226,6 +2227,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "harw-killer"
+version = "0.3.0"
+dependencies = [
+ "clap",
+ "rustix 1.1.4",
+ "serde",
+ "serde_json",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
 name = "harw-knowledge"
 version = "0.3.0"
 dependencies = [
@@ -2410,6 +2423,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "harw-matrix-game"
+version = "0.3.0"
+dependencies = [
+ "jiff",
+ "rand_chacha 0.10.0",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "toml 1.1.3+spec-1.1.0",
+]
+
+[[package]]
 name = "harw-mcp-client"
 version = "0.3.0"
 dependencies = [
@@ -2564,6 +2589,7 @@ dependencies = [
  "harw-config",
  "harw-core",
  "harw-core-bridge",
+ "harw-explorer",
  "harw-extension-api",
  "harw-home",
  "harw-job-runtime",
@@ -2711,24 +2737,29 @@ dependencies = [
  "harw-egress",
  "harw-extension-api",
  "harw-instructions",
+ "harw-knowledge",
  "harw-project-discovery",
  "harw-sandbox",
  "harw-tool-browser",
  "harw-tool-deps",
  "harw-tool-doc",
+ "harw-tool-explorer",
  "harw-tool-fs",
  "harw-tool-lens",
+ "harw-tool-process",
  "harw-tool-shell",
  "harw-tool-web",
  "harw-tools",
  "harw-types",
  "include_dir",
+ "jiff",
  "serde",
  "serde_json",
  "tempfile",
  "time",
  "tokio",
  "toml 1.1.3+spec-1.1.0",
+ "tracing",
 ]
 
 [[package]]
@@ -2752,12 +2783,16 @@ dependencies = [
  "harw-config",
  "harw-context",
  "harw-core",
+ "harw-core-bridge",
+ "harw-explorer",
  "harw-extension-api",
  "harw-fsutil",
  "harw-home",
  "harw-job-runtime",
+ "harw-knowledge",
  "harw-lens-types",
  "harw-macros",
+ "harw-mcp-client",
  "harw-memory",
  "harw-model-catalog",
  "harw-observe",
@@ -2948,6 +2983,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "harw-tool-process"
+version = "0.3.0"
+dependencies = [
+ "harw-authority",
+ "harw-extension-api",
+ "harw-killer",
+ "harw-macros",
+ "harw-tools",
+ "harw-types",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "harw-tool-shell"
 version = "0.3.0"
 dependencies = [
@@ -3040,6 +3092,7 @@ dependencies = [
  "tempfile",
  "time",
  "tokio",
+ "toml 1.1.3+spec-1.1.0",
  "tracing",
  "unicode-segmentation",
  "unicode-width 0.2.0",
@@ -3077,6 +3130,28 @@ dependencies = [
  "serde_json",
  "tempfile",
  "tokio",
+ "tracing",
+]
+
+[[package]]
+name = "harwness-sdk"
+version = "0.3.0"
+dependencies = [
+ "futures-core",
+ "harw-config",
+ "harw-core",
+ "harw-extension-api",
+ "harw-home",
+ "harw-protocol",
+ "harw-provider-http",
+ "harw-runtime",
+ "harw-session-store",
+ "harw-tools",
+ "harw-types",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "tokio-stream",
  "tracing",
 ]
 
@@ -4722,7 +4797,7 @@ version = "0.10.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c7f5fa3a058cd35567ef9bfa5e75732bee0f9e4c55fa90477bef2dfcdbc4be80"
 dependencies = [
- "chacha20 0.10.1",
+ "chacha20 0.10.2",
  "getrandom 0.4.3",
  "rand_core 0.10.1",
 ]
@@ -5006,9 +5081,9 @@ dependencies = [
 
 [[package]]
 name = "rustls"
-version = "0.23.42"
+version = "0.23.45"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3c54fcab019b409d04215d3a17cb438fd7fbf192ee61461f20f4fe18704bc138"
+checksum = "0d41d731c7d2f962d1ccc364cec258de3c0e93b38c2fb3ba97ac74513048d634"
 dependencies = [
  "aws-lc-rs",
  "once_cell",
@@ -5070,9 +5145,9 @@ checksum = "f87165f0995f63a9fbeea62b64d10b4d9d8e78ec6d7d51fb2125fda7bb36788f"
 
 [[package]]
 name = "rustls-webpki"
-version = "0.103.13"
+version = "0.103.15"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "61c429a8649f110dddef65e2a5ad240f747e85f7758a6bccc7e5777bd33f756e"
+checksum = "f3c3cf1d8b1e7d4927e2d154c3fcb02979afb9939629c62cd9048d4f07b60ac2"
 dependencies = [
  "aws-lc-rs",
  "ring",
@@ -5694,7 +5769,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "32497e9a4c7b38532efcdebeef879707aa9f794296a4f0244f6f69e9bc8574bd"
 dependencies = [
  "fastrand",
- "getrandom 0.4.3",
+ "getrandom 0.3.4",
  "once_cell",
  "rustix 1.1.4",
  "windows-sys 0.61.2",
@@ -6185,6 +6260,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "tracing-serde"
+version = "0.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "704b1aeb7be0d0a84fc9828cae51dab5970fee5088f83d1dd7ee6f6246fc6ff1"
+dependencies = [
+ "serde",
+ "tracing-core",
+]
+
+[[package]]
 name = "tracing-subscriber"
 version = "0.3.23"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -6194,6 +6279,8 @@ dependencies = [
  "nu-ansi-term",
  "once_cell",
  "regex-automata",
+ "serde",
+ "serde_json",
  "sharded-slab",
  "smallvec",
  "thread_local",
@@ -6201,6 +6288,7 @@ dependencies = [
  "tracing",
  "tracing-core",
  "tracing-log",
+ "tracing-serde",
 ]
 
 [[package]]

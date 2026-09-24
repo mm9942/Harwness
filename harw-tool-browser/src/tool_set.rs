@@ -28,7 +28,9 @@ use harw_browser::host::BrowserHost;
 use harw_browser::ids::BrowserSessionId;
 use harw_browser::policy::{BrowserLimits, OpenBrowserRequest};
 
-use crate::prepare::{browser_tool_descriptors, prepare_browser_call_with_policy, validate_request};
+use crate::prepare::{
+    browser_tool_descriptors, prepare_browser_call_with_policy, validate_request,
+};
 use crate::types::{
     BrowserOpenPolicy, BrowserToolDescriptor, BrowserToolRequest, PreparedBrowserCall,
     PreparedBrowserRequest,

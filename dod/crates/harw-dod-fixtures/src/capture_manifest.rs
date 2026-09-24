@@ -221,6 +221,127 @@ fn resolve_under_root(root: &Path, raw_path: &str) -> io::Result<PathBuf> {
     Ok(resolved)
 }
 
+/// Maximale Tiefe verketteter Symlinks, denen [`ensure_dir_under_root`]
+/// folgt (entspricht grob `MAXSYMLINKS` des Linux-Kernels).
+const MAX_SYMLINK_DEPTH: usize = 40;
+
+/// Legt `dir` (unter `root`) als Verzeichnis an und folgt dabei bereits
+/// materialisierten Symlinks.
+///
+/// # Description
+/// In echten sysfs-Captures ist z. B. `/sys/class/thermal/thermal_zone0` ein
+/// Symlink auf `../../devices/virtual/thermal/thermal_zone0`, und die
+/// nachfolgenden Einträge (`.../thermal_zone0/type`) liegen *unter* diesem
+/// Symlink. Das Zielverzeichnis steht nicht selbst im Manifest, der Symlink
+/// ist nach dem Anlegen also zunächst hängend. `fs::create_dir_all` scheitert
+/// an einem hängenden Symlink mit `EEXIST` ("File exists"), weil der Pfad
+/// existiert, aber kein Verzeichnis ist. Diese Funktion geht deshalb
+/// komponentenweise von `root` aus vor: ist ein Zwischenpfad ein Symlink,
+/// wird dessen Ziel (relativ zum Elternverzeichnis des Links aufgelöst)
+/// rekursiv angelegt, sodass anschließend Dateien *durch* den Symlink
+/// geschrieben werden können — genau wie auf dem echten Host.
+///
+/// # Arguments
+/// - `root` (`&Path`): das Materialisierungs-Wurzelverzeichnis.
+/// - `dir` (`&Path`): das anzulegende Verzeichnis; muss unter `root` liegen.
+/// - `depth` (`usize`): aktuelle Symlink-Verkettungstiefe (Aufrufer: `0`).
+///
+/// # Returns
+/// `Ok(())`, wenn `dir` danach (ggf. über Symlinks) ein Verzeichnis ist.
+///
+/// # Errors
+/// - [`io::ErrorKind::InvalidInput`], wenn `dir` nicht unter `root` liegt,
+///   ein Symlink-Ziel absolut ist oder `root` lexikalisch verlassen würde,
+///   oder die Symlink-Kette länger als [`MAX_SYMLINK_DEPTH`] ist.
+/// - jeder `io::Error` aus `fs::symlink_metadata`, `fs::read_link` oder
+///   `fs::create_dir`.
+fn ensure_dir_under_root(root: &Path, dir: &Path, depth: usize) -> io::Result<()> {
+    if depth > MAX_SYMLINK_DEPTH {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("too many levels of symlinks below {}", root.display()),
+        ));
+    }
+    let relative = dir.strip_prefix(root).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("{} is not below {}", dir.display(), root.display()),
+        )
+    })?;
+    let mut current = root.to_path_buf();
+    for component in relative.components() {
+        let Component::Normal(part) = component else {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("unexpected path component in {}", dir.display()),
+            ));
+        };
+        let parent = current.clone();
+        current.push(part);
+        match fs::symlink_metadata(&current) {
+            Ok(meta) if meta.file_type().is_symlink() => {
+                let link_target = fs::read_link(&current)?;
+                let resolved = lexically_resolve_under_root(root, &parent, &link_target)?;
+                ensure_dir_under_root(root, &resolved, depth + 1)?;
+            }
+            Ok(meta) if meta.is_dir() => {}
+            Ok(_) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::AlreadyExists,
+                    format!("{} exists and is not a directory", current.display()),
+                ));
+            }
+            Err(err) if err.kind() == io::ErrorKind::NotFound => match fs::create_dir(&current) {
+                Ok(()) => {}
+                Err(err) if err.kind() == io::ErrorKind::AlreadyExists && current.is_dir() => {}
+                Err(err) => return Err(err),
+            },
+            Err(err) => return Err(err),
+        }
+    }
+    Ok(())
+}
+
+/// Löst ein relatives Symlink-Ziel lexikalisch gegen `link_parent` auf und
+/// stellt sicher, dass das Ergebnis unter `root` bleibt.
+///
+/// # Errors
+/// [`io::ErrorKind::InvalidInput`] für absolute Ziele oder Ziele, deren
+/// `..`-Segmente `root` verlassen würden.
+fn lexically_resolve_under_root(
+    root: &Path,
+    link_parent: &Path,
+    link_target: &Path,
+) -> io::Result<PathBuf> {
+    let escape = || {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "symlink target {} escapes materialization root {}",
+                link_target.display(),
+                root.display()
+            ),
+        )
+    };
+    let mut resolved = link_parent.to_path_buf();
+    for component in link_target.components() {
+        match component {
+            Component::Normal(part) => resolved.push(part),
+            Component::CurDir => {}
+            Component::ParentDir => {
+                if resolved == root || !resolved.pop() {
+                    return Err(escape());
+                }
+            }
+            Component::RootDir | Component::Prefix(_) => return Err(escape()),
+        }
+    }
+    if !resolved.starts_with(root) {
+        return Err(escape());
+    }
+    Ok(resolved)
+}
+
 /// Materialisiert eine [`CaptureManifest`] als echten Verzeichnisbaum unter
 /// `root`.
 ///
@@ -228,9 +349,13 @@ fn resolve_under_root(root: &Path, raw_path: &str) -> io::Result<PathBuf> {
 /// Verarbeitet [`CaptureManifest::entries`] in Reihenfolge. Für jeden
 /// Eintrag wird zunächst über [`resolve_under_root`] der Zielpfad bestimmt
 /// (dabei werden `..`-Segmente abgelehnt, siehe dort) und dessen
-/// Elternverzeichnis mit `fs::create_dir_all` angelegt. Danach, je nach
+/// Elternverzeichnis über [`ensure_dir_under_root`] angelegt — dabei wird
+/// bereits materialisierten Symlinks gefolgt und ein (noch hängendes)
+/// relatives Symlink-Ziel unter `root` als Verzeichnis erzeugt, damit
+/// Einträge wie `thermal_zone0/type` *durch* den Symlink
+/// `thermal_zone0 -> ../../devices/...` geschrieben werden können. Danach, je nach
 /// [`CaptureEntryKind`]:
-/// - `Dir`: `fs::create_dir_all` auf dem Zielpfad selbst.
+/// - `Dir`: [`ensure_dir_under_root`] auf dem Zielpfad selbst.
 /// - `File { content }`: `fs::write` des Inhalts (überschreibt eine
 ///   vorhandene Datei an dieser Stelle).
 /// - `Symlink { target }`: ein vorhandener Eintrag an der Zielstelle wird
@@ -249,7 +374,9 @@ fn resolve_under_root(root: &Path, raw_path: &str) -> io::Result<PathBuf> {
 ///
 /// # Errors
 /// [`io::ErrorKind::InvalidInput`] für einen Eintrag mit `..`-Segment
-/// (siehe [`resolve_under_root`]); jeder andere `io::Error`, den
+/// (siehe [`resolve_under_root`]) oder wenn unterhalb eines Symlinks
+/// geschrieben werden soll, dessen Ziel absolut ist bzw. `root` verlassen
+/// würde (siehe [`ensure_dir_under_root`]); jeder andere `io::Error`, den
 /// `fs::create_dir_all`, `fs::write`, `fs::remove_file` oder
 /// `std::os::unix::fs::symlink` liefern (z. B. fehlende Berechtigung).
 ///
@@ -271,11 +398,11 @@ pub fn materialize(manifest: &CaptureManifest, root: &Path) -> io::Result<()> {
     for entry in &manifest.entries {
         let target_path = resolve_under_root(root, &entry.path)?;
         if let Some(parent) = target_path.parent() {
-            fs::create_dir_all(parent)?;
+            ensure_dir_under_root(root, parent, 0)?;
         }
         match &entry.kind {
             CaptureEntryKind::Dir => {
-                fs::create_dir_all(&target_path)?;
+                ensure_dir_under_root(root, &target_path, 0)?;
             }
             CaptureEntryKind::File { content } => {
                 fs::write(&target_path, content)?;
@@ -422,6 +549,38 @@ mod tests {
                 .file_type()
                 .is_symlink()
         );
+        Ok(())
+    }
+
+    #[test]
+    fn test_materialize_rejects_symlink_target_escaping_root() -> TestResult {
+        let dir = tempfile::tempdir().map_err(ctx("tempdir"))?;
+        let manifest = CaptureManifest {
+            kernel: "test".to_owned(),
+            captured_at: "2026-01-01T00:00:00Z".to_owned(),
+            entries: vec![
+                CaptureEntry {
+                    path: "/sys/evil".to_owned(),
+                    kind: CaptureEntryKind::Symlink {
+                        target: "../../../outside".to_owned(),
+                    },
+                },
+                CaptureEntry {
+                    path: "/sys/evil/file".to_owned(),
+                    kind: CaptureEntryKind::File {
+                        content: "escape".to_owned(),
+                    },
+                },
+            ],
+        };
+
+        let result = materialize(&manifest, dir.path());
+        let Err(err) = result else {
+            return Err(TestError::Unexpected(
+                "Schreiben durch einen aus root führenden Symlink muss scheitern".to_owned(),
+            ));
+        };
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
         Ok(())
     }
 

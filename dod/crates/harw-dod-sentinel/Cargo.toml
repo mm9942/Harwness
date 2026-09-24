@@ -1,4 +1,5 @@
 [package]
+publish = false
 name = "harw-dod-sentinel"
 version.workspace = true
 edition.workspace = true
@@ -34,6 +35,11 @@ serde_json = { workspace = true }
 [dev-dependencies]
 harw-sandbox = { path = "../../../harw-sandbox" }
 tempfile = { workspace = true }
+# Nur für `spool.rs`-Tests: `correlate_advisories` ist der einzige öffentliche
+# Weg zu einem `Finding<RuleChecked>` außerhalb von `harw-dod-rules` und nimmt
+# `LockedPackage`s bzw. `semver::VersionReq`-Bereiche entgegen.
+harw-code-graph = { path = "../../../harw-code-graph" }
+semver = { workspace = true }
 # Nur für `error.rs`-Tests: konstruiert einen echten `serde_json::Error`, um
 # den `#[from]`-Pfad von `SentinelError::Evidence` zu prüfen, ohne den
 # (laut `harw_dod_signals::error`-Moduldoku praktisch unerreichbaren)

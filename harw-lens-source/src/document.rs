@@ -11,11 +11,14 @@
 //! ([`crate::KNOWLEDGE_PALACE_INDEX`]), [`collect_diary_documents`]
 //! ([`crate::KNOWLEDGE_DIARY_INDEX`], Knoten AW7-05 — wörtlich
 //! [`collect_palace_documents`] mit vertauschtem `ArtifactKind`-Filter) und
-//! [`collect_rust_sources`] ([`crate::CODE_RUST_INDEX`], Knoten AW7-05 —
-//! wörtlich [`collect_design_docs`] mit vertauschter Dateiendung und
-//! `target/`-Ausschluss). Dieses Modul tut kein Chunking und kein
-//! Einbetten — das übernimmt [`crate::build_index`] mit dem Ergebnis dieses
-//! Moduls als Eingabe.
+//! [`collect_code_sources`] (Quelltext aller gängigen Sprachen, Endungen aus
+//! [`CODE_SOURCE_EXTENSIONS`], Build-/Abhängigkeitsverzeichnisse aus
+//! [`SKIPPED_SOURCE_DIRS`] ausgeschlossen; die Zerlegungsstrategie je Datei
+//! liefert [`chunker_for_path`]). Der veraltete Einstiegspunkt
+//! [`collect_rust_sources`] ([`crate::CODE_RUST_INDEX`], Knoten AW7-05)
+//! ist dieselbe Erfassung, eingeschränkt auf `.rs`. Dieses Modul tut kein
+//! Chunking und kein Einbetten — das übernimmt [`crate::build_index`] mit
+//! dem Ergebnis dieses Moduls als Eingabe.
 //!
 //! # Warum `visibility_of_scope` nur zwei Buckets kennt
 //! [`harw_knowledge::VisibilityScope`] hat vier Varianten
@@ -211,20 +214,113 @@ fn walk_markdown_files(
     Ok(())
 }
 
-/// Erfasst alle Rust-Quelldateien unterhalb von `root` als Quellen für
-/// [`crate::CODE_RUST_INDEX`] (Knoten AW7-05).
+/// Dateiendungen (klein geschrieben, ohne Punkt), die [`collect_code_sources`]
+/// als Quelltext erfasst.
 ///
 /// # Description
-/// Wörtlich [`collect_design_docs`] mit vertauschter Dateiendung und
-/// zusätzlichem Ausschluss von `target/`-Verzeichnissen: dieselbe
-/// symlink-sichere, deterministisch sortierte Erfassung, angewendet auf
-/// `.rs` statt `.md`. `target/` wird übersprungen, weil es ausschließlich
-/// generierten/heruntergeladenen Code enthält (Build-Artefakte,
-/// `cargo doc`-Ausgabe) — kein Quelltext dieses Workspace und potenziell
-/// riesig. Jedes [`RawDocument`] erhält
-/// [`DEFAULT_VISIBILITY`](crate::DEFAULT_VISIBILITY): Quelltext dieses
-/// Repositoriums ist keine `operator-only`-Kategorie nach
-/// [`visibility_of_scope`].
+/// Deckt die gängigen Programmiersprachen (Rust, TypeScript/JavaScript,
+/// Python, Go, JVM, C/C++, C#, Ruby, PHP, Swift, Shell) sowie
+/// Konfigurationsformate ab, die typischerweise neben Quelltext liegen
+/// (`toml`, `yaml`/`yml`). Markdown ist bewusst **nicht** enthalten: Prosa
+/// gehört in [`crate::DOCS_DESIGN_INDEX`] ([`collect_design_docs`]); ein
+/// Code-Walk über dieselbe Wurzel würde sonst jede `.md`-Datei doppelt
+/// indizieren. Der Vergleich erfolgt ohne Beachtung der Groß-/Kleinschreibung.
+pub const CODE_SOURCE_EXTENSIONS: &[&str] = &[
+    "rs", "ts", "tsx", "js", "jsx", "mjs", "cjs", "py", "go", "java", "kt", "kts", "c", "h", "cc",
+    "cpp", "hpp", "cs", "rb", "php", "swift", "sh", "bash", "toml", "yaml", "yml",
+];
+
+/// Verzeichnisnamen, die [`collect_code_sources`] (und
+/// [`collect_rust_sources`]) nie betreten.
+///
+/// # Description
+/// Build-Ausgaben (`target`, `dist`, `build`), heruntergeladene
+/// Abhängigkeiten (`node_modules`, virtuelle Python-Umgebungen `.venv`/`venv`),
+/// Bytecode-Caches (`__pycache__`) und VCS-Metadaten (`.git`, `.hg`, `.svn`):
+/// kein Quelltext des Projekts selbst, aber potenziell riesig.
+pub const SKIPPED_SOURCE_DIRS: &[&str] = &[
+    "target",
+    "node_modules",
+    ".git",
+    ".hg",
+    ".svn",
+    "dist",
+    "build",
+    ".venv",
+    "venv",
+    "__pycache__",
+];
+
+/// Obergrenze in Bytes für eine einzelne von [`collect_code_sources`]
+/// erfasste Datei (1 MiB).
+///
+/// # Description
+/// Größere Dateien sind in aller Regel generiert (minifizierte Bundles,
+/// Lockfile-artige YAML-Dumps, eingebettete Daten) und werden übersprungen,
+/// statt den Index mit wenig aussagekräftigen Chunks zu fluten.
+pub const CODE_SOURCE_MAX_BYTES: u64 = 1024 * 1024;
+
+/// Zerlegungsstrategie aus `harw-lens-chunk`, die zu einer erfassten
+/// Quelldatei passt (siehe [`chunker_for_path`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CodeChunker {
+    /// `harw_lens_chunk::chunk_rust` — Elementgrenzen (`fn`, `struct`, …).
+    Rust,
+    /// `harw_lens_chunk::chunk_markdown` — Überschriftengrenzen.
+    Markdown,
+    /// `harw_lens_chunk::chunk_plain` — Fenster mit Überlappung; für jeden
+    /// Quelltext ohne eigene Strategie.
+    Plain,
+}
+
+/// Ordnet einem Dateipfad die passende Zerlegungsstrategie zu.
+///
+/// # Description
+/// `harw-lens-chunk` kennt genau drei Strategien: `chunk_rust`,
+/// `chunk_markdown` und `chunk_plain`. `.rs` → [`CodeChunker::Rust`],
+/// `.md`/`.markdown` → [`CodeChunker::Markdown`], alles andere (TypeScript,
+/// Python, Go, …, auch Dateien ohne Endung) → [`CodeChunker::Plain`].
+/// Der Vergleich der Endung ignoriert Groß-/Kleinschreibung.
+///
+/// # Arguments
+/// - `path` (`&Path`): Pfad der Datei (relativ oder absolut; nur die Endung
+///   zählt).
+///
+/// # Returns
+/// Die passende [`CodeChunker`]-Variante.
+///
+/// # Examples
+/// ```rust,ignore
+/// use std::path::Path;
+/// assert_eq!(chunker_for_path(Path::new("src/lib.rs")), CodeChunker::Rust);
+/// assert_eq!(chunker_for_path(Path::new("app/main.ts")), CodeChunker::Plain);
+/// ```
+#[must_use]
+pub fn chunker_for_path(path: &Path) -> CodeChunker {
+    let extension = path
+        .extension()
+        .map(|ext| ext.to_string_lossy().to_ascii_lowercase());
+    match extension.as_deref() {
+        Some("rs") => CodeChunker::Rust,
+        Some("md" | "markdown") => CodeChunker::Markdown,
+        _ => CodeChunker::Plain,
+    }
+}
+
+/// Erfasst alle Quelltextdateien unterhalb von `root` (Endungen aus
+/// [`CODE_SOURCE_EXTENSIONS`]) als Code-Quellen.
+///
+/// # Description
+/// Dieselbe symlink-sichere, deterministisch sortierte Erfassung wie
+/// [`collect_design_docs`], angewendet auf alle Endungen aus
+/// [`CODE_SOURCE_EXTENSIONS`]. Verzeichnisse aus [`SKIPPED_SOURCE_DIRS`]
+/// werden nie betreten; Dateien über [`CODE_SOURCE_MAX_BYTES`] sowie
+/// Dateien, die kein valides UTF-8 sind (etwa Latin-1-kodierte C-Quellen),
+/// werden übersprungen statt die ganze Erfassung abzubrechen. Jedes
+/// [`RawDocument`] erhält [`DEFAULT_VISIBILITY`](crate::DEFAULT_VISIBILITY).
+///
+/// Die passende Zerlegungsstrategie je Datei liefert [`chunker_for_path`]
+/// (`.rs` → `chunk_rust`, übrige Endungen → `chunk_plain`).
 ///
 /// # Arguments
 /// - `root` (`&Path`): das Wurzelverzeichnis des Quellbaums. Ein nicht
@@ -232,36 +328,77 @@ fn walk_markdown_files(
 ///   leere Liste, keinen Fehler.
 ///
 /// # Returns
-/// `Vec<RawDocument>`, sortiert nach `root`-relativem Pfad (Vorwärtsschrägstriche,
-/// unabhängig von der Plattform).
+/// `Vec<RawDocument>`, sortiert nach `root`-relativem Pfad
+/// (Vorwärtsschrägstriche, unabhängig von der Plattform).
 ///
 /// # Errors
-/// - [`crate::SourceError::Io`]: ein Dateisystemzugriff schlägt fehl, oder
-///   eine Datei ist kein valides UTF-8.
+/// - [`crate::SourceError::Io`]: ein Verzeichnis- oder Dateizugriff schlägt
+///   fehl (nicht aber ungültiges UTF-8 — solche Dateien werden übersprungen).
 ///
 /// # Examples
-/// ```rust,no_run
-/// use harw_lens_source::collect_rust_sources;
-///
+/// ```rust,ignore
 /// let src_root = tempfile::tempdir()?;
-/// std::fs::write(src_root.path().join("lib.rs"), "//! Doc.\npub fn f() {}\n")?;
-/// let documents = collect_rust_sources(src_root.path())?;
-/// assert_eq!(documents.len(), 1);
+/// std::fs::write(src_root.path().join("lib.rs"), "pub fn f() {}\n")?;
+/// std::fs::write(src_root.path().join("app.ts"), "export const x = 1;\n")?;
+/// let documents = collect_code_sources(src_root.path())?;
+/// assert_eq!(documents.len(), 2);
 /// # Ok::<(), Box<dyn std::error::Error>>(())
 /// ```
+pub fn collect_code_sources(root: &Path) -> SourceResult<Vec<RawDocument>> {
+    collect_sources_with_extensions(root, CODE_SOURCE_EXTENSIONS)
+}
+
+/// Erfasst ausschließlich Rust-Quelldateien unterhalb von `root` als Quellen
+/// für [`crate::CODE_RUST_INDEX`] (Knoten AW7-05).
+///
+/// # Description
+/// Veralteter Einstiegspunkt: entspricht [`collect_code_sources`], jedoch
+/// auf die Endung `.rs` eingeschränkt. Die Einschränkung bleibt bewusst
+/// erhalten, weil [`crate::CODE_RUST_INDEX`] jedes Dokument mit
+/// `harw_lens_chunk::chunk_rust` zerlegt — TypeScript oder Python dort
+/// hineinzugeben wäre falsch. Neue Aufrufer verwenden
+/// [`collect_code_sources`] und wählen die Zerlegung je Datei über
+/// [`chunker_for_path`].
+///
+/// # Arguments
+/// - `root` (`&Path`): das Wurzelverzeichnis des Quellbaums. Ein nicht
+///   existierendes oder kein Verzeichnis darstellendes `root` liefert eine
+///   leere Liste, keinen Fehler.
+///
+/// # Returns
+/// `Vec<RawDocument>`, sortiert nach `root`-relativem Pfad.
+///
+/// # Errors
+/// - [`crate::SourceError::Io`]: ein Dateisystemzugriff schlägt fehl.
+#[deprecated(
+    note = "use `collect_code_sources` (all common source extensions) together with `chunker_for_path`"
+)]
 pub fn collect_rust_sources(root: &Path) -> SourceResult<Vec<RawDocument>> {
+    collect_sources_with_extensions(root, &["rs"])
+}
+
+/// Gemeinsamer Kern von [`collect_code_sources`] und
+/// [`collect_rust_sources`]: Walk, Sortierung, Einlesen.
+fn collect_sources_with_extensions(
+    root: &Path,
+    extensions: &[&str],
+) -> SourceResult<Vec<RawDocument>> {
     if !root.is_dir() {
         return Ok(Vec::new());
     }
 
     let canonical_root = std::fs::canonicalize(root)?;
     let mut files = Vec::new();
-    walk_rust_files(root, &canonical_root, &mut files)?;
+    walk_code_files(root, &canonical_root, extensions, &mut files)?;
     files.sort();
 
     let mut documents = Vec::with_capacity(files.len());
     for path in files {
-        let text = std::fs::read_to_string(&path)?;
+        let text = match std::fs::read_to_string(&path) {
+            Ok(text) => text,
+            Err(error) if error.kind() == std::io::ErrorKind::InvalidData => continue,
+            Err(error) => return Err(error.into()),
+        };
         let relative = path.strip_prefix(root).unwrap_or(path.as_path());
         let display_path = relative
             .to_string_lossy()
@@ -275,13 +412,30 @@ pub fn collect_rust_sources(root: &Path) -> SourceResult<Vec<RawDocument>> {
     Ok(documents)
 }
 
-/// Rekursive Hilfsfunktion für [`collect_rust_sources`]: sammelt reguläre
-/// `.rs`-Dateien unterhalb von `dir`, ohne Symlinks zu befolgen und ohne je
-/// ein `target`-Verzeichnis zu betreten (Build-Artefakte, kein Quelltext
-/// dieses Workspace, potenziell riesig). Eigenständig von
-/// [`walk_markdown_files`], damit [`collect_design_docs`]s bereits
-/// getestetes Verhalten unverändert bleibt (Auflage „rein additiv").
-fn walk_rust_files(dir: &Path, canonical_root: &Path, out: &mut Vec<PathBuf>) -> SourceResult<()> {
+/// `true`, wenn die Endung von `path` (ohne Beachtung der
+/// Groß-/Kleinschreibung) in `extensions` enthalten ist.
+fn has_source_extension(path: &Path, extensions: &[&str]) -> bool {
+    path.extension().is_some_and(|ext| {
+        let ext = ext.to_string_lossy();
+        extensions
+            .iter()
+            .any(|candidate| ext.eq_ignore_ascii_case(candidate))
+    })
+}
+
+/// Rekursive Hilfsfunktion für [`collect_sources_with_extensions`]: sammelt
+/// reguläre Dateien mit einer Endung aus `extensions` unterhalb von `dir`,
+/// ohne Symlinks zu befolgen, ohne je ein Verzeichnis aus
+/// [`SKIPPED_SOURCE_DIRS`] zu betreten und ohne Dateien über
+/// [`CODE_SOURCE_MAX_BYTES`]. Eigenständig von [`walk_markdown_files`],
+/// damit [`collect_design_docs`]s bereits getestetes Verhalten unverändert
+/// bleibt.
+fn walk_code_files(
+    dir: &Path,
+    canonical_root: &Path,
+    extensions: &[&str],
+    out: &mut Vec<PathBuf>,
+) -> SourceResult<()> {
     let canonical_dir = std::fs::canonicalize(dir)?;
     if !canonical_dir.starts_with(canonical_root) {
         return Ok(());
@@ -290,16 +444,23 @@ fn walk_rust_files(dir: &Path, canonical_root: &Path, out: &mut Vec<PathBuf>) ->
     for entry in std::fs::read_dir(dir)? {
         let entry = entry?;
         let path = entry.path();
-        let file_type = std::fs::symlink_metadata(&path)?.file_type();
+        let metadata = std::fs::symlink_metadata(&path)?;
+        let file_type = metadata.file_type();
         if file_type.is_symlink() {
             continue;
         }
         if file_type.is_dir() {
-            if path.file_name().is_some_and(|name| name == "target") {
+            let skipped = path
+                .file_name()
+                .is_some_and(|name| SKIPPED_SOURCE_DIRS.iter().any(|skip| name == *skip));
+            if skipped {
                 continue;
             }
-            walk_rust_files(&path, canonical_root, out)?;
-        } else if file_type.is_file() && path.extension().is_some_and(|ext| ext == "rs") {
+            walk_code_files(&path, canonical_root, extensions, out)?;
+        } else if file_type.is_file()
+            && metadata.len() <= CODE_SOURCE_MAX_BYTES
+            && has_source_extension(&path, extensions)
+        {
             out.push(path);
         }
     }
@@ -657,6 +818,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(deprecated)]
     fn test_collect_rust_sources_missing_root_returns_empty_list() -> TestResult {
         let root = std::path::Path::new("/does/not/exist/harw-lens-source-rust-test");
         assert_eq!(collect_rust_sources(root)?, Vec::new());
@@ -664,6 +826,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(deprecated)]
     fn test_collect_rust_sources_reads_rust_files_recursively_and_sorted() -> TestResult {
         let dir = tempfile::tempdir()?;
         std::fs::write(dir.path().join("b.rs"), "fn b() {}\n")?;
@@ -690,6 +853,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(deprecated)]
     fn test_collect_rust_sources_skips_target_directory() -> TestResult {
         let dir = tempfile::tempdir()?;
         std::fs::write(dir.path().join("lib.rs"), "fn lib() {}\n")?;
@@ -705,5 +869,143 @@ mod tests {
             }
         );
         Ok(())
+    }
+
+    #[test]
+    #[allow(deprecated)]
+    fn test_collect_rust_sources_stays_rust_only() -> TestResult {
+        let dir = tempfile::tempdir()?;
+        std::fs::write(dir.path().join("lib.rs"), "fn lib() {}\n")?;
+        std::fs::write(dir.path().join("app.ts"), "export const x = 1;\n")?;
+
+        let documents = collect_rust_sources(dir.path())?;
+        assert_eq!(documents.len(), 1);
+        assert_eq!(
+            documents[0].source,
+            SourceRef::File {
+                path: "lib.rs".to_owned()
+            }
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn test_collect_code_sources_missing_root_returns_empty_list() -> TestResult {
+        let root = std::path::Path::new("/does/not/exist/harw-lens-source-code-test");
+        assert_eq!(collect_code_sources(root)?, Vec::new());
+        Ok(())
+    }
+
+    #[test]
+    fn test_collect_code_sources_reads_common_extensions_sorted() -> TestResult {
+        let dir = tempfile::tempdir()?;
+        std::fs::write(dir.path().join("main.go"), "package main\n")?;
+        std::fs::write(dir.path().join("lib.rs"), "fn lib() {}\n")?;
+        std::fs::create_dir(dir.path().join("web"))?;
+        std::fs::write(dir.path().join("web/app.tsx"), "export {};\n")?;
+        std::fs::write(dir.path().join("web/Util.PY"), "x = 1\n")?;
+        std::fs::write(dir.path().join("config.yaml"), "a: 1\n")?;
+        std::fs::write(dir.path().join("README.md"), "# Prosa\n")?;
+        std::fs::write(dir.path().join("image.png"), "not text")?;
+        std::fs::write(dir.path().join("Makefile"), "all:\n")?;
+
+        let documents = collect_code_sources(dir.path())?;
+        let paths: Vec<&str> = documents
+            .iter()
+            .filter_map(|d| match &d.source {
+                SourceRef::File { path } => Some(path.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            paths,
+            vec![
+                "config.yaml",
+                "lib.rs",
+                "main.go",
+                "web/Util.PY",
+                "web/app.tsx"
+            ]
+        );
+        assert!(documents.iter().all(|d| d.visibility == DEFAULT_VISIBILITY));
+        Ok(())
+    }
+
+    #[test]
+    fn test_collect_code_sources_skips_build_and_dependency_directories() -> TestResult {
+        let dir = tempfile::tempdir()?;
+        std::fs::write(dir.path().join("index.ts"), "export {};\n")?;
+        for skipped in SKIPPED_SOURCE_DIRS {
+            let sub = dir.path().join(skipped);
+            std::fs::create_dir(&sub)?;
+            std::fs::write(sub.join("hidden.js"), "var x;\n")?;
+        }
+        std::fs::create_dir(dir.path().join("src"))?;
+        std::fs::write(dir.path().join("src/kept.js"), "var y;\n")?;
+
+        let documents = collect_code_sources(dir.path())?;
+        let paths: Vec<&str> = documents
+            .iter()
+            .filter_map(|d| match &d.source {
+                SourceRef::File { path } => Some(path.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(paths, vec!["index.ts", "src/kept.js"]);
+        Ok(())
+    }
+
+    #[test]
+    fn test_collect_code_sources_skips_invalid_utf8_and_oversized_files() -> TestResult {
+        let dir = tempfile::tempdir()?;
+        std::fs::write(dir.path().join("ok.c"), "int main(void) { return 0; }\n")?;
+        std::fs::write(dir.path().join("latin1.c"), b"//\xe4\n")?;
+        assert_eq!(CODE_SOURCE_MAX_BYTES, 1024 * 1024);
+        std::fs::write(dir.path().join("bundle.js"), "a".repeat(1024 * 1024 + 1))?;
+
+        let documents = collect_code_sources(dir.path())?;
+        assert_eq!(documents.len(), 1);
+        assert_eq!(
+            documents[0].source,
+            SourceRef::File {
+                path: "ok.c".to_owned()
+            }
+        );
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_collect_code_sources_does_not_follow_symlinks() -> TestResult {
+        let dir = tempfile::tempdir()?;
+        let outside = tempfile::tempdir()?;
+        std::fs::write(outside.path().join("secret.py"), "TOKEN = 1\n")?;
+        std::os::unix::fs::symlink(outside.path(), dir.path().join("linked"))?;
+        std::fs::write(dir.path().join("real.py"), "x = 1\n")?;
+
+        let documents = collect_code_sources(dir.path())?;
+        assert_eq!(documents.len(), 1);
+        assert_eq!(documents[0].text, "x = 1\n");
+        Ok(())
+    }
+
+    #[test]
+    fn test_chunker_for_path_maps_extensions() {
+        use std::path::Path;
+        assert_eq!(chunker_for_path(Path::new("src/lib.rs")), CodeChunker::Rust);
+        assert_eq!(chunker_for_path(Path::new("MOD.RS")), CodeChunker::Rust);
+        assert_eq!(
+            chunker_for_path(Path::new("docs/a.md")),
+            CodeChunker::Markdown
+        );
+        for plain in [
+            "a.ts", "b.py", "c.go", "d.java", "e.toml", "f.yaml", "Makefile",
+        ] {
+            assert_eq!(
+                chunker_for_path(Path::new(plain)),
+                CodeChunker::Plain,
+                "{plain}"
+            );
+        }
     }
 }

@@ -36,7 +36,7 @@ use std::sync::{Arc, Mutex};
 
 use harw_agent_dsl::roles::AgentRoleId;
 use harw_core::{AgentSession, InteractionMode};
-use harw_operations::session_control::UiaSelection;
+use harw_operations::session_control::{ContextUsageSnapshot, LastCompaction, UiaSelection};
 use harw_operations::{SessionControlError, SessionControlSnapshot, SessionController};
 use harw_types::{ModelId, ProviderId, ReasoningEffort};
 
@@ -114,7 +114,20 @@ struct Inner {
 /// ```
 pub struct TuiSessionController {
     inner: Mutex<Inner>,
+    /// Zuletzt beobachtete Kontextfenster-Auslastung der Root-Session.
+    ///
+    /// Bewusst getrennt von `inner`: reine Lese-Anzeige für `/status` und
+    /// `/usage`, erhöht keinen Generationszähler und löst keinen Apply aus.
+    context_usage: SharedContextUsage,
 }
+
+/// Geteilter Halter der Kontextfenster-Momentaufnahme der Root-Session.
+///
+/// # Beschreibung
+/// Wird von der TUI beim Verarbeiten von `TurnEvent::ContextUpdated` /
+/// `TurnEvent::CompactionApplied` beschrieben und über
+/// [`SessionController::context_usage`] gelesen.
+pub type SharedContextUsage = Arc<Mutex<Option<ContextUsageSnapshot>>>;
 
 impl TuiSessionController {
     /// Erzeugt einen neuen `TuiSessionController` mit leerem Zustand.
@@ -131,6 +144,7 @@ impl TuiSessionController {
     pub fn new() -> Self {
         Self {
             inner: Mutex::new(Inner::default()),
+            context_usage: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -181,6 +195,7 @@ impl TuiSessionController {
         };
         Self {
             inner: Mutex::new(inner),
+            context_usage: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -264,6 +279,62 @@ impl TuiSessionController {
         }
         inner.applied_generation = inner.generation;
         true
+    }
+}
+
+impl TuiSessionController {
+    /// Liefert einen geteilten Handle auf die Kontextfenster-Momentaufnahme.
+    ///
+    /// # Rückgabe
+    /// [`SharedContextUsage`] — `Arc`-Klon desselben Halters, den
+    /// [`SessionController::context_usage`] liest.
+    #[must_use]
+    pub fn context_usage_handle(&self) -> SharedContextUsage {
+        Arc::clone(&self.context_usage)
+    }
+
+    /// Übernimmt die Werte eines `TurnEvent::ContextUpdated` der Root-Session.
+    ///
+    /// # Beschreibung
+    /// Überschreibt die numerischen Felder; eine bereits gemerkte
+    /// `last_compaction` bleibt erhalten. Ein vergifteter Mutex wird
+    /// stillschweigend ignoriert (reine Anzeige).
+    ///
+    /// # Argumente
+    /// - `used_tokens` (`u64`): Belegte Tokens des Kontextfensters.
+    /// - `window_tokens` (`u64`): Größe des Kontextfensters.
+    /// - `estimated_next_tokens` (`Option<u64>`): Schätzung der nächsten Anfrage.
+    /// - `threshold_tokens` (`Option<u64>`): Schwelle der nächsten Kompaktierung.
+    /// - `reserve_tokens` (`Option<u64>`): Reserve für die Modellausgabe.
+    pub fn record_context_updated(
+        &self,
+        used_tokens: u64,
+        window_tokens: u64,
+        estimated_next_tokens: Option<u64>,
+        threshold_tokens: Option<u64>,
+        reserve_tokens: Option<u64>,
+    ) {
+        if let Ok(mut guard) = self.context_usage.lock() {
+            let snapshot = guard.get_or_insert_with(ContextUsageSnapshot::default);
+            snapshot.used_tokens = used_tokens;
+            snapshot.window_tokens = window_tokens;
+            snapshot.estimated_next_tokens = estimated_next_tokens;
+            snapshot.threshold_tokens = threshold_tokens;
+            snapshot.reserve_tokens = reserve_tokens;
+        }
+    }
+
+    /// Merkt eine angewandte Kompaktierung der Root-Session
+    /// (`TurnEvent::CompactionApplied`) als `last_compaction`.
+    ///
+    /// # Argumente
+    /// - `compaction` ([`LastCompaction`]): Kopie der Ereignisfelder.
+    pub fn record_compaction(&self, compaction: LastCompaction) {
+        if let Ok(mut guard) = self.context_usage.lock() {
+            guard
+                .get_or_insert_with(ContextUsageSnapshot::default)
+                .last_compaction = Some(compaction);
+        }
     }
 }
 
@@ -448,6 +519,16 @@ impl SessionController for TuiSessionController {
             },
             Err(_) => SessionControlSnapshot::empty(),
         }
+    }
+
+    /// Liefert die zuletzt beobachtete Kontextfenster-Auslastung der
+    /// Root-Session; `None`, solange nichts beobachtet wurde oder der Mutex
+    /// vergiftet ist.
+    fn context_usage(&self) -> Option<ContextUsageSnapshot> {
+        self.context_usage
+            .lock()
+            .ok()
+            .and_then(|guard| guard.clone())
     }
 }
 

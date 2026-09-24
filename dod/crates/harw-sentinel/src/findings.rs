@@ -9,14 +9,16 @@
 //! Zyklus tatsächlich eingefroren hat, nicht gegen den noch veränderlichen
 //! Puffer. `now` ist dabei dasselbe `jiff::Timestamp`, das `poll_once` bereits
 //! für `poll_all`/`freeze` gelesen hat (`Timestamp::now()` läuft ausschließlich
-//! dort, an der einen Kompositionswurzel dieses Binaries) — [`run_rules`]
-//! selbst liest nie die Systemuhr, siehe `harw_dod_rules::rule`-Moduldoku.
+//! dort, an der einen Kompositionswurzel dieses Binaries) —
+//! [`run_rules_checked`] selbst liest nie die Systemuhr, siehe
+//! `harw_dod_rules::rule`-Moduldoku.
 //!
 //! # Warum der Sentinel nichts durchsetzt
 //! Dieses Binary ist die **unprivilegierte** Sammelstelle (siehe
 //! `crate`-Moduldoku, Abschnitt „Das erste vollständig unprivilegierte
-//! Binary"). [`run_rules`] liefert `Finding<`[`harw_dod_rules::RuleChecked`]`>`
-//! — zertifiziert, aber noch nicht triagiert. Der nächste Typestate-Schritt,
+//! Binary"). [`run_rules_checked`] liefert
+//! `Finding<`[`harw_dod_rules::RuleChecked`]`>` — zertifiziert (je Befund eine
+//! frische `FindingId`), aber noch nicht triagiert. Der nächste Typestate-Schritt,
 //! [`harw_dod_rules::triage`], entscheidet über [`harw_dod_rules::Verdict`]
 //! (`Confirmed`/`FalsePositive`/`NeedsReview`) und ist eine Bewertung, die
 //! dieses Binary bewusst nicht trifft: eine automatische Triage im
@@ -92,7 +94,9 @@
 //! aus (keine Baseline, gegen die abgewichen werden könnte). Nur
 //! [`harw_dod_rules::StructureDriftRule`] arbeitet mit den tatsächlich
 //! registrierten Sensoren (`harw-dod-workspace`, `harw-dod-scanreport`)
-//! produktiv. Das ist keine stille Lücke: beide Felder sind oben benannt,
+//! produktiv — und zwar ausschließlich über deren
+//! `EventKind::StructureDrift`-Ereignisse; ihr Sample-Zweig („neue Metrik
+//! ohne Baseline") schweigt ohne jede Baseline bewusst. Das ist keine stille Lücke: beide Felder sind oben benannt,
 //! zusammen mit der Konsequenz.
 //!
 //! # Nebenläufigkeit
@@ -103,12 +107,13 @@
 //! aber nur aus diesem einen Thread heraus benutzt.
 //!
 //! # Fehler
-//! Keine. [`run_rules`] liefert kein `Result`, und diese Funktion meldet nur
+//! Keine. [`run_rules_checked`] liefert kein `Result`, und diese Funktion
+//! meldet nur
 //! — sie bricht bei keiner Befundzahl ab.
 
 use harw_authority::NetworkScope;
 use harw_dod_rules::rule::RuleContext;
-use harw_dod_rules::{FindingKind, run_rules};
+use harw_dod_rules::{FindingKind, run_rules_checked};
 use harw_dod_signals::SecurityEvidence;
 use harw_observe::{FieldValue, MetricValue, TelemetrySink};
 use jiff::Timestamp;
@@ -151,7 +156,7 @@ const fn finding_kind_label(kind: FindingKind) -> &'static str {
 /// Baut einen [`RuleContext`] aus `evidence.samples`/`evidence.events`, einem
 /// leeren [`NetworkScope`] und einer leeren Baseline-Liste (siehe Moduldoku,
 /// Abschnitt „Was dieser Kontext (noch) nicht befüllt"), ruft
-/// [`run_rules`] darauf auf und meldet jeden zurückgelieferten
+/// [`run_rules_checked`] darauf auf und meldet jeden zurückgelieferten
 /// `Finding<RuleChecked>` über `tracing::warn!` (menschenlesbar, mit
 /// Zusammenfassung) und [`SECURITY_FINDING_TOTAL`] auf `sink` (maschinell
 /// auswertbar, ohne Freitext im Label — siehe
@@ -204,10 +209,11 @@ pub fn report_findings(
         network_scope: &scope,
     };
 
-    let findings = run_rules(&ctx);
+    let findings = run_rules_checked(&ctx);
 
     for finding in &findings {
         tracing::warn!(
+            finding_id = finding.id().as_str(),
             rule_id = finding.rule_id(),
             kind = finding_kind_label(finding.kind()),
             severity = ?finding.severity(),
@@ -250,8 +256,8 @@ mod tests {
         }
     }
 
-    /// Der wichtigste Test dieses Knotens: `run_rules` wird tatsächlich von
-    /// einem Produktionspfad aufgerufen (`report_findings`, das
+    /// Der wichtigste Test dieses Knotens: die Regeln (`run_rules_checked`)
+    /// werden tatsächlich von einem Produktionspfad aufgerufen (`report_findings`, das
     /// `crate::poll_once` jeden Zyklus aufruft) — nicht nur aus einem
     /// Doctest oder einem Test innerhalb von `harw-dod-rules` selbst.
     #[test]

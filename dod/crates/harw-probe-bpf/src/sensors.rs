@@ -1,97 +1,49 @@
-//! Sensor-Aufbau: bindet die beiden geerbten Formungscrates gegen einen
-//! injizierten `harw_dod_bpf::BpfLoader` — und gleicht dabei ihre
-//! unterschiedlichen Schnittstellen aus.
+//! Sensor-Aufbau: löst die vier eBPF-Programmobjekte auf und stellt den
+//! degradierten Platzhalter-Sensor bereit, wenn ein Sensor nicht geladen
+//! werden kann.
 //!
-//! # Die geerbte Unstimmigkeit
+//! # Rolle im produktiven Pfad
+//! Produktiv lädt diese Sonde ihre Objekte **nicht** über
+//! `harw_dod_signals::Sensor`, sondern als v1-Vertragssatz über den
+//! gemeinsamen `harw_dod_bpf::RealBpfLoader` (`harw_dod_procmon::procmon_contracts`,
+//! `harw_dod_flow::flow_contracts`, geladen von
+//! [`crate::real_loader::load_sensor`]) und liest sie über
+//! [`crate::collect::drain_wire_once`]. Diese Datei liefert dafür nur zwei
+//! Bausteine:
+//!
+//! - die **Objektauflösung** ([`resolve_procmon_objects`],
+//!   [`resolve_flow_objects`]): je Sensor genau zwei geprüfte, bereits
+//!   eingelesene Objekte, deren Bytes `main::run` vor der
+//!   Landlock-Durchsetzung einliest;
+//! - den **degradierten Sensor** ([`UnavailableSensor`]): das einzige
+//!   `harw_dod_signals::Sensor`-Objekt dieser Sonde, das die Sammelschleife
+//!   über [`crate::collect::run_once`] bedient.
+//!
+//! # Die geerbte Schnittstellen-Unstimmigkeit (erledigt)
 //! `harw-dod-procmon` und `harw-dod-flow` sind unabhängig voneinander
 //! gebaut worden (Invariante C7: Geschwistercrates, die einander nicht
-//! kennen dürfen) und haben sich **verschieden** entschieden:
+//! kennen dürfen). Ursprünglich implementierte nur `harw-dod-procmon`
+//! `harw_dod_signals::Sensor` (`ProcmonSensor`), `harw-dod-flow` bot nur
+//! `observe()`; diese Sonde glich das mit einem lokalen `FlowSensor`-Adapter
+//! aus. Das Urteil dieser Sonde als einziger Konsument war: `harw-dod-procmon`s
+//! Form (Trait implementieren, `sensor_suite!` bewusst nicht verwenden,
+//! ehrliche Handtests) ist die richtige. `harw-dod-flow` hat das inzwischen
+//! übernommen (K72: `harw_dod_flow::FlowSensor` implementiert `Sensor`).
 //!
-//! | | `harw-dod-procmon` | `harw-dod-flow` |
-//! |---|---|---|
-//! | Schnittstelle | implementiert `harw_dod_signals::Sensor` (`ProcmonSensor`) | implementiert `Sensor` **bewusst nicht**, bietet `observe()` |
-//! | Zeitstempel | `RawBpfEvent::observed_at` je Ereignis, `now` wird angenommen und ignoriert | `RawBpfEvent::observed_at` je Ereignis, kein `now`-Parameter überhaupt |
-//! | Ergebnis | `SensorReading` mit `SecurityEvent`s | `Option<SecurityEvent>` nur für Verbindungen **außerhalb** des `NetworkScope` |
-//!
-//! `harw-dod-flow`s eigene Begründung (siehe dessen `report`-Moduldoku,
-//! Abschnitt „Warum `harw-dod-fixtures` hier nicht passt"): ein `Sensor`,
-//! der `handle.scope()` nie anfasst, bestünde die sechs
-//! `harw_dod_fixtures::sensor_suite!`-Prüfungen trivial — grün, ohne dass
-//! die eigentliche Payload-Parse- oder Melderegel-Logik je ausgeführt würde.
-//! Also lieber gar nicht erst `Sensor` implementieren, als eine Zusage
-//! machen, die eine Fixture-Prüfung nicht ehrlich einlösen kann.
-//!
-//! # Das Urteil dieser Sonde: `harw-dod-procmon`s Form ist die richtige
-//! Diese Crate ist der einzige echte Aufrufer beider Formungscrates — kein
-//! anderer Konsument existiert oder ist geplant. Als Konsument wiegt eine
-//! erschwerte Ansteuerung schwerer als jedes andere Argument, und hier ist
-//! sie eindeutig: [`crate::collect`] treibt `harw-dod-procmon`s
-//! `ProcmonSensor` bereits mit einer einzigen, generischen Zeile
-//! (`sensor.poll(now)`, iterierbar über `Vec<Arc<dyn Sensor>>`, genau wie
-//! `harw-sentinel::sensors::build_sensors` es für seine eigenen Sensoren
-//! tut). Für `harw-dod-flow` hätte diese Sonde ohne einen eigenen Adapter
-//! stattdessen einen **zweiten, andersartigen** Pfad gebraucht: den
-//! `BpfLoader` selbst mit einem eigenen `timeout` ansteuern, das
-//! `NetworkScope` selbst durchreichen, `Option<SecurityEvent>` selbst in die
-//! Sammlung einsortieren — dieselbe Poll-Semantik, die `Sensor::poll` schon
-//! bereitstellt, noch einmal von Hand nachgebaut, nur ohne den gemeinsamen
-//! Vertrag. Zwei Geschwistercrates mit verschiedener Schnittstelle bedeuten,
-//! dass jeder künftige Konsument zwei Wege lernen muss — und hier gibt es
-//! nur diesen einen Konsumenten, auf dessen Rücken beide Wege ohnehin
-//! landen.
-//!
-//! Der von `harw-dod-flow` angeführte Grund (`sensor_suite!` ließe sich
-//! austricksen) ist real, aber **bereits gelöst** — von `harw-dod-procmon`
-//! selbst: dessen eigene Moduldoku (Abschnitt
-//! „`harw_dod_fixtures::sensor_suite!` passt hier nicht") kommt zum
-//! *gleichen* Befund (`ProcmonSensor` liest ebenfalls nie über
-//! `handle.scope()`) und trifft die *gegenteilige* Konsequenz: `Sensor`
-//! trotzdem implementieren, `sensor_suite!` bewusst nicht verwenden, und
-//! stattdessen von Hand geschriebene, ehrliche Tests liefern (genau die
-//! Tests, die auch `harw-dod-flow` bereits für sich selbst schreibt). Das
-//! Fixture-Harness-Problem und die Frage „implementiert diese Crate den
-//! Trait" sind zwei verschiedene Entscheidungen; `harw-dod-procmon` löst
-//! beide sauber, `harw-dod-flow` löst nur die erste und gibt dafür die
-//! zweite auf. Das ist der Punkt, an dem ich als Konsument widerspreche:
-//! diese Sonde hätte sich gewünscht, dass `harw-dod-flow` genau wie
-//! `harw-dod-procmon` `Sensor` implementiert (mit denselben von Hand
-//! geschriebenen, `sensor_suite!`-freien Tests, die es ohnehin schon hat)
-//! und `observe()`/`to_security_event()` als seine interne
-//! Implementierung dahinter behält, statt den Trait ganz auszulassen.
-//!
-//! **Fälle kein Urteil „beide sind fein":** siehe oben — genau das wird hier
-//! vermieden. `harw-dod-flow`s Entscheidung ist nicht falsch *für sich
-//! genommen*, aber sie ist die falsche Entscheidung *für einen Konsumenten*,
-//! und diese Sonde ist der einzige.
-//!
-//! # Was diese Sonde tut, weil sie `harw-dod-flow` nicht ändern darf
-//! Diese Datei kann `harw-dod-flow` nicht umschreiben (außerhalb des
-//! Schreibbereichs dieses Knotens). Sie baut deshalb stattdessen lokal
-//! [`FlowSensor`] — einen dünnen Adapter, der `harw_dod_flow::observe`
-//! hinter `harw_dod_signals::Sensor` verpackt, exakt nach dem Vorbild von
-//! `harw_dod_procmon::ProcmonSensor` (eigener `Box<dyn
-//! harw_dod_bpf::BpfLoader>`, eigener `harw_dod_bpf::BpfHandle`, `now`
-//! ignoriert, `RawBpfEvent::observed_at` je Ereignis übernommen,
-//! `debug_assert_eq!` auf die erwartete Fähigkeit). Damit treibt
-//! [`crate::collect::run_once`]/[`crate::collect::run_forever`] **beide**
-//! geerbten Quellen über denselben, einzigen, generischen Pfad — die
-//! Unstimmigkeit bleibt in den beiden Formungscrates bestehen (die diese
-//! Sonde nicht anfassen darf), wird aber an genau der einen Stelle
-//! aufgefangen, an der sie sonst jeden künftigen Aufrufer dieser Sonde
-//! getroffen hätte.
+//! Für diese Sonde ist die Frage damit doppelt erledigt: beide Formungscrates
+//! bieten heute dieselbe Form, und der produktive Weg führt ohnehin über die
+//! v1-Verträge und Wire-Ereignisse, nicht über `Sensor::poll` (siehe beide
+//! Crate-Dokus: der `Sensor`/`RawBpfEvent`-Pfad dort ist Fixture- und
+//! Übergangskompatibilität). Der lokale Adapter, die alten Einzelprogramm-
+//! Bauer und der Anknüpfungspunkt-Alias sind deshalb entfernt.
 //!
 //! # Genau eine Fähigkeit
 //! Beide Sensoren dieser Sonde tragen `harw_dod_cap::Capability::LoadBpfProgram`
 //! (Klasse `harw_dod_cap::CapabilityClass::Bpf`) — dieselbe Fähigkeit, die
 //! `harw_dod_bpf::REQUIRED_CAPABILITY`, `harw_dod_procmon`s eigene
-//! Erwartung und `harw_dod_flow::REQUIRED_CAPABILITY` benennen. Diese Datei
-//! erfindet keine zweite Fähigkeit für den Verbindungs-Sensor.
-//!
-//! # Der Anknüpfungspunkt des Prozessstart-Programms
-//! `harw-dod-procmon` exportiert seinen Anknüpfungspunkt inzwischen selbst
-//! (`harw_dod_procmon::PROCMON_TRACEPOINT_ATTACH_POINT`, abgeleitet aus
-//! `harw_dod_bpf::EXEC_ATTACH_POINT`); [`PROCMON_TRACEPOINT_ATTACH_POINT`]
-//! dieser Sonde ist nur noch ein Alias darauf, keine eigene Wahl mehr.
+//! Erwartung und `harw_dod_flow::REQUIRED_CAPABILITY` benennen. Auch
+//! [`UnavailableSensor`] trägt sie, damit eine Degradierung dem richtigen
+//! Sensor zugeordnet wird. Diese Datei erfindet keine zweite Fähigkeit.
 //!
 //! # Woher die Programmobjekte kommen
 //! `make build-bpf` (bzw. `scripts/build-bpf.sh` → `dod/bpf/Makefile`)
@@ -117,7 +69,8 @@
 //! Formprüfung gelten damit für genau die Bytes, die später geladen werden
 //! (kein zweites Lesen, das zwischen Prüfung und Laden eine andere Datei
 //! sehen könnte), und nach der Auflösung braucht dieser Prozess keinen
-//! Lesezugriff auf das Objektverzeichnis mehr (Landlock).
+//! Lesezugriff auf das Objektverzeichnis mehr — es ist deshalb nicht Teil
+//! des Landlock-Ausschnitts (siehe [`crate::landlock`]).
 //!
 //! # Degradierung statt leerem Programm
 //! Fehlt eines der beiden Objekte eines Sensors (oder verletzt es eine der
@@ -125,59 +78,49 @@
 //! Sensor wird stattdessen als [`UnavailableSensor`] registriert: er loggt
 //! beim Aufbau jedes fehlende Objekt mit Pfad und Grund, meldet beim ersten
 //! `poll` genau ein `EventKind::SensorDegraded { sensor }` an den Sentinel
-//! und liefert danach leere Lesungen (mit derselben Wartezeit wie ein
-//! realer Sensor, damit die Sammelschleife nicht leer dreht). Ein leerer
-//! Platzhalterrumpf existiert nur noch in den Tests dieser Datei.
+//! und liefert danach leere Lesungen (mit [`UNAVAILABLE_IDLE_INTERVAL`]
+//! Wartezeit, damit die Sammelschleife nicht leer dreht). Dasselbe gilt,
+//! wenn das Laden selbst degradierend scheitert (dann mit leerer
+//! Mängelliste, siehe `main::setup_sensor`).
 //!
 //! # Exportierte Typen
-//! [`PROCMON_TRACEPOINT_ATTACH_POINT`], [`FLOW_DEFAULT_READ_TIMEOUT`],
-//! [`build_procmon_sensor`], [`build_flow_sensor`], [`FlowSensor`],
-//! [`BPF_OBJECT_DIR_ENV`], [`DEFAULT_BPF_OBJECT_DIR`],
-//! [`MAX_BPF_OBJECT_BYTES`], [`BpfObjectKind`], [`ResolvedBpfObject`],
-//! [`ObjectUnavailable`], [`ObjectUnavailableReason`],
+//! [`UNAVAILABLE_IDLE_INTERVAL`], [`BPF_OBJECT_DIR_ENV`],
+//! [`DEFAULT_BPF_OBJECT_DIR`], [`MAX_BPF_OBJECT_BYTES`], [`BpfObjectKind`],
+//! [`ResolvedBpfObject`], [`ObjectUnavailable`], [`ObjectUnavailableReason`],
 //! [`resolve_procmon_objects`], [`resolve_flow_objects`],
 //! [`UnavailableSensor`].
 //!
 //! # Nebenläufigkeit
-//! [`UnavailableSensor`] hält nur Griff und Fehlerliste (`Send + Sync`).
-//! Die Objektauflösung liest das Dateisystem und die Umgebung einmalig beim
-//! Aufbau, nie während eines `poll`.
-//! [`FlowSensor`] ist `Send + Sync + Debug` (Anforderung von
-//! `harw_dod_signals::Sensor`): `SensorHandle<Bound>`,
-//! `Box<dyn harw_dod_bpf::BpfLoader>`, `harw_dod_bpf::BpfHandle`,
-//! `harw_authority::NetworkScope` und `std::time::Duration` sind alle
-//! `Send + Sync`. `poll` nimmt `&self` und führt keine innere
-//! Veränderlichkeit — konkurrierende Polls auf demselben Sensor sind sicher
-//! (auch wenn der gehaltene Lader selbst innere Veränderlichkeit einsetzen
-//! darf, siehe `harw_dod_bpf::fixture::FixtureBpfLoader`).
+//! [`UnavailableSensor`] hält nur Griff, Fehlerliste und ein `AtomicBool`
+//! (`Send + Sync + Debug`, wie `harw_dod_signals::Sensor` verlangt); `poll`
+//! nimmt `&self`, konkurrierende Polls melden die Degradierung trotzdem
+//! genau einmal. Die Objektauflösung liest das Dateisystem und die Umgebung
+//! einmalig beim Aufbau, nie während eines `poll`.
 //!
 //! # Fehler
-//! [`crate::error::ProbeError::BpfLoad`] aus [`build_procmon_sensor`]/
-//! [`build_flow_sensor`], wenn `loader.load(&spec)` scheitert.
 //! [`ObjectUnavailable`] (je fehlendem oder ungültigem Objekt) aus
 //! [`resolve_procmon_objects`]/[`resolve_flow_objects`] — kein
-//! `ProbeError`, weil ein fehlendes Objekt den Sensor degradiert, nicht den
-//! Prozess beendet.
-//! `harw_dod_cap::SensorError`, wie vom `Sensor`-Trait verlangt, aus
-//! [`FlowSensor::poll`] — sowohl `harw_dod_bpf::BpfError` (aus dem
-//! gehaltenen Lader) als auch `harw_dod_flow::FlowError` (aus
-//! `harw_dod_flow::observe`) werden auf diesen einen Typ abgebildet (private
-//! Abbildungsfunktionen in diesem Modul, Muster:
-//! `harw_dod_procmon::sensor::bpf_error_to_sensor_error`).
+//! `crate::error::ProbeError`, weil ein fehlendes Objekt den Sensor
+//! degradiert, nicht den Prozess beendet. [`UnavailableSensor::poll`]
+//! scheitert nie.
 //!
 //! # Examples
 //! ```rust,ignore
-//! use std::sync::Arc;
-//! use crate::sensors::{build_procmon_sensor, resolve_procmon_objects, UnavailableSensor};
-//! use harw_dod_signals::Sensor;
+//! use crate::sensors::{resolve_procmon_objects, UnavailableSensor};
 //! use harw_types::SensorId;
 //!
 //! let id = SensorId::from_str("probe-bpf-procmon-0");
-//! let sensor: Arc<dyn Sensor> = match resolve_procmon_objects(None, None) {
-//!     Ok([exec, _exit]) => Arc::new(build_procmon_sensor(loader, id, exec.into_source())?),
-//!     Err(missing) => Arc::new(UnavailableSensor::new(id, missing)),
-//! };
-//! # Ok::<(), crate::error::ProbeError>(())
+//! match resolve_procmon_objects(None, None) {
+//!     Ok([exec, exit]) => {
+//!         let contracts = harw_dod_procmon::procmon_contracts(
+//!             id, exec.into_source(), exit.into_source(), harw_dod_bpf::BpfScope::Host,
+//!         );
+//!         // → crate::real_loader::load_sensor(&loader, &contracts)
+//!     }
+//!     Err(missing) => {
+//!         let _degraded = UnavailableSensor::new(id, missing);
+//!     }
+//! }
 //! ```
 
 use std::borrow::Cow;
@@ -188,293 +131,32 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
-use harw_authority::NetworkScope;
-use harw_dod_bpf::{
-    BpfError, BpfHandle, BpfLoader, BpfProgramKind, BpfProgramSource, BpfProgramSpec,
-};
+use harw_dod_bpf::BpfProgramSource;
 use harw_dod_cap::{Bound, Capability, ReadScope, SensorError, SensorHandle};
-use harw_dod_flow::FlowError;
-use harw_dod_procmon::ProcmonSensor;
 use harw_dod_signals::{EventKind, SecurityEvent, Sensor, SensorReading};
 use harw_types::SensorId;
 use jiff::Timestamp;
 
-use crate::error::ProbeError;
-
-/// Anknüpfungspunkt des Prozessstart-Programms, das diese Sonde lädt.
+/// Wartezeit eines [`UnavailableSensor`] je leerem `poll`: **200
+/// Millisekunden**.
 ///
 /// # Description
-/// Alias auf `harw_dod_procmon::PROCMON_TRACEPOINT_ATTACH_POINT`
-/// (`"sched:sched_process_exec"`) — siehe Moduldoku, Abschnitt „Der
-/// Anknüpfungspunkt des Prozessstart-Programms".
-pub const PROCMON_TRACEPOINT_ATTACH_POINT: &str = harw_dod_procmon::PROCMON_TRACEPOINT_ATTACH_POINT;
-
-/// Vorgabe-Wartezeit für [`FlowSensor::poll`]s `read_events`-Aufruf:
-/// **200 Millisekunden**.
-///
-/// # Description
-/// Wie `harw_dod_procmon::DEFAULT_READ_TIMEOUT` ein bewusst gewählter
-/// Platzhalter, kein aus einem festen Poll-Abstand abgeleiteter Wert —
-/// dieser Workspace legt keinen programmweiten Poll-Abstand fest. Diese
-/// Sonde wählt denselben Zahlenwert unabhängig (nicht als Import aus
-/// `harw-dod-procmon`, da die beiden Zeitgeber unterschiedliche Quellen
-/// bedienen), weil beide Sensoren dieselbe Ringpuffer-Familie lesen und
-/// dieselbe Abwägung — kurz genug für einen ungestörten Sammelzyklus, lang
-/// genug für kurz zuvor angefallene Ereignisse — gleichermaßen gilt.
-pub const FLOW_DEFAULT_READ_TIMEOUT: Duration = Duration::from_millis(200);
+/// Derselbe Zahlenwert wie `harw_dod_procmon::DEFAULT_READ_TIMEOUT` und
+/// `crate::collect::WIRE_ROUND_BUDGET`: ein degradierter Sensor soll die
+/// Sammelschleife genauso takten wie ein realer Sensor, dessen Lesevorgang
+/// ohne Ereignis abläuft — ohne diese Wartezeit liefe die Schleife auf einem
+/// Host, auf dem alle Objekte fehlen, im Leerlauf mit voller CPU-Last.
+pub const UNAVAILABLE_IDLE_INTERVAL: Duration = Duration::from_millis(200);
 
 /// Baut einen leeren, ungebundenen [`harw_dod_cap::ReadScope`].
 ///
 /// # Description
-/// Beide Sensoren dieser Sonde lesen nie über `handle.scope()` — ihre
-/// einzige Quelle ist der injizierte `harw_dod_bpf::BpfLoader` (siehe
-/// Moduldoku). `harw_dod_cap::SensorHandle::bind` verlangt trotzdem einen
-/// `ReadScope`; ein leerer ist dieselbe Wahl, die `harw_dod_procmon`s eigene
-/// Beispiele und Tests treffen.
+/// [`UnavailableSensor`] liest nie über `handle.scope()`.
+/// `harw_dod_cap::SensorHandle::bind` verlangt trotzdem einen `ReadScope`;
+/// ein leerer ist dieselbe Wahl, die `harw_dod_procmon`s eigene Beispiele
+/// und Tests treffen.
 fn empty_scope() -> ReadScope {
     ReadScope::from_roots(Vec::<std::path::PathBuf>::new())
-}
-
-/// Baut den Prozessstart-Sensor: lädt das konfigurierte Programm über
-/// `loader` und verpackt das Ergebnis in `harw_dod_procmon::ProcmonSensor`
-/// (implementiert bereits `harw_dod_signals::Sensor`, siehe Moduldoku).
-///
-/// # Arguments
-/// - `loader` (`Box<dyn harw_dod_bpf::BpfLoader>`): die Ladeschicht dieses
-///   Sensors — eigene Instanz, unabhängig vom Lader des Verbindungs-Sensors
-///   (`harw_dod_procmon::ProcmonSensor::new` nimmt den Lader als Eigentum
-///   entgegen; ein Sensor liest laut `harw_dod_signals::sensor`-Moduldoku
-///   ohnehin genau eine Quelle).
-/// - `sensor_id` (`harw_types::SensorId`): die Kennung, unter der dieser
-///   Sensor seine Ereignisse meldet. Siehe `crate`-Moduldoku, Abschnitt „Das
-///   `SensorId`-Schema".
-/// - `source` (`harw_dod_bpf::BpfProgramSource`): woher der Programmrumpf
-///   kommt.
-///
-/// # Returns
-/// Einen fertig konstruierten `ProcmonSensor`.
-///
-/// # Errors
-/// - [`ProbeError::BpfLoad`]: wenn `loader.load(&spec)` scheitert (z. B.
-///   [`harw_dod_bpf::BpfError::CapabilityUnavailable`] auf einem Host ohne
-///   `CAP_BPF`).
-pub fn build_procmon_sensor(
-    loader: Box<dyn BpfLoader>,
-    sensor_id: SensorId,
-    source: BpfProgramSource,
-) -> Result<ProcmonSensor, ProbeError> {
-    let spec = BpfProgramSpec::new(
-        sensor_id.clone(),
-        BpfProgramKind::Tracepoint,
-        PROCMON_TRACEPOINT_ATTACH_POINT,
-        source,
-    );
-    let bpf_handle = loader.load(&spec)?;
-    let handle = SensorHandle::new(sensor_id, Capability::LoadBpfProgram).bind(empty_scope());
-    Ok(ProcmonSensor::new(handle, loader, bpf_handle))
-}
-
-/// Baut den Verbindungs-Sensor: lädt das konfigurierte Programm über
-/// `loader` und verpackt `harw_dod_flow::observe` hinter dem lokalen
-/// [`FlowSensor`]-Adapter (siehe Moduldoku, mein Urteil).
-///
-/// # Arguments
-/// - `loader` (`Box<dyn harw_dod_bpf::BpfLoader>`): die Ladeschicht dieses
-///   Sensors — eigene Instanz, siehe [`build_procmon_sensor`].
-/// - `sensor_id` (`harw_types::SensorId`): die Kennung, unter der dieser
-///   Sensor seine Ereignisse meldet.
-/// - `source` (`harw_dod_bpf::BpfProgramSource`): woher der Programmrumpf
-///   kommt.
-/// - `scope` (`harw_authority::NetworkScope`): der Zielbereich, den
-///   `harw_dod_flow::observe` gegen jede beobachtete Verbindung prüft.
-///
-/// # Returns
-/// Einen fertig konstruierten [`FlowSensor`].
-///
-/// # Errors
-/// - [`ProbeError::BpfLoad`]: wenn `loader.load(&spec)` scheitert.
-pub fn build_flow_sensor(
-    loader: Box<dyn BpfLoader>,
-    sensor_id: SensorId,
-    source: BpfProgramSource,
-    scope: NetworkScope,
-) -> Result<FlowSensor, ProbeError> {
-    let spec = harw_dod_flow::flow_program_spec(sensor_id.clone(), source);
-    let bpf_handle = loader.load(&spec)?;
-    let handle = SensorHandle::new(sensor_id, Capability::LoadBpfProgram).bind(empty_scope());
-    Ok(FlowSensor::new(handle, loader, bpf_handle, scope))
-}
-
-/// Lokaler Adapter: verpackt `harw_dod_flow::observe` hinter
-/// `harw_dod_signals::Sensor`, damit diese Sonde beide geerbten Quellen über
-/// dieselbe, generische Sammelschleife treibt wie
-/// `harw_dod_procmon::ProcmonSensor` — siehe Moduldoku, mein Urteil zur
-/// Schnittstellen-Unstimmigkeit.
-pub struct FlowSensor {
-    handle: SensorHandle<Bound>,
-    loader: Box<dyn BpfLoader>,
-    bpf_handle: BpfHandle,
-    scope: NetworkScope,
-    timeout: Duration,
-}
-
-impl FlowSensor {
-    /// Baut einen `FlowSensor` mit [`FLOW_DEFAULT_READ_TIMEOUT`].
-    ///
-    /// # Arguments
-    /// - `handle` (`harw_dod_cap::SensorHandle<harw_dod_cap::Bound>`): der
-    ///   gebundene Griff dieses Sensors. Sollte
-    ///   `harw_dod_flow::REQUIRED_CAPABILITY` (`Capability::LoadBpfProgram`)
-    ///   tragen (siehe [`Self::with_timeout`]).
-    /// - `loader` (`Box<dyn harw_dod_bpf::BpfLoader>`): die Ladeschicht,
-    ///   über die [`Sensor::poll`] Rohereignisse liest.
-    /// - `bpf_handle` (`harw_dod_bpf::BpfHandle`): der Griff eines bereits
-    ///   erfolgreich geladenen Programms.
-    /// - `scope` (`harw_authority::NetworkScope`): die Melderegel-Eingabe für
-    ///   `harw_dod_flow::observe`.
-    ///
-    /// # Returns
-    /// Einen `FlowSensor`, dessen [`Sensor::poll`] `loader.read_events` mit
-    /// [`FLOW_DEFAULT_READ_TIMEOUT`] aufruft.
-    ///
-    /// # Panics
-    /// In Debug-Builds, wenn
-    /// `handle.capability() != harw_dod_flow::REQUIRED_CAPABILITY`. In
-    /// Release-Builds keine Prüfung.
-    #[must_use]
-    pub fn new(
-        handle: SensorHandle<Bound>,
-        loader: Box<dyn BpfLoader>,
-        bpf_handle: BpfHandle,
-        scope: NetworkScope,
-    ) -> Self {
-        Self::with_timeout(handle, loader, bpf_handle, scope, FLOW_DEFAULT_READ_TIMEOUT)
-    }
-
-    /// Baut einen `FlowSensor` mit einer eigenen Wartezeit für
-    /// `read_events`.
-    ///
-    /// # Arguments
-    /// Siehe [`Self::new`], zusätzlich `timeout`
-    /// (`std::time::Duration`): wie lange
-    /// `harw_dod_bpf::BpfLoader::read_events` bei jedem Poll auf mindestens
-    /// ein Ereignis warten darf.
-    ///
-    /// # Returns
-    /// Einen `FlowSensor`, dessen [`Sensor::poll`] `loader.read_events` mit
-    /// `timeout` aufruft.
-    ///
-    /// # Panics
-    /// In Debug-Builds, wenn
-    /// `handle.capability() != harw_dod_flow::REQUIRED_CAPABILITY`.
-    #[must_use]
-    pub fn with_timeout(
-        handle: SensorHandle<Bound>,
-        loader: Box<dyn BpfLoader>,
-        bpf_handle: BpfHandle,
-        scope: NetworkScope,
-        timeout: Duration,
-    ) -> Self {
-        debug_assert_eq!(
-            handle.capability(),
-            harw_dod_flow::REQUIRED_CAPABILITY,
-            "FlowSensor: Griff muss harw_dod_flow::REQUIRED_CAPABILITY (Capability::LoadBpfProgram) tragen"
-        );
-        Self {
-            handle,
-            loader,
-            bpf_handle,
-            scope,
-            timeout,
-        }
-    }
-}
-
-impl std::fmt::Debug for FlowSensor {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        // Zeigt Griff, geladenen Griff und Wartezeit — der Lader ist ein
-        // Trait-Objekt ohne `Debug`-Zusage, `NetworkScope` trägt
-        // Politikinhalt, den eine Debug-Ausgabe nicht wiederholen muss.
-        f.debug_struct("FlowSensor")
-            .field("handle", &self.handle)
-            .field("bpf_handle", &self.bpf_handle)
-            .field("timeout", &self.timeout)
-            .finish_non_exhaustive()
-    }
-}
-
-impl Sensor for FlowSensor {
-    /// Der gebundene Griff dieses Sensors.
-    fn handle(&self) -> &SensorHandle<Bound> {
-        &self.handle
-    }
-
-    /// Liest neu eingetroffene Ringpuffer-Einträge über den gehaltenen
-    /// Lader und wendet `harw_dod_flow::observe` (Formung plus Melderegel)
-    /// auf jeden davon an.
-    ///
-    /// # Description
-    /// `now` wird nicht ausgewertet — wie bei `ProcmonSensor` trägt bereits
-    /// jedes einzelne `harw_dod_bpf::RawBpfEvent::observed_at` den
-    /// tatsächlichen Beobachtungszeitpunkt (siehe `harw_dod_flow::report`-
-    /// Moduldoku, Abschnitt „Der Zeitstempel").
-    ///
-    /// # Errors
-    /// `harw_dod_cap::SensorError`, entpackt aus `harw_dod_bpf::BpfError`
-    /// (wenn der Lader nicht lesbar ist) oder aus `harw_dod_flow::FlowError`
-    /// (wenn ein Rohereignis nicht die von `harw-dod-flow` dokumentierte
-    /// Form hat).
-    fn poll(&self, _now: Timestamp) -> Result<SensorReading, SensorError> {
-        let raw_events = self
-            .loader
-            .read_events(&self.bpf_handle, self.timeout)
-            .map_err(bpf_error_to_sensor_error)?;
-
-        let mut events = Vec::with_capacity(raw_events.len());
-        for raw in &raw_events {
-            let observed = harw_dod_flow::observe(raw, self.handle.id(), &self.scope)
-                .map_err(flow_error_to_sensor_error)?;
-            if let Some(event) = observed {
-                events.push(event);
-            }
-        }
-
-        Ok(SensorReading {
-            samples: Vec::new(),
-            events,
-        })
-    }
-}
-
-/// Entpackt die passende `SensorError`-Variante aus `harw_dod_bpf::BpfError`.
-///
-/// # Description
-/// Identische Abbildung wie
-/// `harw_dod_procmon::sensor::bpf_error_to_sensor_error`, für denselben
-/// Fehlertyp erneut geschrieben, weil diese private Funktion dort nicht
-/// exportiert ist: [`BpfError::CapabilityUnavailable`] wird zu
-/// `SensorError::SourceUnavailable`, [`BpfError::MalformedEvent`] zu
-/// `SensorError::MalformedSource`, [`BpfError::Io`] unverändert zu
-/// `SensorError::Io` durchgereicht.
-fn bpf_error_to_sensor_error(err: BpfError) -> SensorError {
-    // Die Abbildung lebt seit K73 an genau einer Stelle: `impl From<BpfError>
-    // for SensorError` in `harw-dod-bpf/src/error.rs`. Diese Funktion bleibt
-    // als benannter Aufrufpunkt bestehen, damit die vorhandenen Tests und
-    // Aufrufstellen unverändert weiterlesen — sie trägt die Regel nicht mehr.
-    SensorError::from(err)
-}
-
-/// Entpackt die eine `SensorError`-Variante aus `harw_dod_flow::FlowError`.
-///
-/// # Description
-/// `FlowError` hat heute nur eine Variante, `MalformedEvent`, die auf
-/// `SensorError::MalformedSource` abgebildet wird — exhaustiv gematcht,
-/// damit eine künftig hinzukommende Variante hier einen Compilefehler
-/// erzwingt statt still falsch eingeordnet zu werden.
-fn flow_error_to_sensor_error(err: FlowError) -> SensorError {
-    match err {
-        FlowError::MalformedEvent => SensorError::MalformedSource,
-    }
 }
 
 /// Umgebungsvariable, die das Objektverzeichnis für Entwicklungsaufbauten
@@ -731,10 +413,21 @@ fn resolve_bpf_object(
         return Err(unavailable(reason));
     }
 
+    // Blockweises, begrenztes Einlesen (höchstens ein Byte über der
+    // Obergrenze, damit `size_violation` Überlänge erkennt). Bewusst kein
+    // Einlesen „bis zum Streamende“ über `std::io::Read`: der
+    // `push_only_guard` verbietet diesen Bezeichner in der ganzen Sonde.
     let mut bytes = Vec::with_capacity(usize::try_from(meta.len()).unwrap_or(0));
-    file.take(MAX_BPF_OBJECT_BYTES.saturating_add(1))
-        .read_to_end(&mut bytes)
-        .map_err(|err| unavailable(io_reason(&err)))?;
+    let mut limited = file.take(MAX_BPF_OBJECT_BYTES.saturating_add(1));
+    let mut chunk = [0_u8; 64 * 1024];
+    loop {
+        match limited.read(&mut chunk) {
+            Ok(0) => break,
+            Ok(n) => bytes.extend_from_slice(chunk.get(..n).unwrap_or_default()),
+            Err(err) if err.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(err) => return Err(unavailable(io_reason(&err))),
+        }
+    }
     if let Some(reason) = size_violation(u64::try_from(bytes.len()).unwrap_or(u64::MAX)) {
         return Err(unavailable(reason));
     }
@@ -845,13 +538,12 @@ pub fn resolve_flow_objects(
 ///
 /// Der **erste** `poll` liefert genau ein
 /// `EventKind::SensorDegraded { sensor }` — so erreicht die Degradierung
-/// den Sentinel über die unveränderte Sammelschleife
-/// ([`crate::collect::run_forever`]), ohne dass diese einen dauerhaften
-/// Sensorfehler als Prozessende deuten muss. Jeder weitere `poll` wartet
-/// [`FLOW_DEFAULT_READ_TIMEOUT`] und liefert eine leere Lesung — genau wie
-/// ein realer Sensor, dessen `read_events` ohne Ereignis abläuft; ohne diese
-/// Wartezeit liefe die Sammelschleife auf einem Host, auf dem alle
-/// Objekte fehlen, im Leerlauf mit voller CPU-Last.
+/// den Sentinel über den generischen `Sensor`-Zweig der Sammelschleife
+/// ([`crate::collect::run_once`], aufgerufen von `main::collect_forever`),
+/// ohne dass diese einen dauerhaften Sensorfehler als Prozessende deuten
+/// muss. Jeder weitere `poll` wartet [`UNAVAILABLE_IDLE_INTERVAL`] und
+/// liefert eine leere Lesung — genau wie ein realer Sensor, dessen
+/// Lesevorgang ohne Ereignis abläuft.
 #[derive(Debug)]
 pub struct UnavailableSensor {
     handle: SensorHandle<Bound>,
@@ -874,7 +566,7 @@ impl UnavailableSensor {
     /// Einen Sensor, der seine Degradierung beim ersten `poll` meldet.
     #[must_use]
     pub fn new(sensor_id: SensorId, missing: Vec<ObjectUnavailable>) -> Self {
-        Self::with_idle(sensor_id, missing, FLOW_DEFAULT_READ_TIMEOUT)
+        Self::with_idle(sensor_id, missing, UNAVAILABLE_IDLE_INTERVAL)
     }
 
     /// Wie [`Self::new`], mit eigener Wartezeit je leerem `poll`.
@@ -949,37 +641,22 @@ impl Sensor for UnavailableSensor {
 
 #[cfg(test)]
 mod tests {
-    use std::borrow::Cow;
-    use std::net::{IpAddr, Ipv4Addr};
-
-    use harw_authority::{EgressTarget, NetworkScope};
-    use harw_dod_bpf::event::RawBpfEvent;
-    use harw_dod_bpf::fixture::FixtureBpfLoader;
-    use harw_dod_bpf::{BpfError, BpfProgramSource};
-    use harw_dod_cap::{Capability, SensorError};
-    use harw_dod_signals::{EventKind, Sensor};
-    use harw_types::SensorId;
-    use jiff::Timestamp;
-
     use std::ffi::OsStr;
     use std::path::{Path, PathBuf};
     use std::time::Duration;
 
+    use harw_dod_bpf::BpfProgramSource;
+    use harw_dod_cap::Capability;
+    use harw_dod_signals::{EventKind, Sensor};
+    use harw_types::SensorId;
+    use jiff::Timestamp;
+
     use super::{
-        BpfObjectKind, DEFAULT_BPF_OBJECT_DIR, ELF_MAGIC, FlowSensor, MAX_BPF_OBJECT_BYTES,
-        ObjectUnavailableReason, UnavailableSensor, bpf_error_to_sensor_error, bpf_object_path,
-        build_flow_sensor, build_procmon_sensor, flow_error_to_sensor_error, resolve_bpf_object,
+        BpfObjectKind, DEFAULT_BPF_OBJECT_DIR, ELF_MAGIC, MAX_BPF_OBJECT_BYTES,
+        ObjectUnavailableReason, UnavailableSensor, bpf_object_path, resolve_bpf_object,
         resolve_object_pair,
     };
-    use crate::error::ProbeError;
     use crate::test_support::{TestError, TestResult, ctx};
-
-    /// Leerer Rumpf — nur für `FixtureBpfLoader`, der den Rumpf nie liest.
-    /// Produktiv lädt diese Sonde nie einen leeren Rumpf (siehe Moduldoku,
-    /// Abschnitt „Degradierung statt leerem Programm").
-    fn placeholder_source() -> BpfProgramSource {
-        BpfProgramSource::Embedded(Cow::Borrowed(&[]))
-    }
 
     /// Schreibt ein minimales „Objekt" (ELF-Kennung plus Füllbytes).
     fn write_elf(dir: &Path, name: &str) -> TestResult<PathBuf> {
@@ -1238,296 +915,49 @@ mod tests {
                 "an empty directory must not resolve".into(),
             ));
         };
-        let sensor = UnavailableSensor::new(SensorId::from_str("probe-bpf-flow-0"), missing);
+        let id = SensorId::from_str("probe-bpf-flow-0");
+        // Keine Wartezeit, damit der zweite `poll` den Test nicht bremst.
+        let sensor = UnavailableSensor::with_idle(id.clone(), missing, Duration::ZERO);
         assert_eq!(sensor.missing().len(), 2);
-        assert_eq!(
-            sensor.handle().id(),
-            &SensorId::from_str("probe-bpf-flow-0")
-        );
+        assert_eq!(sensor.handle().id(), &id);
         assert_eq!(sensor.handle().capability(), Capability::LoadBpfProgram);
+
+        let first = sensor
+            .poll(Timestamp::UNIX_EPOCH)
+            .map_err(ctx("an unavailable sensor never fails to poll"))?;
+        assert!(first.samples.is_empty());
+        assert_eq!(first.events.len(), 1);
+        let event = first
+            .events
+            .first()
+            .ok_or(TestError::Missing("the degradation event"))?;
+        assert_eq!(event.sensor, id);
+        assert_eq!(event.observed_at, Timestamp::UNIX_EPOCH);
+        assert!(event.actor.is_none());
         assert!(matches!(
-            sensor.poll(Timestamp::UNIX_EPOCH),
-            Err(SensorError::SourceUnavailable)
+            &event.kind,
+            EventKind::SensorDegraded { sensor } if sensor == &id
         ));
+
+        let second = sensor
+            .poll(Timestamp::UNIX_EPOCH)
+            .map_err(ctx("an unavailable sensor never fails to poll"))?;
+        assert!(second.events.is_empty());
+        assert!(second.samples.is_empty());
         Ok(())
     }
 
     #[test]
-    fn test_build_procmon_sensor_with_capable_fixture_loader_succeeds() -> TestResult {
-        let loader = FixtureBpfLoader::new(Vec::new());
-        let sensor = build_procmon_sensor(
-            Box::new(loader),
-            SensorId::from_str("probe-bpf-procmon-0"),
-            placeholder_source(),
-        )
-        .map_err(ctx("fixture loader with capability always succeeds"))?;
-        assert_eq!(sensor.handle().capability(), Capability::LoadBpfProgram);
-        Ok(())
-    }
-
-    #[test]
-    fn test_build_procmon_sensor_without_capability_maps_to_bpf_load() -> TestResult {
-        let loader = FixtureBpfLoader::without_capability();
-        let Err(err) = build_procmon_sensor(
-            Box::new(loader),
-            SensorId::from_str("probe-bpf-procmon-0"),
-            placeholder_source(),
-        ) else {
-            return Err(TestError::Unexpected(
-                "a loader without the bpf capability must fail to load".into(),
-            ));
-        };
-        assert!(matches!(
-            err,
-            ProbeError::BpfLoad(BpfError::CapabilityUnavailable)
-        ));
-        Ok(())
-    }
-
-    #[test]
-    fn test_build_flow_sensor_with_capable_fixture_loader_succeeds() -> TestResult {
-        let loader = FixtureBpfLoader::new(Vec::new());
-        let sensor = build_flow_sensor(
-            Box::new(loader),
-            SensorId::from_str("probe-bpf-flow-0"),
-            placeholder_source(),
-            NetworkScope::empty(),
-        )
-        .map_err(ctx("fixture loader with capability always succeeds"))?;
-        assert_eq!(sensor.handle().capability(), Capability::LoadBpfProgram);
-        Ok(())
-    }
-
-    #[test]
-    fn test_build_flow_sensor_without_capability_maps_to_bpf_load() -> TestResult {
-        let loader = FixtureBpfLoader::without_capability();
-        let Err(err) = build_flow_sensor(
-            Box::new(loader),
-            SensorId::from_str("probe-bpf-flow-0"),
-            placeholder_source(),
-            NetworkScope::empty(),
-        ) else {
-            return Err(TestError::Unexpected(
-                "a loader without the bpf capability must fail to load".into(),
-            ));
-        };
-        assert!(matches!(
-            err,
-            ProbeError::BpfLoad(BpfError::CapabilityUnavailable)
-        ));
-        Ok(())
-    }
-
-    /// Baut einen wohlgeformten, 32 Byte breiten Flow-Payload — dasselbe
-    /// Layout wie `harw_dod_flow::event`s eigene Tests.
-    fn well_formed_flow_payload(port: u16, addr: [u8; 4]) -> Vec<u8> {
-        let mut bytes = vec![0u8; 32];
-        bytes[0..4].copy_from_slice(&100u32.to_le_bytes()); // pid
-        bytes[4..8].copy_from_slice(&1_000u32.to_le_bytes()); // uid
-        bytes[8] = 0; // TCP
-        bytes[9] = 1; // ausgehend
-        bytes[10] = 0; // IPv4
-        bytes[12..14].copy_from_slice(&port.to_be_bytes());
-        bytes[16..20].copy_from_slice(&addr);
-        bytes
-    }
-
-    fn flow_raw_event(payload: Vec<u8>) -> TestResult<RawBpfEvent> {
-        Ok(RawBpfEvent {
-            pid: 100,
-            comm: "curl".to_owned(),
-            observed_at: Timestamp::new(1_700_000_000, 0).map_err(ctx("valid timestamp"))?,
-            payload,
-        })
-    }
-
-    #[test]
-    fn test_flow_sensor_poll_reports_a_connection_outside_the_allowed_scope() -> TestResult {
-        let loader = FixtureBpfLoader::new(vec![flow_raw_event(well_formed_flow_payload(
-            443,
-            [203, 0, 113, 9],
-        ))?]);
-        let sensor = build_flow_sensor(
-            Box::new(loader),
-            SensorId::from_str("probe-bpf-flow-0"),
-            placeholder_source(),
-            NetworkScope::empty(),
-        )
-        .map_err(ctx("fixture loader with capability always succeeds"))?;
-
+    fn test_unavailable_sensor_without_missing_objects_still_reports_degradation() -> TestResult {
+        // Degradierender Ladefehler: `main::setup_sensor` übergibt eine leere
+        // Mängelliste — die Meldung an den Sentinel erfolgt trotzdem.
+        let id = SensorId::from_str("probe-bpf-procmon-0");
+        let sensor = UnavailableSensor::with_idle(id.clone(), Vec::new(), Duration::ZERO);
+        assert!(sensor.missing().is_empty());
         let reading = sensor
             .poll(Timestamp::UNIX_EPOCH)
-            .map_err(ctx("fixture-backed sensor never fails"))?;
+            .map_err(ctx("an unavailable sensor never fails to poll"))?;
         assert_eq!(reading.events.len(), 1);
-        assert_eq!(
-            reading.events[0].sensor,
-            SensorId::from_str("probe-bpf-flow-0")
-        );
-        assert!(matches!(
-            reading.events[0].kind,
-            EventKind::EgressFlow { .. }
-        ));
-        Ok(())
-    }
-
-    #[test]
-    fn test_flow_sensor_poll_does_not_report_a_connection_inside_the_allowed_scope() -> TestResult {
-        let loader = FixtureBpfLoader::new(vec![flow_raw_event(well_formed_flow_payload(
-            443,
-            [10, 0, 0, 5],
-        ))?]);
-        let cidr: ipnet::IpNet = "10.0.0.0/24"
-            .parse()
-            .map_err(ctx("valid test CIDR literal"))?;
-        let scope = NetworkScope::from_targets([EgressTarget::Cidr(cidr)]);
-        let sensor = build_flow_sensor(
-            Box::new(loader),
-            SensorId::from_str("probe-bpf-flow-0"),
-            placeholder_source(),
-            scope,
-        )
-        .map_err(ctx("fixture loader with capability always succeeds"))?;
-
-        let reading = sensor
-            .poll(Timestamp::UNIX_EPOCH)
-            .map_err(ctx("fixture-backed sensor never fails"))?;
-        assert!(reading.events.is_empty());
-        Ok(())
-    }
-
-    #[test]
-    fn test_flow_sensor_poll_maps_malformed_payload_to_malformed_source() -> TestResult {
-        let loader = FixtureBpfLoader::new(vec![flow_raw_event(vec![1, 2, 3])?]);
-        let sensor = build_flow_sensor(
-            Box::new(loader),
-            SensorId::from_str("probe-bpf-flow-0"),
-            placeholder_source(),
-            NetworkScope::empty(),
-        )
-        .map_err(ctx("fixture loader with capability always succeeds"))?;
-
-        let Err(err) = sensor.poll(Timestamp::UNIX_EPOCH) else {
-            return Err(TestError::Unexpected(
-                "a too-short flow payload must fail".into(),
-            ));
-        };
-        assert!(matches!(err, SensorError::MalformedSource));
-        Ok(())
-    }
-
-    #[test]
-    fn test_flow_sensor_poll_two_independently_built_sensors_yield_identical_readings() -> TestResult
-    {
-        let make_loader = || -> TestResult<FixtureBpfLoader> {
-            Ok(FixtureBpfLoader::new(vec![flow_raw_event(
-                well_formed_flow_payload(443, [203, 0, 113, 9]),
-            )?]))
-        };
-
-        let first = build_flow_sensor(
-            Box::new(make_loader()?),
-            SensorId::from_str("probe-bpf-flow-0"),
-            placeholder_source(),
-            NetworkScope::empty(),
-        )
-        .map_err(ctx("fixture loader with capability always succeeds"))?
-        .poll(Timestamp::UNIX_EPOCH)
-        .map_err(ctx("first poll"))?;
-        let second = build_flow_sensor(
-            Box::new(make_loader()?),
-            SensorId::from_str("probe-bpf-flow-0"),
-            placeholder_source(),
-            NetworkScope::empty(),
-        )
-        .map_err(ctx("fixture loader with capability always succeeds"))?
-        .poll(Timestamp::UNIX_EPOCH)
-        .map_err(ctx("second poll, independent sensor instance"))?;
-
-        assert_eq!(first, second);
-        Ok(())
-    }
-
-    #[test]
-    fn test_bpf_error_to_sensor_error_maps_capability_unavailable_to_source_unavailable() {
-        assert!(matches!(
-            bpf_error_to_sensor_error(BpfError::CapabilityUnavailable),
-            SensorError::SourceUnavailable
-        ));
-    }
-
-    #[test]
-    fn test_bpf_error_to_sensor_error_maps_malformed_event_to_malformed_source() {
-        assert!(matches!(
-            bpf_error_to_sensor_error(BpfError::MalformedEvent),
-            SensorError::MalformedSource
-        ));
-    }
-
-    #[test]
-    fn test_bpf_error_to_sensor_error_maps_io_to_io() {
-        let source = std::io::Error::other("boom");
-        assert!(matches!(
-            bpf_error_to_sensor_error(BpfError::Io(source)),
-            SensorError::Io(_)
-        ));
-    }
-
-    #[test]
-    fn test_flow_error_to_sensor_error_maps_malformed_event_to_malformed_source() {
-        assert!(matches!(
-            flow_error_to_sensor_error(harw_dod_flow::FlowError::MalformedEvent),
-            SensorError::MalformedSource
-        ));
-    }
-
-    #[test]
-    fn test_flow_sensor_debug_format_does_not_panic() -> TestResult {
-        let loader = FixtureBpfLoader::new(Vec::new());
-        let sensor: FlowSensor = build_flow_sensor(
-            Box::new(loader),
-            SensorId::from_str("probe-bpf-flow-0"),
-            placeholder_source(),
-            NetworkScope::empty(),
-        )
-        .map_err(ctx("fixture loader with capability always succeeds"))?;
-        let debug = format!("{sensor:?}");
-        assert!(debug.contains("FlowSensor"));
-        Ok(())
-    }
-
-    /// Belegt, dass eine egress-Meldung tatsächlich eine sinnvolle Adresse
-    /// trägt — nicht nur, dass irgendein Ereignis ankommt.
-    #[test]
-    fn test_flow_sensor_reported_destination_matches_the_observed_address() -> TestResult {
-        let loader = FixtureBpfLoader::new(vec![flow_raw_event(well_formed_flow_payload(
-            443,
-            [203, 0, 113, 9],
-        ))?]);
-        let sensor = build_flow_sensor(
-            Box::new(loader),
-            SensorId::from_str("probe-bpf-flow-0"),
-            placeholder_source(),
-            NetworkScope::empty(),
-        )
-        .map_err(ctx("fixture loader with capability always succeeds"))?;
-
-        let reading = sensor
-            .poll(Timestamp::UNIX_EPOCH)
-            .map_err(ctx("fixture-backed sensor never fails"))?;
-        match &reading.events[0].kind {
-            EventKind::EgressFlow { destination, port } => {
-                assert_eq!(
-                    destination,
-                    &IpAddr::V4(Ipv4Addr::new(203, 0, 113, 9)).to_string()
-                );
-                assert_eq!(*port, 443);
-            }
-            other => {
-                return Err(TestError::Unexpected(format!(
-                    "expected EventKind::EgressFlow, got {other:?}"
-                )));
-            }
-        }
         Ok(())
     }
 }

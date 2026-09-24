@@ -586,6 +586,20 @@ impl ModelProvider for UiaDefaultRouteProvider {
         }
         self.inner.respond(request)
     }
+
+    /// Reicht die gepinnte Modell-ID des inneren Routers durch.
+    ///
+    /// # Description
+    /// `default_model_id` ist **kein** Pin: es füllt nur fehlende Werte auf,
+    /// eine gesetzte `model_id` des Aufrufers hat Vorrang (siehe
+    /// [`Self::respond`]). Deshalb wird nicht `default_model_id`, sondern der
+    /// Wert des umhüllten Providers gemeldet.
+    ///
+    /// # Returns
+    /// `self.inner.pinned_model_id()`.
+    fn pinned_model_id(&self) -> Option<String> {
+        self.inner.pinned_model_id()
+    }
 }
 
 /// Löst die Modell-Kennung der uia-worker-Rollenfamilie auf.
@@ -749,6 +763,8 @@ mod tests {
             mode_override: None,
             active_agent: None,
             reasoning_effort: None,
+            approval_override: None,
+            model_override: None,
         }
     }
 
@@ -820,6 +836,7 @@ mod tests {
     fn model_toml(id: &str, provider: &str) -> harw_config::ModelToml {
         harw_config::ModelToml {
             stream: None,
+            rate_limit: None,
             id: id.to_owned(),
             name: None,
             provider: provider.to_owned(),
@@ -952,6 +969,7 @@ mod tests {
             "local-model".to_owned(),
             harw_config::ModelToml {
                 stream: None,
+                rate_limit: None,
                 id: "local-model".to_owned(),
                 name: None,
                 provider: "local".to_owned(),

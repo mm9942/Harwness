@@ -24,7 +24,7 @@
 //! # Flächen
 //! - Command `/explore` (`channel_parity`)
 //! - Model-Tool (readonly, `approval = none`)
-//! - Agent-Tool (`child = "explorer"`, `authority = "reduce_to_read_only"`,
+//! - Agent-Tool (`child = "explorer"`, `authority = "reduce_to_read_explore"`,
 //!   `budget = "60k_tokens,40_tool_calls,180s"`)
 //!
 //! # Warum `FromRawArgs` von Hand geschrieben ist
@@ -86,6 +86,25 @@ use serde_json::{Value, json};
 /// denselben Reducer: keine dieser Operationen darf ein Kind erzeugen, das mehr
 /// als lesen kann.
 pub(crate) const READ_ONLY_REDUCER: &str = "reduce_to_read_only";
+
+/// Reducer für `explorer`: Workspace, Registry-Cache und Netz (nur
+/// `web.fetch`/`web.search`, gebunden an die Egress-Policy des Parents).
+pub(crate) const READ_EXPLORE_REDUCER: &str = "reduce_to_read_explore";
+
+/// Reducer für `uia-explorer`: Workspace und Netz, ohne Registry-Cache.
+pub(crate) const READ_WORKSPACE_NETWORK_REDUCER: &str = "reduce_to_read_workspace_network";
+
+/// Wählt den Reducer passend zur Kind-Rolle: nur die Explorer-Rollen, deren
+/// Definition `web.*` zulässt, bekommen Netz; alle anderen bleiben read-only.
+pub(crate) fn reducer_for_role(role: &str) -> &'static str {
+    if role == role_names::EXPLORER {
+        READ_EXPLORE_REDUCER
+    } else if role == role_names::UIA_EXPLORER {
+        READ_WORKSPACE_NETWORK_REDUCER
+    } else {
+        READ_ONLY_REDUCER
+    }
+}
 
 /// Budget-Label für einen einzelnen Explorations-/Recherche-Lauf.
 ///
@@ -304,7 +323,7 @@ pub(crate) async fn run_single_child(
         ctx,
         role,
         std::slice::from_ref(&payload),
-        READ_ONLY_REDUCER,
+        reducer_for_role(role),
         budget,
         1,
         JoinSemantics::AllTerminal,
@@ -488,7 +507,7 @@ pub(crate) fn finding_output(
     web(path = "/api/explore", method = "get", approval = "none"),
     agent_tool(
         child = "explorer",
-        authority = "reduce_to_read_only",
+        authority = "reduce_to_read_explore",
         budget = "60k_tokens,40_tool_calls,180s"
     )
 )]

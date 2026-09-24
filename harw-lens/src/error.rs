@@ -139,7 +139,10 @@ mod tests {
             digest: "deadbeef".to_owned(),
         };
         let err: LensError = inner.into();
-        assert!(matches!(err, LensError::Source(SourceError::MissingEmbedding { .. })));
+        assert!(matches!(
+            err,
+            LensError::Source(SourceError::MissingEmbedding { .. })
+        ));
     }
 
     #[test]

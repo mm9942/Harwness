@@ -1,10 +1,13 @@
 [package]
+publish.workspace = true
 name = "harw-ops"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+# /analyze: projektneutraler Einheiten-Graph (Projekte + Relationen).
+harw-explorer = { path = "../harw-explorer" }
 harw-authority = { path = "../harw-authority" }
 harw-operations = { path = "../harw-operations" }
 harw-macros = { path = "../harw-macros" }

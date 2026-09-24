@@ -392,6 +392,7 @@ fn build_slice9_fixture(
         "gpt-test-slice9".to_owned(),
         ModelToml {
             stream: None,
+            rate_limit: None,
             id: "gpt-test-slice9".to_owned(),
             name: None,
             provider: "openai".to_owned(),
@@ -409,6 +410,7 @@ fn build_slice9_fixture(
         "claude-opus-4-8".to_owned(),
         ModelToml {
             stream: None,
+            rate_limit: None,
             id: "claude-opus-4-8".to_owned(),
             name: None,
             provider: "anthropic".to_owned(),

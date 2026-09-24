@@ -179,8 +179,11 @@ pub(crate) struct CommandServices<'a> {
 ///   Bubblewrap-gebundenen `shell.exec`-Ausführer ausgeführt. `HARW_DISABLE_SHELL=1`
 ///   schaltet die Capability für den Prozess aus.
 /// - [`Invocation::ShellRepeat`]: ist noch nicht implementiert.
-/// - [`Invocation::Note`]: `"Notiz: {text}"`.
-/// - [`Invocation::Mention`]: `"@{target}: {body}"`.
+/// - [`Invocation::Note`]: wird vorab zu `/diary note …` bzw.
+///   `/memory record …` umgeschrieben (siehe `rewrite_note_line`); ohne
+///   passenden Adapter `"Notiz: {text}"`.
+/// - [`Invocation::Mention`]: `"@{target}: {body}"` (die Chat-Weiterleitung
+///   übernimmt `app.rs`).
 /// - [`Invocation::Chat`]: unverändert durchgereicht.
 ///
 /// # Argumente
@@ -296,21 +299,12 @@ where
 /// Services-Closure — identisch zum bestehenden `execute_command_as`-Zweig in
 /// `app.rs`.
 ///
-/// **Bewusst ausgeklammert:** die `/export`-Sonderbehandlung
-/// (`execute_export_command_with_data` in `app.rs`, liefert zusätzlich
-/// `OpOutput::data` für den Export-Dateischreiber) ist in `app.rs` als
-/// private `async fn` deklariert und von hier — anderes Modul, kein
-/// `pub(crate)` — nicht erreichbar. Für den Sofort-Dispatch-Anwendungsfall
-/// (Welle 4b) ist das folgenlos: `/export` trägt `busy =
-/// DeferredUntilTurnEnd` (Standard, nicht Teil der in Welle 2d/3d/4a auf
-/// `Immediate` gesetzten Befehle) und läuft daher nie über diesen Helfer.
-/// Falls Welle 5 auch den *Idle*-Pfad vollständig hierher verlagern will,
-/// müsste `app.rs` zuerst `execute_export_command_with_data` auf
-/// `pub(crate)` heben (oder die Funktion nach `command_exec.rs`
-/// verschieben); dieser Helfer bräuchte dann einen zusätzlichen
-/// `/export`-Vorabschritt, der bei `Some(Ok(..))`/`Some(Err(..))` Vorrang vor
-/// `execute_command_as` erhält (siehe app.rs, `HarwEvent::Command`-Zweig) —
-/// bis dahin bleibt die Export-Sonderbehandlung ausschließlich in `app.rs`.
+/// **Bewusst ausgeklammert:** die `/export`-Sonderbehandlung. `app.rs`
+/// führt `/export` über [`crate::command_data::execute_command_with_data`]
+/// aus, weil es zusätzlich `OpOutput::data` für den Export-Dateischreiber
+/// braucht. Für den Sofort-Dispatch (Welle 4b) ist das folgenlos: `/export`
+/// trägt `busy = DeferredUntilTurnEnd` und läuft daher nie über diesen
+/// Helfer.
 ///
 /// # Argumente
 /// - `runtime` (`Option<&std::sync::Arc<harw_runtime::RuntimeAssembly>>`):
@@ -448,6 +442,34 @@ fn tui_dispatch_context(caller_permission: PermissionTier) -> DispatchContext {
     }
 }
 
+/// Formt eine `#notiz`-Zeile in die passende Slash-Zeile um — dieselbe
+/// Regel wie `local_commands::intercept` in `app.rs`.
+///
+/// # Beschreibung
+/// `#text` → `/diary note text`, wenn ein `/diary`-Adapter registriert ist,
+/// sonst `/memory record text`, wenn ein `/memory`-Adapter existiert. Ohne
+/// passenden Adapter, bei leerer Notiz oder für jede andere Zeile `None`:
+/// die Zeile läuft dann unverändert weiter (Notiz-Echo).
+///
+/// `app.rs` fängt `#`/`@` im interaktiven Pfad bereits vor diesem Modul ab;
+/// die Umschreibung hier deckt die übrigen Aufrufer ab (etwa synthetische
+/// Befehlszeilen), damit eine Notiz nie nur als Echo verpufft. `@rolle`
+/// braucht den Chat-Pfad und bleibt hier ein Echo.
+fn rewrite_note_line(adapters: &[CommandAdapter], raw_line: &str) -> Option<String> {
+    let note = raw_line.trim_start().strip_prefix('#')?.trim();
+    if note.is_empty() {
+        return None;
+    }
+    let has = |path: &str| adapters.iter().any(|adapter| adapter.path() == path);
+    if has("/diary") {
+        Some(format!("/diary note {note}"))
+    } else if has("/memory") {
+        Some(format!("/memory record {note}"))
+    } else {
+        None
+    }
+}
+
 /// Klassifiziert eine Rohzeile und admittiert sie über
 /// [`CommandRegistry::dispatch`], ohne sie auszuführen.
 ///
@@ -514,6 +536,8 @@ async fn execute_with_context<F>(
 where
     F: FnOnce() -> ServiceMap,
 {
+    let rewritten = rewrite_note_line(adapters, raw_line);
+    let raw_line = rewritten.as_deref().unwrap_or(raw_line);
     let (typed, action) = match classify_and_admit(adapters, context, raw_line) {
         Ok(pair) => pair,
         Err(text) => return text,
@@ -634,6 +658,8 @@ where
     F: FnOnce() -> ServiceMap,
 {
     let context = tui_dispatch_context(caller_permission);
+    let rewritten = rewrite_note_line(adapters, raw_line);
+    let raw_line = rewritten.as_deref().unwrap_or(raw_line);
     let (typed, action) = match classify_and_admit(adapters, context, raw_line) {
         Ok(pair) => pair,
         Err(text) => return CommandDispatchOutcome { text, shell: None },
@@ -1487,8 +1513,26 @@ mod tests {
         .await;
         std::fs::remove_dir_all(tmp).ok();
 
-        assert_eq!(output, "Notiz: this is a note");
+        // `#` wird zu einer Gedächtnis-/Tagebuch-Befehlszeile umgeschrieben
+        // und nicht mehr nur als Echo gezeigt.
+        assert_ne!(output, "Notiz: this is a note");
         Ok(())
+    }
+
+    #[test]
+    fn test_rewrite_note_line_prefers_diary_then_memory() {
+        let adapters = adapters();
+        let has_diary = adapters.iter().any(|adapter| adapter.path() == "/diary");
+        let rewritten = super::rewrite_note_line(&adapters, "  # hallo welt ");
+        let expected = if has_diary {
+            "/diary note hallo welt"
+        } else {
+            "/memory record hallo welt"
+        };
+        assert_eq!(rewritten.as_deref(), Some(expected));
+        assert_eq!(super::rewrite_note_line(&adapters, "#   "), None);
+        assert_eq!(super::rewrite_note_line(&adapters, "/status"), None);
+        assert_eq!(super::rewrite_note_line(&[], "#notiz"), None);
     }
 
     #[tokio::test]

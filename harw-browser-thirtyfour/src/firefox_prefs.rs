@@ -91,8 +91,14 @@ pub fn hardened_preferences(proxy_port: u16) -> Vec<(&'static str, PrefValue)> {
         ("app.shield.optoutstudies.enabled", Bool(false)),
         ("app.normandy.enabled", Bool(false)),
         ("browser.ping-centre.telemetry", Bool(false)),
-        ("browser.newtabpage.activity-stream.feeds.telemetry", Bool(false)),
-        ("browser.crashReports.unsubmittedCheck.autoSubmit2", Bool(false)),
+        (
+            "browser.newtabpage.activity-stream.feeds.telemetry",
+            Bool(false),
+        ),
+        (
+            "browser.crashReports.unsubmittedCheck.autoSubmit2",
+            Bool(false),
+        ),
         ("breakpad.reportURL", Str("")),
         // Updates and background services.
         ("app.update.auto", Bool(false)),
@@ -111,7 +117,10 @@ pub fn hardened_preferences(proxy_port: u16) -> Vec<(&'static str, PrefValue)> {
         ("browser.download.dir", Str(DISABLED_DOWNLOAD_DIR)),
         ("browser.download.useDownloadDir", Bool(true)),
         ("browser.download.forbid_open_with", Bool(true)),
-        ("browser.download.always_ask_before_handling_new_types", Bool(false)),
+        (
+            "browser.download.always_ask_before_handling_new_types",
+            Bool(false),
+        ),
         ("browser.download.manager.showWhenStarting", Bool(false)),
         ("browser.helperApps.neverAsk.saveToDisk", Str("")),
         ("browser.helperApps.neverAsk.openFile", Str("")),
@@ -128,25 +137,55 @@ mod tests {
     use std::collections::HashSet;
 
     fn value_of(prefs: &[(&'static str, PrefValue)], name: &str) -> Option<PrefValue> {
-        prefs.iter().find(|(key, _)| *key == name).map(|(_, value)| value.clone())
+        prefs
+            .iter()
+            .find(|(key, _)| *key == name)
+            .map(|(_, value)| value.clone())
     }
 
     #[test]
     fn test_hardened_preferences_routes_everything_through_socks5h_relay() {
         let prefs = hardened_preferences(31_080);
-        assert_eq!(value_of(&prefs, "network.proxy.type"), Some(PrefValue::Int(1)));
-        assert_eq!(value_of(&prefs, "network.proxy.socks"), Some(PrefValue::Str("127.0.0.1")));
-        assert_eq!(value_of(&prefs, "network.proxy.socks_port"), Some(PrefValue::Int(31_080)));
-        assert_eq!(value_of(&prefs, "network.proxy.socks_version"), Some(PrefValue::Int(5)));
-        assert_eq!(value_of(&prefs, "network.proxy.socks_remote_dns"), Some(PrefValue::Bool(true)));
-        assert_eq!(value_of(&prefs, "network.proxy.no_proxies_on"), Some(PrefValue::Str("")));
+        assert_eq!(
+            value_of(&prefs, "network.proxy.type"),
+            Some(PrefValue::Int(1))
+        );
+        assert_eq!(
+            value_of(&prefs, "network.proxy.socks"),
+            Some(PrefValue::Str("127.0.0.1"))
+        );
+        assert_eq!(
+            value_of(&prefs, "network.proxy.socks_port"),
+            Some(PrefValue::Int(31_080))
+        );
+        assert_eq!(
+            value_of(&prefs, "network.proxy.socks_version"),
+            Some(PrefValue::Int(5))
+        );
+        assert_eq!(
+            value_of(&prefs, "network.proxy.socks_remote_dns"),
+            Some(PrefValue::Bool(true))
+        );
+        assert_eq!(
+            value_of(&prefs, "network.proxy.no_proxies_on"),
+            Some(PrefValue::Str(""))
+        );
         assert_eq!(
             value_of(&prefs, "network.proxy.allow_hijacking_localhost"),
             Some(PrefValue::Bool(true))
         );
-        assert_eq!(value_of(&prefs, "network.proxy.failover_direct"), Some(PrefValue::Bool(false)));
-        assert_eq!(value_of(&prefs, "network.trr.mode"), Some(PrefValue::Int(5)));
-        assert_eq!(value_of(&prefs, "media.peerconnection.enabled"), Some(PrefValue::Bool(false)));
+        assert_eq!(
+            value_of(&prefs, "network.proxy.failover_direct"),
+            Some(PrefValue::Bool(false))
+        );
+        assert_eq!(
+            value_of(&prefs, "network.trr.mode"),
+            Some(PrefValue::Int(5))
+        );
+        assert_eq!(
+            value_of(&prefs, "media.peerconnection.enabled"),
+            Some(PrefValue::Bool(false))
+        );
     }
 
     #[test]
@@ -162,14 +201,24 @@ mod tests {
             "extensions.update.enabled",
             "browser.search.update",
         ] {
-            assert_eq!(value_of(&prefs, name), Some(PrefValue::Bool(false)), "{name}");
+            assert_eq!(
+                value_of(&prefs, name),
+                Some(PrefValue::Bool(false)),
+                "{name}"
+            );
         }
-        assert_eq!(value_of(&prefs, "app.update.disabledForTesting"), Some(PrefValue::Bool(true)));
+        assert_eq!(
+            value_of(&prefs, "app.update.disabledForTesting"),
+            Some(PrefValue::Bool(true))
+        );
         assert_eq!(
             value_of(&prefs, "browser.download.dir"),
             Some(PrefValue::Str(DISABLED_DOWNLOAD_DIR))
         );
-        assert_eq!(value_of(&prefs, "browser.download.folderList"), Some(PrefValue::Int(2)));
+        assert_eq!(
+            value_of(&prefs, "browser.download.folderList"),
+            Some(PrefValue::Int(2))
+        );
         assert_eq!(
             value_of(&prefs, "browser.download.forbid_open_with"),
             Some(PrefValue::Bool(true))
@@ -178,7 +227,10 @@ mod tests {
             value_of(&prefs, "security.fileuri.strict_origin_policy"),
             Some(PrefValue::Bool(true))
         );
-        assert_eq!(value_of(&prefs, "privacy.file_unique_origin"), Some(PrefValue::Bool(true)));
+        assert_eq!(
+            value_of(&prefs, "privacy.file_unique_origin"),
+            Some(PrefValue::Bool(true))
+        );
     }
 
     #[test]

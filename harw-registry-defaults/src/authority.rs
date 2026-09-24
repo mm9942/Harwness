@@ -11,7 +11,8 @@
 //!   Werkzeugs verlangt (belegt an den `#[harw_macros::tool(permission = …)]`-
 //!   bzw. `require_permission`-Stellen der Werkzeug-Crates).
 //! - [`AuthorityReducer`]: die Obergrenze, auf die ein Kind verengt wird —
-//!   `reduce_to_read_only`, `reduce_to_read_registry`, `reduce_to_read_network`.
+//!   `reduce_to_read_only`, `reduce_to_read_registry`, `reduce_to_read_network`,
+//!   `reduce_to_read_explore`, `reduce_to_read_workspace_network`.
 //! - [`authority_reducer_for_role`]: welche Obergrenze eine eingebaute Rolle
 //!   bekommt.
 //!
@@ -57,8 +58,12 @@
 //! assert!(!child.contains(Permission::WriteWorkspace));
 //! assert!(!child.contains(Permission::NetworkAccess));
 //! assert_eq!(
-//!     authority_reducer_for_role(role_names::EXPLORER),
+//!     authority_reducer_for_role(role_names::ANALYST),
 //!     Some(AuthorityReducer::ReadRegistry)
+//! );
+//! assert_eq!(
+//!     authority_reducer_for_role(role_names::EXPLORER),
+//!     Some(AuthorityReducer::ReadExplore)
 //! );
 //! ```
 
@@ -67,9 +72,12 @@ use harw_authority::{Permission, PermissionSet};
 use crate::profile::{
     AGENT_DEFINITION_LIST_TOOLS, AGENT_DEFINITION_READ_TOOLS, AGENT_DEFINITION_WRITE_TOOLS,
     BROWSER_TOOLS, DEPS_SOURCE_TOOLS, DEPS_WORKSPACE_TOOLS, DOC_TOOLS, EXPLORER_TOOLS,
-    FS_READ_ONLY_TOOLS,
-    LENS_TOOLS, SHELL_TOOLS, WEB_TOOLS, role_names,
+    FS_READ_ONLY_TOOLS, LENS_TOOLS, PROCESS_TOOLS, SHELL_TOOLS, WEB_TOOLS, role_names,
 };
+use crate::skill_proposal_tools::{
+    SKILL_PROPOSAL_DECIDE_TOOLS, SKILL_PROPOSAL_PROPOSE_TOOLS, SKILL_PROPOSAL_READ_TOOLS,
+};
+use crate::workbench_tools::WorkbenchToolProvider;
 
 /// Kennung des Reducers „nur Workspace lesen“.
 pub const REDUCE_TO_READ_ONLY: &str = "reduce_to_read_only";
@@ -77,6 +85,12 @@ pub const REDUCE_TO_READ_ONLY: &str = "reduce_to_read_only";
 pub const REDUCE_TO_READ_REGISTRY: &str = "reduce_to_read_registry";
 /// Kennung des Reducers „nur Netz, kein Workspace“.
 pub const REDUCE_TO_READ_NETWORK: &str = "reduce_to_read_network";
+/// Kennung des Reducers „Workspace, Registry-Quellcache und Netz lesen“
+/// (Explorer mit Websuche).
+pub const REDUCE_TO_READ_EXPLORE: &str = "reduce_to_read_explore";
+/// Kennung des Reducers „Workspace und Netz lesen“ (UIA-Explorer mit
+/// Websuche).
+pub const REDUCE_TO_READ_WORKSPACE_NETWORK: &str = "reduce_to_read_workspace_network";
 
 /// Die Rechte-Obergrenze, auf die ein Kind-Agent verengt wird.
 ///
@@ -91,10 +105,29 @@ pub const REDUCE_TO_READ_NETWORK: &str = "reduce_to_read_network";
 /// `ReadWorkspace` (Annahme A5): wer ins Netz darf, liest keine
 /// Workspace-Daten, die er hinaustragen könnte.
 ///
+/// **Ausnahme Explorer-Netz** (Nutzerentscheidungen „der Explorer durchsucht
+/// auch das Internet“ und „die UIA-Helfer recherchieren kurz online und
+/// fügen manchmal Abhängigkeiten hinzu“): `ReadExplore` und
+/// `ReadWorkspaceNetwork` tragen `NetworkAccess` gemeinsam mit
+/// `ReadWorkspace` — ausschließlich für die Rollen, deren TOML
+/// `web.fetch`/`web.search` admittiert und die das per
+/// [`authority_reducer_for_role`] zugewiesen bekommen (`explorer`,
+/// `uia-worker`, `uia-writer` → `ReadExplore`; `uia-explorer` →
+/// `ReadWorkspaceNetwork`). Der Host-Scope des Kindes bleibt dabei an die
+/// Egress-Policy gebunden: die Sandbox-Hälfte in `harw-core-bridge` reicht nur
+/// den (egress-gebundenen) Scope des Elternteils als Obergrenze durch, genau
+/// wie bei `ReadNetwork` (`researcher-web`); ein über den Handoff gestartetes
+/// Kind erbt Sandbox und Host-Scope des Elternteils unverändert
+/// (`ensure_child_of`), nie mehr. `ReadRegistry` (`analyst`,
+/// `researcher-deps`, `planner` …) und `ReadOnly` (Triage-Rollen …) bleiben
+/// ohne Netz.
+///
 /// # Varianten
 /// - `ReadOnly` — `{ReadWorkspace}`.
 /// - `ReadRegistry` — `{ReadWorkspace, ReadCargoRegistry}`.
 /// - `ReadNetwork` — `{NetworkAccess}`.
+/// - `ReadExplore` — `{ReadWorkspace, ReadCargoRegistry, NetworkAccess}`.
+/// - `ReadWorkspaceNetwork` — `{ReadWorkspace, NetworkAccess}`.
 ///
 /// # Nebenläufigkeit
 /// `Copy`, rein; von jedem Thread aus sicher.
@@ -117,6 +150,12 @@ pub enum AuthorityReducer {
     ReadRegistry,
     /// Nur ausgehendes Netz über die Egress-Policy; kein Workspace.
     ReadNetwork,
+    /// Workspace und Registry-Quellcache lesen plus ausgehendes Netz über die
+    /// Egress-Policy (`explorer`, `uia-worker`, `uia-writer`).
+    ReadExplore,
+    /// Workspace lesen plus ausgehendes Netz über die Egress-Policy
+    /// (`uia-explorer`, `dependency-researcher`, `researcher`).
+    ReadWorkspaceNetwork,
 }
 
 impl AuthorityReducer {
@@ -125,19 +164,24 @@ impl AuthorityReducer {
         AuthorityReducer::ReadOnly,
         AuthorityReducer::ReadRegistry,
         AuthorityReducer::ReadNetwork,
+        AuthorityReducer::ReadExplore,
+        AuthorityReducer::ReadWorkspaceNetwork,
     ];
 
     /// Liefert die Kennung, unter der `harw-core-bridge` denselben Reducer führt.
     ///
     /// # Rückgabe
-    /// [`REDUCE_TO_READ_ONLY`], [`REDUCE_TO_READ_REGISTRY`] oder
-    /// [`REDUCE_TO_READ_NETWORK`].
+    /// [`REDUCE_TO_READ_ONLY`], [`REDUCE_TO_READ_REGISTRY`],
+    /// [`REDUCE_TO_READ_NETWORK`], [`REDUCE_TO_READ_EXPLORE`] oder
+    /// [`REDUCE_TO_READ_WORKSPACE_NETWORK`].
     #[must_use]
     pub const fn id(self) -> &'static str {
         match self {
             AuthorityReducer::ReadOnly => REDUCE_TO_READ_ONLY,
             AuthorityReducer::ReadRegistry => REDUCE_TO_READ_REGISTRY,
             AuthorityReducer::ReadNetwork => REDUCE_TO_READ_NETWORK,
+            AuthorityReducer::ReadExplore => REDUCE_TO_READ_EXPLORE,
+            AuthorityReducer::ReadWorkspaceNetwork => REDUCE_TO_READ_WORKSPACE_NETWORK,
         }
     }
 
@@ -155,6 +199,14 @@ impl AuthorityReducer {
             ]),
             AuthorityReducer::ReadNetwork => {
                 PermissionSet::from_policy([Permission::NetworkAccess])
+            }
+            AuthorityReducer::ReadExplore => PermissionSet::from_policy([
+                Permission::ReadWorkspace,
+                Permission::ReadCargoRegistry,
+                Permission::NetworkAccess,
+            ]),
+            AuthorityReducer::ReadWorkspaceNetwork => {
+                PermissionSet::from_policy([Permission::ReadWorkspace, Permission::NetworkAccess])
             }
         }
     }
@@ -190,7 +242,7 @@ pub fn reduce_to_read_only(granted: &PermissionSet) -> PermissionSet {
 }
 
 /// Verengt `granted` auf `{ReadWorkspace, ReadCargoRegistry}` — der Reducer für
-/// `explorer`, `analyst`, `researcher-deps` (und `planner`).
+/// `analyst`, `researcher-deps` (und `planner`); bewusst ohne Netz.
 ///
 /// # Argumente
 /// - `granted` (`&PermissionSet`): Rechte des Elternteils.
@@ -215,13 +267,51 @@ pub fn reduce_to_read_network(granted: &PermissionSet) -> PermissionSet {
     AuthorityReducer::ReadNetwork.reduce(granted)
 }
 
+/// Verengt `granted` auf `{ReadWorkspace, ReadCargoRegistry, NetworkAccess}` —
+/// der Reducer für `explorer` (Workspace, Dependency-Quellen und Websuche)
+/// sowie für den weitergebbaren Lese-/Netzanteil von `uia-worker` und
+/// `uia-writer`.
+///
+/// # Argumente
+/// - `granted` (`&PermissionSet`): Rechte des Elternteils.
+///
+/// # Rückgabe
+/// `granted ∩ {ReadWorkspace, ReadCargoRegistry, NetworkAccess}`;
+/// `NetworkAccess` bleibt nur, wenn der Elternteil es selbst trägt.
+#[must_use]
+pub fn reduce_to_read_explore(granted: &PermissionSet) -> PermissionSet {
+    AuthorityReducer::ReadExplore.reduce(granted)
+}
+
+/// Verengt `granted` auf `{ReadWorkspace, NetworkAccess}` — der Reducer für
+/// `uia-explorer` (Workspace und Websuche, kein Registry-Quellcache).
+///
+/// # Argumente
+/// - `granted` (`&PermissionSet`): Rechte des Elternteils.
+///
+/// # Rückgabe
+/// `granted ∩ {ReadWorkspace, NetworkAccess}`.
+#[must_use]
+pub fn reduce_to_read_workspace_network(granted: &PermissionSet) -> PermissionSet {
+    AuthorityReducer::ReadWorkspaceNetwork.reduce(granted)
+}
+
 /// Liefert den Reducer, den eine eingebaute Rolle bekommt.
 ///
 /// # Beschreibung
-/// - `explorer`, `analyst`, `researcher-deps`, `planner` →
+/// - `explorer` → [`AuthorityReducer::ReadExplore`]: sein Profil
+///   `ReadOnlyExplore` registriert `deps.source_*` (`ReadCargoRegistry`) und
+///   seine TOML admittiert `web.fetch`/`web.search` (`NetworkAccess`).
+/// - `analyst`, `researcher-deps`, `planner` →
 ///   [`AuthorityReducer::ReadRegistry`]: ihre Profile registrieren
-///   `deps.source_*`, deren Prolog `ReadCargoRegistry` verlangt.
+///   `deps.source_*`, deren Prolog `ReadCargoRegistry` verlangt; ihre TOML
+///   verbietet `web.*`, sie bekommen deshalb kein Netz.
 /// - `researcher-web` → [`AuthorityReducer::ReadNetwork`].
+/// - `dependency-researcher`, `researcher` →
+///   [`AuthorityReducer::ReadWorkspaceNetwork`] (Profil `ReadOnlyResearch`:
+///   `fs.read/list/search/glob/grep`, `doc.read_pdf`, `explore.*`,
+///   `web.fetch`/`web.search` — die Obergrenze trägt genau `ReadWorkspace`
+///   und `NetworkAccess`, kein `ReadCargoRegistry`).
 /// - die vier `security-*-triage`-Rollen → [`AuthorityReducer::ReadOnly`]
 ///   (Profil `NoTools`, sie brauchen gar kein Recht; `ReadOnly` ist die engste
 ///   Kennung des Vokabulars).
@@ -229,25 +319,26 @@ pub fn reduce_to_read_network(granted: &PermissionSet) -> PermissionSet {
 ///   `MemoryStewardship`; nächstliegender Reducer gleicher Lese-Reichweite).
 /// - `executor` → [`AuthorityReducer::ReadOnly`] (Profil `ShellExecution`;
 ///   engste Kennung des Vokabulars, analog den Triage-Rollen).
-/// - `uia-worker` → [`AuthorityReducer::ReadOnly`] (Profil
-///   `UiaQuickHelper`, Addendum I; **Muster `executor`**, dieselbe
-///   Ausnahme — die Rolle registriert `shell.exec`/`web.fetch`, kein
-///   Reducer trägt je `ExecuteProcess` oder `NetworkAccess` gemeinsam mit
-///   `ReadWorkspace` weiter, siehe die Ausnahme-Begründung unten).
+/// - `uia-worker` → [`AuthorityReducer::ReadExplore`] (Profil
+///   `UiaQuickHelper`, Addendum I + Nutzerentscheidung „kurz online
+///   recherchieren, manchmal Abhängigkeiten hinzufügen“): die Obergrenze
+///   trägt den Workspace-Lesezugriff, den Registry-Quellcache für
+///   `deps.source_*` und `NetworkAccess` für `web.fetch`/`web.search`/
+///   `browser.open`. `shell.exec` (`ExecuteProcess`) bleibt die
+///   dokumentierte **Ausnahme nach Muster `executor`**, siehe unten.
 /// - `agent-steward` → [`AuthorityReducer::ReadOnly`] (Profil
 ///   `AgentStewardship`, Addendum K; ebenfalls **Muster `executor`** — die
 ///   Rolle registriert die schreibenden Agentendefinitions-Werkzeuge, kein
 ///   Reducer trägt je `WriteWorkspace` weiter).
-/// - `uia-explorer` → [`AuthorityReducer::ReadOnly`] (Profil
-///   `UiaExplorer`; **Muster `uia-worker`**, dieselbe Ausnahme — die Rolle
-///   registriert `fs.read/list/search/glob/grep` **und** `web.fetch`, kein
-///   Reducer trägt je `NetworkAccess` gemeinsam mit `ReadWorkspace` weiter,
-///   siehe die Ausnahme-Begründung unten).
-/// - `uia-writer` → [`AuthorityReducer::ReadOnly`] (Profil `UiaWriter`;
-///   ebenfalls **Muster `uia-worker`** — die Rolle registriert zusätzlich zu
-///   `fs.write` (`WriteWorkspace`) auch `web.fetch` (`NetworkAccess`), kein
-///   Reducer trägt je `WriteWorkspace` oder `NetworkAccess` gemeinsam mit
-///   `ReadWorkspace` weiter).
+/// - `uia-explorer` → [`AuthorityReducer::ReadWorkspaceNetwork`] (Profil
+///   `UiaExplorer`: `fs.read/list/search/glob/grep`, `doc.read_pdf`,
+///   `explore.*` und `web.fetch`/`web.search` — die Obergrenze trägt genau
+///   `ReadWorkspace` und `NetworkAccess`).
+/// - `uia-writer` → [`AuthorityReducer::ReadExplore`] (Profil `UiaWriter`;
+///   dieselbe Nutzerentscheidung wie `uia-worker`): Workspace lesen,
+///   `deps.*` inklusive `deps.source_*` und `web.fetch`/`web.search`.
+///   `fs.write` (`WriteWorkspace`) bleibt die dokumentierte **Ausnahme nach
+///   Muster `executor`**, siehe unten.
 /// - `uia-shell-worker` → [`AuthorityReducer::ReadOnly`] (Profil
 ///   `UiaShellWorker`; **Muster `uia-worker`**, dieselbe Ausnahme — die
 ///   Rolle registriert `fs.read/list/search/glob/grep` **und** `shell.exec`,
@@ -256,27 +347,35 @@ pub fn reduce_to_read_network(granted: &PermissionSet) -> PermissionSet {
 ///
 /// Invariante (Test): Für jede eingebaute Rolle gilt
 /// `profile.required_permissions() ⊆ reducer.ceiling()` — keine Rolle bewirbt
-/// ein Werkzeug, das ihre Obergrenze nie tragen kann. **Ausnahme:**
+/// ein Werkzeug, das ihre Obergrenze nie tragen kann. **Teilausnahme
+/// Explorer-Netz:** `ReadOnlyExplore` wird auch von `analyst` und
+/// `researcher-deps` genutzt und registriert `web.fetch`/`web.search`
+/// (`crate::profile::EXPLORER_WEB_TOOLS`); beide Rollen verbieten sie in ihrer
+/// TOML und bekommen mit `ReadRegistry` bewusst kein `NetworkAccess` — für
+/// sie gilt die Invariante ohne genau diese zwei Werkzeuge. `explorer`
+/// (`ReadExplore`) und `uia-explorer` (`ReadWorkspaceNetwork`) erfüllen sie
+/// vollständig; `uia-worker`/`uia-writer` (`ReadExplore`) bis auf ihr eines
+/// Schreib- bzw. Ausführungsrecht. **Ausnahme:**
 /// `memory-steward` (braucht `WriteWorkspace` für `fs.write`), `executor`
 /// (braucht `ExecuteProcess` für `shell.exec`), `uia-worker` (braucht
-/// zusätzlich zu `ReadWorkspace` auch `ExecuteProcess` für `shell.exec` und
-/// `NetworkAccess` für `web.fetch`), `agent-steward` (Addendum K, braucht
+/// über `ReadExplore` hinaus nur noch `ExecuteProcess` für `shell.exec`),
+/// `agent-steward` (Addendum K, braucht
 /// `WriteWorkspace` für `agents.write_definition`/`agents.write_uia`/
-/// `agents.commit_proposal`/`agents.reject_proposal`), `uia-explorer`
-/// (braucht zusätzlich zu `ReadWorkspace` auch `NetworkAccess` für
-/// `web.fetch`), `uia-writer` (braucht zusätzlich zu `ReadWorkspace` auch
-/// `WriteWorkspace` für `fs.write` und `NetworkAccess` für `web.fetch`) und
-/// `uia-shell-worker` (braucht zusätzlich zu `ReadWorkspace` auch
-/// `ExecuteProcess` für `shell.exec`) — kein Reducer trägt je
-/// `WriteWorkspace`, `ExecuteProcess` oder `NetworkAccess` gemeinsam mit
-/// `ReadWorkspace` (siehe `test_reduce_never_exceeds_parent_or_ceiling`, das
-/// ist Absicht: Delegation gibt nie Schreib-/Ausführungsrecht weiter und
-/// `ReadNetwork` schließt `ReadWorkspace` bewusst aus, Annahme A5). Alle
-/// sieben Rollen erhalten diese Rechte nicht über diesen
-/// Reducer-Mechanismus, sondern über ihre feste Profilzuweisung bei der
-/// Registry-Montage ([`crate::profile::assemble_registry_for_sandbox`]); der
-/// hier vergebene Reducer bindet nur die verbleibende, weitergebbare
-/// Lese-/Netz-Autorität.
+/// `agents.commit_proposal`/`agents.reject_proposal`), `uia-writer` (braucht
+/// über `ReadExplore` hinaus nur noch `WriteWorkspace` für `fs.write`) und
+/// `uia-shell-worker` (braucht
+/// zusätzlich zu `ReadWorkspace` auch `ExecuteProcess` für `shell.exec`) —
+/// kein Reducer trägt je `WriteWorkspace` oder `ExecuteProcess` weiter
+/// (siehe `test_reduce_never_exceeds_parent_or_ceiling`, das ist Absicht:
+/// Delegation gibt nie Schreib-/Ausführungsrecht weiter), und
+/// `NetworkAccess` gemeinsam mit `ReadWorkspace` tragen nur `ReadExplore`
+/// und `ReadWorkspaceNetwork` (siehe
+/// `test_only_web_admitting_roles_get_network_access`). Diese sechs Rollen
+/// erhalten die fehlenden Rechte nicht über diesen Reducer-Mechanismus,
+/// sondern über ihre feste Profilzuweisung bei der Registry-Montage
+/// ([`crate::profile::assemble_registry_for_sandbox`]); der hier vergebene
+/// Reducer bindet nur die verbleibende, weitergebbare Lese- und
+/// (bei `ReadExplore`) egress-gebundene Netz-Autorität.
 ///
 /// # Argumente
 /// - `role` (`&str`): Rollenname, üblicherweise aus [`role_names`].
@@ -290,35 +389,60 @@ pub fn reduce_to_read_network(granted: &PermissionSet) -> PermissionSet {
 pub fn authority_reducer_for_role(role: &str) -> Option<AuthorityReducer> {
     match role {
         role_names::ROOT_ORCHESTRATOR => Some(AuthorityReducer::ReadRegistry),
-        role_names::EXPLORER
-        | role_names::ANALYST
-        | role_names::RESEARCHER_DEPS
-        | role_names::PLANNER => Some(AuthorityReducer::ReadRegistry),
+        // Child-Orchestratoren (Plan Punkt 1) teilen das Profil `Planning`
+        // des Root-Orchestrators: read-only, `deps.source_*` braucht
+        // `ReadCargoRegistry`, kein eigenes `web.*`.
+        role_names::CODING_ORCHESTRATOR | role_names::ANALYSIS_ORCHESTRATOR => {
+            Some(AuthorityReducer::ReadRegistry)
+        }
+        // Dokumentierte Durchreichung: `research-orchestrator` startet
+        // `researcher-web`/`researcher`/`dependency-researcher`, deren Sandbox
+        // stets eine Teilmenge SEINER Sandbox ist. Ohne `NetworkAccess` im
+        // eigenen Satz bekämen seine Netz-Rechercheure nie Netz. Er selbst
+        // registriert kein Netz-Werkzeug (`Planning`) und verbietet `web.*` in
+        // seiner TOML — das Recht ist reine, egress-gebundene Durchreichung
+        // (`test_research_orchestrator_passes_network_through_without_web_tools`).
+        role_names::RESEARCH_ORCHESTRATOR => Some(AuthorityReducer::ReadExplore),
+        // Explorer-Netz: die TOML admittiert `web.fetch`/`web.search`.
+        role_names::EXPLORER => Some(AuthorityReducer::ReadExplore),
+        role_names::ANALYST | role_names::RESEARCHER_DEPS | role_names::PLANNER => {
+            Some(AuthorityReducer::ReadRegistry)
+        }
         role_names::RESEARCHER_WEB => Some(AuthorityReducer::ReadNetwork),
+        // Ökosystem-neutrale bzw. allgemeine Recherche
+        // (`RegistryProfile::ReadOnlyResearch`): Workspace-Dokumente lesen
+        // plus egress-gebundenes Netz, kein Registry-Quellcache (die Rollen
+        // registrieren kein `deps.*`) — trägt ihr ganzes Profil.
+        role_names::DEPENDENCY_RESEARCHER | role_names::RESEARCHER => {
+            Some(AuthorityReducer::ReadWorkspaceNetwork)
+        }
         role_names::SECURITY_EGRESS_TRIAGE
         | role_names::SECURITY_BASELINE_TRIAGE
         | role_names::SECURITY_STRUCTURE_TRIAGE
         | role_names::SECURITY_ENDPOINT_TRIAGE
         | role_names::EXECUTOR => Some(AuthorityReducer::ReadOnly),
         role_names::MEMORY_STEWARD => Some(AuthorityReducer::ReadRegistry),
-        // Addendum I: dokumentierte Ausnahme nach dem Muster `executor` —
-        // `UiaQuickHelper` registriert `shell.exec`/`web.fetch`, die kein
-        // Reducer je zusammen mit `ReadWorkspace` weiterträgt.
-        role_names::UIA_WORKER => Some(AuthorityReducer::ReadOnly),
+        // Nutzerentscheidung „kurz online recherchieren, manchmal
+        // Abhängigkeiten hinzufügen“: `UiaQuickHelper` registriert
+        // `deps.*` und `web.fetch`/`web.search`, die TOML admittiert sie —
+        // Netz nur egress-gebunden und nie weiter als beim Elternteil.
+        // `shell.exec` bleibt die dokumentierte Ausnahme nach dem Muster
+        // `executor` (Addendum I): kein Reducer trägt `ExecuteProcess`.
+        role_names::UIA_WORKER => Some(AuthorityReducer::ReadExplore),
         // Addendum K: dokumentierte Ausnahme nach dem Muster `executor`/
         // `uia-worker` — `AgentStewardship` registriert die schreibenden
         // Agentendefinitions-Werkzeuge (`WriteWorkspace`), die kein Reducer
         // je zusammen mit `ReadWorkspace` weiterträgt.
         role_names::AGENT_STEWARD => Some(AuthorityReducer::ReadOnly),
-        // Muster `uia-worker`: `UiaExplorer` registriert
-        // `fs.read/list/search/glob/grep` **und** `web.fetch`, kein Reducer
-        // trägt je `NetworkAccess` zusammen mit `ReadWorkspace` weiter.
-        role_names::UIA_EXPLORER => Some(AuthorityReducer::ReadOnly),
-        // Muster `uia-worker`: `UiaWriter` registriert zusätzlich `fs.write`
-        // (`WriteWorkspace`) neben `web.fetch` (`NetworkAccess`), kein
-        // Reducer trägt je `WriteWorkspace` oder `NetworkAccess` zusammen
-        // mit `ReadWorkspace` weiter.
-        role_names::UIA_WRITER => Some(AuthorityReducer::ReadOnly),
+        // Explorer-Netz: `UiaExplorer` registriert
+        // `fs.read/list/search/glob/grep`, `explore.*` **und**
+        // `web.fetch`/`web.search`, die TOML admittiert beide.
+        role_names::UIA_EXPLORER => Some(AuthorityReducer::ReadWorkspaceNetwork),
+        // Dieselbe Nutzerentscheidung wie `uia-worker`: `UiaWriter`
+        // registriert `deps.*` und `web.fetch`/`web.search`. `fs.write`
+        // bleibt die dokumentierte Ausnahme nach dem Muster `executor`:
+        // kein Reducer trägt `WriteWorkspace`.
+        role_names::UIA_WRITER => Some(AuthorityReducer::ReadExplore),
         // Muster `uia-worker`: `UiaShellWorker` registriert
         // `fs.read/list/search/glob/grep` **und** `shell.exec`, kein
         // Reducer trägt je `ExecuteProcess` zusammen mit `ReadWorkspace`
@@ -326,6 +450,87 @@ pub fn authority_reducer_for_role(role: &str) -> Option<AuthorityReducer> {
         role_names::UIA_SHELL_WORKER => Some(AuthorityReducer::ReadOnly),
         _ => None,
     }
+}
+
+/// Liefert die in `[delegation].targets` einer eingebauten Agentendefinition
+/// zugelassenen Delegationsziele (Plan Punkt 1, `delegate_wave`).
+///
+/// # Beschreibung
+/// Die Liste ist eine **zusätzliche** Schnittmenge zur Laufzeit-Sichtbarkeit
+/// (`harw_core::delegation_visibility`, `docs/design/
+/// delegation-capabilities.md`: „DefinitionDeclaredTargets ∩
+/// RoleMatrixTargets ∩ …“) — sie erweitert nie, sie verengt nur. Gelesen wird
+/// ausschließlich die eingebaute Schicht (`agents/**/*.toml`, über
+/// [`crate::embedded_agents::builtin_agent_toml`]); das Ergebnis wird einmal
+/// pro Prozess gecacht.
+///
+/// # Argumente
+/// - `role` (`&str`): Rollenname der delegierenden Sitzung.
+///
+/// # Rückgabe
+/// `Some(targets)`, wenn die eingebaute Definition von `role` eine
+/// `[delegation]`-Tabelle mit `targets` trägt (auch eine leere Liste — dann
+/// ist KEIN Ziel zugelassen); `None`, wenn es keine eingebaute Definition oder
+/// keine solche Tabelle gibt. Ein Aufrufer, der daraus eine Admission ableitet,
+/// behandelt `None` fail-closed (kein Ziel).
+///
+/// # Fehler
+/// Keine: eine Definition, die nicht parst, trägt schlicht keine Liste — die
+/// Parse-Prüfung selbst gehört `builtin_agent_definitions`.
+///
+/// # Nebenläufigkeit
+/// Die Tabelle entsteht höchstens einmal (`OnceLock`); danach reine Lesesicht.
+///
+/// # Beispiele
+/// ```rust
+/// use harw_registry_defaults::authority::delegation_targets_for_role;
+/// use harw_registry_defaults::profile::role_names;
+///
+/// let targets = delegation_targets_for_role(role_names::CODING_ORCHESTRATOR)
+///     .unwrap_or_default();
+/// assert!(targets.iter().any(|target| target == role_names::EXECUTOR));
+/// assert!(delegation_targets_for_role(role_names::EXPLORER).is_none());
+/// ```
+#[must_use]
+pub fn delegation_targets_for_role(role: &str) -> Option<Vec<String>> {
+    builtin_delegation_targets().get(role).cloned()
+}
+
+/// Die gecachte Tabelle `Rolle → [delegation].targets` der eingebauten Schicht.
+fn builtin_delegation_targets() -> &'static std::collections::HashMap<String, Vec<String>> {
+    static TABLE: std::sync::OnceLock<std::collections::HashMap<String, Vec<String>>> =
+        std::sync::OnceLock::new();
+    TABLE.get_or_init(|| {
+        let mut table = std::collections::HashMap::new();
+        for (name, source) in crate::embedded_agents::builtin_agent_toml() {
+            let Ok(raw) = harw_agent_dsl::parse::parse_toml(source) else {
+                continue;
+            };
+            if let Some(targets) = delegation_targets_of(&raw.tables) {
+                table.insert((*name).to_owned(), targets);
+            }
+        }
+        table
+    })
+}
+
+/// Liest `[delegation].targets` aus den freien Tabellen einer Definition.
+///
+/// # Rückgabe
+/// `Some(liste)` nur, wenn `targets` ein Array ist; Nicht-String-Einträge
+/// werden verworfen (sie können kein Rollenname sein).
+fn delegation_targets_of(tables: &toml::Table) -> Option<Vec<String>> {
+    let targets = tables
+        .get("delegation")?
+        .as_table()?
+        .get("targets")?
+        .as_array()?;
+    Some(
+        targets
+            .iter()
+            .filter_map(|value| value.as_str().map(str::to_owned))
+            .collect(),
+    )
 }
 
 /// Liefert das Recht, das der Prolog eines eingebauten Werkzeugs verlangt.
@@ -349,6 +554,19 @@ pub fn authority_reducer_for_role(role: &str) -> Option<AuthorityReducer> {
 ///   `agents.write_definition`, `agents.write_uia`, `agents.commit_proposal`,
 ///   `agents.reject_proposal` → `WriteWorkspace` (Addendum K + Nachtrag K/K2,
 ///   `crate::agent_definition_tools::AgentDefinitionToolProvider`, K-C).
+/// - `skills.validate`, `skills.list_proposals` → `ReadWorkspace`;
+///   `skills.propose`, `skills.commit_proposal`, `skills.reject_proposal` →
+///   `WriteWorkspace` (`crate::skill_proposal_tools::SkillProposalToolProvider`).
+/// - `workbench.note`, `workbench.hypothesis` → `ReadWorkspace`
+///   (`crate::workbench_tools::WorkbenchToolProvider::TOOL_PERMISSIONS`).
+/// - `delegate_wave` (und die übrigen Operationen der Composition-Root wie
+///   `plan`/`goal`/`explore`) → `None`: keine Provider-Werkzeuge, sondern
+///   `harw-ops`-/`harw-core-bridge`-Operationen mit eigenem
+///   `PermissionTier`; ihre Zulassung regelt
+///   [`crate::profile::composition_tools_for_role`] bzw. die
+///   Operations-Registry, nicht dieser Rechtefilter. Jedes von
+///   `delegate_wave` gestartete Kind bekommt seine Rechte über den
+///   [`AuthorityReducer`] seiner eigenen Rolle.
 ///
 /// Die Deps- und Lens-Zuordnung prüft ein Test zusätzlich gegen die
 /// `TOOL_PERMISSIONS`-Konstanten der Provider (andere Quelle als diese Tabelle).
@@ -372,9 +590,13 @@ pub fn authority_reducer_for_role(role: &str) -> Option<AuthorityReducer> {
 #[must_use]
 pub fn tool_permission(tool: &str) -> Option<Permission> {
     let listed = |list: &[&str]| list.contains(&tool);
-    if tool == "fs.write" || listed(AGENT_DEFINITION_WRITE_TOOLS) {
+    if tool == "fs.write"
+        || listed(AGENT_DEFINITION_WRITE_TOOLS)
+        || listed(SKILL_PROPOSAL_PROPOSE_TOOLS)
+        || listed(SKILL_PROPOSAL_DECIDE_TOOLS)
+    {
         Some(Permission::WriteWorkspace)
-    } else if listed(SHELL_TOOLS) {
+    } else if listed(SHELL_TOOLS) || listed(PROCESS_TOOLS) {
         Some(Permission::ExecuteProcess)
     } else if listed(FS_READ_ONLY_TOOLS)
         || listed(DOC_TOOLS)
@@ -383,6 +605,8 @@ pub fn tool_permission(tool: &str) -> Option<Permission> {
         || listed(LENS_TOOLS)
         || listed(AGENT_DEFINITION_READ_TOOLS)
         || listed(AGENT_DEFINITION_LIST_TOOLS)
+        || listed(SKILL_PROPOSAL_READ_TOOLS)
+        || listed(WorkbenchToolProvider::TOOL_NAMES)
     {
         Some(Permission::ReadWorkspace)
     } else if listed(DEPS_SOURCE_TOOLS) {
@@ -404,7 +628,7 @@ pub(crate) fn permissions_of(tools: &[&str]) -> PermissionSet {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::profile::RegistryProfile;
+    use crate::profile::{EXPLORER_WEB_TOOLS, RegistryProfile};
 
     fn every_permission() -> PermissionSet {
         PermissionSet::from_policy([
@@ -422,6 +646,16 @@ mod tests {
     fn test_tool_permission_matches_deps_provider_declarations() {
         let names = harw_tool_deps::DepsToolProvider::TOOL_NAMES;
         let declared = harw_tool_deps::DepsToolProvider::TOOL_PERMISSIONS;
+        assert_eq!(names.len(), declared.len());
+        for (name, permission) in names.iter().zip(declared.iter()) {
+            assert_eq!(tool_permission(name), *permission, "{name}");
+        }
+    }
+
+    #[test]
+    fn test_tool_permission_matches_process_provider_declarations() {
+        let names = harw_tool_process::ProcessToolProvider::TOOL_NAMES;
+        let declared = harw_tool_process::ProcessToolProvider::TOOL_PERMISSIONS;
         assert_eq!(names.len(), declared.len());
         for (name, permission) in names.iter().zip(declared.iter()) {
             assert_eq!(tool_permission(name), *permission, "{name}");
@@ -459,6 +693,38 @@ mod tests {
             Some(Permission::ExecuteProcess)
         );
         assert_eq!(tool_permission("plan"), None);
+        assert_eq!(tool_permission("delegate_wave"), None);
+    }
+
+    #[test]
+    fn test_tool_permission_matches_workbench_provider_declarations() {
+        let names = WorkbenchToolProvider::TOOL_NAMES;
+        let declared = WorkbenchToolProvider::TOOL_PERMISSIONS;
+        assert_eq!(names.len(), declared.len());
+        for (name, permission) in names.iter().zip(declared.iter()) {
+            assert_eq!(tool_permission(name), *permission, "{name}");
+        }
+    }
+
+    #[test]
+    fn test_tool_permission_covers_every_skill_proposal_tool() {
+        for tool in SKILL_PROPOSAL_READ_TOOLS {
+            assert_eq!(
+                tool_permission(tool),
+                Some(Permission::ReadWorkspace),
+                "{tool}"
+            );
+        }
+        for tool in SKILL_PROPOSAL_PROPOSE_TOOLS
+            .iter()
+            .chain(SKILL_PROPOSAL_DECIDE_TOOLS.iter())
+        {
+            assert_eq!(
+                tool_permission(tool),
+                Some(Permission::WriteWorkspace),
+                "{tool}"
+            );
+        }
     }
 
     #[test]
@@ -504,6 +770,139 @@ mod tests {
     }
 
     #[test]
+    fn test_reduce_to_read_explore_carries_network_only_if_parent_has_it() {
+        let without =
+            PermissionSet::from_policy([Permission::ReadWorkspace, Permission::ReadCargoRegistry]);
+        assert!(!reduce_to_read_explore(&without).contains(Permission::NetworkAccess));
+        let reduced = reduce_to_read_explore(&every_permission());
+        assert_eq!(
+            reduced,
+            PermissionSet::from_policy([
+                Permission::ReadWorkspace,
+                Permission::ReadCargoRegistry,
+                Permission::NetworkAccess,
+            ])
+        );
+    }
+
+    #[test]
+    fn test_reduce_to_read_workspace_network_has_no_registry() {
+        let reduced = reduce_to_read_workspace_network(&every_permission());
+        assert_eq!(
+            reduced,
+            PermissionSet::from_policy([Permission::ReadWorkspace, Permission::NetworkAccess])
+        );
+        assert!(!reduced.contains(Permission::ReadCargoRegistry));
+    }
+
+    #[test]
+    fn test_only_web_admitting_roles_get_network_access() {
+        // Sicherheitsmatrix Netz: `NetworkAccess` bekommen über den Reducer
+        // genau die Rollen, deren TOML `web.*` admittiert und die dafür
+        // freigegeben sind (seit der Nutzerentscheidung auch `uia-worker`
+        // und `uia-writer`). `analyst`/`researcher-deps` teilen das Profil
+        // des Explorers, verbieten `web.*` aber und bleiben ohne Netz;
+        // `planner`, `root-orchestrator`, die Triage-Rollen, `executor`,
+        // `memory-steward`, `agent-steward` und `uia-shell-worker` ebenso.
+        let networked = [
+            role_names::EXPLORER,
+            role_names::UIA_EXPLORER,
+            role_names::UIA_WORKER,
+            role_names::UIA_WRITER,
+            role_names::RESEARCHER_WEB,
+            role_names::DEPENDENCY_RESEARCHER,
+            role_names::RESEARCHER,
+            // Dokumentierte Durchreichung (Plan Punkt 1): kein eigenes
+            // `web.*`, siehe
+            // `test_research_orchestrator_passes_network_through_without_web_tools`.
+            role_names::RESEARCH_ORCHESTRATOR,
+        ];
+        for role in role_names::ALL {
+            let carries_network = authority_reducer_for_role(role)
+                .is_some_and(|reducer| reducer.ceiling().contains(Permission::NetworkAccess));
+            assert_eq!(
+                carries_network,
+                networked.contains(role),
+                "{role}: Netzrecht über den Reducer entgegen der Sicherheitsmatrix"
+            );
+        }
+        for role in [
+            role_names::ANALYST,
+            role_names::RESEARCHER_DEPS,
+            role_names::PLANNER,
+        ] {
+            assert_eq!(
+                authority_reducer_for_role(role),
+                Some(AuthorityReducer::ReadRegistry),
+                "{role}"
+            );
+        }
+        for role in [
+            role_names::SECURITY_EGRESS_TRIAGE,
+            role_names::SECURITY_BASELINE_TRIAGE,
+            role_names::SECURITY_STRUCTURE_TRIAGE,
+            role_names::SECURITY_ENDPOINT_TRIAGE,
+        ] {
+            assert_eq!(
+                authority_reducer_for_role(role),
+                Some(AuthorityReducer::ReadOnly),
+                "{role}"
+            );
+        }
+        // Netz zusammen mit Workspace-Lesen tragen nur die zwei
+        // Explorer-Reducer; `ReadNetwork` schließt den Workspace weiter aus.
+        for reducer in AuthorityReducer::ALL {
+            let ceiling = reducer.ceiling();
+            let both = ceiling.contains(Permission::NetworkAccess)
+                && ceiling.contains(Permission::ReadWorkspace);
+            assert_eq!(
+                both,
+                matches!(
+                    reducer,
+                    AuthorityReducer::ReadExplore | AuthorityReducer::ReadWorkspaceNetwork
+                ),
+                "{reducer:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_uia_helpers_exceed_their_reducer_only_by_their_one_gated_permission()
+    -> crate::test_support::TestResult {
+        // `uia-worker`/`uia-writer` bleiben Ausnahmen von der
+        // Untermengen-Invariante — aber nur um genau ein Recht, das kein
+        // Reducer je weiterträgt (`ExecuteProcess` bzw. `WriteWorkspace`).
+        // Netz (`web.fetch`/`web.search`/`browser.open`) und
+        // Registry-Quellcache (`deps.source_*`) deckt `ReadExplore` ab.
+        for (role, gated) in [
+            (role_names::UIA_WORKER, Permission::ExecuteProcess),
+            (role_names::UIA_WRITER, Permission::WriteWorkspace),
+        ] {
+            let reducer = authority_reducer_for_role(role).ok_or(
+                crate::test_support::TestError::Unexpected(format!("{role} ohne Reducer")),
+            )?;
+            assert_eq!(reducer, AuthorityReducer::ReadExplore, "{role}");
+            let profile = crate::profile::profile_for_role(role).ok_or(
+                crate::test_support::TestError::Unexpected(format!("{role} ohne Profil")),
+            )?;
+            let required = profile.required_permissions();
+            assert!(required.contains(gated), "{role}: {gated:?}");
+            let rest = PermissionSet::from_policy(
+                required.iter().filter(|permission| *permission != gated),
+            );
+            assert!(
+                rest.is_subset_of(&reducer.ceiling()),
+                "{role}: {profile:?} braucht über {gated:?} hinaus mehr als {reducer:?}"
+            );
+            assert!(
+                reducer.ceiling().contains(Permission::NetworkAccess),
+                "{role}"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
     fn test_reduce_to_read_only_is_read_workspace_at_most() {
         let reduced = reduce_to_read_only(&every_permission());
         assert_eq!(
@@ -517,28 +916,38 @@ mod tests {
         assert_eq!(AuthorityReducer::ReadOnly.id(), REDUCE_TO_READ_ONLY);
         assert_eq!(AuthorityReducer::ReadRegistry.id(), REDUCE_TO_READ_REGISTRY);
         assert_eq!(AuthorityReducer::ReadNetwork.id(), REDUCE_TO_READ_NETWORK);
+        assert_eq!(AuthorityReducer::ReadExplore.id(), REDUCE_TO_READ_EXPLORE);
+        assert_eq!(
+            AuthorityReducer::ReadWorkspaceNetwork.id(),
+            REDUCE_TO_READ_WORKSPACE_NETWORK
+        );
+        let mut ids: Vec<&str> = AuthorityReducer::ALL.iter().map(|r| r.id()).collect();
+        ids.sort_unstable();
+        ids.dedup();
+        assert_eq!(ids.len(), AuthorityReducer::ALL.len());
     }
 
     #[test]
     fn test_authority_reducer_for_role_covers_every_role_and_bounds_its_profile()
     -> crate::test_support::TestResult {
         // `memory-steward` (WriteWorkspace), `executor` (ExecuteProcess),
-        // `uia-worker` (ExecuteProcess + NetworkAccess, Addendum I),
-        // `agent-steward` (WriteWorkspace, Addendum K), `uia-explorer`
-        // (NetworkAccess), `uia-writer` (WriteWorkspace + NetworkAccess) und
-        // `uia-shell-worker` (ExecuteProcess) sind dokumentierte Ausnahmen
-        // von der Untermengen-Invariante: kein Reducer trägt je Schreib-,
-        // Ausführungs- oder (zusammen mit ReadWorkspace) Netzrecht weiter
-        // (siehe `test_reduce_never_exceeds_parent_or_ceiling`); alle sieben
-        // Rollen bekommen diese Rechte über ihre feste Profilzuweisung,
-        // nicht über diesen Reducer (siehe Doku bei
-        // `authority_reducer_for_role`).
+        // `uia-worker` (ExecuteProcess, Addendum I; Netz trägt seit der
+        // Nutzerentscheidung `ReadExplore`), `agent-steward`
+        // (WriteWorkspace, Addendum K), `uia-writer` (WriteWorkspace; Netz
+        // ebenfalls über `ReadExplore`) und `uia-shell-worker`
+        // (ExecuteProcess) sind dokumentierte Ausnahmen von der
+        // Untermengen-Invariante: kein Reducer trägt je Schreib- oder
+        // Ausführungsrecht weiter (siehe
+        // `test_reduce_never_exceeds_parent_or_ceiling`); alle sechs Rollen
+        // bekommen diese Rechte über ihre feste Profilzuweisung, nicht über
+        // diesen Reducer (siehe Doku bei `authority_reducer_for_role`).
+        // `uia-explorer` ist keine Ausnahme mehr: `ReadWorkspaceNetwork`
+        // trägt sein ganzes Profil.
         let exempt_from_subset_bound = [
             role_names::MEMORY_STEWARD,
             role_names::EXECUTOR,
             role_names::UIA_WORKER,
             role_names::AGENT_STEWARD,
-            role_names::UIA_EXPLORER,
             role_names::UIA_WRITER,
             role_names::UIA_SHELL_WORKER,
         ];
@@ -556,10 +965,25 @@ mod tests {
             if exempt_from_subset_bound.contains(role) {
                 continue;
             }
-            assert!(
+            // Explorer-Netz: `ReadOnlyExplore` registriert
+            // `web.fetch`/`web.search` (`EXPLORER_WEB_TOOLS`, `NetworkAccess`)
+            // auch für `analyst`/`researcher-deps`, deren TOML sie verbietet
+            // und deren `ReadRegistry` kein Netz trägt. Nur für diese
+            // Kombination (Profil ohne Netz-Obergrenze) sind genau diese zwei
+            // Werkzeuge ausgenommen; `explorer` (`ReadExplore`) muss sein
+            // Profil vollständig unter die Obergrenze bringen.
+            let ceiling = reducer.ceiling();
+            let web_exempt = profile == RegistryProfile::ReadOnlyExplore
+                && !ceiling.contains(Permission::NetworkAccess);
+            let bounded = PermissionSet::from_policy(
                 profile
-                    .required_permissions()
-                    .is_subset_of(&reducer.ceiling()),
+                    .registered_tool_names()
+                    .into_iter()
+                    .filter(|tool| !(web_exempt && EXPLORER_WEB_TOOLS.contains(tool)))
+                    .filter_map(tool_permission),
+            );
+            assert!(
+                bounded.is_subset_of(&ceiling),
                 "{role}: {profile:?} braucht mehr, als {reducer:?} je trägt"
             );
         }
@@ -574,7 +998,7 @@ mod tests {
         );
         assert_eq!(
             authority_reducer_for_role(role_names::UIA_WORKER),
-            Some(AuthorityReducer::ReadOnly)
+            Some(AuthorityReducer::ReadExplore)
         );
         assert_eq!(
             authority_reducer_for_role(role_names::EXECUTOR),
@@ -586,16 +1010,140 @@ mod tests {
         );
         assert_eq!(
             authority_reducer_for_role(role_names::UIA_EXPLORER),
-            Some(AuthorityReducer::ReadOnly)
+            Some(AuthorityReducer::ReadWorkspaceNetwork)
+        );
+        assert_eq!(
+            authority_reducer_for_role(role_names::EXPLORER),
+            Some(AuthorityReducer::ReadExplore)
         );
         assert_eq!(
             authority_reducer_for_role(role_names::UIA_WRITER),
-            Some(AuthorityReducer::ReadOnly)
+            Some(AuthorityReducer::ReadExplore)
         );
         assert_eq!(
             authority_reducer_for_role(role_names::UIA_SHELL_WORKER),
             Some(AuthorityReducer::ReadOnly)
         );
+        for role in [
+            role_names::ROOT_ORCHESTRATOR,
+            role_names::CODING_ORCHESTRATOR,
+            role_names::ANALYSIS_ORCHESTRATOR,
+        ] {
+            assert_eq!(
+                authority_reducer_for_role(role),
+                Some(AuthorityReducer::ReadRegistry),
+                "{role}"
+            );
+        }
+        assert_eq!(
+            authority_reducer_for_role(role_names::RESEARCH_ORCHESTRATOR),
+            Some(AuthorityReducer::ReadExplore)
+        );
+        Ok(())
+    }
+
+    /// Die Netz-Durchreichung des `research-orchestrator` ist KEIN eigenes
+    /// Netz-Werkzeug: sein Profil registriert unter vollem Netz kein `web.*`,
+    /// und der Reducer gibt nie Schreib- oder Ausführungsrecht weiter.
+    #[test]
+    fn test_research_orchestrator_passes_network_through_without_web_tools()
+    -> crate::test_support::TestResult {
+        let role = role_names::RESEARCH_ORCHESTRATOR;
+        let reducer = authority_reducer_for_role(role).ok_or(
+            crate::test_support::TestError::Missing("research-orchestrator braucht einen Reducer"),
+        )?;
+        let profile = crate::profile::profile_for_role(role).ok_or(
+            crate::test_support::TestError::Missing("research-orchestrator braucht ein Profil"),
+        )?;
+        let child = reducer.reduce(&every_permission());
+        assert!(child.contains(Permission::NetworkAccess));
+        assert!(!child.contains(Permission::WriteWorkspace));
+        assert!(!child.contains(Permission::ExecuteProcess));
+        assert!(
+            !profile
+                .tool_names_for(&child)
+                .iter()
+                .any(|tool| tool.starts_with("web.") || tool.starts_with("browser.")),
+            "{role}: {profile:?} darf trotz Netzrecht kein Netz-Werkzeug registrieren"
+        );
+        Ok(())
+    }
+
+    /// `[delegation].targets` der Orchestratoren: jede genannte Rolle ist eine
+    /// eingebaute Rolle; Child-Orchestratoren nennen ausschließlich Worker
+    /// (keinen Orchestrator, keinen `agent-steward`, keine UIA-Rolle), und
+    /// Worker tragen gar keine Liste.
+    #[test]
+    fn test_delegation_targets_are_builtin_and_child_orchestrators_only_name_workers()
+    -> crate::test_support::TestResult {
+        let forbidden_for_children: Vec<&str> = std::iter::once(role_names::ROOT_ORCHESTRATOR)
+            .chain(role_names::CHILD_ORCHESTRATORS.iter().copied())
+            .chain([
+                role_names::AGENT_STEWARD,
+                role_names::UIA_WORKER,
+                role_names::UIA_EXPLORER,
+                role_names::UIA_WRITER,
+                role_names::UIA_SHELL_WORKER,
+            ])
+            .collect();
+        for role in role_names::CHILD_ORCHESTRATORS {
+            let targets = delegation_targets_for_role(role).ok_or(
+                crate::test_support::TestError::Unexpected(format!(
+                    "{role} braucht [delegation].targets"
+                )),
+            )?;
+            assert!(!targets.is_empty(), "{role}: leere Zielliste");
+            for target in &targets {
+                assert!(
+                    role_names::ALL.contains(&target.as_str()),
+                    "{role}: unbekanntes Ziel {target}"
+                );
+                assert!(
+                    !forbidden_for_children.contains(&target.as_str()),
+                    "{role}: {target} ist kein Worker-Ziel eines Child-Orchestrators"
+                );
+            }
+        }
+        let root = delegation_targets_for_role(role_names::ROOT_ORCHESTRATOR).ok_or(
+            crate::test_support::TestError::Missing("root-orchestrator braucht [delegation]"),
+        )?;
+        for child in role_names::CHILD_ORCHESTRATORS {
+            assert!(
+                root.iter().any(|target| target == child),
+                "root-orchestrator muss {child} als Ziel führen"
+            );
+        }
+        for target in &root {
+            assert!(role_names::ALL.contains(&target.as_str()), "{target}");
+        }
+        for worker in [
+            role_names::EXPLORER,
+            role_names::PLANNER,
+            role_names::ANALYST,
+            role_names::EXECUTOR,
+        ] {
+            assert!(
+                delegation_targets_for_role(worker).is_none(),
+                "{worker}: Worker tragen keine Delegationsliste"
+            );
+        }
+        assert!(delegation_targets_for_role("unbekannt").is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn test_delegation_targets_of_reads_only_string_arrays() -> crate::test_support::TestResult {
+        let tables: toml::Table =
+            toml::from_str("[delegation]\ntargets = [\"explorer\", 3, \"planner\"]\n")
+                .map_err(crate::test_support::ctx("Test-TOML muss parsen"))?;
+        assert_eq!(
+            delegation_targets_of(&tables),
+            Some(vec!["explorer".to_owned(), "planner".to_owned()])
+        );
+        let without: toml::Table = toml::from_str("[delegation]\ntargets = \"explorer\"\n")
+            .map_err(crate::test_support::ctx("Test-TOML muss parsen"))?;
+        assert_eq!(delegation_targets_of(&without), None);
+        assert_eq!(delegation_targets_of(&toml::Table::new()), None);
         Ok(())
     }
 }

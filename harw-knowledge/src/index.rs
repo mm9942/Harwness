@@ -14,6 +14,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::artifact::{ArtifactId, ArtifactKind, KnowledgeArtifact};
 use crate::error::{KnowledgeError, KnowledgeResult};
+use crate::memory::core::core_memory_id;
 use crate::store::KnowledgeStore;
 use crate::visibility::VisibilityScope;
 
@@ -40,6 +41,27 @@ impl ArtifactRef {
             tags: artifact.frontmatter.tags.clone(),
             visibility: artifact.frontmatter.visibility.clone(),
         }
+    }
+}
+
+/// Ergebnisbericht eines [`KnowledgeIndex::rebuild_with_report`]-Laufs.
+///
+/// Ein einzelnes defektes Artefakt (unlesbar, fehlender Fence, ungültiges
+/// YAML) bricht den Rebuild nicht ab: es wird übersprungen und hier mit Pfad
+/// und Fehlertext festgehalten, damit Doctor/CLI es sichtbar machen können.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct IndexReport {
+    /// Anzahl erfolgreich eingelesener Artefakte.
+    pub indexed: usize,
+    /// Übersprungene Dateien mit dem Grund (gerenderter [`KnowledgeError`]).
+    pub skipped: Vec<(PathBuf, String)>,
+}
+
+impl IndexReport {
+    /// `true`, wenn kein Artefakt übersprungen wurde.
+    #[must_use]
+    pub fn is_clean(&self) -> bool {
+        self.skipped.is_empty()
     }
 }
 
@@ -180,30 +202,52 @@ impl KnowledgeIndex {
 
     /// Rebuild the index from the durable markdown tree (§1.3 doctor path).
     ///
+    /// Wie [`Self::rebuild_with_report`], verwirft aber den [`IndexReport`]:
+    /// defekte Einzelartefakte werden übersprungen, nicht als Fehler gemeldet.
+    ///
+    /// # Errors
+    /// Nur bei Fehlern des Verzeichnisdurchlaufs selbst (Root/Surface nicht
+    /// lesbar), nie wegen eines einzelnen defekten Artefakts.
+    pub fn rebuild(store: &KnowledgeStore) -> KnowledgeResult<Self> {
+        Self::rebuild_with_report(store).map(|(index, _report)| index)
+    }
+
+    /// Rebuild the index from the durable markdown tree and report skipped files.
+    ///
     /// The directory layout is the trusted type discriminator. Unknown and
     /// non-Markdown files are ignored so editor state and index cache files
     /// never become searchable artifacts. A missing root is a valid empty
-    /// knowledge store.
-    pub fn rebuild(store: &KnowledgeStore) -> KnowledgeResult<Self> {
+    /// knowledge store. Ein Artefakt, das sich nicht lesen oder parsen lässt,
+    /// landet in [`IndexReport::skipped`]; der Rebuild läuft weiter.
+    ///
+    /// # Errors
+    /// [`KnowledgeError::Io`], wenn Root oder ein Surface-Verzeichnis nicht
+    /// kanonisiert/gelesen werden kann.
+    pub fn rebuild_with_report(store: &KnowledgeStore) -> KnowledgeResult<(Self, IndexReport)> {
+        let mut index = Self::new();
+        let mut report = IndexReport::default();
         if !store.root().exists() {
-            return Ok(Self::new());
+            return Ok((index, report));
         }
 
-        let mut index = Self::new();
         let root = store.root();
         let canonical_root = std::fs::canonicalize(root)?;
 
         let core = store.core_memory_path();
         if core.is_file() {
-            index.insert(store.read_artifact(
+            index_file(
+                &mut index,
+                &mut report,
+                store,
                 &core,
-                ArtifactId::new("core/memory"),
+                core_memory_id(),
                 ArtifactKind::CoreMemory,
-            )?);
+            );
         }
 
         index_surface(
             &mut index,
+            &mut report,
             store,
             &root.join("topics"),
             &canonical_root,
@@ -212,6 +256,7 @@ impl KnowledgeIndex {
         )?;
         index_surface(
             &mut index,
+            &mut report,
             store,
             &root.join("palace"),
             &canonical_root,
@@ -220,6 +265,7 @@ impl KnowledgeIndex {
         )?;
         index_surface(
             &mut index,
+            &mut report,
             store,
             &root.join("diary"),
             &canonical_root,
@@ -228,6 +274,7 @@ impl KnowledgeIndex {
         )?;
         index_surface(
             &mut index,
+            &mut report,
             store,
             &root.join("dreams"),
             &canonical_root,
@@ -236,6 +283,7 @@ impl KnowledgeIndex {
         )?;
         index_surface(
             &mut index,
+            &mut report,
             store,
             &root.join("workbench"),
             &canonical_root,
@@ -244,6 +292,7 @@ impl KnowledgeIndex {
         )?;
         index_surface(
             &mut index,
+            &mut report,
             store,
             &root.join("kanban").join("boards"),
             &canonical_root,
@@ -257,6 +306,7 @@ impl KnowledgeIndex {
         // directory, exactly as it already does for every other surface).
         index_surface(
             &mut index,
+            &mut report,
             store,
             &root.join("context-proposals"),
             &canonical_root,
@@ -264,13 +314,14 @@ impl KnowledgeIndex {
             "context-proposal",
         )?;
 
-        Ok(index)
+        Ok((index, report))
     }
 }
 
 /// Index every Markdown file below one known knowledge surface.
 fn index_surface(
     index: &mut KnowledgeIndex,
+    report: &mut IndexReport,
     store: &KnowledgeStore,
     surface_root: &Path,
     configured_root: &Path,
@@ -288,9 +339,28 @@ fn index_surface(
         let Some(id) = artifact_id_from_relative(id_prefix, relative) else {
             continue;
         };
-        index.insert(store.read_artifact(&file, id, kind)?);
+        index_file(index, report, store, &file, id, kind);
     }
     Ok(())
+}
+
+/// Liest ein einzelnes Artefakt ein; ein Lese-/Parse-Fehler wird im Report
+/// vermerkt statt den Rebuild abzubrechen.
+fn index_file(
+    index: &mut KnowledgeIndex,
+    report: &mut IndexReport,
+    store: &KnowledgeStore,
+    path: &Path,
+    id: ArtifactId,
+    kind: ArtifactKind,
+) {
+    match store.read_artifact(path, id, kind) {
+        Ok(artifact) => {
+            index.insert(artifact);
+            report.indexed += 1;
+        }
+        Err(error) => report.skipped.push((path.to_path_buf(), error.to_string())),
+    }
 }
 
 /// Recursively collect regular Markdown files below one surface without leaving the configured root.
@@ -370,7 +440,7 @@ mod tests {
         let store = KnowledgeStore::new(&root);
 
         let core = KnowledgeArtifact::new(
-            ArtifactId::new("core/memory"),
+            core_memory_id(),
             ArtifactKind::CoreMemory,
             frontmatter(),
             "durable core fact",
@@ -407,7 +477,7 @@ mod tests {
             KnowledgeIndex::rebuild(&store).map_err(crate::test_support::ctx("rebuild index"))?;
 
         assert_eq!(rebuilt.len(), 3);
-        assert!(rebuilt.get(&ArtifactId::new("core/memory")).is_some());
+        assert!(rebuilt.get(&core_memory_id()).is_some());
         assert_eq!(
             rebuilt.backlinks(&ArtifactId::new("palace/deploy"))[0].id,
             ArtifactId::new("topic/nested/runtime")
@@ -459,6 +529,94 @@ mod tests {
             .get(&ArtifactId::new("context-proposal/promote-history-tail"))
             .ok_or(TestError::Missing("context-proposal artifact is indexed"))?;
         assert_eq!(indexed.kind, ArtifactKind::ContextProposal);
+
+        std::fs::remove_dir_all(root)
+            .map_err(crate::test_support::ctx("remove temporary knowledge root"))?;
+        Ok(())
+    }
+
+    /// Regression (R2/W1): ein über `KnowledgeStore::write_dream_report`
+    /// geschriebener Traumbericht trägt gültiges Frontmatter und wird von
+    /// `rebuild` als `DreamReport` indexiert, statt den Rebuild abzubrechen.
+    #[test]
+    fn rebuild_indexes_a_written_dream_report() -> TestResult {
+        use crate::dream::DreamReport;
+
+        let root = temporary_root("harw-knowledge-rebuild-dream")?;
+        let store = KnowledgeStore::new(&root);
+        let report = DreamReport {
+            work_id: harw_job_runtime::WorkId::from_str("dream-20260923T010203"),
+            created_at: jiff::Timestamp::UNIX_EPOCH,
+            summary: "Konsolidierte Reflexion".to_owned(),
+            proposed_topic_updates: Vec::new(),
+            proposed_palace_promotions: Vec::new(),
+            follow_ups: vec!["Deploy prüfen".to_owned()],
+        };
+
+        let path = store.write_dream_report(&report)?;
+        assert_eq!(
+            path,
+            store.dream_path("1970-01-01", "dream-20260923T010203")
+        );
+
+        let (rebuilt, index_report) = KnowledgeIndex::rebuild_with_report(&store)?;
+
+        assert!(
+            index_report.is_clean(),
+            "skipped: {:?}",
+            index_report.skipped
+        );
+        assert_eq!(index_report.indexed, 1);
+        let indexed = rebuilt
+            .get(&report.artifact_id())
+            .ok_or(TestError::Missing("dream report is indexed"))?;
+        assert_eq!(indexed.kind, ArtifactKind::DreamReport);
+        assert_eq!(
+            indexed.frontmatter.visibility,
+            VisibilityScope::OperatorOnly
+        );
+        assert!(indexed.body.contains("Konsolidierte Reflexion"));
+
+        std::fs::remove_dir_all(root)
+            .map_err(crate::test_support::ctx("remove temporary knowledge root"))?;
+        Ok(())
+    }
+
+    /// Eine einzelne defekte Datei (hier: Markdown ohne Frontmatter, wie der
+    /// frühere Gateway-Traumbericht) wird übersprungen und berichtet; gültige
+    /// Artefakte daneben werden weiterhin indexiert.
+    #[test]
+    fn rebuild_skips_and_reports_a_malformed_artifact() -> TestResult {
+        let root = temporary_root("harw-knowledge-rebuild-malformed")?;
+        let store = KnowledgeStore::new(&root);
+
+        let malformed = store.dream_path("2026-09-23", "legacy");
+        std::fs::create_dir_all(
+            malformed
+                .parent()
+                .ok_or(TestError::Missing("dream path has a parent"))?,
+        )?;
+        std::fs::write(&malformed, "# Traumbericht ohne Frontmatter\n")?;
+
+        let palace = KnowledgeArtifact::new(
+            ArtifactId::new("palace/deploy"),
+            ArtifactKind::PalaceNode,
+            frontmatter(),
+            "deployment detail",
+        );
+        store.write_artifact(&store.palace_path(&ArtifactId::new("deploy")), &palace)?;
+
+        let (rebuilt, index_report) = KnowledgeIndex::rebuild_with_report(&store)?;
+
+        assert_eq!(rebuilt.len(), 1);
+        assert!(rebuilt.get(&ArtifactId::new("palace/deploy")).is_some());
+        assert_eq!(index_report.indexed, 1);
+        assert_eq!(index_report.skipped.len(), 1);
+        assert_eq!(index_report.skipped[0].0, malformed);
+        assert!(index_report.skipped[0].1.contains("frontmatter"));
+
+        // Die bequeme `rebuild`-Variante bricht ebenfalls nicht ab.
+        assert_eq!(KnowledgeIndex::rebuild(&store)?.len(), 1);
 
         std::fs::remove_dir_all(root)
             .map_err(crate::test_support::ctx("remove temporary knowledge root"))?;

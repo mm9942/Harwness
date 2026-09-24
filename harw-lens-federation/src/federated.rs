@@ -110,7 +110,7 @@ use std::path::Path;
 
 use harw_lens_embed::{Embedder, EmbeddingDescriptor};
 use harw_lens_index::VectorIndex;
-use harw_lens_query::{query, resolve_index, IndexSelector, QueryProvenance, ReadScope};
+use harw_lens_query::{IndexSelector, QueryProvenance, ReadScope, query, resolve_index};
 use harw_lens_rank::{pack, rrf_fuse};
 use harw_lens_types::{
     BudgetSpec, CollapsePolicy, CostEstimator, EdgeIndex, IndexManifest, LensTypesError, Packed,
@@ -185,7 +185,10 @@ fn selector_sort_key(selector: &IndexSelector) -> (&str, &str) {
 /// Vergleich den Index gegen sich selbst und könnte nie fehlschlagen). Die
 /// übrigen Felder werden von `index_manifest` übernommen, weil
 /// `compatible_with` ohnehin nur `model`/`chunker_version` vergleicht.
-fn provenance_manifest(index_manifest: &IndexManifest, provenance: &QueryProvenance) -> IndexManifest {
+fn provenance_manifest(
+    index_manifest: &IndexManifest,
+    provenance: &QueryProvenance,
+) -> IndexManifest {
     IndexManifest {
         model: provenance.model.clone(),
         chunker_version: provenance.chunker_version,
@@ -379,7 +382,11 @@ pub fn federated_query(
 /// assert!(packed.selected.is_empty());
 /// ```
 #[must_use]
-pub fn federated_pack(outcome: &FederatedOutcome, cost: &dyn CostEstimator, budget: &BudgetSpec) -> Packed {
+pub fn federated_pack(
+    outcome: &FederatedOutcome,
+    cost: &dyn CostEstimator,
+    budget: &BudgetSpec,
+) -> Packed {
     pack(&outcome.fused, cost, budget)
 }
 
@@ -393,9 +400,7 @@ mod tests {
         Ranked {
             chunk: Chunk {
                 digest: ChunkDigest(ContentDigest::of(text.as_bytes())),
-                source: SourceRef::Artifact {
-                    id: "a".to_owned(),
-                },
+                source: SourceRef::Artifact { id: "a".to_owned() },
                 span: ByteSpan {
                     start: 0,
                     end: text.len(),

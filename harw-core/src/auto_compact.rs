@@ -41,6 +41,34 @@
 //! begrenzt zusätzlich die akkumulierte Input-Nutzung großer Sessions
 //! (langlaufende Orchestrator-Sessions mit sehr großen Fenstern).
 //!
+//! # Output-Reserve & fixer Overhead
+//!
+//! Das Fenster muss neben dem Verlauf auch die **Antwort** des Modells
+//! (`max_output_tokens`, inkl. Thinking) und den **fixen Overhead** jeder
+//! Anfrage (System-Prompt, Instruktions-Fragmente, Tool-Schemas) aufnehmen.
+//! Bei kleinen Fenstern (8 k–32 k) frisst beides einen großen Teil des
+//! Fensters; die 70 %-Schwelle allein würde dann zu spät auslösen. Mit
+//! [`AutoCompactPolicy::with_output_reserve`] und
+//! [`AutoCompactPolicy::with_fixed_overhead`] gilt deshalb:
+//!
+//! ```text
+//! Compact-Schwelle = min(70 % Fenster, 80 % · (Fenster − Reserve − Overhead))
+//! ```
+//!
+//! Ohne Reserve/Overhead (Default 0) ist der zweite Term 80 % des Fensters
+//! und damit nie kleiner als 70 % — bestehende Aufrufer verhalten sich
+//! unverändert.
+//!
+//! # Notfall vor dem Senden & Hysterese
+//!
+//! - [`AutoCompactPolicy::must_compact_before_send`] prüft eine konkrete
+//!   Anfrage-Schätzung: `geschätzt + Reserve > 90 % Fenster` ⇒ vor dem
+//!   Senden verdichten ([`CompactDecision::Emergency`]).
+//! - [`AutoCompactPolicy::worth_compacting`] verhindert Compact-Schleifen:
+//!   Nach einer Verdichtung lohnt die nächste erst, wenn der Verlauf
+//!   spürbar über das damalige Ergebnis hinausgewachsen ist (oder der
+//!   Notfall droht).
+//!
 //! # Vertrauen & Sicherheit
 //!
 //! Die Policy **entscheidet nur**; die eigentliche Verdichtung (Summary durch
@@ -90,6 +118,25 @@ const COMPACT_THRESHOLD_DEN: u64 = 10;
 const TASK_END_THRESHOLD_NUM: u64 = 3;
 const TASK_END_THRESHOLD_DEN: u64 = 10;
 
+/// Anteil des nach Reserve und Overhead verfügbaren Input-Raums, ab dem ein
+/// Compact fällig ist (80 %).
+const AVAILABLE_THRESHOLD_NUM: u64 = 8;
+const AVAILABLE_THRESHOLD_DEN: u64 = 10;
+
+/// Anteil des Fensters, den `geschätzte Anfrage + Output-Reserve` vor dem
+/// Senden höchstens belegen darf (90 %), bevor eine Notfall-Verdichtung
+/// greift.
+const EMERGENCY_NUM: u64 = 9;
+const EMERGENCY_DEN: u64 = 10;
+
+/// Hysterese: Nach einer Verdichtung lohnt die nächste erst, wenn der
+/// Verlauf um mindestens 10 % der effektiven Compact-Schwelle gewachsen ist …
+const HYSTERESIS_NUM: u64 = 1;
+const HYSTERESIS_DEN: u64 = 10;
+
+/// … mindestens aber um diese Token-Zahl (kleine Fenster).
+const MIN_HYSTERESIS_TOKENS: u64 = 256;
+
 /// Ausgangs der Trigger-Prüfung.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -108,6 +155,11 @@ pub enum CompactDecision {
     /// `turn_loop` vor der ersten Modellrunde — unabhängig von
     /// [`Self::BudgetExceeded`]/[`Self::TaskCompleted`].
     TurnStart,
+    /// Notfall-Verdichtung vor dem Senden: die geschätzte Anfrage plus
+    /// Output-Reserve passt nicht mehr sicher ins Fenster
+    /// ([`AutoCompactPolicy::must_compact_before_send`]) oder der Provider
+    /// hat die Anfrage wegen Kontextlänge abgelehnt.
+    Emergency,
 }
 
 impl CompactDecision {
@@ -161,6 +213,14 @@ pub struct AutoCompactPolicy {
     /// `turn_loop` ausgewertet, fließt nicht in `decide` ein).
     #[serde(default)]
     turn_start_target_tokens: Option<u64>,
+    /// Für die Modellantwort reservierte Tokens (`max_output_tokens` inkl.
+    /// Thinking-Reserve). 0 = keine Reserve (bisheriges Verhalten).
+    #[serde(default)]
+    output_reserve_tokens: u64,
+    /// Fixer Overhead jeder Anfrage (System-Prompt, Fragmente,
+    /// Tool-Schemas) in Tokens. 0 = kein Overhead (bisheriges Verhalten).
+    #[serde(default)]
+    fixed_overhead_tokens: u64,
 }
 
 impl AutoCompactPolicy {
@@ -185,17 +245,26 @@ impl AutoCompactPolicy {
             task_end_threshold_tokens,
             absolute_ceiling_tokens: None,
             turn_start_target_tokens: None,
+            output_reserve_tokens: 0,
+            fixed_overhead_tokens: 0,
         }
     }
 
     /// Dieselbe Policy für ein anderes Kontextfenster (z. B. nach einem
-    /// Modellwechsel): Schwellen neu abgeleitet, feste Obergrenze und
-    /// Turn-Start-Ziel bleiben erhalten.
+    /// Modellwechsel): Schwellen neu abgeleitet; feste Obergrenze,
+    /// Turn-Start-Ziel, Output-Reserve und fixer Overhead bleiben erhalten.
+    ///
+    /// Hängt die Reserve vom Fenster ab (z. B. 15 % des Fensters), sollte der
+    /// Aufrufer sie anschließend per [`Self::with_output_reserve`] neu setzen;
+    /// ohne das rechnet die Policy mit der alten Reserve weiter (saturierend,
+    /// also auch bei Reserve > Fenster ohne Panik).
     #[must_use]
     pub fn rescaled(self, context_window_tokens: u64) -> Self {
         Self::for_context_window(context_window_tokens)
             .with_absolute_ceiling(self.absolute_ceiling_tokens)
             .with_turn_start_target(self.turn_start_target_tokens)
+            .with_output_reserve(self.output_reserve_tokens)
+            .with_fixed_overhead(self.fixed_overhead_tokens)
     }
 
     /// Deaktivierte Policy (Fenster 0) — entscheidet immer `None`.
@@ -242,13 +311,155 @@ impl AutoCompactPolicy {
         self.turn_start_target_tokens
     }
 
-    /// Effektive Budget-Schwelle unter Berücksichtigung der optionalen
-    /// festen Obergrenze: `min(compact_threshold_tokens, ceiling)`.
-    fn effective_compact_threshold_tokens(&self) -> u64 {
+    /// Setzt die für die Modellantwort reservierten Tokens.
+    ///
+    /// # Arguments
+    /// - `reserve_tokens` (`u64`): `max_output_tokens` der Anfrage inkl.
+    ///   Thinking-Reserve (typisch aus
+    ///   `context_budget::output_reserve_tokens`). 0 = keine Reserve.
+    ///
+    /// # Returns
+    /// Die angepasste Policy (Builder-Stil, konsumiert `self`).
+    #[must_use]
+    pub fn with_output_reserve(mut self, reserve_tokens: u64) -> Self {
+        self.output_reserve_tokens = reserve_tokens;
+        self
+    }
+
+    /// Setzt den fixen Overhead jeder Anfrage (System-Prompt, Fragmente,
+    /// Tool-Schemas).
+    ///
+    /// # Arguments
+    /// - `overhead_tokens` (`u64`): geschätzter Overhead in Tokens.
+    ///   0 = kein Overhead.
+    ///
+    /// # Returns
+    /// Die angepasste Policy (Builder-Stil, konsumiert `self`).
+    #[must_use]
+    pub fn with_fixed_overhead(mut self, overhead_tokens: u64) -> Self {
+        self.fixed_overhead_tokens = overhead_tokens;
+        self
+    }
+
+    /// Die konfigurierte Output-Reserve in Tokens (0, falls nicht gesetzt).
+    #[must_use]
+    pub fn output_reserve_tokens(&self) -> u64 {
+        self.output_reserve_tokens
+    }
+
+    /// Der konfigurierte fixe Overhead in Tokens (0, falls nicht gesetzt).
+    #[must_use]
+    pub fn fixed_overhead_tokens(&self) -> u64 {
+        self.fixed_overhead_tokens
+    }
+
+    /// Für Verlauf verfügbarer Input-Raum: `Fenster − Reserve − Overhead`
+    /// (saturierend, nie negativ).
+    #[must_use]
+    pub fn available_input_tokens(&self) -> u64 {
+        self.context_window_tokens
+            .saturating_sub(self.output_reserve_tokens)
+            .saturating_sub(self.fixed_overhead_tokens)
+    }
+
+    /// Reserve-/Overhead-bewusste Schwelle:
+    /// `80 % · (Fenster − Reserve − Overhead)`.
+    fn available_threshold_tokens(&self) -> u64 {
+        self.available_input_tokens()
+            .saturating_mul(AVAILABLE_THRESHOLD_NUM)
+            / AVAILABLE_THRESHOLD_DEN
+    }
+
+    /// Effektive Budget-Schwelle für [`CompactDecision::BudgetExceeded`]:
+    /// `min(70 % Fenster, 80 % · (Fenster − Reserve − Overhead), Deckel)`.
+    ///
+    /// Das ist die Zahl, die `decide` tatsächlich vergleicht (z. B. für
+    /// die Anzeige „nächste Kompaktierung bei N").
+    #[must_use]
+    pub fn effective_compact_threshold_tokens(&self) -> u64 {
+        let threshold = self.compact_threshold_tokens();
         match self.absolute_ceiling_tokens {
-            Some(ceiling) => self.compact_threshold_tokens.min(ceiling),
-            None => self.compact_threshold_tokens,
+            Some(ceiling) => threshold.min(ceiling),
+            None => threshold,
         }
+    }
+
+    /// Obergrenze für die geschätzte Anfrage vor dem Senden:
+    /// `90 % Fenster − Reserve` (saturierend). Liegt die Schätzung darüber,
+    /// meldet [`Self::must_compact_before_send`] `true`.
+    #[must_use]
+    pub fn emergency_threshold_tokens(&self) -> u64 {
+        (self.context_window_tokens.saturating_mul(EMERGENCY_NUM) / EMERGENCY_DEN)
+            .saturating_sub(self.output_reserve_tokens)
+    }
+
+    /// Muss vor dem Senden dieser Anfrage verdichtet werden?
+    ///
+    /// # Arguments
+    /// - `estimated_tokens` (`u64`): geschätzte Input-Tokens der vollständig
+    ///   gebauten Anfrage (System-Prompt, Fragmente, Verlauf, Tool-Schemas —
+    ///   der fixe Overhead ist darin bereits enthalten).
+    ///
+    /// # Returns
+    /// `true`, wenn `estimated_tokens + Reserve > 90 % Fenster`. Bei
+    /// deaktivierter Policy (Fenster 0) immer `false`.
+    #[must_use]
+    pub fn must_compact_before_send(&self, estimated_tokens: u64) -> bool {
+        if self.context_window_tokens == 0 {
+            return false;
+        }
+        estimated_tokens.saturating_add(self.output_reserve_tokens)
+            > self.context_window_tokens.saturating_mul(EMERGENCY_NUM) / EMERGENCY_DEN
+    }
+
+    /// Entscheidung vor dem Senden einer konkreten Anfrage:
+    /// [`CompactDecision::Emergency`], wenn
+    /// [`Self::must_compact_before_send`] greift, sonst
+    /// [`CompactDecision::None`].
+    #[must_use]
+    pub fn decide_before_send(&self, estimated_tokens: u64) -> CompactDecision {
+        if self.must_compact_before_send(estimated_tokens) {
+            CompactDecision::Emergency
+        } else {
+            CompactDecision::None
+        }
+    }
+
+    /// Hysterese: lohnt eine (nicht erzwungene) Verdichtung jetzt?
+    ///
+    /// # Arguments
+    /// - `tokens_before` (`u64`): aktuelle (geschätzte) Nutzung, die eine
+    ///   Verdichtung jetzt reduzieren würde.
+    /// - `tokens_after_last` (`Option<u64>`): Nutzung direkt nach der
+    ///   letzten Verdichtung dieser Session; `None`, wenn noch keine lief.
+    ///
+    /// # Returns
+    /// - `false` bei deaktivierter Policy (Fenster 0).
+    /// - `true` ohne vorherige Verdichtung.
+    /// - `true`, wenn der Notfall droht (`tokens_before + Reserve >
+    ///   90 % Fenster`) — dann ist Verdichten immer richtig.
+    /// - sonst `true` nur, wenn `tokens_before` das Ergebnis der letzten
+    ///   Verdichtung um mindestens `max(10 % effektive Schwelle, 256)`
+    ///   übersteigt. So wird ein Verlauf, der sich nicht weiter verkleinern
+    ///   lässt (gepinnte Zusammenfassung, aktueller Turn), nicht in jeder
+    ///   Runde erneut verdichtet.
+    #[must_use]
+    pub fn worth_compacting(&self, tokens_before: u64, tokens_after_last: Option<u64>) -> bool {
+        if self.context_window_tokens == 0 {
+            return false;
+        }
+        let Some(after_last) = tokens_after_last else {
+            return true;
+        };
+        if self.must_compact_before_send(tokens_before) {
+            return true;
+        }
+        let min_growth = (self
+            .effective_compact_threshold_tokens()
+            .saturating_mul(HYSTERESIS_NUM)
+            / HYSTERESIS_DEN)
+            .max(MIN_HYSTERESIS_TOKENS);
+        tokens_before >= after_last.saturating_add(min_growth)
     }
 
     /// Das konfigurierte Kontextfenster.
@@ -257,10 +468,15 @@ impl AutoCompactPolicy {
         self.context_window_tokens
     }
 
-    /// Schwelle für [`CompactDecision::BudgetExceeded`].
+    /// Relative Schwelle für [`CompactDecision::BudgetExceeded`]:
+    /// `min(70 % Fenster, 80 % · (Fenster − Reserve − Overhead))`. Ohne
+    /// Reserve/Overhead exakt 70 % des Fensters. Die optionale feste
+    /// Obergrenze ist hier nicht eingerechnet, siehe
+    /// [`Self::effective_compact_threshold_tokens`].
     #[must_use]
     pub fn compact_threshold_tokens(&self) -> u64 {
         self.compact_threshold_tokens
+            .min(self.available_threshold_tokens())
     }
 
     /// Schwelle für [`CompactDecision::TaskCompleted`].
@@ -397,6 +613,7 @@ mod tests {
         assert!(!CompactDecision::None.should_compact());
         assert!(CompactDecision::BudgetExceeded.should_compact());
         assert!(CompactDecision::TaskCompleted.should_compact());
+        assert!(CompactDecision::Emergency.should_compact());
     }
 
     #[test]
@@ -440,8 +657,152 @@ mod tests {
     }
 
     #[test]
-    fn policy_serde_roundtrip() -> TestResult {
+    fn rescaled_keeps_reserve_and_overhead() {
+        let policy = AutoCompactPolicy::for_context_window(200_000)
+            .with_output_reserve(16_384)
+            .with_fixed_overhead(4_096)
+            .rescaled(32_768);
+        assert_eq!(policy.context_window_tokens(), 32_768);
+        assert_eq!(policy.output_reserve_tokens(), 16_384);
+        assert_eq!(policy.fixed_overhead_tokens(), 4_096);
+    }
+
+    #[test]
+    fn without_reserve_thresholds_are_unchanged() {
+        // Reserve/Overhead 0 ⇒ 80 %-Term (160k) liegt über 70 % (140k).
         let policy = AutoCompactPolicy::for_context_window(200_000);
+        assert_eq!(policy.output_reserve_tokens(), 0);
+        assert_eq!(policy.fixed_overhead_tokens(), 0);
+        assert_eq!(policy.compact_threshold_tokens(), 140_000);
+        assert_eq!(policy.effective_compact_threshold_tokens(), 140_000);
+        assert_eq!(policy.available_input_tokens(), 200_000);
+    }
+
+    #[test]
+    fn large_window_reserve_keeps_relative_threshold() {
+        // 200k − 16k − 4k = 179 520 ⇒ 80 % = 143 616 > 140 000.
+        let policy = AutoCompactPolicy::for_context_window(200_000)
+            .with_output_reserve(16_384)
+            .with_fixed_overhead(4_096);
+        assert_eq!(policy.compact_threshold_tokens(), 140_000);
+        assert_eq!(policy.emergency_threshold_tokens(), 180_000 - 16_384);
+    }
+
+    #[test]
+    fn small_window_8k_reserve_lowers_threshold() {
+        // 8k-Fenster, Reserve 15 % = 1 228, Overhead 4 096:
+        // verfügbar 2 868 ⇒ Schwelle 80 % = 2 294 (statt 70 % = 5 734).
+        let policy = AutoCompactPolicy::for_context_window(8_192)
+            .with_output_reserve(1_228)
+            .with_fixed_overhead(4_096);
+        assert_eq!(policy.available_input_tokens(), 2_868);
+        assert_eq!(policy.compact_threshold_tokens(), 2_294);
+        assert_eq!(policy.effective_compact_threshold_tokens(), 2_294);
+        assert_eq!(policy.decide(2_294, false), CompactDecision::None);
+        assert_eq!(policy.decide(2_295, false), CompactDecision::BudgetExceeded);
+        // Notfall: 90 % von 8 192 = 7 372; minus Reserve = 6 144.
+        assert_eq!(policy.emergency_threshold_tokens(), 6_144);
+        assert!(!policy.must_compact_before_send(6_144));
+        assert!(policy.must_compact_before_send(6_145));
+        assert_eq!(policy.decide_before_send(6_145), CompactDecision::Emergency);
+        assert_eq!(policy.decide_before_send(6_144), CompactDecision::None);
+    }
+
+    #[test]
+    fn small_window_32k_reserve_lowers_threshold() {
+        // 32k-Fenster, Reserve 4 915, Overhead 4 096: verfügbar 23 757 ⇒
+        // Schwelle 19 005 (statt 70 % = 22 937).
+        let policy = AutoCompactPolicy::for_context_window(32_768)
+            .with_output_reserve(4_915)
+            .with_fixed_overhead(4_096);
+        assert_eq!(policy.compact_threshold_tokens(), 19_005);
+        assert_eq!(
+            policy.decide(19_006, false),
+            CompactDecision::BudgetExceeded
+        );
+        assert_eq!(policy.decide(19_005, false), CompactDecision::None);
+        // 90 % von 32 768 = 29 491; minus Reserve = 24 576.
+        assert_eq!(policy.emergency_threshold_tokens(), 24_576);
+        assert!(!policy.must_compact_before_send(24_576));
+        assert!(policy.must_compact_before_send(24_577));
+    }
+
+    #[test]
+    fn ceiling_still_applies_with_reserve() {
+        let policy = AutoCompactPolicy::for_context_window(1_000_000)
+            .with_output_reserve(32_768)
+            .with_fixed_overhead(4_096)
+            .with_absolute_ceiling(Some(DEFAULT_ABSOLUTE_CEILING_TOKENS));
+        assert_eq!(policy.compact_threshold_tokens(), 700_000);
+        assert_eq!(policy.effective_compact_threshold_tokens(), 500_000);
+    }
+
+    #[test]
+    fn reserve_larger_than_window_saturates() {
+        let policy = AutoCompactPolicy::for_context_window(4_096)
+            .with_output_reserve(1_000)
+            .with_fixed_overhead(8_000);
+        assert_eq!(policy.available_input_tokens(), 0);
+        assert_eq!(policy.compact_threshold_tokens(), 0);
+        assert_eq!(policy.decide(0, false), CompactDecision::None);
+        assert_eq!(policy.decide(1, false), CompactDecision::BudgetExceeded);
+        let huge = AutoCompactPolicy::for_context_window(1_000).with_output_reserve(u64::MAX);
+        assert_eq!(huge.emergency_threshold_tokens(), 0);
+        assert!(huge.must_compact_before_send(0));
+    }
+
+    #[test]
+    fn disabled_policy_never_requires_emergency_or_hysteresis() {
+        let policy = AutoCompactPolicy::disabled().with_output_reserve(10_000);
+        assert!(!policy.must_compact_before_send(u64::MAX));
+        assert_eq!(policy.decide_before_send(u64::MAX), CompactDecision::None);
+        assert!(!policy.worth_compacting(u64::MAX, None));
+    }
+
+    #[test]
+    fn emergency_without_reserve_uses_90_percent() {
+        let policy = AutoCompactPolicy::for_context_window(200_000);
+        assert!(!policy.must_compact_before_send(180_000));
+        assert!(policy.must_compact_before_send(180_001));
+        assert!(CompactDecision::Emergency.should_compact());
+    }
+
+    #[test]
+    fn worth_compacting_hysteresis() {
+        // 200k: Schwelle 140k ⇒ Mindestwachstum 14k.
+        let policy = AutoCompactPolicy::for_context_window(200_000);
+        assert!(policy.worth_compacting(150_000, None));
+        assert!(!policy.worth_compacting(150_000, Some(140_000)));
+        assert!(!policy.worth_compacting(153_999, Some(140_000)));
+        assert!(policy.worth_compacting(154_000, Some(140_000)));
+        // Notfall schlägt die Hysterese.
+        assert!(policy.worth_compacting(180_001, Some(179_000)));
+    }
+
+    #[test]
+    fn worth_compacting_small_window_uses_minimum_growth() {
+        // 8k mit Reserve/Overhead: Schwelle 2 294 ⇒ 10 % = 229 < 256.
+        let policy = AutoCompactPolicy::for_context_window(8_192)
+            .with_output_reserve(1_228)
+            .with_fixed_overhead(4_096);
+        assert!(!policy.worth_compacting(2_555, Some(2_300)));
+        assert!(policy.worth_compacting(2_556, Some(2_300)));
+    }
+
+    #[test]
+    fn legacy_serialized_policy_deserializes_without_reserve() -> TestResult {
+        let json = r#"{"contextWindowTokens":200000,"compactThresholdTokens":140000,"taskEndThresholdTokens":60000}"#;
+        let parsed: AutoCompactPolicy = serde_json::from_str(json).map_err(ctx("deserialize"))?;
+        assert_eq!(parsed, AutoCompactPolicy::for_context_window(200_000));
+        assert_eq!(parsed.output_reserve_tokens(), 0);
+        Ok(())
+    }
+
+    #[test]
+    fn policy_serde_roundtrip() -> TestResult {
+        let policy = AutoCompactPolicy::for_context_window(200_000)
+            .with_output_reserve(16_384)
+            .with_fixed_overhead(4_096);
         let json = serde_json::to_string(&policy).map_err(ctx("serialize"))?;
         let parsed: AutoCompactPolicy = serde_json::from_str(&json).map_err(ctx("deserialize"))?;
         assert_eq!(policy, parsed);

@@ -145,18 +145,40 @@ pub enum TurnEvent {
     /// ist das effektive Kontextfenster des aktiven Modells.
     /// `history_items_dropped` meldet, wie viele Verlaufseinträge das
     /// Byte-Budget für diese Runde weggelassen hat.
+    /// `estimated_next_tokens` ist die Schätzung für die nächste Anfrage,
+    /// `threshold_tokens` die Schwelle, ab der kompaktiert wird, und
+    /// `reserve_tokens` die für die Ausgabe reservierten Tokens. Alle drei
+    /// sind optional und fehlen bei älteren Sendern (`serde(default)`).
     ContextUpdated {
         turn_id: TurnId,
         used_tokens: u64,
         window_tokens: u64,
         history_items_dropped: u32,
+        #[serde(default)]
+        estimated_next_tokens: Option<u64>,
+        #[serde(default)]
+        threshold_tokens: Option<u64>,
+        #[serde(default)]
+        reserve_tokens: Option<u64>,
     },
-    /// Eine (Auto-)Kompaktierung wurde angewendet.
+    /// Eine (Auto-)Kompaktierung wurde angewendet. `tokens_before` /
+    /// `tokens_after` sind die geschätzten Verlaufs-Tokens vor und nach der
+    /// Kompaktierung, `summarized` meldet, ob eine Zusammenfassung erzeugt
+    /// wurde, und `elided_results` zählt ausgelassene Werkzeugergebnisse.
+    /// Die neuen Felder sind `serde(default)` für ältere Sender.
     CompactionApplied {
         turn_id: Option<TurnId>,
         reason: String,
         items_before: u32,
         items_after: u32,
+        #[serde(default)]
+        tokens_before: Option<u64>,
+        #[serde(default)]
+        tokens_after: Option<u64>,
+        #[serde(default)]
+        summarized: bool,
+        #[serde(default)]
+        elided_results: u32,
     },
 }
 
@@ -422,6 +444,83 @@ mod tests {
             "mode": "plan",
         });
         assert!(serde_json::from_value::<TurnEvent>(malformed).is_err());
+        Ok(())
+    }
+
+    /// Ältere Sender ohne die Welle-3-Felder bleiben lesbar: fehlende
+    /// Felder fallen auf ihre `serde(default)`-Werte zurück.
+    #[test]
+    fn context_and_compaction_events_accept_legacy_wire_form() -> TestResult {
+        let legacy_context = json!({
+            "type": "context_updated",
+            "turn_id": "turn-1",
+            "used_tokens": 1000,
+            "window_tokens": 200000,
+            "history_items_dropped": 0,
+        });
+        match serde_json::from_value::<TurnEvent>(legacy_context)
+            .map_err(ctx("ContextUpdated deserialisiert"))?
+        {
+            TurnEvent::ContextUpdated {
+                estimated_next_tokens,
+                threshold_tokens,
+                reserve_tokens,
+                ..
+            } => {
+                assert_eq!(estimated_next_tokens, None);
+                assert_eq!(threshold_tokens, None);
+                assert_eq!(reserve_tokens, None);
+            }
+            other => {
+                return Err(crate::test_support::TestError::Unexpected(format!(
+                    "unerwartete Variante: {other:?}"
+                )));
+            }
+        }
+
+        let legacy_compaction = json!({
+            "type": "compaction_applied",
+            "turn_id": null,
+            "reason": "auto",
+            "items_before": 10,
+            "items_after": 3,
+        });
+        match serde_json::from_value::<TurnEvent>(legacy_compaction)
+            .map_err(ctx("CompactionApplied deserialisiert"))?
+        {
+            TurnEvent::CompactionApplied {
+                tokens_before,
+                tokens_after,
+                summarized,
+                elided_results,
+                ..
+            } => {
+                assert_eq!(tokens_before, None);
+                assert_eq!(tokens_after, None);
+                assert!(!summarized);
+                assert_eq!(elided_results, 0);
+            }
+            other => {
+                return Err(crate::test_support::TestError::Unexpected(format!(
+                    "unerwartete Variante: {other:?}"
+                )));
+            }
+        }
+
+        let event = TurnEvent::CompactionApplied {
+            turn_id: None,
+            reason: "budget".to_string(),
+            items_before: 10,
+            items_after: 4,
+            tokens_before: Some(90_000),
+            tokens_after: Some(30_000),
+            summarized: true,
+            elided_results: 2,
+        };
+        let value = serde_json::to_value(&event).map_err(ctx("Event serialisiert"))?;
+        assert_eq!(value["tokens_before"], json!(90_000));
+        assert_eq!(value["summarized"], json!(true));
+        assert_eq!(value["elided_results"], json!(2));
         Ok(())
     }
 }

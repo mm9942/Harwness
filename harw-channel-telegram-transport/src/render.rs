@@ -12,7 +12,11 @@ use std::{
 };
 
 use harw_channel::{ApprovalPrompt, ChannelSendOp, InlineAction, OutboundContent, chunk_text};
-use harw_channel_telegram::ApprovalTokenStore;
+use harw_channel_telegram::{
+    ApprovalCallbackContext, ApprovalTokenStore, TelegramChatId, TelegramMessageId,
+    TelegramThreadId,
+};
+use harw_types::PeerId;
 
 use crate::{
     client::{InlineKeyboardButton, SentMessage, TelegramClient},
@@ -195,6 +199,20 @@ struct RenderState {
     global_bucket: Option<Bucket>,
 }
 
+/// Höchstens so lange wartet ein Abschluss (Stream-Ende, Freigabe schließen)
+/// auf ein freies Token der lokalen Buckets, bevor er trotzdem sendet.
+const FINISH_TOKEN_WAIT: Duration = Duration::from_secs(5);
+
+/// Abstand zwischen zwei Versuchen, ein Bucket-Token zu erhalten.
+const TOKEN_POLL_STEP: Duration = Duration::from_millis(100);
+
+/// Präfix der Cache-Schlüssel für Streaming-Blasen, damit sie nie mit
+/// `StatusUpdate`-Schlüsseln kollidieren.
+const STREAM_KEY_PREFIX: &str = "stream:";
+
+/// Auslassungszeichen für gekürzte Zwischenstände.
+const ELLIPSIS: char = '…';
+
 /// Telegram outbound renderer.  The cache and pending status values are
 /// process-local optimizations; they are never durable conversation state.
 pub struct TelegramRenderer {
@@ -203,6 +221,7 @@ pub struct TelegramRenderer {
     config: RendererConfig,
     clock: Arc<dyn Clock>,
     state: Mutex<RenderState>,
+    finish_token_wait: Duration,
 }
 
 impl TelegramRenderer {
@@ -223,6 +242,22 @@ impl TelegramRenderer {
             config,
             Arc::new(SystemClock),
             Arc::new(ApprovalTokenStore::new()),
+        )
+    }
+
+    /// Konstruiert einen konfigurierten Renderer, der den Freigabe-Token-Store
+    /// mit dem Callback-Ingress teilt (ein `Arc` für Adapter und Renderer).
+    #[must_use]
+    pub fn with_config_and_approval_tokens(
+        client: Arc<TelegramClient>,
+        config: RendererConfig,
+        approval_tokens: Arc<ApprovalTokenStore>,
+    ) -> Self {
+        Self::with_config_and_clock_and_approval_tokens(
+            client,
+            config,
+            Arc::new(SystemClock),
+            approval_tokens,
         )
     }
 
@@ -269,7 +304,14 @@ impl TelegramRenderer {
             config,
             clock,
             state: Mutex::new(RenderState::default()),
+            finish_token_wait: FINISH_TOKEN_WAIT,
         }
+    }
+
+    /// Der geteilte Freigabe-Token-Store dieses Renderers.
+    #[must_use]
+    pub fn approval_tokens(&self) -> &Arc<ApprovalTokenStore> {
+        &self.approval_tokens
     }
 
     /// Issues opaque callback tokens and renders an approval for explicit,
@@ -321,6 +363,251 @@ impl TelegramRenderer {
             message,
             issued_tokens: approval.issued_tokens,
         })
+    }
+
+    /// Sendet eine Freigabe und bindet deren Tokens an die tatsächlich
+    /// zugestellte Nachricht und an den berechtigten Genehmiger.
+    ///
+    /// Ablauf: [`Self::prepare_approval`] → [`Self::send_prepared_approval_async`]
+    /// → [`ApprovalDelivery::bind`] mit einem [`ApprovalCallbackContext`], dessen
+    /// `peer` die Telegram-User-ID des Genehmigers (`approver`) und dessen
+    /// `thread_id` der von Telegram gemeldete `message_thread_id` ist.
+    ///
+    /// Scheitert das Senden oder das Binden, werden alle für
+    /// `prompt.request_id` ausgegebenen Tokens widerrufen; ein ungebundener
+    /// Button kann danach nie eingelöst werden.
+    ///
+    /// # Errors
+    /// Transport-/API-Fehler beim Senden, lokales Ratenlimit, `Draft`-Strategie
+    /// oder eine abgelehnte Token-Bindung.
+    pub async fn send_bound_approval_async(
+        &self,
+        chat_id: i64,
+        thread_id: Option<i64>,
+        prompt: &ApprovalPrompt,
+        approver: &PeerId,
+    ) -> TransportResult<SentMessage> {
+        let prepared = self.prepare_approval(prompt);
+        let delivery = match self
+            .send_prepared_approval_async(chat_id, thread_id, prepared)
+            .await
+        {
+            Ok(delivery) => delivery,
+            Err(error) => {
+                let _ = self.approval_tokens.revoke_request(&prompt.request_id);
+                return Err(error);
+            }
+        };
+        let bound = delivery.bind(|token, message| {
+            let mut context = ApprovalCallbackContext::new(
+                TelegramChatId(message.chat_id),
+                TelegramMessageId(message.message_id),
+                approver.clone(),
+            );
+            if let Some(thread) = message.message_thread_id {
+                context = context.with_thread(TelegramThreadId(thread));
+            }
+            self.approval_tokens.bind(token, context)
+        });
+        if bound.is_err() {
+            let _ = self.approval_tokens.revoke_request(&prompt.request_id);
+            // Best effort: tote Schaltflächen entfernen; der Fehler der
+            // Bindung bleibt maßgeblich.
+            let message = delivery.message();
+            let _ = self
+                .client
+                .edit_message_reply_markup(message.chat_id, message.message_id, None)
+                .await;
+            return Err(TelegramTransportError::ApiRejected {
+                method: "bindApproval",
+                code: 0,
+                description:
+                    "Freigabe-Token konnten nicht an die zugestellte Nachricht gebunden werden"
+                        .to_owned(),
+            });
+        }
+        Ok(delivery.message)
+    }
+
+    /// Aktualisiert die Streaming-Blase `stream_key` in `chat_id` mit dem
+    /// bisherigen Gesamttext.
+    ///
+    /// Der Text wird auf `max_message_len` Zeichen gekürzt (mit „…“). Ist ein
+    /// Bucket leer, wird nur der neueste Stand vorgemerkt (Koaleszieren) und
+    /// `Ok` geliefert; der nächste Aufruf oder [`Self::stream_finish_async`]
+    /// überträgt dann den aktuellen Text. Telegrams 400 „message is not
+    /// modified“ gilt als Erfolg.
+    ///
+    /// # Errors
+    /// Transport-/API-Fehler oder `Draft`-Strategie.
+    pub async fn stream_update_async(
+        &self,
+        chat_id: i64,
+        thread_id: Option<i64>,
+        stream_key: &str,
+        text: &str,
+    ) -> TransportResult<()> {
+        if self.config.strategy == StreamingStrategy::Draft {
+            return Err(draft_error());
+        }
+        if text.trim().is_empty() {
+            return Ok(());
+        }
+        let key = stream_cache_key(chat_id, stream_key);
+        let latest = truncate_with_ellipsis(text, self.config.max_message_len);
+        if !self.take_token(chat_id) {
+            self.lock_state().pending.insert(key, latest);
+            return Ok(());
+        }
+        // Der aktuelle Text ist immer neuer als ein vorgemerkter Stand.
+        let _ = self.take_pending(&key);
+        match self.message_id(&key) {
+            Some(message_id) => {
+                match self
+                    .client
+                    .edit_message_text(chat_id, message_id, &latest, None)
+                    .await
+                {
+                    Ok(_) => Ok(()),
+                    Err(error) if is_not_modified(&error) => Ok(()),
+                    Err(error) => {
+                        if is_bad_request(&error) {
+                            // Blase gelöscht o. ä.: nächster Stand beginnt neu.
+                            self.forget(&key);
+                        }
+                        Err(error)
+                    }
+                }
+            }
+            None => {
+                let sent = self
+                    .client
+                    .send_message(chat_id, &latest, thread_id, None)
+                    .await?;
+                self.remember(key, sent.message_id);
+                Ok(())
+            }
+        }
+    }
+
+    /// Schließt den Stream `stream_key` mit dem vollständigen Endtext ab.
+    ///
+    /// Wartet höchstens 5 s auf ein Bucket-Token (und sendet danach trotzdem,
+    /// weil der Endtext nicht verloren gehen darf; Telegrams 429 behandelt der
+    /// Client). Der erste Chunk ersetzt die Streaming-Blase (bzw. wird neu
+    /// gesendet, wenn keine existiert oder sie nicht mehr editierbar ist), alle
+    /// weiteren Chunks folgen als eigene Nachrichten. Der Schlüssel wird in
+    /// jedem Fall vergessen.
+    ///
+    /// # Errors
+    /// Transport-/API-Fehler oder `Draft`-Strategie.
+    pub async fn stream_finish_async(
+        &self,
+        chat_id: i64,
+        thread_id: Option<i64>,
+        stream_key: &str,
+        text: &str,
+    ) -> TransportResult<()> {
+        if self.config.strategy == StreamingStrategy::Draft {
+            return Err(draft_error());
+        }
+        let key = stream_cache_key(chat_id, stream_key);
+        let message_id = self.message_id(&key);
+        self.forget(&key);
+        if text.trim().is_empty() {
+            return Ok(());
+        }
+        let mut chunks = chunk_text(text, self.config.max_message_len).into_iter();
+        let Some(first) = chunks.next() else {
+            return Ok(());
+        };
+        self.wait_for_token(chat_id).await;
+        let edited = match message_id {
+            Some(message_id) => match self
+                .client
+                .edit_message_text(chat_id, message_id, &first, None)
+                .await
+            {
+                Ok(_) => true,
+                Err(error) if is_not_modified(&error) => true,
+                Err(error) if is_bad_request(&error) => false,
+                Err(error) => return Err(error),
+            },
+            None => false,
+        };
+        if !edited {
+            self.client
+                .send_message(chat_id, &first, thread_id, None)
+                .await?;
+        }
+        for chunk in chunks {
+            self.wait_for_token(chat_id).await;
+            self.client
+                .send_message(chat_id, &chunk, thread_id, None)
+                .await?;
+        }
+        Ok(())
+    }
+
+    /// Schließt eine zugestellte Freigabe: entfernt zuerst die Tastatur (damit
+    /// keine weiteren Klicks möglich sind) und ersetzt dann den Text durch
+    /// `outcome_text`. 400 „message is not modified“ gilt jeweils als Erfolg;
+    /// beide Schritte werden versucht, der erste echte Fehler wird gemeldet.
+    ///
+    /// # Errors
+    /// Transport-/API-Fehler oder `Draft`-Strategie.
+    pub async fn close_approval_async(
+        &self,
+        chat_id: i64,
+        message_id: i64,
+        outcome_text: &str,
+    ) -> TransportResult<()> {
+        if self.config.strategy == StreamingStrategy::Draft {
+            return Err(draft_error());
+        }
+        self.wait_for_token(chat_id).await;
+        let markup = self
+            .client
+            .edit_message_reply_markup(chat_id, message_id, None)
+            .await;
+        let text = if outcome_text.trim().is_empty() {
+            Ok(())
+        } else {
+            let outcome = truncate_with_ellipsis(outcome_text, self.config.max_message_len);
+            self.client
+                .edit_message_text(chat_id, message_id, &outcome, None)
+                .await
+                .map(|_| ())
+        };
+        tolerate_not_modified(markup)?;
+        tolerate_not_modified(text)
+    }
+
+    /// Zeigt „schreibt …“ im Chat bzw. Forum-Thema an. Chat-Aktionen belasten
+    /// die Nachrichten-Buckets bewusst nicht.
+    ///
+    /// # Errors
+    /// Transport-/API-Fehler.
+    pub async fn typing_async(&self, chat_id: i64, thread_id: Option<i64>) -> TransportResult<()> {
+        self.client
+            .send_chat_action(chat_id, thread_id, "typing")
+            .await
+    }
+
+    /// Wartet höchstens `finish_token_wait` auf ein Bucket-Token.
+    async fn wait_for_token(&self, chat_id: i64) -> bool {
+        let mut waited = Duration::ZERO;
+        loop {
+            if self.take_token(chat_id) {
+                return true;
+            }
+            if waited >= self.finish_token_wait {
+                return false;
+            }
+            let step = TOKEN_POLL_STEP.min(self.finish_token_wait.saturating_sub(waited));
+            tokio::time::sleep(step).await;
+            waited += step;
+        }
     }
 
     /// Purely maps harness content to Telegram-native operations.
@@ -481,6 +768,20 @@ impl TelegramRenderer {
         }
     }
 
+    fn lock_state(&self) -> std::sync::MutexGuard<'_, RenderState> {
+        self.state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    /// Vergisst Blase, Reihenfolge-Eintrag und vorgemerkten Stand eines Schlüssels.
+    fn forget(&self, key: &(i64, String)) {
+        let mut state = self.lock_state();
+        state.messages.remove(key);
+        state.pending.remove(key);
+        state.order.retain(|existing| existing != key);
+    }
+
     fn message_id(&self, key: &(i64, String)) -> Option<i64> {
         self.state
             .lock()
@@ -550,9 +851,44 @@ fn draft_error() -> TelegramTransportError {
     }
 }
 
-fn block_on<F>(future: F) -> TransportResult<()>
+fn stream_cache_key(chat_id: i64, stream_key: &str) -> (i64, String) {
+    (chat_id, format!("{STREAM_KEY_PREFIX}{stream_key}"))
+}
+
+/// Kürzt `text` auf höchstens `max_chars` Zeichen; gekürzte Texte enden auf „…“.
+/// `max_chars == 0` bedeutet „unbegrenzt“ (wie bei [`chunk_text`]).
+fn truncate_with_ellipsis(text: &str, max_chars: usize) -> String {
+    if max_chars == 0 || text.chars().count() <= max_chars {
+        return text.to_owned();
+    }
+    let mut truncated: String = text.chars().take(max_chars - 1).collect();
+    truncated.push(ELLIPSIS);
+    truncated
+}
+
+fn is_bad_request(error: &TelegramTransportError) -> bool {
+    matches!(error, TelegramTransportError::ApiRejected { code: 400, .. })
+}
+
+/// Telegram meldet ein Edit ohne Änderung als 400 „message is not modified“.
+fn is_not_modified(error: &TelegramTransportError) -> bool {
+    matches!(
+        error,
+        TelegramTransportError::ApiRejected { code: 400, description, .. }
+            if description.to_ascii_lowercase().contains("message is not modified")
+    )
+}
+
+fn tolerate_not_modified(result: TransportResult<()>) -> TransportResult<()> {
+    match result {
+        Err(error) if is_not_modified(&error) => Ok(()),
+        other => other,
+    }
+}
+
+fn block_on<T, F>(future: F) -> TransportResult<T>
 where
-    F: Future<Output = TransportResult<()>>,
+    F: Future<Output = TransportResult<T>>,
 {
     if tokio::runtime::Handle::try_current().is_ok() {
         return Err(rate_error("synchronous-renderer"));
@@ -581,6 +917,50 @@ impl crate::TelegramOutbound for TelegramRenderer {
         content: &OutboundContent,
     ) -> TransportResult<()> {
         block_on(self.edit_async(chat_id, message_id, content))
+    }
+
+    fn send_approval(
+        &self,
+        chat_id: i64,
+        thread_id: Option<i64>,
+        prompt: &ApprovalPrompt,
+        approver: &PeerId,
+    ) -> TransportResult<i64> {
+        block_on(self.send_bound_approval_async(chat_id, thread_id, prompt, approver))
+            .map(|message| message.message_id)
+    }
+
+    fn stream_update(
+        &self,
+        chat_id: i64,
+        thread_id: Option<i64>,
+        stream_key: &str,
+        text: &str,
+    ) -> TransportResult<()> {
+        block_on(self.stream_update_async(chat_id, thread_id, stream_key, text))
+    }
+
+    fn stream_finish(
+        &self,
+        chat_id: i64,
+        thread_id: Option<i64>,
+        stream_key: &str,
+        text: &str,
+    ) -> TransportResult<()> {
+        block_on(self.stream_finish_async(chat_id, thread_id, stream_key, text))
+    }
+
+    fn close_approval(
+        &self,
+        chat_id: i64,
+        message_id: i64,
+        outcome_text: &str,
+    ) -> TransportResult<()> {
+        block_on(self.close_approval_async(chat_id, message_id, outcome_text))
+    }
+
+    fn typing(&self, chat_id: i64, thread_id: Option<i64>) -> TransportResult<()> {
+        block_on(self.typing_async(chat_id, thread_id))
     }
 }
 
@@ -743,6 +1123,178 @@ mod tests {
             delivery.bind(|token, _| token == "first"),
             Err(ApprovalBindingError::Rejected { bound: 1 })
         );
+    }
+
+    fn approval_prompt() -> ApprovalPrompt {
+        ApprovalPrompt {
+            request_id: "turn:req-1".to_owned(),
+            summary: "Datei schreiben".to_owned(),
+            risk: "medium".to_owned(),
+            actions: vec![
+                ApprovalAction {
+                    label: "Erlauben".to_owned(),
+                    decision: "approve".to_owned(),
+                },
+                ApprovalAction {
+                    label: "Ablehnen".to_owned(),
+                    decision: "deny".to_owned(),
+                },
+            ],
+        }
+    }
+
+    #[test]
+    fn truncation_keeps_short_text_and_marks_cut_text_with_ellipsis() {
+        assert_eq!(truncate_with_ellipsis("abc", 3), "abc");
+        assert_eq!(truncate_with_ellipsis("abcd", 3), "ab…");
+        assert_eq!(truncate_with_ellipsis("🙂🙂🙂🙂", 2), "🙂…");
+        assert_eq!(truncate_with_ellipsis("abcd", 0), "abcd");
+        assert_eq!(truncate_with_ellipsis("abcd", 1), "…");
+    }
+
+    #[test]
+    fn only_not_modified_bad_requests_are_tolerated() {
+        let not_modified = TelegramTransportError::ApiRejected {
+            method: "editMessageText",
+            code: 400,
+            description: "Bad Request: message is not modified: specified new message content \
+                          and reply markup are exactly the same"
+                .to_owned(),
+        };
+        let other_bad_request = TelegramTransportError::ApiRejected {
+            method: "editMessageText",
+            code: 400,
+            description: "Bad Request: message to edit not found".to_owned(),
+        };
+        assert!(is_not_modified(&not_modified));
+        assert!(!is_not_modified(&other_bad_request));
+        assert!(is_bad_request(&other_bad_request));
+        assert!(tolerate_not_modified(Err(not_modified)).is_ok());
+        assert!(tolerate_not_modified(Err(other_bad_request)).is_err());
+    }
+
+    #[tokio::test]
+    async fn throttled_stream_update_coalesces_truncated_latest_text() -> TestResult {
+        let renderer = renderer(RendererConfig {
+            per_chat_per_sec: 0,
+            max_message_len: 4,
+            ..RendererConfig::default()
+        });
+        renderer
+            .stream_update_async(7, None, "turn-1", "erst")
+            .await
+            .map_err(ctx("gedrosselter Zwischenstand darf nicht fehlschlagen"))?;
+        renderer
+            .stream_update_async(7, None, "turn-1", "neuester Stand")
+            .await
+            .map_err(ctx("gedrosselter Zwischenstand darf nicht fehlschlagen"))?;
+        let key = stream_cache_key(7, "turn-1");
+        assert_eq!(renderer.take_pending(&key).as_deref(), Some("neu…"));
+        assert_eq!(renderer.take_pending(&key), None);
+        Ok(())
+    }
+
+    #[test]
+    fn stream_keys_do_not_collide_with_status_keys() {
+        assert_ne!(stream_cache_key(7, "turn"), (7, "turn".to_owned()));
+    }
+
+    #[tokio::test]
+    async fn empty_stream_finish_forgets_bubble_without_network() -> TestResult {
+        let renderer = renderer(RendererConfig::default());
+        let key = stream_cache_key(7, "turn-1");
+        renderer.remember(key.clone(), 55);
+        renderer
+            .lock_state()
+            .pending
+            .insert(key.clone(), "alt".to_owned());
+        renderer
+            .stream_finish_async(7, None, "turn-1", "  ")
+            .await
+            .map_err(ctx("leerer Abschluss darf nicht fehlschlagen"))?;
+        assert_eq!(renderer.message_id(&key), None);
+        assert_eq!(renderer.take_pending(&key), None);
+        assert!(renderer.lock_state().order.is_empty());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn failed_bound_approval_revokes_every_issued_token() -> TestResult {
+        let store = Arc::new(ApprovalTokenStore::new());
+        let renderer = TelegramRenderer::with_config_and_clock_and_approval_tokens(
+            Arc::new(TelegramClient::new("test-token")),
+            RendererConfig {
+                per_chat_per_sec: 0,
+                ..RendererConfig::default()
+            },
+            Arc::new(TestClock::default()),
+            Arc::clone(&store),
+        );
+        assert!(Arc::ptr_eq(renderer.approval_tokens(), &store));
+        let result = renderer
+            .send_bound_approval_async(7, None, &approval_prompt(), &PeerId::from_str("42"))
+            .await;
+        let Err(error) = result else {
+            return Err(TestError::Unexpected(
+                "ohne Bucket-Token darf keine Freigabe gesendet werden".into(),
+            ));
+        };
+        assert!(matches!(
+            error,
+            TelegramTransportError::ApiRejected { code: 429, .. }
+        ));
+        assert_eq!(store.len(), 0);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn draft_strategy_fails_closed_for_streaming_and_approvals() -> TestResult {
+        let store = Arc::new(ApprovalTokenStore::new());
+        let renderer = TelegramRenderer::with_config_and_clock_and_approval_tokens(
+            Arc::new(TelegramClient::new("test-token")),
+            RendererConfig {
+                strategy: StreamingStrategy::Draft,
+                ..RendererConfig::default()
+            },
+            Arc::new(TestClock::default()),
+            Arc::clone(&store),
+        );
+        if renderer
+            .stream_update_async(7, None, "k", "text")
+            .await
+            .is_ok()
+            || renderer
+                .stream_finish_async(7, None, "k", "text")
+                .await
+                .is_ok()
+            || renderer
+                .close_approval_async(7, 1, "erledigt")
+                .await
+                .is_ok()
+            || renderer
+                .send_bound_approval_async(7, None, &approval_prompt(), &PeerId::from_str("42"))
+                .await
+                .is_ok()
+        {
+            return Err(TestError::Unexpected(
+                "Draft muss vor jeder Netzwerknutzung scheitern".into(),
+            ));
+        }
+        assert_eq!(store.len(), 0);
+        Ok(())
+    }
+
+    #[test]
+    fn synchronous_outbound_refuses_to_nest_inside_a_runtime() -> TestResult {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .map_err(ctx("Test-Runtime bauen"))?;
+        let renderer = renderer(RendererConfig::default());
+        let result =
+            runtime.block_on(async { crate::TelegramOutbound::typing(&renderer, 7, None) });
+        assert!(result.is_err());
+        Ok(())
     }
 
     #[tokio::test]

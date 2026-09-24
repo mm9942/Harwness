@@ -90,13 +90,19 @@ mod tests {
 
     #[test]
     fn test_interpret_fd_target_strips_deleted_suffix() {
-        assert_eq!(interpret_fd_target("/tmp/secret.txt (deleted)"), "/tmp/secret.txt");
+        assert_eq!(
+            interpret_fd_target("/tmp/secret.txt (deleted)"),
+            "/tmp/secret.txt"
+        );
     }
 
     #[test]
     fn test_interpret_fd_target_does_not_strip_partial_match() {
         // Eine Datei, die zufällig auf "(deleted)" endet, ohne das führende
         // Leerzeichen des echten Kernel-Zusatzes, bleibt unverändert.
-        assert_eq!(interpret_fd_target("/tmp/not(deleted)"), "/tmp/not(deleted)");
+        assert_eq!(
+            interpret_fd_target("/tmp/not(deleted)"),
+            "/tmp/not(deleted)"
+        );
     }
 }

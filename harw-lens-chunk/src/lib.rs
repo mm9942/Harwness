@@ -79,7 +79,7 @@ mod rust_code;
 mod util;
 
 pub use markdown::chunk_markdown;
-pub use plain::{chunk_plain, DEFAULT_OVERLAP_BYTES, DEFAULT_TARGET_BYTES};
+pub use plain::{DEFAULT_OVERLAP_BYTES, DEFAULT_TARGET_BYTES, chunk_plain};
 pub use relations::suggest_relations;
 pub use rust_code::chunk_rust;
 

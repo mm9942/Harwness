@@ -1,11 +1,18 @@
 //! Standalone `harw` process entrypoint.
 //!
-//! Ohne Subcommand startet `harw` den interaktiven ratatui-Chat (`chat`),
-//! nachdem der Root-Space `~/.harw` sichergestellt und — beim Erststart — der
-//! Onboarding-Wizard (`onboarding`) durchlaufen wurde. Die Subcommands
-//! (`init`, `onboard`, `doctor`, `serve`, `web`, `project`, `classify`, `run`)
-//! decken Einrichtung, Validierung, den MCP-Listener, die Web-Oberfläche,
-//! Projekt-Trust und Bootstrap-Pfade ab. `harw serve` fährt bei SIGTERM/SIGINT
+//! Ohne Subcommand (oder mit `chat`) startet `harw` den interaktiven
+//! ratatui-Chat (`chat`), nachdem der Root-Space `~/.harw` sichergestellt und
+//! — beim Erststart — der Onboarding-Wizard (`onboarding`) durchlaufen wurde;
+//! `exec` beantwortet einen einzelnen Prompt ohne Oberfläche. Die übrigen
+//! Subcommands decken Sitzungen, Konfiguration, Anbieter und Modelle,
+//! Agenten und Wissen, Aufträge, Dienste (MCP-Listener, Web-Oberfläche,
+//! Gateway) sowie Einrichtung und Diagnose ab. Ältere Befehlsnamen werden
+//! weiterhin angenommen und mit einem Hinweis auf den neuen Namen umgeleitet.
+//!
+//! Vor dem Routing wendet [`apply_process_globals`] `-C/--cwd` und
+//! `--profile` prozessweit an; [`dispatch`] lehnt Sitzungs-Flags außerhalb
+//! von `chat`/`exec`/`analyze` und `--json` bei Befehlen ohne JSON-Ausgabe
+//! ab. `harw serve` fährt bei SIGTERM/SIGINT
 //! geordnet herunter ([`serve_until`]); sein Job-Worker läuft auf einem eigenen
 //! Thread mit eigener Tokio-Runtime, damit blockierende Store-I/O den
 //! MCP-Listener nicht aushungert. Die
@@ -20,6 +27,7 @@
 #[global_allocator]
 static GLOBAL_ALLOCATOR: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 
+mod agent_cmd;
 mod auth;
 mod chat;
 mod cli;
@@ -29,6 +37,8 @@ mod doc_ocr;
 mod gateway;
 mod home;
 mod job_worker;
+mod jobs_cmd;
+mod knowledge_cmd;
 mod lens;
 mod lifecycle;
 mod mcp;
@@ -36,7 +46,10 @@ mod mcp_auth;
 mod models;
 mod observe;
 mod onboarding;
+mod op_bridge;
+mod output;
 mod project_trust;
+mod provider_cmd;
 mod resume;
 mod runtime_entry;
 mod runtime_gateway;
@@ -44,19 +57,23 @@ mod runtime_jobs;
 mod runtime_web;
 mod sandbox_cmd;
 mod secret_store;
+mod session_cmd;
 mod settings;
+mod telegram_launcher;
 #[cfg(test)]
 mod test_support;
 mod uia_bootstrap;
 mod web;
 mod worker_cancellation;
 
+use std::ffi::OsString;
 use std::future::Future;
 use std::path::{Path, PathBuf};
-use std::process::Command as ProcessCommand;
+use std::process::{Command as ProcessCommand, ExitCode};
 use std::sync::Arc;
 use std::time::Duration;
 
+#[cfg(test)]
 use clap::Parser;
 use harw_config::{
     McpJobCapabilityToml, OriginAllowlistToml, PlanSection, ProviderToml, ResolvedConfig,
@@ -91,7 +108,11 @@ use harw_types::{
 use tokio::runtime::Builder;
 use worker_cancellation::RegistryWorkerCancellationSink;
 
-use cli::{AnalyzeArgs, Cli, Command};
+use cli::{
+    AgentAction, AnalyzeArgs, AnalyzeOrder, ChannelAction, ChatArgs, Cli, Command, DebugAction,
+    GlobalArgs, KnowledgeAction, ModelsAction, SessionAction,
+};
+use output::Printer;
 
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -146,38 +167,10 @@ pub fn log_sensitive_enabled() -> bool {
     LOG_SENSITIVE.load(Ordering::Relaxed)
 }
 
-/// Initializes the global `tracing` subscriber for the binary.
-///
-/// # Description
-///
-/// Must be called exactly once, as the very first statement after argument
-/// parsing. Libraries must **never** call this function — subscriber
-/// installation is the binary's exclusive responsibility.
-///
-/// The subscriber uses `tracing_subscriber::EnvFilter`, which accepts the same
-/// directive syntax as `RUST_LOG` (e.g. `"debug"`,
-/// `"harw_core=trace,info"`). If `level` cannot be parsed, the filter falls
-/// back to `"info"` so the process always starts with a usable subscriber.
-///
-/// When `log_sensitive` is `true` the global [`LOG_SENSITIVE`] flag is set and
-/// a `warn!` event is emitted immediately after subscriber installation to
-/// remind operators that sensitive data may appear in logs.
-///
-/// # Arguments
-///
-/// - `level` (`&str`): tracing filter directive passed verbatim to
-///   [`tracing_subscriber::EnvFilter::try_new`].
-/// - `log_sensitive` (`bool`): when `true`, enables [`log_sensitive_enabled`]
-///   and emits a startup warning.
-///
-/// # Panics
-///
-/// Panics if a global subscriber has already been installed (only possible if
-/// this function is called twice, which is a programming error).
 /// Öffnet (und rotiert bei Bedarf) das Datei-Log der TUI.
 fn open_tui_log_file() -> Option<std::fs::File> {
     const MAX_BYTES: u64 = 10 * 1024 * 1024;
-    let dir = harw_home::logs_dir(&harw_home::home_dir().ok()?);
+    let dir = harw_home::paths::logs_dir(&harw_home::home_dir().ok()?);
     std::fs::create_dir_all(&dir).ok()?;
     let path = dir.join("tui.log");
     if std::fs::metadata(&path).is_ok_and(|meta| meta.len() > MAX_BYTES) {
@@ -190,19 +183,164 @@ fn open_tui_log_file() -> Option<std::fs::File> {
         .ok()
 }
 
-fn init_tracing(level: &str, log_sensitive: bool, tui_active: bool) {
+/// Filter-Vorgabe, wenn weder `--log`, `RUST_LOG` noch ein vom Default
+/// abweichendes `[logging] level` gesetzt ist.
+///
+/// Standardmäßig auf `warn` reduziert, damit die interaktive TUI (Alternate
+/// Screen) nicht durch Info-Spans überschrieben wird und Subcommands ruhig
+/// bleiben. Ein explizites `--log info` (oder `RUST_LOG=info`) bleibt möglich.
+const DEFAULT_LOG_FILTER: &str = "warn";
+
+/// Default-Wert von `[logging] level` (siehe `harw_config::LoggingSection`).
+///
+/// Da das Feld kein `Option` ist, lässt sich ein explizit gesetztes
+/// `level = "info"` nicht vom Default unterscheiden; beides fällt deshalb auf
+/// [`DEFAULT_LOG_FILTER`] zurück.
+const CONFIG_DEFAULT_LOG_LEVEL: &str = "info";
+
+/// Wählt die wirksame Tracing-Filter-Direktive.
+///
+/// # Description
+///
+/// Präzedenz (erste gültige gewinnt):
+/// 1. explizit auf der Kommandozeile übergebenes `--log` (beim Parsen bereits
+///    über `LogFilterParser` validiert);
+/// 2. die Umgebungsvariable `RUST_LOG`, sofern nicht leer und als
+///    `EnvFilter`-Direktive gültig;
+/// 3. `[logging] level` der effektiven Harness-Konfiguration, sofern gültig
+///    und vom Default (`"info"`) verschieden;
+/// 4. [`DEFAULT_LOG_FILTER`].
+///
+/// Ungültige Werte der Stufen 2 und 3 werden übersprungen, damit der Prozess
+/// immer mit einem brauchbaren Subscriber startet.
+///
+/// # Arguments
+///
+/// - `cli_explicit` (`Option<&str>`): `--log`, nur wenn auf der Kommandozeile
+///   gesetzt (nicht der clap-Default).
+/// - `rust_log` (`Option<&str>`): Wert von `RUST_LOG`, falls gesetzt.
+/// - `config_level` (`Option<&str>`): `[logging] level`, falls die
+///   Konfiguration geladen werden konnte.
+///
+/// # Returns
+///
+/// Die Direktive, die an `EnvFilter::try_new` geht.
+fn resolve_log_directive(
+    cli_explicit: Option<&str>,
+    rust_log: Option<&str>,
+    config_level: Option<&str>,
+) -> String {
     use tracing_subscriber::EnvFilter;
-    // Standardmäßig auf `warn` reduzieren, damit die interaktive TUI (Alternate
-    // Screen) nicht durch Info-Spans überschrieben wird. `--log info` bleibt
-    // explizit möglich, wenn Nutzer:innen tiefere Traces wollen.
-    let effective = if level.eq_ignore_ascii_case("info") {
-        "warn"
-    } else {
-        level
-    };
-    // `--log` wird bereits beim Parsen validiert (`LogFilterParser`); der
-    // `warn`-Fallback ist nur noch eine defensive No-op-Absicherung.
-    let filter = EnvFilter::try_new(effective).unwrap_or_else(|_| EnvFilter::new("warn"));
+    if let Some(level) = cli_explicit {
+        return level.to_owned();
+    }
+    let valid = |value: &str| !value.trim().is_empty() && EnvFilter::try_new(value).is_ok();
+    if let Some(value) = rust_log.filter(|value| valid(value)) {
+        return value.to_owned();
+    }
+    if let Some(value) = config_level.filter(|value| {
+        !value.trim().eq_ignore_ascii_case(CONFIG_DEFAULT_LOG_LEVEL) && valid(value)
+    }) {
+        return value.to_owned();
+    }
+    DEFAULT_LOG_FILTER.to_owned()
+}
+
+/// Lädt best-effort den `[logging]`-Abschnitt der effektiven Konfiguration.
+///
+/// # Description
+///
+/// Läuft *vor* der Installation des Subscribers: Home auflösen
+/// ([`home::resolve_home`]), vertraute Layer bestimmen
+/// ([`harw_home::config_layers`]) und die Kette über
+/// [`discover_config`] zusammenführen — dieselbe Kette wie `harw settings`.
+/// Es wird nichts angelegt und nichts migriert: existiert das Home noch nicht
+/// (Erststart, `harw init`), gelten stumm die Defaults. Andere Fehler werden
+/// nur außerhalb der TUI auf `stderr` gemeldet (der Alternate Screen darf
+/// nicht beschrieben werden); der eigentliche Befehl meldet eine kaputte
+/// Konfiguration ohnehin selbst.
+///
+/// # Arguments
+///
+/// - `home_override` (`Option<PathBuf>`): `--home`.
+/// - `tui_active` (`bool`): unterdrückt die `stderr`-Warnung.
+///
+/// # Returns
+///
+/// `Some(section)` bei erfolgreich geladener Konfiguration, sonst `None`.
+fn load_logging_section(
+    home_override: Option<PathBuf>,
+    tui_active: bool,
+) -> Option<harw_config::LoggingSection> {
+    let home = home::resolve_home(home_override).ok()?;
+    if !home.is_dir() {
+        return None;
+    }
+    let loaded = harw_home::config_layers(&home)
+        .map_err(|error| error.to_string())
+        .and_then(|layers| discover_config(&layers).map_err(|error| error.to_string()));
+    match loaded {
+        Ok(config) => Some(config.harness.logging),
+        Err(error) => {
+            if !tui_active {
+                eprintln!("harw: [logging] nicht geladen, verwende Defaults: {error}");
+            }
+            None
+        }
+    }
+}
+
+/// Wirksame Tracing-Einstellungen nach Auflösung von CLI, Umgebung und
+/// Konfiguration.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct TracingSettings {
+    /// `EnvFilter`-Direktive (siehe [`resolve_log_directive`]).
+    directive: String,
+    /// `[logging] json`: Ereignisse als zeilenweises JSON formatieren.
+    json: bool,
+    /// `[logging] target_module_paths`: Modulpfad (`target`) je Ereignis
+    /// anzeigen (entspricht `fmt().with_target(..)`).
+    target_module_paths: bool,
+    /// `--log-sensitive`.
+    log_sensitive: bool,
+}
+
+/// Initializes the global `tracing` subscriber for the binary.
+///
+/// # Description
+///
+/// Must be called exactly once, as the very first statement after argument
+/// parsing. Libraries must **never** call this function — subscriber
+/// installation is the binary's exclusive responsibility.
+///
+/// The subscriber uses `tracing_subscriber::EnvFilter` with
+/// `settings.directive` (already resolved by [`resolve_log_directive`]:
+/// `--log` > `RUST_LOG` > `[logging] level` > `warn`). If the directive cannot
+/// be parsed, the filter falls back to `"warn"` so the process always starts
+/// with a usable subscriber.
+///
+/// Außerhalb der TUI geht die Ausgabe nach `stderr`; `[logging] json` schaltet
+/// auf den JSON-Formatter, `[logging] target_module_paths` blendet den
+/// Modulpfad ein. In der TUI wird nie ins Terminal geschrieben, sondern nur in
+/// `<HARW_HOME>/logs/tui.log` (Target immer an, JSON gemäß Konfiguration).
+///
+/// When `log_sensitive` is `true` the global [`LOG_SENSITIVE`] flag is set and
+/// a `warn!` event is emitted immediately after subscriber installation to
+/// remind operators that sensitive data may appear in logs.
+///
+/// # Arguments
+///
+/// - `settings` (`&TracingSettings`): aufgelöste Einstellungen.
+/// - `tui_active` (`bool`): interaktive TUI läuft (Alternate Screen).
+///
+/// # Panics
+///
+/// Panics if a global subscriber has already been installed (only possible if
+/// this function is called twice, which is a programming error).
+fn init_tracing(settings: &TracingSettings, tui_active: bool) {
+    use tracing_subscriber::EnvFilter;
+    let filter = EnvFilter::try_new(&settings.directive)
+        .unwrap_or_else(|_| EnvFilter::new(DEFAULT_LOG_FILTER));
     // Im Alternate-Screen ist auch STDERR sichtbar. Ein `fmt`-Layer darf in
     // der TUI daher gar nicht installiert werden: Ein Sink-Writer schützt nur
     // diesen einen Layer, nicht spätere Writer/Layers. Die reine Registry
@@ -214,25 +352,40 @@ fn init_tracing(level: &str, log_sensitive: bool, tui_active: bool) {
         // (bei > 10 MiB beim Start nach `tui.log.1` rotiert). Ohne auflösbares
         // Home bleibt es bei der reinen Registry.
         match open_tui_log_file() {
-            Some(file) => tracing_subscriber::registry()
-                .with(filter)
-                .with(
-                    tracing_subscriber::fmt::layer()
-                        .with_ansi(false)
-                        .with_target(true)
-                        .with_writer(std::sync::Mutex::new(file)),
-                )
-                .init(),
+            Some(file) => {
+                let layer = tracing_subscriber::fmt::layer()
+                    .with_ansi(false)
+                    .with_target(true)
+                    .with_writer(std::sync::Mutex::new(file));
+                if settings.json {
+                    tracing_subscriber::registry()
+                        .with(filter)
+                        .with(layer.json())
+                        .init();
+                } else {
+                    tracing_subscriber::registry()
+                        .with(filter)
+                        .with(layer)
+                        .init();
+                }
+            }
             None => tracing_subscriber::registry().with(filter).init(),
         }
+    } else if settings.json {
+        tracing_subscriber::fmt()
+            .json()
+            .with_env_filter(filter)
+            .with_target(settings.target_module_paths)
+            .with_writer(std::io::stderr)
+            .init();
     } else {
         tracing_subscriber::fmt()
             .with_env_filter(filter)
-            .with_target(false)
+            .with_target(settings.target_module_paths)
             .with_writer(std::io::stderr)
             .init();
     }
-    if log_sensitive {
+    if settings.log_sensitive {
         LOG_SENSITIVE.store(true, Ordering::Relaxed);
         tracing::warn!(
             "--log-sensitive is enabled: prompts, tool-args and responses will be logged. \
@@ -241,10 +394,106 @@ fn init_tracing(level: &str, log_sensitive: bool, tui_active: bool) {
     }
 }
 
-fn main() {
-    let cli = Cli::parse();
-    let tui_active = cli.command.is_none() && cli.chat.prompt.is_none();
-    init_tracing(&cli.chat.log, cli.chat.log_sensitive, tui_active);
+/// Parst die Kommandozeile und meldet, ob `--log` explizit gesetzt wurde.
+///
+/// Entspricht `Cli::parse()` (Fehler/`--help` beenden den Prozess über
+/// `clap::Error::exit`), behält aber die `ArgMatches`, um den clap-Default
+/// `info` von einem expliziten `--log info` zu unterscheiden. Geparst wird
+/// gegen [`cli::command`], damit Hilfe und Fehler die deutschen Texte zeigen.
+fn parse_cli() -> (Cli, bool) {
+    use clap::FromArgMatches;
+    let mut matches = cli::command().get_matches();
+    let log_explicit = log_flag_explicit(&matches);
+    match Cli::from_arg_matches_mut(&mut matches) {
+        Ok(cli) => (cli, log_explicit),
+        Err(error) => error.format(&mut cli::command()).exit(),
+    }
+}
+
+/// `true`, wenn `--log` auf der Kommandozeile stand (auch hinter einem
+/// Subcommand; clap propagiert globale Argumente zur Wurzel).
+fn log_flag_explicit(matches: &clap::ArgMatches) -> bool {
+    matches!(
+        matches.value_source("log"),
+        Some(clap::parser::ValueSource::CommandLine)
+    )
+}
+
+/// Erkennt `harw kill …` direkt in den rohen Prozessargumenten.
+///
+/// Liefert die Argumente hinter `kill` unverändert, wenn `kill` das erste
+/// Argument nach dem Programmnamen ist, sonst `None`. Läuft **vor** dem
+/// clap-Parse von [`Cli`]: dessen globale Flags (`--log`, `--verbose`,
+/// `--home`, …) würden killer-eigene gleichnamige Flags sonst abfangen.
+fn kill_passthrough_args<I>(args: I) -> Option<Vec<OsString>>
+where
+    I: IntoIterator<Item = OsString>,
+{
+    let mut args = args.into_iter();
+    let _program = args.next()?;
+    let first = args.next()?;
+    (first == "kill").then(|| args.collect())
+}
+
+/// Führt `harw kill` aus: reicht `args` unverändert an killer weiter.
+///
+/// killer parst selbst (inkl. `--help`), initialisiert sein eigenes Tracing
+/// (`--log`) und startet den sudo-Helfer bei Bedarf als
+/// `<harw> kill --helper …` neu. Deshalb läuft dieser Pfad vor
+/// [`init_tracing`].
+#[cfg(target_os = "linux")]
+fn run_kill(args: Vec<OsString>) -> ExitCode {
+    let argv = std::iter::once(OsString::from("harw kill")).chain(args);
+    harw_killer::run_cli(
+        argv,
+        harw_killer::HelperInvocation::Subcommand(vec![OsString::from("kill")]),
+    )
+}
+
+/// `harw kill` gibt es nur unter Linux (killer braucht pidfd).
+#[cfg(not(target_os = "linux"))]
+fn run_kill(_args: Vec<OsString>) -> ExitCode {
+    eprintln!("harw: `harw kill` ist nur unter Linux verfügbar");
+    ExitCode::from(2)
+}
+
+fn main() -> ExitCode {
+    if let Some(args) = kill_passthrough_args(std::env::args_os()) {
+        return run_kill(args);
+    }
+    let cli = match parse_cli() {
+        // `harw <Root-Flags> kill …`: ebenfalls vor dem Tracing-Init an
+        // killer übergeben.
+        (
+            Cli {
+                command: Some(Command::Kill { args }),
+                ..
+            },
+            _,
+        ) => return run_kill(args),
+        parsed => parsed,
+    };
+    let (cli, log_explicit) = cli;
+    // `-C` und `--profile` gelten prozessweit und müssen vor dem ersten
+    // Pfadzugriff (auch dem Laden von `[logging]`) wirken.
+    if let Err(error) = apply_process_globals(&cli.global) {
+        eprintln!("harw: {error}");
+        return ExitCode::from(2);
+    }
+    let tui_active = starts_tui(&cli);
+    let logging = load_logging_section(cli.global.home.clone(), tui_active).unwrap_or_default();
+    let rust_log = std::env::var("RUST_LOG").ok();
+    let settings = TracingSettings {
+        directive: resolve_log_directive(
+            log_explicit.then_some(cli.global.log.as_str()),
+            rust_log.as_deref(),
+            Some(logging.level.as_str()),
+        ),
+        json: logging.json,
+        target_module_paths: logging.target_module_paths,
+        log_sensitive: cli.global.log_sensitive,
+    };
+    init_tracing(&settings, tui_active);
     let code = match dispatch(cli) {
         Ok(()) => 0,
         Err(error) => {
@@ -255,61 +504,287 @@ fn main() {
     std::process::exit(code);
 }
 
+/// Wendet die prozessweiten globalen Flags `-C/--cwd` und `--profile` an.
+///
+/// # Description
+/// `-C DIR` wechselt das Arbeitsverzeichnis des Prozesses, sodass jeder
+/// Befehl so arbeitet, als wäre `harw` in `DIR` gestartet worden.
+/// `--profile NAME` legt das aktive Profil prozessweit fest
+/// ([`harw_home::paths::set_profile_override`]) und hat damit Vorrang vor
+/// `HARW_PROFILE`. Beides muss vor dem ersten Pfadzugriff geschehen.
+///
+/// # Errors
+/// Ein deutscher Fehlertext, wenn das Verzeichnis nicht gewechselt werden
+/// kann oder der Profilname ungültig ist.
+fn apply_process_globals(global: &GlobalArgs) -> Result<(), String> {
+    if let Some(dir) = global.cwd.as_deref() {
+        std::env::set_current_dir(dir).map_err(|error| {
+            format!(
+                "Arbeitsverzeichnis {} kann nicht gewechselt werden (-C/--cwd): {error}",
+                dir.display()
+            )
+        })?;
+    }
+    if let Some(profile) = global.profile.clone() {
+        harw_home::paths::set_profile_override(profile.clone()).map_err(|error| {
+            format!("Profil '{profile}' kann nicht verwendet werden (--profile): {error}")
+        })?;
+    }
+    Ok(())
+}
+
+/// `true`, wenn der Aufruf die interaktive Oberfläche (Alternate Screen)
+/// startet: `harw`/`harw chat` ohne ersten Prompt sowie `harw session resume`.
+fn starts_tui(cli: &Cli) -> bool {
+    match &cli.command {
+        None => cli.chat.prompt.is_none(),
+        Some(Command::Chat(args)) => args.prompt.is_none(),
+        Some(Command::Session {
+            action: SessionAction::Resume { .. },
+        }) => true,
+        Some(_) => false,
+    }
+}
+
+/// Befehlsname, wie ihn die Person tippt (für Fehlermeldungen).
+///
+/// # Returns
+/// `"harw"` ohne Subcommand, sonst `"harw <befehl>"`.
+fn command_label(command: Option<&Command>) -> String {
+    let name = match command {
+        None => return "harw".to_owned(),
+        Some(command) => match command {
+            Command::Chat(_) => "chat",
+            Command::Exec(_) => "exec",
+            Command::Analyze(_) => "analyze",
+            Command::Session { .. } => "session",
+            Command::Config { .. } => "config",
+            Command::Provider { .. } => "provider",
+            Command::Model { .. } => "model",
+            Command::Auth { .. } => "auth",
+            Command::Project { .. } => "project",
+            Command::Agent { .. } => "agent",
+            Command::Knowledge { .. } => "knowledge",
+            Command::Jobs { .. } => "jobs",
+            Command::Gateway { .. } => "gateway",
+            Command::Serve { .. } => "serve",
+            Command::Web { .. } => "web",
+            Command::Service { .. } => "service",
+            Command::Mcp { .. } => "mcp",
+            Command::Channel { .. } => "channel",
+            Command::Init => "init",
+            Command::Onboard => "onboard",
+            Command::Doctor { .. } => "doctor",
+            Command::Update { .. } => "update",
+            Command::Uninstall { .. } => "uninstall",
+            Command::Completions(_) => "completions",
+            Command::BugReport { .. } => "bug-report",
+            Command::Sandbox { .. } => "sandbox",
+            Command::Debug { .. } => "debug",
+            Command::Kill { .. } => "kill",
+            Command::Connect { .. } => "connect",
+            Command::Lens { .. } => "lens",
+            Command::Uia { .. } => "uia",
+            Command::Catalog { .. } => "catalog",
+            Command::Run { .. } => "run",
+            Command::Classify { .. } => "classify",
+        },
+    };
+    format!("harw {name}")
+}
+
+/// Lehnt Sitzungs-Flags bei Befehlen ab, die keine Sitzung starten.
+///
+/// # Description
+/// `--mode`, `--approval`, `--model`, `--goal` und `--add-dir` wirken nur
+/// bei `harw`/`harw chat`, `harw exec` und `harw analyze`. Bei jedem anderen
+/// Befehl würden sie still ignoriert; stattdessen bricht der Aufruf mit
+/// einem Hinweis ab. `analyze` startet keine Sitzung mit zusätzlichen
+/// Arbeitsverzeichnissen, deshalb gilt dort `--add-dir` ebenfalls als
+/// Fehler.
+///
+/// # Errors
+/// Ein deutscher Fehlertext, der die Flags, den Befehl und die zulässigen
+/// Befehle nennt.
+fn reject_misplaced_session_flags(
+    command: Option<&Command>,
+    global: &GlobalArgs,
+) -> Result<(), String> {
+    let used = global.session_flags_used();
+    if used.is_empty() {
+        return Ok(());
+    }
+    match command {
+        None | Some(Command::Chat(_) | Command::Exec(_)) => Ok(()),
+        Some(Command::Analyze(_)) => {
+            if global.add_dir.is_empty() {
+                Ok(())
+            } else {
+                Err("`--add-dir` wirkt nur bei `harw chat` und `harw exec`, \
+                     nicht bei `harw analyze`"
+                    .to_owned())
+            }
+        }
+        Some(other) => {
+            let flags = used
+                .iter()
+                .map(|flag| format!("`{flag}`"))
+                .collect::<Vec<_>>()
+                .join(", ");
+            Err(format!(
+                "{flags} gilt nur für `harw chat`, `harw exec` und `harw analyze`, \
+                 nicht für `{}`",
+                command_label(Some(other))
+            ))
+        }
+    }
+}
+
+/// Lehnt `--json` bei Befehlen ohne JSON-Ausgabe ab.
+///
+/// # Description
+/// JSON liefern `harw session list|show`, `harw jobs …`,
+/// `harw knowledge memory|proposals` und `harw agent skills|plugins`; diese
+/// Befehle (und `provider`) prüfen ihre Unterfälle selbst. Jeder andere
+/// Befehl bricht mit `--json` ab, statt stillschweigend Text auszugeben.
+///
+/// # Errors
+/// Der Fehlertext von [`Printer::require_text`] mit dem Befehlsnamen.
+fn reject_unsupported_json(command: Option<&Command>, global: &GlobalArgs) -> Result<(), String> {
+    if !global.json {
+        return Ok(());
+    }
+    let printer = Printer::new(global.output());
+    match command {
+        Some(Command::Session {
+            action: SessionAction::Resume { .. },
+        }) => printer.require_text("harw session resume"),
+        Some(
+            Command::Session { .. }
+            | Command::Jobs { .. }
+            | Command::Knowledge { .. }
+            | Command::Agent { .. }
+            | Command::Provider { .. },
+        ) => Ok(()),
+        other => printer.require_text(&command_label(other)),
+    }
+}
+
+/// Meldet auf `stderr`, dass ein älterer Befehlsname umgeleitet wird.
+fn legacy_hint(old: &str, new: &str) {
+    eprintln!("Hinweis: `harw {old}` heißt jetzt `harw {new}`.");
+}
+
+/// Startet den Chat (`harw`, `harw chat`, `harw exec`, `harw session resume`).
+///
+/// # Description
+/// Modus und Ziel werden *vor* dem Chat aufgelöst: ein unbekannter
+/// Modusname darf keine Session starten, und ein `--goal` muss im
+/// Goal-Store stehen, bevor der erste Turn Kontext einsammelt. Die Spec
+/// dient hier nur dem Config-Laden (Home, cwd, Repo-Trust); die eigentliche
+/// Montage baut `chat::run_chat`. `--approval` und `--model` gehen als
+/// Sitzungs-Overrides an die Montage.
+///
+/// # Errors
+/// Ein `String` bei Home-, Config-, Modus- oder Ziel-Fehlern sowie aus dem
+/// Chat selbst.
+fn run_chat_entry(global: &GlobalArgs, chat_args: ChatArgs) -> Result<(), String> {
+    let (entry, surface) = if chat_args.prompt.is_some() {
+        (EntryKind::OneShot, IngressSurface::Cli)
+    } else {
+        (EntryKind::Tui, IngressSurface::Tui)
+    };
+    let spec = local_runtime_spec(global.home.clone(), entry, surface)?;
+    let startup = prepare_planning_startup(&spec, global.mode.as_deref(), global.goal.as_deref())?;
+    // Dieselben Store-Instanzen weiterreichen, nicht neue öffnen: zwei
+    // Schreiber auf einem Plan-Verzeichnis wären stiller Datenverlust.
+    // Die Freigabepolitik aus `[policy]` baut die Montage selbst.
+    let chat_startup = chat::ChatStartup {
+        mode: startup.mode,
+        plan: startup.services.to_runtime(),
+        goal_context: startup.goal_context,
+        approval: global.approval,
+        model: global.model.clone(),
+    };
+    chat::run_chat(
+        global.home.clone(),
+        chat_args.prompt,
+        chat_args.resume,
+        chat_startup,
+        chat::ChatOptions {
+            all_projects: chat_args.all,
+            verbose: global.verbose,
+            add_dirs: global.add_dir.clone(),
+        },
+    )
+}
+
+/// `harw debug echo`: ein Durchlauf gegen den Echo-Test-Anbieter.
+fn run_debug_echo(home_override: Option<PathBuf>, input: &[String]) -> Result<(), String> {
+    let home = home::resolve_home(home_override)?;
+    home::ensure_home(&home).map_err(|error| error.to_string())?;
+    println!("{}", run_local_echo(&input.join(" "), &home)?);
+    Ok(())
+}
+
+/// `harw debug classify`: zeigt die Einordnung einer Eingabezeile.
+fn run_debug_classify(input: &[String]) -> Result<(), String> {
+    let text = input.join(" ");
+    println!(
+        "{:?}",
+        classify_input(&text).map_err(|error| error.to_string())?
+    );
+    Ok(())
+}
+
 /// Routet den geparsten Command; ohne Subcommand startet der Chat.
 fn dispatch(cli: Cli) -> Result<(), String> {
-    let home_override = cli.chat.home.clone();
-    // `--mode`/`--goal` sind Root-Flags: sie gelten für den Chat-Einstieg *und*
-    // für `analyze`. Vor dem `match` kopiert, damit der Teil-Move von
-    // `cli.command` und `cli.chat` sie nicht unerreichbar macht.
-    let requested_mode = cli.mode.clone();
-    let requested_goal = cli.goal.clone();
-    run_startup_migrations(&cli.command, home_override.clone())?;
+    let Cli {
+        global,
+        chat: root_chat,
+        command,
+    } = cli;
+    reject_misplaced_session_flags(command.as_ref(), &global)?;
+    reject_unsupported_json(command.as_ref(), &global)?;
+    let home_override = global.home.clone();
+    run_startup_migrations(&command, home_override.clone())?;
 
-    match cli.command {
-        None => {
-            // Modus und Ziel werden *vor* dem Chat aufgelöst: ein unbekannter
-            // Modusname darf keine Session starten, und ein `--goal` muss im
-            // Goal-Store stehen, bevor der erste Turn Kontext einsammelt.
-            // Die Spec dient hier nur dem Config-Laden (Home, cwd, Repo-Trust);
-            // die eigentliche Montage baut `chat::run_chat`.
-            let (entry, surface) = if cli.chat.prompt.is_some() {
-                (EntryKind::OneShot, IngressSurface::Cli)
-            } else {
-                (EntryKind::Tui, IngressSurface::Tui)
-            };
-            let spec = local_runtime_spec(home_override.clone(), entry, surface)?;
-            let startup = prepare_planning_startup(
-                &spec,
-                requested_mode.as_deref(),
-                requested_goal.as_deref(),
-            )?;
-            // Dieselben Store-Instanzen weiterreichen, nicht neue öffnen: zwei
-            // Schreiber auf einem Plan-Verzeichnis wären stiller Datenverlust.
-            // Die Freigabepolitik aus `[policy]` baut die Montage selbst.
-            let chat_startup = chat::ChatStartup {
-                mode: startup.mode,
-                plan: startup.services.to_runtime(),
-                goal_context: startup.goal_context,
-            };
-            chat::run_chat(
-                home_override,
-                cli.chat.prompt,
-                cli.chat.resume,
-                chat_startup,
-                chat::ChatOptions {
-                    all_projects: cli.chat.all,
-                    verbose: cli.chat.verbose,
-                    add_dirs: cli.chat.add_dir,
+    match command {
+        None => run_chat_entry(&global, root_chat),
+        Some(Command::Chat(args)) => run_chat_entry(&global, args),
+        Some(Command::Exec(args)) => run_chat_entry(
+            &global,
+            ChatArgs {
+                prompt: Some(args.prompt.join(" ")),
+                resume: None,
+                all: false,
+            },
+        ),
+        Some(Command::Session { action }) => match session_cmd::run(&global, action)? {
+            Some(id) => run_chat_entry(
+                &global,
+                ChatArgs {
+                    prompt: None,
+                    resume: Some(Some(id)),
+                    all: false,
                 },
-            )
-        }
+            ),
+            None => Ok(()),
+        },
         Some(Command::Init) => cmd_init(home_override),
         Some(Command::Onboard) => {
             let home = home::resolve_home(home_override)?;
             home::ensure_home(&home).map_err(|error| error.to_string())?;
             onboarding::run_wizard(&home)
         }
+        Some(Command::Channel {
+            action: ChannelAction::Connect { channel, pair },
+        }) => {
+            let home = home::resolve_home(home_override)?;
+            connect::run(&home, channel.as_str(), pair.as_deref())
+        }
         Some(Command::Connect { channel, pair }) => {
+            legacy_hint("connect", "channel connect");
             let home = home::resolve_home(home_override)?;
             connect::run(&home, channel.as_str(), pair.as_deref())
         }
@@ -338,27 +813,34 @@ fn dispatch(cli: Cli) -> Result<(), String> {
             web::serve_web(Some(home), socket)
         }
         Some(Command::Project { action }) => project_trust::run(home_override, action),
-        Some(Command::Settings { action }) => settings::run(home_override, action),
+        Some(Command::Config { action }) => settings::run(home_override, action),
+        Some(Command::Provider { action }) => provider_cmd::run(&global, action),
+        Some(Command::Model { action }) => models::run(home_override, action),
+        Some(Command::Agent { action }) => agent_cmd::run(&global, action),
+        Some(Command::Knowledge { action }) => knowledge_cmd::run(&global, action),
+        Some(Command::Jobs { action }) => jobs_cmd::run(&global, action),
+        Some(Command::Debug {
+            action: DebugAction::Classify { input },
+        }) => run_debug_classify(&input),
+        Some(Command::Debug {
+            action: DebugAction::Echo { input },
+        }) => run_debug_echo(home_override, &input),
         Some(Command::Classify { input }) => {
-            let text = input.join(" ");
-            println!(
-                "{:?}",
-                classify_input(&text).map_err(|error| error.to_string())?
-            );
-            Ok(())
+            legacy_hint("classify", "debug classify");
+            run_debug_classify(&input)
         }
         Some(Command::Run { input }) => {
-            let home = home::resolve_home(home_override)?;
-            home::ensure_home(&home).map_err(|error| error.to_string())?;
-            println!("{}", run_local_echo(&input.join(" "), &home)?);
-            Ok(())
+            legacy_hint("run", "debug echo");
+            run_debug_echo(home_override, &input)
         }
         Some(Command::Auth { action }) => auth::run(home_override, action),
         Some(Command::Completions(command)) => completions::run(command),
         Some(Command::Update { check }) => lifecycle::update(home_override, check),
         Some(Command::Service { action }) => lifecycle::service(home_override, action),
-        Some(Command::Catalog { refresh }) => lifecycle::catalog(home_override, refresh),
-        Some(Command::Models { action }) => models::run(home_override, action),
+        Some(Command::Catalog { refresh }) => {
+            legacy_hint("catalog", "model catalog");
+            models::run(home_override, Some(ModelsAction::Catalog { refresh }))
+        }
         Some(Command::Sandbox { action }) => sandbox_cmd::run(action),
         Some(Command::BugReport {
             report_type,
@@ -391,15 +873,20 @@ fn dispatch(cli: Cli) -> Result<(), String> {
             lifecycle::uninstall(home_override, &scope, dry_run, yes)
         }
         Some(Command::Uia { action }) => match action {
-            cli::UiaAction::New => uia_bootstrap::run_new_uia_command(home_override),
+            cli::UiaAction::New => {
+                legacy_hint("uia new", "agent uia-new");
+                agent_cmd::run(&global, AgentAction::UiaNew)
+            }
         },
-        Some(Command::Analyze(args)) => cmd_analyze(
-            home_override,
-            requested_mode.as_deref(),
-            requested_goal.as_deref(),
-            &args,
-        ),
-        Some(Command::Lens { action }) => lens::run(home_override, action),
+        Some(Command::Analyze(args)) => cmd_analyze(&global, &args),
+        Some(Command::Lens { action }) => {
+            legacy_hint("lens", "knowledge index");
+            knowledge_cmd::run(&global, KnowledgeAction::Index { action })
+        }
+        // `main` leitet `harw kill` vor dem Tracing-Init an killer weiter.
+        Some(Command::Kill { .. }) => {
+            Err("interner Fehler: `harw kill` erreichte dispatch".to_owned())
+        }
     }
 }
 
@@ -413,16 +900,41 @@ fn run_startup_migrations(
     home_override: Option<PathBuf>,
 ) -> Result<(), String> {
     let layers = match command {
+        // Der Modell-Katalog und der Wissensindex lesen keine Konfiguration.
+        Some(
+            Command::Model {
+                action: Some(ModelsAction::Catalog { .. }),
+            }
+            | Command::Knowledge {
+                action: KnowledgeAction::Index { .. },
+            }
+            | Command::Session {
+                action: SessionAction::List { .. } | SessionAction::Show { .. },
+            },
+        ) => return Ok(()),
         // `analyze` liest `[tools.plan]`, `[mode]` und `[policy]` — es gehört
-        // damit zu den Pfaden, die vor dem Lesen migrieren müssen.
+        // damit zu den Pfaden, die vor dem Lesen migrieren müssen. Die
+        // Operationsbefehle (`jobs`, `knowledge memory|proposals`,
+        // `agent skills|plugins`) montieren eine Laufzeit über die
+        // Konfiguration; `session resume` startet den Chat.
         None
-        | Some(Command::Onboard)
-        | Some(Command::Connect { .. })
-        | Some(Command::Gateway { .. })
-        | Some(Command::Settings { .. })
-        | Some(Command::Models { .. })
-        | Some(Command::Uia { .. })
-        | Some(Command::Analyze(_)) => {
+        | Some(
+            Command::Chat(_)
+            | Command::Exec(_)
+            | Command::Session { .. }
+            | Command::Onboard
+            | Command::Connect { .. }
+            | Command::Channel { .. }
+            | Command::Gateway { .. }
+            | Command::Config { .. }
+            | Command::Provider { .. }
+            | Command::Model { .. }
+            | Command::Agent { .. }
+            | Command::Knowledge { .. }
+            | Command::Jobs { .. }
+            | Command::Uia { .. }
+            | Command::Analyze(_),
+        ) => {
             let home = home::resolve_home(home_override)?;
             home::ensure_home(&home).map_err(|error| error.to_string())?;
             harw_home::config_layers(&home).map_err(|error| error.to_string())?
@@ -446,6 +958,7 @@ fn run_startup_migrations(
             Command::Init
             | Command::Classify { .. }
             | Command::Run { .. }
+            | Command::Debug { .. }
             | Command::Completions(_)
             | Command::Update { .. }
             | Command::Service { .. }
@@ -456,7 +969,8 @@ fn run_startup_migrations(
             | Command::Sandbox { .. }
             | Command::Mcp { .. }
             | Command::BugReport { .. }
-            | Command::Lens { .. },
+            | Command::Lens { .. }
+            | Command::Kill { .. },
         ) => return Ok(()),
     };
 
@@ -591,23 +1105,23 @@ fn cmd_bug_report(
 
     let report_type = match report_type {
         Some(value) => value,
-        None => prompt_bug_report_field("Type")?,
+        None => prompt_bug_report_field("Art")?,
     };
     let title = match title {
         Some(value) => value,
-        None => prompt_bug_report_field("Title")?,
+        None => prompt_bug_report_field("Titel")?,
     };
     let area = match area {
         Some(value) => value,
-        None => prompt_bug_report_field("Area")?,
+        None => prompt_bug_report_field("Bereich")?,
     };
     let failure_mode = match failure_mode {
         Some(value) => value,
-        None => prompt_bug_report_field("Failure mode")?,
+        None => prompt_bug_report_field("Fehlermodus")?,
     };
     let what_happened = match what_happened {
         Some(value) => value,
-        None => prompt_bug_report_field("What happened")?,
+        None => prompt_bug_report_field("Was ist passiert")?,
     };
 
     let report = harw_ops::bug_report::BugReport {
@@ -625,7 +1139,7 @@ fn cmd_bug_report(
 
     let path = harw_ops::bug_report::write_bug_report(&home, &report)
         .map_err(|error| error.to_string())?;
-    println!("Bug report saved: {}", path.display());
+    println!("Fehlerbericht gespeichert: {}", path.display());
     Ok(())
 }
 
@@ -1372,7 +1886,12 @@ const CLI_ACTOR: &str = "human:cli";
 const PLAN_NODE_JOB_ACTOR: &str = "job:plan-node-worker";
 
 /// Aufzählung der gültigen Interaktionsmodi für Fehlermeldungen.
-const VALID_MODE_NAMES: &str = "chat, plan, explore, work, shell";
+///
+/// Kommt aus [`InteractionMode::names`], damit Liste und Parser nie
+/// auseinanderlaufen.
+fn valid_mode_names() -> String {
+    InteractionMode::names().collect::<Vec<_>>().join(", ")
+}
 
 /// Löst den Interaktionsmodus einer neuen Session auf.
 ///
@@ -1410,12 +1929,16 @@ fn resolve_startup_mode(
 ) -> Result<InteractionMode, String> {
     match requested {
         Some(raw) => InteractionMode::parse(raw).ok_or_else(|| {
-            format!("unbekannter Interaktionsmodus '{raw}'; gültig sind: {VALID_MODE_NAMES}")
+            format!(
+                "unbekannter Interaktionsmodus '{raw}'; gültig sind: {}",
+                valid_mode_names()
+            )
         }),
         None => InteractionMode::parse(configured).ok_or_else(|| {
             format!(
                 "[mode] default = '{configured}' ist kein bekannter Interaktionsmodus; \
-                 gültig sind: {VALID_MODE_NAMES}"
+                 gültig sind: {}",
+                valid_mode_names()
             )
         }),
     }
@@ -2036,9 +2559,11 @@ fn prepare_planning_startup(
 /// Die Flag-Grammatik von `/analyze` lebt in `harw_ops::analyze::AnalyzeArgs`
 /// (`FromRawArgs`). Diese Funktion baut deshalb Tokens statt einen zweiten
 /// Parser: so gibt es genau eine Stelle, die entscheidet, was `--top-down` oder
-/// `--max-parallel` bedeuten. Nur die Widersprüche, die erst die clap-Form
-/// erzeugt (zwei Bool-Flags für eine Richtung, `--workspace` neben einem
-/// Crate-Namen), werden hier abgefangen.
+/// `--max-parallel` bedeuten. Die Richtung kommt aus
+/// [`AnalyzeArgs::effective_order`] (`--order` bzw. die versteckten
+/// Alt-Flags, deren Widersprüche clap bereits ablehnt); nur `top-down` wird
+/// als Token weitergegeben, `bottom-up` ist die Vorgabe der Operation. Hier
+/// abgefangen wird nur `--workspace` neben einem Crate-Namen.
 ///
 /// # Arguments
 /// - `args` (`&AnalyzeArgs`): die geparsten CLI-Flags, geliehen.
@@ -2047,16 +2572,9 @@ fn prepare_planning_startup(
 /// Die Token-Liste für `OpInput::command("/analyze", …)`.
 ///
 /// # Errors
-/// Ein `String`, wenn `--bottom-up` und `--top-down` zusammen stehen,
-/// `--workspace` neben einem Crate-Namen steht oder `--max-parallel 0` verlangt
-/// wird (eine Welle ohne Kind ist keine Welle).
+/// Ein `String`, wenn `--workspace` neben einem Crate-Namen steht oder
+/// `--max-parallel 0` verlangt wird (eine Welle ohne Kind ist keine Welle).
 fn analyze_tokens(args: &AnalyzeArgs) -> Result<Vec<String>, String> {
-    if args.bottom_up && args.top_down {
-        return Err(
-            "--bottom-up und --top-down schließen einander aus; wähle genau eine Richtung"
-                .to_owned(),
-        );
-    }
     if let Some(name) = args.crate_name.as_deref().filter(|_| args.workspace) {
         return Err(format!(
             "--workspace analysiert den gesamten Workspace; der Crate-Name '{name}' ist damit \
@@ -2068,10 +2586,7 @@ fn analyze_tokens(args: &AnalyzeArgs) -> Result<Vec<String>, String> {
     if args.dry_run {
         tokens.push("--dry-run".to_owned());
     }
-    if args.bottom_up {
-        tokens.push("--bottom-up".to_owned());
-    }
-    if args.top_down {
+    if matches!(args.effective_order(), AnalyzeOrder::TopDown) {
         tokens.push("--top-down".to_owned());
     }
     if let Some(max_parallel) = args.max_parallel {
@@ -2191,10 +2706,12 @@ fn analyze_assembly(
 /// unter [`harw_runtime::RuntimeAssembly::root_session_id`], der beim Bau als
 /// Spawner-Wurzel registrierten Kennung.
 ///
+/// `--mode`, `--approval` und `--model` gehen als Overrides in die
+/// [`RuntimeSpec`] (`mode_override`, `approval_override`, `model_override`).
+///
 /// # Arguments
-/// - `home_override` (`Option<PathBuf>`): expliziter Root-Space (`--home`).
-/// - `requested_mode` (`Option<&str>`): Wert von `--mode`, geliehen.
-/// - `requested_goal` (`Option<&str>`): Wert von `--goal`, geliehen.
+/// - `global` (`&GlobalArgs`): globale Flags (`--home`, `--mode`, `--goal`,
+///   `--approval`, `--model`), geliehen.
 /// - `args` (`&AnalyzeArgs`): die geparsten `analyze`-Flags, geliehen.
 ///
 /// # Returns
@@ -2207,16 +2724,12 @@ fn analyze_assembly(
 ///
 /// # Concurrency
 /// Baut eine eigene Single-Thread-Tokio-Runtime für den einen Operationsaufruf.
-fn cmd_analyze(
-    home_override: Option<PathBuf>,
-    requested_mode: Option<&str>,
-    requested_goal: Option<&str>,
-    args: &AnalyzeArgs,
-) -> Result<(), String> {
+fn cmd_analyze(global: &GlobalArgs, args: &AnalyzeArgs) -> Result<(), String> {
     // Flag-Widersprüche vor jeder Datei- oder Netzarbeit melden.
     let tokens = analyze_tokens(args)?;
-    let mut spec = local_runtime_spec(home_override, EntryKind::Analyze, IngressSurface::Cli)?;
-    let startup = prepare_planning_startup(&spec, requested_mode, requested_goal)?;
+    let mut spec =
+        local_runtime_spec(global.home.clone(), EntryKind::Analyze, IngressSurface::Cli)?;
+    let startup = prepare_planning_startup(&spec, global.mode.as_deref(), global.goal.as_deref())?;
     if !startup.plan_config.is_enabled() {
         return Err(analyze_plan_surface_disabled());
     }
@@ -2225,6 +2738,8 @@ fn cmd_analyze(
         .to_runtime()
         .ok_or_else(analyze_plan_surface_disabled)?;
     spec.mode_override = Some(startup.mode);
+    spec.approval_override = global.approval;
+    spec.model_override = global.model.clone();
 
     let (model, secret_resolver) = if args.dry_run {
         (ModelSource::Echo("harw analyze --dry-run".to_owned()), None)
@@ -2693,6 +3208,94 @@ fn print_runtime_rights(home: &Path) {
 mod tests {
     use super::*;
     use crate::test_support::{TestError, TestResult, ctx};
+
+    #[test]
+    fn log_directive_prefers_explicit_cli_flag() {
+        assert_eq!(
+            resolve_log_directive(Some("info"), Some("trace"), Some("debug")),
+            "info"
+        );
+    }
+
+    #[test]
+    fn log_directive_prefers_rust_log_over_config() {
+        assert_eq!(
+            resolve_log_directive(None, Some("harw_core=trace"), Some("debug")),
+            "harw_core=trace"
+        );
+    }
+
+    #[test]
+    fn log_directive_skips_empty_or_invalid_rust_log() {
+        assert_eq!(
+            resolve_log_directive(None, Some("  "), Some("debug")),
+            "debug"
+        );
+        assert_eq!(
+            resolve_log_directive(None, Some("harw_core=notalevel"), Some("debug")),
+            "debug"
+        );
+    }
+
+    #[test]
+    fn log_directive_uses_config_level_unless_default() {
+        assert_eq!(resolve_log_directive(None, None, Some("error")), "error");
+        assert_eq!(
+            resolve_log_directive(None, None, Some("info")),
+            DEFAULT_LOG_FILTER
+        );
+        assert_eq!(resolve_log_directive(None, None, None), DEFAULT_LOG_FILTER);
+    }
+
+    #[test]
+    fn log_flag_source_distinguishes_default_from_explicit() -> TestResult {
+        let default = cli::command()
+            .try_get_matches_from(["harw"])
+            .map_err(ctx("bare harw parses"))?;
+        assert!(!log_flag_explicit(&default));
+        let explicit = cli::command()
+            .try_get_matches_from(["harw", "--log", "info"])
+            .map_err(ctx("--log parses"))?;
+        assert!(log_flag_explicit(&explicit));
+        let after_subcommand = cli::command()
+            .try_get_matches_from(["harw", "doctor", "--log", "debug"])
+            .map_err(ctx("--log after subcommand parses"))?;
+        assert!(log_flag_explicit(&after_subcommand));
+        Ok(())
+    }
+
+    #[test]
+    fn kill_passthrough_forwards_everything_after_kill_verbatim() {
+        let os = |items: &[&str]| items.iter().map(OsString::from).collect::<Vec<_>>();
+        assert_eq!(
+            kill_passthrough_args(os(&["harw", "kill", "--log", "debug", "-p", "x", "--help"])),
+            Some(os(&["--log", "debug", "-p", "x", "--help"]))
+        );
+        assert_eq!(
+            kill_passthrough_args(os(&["harw", "kill"])),
+            Some(Vec::new())
+        );
+        assert_eq!(kill_passthrough_args(os(&["harw", "doctor", "kill"])), None);
+        assert_eq!(kill_passthrough_args(os(&["harw"])), None);
+    }
+
+    #[test]
+    fn cli_parses_kill_with_hyphen_args_and_help_verbatim() -> TestResult {
+        let cli = Cli::try_parse_from(["harw", "kill", "-p", "sleep", "--dry-run", "--help"])
+            .map_err(ctx("harw kill parses"))?;
+        let Some(Command::Kill { args }) = cli.command else {
+            return Err(TestError::Unexpected(format!(
+                "erwartete Command::Kill, bekam {:?}",
+                cli.command
+            )));
+        };
+        let expected: Vec<OsString> = ["-p", "sleep", "--dry-run", "--help"]
+            .iter()
+            .map(OsString::from)
+            .collect();
+        assert_eq!(args, expected);
+        Ok(())
+    }
 
     #[test]
     fn cli_parses_bare_invocation_as_chat() -> TestResult {
@@ -3345,8 +3948,9 @@ mod tests {
         let args = AnalyzeArgs {
             crate_name: Some("harw-core".to_owned()),
             workspace: false,
+            order: AnalyzeOrder::TopDown,
             bottom_up: false,
-            top_down: true,
+            top_down: false,
             dry_run: true,
             max_parallel: Some(3),
         };
@@ -3371,8 +3975,9 @@ mod tests {
         let args = AnalyzeArgs {
             crate_name: Some("harw-core".to_owned()),
             workspace: false,
+            order: AnalyzeOrder::TopDown,
             bottom_up: false,
-            top_down: true,
+            top_down: false,
             dry_run: true,
             max_parallel: Some(3),
         };
@@ -3388,20 +3993,39 @@ mod tests {
     }
 
     #[test]
-    fn analyze_rejects_contradictory_direction_and_scope_flags() -> TestResult {
-        let both_directions = AnalyzeArgs {
+    fn analyze_legacy_top_down_flag_maps_onto_top_down_token() -> TestResult {
+        let args = AnalyzeArgs {
             crate_name: None,
             workspace: false,
-            bottom_up: true,
+            order: AnalyzeOrder::BottomUp,
+            bottom_up: false,
             top_down: true,
             dry_run: false,
             max_parallel: None,
         };
-        assert!(analyze_tokens(&both_directions).is_err());
+        assert_eq!(
+            analyze_tokens(&args).map_err(ctx("Alt-Flag ist übersetzbar"))?,
+            vec!["--top-down".to_owned()]
+        );
+        let default_order = AnalyzeArgs {
+            top_down: false,
+            ..args
+        };
+        assert!(
+            analyze_tokens(&default_order)
+                .map_err(ctx("Vorgabe ist übersetzbar"))?
+                .is_empty(),
+            "bottom-up ist die Vorgabe der Operation und braucht kein Token"
+        );
+        Ok(())
+    }
 
+    #[test]
+    fn analyze_rejects_contradictory_scope_flags() -> TestResult {
         let workspace_and_crate = AnalyzeArgs {
             crate_name: Some("harw-core".to_owned()),
             workspace: true,
+            order: AnalyzeOrder::BottomUp,
             bottom_up: false,
             top_down: false,
             dry_run: false,
@@ -3418,6 +4042,7 @@ mod tests {
         let zero_parallel = AnalyzeArgs {
             crate_name: None,
             workspace: true,
+            order: AnalyzeOrder::BottomUp,
             bottom_up: false,
             top_down: false,
             dry_run: false,
@@ -3519,13 +4144,18 @@ mod tests {
         let args = AnalyzeArgs {
             crate_name: None,
             workspace: false,
+            order: AnalyzeOrder::BottomUp,
             bottom_up: false,
             top_down: false,
             dry_run: true,
             max_parallel: None,
         };
+        let global = GlobalArgs {
+            home: Some(home.path().to_path_buf()),
+            ..GlobalArgs::default()
+        };
 
-        let result = cmd_analyze(Some(home.path().to_path_buf()), None, None, &args);
+        let result = cmd_analyze(&global, &args);
         let Err(error) = result else {
             return Err(TestError::Unexpected(
                 "harw analyze muss ohne `[tools.plan] enabled = true` scheitern".into(),
@@ -3540,9 +4170,116 @@ mod tests {
         let cli = Cli::try_parse_from(["harw", "--mode", "explore", "--goal", "Bridge fertig"])
             .map_err(ctx("root flags parse"))?;
 
-        assert_eq!(cli.mode.as_deref(), Some("explore"));
-        assert_eq!(cli.goal.as_deref(), Some("Bridge fertig"));
+        assert_eq!(cli.global.mode.as_deref(), Some("explore"));
+        assert_eq!(cli.global.goal.as_deref(), Some("Bridge fertig"));
         assert!(cli.command.is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn valid_mode_names_lists_every_interaction_mode() {
+        assert_eq!(valid_mode_names(), "chat, plan, explore, work, shell");
+    }
+
+    #[test]
+    fn session_flags_are_accepted_for_chat_exec_and_analyze() -> TestResult {
+        for argv in [
+            vec!["harw", "--mode", "explore"],
+            vec!["harw", "chat", "--model", "m1"],
+            vec!["harw", "exec", "--approval", "ask", "hallo", "welt"],
+            vec!["harw", "analyze", "--goal", "Ziel"],
+            vec!["harw", "--add-dir", "/tmp"],
+        ] {
+            let cli = Cli::try_parse_from(argv).map_err(ctx("session flags parse"))?;
+            reject_misplaced_session_flags(cli.command.as_ref(), &cli.global)
+                .map_err(ctx("session flags are allowed here"))?;
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn session_flags_are_rejected_for_other_commands() -> TestResult {
+        let cli = Cli::try_parse_from(["harw", "doctor", "--mode", "explore"])
+            .map_err(ctx("doctor with --mode parses"))?;
+        let result = reject_misplaced_session_flags(cli.command.as_ref(), &cli.global);
+        let Err(error) = result else {
+            return Err(TestError::Unexpected(
+                "--mode bei doctor darf nicht still ignoriert werden".into(),
+            ));
+        };
+        assert!(error.contains("--mode"), "{error}");
+        assert!(error.contains("harw doctor"), "{error}");
+        for allowed in ["harw chat", "harw exec", "harw analyze"] {
+            assert!(error.contains(allowed), "{error} nennt '{allowed}' nicht");
+        }
+
+        let analyze = Cli::try_parse_from(["harw", "analyze", "--add-dir", "/tmp"])
+            .map_err(ctx("analyze with --add-dir parses"))?;
+        assert!(reject_misplaced_session_flags(analyze.command.as_ref(), &analyze.global).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn json_is_rejected_for_commands_without_json_output() -> TestResult {
+        let doctor = Cli::try_parse_from(["harw", "doctor", "--json"])
+            .map_err(ctx("doctor with --json parses"))?;
+        let result = reject_unsupported_json(doctor.command.as_ref(), &doctor.global);
+        let Err(error) = result else {
+            return Err(TestError::Unexpected(
+                "--json bei doctor muss abgelehnt werden".into(),
+            ));
+        };
+        assert!(error.contains("harw doctor"), "{error}");
+
+        let root = Cli::try_parse_from(["harw", "--json"]).map_err(ctx("root --json parses"))?;
+        assert!(reject_unsupported_json(root.command.as_ref(), &root.global).is_err());
+
+        let resume = Cli::try_parse_from(["harw", "session", "resume", "abc", "--json"])
+            .map_err(ctx("session resume --json parses"))?;
+        assert!(reject_unsupported_json(resume.command.as_ref(), &resume.global).is_err());
+
+        for argv in [
+            vec!["harw", "session", "list", "--json"],
+            vec!["harw", "jobs", "list", "--json"],
+            // Vor dem Befehl, weil `memory`/`skills` alle folgenden
+            // Argumente unverändert weiterreichen.
+            vec!["harw", "--json", "knowledge", "memory"],
+            vec!["harw", "--json", "agent", "skills"],
+            vec!["harw", "doctor"],
+        ] {
+            let cli = Cli::try_parse_from(argv).map_err(ctx("json-capable command parses"))?;
+            reject_unsupported_json(cli.command.as_ref(), &cli.global)
+                .map_err(ctx("json-capable command accepts --json"))?;
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn exec_joins_prompt_words_and_is_not_a_tui_start() -> TestResult {
+        let cli =
+            Cli::try_parse_from(["harw", "exec", "sag", "hallo"]).map_err(ctx("exec parses"))?;
+        assert!(!starts_tui(&cli));
+        let Some(Command::Exec(args)) = cli.command else {
+            return Err(TestError::Unexpected("erwartete Command::Exec".into()));
+        };
+        assert_eq!(args.prompt.join(" "), "sag hallo");
+
+        let bare = Cli::try_parse_from(["harw"]).map_err(ctx("bare harw parses"))?;
+        assert!(starts_tui(&bare));
+        let resume = Cli::try_parse_from(["harw", "session", "resume", "abc"])
+            .map_err(ctx("session resume parses"))?;
+        assert!(starts_tui(&resume));
+        Ok(())
+    }
+
+    #[test]
+    fn command_label_names_new_and_legacy_commands() -> TestResult {
+        assert_eq!(command_label(None), "harw");
+        let bug = Cli::try_parse_from(["harw", "bug-report", "--title", "x"])
+            .map_err(ctx("bug-report parses"))?;
+        assert_eq!(command_label(bug.command.as_ref()), "harw bug-report");
+        let legacy = Cli::try_parse_from(["harw", "catalog"]).map_err(ctx("catalog parses"))?;
+        assert_eq!(command_label(legacy.command.as_ref()), "harw catalog");
         Ok(())
     }
 

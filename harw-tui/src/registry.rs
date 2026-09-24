@@ -2,6 +2,7 @@
 //!
 //! Source: `harw-tui` interaction-contract spec.
 
+use crate::command::CommandOrigin;
 use crate::{
     CommandDomain, CommandError, CommandResult, CommandScope, CommandSpec, Invocation,
     OutputSurface, PermissionTier,
@@ -328,6 +329,8 @@ impl CommandRegistry {
                         domain,
                     ) {
                         cmd_spec.busy = meta.busy;
+                        cmd_spec.summary = meta.summary.to_owned();
+                        crate::command_catalog::enrich(&mut cmd_spec);
                         // Record in indexes after successful spec construction.
                         path_index.push((raw_path.clone(), op_name.clone()));
                         name_index.push((canonical.clone(), op_name.clone()));
@@ -459,7 +462,7 @@ impl CommandRegistry {
                 .filter(|alias| crate::CommandName::parse(**alias).is_ok())
                 .map(|alias| (*alias).to_owned())
                 .collect();
-            specs.push(CommandSpec {
+            let mut spec = CommandSpec {
                 name,
                 aliases,
                 scope: map_visibility(adapter.visibility()),
@@ -467,9 +470,56 @@ impl CommandRegistry {
                 output: OutputSurface::Inline,
                 domain: map_domain(meta.domain),
                 busy: meta.busy,
-            });
+                summary: meta.summary.to_owned(),
+                usage: String::new(),
+                subcommands: Vec::new(),
+                origin: CommandOrigin::Operation,
+            };
+            crate::command_catalog::enrich(&mut spec);
+            specs.push(spec);
         }
         Self::new(specs)
+    }
+
+    /// Mischt TUI-lokale Spezifikationen in den Katalog ein.
+    ///
+    /// # Beschreibung
+    /// Jede lokale Spezifikation wird hinten angehängt, sofern weder ihr Name
+    /// noch einer ihrer Aliase mit dem Namen oder einem Alias eines bereits
+    /// vorhandenen Eintrags kollidiert (Vergleich ohne Groß-/Kleinschreibung).
+    /// Bei Kollision gewinnt der vorhandene Eintrag — Operationen haben also
+    /// immer Vorrang, und von zwei gleichnamigen lokalen Einträgen bleibt der
+    /// erste. Verworfene Einträge werden nur per `tracing::debug!` gemeldet.
+    ///
+    /// # Argumente
+    /// - `locals`: typischerweise `command_catalog::local_command_specs()`.
+    ///
+    /// # Rückgabe
+    /// Der erweiterte Katalog (Builder-Stil).
+    #[must_use]
+    pub(crate) fn with_local_specs(mut self, locals: Vec<CommandSpec>) -> Self {
+        for local in locals {
+            let mut keys = std::iter::once(local.name.as_str())
+                .chain(local.aliases.iter().map(String::as_str));
+            let collides = keys.any(|key| {
+                self.specs.iter().any(|existing| {
+                    existing.name.as_str().eq_ignore_ascii_case(key)
+                        || existing
+                            .aliases
+                            .iter()
+                            .any(|alias| alias.eq_ignore_ascii_case(key))
+                })
+            });
+            if collides {
+                tracing::debug!(
+                    command = local.name.as_str(),
+                    "local command spec collides with an existing command; existing wins"
+                );
+                continue;
+            }
+            self.specs.push(local);
+        }
+        self
     }
 
     /// Looks up a command by canonical name, falling back to aliases.
@@ -1085,6 +1135,98 @@ mod tests {
             harw_operations::operation::BusyAvailability::DeferredUntilTurnEnd,
             "'/new' does not declare busy; adapter-derived spec must carry the \
              DeferredUntilTurnEnd default"
+        );
+        Ok(())
+    }
+    // ── Hilfe-Felder und lokale Spezifikationen ─────────────────────────────
+
+    fn adapters() -> Vec<CommandAdapter> {
+        ops_registry()
+            .iter()
+            .flat_map(|op| CommandAdapter::from_operation(std::sync::Arc::clone(op)))
+            .collect()
+    }
+
+    /// Beide Konstruktoren übernehmen `OperationMeta::summary` und reichern
+    /// über `command_catalog::enrich` an.
+    #[test]
+    fn constructors_set_summary_usage_subcommands_and_origin() -> TestResult {
+        let via_ops = CommandRegistry::from_operation_registry(&ops_registry())
+            .map_err(ctx("built-in ops must produce a collision-free registry"))?;
+        let via_adapters = CommandRegistry::from_command_adapters(&adapters());
+        for registry in [&via_ops, &via_adapters] {
+            for spec in registry.specs() {
+                assert_eq!(spec.origin, CommandOrigin::Operation, "{}", spec.name);
+                assert!(!spec.summary.is_empty(), "{} lacks a summary", spec.name);
+                assert!(
+                    spec.usage.starts_with(&format!("/{}", spec.name)),
+                    "{} usage {:?}",
+                    spec.name,
+                    spec.usage
+                );
+            }
+            let model = registry
+                .find("model")
+                .ok_or(TestError::Missing("'model' spec must exist"))?;
+            assert!(model.summary.contains("Modell"), "{:?}", model.summary);
+            let names: Vec<&str> = model.subcommands.iter().map(|h| h.name).collect();
+            assert_eq!(names, ["show", "list", "switch"]);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn with_local_specs_appends_locals_and_lets_operations_win() -> TestResult {
+        let ops = CommandRegistry::built_in().map_err(ctx("built_in"))?;
+        let op_mode = ops.find("mode").cloned();
+        let before = ops.specs().len();
+        let merged = ops.with_local_specs(crate::command_catalog::local_command_specs());
+
+        let tools = merged
+            .find("tools")
+            .ok_or(TestError::Missing("local '/tools' must be merged"))?;
+        assert_eq!(tools.origin, CommandOrigin::TuiLocal);
+        assert!(merged.specs().len() > before);
+
+        // `/mode` ist eine Operation: der lokale Ersatz entfällt.
+        if let Some(op_mode) = op_mode {
+            let hits = merged
+                .specs()
+                .iter()
+                .filter(|spec| spec.name.as_str() == "mode")
+                .count();
+            assert_eq!(hits, 1, "only one '/mode' may survive");
+            let mode = merged.find("mode").ok_or(TestError::Missing("mode"))?;
+            assert_eq!(mode.origin, CommandOrigin::Operation);
+            assert_eq!(mode.permission, op_mode.permission);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn with_local_specs_drops_locals_whose_alias_or_name_collides() -> TestResult {
+        let base = CommandRegistry::new(vec![protected_spec(
+            "status",
+            "st",
+            PermissionTier::Observer,
+        )?]);
+        let by_name = protected_spec("st", "zz", PermissionTier::Owner)?.local();
+        let by_alias = protected_spec("other", "status", PermissionTier::Owner)?.local();
+        let fresh = protected_spec("fresh", "fr", PermissionTier::Observer)?.local();
+        let duplicate = protected_spec("fresh", "fr2", PermissionTier::Owner)?.local();
+        let merged = base.with_local_specs(vec![by_name, by_alias, fresh, duplicate]);
+
+        let names: Vec<&str> = merged.specs().iter().map(|s| s.name.as_str()).collect();
+        assert_eq!(names, ["status", "fresh"]);
+        assert_eq!(
+            merged.find("st").map(|spec| spec.name.as_str()),
+            Some("status"),
+            "the operation alias must keep resolving to the operation"
+        );
+        assert_eq!(
+            merged.find("fresh").map(|spec| spec.permission),
+            Some(PermissionTier::Observer),
+            "the first of two same-named locals wins"
         );
         Ok(())
     }

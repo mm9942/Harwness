@@ -1,8 +1,14 @@
-//! `/mode` — Anzeige und Wechselabsicht des Interaktionsmodus.
+//! `/mode` — Anzeige, Wechsel und Standard des Interaktionsmodus.
 //!
 //! # Verantwortungsbereich
-//! Implementiert die `mode`-Operation gemäß AP W4-05. Sie exponiert **nur**
-//! einen Command `/mode` mit `tui_only`-Sichtbarkeit.
+//! Implementiert die `mode`-Operation (AP W4-05). Sie exponiert **nur** einen
+//! Command `/mode` mit `tui_only`-Sichtbarkeit:
+//!
+//! | Eingabe | Wirkung |
+//! |---|---|
+//! | `/mode` / `/mode show` | Aktueller Modus, konfigurierter Standard, alle Modi mit Kurzbeschreibung |
+//! | `/mode <modus>` | Fordert den Wechsel der laufenden Sitzung an (`chat|plan|explore|work|shell`) |
+//! | `/mode default <modus>` | Persistiert `[mode] default` in der Profil-`config.toml` (neue Sitzungen) |
 //!
 //! # Warum kein `model_tool`
 //! Aus demselben Grund wie bei [`crate::agent`]: das Modell darf sich nicht
@@ -13,42 +19,41 @@
 //! die Beschränkung wäre eine Bitte statt einer Grenze. Der Moduswechsel bleibt
 //! deshalb eine Handlung des Menschen an der TUI.
 //!
-//! # Warum die Operation den Wechsel nicht vollzieht
+//! # Wie der Wechsel wirkt
 //! [`OpContext`] ist unveränderlich; zustandsändernde Ops mutieren über den
 //! [`SessionController`](harw_operations::session_control::SessionController)
-//! aus der `ServiceMap` (so machen es `/effort`, `/model switch`,
-//! `/provider switch`). Dieser Trait kennt **heute keinen Interaktionsmodus**:
-//! er hat `set_reasoning_effort`, `set_active_model`, `set_active_provider` und
-//! `snapshot`, und [`SessionControlSnapshot`](harw_operations::session_control::SessionControlSnapshot)
-//! trägt kein Modus-Feld.
+//! aus der `ServiceMap`. Der Controller bietet dafür
+//! [`request_mode`](harw_operations::session_control::SessionController::request_mode)
+//! und trägt den aktuellen Modus im Snapshot
+//! ([`SessionControlSnapshot::interaction_mode`](harw_operations::session_control::SessionControlSnapshot)).
+//! Der Controller *merkt den Wunsch vor*; angewandt wird er von der Oberfläche
+//! an der nächsten Turn-Grenze — ein laufender Turn darf seine Tool-Menge und
+//! Sandbox-Obergrenze nicht unter sich wechseln. Deshalb meldet die Antwort
+//! `requested` und nicht `applied`. Oberflächen ohne Modusführung lehnen fail-closed
+//! mit `ModeUnsupported` ab; das wird als [`OpError::NotAvailable`] gemeldet.
 //!
-//! Solange das so ist, gibt `/mode` die **Absicht** strukturiert zurück
-//! (`{"mode": "explore", "applied": false, …}`) und benennt genau, was fehlt.
-//! Ein stilles `Ok` ohne Wirkung wäre die schlechtere Antwort: der Aufrufer
-//! glaubte dann, der Modus sei gewechselt.
-//!
-//! Fehlende Signaturen (siehe `CONTROLLER_LACKS_MODE` in dieser Datei):
-//! ```rust,ignore
-//! fn set_interaction_mode(
-//!     &self,
-//!     mode: harw_core::InteractionMode,
-//! ) -> Result<(), SessionControlError>;
-//! // und in SessionControlSnapshot:
-//! pub interaction_mode: Option<harw_core::InteractionMode>,
-//! ```
+//! `/mode default <modus>` berührt die laufende Sitzung nicht, sondern schreibt
+//! bestes Bemühen `[mode] default` über
+//! [`crate::config_util::persist_default_interaction_mode`].
 //!
 //! # Schlüsseltypen
-//! - [`ModeArgs`] — Subcommand-Enum (`show`, `chat`, `plan`, `explore`, `work`,
-//!   `shell`).
+//! - [`ModeArgs`] — positionale Argumente `action target`.
 //! - `ModeOperation` — vom `#[operation]`-Makro erzeugter Op-Struct.
+//!
+//! # Datenvertrag (`OpOutput::data`)
+//! `show` → `{"action":"show","mode","known","default","available_modes":[{"name","summary"}]}`;
+//! Wechsel → `{"action":"switch","mode","requested","available_modes","note"}`;
+//! Standard → `{"action":"default","default","persisted","note"}`.
 //!
 //! # Nebenläufigkeit
 //! `ModeOperation` ist ein zustandsloser Unit-Struct → `Send + Sync`.
 //!
 //! # Fehler
-//! - [`OpError::InvalidArguments`]: unbekanntes Subcommand (die Meldung listet
-//!   die gültigen auf — vom `FromRawArgs`-Derive erzeugt).
-//! - [`OpError::Execution`]: der Bericht ist nicht serialisierbar.
+//! - [`OpError::InvalidArguments`]: unbekanntes Sub-Kommando oder unbekannter
+//!   Modus (die Meldung listet die gültigen auf).
+//! - [`OpError::NotAvailable`]: kein Controller registriert bzw. die Oberfläche
+//!   führt keine Interaktionsmodi (nur `show` und Wechsel).
+//! - [`OpError::Execution`]: Mutations-Kanal geschlossen.
 //!
 //! # Beispiel
 //! ```rust
@@ -56,15 +61,11 @@
 //! use harw_operations::FromRawArgs;
 //!
 //! // "/mode" ohne Argument zeigt den Modus an.
-//! assert!(matches!(
-//!     ModeArgs::from_raw_args(&[]),
-//!     Ok(ModeArgs::Show)
-//! ));
+//! let show = ModeArgs::from_raw_args(&[]).ok();
+//! assert!(show.is_some_and(|args| args.requested_mode().is_none()));
 //! // "/mode explore" ist die Wechselabsicht.
-//! assert!(matches!(
-//!     ModeArgs::from_raw_args(&["explore".to_owned()]),
-//!     Ok(ModeArgs::Explore)
-//! ));
+//! let switch = ModeArgs::from_raw_args(&["explore".to_owned()]).ok();
+//! assert!(switch.is_some_and(|args| args.requested_mode().is_some()));
 //! ```
 
 use harw_core::InteractionMode;
@@ -92,56 +93,54 @@ pub(crate) const NO_CONTROLLER: &str = "In dieser Laufzeit ist kein SessionContr
 pub(crate) const APPLIES_AT_TURN_BOUNDARY: &str =
     "Der Wechsel ist vorgemerkt und wird an der nächsten Turn-Grenze wirksam.";
 
-/// Alle wählbaren Modi in der Reihenfolge der Subcommands.
-const AVAILABLE_MODES: &[InteractionMode] = &[
-    InteractionMode::Chat,
-    InteractionMode::Plan,
-    InteractionMode::Explore,
-    InteractionMode::Work,
-    InteractionMode::Shell,
-];
+/// Wann ein geänderter Standardmodus wirksam wird.
+pub(crate) const DEFAULT_APPLIES_NEXT_SESSION: &str =
+    "Der Standardmodus gilt ab der nächsten Sitzung; die laufende Sitzung bleibt unverändert.";
 
 // ── Argumente ────────────────────────────────────────────────────────────────
 
-/// Subcommands der `mode`-Operation.
+/// Argumente der `mode`-Operation.
 ///
 /// # Beschreibung
-/// `/mode` ohne Argument ist [`Self::Show`] (`#[raw(default_subcommand)]`); jede
-/// andere Variante ist die Absicht, in den gleichnamigen
-/// [`InteractionMode`] zu wechseln. Ein unbekanntes Token liefert
-/// [`OpError::InvalidArguments`] mit der Liste aller Subcommands — erzeugt vom
-/// `FromRawArgs`-Derive.
+/// Positional: `action` ist `show` (Standard), ein Modusname oder `default`;
+/// `target` ist bei `default` der neue Standardmodus. Die Validierung erfolgt
+/// im Handler über [`InteractionMode::parse`], damit die Fehlermeldung alle
+/// gültigen Eingaben nennen kann.
 ///
 /// # Spec-Referenz
-/// AP W4-05 — `/mode`.
-#[derive(Debug, Default, PartialEq, Eq, serde::Deserialize, harw_macros::FromRawArgs)]
-#[serde(rename_all = "snake_case")]
-#[raw(subcommand)]
-pub enum ModeArgs {
-    /// Zeigt den aktuellen Modus an (Vorgabe ohne Argument).
-    #[default]
-    #[raw(default_subcommand)]
+/// AP W4-05 — `/mode`; TUI-Vertrag — `/mode default <modus>`.
+#[derive(Debug, Default, Clone, PartialEq, Eq, serde::Deserialize, harw_macros::FromRawArgs)]
+pub struct ModeArgs {
+    /// `show` (Standard), `chat|plan|explore|work|shell` oder `default`.
+    #[serde(default)]
+    #[raw(first)]
+    pub action: Option<String>,
+    /// Zielmodus für `default`.
+    #[serde(default)]
+    #[raw(nth = 1)]
+    pub target: Option<String>,
+}
+
+/// Interne, validierte Form von [`ModeArgs`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ModeCommand {
     Show,
-    /// Wechselabsicht: Gespräch, keine namensbasierte Werkzeug-Einschränkung.
-    Chat,
-    /// Wechselabsicht: Planung — Plan-/Goal-Werkzeuge und Recherche.
-    Plan,
-    /// Wechselabsicht: Exploration — ausschließlich lesende Werkzeuge.
-    Explore,
-    /// Wechselabsicht: Ausführung — voller Werkzeugsatz.
-    Work,
-    /// Wechselabsicht: Host-Arbeit — voller Werkzeugsatz, das Modell soll
-    /// Host-Befehle bevorzugt an den `uia-shell-worker` delegieren; eine
-    /// Host-Freigabe erteilt weiterhin nur der Mensch.
-    Shell,
+    Switch(InteractionMode),
+    SetDefault(InteractionMode),
+}
+
+/// Liste aller gültigen Modusnamen für Fehlermeldungen.
+fn mode_names() -> String {
+    InteractionMode::names().collect::<Vec<_>>().join(", ")
 }
 
 impl ModeArgs {
-    /// Gibt den gewünschten Zielmodus zurück, falls es einer ist.
+    /// Gibt den gewünschten Zielmodus der laufenden Sitzung zurück, falls es einer ist.
     ///
     /// # Rückgabe
-    /// `None` für [`Self::Show`] (eine Anzeige ist kein Wechsel), sonst der
-    /// zugehörige [`InteractionMode`].
+    /// `Some(modus)`, wenn `action` ein Modusname ist; `None` für `show`,
+    /// `default …` und unbekannte Eingaben (eine Anzeige bzw. ein
+    /// Standardwechsel ist kein Sitzungswechsel).
     ///
     /// # Nebenläufigkeit
     /// Reine Funktion auf einem Werttyp.
@@ -150,25 +149,149 @@ impl ModeArgs {
     /// ```rust
     /// use harw_ops::mode::ModeArgs;
     ///
-    /// assert!(ModeArgs::Show.requested_mode().is_none());
-    /// assert!(ModeArgs::Explore.requested_mode().is_some());
+    /// assert!(ModeArgs::default().requested_mode().is_none());
+    /// let explore = ModeArgs { action: Some("explore".to_owned()), target: None };
+    /// assert!(explore.requested_mode().is_some());
     /// ```
     #[must_use]
     pub fn requested_mode(&self) -> Option<InteractionMode> {
-        match self {
-            Self::Show => None,
-            Self::Chat => Some(InteractionMode::Chat),
-            Self::Plan => Some(InteractionMode::Plan),
-            Self::Explore => Some(InteractionMode::Explore),
-            Self::Work => Some(InteractionMode::Work),
-            Self::Shell => Some(InteractionMode::Shell),
+        match self.command() {
+            Ok(ModeCommand::Switch(mode)) => Some(mode),
+            _ => None,
         }
+    }
+
+    /// Validiert die Argumente.
+    fn command(&self) -> Result<ModeCommand, OpError> {
+        let action = self
+            .action
+            .as_deref()
+            .map(str::trim)
+            .filter(|action| !action.is_empty())
+            .unwrap_or("show");
+        match action.to_ascii_lowercase().as_str() {
+            "show" => Ok(ModeCommand::Show),
+            "default" => {
+                let target = self
+                    .target
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|target| !target.is_empty())
+                    .ok_or_else(|| {
+                        OpError::InvalidArguments(format!(
+                            "Modus fehlt. Aufruf: /mode default <modus>. Gültig: {}.",
+                            mode_names()
+                        ))
+                    })?;
+                InteractionMode::parse(target)
+                    .map(ModeCommand::SetDefault)
+                    .ok_or_else(|| {
+                        OpError::InvalidArguments(format!(
+                            "Unbekannter Modus: '{target}'. Gültig: {}.",
+                            mode_names()
+                        ))
+                    })
+            }
+            _ => InteractionMode::parse(action)
+                .map(ModeCommand::Switch)
+                .ok_or_else(|| {
+                    OpError::InvalidArguments(format!(
+                        "Unbekanntes /mode-Sub-Kommando: '{action}'. Gültig: show, {}, \
+                         default <modus>.",
+                        mode_names()
+                    ))
+                }),
+        }
+    }
+}
+
+// ── Hilfsfunktionen ──────────────────────────────────────────────────────────
+
+/// Alle Modi als `[{"name","summary"}]` für den Datenvertrag.
+fn available_modes_json() -> Value {
+    Value::Array(
+        InteractionMode::ALL
+            .iter()
+            .map(|mode| json!({ "name": mode.as_str(), "summary": mode.summary_de() }))
+            .collect(),
+    )
+}
+
+/// Baut Text und `data` für `show`.
+fn render_show(current: Option<&str>, configured_default: Option<&str>) -> OpOutput {
+    let mut lines = vec![
+        format!("Modus: {}", current.unwrap_or("(unbekannt)")),
+        format!(
+            "Standard für neue Sitzungen: {}",
+            configured_default.unwrap_or("(unbekannt)")
+        ),
+        String::new(),
+        "Verfügbare Modi:".to_owned(),
+    ];
+    for mode in InteractionMode::ALL {
+        let marker = if current == Some(mode.as_str()) {
+            "*"
+        } else {
+            " "
+        };
+        lines.push(format!(
+            "{marker} {:<8} {}",
+            mode.as_str(),
+            mode.summary_de()
+        ));
+    }
+    lines.push(String::new());
+    lines.push("Wechseln: /mode <modus> · Standard setzen: /mode default <modus>".to_owned());
+
+    OpOutput {
+        text: lines.join("\n"),
+        data: Some(json!({
+            "action": "show",
+            "mode": current,
+            "known": current.is_some(),
+            "default": configured_default,
+            "available_modes": available_modes_json(),
+        })),
+    }
+}
+
+/// Persistiert den Standardmodus über `persist` und baut die Antwort.
+///
+/// # Beschreibung
+/// `persist` ist in Produktion
+/// [`crate::config_util::persist_default_interaction_mode`]; die Injektion
+/// erlaubt Tests ohne `HARW_HOME`-Zugriff (dieses Crate verbietet `unsafe`,
+/// also auch Env-Isolation über `set_var`).
+fn handle_set_default(
+    mode: InteractionMode,
+    persist: impl FnOnce(&str) -> Option<String>,
+) -> OpOutput {
+    let note = persist(mode.as_str());
+    let mut text = format!("Standardmodus gesetzt: {}", mode.as_str());
+    match note.as_deref() {
+        Some(note) => {
+            text.push('\n');
+            text.push_str(note);
+        }
+        None => {
+            text.push_str(" — gespeichert. ");
+            text.push_str(DEFAULT_APPLIES_NEXT_SESSION);
+        }
+    }
+    OpOutput {
+        text,
+        data: Some(json!({
+            "action": "default",
+            "default": mode.as_str(),
+            "persisted": note.is_none(),
+            "note": note,
+        })),
     }
 }
 
 // ── Operation ────────────────────────────────────────────────────────────────
 
-/// Zeigt den Interaktionsmodus an oder meldet die Wechselabsicht.
+/// Zeigt den Interaktionsmodus, fordert einen Wechsel an oder setzt den Standard.
 ///
 /// # Beschreibung
 /// `show` liest den aktuellen Modus aus
@@ -176,84 +299,82 @@ impl ModeArgs {
 /// Hat die Oberfläche nie einen Modus angefordert, meldet die Antwort
 /// `known = false` statt einen Vorgabewert zu erfinden — ein erfundenes `"chat"`
 /// wäre schlimmer als ein ehrliches „unbekannt", weil der Nutzer daraus auf
-/// Werkzeug- und Sandbox-Grenzen schließt.
+/// Werkzeug- und Sandbox-Grenzen schließt. `default` stammt aus der
+/// aufgelösten Config (`[mode] default`).
 ///
-/// Jedes andere Subcommand ruft
-/// [`SessionController::request_mode`](harw_operations::session_control::SessionController::request_mode).
-/// Der Controller merkt den Wunsch vor; wirksam wird er an der nächsten
-/// Turn-Grenze — deshalb heißt das Feld `requested` und nicht `applied`.
+/// `/mode <modus>` ruft
+/// [`SessionController::request_mode`](harw_operations::session_control::SessionController::request_mode);
+/// wirksam wird der Wechsel an der nächsten Turn-Grenze.
+///
+/// `/mode default <modus>` persistiert `[mode] default` (bestes Bemühen) und
+/// braucht keinen Controller.
 ///
 /// **Command only**: Das Modell darf diese Operation nicht selbst aufrufen; es
 /// würde sonst sein eigenes Werkzeug-Ceiling verschieben. Diese Grenze wird von
-/// der Flächen-Deklaration gezogen (kein `model_tool`, kein `agent_tool`), nicht
-/// erst im Rumpf.
-///
-/// # Argumente
-/// - `ctx` (`&OpContext`): liefert die `ServiceMap` mit dem
-///   [`SharedSessionController`].
-/// - `args` ([`ModeArgs`]): das Subcommand.
-///
-/// # Rückgabe
-/// `Ok(OpOutput)` mit einem JSON-Bericht.
+/// der Flächen-Deklaration gezogen (kein `model_tool`, kein `agent_tool`).
 ///
 /// # Fehler
+/// - [`OpError::InvalidArguments`]: unbekanntes Sub-Kommando/unbekannter Modus.
 /// - [`OpError::NotAvailable`]: kein Controller registriert, oder die Oberfläche
-///   führt keine Interaktionsmodi
-///   ([`SessionControlError::ModeUnsupported`](harw_operations::session_control::SessionControlError::ModeUnsupported)).
-/// - [`OpError::Execution`]: Mutations-Kanal geschlossen, oder der Bericht ist
-///   nicht serialisierbar.
+///   führt keine Interaktionsmodi.
+/// - [`OpError::Execution`]: Mutations-Kanal geschlossen.
 ///
 /// # Nebenläufigkeit
 /// Zustandslos; der Controller nimmt intern kurz einen Lock.
-///
-/// # Beispiel
-/// ```rust,no_run
-/// // Aufruf erfolgt über Operation::run().
-/// ```
 #[operation(
     name = "mode",
-    summary = "Zeigt den Interaktionsmodus oder meldet die Wechselabsicht (chat/plan/explore/work/shell).",
+    summary = "Zeigt/wechselt den Interaktionsmodus (chat/plan/explore/work/shell) oder setzt den Standard (default <modus>).",
     domain = "session",
     permission = "operator",
     command(path = "/mode", visibility = "tui_only")
 )]
 async fn mode(ctx: &OpContext, args: ModeArgs) -> Result<OpOutput, OpError> {
-    let available: Vec<&'static str> = AVAILABLE_MODES.iter().map(|mode| mode.as_str()).collect();
+    let command = args.command()?;
 
-    // Ohne Controller gibt es keinen Adressaten — für beide Subcommands ein
+    if let ModeCommand::SetDefault(mode) = command {
+        return Ok(handle_set_default(
+            mode,
+            crate::config_util::persist_default_interaction_mode,
+        ));
+    }
+
+    // Ohne Controller gibt es keinen Adressaten — für Anzeige und Wechsel ein
     // Fehler und keine beschönigende Antwort: `show` würde sonst „unbekannt"
     // melden, obwohl der wahre Befund „nicht anschließbar" ist.
     let Some(controller) = ctx.service::<SharedSessionController>() else {
         return Err(OpError::NotAvailable(NO_CONTROLLER.to_owned()));
     };
 
-    let report = match args.requested_mode() {
-        None => {
-            let current = controller.snapshot().interaction_mode;
-            json!({
-                "action": "show",
-                "mode": current.clone().map_or(Value::Null, Value::String),
-                "known": current.is_some(),
-                "available_modes": available,
-            })
-        }
-        Some(mode) => {
+    match command {
+        ModeCommand::Switch(mode) => {
             controller
                 .request_mode(mode.as_str())
                 .map_err(map_control_error)?;
-            json!({
-                "action": "switch",
-                "mode": mode.as_str(),
-                "requested": true,
-                "available_modes": available,
-                "note": APPLIES_AT_TURN_BOUNDARY,
+            Ok(OpOutput {
+                text: format!(
+                    "Modus angefordert: {}. {APPLIES_AT_TURN_BOUNDARY}",
+                    mode.as_str()
+                ),
+                data: Some(json!({
+                    "action": "switch",
+                    "mode": mode.as_str(),
+                    "requested": true,
+                    "available_modes": available_modes_json(),
+                    "note": APPLIES_AT_TURN_BOUNDARY,
+                })),
             })
         }
-    };
-
-    let text = serde_json::to_string_pretty(&report)
-        .map_err(|error| OpError::Execution(format!("Bericht nicht serialisierbar: {error}")))?;
-    Ok(OpOutput::from(text))
+        ModeCommand::Show | ModeCommand::SetDefault(_) => {
+            let current = controller.snapshot().interaction_mode;
+            let configured_default = crate::provider::resolved_config(ctx)
+                .ok()
+                .map(|config| config.harness.mode.default.clone());
+            Ok(render_show(
+                current.as_deref(),
+                configured_default.as_deref(),
+            ))
+        }
+    }
 }
 
 /// Bildet einen [`SessionControlError`] auf die passende [`OpError`]-Variante ab.
@@ -276,7 +397,7 @@ fn map_control_error(error: SessionControlError) -> OpError {
 
 #[cfg(test)]
 mod tests {
-    use super::{ModeArgs, ModeOperation};
+    use super::{ModeArgs, ModeCommand, ModeOperation, handle_set_default};
     use crate::test_support::{TestError, TestResult, ctx};
     use crate::testutil::toks;
     use harw_authority::{PermissionSet, SandboxSpec, WorkspaceRegistration, WorkspaceRegistry};
@@ -284,10 +405,14 @@ mod tests {
     use harw_operations::context::ServiceMap;
     use harw_operations::{FromRawArgs, OpContext, OpError, Operation, Surface};
     use harw_types::{SessionId, TenantId, TurnId, WorkspaceId};
+    use std::sync::Arc;
     use std::sync::atomic::{AtomicU64, Ordering};
 
-    /// Baut einen minimalen [`OpContext`] mit leerer [`ServiceMap`].
-    fn test_context() -> TestResult<(OpContext, std::path::PathBuf)> {
+    /// Baut einen minimalen [`OpContext`]; optional mit
+    /// [`harw_operations::session_control::NullSessionController`]. Eine
+    /// Standard-[`harw_config::ResolvedConfig`] wird immer injiziert, damit
+    /// `show` nie die echte `HARW_HOME`-Config liest.
+    fn test_context(with_controller: bool) -> TestResult<(OpContext, std::path::PathBuf)> {
         static COUNTER: AtomicU64 = AtomicU64::new(0);
         let id = COUNTER.fetch_add(1, Ordering::Relaxed);
         let root = std::env::temp_dir().join(format!("harw-mode-test-{}-{id}", std::process::id()));
@@ -308,84 +433,87 @@ mod tests {
             )
             .map_err(ctx("Workspace-Binding auflösen"))?;
         let sandbox = SandboxSpec::from_resolved(binding, PermissionSet::empty());
+        let mut services = ServiceMap::new();
+        services.insert(Arc::new(harw_config::ResolvedConfig::default()));
+        if with_controller {
+            let controller: harw_operations::SharedSessionController =
+                Arc::new(harw_operations::session_control::NullSessionController::new());
+            services.insert(controller);
+        }
         Ok((
-            OpContext::new(SessionId::new(), TurnId::new(), sandbox, ServiceMap::new()),
+            OpContext::new(SessionId::new(), TurnId::new(), sandbox, services),
             root,
         ))
     }
 
-    /// Führt `/mode` aus und liefert den Bericht als JSON.
-    /// Führt `/mode` mit registriertem [`NullSessionController`] aus.
-    ///
-    /// Der Null-Controller zeichnet den Wunsch auf und gibt ihn im Snapshot
-    /// zurück — genau das, was die Operation von einer echten Oberfläche
-    /// erwartet, ohne eine TUI zu brauchen.
-    async fn run(args: ModeArgs) -> TestResult<serde_json::Value> {
-        let (op_ctx, root) = test_context_with_controller()?;
-        let result = super::mode(&op_ctx, args).await;
+    fn args(tokens: &[&str]) -> TestResult<ModeArgs> {
+        ModeArgs::from_raw_args(&toks(tokens)).map_err(ctx("ModeArgs::from_raw_args"))
+    }
+
+    /// Führt `/mode` mit registriertem Null-Controller aus und liefert `data`.
+    async fn run(tokens: &[&str]) -> TestResult<serde_json::Value> {
+        let (op_ctx, root) = test_context(true)?;
+        let result = super::mode(&op_ctx, args(tokens)?).await;
         std::fs::remove_dir_all(root).ok();
 
         let output = result.map_err(|error| {
             TestError::Unexpected(format!("/mode darf hier nicht fehlschlagen: {error}"))
         })?;
-        serde_json::from_str(&output.text).map_err(ctx("/mode-Ausgabe ist kein JSON"))
-    }
-
-    /// Baut einen [`OpContext`] mit einem [`NullSessionController`] in der
-    /// [`ServiceMap`].
-    fn test_context_with_controller() -> TestResult<(OpContext, std::path::PathBuf)> {
-        let (op_ctx, root) = test_context()?;
-        let controller: harw_operations::SharedSessionController =
-            std::sync::Arc::new(harw_operations::session_control::NullSessionController::new());
-        let mut services = ServiceMap::new();
-        services.insert(controller);
-        Ok((
-            OpContext::new(
-                op_ctx.session_id().clone(),
-                op_ctx.turn_id().clone(),
-                op_ctx.sandbox().clone(),
-                services,
-            ),
-            root,
-        ))
+        output.data.ok_or(TestError::Missing("OpOutput.data"))
     }
 
     #[test]
-    fn test_mode_args_default_is_show() {
-        assert_eq!(ModeArgs::default(), ModeArgs::Show);
-    }
-
-    #[test]
-    fn test_mode_args_from_raw_args_without_tokens_is_show() -> TestResult {
-        let args = ModeArgs::from_raw_args(&toks(&[])).map_err(ctx("ModeArgs::from_raw_args"))?;
-        assert_eq!(args, ModeArgs::Show);
+    fn test_mode_args_default_is_show() -> TestResult {
+        assert_eq!(
+            ModeArgs::default().command().map_err(ctx("command"))?,
+            ModeCommand::Show
+        );
         Ok(())
     }
 
     #[test]
-    fn test_mode_args_from_raw_args_parses_every_subcommand() -> TestResult {
-        for (token, expected) in [
-            ("show", ModeArgs::Show),
-            ("chat", ModeArgs::Chat),
-            ("plan", ModeArgs::Plan),
-            ("explore", ModeArgs::Explore),
-            ("work", ModeArgs::Work),
-            ("shell", ModeArgs::Shell),
+    fn test_mode_args_from_raw_args_without_tokens_is_show() -> TestResult {
+        let parsed = args(&[])?;
+        assert_eq!(parsed, ModeArgs::default());
+        assert_eq!(parsed.command().map_err(ctx("command"))?, ModeCommand::Show);
+        Ok(())
+    }
+
+    #[test]
+    fn test_mode_args_parses_every_subcommand() -> TestResult {
+        for (tokens, expected) in [
+            (vec!["show"], ModeCommand::Show),
+            (vec!["chat"], ModeCommand::Switch(InteractionMode::Chat)),
+            (vec!["plan"], ModeCommand::Switch(InteractionMode::Plan)),
+            (
+                vec!["explore"],
+                ModeCommand::Switch(InteractionMode::Explore),
+            ),
+            (vec!["work"], ModeCommand::Switch(InteractionMode::Work)),
+            (vec!["shell"], ModeCommand::Switch(InteractionMode::Shell)),
+            (
+                vec!["default", "explore"],
+                ModeCommand::SetDefault(InteractionMode::Explore),
+            ),
+            (
+                vec!["default", "Work"],
+                ModeCommand::SetDefault(InteractionMode::Work),
+            ),
         ] {
-            let args = ModeArgs::from_raw_args(&toks(&[token])).map_err(|error| {
-                TestError::Unexpected(format!("Subcommand '{token}' schlug fehl: {error}"))
+            let command = args(&tokens)?.command().map_err(|error| {
+                TestError::Unexpected(format!("{tokens:?} schlug fehl: {error}"))
             })?;
-            assert_eq!(args, expected, "Subcommand '{token}'");
+            assert_eq!(command, expected, "{tokens:?}");
         }
         Ok(())
     }
 
     #[test]
-    fn test_mode_args_from_raw_args_rejects_unknown_subcommand() -> TestResult {
-        match ModeArgs::from_raw_args(&toks(&["turbo"])) {
+    fn test_mode_args_rejects_unknown_subcommand() -> TestResult {
+        match args(&["turbo"])?.command() {
             Err(OpError::InvalidArguments(message)) => {
                 assert!(
-                    message.contains("explore"),
+                    message.contains("explore") && message.contains("default"),
                     "die Meldung muss die gültigen Subcommands nennen: {message}"
                 );
                 Ok(())
@@ -397,19 +525,35 @@ mod tests {
     }
 
     #[test]
-    fn test_requested_mode_maps_each_variant() {
-        assert!(ModeArgs::Show.requested_mode().is_none());
-        assert_eq!(ModeArgs::Chat.requested_mode(), Some(InteractionMode::Chat));
-        assert_eq!(ModeArgs::Plan.requested_mode(), Some(InteractionMode::Plan));
-        assert_eq!(
-            ModeArgs::Explore.requested_mode(),
-            Some(InteractionMode::Explore)
-        );
-        assert_eq!(ModeArgs::Work.requested_mode(), Some(InteractionMode::Work));
-        assert_eq!(
-            ModeArgs::Shell.requested_mode(),
-            Some(InteractionMode::Shell)
-        );
+    fn test_mode_default_rejects_missing_and_unknown_mode() -> TestResult {
+        for (tokens, needle) in [
+            (vec!["default"], "Modus fehlt"),
+            (vec!["default", "turbo"], "Unbekannter Modus"),
+        ] {
+            match args(&tokens)?.command() {
+                Err(OpError::InvalidArguments(message)) => assert!(
+                    message.contains(needle) && message.contains("shell"),
+                    "{tokens:?}: {message}"
+                ),
+                other => {
+                    return Err(TestError::Unexpected(format!(
+                        "{tokens:?}: erwartet InvalidArguments, war: {other:?}"
+                    )));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn test_requested_mode_maps_each_variant() -> TestResult {
+        assert!(args(&["show"])?.requested_mode().is_none());
+        assert!(args(&["default", "work"])?.requested_mode().is_none());
+        assert!(args(&["turbo"])?.requested_mode().is_none());
+        for mode in InteractionMode::ALL {
+            assert_eq!(args(&[mode.as_str()])?.requested_mode(), Some(mode));
+        }
+        Ok(())
     }
 
     #[test]
@@ -444,10 +588,18 @@ mod tests {
         // Ein Controller ist da, hat aber nie einen Modus gesehen. Die Antwort
         // muss das zugeben statt `"chat"` zu erfinden — der Nutzer schließt aus
         // dem Modus auf Werkzeug- und Sandbox-Grenzen.
-        let report = run(ModeArgs::Show).await?;
+        let report = run(&["show"]).await?;
         assert_eq!(report["action"], serde_json::json!("show"));
         assert_eq!(report["mode"], serde_json::Value::Null);
         assert_eq!(report["known"], serde_json::json!(false));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_mode_show_reports_configured_default() -> TestResult {
+        // Die injizierte Standard-Config trägt `[mode] default = "plan"`.
+        let report = run(&[]).await?;
+        assert_eq!(report["default"], serde_json::json!("plan"));
         Ok(())
     }
 
@@ -456,8 +608,8 @@ mod tests {
         // Ohne Controller gibt es keinen Adressaten. Ein beschönigendes
         // „unbekannt" wäre die falsche Auskunft: der wahre Befund ist
         // „nicht anschließbar".
-        let (op_ctx, root) = test_context()?;
-        let result = super::mode(&op_ctx, ModeArgs::Show).await;
+        let (op_ctx, root) = test_context(false)?;
+        let result = super::mode(&op_ctx, ModeArgs::default()).await;
         std::fs::remove_dir_all(root).ok();
         assert!(
             matches!(result, Err(OpError::NotAvailable(_))),
@@ -468,7 +620,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_mode_switch_requests_the_mode_and_says_when_it_applies() -> TestResult {
-        let report = run(ModeArgs::Explore).await?;
+        let report = run(&["explore"]).await?;
         assert_eq!(report["action"], serde_json::json!("switch"));
         assert_eq!(report["mode"], serde_json::json!("explore"));
         assert_eq!(
@@ -491,30 +643,66 @@ mod tests {
     async fn test_mode_switch_is_visible_in_the_following_show() -> TestResult {
         // Der eigentliche Beweis, dass die Kette geschlossen ist: erst
         // wechseln, dann anzeigen — der Controller hat den Modus behalten.
-        let (op_ctx, root) = test_context_with_controller()?;
-        let switched = super::mode(&op_ctx, ModeArgs::Explore).await;
+        let (op_ctx, root) = test_context(true)?;
+        let switched = super::mode(&op_ctx, args(&["explore"])?).await;
         assert!(switched.is_ok(), "Wechsel schlug fehl: {switched:?}");
 
-        let shown = super::mode(&op_ctx, ModeArgs::Show).await;
+        let shown = super::mode(&op_ctx, args(&["show"])?).await;
         std::fs::remove_dir_all(root).ok();
 
         let output = shown.map_err(|error| {
             TestError::Unexpected(format!("/mode show darf nicht fehlschlagen: {error}"))
         })?;
-        let report: serde_json::Value =
-            serde_json::from_str(&output.text).map_err(ctx("/mode-Ausgabe ist kein JSON"))?;
+        let report = output.data.ok_or(TestError::Missing("OpOutput.data"))?;
         assert_eq!(report["mode"], serde_json::json!("explore"));
         assert_eq!(report["known"], serde_json::json!(true));
+        assert!(output.text.contains("* explore"), "{}", output.text);
         Ok(())
     }
 
     #[tokio::test]
-    async fn test_mode_lists_all_available_modes() -> TestResult {
-        let report = run(ModeArgs::Show).await?;
-        assert_eq!(
-            report["available_modes"],
-            serde_json::json!(["chat", "plan", "explore", "work", "shell"])
-        );
+    async fn test_mode_lists_all_available_modes_with_summaries() -> TestResult {
+        let report = run(&["show"]).await?;
+        let modes = report["available_modes"]
+            .as_array()
+            .ok_or(TestError::Missing("available_modes"))?;
+        let names: Vec<&str> = modes
+            .iter()
+            .filter_map(|mode| mode["name"].as_str())
+            .collect();
+        assert_eq!(names, ["chat", "plan", "explore", "work", "shell"]);
+        for (entry, mode) in modes.iter().zip(InteractionMode::ALL) {
+            assert_eq!(entry["summary"], serde_json::json!(mode.summary_de()));
+        }
         Ok(())
+    }
+
+    #[test]
+    fn test_handle_set_default_persists_canonical_name() {
+        let mut persisted = None;
+        let output = handle_set_default(InteractionMode::Explore, |mode| {
+            persisted = Some(mode.to_owned());
+            None
+        });
+        assert_eq!(persisted.as_deref(), Some("explore"));
+        assert!(
+            output.text.contains("Standardmodus gesetzt: explore"),
+            "{}",
+            output.text
+        );
+        assert!(output.text.contains("nächsten Sitzung"), "{}", output.text);
+        let data = output.data.unwrap_or_default();
+        assert_eq!(data["default"], serde_json::json!("explore"));
+        assert_eq!(data["persisted"], serde_json::json!(true));
+    }
+
+    #[test]
+    fn test_handle_set_default_reports_persist_failure_note() {
+        let output = handle_set_default(InteractionMode::Chat, |_| {
+            Some("Hinweis: konnte den Standardmodus nicht dauerhaft speichern (boom).".to_owned())
+        });
+        assert!(output.text.contains("(boom)"), "{}", output.text);
+        let data = output.data.unwrap_or_default();
+        assert_eq!(data["persisted"], serde_json::json!(false));
     }
 }

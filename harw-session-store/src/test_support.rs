@@ -14,7 +14,10 @@ pub(crate) enum TestError {
     /// Ein Ergebnis hatte eine unerwartete Form.
     Unexpected(String),
     /// Ein Fehler mit Kontext (ersetzt `expect("…")`).
-    Context { context: &'static str, source: String },
+    Context {
+        context: &'static str,
+        source: String,
+    },
     /// I/O-Fehler aus Testdateioperationen (`tempfile`, `std::fs`, …).
     Io(std::io::Error),
     /// JSON-(De-)Serialisierungsfehler aus direkten `serde_json`-Aufrufen im Test.

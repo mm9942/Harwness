@@ -171,6 +171,18 @@ impl crate::ModelProvider for UsageReportingProvider {
             Ok(response)
         })
     }
+
+    /// Reicht die gepinnte Modell-ID des umhüllten Providers durch.
+    ///
+    /// # Description
+    /// Die Hülle meldet nur die Token-Nutzung und ändert das angesprochene
+    /// Modell nicht; ein Pin des inneren Providers bleibt so sichtbar.
+    ///
+    /// # Returns
+    /// `self.inner.pinned_model_id()`.
+    fn pinned_model_id(&self) -> Option<String> {
+        self.inner.pinned_model_id()
+    }
 }
 
 #[cfg(test)]

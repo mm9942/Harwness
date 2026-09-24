@@ -72,10 +72,11 @@ fn is_within_baseline(baseline: &Baseline, sample: &HostSample) -> Result<bool, 
 mod tests {
     use super::*;
     use crate::test_support::{TestResult, ctx};
-    use harw_dod_signals::SensorId;
+    use harw_authority::NetworkScope;
+    use harw_types::SensorId;
     use jiff::Timestamp;
 
-    fn sample(metric: &str, value: f64) -> HostSample {
+    fn sample(metric: &'static str, value: f64) -> HostSample {
         HostSample {
             sensor: SensorId::from_str("test"),
             observed_at: Timestamp::UNIX_EPOCH,
@@ -84,11 +85,11 @@ mod tests {
         }
     }
 
-    fn ctx_with(
-        samples: &[HostSample],
-        baselines: &[Baseline],
-        scope: &NetworkScope,
-    ) -> RuleContext<'_> {
+    fn ctx_with<'a>(
+        samples: &'a [HostSample],
+        baselines: &'a [Baseline],
+        scope: &'a NetworkScope,
+    ) -> RuleContext<'a> {
         RuleContext {
             now: Timestamp::UNIX_EPOCH,
             samples,
@@ -104,7 +105,8 @@ mod tests {
             Baseline::new("cpu-load", "cpu-load", 0.0, 80.0).map_err(ctx("gültige Baseline"))?;
         let samples = vec![sample("cpu-load", 42.0)];
         let scope = NetworkScope::empty();
-        let ctx = ctx_with(&samples, &[baseline], &scope);
+        let baselines = [baseline];
+        let ctx = ctx_with(&samples, &baselines, &scope);
 
         assert!(BaselineDeviationRule.evaluate(&ctx).is_empty());
         Ok(())
@@ -116,7 +118,8 @@ mod tests {
             Baseline::new("cpu-load", "cpu-load", 0.0, 80.0).map_err(ctx("gültige Baseline"))?;
         let samples = vec![sample("cpu-load", 99.9)];
         let scope = NetworkScope::empty();
-        let ctx = ctx_with(&samples, &[baseline], &scope);
+        let baselines = [baseline];
+        let ctx = ctx_with(&samples, &baselines, &scope);
 
         let findings = BaselineDeviationRule.evaluate(&ctx);
         assert_eq!(findings.len(), 1);
@@ -140,7 +143,8 @@ mod tests {
             Baseline::new("cpu-load", "cpu-load", 0.0, 80.0).map_err(ctx("gültige Baseline"))?;
         let samples = vec![sample("cpu-load", 90.0), sample("cpu-load", 95.0)];
         let scope = NetworkScope::empty();
-        let ctx = ctx_with(&samples, &[baseline], &scope);
+        let baselines = [baseline];
+        let ctx = ctx_with(&samples, &baselines, &scope);
 
         let findings = BaselineDeviationRule.evaluate(&ctx);
         assert_eq!(findings.len(), 1);
@@ -153,7 +157,8 @@ mod tests {
             Baseline::new("cpu-load", "cpu-load", 0.0, 80.0).map_err(ctx("gültige Baseline"))?;
         let samples = vec![sample("cpu-load", 99.9)];
         let scope = NetworkScope::empty();
-        let ctx = ctx_with(&samples, &[baseline], &scope);
+        let baselines = [baseline];
+        let ctx = ctx_with(&samples, &baselines, &scope);
 
         assert_eq!(
             BaselineDeviationRule.evaluate(&ctx),

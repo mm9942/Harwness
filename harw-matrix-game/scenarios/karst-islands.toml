@@ -1,0 +1,117 @@
+# Beispielszenario aus docs/design/matrix-game.md §5.1 (fiktiv).
+# Einzige Abweichung: `seed` ist leer statt Platzhaltertext (leer = beim Start ziehen und journalisieren).
+schema = "harwness.matrix-scenario/v1"
+id = "karst-wasserkrise"
+title = "Wasserkrise auf den Karst-Inseln"
+purpose = "Ein Matrix Game über den Streit um die einzige Entsalzungsanlage der Karst-Inseln in einem Dürresommer."
+seed = ""                                # leer = beim Start ziehen und journalisieren; sonst 64 Hex-Zeichen
+rounds = 6
+round_represents = "etwa zwei Wochen"
+
+[rules]
+argument_system = "pros_cons"            # "pros_cons" | "three_reasons"
+argument_mode = "simultaneous"           # "simultaneous" (versiegelt) | "sequential"
+adjudication = "pros_cons_2d6"           # "pros_cons_2d6" | "estimative_d100"
+turn_order = "fixed"                     # "fixed" | "leader_first"
+max_track_step = 1
+max_ongoing = 6
+allow_auto_success = true
+auto_success_net = 5
+fail_chits = true
+consensus_check = false
+max_secret_arguments_per_seat = 1
+ending = "fixed_rounds"                  # "fixed_rounds" | "final_arguments"
+prologue = false
+epilogue = true
+debrief_players = true                   # Spieler-Agenten liefern AAR-Reflexion
+
+[rules.negotiation]
+enabled = true
+max_exchanges = 2
+max_channels_per_seat = 2
+max_message_chars = 800
+
+[visibility]
+umpire_negotiations = "none"             # "none" | "cited" | "full"
+secret_outcome_public = false
+leak_guard = "strict"                    # "strict" | "flag_only"
+
+[models]                                 # optional, sonst Default-Modell des Harness
+umpire = "default"
+players = "default"
+
+# ---------- Welt ----------
+[world]
+public_situation = """
+Seit sechs Wochen kein Regen. Die Entsalzungsanlage im Hafen von Velmar liefert nur noch
+60 % Leistung. Der Inselrat hat Rationierung angekündigt; die Hafengilde kontrolliert
+den Tankerverkehr, das Nordreich bietet „technische Hilfe“ an, eine Vermittlungsmission
+der Seeliga ist seit gestern vor Ort.
+"""
+
+tracks = [
+  { id = "stability",           label = "Öffentliche Ordnung",          min = -3, max = 3, start = 0,  visibility = "public" },
+  { id = "water",               label = "Wasserversorgung",             min = -3, max = 3, start = -1, visibility = "public" },
+  { id = "north_influence",     label = "Einfluss Nordreich",           min = 0,  max = 5, start = 1,  visibility = "public" },
+  { id = "rat_support",         label = "Rückhalt des Inselrats",       min = -3, max = 3, start = 1,  visibility = "public" },
+  { id = "smuggling_net",       label = "Schmuggelnetz der Gilde",      min = 0,  max = 3, start = 2,  visibility = "seat:gilde" },
+  { id = "north_agents",        label = "Nordreich-Agenten im Hafen",   min = 0,  max = 3, start = 1,  visibility = "seat:nord" },
+  { id = "plant_sabotage_risk", label = "Sabotagerisiko Anlage",        min = 0,  max = 3, start = 1,  visibility = "umpire" },
+]
+states = [
+  { id = "plant_control", label = "Kontrolle Entsalzungsanlage", values = ["rat", "gilde", "nord", "mission", "umstritten"], start = "rat", visibility = "public" },
+]
+objects = [
+  # nur der Umpire kennt das Reservoir zu Beginn; verdeckt, 1 Schutzstufe
+  { id = "reservoir_altmark", label = "Altes Reservoir von Altmark", hidden = true, protection = 1, visibility_when_found = "public" },
+]
+projects = [
+  { id = "pipeline", label = "Notleitung vom Festland", stages = 3, progress = 0, visibility = "public" },
+]
+
+# ---------- Fraktionen (genau 4 Spieler-Sitze) ----------
+[[factions]]
+id = "rat"
+name = "Inselrat"
+level = "Regierung"
+briefing = "Gewählte Regierung, knappe Kasse, Wahlen in drei Monaten."
+goals.public = ["Öffentliche Ordnung nicht unter 0 fallen lassen", "Kontrolle über die Anlage behalten"]
+goals.secret = ["Die Gilde als Schuldige der Krise dastehen lassen"]
+assets = ["Inselpolizei", "Rationierungsbehörde"]
+
+[[factions]]
+id = "gilde"
+name = "Hafengilde"
+level = "Wirtschaftsmacht"
+briefing = "Kontrolliert Tanker, Kräne und die Hafenarbeiter."
+goals.public = ["Tankerlizenzen sichern", "Rationierung zu Gunsten des Hafens"]
+goals.secret = ["Schmuggelnetz ausbauen (smuggling_net = 3)", "Kontrolle über die Anlage erlangen"]
+assets = ["Tankerflotte", "Hafenarbeiter-Syndikat"]
+
+[[factions]]
+id = "nord"
+name = "Nordreich"
+level = "Nachbarstaat"
+briefing = "Großer Nachbar mit Überschusswasser und politischen Ambitionen."
+goals.public = ["Als Helfer in der Not wahrgenommen werden"]
+goals.secret = ["north_influence mindestens 4 bei Spielende", "Pipeline-Projekt verhindern"]
+assets = ["Tankschiffe", "Techniker", "Botschaft"]
+
+[[factions]]
+id = "mission"
+name = "Vermittlungsmission der Seeliga"
+level = "Internationale Organisation"
+briefing = "Kleines Team mit Mandat, aber ohne Machtmittel."
+goals.public = ["Eskalation verhindern", "Pipeline zu mindestens 2 Stufen bringen"]
+goals.secret = ["Die eigene Organisation als unverzichtbar positionieren"]
+assets = ["Mandat", "Geberkonferenz-Kontakte"]
+
+[seating]                                  # Sitz → Fraktion, Reihenfolge = Zugreihenfolge
+order = ["rat", "gilde", "nord", "mission"]
+
+[[injects]]                                # vorbereitete Facilitator-Ereignisse (optional)
+id = "hitzewelle"
+round = 3
+audience = "public"
+text = "Eine Hitzewelle verdoppelt den Wasserbedarf."
+effects = [{ op = "add", var = "water", by = -1 }]

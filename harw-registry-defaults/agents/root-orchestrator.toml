@@ -44,12 +44,47 @@ admitted = [
   "explore.projects",
   "explore.relations",
   "explore.find",
+  # `delegate_wave` (Plan Punkt 1): Fan-out-Werkzeug der Orchestrator-
+  # Sitzungen. Die Composition-Root steuert es bei
+  # (`harw-core-bridge::delegate_wave`), nicht dieses Crate — siehe
+  # `harw_registry_defaults::profile::composition_tools_for_role`.
+  "delegate_wave",
 ]
-forbidden = ["fs.write", "shell.exec", "web.fetch", "web.docs_rs", "web.crates_io"]
+forbidden = ["fs.write", "shell.exec", "web.fetch", "web.search", "web.docs_rs", "web.crates_io"]
 
+# Zugelassene Delegationsziele für `delegate_wave`
+# (`harw_registry_defaults::authority::delegation_targets_for_role`): eine
+# zusätzliche Schnittmenge zur Laufzeit-Sichtbarkeit
+# (`delegation_visibility`), nie eine Erweiterung. `agent-steward` fehlt
+# bewusst: eine Definitionsänderung ist kein Fan-out-Auftrag, er bleibt über
+# `transfer_to_agent-steward` erreichbar.
+[delegation]
+targets = [
+  "coding-orchestrator",
+  "research-orchestrator",
+  "analysis-orchestrator",
+  "explorer",
+  "researcher",
+  "researcher-deps",
+  "dependency-researcher",
+  "researcher-web",
+  "planner",
+  "analyst",
+  "executor",
+]
+
+# `child_orchestrators` ist die exakte, namentliche Freigabeliste
+# (`delegation-capabilities.md`, „Rekursive Sub-Orchestrierung“): nur diese
+# drei eingebauten Child-Orchestratoren darf der Root starten. Jeder trägt
+# selbst `max_depth = 1` und eine leere eigene Freigabeliste — unter ihnen
+# entstehen ausschließlich Worker.
 [spawn]
 max_depth = 2
-child_orchestrators = []
+child_orchestrators = [
+  "coding-orchestrator",
+  "research-orchestrator",
+  "analysis-orchestrator",
+]
 
 [spawn.budget]
 max_tokens = 120000

@@ -1,4 +1,5 @@
 [package]
+publish.workspace = true
 name = "harw-cli"
 version.workspace = true
 edition.workspace = true
@@ -97,7 +98,7 @@ harw-install = { path = "../harw-install" }
 harw-model-catalog = { path = "../harw-model-catalog" }
 clap_complete = "4.6.7"
 harw-completions = { path = "../harw-completions", features = ["clap-args"] }
-tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
+tracing-subscriber = { version = "0.3.23", features = ["env-filter", "json"] }
 tracing = "0.1.44"
 tikv-jemallocator = { version = "0.7.0", optional = true }
 # Telemetrie-Senken für Gateway und `src/observe.rs`.
@@ -120,6 +121,12 @@ harw-observe-prom = { path = "../harw-observe-prom" }
 harw-observe-otlp = { path = "../harw-observe-otlp" }
 harw-runtime = { path = "../harw-runtime" }
 harw-protocol = { path = "../harw-protocol" }
+
+# `harw kill` (src/main.rs::run_kill): reicht alle Argumente an killer durch.
+# killer braucht pidfd und ist deshalb Linux-only; auf anderen Systemen meldet
+# `harw kill` einen Fehler (Exit-Code 2).
+[target.'cfg(target_os = "linux")'.dependencies]
+harw-killer = { path = "../harw-killer" }
 
 [dev-dependencies]
 tempfile = "3"

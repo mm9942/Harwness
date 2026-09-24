@@ -1,0 +1,5 @@
+name = "rust-while-let"
+description = "Use when eine Schleife einen Iterator oder Receiver so lange konsumiert, bis `None`/`Err` kommt — lehrt `while let Some(x) = iter.next()` als kompakte Alternative zu `loop { match … break }` (Rust Edition 2024)"
+enabled = true
+instructions_file = "instructions.md"
+tools = ["filesystem.read"]

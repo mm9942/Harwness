@@ -363,6 +363,234 @@ impl CatalogSnapshot {
         descriptors.sort_by(|left, right| left.name.cmp(&right.name));
         Ok(descriptors)
     }
+
+    /// Liefert das Manifest eines Skills aus dem eingefrorenen Katalog.
+    #[must_use]
+    pub fn skill(&self, name: &str) -> Option<&SkillToml> {
+        self.skills.get(name)
+    }
+
+    /// Die direkt konfigurierten Skills eines Agenten (`agent.toml`,
+    /// Feld `skills`) — im Gegensatz zu `suggestions.skills` keine
+    /// Vorschläge, sondern feste Bestandteile des Agenten.
+    ///
+    /// # Returns
+    /// `None`, wenn der Katalog keinen Agenten dieses Namens kennt.
+    #[must_use]
+    pub fn direct_skills_of(&self, agent: &str) -> Option<&[String]> {
+        self.agents.get(agent).map(|agent| agent.skills.as_slice())
+    }
+
+    /// Friert die direkt konfigurierten, aktivierten Skills eines Agenten
+    /// zusammen mit seinen beratenden Vorschlägen als Spawn-Vertrag ein.
+    ///
+    /// # Beschreibung
+    /// Anders als [`Self::activation_snapshot`] wählt hier kein
+    /// Spawn-Koordinator aus: die vertrauenswürdige Konfiguration selbst
+    /// (`agents/<name>/agent.toml`, Feld `skills`) hat die Skills dem Agenten
+    /// fest zugeordnet. Deaktivierte Skills werden ausgelassen, nie
+    /// stillschweigend aktiviert. Jede Aktivierung trägt den
+    /// `definition_sha256` ihres Manifests.
+    ///
+    /// # Returns
+    /// `Ok(None)`, wenn der Katalog keinen Agenten `agent` kennt (etwa eine
+    /// eingebaute Rolle ohne `agent.toml`).
+    ///
+    /// # Errors
+    /// [`CatalogError::InvalidConfig`], wenn ein validierter Skill-Verweis im
+    /// Snapshot fehlt; Fehler aus [`Self::suggestions_for_agent`].
+    pub fn direct_skills_snapshot(
+        &self,
+        agent: &str,
+    ) -> CatalogResult<Option<SpawnCapabilitySnapshot>> {
+        let Some(skill_names) = self.direct_skills_of(agent) else {
+            return Ok(None);
+        };
+        let suggestions = self.suggestions_for_agent(agent)?;
+        let mut seen = std::collections::BTreeSet::new();
+        let mut activated = Vec::new();
+        for name in skill_names {
+            if !seen.insert(name.as_str()) {
+                continue;
+            }
+            let skill = self.skills.get(name).ok_or_else(|| {
+                CatalogError::InvalidConfig(format!(
+                    "validated skill '{name}' of agent '{agent}' disappeared from snapshot"
+                ))
+            })?;
+            if !skill.enabled {
+                continue;
+            }
+            activated.push(ActivatedCapability {
+                kind: SuggestionKind::Skill,
+                name: name.clone(),
+                description: skill.description.clone(),
+                tools: skill.tools.clone(),
+                mcps: skill.mcps.clone(),
+                definition_sha256: self.definition_hash(&SuggestionKind::Skill, name)?,
+            });
+        }
+        Ok(Some(SpawnCapabilitySnapshot {
+            agent: agent.to_owned(),
+            suggestions,
+            activated,
+        }))
+    }
+}
+
+/// Findet das Verzeichnis, aus dem die Discovery den Skill `name` bezieht.
+///
+/// # Beschreibung
+/// Spiegelt `harw_config::discover_config`: der **letzte** Layer gewinnt,
+/// innerhalb eines Layers das nach Verzeichnisnamen letzte
+/// `skills/*/skill.toml`, dessen `name`-Feld passt (der Verzeichnisname
+/// selbst ist nicht maßgeblich). Verzeichnisse mit führendem Punkt
+/// (`skills/.proposals`) tragen nie ein eigenes Manifest und werden
+/// übersprungen.
+///
+/// # Arguments
+/// - `roots` (`&[PathBuf]`): die vertrauten Config-Layer in aufsteigender
+///   Präzedenz (dieselbe Liste, die die Discovery erhielt).
+/// - `name` (`&str`): der Skill-Name.
+///
+/// # Returns
+/// `Ok(Some(dir))` für das wirksame Skill-Verzeichnis, `Ok(None)`, wenn kein
+/// Layer den Skill definiert.
+///
+/// # Errors
+/// [`CatalogError::Io`] bei Lesefehlern, [`CatalogError::Toml`], wenn ein
+/// Manifest nicht parst (die Discovery wäre daran ebenfalls gescheitert).
+pub fn resolve_skill_directory(roots: &[PathBuf], name: &str) -> CatalogResult<Option<PathBuf>> {
+    for root in roots.iter().rev() {
+        let skills_dir = root.join("skills");
+        if !skills_dir.is_dir() {
+            continue;
+        }
+        let io_error = |path: &Path, error: std::io::Error| CatalogError::Io {
+            path: path.to_path_buf(),
+            reason: error.to_string(),
+        };
+        let mut entries = std::fs::read_dir(&skills_dir)
+            .map_err(|error| io_error(&skills_dir, error))?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|error| io_error(&skills_dir, error))?;
+        entries.sort_by_key(std::fs::DirEntry::file_name);
+        for entry in entries.iter().rev() {
+            let path = entry.path();
+            if entry.file_name().to_string_lossy().starts_with('.') {
+                continue;
+            }
+            let is_dir = entry
+                .file_type()
+                .map_err(|error| io_error(&path, error))?
+                .is_dir();
+            if !is_dir {
+                continue;
+            }
+            let manifest = path.join("skill.toml");
+            if !manifest.is_file() {
+                continue;
+            }
+            let source =
+                std::fs::read_to_string(&manifest).map_err(|error| io_error(&manifest, error))?;
+            let skill: SkillToml = toml::from_str(&source)
+                .map_err(|error| CatalogError::Toml(format!("{}: {error}", manifest.display())))?;
+            if skill.name == name {
+                return Ok(Some(path));
+            }
+        }
+    }
+    Ok(None)
+}
+
+/// Lädt den Anweisungstext eines bereits aufgelösten Skills als
+/// eingefrorenen Laufzeit-Snapshot mit SHA-256-Provenienz.
+///
+/// # Beschreibung
+/// Liest über [`harw_config::load_skill_instructions`] (Pfad bleibt im
+/// Skill-Verzeichnis, Symlink- und Traversal-Ausbrüche werden abgelehnt; eine
+/// fehlende Datei ergibt einen leeren Text) und begrenzt die Größe wie
+/// [`SkillWorkspace::runtime_snapshot`]. Der Hash deckt exakt die geladenen
+/// Bytes ab, sodass ein späteres Editieren den Lauf nicht unbemerkt ändert.
+///
+/// # Arguments
+/// - `skill_dir` (`&Path`): das Skill-Verzeichnis (z. B. aus
+///   [`resolve_skill_directory`]).
+/// - `skill` (`&SkillToml`): das Manifest aus dem eingefrorenen Katalog.
+///
+/// # Errors
+/// [`CatalogError::InvalidInstructionPath`] bei unzulässigem
+/// `instructions_file`, [`CatalogError::Io`] bei Lesefehlern,
+/// [`CatalogError::InstructionsTooLarge`] über 512 KiB.
+pub fn load_skill_runtime_snapshot(
+    skill_dir: &Path,
+    skill: &SkillToml,
+) -> CatalogResult<SkillRuntimeSnapshot> {
+    let filename = skill
+        .instructions_file
+        .as_deref()
+        .unwrap_or("instructions.md");
+    let instructions = harw_config::load_skill_instructions(skill_dir, Some(filename)).map_err(
+        |error| match error {
+            harw_config::ConfigError::Invalid(_) => {
+                CatalogError::InvalidInstructionPath(filename.to_owned())
+            }
+            other => CatalogError::Io {
+                path: skill_dir.join(filename),
+                reason: other.to_string(),
+            },
+        },
+    )?;
+    const MAX_INSTRUCTIONS_BYTES: u64 = 512 * 1024;
+    let size = u64::try_from(instructions.len()).unwrap_or(u64::MAX);
+    if size > MAX_INSTRUCTIONS_BYTES {
+        return Err(CatalogError::InstructionsTooLarge {
+            path: skill_dir.join(filename),
+            size,
+            limit: MAX_INSTRUCTIONS_BYTES,
+        });
+    }
+    let sha256 = format!("{:x}", Sha256::digest(instructions.as_bytes()));
+    Ok(SkillRuntimeSnapshot {
+        name: skill.name.clone(),
+        description: skill.description.clone(),
+        instructions,
+        tools: skill.tools.clone(),
+        mcps: skill.mcps.clone(),
+        source_path: skill_dir.join(filename),
+        sha256,
+    })
+}
+
+impl SkillRuntimeSnapshot {
+    /// Rendert den Skill als Instruktionsfragment für den Modellkontext.
+    ///
+    /// # Beschreibung
+    /// Kopfzeile mit Name und SHA-256 der Anweisungen (Provenienz im
+    /// Transkript), danach Beschreibung und Anweisungstext. Deklarierte
+    /// Werkzeuge/MCPs werden nur genannt — sie sind keine Freigabe; was der
+    /// Agent tatsächlich darf, entscheiden Registry und Sandbox.
+    #[must_use]
+    pub fn instruction_fragment(&self) -> String {
+        let mut fragment = format!("# Skill: {} (sha256 {})\n", self.name, self.sha256);
+        if !self.description.trim().is_empty() {
+            fragment.push_str(self.description.trim());
+            fragment.push('\n');
+        }
+        if !self.tools.is_empty() || !self.mcps.is_empty() {
+            fragment.push_str(&format!(
+                "Deklarierte Werkzeuge: [{}]; MCPs: [{}] (keine Freigabe)\n",
+                self.tools.join(", "),
+                self.mcps.join(", ")
+            ));
+        }
+        if !self.instructions.trim().is_empty() {
+            fragment.push('\n');
+            fragment.push_str(self.instructions.trim_end());
+            fragment.push('\n');
+        }
+        fragment
+    }
 }
 
 fn omitted_suggestion(kind: SuggestionKind, name: &str, reason: &str) -> OmittedSuggestion {
@@ -1032,6 +1260,123 @@ mod tests {
             workspace.runtime_snapshot("review"),
             Err(CatalogError::InvalidInstructionPath(_))
         ));
+        Ok(())
+    }
+
+    fn write_skill(root: &Path, dir: &str, manifest: &str, body: &str) -> TestResult<PathBuf> {
+        let skill_dir = root.join("skills").join(dir);
+        std::fs::create_dir_all(&skill_dir).map_err(ctx("mkdir skill"))?;
+        std::fs::write(skill_dir.join("skill.toml"), manifest).map_err(ctx("write manifest"))?;
+        std::fs::write(skill_dir.join("instructions.md"), body).map_err(ctx("write body"))?;
+        Ok(skill_dir)
+    }
+
+    #[test]
+    fn resolve_skill_directory_follows_discovery_precedence() -> TestResult {
+        let temporary = tempfile::tempdir().map_err(ctx("tempdir"))?;
+        let global = temporary.path().join("global");
+        let profile = temporary.path().join("profile");
+        write_skill(&global, "review", "name = \"review\"\n", "global")?;
+        let winner = write_skill(&profile, "renamed", "name = \"review\"\n", "profile")?;
+        std::fs::create_dir_all(profile.join("skills/.proposals/x"))
+            .map_err(ctx("mkdir proposals"))?;
+
+        let roots = vec![global, profile];
+        assert_eq!(
+            resolve_skill_directory(&roots, "review").map_err(ctx("resolve"))?,
+            Some(winner)
+        );
+        assert_eq!(
+            resolve_skill_directory(&roots, "missing").map_err(ctx("resolve missing"))?,
+            None
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn loaded_skill_snapshot_carries_sha256_provenance_in_its_fragment() -> TestResult {
+        let temporary = tempfile::tempdir().map_err(ctx("tempdir"))?;
+        let dir = write_skill(
+            temporary.path(),
+            "review",
+            "name = \"review\"\ndescription = \"Review code\"\ntools = [\"fs.read\"]\n",
+            "Read tests first.\n",
+        )?;
+        let skill = SkillToml {
+            name: "review".to_owned(),
+            enabled: true,
+            description: "Review code".to_owned(),
+            instructions_file: None,
+            tools: vec!["fs.read".to_owned()],
+            mcps: Vec::new(),
+        };
+        let snapshot = load_skill_runtime_snapshot(&dir, &skill).map_err(ctx("load"))?;
+        let expected = format!("{:x}", Sha256::digest(b"Read tests first.\n"));
+        assert_eq!(snapshot.sha256, expected);
+        let fragment = snapshot.instruction_fragment();
+        assert!(fragment.starts_with(&format!("# Skill: review (sha256 {expected})")));
+        assert!(fragment.contains("Review code"));
+        assert!(fragment.contains("Read tests first."));
+        assert!(fragment.contains("keine Freigabe"));
+
+        let escaping = SkillToml {
+            instructions_file: Some("../escape.md".to_owned()),
+            ..skill
+        };
+        assert!(matches!(
+            load_skill_runtime_snapshot(&dir, &escaping),
+            Err(CatalogError::InvalidInstructionPath(_))
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn direct_skills_snapshot_activates_only_enabled_direct_skills() -> TestResult {
+        let mut config = ResolvedConfig::default();
+        config.agents.insert(
+            "worker".to_owned(),
+            AgentToml {
+                name: "worker".to_owned(),
+                role: "worker".to_owned(),
+                description: String::new(),
+                system_file: None,
+                providers: Vec::new(),
+                models: Vec::new(),
+                skills: vec!["review".to_owned(), "off".to_owned()],
+                suggestions: AgentSuggestionsToml::default(),
+                primary_provider: None,
+                secondary_providers: Vec::new(),
+                timeout_seconds: 120,
+                max_retries: 2,
+            },
+        );
+        for (name, enabled) in [("review", true), ("off", false)] {
+            config.skills.insert(
+                name.to_owned(),
+                SkillToml {
+                    name: name.to_owned(),
+                    enabled,
+                    description: format!("{name} skill"),
+                    instructions_file: None,
+                    tools: Vec::new(),
+                    mcps: Vec::new(),
+                },
+            );
+        }
+        let catalog = CatalogSnapshot::from_config(&config).map_err(ctx("from_config"))?;
+        let snapshot = catalog
+            .direct_skills_snapshot("worker")
+            .map_err(ctx("direct_skills_snapshot"))?
+            .ok_or(crate::test_support::TestError::Missing("worker snapshot"))?;
+        assert_eq!(snapshot.activated.len(), 1);
+        assert_eq!(snapshot.activated[0].name, "review");
+        assert_eq!(snapshot.activated[0].definition_sha256.len(), 64);
+        assert!(
+            catalog
+                .direct_skills_snapshot("unknown")
+                .map_err(ctx("unknown agent"))?
+                .is_none()
+        );
         Ok(())
     }
 }

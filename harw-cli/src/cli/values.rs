@@ -1,10 +1,12 @@
 //! Typisierte Werte der `harw`-Grammatik.
 //!
-//! Enthält die `ValueEnum`s für Argumente mit fester Wertemenge sowie zwei
+//! Enthält die `ValueEnum`s für Argumente mit fester Wertemenge sowie drei
 //! Wert-Parser für frei formulierte, aber prüfbare Werte:
-//! [`LogFilterParser`] (`--log`, `tracing-subscriber`-Filtersyntax) und
-//! [`ModeParser`] (`--mode`, Modusliste aus `harw-core`). Beide melden ihre
-//! möglichen Werte an clap, sodass Hilfe und Shell-Completions sie anzeigen.
+//! [`LogFilterParser`] (`--log`, `tracing-subscriber`-Filtersyntax),
+//! [`ModeParser`] (`--mode`, Modusliste aus `harw-core`) und
+//! [`ApprovalParser`] (`--approval`, Freigabemodi aus `harw-extension-api`).
+//! Alle melden ihre möglichen Werte an clap, sodass Hilfe und
+//! Shell-Completions sie anzeigen. Fehlermeldungen der Parser sind deutsch.
 //!
 //! Jedes Enum liefert über `as_str` genau die Zeichenkette, die die
 //! aufrufenden Kommando-Module vor der Typisierung als `String` erhielten.
@@ -16,6 +18,7 @@ use clap::builder::{PossibleValue, TypedValueParser};
 use clap::error::ErrorKind;
 use clap::{Arg, Command, ValueEnum};
 use harw_core::mode::InteractionMode;
+use harw_extension_api::ApprovalMode;
 
 /// Implementiert `Display` für ein Enum durch Delegation an `as_str`.
 macro_rules! display_via_as_str {
@@ -53,6 +56,10 @@ impl OnOff {
 }
 
 /// Standard-Freigabemodus (`ask` | `auto` | `full`).
+///
+/// Kurzname von [`ApprovalMode`]: dieselben drei Stufen als `ValueEnum` für
+/// `harw config permissions set-mode`; [`Self::as_str`] entspricht
+/// [`ApprovalMode::as_str`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 pub enum PermissionMode {
     /// Vor jeder freigabepflichtigen Aktion nachfragen.
@@ -282,7 +289,31 @@ impl ApiDialect {
     }
 }
 
+/// Reihenfolge für `harw analyze --order` (`bottom-up` | `top-down`).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, ValueEnum)]
+pub enum AnalyzeOrder {
+    /// Von den Blättern des Abhängigkeitsgraphen zu den Wurzeln. Voreinstellung.
+    #[default]
+    #[value(name = "bottom-up")]
+    BottomUp,
+    /// Von den Wurzeln des Abhängigkeitsgraphen zu den Blättern.
+    #[value(name = "top-down")]
+    TopDown,
+}
+
+impl AnalyzeOrder {
+    /// Liefert den kanonischen Namen (`"bottom-up"` | `"top-down"`).
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::BottomUp => "bottom-up",
+            Self::TopDown => "top-down",
+        }
+    }
+}
+
 display_via_as_str!(
+    AnalyzeOrder,
     OnOff,
     PermissionMode,
     LensSource,
@@ -306,7 +337,7 @@ fn value_to_str<'a>(cmd: &Command, value: &'a OsStr) -> Result<&'a str, clap::Er
     value.to_str().ok_or_else(|| {
         clap::Error::raw(
             ErrorKind::InvalidUtf8,
-            format!("invalid UTF-8 in value '{}'\n", value.to_string_lossy()),
+            format!("ungültiges UTF-8 im Wert '{}'\n", value.to_string_lossy()),
         )
         .with_cmd(cmd)
     })
@@ -336,7 +367,7 @@ impl TypedValueParser for LogFilterParser {
             Ok(_) => Ok(raw.to_owned()),
             Err(error) => Err(clap::Error::raw(
                 ErrorKind::InvalidValue,
-                format!("invalid log filter '{raw}': {error}\n"),
+                format!("ungültiger Log-Filter '{raw}': {error}\n"),
             )
             .with_cmd(cmd)),
         }
@@ -374,7 +405,7 @@ impl TypedValueParser for ModeParser {
                 let valid = InteractionMode::names().collect::<Vec<_>>().join(", ");
                 Err(clap::Error::raw(
                     ErrorKind::InvalidValue,
-                    format!("invalid mode '{raw}' (valid: {valid})\n"),
+                    format!("ungültiger Modus '{raw}' (gültig: {valid})\n"),
                 )
                 .with_cmd(cmd))
             }
@@ -383,5 +414,49 @@ impl TypedValueParser for ModeParser {
 
     fn possible_values(&self) -> Option<Box<dyn Iterator<Item = PossibleValue> + '_>> {
         Some(Box::new(InteractionMode::names().map(PossibleValue::new)))
+    }
+}
+
+/// Wert-Parser für `--approval`: liest einen [`ApprovalMode`].
+///
+/// # Description
+/// Liest den Wert über [`ApprovalMode::parse`] (Kurznamen `ask`, `auto`,
+/// `full` sowie die dort erkannten Langformen; Groß-/Kleinschreibung und
+/// umgebende Leerzeichen egal). Ein unbekannter Name ist ein
+/// [`ErrorKind::InvalidValue`], der die gültigen Kurznamen aufzählt. Als
+/// mögliche Werte meldet der Parser die Kurznamen aus [`ApprovalMode::ALL`].
+#[derive(Debug, Clone, Copy, Default)]
+pub struct ApprovalParser;
+
+impl TypedValueParser for ApprovalParser {
+    type Value = ApprovalMode;
+
+    fn parse_ref(
+        &self,
+        cmd: &Command,
+        _arg: Option<&Arg>,
+        value: &OsStr,
+    ) -> Result<Self::Value, clap::Error> {
+        let raw = value_to_str(cmd, value)?;
+        ApprovalMode::parse(raw).ok_or_else(|| {
+            let valid = ApprovalMode::ALL
+                .iter()
+                .map(|mode| mode.as_str())
+                .collect::<Vec<_>>()
+                .join(", ");
+            clap::Error::raw(
+                ErrorKind::InvalidValue,
+                format!("ungültiger Freigabemodus '{raw}' (gültig: {valid})\n"),
+            )
+            .with_cmd(cmd)
+        })
+    }
+
+    fn possible_values(&self) -> Option<Box<dyn Iterator<Item = PossibleValue> + '_>> {
+        Some(Box::new(
+            ApprovalMode::ALL
+                .into_iter()
+                .map(|mode| PossibleValue::new(mode.as_str())),
+        ))
     }
 }

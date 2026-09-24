@@ -16,8 +16,9 @@
 #
 # ── Werkzeugoberflaeche ─────────────────────────────────────────────────────
 # `RegistryProfile::UiaExplorer` (`harw-registry-defaults/src/profile.rs`):
-# der lesende fs.*-Kern plus ausschliesslich `web.fetch` — kein `fs.write`,
-# kein `shell.exec`, kein `deps.*`, kein `lens.ask`, kein `browser.*`.
+# der lesende fs.*-Kern plus `doc.read_pdf`, `explore.*` und
+# `web.fetch`/`web.search` — kein `fs.write`, kein `shell.exec`, kein
+# `deps.*`, kein `lens.ask`, kein `browser.*`.
 #
 # ── Rueckgabevertrag ─────────────────────────────────────────────────────
 # `harwness.return.research-finding@1`: belegte Funde statt Rohausgaben —

@@ -29,20 +29,33 @@
 //!    [`ApprovalChain::for_child`] in **jede** Kind-Registry.
 
 use std::collections::HashMap;
+use std::path::PathBuf;
 use std::sync::{Arc, OnceLock, Weak};
 
 use harw_agent_dsl::ExecutableAgentIr;
-use harw_config::{InternalModelPoint, ResolvedInternalModel, resolve_internal_model};
-use harw_core::{ChildRegistryFactory, ManagedAgentSpawner, ModelProvider, PinnedModelProvider};
+use harw_catalog::{
+    CatalogSnapshot, SkillRuntimeSnapshot, SpawnCapabilitySnapshot, load_skill_runtime_snapshot,
+    resolve_skill_directory,
+};
+use harw_config::{
+    InternalModelPoint, ResolvedConfig, ResolvedInternalModel, SkillToml, resolve_internal_model,
+};
+use harw_core::{
+    ChildRegistryFactory, ManagedAgentSpawner, ModelProvider, PinnedModelProvider, StateStore,
+};
 use harw_extension_api::{
     AgentSpawnError, AgentSpawner, ExtensionRegistry, SpawnFuture, SpawnInput,
 };
+use harw_operations::OpContext;
+use harw_operations::adapter::ModelToolProvider;
+use harw_operations::context::ServiceMap;
+use harw_operations::operation::Operation;
 use harw_project_discovery::ProjectContext;
 use harw_registry_defaults::embedded_agents::builtin_agent_definitions;
 use harw_registry_defaults::profile::{
     HostPermitWiring, IdentityOverrides,
     assemble_registry_for_sandbox_with_definition_access_and_sandbox_profile_and_permits,
-    profile_for_role, role_names,
+    composition_tools_for_role, profile_for_role, role_names,
 };
 
 use crate::approval::ApprovalChain;
@@ -73,7 +86,10 @@ use crate::error::{RuntimeError, RuntimeResult};
 /// [`crate::model::build_uia_model_with_resolver`] +
 /// [`crate::model::build_uia_worker_model`]). Jede andere Rolle (inklusive
 /// `planner`, `executor`, `security-*` und unbekannter/repo-lokaler Rollen)
-/// bleibt unverändert beim Eltern-Modell — `None`.
+/// liefert hier `None`. Orchestrator-Rollen bekommen ihre Stelle nicht über
+/// den Namen, sondern über die Organisationsrolle ihrer eingebauten
+/// Definition ([`orchestrator_point_for_organizational_role`], R1); die
+/// Fabrik kombiniert beide Zuordnungen.
 ///
 /// # Returns
 /// `Some(point)` für eine der oben genannten Rollen, sonst `None`.
@@ -90,6 +106,54 @@ pub fn internal_point_for_role(role: &str) -> Option<InternalModelPoint> {
         r if r == role_names::AGENT_STEWARD => Some(InternalModelPoint::WorkerComplex),
         _ => None,
     }
+}
+
+/// Bildet die Organisationsrolle einer Orchestrator-Definition auf ihre
+/// interne Modellstelle ab (R1).
+///
+/// # Description
+/// Reine Zuordnung über die **gesenkte** Organisationsrolle
+/// ([`ExecutableAgentIr::role`]), nicht über den Rollennamen: jede
+/// Definition mit `role = "root-orchestrator"` →
+/// [`InternalModelPoint::RootOrchestrator`], jede mit
+/// `role = "child-orchestrator"` (darunter `coding-orchestrator`,
+/// `research-orchestrator`, `analysis-orchestrator`) →
+/// [`InternalModelPoint::SubOrchestrator`]. Ohne explizite Wahl lösen beide
+/// Stellen auf das Hauptmodell auf
+/// ([`InternalModelPoint::uses_openrouter_default`] ist für sie `false`) —
+/// das Verhalten bleibt dann das bisherige Eltern-Modell.
+///
+/// # Arguments
+/// - `role` (`harw_agent_dsl::roles::AgentRoleId`): die Organisationsrolle.
+///
+/// # Returns
+/// `Some(point)` für die beiden Orchestrator-Rollen, sonst `None`.
+#[must_use]
+pub fn orchestrator_point_for_organizational_role(
+    role: harw_agent_dsl::roles::AgentRoleId,
+) -> Option<InternalModelPoint> {
+    use harw_agent_dsl::roles::AgentRoleId;
+
+    match role {
+        AgentRoleId::RootOrchestrator => Some(InternalModelPoint::RootOrchestrator),
+        AgentRoleId::ChildOrchestrator => Some(InternalModelPoint::SubOrchestrator),
+        AgentRoleId::UserInterface
+        | AgentRoleId::Worker
+        | AgentRoleId::UiaWorker
+        | AgentRoleId::AgentSteward => None,
+    }
+}
+
+/// Ob die Kind-Registry von `role` die `delegate_wave`-Fläche bekommt.
+///
+/// # Description
+/// Genau dann, wenn die Composition-Tools der Rolle
+/// ([`composition_tools_for_role`]) [`harw_core_bridge::DELEGATE_WAVE_TOOL`]
+/// enthalten — heute der Root-Orchestrator und jeder Child-Orchestrator.
+/// Worker bekommen nie eine Delegationsoberfläche.
+#[must_use]
+pub fn role_gets_delegate_wave(role: &str) -> bool {
+    composition_tools_for_role(role).contains(&harw_core_bridge::DELEGATE_WAVE_TOOL)
 }
 
 /// Deckelt die höchstens gleichzeitig laufende Anzahl Instanzen einer Rolle
@@ -199,7 +263,10 @@ pub fn definition_write_mode_for_parent_role(
 /// ([`InternalModelPoint::Explorer`], [`InternalModelPoint::Research`],
 /// [`InternalModelPoint::MemoryConsolidation`]), sowie zusätzlich die beiden
 /// Worker-Modellstufen ([`InternalModelPoint::WorkerSimple`],
-/// [`InternalModelPoint::WorkerComplex`], Addendum D+E) — die übrigen
+/// [`InternalModelPoint::WorkerComplex`], Addendum D+E) und die beiden
+/// Orchestrator-Stellen ([`InternalModelPoint::RootOrchestrator`],
+/// [`InternalModelPoint::SubOrchestrator`], R1, über
+/// [`orchestrator_point_for_organizational_role`]) — die übrigen
 /// Stellen (`SessionTitle`, `CompactionSummary`, `DreamReflection`) haben
 /// eigene Aufrufstellen außerhalb dieser Fabrik.
 ///
@@ -220,6 +287,8 @@ pub fn resolve_internal_models_for_children(
         InternalModelPoint::MemoryConsolidation,
         InternalModelPoint::WorkerSimple,
         InternalModelPoint::WorkerComplex,
+        InternalModelPoint::RootOrchestrator,
+        InternalModelPoint::SubOrchestrator,
     ]
     .into_iter()
     .map(|point| (point, resolve_internal_model(config, point)))
@@ -297,6 +366,27 @@ pub struct RuntimeChildRegistryFactory {
     /// solange [`Self::with_host_permits`] nicht aufgerufen wurde — Host-
     /// Ausführung bleibt dann fail-closed, genau wie vor dieser Ergänzung.
     host_permit_wiring: Option<HostPermitWiring>,
+    /// Eingefrorener Skill-Katalog samt Skill-Wurzeln (Welle 4, „Skills
+    /// erreichen Agenten“). `None`, solange [`Self::with_skill_catalog`]
+    /// nicht aufgerufen wurde — dann bekommt kein Kind Skill-Fragmente und
+    /// [`ChildRegistryFactory::capability_snapshot`] bleibt `None`, genau wie
+    /// vor dieser Ergänzung.
+    skill_catalog: Option<SkillCatalogWiring>,
+    /// Der geteilte `StateStore` des Laufs für die `delegate_wave`-Fläche der
+    /// Orchestrator-Kinder (R1/B). `None`, solange
+    /// [`Self::with_delegate_wave_store`] nicht aufgerufen wurde — die
+    /// Operation wird dennoch montiert, scheitert dann aber beim Aufruf
+    /// fail-closed mit `OpError::NotAvailable` (kein StateStore).
+    delegate_wave_store: Option<Arc<dyn StateStore>>,
+}
+
+/// Der Skill-Katalog einer Kind-Fabrik: ein über die ganze Lebensdauer des
+/// Spawners unveränderlicher [`CatalogSnapshot`] und die vertrauten
+/// Config-Layer, aus denen die Skill-Verzeichnisse aufgelöst werden.
+#[derive(Debug, Clone)]
+struct SkillCatalogWiring {
+    catalog: CatalogSnapshot,
+    roots: Vec<PathBuf>,
 }
 
 impl std::fmt::Debug for RuntimeChildRegistryFactory {
@@ -378,6 +468,8 @@ impl RuntimeChildRegistryFactory {
             main_model_selection: None,
             sandbox_profile: harw_sandbox::SandboxProfile::Strict,
             host_permit_wiring: None,
+            skill_catalog: None,
+            delegate_wave_store: None,
         }
     }
 
@@ -554,6 +646,168 @@ impl RuntimeChildRegistryFactory {
         self
     }
 
+    /// Hinterlegt den Skill-Katalog, aus dem jedes Kind seine direkt
+    /// konfigurierten Skills als Instruktionsfragmente bekommt (Welle 4).
+    ///
+    /// # Description
+    /// Reiner Erbauer-Schritt, analog [`Self::with_internal_models`]. Friert
+    /// `config` einmalig als [`CatalogSnapshot`] ein; eine spätere Änderung
+    /// des Live-Katalogs wirkt erst in der nächsten Montage. Für eine Rolle,
+    /// die in `agents/<rolle>/agent.toml` Skills führt, lädt
+    /// [`ChildRegistryFactory::build_registry`] deren Anweisungen (über
+    /// [`harw_config::load_skill_instructions`], symlink- und traversalfest)
+    /// und hängt sie als Fragmente mit SHA-256-Provenienz an die Identität
+    /// des Kindes; [`ChildRegistryFactory::capability_snapshot`] liefert
+    /// denselben Satz als eingefrorenen Spawn-Vertrag.
+    ///
+    /// # Arguments
+    /// - `config` (`&ResolvedConfig`): die bereits validierte Konfiguration
+    ///   des Elternlaufs.
+    /// - `skill_roots` (`Vec<PathBuf>`): die vertrauten Config-Layer in
+    ///   aufsteigender Präzedenz (`ConfigTrustReport::layers`) — dieselbe
+    ///   Liste, aus der die Discovery `config.skills` gelesen hat.
+    ///
+    /// # Errors
+    /// [`RuntimeError::Registry`], wenn die Konfiguration nicht als Katalog
+    /// einfrierbar ist (ungültige Verweise).
+    pub fn with_skill_catalog(
+        mut self,
+        config: &ResolvedConfig,
+        skill_roots: Vec<PathBuf>,
+    ) -> RuntimeResult<Self> {
+        let catalog =
+            CatalogSnapshot::from_config(config).map_err(|error| RuntimeError::Registry {
+                detail: format!("could not freeze the skill catalog for children: {error}"),
+            })?;
+        self.skill_catalog = Some(SkillCatalogWiring {
+            catalog,
+            roots: skill_roots,
+        });
+        Ok(self)
+    }
+
+    /// Hinterlegt den geteilten `StateStore` für die `delegate_wave`-Fläche
+    /// der Orchestrator-Kinder.
+    ///
+    /// # Description
+    /// Reiner Erbauer-Schritt, analog [`Self::with_internal_models`]. Jede
+    /// Orchestrator-Registry (`composition_tools_for_role(role)` enthält
+    /// `delegate_wave`) bekommt eine
+    /// [`harw_core_bridge::DelegateWaveOperation`], deren `OpContext` den
+    /// `ManagedAgentSpawner` (über den schwachen Spawner-Slot, erst beim
+    /// Aufruf aufgelöst) und diesen `StateStore` trägt — genau die beiden
+    /// Dienste, die `delegate_wave` verlangt.
+    ///
+    /// # Arguments
+    /// - `state_store` (`Arc<dyn StateStore>`): derselbe Store wie der der
+    ///   Wurzel (`RuntimeServicesParts::state_store`).
+    #[must_use]
+    pub fn with_delegate_wave_store(mut self, state_store: Arc<dyn StateStore>) -> Self {
+        self.delegate_wave_store = Some(state_store);
+        self
+    }
+
+    /// Die interne Modellstelle einer Kind-Rolle (Addendum C + R1).
+    ///
+    /// # Description
+    /// Zuerst die namensbasierte Zuordnung [`internal_point_for_role`];
+    /// sonst die Orchestrator-Stellen über die Organisationsrolle der
+    /// eingebauten Definition
+    /// ([`orchestrator_point_for_organizational_role`]). Eine Rolle ohne
+    /// eingebaute Definition bekommt nie eine Orchestrator-Stelle.
+    fn internal_point_for_child(&self, role: &str) -> Option<InternalModelPoint> {
+        internal_point_for_role(role).or_else(|| {
+            self.builtin_definitions
+                .get(role)
+                .map(ExecutableAgentIr::role)
+                .and_then(orchestrator_point_for_organizational_role)
+        })
+    }
+
+    /// Die `delegate_wave`-Fläche einer Orchestrator-Registry.
+    ///
+    /// # Description
+    /// Baut einen [`ModelToolProvider`] mit genau einer
+    /// [`harw_core_bridge::DelegateWaveOperation`]. Die Politik liefert die
+    /// Reducer-Kennung je Zielrolle
+    /// ([`harw_registry_defaults::authority_reducer_for_role`]) und die
+    /// deklarierten Ziele je Aufruferrolle
+    /// ([`harw_registry_defaults::authority::delegation_targets_for_role`]).
+    /// Der `OpContext` entsteht je Aufruf aus dem
+    /// [`harw_extension_api::ToolExecutionContext`] (Sitzung, Turn, Sandbox,
+    /// `CancelToken` des Turn-Loops — dasselbe Muster wie
+    /// `assembly.rs::install_operation_model_tools`); seine `ServiceMap`
+    /// trägt `Arc<ManagedAgentSpawner>` (nur, solange der Spawner lebt) und
+    /// `Arc<dyn StateStore>` (sofern hinterlegt). Fehlt einer der beiden
+    /// Dienste, scheitert `delegate_wave` selbst fail-closed mit
+    /// `OpError::NotAvailable`.
+    fn delegate_wave_provider(&self) -> ModelToolProvider {
+        let policy = harw_core_bridge::DelegateWavePolicy::new(
+            |role: &str| {
+                harw_registry_defaults::authority_reducer_for_role(role).map(|reducer| reducer.id())
+            },
+            harw_registry_defaults::authority::delegation_targets_for_role,
+        );
+        let operation: Arc<dyn Operation> =
+            Arc::new(harw_core_bridge::DelegateWaveOperation::new(policy));
+        let slot = Arc::clone(&self.spawner_slot);
+        let state_store = self.delegate_wave_store.clone();
+        ModelToolProvider::new([operation], move |execution_context| {
+            let mut services = ServiceMap::new();
+            if let Some(spawner) = slot.get().and_then(Weak::upgrade) {
+                services.insert(spawner);
+            }
+            if let Some(store) = &state_store {
+                services.insert(Arc::clone(store));
+            }
+            let ctx = OpContext::new(
+                execution_context.session_id().clone(),
+                execution_context.turn_id().clone(),
+                execution_context.sandbox().clone(),
+                services,
+            );
+            // Wie `install_operation_model_tools`: ohne den `CancelToken` des
+            // Turn-Loops sähe `fanout_children` nie den echten Turn-Abbruch.
+            match execution_context.cancel() {
+                Some(cancel) => ctx.with_cancel_token(cancel.clone()),
+                None => ctx,
+            }
+        })
+    }
+
+    /// Die Skill-Fragmente einer Kind-Rolle (leer ohne Katalog oder ohne
+    /// `agent.toml` für diese Rolle).
+    ///
+    /// # Errors
+    /// [`AgentSpawnError`], wenn ein aktivierter Skill nicht geladen werden
+    /// kann — fail-closed: ein Kind startet nie mit einem Teil seiner Skills.
+    fn skill_fragments_for_role(&self, role: &str) -> Result<Vec<String>, AgentSpawnError> {
+        let Some(wiring) = &self.skill_catalog else {
+            return Ok(Vec::new());
+        };
+        let Some(names) = wiring.catalog.direct_skills_of(role) else {
+            return Ok(Vec::new());
+        };
+        let snapshots =
+            load_enabled_skills(|name| wiring.catalog.skill(name), &wiring.roots, names).map_err(
+                |detail| AgentSpawnError {
+                    message: format!("could not load the skills of child role '{role}': {detail}"),
+                },
+            )?;
+        for snapshot in &snapshots {
+            tracing::debug!(
+                role,
+                skill = %snapshot.name,
+                sha256 = %snapshot.sha256,
+                "runtime.child_skill.injected"
+            );
+        }
+        Ok(snapshots
+            .iter()
+            .map(SkillRuntimeSnapshot::instruction_fragment)
+            .collect())
+    }
+
     /// Liefert Provider-/Modell-Reasoning-Effort-Defaults für eine bereits
     /// aufgelöste interne Modellstelle.
     ///
@@ -668,6 +922,20 @@ impl ChildRegistryFactory for RuntimeChildRegistryFactory {
     /// `Ok(ExtensionRegistry)` mit genau den Tool-Providern des Profils aus
     /// [`profile_for_role`], erweitert um die Kind-Freigabekette.
     ///
+    /// # Rechte und Netz
+    /// Die Registry legt nur fest, welche Werkzeuge das Kind **sieht**; was
+    /// es tatsächlich darf, entscheidet die Sandbox, mit der
+    /// [`ManagedAgentSpawner`] das Kind admittiert — über den Handoff die
+    /// Sandbox des Elternteils, geprüft mit `ensure_child_of`, also nie mehr
+    /// Rechte und nie mehr Hosts als der Elternteil. Das gilt insbesondere
+    /// für `uia-worker`/`uia-writer`, deren Profile seit der
+    /// Nutzerentscheidung „kurz online recherchieren, manchmal
+    /// Abhängigkeiten hinzufügen“ `web.fetch`/`web.search` und die lesenden
+    /// `deps.*` registrieren: `NetworkAccess` samt Host-Scope kommt nur vom
+    /// Elternteil (registry-seitiger Reducer `ReadExplore`), und jeder Abruf
+    /// läuft zusätzlich durch die prozessweite Egress-Policy
+    /// (`harw_registry_defaults::install_web_tools`).
+    ///
     /// # Fehler
     /// [`AgentSpawnError`], wenn `role` **keine** bekannte Rolle ist
     /// (fail-closed, kein `unwrap_or_default`) oder die Montage scheitert.
@@ -694,11 +962,17 @@ impl ChildRegistryFactory for RuntimeChildRegistryFactory {
                 .builtin_definitions
                 .get(role)
                 .map(ExecutableAgentIr::role),
+            // Welle 4: die direkt konfigurierten Skills der Rolle als
+            // Instruktionsfragmente (leer ohne Skill-Katalog).
+            extra_context: self.skill_fragments_for_role(role)?,
             ..IdentityOverrides::default()
         };
-        // Eine Kette je Kind: `for_child` löst die Modus-Zelle
-        // ([`ApprovalModeCell::detached`]), Geschwister beeinflussen sich also
-        // nicht.
+        // Eine Kette je Kind: `for_child` legt eine Folgezelle an
+        // ([`ApprovalModeCell::follower`], gedeckelt auf
+        // `ApprovalMode::Delegated`). Eine Umstellung der Wurzel erreicht
+        // laufende Kinder sofort; ein `set` im Kind koppelt nur dieses Kind ab
+        // — Geschwister bleiben voneinander unabhängig, folgen aber weiter der
+        // Wurzel.
         let child_chain = self.chain.for_child();
         // Teil B4: ruft dieselbe Delegationskette wie zuvor
         // `assemble_registry_for_project` mit exakt deren bisherigen
@@ -753,6 +1027,13 @@ impl ChildRegistryFactory for RuntimeChildRegistryFactory {
                 registry_builder = registry_builder.tool_provider(provider);
             }
         }
+        // `delegate_wave` nur für Orchestrator-Rollen (Root oder Child); die
+        // `SessionActivation` des Kindes schaltet das Werkzeug zusätzlich nur
+        // frei, wenn seine Definition es admittiert.
+        if role_gets_delegate_wave(role) {
+            registry_builder =
+                registry_builder.tool_provider(Arc::new(self.delegate_wave_provider()));
+        }
         let registry = registry_builder.build();
         tracing::debug!(
             role,
@@ -763,11 +1044,39 @@ impl ChildRegistryFactory for RuntimeChildRegistryFactory {
         Ok(registry)
     }
 
+    /// Friert die direkt konfigurierten Skills der Rolle als Spawn-Vertrag
+    /// ein (Welle 4).
+    ///
+    /// # Beschreibung
+    /// Nur aus vertrauenswürdigem Zustand — dem bei
+    /// [`Self::with_skill_catalog`] eingefrorenen Katalog, nie aus
+    /// Modell-JSON. `Ok(None)` ohne Katalog oder für eine Rolle ohne
+    /// `agent.toml`; dann gilt unverändert der Kompatibilitäts-Default.
+    ///
+    /// # Fehler
+    /// [`AgentSpawnError`], wenn der Katalog für die Rolle inkonsistent ist.
+    fn capability_snapshot(
+        &self,
+        role: &str,
+        _input: &SpawnInput,
+    ) -> Result<Option<SpawnCapabilitySnapshot>, AgentSpawnError> {
+        let Some(wiring) = &self.skill_catalog else {
+            return Ok(None);
+        };
+        wiring
+            .catalog
+            .direct_skills_snapshot(role)
+            .map_err(|error| AgentSpawnError {
+                message: format!("could not freeze the capabilities of role '{role}': {error}"),
+            })
+    }
+
     /// Liefert den Modellanbieter für eine Kind-Rolle.
     ///
     /// # Beschreibung
-    /// [`internal_point_for_role`] bildet `role` auf eine interne
-    /// Modellstelle ab (Addendum C). Ist keine Stelle zuständig, keine
+    /// [`internal_point_for_role`] bzw. — für Orchestrator-Definitionen —
+    /// [`orchestrator_point_for_organizational_role`] (R1) bildet `role` auf
+    /// eine interne Modellstelle ab (Addendum C). Ist keine Stelle zuständig, keine
     /// aufgelöste Stelle bekannt (`self.internal_models` leer, z. B. weil
     /// [`Self::with_internal_models`] nie aufgerufen wurde) oder die
     /// aufgelöste Stelle das Hauptmodell ([`ResolvedInternalModel::is_main_model`]),
@@ -779,7 +1088,7 @@ impl ChildRegistryFactory for RuntimeChildRegistryFactory {
     /// Nie: jede Auflösung fällt bei Unklarheit auf das Eltern-Modell
     /// zurück, statt zu scheitern.
     fn model_for(&self, role: &str) -> Result<Arc<dyn ModelProvider>, AgentSpawnError> {
-        let Some(point) = internal_point_for_role(role) else {
+        let Some(point) = self.internal_point_for_child(role) else {
             return Ok(Arc::clone(&self.model));
         };
         Ok(self.pinned_model_for_point(role, point))
@@ -809,7 +1118,7 @@ impl ChildRegistryFactory for RuntimeChildRegistryFactory {
         role: &str,
         complexity: Option<harw_core::TaskComplexity>,
     ) -> Result<Arc<dyn ModelProvider>, AgentSpawnError> {
-        if let Some(point) = internal_point_for_role(role) {
+        if let Some(point) = self.internal_point_for_child(role) {
             return Ok(self.pinned_model_for_point(role, point));
         }
         let is_worker = self
@@ -855,7 +1164,7 @@ impl ChildRegistryFactory for RuntimeChildRegistryFactory {
         Option<harw_types::ReasoningEffort>,
         Option<harw_types::ReasoningEffort>,
     ) {
-        let Some(point) = internal_point_for_role(role) else {
+        let Some(point) = self.internal_point_for_child(role) else {
             return (None, None);
         };
         self.reasoning_effort_defaults_for_point(point)
@@ -881,7 +1190,7 @@ impl ChildRegistryFactory for RuntimeChildRegistryFactory {
         Option<harw_types::ReasoningEffort>,
         Option<harw_types::ReasoningEffort>,
     ) {
-        if let Some(point) = internal_point_for_role(role) {
+        if let Some(point) = self.internal_point_for_child(role) {
             return self.reasoning_effort_defaults_for_point(point);
         }
         let is_worker = self
@@ -962,6 +1271,7 @@ impl ChildRegistryFactory for RuntimeChildRegistryFactory {
                 .builtin_definitions
                 .get(role)
                 .map(ExecutableAgentIr::role),
+            extra_context: self.skill_fragments_for_role(role)?,
             ..IdentityOverrides::default()
         };
         let child_chain = self.chain.for_child();
@@ -1013,6 +1323,110 @@ impl ChildRegistryFactory for RuntimeChildRegistryFactory {
         );
         Ok(registry)
     }
+}
+
+/// Lädt die aktivierten Skills aus `names` als eingefrorene Snapshots.
+///
+/// # Beschreibung
+/// Doppelte Namen zählen einmal, deaktivierte Skills werden übersprungen.
+/// Ein Name, den der Katalog nicht kennt oder dessen Verzeichnis sich in den
+/// Wurzeln nicht findet, ist ein Fehler (fail-closed).
+fn load_enabled_skills<'a>(
+    lookup: impl Fn(&str) -> Option<&'a SkillToml>,
+    roots: &[PathBuf],
+    names: &[String],
+) -> Result<Vec<SkillRuntimeSnapshot>, String> {
+    let mut seen = std::collections::BTreeSet::new();
+    let mut snapshots = Vec::new();
+    for name in names {
+        if !seen.insert(name.as_str()) {
+            continue;
+        }
+        let skill = lookup(name).ok_or_else(|| format!("skill '{name}' is not configured"))?;
+        if !skill.enabled {
+            continue;
+        }
+        let directory = resolve_skill_directory(roots, name)
+            .map_err(|error| format!("skill '{name}': {error}"))?
+            .ok_or_else(|| {
+                format!("skill '{name}' has no skills/*/skill.toml in any trusted config layer")
+            })?;
+        let snapshot = load_skill_runtime_snapshot(&directory, skill)
+            .map_err(|error| format!("skill '{name}': {error}"))?;
+        snapshots.push(snapshot);
+    }
+    Ok(snapshots)
+}
+
+/// Rendert die aktivierten Skills `skill_names` als Instruktionsfragmente
+/// mit SHA-256-Provenienz (Welle 4).
+///
+/// # Beschreibung
+/// Gemeinsamer Weg für Wurzel und Kinder: dieselbe Auflösung
+/// ([`harw_catalog::resolve_skill_directory`]) und dieselbe Ladefunktion
+/// ([`harw_catalog::load_skill_runtime_snapshot`] über
+/// [`harw_config::load_skill_instructions`]) wie in
+/// [`RuntimeChildRegistryFactory`]. Das Ergebnis gehört in
+/// `IdentityOverrides::extra_context`.
+///
+/// # Arguments
+/// - `config` (`&ResolvedConfig`): die aufgelöste Konfiguration.
+/// - `skill_roots` (`&[PathBuf]`): die vertrauten Config-Layer in
+///   aufsteigender Präzedenz (`ConfigTrustReport::layers`).
+/// - `skill_names` (`&[String]`): die zu ladenden Skills.
+///
+/// # Errors
+/// [`RuntimeError::Registry`], wenn ein aktivierter Skill nicht geladen
+/// werden kann.
+pub fn skill_instruction_fragments(
+    config: &ResolvedConfig,
+    skill_roots: &[PathBuf],
+    skill_names: &[String],
+) -> RuntimeResult<Vec<String>> {
+    let snapshots = load_enabled_skills(|name| config.skills.get(name), skill_roots, skill_names)
+        .map_err(|detail| RuntimeError::Registry {
+        detail: format!("could not load skills: {detail}"),
+    })?;
+    Ok(snapshots
+        .iter()
+        .map(SkillRuntimeSnapshot::instruction_fragment)
+        .collect())
+}
+
+/// Die Skill-Fragmente eines benannten Agenten aus `agents/<agent>/agent.toml`
+/// (Feld `skills`); leer, wenn die Konfiguration keinen solchen Agenten kennt.
+///
+/// # Errors
+/// Wie [`skill_instruction_fragments`].
+pub fn agent_skill_fragments(
+    config: &ResolvedConfig,
+    skill_roots: &[PathBuf],
+    agent: &str,
+) -> RuntimeResult<Vec<String>> {
+    match config.agents.get(agent) {
+        Some(agent) => skill_instruction_fragments(config, skill_roots, &agent.skills),
+        None => Ok(Vec::new()),
+    }
+}
+
+/// Die Fragmente **aller** aktivierten Skills der Konfiguration, nach Namen
+/// sortiert — für eine Wurzel (etwa die UIA), die ohne eigenes `agent.toml`
+/// den gesamten aktivierten Katalog sehen soll.
+///
+/// # Errors
+/// Wie [`skill_instruction_fragments`].
+pub fn enabled_skill_fragments(
+    config: &ResolvedConfig,
+    skill_roots: &[PathBuf],
+) -> RuntimeResult<Vec<String>> {
+    let mut names: Vec<String> = config
+        .skills
+        .values()
+        .filter(|skill| skill.enabled)
+        .map(|skill| skill.name.clone())
+        .collect();
+    names.sort();
+    skill_instruction_fragments(config, skill_roots, &names)
 }
 
 /// Spawner-Adapter für Kind-Registries.
@@ -1284,6 +1698,7 @@ mod tests {
             .map_err(ctx("test fixture uses a valid ReasoningEffort label"))?;
         Ok(harw_config::ModelToml {
             stream: None,
+            rate_limit: None,
             id: "acme-model".to_owned(),
             name: None,
             provider: "acme".to_owned(),
@@ -1411,15 +1826,25 @@ mod tests {
 
     #[test]
     fn reasoning_effort_defaults_for_role_task_yields_none_for_main_model_fallback() -> TestResult {
-        // A role with no builtin `TaskComplexity`-mapped point and no
-        // internal-model-point override falls back to the parent's main
-        // model — whose provider/model id this factory does not track (see
-        // field doc on `reasoning_effort_config`).
+        // A role with no internal-model-point override that is not a builtin
+        // `worker` role falls back to the parent's main model — whose
+        // provider/model id this factory does not track (see field doc on
+        // `reasoning_effort_config`). `planner` is deliberately *not* used
+        // here: its builtin definition has `role = "worker"`, so it takes the
+        // `WorkerSimple`/`WorkerComplex` path exactly like `model_for_task`.
         let factory = factory_with_worker_complex_effort_defaults(Some("high"), Some("high"))?;
-        let (provider_default, model_default) =
-            factory.reasoning_effort_defaults_for_role_task(role_names::PLANNER, None);
-        assert_eq!(provider_default, None);
-        assert_eq!(model_default, None);
+        for role in [
+            // Builtin definition, but not a worker role; its own
+            // `RootOrchestrator` point (R1) is unresolved in this fixture.
+            role_names::ROOT_ORCHESTRATOR,
+            // Repo-local role without a builtin definition.
+            "some-repo-local-role",
+        ] {
+            let (provider_default, model_default) =
+                factory.reasoning_effort_defaults_for_role_task(role, None);
+            assert_eq!(provider_default, None, "role {role}");
+            assert_eq!(model_default, None, "role {role}");
+        }
         Ok(())
     }
 
@@ -1561,6 +1986,351 @@ mod tests {
 
         assert_eq!(factory.sandbox_profile, harw_sandbox::SandboxProfile::Host);
         assert!(factory.host_permit_wiring.is_some());
+        Ok(())
+    }
+
+    // -------------------------------------------------------------------
+    // Welle 4 — Skills erreichen Agenten.
+    // -------------------------------------------------------------------
+
+    /// Ein Layer mit den Skills `review` (aktiviert) und `off` (deaktiviert)
+    /// sowie eine Konfiguration, in der `agent` beide direkt führt.
+    fn skill_fixture(agent: &str) -> TestResult<(tempfile::TempDir, harw_config::ResolvedConfig)> {
+        let layer = tempfile::tempdir().map_err(ctx("tempdir"))?;
+        let mut config = harw_config::ResolvedConfig::default();
+        for (name, enabled, body) in [("review", true, "Read tests first.\n"), ("off", false, "x")]
+        {
+            let dir = layer.path().join("skills").join(name);
+            std::fs::create_dir_all(&dir).map_err(ctx("mkdir skill"))?;
+            std::fs::write(
+                dir.join("skill.toml"),
+                format!("name = \"{name}\"\nenabled = {enabled}\ndescription = \"{name} skill\"\n"),
+            )
+            .map_err(ctx("write manifest"))?;
+            std::fs::write(dir.join("instructions.md"), body).map_err(ctx("write body"))?;
+            config.skills.insert(
+                name.to_owned(),
+                SkillToml {
+                    name: name.to_owned(),
+                    enabled,
+                    description: format!("{name} skill"),
+                    instructions_file: None,
+                    tools: Vec::new(),
+                    mcps: Vec::new(),
+                },
+            );
+        }
+        config.agents.insert(
+            agent.to_owned(),
+            harw_config::AgentToml {
+                name: agent.to_owned(),
+                role: "worker".to_owned(),
+                description: String::new(),
+                system_file: None,
+                providers: Vec::new(),
+                models: Vec::new(),
+                skills: vec!["review".to_owned(), "off".to_owned(), "review".to_owned()],
+                suggestions: harw_config::AgentSuggestionsToml::default(),
+                primary_provider: None,
+                secondary_providers: Vec::new(),
+                timeout_seconds: 120,
+                max_retries: 2,
+            },
+        );
+        Ok((layer, config))
+    }
+
+    #[test]
+    fn child_registry_skill_fragments_carry_enabled_skills_with_sha256() -> TestResult {
+        let (layer, config) = skill_fixture(role_names::EXPLORER)?;
+        let factory = RuntimeChildRegistryFactory::new(
+            test_project(),
+            Arc::new(harw_core::EchoModelProvider::new("echo")),
+            test_chain(&config),
+        )
+        .map_err(ctx("factory builds"))?
+        .with_skill_catalog(&config, vec![layer.path().to_path_buf()])
+        .map_err(ctx("skill catalog"))?;
+
+        let fragments = factory
+            .skill_fragments_for_role(role_names::EXPLORER)
+            .map_err(|error| crate::test_support::TestError::Unexpected(error.message))?;
+        assert_eq!(fragments.len(), 1, "{fragments:?}");
+        assert!(fragments[0].starts_with("# Skill: review (sha256 "));
+        assert!(fragments[0].contains("Read tests first."));
+        assert!(
+            factory
+                .skill_fragments_for_role(role_names::PLANNER)
+                .map_err(|error| crate::test_support::TestError::Unexpected(error.message))?
+                .is_empty(),
+            "a role without agent.toml gets no skill fragments"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn child_registry_without_skill_catalog_injects_nothing() -> TestResult {
+        let config = harw_config::ResolvedConfig::default();
+        let factory = RuntimeChildRegistryFactory::new(
+            test_project(),
+            Arc::new(harw_core::EchoModelProvider::new("echo")),
+            test_chain(&config),
+        )
+        .map_err(ctx("factory builds"))?;
+        assert!(
+            factory
+                .skill_fragments_for_role(role_names::EXPLORER)
+                .map_err(|error| crate::test_support::TestError::Unexpected(error.message))?
+                .is_empty()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn skill_fragment_helpers_serve_root_agents_and_fail_closed() -> TestResult {
+        let (layer, config) = skill_fixture("emily")?;
+        let roots = vec![layer.path().to_path_buf()];
+        let fragments =
+            agent_skill_fragments(&config, &roots, "emily").map_err(ctx("agent fragments"))?;
+        assert_eq!(fragments.len(), 1);
+        assert!(
+            agent_skill_fragments(&config, &roots, "nobody")
+                .map_err(ctx("unknown agent"))?
+                .is_empty()
+        );
+        let all = enabled_skill_fragments(&config, &roots).map_err(ctx("enabled fragments"))?;
+        assert_eq!(all, fragments);
+        // Ein aktivierter Skill ohne auffindbares Verzeichnis: fail-closed.
+        assert!(skill_instruction_fragments(&config, &[], &["review".to_owned()]).is_err());
+        Ok(())
+    }
+
+    // -------------------------------------------------------------------
+    // R1 — Orchestrator-Modellstellen und `delegate_wave` (B).
+    // -------------------------------------------------------------------
+
+    /// Eine Fabrik über den eingebauten Definitionen mit einer explizit
+    /// aufgelösten Orchestrator-Stelle `point` (Provider `acme`, Modell
+    /// `acme-model`, beide mit `default_reasoning_effort`).
+    fn factory_with_orchestrator_point(
+        point: InternalModelPoint,
+    ) -> TestResult<RuntimeChildRegistryFactory> {
+        let mut config = harw_config::ResolvedConfig::default();
+        config
+            .providers
+            .insert("acme".to_owned(), test_provider_toml(Some("high"))?);
+        config
+            .models
+            .insert("acme-model".to_owned(), test_model_toml(Some("low"))?);
+        let chain = test_chain(&config);
+        let mut internal_models = HashMap::new();
+        internal_models.insert(
+            point,
+            harw_config::ResolvedInternalModel {
+                point,
+                provider: Some("acme".to_owned()),
+                model: Some("acme-model".to_owned()),
+                source: harw_config::InternalModelSource::Explicit,
+            },
+        );
+        Ok(RuntimeChildRegistryFactory::new(
+            test_project(),
+            Arc::new(harw_core::EchoModelProvider::new("echo")),
+            chain,
+        )
+        .map_err(ctx("factory builds"))?
+        .with_internal_models(internal_models)
+        .with_reasoning_effort_config(Arc::new(config)))
+    }
+
+    #[test]
+    fn orchestrator_point_for_organizational_role_maps_only_orchestrators() {
+        use harw_agent_dsl::roles::AgentRoleId;
+
+        assert_eq!(
+            orchestrator_point_for_organizational_role(AgentRoleId::RootOrchestrator),
+            Some(InternalModelPoint::RootOrchestrator)
+        );
+        assert_eq!(
+            orchestrator_point_for_organizational_role(AgentRoleId::ChildOrchestrator),
+            Some(InternalModelPoint::SubOrchestrator)
+        );
+        for role in [
+            AgentRoleId::UserInterface,
+            AgentRoleId::Worker,
+            AgentRoleId::UiaWorker,
+            AgentRoleId::AgentSteward,
+        ] {
+            assert_eq!(
+                orchestrator_point_for_organizational_role(role),
+                None,
+                "{role:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn builtin_orchestrators_resolve_to_their_orchestrator_points() -> TestResult {
+        let factory = RuntimeChildRegistryFactory::new(
+            test_project(),
+            Arc::new(harw_core::EchoModelProvider::new("echo")),
+            test_chain(&harw_config::ResolvedConfig::default()),
+        )
+        .map_err(ctx("factory builds"))?;
+        assert_eq!(
+            factory.internal_point_for_child(role_names::ROOT_ORCHESTRATOR),
+            Some(InternalModelPoint::RootOrchestrator)
+        );
+        for role in [
+            role_names::CODING_ORCHESTRATOR,
+            role_names::RESEARCH_ORCHESTRATOR,
+            role_names::ANALYSIS_ORCHESTRATOR,
+        ] {
+            assert_eq!(
+                factory.internal_point_for_child(role),
+                Some(InternalModelPoint::SubOrchestrator),
+                "role {role}"
+            );
+        }
+        for role in role_names::CHILD_ORCHESTRATORS {
+            assert_eq!(
+                factory.internal_point_for_child(role),
+                Some(InternalModelPoint::SubOrchestrator),
+                "role {role}"
+            );
+        }
+        // Die namensbasierten Stellen bleiben unverändert; Worker und
+        // unbekannte Rollen bekommen keine Orchestrator-Stelle.
+        assert_eq!(
+            factory.internal_point_for_child(role_names::EXPLORER),
+            Some(InternalModelPoint::Explorer)
+        );
+        assert_eq!(factory.internal_point_for_child(role_names::EXECUTOR), None);
+        assert_eq!(
+            factory.internal_point_for_child("some-repo-local-role"),
+            None
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn reasoning_effort_defaults_follow_the_orchestrator_points() -> TestResult {
+        let root = factory_with_orchestrator_point(InternalModelPoint::RootOrchestrator)?;
+        assert_eq!(
+            root.reasoning_effort_defaults_for_role_task(role_names::ROOT_ORCHESTRATOR, None),
+            (
+                Some(harw_types::ReasoningEffort::High),
+                Some(harw_types::ReasoningEffort::Low)
+            )
+        );
+        // Die Root-Stelle gilt nicht für Child-Orchestratoren.
+        assert_eq!(
+            root.reasoning_effort_defaults_for_role(role_names::CODING_ORCHESTRATOR),
+            (None, None)
+        );
+
+        let sub = factory_with_orchestrator_point(InternalModelPoint::SubOrchestrator)?;
+        for role in [
+            role_names::CODING_ORCHESTRATOR,
+            role_names::RESEARCH_ORCHESTRATOR,
+            role_names::ANALYSIS_ORCHESTRATOR,
+        ] {
+            assert_eq!(
+                sub.reasoning_effort_defaults_for_role_task(
+                    role,
+                    Some(harw_core::TaskComplexity::Simple)
+                ),
+                (
+                    Some(harw_types::ReasoningEffort::High),
+                    Some(harw_types::ReasoningEffort::Low)
+                ),
+                "role {role}"
+            );
+        }
+        assert_eq!(
+            sub.reasoning_effort_defaults_for_role(role_names::ROOT_ORCHESTRATOR),
+            (None, None)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn orchestrators_keep_the_parent_model_on_the_main_model_fallback() -> TestResult {
+        // Ohne explizite Wahl lösen beide Orchestrator-Stellen auf das
+        // Hauptmodell auf — das Kind behält exakt den Eltern-Anbieter.
+        let config = harw_config::ResolvedConfig::default();
+        let parent: Arc<dyn ModelProvider> = Arc::new(harw_core::EchoModelProvider::new("echo"));
+        let factory = RuntimeChildRegistryFactory::new(
+            test_project(),
+            Arc::clone(&parent),
+            test_chain(&config),
+        )
+        .map_err(ctx("factory builds"))?
+        .with_internal_models(resolve_internal_models_for_children(&config));
+        for role in [
+            role_names::ROOT_ORCHESTRATOR,
+            role_names::CODING_ORCHESTRATOR,
+            role_names::RESEARCH_ORCHESTRATOR,
+            role_names::ANALYSIS_ORCHESTRATOR,
+        ] {
+            let model = factory
+                .model_for_task(role, Some(harw_core::TaskComplexity::Complex))
+                .map_err(|error| crate::test_support::TestError::Unexpected(error.message))?;
+            assert!(Arc::ptr_eq(&model, &parent), "role {role}");
+            let model = factory
+                .model_for(role)
+                .map_err(|error| crate::test_support::TestError::Unexpected(error.message))?;
+            assert!(Arc::ptr_eq(&model, &parent), "role {role}");
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn explicit_orchestrator_point_pins_the_child_model() -> TestResult {
+        let factory = factory_with_orchestrator_point(InternalModelPoint::SubOrchestrator)?;
+        let pinned = factory
+            .model_for_task(role_names::CODING_ORCHESTRATOR, None)
+            .map_err(|error| crate::test_support::TestError::Unexpected(error.message))?;
+        let unpinned = factory
+            .model_for_task(role_names::ROOT_ORCHESTRATOR, None)
+            .map_err(|error| crate::test_support::TestError::Unexpected(error.message))?;
+        assert!(
+            !Arc::ptr_eq(&pinned, &unpinned),
+            "a resolved SubOrchestrator point must pin, the unresolved root point must not"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn delegate_wave_is_offered_only_to_orchestrators() -> TestResult {
+        assert!(role_gets_delegate_wave(role_names::ROOT_ORCHESTRATOR));
+        for role in role_names::CHILD_ORCHESTRATORS {
+            assert!(role_gets_delegate_wave(role), "role {role}");
+        }
+        for role in [
+            role_names::EXPLORER,
+            role_names::EXECUTOR,
+            role_names::PLANNER,
+            role_names::UIA_WORKER,
+            role_names::AGENT_STEWARD,
+            "some-repo-local-role",
+        ] {
+            assert!(!role_gets_delegate_wave(role), "role {role}");
+        }
+
+        let factory = RuntimeChildRegistryFactory::new(
+            test_project(),
+            Arc::new(harw_core::EchoModelProvider::new("echo")),
+            test_chain(&harw_config::ResolvedConfig::default()),
+        )
+        .map_err(ctx("factory builds"))?
+        .with_delegate_wave_store(Arc::new(harw_core::InMemoryStateStore::default()));
+        let names: Vec<String> =
+            harw_extension_api::ToolProvider::tools(&factory.delegate_wave_provider())
+                .iter()
+                .map(|spec| spec.name().to_owned())
+                .collect();
+        assert_eq!(names, vec![harw_core_bridge::DELEGATE_WAVE_TOOL.to_owned()]);
         Ok(())
     }
 }

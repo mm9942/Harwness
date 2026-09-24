@@ -157,8 +157,7 @@ mod tests {
     fn complete_text_propagates_model_errors() -> TestResult {
         let provider = StubProvider { reply: Err(()) };
 
-        let outcome =
-            runtime()?.block_on(complete_text(&provider, "m", "system", "user", 16));
+        let outcome = runtime()?.block_on(complete_text(&provider, "m", "system", "user", 16));
         let Err(error) = outcome else {
             return Err(TestError::Unexpected("stub failure propagates".into()));
         };
@@ -176,8 +175,7 @@ mod tests {
             reply: Ok("   \n\t  ".to_owned()),
         };
 
-        let outcome =
-            runtime()?.block_on(complete_text(&provider, "m", "system", "user", 16));
+        let outcome = runtime()?.block_on(complete_text(&provider, "m", "system", "user", 16));
         let Err(error) = outcome else {
             return Err(TestError::Unexpected("blank response is rejected".into()));
         };

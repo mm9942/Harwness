@@ -87,8 +87,8 @@ use std::path::Path;
 
 use harw_dod_cap::ReadScope;
 use landlock::{
-    ABI, AccessFs, CompatLevel, Compatible, PathBeneath, PathFd, RestrictionStatus,
-    Ruleset, RulesetAttr, RulesetCreatedAttr, RulesetStatus,
+    ABI, AccessFs, CompatLevel, Compatible, PathBeneath, PathFd, RestrictionStatus, Ruleset,
+    RulesetAttr, RulesetCreatedAttr, RulesetStatus,
 };
 
 use crate::error::ProbeError;
@@ -120,10 +120,12 @@ pub fn enforce_read_scope(scope: &ReadScope) -> Result<(), ProbeError> {
     let abi = ABI::V1;
 
     let ruleset = Ruleset::default().set_compatibility(CompatLevel::BestEffort);
-    let ruleset = ruleset.handle_access(AccessFs::from_read(abi)).map_err(|error| {
-        tracing::error!(error = %error, "landlock handle_access failed; refusing to start");
-        ProbeError::LandlockUnavailable
-    })?;
+    let ruleset = ruleset
+        .handle_access(AccessFs::from_read(abi))
+        .map_err(|error| {
+            tracing::error!(error = %error, "landlock handle_access failed; refusing to start");
+            ProbeError::LandlockUnavailable
+        })?;
 
     let created = ruleset
         .create()
@@ -133,8 +135,10 @@ pub fn enforce_read_scope(scope: &ReadScope) -> Result<(), ProbeError> {
         })?
         .set_compatibility(CompatLevel::BestEffort);
 
-    let rules: Vec<Result<PathBeneath<PathFd>, landlock::RulesetError>> =
-        scope.roots().filter_map(|root| open_rule(root, abi)).collect();
+    let rules: Vec<Result<PathBeneath<PathFd>, landlock::RulesetError>> = scope
+        .roots()
+        .filter_map(|root| open_rule(root, abi))
+        .collect();
 
     let created = created.add_rules(rules).map_err(|error| {
         tracing::error!(error = %error, "landlock add_rules failed; refusing to start");

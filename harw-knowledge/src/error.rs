@@ -62,7 +62,9 @@ pub enum KnowledgeError {
     /// `ApprovalProof` resolving to a positive `ReviewDecision` (§6.4). This
     /// crate never contacts an approval service itself — the caller must
     /// already hold the proof before calling `claim`.
-    #[msg("card {card_id} cannot claim on a lane with risk level {risk_level}: a positive approval proof is required")]
+    #[msg(
+        "card {card_id} cannot claim on a lane with risk level {risk_level}: a positive approval proof is required"
+    )]
     ClaimRequiresApproval { card_id: String, risk_level: String },
 
     /// A `ContextProposal` was read with a kind other than `ContextProposal`

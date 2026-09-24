@@ -1,0 +1,5 @@
+name = "rust-match-exhaustive"
+description = "Use when du einen `match`-Ausdruck über ein Enum oder ein Tupel von Enums schreibst — lehrt, warum Nicht-Exhaustivität ein Compilefehler (kein Laufzeitfehler) ist und wie du alle Kombinationen sicher abdeckst (Rust Edition 2024)"
+enabled = true
+instructions_file = "instructions.md"
+tools = ["filesystem.read"]

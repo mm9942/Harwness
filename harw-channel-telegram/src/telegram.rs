@@ -19,7 +19,8 @@ use crate::{
 };
 
 const UNPAIRED_TENANT: &str = "harw:unpaired";
-const INGRESS_UNAVAILABLE_MESSAGE: &str = "Telegram ingress is not configured, already running, or its sink/lock is gone";
+const INGRESS_UNAVAILABLE_MESSAGE: &str =
+    "Telegram ingress is not configured, already running, or its sink/lock is gone";
 const CHANNEL_MISMATCH_REASON: &str = "inbound event channel does not match Telegram binding";
 /// Sliding-window width for `max_updates_per_peer_per_min` (§3.5) and for the
 /// "at most one throttle notice per window" de-duplication.
@@ -28,6 +29,20 @@ const RATE_LIMIT_WINDOW: SignedDuration = SignedDuration::from_secs(60);
 /// intentionally short and free of Telegram MarkdownV2 reserved characters so
 /// no downstream escaping decision is required for it.
 const THROTTLE_NOTICE_TEXT: &str = "Zu schnell — bitte kurz warten und erneut senden.";
+/// Antwort nach erfolgreicher In-Channel-Einlösung eines `/pair <Code>`.
+/// Enthält bewusst weder Code noch Tenant.
+const PAIRING_SUCCESS_TEXT: &str = "Pairing erfolgreich — du kannst jetzt schreiben";
+/// Einheitliche Antwort für *jeden* fehlgeschlagenen Einlöseversuch
+/// (ungültig, abgelaufen, bereits verwendet, Speicherfehler). Unterscheidet
+/// die Ursachen absichtlich nicht, damit ein Absender den Code-Raum nicht
+/// über unterschiedliche Antworten abtasten kann.
+const PAIRING_FAILURE_TEXT: &str =
+    "Pairing fehlgeschlagen — Code ungültig, abgelaufen oder bereits verwendet";
+/// Standard-Gültigkeit von Approval-Callback-Tokens, wenn keine geteilte
+/// Instanz über [`TelegramChannel::with_approval_tokens`] gesetzt wird.
+const DEFAULT_APPROVAL_TOKEN_TTL: SignedDuration = SignedDuration::from_secs(24 * 60 * 60);
+/// Crockford-Base32-Alphabet der Pairing-Codes (`harw_channel::PairingCode`).
+const PAIRING_CODE_ALPHABET: &[u8] = b"0123456789ABCDEFGHJKMNPQRSTVWXYZ";
 
 /// One per-rate-limit-key sliding-window counter (§3.5).
 ///
@@ -58,6 +73,39 @@ pub struct ThrottleNotice {
     pub content: OutboundContent,
 }
 
+/// Ergebnis einer In-Channel-Einlösung von `/pair <Code>` (§3.2).
+///
+/// Trägt niemals den Code selbst: weder Notice noch Outcome dürfen den
+/// einmaligen Geheimwert in Logs oder Antworten tragen.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PairingOutcome {
+    /// Der Code wurde eingelöst; der Peer ist nun durable an `tenant` gebunden.
+    Paired {
+        /// Der Tenant, an den der Peer gebunden wurde.
+        tenant: TenantId,
+    },
+    /// Einlösung fehlgeschlagen (ungültig, abgelaufen, bereits eingelöst,
+    /// umkämpft oder Speicherfehler) — bewusst ohne Ursache.
+    Failed,
+}
+
+/// Antwort der Adapter-Perimeter auf einen `/pair <Code>`-DM eines
+/// ungepairten Peers, analog zu [`ThrottleNotice`]: der Adapter entscheidet
+/// und erzeugt nur die Notice, die Zustellung übernimmt die Transport-
+/// Komposition (z. B. `harw gateway`) über [`TelegramChannel::with_pairing_sink`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PairingNotice {
+    /// Der DM-Peer, an den die Antwort geht (entspricht `InboundEvent::peer`).
+    pub peer: PeerId,
+    /// Der ursprüngliche Thread, falls vorhanden.
+    pub thread: Option<ThreadRef>,
+    /// Das Ergebnis der Einlösung, ohne Code.
+    pub outcome: PairingOutcome,
+    /// Der zu rendernde harness-native Inhalt; immer eine schlichte
+    /// [`OutboundContent::Message`] ohne Code.
+    pub content: OutboundContent,
+}
+
 /// Pure Telegram binding; HTTP polling/webhook delivery is intentionally wired
 /// later behind this policy boundary.
 #[derive(Clone)]
@@ -78,6 +126,10 @@ pub struct TelegramChannel {
     /// In-memory only, without sender/message content, so a flood of
     /// unpinned traffic stays observable without becoming persistence.
     rejected_unpinned: Arc<AtomicU64>,
+    /// Zählt `/pair <Code>`-Versuche ungepinnter DM-Absender, die bei
+    /// `allow_unpinned_pairing` den Pairing-Pfad erreicht haben (inklusive
+    /// rate-limitierter). Nur im Speicher, ohne Absender oder Code.
+    pairing_attempts_unpinned: Arc<AtomicU64>,
     /// In-memory, per-rate-limit-key sliding-window counters enforcing
     /// `max_updates_per_peer_per_min` (§3.5). Deliberately process-local: a
     /// restart resetting the window is an acceptable trade-off for a
@@ -93,6 +145,10 @@ pub struct TelegramChannel {
     /// composition (e.g. `harw gateway`) opts in via
     /// [`Self::with_throttle_sink`].
     throttle_sink: Option<Arc<Mutex<Sender<ThrottleNotice>>>>,
+    /// Optionale Übergabe für [`PairingNotice`]s nach einer In-Channel-
+    /// Einlösung von `/pair <Code>`. Die Einlösung selbst passiert auch ohne
+    /// Sink; `None` bedeutet nur, dass der Peer keine Rückmeldung bekommt.
+    pairing_sink: Option<Arc<Mutex<Sender<PairingNotice>>>>,
 }
 
 impl std::fmt::Debug for TelegramChannel {
@@ -107,7 +163,12 @@ impl std::fmt::Debug for TelegramChannel {
                 "rejected_unpinned_sender_count",
                 &self.rejected_unpinned.load(Ordering::Relaxed),
             )
+            .field(
+                "pairing_attempts_unpinned_count",
+                &self.pairing_attempts_unpinned.load(Ordering::Relaxed),
+            )
             .field("throttle_sink_configured", &self.throttle_sink.is_some())
+            .field("pairing_sink_configured", &self.pairing_sink.is_some())
             .finish_non_exhaustive()
     }
 }
@@ -118,13 +179,15 @@ impl TelegramChannel {
         Self {
             config,
             pairing,
-            approval_tokens: Arc::new(ApprovalTokenStore::new()),
+            approval_tokens: Arc::new(ApprovalTokenStore::with_ttl(DEFAULT_APPROVAL_TOKEN_TTL)),
             sandbox: TelegramSandbox::reduced_default(),
             ingress: None,
             rejected_unpinned: Arc::new(AtomicU64::new(0)),
+            pairing_attempts_unpinned: Arc::new(AtomicU64::new(0)),
             rate_limits: Arc::new(Mutex::new(HashMap::new())),
             last_throttle_notice: Arc::new(Mutex::new(HashMap::new())),
             throttle_sink: None,
+            pairing_sink: None,
         }
     }
 
@@ -144,13 +207,15 @@ impl TelegramChannel {
         Self {
             config,
             pairing,
-            approval_tokens: Arc::new(ApprovalTokenStore::new()),
+            approval_tokens: Arc::new(ApprovalTokenStore::with_ttl(DEFAULT_APPROVAL_TOKEN_TTL)),
             sandbox: TelegramSandbox::reduced_default(),
             ingress: Some(Arc::new(Mutex::new(Some(ingress)))),
             rejected_unpinned: Arc::new(AtomicU64::new(0)),
+            pairing_attempts_unpinned: Arc::new(AtomicU64::new(0)),
             rate_limits: Arc::new(Mutex::new(HashMap::new())),
             last_throttle_notice: Arc::new(Mutex::new(HashMap::new())),
             throttle_sink: None,
+            pairing_sink: None,
         }
     }
 
@@ -163,6 +228,35 @@ impl TelegramChannel {
     pub fn with_throttle_sink(mut self, sink: Sender<ThrottleNotice>) -> Self {
         self.throttle_sink = Some(Arc::new(Mutex::new(sink)));
         self
+    }
+
+    /// Registriert eine Übergabe für [`PairingNotice`]s (§3.2).
+    ///
+    /// Die Transport-Komposition stellt darüber die Bestätigung bzw. die
+    /// einheitliche Fehlermeldung einer In-Channel-Einlösung von
+    /// `/pair <Code>` zu. Ohne Sink wird trotzdem eingelöst, nur still.
+    #[must_use]
+    pub fn with_pairing_sink(mut self, sink: Sender<PairingNotice>) -> Self {
+        self.pairing_sink = Some(Arc::new(Mutex::new(sink)));
+        self
+    }
+
+    /// Ersetzt den Approval-Token-Store durch eine geteilte Instanz.
+    ///
+    /// Die Transport-Komposition übergibt hier denselben `Arc`, den auch der
+    /// Renderer zum Ausgeben und Binden verwendet, damit Callbacks die dort
+    /// ausgegebenen Tokens einlösen können. Ohne Aufruf besitzt der Adapter
+    /// einen eigenen Store mit 24 h TTL.
+    #[must_use]
+    pub fn with_approval_tokens(mut self, tokens: Arc<ApprovalTokenStore>) -> Self {
+        self.approval_tokens = tokens;
+        self
+    }
+
+    /// Der (ggf. geteilte) Approval-Token-Store dieses Adapters.
+    #[must_use]
+    pub fn approval_tokens(&self) -> Arc<ApprovalTokenStore> {
+        Arc::clone(&self.approval_tokens)
     }
 
     #[must_use]
@@ -228,15 +322,52 @@ impl TelegramChannel {
         tenant.as_str() != UNPAIRED_TENANT
     }
 
-    /// Whether `event` carries an identified sender on the pinning allowlist.
-    /// Pure and stateless (no I/O, no store access) so it can run before any
-    /// durable work — this is the single pinning check shared by the
-    /// pre-claim gate in [`Self::forward_ingress_event`] and [`Self::admit`].
-    fn sender_pinned(&self, event: &InboundEvent) -> bool {
+    /// Ob `sender_id` in der Unterhaltung `peer` zugelassen ist.
+    ///
+    /// Zugelassen ist ein gepinnter Absender, oder — nur bei
+    /// `allow_unpinned_pairing` — ein ungepinnter Absender in seinem privaten
+    /// DM (`sender_id == peer`, keine konfigurierte Gruppe), dessen DM bereits
+    /// durable gepairt ist. Die Pairing-Abfrage ist rein lesend und legt keine
+    /// Dateien an.
+    ///
+    /// # Errors
+    /// Speicherfehler beim Lesen der Pairing-Bindung.
+    pub fn is_sender_admitted(
+        &self,
+        sender_id: &str,
+        peer: &PeerId,
+    ) -> TelegramChannelResult<bool> {
+        if self.config.is_sender_identity_pinned(sender_id) {
+            return Ok(true);
+        }
+        if !self.config.allow_unpinned_pairing
+            || sender_id != peer.as_str()
+            || self.config.is_group(peer)
+        {
+            return Ok(false);
+        }
+        Ok(self.resolve_tenant(peer)?.is_some())
+    }
+
+    /// Zulässigkeit des Absenders von `event` — die gemeinsame Prüfung des
+    /// Vor-Claim-Gates in [`Self::forward_ingress_event`] und von
+    /// [`Self::admit`]. Ohne Absender oder bei Speicherfehlern: nicht
+    /// zugelassen (fail closed).
+    fn event_sender_admitted(&self, event: &InboundEvent) -> bool {
+        event.sender.as_ref().is_some_and(|sender| {
+            self.is_sender_admitted(&sender.id, &event.peer)
+                .unwrap_or(false)
+        })
+    }
+
+    /// Ob `event` ein privater DM ist: Absender == DM-Peer und der Peer ist
+    /// keine konfigurierte Gruppe.
+    fn is_private_dm(&self, event: &InboundEvent) -> bool {
         event
             .sender
             .as_ref()
-            .is_some_and(|sender| self.config.is_sender_identity_pinned(&sender.id))
+            .is_some_and(|sender| sender.id == event.peer.as_str())
+            && !self.config.is_group(&event.peer)
     }
 
     /// Number of ingress events dropped by the pinning gate so far (F-040).
@@ -244,6 +375,13 @@ impl TelegramChannel {
     #[must_use]
     pub fn rejected_unpinned_sender_count(&self) -> u64 {
         self.rejected_unpinned.load(Ordering::Relaxed)
+    }
+
+    /// Anzahl der `/pair <Code>`-Versuche ungepinnter DM-Absender über den
+    /// `allow_unpinned_pairing`-Pfad. Diagnostisch, nur im Speicher.
+    #[must_use]
+    pub fn pairing_attempts_unpinned_count(&self) -> u64 {
+        self.pairing_attempts_unpinned.load(Ordering::Relaxed)
     }
 
     /// The sliding-window rate-limit key for `event` (§3.5).
@@ -346,6 +484,114 @@ impl TelegramChannel {
         }
     }
 
+    /// Löst ein `/pair <Code>` eines zugelassenen, aber ungepairten Peers
+    /// direkt im Channel ein (§3.2) — das In-Channel-Gegenstück zu
+    /// `harw connect --pair`.
+    ///
+    /// Nur aufgerufen für Events mit `Admission::Deferred(Onboarding)`, also
+    /// nachdem Struktur-, Zulässigkeits-, Replay-, Rate-Limit- (§3.5, begrenzt
+    /// damit auch Einlöseversuche pro Absender) und Gruppen-Gates gegriffen
+    /// haben. Eingelöst wird nur
+    /// - im privaten DM (Absender == DM-Peer, keine konfigurierte Gruppe), oder
+    /// - in einer erlaubten Gruppe durch einen *gepinnten* Absender; gebunden
+    ///   wird dann die Gruppen-`PeerId`, nicht der Absender.
+    ///
+    /// Nur ein syntaktisch gültiger Code berührt den Pairing-Store — beliebiger
+    /// Text erzeugt dort keine Lock-Datei. Alle anderen zurückgestellten
+    /// Events werden verworfen.
+    fn redeem_deferred_pairing(&self, event: &InboundEvent) {
+        let Some(sender) = event.sender.as_ref() else {
+            return;
+        };
+        let eligible = self.is_private_dm(event)
+            || (self.config.is_group(&event.peer)
+                && self.config.is_sender_identity_pinned(&sender.id));
+        if !eligible {
+            return;
+        }
+        let Some(code) = event.text.as_deref().and_then(parse_pair_command) else {
+            return;
+        };
+        self.redeem_and_notify(event, &code);
+    }
+
+    /// Löst `code` für `event.peer` ein und meldet das Ergebnis über den
+    /// Pairing-Sink.
+    ///
+    /// Fehler der Einlösung sind nicht fatal für die Ingress-Schleife und
+    /// werden nie geloggt oder in die Antwort übernommen, da die Fehler-
+    /// Varianten des Stores den Code enthalten.
+    fn redeem_and_notify(&self, event: &InboundEvent, code: &str) -> PairingOutcome {
+        let outcome = match self.redeem_pairing(code, &event.peer, event.received_at) {
+            Ok(record) => PairingOutcome::Paired {
+                tenant: record.tenant,
+            },
+            Err(_) => PairingOutcome::Failed,
+        };
+        self.notify_pairing(event, outcome.clone());
+        outcome
+    }
+
+    /// Pairing-Pfad für einen *nicht* zugelassenen Absender (nur bei
+    /// `allow_unpinned_pairing`): ausschließlich ein wohlgeformtes
+    /// `/pair <Code>` im privaten DM erreicht den Pairing-Store, nach dem
+    /// Rate-Limit und ohne vorherigen Replay-Claim.
+    ///
+    /// # Returns
+    /// `true`, wenn das Event als Pairing-Versuch behandelt wurde; `false`,
+    /// wenn es wie jeder andere nicht zugelassene Verkehr verworfen werden
+    /// muss (ohne jede Schreiboperation).
+    fn try_unpinned_pairing(&self, event: &InboundEvent) -> bool {
+        if !self.config.allow_unpinned_pairing || !self.is_private_dm(event) {
+            return false;
+        }
+        let Some(code) = event.text.as_deref().and_then(parse_pair_command) else {
+            return false;
+        };
+        self.pairing_attempts_unpinned
+            .fetch_add(1, Ordering::Relaxed);
+        if !self.record_inbound_rate(event) {
+            self.maybe_notify_throttled(event);
+            return true;
+        }
+        if matches!(
+            self.redeem_and_notify(event, &code),
+            PairingOutcome::Paired { .. }
+        ) {
+            // Erst jetzt, da der Peer durable gepairt ist, darf das Update
+            // einen Replay-Claim schreiben: eine erneute Zustellung desselben
+            // `/pair` wird so nicht als neue Nachricht weitergereicht.
+            // Best-effort — ein Fehler ändert das Pairing nicht.
+            let _ = self.claim_update(event);
+        }
+        true
+    }
+
+    /// Übergibt eine [`PairingNotice`] best-effort an den optionalen Sink.
+    fn notify_pairing(&self, event: &InboundEvent, outcome: PairingOutcome) {
+        let Some(sink) = self.pairing_sink.as_ref() else {
+            return;
+        };
+        let text = match outcome {
+            PairingOutcome::Paired { .. } => PAIRING_SUCCESS_TEXT,
+            PairingOutcome::Failed => PAIRING_FAILURE_TEXT,
+        };
+        let notice = PairingNotice {
+            peer: event.peer.clone(),
+            thread: event.thread.clone(),
+            outcome,
+            content: OutboundContent::Message {
+                markdown: text.to_owned(),
+            },
+        };
+        if let Ok(sink) = sink.lock() {
+            // Best-effort wie beim Throttle-Sink: eine volle/geschlossene
+            // Übergabe darf die bereits durchgeführte Einlösung nicht
+            // zurückdrehen oder die Ingress-Schleife stoppen.
+            let _ = sink.send(notice);
+        }
+    }
+
     /// Returns the intersection-only capability profile for this remote binding.
     #[must_use]
     pub fn sandbox(&self) -> &TelegramSandbox {
@@ -412,13 +658,17 @@ impl TelegramChannel {
 
     /// Processes one transport-normalized event through the Telegram perimeter.
     ///
-    /// Pinning is checked before the replay claim, before channel mismatches
+    /// Sender admission ([`Self::is_sender_admitted`]: pinning, or a paired
+    /// private DM under `allow_unpinned_pairing`) is checked before the replay claim, before channel mismatches
     /// are otherwise treated as durable-eligible, and before any session
     /// work: an unpinned sender must not be able to make this binding write a
     /// single file or journal entry (F-040/F-041 remediation of S5 — the plan
     /// and §2.3 both require unauthenticated traffic to create no journal
     /// entries). Only events that survive pinning, durable replay claiming,
-    /// pairing/session resolution, and admission enter the runtime sink. The
+    /// pairing/session resolution, and admission enter the runtime sink.
+    /// Events deferred for onboarding never enter the runtime sink; a private
+    /// `/pair <Code>` DM among them is redeemed in-channel via
+    /// [`Self::redeem_deferred_pairing`], everything else is dropped. The
     /// reduced sandbox remains attached to this adapter and is never widened
     /// by ingress.
     fn forward_ingress_event(
@@ -430,12 +680,16 @@ impl TelegramChannel {
             return Ok(());
         }
         self.validate_channel(&event)?;
-        // Zustandsloses Pinning-Gate zuerst: kein Claim, keine Journal-/
-        // Dateischreibung für einen nicht gepinnten Absender. Nur ein
-        // In-Memory-Zähler beobachtet das, niemals der Nachrichteninhalt oder
-        // die Sender-Identität selbst.
-        if !self.sender_pinned(&event) {
-            self.rejected_unpinned.fetch_add(1, Ordering::Relaxed);
+        // Zulässigkeits-Gate zuerst: kein Claim, keine Journal-/
+        // Dateischreibung für einen nicht zugelassenen Absender (die
+        // Pairing-Abfrage für `allow_unpinned_pairing` ist rein lesend). Nur
+        // In-Memory-Zähler beobachten das, niemals der Nachrichteninhalt oder
+        // die Sender-Identität selbst. Einzige Ausnahme: ein wohlgeformtes
+        // `/pair <Code>` im privaten DM bei `allow_unpinned_pairing`.
+        if !self.event_sender_admitted(&event) {
+            if !self.try_unpinned_pairing(&event) {
+                self.rejected_unpinned.fetch_add(1, Ordering::Relaxed);
+            }
             return Ok(());
         }
         // Telegram update delivery is at-least-once. The structural and
@@ -455,10 +709,46 @@ impl TelegramChannel {
             Admission::Rejected(RejectionReason::RateLimited) => {
                 self.maybe_notify_throttled(&event);
             }
-            Admission::Rejected(_) | Admission::Deferred(_) => {}
+            Admission::Deferred(DeferralReason::Onboarding) => {
+                self.redeem_deferred_pairing(&event);
+            }
+            Admission::Rejected(_) => {}
         }
         Ok(())
     }
+}
+
+/// Extrahiert den Code aus einem `/pair <Code>`- bzw. `/pair@bot <Code>`-
+/// Kommando (Befehl case-insensitiv, wie `harw gateway` ihn erkennt).
+///
+/// Genau zwei Tokens; der Code wird auf ASCII-Großbuchstaben normalisiert
+/// und muss die Form `XXXX-XXXX` im Crockford-Base32-Alphabet haben, sonst
+/// `None` — so erreicht kein Freitext den Pairing-Store.
+fn parse_pair_command(text: &str) -> Option<String> {
+    let mut tokens = text.split_ascii_whitespace();
+    let command = tokens.next()?.to_ascii_lowercase();
+    let code = tokens.next()?;
+    if tokens.next().is_some() {
+        return None;
+    }
+    let is_pair = command == "/pair"
+        || command
+            .strip_prefix("/pair@")
+            .is_some_and(|bot| !bot.is_empty());
+    if !is_pair {
+        return None;
+    }
+    let code = code.to_ascii_uppercase();
+    let bytes = code.as_bytes();
+    let well_formed = bytes.len() == 9
+        && bytes.iter().enumerate().all(|(index, byte)| {
+            if index == 4 {
+                *byte == b'-'
+            } else {
+                PAIRING_CODE_ALPHABET.contains(byte)
+            }
+        });
+    well_formed.then_some(code)
 }
 
 /// Whether more than [`RATE_LIMIT_WINDOW`] has elapsed since `window_start`,
@@ -480,13 +770,9 @@ impl ChannelAdapter for TelegramChannel {
             markdown: MarkdownSupport::BasicV1,
             max_message_len: 4096,
             attachments: AttachmentSupport {
-                max_size_bytes: 20_000_000,
-                max_count_per_message: 10,
-                allowed_kinds: vec![
-                    "image/*".to_owned(),
-                    "application/pdf".to_owned(),
-                    "text/plain".to_owned(),
-                ],
+                max_size_bytes: self.config.attachment_max_bytes,
+                max_count_per_message: self.config.attachment_max_count,
+                allowed_kinds: self.config.attachment_allowed_kinds.clone(),
             },
             edits: true,
             reactions: false,
@@ -513,7 +799,7 @@ impl ChannelAdapter for TelegramChannel {
     }
 
     fn admit(&self, event: &InboundEvent, key: &SessionKey) -> Admission {
-        if !self.sender_pinned(event) {
+        if !self.event_sender_admitted(event) {
             return Admission::Rejected(RejectionReason::NotAllowlisted);
         }
         if self.validate_channel(event).is_err() {
@@ -523,7 +809,11 @@ impl ChannelAdapter for TelegramChannel {
             return Admission::Rejected(RejectionReason::RateLimited);
         }
         if self.config.is_group(&event.peer) {
-            if self.config.require_mention_in_groups && !event.mentioned {
+            // Ein `/pair <Code>` in einer noch ungepairten Gruppe braucht keine
+            // Erwähnung; es wird ohnehin nur als Onboarding zurückgestellt.
+            let group_pairing_attempt = !Self::is_paired(&key.tenant)
+                && event.text.as_deref().and_then(parse_pair_command).is_some();
+            if self.config.require_mention_in_groups && !event.mentioned && !group_pairing_attempt {
                 return Admission::Rejected(RejectionReason::NoMention);
             }
             if !self.config.group_allowed_senders.is_empty()
@@ -1357,6 +1647,573 @@ mod tests {
 
         adapter.run_ingress(sink_tx).map_err(ctx("run_ingress"))?;
         assert!(sink_rx.try_recv().is_err());
+        Ok(())
+    }
+
+    /// Konfiguration, in der der DM-Absender `100` gepinnt, aber (noch)
+    /// nicht gepairt ist — der Zustand vor einer In-Channel-Einlösung.
+    fn dm_config() -> TelegramChannelConfig {
+        let mut config = config(ChannelId::from_str("telegram:ops"));
+        config.pinned_sender_ids.insert("100".to_owned());
+        config
+    }
+
+    /// Privater DM: Absender == Peer (Telegram-DM-Chat-ID == User-ID).
+    fn dm_event(update: &str, text: &str) -> InboundEvent {
+        let mut inbound = event("100", false);
+        inbound.thread = None;
+        inbound.sender = Some(SenderRef {
+            id: "100".to_owned(),
+            display_name: None,
+        });
+        inbound.text = Some(text.to_owned());
+        inbound.raw_event_id = Some(update.to_owned());
+        inbound
+    }
+
+    fn issue(store: &PairingStore, tenant: &str, seed: &[u8]) -> TestResult<String> {
+        store
+            .issue_code(
+                &ChannelId::from_str("telegram:ops"),
+                &TenantId::from_str(tenant),
+                seed,
+                Timestamp::now(),
+            )
+            .map_err(ctx("issue"))
+    }
+
+    /// Führt die Ingress-Schleife über `events` aus und liefert die an den
+    /// Runtime-Sink weitergereichten Events sowie die Pairing-Notices.
+    fn run_pairing_ingress(
+        adapter_config: TelegramChannelConfig,
+        store: Arc<PairingStore>,
+        events: Vec<InboundEvent>,
+    ) -> TestResult<(TelegramChannel, Vec<InboundEvent>, Vec<PairingNotice>)> {
+        let (ingress_tx, ingress_rx) = mpsc::channel();
+        let (pairing_tx, pairing_rx) = mpsc::channel();
+        let adapter = TelegramChannel::with_ingress_receiver(adapter_config, store, ingress_rx)
+            .with_pairing_sink(pairing_tx);
+        let (sink_tx, sink_rx) = mpsc::channel();
+        for inbound in events {
+            ingress_tx.send(inbound).map_err(ctx("send"))?;
+        }
+        drop(ingress_tx);
+        adapter.run_ingress(sink_tx).map_err(ctx("run_ingress"))?;
+        let forwarded = sink_rx.try_iter().collect();
+        let notices = pairing_rx.try_iter().collect();
+        Ok((adapter, forwarded, notices))
+    }
+
+    #[test]
+    fn pair_command_parser_accepts_only_well_formed_codes() {
+        assert_eq!(
+            parse_pair_command("/pair Y2GQ-DEYE"),
+            Some("Y2GQ-DEYE".to_owned())
+        );
+        assert_eq!(
+            parse_pair_command("  /PAIR@LinLinBot y2gq-deye "),
+            Some("Y2GQ-DEYE".to_owned())
+        );
+        assert_eq!(parse_pair_command("/pair"), None);
+        assert_eq!(parse_pair_command("/pair@ Y2GQ-DEYE"), None);
+        assert_eq!(parse_pair_command("/pairing Y2GQ-DEYE"), None);
+        assert_eq!(parse_pair_command("hey /pair Y2GQ-DEYE"), None);
+        assert_eq!(parse_pair_command("/pair Y2GQ-DEYE extra"), None);
+        assert_eq!(parse_pair_command("/pair Y2GQDEYE"), None);
+        assert_eq!(parse_pair_command("/pair ILOU-ILOU"), None);
+        assert_eq!(parse_pair_command("/pair ../../etc"), None);
+    }
+
+    #[test]
+    fn unpaired_dm_pair_command_redeems_in_channel() -> TestResult {
+        let (_dir, store) = store()?;
+        let code = issue(&store, "ops", b"seed12345")?;
+        let (adapter, forwarded, notices) = run_pairing_ingress(
+            dm_config(),
+            Arc::clone(&store),
+            vec![dm_event("1", &format!("/pair {code}"))],
+        )?;
+
+        // Das `/pair`-Kommando selbst erreicht nie die Runtime ...
+        assert!(forwarded.is_empty());
+        // ... der Peer ist aber nun durable gebunden.
+        assert_eq!(
+            adapter
+                .resolve_tenant(&PeerId::from_str("100"))
+                .map_err(ctx("resolve_tenant"))?,
+            Some(TenantId::from_str("ops"))
+        );
+        let [notice] = notices.as_slice() else {
+            return Err(TestError::Unexpected(format!(
+                "expected one pairing notice, got {}",
+                notices.len()
+            )));
+        };
+        assert_eq!(notice.peer.as_str(), "100");
+        assert_eq!(
+            notice.outcome,
+            PairingOutcome::Paired {
+                tenant: TenantId::from_str("ops")
+            }
+        );
+        let OutboundContent::Message { markdown } = &notice.content else {
+            return Err(TestError::Unexpected("notice must be a message".to_owned()));
+        };
+        assert!(!markdown.contains(&code));
+        Ok(())
+    }
+
+    #[test]
+    fn pair_command_with_bot_suffix_and_lowercase_code_redeems() -> TestResult {
+        let (_dir, store) = store()?;
+        let code = issue(&store, "ops", b"seed12345")?;
+        let text = format!("/pair@HarwBot {}", code.to_ascii_lowercase());
+        let (adapter, forwarded, notices) =
+            run_pairing_ingress(dm_config(), store, vec![dm_event("1", &text)])?;
+
+        assert!(forwarded.is_empty());
+        assert_eq!(notices.len(), 1);
+        assert!(
+            adapter
+                .resolve_tenant(&PeerId::from_str("100"))
+                .map_err(ctx("resolve_tenant"))?
+                .is_some()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn invalid_or_reused_pair_code_fails_without_pairing_or_leaking_code() -> TestResult {
+        let (_dir, store) = store()?;
+        let channel = ChannelId::from_str("telegram:ops");
+        let code = issue(&store, "ops", b"seed12345")?;
+        // Der Code wurde bereits von einem anderen Peer eingelöst.
+        store
+            .redeem_once(&channel, &code, &PeerId::from_str("999"), Timestamp::now())
+            .map_err(ctx("redeem"))?;
+
+        let (adapter, forwarded, notices) = run_pairing_ingress(
+            dm_config(),
+            store,
+            vec![
+                dm_event("1", &format!("/pair {code}")),
+                dm_event("2", "/pair ZZZZ-ZZZZ"),
+            ],
+        )?;
+
+        assert!(forwarded.is_empty());
+        assert_eq!(
+            adapter
+                .resolve_tenant(&PeerId::from_str("100"))
+                .map_err(ctx("resolve_tenant"))?,
+            None
+        );
+        assert_eq!(notices.len(), 2);
+        for notice in &notices {
+            assert_eq!(notice.outcome, PairingOutcome::Failed);
+            let OutboundContent::Message { markdown } = &notice.content else {
+                return Err(TestError::Unexpected("notice must be a message".to_owned()));
+            };
+            assert!(!markdown.contains(&code));
+            assert!(!markdown.contains("ZZZZ-ZZZZ"));
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn deferred_non_pair_and_non_dm_events_are_still_dropped_silently() -> TestResult {
+        let (_dir, store) = store()?;
+        let code = issue(&store, "ops", b"seed12345")?;
+        // Absender weicht vom Peer ab (kein privater DM mit diesem Absender).
+        let mut foreign = dm_event("2", &format!("/pair {code}"));
+        foreign.sender = Some(SenderRef {
+            id: "alice".to_owned(),
+            display_name: None,
+        });
+        let (adapter, forwarded, notices) = run_pairing_ingress(
+            dm_config(),
+            Arc::clone(&store),
+            vec![dm_event("1", "hello"), foreign],
+        )?;
+
+        assert!(forwarded.is_empty());
+        assert!(notices.is_empty());
+        assert_eq!(
+            adapter
+                .resolve_tenant(&PeerId::from_str("100"))
+                .map_err(ctx("resolve_tenant"))?,
+            None
+        );
+        // Der Code blieb unberührt und ist weiterhin einlösbar.
+        store
+            .redeem_once(
+                &ChannelId::from_str("telegram:ops"),
+                &code,
+                &PeerId::from_str("100"),
+                Timestamp::now(),
+            )
+            .map_err(ctx("code must still be redeemable"))?;
+        Ok(())
+    }
+
+    #[test]
+    fn pair_attempts_are_bounded_by_the_per_sender_rate_limit() -> TestResult {
+        let (_dir, store) = store()?;
+        let code = issue(&store, "ops", b"seed12345")?;
+        let mut adapter_config = dm_config();
+        adapter_config.max_updates_per_peer_per_min = 1;
+        let (adapter, forwarded, notices) = run_pairing_ingress(
+            adapter_config,
+            store,
+            vec![
+                dm_event("1", "/pair ZZZZ-ZZZZ"),
+                dm_event("2", &format!("/pair {code}")),
+            ],
+        )?;
+
+        // Nur der erste Versuch passiert das Rate-Limit; der zweite wird
+        // abgewiesen, bevor er den Pairing-Store erreicht.
+        assert!(forwarded.is_empty());
+        assert_eq!(notices.len(), 1);
+        assert_eq!(notices[0].outcome, PairingOutcome::Failed);
+        assert_eq!(
+            adapter
+                .resolve_tenant(&PeerId::from_str("100"))
+                .map_err(ctx("resolve_tenant"))?,
+            None
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn pair_command_redeems_even_without_a_pairing_sink() -> TestResult {
+        let (_dir, store) = store()?;
+        let code = issue(&store, "ops", b"seed12345")?;
+        let (ingress_tx, ingress_rx) = mpsc::channel();
+        let adapter = TelegramChannel::with_ingress_receiver(dm_config(), store, ingress_rx);
+        let (sink_tx, sink_rx) = mpsc::channel();
+        ingress_tx
+            .send(dm_event("1", &format!("/pair {code}")))
+            .map_err(ctx("send"))?;
+        drop(ingress_tx);
+
+        adapter.run_ingress(sink_tx).map_err(ctx("run_ingress"))?;
+        assert!(sink_rx.try_recv().is_err());
+        assert!(
+            adapter
+                .resolve_tenant(&PeerId::from_str("100"))
+                .map_err(ctx("resolve_tenant"))?
+                .is_some()
+        );
+        Ok(())
+    }
+
+    /// Konfiguration mit `allow_unpinned_pairing`, in der `100` *nicht*
+    /// gepinnt ist (nur `alice`).
+    fn unpinned_pairing_config() -> TelegramChannelConfig {
+        let mut config = config(ChannelId::from_str("telegram:ops"));
+        config.allow_unpinned_pairing = true;
+        config
+    }
+
+    fn count_files(root: &std::path::Path) -> TestResult<usize> {
+        let mut count = 0;
+        let mut pending = vec![root.to_path_buf()];
+        while let Some(dir) = pending.pop() {
+            for entry in std::fs::read_dir(&dir).map_err(ctx("read_dir"))? {
+                let entry = entry.map_err(ctx("dir entry"))?;
+                count += 1;
+                if entry.file_type().map_err(ctx("file_type"))?.is_dir() {
+                    pending.push(entry.path());
+                }
+            }
+        }
+        Ok(count)
+    }
+
+    #[test]
+    fn unpinned_dm_pair_command_redeems_when_unpinned_pairing_is_allowed() -> TestResult {
+        let (_dir, store) = store()?;
+        let code = issue(&store, "ops", b"seed12345")?;
+        let (adapter, forwarded, notices) = run_pairing_ingress(
+            unpinned_pairing_config(),
+            Arc::clone(&store),
+            vec![dm_event("1", &format!("/pair {code}"))],
+        )?;
+
+        assert!(forwarded.is_empty());
+        assert_eq!(
+            adapter
+                .resolve_tenant(&PeerId::from_str("100"))
+                .map_err(ctx("resolve_tenant"))?,
+            Some(TenantId::from_str("ops"))
+        );
+        assert_eq!(notices.len(), 1);
+        assert_eq!(
+            notices[0].outcome,
+            PairingOutcome::Paired {
+                tenant: TenantId::from_str("ops")
+            }
+        );
+        assert_eq!(adapter.pairing_attempts_unpinned_count(), 1);
+        assert_eq!(adapter.rejected_unpinned_sender_count(), 0);
+        Ok(())
+    }
+
+    #[test]
+    fn unpinned_dm_pair_command_is_dropped_without_unpinned_pairing() -> TestResult {
+        let (dir, store) = store()?;
+        let code = issue(&store, "ops", b"seed12345")?;
+        let files_before = count_files(dir.path())?;
+        let mut adapter_config = unpinned_pairing_config();
+        adapter_config.allow_unpinned_pairing = false;
+        let (adapter, forwarded, notices) = run_pairing_ingress(
+            adapter_config,
+            Arc::clone(&store),
+            vec![dm_event("1", &format!("/pair {code}"))],
+        )?;
+
+        assert!(forwarded.is_empty());
+        assert!(notices.is_empty());
+        assert_eq!(count_files(dir.path())?, files_before);
+        assert_eq!(adapter.pairing_attempts_unpinned_count(), 0);
+        assert_eq!(adapter.rejected_unpinned_sender_count(), 1);
+        store
+            .redeem_once(
+                &ChannelId::from_str("telegram:ops"),
+                &code,
+                &PeerId::from_str("100"),
+                Timestamp::now(),
+            )
+            .map_err(ctx("code must still be redeemable"))?;
+        Ok(())
+    }
+
+    #[test]
+    fn unpinned_non_pair_text_writes_nothing() -> TestResult {
+        let (dir, store) = store()?;
+        let (adapter, forwarded, notices) = run_pairing_ingress(
+            unpinned_pairing_config(),
+            store,
+            vec![
+                dm_event("1", "hello"),
+                dm_event("2", "/pair not-a-code"),
+                dm_event("3", "/start"),
+            ],
+        )?;
+
+        assert!(forwarded.is_empty());
+        assert!(notices.is_empty());
+        assert_eq!(count_files(dir.path())?, 0);
+        assert_eq!(adapter.pairing_attempts_unpinned_count(), 0);
+        assert_eq!(adapter.rejected_unpinned_sender_count(), 3);
+        Ok(())
+    }
+
+    #[test]
+    fn unpinned_group_pair_command_is_never_redeemed() -> TestResult {
+        let (_dir, store) = store()?;
+        let code = issue(&store, "ops", b"seed12345")?;
+        let mut adapter_config = unpinned_pairing_config();
+        adapter_config
+            .allowed_group_chats
+            .insert("-1001".to_owned());
+        let mut inbound = dm_event("1", &format!("/pair {code}"));
+        inbound.peer = PeerId::from_str("-1001");
+        let (adapter, forwarded, notices) =
+            run_pairing_ingress(adapter_config, store, vec![inbound])?;
+
+        assert!(forwarded.is_empty());
+        assert!(notices.is_empty());
+        assert_eq!(
+            adapter
+                .resolve_tenant(&PeerId::from_str("-1001"))
+                .map_err(ctx("resolve_tenant"))?,
+            None
+        );
+        assert_eq!(adapter.pairing_attempts_unpinned_count(), 0);
+        Ok(())
+    }
+
+    #[test]
+    fn unpinned_sender_is_admitted_after_pairing_its_dm() -> TestResult {
+        let (_dir, store) = store()?;
+        let code = issue(&store, "ops", b"seed12345")?;
+        let (_adapter, forwarded, notices) = run_pairing_ingress(
+            unpinned_pairing_config(),
+            store,
+            vec![
+                dm_event("1", &format!("/pair {code}")),
+                dm_event("2", "hello"),
+            ],
+        )?;
+
+        assert_eq!(notices.len(), 1);
+        let [message] = forwarded.as_slice() else {
+            return Err(TestError::Unexpected(format!(
+                "expected one forwarded event, got {}",
+                forwarded.len()
+            )));
+        };
+        assert_eq!(message.text.as_deref(), Some("hello"));
+        Ok(())
+    }
+
+    #[test]
+    fn replayed_unpinned_pair_update_is_not_forwarded_after_pairing() -> TestResult {
+        let (_dir, store) = store()?;
+        let code = issue(&store, "ops", b"seed12345")?;
+        let pair_event = dm_event("1", &format!("/pair {code}"));
+        let (_adapter, forwarded, notices) = run_pairing_ingress(
+            unpinned_pairing_config(),
+            store,
+            vec![pair_event.clone(), pair_event],
+        )?;
+
+        assert!(forwarded.is_empty());
+        assert_eq!(notices.len(), 1);
+        Ok(())
+    }
+
+    #[test]
+    fn group_pair_command_by_pinned_sender_pairs_the_group_peer() -> TestResult {
+        let (_dir, store) = store()?;
+        let code = issue(&store, "ops", b"seed12345")?;
+        let mut adapter_config = config(ChannelId::from_str("telegram:ops"));
+        adapter_config
+            .allowed_group_chats
+            .insert("-1001".to_owned());
+        // `alice` ist gepinnt; ohne Erwähnung, wie ein schlichtes `/pair` in der Gruppe.
+        let mut inbound = event("-1001", false);
+        inbound.text = Some(format!("/pair {code}"));
+        let (adapter, forwarded, notices) =
+            run_pairing_ingress(adapter_config, store, vec![inbound])?;
+
+        assert!(forwarded.is_empty());
+        assert_eq!(
+            adapter
+                .resolve_tenant(&PeerId::from_str("-1001"))
+                .map_err(ctx("resolve_tenant group"))?,
+            Some(TenantId::from_str("ops"))
+        );
+        assert_eq!(
+            adapter
+                .resolve_tenant(&PeerId::from_str("alice"))
+                .map_err(ctx("resolve_tenant sender"))?,
+            None
+        );
+        let [notice] = notices.as_slice() else {
+            return Err(TestError::Unexpected(format!(
+                "expected one pairing notice, got {}",
+                notices.len()
+            )));
+        };
+        assert_eq!(notice.peer.as_str(), "-1001");
+        Ok(())
+    }
+
+    #[test]
+    fn group_pair_command_outside_allowed_groups_is_dropped() -> TestResult {
+        let (_dir, store) = store()?;
+        let code = issue(&store, "ops", b"seed12345")?;
+        let mut inbound = event("-2002", true);
+        inbound.text = Some(format!("/pair {code}"));
+        let (adapter, forwarded, notices) = run_pairing_ingress(
+            config(ChannelId::from_str("telegram:ops")),
+            store,
+            vec![inbound],
+        )?;
+
+        assert!(forwarded.is_empty());
+        assert!(notices.is_empty());
+        assert_eq!(
+            adapter
+                .resolve_tenant(&PeerId::from_str("-2002"))
+                .map_err(ctx("resolve_tenant"))?,
+            None
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn is_sender_admitted_covers_pinned_and_unpinned_paths() -> TestResult {
+        let (_dir, store) = store()?;
+        let channel = ChannelId::from_str("telegram:ops");
+        pair(&store, &channel, "100", "ops")?;
+        let dm = PeerId::from_str("100");
+        let unpaired_dm = PeerId::from_str("200");
+
+        let strict = TelegramChannel::new(config(channel.clone()), Arc::clone(&store));
+        assert!(
+            strict
+                .is_sender_admitted("alice", &dm)
+                .map_err(ctx("pinned"))?
+        );
+        // Gepairt, aber ungepinnt und ohne `allow_unpinned_pairing`.
+        assert!(
+            !strict
+                .is_sender_admitted("100", &dm)
+                .map_err(ctx("strict unpinned"))?
+        );
+
+        let relaxed = TelegramChannel::new(unpinned_pairing_config(), store);
+        assert!(
+            relaxed
+                .is_sender_admitted("100", &dm)
+                .map_err(ctx("paired dm"))?
+        );
+        assert!(
+            !relaxed
+                .is_sender_admitted("200", &unpaired_dm)
+                .map_err(ctx("unpaired dm"))?
+        );
+        // Absender weicht vom Peer ab: nie über den ungepinnten Pfad.
+        assert!(
+            !relaxed
+                .is_sender_admitted("200", &dm)
+                .map_err(ctx("foreign sender"))?
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn shared_approval_tokens_are_used_for_rendering() -> TestResult {
+        let (_dir, store) = store()?;
+        let shared = Arc::new(ApprovalTokenStore::new());
+        let adapter = TelegramChannel::new(config(ChannelId::from_str("telegram:ops")), store)
+            .with_approval_tokens(Arc::clone(&shared));
+        assert!(Arc::ptr_eq(&adapter.approval_tokens(), &shared));
+
+        let _ = adapter.render_outbound(&OutboundContent::Approval(ApprovalPrompt {
+            request_id: "a-3".to_owned(),
+            summary: "write file".to_owned(),
+            risk: "high".to_owned(),
+            actions: vec![ApprovalAction {
+                label: "Approve".to_owned(),
+                decision: "approve".to_owned(),
+            }],
+        }));
+        assert_eq!(shared.len(), 1);
+        assert_eq!(shared.revoke_request("a-3"), 1);
+        Ok(())
+    }
+
+    #[test]
+    fn capabilities_reflect_configured_attachment_limits() -> TestResult {
+        let (_dir, store) = store()?;
+        let mut adapter_config = config(ChannelId::from_str("telegram:ops"));
+        adapter_config.attachment_max_bytes = 1024;
+        adapter_config.attachment_max_count = 2;
+        adapter_config.attachment_allowed_kinds = vec!["application/pdf".to_owned()];
+        let adapter = TelegramChannel::new(adapter_config, store);
+
+        let attachments = adapter.capabilities().attachments;
+        assert_eq!(attachments.max_size_bytes, 1024);
+        assert_eq!(attachments.max_count_per_message, 2);
+        assert_eq!(
+            attachments.allowed_kinds,
+            vec!["application/pdf".to_owned()]
+        );
         Ok(())
     }
 }

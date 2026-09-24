@@ -1,4 +1,5 @@
 [package]
+publish.workspace = true
 name = "harw-registry-defaults"
 version.workspace = true
 edition.workspace = true
@@ -21,6 +22,7 @@ harw-project-discovery = { path = "../harw-project-discovery" }
 harw-sandbox = { path = "../harw-sandbox" }
 harw-tool-deps = { path = "../harw-tool-deps" }
 harw-tool-explorer = { path = "../harw-tool-explorer" }
+harw-tool-process = { path = "../harw-tool-process" }
 # `doc.read_pdf` (Anbindung W3): lesendes PDF-Werkzeug, erscheint überall, wo
 # ein lesender `FsToolProvider` registriert wird (siehe `profile::DOC_TOOLS`).
 harw-tool-doc = { version = "0.3.0", path = "../harw-tool-doc" }
@@ -53,6 +55,12 @@ toml = "1.1.3"
 serde = { workspace = true, features = ["derive"] }
 serde_json.workspace = true
 harw-tools = { version = "0.3.0", path = "../harw-tools" }
+# `workbench.note`/`workbench.hypothesis` (`workbench_tools.rs`) schreiben über
+# `harw_knowledge::workbench` in den Sitzungs-Scope. Kein Zyklus:
+# `harw-knowledge` hängt (auch transitiv) nicht von `harw-registry-defaults` ab.
+harw-knowledge = { path = "../harw-knowledge" }
+# Zeitstempel der Workbench-Einträge (`harw_knowledge::workbench` datiert in `jiff`).
+jiff = { workspace = true }
 
 [features]
 # Opt-in surface for the Harwness browser tool set (`browser.open`,

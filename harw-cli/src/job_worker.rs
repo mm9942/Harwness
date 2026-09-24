@@ -1,12 +1,23 @@
 //! Durable job consumer for `harw serve`.
 //!
-//! Jobs arrive here with their authority already resolved by admission.  Two
+//! Jobs arrive here with their authority already resolved by admission.  Three
 //! job families are executed, and they differ in exactly one thing: how much
 //! authority the turn is allowed to carry.
 //!
 //! * [`JobKind::Worker`] / [`JobKind::Dream`] — a trusted `prompt`/`task`
 //!   string is turned into one durable assistant turn under the runtime entry
 //!   `EntryKind::JobPrompt`: no tools, no permissions, no ambient authority.
+//! * [`JobKind::Custom`] named
+//!   [`harw_channel_telegram::TELEGRAM_WORK_REQUEST_JOB_KIND`] — ein über
+//!   Telegram eingereichter, geprüfter und genehmigter Auftrag
+//!   (`crate::telegram_launcher::TelegramWorkPayload`).  Der digest-geprüfte
+//!   Aufgabentext läuft als genau derselbe Prompt-Turn wie ein Prompt-Job
+//!   (`EntryKind::JobPrompt`, gleiche Budget- und Wanduhr-Deckelung, keine
+//!   Werkzeuge, keine Rechte).  Der Einreicher darf hier ein
+//!   `ApprovalActor::ChannelPeer` sein — die Genehmigung ist bereits im
+//!   Telegram-Auftragsfluss erfolgt; Lease- und Scope-Zaun gelten unverändert.
+//!   Eine fehlerhafte Payload beendet den Job endgültig als `Failed` ohne
+//!   Modellaufruf.
 //! * [`JobKind::Custom`] named [`PLAN_NODE_JOB_KIND`] — a plan node admitted by
 //!   `harw_plan_bridge::PlanJobBridge::admit_ready_nodes`.  The turn runs under
 //!   `EntryKind::JobPlanNode`, narrowed (`harw_runtime::RuntimeNarrowing`) to
@@ -377,18 +388,29 @@ pub async fn run_job_worker(
 }
 
 // Kinds this worker knows how to execute. Every other kind belongs to another
-// consumer and is left untouched (fail closed: an unknown `Custom` name is not
-// a plan node).
+// consumer and is left untouched (fail closed: an unknown `Custom` name is
+// neither a plan node nor a Telegram work request).
 fn is_supported_kind(kind: &JobKind) -> bool {
     match kind {
         JobKind::Worker | JobKind::Dream => true,
-        JobKind::Custom(name) => name == PLAN_NODE_JOB_KIND,
+        JobKind::Custom(name) => {
+            name == PLAN_NODE_JOB_KIND
+                || name == harw_channel_telegram::TELEGRAM_WORK_REQUEST_JOB_KIND
+        }
     }
 }
 
 // True only for the plan-node discriminator.
 fn is_plan_node_kind(kind: &JobKind) -> bool {
     matches!(kind, JobKind::Custom(name) if name == PLAN_NODE_JOB_KIND)
+}
+
+// Wahr nur für den Diskriminator genehmigter Telegram-Aufträge.
+fn is_telegram_work_kind(kind: &JobKind) -> bool {
+    matches!(
+        kind,
+        JobKind::Custom(name) if name == harw_channel_telegram::TELEGRAM_WORK_REQUEST_JOB_KIND
+    )
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
@@ -411,6 +433,16 @@ async fn execute_claim(
             provider,
             job_store,
             plan_services,
+            Arc::clone(&control),
+            &context,
+        )
+        .await
+    } else if is_telegram_work_kind(&claim.job.kind) {
+        execute_telegram_work_claim(
+            claim,
+            input,
+            provider,
+            job_store,
             Arc::clone(&control),
             &context,
         )
@@ -477,6 +509,136 @@ async fn execute_prompt_claim(
         Err(reason) => return JobOutcome::Blocked { reason },
     };
 
+    run_prompt_turn(
+        claim,
+        &submitter_id,
+        prompt,
+        provider,
+        job_store,
+        control,
+        context,
+    )
+    .await
+}
+
+/// Grund für eine Telegram-Auftrags-Payload, die nicht dekodiert werden kann
+/// oder leere Pflichtfelder trägt. Fester Text: Payload-Inhalte (Aufgabentext,
+/// Serde-Details) erscheinen nie im Grund, der über MCP zurückgeht.
+const MALFORMED_TELEGRAM_PAYLOAD: &str = "telegram work request payload is malformed";
+
+// Ausführungspfad für genehmigte Telegram-Aufträge
+// (`harw_channel_telegram::TELEGRAM_WORK_REQUEST_JOB_KIND`).
+//
+// Reihenfolge, jeweils fail closed und ohne Modellaufruf bei Ablehnung:
+// 1. Zaun: Lease, Job-id und Tenant/Workspace wie bei Prompt-Jobs
+//    (`check_claim_fence`); eine Eingabe darf den Scope nicht umlenken
+//    (`check_input_declared_scope`). Die MCP-Einreicherprüfung entfällt: der
+//    Einreicher ist hier typischerweise ein `ChannelPeer`, dessen Auftrag im
+//    Telegram-Fluss geprüft und genehmigt wurde; `Custom`-Arten kann ein
+//    MCP-Client nicht einreichen.
+// 2. Payload: `crate::telegram_launcher::decode_payload`; eine fehlerhafte
+//    Payload oder ein leerer Aufgabentext ⇒ endgültiges `Failed`
+//    (`MALFORMED_TELEGRAM_PAYLOAD`), kein `Blocked` — ein erneuter Versuch
+//    kann dieselbe Payload nie reparieren.
+// 3. Turn: `run_prompt_turn` — exakt der Prompt-Job-Pfad (`JobEntry::Prompt`,
+//    Budget-Deckelung, Wanduhr, Runtime-Montage).
+async fn execute_telegram_work_claim(
+    claim: JobClaim,
+    input: serde_json::Value,
+    provider: Arc<dyn ModelProvider>,
+    job_store: Arc<JobStore>,
+    control: Arc<WorkerExecutionControl>,
+    context: &JobWorkerContext,
+) -> JobOutcome {
+    let work_id = claim.job.id.as_str().to_owned();
+
+    let fenced = check_claim_fence(&claim)
+        .and_then(|()| check_input_declared_scope(&claim.scope, &input))
+        .and_then(|()| telegram_submitter_id(claim.scope.submitter()));
+    let submitter_id = match fenced {
+        Ok(submitter_id) => submitter_id,
+        Err(reason) => {
+            tracing::warn!(work_id = %work_id, reason = %reason, "telegram work job rejected before any model call");
+            return JobOutcome::Failed { reason };
+        }
+    };
+
+    let payload = match telegram_payload_from_input(&input) {
+        Ok(payload) => payload,
+        Err(reason) => {
+            tracing::warn!(work_id = %work_id, "telegram work job carries a malformed payload");
+            return JobOutcome::Failed { reason };
+        }
+    };
+    tracing::info!(
+        work_id = %work_id,
+        request = %payload.work_id,
+        requested_by = %payload.requested_by,
+        "executing approved telegram work request"
+    );
+
+    run_prompt_turn(
+        claim,
+        &submitter_id,
+        payload.task,
+        provider,
+        job_store,
+        control,
+        context,
+    )
+    .await
+}
+
+// Dekodiert die Launcher-Payload aus der Job-Eingabe. Der Launcher legt die
+// Payload als JSON-Objekt ab; eine als JSON-Text gespeicherte Zeichenkette
+// wird ebenfalls akzeptiert. Pflichtfelder dürfen nicht leer sein; der
+// Aufgabentext wird getrimmt.
+fn telegram_payload_from_input(
+    input: &serde_json::Value,
+) -> Result<crate::telegram_launcher::TelegramWorkPayload, String> {
+    let bytes = match input {
+        serde_json::Value::String(text) => text.as_bytes().to_vec(),
+        other => serde_json::to_vec(other).map_err(|_| MALFORMED_TELEGRAM_PAYLOAD.to_owned())?,
+    };
+    let mut payload = crate::telegram_launcher::decode_payload(&bytes)
+        .map_err(|_| MALFORMED_TELEGRAM_PAYLOAD.to_owned())?;
+    let task = payload.task.trim();
+    if task.is_empty() || payload.work_id.trim().is_empty() {
+        return Err(MALFORMED_TELEGRAM_PAYLOAD.to_owned());
+    }
+    payload.task = task.to_owned();
+    Ok(payload)
+}
+
+// Principal-Kennung eines Telegram-Auftrags aus dem serverseitig aufgelösten
+// Einreicher des Job-Scopes — nie aus der Payload. Ein `ChannelPeer` wird als
+// `<channel>:<peer>` geführt.
+fn telegram_submitter_id(submitter: &harw_types::ApprovalActor) -> Result<String, String> {
+    match submitter {
+        harw_types::ApprovalActor::Operator { id } if is_scope_identifier(id) => Ok(id.clone()),
+        harw_types::ApprovalActor::ChannelPeer { channel, peer }
+            if is_scope_identifier(channel.as_str()) && is_scope_identifier(peer.as_str()) =>
+        {
+            Ok(format!("{}:{}", channel.as_str(), peer.as_str()))
+        }
+        _ => Err("scope: the job submitter is not a valid identity".to_owned()),
+    }
+}
+
+// Gemeinsamer Turn-Pfad für Prompt-Jobs und Telegram-Aufträge: Budget,
+// Wanduhr, Runtime-Montage (`JobEntry::Prompt`) und Ausführung. Aufrufer haben
+// Zaun und Eingabe bereits geprüft.
+async fn run_prompt_turn(
+    claim: JobClaim,
+    submitter_id: &str,
+    prompt: String,
+    provider: Arc<dyn ModelProvider>,
+    job_store: Arc<JobStore>,
+    control: Arc<WorkerExecutionControl>,
+    context: &JobWorkerContext,
+) -> JobOutcome {
+    let work_id = claim.job.id.as_str().to_owned();
+
     let budget = effective_prompt_budget(&claim.job.budget);
     let wall = match prompt_wall_allowance(
         &budget,
@@ -509,7 +671,7 @@ async fn execute_prompt_claim(
             entry: JobEntry::Prompt,
             home: &runtime_root.home,
             cwd: &runtime_root.cwd,
-            principal: job_principal(&submitter_id),
+            principal: job_principal(submitter_id),
             session_id: durable_session_id(&claim),
             state_store: job_state_store(&context.transcript_root),
             job_store,
@@ -586,18 +748,7 @@ fn check_prompt_claim_scope(
     input: &serde_json::Value,
     configured_submitters: &BTreeSet<String>,
 ) -> Result<(), String> {
-    if claim.lease.holder != WORKER_ID {
-        return Err("scope: the job lease is held by another worker".to_owned());
-    }
-    if claim.lease.work_id != claim.job.id || claim.token.work_id != claim.job.id {
-        return Err("scope: the job lease names another job".to_owned());
-    }
-    if !is_scope_identifier(claim.scope.tenant().as_str()) {
-        return Err("scope: the job tenant is not a valid identifier".to_owned());
-    }
-    if !is_scope_identifier(claim.scope.workspace().as_str()) {
-        return Err("scope: the job workspace is not a valid identifier".to_owned());
-    }
+    check_claim_fence(claim)?;
     match claim.scope.submitter() {
         harw_types::ApprovalActor::Operator { id } if is_scope_identifier(id) => {
             if !configured_submitters.contains(id) {
@@ -615,6 +766,26 @@ fn check_prompt_claim_scope(
         }
     }
     check_input_declared_scope(&claim.scope, input)
+}
+
+// Worker- und Scope-Zaun, den jeder Prompt-Turn (Prompt-Job wie
+// Telegram-Auftrag) vor jedem Modellaufruf besteht: der Claim gehört genau
+// diesem Worker und genau diesem Job, Tenant und Workspace sind gültige
+// Kennungen.
+fn check_claim_fence(claim: &JobClaim) -> Result<(), String> {
+    if claim.lease.holder != WORKER_ID {
+        return Err("scope: the job lease is held by another worker".to_owned());
+    }
+    if claim.lease.work_id != claim.job.id || claim.token.work_id != claim.job.id {
+        return Err("scope: the job lease names another job".to_owned());
+    }
+    if !is_scope_identifier(claim.scope.tenant().as_str()) {
+        return Err("scope: the job tenant is not a valid identifier".to_owned());
+    }
+    if !is_scope_identifier(claim.scope.workspace().as_str()) {
+        return Err("scope: the job workspace is not a valid identifier".to_owned());
+    }
+    Ok(())
 }
 
 // Eine Eingabe darf den Scope nicht umlenken: `tenant`, `workspace` oder ein
@@ -869,6 +1040,19 @@ impl ModelProvider for BudgetedModelProvider {
                 .map_err(harw_core::ModelError::RequestFailed)?;
             Ok::<harw_core::ModelResponse, harw_core::ModelError>(response)
         })
+    }
+
+    /// Reicht die gepinnte Modell-ID des umhüllten Providers durch.
+    ///
+    /// # Description
+    /// Das Budget begrenzt nur die Runden, nicht das angesprochene Modell;
+    /// ein Pin des inneren Providers darf hinter der Hülle nicht verloren
+    /// gehen.
+    ///
+    /// # Returns
+    /// `self.inner.pinned_model_id()`.
+    fn pinned_model_id(&self) -> Option<String> {
+        self.inner.pinned_model_id()
     }
 }
 
@@ -2430,6 +2614,126 @@ mod tests {
             "etwas-anderes".to_owned()
         )));
         assert!(!is_supported_kind(&JobKind::Custom(String::new())));
+    }
+
+    #[test]
+    fn test_is_supported_kind_accepts_the_telegram_work_request_kind() {
+        let telegram =
+            JobKind::Custom(harw_channel_telegram::TELEGRAM_WORK_REQUEST_JOB_KIND.to_owned());
+        assert!(is_supported_kind(&telegram));
+        assert!(is_telegram_work_kind(&telegram));
+        assert!(!is_plan_node_kind(&telegram));
+        assert!(!is_telegram_work_kind(&JobKind::Worker));
+        assert!(!is_telegram_work_kind(&JobKind::Custom(
+            PLAN_NODE_JOB_KIND.to_owned()
+        )));
+        assert!(!is_telegram_work_kind(&JobKind::Custom(
+            "telegram_work_request".to_owned()
+        )));
+    }
+
+    // ── Telegram work requests ────────────────────────────────────────────
+
+    fn telegram_kind() -> JobKind {
+        JobKind::Custom(harw_channel_telegram::TELEGRAM_WORK_REQUEST_JOB_KIND.to_owned())
+    }
+
+    // Die exakte Eingabe, die der Launcher über `encode_payload` erzeugt.
+    fn telegram_input(task: &str) -> TestResult<serde_json::Value> {
+        let payload = crate::telegram_launcher::TelegramWorkPayload {
+            work_id: "wr-1".to_owned(),
+            task: task.to_owned(),
+            requested_by: "telegram:peer-1".to_owned(),
+        };
+        let bytes =
+            crate::telegram_launcher::encode_payload(&payload).map_err(ctx("encode payload"))?;
+        serde_json::from_slice(&bytes).map_err(ctx("payload as json value"))
+    }
+
+    // Ein Telegram-Auftrag mit `ChannelPeer`-Einreicher, wie ihn der Launcher
+    // zulässt.
+    fn telegram_record(id: &str, input: serde_json::Value) -> TestResult<StoredJob> {
+        let mut record = ready_record_of_kind(id, telegram_kind(), input)?;
+        record.scope = JobScope::new(
+            TenantId::from_str("tenant"),
+            WorkspaceId::from_str("workspace"),
+            ApprovalActor::ChannelPeer {
+                channel: harw_types::ChannelId::from_str("telegram"),
+                peer: harw_types::PeerId::from_str("peer-1"),
+            },
+        );
+        Ok(record)
+    }
+
+    #[test]
+    fn test_telegram_payload_from_input_rejects_malformed_payloads() -> TestResult {
+        for input in [
+            serde_json::json!({"unexpected": true}),
+            serde_json::json!("not json"),
+            serde_json::json!(42),
+            telegram_input("   ")?,
+        ] {
+            assert_eq!(
+                telegram_payload_from_input(&input),
+                Err(MALFORMED_TELEGRAM_PAYLOAD.to_owned())
+            );
+        }
+        let payload = telegram_payload_from_input(&telegram_input("  fix it  ")?)
+            .map_err(TestError::Unexpected)?;
+        assert_eq!(payload.task, "fix it");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_telegram_work_job_with_malformed_payload_fails_without_model_call() -> TestResult
+    {
+        let temp = temp_dir()?;
+        let store = Arc::new(JobStore::new(temp.path()));
+        admit(
+            &store,
+            &telegram_record("tg-bad", serde_json::json!({"prompt": "hello"}))?,
+        )?;
+        let provider = Arc::new(RecordingModelProvider::new());
+        let completed = run_job_worker_once(
+            Arc::clone(&store),
+            Arc::new(JobExecutionRegistry::new()),
+            Arc::clone(&provider) as Arc<dyn ModelProvider>,
+            None,
+            job_context(temp.path())?,
+        )
+        .await;
+        assert_eq!(completed, 1);
+        assert!(provider.recorded().is_empty());
+        assert_eq!(
+            completion_of(&store, "tg-bad")?,
+            JobOutcome::Failed {
+                reason: MALFORMED_TELEGRAM_PAYLOAD.to_owned()
+            }
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_telegram_work_job_runs_the_task_as_a_prompt_turn() -> TestResult {
+        let temp = temp_dir()?;
+        let store = Arc::new(JobStore::new(temp.path()));
+        admit(&store, &telegram_record("tg-ok", telegram_input("hello")?)?)?;
+        let completed = run_job_worker_once(
+            Arc::clone(&store),
+            Arc::new(JobExecutionRegistry::new()),
+            Arc::new(EchoModelProvider::new("telegram done")),
+            None,
+            job_context(temp.path())?,
+        )
+        .await;
+        assert_eq!(completed, 1);
+        let JobOutcome::Succeeded { result } = completion_of(&store, "tg-ok")? else {
+            return Err(TestError::Unexpected(
+                "approved telegram work job should durably succeed".into(),
+            ));
+        };
+        assert_eq!(result["assistant"], "telegram done");
+        Ok(())
     }
 
     #[test]

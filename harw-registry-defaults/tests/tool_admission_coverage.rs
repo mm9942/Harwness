@@ -49,7 +49,9 @@
 use std::collections::{BTreeSet, HashMap};
 
 use harw_registry_defaults::embedded_agents::builtin_agent_definitions;
-use harw_registry_defaults::profile::{RegistryProfile, profile_for_role, role_names};
+use harw_registry_defaults::profile::{
+    RegistryProfile, composition_tools_for_role, profile_for_role, role_names,
+};
 
 mod common;
 use common::{TestError, TestResult, ctx};
@@ -80,7 +82,15 @@ fn every_role_admitted_tool_is_registered_by_its_profile() -> TestResult {
         let profile = profile_for_role(role).ok_or(TestError::Unexpected(format!(
             "eingebaute Rolle {role} braucht ein Profil"
         )))?;
-        let advertised: BTreeSet<&str> = profile.tool_names().into_iter().collect();
+        // Plan Punkt 1: Orchestratoren admittieren zusätzlich die Werkzeuge,
+        // die die Composition-Root für sie beisteuert (`delegate_wave`) —
+        // sie gehören zu keinem `RegistryProfile`, sind aber ebenso wenig
+        // toter Text (siehe `profile::composition_tools_for_role`).
+        let advertised: BTreeSet<&str> = profile
+            .tool_names()
+            .into_iter()
+            .chain(composition_tools_for_role(role).iter().copied())
+            .collect();
 
         for admitted in ir.tool_surface().admitted() {
             assert!(
@@ -123,7 +133,33 @@ fn every_profile_registered_tool_is_admitted_by_its_role() -> TestResult {
             .map(String::as_str)
             .collect();
 
+        let forbidden: BTreeSet<&str> = ir
+            .tool_surface()
+            .forbidden()
+            .iter()
+            .map(String::as_str)
+            .collect();
+
         for tool in profile.tool_names() {
+            // Einzige dokumentierte Ausnahme: das Explorer-Netz
+            // (`web.fetch`/`web.search`, Nutzerentscheidung „der Explorer
+            // durchsucht auch das Internet“) hängt am geteilten Profil
+            // `ReadOnlyExplore`. `analyst`/`researcher-deps` teilen dieses
+            // Profil, sollen aber kein Netz bekommen — sie müssen beide
+            // Werkzeuge deshalb **ausdrücklich** verbieten (die Aktivierung
+            // schaltet `forbidden` ab), statt sie nur stillschweigend
+            // wegzulassen, und der `explorer` muss sie admittieren.
+            let is_explorer_web_on_shared_profile = profile == RegistryProfile::ReadOnlyExplore
+                && ["web.fetch", "web.search"].contains(&tool)
+                && *role != role_names::EXPLORER;
+            if is_explorer_web_on_shared_profile {
+                assert!(
+                    forbidden.contains(tool),
+                    "Rolle {role} teilt ReadOnlyExplore mit dem explorer und muss \
+                     {tool} ausdrücklich verbieten"
+                );
+                continue;
+            }
             assert!(
                 admitted.contains(tool),
                 "Rolle {role} ({profile:?}) sieht {tool} in ihrem beworbenen \
@@ -270,5 +306,113 @@ fn agent_steward_admits_the_commit_mode_tool_set_even_though_two_tools_are_mode_
 #[test]
 fn agent_definition_tool_provider_without_access_registers_only_read_and_list_tools() {
     let names = harw_registry_defaults::agent_definition_tool_names_for_access(None);
-    assert_eq!(names, vec!["agents.validate", "agents.list_proposals"]);
+    assert_eq!(
+        names,
+        vec![
+            "agents.validate",
+            "agents.list_proposals",
+            "skills.validate",
+            "skills.list_proposals",
+        ]
+    );
+}
+
+/// Nutzerentscheidung „die UIA-Helfer recherchieren kurz online und fügen
+/// manchmal Abhängigkeiten hinzu“: `uia-worker` und `uia-writer` admittieren
+/// alle vier `web.*`-Werkzeuge (`web.fetch`/`web.search` plus die
+/// Crate-Werkzeuge `web.docs_rs`/`web.crates_io`, `UIA_HELPER_WEB_TOOLS`) und
+/// die fünf lesenden `deps.*`-Werkzeuge — und ihr Profil (`UiaQuickHelper`
+/// bzw. `UiaWriter`) registriert/bewirbt genau diese auch, sonst wäre der
+/// TOML-Eintrag toter Text. `lens.ask` bleibt beiden verboten; das Netz
+/// selbst bindet weiterhin die Egress-Policy des Elternteils.
+#[test]
+fn uia_helpers_admit_and_register_web_search_and_read_only_deps_tools() -> TestResult {
+    let roles = resolved_roles()?;
+    const RESEARCH_TOOLS: [&str; 9] = [
+        "web.fetch",
+        "web.docs_rs",
+        "web.crates_io",
+        "web.search",
+        "deps.graph",
+        "deps.locked",
+        "deps.source_read",
+        "deps.source_search",
+        "deps.source_list",
+    ];
+    for (role, expected_profile) in [
+        (role_names::UIA_WORKER, RegistryProfile::UiaQuickHelper),
+        (role_names::UIA_WRITER, RegistryProfile::UiaWriter),
+    ] {
+        let ir = roles
+            .get(role)
+            .ok_or(TestError::Unexpected(format!("{role} fehlt")))?;
+        let profile =
+            profile_for_role(role).ok_or(TestError::Unexpected(format!("{role} ohne Profil")))?;
+        assert_eq!(profile, expected_profile, "{role}");
+        let advertised: BTreeSet<&str> = profile.tool_names().into_iter().collect();
+        let admitted: BTreeSet<&str> = ir
+            .tool_surface()
+            .admitted()
+            .iter()
+            .map(String::as_str)
+            .collect();
+        let forbidden: BTreeSet<&str> = ir
+            .tool_surface()
+            .forbidden()
+            .iter()
+            .map(String::as_str)
+            .collect();
+        for tool in RESEARCH_TOOLS {
+            assert!(admitted.contains(tool), "{role} muss {tool} admittieren");
+            assert!(
+                advertised.contains(tool),
+                "{profile:?} muss {tool} registrieren"
+            );
+            assert!(!forbidden.contains(tool), "{role} verbietet {tool}");
+        }
+        assert!(!admitted.contains("lens.ask"), "{role} admittiert lens.ask");
+        assert!(
+            !advertised.contains("lens.ask"),
+            "{profile:?} registriert lens.ask"
+        );
+        assert!(
+            forbidden.contains("lens.ask"),
+            "{role} muss lens.ask verbieten"
+        );
+    }
+    Ok(())
+}
+
+/// Plan Punkt 1: jede Orchestrator-Rolle admittiert die Werkzeuge, die die
+/// Composition-Root für sie beisteuert (`delegate_wave`) — sonst hängt die
+/// Kind-Registry einen Provider an, dessen Werkzeug die `SessionActivation`
+/// (deny-by-default aus `admitted`) nie freischaltet. Umgekehrt admittiert
+/// kein Worker ein solches Werkzeug.
+#[test]
+fn orchestrators_admit_exactly_their_composition_tools() -> TestResult {
+    let roles = resolved_roles()?;
+    for role in role_names::ALL {
+        let ir = roles
+            .get(*role)
+            .ok_or(TestError::Unexpected(format!("{role} fehlt")))?;
+        let admitted: BTreeSet<&str> = ir
+            .tool_surface()
+            .admitted()
+            .iter()
+            .map(String::as_str)
+            .collect();
+        let granted = composition_tools_for_role(role);
+        for tool in granted {
+            assert!(admitted.contains(tool), "{role} muss {tool} admittieren");
+        }
+        for tool in harw_registry_defaults::profile::ORCHESTRATION_TOOLS {
+            if !granted.contains(tool) {
+                assert!(
+                    !admitted.contains(tool),
+                    "{role} ist kein Orchestrator und darf {tool} nicht admittieren"
+                );
+            }
+        }
+    }
+    Ok(())
 }

@@ -309,16 +309,25 @@ mod tests {
     use harw_authority::NetworkScope;
     use harw_dod_rules::rule::{Rule, RuleContext};
     use harw_dod_rules::rules::EgressFlowRule;
-    use harw_dod_rules::{run_rules, triage};
+    use harw_dod_rules::{run_rules, triaged_finding_for_test};
     use harw_dod_signals::{EventKind, SecurityEvent};
-    use harw_types::{CgroupId, SensorId};
+    use harw_types::{CgroupId, FindingId, SensorId};
 
     // Die Testfaelle unten binden `RuleContext`-Werte an den lokalen Namen
     // `ctx` (Vorbild fuer echten Aufrufcode) -- der Test-Helfer `ctx()` wird
     // dort deshalb voll qualifiziert aufgerufen, um die Verschattung zu
     // vermeiden (siehe Worker-Zusatz).
 
-    fn confirmed_finding() -> TestResult<Finding<Triaged>> {
+    /// Wertet `EgressFlowRule` ueber die oeffentliche Regel-Pipeline aus und
+    /// triagiert den ausgeloesten Befund mit `verdict`.
+    ///
+    /// `run_rules` liefert seit der Umstellung `Finding<Raw>`; der Uebergang
+    /// `Raw -> RuleChecked` ist in `harw-dod-rules` `pub(crate)`. Der Test
+    /// traegt die Felder des echten Regelbefundes deshalb ueber die dafuer
+    /// vorgesehene Testhilfe `triaged_finding_for_test` (Feature
+    /// `test-support`) in einen `Finding<Triaged>` -- derselbe interne Pfad
+    /// `Finding::raw(..).check(id)` plus `triage`.
+    fn triaged_from_rule(verdict: Verdict) -> TestResult<Finding<Triaged>> {
         let scope = NetworkScope::from_hosts(["docs.rs".to_owned()]);
         let events = vec![SecurityEvent {
             sensor: SensorId::from_str("net-0"),
@@ -336,13 +345,24 @@ mod tests {
             baselines: &[],
             network_scope: &scope,
         };
-        let rule: &dyn Rule = &EgressFlowRule;
-        let checked = run_rules(&[rule], &ctx);
-        let finding = checked
+        let raw = run_rules(&ctx)
             .into_iter()
-            .next()
+            .find(|finding| finding.rule_id() == EgressFlowRule.id())
             .ok_or(TestError::Missing("EgressFlowRule löst aus"))?;
-        Ok(triage(finding, Verdict::Confirmed))
+        Ok(triaged_finding_for_test(
+            raw.rule_id(),
+            raw.kind(),
+            raw.severity(),
+            raw.hardness(),
+            raw.summary(),
+            raw.observed_at(),
+            FindingId::new(),
+            verdict,
+        ))
+    }
+
+    fn confirmed_finding() -> TestResult<Finding<Triaged>> {
+        triaged_from_rule(Verdict::Confirmed)
     }
 
     fn actor() -> ApprovalActor {
@@ -363,32 +383,7 @@ mod tests {
 
     #[test]
     fn test_authorize_rejects_unconfirmed_verdict() -> TestResult {
-        let finding = {
-            let scope = NetworkScope::from_hosts(["docs.rs".to_owned()]);
-            let events = vec![SecurityEvent {
-                sensor: SensorId::from_str("net-0"),
-                observed_at: jiff::Timestamp::UNIX_EPOCH,
-                actor: None,
-                kind: EventKind::EgressFlow {
-                    destination: "evil.example.com".to_owned(),
-                    port: 443,
-                },
-            }];
-            let ctx = RuleContext {
-                now: jiff::Timestamp::UNIX_EPOCH,
-                samples: &[],
-                events: &events,
-                baselines: &[],
-                network_scope: &scope,
-            };
-            let rule: &dyn Rule = &EgressFlowRule;
-            let checked = run_rules(&[rule], &ctx);
-            let finding = checked
-                .into_iter()
-                .next()
-                .ok_or(TestError::Missing("EgressFlowRule löst aus"))?;
-            triage(finding, Verdict::NeedsReview)
-        };
+        let finding = triaged_from_rule(Verdict::NeedsReview)?;
         let proposed = Action::propose(ProposedAction::FreezeCgroup {
             cgroup: CgroupId::try_from_str("cgroup-1")
                 .map_err(crate::test_support::ctx("CgroupId parsen"))?,

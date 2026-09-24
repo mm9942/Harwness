@@ -23,7 +23,8 @@
 //!     das Hauptmodell → [`InternalModelSource::MainModel`];
 //! (c) nur für [`InternalModelPoint::SessionTitle`]: fehlt jeder Eintrag, aber
 //!     das Legacy-Feld `session.title_model` ist gesetzt → `Explicit`;
-//! (d) `use_openrouter_defaults && `[`openrouter_available`] → `OpenRouterDefault`
+//! (d) nur für Stellen mit [`InternalModelPoint::uses_openrouter_default`]:
+//!     `use_openrouter_defaults && `[`openrouter_available`] → `OpenRouterDefault`
 //!     (Provider `"openrouter"`, Modell aus [`InternalModelPoint::openrouter_default_model`]);
 //! (e) sonst `MainModel` mit `provider`/`model` beide `None`.
 
@@ -50,11 +51,17 @@ pub enum InternalModelPoint {
     /// Worker-Kind mit komplexer Aufgabe, auch wenn klein (Addendum D+E:
     /// `TaskComplexity::Complex` oder unbekannt).
     WorkerComplex,
+    /// Wurzel-Orchestrator (oberste Orchestrator-Rolle). Ohne explizite Wahl
+    /// gilt das Hauptmodell — kein OpenRouter-Standard.
+    RootOrchestrator,
+    /// Unter-Orchestrator (von einem Orchestrator gestarteter Orchestrator).
+    /// Ohne explizite Wahl gilt das Hauptmodell — kein OpenRouter-Standard.
+    SubOrchestrator,
 }
 
 impl InternalModelPoint {
     /// Alle Stellen in stabiler Reihenfolge (u. a. für Iteration/Merge).
-    pub const ALL: [InternalModelPoint; 8] = [
+    pub const ALL: [InternalModelPoint; 10] = [
         InternalModelPoint::SessionTitle,
         InternalModelPoint::CompactionSummary,
         InternalModelPoint::MemoryConsolidation,
@@ -63,6 +70,8 @@ impl InternalModelPoint {
         InternalModelPoint::Research,
         InternalModelPoint::WorkerSimple,
         InternalModelPoint::WorkerComplex,
+        InternalModelPoint::RootOrchestrator,
+        InternalModelPoint::SubOrchestrator,
     ];
 
     /// TOML-/Config-Schlüssel dieser Stelle, z. B. `"session_title"`.
@@ -77,6 +86,8 @@ impl InternalModelPoint {
             Self::Research => "research",
             Self::WorkerSimple => "worker_simple",
             Self::WorkerComplex => "worker_complex",
+            Self::RootOrchestrator => "root_orchestrator",
+            Self::SubOrchestrator => "sub_orchestrator",
         }
     }
 
@@ -109,7 +120,19 @@ impl InternalModelPoint {
             Self::Research => "Recherchiert externe Quellen (Web/Dokumentation).",
             Self::WorkerSimple => "Worker-Kind mit einfacher Aufgabe.",
             Self::WorkerComplex => "Worker-Kind mit komplexer Aufgabe (auch wenn klein).",
+            Self::RootOrchestrator => "Wurzel-Orchestrator, der die Arbeit plant und verteilt.",
+            Self::SubOrchestrator => "Unter-Orchestrator, der Teilaufgaben weiter verteilt.",
         }
+    }
+
+    /// `true`, wenn diese Stelle ohne explizite Wahl auf den
+    /// OpenRouter-Nemotron-Standard fallen darf (Schritt (d) der Auflösung).
+    ///
+    /// Für die Orchestrator-Stellen `false`: Orchestratoren nutzen ohne
+    /// explizite Wahl immer das Hauptmodell.
+    #[must_use]
+    pub fn uses_openrouter_default(self) -> bool {
+        !matches!(self, Self::RootOrchestrator | Self::SubOrchestrator)
     }
 
     /// NVIDIA-Nemotron-Standardmodell dieser Stelle über OpenRouter.
@@ -117,13 +140,18 @@ impl InternalModelPoint {
     /// Live verifiziert (OpenRouter `/api/v1/models`, 2026-09-15):
     /// `nvidia/nemotron-3-super-120b-a12b` für rechercheintensive Stellen
     /// (Explorer, Research), sonst das leichtere
-    /// `nvidia/nemotron-3.5-lightning`.
+    /// `nvidia/nemotron-3.5-lightning`. Die Orchestrator-Stellen nutzen den
+    /// Standard nie (siehe [`Self::uses_openrouter_default`]); für sie liefert
+    /// diese Funktion der Vollständigkeit halber das Modell von
+    /// [`Self::WorkerComplex`].
     #[must_use]
     pub fn openrouter_default_model(self) -> &'static str {
         match self {
-            Self::Explorer | Self::Research | Self::WorkerComplex => {
-                "nvidia/nemotron-3-super-120b-a12b"
-            }
+            Self::Explorer
+            | Self::Research
+            | Self::WorkerComplex
+            | Self::RootOrchestrator
+            | Self::SubOrchestrator => "nvidia/nemotron-3-super-120b-a12b",
             Self::SessionTitle
             | Self::CompactionSummary
             | Self::MemoryConsolidation
@@ -178,6 +206,10 @@ pub struct InternalModelsToml {
     pub worker_simple: Option<InternalModelChoice>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub worker_complex: Option<InternalModelChoice>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub root_orchestrator: Option<InternalModelChoice>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sub_orchestrator: Option<InternalModelChoice>,
 }
 
 impl Default for InternalModelsToml {
@@ -192,6 +224,8 @@ impl Default for InternalModelsToml {
             research: None,
             worker_simple: None,
             worker_complex: None,
+            root_orchestrator: None,
+            sub_orchestrator: None,
         }
     }
 }
@@ -209,6 +243,8 @@ impl InternalModelsToml {
             InternalModelPoint::Research => self.research.as_ref(),
             InternalModelPoint::WorkerSimple => self.worker_simple.as_ref(),
             InternalModelPoint::WorkerComplex => self.worker_complex.as_ref(),
+            InternalModelPoint::RootOrchestrator => self.root_orchestrator.as_ref(),
+            InternalModelPoint::SubOrchestrator => self.sub_orchestrator.as_ref(),
         }
     }
 
@@ -223,6 +259,8 @@ impl InternalModelsToml {
             InternalModelPoint::Research => self.research = choice,
             InternalModelPoint::WorkerSimple => self.worker_simple = choice,
             InternalModelPoint::WorkerComplex => self.worker_complex = choice,
+            InternalModelPoint::RootOrchestrator => self.root_orchestrator = choice,
+            InternalModelPoint::SubOrchestrator => self.sub_orchestrator = choice,
         }
     }
 }
@@ -319,7 +357,10 @@ pub fn resolve_internal_model(
         }
     }
 
-    if internal_models.use_openrouter_defaults && openrouter_available(config) {
+    if point.uses_openrouter_default()
+        && internal_models.use_openrouter_defaults
+        && openrouter_available(config)
+    {
         return ResolvedInternalModel {
             point,
             provider: Some(OPENROUTER_PROVIDER.to_owned()),
@@ -481,6 +522,66 @@ mod tests {
         // für SessionTitle.
         let resolved = resolve_internal_model(&config, InternalModelPoint::Research);
         assert_eq!(resolved.source, InternalModelSource::MainModel);
+    }
+
+    #[test]
+    fn test_orchestrator_points_use_main_model_even_with_openrouter() -> TestResult {
+        let config = config_with_openrouter(true, true)?;
+        assert!(openrouter_available(&config));
+        for point in [
+            InternalModelPoint::RootOrchestrator,
+            InternalModelPoint::SubOrchestrator,
+        ] {
+            assert!(!point.uses_openrouter_default());
+            let resolved = resolve_internal_model(&config, point);
+            assert_eq!(resolved.source, InternalModelSource::MainModel);
+            assert!(resolved.provider.is_none());
+            assert!(resolved.model.is_none());
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn test_orchestrator_explicit_choice_wins() -> TestResult {
+        let mut config = config_with_openrouter(true, true)?;
+        config.harness.internal_models.set_choice(
+            InternalModelPoint::SubOrchestrator,
+            Some(InternalModelChoice {
+                provider: Some("anthropic".to_owned()),
+                model: Some("claude-sonnet".to_owned()),
+            }),
+        );
+        let resolved = resolve_internal_model(&config, InternalModelPoint::SubOrchestrator);
+        assert_eq!(resolved.source, InternalModelSource::Explicit);
+        assert_eq!(resolved.provider.as_deref(), Some("anthropic"));
+        assert_eq!(resolved.model.as_deref(), Some("claude-sonnet"));
+        // Die andere Orchestrator-Stelle bleibt unberührt.
+        let root = resolve_internal_model(&config, InternalModelPoint::RootOrchestrator);
+        assert_eq!(root.source, InternalModelSource::MainModel);
+        Ok(())
+    }
+
+    #[test]
+    fn test_all_points_have_unique_keys_and_roundtrip() {
+        assert_eq!(InternalModelPoint::ALL.len(), 10);
+        for point in InternalModelPoint::ALL {
+            assert_eq!(InternalModelPoint::parse(point.key()), Some(point));
+            let mut toml = InternalModelsToml::default();
+            let choice = InternalModelChoice {
+                provider: None,
+                model: Some(point.key().to_owned()),
+            };
+            toml.set_choice(point, Some(choice.clone()));
+            assert_eq!(toml.choice(point), Some(&choice));
+        }
+        assert_eq!(
+            InternalModelPoint::parse("root-orchestrator"),
+            Some(InternalModelPoint::RootOrchestrator)
+        );
+        assert_eq!(
+            InternalModelPoint::parse("sub_orchestrator"),
+            Some(InternalModelPoint::SubOrchestrator)
+        );
     }
 
     #[test]

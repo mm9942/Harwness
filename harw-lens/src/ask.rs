@@ -46,7 +46,7 @@
 use std::path::Path;
 
 use harw_lens_embed::{Embedder, EmbeddingDescriptor};
-use harw_lens_query::{query_scoped, IndexSelector, QueryProvenance, ReadScope};
+use harw_lens_query::{IndexSelector, QueryProvenance, ReadScope, query_scoped};
 use harw_lens_types::{CollapsePolicy, EdgeIndex, Ranked};
 
 use crate::LensResult;

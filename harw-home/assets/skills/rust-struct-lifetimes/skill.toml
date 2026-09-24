@@ -1,0 +1,5 @@
+name = "rust-struct-lifetimes"
+description = "Use when defining a struct that holds a reference field, or when a function may return borrowed or owned data — teaches `struct Foo<'a>` lifetime parameters and `Cow<'a, T>` as the borrow-or-own edge case (Rust Edition 2024)"
+enabled = true
+instructions_file = "instructions.md"
+tools = ["filesystem.read"]

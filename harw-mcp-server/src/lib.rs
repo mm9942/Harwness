@@ -31,9 +31,7 @@ pub use supervisor::{
     McpRequestContext, McpSupervisor, McpSupervisorError, UnavailableWorkerCancellationSink,
     WorkerCancellationSink, WorkerCancellationStatus,
 };
-pub use transport::{
-    BoundMcpListener, DuplicatePrincipalId, McpListenerConfig, PrincipalRegistry,
-};
+pub use transport::{BoundMcpListener, DuplicatePrincipalId, McpListenerConfig, PrincipalRegistry};
 
 /// The MCP operation surface that can honestly be advertised by a listener
 /// composition.

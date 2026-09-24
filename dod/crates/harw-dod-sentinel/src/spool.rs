@@ -895,19 +895,36 @@ mod tests {
     use super::*;
     use std::os::unix::fs::PermissionsExt;
 
-    use harw_authority::NetworkScope;
-    use harw_dod_rules::rule::{Rule, RuleContext};
-    use harw_dod_rules::rules::StructureDriftRule;
-    use harw_dod_rules::run_rules;
-    use harw_dod_signals::{DriftSeverity, EventKind, SecurityEvent, SecurityEvidence};
+    use harw_code_graph::lockfile::LockedPackage;
+    use harw_dod_rules::advisory::{Advisory, correlate_advisories};
+    use harw_dod_signals::{DriftSeverity, EventKind, SecurityEvent, SecurityEvidence, Severity};
     use harw_types::SensorId;
     use jiff::Timestamp;
+    use semver::VersionReq;
 
     use crate::test_support::{TestError, TestResult, ctx};
 
-    // Erzeugt `n` echte Records über die öffentliche Regel-Pipeline (die
-    // einzige Prägestelle für `Finding<RuleChecked>` außerhalb der Crate).
+    // Erzeugt `n` echte Records über die öffentliche Advisory-Korrelation
+    // (neben `run_rules_checked` eine der beiden öffentlichen Prägestellen
+    // für `Finding<RuleChecked>`; sie erlaubt hier `n` unterscheidbare
+    // Befunde).
     fn records(n: usize, detail: &str) -> TestResult<Vec<FindingRecord>> {
+        let locked = vec![LockedPackage {
+            name: "example-crate".to_owned(),
+            version: "1.9.0".to_owned(),
+            source: None,
+            checksum: None,
+        }];
+        let range = VersionReq::parse("<1.10.0").map_err(ctx("version range parses"))?;
+        let advisories: Vec<Advisory> = (0..n)
+            .map(|i| Advisory {
+                id: format!("RUSTSEC-2024-{i:04}"),
+                crate_name: "example-crate".to_owned(),
+                vulnerable_ranges: vec![range.clone()],
+                severity: Severity::High,
+                summary: format!("{detail} #{i}"),
+            })
+            .collect();
         let events: Vec<SecurityEvent> = (0..n)
             .map(|i| SecurityEvent {
                 sensor: SensorId::from_str("workspace-0"),
@@ -919,30 +936,21 @@ mod tests {
                 },
             })
             .collect();
-        let scope = NetworkScope::empty();
-        let rule_ctx = RuleContext {
-            now: Timestamp::UNIX_EPOCH,
-            samples: &[],
-            events: &events,
-            baselines: &[],
-            network_scope: &scope,
-        };
-        let rule: &dyn Rule = &StructureDriftRule;
-        let evidence = SecurityEvidence::capture(vec![], events.clone(), Timestamp::UNIX_EPOCH)
+        let evidence = SecurityEvidence::capture(vec![], events, Timestamp::UNIX_EPOCH)
             .map_err(ctx("test evidence encodes"))?;
-        Ok(run_rules(&[rule], &rule_ctx)
-            .iter()
-            .map(|finding| finding.record(evidence.clone()))
-            .collect())
+        Ok(
+            correlate_advisories(&advisories, &locked, Timestamp::UNIX_EPOCH)
+                .iter()
+                .map(|finding| finding.record(evidence.clone()))
+                .collect(),
+        )
     }
 
     fn one_record() -> TestResult<FindingRecord> {
         records(1, "unexpected setuid binary")?
             .into_iter()
             .next()
-            .ok_or(TestError::Missing(
-                "StructureDriftRule fires for a high drift event",
-            ))
+            .ok_or(TestError::Missing("advisory matches the locked version"))
     }
 
     fn spool_dir(root: &tempfile::TempDir) -> PathBuf {

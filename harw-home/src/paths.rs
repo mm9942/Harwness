@@ -11,6 +11,10 @@
 //!   falls gesetzt, auf ein existierendes Verzeichnis zeigen.
 //! - `HARW_PROFILE`: Name des aktiven Profils (überschreibt `active_profile`).
 //!
+//! Ein prozessweiter Profil-Override ([`set_profile_override`], z. B. aus
+//! `--profile`) hat Vorrang vor `HARW_PROFILE`; er ersetzt das Setzen der
+//! Umgebungsvariablen, das ohne `unsafe` nicht möglich ist.
+//!
 //! # Verzeichnisse des Ausbauprogramms AW0–AW7
 //! Mehrere Teilsysteme des Ausbauprogramms legen Dateien unterhalb des
 //! Root-Space ab; ihre Pfade sind hier benannt, damit der Speicherort aus dem
@@ -31,6 +35,7 @@
 //!   Index (kein Filter auf einem gemeinsamen Index).
 
 use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
 
 use crate::error::{HomeError, HomeResult};
 use crate::trust::{TrustStatus, project_trust_status};
@@ -70,12 +75,62 @@ pub fn home_dir() -> HomeResult<PathBuf> {
     }
 }
 
+/// Prozessweiter Profil-Override (siehe [`set_profile_override`]).
+static PROFILE_OVERRIDE: OnceLock<String> = OnceLock::new();
+
+/// Setzt das aktive Profil prozessweit, mit Vorrang vor `HARW_PROFILE`.
+///
+/// # Beschreibung
+/// Gedacht für einen expliziten Profilwunsch des Aufrufers (etwa
+/// `--profile NAME`), bevor irgendein Pfad aufgelöst wird. Der Name wird wie
+/// ein Wert aus `HARW_PROFILE` behandelt: Leerraum am Rand wird entfernt, und
+/// er muss ein gültiger Profilname sein (`[A-Za-z0-9_-]+`). Der Override lässt
+/// sich genau einmal festlegen; ein erneuter Aufruf mit demselben Namen ist
+/// wirkungslos und erfolgreich.
+///
+/// # Argumente
+/// - `name` (`String`): gewünschter Profilname.
+///
+/// # Errors
+/// [`HomeError::InvalidProfileName`], wenn `name` leer oder ungültig ist oder
+/// bereits ein **anderer** Override gesetzt wurde (der Fehler nennt dann den
+/// abgelehnten neuen Namen).
+///
+/// # Nebenläufigkeit
+/// Threadsicher über [`OnceLock`]; konkurrierende Aufrufe mit
+/// unterschiedlichen Namen: genau einer gewinnt, die übrigen erhalten einen
+/// Fehler.
+pub fn set_profile_override(name: String) -> HomeResult<()> {
+    set_profile_override_in(&PROFILE_OVERRIDE, name)
+}
+
+/// Kern von [`set_profile_override`] über eine explizite Zelle (testbar ohne
+/// den prozessweiten Zustand zu verändern).
+fn set_profile_override_in(cell: &OnceLock<String>, name: String) -> HomeResult<()> {
+    let trimmed = name.trim();
+    if trimmed.is_empty() || !is_valid_profile_name(trimmed) {
+        return Err(HomeError::InvalidProfileName { name });
+    }
+    let stored = cell.get_or_init(|| trimmed.to_owned());
+    if stored == trimmed {
+        Ok(())
+    } else {
+        Err(HomeError::InvalidProfileName {
+            name: trimmed.to_owned(),
+        })
+    }
+}
+
 /// Ermittelt den Namen des aktiven Profils.
 ///
-/// Präzedenz: `HARW_PROFILE` → Inhalt der `active_profile`-Datei → `default`.
+/// Präzedenz: Override aus [`set_profile_override`] → `HARW_PROFILE` →
+/// Inhalt der `active_profile`-Datei → `default`.
 /// Diese Funktion liest höchstens eine kleine Textdatei und legt nichts an.
 #[must_use]
 pub fn active_profile_name(home: &Path) -> String {
+    if let Some(name) = PROFILE_OVERRIDE.get() {
+        return name.clone();
+    }
     if let Some(name) = std::env::var(HARW_PROFILE_ENV)
         .ok()
         .map(|value| value.trim().to_owned())
@@ -137,18 +192,13 @@ pub fn cache_dir(home: &Path) -> PathBuf {
     home.join("cache")
 }
 
-/// Durable-Job-Verzeichnis (bestehendes `JobStore`-Layout).
-#[must_use]
-pub fn jobs_dir(home: &Path) -> PathBuf {
-    home.join("jobs")
-}
-
 /// Verzeichnis der persistierten Plan-Graphen.
 ///
-/// Root-bezogen (analog zu [`jobs_dir`]/[`cache_dir`], nicht profilbezogen):
-/// Aufrufer, die einen profil-lokalen Plan-Space brauchen, reichen bereits
-/// den per [`profile_dir`] aufgelösten Pfad als `home` hinein — genau wie es
-/// `harw-cli` heute schon mit `jobs_dir`/`JobStore` handhabt.
+/// Root-bezogen (analog zu [`cache_dir`], nicht profilbezogen): Aufrufer, die
+/// einen profil-lokalen Plan-Space brauchen, reichen bereits den per
+/// [`profile_dir`] aufgelösten Pfad als `home` hinein — genau wie `harw-cli`
+/// den `JobStore` mit dem Profilverzeichnis als Root öffnet (Jobs liegen
+/// unter `profiles/<name>/jobs`, nicht unter `<home>/jobs`).
 #[must_use]
 pub fn plans_dir(home: &Path) -> PathBuf {
     home.join("plans")
@@ -157,7 +207,7 @@ pub fn plans_dir(home: &Path) -> PathBuf {
 /// Verzeichnis der persistierten Goals (Desired State, überlebt
 /// Plan-Revisionen).
 ///
-/// Root-bezogen (analog zu [`jobs_dir`]/[`cache_dir`], nicht profilbezogen):
+/// Root-bezogen (analog zu [`cache_dir`], nicht profilbezogen):
 /// siehe [`plans_dir`] zur Begründung dieser Konvention.
 #[must_use]
 pub fn goals_dir(home: &Path) -> PathBuf {
@@ -274,7 +324,7 @@ pub fn scan_reports_dir(home: &Path) -> PathBuf {
 
 /// Wurzelverzeichnis für lokal gespeicherte Bug-Reports (`<home>/bug-report`).
 ///
-/// Root-bezogen, analog zu [`jobs_dir`]/[`cache_dir`] — nicht profilbezogen,
+/// Root-bezogen, analog zu [`cache_dir`] — nicht profilbezogen,
 /// da ein Bug-Report keiner bestimmten `--profile`-Sitzung zugeordnet ist.
 /// Wird nicht vorab angelegt; der erste Schreibvorgang erstellt das
 /// Verzeichnis (siehe Aufrufer).
@@ -354,6 +404,33 @@ pub fn profile_dir(home: &Path, name: &str) -> HomeResult<PathBuf> {
         });
     }
     Ok(home.join("profiles").join(name))
+}
+
+/// Wissensspeicher eines Profils (`<profile_dir>/knowledge`).
+///
+/// # Description
+/// Wurzel des `harw-knowledge`-Stores (Artefakte, Index, Dream-Reports).
+/// Profilbezogen wie `memories`/`sessions`; [`crate::scaffold::ensure_home`]
+/// legt das Verzeichnis für das aktive Profil an. Die Funktion selbst löst nur
+/// auf und legt nichts an.
+///
+/// # Arguments
+/// - `profile_dir` (`&Path`): bereits per [`profile_dir`] aufgelöstes
+///   Profilverzeichnis.
+///
+/// # Examples
+/// ```rust
+/// use std::path::Path;
+///
+/// let profile = Path::new("/tmp/harw/profiles/default");
+/// assert_eq!(
+///     harw_home::knowledge_dir(profile),
+///     profile.join("knowledge")
+/// );
+/// ```
+#[must_use]
+pub fn knowledge_dir(profile_dir: &Path) -> PathBuf {
+    profile_dir.join("knowledge")
 }
 
 /// Ergebnis von [`config_layers_report`]: vertraute Layer plus Auskunft über
@@ -528,6 +605,33 @@ mod tests {
     use crate::test_support::TestResult;
 
     #[test]
+    fn profile_override_validates_and_rejects_a_different_second_value() {
+        // Eigene Zelle: der prozessweite Override bleibt für andere Tests
+        // unberührt.
+        let cell = OnceLock::new();
+        assert!(matches!(
+            set_profile_override_in(&cell, "   ".to_owned()),
+            Err(HomeError::InvalidProfileName { .. })
+        ));
+        assert!(matches!(
+            set_profile_override_in(&cell, "../flucht".to_owned()),
+            Err(HomeError::InvalidProfileName { .. })
+        ));
+        assert!(cell.get().is_none(), "ungültige Namen setzen nichts");
+
+        assert!(set_profile_override_in(&cell, " arbeit ".to_owned()).is_ok());
+        assert_eq!(cell.get().map(String::as_str), Some("arbeit"));
+        // Derselbe Name erneut: erfolgreich und ohne Wirkung.
+        assert!(set_profile_override_in(&cell, "arbeit".to_owned()).is_ok());
+        // Ein anderer Name: Fehler, der erste Wert bleibt.
+        assert!(matches!(
+            set_profile_override_in(&cell, "privat".to_owned()),
+            Err(HomeError::InvalidProfileName { name }) if name == "privat"
+        ));
+        assert_eq!(cell.get().map(String::as_str), Some("arbeit"));
+    }
+
+    #[test]
     fn plans_dir_ends_with_plans_component_below_home() {
         let home = PathBuf::from("/tmp/harw-test-home");
         let plans = plans_dir(&home);
@@ -558,10 +662,20 @@ mod tests {
     }
 
     #[test]
-    fn plans_dir_and_goals_dir_are_root_relative_like_jobs_dir() {
+    fn knowledge_dir_is_below_the_profile_dir() -> TestResult {
         let home = PathBuf::from("/tmp/harw-test-home");
-        // Gleiche Konvention wie `jobs_dir`/`cache_dir`: direkt unterhalb von
-        // `home`, nicht unterhalb eines Profils.
+        let profile = profile_dir(&home, "analysis")?;
+        let knowledge = knowledge_dir(&profile);
+        assert_eq!(knowledge, home.join("profiles/analysis/knowledge"));
+        assert_eq!(knowledge.parent(), Some(profile.as_path()));
+        Ok(())
+    }
+
+    #[test]
+    fn plans_dir_and_goals_dir_are_root_relative_like_cache_dir() {
+        let home = PathBuf::from("/tmp/harw-test-home");
+        // Gleiche Konvention wie `cache_dir`: direkt unterhalb von `home`,
+        // nicht unterhalb eines Profils.
         assert_eq!(plans_dir(&home).parent(), Some(home.as_path()));
         assert_eq!(goals_dir(&home).parent(), Some(home.as_path()));
     }

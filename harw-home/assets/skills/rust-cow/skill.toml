@@ -1,0 +1,5 @@
+name = "rust-cow"
+description = "Use when eine Funktion mal einen &str/&[T] zurückgeben kann ohne zu allozieren und mal eine neue String/Vec braucht — teaches Cow<'a, T> zur Vermeidung unnötiger Allokationen (Rust Edition 2024)"
+enabled = true
+instructions_file = "instructions.md"
+tools = ["filesystem.read"]

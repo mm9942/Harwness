@@ -115,12 +115,13 @@ use jiff::{SignedDuration, Timestamp};
 
 use harw_channel::{Admission, ChannelAdapter, InboundEvent, PairingStore, SessionKey};
 use harw_channel_telegram::{
-    TelegramChannel, TelegramChannelConfig, ThrottleNotice, TopicMode, WorkRequestStore,
+    ApprovalTokenStore, ChatStateStore, PairingNotice, TelegramChannel, TelegramChannelConfig,
+    ThrottleNotice, TopicMode, WorkRequestStore,
 };
 use harw_channel_telegram_transport::{
-    AdmittedEventConsumer, BotCommand, LongPollConfig, LongPollShutdown, RendererConfig,
-    TelegramClient, TelegramOffsetStore, TelegramOutbound, TelegramRenderer, TransportResult,
-    WebhookConfig, run_webhook_server, spawn_long_poll_thread,
+    AdmittedEventConsumer, LongPollConfig, LongPollShutdown, RendererConfig, TelegramClient,
+    TelegramOffsetStore, TelegramOutbound, TelegramRenderer, TransportResult, WebhookConfig,
+    run_webhook_server_with_shutdown, spawn_long_poll_thread,
 };
 use harw_config::{
     ChannelToml, InternalModelPoint, ResolvedConfig, SecretRef, TelegramChannelToml,
@@ -138,11 +139,21 @@ use harw_secrets::audit::chain::PersistedChainStatus;
 use harw_secrets::audit::telemetry::AUDIT_CHAIN_BREAK;
 use harw_secrets::{AuditError, AuditResult};
 use harw_session_store::{RecordKind, TranscriptStore};
-use harw_types::{AgentRole, ChannelId, PeerId, Principal, SessionId, ThreadRef};
+use harw_types::{AgentRole, ChannelId, Principal, SessionId, TenantId, ThreadRef, WorkspaceId};
 use secrecy::{ExposeSecret, SecretString};
 
 use crate::home::resolve_home;
 use crate::runtime_gateway::{GatewayEntry, channel_principal, gateway_assembly};
+
+mod telegram_attachments;
+mod telegram_callbacks;
+mod telegram_commands;
+mod telegram_session;
+
+use telegram_attachments::{TelegramAttachmentIntake, telegram_attachment_cache_root};
+use telegram_callbacks::{GatewayCallbackWorker, spawn_callback_worker};
+use telegram_commands::{CommandDisposition, TelegramCommandHandler, UnknownCommandFallback};
+use telegram_session::{TelegramSessionConfig, TelegramSessionDispatcher};
 
 /// Zählt jeden Gateway-Start. Geroutet unter dem Präfix `"app."`
 /// (`crate::observe`) — erreicht damit optional Prometheus/OTLP, nie ohne
@@ -317,175 +328,35 @@ fn is_telegram_pairing_command(text: &str) -> bool {
 
 /// Runtime consumer registered by this gateway composition. It deliberately
 /// accepts only events already admitted by `TelegramChannel`.
+///
+/// Reihenfolge je Ereignis: `/pair` wird verworfen (gehört zum lokalen
+/// `harw connect`-Ablauf), geschlossene Befehle verarbeitet der
+/// [`TelegramCommandHandler`], alles andere (Text und/oder Anhänge) reiht
+/// der [`TelegramSessionDispatcher`] nicht blockierend in die FIFO des Chats
+/// ein. Der Consumer hält den Dispatcher am Leben: endet der Admission-Thread
+/// (Transport-Neustart), werden Worker und Sweeper mit ihm beendet.
 struct GatewayTelegramConsumer {
-    provider: Arc<dyn ModelProvider>,
-    transcript_root: PathBuf,
-    outbound: Arc<dyn TelegramOutbound>,
-    /// Durable `WorkRequest` lifecycle store for `/request /review /approve
-    /// /deny /cancel` (docs/design/telegram-sandbox-work-requests.md).
-    work_requests: Arc<WorkRequestStore>,
-    /// Authoritative workspace-alias resolver. See this crate's `run`/
-    /// `supervise` docs for why it is currently built with zero registered
-    /// workspaces (no `harw-config` workspace-registration surface exists
-    /// yet): every `/request` fails closed with `WorkspaceUnresolved` until
-    /// that follow-up config surface lands, rather than trusting an alias.
-    workspaces: Arc<harw_authority::WorkspaceRegistry>,
-}
-
-impl GatewayTelegramConsumer {
-    /// Handles one of the closed `/request /review /approve /deny /cancel`
-    /// commands (docs/design/telegram-sandbox-work-requests.md, "Typed
-    /// request boundary"). Only the parsed, already-validated command
-    /// arguments are used — never `event.text`/attachments/callback data
-    /// beyond what `parse_command` extracted, so this cannot select a
-    /// workspace or grant a permission on its own authority.
-    fn handle_work_request_command(
-        &self,
-        key: &SessionKey,
-        event: &InboundEvent,
-        command: harw_channel_telegram_transport::TelegramCommand,
-    ) {
-        use harw_channel_telegram_transport::TelegramCommand;
-
-        let Ok(chat_id) = event.peer.as_str().parse::<i64>() else {
-            tracing::warn!(channel = %key.channel, peer = %key.peer, "Telegram peer is not a numeric chat id");
-            return;
-        };
-        let thread_id = event
-            .thread
-            .as_ref()
-            .and_then(|thread| thread.as_str().parse::<i64>().ok());
-        // The requester is the acting human, never a group's `PeerId`
-        // (docs/design/channel-ingress-telegram.md §3.3).
-        let requester = event
-            .sender
-            .as_ref()
-            .map(|sender| PeerId::from_str(sender.id.clone()))
-            .unwrap_or_else(|| event.peer.clone());
-        let now = Timestamp::now();
-
-        let reply = match command {
-            TelegramCommand::Request {
-                workspace_alias,
-                role,
-                task,
-            } => self
-                .work_requests
-                .submit(
-                    &key.channel,
-                    &requester,
-                    &key.tenant,
-                    &workspace_alias,
-                    &role,
-                    &task,
-                    event.raw_event_id.as_deref().unwrap_or_default(),
-                    self.workspaces.as_ref(),
-                    now,
-                )
-                .map(|record| format!("Requested {} (state: requested)", record.work_id)),
-            TelegramCommand::Review { work_id } => {
-                self.work_requests.review(&WorkId::from_str(work_id), now)
-            }
-            TelegramCommand::Approve { work_id } => {
-                self.work_requests.approve(&WorkId::from_str(work_id), now)
-            }
-            TelegramCommand::Deny { work_id } => {
-                self.work_requests.deny(&WorkId::from_str(work_id), now)
-            }
-            TelegramCommand::Cancel { work_id } => {
-                self.work_requests.cancel(&WorkId::from_str(work_id), now)
-            }
-        };
-
-        let markdown = match reply {
-            Ok(message) => message,
-            Err(error) => {
-                tracing::warn!(channel = %key.channel, peer = %key.peer, error = %error, "Telegram work-request command failed");
-                format!("Anfrage fehlgeschlagen: {error}")
-            }
-        };
-        if let Err(error) = self.outbound.send(
-            chat_id,
-            thread_id,
-            &harw_channel::OutboundContent::Message { markdown },
-        ) {
-            tracing::error!(error = %error, "Telegram work-request reply delivery failed");
-        }
-    }
+    commands: TelegramCommandHandler,
+    sessions: TelegramSessionDispatcher,
 }
 
 impl AdmittedEventConsumer for GatewayTelegramConsumer {
     fn handle_admitted(&self, key: SessionKey, event: InboundEvent) {
-        let Some(text) = event.text.clone().filter(|text| !text.trim().is_empty()) else {
-            tracing::warn!(channel = %key.channel, peer = %key.peer, "Telegram event has no text runtime handoff");
-            return;
-        };
-        if is_telegram_pairing_command(&text) {
-            tracing::debug!(channel = %key.channel, peer = %key.peer, "Telegram pairing command consumed outside model runtime");
+        let text = event.text.clone().filter(|text| !text.trim().is_empty());
+        if text.is_none() && event.attachments.is_empty() {
+            tracing::warn!(channel = %key.channel, peer = %key.peer, "Telegram event has neither text nor attachments for runtime handoff");
             return;
         }
-        if let Some(command) = harw_channel_telegram_transport::parse_command(&text) {
-            self.handle_work_request_command(&key, &event, command);
-            return;
-        }
-        if !event.attachments.is_empty() {
-            tracing::warn!(channel = %key.channel, peer = %key.peer, "Telegram attachments have no governed runtime intake handoff");
-            return;
-        }
-        let Ok(chat_id) = event.peer.as_str().parse::<i64>() else {
-            tracing::warn!(channel = %key.channel, peer = %key.peer, "Telegram peer is not a numeric chat id");
-            return;
-        };
-        let thread_id = event
-            .thread
-            .as_ref()
-            .and_then(|thread| thread.as_str().parse::<i64>().ok());
-
-        let store = build_telegram_state_store(&self.transcript_root);
-        let (event_tx, _event_rx) = tokio::sync::mpsc::unbounded_channel();
-        let mut session = AgentSession::new(
-            AgentRole::Assistant,
-            None,
-            empty_extension_registry(),
-            event_tx,
-        );
-        let runtime = match tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-        {
-            Ok(runtime) => runtime,
-            Err(error) => {
-                tracing::error!(error = %error, "Telegram admitted-event runtime could not start");
+        if let Some(text) = text.as_deref() {
+            if is_telegram_pairing_command(text) {
+                tracing::debug!(channel = %key.channel, peer = %key.peer, "Telegram pairing command consumed outside model runtime");
                 return;
             }
-        };
-        let response = match runtime.block_on(run_turn(
-            &mut session,
-            self.provider.as_ref(),
-            &store,
-            TurnInput::user(text),
-        )) {
-            Ok(TurnOutcome::Completed) => last_assistant_text(&session),
-            Ok(outcome) => {
-                tracing::warn!(
-                    ?outcome,
-                    "Telegram turn did not complete; no outbound reply sent"
-                );
+            if self.commands.handle(&key, &event, text) == CommandDisposition::Handled {
                 return;
             }
-            Err(error) => {
-                tracing::error!(error = %error, "Telegram governed turn failed");
-                return;
-            }
-        };
-        drop(runtime);
-        if let Err(error) = self.outbound.send(
-            chat_id,
-            thread_id,
-            &harw_channel::OutboundContent::Message { markdown: response },
-        ) {
-            tracing::error!(error = %error, "Telegram typed outbound delivery failed");
         }
+        self.sessions.dispatch(key, event);
     }
 }
 
@@ -559,9 +430,13 @@ pub fn run(
         .map_err(|error| format!("gateway: Arbeitsverzeichnis nicht lesbar: {error}"))?;
 
     // Profil vor der Montage auflösen: der Telegram-Verlaufsspeicher der
-    // Assembly liegt unter `<profil>/sessions`, derselben Wurzel wie Dream.
+    // Assembly liegt unter der Session-Wurzel des Profils (`[session]
+    // store_dir`, Vorgabe `<profil>/sessions`), derselben Wurzel wie Dream.
     let profile_name = harw_home::active_profile_name(&home);
     let profile = harw_home::profile_dir(&home, &profile_name).map_err(|e| e.to_string())?;
+    // Einmal auflösen und überall durchreichen (Montage, Dream, Telegram-
+    // Consumer), damit ein angepasstes `store_dir` nirgends auseinanderläuft.
+    let sessions_root = crate::runtime_entry::profile_sessions_root(&home)?;
 
     // Die Gateway-Montagen ersetzen `config_layers` + `discover_config` +
     // `validate` und den früher separat gebauten Provider. Scheitert der
@@ -569,7 +444,7 @@ pub fn run(
     // Dream und jede aktivierte Telegram-Bindung bekommen je eine eigene
     // Montage (G1/G3), damit Audit und Trace den auslösenden Kanal — und bei
     // Telegram die auslösende Bindung — unterscheiden.
-    let assemblies = mount_gateway_assembly(&home, &cwd, &profile.join("sessions"))?;
+    let assemblies = mount_gateway_assembly(&home, &cwd, &sessions_root)?;
     // Shared with `audit_chain_scheduler`, which clones this `Arc` into a
     // fresh `spawn_blocking` closure on every tick (see its doc for why it
     // re-opens the configured secret store each tick instead of holding one).
@@ -597,14 +472,17 @@ pub fn run(
 
     // Knowledge-Store am Profil-Wissensordner mounten (memory/diary/dream/
     // workbench/kanban teilen sich diesen Store).
-    let knowledge_root = profile.join("knowledge");
+    let knowledge_root = harw_home::knowledge_dir(&profile);
     std::fs::create_dir_all(&knowledge_root)
         .map_err(|error| format!("knowledge-Ordner anlegen: {error}"))?;
     let knowledge = KnowledgeStore::new(&knowledge_root);
     // Dream turns use the same active-profile transcript root as CLI turns.
     // Keep the root derived before entering the runtime so a profile switch
     // cannot make an in-flight gateway write into another profile.
-    let dream_transcript_root = profile.join("sessions");
+    let roots = GatewayProfileRoots {
+        profile,
+        sessions: sessions_root,
+    };
 
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -616,7 +494,7 @@ pub fn run(
         Arc::clone(&config),
         providers,
         &knowledge,
-        &dream_transcript_root,
+        &roots,
         Arc::clone(&telemetry_sinks.sink),
         audit_chain_check_interval_secs,
     ));
@@ -668,6 +546,20 @@ struct GatewayProviders {
     /// Modell der **eigenen** Dream-Montage (`GatewayAssemblies::dream`,
     /// Befunde G1/G3); geht an [`dream_scheduler`].
     dream: Arc<dyn ModelProvider>,
+}
+
+/// Die vor dem Runtime-Eintritt aufgelösten Profil-Wurzeln eines
+/// Gateway-Starts, gebündelt für [`supervise`] (hält dessen Parameterliste
+/// unter der `clippy::too_many_arguments`-Schwelle, ohne `#[allow]`).
+struct GatewayProfileRoots {
+    /// Aktives Profilverzeichnis; Wurzel für `channel-state` (Pairing,
+    /// Offsets, Work-Requests) und den Profil-Jobstore. Bewusst explizit und
+    /// nicht aus `sessions` abgeleitet: ein angepasstes `[session] store_dir`
+    /// liegt nicht zwingend unter dem Profil.
+    profile: PathBuf,
+    /// Aufgelöste Session-Wurzel (`crate::runtime_entry::profile_sessions_root`);
+    /// Transkripte von Dream und Telegram.
+    sessions: PathBuf,
 }
 
 /// Öffnet den Secret-Resolver für die Gateway-Montagen genau einmal, verengt
@@ -908,6 +800,9 @@ fn gateway_provider_status(config: &ResolvedConfig) -> String {
 ///   Montagen (je Bindung) und der **eigenen** Dream-Montage
 ///   (`RuntimeAssembly::model`, Befunde G1/G3); `telegram` geht je Bindung an
 ///   [`supervise_telegram_binding`], `dream` an [`dream_scheduler`].
+/// - `roots` ([`GatewayProfileRoots`]): explizites Profilverzeichnis
+///   (`channel-state`, Jobstore) und aufgelöste Session-Wurzel (Dream- und
+///   Telegram-Transkripte).
 ///
 /// # Shutdown
 /// Nach einem Shutdown-Signal wird für jede im Webhook-Modus gestartete
@@ -927,7 +822,7 @@ async fn supervise(
     config: Arc<ResolvedConfig>,
     providers: GatewayProviders,
     knowledge: &KnowledgeStore,
-    dream_transcript_root: &Path,
+    roots: &GatewayProfileRoots,
     telemetry_sink: Arc<dyn TelemetrySink>,
     audit_chain_check_interval_secs: u64,
 ) -> Result<(), String> {
@@ -972,33 +867,19 @@ async fn supervise(
         telegram: mut telegram_providers,
         dream: dream_provider,
     } = providers;
-    let telegram_profile = dream_transcript_root
-        .parent()
-        .map(Path::to_path_buf)
-        .unwrap_or_else(|| PathBuf::from("."));
-    // Authoritative workspace-alias resolver for Telegram `/request`
-    // (docs/design/telegram-sandbox-work-requests.md, "Typed request
-    // boundary"). Built with **zero** registrations: `harw-config` has no
-    // workspace-registration TOML surface yet (only `harw-cli/src/gateway.rs`
-    // is in this change's file scope, not that config schema), so every
-    // `/request` fails closed with `WorkspaceUnresolved` until a follow-up
-    // change adds registrations here. This is deliberate fail-closed
-    // behavior, not a bug: no alias can select a workspace it was never
-    // configured to resolve to.
-    let workspaces = Arc::new(
-        harw_authority::WorkspaceRegistry::build(
-            home,
-            std::iter::empty::<harw_authority::WorkspaceRegistration>(),
-        )
-        .map_err(|error| format!("gateway: workspace registry: {error}"))?,
-    );
+    let telegram_profile = roots.profile.clone();
     // Ein einziger `WorkRequestStore` für alle Bindungen: er serialisiert
     // seine Dateizugriffe nur über einen prozessinternen Mutex, zwei parallel
     // laufende Instanzen auf demselben Verzeichnis dürften sich also nicht
     // gegenseitig überschreiben.
-    let work_requests = Arc::new(WorkRequestStore::new(
-        &telegram_profile.join("channel-state").join("work-requests"),
-    ));
+    // Genehmigte Aufträge werden als durabler Job im Profil-Jobstore
+    // zugelassen; `harw job-worker` führt sie aus.
+    let work_requests = Arc::new(
+        WorkRequestStore::new(&telegram_profile.join("channel-state").join("work-requests"))
+            .with_launcher(Arc::new(
+                crate::telegram_launcher::JobStoreWorkLauncher::for_profile_dir(&telegram_profile),
+            )),
+    );
 
     let mut webhook_teardowns = Vec::new();
     let mut binding_tasks: Vec<TelegramBindingTask> = Vec::new();
@@ -1016,6 +897,19 @@ async fn supervise(
                     tracing::error!(binding = %binding.id, "Telegram binding has no mounted runtime assembly; remains disabled (fail closed)");
                     continue;
                 };
+                // Arbeitsbereiche, Befehls-Fallback und Chat-Zustand je
+                // Bindung; ein Fehler schließt nur diese Bindung.
+                let services = match telegram_binding_services(
+                    home,
+                    &plan.binding,
+                    &telegram_profile,
+                ) {
+                    Ok(services) => services,
+                    Err(reason) => {
+                        tracing::warn!(binding = %binding.id, reason = %reason, "Telegram binding remains disabled (fail closed)");
+                        continue;
+                    }
+                };
                 if matches!(plan.transport, TelegramTransportPlan::Webhook(_)) {
                     webhook_teardowns.push(TelegramWebhookTeardown {
                         binding_id: binding.id.clone(),
@@ -1026,7 +920,8 @@ async fn supervise(
                     *plan,
                     provider,
                     telegram_profile.clone(),
-                    Arc::clone(&workspaces),
+                    roots.sessions.clone(),
+                    services,
                     Arc::clone(&work_requests),
                 )));
             }
@@ -1050,7 +945,7 @@ async fn supervise(
     let dream = dream_scheduler(
         Arc::clone(&dream_provider),
         knowledge,
-        dream_transcript_root,
+        &roots.sessions,
         &activity,
         config.as_ref(),
     );
@@ -1423,15 +1318,17 @@ fn describe_audit_chain_check(result: &AuditResult<PersistedChainStatus>) -> Aud
 /// vor der Mehrfachbindungs-Unterstützung ihren Offset persistiert.
 const TELEGRAM_LEGACY_OFFSET_BINDING: &str = "telegram:default";
 
-/// Update-Arten, die Telegram per Long-Poll bzw. Webhook zustellen soll.
+/// Update-Arten, die Telegram per Webhook zustellen soll (`setWebhook`).
 ///
-/// Entspricht bewusst der Vorgabe des Long-Poll-Runners
-/// (`message`/`edited_message`): `callback_query` wird nicht abonniert, weil
-/// die Transport-Abbildung (`map_update`) Button-Taps nicht als
-/// `InboundEvent` weiterreicht und dieser Gateway keine Inline-Buttons
-/// rendert — ein abonnierter, aber nie beantworteter Callback würde beim
-/// Nutzer nur als hängender Ladeindikator enden.
-const TELEGRAM_ALLOWED_UPDATES: [&str; 2] = ["message", "edited_message"];
+/// Enthält neben `message`/`edited_message` auch `callback_query`: jede
+/// Webhook-Bindung installiert den Callback-Consumer aus
+/// [`telegram_callbacks::spawn_callback_worker`]
+/// (`WebhookConfig::with_callback_consumer`), der jeden Button-Klick per
+/// `answerCallbackQuery` beantwortet — ohne dieses Abonnement stellte
+/// Telegram keine Klicks zu. Der Long-Poll-Pfad nutzt diese Konstante nicht:
+/// `LongPollConfig::with_callback_consumer` nimmt `callback_query` selbst in
+/// seine `allowed_updates` auf.
+const TELEGRAM_ALLOWED_UPDATES: [&str; 3] = ["message", "edited_message", "callback_query"];
 
 /// Von Telegram für Webhooks akzeptierte Ports (Bot-API `setWebhook`).
 const TELEGRAM_WEBHOOK_PORTS: [u16; 4] = [443, 80, 88, 8443];
@@ -1476,7 +1373,10 @@ fn telegram_ingress_modes(config: &ResolvedConfig) -> Vec<TelegramBindingIngress
 /// Identitäten, Transportwahl ([`telegram_transport_choice`]), Bot-
 /// Credential und — nur im Webhook-Modus — das `secret_token`. Meldungen
 /// nennen nie einen Geheimniswert oder den Namen einer Umgebungsvariable.
-fn telegram_binding_mode(binding: &TelegramChannelToml, config: &ResolvedConfig) -> TelegramIngressMode {
+fn telegram_binding_mode(
+    binding: &TelegramChannelToml,
+    config: &ResolvedConfig,
+) -> TelegramIngressMode {
     if ChannelId::try_from(binding.id.clone()).is_err() {
         return TelegramIngressMode::Disabled("Telegram channel id is invalid".to_owned());
     }
@@ -1627,9 +1527,9 @@ fn is_supported_webhook_route(path: &str) -> bool {
         !segment.is_empty()
             && segment != "."
             && segment != ".."
-            && segment
-                .bytes()
-                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b'~'))
+            && segment.bytes().all(|byte| {
+                byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b'~')
+            })
     })
 }
 
@@ -1676,13 +1576,14 @@ fn disable_conflicting_telegram_bindings(bindings: &mut [TelegramBindingIngress]
                 shared_token.insert(left_index);
                 shared_token.insert(right_index);
             }
-            if let (TelegramTransportPlan::Webhook(left_hook), TelegramTransportPlan::Webhook(right_hook)) =
-                (&left_plan.transport, &right_plan.transport)
-            {
-                if left_hook.listen_addr == right_hook.listen_addr {
-                    shared_listener.insert(left_index);
-                    shared_listener.insert(right_index);
-                }
+            let same_listener = matches!(
+                (&left_plan.transport, &right_plan.transport),
+                (TelegramTransportPlan::Webhook(left_hook), TelegramTransportPlan::Webhook(right_hook))
+                    if left_hook.listen_addr == right_hook.listen_addr
+            );
+            if same_listener {
+                shared_listener.insert(left_index);
+                shared_listener.insert(right_index);
             }
         }
     }
@@ -1775,7 +1676,7 @@ enum RunningTelegramIngress {
     /// Eigener Long-Poll-Thread; endet mit einem `TransportResult`.
     LongPoll(std::thread::JoinHandle<TransportResult<()>>),
     /// Fertig konfigurierter Webhook-Listener; läuft, bis
-    /// [`run_webhook_server`] zurückkehrt oder der Future verworfen wird.
+    /// [`run_webhook_server_with_shutdown`] zurückkehrt oder der Future verworfen wird.
     Webhook(WebhookConfig),
 }
 
@@ -1806,72 +1707,6 @@ async fn drive_telegram_bindings(mut tasks: Vec<TelegramBindingTask>) -> Infalli
     .await
 }
 
-/// Die Befehle, die dieser Gateway für **jeden** admittierten Peer
-/// tatsächlich verarbeitet (`GatewayTelegramConsumer`,
-/// `harw_channel_telegram_transport::parse_command`). `/pair` fehlt bewusst:
-/// es gehört zum lokalen `harw connect`-Ablauf und wird nie vom Gateway
-/// ausgeführt.
-fn telegram_gateway_commands() -> Vec<BotCommand> {
-    [
-        (
-            "request",
-            "Arbeitsauftrag anfragen: /request <workspace> <rolle> <aufgabe>",
-        ),
-        ("review", "Arbeitsauftrag prüfen: /review <work-id>"),
-        ("approve", "Arbeitsauftrag freigeben: /approve <work-id>"),
-        ("deny", "Arbeitsauftrag ablehnen: /deny <work-id>"),
-        ("cancel", "Arbeitsauftrag abbrechen: /cancel <work-id>"),
-    ]
-    .into_iter()
-    .map(|(command, description)| BotCommand {
-        command: command.to_owned(),
-        description: description.to_owned(),
-    })
-    .collect()
-}
-
-/// Leitet das Befehlsmenü aus `[channel.telegram.commands].menu_source` ab.
-///
-/// - `"policy_visible"` (Vorgabe): genau die Befehle, die jeder admittierte
-///   Peer über diesen Gateway ausführen kann ([`telegram_gateway_commands`]).
-///   Der Client kennt derzeit nur den Standard-Scope von `setMyCommands`;
-///   peer-relative Menüs je Sichtbarkeits-Scope brauchen einen Scope-Parameter
-///   im Transport (siehe Integrationsbedarf im Bericht) — bis dahin ist das
-///   Menü die für alle admittierten Peers gleiche, policy-sichtbare Menge.
-/// - `"none"`: kein Menü veröffentlichen (ein bestehendes bleibt unberührt).
-/// - sonst: `Err` mit einer Meldung ohne Geheimnisinhalt.
-fn telegram_menu_commands(menu_source: &str) -> Result<Option<Vec<BotCommand>>, String> {
-    match menu_source.trim() {
-        "policy_visible" => Ok(Some(telegram_gateway_commands())),
-        "none" => Ok(None),
-        other => Err(format!(
-            "unknown commands.menu_source {other:?} (expected policy_visible or none)"
-        )),
-    }
-}
-
-/// Veröffentlicht das Befehlsmenü einer Bindung (best effort: ein Fehler wird
-/// geloggt, schließt die Bindung aber nicht — das Menü ist reine Anzeige,
-/// die Autorisierung liegt in Admission und Befehlsverarbeitung).
-async fn publish_telegram_command_menu(
-    binding: &TelegramChannelToml,
-    client: &TelegramClient,
-) {
-    match telegram_menu_commands(&binding.commands.menu_source) {
-        Ok(Some(commands)) => {
-            if let Err(error) = client.set_my_commands(&commands).await {
-                tracing::warn!(binding = %binding.id, error = %error, "Telegram command menu could not be published");
-            }
-        }
-        Ok(None) => {
-            tracing::debug!(binding = %binding.id, "Telegram command menu publication disabled by config");
-        }
-        Err(reason) => {
-            tracing::warn!(binding = %binding.id, reason = %reason, "Telegram command menu not published");
-        }
-    }
-}
-
 /// Offset-Verzeichnis des Long-Poll-Runners einer Bindung.
 ///
 /// [`TELEGRAM_LEGACY_OFFSET_BINDING`] behält `<state>/telegram-offset`; jede
@@ -1884,23 +1719,118 @@ fn telegram_offset_root(channel_state: &Path, binding_id: &str) -> PathBuf {
     if binding_id == TELEGRAM_LEGACY_OFFSET_BINDING {
         return legacy;
     }
-    let encoded = binding_id
+    legacy.join(telegram_binding_dir_name(binding_id))
+}
+
+/// Gültigkeit der Freigabe-Schaltflächen (Approval-Tokens) und Obergrenze
+/// der Wartezeit geparkter Turn-Freigaben.
+const TELEGRAM_APPROVAL_TTL: SignedDuration = SignedDuration::from_secs(24 * 60 * 60);
+
+/// Höchstzahl gleichzeitig laufender Chat-Sitzungen je Bindung.
+const TELEGRAM_MAX_PARALLEL_SESSIONS: usize = 4;
+
+/// Hex-Kodierung einer Bindungs-ID: kollisionsfrei und dateisystemsicher.
+fn telegram_binding_dir_name(binding_id: &str) -> String {
+    binding_id
         .bytes()
         .map(|byte| format!("{byte:02x}"))
-        .collect::<String>();
-    legacy.join(encoded)
+        .collect::<String>()
+}
+
+/// Chat-Zustand (Workspace-Wahl, Sitzungsgeneration) einer Bindung:
+/// `<channel-state>/telegram-chats/<hex(binding id)>`.
+fn telegram_chat_state_root(channel_state: &Path, binding_id: &str) -> PathBuf {
+    channel_state
+        .join("telegram-chats")
+        .join(telegram_binding_dir_name(binding_id))
+}
+
+/// Über Transport-Neustarts hinweg stabile Dienste einer Telegram-Bindung.
+struct TelegramBindingServices {
+    /// Autoritative Workspace-Auflösung aus `binding.workspaces`.
+    workspaces: Arc<harw_authority::WorkspaceRegistry>,
+    /// Chat-Zustand; geteilt von Befehlsverarbeitung und Sitzungs-Dispatcher.
+    chat_state: Arc<ChatStateStore>,
+    /// Telegram-User-IDs aus `security.admin_identities`.
+    admin_sender_ids: HashSet<String>,
+    unknown_command_fallback: UnknownCommandFallback,
+    /// Alias des Workspaces mit `default = true`, falls vorhanden.
+    default_workspace_alias: Option<String>,
+}
+
+/// Baut die bindungsbezogenen Dienste aus der Konfiguration.
+///
+/// # Errors
+/// Eine deutsche Begründung (ohne Geheimnisse), wenn die Workspace-Registry
+/// nicht gebaut werden kann (Wurzel fehlt, liegt außerhalb des Harness-Homes,
+/// doppelte Registrierung) oder `commands.unknown_command_fallback`
+/// unbekannt ist. Die Bindung bleibt dann fail-closed deaktiviert.
+fn telegram_binding_services(
+    home: &Path,
+    binding: &TelegramChannelToml,
+    profile: &Path,
+) -> Result<TelegramBindingServices, String> {
+    let registrations = binding
+        .workspaces
+        .iter()
+        .map(|workspace| {
+            let tenant = TenantId::try_from_str(workspace.tenant.trim()).map_err(|_| {
+                format!(
+                    "Arbeitsbereich {:?}: ungültiger Mandant",
+                    workspace.alias.trim()
+                )
+            })?;
+            let alias = WorkspaceId::try_from_str(workspace.alias.trim())
+                .map_err(|_| "Arbeitsbereich mit ungültigem Alias".to_owned())?;
+            Ok(harw_authority::WorkspaceRegistration {
+                tenant,
+                workspace: alias,
+                root: PathBuf::from(workspace.root.trim()),
+            })
+        })
+        .collect::<Result<Vec<_>, String>>()?;
+    let workspaces = harw_authority::WorkspaceRegistry::build(home, registrations)
+        .map_err(|error| format!("Arbeitsbereiche nicht auflösbar: {error}"))?;
+    let unknown_command_fallback =
+        UnknownCommandFallback::parse(&binding.commands.unknown_command_fallback)?;
+    let default_workspace_alias = binding
+        .workspaces
+        .iter()
+        .find(|workspace| workspace.default)
+        .map(|workspace| workspace.alias.trim().to_owned());
+    let admin_sender_ids = binding
+        .security
+        .admin_identities
+        .iter()
+        .map(ToString::to_string)
+        .collect::<HashSet<_>>();
+    let chat_state = Arc::new(ChatStateStore::new(&telegram_chat_state_root(
+        &profile.join("channel-state"),
+        &binding.id,
+    )));
+    Ok(TelegramBindingServices {
+        workspaces: Arc::new(workspaces),
+        chat_state,
+        admin_sender_ids,
+        unknown_command_fallback,
+        default_workspace_alias,
+    })
 }
 
 /// Startet Admission, Runtime-Handoff und Transport einer Bindung.
 ///
 /// # Description
 /// Reihenfolge: Bot-Identität (`getMe`), Befehlsmenü
-/// ([`publish_telegram_command_menu`]), Transport-Lebenszyklus — im
-/// Long-Poll-Modus ein `deleteWebhook` (ein nach einem Absturz verwaister
-/// Webhook würde `getUpdates` sonst dauerhaft mit 409 blockieren), im
-/// Webhook-Modus `setWebhook` mit `public_url` und `secret_token` —, erst
-/// danach die Admission-/Throttle-Threads und der Transport selbst. Scheitert
-/// ein Schritt vor den Threads, bleibt nichts halb gestartet zurück.
+/// ([`telegram_commands::publish_telegram_command_menu`]),
+/// Transport-Lebenszyklus — im Long-Poll-Modus ein `deleteWebhook` (ein nach
+/// einem Absturz verwaister Webhook würde `getUpdates` sonst dauerhaft mit
+/// 409 blockieren), im Webhook-Modus `setWebhook` mit `public_url` und
+/// `secret_token` —, danach Renderer (mit dem geteilten `approval_tokens`),
+/// Anhang-Aufnahme, Sitzungs-Dispatcher und Befehlsverarbeitung, erst dann
+/// die Throttle-/Pairing-Notice-, Callback- und Admission-Threads und der
+/// Transport selbst (mit installiertem Callback-Consumer aus
+/// [`telegram_callbacks::spawn_callback_worker`]). Scheitert ein Schritt vor
+/// den Threads, bleibt nichts halb gestartet zurück.
 ///
 /// # Errors
 /// Eine inhaltsfreie Meldung (nie Token oder Secret), wenn ein Schritt
@@ -1910,8 +1840,10 @@ async fn start_telegram_binding(
     plan: &TelegramIngressPlan,
     provider: Arc<dyn ModelProvider>,
     profile: &Path,
-    workspaces: Arc<harw_authority::WorkspaceRegistry>,
+    sessions_root: &Path,
+    services: &TelegramBindingServices,
     work_requests: Arc<WorkRequestStore>,
+    approval_tokens: Arc<ApprovalTokenStore>,
 ) -> Result<RunningTelegramIngress, String> {
     let channel_id = ChannelId::try_from(plan.binding.id.clone())
         .map_err(|_| "Telegram channel id is invalid".to_owned())?;
@@ -1940,6 +1872,12 @@ async fn start_telegram_binding(
         plan.binding.rate_limit.max_updates_per_peer_per_min;
     channel_config.topic_mode = telegram_topic_mode(&plan.binding.topics.mode)
         .ok_or_else(|| "Telegram topic mode is invalid".to_owned())?;
+    channel_config.allow_unpinned_pairing = plan.binding.security.allow_unpinned_pairing;
+    channel_config.admin_sender_ids = services.admin_sender_ids.clone();
+    channel_config.attachment_max_bytes = plan.binding.attachments.max_bytes;
+    channel_config.attachment_max_count =
+        usize::try_from(plan.binding.attachments.max_count_per_message).unwrap_or(usize::MAX);
+    channel_config.attachment_allowed_kinds = plan.binding.attachments.mime_allowlist.clone();
 
     let bot_http = telegram_http_client(TELEGRAM_CLIENT_REQUEST_TIMEOUT)?;
     let bot_client = Arc::new(TelegramClient::with_http_client(
@@ -1950,7 +1888,7 @@ async fn start_telegram_binding(
         .get_me()
         .await
         .map_err(|_| "Telegram bot identity lookup failed".to_owned())?;
-    publish_telegram_command_menu(&plan.binding, &bot_client).await;
+    telegram_commands::publish_telegram_command_menu(&plan.binding, &bot_client).await;
     match &plan.transport {
         TelegramTransportPlan::LongPoll { webhook_fallback } => {
             if *webhook_fallback {
@@ -1983,20 +1921,55 @@ async fn start_telegram_binding(
         per_chat_per_sec: plan.binding.rate_limit.max_outbound_per_chat_per_sec,
         ..RendererConfig::default()
     };
-    let renderer: Arc<dyn TelegramOutbound> = Arc::new(TelegramRenderer::with_config(
+    // Derselbe Token-Store wie der Adapter (und über Neustarts hinweg):
+    // ausgegebene Freigabe-Schaltflächen bleiben nach einem Transport-Neustart
+    // einlösbar.
+    let renderer = Arc::new(TelegramRenderer::with_config_and_approval_tokens(
         Arc::clone(&bot_client),
         renderer_config,
+        Arc::clone(&approval_tokens),
     ));
-    let throttle_outbound = Arc::clone(&renderer);
-    let consumer = Arc::new(GatewayTelegramConsumer {
+    let outbound: Arc<dyn TelegramOutbound> = renderer.clone();
+    let throttle_outbound = Arc::clone(&outbound);
+    let pairing_outbound = Arc::clone(&outbound);
+    let callback_outbound = Arc::clone(&outbound);
+    let callback_work_requests = Arc::clone(&work_requests);
+    let attachments = match TelegramAttachmentIntake::from_binding(
+        &plan.binding,
+        Arc::clone(&bot_client),
+        &telegram_attachment_cache_root(profile),
+    ) {
+        Ok(intake) => Some(Arc::new(intake)),
+        Err(reason) => {
+            tracing::warn!(binding = %plan.binding.id, reason = %reason, "Telegram attachment intake unavailable; attachments will be rejected");
+            None
+        }
+    };
+    let sessions = TelegramSessionDispatcher::new(TelegramSessionConfig {
         provider,
-        transcript_root: profile.join("sessions"),
-        outbound: renderer,
-        work_requests,
-        workspaces,
+        transcript_root: sessions_root.to_path_buf(),
+        renderer,
+        chat_state: Arc::clone(&services.chat_state),
+        attachments,
+        max_parallel_sessions: TELEGRAM_MAX_PARALLEL_SESSIONS,
+        approval_ttl: TELEGRAM_APPROVAL_TTL,
+    });
+    let turn_approvals = sessions.turn_approvals();
+    let consumer = Arc::new(GatewayTelegramConsumer {
+        commands: TelegramCommandHandler {
+            outbound,
+            work_requests,
+            workspaces: Arc::clone(&services.workspaces),
+            chat_state: Arc::clone(&services.chat_state),
+            admin_sender_ids: services.admin_sender_ids.clone(),
+            unknown_command_fallback: services.unknown_command_fallback,
+            default_workspace_alias: services.default_workspace_alias.clone(),
+        },
+        sessions,
     });
     let (ingress_tx, ingress_rx) = mpsc::sync_channel(128);
     let (throttle_tx, throttle_rx) = mpsc::channel::<ThrottleNotice>();
+    let (pairing_tx, pairing_rx) = mpsc::channel::<PairingNotice>();
     let adapter = TelegramChannel::with_ingress_receiver(
         channel_config,
         Arc::new(PairingStore::new(
@@ -2004,7 +1977,9 @@ async fn start_telegram_binding(
         )),
         ingress_rx,
     )
-    .with_throttle_sink(throttle_tx);
+    .with_throttle_sink(throttle_tx)
+    .with_pairing_sink(pairing_tx)
+    .with_approval_tokens(approval_tokens);
     // Delivers at most one "you're sending too fast" reply per rate-limit
     // window (§3.5): the admission perimeter (`TelegramChannel::admit`) only
     // decides and emits the notice, it never sends network traffic itself.
@@ -2026,6 +2001,36 @@ async fn start_telegram_binding(
             }
         })
         .map_err(|_| "Telegram throttle-notice thread could not start".to_owned())?;
+    // Delivers the confirmation or the uniform failure reply of an in-channel
+    // `/pair <code>` redemption (§3.2). Like throttling, the adapter only
+    // decides and emits the notice. The notice content is never logged.
+    std::thread::Builder::new()
+        .name("harw-telegram-pairing-notice".to_owned())
+        .spawn(move || {
+            for notice in pairing_rx {
+                let Ok(chat_id) = notice.peer.as_str().parse::<i64>() else {
+                    tracing::warn!("Telegram pairing notice has a non-numeric peer");
+                    continue;
+                };
+                let thread_id = notice
+                    .thread
+                    .as_ref()
+                    .and_then(|thread| thread.as_str().parse::<i64>().ok());
+                if let Err(error) = pairing_outbound.send(chat_id, thread_id, &notice.content) {
+                    tracing::error!(error = %error, "Telegram pairing notice delivery failed");
+                }
+            }
+        })
+        .map_err(|_| "Telegram pairing-notice thread could not start".to_owned())?;
+    // Inline-button clicks: the transport hands them to a non-blocking
+    // consumer; this worker validates and answers them off the ingress path.
+    let callback_consumer = spawn_callback_worker(GatewayCallbackWorker {
+        adapter: adapter.clone(),
+        work_requests: callback_work_requests,
+        outbound: callback_outbound,
+        bot_client: Arc::clone(&bot_client),
+        turn_approvals: Some(turn_approvals),
+    })?;
     std::thread::Builder::new()
         .name("harw-telegram-admission".to_owned())
         .spawn(move || {
@@ -2060,13 +2065,14 @@ async fn start_telegram_binding(
                 offset_store,
                 ingress_tx,
                 LongPollShutdown::default(),
-            );
+            )
+            .with_callback_consumer(callback_consumer);
             spawn_long_poll_thread(long_poll)
                 .map(RunningTelegramIngress::LongPoll)
                 .map_err(|_| "Telegram long-poll thread could not start".to_owned())
         }
-        TelegramTransportPlan::Webhook(webhook) => {
-            Ok(RunningTelegramIngress::Webhook(WebhookConfig::new(
+        TelegramTransportPlan::Webhook(webhook) => Ok(RunningTelegramIngress::Webhook(
+            WebhookConfig::new(
                 webhook.listen_addr,
                 webhook.route.clone(),
                 webhook.secret_token.expose_secret(),
@@ -2074,8 +2080,9 @@ async fn start_telegram_binding(
                 bot.id,
                 bot.username.clone(),
                 ingress_tx,
-            )))
-        }
+            )
+            .with_callback_consumer(callback_consumer),
+        )),
     }
 }
 
@@ -2098,10 +2105,15 @@ async fn supervise_telegram_binding(
     plan: TelegramIngressPlan,
     provider: Arc<dyn ModelProvider>,
     profile: PathBuf,
-    workspaces: Arc<harw_authority::WorkspaceRegistry>,
+    sessions_root: PathBuf,
+    services: TelegramBindingServices,
     work_requests: Arc<WorkRequestStore>,
 ) -> Infallible {
     let binding_id = plan.binding.id.clone();
+    // Ein einziger Approval-Token-Store je Bindung, bewusst außerhalb der
+    // Neustart-Schleife: Adapter (Callback-Prüfung) und Renderer (Ausgabe)
+    // teilen ihn, und offene Freigaben überleben einen Transport-Neustart.
+    let approval_tokens = Arc::new(ApprovalTokenStore::with_ttl(TELEGRAM_APPROVAL_TTL));
     let mut attempt: u32 = 0;
     loop {
         let started = Instant::now();
@@ -2109,8 +2121,10 @@ async fn supervise_telegram_binding(
             &plan,
             Arc::clone(&provider),
             &profile,
-            Arc::clone(&workspaces),
+            &sessions_root,
+            &services,
             Arc::clone(&work_requests),
+            Arc::clone(&approval_tokens),
         )
         .await
         {
@@ -2132,14 +2146,16 @@ async fn supervise_telegram_binding(
                     }
                 }
             }
-            Ok(RunningTelegramIngress::Webhook(config)) => match run_webhook_server(config).await {
-                Ok(()) => {
-                    tracing::warn!(binding = %binding_id, "Telegram webhook listener stopped; restarting with backoff");
+            Ok(RunningTelegramIngress::Webhook(config)) => {
+                match run_webhook_server_with_shutdown(config, std::future::pending::<()>()).await {
+                    Ok(()) => {
+                        tracing::warn!(binding = %binding_id, "Telegram webhook listener stopped; restarting with backoff");
+                    }
+                    Err(error) => {
+                        tracing::error!(binding = %binding_id, error = %error, "Telegram webhook listener failed; restarting with backoff");
+                    }
                 }
-                Err(error) => {
-                    tracing::error!(binding = %binding_id, error = %error, "Telegram webhook listener failed; restarting with backoff");
-                }
-            },
+            }
             Err(error) => {
                 tracing::error!(binding = %binding_id, error = %error, "Telegram ingress setup failed; retrying with backoff");
             }
@@ -2448,7 +2464,6 @@ async fn run_dream_job(
     config: &ResolvedConfig,
 ) -> Result<PathBuf, String> {
     let now = Timestamp::now();
-    let date = now.strftime("%Y-%m-%d").to_string();
     let job_id = format!("dream-{}", now.strftime("%Y%m%dT%H%M%S"));
 
     // Governance: budgetierter, retry-fähiger Job (tokens/wall/tools gedeckelt).
@@ -2558,8 +2573,7 @@ async fn run_dream_job(
     })
     .map_err(|e| e.to_string())?;
 
-    let report_path =
-        write_review_gated_dream_report(knowledge, &date, &job_id, &now, idle, &reflection)?;
+    let report_path = write_review_gated_dream_report(knowledge, &job_id, &now, idle, &reflection)?;
 
     Ok(report_path)
 }
@@ -2640,33 +2654,27 @@ fn last_assistant_text(session: &AgentSession) -> String {
 /// Diary oder andere dauerhafte Wissensbereiche übernommen werden.
 fn write_review_gated_dream_report(
     knowledge: &KnowledgeStore,
-    date: &str,
     job_id: &str,
     at: &Timestamp,
     idle: Duration,
     reflection: &str,
 ) -> Result<PathBuf, String> {
-    let report = render_dream_report(job_id, at, idle, reflection);
-    let report_path = knowledge.dream_path(date, job_id);
-    harw_knowledge::store::write_atomic(&report_path, &report)
-        .map_err(|error| error.to_string())?;
-    Ok(report_path)
-}
-
-/// Rendert einen `DreamReport` als review-gated Markdown-Dokument.
-fn render_dream_report(job_id: &str, at: &Timestamp, idle: Duration, reflection: &str) -> String {
-    format!(
-        "# Traumbericht {job_id}\n\n\
-         - Zeit: {}\n\
-         - Idle vor dem Schlaf: {} min\n\
-         - Status: **review-gated** (keine automatische Übernahme in Memory/Palace)\n\n\
-         ## Reflexion\n\n{reflection}\n\n\
-         ## Vorschläge\n\n\
-         _Keine automatisch übernommenen Änderungen. Prüfe die Reflexion und \
-         promote sie bei Bedarf manuell nach `topics/` oder `palace/`._\n",
-        at.strftime("%Y-%m-%d %H:%M:%S"),
-        idle.as_secs() / 60,
-    )
+    let report = harw_knowledge::DreamReport {
+        work_id: harw_job_runtime::WorkId::from_str(job_id),
+        created_at: *at,
+        summary: format!(
+            "Idle vor dem Schlaf: {} min\n\n{reflection}",
+            idle.as_secs() / 60
+        ),
+        proposed_topic_updates: Vec::new(),
+        proposed_palace_promotions: Vec::new(),
+        follow_ups: Vec::new(),
+    };
+    // Gültige Frontmatter (kind `dream_report`, operator_only): der Bericht
+    // bleibt review-gated und bricht den Wissensindex nicht mehr.
+    knowledge
+        .write_dream_report(&report)
+        .map_err(|error| error.to_string())
 }
 
 #[cfg(test)]
@@ -2779,13 +2787,24 @@ mod tests {
     }
 
     #[test]
-    fn dream_report_marks_review_gated_and_embeds_reflection() {
+    fn dream_report_is_indexable_and_review_gated() -> TestResult {
+        let tmp = tempfile::tempdir().map_err(ctx("temp dir"))?;
+        let store = KnowledgeStore::new(tmp.path());
         let now = Timestamp::now();
-        let report =
-            render_dream_report("dream-x", &now, Duration::from_secs(20 * 60), "Wichtig: A.");
+        let path = write_review_gated_dream_report(
+            &store,
+            "dream-x",
+            &now,
+            Duration::from_secs(20 * 60),
+            "Wichtig: A.",
+        )
+        .map_err(ctx("write dream report"))?;
+        let report = std::fs::read_to_string(path).map_err(ctx("read report"))?;
         assert!(report.contains("review-gated"));
         assert!(report.contains("Wichtig: A."));
         assert!(report.contains("20 min"));
+        harw_knowledge::index::KnowledgeIndex::rebuild(&store).map_err(ctx("index rebuild"))?;
+        Ok(())
     }
 
     #[test]
@@ -2999,7 +3018,6 @@ mod tests {
         let reflection = "nur im Bericht";
         let report_path = write_review_gated_dream_report(
             &store,
-            "2026-07-15",
             "dream-test",
             &now,
             Duration::from_secs(20 * 60),
@@ -3012,7 +3030,11 @@ mod tests {
         assert!(report.contains(reflection));
 
         let agent = harw_knowledge::AgentId::new("gateway");
-        assert!(!store.diary_path(&agent, "2026-07-15").exists());
+        assert!(
+            !store
+                .diary_path(&agent, &now.strftime("%Y-%m-%d").to_string())
+                .exists()
+        );
         Ok(())
     }
 
@@ -3075,6 +3097,513 @@ pinned_identities = [123456789]
         assert_eq!(telegram_restart_backoff(6), Duration::from_secs(60));
         assert_eq!(telegram_restart_backoff(100), Duration::from_secs(60));
         assert_eq!(telegram_restart_backoff(u32::MAX), Duration::from_secs(60));
+    }
+
+    /// Baut eine `ResolvedConfig` aus einer `channels/*.toml`-Datei und
+    /// einem Env-Layer (statt Prozessumgebung, damit Tests isoliert bleiben).
+    fn telegram_test_config(
+        channel_file: &str,
+        env: &[(&str, &str)],
+    ) -> TestResult<ResolvedConfig> {
+        let file: harw_config::ChannelFileToml =
+            toml::from_str(channel_file).map_err(ctx("parse channel file"))?;
+        let mut config = ResolvedConfig {
+            channels: harw_config::channel_toml::flatten_channel_file(file),
+            ..Default::default()
+        };
+        for (name, value) in env {
+            config
+                .env_layer
+                .insert((*name).to_owned(), (*value).to_owned());
+        }
+        Ok(config)
+    }
+
+    /// Erste (einzige) Telegram-Bindung einer Test-Konfiguration.
+    fn first_telegram_binding(config: &ResolvedConfig) -> TestResult<&TelegramChannelToml> {
+        enabled_telegram_bindings(config)
+            .into_iter()
+            .next()
+            .ok_or(TestError::Missing("an enabled Telegram binding"))
+    }
+
+    #[test]
+    fn telegram_principal_is_derived_from_the_binding_id() {
+        assert_eq!(
+            telegram_principal_peer("telegram:support-bot"),
+            "support-bot"
+        );
+        assert_eq!(telegram_principal_peer("support-bot"), "support-bot");
+        assert_eq!(telegram_principal_peer("telegram:"), "telegram:");
+        let principal = channel_principal(
+            GatewayEntry::Telegram,
+            telegram_principal_peer("telegram:ops"),
+        );
+        assert_eq!(principal.id(), "telegram:ops");
+        assert_ne!(principal.id(), "telegram:gateway");
+    }
+
+    #[test]
+    fn enabled_telegram_binding_ids_are_sorted_and_skip_disabled_bindings() -> TestResult {
+        let config = telegram_test_config(
+            r#"
+[[channel.telegram]]
+id = "telegram:zulu"
+bot_token_ref = "env:HARW_GW_TEST_TOKEN_Z"
+
+[[channel.telegram]]
+id = "telegram:alpha"
+bot_token_ref = "env:HARW_GW_TEST_TOKEN_A"
+
+[[channel.telegram]]
+id = "telegram:off"
+enabled = false
+bot_token_ref = "env:HARW_GW_TEST_TOKEN_O"
+"#,
+            &[],
+        )?;
+        assert_eq!(
+            enabled_telegram_binding_ids(&config),
+            vec!["telegram:alpha".to_owned(), "telegram:zulu".to_owned()]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn multiple_telegram_bindings_each_get_their_own_ingress_plan() -> TestResult {
+        let config = telegram_test_config(
+            r#"
+[[channel.telegram]]
+id = "telegram:ops"
+bot_token_ref = "env:HARW_GW_TEST_MULTI_TOKEN_OPS"
+[channel.telegram.security]
+pinned_identities = [1]
+
+[[channel.telegram]]
+id = "telegram:support"
+bot_token_ref = "env:HARW_GW_TEST_MULTI_TOKEN_SUPPORT"
+[channel.telegram.security]
+pinned_identities = [2]
+"#,
+            &[
+                ("HARW_GW_TEST_MULTI_TOKEN_OPS", "111:ops-token"),
+                ("HARW_GW_TEST_MULTI_TOKEN_SUPPORT", "222:support-token"),
+            ],
+        )?;
+
+        let bindings = telegram_ingress_modes(&config);
+
+        assert_eq!(bindings.len(), 2);
+        assert!(
+            bindings
+                .iter()
+                .all(|binding| matches!(binding.mode, TelegramIngressMode::Enabled(_)))
+        );
+        let status = telegram_ingress_status(&bindings);
+        assert!(status.contains("telegram:ops: bereit"));
+        assert!(status.contains("telegram:support: bereit"));
+        assert!(!status.contains("ops-token"));
+        assert!(!status.contains("support-token"));
+        Ok(())
+    }
+
+    #[test]
+    fn telegram_bindings_sharing_a_bot_token_are_all_disabled() -> TestResult {
+        let config = telegram_test_config(
+            r#"
+[[channel.telegram]]
+id = "telegram:one"
+bot_token_ref = "env:HARW_GW_TEST_SHARED_TOKEN_ONE"
+[channel.telegram.security]
+pinned_identities = [1]
+
+[[channel.telegram]]
+id = "telegram:two"
+bot_token_ref = "env:HARW_GW_TEST_SHARED_TOKEN_TWO"
+[channel.telegram.security]
+pinned_identities = [1]
+"#,
+            &[
+                ("HARW_GW_TEST_SHARED_TOKEN_ONE", "333:same-token"),
+                ("HARW_GW_TEST_SHARED_TOKEN_TWO", "333:same-token"),
+            ],
+        )?;
+
+        let bindings = telegram_ingress_modes(&config);
+
+        assert_eq!(bindings.len(), 2);
+        for binding in &bindings {
+            let TelegramIngressMode::Disabled(reason) = &binding.mode else {
+                return Err(TestError::Unexpected(format!(
+                    "{} must be disabled when its bot token is shared",
+                    binding.id
+                )));
+            };
+            assert!(reason.contains("share one bot credential"));
+        }
+        assert!(!telegram_ingress_status(&bindings).contains("same-token"));
+        Ok(())
+    }
+
+    #[test]
+    fn telegram_webhook_binding_resolves_url_route_listener_and_secret() -> TestResult {
+        let config = telegram_test_config(
+            r#"
+[[channel.telegram]]
+id = "telegram:hook"
+bot_token_ref = "env:HARW_GW_TEST_HOOK_TOKEN"
+transport = "webhook"
+[channel.telegram.transport_webhook]
+public_url = "https://ingress.example.com/telegram/hook-bot"
+secret_token_ref = "env:HARW_GW_TEST_HOOK_SECRET"
+listen_addr = "127.0.0.1:8443"
+[channel.telegram.security]
+pinned_identities = [7]
+"#,
+            &[
+                ("HARW_GW_TEST_HOOK_TOKEN", "444:hook-token"),
+                ("HARW_GW_TEST_HOOK_SECRET", "hook_secret-value"),
+            ],
+        )?;
+
+        let bindings = telegram_ingress_modes(&config);
+        let [binding] = bindings.as_slice() else {
+            return Err(TestError::Unexpected("exactly one binding expected".into()));
+        };
+        let TelegramIngressMode::Enabled(plan) = &binding.mode else {
+            return Err(TestError::Unexpected(
+                "webhook binding must be enabled".into(),
+            ));
+        };
+        let TelegramTransportPlan::Webhook(webhook) = &plan.transport else {
+            return Err(TestError::Unexpected("webhook transport expected".into()));
+        };
+        assert_eq!(
+            webhook.public_url,
+            "https://ingress.example.com/telegram/hook-bot"
+        );
+        assert_eq!(webhook.route, "/telegram/hook-bot");
+        assert_eq!(webhook.listen_addr.to_string(), "127.0.0.1:8443");
+        assert_eq!(webhook.secret_token.expose_secret(), "hook_secret-value");
+
+        let status = telegram_ingress_status(&bindings);
+        assert!(status.contains("Webhook-Adapter auf 127.0.0.1:8443/telegram/hook-bot"));
+        assert!(!status.contains("hook_secret-value"));
+        assert!(!status.contains("hook-token"));
+        assert!(!status.contains("ingress.example.com"));
+        Ok(())
+    }
+
+    #[test]
+    fn telegram_webhook_without_resolvable_secret_fails_closed() -> TestResult {
+        let config = telegram_test_config(
+            r#"
+[[channel.telegram]]
+id = "telegram:hook"
+bot_token_ref = "env:HARW_GW_TEST_NOSECRET_TOKEN"
+transport = "webhook"
+[channel.telegram.transport_webhook]
+public_url = "https://ingress.example.com/telegram"
+secret_token_ref = "env:HARW_GW_TEST_NOSECRET_UNSET"
+listen_addr = "127.0.0.1:8443"
+[channel.telegram.security]
+pinned_identities = [7]
+"#,
+            &[("HARW_GW_TEST_NOSECRET_TOKEN", "555:token")],
+        )?;
+
+        let status = telegram_ingress_status(&telegram_ingress_modes(&config));
+
+        assert!(status.contains("fail closed"));
+        assert!(status.contains("webhook secret"));
+        assert!(!status.contains("HARW_GW_TEST_NOSECRET_UNSET"));
+        Ok(())
+    }
+
+    #[test]
+    fn telegram_webhook_bindings_sharing_a_listener_are_disabled() -> TestResult {
+        let config = telegram_test_config(
+            r#"
+[[channel.telegram]]
+id = "telegram:a"
+bot_token_ref = "env:HARW_GW_TEST_LISTEN_TOKEN_A"
+transport = "webhook"
+[channel.telegram.transport_webhook]
+public_url = "https://ingress.example.com/a"
+secret_token_ref = "env:HARW_GW_TEST_LISTEN_SECRET"
+listen_addr = "127.0.0.1:8443"
+[channel.telegram.security]
+pinned_identities = [7]
+
+[[channel.telegram]]
+id = "telegram:b"
+bot_token_ref = "env:HARW_GW_TEST_LISTEN_TOKEN_B"
+transport = "webhook"
+[channel.telegram.transport_webhook]
+public_url = "https://ingress.example.com/b"
+secret_token_ref = "env:HARW_GW_TEST_LISTEN_SECRET"
+listen_addr = "127.0.0.1:8443"
+[channel.telegram.security]
+pinned_identities = [7]
+"#,
+            &[
+                ("HARW_GW_TEST_LISTEN_TOKEN_A", "601:a"),
+                ("HARW_GW_TEST_LISTEN_TOKEN_B", "602:b"),
+                ("HARW_GW_TEST_LISTEN_SECRET", "secret"),
+            ],
+        )?;
+
+        let bindings = telegram_ingress_modes(&config);
+
+        assert_eq!(bindings.len(), 2);
+        assert!(bindings.iter().all(|binding| matches!(
+            &binding.mode,
+            TelegramIngressMode::Disabled(reason) if reason.contains("listen_addr is shared")
+        )));
+        Ok(())
+    }
+
+    #[test]
+    fn telegram_transport_choice_falls_back_to_long_poll_only_when_webhook_is_unconfigured()
+    -> TestResult {
+        let long_poll = telegram_test_config(
+            r#"
+[[channel.telegram]]
+id = "telegram:lp"
+bot_token_ref = "env:HARW_GW_TEST_CHOICE"
+"#,
+            &[],
+        )?;
+        assert_eq!(
+            telegram_transport_choice(first_telegram_binding(&long_poll)?),
+            Ok(TelegramTransportChoice::LongPoll {
+                webhook_fallback: false
+            })
+        );
+
+        let fallback = telegram_test_config(
+            r#"
+[[channel.telegram]]
+id = "telegram:fb"
+bot_token_ref = "env:HARW_GW_TEST_CHOICE"
+transport = "webhook"
+"#,
+            &[],
+        )?;
+        assert_eq!(
+            telegram_transport_choice(first_telegram_binding(&fallback)?),
+            Ok(TelegramTransportChoice::LongPoll {
+                webhook_fallback: true
+            })
+        );
+
+        let bad_listener = telegram_test_config(
+            r#"
+[[channel.telegram]]
+id = "telegram:bad"
+bot_token_ref = "env:HARW_GW_TEST_CHOICE"
+transport = "webhook"
+[channel.telegram.transport_webhook]
+public_url = "https://ingress.example.com/hook"
+secret_token_ref = "env:HARW_GW_TEST_CHOICE_SECRET"
+listen_addr = "localhost"
+"#,
+            &[],
+        )?;
+        assert!(telegram_transport_choice(first_telegram_binding(&bad_listener)?).is_err());
+
+        let unknown = telegram_test_config(
+            r#"
+[[channel.telegram]]
+id = "telegram:unknown"
+bot_token_ref = "env:HARW_GW_TEST_CHOICE"
+transport = "carrier_pigeon"
+"#,
+            &[],
+        )?;
+        assert!(telegram_transport_choice(first_telegram_binding(&unknown)?).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn telegram_webhook_route_requires_https_supported_port_and_safe_path() {
+        assert_eq!(
+            telegram_webhook_route("https://ingress.example.com/telegram/support-bot"),
+            Ok("/telegram/support-bot".to_owned())
+        );
+        assert_eq!(
+            telegram_webhook_route("https://ingress.example.com:8443"),
+            Ok("/".to_owned())
+        );
+        assert_eq!(
+            telegram_webhook_route("https://ingress.example.com/hook?x=1"),
+            Ok("/hook".to_owned())
+        );
+        assert!(telegram_webhook_route("http://ingress.example.com/hook").is_err());
+        assert!(telegram_webhook_route("https://ingress.example.com:8080/hook").is_err());
+        assert!(telegram_webhook_route("https://user:pw@ingress.example.com/hook").is_err());
+        assert!(telegram_webhook_route("https://ingress.example.com/{capture}").is_err());
+        assert!(telegram_webhook_route("https://ingress.example.com/hook/").is_err());
+        assert!(telegram_webhook_route("not a url").is_err());
+    }
+
+    #[test]
+    fn webhook_routes_exclude_router_placeholder_syntax() {
+        assert!(is_supported_webhook_route("/"));
+        assert!(is_supported_webhook_route("/telegram/bot-1_a.b~c"));
+        assert!(!is_supported_webhook_route(""));
+        assert!(!is_supported_webhook_route("telegram"));
+        assert!(!is_supported_webhook_route("//double"));
+        assert!(!is_supported_webhook_route("/:param"));
+        assert!(!is_supported_webhook_route("/*rest"));
+        assert!(!is_supported_webhook_route("/{id}"));
+        assert!(!is_supported_webhook_route("/a/../b"));
+    }
+
+    #[test]
+    fn telegram_webhook_secret_follows_the_bot_api_charset() {
+        assert!(is_valid_telegram_webhook_secret("abc_DEF-123"));
+        assert!(is_valid_telegram_webhook_secret(&"a".repeat(256)));
+        assert!(!is_valid_telegram_webhook_secret(""));
+        assert!(!is_valid_telegram_webhook_secret(&"a".repeat(257)));
+        assert!(!is_valid_telegram_webhook_secret("has space"));
+        assert!(!is_valid_telegram_webhook_secret("umlaut-ä"));
+    }
+
+    #[test]
+    fn telegram_binding_services_map_workspaces_admins_and_default_alias() -> TestResult {
+        let home = tempfile::tempdir().map_err(ctx("temp home"))?;
+        fs::create_dir_all(home.path().join("ws").join("ops")).map_err(ctx("workspace root"))?;
+        let config = telegram_test_config(
+            r#"
+[[channel.telegram]]
+id = "telegram:ops"
+bot_token_ref = "env:HARW_GW_TEST_SERVICES_TOKEN"
+[channel.telegram.security]
+pinned_identities = [1]
+admin_identities = [42]
+[[channel.telegram.workspaces]]
+alias = "ops"
+tenant = "default"
+root = "ws/ops"
+default = true
+"#,
+            &[("HARW_GW_TEST_SERVICES_TOKEN", "444:token")],
+        )?;
+        let binding = first_telegram_binding(&config)?;
+        let services = telegram_binding_services(home.path(), binding, home.path())
+            .map_err(TestError::Unexpected)?;
+        assert_eq!(services.default_workspace_alias.as_deref(), Some("ops"));
+        assert!(services.admin_sender_ids.contains("42"));
+        assert_eq!(services.admin_sender_ids.len(), 1);
+        services
+            .workspaces
+            .resolve(
+                &TenantId::from_str("default"),
+                &WorkspaceId::from_str("ops"),
+            )
+            .map_err(ctx("configured workspace resolves"))?;
+        Ok(())
+    }
+
+    #[test]
+    fn telegram_binding_services_fail_closed_on_unresolvable_workspace_or_fallback() -> TestResult {
+        let home = tempfile::tempdir().map_err(ctx("temp home"))?;
+        let missing_root = telegram_test_config(
+            r#"
+[[channel.telegram]]
+id = "telegram:ops"
+bot_token_ref = "env:HARW_GW_TEST_SERVICES_TOKEN"
+[channel.telegram.security]
+pinned_identities = [1]
+[[channel.telegram.workspaces]]
+alias = "ops"
+tenant = "default"
+root = "does-not-exist"
+"#,
+            &[("HARW_GW_TEST_SERVICES_TOKEN", "444:token")],
+        )?;
+        assert!(
+            telegram_binding_services(
+                home.path(),
+                first_telegram_binding(&missing_root)?,
+                home.path()
+            )
+            .is_err()
+        );
+        let bogus_fallback = telegram_test_config(
+            r#"
+[[channel.telegram]]
+id = "telegram:ops"
+bot_token_ref = "env:HARW_GW_TEST_SERVICES_TOKEN"
+[channel.telegram.security]
+pinned_identities = [1]
+[channel.telegram.commands]
+unknown_command_fallback = "bogus"
+"#,
+            &[("HARW_GW_TEST_SERVICES_TOKEN", "444:token")],
+        )?;
+        assert!(
+            telegram_binding_services(
+                home.path(),
+                first_telegram_binding(&bogus_fallback)?,
+                home.path()
+            )
+            .is_err()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn telegram_chat_state_roots_are_per_binding() {
+        let state = Path::new("/state");
+        assert_eq!(
+            telegram_chat_state_root(state, "telegram:a"),
+            Path::new("/state/telegram-chats/74656c656772616d3a61")
+        );
+        assert_ne!(
+            telegram_chat_state_root(state, "telegram:a"),
+            telegram_chat_state_root(state, "telegram:b")
+        );
+    }
+
+    #[test]
+    fn telegram_offset_roots_are_per_binding_and_keep_the_legacy_default() {
+        let state = Path::new("/state");
+        assert_eq!(
+            telegram_offset_root(state, "telegram:default"),
+            PathBuf::from("/state/telegram-offset")
+        );
+        let ops = telegram_offset_root(state, "telegram:ops");
+        assert_eq!(
+            ops,
+            PathBuf::from("/state/telegram-offset/74656c656772616d3a6f7073")
+        );
+        assert_ne!(ops, telegram_offset_root(state, "telegram_ops"));
+    }
+
+    #[test]
+    fn telegram_backoff_resets_only_after_a_stable_run() {
+        assert_eq!(telegram_attempt_after_run(5, TELEGRAM_STABLE_RUN), 0);
+        assert_eq!(
+            telegram_attempt_after_run(5, TELEGRAM_STABLE_RUN + Duration::from_secs(1)),
+            0
+        );
+        assert_eq!(telegram_attempt_after_run(5, Duration::from_millis(10)), 5);
+        assert_eq!(telegram_attempt_after_run(0, Duration::ZERO), 0);
+    }
+
+    #[test]
+    fn telegram_topic_mode_accepts_only_documented_values() {
+        assert_eq!(
+            telegram_topic_mode("per_topic_session"),
+            Some(TopicMode::PerTopicSession)
+        );
+        assert_eq!(
+            telegram_topic_mode("shared_session"),
+            Some(TopicMode::SharedSession)
+        );
+        assert_eq!(telegram_topic_mode("per_user"), None);
     }
 
     #[test]
@@ -3507,9 +4036,10 @@ pinned_identities = [123456789]
     /// Regression B3/G2: ein aktivierter Provider mit `secrets:`-Credential,
     /// konfiguriertem KEK und versiegeltem Token muss über den Resolver
     /// montieren — nicht mit „sealed secret … could not be resolved" bzw.
-    /// „secret resolver failed" scheitern. Zugleich Beleg für G1: Telegram
-    /// und Dream bekommen je eine eigene Montage mit eigener `EntryKind` und
-    /// eigenem Principal. Kein Netz: der Provider wird nur gebaut, nie
+    /// „secret resolver failed" scheitern. Zugleich Beleg für G1: jede
+    /// aktivierte Telegram-Bindung und Dream bekommen je eine eigene Montage
+    /// mit eigener `EntryKind` und eigenem, aus der Bindung abgeleitetem
+    /// Principal. Kein Netz: der Provider wird nur gebaut, nie
     /// angefragt.
     #[test]
     fn test_mount_gateway_assembly_sealed_secret_provider_resolves_with_kek() -> TestResult {
@@ -3518,6 +4048,15 @@ pinned_identities = [123456789]
         let key_path = write_gateway_test_kek(home.path())?;
         seal_gateway_test_provider_token(home.path(), &key_path)?;
         write_gateway_sealed_provider_home(home.path(), Some(&key_path))?;
+        // Eine aktivierte Telegram-Bindung: ihre Montage muss einen aus der
+        // Bindungs-ID abgeleiteten Principal tragen (kein Platzhalter mehr).
+        std::fs::create_dir_all(home.path().join("channels"))
+            .map_err(ctx("create channels dir"))?;
+        std::fs::write(
+            home.path().join("channels").join("telegram.toml"),
+            "[[channel.telegram]]\nid = \"telegram:ops\"\nbot_token_ref = \"env:HARW_GW_TEST_MOUNT_TOKEN\"\n\n[channel.telegram.security]\npinned_identities = [42]\n",
+        )
+        .map_err(ctx("write telegram channel"))?;
         let sessions_root = home.path().join("sessions");
 
         let result = mount_gateway_assembly(home.path(), cwd.path(), &sessions_root);
@@ -3536,19 +4075,25 @@ pinned_identities = [123456789]
 
         assert_eq!(
             assemblies
-                .telegram
+                .dream
                 .config()
                 .harness
                 .default_provider
                 .as_deref(),
             Some("sealed")
         );
-        let telegram_rights = assemblies.telegram.rights_snapshot();
+        let [telegram] = assemblies.telegram.as_slice() else {
+            return Err(TestError::Unexpected(
+                "exactly one Telegram assembly per enabled binding expected".into(),
+            ));
+        };
+        assert_eq!(telegram.binding_id, "telegram:ops");
+        let telegram_rights = telegram.assembly.rights_snapshot();
         assert_eq!(
             telegram_rights.entry,
             harw_runtime::EntryKind::GatewayTelegram
         );
-        assert_eq!(telegram_rights.principal.id(), "telegram:gateway");
+        assert_eq!(telegram_rights.principal.id(), "telegram:ops");
         let dream_rights = assemblies.dream.rights_snapshot();
         assert_eq!(dream_rights.entry, harw_runtime::EntryKind::GatewayDream);
         assert_eq!(dream_rights.principal.id(), "gateway-dream");
@@ -3587,7 +4132,7 @@ pinned_identities = [123456789]
         let cwd = tempfile::tempdir().map_err(ctx("temp cwd"))?;
         let principal = channel_principal(GatewayEntry::Dream, "");
 
-        let resolver =
+        let (resolver, _config) =
             open_gateway_secret_resolver(GatewayEntry::Dream, home.path(), cwd.path(), &principal)
                 .map_err(ctx("an empty home has no sealed provider and needs no KEK"))?;
 
@@ -3636,7 +4181,7 @@ pinned_identities = [123456789]
         write_gateway_home_with_unused_sealed_provider(home.path())?;
         let principal = channel_principal(GatewayEntry::Dream, "");
 
-        let resolver = open_gateway_secret_resolver(
+        let (resolver, _config) = open_gateway_secret_resolver(
             GatewayEntry::Dream,
             home.path(),
             cwd.path(),

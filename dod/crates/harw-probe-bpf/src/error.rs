@@ -2,16 +2,33 @@
 //!
 //! # Verantwortungsbereich
 //! [`ProbeError`] ist der eine Fehlertyp dieses Binaries. Er deckt fünf
-//! Quellen ab: die Landlock-Durchsetzung ([`crate::landlock`]), den
-//! (nach Aufgabenstellung nicht gebauten) realen eBPF-Ladeteil
-//! ([`crate::real_loader`]) samt eines fehlgeschlagenen `load()`-Aufrufs auf
-//! einem echten oder Fixture-`harw_dod_bpf::BpfLoader`
-//! ([`crate::sensors`]), den Sendeweg zum Sentinel ([`crate::sink`]) und
-//! Sensorfehler aus der Sammelschleife ([`crate::collect`], über
-//! `harw_dod_cap::SensorError`) sowie den `completions`-Unterbefehl (über
-//! `harw_completions::CompletionError`). Kommandozeilenfehler gehören **nicht**
-//! hierher — `clap::Error` behandelt `main` direkt, ohne Umweg über diesen
-//! Typ (Muster: `harw-sentinel/src/main.rs`, `harw-probe-fs/src/main.rs`).
+//! Quellen ab:
+//!
+//! 1. die Landlock-Durchsetzung ([`crate::landlock`]);
+//! 2. das Laden der eBPF-Objekte — den transaktionalen Produktionspfad
+//!    `RealBpfLoader::load_contracts` ([`crate::real_loader::load_sensor`])
+//!    ebenso wie einen gescheiterten `load()`-Aufruf auf einem echten oder
+//!    Fixture-`harw_dod_bpf::BpfLoader` ([`crate::sensors`]);
+//! 3. den Sendeweg zum Sentinel ([`crate::sink`]);
+//! 4. Sensorfehler aus der Sammelschleife ([`crate::collect`], über
+//!    `harw_dod_cap::SensorError`);
+//! 5. den `completions`-Unterbefehl (über
+//!    `harw_completions::CompletionError`).
+//!
+//! **Nicht** hierher gehört ein fehlendes oder ungültiges eBPF-Objekt: die
+//! Objektauflösung ([`crate::sensors::resolve_procmon_objects`],
+//! [`crate::sensors::resolve_flow_objects`]) meldet das als
+//! [`crate::sensors::ObjectUnavailable`], und der betroffene Sensor wird als
+//! [`crate::sensors::UnavailableSensor`] degradiert (`SensorDegraded` an den
+//! Sentinel), statt den Prozess zu beenden. Auch ein
+//! [`ProbeError::BpfLoad`] ist deshalb nicht automatisch ein Startabbruch —
+//! ob ein Ladefehler den Sensor nur degradiert oder den Prozess beendet,
+//! entscheidet der Aufrufer in `main` anhand der inneren
+//! `harw_dod_bpf::BpfError`-Variante.
+//!
+//! Kommandozeilenfehler gehören ebenfalls **nicht** hierher — `clap::Error`
+//! behandelt `main` direkt, ohne Umweg über diesen Typ (Muster:
+//! `harw-sentinel/src/main.rs`, `harw-probe-fs/src/main.rs`).
 //!
 //! # Warum kein `harw-macros`
 //! `harw-probe-fs` (dasselbe Knotenmuster, dieselbe Aufgabenform) hat sich
@@ -74,12 +91,19 @@ pub enum ProbeError {
     /// [`crate::landlock`]-Moduldoku, Abschnitt „Die Landlock-Asymmetrie".
     LandlockUnavailable,
 
-    /// Ein `harw_dod_bpf::BpfLoader::load`-Aufruf ist gescheitert.
+    /// Das Laden eines eBPF-Objekts ist gescheitert — über
+    /// `RealBpfLoader::load_contracts` ([`crate::real_loader::load_sensor`];
+    /// bereits angeheftete Objekte desselben Aufrufs sind dann wieder
+    /// entfernt) oder über `harw_dod_bpf::BpfLoader::load`
+    /// ([`crate::sensors`]).
     ///
     /// # Arguments
     /// - `source` (`harw_dod_bpf::BpfError`): der zugrunde liegende,
-    ///   inhaltsfreie Ladefehler (z. B. `CapabilityUnavailable` auf einem
-    ///   Host ohne `CAP_BPF`). Über `std::error::Error::source()` verlinkt.
+    ///   inhaltsfreie Ladefehler (z. B. `AttachCapabilitiesUnavailable`/
+    ///   `CapabilityUnavailable` auf einem Host ohne die nötigen Fähigkeiten,
+    ///   `InvalidProgramContract` für einen nicht vertragsgemäßen Objektsatz,
+    ///   `Io`/`ProgramLoadFailed` für Lese- bzw. Lade-/Anheftfehler). Über
+    ///   `std::error::Error::source()` verlinkt.
     BpfLoad(harw_dod_bpf::BpfError),
 
     /// Der Verbindungsaufbau zum Sentinel-Socket ist gescheitert.
@@ -106,8 +130,8 @@ pub enum ProbeError {
     ///
     /// # Arguments
     /// - `source` (`harw_dod_cap::SensorError`): der zugrunde liegende,
-    ///   inhaltsfreie Sensorfehler — entsteht sowohl bei `ProcmonSensor::poll`
-    ///   als auch bei `sensors::FlowSensor::poll`. Über
+    ///   inhaltsfreie Sensorfehler — entsteht bei `Sensor::poll` im
+    ///   generischen Zweig der Sammelschleife (`crate::collect::run_once`). Über
     ///   `std::error::Error::source()` verlinkt.
     Sensor(harw_dod_cap::SensorError),
 

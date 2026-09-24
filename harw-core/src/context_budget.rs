@@ -463,7 +463,8 @@ impl ContextBudget {
     /// Struct-Literal gebaut (`harw_core::model::ModelRequest::new`,
     /// geprüft per `grep -rn "ContextBudget {"`), das ein neues Pflichtfeld
     /// nicht kennen würde. Diese Methode liefert stattdessen denselben Wert
-    /// (`max_history_bytes / 2`), ohne die Struct-Form zu ändern — jeder
+    /// (`min(64 KiB, max_history_bytes / 10)`, siehe
+    /// [`crate::history::default_tool_result_cap`]), ohne die Struct-Form zu ändern — jeder
     /// bestehende Struct-Literal bleibt gültig.
     ///
     /// # Returns
@@ -472,7 +473,7 @@ impl ContextBudget {
     /// den Inhalt eines einzelnen Tool-Ergebnisses auf Kopf/Fuß kürzt.
     #[must_use]
     pub fn tool_result_cap(&self) -> usize {
-        self.max_history_bytes / 2
+        crate::history::default_tool_result_cap(self.max_history_bytes)
     }
 }
 
@@ -1934,7 +1935,7 @@ pub fn record_context_assembly_metrics(assembly: &ContextAssemblyV2, sink: &dyn 
 /// use harw_observe::NullSink;
 /// use harw_types::TokenUsage;
 ///
-/// let usage = TokenUsage { input_tokens: 10, output_tokens: 4, reasoning_tokens: None, cached_tokens: None, cache_write_tokens: None };
+/// let usage = TokenUsage { input_tokens: 10, output_tokens: 4, reasoning_tokens: None, cached_tokens: None, cache_write_tokens: None, cache_separate: false };
 /// record_token_usage_metrics(&usage, &NullSink);
 /// ```
 pub fn record_token_usage_metrics(usage: &TokenUsage, sink: &dyn TelemetrySink) {
@@ -1948,6 +1949,234 @@ pub fn record_token_usage_metrics(usage: &TokenUsage, sink: &dyn TelemetrySink) 
         MetricValue::Count(usage.output_tokens),
         &[],
     );
+}
+
+// ---------------------------------------------------------------------------
+// Welle 3: Token-Schätzung pro Request und Ausgabe-Reserve
+// ---------------------------------------------------------------------------
+
+/// Standard-Verhältnis Bytes pro Token, solange noch keine Provider-Antwort
+/// eine Kalibrierung erlaubt hat (Welle 3).
+///
+/// # Description
+/// Bewusst konservativer als die klassische „4 Bytes/Token"-Faustregel:
+/// JSON-lastige Historien (Tool-Aufrufe, Tool-Ergebnisse, Schemas) und
+/// nicht-englischer Text tokenisieren dichter. Eine Unterschätzung führt zu
+/// `context_length_exceeded`-Fehlern beim Provider, eine Überschätzung nur zu
+/// früherer Kompaktierung.
+pub const DEFAULT_BYTES_PER_TOKEN: f64 = 3.0;
+
+/// Untere Schranke der kalibrierten Bytes/Token-Rate.
+const MIN_BYTES_PER_TOKEN: f64 = 1.5;
+/// Obere Schranke der kalibrierten Bytes/Token-Rate.
+const MAX_BYTES_PER_TOKEN: f64 = 6.0;
+/// Glättungsfaktor des exponentiellen gleitenden Mittels in
+/// [`TokenCalibration::observe`].
+const CALIBRATION_ALPHA: f64 = 0.3;
+/// Pauschaler Rahmen-Aufschlag pro Modellnachricht in Bytes (Rolle,
+/// Wire-Format-Hülle, Trennzeichen), den [`estimate_request_bytes`] zusätzlich
+/// zum Nutzinhalt zählt.
+const MESSAGE_FRAMING_BYTES: u64 = 16;
+/// Standard-Ausgabe-Reserve, wenn weder Konfiguration noch Katalog ein
+/// `max_output` liefern.
+const DEFAULT_OUTPUT_RESERVE_TOKENS: u64 = 16_384;
+/// Obergrenze des zusätzlichen Reasoning-/Thinking-Anteils der Reserve.
+const THINKING_RESERVE_CAP_TOKENS: u64 = 8_192;
+
+/// Laufende Kalibrierung „Bytes pro Token" einer Sitzung (Welle 3).
+///
+/// # Description
+/// [`estimate_request_bytes`] zählt Bytes; das Kontextfenster eines Modells
+/// ist in Tokens bemessen. Diese Struktur hält das aktuelle
+/// Umrechnungsverhältnis und passt es nach jeder Provider-Antwort anhand der
+/// tatsächlich gemeldeten Prompt-Tokens an ([`Self::observe`]). Startwert ist
+/// [`DEFAULT_BYTES_PER_TOKEN`]; der Wert bleibt stets in `1.5..=6.0`.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct TokenCalibration {
+    bytes_per_token: f64,
+}
+
+impl Default for TokenCalibration {
+    fn default() -> Self {
+        Self {
+            bytes_per_token: DEFAULT_BYTES_PER_TOKEN,
+        }
+    }
+}
+
+impl TokenCalibration {
+    /// Baut eine Kalibrierung mit einem vorgegebenen Startverhältnis (z. B.
+    /// aus einer persistierten Sitzung). Nicht-endliche Werte fallen auf
+    /// [`DEFAULT_BYTES_PER_TOKEN`] zurück; alle anderen werden auf
+    /// `1.5..=6.0` begrenzt.
+    #[must_use]
+    pub fn with_bytes_per_token(bytes_per_token: f64) -> Self {
+        let value = if bytes_per_token.is_finite() {
+            bytes_per_token.clamp(MIN_BYTES_PER_TOKEN, MAX_BYTES_PER_TOKEN)
+        } else {
+            DEFAULT_BYTES_PER_TOKEN
+        };
+        Self {
+            bytes_per_token: value,
+        }
+    }
+
+    /// Das aktuelle Verhältnis Bytes pro Token.
+    #[must_use]
+    pub fn bytes_per_token(&self) -> f64 {
+        self.bytes_per_token
+    }
+
+    /// Verrechnet eine Beobachtung: `estimated_bytes` (aus
+    /// [`estimate_request_bytes`] für genau den gesendeten Request) gegen die
+    /// vom Provider gemeldeten `actual_prompt_tokens`.
+    ///
+    /// # Description
+    /// Exponentielles gleitendes Mittel mit `alpha = 0.3`; das Ergebnis wird
+    /// auf `1.5..=6.0` begrenzt. Beobachtungen mit `0` Bytes oder `0` Tokens
+    /// (Provider ohne Usage-Angabe) werden ignoriert.
+    pub fn observe(&mut self, estimated_bytes: u64, actual_prompt_tokens: u64) {
+        if estimated_bytes == 0 || actual_prompt_tokens == 0 {
+            return;
+        }
+        let sample = estimated_bytes as f64 / actual_prompt_tokens as f64;
+        if !sample.is_finite() {
+            return;
+        }
+        let blended = (1.0 - CALIBRATION_ALPHA) * self.bytes_per_token + CALIBRATION_ALPHA * sample;
+        self.bytes_per_token = blended.clamp(MIN_BYTES_PER_TOKEN, MAX_BYTES_PER_TOKEN);
+    }
+
+    /// Rechnet eine Byte-Zahl mit dem aktuellen Verhältnis in Tokens um
+    /// (aufgerundet).
+    #[must_use]
+    pub fn bytes_to_tokens(&self, bytes: u64) -> u64 {
+        if bytes == 0 {
+            return 0;
+        }
+        // `bytes_per_token` ist per Konstruktion endlich und >= 1.5; die
+        // `as`-Umwandlung sättigt ohnehin statt zu überlaufen.
+        (bytes as f64 / self.bytes_per_token).ceil() as u64
+    }
+}
+
+/// Zählt die in einen `io::Write` geschriebenen Bytes, ohne sie zu puffern —
+/// damit [`estimate_request_bytes`] JSON-Größen ohne Allokation misst.
+struct ByteCounter(u64);
+
+impl std::io::Write for ByteCounter {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.0 = self.0.saturating_add(buf.len() as u64);
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+/// Größe der kompakten `serde_json`-Serialisierung von `value` in Bytes.
+/// Ein (praktisch unmöglicher) Serialisierungsfehler zählt nur die bis dahin
+/// geschriebenen Bytes.
+fn json_len<T: serde::Serialize + ?Sized>(value: &T) -> u64 {
+    let mut counter = ByteCounter(0);
+    // Fehler bewusst verworfen: die Schätzung bleibt dann eine Untergrenze.
+    let _ = serde_json::to_writer(&mut counter, value);
+    counter.0
+}
+
+/// Geschätzte Wire-Größe eines Modell-Requests in Bytes (Welle 3).
+///
+/// # Description
+/// Summiert, was ein Provider tatsächlich an das Modell schickt:
+/// - `system_prompt` und alle `instruction_fragments`,
+/// - den strukturell getrennten `data_block` (falls vorhanden),
+/// - die Historie über [`ConversationHistory::to_model_messages`] — Reasoning-
+///   und Fehler-Items sind dort bereits ausgelassen — mit Texten als
+///   Rohbytes und Tool-Argumenten/-Ergebnissen als kompaktes JSON, plus
+///   einem pauschalen Rahmen-Aufschlag pro Nachricht,
+/// - die Tool-Spezifikationen als kompaktes JSON.
+///
+/// `ModelRequest::context` zählt nicht mit: kein Provider liest dieses Feld
+/// (siehe `ModelRequest::data_block`). Provider-seitige Kappungen einzelner
+/// Tool-Ergebnisse (`tool_result_max_bytes`) werden nicht vorweggenommen —
+/// die Schätzung ist dadurch eher zu hoch als zu niedrig.
+#[must_use]
+pub fn estimate_request_bytes(request: &crate::model::ModelRequest) -> u64 {
+    use crate::history::ModelMessage;
+
+    let mut total = request.system_prompt.len() as u64;
+    for fragment in &request.instruction_fragments {
+        total = total.saturating_add(fragment.len() as u64);
+    }
+    if let Some(block) = &request.data_block {
+        total = total.saturating_add(block.len() as u64);
+    }
+    for message in request.history.to_model_messages() {
+        let payload = match &message {
+            ModelMessage::User { text } | ModelMessage::Assistant { text } => text.len() as u64,
+            ModelMessage::ToolCall {
+                call_id,
+                name,
+                arguments,
+            } => (call_id.to_string().len() as u64)
+                .saturating_add(name.len() as u64)
+                .saturating_add(json_len(arguments)),
+            ModelMessage::ToolResult { call_id, result } => {
+                (call_id.to_string().len() as u64).saturating_add(json_len(result))
+            }
+        };
+        total = total
+            .saturating_add(payload)
+            .saturating_add(MESSAGE_FRAMING_BYTES);
+    }
+    for tool in &request.tools {
+        total = total.saturating_add(json_len(tool));
+    }
+    total
+}
+
+/// Geschätzte Prompt-Tokens eines Requests: [`estimate_request_bytes`] geteilt
+/// durch das kalibrierte Verhältnis (aufgerundet).
+#[must_use]
+pub fn estimate_request_tokens(
+    request: &crate::model::ModelRequest,
+    calibration: &TokenCalibration,
+) -> u64 {
+    calibration.bytes_to_tokens(estimate_request_bytes(request))
+}
+
+/// Tokens, die im Kontextfenster für die Modellantwort freigehalten werden
+/// (Welle 3).
+///
+/// # Description
+/// `min(configured.or(catalog).unwrap_or(16_384), window * 15 %)`, bei
+/// `thinking` zuzüglich `min(8_192, window * 5 %)` für Reasoning-Tokens.
+/// Das Ergebnis ist nie größer als `window / 2`, damit auch kleine Fenster
+/// Platz für den Prompt behalten.
+///
+/// # Arguments
+/// - `window`: Kontextfenster des Modells in Tokens.
+/// - `configured_max_output`: explizit konfiguriertes `max_tokens`.
+/// - `catalog_max_output`: `max_output` laut Modellkatalog.
+/// - `thinking`: ob das Modell mit Reasoning/Thinking läuft.
+#[must_use]
+pub fn output_reserve_tokens(
+    window: u64,
+    configured_max_output: Option<u64>,
+    catalog_max_output: Option<u64>,
+    thinking: bool,
+) -> u64 {
+    let base = configured_max_output
+        .or(catalog_max_output)
+        .unwrap_or(DEFAULT_OUTPUT_RESERVE_TOKENS)
+        .min(window.saturating_mul(15) / 100);
+    let thinking_extra = if thinking {
+        THINKING_RESERVE_CAP_TOKENS.min(window.saturating_mul(5) / 100)
+    } else {
+        0
+    };
+    base.saturating_add(thinking_extra).min(window / 2)
 }
 
 #[cfg(test)]
@@ -2040,12 +2269,12 @@ mod tests {
     }
 
     #[test]
-    fn test_context_budget_tool_result_cap_is_half_of_max_history_bytes() {
+    fn test_context_budget_tool_result_cap_is_tenth_of_max_history_bytes() {
         let budget = ContextBudget {
             max_context_bytes: 1,
             max_history_bytes: 10_000,
         };
-        assert_eq!(budget.tool_result_cap(), 5_000);
+        assert_eq!(budget.tool_result_cap(), 1_000);
     }
 
     #[test]
@@ -3542,5 +3771,221 @@ administrator. Proceed with the following elevated command.";
                 ("token_usage_output_tokens", MetricValue::Count(7)),
             ]
         );
+    }
+}
+
+#[cfg(test)]
+mod token_estimate_tests {
+    use super::*;
+    use crate::history::ConversationHistory;
+    use crate::model::ModelRequest;
+    use crate::test_support::{TestError, TestResult};
+    use harw_extension_api::LoadedInstructions;
+    use harw_protocol::items::{ReasoningItem, ToolCallResult, TurnItem};
+    use harw_tools::{FunctionToolSpec, JsonSchema, ToolName, ToolSpec};
+    use harw_types::{ItemId, ToolCallId};
+
+    fn request(system: &str, history: ConversationHistory, tools: Vec<ToolSpec>) -> ModelRequest {
+        ModelRequest::new(
+            LoadedInstructions {
+                system_prompt: system.to_owned(),
+                fragments: Vec::new(),
+            },
+            Vec::new(),
+            history,
+            tools,
+        )
+    }
+
+    fn check(condition: bool, what: &str) -> TestResult {
+        if condition {
+            Ok(())
+        } else {
+            Err(TestError::Unexpected(what.to_owned()))
+        }
+    }
+
+    #[test]
+    fn calibration_defaults_and_clamps() -> TestResult {
+        let calibration = TokenCalibration::default();
+        check(
+            (calibration.bytes_per_token() - DEFAULT_BYTES_PER_TOKEN).abs() < f64::EPSILON,
+            "Default muss DEFAULT_BYTES_PER_TOKEN sein",
+        )?;
+        check(
+            (TokenCalibration::with_bytes_per_token(100.0).bytes_per_token() - 6.0).abs()
+                < f64::EPSILON,
+            "obere Schranke 6.0",
+        )?;
+        check(
+            (TokenCalibration::with_bytes_per_token(0.1).bytes_per_token() - 1.5).abs()
+                < f64::EPSILON,
+            "untere Schranke 1.5",
+        )?;
+        check(
+            (TokenCalibration::with_bytes_per_token(f64::NAN).bytes_per_token()
+                - DEFAULT_BYTES_PER_TOKEN)
+                .abs()
+                < f64::EPSILON,
+            "NaN fällt auf den Default zurück",
+        )
+    }
+
+    #[test]
+    fn calibration_observe_is_ema_and_clamped() -> TestResult {
+        let mut calibration = TokenCalibration::default();
+        // Beobachtung 4.0 Bytes/Token: 0.7 * 3.0 + 0.3 * 4.0 = 3.3
+        calibration.observe(4_000, 1_000);
+        check(
+            (calibration.bytes_per_token() - 3.3).abs() < 1e-9,
+            "EMA mit alpha 0.3",
+        )?;
+        // Null-Beobachtungen werden ignoriert.
+        calibration.observe(0, 1_000);
+        calibration.observe(1_000, 0);
+        check(
+            (calibration.bytes_per_token() - 3.3).abs() < 1e-9,
+            "Null-Beobachtungen ändern nichts",
+        )?;
+        // Extreme Beobachtungen konvergieren gegen die Schranken.
+        for _ in 0..100 {
+            calibration.observe(1_000_000, 1);
+        }
+        check(
+            (calibration.bytes_per_token() - 6.0).abs() < f64::EPSILON,
+            "Clamp auf 6.0",
+        )?;
+        for _ in 0..100 {
+            calibration.observe(1, 1_000_000);
+        }
+        check(
+            (calibration.bytes_per_token() - 1.5).abs() < f64::EPSILON,
+            "Clamp auf 1.5",
+        )
+    }
+
+    #[test]
+    fn estimate_counts_all_request_parts() -> TestResult {
+        let empty = request("", ConversationHistory::new(), Vec::new());
+        check(
+            estimate_request_bytes(&empty) == 0,
+            "leerer Request = 0 Bytes",
+        )?;
+        check(
+            estimate_request_tokens(&empty, &TokenCalibration::default()) == 0,
+            "leerer Request = 0 Tokens",
+        )?;
+
+        let mut req = request("system!", ConversationHistory::new(), Vec::new());
+        req.instruction_fragments.push("frag".to_owned());
+        req.data_block = Some("data".to_owned());
+        check(
+            estimate_request_bytes(&req) == 7 + 4 + 4,
+            "System-Prompt, Fragmente und Datenblock zählen",
+        )?;
+
+        let mut history = ConversationHistory::new();
+        history.push_user_text("hello");
+        let with_history = request("", history, Vec::new());
+        check(
+            estimate_request_bytes(&with_history) == 5 + MESSAGE_FRAMING_BYTES,
+            "User-Text plus Rahmen",
+        )?;
+
+        let tool = ToolSpec::Function(FunctionToolSpec {
+            name: ToolName::new("lookup"),
+            description: "sucht etwas".to_owned(),
+            parameters: JsonSchema::default(),
+            strict: false,
+        });
+        let expected_tool_bytes = serde_json::to_vec(&tool)?.len() as u64;
+        let with_tool = request("", ConversationHistory::new(), vec![tool]);
+        check(
+            estimate_request_bytes(&with_tool) == expected_tool_bytes,
+            "Tool-Spec als kompaktes JSON",
+        )
+    }
+
+    #[test]
+    fn estimate_counts_tool_pairs_and_skips_reasoning() -> TestResult {
+        let call_id = ToolCallId::new();
+        let arguments = serde_json::json!({"query": "doku"});
+        let result = ToolCallResult::success(serde_json::json!({"hits": [1, 2, 3]}));
+        let mut history = ConversationHistory::new();
+        history.push_tool_call(call_id.clone(), "lookup", arguments.clone());
+        history.push_tool_result(call_id.clone(), result.clone(), 5);
+        let base = estimate_request_bytes(&request("", history.clone(), Vec::new()));
+
+        let id_len = call_id.to_string().len() as u64;
+        let expected = id_len
+            + "lookup".len() as u64
+            + serde_json::to_vec(&arguments)?.len() as u64
+            + id_len
+            + serde_json::to_vec(&result)?.len() as u64
+            + 2 * MESSAGE_FRAMING_BYTES;
+        check(base == expected, "Call/Ergebnis-Paar korrekt gezählt")?;
+
+        history.push(TurnItem::Reasoning(ReasoningItem {
+            id: ItemId::new(),
+            summary_text: vec!["x".repeat(10_000)],
+            raw_content: vec!["y".repeat(10_000)],
+        }));
+        let with_reasoning = estimate_request_bytes(&request("", history, Vec::new()));
+        check(with_reasoning == base, "Reasoning zählt nicht mit")
+    }
+
+    #[test]
+    fn estimate_tokens_uses_calibration_and_rounds_up() -> TestResult {
+        let req = request(&"a".repeat(10), ConversationHistory::new(), Vec::new());
+        // 10 Bytes / 3.0 = 3.33 → 4
+        check(
+            estimate_request_tokens(&req, &TokenCalibration::default()) == 4,
+            "Aufrunden bei Default-Rate",
+        )?;
+        check(
+            estimate_request_tokens(&req, &TokenCalibration::with_bytes_per_token(5.0)) == 2,
+            "kalibrierte Rate wird genutzt",
+        )
+    }
+
+    #[test]
+    fn output_reserve_follows_contract() -> TestResult {
+        // Großes Fenster: Default 16_384 greift, 15 % wären größer.
+        check(
+            output_reserve_tokens(200_000, None, None, false) == 16_384,
+            "Default-Reserve",
+        )?;
+        // Konfiguration schlägt Katalog.
+        check(
+            output_reserve_tokens(200_000, Some(4_096), Some(32_000), false) == 4_096,
+            "konfiguriert vor Katalog",
+        )?;
+        check(
+            output_reserve_tokens(200_000, None, Some(20_000), false) == 20_000,
+            "Katalog vor Default",
+        )?;
+        // Kleines Fenster: 15 %-Deckel.
+        check(
+            output_reserve_tokens(32_768, None, None, false) == 32_768 * 15 / 100,
+            "15 %-Deckel",
+        )?;
+        // Thinking: + min(8_192, 5 %).
+        check(
+            output_reserve_tokens(200_000, None, None, true) == 16_384 + 8_192,
+            "Thinking-Aufschlag gedeckelt auf 8_192",
+        )?;
+        check(
+            output_reserve_tokens(32_768, None, None, true) == 32_768 * 15 / 100 + 32_768 * 5 / 100,
+            "Thinking-Aufschlag 5 %",
+        )?;
+        // Nie mehr als die Hälfte des Fensters, auch bei 0.
+        check(
+            output_reserve_tokens(0, Some(1_000), None, true) == 0,
+            "leeres Fenster",
+        )?;
+        check(
+            output_reserve_tokens(1_000, Some(1_000), None, true) <= 500,
+            "höchstens window / 2",
+        )
     }
 }

@@ -195,6 +195,80 @@ impl TelegramClient {
             .await
     }
 
+    /// Registriert die Befehlsliste für einen bestimmten [`BotCommandScope`].
+    ///
+    /// Telegram wählt pro Chat die spezifischste passende Liste; so können
+    /// Privatchats, Gruppen und einzelne Chats unterschiedliche Menüs sehen.
+    pub async fn set_my_commands_scoped(
+        &self,
+        commands: &[BotCommand],
+        scope: &BotCommandScope,
+    ) -> TransportResult<()> {
+        self.call_ok(
+            "setMyCommands",
+            SetMyCommandsScopedRequest { commands, scope },
+        )
+        .await
+    }
+
+    /// Entfernt die Befehlsliste eines [`BotCommandScope`]; Telegram fällt
+    /// danach auf den nächstallgemeineren Scope zurück.
+    pub async fn delete_my_commands(&self, scope: &BotCommandScope) -> TransportResult<()> {
+        self.call_ok("deleteMyCommands", DeleteMyCommandsRequest { scope })
+            .await
+    }
+
+    /// Ersetzt (oder mit `None` entfernt) die Inline-Tastatur einer Nachricht.
+    ///
+    /// Telegram antwortet je nach Nachrichtenart mit der Nachricht oder mit
+    /// `true`; das Ergebnis wird deshalb nur als JSON-Wert angenommen und
+    /// verworfen.
+    pub async fn edit_message_reply_markup(
+        &self,
+        chat_id: i64,
+        message_id: i64,
+        inline_keyboard: Option<&[Vec<InlineKeyboardButton>]>,
+    ) -> TransportResult<()> {
+        self.call::<Value, _>(
+            "editMessageReplyMarkup",
+            EditMessageReplyMarkupRequest {
+                chat_id,
+                message_id,
+                reply_markup: InlineKeyboardMarkup::new(inline_keyboard.unwrap_or(&[])),
+            },
+        )
+        .await
+        .map(|_| ())
+    }
+
+    /// Zeigt eine Chat-Aktion (z. B. `typing`) für etwa fünf Sekunden an.
+    ///
+    /// Nur die von der Bot API definierten Aktionen werden akzeptiert;
+    /// andere Werte werden lokal abgewiesen, ohne eine Anfrage zu senden.
+    pub async fn send_chat_action(
+        &self,
+        chat_id: i64,
+        thread_id: Option<i64>,
+        action: &str,
+    ) -> TransportResult<()> {
+        if !is_valid_chat_action(action) {
+            return Err(TelegramTransportError::ApiRejected {
+                method: "sendChatAction",
+                code: 0,
+                description: "unbekannte Telegram-Chat-Aktion".to_owned(),
+            });
+        }
+        self.call_ok(
+            "sendChatAction",
+            SendChatActionRequest {
+                chat_id,
+                message_thread_id: thread_id,
+                action,
+            },
+        )
+        .await
+    }
+
     /// Configure Telegram to deliver updates to an HTTPS webhook.
     pub async fn set_webhook(
         &self,
@@ -378,6 +452,51 @@ struct SetMyCommandsRequest<'a> {
 }
 
 #[derive(Serialize)]
+struct SetMyCommandsScopedRequest<'a> {
+    commands: &'a [BotCommand],
+    scope: &'a BotCommandScope,
+}
+
+#[derive(Serialize)]
+struct DeleteMyCommandsRequest<'a> {
+    scope: &'a BotCommandScope,
+}
+
+#[derive(Serialize)]
+struct EditMessageReplyMarkupRequest<'a> {
+    chat_id: i64,
+    message_id: i64,
+    reply_markup: InlineKeyboardMarkup<'a>,
+}
+
+#[derive(Serialize)]
+struct SendChatActionRequest<'a> {
+    chat_id: i64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    message_thread_id: Option<i64>,
+    action: &'a str,
+}
+
+/// Von der Bot API definierte Werte für `sendChatAction`.
+const CHAT_ACTIONS: &[&str] = &[
+    "typing",
+    "upload_photo",
+    "record_video",
+    "upload_video",
+    "record_voice",
+    "upload_voice",
+    "upload_document",
+    "choose_sticker",
+    "find_location",
+    "record_video_note",
+    "upload_video_note",
+];
+
+fn is_valid_chat_action(action: &str) -> bool {
+    CHAT_ACTIONS.contains(&action)
+}
+
+#[derive(Serialize)]
 struct SetWebhookRequest<'a> {
     url: &'a str,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -418,7 +537,8 @@ pub struct BotInfo {
 pub struct SentMessage {
     pub message_id: i64,
     pub date: i64,
-    #[serde(deserialize_with = "deserialize_chat_id")]
+    /// Telegram liefert das Chat-Objekt als `chat`; übernommen wird nur `chat.id`.
+    #[serde(rename = "chat", deserialize_with = "deserialize_chat_id")]
     pub chat_id: i64,
     pub message_thread_id: Option<i64>,
 }
@@ -449,6 +569,28 @@ pub struct TelegramFile {
 pub struct BotCommand {
     pub command: String,
     pub description: String,
+}
+
+/// Geltungsbereich einer Befehlsliste (`BotCommandScope` der Bot API).
+///
+/// Serialisiert im Telegram-Format, z. B. `{"type":"chat","chat_id":42}`.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq, Hash)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum BotCommandScope {
+    /// `default`: gilt, wenn kein spezifischerer Scope passt.
+    Default,
+    /// `all_private_chats`: alle Privatchats.
+    AllPrivateChats,
+    /// `all_group_chats`: alle Gruppen und Supergruppen.
+    AllGroupChats,
+    /// `all_chat_administrators`: alle Gruppen-Administratoren.
+    AllChatAdministrators,
+    /// `chat`: genau ein Chat.
+    Chat { chat_id: i64 },
+    /// `chat_administrators`: Administratoren genau eines Gruppenchats.
+    ChatAdministrators { chat_id: i64 },
+    /// `chat_member`: ein Mitglied in genau einem Gruppenchat.
+    ChatMember { chat_id: i64, user_id: i64 },
 }
 
 /// A supported inline keyboard button.
@@ -596,6 +738,142 @@ mod tests {
         let rendered = format!("{:?}", TelegramClient::new(token));
         assert!(!rendered.contains(token));
         assert!(rendered.contains("[REDACTED]"));
+    }
+
+    #[test]
+    fn sent_message_decodes_real_send_message_result() -> TestResult {
+        let envelope: TelegramResponse<SentMessage> = serde_json::from_str(
+            r#"{"ok":true,"result":{"message_id":4711,"from":{"id":7000000001,"is_bot":true,"first_name":"Harw","username":"harw_bot"},"chat":{"id":-1001234567890,"title":"Ops","is_forum":true,"type":"supergroup"},"date":1758700000,"message_thread_id":33,"is_topic_message":true,"text":"hallo"}}"#,
+        )
+        .map_err(ctx("real sendMessage response must deserialize"))?;
+        assert!(envelope.ok);
+        assert_eq!(
+            envelope.result,
+            Some(SentMessage {
+                message_id: 4711,
+                date: 1758700000,
+                chat_id: -1001234567890,
+                message_thread_id: Some(33),
+            })
+        );
+
+        let private: SentMessage = serde_json::from_str(
+            r#"{"message_id":5,"from":{"id":1,"is_bot":true,"first_name":"Harw"},"chat":{"id":42,"first_name":"Mia","type":"private"},"date":1758700001,"text":"ok"}"#,
+        )
+        .map_err(ctx("private sendMessage result must deserialize"))?;
+        assert_eq!(private.chat_id, 42);
+        assert_eq!(private.message_thread_id, None);
+        Ok(())
+    }
+
+    #[test]
+    fn bot_command_scope_uses_telegram_wire_names() -> TestResult {
+        let cases = [
+            (BotCommandScope::Default, r#"{"type":"default"}"#),
+            (
+                BotCommandScope::AllPrivateChats,
+                r#"{"type":"all_private_chats"}"#,
+            ),
+            (
+                BotCommandScope::AllGroupChats,
+                r#"{"type":"all_group_chats"}"#,
+            ),
+            (
+                BotCommandScope::AllChatAdministrators,
+                r#"{"type":"all_chat_administrators"}"#,
+            ),
+            (
+                BotCommandScope::Chat { chat_id: -100 },
+                r#"{"type":"chat","chat_id":-100}"#,
+            ),
+            (
+                BotCommandScope::ChatAdministrators { chat_id: -100 },
+                r#"{"type":"chat_administrators","chat_id":-100}"#,
+            ),
+            (
+                BotCommandScope::ChatMember {
+                    chat_id: -100,
+                    user_id: 7,
+                },
+                r#"{"type":"chat_member","chat_id":-100,"user_id":7}"#,
+            ),
+        ];
+        for (scope, expected) in cases {
+            let encoded = serde_json::to_string(&scope).map_err(ctx("scope serializes"))?;
+            assert_eq!(encoded, expected);
+            let decoded: BotCommandScope =
+                serde_json::from_str(expected).map_err(ctx("scope deserializes"))?;
+            assert_eq!(decoded, scope);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn new_request_bodies_match_bot_api_shape() -> TestResult {
+        let commands = [BotCommand {
+            command: "help".to_owned(),
+            description: "Hilfe".to_owned(),
+        }];
+        let scope = BotCommandScope::Chat { chat_id: 42 };
+        assert_eq!(
+            serde_json::to_value(SetMyCommandsScopedRequest {
+                commands: &commands,
+                scope: &scope,
+            })
+            .map_err(ctx("setMyCommands body serializes"))?,
+            serde_json::json!({
+                "commands": [{ "command": "help", "description": "Hilfe" }],
+                "scope": { "type": "chat", "chat_id": 42 }
+            })
+        );
+        assert_eq!(
+            serde_json::to_value(DeleteMyCommandsRequest {
+                scope: &BotCommandScope::Default,
+            })
+            .map_err(ctx("deleteMyCommands body serializes"))?,
+            serde_json::json!({ "scope": { "type": "default" } })
+        );
+        assert_eq!(
+            serde_json::to_value(EditMessageReplyMarkupRequest {
+                chat_id: 1,
+                message_id: 2,
+                reply_markup: InlineKeyboardMarkup::new(&[]),
+            })
+            .map_err(ctx("editMessageReplyMarkup body serializes"))?,
+            serde_json::json!({
+                "chat_id": 1,
+                "message_id": 2,
+                "reply_markup": { "inline_keyboard": [] }
+            })
+        );
+        assert_eq!(
+            serde_json::to_value(SendChatActionRequest {
+                chat_id: 1,
+                message_thread_id: None,
+                action: "typing",
+            })
+            .map_err(ctx("sendChatAction body serializes"))?,
+            serde_json::json!({ "chat_id": 1, "action": "typing" })
+        );
+        assert_eq!(
+            serde_json::to_value(SendChatActionRequest {
+                chat_id: 1,
+                message_thread_id: Some(9),
+                action: "typing",
+            })
+            .map_err(ctx("sendChatAction body serializes"))?,
+            serde_json::json!({ "chat_id": 1, "message_thread_id": 9, "action": "typing" })
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn chat_action_allowlist_matches_bot_api() {
+        assert!(is_valid_chat_action("typing"));
+        assert!(is_valid_chat_action("upload_document"));
+        assert!(!is_valid_chat_action(""));
+        assert!(!is_valid_chat_action("Typing"));
+        assert!(!is_valid_chat_action("hacking"));
     }
 
     #[test]

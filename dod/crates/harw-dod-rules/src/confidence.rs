@@ -107,12 +107,18 @@ mod tests {
 
     #[test]
     fn test_maps_all_four_input_levels() {
-        assert_eq!(epistemic_confidence_for(ResearchConfidence::Low), EpistemicConfidence::Low);
+        assert_eq!(
+            epistemic_confidence_for(ResearchConfidence::Low),
+            EpistemicConfidence::Low
+        );
         assert_eq!(
             epistemic_confidence_for(ResearchConfidence::Medium),
             EpistemicConfidence::Medium
         );
-        assert_eq!(epistemic_confidence_for(ResearchConfidence::High), EpistemicConfidence::High);
+        assert_eq!(
+            epistemic_confidence_for(ResearchConfidence::High),
+            EpistemicConfidence::High
+        );
         assert_eq!(
             epistemic_confidence_for(ResearchConfidence::Verified),
             EpistemicConfidence::VeryHigh

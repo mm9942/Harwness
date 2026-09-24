@@ -1,4 +1,5 @@
 [package]
+publish.workspace = true
 name = "harw-browser-thirtyfour"
 version.workspace = true
 edition.workspace = true

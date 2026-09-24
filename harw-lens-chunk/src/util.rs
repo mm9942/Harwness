@@ -143,7 +143,11 @@ pub(crate) fn extend_chunk_end(chunk: &mut Chunk, text: &str, new_end: usize) {
         "extend_chunk_end must grow forward: {new_end} < {}",
         chunk.span.end
     );
-    debug_assert!(new_end <= text.len(), "new_end {new_end} exceeds text length {}", text.len());
+    debug_assert!(
+        new_end <= text.len(),
+        "new_end {new_end} exceeds text length {}",
+        text.len()
+    );
     debug_assert!(
         text.is_char_boundary(new_end),
         "new_end {new_end} must fall on a UTF-8 char boundary"

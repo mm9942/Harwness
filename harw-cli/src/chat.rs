@@ -44,7 +44,13 @@
 //!
 //! # Beispiel
 //! ```rust,ignore
-//! let startup = ChatStartup { mode: InteractionMode::Chat, plan: None, goal_context: None };
+//! let startup = ChatStartup {
+//!     mode: InteractionMode::Chat,
+//!     plan: None,
+//!     goal_context: None,
+//!     approval: None,
+//!     model: None,
+//! };
 //! chat::run_chat(None, Some("Hallo".to_owned()), None, startup, chat::ChatOptions::default())?;
 //! ```
 
@@ -60,7 +66,7 @@ use harw_core::{
     ApprovalResolution, InteractionMode, ModelMessage, StateStore, TurnInput, TurnOutcome,
     resume_after_approval, run_turn,
 };
-use harw_extension_api::ContextProvider;
+use harw_extension_api::{ApprovalMode, ContextProvider};
 use harw_memory::facts::{FactScope, FactStore};
 use harw_protocol::{SessionEvent, TurnEvent};
 use harw_runtime::{
@@ -116,6 +122,13 @@ pub(crate) struct ChatStartup {
     pub(crate) plan: Option<PlanServices>,
     /// Kontext-Beitrag für jeden Turn (Ziel-Kontext); `None` heißt keiner.
     pub(crate) goal_context: Option<Arc<dyn ContextProvider>>,
+    /// Explizit gewählter Freigabemodus (`--approval`,
+    /// `RuntimeSpec::approval_override`); `None` lässt die Konfiguration
+    /// entscheiden.
+    pub(crate) approval: Option<ApprovalMode>,
+    /// Explizit gewähltes Modell (`--model`, `RuntimeSpec::model_override`)
+    /// als Schlüssel, Modell-ID oder Alias; `None` lässt die Vorgabe stehen.
+    pub(crate) model: Option<String>,
 }
 
 /// Zusätzliche Chat-Flags, die `harw-cli/src/cli.rs::ChatArgs` heute noch
@@ -257,6 +270,12 @@ pub fn run_chat(
                 assembly,
                 TuiRunOptions {
                     wiring,
+                    keybindings_path: harw_home::profile_dir(
+                        &home,
+                        &harw_home::active_profile_name(&home),
+                    )
+                    .ok()
+                    .map(|dir| dir.join(&config.harness.tui.keybindings_file)),
                     verbose_tools: factory.verbose_tools(),
                     resume: Some(TuiResume {
                         selector: Box::new(ProfileResumeSelector::new(
@@ -359,6 +378,14 @@ impl ChatRuntimeInputs {
         verbose: bool,
     ) -> Result<Self, String> {
         spec.mode_override = Some(startup.mode);
+        spec.approval_override = startup.approval;
+        spec.model_override = startup.model.clone();
+        if startup.approval == Some(ApprovalMode::FullAccess) {
+            eprintln!(
+                "Warnung: Freigabemodus „full“ aktiv – Schreib- und Shell-Aktionen \
+                 laufen in dieser Sitzung ohne Rückfrage."
+            );
+        }
         spec.active_agent = config.harness.active_agent_definition.clone();
 
         let home = spec.home.clone();
@@ -1106,6 +1133,8 @@ mod tests {
             mode,
             plan: None,
             goal_context: None,
+            approval: None,
+            model: None,
         }
     }
 
@@ -1547,6 +1576,37 @@ mod tests {
             .map_err(ctx("read CLI transcript"))?;
         assert_eq!(records.len(), 1);
         assert_eq!(records[0].thread, cli_thread_for_session(&session));
+        Ok(())
+    }
+
+    #[test]
+    fn test_chat_inputs_carry_approval_and_model_overrides() -> TestResult {
+        let fixture = chat_fixture()?;
+        let with_overrides = ChatStartup {
+            approval: Some(ApprovalMode::AlwaysAsk),
+            model: Some("irgendein-modell".to_owned()),
+            ..startup(InteractionMode::Chat)
+        };
+        let inputs = fixture_inputs(
+            &fixture,
+            EntryKind::OneShot,
+            IngressSurface::Cli,
+            with_overrides,
+        )?;
+        assert_eq!(inputs.spec.approval_override, Some(ApprovalMode::AlwaysAsk));
+        assert_eq!(
+            inputs.spec.model_override.as_deref(),
+            Some("irgendein-modell")
+        );
+
+        let plain = fixture_inputs(
+            &fixture,
+            EntryKind::OneShot,
+            IngressSurface::Cli,
+            startup(InteractionMode::Chat),
+        )?;
+        assert_eq!(plain.spec.approval_override, None);
+        assert_eq!(plain.spec.model_override, None);
         Ok(())
     }
 

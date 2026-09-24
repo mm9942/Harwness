@@ -973,6 +973,7 @@ name = "harw-dod-sentinel"
 version = "0.3.0"
 dependencies = [
  "harw-authority",
+ "harw-code-graph",
  "harw-dod-cap",
  "harw-dod-rules",
  "harw-dod-signals",
@@ -982,6 +983,7 @@ dependencies = [
  "harw-sandbox",
  "harw-types",
  "jiff",
+ "semver",
  "serde_json",
  "tempfile",
 ]
@@ -2549,7 +2551,19 @@ dependencies = [
  "mio",
  "pin-project-lite",
  "socket2",
+ "tokio-macros",
  "windows-sys 0.61.2",
+]
+
+[[package]]
+name = "tokio-macros"
+version = "2.7.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "78773a2a397f451582ce068015985c33193cf6dea8b74d2a639fe457b2f07b0e"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn 3.0.5",
 ]
 
 [[package]]

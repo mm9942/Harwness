@@ -148,26 +148,27 @@ pub mod event;
 pub mod fixture;
 pub mod handle;
 pub mod loader;
-pub mod real;
 pub mod profile;
+pub mod real;
 pub mod spec;
 pub mod time;
 
-pub use error::BpfError;
-pub use abi::{parse_wire_event, TaskIdentity, WireEvent, WireEventType, WIRE_HEADER_LEN_V1, WIRE_VERSION_V1};
-pub use contract::{
-    BpfObjectContract, EVENTS_MAP_NAME, EXEC_ATTACH_POINT, EXEC_PROGRAM_NAME,
-    EXIT_ATTACH_POINT, EXIT_PROGRAM_NAME, LOSS_COUNTS_MAP_NAME,
-    REQUIRED_MAP_NAMES, SEQUENCE_MAP_NAME, SCOPE_MAP_NAME,
-    TCP_V4_CONNECT_ATTACH_POINT, TCP_V4_CONNECT_PROGRAM_NAME,
-    TCP_V6_CONNECT_ATTACH_POINT, TCP_V6_CONNECT_PROGRAM_NAME,
+pub use abi::{
+    TaskIdentity, WIRE_HEADER_LEN_V1, WIRE_VERSION_V1, WireEvent, WireEventType, parse_wire_event,
 };
+pub use contract::{
+    BpfObjectContract, EVENTS_MAP_NAME, EXEC_ATTACH_POINT, EXEC_PROGRAM_NAME, EXIT_ATTACH_POINT,
+    EXIT_PROGRAM_NAME, LOSS_COUNTS_MAP_NAME, REQUIRED_MAP_NAMES, SCOPE_MAP_NAME, SEQUENCE_MAP_NAME,
+    TCP_V4_CONNECT_ATTACH_POINT, TCP_V4_CONNECT_PROGRAM_NAME, TCP_V6_CONNECT_ATTACH_POINT,
+    TCP_V6_CONNECT_PROGRAM_NAME,
+};
+pub use error::BpfError;
 pub use event::RawBpfEvent;
 pub use fixture::FixtureBpfLoader;
 pub use handle::BpfHandle;
 pub use loader::BpfLoader;
+pub use profile::{BpfScope, MAX_SCOPE_CGROUP_IDS, ResolvedCgroup};
 pub use real::{BpfLossCounters, RealBpfLoader, TimedWireEvent};
-pub use profile::{BpfScope, ResolvedCgroup, MAX_SCOPE_CGROUP_IDS};
 pub use spec::{BpfProgramKind, BpfProgramSource, BpfProgramSpec};
 pub use time::{KernelTimeMapper, TimeConfidence};
 
@@ -194,8 +195,14 @@ mod tests {
 
     #[test]
     fn test_required_capability_is_load_bpf_program_in_the_bpf_class() {
-        assert_eq!(REQUIRED_CAPABILITY, harw_dod_cap::Capability::LoadBpfProgram);
-        assert_eq!(REQUIRED_CAPABILITY.class(), harw_dod_cap::CapabilityClass::Bpf);
+        assert_eq!(
+            REQUIRED_CAPABILITY,
+            harw_dod_cap::Capability::LoadBpfProgram
+        );
+        assert_eq!(
+            REQUIRED_CAPABILITY.class(),
+            harw_dod_cap::CapabilityClass::Bpf
+        );
     }
 
     /// Hält die (jetzt umgekehrte) Entscheidung strukturell fest: diese

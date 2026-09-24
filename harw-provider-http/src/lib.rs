@@ -77,6 +77,7 @@
 
 pub mod anthropic;
 mod anthropic_caps;
+pub mod budget;
 pub mod cache_strategy;
 pub mod discovery;
 mod error;
@@ -251,7 +252,13 @@ const EXTERNAL_CLI_CREDENTIALS: &[(&str, &[&str], &[&str])] = &[
 pub fn build_provider(
     config: &harw_config::ResolvedConfig,
 ) -> HttpProviderResult<Box<dyn ModelProvider>> {
-    build_provider_with_optional_resolver(config, None, None).map(|(provider, _)| provider)
+    build_provider_with_optional_resolver(
+        config,
+        None,
+        None,
+        &budget::ProviderBudgetRegistry::global(),
+    )
+    .map(|(provider, _)| provider)
 }
 
 /// Builds configured providers with an injected synchronous `secrets:` resolver.
@@ -261,8 +268,13 @@ pub fn build_provider_with_resolver(
     config: &harw_config::ResolvedConfig,
     resolver: &dyn SecretResolver,
 ) -> HttpProviderResult<Box<dyn ModelProvider>> {
-    build_provider_with_optional_resolver(config, Some(resolver), None)
-        .map(|(provider, _)| provider)
+    build_provider_with_optional_resolver(
+        config,
+        Some(resolver),
+        None,
+        &budget::ProviderBudgetRegistry::global(),
+    )
+    .map(|(provider, _)| provider)
 }
 
 /// Wie [`build_provider`], liefert zusätzlich eine [`ProviderLoadRegistry`]
@@ -282,7 +294,12 @@ pub fn build_provider_with_resolver(
 pub fn build_provider_with_load_registry(
     config: &harw_config::ResolvedConfig,
 ) -> HttpProviderResult<(Box<dyn ModelProvider>, ProviderLoadRegistry)> {
-    build_provider_with_optional_resolver(config, None, None)
+    build_provider_with_optional_resolver(
+        config,
+        None,
+        None,
+        &budget::ProviderBudgetRegistry::global(),
+    )
 }
 
 /// Wie [`build_provider_with_load_registry`] mit injiziertem `secrets:`-Resolver.
@@ -290,7 +307,12 @@ pub fn build_provider_with_load_registry_and_resolver(
     config: &harw_config::ResolvedConfig,
     resolver: &dyn SecretResolver,
 ) -> HttpProviderResult<(Box<dyn ModelProvider>, ProviderLoadRegistry)> {
-    build_provider_with_optional_resolver(config, Some(resolver), None)
+    build_provider_with_optional_resolver(
+        config,
+        Some(resolver),
+        None,
+        &budget::ProviderBudgetRegistry::global(),
+    )
 }
 
 /// Wie [`build_provider_with_load_registry`] mit bekanntem harw-Home (siehe
@@ -300,7 +322,33 @@ pub fn build_provider_with_load_registry_and_home(
     home: &Path,
     resolver: Option<&dyn SecretResolver>,
 ) -> HttpProviderResult<(Box<dyn ModelProvider>, ProviderLoadRegistry)> {
-    build_provider_with_optional_resolver(config, resolver, Some(home))
+    build_provider_with_optional_resolver(
+        config,
+        resolver,
+        Some(home),
+        &budget::ProviderBudgetRegistry::global(),
+    )
+}
+
+/// Wie [`build_provider_with_load_registry_and_home`], aber mit injizierter
+/// [`budget::ProviderBudgetRegistry`] statt der prozessweiten
+/// ([`budget::ProviderBudgetRegistry::global`]).
+///
+/// # Composition-Root-Hinweis
+/// Wer dieselbe Registry zusätzlich in die `ServiceMap` legt, kann über
+/// [`budget::ProviderBudgetRegistry::snapshots`] alle RPM/TPM-Buckets
+/// (auch Modell-Overrides) providerübergreifend anzeigen. Bei einem
+/// Neuaufbau mit unveränderten Grenzen bleibt der Bucket-Zustand erhalten.
+///
+/// # Errors
+/// Wie [`build_provider`].
+pub fn build_provider_with_load_registry_and_budgets(
+    config: &harw_config::ResolvedConfig,
+    home: Option<&Path>,
+    resolver: Option<&dyn SecretResolver>,
+    budgets: &budget::ProviderBudgetRegistry,
+) -> HttpProviderResult<(Box<dyn ModelProvider>, ProviderLoadRegistry)> {
+    build_provider_with_optional_resolver(config, resolver, home, budgets)
 }
 
 /// Baut die konfigurierten Provider mit bekanntem harw-Home.
@@ -325,14 +373,20 @@ pub fn build_provider_with_home(
     home: &Path,
     resolver: Option<&dyn SecretResolver>,
 ) -> HttpProviderResult<Box<dyn ModelProvider>> {
-    build_provider_with_optional_resolver(config, resolver, Some(home))
-        .map(|(provider, _)| provider)
+    build_provider_with_optional_resolver(
+        config,
+        resolver,
+        Some(home),
+        &budget::ProviderBudgetRegistry::global(),
+    )
+    .map(|(provider, _)| provider)
 }
 
 fn build_provider_with_optional_resolver(
     config: &harw_config::ResolvedConfig,
     resolver: Option<&dyn SecretResolver>,
     home: Option<&Path>,
+    budgets: &budget::ProviderBudgetRegistry,
 ) -> HttpProviderResult<(Box<dyn ModelProvider>, ProviderLoadRegistry)> {
     let sources = SecretSources {
         env_layer: &config.env_layer,
@@ -359,7 +413,7 @@ fn build_provider_with_optional_resolver(
         .filter(|(_, provider)| provider.enabled)
         .collect::<BTreeMap<_, _>>()
     {
-        let backend = match build_named_provider(name, provider, config, model, sources) {
+        let backend = match build_named_provider(name, provider, config, model, sources, budgets) {
             Ok((backend, load_control)) => {
                 if let Some(load_control) = load_control {
                     load_controls.insert(name.to_owned(), load_control);
@@ -441,6 +495,7 @@ fn build_named_provider(
     config: &harw_config::ResolvedConfig,
     default_model: &str,
     sources: SecretSources<'_>,
+    budgets: &budget::ProviderBudgetRegistry,
 ) -> HttpProviderResult<NamedProviderBuild> {
     validate_endpoint(&provider.base_url)?;
     let sources = SecretSources {
@@ -549,7 +604,16 @@ fn build_named_provider(
             provider_name,
             configured_headers(provider_name, &provider.headers, sources)?,
         );
-        backend.configure_rate_limit(provider.rate_limit.clone());
+        backend.configure_rate_limit(
+            provider
+                .rate_limit
+                .as_ref()
+                .map(harw_config::RateLimitToml::header_pacer_config),
+        );
+        // Client-seitige RPM/TPM-Budgets (siehe [`budget`]): durchgesetzt im
+        // Sendepfad von `anthropic.rs`, sichtbar im Load-Status.
+        let anthropic_budgets = budgets.configure_provider(provider_name, provider, config);
+        backend.configure_budgets(anthropic_budgets.clone());
         backend.configure_stream_policy(sse::StreamPolicy::from_config(
             provider_name,
             provider,
@@ -566,6 +630,7 @@ fn build_named_provider(
                 provider_id: provider_name.to_owned(),
                 concurrency_limiter: backend.concurrency_limiter(),
                 rate_limiter: backend.rate_limiter_handle(),
+                budgets: anthropic_budgets,
             });
         return Ok((
             Box::new(RetryingProvider::new(backend, network_retry_policy())),
@@ -573,12 +638,13 @@ fn build_named_provider(
         ));
     }
 
-    let http_provider = OpenAiResponsesProvider::from_named_config(
+    let http_provider = OpenAiResponsesProvider::from_named_config_with_budgets(
         provider_name,
         provider,
         config,
         model,
         sources,
+        budgets,
     )?;
     // Beide `Arc`s werden geklont, *bevor* `http_provider` unten per Wert in
     // `RetryingProvider::new` verschoben wird — siehe [`ProviderLoadHandle`]-Doku.
@@ -587,11 +653,26 @@ fn build_named_provider(
             provider_id: provider_name.to_owned(),
             concurrency_limiter: http_provider.concurrency_limiter(),
             rate_limiter: http_provider.rate_limiter_handle(),
+            budgets: http_provider.budgets(),
         });
     Ok((
         Box::new(RetryingProvider::new(http_provider, network_retry_policy())),
         Some(load_control),
     ))
+}
+
+/// Übersetzt einen Fail-fast-Fehler des Header-Pacers in einen [`ModelError`].
+///
+/// # Description
+/// [`rate_limiter::RateBudgetError::RequestExceedsLimit`] bedeutet: schon die
+/// Eingabe-Schätzung eines einzelnen Requests sprengt das vom Provider
+/// gemeldete Token-Limit — Warten hilft nie, nur ein kleinerer Request.
+/// Daher [`ModelError::ContextLength`], damit der Aufrufer wie bei einem
+/// zu großen Kontext reagiert (z. B. kompaktiert).
+pub(crate) fn rate_budget_error(error: rate_limiter::RateBudgetError) -> ModelError {
+    ModelError::ContextLength {
+        message: error.to_string(),
+    }
 }
 
 /// Löst Base-URL + Credential für den nativen Anthropic-Weg auf.
@@ -1172,6 +1253,20 @@ pub struct ProviderLoadStatus {
     /// Wiederholte 429 sind das primäre Signal, die Concurrency für diesen
     /// Provider zu **senken** — nicht zu erhöhen.
     pub recent_rate_limited: u64,
+    /// Momentaufnahmen der client-seitigen RPM/TPM-Budgets dieses Providers
+    /// (Provider-Bucket zuerst, dann Modell-Overrides; siehe
+    /// [`budget::BudgetSnapshot`]). Leer, wenn keine Budgets konfiguriert
+    /// sind.
+    pub budgets: Vec<budget::BudgetSnapshot>,
+}
+
+impl ProviderLoadStatus {
+    /// Ergänzt die Budget-Momentaufnahmen aus `budgets`.
+    #[must_use]
+    pub fn with_budgets(mut self, budgets: &budget::ProviderBudgets) -> Self {
+        self.budgets = budgets.snapshot();
+        self
+    }
 }
 
 /// Provider-neutrale Steuer- und Beobachtungsfläche für Nebenläufigkeit und
@@ -1251,6 +1346,7 @@ pub(crate) fn provider_load_status(
             .unwrap_or(usize::MAX),
         rate_limit_wait: rate_limiter.pending_wait(),
         recent_rate_limited: rate_limiter.rate_limited_count(),
+        budgets: Vec::new(),
     }
 }
 
@@ -1278,6 +1374,7 @@ struct ProviderLoadHandle {
     provider_id: String,
     concurrency_limiter: Option<std::sync::Arc<DynamicConcurrencyLimiter>>,
     rate_limiter: std::sync::Arc<rate_limiter::ProviderRateLimiter>,
+    budgets: budget::ProviderBudgets,
 }
 
 impl ProviderLoadControl for ProviderLoadHandle {
@@ -1287,6 +1384,7 @@ impl ProviderLoadControl for ProviderLoadHandle {
             self.concurrency_limiter.as_deref(),
             &self.rate_limiter,
         )
+        .with_budgets(&self.budgets)
     }
 
     fn set_max_concurrency(&self, target: Option<usize>) -> bool {
@@ -1363,6 +1461,11 @@ pub struct OpenAiResponsesProvider {
     /// [`Self::authorized_request`], [`identity_headers`]). Andere Provider
     /// bleiben unberührt, solange dieses Feld `false` ist.
     gateway_identity_headers: bool,
+    /// Client-seitige RPM/TPM-Budgets dieses Providers und seiner
+    /// Modell-Overrides (siehe [`budget`]); leer ohne `[rate_limit]`-Budgets.
+    /// Wird in [`Self::respond_once`] **vor** dem Nebenläufigkeits-Permit
+    /// reserviert, nach der Antwort abgeglichen und bei 429 gesperrt.
+    budgets: budget::ProviderBudgets,
 }
 
 /// Eine gemerkte Reasoning-Runde der Responses-API (W4a / A-OAI).
@@ -1498,6 +1601,7 @@ impl OpenAiResponsesProvider {
             concurrency_limiter: None,
             credential_pool: None,
             gateway_identity_headers: false,
+            budgets: budget::ProviderBudgets::default(),
         })
     }
 
@@ -1582,6 +1686,26 @@ impl OpenAiResponsesProvider {
         config: &harw_config::ResolvedConfig,
         model: &str,
         sources: SecretSources<'_>,
+    ) -> HttpProviderResult<Self> {
+        Self::from_named_config_with_budgets(
+            provider_name,
+            provider,
+            config,
+            model,
+            sources,
+            &budget::ProviderBudgetRegistry::global(),
+        )
+    }
+
+    /// Wie [`Self::from_named_config`], aber mit injizierter
+    /// [`budget::ProviderBudgetRegistry`] statt der prozessweiten.
+    fn from_named_config_with_budgets(
+        provider_name: &str,
+        provider: &harw_config::ProviderToml,
+        config: &harw_config::ResolvedConfig,
+        model: &str,
+        sources: SecretSources<'_>,
+        budgets: &budget::ProviderBudgetRegistry,
     ) -> HttpProviderResult<Self> {
         let codex_route = codex::CodexRoute::from_provider(provider)?;
         let base_url = if codex_route.is_some() {
@@ -1715,10 +1839,15 @@ impl OpenAiResponsesProvider {
                 }
             }
         }
-        http_provider.stream_policy = sse::StreamPolicy::from_config(provider_name, provider, config);
+        http_provider.stream_policy =
+            sse::StreamPolicy::from_config(provider_name, provider, config);
         http_provider.rate_limiter = std::sync::Arc::new(rate_limiter::ProviderRateLimiter::new(
-            provider.rate_limit.clone(),
+            provider
+                .rate_limit
+                .as_ref()
+                .map(harw_config::RateLimitToml::header_pacer_config),
         ));
+        http_provider.budgets = budgets.configure_provider(provider_name, provider, config);
         http_provider.concurrency_limiter = Some(std::sync::Arc::new(
             DynamicConcurrencyLimiter::new(provider.max_concurrency),
         ));
@@ -1786,6 +1915,20 @@ impl OpenAiResponsesProvider {
             self.concurrency_limiter.as_deref(),
             &self.rate_limiter,
         )
+        .with_budgets(&self.budgets)
+    }
+
+    /// Liefert die client-seitigen Budgets dieses Providers (billiger Klon
+    /// aus `Arc`s), z. B. für einen [`ProviderLoadHandle`].
+    #[must_use]
+    pub fn budgets(&self) -> budget::ProviderBudgets {
+        self.budgets.clone()
+    }
+
+    /// Ersetzt die client-seitigen Budgets (Tests/Composition Roots, die
+    /// eine eigene [`budget::ProviderBudgetRegistry`] injizieren).
+    pub fn set_budgets(&mut self, budgets: budget::ProviderBudgets) {
+        self.budgets = budgets;
     }
 
     /// Resolves the model for one request after checking its provider affinity.
@@ -1895,6 +2038,7 @@ fn provider_request_id(headers: &reqwest::header::HeaderMap) -> Option<String> {
 }
 
 /// Renders a typed remote-response error without retaining an arbitrary body.
+#[cfg(test)]
 fn sanitized_provider_error(status: u16, request_id: Option<&str>, body: &str) -> String {
     HttpProviderError::remote_response(status, request_id.map(str::to_owned), body).to_string()
 }
@@ -3546,6 +3690,30 @@ impl OpenAiResponsesProvider {
             }
         }
 
+        // Client-seitige RPM/TPM-Budgets (siehe [`budget`]): vor dem
+        // Nebenläufigkeits-Permit reservieren, damit ein auf Budget wartender
+        // Request keinen Slot blockiert. Fail-fast, wenn schon die
+        // Eingabe-Schätzung ein Minutenlimit sprengt. Der Permit lebt bis zum
+        // Abgleich mit der tatsächlichen Nutzung unten.
+        // Eingabe-Schätzung nur berechnen, wenn Budgets oder der Header-Pacer
+        // sie tatsächlich brauchen (Serialisierung des Wire-Bodys).
+        let estimated_input = if self.budgets.is_empty() && !self.rate_limiter.is_enabled() {
+            0
+        } else {
+            budget::estimate_wire_tokens(&wire)
+        };
+        let budget_permit = if self.budgets.is_empty() {
+            budget::BudgetPermit::empty()
+        } else {
+            self.budgets
+                .acquire(
+                    model,
+                    estimated_input,
+                    request.max_output_tokens.map(u64::from).unwrap_or(0),
+                )
+                .await?
+        };
+
         // Hartes Nebenläufigkeits-Limit (siehe [`Self::concurrency_limiter`]):
         // blockiert, bis ein Slot frei wird, statt fehlzuschlagen. Der
         // Guard bleibt bis zum Ende dieses async-Blocks (also bis der
@@ -3560,7 +3728,10 @@ impl OpenAiResponsesProvider {
             })?),
             None => None,
         };
-        self.rate_limiter.wait_for_slot().await;
+        self.rate_limiter
+            .wait_for_slot_with_estimate(estimated_input)
+            .await
+            .map_err(rate_budget_error)?;
         // Codex-Route: bei einem tatsächlichen 401 genau einmal
         // reaktiv erneuern und den Request genau einmal wiederholen —
         // kein zweiter Refresh-Versuch nach erneutem 401 (siehe
@@ -3615,6 +3786,11 @@ impl OpenAiResponsesProvider {
                 }
                 let hint =
                     retry_after_hint(retry_after.as_deref(), retry_after_ms.as_deref(), &body);
+                if status.as_u16() == 429 {
+                    // Sperrt alle Budget-Buckets dieses Requests (auch für
+                    // bereits Wartende) für die `Retry-After`-Dauer.
+                    self.budgets.penalize(model, hint.map(Duration::from_secs));
+                }
                 let error =
                     model_error_for_status(status.as_u16(), request_id.as_deref(), hint, &body);
                 tracing::debug!(
@@ -3657,6 +3833,7 @@ impl OpenAiResponsesProvider {
         for call in &mut response.tool_calls {
             call.name = ToolName::new(names.decode(call.name.as_str()));
         }
+        budget_permit.reconcile(&response.usage);
         Ok(response)
     }
 }
@@ -5084,6 +5261,82 @@ mod tests {
         assert_eq!(provider.model, "gpt-test");
         assert_eq!(provider.api_key.expose_secret(), "sk-secret");
         assert_eq!(provider.request_timeout, DEFAULT_REQUEST_TIMEOUT);
+        Ok(())
+    }
+
+    #[test]
+    fn provider_load_status_includes_configured_budgets_from_injected_registry() -> TestResult {
+        let mut config = harw_config::ResolvedConfig::default();
+        config.harness.default_provider = Some("primary".to_owned());
+        config.harness.default_model = Some("a-model".to_owned());
+        let mut provider = configured_provider(
+            "primary",
+            "https://primary.example.com".to_owned(),
+            vec!["a-model"],
+            "PRIMARY_KEY",
+        );
+        provider.rate_limit = Some(harw_config::RateLimitToml {
+            requests_per_minute: Some(60),
+            tokens_per_minute: Some(30_000),
+            ..harw_config::RateLimitToml::default()
+        });
+        provider
+            .validate()
+            .map_err(ctx("positive budgets are valid"))?;
+        config.providers.insert("primary".to_owned(), provider);
+        config
+            .env_layer
+            .insert("PRIMARY_KEY".to_owned(), "primary-secret".to_owned());
+
+        let budgets = budget::ProviderBudgetRegistry::new();
+        let (_provider, registry) =
+            build_provider_with_load_registry_and_budgets(&config, None, None, &budgets)
+                .map_err(ctx("construct budgeted provider"))?;
+        let handle = registry
+            .get("primary")
+            .ok_or(TestError::Missing("load-control handle for primary"))?;
+        let status = handle.provider_status();
+        assert_eq!(status.budgets.len(), 1);
+        let snapshot = &status.budgets[0];
+        assert_eq!(snapshot.provider, "primary");
+        assert_eq!(snapshot.model, None);
+        assert_eq!(snapshot.requests_available, Some(60));
+        assert_eq!(snapshot.tokens_available, Some(30_000));
+        assert!(
+            budgets.get("primary", None).is_some(),
+            "the injected registry, not the global one, holds the bucket"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn respond_fails_fast_when_request_exceeds_token_budget() -> TestResult {
+        let mut provider = OpenAiResponsesProvider::new(
+            "https://budget.example.test/v1",
+            "gpt-test",
+            SecretString::new("sk-secret".into()),
+        )
+        .map_err(ctx("OpenAiResponsesProvider::new"))?;
+        let limits = budget::BudgetLimits {
+            tokens_per_minute: Some(1),
+            ..budget::BudgetLimits::default()
+        };
+        provider.set_budgets(budget::ProviderBudgets::for_provider(std::sync::Arc::new(
+            budget::ProviderBudget::new("openai", None, limits),
+        )));
+        let Err(error) = provider.respond(request_with_ids(None, None)).await else {
+            return Err(TestError::Unexpected(
+                "a request larger than the whole per-minute budget must fail".into(),
+            ));
+        };
+        assert!(
+            matches!(&error, ModelError::RequestFailed(message) if message.contains("tokens_per_minute")),
+            "{error}"
+        );
+        assert!(!error.is_retryable(), "budget overflow is not transient");
+        let status = provider.load_status();
+        assert_eq!(status.budgets.len(), 1);
+        assert_eq!(status.budgets[0].admitted_total, 0);
         Ok(())
     }
 

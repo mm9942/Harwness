@@ -92,8 +92,8 @@ pub trait EventSink: Send + Sync {
     ///
     /// # Arguments
     /// - `event` (`&harw_dod_signals::SecurityEvent`): das bereits geformte
-    ///   Ereignis, wie es `crate::sensors::build_procmon_sensor`/
-    ///   `build_flow_sensor` liefern. Trägt nie Rohereignisbytes (siehe
+    ///   Ereignis, wie es der Wire-Wandler in `crate::collect` oder
+    ///   `crate::sensors::UnavailableSensor` liefert. Trägt nie Rohereignisbytes (siehe
     ///   Typ-Doku von `SecurityEvent` und `crate::sensors`-Moduldoku).
     ///
     /// # Returns

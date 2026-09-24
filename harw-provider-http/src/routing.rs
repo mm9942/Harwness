@@ -100,6 +100,21 @@ impl ModelProvider for RoutingModelProvider {
             Err(error) => Box::pin(async move { Err(error) }),
         }
     }
+
+    /// Meldet nie eine gepinnte Modell-ID.
+    ///
+    /// # Description
+    /// Der Router wählt das Backend pro Request anhand von
+    /// `request.provider_id`/`request.model_id`; es gibt kein einzelnes,
+    /// fest angesprochenes Modell. Die Pins einzelner Backends gelten nur für
+    /// Requests, die dorthin geroutet werden, und werden daher bewusst nicht
+    /// durchgereicht.
+    ///
+    /// # Returns
+    /// Immer `None`.
+    fn pinned_model_id(&self) -> Option<String> {
+        None
+    }
 }
 
 #[cfg(test)]

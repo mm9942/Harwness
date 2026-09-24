@@ -1,0 +1,5 @@
+name = "dependency-add-and-research"
+description = "Use when eine Dependency in IRGENDEINEM Ökosystem hinzugefügt, aktualisiert oder ausgewählt wird oder ein Versionskonflikt auftritt — npm/pnpm/yarn, pip/uv/poetry, go get, Maven/Gradle, dotnet, cargo — oder wenn du die exakte API einer Library nachschlagen musst. Trigger: Versionsnummer von Hand in package.json/pyproject.toml/go.mod/pom.xml/Cargo.toml tippen, ERESOLVE/\"ResolutionImpossible\"/\"failed to select a version\", \"welche Library soll ich nehmen\", Lockfile-Diff. Lehrt: per Paketmanager-CLI hinzufügen (neueste kompatible Version), Registry + lokal installierte Quelle als zwei Wahrheiten, Prüfung von Lizenz, Wartung, Security-Advisories und Typosquatting, Lockfile-Disziplin, Konflikte durch Hochziehen der neueren Seite lösen, Recherche an Subagents delegieren. Ökosystem-neutrale Variante von rust-cargo-add-and-dep-research."
+enabled = true
+instructions_file = "instructions.md"
+tools = ["filesystem.read", "process.execute", "web.search", "web.fetch"]

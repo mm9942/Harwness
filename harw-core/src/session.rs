@@ -133,8 +133,8 @@ use harw_protocol::events::SessionEvent;
 use harw_protocol::events::TurnEvent;
 use harw_tools::{ToolCall, ToolName};
 use harw_types::{
-    AgentRole, ApprovalActor, ItemId, ModelId, ProviderId, ReasoningEffort, SessionId, TokenUsage,
-    ThreadId, ToolCallId, TurnId,
+    AgentRole, ApprovalActor, ItemId, ModelId, ProviderId, ReasoningEffort, SessionId, ThreadId,
+    TokenUsage, ToolCallId, TurnId,
 };
 use std::collections::BTreeSet;
 use tokio::sync::mpsc;
@@ -304,6 +304,20 @@ pub struct AgentSession {
     /// Session über Fortschritt benachrichtigt wird (Lease-Erneuerung durch
     /// `ManagedAgentSpawner`). `None`: kein Beobachter registriert.
     progress_observer: Option<std::sync::Arc<dyn crate::guard::ProgressObserver>>,
+    /// Laufende Kalibrierung Bytes→Tokens dieser Session. Der Turn-Loop
+    /// schätzt vor jedem Request mit ihr und füttert sie danach mit der vom
+    /// Provider gemeldeten Prompt-Token-Zahl nach.
+    token_calibration: crate::context_budget::TokenCalibration,
+    /// Obergrenze für Ausgabe-Tokens je Modellanfrage (Output-Reserve).
+    /// `None`: Provider-Default.
+    max_output_tokens: Option<u64>,
+    /// Markiert, dass vor dem nächsten Modell-Request kompaktiert werden muss
+    /// (z. B. nach einem Wechsel auf ein Modell mit kleinerem Fenster).
+    pending_compaction: bool,
+    /// Explizit konfigurierter `max_history_bytes`-Override. Ist er gesetzt,
+    /// leitet [`AgentSession::set_active_model`] das History-Budget nicht aus
+    /// dem neuen Fenster ab, sondern behält diesen Wert.
+    configured_max_history_bytes: Option<usize>,
 }
 
 #[derive(Debug, Clone)]
@@ -592,6 +606,10 @@ impl AgentSession {
             drift_observer: None,
             pitfall_advisor: None,
             progress_observer: None,
+            token_calibration: crate::context_budget::TokenCalibration::default(),
+            max_output_tokens: None,
+            pending_compaction: false,
+            configured_max_history_bytes: None,
         }
     }
 
@@ -800,6 +818,77 @@ impl AgentSession {
     #[must_use]
     pub fn context_budget(&self) -> ContextBudget {
         self.context_budget
+    }
+
+    /// Hinterlegt einen explizit konfigurierten `max_history_bytes`-Override
+    /// (z. B. `[harness.compaction].max_history_bytes`).
+    ///
+    /// # Beschreibung
+    /// Ein gesetzter Wert wird sofort ins aktuelle [`ContextBudget`]
+    /// übernommen und überlebt jeden späteren Modellwechsel über
+    /// [`Self::set_active_model`]. `None` lässt das Budget unverändert und
+    /// erlaubt die Ableitung aus dem Kontextfenster.
+    #[must_use]
+    pub fn with_configured_max_history_bytes(mut self, max_history_bytes: Option<usize>) -> Self {
+        self.set_configured_max_history_bytes(max_history_bytes);
+        self
+    }
+
+    /// Nicht-konsumierende Variante von
+    /// [`Self::with_configured_max_history_bytes`].
+    pub fn set_configured_max_history_bytes(&mut self, max_history_bytes: Option<usize>) {
+        self.configured_max_history_bytes = max_history_bytes;
+        if let Some(bytes) = max_history_bytes {
+            self.context_budget.max_history_bytes = bytes;
+        }
+    }
+
+    /// Explizit konfigurierter `max_history_bytes`-Override, falls vorhanden.
+    #[must_use]
+    pub fn configured_max_history_bytes(&self) -> Option<usize> {
+        self.configured_max_history_bytes
+    }
+
+    /// Bytes→Tokens-Kalibrierung dieser Session (nur lesend).
+    #[must_use]
+    pub fn token_calibration(&self) -> &crate::context_budget::TokenCalibration {
+        &self.token_calibration
+    }
+
+    /// Veränderlicher Zugriff auf die Kalibrierung, damit der Turn-Loop nach
+    /// jeder Antwort `observe` aufrufen kann.
+    pub fn token_calibration_mut(&mut self) -> &mut crate::context_budget::TokenCalibration {
+        &mut self.token_calibration
+    }
+
+    /// Obergrenze für Ausgabe-Tokens je Modellanfrage; `None`: Provider-Default.
+    #[must_use]
+    pub fn max_output_tokens(&self) -> Option<u64> {
+        self.max_output_tokens
+    }
+
+    /// Setzt die Ausgabe-Obergrenze je Modellanfrage (Output-Reserve).
+    pub fn set_max_output_tokens(&mut self, max_output_tokens: Option<u64>) {
+        self.max_output_tokens = max_output_tokens;
+    }
+
+    /// Builder-Variante von [`Self::set_max_output_tokens`].
+    #[must_use]
+    pub fn with_max_output_tokens(mut self, max_output_tokens: Option<u64>) -> Self {
+        self.max_output_tokens = max_output_tokens;
+        self
+    }
+
+    /// `true`, wenn vor dem nächsten Modell-Request kompaktiert werden muss.
+    #[must_use]
+    pub fn pending_compaction(&self) -> bool {
+        self.pending_compaction
+    }
+
+    /// Setzt oder löscht die Markierung „vor dem nächsten Request
+    /// kompaktieren“. Der Turn-Loop löscht sie nach erfolgter Kompaktierung.
+    pub fn set_pending_compaction(&mut self, pending: bool) {
+        self.pending_compaction = pending;
     }
 
     /// Setzt das [`ContextProgram`], das diese Sitzung mitbringt.
@@ -1041,18 +1130,38 @@ impl AgentSession {
     /// Non-consuming counterpart to [`Self::with_active_model`] for sessions
     /// already registered in the session manager. `None` falls back to the
     /// provider's catalog default.
+    ///
+    /// Mit Resolver ([`Self::with_context_window_resolver`]) wird bei einem
+    /// echten Wechsel die Auto-Compact-Policy auf das neue Fenster skaliert
+    /// und `max_history_bytes` neu abgeleitet — außer ein explizit
+    /// konfigurierter Override ([`Self::with_configured_max_history_bytes`])
+    /// ist gesetzt, dann bleibt dieser erhalten. Ist das neue Fenster kleiner
+    /// als das alte, wird [`Self::pending_compaction`] gesetzt, damit die
+    /// History vor dem nächsten Request auf das kleinere Fenster schrumpft.
     pub fn set_active_model(&mut self, model: Option<ModelId>) {
         let changed = self.active_model != model;
+        if !changed {
+            return;
+        }
+        let Some(resolve) = self.context_window_resolver.clone() else {
+            self.active_model = model;
+            return;
+        };
+        let old_window = resolve(self.active_model.as_ref().map(ModelId::as_str));
         self.active_model = model;
-        if changed
-            && let Some(resolve) = &self.context_window_resolver
-        {
-            let window = resolve(self.active_model.as_ref().map(ModelId::as_str));
-            if let Some(policy) = self.auto_compact {
-                self.auto_compact = Some(policy.rescaled(window));
+        let window = resolve(self.active_model.as_ref().map(ModelId::as_str));
+        if let Some(policy) = self.auto_compact {
+            self.auto_compact = Some(policy.rescaled(window));
+        }
+        self.context_budget.max_history_bytes = match self.configured_max_history_bytes {
+            Some(configured) => configured,
+            None => {
+                let history = usize::try_from(window.saturating_mul(3)).unwrap_or(usize::MAX);
+                history.max(ContextBudget::conservative().max_history_bytes)
             }
-            let history = usize::try_from(window.saturating_mul(3)).unwrap_or(usize::MAX);
-            self.context_budget.max_history_bytes = history.max(ContextBudget::conservative().max_history_bytes);
+        };
+        if window < old_window {
+            self.pending_compaction = true;
         }
     }
 
@@ -1545,9 +1654,9 @@ impl AgentSession {
     /// Entnimmt die bisherige Laufzeit des zuletzt begonnenen Handoffs in
     /// Millisekunden (0, wenn kein Startzeitpunkt bekannt ist).
     pub fn take_handoff_elapsed_ms(&mut self) -> u64 {
-        self.handoff_started_at
-            .take()
-            .map_or(0, |start| u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX))
+        self.handoff_started_at.take().map_or(0, |start| {
+            u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX)
+        })
     }
 
     /// Pausiert die Session für eine Freigabeentscheidung.
@@ -2224,6 +2333,75 @@ forbidden = [{forbidden}]
         // Clearing resets to None.
         session.set_active_model(None);
         assert_eq!(session.active_model(), None);
+    }
+
+    fn resolver_session() -> AgentSession {
+        let resolver: std::sync::Arc<crate::child_controller::ContextWindowResolver> =
+            std::sync::Arc::new(|model: Option<&str>| match model {
+                Some("small") => 32_000,
+                Some("big") => 1_000_000,
+                _ => 200_000,
+            });
+        test_session().with_context_window_resolver(resolver)
+    }
+
+    #[test]
+    fn test_set_active_model_smaller_window_sets_pending_compaction() {
+        let mut session = resolver_session();
+        assert!(!session.pending_compaction());
+
+        session.set_active_model(Some(ModelId::from("big")));
+        assert!(!session.pending_compaction(), "größeres Fenster: kein Flag");
+        assert_eq!(session.context_budget().max_history_bytes, 3_000_000);
+
+        session.set_active_model(Some(ModelId::from("small")));
+        assert!(session.pending_compaction(), "kleineres Fenster: Flag");
+        assert_eq!(
+            session.context_budget().max_history_bytes,
+            ContextBudget::conservative().max_history_bytes
+        );
+
+        session.set_pending_compaction(false);
+        session.set_active_model(Some(ModelId::from("small")));
+        assert!(!session.pending_compaction(), "kein Wechsel: kein Flag");
+    }
+
+    #[test]
+    fn test_set_active_model_keeps_configured_max_history_bytes() {
+        let mut session = resolver_session().with_configured_max_history_bytes(Some(123_456));
+        assert_eq!(session.configured_max_history_bytes(), Some(123_456));
+        assert_eq!(session.context_budget().max_history_bytes, 123_456);
+
+        session.set_active_model(Some(ModelId::from("big")));
+        assert_eq!(session.context_budget().max_history_bytes, 123_456);
+        session.set_active_model(Some(ModelId::from("small")));
+        assert_eq!(session.context_budget().max_history_bytes, 123_456);
+        assert!(session.pending_compaction());
+    }
+
+    #[test]
+    fn test_set_active_model_without_resolver_leaves_budget_and_flag() {
+        let mut session = test_session();
+        let before = session.context_budget().max_history_bytes;
+        session.set_active_model(Some(ModelId::from("small")));
+        assert_eq!(session.context_budget().max_history_bytes, before);
+        assert!(!session.pending_compaction());
+    }
+
+    #[test]
+    fn test_max_output_tokens_and_calibration_accessors() {
+        let mut session = test_session();
+        assert_eq!(session.max_output_tokens(), None);
+        session.set_max_output_tokens(Some(16_384));
+        assert_eq!(session.max_output_tokens(), Some(16_384));
+        let session2 = test_session().with_max_output_tokens(Some(4_096));
+        assert_eq!(session2.max_output_tokens(), Some(4_096));
+
+        let default_bpt = crate::context_budget::DEFAULT_BYTES_PER_TOKEN;
+        assert!((session.token_calibration().bytes_per_token() - default_bpt).abs() < f64::EPSILON);
+        // 4 Bytes je Token beobachtet → EMA bewegt sich nach oben.
+        session.token_calibration_mut().observe(40_000, 10_000);
+        assert!(session.token_calibration().bytes_per_token() > default_bpt);
     }
 
     #[test]

@@ -112,7 +112,10 @@ mod tests {
     #[test]
     fn test_query_error_display_empty_embedding() {
         let err = QueryError::EmptyEmbedding;
-        assert_eq!(err.to_string(), "embedder returned no vector for the query text");
+        assert_eq!(
+            err.to_string(),
+            "embedder returned no vector for the query text"
+        );
     }
 
     #[test]

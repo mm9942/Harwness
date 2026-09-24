@@ -209,7 +209,8 @@ fn main() -> ExitCode {
 fn init_tracing(level: LogLevel) {
     use tracing_subscriber::EnvFilter;
 
-    let filter = EnvFilter::try_new(level.as_filter_directive()).unwrap_or_else(|_| EnvFilter::new("info"));
+    let filter =
+        EnvFilter::try_new(level.as_filter_directive()).unwrap_or_else(|_| EnvFilter::new("info"));
     tracing_subscriber::fmt()
         .with_env_filter(filter)
         .with_target(false)
@@ -275,8 +276,11 @@ fn run(cli: Cli, sentinel_socket: &Path) -> Result<(), ProbeError> {
     landlock::enforce_read_scope(&scope)?;
 
     let source = source::build_fanotify_source(&scope)?;
-    let handle =
-        SensorHandle::new(SensorId::from_str(cli.sensor_id.clone()), Capability::WatchFilesystem).bind(scope);
+    let handle = SensorHandle::new(
+        SensorId::from_str(cli.sensor_id.clone()),
+        Capability::WatchFilesystem,
+    )
+    .bind(scope);
     let sensor = FsMonSensor::new(handle, source, cli.proc_root.clone());
 
     tracing::info!(sensor_id = %cli.sensor_id, "collection loop starting");

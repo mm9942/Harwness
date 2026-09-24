@@ -980,6 +980,7 @@ mod tests {
             "private-model".to_owned(),
             harw_config::ModelToml {
                 stream: None,
+                rate_limit: None,
                 id: "private-model-2026".to_owned(),
                 name: Some("Private Model".to_owned()),
                 provider: "private-provider".to_owned(),
@@ -1091,6 +1092,7 @@ mod tests {
         fn model(model_id: &str, provider_name: &str) -> harw_config::ModelToml {
             harw_config::ModelToml {
                 stream: None,
+                rate_limit: None,
                 id: model_id.to_owned(),
                 name: None,
                 provider: provider_name.to_owned(),
@@ -1273,6 +1275,7 @@ mod tests {
                 key.to_owned(),
                 harw_config::ModelToml {
                     stream: None,
+                    rate_limit: None,
                     id: id.to_owned(),
                     name: None,
                     provider: provider.to_owned(),

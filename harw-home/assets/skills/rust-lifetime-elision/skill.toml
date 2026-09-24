@@ -1,0 +1,5 @@
+name = "rust-lifetime-elision"
+description = "Use when writing a function that takes or returns references and you are unsure whether lifetime annotations are required — teaches the three compiler elision rules and the exact cases where explicit annotations become necessary (Rust Edition 2024)"
+enabled = true
+instructions_file = "instructions.md"
+tools = ["filesystem.read"]

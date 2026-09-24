@@ -1,0 +1,5 @@
+name = "version-bump"
+description = "Analyze the pending changes and determine WHICH semver bump (patch/minor/major) is correct, then apply it to the project's single version source. Use when the user asks \"what version bump is this\", \"bump the version\", \"should this be major/minor/patch\", \"version this release\", or wants to keep versioning small-step and continuous. Works across ecosystems (Cargo, npm, Python/pyproject, Go tags, etc.)."
+enabled = true
+instructions_file = "instructions.md"
+tools = ["filesystem.read", "filesystem.write", "process.execute"]

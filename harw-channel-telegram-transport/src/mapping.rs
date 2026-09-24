@@ -150,19 +150,43 @@ pub enum TelegramCommand {
     Cancel {
         work_id: String,
     },
+    /// `/task <role> <text>`: Arbeitsauftrag im Workspace des Chats.
+    Task {
+        role: String,
+        task: String,
+    },
+    /// `/start` (ein Deep-Link-Payload wird ignoriert).
+    Start,
+    /// `/help`.
+    Help,
+    /// `/status`.
+    Status,
+    /// `/new`: beginnt eine frische Sitzung für diesen Chat.
+    New,
+    /// `/workspace` (anzeigen) bzw. `/workspace <alias>` (wechseln).
+    Workspace {
+        alias: Option<String>,
+    },
+    /// `/pair …`. Trägt den Code bewusst nicht: Pairing-Codes werden
+    /// ausschließlich von der Admission-Grenze ausgewertet und dürfen nicht
+    /// in Befehlsverarbeitung oder Protokolle gelangen.
+    Pair,
 }
 
 /// Maps a supported Telegram update into the transport-neutral ingress event.
 ///
 /// Callback payload data is intentionally excluded: it must be validated by the
 /// pending-approval boundary, never interpreted as ordinary message content.
+/// Callback-Queries werden separat über [`map_callback_query`] abgebildet.
 #[must_use]
 pub fn map_update(
     update: &RawUpdate,
     bot_id: i64,
     bot_username: Option<&str>,
 ) -> Option<InboundEvent> {
-    if let Some(message) = update.message.as_ref().or(update.edited_message.as_ref()) {
+    // `edited_message` wird bewusst nicht abgebildet: eine Bearbeitung ist
+    // keine neue Eingabe und darf keinen weiteren Turn/Befehl auslösen.
+    if let Some(message) = update.message.as_ref() {
         return map_message(
             update.update_id,
             message,
@@ -178,19 +202,142 @@ pub fn map_update(
 }
 
 /// Parses only the closed remote-command syntax; it performs no resolution.
+///
+/// Die Gruppenform `/cmd@botname args` wird akzeptiert: ein `@username`-Suffix
+/// am Befehlstoken wird entfernt, sofern er nicht leer ist und nur aus dem
+/// Telegram-Username-Zeichensatz `[A-Za-z0-9_]` besteht. Welcher Bot adressiert
+/// ist, wird hier bewusst nicht geprüft; die Adressierung entscheidet die
+/// Mention-/Admission-Logik. Der Befehlsname wird ASCII-case-insensitiv
+/// verglichen.
+///
+/// `/help`, `/status` und `/new` erwarten keine Argumente; `/start` ignoriert
+/// einen Deep-Link-Payload; `/pair` liefert unabhängig vom Argument
+/// [`TelegramCommand::Pair`] ohne Code.
 #[must_use]
 pub fn parse_command(text: &str) -> Option<TelegramCommand> {
     let text = text.trim();
-    let (command, arguments) = text.split_once(char::is_whitespace)?;
+    let (command, arguments) = match text.split_once(char::is_whitespace) {
+        Some((command, arguments)) => (command, arguments.trim()),
+        None => (text, ""),
+    };
+    let command = strip_bot_suffix(command)?.to_ascii_lowercase();
 
-    match command {
+    match command.as_str() {
         "/request" => parse_request(arguments),
         "/review" => parse_work_id(arguments).map(|work_id| TelegramCommand::Review { work_id }),
         "/approve" => parse_work_id(arguments).map(|work_id| TelegramCommand::Approve { work_id }),
         "/deny" => parse_work_id(arguments).map(|work_id| TelegramCommand::Deny { work_id }),
         "/cancel" => parse_work_id(arguments).map(|work_id| TelegramCommand::Cancel { work_id }),
+        "/task" => parse_task(arguments),
+        "/start" => Some(TelegramCommand::Start),
+        "/help" => arguments.is_empty().then_some(TelegramCommand::Help),
+        "/status" => arguments.is_empty().then_some(TelegramCommand::Status),
+        "/new" => arguments.is_empty().then_some(TelegramCommand::New),
+        "/workspace" => parse_workspace(arguments),
+        "/pair" => Some(TelegramCommand::Pair),
         _ => None,
     }
+}
+
+/// Maximale Länge eines Telegram-Befehlsnamens (ohne `/`).
+const MAX_COMMAND_NAME_LEN: usize = 32;
+
+/// Prüft, ob `text` syntaktisch wie ein Telegram-Bot-Befehl aussieht
+/// (`/name` oder `/name@bot`, Name 1–32 Zeichen aus `[A-Za-z0-9_]`),
+/// unabhängig davon, ob der Befehl bekannt ist.
+///
+/// Dient der Entscheidung über die Rückfallbehandlung unbekannter Befehle;
+/// Pfade wie `/etc/passwd` oder ein bloßes `/` gelten nicht als Befehl.
+#[must_use]
+pub fn is_command_like(text: &str) -> bool {
+    let Some(token) = text.split_whitespace().next() else {
+        return false;
+    };
+    let Some(name) = token.strip_prefix('/').and_then(strip_bot_suffix) else {
+        return false;
+    };
+    (1..=MAX_COMMAND_NAME_LEN).contains(&name.len())
+        && name
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
+}
+
+/// Liefert die `callback_query.id` eines Updates, sofern vorhanden und nicht leer.
+///
+/// Auch für Callbacks, die [`map_callback_query`] nicht abbilden kann (z. B.
+/// ohne zugängliche Nachricht), muss die Query per `answerCallbackQuery`
+/// beantwortet werden; dafür genügt diese ID.
+#[must_use]
+pub fn callback_query_id(update: &RawUpdate) -> Option<String> {
+    update
+        .callback_query
+        .as_ref()
+        .map(|callback| callback.id.as_str())
+        .filter(|id| !id.is_empty())
+        .map(str::to_owned)
+}
+
+/// Entfernt ein optionales `@username`-Suffix vom Befehlstoken.
+///
+/// Liefert `None`, wenn nach `@` kein gültiger Telegram-Username folgt.
+fn strip_bot_suffix(command: &str) -> Option<&str> {
+    match command.split_once('@') {
+        None => Some(command),
+        Some((command, username)) => {
+            let valid = !username.is_empty()
+                && username
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_');
+            valid.then_some(command)
+        }
+    }
+}
+
+/// Ein Tastendruck auf einen Inline-Button, getrennt vom normalen Nachrichtenpfad.
+///
+/// `data` bleibt opak und unvertrauenswürdig: Sie darf nur von der
+/// Pending-Approval-Grenze (Token-Store) ausgewertet werden, nie als Nutzertext.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TelegramCallback {
+    /// Telegram `update_id` für Dedup/Offset.
+    pub update_id: i64,
+    /// `callback_query.id`, benötigt für `answerCallbackQuery`.
+    pub callback_id: String,
+    /// Opake Callback-Nutzlast des Buttons.
+    pub data: String,
+    /// Chat der Nachricht, an der der Button hing.
+    pub chat_id: i64,
+    /// Nachricht, an der der Button hing.
+    pub message_id: i64,
+    /// Forum-Thema der Nachricht, falls vorhanden.
+    pub thread_id: Option<i64>,
+    /// Der tatsächlich tippende Nutzer (nicht der Autor der Nachricht).
+    pub sender: SenderRef,
+}
+
+/// Bildet eine `callback_query` auf einen [`TelegramCallback`] ab.
+///
+/// Liefert `None`, wenn das Update keine Callback-Query enthält, keine
+/// (zugängliche) Nachricht trägt – ohne Chat-/Nachrichtenbindung lässt sich
+/// ein Approval-Token nicht sicher zuordnen – oder keine nicht-leere `data`
+/// besitzt.
+#[must_use]
+pub fn map_callback_query(update: &RawUpdate) -> Option<TelegramCallback> {
+    let callback = update.callback_query.as_ref()?;
+    let message = callback.message.as_ref()?;
+    let data = callback.data.as_deref().filter(|data| !data.is_empty())?;
+    if callback.id.is_empty() {
+        return None;
+    }
+    Some(TelegramCallback {
+        update_id: update.update_id,
+        callback_id: callback.id.clone(),
+        data: data.to_owned(),
+        chat_id: message.chat.id,
+        message_id: message.message_id,
+        thread_id: message.message_thread_id,
+        sender: sender_ref(&callback.from),
+    })
 }
 
 fn map_message(
@@ -396,6 +543,28 @@ fn parse_request(arguments: &str) -> Option<TelegramCommand> {
         workspace_alias: workspace_alias.to_owned(),
         role: role.to_owned(),
         task: task.to_owned(),
+    })
+}
+
+fn parse_task(arguments: &str) -> Option<TelegramCommand> {
+    let (role, task) = arguments.trim().split_once(char::is_whitespace)?;
+    let task = task.trim();
+    if !is_atom(role) || task.is_empty() {
+        return None;
+    }
+    Some(TelegramCommand::Task {
+        role: role.to_owned(),
+        task: task.to_owned(),
+    })
+}
+
+fn parse_workspace(arguments: &str) -> Option<TelegramCommand> {
+    let alias = arguments.trim();
+    if alias.is_empty() {
+        return Some(TelegramCommand::Workspace { alias: None });
+    }
+    is_workspace_alias(alias).then(|| TelegramCommand::Workspace {
+        alias: Some(alias.to_owned()),
     })
 }
 
@@ -630,11 +799,237 @@ mod tests {
             "/approve work extra",
             "/deny work extra",
             "/cancel work extra",
-            "/request@harwbot ops role task",
+            "/request@ ops role task",
+            "/request@harw-bot ops role task",
+            "/request@harw.bot ops role task",
+            "/request@harw@bot ops role task",
+            "/unknown@harwbot work-42",
+            "/review@harwbot",
+            "/help now",
+            "/status please",
+            "/new session",
+            "/workspace ../ops",
+            "/workspace ops other",
+            "/task",
+            "/task implementer",
+            "/task@ implementer fix",
             "hello",
         ] {
             assert_eq!(parse_command(input), None, "{input}");
         }
+    }
+
+    #[test]
+    fn accepts_group_form_with_bot_username_suffix() {
+        assert_eq!(
+            parse_command("/request@HarwBot_2 ops-room implementer fix it"),
+            Some(TelegramCommand::Request {
+                workspace_alias: "ops-room".to_owned(),
+                role: "implementer".to_owned(),
+                task: "fix it".to_owned()
+            })
+        );
+        assert_eq!(
+            parse_command("  /approve@harwbot work-42  "),
+            Some(TelegramCommand::Approve {
+                work_id: "work-42".to_owned()
+            })
+        );
+        assert_eq!(
+            parse_command("/cancel@harwbot\twork-7"),
+            Some(TelegramCommand::Cancel {
+                work_id: "work-7".to_owned()
+            })
+        );
+    }
+
+    #[test]
+    fn parses_argumentless_and_chat_scoped_commands() {
+        assert_eq!(parse_command("/start"), Some(TelegramCommand::Start));
+        assert_eq!(
+            parse_command("/start deep-link-payload"),
+            Some(TelegramCommand::Start)
+        );
+        assert_eq!(parse_command("/help"), Some(TelegramCommand::Help));
+        assert_eq!(
+            parse_command(" /help@HarwBot "),
+            Some(TelegramCommand::Help)
+        );
+        assert_eq!(parse_command("/status"), Some(TelegramCommand::Status));
+        assert_eq!(parse_command("/new"), Some(TelegramCommand::New));
+        assert_eq!(parse_command("/NEW"), Some(TelegramCommand::New));
+        assert_eq!(
+            parse_command("/workspace"),
+            Some(TelegramCommand::Workspace { alias: None })
+        );
+        assert_eq!(
+            parse_command("/workspace@harwbot ops-room"),
+            Some(TelegramCommand::Workspace {
+                alias: Some("ops-room".to_owned())
+            })
+        );
+        assert_eq!(
+            parse_command("/task implementer fix the  failing test "),
+            Some(TelegramCommand::Task {
+                role: "implementer".to_owned(),
+                task: "fix the  failing test".to_owned()
+            })
+        );
+    }
+
+    #[test]
+    fn pair_command_never_carries_the_code() {
+        for input in ["/pair", "/pair Y2GQ-DEYE", "/PAIR@HarwBot y2gq-deye extra"] {
+            assert_eq!(parse_command(input), Some(TelegramCommand::Pair), "{input}");
+        }
+        let rendered = format!("{:?}", parse_command("/pair Y2GQ-DEYE"));
+        assert!(!rendered.contains("Y2GQ"));
+        assert_eq!(parse_command("/pairing Y2GQ-DEYE"), None);
+    }
+
+    #[test]
+    fn command_like_detection_is_syntactic() {
+        for input in [
+            "/unknown",
+            "/foo bar",
+            "/foo@harwbot",
+            "  /Start_2 x",
+            "/help",
+        ] {
+            assert!(is_command_like(input), "{input}");
+        }
+        for input in [
+            "",
+            "   ",
+            "/",
+            "/ foo",
+            "hello /help",
+            "/etc/passwd",
+            "/foo@",
+            "/foo@bad-bot",
+            "/fö",
+            "/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        ] {
+            assert!(!is_command_like(input), "{input}");
+        }
+    }
+
+    #[test]
+    fn edited_message_is_not_mapped_as_new_input() -> TestResult {
+        let update = RawUpdate {
+            update_id: 9,
+            message: None,
+            edited_message: Some(message()?),
+            callback_query: None,
+        };
+        assert!(map_update(&update, 700, Some("harwbot")).is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn callback_query_id_is_available_even_without_message() -> TestResult {
+        assert_eq!(
+            callback_query_id(&callback_update(Some("token"), false)?),
+            Some("callback-1".to_owned())
+        );
+        assert_eq!(
+            callback_query_id(&callback_update(None, true)?),
+            Some("callback-1".to_owned())
+        );
+        let plain_message = RawUpdate {
+            update_id: 1,
+            message: Some(message()?),
+            edited_message: None,
+            callback_query: None,
+        };
+        assert_eq!(callback_query_id(&plain_message), None);
+        let mut empty = callback_update(Some("token"), true)?;
+        if let Some(callback) = empty.callback_query.as_mut() {
+            callback.id.clear();
+        }
+        assert_eq!(callback_query_id(&empty), None);
+        Ok(())
+    }
+
+    fn callback_update(data: Option<&str>, with_message: bool) -> TestResult<RawUpdate> {
+        Ok(RawUpdate {
+            update_id: 22,
+            message: None,
+            edited_message: None,
+            callback_query: Some(RawCallbackQuery {
+                id: "callback-1".to_owned(),
+                from: RawUser {
+                    id: 44,
+                    is_bot: false,
+                    first_name: "Operator".to_owned(),
+                    last_name: Some("One".to_owned()),
+                    username: None,
+                },
+                message: if with_message { Some(message()?) } else { None },
+                data: data.map(str::to_owned),
+            }),
+        })
+    }
+
+    #[test]
+    fn callback_query_maps_binding_context_and_tapping_sender() -> TestResult {
+        let update = callback_update(Some("opaque-approval-token"), true)?;
+        let callback = map_callback_query(&update).ok_or(TestError::Missing("callback maps"))?;
+        assert_eq!(
+            callback,
+            TelegramCallback {
+                update_id: 22,
+                callback_id: "callback-1".to_owned(),
+                data: "opaque-approval-token".to_owned(),
+                chat_id: -10042,
+                message_id: 7,
+                thread_id: Some(33),
+                sender: SenderRef {
+                    id: "44".to_owned(),
+                    display_name: Some("Operator One".to_owned()),
+                },
+            }
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn callback_query_without_message_or_data_is_dropped() -> TestResult {
+        assert!(map_callback_query(&callback_update(Some("token"), false)?).is_none());
+        assert!(map_callback_query(&callback_update(None, true)?).is_none());
+        assert!(map_callback_query(&callback_update(Some(""), true)?).is_none());
+        let plain_message = RawUpdate {
+            update_id: 1,
+            message: Some(message()?),
+            edited_message: None,
+            callback_query: None,
+        };
+        assert!(map_callback_query(&plain_message).is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn callback_query_deserializes_from_wire_json() -> TestResult {
+        let update: RawUpdate = serde_json::from_value(json!({
+            "update_id": 5,
+            "callback_query": {
+                "id": "cb-9",
+                "from": { "id": 44, "is_bot": false, "first_name": "Op" },
+                "message": {
+                    "message_id": 12,
+                    "chat": { "id": 99, "type": "private" }
+                },
+                "data": "tok"
+            }
+        }))
+        .map_err(ctx("callback update JSON is valid"))?;
+        let callback = map_callback_query(&update).ok_or(TestError::Missing("callback maps"))?;
+        assert_eq!(callback.chat_id, 99);
+        assert_eq!(callback.message_id, 12);
+        assert_eq!(callback.thread_id, None);
+        assert_eq!(callback.data, "tok");
+        assert!(map_update(&update, 700, Some("harwbot")).is_none());
+        Ok(())
     }
 
     #[test]

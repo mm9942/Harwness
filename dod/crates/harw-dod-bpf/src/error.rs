@@ -188,7 +188,6 @@ impl From<BpfError> for harw_dod_cap::SensorError {
     }
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::BpfError;
@@ -256,6 +255,9 @@ mod tests {
 
     #[test]
     fn test_unknown_handle_display_is_exact() {
-        assert_eq!(BpfError::UnknownHandle.to_string(), "bpf handle is unknown to this loader");
+        assert_eq!(
+            BpfError::UnknownHandle.to_string(),
+            "bpf handle is unknown to this loader"
+        );
     }
 }

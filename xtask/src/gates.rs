@@ -112,7 +112,13 @@ impl GateReport {
 /// Tippfehler rot werden, nicht still alles überspringen.
 pub fn run(args: &[String]) -> Result<(), String> {
     let selected: Vec<&str> = if args.is_empty() {
-        vec!["edges", "privileges", "writescopes", "warden-deps", "warden-cbuild"]
+        vec![
+            "edges",
+            "privileges",
+            "writescopes",
+            "warden-deps",
+            "warden-cbuild",
+        ]
     } else {
         args.iter().map(String::as_str).collect()
     };
@@ -153,7 +159,10 @@ fn failure_message(failures: &[&GateReport]) -> String {
     let mut message = String::new();
     for report in failures {
         if report.checked == 0 {
-            message.push_str(&format!("Gate {} hat nichts geprüft (checked == 0)\n", report.name));
+            message.push_str(&format!(
+                "Gate {} hat nichts geprüft (checked == 0)\n",
+                report.name
+            ));
         }
         for violation in &report.violations {
             message.push_str(&format!("{}: {violation}\n", report.name));
@@ -176,7 +185,10 @@ mod tests {
             checked: 0,
             violations: Vec::new(),
         };
-        assert!(!report.is_green(), "ein leerer Report (checked == 0) darf nicht grün sein");
+        assert!(
+            !report.is_green(),
+            "ein leerer Report (checked == 0) darf nicht grün sein"
+        );
     }
 
     #[test]
@@ -224,7 +236,10 @@ mod tests {
             checked: 3,
             violations: vec!["irgendein Verstoß".to_owned()],
         };
-        assert_eq!(report.summary(), "test-gate: 1 Verstöße bei 3 geprüften Kandidaten");
+        assert_eq!(
+            report.summary(),
+            "test-gate: 1 Verstöße bei 3 geprüften Kandidaten"
+        );
     }
 
     /// R3-05: `run()`s Fehlermeldung darf für ein rotes Gate mit
@@ -240,7 +255,10 @@ mod tests {
             violations: Vec::new(),
         };
         let message = super::failure_message(&[&report]);
-        assert!(!message.is_empty(), "Meldung darf bei checked == 0 nicht leer sein");
+        assert!(
+            !message.is_empty(),
+            "Meldung darf bei checked == 0 nicht leer sein"
+        );
         assert!(message.contains("leeres-gate"), "{message:?}");
         assert!(message.contains("nichts geprüft"), "{message:?}");
     }

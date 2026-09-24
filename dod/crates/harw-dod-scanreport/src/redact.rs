@@ -123,7 +123,7 @@ pub(crate) fn sanitize_and_truncate(input: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{sanitize_and_truncate, MAX_DETAIL_LEN, TRUNCATION_MARKER};
+    use super::{MAX_DETAIL_LEN, TRUNCATION_MARKER, sanitize_and_truncate};
 
     #[test]
     fn test_sanitize_and_truncate_leaves_short_plain_text_unchanged() {

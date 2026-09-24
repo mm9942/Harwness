@@ -69,7 +69,13 @@ struct RelationSink {
 impl RelationSink {
     /// Fügt eine Relation hinzu; Selbstbezüge werden verworfen. Gibt `true`
     /// zurück, wenn das Tripel neu war.
-    fn push(&mut self, from: PathBuf, to: PathBuf, kind: RelationKind, label: Option<String>) -> bool {
+    fn push(
+        &mut self,
+        from: PathBuf,
+        to: PathBuf,
+        kind: RelationKind,
+        label: Option<String>,
+    ) -> bool {
         if from == to {
             return false;
         }
@@ -195,7 +201,9 @@ fn resolve(root: &Path, base: &Path, target: &str) -> Option<PathBuf> {
 /// Manifest, falls es `file_name` heißt, sonst `<root>/<file_name>`.
 fn manifest_path(project: &Project, file_name: &str) -> PathBuf {
     match &project.manifest {
-        Some(manifest) if manifest.file_name().is_some_and(|name| name == file_name) => manifest.clone(),
+        Some(manifest) if manifest.file_name().is_some_and(|name| name == file_name) => {
+            manifest.clone()
+        }
         _ => project.root.join(file_name),
     }
 }
@@ -222,11 +230,17 @@ fn same_ecosystem(a: ProjectKind, b: ProjectKind) -> bool {
 
 /// Bester Anzeigename für das Projekt an `root`: bevorzugt dieselbe
 /// Ökosystem-Art, dann jede Art außer Git/Dokumente, dann irgendeine.
-fn project_name_at<'a>(projects: &'a [Project], root: &Path, prefer: Option<ProjectKind>) -> Option<&'a str> {
+fn project_name_at<'a>(
+    projects: &'a [Project],
+    root: &Path,
+    prefer: Option<ProjectKind>,
+) -> Option<&'a str> {
     let at_root = || projects.iter().filter(move |p| p.root == root);
     let preferred = prefer.and_then(|kind| at_root().find(|p| same_ecosystem(p.kind, kind)));
     preferred
-        .or_else(|| at_root().find(|p| !matches!(p.kind, ProjectKind::Git | ProjectKind::Documents)))
+        .or_else(|| {
+            at_root().find(|p| !matches!(p.kind, ProjectKind::Git | ProjectKind::Documents))
+        })
         .or_else(|| at_root().next())
         .map(|p| p.name.as_str())
 }
@@ -235,7 +249,12 @@ fn workspace_members(projects: &[Project], sink: &mut RelationSink) {
     for project in projects {
         for member in &project.members {
             let label = project_name_at(projects, member, Some(project.kind)).map(str::to_owned);
-            sink.push(project.root.clone(), member.clone(), RelationKind::WorkspaceMember, label);
+            sink.push(
+                project.root.clone(),
+                member.clone(),
+                RelationKind::WorkspaceMember,
+                label,
+            );
         }
     }
 }
@@ -255,7 +274,12 @@ fn nested_projects(projects: &[Project], sink: &mut RelationSink) {
             continue;
         }
         let label = project_name_at(projects, inner, None).map(str::to_owned);
-        sink.push(outer.to_path_buf(), inner.to_path_buf(), RelationKind::NestedProject, label);
+        sink.push(
+            outer.to_path_buf(),
+            inner.to_path_buf(),
+            RelationKind::NestedProject,
+            label,
+        );
     }
 }
 
@@ -280,7 +304,12 @@ fn push_path_dep(root: &Path, from: &Path, target: &str, label: &str, sink: &mut
         tracing::debug!(from = %from.display(), to = %to.display(), "path dependency target missing");
         return;
     }
-    sink.push(from.to_path_buf(), to, RelationKind::PathDependency, Some(label.to_owned()));
+    sink.push(
+        from.to_path_buf(),
+        to,
+        RelationKind::PathDependency,
+        Some(label.to_owned()),
+    );
 }
 
 /// Trägt namentliche Abhängigkeiten auf passende Projekte der Art(en) ein.
@@ -360,9 +389,16 @@ fn push_sections<'a>(table: &'a toml::Table, out: &mut Vec<&'a toml::Table>) {
     }
 }
 
-fn cargo_dependencies(root: &Path, project: &Project, projects: &[Project], sink: &mut RelationSink) {
+fn cargo_dependencies(
+    root: &Path,
+    project: &Project,
+    projects: &[Project],
+    sink: &mut RelationSink,
+) {
     let rel = manifest_path(project, "Cargo.toml");
-    let Some(text) = read_manifest(root, &rel) else { return };
+    let Some(text) = read_manifest(root, &rel) else {
+        return;
+    };
     let manifest: toml::Table = match toml::from_str(&text) {
         Ok(table) => table,
         Err(error) => {
@@ -406,7 +442,9 @@ fn npm_dep_ref(name: &str, spec: &str) -> DepRef {
 
 fn npm_dependencies(root: &Path, project: &Project, projects: &[Project], sink: &mut RelationSink) {
     let rel = manifest_path(project, "package.json");
-    let Some(text) = read_manifest(root, &rel) else { return };
+    let Some(text) = read_manifest(root, &rel) else {
+        return;
+    };
     let manifest: serde_json::Value = match serde_json::from_str(&text) {
         Ok(value) => value,
         Err(error) => {
@@ -423,7 +461,9 @@ fn npm_dependencies(root: &Path, project: &Project, projects: &[Project], sink: 
             let Some(spec) = spec.as_str() else { continue };
             match npm_dep_ref(name, spec) {
                 DepRef::Path(path) => push_path_dep(root, &project.root, &path, name, sink),
-                DepRef::Name(name) => push_name_dep(&project.root, &name, projects, &node_kinds, sink),
+                DepRef::Name(name) => {
+                    push_name_dep(&project.root, &name, projects, &node_kinds, sink)
+                }
             }
         }
     }
@@ -437,7 +477,9 @@ fn python_dependencies(root: &Path, project: &Project, sink: &mut RelationSink) 
     if !root.join(&rel).is_file() {
         return;
     }
-    let Some(text) = read_manifest(root, &rel) else { return };
+    let Some(text) = read_manifest(root, &rel) else {
+        return;
+    };
     let manifest: toml::Table = match toml::from_str(&text) {
         Ok(table) => table,
         Err(error) => {
@@ -445,7 +487,9 @@ fn python_dependencies(root: &Path, project: &Project, sink: &mut RelationSink) 
             return;
         }
     };
-    let Some(tool) = manifest.get("tool").and_then(toml::Value::as_table) else { return };
+    let Some(tool) = manifest.get("tool").and_then(toml::Value::as_table) else {
+        return;
+    };
 
     let mut sections: Vec<&toml::Table> = Vec::new();
     if let Some(poetry) = tool.get("poetry").and_then(toml::Value::as_table) {
@@ -490,7 +534,10 @@ fn python_dependencies(root: &Path, project: &Project, sink: &mut RelationSink) 
 
 fn doc_links(root: &Path, nodes: &[Node], sink: &mut RelationSink) {
     let known: HashSet<&Path> = nodes.iter().map(|node| node.path.as_path()).collect();
-    let mut markdown: Vec<&Node> = nodes.iter().filter(|n| n.kind == FileKind::Markdown).collect();
+    let mut markdown: Vec<&Node> = nodes
+        .iter()
+        .filter(|n| n.kind == FileKind::Markdown)
+        .collect();
     markdown.sort_by(|a, b| a.path.cmp(&b.path));
 
     let mut count = 0usize;
@@ -519,7 +566,9 @@ fn doc_links(root: &Path, nodes: &[Node], sink: &mut RelationSink) {
         };
         let base = node.path.parent().unwrap_or_else(|| Path::new(""));
         for (text, target) in extract_links(&text) {
-            let Some(target) = local_link_target(&target) else { continue };
+            let Some(target) = local_link_target(&target) else {
+                continue;
+            };
             let resolved = match target.strip_prefix('/') {
                 // Führender Schrägstrich: relativ zur Explorer-Wurzel (wie bei Git-Hostern).
                 Some(from_root) => normalize_relative(Path::new(from_root)),
@@ -529,7 +578,12 @@ fn doc_links(root: &Path, nodes: &[Node], sink: &mut RelationSink) {
             if !to.as_os_str().is_empty() && !known.contains(to.as_path()) {
                 continue;
             }
-            if sink.push(node.path.clone(), to, RelationKind::DocLink, link_label(&text)) {
+            if sink.push(
+                node.path.clone(),
+                to,
+                RelationKind::DocLink,
+                link_label(&text),
+            ) {
                 count += 1;
                 if count >= MAX_DOC_LINKS {
                     break;
@@ -559,10 +613,15 @@ fn local_link_target(raw: &str) -> Option<String> {
 
 /// `true` für `scheme:` am Anfang (`http:`, `mailto:`, `data:` …).
 fn has_scheme(target: &str) -> bool {
-    let Some(colon) = target.find(':') else { return false };
+    let Some(colon) = target.find(':') else {
+        return false;
+    };
     let scheme = &target[..colon];
     scheme.len() > 1
-        && scheme.chars().next().is_some_and(|c| c.is_ascii_alphabetic())
+        && scheme
+            .chars()
+            .next()
+            .is_some_and(|c| c.is_ascii_alphabetic())
         && scheme
             .chars()
             .all(|c| c.is_ascii_alphanumeric() || matches!(c, '+' | '-' | '.'))
@@ -783,7 +842,13 @@ mod tests {
                 let rel = path.strip_prefix(root)?.to_path_buf();
                 let depth = u16::try_from(rel.components().count())?;
                 if path.is_dir() {
-                    out.push(Node { path: rel, kind: FileKind::Dir, size: 0, depth, ignored: false });
+                    out.push(Node {
+                        path: rel,
+                        kind: FileKind::Dir,
+                        size: 0,
+                        depth,
+                        ignored: false,
+                    });
                     visit(root, &path, out)?;
                 } else {
                     let kind = if path.extension().is_some_and(|e| e == "md") {
@@ -792,7 +857,13 @@ mod tests {
                         FileKind::Config
                     };
                     let size = fs::metadata(&path)?.len();
-                    out.push(Node { path: rel, kind, size, depth, ignored: false });
+                    out.push(Node {
+                        path: rel,
+                        kind,
+                        size,
+                        depth,
+                        ignored: false,
+                    });
                 }
             }
             Ok(())
@@ -803,7 +874,13 @@ mod tests {
         Ok(out)
     }
 
-    fn project(root: &str, kind: ProjectKind, name: &str, members: &[&str], manifest: Option<&str>) -> Project {
+    fn project(
+        root: &str,
+        kind: ProjectKind,
+        name: &str,
+        members: &[&str],
+        manifest: Option<&str>,
+    ) -> Project {
         Project {
             root: PathBuf::from(root),
             kind,
@@ -813,15 +890,27 @@ mod tests {
         }
     }
 
-    fn has(relations: &[Relation], from: &str, to: &str, kind: RelationKind, label: Option<&str>) -> bool {
+    fn has(
+        relations: &[Relation],
+        from: &str,
+        to: &str,
+        kind: RelationKind,
+        label: Option<&str>,
+    ) -> bool {
         relations.iter().any(|r| {
-            r.from == Path::new(from) && r.to == Path::new(to) && r.kind == kind && r.label.as_deref() == label
+            r.from == Path::new(from)
+                && r.to == Path::new(to)
+                && r.kind == kind
+                && r.label.as_deref() == label
         })
     }
 
     #[test]
     fn normalizes_lexically() {
-        assert_eq!(normalize_relative(Path::new("a/./b/../c")), Some(PathBuf::from("a/c")));
+        assert_eq!(
+            normalize_relative(Path::new("a/./b/../c")),
+            Some(PathBuf::from("a/c"))
+        );
         assert_eq!(normalize_relative(Path::new("a/../..")), None);
         assert_eq!(normalize_relative(Path::new("a/..")), Some(PathBuf::new()));
         assert_eq!(normalize_relative(Path::new("/abs")), None);
@@ -830,7 +919,10 @@ mod tests {
             Some(PathBuf::from("z"))
         );
         assert_eq!(resolve(Path::new("/r"), Path::new("x"), "../../z"), None);
-        assert_eq!(resolve(Path::new("/r"), Path::new("x"), "/r/q/../w"), Some(PathBuf::from("w")));
+        assert_eq!(
+            resolve(Path::new("/r"), Path::new("x"), "/r/q/../w"),
+            Some(PathBuf::from("w"))
+        );
         assert_eq!(resolve(Path::new("/r"), Path::new("x"), "/other"), None);
     }
 
@@ -838,7 +930,11 @@ mod tests {
     fn cargo_workspace_members_deps_and_nesting() -> TestResult {
         let dir = tempfile::tempdir()?;
         let root = dir.path();
-        write(root, "Cargo.toml", "[workspace]\nmembers = [\"crates/*\"]\n[workspace.dependencies]\nbeta = { path = \"crates/beta\" }\n")?;
+        write(
+            root,
+            "Cargo.toml",
+            "[workspace]\nmembers = [\"crates/*\"]\n[workspace.dependencies]\nbeta = { path = \"crates/beta\" }\n",
+        )?;
         write(
             root,
             "crates/alpha/Cargo.toml",
@@ -846,36 +942,121 @@ mod tests {
              [dev-dependencies]\ngamma-renamed = { path = \"../../tools/gamma\", package = \"gamma\" }\n\
              [target.'cfg(unix)'.build-dependencies]\nout = { path = \"../../../outside\" }\n",
         )?;
-        write(root, "crates/beta/Cargo.toml", "[package]\nname = \"beta\"\n[dependencies]\nalpha = \"0.1\"\n")?;
-        write(root, "tools/gamma/Cargo.toml", "[package]\nname = \"gamma\"\n")?;
+        write(
+            root,
+            "crates/beta/Cargo.toml",
+            "[package]\nname = \"beta\"\n[dependencies]\nalpha = \"0.1\"\n",
+        )?;
+        write(
+            root,
+            "tools/gamma/Cargo.toml",
+            "[package]\nname = \"gamma\"\n",
+        )?;
         write(root, "tools/gamma/sub/Cargo.toml", "this is = = not toml")?;
 
         let projects = vec![
-            project("", ProjectKind::CargoWorkspace, "root", &["crates/alpha", "crates/beta"], Some("Cargo.toml")),
+            project(
+                "",
+                ProjectKind::CargoWorkspace,
+                "root",
+                &["crates/alpha", "crates/beta"],
+                Some("Cargo.toml"),
+            ),
             project("", ProjectKind::Git, "repo", &[], None),
-            project("crates/alpha", ProjectKind::CargoCrate, "alpha", &[], Some("crates/alpha/Cargo.toml")),
-            project("crates/beta", ProjectKind::CargoCrate, "beta", &[], Some("crates/beta/Cargo.toml")),
-            project("tools/gamma", ProjectKind::CargoCrate, "gamma", &[], Some("tools/gamma/Cargo.toml")),
+            project(
+                "crates/alpha",
+                ProjectKind::CargoCrate,
+                "alpha",
+                &[],
+                Some("crates/alpha/Cargo.toml"),
+            ),
+            project(
+                "crates/beta",
+                ProjectKind::CargoCrate,
+                "beta",
+                &[],
+                Some("crates/beta/Cargo.toml"),
+            ),
+            project(
+                "tools/gamma",
+                ProjectKind::CargoCrate,
+                "gamma",
+                &[],
+                Some("tools/gamma/Cargo.toml"),
+            ),
             project("tools/gamma/sub", ProjectKind::CargoCrate, "sub", &[], None),
         ];
         let nodes = nodes_of(root)?;
         let rel = find_relations(root, &projects, &nodes);
 
-        assert!(has(&rel, "", "crates/alpha", RelationKind::WorkspaceMember, Some("alpha")));
-        assert!(has(&rel, "", "crates/beta", RelationKind::WorkspaceMember, Some("beta")));
-        assert!(has(&rel, "", "crates/beta", RelationKind::PathDependency, Some("beta")));
-        assert!(has(&rel, "crates/alpha", "crates/beta", RelationKind::CrateDependency, Some("beta")));
-        assert!(has(&rel, "crates/beta", "crates/alpha", RelationKind::CrateDependency, Some("alpha")));
-        assert!(has(&rel, "crates/alpha", "tools/gamma", RelationKind::PathDependency, Some("gamma-renamed")));
-        assert!(has(&rel, "", "tools/gamma", RelationKind::NestedProject, Some("gamma")));
-        assert!(has(&rel, "tools/gamma", "tools/gamma/sub", RelationKind::NestedProject, Some("sub")));
+        assert!(has(
+            &rel,
+            "",
+            "crates/alpha",
+            RelationKind::WorkspaceMember,
+            Some("alpha")
+        ));
+        assert!(has(
+            &rel,
+            "",
+            "crates/beta",
+            RelationKind::WorkspaceMember,
+            Some("beta")
+        ));
+        assert!(has(
+            &rel,
+            "",
+            "crates/beta",
+            RelationKind::PathDependency,
+            Some("beta")
+        ));
+        assert!(has(
+            &rel,
+            "crates/alpha",
+            "crates/beta",
+            RelationKind::CrateDependency,
+            Some("beta")
+        ));
+        assert!(has(
+            &rel,
+            "crates/beta",
+            "crates/alpha",
+            RelationKind::CrateDependency,
+            Some("alpha")
+        ));
+        assert!(has(
+            &rel,
+            "crates/alpha",
+            "tools/gamma",
+            RelationKind::PathDependency,
+            Some("gamma-renamed")
+        ));
+        assert!(has(
+            &rel,
+            "",
+            "tools/gamma",
+            RelationKind::NestedProject,
+            Some("gamma")
+        ));
+        assert!(has(
+            &rel,
+            "tools/gamma",
+            "tools/gamma/sub",
+            RelationKind::NestedProject,
+            Some("sub")
+        ));
         // Mitglieder werden nicht zusätzlich als verschachtelt gemeldet.
         assert!(!rel.iter().any(|r| r.kind == RelationKind::NestedProject && r.to == Path::new("crates/alpha")));
         // Externe/fremde Abhängigkeiten und Pfade außerhalb der Wurzel fehlen.
-        assert!(!rel.iter().any(|r| r.label.as_deref() == Some("serde") || r.label.as_deref() == Some("out")));
+        assert!(
+            !rel.iter()
+                .any(|r| r.label.as_deref() == Some("serde") || r.label.as_deref() == Some("out"))
+        );
 
         let mut sorted = rel.clone();
-        sorted.sort_by(|a, b| (&a.from, &a.to, kind_rank(a.kind)).cmp(&(&b.from, &b.to, kind_rank(b.kind))));
+        sorted.sort_by(|a, b| {
+            (&a.from, &a.to, kind_rank(a.kind)).cmp(&(&b.from, &b.to, kind_rank(b.kind)))
+        });
         assert_eq!(rel, sorted);
         Ok(())
     }
@@ -904,22 +1085,94 @@ mod tests {
         fs::create_dir_all(root.join("py/lib"))?;
 
         let projects = vec![
-            project("web", ProjectKind::Node, "web", &[], Some("web/package.json")),
-            project("web/tools", ProjectKind::Node, "tools", &[], Some("web/tools/package.json")),
-            project("libs/ui", ProjectKind::Node, "ui", &[], Some("libs/ui/package.json")),
-            project("libs/shared", ProjectKind::Node, "shared", &[], Some("libs/shared/package.json")),
-            project("broken", ProjectKind::Node, "broken", &[], Some("broken/package.json")),
-            project("py/app", ProjectKind::Python, "app", &[], Some("py/app/pyproject.toml")),
+            project(
+                "web",
+                ProjectKind::Node,
+                "web",
+                &[],
+                Some("web/package.json"),
+            ),
+            project(
+                "web/tools",
+                ProjectKind::Node,
+                "tools",
+                &[],
+                Some("web/tools/package.json"),
+            ),
+            project(
+                "libs/ui",
+                ProjectKind::Node,
+                "ui",
+                &[],
+                Some("libs/ui/package.json"),
+            ),
+            project(
+                "libs/shared",
+                ProjectKind::Node,
+                "shared",
+                &[],
+                Some("libs/shared/package.json"),
+            ),
+            project(
+                "broken",
+                ProjectKind::Node,
+                "broken",
+                &[],
+                Some("broken/package.json"),
+            ),
+            project(
+                "py/app",
+                ProjectKind::Python,
+                "app",
+                &[],
+                Some("py/app/pyproject.toml"),
+            ),
         ];
         let nodes = nodes_of(root)?;
         let rel = find_relations(root, &projects, &nodes);
 
-        assert!(has(&rel, "web", "libs/ui", RelationKind::PathDependency, Some("ui")));
-        assert!(has(&rel, "web", "web/tools", RelationKind::PathDependency, Some("tools")));
-        assert!(has(&rel, "web", "libs/shared", RelationKind::CrateDependency, Some("shared")));
-        assert!(has(&rel, "web", "web/tools", RelationKind::NestedProject, Some("tools")));
-        assert!(has(&rel, "py/app", "py/core", RelationKind::PathDependency, Some("core")));
-        assert!(has(&rel, "py/app", "py/lib", RelationKind::PathDependency, Some("lib")));
+        assert!(has(
+            &rel,
+            "web",
+            "libs/ui",
+            RelationKind::PathDependency,
+            Some("ui")
+        ));
+        assert!(has(
+            &rel,
+            "web",
+            "web/tools",
+            RelationKind::PathDependency,
+            Some("tools")
+        ));
+        assert!(has(
+            &rel,
+            "web",
+            "libs/shared",
+            RelationKind::CrateDependency,
+            Some("shared")
+        ));
+        assert!(has(
+            &rel,
+            "web",
+            "web/tools",
+            RelationKind::NestedProject,
+            Some("tools")
+        ));
+        assert!(has(
+            &rel,
+            "py/app",
+            "py/core",
+            RelationKind::PathDependency,
+            Some("core")
+        ));
+        assert!(has(
+            &rel,
+            "py/app",
+            "py/lib",
+            RelationKind::PathDependency,
+            Some("lib")
+        ));
         assert!(!rel.iter().any(|r| r.label.as_deref() == Some("left-pad")));
         Ok(())
     }
@@ -948,16 +1201,59 @@ mod tests {
 
         let nodes = nodes_of(root)?;
         let rel = find_relations(root, &[], &nodes);
-        let links: Vec<&Relation> = rel.iter().filter(|r| r.kind == RelationKind::DocLink).collect();
+        let links: Vec<&Relation> = rel
+            .iter()
+            .filter(|r| r.kind == RelationKind::DocLink)
+            .collect();
 
-        assert!(has(&rel, "docs/guide.md", "docs/api.md", RelationKind::DocLink, Some("the API")));
-        assert!(has(&rel, "docs/guide.md", "README.md", RelationKind::DocLink, Some("Readme")));
-        assert!(has(&rel, "docs/guide.md", "docs/img/logo big.png", RelationKind::DocLink, Some("logo")));
-        assert!(has(&rel, "docs/guide.md", "src", RelationKind::DocLink, Some("root")));
-        assert!(has(&rel, "docs/guide.md", "docs/other.md", RelationKind::DocLink, Some("ref")));
-        assert!(has(&rel, "README.md", "docs", RelationKind::DocLink, Some("docs")));
+        assert!(has(
+            &rel,
+            "docs/guide.md",
+            "docs/api.md",
+            RelationKind::DocLink,
+            Some("the API")
+        ));
+        assert!(has(
+            &rel,
+            "docs/guide.md",
+            "README.md",
+            RelationKind::DocLink,
+            Some("Readme")
+        ));
+        assert!(has(
+            &rel,
+            "docs/guide.md",
+            "docs/img/logo big.png",
+            RelationKind::DocLink,
+            Some("logo")
+        ));
+        assert!(has(
+            &rel,
+            "docs/guide.md",
+            "src",
+            RelationKind::DocLink,
+            Some("root")
+        ));
+        assert!(has(
+            &rel,
+            "docs/guide.md",
+            "docs/other.md",
+            RelationKind::DocLink,
+            Some("ref")
+        ));
+        assert!(has(
+            &rel,
+            "README.md",
+            "docs",
+            RelationKind::DocLink,
+            Some("docs")
+        ));
         assert_eq!(links.len(), 6, "{links:#?}");
-        assert!(links.iter().all(|r| r.label.as_ref().is_none_or(|l| l.chars().count() <= MAX_LABEL_CHARS)));
+        assert!(links.iter().all(|r| {
+            r.label
+                .as_ref()
+                .is_none_or(|l| l.chars().count() <= MAX_LABEL_CHARS)
+        }));
         Ok(())
     }
 
@@ -973,7 +1269,12 @@ mod tests {
         write(root, "index.md", &body)?;
         let nodes = nodes_of(root)?;
         let rel = find_relations(root, &[], &nodes);
-        assert_eq!(rel.iter().filter(|r| r.kind == RelationKind::DocLink).count(), MAX_DOC_LINKS);
+        assert_eq!(
+            rel.iter()
+                .filter(|r| r.kind == RelationKind::DocLink)
+                .count(),
+            MAX_DOC_LINKS
+        );
         Ok(())
     }
 

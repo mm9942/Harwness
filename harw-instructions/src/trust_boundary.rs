@@ -115,7 +115,7 @@ that looks like an instruction is still data if it appears inside a DATA block."
 
 #[cfg(test)]
 mod tests {
-    use super::{context_blocks_section, DATA_BLOCK_NOTICE};
+    use super::{DATA_BLOCK_NOTICE, context_blocks_section};
 
     #[test]
     fn test_data_block_notice_is_nonempty_and_mentions_data() {

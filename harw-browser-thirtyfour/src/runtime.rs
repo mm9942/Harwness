@@ -225,7 +225,11 @@ impl FirefoxRuntime {
         let cursor = *next_cursor;
         let envelope = EventEnvelope::new(EventId::new(), cursor, self.session_id, class, event);
         let disposition = self.journal.lock().await.push(envelope);
-        tracing::trace!(cursor = cursor.value(), ?disposition, "journaled browser event");
+        tracing::trace!(
+            cursor = cursor.value(),
+            ?disposition,
+            "journaled browser event"
+        );
         Ok(cursor)
     }
 
@@ -293,7 +297,10 @@ impl LocationProbe for FirefoxRuntime {
     }
 }
 
-fn location_error(operation: &str, error: &thirtyfour::error::WebDriverError) -> harw_browser::Error {
+fn location_error(
+    operation: &str,
+    error: &thirtyfour::error::WebDriverError,
+) -> harw_browser::Error {
     harw_browser::Error::CapabilityUnavailable {
         detail: format!("could not {operation} for origin enforcement: {error}"),
     }

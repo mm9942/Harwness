@@ -126,7 +126,7 @@ mod resolve;
 mod selector;
 
 pub use error::{QueryError, QueryResult};
-pub use query::{query, query_scoped, QueryProvenance};
+pub use query::{QueryProvenance, query, query_scoped};
 pub use resolve::resolve_index;
 pub use selector::{IndexSelector, ReadScope};
 

@@ -86,9 +86,9 @@ impl ModelProvider for PinnedModelProvider {
     /// gepinnten Werten (sofern gesetzt) und delegiert dann an `inner`.
     ///
     /// # Description
-    /// Der Trait [`ModelProvider`] hat aktuell genau eine Methode
-    /// (`respond`) und keine weiteren Default-Methoden — sie ist die
-    /// einzige, an die delegiert werden muss.
+    /// Neben `respond` überschreibt der Wrapper nur
+    /// [`ModelProvider::pinned_model_id`] (siehe unten); weitere Methoden hat
+    /// der Trait nicht.
     ///
     /// # Arguments
     /// - `request` (`ModelRequest`): der Request, dessen `model_id`/
@@ -109,6 +109,25 @@ impl ModelProvider for PinnedModelProvider {
             request.provider_id = Some(provider_id);
         }
         self.inner.respond(request)
+    }
+
+    /// Liefert die gepinnte Modell-ID, sonst die des inneren Providers.
+    ///
+    /// # Description
+    /// Grundlage für die Kontextfenster-Auflösung von Kind-Sessions
+    /// (`ManagedAgentSpawner`, Welle 3): ein gepinnter Kind-Provider spricht
+    /// immer dieses Modell an, unabhängig vom `active_model` der Session.
+    /// Ohne eigenen Pin wird der Wert des umhüllten Providers durchgereicht,
+    /// damit verschachtelte Wrapper den Pin nicht verlieren.
+    ///
+    /// # Returns
+    /// `Some(model_id)` bei gepinnter Modell-ID, sonst
+    /// `self.inner.pinned_model_id()`.
+    fn pinned_model_id(&self) -> Option<String> {
+        match &self.model_id {
+            Some(model_id) => Some(model_id.as_str().to_owned()),
+            None => self.inner.pinned_model_id(),
+        }
     }
 }
 
@@ -171,5 +190,38 @@ mod tests {
         assert!(recorded.model_id.is_none());
         assert!(recorded.provider_id.is_none());
         Ok(())
+    }
+
+    #[test]
+    fn test_pinned_model_id_reports_the_pinned_model() {
+        let inner: Arc<dyn ModelProvider> = Arc::new(RecordingModelProvider::new());
+        let provider = PinnedModelProvider::new(
+            inner,
+            None,
+            Some(ModelId::from("nvidia/nemotron-3.5-lightning")),
+        );
+        assert_eq!(
+            provider.pinned_model_id().as_deref(),
+            Some("nvidia/nemotron-3.5-lightning")
+        );
+    }
+
+    #[test]
+    fn test_pinned_model_id_falls_through_to_the_inner_provider() {
+        let inner: Arc<dyn ModelProvider> = Arc::new(RecordingModelProvider::new());
+        let unpinned: Arc<dyn ModelProvider> = Arc::new(PinnedModelProvider::new(
+            inner,
+            Some(ProviderId::from("p")),
+            None,
+        ));
+        assert_eq!(unpinned.pinned_model_id(), None);
+
+        let inner_pinned: Arc<dyn ModelProvider> = Arc::new(PinnedModelProvider::new(
+            unpinned,
+            None,
+            Some(ModelId::from("inner-model")),
+        ));
+        let outer = PinnedModelProvider::new(inner_pinned, None, None);
+        assert_eq!(outer.pinned_model_id().as_deref(), Some("inner-model"));
     }
 }

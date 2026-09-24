@@ -9,6 +9,15 @@
 //! [`harw_config::ConfigWriter`] (kommentarerhaltend, atomar, mit Backup) —
 //! derselbe Persistenzweg, den `/permissions` und `/model switch` nutzen.
 //!
+//! `proposals`, `review <id>`, `accept <id>` und `reject <id> [grund]` sind
+//! die Operator-Fläche der Skill-Vorschläge (Welle 4): sie lesen und
+//! entscheiden die unter `<profil>/skills/.proposals/` abgelegten Vorschläge
+//! aus `skills.propose`
+//! ([`harw_registry_defaults::skill_proposal_tools::SkillProposalStore`]).
+//! `accept` ist die Nutzerbestätigung selbst und schreibt
+//! `<profil>/skills/<name>/`; einem Agenten zugewiesen wird der Skill dadurch
+//! nicht.
+//!
 //! # Verantwortungsbereich
 //! Implementiert die `skills`-Operation ausschließlich als `/skills`-Command
 //! (`channel_reduced`); sie wird nicht als Model-Tool exponiert, weil das
@@ -55,6 +64,10 @@
 use harw_config::{ResolvedConfig, SkillToml};
 use harw_macros::operation;
 use harw_operations::{OpContext, OpError, OpOutput};
+use harw_registry_defaults::skill_proposal_tools::{
+    CommitAuthority, LoadedSkillProposal, SkillProposalError, SkillProposalListing,
+    SkillProposalStore,
+};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -75,6 +88,10 @@ const SKILL_MANIFEST: &str = "skill.toml";
 /// - `action = Some("show")` mit `target` → Details eines Skills.
 /// - `action = Some("activate")`/`Some("deactivate")` mit `target` → `enabled`
 ///   im Skill-Manifest dauerhaft umschalten.
+/// - `action = Some("proposals")` → offene und entschiedene Skill-Vorschläge.
+/// - `action = Some("review")`/`Some("accept")` mit `target` (Vorschlags-ID) →
+///   Vorschlag ansehen bzw. übernehmen; `Some("reject")` mit `target` und
+///   optionalem Grund in `value` → verwerfen.
 ///
 /// # Felder
 /// - `action` (`Option<String>`): Token 0 — Sub-Kommando: `"list"` (Standard),
@@ -323,6 +340,277 @@ fn skill_state_persistence(ctx: &OpContext) -> Result<Arc<dyn SkillStatePersiste
     Ok(Arc::new(LayeredSkillStatePersistence::from_home()?) as Arc<dyn SkillStatePersistence>)
 }
 
+// ── Skill-Vorschläge ──────────────────────────────────────────────────────────
+
+/// Liefert die injizierte Vorschlagsablage oder die des aktiven Profils
+/// (`<HARW_HOME>/profiles/<aktiv>/skills`).
+///
+/// # Fehler
+/// - [`OpError::Execution`]: kein Dienst registriert und Home/Profil nicht
+///   auflösbar.
+fn skill_proposal_store(ctx: &OpContext) -> Result<Arc<SkillProposalStore>, OpError> {
+    if let Some(store) = ctx.service::<Arc<SkillProposalStore>>() {
+        return Ok(Arc::clone(store));
+    }
+    let home = harw_home::home_dir()
+        .map_err(|error| OpError::Execution(format!("HARW_HOME nicht auflösbar: {error}")))?;
+    let profile = harw_home::active_profile_name(&home);
+    let profile_dir = harw_home::profile_dir(&home, &profile).map_err(|error| {
+        OpError::Execution(format!("Profil '{profile}' nicht auflösbar: {error}"))
+    })?;
+    Ok(Arc::new(SkillProposalStore::new(
+        profile_dir.join("skills"),
+    )))
+}
+
+/// Bildet einen Ablagefehler auf den passenden Operationsfehler ab.
+fn proposal_error(error: SkillProposalError) -> OpError {
+    match error {
+        SkillProposalError::Io(_) => OpError::Execution(error.to_string()),
+        SkillProposalError::Invalid(_)
+        | SkillProposalError::InvalidId(_)
+        | SkillProposalError::NotFound(_)
+        | SkillProposalError::Expired(_)
+        | SkillProposalError::Conflict(_)
+        | SkillProposalError::RequiresUserConfirmation { .. } => {
+            OpError::InvalidArguments(error.to_string())
+        }
+    }
+}
+
+/// Verlangt die Vorschlags-ID aus Token 1.
+fn required_proposal_id<'a>(action: &str, args: &'a SkillsArgs) -> Result<&'a str, OpError> {
+    args.target.as_deref().ok_or_else(|| {
+        OpError::InvalidArguments(format!("action '{action}' requires a proposal id"))
+    })
+}
+
+/// Rendert die Vorschlagsliste für `/skills proposals`.
+fn render_proposal_list(listings: &[SkillProposalListing]) -> String {
+    if listings.is_empty() {
+        return "Keine Skill-Vorschläge.".to_owned();
+    }
+    let mut lines = vec![format!("{} Skill-Vorschlag/-Vorschläge:", listings.len())];
+    for listing in listings {
+        match listing {
+            SkillProposalListing::Proposal { meta, expired } => {
+                let mut line = format!(
+                    "- {} [{}] {} · Prüfstufe {} · Evals {}",
+                    meta.proposal_id,
+                    meta.status.as_str(),
+                    meta.name,
+                    meta.review_level.as_str(),
+                    meta.eval_status()
+                );
+                if !meta.capability_delta.is_empty() {
+                    line.push_str(&format!(
+                        " · Delta Werkzeuge [{}] MCPs [{}]",
+                        meta.capability_delta.added_tools.join(", "),
+                        meta.capability_delta.added_mcps.join(", ")
+                    ));
+                }
+                if *expired {
+                    line.push_str(" · abgelaufen");
+                }
+                lines.push(line);
+            }
+            SkillProposalListing::Broken { proposal_id, error } => {
+                lines.push(format!("- {proposal_id} (defekt: {error})"));
+            }
+        }
+    }
+    lines.join("\n")
+}
+
+/// Kürzt `text` auf seine erste Zeile mit höchstens `max` Zeichen.
+fn first_line(text: &str, max: usize) -> String {
+    let line = text.lines().next().unwrap_or_default();
+    if line.chars().count() > max {
+        let mut cut: String = line.chars().take(max).collect();
+        cut.push('…');
+        cut
+    } else {
+        line.to_owned()
+    }
+}
+
+/// Rendert einen Vorschlag für `/skills review <id>`.
+fn render_proposal_review(loaded: &LoadedSkillProposal) -> String {
+    let meta = &loaded.meta;
+    let mut lines = vec![
+        format!("Skill-Vorschlag {} — {}", meta.proposal_id, meta.name),
+        format!(
+            "Status: {} · läuft ab {}{}",
+            meta.status.as_str(),
+            meta.expires_at,
+            if loaded.expired { " (ABGELAUFEN)" } else { "" }
+        ),
+        format!(
+            "Prüfstufe: {} · Urheber: {} · ersetzt bestehenden Skill: {}",
+            meta.review_level.as_str(),
+            meta.author_role.as_deref().unwrap_or("unbekannt"),
+            if meta.replaces_existing { "ja" } else { "nein" }
+        ),
+        format!("Beschreibung: {}", meta.description),
+    ];
+    if meta.capability_delta.is_empty() {
+        lines.push("Delta gegenüber Urheber: keines".to_owned());
+    } else {
+        lines.push(format!(
+            "Delta gegenüber Urheber: Werkzeuge [{}], MCPs [{}]",
+            meta.capability_delta.added_tools.join(", "),
+            meta.capability_delta.added_mcps.join(", ")
+        ));
+    }
+    for warning in &meta.warnings {
+        lines.push(format!("Hinweis: {warning}"));
+    }
+    if let Some(reason) = &meta.reason {
+        lines.push(format!("Ablehnungsgrund: {reason}"));
+    }
+    lines.push("--- skill.toml ---".to_owned());
+    lines.push(loaded.skill_toml.trim_end().to_owned());
+    if meta.replaces_existing {
+        lines.push(format!(
+            "--- instructions.md ({} Bytes), Diff gegen Bestand ---",
+            loaded.instructions.len()
+        ));
+        lines.push(meta.instructions_diff.trim_end().to_owned());
+    } else {
+        // Ohne Bestand ist der Diff nur „new file" — der Operator muss den
+        // vollständigen Text sehen, den er übernimmt.
+        lines.push(format!(
+            "--- instructions.md ({} Bytes), neu ---",
+            loaded.instructions.len()
+        ));
+        lines.push(loaded.instructions.trim_end().to_owned());
+    }
+    if meta.evals.is_empty() {
+        lines.push("Evals: keine".to_owned());
+    } else {
+        lines.push(format!(
+            "Evals ({}, Status {}):",
+            meta.evals.len(),
+            meta.eval_status()
+        ));
+        for case in &meta.evals {
+            lines.push(format!(
+                "- {}: {} ({} Assertion(s))",
+                case.id,
+                first_line(&case.prompt, 80),
+                case.assertions.len()
+            ));
+        }
+    }
+    if let Some(benchmark) = &meta.benchmark {
+        let delta = benchmark.delta();
+        lines.push(format!(
+            "Benchmark (Iteration {}, {} Lauf/Läufe je Konfiguration, Baseline {:?}):",
+            benchmark.iteration, benchmark.runs_per_configuration, benchmark.baseline
+        ));
+        let with = &benchmark.with_skill;
+        let base = &benchmark.baseline_stats;
+        lines.push(format!(
+            "  Passrate {:.2}±{:.2} vs {:.2}±{:.2} (Δ {:+.2})",
+            with.pass_rate.mean,
+            with.pass_rate.stddev,
+            base.pass_rate.mean,
+            base.pass_rate.stddev,
+            delta.pass_rate
+        ));
+        lines.push(format!(
+            "  Dauer s  {:.1}±{:.1} vs {:.1}±{:.1} (Δ {:+.1})",
+            with.duration_seconds.mean,
+            with.duration_seconds.stddev,
+            base.duration_seconds.mean,
+            base.duration_seconds.stddev,
+            delta.duration_seconds
+        ));
+        lines.push(format!(
+            "  Token    {:.0}±{:.0} vs {:.0}±{:.0} (Δ {:+.0})",
+            with.total_tokens.mean,
+            with.total_tokens.stddev,
+            base.total_tokens.mean,
+            base.total_tokens.stddev,
+            delta.total_tokens
+        ));
+        if !benchmark.flaky_assertions.is_empty() {
+            lines.push(format!(
+                "  schwankend: {}",
+                benchmark.flaky_assertions.join("; ")
+            ));
+        }
+        if !benchmark.non_discriminating_assertions.is_empty() {
+            lines.push(format!(
+                "  nicht unterscheidend: {}",
+                benchmark.non_discriminating_assertions.join("; ")
+            ));
+        }
+        for note in &benchmark.notes {
+            lines.push(format!("  Notiz: {note}"));
+        }
+    }
+    lines.join("\n")
+}
+
+/// Führt die Vorschlags-Aktionen aus (`proposals`, `review`, `accept`,
+/// `reject`). Braucht keinen Config-Service.
+///
+/// # Fehler
+/// - [`OpError::InvalidArguments`]: fehlende/ungültige ID, unbekannter,
+///   abgelaufener oder nicht offener Vorschlag, ungültiger Kandidat.
+/// - [`OpError::Execution`]: Ablage nicht auflösbar, Lese-/Schreibfehler.
+fn run_proposal_action(
+    ctx: &OpContext,
+    action: &str,
+    args: &SkillsArgs,
+) -> Result<OpOutput, OpError> {
+    let store = skill_proposal_store(ctx)?;
+    match action {
+        "proposals" => {
+            let listings = store.list().map_err(proposal_error)?;
+            Ok(OpOutput::from(render_proposal_list(&listings)))
+        }
+        "review" => {
+            let id = required_proposal_id(action, args)?;
+            let loaded = store.load(id).map_err(proposal_error)?;
+            Ok(OpOutput::from(render_proposal_review(&loaded)))
+        }
+        "accept" => {
+            let id = required_proposal_id(action, args)?;
+            let outcome = store
+                .commit(id, CommitAuthority::Operator)
+                .map_err(proposal_error)?;
+            let mut text = format!(
+                "Skill '{}' übernommen nach {}. Er ist keinem Agenten zugewiesen; wirksam ab \
+                 dem nächsten Config-Laden, sobald ein Agent ihn unter `skills` führt.",
+                outcome.meta.name,
+                outcome.skill_dir.display()
+            );
+            if let Some(error) = outcome.status_update_error {
+                text.push_str(&format!("\nWarnung: {error}"));
+            }
+            Ok(OpOutput::from(text))
+        }
+        "reject" => {
+            let id = required_proposal_id(action, args)?;
+            let reason = args
+                .value
+                .as_deref()
+                .filter(|reason| !reason.trim().is_empty())
+                .unwrap_or("vom Operator abgelehnt");
+            let meta = store.reject(id, reason).map_err(proposal_error)?;
+            Ok(OpOutput::from(format!(
+                "Skill-Vorschlag {} ({}) abgelehnt: {reason}",
+                meta.proposal_id, meta.name
+            )))
+        }
+        unknown => Err(OpError::InvalidArguments(format!(
+            "unknown /skills action '{unknown}'"
+        ))),
+    }
+}
+
 // ── Operation ─────────────────────────────────────────────────────────────────
 
 /// Liest den Skill-Katalog und schaltet Skills dauerhaft an oder ab.
@@ -362,12 +650,15 @@ fn skill_state_persistence(ctx: &OpContext) -> Result<Arc<dyn SkillStatePersiste
 /// ```
 #[operation(
     name = "skills",
-    summary = "Skill-Katalog: list/show/activate/deactivate gegen ResolvedConfig.skills.",
+    summary = "Skill-Katalog (list/show/activate/deactivate) und Skill-Vorschläge (proposals/review/accept/reject).",
     domain = "catalog_config",
     permission = "operator",
     command(path = "/skills", visibility = "channel_reduced")
 )]
 async fn skills(ctx: &OpContext, args: SkillsArgs) -> Result<OpOutput, OpError> {
+    if let Some(action @ ("proposals" | "review" | "accept" | "reject")) = args.action.as_deref() {
+        return run_proposal_action(ctx, action, &args);
+    }
     let Some(config) = ctx.service::<Arc<ResolvedConfig>>() else {
         return Err(OpError::NotAvailable(
             "skill catalog integration is not available".to_owned(),
@@ -845,6 +1136,106 @@ mod tests {
         let second = second.map_err(ctx("second deactivate"))?;
         assert!(second.text.contains("bereits deaktiviert"));
         assert!(!read_enabled(&manifest)?);
+        Ok(())
+    }
+
+    // ── Skill-Vorschläge ─────────────────────────────────────────────────────
+
+    use harw_registry_defaults::skill_proposal_tools::{
+        SkillAuthorCeiling, SkillCandidate, SkillProposalStore,
+    };
+
+    /// Kontext nur mit Vorschlagsablage — ohne Config-Service.
+    fn proposal_context(store: Arc<SkillProposalStore>) -> TestResult<(OpContext, PathBuf)> {
+        let (base, root) = test_context()?;
+        let mut services = ServiceMap::new();
+        services.insert(store);
+        Ok((
+            OpContext::new(
+                base.session_id().clone(),
+                base.turn_id().clone(),
+                base.sandbox().clone(),
+                services,
+            ),
+            root,
+        ))
+    }
+
+    fn propose_review_skill(store: &SkillProposalStore) -> TestResult<String> {
+        let meta = store
+            .propose(
+                &SkillCandidate {
+                    skill_toml: "name = \"review\"\ndescription = \"Prüft Diffs gründlich \
+                                 vor jedem Commit\"\ntools = [\"fs.read\"]\n"
+                        .to_owned(),
+                    instructions: "Lies zuerst die Tests.\n".to_owned(),
+                    ..SkillCandidate::default()
+                },
+                &SkillAuthorCeiling {
+                    role: harw_agent_dsl::roles::AgentRoleId::UserInterface,
+                    tools: std::collections::BTreeSet::new(),
+                    mcps: std::collections::BTreeSet::new(),
+                },
+            )
+            .map_err(ctx("propose"))?;
+        Ok(meta.proposal_id)
+    }
+
+    #[tokio::test]
+    async fn skills_proposals_review_and_accept_without_config_service() -> TestResult {
+        let temp = tempfile::tempdir().map_err(ctx("tempdir"))?;
+        let skills_dir = temp.path().join("skills");
+        let store = Arc::new(SkillProposalStore::new(skills_dir.clone()));
+        let id = propose_review_skill(&store)?;
+        let (ctx_, root) = proposal_context(Arc::clone(&store))?;
+
+        let listed = super::skills(&ctx_, args("proposals", None)).await;
+        let reviewed = super::skills(&ctx_, args("review", Some(id.as_str()))).await;
+        let accepted = super::skills(&ctx_, args("accept", Some(id.as_str()))).await;
+        let again = super::skills(&ctx_, args("accept", Some(id.as_str()))).await;
+        let missing_id = super::skills(&ctx_, args("review", None)).await;
+        std::fs::remove_dir_all(root).map_err(ctx("remove test workspace"))?;
+
+        let listed = listed.map_err(ctx("proposals"))?;
+        assert!(listed.text.contains(&id));
+        assert!(listed.text.contains("user_required"));
+        assert!(listed.text.contains("Delta Werkzeuge [fs.read]"));
+        let reviewed = reviewed.map_err(ctx("review"))?;
+        assert!(reviewed.text.contains("Lies zuerst die Tests."));
+        assert!(reviewed.text.contains("Evals: keine"));
+        let accepted = accepted.map_err(ctx("accept"))?;
+        assert!(accepted.text.contains("keinem Agenten zugewiesen"));
+        assert!(skills_dir.join("review/skill.toml").is_file());
+        assert!(matches!(again, Err(OpError::InvalidArguments(_))));
+        assert!(matches!(missing_id, Err(OpError::InvalidArguments(_))));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn skills_reject_records_reason_and_blocks_accept() -> TestResult {
+        let temp = tempfile::tempdir().map_err(ctx("tempdir"))?;
+        let store = Arc::new(SkillProposalStore::new(temp.path().join("skills")));
+        let id = propose_review_skill(&store)?;
+        let (ctx_, root) = proposal_context(Arc::clone(&store))?;
+
+        let rejected = super::skills(
+            &ctx_,
+            SkillsArgs {
+                action: Some("reject".to_owned()),
+                target: Some(id.clone()),
+                value: Some("doppelt".to_owned()),
+            },
+        )
+        .await;
+        let accepted = super::skills(&ctx_, args("accept", Some(id.as_str()))).await;
+        let unknown = super::skills(&ctx_, args("review", Some("does-not-exist"))).await;
+        std::fs::remove_dir_all(root).map_err(ctx("remove test workspace"))?;
+
+        let rejected = rejected.map_err(ctx("reject"))?;
+        assert!(rejected.text.contains("abgelehnt: doppelt"));
+        assert!(matches!(accepted, Err(OpError::InvalidArguments(_))));
+        assert!(matches!(unknown, Err(OpError::InvalidArguments(_))));
+        assert!(!temp.path().join("skills/review").exists());
         Ok(())
     }
 }

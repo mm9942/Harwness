@@ -28,8 +28,8 @@
 #![forbid(unsafe_code)]
 
 pub mod context;
-pub mod dod_units;
 pub mod doctor;
+pub mod dod_units;
 pub mod error;
 pub mod migration;
 pub mod pathscope;
@@ -42,11 +42,11 @@ pub mod uninstall;
 pub mod update;
 
 pub use context::{InstallContext, InstallMethod};
-pub use dod_units::{ParsedUnit, UnitClass, UNIT_CLASSES};
 pub use doctor::{
     AuditIntegrityCheck, AuditIntegrityEvidence, CheckOutcome, DoctorCheck, KekFilePermsCheck,
     KekFilePermsEvidence, default_checks, run_all,
 };
+pub use dod_units::{ParsedUnit, UNIT_CLASSES, UnitClass};
 pub use error::{DoctorError, InstallError, MigrationError, PathError, ServiceError, UpdateError};
 pub use migration::{ConfigMigration, MigrationRunner};
 pub use pathscope::PathScope;

@@ -139,7 +139,7 @@ mod sensor;
 #[cfg(test)]
 mod invariant_test;
 
-pub use sensor::{ScanReportSensor, REPORT_HARDNESS};
+pub use sensor::{REPORT_HARDNESS, ScanReportSensor};
 
 // Test-Fehlertyp (Bible R087/R165/R182), nur für Tests.
 #[cfg(test)]

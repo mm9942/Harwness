@@ -12,6 +12,19 @@
 //! - [`CommandItem`]: Name + Beschreibung eines Befehls.
 //! - [`CommandPopup`]: Widget-Zustand (Items, Filterindex, Auswahl).
 //! - [`PopupAction`]: Ereignis das `on_key` zurückgibt.
+//! - [`PopupMode`]: Befehlsnamen- oder Unterkommando-Auswahl.
+//!
+//! # Modi
+//! - [`PopupMode::CommandName`] ([`CommandPopup::new`]): alle Befehle des
+//!   Katalogs; Ziffern `1`–`9` wählen direkt.
+//! - [`PopupMode::Subcommand`] ([`CommandPopup::for_subcommands`]): die
+//!   Unterkommando-Hinweise eines Befehls. Ziffern sind hier **keine**
+//!   Auswahl (sie können Argumente sein, z. B. `/permissions remove 2`);
+//!   `on_key` meldet für sie `Stay`, und der Aufrufer reicht sie an die
+//!   Eingabe weiter (siehe [`CommandPopup::digits_select`]).
+//!
+//! Unter der Liste steht eine Fußzeile mit der Nutzungszeile des markierten
+//! Eintrags, sobald der Bereich mindestens zwei Zeilen hoch ist.
 //!
 //! # Nebenläufigkeit
 //! Kein interner Zustand wird geteilt; der Aufrufer hält `CommandPopup` exklusiv.
@@ -23,6 +36,7 @@ use crossterm::event::{KeyCode, KeyEvent};
 use ratatui::{buffer::Buffer, layout::Rect, style::Style, text::Line, widgets::Widget};
 
 use crate::CommandRegistry;
+use crate::CommandSpec;
 use crate::style;
 
 // ---------------------------------------------------------------------------
@@ -86,6 +100,20 @@ pub(crate) struct CommandItem {
     pub name: String,
     /// Menschenlesbare Kurzbeschreibung für die Anzeige im Popup.
     pub description: String,
+    /// Nutzungszeile für die Fußzeile; leer, wenn unbekannt.
+    pub usage: String,
+}
+
+/// Auswahlmodus des Popups.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum PopupMode {
+    /// Auswahl eines Befehlsnamens (`/mo` → `/model`).
+    CommandName,
+    /// Auswahl eines Unterkommandos von `command` (ohne führendes `/`).
+    Subcommand {
+        /// Kanonischer Befehlsname, dessen Unterkommandos angeboten werden.
+        command: String,
+    },
 }
 
 /// Aktionssignal das `CommandPopup::on_key` zurückgibt.
@@ -135,6 +163,8 @@ pub(crate) struct CommandPopup {
     /// [`Self::tab_outcome`]: eine bewusst bewegte Markierung hat Vorrang vor
     /// der automatischen Rang-/Präfix-Logik.
     selection_moved: bool,
+    /// Befehlsnamen- oder Unterkommando-Auswahl.
+    mode: PopupMode,
 }
 
 // ---------------------------------------------------------------------------
@@ -154,15 +184,54 @@ impl CommandPopup {
             .specs()
             .iter()
             .map(|spec| {
-                let domain_str = format!("{:?}", spec.domain);
-                let permission_str = format!("{:?}", spec.permission);
+                let description = if spec.summary.is_empty() {
+                    let domain_str = format!("{:?}", spec.domain);
+                    let permission_str = format!("{:?}", spec.permission);
+                    make_description(&domain_str, &permission_str)
+                } else {
+                    spec.summary.clone()
+                };
                 CommandItem {
                     name: spec.name.as_str().to_owned(),
-                    description: make_description(&domain_str, &permission_str),
+                    description,
+                    usage: spec.usage.clone(),
                 }
             })
             .collect();
+        Self::with_items(items, PopupMode::CommandName)
+    }
 
+    /// Erstellt ein Unterkommando-Popup für `spec`.
+    ///
+    /// # Beschreibung
+    /// Ein Eintrag je [`crate::command::SubcommandHint`]; Beschreibung ist
+    /// dessen `summary`, die Fußzeile zeigt `/<befehl> <unterkommando> <args>`.
+    /// Die Reihenfolge ist bei leerem Suchtext die Rang-Reihenfolge (Länge,
+    /// dann alphabetisch), wie im Befehlsmodus.
+    ///
+    /// # Rückgabe
+    /// `None`, wenn `spec` keine Unterkommandos kennt.
+    pub(crate) fn for_subcommands(spec: &CommandSpec) -> Option<Self> {
+        if spec.subcommands.is_empty() {
+            return None;
+        }
+        let command = spec.name.as_str().to_owned();
+        let items = spec
+            .subcommands
+            .iter()
+            .map(|hint| CommandItem {
+                name: hint.name.to_owned(),
+                description: hint.summary.to_owned(),
+                usage: format!("/{command} {} {}", hint.name, hint.args)
+                    .trim_end()
+                    .to_owned(),
+            })
+            .collect();
+        Some(Self::with_items(items, PopupMode::Subcommand { command }))
+    }
+
+    /// Gemeinsamer Aufbau beider Modi.
+    fn with_items(items: Vec<CommandItem>, mode: PopupMode) -> Self {
         let mut popup = Self {
             items,
             selected: 0,
@@ -170,6 +239,7 @@ impl CommandPopup {
             filtered: Vec::new(),
             prefix_count: 0,
             selection_moved: false,
+            mode,
         };
         // Baut `filtered`/`prefix_count` über dieselbe Rang-Logik wie jede
         // spätere Eingabe auf, statt Registrierungsreihenfolge zu
@@ -189,7 +259,8 @@ impl CommandPopup {
     /// wenn `query` irgendwo im Namen vorkommt). Einträge ohne Treffer
     /// entfallen. Innerhalb eines Rangs sortiert stabil nach Namenslänge,
     /// dann alphabetisch — deterministisch unabhängig von der
-    /// Registrierungsreihenfolge. Setzt `selected` auf `0` und
+    /// Registrierungsreihenfolge. Im Unterkommando-Modus gilt innerhalb eines
+    /// Rangs stattdessen die Katalog-Reihenfolge der Hinweise. Setzt `selected` auf `0` und
     /// `selection_moved` auf `false`.
     pub(crate) fn on_query_change(&mut self, query: &str) {
         self.query = query.to_owned();
@@ -214,9 +285,16 @@ impl CommandPopup {
             })
             .collect();
         let items = &self.items;
+        // Unterkommandos behalten innerhalb eines Rangs die Katalog-Reihenfolge
+        // (`show` zuerst usw.); Befehlsnamen sortieren nach Länge, dann
+        // alphabetisch.
+        let keep_order = matches!(self.mode, PopupMode::Subcommand { .. });
         ranked.sort_by(|(idx_a, tier_a), (idx_b, tier_b)| {
-            tier_a
-                .cmp(tier_b)
+            let by_tier = tier_a.cmp(tier_b);
+            if keep_order {
+                return by_tier.then_with(|| idx_a.cmp(idx_b));
+            }
+            by_tier
                 .then_with(|| items[*idx_a].name.len().cmp(&items[*idx_b].name.len()))
                 .then_with(|| items[*idx_a].name.cmp(&items[*idx_b].name))
         });
@@ -246,6 +324,53 @@ impl CommandPopup {
     pub(crate) fn selected_name(&self) -> Option<&str> {
         let &item_idx = self.filtered.get(self.selected)?;
         Some(&self.items[item_idx].name)
+    }
+
+    /// Aktueller Auswahlmodus.
+    pub(crate) fn mode(&self) -> &PopupMode {
+        &self.mode
+    }
+
+    /// `true`, wenn Ziffern `1`–`9` direkt einen Eintrag wählen (nur im
+    /// Befehlsmodus). Im Unterkommando-Modus soll der Aufrufer Ziffern als
+    /// normale Eingabe behandeln.
+    pub(crate) fn digits_select(&self) -> bool {
+        matches!(self.mode, PopupMode::CommandName)
+    }
+
+    /// Eingabezeile, die nach Übernahme von `accepted` im Composer stehen soll
+    /// (mit abschließendem Leerzeichen): `"/name "` bzw.
+    /// `"/befehl unterkommando "`.
+    pub(crate) fn completion_line(&self, accepted: &str) -> String {
+        match &self.mode {
+            PopupMode::CommandName => format!("/{accepted} "),
+            PopupMode::Subcommand { command } => format!("/{command} {accepted} "),
+        }
+    }
+
+    /// Eingabezeile für einen erweiterten Suchtext
+    /// ([`TabOutcome::ExtendQuery`]): `"/query"` bzw. `"/befehl query"`.
+    pub(crate) fn query_line(&self, query: &str) -> String {
+        match &self.mode {
+            PopupMode::CommandName => format!("/{query}"),
+            PopupMode::Subcommand { command } => format!("/{command} {query}"),
+        }
+    }
+
+    /// Fußzeilentext für den markierten Eintrag (`"Nutzung: …"`), sofern
+    /// dieser eine Nutzungszeile hat.
+    pub(crate) fn footer_line(&self) -> Option<String> {
+        let &item_idx = self.filtered.get(self.selected)?;
+        let usage = &self.items[item_idx].usage;
+        (!usage.is_empty()).then(|| format!("Nutzung: {usage}"))
+    }
+
+    /// Gewünschte Höhe in Zeilen bei höchstens `max_rows`: Trefferzahl plus
+    /// ggf. eine Fußzeile, gedeckelt auf `max_rows`.
+    pub(crate) fn preferred_height(&self, max_rows: u16) -> u16 {
+        let rows = u16::try_from(self.filtered.len()).unwrap_or(u16::MAX);
+        let footer = u16::from(self.footer_line().is_some());
+        rows.saturating_add(footer).min(max_rows)
     }
 
     /// Gibt `true` zurück wenn keine Items in der gefilterten Liste vorhanden sind.
@@ -325,6 +450,7 @@ impl CommandPopup {
                 Some(name) => PopupAction::Accept(name.to_owned()),
                 None => PopupAction::Stay,
             },
+            KeyCode::Char('1'..='9') if !self.digits_select() => PopupAction::Stay,
             KeyCode::Char(c @ '1'..='9') => {
                 let zero_based = (c as usize) - ('1' as usize);
                 if zero_based < self.filtered.len() {
@@ -344,7 +470,18 @@ impl CommandPopup {
     /// `Down` folgt der Ausschnitt der Auswahl. Damit bleiben auch Befehle nach
     /// der achten Zeile in kleinen Terminals erreichbar und sichtbar.
     pub(crate) fn render(&self, area: Rect, buf: &mut Buffer, theme: style::Theme) {
-        let visible = self.visible_range(area.height as usize);
+        // Fußzeile nur, wenn neben ihr noch mindestens eine Listenzeile passt.
+        let footer = self.footer_line().filter(|_| area.height >= 2);
+        let list_height = area.height - u16::from(footer.is_some());
+        if let Some(text) = footer {
+            let footer_area = Rect::new(area.left(), area.bottom() - 1, area.width, 1);
+            Widget::render(
+                Line::styled(text, style::dim_style(theme)),
+                footer_area,
+                buf,
+            );
+        }
+        let visible = self.visible_range(list_height as usize);
         // `Range` wird vom `for`-Loop konsumiert. Die Startposition brauchen wir
         // daneben für die Zeile innerhalb des sichtbaren Fensters.
         let visible_start = visible.start;
@@ -365,7 +502,13 @@ impl CommandPopup {
 
             // Die Ordnungszahl bleibt der Index in der vollständigen gefilterten
             // Liste, damit beim Scrollen klar ist, dass weitere Treffer folgen.
-            let label = format!("{:>2}. /{}", filtered_idx + 1, item.name);
+            // Im Unterkommando-Modus keine Ordnungszahl: Ziffern wählen dort
+            // nicht aus und sollen es auch nicht suggerieren.
+            let label = if self.digits_select() {
+                format!("{:>2}. /{}", filtered_idx + 1, item.name)
+            } else {
+                format!("  {}", item.name)
+            };
             let name_width = area.width.min(NAME_COLUMN_WIDTH);
             let name_area = Rect::new(area.left(), y, name_width, 1);
             Widget::render(Line::styled(label, name_style), name_area, buf);
@@ -533,17 +676,19 @@ mod tests {
         let mut popup = built_in_popup()?;
         popup.on_query_change("mo");
 
-        assert_eq!(
-            popup.prefix_count, 2,
-            "expected exactly two prefix matches ('mode', 'model') for 'mo'"
+        // `/models` kommt hinzu, sobald die Operation registriert ist — der
+        // Test verlangt deshalb nur, dass `mode`, `model` die Spitze bilden.
+        assert!(
+            popup.prefix_count >= 2,
+            "expected at least the prefix matches 'mode' and 'model' for 'mo'"
         );
         let leading: Vec<&str> = popup.filtered[..popup.prefix_count]
             .iter()
             .map(|&idx| popup.items[idx].name.as_str())
             .collect();
         assert_eq!(
-            leading,
-            vec!["mode", "model"],
+            leading[..2],
+            ["mode", "model"],
             "prefix matches must lead, sorted by length then alphabetically"
         );
 
@@ -582,6 +727,166 @@ mod tests {
 
         assert_eq!(popup.visible_range(8), 1..9);
         assert!(popup.visible_range(8).contains(&popup.selected));
+        Ok(())
+    }
+    // ── Beschreibung, Fußzeile, Unterkommando-Modus ─────────────────────────
+
+    fn model_spec() -> TestResult<crate::CommandSpec> {
+        let registry = CommandRegistry::built_in().map_err(ctx("built_in"))?;
+        registry
+            .find("model")
+            .cloned()
+            .ok_or(TestError::Missing("model spec"))
+    }
+
+    fn render_rows(popup: &CommandPopup, width: u16, height: u16) -> Vec<String> {
+        let area = Rect::new(0, 0, width, height);
+        let mut buf = Buffer::empty(area);
+        popup.render(area, &mut buf, style::Theme::Dark);
+        (0..height)
+            .map(|y| {
+                (0..width)
+                    .map(|x| buf[(x, y)].symbol().to_owned())
+                    .collect::<String>()
+            })
+            .collect()
+    }
+
+    #[test]
+    fn description_uses_the_spec_summary_when_present() -> TestResult {
+        let registry = CommandRegistry::built_in().map_err(ctx("built_in"))?;
+        let popup = CommandPopup::new(&registry);
+        let spec = registry
+            .find("model")
+            .ok_or(TestError::Missing("model spec"))?;
+        let item = popup
+            .items
+            .iter()
+            .find(|item| item.name == "model")
+            .ok_or(TestError::Missing("model item"))?;
+        assert_eq!(item.description, spec.summary);
+        assert_eq!(item.usage, spec.usage);
+        Ok(())
+    }
+
+    #[test]
+    fn description_falls_back_to_domain_and_permission() -> TestResult {
+        let spec = crate::CommandSpec::new(
+            "bare",
+            Vec::<String>::new(),
+            crate::CommandScope::TuiOnly,
+            crate::PermissionTier::Operator,
+            crate::OutputSurface::Inline,
+            crate::CommandDomain::Misc,
+        )
+        .map_err(ctx("valid spec"))?;
+        let popup = CommandPopup::new(&CommandRegistry::new(vec![spec]));
+        assert_eq!(
+            popup.items[0].description,
+            "Allgemein · Berechtigung: Operator"
+        );
+        assert_eq!(popup.footer_line(), None, "no usage → no footer");
+        Ok(())
+    }
+
+    #[test]
+    fn footer_shows_usage_of_the_selected_command() -> TestResult {
+        let mut popup = built_in_popup()?;
+        popup.on_query_change("model");
+        assert_eq!(popup.selected_name(), Some("model"));
+        assert_eq!(
+            popup.footer_line().as_deref(),
+            Some("Nutzung: /model [show|list|switch <modell-id>]")
+        );
+        let rows = render_rows(&popup, 80, 3);
+        assert!(rows[2].starts_with("Nutzung: /model"), "{rows:?}");
+        assert!(rows[0].contains("/model"), "{rows:?}");
+        let hits = u16::try_from(popup.filtered.len()).map_err(ctx("hit count"))?;
+        assert_eq!(popup.preferred_height(20), hits + 1, "hits plus footer");
+        assert_eq!(popup.preferred_height(2), 2, "capped at max_rows");
+
+        // In einer einzeiligen Fläche hat die Liste Vorrang.
+        let single = render_rows(&popup, 80, 1);
+        assert!(single[0].contains("/model"), "{single:?}");
+        Ok(())
+    }
+
+    #[test]
+    fn for_subcommands_lists_hints_in_catalog_order() -> TestResult {
+        let spec = model_spec()?;
+        let popup = CommandPopup::for_subcommands(&spec)
+            .ok_or(TestError::Missing("model has subcommands"))?;
+        assert_eq!(
+            popup.mode(),
+            &PopupMode::Subcommand {
+                command: "model".to_owned()
+            }
+        );
+        let names: Vec<&str> = popup
+            .filtered
+            .iter()
+            .map(|&idx| popup.items[idx].name.as_str())
+            .collect();
+        assert_eq!(names, ["show", "list", "switch"]);
+        Ok(())
+    }
+
+    #[test]
+    fn for_subcommands_is_none_without_hints() -> TestResult {
+        let mut spec = model_spec()?;
+        spec.subcommands.clear();
+        assert!(CommandPopup::for_subcommands(&spec).is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn subcommand_mode_filters_and_builds_the_usage_footer() -> TestResult {
+        let spec = model_spec()?;
+        let mut popup = CommandPopup::for_subcommands(&spec)
+            .ok_or(TestError::Missing("model has subcommands"))?;
+        popup.on_query_change("sw");
+        assert_eq!(popup.selected_name(), Some("switch"));
+        assert_eq!(
+            popup.footer_line().as_deref(),
+            Some("Nutzung: /model switch <modell-id>")
+        );
+        assert_eq!(popup.tab_outcome(), TabOutcome::Accept("switch".to_owned()));
+        assert_eq!(popup.completion_line("switch"), "/model switch ");
+        assert_eq!(popup.query_line("sw"), "/model sw");
+
+        popup.on_query_change("show");
+        assert_eq!(
+            popup.footer_line().as_deref(),
+            Some("Nutzung: /model show"),
+            "no args → no trailing space"
+        );
+        let rows = render_rows(&popup, 60, 2);
+        assert!(
+            rows[0].starts_with("  show"),
+            "no ordinal, no slash: {rows:?}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn digits_do_not_select_in_subcommand_mode() -> TestResult {
+        let spec = model_spec()?;
+        let mut popup = CommandPopup::for_subcommands(&spec)
+            .ok_or(TestError::Missing("model has subcommands"))?;
+        assert!(!popup.digits_select());
+        assert_eq!(
+            popup.on_key(make_key(KeyCode::Char('1'))),
+            PopupAction::Stay
+        );
+        assert_eq!(
+            popup.on_key(make_key(KeyCode::Enter)),
+            PopupAction::Accept("show".to_owned())
+        );
+
+        let command_popup = built_in_popup()?;
+        assert!(command_popup.digits_select());
+        assert_eq!(command_popup.completion_line("model"), "/model ");
+        assert_eq!(command_popup.query_line("mo"), "/mo");
         Ok(())
     }
 }

@@ -115,6 +115,12 @@ mod tests {
     fn sample_finding() -> TestResult<ResearchFinding> {
         Ok(ResearchFinding {
             question_id: QuestionId::new("q-1"),
+            likelihood: None,
+            confidence_rationale: String::new(),
+            hypotheses: vec![],
+            key_assumptions: vec![],
+            indicators: vec![],
+            dissent: vec![],
             conclusion: "jiff 0.2.32 is current".to_owned(),
             evidence: vec![],
             verified_versions: vec![],

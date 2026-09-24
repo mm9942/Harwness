@@ -96,7 +96,11 @@ pub fn is_managed_script(content: &str, bin: &str) -> bool {
 // Function-name spellings clap_complete may derive from `bin`: verbatim (zsh),
 // '-' -> '_' and '-' -> "__" (bash).
 fn name_variants(bin: &str) -> [String; 3] {
-    [bin.to_owned(), bin.replace('-', "_"), bin.replace('-', "__")]
+    [
+        bin.to_owned(),
+        bin.replace('-', "_"),
+        bin.replace('-', "__"),
+    ]
 }
 
 /// Returns true if `content` carries a clap_complete-generated signature for

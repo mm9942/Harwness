@@ -1,0 +1,5 @@
+name = "schematron-beschaffung"
+description = "Beschafft, prüft und aktualisiert Schematron/XSLT-Validierungsartefakte für europäische e-Invoice-Standards (EN16931, Factur-X, ZUGFeRD, XRechnung, PEPPOL BIS). Liefert immer verifizierte Download-URLs, aktuelle Versionsnummern und Anweisungen zur Aktualisierung von resources/ und routes.json."
+enabled = true
+instructions_file = "instructions.md"
+tools = ["filesystem.read", "filesystem.write", "process.execute", "web.search", "web.fetch"]

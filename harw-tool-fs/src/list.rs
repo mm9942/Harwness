@@ -21,8 +21,8 @@
 use crate::tree::{
     HARD_MAX_ENTRIES, StopReason, WALK_DEADLINE, Workspace, normalize_relative, read_dir_limited,
 };
-use harw_fsutil::EntryType;
 use harw_authority::Permission;
+use harw_fsutil::EntryType;
 use harw_tools::{
     ToolCall, ToolOutput,
     error::ToolsError,
@@ -134,13 +134,12 @@ impl FsListExecutor {
             .min(self.max_entries)
             .min(HARD_MAX_ENTRIES);
 
-        let listed = Workspace::open(ctx.sandbox().workspace().canonical_root()).and_then(
-            |workspace| {
+        let listed =
+            Workspace::open(ctx.sandbox().workspace().canonical_root()).and_then(|workspace| {
                 let dir = workspace.open_dir(&relative)?;
                 let deadline = Instant::now() + WALK_DEADLINE;
                 read_dir_limited(&workspace, &dir, &relative, cap, deadline)
-            },
-        );
+            });
         let (children, stop) = match listed {
             Ok(listed) => listed,
             Err(err) => {
@@ -214,7 +213,9 @@ impl ToolExecutor for FsListExecutor {
 mod tests {
     use super::*;
     use crate::test_support::{Fixture, SECRET, TestError, TestResult, call, ctx, render};
-    use harw_authority::{Permission, PermissionSet, SandboxSpec, WorkspaceRegistration, WorkspaceRegistry};
+    use harw_authority::{
+        Permission, PermissionSet, SandboxSpec, WorkspaceRegistration, WorkspaceRegistry,
+    };
     use harw_types::{SessionId, TenantId, ToolCallId, TurnId, WorkspaceId};
     use std::fs;
     use std::path::{Path, PathBuf};
@@ -238,7 +239,10 @@ mod tests {
         let binding = registry
             .resolve(&TenantId::from_str("t"), &WorkspaceId::from_str("w"))
             .map_err(ctx("binding"))?;
-        Ok(SandboxSpec::from_resolved(binding, PermissionSet::from_policy(permissions)))
+        Ok(SandboxSpec::from_resolved(
+            binding,
+            PermissionSet::from_policy(permissions),
+        ))
     }
 
     fn make_ctx(sandbox: SandboxSpec) -> ToolExecutionContext {
@@ -285,7 +289,11 @@ mod tests {
                 assert_eq!(arr[2]["kind"], "dir");
                 assert!(content.get("stopped").is_none());
             }
-            other => return Err(TestError::Unexpected(format!("expected json output, got: {other:?}"))),
+            other => {
+                return Err(TestError::Unexpected(format!(
+                    "expected json output, got: {other:?}"
+                )));
+            }
         }
         Ok(())
     }
@@ -308,7 +316,11 @@ mod tests {
             ToolOutput::Error { message } => {
                 assert!(message.contains("ReadWorkspace"), "unexpected: {message}");
             }
-            other => return Err(TestError::Unexpected(format!("expected error output, got: {other:?}"))),
+            other => {
+                return Err(TestError::Unexpected(format!(
+                    "expected error output, got: {other:?}"
+                )));
+            }
         }
         Ok(())
     }
@@ -344,9 +356,12 @@ mod tests {
         };
         let ctx = fixture.ctx(vec![Permission::ReadWorkspace])?;
 
-        let output = executor.list_dir(&ctx, &call("fs.list", serde_json::json!({ "path": "." })))?;
+        let output =
+            executor.list_dir(&ctx, &call("fs.list", serde_json::json!({ "path": "." })))?;
         let ToolOutput::Json { content } = &output else {
-            return Err(TestError::Unexpected(format!("expected json output, got: {output:?}")));
+            return Err(TestError::Unexpected(format!(
+                "expected json output, got: {output:?}"
+            )));
         };
         let entries = content["entries"]
             .as_array()
@@ -360,12 +375,24 @@ mod tests {
         }
         assert!(!render(&output)?.contains("secret.txt"));
 
-        for path in ["link_dir", "loop", "nested/up", "link_dir/deep", "../outside"] {
+        for path in [
+            "link_dir",
+            "loop",
+            "nested/up",
+            "link_dir/deep",
+            "../outside",
+        ] {
             let output =
                 executor.list_dir(&ctx, &call("fs.list", serde_json::json!({ "path": path })))?;
-            assert!(matches!(output, ToolOutput::Error { .. }), "{path}: {output:?}");
+            assert!(
+                matches!(output, ToolOutput::Error { .. }),
+                "{path}: {output:?}"
+            );
             let rendered = render(&output)?;
-            assert!(!rendered.contains("secret.txt") && !rendered.contains(SECRET), "{rendered}");
+            assert!(
+                !rendered.contains("secret.txt") && !rendered.contains(SECRET),
+                "{rendered}"
+            );
         }
         Ok(())
     }
@@ -378,7 +405,8 @@ mod tests {
         }
         let executor = FsListExecutor { max_entries: 3 };
         let ctx = fixture.ctx(vec![Permission::ReadWorkspace])?;
-        let output = executor.list_dir(&ctx, &call("fs.list", serde_json::json!({ "path": "." })))?;
+        let output =
+            executor.list_dir(&ctx, &call("fs.list", serde_json::json!({ "path": "." })))?;
         let ToolOutput::Json { content } = output else {
             return Err(TestError::Unexpected("expected json output".to_string()));
         };

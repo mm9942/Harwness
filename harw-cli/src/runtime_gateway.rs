@@ -33,13 +33,17 @@
 //! genau einmal vorab über eine vorläufig geladene Konfiguration
 //! (`crate::gateway::open_gateway_secret_resolver` →
 //! `crate::secret_store::open_configured_secret_resolver`) und teilt ihn per
-//! `Arc::clone` zwischen der Telegram- und der Dream-Montage.
+//! `Arc::clone` zwischen der Dream-Montage und allen Telegram-Montagen.
 //!
-//! # Zwei Montagen je Gateway-Start (Befunde G1/G3)
-//! `crate::gateway::mount_gateway_assembly` baut für jeden Daemon-Start je eine
-//! Montage für [`GatewayEntry::Telegram`] und [`GatewayEntry::Dream`]; das
-//! Modell der Dream-Montage speist den Dream-Scheduler, sodass Audit und Trace
-//! Telegram-Turns und Dream-Läufe über ihre [`EntryKind`] unterscheiden.
+//! # Montagen je Gateway-Start (Befunde G1/G3)
+//! `crate::gateway::mount_gateway_assembly` baut für jeden Daemon-Start genau
+//! eine Montage für [`GatewayEntry::Dream`] und zusätzlich **je aktivierter
+//! Telegram-Bindung** eine eigene Montage für [`GatewayEntry::Telegram`]
+//! (null Bindungen → keine Telegram-Montage). Das Modell der Dream-Montage
+//! speist den Dream-Scheduler, sodass Audit und Trace Telegram-Turns und
+//! Dream-Läufe über ihre [`EntryKind`] unterscheiden; mehrere Telegram-Bots
+//! unterscheiden sich zusätzlich über ihren bindungsbezogenen [`Principal`]
+//! (siehe [`channel_principal`]).
 //!
 //! # Kein stiller Fallback (Befund G-048)
 //! Die frühere Montage (vor W2d-1) bildete einen gescheiterten
@@ -118,18 +122,20 @@ impl GatewayEntry {
 ///
 /// # Arguments
 /// - `entry` ([`GatewayEntry`]): welcher Kanal.
-/// - `peer` (`&str`): für `Telegram` die stabile, vom Bot-API authentifizierte
-///   Peer-Kennung; für `Dream` ungenutzt, weil Dream-Läufe keinen externen
-///   Peer haben (der Gateway übergibt `""`).
+/// - `peer` (`&str`): für `Telegram` die Kennung der konfigurierten
+///   Bot-Bindung ohne `telegram:`-Präfix; für `Dream` ungenutzt, weil
+///   Dream-Läufe keinen externen Peer haben (der Gateway übergibt `""`).
 ///
-/// # Daemon-Platzhalter `telegram:gateway` (Befund G6)
-/// Die Telegram-Montage des Daemons (`crate::gateway::mount_gateway_assembly`)
-/// ruft diese Funktion bis P1.6 mit dem festen Peer `"gateway"` auf, weil es
-/// beim Start noch keinen transport-gebundenen, authentifizierten Peer gibt.
-/// `telegram:gateway` ist damit ein **Platzhalter**, kein echter
-/// Telegram-Absender; die Rechte bleiben unverändert `Observer` mit
-/// `{}`-Rechten. Mit P1.6 wird der Principal je admittiertem Ereignis aus dem
-/// echten Peer abgeleitet.
+/// # Bindungsbezogener Telegram-Principal (Befund G6)
+/// Die Telegram-Montagen des Daemons (`crate::gateway::mount_gateway_assembly`)
+/// rufen diese Funktion je aktivierter Bindung mit der Bindungs-ID ohne
+/// führendes `telegram:` auf (`crate::gateway::telegram_principal_peer`); der
+/// Principal heißt damit `telegram:<bindung>` (z. B. `telegram:ops` für die
+/// Bindung `telegram:ops`). Er stammt aus der vertrauenswürdig
+/// **konfigurierten** Bindung, nie aus Chat- oder Modelltext, und bezeichnet
+/// den Bot-Kanal, nicht den einzelnen Absender — der handelnde Mensch wird
+/// pro Ereignis über `SessionKey`/`SenderRef` an der Admission-Grenze
+/// getragen. Die Rechte bleiben unverändert `Observer` mit `{}`-Rechten.
 ///
 /// # Beschreibung
 /// `Telegram` → `Principal::trusted_ingress(PrincipalKind::Channel,
@@ -438,6 +444,7 @@ mod tests {
             "catalog-model".to_owned(),
             harw_config::ModelToml {
                 stream: None,
+                rate_limit: None,
                 id: "catalog-model".to_owned(),
                 name: None,
                 provider: "catalog".to_owned(),

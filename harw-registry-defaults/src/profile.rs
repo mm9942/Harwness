@@ -63,10 +63,11 @@ use harw_project_discovery::{
 };
 use harw_sandbox::{HostPermitSessionRegistry, ProcessPermitLedger, SandboxProfile};
 use harw_tool_deps::DepsToolProvider;
-use harw_tool_explorer::ExplorerToolProvider;
 use harw_tool_doc::DocToolProvider;
+use harw_tool_explorer::ExplorerToolProvider;
 use harw_tool_fs::FsToolProvider;
 use harw_tool_lens::LensToolProvider;
+use harw_tool_process::ProcessToolProvider;
 use harw_tool_shell::{HostPermitPromptSender, HostPermitVariant, ShellToolProvider};
 use harw_tool_web::WebToolProvider;
 
@@ -82,6 +83,10 @@ use harw_tool_browser::{
 use crate::agent_definition_tools::{DefinitionAuthorCeiling, DefinitionWriteMode};
 use crate::authority::{permissions_of, tool_permission};
 use crate::error::{RegistryDefaultsError, RegistryDefaultsResult};
+use crate::skill_proposal_tools::{
+    SKILL_PROPOSAL_DECIDE_TOOLS, SKILL_PROPOSAL_PROPOSE_TOOLS, SKILL_PROPOSAL_READ_TOOLS,
+    SkillAuthorCeiling, SkillProposalToolProvider,
+};
 use crate::{AssembledRegistry, DefaultApprovalPolicy};
 
 /// Die Namen der eingebauten Rollen — Single Source of Truth.
@@ -163,9 +168,26 @@ pub mod role_names {
     pub const ROOT_ORCHESTRATOR: &str = "root-orchestrator";
     /// Read-only Erkundung von Workspace und Dependency-Quellen.
     pub const EXPLORER: &str = "explorer";
-    /// Dependency-Recherche aus `Cargo.lock` und dem lokalen Registry-Quellcache.
+    /// Rust/Cargo-Spezialist der Dependency-Recherche: belegt Verhalten aus
+    /// `Cargo.lock`, dem lokalen Registry-Quellcache, docs.rs und crates.io.
+    /// Für jedes andere Ökosystem (npm, PyPI, Go, Maven …) ist
+    /// [`DEPENDENCY_RESEARCHER`] zuständig.
     pub const RESEARCHER_DEPS: &str = "researcher-deps";
-    /// Web-Recherche über die Host-Allowlist der Sandbox.
+    /// Ökosystem-neutrale Dependency-Recherche (npm/pnpm/yarn, PyPI/uv/poetry,
+    /// Go-Module, Maven/Gradle, Cargo): liest Manifeste und Lockfiles im
+    /// Workspace und die offiziellen Paket-Registries/Dokus über das Netz —
+    /// ohne die Cargo-spezifischen `deps.*`-Werkzeuge
+    /// ([`crate::profile::RegistryProfile::ReadOnlyResearch`]).
+    pub const DEPENDENCY_RESEARCHER: &str = "dependency-researcher";
+    /// Allgemeine Recherche zu beliebigen Themen (Technik, Markt, Business,
+    /// Dokumente): Web, Workspace-Dokumente und PDFs, mit analytischem
+    /// Handwerk (Hypothesen, Schlüsselannahmen, Quellenbewertung,
+    /// Wahrscheinlichkeit getrennt von Konfidenz) im `ResearchFinding`
+    /// ([`crate::profile::RegistryProfile::ReadOnlyResearch`]).
+    pub const RESEARCHER: &str = "researcher";
+    /// Dokumentations-Web-Recherche über die Host-Allowlist der Sandbox —
+    /// ausschließlich Netz, kein Workspace-Lesen (A5), einschließlich der
+    /// Crate-Werkzeuge `web.docs_rs`/`web.crates_io`.
     pub const RESEARCHER_WEB: &str = "researcher-web";
     /// Erzeugt Planvorschläge, ohne den autoritativen Plan zu mutieren.
     pub const PLANNER: &str = "planner";
@@ -260,6 +282,33 @@ pub mod role_names {
     /// siehe `agents/agent-steward.toml` und die Begründung dort.
     pub const AGENT_STEWARD: &str = "agent-steward";
 
+    /// Eingebauter Child-Orchestrator der Coding-Spur (`role =
+    /// "child-orchestrator"`, Plan Punkt 1): Leader des Clans `coding`,
+    /// delegiert Planung, Erkundung und Ausführung an Worker und schreibt
+    /// selbst nicht. Profil wie [`ROOT_ORCHESTRATOR`]
+    /// ([`crate::profile::RegistryProfile::Planning`]); siehe
+    /// `agents/coding-orchestrator.toml`.
+    pub const CODING_ORCHESTRATOR: &str = "coding-orchestrator";
+
+    /// Eingebauter Child-Orchestrator der Recherche-Spur: Leader des Clans
+    /// `research`, fächert auf read-only Rechercheure auf. Siehe
+    /// `agents/research-orchestrator.toml`.
+    pub const RESEARCH_ORCHESTRATOR: &str = "research-orchestrator";
+
+    /// Eingebauter Child-Orchestrator der Verdichtungs-/Triage-Spur: Leader
+    /// der Clans `synthesis` und `security`. Siehe
+    /// `agents/analysis-orchestrator.toml`.
+    pub const ANALYSIS_ORCHESTRATOR: &str = "analysis-orchestrator";
+
+    /// Die eingebauten Child-Orchestratoren (`AgentRoleId::ChildOrchestrator`)
+    /// — genau die Namen, die `agents/root-orchestrator.toml` in
+    /// `[spawn].child_orchestrators` exakt freigibt.
+    pub const CHILD_ORCHESTRATORS: &[&str] = &[
+        CODING_ORCHESTRATOR,
+        RESEARCH_ORCHESTRATOR,
+        ANALYSIS_ORCHESTRATOR,
+    ];
+
     /// Alle bekannten eingebauten Rollen.
     ///
     /// Siehe die Moduldokumentation oben: `context-steward`, `intel-scout`,
@@ -272,6 +321,8 @@ pub mod role_names {
         ROOT_ORCHESTRATOR,
         EXPLORER,
         RESEARCHER_DEPS,
+        DEPENDENCY_RESEARCHER,
+        RESEARCHER,
         RESEARCHER_WEB,
         PLANNER,
         ANALYST,
@@ -286,7 +337,73 @@ pub mod role_names {
         UIA_WRITER,
         UIA_SHELL_WORKER,
         AGENT_STEWARD,
+        CODING_ORCHESTRATOR,
+        RESEARCH_ORCHESTRATOR,
+        ANALYSIS_ORCHESTRATOR,
     ];
+}
+
+// ---------------------------------------------------------------------------
+// Werkzeuge der Composition-Root für Orchestrator-Sitzungen
+// ---------------------------------------------------------------------------
+
+/// Die Werkzeuge, die eine Orchestrator-Sitzung über die Werkzeugoberfläche
+/// ihres Registry-Profils hinaus admittiert: heute genau `delegate_wave`
+/// (`harw-core-bridge::delegate_wave`, Plan Punkt 1).
+///
+/// # Warum nicht Teil eines [`RegistryProfile`]
+/// `delegate_wave` braucht den `ManagedAgentSpawner` aus `harw-core`; dieses
+/// Crate hängt bewusst nicht von `harw-core` ab. Die Composition-Root
+/// (`harw-runtime`, Kind-Registry-Fabrik) hängt den Provider deshalb selbst
+/// an die Registry einer Orchestrator-Rolle an. Ein eigenes
+/// `RegistryProfile::Orchestration` hätte zudem jede erschöpfende
+/// `match`-Stelle über `RegistryProfile` außerhalb dieses Crates gebrochen.
+/// Die Deckungstests (`tests/tool_admission_coverage.rs`) vergleichen die
+/// TOML-Seite deshalb gegen `profile.tool_names()` ∪
+/// [`composition_tools_for_role`].
+pub const ORCHESTRATION_TOOLS: &[&str] = &["delegate_wave"];
+
+/// Liefert die Werkzeuge, die die Composition-Root für `role` zusätzlich zur
+/// Profil-Registry beisteuert.
+///
+/// # Argumente
+/// - `role` (`&str`): Rollenname, üblicherweise aus [`role_names`].
+///
+/// # Rückgabe
+/// [`ORCHESTRATION_TOOLS`] für [`role_names::ROOT_ORCHESTRATOR`] und jeden
+/// Eintrag aus [`role_names::CHILD_ORCHESTRATORS`], sonst eine leere Liste —
+/// Worker bekommen nie eine Delegationsoberfläche.
+///
+/// # Nebenläufigkeit
+/// Rein.
+///
+/// # Beispiele
+/// ```rust
+/// use harw_registry_defaults::profile::{composition_tools_for_role, role_names};
+///
+/// assert_eq!(
+///     composition_tools_for_role(role_names::CODING_ORCHESTRATOR),
+///     &["delegate_wave"]
+/// );
+/// assert!(composition_tools_for_role(role_names::EXPLORER).is_empty());
+/// ```
+#[must_use]
+pub fn composition_tools_for_role(role: &str) -> &'static [&'static str] {
+    if is_orchestrator_role(role) {
+        ORCHESTRATION_TOOLS
+    } else {
+        &[]
+    }
+}
+
+/// Ob `role` eine eingebaute Orchestrator-Rolle ist (Root oder Child).
+///
+/// # Rückgabe
+/// `true` für [`role_names::ROOT_ORCHESTRATOR`] und jeden Eintrag aus
+/// [`role_names::CHILD_ORCHESTRATORS`].
+#[must_use]
+pub fn is_orchestrator_role(role: &str) -> bool {
+    role == role_names::ROOT_ORCHESTRATOR || role_names::CHILD_ORCHESTRATORS.contains(&role)
 }
 
 // ---------------------------------------------------------------------------
@@ -356,15 +473,42 @@ pub(crate) const DEPS_SOURCE_TOOLS: &[&str] =
 /// Die Werkzeuge von `harw-tool-web`, in Provider-Reihenfolge.
 pub(crate) const WEB_TOOLS: &[&str] = &["web.fetch", "web.docs_rs", "web.crates_io", "web.search"];
 
-/// Das einzige Netz-Werkzeug von [`RegistryProfile::UiaQuickHelper`]
-/// (Addendum I): nur `web.fetch`, ohne `web.docs_rs`/`web.crates_io` — die
-/// Schnellhelfer-Rolle braucht keinen automatischen Crate-/Doku-Index, nur
-/// gezieltes Nachschlagen einer einzelnen URL.
+/// Die Netz-Werkzeuge der Erkundungsprofile [`RegistryProfile::ReadOnlyExplore`],
+/// [`RegistryProfile::UiaExplorer`] und [`RegistryProfile::ReadOnlyResearch`]:
+/// `web.fetch` und `web.search`, in Provider-Reihenfolge — kein
+/// `web.docs_rs`/`web.crates_io` (die Crate-Werkzeuge bleiben bei
+/// [`RegistryProfile::Research`] und den UIA-Helfern, siehe
+/// [`UIA_HELPER_WEB_TOOLS`]).
 ///
-/// Dieselbe Begründung gilt für [`RegistryProfile::UiaExplorer`] und
-/// [`RegistryProfile::UiaWriter`] — beide teilen sich diese Konstante statt
-/// eine eigene, wertgleiche Liste zu pflegen.
-pub(crate) const UIA_QUICK_HELPER_WEB_TOOLS: &[&str] = &["web.fetch"];
+/// # Warum diese Profile Netz bekommen (Nutzerentscheidungen)
+/// „Der Explorer durchsucht alles … auch das Internet“: `explorer` und
+/// `uia-explorer` admittieren beide Werkzeuge in ihrer TOML. Dasselbe gilt
+/// für `uia-worker` und `uia-writer` (Nutzerentscheidung „die UIA-Helfer
+/// recherchieren kurz online und fügen manchmal Abhängigkeiten hinzu“),
+/// die dafür über [`UIA_HELPER_WEB_TOOLS`] zusätzlich die Crate-Werkzeuge
+/// bekommen. Jeder Abruf braucht weiterhin `Permission::NetworkAccess` im
+/// Sandbox-Scope der Rolle (Prolog, Host-Allowlist); ohne dieses Recht fallen
+/// beide Werkzeuge über [`RegistryProfile::tool_names_for`] heraus. Die
+/// übrigen Rollen auf `ReadOnlyExplore` (`analyst`, `researcher-deps`)
+/// verbieten beide Werkzeuge ausdrücklich in ihrem `[tools].forbidden`.
+/// [`RegistryProfile::ReadOnlyResearch`] (`researcher`,
+/// `dependency-researcher`) führt dieselben zwei Werkzeuge.
+pub(crate) const EXPLORER_WEB_TOOLS: &[&str] = &["web.fetch", "web.search"];
+
+/// Die Netz-Werkzeuge der UIA-Helfer [`RegistryProfile::UiaQuickHelper`]
+/// (`uia-worker`) und [`RegistryProfile::UiaWriter`] (`uia-writer`): alle
+/// vier `web.*`-Werkzeuge in Provider-Reihenfolge — `web.fetch`,
+/// `web.docs_rs`, `web.crates_io`, `web.search`.
+///
+/// # Warum eine eigene Konstante (Nutzerentscheidung)
+/// Die UIA-Helfer prüfen vor dem Hinzufügen einer Abhängigkeit auch deren
+/// crates.io-Metadaten und docs.rs-Dokumentation. Die beiden Crate-Werkzeuge
+/// sind rein lesend und laufen wie `web.fetch`/`web.search` durch die
+/// Egress-Policy und den Host-Scope des Elternteils. Der `explorer` (und
+/// jedes andere Profil mit [`EXPLORER_WEB_TOOLS`]) bekommt sie ausdrücklich
+/// **nicht** — deshalb keine Wiederverwendung von [`EXPLORER_WEB_TOOLS`].
+pub(crate) const UIA_HELPER_WEB_TOOLS: &[&str] =
+    &["web.fetch", "web.docs_rs", "web.crates_io", "web.search"];
 
 /// Das einzige Browser-Werkzeug von [`RegistryProfile::UiaQuickHelper`]
 /// (Nutzerentscheidung, ersetzt Addendum I in diesem Punkt): `uia-worker`
@@ -373,7 +517,7 @@ pub(crate) const UIA_QUICK_HELPER_WEB_TOOLS: &[&str] = &["web.fetch"];
 /// (`browser_tool_provider`, das sonst für **jedes** `browser.*`-Werkzeug der
 /// einzige Weg ist, siehe die Moduldokumentation oben) registriert und
 /// bewirbt `UiaQuickHelper` dieses eine Werkzeug statisch, im selben Muster
-/// wie [`UIA_QUICK_HELPER_WEB_TOOLS`] es für `web.fetch` tut — genau ein
+/// wie [`EXPLORER_WEB_TOOLS`] es für `web.fetch`/`web.search` tut — genau ein
 /// benanntes Werkzeug, nicht die ganze Werkzeugfläche seines Providers.
 /// Bewusst **kein** weiteres Browser-Werkzeug: `browser.observe`/`find`/
 /// `act`/`wait`/`events`/`close` bleiben für jedes Profil (inklusive
@@ -420,6 +564,11 @@ pub(crate) const AGENT_DEFINITION_WRITE_TOOLS: &[&str] = &[
 /// dieselbe Reihenfolge, in der
 /// `crate::agent_definition_tools::AgentDefinitionToolProvider` sie im
 /// Commit-Modus (der maximalen Werkzeugmenge) bewirbt.
+///
+/// Danach folgen die fünf Skill-Vorschlagswerkzeuge von
+/// `crate::skill_proposal_tools::SkillProposalToolProvider` (neben dem
+/// Agentendefinitions-Provider montiert), ebenfalls in ihrer
+/// Commit-Modus-Ausprägung und Registrierungsreihenfolge.
 const AGENT_DEFINITION_TOOLS: &[&str] = &[
     "agents.validate",
     "agents.list_proposals",
@@ -427,10 +576,21 @@ const AGENT_DEFINITION_TOOLS: &[&str] = &[
     "agents.write_uia",
     "agents.commit_proposal",
     "agents.reject_proposal",
+    "skills.validate",
+    "skills.list_proposals",
+    "skills.propose",
+    "skills.commit_proposal",
+    "skills.reject_proposal",
 ];
 
 /// Die Werkzeuge von `harw-tool-shell`.
 pub(crate) const SHELL_TOOLS: &[&str] = &["shell.exec"];
+
+/// Die Werkzeuge von `harw-tool-process`: `process.list` (Vorschau, sendet
+/// nie ein Signal) und `process.kill` (destruktiv, immer freigabepflichtig
+/// über [`crate::ALWAYS_ASK_TOOLS`]). Beide verlangen
+/// `Permission::ExecuteProcess`; nur unter Linux wirksam.
+pub(crate) const PROCESS_TOOLS: &[&str] = &["process.list", "process.kill"];
 
 /// Das eine Werkzeug von `harw-tool-lens` (AW6-10): semantische Abfrage über
 /// `docs.design` und `knowledge.palace`.
@@ -574,20 +734,25 @@ pub(crate) const BROWSER_TOOLS: &[&str] = &[
 /// ```
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RegistryProfile {
-    /// Voller Coding-Satz: fs.*, doc.read_pdf, shell.exec. Browser nur über
-    /// expliziten Grant.
+    /// Voller Coding-Satz: fs.*, doc.read_pdf, explore.*, shell.exec sowie
+    /// `process.list`/`process.kill` (`ExecuteProcess`; `process.kill` fragt
+    /// immer, siehe [`crate::ALWAYS_ASK_TOOLS`]). Browser nur über expliziten
+    /// Grant.
     Full,
     /// Dedizierter Prozessworker: ausschließlich `shell.exec`. Das Profil ist
     /// absichtlich kein Fallback und erhält weder `fs.write` noch lesende
     /// Workspace-Werkzeuge.
     ShellExecution,
     /// Ausschließlich lesend: fs.read/list/search/glob/grep + doc.read_pdf +
-    /// deps.*.
+    /// explore.* + deps.* + `web.fetch`/`web.search` ([`EXPLORER_WEB_TOOLS`],
+    /// nur mit `NetworkAccess`; Nutzerentscheidung „der Explorer durchsucht
+    /// auch das Internet“). Kein Schreib- und kein Ausführungswerkzeug.
     ReadOnlyExplore,
     /// Nur web.* — kein Workspace-Lesen (A5); Netz nur über
     /// `[network].researcher_web_hosts`.
     Research,
-    /// ReadOnlyExplore + `lens.ask`. Die Plan-/Goal-Operationen der
+    /// ReadOnlyExplore ohne `web.*` + `lens.ask` (root-orchestrator und
+    /// planner verbieten Netz-Werkzeuge). Die Plan-/Goal-Operationen der
     /// Composition-Root gehören **nicht** dazu (siehe W1-05).
     Planning,
     /// Registriert und bewirbt keine Werkzeuge — für Rollen, die bereits
@@ -615,10 +780,12 @@ pub enum RegistryProfile {
     /// Schnellhelfer der UIA (Addendum I, korrigiert REG-DE): lesender
     /// Workspace-Zugriff (`FS_READ_ONLY_TOOLS`) plus `doc.read_pdf`
     /// (`DOC_TOOLS`) plus `shell.exec` (`SHELL_TOOLS`, läuft wie überall über
-    /// Sandbox+Freigabe) plus ausschließlich `web.fetch` plus ausschließlich
-    /// `browser.open` (Nutzerentscheidung, siehe
-    /// [`UIA_QUICK_HELPER_BROWSER_TOOLS`]) — kein `fs.write`, kein `deps.*`,
-    /// kein `lens.ask`, keine der übrigen sechs `browser.*`-Werkzeuge.
+    /// Sandbox+Freigabe) plus die fünf lesenden `deps.*`-Werkzeuge
+    /// ([`DEPS_TOOLS`]) plus alle vier `web.*`-Werkzeuge
+    /// ([`UIA_HELPER_WEB_TOOLS`]) plus ausschließlich `browser.open`
+    /// (Nutzerentscheidung, siehe [`UIA_QUICK_HELPER_BROWSER_TOOLS`]) — kein
+    /// `fs.write`, kein `lens.ask`, keine der übrigen sechs
+    /// `browser.*`-Werkzeuge.
     ///
     /// # Warum dieses Profil existiert (Addendum I)
     /// [`role_names::UIA_WORKER`] war zuvor auf [`RegistryProfile::Research`]
@@ -626,9 +793,23 @@ pub enum RegistryProfile {
     /// Addendum I korrigiert das: `uia-worker` ist der exklusive
     /// Schnellhelfer der UIA für kleine Schnelleingriffe — eine Frage mit
     /// einem Aufruf beantworten, schnell etwas in der Shell regeln, eine
-    /// Datei lesen — nicht nur Netz-Recherche. `web.fetch` bleibt die
-    /// einzige Netz-Oberfläche (kein `web.docs_rs`/`web.crates_io`, die für
-    /// tiefere Recherche gedacht sind, siehe `RegistryProfile::Research`).
+    /// Datei lesen — nicht nur Netz-Recherche.
+    ///
+    /// # Warum `web.search` und `deps.*` (spätere Nutzerentscheidung)
+    /// `uia-worker` recherchiert kurz online und fügt manchmal eine
+    /// Abhängigkeit hinzu. Dafür bekommt das Profil neben `web.fetch` auch
+    /// `web.search` ([`EXPLORER_WEB_TOOLS`], wie der Explorer) und die rein
+    /// lesenden Dependency-Werkzeuge ([`DEPS_TOOLS`]: `deps.graph`/
+    /// `deps.locked` über `ReadWorkspace`, `deps.source_*` über
+    /// `ReadCargoRegistry`), um vorhandene Versionen und Quellen zu prüfen,
+    /// bevor eine Abhängigkeit dazukommt. Seit einer weiteren
+    /// Nutzerentscheidung kommen `web.docs_rs`/`web.crates_io` hinzu
+    /// ([`UIA_HELPER_WEB_TOOLS`]): rein lesend, egress-gebunden wie
+    /// `web.fetch`/`web.search`. Das Netz ist dabei nie weiter als das
+    /// des Elternteils: der Reducer der Rolle ist
+    /// [`crate::authority::AuthorityReducer::ReadExplore`], die Kind-Sandbox
+    /// erbt Recht und Host-Scope des Elternteils, und jeder Abruf läuft
+    /// zusätzlich durch die prozessweite Egress-Policy.
     ///
     /// # Warum `browser.open` (spätere Nutzerentscheidung)
     /// `uia-worker` darf `browser.open` benutzen — `agents/uia-worker.toml`
@@ -661,9 +842,9 @@ pub enum RegistryProfile {
     /// Agenten-Werkzeuge schreiben darf.
     AgentStewardship,
     /// Read-only Erkundungsspezialisierung der UIA: [`FS_READ_ONLY_TOOLS`]
-    /// plus [`DOC_TOOLS`] (`doc.read_pdf`) plus [`UIA_QUICK_HELPER_WEB_TOOLS`]
-    /// (`web.fetch`) — kein `fs.write`, kein `shell.exec`, kein `deps.*`,
-    /// kein `lens.ask`.
+    /// plus [`DOC_TOOLS`] (`doc.read_pdf`) plus [`EXPLORER_TOOLS`]
+    /// (`explore.*`) plus [`EXPLORER_WEB_TOOLS`] (`web.fetch`, `web.search`)
+    /// — kein `fs.write`, kein `shell.exec`, kein `deps.*`, kein `lens.ask`.
     ///
     /// # Warum dieses Profil existiert
     /// Die Spawn-Matrix (`harw-agent-dsl/src/roles.rs::can_spawn`) lässt die
@@ -675,14 +856,16 @@ pub enum RegistryProfile {
     /// stattdessen die bereits zugelassene Organisationsrolle
     /// `role = "uia-worker"` (`AgentRoleId::UiaWorker`) bei derselben
     /// read-only Werkzeugoberfläche wie
-    /// [`RegistryProfile::ReadOnlyExplore`] plus `web.fetch` (ohne `deps.*`,
-    /// das dort zusätzlich registriert wäre) — siehe
+    /// [`RegistryProfile::ReadOnlyExplore`] (inklusive `explore.*` und
+    /// `web.fetch`/`web.search`), aber ohne `deps.*` — siehe
     /// `agents/uia-explorer.toml`.
     UiaExplorer,
-    /// Schreibende Erkundungsspezialisierung der UIA: [`UiaExplorer`] plus
-    /// `fs.write` (alle sechs `fs.*`-Werkzeuge, [`FS_FULL_TOOLS`]) plus
-    /// [`DOC_TOOLS`] (`doc.read_pdf`) plus [`UIA_QUICK_HELPER_WEB_TOOLS`] —
-    /// kein `shell.exec`, kein `deps.*`, kein `lens.ask`.
+    /// Schreibende Erkundungsspezialisierung der UIA: alle sechs
+    /// `fs.*`-Werkzeuge inklusive `fs.write` ([`FS_FULL_TOOLS`]) plus
+    /// [`DOC_TOOLS`] (`doc.read_pdf`) plus die fünf lesenden
+    /// `deps.*`-Werkzeuge ([`DEPS_TOOLS`]) plus alle vier `web.*`-Werkzeuge
+    /// ([`UIA_HELPER_WEB_TOOLS`]) — kein `shell.exec`, kein `lens.ask`, kein
+    /// `explore.*`.
     ///
     /// # Warum dieses Profil existiert
     /// Dieselbe Begründung wie bei [`RegistryProfile::UiaExplorer`]: ein
@@ -690,6 +873,15 @@ pub enum RegistryProfile {
     /// braucht `fs.write` unter der für die UIA zugelassenen
     /// Organisationsrolle `role = "uia-worker"` — siehe
     /// `agents/uia-writer.toml` und [`role_names::UIA_WRITER`].
+    ///
+    /// # Warum `web.search` und `deps.*` (Nutzerentscheidung)
+    /// `uia-writer` fügt manchmal eine Abhängigkeit hinzu und recherchiert
+    /// dafür kurz online: `web.search`/`web.fetch` für die Recherche,
+    /// `web.docs_rs`/`web.crates_io` für Crate-Metadaten und -Dokumentation,
+    /// `deps.*` (rein lesend), um `Cargo.lock` und vorhandene Quellen zu
+    /// prüfen, bevor `fs.write` das Manifest ändert. Netz bleibt an den
+    /// Elternteil gebunden — siehe dieselbe Begründung bei
+    /// [`RegistryProfile::UiaQuickHelper`].
     UiaWriter,
     /// Host-Shell-Spezialisierung der UIA: [`FS_READ_ONLY_TOOLS`] plus
     /// [`DOC_TOOLS`] (`doc.read_pdf`) plus [`SHELL_TOOLS`] — kein `fs.write`,
@@ -710,6 +902,27 @@ pub enum RegistryProfile {
     /// damit permitpflichtig und fail-closed, siehe
     /// `agents/uia-shell-worker.toml` und [`role_names::UIA_SHELL_WORKER`].
     UiaShellWorker,
+    /// Lesende Recherche mit Netz: [`FS_READ_ONLY_TOOLS`] plus [`DOC_TOOLS`]
+    /// (`doc.read_pdf`) plus [`EXPLORER_TOOLS`] (`explore.*`) plus
+    /// [`EXPLORER_WEB_TOOLS`] (`web.fetch`, `web.search`) — kein `fs.write`,
+    /// kein `shell.exec`, kein `deps.*`, kein `lens.ask`,
+    /// kein `web.docs_rs`/`web.crates_io`.
+    ///
+    /// # Warum dieses Profil existiert
+    /// Harwness ist nicht Rust-zentriert: Recherche zu npm-, PyPI-, Go- oder
+    /// Maven-Abhängigkeiten, zu Märkten, Wettbewerbern oder Fachdokumenten
+    /// braucht Workspace-Dokumente (Manifeste, Lockfiles, PDFs) **und**
+    /// offizielle Quellen im Netz — aber keine Cargo-spezifischen
+    /// `deps.*`-Werkzeuge (die nur `Cargo.lock` und den Cargo-Registry-Cache
+    /// kennen). `ReadOnlyExplore` bringt genau diese `deps.*` mit, `Research`
+    /// liest keinen Workspace (A5), `UiaExplorer` hat dieselbe
+    /// Werkzeugmenge, gehört aber zur Organisationsrolle der UIA und trägt
+    /// deren Rollenbeschreibung. Rollen: [`role_names::DEPENDENCY_RESEARCHER`]
+    /// und [`role_names::RESEARCHER`], beide mit dem Reducer
+    /// [`crate::authority::AuthorityReducer::ReadWorkspaceNetwork`] — Netz
+    /// nur, wenn der Elternteil es trägt, und nur zu dessen
+    /// (egress-gebundenen) Hosts.
+    ReadOnlyResearch,
 }
 
 impl RegistryProfile {
@@ -729,6 +942,7 @@ impl RegistryProfile {
         RegistryProfile::UiaExplorer,
         RegistryProfile::UiaWriter,
         RegistryProfile::UiaShellWorker,
+        RegistryProfile::ReadOnlyResearch,
     ];
 
     /// Liefert die Rollenbeschreibung, die im System-Prompt erscheint.
@@ -764,6 +978,7 @@ impl RegistryProfile {
             RegistryProfile::UiaShellWorker => {
                 "host shell execution specialization of the user interface agent"
             }
+            RegistryProfile::ReadOnlyResearch => "read-only research agent",
         }
     }
 
@@ -834,6 +1049,7 @@ impl RegistryProfile {
                 .chain(DOC_TOOLS.iter())
                 .chain(EXPLORER_TOOLS.iter())
                 .chain(SHELL_TOOLS.iter())
+                .chain(PROCESS_TOOLS.iter())
                 .copied()
                 .collect(),
             RegistryProfile::ShellExecution => SHELL_TOOLS.to_vec(),
@@ -842,11 +1058,11 @@ impl RegistryProfile {
                 .chain(DOC_TOOLS.iter())
                 .chain(EXPLORER_TOOLS.iter())
                 .chain(DEPS_TOOLS.iter())
-                // Der Explorer darf auch das Netz durchsuchen (`web.search`,
-                // `web.fetch`); welche davon eine Rolle wirklich bekommt,
-                // entscheidet ihr `admitted` in der Agent-Definition, und jeder
+                // Der Explorer darf auch das Netz durchsuchen (`web.fetch`,
+                // `web.search`, siehe `EXPLORER_WEB_TOOLS`); `analyst` und
+                // `researcher-deps` verbieten beide in ihrer TOML, und jeder
                 // Abruf braucht weiterhin `NetworkAccess` im Sandbox-Scope.
-                .chain(WEB_TOOLS.iter())
+                .chain(EXPLORER_WEB_TOOLS.iter())
                 .copied()
                 .collect(),
             // `Planning` teilt den read-only Kern mit `ReadOnlyExplore`, hängt
@@ -875,15 +1091,16 @@ impl RegistryProfile {
                 .copied()
                 .collect(),
             // Schnellhelfer der UIA (Addendum I): lesender fs.*-Kern plus
-            // `doc.read_pdf` plus `shell.exec` plus ausschließlich
-            // `web.fetch` plus ausschließlich `browser.open`
-            // (Nutzerentscheidung) — siehe die Begründung bei
-            // `RegistryProfile::UiaQuickHelper`.
+            // `doc.read_pdf` plus `shell.exec` plus die lesenden `deps.*`
+            // plus `web.fetch`/`web.search` plus ausschließlich
+            // `browser.open` (Nutzerentscheidungen) — siehe die Begründung
+            // bei `RegistryProfile::UiaQuickHelper`.
             RegistryProfile::UiaQuickHelper => FS_READ_ONLY_TOOLS
                 .iter()
                 .chain(DOC_TOOLS.iter())
                 .chain(SHELL_TOOLS.iter())
-                .chain(UIA_QUICK_HELPER_WEB_TOOLS.iter())
+                .chain(DEPS_TOOLS.iter())
+                .chain(UIA_HELPER_WEB_TOOLS.iter())
                 .chain(UIA_QUICK_HELPER_BROWSER_TOOLS.iter())
                 .copied()
                 .collect(),
@@ -905,22 +1122,25 @@ impl RegistryProfile {
                 .collect(),
             // Read-only Erkundungsspezialisierung der UIA (siehe die
             // Begründung bei `RegistryProfile::UiaExplorer`): lesender
-            // fs.*-Kern plus `doc.read_pdf` plus ausschließlich `web.fetch`
-            // — kein `deps.*`.
+            // fs.*-Kern plus `doc.read_pdf` plus `explore.*` plus
+            // `web.fetch`/`web.search` — kein `deps.*`.
             RegistryProfile::UiaExplorer => FS_READ_ONLY_TOOLS
                 .iter()
                 .chain(DOC_TOOLS.iter())
-                .chain(UIA_QUICK_HELPER_WEB_TOOLS.iter())
+                .chain(EXPLORER_TOOLS.iter())
+                .chain(EXPLORER_WEB_TOOLS.iter())
                 .copied()
                 .collect(),
             // Schreibende Erkundungsspezialisierung der UIA (siehe die
             // Begründung bei `RegistryProfile::UiaWriter`): alle sechs
             // fs.*-Werkzeuge (inklusive `fs.write`) plus `doc.read_pdf` plus
-            // ausschließlich `web.fetch` — kein `deps.*`, kein `shell.exec`.
+            // die lesenden `deps.*` plus `web.fetch`/`web.search` — kein
+            // `shell.exec`.
             RegistryProfile::UiaWriter => FS_FULL_TOOLS
                 .iter()
                 .chain(DOC_TOOLS.iter())
-                .chain(UIA_QUICK_HELPER_WEB_TOOLS.iter())
+                .chain(DEPS_TOOLS.iter())
+                .chain(UIA_HELPER_WEB_TOOLS.iter())
                 .copied()
                 .collect(),
             // Host-Shell-Spezialisierung der UIA (siehe die Begründung bei
@@ -930,6 +1150,17 @@ impl RegistryProfile {
                 .iter()
                 .chain(DOC_TOOLS.iter())
                 .chain(SHELL_TOOLS.iter())
+                .copied()
+                .collect(),
+            // Lesende Recherche mit Netz (siehe die Begründung bei
+            // `RegistryProfile::ReadOnlyResearch`): lesender fs.*-Kern plus
+            // `doc.read_pdf` plus `explore.*` plus `web.fetch`/`web.search` —
+            // kein `deps.*` (Cargo-spezifisch).
+            RegistryProfile::ReadOnlyResearch => FS_READ_ONLY_TOOLS
+                .iter()
+                .chain(DOC_TOOLS.iter())
+                .chain(EXPLORER_TOOLS.iter())
+                .chain(EXPLORER_WEB_TOOLS.iter())
                 .copied()
                 .collect(),
         }
@@ -1055,11 +1286,24 @@ impl RegistryProfile {
 #[must_use]
 pub fn profile_for_role(role: &str) -> Option<RegistryProfile> {
     match role {
-        role_names::ROOT_ORCHESTRATOR => Some(RegistryProfile::Planning),
+        // Orchestratoren (Root und die drei Child-Orchestratoren) teilen die
+        // read-only Planungsoberfläche ohne Netz; ihr Fan-out-Werkzeug
+        // `delegate_wave` steuert die Composition-Root bei (siehe
+        // `composition_tools_for_role`).
+        role_names::ROOT_ORCHESTRATOR
+        | role_names::CODING_ORCHESTRATOR
+        | role_names::RESEARCH_ORCHESTRATOR
+        | role_names::ANALYSIS_ORCHESTRATOR => Some(RegistryProfile::Planning),
         role_names::EXPLORER | role_names::RESEARCHER_DEPS | role_names::ANALYST => {
             Some(RegistryProfile::ReadOnlyExplore)
         }
         role_names::RESEARCHER_WEB => Some(RegistryProfile::Research),
+        // Ökosystem-neutrale und allgemeine Recherche: Workspace-Dokumente
+        // plus Netz, ohne die Cargo-spezifischen `deps.*` — siehe die
+        // Begründung bei `RegistryProfile::ReadOnlyResearch`.
+        role_names::DEPENDENCY_RESEARCHER | role_names::RESEARCHER => {
+            Some(RegistryProfile::ReadOnlyResearch)
+        }
         role_names::PLANNER => Some(RegistryProfile::Planning),
         // Die vier Triage-Rollen admittieren kein Werkzeug (`[tools].admitted
         // = []`) — sie bekommen bereits ausgewertete Befund-Batches als
@@ -1082,7 +1326,8 @@ pub fn profile_for_role(role: &str) -> Option<RegistryProfile> {
         // `uia-worker` ist der exklusive Schnellhelfer der UIA (Addendum I,
         // korrigiert REG-DE) — nicht mehr nur Netz-Recherche
         // (`RegistryProfile::Research`), sondern lesender Workspace-Zugriff
-        // plus `shell.exec` plus `web.fetch`, siehe `agents/uia-worker.toml`
+        // plus `shell.exec` plus lesende `deps.*` plus `web.fetch`/
+        // `web.search`, siehe `agents/uia-worker.toml`
         // und die Begründung bei `RegistryProfile::UiaQuickHelper`.
         role_names::UIA_WORKER => Some(RegistryProfile::UiaQuickHelper),
         // Read-only Erkundungsspezialisierung der UIA — siehe die Begründung
@@ -1288,7 +1533,9 @@ pub struct AgentDefinitionAccess {
     pub mode: DefinitionWriteMode,
     /// Die Urheber-Decke des Eltern-Aufrufers des Stewards (Nachtrag K3);
     /// `None` ⇒ fail-closed — der Provider registriert dann ausschließlich
-    /// `agents.validate`/`agents.list_proposals`.
+    /// `agents.validate`/`agents.list_proposals` (und der daneben montierte
+    /// `SkillProposalToolProvider` nur `skills.validate`/
+    /// `skills.list_proposals`).
     pub ceiling: Option<DefinitionAuthorCeiling>,
 }
 
@@ -1333,6 +1580,18 @@ pub fn agent_definition_tool_names_for_access(
             tools.extend_from_slice(&AGENT_DEFINITION_WRITE_TOOLS[..2]);
             if access.mode == DefinitionWriteMode::Commit {
                 tools.extend_from_slice(&AGENT_DEFINITION_WRITE_TOOLS[2..]);
+            }
+        }
+    }
+    // Danach die Werkzeuge des daneben montierten
+    // `SkillProposalToolProvider` — dieselbe Staffelung: lesend immer, mit
+    // Decke `skills.propose`, im Commit-Modus zusätzlich Commit/Reject.
+    tools.extend_from_slice(SKILL_PROPOSAL_READ_TOOLS);
+    if let Some(access) = access {
+        if access.ceiling.is_some() {
+            tools.extend_from_slice(SKILL_PROPOSAL_PROPOSE_TOOLS);
+            if access.mode == DefinitionWriteMode::Commit {
+                tools.extend_from_slice(SKILL_PROPOSAL_DECIDE_TOOLS);
             }
         }
     }
@@ -1475,12 +1734,18 @@ fn profile_tool_providers(
             let doc: Arc<dyn ToolProvider> = Arc::new(DocToolProvider);
             let explorer: Arc<dyn ToolProvider> = Arc::new(ExplorerToolProvider::new());
             let shell = build_shell_provider(sandbox_profile);
-            vec![filesystem, doc, explorer, shell]
+            let process: Arc<dyn ToolProvider> = Arc::new(ProcessToolProvider::new());
+            vec![filesystem, doc, explorer, shell, process]
         }
         RegistryProfile::ShellExecution => vec![build_shell_provider(sandbox_profile)],
+        // Der Web-Provider wird auf `EXPLORER_WEB_TOOLS` gefiltert, damit
+        // `web.docs_rs`/`web.crates_io` nicht per Namensraten erreichbar sind.
         RegistryProfile::ReadOnlyExplore => {
             let mut providers = read_only_base();
-            providers.push(Arc::new(WebToolProvider::new()));
+            providers.push(Arc::new(RestrictedToolProvider::new(
+                Arc::new(WebToolProvider::new()),
+                EXPLORER_WEB_TOOLS,
+            )));
             providers
         }
         // `LensToolProvider::new()` ist zustandslos (keine Bau-, Home- oder
@@ -1513,8 +1778,9 @@ fn profile_tool_providers(
         }
         // Schnellhelfer der UIA (Addendum I): gefilterter, lesender
         // FS-Provider + lesender Doc-Provider + voller Shell-Provider
-        // (Sandbox+Freigabe greifen wie überall) + auf `web.fetch`
-        // gefilterter Web-Provider.
+        // (Sandbox+Freigabe greifen wie überall) + vollständig lesender
+        // Deps-Provider + auf `web.fetch`/`web.search` gefilterter
+        // Web-Provider.
         RegistryProfile::UiaQuickHelper => {
             let filesystem: Arc<dyn ToolProvider> = Arc::new(RestrictedToolProvider::new(
                 Arc::new(FsToolProvider::default()),
@@ -1522,11 +1788,12 @@ fn profile_tool_providers(
             ));
             let doc: Arc<dyn ToolProvider> = Arc::new(DocToolProvider);
             let shell = build_shell_provider(sandbox_profile);
+            let dependencies: Arc<dyn ToolProvider> = Arc::new(DepsToolProvider::new());
             let web: Arc<dyn ToolProvider> = Arc::new(RestrictedToolProvider::new(
                 Arc::new(WebToolProvider::new()),
-                UIA_QUICK_HELPER_WEB_TOOLS,
+                UIA_HELPER_WEB_TOOLS,
             ));
-            vec![filesystem, doc, shell, web]
+            vec![filesystem, doc, shell, dependencies, web]
         }
         // `agent-steward` (Addendum K + Nachtrag K/K2/K3): gefilterter,
         // lesender FS-Provider + der Agentendefinitions-Provider, dessen
@@ -1550,6 +1817,26 @@ fn profile_tool_providers(
                 FS_READ_ONLY_TOOLS,
             ));
             let doc: Arc<dyn ToolProvider> = Arc::new(DocToolProvider);
+            // Skill-Vorschläge liegen neben `<profil>/agents` unter
+            // `<profil>/skills`; die Decke übernimmt Rolle und Werkzeuge der
+            // Agentendefinitions-Decke (MCPs kennt dieser Pfad nicht —
+            // fail-closed leer).
+            let skill_proposals: Arc<dyn ToolProvider> = Arc::new(SkillProposalToolProvider::new(
+                agent_definition_access
+                    .profile_agents_dir
+                    .as_ref()
+                    .and_then(|dir| dir.parent())
+                    .map(|profile| profile.join("skills")),
+                agent_definition_access.mode,
+                agent_definition_access
+                    .ceiling
+                    .as_ref()
+                    .map(|ceiling| SkillAuthorCeiling {
+                        role: ceiling.role,
+                        tools: ceiling.tools.clone(),
+                        mcps: Default::default(),
+                    }),
+            ));
             let agent_definitions: Arc<dyn ToolProvider> = Arc::new(
                 crate::agent_definition_tools::AgentDefinitionToolProvider::new(
                     agent_definition_access.project_agents_dir,
@@ -1558,11 +1845,12 @@ fn profile_tool_providers(
                     agent_definition_access.ceiling,
                 ),
             );
-            vec![filesystem, doc, agent_definitions]
+            vec![filesystem, doc, agent_definitions, skill_proposals]
         }
         // Read-only Erkundungsspezialisierung der UIA: gefilterter, lesender
-        // FS-Provider + lesender Doc-Provider + auf `web.fetch` gefilterter
-        // Web-Provider — siehe die Begründung bei
+        // FS-Provider + lesender Doc-Provider + Explorer-Provider + auf
+        // `web.fetch`/`web.search` gefilterter Web-Provider — siehe die
+        // Begründung bei
         // `RegistryProfile::UiaExplorer`.
         RegistryProfile::UiaExplorer => {
             let filesystem: Arc<dyn ToolProvider> = Arc::new(RestrictedToolProvider::new(
@@ -1570,25 +1858,28 @@ fn profile_tool_providers(
                 FS_READ_ONLY_TOOLS,
             ));
             let doc: Arc<dyn ToolProvider> = Arc::new(DocToolProvider);
+            let explorer: Arc<dyn ToolProvider> = Arc::new(ExplorerToolProvider::new());
             let web: Arc<dyn ToolProvider> = Arc::new(RestrictedToolProvider::new(
                 Arc::new(WebToolProvider::new()),
-                UIA_QUICK_HELPER_WEB_TOOLS,
+                EXPLORER_WEB_TOOLS,
             ));
-            vec![filesystem, doc, web]
+            vec![filesystem, doc, explorer, web]
         }
         // Schreibende Erkundungsspezialisierung der UIA: voller, ungefilterter
         // FS-Provider (alle sechs `fs.*`, inklusive `fs.write`) + lesender
-        // Doc-Provider + auf `web.fetch` gefilterter Web-Provider — kein
+        // Doc-Provider + vollständig lesender Deps-Provider + auf
+        // `web.fetch`/`web.search` gefilterter Web-Provider — kein
         // `ShellToolProvider`. Siehe die Begründung bei
         // `RegistryProfile::UiaWriter`.
         RegistryProfile::UiaWriter => {
             let filesystem: Arc<dyn ToolProvider> = Arc::new(FsToolProvider::default());
             let doc: Arc<dyn ToolProvider> = Arc::new(DocToolProvider);
+            let dependencies: Arc<dyn ToolProvider> = Arc::new(DepsToolProvider::new());
             let web: Arc<dyn ToolProvider> = Arc::new(RestrictedToolProvider::new(
                 Arc::new(WebToolProvider::new()),
-                UIA_QUICK_HELPER_WEB_TOOLS,
+                UIA_HELPER_WEB_TOOLS,
             ));
-            vec![filesystem, doc, web]
+            vec![filesystem, doc, dependencies, web]
         }
         // Host-Shell-Spezialisierung der UIA: gefilterter, lesender
         // FS-Provider + lesender Doc-Provider + Shell-Provider — anders als
@@ -1607,6 +1898,23 @@ fn profile_tool_providers(
             let doc: Arc<dyn ToolProvider> = Arc::new(DocToolProvider);
             let shell = build_shell_provider(&SandboxProfile::Host);
             vec![filesystem, doc, shell]
+        }
+        // Lesende Recherche mit Netz: gefilterter, lesender FS-Provider +
+        // lesender Doc-Provider + Explorer-Provider + auf
+        // `web.fetch`/`web.search` gefilterter Web-Provider — siehe die
+        // Begründung bei `RegistryProfile::ReadOnlyResearch`.
+        RegistryProfile::ReadOnlyResearch => {
+            let filesystem: Arc<dyn ToolProvider> = Arc::new(RestrictedToolProvider::new(
+                Arc::new(FsToolProvider::default()),
+                FS_READ_ONLY_TOOLS,
+            ));
+            let doc: Arc<dyn ToolProvider> = Arc::new(DocToolProvider);
+            let explorer: Arc<dyn ToolProvider> = Arc::new(ExplorerToolProvider::new());
+            let web: Arc<dyn ToolProvider> = Arc::new(RestrictedToolProvider::new(
+                Arc::new(WebToolProvider::new()),
+                EXPLORER_WEB_TOOLS,
+            ));
+            vec![filesystem, doc, explorer, web]
         }
     }
 }
@@ -1865,7 +2173,8 @@ pub fn assemble_registry_for_project(
 /// None)`: ohne `access` bleibt `crate::agent_definition_tools::
 /// AgentDefinitionToolProvider` fail-closed bei
 /// `DefinitionWriteMode::ProposalOnly` ohne Decke — registriert also nur
-/// `agents.validate`/`agents.list_proposals`, unabhängig vom Profil. Wer eine
+/// `agents.validate`/`agents.list_proposals` (plus `skills.validate`/
+/// `skills.list_proposals`), unabhängig vom Profil. Wer eine
 /// Kind-Registry für `RegistryProfile::AgentStewardship` montiert und dem
 /// Steward tatsächlich Schreibrechte geben will, übergibt `Some(access)` mit
 /// den Verzeichnissen, dem gewählten Modus (`Commit` nur, wenn der Eltern-
@@ -2226,7 +2535,20 @@ pub fn assemble_registry_for_sandbox_with_definition_access_and_sandbox_profile_
     .filter_map(|provider| restrict_provider(provider, &allowed))
     .collect();
 
-    let advertised_tools: Vec<String> = allowed.iter().map(|name| (*name).to_owned()).collect();
+    // Beworben wird nur, wofür tatsächlich ein Provider-Werkzeug registriert
+    // ist: `allowed` ist die statische Vertrags-Obermenge (etwa
+    // `browser.open` bei `UiaQuickHelper`, das ohne `BrowserOpenGrant` keinen
+    // Provider hat). Ein beworbenes Werkzeug ohne Executor schickte das
+    // Modell in einen sicheren Fehlschlag.
+    let registered: Vec<ToolSpec> = providers
+        .iter()
+        .flat_map(|provider| provider.tools())
+        .collect();
+    let advertised_tools: Vec<String> = allowed
+        .iter()
+        .filter(|name| registered.iter().any(|spec| spec.name() == **name))
+        .map(|name| (*name).to_owned())
+        .collect();
 
     let IdentityOverrides {
         agent_name,
@@ -2384,6 +2706,8 @@ mod tests {
             .collect();
         expected.push("agents.validate".to_owned());
         expected.push("agents.list_proposals".to_owned());
+        expected.push("skills.validate".to_owned());
+        expected.push("skills.list_proposals".to_owned());
         assert_eq!(registered_names(&assembled), expected);
         assert_eq!(assembled.identity.tools_available, expected);
         Ok(())
@@ -2446,13 +2770,75 @@ mod tests {
                 "fs.glob",
                 "fs.grep",
                 "doc.read_pdf",
+                "explore.tree",
+                "explore.projects",
+                "explore.relations",
+                "explore.find",
                 "deps.graph",
                 "deps.locked",
                 "deps.source_read",
                 "deps.source_search",
                 "deps.source_list",
+                // Nutzerentscheidung: der Explorer darf auch das Netz
+                // durchsuchen — nur diese zwei, nie `web.docs_rs`/`web.crates_io`.
+                "web.fetch",
+                "web.search",
             ]
         );
+        Ok(())
+    }
+
+    /// Nutzerentscheidung „UIA-Helfer recherchieren kurz online und fügen
+    /// manchmal Abhängigkeiten hinzu“: `UiaQuickHelper` (`uia-worker`) und
+    /// `UiaWriter` (`uia-writer`) registrieren tatsächlich die fünf lesenden
+    /// `deps.*`-Werkzeuge und alle vier `web.*`-Werkzeuge (seit der
+    /// Nutzerentscheidung auch `web.docs_rs`/`web.crates_io`) — nie
+    /// `lens.ask` — und brauchen dafür genau `ReadCargoRegistry` und
+    /// `NetworkAccess` zusätzlich.
+    #[test]
+    fn test_uia_helpers_register_web_search_and_read_only_deps_tools() -> TestResult {
+        use harw_authority::Permission;
+
+        const DEPS_AND_WEB: [&str; 9] = [
+            "deps.graph",
+            "deps.locked",
+            "deps.source_read",
+            "deps.source_search",
+            "deps.source_list",
+            "web.fetch",
+            "web.docs_rs",
+            "web.crates_io",
+            "web.search",
+        ];
+        let quick = registered_names(&assemble(RegistryProfile::UiaQuickHelper)?);
+        let mut expected_quick: Vec<&str> = FS_READ_ONLY_TOOLS
+            .iter()
+            .chain(DOC_TOOLS.iter())
+            .chain(SHELL_TOOLS.iter())
+            .copied()
+            .collect();
+        expected_quick.extend(DEPS_AND_WEB);
+        assert_eq!(quick, expected_quick);
+
+        let writer = registered_names(&assemble(RegistryProfile::UiaWriter)?);
+        let mut expected_writer: Vec<&str> = FS_FULL_TOOLS
+            .iter()
+            .chain(DOC_TOOLS.iter())
+            .copied()
+            .collect();
+        expected_writer.extend(DEPS_AND_WEB);
+        assert_eq!(writer, expected_writer);
+
+        for profile in [RegistryProfile::UiaQuickHelper, RegistryProfile::UiaWriter] {
+            let names = profile.registered_tool_names();
+            assert!(!names.contains(&"lens.ask"), "{profile:?}: lens.ask");
+            let required = profile.required_permissions();
+            assert!(required.contains(Permission::NetworkAccess), "{profile:?}");
+            assert!(
+                required.contains(Permission::ReadCargoRegistry),
+                "{profile:?}"
+            );
+        }
         Ok(())
     }
 
@@ -2516,7 +2902,11 @@ mod tests {
         );
         assert_eq!(
             RegistryProfile::ReadOnlyExplore.required_permissions(),
-            set(&[Permission::ReadWorkspace, Permission::ReadCargoRegistry])
+            set(&[
+                Permission::ReadWorkspace,
+                Permission::ReadCargoRegistry,
+                Permission::NetworkAccess
+            ])
         );
         assert_eq!(
             RegistryProfile::Planning.required_permissions(),
@@ -2547,6 +2937,10 @@ mod tests {
                 "fs.glob",
                 "fs.grep",
                 "doc.read_pdf",
+                "explore.tree",
+                "explore.projects",
+                "explore.relations",
+                "explore.find",
                 "deps.graph",
                 "deps.locked"
             ]
@@ -2616,16 +3010,23 @@ mod tests {
     fn test_planning_profile_registers_read_only_tools_and_does_not_advertise_plan_or_goal()
     -> TestResult {
         let assembled = assemble(RegistryProfile::Planning)?;
-        // Registriert werden die read-only Provider von `ReadOnlyExplore`
-        // plus `lens.ask` — der einzige Grund, warum `Planning` sich
-        // überhaupt vom read-only Kern unterscheidet (siehe `LENS_TOOLS`).
-        let mut expected: Vec<String> = RegistryProfile::ReadOnlyExplore
-            .registered_tool_names()
+        // Registriert wird der read-only Kern von `ReadOnlyExplore` (fs.*,
+        // doc.read_pdf, explore.*, deps.*) **ohne** dessen Explorer-Netz
+        // (`web.fetch`/`web.search`, nur für `explorer`), plus `lens.ask`
+        // (siehe `LENS_TOOLS`).
+        let expected: Vec<String> = FS_READ_ONLY_TOOLS
             .iter()
+            .chain(DOC_TOOLS.iter())
+            .chain(EXPLORER_TOOLS.iter())
+            .chain(DEPS_TOOLS.iter())
+            .chain(LENS_TOOLS.iter())
             .map(|name| (*name).to_owned())
             .collect();
-        expected.push("lens.ask".to_owned());
         assert_eq!(registered_names(&assembled), expected);
+        assert!(
+            !expected.iter().any(|name| name.starts_with("web.")),
+            "Planning (root-orchestrator, planner) führt kein Netz-Werkzeug"
+        );
         // … und beworben wird genau das Registrierte: `plan`/`goal` sind
         // Composition-Root-Operationen ohne Executor im Kind (W1-05).
         assert_eq!(assembled.identity.tools_available, expected);
@@ -2916,6 +3317,54 @@ mod tests {
         for role in role_names::ALL {
             assert!(profile_for_role(role).is_some(), "unbekannt: {role}");
         }
+        // Plan Punkt 1: Root- und Child-Orchestratoren teilen die read-only
+        // Planungsoberfläche ohne Netz.
+        for role in [role_names::ROOT_ORCHESTRATOR]
+            .iter()
+            .chain(role_names::CHILD_ORCHESTRATORS.iter())
+        {
+            assert_eq!(
+                profile_for_role(role),
+                Some(RegistryProfile::Planning),
+                "Orchestrator {role} muss Planning bekommen"
+            );
+        }
+    }
+
+    /// `delegate_wave` steuert die Composition-Root bei — ausschließlich für
+    /// Orchestratoren, nie für Worker oder UIA-Rollen, und nie als Teil eines
+    /// Registry-Profils (sonst bewürbe `Planning` es auch dem `planner`).
+    #[test]
+    fn test_composition_tools_are_granted_only_to_orchestrators() {
+        let orchestrators: Vec<&str> = std::iter::once(role_names::ROOT_ORCHESTRATOR)
+            .chain(role_names::CHILD_ORCHESTRATORS.iter().copied())
+            .collect();
+        for role in role_names::ALL {
+            let expected: &[&str] = if orchestrators.contains(role) {
+                ORCHESTRATION_TOOLS
+            } else {
+                &[]
+            };
+            assert_eq!(composition_tools_for_role(role), expected, "{role}");
+            assert_eq!(is_orchestrator_role(role), orchestrators.contains(role));
+        }
+        for profile in RegistryProfile::ALL {
+            for tool in ORCHESTRATION_TOOLS {
+                assert!(
+                    !profile.registered_tool_names().contains(tool),
+                    "{profile:?} darf {tool} nicht selbst registrieren"
+                );
+            }
+        }
+        assert!(composition_tools_for_role("unbekannt").is_empty());
+    }
+
+    #[test]
+    fn test_child_orchestrators_are_listed_in_all() {
+        for role in role_names::CHILD_ORCHESTRATORS {
+            assert!(role_names::ALL.contains(role), "{role} fehlt in ALL");
+        }
+        assert_eq!(role_names::CHILD_ORCHESTRATORS.len(), 3);
     }
 
     #[test]

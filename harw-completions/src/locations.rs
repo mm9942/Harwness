@@ -224,7 +224,10 @@ pub fn resolve_locations(env: &HomeEnv, bin: &str, shell: Shell) -> CompletionRe
         }
         Shell::Fish => (
             config.join("fish/completions").join(format!("{bin}.fish")),
-            vec![home.join(".config/fish/completions").join(format!("{bin}.fish"))],
+            vec![
+                home.join(".config/fish/completions")
+                    .join(format!("{bin}.fish")),
+            ],
             None,
             vec![config.join("fish/config.fish")],
             Vec::new(),

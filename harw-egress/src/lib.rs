@@ -66,7 +66,7 @@ mod relay;
 pub use classify::{AddrClass, classify};
 pub use client::build_client;
 pub use error::EgressError;
-pub use harw_sandbox ::{EgressHost, EgressUrl, EgressUrlError};
+pub use harw_sandbox::{EgressHost, EgressUrl, EgressUrlError};
 pub use policy::EgressPolicy;
 pub use proxy::{EgressProxy, ProxyLimits, serve};
 pub use relay::{

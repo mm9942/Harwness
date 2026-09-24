@@ -1,0 +1,101 @@
+# Eingebauter Child-Orchestrator der Coding-Spur (Sub-Orchestrator, Plan
+# Punkt 1; `agent-definition-dsl.md` §11.1, `docs/design/
+# delegation-capabilities.md`).
+#
+# ── Warum eine eigene Rolle statt `planner` als Clan-Leader ────────────────
+# Bis zu dieser Definition führte `planner` (`role = "worker"`,
+# `max_depth = 1`) den Coding-Clan der Default-Organisation. Ein Worker hat
+# laut Rollenmatrix (`harw-agent-dsl/src/roles.rs::can_spawn`) aber keine
+# dauerhafte Delegation — der Clan konnte seine Zelle `coding-wave` also nur
+# auf dem Papier starten. `coding-orchestrator` trägt
+# `role = "child-orchestrator"` (`AgentRoleId::ChildOrchestrator`) und darf
+# damit Worker seines Teilbaums starten.
+#
+# ── Rechte ──────────────────────────────────────────────────────────────────
+# Werkzeugoberfläche wie `root-orchestrator` (`RegistryProfile::Planning`,
+# read-only, kein Netz) plus `delegate_wave` — das Fan-out-Werkzeug der
+# Orchestrator-Sitzungen, das die Composition-Root
+# (`harw-core-bridge::delegate_wave`) beisteuert, nicht dieses Crate
+# (siehe `profile::composition_tools_for_role`). Der Orchestrator schreibt
+# selbst keinen Code: Schreib-/Ausführungsarbeit delegiert er an `executor`.
+#
+# ── Tiefe ───────────────────────────────────────────────────────────────────
+# `max_depth = 1`: unter ihm entstehen ausschließlich Worker. Weitere
+# Child-Orchestratoren bräuchten eine exakte, namentliche Freigabe
+# (`child_orchestrators`), die hier bewusst leer bleibt.
+#
+# ── Budget ──────────────────────────────────────────────────────────────────
+# Jede Dimension liegt unter der des `root-orchestrator` (120000 / 80 / 900):
+# ein Kind verfügt nie über mehr Budget als sein Parent (monoton).
+
+schema = "harwness.agent/v1"
+id = "harwness.agent.coding-orchestrator@1"
+version = "1.0.0"
+role = "child-orchestrator"
+specialization = "coding-orchestrator"
+
+name = "Coding Orchestrator"
+description = "Zerlegt einen abgegrenzten Coding-Teilauftrag in schreibkonfliktfreie Wellen, delegiert Planung, Erkundung und Ausführung an Worker und liefert dem Root-Orchestrator eine ReturnEnvelope-Zusammenfassung."
+
+[work]
+mode = "orchestration"
+may_change_plan = false
+may_write_code = false
+may_research_web = false
+aggregates_child_returns = true
+
+[lifecycle]
+allow_pause = false
+allow_rerun = true
+max_attempts = 2
+
+[context]
+must_include = ["task.objective", "task.read_scope", "new.trigger_return"]
+exclude = ["full_parent_transcript", "sibling_transcripts"]
+
+[tools]
+admitted = [
+  "fs.read",
+  "fs.list",
+  "fs.search",
+  "fs.glob",
+  "fs.grep",
+  "doc.read_pdf",
+  "deps.graph",
+  "deps.locked",
+  "deps.source_read",
+  "deps.source_search",
+  "deps.source_list",
+  "lens.ask",
+  "explore.tree",
+  "explore.projects",
+  "explore.relations",
+  "explore.find",
+  "delegate_wave",
+]
+forbidden = ["fs.write", "shell.exec", "web.fetch", "web.search", "web.docs_rs", "web.crates_io"]
+
+# Zugelassene Delegationsziele (`harw_registry_defaults::authority::
+# delegation_targets_for_role`). Eine weitere Schnittmenge ZUSÄTZLICH zur
+# Laufzeit-Sichtbarkeit (`delegation_visibility`): `delegate_wave` startet
+# nur Ziele, die hier stehen UND für diese Sitzung sichtbar sind.
+[delegation]
+targets = [
+  "planner",
+  "explorer",
+  "executor",
+  "researcher-deps",
+  "dependency-researcher",
+]
+
+[spawn]
+max_depth = 1
+child_orchestrators = []
+
+[spawn.budget]
+max_tokens = 100000
+max_tool_calls = 70
+max_wall_secs = 900
+
+[return]
+contract = "harwness.return.envelope@1"

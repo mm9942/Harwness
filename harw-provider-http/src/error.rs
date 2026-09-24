@@ -231,6 +231,52 @@ const QUOTA_ERROR_CODES: &[&str] = &[
 /// Fehlercodes, die eine zu lange Eingabe melden.
 const CONTEXT_LENGTH_ERROR_CODES: &[&str] = &["context_length_exceeded", "string_above_max_length"];
 
+/// Meldungsfragmente (ASCII-kleingeschrieben), an denen die gängigen Provider
+/// eine zu lange Eingabe erkennen lassen, auch wenn kein strukturierter
+/// Fehlercode mitkommt.
+///
+/// Abgedeckt: Anthropic (`prompt is too long`, `input length and max_tokens
+/// exceed context limit`), OpenAI/Azure (`maximum context length`,
+/// `context_length_exceeded`), vLLM (`This model's maximum context length`),
+/// diverse OpenAI-kompatible Gateways (`exceeds the maximum number of
+/// tokens`, `too many tokens`, `exceed context limit`).
+const CONTEXT_LENGTH_MESSAGE_PATTERNS: &[&str] = &[
+    "context length",
+    "prompt is too long",
+    "exceed context limit",
+    "exceeds context limit",
+    "input length and `max_tokens` exceed",
+    "input length and max_tokens exceed",
+    "maximum context length",
+    "this model's maximum context length",
+    "exceeds the maximum number of tokens",
+    "context_length_exceeded",
+    "too many tokens",
+];
+
+/// `true`, wenn `text` eine der bekannten Kontextlängen-Meldungen enthält.
+///
+/// # Description
+/// Vergleich ASCII-case-insensitiv auf Teilstrings aus
+/// [`CONTEXT_LENGTH_MESSAGE_PATTERNS`]. Wird von
+/// [`model_error_for_status`] auf die bereinigte Diagnose **und** den
+/// Roh-Body angewandt (der Roh-Body wird dabei nur gelesen, nie
+/// zurückgegeben) — manche Gateways liefern die Meldung außerhalb der
+/// dokumentierten JSON-Felder.
+///
+/// # Arguments
+/// - `text` (`&str`): Fehlermeldung oder Antwort-Body.
+///
+/// # Returns
+/// `true` bei einem Treffer.
+#[must_use]
+pub(crate) fn is_context_length_message(text: &str) -> bool {
+    let lower = text.to_ascii_lowercase();
+    CONTEXT_LENGTH_MESSAGE_PATTERNS
+        .iter()
+        .any(|pattern| lower.contains(pattern))
+}
+
 /// Obergrenze für einen aus `Retry-After` gelesenen Wert, bevor er in
 /// Sekunden gespeichert wird (verhindert Überläufe bei absurden Headern).
 const MAX_RETRY_AFTER_HINT_SECS: u64 = 24 * 60 * 60;
@@ -293,7 +339,7 @@ pub(crate) fn retry_after_hint(
 /// | 429 | `error.code/type` ∈ Kontingent-Codes | `QuotaExceeded` |
 /// | 429 | sonst | `Transient{status:429, retry_after_secs}` |
 /// | 401, 403 | — | `Auth` |
-/// | 400, 413 | Kontextlängen-Code oder Meldung „context length“ | `ContextLength` |
+/// | 400, 413, 422 | Kontextlängen-Code oder bekannte Kontextlängen-Meldung ([`is_context_length_message`]) | `ContextLength` |
 /// | 408, 500–599 (inkl. 529) | — | `Transient{status, retry_after_secs}` |
 /// | sonst | — | `RequestFailed` |
 ///
@@ -328,9 +374,10 @@ pub(crate) fn model_error_for_status(
             message,
         },
         401 | 403 => ModelError::Auth { message },
-        400 | 413
+        400 | 413 | 422
             if code_in(CONTEXT_LENGTH_ERROR_CODES)
-                || message.to_ascii_lowercase().contains("context length") =>
+                || is_context_length_message(&message)
+                || is_context_length_message(body) =>
         {
             ModelError::ContextLength { message }
         }
@@ -413,7 +460,9 @@ impl From<reqwest::Error> for HttpProviderError {
 
 #[cfg(test)]
 mod tests {
-    use super::{HttpProviderError, model_error_for_status, retry_after_hint};
+    use super::{
+        HttpProviderError, is_context_length_message, model_error_for_status, retry_after_hint,
+    };
     use harw_core::ModelError;
 
     #[test]
@@ -463,6 +512,72 @@ mod tests {
             model_error_for_status(404, None, None, "{}"),
             ModelError::RequestFailed(_)
         ));
+    }
+
+    #[test]
+    fn test_model_error_for_status_detects_provider_context_length_messages() {
+        let bodies = [
+            // Anthropic
+            r#"{"type":"error","error":{"type":"invalid_request_error","message":"prompt is too long: 215000 tokens > 200000 maximum"}}"#,
+            r#"{"type":"error","error":{"type":"invalid_request_error","message":"input length and `max_tokens` exceed context limit: 190000 + 32000 > 200000"}}"#,
+            // OpenAI
+            r#"{"error":{"message":"This model's maximum context length is 128000 tokens. However, your messages resulted in 130000 tokens.","type":"invalid_request_error","code":null}}"#,
+            // vLLM (Top-Level-`message`)
+            r#"{"object":"error","message":"This model's maximum context length is 32768 tokens. However, you requested 40000 tokens.","type":"BadRequestError","code":400}"#,
+            // Gateways
+            r#"{"error":{"message":"Requested input exceeds the maximum number of tokens"}}"#,
+            r#"{"error":{"message":"Too many tokens in request"}}"#,
+            r#"{"message":"request would exceed context limit"}"#,
+            r#"{"error":{"message":"bad request","type":"context_length_exceeded"}}"#,
+            // Nicht-JSON-Body
+            "upstream: prompt is too long",
+        ];
+        for body in bodies {
+            for status in [400_u16, 413, 422] {
+                assert!(
+                    matches!(
+                        model_error_for_status(status, None, None, body),
+                        ModelError::ContextLength { .. }
+                    ),
+                    "status {status} body {body} must be ContextLength"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_model_error_for_status_context_patterns_do_not_misclassify() {
+        let unrelated = r#"{"error":{"message":"invalid tool schema"}}"#;
+        assert!(matches!(
+            model_error_for_status(400, None, None, unrelated),
+            ModelError::RequestFailed(_)
+        ));
+        // Ein 429 mit Token-Meldung bleibt ein Rate-Limit.
+        let tpm = r#"{"error":{"message":"too many tokens per minute"}}"#;
+        assert!(matches!(
+            model_error_for_status(429, None, None, tpm),
+            ModelError::Transient { .. }
+        ));
+        // 5xx bleibt transient, auch wenn die Meldung passt.
+        assert!(matches!(
+            model_error_for_status(503, None, None, "prompt is too long"),
+            ModelError::Transient { .. }
+        ));
+    }
+
+    #[test]
+    fn test_is_context_length_message_is_case_insensitive() {
+        assert!(is_context_length_message("PROMPT IS TOO LONG"));
+        assert!(is_context_length_message("Maximum Context Length exceeded"));
+        assert!(!is_context_length_message("rate limit reached"));
+        assert!(!is_context_length_message(""));
+    }
+
+    #[test]
+    fn test_model_error_for_status_context_length_does_not_echo_raw_body() {
+        let error = model_error_for_status(400, None, None, "prompt is too long secret-token");
+        assert!(matches!(error, ModelError::ContextLength { .. }));
+        assert!(!error.to_string().contains("secret-token"));
     }
 
     #[test]

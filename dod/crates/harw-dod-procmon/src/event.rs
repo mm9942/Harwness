@@ -364,10 +364,15 @@ mod tests {
 
     #[test]
     fn v1_exec_has_explicit_path_length_and_never_fabricates_argv_evidence() -> TestResult {
+        // Wire layout (bpf/include/harw_dod_wire_v1.h, `hwd_emit_exec`):
+        // `comm[16] | path_len:u16-le | path[path_len]`, where `path_len` is the
+        // byte count without the C NUL and the payload ends exactly after the path.
+        let path: &[u8] = b"/bin/bash";
+        let path_len = u16::try_from(path.len()).map_err(ctx("test path fits in u16"))?;
         let mut payload = vec![0; 18];
         payload[..4].copy_from_slice(b"bash");
-        payload[16..18].copy_from_slice(&8u16.to_le_bytes());
-        payload.extend_from_slice(b"/bin/bash");
+        payload[16..18].copy_from_slice(&path_len.to_le_bytes());
+        payload.extend_from_slice(path);
         let event = WireEvent {
             event_type: WireEventType::Exec,
             flags: EXEC_PATH_TRUNCATED,

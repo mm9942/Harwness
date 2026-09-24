@@ -1,23 +1,46 @@
-//! `/analyze` — Bottom-up-Analyse eines Workspace über Analyst-Kindagenten.
+//! `/analyze` — Bottom-up-Analyse eines Arbeitsbereichs über Analyst-Kindagenten.
 //!
 //! # Verantwortungsbereich
 //! Implementiert die `analyze`-Operation gemäß AP W4-04. Sie ist die einzige
-//! Operation dieses APs, die **selbst orchestriert**: sie lädt den
-//! Workspace-Graph, legt je Crate einen `Analysis`-Plan-Knoten an, fährt die
-//! Ebenen von den Blättern aufwärts als Fan-out-Wellen und verdichtet das
-//! Ergebnis in einem `Synthesis`-Knoten.
+//! Operation dieses APs, die **selbst orchestriert**: sie baut den
+//! Einheiten-Graphen des Arbeitsbereichs, legt je Analyse-Einheit einen
+//! `Analysis`-Plan-Knoten an, fährt die Ebenen von den Blättern aufwärts als
+//! Fan-out-Wellen und verdichtet das Ergebnis in einem `Synthesis`-Knoten.
 //!
 //! Deshalb trägt sie **kein** `agent_tool`-Attribut: eine Operation, die selbst
 //! Kinder startet, darf nicht zusätzlich als einzelnes Kind-Werkzeug erscheinen
 //! — das Modell würde sonst eine Orchestrierung für einen Einzelaufruf halten.
 //!
+//! # Einheiten statt Crates
+//! `/analyze` ist verzeichnis- und projektneutral. Eine **Einheit** ist ein von
+//! [`harw_explorer`] erkanntes Projekt (Cargo-Crate, npm/pnpm-Paket,
+//! Python-Projekt, Go-Modul, Dokumentsammlung — beliebig verschachtelt); die
+//! Kanten zwischen Einheiten stammen aus den Explorer-Relationen
+//! (Pfad-Abhängigkeiten, namentliche Abhängigkeiten, Dokument-Links). Reine
+//! Workspace-Hüllen (virtuelles `Cargo.toml`, `package.json` mit `workspaces`)
+//! und Git-Wurzeln sind selbst keine Einheit — ihre Mitglieder sind es.
+//!
+//! [`WorkspaceGraph`] ist nur noch eine **Anreicherung** für Cargo: für jeden
+//! erkannten Cargo-Workspace wird er geladen und liefert Version, externe
+//! Abhängigkeiten und die präzisen internen Kanten (nur `[dependencies]`, ohne
+//! Dev-/Build-Abhängigkeiten). Kanten zwischen zwei so angereicherten Crates
+//! kommen dann ausschließlich aus dem [`WorkspaceGraph`]. Scheitert das Laden,
+//! bleibt es bei den Explorer-Kanten; der Fehler steht im Bericht
+//! (`graph.cargo_enrichment`), `/analyze` scheitert daran nicht.
+//!
+//! Kanten werden in fester Reihenfolge eingefügt (Cargo-Anreicherung,
+//! Explorer-Abhängigkeiten, Dokument-Links) und nur, wenn sie keinen Zyklus
+//! schließen — verworfene Kanten zählt `graph.dropped_edges`. Der Graph ist
+//! dadurch immer azyklisch und in Ebenen zerlegbar.
+//!
 //! # Ablauf
-//! 1. [`WorkspaceGraph::load`] auf der kanonischen Sandbox-Wurzel.
-//! 2. Optional [`WorkspaceGraph::subgraph`], wenn ein Crate genannt ist.
-//! 3. Je Crate ein [`PlanNode`] (`kind = Analysis`, `read_scope = <dir>/**`),
-//!    dessen Abhängigkeiten die **internen** Dependencies des Crates sind —
-//!    [`WorkspaceGraph::topological_levels`] liefert genau diese Ordnung,
-//!    Ebene 0 sind die Blätter.
+//! 1. [`build_unit_graph`] auf der kanonischen Sandbox-Wurzel.
+//! 2. Optional [`UnitGraph::subgraph`], wenn eine Einheit genannt ist (Name,
+//!    Cargo-Crate-Name oder relativer Pfad).
+//! 3. Je Einheit ein [`PlanNode`] (`kind = Analysis`, `read_scope = <dir>/**`),
+//!    dessen Abhängigkeiten die Kanten der Einheit sind —
+//!    [`UnitGraph::levels`] liefert genau diese Ordnung, Ebene 0 sind die
+//!    Blätter.
 //! 4. Je Ebene wird die Zelle des Clans [`RESEARCH_CLAN_ID`] der eingebauten
 //!    Organisation über [`CellPlan::from_cell`] aufgelöst; ihre Batches sind die
 //!    Startgruppen der Welle (siehe „Zell-gesteuerter Fan-out" unten).
@@ -30,7 +53,7 @@
 //! 7. Zum Schluss ein `Synthesis`-Knoten, der von allen Analyse-Knoten abhängt.
 //!
 //! # Zell-gesteuerter Fan-out
-//! Welche Knoten gemeinsam starten dürfen, steht nicht mehr hier, sondern in
+//! Welche Knoten gemeinsam starten dürfen, steht nicht hier, sondern in
 //! `harw-registry-defaults/agents/organization/default.toml`: die Zelle
 //! `research-wave` des Clans `research` trägt Muster, Barriere und
 //! Schreibtrennung. [`CellPlan::from_cell`] löst sie gegen den Plan der Ebene
@@ -39,9 +62,9 @@
 //! [`JoinSemantics`] der Welle. Die Batches laufen **nacheinander**, ihre
 //! Mitglieder nebenläufig — genau das bedeutet eine erzwungene Schreibtrennung.
 //!
-//! Deshalb tragen die Plan-Knoten den Clan im Namen (`research-<crate>`, siehe
-//! [`node_id`]): [`CellPlan::from_cell`] wählt Mitglieder über einen Glob gegen
-//! die `TaskId` **und** den `write_scope`; Analyse-Knoten haben keinen
+//! Deshalb tragen die Plan-Knoten den Clan im Namen (`research-<einheit>`,
+//! siehe [`node_id`]): [`CellPlan::from_cell`] wählt Mitglieder über einen Glob
+//! gegen die `TaskId` **und** den `write_scope`; Analyse-Knoten haben keinen
 //! `write_scope`, also entscheidet allein die `TaskId`.
 //!
 //! # Rückfall — `/analyze` darf daran nicht scheitern
@@ -50,7 +73,7 @@
 //! einen Fehler zu erzeugen: eine nicht ladbare Organisation, ein fehlender
 //! Clan, eine fehlende Zelle, ein Muster ohne Treffer, ein Auflösungsfehler und
 //! sogar eine Zelle, die nur einen *Teil* der Ebene auswählt, führen alle zu
-//! einer einzigen Welle mit allen Crates der Ebene in Graph-Reihenfolge
+//! einer einzigen Welle mit allen Einheiten der Ebene in Graph-Reihenfolge
 //! ([`wave_batches`]). Eine Zelle darf die Arbeit einer Ebene umsortieren und
 //! aufteilen — sie darf sie niemals verschlucken.
 //!
@@ -62,19 +85,14 @@
 //! trotzdem immer in Leaf-first-Reihenfolge **angelegt**, weil `AddNode` keine
 //! unbekannten Abhängigkeiten akzeptiert.
 //!
-//! # Ohne `Cargo.toml`
-//! Fehlt `<root>/Cargo.toml`, wird [`WorkspaceGraph::load`] gar nicht erst
-//! aufgerufen — [`synthesize_directory_graph`] baut stattdessen einen
-//! synthetischen Graphen: ein [`CrateNode`] je direktem Unterverzeichnis der
-//! Wurzel (versteckte Verzeichnisse und eine feste Rauschliste wie `target`
-//! oder `node_modules` ausgenommen), alle auf Ebene 0 ohne hergeleitete
-//! Abhängigkeitskanten — `bottom_up` wird dadurch zu einer einzigen Welle.
-//! Ohne qualifizierendes Unterverzeichnis entsteht genau ein Pseudo-Knoten für
-//! die Wurzel selbst. Das macht `/analyze` in jedem Nicht-Rust-Projekt
-//! nutzbar, statt am internen `CodeGraphError::ManifestMissing`
-//! durchzuschlagen. Existiert `Cargo.toml`, bleibt der bisherige
-//! [`WorkspaceGraph::load`]-Pfad unverändert, inklusive echter Fehler bei
-//! einem kaputten oder unvollständigen Cargo-Workspace.
+//! # Ohne erkanntes Projekt
+//! Findet der Explorer keine Einheit (oder scheitert er),
+//! baut [`synthesize_directory_graph`] einen Verzeichnis-Graphen: eine Einheit
+//! je direktem Unterverzeichnis der Wurzel (versteckte Verzeichnisse und eine
+//! feste Rauschliste wie `target` oder `node_modules` ausgenommen), alle auf
+//! Ebene 0 ohne Kanten — `bottom_up` wird dadurch zu einer einzigen Welle.
+//! Ohne qualifizierendes Unterverzeichnis entsteht genau eine Einheit für die
+//! Wurzel selbst.
 //!
 //! # Schlüsseltypen
 //! - [`AnalyzeArgs`] — Argument-Container mit Flag-Parsing auf der
@@ -87,11 +105,11 @@
 //!
 //! # Fehler
 //! - [`OpError::InvalidArguments`]: unbekanntes Flag, ungültiges
-//!   `--max-parallel`, zweiter Crate-Name.
+//!   `--max-parallel`, zweiter Einheiten-Name.
 //! - [`OpError::NotAvailable`]: kein Plan-Store (nur im Nicht-Dry-Run) oder
 //!   kein Agent-Spawner im Kontext.
-//! - [`OpError::Execution`]: der Workspace-Graph ist nicht ladbar, oder eine
-//!   Plan-Mutation wurde abgelehnt.
+//! - [`OpError::Execution`]: die Wurzel ist nicht lesbar, die genannte Einheit
+//!   existiert nicht, oder eine Plan-Mutation wurde abgelehnt.
 //!
 //! # Beispiel
 //! ```rust,no_run
@@ -102,15 +120,17 @@
 //! let args = AnalyzeArgs::from_raw_args(&["--dry-run".to_owned(), "harw-core".to_owned()])
 //!     .expect("gültige Flags");
 //! assert_eq!(args.dry_run, Some(true));
-//! assert_eq!(args.crate_name.as_deref(), Some("harw-core"));
+//! assert_eq!(args.unit_name(), Some("harw-core"));
 //! ```
 
+use std::collections::{BTreeSet, HashMap};
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use harw_code_graph::{CrateNode, WorkspaceGraph};
+use harw_code_graph::WorkspaceGraph;
 use harw_core::child_controller::JoinSemantics;
 use harw_core_bridge::{ChildReturnContract, fanout_children, parse_budget_hint};
+use harw_explorer::{ExplorerIndex, ExplorerOptions, ProjectKind, RelationKind};
 use harw_macros::operation;
 use harw_operations::require_service;
 use harw_operations::{FromRawArgs, OpContext, OpError, OpOutput};
@@ -138,7 +158,7 @@ use crate::explore::{READ_ONLY_REDUCER, child_payload, finding_from_value, persi
 /// Budget je Analyst-Kind einer Welle.
 ///
 /// Grammatik siehe [`parse_budget_hint`]. Großzügiger als der Einzel-Lauf in
-/// [`crate::explore`], weil ein Analyst ein ganzes Crate lesen muss.
+/// [`crate::explore`], weil ein Analyst eine ganze Einheit lesen muss.
 const ANALYST_BUDGET: &str = "90k_tokens,60_tool_calls,300s";
 
 /// Vorgabe für die Zahl gleichzeitiger Kinder je Welle.
@@ -159,8 +179,8 @@ const ANALYSIS_EXPECTED_OUTPUT: &str = "Ein ResearchFinding, dessen Schlussfolge
      Dateipfad und Zeilenbereich; alles Unbelegte gehört in unresolved_questions.";
 
 /// Stop-Bedingung eines Analyst-Kindes.
-const ANALYSIS_STOP_CONDITION: &str = "Alle fünf Punkte sind für dieses Crate beantwortet oder \
-     ausdrücklich als offen markiert. Kein Blick über die Crate-Grenze hinaus außer für die \
+const ANALYSIS_STOP_CONDITION: &str = "Alle fünf Punkte sind für diese Einheit beantwortet oder \
+     ausdrücklich als offen markiert. Kein Blick über die Grenze der Einheit hinaus außer für die \
      Konsumentenliste.";
 
 // ── Argumente ────────────────────────────────────────────────────────────────
@@ -173,8 +193,12 @@ const ANALYSIS_STOP_CONDITION: &str = "Alle fünf Punkte sind für dieses Crate 
 /// `/analyze --dry-run` sonst nur über einen Tool-Call erreichbar wäre.
 ///
 /// # Felder
-/// - `crate_name` (`Option<String>`): einzelnes Crate; ohne Angabe der ganze
-///   Workspace.
+/// - `crate_name` (`Option<String>`): einzelne Analyse-Einheit (Projektname,
+///   Cargo-Crate-Name oder relativer Pfad); ohne Angabe der ganze
+///   Arbeitsbereich. Der Feldname bleibt aus Kompatibilitätsgründen
+///   `crate_name` (JSON-Schema, Web-/Modell-Fläche); auf den JSON-Flächen wird
+///   zusätzlich `unit_name` angenommen. Intern immer über
+///   [`AnalyzeArgs::unit_name`] lesen.
 /// - `bottom_up` (`Option<bool>`): von den Blättern aufwärts (Vorgabe: `true`).
 /// - `dry_run` (`Option<bool>`): nur den Plan erzeugen, keine Kinder starten.
 /// - `max_parallel` (`Option<usize>`): Obergrenze gleichzeitiger Kinder je
@@ -184,8 +208,9 @@ const ANALYSIS_STOP_CONDITION: &str = "Alle fünf Punkte sind für dieses Crate 
 /// AP W4-04 — `/analyze`.
 #[derive(Debug, Default, serde::Deserialize, harw_macros::OpArgs)]
 pub struct AnalyzeArgs {
-    /// Einzelnes Crate; ohne Angabe der ganze Workspace.
-    #[serde(default)]
+    /// Einzelne Analyse-Einheit (Projektname, Crate-Name oder relativer Pfad);
+    /// ohne Angabe der ganze Arbeitsbereich. Auch als `unit_name` annehmbar.
+    #[serde(default, alias = "unit_name")]
     #[raw(first)]
     pub crate_name: Option<String>,
     /// Von den Blättern aufwärts (Standard: true).
@@ -199,13 +224,29 @@ pub struct AnalyzeArgs {
     pub max_parallel: Option<usize>,
 }
 
+impl AnalyzeArgs {
+    /// Liefert den Namen der gewählten Analyse-Einheit.
+    ///
+    /// # Beschreibung
+    /// Das serialisierte Feld heißt aus Kompatibilitätsgründen weiterhin
+    /// `crate_name`; gemeint ist aber jede Einheit, nicht nur ein Cargo-Crate.
+    ///
+    /// # Rückgabe
+    /// `Some(name)`, wenn eine Einheit genannt ist, sonst `None`.
+    #[must_use]
+    pub fn unit_name(&self) -> Option<&str> {
+        self.crate_name.as_deref()
+    }
+}
+
 impl FromRawArgs for AnalyzeArgs {
-    /// Parst Crate-Name und Flags aus der Command-Zeile.
+    /// Parst Einheiten-Name und Flags aus der Command-Zeile.
     ///
     /// # Beschreibung
     /// Erkannt werden `--dry-run` / `--no-dry-run`, `--bottom-up` /
     /// `--top-down` (alias `--no-bottom-up`) sowie `--max-parallel <n>` und
-    /// `--max-parallel=<n>`. Das erste flag-freie Token ist der Crate-Name.
+    /// `--max-parallel=<n>`. Das erste flag-freie Token ist der Name der
+    /// Analyse-Einheit.
     ///
     /// Ein unbekanntes Flag ist ein **Fehler**: still ignoriert würde
     /// `/analyze --dry-runn` einen echten Fan-out starten, den der Aufrufer
@@ -219,7 +260,7 @@ impl FromRawArgs for AnalyzeArgs {
     ///
     /// # Fehler
     /// - [`OpError::InvalidArguments`]: unbekanntes Flag, fehlender oder
-    ///   ungültiger `--max-parallel`-Wert, zweiter Crate-Name.
+    ///   ungültiger `--max-parallel`-Wert, zweiter Einheiten-Name.
     fn from_raw_args(tokens: &[String]) -> Result<Self, OpError> {
         let mut args = Self::default();
         let mut index = 0;
@@ -252,7 +293,7 @@ impl FromRawArgs for AnalyzeArgs {
                     } else {
                         return Err(OpError::InvalidArguments(format!(
                             "unerwartetes Argument '{other}'; /analyze nimmt höchstens einen \
-                             Crate-Namen"
+                             Einheiten-Namen"
                         )));
                     }
                 }
@@ -282,14 +323,14 @@ fn parse_max_parallel(raw: &str) -> Result<usize, OpError> {
     Ok(value)
 }
 
-// ── Graph ohne Cargo.toml ────────────────────────────────────────────────────
+// ── Einheiten-Graph ──────────────────────────────────────────────────────────
 
-/// Verzeichnisnamen, die nie als Pseudo-Crate gezählt werden.
+/// Verzeichnisnamen, die im Verzeichnis-Rückfall nie als Einheit zählen.
 ///
-/// Feste Ausschlussliste für gängige Build-/Abhängigkeits-Artefakte, die auch
-/// in einem Nicht-Rust-Projekt im Wurzelverzeichnis liegen können. Versteckte
-/// Verzeichnisse (führendes `.`, siehe [`synthesize_directory_graph`]) deckt
-/// diese Liste bewusst nicht ab — dafür reicht der Namenstest allein.
+/// Feste Ausschlussliste für gängige Build-/Abhängigkeits-Artefakte, die im
+/// Wurzelverzeichnis liegen können. Versteckte Verzeichnisse (führendes `.`,
+/// siehe [`synthesize_directory_graph`]) deckt diese Liste bewusst nicht ab —
+/// dafür reicht der Namenstest allein.
 const SYNTHETIC_EXCLUDED_DIRS: [&str; 6] = [
     "target",
     "node_modules",
@@ -299,36 +340,620 @@ const SYNTHETIC_EXCLUDED_DIRS: [&str; 6] = [
     "__pycache__",
 ];
 
-/// Baut einen [`WorkspaceGraph`] für ein Wurzelverzeichnis ohne `Cargo.toml`.
+/// Projektarten, die selbst eine Analyse-Einheit bilden, in Vorrang-Reihenfolge.
+///
+/// Die erste vorhandene Art einer Projektwurzel bestimmt Name und Etikett der
+/// Einheit. `CargoWorkspace` (Hülle) und `Git` (Repository-Grenze) fehlen
+/// bewusst: sie beschreiben Gruppierungen, keinen analysierbaren Inhalt.
+const UNIT_KIND_PRIORITY: [ProjectKind; 5] = [
+    ProjectKind::CargoCrate,
+    ProjectKind::Node,
+    ProjectKind::Python,
+    ProjectKind::Go,
+    ProjectKind::Documents,
+];
+
+/// Eine Analyse-Einheit: ein Projekt oder (im Rückfall) ein Verzeichnis.
 ///
 /// # Beschreibung
-/// Liest die direkten Unterverzeichnisse von `root` (nicht rekursiv);
-/// unterhalb liegende Verzeichnisse werden nicht betrachtet. Übersprungen
-/// werden Verzeichnisse mit führendem `.` (deckt `.git`, `.harw`, `.claude`,
-/// `.codex`, `.venv` einheitlich ab) sowie [`SYNTHETIC_EXCLUDED_DIRS`]. Für
-/// jedes verbleibende Unterverzeichnis entsteht ein synthetischer
-/// [`CrateNode`] auf Ebene 0 ohne hergeleitete Abhängigkeitskanten — ein
-/// ehrlicher Stand für ein Projekt ohne bekannte interne Abhängigkeiten.
-/// Gibt es kein qualifizierendes Unterverzeichnis (ein flaches Projekt, z. B.
-/// ein Ordner voller Markdown-Dateien), entsteht genau ein Pseudo-Crate für
-/// `root` selbst.
+/// Sprach- und ökosystemneutrale Entsprechung des früheren Crate-Knotens.
+/// `deps` enthält die **Namen** anderer Einheiten desselben Graphen, von denen
+/// diese Einheit abhängt; der Graph ist per Konstruktion azyklisch.
 ///
-/// # Argumente
-/// - `root` (`&Path`): die Workspace-Wurzel; muss als Verzeichnis lesbar
-///   sein.
+/// # Nebenläufigkeit
+/// Reiner Werttyp.
+#[derive(Debug, Clone)]
+struct AnalysisUnit {
+    /// Eindeutiger Anzeigename (Manifest-Name, sonst Ordnername; bei
+    /// Kollision um den relativen Pfad ergänzt).
+    name: String,
+    /// Erkannte Projektarten dieser Wurzel in [`UNIT_KIND_PRIORITY`]-Ordnung;
+    /// leer für eine reine Verzeichnis-Einheit.
+    kinds: Vec<ProjectKind>,
+    /// Pfad relativ zur Wurzel (leer = die Wurzel selbst).
+    rel: PathBuf,
+    /// Absolutes Verzeichnis der Einheit.
+    dir: PathBuf,
+    /// Manifest relativ zur Wurzel, falls vorhanden.
+    manifest: Option<PathBuf>,
+    /// `[package].name`, wenn die Einheit ein Cargo-Crate ist.
+    cargo_name: Option<String>,
+    /// Version aus der Cargo-Anreicherung, falls bekannt.
+    version: Option<String>,
+    /// Namen der Einheiten, von denen diese abhängt.
+    deps: Vec<String>,
+    /// Externe Abhängigkeiten aus der Cargo-Anreicherung.
+    external_deps: Vec<String>,
+    /// Ebene von unten: `0` für Blätter, sonst `1 + max(Ebene der deps)`.
+    level: u32,
+}
+
+impl AnalysisUnit {
+    /// Etikett der vorrangigen Projektart (`cargo-crate`, `node`, …) oder
+    /// `directory` für eine reine Verzeichnis-Einheit.
+    fn kind_label(&self) -> &'static str {
+        self.kinds.first().map_or("directory", |kind| kind.label())
+    }
+
+    /// Relativer Pfad für Anzeige und Prompt (`.` für die Wurzel).
+    fn rel_display(&self) -> String {
+        if self.rel.as_os_str().is_empty() {
+            ".".to_owned()
+        } else {
+            path_key(&self.rel)
+        }
+    }
+}
+
+/// Der Einheiten-Graph eines Arbeitsbereichs.
+///
+/// # Beschreibung
+/// Ersetzt den früheren Cargo-only [`WorkspaceGraph`] als Arbeitsstruktur von
+/// `/analyze`. Die Ebenen sind nach [`assign_levels`] in jeder Einheit
+/// gespeichert und mit ihren `deps` konsistent.
+#[derive(Debug, Clone)]
+struct UnitGraph {
+    /// Wurzel des Arbeitsbereichs.
+    root: PathBuf,
+    /// Alle Einheiten.
+    units: Vec<AnalysisUnit>,
+}
+
+impl UnitGraph {
+    /// Sucht eine Einheit anhand ihres Namens.
+    fn get(&self, name: &str) -> Option<&AnalysisUnit> {
+        self.units.iter().find(|unit| unit.name == name)
+    }
+
+    /// Sucht eine Einheit über Namen, Cargo-Crate-Namen oder relativen Pfad.
+    fn find(&self, query: &str) -> Option<&AnalysisUnit> {
+        let trimmed = query.trim().trim_end_matches('/');
+        let path_query = trimmed.strip_prefix("./").unwrap_or(trimmed);
+        self.get(query)
+            .or_else(|| {
+                self.units
+                    .iter()
+                    .find(|unit| unit.cargo_name.as_deref() == Some(query))
+            })
+            .or_else(|| {
+                self.units
+                    .iter()
+                    .find(|unit| unit.rel_display() == path_query)
+            })
+    }
+
+    /// Alle Einheiten, die `name` direkt (über `deps`) benutzen, nach Name
+    /// sortiert.
+    fn consumers_of(&self, name: &str) -> Vec<&AnalysisUnit> {
+        let mut consumers: Vec<&AnalysisUnit> = self
+            .units
+            .iter()
+            .filter(|unit| unit.deps.iter().any(|dep| dep == name))
+            .collect();
+        consumers.sort_by(|a, b| a.name.cmp(&b.name));
+        consumers
+    }
+
+    /// Einheiten, die verzeichnismäßig **innerhalb** von `unit` liegen und
+    /// eigenständig analysiert werden, nach Name sortiert.
+    fn nested_in(&self, unit: &AnalysisUnit) -> Vec<&AnalysisUnit> {
+        let mut nested: Vec<&AnalysisUnit> = self
+            .units
+            .iter()
+            .filter(|other| other.rel != unit.rel && other.rel.starts_with(&unit.rel))
+            .collect();
+        nested.sort_by(|a, b| a.name.cmp(&b.name));
+        nested
+    }
+
+    /// Teilgraph aus der Einheit `query` und allen transitiven Abhängigkeiten.
+    ///
+    /// # Errors
+    /// - [`OpError::Execution`]: keine Einheit passt auf `query`.
+    fn subgraph(&self, query: &str) -> Result<Self, OpError> {
+        let Some(start) = self.find(query) else {
+            let known: Vec<&str> = self.units.iter().map(|unit| unit.name.as_str()).collect();
+            return Err(OpError::Execution(format!(
+                "Teilgraph für '{query}' nicht bildbar: keine Einheit dieses Namens oder Pfads \
+                 (bekannt: {})",
+                known.join(", ")
+            )));
+        };
+        let mut included: BTreeSet<String> = BTreeSet::new();
+        let mut stack: Vec<String> = vec![start.name.clone()];
+        while let Some(current) = stack.pop() {
+            if !included.insert(current.clone()) {
+                continue;
+            }
+            if let Some(unit) = self.get(&current) {
+                stack.extend(
+                    unit.deps
+                        .iter()
+                        .filter(|dep| !included.contains(*dep))
+                        .cloned(),
+                );
+            }
+        }
+        let mut units: Vec<AnalysisUnit> = self
+            .units
+            .iter()
+            .filter(|unit| included.contains(&unit.name))
+            .cloned()
+            .collect();
+        assign_levels(&mut units);
+        Ok(Self {
+            root: self.root.clone(),
+            units,
+        })
+    }
+
+    /// Gruppiert alle Einheiten in Ebenen von unten (Index `0` = Blätter),
+    /// innerhalb einer Ebene nach Name sortiert.
+    fn levels(&self) -> Vec<Vec<&AnalysisUnit>> {
+        let Some(max_level) = self.units.iter().map(|unit| unit.level).max() else {
+            return Vec::new();
+        };
+        let mut levels: Vec<Vec<&AnalysisUnit>> = (0..=max_level).map(|_| Vec::new()).collect();
+        for unit in &self.units {
+            if let Some(bucket) = levels.get_mut(unit.level as usize) {
+                bucket.push(unit);
+            }
+        }
+        for bucket in &mut levels {
+            bucket.sort_by(|a, b| a.name.cmp(&b.name));
+        }
+        levels.retain(|bucket| !bucket.is_empty());
+        levels
+    }
+
+    /// Kompakte Textprojektion (`Ebene N: a, b`) für Prompts und Berichte.
+    fn render_levels(&self) -> String {
+        let mut out = String::new();
+        for (index, bucket) in self.levels().iter().enumerate() {
+            let names: Vec<&str> = bucket.iter().map(|unit| unit.name.as_str()).collect();
+            out.push_str(&format!("Ebene {index}: {}\n", names.join(", ")));
+        }
+        out
+    }
+}
+
+/// Berechnet die Ebenen aller Einheiten und hält `deps` konsistent.
+///
+/// # Beschreibung
+/// Unbekannte Abhängigkeitsnamen werden entfernt. Sollte trotz azyklischer
+/// Konstruktion ein Zyklus übrig sein, werden die offenen Kanten der ersten
+/// blockierten Einheit verworfen (protokolliert) — so passen gespeicherte
+/// Ebenen und `deps` immer zusammen, und `harw_plan` sieht nie eine Kante auf
+/// einen später angelegten Knoten.
+fn assign_levels(units: &mut [AnalysisUnit]) {
+    let index: HashMap<String, usize> = units
+        .iter()
+        .enumerate()
+        .map(|(position, unit)| (unit.name.clone(), position))
+        .collect();
+    for unit in units.iter_mut() {
+        unit.deps.retain(|dep| index.contains_key(dep));
+    }
+
+    let mut levels: Vec<Option<u32>> = vec![None; units.len()];
+    loop {
+        let mut progressed = false;
+        let mut pending = false;
+        for position in 0..units.len() {
+            if levels[position].is_some() {
+                continue;
+            }
+            let mut ready = true;
+            let mut max_dep: Option<u32> = None;
+            for dep in &units[position].deps {
+                match index.get(dep).and_then(|&other| levels[other]) {
+                    Some(level) => max_dep = Some(max_dep.map_or(level, |max| max.max(level))),
+                    None => {
+                        ready = false;
+                        break;
+                    }
+                }
+            }
+            if ready {
+                levels[position] = Some(max_dep.map_or(0, |max| max + 1));
+                progressed = true;
+            } else {
+                pending = true;
+            }
+        }
+        if !pending {
+            break;
+        }
+        if !progressed {
+            if let Some(blocked) = levels.iter().position(Option::is_none) {
+                tracing::warn!(
+                    unit = units[blocked].name.as_str(),
+                    "analyze.graph.cycle — offene Kanten verworfen"
+                );
+                let resolved: BTreeSet<String> = index
+                    .iter()
+                    .filter(|&(_, &other)| levels[other].is_some())
+                    .map(|(name, _)| name.clone())
+                    .collect();
+                units[blocked].deps.retain(|dep| resolved.contains(dep));
+            }
+        }
+    }
+    for (unit, level) in units.iter_mut().zip(levels) {
+        unit.level = level.unwrap_or(0);
+    }
+}
+
+/// Kanten-Sammler, der nur azyklische Kanten zulässt.
+///
+/// `deps[i]` sind die Indizes der Einheiten, von denen Einheit `i` abhängt.
+struct EdgeSet {
+    deps: Vec<BTreeSet<usize>>,
+    dropped: usize,
+}
+
+impl EdgeSet {
+    /// Leerer Sammler für `count` Einheiten.
+    fn new(count: usize) -> Self {
+        Self {
+            deps: vec![BTreeSet::new(); count],
+            dropped: 0,
+        }
+    }
+
+    /// `true`, wenn `target` von `start` aus über Kanten erreichbar ist.
+    fn reaches(&self, start: usize, target: usize) -> bool {
+        let mut visited = vec![false; self.deps.len()];
+        let mut stack = vec![start];
+        while let Some(current) = stack.pop() {
+            if current == target {
+                return true;
+            }
+            if visited.get(current).copied().unwrap_or(true) {
+                continue;
+            }
+            visited[current] = true;
+            if let Some(next) = self.deps.get(current) {
+                stack.extend(next.iter().copied());
+            }
+        }
+        false
+    }
+
+    /// Fügt `from → to` hinzu, sofern die Kante neu ist und keinen Zyklus
+    /// schließt; eine zyklusschließende Kante wird gezählt und verworfen.
+    fn add(&mut self, from: usize, to: usize) {
+        if from == to || from >= self.deps.len() || to >= self.deps.len() {
+            return;
+        }
+        if self.deps[from].contains(&to) {
+            return;
+        }
+        if self.reaches(to, from) {
+            self.dropped += 1;
+            return;
+        }
+        self.deps[from].insert(to);
+    }
+}
+
+/// Pfad als `/`-getrennte Zeichenkette (plattformunabhängig).
+fn path_key(path: &Path) -> String {
+    path.components()
+        .map(|component| component.as_os_str().to_string_lossy().into_owned())
+        .collect::<Vec<_>>()
+        .join("/")
+}
+
+/// Die innerste Einheit, deren Verzeichnis `path` enthält.
+fn innermost_unit(units: &[AnalysisUnit], path: &Path) -> Option<usize> {
+    units
+        .iter()
+        .enumerate()
+        .filter(|(_, unit)| path.starts_with(&unit.rel))
+        .max_by_key(|(_, unit)| unit.rel.components().count())
+        .map(|(position, _)| position)
+}
+
+/// Baut die Einheiten aus den Projekten eines Explorer-Index.
+///
+/// # Beschreibung
+/// Projekte werden nach Wurzel gruppiert. Eine Wurzel wird zur Einheit, wenn
+/// sie mindestens eine Art aus [`UNIT_KIND_PRIORITY`] trägt; ein
+/// `package.json` mit aufgelösten `workspaces`-Mitgliedern gilt dabei als
+/// Hülle (wie ein virtuelles `Cargo.toml`) und zählt nicht. Namen werden
+/// eindeutig gemacht — auch über [`node_id`], damit keine zwei Einheiten auf
+/// denselben Plan-Knoten fallen.
+fn units_from_explorer(root: &Path, index: &ExplorerIndex) -> Vec<AnalysisUnit> {
+    let mut roots: Vec<&Path> = index
+        .projects
+        .iter()
+        .map(|project| project.root.as_path())
+        .collect();
+    roots.sort();
+    roots.dedup();
+
+    let mut units: Vec<AnalysisUnit> = Vec::new();
+    let mut taken: BTreeSet<String> = BTreeSet::new();
+    for rel in roots {
+        let at_root: Vec<&harw_explorer::Project> = index
+            .projects
+            .iter()
+            .filter(|project| project.root.as_path() == rel)
+            .filter(|project| project.kind != ProjectKind::Node || project.members.is_empty())
+            .collect();
+        let kinds: Vec<ProjectKind> = UNIT_KIND_PRIORITY
+            .iter()
+            .copied()
+            .filter(|kind| at_root.iter().any(|project| project.kind == *kind))
+            .collect();
+        let Some(primary_kind) = kinds.first().copied() else {
+            continue;
+        };
+        let Some(primary) = at_root.iter().find(|project| project.kind == primary_kind) else {
+            continue;
+        };
+        let cargo_name = at_root
+            .iter()
+            .find(|project| project.kind == ProjectKind::CargoCrate)
+            .map(|project| project.name.clone());
+
+        let mut name = primary.name.clone();
+        if taken.contains(&node_id(&name)) {
+            name = format!("{}@{}", primary.name, path_key(rel));
+        }
+        let mut suffix = 2_usize;
+        while taken.contains(&node_id(&name)) {
+            name = format!("{}@{}-{suffix}", primary.name, path_key(rel));
+            suffix += 1;
+        }
+        taken.insert(node_id(&name));
+
+        units.push(AnalysisUnit {
+            name,
+            kinds,
+            rel: rel.to_path_buf(),
+            dir: if rel.as_os_str().is_empty() {
+                root.to_path_buf()
+            } else {
+                root.join(rel)
+            },
+            manifest: primary.manifest.clone(),
+            cargo_name,
+            version: None,
+            deps: Vec::new(),
+            external_deps: Vec::new(),
+            level: 0,
+        });
+    }
+    units
+}
+
+/// Reichert Cargo-Einheiten über [`WorkspaceGraph`] an.
+///
+/// # Beschreibung
+/// Lädt je erkanntem Cargo-Workspace den [`WorkspaceGraph`] und überträgt
+/// Version und externe Abhängigkeiten auf die passenden Einheiten (gleicher
+/// Crate-Name, Verzeichnis unterhalb des Workspace). Die internen
+/// `[dependencies]` gehen als Kanten in `edges`.
 ///
 /// # Rückgabe
-/// Ein [`WorkspaceGraph`] mit mindestens einem Pseudo-[`CrateNode`].
+/// `(angereichert, bericht)`: je Einheit, ob sie aus einem erfolgreich
+/// geladenen Workspace stammt, und je Workspace ein JSON-Eintrag mit Anzahl
+/// oder Fehler. Ein Ladefehler ist **kein** Fehler von `/analyze`.
+fn enrich_with_cargo(
+    root: &Path,
+    index: &ExplorerIndex,
+    units: &mut [AnalysisUnit],
+    edges: &mut EdgeSet,
+) -> (Vec<bool>, Vec<Value>) {
+    let mut enriched = vec![false; units.len()];
+    let mut report: Vec<Value> = Vec::new();
+    for workspace in index
+        .projects
+        .iter()
+        .filter(|project| project.kind == ProjectKind::CargoWorkspace)
+    {
+        let ws_dir = if workspace.root.as_os_str().is_empty() {
+            root.to_path_buf()
+        } else {
+            root.join(&workspace.root)
+        };
+        let ws_label = if workspace.root.as_os_str().is_empty() {
+            ".".to_owned()
+        } else {
+            path_key(&workspace.root)
+        };
+        let graph = match WorkspaceGraph::load(&ws_dir) {
+            Ok(graph) => graph,
+            Err(error) => {
+                tracing::warn!(
+                    workspace = ws_label.as_str(),
+                    error = %error,
+                    "analyze.cargo_enrichment.failed"
+                );
+                report.push(json!({ "workspace": ws_label, "error": error.to_string() }));
+                continue;
+            }
+        };
+        let mut matched = 0_usize;
+        for crate_node in &graph.crates {
+            let Some(position) = cargo_unit(units, &ws_dir, &crate_node.name) else {
+                continue;
+            };
+            matched += 1;
+            enriched[position] = true;
+            if crate_node.version != "0.0.0" {
+                units[position].version = Some(crate_node.version.clone());
+            }
+            units[position].external_deps = crate_node.external_deps.clone();
+            for dep in &crate_node.deps {
+                if let Some(target) = cargo_unit(units, &ws_dir, dep) {
+                    edges.add(position, target);
+                }
+            }
+        }
+        report.push(json!({ "workspace": ws_label, "crates": matched }));
+    }
+    (enriched, report)
+}
+
+/// Index der Cargo-Einheit `crate_name` unterhalb von `ws_dir`.
+fn cargo_unit(units: &[AnalysisUnit], ws_dir: &Path, crate_name: &str) -> Option<usize> {
+    units.iter().position(|unit| {
+        unit.cargo_name.as_deref() == Some(crate_name) && unit.dir.starts_with(ws_dir)
+    })
+}
+
+/// Baut den Einheiten-Graphen aus einem Explorer-Index.
+///
+/// # Beschreibung
+/// Kanten in fester Reihenfolge, jeweils nur azyklisch ([`EdgeSet::add`]):
+/// 1. Cargo-Anreicherung ([`enrich_with_cargo`]),
+/// 2. Explorer-Pfad- und Namensabhängigkeiten — zwischen zwei angereicherten
+///    Cargo-Einheiten übersprungen, weil der [`WorkspaceGraph`] dort präziser
+///    ist (keine Dev-Abhängigkeiten),
+/// 3. Dokument-Links zwischen verschiedenen Einheiten.
+///
+/// Endpunkte einer Relation werden auf die innerste enthaltende Einheit
+/// abgebildet; Mitgliedschaft und Verschachtelung sind Enthaltensein, keine
+/// Abhängigkeit, und erzeugen keine Kante.
+///
+/// # Rückgabe
+/// Graph plus JSON-Beschreibung seiner Herkunft; `None`, wenn der Index keine
+/// einzige Einheit ergibt.
+fn unit_graph_from_explorer(root: &Path, index: &ExplorerIndex) -> Option<(UnitGraph, Value)> {
+    let mut units = units_from_explorer(root, index);
+    if units.is_empty() {
+        return None;
+    }
+    let mut edges = EdgeSet::new(units.len());
+    let (enriched, cargo_report) = enrich_with_cargo(root, index, &mut units, &mut edges);
+
+    let dependency_kinds = [RelationKind::PathDependency, RelationKind::CrateDependency];
+    let doc_kinds = [RelationKind::DocLink];
+    for pass in [&dependency_kinds[..], &doc_kinds[..]] {
+        for relation in index
+            .relations
+            .iter()
+            .filter(|relation| pass.contains(&relation.kind))
+        {
+            let (Some(from), Some(to)) = (
+                innermost_unit(&units, &relation.from),
+                innermost_unit(&units, &relation.to),
+            ) else {
+                continue;
+            };
+            if relation.kind != RelationKind::DocLink && enriched[from] && enriched[to] {
+                continue;
+            }
+            edges.add(from, to);
+        }
+    }
+
+    let names: Vec<String> = units.iter().map(|unit| unit.name.clone()).collect();
+    for (unit, deps) in units.iter_mut().zip(&edges.deps) {
+        unit.deps = deps
+            .iter()
+            .filter_map(|&target| names.get(target).cloned())
+            .collect();
+    }
+    assign_levels(&mut units);
+
+    let info = json!({
+        "source": "explorer",
+        "projects": index.projects.len(),
+        "relations": index.relations.len(),
+        "truncated": index.truncated,
+        "dropped_edges": edges.dropped,
+        "cargo_enrichment": cargo_report,
+    });
+    Some((
+        UnitGraph {
+            root: root.to_path_buf(),
+            units,
+        },
+        info,
+    ))
+}
+
+/// Baut den Einheiten-Graphen der Wurzel: Explorer, sonst Verzeichnis-Rückfall.
+///
+/// # Beschreibung
+/// Läuft [`ExplorerIndex::build`] (unter Beachtung von `.gitignore`) und leitet
+/// daraus über [`unit_graph_from_explorer`] den Graphen ab. Scheitert der
+/// Explorer oder findet er keine Einheit, greift
+/// [`synthesize_directory_graph`].
+///
+/// # Rückgabe
+/// Graph plus JSON-Beschreibung seiner Herkunft (`graph` im Bericht).
+///
+/// # Errors
+/// - [`OpError::Execution`]: auch der Verzeichnis-Rückfall kann die Wurzel
+///   nicht lesen.
+fn build_unit_graph(root: &Path) -> Result<(UnitGraph, Value), OpError> {
+    let explorer_error = match ExplorerIndex::build(root, &ExplorerOptions::default()) {
+        Ok(index) => match unit_graph_from_explorer(root, &index) {
+            Some(result) => return Ok(result),
+            None => None,
+        },
+        Err(error) => {
+            tracing::warn!(error = %error, "analyze.explorer.failed — Verzeichnis-Rückfall");
+            Some(error.to_string())
+        }
+    };
+    let graph = synthesize_directory_graph(root)?;
+    Ok((
+        graph,
+        json!({ "source": "directories", "explorer_error": explorer_error }),
+    ))
+}
+
+/// Baut einen Verzeichnis-Graphen für eine Wurzel ohne erkanntes Projekt.
+///
+/// # Beschreibung
+/// Liest die direkten Unterverzeichnisse von `root` (nicht rekursiv).
+/// Übersprungen werden Verzeichnisse mit führendem `.` (deckt `.git`, `.harw`,
+/// `.claude`, `.codex`, `.venv` einheitlich ab) sowie
+/// [`SYNTHETIC_EXCLUDED_DIRS`]. Für jedes verbleibende Unterverzeichnis
+/// entsteht eine Verzeichnis-Einheit auf Ebene 0 ohne Kanten. Gibt es kein
+/// qualifizierendes Unterverzeichnis (z. B. ein Ordner mit wenigen losen
+/// Dateien), entsteht genau eine Einheit für `root` selbst.
+///
+/// # Argumente
+/// - `root` (`&Path`): die Wurzel; muss als Verzeichnis lesbar sein.
+///
+/// # Rückgabe
+/// Ein [`UnitGraph`] mit mindestens einer Einheit.
 ///
 /// # Errors
 /// - [`OpError::Execution`]: `root` ist nicht als Verzeichnis lesbar, oder
 ///   ein einzelner Verzeichniseintrag ist nicht auflösbar. Kein Panic in
 ///   beiden Fällen.
-fn synthesize_directory_graph(root: &Path) -> Result<WorkspaceGraph, OpError> {
+fn synthesize_directory_graph(root: &Path) -> Result<UnitGraph, OpError> {
     let entries = fs::read_dir(root).map_err(|error| {
         OpError::Execution(format!(
-            "Verzeichnis '{}' ist ohne 'Cargo.toml' auch nicht als einfaches \
-             Verzeichnis lesbar: {error}",
+            "Verzeichnis '{}' ist nicht als Verzeichnis lesbar: {error}",
             root.display()
         ))
     })?;
@@ -355,87 +980,108 @@ fn synthesize_directory_graph(root: &Path) -> Result<WorkspaceGraph, OpError> {
     }
     subdirs.sort();
 
-    let crates: Vec<CrateNode> = if subdirs.is_empty() {
-        vec![pseudo_crate_node(root.to_path_buf())]
+    let units: Vec<AnalysisUnit> = if subdirs.is_empty() {
+        vec![directory_unit(root, root.to_path_buf())]
     } else {
-        subdirs.into_iter().map(pseudo_crate_node).collect()
+        subdirs
+            .into_iter()
+            .map(|dir| directory_unit(root, dir))
+            .collect()
     };
 
-    Ok(WorkspaceGraph {
+    Ok(UnitGraph {
         root: root.to_path_buf(),
-        crates,
+        units,
     })
 }
 
-/// Baut einen einzelnen Pseudo-[`CrateNode`] für [`synthesize_directory_graph`].
+/// Baut eine einzelne Verzeichnis-Einheit für [`synthesize_directory_graph`].
 ///
 /// # Beschreibung
 /// `name` ist der Basisname von `dir`, Rückfall `"project"`, falls er nicht
-/// ermittelbar ist (z. B. Wurzelpfad `/`). `manifest_path` bleibt bewusst
-/// leer — das markiert den Knoten als synthetisch, ausgewertet in
-/// [`analysis_question`]. `deps`/`dev_deps`/`build_deps`/`external_deps`
-/// bleiben leer und `level` auf `0`: ohne geparste Manifeste sind keine
-/// Abhängigkeiten bekannt.
-fn pseudo_crate_node(dir: PathBuf) -> CrateNode {
+/// ermittelbar ist (z. B. Wurzelpfad `/`). `kinds` bleibt leer — das markiert
+/// die Einheit als reines Verzeichnis, ausgewertet in [`analysis_question`].
+fn directory_unit(root: &Path, dir: PathBuf) -> AnalysisUnit {
     let name = dir
         .file_name()
         .and_then(|name| name.to_str())
         .map(str::to_owned)
         .unwrap_or_else(|| "project".to_owned());
-    CrateNode {
+    let rel = dir
+        .strip_prefix(root)
+        .map(Path::to_path_buf)
+        .unwrap_or_default();
+    AnalysisUnit {
         name,
-        version: "0.0.0".to_owned(),
-        manifest_path: PathBuf::new(),
+        kinds: Vec::new(),
+        rel,
         dir,
+        manifest: None,
+        cargo_name: None,
+        version: None,
         deps: Vec::new(),
-        dev_deps: Vec::new(),
-        build_deps: Vec::new(),
         external_deps: Vec::new(),
-        is_leaf: true,
         level: 0,
     }
 }
 
 // ── Plan-Bausteine ───────────────────────────────────────────────────────────
 
-/// Bildet den Plan-Knoten-Bezeichner eines Crates.
+/// Bildet den Plan-Knoten-Bezeichner einer Einheit.
 ///
 /// # Beschreibung
-/// Der Bezeichner trägt den Clan, dem der Knoten gehört: `research-<crate>`.
+/// Der Bezeichner trägt den Clan, dem der Knoten gehört: `research-<einheit>`.
 /// Das ist keine Kosmetik, sondern die Bedingung dafür, dass die Zelle des
 /// Research-Clans ihn überhaupt finden kann — `CellPlan::from_cell` wählt
 /// Mitglieder über einen Glob gegen die `TaskId` und den `write_scope`, und ein
 /// Analyse-Knoten hat keinen `write_scope`. Der Präfix kommt deshalb aus
 /// [`RESEARCH_CLAN_ID`] und nicht aus einem Literal: ändert sich die Clan-ID der
 /// eingebauten Organisation, ändern sich die Knotennamen mit.
-fn node_id(crate_name: &str) -> String {
-    format!("{RESEARCH_CLAN_ID}-{crate_name}")
+///
+/// Einheiten-Namen sind nicht mehr auf Crate-Namen beschränkt (`@scope/pkg`,
+/// Pfade, Leerzeichen); jedes Zeichen außer ASCII-Alphanumerik, `-`, `_` und
+/// `.` wird deshalb zu `-`, damit kein `/` den Glob der Zelle bricht. Für
+/// Crate-Namen ist die Abbildung die Identität.
+fn node_id(unit_name: &str) -> String {
+    let slug: String = unit_name
+        .chars()
+        .map(|character| {
+            if character.is_ascii_alphanumeric() || matches!(character, '-' | '_' | '.') {
+                character
+            } else {
+                '-'
+            }
+        })
+        .collect();
+    format!("{RESEARCH_CLAN_ID}-{slug}")
 }
 
-/// Bildet den Lesebereich eines Crates relativ zur Workspace-Wurzel.
+/// Bildet den Lesebereich einer Einheit relativ zur Wurzel.
 ///
-/// Fällt auf den Crate-Namen zurück, wenn das Verzeichnis nicht unterhalb der
-/// Wurzel liegt — dann ist der Name die einzige Kennung, die der Knoten hat.
-fn read_scope_for(root: &Path, crate_node: &CrateNode) -> String {
-    match crate_node.dir.strip_prefix(root) {
-        Ok(relative) if !relative.as_os_str().is_empty() => format!("{}/**", relative.display()),
-        _ => format!("{}/**", crate_node.name),
+/// Die Wurzel-Einheit selbst liest `**`. Fällt auf den Namen zurück, wenn das
+/// Verzeichnis nicht unterhalb der Wurzel liegt — dann ist der Name die
+/// einzige Kennung, die der Knoten hat.
+fn read_scope_for(root: &Path, unit: &AnalysisUnit) -> String {
+    match unit.dir.strip_prefix(root) {
+        Ok(relative) if relative.as_os_str().is_empty() => "**".to_owned(),
+        Ok(relative) => format!("{}/**", path_key(relative)),
+        Err(_) => format!("{}/**", unit.name),
     }
 }
 
-/// Baut den `Analysis`-Knoten eines Crates.
+/// Baut den `Analysis`-Knoten einer Einheit.
 ///
 /// `created_at`/`updated_at` werden vom Plan-Store überschrieben (Design-Doc
 /// §7); die hier gesetzten Werte sind nur Platzhalter für den Typ.
-fn analysis_node(root: &Path, crate_node: &CrateNode, dependencies: Vec<TaskId>) -> PlanNode {
+fn analysis_node(root: &Path, unit: &AnalysisUnit, dependencies: Vec<TaskId>) -> PlanNode {
     let now = offset_from_timestamp(jiff::Timestamp::now());
     PlanNode {
-        id: TaskId::new(node_id(&crate_node.name)),
-        objective: format!("Bottom-up-Analyse von {}", crate_node.name),
+        id: TaskId::new(node_id(&unit.name)),
+        objective: format!("Bottom-up-Analyse von {}", unit.name),
         dependencies,
         input_contracts: Vec::new(),
         output_contracts: Vec::new(),
-        read_scope: vec![PathOrSymbol::new(read_scope_for(root, crate_node))],
+        read_scope: vec![PathOrSymbol::new(read_scope_for(root, unit))],
         write_scope: Vec::new(),
         forbidden_scope: Vec::new(),
         acceptance_criteria: Vec::new(),
@@ -443,7 +1089,7 @@ fn analysis_node(root: &Path, crate_node: &CrateNode, dependencies: Vec<TaskId>)
         status: PlanNodeStatus::Draft,
         evidence: Vec::new(),
         kind: PlanNodeKind::Analysis,
-        wave: Some(crate_node.level),
+        wave: Some(unit.level),
         assignment: None,
         parent: None,
         created_at: now,
@@ -456,7 +1102,7 @@ fn synthesis_node(dependencies: Vec<TaskId>) -> PlanNode {
     let now = offset_from_timestamp(jiff::Timestamp::now());
     PlanNode {
         id: TaskId::new(SYNTHESIS_NODE_ID),
-        objective: "Verdichtung der Crate-Analysen zu einem Workspace-Bild".to_owned(),
+        objective: "Verdichtung der Einheiten-Analysen zu einem Gesamtbild".to_owned(),
         dependencies,
         input_contracts: Vec::new(),
         output_contracts: Vec::new(),
@@ -476,67 +1122,209 @@ fn synthesis_node(dependencies: Vec<TaskId>) -> PlanNode {
     }
 }
 
-/// Baut die gebundene Frage an das Analyst-Kind eines Crates.
+/// Sprachspezifische Hinweise für den Analyse-Prompt.
+///
+/// Jede Angabe ist ein kurzer Einschub, den [`analysis_question`] in die
+/// sprachneutral formulierten fünf Punkte einsetzt.
+struct LanguageHints {
+    /// Sprache/Ökosystem für die Anzeige.
+    language: &'static str,
+    /// Was hier als öffentliche Oberfläche zählt.
+    api: &'static str,
+    /// Sprachübliche Platzhalter- und Stub-Marker.
+    markers: &'static str,
+    /// Sprachübliche Doku-Kommentare.
+    docs: &'static str,
+}
+
+/// Liefert die Hinweise zu einer Projektart; `None` für Dokumentsammlungen
+/// und Arten ohne eigene Sprache.
+fn language_hints(kind: ProjectKind) -> Option<LanguageHints> {
+    match kind {
+        ProjectKind::CargoCrate | ProjectKind::CargoWorkspace => Some(LanguageHints {
+            language: "Rust",
+            api: "jedes `pub`-Item",
+            markers: "`todo!()`, `unimplemented!()`",
+            docs: "`//!`/`///`",
+        }),
+        ProjectKind::Node => Some(LanguageHints {
+            language: "JavaScript/TypeScript",
+            api: "jede `export`-Deklaration sowie die Einstiegspunkte aus `package.json` \
+                  (`main`, `exports`, `bin`)",
+            markers: "`throw new Error(\"not implemented\")` und ähnliche Platzhalter-Würfe",
+            docs: "JSDoc/TSDoc `/** … */`",
+        }),
+        ProjectKind::Python => Some(LanguageHints {
+            language: "Python",
+            api: "jeder Name auf Modulebene ohne führenden Unterstrich bzw. laut `__all__`, \
+                  sowie Kommandozeilen-Einstiegspunkte",
+            markers: "`raise NotImplementedError`, Rümpfe aus nur `pass` oder `...`",
+            docs: "Docstrings",
+        }),
+        ProjectKind::Go => Some(LanguageHints {
+            language: "Go",
+            api: "jeder exportierte (großgeschriebene) Bezeichner",
+            markers: "`panic(\"not implemented\")` und ähnliche Platzhalter",
+            docs: "Kommentare direkt vor Deklarationen und `doc.go`",
+        }),
+        ProjectKind::Git | ProjectKind::Documents => None,
+    }
+}
+
+/// Baut die gebundene Frage an das Analyst-Kind einer Einheit.
 ///
 /// # Beschreibung
 /// Die Frage ist absichtlich nummeriert und abschließend: das Kind soll nicht
-/// „das Crate anschauen", sondern fünf benannte Dinge liefern. Der Scope
-/// begrenzt es auf das Crate-Verzeichnis; die Konsumentenliste steht schon in
-/// der Frage, damit das Kind sie nicht selbst erlaufen muss.
+/// „die Einheit anschauen", sondern fünf benannte Dinge liefern. Der Text ist
+/// sprachneutral; die sprachüblichen Begriffe (öffentliche Oberfläche,
+/// Stub-Marker, Doku-Kommentare) kommen aus [`language_hints`] der erkannten
+/// Projektarten, für reine Verzeichnisse aus einer allgemeinen Aufzählung. Eine
+/// Dokumentsammlung bekommt Punkte, die auf Dokumente passen. Der Scope
+/// begrenzt das Kind auf das Verzeichnis der Einheit; eigenständig analysierte
+/// verschachtelte Einheiten werden ausdrücklich ausgenommen, und die
+/// Konsumentenliste steht schon in der Frage.
 fn analysis_question(
     root: &Path,
-    crate_node: &CrateNode,
-    consumers: &[&CrateNode],
+    unit: &AnalysisUnit,
+    consumers: &[&AnalysisUnit],
+    nested: &[&AnalysisUnit],
 ) -> ResearchQuestion {
-    let consumer_names: Vec<&str> = consumers.iter().map(|node| node.name.as_str()).collect();
+    let consumer_names: Vec<&str> = consumers.iter().map(|other| other.name.as_str()).collect();
     let consumer_hint = if consumer_names.is_empty() {
-        "Keine Workspace-Crate konsumiert es (Stand Graph).".to_owned()
+        "Keine andere Einheit des Arbeitsbereichs benutzt sie (Stand Graph).".to_owned()
     } else {
         format!(
-            "Laut Graph konsumieren es: {}. Prüfe für jedes, welche Symbole es tatsächlich \
-             benutzt.",
+            "Laut Graph benutzen sie: {}. Prüfe für jede, was sie tatsächlich davon verwendet.",
             consumer_names.join(", ")
         )
     };
-    // Pseudo-Crates aus `synthesize_directory_graph` tragen keine
-    // `manifest_path` — dann ist "Verzeichnis" die ehrliche Bezeichnung.
-    let noun = if crate_node.manifest_path.as_os_str().is_empty() {
-        "Verzeichnis"
+    let nested_hint = if nested.is_empty() {
+        String::new()
     } else {
-        "Crate"
+        let entries: Vec<String> = nested
+            .iter()
+            .map(|other| format!("`{}` ({})", other.rel_display(), other.name))
+            .collect();
+        format!(
+            "Verschachtelte Einheiten werden eigenständig analysiert und gehören nicht zu \
+             dieser Analyse: {}.\n",
+            entries.join(", ")
+        )
+    };
+
+    let hints: Vec<LanguageHints> = unit
+        .kinds
+        .iter()
+        .copied()
+        .filter_map(language_hints)
+        .collect();
+    let is_documents = hints.is_empty() && unit.kinds.contains(&ProjectKind::Documents);
+    let description = match unit.kinds.first() {
+        Some(_) => {
+            let labels: Vec<&str> = unit.kinds.iter().map(|kind| kind.label()).collect();
+            format!(
+                "Einheit `{}` (Projektart {})",
+                unit.name,
+                labels.join(" + ")
+            )
+        }
+        None => format!("Verzeichnis `{}`", unit.name),
+    };
+    let version = unit
+        .version
+        .as_deref()
+        .map(|version| format!("Version {version}, "))
+        .unwrap_or_default();
+    let manifest = unit
+        .manifest
+        .as_deref()
+        .map(|manifest| format!("Manifest `{}`, ", path_key(manifest)))
+        .unwrap_or_default();
+    let external = if unit.external_deps.is_empty() {
+        String::new()
+    } else {
+        format!(
+            "Externe Abhängigkeiten laut Manifest: {}.\n",
+            unit.external_deps.join(", ")
+        )
+    };
+    let header = format!(
+        "Analysiere {description} (Pfad `{path}`, {manifest}{version}Ebene {level}) vollständig \
+         und liefere genau diese fünf Punkte:\n{external}",
+        path = unit.rel_display(),
+        level = unit.level,
+    );
+
+    let points = if is_documents {
+        format!(
+            "1. Inhalt: jedes Dokument mit Titel, Zweck und Kernaussagen, gruppiert nach \
+                Unterordner.\n\
+             2. Konsumenten: welche anderen Einheiten auf diese Dokumente verweisen und wofür. \
+                {consumer_hint}\n\
+             3. Lücken: jedes `TODO`, `FIXME`, `TBD`, jeder leere oder als Platzhalter \
+                markierte Abschnitt.\n\
+             4. Querverweise: welche Dokumente aufeinander verweisen und welche Links ins \
+                Leere zeigen.\n\
+             5. Widersprüche: jede Stelle, an der zwei Dokumente (oder ein Dokument und der \
+                Stand des Arbeitsbereichs) einander widersprechen.\n"
+        )
+    } else {
+        let (api, markers, docs) = if hints.is_empty() {
+            (
+                "alles, was von außen benutzt werden soll — öffentliche bzw. exportierte \
+                 Symbole in der jeweiligen Sprache, Einstiegspunkte, Kommandos, Schnittstellen"
+                    .to_owned(),
+                "sprachübliche Platzhalter (z. B. `todo!()`, `raise NotImplementedError`, \
+                 `throw new Error(\"not implemented\")`, `panic(\"not implemented\")`)"
+                    .to_owned(),
+                "Doku-Kommentare/Docstrings".to_owned(),
+            )
+        } else {
+            let api: Vec<String> = hints
+                .iter()
+                .map(|hint| format!("{}: {}", hint.language, hint.api))
+                .collect();
+            let markers: Vec<String> = hints
+                .iter()
+                .map(|hint| format!("{}: {}", hint.language, hint.markers))
+                .collect();
+            let docs: Vec<String> = hints
+                .iter()
+                .map(|hint| format!("{}: {}", hint.language, hint.docs))
+                .collect();
+            (api.join("; "), markers.join("; "), docs.join("; "))
+        };
+        format!(
+            "1. Öffentliche Oberfläche ({api}) mit Signatur bzw. Fundstelle, gruppiert nach \
+                Modul oder Datei, und wofür sie da ist.\n\
+             2. Konsumenten: welche anderen Einheiten des Arbeitsbereichs diese benutzen und \
+                was sie davon verwenden. {consumer_hint}\n\
+             3. Stubs und Lücken: jedes `TODO`, `FIXME`, `XXX`, `HACK`, jeder Platzhalter \
+                ({markers}), jede Funktion, die einen Platzhalterwert liefert, und jeder \
+                Fehlerfall, der nie ausgelöst wird.\n\
+             4. Testabdeckung: welche öffentlichen Teile haben Tests, welche nicht, und welche \
+                Tests prüfen nur, dass nichts abstürzt.\n\
+             5. Abweichungen zwischen Doku und Verhalten: jede Stelle, an der Dokumentation \
+                ({docs}; README und weitere Markdown-Dateien) etwas behauptet, das der Code \
+                nicht tut.\n"
+        )
     };
 
     ResearchQuestion {
-        id: QuestionId::new(node_id(&crate_node.name)),
+        id: QuestionId::new(node_id(&unit.name)),
         question: format!(
-            "Analysiere das {noun} `{name}` (Version {version}, Ebene {level}) vollständig und \
-             liefere genau diese fünf Punkte:\n\
-             1. Öffentliche API: jedes `pub`-Item mit Signatur, gruppiert nach Modul, und wofür \
-                es da ist.\n\
-             2. Konsumenten: welche Workspace-Crates dieses Crate benutzen und welche Symbole \
-                sie davon ziehen. {consumer_hint}\n\
-             3. Stubs und Lücken: jedes `todo!()`, `unimplemented!()`, `TODO`, `FIXME`, jede \
-                Funktion, die einen Platzhalterwert liefert, und jede Fehlervariante, die nie \
-                erzeugt wird.\n\
-             4. Testabdeckung: welche öffentlichen Funktionen haben Tests, welche nicht, und \
-                welche Tests prüfen nur, dass nichts panickt.\n\
-             5. Abweichungen zwischen Doku und Verhalten: jede Stelle, an der `//!`- oder \
-                `///`-Dokumentation etwas behauptet, das der Code nicht tut.\n\
-             Belege jede Aussage mit Dateipfad und Zeilenbereich.",
-            name = crate_node.name,
-            version = crate_node.version,
-            level = crate_node.level,
+            "{header}{points}{nested_hint}Belege jede Aussage mit Dateipfad und Zeilenbereich."
         ),
         scope: QuestionScope {
-            paths: vec![read_scope_for(root, crate_node)],
-            crates: vec![crate_node.name.clone()],
+            paths: vec![read_scope_for(root, unit)],
+            crates: unit.cargo_name.iter().cloned().collect(),
             urls: Vec::new(),
             sources: vec![SourceClass::LocalSource],
         },
         expected_output: ANALYSIS_EXPECTED_OUTPUT.to_owned(),
         freshness: Freshness::AnyTime,
         stop_condition: ANALYSIS_STOP_CONDITION.to_owned(),
-        owner_task: Some(node_id(&crate_node.name)),
+        owner_task: Some(node_id(&unit.name)),
     }
 }
 
@@ -687,34 +1475,32 @@ fn reconcile_proposals(
 /// ([`wave_batches`]).
 fn wave_json(
     level: usize,
-    crates: &[&CrateNode],
+    units: &[&AnalysisUnit],
     dependencies_enabled: bool,
-    batches: &[Vec<&CrateNode>],
+    batches: &[Vec<&AnalysisUnit>],
 ) -> Value {
-    let nodes: Vec<Value> = crates
+    let nodes: Vec<Value> = units
         .iter()
-        .map(|crate_node| {
+        .map(|unit| {
             let dependencies: Vec<String> = if dependencies_enabled {
-                crate_node.deps.iter().map(|dep| node_id(dep)).collect()
+                unit.deps.iter().map(|dep| node_id(dep)).collect()
             } else {
                 Vec::new()
             };
             json!({
-                "id": node_id(&crate_node.name),
-                "crate": crate_node.name,
-                "level": crate_node.level,
+                "id": node_id(&unit.name),
+                "crate": unit.name,
+                "unit": unit.name,
+                "kind": unit.kind_label(),
+                "path": unit.rel_display(),
+                "level": unit.level,
                 "dependencies": dependencies,
             })
         })
         .collect();
     let batches: Vec<Vec<String>> = batches
         .iter()
-        .map(|batch| {
-            batch
-                .iter()
-                .map(|crate_node| node_id(&crate_node.name))
-                .collect()
-        })
+        .map(|batch| batch.iter().map(|unit| node_id(&unit.name)).collect())
         .collect();
     json!({ "level": level, "nodes": nodes, "batches": batches })
 }
@@ -726,14 +1512,14 @@ fn wave_json(
 /// # Beschreibung
 /// Das Ergebnis der Zell-Auflösung einer Ebene. `batches` laufen nacheinander,
 /// die Mitglieder eines Batches nebenläufig. Ohne auflösbare Zelle enthält
-/// `batches` genau einen Batch mit allen Crates der Ebene und `join` ist
+/// `batches` genau einen Batch mit allen Einheiten der Ebene und `join` ist
 /// [`JoinSemantics::AllTerminal`] — das bisherige Verhalten.
 ///
 /// # Nebenläufigkeit
-/// Reiner Werttyp; hält nur Verweise auf den Workspace-Graphen.
+/// Reiner Werttyp; hält nur Verweise auf den Einheiten-Graphen.
 struct WavePlan<'a> {
     /// Die Startgruppen der Welle in Ausführungsreihenfolge.
-    batches: Vec<Vec<&'a CrateNode>>,
+    batches: Vec<Vec<&'a AnalysisUnit>>,
     /// Wie der Orchestrator auf die Kinder eines Batches wartet.
     join: JoinSemantics,
     /// Die Zell-ID, wenn die Welle aus einer Zelle stammt; sonst `None`.
@@ -770,9 +1556,9 @@ fn load_organization() -> Option<ResolvedOrganization> {
 ///
 /// # Beschreibung
 /// [`CellPlan::from_cell`] löst gegen einen [`Plan`] auf, nicht gegen einen
-/// Crate-Graphen. Dieser Plan enthält genau die Analyse-Knoten *einer* Ebene —
+/// Einheiten-Graphen. Dieser Plan enthält genau die Analyse-Knoten *einer* Ebene —
 /// dadurch bleibt die Wellenordnung erhalten, die
-/// [`WorkspaceGraph::topological_levels`] vorgibt: eine Zelle über dem
+/// [`UnitGraph::levels`] vorgibt: eine Zelle über dem
 /// Gesamtplan würde alle Ebenen zu einer einzigen Welle verschmelzen und die
 /// Bottom-up-Ordnung zerstören.
 ///
@@ -781,15 +1567,15 @@ fn load_organization() -> Option<ResolvedOrganization> {
 /// `id` und `write_scope`. Der Plan wird nirgends persistiert.
 ///
 /// # Argumente
-/// - `root` (`&Path`): Workspace-Wurzel für die Lesebereiche.
-/// - `crates` (`&[&CrateNode]`): die Crates dieser Ebene.
+/// - `root` (`&Path`): Wurzel für die Lesebereiche.
+/// - `units` (`&[&AnalysisUnit]`): die Einheiten dieser Ebene.
 ///
 /// # Rückgabe
-/// Ein flüchtiger [`Plan`] mit einem Analyse-Knoten je Crate.
+/// Ein flüchtiger [`Plan`] mit einem Analyse-Knoten je Einheit.
 ///
 /// # Nebenläufigkeit
 /// Rein bis auf die Systemuhr für die Zeitstempel der Knoten.
-fn wave_plan(root: &Path, crates: &[&CrateNode]) -> Plan {
+fn wave_plan(root: &Path, units: &[&AnalysisUnit]) -> Plan {
     let now = offset_from_timestamp(jiff::Timestamp::now());
     Plan {
         id: PlanId::new(ANALYSIS_PLAN_ID),
@@ -797,9 +1583,9 @@ fn wave_plan(root: &Path, crates: &[&CrateNode]) -> Plan {
         parent_revision: None,
         goal_statement: "Analyse-Welle".to_owned(),
         goal_id: None,
-        nodes: crates
+        nodes: units
             .iter()
-            .map(|crate_node| analysis_node(root, crate_node, Vec::new()))
+            .map(|unit| analysis_node(root, unit, Vec::new()))
             .collect(),
         created_at: now,
         updated_at: now,
@@ -811,8 +1597,8 @@ fn wave_plan(root: &Path, crates: &[&CrateNode]) -> Plan {
 /// # Argumente
 /// - `cell` (`Option<(&RawClanSpec, &RawCellSpec)>`): Clan und Zelle aus der
 ///   Organisation; `None`, wenn keine gefunden wurde.
-/// - `root` (`&Path`): Workspace-Wurzel.
-/// - `crates` (`&[&CrateNode]`): die Crates dieser Ebene.
+/// - `root` (`&Path`): Wurzel.
+/// - `units` (`&[&AnalysisUnit]`): die Einheiten dieser Ebene.
 ///
 /// # Rückgabe
 /// `Some(cell_plan)`, wenn die Zelle mindestens ein Mitglied auswählt; sonst
@@ -828,10 +1614,10 @@ fn wave_plan(root: &Path, crates: &[&CrateNode]) -> Plan {
 fn cell_plan_for_wave(
     cell: Option<(&RawClanSpec, &RawCellSpec)>,
     root: &Path,
-    crates: &[&CrateNode],
+    units: &[&AnalysisUnit],
 ) -> Option<CellPlan> {
     let (clan, spec) = cell?;
-    let plan = wave_plan(root, crates);
+    let plan = wave_plan(root, units);
     match CellPlan::from_cell(spec, Some(clan), &plan) {
         Ok(resolved) if !resolved.members.is_empty() => Some(resolved),
         Ok(resolved) => {
@@ -839,7 +1625,7 @@ fn cell_plan_for_wave(
                 cell = resolved.cell_id.as_str(),
                 clan = clan.id.as_str(),
                 pattern = spec.members_from_plan.as_str(),
-                crates = crates.len(),
+                units = units.len(),
                 "analyze.cell.no_members"
             );
             None
@@ -856,48 +1642,51 @@ fn cell_plan_for_wave(
     }
 }
 
-/// Übersetzt die Batches einer aufgelösten Zelle in Crate-Gruppen.
+/// Übersetzt die Batches einer aufgelösten Zelle in Einheiten-Gruppen.
 ///
 /// # Beschreibung
-/// Bildet jede `TaskId` eines Batches auf ihr Crate zurück. Die Zelle darf die
+/// Bildet jede `TaskId` eines Batches auf ihr Einheit zurück. Die Zelle darf die
 /// Ebene umsortieren und aufteilen, aber nichts verschlucken: deckt sie nicht
-/// **jedes** Crate der Ebene ab, wird das Ergebnis verworfen und die ungeteilte
-/// Welle zurückgegeben. Sonst würde eine zu enge Zelle stillschweigend Crates
+/// **jedes** Einheit der Ebene ab, wird das Ergebnis verworfen und die ungeteilte
+/// Welle zurückgegeben. Sonst würde eine zu enge Zelle stillschweigend Einheiten
 /// von der Analyse ausschließen — ein Rückschritt gegenüber dem Verhalten ohne
 /// Organisation.
 ///
 /// # Argumente
 /// - `cell` (`Option<&CellPlan>`): die aufgelöste Zelle dieser Ebene.
-/// - `crates` (`&[&CrateNode]`): die Crates der Ebene in Graph-Reihenfolge.
+/// - `units` (`&[&AnalysisUnit]`): die Einheiten der Ebene in Graph-Reihenfolge.
 ///
 /// # Rückgabe
 /// Die Batches in Ausführungsreihenfolge; im Rückfall genau ein Batch mit allen
-/// Crates.
+/// Einheiten.
 ///
 /// # Nebenläufigkeit
 /// Rein funktional, keine Seiteneffekte.
-fn wave_batches<'a>(cell: Option<&CellPlan>, crates: &[&'a CrateNode]) -> Vec<Vec<&'a CrateNode>> {
+fn wave_batches<'a>(
+    cell: Option<&CellPlan>,
+    units: &[&'a AnalysisUnit],
+) -> Vec<Vec<&'a AnalysisUnit>> {
     let Some(cell) = cell else {
-        return vec![crates.to_vec()];
+        return vec![units.to_vec()];
     };
 
-    let mut batches: Vec<Vec<&'a CrateNode>> = Vec::with_capacity(cell.batches.len());
+    let mut batches: Vec<Vec<&'a AnalysisUnit>> = Vec::with_capacity(cell.batches.len());
     let mut covered = 0_usize;
     for batch in &cell.batches {
-        let mut members: Vec<&'a CrateNode> = Vec::with_capacity(batch.len());
+        let mut members: Vec<&'a AnalysisUnit> = Vec::with_capacity(batch.len());
         for task in batch {
-            match crates
+            match units
                 .iter()
-                .find(|crate_node| node_id(&crate_node.name) == task.as_str())
+                .find(|unit| node_id(&unit.name) == task.as_str())
             {
-                Some(crate_node) => {
-                    members.push(*crate_node);
+                Some(unit) => {
+                    members.push(*unit);
                     covered += 1;
                 }
                 None => tracing::warn!(
                     cell = cell.cell_id.as_str(),
                     task = task.as_str(),
-                    "analyze.cell.member_without_crate"
+                    "analyze.cell.member_without_unit"
                 ),
             }
         }
@@ -906,14 +1695,14 @@ fn wave_batches<'a>(cell: Option<&CellPlan>, crates: &[&'a CrateNode]) -> Vec<Ve
         }
     }
 
-    if batches.is_empty() || covered != crates.len() {
+    if batches.is_empty() || covered != units.len() {
         tracing::warn!(
             cell = cell.cell_id.as_str(),
             covered,
-            expected = crates.len(),
+            expected = units.len(),
             "analyze.cell.partial_cover — Rückfall auf die ungeteilte Welle"
         );
-        return vec![crates.to_vec()];
+        return vec![units.to_vec()];
     }
     batches
 }
@@ -922,8 +1711,8 @@ fn wave_batches<'a>(cell: Option<&CellPlan>, crates: &[&'a CrateNode]) -> Vec<Ve
 ///
 /// # Argumente
 /// - `cell` (`Option<(&RawClanSpec, &RawCellSpec)>`): Clan und Zelle aus der Organisation.
-/// - `root` (`&Path`): Workspace-Wurzel.
-/// - `crates` (`&[&CrateNode]`): die Crates dieser Ebene.
+/// - `root` (`&Path`): Wurzel.
+/// - `units` (`&[&AnalysisUnit]`): die Einheiten dieser Ebene.
 ///
 /// # Rückgabe
 /// Der [`WavePlan`] dieser Ebene; ohne Zelle ein einziger Batch mit
@@ -934,11 +1723,11 @@ fn wave_batches<'a>(cell: Option<&CellPlan>, crates: &[&'a CrateNode]) -> Vec<Ve
 fn plan_wave<'a>(
     cell: Option<(&RawClanSpec, &RawCellSpec)>,
     root: &Path,
-    crates: &[&'a CrateNode],
+    units: &[&'a AnalysisUnit],
 ) -> WavePlan<'a> {
-    let resolved = cell_plan_for_wave(cell, root, crates);
+    let resolved = cell_plan_for_wave(cell, root, units);
     WavePlan {
-        batches: wave_batches(resolved.as_ref(), crates),
+        batches: wave_batches(resolved.as_ref(), units),
         join: resolved
             .as_ref()
             .map_or(JoinSemantics::AllTerminal, |plan| plan.join),
@@ -972,7 +1761,7 @@ fn cell_json(cell: Option<(&RawClanSpec, &RawCellSpec)>) -> Value {
 
 // ── Operation ────────────────────────────────────────────────────────────────
 
-/// Analysiert einen Workspace bottom-up über Analyst-Kindagenten.
+/// Analysiert einen Arbeitsbereich bottom-up über Analyst-Kindagenten.
 ///
 /// # Beschreibung
 /// Siehe Modul-Dokumentation für den vollständigen Ablauf. Die Operation trägt
@@ -986,14 +1775,14 @@ fn cell_json(cell: Option<(&RawClanSpec, &RawCellSpec)>) -> Value {
 /// - `args` ([`AnalyzeArgs`]): die Argumente; werden konsumiert.
 ///
 /// # Rückgabe
-/// `Ok(OpOutput)` mit einem JSON-Bericht: Wellen, Crate-Anzahl, Findings,
+/// `Ok(OpOutput)` mit einem JSON-Bericht: Wellen, Einheiten-Anzahl, Findings,
 /// offene Fragen, Reconcile-Vorschläge und Fehlschläge je Knoten.
 ///
 /// # Fehler
 /// - [`OpError::InvalidArguments`]: siehe [`AnalyzeArgs::from_raw_args`].
 /// - [`OpError::NotAvailable`]: kein Plan-Store oder kein Agent-Spawner.
-/// - [`OpError::Execution`]: Workspace-Graph nicht ladbar oder Plan-Mutation
-///   abgelehnt.
+/// - [`OpError::Execution`]: Wurzel nicht lesbar, genannte Einheit unbekannt
+///   oder Plan-Mutation abgelehnt.
 ///
 /// # Nebenläufigkeit
 /// Die Kinder einer Welle laufen nebenläufig, gedeckelt durch `max_parallel`;
@@ -1025,28 +1814,16 @@ async fn analyze(ctx: &OpContext, args: AnalyzeArgs) -> Result<OpOutput, OpError
     let max_parallel = args.max_parallel.unwrap_or(DEFAULT_MAX_PARALLEL).max(1);
 
     let workspace_root = ctx.sandbox().workspace().canonical_root();
-    let full_graph = if workspace_root.join("Cargo.toml").is_file() {
-        WorkspaceGraph::load(workspace_root).map_err(|error| {
-            OpError::Execution(format!(
-                "Workspace-Graph konnte nicht geladen werden: {error}"
-            ))
-        })?
-    } else {
-        synthesize_directory_graph(workspace_root)?
-    };
-    let graph = match args.crate_name.as_deref() {
-        Some(name) => full_graph.subgraph(name).map_err(|error| {
-            OpError::Execution(format!("Teilgraph für '{name}' nicht bildbar: {error}"))
-        })?,
+    let (full_graph, graph_info) = build_unit_graph(workspace_root)?;
+    let graph = match args.unit_name() {
+        Some(unit_name) => full_graph.subgraph(unit_name)?,
         None => full_graph,
     };
 
-    let levels = graph
-        .topological_levels()
-        .map_err(|error| OpError::Execution(format!("Ebenen nicht berechenbar: {error}")))?;
+    let levels = graph.levels();
     if levels.is_empty() {
         return Err(OpError::Execution(
-            "der Workspace enthält kein analysierbares Crate".to_owned(),
+            "der Arbeitsbereich enthält keine analysierbare Einheit".to_owned(),
         ));
     }
 
@@ -1054,12 +1831,10 @@ async fn analyze(ctx: &OpContext, args: AnalyzeArgs) -> Result<OpOutput, OpError
     let leaf_first: Vec<String> = levels
         .iter()
         .flatten()
-        .map(|crate_node| node_id(&crate_node.name))
+        .map(|unit| node_id(&unit.name))
         .collect();
-    let crate_count = leaf_first.len();
-    let rendered = graph
-        .render_levels()
-        .map_err(|error| OpError::Execution(format!("Ebenen nicht darstellbar: {error}")))?;
+    let unit_count = leaf_first.len();
+    let rendered = graph.render_levels();
 
     // Die Wellensteuerung kommt aus der eingebauten Organisation; jede Stufe
     // fällt einzeln auf das bisherige Verhalten zurück (siehe Modul-Doku).
@@ -1069,14 +1844,14 @@ async fn analyze(ctx: &OpContext, args: AnalyzeArgs) -> Result<OpOutput, OpError
         .and_then(|organization| clan_cell(organization, RESEARCH_CLAN_ID));
     let waves: Vec<WavePlan<'_>> = levels
         .iter()
-        .map(|crates| plan_wave(cell, root, crates))
+        .map(|units| plan_wave(cell, root, units))
         .collect();
 
     let waves_json: Vec<Value> = levels
         .iter()
         .zip(waves.iter())
         .enumerate()
-        .map(|(level, (crates, wave))| wave_json(level, crates, bottom_up, &wave.batches))
+        .map(|(level, (units, wave))| wave_json(level, units, bottom_up, &wave.batches))
         .collect();
 
     if dry_run {
@@ -1084,7 +1859,9 @@ async fn analyze(ctx: &OpContext, args: AnalyzeArgs) -> Result<OpOutput, OpError
             "dry_run": true,
             "root": root.display().to_string(),
             "bottom_up": bottom_up,
-            "crate_count": crate_count,
+            "crate_count": unit_count,
+            "unit_count": unit_count,
+            "graph": graph_info,
             "cell": cell_json(cell),
             "waves": waves_json,
             "leaf_first": leaf_first,
@@ -1100,11 +1877,10 @@ async fn analyze(ctx: &OpContext, args: AnalyzeArgs) -> Result<OpOutput, OpError
 
     // Immer leaf-first anlegen: `AddNode` akzeptiert keine unbekannte Dependency.
     let mut created = 0_usize;
-    for crates in &levels {
-        for crate_node in crates {
+    for units in &levels {
+        for unit in units {
             let dependencies: Vec<TaskId> = if bottom_up {
-                crate_node
-                    .deps
+                unit.deps
                     .iter()
                     .filter(|dep| graph.get(dep.as_str()).is_some())
                     .map(|dep| TaskId::new(node_id(dep.as_str())))
@@ -1112,7 +1888,7 @@ async fn analyze(ctx: &OpContext, args: AnalyzeArgs) -> Result<OpOutput, OpError
             } else {
                 Vec::new()
             };
-            if ensure_node(plan.as_ref(), analysis_node(root, crate_node, dependencies))? {
+            if ensure_node(plan.as_ref(), analysis_node(root, unit, dependencies))? {
                 created += 1;
             }
         }
@@ -1143,9 +1919,10 @@ async fn analyze(ctx: &OpContext, args: AnalyzeArgs) -> Result<OpOutput, OpError
 
             let questions: Vec<Value> = batch
                 .iter()
-                .map(|crate_node| {
-                    let consumers = graph.consumers_of(&crate_node.name);
-                    child_payload(&analysis_question(root, crate_node, &consumers))
+                .map(|unit| {
+                    let consumers = graph.consumers_of(&unit.name);
+                    let nested = graph.nested_in(unit);
+                    child_payload(&analysis_question(root, unit, &consumers, &nested))
                 })
                 .collect::<Result<Vec<Value>, OpError>>()?;
 
@@ -1154,7 +1931,7 @@ async fn analyze(ctx: &OpContext, args: AnalyzeArgs) -> Result<OpOutput, OpError
                 batch = batch_index,
                 batches = wave.batches.len(),
                 cell = wave.cell_id.as_deref().unwrap_or("<rückfall>"),
-                crates = questions.len(),
+                units = questions.len(),
                 max_parallel,
                 "analyze.wave.start"
             );
@@ -1171,8 +1948,8 @@ async fn analyze(ctx: &OpContext, args: AnalyzeArgs) -> Result<OpOutput, OpError
             )
             .await?;
 
-            for (crate_node, outcome) in batch.iter().zip(results) {
-                let id = node_id(&crate_node.name);
+            for (unit, outcome) in batch.iter().zip(results) {
+                let id = node_id(&unit.name);
                 match outcome {
                     Ok(value) => match finding_from_value(value) {
                         Ok(finding) => {
@@ -1224,7 +2001,9 @@ async fn analyze(ctx: &OpContext, args: AnalyzeArgs) -> Result<OpOutput, OpError
         "dry_run": false,
         "root": root.display().to_string(),
         "bottom_up": bottom_up,
-        "crate_count": crate_count,
+        "crate_count": unit_count,
+        "unit_count": unit_count,
+        "graph": graph_info,
         "nodes_created": created,
         "cell": cell_json(cell),
         "waves": waves_json,
@@ -1255,14 +2034,15 @@ fn render(report: &Value) -> Result<OpOutput, OpError> {
 #[cfg(test)]
 mod tests {
     use super::{
-        AnalyzeArgs, AnalyzeOperation, cell_plan_for_wave, load_organization, node_id,
-        parse_max_parallel, plan_wave, wave_batches,
+        AnalysisUnit, AnalyzeArgs, AnalyzeOperation, analysis_question, build_unit_graph,
+        cell_plan_for_wave, directory_unit, load_organization, node_id, parse_max_parallel,
+        plan_wave, wave_batches,
     };
     use crate::test_support::{TestError, TestResult, ctx};
     use crate::testutil::toks;
     use harw_authority::{PermissionSet, SandboxSpec, WorkspaceRegistration, WorkspaceRegistry};
-    use harw_code_graph::CrateNode;
     use harw_core::child_controller::JoinSemantics;
+    use harw_explorer::ProjectKind;
     use harw_operations::context::ServiceMap;
     use harw_operations::{FromRawArgs, OpContext, OpError, Operation, Surface};
     use harw_plan::{
@@ -1671,10 +2451,10 @@ mod tests {
     #[tokio::test]
     async fn test_analyze_on_root_with_cargo_toml_still_uses_the_real_graph_load_path() -> TestResult
     {
-        // Regressionsschutz: mit `Cargo.toml` bleibt der echte
-        // `WorkspaceGraph::load`-Pfad unverändert — erkennbar an der realen
-        // internen Abhängigkeit a→b, die der synthetische Rückfall nie
-        // herleitet (dessen Pseudo-Crates tragen immer leere `deps`).
+        // Regressionsschutz: für einen Cargo-Workspace reichert
+        // `WorkspaceGraph::load` die Explorer-Einheiten an — erkennbar an der
+        // realen internen Abhängigkeit a→b, die der Verzeichnis-Rückfall nie
+        // herleitet (dessen Einheiten tragen immer leere `deps`).
         let (ctx, root) = workspace_context()?;
         let result = super::analyze(
             &ctx,
@@ -1759,18 +2539,18 @@ mod tests {
         }
     }
 
-    /// Baut einen Crate-Knoten unterhalb von `/ws`.
-    fn crate_node(name: &str, level: u32) -> CrateNode {
-        CrateNode {
+    /// Baut eine Cargo-Einheit unterhalb von `/ws`.
+    fn crate_node(name: &str, level: u32) -> AnalysisUnit {
+        AnalysisUnit {
             name: name.to_owned(),
-            version: "0.1.0".to_owned(),
-            manifest_path: PathBuf::from(format!("/ws/{name}/Cargo.toml")),
+            kinds: vec![ProjectKind::CargoCrate],
+            rel: PathBuf::from(name),
             dir: PathBuf::from(format!("/ws/{name}")),
+            manifest: Some(PathBuf::from(format!("{name}/Cargo.toml"))),
+            cargo_name: Some(name.to_owned()),
+            version: Some("0.1.0".to_owned()),
             deps: Vec::new(),
-            dev_deps: Vec::new(),
-            build_deps: Vec::new(),
             external_deps: Vec::new(),
-            is_leaf: true,
             level,
         }
     }
@@ -1891,7 +2671,7 @@ mod tests {
     #[test]
     fn test_wave_batches_without_a_cell_is_one_batch_in_graph_order() {
         let crates = [crate_node("a", 0), crate_node("b", 0)];
-        let level: Vec<&CrateNode> = crates.iter().collect();
+        let level: Vec<&AnalysisUnit> = crates.iter().collect();
 
         let batches = wave_batches(None, &level);
 
@@ -1903,7 +2683,7 @@ mod tests {
     #[test]
     fn test_wave_batches_follows_the_cell_batch_order() {
         let crates = [crate_node("a", 0), crate_node("b", 0)];
-        let level: Vec<&CrateNode> = crates.iter().collect();
+        let level: Vec<&AnalysisUnit> = crates.iter().collect();
         let cell = CellPlan {
             cell_id: "research-wave".to_owned(),
             members: vec![TaskId::new(node_id("b")), TaskId::new(node_id("a"))],
@@ -1927,7 +2707,7 @@ mod tests {
         // Eine Zelle darf die Ebene aufteilen und umsortieren, aber kein Crate
         // verschlucken: deckt sie nicht alle ab, gilt die ungeteilte Welle.
         let crates = [crate_node("a", 0), crate_node("b", 0)];
-        let level: Vec<&CrateNode> = crates.iter().collect();
+        let level: Vec<&AnalysisUnit> = crates.iter().collect();
         let cell = CellPlan {
             cell_id: "research-wave".to_owned(),
             members: vec![TaskId::new(node_id("a"))],
@@ -1948,7 +2728,7 @@ mod tests {
         // Der Rückfall: ohne Clan/Zelle läuft die Welle wie vor der
         // Organisation — ein Batch, `AllTerminal`, kein Fehler.
         let crates = [crate_node("a", 0), crate_node("b", 0)];
-        let level: Vec<&CrateNode> = crates.iter().collect();
+        let level: Vec<&AnalysisUnit> = crates.iter().collect();
 
         assert!(cell_plan_for_wave(None, Path::new("/ws"), &level).is_none());
 
@@ -1964,7 +2744,7 @@ mod tests {
         let organization = organization()?;
         let cell = clan_cell(&organization, RESEARCH_CLAN_ID);
         let crates = [crate_node("a", 0), crate_node("b", 0)];
-        let level: Vec<&CrateNode> = crates.iter().collect();
+        let level: Vec<&AnalysisUnit> = crates.iter().collect();
 
         let wave = plan_wave(cell, Path::new("/ws"), &level);
 
@@ -2108,5 +2888,282 @@ mod tests {
             OpContext::new(SessionId::new(), TurnId::new(), sandbox, ServiceMap::new()),
             root,
         ))
+    }
+
+    // ── Projektneutraler Einheiten-Graph ─────────────────────────────────────
+
+    /// Schreibt eine Datei samt Elternverzeichnissen.
+    fn write_file(path: &Path, content: &str) -> TestResult {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).map_err(ctx("Verzeichnis anlegen"))?;
+        }
+        std::fs::write(path, content).map_err(ctx("Datei schreiben"))?;
+        Ok(())
+    }
+
+    /// Legt ein Nicht-Cargo-Fixture an: zwei npm-Pakete und zwei
+    /// Python-Projekte mit je einer Pfad-Abhängigkeit.
+    ///
+    /// Erwartet: `web → shared-js` (`file:`-Abhängigkeit in `package.json`)
+    /// und `api → core` (`[tool.uv.sources]` in `pyproject.toml`).
+    fn polyglot_workspace(dir: &Path) -> TestResult {
+        write_file(
+            &dir.join("web/package.json"),
+            r#"{ "name": "web", "dependencies": { "shared-js": "file:../shared-js" } }"#,
+        )?;
+        write_file(
+            &dir.join("shared-js/package.json"),
+            r#"{ "name": "shared-js", "version": "1.0.0" }"#,
+        )?;
+        write_file(
+            &dir.join("api/pyproject.toml"),
+            "[project]\nname = \"api\"\n\n[tool.uv.sources]\ncore = { path = \"../core\" }\n",
+        )?;
+        write_file(
+            &dir.join("core/pyproject.toml"),
+            "[project]\nname = \"core\"\n",
+        )?;
+        Ok(())
+    }
+
+    /// Kontext, dessen Sandbox auf das Nicht-Cargo-Fixture zeigt.
+    fn polyglot_context() -> TestResult<(OpContext, PathBuf)> {
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+        let id = COUNTER.fetch_add(1, Ordering::Relaxed);
+        let root = std::env::temp_dir().join(format!(
+            "harw-analyze-polyglot-test-{}-{id}",
+            std::process::id()
+        ));
+        let workspace = root.join("ws");
+        std::fs::create_dir_all(&workspace).map_err(ctx("Test-Workspace anlegen"))?;
+        polyglot_workspace(&workspace)?;
+        let registry = WorkspaceRegistry::build(
+            &root,
+            [WorkspaceRegistration {
+                tenant: TenantId::from_str("test-tenant"),
+                workspace: WorkspaceId::from_str("ws"),
+                root: PathBuf::from("ws"),
+            }],
+        )
+        .map_err(ctx("Workspace-Registry bauen"))?;
+        let binding = registry
+            .resolve(
+                &TenantId::from_str("test-tenant"),
+                &WorkspaceId::from_str("ws"),
+            )
+            .map_err(ctx("Workspace-Binding auflösen"))?;
+        let sandbox = SandboxSpec::from_resolved(binding, PermissionSet::empty());
+        Ok((
+            OpContext::new(SessionId::new(), TurnId::new(), sandbox, ServiceMap::new()),
+            root,
+        ))
+    }
+
+    /// Führt einen Dry-Run aus und parst den Bericht.
+    async fn dry_run_report(
+        op_ctx: &OpContext,
+        args: AnalyzeArgs,
+    ) -> TestResult<serde_json::Value> {
+        let output = super::analyze(
+            op_ctx,
+            AnalyzeArgs {
+                dry_run: Some(true),
+                ..args
+            },
+        )
+        .await
+        .map_err(ctx("Dry-Run darf nicht fehlschlagen"))?;
+        serde_json::from_str(&output.text).map_err(ctx("Dry-Run-Ausgabe ist kein JSON"))
+    }
+
+    #[tokio::test]
+    async fn test_analyze_on_npm_and_python_fixture_builds_units_and_edges() -> TestResult {
+        let (op_ctx, root) = polyglot_context()?;
+        let report = dry_run_report(&op_ctx, AnalyzeArgs::default()).await;
+        std::fs::remove_dir_all(root).ok();
+        let report = report?;
+
+        assert_eq!(report["graph"]["source"], serde_json::json!("explorer"));
+        assert_eq!(report["unit_count"], serde_json::json!(4));
+        assert_eq!(report["crate_count"], serde_json::json!(4));
+        assert_eq!(
+            report["leaf_first"],
+            serde_json::json!([
+                node_id("core"),
+                node_id("shared-js"),
+                node_id("api"),
+                node_id("web")
+            ]),
+            "Pfad-Abhängigkeiten müssen die Ziele eine Ebene tiefer legen"
+        );
+        assert_eq!(
+            report["waves"][1]["nodes"][0]["unit"],
+            serde_json::json!("api")
+        );
+        assert_eq!(
+            report["waves"][1]["nodes"][0]["kind"],
+            serde_json::json!("python")
+        );
+        assert_eq!(
+            report["waves"][1]["nodes"][0]["dependencies"],
+            serde_json::json!([node_id("core")])
+        );
+        assert_eq!(
+            report["waves"][1]["nodes"][1]["kind"],
+            serde_json::json!("node")
+        );
+        assert_eq!(
+            report["waves"][1]["nodes"][1]["dependencies"],
+            serde_json::json!([node_id("shared-js")])
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_analyze_on_polyglot_fixture_subgraph_by_unit_name_and_path() -> TestResult {
+        let (op_ctx, root) = polyglot_context()?;
+        let by_name = dry_run_report(
+            &op_ctx,
+            AnalyzeArgs {
+                crate_name: Some("web".to_owned()),
+                ..AnalyzeArgs::default()
+            },
+        )
+        .await;
+        let by_path = dry_run_report(
+            &op_ctx,
+            AnalyzeArgs {
+                crate_name: Some("./api/".to_owned()),
+                ..AnalyzeArgs::default()
+            },
+        )
+        .await;
+        let unknown = super::analyze(
+            &op_ctx,
+            AnalyzeArgs {
+                crate_name: Some("gibt-es-nicht".to_owned()),
+                dry_run: Some(true),
+                ..AnalyzeArgs::default()
+            },
+        )
+        .await;
+        std::fs::remove_dir_all(root).ok();
+
+        assert_eq!(
+            by_name?["leaf_first"],
+            serde_json::json!([node_id("shared-js"), node_id("web")])
+        );
+        assert_eq!(
+            by_path?["leaf_first"],
+            serde_json::json!([node_id("core"), node_id("api")])
+        );
+        assert!(matches!(unknown, Err(OpError::Execution(_))));
+        Ok(())
+    }
+
+    #[test]
+    fn test_build_unit_graph_marks_nested_projects_and_skips_workspace_shells() -> TestResult {
+        let dir = tempfile::tempdir().map_err(ctx("Temp-Verzeichnis anlegen"))?;
+        let root = std::fs::canonicalize(dir.path()).map_err(ctx("Wurzel kanonisieren"))?;
+        // Wurzel-`package.json` mit `workspaces` ist eine Hülle, keine Einheit;
+        // das Mitglied `packages/ui` ist eine. `packages/ui/tools` ist ein
+        // darin verschachteltes Python-Projekt.
+        write_file(
+            &root.join("package.json"),
+            r#"{ "name": "mono", "private": true, "workspaces": ["packages/*"] }"#,
+        )?;
+        write_file(
+            &root.join("packages/ui/package.json"),
+            r#"{ "name": "@acme/ui" }"#,
+        )?;
+        write_file(
+            &root.join("packages/ui/tools/pyproject.toml"),
+            "[project]\nname = \"ui-tools\"\n",
+        )?;
+
+        let (graph, info) = build_unit_graph(&root).map_err(ctx("Graph bauen"))?;
+        assert_eq!(info["source"], serde_json::json!("explorer"));
+        let mut names: Vec<&str> = graph.units.iter().map(|unit| unit.name.as_str()).collect();
+        names.sort_unstable();
+        assert_eq!(
+            names,
+            vec!["@acme/ui", "ui-tools"],
+            "die Hülle 'mono' zählt nicht"
+        );
+        assert_eq!(node_id("@acme/ui"), "research--acme-ui");
+
+        let Some(ui) = graph.get("@acme/ui") else {
+            return Err(TestError::Unexpected("Einheit @acme/ui fehlt".to_owned()));
+        };
+        let nested: Vec<&str> = graph
+            .nested_in(ui)
+            .iter()
+            .map(|unit| unit.name.as_str())
+            .collect();
+        assert_eq!(nested, vec!["ui-tools"]);
+
+        let question = analysis_question(&root, ui, &[], &graph.nested_in(ui));
+        assert!(question.question.contains("packages/ui/tools"));
+        assert_eq!(question.scope.paths, vec!["packages/ui/**".to_owned()]);
+        assert!(
+            question.scope.crates.is_empty(),
+            "npm-Pakete sind keine Crates"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn test_analysis_question_is_language_neutral_for_python_units() {
+        let unit = AnalysisUnit {
+            kinds: vec![ProjectKind::Python],
+            cargo_name: None,
+            version: None,
+            manifest: Some(PathBuf::from("core/pyproject.toml")),
+            ..crate_node("core", 0)
+        };
+        let question = analysis_question(Path::new("/ws"), &unit, &[], &[]);
+        let text = question.question.as_str();
+        assert!(text.contains("NotImplementedError"), "{text}");
+        assert!(text.contains("Docstrings"), "{text}");
+        assert!(
+            !text.contains("todo!()"),
+            "keine Rust-Marker für Python: {text}"
+        );
+        assert!(
+            !text.contains("`pub`"),
+            "keine Rust-API-Begriffe für Python: {text}"
+        );
+        assert!(!text.contains("Crate"), "{text}");
+    }
+
+    #[test]
+    fn test_analysis_question_for_rust_units_keeps_rust_markers() {
+        let unit = crate_node("a", 0);
+        let question = analysis_question(Path::new("/ws"), &unit, &[], &[]);
+        assert!(question.question.contains("todo!()"));
+        assert!(question.question.contains("`pub`"));
+        assert_eq!(question.scope.crates, vec!["a".to_owned()]);
+    }
+
+    #[test]
+    fn test_analysis_question_for_plain_directory_is_generic() {
+        let unit = directory_unit(Path::new("/ws"), PathBuf::from("/ws/scripts"));
+        let question = analysis_question(Path::new("/ws"), &unit, &[], &[]);
+        assert!(question.question.contains("Verzeichnis `scripts`"));
+        assert!(question.question.contains("raise NotImplementedError"));
+        assert_eq!(question.scope.paths, vec!["scripts/**".to_owned()]);
+    }
+
+    #[test]
+    fn test_analyze_args_accept_unit_name_and_crate_name_in_json() -> TestResult {
+        let legacy: AnalyzeArgs =
+            serde_json::from_value(serde_json::json!({ "crate_name": "harw-core" }))
+                .map_err(ctx("crate_name muss weiter gelten"))?;
+        assert_eq!(legacy.unit_name(), Some("harw-core"));
+        let neutral: AnalyzeArgs =
+            serde_json::from_value(serde_json::json!({ "unit_name": "web" }))
+                .map_err(ctx("unit_name muss gelten"))?;
+        assert_eq!(neutral.unit_name(), Some("web"));
+        Ok(())
     }
 }

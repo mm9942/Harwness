@@ -175,6 +175,11 @@ impl From<harw_config::ConfigError> for ModelsError {
 /// `String` mit menschenlesbarem Kontext — konsistent mit den übrigen
 /// `harw-cli`-Subcommand-Läufern (siehe `crate::settings::run`).
 pub fn run(home_override: Option<PathBuf>, action: Option<ModelsAction>) -> Result<(), String> {
+    // Der Katalog braucht kein angelegtes Home und läuft über denselben Weg
+    // wie der frühere Befehl `harw catalog`.
+    if let Some(ModelsAction::Catalog { refresh }) = action {
+        return crate::lifecycle::catalog(home_override, refresh);
+    }
     let home = crate::home::resolve_home(home_override)?;
     crate::home::ensure_home(&home).map_err(|error| error.to_string())?;
     execute(&home, action).map_err(|error| error.to_string())
@@ -194,12 +199,22 @@ fn execute(home: &Path, action: Option<ModelsAction>) -> Result<(), ModelsError>
             target: Some(target),
         }) => add_model(home, &target),
         Some(ModelsAction::Add { target: None }) => run_model_picker(home),
-        Some(ModelsAction::Delete { target }) => delete_model(home, &target),
+        Some(ModelsAction::Remove { target }) => delete_model(home, &target),
         Some(ModelsAction::Internal { action }) => run_internal(home, action),
         Some(ModelsAction::Default { id }) => {
             set_default_model(home, &id)?;
             println!("Standardmodell auf {id:?} gesetzt.");
             Ok(())
+        }
+        // [`run`] fängt den Katalog vorher ab; dieser Zweig hält nur das
+        // `match` vollständig.
+        Some(ModelsAction::Catalog { refresh }) => {
+            crate::lifecycle::catalog(Some(home.to_path_buf()), refresh).map_err(|reason| {
+                ModelsError::Io {
+                    path: home.join("cache"),
+                    source: std::io::Error::other(reason),
+                }
+            })
         }
     }
 }
@@ -883,6 +898,7 @@ fn write_discovered_model_file(
     })?;
     let toml_model = harw_config::ModelToml {
         stream: None,
+        rate_limit: None,
         id: model.id.clone(),
         name: None,
         provider: provider_name.to_owned(),
@@ -1240,6 +1256,7 @@ mod tests {
         .map_err(ctx("provider"))?;
         let live = harw_config::ModelToml {
             stream: None,
+            rate_limit: None,
             id: "model/with-slash".to_owned(),
             name: None,
             provider: "acme".to_owned(),
@@ -1313,6 +1330,7 @@ mod tests {
         std::fs::create_dir_all(&models_dir).map_err(ctx("models dir"))?;
         let old = harw_config::ModelToml {
             stream: None,
+            rate_limit: None,
             id: "gone".to_owned(),
             name: None,
             provider: "acme".to_owned(),
@@ -1327,6 +1345,7 @@ mod tests {
         };
         let other = harw_config::ModelToml {
             stream: None,
+            rate_limit: None,
             provider: "other".to_owned(),
             ..old.clone()
         };
@@ -1423,6 +1442,7 @@ mod tests {
 
         let stale = harw_config::ModelToml {
             stream: None,
+            rate_limit: None,
             id: "stale-model".to_owned(),
             name: None,
             provider: "acme".to_owned(),
@@ -1437,6 +1457,7 @@ mod tests {
         };
         let default_model = harw_config::ModelToml {
             stream: None,
+            rate_limit: None,
             id: "gpt-5.6-terra".to_owned(),
             ..stale.clone()
         };

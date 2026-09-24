@@ -183,8 +183,7 @@ mod tests {
         );
         assert_eq!(fragments[0].label, "project.root");
         assert_eq!(
-            fragments[0].content,
-            "project_root=/work\ncwd=/work/sub",
+            fragments[0].content, "project_root=/work\ncwd=/work/sub",
             "root fragment content format must be unchanged"
         );
         assert_eq!(fragments[1].label, "project.doc:HARW.md");

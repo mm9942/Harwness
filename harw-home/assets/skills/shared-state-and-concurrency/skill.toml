@@ -1,0 +1,5 @@
+name = "shared-state-and-concurrency"
+description = "Use when Daten zwischen Threads, Goroutines, Tasks, Workern oder async-Callbacks geteilt werden — in Go, Java, C#, Python (threading/asyncio), TypeScript/Node (await-Interleaving, worker_threads) oder Rust (Arc/Mutex/Send/Sync). Trigger: globale mutable Variablen, Race Conditions, Check-then-act über ein `await`, Lock über I/O gehalten, jeder Thread bekommt eine deep copy der Config, `counter += 1` aus mehreren Threads, Thread-Safety \"per Kommentar\" oder `unsafe impl Send` behauptet. Lehrt: unveränderlich teilen (Referenz, nicht Kopie), Mutation hinter genau einem Mechanismus (Lock/Atomic/Channel/Actor), Locks kurz und nie über await, Thread-Safety vom Typsystem/Tooling prüfen lassen. Sprachunabhängige Variante von rust-arc-sharing / rust-references-vs-raw-pointers."
+enabled = true
+instructions_file = "instructions.md"
+tools = ["filesystem.read"]

@@ -193,6 +193,7 @@ fn load_os_keyring_seed(_service: &str, _account: &str) -> SecretsResult<SecretB
     })
 }
 
+#[cfg(any(feature = "keyring", test))]
 fn secret_box_from_exact_32_bytes(kind: &str, secret: Vec<u8>) -> SecretsResult<SecretBox<[u8]>> {
     if secret.len() != 32 {
         return Err(SecretsError::KekUnavailable {

@@ -58,8 +58,14 @@ pub const DEFAULT_ANTHROPIC_BASE_URL: &str = "https://api.anthropic.com";
 /// Nur an diesen Host gehen implizite Umgebungs-Credentials
 /// (`CLAUDE_CODE_OAUTH_TOKEN`, `ANTHROPIC_API_KEY`).
 pub(crate) const ANTHROPIC_API_HOST: &str = "api.anthropic.com";
-/// Default-Ausgabe-Token-Obergrenze, falls die Anfrage keine vorgibt.
-pub const DEFAULT_MAX_TOKENS: u32 = 4096;
+/// Default-Ausgabe-Token-Obergrenze, falls die Anfrage keine vorgibt
+/// (`ModelRequest::max_output_tokens == None`). Wird wie ein explizit
+/// angeforderter Wert über `anthropic_caps::clamp_max_tokens` auf das
+/// Ausgabe-Limit des Modells geklemmt.
+pub const DEFAULT_MAX_TOKENS: u32 = 16_384;
+/// Byte-Deckel je gerendertem Tool-Ergebnis im Messages-Body, wenn der
+/// Request keinen setzt (`ModelRequest::tool_result_max_bytes == None`).
+pub const DEFAULT_TOOL_RESULT_MAX_BYTES: usize = 64 * 1024;
 
 /// Warnhinweis für die Nutzung eines Abo-OAuth-/Setup-Tokens (Claude Free/Pro/Max)
 /// mit `harw` statt eines Console-API-Keys.
@@ -153,6 +159,10 @@ pub struct AnthropicMessagesProvider {
     credential_pool: Option<Arc<crate::credential_pool::CredentialPool<AnthropicCredential>>>,
     /// Pro-Modell-Entscheidung für SSE-Streaming (siehe [`crate::sse::StreamPolicy`]).
     stream_policy: crate::sse::StreamPolicy,
+    /// Client-seitige RPM/TPM-Budgets (siehe [`crate::budget`]); leer (ohne
+    /// Wirkung) bis `build_named_provider` sie über
+    /// [`Self::configure_budgets`] setzt.
+    budgets: crate::budget::ProviderBudgets,
 }
 
 impl AnthropicMessagesProvider {
@@ -188,6 +198,7 @@ impl AnthropicMessagesProvider {
             concurrency_limiter: None,
             credential_pool: None,
             stream_policy: crate::sse::StreamPolicy::default(),
+            budgets: crate::budget::ProviderBudgets::default(),
         })
     }
 
@@ -230,6 +241,13 @@ impl AnthropicMessagesProvider {
 
     pub(crate) fn configure_stream_policy(&mut self, policy: crate::sse::StreamPolicy) {
         self.stream_policy = policy;
+    }
+
+    /// Setzt die client-seitigen RPM/TPM-Budgets (siehe [`crate::budget`]);
+    /// aufgerufen von `build_named_provider` im Anthropic-Zweig mit dem
+    /// Ergebnis von `ProviderBudgetRegistry::configure_provider`.
+    pub(crate) fn configure_budgets(&mut self, budgets: crate::budget::ProviderBudgets) {
+        self.budgets = budgets;
     }
 
     pub(crate) fn configure_rate_limit(&mut self, rate_limit: Option<harw_config::RateLimitToml>) {
@@ -285,6 +303,7 @@ impl AnthropicMessagesProvider {
             self.concurrency_limiter.as_deref(),
             &self.rate_limiter,
         )
+        .with_budgets(&self.budgets)
     }
 
     /// Resolves the model for one request after checking its provider affinity.
@@ -476,7 +495,11 @@ fn push_content_block(messages: &mut Vec<Value>, role: &str, block: Value) {
 ///   (`{"type":"tool_use","id":<call_id>,"name":<tool_name>,"input":<args>}`).
 /// - `ToolResult` → `user`-Message mit einem `tool_result`-Content-Block
 ///   (`{"type":"tool_result","tool_use_id":<call_id>,"content":<text>}`),
-///   plus `"is_error":true` bei `Err`.
+///   plus `"is_error":true` bei `Err`. `<text>` entsteht — wie im
+///   OpenAI-kompatiblen Pfad — ausschließlich über
+///   [`harw_core::envelope::render_tool_result`] (Trust-Hülle für
+///   `Untrusted`, Byte-Deckel `request.tool_result_max_bytes`, sonst
+///   [`DEFAULT_TOOL_RESULT_MAX_BYTES`]).
 ///
 /// `request.tools` wird — sofern nicht leer — via [`build_anthropic_tools`]
 /// auf `body["tools"]` abgebildet; bei leerem Tool-Set bleibt das Feld unset
@@ -501,13 +524,16 @@ fn push_content_block(messages: &mut Vec<Value>, role: &str, block: Value) {
 ///
 /// Ist `request.reasoning_effort` `None`, bleiben beide Felder unset.
 ///
-/// `max_tokens` wird über [`anthropic_caps::clamp_max_tokens`] auf das
-/// Ausgabe-Limit des Modells geklemmt, bevor es auf `body["max_tokens"]`
-/// landet; für unbekannte Modelle bleibt der angeforderte Wert unverändert.
+/// Die Ausgabe-Obergrenze ist `request.max_output_tokens`, sofern gesetzt
+/// und > 0, sonst der Provider-Default `max_tokens`. Sie wird über
+/// [`anthropic_caps::clamp_max_tokens`] auf das Ausgabe-Limit des Modells
+/// geklemmt, bevor sie auf `body["max_tokens"]` landet; für unbekannte
+/// Modelle bleibt der Wert unverändert.
 ///
 /// # Arguments
 /// - `model` (`&str`): Modell-/Deployment-Name für das `model`-Feld.
-/// - `max_tokens` (`u32`): gewünschte Ausgabe-Token-Obergrenze (vor Clamping).
+/// - `max_tokens` (`u32`): Provider-Default der Ausgabe-Token-Obergrenze
+///   (vor Clamping), greift nur ohne `request.max_output_tokens`.
 /// - `request` (`&ModelRequest`): Quelle für System-Prompt, Fragmente,
 ///   Verlauf, Tools und optionales `reasoning_effort`.
 ///
@@ -523,6 +549,10 @@ pub fn build_messages_body(model: &str, max_tokens: u32, request: &ModelRequest)
 
     // Interne Namen wie `fs.read` verletzen Anthropics Namensmuster.
     let names = ToolNameCodec::for_request(request);
+    let mut renderer = super::ToolResultRenderer::new(request);
+    if request.tool_result_max_bytes.is_none() {
+        renderer.max_bytes = DEFAULT_TOOL_RESULT_MAX_BYTES;
+    }
     let mut messages: Vec<Value> = Vec::new();
     for message in request.history.to_model_messages() {
         match message {
@@ -549,10 +579,8 @@ pub fn build_messages_body(model: &str, max_tokens: u32, request: &ModelRequest)
                 );
             }
             harw_core::ModelMessage::ToolResult { call_id, result } => {
-                let (content, is_error) = match result {
-                    ToolCallResult::Success { value } => (value.to_string(), false),
-                    ToolCallResult::Error { message } => (message, true),
-                };
+                let is_error = matches!(result, ToolCallResult::Error { .. });
+                let content = renderer.render(&call_id, &result);
                 let mut block = serde_json::json!({
                     "type": "tool_result",
                     "tool_use_id": call_id.as_str(),
@@ -566,7 +594,11 @@ pub fn build_messages_body(model: &str, max_tokens: u32, request: &ModelRequest)
         }
     }
 
-    let max_tokens = crate::anthropic_caps::clamp_max_tokens(model, max_tokens);
+    let requested = request
+        .max_output_tokens
+        .filter(|tokens| *tokens > 0)
+        .unwrap_or(max_tokens);
+    let max_tokens = crate::anthropic_caps::clamp_max_tokens(model, requested);
     let mut body = serde_json::json!({
         "model": model,
         "max_tokens": max_tokens,
@@ -752,6 +784,9 @@ pub fn extract_anthropic_usage(body: &Value) -> TokenUsage {
 /// Anthropic-Werte werden 1:1 gemappt, ein unbekannter String landet in
 /// [`StopReason::Other`], und ein komplett fehlendes Feld fällt auf
 /// [`StopReason::EndTurn`] zurück (Default-Verhalten bei regulärer Antwort).
+/// `model_context_window_exceeded` (Eingabe + Ausgabe haben das
+/// Kontextfenster erreicht) wird zu [`StopReason::ContextWindowExceeded`],
+/// damit der Turn-Loop eine Notfall-Kompaktierung auslösen kann.
 ///
 /// # Arguments
 /// - `body` (`&Value`): der bereits geparste JSON-Response-Body.
@@ -767,6 +802,7 @@ pub fn extract_anthropic_stop_reason(body: &Value) -> StopReason {
         Some("stop_sequence") => StopReason::StopSequence,
         Some("pause_turn") => StopReason::PauseTurn,
         Some("refusal") => StopReason::Refusal { detail: None },
+        Some("model_context_window_exceeded") => StopReason::ContextWindowExceeded,
         Some(other) => StopReason::Other(other.to_owned()),
         None => StopReason::EndTurn,
     }
@@ -836,6 +872,51 @@ fn apply_anthropic_credential(
     })
 }
 
+/// Übersetzt eine nicht-erfolgreiche Anthropic-Antwort in den
+/// `ModelError`-Vertrag.
+///
+/// # Description
+/// Nutzt dieselbe Klassifikation wie der OpenAI-kompatible Pfad
+/// ([`crate::error::model_error_for_status`] plus
+/// [`crate::error::retry_after_hint`] für `retry-after-ms`/`Retry-After`/
+/// Body-Hinweis): 529 (overloaded) und 408/5xx → `Transient`, 401/403 →
+/// `Auth`, Kontextlängen-/Kontingent-Fehler → `ContextLength`/
+/// `QuotaExceeded`, übrige 4xx → `RequestFailed`. Einzige Abweichung: ein
+/// kurzfristiges 429 wird wie bisher als [`ModelError::RateLimited`]
+/// gemeldet (ebenfalls retryable); ohne Wartehinweis gilt der Fallback von
+/// [`super::parse_retry_after`] (30 s).
+///
+/// # Arguments
+/// - `status` (`u16`): HTTP-Status.
+/// - `request_id` (`Option<&str>`): begrenzte Gateway-Request-ID.
+/// - `retry_after` (`Option<&str>`): Wert des `Retry-After`-Headers.
+/// - `retry_after_ms` (`Option<&str>`): Wert des `retry-after-ms`-Headers.
+/// - `body` (`&str`): unvertrauenswürdiger Antwort-Body (nie im Ergebnis).
+///
+/// # Returns
+/// Die passende [`ModelError`]-Variante.
+fn anthropic_error_for_status(
+    status: u16,
+    request_id: Option<&str>,
+    retry_after: Option<&str>,
+    retry_after_ms: Option<&str>,
+    body: &str,
+) -> ModelError {
+    let hint = crate::error::retry_after_hint(retry_after, retry_after_ms, body);
+    match crate::error::model_error_for_status(status, request_id, hint, body) {
+        ModelError::Transient {
+            status: Some(429),
+            retry_after_secs,
+            message,
+        } => ModelError::RateLimited {
+            retry_after_secs: retry_after_secs
+                .unwrap_or_else(|| super::parse_retry_after(retry_after, body).as_secs()),
+            message,
+        },
+        other => other,
+    }
+}
+
 impl AnthropicMessagesProvider {
     /// Sendet **einen** Versuch mit dem durch `credential_idx` gewählten
     /// Credential (siehe [`Self::request_target`]). Der eigentliche Körper
@@ -848,7 +929,12 @@ impl AnthropicMessagesProvider {
     /// Siehe [`ModelProvider::respond`]; zusätzlich [`ModelError::Auth`] bei
     /// HTTP 401/403 (zuvor Teil von [`ModelError::RequestFailed`] — die
     /// Unterscheidung ist nötig, damit `credential_pool::should_failover`
-    /// einen ungültigen/entzogenen Schlüssel erkennen kann).
+    /// einen ungültigen/entzogenen Schlüssel erkennen kann). Fehlerstatus und
+    /// Transportfehler werden wie im OpenAI-kompatiblen Pfad klassifiziert
+    /// (siehe [`anthropic_error_for_status`] bzw.
+    /// [`crate::error::model_error_for_transport`]): 429 → `RateLimited`,
+    /// 408/5xx/529 und Verbindungsfehler → `Transient`, Zeitüberschreitung →
+    /// `Timeout` — alle vom `RetryingProvider` wiederholbar.
     async fn respond_once(
         &self,
         request: ModelRequest,
@@ -901,6 +987,34 @@ impl AnthropicMessagesProvider {
             }
         }
 
+        // Eingabe-Schätzung nur berechnen, wenn Budgets oder der Header-Pacer
+        // sie tatsächlich brauchen (Serialisierung des Wire-Bodys).
+        let estimated_input = if self.budgets.is_empty() && !self.rate_limiter.is_enabled() {
+            0
+        } else {
+            crate::budget::estimate_wire_tokens(&wire)
+        };
+        // Client-seitige RPM/TPM-Budgets (siehe [`crate::budget`]) und
+        // Header-Pacing zuerst: eine Wartepause darf keinen
+        // Nebenläufigkeits-Slot belegen, sonst blockiert ein wartender Request
+        // andere, die sofort senden dürften. Fail-fast, wenn schon die
+        // Eingabe-Schätzung ein Minutenlimit sprengt. Der Budget-Permit lebt
+        // bis zum Abgleich mit der tatsächlichen Nutzung unten.
+        let budget_permit = if self.budgets.is_empty() {
+            crate::budget::BudgetPermit::empty()
+        } else {
+            let max_output = wire
+                .get("max_tokens")
+                .and_then(Value::as_u64)
+                .unwrap_or_else(|| u64::from(self.max_tokens));
+            self.budgets
+                .acquire(model, estimated_input, max_output)
+                .await?
+        };
+        self.rate_limiter
+            .wait_for_slot_with_estimate(estimated_input)
+            .await
+            .map_err(crate::rate_budget_error)?;
         // Hartes Nebenläufigkeits-Limit (siehe [`Self::concurrency_limiter`]):
         // blockiert, bis ein Slot frei wird, statt fehlzuschlagen. Der Guard
         // bleibt bis zum Ende dieser Funktion (also bis der Response-Body
@@ -915,23 +1029,20 @@ impl AnthropicMessagesProvider {
             })?),
             None => None,
         };
-        self.rate_limiter.wait_for_slot().await;
+        // Transportfehler laufen über dieselbe Klassifikation wie der
+        // OpenAI-kompatible Pfad: Timeout → `Timeout`, Verbindungs-/Sendefehler
+        // → `Transient` (beide vom `RetryingProvider` wiederholbar).
         let response = builder
             .json(&wire)
             .timeout(self.request_timeout)
             .send()
             .await
-            .map_err(|error| {
-                ModelError::RequestFailed(super::HttpProviderError::from(error).to_string())
-            })?;
+            .map_err(|error| crate::error::model_error_for_transport(error, false))?;
 
         self.rate_limiter.observe_headers(response.headers());
         let status = response.status();
-        let retry_after_header = response
-            .headers()
-            .get("retry-after")
-            .and_then(|v| v.to_str().ok())
-            .map(str::to_owned);
+        let retry_after_header = super::header_string(response.headers(), "retry-after");
+        let retry_after_ms_header = super::header_string(response.headers(), "retry-after-ms");
         let request_id = super::provider_request_id(response.headers());
         if status.is_success()
             && let Some(sink) = stream_sink
@@ -939,48 +1050,49 @@ impl AnthropicMessagesProvider {
             let mut accumulator = crate::sse::AnthropicStreamAccumulator::default();
             crate::sse::read_sse(response, |frame| accumulator.push(&frame, Some(sink))).await?;
             let value = accumulator.finish()?;
-            return self.interpret_body(&request, model, &value);
+            let response = self.interpret_body(&request, model, &value)?;
+            budget_permit.reconcile(&response.usage);
+            return Ok(response);
         }
-        let body = response.text().await.map_err(|error| {
-            ModelError::RequestFailed(super::HttpProviderError::from(error).to_string())
-        })?;
-
-        if status.as_u16() == 429 {
-            // W6b — UIA-Sichtbarkeit: zählt jede beobachtete 429-Antwort
-            // dieses Providers (siehe
-            // `rate_limiter::ProviderRateLimiter::record_rate_limited`).
-            self.rate_limiter.record_rate_limited();
-            let retry_after = super::parse_retry_after(retry_after_header.as_deref(), &body);
-            return Err(ModelError::RateLimited {
-                retry_after_secs: retry_after.as_secs(),
-                message: super::sanitized_provider_error(
-                    status.as_u16(),
-                    request_id.as_deref(),
-                    &body,
-                ),
-            });
-        }
-
-        if status.as_u16() == 401 || status.as_u16() == 403 {
-            return Err(ModelError::Auth {
-                message: super::sanitized_provider_error(
-                    status.as_u16(),
-                    request_id.as_deref(),
-                    &body,
-                ),
-            });
-        }
+        let body = response
+            .text()
+            .await
+            .map_err(|error| crate::error::model_error_for_transport(error, true))?;
 
         if !status.is_success() {
-            return Err(ModelError::RequestFailed(super::sanitized_provider_error(
+            if status.as_u16() == 429 {
+                // W6b — UIA-Sichtbarkeit: zählt jede beobachtete 429-Antwort
+                // dieses Providers (siehe
+                // `rate_limiter::ProviderRateLimiter::record_rate_limited`).
+                self.rate_limiter.record_rate_limited();
+                // Sperrt alle Budget-Buckets dieses Requests (auch für bereits
+                // Wartende) für die `Retry-After`-Dauer.
+                let hint = crate::error::retry_after_hint(
+                    retry_after_header.as_deref(),
+                    retry_after_ms_header.as_deref(),
+                    &body,
+                );
+                self.budgets.penalize(model, hint.map(Duration::from_secs));
+            }
+            let error = anthropic_error_for_status(
                 status.as_u16(),
                 request_id.as_deref(),
+                retry_after_header.as_deref(),
+                retry_after_ms_header.as_deref(),
                 &body,
-            )));
+            );
+            tracing::debug!(
+                status = status.as_u16(),
+                retryable = error.is_retryable(),
+                "anthropic provider returned an error status"
+            );
+            return Err(error);
         }
 
         let value: Value = serde_json::from_str(&body)?;
-        self.interpret_body(&request, model, &value)
+        let response = self.interpret_body(&request, model, &value)?;
+        budget_permit.reconcile(&response.usage);
+        Ok(response)
     }
 
     /// Projiziert einen (ggf. aus SSE rekonstruierten) Messages-Body auf eine
@@ -1544,7 +1656,15 @@ mod tests {
     #[test]
     fn test_extract_anthropic_usage_missing_object_defaults() {
         let body = serde_json::json!({ "content": [] });
-        assert_eq!(extract_anthropic_usage(&body), TokenUsage::default());
+        // Anthropic meldet Cache-Tokens stets getrennt von `input_tokens`;
+        // die Semantik-Markierung bleibt auch ohne `usage`-Objekt gesetzt.
+        assert_eq!(
+            extract_anthropic_usage(&body),
+            TokenUsage {
+                cache_separate: true,
+                ..TokenUsage::default()
+            }
+        );
     }
 
     fn sample_tool_spec() -> ToolSpec {
@@ -1836,15 +1956,154 @@ mod tests {
             .get("content")
             .and_then(Value::as_array)
             .ok_or(TestError::Missing("content array"))?;
-        assert_eq!(
-            content[0].get("content").and_then(Value::as_str),
-            Some("boom")
-        );
+        // Untrusted (Default von `push_tool_result`) ⇒ Trust-Hülle um die
+        // Fehlermeldung (gemeinsamer Renderer, W3 C-PROTO).
+        let rendered = content[0]
+            .get("content")
+            .and_then(Value::as_str)
+            .ok_or(TestError::Missing("tool_result content"))?;
+        assert!(rendered.starts_with(harw_core::envelope::UNTRUSTED_BEGIN_PREFIX));
+        assert!(rendered.contains("status=error"));
+        assert!(rendered.contains("| boom"));
         assert_eq!(
             content[0].get("is_error").and_then(Value::as_bool),
             Some(true)
         );
         Ok(())
+    }
+
+    fn request_with_history(history: harw_core::ConversationHistory) -> ModelRequest {
+        ModelRequest {
+            stream: None,
+            system_prompt: String::new(),
+            instruction_fragments: Vec::new(),
+            context: Vec::new(),
+            history,
+            tools: Vec::new(),
+            context_assembly: Default::default(),
+            reasoning_effort: None,
+            model_id: None,
+            provider_id: None,
+            data_block: None,
+            max_output_tokens: None,
+            tool_result_max_bytes: None,
+            cancel: None,
+            identity: None,
+        }
+    }
+
+    fn first_tool_result_content(body: &Value) -> TestResult<String> {
+        body.get("messages")
+            .and_then(Value::as_array)
+            .and_then(|messages| messages.first())
+            .and_then(|message| message.get("content"))
+            .and_then(Value::as_array)
+            .and_then(|blocks| blocks.first())
+            .and_then(|block| block.get("content"))
+            .and_then(Value::as_str)
+            .map(str::to_owned)
+            .ok_or(TestError::Missing("tool_result content"))
+    }
+
+    #[test]
+    fn test_build_messages_body_caps_tool_result_at_default_budget() -> TestResult {
+        let mut history = harw_core::ConversationHistory::new();
+        history.push_tool_result(
+            harw_types::ToolCallId::from_str("call_big"),
+            ToolCallResult::success(Value::String("x".repeat(200 * 1024))),
+            5,
+        );
+        let body = build_messages_body("m", 256, &request_with_history(history));
+        let content = first_tool_result_content(&body)?;
+        assert!(content.len() <= DEFAULT_TOOL_RESULT_MAX_BYTES);
+        assert!(content.contains("[truncated: showing"));
+        assert!(content.contains(harw_core::envelope::UNTRUSTED_END_PREFIX));
+        Ok(())
+    }
+
+    #[test]
+    fn test_build_messages_body_caps_tool_result_at_request_hint() -> TestResult {
+        let mut history = harw_core::ConversationHistory::new();
+        history.push_tool_result(
+            harw_types::ToolCallId::from_str("call_big"),
+            ToolCallResult::success(Value::String("y".repeat(16 * 1024))),
+            5,
+        );
+        let request = request_with_history(history).with_tool_result_max_bytes(Some(2_048));
+        let body = build_messages_body("m", 256, &request);
+        let content = first_tool_result_content(&body)?;
+        assert!(content.len() <= 2_048);
+        assert!(content.contains("[truncated: showing"));
+        Ok(())
+    }
+
+    #[test]
+    fn test_build_messages_body_small_tool_result_is_not_truncated() -> TestResult {
+        let mut history = harw_core::ConversationHistory::new();
+        history.push_tool_result(
+            harw_types::ToolCallId::from_str("call_small"),
+            ToolCallResult::success(serde_json::json!({"temp": 20})),
+            5,
+        );
+        let body = build_messages_body("m", 256, &request_with_history(history));
+        let content = first_tool_result_content(&body)?;
+        assert!(content.contains(r#"| {"temp":20}"#));
+        assert!(!content.contains("[truncated:"));
+        Ok(())
+    }
+
+    #[test]
+    fn test_build_messages_body_honors_request_max_output_tokens() {
+        let request = request_with_history(harw_core::ConversationHistory::new())
+            .with_max_output_tokens(Some(2_000));
+        let body = build_messages_body("totally-unknown-deployment", DEFAULT_MAX_TOKENS, &request);
+        assert_eq!(body.get("max_tokens").and_then(Value::as_u64), Some(2_000));
+    }
+
+    #[test]
+    fn test_build_messages_body_request_max_output_tokens_is_clamped_by_caps() {
+        let request = request_with_history(harw_core::ConversationHistory::new())
+            .with_max_output_tokens(Some(u32::MAX));
+        let body = build_messages_body("claude-opus-5", DEFAULT_MAX_TOKENS, &request);
+        let expected = crate::anthropic_caps::clamp_max_tokens("claude-opus-5", u32::MAX);
+        assert!(
+            expected < u32::MAX,
+            "claude-opus-5 must have a known output cap"
+        );
+        assert_eq!(
+            body.get("max_tokens").and_then(Value::as_u64),
+            Some(u64::from(expected))
+        );
+    }
+
+    #[test]
+    fn test_build_messages_body_zero_or_missing_max_output_uses_default() {
+        for hint in [None, Some(0)] {
+            let request = request_with_history(harw_core::ConversationHistory::new())
+                .with_max_output_tokens(hint);
+            let body =
+                build_messages_body("totally-unknown-deployment", DEFAULT_MAX_TOKENS, &request);
+            assert_eq!(
+                body.get("max_tokens").and_then(Value::as_u64),
+                Some(u64::from(DEFAULT_MAX_TOKENS)),
+                "hint {hint:?}"
+            );
+        }
+        assert_eq!(DEFAULT_MAX_TOKENS, 16_384);
+    }
+
+    #[test]
+    fn test_extract_anthropic_stop_reason_maps_context_window_exceeded() {
+        let body = serde_json::json!({"stop_reason": "model_context_window_exceeded"});
+        assert_eq!(
+            extract_anthropic_stop_reason(&body),
+            StopReason::ContextWindowExceeded
+        );
+        let other = serde_json::json!({"stop_reason": "something_new"});
+        assert_eq!(
+            extract_anthropic_stop_reason(&other),
+            StopReason::Other("something_new".to_owned())
+        );
     }
 
     #[test]
@@ -2463,6 +2722,126 @@ mod tests {
             .join()
             .map_err(|_| TestError::Unexpected("mock server thread panicked".to_owned()))??;
 
+        Ok(())
+    }
+
+    #[test]
+    fn test_anthropic_error_for_status_529_overloaded_is_transient() {
+        let body = r#"{"type":"error","error":{"type":"overloaded_error","message":"Overloaded"}}"#;
+        let error = anthropic_error_for_status(529, Some("req-1"), None, None, body);
+        assert!(matches!(
+            error,
+            ModelError::Transient {
+                status: Some(529),
+                retry_after_secs: None,
+                ..
+            }
+        ));
+        assert!(error.is_retryable());
+    }
+
+    #[test]
+    fn test_anthropic_error_for_status_503_is_transient_with_retry_after() {
+        let error = anthropic_error_for_status(503, None, Some("4"), None, "upstream down");
+        assert!(matches!(
+            error,
+            ModelError::Transient {
+                status: Some(503),
+                retry_after_secs: Some(4),
+                ..
+            }
+        ));
+        assert!(error.is_retryable());
+        assert!(!error.to_string().contains("upstream down"));
+    }
+
+    #[test]
+    fn test_anthropic_error_for_status_429_uses_retry_after_ms() {
+        let body =
+            r#"{"type":"error","error":{"type":"rate_limit_error","message":"rate limited"}}"#;
+        let error = anthropic_error_for_status(429, None, Some("30"), Some("1500"), body);
+        assert!(matches!(
+            error,
+            ModelError::RateLimited {
+                retry_after_secs: 2,
+                ..
+            }
+        ));
+        assert!(error.is_retryable());
+    }
+
+    #[test]
+    fn test_anthropic_error_for_status_429_without_hint_falls_back_to_default() {
+        let error = anthropic_error_for_status(429, None, None, None, "{}");
+        assert!(matches!(
+            error,
+            ModelError::RateLimited {
+                retry_after_secs: 30,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn test_anthropic_error_for_status_auth_and_invalid_are_not_retryable() {
+        let auth = anthropic_error_for_status(401, None, None, None, "{}");
+        assert!(matches!(auth, ModelError::Auth { .. }));
+        assert!(!auth.is_retryable());
+        let forbidden = anthropic_error_for_status(403, None, None, None, "{}");
+        assert!(matches!(forbidden, ModelError::Auth { .. }));
+        let invalid = anthropic_error_for_status(
+            400,
+            None,
+            None,
+            None,
+            r#"{"type":"error","error":{"type":"invalid_request_error","message":"bad"}}"#,
+        );
+        assert!(matches!(invalid, ModelError::RequestFailed(_)));
+        assert!(!invalid.is_retryable());
+    }
+
+    #[tokio::test]
+    async fn respond_maps_request_timeout_to_retryable_timeout() -> TestResult {
+        use std::net::TcpListener;
+        use std::thread;
+
+        let listener = TcpListener::bind("127.0.0.1:0").map_err(ctx("bind mock server"))?;
+        let base_url = format!(
+            "http://{}/v1/messages",
+            listener.local_addr().map_err(ctx("mock address"))?
+        );
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let server = thread::spawn(move || -> TestResult {
+            // Verbindung annehmen, aber nie antworten, bis der Test fertig ist.
+            let (_stream, _) = listener.accept().map_err(ctx("accept mock request"))?;
+            let _ = release_rx.recv_timeout(Duration::from_secs(10));
+            Ok(())
+        });
+
+        let mut provider = AnthropicMessagesProvider::new(
+            base_url,
+            "configured-model",
+            AnthropicCredential::ApiKey(SecretString::new("sk-secret".into())),
+        )
+        .map_err(ctx("AnthropicMessagesProvider::new"))?;
+        provider.request_timeout = Duration::from_millis(100);
+
+        let response = provider.respond(request_with_ids(None, None)).await;
+        let _ = release_tx.send(());
+        server
+            .join()
+            .map_err(|_| TestError::Unexpected("mock server thread panicked".to_owned()))??;
+
+        let Err(error) = response else {
+            return Err(TestError::Unexpected(
+                "stalled server must surface as an error".to_owned(),
+            ));
+        };
+        assert!(
+            matches!(error, ModelError::Timeout { .. }),
+            "expected Timeout, got {error:?}"
+        );
+        assert!(error.is_retryable());
         Ok(())
     }
 }

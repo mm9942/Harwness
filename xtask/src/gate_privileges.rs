@@ -611,9 +611,7 @@ pub fn run() -> Result<GateReport, String> {
         .map_err(|error| format!("Workspace-Graph nicht lesbar: {error}"))?;
 
     for binary in missing_binaries(&graph) {
-        println!(
-            "privileges: '{binary}' hat noch keine Abhängigkeiten (Gerüst) — nicht geprüft"
-        );
+        println!("privileges: '{binary}' hat noch keine Abhängigkeiten (Gerüst) — nicht geprüft");
     }
 
     Ok(evaluate(&graph))
@@ -739,7 +737,10 @@ mod tests {
         let report = evaluate(&g);
 
         assert!(!report.is_green());
-        assert_eq!(report.checked, 1, "nur harw-sentinel ist im Graphen vorhanden");
+        assert_eq!(
+            report.checked, 1,
+            "nur harw-sentinel ist im Graphen vorhanden"
+        );
         assert!(
             report.violations.iter().any(|v| {
                 v.contains("harw-sentinel (unprivilegiert)")
@@ -776,8 +777,7 @@ mod tests {
         assert!(!report.is_green());
         assert!(
             report.violations.iter().any(|v| {
-                v.contains("harw-brandneue-sensor-crate")
-                    && v.contains("keine Fähigkeitszuordnung")
+                v.contains("harw-brandneue-sensor-crate") && v.contains("keine Fähigkeitszuordnung")
             }),
             "eine nicht eingetragene Crate muss als Verstoß erscheinen: {:?}",
             report.violations
@@ -796,7 +796,10 @@ mod tests {
         let report = evaluate(&g);
 
         assert!(report.is_green());
-        assert_eq!(report.checked, 1, "nur harw-sentinel wurde tatsächlich geprüft");
+        assert_eq!(
+            report.checked, 1,
+            "nur harw-sentinel wurde tatsächlich geprüft"
+        );
         assert_eq!(
             missing_binaries(&g),
             vec!["harw-probe-fs", "harw-probe-bpf", "harw-warden"]
@@ -815,7 +818,12 @@ mod tests {
         assert_eq!(report.checked, 0);
         assert_eq!(
             missing_binaries(&g),
-            vec!["harw-sentinel", "harw-probe-fs", "harw-probe-bpf", "harw-warden"]
+            vec![
+                "harw-sentinel",
+                "harw-probe-fs",
+                "harw-probe-bpf",
+                "harw-warden"
+            ]
         );
     }
 
@@ -993,7 +1001,10 @@ mod tests {
 
     #[test]
     fn test_lookup_privilege_returns_none_for_unknown_and_some_for_known() {
-        assert_eq!(lookup_privilege("harw-dod-bpf"), Some(RequiredPrivilege::Bpf));
+        assert_eq!(
+            lookup_privilege("harw-dod-bpf"),
+            Some(RequiredPrivilege::Bpf)
+        );
         assert_eq!(lookup_privilege("irgendeine-neue-crate"), None);
     }
 

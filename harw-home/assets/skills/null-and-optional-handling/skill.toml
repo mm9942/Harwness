@@ -1,0 +1,5 @@
+name = "null-and-optional-handling"
+description = "Use when ein Wert fehlen kann (null/undefined/None/nil/Option/Optional) und du ihn entpacken, prüfen oder in einen Fehler umwandeln musst — in TypeScript, Python, Go, Java, C# oder Rust. Trigger: tiefe `if (x != null)`-Verschachtelung, Non-Null-Assertion `x!`, `Optional.get()`, `.unwrap()`, `if x:` bei 0/\"\"-Werten, `||` statt `??`, Go-Map-Zugriff ohne comma-ok, NullPointerException/TypeError \"cannot read properties of undefined\". Lehrt Guard-Clauses/Early Return, Optional→Fehler mit Kontext (lazy), optional chaining ohne Kopie, und wann fehlend ein Fehler vs. ein normaler Fall ist. Sprachunabhängige Variante von rust-if-let-let-else / rust-ok-or-else / rust-as-ref / rust-while-let."
+enabled = true
+instructions_file = "instructions.md"
+tools = ["filesystem.read"]

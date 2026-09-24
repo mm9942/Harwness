@@ -370,6 +370,7 @@ fn persist_outcome(home: &Path, outcome: &harw_tui::SetupOutcome) -> Result<(), 
 
     let model = ModelToml {
         stream: None,
+        rate_limit: None,
         id: model_id.clone(),
         name: None,
         provider: outcome.provider_id.clone(),
@@ -403,6 +404,7 @@ fn persist_outcome(home: &Path, outcome: &harw_tui::SetupOutcome) -> Result<(), 
         }
         let extra_model = ModelToml {
             stream: None,
+            rate_limit: None,
             id: extra_id.clone(),
             name: None,
             provider: outcome.provider_id.clone(),

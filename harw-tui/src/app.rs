@@ -109,6 +109,8 @@ use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, Paragraph, Wrap};
+use unicode_segmentation::UnicodeSegmentation;
+use unicode_width::UnicodeWidthStr;
 
 use harw_authority::SandboxSpec;
 use harw_core::cancel::{CancelReason, CancelToken};
@@ -145,7 +147,7 @@ use crate::command_exec::{
     ShellRunOutcome, busy_availability_for, dispatch_command_with_shell_result,
     dispatch_slash_command, execute_command_as,
 };
-use crate::command_popup::{CommandPopup, PopupAction, TabOutcome};
+use crate::command_popup::{CommandPopup, PopupAction, PopupMode, TabOutcome};
 use crate::events::{HarwEvent, HarwEventSender};
 use crate::export::{
     self, ExportAgentEntry, ExportEntry, ExportError, ExportErrorEntry, ExportMeta,
@@ -154,10 +156,11 @@ use crate::export::{
 use crate::frame_requester::{FrameRequester, MIN_FRAME_INTERVAL};
 use crate::history_cell::{
     AssistantHistoryCell, GoalCell, HistoryCell, PlainHistoryCell, PlanGraphCell,
-    ReasoningHistoryCell, SharedToolCell, SubAgentCell, SubAgentStatus, ToolCell, ToolGroupCell,
-    ToolState, ToolVerbosity, UserHistoryCell,
+    ReasoningHistoryCell, SharedReasoningCell, SharedToolCell, SubAgentCell, SubAgentStatus,
+    ToolCell, ToolGroupCell, ToolState, ToolVerbosity, UserHistoryCell,
 };
 use crate::host_permit_dialog::{HostPermitPrompt, HostPermitPromptReceiver, HostPermitVariant};
+use crate::keybindings::{KeyAction, KeyBindings};
 use crate::model_switch_picker::{
     ModelEntry, ModelSwitchPicker, PickerAction as ModelSwitchAction, PickerTarget, ProviderEntry,
 };
@@ -166,13 +169,23 @@ use crate::model_switch_picker::{
 // Moduldoku) — der Fragevertrag und die Ausstellungslogik leben dort bzw. in
 // `harw_tool_shell::exec::ShellExecutor::authorize_host_command`; `app.rs`
 // besitzt nur noch Rendering, Vorauswahl-Anzeige und das Arming-Delay.
+use crate::CommandRegistry;
+use crate::command_data;
+use crate::help_overlay::{HelpOverlay, HelpTab};
 use crate::input_editor::{InputAction, InputEditor};
 use crate::input_history::InputHistoryStore;
-use crate::runtime_commands;
-use crate::{
-    CapabilitySet, CommandAction, CommandRegistry, DispatchContext, Invocation, InvocationSurface,
-    ShellCapability,
+use crate::kanban_board::KanbanBoard;
+use crate::local_commands::{self, LocalCommandContext, LocalIntercept, PanelToggle};
+use crate::mention::{MentionLimits, expand_file_mentions, scan_mention_candidates};
+use crate::mention_popup::{
+    MentionCandidate, MentionPopup, MentionPopupAction, current_mention_query,
 };
+use crate::mode_picker::ModePicker;
+use crate::model_roles_view::ModelRolesView;
+use crate::overlay_view::{OverlayOutcome, OverlayView};
+use crate::runtime_commands;
+use crate::status_line;
+use crate::workbench_pane::{PaneCommand, WorkbenchPane};
 // Nur Tests (über `use super::*`) rufen die in `runtime_root` gewanderte
 // Coercion-Hilfe noch unqualifiziert auf; Prod in app.rs nutzt sie nicht.
 use crate::runtime_root::TitleJobContext;
@@ -351,6 +364,24 @@ impl TurnEventState {
 
 // ── Werkzeugzellen: Handle, Verbosity-Wrapper (Plan Schritt 2) ───────────────
 
+/// Zustand der Agenten-Detailansicht (Enter im Agenten-Panel).
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct AgentDetailState {
+    /// Der angezeigte Agent.
+    agent: SessionId,
+    /// Abstand in umbrochenen Zeilen vom Ende der Spur; `0` folgt dem
+    /// neuesten Eintrag.
+    scroll: u16,
+    /// Reasoning-Einträge vollständig zeigen (`r` schaltet um).
+    show_reasoning: bool,
+    /// Vollbild-Zustand des Panels vor dem Öffnen (wird beim Schließen
+    /// wiederhergestellt).
+    prev_maximized: bool,
+}
+
+/// Seitenweite (Zeilen) für PageUp/PageDown in der Agenten-Detailansicht.
+const AGENT_DETAIL_PAGE: u16 = 10;
+
 /// Kennung einer einzelnen oder gruppierten Werkzeugzelle, wie sie
 /// [`ChatApp`] für Ctrl+O „letzte bzw. alle aufklappen“ vorhält.
 ///
@@ -364,6 +395,9 @@ enum ToolCellHandle {
     Single(SharedToolCell),
     /// Eine Sammelzelle aufeinanderfolgender lesender `fs.*`-Aufrufe.
     Group(Arc<Mutex<ToolGroupCell>>),
+    /// Eine einklappbare Reasoning-Zelle (Ctrl+O klappt sie wie
+    /// Werkzeugzellen auf/zu).
+    Reasoning(SharedReasoningCell),
 }
 
 impl ToolCellHandle {
@@ -376,6 +410,10 @@ impl ToolCellHandle {
         match self {
             Self::Single(cell) => cell.lock().map(|guard| guard.expanded).unwrap_or(false),
             Self::Group(group) => group.lock().map(|guard| guard.expanded).unwrap_or(false),
+            Self::Reasoning(cell) => cell
+                .lock()
+                .map(|guard| guard.is_expanded())
+                .unwrap_or(false),
         }
     }
 
@@ -390,6 +428,11 @@ impl ToolCellHandle {
             Self::Group(group) => {
                 if let Ok(mut guard) = group.lock() {
                     guard.expanded = expanded;
+                }
+            }
+            Self::Reasoning(cell) => {
+                if let Ok(mut guard) = cell.lock() {
+                    guard.set_expanded(expanded);
                 }
             }
         }
@@ -440,6 +483,8 @@ impl HistoryCell for ToolHistoryCell {
                     style::warning_style(theme),
                 ))],
             },
+            // Reasoning-Zellen rendern sich selbst (Verbosity irrelevant).
+            ToolCellHandle::Reasoning(cell) => cell.display_lines(width, theme),
         }
     }
 }
@@ -530,7 +575,39 @@ enum Overlay {
         /// Der eigentliche Auswahldialog.
         dialog: ChoiceDialog,
     },
+    /// Generische Ansicht (Hilfe, Modelle je Rolle, Modus-Auswahl, Kanban,
+    /// Wissensbrowser). Schreibaktionen erzeugen Slash-Zeilen; Daten kommen
+    /// über [`OverlayView::refresh_command`] bzw. `Fetch` aus `OpOutput.data`.
+    View(Box<dyn OverlayView>),
 }
+
+/// Ausstehender Datenabruf (`OpOutput.data`) für eine Ansicht oder das
+/// Werkbank-Panel.
+///
+/// # Beschreibung
+/// Tastenbehandlung ist synchron; die eigentliche Ausführung über
+/// [`command_data::execute_command_with_data`] ist `async` und läuft deshalb
+/// erst am Anfang der nächsten Runde von [`run_loop`]
+/// ([`process_pending_fetches`]). Die Ergebnisse landen nie im Chat.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum DataFetch {
+    /// Befehl für die generische Ansicht der angegebenen Generation; ein
+    /// Ergebnis für eine inzwischen ersetzte Ansicht wird verworfen.
+    Overlay {
+        /// Auszuführende Slash-Zeile.
+        command: String,
+        /// Generation der Ansicht beim Einreihen.
+        generation: u64,
+    },
+    /// `/workbench show` für das Werkbank-Panel.
+    Workbench,
+}
+
+/// Bekannte Agentenrollen für `@rolle`-Erwähnungen und das `@`-Popup.
+const KNOWN_ROLES: &[&str] = harw_registry_defaults::profile::role_names::ALL;
+
+/// Höchstzahl der Dateikandidaten im `@`-Popup.
+const MENTION_CANDIDATE_CAP: usize = 200;
 
 /// Plan- und Ziel-Dienste, die der Renderer für [`PlanGraphCell`] und
 /// [`GoalCell`] braucht.
@@ -924,6 +1001,12 @@ pub struct ChatApp {
     live_reasoning: String,
     /// Sichtbarkeit und Fokus der Seitenpanels.
     panels: crate::panes::PanelState,
+    /// Offene Detailansicht eines Agenten im Agenten-Panel (Enter);
+    /// `None` = Listenansicht.
+    agent_detail: Option<AgentDetailState>,
+    /// Aktive Tastenbelegung (Standard oder aus der Keybindings-Datei, siehe
+    /// [`Self::set_key_bindings`]); gilt für Panels und Composer.
+    key_bindings: KeyBindings,
     /// Explorer-Panel über den gesamten Projektbaum; beim ersten Einblenden
     /// angelegt und im Hintergrund indiziert.
     explorer: Option<crate::explorer_panel::ExplorerPanel>,
@@ -1098,6 +1181,21 @@ pub struct ChatApp {
     /// zur Hand ist; von einem Aufrufer, der einen Guard besitzt, über
     /// [`Self::take_needs_terminal_reassert`] konsumiert.
     needs_terminal_reassert: bool,
+    /// Werkbank-Panel (rechte Spalte, `F5`); lädt über
+    /// [`WorkbenchPane::REFRESH_COMMAND`], sobald sichtbar und veraltet.
+    workbench: WorkbenchPane,
+    /// Geöffnetes `@`-Erwähnungs-Popup oder `None`.
+    mention_popup: Option<MentionPopup>,
+    /// Ausstehende Datenabrufe, abgearbeitet am Anfang jeder
+    /// [`run_loop`]-Runde (siehe [`DataFetch`]).
+    pending_fetches: Vec<DataFetch>,
+    /// Slash-Zeilen aus synchronen Pfaden ohne Ereigniskanal (z. B.
+    /// Werkbank-Tasten), die [`run_loop`] im Leerlauf als
+    /// [`HarwEvent::Command`] abschickt.
+    pending_commands: std::collections::VecDeque<String>,
+    /// Generation der aktuell offenen generischen Ansicht
+    /// ([`Overlay::View`]); wächst bei jedem Öffnen.
+    overlay_generation: u64,
 }
 
 /// Handgeschriebene `Debug`-Implementierung, da [`CommandAdapter`] (enthält
@@ -1124,6 +1222,7 @@ impl std::fmt::Debug for ChatApp {
             .field("has_runtime", &self.runtime.is_some())
             .field("tool_verbosity", &self.tool_verbosity)
             .field("tool_cells_len", &self.tool_cells.len())
+            .field("agent_detail", &self.agent_detail)
             .field(
                 "has_pending_approval_dialog",
                 &self.pending_approval_dialog.is_some(),
@@ -1212,7 +1311,8 @@ impl ChatApp {
             escape_armed: false,
             scroll: ChatScroll::new(),
             input_history,
-            command_registry: CommandRegistry::from_command_adapters(&adapters),
+            command_registry: CommandRegistry::from_command_adapters(&adapters)
+                .with_local_specs(crate::command_catalog::local_command_specs()),
             command_popup: None,
             theme: style::detect_theme(),
             total_usage: TokenUsage::default(),
@@ -1221,6 +1321,8 @@ impl ChatApp {
             live_stream: String::new(),
             live_reasoning: String::new(),
             panels: crate::panes::PanelState::default(),
+            agent_detail: None,
+            key_bindings: KeyBindings::default(),
             explorer: None,
             adapters,
             sandbox,
@@ -1259,6 +1361,11 @@ impl ChatApp {
             last_shell_command: None,
             pending_turn_user_cell_override: None,
             needs_terminal_reassert: false,
+            workbench: WorkbenchPane::new(),
+            mention_popup: None,
+            pending_fetches: Vec::new(),
+            pending_commands: std::collections::VecDeque::new(),
+            overlay_generation: 0,
         }
     }
 
@@ -1296,6 +1403,12 @@ impl ChatApp {
     /// Orchestrierungshistorie für die Agentenbaum-Projektion.
     pub(crate) fn set_historic_agent_events(&mut self, events: Vec<AgentOrchestrationEvent>) {
         self.historic_agent_events = events;
+    }
+
+    /// Ersetzt die aktive Tastenbelegung (z. B. aus der Keybindings-Datei
+    /// geladen); gilt ab der nächsten Taste für Panels und Composer.
+    pub(crate) fn set_key_bindings(&mut self, bindings: KeyBindings) {
+        self.key_bindings = bindings;
     }
 
     /// Rebinds persistent input history to the runtime-selected Harw home.
@@ -1591,10 +1704,11 @@ impl ChatApp {
     /// # Argumente
     /// - `target` (`PickerTarget`): Umschalt-Kontext (siehe oben).
     pub(crate) fn open_model_switch_picker(&mut self, target: PickerTarget) {
-        let context_label = match &target {
-            PickerTarget::Orchestrator => "Modell-Auswahl",
-            PickerTarget::Uia => "UIA-Modell-Auswahl",
-            PickerTarget::UiaWorker { .. } => "UIA-Worker-Modell-Auswahl",
+        let context_label: String = match &target {
+            PickerTarget::Orchestrator => "Modell-Auswahl".to_owned(),
+            PickerTarget::Uia => "UIA-Modell-Auswahl".to_owned(),
+            PickerTarget::UiaWorker { .. } => "UIA-Worker-Modell-Auswahl".to_owned(),
+            PickerTarget::Role { .. } => target.context_label(),
         };
 
         let Some(config) = self.resolved_config() else {
@@ -1678,6 +1792,10 @@ impl ChatApp {
                 Some(fixed_provider.clone()),
                 config.harness.uia_worker_model.clone(),
             ),
+            PickerTarget::Role { role } => {
+                let row = harw_config::resolve_role_model(&config, *role);
+                (row.provider, row.model)
+            }
         };
 
         let Some(picker) = ModelSwitchPicker::new(
@@ -1973,7 +2091,73 @@ impl ChatApp {
         true
     }
 
-    /// Gibt `true` zurück, wenn mindestens eine Werkzeugzelle eingeklappt ist
+    /// Öffnet die Detailansicht für den im Agenten-Panel ausgewählten Agenten
+    /// und maximiert das Panel dafür.
+    ///
+    /// # Rückgabe
+    /// `true`, wenn ein Agent ausgewählt war (Redraw nötig).
+    fn open_agent_detail(&mut self) -> bool {
+        let Some(agent) = self.agent_monitor.selected_agent() else {
+            return false;
+        };
+        let prev_maximized = self
+            .agent_detail
+            .as_ref()
+            .map_or(self.panels.maximized, |detail| detail.prev_maximized);
+        self.agent_detail = Some(AgentDetailState {
+            agent,
+            scroll: 0,
+            show_reasoning: true,
+            prev_maximized,
+        });
+        self.panels.maximized = true;
+        true
+    }
+
+    /// Schließt die Detailansicht und stellt den vorherigen Vollbild-Zustand
+    /// des Agenten-Panels wieder her.
+    fn close_agent_detail(&mut self) {
+        if let Some(detail) = self.agent_detail.take() {
+            self.panels.maximized = detail.prev_maximized;
+        }
+    }
+
+    /// Schließt die Detailansicht, wenn das Agenten-Panel Fokus oder
+    /// Sichtbarkeit verloren hat (F3/F4/Esc über die Panel-Logik).
+    fn sync_agent_detail(&mut self) {
+        let agents_active =
+            self.panels.focus == crate::panes::PaneFocus::Agents && self.panels.agents_visible;
+        if agents_active || self.agent_detail.is_none() {
+            return;
+        }
+        let keep_maximized = self.panels.maximized;
+        self.close_agent_detail();
+        // Ein anderes Panel behält einen gerade gewählten Vollbild-Zustand;
+        // der Chat braucht keinen.
+        self.panels.maximized = match self.panels.focus {
+            crate::panes::PaneFocus::Chat => false,
+            _ => keep_maximized && self.panels.maximized,
+        };
+    }
+
+    /// Hängt eine (eingeklappte) Reasoning-Zelle an den Verlauf und merkt sie
+    /// für Ctrl+O vor (Runde 2 / Welle 2).
+    ///
+    /// # Argumente
+    /// - `summary` (`String`): Zusammengefasster Denkprozess-Text.
+    /// - `origin` (`Option<&str>`): Rolle eines Kind-Agenten; `None` für den
+    ///   Hauptagenten.
+    fn push_reasoning_cell(&mut self, summary: String, origin: Option<&str>) {
+        let mut cell = ReasoningHistoryCell::new(summary);
+        if let Some(role) = origin {
+            cell = cell.with_origin(role);
+        }
+        let shared = cell.into_shared();
+        self.push_cell(Box::new(Arc::clone(&shared)));
+        self.tool_cells.push(ToolCellHandle::Reasoning(shared));
+    }
+
+    /// Gibt `true` zurück, wenn mindestens eine Werkzeug- oder Reasoning-Zelle eingeklappt ist
     /// (Statuszeilen-Hinweis auf Ctrl+O, Plan Schritt 5).
     #[must_use]
     fn has_collapsed_tool_cells(&self) -> bool {
@@ -2407,24 +2591,133 @@ impl ChatApp {
     /// Aktualisiert den Filtertext (ohne führendes `/`) wenn das Popup bereits
     /// offen ist. (Spec-Abschnitt 2.8 / SLICE 5)
     fn sync_popup(&mut self) {
-        // Das Popup ist Autocomplete für den COMMAND-NAMEN. Sobald ein
-        // Leerzeichen getippt wird (Argument-Eingabe beginnt), wird es
-        // geschlossen: sonst fängt der Popup-Zweig Ziffern in Argumenten
-        // (z. B. Job-IDs `job-42`) als Auswahl-Index ab und die Zeichen
-        // erreichen die Eingabe nie.
-        if let Some(query) = self.input.text().strip_prefix('/') {
-            if !query.contains(char::is_whitespace) {
-                if let Some(popup) = self.command_popup.as_mut() {
-                    popup.on_query_change(query);
-                } else {
-                    let mut popup = CommandPopup::new(&self.command_registry);
-                    popup.on_query_change(query);
-                    self.command_popup = Some(popup);
-                }
-                return;
+        self.sync_command_popup();
+        self.sync_mention_popup();
+    }
+
+    /// Befehls-Popup in zwei Stufen.
+    ///
+    /// # Beschreibung
+    /// Stufe 1 (`/mo`): Autocomplete für den Befehlsnamen, solange kein
+    /// Leerraum getippt ist. Stufe 2 (`/kanban mo`): Folgt auf einen
+    /// vollständigen, bekannten Befehl genau ein Leerzeichen-getrenntes Wort,
+    /// bietet [`CommandPopup::for_subcommands`] dessen Unterkommandos an.
+    /// Sobald danach weiterer Leerraum folgt (Argument-Eingabe) oder nichts
+    /// passt, schließt das Popup — sonst fingen Ziffern in Argumenten (z. B.
+    /// Job-IDs `job-42`) die Eingabe ab.
+    fn sync_command_popup(&mut self) {
+        let Some(query) = self.input.text().strip_prefix('/') else {
+            self.command_popup = None;
+            return;
+        };
+        if !query.contains(char::is_whitespace) {
+            let reuse = matches!(
+                self.command_popup.as_ref().map(CommandPopup::mode),
+                Some(PopupMode::CommandName)
+            );
+            if !reuse {
+                self.command_popup = Some(CommandPopup::new(&self.command_registry));
+            }
+            if let Some(popup) = self.command_popup.as_mut() {
+                popup.on_query_change(query);
+            }
+            return;
+        }
+        let Some((name, rest)) = query.split_once(char::is_whitespace) else {
+            self.command_popup = None;
+            return;
+        };
+        let sub_query = rest.trim_start();
+        if sub_query.contains(char::is_whitespace) {
+            self.command_popup = None;
+            return;
+        }
+        let Some(spec) = self.command_registry.find(name) else {
+            self.command_popup = None;
+            return;
+        };
+        let canonical = spec.name.as_str().to_owned();
+        let reuse = matches!(
+            self.command_popup.as_ref().map(CommandPopup::mode),
+            Some(PopupMode::Subcommand { command }) if *command == canonical
+        );
+        if !reuse {
+            self.command_popup = CommandPopup::for_subcommands(spec);
+        }
+        let sub_query = sub_query.to_owned();
+        if let Some(popup) = self.command_popup.as_mut() {
+            popup.on_query_change(&sub_query);
+            if popup.is_empty() {
+                self.command_popup = None;
             }
         }
-        self.command_popup = None;
+    }
+
+    /// Öffnet, filtert oder schließt das `@`-Erwähnungs-Popup passend zum
+    /// Wort unter dem Cursor (nur außerhalb des Befehls-Popups).
+    fn sync_mention_popup(&mut self) {
+        if self.command_popup.is_some() {
+            self.mention_popup = None;
+            return;
+        }
+        let cursor = editor_cursor_byte(&self.input);
+        let query = current_mention_query(self.input.text(), cursor).map(|(_, q)| q.to_owned());
+        match query {
+            Some(query) => {
+                if self.mention_popup.is_none() {
+                    self.mention_popup = Some(MentionPopup::new(self.mention_candidates()));
+                }
+                if let Some(popup) = self.mention_popup.as_mut() {
+                    popup.filter(&query);
+                }
+            }
+            None => self.mention_popup = None,
+        }
+    }
+
+    /// Kandidaten für das `@`-Popup: bekannte Rollen und bis zu
+    /// [`MENTION_CANDIDATE_CAP`] Dateien unter der Projektwurzel.
+    fn mention_candidates(&self) -> Vec<MentionCandidate> {
+        let mut candidates: Vec<MentionCandidate> = KNOWN_ROLES
+            .iter()
+            .map(|role| MentionCandidate::role(*role))
+            .collect();
+        if !self.project_root.is_empty() {
+            candidates.extend(
+                scan_mention_candidates(
+                    std::path::Path::new(&self.project_root),
+                    MENTION_CANDIDATE_CAP,
+                )
+                .into_iter()
+                .map(MentionCandidate::file),
+            );
+        }
+        candidates
+    }
+
+    /// Ersetzt das `@token` unter dem Cursor durch `@insert` und schließt das
+    /// Popup. Ohne folgenden Text wird ein Leerzeichen angehängt.
+    fn accept_mention(&mut self, insert: &str) {
+        let text = self.input.text().to_owned();
+        let cursor = editor_cursor_byte(&self.input);
+        self.mention_popup = None;
+        let Some((start, query)) = current_mention_query(&text, cursor) else {
+            return;
+        };
+        let end = start + 1 + query.len();
+        let (Some(before), Some(tail)) = (text.get(..start), text.get(end..)) else {
+            return;
+        };
+        let mut head = format!("{before}@{insert}");
+        if tail.is_empty() {
+            head.push(' ');
+        }
+        self.input.clear();
+        self.input.insert_str(&head);
+        self.input.insert_str(tail);
+        for _ in 0..tail.graphemes(true).count() {
+            self.input.move_left();
+        }
     }
 
     /// Gibt `true` zurück wenn das `/command`-Popup aktuell geöffnet ist.
@@ -2435,6 +2728,242 @@ impl ChatApp {
     fn has_popup(&self) -> bool {
         self.command_popup.is_some()
     }
+
+    /// Aktiver Freigabemodus aus der geteilten Zelle der Runtime-Montage.
+    fn current_approval(&self) -> Option<ApprovalMode> {
+        self.runtime.as_ref().map(|rt| rt.approval_mode().get())
+    }
+
+    /// Berechtigungsstufe des TUI-Nutzers; ohne Runtime-Montage die
+    /// niedrigste Stufe.
+    fn caller_tier(&self) -> crate::PermissionTier {
+        self.runtime
+            .as_ref()
+            .map_or(crate::PermissionTier::Observer, |rt| {
+                runtime_commands::caller_tier(rt.principal())
+            })
+    }
+
+    /// Live-Provider und -Modell der Sitzung: Controller-Snapshot, sonst das
+    /// zuletzt gemeldete Sitzungsmodell.
+    fn live_model(&self) -> (Option<String>, Option<String>) {
+        let snap = self.session_controller.snapshot();
+        let model = snap
+            .active_model
+            .clone()
+            .or_else(|| self.export_session_model.clone());
+        (snap.active_provider, model)
+    }
+
+    /// Öffnet eine generische Ansicht und reiht ihren Initial-Abruf ein.
+    fn open_overlay_view(&mut self, view: Box<dyn OverlayView>) {
+        self.overlay_generation = self.overlay_generation.wrapping_add(1);
+        self.overlay = Some(Overlay::View(view));
+        self.queue_overlay_refresh();
+    }
+
+    /// Reiht den `refresh_command` der offenen generischen Ansicht ein.
+    fn queue_overlay_refresh(&mut self) {
+        let command = match &self.overlay {
+            Some(Overlay::View(view)) => view.refresh_command(),
+            _ => None,
+        };
+        if let Some(command) = command {
+            self.queue_overlay_fetch(command);
+        }
+    }
+
+    /// Reiht einen Datenabruf für die offene generische Ansicht ein
+    /// (doppelte Einträge werden zusammengefasst).
+    fn queue_overlay_fetch(&mut self, command: String) {
+        let fetch = DataFetch::Overlay {
+            command,
+            generation: self.overlay_generation,
+        };
+        if !self.pending_fetches.contains(&fetch) {
+            self.pending_fetches.push(fetch);
+        }
+    }
+
+    /// `true`, wenn das Werkbank-Panel sichtbar ist und neu laden sollte.
+    fn workbench_needs_refresh(&self) -> bool {
+        self.panels.workbench_visible && self.workbench.is_stale()
+    }
+
+    /// Schaltet das Werkbank-Panel um (wie `F5`); beim Einblenden wird es
+    /// als veraltet markiert und damit neu geladen.
+    fn toggle_workbench(&mut self) {
+        self.panels.workbench_visible = !self.panels.workbench_visible;
+        if self.panels.workbench_visible {
+            self.workbench.mark_stale();
+        } else if self.panels.focus == crate::panes::PaneFocus::Workbench {
+            self.panels.focus = crate::panes::PaneFocus::Chat;
+            self.panels.maximized = false;
+        }
+    }
+
+    /// Setzt die Composer-Zeile auf `text` (Cursor am Ende) und gibt den
+    /// Fokus an den Chat.
+    fn prefill_composer(&mut self, text: &str) {
+        self.input.clear();
+        self.input.insert_str(text);
+        self.panels.focus = crate::panes::PaneFocus::Chat;
+        self.panels.maximized = false;
+        self.sync_popup();
+    }
+
+    /// Tasten des fokussierten Werkbank-Panels.
+    ///
+    /// # Rückgabe
+    /// `true`, wenn neu gezeichnet werden soll.
+    fn handle_workbench_key(&mut self, key: KeyEvent) -> bool {
+        match self.workbench.handle_key(key) {
+            PaneCommand::None => false,
+            PaneCommand::Redraw => true,
+            PaneCommand::Run(command) => {
+                if command == WorkbenchPane::REFRESH_COMMAND {
+                    // Neu laden ohne Chat-Ausgabe.
+                    self.workbench.mark_stale();
+                } else {
+                    self.pending_commands.push_back(command);
+                }
+                true
+            }
+            PaneCommand::Prefill(text) => {
+                self.prefill_composer(&text);
+                true
+            }
+            PaneCommand::ReleaseFocus => {
+                self.panels.focus = crate::panes::PaneFocus::Chat;
+                self.panels.maximized = false;
+                true
+            }
+        }
+    }
+
+    /// Leert die sichtbaren Verlaufszellen (`/clear`). Sitzungsverlauf,
+    /// Modellkontext und Exporteinträge bleiben unverändert.
+    fn clear_transcript(&mut self) {
+        self.cells.clear();
+        self.tool_cells.clear();
+        self.open_tool_group = None;
+        self.ctrl_o_expand_last_armed = false;
+        self.live_stream.clear();
+        self.live_reasoning.clear();
+        self.scroll.force_follow();
+    }
+
+    /// Schaltet die ausführliche Werkzeuganzeige um (`/verbose`).
+    ///
+    /// # Beschreibung
+    /// Neue Werkzeugzellen erhalten die neue [`ToolVerbosity`]; bestehende
+    /// Zellen werden passend auf- bzw. zugeklappt.
+    ///
+    /// # Rückgabe
+    /// `true`, wenn jetzt die ausführliche Anzeige aktiv ist.
+    fn toggle_verbose(&mut self) -> bool {
+        let verbose = self.tool_verbosity != ToolVerbosity::Verbose;
+        self.tool_verbosity = if verbose {
+            ToolVerbosity::Verbose
+        } else {
+            ToolVerbosity::Compact
+        };
+        for handle in &self.tool_cells {
+            handle.set_expanded(verbose);
+        }
+        self.ctrl_o_expand_last_armed = false;
+        verbose
+    }
+
+    /// `/uia-worker-model` bare: Picker für den an den effektiven
+    /// UIA-Provider gebundenen Worker.
+    ///
+    /// # Beschreibung
+    /// Der Worker ist zwingend an den effektiven UIA-Provider gebunden
+    /// (UIA-Pin, sonst der aktive/Standard-Provider) — keine eigene
+    /// `uia_worker_provider`-Konzeption.
+    fn open_uia_worker_picker(&mut self) {
+        match self.resolved_config() {
+            Some(config) => {
+                let provider = config
+                    .harness
+                    .uia_provider
+                    .clone()
+                    .or_else(|| self.active_or_default_provider(&config));
+                match provider {
+                    Some(fixed_provider) => {
+                        self.open_model_switch_picker(PickerTarget::UiaWorker { fixed_provider });
+                    }
+                    None => self.push_line(
+                        Role::System,
+                        "UIA-Worker-Modell-Auswahl nicht verfügbar: kein \
+                         UIA-Pin-, aktiver oder Standard-Provider bekannt.",
+                    ),
+                }
+            }
+            None => self.push_line(
+                Role::System,
+                "UIA-Worker-Modell-Auswahl nicht verfügbar: keine \
+                 Konfiguration geladen.",
+            ),
+        }
+    }
+
+    /// Modus-/Freigabe-Auswahl mit aktuellem Zustand (`F7`, `/mode`).
+    fn mode_picker_view(&self) -> ModePicker {
+        let config = self.resolved_config();
+        ModePicker::new(
+            self.active_mode,
+            config
+                .as_deref()
+                .map(|config| config.harness.mode.default.as_str()),
+            self.current_approval(),
+        )
+    }
+
+    /// Modelle je Rolle (`F8`, `/models`).
+    fn model_roles_view(&self) -> ModelRolesView {
+        let (provider, model) = self.live_model();
+        match self.resolved_config() {
+            Some(config) => {
+                ModelRolesView::from_config(&config, provider.as_deref(), model.as_deref())
+            }
+            None => ModelRolesView::empty(provider.as_deref(), model.as_deref()),
+        }
+    }
+}
+
+/// Byte-Offset des Composer-Cursors.
+///
+/// # Beschreibung
+/// `InputEditor::cursor` ist nur in Tests sichtbar; der Offset wird deshalb
+/// aus [`InputEditor::cursor_position`] mit Breite `0` (keine weichen
+/// Umbrüche: Zeile = harte Zeile, Spalte = Anzeigebreite davor)
+/// zurückgerechnet. Ergebnis liegt immer auf einer Zeichengrenze.
+fn editor_cursor_byte(editor: &InputEditor) -> usize {
+    let (row, col) = editor.cursor_position(0);
+    let text = editor.text();
+    let mut line_start = 0usize;
+    for _ in 0..row {
+        match text.get(line_start..).and_then(|rest| rest.find('\n')) {
+            Some(pos) => line_start += pos + 1,
+            None => return text.len(),
+        }
+    }
+    let line = text.get(line_start..).unwrap_or("");
+    let line_end = line.find('\n').map_or(text.len(), |pos| line_start + pos);
+    let mut width = 0usize;
+    for (offset, grapheme) in text
+        .get(line_start..line_end)
+        .unwrap_or("")
+        .grapheme_indices(true)
+    {
+        if width >= col {
+            return line_start + offset;
+        }
+        width += UnicodeWidthStr::width(grapheme);
+    }
+    line_end
 }
 
 /// RAII-Guard, der Raw-Mode, Bracketed-Paste und Alternate-Screen bei Drop zurückstellt.
@@ -2564,24 +3093,341 @@ fn resume_request(raw: &str) -> Option<TuiRunOutcome> {
     }
 }
 
-/// Erkennt die bare Form eines Befehls **oder** dessen argloses `switch`
-/// (Welle 4a/7b: `/model`, `/model switch`, `/uia-effort switch`, …).
-///
-/// # Beschreibung
-/// `raw.trim() == command` oder `raw.trim() == format!("{command} switch")`
-/// — jeweils exakt, kein zusätzliches Argument. `/model switch <id>` bleibt
-/// unberührt (bleibt Text-Dispatch); nur die beiden argumentlosen Formen
-/// öffnen den jeweiligen Picker.
-///
-/// # Argumente
-/// - `raw` (`&str`): die unveränderte Befehlszeile.
-/// - `command` (`&str`): der zu erkennende Befehl, z. B. `"/model"`.
+/// `true`, wenn nach `/befehl` nur Leerraum steht (Unterkommando-Popup ohne
+/// Suchtext).
+fn subcommand_query_is_empty(text: &str) -> bool {
+    text.strip_prefix('/')
+        .and_then(|rest| rest.split_once(char::is_whitespace))
+        .is_none_or(|(_, query)| query.trim().is_empty())
+}
+
+/// Hängt per `@pfad` erwähnte Projektdateien an eine Chat-Nachricht an.
 ///
 /// # Rückgabe
-/// `true` für die bare Form oder das arglose `switch`, sonst `false`.
-fn is_bare_or_argless_switch(raw: &str, command: &str) -> bool {
-    let trimmed = raw.trim();
-    trimmed == command || trimmed == format!("{command} switch")
+/// `(modelltext, hinweis)`: der Text für das Modell (Original plus
+/// `<datei>`-Blöcke) und optional eine Systemzeile mit angehängten und
+/// abgelehnten Dateien. Ohne Projektwurzel bleibt der Text unverändert.
+fn expand_mentions_for_turn(project_root: &str, text: &str) -> (String, Option<String>) {
+    if project_root.is_empty() {
+        return (text.to_owned(), None);
+    }
+    let root = std::path::Path::new(project_root);
+    let expanded = expand_file_mentions(text, root, MentionLimits::default());
+    if expanded.attached.is_empty() && expanded.rejected.is_empty() {
+        return (expanded.text, None);
+    }
+    let mut lines = Vec::new();
+    if !expanded.attached.is_empty() {
+        let canonical_root = std::fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
+        let names: Vec<String> = expanded
+            .attached
+            .iter()
+            .map(|path| {
+                path.strip_prefix(&canonical_root)
+                    .unwrap_or(path)
+                    .display()
+                    .to_string()
+            })
+            .collect();
+        lines.push(format!("Angehängt: {}", names.join(", ")));
+    }
+    for (token, reason) in &expanded.rejected {
+        lines.push(format!("Nicht angehängt: @{token} — {reason}"));
+    }
+    (expanded.text, Some(lines.join("\n")))
+}
+
+/// `true` für jede `/workbench …`-Zeile (Werkbank danach neu laden).
+fn is_workbench_command(raw: &str) -> bool {
+    raw.split_whitespace().next() == Some("/workbench")
+}
+
+/// `true`, wenn `raw` ein TUI-lokaler Befehl ist (keine Operation dahinter).
+fn is_tui_local_command(registry: &CommandRegistry, raw: &str) -> bool {
+    let Some(name) = raw
+        .trim()
+        .strip_prefix('/')
+        .and_then(|rest| rest.split_whitespace().next())
+    else {
+        return false;
+    };
+    registry
+        .find(name)
+        .is_some_and(|spec| spec.origin == crate::CommandOrigin::TuiLocal)
+}
+
+/// Baut den [`LocalCommandContext`] aus dem App-Zustand und fragt
+/// [`local_commands::intercept`]. Das Ergebnis besitzt keine Borrows auf
+/// `app`, der Aufrufer darf danach mutieren.
+fn local_intercept_for(app: &ChatApp, raw: &str) -> Option<LocalIntercept> {
+    let config = app.resolved_config();
+    let (live_provider, live_model) = app.live_model();
+    let project_root = std::path::PathBuf::from(&app.project_root);
+    let ctx = LocalCommandContext {
+        registry: &app.command_registry,
+        config: config.as_deref(),
+        key_bindings: &app.key_bindings,
+        active_mode: app.active_mode,
+        approval: app.current_approval(),
+        live_provider: live_provider.as_deref(),
+        live_model: live_model.as_deref(),
+        project_root: &project_root,
+        session_id: app.session_id(),
+        tier: app.caller_tier(),
+        known_roles: KNOWN_ROLES,
+    };
+    local_commands::intercept(raw, &ctx)
+}
+
+/// Wendet ein [`LocalIntercept`] an.
+///
+/// # Rückgabe
+/// `Some(outcome)`, wenn die TUI-Schleife mit diesem Ergebnis enden soll
+/// (bare `/resume`); sonst `None`.
+fn apply_local_intercept(
+    app: &mut ChatApp,
+    intercepted: LocalIntercept,
+    bus: &HarwEventSender,
+) -> Option<TuiRunOutcome> {
+    match intercepted {
+        LocalIntercept::OpenOverlay(view) => app.open_overlay_view(view),
+        LocalIntercept::OpenModelPicker(target) => app.open_model_switch_picker(target),
+        LocalIntercept::OpenUiaWorkerPicker => app.open_uia_worker_picker(),
+        LocalIntercept::OpenEffortChoice(target) => app.open_effort_choice(target),
+        LocalIntercept::OpenAgentTree => app.open_agent_tree(),
+        LocalIntercept::OpenSessionPicker => {
+            return Some(TuiRunOutcome::Resume { selector: None });
+        }
+        LocalIntercept::TogglePanel(PanelToggle::Workbench) => app.toggle_workbench(),
+        LocalIntercept::TogglePanel(PanelToggle::Agents) => {
+            app.panels.agents_visible = !app.panels.agents_visible;
+            if !app.panels.agents_visible && app.panels.focus == crate::panes::PaneFocus::Agents {
+                app.panels.focus = crate::panes::PaneFocus::Chat;
+                app.panels.maximized = false;
+            }
+            app.sync_agent_detail();
+        }
+        LocalIntercept::TogglePanel(PanelToggle::Explorer) => {
+            app.panels.explorer_visible = !app.panels.explorer_visible;
+            if !app.panels.explorer_visible && app.panels.focus == crate::panes::PaneFocus::Explorer
+            {
+                app.panels.focus = crate::panes::PaneFocus::Chat;
+                app.panels.maximized = false;
+            }
+            app.ensure_explorer();
+        }
+        LocalIntercept::ToggleVerbose => {
+            let text = if app.toggle_verbose() {
+                "Ausführliche Werkzeuganzeige: an"
+            } else {
+                "Ausführliche Werkzeuganzeige: aus"
+            };
+            app.push_lines(vec![Line::from(text)]);
+        }
+        LocalIntercept::ClearTranscript => {
+            app.clear_transcript();
+            app.push_lines(vec![Line::from(
+                "Anzeige geleert — Sitzung und Modellkontext bleiben erhalten.",
+            )]);
+        }
+        LocalIntercept::RenameSession(title) => {
+            let title = title.trim().to_owned();
+            app.set_session_title(title.clone());
+            app.push_lines(vec![Line::from(format!(
+                "Sitzungstitel (Anzeige) gesetzt: „{title}“"
+            ))]);
+        }
+        LocalIntercept::Rewrite(line) => bus.send(HarwEvent::Command(line)),
+        LocalIntercept::Chat(text) => {
+            app.scroll.force_follow();
+            app.pending_turns.push_back(text);
+        }
+        LocalIntercept::System(text) => {
+            app.push_lines(
+                text.split('\n')
+                    .map(|line| Line::from(line.to_owned()))
+                    .collect(),
+            );
+        }
+    }
+    None
+}
+
+/// Führt `raw` über [`command_data::execute_command_with_data`] aus, ohne
+/// etwas in den Chat zu schreiben.
+///
+/// Nimmt bewusst nur Feld-Referenzen statt `&ChatApp` (dieselbe Form wie die
+/// übrigen Dispatch-Aufrufe in [`run_loop`]), damit über das `await` keine
+/// Referenz auf den ganzen App-Zustand gehalten wird.
+async fn fetch_command_data(
+    runtime: Option<&Arc<harw_runtime::RuntimeAssembly>>,
+    adapters: &[CommandAdapter],
+    sandbox: &SandboxSpec,
+    session_id: &SessionId,
+    raw: &str,
+) -> Result<OpOutput, String> {
+    let Some(rt) = runtime else {
+        return Err("Fehler: keine Runtime-Montage".to_owned());
+    };
+    command_data::execute_command_with_data(
+        adapters,
+        sandbox,
+        session_id,
+        runtime_commands::caller_tier(rt.principal()),
+        raw,
+        || runtime_commands::slash_service_map(rt.services()),
+    )
+    .await
+}
+
+/// Arbeitet alle ausstehenden Datenabrufe ab (siehe [`DataFetch`]); lädt
+/// zusätzlich das Werkbank-Panel, wenn es sichtbar und veraltet ist.
+///
+/// # Rückgabe
+/// `true`, wenn mindestens ein Abruf lief (Redraw nötig).
+async fn process_pending_fetches(app: &mut ChatApp) -> bool {
+    let mut fetches = std::mem::take(&mut app.pending_fetches);
+    if app.workbench_needs_refresh() && !fetches.contains(&DataFetch::Workbench) {
+        fetches.push(DataFetch::Workbench);
+    }
+    if fetches.is_empty() {
+        return false;
+    }
+    for fetch in fetches {
+        match fetch {
+            DataFetch::Overlay {
+                command,
+                generation,
+            } => {
+                if generation != app.overlay_generation
+                    || !matches!(app.overlay, Some(Overlay::View(_)))
+                {
+                    continue;
+                }
+                let result = fetch_command_data(
+                    app.runtime.as_ref(),
+                    &app.adapters,
+                    &app.sandbox,
+                    &app.session_id,
+                    &command,
+                )
+                .await;
+                if generation != app.overlay_generation {
+                    continue;
+                }
+                if let Some(Overlay::View(view)) = app.overlay.as_mut() {
+                    match result {
+                        Ok(output) => match output.data {
+                            Some(data) => view.apply_data(&data),
+                            None => view.apply_error(&output.text),
+                        },
+                        Err(error) => view.apply_error(&error),
+                    }
+                }
+            }
+            DataFetch::Workbench => {
+                let result = fetch_command_data(
+                    app.runtime.as_ref(),
+                    &app.adapters,
+                    &app.sandbox,
+                    &app.session_id,
+                    WorkbenchPane::REFRESH_COMMAND,
+                )
+                .await;
+                match result {
+                    Ok(output) => match output.data {
+                        Some(data) => app.workbench.apply_data(&data),
+                        None => app.workbench.apply_error(output.text),
+                    },
+                    Err(error) => app.workbench.apply_error(error),
+                }
+            }
+        }
+    }
+    true
+}
+
+/// Wendet das Ergebnis einer Taste in einer generischen Ansicht an.
+fn apply_overlay_outcome(app: &mut ChatApp, outcome: OverlayOutcome, bus: &HarwEventSender) {
+    match outcome {
+        OverlayOutcome::Stay => {}
+        OverlayOutcome::Close => app.overlay = None,
+        // Der `HarwEvent::Command`-Zweig lädt die offene Ansicht danach neu
+        // (`queue_overlay_refresh`).
+        OverlayOutcome::Run(command) => bus.send(HarwEvent::Command(command)),
+        OverlayOutcome::RunAndClose(command) => {
+            app.overlay = None;
+            bus.send(HarwEvent::Command(command));
+        }
+        OverlayOutcome::Fetch(command) => app.queue_overlay_fetch(command),
+        OverlayOutcome::Prefill(text) => {
+            app.overlay = None;
+            app.prefill_composer(&text);
+        }
+    }
+}
+
+/// Globale Ansichtstasten (Standard `F1` Hilfe, `F6` Kanban, `F7`
+/// Modus/Freigabe, `F8` Modelle je Rolle), unabhängig vom Panel-Fokus.
+///
+/// # Beschreibung
+/// Greift nicht, solange eine Freigabefrage oder ein anderes als ein
+/// generisches Overlay offen ist; eine offene generische Ansicht wird
+/// ersetzt.
+///
+/// # Rückgabe
+/// `Some(true)`, wenn eine Ansicht geöffnet wurde; `None` sonst.
+fn handle_view_hotkey(app: &mut ChatApp, key: KeyEvent) -> Option<bool> {
+    if app.pending_approval_dialog.is_some() || app.pending_host_permit_dialog.is_some() {
+        return None;
+    }
+    if app
+        .overlay
+        .as_ref()
+        .is_some_and(|overlay| !matches!(overlay, Overlay::View(_)))
+    {
+        return None;
+    }
+    let view: Box<dyn OverlayView> = match app.key_bindings.action_for(&key)? {
+        KeyAction::OpenKanban => Box::new(KanbanBoard::new()),
+        KeyAction::OpenModePicker => Box::new(app.mode_picker_view()),
+        KeyAction::OpenModels => Box::new(app.model_roles_view()),
+        KeyAction::ShowHelp => Box::new(HelpOverlay::new(
+            &app.command_registry,
+            &app.key_bindings,
+            HelpTab::Commands,
+        )),
+        _ => return None,
+    };
+    app.open_overlay_view(view);
+    Some(true)
+}
+
+/// Tasten des `@`-Erwähnungs-Popups (↑/↓, Enter/Tab übernehmen, Esc).
+///
+/// # Rückgabe
+/// `Some(redraw)`, wenn das Popup die Taste verarbeitet hat; `None` gibt sie
+/// an den Composer weiter (auch bei leerer Trefferliste, damit Enter weiter
+/// absendet).
+fn handle_mention_popup_key(app: &mut ChatApp, key: KeyEvent) -> Option<bool> {
+    let popup = app.mention_popup.as_mut()?;
+    if popup.is_empty()
+        || key
+            .modifiers
+            .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::SHIFT)
+        || !matches!(
+            key.code,
+            KeyCode::Up | KeyCode::Down | KeyCode::Enter | KeyCode::Tab | KeyCode::Esc
+        )
+    {
+        return None;
+    }
+    match popup.handle_key(key) {
+        MentionPopupAction::Stay => {}
+        MentionPopupAction::Cancel => app.mention_popup = None,
+        MentionPopupAction::Accept(insert) => app.accept_mention(&insert),
+    }
+    Some(true)
 }
 
 /// Appends the controller-owned descendants of `parent` in pre-order.
@@ -2913,7 +3759,7 @@ fn hydrate_visible_history(app: &mut ChatApp, history: &ConversationHistory) {
                 if !summary.trim().is_empty() {
                     app.export_entries
                         .push(ExportEntry::Reasoning(summary.clone()));
-                    app.push_cell(Box::new(ReasoningHistoryCell { summary }));
+                    app.push_reasoning_cell(summary, None);
                 }
             }
             TurnItem::Error(error) => {
@@ -3115,6 +3961,9 @@ const QUIT_HINT_WINDOW: Duration = Duration::from_secs(2);
 /// Maximale Popup-Höhe in Zeilen (ohne Rahmen).
 const POPUP_MAX_ROWS: u16 = 8;
 
+/// Höchstlänge des Modell-Segments in der Statuszeile (Zeichen).
+const STATUS_MODEL_MAX_CHARS: usize = 32;
+
 /// „Scharfgestellter" Beenden-Zustand: welches Label + wann gedrückt.
 ///
 /// Ein zweiter Druck derselben Taste innerhalb von [`QUIT_HINT_WINDOW`] beendet;
@@ -3208,6 +4057,16 @@ pub(crate) async fn run_loop(
     let mut provider_error_streak = 0_u32;
 
     loop {
+        // Slash-Zeilen aus synchronen Pfaden (Werkbank-Tasten) laufen über
+        // denselben Command-Kanal wie getippte Befehle.
+        while let Some(command) = app.pending_commands.pop_front() {
+            harw_tx.send(HarwEvent::Command(command));
+        }
+        // Ausstehende Datenabrufe für Ansichten und Werkbank (nie in den Chat).
+        if process_pending_fetches(app).await {
+            frame_req.schedule_frame();
+        }
+
         // Eine während des vorherigen Turns abgeschickte Eingabe hat Vorrang.
         // Sie passiert denselben Pfad wie eine frische `HarwEvent::Submit`.
         let mut submitted: Option<String> = app.pending_turns.pop_front();
@@ -3294,78 +4153,24 @@ pub(crate) async fn run_loop(
                             if let Some(request) = resume_request(&raw) {
                                 return Ok(request);
                             }
-                            // Die bare Form ist eine interaktive Projektion;
-                            // `/agent list` bleibt der textuelle Slash-Befehl.
-                            if raw.trim() == "/agent" {
-                                app.open_agent_tree();
-                                frame_req.schedule_frame();
-                                continue;
+                            // Eine offene Ansicht lädt nach jedem Befehl (z. B.
+                            // ihrem eigenen `Run`) neu; die Generationsprüfung
+                            // verwirft das Ergebnis, falls der Befehl die
+                            // Ansicht ersetzt.
+                            app.queue_overlay_refresh();
+                            if is_workbench_command(&raw) {
+                                app.workbench.mark_stale();
                             }
-                            // `/model`/`/uia-model`/`/uia-worker-model` ohne
-                            // Argument (oder als argloses `switch`) öffnen den
-                            // konsolidierten Provider/Modell-Picker statt der
-                            // Text-Ausgabe (`show`) — vor dem regulären
-                            // `/command`-Dispatch abgefangen, damit `show`
-                            // nicht zusätzlich läuft. `/model switch <id>` mit
-                            // Argument bleibt unberührt und läuft unverändert
-                            // weiter unten. Bare `/provider`/`/uia-provider`
-                            // öffnen seit der Picker-Konsolidierung (Welle 4a)
-                            // **keinen** Picker mehr — sie laufen unverändert
-                            // auf `show` durch den regulären Dispatch.
-                            if is_bare_or_argless_switch(&raw, "/model") {
-                                app.open_model_switch_picker(PickerTarget::Orchestrator);
-                                frame_req.schedule_frame();
-                                continue;
-                            }
-                            if is_bare_or_argless_switch(&raw, "/uia-model") {
-                                app.open_model_switch_picker(PickerTarget::Uia);
-                                frame_req.schedule_frame();
-                                continue;
-                            }
-                            if is_bare_or_argless_switch(&raw, "/uia-worker-model") {
-                                match app.resolved_config() {
-                                    // Der Worker ist zwingend an den effektiven
-                                    // UIA-Provider gebunden (UIA-Pin, sonst der
-                                    // aktive/Standard-Provider) — keine eigene
-                                    // `uia_worker_provider`-Konzeption.
-                                    Some(config) => {
-                                        let provider = config
-                                            .harness
-                                            .uia_provider
-                                            .clone()
-                                            .or_else(|| app.active_or_default_provider(&config));
-                                        match provider {
-                                            Some(fixed_provider) => app.open_model_switch_picker(
-                                                PickerTarget::UiaWorker { fixed_provider },
-                                            ),
-                                            None => app.push_line(
-                                                Role::System,
-                                                "UIA-Worker-Modell-Auswahl nicht verfügbar: kein \
-                                                 UIA-Pin-, aktiver oder Standard-Provider bekannt.",
-                                            ),
-                                        }
-                                    }
-                                    None => app.push_line(
-                                        Role::System,
-                                        "UIA-Worker-Modell-Auswahl nicht verfügbar: keine \
-                                         Konfiguration geladen.",
-                                    ),
+                            // TUI-lokale Befehle und Präfixe (`/model`, `/mode`,
+                            // `/help`, `#notiz`, `@rolle` …) — vor dem regulären
+                            // `/command`-Dispatch abgefangen. `/tools` und
+                            // `/compact` bleiben darunter unverändert.
+                            if let Some(intercepted) = local_intercept_for(app, &raw) {
+                                if let Some(outcome) =
+                                    apply_local_intercept(app, intercepted, harw_tx)
+                                {
+                                    return Ok(outcome);
                                 }
-                                frame_req.schedule_frame();
-                                continue;
-                            }
-                            // `/effort`/`/uia-effort` ohne Argument (oder als
-                            // argloses `switch`) öffnen die einstufige
-                            // Effort-Auswahl (Welle 7b) — dieselbe
-                            // Abfang-Reihenfolge wie beim Modell-Picker.
-                            // `/effort <level>` mit Argument bleibt unberührt.
-                            if is_bare_or_argless_switch(&raw, "/effort") {
-                                app.open_effort_choice(EffortTarget::Session);
-                                frame_req.schedule_frame();
-                                continue;
-                            }
-                            if is_bare_or_argless_switch(&raw, "/uia-effort") {
-                                app.open_effort_choice(EffortTarget::Uia);
                                 frame_req.schedule_frame();
                                 continue;
                             }
@@ -3489,16 +4294,22 @@ pub(crate) async fn run_loop(
                                     match app.runtime() {
                                         Some(rt) => {
                                             let caller_tier = runtime_commands::caller_tier(rt.principal());
-                                            match execute_export_command_with_data(
-                                                app.adapters(),
-                                                app.sandbox(),
-                                                app.session_id(),
-                                                caller_tier,
-                                                &raw,
-                                                || runtime_commands::slash_service_map(rt.services()),
-                                            )
-                                            .await
-                                            {
+                                            let export_output = if export_request_for_command(&raw).is_some() {
+                                                Some(
+                                                    command_data::execute_command_with_data(
+                                                        app.adapters(),
+                                                        app.sandbox(),
+                                                        app.session_id(),
+                                                        caller_tier,
+                                                        &raw,
+                                                        || runtime_commands::slash_service_map(rt.services()),
+                                                    )
+                                                    .await,
+                                                )
+                                            } else {
+                                                None
+                                            };
+                                            match export_output {
                                                 Some(Ok(output)) => (output.text, output.data),
                                                 Some(Err(error)) => (error, None),
                                                 None => {
@@ -3654,11 +4465,24 @@ pub(crate) async fn run_loop(
         // bekommt weiterhin `text` in voller Länge (siehe `run_turn_streaming`
         // unten). Ohne Überschreibung (jede normal getippte Nachricht):
         // unverändertes Verhalten.
-        let displayed_text = app
-            .pending_turn_user_cell_override
-            .take()
-            .unwrap_or_else(|| text.clone());
+        let display_override = app.pending_turn_user_cell_override.take();
+        // `@pfad`-Anhänge nur für getippte Nachrichten expandieren — ein
+        // automatischer `!`-Folge-Turn (mit Anzeige-Überschreibung) trägt
+        // fremde Ausgabe, deren `@` keine Erwähnung ist.
+        let (turn_text, attachment_note) = if display_override.is_none() && text.contains('@') {
+            expand_mentions_for_turn(&app.project_root, &text)
+        } else {
+            (text.clone(), None)
+        };
+        let displayed_text = display_override.unwrap_or_else(|| text.clone());
         app.push_line(Role::User, displayed_text);
+        if let Some(note) = attachment_note {
+            app.push_lines(
+                note.split('\n')
+                    .map(|line| Line::from(line.to_owned()))
+                    .collect(),
+            );
+        }
         // Auto-Correction-Detection (harw-memory M3): reine Textregel,
         // kein LLM-Call. Bei Match: Signal explizit an das Backend geben.
         if let Some(mem) = app.memory() {
@@ -3683,7 +4507,7 @@ pub(crate) async fn run_loop(
             app,
             &mut spinner,
             gateway,
-            &text,
+            &turn_text,
             approval_driver,
             approvals,
             host_permit_prompts,
@@ -3692,6 +4516,8 @@ pub(crate) async fn run_loop(
             &mut turn_state,
         )
         .await;
+        // Werkzeuge des Turns können die Werkbank verändert haben.
+        app.workbench.mark_stale();
 
         // Welle 4c: ein zweiter Ctrl+C während des soeben beendeten Turns hat
         // `app.hard_quit_requested` gesetzt (siehe `handle_busy_event`) — der
@@ -3826,6 +4652,39 @@ fn ensure_tool_cell(
 ///
 /// # Rückgabe
 /// `true`, wenn sich der sichtbare Zustand geändert hat und ein Redraw nötig ist.
+/// Obergrenze (Zeichen) des vorgehaltenen Live-Reasoning-Schwanzes.
+const LIVE_REASONING_MAX_CHARS: usize = 2000;
+/// Maximale Zahl umbrochener Live-Reasoning-Zeilen im Chat.
+const LIVE_REASONING_MAX_LINES: usize = 3;
+
+/// Baut die transienten Live-Reasoning-Zeilen: die letzten (bis zu)
+/// [`LIVE_REASONING_MAX_LINES`] umbrochenen Zeilen, gedimmt, die erste mit
+/// `"∴ "`-Markierung.
+///
+/// # Argumente
+/// - `text` (`&str`): Roher, gestreamter Reasoning-Text (wird sanitisiert).
+/// - `width` (`u16`): Breite der Verlaufsfläche.
+/// - `theme` ([`style::Theme`]): Farbschema.
+fn live_reasoning_lines(text: &str, width: u16, theme: style::Theme) -> Vec<Line<'static>> {
+    let sanitized = crate::sanitize::sanitize_inline(text);
+    let wrapped = crate::history_cell::wrap_plain(sanitized.trim(), width.saturating_sub(4));
+    let skip = wrapped.len().saturating_sub(LIVE_REASONING_MAX_LINES);
+    wrapped
+        .into_iter()
+        .skip(skip)
+        .enumerate()
+        .map(|(index, line)| {
+            let content: String = line
+                .spans
+                .iter()
+                .map(|span| span.content.as_ref())
+                .collect();
+            let prefix = if index == 0 { "  ∴ " } else { "    " };
+            Line::styled(format!("{prefix}{content}"), style::dim_style(theme))
+        })
+        .collect()
+}
+
 fn handle_turn_event(app: &mut ChatApp, state: &mut TurnEventState, event: TurnEvent) -> bool {
     match event {
         TurnEvent::ToolCallRequested {
@@ -3955,7 +4814,7 @@ fn handle_turn_event(app: &mut ChatApp, state: &mut TurnEventState, event: TurnE
             app.close_tool_group();
             app.export_entries
                 .push(ExportEntry::Reasoning(summary.clone()));
-            app.push_cell(Box::new(ReasoningHistoryCell { summary }));
+            app.push_reasoning_cell(summary, None);
             true
         }
         TurnEvent::AssistantDelta { text, .. } => {
@@ -3964,10 +4823,15 @@ fn handle_turn_event(app: &mut ChatApp, state: &mut TurnEventState, event: TurnE
         }
         TurnEvent::ReasoningDelta { text, .. } => {
             app.live_reasoning.push_str(&text);
-            // Nur ein kurzer Schwanz bleibt sichtbar.
+            // Nur ein Schwanz bleibt vorgehalten — genug für die letzten
+            // drei umbrochenen Zeilen auch auf breiten Terminals.
             let count = app.live_reasoning.chars().count();
-            if count > 400 {
-                app.live_reasoning = app.live_reasoning.chars().skip(count - 400).collect();
+            if count > LIVE_REASONING_MAX_CHARS {
+                app.live_reasoning = app
+                    .live_reasoning
+                    .chars()
+                    .skip(count - LIVE_REASONING_MAX_CHARS)
+                    .collect();
             }
             true
         }
@@ -3975,15 +4839,52 @@ fn handle_turn_event(app: &mut ChatApp, state: &mut TurnEventState, event: TurnE
             reason,
             items_before,
             items_after,
+            tokens_before,
+            tokens_after,
+            summarized,
+            elided_results,
             ..
         } => {
+            // `turn_event_rx` trägt nur die Ereignisse der Root-Session
+            // (Kind-Sessions melden über den Agenten-Bus) — die Momentaufnahme
+            // für `/status` und `/usage` bleibt damit root-exklusiv.
+            app.session_controller
+                .record_compaction(harw_operations::LastCompaction {
+                    reason: reason.clone(),
+                    tokens_before,
+                    tokens_after,
+                    summarized,
+                    elided_results,
+                });
             app.push_line(
                 Role::System,
                 format!("⟲ Kontext verdichtet ({reason}): {items_before} → {items_after} Einträge"),
             );
             true
         }
-        TurnEvent::UsageUpdated { .. } | TurnEvent::ContextUpdated { .. } => {
+        TurnEvent::ContextUpdated {
+            used_tokens,
+            window_tokens,
+            estimated_next_tokens,
+            threshold_tokens,
+            reserve_tokens,
+            ..
+        } => {
+            // Nur Root-Ereignisse erreichen `turn_event_rx` (siehe oben);
+            // die Momentaufnahme speist `/status` und `/usage`.
+            app.session_controller.record_context_updated(
+                used_tokens,
+                window_tokens,
+                estimated_next_tokens,
+                threshold_tokens,
+                reserve_tokens,
+            );
+            // Die Werte der Statuszeile liest weiterhin der Agenten-Monitor
+            // (Bus); hier nur ein Redraw-Anstoß.
+            app.drain_agent_events();
+            true
+        }
+        TurnEvent::UsageUpdated { .. } => {
             // Die Werte selbst liest die Statuszeile aus dem Agenten-Monitor
             // (Bus); hier nur ein Redraw-Anstoß.
             app.drain_agent_events();
@@ -4303,69 +5204,6 @@ struct ExportRequest {
     /// Exports in Unicode-Zeichen (nicht je Eintrag). Fehlt der Schlüssel im
     /// Marker, bleibt es `None` — keine Begrenzung.
     max_chars: Option<usize>,
-}
-
-/// Führt den strukturierten `/export`-Command bis zum `OpOutput` aus.
-///
-/// `execute_command_as` liefert aus Kompatibilitätsgründen nur den
-/// Anzeigetext zurück. Für `/export` muss die TUI zusätzlich `data` behalten;
-/// deshalb wird hier ausschließlich dieser eine Command über dieselbe
-/// Registry-/Admission-/Adapter-Pipeline ausgeführt. Für alle anderen Commands
-/// gibt die Funktion `None` zurück, sodass der bestehende Pfad unverändert
-/// verwendet werden kann.
-async fn execute_export_command_with_data<F>(
-    adapters: &[CommandAdapter],
-    sandbox: &SandboxSpec,
-    session_id: &SessionId,
-    caller_tier: crate::PermissionTier,
-    raw_line: &str,
-    services: F,
-) -> Option<Result<OpOutput, String>>
-where
-    F: FnOnce() -> harw_operations::ServiceMap,
-{
-    let invocation = crate::classify_input(raw_line).ok()?;
-    let Invocation::Command { name, .. } = &invocation else {
-        return None;
-    };
-    if name != "export" {
-        return None;
-    }
-
-    let registry = CommandRegistry::from_command_adapters(adapters);
-    let action = match registry.dispatch(
-        DispatchContext {
-            caller_tier,
-            surface: InvocationSurface::Tui,
-            capabilities: CapabilitySet::with(ShellCapability::CommandsShell),
-        },
-        invocation,
-    ) {
-        Ok(action) => action,
-        Err(error) => return Some(Err(format!("Eingabe abgelehnt: {error}"))),
-    };
-
-    let CommandAction::Command(spec, raw_args) = action else {
-        return Some(Err(
-            "Eingabe abgelehnt: /export ist kein ausführbarer Command.".to_owned(),
-        ));
-    };
-    let path = format!("/{}", spec.name.as_str());
-    let Some(adapter) = adapters.iter().find(|adapter| adapter.path() == path) else {
-        return Some(Err(format!("Unbekannter Command: /{}", spec.name.as_str())));
-    };
-    let ctx = harw_operations::OpContext::new(
-        session_id.clone(),
-        harw_types::TurnId::new(),
-        sandbox.clone(),
-        services(),
-    );
-    Some(
-        adapter
-            .dispatch(&ctx, raw_args)
-            .await
-            .map_err(|error| format!("Fehler: {error}")),
-    )
 }
 
 /// Erkennt `/export [--tools] [--datei <pfad>]` in der rohen Befehlszeile.
@@ -4859,19 +5697,16 @@ fn handle_overlay_key(app: &mut ChatApp, key: KeyEvent, bus: &HarwEventSender) -
         Some(Overlay::ModelSwitch(picker)) => match picker.on_key(key) {
             ModelSwitchAction::Stay => {}
             ModelSwitchAction::Cancel => app.overlay = None,
-            ModelSwitchAction::Accept { model, .. } => {
-                let target = picker.target().clone();
+            ModelSwitchAction::Accept { provider, model } => {
+                let command = picker.target().command_line(&provider, &model);
                 app.overlay = None;
-                let command = match target {
-                    PickerTarget::Orchestrator => format!("/model switch {model}"),
-                    PickerTarget::Uia => format!("/uia-model switch {model}"),
-                    PickerTarget::UiaWorker { .. } => {
-                        format!("/uia-worker-model switch {model}")
-                    }
-                };
                 bus.send(HarwEvent::Command(command));
             }
         },
+        Some(Overlay::View(view)) => {
+            let outcome = view.on_key(key);
+            apply_overlay_outcome(app, outcome, bus);
+        }
         Some(Overlay::EffortChoice { target, dialog }) => {
             let target = *target;
             match dialog.handle_key(key) {
@@ -4957,28 +5792,51 @@ fn handle_agent_tree_key(app: &mut ChatApp, key: KeyEvent) {
 /// # Rückgabe
 /// `true` wenn ein Redraw angefordert werden soll, sonst `false`.
 fn handle_key(app: &mut ChatApp, key: KeyEvent, bus: &HarwEventSender) -> bool {
+    if let Some(redraw) = handle_view_hotkey(app, key) {
+        return redraw;
+    }
     if let Some(redraw) = handle_panel_key(app, key) {
         return redraw;
     }
     scroll_and_composer_key(app, key, bus)
 }
 
-/// Panel-Tasten (F2/F3/F4/F11/Esc und Navigation im fokussierten Panel).
+/// Panel-Tasten (Standard F2/F3/F4/F11/Ctrl+E laut [`ChatApp::key_bindings`],
+/// Esc und Navigation im fokussierten Panel).
 /// `None`: Taste gehört dem Chat/Composer.
 fn handle_panel_key(app: &mut ChatApp, key: KeyEvent) -> Option<bool> {
     // Ein offenes Popup/Dialog behält Esc & Pfeile für sich.
     if app.command_popup.as_ref().is_some_and(|p| !p.is_empty())
+        || app.mention_popup.as_ref().is_some_and(|p| !p.is_empty())
         || app.pending_approval_dialog.is_some()
         || app.pending_host_permit_dialog.is_some()
     {
         return None;
     }
-    match app.panels.handle_key(key) {
+    // Die Agenten-Detailansicht bekommt ihre Tasten (insbesondere Esc) vor
+    // der Panel-Logik, die Esc sonst als „Fokus zurück an den Chat" deutet.
+    if app.agent_detail.is_some() && app.panels.focus == crate::panes::PaneFocus::Agents {
+        if let Some(redraw) = handle_agent_detail_key(app, key) {
+            return Some(redraw);
+        }
+    }
+    match app.panels.handle_key(key, &app.key_bindings) {
         crate::panes::PanelKey::Ignored => None,
         crate::panes::PanelKey::Changed => {
+            app.sync_agent_detail();
             app.ensure_explorer();
+            // Frisch eingeblendete Werkbank lädt neu (siehe
+            // `process_pending_fetches`).
+            if app.panels.workbench_visible
+                && app.key_bindings.action_for(&key) == Some(KeyAction::ToggleWorkbench)
+            {
+                app.workbench.mark_stale();
+            }
             Some(true)
         }
+        // Übrige Tasten verschluckt die Detailansicht (kein Rückfall auf
+        // die Listennavigation).
+        crate::panes::PanelKey::ForFocused(_) if app.agent_detail.is_some() => Some(false),
         crate::panes::PanelKey::ForFocused(key) => Some(match app.panels.focus {
             crate::panes::PaneFocus::Agents => match key.code {
                 KeyCode::Down | KeyCode::Char('j') => {
@@ -4989,12 +5847,49 @@ fn handle_panel_key(app: &mut ChatApp, key: KeyEvent) -> Option<bool> {
                     app.agent_monitor.select_prev();
                     true
                 }
+                KeyCode::Enter => app.open_agent_detail(),
                 _ => false,
             },
             crate::panes::PaneFocus::Explorer => handle_explorer_key(app, key),
+            crate::panes::PaneFocus::Workbench => app.handle_workbench_key(key),
             crate::panes::PaneFocus::Chat => false,
         }),
     }
+}
+
+/// Tasten der Agenten-Detailansicht.
+///
+/// # Beschreibung
+/// Esc/q zurück zur Liste, j/↓ Richtung neuester Einträge, k/↑ ältere,
+/// PageUp/PageDown um [`AGENT_DETAIL_PAGE`] Zeilen, Home/g an den Anfang,
+/// End/G ans Ende (folgt dem Neuesten), `r` schaltet Reasoning um.
+///
+/// # Rückgabe
+/// `Some(redraw)`, wenn die Taste verarbeitet wurde; `None` für Tasten, die
+/// an die Panel-Logik weitergehen (z. B. F2/F3/F4/F11).
+fn handle_agent_detail_key(app: &mut ChatApp, key: KeyEvent) -> Option<bool> {
+    if key
+        .modifiers
+        .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
+    {
+        return None;
+    }
+    if matches!(key.code, KeyCode::Esc | KeyCode::Char('q')) {
+        app.close_agent_detail();
+        return Some(true);
+    }
+    let detail = app.agent_detail.as_mut()?;
+    match key.code {
+        KeyCode::Down | KeyCode::Char('j') => detail.scroll = detail.scroll.saturating_sub(1),
+        KeyCode::Up | KeyCode::Char('k') => detail.scroll = detail.scroll.saturating_add(1),
+        KeyCode::PageDown => detail.scroll = detail.scroll.saturating_sub(AGENT_DETAIL_PAGE),
+        KeyCode::PageUp => detail.scroll = detail.scroll.saturating_add(AGENT_DETAIL_PAGE),
+        KeyCode::Home | KeyCode::Char('g') => detail.scroll = u16::MAX,
+        KeyCode::End | KeyCode::Char('G') => detail.scroll = 0,
+        KeyCode::Char('r') => detail.show_reasoning = !detail.show_reasoning,
+        _ => return None,
+    }
+    Some(true)
 }
 
 /// Entscheidet, ob eine Taste zuerst dem Transkript-Scroll ([`ChatScroll`])
@@ -5064,6 +5959,9 @@ fn scroll_and_composer_key(app: &mut ChatApp, key: KeyEvent, bus: &HarwEventSend
 
     // Jede andere Taste macht eine Scharfstellung rückgängig.
     app.pending_quit = None;
+
+    // Konfigurierbare Aktionen (Standardbelegung siehe `keybindings.rs`).
+    let action = app.key_bindings.action_for(&key);
     if !matches!(key.code, KeyCode::Esc) {
         app.escape_armed = false;
     }
@@ -5076,6 +5974,12 @@ fn scroll_and_composer_key(app: &mut ChatApp, key: KeyEvent, bus: &HarwEventSend
         return handle_overlay_key(app, key, bus);
     }
 
+    // `@`-Erwähnungs-Popup: Navigation/Übernahme vor Composer und
+    // Befehls-Popup (beide schließen sich gegenseitig aus).
+    if let Some(redraw) = handle_mention_popup_key(app, key) {
+        return redraw;
+    }
+
     // Das erste Escape schließt ausschließlich die Autovervollständigung.
     // Ein direkt folgendes Escape erreicht danach den Composer und leert ihn.
     if matches!(key.code, KeyCode::Esc) && app.has_popup() {
@@ -5084,10 +5988,11 @@ fn scroll_and_composer_key(app: &mut ChatApp, key: KeyEvent, bus: &HarwEventSend
         return true;
     }
 
-    // Shift+Tab — Zyklus ask → auto → full → plan (Plan Schritt 5). Nur
-    // außerhalb eines offenen `/command`-Popups: sonst hätte dieselbe Taste
-    // zwei Bedeutungen (Popup-Navigation vs. Moduszyklus).
-    if matches!(key.code, KeyCode::BackTab) && !app.has_popup() {
+    // CyclePermissionMode (Standard Shift+Tab) — Zyklus ask → auto → full →
+    // plan (Plan Schritt 5). Nur außerhalb eines offenen `/command`-Popups:
+    // sonst hätte dieselbe Taste zwei Bedeutungen (Popup-Navigation vs.
+    // Moduszyklus).
+    if action == Some(KeyAction::CyclePermissionMode) && !app.has_popup() {
         // `handle_key` läuft ausschließlich außerhalb eines laufenden Turns
         // (während eines Turns übernimmt `handle_busy_event`) — der Wechsel
         // wirkt hier also sofort, nicht vorgemerkt.
@@ -5095,24 +6000,25 @@ fn scroll_and_composer_key(app: &mut ChatApp, key: KeyEvent, bus: &HarwEventSend
         return true;
     }
 
-    // Ctrl+K löscht die komplette aktuelle Zeile (nicht nur bis Zeilenende),
-    // auch bei offenem Command-Popup — nachfolgende Zeilen rücken nach oben.
-    if ctrl && matches!(key.code, KeyCode::Char('k' | 'K')) {
+    // DeleteLine (Standard Ctrl+K) löscht die komplette aktuelle Zeile (nicht
+    // nur bis Zeilenende), auch bei offenem Command-Popup — nachfolgende
+    // Zeilen rücken nach oben.
+    if action == Some(KeyAction::DeleteLine) {
         app.input.delete_current_line();
         app.sync_popup();
         return true;
     }
 
-    // Ctrl+O — klappt die letzte bzw. bei erneutem Druck alle Werkzeugzellen
-    // auf/zu (Plan Schritt 2).
-    if ctrl && matches!(key.code, KeyCode::Char('o' | 'O')) {
+    // ToggleToolCells (Standard Ctrl+O) — klappt die letzte bzw. bei erneutem
+    // Druck alle Werkzeugzellen auf/zu (Plan Schritt 2).
+    if action == Some(KeyAction::ToggleToolCells) {
         return app.toggle_tool_cells();
     }
 
-    // Ctrl+H — beendet eine laufende Host-Arbeitsphase sofort (Plan
-    // „UIA-Shell-Worker und Shell-Modus", Schritt 2: „eine Möglichkeit, sie
-    // zu beenden"). Ohne aktive Phase tut die Taste nichts (kein Redraw).
-    if ctrl && matches!(key.code, KeyCode::Char('h' | 'H')) {
+    // EndHostMode (Standard Ctrl+H) — beendet eine laufende Host-Arbeitsphase
+    // sofort (Plan „UIA-Shell-Worker und Shell-Modus", Schritt 2: „eine
+    // Möglichkeit, sie zu beenden"). Ohne aktive Phase tut die Taste nichts (kein Redraw).
+    if action == Some(KeyAction::EndHostMode) {
         return app.end_host_mode();
     }
 
@@ -5132,8 +6038,9 @@ fn scroll_and_composer_key(app: &mut ChatApp, key: KeyEvent, bus: &HarwEventSend
         }
     }
 
-    // Ctrl+J — neue Zeile einfügen (schließt ein offenes Popup).
-    if ctrl && matches!(key.code, KeyCode::Char('j' | 'J')) {
+    // InsertNewline (Standard Ctrl+J) — neue Zeile einfügen (schließt ein
+    // offenes Popup).
+    if action == Some(KeyAction::InsertNewline) {
         app.command_popup = None;
         app.input.insert_newline();
         return true;
@@ -5152,13 +6059,23 @@ fn scroll_and_composer_key(app: &mut ChatApp, key: KeyEvent, bus: &HarwEventSend
             app.sync_popup();
             return true;
         }
-        if let Some(name) = app
+        // Im Unterkommando-Modus ohne getippten Suchtext (`/kanban `) sendet
+        // Enter die Zeile ab, statt still das erste Unterkommando zu wählen.
+        let completion = app
             .command_popup
             .as_ref()
-            .and_then(CommandPopup::selected_name)
-        {
+            .filter(|popup| {
+                !(matches!(popup.mode(), PopupMode::Subcommand { .. })
+                    && subcommand_query_is_empty(app.input.text()))
+            })
+            .and_then(|popup| {
+                popup
+                    .selected_name()
+                    .map(|name| popup.completion_line(name))
+            });
+        if let Some(line) = completion {
             app.input.clear();
-            app.input.insert_str(&format!("/{name} "));
+            app.input.insert_str(&line);
             app.command_popup = None;
             return true;
         }
@@ -5166,6 +6083,7 @@ fn scroll_and_composer_key(app: &mut ChatApp, key: KeyEvent, bus: &HarwEventSend
         let line = app.input.text().to_owned();
         app.input.clear();
         app.command_popup = None;
+        app.mention_popup = None;
         match classify_line(&line) {
             LineAction::Quit => bus.send(HarwEvent::Quit),
             LineAction::Ignore => {}
@@ -5194,21 +6112,39 @@ fn scroll_and_composer_key(app: &mut ChatApp, key: KeyEvent, bus: &HarwEventSend
                 let outcome = app
                     .command_popup
                     .as_ref()
-                    .map(CommandPopup::tab_outcome)
-                    .unwrap_or(TabOutcome::None);
-                match outcome {
+                    .map(|popup| match popup.tab_outcome() {
+                        TabOutcome::None => TabOutcome::None,
+                        TabOutcome::Accept(name) => {
+                            TabOutcome::Accept(popup.completion_line(&name))
+                        }
+                        TabOutcome::ExtendQuery(common) => {
+                            TabOutcome::ExtendQuery(popup.query_line(&common))
+                        }
+                    });
+                match outcome.unwrap_or(TabOutcome::None) {
                     TabOutcome::None => {}
-                    TabOutcome::Accept(name) => {
+                    TabOutcome::Accept(line) => {
                         app.input.clear();
-                        app.input.insert_str(&format!("/{name} "));
+                        app.input.insert_str(&line);
                         app.command_popup = None;
                     }
-                    TabOutcome::ExtendQuery(common) => {
+                    TabOutcome::ExtendQuery(line) => {
                         app.input.clear();
-                        app.input.insert_str(&format!("/{common}"));
+                        app.input.insert_str(&line);
                         app.sync_popup();
                     }
                 }
+                true
+            }
+            // Im Unterkommando-Modus sind Ziffern normale Eingabe.
+            KeyCode::Char(character @ '1'..='9')
+                if !app
+                    .command_popup
+                    .as_ref()
+                    .is_some_and(CommandPopup::digits_select) =>
+            {
+                app.input.insert_char(character);
+                app.sync_popup();
                 true
             }
             KeyCode::Up | KeyCode::Down | KeyCode::Esc | KeyCode::Char('1'..='9') => {
@@ -5219,8 +6155,9 @@ fn scroll_and_composer_key(app: &mut ChatApp, key: KeyEvent, bus: &HarwEventSend
                             app.command_popup = None;
                         }
                         PopupAction::Accept(name) => {
+                            let line = popup.completion_line(&name);
                             app.input.clear();
-                            app.input.insert_str(&format!("/{name} "));
+                            app.input.insert_str(&line);
                             app.command_popup = None;
                         }
                     }
@@ -5248,6 +6185,7 @@ fn scroll_and_composer_key(app: &mut ChatApp, key: KeyEvent, bus: &HarwEventSend
             if app.escape_armed {
                 app.input.clear();
                 app.command_popup = None;
+                app.mention_popup = None;
                 app.escape_armed = false;
             } else {
                 app.escape_armed = true;
@@ -5274,6 +6212,7 @@ fn scroll_and_composer_key(app: &mut ChatApp, key: KeyEvent, bus: &HarwEventSend
                 app.remember_input(&text);
                 app.scroll.force_follow();
                 app.command_popup = None;
+                app.mention_popup = None;
                 match classify_line(&text) {
                     LineAction::Quit => bus.send(HarwEvent::Quit),
                     LineAction::Ignore => {}
@@ -6809,14 +7748,18 @@ fn queue_busy_key(app: &mut ChatApp, key: KeyEvent) -> BusyKeyOutcome {
     match app.input.handle_key(key) {
         InputAction::Submit(text) => {
             app.remember_input(&text);
+            app.mention_popup = None;
             match classify_line(&text) {
                 LineAction::Chat(text) => app.pending_turns.push_back(text),
                 LineAction::Command(raw) => {
                     if raw.trim() == "/agent" {
                         return BusyKeyOutcome::RunImmediate(raw);
                     }
+                    // TUI-lokale Befehle haben keinen Adapter; sie laufen
+                    // nach dem Turn über den regulären Abfang in `run_loop`.
                     if busy_availability_for(&app.command_registry, &raw)
                         == BusyAvailability::Immediate
+                        && !is_tui_local_command(&app.command_registry, &raw)
                     {
                         return BusyKeyOutcome::RunImmediate(raw);
                     }
@@ -6941,9 +7884,12 @@ fn handle_busy_event(app: &mut ChatApp, event: TuiEvent) -> BusyKeyOutcome {
         {
             BusyKeyOutcome::Redraw
         }
-        // Shift+Tab gilt sofort und wird nicht in `deferred_input` eingereiht,
-        // damit der Zyklus nach Turn-Ende nicht ein zweites Mal läuft.
-        TuiEvent::Key(key) if matches!(key.code, KeyCode::BackTab) => {
+        // CyclePermissionMode (Standard Shift+Tab) gilt sofort und wird nicht
+        // in `deferred_input` eingereiht, damit der Zyklus nach Turn-Ende
+        // nicht ein zweites Mal läuft.
+        TuiEvent::Key(key)
+            if app.key_bindings.action_for(&key) == Some(KeyAction::CyclePermissionMode) =>
+        {
             app.cycle_permission_stage(false);
             BusyKeyOutcome::Redraw
         }
@@ -7008,8 +7954,8 @@ fn handle_explorer_key(app: &mut ChatApp, key: KeyEvent) -> bool {
         }
         ExplorerAction::Redraw | ExplorerAction::Rebuild => true,
         ExplorerAction::InsertPath(path) => {
-            let needs_space = !app.input.is_empty()
-                && !app.input.text().ends_with(char::is_whitespace);
+            let needs_space =
+                !app.input.is_empty() && !app.input.text().ends_with(char::is_whitespace);
             if needs_space {
                 app.input.insert_str(" ");
             }
@@ -7095,6 +8041,11 @@ fn render_viewport(
             dialog.render(area, frame.buffer_mut(), theme);
             return;
         }
+        Some(Overlay::View(view)) => {
+            frame.render_widget(Clear, area);
+            view.render(area, frame.buffer_mut(), theme);
+            return;
+        }
         None => {}
     }
 
@@ -7139,18 +8090,38 @@ fn render_viewport(
     // Fläche mit dem Verlauf; auf schmalen Terminals bleibt nur der Chat.
     let pane_areas = crate::panes::split(chunks[0], &app.panels);
     if let Some(agents_area) = pane_areas.agents {
-        crate::agent_monitor::render_agents_panel(
-            &app.agent_monitor,
-            agents_area,
-            frame.buffer_mut(),
-            theme,
-            app.panels.focus == crate::panes::PaneFocus::Agents,
-        );
+        if let Some(detail) = app.agent_detail.as_ref() {
+            app.agent_monitor.render_agent_detail(
+                &detail.agent,
+                agents_area,
+                frame.buffer_mut(),
+                detail.scroll,
+                detail.show_reasoning,
+            );
+        } else {
+            crate::agent_monitor::render_agents_panel(
+                &app.agent_monitor,
+                agents_area,
+                frame.buffer_mut(),
+                theme,
+                app.panels.focus == crate::panes::PaneFocus::Agents,
+            );
+        }
     }
     if let Some(explorer_area) = pane_areas.explorer {
         render_explorer_panel(app, explorer_area, frame.buffer_mut(), theme);
     }
-    let history_area = pane_areas.chat.unwrap_or(Rect::new(chunks[0].x, chunks[0].y, 0, 0));
+    if let Some(workbench_area) = pane_areas.workbench {
+        app.workbench.render(
+            workbench_area,
+            frame.buffer_mut(),
+            theme,
+            app.panels.focus == crate::panes::PaneFocus::Workbench,
+        );
+    }
+    let history_area = pane_areas
+        .chat
+        .unwrap_or(Rect::new(chunks[0].x, chunks[0].y, 0, 0));
     let permission = match app.current_permission_stage() {
         PermissionCycleStage::Ask => "Ask",
         PermissionCycleStage::Auto => "Auto",
@@ -7175,8 +8146,18 @@ fn render_viewport(
         .agent(app.session_id().as_str())
         .and_then(|root| Some((root.context_percent()?, root.context_window)))
         .map(|(pct, window)| {
+            // Schwelle der nächsten Kompaktierung (aus `ContextUpdated`), falls bekannt.
+            let threshold = SessionController::context_usage(app.session_controller.as_ref())
+                .and_then(|usage| usage.threshold_tokens)
+                .map(|tokens| {
+                    format!(
+                        ", verdichtet ab {}",
+                        crate::agent_monitor::human_tokens(tokens)
+                    )
+                })
+                .unwrap_or_default();
             format!(
-                " | ctx {} {pct}% / {}",
+                " | ctx {} {pct}% / {}{threshold}",
                 crate::agent_monitor::gauge(pct, 8),
                 crate::agent_monitor::human_tokens(window)
             )
@@ -7256,17 +8237,44 @@ fn render_viewport(
         format!(" · {n} Nachricht(en) warten", n = app.pending_turns.len())
     };
     let tool_suffix = if app.has_collapsed_tool_cells() {
-        " · Ctrl+O: Werkzeugdetails"
+        " · Ctrl+O: Werkzeug-/Reasoning-Details"
     } else {
         ""
+    };
+    // Kontexthinweis für das fokussierte Agenten-Panel.
+    let agents_hint = if app.panels.focus == crate::panes::PaneFocus::Agents {
+        match app.agent_detail.as_ref() {
+            Some(detail) => {
+                let entries = app
+                    .agent_monitor
+                    .trace(&detail.agent)
+                    .map_or(0, crate::agent_monitor::AgentTrace::len);
+                format!(
+                    " · {entries} Spureinträge · Esc: Liste | j/k/Bild↑↓: scrollen | g/G: Anfang/Ende | r: Reasoning"
+                )
+            }
+            None => " · Enter: Agentendetails".to_owned(),
+        }
+    } else {
+        String::new()
     };
     let pending_permission_suffix = app
         .pending_permission_stage()
         .map(|_| " · Freigabemodus wird nach dem Turn übernommen")
         .unwrap_or("");
+    let mode_segment = status_line::mode_segment(
+        app.active_mode(),
+        app.current_approval(),
+        app.pending_permission_stage().is_some(),
+    );
+    let (live_provider, live_model) = app.live_model();
+    let model_segment = status_line::model_segment(
+        live_provider.as_deref(),
+        live_model.as_deref(),
+        STATUS_MODEL_MAX_CHARS,
+    );
     let status = format!(
-        " {spinner_prefix}Shift+Tab: {permission} | Modus: {} | Σ Tokens: {} (in {}, out {}{cache_suffix}){context_suffix}{agents_suffix}{explorer_suffix}{cancel_suffix}{queue_cleared_suffix}{quit_suffix}{queue_suffix}{tool_suffix}{pending_permission_suffix}",
-        app.active_mode().as_str(),
+        " {spinner_prefix}Shift+Tab: {permission} | {mode_segment} | {model_segment} | Σ Tokens: {} (in {}, out {}{cache_suffix}){context_suffix}{agents_suffix}{explorer_suffix}{cancel_suffix}{queue_cleared_suffix}{quit_suffix}{queue_suffix}{tool_suffix}{agents_hint}{pending_permission_suffix}",
         crate::agent_monitor::human_tokens(usage.total()),
         crate::agent_monitor::human_tokens(usage.prompt_tokens()),
         crate::agent_monitor::human_tokens(usage.output_tokens),
@@ -7304,10 +8312,7 @@ fn render_viewport(
         .collect();
     // Transient: live gestreamtes Reasoning/Text der laufenden Runde.
     if !app.live_reasoning.is_empty() {
-        all_lines.push(Line::styled(
-            format!("  ∴ {}", crate::sanitize::sanitize_inline(&app.live_reasoning)),
-            style::dim_style(theme),
-        ));
+        all_lines.extend(live_reasoning_lines(&app.live_reasoning, width, theme));
     }
     if !app.live_stream.is_empty() {
         for (index, text) in app.live_stream.lines().enumerate() {
@@ -7352,7 +8357,9 @@ fn render_viewport(
         .is_some_and(|popup| !popup.is_empty());
     if popup_open {
         if let Some(popup) = app.command_popup.as_ref() {
-            let popup_height = POPUP_MAX_ROWS.min(history_area.height);
+            let popup_height = popup
+                .preferred_height(POPUP_MAX_ROWS)
+                .min(history_area.height);
             if popup_height > 0 {
                 let popup_area = Rect::new(
                     history_area.x,
@@ -7367,6 +8374,22 @@ fn render_viewport(
                 frame.render_widget(Clear, popup_area);
                 popup.render(popup_area, frame.buffer_mut(), theme);
             }
+        }
+    }
+
+    // `@`-Erwähnungs-Popup (nur mit Treffern; schließt das Befehls-Popup
+    // aus, siehe `ChatApp::sync_mention_popup`).
+    if let Some(popup) = app.mention_popup.as_ref().filter(|popup| !popup.is_empty()) {
+        let popup_height = POPUP_MAX_ROWS.min(history_area.height);
+        if popup_height > 0 {
+            let popup_area = Rect::new(
+                history_area.x,
+                history_area.y + history_area.height - popup_height,
+                history_area.width,
+                popup_height,
+            );
+            frame.render_widget(Clear, popup_area);
+            popup.render(popup_area, frame.buffer_mut(), theme);
         }
     }
 
@@ -7629,6 +8652,94 @@ mod tests {
         let mut app = ChatApp::new(Vec::new(), test_sandbox()?, SessionId::new());
         app.command_registry = CommandRegistry::built_in().map_err(ctx("built_in"))?;
         Ok(app)
+    }
+
+    /// Enter im Agenten-Panel öffnet die Detailansicht (Panel maximiert),
+    /// Tasten scrollen/schalten dort, Esc kehrt zur Liste zurück, ohne den
+    /// Fokus an den Chat abzugeben, und stellt den Vollbild-Zustand wieder her.
+    #[test]
+    fn agents_panel_enter_opens_detail_and_esc_closes_it() -> TestResult {
+        let mut app = test_chat_app()?;
+        app.agent_monitor
+            .seed_usage("agent-1", "explorer", TokenUsage::default());
+        app.panels.agents_visible = true;
+        app.panels.focus = crate::panes::PaneFocus::Agents;
+        assert!(!app.panels.maximized);
+
+        let key = |code| KeyEvent::new(code, KeyModifiers::NONE);
+        assert_eq!(handle_panel_key(&mut app, key(KeyCode::Enter)), Some(true));
+        let detail = app
+            .agent_detail
+            .clone()
+            .ok_or(TestError::Missing("agent detail"))?;
+        assert_eq!(detail.agent.as_str(), "agent-1");
+        assert_eq!(detail.scroll, 0);
+        assert!(app.panels.maximized, "Detailansicht maximiert das Panel");
+
+        assert_eq!(
+            handle_panel_key(&mut app, key(KeyCode::Char('k'))),
+            Some(true)
+        );
+        assert_eq!(handle_panel_key(&mut app, key(KeyCode::PageUp)), Some(true));
+        assert_eq!(app.agent_detail.as_ref().map(|d| d.scroll), Some(11));
+        assert_eq!(
+            handle_panel_key(&mut app, key(KeyCode::Char('j'))),
+            Some(true)
+        );
+        assert_eq!(app.agent_detail.as_ref().map(|d| d.scroll), Some(10));
+        assert_eq!(handle_panel_key(&mut app, key(KeyCode::Home)), Some(true));
+        assert_eq!(app.agent_detail.as_ref().map(|d| d.scroll), Some(u16::MAX));
+        assert_eq!(handle_panel_key(&mut app, key(KeyCode::End)), Some(true));
+        assert_eq!(app.agent_detail.as_ref().map(|d| d.scroll), Some(0));
+        let before = app.agent_detail.as_ref().map(|d| d.show_reasoning);
+        assert_eq!(
+            handle_panel_key(&mut app, key(KeyCode::Char('r'))),
+            Some(true)
+        );
+        assert_ne!(app.agent_detail.as_ref().map(|d| d.show_reasoning), before);
+
+        assert_eq!(handle_panel_key(&mut app, key(KeyCode::Esc)), Some(true));
+        assert!(app.agent_detail.is_none());
+        assert_eq!(app.panels.focus, crate::panes::PaneFocus::Agents);
+        assert!(!app.panels.maximized, "vorheriger Vollbild-Zustand zurück");
+
+        // Ein zweites Esc gibt den Fokus wie bisher an den Chat zurück.
+        assert_eq!(handle_panel_key(&mut app, key(KeyCode::Esc)), Some(true));
+        assert_eq!(app.panels.focus, crate::panes::PaneFocus::Chat);
+        Ok(())
+    }
+
+    /// Ctrl+O klappt auch Reasoning-Zellen auf und zu.
+    #[test]
+    fn toggle_tool_cells_expands_reasoning_cells() -> TestResult {
+        let mut app = test_chat_app()?;
+        app.push_reasoning_cell("erste Zeile\nzweite Zeile".to_owned(), None);
+        assert!(app.has_collapsed_tool_cells());
+        assert!(app.toggle_tool_cells());
+        assert!(!app.has_collapsed_tool_cells());
+        Ok(())
+    }
+
+    /// Live-Reasoning zeigt höchstens drei umbrochene Zeilen, die neuesten.
+    #[test]
+    fn live_reasoning_shows_last_three_wrapped_lines() {
+        let text = (0..40)
+            .map(|index| format!("wort{index}"))
+            .collect::<Vec<_>>()
+            .join(" ");
+        let lines = live_reasoning_lines(&text, 24, style::Theme::Dark);
+        assert_eq!(lines.len(), 3);
+        let rendered: Vec<String> = lines
+            .iter()
+            .map(|line| {
+                line.spans
+                    .iter()
+                    .map(|span| span.content.as_ref())
+                    .collect()
+            })
+            .collect();
+        assert!(rendered[0].starts_with("  ∴ "));
+        assert!(rendered[2].contains("wort39"));
     }
 
     /// Baut einen Session-Store-Sidecar mit festem `created_at`/`last_opened_at`
@@ -10281,31 +11392,6 @@ forbidden = [{forbidden}]
     // ── Welle 4a/7b: Picker-Konsolidierung (`/model`, `/uia-model`,
     // `/uia-worker-model`, `/effort`, `/uia-effort`) ──────────────────────
 
-    /// Bare Form und argloses `switch` öffnen den Picker; `switch <id>` mit
-    /// Argument bleibt Text-Dispatch (kein Picker).
-    #[test]
-    fn is_bare_or_argless_switch_matches_bare_and_argless_switch_only() -> TestResult {
-        assert!(is_bare_or_argless_switch("/model", "/model"));
-        assert!(is_bare_or_argless_switch("  /model  ", "/model"));
-        assert!(is_bare_or_argless_switch("/model switch", "/model"));
-        assert!(is_bare_or_argless_switch(
-            "/uia-effort switch",
-            "/uia-effort"
-        ));
-
-        assert!(!is_bare_or_argless_switch("/model switch x", "/model"));
-        assert!(!is_bare_or_argless_switch("/model list", "/model"));
-        assert!(!is_bare_or_argless_switch("/provider", "/model"));
-        // Bare `/provider` selbst öffnet seit der Konsolidierung (Welle 4a)
-        // keinen Picker mehr — es gibt schlicht keinen `is_bare_or_argless_switch`-
-        // Aufruf mehr für `/provider`/`/uia-provider` im Trigger-Zweig
-        // (siehe `run_loop`s `HarwEvent::Command`-Arm); diese Zeile hält nur
-        // fest, dass der Prädikat selbst `/provider` nicht fälschlich matcht,
-        // falls er versehentlich doch wieder verdrahtet würde.
-        assert!(!is_bare_or_argless_switch("/provider switch", "/model"));
-        Ok(())
-    }
-
     /// Ohne Konfiguration (Test-`ChatApp` ohne Runtime-Montage) wird kein
     /// leerer Dialog geöffnet, sondern eine klare Systemzeile angehängt —
     /// für jedes der drei `PickerTarget`-Ziele.
@@ -10392,6 +11478,379 @@ forbidden = [{forbidden}]
             }
         }
         Ok(())
+    }
+
+    /// `PickerTarget::Role` synthetisiert `/models set <rolle> <provider>/<modell>`.
+    #[test]
+    fn model_switch_accept_for_role_target_emits_models_set() -> TestResult {
+        let providers = vec![ProviderEntry {
+            id: "anthropic".to_owned(),
+            label: "Anthropic".to_owned(),
+        }];
+        let models = vec![(
+            "anthropic".to_owned(),
+            vec![ModelEntry {
+                id: "claude-sonnet".to_owned(),
+                label: "Claude Sonnet".to_owned(),
+            }],
+        )];
+        let target = PickerTarget::Role {
+            role: harw_config::ModelRole::Orchestrator,
+        };
+        let expected = target.command_line("anthropic", "claude-sonnet");
+        let picker = ModelSwitchPicker::new(target, providers, models, None, None)
+            .ok_or(TestError::Missing("providers fixture ist nicht leer"))?;
+        let mut app = test_chat_app()?;
+        app.overlay = Some(Overlay::ModelSwitch(Box::new(picker)));
+        let (bus, mut receiver) = harw_event_channel();
+        let enter = KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE);
+        handle_key(&mut app, enter, &bus);
+        if app.overlay.is_some() {
+            handle_key(&mut app, enter, &bus);
+        }
+        assert!(app.overlay.is_none());
+        match receiver.try_recv() {
+            Ok(HarwEvent::Command(command)) => {
+                assert_eq!(command, expected);
+                assert!(command.starts_with("/models set "), "{command}");
+            }
+            other => {
+                return Err(TestError::Unexpected(format!(
+                    "erwartete /models set, bekam {other:?}"
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    // ── T21: lokale Befehle, Ansichten, Werkbank, Erwähnungen ──────────
+
+    /// `/help` öffnet die generische Hilfe-Ansicht, `/workbench` blendet die
+    /// Werkbank ein und markiert sie zum Laden.
+    #[test]
+    fn local_intercept_opens_views_and_toggles_workbench() -> TestResult {
+        let mut app = test_chat_app()?;
+        let (bus, _receiver) = harw_event_channel();
+
+        let help = local_intercept_for(&app, "/help").ok_or(TestError::Missing("help"))?;
+        assert!(apply_local_intercept(&mut app, help, &bus).is_none());
+        assert!(matches!(app.overlay, Some(Overlay::View(_))));
+
+        app.overlay = None;
+        let workbench =
+            local_intercept_for(&app, "/workbench").ok_or(TestError::Missing("workbench"))?;
+        assert!(apply_local_intercept(&mut app, workbench, &bus).is_none());
+        assert!(app.panels.workbench_visible);
+        assert!(app.workbench_needs_refresh());
+
+        // Befehle mit Argumenten bleiben beim regulären Dispatch.
+        assert!(local_intercept_for(&app, "/model switch x").is_none());
+        assert!(local_intercept_for(&app, "/status").is_none());
+        Ok(())
+    }
+
+    /// `#notiz` und `/sessions` werden zu Slash-Zeilen umgeschrieben und
+    /// erneut über den Command-Kanal geschickt; `@rolle` wird Chat.
+    #[test]
+    fn local_intercept_rewrites_notes_and_routes_mentions_to_chat() -> TestResult {
+        let mut app = test_chat_app()?;
+        let (bus, mut receiver) = harw_event_channel();
+
+        let note = local_intercept_for(&app, "#Merken").ok_or(TestError::Missing("note"))?;
+        assert!(apply_local_intercept(&mut app, note, &bus).is_none());
+        match receiver.try_recv() {
+            Ok(HarwEvent::Command(command)) => assert!(
+                command == "/diary note Merken" || command == "/memory record Merken",
+                "{command}"
+            ),
+            other => {
+                return Err(TestError::Unexpected(format!(
+                    "erwartete Rewrite, bekam {other:?}"
+                )));
+            }
+        }
+
+        let sessions =
+            local_intercept_for(&app, "/sessions").ok_or(TestError::Missing("sessions"))?;
+        assert!(apply_local_intercept(&mut app, sessions, &bus).is_none());
+        assert!(matches!(
+            receiver.try_recv(),
+            Ok(HarwEvent::Command(command)) if command == "/resume"
+        ));
+
+        let role = KNOWN_ROLES
+            .first()
+            .ok_or(TestError::Missing("bekannte Rolle"))?;
+        let mention = local_intercept_for(&app, &format!("@{role} bitte prüfen"))
+            .ok_or(TestError::Missing("mention"))?;
+        assert!(apply_local_intercept(&mut app, mention, &bus).is_none());
+        let queued = app
+            .pending_turns
+            .pop_front()
+            .ok_or(TestError::Missing("chat turn"))?;
+        assert!(queued.contains(role), "{queued}");
+        assert!(queued.contains("bitte prüfen"), "{queued}");
+        Ok(())
+    }
+
+    /// `/clear` leert nur die Anzeige; `/verbose` schaltet die Werkzeug-
+    /// Ausführlichkeit um.
+    #[test]
+    fn local_clear_and_verbose_change_display_state() -> TestResult {
+        let mut app = test_chat_app()?;
+        let (bus, _receiver) = harw_event_channel();
+        app.push_line(Role::User, "hallo");
+        app.push_line(Role::Assistant, "welt");
+        let exported = app.export_entries.len();
+
+        let clear = local_intercept_for(&app, "/clear").ok_or(TestError::Missing("clear"))?;
+        apply_local_intercept(&mut app, clear, &bus);
+        // Nur die Hinweiszeile bleibt; der Export-Verlauf ist unverändert.
+        assert_eq!(app.cells_len(), 1);
+        assert_eq!(app.export_entries.len(), exported);
+
+        let before = app.tool_verbosity;
+        let verbose = local_intercept_for(&app, "/verbose").ok_or(TestError::Missing("verbose"))?;
+        apply_local_intercept(&mut app, verbose, &bus);
+        assert_ne!(app.tool_verbosity, before);
+        Ok(())
+    }
+
+    /// F6 öffnet das Kanban-Board als generische Ansicht und reiht dessen
+    /// Initial-Abruf ein; ohne Runtime landet ein Fehler in der Ansicht,
+    /// nicht im Chat.
+    #[tokio::test]
+    async fn view_hotkey_opens_kanban_and_fetch_does_not_touch_chat() -> TestResult {
+        let mut app = test_chat_app()?;
+        let (bus, _receiver) = harw_event_channel();
+        assert!(handle_key(
+            &mut app,
+            KeyEvent::new(KeyCode::F(6), KeyModifiers::NONE),
+            &bus
+        ));
+        assert!(matches!(app.overlay, Some(Overlay::View(_))));
+        assert!(app.pending_fetches.contains(&DataFetch::Overlay {
+            command: crate::kanban_board::REFRESH_COMMAND.to_owned(),
+            generation: app.overlay_generation,
+        }));
+
+        let cells = app.cells_len();
+        assert!(process_pending_fetches(&mut app).await);
+        assert_eq!(
+            app.cells_len(),
+            cells,
+            "Datenabruf schreibt nie in den Chat"
+        );
+        assert!(app.pending_fetches.is_empty());
+        assert!(!process_pending_fetches(&mut app).await);
+        Ok(())
+    }
+
+    /// Ein Abruf für eine inzwischen ersetzte Ansicht wird verworfen.
+    #[tokio::test]
+    async fn stale_overlay_fetch_is_dropped_after_view_replaced() -> TestResult {
+        let mut app = test_chat_app()?;
+        app.open_overlay_view(Box::new(KanbanBoard::new()));
+        let stale_generation = app.overlay_generation;
+        app.open_overlay_view(Box::new(HelpOverlay::new(
+            &app.command_registry,
+            &app.key_bindings,
+            HelpTab::Keys,
+        )));
+        assert_ne!(stale_generation, app.overlay_generation);
+        assert!(app.pending_fetches.iter().all(|fetch| matches!(
+            fetch,
+            DataFetch::Overlay { generation, .. } if *generation == stale_generation
+        )));
+        // Läuft ohne Wirkung auf die neue Ansicht durch.
+        process_pending_fetches(&mut app).await;
+        assert!(matches!(app.overlay, Some(Overlay::View(_))));
+        Ok(())
+    }
+
+    /// Generische Ansicht: `Prefill` schließt und füllt den Composer, `Run`
+    /// schickt die Zeile über den Bus und lässt die Ansicht offen.
+    #[test]
+    fn overlay_outcomes_prefill_and_run() -> TestResult {
+        let mut app = test_chat_app()?;
+        let (bus, mut receiver) = harw_event_channel();
+        app.open_overlay_view(Box::new(KanbanBoard::new()));
+
+        apply_overlay_outcome(
+            &mut app,
+            OverlayOutcome::Run("/kanban show".to_owned()),
+            &bus,
+        );
+        assert!(matches!(app.overlay, Some(Overlay::View(_))));
+        assert!(matches!(
+            receiver.try_recv(),
+            Ok(HarwEvent::Command(command)) if command == "/kanban show"
+        ));
+
+        apply_overlay_outcome(
+            &mut app,
+            OverlayOutcome::Prefill("/kanban add ".to_owned()),
+            &bus,
+        );
+        assert!(app.overlay.is_none());
+        assert_eq!(app.input(), "/kanban add ");
+        Ok(())
+    }
+
+    /// Werkbank-Tasten: `n` füllt den Composer und gibt den Fokus ab, `R`
+    /// lädt still neu (kein Chat-Befehl).
+    #[test]
+    fn workbench_focus_keys_prefill_and_refresh() -> TestResult {
+        let mut app = test_chat_app()?;
+        app.panels.workbench_visible = true;
+        app.panels.focus = crate::panes::PaneFocus::Workbench;
+        app.workbench.apply_error("noch nicht geladen".to_owned());
+        assert!(!app.workbench.is_stale());
+
+        let key = |code| KeyEvent::new(code, KeyModifiers::NONE);
+        assert_eq!(
+            handle_panel_key(&mut app, key(KeyCode::Char('R'))),
+            Some(true)
+        );
+        assert!(app.workbench.is_stale());
+        assert!(app.pending_commands.is_empty());
+
+        assert_eq!(
+            handle_panel_key(&mut app, key(KeyCode::Char('n'))),
+            Some(true)
+        );
+        assert_eq!(app.input(), crate::workbench_pane::NOTE_PREFILL);
+        assert_eq!(app.panels.focus, crate::panes::PaneFocus::Chat);
+        Ok(())
+    }
+
+    /// Stufe 2 des Befehls-Popups: nach `/model ` erscheinen die
+    /// Unterkommandos; Enter ohne Suchtext sendet ab, mit Suchtext wird
+    /// vervollständigt.
+    #[test]
+    fn subcommand_popup_after_complete_command() -> TestResult {
+        let mut app = test_chat_app()?;
+        let Some(spec) = app.command_registry.find("model") else {
+            return Ok(());
+        };
+        if spec.subcommands.is_empty() {
+            return Ok(());
+        }
+
+        app.input.insert_str("/model ");
+        app.sync_popup();
+        assert!(matches!(
+            app.command_popup.as_ref().map(CommandPopup::mode),
+            Some(PopupMode::Subcommand { .. })
+        ));
+        let (bus, mut receiver) = harw_event_channel();
+        let enter = KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE);
+        assert!(handle_key(&mut app, enter, &bus));
+        assert!(matches!(
+            receiver.try_recv(),
+            Ok(HarwEvent::Command(command)) if command.trim() == "/model"
+        ));
+
+        app.input.insert_str("/model sh");
+        app.sync_popup();
+        assert!(handle_key(&mut app, enter, &bus));
+        assert_eq!(app.input(), "/model show ");
+        assert!(receiver.try_recv().is_err());
+
+        // Argumente nach dem Unterkommando schließen das Popup.
+        app.input.clear();
+        app.input.insert_str("/model switch x");
+        app.sync_popup();
+        assert!(app.command_popup.is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn subcommand_query_is_empty_detects_bare_command_with_space() {
+        assert!(subcommand_query_is_empty("/model "));
+        assert!(subcommand_query_is_empty("/model"));
+        assert!(!subcommand_query_is_empty("/model s"));
+    }
+
+    /// Lokale Befehle laufen während eines Turns nie sofort (kein Adapter),
+    /// sondern werden eingereiht.
+    #[test]
+    fn busy_local_command_is_deferred() -> TestResult {
+        let mut app = test_chat_app()?;
+        app.command_registry = CommandRegistry::built_in()
+            .map_err(ctx("built_in"))?
+            .with_local_specs(crate::command_catalog::local_command_specs());
+        assert!(is_tui_local_command(&app.command_registry, "/whoami"));
+        assert!(!is_tui_local_command(&app.command_registry, "/status"));
+        app.input.insert_str("/whoami");
+        assert_eq!(
+            queue_busy_key(&mut app, KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+            BusyKeyOutcome::Redraw
+        );
+        assert_eq!(
+            app.deferred_input.pop_front(),
+            Some(TuiEvent::Paste("/whoami".to_owned()))
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn workbench_command_detection() {
+        assert!(is_workbench_command("/workbench"));
+        assert!(is_workbench_command("  /workbench note x"));
+        assert!(!is_workbench_command("/workbenches"));
+        assert!(!is_workbench_command("workbench"));
+    }
+
+    /// Der rückgerechnete Cursor-Offset stimmt mit dem echten überein.
+    #[test]
+    fn editor_cursor_byte_matches_editor_cursor() {
+        let mut editor = InputEditor::new();
+        editor.insert_str("ab\nc@dé x");
+        assert_eq!(editor_cursor_byte(&editor), editor.cursor());
+        for _ in 0..4 {
+            editor.move_left();
+            assert_eq!(editor_cursor_byte(&editor), editor.cursor());
+        }
+    }
+
+    /// `@`-Popup öffnet mit Rollen; die Übernahme ersetzt das Token unter dem
+    /// Cursor und erhält den Rest der Zeile.
+    #[test]
+    fn mention_popup_opens_and_accept_replaces_token() -> TestResult {
+        let mut app = test_chat_app()?;
+        let role = KNOWN_ROLES
+            .first()
+            .ok_or(TestError::Missing("bekannte Rolle"))?;
+        app.input.insert_str("@");
+        app.sync_popup();
+        assert!(
+            app.mention_popup
+                .as_ref()
+                .is_some_and(|popup| !popup.is_empty())
+        );
+
+        app.input.clear();
+        app.input.insert_str("a @ex b");
+        app.input.move_left();
+        app.input.move_left();
+        app.accept_mention(role);
+        assert_eq!(app.input(), format!("a @{role} b"));
+        assert_eq!(app.input.cursor(), format!("a @{role}").len());
+        assert!(app.mention_popup.is_none());
+
+        app.input.clear();
+        app.input.insert_str("schau @src/ma");
+        app.accept_mention("src/main.rs");
+        assert_eq!(app.input(), "schau @src/main.rs ");
+        Ok(())
+    }
+
+    #[test]
+    fn expand_mentions_without_root_keeps_text() {
+        let (text, note) = expand_mentions_for_turn("", "hallo @datei.rs");
+        assert_eq!(text, "hallo @datei.rs");
+        assert!(note.is_none());
     }
 
     /// `Cancel` (Esc) auf [`Overlay::ModelSwitch`] schließt das Overlay ohne

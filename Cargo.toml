@@ -6,12 +6,15 @@ members = [
     "harw-code-graph",
     "harw-explorer",
     "harw-tool-explorer",
+    "harw-killer",
+    "harw-tool-process",
     "harw-config",
     "harw-home",
     "harw-plan",
     "harw-types",
     "harw-protocol",
     "harw-research",
+    "harw-matrix-game",
     "harw-macros",
     "harw-tools",
     "harw-operations",
@@ -78,6 +81,7 @@ members = [
     "harw-egress",
     "harw-fsutil",
     "harw-runtime",
+    "harwness-sdk",
     "xtask",
 ]
 # DoD ist ein eigener Cargo-Workspace in derselben Repository-Domäne: eigener
@@ -91,6 +95,10 @@ exclude = ["dod"]
 
 [workspace.package]
 version = "0.3.0"
+# Kein Crate wird auf crates.io veröffentlicht; `cargo deny` behandelt sie
+# damit als privat (keine Lizenzpflicht ohne Entscheidung, Pfad-Abhängigkeiten
+# ohne Versionsangabe erlaubt).
+publish = false
 edition = "2024"
 rust-version = "1.85"
 

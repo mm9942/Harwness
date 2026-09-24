@@ -1,0 +1,5 @@
+name = "rust-references-vs-raw-pointers"
+description = "Use when writing or reviewing Rust code that reaches for `*const`/`*mut` raw pointers or manually writes `unsafe impl Send`/`unsafe impl Sync` — teaches why safe references (`&`/`&mut`) cover almost all cases, when raw pointers are justified, and how compiler auto-derivation of `Send + Sync` replaces redundant `unsafe impl` blocks (Rust Edition 2024)"
+enabled = true
+instructions_file = "instructions.md"
+tools = ["filesystem.read"]

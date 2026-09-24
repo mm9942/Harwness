@@ -61,10 +61,12 @@ invariants = [
   "plan_is_authoritative",
 ]
 
-# Der Planer führt die Coding-Spur an: er ist die einzige eingebaute Rolle mit
-# den `plan`- und `goal`-Operationen auf ihrer Werkzeugoberfläche.
+# `coding-orchestrator` (`role = "child-orchestrator"`) führt die Coding-Spur
+# der Default-Organisation. `planner` bleibt zusätzlich zugelassen
+# (Rückwärtskompatibilität für lokale Organisationen, die ihn als Leader
+# nennen) — als Worker delegiert er selbst jedoch nicht.
 [orchestrators]
-allowed = ["harwness.agent.planner@1"]
+allowed = ["harwness.agent.coding-orchestrator@1", "harwness.agent.planner@1"]
 
 # `planner` und `explorer` sind read-only Rollen. Sie sind hier, weil sie die
 # Coding-Spur vorbereiten — nicht, weil sie Code schreiben. `executor` ist die

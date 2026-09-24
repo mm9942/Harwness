@@ -135,7 +135,8 @@ use std::time::{Duration, Instant};
 use harw_authority::{Permission, PermissionRequest, PermissionSet, SandboxSpec};
 use harw_core::cancel::CancelToken;
 use harw_core::child_controller::{
-    AgentBudget, ChildRegistryFactory, ChildRunResult, JoinSemantics, ManagedAgentSpawner,
+    AgentBudget, CHILD_RETURN_MAX_BYTES, ChildRegistryFactory, ChildRunResult, JoinSemantics,
+    ManagedAgentSpawner, cap_child_return_text,
 };
 use harw_core::turn_loop::{TurnInput, TurnOutcome};
 use harw_core::{ModelMessage, StateStore};
@@ -387,8 +388,9 @@ impl AgentToolAdapter {
     ///   sowie optional `ManagedAgentSpawner`, `StateStore` und
     ///   `Arc<dyn ChildRegistryFactory>`.
     /// - `args` (`serde_json::Value`): JSON-Argumente aus dem Modell-Tool-Call.
-    ///   Werden unverändert als `context` in `SpawnInput` sowie als Text
-    ///   (`args.to_string()`) im initialen Child-Turn übergeben.
+    ///   Werden unverändert als `context` in `SpawnInput`, als Auftrag
+    ///   (`SpawnInput::instructions`) sowie als Text (`args.to_string()`) im
+    ///   initialen Child-Turn übergeben.
     ///
     /// # Returns
     /// - `Ok(OpOutput)` mit dem kanonisch serialisierten JSON des validierten
@@ -501,7 +503,9 @@ impl AgentToolAdapter {
             let spawn_input = harw_extension_api::SpawnInput {
                 parent_session_id: ctx.session_id().clone(),
                 handoff_call_id: harw_types::ToolCallId::new(),
-                instructions: None,
+                // Der Auftrag des Kindes: derselbe Argument-Text, der auch als
+                // initialer Turn-Input übergeben wird (siehe unten).
+                instructions: Some(task_instructions(&args)),
                 context: args.clone(),
                 // This tool declares no ceiling demand of its own: the child
                 // simply inherits whatever ceiling its parent already
@@ -621,11 +625,13 @@ impl AgentToolAdapter {
                         // Rückwärtskompatibel: der Freitext des Kindes geht
                         // unverändert (und ohne JSON-Quoting) an das Parent-Modell.
                         ChildReturnContract::Text => {
-                            completed_child_output(spawner.child_final_assistant_text(&child))
+                            completed_child_output(plain_child_return_text(&spawner, &run_result))
                         }
+                        // Typisierte Contracts parsen den ungekürzten Text: ein
+                        // gekürztes JSON wäre sonst ein falscher Vertragsbruch.
                         typed => {
                             let text =
-                                spawner.child_final_assistant_text(&child).map_err(|error| {
+                                full_child_return_text(&spawner, &run_result).map_err(|error| {
                                     OpError::NotAvailable(format!(
                                         "Child-Agent-Abschlussantwort nicht verfügbar: {error}"
                                     ))
@@ -968,6 +974,64 @@ fn ensure_owned_child_target(
         Ok(())
     } else {
         Err(OpError::NotAvailable(CHILD_TARGET_UNAVAILABLE.to_owned()))
+    }
+}
+
+/// Leitet den Auftragstext (`SpawnInput::instructions`) eines Kindes aus
+/// seinen Tool-Argumenten bzw. seiner Frage ab.
+///
+/// # Arguments
+/// - `args` (`&Value`): Tool-Argumente bzw. gestellte Frage.
+///
+/// # Returns
+/// Einen JSON-String unverändert (ohne JSON-Quoting) als Text, jeden anderen
+/// Wert als kompaktes JSON — für Objekte identisch zum Text des initialen
+/// Kind-Turns.
+fn task_instructions(args: &Value) -> String {
+    match args {
+        Value::String(text) => text.clone(),
+        other => other.to_string(),
+    }
+}
+
+/// Liefert den **ungekürzten** Abschlusstext eines Kindes für typisierte
+/// Contracts.
+///
+/// # Description
+/// Bevorzugt [`ChildRunResult::full_text`] (vom Controller ungekürzt
+/// mitgeliefert); fehlt er (`None`), fällt die Funktion auf
+/// [`ManagedAgentSpawner::child_final_assistant_text`] zurück.
+///
+/// # Errors
+/// [`harw_extension_api::AgentSpawnError`], wenn kein `full_text` vorliegt
+/// und der Spawner keine Abschlussantwort liefern kann.
+fn full_child_return_text(
+    spawner: &ManagedAgentSpawner,
+    result: &ChildRunResult,
+) -> Result<String, harw_extension_api::AgentSpawnError> {
+    match &result.full_text {
+        Some(text) => Ok(text.clone()),
+        None => spawner.child_final_assistant_text(&result.child),
+    }
+}
+
+/// Liefert den Abschlusstext eines Kindes für den Freitext-Contract
+/// ([`ChildReturnContract::Text`]), gekappt auf [`CHILD_RETURN_MAX_BYTES`].
+///
+/// # Description
+/// Liegt [`ChildRunResult::full_text`] vor, wird er hier über
+/// [`cap_child_return_text`] gekappt; sonst gilt der Text von
+/// [`ManagedAgentSpawner::child_final_assistant_text`] unverändert.
+///
+/// # Errors
+/// Wie [`full_child_return_text`].
+fn plain_child_return_text(
+    spawner: &ManagedAgentSpawner,
+    result: &ChildRunResult,
+) -> Result<String, harw_extension_api::AgentSpawnError> {
+    match &result.full_text {
+        Some(text) => Ok(cap_child_return_text(text, CHILD_RETURN_MAX_BYTES)),
+        None => spawner.child_final_assistant_text(&result.child),
     }
 }
 
@@ -1713,8 +1777,9 @@ fn paused_child_result(
 ///
 /// Muss mit `KNOWN_AUTHORITY_REDUCERS` in `harw-macros/src/operation.rs`
 /// übereinstimmen (das Makro weist unbekannte Kennungen zur Compile-Zeit ab).
-/// Die Kennungen `reduce_to_read_only`, `reduce_to_read_registry` und
-/// `reduce_to_read_network` sind wortgleich mit
+/// Die Kennungen `reduce_to_read_only`, `reduce_to_read_registry`,
+/// `reduce_to_read_network`, `reduce_to_read_explore` und
+/// `reduce_to_read_workspace_network` sind wortgleich mit
 /// `harw_registry_defaults::authority::REDUCE_TO_READ_*` (W5/RD), ebenso ihre
 /// Permission-Obergrenzen (siehe [`reducer_ceiling`]).
 const KNOWN_AUTHORITY_REDUCERS: &[&str] = &[
@@ -1722,6 +1787,8 @@ const KNOWN_AUTHORITY_REDUCERS: &[&str] = &[
     "reduce_to_read_execute",
     "reduce_to_read_registry",
     "reduce_to_read_network",
+    "reduce_to_read_explore",
+    "reduce_to_read_workspace_network",
 ];
 
 /// Liefert die Permission-Obergrenze einer bekannten Reducer-Kennung.
@@ -1740,10 +1807,22 @@ const KNOWN_AUTHORITY_REDUCERS: &[&str] = &[
 /// | `reduce_to_read_execute` | `{ReadWorkspace, ExecuteProcess}` (nur Bridge) |
 /// | `reduce_to_read_registry` | `{ReadWorkspace, ReadCargoRegistry}` |
 /// | `reduce_to_read_network` | `{NetworkAccess}` — **ohne** `ReadWorkspace` |
+/// | `reduce_to_read_explore` | `{ReadWorkspace, ReadCargoRegistry, NetworkAccess}` |
+/// | `reduce_to_read_workspace_network` | `{ReadWorkspace, NetworkAccess}` |
 ///
 /// `reduce_to_read_network` liest den Workspace absichtlich nicht: ein Kind mit
 /// Netz und Workspace-Lesezugriff könnte Workspace-Daten über Anfrageparameter
-/// hinaustragen (Plan-Annahme A5).
+/// hinaustragen (Plan-Annahme A5). Die zwei Explorer-Kennungen sind die
+/// bewusste Ausnahme (Nutzerentscheidungen „der Explorer durchsucht auch das
+/// Internet“ und „die UIA-Helfer recherchieren kurz online und fügen
+/// manchmal Abhängigkeiten hinzu“) für genau die Rollen, deren TOML
+/// `web.fetch`/`web.search` admittiert: `reduce_to_read_explore` für
+/// `explorer`, `uia-worker` und `uia-writer`,
+/// `reduce_to_read_workspace_network` für `uia-explorer`. Ihr Host-Scope
+/// bleibt wie bei `reduce_to_read_network` an den egress-gebundenen Scope
+/// des Parents gebunden, `NetworkAccess` nur, wenn der Parent es selbst
+/// trägt. `reduce_to_read_registry` (`analyst`, `researcher-deps`,
+/// `planner`) und `reduce_to_read_only` bleiben ohne Netz.
 ///
 /// # Returns
 /// `Some(PermissionSet)` für eine bekannte Kennung, sonst `None`.
@@ -1753,6 +1832,14 @@ fn reducer_ceiling(name: &str) -> Option<PermissionSet> {
         "reduce_to_read_execute" => &[Permission::ReadWorkspace, Permission::ExecuteProcess],
         "reduce_to_read_registry" => &[Permission::ReadWorkspace, Permission::ReadCargoRegistry],
         "reduce_to_read_network" => &[Permission::NetworkAccess],
+        "reduce_to_read_explore" => &[
+            Permission::ReadWorkspace,
+            Permission::ReadCargoRegistry,
+            Permission::NetworkAccess,
+        ],
+        "reduce_to_read_workspace_network" => {
+            &[Permission::ReadWorkspace, Permission::NetworkAccess]
+        }
         _ => return None,
     };
     Some(PermissionSet::from_policy(permissions.iter().copied()))
@@ -1794,6 +1881,8 @@ fn resolve_authority_reducer(name: &str) -> fn(&SandboxSpec) -> SandboxSpec {
         "reduce_to_read_execute" => reduce_to_read_execute,
         "reduce_to_read_registry" => reduce_to_read_registry,
         "reduce_to_read_network" => reduce_to_read_network,
+        "reduce_to_read_explore" => reduce_to_read_explore,
+        "reduce_to_read_workspace_network" => reduce_to_read_workspace_network,
         unknown => {
             tracing::warn!(
                 unknown,
@@ -1835,7 +1924,7 @@ fn reduce_to_read_execute(parent: &SandboxSpec) -> SandboxSpec {
 /// Reduziert eine Sandbox auf lesende Workspace- und Registry-Quellen.
 ///
 /// Schnittmenge mit `{ ReadWorkspace, ReadCargoRegistry }`, Host-Scope geleert
-/// (explorer, analyst, researcher-deps, planner laut W5/RD).
+/// (analyst, researcher-deps, planner laut W5/RD; bewusst ohne Netz).
 /// `ReadCargoRegistry` bleibt nur, wenn der Parent es selbst hat.
 fn reduce_to_read_registry(parent: &SandboxSpec) -> SandboxSpec {
     restrict_without_network(parent, "reduce_to_read_registry")
@@ -1846,15 +1935,45 @@ fn reduce_to_read_registry(parent: &SandboxSpec) -> SandboxSpec {
 /// Schnittmenge mit `{ NetworkAccess }` (researcher-web laut W5/RD). Der
 /// Host-Scope des Parents bleibt als Obergrenze unverändert (`restrict`);
 /// verengt wird er von der Composition (`researcher_web_network_scope`), nie
-/// erweitert. `NetworkAccess` bleibt nur, wenn der Parent es selbst hat.
+/// erweitert. `NetworkAccess` bleibt nur, wenn der Parent es selbst hat
+/// (siehe [`restrict_with_parent_network`]).
+fn reduce_to_read_network(parent: &SandboxSpec) -> SandboxSpec {
+    restrict_with_parent_network(parent, "reduce_to_read_network")
+}
+
+/// Reduziert eine Sandbox auf lesende Workspace- und Registry-Quellen plus
+/// ausgehendes Netz (explorer mit Websuche; weitergebbarer Lese-/Netzanteil
+/// von uia-worker und uia-writer — deren `ExecuteProcess`/`WriteWorkspace`
+/// gibt dieser Reducer nie weiter).
+///
+/// Schnittmenge mit `{ ReadWorkspace, ReadCargoRegistry, NetworkAccess }`;
+/// der Host-Scope des Parents (egress-gebunden) bleibt Obergrenze, wie bei
+/// [`reduce_to_read_network`]. Jedes Recht bleibt nur, wenn der Parent es
+/// selbst hat.
+fn reduce_to_read_explore(parent: &SandboxSpec) -> SandboxSpec {
+    restrict_with_parent_network(parent, "reduce_to_read_explore")
+}
+
+/// Reduziert eine Sandbox auf lesenden Workspace-Zugriff plus ausgehendes
+/// Netz (uia-explorer mit Websuche).
+///
+/// Schnittmenge mit `{ ReadWorkspace, NetworkAccess }`; Host-Scope wie bei
+/// [`reduce_to_read_network`].
+fn reduce_to_read_workspace_network(parent: &SandboxSpec) -> SandboxSpec {
+    restrict_with_parent_network(parent, "reduce_to_read_workspace_network")
+}
+
+/// Schneidet `parent` auf die Obergrenze einer Kennung mit Netzrecht und
+/// reicht den Host-Scope des Parents als Obergrenze durch.
 ///
 /// `PermissionRequest::from_permissions` setzt `network_scope` standardmäßig
 /// auf `NetworkScope::empty()`, und `restrict` schneidet immer nur (leer ∩
 /// irgendwas = leer). Ohne den expliziten `.with_network_scope(...)`-Aufruf
-/// unten würde dieser Reduzierer den Host-Scope des Parents also entgegen der
-/// Doku oben stets leeren, statt ihn als Obergrenze durchzureichen.
-fn reduce_to_read_network(parent: &SandboxSpec) -> SandboxSpec {
-    let ceiling = reducer_ceiling("reduce_to_read_network").unwrap_or_else(PermissionSet::empty);
+/// würde der Host-Scope des Parents stets geleert, statt ihn als Obergrenze
+/// durchzureichen. Erweitert wird er nie: die Composition verengt ihn
+/// höchstens (`researcher_web_network_scope`).
+fn restrict_with_parent_network(parent: &SandboxSpec, name: &str) -> SandboxSpec {
+    let ceiling = reducer_ceiling(name).unwrap_or_else(PermissionSet::empty);
     parent.restrict(
         &PermissionRequest::from_permissions(ceiling.iter())
             .with_network_scope(parent.network_scope().clone()),
@@ -2178,7 +2297,9 @@ async fn run_fanout_slot(
     let spawn_input = harw_extension_api::SpawnInput {
         parent_session_id: shared.ctx.session_id().clone(),
         handoff_call_id: harw_types::ToolCallId::new(),
-        instructions: None,
+        // Der Auftrag des Kindes: dieselbe Frage, die auch als initialer
+        // Turn-Input übergeben wird (siehe unten).
+        instructions: Some(task_instructions(question)),
         context: question.clone(),
         // This fan-out tool declares no ceiling demand of its own: each
         // question-child simply inherits whatever ceiling its parent
@@ -2371,14 +2492,14 @@ async fn fanout_child_value(
         ));
     }
 
-    let text = spawner
-        .child_final_assistant_text(&result.child)
-        .map_err(|error| {
-            format!(
-                "Child-Agent-Abschlussantwort von '{}' nicht verfügbar: {error}",
-                result.child
-            )
-        })?;
+    // Typisierte Contracts parsen den ungekürzten Text (`full_text`), damit
+    // ein langes, gültiges JSON nicht an der Rückgabe-Kappung zerbricht.
+    let text = full_child_return_text(spawner, result).map_err(|error| {
+        format!(
+            "Child-Agent-Abschlussantwort von '{}' nicht verfügbar: {error}",
+            result.child
+        )
+    })?;
     let value =
         evaluate_with_repair(spawner, store, contract, &result.child, budget, &text).await?;
     if contract == ChildReturnContract::ResearchFinding {
@@ -2404,7 +2525,15 @@ async fn fanout_child_value(
 /// `release_notes`/`standard`/`web`, die ein Kind auch ohne lokale
 /// Werkzeuge (aus Trainingswissen oder mitgelieferten Web-Belegen) kennen
 /// darf.
-const GROUNDED_EVIDENCE_KINDS: [&str; 2] = ["local_source", "cargo_registry_source"];
+///
+/// `package_registry_source` ist die sprachneutrale Form (npm, PyPI, crates.io,
+/// Maven, …); `cargo_registry_source` bleibt aus Kompatibilitätsgründen
+/// erhalten.
+const GROUNDED_EVIDENCE_KINDS: [&str; 3] = [
+    "local_source",
+    "package_registry_source",
+    "cargo_registry_source",
+];
 
 /// Ob ein kanonisches `ResearchFinding`-JSON mindestens einen Beleg einer
 /// [`GROUNDED_EVIDENCE_KINDS`]-Art führt.
@@ -2502,7 +2631,7 @@ async fn evaluate_return_with_grounding(
         Ok(0) => Err(ContractViolation::new(
             contract,
             "Befund ohne Werkzeugaufruf — Belege nicht verifiziert (das Finding behauptet \
-             lokale Belege der Art local_source/cargo_registry_source, aber die Kind-Session \
+             lokale Belege der Art local_source/package_registry_source/cargo_registry_source, aber die Kind-Session \
              hat keinen einzigen Werkzeugaufruf ausgeführt)"
                 .to_owned(),
             text,
@@ -2617,7 +2746,7 @@ async fn evaluate_with_repair(
             repair_run.outcome
         ));
     }
-    let repaired_text = spawner.child_final_assistant_text(child).map_err(|error| {
+    let repaired_text = full_child_return_text(spawner, &repair_run).map_err(|error| {
         format!(
             "{} (nach 1 Reparaturversuch: Abschlussantwort nicht verfügbar: {error})",
             violation.to_message()
@@ -3613,6 +3742,8 @@ contract = "{contract}"
 
         assert!(claims_local_evidence(&local));
         assert!(claims_local_evidence(&registry));
+        let package = serde_json::json!({ "evidence": [{ "kind": "package_registry_source" }] });
+        assert!(claims_local_evidence(&package));
         assert!(!claims_local_evidence(&web));
         assert!(!claims_local_evidence(&empty));
         assert!(!claims_local_evidence(&missing));
@@ -4220,14 +4351,43 @@ contract = "{contract}"
             Some(set(&[Permission::NetworkAccess])),
             "W5/RD: die Netz-Obergrenze enthält kein ReadWorkspace"
         );
+        assert_eq!(
+            reducer_ceiling("reduce_to_read_explore"),
+            Some(set(&[
+                Permission::ReadWorkspace,
+                Permission::ReadCargoRegistry,
+                Permission::NetworkAccess
+            ]))
+        );
+        assert_eq!(
+            reducer_ceiling("reduce_to_read_workspace_network"),
+            Some(set(&[Permission::ReadWorkspace, Permission::NetworkAccess]))
+        );
+        // Netz tragen nur die Netz-Kennungen; `reduce_to_read_registry`
+        // (analyst, researcher-deps) bleibt ohne Netz.
+        for name in KNOWN_AUTHORITY_REDUCERS {
+            let networked = reducer_ceiling(name)
+                .is_some_and(|ceiling| ceiling.contains(Permission::NetworkAccess));
+            assert_eq!(
+                networked,
+                matches!(
+                    *name,
+                    "reduce_to_read_network"
+                        | "reduce_to_read_explore"
+                        | "reduce_to_read_workspace_network"
+                ),
+                "{name}"
+            );
+        }
         assert_eq!(reducer_ceiling("reduce_ro"), None);
         for name in KNOWN_AUTHORITY_REDUCERS {
             assert!(reducer_ceiling(name).is_some(), "{name} ohne Obergrenze");
         }
     }
 
-    /// `reduce_to_read_network` reicht die Parent-Hosts unverändert durch,
-    /// während die drei anderen Reduzierer den Host-Scope leeren. Der Parent
+    /// `reduce_to_read_network` (und die zwei Explorer-Kennungen) reichen die
+    /// Parent-Hosts unverändert durch, während die drei anderen Reduzierer den
+    /// Host-Scope leeren. Der Parent
     /// trägt hierfür über `SandboxSpec::from_resolved_for_test` (Feature
     /// `test-support` von `harw-authority`, nur in `[dev-dependencies]`) eine
     /// echte, nicht-leere Host-Allow-Liste — vorher konnte von außerhalb von
@@ -4254,6 +4414,34 @@ contract = "{contract}"
             "reduce_to_read_network muss die Parent-Hosts durchreichen"
         );
 
+        for name in ["reduce_to_read_explore", "reduce_to_read_workspace_network"] {
+            let child = resolve_authority_reducer(name)(&parent);
+            assert!(
+                child.permissions().contains(Permission::ReadWorkspace),
+                "{name}"
+            );
+            assert!(
+                child.permissions().contains(Permission::NetworkAccess),
+                "{name}"
+            );
+            assert_eq!(
+                child.network_scope(),
+                parent.network_scope(),
+                "{name}: Host-Scope bleibt an den Parent gebunden"
+            );
+            assert!(!child.network_scope().allows("example.org"), "{name}");
+        }
+        assert!(
+            resolve_authority_reducer("reduce_to_read_explore")(&parent)
+                .permissions()
+                .contains(Permission::ReadCargoRegistry)
+        );
+        assert!(
+            !resolve_authority_reducer("reduce_to_read_workspace_network")(&parent)
+                .permissions()
+                .contains(Permission::ReadCargoRegistry)
+        );
+
         for name in [
             "reduce_to_read_only",
             "reduce_to_read_registry",
@@ -4268,6 +4456,66 @@ contract = "{contract}"
                 child.network_scope().is_empty(),
                 "{name}: Host-Scope muss leer sein"
             );
+        }
+        Ok(())
+    }
+
+    /// Die Netz-Kennungen (`reduce_to_read_explore` für `explorer`,
+    /// `uia-worker`, `uia-writer`; `reduce_to_read_workspace_network` für
+    /// `uia-explorer`; `reduce_to_read_network` für `researcher-web`)
+    /// gewähren nie Netz, das der Parent nicht selbst trägt, und nie
+    /// Schreib-/Ausführungsrecht — auch nicht einem voll berechtigten
+    /// Parent.
+    #[test]
+    fn test_network_reducers_never_grant_network_the_parent_lacks() -> TestResult {
+        let (ctx, tmp) = make_test_ctx()?;
+        let binding = ctx.sandbox().workspace().clone();
+        std::fs::remove_dir_all(tmp).ok();
+        let without_network: Vec<Permission> = ALL_PERMISSIONS
+            .iter()
+            .copied()
+            .filter(|permission| *permission != Permission::NetworkAccess)
+            .collect();
+        let offline_parent = SandboxSpec::from_resolved_for_test(
+            binding.clone(),
+            PermissionSet::from_policy(without_network),
+            NetworkScope::empty(),
+        );
+        let online_parent = SandboxSpec::from_resolved_for_test(
+            binding,
+            PermissionSet::from_policy(ALL_PERMISSIONS),
+            NetworkScope::from_hosts(["crates.io".to_owned()]),
+        );
+        for name in [
+            "reduce_to_read_network",
+            "reduce_to_read_explore",
+            "reduce_to_read_workspace_network",
+        ] {
+            let offline = resolve_authority_reducer(name)(&offline_parent);
+            assert!(
+                !offline.permissions().contains(Permission::NetworkAccess),
+                "{name}: Netz ohne Netz beim Parent"
+            );
+            assert!(offline.network_scope().is_empty(), "{name}");
+            let online = resolve_authority_reducer(name)(&online_parent);
+            assert!(
+                online
+                    .permissions()
+                    .is_subset_of(online_parent.permissions())
+            );
+            assert!(
+                online.network_scope().allows("crates.io")
+                    && !online.network_scope().allows("example.org"),
+                "{name}: Host-Scope nie breiter als beim Parent"
+            );
+            for gated in [
+                Permission::WriteWorkspace,
+                Permission::ExecuteProcess,
+                Permission::ReadSecrets,
+                Permission::ManagePlugins,
+            ] {
+                assert!(!online.permissions().contains(gated), "{name}: {gated:?}");
+            }
         }
         Ok(())
     }

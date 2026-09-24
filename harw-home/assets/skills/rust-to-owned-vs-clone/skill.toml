@@ -1,0 +1,5 @@
+name = "rust-to-owned-vs-clone"
+description = "Use when converting a borrowed type to owned (&str → String, &[T] → Vec<T>, &Path → PathBuf), or when sharing an Arc across threads — teaches .to_owned()/.to_string()/.to_vec()/.to_path_buf() instead of .clone(), and Arc::clone(&x) instead of x.clone() (Rust Edition 2024)"
+enabled = true
+instructions_file = "instructions.md"
+tools = ["filesystem.read"]

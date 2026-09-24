@@ -116,6 +116,54 @@ impl From<FromUtf8Error> for DiscoveryError {
 
 // ─── Config ──────────────────────────────────────────────────────────────────
 
+/// Default project-root markers used by [`DiscoveryConfig::default`].
+///
+/// Aligned with the manifest detection of `harw-explorer`
+/// (`harw-explorer/src/projects.rs`: Cargo, Node incl. `pnpm-workspace.yaml`,
+/// Python `pyproject.toml`/`setup.cfg`/`setup.py`, Go `go.mod`, Git) and
+/// extended by further ecosystems whose manifest sits at the project root
+/// (Deno, PHP/Composer, Ruby/Bundler, Maven, Gradle) plus Mercurial as a
+/// second VCS.
+///
+/// Only fixed file/directory names are supported (no globs such as `*.sln`).
+/// Files that routinely appear in *sub*directories without denoting a
+/// project root (e.g. `requirements.txt`, `Makefile`) are deliberately
+/// omitted: because the nearest ancestor with any marker wins (see
+/// [`DiscoveryConfig::root_markers`]), such a marker would shrink the root
+/// to a subfolder and hide the repository-level doc cascade.
+///
+/// The order carries no precedence semantics between directories; within
+/// one directory it merely fixes the probe order (VCS first, then the most
+/// common manifests).
+pub const DEFAULT_ROOT_MARKERS: &[&str] = &[
+    // Versionskontrolle
+    ".git",
+    ".hg",
+    // Rust
+    "Cargo.toml",
+    // Node / JavaScript / TypeScript
+    "package.json",
+    "pnpm-workspace.yaml",
+    "deno.json",
+    "deno.jsonc",
+    // Python
+    "pyproject.toml",
+    "setup.cfg",
+    "setup.py",
+    // Go
+    "go.mod",
+    // PHP
+    "composer.json",
+    // Ruby
+    "Gemfile",
+    // JVM (Maven / Gradle)
+    "pom.xml",
+    "settings.gradle",
+    "settings.gradle.kts",
+    "build.gradle",
+    "build.gradle.kts",
+];
+
 /// Configuration for the project-discovery walk.
 ///
 /// # Description
@@ -149,8 +197,11 @@ impl From<FromUtf8Error> for DiscoveryError {
 pub struct DiscoveryConfig {
     /// Filesystem entries (file or directory) whose presence marks a project root.
     ///
-    /// Checked in order; the first ancestor directory that contains any of these
-    /// entries is considered the project root.
+    /// Entries are fixed names (no globs), each tested via `dir.join(marker)`.
+    /// Precedence is by *distance*, not by list position: the nearest ancestor
+    /// of `cwd` (inclusive) that contains **any** of these entries is the
+    /// project root. The order only determines which marker is probed first
+    /// inside one directory. Defaults to [`DEFAULT_ROOT_MARKERS`].
     pub root_markers: Vec<String>,
 
     /// Filenames scanned for documentation in each directory along the chain.
@@ -196,12 +247,10 @@ pub struct DiscoveryConfig {
 impl Default for DiscoveryConfig {
     fn default() -> Self {
         Self {
-            root_markers: vec![
-                ".git".to_string(),
-                "Cargo.toml".to_string(),
-                "package.json".to_string(),
-                "pyproject.toml".to_string(),
-            ],
+            root_markers: DEFAULT_ROOT_MARKERS
+                .iter()
+                .map(|marker| (*marker).to_string())
+                .collect(),
             doc_filenames: vec![
                 "HARW.md".to_string(),
                 "AGENTS.md".to_string(),
@@ -232,8 +281,9 @@ impl DiscoveryConfig {
     ///
     /// ```rust
     /// use harw_project_discovery::DiscoveryConfig;
+    /// use harw_project_discovery::discovery::DEFAULT_ROOT_MARKERS;
     /// let cfg = DiscoveryConfig::new();
-    /// assert_eq!(cfg.root_markers.len(), 4);
+    /// assert_eq!(cfg.root_markers.len(), DEFAULT_ROOT_MARKERS.len());
     /// ```
     pub fn new() -> Self {
         Self::default()
@@ -824,6 +874,25 @@ mod tests {
         assert!(cfg.root_markers.contains(&"Cargo.toml".to_string()));
         assert!(cfg.root_markers.contains(&"package.json".to_string()));
         assert!(cfg.root_markers.contains(&"pyproject.toml".to_string()));
+        for marker in [
+            "go.mod",
+            "pnpm-workspace.yaml",
+            "deno.json",
+            "setup.py",
+            "setup.cfg",
+            "composer.json",
+            "Gemfile",
+            "pom.xml",
+            "build.gradle",
+            "build.gradle.kts",
+        ] {
+            assert!(
+                cfg.root_markers.iter().any(|m| m == marker),
+                "missing default marker {marker}"
+            );
+        }
+        assert!(!cfg.root_markers.iter().any(|m| m == "requirements.txt"));
+        assert_eq!(cfg.root_markers.len(), DEFAULT_ROOT_MARKERS.len());
         assert!(cfg.doc_filenames.contains(&"HARW.md".to_string()));
         assert!(cfg.doc_filenames.contains(&"AGENTS.md".to_string()));
         assert!(cfg.doc_filenames.contains(&"CLAUDE.md".to_string()));
@@ -870,6 +939,68 @@ mod tests {
 
         let cfg = DiscoveryConfig::new().with_root_markers(vec!["Cargo.toml".to_string()]);
         let ctx_result = discover_project(&sub, &cfg).map_err(ctx("Discovery"))?;
+        assert_eq!(ctx_result.project_root, root);
+        Ok(())
+    }
+
+    // ── test_discover_finds_extended_default_markers ─────────────────────────
+
+    #[test]
+    fn test_discover_finds_extended_default_markers() -> TestResult {
+        for marker in [
+            "go.mod",
+            "pom.xml",
+            "Gemfile",
+            "build.gradle.kts",
+            "deno.json",
+        ] {
+            let tmp = TempDir::new().map_err(ctx("Tempdir anlegen"))?;
+            let root = tmp
+                .path()
+                .canonicalize()
+                .map_err(ctx("Pfad kanonisieren"))?;
+            write(&root, marker, "")?;
+            let sub = mkdir(&root, "src/deep")?;
+
+            let ctx_result = discover_project(&sub, &default_cfg()).map_err(ctx("Discovery"))?;
+            assert_eq!(ctx_result.project_root, root, "marker {marker}");
+        }
+        Ok(())
+    }
+
+    // ── test_discover_nearest_marker_wins_over_outer_git ─────────────────────
+
+    #[test]
+    fn test_discover_nearest_marker_wins_over_outer_git() -> TestResult {
+        let tmp = TempDir::new().map_err(ctx("Tempdir anlegen"))?;
+        let root = tmp
+            .path()
+            .canonicalize()
+            .map_err(ctx("Pfad kanonisieren"))?;
+        mkdir(&root, ".git")?;
+        let module = mkdir(&root, "services/api")?;
+        write(&module, "go.mod", "module example.com/api\n")?;
+        let cwd = mkdir(&module, "internal")?;
+
+        let ctx_result = discover_project(&cwd, &default_cfg()).map_err(ctx("Discovery"))?;
+        assert_eq!(ctx_result.project_root, module);
+        Ok(())
+    }
+
+    // ── test_discover_requirements_txt_is_not_a_marker ───────────────────────
+
+    #[test]
+    fn test_discover_requirements_txt_is_not_a_marker() -> TestResult {
+        let tmp = TempDir::new().map_err(ctx("Tempdir anlegen"))?;
+        let root = tmp
+            .path()
+            .canonicalize()
+            .map_err(ctx("Pfad kanonisieren"))?;
+        mkdir(&root, ".git")?;
+        let docs = mkdir(&root, "docs")?;
+        write(&docs, "requirements.txt", "sphinx\n")?;
+
+        let ctx_result = discover_project(&docs, &default_cfg()).map_err(ctx("Discovery"))?;
         assert_eq!(ctx_result.project_root, root);
         Ok(())
     }
@@ -1253,16 +1384,36 @@ mod tests {
             .map_err(ctx("Rechte setzen"))?;
         write(&mid, "HARW.md", "readable mid doc")?;
 
-        let ctx_result = discover_project(&mid, &default_cfg()).map_err(ctx("Discovery"))?;
+        // Läuft der Test mit DAC-Override (z. B. als root im Container), macht
+        // `0o000` die Datei nicht unlesbar. Dann wird derselbe Fehlerpfad
+        // (I/O-Fehler an einem einzelnen Kandidaten, kein `NotFound`) anders
+        // ausgelöst: ein Kandidatenname über `NAME_MAX` (255 Byte) lässt
+        // `symlink_metadata` deterministisch mit `ENAMETOOLONG` scheitern —
+        // in *jedem* Verzeichnis der Kette, auch vor dem lesbaren `mid`-Dokument.
+        // Das Root-Dokument wird in diesem Fall entfernt, damit es nicht
+        // (lesbar) mitgezählt wird.
+        let permissions_enforced = fs::File::open(root.join("HARW.md")).is_err();
+        let cfg = if permissions_enforced {
+            default_cfg()
+        } else {
+            fs::remove_file(root.join("HARW.md")).map_err(ctx("Root-Dokument entfernen"))?;
+            let mut names = vec!["x".repeat(300)];
+            names.extend(default_cfg().doc_filenames);
+            default_cfg().with_doc_filenames(names)
+        };
 
-        // Das unlesbare Root-Dokument wird übersprungen (kein Abbruch der
+        let ctx_result = discover_project(&mid, &cfg).map_err(ctx("Discovery"))?;
+
+        // Der fehlerhafte Kandidat wird übersprungen (kein Abbruch der
         // gesamten Discovery); das Dokument aus `mid` lädt trotzdem.
         assert_eq!(ctx_result.docs.len(), 1);
         assert_eq!(ctx_result.docs[0].content, "readable mid doc");
 
         // Aufräumen, damit TempDir sich beim Drop löschen lässt.
-        fs::set_permissions(root.join("HARW.md"), fs::Permissions::from_mode(0o644))
-            .map_err(ctx("Rechte setzen"))?;
+        if permissions_enforced {
+            fs::set_permissions(root.join("HARW.md"), fs::Permissions::from_mode(0o644))
+                .map_err(ctx("Rechte setzen"))?;
+        }
         Ok(())
     }
 

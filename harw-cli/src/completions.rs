@@ -1,24 +1,26 @@
-//! `harw completions` adapter: `Cli::command()` -> `harw_completions`.
+//! `harw completions`: verbindet den fertigen clap-Befehl
+//! ([`crate::cli::command`], inklusive deutscher Hilfetexte) mit
+//! `harw_completions`.
 //!
-//! Generates the completion script for `harw` (stdout) or installs/uninstalls
-//! it via [`harw_completions::run_completions`]. With `--all-binaries` it also
-//! forwards `--install`/`--uninstall` to every harw DoD binary found on
-//! `$PATH` ([`DOD_BINARIES`]); missing binaries are skipped silently.
+//! Erzeugt das Vervollständigungsskript für `harw` (stdout) oder installiert
+//! bzw. entfernt es über [`harw_completions::run_completions`]. Mit
+//! `--all-binaries` wird `--install`/`--uninstall` zusätzlich an jedes
+//! weitere harw-Programm aus [`DOD_BINARIES`] im `$PATH` weitergereicht;
+//! fehlende Programme werden still übersprungen.
 
 use std::ffi::OsStr;
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use std::process::Command as ProcessCommand;
 
-use clap::CommandFactory;
 use harw_completions::{HomeEnv, detect_shell, run_completions};
 
-use crate::cli::{Cli, CompletionsCommand};
+use crate::cli::CompletionsCommand;
 
-/// Binary name the `harw` completion script is generated for.
+/// Programmname, für den das `harw`-Vervollständigungsskript erzeugt wird.
 const BIN_NAME: &str = "harw";
 
-/// harw DoD binaries that `--all-binaries` forwards the install/uninstall to.
+/// Weitere harw-Programme, an die `--all-binaries` Installation bzw. Entfernung weiterreicht.
 pub const DOD_BINARIES: [&str; 4] = [
     "harw-sentinel",
     "harw-warden",
@@ -26,22 +28,31 @@ pub const DOD_BINARIES: [&str; 4] = [
     "harw-probe-bpf",
 ];
 
-/// Runs `harw completions` (spec section 4).
+/// Führt `harw completions` aus.
 ///
-/// Prints or installs/uninstalls the `harw` completions and, with
-/// `--all-binaries`, delegates to every DoD binary found on `$PATH`.
+/// Gibt die `harw`-Vervollständigungen aus oder installiert bzw. entfernt
+/// sie und reicht den Auftrag mit `--all-binaries` an jedes weitere
+/// harw-Programm im `$PATH` weiter.
 ///
 /// # Errors
-/// A human-readable `String` when shell detection, generation, installation
-/// or any delegated DoD binary fails (failures are joined with `"; "`).
+/// Ein lesbarer `String`, wenn Shell-Erkennung, Erzeugung, Installation oder
+/// ein weitergereichtes Programm scheitert (mehrere Fehler mit `"; "`
+/// verbunden).
 pub fn run(command: CompletionsCommand) -> Result<(), String> {
     let env = HomeEnv::from_process();
     {
         let stdout = std::io::stdout();
         let mut out = stdout.lock();
-        run_completions(&mut Cli::command(), BIN_NAME, &command.args, &env, &mut out)
-            .map_err(|error| error.to_string())?;
-        out.flush().map_err(|error| format!("write '<stdout>' failed: {error}"))?;
+        run_completions(
+            &mut crate::cli::command(),
+            BIN_NAME,
+            &command.args,
+            &env,
+            &mut out,
+        )
+        .map_err(|error| error.to_string())?;
+        out.flush()
+            .map_err(|error| format!("Ausgabe nach stdout fehlgeschlagen: {error}"))?;
     }
 
     if !command.all_binaries {
@@ -85,11 +96,14 @@ pub fn run(command: CompletionsCommand) -> Result<(), String> {
             Ok(status) if status.success() => {}
             Ok(status) => {
                 tracing::warn!(binary = name, %status, "DoD binary completions failed");
-                failures.push(format!("{name}: completions exited with {status}"));
+                failures.push(format!("{name}: Vervollständigung endete mit {status}"));
             }
             Err(error) => {
                 tracing::warn!(binary = name, %error, "cannot start DoD binary");
-                failures.push(format!("{name}: cannot run '{}': {error}", binary.display()));
+                failures.push(format!(
+                    "{name}: '{}' kann nicht gestartet werden: {error}",
+                    binary.display()
+                ));
             }
         }
     }
@@ -101,17 +115,17 @@ pub fn run(command: CompletionsCommand) -> Result<(), String> {
     }
 }
 
-/// Finds an executable file `name` in the directories of `path_var`.
+/// Sucht die ausführbare Datei `name` in den Verzeichnissen von `path_var`.
 ///
-/// Uses [`std::env::split_paths`]; a candidate must be a regular file and, on
-/// Unix, carry at least one execute bit (`0o111`).
+/// Nutzt [`std::env::split_paths`]; ein Kandidat muss eine reguläre Datei
+/// sein und unter Unix mindestens ein Ausführungsbit (`0o111`) tragen.
 pub fn find_on_path(name: &str, path_var: &OsStr) -> Option<PathBuf> {
     std::env::split_paths(path_var)
         .map(|dir| dir.join(name))
         .find(|candidate| is_executable_file(candidate))
 }
 
-// True when `path` is a regular file with an execute bit (Unix) / a file (other).
+// Wahr, wenn `path` eine reguläre Datei mit Ausführungsbit (Unix) bzw. eine Datei (sonst) ist.
 fn is_executable_file(path: &Path) -> bool {
     let Ok(metadata) = std::fs::metadata(path) else {
         return false;

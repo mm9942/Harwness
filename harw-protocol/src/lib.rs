@@ -14,11 +14,11 @@ pub mod wire;
 
 pub use approvals::{ApprovalKind, ApprovalRequest, ApprovalResponse};
 pub use events::{SessionEvent, TurnEvent};
-pub use orchestration::{AgentOrchestrationEvent, AgentOrchestrationStatus};
 pub use items::{
     AssistantMessageItem, ContentPart, ErrorItem, OpaqueReasoning, ReasoningItem, ResultTrust,
     ToolCallItem, ToolCallResult, ToolResultItem, TurnItem, UserMessageItem,
 };
+pub use orchestration::{AgentOrchestrationEvent, AgentOrchestrationStatus};
 pub use wire::{
     NotificationEnvelope, ProtocolVersion, RequestEnvelope, ResponseEnvelope, WireError,
     WireMessage,

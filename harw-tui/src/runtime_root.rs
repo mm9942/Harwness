@@ -61,7 +61,10 @@
 //! # ) -> Result<(), Box<dyn std::error::Error>> {
 //! let wiring = TuiSessionWiring::new();
 //! let assembly = Arc::new(wiring.install(builder).build()?);
-//! run_tui(assembly, TuiRunOptions { wiring, resume: None, verbose_tools: false })?;
+//! run_tui(
+//!     assembly,
+//!     TuiRunOptions { wiring, resume: None, verbose_tools: false, keybindings_path: None },
+//! )?;
 //! # Ok(())
 //! # }
 //! ```
@@ -466,6 +469,11 @@ pub struct TuiRunOptions {
     /// Ausführliche Werkzeugzellen; wird von `harw chat --verbose` gesetzt
     /// und beim anschließenden Fortsetzen einer Sitzung beibehalten.
     pub verbose_tools: bool,
+    /// Pfad der Keybindings-Datei (`[tui].keybindings_file`); `None` behält
+    /// die Standardbelegung. Eine fehlende Datei gilt ebenfalls als
+    /// Standardbelegung; eine ungültige erscheint als Systemzeile, und die
+    /// Standardbelegung bleibt aktiv.
+    pub keybindings_path: Option<PathBuf>,
 }
 
 /// Handgeschriebenes `Debug`: [`TuiSessionWiring`] enthält Kanäle.
@@ -476,6 +484,7 @@ impl std::fmt::Debug for TuiRunOptions {
             .field("wiring", &self.wiring)
             .field("resume", &self.resume)
             .field("verbose_tools", &self.verbose_tools)
+            .field("keybindings_path", &self.keybindings_path)
             .finish()
     }
 }
@@ -486,6 +495,9 @@ impl std::fmt::Debug for TuiRunOptions {
 /// 1. Baut einen `current_thread`-Tokio-Runtime.
 /// 2. Baut die Wurzelsitzung und den Renderer-Zustand (`build_root_runtime`).
 /// 3. Lädt den dauerhaften Verlauf der Sitzung und hängt die Willkommenszeile an.
+///    Ist [`TuiRunOptions::keybindings_path`] gesetzt, wird die Tastenbelegung
+///    geladen; ein Ladefehler erscheint als Systemzeile, die Standardbelegung
+///    bleibt dann aktiv. Die Belegung gilt auch nach `/resume` und `/new`.
 /// 4. Betritt Raw-Mode/Alternate-Screen hinter `TerminalGuard` und treibt
 ///    `run_loop`, bis `Quit` kommt oder ein Fehler auftritt.
 ///
@@ -504,7 +516,8 @@ impl std::fmt::Debug for TuiRunOptions {
 /// # Argumente
 /// - `assembly` (`Arc<RuntimeAssembly>`): Montage mit Einstieg `Tui`, gebaut
 ///   mit `options.wiring` ([`TuiSessionWiring::install`]).
-/// - `options` ([`TuiRunOptions`]): Verdrahtung und optionales `/resume`.
+/// - `options` ([`TuiRunOptions`]): Verdrahtung, optionales `/resume` und
+///   optionale Keybindings-Datei.
 ///
 /// # Rückgabe
 /// `Ok(())` bei sauberem Verlassen.
@@ -526,7 +539,15 @@ impl std::fmt::Debug for TuiRunOptions {
 /// #     assembly: Arc<harw_runtime::RuntimeAssembly>,
 /// #     wiring: harw_tui::TuiSessionWiring,
 /// # ) -> Result<(), harw_tui::TuiError> {
-/// harw_tui::run_tui(assembly, harw_tui::TuiRunOptions { wiring, resume: None, verbose_tools: false })
+/// harw_tui::run_tui(
+///     assembly,
+///     harw_tui::TuiRunOptions {
+///         wiring,
+///         resume: None,
+///         verbose_tools: false,
+///         keybindings_path: None,
+///     },
+/// )
 /// # }
 /// ```
 pub fn run_tui(assembly: Arc<RuntimeAssembly>, options: TuiRunOptions) -> Result<(), TuiError> {
@@ -534,6 +555,7 @@ pub fn run_tui(assembly: Arc<RuntimeAssembly>, options: TuiRunOptions) -> Result
         wiring,
         resume,
         verbose_tools,
+        keybindings_path,
     } = options;
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -554,6 +576,16 @@ pub fn run_tui(assembly: Arc<RuntimeAssembly>, options: TuiRunOptions) -> Result
         resume.as_ref().map(|r| r.session_store_root.as_path()),
         verbose_tools,
     )?;
+    // Ein Ladefehler bricht den Start nicht ab: Standardbelegung behalten und
+    // die Meldung nach der Willkommenszeile anzeigen.
+    let (key_bindings, key_bindings_error) = match keybindings_path.as_deref() {
+        Some(path) => match crate::keybindings::load(path) {
+            Ok(bindings) => (bindings, None),
+            Err(error) => (crate::keybindings::KeyBindings::default(), Some(error)),
+        },
+        None => (crate::keybindings::KeyBindings::default(), None),
+    };
+    app.set_key_bindings(key_bindings.clone());
     let hydration =
         match runtime.block_on(session.hydrate_from_store(assembly.state_store().as_ref())) {
             Ok(hydration) => hydration,
@@ -592,6 +624,10 @@ pub fn run_tui(assembly: Arc<RuntimeAssembly>, options: TuiRunOptions) -> Result
         uia_user_name.as_deref(),
         provider_model_info(assembly.config()).as_deref(),
     ))]);
+    if let Some(error) = key_bindings_error {
+        tracing::warn!(%error, "tui.keybindings.load_failed");
+        push_system_text(&mut app, &format!("{error}; using default key bindings"));
+    }
     let mut gateway = ResumableGateway::new(
         session,
         Arc::clone(assembly.state_store()),
@@ -718,6 +754,9 @@ pub fn run_tui(assembly: Arc<RuntimeAssembly>, options: TuiRunOptions) -> Result
                                 Arc::clone(next_assembly.model()),
                             );
                             app = next_runtime.app;
+                            // Die neue App startet mit der Standardbelegung;
+                            // die geladene Belegung gilt sitzungsübergreifend.
+                            app.set_key_bindings(key_bindings.clone());
                             event_rx = next_runtime.event_rx;
                             turn_event_rx = next_runtime.turn_event_rx;
                             // Treiber und Fragekanal gehören zum Handler der
@@ -745,7 +784,8 @@ pub fn run_tui(assembly: Arc<RuntimeAssembly>, options: TuiRunOptions) -> Result
     // `guard` stellt das Terminal zurück, auch im Fehlerfall.
     drop(guard);
     let persistence = runtime.block_on(gateway.persist_state());
-    crate::gateway::ChatGateway::session_mut(&mut gateway).announce_closed(Some("tui exited".to_owned()));
+    crate::gateway::ChatGateway::session_mut(&mut gateway)
+        .announce_closed(Some("tui exited".to_owned()));
     current.close_session(current.root_session_id());
     match (result, persistence) {
         (Err(error), _) => Err(error),
@@ -1281,6 +1321,8 @@ mod tests {
             mode_override,
             active_agent: None,
             reasoning_effort: None,
+            approval_override: None,
+            model_override: None,
         };
         let state_store: Arc<dyn StateStore> = Arc::new(harw_core::InMemoryStateStore::new());
         RuntimeAssembly::builder(spec)

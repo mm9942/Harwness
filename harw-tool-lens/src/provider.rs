@@ -55,8 +55,8 @@ harw_tools::tool_provider! {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use harw_extension_api::contributors::ToolProvider as _;
     use harw_authority::Permission;
+    use harw_extension_api::contributors::ToolProvider as _;
     use harw_tools::ToolName;
 
     /// Genau ein Werkzeug wird beworben -- die begründete Entscheidung aus
@@ -76,14 +76,17 @@ mod tests {
         let provider = LensToolProvider::new();
         assert!(provider.executor(&ToolName::new("lens.ask")).is_some());
         assert!(provider.executor(&ToolName::new("lens.build")).is_none());
-        assert!(provider.executor(&ToolName::new("lens.unbekannt")).is_none());
+        assert!(
+            provider
+                .executor(&ToolName::new("lens.unbekannt"))
+                .is_none()
+        );
     }
 
     /// `lens.ask` deklariert `ReadWorkspace`.
     #[test]
     fn test_provider_declares_read_workspace_permission() {
-        let permissions: Vec<Option<Permission>> =
-            LensToolProvider::TOOL_PERMISSIONS.to_vec();
+        let permissions: Vec<Option<Permission>> = LensToolProvider::TOOL_PERMISSIONS.to_vec();
         assert_eq!(permissions, vec![Some(Permission::ReadWorkspace)]);
     }
 

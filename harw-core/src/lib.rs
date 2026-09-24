@@ -11,8 +11,8 @@
 #![deny(clippy::print_stdout, clippy::print_stderr)]
 
 pub mod activation;
-pub mod agent_events;
 pub mod admission;
+pub mod agent_events;
 pub mod auto_compact;
 pub mod cancel;
 pub mod capture;
@@ -42,12 +42,12 @@ pub mod testing;
 pub mod turn_loop;
 
 pub use activation::{SessionActivation, ToolProfile};
-pub use agent_events::{
-    AgentEvent, AgentEventHub, AgentEventKind, HubOrchestrationObserver, UsageReportingProvider,
-};
 pub use admission::{
     AdmissionContext, JobAdmissionError, JobAdmissionPolicy, JobAdmissionService, JobIntent,
     ResolvedAdmission,
+};
+pub use agent_events::{
+    AgentEvent, AgentEventHub, AgentEventKind, HubOrchestrationObserver, UsageReportingProvider,
 };
 pub use auto_compact::{
     AutoCompactPolicy, CompactDecision, DEFAULT_ABSOLUTE_CEILING_TOKENS,
@@ -56,14 +56,18 @@ pub use auto_compact::{
 pub use capture::{ToolOutcome, ToolOutcomeObserver, ToolOutcomeStatus};
 pub use child_controller::{
     AgentBudget, BudgetDimension, ChildLimits, ChildRecord, ChildRegistryFactory, ChildRunResult,
-    ExpiredChild, FanoutRequest, JoinSemantics, ManagedAgentSpawner, OrchestrationObserver,
-    ParentGrant, RoleEffortWeights, TaskComplexity, ContextWindowResolver, DEFAULT_CHILD_CONTEXT_WINDOW,
+    ChildUsage, ContextWindowResolver, DEFAULT_CHILD_CONTEXT_WINDOW, ExpiredChild, FanoutRequest,
+    JoinSemantics, ManagedAgentSpawner, OrchestrationObserver, ParentGrant, RoleEffortWeights,
+    TaskComplexity,
 };
 pub use compaction::{
     CompactionObserver, CompactionOutcome, CompactionPlan, SUMMARY_MARKER, compact_session,
     deterministic_pass,
 };
-pub use context_budget::{ContextAssembly, ContextBudget};
+pub use context_budget::{
+    ContextAssembly, ContextBudget, DEFAULT_BYTES_PER_TOKEN, TokenCalibration,
+    estimate_request_bytes, estimate_request_tokens, output_reserve_tokens,
+};
 pub use delegation_visibility::{
     DelegationTarget, DelegationTargetKind, visible_delegation_targets,
 };
@@ -90,14 +94,14 @@ pub use one_shot::{OneShotError, complete_text};
 pub use pinned_model::PinnedModelProvider;
 pub use policy::ConfigApprovalPolicy;
 pub use session::{
-    APPROVAL_TIMEOUT_REASON, AgentSession, DEFAULT_APPROVAL_TIMEOUT, PendingApproval,
-    LiveEmitter, PendingHandoff, SessionState, SpawnContext, TurnHandle, TurnRejection,
+    APPROVAL_TIMEOUT_REASON, AgentSession, DEFAULT_APPROVAL_TIMEOUT, LiveEmitter, PendingApproval,
+    PendingHandoff, SessionState, SpawnContext, TurnHandle, TurnRejection,
 };
 pub use session_manager::SessionManager;
-pub use stream::{ModelStreamEvent, StreamSink};
 pub use state_store::{
     InMemoryStateStore, SessionThreadMapper, StateStore, TranscriptStateStore, UsageRound,
 };
+pub use stream::{ModelStreamEvent, StreamSink};
 pub use testing::RecordingModelProvider;
 pub use turn_loop::{
     ApprovalResolution, TurnInput, TurnOutcome, resume_after_approval,

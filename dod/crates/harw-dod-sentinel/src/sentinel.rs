@@ -848,6 +848,7 @@ mod tests {
         sentinel.poll_all(next_attempt);
         assert_eq!(mock.calls(), 2);
         assert_eq!(sentinel.health_snapshot()[0].1, SensorHealth::Bound);
+        Ok(())
     }
 
     #[test]

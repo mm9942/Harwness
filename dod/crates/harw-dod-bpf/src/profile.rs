@@ -30,19 +30,26 @@ pub enum BpfScope {
     /// `groups`; BPF can then make an exact ID lookup without using unsafe
     /// path prefixes or guessing ancestry in kernel context.  Newly created
     /// descendants require the documented ordered profile restart.
-    Cgroups { groups: Vec<ResolvedCgroup>, include_descendants: bool },
+    Cgroups {
+        groups: Vec<ResolvedCgroup>,
+        include_descendants: bool,
+    },
 }
 
 impl BpfScope {
     pub fn validate(&self) -> Result<(), crate::BpfError> {
         match self {
             Self::Host => Ok(()),
-            Self::Cgroups { groups, .. } if groups.is_empty() => Err(crate::BpfError::InvalidProgramContract),
+            Self::Cgroups { groups, .. } if groups.is_empty() => {
+                Err(crate::BpfError::InvalidProgramContract)
+            }
             Self::Cgroups { groups, .. } => {
                 let ids: BTreeSet<_> = groups.iter().map(|group| group.id).collect();
                 if groups.len() > MAX_SCOPE_CGROUP_IDS
                     || ids.len() != groups.len()
-                    || groups.iter().any(|group| group.id == 0 || !valid_cgroup_path(&group.path))
+                    || groups
+                        .iter()
+                        .any(|group| group.id == 0 || !valid_cgroup_path(&group.path))
                 {
                     Err(crate::BpfError::InvalidProgramContract)
                 } else {
@@ -56,8 +63,12 @@ impl BpfScope {
     pub fn contains_path(&self, actual: &str) -> bool {
         match self {
             Self::Host => true,
-            Self::Cgroups { groups, include_descendants } => groups.iter().any(|group| {
-                actual == group.path || (*include_descendants && is_descendant_path(actual, &group.path))
+            Self::Cgroups {
+                groups,
+                include_descendants,
+            } => groups.iter().any(|group| {
+                actual == group.path
+                    || (*include_descendants && is_descendant_path(actual, &group.path))
             }),
         }
     }
@@ -81,16 +92,24 @@ fn valid_cgroup_path(path: &str) -> bool {
 /// `/a` is an ancestor of `/a/b`, never of `/ab`.
 #[must_use]
 pub fn is_descendant_path(candidate: &str, parent: &str) -> bool {
-    candidate.strip_prefix(parent).is_some_and(|rest| rest.starts_with('/'))
+    candidate
+        .strip_prefix(parent)
+        .is_some_and(|rest| rest.starts_with('/'))
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{is_descendant_path, BpfScope, ResolvedCgroup};
+    use super::{BpfScope, ResolvedCgroup, is_descendant_path};
 
     #[test]
     fn component_aware_scope_excludes_siblings_and_prefix_collisions() {
-        let scope = BpfScope::Cgroups { groups: vec![ResolvedCgroup { path: "/a".into(), id: 12 }], include_descendants: true };
+        let scope = BpfScope::Cgroups {
+            groups: vec![ResolvedCgroup {
+                path: "/a".into(),
+                id: 12,
+            }],
+            include_descendants: true,
+        };
         assert!(scope.contains_path("/a/child"));
         assert!(!scope.contains_path("/ab"));
         assert!(!scope.contains_path("/other"));
@@ -99,18 +118,41 @@ mod tests {
 
     #[test]
     fn rejects_empty_and_duplicate_kernel_id_scopes() {
-        assert!(BpfScope::Cgroups { groups: vec![], include_descendants: false }.validate().is_err());
+        assert!(
+            BpfScope::Cgroups {
+                groups: vec![],
+                include_descendants: false
+            }
+            .validate()
+            .is_err()
+        );
         let groups = vec![
-            ResolvedCgroup { path: "/a".into(), id: 1 },
-            ResolvedCgroup { path: "/b".into(), id: 1 },
+            ResolvedCgroup {
+                path: "/a".into(),
+                id: 1,
+            },
+            ResolvedCgroup {
+                path: "/b".into(),
+                id: 1,
+            },
         ];
-        assert!(BpfScope::Cgroups { groups, include_descendants: true }.validate().is_err());
+        assert!(
+            BpfScope::Cgroups {
+                groups,
+                include_descendants: true
+            }
+            .validate()
+            .is_err()
+        );
     }
 
     #[test]
     fn recreated_path_never_inherits_the_previous_cgroup_identity() {
         let scope = BpfScope::Cgroups {
-            groups: vec![ResolvedCgroup { path: "/selected".into(), id: 41 }],
+            groups: vec![ResolvedCgroup {
+                path: "/selected".into(),
+                id: 41,
+            }],
             include_descendants: false,
         };
         assert!(scope.allows_cgroup_id(41));

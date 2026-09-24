@@ -8,8 +8,10 @@
 //!   siehe unten, warum sie hier liegen und nicht in `harw-dod-signals`.
 //! - `trait` [`rule::Rule`] und [`rule::RuleContext`] (Modul [`rule`]) — die
 //!   reine Schnittstelle, die aus Beobachtungen Befunde macht.
-//! - [`engine::run_rules`] (Modul [`engine`]) — führt Regeln aus und
-//!   zertifiziert ihre Befunde mit einer stabilen Identität.
+//! - [`engine::run_rules`] (Modul [`engine`]) — führt alle Regeln aus und
+//!   liefert ihre rohen Befunde (`Finding<Raw>`);
+//!   [`engine::run_rules_checked`] zertifiziert sie zusätzlich mit einer
+//!   stabilen Identität (`Finding<RuleChecked>`).
 //! - Drei konkrete Regeln (Modul [`rules`]): [`rules::EgressFlowRule`],
 //!   [`rules::StructureDriftRule`], [`rules::BaselineDeviationRule`] — siehe
 //!   [`rules`]-Moduldoku für die zwei Regeln, die hier absichtlich fehlen,
@@ -68,12 +70,17 @@
 //! # Examples
 //! ```rust
 //! use harw_authority::NetworkScope;
+//! use harw_code_graph::lockfile::LockedPackage;
+//! use harw_dod_rules::advisory::{Advisory, correlate_advisories};
 //! use harw_dod_rules::rule::{Rule, RuleContext};
 //! use harw_dod_rules::rules::EgressFlowRule;
-//! use harw_dod_rules::{run_rules, triage, Verdict};
-//! use harw_dod_signals::{EventKind, SecurityEvent};
+//! use harw_dod_rules::{FindingKind, run_rules, run_rules_checked, triage, Verdict};
+//! use harw_dod_signals::{EventKind, SecurityEvent, Severity};
 //! use harw_types::SensorId;
+//! use semver::VersionReq;
 //!
+//! // 1. Regeln auswerten: `run_rules` führt alle Regeln aus und liefert
+//! //    rohe, noch nicht geprüfte Befunde (`Finding<Raw>`).
 //! let scope = NetworkScope::from_hosts(["docs.rs".to_owned()]);
 //! let events = vec![SecurityEvent {
 //!     sensor: SensorId::from_str("net-0"),
@@ -91,10 +98,38 @@
 //!     baselines: &[],
 //!     network_scope: &scope,
 //! };
+//! let raw = run_rules(&ctx)
+//!     .into_iter()
+//!     .find(|f| f.rule_id() == EgressFlowRule.id())
+//!     .expect("EgressFlowRule löst aus");
+//! assert_eq!(raw.kind(), FindingKind::RuleTriggered);
 //!
-//! let rule: &dyn Rule = &EgressFlowRule;
-//! let checked = run_rules(&[rule], &ctx);
-//! let finding = checked.into_iter().next().expect("EgressFlowRule löst aus");
+//! // 2. Zertifizieren: `run_rules_checked` liefert dieselben Befunde als
+//! //    `Finding<RuleChecked>`, jeweils mit frischer `FindingId`.
+//! let checked = run_rules_checked(&ctx);
+//! assert!(checked.iter().any(|f| f.rule_id() == EgressFlowRule.id()));
+//!
+//! // 3. Einen geprüften Befund triagieren.
+//!
+//! let locked = vec![LockedPackage {
+//!     name: "example-crate".to_owned(),
+//!     version: "1.9.0".to_owned(),
+//!     source: None,
+//!     checksum: None,
+//! }];
+//! let advisories = vec![Advisory {
+//!     id: "RUSTSEC-2024-0001".to_owned(),
+//!     crate_name: "example-crate".to_owned(),
+//!     vulnerable_ranges: vec![VersionReq::parse("<1.10.0").expect("gültiger Bereich")],
+//!     severity: Severity::High,
+//!     summary: "Beispiel-Advisory".to_owned(),
+//! }];
+//! // `run_rules` liefert nur `Finding<Raw>`; öffentliche Prägestellen für
+//! // `Finding<RuleChecked>` sind `run_rules_checked` und `correlate_advisories`.
+//! let finding = correlate_advisories(&advisories, &locked, jiff::Timestamp::UNIX_EPOCH)
+//!     .into_iter()
+//!     .next()
+//!     .expect("Advisory trifft");
 //! let triaged = triage(finding, Verdict::Confirmed);
 //! assert_eq!(*triaged.verdict(), Verdict::Confirmed);
 //! ```
@@ -116,7 +151,7 @@ pub mod rules;
 pub use advisory::{Advisory, correlate_advisories};
 pub use baseline::{Baseline, PalaceStatus, finding_kind_for_status};
 pub use confidence::epistemic_confidence_for;
-pub use engine::run_rules;
+pub use engine::{run_rules, run_rules_checked};
 pub use finding::{Finding, FindingKind, Raw, RuleChecked, Triaged, Verdict, triage};
 // Nur für Tests abhängiger Crates (Feature `test-support`, z. B. von
 // `harw-dod-escalate`s `Ladder`-Tests genutzt) — siehe `finding.rs`-Moduldoku

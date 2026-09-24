@@ -80,7 +80,7 @@ mod error;
 mod federated;
 
 pub use error::{FederationError, FederationResult};
-pub use federated::{federated_pack, federated_query, FederatedOutcome, SkipReason, SkippedIndex};
+pub use federated::{FederatedOutcome, SkipReason, SkippedIndex, federated_pack, federated_query};
 
 // Test-Fehlertyp (Bible R087/R165/R182), nur für Tests.
 #[cfg(test)]

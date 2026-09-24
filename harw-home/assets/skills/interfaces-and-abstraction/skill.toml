@@ -1,0 +1,5 @@
+name = "interfaces-and-abstraction"
+description = "Use when du ein Interface/Protocol/Trait/abstrakte Klasse definierst, Logik für mehrere Typen duplizierst, zwischen Generics und dynamischem Dispatch (Interface-Objekt, Factory, Plugin, DI, Test-Fake) wählst oder Typ-Constraints unlesbar werden — in TypeScript, Python (Protocol/ABC/TypeVar), Go (interfaces, type parameters), Java/C# oder Rust (traits, `dyn`). Lehrt: nach Verhalten benennen statt nach Technologie, kleine Interfaces beim Konsumenten, erst ab 2+ Implementierungen extrahieren, Generics für homogene Algorithmen, Interface-Objekte für heterogene Sammlungen, Constraints in where/bound-Klauseln. Sprachunabhängige Variante von rust-traits-defining / rust-trait-bounds / rust-generic-functions / rust-monomorphization-vs-dyn / rust-box-dyn."
+enabled = true
+instructions_file = "instructions.md"
+tools = ["filesystem.read"]

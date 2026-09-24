@@ -32,21 +32,28 @@ mod offset;
 mod render;
 
 pub use client::{
-    BotCommand, BotInfo, InlineKeyboardButton, SentMessage, TelegramClient, TelegramFile,
+    BotCommand, BotCommandScope, BotInfo, InlineKeyboardButton, SentMessage, TelegramClient,
+    TelegramFile,
 };
 pub use dedup::DedupWindow;
 pub use error::{OffsetPersistenceOperation, TelegramTransportError, TransportResult};
-pub use hand_off::{AdmittedEventConsumer, TelegramOutbound};
+pub use hand_off::{AdmittedEventConsumer, CallbackConsumer, TelegramOutbound};
 pub use ingress_long_poll::{LongPollConfig, LongPollShutdown, spawn_long_poll_thread};
-pub use ingress_webhook::{WebhookConfig, run_webhook_server, webhook_router};
+pub use ingress_webhook::{
+    WebhookConfig, run_webhook_server, run_webhook_server_with_shutdown, webhook_router,
+};
 pub use mapping::{
     RawCallbackQuery, RawChat, RawDocument, RawMedia, RawMessage, RawMessageEntity, RawPhotoSize,
-    RawUpdate, RawUser, TelegramCommand, map_update, parse_command,
+    RawUpdate, RawUser, TelegramCallback, TelegramCommand, callback_query_id, is_command_like,
+    map_callback_query, map_update, parse_command,
 };
-pub use media::{AttachmentIntake, DownloadedAttachment};
+pub use media::{AttachmentIntake, DownloadedAttachment, fetch_attachment};
 pub use mirror::TelegramMirrorTransport;
 pub use offset::TelegramOffsetStore;
-pub use render::{RendererConfig, TelegramRenderer};
+pub use render::{
+    ApprovalBindingError, ApprovalDelivery, Clock, PreparedApproval, RendererConfig,
+    StreamingStrategy, TelegramRenderer,
+};
 
 // Test-Fehlertyp (Bible R087/R165/R182), nur für Tests.
 #[cfg(test)]

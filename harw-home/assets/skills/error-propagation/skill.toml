@@ -1,0 +1,5 @@
+name = "error-propagation"
+description = "Use when ein Fehler in IRGENDEINER Sprache nach oben weitergereicht, in einen eigenen Typ übersetzt oder mit Kontext angereichert werden muss — z. B. `if err != nil { return err }` ohne Kontext, `except Exception: pass`, leeres `catch {}`, `raise X` ohne `from`, `throw new Error(e.message)` (Ursache verloren), `fmt.Errorf(\"%v\")` statt `%w`, Log-and-rethrow oder Rusts `?`/`.map_err`. Lehrt frühe Rückgabe, einmaliges Wrappen mit Kontext pro Schicht, Übersetzung fremder Fehler an der Modulgrenze und niemals Fehler verschlucken. Immer verwenden, wenn du Fehlerpfade schreibst oder reviewst. Sprachunabhängige Variante von rust-question-mark-operator / rust-map-err / rust-ok-or-else."
+enabled = true
+instructions_file = "instructions.md"
+tools = ["filesystem.read"]

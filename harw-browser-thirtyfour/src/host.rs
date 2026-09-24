@@ -123,17 +123,22 @@ impl BrowserHost for FirefoxHost {
         request: OpenBrowserRequest,
     ) -> harw_browser::Result<BrowserSessionHandle> {
         self.validate_open_request(&request)?;
-        let pin = self.config.geckodriver_pin().ok_or_else(|| {
-            BrowserError::CapabilityUnavailable {
-                detail: "no pinned geckodriver (path + SHA-256) is configured for the Firefox adapter"
-                    .to_owned(),
+        let pin =
+            self.config
+                .geckodriver_pin()
+                .ok_or_else(|| {
+                    BrowserError::CapabilityUnavailable {
+                detail:
+                    "no pinned geckodriver (path + SHA-256) is configured for the Firefox adapter"
+                        .to_owned(),
             }
-        })?;
-        let launcher = self.config.launcher().ok_or_else(|| {
-            BrowserError::CapabilityUnavailable {
-                detail: "no sandbox launcher is configured for the Firefox adapter".to_owned(),
-            }
-        })?;
+                })?;
+        let launcher =
+            self.config
+                .launcher()
+                .ok_or_else(|| BrowserError::CapabilityUnavailable {
+                    detail: "no sandbox launcher is configured for the Firefox adapter".to_owned(),
+                })?;
 
         let plan = FirefoxCapabilityFactory::new(&self.config).plan(&request)?;
         let event_policy = self.config.journal_policy()?;
@@ -243,9 +248,11 @@ impl BrowserHost for FirefoxHost {
             };
             if let Err(detail) = mapping {
                 if matches!(bidi_requirement, BiDiRequirement::Required) {
-                    if let Err(error) = <FirefoxRuntime as BrowserRuntime>::close(runtime.as_ref()).await {
-                    tracing::warn!(%error, "Firefox runtime close failed after an aborted open");
-                }
+                    if let Err(error) =
+                        <FirefoxRuntime as BrowserRuntime>::close(runtime.as_ref()).await
+                    {
+                        tracing::warn!(%error, "Firefox runtime close failed after an aborted open");
+                    }
                     return Err(BrowserError::CapabilityUnavailable {
                         detail: format!(
                             "required Firefox BiDi primary-context mapping failed: {detail}"
@@ -290,7 +297,9 @@ impl BrowserHost for FirefoxHost {
             .into_iter()
             .any(|status| status == CapabilityStatus::Native);
             if matches!(bidi_requirement, BiDiRequirement::Required) && !any_native {
-                if let Err(error) = <FirefoxRuntime as BrowserRuntime>::close(runtime.as_ref()).await {
+                if let Err(error) =
+                    <FirefoxRuntime as BrowserRuntime>::close(runtime.as_ref()).await
+                {
                     tracing::warn!(%error, "Firefox runtime close failed after an aborted open");
                 }
                 return Err(BrowserError::CapabilityUnavailable {

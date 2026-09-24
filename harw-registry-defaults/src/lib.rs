@@ -64,6 +64,8 @@ pub mod authority;
 pub mod embedded_agents;
 pub mod profile;
 pub mod research_web;
+pub mod skill_proposal_tools;
+pub mod workbench_tools;
 
 #[cfg(test)]
 mod test_support;
@@ -82,7 +84,9 @@ pub use agent_definition_tools::{
     AgentDefinitionToolProvider, DefinitionAuthorCeiling, DefinitionWriteMode,
     UiaSelfDocumentToolProvider,
 };
-pub use authority::{AuthorityReducer, authority_reducer_for_role, tool_permission};
+pub use authority::{
+    AuthorityReducer, authority_reducer_for_role, delegation_targets_for_role, tool_permission,
+};
 pub use error::{RegistryDefaultsError, RegistryDefaultsResult};
 pub use profile::{
     AgentDefinitionAccess, HostPermitWiring, IdentityOverrides, RegistryProfile,
@@ -92,6 +96,8 @@ pub use profile::{
     profile_for_role, role_names,
 };
 pub use research_web::{install_web_tools, researcher_web_network_scope, researcher_web_policy};
+pub use skill_proposal_tools::{SkillAuthorCeiling, SkillProposalStore, SkillProposalToolProvider};
+pub use workbench_tools::WorkbenchToolProvider;
 
 /// Die Werkzeuge, die ohne Nutzerrückfrage ausgeführt werden dürfen.
 ///
@@ -99,9 +105,11 @@ pub use research_web::{install_web_tools, researcher_web_network_scope, research
 /// Die Liste umfasst ausschließlich Werkzeuge, die **nachweislich** nur lesen
 /// und an keiner Fläche eine Freigabe (`ApprovalPolicy != None`) deklarieren:
 /// lesende Dateisystem-Werkzeuge, das lesende PDF-Werkzeug (`doc.read_pdf`,
-/// `harw-tool-doc`), die Dependency-Werkzeuge, `lens.ask`, die Web-Recherche
-/// (deren Netzgrenze die Host-Allowlist der Sandbox zieht, nicht die
-/// Freigabe) und die lesenden Status-Operationen `status`/`ps`.
+/// `harw-tool-doc`), die Explorer-Werkzeuge (`explore.*`), die
+/// Dependency-Werkzeuge, `lens.ask`, die Web-Recherche (deren Netzgrenze die
+/// Host-Allowlist der Sandbox zieht, nicht die Freigabe) und die lesenden
+/// Status-Operationen `status`/`ps`. `process.list`/`process.kill` gehören
+/// nie dazu (`ExecuteProcess`, nur im Profil `Full`).
 ///
 /// Alles Mutierende — `fs.write`, `shell.exec`, `stop`, `plan`, `goal` —, alles
 /// mit Nebenwirkung über einen anderen Weg (`diff`, `explore`, `research_*`,
@@ -147,6 +155,13 @@ pub const AUTO_APPROVED_TOOLS: &[&str] = &[
     // Eigenschaft wie `fs.read`, erscheint deshalb überall, wo ein lesender
     // FS-Provider registriert wird (siehe `profile::DOC_TOOLS`).
     "doc.read_pdf",
+    // Workspace-Explorer (`harw-tool-explorer`) — Baum, Projekte, Relationen,
+    // Suche ab der Workspace-Wurzel; rein lesend, `Permission::ReadWorkspace`
+    // wie `fs.read` (siehe `profile::EXPLORER_TOOLS`).
+    "explore.tree",
+    "explore.projects",
+    "explore.relations",
+    "explore.find",
     // Dependency-Werkzeuge (`harw-tool-deps`) — ausnahmslos read-only.
     "deps.graph",
     "deps.locked",
@@ -159,16 +174,33 @@ pub const AUTO_APPROVED_TOOLS: &[&str] = &[
     // Agenten. Die Sichtbarkeitsgrenze zieht `ReadScope`, nicht die
     // Genehmigung — der Aufrufer kann seinen Bereich nicht selbst wählen.
     "lens.ask",
-    // Web-Recherche (`harw-tool-web`) — nur im Profil `Research` (Rolle
-    // `researcher-web`, ohne `fs.*`/`deps.*`); die Netzgrenze zieht die
-    // `EgressPolicy` aus `[network].researcher_web_hosts` (W5 RD).
+    // Web-Recherche (`harw-tool-web`) — alle vier im Profil `Research` (Rolle
+    // `researcher-web`, ohne `fs.*`/`deps.*`); `web.fetch`/`web.search`
+    // zusätzlich in den Erkundungsprofilen (`explorer`, `uia-explorer`,
+    // Nutzerentscheidung) und in den UIA-Helferprofilen (`uia-worker`,
+    // `uia-writer`, Nutzerentscheidung „kurz online recherchieren“). Die
+    // Netzgrenze zieht jeweils der `NetworkScope` der Sandbox bzw. die
+    // `EgressPolicy` (W5 RD), nicht die Freigabe — rein lesend.
     "web.fetch",
     "web.docs_rs",
     "web.crates_io",
+    "web.search",
     // Lesende Status-Operationen (`harw-ops`, `model_tool(readonly, approval =
     // "none")`, ohne Seitenpfad in andere Executor).
     "status",
     "ps",
+    // Fan-out-Operation der Orchestratoren (`harw-core-bridge::delegate_wave`,
+    // Plan Punkt 1; `model_tool(readonly = false, approval = "none")`). Die
+    // Operation selbst schreibt nichts: jedes gestartete Kind läuft mit seinem
+    // eigenen, per `AuthorityReducer` gedeckelten Rechtesatz, seiner eigenen
+    // Freigabe-Politik und unter dem Budget-Deckel der Welle
+    // (`wave_budget_cap`). Ein Child-Orchestrator läuft mit
+    // `allow_pause = false` und könnte eine Rückfrage nie beantworten — eine
+    // Freigabepflicht hier würde jede verschachtelte Welle blockieren.
+    // Registriert wird sie ausschließlich für Orchestrator-Rollen
+    // (`profile::composition_tools_for_role`), nie über ein
+    // `RegistryProfile`.
+    "delegate_wave",
     // Bewusst entfernt (W1-05, Register F-014, G-003, G-004, F-043, G-068):
     // - `plan`, `goal`: deklarieren `model_tool(approval = "always")` und
     //   mutieren PlanStore bzw. Ziel; die Auto-Freigabe überstimmte die
@@ -204,14 +236,30 @@ pub const AUTO_APPROVED_TOOLS: &[&str] = &[
 /// hier gelistete Werkzeug bleibt zusätzlich außerhalb von
 /// [`AUTO_APPROVED_TOOLS`] (das gilt bereits, da beide Werkzeuge schreiben).
 ///
-/// # Warum nur diese zwei
+/// # Warum nur diese beiden Agenten-Werkzeuge
 /// `agents.write_definition` legt lediglich einen Vorschlag ab (nie eine
 /// aktive Definition) — dessen Prüfung ist Sache von `agents.commit_proposal`,
 /// nicht des Ablegens selbst. `agents.reject_proposal` verwirft nur, verleiht
 /// keine Rechte. Beide bleiben normal freigabepflichtig über
 /// [`AUTO_APPROVED_TOOLS`]/die Modus-Logik, aber nicht zusätzlich über diese
 /// Liste.
-pub const ALWAYS_ASK_TOOLS: &[&str] = &["agents.write_uia", "agents.commit_proposal"];
+///
+/// # `skills.commit_proposal`
+/// Übernimmt einen Skill-Vorschlag dauerhaft in `<profil>/skills/`
+/// ([`skill_proposal_tools`]); wie `agents.commit_proposal` ist ein
+/// `user_confirmed: true` im Argument keine echte Freigabe. `skills.propose`
+/// und `skills.reject_proposal` bleiben normal freigabepflichtig.
+///
+/// # `process.kill`
+/// Schickt SIGKILL an Host-Prozesse — nicht umkehrbar. Deshalb fragt es wie
+/// die beiden Agenten-Werkzeuge immer, auch unter `FullAccess` und trotz
+/// passender Allow-Regel.
+pub const ALWAYS_ASK_TOOLS: &[&str] = &[
+    "agents.write_uia",
+    "agents.commit_proposal",
+    "skills.commit_proposal",
+    "process.kill",
+];
 
 /// Default approval boundary for the built-in coding-agent tool set.
 ///
@@ -466,7 +514,14 @@ mod tests {
             "fs.glob".to_owned(),
             "fs.grep".to_owned(),
             "doc.read_pdf".to_owned(),
+            "explore.tree".to_owned(),
+            "explore.projects".to_owned(),
+            "explore.relations".to_owned(),
+            "explore.find".to_owned(),
             "shell.exec".to_owned(),
+            // `process.kill` steht in `ALWAYS_ASK_TOOLS`, fragt also immer.
+            "process.list".to_owned(),
+            "process.kill".to_owned(),
         ];
 
         let advertised_tools = registered_names(&ar);
@@ -524,12 +579,20 @@ mod tests {
     /// fremden Executor aufrufen (`harw-ops/src/status.rs`, `ps.rs`).
     const READ_ONLY_ROOT_OPERATIONS: &[&str] = &["status", "ps"];
 
+    /// Fan-out-Operationen der Composition-Root für Orchestratoren
+    /// (`profile::ORCHESTRATION_TOOLS`, heute `delegate_wave`): nicht
+    /// read-only im engeren Sinn, aber ohne eigene Schreibwirkung — jedes
+    /// Kind bleibt an seine eigene Rechte- und Freigabegrenze gebunden
+    /// (Begründung bei [`AUTO_APPROVED_TOOLS`]).
+    const NON_PAUSING_ORCHESTRATION_OPERATIONS: &[&str] = crate::profile::ORCHESTRATION_TOOLS;
+
     #[test]
     fn auto_approved_tools_are_a_subset_of_the_read_only_surface() {
         // Umkehrung der früheren Deckungsprüfung: nicht „jedes Profil-Werkzeug
         // muss in die Allowlist“, sondern „jeder Allowlist-Eintrag muss
         // nachweislich read-only sein“.
         let mut read_only_surface: Vec<&str> = READ_ONLY_ROOT_OPERATIONS.to_vec();
+        read_only_surface.extend_from_slice(NON_PAUSING_ORCHESTRATION_OPERATIONS);
         for profile in RegistryProfile::ALL.iter().filter(|p| p.is_read_only()) {
             read_only_surface.extend(profile.registered_tool_names());
         }
@@ -596,7 +659,8 @@ mod tests {
             // `crate::authority::tests::test_authority_reducer_for_role_covers_every_role_and_bounds_its_profile`
             // (dort `exempt_from_subset_bound`), statt einer zweiten,
             // handgepflegten Rollenliste: `executor`, `memory-steward`,
-            // `uia-worker` und `agent-steward` bekommen ihr freigabepflichtiges
+            // `uia-worker`, `uia-writer`, `uia-shell-worker` und
+            // `agent-steward` bekommen ihr freigabepflichtiges
             // Werkzeug (`shell.exec`/`fs.write`/die schreibenden
             // Agentendefinitions-Werkzeuge) über ihre feste Profilzuweisung bei
             // der Registry-Montage, nicht über den `AuthorityReducer` — siehe

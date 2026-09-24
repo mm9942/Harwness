@@ -14,6 +14,7 @@ pub mod contributors;
 pub mod error;
 pub mod guard_wiring;
 pub mod handoff;
+pub mod job_ledger;
 pub mod mcp_wiring;
 pub mod memory_wiring;
 pub mod model;
@@ -21,6 +22,7 @@ pub mod sandbox;
 pub mod services;
 pub mod session_title;
 pub mod spec;
+pub mod task_context;
 pub mod trace;
 
 #[cfg(test)]

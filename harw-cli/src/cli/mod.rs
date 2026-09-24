@@ -1,30 +1,41 @@
 //! clap-basierte Kommandozeilen-Grammatik für `harw`.
 //!
-//! Spiegelt das codex-Muster: ein Root-Parser mit optionalem Subcommand und
-//! geflatteten Chat-Flags. Fehlt ein Subcommand, startet der interaktive Chat
-//! (`Cli::command == None`); `--help`/`-h`/`--version` behandelt clap selbst.
+//! Ein Root-Parser mit optionalem Subcommand: globale Flags ([`GlobalArgs`])
+//! gelten hinter jedem Befehl, die Chat-Flags ([`ChatArgs`]) sind an der
+//! Wurzel geflattet, sodass `harw [PROMPT]` ohne Subcommand den Chat startet
+//! (`Cli::command == None`). `--help`/`-h`/`--version` behandelt clap selbst.
 //!
 //! Die Grammatik ist nach Domänen auf Untermodule verteilt; alle Typen werden
 //! hier per Glob re-exportiert, sodass jeder Pfad `crate::cli::X` stabil bleibt.
-//! Typisierte Werte (`ValueEnum`s, Wert-Parser für `--log`/`--mode`) liegen in
-//! [`values`] und speisen sowohl die Parse-Validierung als auch die
-//! Shell-Completions.
+//! Typisierte Werte (`ValueEnum`s, Wert-Parser für `--log`/`--mode`/
+//! `--approval`) liegen in [`values`] und speisen sowohl die
+//! Parse-Validierung als auch die Shell-Completions. Den fertigen
+//! clap-Befehl (inklusive deutscher Hilfe für `completions`) liefert
+//! [`command`].
 
+use std::ffi::OsString;
 use std::path::PathBuf;
 
-use clap::{Parser, Subcommand, ValueHint};
+use clap::{CommandFactory, Parser, Subcommand, ValueHint};
 
+mod agent;
 mod analyze;
 mod auth;
+mod channel;
 mod completions;
+mod debug;
 mod gateway;
 mod global;
+mod jobs;
+mod knowledge;
 mod lens;
 mod mcp;
 mod models;
 mod project;
+mod provider;
 mod sandbox;
 mod service;
+mod session;
 mod settings;
 mod uia;
 pub mod values;
@@ -32,17 +43,24 @@ pub mod values;
 #[cfg(test)]
 mod tests;
 
+pub use agent::*;
 pub use analyze::*;
 pub use auth::*;
+pub use channel::*;
 pub use completions::*;
+pub use debug::*;
 pub use gateway::*;
 pub use global::*;
+pub use jobs::*;
+pub use knowledge::*;
 pub use lens::*;
 pub use mcp::*;
 pub use models::*;
 pub use project::*;
+pub use provider::*;
 pub use sandbox::*;
 pub use service::*;
+pub use session::*;
 pub use settings::*;
 pub use uia::*;
 pub use values::*;
@@ -58,155 +76,192 @@ pub use values::*;
     subcommand_precedence_over_arg = true
 )]
 pub struct Cli {
-    /// Chat-Flags am Root, damit `harw [PROMPT]` ohne Subcommand funktioniert.
+    /// Globale Flags, die hinter jedem Befehl gelten.
+    #[command(flatten)]
+    pub global: GlobalArgs,
+    /// Chat-Flags an der Wurzel, damit `harw [PROMPT]` ohne Subcommand funktioniert.
     #[command(flatten)]
     pub chat: ChatArgs,
-    /// Interaktionsmodus beim Start: chat, plan, explore, work oder shell.
-    /// Ohne Angabe gilt der Wert aus `[mode] default` der Harness-Konfiguration.
-    ///
-    /// Der Wert wird beim Parsen über [`ModeParser`] geprüft, der ausschließlich
-    /// `harw_core::InteractionMode::parse` bzw. `InteractionMode::names`
-    /// befragt und den kanonischen Namen (`InteractionMode::as_str`) liefert.
-    /// `harw-cli` führt die Modusliste damit nicht ein zweites Mal — die in
-    /// `harw-core` bleibt die maßgebliche.
-    #[arg(long, value_name = "MODE", global = true, value_parser = ModeParser)]
-    pub mode: Option<String>,
-    /// Ziel-Statement, das beim Start gesetzt und an den Plan gebunden wird.
-    #[arg(long, value_name = "TEXT", global = true, value_hint = ValueHint::Other)]
-    pub goal: Option<String>,
     /// Optionaler Subcommand; ohne diesen startet der Chat.
     #[command(subcommand)]
     pub command: Option<Command>,
 }
 
+/// Liefert den vollständigen clap-Befehl von `harw`.
+///
+/// Entspricht [`Cli::command`], ergänzt um deutsche Hilfetexte für die
+/// Argumente von `completions`, die aus dem gemeinsamen Completions-Crate
+/// stammen. Hilfe-Ausgabe, Parse-Fehler und Shell-Completions sollten diesen
+/// Befehl verwenden.
+///
+/// # Returns
+/// Den fertig konfigurierten [`clap::Command`].
+#[must_use]
+pub fn command() -> clap::Command {
+    Cli::command().mut_subcommand("completions", |sub| {
+        sub.about("Erzeugt oder installiert Shell-Vervollständigungen.")
+            .long_about(
+                "Erzeugt oder installiert Shell-Vervollständigungen \
+                 (bash, zsh, fish, elvish, powershell).",
+            )
+            .mut_arg("shell", |arg| {
+                arg.help("Ziel-Shell; ohne Angabe wird sie aus $SHELL ermittelt.")
+            })
+            .mut_arg("install", |arg| {
+                arg.help(
+                    "Installiert das Vervollständigungsskript (ersetzt ältere Installationen).",
+                )
+            })
+            .mut_arg("uninstall", |arg| {
+                arg.help("Entfernt alle von harw angelegten Vervollständigungsdateien.")
+            })
+            .mut_arg("dry_run", |arg| {
+                arg.help("Zeigt nur, was --install bzw. --uninstall ändern würde.")
+            })
+            .mut_arg("all_binaries", |arg| {
+                arg.help(
+                    "Installiert bzw. entfernt die Vervollständigungen auch für alle \
+                     weiteren harw-Programme im PATH.",
+                )
+            })
+    })
+}
+
 /// Alle Subcommands von `harw`.
+///
+/// Die Reihenfolge der Varianten bestimmt die Reihenfolge in `harw --help`.
+/// Versteckte Varianten (`hide = true`) sind ältere Schreibweisen, die
+/// weiterhin geparst werden; `main.rs` leitet sie mit einem Hinweis auf den
+/// neuen Namen um.
 #[derive(Debug, Subcommand)]
 pub enum Command {
-    /// Root-Space `~/.harw` anlegen/scaffolden (idempotent).
-    Init,
-    /// Onboarding-Wizard: Provider, Modell und optional Channel einrichten.
-    Onboard,
-    /// Richtet einen Channel ein oder schließt ein ausstehendes Pairing ab.
-    Connect {
-        /// Channel-Art (derzeit nur `telegram`).
-        #[arg(long, value_enum)]
-        channel: Channel,
-        /// Einmaligen Code nach einer `/pair CODE`-Nachricht an den Bot einlösen.
-        #[arg(long, value_name = "CODE", value_hint = ValueHint::Other)]
-        pair: Option<String>,
-    },
-    /// Layered-Konfiguration und Katalog-Referenzen validieren.
-    Doctor {
-        /// Statt der Home-Layer genau dieses Verzeichnis prüfen.
-        #[arg(long, value_name = "DIR", value_hint = ValueHint::DirPath)]
-        config_dir: Option<PathBuf>,
-    },
-    /// Den lokalen Streamable-HTTP-MCP-Listener binden.
-    Serve {
-        /// Statt der Home-Layer genau dieses Verzeichnis verwenden.
-        #[arg(long, value_name = "DIR", value_hint = ValueHint::DirPath)]
-        config_dir: Option<PathBuf>,
-    },
-    /// Cloudflare-MCP-Verbindung einrichten oder prüfen.
-    Mcp {
-        /// Auszuführende MCP-Aktion.
+    // ── Arbeiten ────────────────────────────────────────────────────────
+    /// Startet den interaktiven Chat, optional mit einem ersten Prompt.
+    Chat(ChatArgs),
+    /// Führt einen einzelnen Prompt ohne Rückfragen aus und beendet sich danach.
+    Exec(ExecArgs),
+    /// Analysiert die Crate-Abhängigkeiten im Workspace und bearbeitet sie der Reihe nach.
+    Analyze(AnalyzeArgs),
+    /// Listet, zeigt oder setzt gespeicherte Sitzungen fort.
+    Session {
+        /// Auszuführende Sitzungs-Aktion.
         #[command(subcommand)]
-        action: McpAction,
+        action: SessionAction,
     },
-    /// Persistenter Hintergrund-Daemon: Gateway + Agenten + Channels
-    /// (Telegram) + Knowledge (Workbench/Dream/Diary). Ohne Aktion läuft der
-    /// Daemon im Vordergrund; die Aktionen verwalten seine Service-Unit.
+
+    // ── Konfiguration ───────────────────────────────────────────────────
+    /// Zeigt und ändert Konfigurationswerte und Freigaben; ohne Unterbefehl startet ein Menü.
+    #[command(visible_alias = "settings")]
+    Config {
+        /// Auszuführende Konfigurations-Aktion; ohne Angabe startet das Menü.
+        #[command(subcommand)]
+        action: Option<SettingsAction>,
+    },
+    /// Verwaltet die Modell-Anbieter.
+    Provider {
+        /// Auszuführende Anbieter-Aktion.
+        #[command(subcommand)]
+        action: ProviderAction,
+    },
+    /// Verwaltet Modelle und das Standardmodell; ohne Unterbefehl werden sie gelistet.
+    #[command(visible_alias = "models")]
+    Model {
+        /// Auszuführende Modell-Aktion; ohne Angabe wird gelistet.
+        #[command(subcommand)]
+        action: Option<ModelsAction>,
+    },
+    /// Verwaltet Zugangsdaten für Anbieter.
+    Auth {
+        /// Auszuführende Auth-Aktion.
+        #[command(subcommand)]
+        action: AuthAction,
+    },
+    /// Gibt Projektverzeichnisse frei oder entzieht die Freigabe.
+    Project {
+        /// Auszuführende Freigabe-Aktion.
+        #[command(subcommand)]
+        action: ProjectAction,
+    },
+
+    // ── Agenten und Wissen ──────────────────────────────────────────────
+    /// Verwaltet Agentin, Skills und Plugins.
+    Agent {
+        /// Auszuführende Agenten-Aktion.
+        #[command(subcommand)]
+        action: AgentAction,
+    },
+    /// Verwaltet Wissensindex, Gedächtnis und Kontext-Vorschläge.
+    Knowledge {
+        /// Auszuführende Wissens-Aktion.
+        #[command(subcommand)]
+        action: KnowledgeAction,
+    },
+    /// Zeigt und steuert Hintergrundaufträge.
+    Jobs {
+        /// Auszuführende Auftrags-Aktion.
+        #[command(subcommand)]
+        action: JobsAction,
+    },
+
+    // ── Dienste ─────────────────────────────────────────────────────────
+    /// Startet den Hintergrunddienst mit Agenten und Kanälen oder verwaltet seine Dienst-Einheit.
     Gateway {
-        /// Service-Aktion; ohne Subcommand wird der Gateway direkt gestartet.
+        /// Dienst-Aktion; ohne Unterbefehl läuft der Dienst im Vordergrund.
         #[command(subcommand)]
         action: Option<GatewayAction>,
         /// Zusätzliche Telemetrie-Exportziele (Vorgabe: beide aus).
         #[command(flatten)]
         telemetry: TelemetryArgs,
     },
-    /// Startet die HTTP-Kontrollfläche (`harw-web`) auf einem Unix-Socket.
-    ///
-    /// Läuft **nicht** ungefragt: ohne diesen Subcommand bindet kein
-    /// Prozess `harw-web`s Socket. Bedient dieselbe [`harw_operations`]-
-    /// Registry, die auch der Chat- und `analyze`-Pfad zusammenstellen
-    /// (siehe `crate::web`-Moduldoku). Der Root-Space wird ausschließlich
-    /// über `--home` bzw. `HARW_HOME` aufgelöst — erfordert `--home` bzw.
-    /// `HARW_HOME`.
+    /// Startet den lokalen MCP-Server über HTTP.
+    Serve {
+        /// Statt der Home-Konfiguration genau dieses Verzeichnis verwenden.
+        #[arg(long, value_name = "DIR", value_hint = ValueHint::DirPath)]
+        config_dir: Option<PathBuf>,
+    },
+    /// Startet die lokale Web-Oberfläche auf einem Unix-Socket.
     Web {
         /// Socket-Pfad überschreiben (Vorgabe: `<home>/web.sock`).
         #[arg(long, value_name = "PATH", value_hint = ValueHint::FilePath)]
         socket: Option<PathBuf>,
     },
-    /// Projekt-Freigabe (Trust) für ein Verzeichnis verwalten.
-    ///
-    /// Steuert `<home>/trusted-projects.toml` (siehe
-    /// [`harw_home::trust`]): ein freigegebenes Projekt darf sein
-    /// repo-lokales `.harw` als zusätzlichen Config-Layer beisteuern.
-    Project {
-        /// Auszuführende Trust-Aktion.
-        #[command(subcommand)]
-        action: ProjectAction,
-    },
-    /// Eine Eingabezeile mit dem Front-End-Klassifikator einordnen.
-    Classify {
-        /// Die zu klassifizierende Eingabe.
-        #[arg(required = true, num_args = 1.., value_hint = ValueHint::Other)]
-        input: Vec<String>,
-    },
-    /// Einen einzelnen Turn gegen den lokalen Echo-Bootstrap-Provider laufen.
-    Run {
-        /// Die Eingabezeile.
-        #[arg(required = true, num_args = 1.., value_hint = ValueHint::Other)]
-        input: Vec<String>,
-    },
-    /// Crate-Abhängigkeiten im Workspace analysieren und Kind-Agenten planen.
-    Analyze(AnalyzeArgs),
-    /// Generate or install shell completions (bash, zsh, fish, elvish, powershell).
-    #[command(name = "completions", alias = "completion")]
-    Completions(CompletionsCommand),
-    /// Auf eine neue Version prüfen (schreibt `version.json`).
-    Update {
-        /// Nur prüfen und Stand anzeigen, nichts installieren.
-        #[arg(long)]
-        check: bool,
-    },
-    /// Den Hintergrunddienst (systemd/launchd) verwalten.
+    /// Verwaltet den Hintergrunddienst (systemd/launchd).
     Service {
         /// Auszuführende Dienst-Aktion.
         #[command(subcommand)]
         action: ServiceAction,
     },
-    /// Provider-Katalog anzeigen oder (mit `--refresh`) via models.dev anreichern.
-    Catalog {
-        /// Modell-Listen aus models.dev aktualisieren.
-        #[arg(long)]
-        refresh: bool,
-    },
-    /// Konfigurierte Modelle entdecken/verwalten und interne Modellstellen
-    /// (Session-Titel, Kompaktierung, Speicher-Konsolidierung,
-    /// Traumreflexion, Explorer, Recherche) einzeln konfigurieren.
-    /// Ohne Unterbefehl entspricht dies `harw models list`.
-    Models {
-        /// Auszuführende Models-Aktion; ohne Angabe wird gelistet.
+    /// Richtet die MCP-Verbindung ein oder prüft sie.
+    Mcp {
+        /// Auszuführende MCP-Aktion.
         #[command(subcommand)]
-        action: Option<ModelsAction>,
+        action: McpAction,
     },
-    /// Auth-/Credential-Verwaltung (Claude-Setup-Token, Import, Status).
-    Auth {
-        /// Auszuführende Auth-Aktion.
+    /// Bindet Nachrichtenkanäle wie Telegram an.
+    Channel {
+        /// Auszuführende Kanal-Aktion.
         #[command(subcommand)]
-        action: AuthAction,
+        action: ChannelAction,
     },
-    /// Provider, Modelle, Freigaben und einzelne Konfigurationswerte
-    /// verwalten. Ohne Unterbefehl startet ein zeilenbasiertes Menü
-    /// (siehe `crate::settings`).
-    Settings {
-        /// Auszuführende Settings-Aktion; ohne Angabe startet das
-        /// interaktive Menü.
-        #[command(subcommand)]
-        action: Option<SettingsAction>,
+
+    // ── System ──────────────────────────────────────────────────────────
+    /// Legt das Harwness-Verzeichnis an, falls es noch fehlt.
+    Init,
+    /// Richtet Anbieter, Modell und optional einen Kanal Schritt für Schritt ein.
+    Onboard,
+    /// Prüft Konfiguration und Verweise auf Fehler.
+    Doctor {
+        /// Statt der Home-Konfiguration genau dieses Verzeichnis prüfen.
+        #[arg(long, value_name = "DIR", value_hint = ValueHint::DirPath)]
+        config_dir: Option<PathBuf>,
     },
-    /// Harwness deinstallieren (Bereiche wählbar, Dry-Run möglich).
+    /// Sucht nach einer neuen Version.
+    Update {
+        /// Nur prüfen und Stand anzeigen, nichts installieren.
+        #[arg(long, hide = true)]
+        check: bool,
+    },
+    /// Deinstalliert Harwness ganz oder teilweise.
     Uninstall {
         /// Zu entfernende Bereiche: service, state, workspace, binary.
         #[arg(long, value_enum, value_delimiter = ',')]
@@ -218,41 +273,10 @@ pub enum Command {
         #[arg(long)]
         yes: bool,
     },
-    /// Benutzeroberflächen-Agentin (UIA) verwalten.
-    ///
-    /// Der interaktive Chat-Einstieg richtet ohne konfigurierte UIA bereits
-    /// automatisch eine ein (siehe `crate::uia_bootstrap`); dieser Befehl
-    /// erlaubt, den Einrichtungsdialog gezielt erneut aufzurufen, z. B. um
-    /// eine zusätzliche UIA neben einer bereits aktiven anzulegen.
-    Uia {
-        /// Auszuführende UIA-Aktion.
-        #[command(subcommand)]
-        action: UiaAction,
-    },
-    /// Host-Profil-Permit-Ledger prüfen und verwalten (siehe
-    /// [`harw_sandbox::ProcessPermitLedger`], `host-process-worker.toml`).
-    /// Ohne Unterbefehl entspricht dies `harw sandbox status`.
-    ///
-    /// **Achtung**: Ledger und Sitzungs-Registry leben ausschließlich im
-    /// Speicher der laufenden Sitzung (`harw`-Chat/-TUI-Prozess), die sie
-    /// ausgestellt hat — wie jede In-Memory-Freigabe in dieser Harness gibt
-    /// es keine Persistenz über Prozessgrenzen. Dieser Befehl ist deshalb
-    /// die Konfigurations-/Audit-Fläche (analog zu `harw settings`/
-    /// `harw models`), kein Fenster in eine fremde, bereits laufende
-    /// Sitzung: `leases`/`revoke` wirken nur auf den Ledger **dieses**
-    /// Prozesses.
-    Sandbox {
-        /// Auszuführende Sandbox-Aktion; ohne Angabe wird der Status gezeigt.
-        #[command(subcommand)]
-        action: Option<SandboxAction>,
-    },
-    /// Speichert einen lokalen Bug-Report unter `<home>/bug-report/`.
-    ///
-    /// Rein lokal — kein Netzwerk-Versand. Fehlende Pflichtfelder
-    /// (`--type`, `--title`, `--area`, `--failure-mode`, `--what-happened`)
-    /// werden interaktiv nachgefragt. Die automatische Incident-Erkennung
-    /// (gekillte Kinder, erschöpfte Retries, Panics) ist ein separates, noch
-    /// ausstehendes Arbeitspaket — dieser Befehl ist der manuelle Fallback.
+    /// Erzeugt oder installiert Shell-Vervollständigungen.
+    #[command(name = "completions", alias = "completion")]
+    Completions(CompletionsCommand),
+    /// Speichert einen lokalen Fehlerbericht, ohne ihn zu versenden.
     BugReport {
         /// Berichtsart (z. B. `manual`, `crash`).
         #[arg(long = "type", value_hint = ValueHint::Other)]
@@ -260,7 +284,7 @@ pub enum Command {
         /// Kurztitel des Berichts.
         #[arg(long, value_hint = ValueHint::Other)]
         title: Option<String>,
-        /// Betroffener Bereich/Modul.
+        /// Betroffener Bereich.
         #[arg(long, value_hint = ValueHint::Other)]
         area: Option<String>,
         /// Beobachteter Fehlermodus.
@@ -272,7 +296,7 @@ pub enum Command {
         /// Freitext-Beschreibung des Vorfalls.
         #[arg(long = "what-happened", value_hint = ValueHint::Other)]
         what_happened: Option<String>,
-        /// Optionaler, bereits redigierter Nutzer-O-Ton.
+        /// Optionale, bereits geschwärzte Aussage des Nutzers.
         #[arg(long = "what-user-said", value_hint = ValueHint::Other)]
         what_user_said: Option<String>,
         /// Optionale Reproduktionsschritte.
@@ -282,19 +306,79 @@ pub enum Command {
         #[arg(long, value_hint = ValueHint::Other)]
         evidence: Option<String>,
     },
-    /// Den Wissensindex des Retrieval-Subsystems (`harw-lens`) bauen,
-    /// aktualisieren oder seinen Status anzeigen.
+    /// Zeigt, welche Werkzeuge direkt auf dem Host laufen dürfen.
+    Sandbox {
+        /// Auszuführende Sandbox-Aktion; ohne Angabe wird der Status gezeigt.
+        #[command(subcommand)]
+        action: Option<SandboxAction>,
+    },
+    /// Diagnosewerkzeuge für Entwickler.
+    Debug {
+        /// Auszuführende Diagnose-Aktion.
+        #[command(subcommand)]
+        action: DebugAction,
+    },
+    /// Wählt Prozesse gezielt aus und beendet sie zuverlässig (nur Linux).
     ///
-    /// Baut **niemals** automatisch beim Sitzungsstart — eine Indizierung
-    /// kann bei einem großen Bestand mehrere Minuten dauern; dieser Befehl
-    /// ist der bewusste, vom Betreiber angestoßene Einstiegspunkt (siehe
-    /// `crate::lens`). Ohne dieses Kommando bleiben die von `lens.ask`
-    /// befragten Indizes leer, und `lens.ask` meldet sie als `skipped`
-    /// statt Treffer zu liefern. Ohne Unterbefehl entspricht dies
-    /// `harw lens status`.
+    /// Alle folgenden Argumente gehen unverändert an das Kill-Werkzeug;
+    /// `harw kill --help` zeigt dessen eigene Hilfe.
+    #[command(disable_help_flag = true)]
+    Kill {
+        /// Argumente für das Kill-Werkzeug (z. B. `-p NAME`, `--pid PID`, `--dry-run`).
+        #[arg(
+            trailing_var_arg = true,
+            allow_hyphen_values = true,
+            num_args = 0..,
+            value_name = "KILLER_ARGS",
+            value_hint = ValueHint::Other
+        )]
+        args: Vec<OsString>,
+    },
+
+    // ── Versteckte ältere Schreibweisen ─────────────────────────────────
+    /// Ältere Schreibweise von `harw channel connect`.
+    #[command(hide = true)]
+    Connect {
+        /// Kanal-Art (derzeit nur `telegram`).
+        #[arg(long, value_enum)]
+        channel: Channel,
+        /// Einmaligen Code nach einer `/pair CODE`-Nachricht an den Bot einlösen.
+        #[arg(long, value_name = "CODE", value_hint = ValueHint::Other)]
+        pair: Option<String>,
+    },
+    /// Ältere Schreibweise von `harw knowledge index`.
+    #[command(hide = true)]
     Lens {
-        /// Auszuführende Lens-Aktion; ohne Angabe wird der Status gezeigt.
+        /// Auszuführende Index-Aktion; ohne Angabe wird der Stand gezeigt.
         #[command(subcommand)]
         action: Option<LensAction>,
+    },
+    /// Ältere Schreibweise von `harw agent uia-new`.
+    #[command(hide = true)]
+    Uia {
+        /// Auszuführende Aktion.
+        #[command(subcommand)]
+        action: UiaAction,
+    },
+    /// Ältere Schreibweise von `harw model catalog`.
+    #[command(hide = true)]
+    Catalog {
+        /// Modell-Listen aus models.dev aktualisieren.
+        #[arg(long)]
+        refresh: bool,
+    },
+    /// Ältere Schreibweise von `harw debug echo`.
+    #[command(hide = true)]
+    Run {
+        /// Die Eingabezeile.
+        #[arg(required = true, num_args = 1.., value_hint = ValueHint::Other)]
+        input: Vec<String>,
+    },
+    /// Ältere Schreibweise von `harw debug classify`.
+    #[command(hide = true)]
+    Classify {
+        /// Die einzuordnende Eingabe.
+        #[arg(required = true, num_args = 1.., value_hint = ValueHint::Other)]
+        input: Vec<String>,
     },
 }

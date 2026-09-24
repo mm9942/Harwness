@@ -17,9 +17,14 @@
 //! `uia_worker_provider`-Pendant (der Worker teilt sich den effektiven
 //! UIA-Provider mit `/uia-model`), der anders als die beiden anderen keinen
 //! Live-`SessionController`-Pfad hat und erst beim nächsten Sitzungsstart wirkt.
+//! Für `/models` und `/mode default` kommen [`persist_internal_model`]
+//! (`[internal_models.<stelle>]`, inkl. Orchestrator/Sub-Orchestrator),
+//! [`clear_uia_selection`] (entfernt `uia_provider`/`uia_model`) und
+//! [`persist_default_interaction_mode`] (`[mode] default`) hinzu — alle
+//! ebenfalls bestes Bemühen und erst ab der nächsten Sitzung wirksam.
 //!
 //! Zusätzlich stellt dieses Modul [`SelectionPersistence`] bereit: einen
-//! austauschbaren Dienst-Trait, der die vier `persist_*`-Funktionen hinter
+//! austauschbaren Dienst-Trait, der die `persist_*`-/`clear_*`-Funktionen hinter
 //! einer gemeinsamen Schnittstelle bündelt, plus [`FileSelectionPersistence`]
 //! (Standard-Implementierung, ruft unverändert die freien Funktionen auf) und
 //! [`RecordingSelectionPersistence`] (No-op-Aufzeichnung für Tests). Die
@@ -44,7 +49,9 @@
 //! # Fehlertypen
 //! - [`harw_operations::OpError::Execution`]: wenn die Config-Discovery fehlschlägt.
 //! - [`persist_default_selection`]/[`persist_uia_selection`]/
-//!   [`persist_uia_worker_model`]/[`persist_uia_reasoning_effort`] (und ihre
+//!   [`persist_uia_worker_model`]/[`persist_uia_reasoning_effort`]/
+//!   [`persist_internal_model`]/[`clear_uia_selection`]/
+//!   [`persist_default_interaction_mode`] (und ihre
 //!   [`SelectionPersistence`]-Trait-Pendants) liefern nie `Err` —
 //!   Persistenzfehler werden als menschenlesbare Notiz zurückgegeben, nicht
 //!   propagiert.
@@ -425,6 +432,195 @@ fn try_persist_uia_reasoning_effort(effort: Option<&str>) -> Result<(), String> 
     writer.save().map_err(|error| error.to_string())
 }
 
+/// Öffnet die Profil-`config.toml` des aktiven Profils über
+/// [`harw_config::ConfigWriter`].
+///
+/// # Errors
+/// Menschenlesbarer Grund als `String`, wenn Home/Profil nicht auflösbar
+/// sind oder die Datei nicht geöffnet werden kann.
+fn open_profile_config_writer() -> Result<harw_config::ConfigWriter, String> {
+    let home = harw_home::home_dir().map_err(|error| error.to_string())?;
+    let profile = harw_home::active_profile_name(&home);
+    let profile_dir = harw_home::profile_dir(&home, &profile).map_err(|error| error.to_string())?;
+    harw_config::ConfigWriter::open(&profile_dir.join("config.toml"))
+        .map_err(|error| error.to_string())
+}
+
+/// Verankert die Modellwahl einer internen Modellstelle
+/// (`[internal_models.<stelle>]`) bestes Bemühen in der Profil-`config.toml`.
+///
+/// # Description
+/// Struktureller Zwilling von [`persist_uia_worker_model`] für die
+/// `internal_models`-Punkte (inklusive Orchestrator/Sub-Orchestrator). Die
+/// Semantik der Argumente:
+///
+/// | `provider` | `model` | Wirkung |
+/// |---|---|---|
+/// | `None` | `None` | Entfernt `[internal_models.<stelle>]` vollständig („zurücksetzen“ — die Stelle fällt wieder auf ihren Standard zurück) |
+/// | `Some(p)` | `Some(m)` | Setzt `provider = p` und `model = m` |
+/// | `Some(p)` | `None` | Setzt `provider = p` und entfernt `model` (explizite Wahl ohne Modell ⇒ Hauptmodell, siehe [`harw_config::resolve_internal_model`]) |
+/// | `None` | `Some(m)` | Setzt `model = m` und entfernt `provider` |
+///
+/// Wirkt erst ab der nächsten Sitzung. **Niemals fehlschlagend** für den
+/// Aufrufer — Persistenzfehler werden als deutschsprachige Notiz
+/// zurückgegeben statt propagiert.
+///
+/// # Arguments
+/// - `point` ([`harw_config::InternalModelPoint`]): die Stelle; ihr
+///   [`harw_config::InternalModelPoint::key`] bildet den TOML-Pfad.
+/// - `provider` (`Option<&str>`): kanonischer Provider-Name.
+/// - `model` (`Option<&str>`): kanonische Modell-ID.
+///
+/// # Returns
+/// `None` bei Erfolg; `Some(note)` bei einem Persistenzfehler.
+///
+/// # Panics
+/// Nie.
+///
+/// # Concurrency
+/// Rein synchron; kein Datei-Lock, analog zu [`persist_uia_worker_model`].
+pub(crate) fn persist_internal_model(
+    point: harw_config::InternalModelPoint,
+    provider: Option<&str>,
+    model: Option<&str>,
+) -> Option<String> {
+    let result = open_profile_config_writer().and_then(|mut writer| {
+        write_internal_model(&mut writer, point, provider, model)?;
+        writer.save().map_err(|error| error.to_string())
+    });
+    match result {
+        Ok(()) => None,
+        Err(reason) => Some(format!(
+            "Hinweis: konnte das Modell für „{}“ nicht dauerhaft speichern ({reason}).",
+            point.key()
+        )),
+    }
+}
+
+/// Reiner Schreibkern von [`persist_internal_model`] auf einem bereits
+/// geöffneten [`harw_config::ConfigWriter`] (ohne `save`) — getrennt, damit
+/// Tests ihn gegen eine temporäre Datei prüfen können, ohne `HARW_HOME`
+/// aufzulösen.
+///
+/// # Errors
+/// Menschenlesbarer Grund, wenn [`harw_config::ConfigWriter::set_value`]
+/// scheitert.
+fn write_internal_model(
+    writer: &mut harw_config::ConfigWriter,
+    point: harw_config::InternalModelPoint,
+    provider: Option<&str>,
+    model: Option<&str>,
+) -> Result<(), String> {
+    let base = format!("internal_models.{}", point.key());
+    if provider.is_none() && model.is_none() {
+        writer.remove_value(&base);
+        return Ok(());
+    }
+    let provider_key = format!("{base}.provider");
+    let model_key = format!("{base}.model");
+    match provider {
+        Some(provider) => writer
+            .set_value(&provider_key, toml_edit::value(provider))
+            .map_err(|error| error.to_string())?,
+        None => {
+            writer.remove_value(&provider_key);
+        }
+    }
+    match model {
+        Some(model) => writer
+            .set_value(&model_key, toml_edit::value(model))
+            .map_err(|error| error.to_string())?,
+        None => {
+            writer.remove_value(&model_key);
+        }
+    }
+    Ok(())
+}
+
+/// Entfernt die UIA-Auswahl (`uia_provider` **und** `uia_model`) bestes
+/// Bemühen aus der Profil-`config.toml`.
+///
+/// # Description
+/// Gegenstück zu [`persist_uia_selection`] für `/models reset uia`: danach
+/// fällt die UIA wieder auf `default_provider`/`default_model` zurück. Wirkt
+/// erst ab der nächsten Sitzung; eine bereits laufende Live-Auswahl bleibt
+/// unberührt. **Niemals fehlschlagend** für den Aufrufer.
+///
+/// # Returns
+/// `None` bei Erfolg; `Some(note)` bei einem Persistenzfehler.
+///
+/// # Panics
+/// Nie.
+///
+/// # Concurrency
+/// Rein synchron; kein Datei-Lock.
+pub(crate) fn clear_uia_selection() -> Option<String> {
+    let result = open_profile_config_writer().and_then(|mut writer| {
+        clear_uia_keys(&mut writer);
+        writer.save().map_err(|error| error.to_string())
+    });
+    match result {
+        Ok(()) => None,
+        Err(reason) => Some(format!(
+            "Hinweis: konnte die UIA-Auswahl nicht dauerhaft zurücksetzen ({reason})."
+        )),
+    }
+}
+
+/// Reiner Schreibkern von [`clear_uia_selection`] (ohne `save`).
+fn clear_uia_keys(writer: &mut harw_config::ConfigWriter) {
+    writer.remove_value("uia_provider");
+    writer.remove_value("uia_model");
+}
+
+/// Verankert den Standard-Interaktionsmodus (`[mode] default`) bestes
+/// Bemühen in der Profil-`config.toml`.
+///
+/// # Description
+/// Wird von `/mode default <modus>` nach erfolgreicher Validierung über
+/// `harw_core::InteractionMode::parse` aufgerufen; `mode` ist daher bereits
+/// der kanonische Name (`chat|plan|explore|work|shell`). Wirkt erst für neue
+/// Sitzungen; der Modus der laufenden Sitzung bleibt unberührt. **Niemals
+/// fehlschlagend** für den Aufrufer.
+///
+/// # Arguments
+/// - `mode` (`&str`): kanonischer Modusname.
+///
+/// # Returns
+/// `None` bei Erfolg; `Some(note)` bei einem Persistenzfehler.
+///
+/// # Panics
+/// Nie.
+///
+/// # Concurrency
+/// Rein synchron; kein Datei-Lock.
+pub(crate) fn persist_default_interaction_mode(mode: &str) -> Option<String> {
+    let result = open_profile_config_writer().and_then(|mut writer| {
+        write_default_interaction_mode(&mut writer, mode)?;
+        writer.save().map_err(|error| error.to_string())
+    });
+    match result {
+        Ok(()) => None,
+        Err(reason) => Some(format!(
+            "Hinweis: konnte den Standardmodus nicht dauerhaft speichern ({reason})."
+        )),
+    }
+}
+
+/// Reiner Schreibkern von [`persist_default_interaction_mode`] (ohne `save`).
+///
+/// # Errors
+/// Menschenlesbarer Grund, wenn [`harw_config::ConfigWriter::set_value`]
+/// scheitert.
+fn write_default_interaction_mode(
+    writer: &mut harw_config::ConfigWriter,
+    mode: &str,
+) -> Result<(), String> {
+    writer
+        .set_value("mode.default", toml_edit::value(mode))
+        .map_err(|error| error.to_string())
+}
+
 // ── Pluggable Persistenz-Dienst ─────────────────────────────────────────────
 //
 // Motivation: `try_persist_default_selection`/`try_persist_uia_selection`/
@@ -443,7 +639,7 @@ fn try_persist_uia_reasoning_effort(effort: Option<&str>) -> Result<(), String> 
 // [`OpContext`] end-to-end durchlaufen, ohne die echte,
 // `HARW_HOME`-auflösende Persistenz zu berühren.
 
-/// Austauschbarer Persistenz-Dienst für die vier Operator-Auswahl-Persistenzen.
+/// Austauschbarer Persistenz-Dienst für die Operator-Auswahl-Persistenzen (Default, UIA, UIA-Worker, UIA-Effort, interne Modellstellen).
 ///
 /// # Description
 /// Spiegelt exakt die Signaturen der bestehenden freien Funktionen
@@ -480,6 +676,17 @@ pub trait SelectionPersistence: Send + Sync {
 
     /// Siehe [`persist_uia_reasoning_effort`].
     fn persist_uia_reasoning_effort(&self, effort: Option<&str>) -> Option<String>;
+
+    /// Siehe [`persist_internal_model`].
+    fn persist_internal_model(
+        &self,
+        point: harw_config::InternalModelPoint,
+        provider: Option<&str>,
+        model: Option<&str>,
+    ) -> Option<String>;
+
+    /// Siehe [`clear_uia_selection`].
+    fn clear_uia_selection(&self) -> Option<String>;
 }
 
 /// Standard-Implementierung von [`SelectionPersistence`]: ruft unverändert
@@ -519,6 +726,19 @@ impl SelectionPersistence for FileSelectionPersistence {
     fn persist_uia_reasoning_effort(&self, effort: Option<&str>) -> Option<String> {
         persist_uia_reasoning_effort(effort)
     }
+
+    fn persist_internal_model(
+        &self,
+        point: harw_config::InternalModelPoint,
+        provider: Option<&str>,
+        model: Option<&str>,
+    ) -> Option<String> {
+        persist_internal_model(point, provider, model)
+    }
+
+    fn clear_uia_selection(&self) -> Option<String> {
+        clear_uia_selection()
+    }
 }
 
 /// Ein einzelner aufgezeichneter Aufruf auf [`RecordingSelectionPersistence`].
@@ -543,6 +763,14 @@ pub enum RecordedSelectionPersistCall {
     UiaWorkerModel { model: Option<String> },
     /// Aufzeichnung von [`SelectionPersistence::persist_uia_reasoning_effort`].
     UiaReasoningEffort { effort: Option<String> },
+    /// Aufzeichnung von [`SelectionPersistence::persist_internal_model`].
+    InternalModel {
+        point: harw_config::InternalModelPoint,
+        provider: Option<String>,
+        model: Option<String>,
+    },
+    /// Aufzeichnung von [`SelectionPersistence::clear_uia_selection`].
+    ClearUia,
 }
 
 /// No-op-Aufzeichnungs-Implementierung von [`SelectionPersistence`] für Tests.
@@ -626,6 +854,25 @@ impl SelectionPersistence for RecordingSelectionPersistence {
         });
         None
     }
+
+    fn persist_internal_model(
+        &self,
+        point: harw_config::InternalModelPoint,
+        provider: Option<&str>,
+        model: Option<&str>,
+    ) -> Option<String> {
+        self.record(RecordedSelectionPersistCall::InternalModel {
+            point,
+            provider: provider.map(str::to_owned),
+            model: model.map(str::to_owned),
+        });
+        None
+    }
+
+    fn clear_uia_selection(&self) -> Option<String> {
+        self.record(RecordedSelectionPersistCall::ClearUia);
+        None
+    }
 }
 
 /// Löst den für `ctx` zu verwendenden [`SelectionPersistence`]-Dienst auf.
@@ -660,9 +907,11 @@ pub(crate) fn selection_persistence(ctx: &OpContext) -> Arc<dyn SelectionPersist
 mod tests {
     use super::{
         FileSelectionPersistence, OpError, RecordedSelectionPersistCall,
-        RecordingSelectionPersistence, SelectionPersistence, execution_error,
+        RecordingSelectionPersistence, SelectionPersistence, clear_uia_keys, execution_error,
+        write_default_interaction_mode, write_internal_model,
     };
     use crate::test_support::{TestResult, ctx};
+    use harw_config::InternalModelPoint;
 
     #[test]
     fn recording_selection_persistence_records_default_selection_call() {
@@ -857,6 +1106,142 @@ mod tests {
         let reopened =
             harw_config::ConfigWriter::open(&config_path).map_err(ctx("reopen after removal"))?;
         assert!(reopened.get_value("reasoning.uia").is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn recording_selection_persistence_records_internal_model_and_clear_uia() {
+        let recorder = RecordingSelectionPersistence::new();
+        let first = recorder.persist_internal_model(
+            InternalModelPoint::Explorer,
+            Some("openrouter"),
+            Some("nvidia/x"),
+        );
+        let second = recorder.persist_internal_model(InternalModelPoint::Research, None, None);
+        let third = recorder.clear_uia_selection();
+
+        assert!(first.is_none() && second.is_none() && third.is_none());
+        assert_eq!(
+            recorder.calls(),
+            vec![
+                RecordedSelectionPersistCall::InternalModel {
+                    point: InternalModelPoint::Explorer,
+                    provider: Some("openrouter".to_owned()),
+                    model: Some("nvidia/x".to_owned()),
+                },
+                RecordedSelectionPersistCall::InternalModel {
+                    point: InternalModelPoint::Research,
+                    provider: None,
+                    model: None,
+                },
+                RecordedSelectionPersistCall::ClearUia,
+            ]
+        );
+    }
+
+    /// Schreibkern von `persist_internal_model`: setzt beide Felder unter
+    /// `[internal_models.<stelle>]` und entfernt die Tabelle beim Reset
+    /// (`None`/`None`) vollständig.
+    #[test]
+    fn write_internal_model_sets_and_removes_the_point_table() -> TestResult {
+        let dir = tempfile::tempdir().map_err(ctx("tempdir"))?;
+        let config_path = dir.path().join("config.toml");
+
+        let mut writer = harw_config::ConfigWriter::open(&config_path).map_err(ctx("open"))?;
+        write_internal_model(
+            &mut writer,
+            InternalModelPoint::Explorer,
+            Some("openrouter"),
+            Some("nvidia/nemotron"),
+        )
+        .map_err(ctx("Schreibkern"))?;
+        writer.save().map_err(ctx("save"))?;
+
+        let reopened = harw_config::ConfigWriter::open(&config_path).map_err(ctx("reopen"))?;
+        assert_eq!(
+            reopened.get_value("internal_models.explorer.provider"),
+            Some("openrouter".to_owned())
+        );
+        assert_eq!(
+            reopened.get_value("internal_models.explorer.model"),
+            Some("nvidia/nemotron".to_owned())
+        );
+
+        // Provider ohne Modell: `model` wird entfernt, `provider` bleibt.
+        let mut writer = harw_config::ConfigWriter::open(&config_path).map_err(ctx("reopen2"))?;
+        write_internal_model(
+            &mut writer,
+            InternalModelPoint::Explorer,
+            Some("anthropic"),
+            None,
+        )
+        .map_err(ctx("Schreibkern"))?;
+        writer.save().map_err(ctx("save2"))?;
+        let reopened = harw_config::ConfigWriter::open(&config_path).map_err(ctx("reopen3"))?;
+        assert_eq!(
+            reopened.get_value("internal_models.explorer.provider"),
+            Some("anthropic".to_owned())
+        );
+        assert!(
+            reopened
+                .get_value("internal_models.explorer.model")
+                .is_none()
+        );
+
+        // Reset: die ganze Stellen-Tabelle verschwindet.
+        let mut writer = harw_config::ConfigWriter::open(&config_path).map_err(ctx("reopen4"))?;
+        write_internal_model(&mut writer, InternalModelPoint::Explorer, None, None)
+            .map_err(ctx("Schreibkern"))?;
+        writer.save().map_err(ctx("save3"))?;
+        let content = std::fs::read_to_string(&config_path).map_err(ctx("read back"))?;
+        assert!(
+            !content.contains("[internal_models.explorer]"),
+            "Reset muss die Stellen-Tabelle entfernen: {content}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn clear_uia_keys_removes_provider_and_model() -> TestResult {
+        let dir = tempfile::tempdir().map_err(ctx("tempdir"))?;
+        let config_path = dir.path().join("config.toml");
+        std::fs::write(
+            &config_path,
+            "uia_provider = \"anthropic\"\nuia_model = \"claude-x\"\nuia_worker_model = \"w\"\n",
+        )
+        .map_err(ctx("seed"))?;
+
+        let mut writer = harw_config::ConfigWriter::open(&config_path).map_err(ctx("open"))?;
+        clear_uia_keys(&mut writer);
+        writer.save().map_err(ctx("save"))?;
+
+        let reopened = harw_config::ConfigWriter::open(&config_path).map_err(ctx("reopen"))?;
+        assert!(reopened.get_value("uia_provider").is_none());
+        assert!(reopened.get_value("uia_model").is_none());
+        assert_eq!(
+            reopened.get_value("uia_worker_model"),
+            Some("w".to_owned()),
+            "der Worker-Pin gehört nicht zur UIA-Auswahl"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn write_default_interaction_mode_sets_nested_mode_default() -> TestResult {
+        let dir = tempfile::tempdir().map_err(ctx("tempdir"))?;
+        let config_path = dir.path().join("config.toml");
+
+        let mut writer = harw_config::ConfigWriter::open(&config_path).map_err(ctx("open"))?;
+        write_default_interaction_mode(&mut writer, "explore").map_err(ctx("Schreibkern"))?;
+        writer.save().map_err(ctx("save"))?;
+
+        let reopened = harw_config::ConfigWriter::open(&config_path).map_err(ctx("reopen"))?;
+        assert_eq!(
+            reopened.get_value("mode.default"),
+            Some("explore".to_owned())
+        );
+        let content = std::fs::read_to_string(&config_path).map_err(ctx("read back"))?;
+        assert!(content.contains("[mode]"), "{content}");
         Ok(())
     }
 }

@@ -1,0 +1,150 @@
+# Business-Beispielszenario aus docs/design/wargaming-and-analysis.md §1.9 (fiktiv).
+# Gamebooks (`gamebook/*.md`) sind Teil des Szenario-Pakets und hier nicht enthalten.
+schema = "harwness.matrix-scenario/v1"
+id = "cloud-sme-2027"
+title = "KMU-Cloud: Markteintritt eines Hyperscalers"
+mode = "business"
+seed = 20270101
+language = "de"
+
+[game]
+moves = 3
+# simulierte Zeit je Zug (Zug 3 = Foresight)
+move_labels = ["2027 – Markteintritt", "2028 – Positionierung", "2031 – Verfestigung"]
+phase_deadline_turns = 6          # max. Agenten-Turns je Phase und Team
+max_channel_messages_per_move = 12
+
+[[game.key_questions]]
+id = "KQ1"
+text = "Hält unsere Premium-Positionierung, wenn ein Hyperscaler KMU-Preise um 30 % unterbietet?"
+[[game.key_questions]]
+id = "KQ2"
+text = "Lohnt eine Allianz mit einem regionalen Systemhaus-Verbund gegenüber eigenem Vertriebsausbau?"
+[[game.key_questions]]
+id = "KQ3"
+text = "Welche Regulierung (Datenresidenz) verändert die Spielregeln, und wer profitiert?"
+
+[business]
+variant = "strategy_test"         # | "attack_counter" | "crisis_response"
+market_role = "player"            # | "white_cell"
+currency = "MEUR"
+override_bounds = { share_pp = 5.0, cost_pct = 15.0 }
+action_kinds = ["price", "invest", "product", "alliance", "acquisition", "lobby", "campaign", "free_argument"]
+
+[business.market_model]
+kind = "logit_share"
+beta = 0.9
+weights = { market_score = 0.45, price_position = 0.30, sales_invest = 0.15, product_fit = 0.10 }
+sales_invest_saturation_meur = 20
+kpis = ["share", "revenue", "contribution_margin", "ebit", "cash"]
+
+[[business.segments]]
+id = "sme"
+name = "KMU (10–249 MA)"
+size_meur = [800, 950, 1300]      # je Zug
+price_sensitivity = 0.8
+[[business.segments]]
+id = "enterprise"
+name = "Großkunden"
+size_meur = [1200, 1260, 1400]
+price_sensitivity = 0.35
+
+[[business.rules]]
+id = "antitrust"
+when = "share(segment) > 0.40 && action.kind == 'acquisition'"
+effect = "require_stakeholder:regulator"
+[[business.rules]]
+id = "cash_floor"
+when = "cash < 0"
+effect = "restrict_actions:[invest,acquisition]"
+
+[[teams]]
+id = "company"
+role = "company"
+display = "NordCloud AG (wir)"
+agent = "matrix-player"
+strategy_brief = "gamebook/nordcloud.md"
+start = { cash = 60, share = { sme = 0.34, enterprise = 0.22 }, capacity = 1.0 }
+
+[[teams]]
+id = "competitor_a"
+role = "competitor"
+display = "Hyperscaler X (Neueinsteiger KMU)"
+agent = "matrix-player"
+strategy_brief = "gamebook/hyperscaler-x.md"
+directive = "Be the enemy: gewinne KMU-Anteile legal, plausibel, aggressiv."
+start = { cash = 500, share = { sme = 0.05, enterprise = 0.30 }, capacity = 3.0 }
+
+[[teams]]
+id = "competitor_b"
+role = "competitor"
+display = "ValueHost GmbH (Billiganbieter, fiktiv)"
+agent = "matrix-player"
+strategy_brief = "gamebook/valuehost.md"
+start = { cash = 25, share = { sme = 0.28, enterprise = 0.03 }, capacity = 0.8 }
+
+[[teams]]
+id = "market"
+role = "market"
+display = "Marktteam (KMU- und Großkunden-Panel)"
+agent = "matrix-market"
+strategy_brief = "gamebook/market-panel.md"
+assessment_scale = [0, 10]
+
+[[business.stakeholders]]
+id = "regulator"
+display = "Aufsichtsbehörde Datenschutz/Wettbewerb"
+played_by = "gamemaster"
+profile = "Prüft Übernahmen ab 40 % Segmentanteil; sensibel für Datenresidenz."
+[[business.stakeholders]]
+id = "sysint_alliance"
+display = "Verbund regionaler Systemhäuser"
+played_by = "gamemaster"
+profile = "Sucht exklusiven Plattformpartner; verlangt 20 % Marge und Leadschutz."
+
+[channels]
+pairwise = "all_players"          # private Paarkanäle zwischen allen Teams
+observer = "gamemaster"           # GM liest jeden Kanal mit (cc Control)
+market_contact = "sales_call_only"
+
+[[business.disclosure]]
+on = "alliance_signed"
+audience = "all"
+delay_phases = 0
+template = "{a} und {b} verkünden eine Partnerschaft: {summary}"
+[[business.disclosure]]
+on = "price_change"
+audience = "all"
+delay_phases = 1                  # Listenpreise sind nach einer Phase öffentlich
+
+[[injects]]
+id = "INJ-1"
+kind = "scheduled"
+at = { move = 2, phase = "brief" }
+audience = "all"
+text = "Gesetzentwurf: Personenbezogene KMU-Daten müssen ab 2029 im Inland verarbeitet werden."
+[[injects]]
+id = "INJ-2"
+kind = "conditional"
+when = "share('competitor_a','sme') > 0.25"
+audience = "all"
+text = "Fachpresse: Kartellbehörde prüft Kampfpreise im KMU-Cloudmarkt."
+[[injects]]
+id = "INJ-3"
+kind = "random"
+p = 0.25
+at = { move = 3, phase = "brief" }
+audience = ["competitor_b"]
+text = "Ihr Rechenzentrumsbetreiber kündigt; 20 % Kapazität fallen für einen Zug aus."
+[[injects]]
+id = "INJ-4"
+kind = "control_discretion"
+audience = "all"
+text = "Ein Allianzgespräch wird öffentlich geleakt."
+
+[debrief]
+hotwash_each_move = true
+bias_checklist = true
+counter_approach_taxonomy = true
+export_indicators = true
+endex_release = "public_aar_only"

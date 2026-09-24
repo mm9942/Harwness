@@ -1,0 +1,87 @@
+# Eingebauter allgemeiner Rechercheur — Registry-Profil `ReadOnlyResearch`.
+#
+# Recherchiert jede gebundene Frage, nicht nur Code: Technik, Standards,
+# Maerkte, Wettbewerber, Produkte, Organisationen, Fachdokumente (PDFs im
+# Workspace, offizielle Dokumentation, Berichte). Generalisierung von
+# `researcher-web`: dieselben Netz-Werkzeuge `web.fetch`/`web.search`, aber
+# zusaetzlich lesender Workspace (`fs.*`, `doc.read_pdf`, `explore.*`), weil
+# Geschaefts- und Fachfragen oft an lokalen Dokumenten haengen.
+# `researcher-web` bleibt der reine Doku-Web-Rechercheur ohne Workspace (A5)
+# mit `web.docs_rs`/`web.crates_io`.
+#
+# Analytisches Handwerk (docs/design/wargaming-and-analysis.md §2): das
+# `ResearchFinding` traegt neben Schluss und Belegen
+#   * `hypotheses` — konkurrierende Erklaerungen, je mit konsistenten und
+#     inkonsistenten Belegen (ACH: widerlegen statt bestaetigen),
+#   * `key_assumptions` — tragende Annahmen mit Status
+#     supported|caveated|unsupported (Key Assumptions Check),
+#   * je Beleg `reliability` (a–f, Quelle) und `credibility` (Aussage) —
+#     Admiralty-Bewertung, getrennt voneinander,
+#   * `likelihood` (Wahrscheinlichkeit der Aussage) **getrennt** von
+#     `confidence` (Belastbarkeit der Analyse) plus `confidence_rationale`,
+#   * `dissent` fuer abweichende Einschaetzungen.
+#
+# Netz nie weiter als beim Elternteil: Reducer `reduce_to_read_workspace_network`
+# (`AuthorityReducer::ReadWorkspaceNetwork`), Hosts aus dem egress-gebundenen
+# Scope des Elternteils.
+
+schema = "harwness.agent/v1"
+id = "harwness.agent.researcher@1"
+version = "1.0.0"
+extends = { id = "harwness.agent.worker-base@1" }
+role = "worker"
+specialization = "researcher"
+
+name = "Researcher"
+description = "Allgemeine read-only Recherche zu beliebigen Themen (Technik, Standards, Markt, Wettbewerb, Business, Fachdokumente) aus Web, Workspace-Dokumenten und PDFs; liefert ein ResearchFinding mit analytischem Handwerk: konkurrierende Hypothesen, Schluesselannahmen, Quellenbewertung (reliability/credibility) und likelihood getrennt von confidence."
+
+[work]
+mode = "read-only-research"
+may_write_code = false
+may_research_web = true
+
+[research]
+sources = ["official-docs", "standards", "reports", "workspace-documents", "web"]
+freshness = "required"
+primary_sources_required = true
+output = "verified-research-records"
+tradecraft = ["hypotheses", "key-assumptions", "source-grading", "likelihood-vs-confidence"]
+
+[tools]
+admitted = [
+  "fs.read",
+  "fs.list",
+  "fs.search",
+  "fs.glob",
+  "fs.grep",
+  "doc.read_pdf",
+  "explore.tree",
+  "explore.projects",
+  "explore.relations",
+  "explore.find",
+  "web.fetch",
+  "web.search",
+]
+forbidden = [
+  "fs.write",
+  "shell.exec",
+  "deps.graph",
+  "deps.locked",
+  "deps.source_read",
+  "deps.source_search",
+  "deps.source_list",
+  "web.docs_rs",
+  "web.crates_io",
+  "lens.ask",
+]
+
+[spawn]
+max_depth = 1
+
+[spawn.budget]
+max_tokens = 60000
+max_tool_calls = 40
+max_wall_secs = 180
+
+[return]
+contract = "harwness.return.research-finding@1"

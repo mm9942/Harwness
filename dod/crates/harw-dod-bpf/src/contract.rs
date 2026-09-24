@@ -48,7 +48,15 @@ impl BpfObjectContract {
         source: BpfProgramSource,
         scope: BpfScope,
     ) -> Self {
-        Self { sensor, program_name: program_name.into(), kind, attach_point: attach_point.into(), source, wire_version: WIRE_VERSION_V1, scope }
+        Self {
+            sensor,
+            program_name: program_name.into(),
+            kind,
+            attach_point: attach_point.into(),
+            source,
+            wire_version: WIRE_VERSION_V1,
+            scope,
+        }
     }
 
     pub fn validate(&self) -> Result<(), BpfError> {
@@ -74,16 +82,31 @@ impl BpfObjectContract {
 fn is_exact_program_contract(name: &str, kind: BpfProgramKind, attach_point: &str) -> bool {
     matches!(
         (name, kind, attach_point),
-        (EXEC_PROGRAM_NAME, BpfProgramKind::Tracepoint, EXEC_ATTACH_POINT)
-            | (EXIT_PROGRAM_NAME, BpfProgramKind::Tracepoint, EXIT_ATTACH_POINT)
-            | (TCP_V4_CONNECT_PROGRAM_NAME, BpfProgramKind::FEntry, TCP_V4_CONNECT_ATTACH_POINT)
-            | (TCP_V6_CONNECT_PROGRAM_NAME, BpfProgramKind::FEntry, TCP_V6_CONNECT_ATTACH_POINT)
+        (
+            EXEC_PROGRAM_NAME,
+            BpfProgramKind::Tracepoint,
+            EXEC_ATTACH_POINT
+        ) | (
+            EXIT_PROGRAM_NAME,
+            BpfProgramKind::Tracepoint,
+            EXIT_ATTACH_POINT
+        ) | (
+            TCP_V4_CONNECT_PROGRAM_NAME,
+            BpfProgramKind::FEntry,
+            TCP_V4_CONNECT_ATTACH_POINT
+        ) | (
+            TCP_V6_CONNECT_PROGRAM_NAME,
+            BpfProgramKind::FEntry,
+            TCP_V6_CONNECT_ATTACH_POINT
+        )
     )
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{BpfObjectContract, EVENTS_MAP_NAME, LOSS_COUNTS_MAP_NAME, SEQUENCE_MAP_NAME, SCOPE_MAP_NAME};
+    use super::{
+        BpfObjectContract, EVENTS_MAP_NAME, LOSS_COUNTS_MAP_NAME, SCOPE_MAP_NAME, SEQUENCE_MAP_NAME,
+    };
     use crate::{BpfProgramKind, BpfProgramSource, BpfScope};
     use harw_types::SensorId;
     use std::borrow::Cow;
@@ -99,7 +122,15 @@ mod tests {
             BpfScope::Host,
         );
 
-        assert_eq!(contract.required_map_names(), [EVENTS_MAP_NAME, SCOPE_MAP_NAME, LOSS_COUNTS_MAP_NAME, SEQUENCE_MAP_NAME]);
+        assert_eq!(
+            contract.required_map_names(),
+            [
+                EVENTS_MAP_NAME,
+                SCOPE_MAP_NAME,
+                LOSS_COUNTS_MAP_NAME,
+                SEQUENCE_MAP_NAME
+            ]
+        );
         assert!(contract.validate().is_ok());
     }
 
@@ -130,7 +161,12 @@ mod tests {
         for name in ["EVENTS", "SCOPE_CGROUP_IDS", "LOSS_COUNTS", "SEQUENCE"] {
             assert!(header.contains(name));
         }
-        for name in ["dod_sched_process_exec", "dod_sched_process_exit", "dod_tcp_v4_connect", "dod_tcp_v6_connect"] {
+        for name in [
+            "dod_sched_process_exec",
+            "dod_sched_process_exit",
+            "dod_tcp_v4_connect",
+            "dod_tcp_v6_connect",
+        ] {
             assert!(sources.contains(name));
         }
     }

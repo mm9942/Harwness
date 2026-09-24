@@ -70,8 +70,9 @@
 //! (typischerweise einer [`crate::rule::Rule`], die `ctx.now` injiziert
 //! bekommt) oder ist eine reine Berechnung daraus. Dasselbe gilt für
 //! [`Finding::record`] und [`triage_record`]: beide sind reine Funktionen
-//! ihrer Eingaben. Die einzige Stelle dieser Crate, die einen Zufallswert
-//! erzeugt, ist [`crate::engine::run_rules`].
+//! ihrer Eingaben. Zufallswerte (die [`FindingId`] eines geprüften Befundes)
+//! erzeugen nur die Prägestellen [`crate::engine::run_rules_checked`] und
+//! [`crate::advisory::correlate_advisories`].
 //!
 //! # Die Baseline-Regel
 //! [`FindingKind`] unterscheidet, ob ein Befund seine Existenz einer
@@ -99,38 +100,34 @@
 //!
 //! # Examples
 //! ```rust
-//! use harw_dod_rules::rule::{Rule, RuleContext};
-//! use harw_dod_rules::rules::EgressFlowRule;
+//! use harw_code_graph::lockfile::LockedPackage;
+//! use harw_dod_rules::advisory::{Advisory, correlate_advisories};
 //! use harw_dod_rules::finding::triage_record;
-//! use harw_dod_rules::{run_rules, Verdict};
-//! use harw_dod_signals::{
-//!     EventKind, SecurityEvent, SecurityEvidence, SecurityVerdict, Severity,
-//!     VerdictClassification,
-//! };
-//! use harw_authority::NetworkScope;
-//! use harw_types::SensorId;
+//! use harw_dod_rules::Verdict;
+//! use harw_dod_signals::{SecurityEvidence, SecurityVerdict, Severity, VerdictClassification};
+//! use semver::VersionReq;
 //!
-//! let scope = NetworkScope::from_hosts(["docs.rs".to_owned()]);
-//! let events = vec![SecurityEvent {
-//!     sensor: SensorId::from_str("net-0"),
-//!     observed_at: jiff::Timestamp::UNIX_EPOCH,
-//!     actor: None,
-//!     kind: EventKind::EgressFlow {
-//!         destination: "evil.example.com".to_owned(),
-//!         port: 443,
-//!     },
+//! let locked = vec![LockedPackage {
+//!     name: "example-crate".to_owned(),
+//!     version: "1.9.0".to_owned(),
+//!     source: None,
+//!     checksum: None,
 //! }];
-//! let ctx = RuleContext {
-//!     now: jiff::Timestamp::UNIX_EPOCH,
-//!     samples: &[],
-//!     events: &events,
-//!     baselines: &[],
-//!     network_scope: &scope,
-//! };
-//! let rule: &dyn Rule = &EgressFlowRule;
-//! let finding = run_rules(&[rule], &ctx).into_iter().next().expect("löst aus");
+//! let advisories = vec![Advisory {
+//!     id: "RUSTSEC-2024-0001".to_owned(),
+//!     crate_name: "example-crate".to_owned(),
+//!     vulnerable_ranges: vec![VersionReq::parse("<1.10.0").expect("gültiger Bereich")],
+//!     severity: Severity::High,
+//!     summary: "Beispiel-Advisory".to_owned(),
+//! }];
+//! // `run_rules` liefert nur `Finding<Raw>`; öffentliche Prägestellen für
+//! // `Finding<RuleChecked>` sind `run_rules_checked` und `correlate_advisories`.
+//! let finding = correlate_advisories(&advisories, &locked, jiff::Timestamp::UNIX_EPOCH)
+//!     .into_iter()
+//!     .next()
+//!     .expect("Advisory trifft");
 //!
-//! let evidence = SecurityEvidence::capture(vec![], events.clone(), jiff::Timestamp::UNIX_EPOCH)
+//! let evidence = SecurityEvidence::capture(vec![], vec![], jiff::Timestamp::UNIX_EPOCH)
 //!     .expect("Beleg kodierbar");
 //! let record = finding.record(evidence);
 //!
@@ -570,8 +567,11 @@ impl Finding<Raw> {
     /// `pub(crate)`: der einzige Weg zu einem `Finding<RuleChecked>`.
     ///
     /// # Description
-    /// Konsumiert `self` (Typestate-Übergang). Aufgerufen von
-    /// [`crate::engine::run_rules`] und `crate::advisory::correlate_advisories`.
+    /// Konsumiert `self` (Typestate-Übergang). Aufgerufen von den beiden
+    /// öffentlichen Prägestellen [`crate::engine::run_rules_checked`] und
+    /// [`crate::advisory::correlate_advisories`] (sowie der Testhilfe
+    /// `triaged_finding_for_test`). Außerhalb dieser Crate entsteht ein
+    /// `Finding<RuleChecked>` ausschließlich über diese Prägestellen.
     ///
     /// # Arguments
     /// - `id` (`harw_types::FindingId`): die dem Befund zugewiesene Identität.
@@ -1186,33 +1186,31 @@ pub fn triage_record(
 ///
 /// # Examples
 /// ```rust
-/// use harw_dod_rules::rule::{Rule, RuleContext};
-/// use harw_dod_rules::rules::EgressFlowRule;
-/// use harw_dod_rules::{run_rules, triage, Verdict};
-/// use harw_dod_signals::{EventKind, SecurityEvent};
-/// use harw_authority::NetworkScope;
-/// use harw_types::SensorId;
+/// use harw_code_graph::lockfile::LockedPackage;
+/// use harw_dod_rules::advisory::{Advisory, correlate_advisories};
+/// use harw_dod_rules::{triage, Verdict};
+/// use harw_dod_signals::Severity;
+/// use semver::VersionReq;
 ///
-/// let scope = NetworkScope::from_hosts(["docs.rs".to_owned()]);
-/// let events = vec![SecurityEvent {
-///     sensor: SensorId::from_str("net-0"),
-///     observed_at: jiff::Timestamp::UNIX_EPOCH,
-///     actor: None,
-///     kind: EventKind::EgressFlow {
-///         destination: "evil.example.com".to_owned(),
-///         port: 443,
-///     },
+/// let locked = vec![LockedPackage {
+///     name: "example-crate".to_owned(),
+///     version: "1.9.0".to_owned(),
+///     source: None,
+///     checksum: None,
 /// }];
-/// let ctx = RuleContext {
-///     now: jiff::Timestamp::UNIX_EPOCH,
-///     samples: &[],
-///     events: &events,
-///     baselines: &[],
-///     network_scope: &scope,
-/// };
-///
-/// let rule: &dyn Rule = &EgressFlowRule;
-/// let finding = run_rules(&[rule], &ctx).into_iter().next().expect("löst aus");
+/// let advisories = vec![Advisory {
+///     id: "RUSTSEC-2024-0001".to_owned(),
+///     crate_name: "example-crate".to_owned(),
+///     vulnerable_ranges: vec![VersionReq::parse("<1.10.0").expect("gültiger Bereich")],
+///     severity: Severity::High,
+///     summary: "Beispiel-Advisory".to_owned(),
+/// }];
+/// // `run_rules` liefert nur `Finding<Raw>`; öffentliche Prägestellen für
+/// // `Finding<RuleChecked>` sind `run_rules_checked` und `correlate_advisories`.
+/// let finding = correlate_advisories(&advisories, &locked, jiff::Timestamp::UNIX_EPOCH)
+///     .into_iter()
+///     .next()
+///     .expect("Advisory trifft");
 /// let triaged = triage(finding, Verdict::Confirmed);
 /// assert_eq!(*triaged.verdict(), Verdict::Confirmed);
 /// assert_eq!(triaged.record_digest(), None);

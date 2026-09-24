@@ -291,10 +291,13 @@ impl TelemetrySink for PromSink {
         label_set.sort_by(|a, b| a.0.cmp(&b.0));
 
         let mut state = self.lock_state();
-        let series = state.series.entry(key.name).or_insert_with(|| MetricSeries {
-            kind: key.kind,
-            values: BTreeMap::new(),
-        });
+        let series = state
+            .series
+            .entry(key.name)
+            .or_insert_with(|| MetricSeries {
+                kind: key.kind,
+                values: BTreeMap::new(),
+            });
         series.kind = key.kind;
         series.values.insert(label_set, value);
     }
@@ -440,7 +443,10 @@ mod tests {
         );
         let first = sink.render();
         let second = sink.render();
-        assert_eq!(first, second, "render() must be byte-identical across calls");
+        assert_eq!(
+            first, second,
+            "render() must be byte-identical across calls"
+        );
     }
 
     #[test]
@@ -451,7 +457,11 @@ mod tests {
         sink.record(&LATENCY_HISTOGRAM, MetricValue::Observation(1.23), &[]);
 
         assert_eq!(sink.unsupported_histogram_count(), 1);
-        assert_eq!(sink.render(), "", "a rejected histogram must not appear in the output");
+        assert_eq!(
+            sink.render(),
+            "",
+            "a rejected histogram must not appear in the output"
+        );
     }
 
     #[test]
@@ -469,7 +479,10 @@ mod tests {
         // byte inside the label value would otherwise split the sample line
         // and corrupt every line after it for a scraping parser.
         assert_eq!(output.matches('\n').count(), output.lines().count());
-        assert!(output.contains(r#"path="line1\nquote\"and\\slash""#), "{output}");
+        assert!(
+            output.contains(r#"path="line1\nquote\"and\\slash""#),
+            "{output}"
+        );
     }
 
     #[test]

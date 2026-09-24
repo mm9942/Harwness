@@ -68,7 +68,21 @@
 //! Sperre gar nicht erst in die Deckel-Prüfung eintreten, solange die erste
 //! noch läuft. Verschachtelt wird nur noch ein Paar, immer in dieser
 //! Richtung: `manager` ⊃ `released` (Rückgabe bzw. Verwerfen einer laufenden
-//! Session).
+//! Session). Die Auftrags- und Fortschritts-Registries (`child_tasks`,
+//! `progress_sinks`) sind Blatt-Sperren: unter ihnen wird nie eine weitere
+//! Sperre genommen und nie ein Beobachter aufgerufen.
+//!
+//! # Auftrag, Ergebnis und Live-Fortschritt
+//! - Die Admission hinterlegt `SpawnInput::instructions` (sonst einen nicht
+//!   leeren `context`) als einmaligen Auftrag; der erste Lauf mit leerem
+//!   [`TurnInput`] bekommt ihn als User-Turn.
+//! - Orchestrierungs-Events tragen in `task` den Kurzkopf dieses Auftrags und
+//!   bei `Completed`/`Failed` in `detail` den Kurzkopf der finalen Antwort
+//!   bzw. des Fehlergrunds (siehe [`orchestration_detail_head`]).
+//! - [`ChildRunResult::full_text`] trägt die ungekürzte finale Antwort.
+//! - Der [`ManagedAgentSpawner::progress_observer`] sendet gedrosselt
+//!   `TurnEvent::ChildProgress` an den Live-Kanal des Elternteils (siehe
+//!   [`ManagedAgentSpawner::attach_child_progress_sink`]).
 //!
 //! # Fehler
 //! Alle öffentlichen Fehler sind [`AgentSpawnError`] mit lesbarer Meldung.
@@ -86,7 +100,7 @@
 use crate::ModelProvider;
 use crate::activation::SessionActivation;
 use crate::cancel::{CancelReason, CancelToken};
-use crate::session::{AgentSession, SpawnContext};
+use crate::session::{AgentSession, LiveEmitter, SpawnContext};
 use crate::session_manager::SessionManager;
 use crate::state_store::StateStore;
 use crate::turn_loop::{TurnInput, TurnOutcome, run_turn, run_turn_durable};
@@ -99,9 +113,9 @@ use harw_extension_api::{
 };
 use harw_observe::TraceContext;
 use harw_protocol::items::{ContentPart, TurnItem};
-use harw_protocol::{AgentOrchestrationEvent, AgentOrchestrationStatus};
+use harw_protocol::{AgentOrchestrationEvent, AgentOrchestrationStatus, TurnEvent};
 use harw_session_store::{ApprovalStore, ChildLeaseRecord, ChildLeaseStore};
-use harw_types::{AgentRole, ReasoningEffort, SessionId, TokenUsage, ToolCallId};
+use harw_types::{AgentRole, ReasoningEffort, SessionId, TokenUsage, ToolCallId, TurnId};
 use jiff::{SignedDuration, Timestamp};
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::future::Future;
@@ -299,6 +313,118 @@ fn ceil_char_boundary(s: &str, idx: usize) -> usize {
     }
     i
 }
+
+/// Obergrenze (in Zeichen, nicht Bytes) für `task` und `detail` eines vom
+/// Controller erzeugten [`AgentOrchestrationEvent`].
+///
+/// # Beschreibung
+/// Liegt bewusst unter [`AgentOrchestrationEvent::MAX_DETAIL_CHARS`], damit
+/// das Protokoll-seitige Kürzen nie ein bereits gesetztes Kürzungszeichen
+/// abschneidet. Siehe [`orchestration_detail_head`].
+pub const ORCHESTRATION_DETAIL_MAX_CHARS: usize = 500;
+
+/// Mindestabstand zwischen zwei [`TurnEvent::ChildProgress`]-Meldungen
+/// desselben Kindes (Drosselung, siehe
+/// [`ManagedAgentSpawner::attach_child_progress_sink`]).
+pub const CHILD_PROGRESS_MIN_INTERVAL: Duration = Duration::from_millis(500);
+
+/// Liefert einen kurzen, zeichengrenzen-sicheren Kopf eines Textes für
+/// Orchestrierungs-Events (`task`/`detail`).
+///
+/// # Beschreibung
+/// Entfernt führenden und abschließenden Leerraum. Ist der Rest länger als
+/// [`ORCHESTRATION_DETAIL_MAX_CHARS`] Zeichen, werden die ersten
+/// `ORCHESTRATION_DETAIL_MAX_CHARS - 1` Zeichen behalten und ein `…`
+/// angehängt — das Ergebnis hat damit höchstens
+/// [`ORCHESTRATION_DETAIL_MAX_CHARS`] Zeichen. Gezählt wird in `char`s, ein
+/// Mehrbyte-Zeichen wird also nie zerschnitten.
+///
+/// # Arguments
+/// - `text` (`&str`): der ungekürzte Text.
+///
+/// # Returns
+/// `None` für einen leeren bzw. reinen Leerraum-Text, sonst den Kopf.
+///
+/// # Examples
+/// ```rust
+/// use harw_core::child_controller::{ORCHESTRATION_DETAIL_MAX_CHARS, orchestration_detail_head};
+///
+/// assert_eq!(orchestration_detail_head("  kurz \n"), Some("kurz".to_owned()));
+/// assert_eq!(orchestration_detail_head("   "), None);
+/// let long = "ä".repeat(2_000);
+/// let head = orchestration_detail_head(&long).unwrap_or_default();
+/// assert_eq!(head.chars().count(), ORCHESTRATION_DETAIL_MAX_CHARS);
+/// assert!(head.ends_with('…'));
+/// ```
+#[must_use]
+pub fn orchestration_detail_head(text: &str) -> Option<String> {
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    if trimmed.chars().count() <= ORCHESTRATION_DETAIL_MAX_CHARS {
+        return Some(trimmed.to_owned());
+    }
+    let mut head: String = trimmed
+        .chars()
+        .take(ORCHESTRATION_DETAIL_MAX_CHARS.saturating_sub(1))
+        .collect();
+    head.push('…');
+    Some(head)
+}
+
+/// Leitet den Auftragstext eines Kindes aus seinem [`SpawnInput`] ab.
+///
+/// # Beschreibung
+/// Vorrang hat `instructions` (sofern nicht leer). Sonst wird ein nicht
+/// leerer `context` verwendet: ein JSON-String direkt, jeder andere Wert
+/// (außer `null`, `{}` und `[]`) als kompaktes JSON.
+///
+/// # Returns
+/// Den **ungekürzten** Auftragstext oder `None`, wenn keiner vorliegt.
+fn spawn_task_text(instructions: Option<&str>, context: &serde_json::Value) -> Option<String> {
+    if let Some(text) = instructions
+        && !text.trim().is_empty()
+    {
+        return Some(text.to_owned());
+    }
+    match context {
+        serde_json::Value::Null => None,
+        serde_json::Value::String(text) if text.trim().is_empty() => None,
+        serde_json::Value::String(text) => Some(text.clone()),
+        serde_json::Value::Object(map) if map.is_empty() => None,
+        serde_json::Value::Array(items) if items.is_empty() => None,
+        other => Some(other.to_string()),
+    }
+}
+
+/// Auftrags- und Ergebniszustand eines admittierten Kindes, der nicht im
+/// öffentlichen [`ChildRecord`] liegt (dessen Literal-Konstruktion in anderen
+/// Crates sonst bräche).
+#[derive(Debug, Clone, Default)]
+struct ChildTaskState {
+    /// Der ungekürzte Auftrag; wird vom ersten Lauf mit leerem
+    /// [`TurnInput`] als User-Text verbraucht.
+    pending_task: Option<String>,
+    /// Kurzkopf des Auftrags für `AgentOrchestrationEvent::task`.
+    task: Option<String>,
+    /// Kurzkopf der finalen Antwort bzw. des Fehlergrunds für
+    /// `AgentOrchestrationEvent::detail` (`Completed`/`Failed`).
+    outcome_detail: Option<String>,
+}
+
+/// Ziel der [`TurnEvent::ChildProgress`]-Meldungen eines Kindes: der
+/// Live-Kanal seines Elternteils samt dessen Turn-ID.
+#[derive(Debug, Clone)]
+struct ChildProgressSink {
+    turn_id: TurnId,
+    emitter: LiveEmitter,
+    /// Zeitpunkt der letzten gesendeten Meldung (Drosselung).
+    last_emitted: Option<std::time::Instant>,
+}
+
+/// Geteilte Registry der Fortschritts-Senken je Kind (Schlüssel: Kind-ID).
+type ProgressSinks = Arc<Mutex<BTreeMap<String, ChildProgressSink>>>;
 
 /// Ein bereits geboxtes Kind-Future im Fan-out-Scheduler.
 ///
@@ -580,6 +706,99 @@ pub struct ChildRecord {
     pub task_complexity: Option<TaskComplexity>,
     /// Live-Zähler (Tokens, Tool-Aufrufe) für Beobachter.
     pub live: ChildLiveStats,
+    /// Das Modell, das dieses Kind anspricht: das bei der Admission gepinnte
+    /// Kind-Modell, sonst das `active_model` der Kind-Session. `None`, wenn
+    /// keines von beiden bekannt ist (dann gilt der Provider-Default).
+    pub model: Option<String>,
+    /// Bisher abgerechneter Verbrauch dieses Kindes **samt Nachkommen**.
+    ///
+    /// Das Kind selbst trägt am Ende jedes
+    /// [`ManagedAgentSpawner::run_child_with_budget`] den Verbrauch des Laufs
+    /// ein; Nachkommen werden beim Abschluss ihres Laufs bzw. bei ihrer
+    /// Freigabe (`close_child`) jeweils eine Ebene nach oben verrechnet.
+    /// Grundlage für [`ManagedAgentSpawner::remaining_budget`].
+    pub consumed: ChildUsage,
+    /// Der Teil von [`Self::consumed`], der dem direkten Elternteil bereits
+    /// angerechnet wurde. Weitere Anrechnungen übertragen nur die Differenz,
+    /// damit Lauf-Ende und Freigabe nichts doppelt verbuchen.
+    pub charged_to_parent: ChildUsage,
+}
+
+/// Verbrauch eines Kindes in den drei durchgesetzten Budget-Dimensionen.
+///
+/// # Beschreibung
+/// In [`ChildRunResult::usage`] der Verbrauch **eines** Laufs, in
+/// [`ChildRecord::consumed`] die aufsummierte Anrechnung (Kind plus
+/// Nachkommen). Alle Rechnungen sättigen, statt überzulaufen.
+///
+/// # Concurrency
+/// `Copy`; enthält keinen geteilten Zustand.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ChildUsage {
+    /// Verbrauchte Modell-Token.
+    pub tokens: u64,
+    /// Ausgeführte Werkzeugaufrufe.
+    pub tool_calls: u32,
+    /// Verbrauchte Wanduhrzeit in Millisekunden.
+    pub wall_time_ms: u64,
+}
+
+impl ChildUsage {
+    /// Sättigende, dimensionsweise Summe.
+    #[must_use]
+    pub fn saturating_add(self, other: Self) -> Self {
+        Self {
+            tokens: self.tokens.saturating_add(other.tokens),
+            tool_calls: self.tool_calls.saturating_add(other.tool_calls),
+            wall_time_ms: self.wall_time_ms.saturating_add(other.wall_time_ms),
+        }
+    }
+
+    /// Sättigende, dimensionsweise Differenz (nie unter 0).
+    #[must_use]
+    pub fn saturating_sub(self, other: Self) -> Self {
+        Self {
+            tokens: self.tokens.saturating_sub(other.tokens),
+            tool_calls: self.tool_calls.saturating_sub(other.tool_calls),
+            wall_time_ms: self.wall_time_ms.saturating_sub(other.wall_time_ms),
+        }
+    }
+}
+
+/// Zieht den Verbrauch dimensionsweise von einem Budget ab.
+///
+/// Eine nicht gesetzte Dimension bleibt nicht gesetzt (kein Deckel); eine
+/// gesetzte sättigt bei 0. `reasoning_effort` bleibt unverändert.
+fn budget_minus_usage(budget: AgentBudget, usage: ChildUsage) -> AgentBudget {
+    AgentBudget {
+        max_tokens: budget
+            .max_tokens
+            .map(|limit| limit.saturating_sub(usage.tokens)),
+        max_tool_calls: budget
+            .max_tool_calls
+            .map(|limit| limit.saturating_sub(usage.tool_calls)),
+        max_wall_time_ms: budget
+            .max_wall_time_ms
+            .map(|limit| limit.saturating_sub(usage.wall_time_ms)),
+        reasoning_effort: budget.reasoning_effort,
+    }
+}
+
+/// Infimum zweier Budgets je Dimension; `None` ist das neutrale Element.
+fn tighten_agent_budget(left: AgentBudget, right: AgentBudget) -> AgentBudget {
+    fn tighter<T: Ord>(left: Option<T>, right: Option<T>) -> Option<T> {
+        match (left, right) {
+            (Some(left), Some(right)) => Some(left.min(right)),
+            (Some(only), None) | (None, Some(only)) => Some(only),
+            (None, None) => None,
+        }
+    }
+    AgentBudget {
+        max_tokens: tighter(left.max_tokens, right.max_tokens),
+        max_tool_calls: tighter(left.max_tool_calls, right.max_tool_calls),
+        max_wall_time_ms: tighter(left.max_wall_time_ms, right.max_wall_time_ms),
+        reasoning_effort: tighter(left.reasoning_effort, right.reasoning_effort),
+    }
 }
 
 /// Laufende Zähler eines Kindes, fortgeschrieben vom Progress-Observer.
@@ -627,6 +846,18 @@ pub struct ExpiredChild {
 pub struct ChildRunResult {
     pub child: SessionId,
     pub outcome: TurnOutcome,
+    /// Die **ungekürzte** finale Assistenten-Antwort des Kindes, gesetzt bei
+    /// `TurnOutcome::Completed`, sofern das Kind Text geliefert hat; sonst
+    /// `None`. Typisierte Rückgabe-Verträge parsen diesen Text; für eine
+    /// Freitext-Rückgabe an den Elternteil kappt der Aufrufer ihn selbst über
+    /// [`cap_child_return_text`] (die gekappte Form liefert weiterhin
+    /// [`ManagedAgentSpawner::child_final_assistant_text`]).
+    pub full_text: Option<String>,
+    /// Verbrauch **dieses** Laufs (Token- und Tool-Aufruf-Differenz der
+    /// Kind-Session plus Wanduhrzeit). Gesetzt von
+    /// [`ManagedAgentSpawner::run_child_with_budget`]; die übrigen
+    /// Lauf-Einstiege liefern [`ChildUsage::default`].
+    pub usage: ChildUsage,
 }
 
 /// Lebenszyklus-Status eines admittierten Kindes.
@@ -667,6 +898,14 @@ pub type ContextWindowResolver = dyn Fn(Option<&str>) -> u64 + Send + Sync;
 
 /// Kontextfenster eines Kindes ohne Resolver (Addendum D).
 pub const DEFAULT_CHILD_CONTEXT_WINDOW: u64 = 200_000;
+
+/// Obergrenze eines einzelnen Werkzeugergebnisses in Kind-Turns (Bytes), die
+/// jedes Kind als Vorgabe-Turn-Grenze erhält (Welle 3): 64 KiB.
+pub const CHILD_TOOL_RESULT_MAX_BYTES: usize = 64 * 1024;
+
+/// Fester Token-Overhead (System-Prompt, Tool-Spezifikationen), den die
+/// Auto-Compact-Policy eines Kindes vom Fenster abzieht (Welle 3).
+pub const CHILD_FIXED_OVERHEAD_TOKENS: u64 = 4_096;
 
 /// Receives bounded lifecycle snapshots after controller locks have been
 /// released. Implementations may persist, forward, or fan out the event but
@@ -1205,6 +1444,34 @@ pub trait ChildRegistryFactory: Send + Sync {
         self.model_for(role)
     }
 
+    /// Modell-ID, die der Kind-Provider für `role`/`complexity` fest
+    /// anspricht (Welle 3), z. B. die eines `PinnedModelProvider`.
+    ///
+    /// # Description
+    /// Grundlage für das Kontextfenster, die Auto-Compact-Policy und die
+    /// Ausgabe-Reserve des Kindes bei der Admission. Der Default baut den
+    /// Provider über [`Self::model_for_task`] und liest
+    /// [`ModelProvider::pinned_model_id`]; Factories, deren `model_for`
+    /// Nebenwirkungen hat oder teuer ist, überschreiben diese Methode.
+    ///
+    /// # Arguments
+    /// - `role` (`&str`): exakter registrierter Rollenname.
+    /// - `complexity` (`Option<TaskComplexity>`): wie bei
+    ///   [`Self::model_for_task`].
+    ///
+    /// # Returns
+    /// Die gepinnte Modell-ID oder `None` (kein Pin bekannt oder
+    /// `model_for_task` scheitert — dann gilt das `active_model` der Session).
+    fn pinned_model_for_task(
+        &self,
+        role: &str,
+        complexity: Option<TaskComplexity>,
+    ) -> Option<String> {
+        self.model_for_task(role, complexity)
+            .ok()
+            .and_then(|provider| provider.pinned_model_id())
+    }
+
     /// Liefert Provider- und Modell-Standard-Reasoning-Effort für die
     /// Provider-/Modell-Zuordnung, die diese Factory für `role` tatsächlich
     /// auflöst (Welle 8: Rangfolge Provider > Modell > Agent > Rolle).
@@ -1368,9 +1635,20 @@ pub struct ManagedAgentSpawner {
     /// Kontextfenster (Tokens) je Modell-ID des Kindes; `None`-Argument =
     /// Vorgabemodell. Ohne Resolver gilt [`DEFAULT_CHILD_CONTEXT_WINDOW`].
     context_window_resolver: Option<Arc<ContextWindowResolver>>,
+    /// Absoluter Auto-Compact-Deckel (Input-Tokens) für Kind-Sessions aus der
+    /// Konfiguration ([`Self::with_compaction_ceiling`]). `None`: es gilt
+    /// [`crate::auto_compact::DEFAULT_ABSOLUTE_CEILING_TOKENS`].
+    compaction_ceiling: Option<u64>,
     /// Optional sink for user-safe lifecycle snapshots. Invocation happens
     /// only after the active/cancellation/manager locks are released.
     orchestration_observer: Option<Arc<dyn OrchestrationObserver>>,
+    /// Auftrag (`pending_task`, Kurzkopf) und Ergebnis-Kurzkopf je
+    /// admittiertem Kind (Schlüssel: Kind-ID), siehe [`ChildTaskState`].
+    child_tasks: Mutex<BTreeMap<String, ChildTaskState>>,
+    /// Live-Kanäle der Elternteile je Kind für gedrosselte
+    /// [`TurnEvent::ChildProgress`]-Meldungen; geteilt mit dem
+    /// [`Self::progress_observer`].
+    progress_sinks: ProgressSinks,
     /// Woken every time a slot in `active` is freed (`release_in_memory`,
     /// `reap_expired`, `reap_expired_durable` — every path that removes an
     /// entry from `active`). Lets [`Self::admit_or_wait`] wait for capacity
@@ -1490,6 +1768,8 @@ struct ActiveLeaseProgressObserver {
     active: Arc<Mutex<BTreeMap<String, ChildRecord>>>,
     lease_seconds: i64,
     orchestration_observer: Option<Arc<dyn OrchestrationObserver>>,
+    /// Live-Kanäle der Elternteile für [`TurnEvent::ChildProgress`].
+    progress_sinks: ProgressSinks,
 }
 
 impl ActiveLeaseProgressObserver {
@@ -1528,16 +1808,68 @@ impl crate::guard::ProgressObserver for ActiveLeaseProgressObserver {
             let root = ManagedAgentSpawner::root_from_active(&active, session_id)?;
             Some((root, record))
         });
+        if let Some((_, record)) = snapshot.as_ref() {
+            emit_child_progress(&self.progress_sinks, record, std::time::Instant::now());
+        }
         if let (Some(observer), Some((root, record))) = (&self.orchestration_observer, snapshot) {
             emit_orchestration_event(
                 observer,
                 root,
                 &record,
                 None,
+                None,
                 AgentOrchestrationStatus::Progress,
             );
         }
     }
+}
+
+/// Sendet gedrosselt ein [`TurnEvent::ChildProgress`] für `record` an die
+/// registrierte Fortschritts-Senke seines Elternteils.
+///
+/// # Beschreibung
+/// Höchstens eine Meldung je [`CHILD_PROGRESS_MIN_INTERVAL`] und Kind; eine
+/// gedrosselte Meldung wird verworfen (die nächste trägt ohnehin die dann
+/// aktuellen Zähler). Ohne Senke ist das ein No-op. Die Sperre der Registry
+/// ist beim Senden bereits freigegeben.
+///
+/// # Arguments
+/// - `sinks` (`&ProgressSinks`): die geteilte Senken-Registry.
+/// - `record` (`&ChildRecord`): Schnappschuss des Kindes (Zähler aus `live`).
+/// - `now` (`std::time::Instant`): Referenzzeitpunkt der Drosselung.
+///
+/// # Returns
+/// `true`, wenn eine Meldung gesendet wurde.
+fn emit_child_progress(
+    sinks: &ProgressSinks,
+    record: &ChildRecord,
+    now: std::time::Instant,
+) -> bool {
+    let target = {
+        let Ok(mut sinks) = sinks.lock() else {
+            tracing::warn!(child = %record.child, "child_progress.lock_poisoned");
+            return false;
+        };
+        let Some(sink) = sinks.get_mut(record.child.as_str()) else {
+            return false;
+        };
+        let throttled = sink
+            .last_emitted
+            .is_some_and(|last| now.saturating_duration_since(last) < CHILD_PROGRESS_MIN_INTERVAL);
+        if throttled {
+            return false;
+        }
+        sink.last_emitted = Some(now);
+        (sink.turn_id.clone(), sink.emitter.clone())
+    };
+    let (turn_id, emitter) = target;
+    emitter.emit(TurnEvent::ChildProgress {
+        turn_id,
+        child: record.child.clone(),
+        tool_calls: record.live.tool_calls,
+        tokens: record.live.usage.total(),
+    });
+    true
 }
 
 /// Builds one user-safe lifecycle observation. Callers must invoke this only
@@ -1548,6 +1880,7 @@ fn emit_orchestration_event(
     root_session_id: SessionId,
     record: &ChildRecord,
     task: Option<String>,
+    detail: Option<String>,
     status: AgentOrchestrationStatus,
 ) {
     observer.on_orchestration_event(AgentOrchestrationEvent {
@@ -1564,8 +1897,9 @@ fn emit_orchestration_event(
         usage: Some(record.live.usage.clone()),
         duration_ms: Some(elapsed_ms(record.admitted_at)),
         progress: None,
-        detail: None,
+        detail: AgentOrchestrationEvent::bounded_detail(detail),
         tool_calls: Some(record.live.tool_calls),
+        model: record.model.clone(),
     });
 }
 
@@ -1634,7 +1968,137 @@ impl ManagedAgentSpawner {
         let Some(observer) = &self.orchestration_observer else {
             return;
         };
-        emit_orchestration_event(observer, root_session_id, record, task, status);
+        let state = self.child_task_state(&record.child);
+        let task = task
+            .as_deref()
+            .and_then(orchestration_detail_head)
+            .or_else(|| state.as_ref().and_then(|state| state.task.clone()));
+        let detail = match status {
+            AgentOrchestrationStatus::Completed | AgentOrchestrationStatus::Failed => {
+                state.and_then(|state| state.outcome_detail)
+            }
+            _ => None,
+        };
+        emit_orchestration_event(observer, root_session_id, record, task, detail, status);
+    }
+
+    /// Kopie des Auftrags-/Ergebniszustands eines Kindes (`None`, wenn
+    /// unbekannt oder die Sperre vergiftet ist).
+    fn child_task_state(&self, child: &SessionId) -> Option<ChildTaskState> {
+        self.child_tasks
+            .lock()
+            .ok()
+            .and_then(|tasks| tasks.get(child.as_str()).cloned())
+    }
+
+    /// Hinterlegt den Kurzkopf der finalen Antwort bzw. des Fehlergrunds
+    /// eines Kindes für das spätere `Completed`/`Failed`-Orchestrierungs-Event.
+    fn set_outcome_detail(&self, child: &SessionId, text: &str) {
+        match self.child_tasks.lock() {
+            Ok(mut tasks) => {
+                tasks
+                    .entry(child.as_str().to_owned())
+                    .or_default()
+                    .outcome_detail = orchestration_detail_head(text);
+            }
+            Err(_) => tracing::warn!(child = %child, "child_task_state.lock_poisoned"),
+        }
+    }
+
+    /// Markiert ein Kind als gescheitert und merkt sich den Grund als
+    /// `detail` des späteren `Failed`-Orchestrierungs-Events.
+    fn set_failed(&self, child: &SessionId, reason: &str) {
+        self.set_outcome_detail(child, reason);
+        self.set_status(child, ChildStatus::Failed);
+    }
+
+    /// Entnimmt den noch nicht verbrauchten Auftrag eines Kindes (einmalig).
+    fn take_pending_task(&self, child: &SessionId) -> Option<String> {
+        self.child_tasks
+            .lock()
+            .ok()
+            .and_then(|mut tasks| tasks.get_mut(child.as_str())?.pending_task.take())
+    }
+
+    /// Meldet den Abschluss-/Freigabestatus eines eben freigegebenen Kindes
+    /// und räumt danach dessen Auftrags- und Fortschrittszustand ab.
+    fn observe_release(
+        &self,
+        child: &SessionId,
+        root: Option<SessionId>,
+        record: Option<&ChildRecord>,
+    ) {
+        if let (Some(root), Some(record)) = (root, record) {
+            let status = match record.status {
+                ChildStatus::Completed => AgentOrchestrationStatus::Completed,
+                ChildStatus::Failed => AgentOrchestrationStatus::Failed,
+                ChildStatus::Cancelled => AgentOrchestrationStatus::Cancelled,
+                ChildStatus::Paused => AgentOrchestrationStatus::Paused,
+                ChildStatus::Running => AgentOrchestrationStatus::Running,
+                ChildStatus::Admitted => AgentOrchestrationStatus::Cancelled,
+            };
+            self.observe_orchestration(root, record, None, status);
+        }
+        self.forget_child_state(child);
+    }
+
+    /// Entfernt Auftrags- und Fortschrittszustand eines nicht mehr aktiven Kindes.
+    fn forget_child_state(&self, child: &SessionId) {
+        if let Ok(mut tasks) = self.child_tasks.lock() {
+            tasks.remove(child.as_str());
+        }
+        if let Ok(mut sinks) = self.progress_sinks.lock() {
+            sinks.remove(child.as_str());
+        }
+    }
+
+    /// Registriert den Live-Kanal, über den dieses Kind gedrosselte
+    /// [`TurnEvent::ChildProgress`]-Meldungen an seinen Elternteil sendet.
+    ///
+    /// # Beschreibung
+    /// Die Admission registriert die Senke automatisch, wenn die
+    /// Elternsitzung beim Spawn im [`SessionManager`] liegt und einen
+    /// laufenden Turn hat (deren [`AgentSession::live_emitter`] und
+    /// [`AgentSession::current_turn`]). Für Elternteile außerhalb des
+    /// Managers (externe Wurzel, gerade laufende Kind-Sitzung) ruft der
+    /// Aufrufer, der den Eltern-Turn fährt, diese Methode nach dem Spawn.
+    /// Eine vorhandene Senke wird ersetzt. Gesendet wird aus dem
+    /// [`Self::progress_observer`] nach jeder Modellrunde bzw. jedem
+    /// Tool-Ergebnis, höchstens alle [`CHILD_PROGRESS_MIN_INTERVAL`].
+    ///
+    /// # Arguments
+    /// - `child` (`&SessionId`): das admittierte Kind.
+    /// - `turn_id` (`TurnId`): der Turn des Elternteils, der das Kind startete.
+    /// - `emitter` (`LiveEmitter`): der Live-Kanal des Elternteils.
+    ///
+    /// # Returns
+    /// `true`, wenn das Kind admittiert ist und die Senke registriert wurde.
+    pub fn attach_child_progress_sink(
+        &self,
+        child: &SessionId,
+        turn_id: TurnId,
+        emitter: LiveEmitter,
+    ) -> bool {
+        if self.child_record(child).is_none() {
+            return false;
+        }
+        match self.progress_sinks.lock() {
+            Ok(mut sinks) => {
+                sinks.insert(
+                    child.as_str().to_owned(),
+                    ChildProgressSink {
+                        turn_id,
+                        emitter,
+                        last_emitted: None,
+                    },
+                );
+                true
+            }
+            Err(_) => {
+                tracing::warn!(child = %child, "child_progress.attach_lock_poisoned");
+                false
+            }
+        }
     }
 
     /// Setzt den Resolver, der jedem Kind das Kontextfenster **seines**
@@ -1644,6 +2108,31 @@ impl ManagedAgentSpawner {
     pub fn with_context_window_resolver(mut self, resolver: Arc<ContextWindowResolver>) -> Self {
         self.context_window_resolver = Some(resolver);
         self
+    }
+
+    /// Setzt den absoluten Auto-Compact-Deckel (Input-Tokens) für jede
+    /// admittierte Kind-Session (Welle 3).
+    ///
+    /// # Arguments
+    /// - `ceiling` (`Option<u64>`): konfigurierter Deckel; `None` lässt den
+    ///   Standard [`crate::auto_compact::DEFAULT_ABSOLUTE_CEILING_TOKENS`]
+    ///   gelten.
+    ///
+    /// # Returns
+    /// Den Spawner mit gesetztem Deckel (verbrauchender Builder).
+    #[must_use]
+    pub fn with_compaction_ceiling(mut self, ceiling: Option<u64>) -> Self {
+        self.compaction_ceiling = ceiling;
+        self
+    }
+
+    /// Effektiver absoluter Auto-Compact-Deckel für Kind-Sessions:
+    /// konfigurierter Wert, sonst
+    /// [`crate::auto_compact::DEFAULT_ABSOLUTE_CEILING_TOKENS`].
+    #[must_use]
+    pub fn compaction_ceiling(&self) -> u64 {
+        self.compaction_ceiling
+            .unwrap_or(crate::auto_compact::DEFAULT_ABSOLUTE_CEILING_TOKENS)
     }
 
     /// Liefert die globalen Admission-Limits dieses Controllers.
@@ -1677,7 +2166,10 @@ impl ManagedAgentSpawner {
             pitfall_advisor: None,
             recent_delegation_hashes: Mutex::new(BTreeMap::new()),
             context_window_resolver: None,
+            compaction_ceiling: None,
             orchestration_observer: None,
+            child_tasks: Mutex::new(BTreeMap::new()),
+            progress_sinks: Arc::new(Mutex::new(BTreeMap::new())),
             freed: tokio::sync::Notify::new(),
         }
     }
@@ -1874,13 +2366,18 @@ impl ManagedAgentSpawner {
     /// `Arc<Self>` nötig) und die konfigurierte Lease-Dauer. Registriert
     /// über [`crate::session::AgentSession::with_progress_observer`] an
     /// jeder Kind-Session, ruft die dieselbe Renew-Logik wie
-    /// [`Self::renew_lease`] mit dem aktuellen Zeitpunkt auf.
+    /// [`Self::renew_lease`] mit dem aktuellen Zeitpunkt auf. Zusätzlich
+    /// sendet er je Fortschritt höchstens alle
+    /// [`CHILD_PROGRESS_MIN_INTERVAL`] ein `TurnEvent::ChildProgress` an die
+    /// per [`Self::attach_child_progress_sink`] (oder automatisch bei der
+    /// Admission) registrierte Senke des Elternteils.
     #[must_use]
     pub fn progress_observer(&self) -> Arc<dyn crate::guard::ProgressObserver> {
         Arc::new(ActiveLeaseProgressObserver {
             active: Arc::clone(&self.active),
             lease_seconds: self.limits.lease_seconds,
             orchestration_observer: self.orchestration_observer.clone(),
+            progress_sinks: Arc::clone(&self.progress_sinks),
         })
     }
 
@@ -1895,19 +2392,10 @@ impl ManagedAgentSpawner {
         let root = self.root_for(child);
         match self.release_in_memory(child) {
             Ok(Some(record)) => {
-                if let Some(root) = root {
-                    let status = match record.status {
-                        ChildStatus::Completed => AgentOrchestrationStatus::Completed,
-                        ChildStatus::Failed => AgentOrchestrationStatus::Failed,
-                        ChildStatus::Cancelled => AgentOrchestrationStatus::Cancelled,
-                        ChildStatus::Paused => AgentOrchestrationStatus::Paused,
-                        ChildStatus::Running => AgentOrchestrationStatus::Running,
-                        ChildStatus::Admitted => AgentOrchestrationStatus::Cancelled,
-                    };
-                    self.observe_orchestration(root, &record, None, status);
-                }
+                self.charge_released_child(&record);
+                self.observe_release(child, root, Some(&record));
             }
-            Ok(None) => {}
+            Ok(None) => self.forget_child_state(child),
             Err(error) => {
                 tracing::warn!(child = %child, error = %error, "child_close.release_failed");
             }
@@ -1933,17 +2421,10 @@ impl ManagedAgentSpawner {
         }
         let root = self.root_for(child);
         let released = self.release_in_memory(child)?;
-        if let (Some(root), Some(record)) = (root, released.as_ref()) {
-            let status = match record.status {
-                ChildStatus::Completed => AgentOrchestrationStatus::Completed,
-                ChildStatus::Failed => AgentOrchestrationStatus::Failed,
-                ChildStatus::Cancelled => AgentOrchestrationStatus::Cancelled,
-                ChildStatus::Paused => AgentOrchestrationStatus::Paused,
-                ChildStatus::Running => AgentOrchestrationStatus::Running,
-                ChildStatus::Admitted => AgentOrchestrationStatus::Cancelled,
-            };
-            self.observe_orchestration(root, record, None, status);
+        if let Some(record) = released.as_ref() {
+            self.charge_released_child(record);
         }
+        self.observe_release(child, root, released.as_ref());
         Ok(())
     }
 
@@ -1996,24 +2477,17 @@ impl ManagedAgentSpawner {
         let root = self.root_for(child);
         let record = self.release_in_memory(child)?;
         if let (Some(lease_store), Some(record)) = (&self.lease_store, record.as_ref()) {
-            lease_store.complete(child, Timestamp::now()).map_err(|error| {
-                Self::reject(format!(
+            if let Err(error) = lease_store.complete(child, Timestamp::now()) {
+                // Der Slot ist trotzdem frei: Auftrags-/Fortschrittszustand
+                // abräumen, bevor der Fehler zurückgeht.
+                self.forget_child_state(child);
+                return Err(Self::reject(format!(
                     "child {child} was released but its durable lease could not be closed: {error}"
-                ))
-            })?;
+                )));
+            }
             tracing::info!(child = %child, status = record.status.as_str(), "child_release.lease_closed");
         }
-        if let (Some(root), Some(record)) = (root, record.as_ref()) {
-            let status = match record.status {
-                ChildStatus::Completed => AgentOrchestrationStatus::Completed,
-                ChildStatus::Failed => AgentOrchestrationStatus::Failed,
-                ChildStatus::Cancelled => AgentOrchestrationStatus::Cancelled,
-                ChildStatus::Paused => AgentOrchestrationStatus::Paused,
-                ChildStatus::Running => AgentOrchestrationStatus::Running,
-                ChildStatus::Admitted => AgentOrchestrationStatus::Cancelled,
-            };
-            self.observe_orchestration(root, record, None, status);
-        }
+        self.observe_release(child, root, record.as_ref());
         Ok(record)
     }
 
@@ -2671,10 +3145,35 @@ impl ManagedAgentSpawner {
     /// independently (e.g. the child's own transcript/state store); this
     /// method only shrinks what is handed back to the parent.
     ///
+    /// Für typisierte Rückgabe-Verträge liefert
+    /// [`Self::child_final_assistant_text_full`] (bzw.
+    /// [`ChildRunResult::full_text`]) denselben Text ungekürzt.
+    ///
     /// # Errors
     /// Returns [`AgentSpawnError`] when the child is not admitted, its restored
     /// session is unavailable, or its history contains no assistant text.
     pub fn child_final_assistant_text(&self, child: &SessionId) -> Result<String, AgentSpawnError> {
+        let text = self.child_final_assistant_text_full(child)?;
+        Ok(cap_child_return_text(&text, CHILD_RETURN_MAX_BYTES))
+    }
+
+    /// Liefert die neueste Text-Antwort eines admittierten Kindes
+    /// **ungekürzt**.
+    ///
+    /// # Beschreibung
+    /// Gleiche Quelle und gleiche Fehler wie
+    /// [`Self::child_final_assistant_text`], aber ohne
+    /// [`cap_child_return_text`]. Gedacht für typisierte Rückgabe-Verträge,
+    /// deren Parser an einem gekürzten JSON fälschlich scheitern würden; eine
+    /// Freitext-Rückgabe an den Elternteil muss der Aufrufer selbst kappen.
+    ///
+    /// # Errors
+    /// [`AgentSpawnError`], wenn das Kind nicht admittiert ist, seine Session
+    /// nicht verfügbar ist oder sein Verlauf keinen Antworttext enthält.
+    pub fn child_final_assistant_text_full(
+        &self,
+        child: &SessionId,
+    ) -> Result<String, AgentSpawnError> {
         self.child_record(child)
             .ok_or_else(|| Self::reject(format!("child {child} is not admitted")))?;
         let manager = self
@@ -2706,8 +3205,7 @@ impl ManagedAgentSpawner {
             })
             .filter(|text: &String| !text.is_empty())
             .ok_or_else(|| Self::reject(format!("child {child} has no assistant response text")))?;
-
-        Ok(cap_child_return_text(&text, CHILD_RETURN_MAX_BYTES))
+        Ok(text)
     }
 
     #[must_use]
@@ -2965,6 +3463,9 @@ impl ManagedAgentSpawner {
     }
 
     fn mark_expired(&self, expired: &[ExpiredChild]) {
+        for record in expired {
+            self.forget_child_state(&record.child);
+        }
         if let Ok(mut tombstones) = self.expired.lock() {
             for record in expired {
                 tombstones.insert(record.child.as_str().to_owned(), record.clone());
@@ -3092,7 +3593,113 @@ impl ManagedAgentSpawner {
         input: TurnInput,
         budget: AgentBudget,
     ) -> Result<ChildRunResult, AgentSpawnError> {
+        // Budget-Anrechnung: Ausgangsstand vor dem Lauf. Solange das Kind
+        // nicht läuft, liegt seine Session im Manager; fehlt sie, zählt der
+        // Lauf ab 0 (der Lauf selbst scheitert dann ohnehin).
+        let baseline_tokens = self.child_token_usage(child).unwrap_or(0);
+        let baseline_tool_calls = self.child_tool_call_count(child).unwrap_or(0);
         let started = std::time::Instant::now();
+        let result = self
+            .enforce_child_budget(child, store, approvals, input, budget, started)
+            .await;
+        // Auch ein gescheiterter oder über das Budget gelaufener Lauf hat
+        // verbraucht — die Anrechnung erfolgt auf jedem Ausgang. Ist die
+        // Session inzwischen verworfen, gilt der Ausgangsstand (Differenz 0).
+        let usage = ChildUsage {
+            tokens: self
+                .child_token_usage(child)
+                .unwrap_or(baseline_tokens)
+                .saturating_sub(baseline_tokens),
+            tool_calls: self
+                .child_tool_call_count(child)
+                .unwrap_or(baseline_tool_calls)
+                .saturating_sub(baseline_tool_calls),
+            wall_time_ms: u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
+        };
+        self.charge_run_usage(child, usage);
+        result.map(|mut run| {
+            run.usage = usage;
+            run
+        })
+    }
+
+    /// Rechnet den Verbrauch eines Laufs dem Kind an und reicht die noch
+    /// nicht verrechnete Differenz an den direkten Elternteil weiter.
+    ///
+    /// # Beschreibung
+    /// Die Weitergabe geht genau **eine** Ebene nach oben: der Elternteil
+    /// verrechnet seinerseits erst, wenn sein eigener Lauf endet oder er
+    /// freigegeben wird. Ein Elternteil ohne Record (Wurzel) wird nicht
+    /// belastet. Unbekannte Kinder sind ein No-op.
+    ///
+    /// # Concurrency
+    /// Nimmt kurz den `active`-Lock.
+    fn charge_run_usage(&self, child: &SessionId, run: ChildUsage) {
+        let Ok(mut active) = self.active.lock() else {
+            tracing::warn!(child = %child, "child_budget.charge_lock_poisoned");
+            return;
+        };
+        let Some(record) = active.get_mut(child.as_str()) else {
+            return;
+        };
+        record.consumed = record.consumed.saturating_add(run);
+        let delta = record.consumed.saturating_sub(record.charged_to_parent);
+        record.charged_to_parent = record.consumed;
+        let parent = record.parent.as_str().to_owned();
+        if let Some(parent_record) = active.get_mut(&parent) {
+            parent_record.consumed = parent_record.consumed.saturating_add(delta);
+        }
+    }
+
+    /// Rechnet einem Elternteil den noch offenen Verbrauch eines eben
+    /// freigegebenen Kindes an (Nachkommen, die erst nach dem letzten Lauf
+    /// des Kindes abgeschlossen wurden).
+    fn charge_released_child(&self, record: &ChildRecord) {
+        let delta = record.consumed.saturating_sub(record.charged_to_parent);
+        if delta == ChildUsage::default() {
+            return;
+        }
+        match self.active.lock() {
+            Ok(mut active) => {
+                if let Some(parent) = active.get_mut(record.parent.as_str()) {
+                    parent.consumed = parent.consumed.saturating_add(delta);
+                }
+            }
+            Err(_) => tracing::warn!(child = %record.child, "child_budget.charge_lock_poisoned"),
+        }
+    }
+
+    /// Restbudget einer admittierten Sitzung: ihr Budget-Deckel abzüglich
+    /// des bisher angerechneten Verbrauchs (eigener plus Nachkommen).
+    ///
+    /// # Argumente
+    /// - `session` (`&SessionId`): ein admittiertes Kind.
+    ///
+    /// # Returns
+    /// `Some(AgentBudget)` mit dimensionsweise abgezogenem Verbrauch (nicht
+    /// gesetzte Dimensionen bleiben nicht gesetzt, gesetzte sättigen bei 0);
+    /// `None` für unbekannte Sitzungen (auch Wurzeln ohne Record) oder bei
+    /// vergifteter Registry-Sperre.
+    ///
+    /// # Concurrency
+    /// Nimmt kurz den `active`-Lock.
+    #[must_use]
+    pub fn remaining_budget(&self, session: &SessionId) -> Option<AgentBudget> {
+        self.child_record(session)
+            .map(|record| budget_minus_usage(record.budget, record.consumed))
+    }
+
+    /// Setzt `budget` für einen Lauf durch (Kern von
+    /// [`Self::run_child_with_budget`], ohne Verbrauchsanrechnung).
+    async fn enforce_child_budget(
+        &self,
+        child: &SessionId,
+        store: &dyn StateStore,
+        approvals: Option<&ApprovalStore>,
+        input: TurnInput,
+        budget: AgentBudget,
+        started: std::time::Instant,
+    ) -> Result<ChildRunResult, AgentSpawnError> {
         let mut turn = Box::pin(self.run_child_with_approvals(child, store, approvals, input));
 
         let outcome = match budget.max_wall_time_ms {
@@ -3120,9 +3727,11 @@ impl ManagedAgentSpawner {
                             );
                             drop(turn);
                         }
-                        self.set_status(child, ChildStatus::Failed);
                         let used_ms =
                             u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
+                        let error =
+                            Self::budget_exceeded(BudgetDimension::WallTime, limit_ms, used_ms);
+                        self.set_failed(child, &error.message);
                         tracing::warn!(
                             child = %child,
                             dimension = BudgetDimension::WallTime.as_str(),
@@ -3130,11 +3739,7 @@ impl ManagedAgentSpawner {
                             used = used_ms,
                             "child_budget.exceeded",
                         );
-                        return Err(Self::budget_exceeded(
-                            BudgetDimension::WallTime,
-                            limit_ms,
-                            used_ms,
-                        ));
+                        return Err(error);
                     }
                 }
             }
@@ -3145,7 +3750,6 @@ impl ManagedAgentSpawner {
         if let Some(limit) = budget.max_tool_calls {
             let used = self.child_tool_call_count(child)?;
             if used > limit {
-                self.set_status(child, ChildStatus::Failed);
                 tracing::warn!(
                     child = %child,
                     dimension = BudgetDimension::ToolCalls.as_str(),
@@ -3153,17 +3757,18 @@ impl ManagedAgentSpawner {
                     used = used,
                     "child_budget.exceeded",
                 );
-                return Err(Self::budget_exceeded(
+                let error = Self::budget_exceeded(
                     BudgetDimension::ToolCalls,
                     u64::from(limit),
                     u64::from(used),
-                ));
+                );
+                self.set_failed(child, &error.message);
+                return Err(error);
             }
         }
         if let Some(limit) = budget.max_tokens {
             let used = self.child_token_usage(child)?;
             if used > limit {
-                self.set_status(child, ChildStatus::Failed);
                 tracing::warn!(
                     child = %child,
                     dimension = BudgetDimension::Tokens.as_str(),
@@ -3171,7 +3776,9 @@ impl ManagedAgentSpawner {
                     used = used,
                     "child_budget.exceeded",
                 );
-                return Err(Self::budget_exceeded(BudgetDimension::Tokens, limit, used));
+                let error = Self::budget_exceeded(BudgetDimension::Tokens, limit, used);
+                self.set_failed(child, &error.message);
+                return Err(error);
             }
         }
         Ok(outcome)
@@ -3492,7 +4099,7 @@ impl ManagedAgentSpawner {
         child: &SessionId,
         store: &dyn StateStore,
         approvals: Option<&ApprovalStore>,
-        input: TurnInput,
+        mut input: TurnInput,
     ) -> Result<ChildRunResult, AgentSpawnError> {
         let record = self
             .child_record(child)
@@ -3538,6 +4145,18 @@ impl ManagedAgentSpawner {
             child: child.clone(),
             session: Some(session),
         };
+        // Der bei der Admission hinterlegte Auftrag wird genau einmal
+        // verbraucht: vom ersten Lauf. Bringt dieser keinen eigenen User-Text
+        // mit (z. B. `TurnInput::default()`), wird der Auftrag sein User-Turn;
+        // der Steuerblock des Aufrufers bleibt erhalten.
+        let pending_task = self.take_pending_task(child);
+        let has_user_text = input
+            .user_text
+            .as_deref()
+            .is_some_and(|text| !text.trim().is_empty());
+        if !has_user_text && let Some(task) = pending_task {
+            input.user_text = Some(task);
+        }
 
         let turn = {
             let session = running.session_mut()?;
@@ -3579,12 +4198,11 @@ impl ManagedAgentSpawner {
             Err(error) => {
                 // Nur echter Abschluss ist `Completed`: Abbruch und Fehler
                 // werden unterschieden und nie als Erfolg verbucht.
-                let status = if token.is_cancelled() {
-                    ChildStatus::Cancelled
+                if token.is_cancelled() {
+                    self.set_status(child, ChildStatus::Cancelled);
                 } else {
-                    ChildStatus::Failed
-                };
-                self.set_status(child, status);
+                    self.set_failed(child, &error.message);
+                }
                 return Err(error);
             }
         };
@@ -3597,23 +4215,46 @@ impl ManagedAgentSpawner {
         let pause_label = Self::pause_label(&outcome);
         match pause_label {
             Some(label) if !record.allow_pause => {
-                self.set_status(child, ChildStatus::Failed);
-                Err(Self::reject(format!(
-                    "child paused but its lifecycle forbids pausing: {label}"
-                )))
+                let reason = format!("child paused but its lifecycle forbids pausing: {label}");
+                self.set_failed(child, &reason);
+                Err(Self::reject(reason))
             }
             Some(_) => {
                 self.set_status(child, ChildStatus::Paused);
                 Ok(ChildRunResult {
                     child: child.clone(),
                     outcome,
+                    full_text: None,
+                    usage: ChildUsage::default(),
                 })
             }
             None => {
+                // Ungekürzt für typisierte Verträge; fehlt Antworttext, bleibt
+                // `full_text` leer (der Aufrufer fällt dann auf
+                // `child_final_assistant_text` und dessen Fehler zurück).
+                let full_text = match &outcome {
+                    TurnOutcome::Completed => self.child_final_assistant_text_full(child).ok(),
+                    _ => None,
+                };
+                match (&outcome, full_text.as_deref()) {
+                    (_, Some(text)) => self.set_outcome_detail(child, text),
+                    (TurnOutcome::Failed { reason }, None) => {
+                        self.set_outcome_detail(child, reason);
+                    }
+                    (
+                        TurnOutcome::Refused {
+                            detail: Some(detail),
+                        },
+                        None,
+                    ) => self.set_outcome_detail(child, detail),
+                    _ => {}
+                }
                 self.set_status(child, ChildStatus::Completed);
                 Ok(ChildRunResult {
                     child: child.clone(),
                     outcome,
+                    full_text,
+                    usage: ChildUsage::default(),
                 })
             }
         }
@@ -4164,6 +4805,55 @@ impl ManagedAgentSpawner {
             ))));
         }
 
+        // Budget-Anrechnung: ein Kind darf nie mehr bekommen, als seinem
+        // Elternteil noch bleibt (Budget minus angerechneter Verbrauch). Ein
+        // Elternteil ohne Record (Wurzel) setzt keinen Deckel. Ist eine
+        // gesetzte Dimension erschöpft, wird fail-closed abgelehnt.
+        let child_budget = match active.get(input.parent_session_id.as_str()) {
+            Some(parent_record) => {
+                let remaining = budget_minus_usage(parent_record.budget, parent_record.consumed);
+                let exhausted = [
+                    (
+                        BudgetDimension::Tokens,
+                        parent_record.budget.max_tokens,
+                        remaining.max_tokens,
+                        parent_record.consumed.tokens,
+                    ),
+                    (
+                        BudgetDimension::ToolCalls,
+                        parent_record.budget.max_tool_calls.map(u64::from),
+                        remaining.max_tool_calls.map(u64::from),
+                        u64::from(parent_record.consumed.tool_calls),
+                    ),
+                    (
+                        BudgetDimension::WallTime,
+                        parent_record.budget.max_wall_time_ms,
+                        remaining.max_wall_time_ms,
+                        parent_record.consumed.wall_time_ms,
+                    ),
+                ]
+                .into_iter()
+                .find_map(|(dimension, limit, left, used)| match (limit, left) {
+                    (Some(limit), Some(0)) => Some((dimension, limit, used)),
+                    _ => None,
+                });
+                if let Some((dimension, limit, used)) = exhausted {
+                    tracing::warn!(
+                        parent = %input.parent_session_id,
+                        dimension = dimension.as_str(),
+                        limit = limit,
+                        used = used,
+                        "child_admission.parent_budget_exhausted",
+                    );
+                    return Err(AdmitRejection::Other(Self::budget_exceeded(
+                        dimension, limit, used,
+                    )));
+                }
+                tighten_agent_budget(child_budget, remaining)
+            }
+            None => child_budget,
+        };
+
         sandbox
             .ensure_child_of(&parent_context.sandbox)
             .map_err(|error| Self::reject(format!("child sandbox escalation rejected: {error}")))?;
@@ -4361,6 +5051,16 @@ impl ManagedAgentSpawner {
             // keinen Moduswechsel überleben müssen — sie muss ihn überleben.
             child_session.narrow_base_activation(&parent_activation);
         }
+        // Welle 3: das Modell, das der Kind-Provider fest anspricht (z. B. ein
+        // `PinnedModelProvider` für Explorer/Worker). Die Factory ist die
+        // einzige Stelle, die das Provider-Routing kennt. `None` blockiert
+        // die Admission nicht — dann gilt das `active_model` der Session.
+        let child_pinned_model: Option<String> = definition
+            .registry_factory
+            .pinned_model_for_task(role_name, task_complexity);
+        // Für `ChildRecord::model`: gepinntes Modell, sonst `active_model`;
+        // gesetzt im Auto-Compact-Block unten, der die Kind-Session ohnehin liest.
+        let mut child_model: Option<String> = child_pinned_model.clone();
         // Addendum D: Auto-Compact-Policy des Kindes nach organisatorischer
         // Rolle. Root-/Sub-Orchestrator-Sessions bekommen zusätzlich zur
         // relativen Schwelle einen festen Deckel und ein Turn-Start-
@@ -4374,14 +5074,21 @@ impl ManagedAgentSpawner {
                     "child session {child} disappeared before the auto-compact policy was set: {error}"
                 ))
             })?;
-            // Kontextfenster des tatsächlich aktiven Kind-Modells (Resolver
-            // aus der Runtime: Config → Modellkatalog → 200 000). Die relative
-            // 70 %-Schwelle gilt gegen dieses Fenster; der feste Deckel (s. u.)
-            // begrenzt zusätzlich die kumulierte Input-Nutzung langer
-            // Sessions (Standard: 500 000).
-            let window = self.context_window_for(
-                child_session.active_model().map(harw_types::ModelId::as_str),
-            );
+            // Kontextfenster des tatsächlich angesprochenen Kind-Modells
+            // (Resolver aus der Runtime: Config → Modellkatalog → 200 000).
+            // Ein gepinnter Kind-Provider (`ModelProvider::pinned_model_id`,
+            // z. B. ein `PinnedModelProvider` für Explorer/Worker) überschreibt
+            // das Modell jedes Requests — sein Fenster gilt, nicht das des
+            // `active_model` der Session. Die relative 70 %-Schwelle gilt gegen
+            // dieses Fenster; der feste Deckel (s. u., konfigurierbar über
+            // `with_compaction_ceiling`) begrenzt zusätzlich die kumulierte
+            // Input-Nutzung langer Sessions (Standard: 500 000).
+            let active_model = child_session
+                .active_model()
+                .map(|model| model.as_str().to_owned());
+            let model = child_pinned_model.clone().or(active_model);
+            child_model.clone_from(&model);
+            let window = self.context_window_for(model.as_deref());
             let history_budget = usize::try_from(window.saturating_mul(3)).unwrap_or(usize::MAX);
             let budget = child_session.context_budget();
             if history_budget > budget.max_history_bytes {
@@ -4390,8 +5097,15 @@ impl ManagedAgentSpawner {
                     max_history_bytes: history_budget,
                 });
             }
+            // Ausgabe-Reserve (Welle 3): ohne Config-Zugriff gilt der
+            // Standard (16 384, gedeckelt auf 15 % des Fensters); die Runtime
+            // setzt für die Wurzel ggf. einen konfigurierten Wert.
+            let reserve = crate::context_budget::output_reserve_tokens(window, None, None, false);
+            child_session.set_max_output_tokens(Some(reserve));
             let base_policy = crate::auto_compact::AutoCompactPolicy::for_context_window(window)
-                .with_absolute_ceiling(Some(crate::auto_compact::DEFAULT_ABSOLUTE_CEILING_TOKENS));
+                .with_absolute_ceiling(Some(self.compaction_ceiling()))
+                .with_output_reserve(reserve)
+                .with_fixed_overhead(CHILD_FIXED_OVERHEAD_TOKENS);
             let policy = match definition.organizational_role {
                 harw_agent_dsl::roles::AgentRoleId::RootOrchestrator
                 | harw_agent_dsl::roles::AgentRoleId::ChildOrchestrator => base_policy
@@ -4420,6 +5134,29 @@ impl ManagedAgentSpawner {
                     "child session {child} disappeared before the progress observer was attached"
                 ))
             })?;
+            // Welle 3: Vorgabe-Turn-Grenzen des Kindes. Bereits gesetzte
+            // Grenzen bleiben erhalten; nur eine fehlende Kappung der
+            // Werkzeugergebnisse wird auf `CHILD_TOOL_RESULT_MAX_BYTES` gesetzt.
+            let mut limits = child_session
+                .default_turn_limits()
+                .unwrap_or_else(crate::turn_loop::TurnLimits::unlimited);
+            if limits.tool_result_max_bytes == usize::MAX {
+                limits.tool_result_max_bytes = CHILD_TOOL_RESULT_MAX_BYTES;
+            }
+            let child_session = child_session.with_default_turn_limits(limits);
+            // Welle 3: Resolver an die Kind-Session, damit ein späterer
+            // Modellwechsel (`set_active_model`) Policy und History-Budget neu
+            // skaliert. Bei gepinntem Kind-Modell bleibt dessen Fenster
+            // maßgeblich — der Pin überschreibt jedes Request-Modell.
+            let child_session = match self.context_window_resolver.clone() {
+                Some(resolver) => {
+                    let pinned = child_pinned_model.clone();
+                    let scoped: Arc<ContextWindowResolver> =
+                        Arc::new(move |model: Option<&str>| resolver(pinned.as_deref().or(model)));
+                    child_session.with_context_window_resolver(scoped)
+                }
+                None => child_session,
+            };
             let child_session = child_session
                 .with_progress_observer(Some(self.progress_observer()))
                 .with_guard_policy(Some(self.guard_policy))
@@ -4465,7 +5202,24 @@ impl ManagedAgentSpawner {
         // auf SpawnContext.
         let root_session_id = Self::root_from_active(&active, &input.parent_session_id)
             .ok_or_else(|| Self::reject("child parent lineage contains a cycle"))?;
-        let task = input.instructions.clone();
+        // Auftrag des Kindes: `instructions`, sonst ein nicht leerer
+        // `context`. Der ungekürzte Text wird als `pending_task` für den
+        // ersten Lauf mit leerem `TurnInput` hinterlegt, sein Kurzkopf
+        // speist `AgentOrchestrationEvent::task`.
+        let pending_task = spawn_task_text(input.instructions.as_deref(), &input.context);
+        let task = pending_task.as_deref().and_then(orchestration_detail_head);
+        // Liegt der Elternteil mit laufendem Turn im Manager, bekommt das
+        // Kind sofort dessen Live-Kanal als Fortschritts-Senke; sonst muss
+        // der Aufrufer `attach_child_progress_sink` nutzen.
+        let parent_progress = manager
+            .get(&input.parent_session_id)
+            .ok()
+            .and_then(|parent| {
+                parent
+                    .current_turn()
+                    .cloned()
+                    .map(|turn_id| (turn_id, parent.live_emitter()))
+            });
         let record = ChildRecord {
             live: crate::child_controller::ChildLiveStats::default(),
             child: child.clone(),
@@ -4481,6 +5235,9 @@ impl ManagedAgentSpawner {
             trace: child_trace,
             status: ChildStatus::Admitted,
             task_complexity,
+            model: child_model,
+            consumed: ChildUsage::default(),
+            charged_to_parent: ChildUsage::default(),
         };
         if let Some(lease_store) = &self.lease_store {
             if let Err(error) = lease_store.admit(&record.durable_lease()) {
@@ -4518,6 +5275,34 @@ impl ManagedAgentSpawner {
                 .child()
         };
         cancellations.insert(child.as_str().to_owned(), child_cancel);
+        match self.child_tasks.lock() {
+            Ok(mut tasks) => {
+                tasks.insert(
+                    child.as_str().to_owned(),
+                    ChildTaskState {
+                        pending_task,
+                        task: task.clone(),
+                        outcome_detail: None,
+                    },
+                );
+            }
+            Err(_) => tracing::warn!(child = %child, "child_task_state.lock_poisoned"),
+        }
+        if let Some((turn_id, emitter)) = parent_progress {
+            match self.progress_sinks.lock() {
+                Ok(mut sinks) => {
+                    sinks.insert(
+                        child.as_str().to_owned(),
+                        ChildProgressSink {
+                            turn_id,
+                            emitter,
+                            last_emitted: None,
+                        },
+                    );
+                }
+                Err(_) => tracing::warn!(child = %child, "child_progress.attach_lock_poisoned"),
+            }
+        }
         // Never invoke runtime code while controller locks are live: an
         // observer may persist synchronously or inspect the tree.
         drop(cancellations);
@@ -5178,6 +5963,9 @@ specialization = "child-controller-test"
             trace: None,
             status: ChildStatus::Admitted,
             task_complexity: None,
+            model: None,
+            consumed: ChildUsage::default(),
+            charged_to_parent: ChildUsage::default(),
         };
         if let Some(lease_store) = lease_store {
             lease_store
@@ -5524,6 +6312,9 @@ specialization = "child-controller-test"
                         trace: None,
                         status: ChildStatus::Admitted,
                         task_complexity: None,
+                        model: None,
+                        consumed: ChildUsage::default(),
+                        charged_to_parent: ChildUsage::default(),
                     },
                 );
             spawner
@@ -5613,6 +6404,9 @@ specialization = "child-controller-test"
                         trace: None,
                         status: ChildStatus::Admitted,
                         task_complexity: None,
+                        model: None,
+                        consumed: ChildUsage::default(),
+                        charged_to_parent: ChildUsage::default(),
                     },
                 );
             spawner
@@ -6050,6 +6844,15 @@ specialization = "child-controller-test"
                     Arc::new(HangingModel)
                 };
                 Ok(model)
+            }
+
+            // Die Admission darf den Sieger-Provider nicht vorab verbrauchen.
+            fn pinned_model_for_task(
+                &self,
+                _role: &str,
+                _complexity: Option<TaskComplexity>,
+            ) -> Option<String> {
+                None
             }
         }
 
@@ -7330,6 +8133,9 @@ max_trust = "instruction"
             trace: Some(trace.clone()),
             status: ChildStatus::Admitted,
             task_complexity: None,
+            model: None,
+            consumed: ChildUsage::default(),
+            charged_to_parent: ChildUsage::default(),
         };
 
         let lease = record.durable_lease();
@@ -7854,6 +8660,9 @@ admitted = ["fs.read", "shell.exec"]
                     trace: None,
                     status: ChildStatus::Admitted,
                     task_complexity: None,
+                    model: None,
+                    consumed: ChildUsage::default(),
+                    charged_to_parent: ChildUsage::default(),
                 },
             );
         child
@@ -8180,6 +8989,745 @@ max_depth = 0
         };
 
         assert_eq!(rejection.message, "child depth 2 exceeds maximum 1");
+        Ok(())
+    }
+
+    // --- Runde 2 / Welle 1: Auftrag, Detail, Volltext, ChildProgress -------
+
+    #[test]
+    fn admission_seeds_pending_task_from_instructions_and_context() -> TestResult {
+        let (events, _receiver) = mpsc::unbounded_channel();
+        let manager = Arc::new(Mutex::new(SessionManager::new(events)));
+        let sandbox = test_sandbox(PermissionSet::from_policy([Permission::ReadWorkspace]))?;
+        let parent = SessionId::new();
+        let spawner = worker_spawner(manager)
+            .with_external_root_parent(
+                parent.clone(),
+                external_root_context(
+                    sandbox.clone(),
+                    harw_agent_dsl::roles::AgentRoleId::RootOrchestrator,
+                ),
+                Some(ReasoningEffort::Medium),
+                SessionActivation::default(),
+            )
+            .map_err(ctx("trusted external root registers during construction"))?;
+
+        let mut with_instructions = spawn_input(parent.clone());
+        with_instructions.instructions = Some("Analysiere das Modul".to_owned());
+        let first = spawner
+            .admit("worker", with_instructions, sandbox.clone(), None)
+            .map_err(ctx("child with instructions admits"))?;
+        let state = spawner
+            .child_task_state(&first)
+            .ok_or(TestError::Missing("task state is seeded"))?;
+        assert_eq!(state.pending_task.as_deref(), Some("Analysiere das Modul"));
+        assert_eq!(state.task.as_deref(), Some("Analysiere das Modul"));
+
+        let mut with_context = spawn_input(parent.clone());
+        with_context.context = serde_json::json!({"question": "Wo liegt der Fehler?"});
+        let second = spawner
+            .admit("worker", with_context, sandbox.clone(), None)
+            .map_err(ctx("child with context admits"))?;
+        let state = spawner
+            .child_task_state(&second)
+            .ok_or(TestError::Missing("task state is seeded"))?;
+        assert_eq!(
+            state.pending_task.as_deref(),
+            Some(r#"{"question":"Wo liegt der Fehler?"}"#)
+        );
+
+        let third = spawner
+            .admit("worker", spawn_input(parent), sandbox, None)
+            .map_err(ctx("child without task admits"))?;
+        let state = spawner
+            .child_task_state(&third)
+            .ok_or(TestError::Missing("task state exists"))?;
+        assert_eq!(state.pending_task, None);
+        assert_eq!(state.task, None);
+        Ok(())
+    }
+
+    /// Liest alle User-Texte aus dem Verlauf eines Kindes.
+    fn child_user_texts(
+        spawner: &ManagedAgentSpawner,
+        child: &SessionId,
+    ) -> TestResult<Vec<String>> {
+        let manager = spawner
+            .manager
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let session = manager.get(child).map_err(ctx("child is manager-owned"))?;
+        Ok(session
+            .history()
+            .items()
+            .iter()
+            .filter_map(|item| match item {
+                TurnItem::UserMessage(message) => Some(
+                    message
+                        .content
+                        .iter()
+                        .filter_map(|part| match part {
+                            ContentPart::Text { text } => Some(text.as_str()),
+                            ContentPart::ImageUrl { .. } => None,
+                        })
+                        .collect::<String>(),
+                ),
+                _ => None,
+            })
+            .collect())
+    }
+
+    fn seed_pending_task(spawner: &ManagedAgentSpawner, child: &SessionId, task: &str) {
+        spawner
+            .child_tasks
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .insert(
+                child.as_str().to_owned(),
+                ChildTaskState {
+                    pending_task: Some(task.to_owned()),
+                    task: orchestration_detail_head(task),
+                    outcome_detail: None,
+                },
+            );
+    }
+
+    #[tokio::test]
+    async fn first_run_with_empty_input_receives_the_pending_task() -> TestResult {
+        let (spawner, children) = runnable_children(
+            Arc::new(EchoChildRegistry { reply: "erledigt" }),
+            true,
+            1,
+            empty_registry,
+        )?;
+        let child = children[0].clone();
+        seed_pending_task(&spawner, &child, "Fasse die Datei zusammen");
+        let store = InMemoryStateStore::new();
+
+        let result = spawner
+            .run_child(&child, &store, TurnInput::default())
+            .await
+            .map_err(ctx("child with a pending task runs"))?;
+
+        assert!(matches!(result.outcome, TurnOutcome::Completed));
+        let texts = child_user_texts(&spawner, &child)?;
+        assert!(
+            texts.iter().any(|text| text == "Fasse die Datei zusammen"),
+            "pending task must become the user turn: {texts:?}"
+        );
+        let state = spawner
+            .child_task_state(&child)
+            .ok_or(TestError::Missing("task state remains until release"))?;
+        assert_eq!(
+            state.pending_task, None,
+            "the task is consumed exactly once"
+        );
+        assert_eq!(result.full_text.as_deref(), Some("erledigt"));
+        assert_eq!(state.outcome_detail.as_deref(), Some("erledigt"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn explicit_user_text_wins_and_still_consumes_the_pending_task() -> TestResult {
+        let (spawner, children) = runnable_children(
+            Arc::new(EchoChildRegistry { reply: "erledigt" }),
+            true,
+            1,
+            empty_registry,
+        )?;
+        let child = children[0].clone();
+        seed_pending_task(&spawner, &child, "Auftrag aus der Admission");
+        let store = InMemoryStateStore::new();
+
+        spawner
+            .run_child(&child, &store, TurnInput::user("expliziter Auftrag"))
+            .await
+            .map_err(ctx("child runs with explicit text"))?;
+
+        let texts = child_user_texts(&spawner, &child)?;
+        assert!(texts.iter().any(|text| text == "expliziter Auftrag"));
+        assert!(
+            !texts
+                .iter()
+                .any(|text| text.contains("Auftrag aus der Admission")),
+            "explicit user text must not be replaced: {texts:?}"
+        );
+        let state = spawner
+            .child_task_state(&child)
+            .ok_or(TestError::Missing("task state remains until release"))?;
+        assert_eq!(state.pending_task, None);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn full_text_is_uncapped_while_the_plain_return_is_capped() -> TestResult {
+        let long: &'static str = Box::leak("x".repeat(CHILD_RETURN_MAX_BYTES * 2).into_boxed_str());
+        let (spawner, children) = runnable_children(
+            Arc::new(EchoChildRegistry { reply: long }),
+            true,
+            1,
+            empty_registry,
+        )?;
+        let child = children[0].clone();
+        let store = InMemoryStateStore::new();
+
+        let result = spawner
+            .run_child(&child, &store, TurnInput::user("liefere viel Text"))
+            .await
+            .map_err(ctx("child completes"))?;
+
+        assert_eq!(result.full_text.as_deref(), Some(long));
+        let capped = spawner
+            .child_final_assistant_text(&child)
+            .map_err(ctx("capped text is available"))?;
+        assert!(capped.len() < long.len());
+        assert!(capped.contains("gekürzt"));
+        let detail = spawner
+            .child_task_state(&child)
+            .and_then(|state| state.outcome_detail)
+            .ok_or(TestError::Missing("completion detail is recorded"))?;
+        assert_eq!(detail.chars().count(), ORCHESTRATION_DETAIL_MAX_CHARS);
+        Ok(())
+    }
+
+    #[test]
+    fn orchestration_detail_head_truncates_on_char_boundaries() {
+        assert_eq!(orchestration_detail_head(""), None);
+        assert_eq!(orchestration_detail_head(" \n\t "), None);
+        assert_eq!(
+            orchestration_detail_head("  genau so  "),
+            Some("genau so".to_owned())
+        );
+
+        let exact = "é".repeat(ORCHESTRATION_DETAIL_MAX_CHARS);
+        assert_eq!(orchestration_detail_head(&exact), Some(exact.clone()));
+
+        let long = "日本".repeat(ORCHESTRATION_DETAIL_MAX_CHARS);
+        let head = orchestration_detail_head(&long).unwrap_or_default();
+        assert_eq!(head.chars().count(), ORCHESTRATION_DETAIL_MAX_CHARS);
+        assert!(head.ends_with('…'));
+        assert!(long.starts_with(head.trim_end_matches('…')));
+    }
+
+    /// Beobachter, der jedes Orchestrierungs-Event aufzeichnet.
+    #[derive(Default)]
+    struct RecordingOrchestrationObserver {
+        events: Mutex<Vec<AgentOrchestrationEvent>>,
+    }
+
+    impl OrchestrationObserver for RecordingOrchestrationObserver {
+        fn on_orchestration_event(&self, event: AgentOrchestrationEvent) {
+            self.events
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .push(event);
+        }
+    }
+
+    #[tokio::test]
+    async fn failed_release_event_carries_task_and_truncated_reason() -> TestResult {
+        let (spawner, children) =
+            runnable_children(Arc::new(ToolCallingChildRegistry), true, 1, empty_registry)?;
+        let observer = Arc::new(RecordingOrchestrationObserver::default());
+        let spawner = spawner.with_orchestration_observer(observer.clone());
+        let child = children[0].clone();
+        let long_task = format!("Aufgabe {}", "ü".repeat(900));
+        seed_pending_task(&spawner, &child, &long_task);
+        let long_reason = "grund ".repeat(300);
+        spawner.set_failed(&child, &long_reason);
+
+        spawner
+            .release_child(&child)
+            .map_err(ctx("failed child releases"))?;
+
+        let events = observer
+            .events
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone();
+        let event = events
+            .iter()
+            .find(|event| event.status == AgentOrchestrationStatus::Failed)
+            .ok_or(TestError::Missing("failed event is emitted"))?;
+        let task = event
+            .task
+            .as_deref()
+            .ok_or(TestError::Missing("task head is filled"))?;
+        assert_eq!(task.chars().count(), ORCHESTRATION_DETAIL_MAX_CHARS);
+        assert!(task.starts_with("Aufgabe ü"));
+        let detail = event
+            .detail
+            .as_deref()
+            .ok_or(TestError::Missing("failure reason is filled"))?;
+        assert!(detail.chars().count() <= ORCHESTRATION_DETAIL_MAX_CHARS);
+        assert!(detail.starts_with("grund grund"));
+        assert!(
+            spawner.child_task_state(&child).is_none(),
+            "release forgets the task state"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn child_progress_is_emitted_to_the_attached_sink_and_throttled() -> TestResult {
+        let (spawner, child) = spawner_with_admitted_child()?;
+        let (events, _session_events) = mpsc::unbounded_channel();
+        let (turn_tx, mut turn_rx) = mpsc::unbounded_channel();
+        let parent = AgentSession::new(
+            AgentRole::Agent {
+                name: "parent".to_owned(),
+            },
+            None,
+            ExtensionRegistryBuilder::default().build(),
+            events,
+        )
+        .with_turn_event_sink(turn_tx);
+        let turn_id = TurnId::new();
+        assert!(spawner.attach_child_progress_sink(&child, turn_id.clone(), parent.live_emitter()));
+        assert!(!spawner.attach_child_progress_sink(
+            &SessionId::new(),
+            turn_id.clone(),
+            parent.live_emitter()
+        ));
+
+        let record = spawner
+            .child_record(&child)
+            .ok_or(TestError::Missing("child is tracked"))?;
+        let start = std::time::Instant::now();
+        assert!(emit_child_progress(&spawner.progress_sinks, &record, start));
+        assert!(!emit_child_progress(
+            &spawner.progress_sinks,
+            &record,
+            start + Duration::from_millis(100)
+        ));
+        assert!(emit_child_progress(
+            &spawner.progress_sinks,
+            &record,
+            start + CHILD_PROGRESS_MIN_INTERVAL
+        ));
+
+        let mut received = Vec::new();
+        while let Ok(event) = turn_rx.try_recv() {
+            received.push(event);
+        }
+        assert_eq!(received.len(), 2);
+        match &received[0] {
+            TurnEvent::ChildProgress {
+                turn_id: got_turn,
+                child: got_child,
+                tool_calls,
+                tokens,
+            } => {
+                assert_eq!(got_turn, &turn_id);
+                assert_eq!(got_child, &child);
+                assert_eq!(*tool_calls, 0);
+                assert_eq!(*tokens, 0);
+            }
+            other => {
+                return Err(TestError::Unexpected(format!(
+                    "unerwartetes Event: {other:?}"
+                )));
+            }
+        }
+
+        spawner.close_child(&child);
+        assert!(!emit_child_progress(
+            &spawner.progress_sinks,
+            &record,
+            start + CHILD_PROGRESS_MIN_INTERVAL * 4
+        ));
+        Ok(())
+    }
+
+    // --- Welle 3: Kontextfenster, Ausgabe-Reserve und Turn-Grenzen ---
+
+    /// Registry-Factory, deren Kind-Provider auf ein festes Modell gepinnt
+    /// ist (wie `RuntimeChildRegistryFactory` für Explorer/Worker).
+    struct PinnedChildRegistry {
+        model: &'static str,
+    }
+
+    impl ChildRegistryFactory for PinnedChildRegistry {
+        fn build_registry(
+            &self,
+            _role: &str,
+            _input: &SpawnInput,
+            _suggestions: Option<&AgentSuggestions>,
+        ) -> Result<ExtensionRegistry, AgentSpawnError> {
+            Ok(ExtensionRegistryBuilder::default().build())
+        }
+
+        fn model_for(&self, _role: &str) -> Result<Arc<dyn ModelProvider>, AgentSpawnError> {
+            let inner: Arc<dyn ModelProvider> = Arc::new(EchoModelProvider::new("pinned"));
+            Ok(Arc::new(crate::pinned_model::PinnedModelProvider::new(
+                inner,
+                None,
+                Some(harw_types::ModelId::from(self.model)),
+            )))
+        }
+    }
+
+    fn window_test_resolver() -> Arc<ContextWindowResolver> {
+        Arc::new(|model: Option<&str>| match model {
+            Some("small-model") => 32_000,
+            Some("big-model") => 1_000_000,
+            _ => 200_000,
+        })
+    }
+
+    fn window_test_spawner(
+        registry: Arc<dyn ChildRegistryFactory>,
+        ceiling: Option<u64>,
+    ) -> TestResult<(ManagedAgentSpawner, SessionId, SandboxSpec)> {
+        let (events, _receiver) = mpsc::unbounded_channel();
+        let manager = Arc::new(Mutex::new(SessionManager::new(events)));
+        let sandbox = test_sandbox(PermissionSet::from_policy([Permission::ReadWorkspace]))?;
+        let parent = SessionId::new();
+        let spawner = ManagedAgentSpawner::new(manager, ChildLimits::conservative())
+            .with_role(
+                "worker",
+                AgentRole::Agent {
+                    name: "worker".to_owned(),
+                },
+                harw_agent_dsl::roles::AgentRoleId::Worker,
+                registry,
+            )
+            .with_context_window_resolver(window_test_resolver())
+            .with_compaction_ceiling(ceiling)
+            .with_external_root_parent(
+                parent.clone(),
+                external_root_context(
+                    sandbox.clone(),
+                    harw_agent_dsl::roles::AgentRoleId::RootOrchestrator,
+                ),
+                None,
+                SessionActivation::default(),
+            )
+            .map_err(ctx("trusted external root registers during construction"))?;
+        Ok((spawner, parent, sandbox))
+    }
+
+    #[test]
+    fn compaction_ceiling_defaults_to_the_standard_ceiling() {
+        let (events, _receiver) = mpsc::unbounded_channel();
+        let manager = Arc::new(Mutex::new(SessionManager::new(events)));
+        let spawner = ManagedAgentSpawner::new(manager, ChildLimits::conservative());
+        assert_eq!(
+            spawner.compaction_ceiling(),
+            crate::auto_compact::DEFAULT_ABSOLUTE_CEILING_TOKENS
+        );
+        let spawner = spawner.with_compaction_ceiling(Some(42_000));
+        assert_eq!(spawner.compaction_ceiling(), 42_000);
+    }
+
+    #[test]
+    fn admit_sizes_the_child_from_its_pinned_model_window() -> TestResult {
+        let (spawner, parent, sandbox) = window_test_spawner(
+            Arc::new(PinnedChildRegistry {
+                model: "small-model",
+            }),
+            Some(123_456),
+        )?;
+        let child = spawner
+            .admit("worker", spawn_input(parent), sandbox, None)
+            .map_err(ctx("child is admitted"))?;
+
+        let mut manager = spawner
+            .manager
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let session = manager
+            .get_mut(&child)
+            .map_err(ctx("child is manager-owned"))?;
+
+        let reserve = crate::context_budget::output_reserve_tokens(32_000, None, None, false);
+        let expected = crate::auto_compact::AutoCompactPolicy::for_context_window(32_000)
+            .with_absolute_ceiling(Some(123_456))
+            .with_output_reserve(reserve)
+            .with_fixed_overhead(CHILD_FIXED_OVERHEAD_TOKENS);
+        assert_eq!(
+            session.auto_compact().copied(),
+            Some(expected),
+            "das Fenster des gepinnten Modells (32 000) und der konfigurierte Deckel gelten"
+        );
+        assert_eq!(session.max_output_tokens(), Some(reserve));
+
+        let limits = session
+            .default_turn_limits()
+            .ok_or(TestError::Missing("child must carry default turn limits"))?;
+        assert_eq!(limits.tool_result_max_bytes, CHILD_TOOL_RESULT_MAX_BYTES);
+        assert_eq!(limits.tool_result_max_bytes, 65_536);
+        assert_eq!(limits.max_model_rounds, u32::MAX);
+
+        // Ein Modellwechsel darf das Fenster eines gepinnten Kindes nicht
+        // verschieben — der Pin überschreibt jedes Request-Modell.
+        session.set_active_model(Some(harw_types::ModelId::from("big-model")));
+        assert_eq!(
+            session
+                .auto_compact()
+                .map(crate::auto_compact::AutoCompactPolicy::context_window_tokens),
+            Some(32_000)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn admit_without_a_pin_uses_the_default_ceiling_and_rescales_on_model_change() -> TestResult {
+        let (spawner, parent, sandbox) = window_test_spawner(Arc::new(EmptyChildRegistry), None)?;
+        let child = spawner
+            .admit("worker", spawn_input(parent), sandbox, None)
+            .map_err(ctx("child is admitted"))?;
+
+        let mut manager = spawner
+            .manager
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let session = manager
+            .get_mut(&child)
+            .map_err(ctx("child is manager-owned"))?;
+
+        let reserve = crate::context_budget::output_reserve_tokens(200_000, None, None, false);
+        let expected = crate::auto_compact::AutoCompactPolicy::for_context_window(200_000)
+            .with_absolute_ceiling(Some(crate::auto_compact::DEFAULT_ABSOLUTE_CEILING_TOKENS))
+            .with_output_reserve(reserve)
+            .with_fixed_overhead(CHILD_FIXED_OVERHEAD_TOKENS);
+        assert_eq!(session.auto_compact().copied(), Some(expected));
+        assert_eq!(session.max_output_tokens(), Some(reserve));
+
+        // Die Kind-Session trägt den Resolver: ein Modellwechsel skaliert.
+        session.set_active_model(Some(harw_types::ModelId::from("big-model")));
+        assert_eq!(
+            session
+                .auto_compact()
+                .map(crate::auto_compact::AutoCompactPolicy::context_window_tokens),
+            Some(1_000_000)
+        );
+        Ok(())
+    }
+
+    // --- Budget-Anrechnung an den Elternteil --------------------------------
+
+    fn edit_record(
+        spawner: &ManagedAgentSpawner,
+        child: &SessionId,
+        edit: impl FnOnce(&mut ChildRecord),
+    ) -> TestResult {
+        let mut active = spawner
+            .active
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let record = active
+            .get_mut(child.as_str())
+            .ok_or(TestError::Missing("child record exists"))?;
+        edit(record);
+        Ok(())
+    }
+
+    fn consumed_of(spawner: &ManagedAgentSpawner, child: &SessionId) -> TestResult<ChildUsage> {
+        spawner
+            .child_record(child)
+            .map(|record| record.consumed)
+            .ok_or(TestError::Missing("child record exists"))
+    }
+
+    #[test]
+    fn remaining_budget_subtracts_consumption_and_keeps_unset_dimensions() -> TestResult {
+        let (spawner, children) = runnable_children(
+            Arc::new(EchoChildRegistry { reply: "done" }),
+            true,
+            1,
+            empty_registry,
+        )?;
+        let child = children[0].clone();
+        edit_record(&spawner, &child, |record| {
+            record.budget = AgentBudget {
+                max_tokens: Some(100),
+                max_wall_time_ms: Some(50),
+                ..AgentBudget::default()
+            };
+            record.consumed = ChildUsage {
+                tokens: 30,
+                tool_calls: 7,
+                wall_time_ms: 80,
+            };
+        })?;
+
+        let remaining = spawner
+            .remaining_budget(&child)
+            .ok_or(TestError::Missing("admitted child has a remaining budget"))?;
+        assert_eq!(remaining.max_tokens, Some(70));
+        assert_eq!(remaining.max_tool_calls, None, "unset stays unset");
+        assert_eq!(remaining.max_wall_time_ms, Some(0), "saturates at zero");
+        assert_eq!(spawner.remaining_budget(&SessionId::new()), None);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_finished_run_reports_its_usage_and_charges_the_direct_parent() -> TestResult {
+        let (spawner, children) = runnable_children(
+            Arc::new(EchoChildRegistry { reply: "done" }),
+            true,
+            2,
+            empty_registry,
+        )?;
+        let (parent, child) = (children[0].clone(), children[1].clone());
+        edit_record(&spawner, &child, |record| record.parent = parent.clone())?;
+        let store = InMemoryStateStore::new();
+
+        let result = spawner
+            .run_child_with_budget(
+                &child,
+                &store,
+                None,
+                TurnInput::user("work"),
+                AgentBudget::default(),
+            )
+            .await
+            .map_err(ctx("child run completes"))?;
+
+        assert_eq!(consumed_of(&spawner, &child)?, result.usage);
+        assert_eq!(consumed_of(&spawner, &parent)?, result.usage);
+        Ok(())
+    }
+
+    #[test]
+    fn usage_propagates_one_level_at_a_time_without_double_counting() -> TestResult {
+        let (spawner, children) = runnable_children(
+            Arc::new(EchoChildRegistry { reply: "done" }),
+            true,
+            3,
+            empty_registry,
+        )?;
+        let (top, middle, leaf) = (
+            children[0].clone(),
+            children[1].clone(),
+            children[2].clone(),
+        );
+        edit_record(&spawner, &middle, |record| record.parent = top.clone())?;
+        edit_record(&spawner, &leaf, |record| record.parent = middle.clone())?;
+
+        let run = ChildUsage {
+            tokens: 10,
+            tool_calls: 2,
+            wall_time_ms: 5,
+        };
+        spawner.charge_run_usage(&leaf, run);
+        assert_eq!(consumed_of(&spawner, &leaf)?, run);
+        assert_eq!(consumed_of(&spawner, &middle)?, run);
+        assert_eq!(
+            consumed_of(&spawner, &top)?,
+            ChildUsage::default(),
+            "only the direct parent is charged"
+        );
+
+        spawner.charge_run_usage(&middle, ChildUsage::default());
+        assert_eq!(consumed_of(&spawner, &top)?, run);
+        // Ein zweiter Lauf ohne neuen Verbrauch verbucht nichts doppelt.
+        spawner.charge_run_usage(&middle, ChildUsage::default());
+        assert_eq!(consumed_of(&spawner, &top)?, run);
+
+        // Nachträglicher Verbrauch des Blatts kommt über `close_child` nach oben.
+        edit_record(&spawner, &leaf, |record| {
+            record.consumed = record.consumed.saturating_add(ChildUsage {
+                tokens: 5,
+                ..ChildUsage::default()
+            });
+        })?;
+        spawner.close_child(&leaf);
+        assert_eq!(consumed_of(&spawner, &middle)?.tokens, 15);
+        spawner.close_child(&middle);
+        assert_eq!(consumed_of(&spawner, &top)?.tokens, 15);
+        assert_eq!(consumed_of(&spawner, &top)?.tool_calls, 2);
+        Ok(())
+    }
+
+    #[test]
+    fn admission_caps_the_child_budget_by_the_parents_remainder() -> TestResult {
+        let (events, _receiver) = mpsc::unbounded_channel();
+        let manager = Arc::new(Mutex::new(SessionManager::new(events.clone())));
+        let sandbox = test_sandbox(PermissionSet::from_policy([Permission::ReadWorkspace]))?;
+        let root_session = AgentSession::new(
+            AgentRole::Agent {
+                name: "root".to_owned(),
+            },
+            None,
+            ExtensionRegistryBuilder::default().build(),
+            events,
+        )
+        .with_spawn_context(SpawnContext {
+            sandbox: sandbox.clone(),
+            suggestions: None,
+            capability_snapshot: None,
+            approval_actor: None,
+            organizational_role: harw_agent_dsl::roles::AgentRoleId::RootOrchestrator,
+            allowed_child_orchestrators: vec!["manager".to_owned()],
+            trace: None,
+            ceiling: None,
+        });
+        let root = root_session.id().clone();
+        manager
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .restore(root_session)
+            .map_err(ctx("root session restores"))?;
+        let spawner = ManagedAgentSpawner::new(Arc::clone(&manager), ChildLimits::conservative())
+            .with_role(
+                "manager",
+                AgentRole::Agent {
+                    name: "manager".to_owned(),
+                },
+                harw_agent_dsl::roles::AgentRoleId::ChildOrchestrator,
+                Arc::new(EmptyChildRegistry),
+            )
+            .with_role(
+                "worker",
+                AgentRole::Agent {
+                    name: "worker".to_owned(),
+                },
+                harw_agent_dsl::roles::AgentRoleId::Worker,
+                Arc::new(EmptyChildRegistry),
+            );
+
+        let child = spawner
+            .admit("manager", spawn_input(root.clone()), sandbox.clone(), None)
+            .map_err(ctx("child is admitted"))?;
+        assert_eq!(
+            spawner.remaining_budget(&root),
+            None,
+            "a root has no record"
+        );
+        edit_record(&spawner, &child, |record| {
+            record.budget = AgentBudget {
+                max_tokens: Some(100),
+                ..AgentBudget::default()
+            };
+            record.consumed = ChildUsage {
+                tokens: 40,
+                ..ChildUsage::default()
+            };
+        })?;
+
+        let grandchild = spawner
+            .admit("worker", spawn_input(child.clone()), sandbox.clone(), None)
+            .map_err(ctx("grandchild is admitted inside the remainder"))?;
+        let capped = spawner
+            .child_budget(&grandchild)
+            .ok_or(TestError::Missing("grandchild is tracked"))?;
+        assert_eq!(capped.max_tokens, Some(60));
+        assert_eq!(capped.max_tool_calls, None);
+
+        edit_record(&spawner, &child, |record| {
+            record.consumed.tokens = 100;
+        })?;
+        let Err(error) = spawner.admit("worker", spawn_input(child), sandbox, None) else {
+            return Err(TestError::Unexpected(
+                "an exhausted parent budget must reject the admission".to_owned(),
+            ));
+        };
+        assert_eq!(
+            error.message,
+            "budget_exceeded: tokens (limit=100, used=100)"
+        );
         Ok(())
     }
 }

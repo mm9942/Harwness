@@ -1,10 +1,12 @@
 [package]
+publish.workspace = true
 name = "harw-tui"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+toml = { workspace = true }
 harw-authority = { path = "../harw-authority" }
 crossterm = "0.29.0"
 harw-agent-dsl = { path = "../harw-agent-dsl" }

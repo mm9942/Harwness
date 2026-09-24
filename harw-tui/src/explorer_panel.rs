@@ -18,7 +18,6 @@
 //! └──────────────────────────────────────┘
 //! ```
 
-
 use std::cell::Cell;
 use std::collections::HashSet;
 use std::io::Read;

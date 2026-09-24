@@ -1,0 +1,5 @@
+name = "typestate-and-illegal-states"
+description = "Use when ein Objekt einen Lebenszyklus oder Berechtigungsstufen hat (Draft→Submitted→Approved, Pending→Stored, Anonymous→Authenticated→Admin, Builder mit Pflichtfeldern) oder wenn Kombinationen aus Booleans/nullable Feldern ungültige Zustände erlauben — in TypeScript (discriminated unions, branded types), Python (Klassen pro Zustand, NewType, frozen dataclasses), Go (eigener Typ pro Zustand), Java (sealed + records) oder Rust (PhantomData-Typestate). Lehrt \"make illegal states unrepresentable\" und \"parse, don't validate\": ungültige Übergänge existieren gar nicht erst als Methode. Immer verwenden, wenn du `if (state !== ...) throw` oder `isValidated: boolean` schreiben willst. Sprachunabhängige Variante von rust-phantomdata-typestate."
+enabled = true
+instructions_file = "instructions.md"
+tools = ["filesystem.read"]

@@ -141,8 +141,8 @@ pub mod remote;
 pub mod runtime;
 pub mod spec;
 
-pub use catalog::{route, EmbeddingCatalog, EmbeddingRole, ModelEntry};
-pub use descriptor::{prepare_document, prepare_query, EmbeddingDescriptor};
+pub use catalog::{EmbeddingCatalog, EmbeddingRole, ModelEntry, route};
+pub use descriptor::{EmbeddingDescriptor, prepare_document, prepare_query};
 pub use embedder::{DeterministicEmbedder, DimensionCheckedEmbedder, Embedder};
 pub use error::{EmbedError, EmbedResult};
 pub use http_backend::HttpEmbedBackend;

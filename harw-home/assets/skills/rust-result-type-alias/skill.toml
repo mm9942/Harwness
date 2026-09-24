@@ -1,0 +1,5 @@
+name = "rust-result-type-alias"
+description = "Use when ein Rust-Modul oder Crate einen eigenen Fehlertyp definiert und Rückgabetypen kürzer schreiben will — lehrt den kanonischen `pub type Result<T>` Alias (Rust Edition 2024)"
+enabled = true
+instructions_file = "instructions.md"
+tools = ["filesystem.read"]

@@ -2220,7 +2220,33 @@ mod tests {
             !args.iter().any(|a| a == "/home/tester/.rustup"),
             "{args:?}"
         );
-        assert!(!args.iter().any(|a| a == "/home/tester/.cargo"), "{args:?}");
+        // `/home/tester/.cargo` darf nur als Einhängepunkt-Elternverzeichnis
+        // (`--dir`) des gebundenen PATH-Eintrags `/home/tester/.cargo/bin`
+        // auftauchen — ohne `--dir` kann bwrap den Eintrag nicht einhängen.
+        // Verboten ist die Bindung des ganzen Host-`cargo_home`-Baums bzw.
+        // eine konkurrierende CARGO_HOME-Umgebung.
+        assert_eq!(
+            count_window(&args, &["--dir", "/home/tester/.cargo"]),
+            1,
+            "{args:?}"
+        );
+        assert_eq!(
+            args.iter().filter(|a| *a == "/home/tester/.cargo").count(),
+            1,
+            "{args:?}"
+        );
+        assert_eq!(
+            count_window(
+                &args,
+                &[
+                    "--ro-bind-try",
+                    "/home/tester/.cargo/bin",
+                    "/home/tester/.cargo/bin"
+                ]
+            ),
+            1,
+            "{args:?}"
+        );
         // PATH: Cargo-bin der Sandbox vorangestellt, dahinter der volle
         // Host-PATH (C1: "bei gesetztem cargo_profile: dessen bin-Dir
         // voranstellen wie heute").

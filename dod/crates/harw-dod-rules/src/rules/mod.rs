@@ -7,8 +7,9 @@
 //!
 //! - [`EgressFlowRule`] — ein beobachteter ausgehender Fluss außerhalb des
 //!   erlaubten [`harw_authority::NetworkScope`].
-//! - [`StructureDriftRule`] — meldet neue Metriken, die in keiner Baseline
-//!   definiert sind.
+//! - [`StructureDriftRule`] — meldet jedes `EventKind::StructureDrift`-
+//!   Ereignis (Schwere aus dem strukturierten `DriftSeverity`-Feld) sowie
+//!   neue Metriken, die in keiner vorhandenen Baseline definiert sind.
 //! - [`BaselineDeviationRule`] — demonstriert die Baseline-Regel
 //!   (`Established` → `RuleTriggered`, `Provisional` → `Anomaly`) in einer
 //!   vollständigen `Rule::evaluate`-Auswertung; siehe [`crate::baseline`]-

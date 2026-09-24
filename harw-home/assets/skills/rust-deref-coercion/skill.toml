@@ -1,0 +1,5 @@
+name = "rust-deref-coercion"
+description = "Use when passing a smart-pointer or newtype wrapper (e.g. Zeroizing<Vec<u8>>, Box<T>, Arc<T>) to a function that expects &[u8] or &str — teaches how the compiler automatically chains Deref impls so no manual .as_slice()/.as_ref() is needed (Rust Edition 2024)"
+enabled = true
+instructions_file = "instructions.md"
+tools = ["filesystem.read"]
