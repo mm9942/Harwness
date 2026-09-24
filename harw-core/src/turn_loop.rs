@@ -8643,8 +8643,9 @@ mod tests {
     }
 
     /// Session mit dem Tool `lookup` (damit Turn-Requests Tools tragen),
-    /// optionaler Auto-Compact-Policy und zehn älteren Runden mit je einem
-    /// 20-KB-Tool-Ergebnis — genug Masse, die eine Verdichtung sicher
+    /// optionaler Auto-Compact-Policy und zwölf älteren Runden mit je einem
+    /// 20-KB-Tool-Ergebnis (rund 60–80 k Tokens, noch innerhalb des
+    /// 256-KiB-Verlaufsbudgets des Requests) — genug Masse, die eine Verdichtung sicher
     /// verkleinert.
     fn bulky_session(policy: Option<crate::auto_compact::AutoCompactPolicy>) -> AgentSession {
         let mut session = make_session(
@@ -8652,7 +8653,7 @@ mod tests {
             SessionActivation::new(ToolProfile::Full),
         )
         .with_auto_compact(policy);
-        for i in 0..10 {
+        for i in 0..12 {
             let call_id = ToolCallId::new();
             session.history_mut().push_user_text(format!("frage {i}"));
             session.history_mut().push_tool_call(
@@ -8739,7 +8740,7 @@ mod tests {
     #[tokio::test]
     async fn pending_compaction_runs_an_emergency_compaction_before_the_first_request() -> TestResult
     {
-        let policy = crate::auto_compact::AutoCompactPolicy::for_context_window(200_000);
+        let policy = crate::auto_compact::AutoCompactPolicy::for_context_window(100_000);
         let mut session = bulky_session(Some(policy));
         session.set_pending_compaction(true);
         let bytes_before: u64 = session

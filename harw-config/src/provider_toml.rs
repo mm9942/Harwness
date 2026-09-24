@@ -33,8 +33,9 @@ pub struct ProviderToml {
     pub enabled: bool,
     #[serde(default)]
     pub origin_allowlist: OriginAllowlistToml,
-    /// Client-seitiges Rate-Limiting für diesen Provider; `None` = kein
-    /// Override (deaktiviert, siehe [`RateLimitToml::default`]).
+    /// Client-seitiges Rate-Limiting für diesen Provider: reaktives
+    /// Header-Pacing und/oder proaktive RPM/TPM-Budgets (siehe
+    /// [`RateLimitToml`]); `None` = beides aus.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub rate_limit: Option<RateLimitToml>,
     /// Harte Obergrenze gleichzeitig in Flug befindlicher Requests an
@@ -845,6 +846,162 @@ mod tests {
             ));
         };
         assert!(matches!(error, ConfigError::Invalid(ref msg) if msg.contains("max_concurrency")));
+        Ok(())
+    }
+
+    #[test]
+    fn test_rate_limit_budget_fields_parse_and_default_mode_is_both() -> TestResult {
+        let src = r#"
+            name = "openai"
+            api = "openai-chat"
+            base_url = "https://api.openai.com/v1"
+
+            [rate_limit]
+            requests_per_minute = 500
+            tokens_per_minute = 30000
+            input_tokens_per_minute = 20000
+            output_tokens_per_minute = 8000
+            max_concurrent = 4
+        "#;
+        let provider: ProviderToml = toml::from_str(src).map_err(ctx("provider toml parsen"))?;
+        provider
+            .validate()
+            .map_err(ctx("positive budgets are valid"))?;
+        let rate_limit = provider
+            .rate_limit
+            .ok_or(TestError::Missing("rate_limit section present"))?;
+        assert_eq!(rate_limit.requests_per_minute, Some(500));
+        assert_eq!(rate_limit.tokens_per_minute, Some(30_000));
+        assert_eq!(rate_limit.input_tokens_per_minute, Some(20_000));
+        assert_eq!(rate_limit.output_tokens_per_minute, Some(8_000));
+        assert_eq!(rate_limit.max_concurrent, Some(4));
+        assert_eq!(rate_limit.mode, None);
+        assert_eq!(rate_limit.effective_mode(), RateLimitMode::Both);
+        assert!(rate_limit.budget_enabled());
+        assert!(
+            !rate_limit.header_pacing_enabled(),
+            "header pacing still requires enabled = true"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn test_rate_limit_without_budget_keeps_header_mode() -> TestResult {
+        let rate_limit: RateLimitToml =
+            toml::from_str("enabled = true").map_err(ctx("rate_limit parsen"))?;
+        assert_eq!(rate_limit.effective_mode(), RateLimitMode::Header);
+        assert!(rate_limit.header_pacing_enabled());
+        assert!(!rate_limit.budget_enabled());
+        assert!(rate_limit.header_pacer_config().enabled);
+        Ok(())
+    }
+
+    #[test]
+    fn test_rate_limit_budget_mode_disables_header_pacing() -> TestResult {
+        let rate_limit: RateLimitToml = toml::from_str(
+            r#"
+                enabled = true
+                mode = "budget"
+                tokens_per_minute = 1000
+            "#,
+        )
+        .map_err(ctx("rate_limit parsen"))?;
+        assert!(!rate_limit.header_pacing_enabled());
+        assert!(!rate_limit.header_pacer_config().enabled);
+        assert!(rate_limit.budget_enabled());
+        Ok(())
+    }
+
+    #[test]
+    fn test_rate_limit_header_mode_ignores_budgets() -> TestResult {
+        let rate_limit: RateLimitToml = toml::from_str(
+            r#"
+                enabled = true
+                mode = "header"
+                requests_per_minute = 10
+            "#,
+        )
+        .map_err(ctx("rate_limit parsen"))?;
+        assert!(rate_limit.header_pacing_enabled());
+        assert!(!rate_limit.budget_enabled());
+        Ok(())
+    }
+
+    #[test]
+    fn test_rate_limit_rejects_unknown_mode_and_field() {
+        assert!(toml::from_str::<RateLimitToml>(r#"mode = "sometimes""#).is_err());
+        assert!(toml::from_str::<RateLimitToml>("tokens_per_minut = 5").is_err());
+    }
+
+    #[test]
+    fn test_rate_limit_validate_rejects_zero_budgets() -> TestResult {
+        for field in [
+            "requests_per_minute",
+            "tokens_per_minute",
+            "input_tokens_per_minute",
+            "output_tokens_per_minute",
+            "max_concurrent",
+        ] {
+            let rate_limit: RateLimitToml =
+                toml::from_str(&format!("{field} = 0")).map_err(ctx("rate_limit parsen"))?;
+            let Err(error) = rate_limit.validate("provider 'x'") else {
+                return Err(TestError::Unexpected(format!(
+                    "{field} = 0 should fail validation"
+                )));
+            };
+            assert!(
+                matches!(&error, ConfigError::Invalid(msg) if msg.contains(field)),
+                "{field}: {error}"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn test_rate_limit_validate_rejects_budget_mode_without_budget() -> TestResult {
+        let rate_limit: RateLimitToml =
+            toml::from_str(r#"mode = "budget""#).map_err(ctx("rate_limit parsen"))?;
+        assert!(rate_limit.validate("provider 'x'").is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn test_provider_validate_propagates_rate_limit_errors() -> TestResult {
+        let src = r#"
+            name = "openai"
+            api = "openai-chat"
+            base_url = "https://api.openai.com/v1"
+
+            [rate_limit]
+            tokens_per_minute = 0
+        "#;
+        let provider: ProviderToml = toml::from_str(src).map_err(ctx("provider toml parsen"))?;
+        let Err(error) = provider.validate() else {
+            return Err(TestError::Unexpected(
+                "tokens_per_minute = 0 should fail provider validation".into(),
+            ));
+        };
+        assert!(
+            matches!(error, ConfigError::Invalid(ref msg) if msg.contains("provider 'openai'") && msg.contains("tokens_per_minute"))
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn test_rate_limit_budget_fields_round_trip() -> TestResult {
+        let rate_limit = RateLimitToml {
+            requests_per_minute: Some(60),
+            tokens_per_minute: Some(90_000),
+            mode: Some(RateLimitMode::Both),
+            ..RateLimitToml::default()
+        };
+        let encoded = toml::to_string(&rate_limit).map_err(ctx("rate_limit serialisieren"))?;
+        assert!(encoded.contains("requests_per_minute = 60"));
+        assert!(encoded.contains(r#"mode = "both""#));
+        assert!(!encoded.contains("input_tokens_per_minute"));
+        let decoded: RateLimitToml =
+            toml::from_str(&encoded).map_err(ctx("rate_limit erneut parsen"))?;
+        assert_eq!(decoded, rate_limit);
         Ok(())
     }
 }

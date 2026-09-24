@@ -64,7 +64,7 @@ pub use network_toml::NetworkSection;
 pub use permissions_toml::{PermissionsSection, RuleToml};
 pub use plan_toml::{PlanSection, ToolsSection};
 pub use plugin_toml::{PluginCapabilitiesToml, PluginToml};
-pub use provider_toml::{OriginAllowlistToml, ProviderToml, RateLimitToml};
+pub use provider_toml::{OriginAllowlistToml, ProviderToml, RateLimitMode, RateLimitToml};
 pub use research_toml::ResearchSection;
 pub use scope::{FIELD_TABLE, FieldScope, MergeRule, Scope, SettingScope};
 pub use skill_toml::SkillToml;
