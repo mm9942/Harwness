@@ -95,7 +95,7 @@ make install BINDIR=/usr/local/bin   # or PREFIX=/usr/local (BINDIR wins if both
 | `clippy` | Clippy, warnings as errors |
 | `tests` | Test suite |
 | `clippy-tests` | Canonical verification: clippy + tests + gates |
-| `gates` | Write-scope/structure gates (`xtask gates`) |
+| `gates` | Dependency-edge, privilege and Warden structure gates (`xtask gates`, reads the root and `dod/` workspaces) |
 | `dod-build` / `dod-install` / `dod-enable` / `dod-uninstall` | Delegate to `dod/Makefile` — see [`docs/setup/dod.md`](dod.md) |
 
 ## First run
@@ -112,6 +112,14 @@ cloud (OpenAI, Anthropic, OpenRouter, …, via an API key or an imported CLI
 credential) or local. For running against a local model server (vLLM, LM
 Studio, Ollama), see
 [`docs/setup/local-models.md`](local-models.md).
+
+A configured Mistral provider (provider key `mistral` or base URL host
+`api.mistral.ai`) also enables remote OCR for `doc.read_pdf`: PDFs from the
+workspace can then be uploaded to the Mistral API for text extraction. This
+is controlled by `[tools.doc].remote_ocr` in `config.toml`: `"ask"` (the
+default) asks for approval before each upload, `"on"` uploads without
+asking, `"off"` always extracts locally. See
+[`docs/design/config-scopes.md`](../design/config-scopes.md) §1.8a.
 
 ## Optional: user services
 

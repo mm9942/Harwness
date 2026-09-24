@@ -45,8 +45,9 @@
 //!
 //! # Nebenläufigkeit
 //! Alle öffentlichen Typen sind `Send + Sync`. Der Mistral-OCR-Client liegt
-//! in einem prozessweiten `OnceLock<Arc<MistralOcrClient>>`
-//! ([`install_mistral_ocr`] / `mistral::mistral_ocr`). `doc.read_pdf` ist
+//! in einem prozessweiten `OnceLock` ([`install_mistral_ocr`] /
+//! `mistral::mistral_ocr`, Ziel und Freigabe-Modus über
+//! [`remote_ocr_target`]). `doc.read_pdf` ist
 //! `parallel_safe`.
 //!
 //! # Fehler
@@ -78,6 +79,9 @@ pub mod types;
 mod test_support;
 
 pub use error::{DocToolError, DocToolResult};
-pub use mistral::{DEFAULT_OCR_MODEL, MistralOcrConfig, install_mistral_ocr};
+pub use mistral::{
+    DEFAULT_OCR_MODEL, MistralOcrConfig, RemoteOcrApproval, RemoteOcrTarget,
+    arguments_request_remote_ocr, install_mistral_ocr, remote_ocr_target,
+};
 pub use provider::DocToolProvider;
 pub use types::PageRange;

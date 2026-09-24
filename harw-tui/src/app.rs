@@ -7762,6 +7762,13 @@ fn apply_host_permit_decision(app: &mut ChatApp, prompt: HostPermitPrompt, optio
     app.push_line(Role::System, message);
 }
 
+/// Risiko-Hinweis für den Freigabe-Dialog: nennt den Remote-OCR-Host, wenn
+/// `doc.read_pdf` die Datei unter `[tools.doc].remote_ocr = "ask"` an einen
+/// externen Dienst schicken würde; sonst `None`.
+pub(crate) fn approval_risk(call: &ToolCall) -> Option<String> {
+    harw_registry_defaults::remote_ocr_approval_notice(call)
+}
+
 fn build_approval_dialog(
     prompt: &ApprovalPrompt,
     app: &ChatApp,
@@ -7794,7 +7801,7 @@ fn build_approval_dialog(
             Some(app.project_root().to_owned())
         },
         justification: None,
-        risk: None,
+        risk: approval_risk(call),
         origin: None,
         remember_rule,
         deadline: Instant::now() + timeout,

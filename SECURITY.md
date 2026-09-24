@@ -58,6 +58,12 @@ and should be flagged rather than merged silently — see
   only shrink on the way down to spawned child agents — a child can never end
   up with more network (or filesystem, or tool) access than the session that
   spawned it.
+- **Workspace files leave the machine for remote OCR only as configured.**
+  With a Mistral provider configured, `doc.read_pdf` can upload a PDF to the
+  provider's API for OCR. `[tools.doc].remote_ocr` controls this: `ask`
+  (default) requires an approval naming the host for every upload, in every
+  approval mode; `off` never uploads; an untrusted project config can only
+  tighten the setting, never loosen it.
 - **Always-ask tools are never auto-approved.** Tools registered in the
   always-ask set (destructive or high-impact operations such as
   `process.kill` and `host.sudo_exec`) are excluded from the deterministic

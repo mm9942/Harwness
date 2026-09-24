@@ -184,6 +184,12 @@ impl AskResolutionPolicy {
     /// Rückfrage missdeuten (und einen an sich freigegebenen Aufruf hier
     /// fälschlich ablehnen) oder eine Deny-Regel übersehen.
     fn would_ask(&self, call: &ToolCall) -> bool {
+        // Wie in `DefaultApprovalPolicy::review`: Remote-OCR unter
+        // `[tools.doc].remote_ocr = "ask"` fragt unabhängig von Regeln und
+        // Modus.
+        if harw_registry_defaults::call_needs_remote_ocr_approval(call) {
+            return true;
+        }
         if self
             .config
             .as_ref()
@@ -221,10 +227,19 @@ impl AskResolutionPolicy {
             }
             AskResolution::Fail => "this entry fails the run instead (W4a)",
         };
-        format!(
+        let reason = format!(
             "'{}' needs an approval, but no one can answer it here: {outcome}",
             call.name.as_str()
-        )
+        );
+        // Das Modell soll lokal weitermachen können, statt aufzugeben.
+        if harw_registry_defaults::call_needs_remote_ocr_approval(call) {
+            format!(
+                "{reason}; {}",
+                harw_registry_defaults::REMOTE_OCR_DENIAL_HINT
+            )
+        } else {
+            reason
+        }
     }
 }
 

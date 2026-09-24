@@ -364,7 +364,7 @@ fn build_dialog(app: &ChatApp, request: &ChildApprovalRequest) -> ApprovalDialog
             Some(app.project_root().to_owned())
         },
         justification: None,
-        risk: None,
+        risk: crate::app::approval_risk(&request.call),
         origin: Some(request.requester_label()),
         // Keine Regel, kein Lern-Angebot: eine Kind-Freigabe gilt einmalig.
         remember_rule: None,

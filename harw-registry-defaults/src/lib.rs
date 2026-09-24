@@ -86,6 +86,9 @@ use harw_extension_api::{
 };
 use harw_instructions::AgentIdentity;
 use harw_project_discovery::ProjectContext;
+// Remote-OCR-Status von `doc.read_pdf`; re-exportiert, damit die TUI den
+// Freigabe-Hinweis ohne eigene `harw-tool-doc`-Kante testen kann.
+pub use harw_tool_doc::{RemoteOcrApproval, RemoteOcrTarget, remote_ocr_target};
 
 pub use agent_definition_tools::{
     AgentDefinitionToolProvider, DefinitionAuthorCeiling, DefinitionWriteMode,
@@ -165,7 +168,10 @@ pub const AUTO_APPROVED_TOOLS: &[&str] = &[
     // PDF-Datei aus dem Workspace seitenweise als Text/Markdown — dieselbe
     // Berechtigung (`Permission::ReadWorkspace`) und dieselbe read-only
     // Eigenschaft wie `fs.read`, erscheint deshalb überall, wo ein lesender
-    // FS-Provider registriert wird (siehe `profile::DOC_TOOLS`).
+    // FS-Provider registriert wird (siehe `profile::DOC_TOOLS`). Ausnahme:
+    // würde der Aufruf die Datei an einen Remote-OCR-Dienst schicken und
+    // steht `[tools.doc].remote_ocr` auf `ask`, fragt `review` trotzdem
+    // (siehe [`remote_ocr_requires_approval`]).
     "doc.read_pdf",
     // Workspace-Explorer (`harw-tool-explorer`) — Baum, Projekte, Relationen,
     // Suche ab der Workspace-Wurzel; rein lesend, `Permission::ReadWorkspace`
@@ -349,6 +355,151 @@ pub const ALWAYS_ASK_TOOLS: &[&str] = &[
     "agent.cancel",
 ];
 
+/// Werkzeug, dessen Remote-OCR-Versand eine eigene Freigabe braucht.
+pub const REMOTE_OCR_TOOL: &str = "doc.read_pdf";
+
+/// Quelle des Remote-OCR-Status für [`DefaultApprovalPolicy`].
+///
+/// Standard ist [`harw_tool_doc::remote_ocr_target`] (der prozessweite
+/// Status aus `harw-cli`s `install_doc_ocr`); Tests setzen über
+/// [`DefaultApprovalPolicy::with_remote_ocr_status`] eine eigene Funktion.
+pub type RemoteOcrStatus = fn() -> Option<RemoteOcrTarget>;
+
+/// Hinweis an das Modell, wenn ein Remote-OCR-Aufruf nicht freigegeben
+/// wurde oder niemand ihn freigeben kann.
+pub const REMOTE_OCR_DENIAL_HINT: &str =
+    "remote OCR needs approval; retry with `backend: \"native\"` for local extraction";
+
+/// Ob `call` unter dem Ziel `target` eine Remote-OCR-Freigabe braucht.
+///
+/// # Beschreibung
+/// `true` genau dann, wenn `call` [`REMOTE_OCR_TOOL`] ist, ein
+/// Remote-OCR-Client installiert ist (`target` ist `Some`), sein Modus
+/// [`harw_tool_doc::RemoteOcrApproval::Ask`] ist und die Argumente nicht
+/// `backend: "native"` verlangen. Unabhängig vom Freigabemodus: der
+/// Datenabfluss ist keine Ausführungsfrage und fragt deshalb auch unter
+/// [`ApprovalMode::FullAccess`].
+///
+/// # Examples
+/// ```rust
+/// use harw_extension_api::{ToolCall, ToolName};
+/// use harw_registry_defaults::remote_ocr_requires_approval;
+/// use harw_tool_doc::{RemoteOcrApproval, RemoteOcrTarget};
+/// use serde_json::json;
+///
+/// let target = RemoteOcrTarget {
+///     host: "api.mistral.ai".to_owned(),
+///     approval: RemoteOcrApproval::Ask,
+/// };
+/// let call = ToolCall {
+///     id: Default::default(),
+///     name: ToolName::new("doc.read_pdf"),
+///     arguments: json!({ "path": "a.pdf" }),
+/// };
+/// assert!(remote_ocr_requires_approval(&call, Some(&target)));
+/// assert!(!remote_ocr_requires_approval(&call, None));
+/// ```
+#[must_use]
+pub fn remote_ocr_requires_approval(call: &ToolCall, target: Option<&RemoteOcrTarget>) -> bool {
+    call.name.as_str() == REMOTE_OCR_TOOL
+        && target.is_some_and(|target| target.approval == harw_tool_doc::RemoteOcrApproval::Ask)
+        && harw_tool_doc::arguments_request_remote_ocr(&call.arguments)
+}
+
+/// Host, an den `call` die Datei schickt, wenn es ein `doc.read_pdf` mit
+/// Remote-OCR-Pfad ist und ein Client installiert ist (Modus egal); sonst
+/// `None`. Für die Verlaufsanzeige der TUI.
+///
+/// # Examples
+/// ```rust
+/// use harw_extension_api::{ToolCall, ToolName};
+/// use harw_registry_defaults::{RemoteOcrApproval, RemoteOcrTarget, remote_ocr_host};
+/// use serde_json::json;
+///
+/// let target = RemoteOcrTarget {
+///     host: "api.mistral.ai".to_owned(),
+///     approval: RemoteOcrApproval::Auto,
+/// };
+/// let call = ToolCall {
+///     id: Default::default(),
+///     name: ToolName::new("doc.read_pdf"),
+///     arguments: json!({ "path": "a.pdf" }),
+/// };
+/// assert_eq!(remote_ocr_host(&call, Some(&target)), Some("api.mistral.ai"));
+/// ```
+#[must_use]
+pub fn remote_ocr_host<'a>(
+    call: &ToolCall,
+    target: Option<&'a RemoteOcrTarget>,
+) -> Option<&'a str> {
+    if call.name.as_str() != REMOTE_OCR_TOOL
+        || !harw_tool_doc::arguments_request_remote_ocr(&call.arguments)
+    {
+        return None;
+    }
+    target.map(|target| target.host.as_str())
+}
+
+/// Wie [`remote_ocr_requires_approval`], gegen den prozessweiten
+/// Remote-OCR-Status ([`harw_tool_doc::remote_ocr_target`]). Für Aufrufer,
+/// die die Rückfrage vorhersagen müssen (`harw-runtime`s
+/// `AskResolutionPolicy`), ohne eine eigene Politik zu tragen.
+#[must_use]
+pub fn call_needs_remote_ocr_approval(call: &ToolCall) -> bool {
+    remote_ocr_requires_approval(call, harw_tool_doc::remote_ocr_target().as_ref())
+}
+
+/// Hinweistext für den Freigabe-Dialog, wenn `call` die Datei an einen
+/// Remote-OCR-Dienst schicken würde und dafür gefragt wird.
+///
+/// # Returns
+/// `Some(text)` mit dem Host aus dem prozessweiten Remote-OCR-Status
+/// ([`harw_tool_doc::remote_ocr_target`]), wenn
+/// [`remote_ocr_requires_approval`] für `call` gilt; sonst `None`.
+#[must_use]
+pub fn remote_ocr_approval_notice(call: &ToolCall) -> Option<String> {
+    remote_ocr_approval_notice_with(call, harw_tool_doc::remote_ocr_target().as_ref())
+}
+
+/// Wie [`remote_ocr_approval_notice`], mit explizit übergebenem Ziel
+/// (testbar ohne prozessweiten Status).
+///
+/// # Examples
+/// ```rust
+/// use harw_extension_api::{ToolCall, ToolName};
+/// use harw_registry_defaults::remote_ocr_approval_notice_with;
+/// use harw_tool_doc::{RemoteOcrApproval, RemoteOcrTarget};
+/// use serde_json::json;
+///
+/// let target = RemoteOcrTarget {
+///     host: "api.mistral.ai".to_owned(),
+///     approval: RemoteOcrApproval::Ask,
+/// };
+/// let call = ToolCall {
+///     id: Default::default(),
+///     name: ToolName::new("doc.read_pdf"),
+///     arguments: json!({ "path": "a.pdf" }),
+/// };
+/// let notice = remote_ocr_approval_notice_with(&call, Some(&target));
+/// assert!(notice.is_some_and(|text| text.contains("api.mistral.ai")));
+/// ```
+#[must_use]
+pub fn remote_ocr_approval_notice_with(
+    call: &ToolCall,
+    target: Option<&RemoteOcrTarget>,
+) -> Option<String> {
+    if !remote_ocr_requires_approval(call, target) {
+        return None;
+    }
+    target.map(|target| {
+        format!(
+            "Sends the file contents to {} (remote OCR). Deny, or ask for backend=native, \
+             to keep it local.",
+            target.host
+        )
+    })
+}
+
 /// Default approval boundary for the built-in coding-agent tool set.
 ///
 /// Only the known read-only tools and operations execute without a pause
@@ -392,6 +543,9 @@ pub struct DefaultApprovalPolicy {
     /// `harw-runtime`). `None` = bisheriges Verhalten (`auto` fragt bei
     /// allem außerhalb von [`AUTO_APPROVED_TOOLS`]).
     auto_gate: Option<Arc<dyn AutoApprovalGate>>,
+    /// Quelle des Remote-OCR-Status (`doc.read_pdf` → Mistral); Standard
+    /// [`harw_tool_doc::remote_ocr_target`], in Tests injizierbar.
+    remote_ocr: RemoteOcrStatus,
 }
 
 impl Default for DefaultApprovalPolicy {
@@ -446,7 +600,23 @@ impl DefaultApprovalPolicy {
             mode,
             rules,
             auto_gate: None,
+            remote_ocr: harw_tool_doc::remote_ocr_target,
         }
+    }
+
+    /// Ersetzt die Quelle des Remote-OCR-Status (Standard:
+    /// [`harw_tool_doc::remote_ocr_target`]).
+    ///
+    /// # Arguments
+    /// - `status` ([`RemoteOcrStatus`]): liefert das aktuelle Remote-OCR-Ziel
+    ///   oder `None`, wenn kein Client installiert ist.
+    ///
+    /// # Returns
+    /// Die Politik mit der neuen Quelle.
+    #[must_use]
+    pub fn with_remote_ocr_status(mut self, status: RemoteOcrStatus) -> Self {
+        self.remote_ocr = status;
+        self
     }
 
     /// Runde 5, Teil E: hängt das Auto-Modus-Gate an.
@@ -498,6 +668,9 @@ impl ApprovalHandler for DefaultApprovalPolicy {
     ///    [`ApprovalDecision::AskUser`], ohne Regeln oder Modus überhaupt zu
     ///    befragen — auch nicht unter [`ApprovalMode::FullAccess`] oder mit
     ///    einer passenden `Allow`-Regel (Nachtrag K3, „Freigabe-Härtung“).
+    ///    Ebenso ein `doc.read_pdf`, das die Datei an einen Remote-OCR-Dienst
+    ///    schicken würde, solange `[tools.doc].remote_ocr = "ask"` gilt
+    ///    ([`remote_ocr_requires_approval`]).
     /// 1. [`AllowRuleSet::evaluate`] auf `call.name`/`call.arguments`:
     ///    - `Some(`[`RuleDecision::Deny`]`)` → [`ApprovalDecision::AskUser`],
     ///      unabhängig vom Modus (fail-closed, nie automatisch freigegeben).
@@ -525,6 +698,12 @@ impl ApprovalHandler for DefaultApprovalPolicy {
         // Modus, auch `FullAccess` — siehe die Begründung bei
         // `ALWAYS_ASK_TOOLS`.
         if ALWAYS_ASK_TOOLS.contains(&call.name.as_str()) {
+            return Box::pin(async { ApprovalDecision::AskUser(Default::default()) });
+        }
+        // `[tools.doc].remote_ocr = "ask"`: die Datei verließe die Maschine.
+        // Das ist keine Ausführungsfrage, deshalb fragt es in jedem Modus und
+        // trotz Allow-Regel; `on` in der Config ist der Weg, das abzuschalten.
+        if remote_ocr_requires_approval(call, (self.remote_ocr)().as_ref()) {
             return Box::pin(async { ApprovalDecision::AskUser(Default::default()) });
         }
         let rule_decision = self.rules.evaluate(call.name.as_str(), &call.arguments);
@@ -1001,6 +1180,107 @@ mod tests {
             ApprovalDecision::AskUser(_)
         ));
         Ok(())
+    }
+
+    fn remote_ocr_ask() -> Option<RemoteOcrTarget> {
+        Some(RemoteOcrTarget {
+            host: "api.mistral.ai".to_owned(),
+            approval: harw_tool_doc::RemoteOcrApproval::Ask,
+        })
+    }
+
+    fn remote_ocr_auto() -> Option<RemoteOcrTarget> {
+        Some(RemoteOcrTarget {
+            host: "api.mistral.ai".to_owned(),
+            approval: harw_tool_doc::RemoteOcrApproval::Auto,
+        })
+    }
+
+    fn read_pdf(arguments: serde_json::Value) -> ToolCall {
+        ToolCall {
+            id: Default::default(),
+            name: harw_extension_api::ToolName::new(REMOTE_OCR_TOOL),
+            arguments,
+        }
+    }
+
+    /// `[tools.doc].remote_ocr = "ask"`: `doc.read_pdf` fragt, sobald die
+    /// Datei an den Remote-Dienst ginge — in jedem Modus, auch unter
+    /// `FullAccess` und trotz Allow-Regel. `backend: "native"`, Modus `on`
+    /// und „kein Client installiert“ bleiben ohne Rückfrage.
+    #[test]
+    fn review_asks_for_remote_ocr_in_ask_mode_even_under_full_access() -> TestResult {
+        use harw_extension_api::allow_rules::{ApprovalRule, RuleScope};
+        use serde_json::json;
+
+        let remote = read_pdf(json!({ "path": "scan.pdf" }));
+        let native = read_pdf(json!({ "path": "scan.pdf", "backend": "native" }));
+        for mode in [ApprovalMode::Delegated, ApprovalMode::FullAccess] {
+            let rules = AllowRuleSet::new();
+            rules.add(ApprovalRule {
+                tool: REMOTE_OCR_TOOL.to_owned(),
+                pattern: None,
+                decision: RuleDecision::Allow,
+                scope: RuleScope::Session,
+            });
+            let asking = DefaultApprovalPolicy::with_rules(ApprovalModeCell::new(mode), rules)
+                .with_remote_ocr_status(remote_ocr_ask);
+            assert!(
+                matches!(
+                    block_on(asking.review(&remote))?,
+                    ApprovalDecision::AskUser(_)
+                ),
+                "remote OCR unter {mode:?} muss fragen"
+            );
+            assert!(
+                matches!(block_on(asking.review(&native))?, ApprovalDecision::Allow),
+                "backend native unter {mode:?} bleibt ohne Rückfrage"
+            );
+
+            let auto = DefaultApprovalPolicy::new(ApprovalModeCell::new(mode))
+                .with_remote_ocr_status(remote_ocr_auto);
+            assert!(matches!(
+                block_on(auto.review(&remote))?,
+                ApprovalDecision::Allow
+            ));
+
+            let none = DefaultApprovalPolicy::new(ApprovalModeCell::new(mode))
+                .with_remote_ocr_status(|| None);
+            assert!(matches!(
+                block_on(none.review(&remote))?,
+                ApprovalDecision::Allow
+            ));
+        }
+        // Weiterhin auto-freigegeben: die Rückfrage hängt nur am Remote-Pfad.
+        assert!(AUTO_APPROVED_TOOLS.contains(&REMOTE_OCR_TOOL));
+        Ok(())
+    }
+
+    #[test]
+    fn remote_ocr_notice_names_host_only_when_asking() {
+        use serde_json::json;
+
+        let remote = read_pdf(json!({ "path": "scan.pdf" }));
+        let native = read_pdf(json!({ "path": "scan.pdf", "backend": "native" }));
+        let notice = remote_ocr_approval_notice_with(&remote, remote_ocr_ask().as_ref());
+        assert!(
+            notice
+                .as_deref()
+                .is_some_and(|text| text.contains("api.mistral.ai") && text.contains("native")),
+            "{notice:?}"
+        );
+        assert_eq!(
+            remote_ocr_approval_notice_with(&native, remote_ocr_ask().as_ref()),
+            None
+        );
+        assert_eq!(
+            remote_ocr_approval_notice_with(&remote, remote_ocr_auto().as_ref()),
+            None
+        );
+        assert_eq!(
+            remote_ocr_approval_notice_with(&call("fs.read"), remote_ocr_ask().as_ref()),
+            None
+        );
     }
 
     #[test]

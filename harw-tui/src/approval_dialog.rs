@@ -1138,6 +1138,35 @@ mod tests {
         );
     }
 
+    // ── Remote-OCR-Hinweis ───────────────────────────────────────────────
+
+    #[test]
+    fn test_remote_ocr_risk_names_host_in_render() {
+        let call = tool_call(
+            "doc.read_pdf",
+            harw_tools::serde_json::json!({ "path": "scan.pdf" }),
+        );
+        let target = harw_registry_defaults::RemoteOcrTarget {
+            host: "api.mistral.ai".to_owned(),
+            approval: harw_registry_defaults::RemoteOcrApproval::Ask,
+        };
+        let risk = harw_registry_defaults::remote_ocr_approval_notice_with(&call, Some(&target));
+        assert!(risk.is_some());
+        let dialog = ApprovalDialog::new(ApprovalDialogRequest {
+            call,
+            cwd: None,
+            justification: None,
+            risk,
+            origin: None,
+            remember_rule: None,
+            deadline: Instant::now() + Duration::from_secs(300),
+            reason_input_enabled: false,
+        });
+        let rendered = render_dialog(&dialog, 100, 30);
+        assert!(rendered.contains("api.mistral.ai"), "{rendered}");
+        assert!(rendered.contains("remote OCR"), "{rendered}");
+    }
+
     // ── Terminal-Sicherheit ──────────────────────────────────────────────
 
     #[test]

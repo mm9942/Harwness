@@ -160,6 +160,30 @@ see Section 2 for the field's current, implemented rule.
 | `tools.plan.exploration_ttl_secs` | `u64` | `86400` | `plan_toml.rs:71` | RESET |
 | `tools.plan.max_expand_depth` | `u32` | `3` | `plan_toml.rs:75` | RESET — **RESTRICTED PRECEDENT**: Minimum (`merge_restricted_harness:999-1001`) |
 
+### 1.8a `[tools.doc]` (`plan_toml.rs`, `DocSection`)
+
+| TOML path | Type | Default | Allowed | Merge today |
+|---|---|---|---|---|
+| `tools.doc.remote_ocr` | `RemoteOcrMode` | `"ask"` | `off`/`ask`/`on` | `StricterOf` for the untrusted project (`merge_tools_doc`) — 🔒 |
+
+Controls whether `doc.read_pdf` may send workspace PDFs to a remote OCR
+service. Remote OCR is only possible when an enabled Mistral provider with a
+resolvable credential is configured; the file then goes to that provider's
+API host (normally `api.mistral.ai`), outside the `[network]` policy.
+
+- `off`: no OCR client is installed; `doc.read_pdf` always extracts locally.
+- `ask` (default): every `doc.read_pdf` call that would use remote OCR
+  (any `backend` other than `"native"`) needs an explicit approval, in every
+  approval mode including full access and regardless of allow rules. The
+  approval dialog names the host. Entries where no one can answer (one-shot,
+  jobs) deny the call with a hint to retry with `backend: "native"`.
+- `on`: remote OCR without asking (the behavior before this setting existed).
+
+```toml
+[tools.doc]
+remote_ocr = "ask"   # "off" | "ask" | "on"
+```
+
 ### 1.9 `[mode]` (`mode_toml.rs:19-38`)
 
 | TOML path | Type | Default | File:Line | Merge today |
@@ -481,6 +505,7 @@ This table now matches `FIELD_TABLE` in `harw-config/src/scope.rs`.
 | `uia_worker_models.*` (5 fields) | PROFILE | `ProfileReplaces` | Model choice per UIA-worker role is user preference, like `uia_worker_model`. | |
 | `agents.*` (4 fields) | PROFILE, untrusted project may only lower | `MinBound` | Cost and blow-up limit for orchestration; home and profile set freely, including upward. | 🔒 |
 | `shell.max_timeout_secs` | PROFILE, untrusted project may only lower | `MinBound` | Resource limit for shell commands; like `agents.*`. | 🔒 |
+| `tools.doc.remote_ocr` | PROFILE, untrusted project may only tighten | `StricterOf` (`off` < `ask` < `on`) | Data egress to a remote OCR service; home and profile set freely, a project may never move from `ask` to `on`. | 🔒 |
 
 ---
 
@@ -706,7 +731,7 @@ pub struct FieldScope {
 
 ### 6.2 Explicit strictness orderings for `StricterOf`
 
-Only two fields use `StricterOf`; both orderings are deliberately **newly
+Three fields use `StricterOf`; all orderings are deliberately **newly
 established**, since they were not encoded anywhere in the code before this
 design:
 
@@ -730,6 +755,13 @@ design:
   behavior (no comparison attempted — the deviating layer value is ignored
   and raises a `ScopeDiagnostic`), so a third value is never silently sorted
   into the ordering; covered by test #24 (Section 7h).
+- **`tools.doc.remote_ocr`**: `["off", "ask", "on"]` (index 0 = strictest
+  value, `TOOLS_DOC_REMOTE_OCR_ORDER`, same order as the `RemoteOcrMode`
+  variants). Unlike the two fields above, trusted layers (home and profile)
+  set it freely, including loosening it; only the untrusted project layer is
+  restricted to stricter values (`merge_tools_doc`, same pattern as
+  `merge_shell_limits`). The value set is closed by serde, so there is no
+  unordered fallback case.
 
 ### 6.3 Complete field-by-field mapping (all fields from the original 111-field count)
 
@@ -812,6 +844,9 @@ subsection numbers, so the table can be checked 1:1 against Section 1.
 | `tools.plan.require_exploration_for` | Profile | `ProfileReplaces` |
 | `tools.plan.exploration_ttl_secs` | Profile | `ProfileReplaces` |
 | `tools.plan.max_expand_depth` | Global | `MinBound` |
+
+**1.8a `[tools.doc]`** (1): `tools.doc.remote_ocr` — Profile / `StricterOf`
+(`off` < `ask` < `on`, untrusted project may only tighten), security-critical.
 
 **1.9 `[mode]`** (1): `mode.default` — Profile / `ProfileReplaces`.
 
@@ -911,7 +946,7 @@ time — the growth history through several rounds of field additions
 `internal_models.root_orchestrator`/`.sub_orchestrator`, then
 `tui.child_stream`, `internal_models.auto_classifier`,
 `uia_worker_models.*`, `host.sudo_session_minutes`, `agents.*`,
-`shell.max_timeout_secs`) is not repeated here; `scope.rs`'s own test is the
+`shell.max_timeout_secs`, `tools.doc.remote_ocr`) is not repeated here; `scope.rs`'s own test is the
 source of truth, not this document's historical counts.
 
 ---
