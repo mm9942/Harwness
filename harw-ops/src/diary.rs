@@ -4,6 +4,10 @@
 //! # Subcommands
 //! - (bare) / `show [AgentRef] [--date=YYYY-MM-DD]` — rendert einen Tag;
 //!   ohne Angaben das eigene Tagebuch von heute (UTC).
+//! - `today` — Kurzform für das eigene Tagebuch von heute.
+//!
+//! `show`/`today` liefern zusätzlich `OpOutput::data` =
+//! `{"agent","date","entries":[{"time","trigger","text"}]}` für die TUI.
 //! - `note <text>` — außerplanmäßiger Eintrag (`DiaryTrigger::Manual`) im
 //!   eigenen Tagebuch. Das `#`-Präfix der TUI ist Zucker für genau diesen
 //!   Pfad (ein Codepfad, eine Audit-Spur).
@@ -81,6 +85,7 @@ pub fn run_diary(
     match tokens.first().map(String::as_str) {
         None => show(store, caller, &[], now),
         Some("show") => show(store, caller, tokens.get(1..).unwrap_or_default(), now),
+        Some("today") => show(store, caller, &[], now),
         Some("note") => note(store, caller, &tokens.get(1..).unwrap_or_default().join(" "), now),
         // `/diary <agent>` ist Kurzform von `/diary show <agent>`.
         Some(_) => show(store, caller, tokens, now),
@@ -115,14 +120,57 @@ fn show(
             .visible_to_caller(&VisibilityScope::OperatorOnly)
     });
     let Some(artifact) = visible else {
-        return Ok(OpOutput::from(format!(
-            "Kein sichtbarer Tagebucheintrag für {agent} am {date}."
-        )));
+        return Ok(OpOutput {
+            text: format!("Kein sichtbarer Tagebucheintrag für {agent} am {date}."),
+            data: Some(day_data(&agent, &date, "")),
+        });
     };
-    Ok(OpOutput::from(format!(
-        "Tagebuch {agent} — {date}\n\n{}",
-        artifact.body.trim_end()
-    )))
+    Ok(OpOutput {
+        text: format!("Tagebuch {agent} — {date}\n\n{}", artifact.body.trim_end()),
+        data: Some(day_data(&agent, &date, &artifact.body)),
+    })
+}
+
+/// Zerlegt einen Tages-Body in `### HH:MM:SS — <trigger>`-Einträge.
+///
+/// # Rückgabe
+/// `(time, trigger, text)` je Eintrag in Dateireihenfolge.
+fn parse_entries(body: &str) -> Vec<(String, String, String)> {
+    let mut entries: Vec<(String, String, String)> = Vec::new();
+    for line in body.lines() {
+        let header = line
+            .strip_prefix("### ")
+            .and_then(|rest| rest.split_once(" — "));
+        match header {
+            Some((time, trigger)) => {
+                entries.push((time.trim().to_owned(), trigger.trim().to_owned(), String::new()));
+            }
+            None => {
+                if let Some((_, _, text)) = entries.last_mut() {
+                    if !text.is_empty() || !line.trim().is_empty() {
+                        text.push_str(line);
+                        text.push('\n');
+                    }
+                }
+            }
+        }
+    }
+    for (_, _, text) in &mut entries {
+        let trimmed = text.trim_end().to_owned();
+        *text = trimmed;
+    }
+    entries
+}
+
+/// Nutzlast von `show`/`today` für die TUI.
+fn day_data(agent: &AgentId, date: &str, body: &str) -> serde_json::Value {
+    let entries: Vec<serde_json::Value> = parse_entries(body)
+        .into_iter()
+        .map(|(time, trigger, text)| {
+            serde_json::json!({ "time": time, "trigger": trigger, "text": text })
+        })
+        .collect();
+    serde_json::json!({ "agent": agent.as_str(), "date": date, "entries": entries })
 }
 
 fn note(
@@ -252,6 +300,23 @@ mod tests {
         )
         .map_err(ctx("explicit show succeeds"))?;
         assert!(explicit.text.contains("Build grün"));
+        std::fs::remove_dir_all(store.root()).ok();
+        Ok(())
+    }
+
+    #[test]
+    fn today_carries_structured_entries_for_the_tui() -> TestResult {
+        let store = temporary_store("today")?;
+        let me = AgentId::new("operator");
+        let now = noon()?;
+        run_diary(&store, &me, &toks(&["note", "erster"]), now).map_err(ctx("note 1"))?;
+        run_diary(&store, &me, &toks(&["note", "zweiter"]), now).map_err(ctx("note 2"))?;
+        let output = run_diary(&store, &me, &toks(&["today"]), now).map_err(ctx("today"))?;
+        let data = output.data.ok_or(TestError::Missing("today data"))?;
+        assert_eq!(data["entries"][0]["trigger"], "manual");
+        assert_eq!(data["entries"][0]["text"], "erster");
+        assert_eq!(data["entries"][1]["text"], "zweiter");
+        assert_eq!(data["entries"][0]["time"], "12:00:00");
         std::fs::remove_dir_all(store.root()).ok();
         Ok(())
     }

@@ -4190,7 +4190,7 @@ mod tests {
             vec!["harw", "analyze", "--goal", "Ziel"],
             vec!["harw", "--add-dir", "/tmp"],
         ] {
-            let cli = Cli::try_parse_from(argv.clone()).map_err(ctx("session flags parse"))?;
+            let cli = Cli::try_parse_from(argv).map_err(ctx("session flags parse"))?;
             reject_misplaced_session_flags(cli.command.as_ref(), &cli.global)
                 .map_err(ctx("session flags are allowed here"))?;
         }

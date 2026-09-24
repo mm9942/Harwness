@@ -86,6 +86,52 @@ pub enum CommandDomain {
     Misc,
 }
 
+/// Herkunft eines Befehls im TUI-Katalog.
+///
+/// # Varianten
+/// - [`Self::Operation`]: aus einer registrierten `harw-ops`-Operation
+///   abgeleitet; die Ausführung läuft über den Operations-Dispatch.
+/// - [`Self::TuiLocal`]: rein TUI-lokaler Befehl (z. B. `/tools`, `/exit`),
+///   der vor dem Operations-Dispatch abgefangen wird. Er erscheint im Popup
+///   und in der Hilfe, hat aber keine Operation hinter sich.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub enum CommandOrigin {
+    /// Aus einer registrierten Operation abgeleitet (Standard).
+    #[default]
+    Operation,
+    /// Rein TUI-lokal abgefangener Befehl.
+    TuiLocal,
+}
+
+/// Statischer Hinweis auf ein Unterkommando für Popup, Hilfe und Vervollständigung.
+///
+/// # Felder
+/// - `name`: das Unterkommando-Token (z. B. `"switch"`, `"--format"`).
+/// - `args`: Argument-Grammatik hinter dem Token, leer wenn keine
+///   (z. B. `"<modell-id>"`).
+/// - `summary`: kurze deutsche Beschreibung (eine Zeile).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct SubcommandHint {
+    /// Unterkommando-Token ohne führendes `/`.
+    pub name: &'static str,
+    /// Argument-Grammatik hinter dem Token; leer, wenn keine Argumente folgen.
+    pub args: &'static str,
+    /// Kurze deutsche Beschreibung.
+    pub summary: &'static str,
+}
+
+impl SubcommandHint {
+    /// Erzeugt einen Hinweis (in `const`-Tabellen verwendbar).
+    #[must_use]
+    pub const fn new(name: &'static str, args: &'static str, summary: &'static str) -> Self {
+        Self {
+            name,
+            args,
+            summary,
+        }
+    }
+}
+
 /// Static description of a command accepted by the command shell.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CommandSpec {
@@ -96,6 +142,15 @@ pub struct CommandSpec {
     pub output: OutputSurface,
     pub domain: CommandDomain,
     pub busy: harw_operations::operation::BusyAvailability,
+    /// Kurze deutsche Beschreibung (eine Zeile); leer, wenn unbekannt.
+    pub summary: String,
+    /// Nutzungszeile, z. B. `"/model [show|list|switch <modell-id>]"`; leer,
+    /// wenn unbekannt.
+    pub usage: String,
+    /// Bekannte Unterkommandos in Anzeigereihenfolge; leer, wenn keine.
+    pub subcommands: Vec<SubcommandHint>,
+    /// Herkunft: Operation oder TUI-lokal.
+    pub origin: CommandOrigin,
 }
 
 impl CommandSpec {
@@ -105,6 +160,10 @@ impl CommandSpec {
     /// default as [`harw_operations::operation::OperationMeta::busy`]); callers
     /// that need to construct a spec with an explicit busy-availability set the
     /// field directly on the returned value.
+    ///
+    /// `summary`/`usage` starten leer, `subcommands` ohne Einträge und
+    /// `origin` als [`CommandOrigin::Operation`]; siehe [`Self::with_help`]
+    /// und [`Self::local`].
     pub fn new(
         name: impl Into<String>,
         aliases: impl IntoIterator<Item = impl Into<String>>,
@@ -128,14 +187,48 @@ impl CommandSpec {
             output,
             domain,
             busy: BusyAvailability::default(),
+            summary: String::new(),
+            usage: String::new(),
+            subcommands: Vec::new(),
+            origin: CommandOrigin::Operation,
         })
+    }
+
+    /// Setzt Beschreibung, Nutzungszeile und Unterkommando-Hinweise.
+    ///
+    /// # Argumente
+    /// - `summary`: kurze deutsche Beschreibung.
+    /// - `usage`: Nutzungszeile (mit führendem `/`).
+    /// - `subs`: Unterkommando-Hinweise; ersetzt vorhandene vollständig.
+    ///
+    /// # Rückgabe
+    /// Die geänderte Spezifikation (Builder-Stil).
+    #[must_use]
+    pub fn with_help(
+        mut self,
+        summary: impl Into<String>,
+        usage: impl Into<String>,
+        subs: &[SubcommandHint],
+    ) -> Self {
+        self.summary = summary.into();
+        self.usage = usage.into();
+        self.subcommands = subs.to_vec();
+        self
+    }
+
+    /// Markiert die Spezifikation als TUI-lokal ([`CommandOrigin::TuiLocal`]).
+    #[must_use]
+    pub fn local(mut self) -> Self {
+        self.origin = CommandOrigin::TuiLocal;
+        self
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
-        BusyAvailability, CommandDomain, CommandName, CommandScope, CommandSpec, OutputSurface,
+        BusyAvailability, CommandDomain, CommandName, CommandOrigin, CommandScope, CommandSpec,
+        OutputSurface, SubcommandHint,
     };
     use crate::test_support::{TestError, TestResult, ctx};
     use crate::{CommandError, PermissionTier};
@@ -216,6 +309,60 @@ mod tests {
         spec.busy = BusyAvailability::Immediate;
 
         assert_eq!(spec.busy, BusyAvailability::Immediate);
+        Ok(())
+    }
+    #[test]
+    fn command_spec_new_defaults_help_fields_to_empty_operation() -> TestResult {
+        let spec = CommandSpec::new(
+            "status",
+            Vec::<String>::new(),
+            CommandScope::TuiOnly,
+            PermissionTier::Observer,
+            OutputSurface::Inline,
+            CommandDomain::SessionLifecycle,
+        )
+        .map_err(ctx("valid spec must construct"))?;
+
+        assert!(spec.summary.is_empty());
+        assert!(spec.usage.is_empty());
+        assert!(spec.subcommands.is_empty());
+        assert_eq!(spec.origin, CommandOrigin::Operation);
+        Ok(())
+    }
+
+    #[test]
+    fn with_help_and_local_set_the_help_fields_and_origin() -> TestResult {
+        const SUBS: &[SubcommandHint] = &[
+            SubcommandHint::new("on", "<name>", "Werkzeug einschalten"),
+            SubcommandHint::new("off", "<name>", "Werkzeug ausschalten"),
+        ];
+        let spec = CommandSpec::new(
+            "tools",
+            Vec::<String>::new(),
+            CommandScope::TuiOnly,
+            PermissionTier::Operator,
+            OutputSurface::Inline,
+            CommandDomain::Execution,
+        )
+        .map_err(ctx("valid spec must construct"))?
+        .with_help("Werkzeuge verwalten", "/tools [on|off <name>]", SUBS)
+        .local();
+
+        assert_eq!(spec.summary, "Werkzeuge verwalten");
+        assert_eq!(spec.usage, "/tools [on|off <name>]");
+        assert_eq!(spec.subcommands, SUBS.to_vec());
+        assert_eq!(spec.origin, CommandOrigin::TuiLocal);
+
+        let replaced = spec.with_help("neu", "", &[]);
+        assert!(
+            replaced.subcommands.is_empty(),
+            "with_help replaces subcommands"
+        );
+        assert_eq!(
+            replaced.origin,
+            CommandOrigin::TuiLocal,
+            "with_help keeps the origin"
+        );
         Ok(())
     }
 }

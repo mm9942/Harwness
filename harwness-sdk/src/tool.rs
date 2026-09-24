@@ -116,7 +116,7 @@ impl std::error::Error for ToolError {}
 ///     fn call<'a>(&'a self, _ctx: &'a ToolContext, _args: Value)
 ///         -> BoxFuture<'a, Result<Value, ToolError>>
 ///     {
-///         Box::pin(async { Ok(json!("12:00")) })
+///         Box::pin(async { Ok::<_, ToolError>(json!("12:00")) })
 ///     }
 /// }
 /// ```

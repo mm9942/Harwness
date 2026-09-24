@@ -17,6 +17,11 @@
 //! `uia_worker_provider`-Pendant (der Worker teilt sich den effektiven
 //! UIA-Provider mit `/uia-model`), der anders als die beiden anderen keinen
 //! Live-`SessionController`-Pfad hat und erst beim nächsten Sitzungsstart wirkt.
+//! Für `/models` und `/mode default` kommen [`persist_internal_model`]
+//! (`[internal_models.<stelle>]`, inkl. Orchestrator/Sub-Orchestrator),
+//! [`clear_uia_selection`] (entfernt `uia_provider`/`uia_model`) und
+//! [`persist_default_interaction_mode`] (`[mode] default`) hinzu — alle
+//! ebenfalls bestes Bemühen und erst ab der nächsten Sitzung wirksam.
 //!
 //! Zusätzlich stellt dieses Modul [`SelectionPersistence`] bereit: einen
 //! austauschbaren Dienst-Trait, der die vier `persist_*`-Funktionen hinter
@@ -44,7 +49,9 @@
 //! # Fehlertypen
 //! - [`harw_operations::OpError::Execution`]: wenn die Config-Discovery fehlschlägt.
 //! - [`persist_default_selection`]/[`persist_uia_selection`]/
-//!   [`persist_uia_worker_model`]/[`persist_uia_reasoning_effort`] (und ihre
+//!   [`persist_uia_worker_model`]/[`persist_uia_reasoning_effort`]/
+//!   [`persist_internal_model`]/[`clear_uia_selection`]/
+//!   [`persist_default_interaction_mode`] (und ihre
 //!   [`SelectionPersistence`]-Trait-Pendants) liefern nie `Err` —
 //!   Persistenzfehler werden als menschenlesbare Notiz zurückgegeben, nicht
 //!   propagiert.
@@ -900,8 +907,10 @@ pub(crate) fn selection_persistence(ctx: &OpContext) -> Arc<dyn SelectionPersist
 mod tests {
     use super::{
         FileSelectionPersistence, OpError, RecordedSelectionPersistCall,
-        RecordingSelectionPersistence, SelectionPersistence, execution_error,
+        RecordingSelectionPersistence, SelectionPersistence, clear_uia_keys, execution_error,
+        write_default_interaction_mode, write_internal_model,
     };
+    use harw_config::InternalModelPoint;
     use crate::test_support::{TestResult, ctx};
 
     #[test]
@@ -1097,6 +1106,136 @@ mod tests {
         let reopened =
             harw_config::ConfigWriter::open(&config_path).map_err(ctx("reopen after removal"))?;
         assert!(reopened.get_value("reasoning.uia").is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn recording_selection_persistence_records_internal_model_and_clear_uia() {
+        let recorder = RecordingSelectionPersistence::new();
+        let first = recorder.persist_internal_model(
+            InternalModelPoint::Explorer,
+            Some("openrouter"),
+            Some("nvidia/x"),
+        );
+        let second = recorder.persist_internal_model(InternalModelPoint::Research, None, None);
+        let third = recorder.clear_uia_selection();
+
+        assert!(first.is_none() && second.is_none() && third.is_none());
+        assert_eq!(
+            recorder.calls(),
+            vec![
+                RecordedSelectionPersistCall::InternalModel {
+                    point: InternalModelPoint::Explorer,
+                    provider: Some("openrouter".to_owned()),
+                    model: Some("nvidia/x".to_owned()),
+                },
+                RecordedSelectionPersistCall::InternalModel {
+                    point: InternalModelPoint::Research,
+                    provider: None,
+                    model: None,
+                },
+                RecordedSelectionPersistCall::ClearUia,
+            ]
+        );
+    }
+
+    /// Schreibkern von `persist_internal_model`: setzt beide Felder unter
+    /// `[internal_models.<stelle>]` und entfernt die Tabelle beim Reset
+    /// (`None`/`None`) vollständig.
+    #[test]
+    fn write_internal_model_sets_and_removes_the_point_table() -> TestResult {
+        let dir = tempfile::tempdir().map_err(ctx("tempdir"))?;
+        let config_path = dir.path().join("config.toml");
+
+        let mut writer = harw_config::ConfigWriter::open(&config_path).map_err(ctx("open"))?;
+        write_internal_model(
+            &mut writer,
+            InternalModelPoint::Explorer,
+            Some("openrouter"),
+            Some("nvidia/nemotron"),
+        )
+        .map_err(|reason| crate::test_support::TestError::Unexpected(reason))?;
+        writer.save().map_err(ctx("save"))?;
+
+        let reopened = harw_config::ConfigWriter::open(&config_path).map_err(ctx("reopen"))?;
+        assert_eq!(
+            reopened.get_value("internal_models.explorer.provider"),
+            Some("openrouter".to_owned())
+        );
+        assert_eq!(
+            reopened.get_value("internal_models.explorer.model"),
+            Some("nvidia/nemotron".to_owned())
+        );
+
+        // Provider ohne Modell: `model` wird entfernt, `provider` bleibt.
+        let mut writer = harw_config::ConfigWriter::open(&config_path).map_err(ctx("reopen2"))?;
+        write_internal_model(
+            &mut writer,
+            InternalModelPoint::Explorer,
+            Some("anthropic"),
+            None,
+        )
+        .map_err(|reason| crate::test_support::TestError::Unexpected(reason))?;
+        writer.save().map_err(ctx("save2"))?;
+        let reopened = harw_config::ConfigWriter::open(&config_path).map_err(ctx("reopen3"))?;
+        assert_eq!(
+            reopened.get_value("internal_models.explorer.provider"),
+            Some("anthropic".to_owned())
+        );
+        assert!(reopened.get_value("internal_models.explorer.model").is_none());
+
+        // Reset: die ganze Stellen-Tabelle verschwindet.
+        let mut writer = harw_config::ConfigWriter::open(&config_path).map_err(ctx("reopen4"))?;
+        write_internal_model(&mut writer, InternalModelPoint::Explorer, None, None)
+            .map_err(|reason| crate::test_support::TestError::Unexpected(reason))?;
+        writer.save().map_err(ctx("save3"))?;
+        let content = std::fs::read_to_string(&config_path).map_err(ctx("read back"))?;
+        assert!(
+            !content.contains("[internal_models.explorer]"),
+            "Reset muss die Stellen-Tabelle entfernen: {content}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn clear_uia_keys_removes_provider_and_model() -> TestResult {
+        let dir = tempfile::tempdir().map_err(ctx("tempdir"))?;
+        let config_path = dir.path().join("config.toml");
+        std::fs::write(
+            &config_path,
+            "uia_provider = \"anthropic\"\nuia_model = \"claude-x\"\nuia_worker_model = \"w\"\n",
+        )
+        .map_err(ctx("seed"))?;
+
+        let mut writer = harw_config::ConfigWriter::open(&config_path).map_err(ctx("open"))?;
+        clear_uia_keys(&mut writer);
+        writer.save().map_err(ctx("save"))?;
+
+        let reopened = harw_config::ConfigWriter::open(&config_path).map_err(ctx("reopen"))?;
+        assert!(reopened.get_value("uia_provider").is_none());
+        assert!(reopened.get_value("uia_model").is_none());
+        assert_eq!(
+            reopened.get_value("uia_worker_model"),
+            Some("w".to_owned()),
+            "der Worker-Pin gehört nicht zur UIA-Auswahl"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn write_default_interaction_mode_sets_nested_mode_default() -> TestResult {
+        let dir = tempfile::tempdir().map_err(ctx("tempdir"))?;
+        let config_path = dir.path().join("config.toml");
+
+        let mut writer = harw_config::ConfigWriter::open(&config_path).map_err(ctx("open"))?;
+        write_default_interaction_mode(&mut writer, "explore")
+            .map_err(|reason| crate::test_support::TestError::Unexpected(reason))?;
+        writer.save().map_err(ctx("save"))?;
+
+        let reopened = harw_config::ConfigWriter::open(&config_path).map_err(ctx("reopen"))?;
+        assert_eq!(reopened.get_value("mode.default"), Some("explore".to_owned()));
+        let content = std::fs::read_to_string(&config_path).map_err(ctx("read back"))?;
+        assert!(content.contains("[mode]"), "{content}");
         Ok(())
     }
 }
