@@ -1719,11 +1719,7 @@ fn telegram_offset_root(channel_state: &Path, binding_id: &str) -> PathBuf {
     if binding_id == TELEGRAM_LEGACY_OFFSET_BINDING {
         return legacy;
     }
-    let encoded = binding_id
-        .bytes()
-        .map(|byte| format!("{byte:02x}"))
-        .collect::<String>();
-    legacy.join(encoded)
+    legacy.join(telegram_binding_dir_name(binding_id))
 }
 
 /// Gültigkeit der Freigabe-Schaltflächen (Approval-Tokens) und Obergrenze

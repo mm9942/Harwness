@@ -35,6 +35,16 @@
 //! deren Workbench sie beschreiben dürften, und die Sichtbarkeitsprüfung der
 //! Wissensfläche kennt noch keinen Web-/Job-Aufrufer.
 //!
+//! # Kanban-Job-Ledger
+//! Liegen ein Wissensspeicher **und** ein `JobStore` vor und trägt das
+//! [`Principal`] einen Freigabe-Akteur (`Principal::approval_actor`), legt
+//! die Fabrik auf denselben Flächen wie den Wissensspeicher (Slash,
+//! Modell-Werkzeug) zusätzlich `Arc<dyn JobTransitions>` ab —
+//! [`crate::job_ledger::JobStoreTransitions`] über den geteilten
+//! `JobStore`. Damit bewegt `/kanban` Karten über den durablen Ledger.
+//! Fehlt eine der drei Zutaten, fehlt der Ledger (fail closed: `/kanban`
+//! meldet Übergänge dann `NotAvailable`).
+//!
 //! # Was hier bewusst NICHT registriert wird
 //! - Web-eigene Dienste (`PeerCredentials`, `Arc<dyn ApprovalActorResolver>`,
 //!   `Arc<ApprovalStore>`): sie stammen pro Verbindung aus dem Kernel bzw. aus
@@ -65,7 +75,9 @@ use harw_config::ResolvedConfig;
 use harw_core::{ManagedAgentSpawner, StateStore};
 use harw_extension_api::allow_rules::AllowRuleSet;
 use harw_extension_api::approval_mode::ApprovalModeCell;
+use harw_job_runtime::JobScope;
 use harw_knowledge::KnowledgeStore;
+use harw_knowledge::kanban::lifecycle::JobTransitions;
 use harw_memory::Memory;
 use harw_operations::registry::OperationRegistry;
 use harw_operations::{ServiceMap, SharedSessionController};
@@ -75,7 +87,15 @@ use harw_provider_http::ProviderLoadRegistry;
 use harw_sandbox::ExtraRootsCell;
 use harw_session_store::JobStore;
 use harw_tool_shell::HostPermitHandles;
-use harw_types::Principal;
+use harw_types::{Principal, TenantId, WorkspaceId};
+
+use crate::job_ledger::JobStoreTransitions;
+
+/// Mandant, unter dem die Fabrik Kanban-Jobs zulässt (lokaler Einzelbetrieb).
+pub const KANBAN_TENANT: &str = "local";
+
+/// Arbeitsbereich, unter dem die Fabrik Kanban-Jobs zulässt.
+pub const KANBAN_WORKSPACE: &str = "kanban";
 
 // ── ServiceSurface ────────────────────────────────────────────────────────────
 
@@ -532,6 +552,7 @@ impl RuntimeServices {
     /// | `Arc<ManagedAgentSpawner>` (falls vorhanden) | ✓ | ✓ | — | — |
     /// | [`SharedSessionController`] (falls vorhanden) | ✓ | ✓ | — | — |
     /// | `Arc<KnowledgeStore>` (falls gebunden, L6) | ✓ | ✓ | — | — |
+    /// | `Arc<dyn JobTransitions>` (Speicher + `JobStore` + Freigabe-Akteur) | ✓ | ✓ | — | — |
     ///
     /// Die Zeile [`OperationRegistry`] trägt in jeder Fläche dieselbe Menge —
     /// nämlich die, die [`crate::spec::EntryProfile::operations`] dem Einstieg
@@ -669,6 +690,9 @@ impl RuntimeServices {
         {
             insert_service(&mut map, &mut names, Arc::clone(knowledge));
         }
+        if let Some(ledger) = self.kanban_ledger(surface) {
+            insert_service(&mut map, &mut names, ledger);
+        }
         if let Some(plan) = &self.parts.plan {
             // `register_plan_services` legt genau diese vier Typen ab
             // (harw-plan-bridge/src/context_ext.rs:202-205). Der Test
@@ -689,6 +713,33 @@ impl RuntimeServices {
 
         (map, names)
     }
+
+    /// Das Kanban-Job-Ledger einer Fläche.
+    ///
+    /// # Beschreibung
+    /// Nur auf Flächen mit Wissensspeicher ([`ServiceSurface::allows_knowledge_store`]),
+    /// nur mit gebundenem Speicher, vorhandenem `JobStore` und einem
+    /// Freigabe-Akteur des [`Principal`] — dieser wird `submitter` der
+    /// zugelassenen Jobs und Akteur von `unblock`/`retry`/`cancel`.
+    ///
+    /// # Rückgabe
+    /// `Some(Arc<dyn JobTransitions>)` über den geteilten `JobStore`, sonst `None`.
+    fn kanban_ledger(&self, surface: ServiceSurface) -> Option<Arc<dyn JobTransitions>> {
+        if !surface.allows_knowledge_store() || self.knowledge.is_none() {
+            return None;
+        }
+        let job_store = self.parts.job_store.as_ref()?;
+        let actor = self.parts.principal.approval_actor()?;
+        let scope = JobScope::new(
+            TenantId::from_str(KANBAN_TENANT),
+            WorkspaceId::from_str(KANBAN_WORKSPACE),
+            actor,
+        );
+        Some(Arc::new(JobStoreTransitions::new(
+            Arc::clone(job_store),
+            scope,
+        )))
+    }
 }
 
 #[cfg(test)]
@@ -702,6 +753,7 @@ mod tests {
     use harw_extension_api::allow_rules::AllowRuleSet;
     use harw_extension_api::approval_mode::{ApprovalMode, ApprovalModeCell};
     use harw_knowledge::KnowledgeStore;
+    use harw_knowledge::kanban::lifecycle::JobTransitions;
     use harw_memory::{Entry, MaintenanceReport, Memory, MemoryResult, RecallQuery, Signal, Stats};
     use harw_operations::registry::OperationRegistry;
     use harw_operations::session_control::NullSessionController;
@@ -1235,8 +1287,9 @@ mod tests {
         Ok(())
     }
 
-    /// Mit Speicher unterscheiden sich Web/Job vom Slash-Pfad um genau die
-    /// drei deklarierten Einträge.
+    /// Mit Speicher (und `JobStore` samt Freigabe-Akteur) unterscheiden sich
+    /// Web/Job vom Slash-Pfad um genau die drei deklarierten Einträge plus das
+    /// davon abgeleitete Kanban-Ledger.
     #[test]
     fn with_a_store_surfaces_differ_only_in_the_three_declared_entries() {
         let store = Arc::new(KnowledgeStore::new(Path::new("/nonexistent/l6/knowledge")));
@@ -1255,10 +1308,70 @@ mod tests {
                     type_name::<Arc<ManagedAgentSpawner>>(),
                     type_name::<SharedSessionController>(),
                     type_name::<Arc<KnowledgeStore>>(),
+                    type_name::<Arc<dyn JobTransitions>>(),
                 ]),
                 "Fläche {}",
                 surface.as_str()
             );
+        }
+    }
+
+    /// Kanban-Ledger: mit Speicher, `JobStore` und Freigabe-Akteur liegt
+    /// `Arc<dyn JobTransitions>` auf genau den Flächen des Wissensspeichers.
+    #[test]
+    fn job_transitions_follow_the_knowledge_store_surfaces() {
+        let store = Arc::new(KnowledgeStore::new(Path::new("/nonexistent/l6/knowledge")));
+        let services = RuntimeServices::new(full_parts()).with_knowledge_store(store);
+        for surface in ServiceSurface::ALL {
+            let map = services.service_map(surface);
+            assert_eq!(
+                map.get::<Arc<dyn JobTransitions>>().is_some(),
+                surface.allows_knowledge_store(),
+                "Kanban-Ledger auf {}",
+                surface.as_str()
+            );
+            assert_eq!(
+                services
+                    .registered(surface)
+                    .contains(&type_name::<Arc<dyn JobTransitions>>()),
+                surface.allows_knowledge_store(),
+                "{}",
+                surface.as_str()
+            );
+        }
+    }
+
+    /// Ohne `JobStore`, ohne Wissensspeicher oder ohne Freigabe-Akteur gibt
+    /// es kein Kanban-Ledger (fail closed).
+    #[test]
+    fn job_transitions_need_store_job_store_and_an_approval_actor() {
+        let knowledge = || Arc::new(KnowledgeStore::new(Path::new("/nonexistent/l6/knowledge")));
+
+        let without_knowledge = RuntimeServices::new(full_parts());
+        let mut no_job_store = full_parts();
+        no_job_store.job_store = None;
+        let without_job_store =
+            RuntimeServices::new(no_job_store).with_knowledge_store(knowledge());
+        let mut model_principal = full_parts();
+        model_principal.principal = Principal::trusted_ingress(
+            PrincipalKind::Model,
+            "w2b-04-model",
+            IngressSurface::Tui,
+            PermissionTier::Owner,
+        );
+        let without_actor = RuntimeServices::new(model_principal).with_knowledge_store(knowledge());
+
+        for services in [without_knowledge, without_job_store, without_actor] {
+            for surface in ServiceSurface::ALL {
+                assert!(
+                    services
+                        .service_map(surface)
+                        .get::<Arc<dyn JobTransitions>>()
+                        .is_none(),
+                    "{} darf ohne alle Zutaten kein Kanban-Ledger tragen",
+                    surface.as_str()
+                );
+            }
         }
     }
 
