@@ -94,8 +94,8 @@ jobs:
         working-directory: dist
         run: |
           set -euo pipefail
-          sha256sum *.tar.gz > SHA256SUMS
-          rm -f *.tar.gz.sha256
+          sha256sum -- *.tar.gz > SHA256SUMS
+          rm -f -- *.tar.gz.sha256
 
       - name: Create GitHub release
         uses: softprops/action-gh-release@v2
