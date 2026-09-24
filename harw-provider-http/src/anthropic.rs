@@ -159,6 +159,10 @@ pub struct AnthropicMessagesProvider {
     credential_pool: Option<Arc<crate::credential_pool::CredentialPool<AnthropicCredential>>>,
     /// Pro-Modell-Entscheidung für SSE-Streaming (siehe [`crate::sse::StreamPolicy`]).
     stream_policy: crate::sse::StreamPolicy,
+    /// Client-seitige RPM/TPM-Budgets (siehe [`crate::budget`]); leer (ohne
+    /// Wirkung) bis `build_named_provider` sie über
+    /// [`Self::configure_budgets`] setzt.
+    budgets: crate::budget::ProviderBudgets,
 }
 
 impl AnthropicMessagesProvider {
@@ -194,6 +198,7 @@ impl AnthropicMessagesProvider {
             concurrency_limiter: None,
             credential_pool: None,
             stream_policy: crate::sse::StreamPolicy::default(),
+            budgets: crate::budget::ProviderBudgets::default(),
         })
     }
 
@@ -236,6 +241,13 @@ impl AnthropicMessagesProvider {
 
     pub(crate) fn configure_stream_policy(&mut self, policy: crate::sse::StreamPolicy) {
         self.stream_policy = policy;
+    }
+
+    /// Setzt die client-seitigen RPM/TPM-Budgets (siehe [`crate::budget`]);
+    /// aufgerufen von `build_named_provider` im Anthropic-Zweig mit dem
+    /// Ergebnis von `ProviderBudgetRegistry::configure_provider`.
+    pub(crate) fn configure_budgets(&mut self, budgets: crate::budget::ProviderBudgets) {
+        self.budgets = budgets;
     }
 
     pub(crate) fn configure_rate_limit(&mut self, rate_limit: Option<harw_config::RateLimitToml>) {
@@ -291,6 +303,7 @@ impl AnthropicMessagesProvider {
             self.concurrency_limiter.as_deref(),
             &self.rate_limiter,
         )
+        .with_budgets(&self.budgets)
     }
 
     /// Resolves the model for one request after checking its provider affinity.
@@ -974,10 +987,34 @@ impl AnthropicMessagesProvider {
             }
         }
 
-        // Header-Pacing zuerst: eine Pacing-Pause darf keinen
+        // Eingabe-Schätzung nur berechnen, wenn Budgets oder der Header-Pacer
+        // sie tatsächlich brauchen (Serialisierung des Wire-Bodys).
+        let estimated_input = if self.budgets.is_empty() && !self.rate_limiter.is_enabled() {
+            0
+        } else {
+            crate::budget::estimate_wire_tokens(&wire)
+        };
+        // Client-seitige RPM/TPM-Budgets (siehe [`crate::budget`]) und
+        // Header-Pacing zuerst: eine Wartepause darf keinen
         // Nebenläufigkeits-Slot belegen, sonst blockiert ein wartender Request
-        // andere, die sofort senden dürften.
-        self.rate_limiter.wait_for_slot().await;
+        // andere, die sofort senden dürften. Fail-fast, wenn schon die
+        // Eingabe-Schätzung ein Minutenlimit sprengt. Der Budget-Permit lebt
+        // bis zum Abgleich mit der tatsächlichen Nutzung unten.
+        let budget_permit = if self.budgets.is_empty() {
+            crate::budget::BudgetPermit::empty()
+        } else {
+            let max_output = wire
+                .get("max_tokens")
+                .and_then(Value::as_u64)
+                .unwrap_or_else(|| u64::from(self.max_tokens));
+            self.budgets
+                .acquire(model, estimated_input, max_output)
+                .await?
+        };
+        self.rate_limiter
+            .wait_for_slot_with_estimate(estimated_input)
+            .await
+            .map_err(crate::rate_budget_error)?;
         // Hartes Nebenläufigkeits-Limit (siehe [`Self::concurrency_limiter`]):
         // blockiert, bis ein Slot frei wird, statt fehlzuschlagen. Der Guard
         // bleibt bis zum Ende dieser Funktion (also bis der Response-Body
@@ -1013,7 +1050,9 @@ impl AnthropicMessagesProvider {
             let mut accumulator = crate::sse::AnthropicStreamAccumulator::default();
             crate::sse::read_sse(response, |frame| accumulator.push(&frame, Some(sink))).await?;
             let value = accumulator.finish()?;
-            return self.interpret_body(&request, model, &value);
+            let response = self.interpret_body(&request, model, &value)?;
+            budget_permit.reconcile(&response.usage);
+            return Ok(response);
         }
         let body = response
             .text()
@@ -1026,6 +1065,14 @@ impl AnthropicMessagesProvider {
                 // dieses Providers (siehe
                 // `rate_limiter::ProviderRateLimiter::record_rate_limited`).
                 self.rate_limiter.record_rate_limited();
+                // Sperrt alle Budget-Buckets dieses Requests (auch für bereits
+                // Wartende) für die `Retry-After`-Dauer.
+                let hint = crate::error::retry_after_hint(
+                    retry_after_header.as_deref(),
+                    retry_after_ms_header.as_deref(),
+                    &body,
+                );
+                self.budgets.penalize(model, hint.map(Duration::from_secs));
             }
             let error = anthropic_error_for_status(
                 status.as_u16(),
@@ -1043,7 +1090,9 @@ impl AnthropicMessagesProvider {
         }
 
         let value: Value = serde_json::from_str(&body)?;
-        self.interpret_body(&request, model, &value)
+        let response = self.interpret_body(&request, model, &value)?;
+        budget_permit.reconcile(&response.usage);
+        Ok(response)
     }
 
     /// Projiziert einen (ggf. aus SSE rekonstruierten) Messages-Body auf eine

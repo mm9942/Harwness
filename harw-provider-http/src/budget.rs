@@ -1078,7 +1078,7 @@ impl ProviderBudgetRegistry {
                 .as_ref()
                 .and_then(BudgetLimits::from_config)
                 .unwrap_or_default();
-            if let Some(budget) = self.configure(provider_id, Some(&model.id), limits) {
+            if let Some(budget) = self.configure(provider_id, Some(model.id.as_str()), limits) {
                 configured.insert(model.id.clone());
                 budgets = budgets.with_model(&model.id, &model.aliases, budget);
             }

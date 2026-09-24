@@ -4,6 +4,14 @@
 //! `env:HARW_TELEGRAM_BOT_TOKEN`. Pairing akzeptiert nur eine frische,
 //! einmalige lokale Pairing-Referenz und bindet sie an die Telegram-ID der
 //! Nachricht, die den Code tatsächlich gesendet hat.
+//!
+//! Wichtig: `harw connect --channel telegram --pair <Code>` liest die
+//! Bot-Updates selbst per `getUpdates`. Solange der Gateway denselben Bot per
+//! Long-Poll abfragt, dürfen beide nicht gleichzeitig laufen — Telegram
+//! liefert jedes Update nur an einen Abrufer aus (parallele Abfragen enden
+//! mit `409 Conflict` bzw. der Gateway „verbraucht“ die `/pair`-Nachricht).
+//! Vor dem Pairing daher den Gateway stoppen oder das Pairing über den
+//! laufenden Gateway (`security.allow_unpinned_pairing`) abwickeln.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -60,6 +68,7 @@ fn setup(home: &Path) -> Result<(), String> {
         rate_limit: Default::default(),
         attachments: Default::default(),
         commands: Default::default(),
+        workspaces: Vec::new(),
     };
     let mut document = ChannelFileToml::default();
     document.channel.telegram.push(channel);

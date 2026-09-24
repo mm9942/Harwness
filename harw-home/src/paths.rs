@@ -11,6 +11,10 @@
 //!   falls gesetzt, auf ein existierendes Verzeichnis zeigen.
 //! - `HARW_PROFILE`: Name des aktiven Profils (überschreibt `active_profile`).
 //!
+//! Ein prozessweiter Profil-Override ([`set_profile_override`], z. B. aus
+//! `--profile`) hat Vorrang vor `HARW_PROFILE`; er ersetzt das Setzen der
+//! Umgebungsvariablen, das ohne `unsafe` nicht möglich ist.
+//!
 //! # Verzeichnisse des Ausbauprogramms AW0–AW7
 //! Mehrere Teilsysteme des Ausbauprogramms legen Dateien unterhalb des
 //! Root-Space ab; ihre Pfade sind hier benannt, damit der Speicherort aus dem
@@ -31,6 +35,7 @@
 //!   Index (kein Filter auf einem gemeinsamen Index).
 
 use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
 
 use crate::error::{HomeError, HomeResult};
 use crate::trust::{TrustStatus, project_trust_status};
@@ -70,12 +75,62 @@ pub fn home_dir() -> HomeResult<PathBuf> {
     }
 }
 
+/// Prozessweiter Profil-Override (siehe [`set_profile_override`]).
+static PROFILE_OVERRIDE: OnceLock<String> = OnceLock::new();
+
+/// Setzt das aktive Profil prozessweit, mit Vorrang vor `HARW_PROFILE`.
+///
+/// # Beschreibung
+/// Gedacht für einen expliziten Profilwunsch des Aufrufers (etwa
+/// `--profile NAME`), bevor irgendein Pfad aufgelöst wird. Der Name wird wie
+/// ein Wert aus `HARW_PROFILE` behandelt: Leerraum am Rand wird entfernt, und
+/// er muss ein gültiger Profilname sein (`[A-Za-z0-9_-]+`). Der Override lässt
+/// sich genau einmal festlegen; ein erneuter Aufruf mit demselben Namen ist
+/// wirkungslos und erfolgreich.
+///
+/// # Argumente
+/// - `name` (`String`): gewünschter Profilname.
+///
+/// # Errors
+/// [`HomeError::InvalidProfileName`], wenn `name` leer oder ungültig ist oder
+/// bereits ein **anderer** Override gesetzt wurde (der Fehler nennt dann den
+/// abgelehnten neuen Namen).
+///
+/// # Nebenläufigkeit
+/// Threadsicher über [`OnceLock`]; konkurrierende Aufrufe mit
+/// unterschiedlichen Namen: genau einer gewinnt, die übrigen erhalten einen
+/// Fehler.
+pub fn set_profile_override(name: String) -> HomeResult<()> {
+    set_profile_override_in(&PROFILE_OVERRIDE, name)
+}
+
+/// Kern von [`set_profile_override`] über eine explizite Zelle (testbar ohne
+/// den prozessweiten Zustand zu verändern).
+fn set_profile_override_in(cell: &OnceLock<String>, name: String) -> HomeResult<()> {
+    let trimmed = name.trim();
+    if trimmed.is_empty() || !is_valid_profile_name(trimmed) {
+        return Err(HomeError::InvalidProfileName { name });
+    }
+    let stored = cell.get_or_init(|| trimmed.to_owned());
+    if stored == trimmed {
+        Ok(())
+    } else {
+        Err(HomeError::InvalidProfileName {
+            name: trimmed.to_owned(),
+        })
+    }
+}
+
 /// Ermittelt den Namen des aktiven Profils.
 ///
-/// Präzedenz: `HARW_PROFILE` → Inhalt der `active_profile`-Datei → `default`.
+/// Präzedenz: Override aus [`set_profile_override`] → `HARW_PROFILE` →
+/// Inhalt der `active_profile`-Datei → `default`.
 /// Diese Funktion liest höchstens eine kleine Textdatei und legt nichts an.
 #[must_use]
 pub fn active_profile_name(home: &Path) -> String {
+    if let Some(name) = PROFILE_OVERRIDE.get() {
+        return name.clone();
+    }
     if let Some(name) = std::env::var(HARW_PROFILE_ENV)
         .ok()
         .map(|value| value.trim().to_owned())
@@ -548,6 +603,33 @@ fn user_home_directory() -> Option<PathBuf> {
 mod tests {
     use super::*;
     use crate::test_support::TestResult;
+
+    #[test]
+    fn profile_override_validates_and_rejects_a_different_second_value() {
+        // Eigene Zelle: der prozessweite Override bleibt für andere Tests
+        // unberührt.
+        let cell = OnceLock::new();
+        assert!(matches!(
+            set_profile_override_in(&cell, "   ".to_owned()),
+            Err(HomeError::InvalidProfileName { .. })
+        ));
+        assert!(matches!(
+            set_profile_override_in(&cell, "../flucht".to_owned()),
+            Err(HomeError::InvalidProfileName { .. })
+        ));
+        assert!(cell.get().is_none(), "ungültige Namen setzen nichts");
+
+        assert!(set_profile_override_in(&cell, " arbeit ".to_owned()).is_ok());
+        assert_eq!(cell.get().map(String::as_str), Some("arbeit"));
+        // Derselbe Name erneut: erfolgreich und ohne Wirkung.
+        assert!(set_profile_override_in(&cell, "arbeit".to_owned()).is_ok());
+        // Ein anderer Name: Fehler, der erste Wert bleibt.
+        assert!(matches!(
+            set_profile_override_in(&cell, "privat".to_owned()),
+            Err(HomeError::InvalidProfileName { name }) if name == "privat"
+        ));
+        assert_eq!(cell.get().map(String::as_str), Some("arbeit"));
+    }
 
     #[test]
     fn plans_dir_ends_with_plans_component_below_home() {

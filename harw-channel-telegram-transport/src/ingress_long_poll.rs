@@ -20,7 +20,7 @@ use crate::{
     BotInfo, DedupWindow, TelegramClient, TelegramOffsetStore, TransportResult,
     error::TelegramTransportError,
     hand_off::CallbackConsumer,
-    mapping::{RawUpdate, map_callback_query, map_update},
+    mapping::{RawUpdate, callback_query_id, map_callback_query, map_update},
 };
 
 const DEFAULT_TIMEOUT_SECS: u64 = 30;
@@ -28,6 +28,12 @@ const DEFAULT_ALLOWED_UPDATES: [&str; 2] = ["message", "edited_message"];
 /// Update-Arten, sobald ein [`CallbackConsumer`] registriert ist: zusätzlich
 /// `callback_query`, damit Inline-Button-Klicks überhaupt zugestellt werden.
 const CALLBACK_ALLOWED_UPDATES: [&str; 3] = ["message", "edited_message", "callback_query"];
+/// Erste Wartezeit nach einem transienten `getUpdates`-Fehler.
+const POLL_BACKOFF_INITIAL: Duration = Duration::from_secs(1);
+/// Obergrenze der exponentiellen Wartezeit nach transienten Fehlern.
+const POLL_BACKOFF_MAX: Duration = Duration::from_secs(30);
+/// Granularität, mit der eine Backoff-Pause das Stopp-Signal prüft.
+const SHUTDOWN_POLL_SLICE: Duration = Duration::from_millis(250);
 
 /// Cooperative shutdown signal for a long-poll runner.
 ///
@@ -165,10 +171,33 @@ async fn run_long_poll(config: LongPollConfig) -> TransportResult<()> {
     // diagnostisch (Log-Feld), nicht durabel — siehe `decode_update`s Doku.
     let mut poison_update_count: u64 = 0;
 
+    let mut backoff = PollBackoff::new();
+
     'poll: while !shutdown.is_requested() {
-        let updates = client
+        let updates = match client
             .get_updates(persisted_offset, timeout_secs, allowed_updates)
-            .await?;
+            .await
+        {
+            Ok(updates) => {
+                backoff.reset();
+                updates
+            }
+            Err(error) => match classify_get_updates_error(&error) {
+                PollErrorClass::Permanent => return Err(error),
+                PollErrorClass::Transient => {
+                    let delay = backoff.next_delay();
+                    tracing::warn!(
+                        error = %error,
+                        backoff_secs = delay.as_secs(),
+                        "Telegram long-poll: transienter getUpdates-Fehler, neuer Versuch nach Wartezeit"
+                    );
+                    if !sleep_unless_shutdown(delay, &shutdown).await {
+                        break 'poll;
+                    }
+                    continue 'poll;
+                }
+            },
+        };
 
         for value in updates {
             if shutdown.is_requested() {
@@ -234,6 +263,80 @@ async fn run_long_poll(config: LongPollConfig) -> TransportResult<()> {
     Ok(())
 }
 
+/// Einordnung eines `getUpdates`-Fehlers für die Wiederholungsstrategie.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PollErrorClass {
+    /// Vorübergehend (Netzwerk, 5xx, 429): mit Backoff erneut versuchen.
+    Transient,
+    /// Dauerhaft (z. B. 401 ungültiger Token, 404, 409 Konflikt mit einem
+    /// Webhook oder zweitem Poller): Runner beenden, Supervision entscheidet.
+    Permanent,
+}
+
+/// Ordnet einen `getUpdates`-Fehler als transient oder dauerhaft ein.
+///
+/// Transient sind Transportfehler (Verbindung, Timeout, TLS), HTTP-5xx und
+/// 429. Ein von Telegram gesetztes `retry_after` wertet bereits der Client
+/// selbst aus; erreicht ein 429 diese Ebene, greift der eigene Backoff. Alles
+/// andere – insbesondere 401, 403, 404 und 409 – ist dauerhaft.
+fn classify_get_updates_error(error: &TelegramTransportError) -> PollErrorClass {
+    match error {
+        TelegramTransportError::Transport(_) => PollErrorClass::Transient,
+        TelegramTransportError::ApiRejected { code, .. }
+            if *code == 429 || (500..600).contains(code) =>
+        {
+            PollErrorClass::Transient
+        }
+        _ => PollErrorClass::Permanent,
+    }
+}
+
+/// Exponentieller Backoff (1 s, 2 s, 4 s, … höchstens 30 s) für transiente
+/// `getUpdates`-Fehler; ein erfolgreicher Poll setzt ihn zurück.
+#[derive(Debug)]
+struct PollBackoff {
+    next: Duration,
+}
+
+impl PollBackoff {
+    fn new() -> Self {
+        Self {
+            next: POLL_BACKOFF_INITIAL,
+        }
+    }
+
+    fn reset(&mut self) {
+        self.next = POLL_BACKOFF_INITIAL;
+    }
+
+    fn next_delay(&mut self) -> Duration {
+        let delay = self.next;
+        self.next = self
+            .next
+            .checked_mul(2)
+            .unwrap_or(POLL_BACKOFF_MAX)
+            .min(POLL_BACKOFF_MAX);
+        delay
+    }
+}
+
+/// Schläft `delay`, prüft dabei aber regelmäßig das Stopp-Signal.
+///
+/// Liefert `false`, sobald ein Shutdown angefordert wurde (vor oder während
+/// der Pause), sonst `true` nach Ablauf der vollen Wartezeit.
+async fn sleep_unless_shutdown(delay: Duration, shutdown: &LongPollShutdown) -> bool {
+    let mut remaining = delay;
+    while !remaining.is_zero() {
+        if shutdown.is_requested() {
+            return false;
+        }
+        let slice = remaining.min(SHUTDOWN_POLL_SLICE);
+        tokio::time::sleep(slice).await;
+        remaining = remaining.saturating_sub(slice);
+    }
+    !shutdown.is_requested()
+}
+
 /// Liefert die bei `getUpdates` angeforderten Update-Arten: `callback_query`
 /// nur, wenn ein [`CallbackConsumer`] registriert ist.
 fn allowed_updates_for(has_callback_consumer: bool) -> &'static [&'static str] {
@@ -247,10 +350,13 @@ fn allowed_updates_for(has_callback_consumer: bool) -> &'static [&'static str] {
 /// Reicht eine `callback_query` an den registrierten Consumer weiter.
 ///
 /// Liefert `true`, wenn der Callback zugestellt wurde. Ohne Consumer, ohne
-/// abbildbare Callback-Query oder bei einem bereits beanspruchten
-/// `update_id` (gleiche Deduplizierung wie Nachrichten) wird nichts
-/// zugestellt; der Offset rückt in jedem Fall normal vor. Die opake
-/// Callback-Nutzlast wird niemals geloggt.
+/// `callback_query` oder bei einem bereits beanspruchten `update_id` (gleiche
+/// Deduplizierung wie Nachrichten) wird nichts zugestellt; der Offset rückt
+/// in jedem Fall normal vor. Eine Callback-Query, die sich nicht sicher
+/// zuordnen lässt (z. B. ohne Nachricht oder Nutzlast), geht nach der
+/// Deduplizierung mit ihrer Query-ID an
+/// [`CallbackConsumer::handle_unroutable_callback`], damit der Client-Spinner
+/// beantwortet werden kann. Die opake Callback-Nutzlast wird niemals geloggt.
 fn dispatch_callback(
     update: &RawUpdate,
     consumer: Option<&dyn CallbackConsumer>,
@@ -259,14 +365,25 @@ fn dispatch_callback(
     let Some(consumer) = consumer else {
         return false;
     };
-    let Some(callback) = map_callback_query(update) else {
-        return false;
-    };
-    if !dedup.claim_update(update.update_id) {
-        return false;
+    match map_callback_query(update) {
+        Some(callback) => {
+            if !dedup.claim_update(update.update_id) {
+                return false;
+            }
+            consumer.handle_callback(callback);
+            true
+        }
+        None => {
+            let Some(callback_id) = callback_query_id(update) else {
+                return false;
+            };
+            if !dedup.claim_update(update.update_id) {
+                return false;
+            }
+            consumer.handle_unroutable_callback(callback_id);
+            true
+        }
     }
-    consumer.handle_callback(callback);
-    true
 }
 
 /// Decodes one raw Telegram update, also returning its `update_id` when that
@@ -395,11 +512,15 @@ mod tests {
 
     use jiff::Timestamp;
 
+    use std::time::Duration;
+
     use super::{
-        LongPollShutdown, SendOutcome, advance_offset_past_poison_update, allowed_updates_for,
+        LongPollShutdown, PollBackoff, PollErrorClass, SendOutcome,
+        advance_offset_past_poison_update, allowed_updates_for, classify_get_updates_error,
         decode_update, dispatch_callback, next_offset_after_safe_processing, restart_offset,
-        send_event_with_backoff,
+        send_event_with_backoff, sleep_unless_shutdown,
     };
+    use crate::error::TelegramTransportError;
     use crate::hand_off::CallbackConsumer;
     use crate::mapping::{RawUpdate, TelegramCallback};
     use crate::test_support::{TestError, TestResult, ctx};
@@ -588,14 +709,94 @@ mod tests {
         );
     }
 
+    fn rejected(code: i64) -> TelegramTransportError {
+        TelegramTransportError::ApiRejected {
+            method: "getUpdates",
+            code,
+            description: "test".to_owned(),
+        }
+    }
+
+    #[test]
+    fn server_errors_and_rate_limits_are_transient() {
+        for code in [429, 500, 502, 503, 599] {
+            assert_eq!(
+                classify_get_updates_error(&rejected(code)),
+                PollErrorClass::Transient,
+                "code {code}"
+            );
+        }
+    }
+
+    #[test]
+    fn auth_not_found_and_conflict_are_permanent() {
+        for code in [0, 400, 401, 403, 404, 409] {
+            assert_eq!(
+                classify_get_updates_error(&rejected(code)),
+                PollErrorClass::Permanent,
+                "code {code}"
+            );
+        }
+        assert_eq!(
+            classify_get_updates_error(&TelegramTransportError::WebhookAuth),
+            PollErrorClass::Permanent
+        );
+    }
+
+    #[test]
+    fn network_transport_failures_are_transient() -> TestResult {
+        // Ein ungültiger URL erzeugt synchron einen `reqwest::Error`, ohne
+        // Netzwerkzugriff.
+        let Err(error) = reqwest::Client::new().get("not a url").build() else {
+            return Err(TestError::Unexpected(
+                "an invalid URL must fail to build".to_owned(),
+            ));
+        };
+        assert_eq!(
+            classify_get_updates_error(&TelegramTransportError::from(error)),
+            PollErrorClass::Transient
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn poll_backoff_doubles_from_one_to_thirty_seconds_and_resets() {
+        let mut backoff = PollBackoff::new();
+        let delays: Vec<u64> = (0..8).map(|_| backoff.next_delay().as_secs()).collect();
+        assert_eq!(delays, [1, 2, 4, 8, 16, 30, 30, 30]);
+        backoff.reset();
+        assert_eq!(backoff.next_delay(), Duration::from_secs(1));
+    }
+
+    #[tokio::test]
+    async fn backoff_sleep_stops_immediately_on_shutdown() {
+        let shutdown = LongPollShutdown::default();
+        shutdown.request_shutdown();
+        let started = std::time::Instant::now();
+        assert!(!sleep_unless_shutdown(Duration::from_secs(30), &shutdown).await);
+        assert!(started.elapsed() < Duration::from_secs(1));
+    }
+
+    #[tokio::test]
+    async fn backoff_sleep_completes_without_shutdown() {
+        let shutdown = LongPollShutdown::default();
+        assert!(sleep_unless_shutdown(Duration::from_millis(10), &shutdown).await);
+    }
+
     /// Test-Consumer, der zugestellte Callbacks mitschreibt.
     #[derive(Default)]
-    struct RecordingConsumer(Mutex<Vec<TelegramCallback>>);
+    struct RecordingConsumer(Mutex<Vec<TelegramCallback>>, Mutex<Vec<String>>);
 
     impl CallbackConsumer for RecordingConsumer {
         fn handle_callback(&self, callback: TelegramCallback) {
             if let Ok(mut seen) = self.0.lock() {
                 seen.push(callback);
+            }
+        }
+
+        fn handle_unroutable_callback(&self, callback_id: String) {
+            if let Ok(mut seen) = self.1.lock() {
+                seen.push(callback_id);
             }
         }
     }
@@ -607,6 +808,37 @@ mod tests {
                 .map(|seen| seen.clone())
                 .map_err(|_| TestError::Unexpected("consumer mutex poisoned".to_owned()))
         }
+    }
+
+    impl RecordingConsumer {
+        fn unroutable(&self) -> TestResult<Vec<String>> {
+            self.1
+                .lock()
+                .map(|seen| seen.clone())
+                .map_err(|_| TestError::Unexpected("consumer mutex poisoned".to_owned()))
+        }
+    }
+
+    #[test]
+    fn unroutable_callback_is_answered_once_after_dedup() -> TestResult {
+        let consumer = RecordingConsumer::default();
+        let dedup = DedupWindow::new(16);
+        // Ohne `message`/`data` lässt sich der Klick nicht zuordnen.
+        let update: RawUpdate = serde_json::from_value(serde_json::json!({
+            "update_id": 11,
+            "callback_query": {
+                "id": "cb-stale",
+                "from": { "id": 44, "is_bot": false, "first_name": "Op" }
+            }
+        }))
+        .map_err(ctx("unroutable callback JSON is valid"))?;
+
+        assert!(dispatch_callback(&update, Some(&consumer), &dedup));
+        assert!(!dispatch_callback(&update, Some(&consumer), &dedup));
+
+        assert!(consumer.seen()?.is_empty());
+        assert_eq!(consumer.unroutable()?, ["cb-stale".to_owned()]);
+        Ok(())
     }
 
     fn callback_update(update_id: i64) -> TestResult<RawUpdate> {

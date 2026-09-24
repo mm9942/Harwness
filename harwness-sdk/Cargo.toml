@@ -36,7 +36,7 @@ serde_json = { workspace = true }
 # `Stream`-Trait für `EventStream` (identisch zu `tokio_stream::Stream`).
 futures-core = "0.3.32"
 # Kein `[workspace.dependencies]`-Eintrag für tokio; Version = Cargo.lock.
-tokio = { version = "1.53.0", features = ["rt", "sync", "time"] }
+tokio = { version = "1.53.0", features = ["rt", "sync", "time", "macros"] }
 # `BroadcastStream` über den `AgentEventHub` (Version = Cargo.lock).
 tokio-stream = { version = "0.1.18", features = ["sync"] }
 tracing = { workspace = true }

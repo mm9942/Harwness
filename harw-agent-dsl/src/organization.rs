@@ -192,6 +192,114 @@ fn default_depth_cost() -> u32 {
     1
 }
 
+impl RawClanSpec {
+    /// Tiefe eines Kindes, das ein Knoten dieses Clans auf `parent_depth`
+    /// startet (§15 `child_depth_cost`).
+    ///
+    /// # Beschreibung
+    /// Jede Kindebene innerhalb eines Clans kostet `child_depth_cost`
+    /// Tiefeneinheiten statt einer. Ein Clan mit Kosten `2` verbraucht damit
+    /// die geerbte Tiefendecke (`ChildRecord::depth_ceiling` im
+    /// Kind-Controller) doppelt so schnell — so begrenzt eine Organisation,
+    /// wie tief ein einzelner Clan seinen Teilbaum wachsen lassen darf, ohne
+    /// die globale Decke anzufassen. Die Kosten senken die erreichbare Tiefe
+    /// nur, sie heben sie nie an: `resolve_organization` weist
+    /// `child_depth_cost = 0` ab.
+    ///
+    /// # Argumente
+    /// - `parent_depth` (`u32`): Tiefe des startenden Knotens.
+    ///
+    /// # Rückgabe
+    /// `Some(parent_depth + child_depth_cost)`; `None` bei Überlauf — ein
+    /// Aufrufer behandelt das fail-closed als „keine weitere Ebene“.
+    ///
+    /// # Nebenläufigkeit
+    /// Rein.
+    ///
+    /// # Beispiele
+    /// ```rust,no_run
+    /// use harw_agent_dsl::organization::RawClanSpec;
+    ///
+    /// let clan: RawClanSpec = toml::from_str(r#"
+    /// id = "research"
+    /// name = "Research Clan"
+    /// leader = { id = "harwness.agent.research-orchestrator@1" }
+    /// family = { id = "harwness.family.research@1" }
+    /// plan_scope = "research-*"
+    /// child_depth_cost = 2
+    /// "#).unwrap();
+    /// assert_eq!(clan.child_depth(1), Some(3));
+    /// ```
+    #[must_use]
+    pub fn child_depth(&self, parent_depth: u32) -> Option<u32> {
+        parent_depth.checked_add(self.child_depth_cost)
+    }
+
+    /// Wie viele Kindebenen unter `parent_depth` innerhalb der Decke
+    /// `depth_ceiling` für diesen Clan noch entstehen dürfen.
+    ///
+    /// # Argumente
+    /// - `parent_depth` (`u32`): Tiefe des startenden Knotens.
+    /// - `depth_ceiling` (`u32`): die absolute, geerbte Tiefendecke (größte
+    ///   zulässige Tiefe einer Sitzung in diesem Teilbaum).
+    ///
+    /// # Rückgabe
+    /// `(depth_ceiling − parent_depth) / child_depth_cost` (abgerundet,
+    /// sättigend). Bei `child_depth_cost = 0` — nur über eine nicht
+    /// aufgelöste Rohdefinition erreichbar — fail-closed `0`, nie
+    /// „unbegrenzt“.
+    ///
+    /// # Nebenläufigkeit
+    /// Rein.
+    #[must_use]
+    pub fn remaining_levels(&self, parent_depth: u32, depth_ceiling: u32) -> u32 {
+        if self.child_depth_cost == 0 {
+            return 0;
+        }
+        depth_ceiling.saturating_sub(parent_depth) / self.child_depth_cost
+    }
+
+    /// Ob ein Kind dieses Clans auf `parent_depth` unter `depth_ceiling`
+    /// noch zulässig ist.
+    ///
+    /// # Rückgabe
+    /// `true`, wenn [`Self::child_depth`] existiert und `≤ depth_ceiling` ist.
+    #[must_use]
+    pub fn admits_child_at(&self, parent_depth: u32, depth_ceiling: u32) -> bool {
+        self.child_depth_cost > 0
+            && self
+                .child_depth(parent_depth)
+                .is_some_and(|depth| depth <= depth_ceiling)
+    }
+}
+
+impl ResolvedOrganization {
+    /// Der Clan mit der ID `clan_id`, falls vorhanden.
+    #[must_use]
+    pub fn clan(&self, clan_id: &str) -> Option<&RawClanSpec> {
+        self.clans.iter().find(|clan| clan.id == clan_id)
+    }
+
+    /// Die Tiefenkosten des Clans, den die Agentendefinition `leader_name`
+    /// führt (Vergleich über `leader.id.name`).
+    ///
+    /// # Beschreibung
+    /// Führt ein Leader mehrere Clans, gilt das **Maximum** ihrer Kosten —
+    /// die strengere Grenze, nie die großzügigere.
+    ///
+    /// # Rückgabe
+    /// `Some(kosten)`, wenn `leader_name` mindestens einen Clan führt, sonst
+    /// `None` (der Aufrufer bleibt dann bei der Standardtiefe `1`).
+    #[must_use]
+    pub fn child_depth_cost_for_leader(&self, leader_name: &str) -> Option<u32> {
+        self.clans
+            .iter()
+            .filter(|clan| clan.leader.id.name == leader_name)
+            .map(|clan| clan.child_depth_cost)
+            .max()
+    }
+}
+
 /// Eine Cell — temporärer Fan-out-Batch innerhalb eines Clans (§22, Invariante 11).
 ///
 /// # Beschreibung
@@ -564,6 +672,19 @@ pub fn resolve_organization(
         }
     }
 
+    // Validierung: child_depth_cost ≥ 1 → sonst DslError::Parse. Kosten 0
+    // hießen „eine Kindebene kostet keine Tiefe“ — ein Clan könnte seinen
+    // Teilbaum dann unbegrenzt tief wachsen lassen (§22: Clans sind
+    // begrenzte, run-lokale Subtrees).
+    for clan in &resolved_clans {
+        if clan.child_depth_cost == 0 {
+            return Err(DslError::Parse(format!(
+                "clan '{}' in Organisation '{}': child_depth_cost muss mindestens 1 sein",
+                clan.id, target_id
+            )));
+        }
+    }
+
     // Validierung: cell.clan muss auf existierende clan.id verweisen → DslError::MissingBase
     for cell in &resolved_cells {
         if !seen_clan_ids.contains(cell.clan.as_str()) {
@@ -760,6 +881,124 @@ plan_scope = "research/*"
 "#;
         let clan: RawClanSpec = toml::from_str(toml_str)?;
         assert_eq!(clan.child_depth_cost, 1);
+        Ok(())
+    }
+
+    fn clan_with_cost(cost: u32) -> TestResult<RawClanSpec> {
+        let toml_str = format!(
+            r#"
+id = "research"
+name = "Research Clan"
+leader = {{ id = "harwness.agent.research-orchestrator@1" }}
+family = {{ id = "harwness.family.research@1" }}
+plan_scope = "research-*"
+child_depth_cost = {cost}
+"#
+        );
+        Ok(toml::from_str(&toml_str)?)
+    }
+
+    #[test]
+    fn child_depth_adds_the_clan_cost() -> TestResult {
+        assert_eq!(clan_with_cost(1)?.child_depth(2), Some(3));
+        assert_eq!(clan_with_cost(2)?.child_depth(2), Some(4));
+        assert_eq!(clan_with_cost(1)?.child_depth(u32::MAX), None);
+        Ok(())
+    }
+
+    #[test]
+    fn remaining_levels_divides_the_headroom_by_the_cost() -> TestResult {
+        assert_eq!(clan_with_cost(1)?.remaining_levels(1, 4), 3);
+        assert_eq!(clan_with_cost(2)?.remaining_levels(1, 4), 1);
+        assert_eq!(clan_with_cost(2)?.remaining_levels(5, 4), 0);
+        // Fail-closed: eine unaufgelöste Kostenangabe 0 gibt nie Tiefe frei.
+        assert_eq!(clan_with_cost(0)?.remaining_levels(0, 4), 0);
+        Ok(())
+    }
+
+    #[test]
+    fn admits_child_at_respects_ceiling_and_zero_cost() -> TestResult {
+        assert!(clan_with_cost(1)?.admits_child_at(2, 3));
+        assert!(!clan_with_cost(2)?.admits_child_at(2, 3));
+        assert!(!clan_with_cost(0)?.admits_child_at(0, 3));
+        Ok(())
+    }
+
+    #[test]
+    fn resolve_rejects_zero_child_depth_cost() -> TestResult {
+        let toml_str = r#"
+schema = "harwness.organization/v1"
+id = "harwness.organization.zero-cost@1"
+version = "1.0.0"
+name = "Zero Cost"
+
+[root]
+agent = { id = "harwness.agent.root-orchestrator@1" }
+family = { id = "harwness.family.research@1" }
+
+[[clans]]
+id = "research"
+name = "Research Clan"
+leader = { id = "harwness.agent.research-orchestrator@1" }
+family = { id = "harwness.family.research@1" }
+plan_scope = "research-*"
+child_depth_cost = 0
+"#;
+        let raw = parse_org(toml_str)?;
+        let id = DefinitionId::parse("harwness.organization.zero-cost@1")?;
+        let layers = vec![(DefinitionLayer::BuiltIn, raw)];
+        match resolve_organization(&id, &layers, now()) {
+            Err(DslError::Parse(message)) => {
+                assert!(message.contains("child_depth_cost"), "{message}");
+                Ok(())
+            }
+            other => Err(crate::test_support::TestError::Unexpected(format!(
+                "erwartet DslError::Parse, bekommen: {other:?}"
+            ))),
+        }
+    }
+
+    #[test]
+    fn child_depth_cost_for_leader_takes_the_strictest_clan() -> TestResult {
+        let toml_str = r#"
+schema = "harwness.organization/v1"
+id = "harwness.organization.costs@1"
+version = "1.0.0"
+name = "Costs"
+
+[root]
+agent = { id = "harwness.agent.root-orchestrator@1" }
+family = { id = "harwness.family.research@1" }
+
+[[clans]]
+id = "synthesis"
+name = "Synthesis"
+leader = { id = "harwness.agent.analysis-orchestrator@1" }
+family = { id = "harwness.family.research@1" }
+plan_scope = "*-synthesis"
+
+[[clans]]
+id = "security"
+name = "Security"
+leader = { id = "harwness.agent.analysis-orchestrator@1" }
+family = { id = "harwness.family.security@1" }
+plan_scope = "security-*"
+child_depth_cost = 3
+"#;
+        let raw = parse_org(toml_str)?;
+        let id = DefinitionId::parse("harwness.organization.costs@1")?;
+        let layers = vec![(DefinitionLayer::BuiltIn, raw)];
+        let resolved = resolve_organization(&id, &layers, now())?;
+        assert_eq!(
+            resolved.child_depth_cost_for_leader("analysis-orchestrator"),
+            Some(3)
+        );
+        assert_eq!(resolved.child_depth_cost_for_leader("unbekannt"), None);
+        assert_eq!(
+            resolved.clan("synthesis").map(|clan| clan.child_depth_cost),
+            Some(1)
+        );
+        assert!(resolved.clan("gibt-es-nicht").is_none());
         Ok(())
     }
 

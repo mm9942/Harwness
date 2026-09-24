@@ -312,6 +312,7 @@ impl ResolvedConfig {
 fn validate_telegram_binding(
     telegram: &crate::channel_toml::TelegramChannelToml,
 ) -> ConfigResult<()> {
+    telegram.validate_extensions()?;
     let channel_id = &telegram.id;
 
     if telegram.enabled && telegram.security.pinned_identities.is_empty() {

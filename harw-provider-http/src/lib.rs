@@ -610,11 +610,10 @@ fn build_named_provider(
                 .as_ref()
                 .map(harw_config::RateLimitToml::header_pacer_config),
         );
-        // Client-seitige RPM/TPM-Budgets (siehe [`budget`]). Die Durchsetzung
-        // im Anthropic-Pfad verdrahtet `anthropic.rs` über
-        // `configure_budgets`; bis dahin sind die Buckets nur im Status
-        // sichtbar.
+        // Client-seitige RPM/TPM-Budgets (siehe [`budget`]): durchgesetzt im
+        // Sendepfad von `anthropic.rs`, sichtbar im Load-Status.
         let anthropic_budgets = budgets.configure_provider(provider_name, provider, config);
+        backend.configure_budgets(anthropic_budgets.clone());
         backend.configure_stream_policy(sse::StreamPolicy::from_config(
             provider_name,
             provider,
@@ -660,6 +659,20 @@ fn build_named_provider(
         Box::new(RetryingProvider::new(http_provider, network_retry_policy())),
         Some(load_control),
     ))
+}
+
+/// Übersetzt einen Fail-fast-Fehler des Header-Pacers in einen [`ModelError`].
+///
+/// # Description
+/// [`rate_limiter::RateBudgetError::RequestExceedsLimit`] bedeutet: schon die
+/// Eingabe-Schätzung eines einzelnen Requests sprengt das vom Provider
+/// gemeldete Token-Limit — Warten hilft nie, nur ein kleinerer Request.
+/// Daher [`ModelError::ContextLength`], damit der Aufrufer wie bei einem
+/// zu großen Kontext reagiert (z. B. kompaktiert).
+pub(crate) fn rate_budget_error(error: rate_limiter::RateBudgetError) -> ModelError {
+    ModelError::ContextLength {
+        message: error.to_string(),
+    }
 }
 
 /// Löst Base-URL + Credential für den nativen Anthropic-Weg auf.
@@ -3682,13 +3695,20 @@ impl OpenAiResponsesProvider {
         // Request keinen Slot blockiert. Fail-fast, wenn schon die
         // Eingabe-Schätzung ein Minutenlimit sprengt. Der Permit lebt bis zum
         // Abgleich mit der tatsächlichen Nutzung unten.
+        // Eingabe-Schätzung nur berechnen, wenn Budgets oder der Header-Pacer
+        // sie tatsächlich brauchen (Serialisierung des Wire-Bodys).
+        let estimated_input = if self.budgets.is_empty() && !self.rate_limiter.is_enabled() {
+            0
+        } else {
+            budget::estimate_wire_tokens(&wire)
+        };
         let budget_permit = if self.budgets.is_empty() {
             budget::BudgetPermit::empty()
         } else {
             self.budgets
                 .acquire(
                     model,
-                    budget::estimate_wire_tokens(&wire),
+                    estimated_input,
                     request.max_output_tokens.map(u64::from).unwrap_or(0),
                 )
                 .await?
@@ -3708,7 +3728,10 @@ impl OpenAiResponsesProvider {
             })?),
             None => None,
         };
-        self.rate_limiter.wait_for_slot().await;
+        self.rate_limiter
+            .wait_for_slot_with_estimate(estimated_input)
+            .await
+            .map_err(rate_budget_error)?;
         // Codex-Route: bei einem tatsächlichen 401 genau einmal
         // reaktiv erneuern und den Request genau einmal wiederholen —
         // kein zweiter Refresh-Versuch nach erneutem 401 (siehe
@@ -5238,6 +5261,82 @@ mod tests {
         assert_eq!(provider.model, "gpt-test");
         assert_eq!(provider.api_key.expose_secret(), "sk-secret");
         assert_eq!(provider.request_timeout, DEFAULT_REQUEST_TIMEOUT);
+        Ok(())
+    }
+
+    #[test]
+    fn provider_load_status_includes_configured_budgets_from_injected_registry() -> TestResult {
+        let mut config = harw_config::ResolvedConfig::default();
+        config.harness.default_provider = Some("primary".to_owned());
+        config.harness.default_model = Some("a-model".to_owned());
+        let mut provider = configured_provider(
+            "primary",
+            "https://primary.example.com".to_owned(),
+            vec!["a-model"],
+            "PRIMARY_KEY",
+        );
+        provider.rate_limit = Some(harw_config::RateLimitToml {
+            requests_per_minute: Some(60),
+            tokens_per_minute: Some(30_000),
+            ..harw_config::RateLimitToml::default()
+        });
+        provider
+            .validate()
+            .map_err(ctx("positive budgets are valid"))?;
+        config.providers.insert("primary".to_owned(), provider);
+        config
+            .env_layer
+            .insert("PRIMARY_KEY".to_owned(), "primary-secret".to_owned());
+
+        let budgets = budget::ProviderBudgetRegistry::new();
+        let (_provider, registry) =
+            build_provider_with_load_registry_and_budgets(&config, None, None, &budgets)
+                .map_err(ctx("construct budgeted provider"))?;
+        let handle = registry
+            .get("primary")
+            .ok_or(TestError::Missing("load-control handle for primary"))?;
+        let status = handle.provider_status();
+        assert_eq!(status.budgets.len(), 1);
+        let snapshot = &status.budgets[0];
+        assert_eq!(snapshot.provider, "primary");
+        assert_eq!(snapshot.model, None);
+        assert_eq!(snapshot.requests_available, Some(60));
+        assert_eq!(snapshot.tokens_available, Some(30_000));
+        assert!(
+            budgets.get("primary", None).is_some(),
+            "the injected registry, not the global one, holds the bucket"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn respond_fails_fast_when_request_exceeds_token_budget() -> TestResult {
+        let mut provider = OpenAiResponsesProvider::new(
+            "https://budget.example.test/v1",
+            "gpt-test",
+            SecretString::new("sk-secret".into()),
+        )
+        .map_err(ctx("OpenAiResponsesProvider::new"))?;
+        let limits = budget::BudgetLimits {
+            tokens_per_minute: Some(1),
+            ..budget::BudgetLimits::default()
+        };
+        provider.set_budgets(budget::ProviderBudgets::for_provider(std::sync::Arc::new(
+            budget::ProviderBudget::new("openai", None, limits),
+        )));
+        let Err(error) = provider.respond(request_with_ids(None, None)).await else {
+            return Err(TestError::Unexpected(
+                "a request larger than the whole per-minute budget must fail".into(),
+            ));
+        };
+        assert!(
+            matches!(&error, ModelError::RequestFailed(message) if message.contains("tokens_per_minute")),
+            "{error}"
+        );
+        assert!(!error.is_retryable(), "budget overflow is not transient");
+        let status = provider.load_status();
+        assert_eq!(status.budgets.len(), 1);
+        assert_eq!(status.budgets[0].admitted_total, 0);
         Ok(())
     }
 

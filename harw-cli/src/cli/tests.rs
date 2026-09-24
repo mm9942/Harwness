@@ -1,4 +1,8 @@
-//! Parse-Tests der `harw`-Grammatik (aus dem früheren `cli.rs` übernommen).
+//! Parse-Tests der `harw`-Grammatik.
+//!
+//! Enthält die aus dem früheren `cli.rs` übernommenen Tests sowie Tests für
+//! den neuen Befehlsbaum, die globalen und Sitzungs-Flags und alle
+//! versteckten älteren Schreibweisen.
 
 use std::path::PathBuf;
 
@@ -78,7 +82,7 @@ fn test_mode_flag_sets_the_requested_mode() -> TestResult {
     let cli = Cli::try_parse_from(["harw", "--mode", "explore"])
         .map_err(ctx("`harw --mode explore` sollte parsen"))?;
 
-    assert_eq!(cli.mode.as_deref(), Some("explore"));
+    assert_eq!(cli.global.mode.as_deref(), Some("explore"));
     Ok(())
 }
 
@@ -100,7 +104,7 @@ fn test_goal_flag_sets_the_goal_statement() -> TestResult {
     let cli = Cli::try_parse_from(["harw", "--goal", "Alle Tests grün"])
         .map_err(ctx("`harw --goal ...` sollte parsen"))?;
 
-    assert_eq!(cli.goal.as_deref(), Some("Alle Tests grün"));
+    assert_eq!(cli.global.goal.as_deref(), Some("Alle Tests grün"));
     Ok(())
 }
 
@@ -116,7 +120,10 @@ fn test_analyze_without_arguments_defaults_to_bottom_up_whole_workspace() -> Tes
         )));
     };
     assert_eq!(args.crate_name, None);
-    assert!(args.bottom_up);
+    assert_eq!(args.order, AnalyzeOrder::BottomUp);
+    assert!(!args.bottom_up);
+    assert!(!args.top_down);
+    assert_eq!(args.effective_order(), AnalyzeOrder::BottomUp);
     Ok(())
 }
 
@@ -219,9 +226,9 @@ fn test_verbose_and_add_dir_flags_parse_and_repeat() -> TestResult {
     ])
     .map_err(ctx("`--verbose --add-dir ...` sollte parsen"))?;
 
-    assert!(cli.chat.verbose);
+    assert!(cli.global.verbose);
     assert_eq!(
-        cli.chat.add_dir,
+        cli.global.add_dir,
         vec![PathBuf::from("/tmp/a"), PathBuf::from("/tmp/b")]
     );
     Ok(())
@@ -231,8 +238,8 @@ fn test_verbose_and_add_dir_flags_parse_and_repeat() -> TestResult {
 fn test_verbose_and_add_dir_default_to_empty() -> TestResult {
     let cli = Cli::try_parse_from(["harw"]).map_err(ctx("bare harw parses"))?;
 
-    assert!(!cli.chat.verbose);
-    assert!(cli.chat.add_dir.is_empty());
+    assert!(!cli.global.verbose);
+    assert!(cli.global.add_dir.is_empty());
     Ok(())
 }
 
@@ -243,7 +250,7 @@ fn test_settings_without_action_parses_for_interactive_menu() -> TestResult {
 
     assert!(matches!(
         cli.command,
-        Some(Command::Settings { action: None })
+        Some(Command::Config { action: None })
     ));
     Ok(())
 }
@@ -267,7 +274,7 @@ fn test_settings_provider_add_parses_all_flags() -> TestResult {
     ])
     .map_err(ctx("`harw settings provider add ...` sollte parsen"))?;
 
-    let Some(Command::Settings {
+    let Some(Command::Config {
         action:
             Some(SettingsAction::Provider {
                 action:
@@ -282,7 +289,7 @@ fn test_settings_provider_add_parses_all_flags() -> TestResult {
     }) = cli.command
     else {
         return Err(TestError::Unexpected(format!(
-            "erwartete Settings(Provider(Add)), bekam {:?}",
+            "erwartete Config(Provider(Add)), bekam {:?}",
             cli.command
         )));
     };
@@ -300,7 +307,7 @@ fn test_settings_model_default_parses() -> TestResult {
     let cli = Cli::try_parse_from(["harw", "settings", "model", "default", "gpt-5.4"])
         .map_err(ctx("`harw settings model default ...` sollte parsen"))?;
 
-    let Some(Command::Settings {
+    let Some(Command::Config {
         action:
             Some(SettingsAction::Model {
                 action: SettingsModelAction::Default { id },
@@ -308,7 +315,7 @@ fn test_settings_model_default_parses() -> TestResult {
     }) = cli.command
     else {
         return Err(TestError::Unexpected(format!(
-            "erwartete Settings(Model(Default)), bekam {:?}",
+            "erwartete Config(Model(Default)), bekam {:?}",
             cli.command
         )));
     };
@@ -320,12 +327,12 @@ fn test_settings_model_default_parses() -> TestResult {
 fn test_settings_get_set_default_to_global_scope() -> TestResult {
     let get = Cli::try_parse_from(["harw", "settings", "get", "default_model"])
         .map_err(ctx("`harw settings get ...` sollte parsen"))?;
-    let Some(Command::Settings {
+    let Some(Command::Config {
         action: Some(SettingsAction::Get { key, scope }),
     }) = get.command
     else {
         return Err(TestError::Unexpected(format!(
-            "erwartete Settings(Get), bekam {:?}",
+            "erwartete Config(Get), bekam {:?}",
             get.command
         )));
     };
@@ -342,12 +349,12 @@ fn test_settings_get_set_default_to_global_scope() -> TestResult {
         "--project",
     ])
     .map_err(ctx("`harw settings set ... --project` sollte parsen"))?;
-    let Some(Command::Settings {
+    let Some(Command::Config {
         action: Some(SettingsAction::Set { key, value, scope }),
     }) = set.command
     else {
         return Err(TestError::Unexpected(format!(
-            "erwartete Settings(Set), bekam {:?}",
+            "erwartete Config(Set), bekam {:?}",
             set.command
         )));
     };
@@ -402,7 +409,7 @@ fn test_settings_permissions_allow_and_deny_parse() -> TestResult {
     .map_err(ctx("`harw settings permissions allow ...` sollte parsen"))?;
     assert!(matches!(
         allow.command,
-        Some(Command::Settings {
+        Some(Command::Config {
             action: Some(SettingsAction::Permissions {
                 action: SettingsPermissionsAction::Allow { .. },
             }),
@@ -413,7 +420,7 @@ fn test_settings_permissions_allow_and_deny_parse() -> TestResult {
         .map_err(ctx("`harw settings permissions deny ...` sollte parsen"))?;
     assert!(matches!(
         deny.command,
-        Some(Command::Settings {
+        Some(Command::Config {
             action: Some(SettingsAction::Permissions {
                 action: SettingsPermissionsAction::Deny { .. },
             }),
@@ -426,10 +433,7 @@ fn test_settings_permissions_allow_and_deny_parse() -> TestResult {
 fn test_models_without_action_parses_for_list() -> TestResult {
     let cli =
         Cli::try_parse_from(["harw", "models"]).map_err(ctx("`harw models` sollte parsen"))?;
-    assert!(matches!(
-        cli.command,
-        Some(Command::Models { action: None })
-    ));
+    assert!(matches!(cli.command, Some(Command::Model { action: None })));
     Ok(())
 }
 
@@ -444,7 +448,7 @@ fn test_models_scan_parses_provider_and_flags() -> TestResult {
         "--free-only",
     ])
     .map_err(ctx("`harw models scan ...` sollte parsen"))?;
-    let Some(Command::Models {
+    let Some(Command::Model {
         action:
             Some(ModelsAction::Scan {
                 provider,
@@ -455,7 +459,7 @@ fn test_models_scan_parses_provider_and_flags() -> TestResult {
     }) = cli.command
     else {
         return Err(TestError::Unexpected(format!(
-            "erwartete Models(Scan), bekam {:?}",
+            "erwartete Model(Scan), bekam {:?}",
             cli.command
         )));
     };
@@ -470,7 +474,7 @@ fn test_models_scan_parses_provider_and_flags() -> TestResult {
 fn test_models_scan_without_provider_defaults_to_all() -> TestResult {
     let cli = Cli::try_parse_from(["harw", "models", "scan"])
         .map_err(ctx("`harw models scan` sollte parsen"))?;
-    let Some(Command::Models {
+    let Some(Command::Model {
         action:
             Some(ModelsAction::Scan {
                 provider,
@@ -481,7 +485,7 @@ fn test_models_scan_without_provider_defaults_to_all() -> TestResult {
     }) = cli.command
     else {
         return Err(TestError::Unexpected(format!(
-            "erwartete Models(Scan), bekam {:?}",
+            "erwartete Model(Scan), bekam {:?}",
             cli.command
         )));
     };
@@ -496,12 +500,12 @@ fn test_models_scan_without_provider_defaults_to_all() -> TestResult {
 fn test_models_scan_parses_prune_flag() -> TestResult {
     let cli = Cli::try_parse_from(["harw", "models", "scan", "--prune"])
         .map_err(ctx("`harw models scan --prune` sollte parsen"))?;
-    let Some(Command::Models {
+    let Some(Command::Model {
         action: Some(ModelsAction::Scan { prune, .. }),
     }) = cli.command
     else {
         return Err(TestError::Unexpected(format!(
-            "erwartete Models(Scan), bekam {:?}",
+            "erwartete Model(Scan), bekam {:?}",
             cli.command
         )));
     };
@@ -515,7 +519,7 @@ fn test_models_add_and_delete_parse_targets_and_picker_mode() -> TestResult {
         Cli::try_parse_from(["harw", "models", "add"]).map_err(ctx("picker mode should parse"))?;
     assert!(matches!(
         cli.command,
-        Some(Command::Models {
+        Some(Command::Model {
             action: Some(ModelsAction::Add { target: None })
         })
     ));
@@ -524,7 +528,7 @@ fn test_models_add_and_delete_parse_targets_and_picker_mode() -> TestResult {
         .map_err(ctx("add target should parse"))?;
     assert!(matches!(
         cli.command,
-        Some(Command::Models {
+        Some(Command::Model {
             action: Some(ModelsAction::Add { target: Some(target) })
         }) if target == "mistral/mistral-medium-2604"
     ));
@@ -533,8 +537,8 @@ fn test_models_add_and_delete_parse_targets_and_picker_mode() -> TestResult {
         .map_err(ctx("delete target should parse"))?;
     assert!(matches!(
         cli.command,
-        Some(Command::Models {
-            action: Some(ModelsAction::Delete { target })
+        Some(Command::Model {
+            action: Some(ModelsAction::Remove { target })
         }) if target == "openrouter/meta-llama/x"
     ));
     Ok(())
@@ -546,7 +550,7 @@ fn test_models_internal_show_parses() -> TestResult {
         .map_err(ctx("`harw models internal` sollte parsen"))?;
     assert!(matches!(
         cli.command,
-        Some(Command::Models {
+        Some(Command::Model {
             action: Some(ModelsAction::Internal { action: None }),
         })
     ));
@@ -555,7 +559,7 @@ fn test_models_internal_show_parses() -> TestResult {
         .map_err(ctx("`harw models internal show` sollte parsen"))?;
     assert!(matches!(
         cli.command,
-        Some(Command::Models {
+        Some(Command::Model {
             action: Some(ModelsAction::Internal {
                 action: Some(InternalAction::Show),
             }),
@@ -577,7 +581,7 @@ fn test_models_internal_set_parses_point_model_and_provider() -> TestResult {
         "openrouter",
     ])
     .map_err(ctx("`harw models internal set ...` sollte parsen"))?;
-    let Some(Command::Models {
+    let Some(Command::Model {
         action:
             Some(ModelsAction::Internal {
                 action:
@@ -590,7 +594,7 @@ fn test_models_internal_set_parses_point_model_and_provider() -> TestResult {
     }) = cli.command
     else {
         return Err(TestError::Unexpected(format!(
-            "erwartete Models(Internal(Set)), bekam {:?}",
+            "erwartete Model(Internal(Set)), bekam {:?}",
             cli.command
         )));
     };
@@ -606,7 +610,7 @@ fn test_models_internal_main_and_reset_parse() -> TestResult {
         .map_err(ctx("`harw models internal main ...` sollte parsen"))?;
     assert!(matches!(
         main.command,
-        Some(Command::Models {
+        Some(Command::Model {
             action: Some(ModelsAction::Internal {
                 action: Some(InternalAction::Main { .. }),
             }),
@@ -617,7 +621,7 @@ fn test_models_internal_main_and_reset_parse() -> TestResult {
         .map_err(ctx("`harw models internal reset ...` sollte parsen"))?;
     assert!(matches!(
         reset.command,
-        Some(Command::Models {
+        Some(Command::Model {
             action: Some(ModelsAction::Internal {
                 action: Some(InternalAction::Reset { .. }),
             }),
@@ -632,7 +636,7 @@ fn test_models_internal_openrouter_defaults_accepts_on_off_only() -> TestResult 
         .map_err(ctx("`on` sollte parsen"))?;
     assert!(matches!(
         on.command,
-        Some(Command::Models {
+        Some(Command::Model {
             action: Some(ModelsAction::Internal {
                 action: Some(InternalAction::OpenrouterDefaults { state: OnOff::On }),
             }),
@@ -649,12 +653,12 @@ fn test_models_internal_openrouter_defaults_accepts_on_off_only() -> TestResult 
 fn test_models_default_parses() -> TestResult {
     let cli = Cli::try_parse_from(["harw", "models", "default", "gpt-5.4"])
         .map_err(ctx("`harw models default ...` sollte parsen"))?;
-    let Some(Command::Models {
+    let Some(Command::Model {
         action: Some(ModelsAction::Default { id }),
     }) = cli.command
     else {
         return Err(TestError::Unexpected(format!(
-            "erwartete Models(Default), bekam {:?}",
+            "erwartete Model(Default), bekam {:?}",
             cli.command
         )));
     };

@@ -191,6 +191,34 @@ pub struct WorkRequestRecord {
     pub launch: Option<LaunchReceipt>,
 }
 
+/// Der handelnde Telegram-Nutzer einer Lebenszyklus-Aktion
+/// (`/review /approve /deny /cancel`) bzw. einer Auflistung.
+///
+/// Alle Felder stammen aus dem bereits zugelassenen Ereignis (Binding,
+/// gepaarter Tenant, `SenderRef::id` des Absenders) und der
+/// serverseitigen Admin-Konfiguration — nie aus Nachrichteninhalt.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorkRequestActor {
+    /// Binding, über das die Aktion eintraf.
+    pub channel: ChannelId,
+    /// Gepaarter Tenant des Handelnden.
+    pub tenant: TenantId,
+    /// Telegram-User-ID des handelnden Menschen (nie eine Gruppen-`PeerId`).
+    pub peer: PeerId,
+    /// `true`, wenn der Handelnde als Admin dieses Bindings konfiguriert ist.
+    pub is_admin: bool,
+}
+
+impl WorkRequestActor {
+    /// Ob `record` für diesen Handelnden sichtbar und steuerbar ist: gleiches
+    /// Binding, gleicher Tenant und Anfragender selbst oder Admin.
+    fn may_access(&self, record: &WorkRequestRecord) -> bool {
+        record.channel == self.channel
+            && record.tenant == self.tenant
+            && (self.is_admin || record.requester == self.peer)
+    }
+}
+
 /// Quittung eines erfolgreichen Launches: der durable Job, unter dem der
 /// genehmigte Auftrag nun läuft.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -793,6 +821,135 @@ impl WorkRequestStore {
         self.remove_payload(work_id);
         self.record_command_audit("cancel", now, &record);
         Ok(format!("Cancelled {}", record.work_id))
+    }
+
+    /// Liefert den Datensatz `work_id`, sofern `actor` ihn sehen und steuern
+    /// darf: Binding und Tenant müssen übereinstimmen, und `actor` muss der
+    /// Anfragende oder ein Admin sein.
+    ///
+    /// # Errors
+    /// - [`TelegramChannelError::WorkRequestNotFound`]: unbekannte `WorkId`
+    ///   **oder** fehlende Berechtigung — beide Fälle sind bewusst nicht
+    ///   unterscheidbar, damit fremde Aufträge ihre Existenz nicht verraten.
+    /// - [`TelegramChannelError::Io`] / [`TelegramChannelError::Serde`]:
+    ///   Lesefehler des Datensatzes.
+    pub fn authorize(
+        &self,
+        work_id: &WorkId,
+        actor: &WorkRequestActor,
+    ) -> TelegramChannelResult<WorkRequestRecord> {
+        match self.get(work_id)? {
+            Some(record) if actor.may_access(&record) => Ok(record),
+            _ => Err(TelegramChannelError::WorkRequestNotFound {
+                work_id: work_id.clone(),
+            }),
+        }
+    }
+
+    /// [`Self::review`] nach erfolgreicher [`Self::authorize`]-Prüfung.
+    ///
+    /// # Errors
+    /// Wie [`Self::authorize`] und [`Self::review`].
+    pub fn review_as(
+        &self,
+        work_id: &WorkId,
+        actor: &WorkRequestActor,
+        now: Timestamp,
+    ) -> TelegramChannelResult<String> {
+        self.authorize(work_id, actor)?;
+        self.review(work_id, now)
+    }
+
+    /// [`Self::approve`] nach erfolgreicher [`Self::authorize`]-Prüfung.
+    ///
+    /// # Errors
+    /// Wie [`Self::authorize`] und [`Self::approve`].
+    pub fn approve_as(
+        &self,
+        work_id: &WorkId,
+        actor: &WorkRequestActor,
+        now: Timestamp,
+    ) -> TelegramChannelResult<String> {
+        self.authorize(work_id, actor)?;
+        self.approve(work_id, now)
+    }
+
+    /// [`Self::deny`] nach erfolgreicher [`Self::authorize`]-Prüfung.
+    ///
+    /// # Errors
+    /// Wie [`Self::authorize`] und [`Self::deny`].
+    pub fn deny_as(
+        &self,
+        work_id: &WorkId,
+        actor: &WorkRequestActor,
+        now: Timestamp,
+    ) -> TelegramChannelResult<String> {
+        self.authorize(work_id, actor)?;
+        self.deny(work_id, now)
+    }
+
+    /// [`Self::cancel`] nach erfolgreicher [`Self::authorize`]-Prüfung.
+    ///
+    /// # Errors
+    /// Wie [`Self::authorize`] und [`Self::cancel`].
+    pub fn cancel_as(
+        &self,
+        work_id: &WorkId,
+        actor: &WorkRequestActor,
+        now: Timestamp,
+    ) -> TelegramChannelResult<String> {
+        self.authorize(work_id, actor)?;
+        self.cancel(work_id, now)
+    }
+
+    /// Listet höchstens `limit` für `actor` sichtbare Aufträge, neueste zuerst
+    /// (nach `created_at`, bei Gleichstand nach `WorkId`).
+    ///
+    /// Unlesbare oder beschädigte Einzeldatensätze werden protokolliert und
+    /// übersprungen, damit ein defekter Datensatz die Liste nicht blockiert.
+    ///
+    /// # Errors
+    /// [`TelegramChannelError::Io`], wenn das Datensatzverzeichnis nicht
+    /// gelesen werden kann (ein noch nicht existierendes Verzeichnis ergibt
+    /// eine leere Liste).
+    pub fn list_for(
+        &self,
+        actor: &WorkRequestActor,
+        limit: usize,
+    ) -> TelegramChannelResult<Vec<WorkRequestRecord>> {
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+        let _guard = self.guard.lock().unwrap_or_else(|p| p.into_inner());
+        let entries = match std::fs::read_dir(self.root.join("records")) {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return Ok(Vec::new());
+            }
+            Err(error) => return Err(TelegramChannelError::from(error)),
+        };
+        let mut visible = Vec::new();
+        for entry in entries {
+            let path = entry?.path();
+            if path.extension().and_then(|ext| ext.to_str()) != Some("json") {
+                continue;
+            }
+            match read_json::<WorkRequestRecord>(&path) {
+                Ok(Some(record)) if actor.may_access(&record) => visible.push(record),
+                Ok(_) => {}
+                Err(error) => tracing::warn!(
+                    error = %error,
+                    "work-request record could not be read while listing"
+                ),
+            }
+        }
+        visible.sort_by(|a, b| {
+            b.created_at
+                .cmp(&a.created_at)
+                .then_with(|| b.work_id.as_str().cmp(a.work_id.as_str()))
+        });
+        visible.truncate(limit);
+        Ok(visible)
     }
 
     /// Löscht den gespeicherten Aufgabentext (best effort): nach Launch,
@@ -1408,6 +1565,168 @@ mod tests {
             .cancel(&cancelled.work_id, now)
             .map_err(ctx("cancel"))?;
         assert!(!store.payload_path(&cancelled.work_id).exists());
+        Ok(())
+    }
+
+    fn submit_as(
+        store: &WorkRequestStore,
+        registry: &WorkspaceRegistry,
+        requester: &str,
+        now: Timestamp,
+    ) -> TestResult<WorkRequestRecord> {
+        store
+            .submit(
+                &ChannelId::from_str("telegram:ops"),
+                &PeerId::from_str(requester),
+                &TenantId::from_str("ops"),
+                "ops-room",
+                "implementer",
+                "task",
+                "9",
+                registry,
+                now,
+            )
+            .map_err(ctx("submit"))
+    }
+
+    fn actor(peer: &str, is_admin: bool) -> WorkRequestActor {
+        WorkRequestActor {
+            channel: ChannelId::from_str("telegram:ops"),
+            tenant: TenantId::from_str("ops"),
+            peer: PeerId::from_str(peer),
+            is_admin,
+        }
+    }
+
+    #[test]
+    fn authorize_admits_requester_and_admin_only() -> TestResult {
+        let harness = tempfile::tempdir().map_err(ctx("harness dir"))?;
+        let store_dir = tempfile::tempdir().map_err(ctx("store dir"))?;
+        let tenant = TenantId::from_str("ops");
+        let registry = registry(&tenant, &WorkspaceId::from_str("ops-room"), harness.path())?;
+        let store = WorkRequestStore::new(store_dir.path());
+        let record = submit_as(&store, &registry, "100", Timestamp::now())?;
+
+        assert_eq!(
+            store
+                .authorize(&record.work_id, &actor("100", false))
+                .map_err(ctx("requester"))?
+                .work_id,
+            record.work_id
+        );
+        assert!(
+            store
+                .authorize(&record.work_id, &actor("999", true))
+                .is_ok()
+        );
+        assert!(matches!(
+            store.authorize(&record.work_id, &actor("200", false)),
+            Err(TelegramChannelError::WorkRequestNotFound { .. })
+        ));
+
+        let mut other_tenant = actor("100", true);
+        other_tenant.tenant = TenantId::from_str("other");
+        assert!(matches!(
+            store.authorize(&record.work_id, &other_tenant),
+            Err(TelegramChannelError::WorkRequestNotFound { .. })
+        ));
+        let mut other_channel = actor("100", true);
+        other_channel.channel = ChannelId::from_str("telegram:elsewhere");
+        assert!(matches!(
+            store.authorize(&record.work_id, &other_channel),
+            Err(TelegramChannelError::WorkRequestNotFound { .. })
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn foreign_actor_cannot_mutate_and_learns_nothing() -> TestResult {
+        let harness = tempfile::tempdir().map_err(ctx("harness dir"))?;
+        let store_dir = tempfile::tempdir().map_err(ctx("store dir"))?;
+        let tenant = TenantId::from_str("ops");
+        let registry = registry(&tenant, &WorkspaceId::from_str("ops-room"), harness.path())?;
+        let store = WorkRequestStore::new(store_dir.path());
+        let now = Timestamp::now();
+        let record = submit_as(&store, &registry, "100", now)?;
+        let stranger = actor("200", false);
+
+        let denied = store.review_as(&record.work_id, &stranger, now);
+        let missing = store.review_as(&WorkId::from_str("missing"), &stranger, now);
+        assert!(matches!(
+            denied,
+            Err(TelegramChannelError::WorkRequestNotFound { .. })
+        ));
+        assert!(matches!(
+            missing,
+            Err(TelegramChannelError::WorkRequestNotFound { .. })
+        ));
+        assert!(store.approve_as(&record.work_id, &stranger, now).is_err());
+        assert!(store.deny_as(&record.work_id, &stranger, now).is_err());
+        assert!(store.cancel_as(&record.work_id, &stranger, now).is_err());
+        assert_eq!(
+            state_of(&store, &record.work_id)?.state,
+            WorkRequestState::Requested
+        );
+
+        let owner = actor("100", false);
+        store
+            .review_as(&record.work_id, &owner, now)
+            .map_err(ctx("owner review"))?;
+        let reply = store
+            .cancel_as(&record.work_id, &actor("999", true), now)
+            .map_err(ctx("admin cancel"))?;
+        assert!(reply.starts_with("Cancelled"));
+        Ok(())
+    }
+
+    #[test]
+    fn list_for_filters_sorts_newest_first_and_limits() -> TestResult {
+        let harness = tempfile::tempdir().map_err(ctx("harness dir"))?;
+        let store_dir = tempfile::tempdir().map_err(ctx("store dir"))?;
+        let tenant = TenantId::from_str("ops");
+        let registry = registry(&tenant, &WorkspaceId::from_str("ops-room"), harness.path())?;
+        let store = WorkRequestStore::new(store_dir.path());
+
+        assert!(
+            store
+                .list_for(&actor("100", false), 10)
+                .map_err(ctx("empty list"))?
+                .is_empty()
+        );
+
+        let base = Timestamp::from_second(1_700_000_000).map_err(ctx("base"))?;
+        let later = Timestamp::from_second(1_700_000_100).map_err(ctx("later"))?;
+        let latest = Timestamp::from_second(1_700_000_200).map_err(ctx("latest"))?;
+        let first = submit_as(&store, &registry, "100", base)?;
+        let foreign = submit_as(&store, &registry, "200", later)?;
+        let second = submit_as(&store, &registry, "100", latest)?;
+
+        let own = store
+            .list_for(&actor("100", false), 10)
+            .map_err(ctx("own list"))?;
+        let ids: Vec<_> = own.iter().map(|record| record.work_id.clone()).collect();
+        assert_eq!(ids, vec![second.work_id.clone(), first.work_id.clone()]);
+
+        let admin = store
+            .list_for(&actor("999", true), 2)
+            .map_err(ctx("admin list"))?;
+        let ids: Vec<_> = admin.iter().map(|record| record.work_id.clone()).collect();
+        assert_eq!(ids, vec![second.work_id, foreign.work_id]);
+
+        let mut other_tenant = actor("100", true);
+        other_tenant.tenant = TenantId::from_str("other");
+        assert!(
+            store
+                .list_for(&other_tenant, 10)
+                .map_err(ctx("other tenant"))?
+                .is_empty()
+        );
+        assert!(
+            store
+                .list_for(&actor("100", false), 0)
+                .map_err(ctx("zero limit"))?
+                .is_empty()
+        );
         Ok(())
     }
 }

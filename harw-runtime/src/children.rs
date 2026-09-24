@@ -29,10 +29,17 @@
 //!    [`ApprovalChain::for_child`] in **jede** Kind-Registry.
 
 use std::collections::HashMap;
+use std::path::PathBuf;
 use std::sync::{Arc, OnceLock, Weak};
 
 use harw_agent_dsl::ExecutableAgentIr;
-use harw_config::{InternalModelPoint, ResolvedInternalModel, resolve_internal_model};
+use harw_catalog::{
+    CatalogSnapshot, SkillRuntimeSnapshot, SpawnCapabilitySnapshot, load_skill_runtime_snapshot,
+    resolve_skill_directory,
+};
+use harw_config::{
+    InternalModelPoint, ResolvedConfig, ResolvedInternalModel, SkillToml, resolve_internal_model,
+};
 use harw_core::{ChildRegistryFactory, ManagedAgentSpawner, ModelProvider, PinnedModelProvider};
 use harw_extension_api::{
     AgentSpawnError, AgentSpawner, ExtensionRegistry, SpawnFuture, SpawnInput,
@@ -297,6 +304,21 @@ pub struct RuntimeChildRegistryFactory {
     /// solange [`Self::with_host_permits`] nicht aufgerufen wurde — Host-
     /// Ausführung bleibt dann fail-closed, genau wie vor dieser Ergänzung.
     host_permit_wiring: Option<HostPermitWiring>,
+    /// Eingefrorener Skill-Katalog samt Skill-Wurzeln (Welle 4, „Skills
+    /// erreichen Agenten“). `None`, solange [`Self::with_skill_catalog`]
+    /// nicht aufgerufen wurde — dann bekommt kein Kind Skill-Fragmente und
+    /// [`ChildRegistryFactory::capability_snapshot`] bleibt `None`, genau wie
+    /// vor dieser Ergänzung.
+    skill_catalog: Option<SkillCatalogWiring>,
+}
+
+/// Der Skill-Katalog einer Kind-Fabrik: ein über die ganze Lebensdauer des
+/// Spawners unveränderlicher [`CatalogSnapshot`] und die vertrauten
+/// Config-Layer, aus denen die Skill-Verzeichnisse aufgelöst werden.
+#[derive(Debug, Clone)]
+struct SkillCatalogWiring {
+    catalog: CatalogSnapshot,
+    roots: Vec<PathBuf>,
 }
 
 impl std::fmt::Debug for RuntimeChildRegistryFactory {
@@ -378,6 +400,7 @@ impl RuntimeChildRegistryFactory {
             main_model_selection: None,
             sandbox_profile: harw_sandbox::SandboxProfile::Strict,
             host_permit_wiring: None,
+            skill_catalog: None,
         }
     }
 
@@ -554,6 +577,79 @@ impl RuntimeChildRegistryFactory {
         self
     }
 
+    /// Hinterlegt den Skill-Katalog, aus dem jedes Kind seine direkt
+    /// konfigurierten Skills als Instruktionsfragmente bekommt (Welle 4).
+    ///
+    /// # Description
+    /// Reiner Erbauer-Schritt, analog [`Self::with_internal_models`]. Friert
+    /// `config` einmalig als [`CatalogSnapshot`] ein; eine spätere Änderung
+    /// des Live-Katalogs wirkt erst in der nächsten Montage. Für eine Rolle,
+    /// die in `agents/<rolle>/agent.toml` Skills führt, lädt
+    /// [`ChildRegistryFactory::build_registry`] deren Anweisungen (über
+    /// [`harw_config::load_skill_instructions`], symlink- und traversalfest)
+    /// und hängt sie als Fragmente mit SHA-256-Provenienz an die Identität
+    /// des Kindes; [`ChildRegistryFactory::capability_snapshot`] liefert
+    /// denselben Satz als eingefrorenen Spawn-Vertrag.
+    ///
+    /// # Arguments
+    /// - `config` (`&ResolvedConfig`): die bereits validierte Konfiguration
+    ///   des Elternlaufs.
+    /// - `skill_roots` (`Vec<PathBuf>`): die vertrauten Config-Layer in
+    ///   aufsteigender Präzedenz (`ConfigTrustReport::layers`) — dieselbe
+    ///   Liste, aus der die Discovery `config.skills` gelesen hat.
+    ///
+    /// # Errors
+    /// [`RuntimeError::Registry`], wenn die Konfiguration nicht als Katalog
+    /// einfrierbar ist (ungültige Verweise).
+    pub fn with_skill_catalog(
+        mut self,
+        config: &ResolvedConfig,
+        skill_roots: Vec<PathBuf>,
+    ) -> RuntimeResult<Self> {
+        let catalog =
+            CatalogSnapshot::from_config(config).map_err(|error| RuntimeError::Registry {
+                detail: format!("could not freeze the skill catalog for children: {error}"),
+            })?;
+        self.skill_catalog = Some(SkillCatalogWiring {
+            catalog,
+            roots: skill_roots,
+        });
+        Ok(self)
+    }
+
+    /// Die Skill-Fragmente einer Kind-Rolle (leer ohne Katalog oder ohne
+    /// `agent.toml` für diese Rolle).
+    ///
+    /// # Errors
+    /// [`AgentSpawnError`], wenn ein aktivierter Skill nicht geladen werden
+    /// kann — fail-closed: ein Kind startet nie mit einem Teil seiner Skills.
+    fn skill_fragments_for_role(&self, role: &str) -> Result<Vec<String>, AgentSpawnError> {
+        let Some(wiring) = &self.skill_catalog else {
+            return Ok(Vec::new());
+        };
+        let Some(names) = wiring.catalog.direct_skills_of(role) else {
+            return Ok(Vec::new());
+        };
+        let snapshots =
+            load_enabled_skills(|name| wiring.catalog.skill(name), &wiring.roots, names).map_err(
+                |detail| AgentSpawnError {
+                    message: format!("could not load the skills of child role '{role}': {detail}"),
+                },
+            )?;
+        for snapshot in &snapshots {
+            tracing::debug!(
+                role,
+                skill = %snapshot.name,
+                sha256 = %snapshot.sha256,
+                "runtime.child_skill.injected"
+            );
+        }
+        Ok(snapshots
+            .iter()
+            .map(SkillRuntimeSnapshot::instruction_fragment)
+            .collect())
+    }
+
     /// Liefert Provider-/Modell-Reasoning-Effort-Defaults für eine bereits
     /// aufgelöste interne Modellstelle.
     ///
@@ -708,6 +804,9 @@ impl ChildRegistryFactory for RuntimeChildRegistryFactory {
                 .builtin_definitions
                 .get(role)
                 .map(ExecutableAgentIr::role),
+            // Welle 4: die direkt konfigurierten Skills der Rolle als
+            // Instruktionsfragmente (leer ohne Skill-Katalog).
+            extra_context: self.skill_fragments_for_role(role)?,
             ..IdentityOverrides::default()
         };
         // Eine Kette je Kind: `for_child` löst die Modus-Zelle
@@ -775,6 +874,33 @@ impl ChildRegistryFactory for RuntimeChildRegistryFactory {
             "runtime.child_registry.assembled"
         );
         Ok(registry)
+    }
+
+    /// Friert die direkt konfigurierten Skills der Rolle als Spawn-Vertrag
+    /// ein (Welle 4).
+    ///
+    /// # Beschreibung
+    /// Nur aus vertrauenswürdigem Zustand — dem bei
+    /// [`Self::with_skill_catalog`] eingefrorenen Katalog, nie aus
+    /// Modell-JSON. `Ok(None)` ohne Katalog oder für eine Rolle ohne
+    /// `agent.toml`; dann gilt unverändert der Kompatibilitäts-Default.
+    ///
+    /// # Fehler
+    /// [`AgentSpawnError`], wenn der Katalog für die Rolle inkonsistent ist.
+    fn capability_snapshot(
+        &self,
+        role: &str,
+        _input: &SpawnInput,
+    ) -> Result<Option<SpawnCapabilitySnapshot>, AgentSpawnError> {
+        let Some(wiring) = &self.skill_catalog else {
+            return Ok(None);
+        };
+        wiring
+            .catalog
+            .direct_skills_snapshot(role)
+            .map_err(|error| AgentSpawnError {
+                message: format!("could not freeze the capabilities of role '{role}': {error}"),
+            })
     }
 
     /// Liefert den Modellanbieter für eine Kind-Rolle.
@@ -976,6 +1102,7 @@ impl ChildRegistryFactory for RuntimeChildRegistryFactory {
                 .builtin_definitions
                 .get(role)
                 .map(ExecutableAgentIr::role),
+            extra_context: self.skill_fragments_for_role(role)?,
             ..IdentityOverrides::default()
         };
         let child_chain = self.chain.for_child();
@@ -1027,6 +1154,110 @@ impl ChildRegistryFactory for RuntimeChildRegistryFactory {
         );
         Ok(registry)
     }
+}
+
+/// Lädt die aktivierten Skills aus `names` als eingefrorene Snapshots.
+///
+/// # Beschreibung
+/// Doppelte Namen zählen einmal, deaktivierte Skills werden übersprungen.
+/// Ein Name, den der Katalog nicht kennt oder dessen Verzeichnis sich in den
+/// Wurzeln nicht findet, ist ein Fehler (fail-closed).
+fn load_enabled_skills<'a>(
+    lookup: impl Fn(&str) -> Option<&'a SkillToml>,
+    roots: &[PathBuf],
+    names: &[String],
+) -> Result<Vec<SkillRuntimeSnapshot>, String> {
+    let mut seen = std::collections::BTreeSet::new();
+    let mut snapshots = Vec::new();
+    for name in names {
+        if !seen.insert(name.as_str()) {
+            continue;
+        }
+        let skill = lookup(name).ok_or_else(|| format!("skill '{name}' is not configured"))?;
+        if !skill.enabled {
+            continue;
+        }
+        let directory = resolve_skill_directory(roots, name)
+            .map_err(|error| format!("skill '{name}': {error}"))?
+            .ok_or_else(|| {
+                format!("skill '{name}' has no skills/*/skill.toml in any trusted config layer")
+            })?;
+        let snapshot = load_skill_runtime_snapshot(&directory, skill)
+            .map_err(|error| format!("skill '{name}': {error}"))?;
+        snapshots.push(snapshot);
+    }
+    Ok(snapshots)
+}
+
+/// Rendert die aktivierten Skills `skill_names` als Instruktionsfragmente
+/// mit SHA-256-Provenienz (Welle 4).
+///
+/// # Beschreibung
+/// Gemeinsamer Weg für Wurzel und Kinder: dieselbe Auflösung
+/// ([`harw_catalog::resolve_skill_directory`]) und dieselbe Ladefunktion
+/// ([`harw_catalog::load_skill_runtime_snapshot`] über
+/// [`harw_config::load_skill_instructions`]) wie in
+/// [`RuntimeChildRegistryFactory`]. Das Ergebnis gehört in
+/// `IdentityOverrides::extra_context`.
+///
+/// # Arguments
+/// - `config` (`&ResolvedConfig`): die aufgelöste Konfiguration.
+/// - `skill_roots` (`&[PathBuf]`): die vertrauten Config-Layer in
+///   aufsteigender Präzedenz (`ConfigTrustReport::layers`).
+/// - `skill_names` (`&[String]`): die zu ladenden Skills.
+///
+/// # Errors
+/// [`RuntimeError::Registry`], wenn ein aktivierter Skill nicht geladen
+/// werden kann.
+pub fn skill_instruction_fragments(
+    config: &ResolvedConfig,
+    skill_roots: &[PathBuf],
+    skill_names: &[String],
+) -> RuntimeResult<Vec<String>> {
+    let snapshots = load_enabled_skills(|name| config.skills.get(name), skill_roots, skill_names)
+        .map_err(|detail| RuntimeError::Registry {
+        detail: format!("could not load skills: {detail}"),
+    })?;
+    Ok(snapshots
+        .iter()
+        .map(SkillRuntimeSnapshot::instruction_fragment)
+        .collect())
+}
+
+/// Die Skill-Fragmente eines benannten Agenten aus `agents/<agent>/agent.toml`
+/// (Feld `skills`); leer, wenn die Konfiguration keinen solchen Agenten kennt.
+///
+/// # Errors
+/// Wie [`skill_instruction_fragments`].
+pub fn agent_skill_fragments(
+    config: &ResolvedConfig,
+    skill_roots: &[PathBuf],
+    agent: &str,
+) -> RuntimeResult<Vec<String>> {
+    match config.agents.get(agent) {
+        Some(agent) => skill_instruction_fragments(config, skill_roots, &agent.skills),
+        None => Ok(Vec::new()),
+    }
+}
+
+/// Die Fragmente **aller** aktivierten Skills der Konfiguration, nach Namen
+/// sortiert — für eine Wurzel (etwa die UIA), die ohne eigenes `agent.toml`
+/// den gesamten aktivierten Katalog sehen soll.
+///
+/// # Errors
+/// Wie [`skill_instruction_fragments`].
+pub fn enabled_skill_fragments(
+    config: &ResolvedConfig,
+    skill_roots: &[PathBuf],
+) -> RuntimeResult<Vec<String>> {
+    let mut names: Vec<String> = config
+        .skills
+        .values()
+        .filter(|skill| skill.enabled)
+        .map(|skill| skill.name.clone())
+        .collect();
+    names.sort();
+    skill_instruction_fragments(config, skill_roots, &names)
 }
 
 /// Spawner-Adapter für Kind-Registries.
@@ -1585,6 +1816,122 @@ mod tests {
 
         assert_eq!(factory.sandbox_profile, harw_sandbox::SandboxProfile::Host);
         assert!(factory.host_permit_wiring.is_some());
+        Ok(())
+    }
+
+    // -------------------------------------------------------------------
+    // Welle 4 — Skills erreichen Agenten.
+    // -------------------------------------------------------------------
+
+    /// Ein Layer mit den Skills `review` (aktiviert) und `off` (deaktiviert)
+    /// sowie eine Konfiguration, in der `agent` beide direkt führt.
+    fn skill_fixture(agent: &str) -> TestResult<(tempfile::TempDir, harw_config::ResolvedConfig)> {
+        let layer = tempfile::tempdir().map_err(ctx("tempdir"))?;
+        let mut config = harw_config::ResolvedConfig::default();
+        for (name, enabled, body) in [("review", true, "Read tests first.\n"), ("off", false, "x")]
+        {
+            let dir = layer.path().join("skills").join(name);
+            std::fs::create_dir_all(&dir).map_err(ctx("mkdir skill"))?;
+            std::fs::write(
+                dir.join("skill.toml"),
+                format!("name = \"{name}\"\nenabled = {enabled}\ndescription = \"{name} skill\"\n"),
+            )
+            .map_err(ctx("write manifest"))?;
+            std::fs::write(dir.join("instructions.md"), body).map_err(ctx("write body"))?;
+            config.skills.insert(
+                name.to_owned(),
+                SkillToml {
+                    name: name.to_owned(),
+                    enabled,
+                    description: format!("{name} skill"),
+                    instructions_file: None,
+                    tools: Vec::new(),
+                    mcps: Vec::new(),
+                },
+            );
+        }
+        config.agents.insert(
+            agent.to_owned(),
+            harw_config::AgentToml {
+                name: agent.to_owned(),
+                role: "worker".to_owned(),
+                description: String::new(),
+                system_file: None,
+                providers: Vec::new(),
+                models: Vec::new(),
+                skills: vec!["review".to_owned(), "off".to_owned(), "review".to_owned()],
+                suggestions: harw_config::AgentSuggestionsToml::default(),
+                primary_provider: None,
+                secondary_providers: Vec::new(),
+                timeout_seconds: 120,
+                max_retries: 2,
+            },
+        );
+        Ok((layer, config))
+    }
+
+    #[test]
+    fn child_registry_skill_fragments_carry_enabled_skills_with_sha256() -> TestResult {
+        let (layer, config) = skill_fixture(role_names::EXPLORER)?;
+        let factory = RuntimeChildRegistryFactory::new(
+            test_project(),
+            Arc::new(harw_core::EchoModelProvider::new("echo")),
+            test_chain(&config),
+        )
+        .map_err(ctx("factory builds"))?
+        .with_skill_catalog(&config, vec![layer.path().to_path_buf()])
+        .map_err(ctx("skill catalog"))?;
+
+        let fragments = factory
+            .skill_fragments_for_role(role_names::EXPLORER)
+            .map_err(|error| crate::test_support::TestError::Unexpected(error.message))?;
+        assert_eq!(fragments.len(), 1, "{fragments:?}");
+        assert!(fragments[0].starts_with("# Skill: review (sha256 "));
+        assert!(fragments[0].contains("Read tests first."));
+        assert!(
+            factory
+                .skill_fragments_for_role(role_names::PLANNER)
+                .map_err(|error| crate::test_support::TestError::Unexpected(error.message))?
+                .is_empty(),
+            "a role without agent.toml gets no skill fragments"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn child_registry_without_skill_catalog_injects_nothing() -> TestResult {
+        let config = harw_config::ResolvedConfig::default();
+        let factory = RuntimeChildRegistryFactory::new(
+            test_project(),
+            Arc::new(harw_core::EchoModelProvider::new("echo")),
+            test_chain(&config),
+        )
+        .map_err(ctx("factory builds"))?;
+        assert!(
+            factory
+                .skill_fragments_for_role(role_names::EXPLORER)
+                .map_err(|error| crate::test_support::TestError::Unexpected(error.message))?
+                .is_empty()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn skill_fragment_helpers_serve_root_agents_and_fail_closed() -> TestResult {
+        let (layer, config) = skill_fixture("emily")?;
+        let roots = vec![layer.path().to_path_buf()];
+        let fragments =
+            agent_skill_fragments(&config, &roots, "emily").map_err(ctx("agent fragments"))?;
+        assert_eq!(fragments.len(), 1);
+        assert!(
+            agent_skill_fragments(&config, &roots, "nobody")
+                .map_err(ctx("unknown agent"))?
+                .is_empty()
+        );
+        let all = enabled_skill_fragments(&config, &roots).map_err(ctx("enabled fragments"))?;
+        assert_eq!(all, fragments);
+        // Ein aktivierter Skill ohne auffindbares Verzeichnis: fail-closed.
+        assert!(skill_instruction_fragments(&config, &[], &["review".to_owned()]).is_err());
         Ok(())
     }
 }
