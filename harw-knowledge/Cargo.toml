@@ -70,6 +70,9 @@ serde_norway = "0.9.42"
 # workspace default (`[workspace.dependencies] toml`, root `Cargo.toml`), same
 # as `harw-home`/`harw-authority`/`harw-lens-embed`.
 toml = { workspace = true }
+# Prozessübergreifende Dateisperren (`src/lock.rs`, Runde 4 D0) — dieselbe
+# Workspace-Fassung, die `harw-session-store` für Transcript-/Job-Sperren nutzt.
+fs4 = { workspace = true }
 # External crates are LISTED here for the parent build to `cargo add` (this
 # worker never runs cargo); no version is invented for them.
 

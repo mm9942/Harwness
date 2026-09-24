@@ -1,0 +1,7 @@
+name = "latex-writer"
+role = "worker"
+description = "Schreibt und überarbeitet LaTeX-Quellen (Arbeiten, Paper, Beamer-Folien, Literatur), prüft sie statisch und baut sie mit latex.build, ohne freie Shell und ohne Installationen."
+system_file = "system.md"
+skills = ["latex-writing", "xelatex-compile"]
+timeout_seconds = 600
+max_retries = 1

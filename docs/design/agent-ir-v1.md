@@ -1,7 +1,7 @@
 # Agent-IR v1 — Bestehende Pipeline als expliziter Compiler-Kanal
 
 **Status:** Design-Anker (deskriptiv, kein neues Crate).
-**Bindet an:** `agent-definition-dsl.md` §17, `coding-philosophy.md` §6, §7, §11.
+**Bindet an:** [`agent-definition-dsl.md`](agent-definition-dsl.md) §17, [`coding-philosophy.md`](../philosophy/coding-philosophy.md) §6, §7, §11.
 
 Diese Doku macht die **Lowering-Stufen sichtbar**, die in `harw-agent-dsl` bereits latent existieren. Sie ersetzt keine Implementierung — sie benennt.
 

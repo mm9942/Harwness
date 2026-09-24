@@ -46,9 +46,11 @@ pub use dotenv::{
 };
 pub use error::{ConfigError, ConfigResult};
 pub use harness_config::{
-    CargoSandboxModeToml, CargoSandboxToml, HarnessConfig, LoggingSection, McpJobCapabilityToml,
-    McpListenerSection, McpPrincipalToml, PolicySection, SandboxSection, SessionSection,
-    TmuxOperationModeToml, TmuxSandboxToml, TuiSection,
+    CargoSandboxModeToml, CargoSandboxToml, DEFAULT_DIARY_RETENTION_DAYS,
+    DEFAULT_DREAM_BUDGET_TOKENS, DEFAULT_DREAM_COOLDOWN_MINUTES, DEFAULT_DREAM_ENABLED,
+    DEFAULT_DREAM_IDLE_MINUTES, DiaryToml, DreamToml, HarnessConfig, KnowledgeToml, LoggingSection,
+    McpJobCapabilityToml, McpListenerSection, McpPrincipalToml, PolicySection, SandboxSection,
+    SessionSection, TmuxOperationModeToml, TmuxSandboxToml, TuiSection,
 };
 pub use internal_models::{
     InternalModelChoice, InternalModelPoint, InternalModelSource, InternalModelsToml,

@@ -50,7 +50,8 @@ use std::collections::{BTreeSet, HashMap};
 
 use harw_registry_defaults::embedded_agents::builtin_agent_definitions;
 use harw_registry_defaults::profile::{
-    RegistryProfile, composition_tools_for_role, profile_for_role, role_names,
+    KANBAN_READ_TOOLS, KNOWLEDGE_READ_TOOLS, RegistryProfile, composition_tools_for_role,
+    knowledge_tools_for_role, profile_for_role, role_names,
 };
 
 mod common;
@@ -86,10 +87,14 @@ fn every_role_admitted_tool_is_registered_by_its_profile() -> TestResult {
         // die die Composition-Root für sie beisteuert (`delegate_wave`) —
         // sie gehören zu keinem `RegistryProfile`, sind aber ebenso wenig
         // toter Text (siehe `profile::composition_tools_for_role`).
+        // Plan Teil D: dasselbe gilt für die lesenden Wissenswerkzeuge, die
+        // die Composition-Root bei vorhandenem Wissensspeicher anhängt
+        // (`profile::knowledge_tools_for_role`).
         let advertised: BTreeSet<&str> = profile
             .tool_names()
             .into_iter()
             .chain(composition_tools_for_role(role).iter().copied())
+            .chain(knowledge_tools_for_role(role).iter().copied())
             .collect();
 
         for admitted in ir.tool_surface().admitted() {
@@ -501,4 +506,115 @@ fn workspace_edit_profile_never_includes_shell_or_web_tools() {
             "{role} darf WorkspaceEdit nicht bekommen"
         );
     }
+}
+
+/// Runde 4, Teil E: `uia-latex-writer` admittiert genau lesende `fs.*`,
+/// `fs.write`, `doc.read_pdf` und das typisierte `latex.build` — und sein
+/// Profil (`UiaLatexWriter`) registriert/bewirbt genau diese Menge. Freie
+/// Shell, Prozesswerkzeuge, Netz, `deps.*` und `lens.ask` sind ausdrücklich
+/// verboten; Rückgabevertrag `execution-summary`, keine Spawn-Tiefe.
+#[test]
+fn uia_latex_writer_admits_exactly_files_pdf_and_latex_build() -> TestResult {
+    let roles = resolved_roles()?;
+    let role = role_names::UIA_LATEX_WRITER;
+    let ir = roles
+        .get(role)
+        .ok_or(TestError::Unexpected(format!("{role} fehlt")))?;
+    let profile =
+        profile_for_role(role).ok_or(TestError::Unexpected(format!("{role} ohne Profil")))?;
+    assert_eq!(profile, RegistryProfile::UiaLatexWriter);
+    let expected: BTreeSet<&str> = [
+        "fs.read",
+        "fs.write",
+        "fs.list",
+        "fs.search",
+        "fs.glob",
+        "fs.grep",
+        "doc.read_pdf",
+        "latex.build",
+    ]
+    .into();
+    let admitted: BTreeSet<&str> = ir
+        .tool_surface()
+        .admitted()
+        .iter()
+        .map(String::as_str)
+        .collect();
+    let advertised: BTreeSet<&str> = profile.tool_names().into_iter().collect();
+    assert_eq!(admitted, expected, "{role}: admitted");
+    assert_eq!(advertised, expected, "{profile:?}: beworben");
+    let forbidden: BTreeSet<&str> = ir
+        .tool_surface()
+        .forbidden()
+        .iter()
+        .map(String::as_str)
+        .collect();
+    for tool in [
+        "shell.exec",
+        "process.kill",
+        "web.fetch",
+        "web.search",
+        "web.docs_rs",
+        "web.crates_io",
+        "deps.graph",
+        "deps.source_read",
+        "lens.ask",
+    ] {
+        assert!(forbidden.contains(tool), "{role} muss {tool} verbieten");
+    }
+    assert_eq!(ir.spawn_contract().max_depth(), Some(0), "{role}");
+    assert_eq!(
+        ir.return_pipeline().contract(),
+        Some("harwness.return.execution-summary@1"),
+        "{role}"
+    );
+    Ok(())
+}
+
+/// Plan Teil D („Agenten dürfen Workbench, Palace und Diary lesen“): jede
+/// Rolle admittiert genau die lesenden Wissenswerkzeuge, die
+/// `profile::knowledge_tools_for_role` ihr anbietet — sonst montiert die
+/// Kind-Registry einen Provider, dessen Werkzeug die deny-by-default-
+/// Aktivierung nie freischaltet —, und keines davon ist verboten. Kanban
+/// (`kanban.list`/`kanban.show`, nur auf ausdrücklichen Wunsch der Nutzerin)
+/// admittiert ausschließlich der Root-Orchestrator.
+#[test]
+fn roles_admit_exactly_their_offered_knowledge_read_tools() -> TestResult {
+    let roles = resolved_roles()?;
+    for role in role_names::ALL {
+        let ir = roles
+            .get(*role)
+            .ok_or(TestError::Unexpected(format!("{role} fehlt")))?;
+        let admitted: BTreeSet<&str> = ir
+            .tool_surface()
+            .admitted()
+            .iter()
+            .map(String::as_str)
+            .collect();
+        let forbidden: BTreeSet<&str> = ir
+            .tool_surface()
+            .forbidden()
+            .iter()
+            .map(String::as_str)
+            .collect();
+        let offered = knowledge_tools_for_role(role);
+        for tool in KNOWLEDGE_READ_TOOLS.iter().chain(KANBAN_READ_TOOLS) {
+            assert_eq!(
+                admitted.contains(tool),
+                offered.contains(tool),
+                "{role}: {tool} admittiert = {}, angeboten = {}",
+                admitted.contains(tool),
+                offered.contains(tool)
+            );
+            assert!(!forbidden.contains(tool), "{role} verbietet {tool}");
+        }
+        for tool in KANBAN_READ_TOOLS {
+            assert_eq!(
+                admitted.contains(tool),
+                *role == role_names::ROOT_ORCHESTRATOR,
+                "{role}: {tool} nur für den Root-Orchestrator"
+            );
+        }
+    }
+    Ok(())
 }

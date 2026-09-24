@@ -589,6 +589,9 @@ impl AgentMonitor {
             // Matrix-Spielereignisse gehören der Matrix-Ansicht (`app.rs`
             // leitet sie dorthin weiter); der Monitor ignoriert sie.
             AgentEventKind::Matrix { .. } => false,
+            // Wissensänderungen markieren Panels als veraltet (`app.rs`);
+            // der Monitor ignoriert sie.
+            AgentEventKind::Knowledge { .. } => false,
         }
     }
 

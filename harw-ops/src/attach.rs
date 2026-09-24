@@ -91,7 +91,7 @@ pub struct AttachArgs {
     summary = "Inspiziert einen dauerhaft gespeicherten Job.",
     domain = "execution",
     permission = "operator",
-    command(path = "/attach", visibility = "tui_only"),
+    command(path = "/attach", visibility = "tui_only", busy = "immediate"),
     // Web-Fläche: laut Moduldoku "öffnet keine interaktive Session und
     // verändert den Job nicht" — reine Inspektion über den `JobStore`, daher
     // `method = "get"`. `approval = "none"`, weil ein Lesevorgang keine

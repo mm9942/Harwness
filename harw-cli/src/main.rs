@@ -1275,10 +1275,19 @@ fn serve_mcp(
         }),
         None => None,
     };
+    // Kanban-Karten (Plan D2) liegen im Wissensspeicher des Profils, dessen
+    // Job-Speicher dieser Dienst bedient (`<storage_root>/knowledge`). Ohne
+    // HARW-Home bleiben `kanban_card`-Jobs unberührt.
+    let knowledge = home.as_deref().map(|_| {
+        Arc::new(harw_knowledge::KnowledgeStore::new(
+            &harw_home::knowledge_dir(&storage_root),
+        ))
+    });
     let worker_context = Arc::new(job_worker::JobWorkerContext {
         transcript_root,
         configured_submitters,
         runtime_root,
+        knowledge,
     });
 
     // Zwei Runtimes (G-054): der Listener behält seine `current_thread`-Runtime

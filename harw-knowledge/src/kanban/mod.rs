@@ -6,7 +6,9 @@
 //! approval/structural gates. Neither submodule calls `harw-job-runtime`'s
 //! claim/lease/retry machinery directly — [`board::Card::work_id`] carries
 //! the `WorkId` that ties a card into that machinery, but driving the actual
-//! governed-work lifecycle stays with the caller (§6.2).
+//! governed-work lifecycle stays with the caller (§6.2). [`notes`] hält
+//! Kommentare, Belege, Verlauf und Ergebnis einer Karte (Plan D2).
 
 pub mod board;
 pub mod lifecycle;
+pub mod notes;

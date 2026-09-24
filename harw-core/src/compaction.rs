@@ -98,8 +98,15 @@ pub const PROGRESS_MARKER: &str = "[Fortschrittsnotiz]\n";
 pub const SUMMARY_MAX_OUTPUT_TOKENS: u32 = 4096;
 
 /// Standardanzahl der jüngsten Tool-Runden des aktuellen Turns, die die
-/// Current-Turn-Elision nie anfasst.
+/// Current-Turn-Elision nie anfasst — außer unter Notdruck
+/// ([`CompactionBudget::emergency`]), dann sinkt sie auf `0`.
 pub const DEFAULT_KEEP_RECENT_ROUNDS: usize = 2;
+
+/// Behaltene Bytes (Kopf + Ende) eines übergroßen Ergebnisses der jüngsten,
+/// sonst geschützten Runden unter Notdruck (Teil C). Größer als
+/// [`ELISION_HEAD_TAIL_BYTES`], weil diese Ergebnisse das Modell gleich
+/// weiterverwenden will.
+const EMERGENCY_RECENT_RESULT_BYTES: usize = 8 * 1024;
 
 /// Angenommenes Kontextfenster des Zusammenfassungs-Modells, wenn der
 /// Aufrufer keines angibt (dieselbe konservative Annahme wie für unbekannte
@@ -267,6 +274,11 @@ pub struct CompactionBudget {
     pub summary_model: Option<ModelId>,
     /// Provider-ID des Zusammenfassungs-Aufrufs (siehe `summary_model`).
     pub summary_provider: Option<ProviderId>,
+    /// Notdruck (Teil C): reichen die regulären Stufen nicht, werden
+    /// zusätzlich übergroße Ergebnisse der geschützten jüngsten Runden auf
+    /// Kopf und Ende gekürzt und danach `keep_recent_rounds` auf `0` gesenkt.
+    /// Nur bei [`CompactionScope::CurrentTurn`] wirksam.
+    pub emergency: bool,
 }
 
 impl CompactionBudget {
@@ -283,7 +295,16 @@ impl CompactionBudget {
             summary_window_tokens: None,
             summary_model: None,
             summary_provider: None,
+            emergency: false,
         }
+    }
+
+    /// Schaltet die Notdruck-Stufen ein oder aus (siehe
+    /// [`Self::emergency`]).
+    #[must_use]
+    pub fn with_emergency(mut self, emergency: bool) -> Self {
+        self.emergency = emergency;
+        self
     }
 
     /// Setzt den Nicht-Historien-Anteil des Requests in Tokens.
@@ -626,14 +647,22 @@ pub async fn compact_session(
 /// - `session` (`&mut AgentSession`): deren Historie ersetzt wird.
 /// - `model` (`&dyn ModelProvider`): für den optionalen
 ///   Zusammenfassungs-Aufruf.
-/// - `target_tokens` (`u64`): Ziel für die geschätzten Historien-Tokens.
+/// - `target_tokens` (`u64`): Ziel für die geschätzten Request-Tokens
+///   (Historie plus `overhead_tokens`).
 ///   Wirkungsbereich ist [`CompactionScope::default`] (Current-Turn-Elision,
 ///   2 Runden geschützt); das Zusammenfassungs-Modell kommt aus
 ///   [`AgentSession::compaction_summary_model`], sein Fenster aus der
 ///   Auto-Compact-Policy der Session (sonst
-///   [`DEFAULT_SUMMARY_WINDOW_TOKENS`]). Für Overhead und weitere Optionen
-///   siehe [`compact_for_budget_with`].
-/// - `reason` (`Option<CompactDecision>`): der Auslöser.
+///   [`DEFAULT_SUMMARY_WINDOW_TOKENS`]). Weitere Optionen: siehe
+///   [`compact_for_budget_with`].
+/// - `overhead_tokens` (`u64`): geschätzte Tokens des Requests außerhalb der
+///   Historie (System-Prompt, Fragmente, Werkzeugschemata; Teil C). Ohne
+///   diesen Anteil hielt die Verdichtung eine Historie für passend, die
+///   zusammen mit dem festen Rahmen das Fenster weiter sprengte. `0` ⇒ das
+///   Ziel gilt für die Historie allein.
+/// - `reason` (`Option<CompactDecision>`): der Auslöser. Bei
+///   [`CompactDecision::Emergency`] gelten zusätzlich die Notdruck-Stufen
+///   ([`CompactionBudget::emergency`]).
 ///
 /// # Returns
 /// Das [`CompactionOutcome`] dieses Laufs (`no_op`, `tokens_before`,
@@ -649,13 +678,17 @@ pub async fn compact_for_budget(
     session: &mut AgentSession,
     model: &dyn ModelProvider,
     target_tokens: u64,
+    overhead_tokens: u64,
     reason: Option<CompactDecision>,
 ) -> CoreResult<CompactionOutcome> {
     let summary_window = session
         .auto_compact()
         .map(crate::auto_compact::AutoCompactPolicy::context_window_tokens)
         .filter(|window| *window > 0);
-    let budget = CompactionBudget::new(target_tokens).with_summary_window_tokens(summary_window);
+    let budget = CompactionBudget::new(target_tokens)
+        .with_summary_window_tokens(summary_window)
+        .with_overhead_tokens(overhead_tokens)
+        .with_emergency(matches!(reason, Some(CompactDecision::Emergency)));
     compact_for_budget_with(session, model, &budget, reason).await
 }
 
@@ -754,6 +787,30 @@ pub async fn compact_for_budget_with(
             history = elided;
             outcome.elided_results = u32::try_from(stats.elided_results).unwrap_or(u32::MAX);
             outcome.progress_note = stats.progress_note;
+        }
+        // Teil C, Notdruck: (e1) übergroße Ergebnisse auch der geschützten
+        // jüngsten Runden auf Kopf/Ende kürzen, (e2) danach keine Runde mehr
+        // schützen. Die Call/Ergebnis-Paarung und die auslösende
+        // `UserMessage` bleiben in beiden Stufen erhalten.
+        if budget.emergency && !fits_items(history.items()) {
+            let (trimmed, count) =
+                trim_current_turn_results(&history, EMERGENCY_RECENT_RESULT_BYTES);
+            if count > 0 {
+                history = trimmed;
+                outcome.elided_results = outcome
+                    .elided_results
+                    .saturating_add(u32::try_from(count).unwrap_or(u32::MAX));
+            }
+            if !fits_items(history.items())
+                && keep_recent_rounds > 0
+                && let Some((elided, stats)) = elide_current_turn(&history, 0, &fits_groups)
+            {
+                history = elided;
+                outcome.elided_results = outcome
+                    .elided_results
+                    .saturating_add(u32::try_from(stats.elided_results).unwrap_or(u32::MAX));
+                outcome.progress_note |= stats.progress_note;
+            }
         }
     }
 
@@ -1238,7 +1295,7 @@ fn ceil_char_boundary(value: &str, index: usize) -> usize {
 /// Kürzt `text` auf höchstens etwa `max_bytes`, indem die Mitte durch einen
 /// Auslassungs-Hinweis ersetzt wird. `head_percent` bestimmt den Anteil des
 /// Kopfes am behaltenen Rest (0..=100). UTF-8-sicher.
-fn elide_middle(text: &str, max_bytes: usize, head_percent: usize) -> String {
+pub(crate) fn elide_middle(text: &str, max_bytes: usize, head_percent: usize) -> String {
     if text.len() <= max_bytes {
         return text.to_owned();
     }
@@ -1738,6 +1795,37 @@ fn elide_current_turn(
     let note = progress_note_item(&region, &original_sizes);
     groups.insert(first_current, vec![note]);
     Some(finish(groups, &affected, true))
+}
+
+/// Kürzt jedes Tool-Ergebnis des aktuellen Turns (nach der letzten
+/// `UserMessage`), das größer als `max_bytes` ist, auf Kopf und Ende
+/// (Notdruck-Stufe (e1), Teil C).
+///
+/// # Returns
+/// Die neue Historie und die Anzahl gekürzter Ergebnisse (`0` ⇒ unverändert).
+fn trim_current_turn_results(
+    history: &ConversationHistory,
+    max_bytes: usize,
+) -> (ConversationHistory, usize) {
+    let mut items: Vec<TurnItem> = history.items().to_vec();
+    let first_current = items
+        .iter()
+        .rposition(|item| matches!(item, TurnItem::UserMessage(_)))
+        .map_or(0, |idx| idx + 1);
+    let mut trimmed = 0_usize;
+    for item in items.iter_mut().skip(first_current) {
+        let TurnItem::ToolResult(result) = item else {
+            continue;
+        };
+        let text = tool_result_text(&result.result);
+        if text.len() <= max_bytes {
+            continue;
+        }
+        let cut = elide_middle(&text, max_bytes, 50);
+        result.result = tool_result_with_text(&result.result, cut);
+        trimmed += 1;
+    }
+    (ConversationHistory::from_items(items), trimmed)
 }
 
 /// Baut die Fortschrittsnotiz für die ausgelassenen Gruppen `region`. Eine
@@ -2332,6 +2420,7 @@ mod tests {
             &mut session,
             &crate::model::EchoModelProvider::default(),
             target,
+            0,
             None,
         )
         .await?;
@@ -2392,7 +2481,7 @@ mod tests {
         let model = crate::model::EchoModelProvider::default();
 
         // Unerreichbares Ziel ⇒ alle Stufen bis zur Fortschrittsnotiz.
-        let outcome = compact_for_budget(&mut session, &model, 1, None).await?;
+        let outcome = compact_for_budget(&mut session, &model, 1, 0, None).await?;
         assert!(outcome.progress_note);
         assert_eq!(outcome.elided_results, 6);
         assert_pairing(session.history())?;
@@ -2413,7 +2502,7 @@ mod tests {
         // Weitere Runden, erneute Verdichtung: die Notiz wird zusammengeführt,
         // nicht verschachtelt.
         push_worker_rounds(session.history_mut(), 8..11, 20_000);
-        let outcome = compact_for_budget(&mut session, &model, 1, None).await?;
+        let outcome = compact_for_budget(&mut session, &model, 1, 0, None).await?;
         assert!(outcome.progress_note);
         assert_pairing(session.history())?;
         let notes = progress_notes(session.history());
@@ -2437,7 +2526,7 @@ mod tests {
         push_worker_rounds(session.history_mut(), 0..5, 20_000);
         let model = RecordingSummaryModel::new("unbenutzt", StopReason::EndTurn);
 
-        let outcome = compact_for_budget(&mut session, &model, 1, None).await?;
+        let outcome = compact_for_budget(&mut session, &model, 1, 0, None).await?;
 
         assert!(!outcome.no_op);
         assert!(
@@ -2614,6 +2703,7 @@ mod tests {
             &mut session,
             &crate::model::EchoModelProvider::default(),
             1_000_000,
+            0,
             None,
         )
         .await?;
@@ -2683,5 +2773,54 @@ mod tests {
             crate::context_budget::estimate_request_bytes(&request),
             expected
         );
+    }
+
+    /// Teil C: ein Kind im 32k-Fenster mit drei 64-KiB-Ergebnissen in den
+    /// jüngsten Runden. Mit echtem Overhead (System + Werkzeuge) und ohne
+    /// Notdruck bleibt die Historie zu groß; unter Notdruck passt der ganze
+    /// Request (Historie + Overhead) ins Ziel, und die Paarung bleibt heil.
+    #[tokio::test]
+    async fn test_compact_for_budget_fits_a_32k_window_with_overhead() -> TestResult {
+        const WINDOW: u64 = 32_768;
+        const RESERVE: u64 = 4_915;
+        const OVERHEAD: u64 = 8_000;
+        let target = (WINDOW - RESERVE) * 60 / 100;
+        let model = crate::model::EchoModelProvider::default();
+        let build = || {
+            let mut session = test_session();
+            session.history_mut().push(user("Untersuche das Modul"));
+            push_worker_rounds(session.history_mut(), 0..3, 64 * 1024);
+            session
+        };
+
+        let mut regular = build();
+        let outcome = compact_for_budget(&mut regular, &model, target, OVERHEAD, None).await?;
+        assert!(
+            outcome.tokens_after > target,
+            "ohne Notdruck bleiben die zwei geschützten 64-KiB-Runden stehen"
+        );
+        assert!(outcome.tokens_after >= OVERHEAD, "der Overhead zählt mit");
+
+        let mut pressed = build();
+        let outcome = compact_for_budget(
+            &mut pressed,
+            &model,
+            target,
+            OVERHEAD,
+            Some(CompactDecision::Emergency),
+        )
+        .await?;
+        assert!(
+            outcome.tokens_after <= target,
+            "unter Notdruck passt der Request: {} > {target}",
+            outcome.tokens_after
+        );
+        assert!(outcome.tokens_after + RESERVE <= WINDOW);
+        assert_pairing(pressed.history())?;
+        assert!(matches!(
+            pressed.history().items().first(),
+            Some(TurnItem::UserMessage(_))
+        ));
+        Ok(())
     }
 }

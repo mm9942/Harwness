@@ -389,6 +389,7 @@ pub struct RuntimeServices {
     home_context: Option<Arc<harw_home::ResolvedHomeContext>>,
     knowledge: Option<Arc<KnowledgeStore>>,
     agent_events: Option<Arc<AgentEventHub>>,
+    dream_launcher: Option<Arc<dyn harw_ops::dream_run::DreamLauncher>>,
 }
 
 /// Legt `service` in `map` ab und merkt sich seinen Typnamen in `names`.
@@ -429,7 +430,25 @@ impl RuntimeServices {
             home_context: None,
             knowledge: None,
             agent_events: None,
+            dream_launcher: None,
         }
+    }
+
+    /// Bindet den Traum-Starter für `/dream run` (Plan D5).
+    ///
+    /// # Beschreibung
+    /// Die Montage baut ihn aus ihrem Modell, dem Wissensspeicher, dem
+    /// `JobStore` und der Session-Wurzel
+    /// (`crate::dream_run::RuntimeDreamLauncher`). Er liegt nur auf der
+    /// Slash-Fläche — `/dream` ist ein reines Operator-Kommando ohne
+    /// Modell-Werkzeug. Ohne Aufruf meldet `/dream run` `NotAvailable`.
+    #[must_use]
+    pub fn with_dream_launcher(
+        mut self,
+        launcher: Arc<dyn harw_ops::dream_run::DreamLauncher>,
+    ) -> Self {
+        self.dream_launcher = Some(launcher);
+        self
     }
 
     /// Bindet den Agenten-Event-Bus der Montage.
@@ -611,6 +630,7 @@ impl RuntimeServices {
     /// | `Arc<KnowledgeStore>` (falls gebunden, L6) | ✓ | ✓ | — | — |
     /// | `Arc<dyn JobTransitions>` (Speicher + `JobStore` + Freigabe-Akteur) | ✓ | ✓ | — | — |
     /// | `Arc<AgentEventHub>` (falls gebunden, `/matrix`) | ✓ | ✓ | — | — |
+    /// | `Arc<dyn DreamLauncher>` (falls gebunden, `/dream run`, Plan D5) | ✓ | — | — | — |
     ///
     /// Die Zeile [`OperationRegistry`] trägt in jeder Fläche dieselbe Menge —
     /// nämlich die, die [`crate::spec::EntryProfile::operations`] dem Einstieg
@@ -751,6 +771,13 @@ impl RuntimeServices {
         if let Some(ledger) = self.kanban_ledger(surface) {
             insert_service(&mut map, &mut names, ledger);
         }
+        if let Some(launcher) = self
+            .dream_launcher
+            .as_ref()
+            .filter(|_| surface == ServiceSurface::Slash)
+        {
+            insert_service(&mut map, &mut names, Arc::clone(launcher));
+        }
         if let Some(hub) = self
             .agent_events
             .as_ref()
@@ -789,22 +816,39 @@ impl RuntimeServices {
     ///
     /// # Rückgabe
     /// `Some(Arc<dyn JobTransitions>)` über den geteilten `JobStore`, sonst `None`.
-    fn kanban_ledger(&self, surface: ServiceSurface) -> Option<Arc<dyn JobTransitions>> {
+    pub(crate) fn kanban_ledger(&self, surface: ServiceSurface) -> Option<Arc<dyn JobTransitions>> {
         if !surface.allows_knowledge_store() || self.knowledge.is_none() {
             return None;
         }
-        let job_store = self.parts.job_store.as_ref()?;
-        let actor = self.parts.principal.approval_actor()?;
-        let scope = JobScope::new(
-            TenantId::from_str(KANBAN_TENANT),
-            WorkspaceId::from_str(KANBAN_WORKSPACE),
-            actor,
-        );
-        Some(Arc::new(JobStoreTransitions::new(
-            Arc::clone(job_store),
-            scope,
-        )))
+        kanban_transitions(self.parts.job_store.as_ref(), &self.parts.principal)
     }
+}
+
+/// Baut das Kanban-Job-Ledger über `job_store` für `principal`.
+///
+/// # Beschreibung
+/// Gemeinsamer Kern von [`RuntimeServices::kanban_ledger`] und der
+/// Kind-Registry-Fabrik (lesende `kanban.*`-Werkzeuge der Kinder, Plan D2),
+/// die vor den Diensten entsteht: derselbe Mandant/Workspace
+/// ([`KANBAN_TENANT`]/[`KANBAN_WORKSPACE`]) und derselbe Freigabe-Akteur.
+///
+/// # Rückgabe
+/// `None` ohne `JobStore` oder ohne Freigabe-Akteur des [`Principal`].
+pub(crate) fn kanban_transitions(
+    job_store: Option<&Arc<JobStore>>,
+    principal: &Principal,
+) -> Option<Arc<dyn JobTransitions>> {
+    let job_store = job_store?;
+    let actor = principal.approval_actor()?;
+    let scope = JobScope::new(
+        TenantId::from_str(KANBAN_TENANT),
+        WorkspaceId::from_str(KANBAN_WORKSPACE),
+        actor,
+    );
+    Some(Arc::new(JobStoreTransitions::new(
+        Arc::clone(job_store),
+        scope,
+    )))
 }
 
 #[cfg(test)]
@@ -1315,6 +1359,42 @@ mod tests {
                     .iter()
                     .any(|name| name.contains("KnowledgeStore")),
                 "{} darf ohne gebundenen Speicher keinen KnowledgeStore tragen",
+                surface.as_str()
+            );
+        }
+    }
+
+    /// Plan D5: der Traum-Starter liegt nur auf der Slash-Fläche.
+    #[test]
+    fn dream_launcher_reaches_the_slash_surface_only() {
+        struct NeverLauncher;
+        impl harw_ops::dream_run::DreamLauncher for NeverLauncher {
+            fn launch(
+                &self,
+                _trigger: harw_ops::dream_run::DreamTrigger,
+            ) -> harw_ops::dream_run::DreamFuture<
+                '_,
+                Result<harw_ops::dream_run::DreamRunOutcome, harw_ops::dream_run::DreamRunError>,
+            > {
+                Box::pin(async { Err(harw_ops::dream_run::DreamRunError::Busy) })
+            }
+        }
+        let launcher: Arc<dyn harw_ops::dream_run::DreamLauncher> = Arc::new(NeverLauncher);
+        let without = RuntimeServices::new(full_parts());
+        let with = RuntimeServices::new(full_parts()).with_dream_launcher(launcher);
+        for surface in ServiceSurface::ALL {
+            assert!(
+                without
+                    .service_map(surface)
+                    .get::<Arc<dyn harw_ops::dream_run::DreamLauncher>>()
+                    .is_none()
+            );
+            assert_eq!(
+                with.service_map(surface)
+                    .get::<Arc<dyn harw_ops::dream_run::DreamLauncher>>()
+                    .is_some(),
+                surface == ServiceSurface::Slash,
+                "{}",
                 surface.as_str()
             );
         }

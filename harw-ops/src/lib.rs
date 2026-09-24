@@ -164,12 +164,17 @@ pub mod deny;
 pub mod diary;
 pub mod diff;
 pub mod dream;
+pub mod dream_run;
 pub mod effort;
 pub mod explore;
 pub mod export;
 pub mod goal;
 pub mod help;
 pub mod kanban;
+pub mod knowledge_args;
+pub mod knowledge_common;
+#[cfg(test)]
+pub(crate) mod knowledge_test_support;
 pub mod learn;
 pub mod matrix;
 pub mod memory;

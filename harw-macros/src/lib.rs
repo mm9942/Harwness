@@ -407,6 +407,9 @@ pub fn agent(attr: TokenStream, item: TokenStream) -> TokenStream {
 ///     domain = "misc",          // session | agents | execution | catalog_config | knowledge | misc
 ///     permission = "observer",  // observer | operator | maintainer | owner
 ///     command(path = "/status", visibility = "channel_parity"),   // optional
+///     // command(...) kennt zusätzlich `busy = "immediate" | "staged" | "deferred"`
+///     // und `busy_subcommands = "show=immediate, switch=staged, -=immediate"`
+///     // (`-` = bare Form; überschreibt `Operation::busy_subcommands`).
 ///     model_tool(readonly, approval = "none"),                    // optional; approval: none | always
 ///     agent_tool(child = "researcher", authority = "reduce_to_read_only", budget = "8k"), // optional
 /// )]

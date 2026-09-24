@@ -326,7 +326,12 @@ fn handle_set_default(
     summary = "Zeigt/wechselt den Interaktionsmodus (chat/plan/explore/work/shell) oder setzt den Standard (default <modus>).",
     domain = "session",
     permission = "operator",
-    command(path = "/mode", visibility = "tui_only")
+    command(
+        path = "/mode",
+        visibility = "tui_only",
+        busy = "staged",
+        busy_subcommands = "-=immediate, show=immediate"
+    )
 )]
 async fn mode(ctx: &OpContext, args: ModeArgs) -> Result<OpOutput, OpError> {
     let command = args.command()?;

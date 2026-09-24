@@ -373,7 +373,11 @@ fn mode_lines(active: ApprovalMode) -> String {
     // wählt Freigabemodus/Regeln der eigenen Sitzung bzw. des eigenen Projekts.
     // Beides liegt ohnehin in der Hand der Person am Terminal.
     permission = "operator",
-    command(path = "/permissions", visibility = "tui_only"),
+    command(
+        path = "/permissions",
+        visibility = "tui_only",
+        busy_subcommands = "-=immediate, show=immediate, mode=immediate, set=immediate"
+    ),
     // Web-Fläche: `method = "post"`, seit Mutationen (`mode`, `allow`, `deny`,
     // `remove`) möglich sind. `approval = "always"`, weil genau dieser Aufruf
     // bestimmt, wie viel ohne Rückfrage geschieht — er darf nicht selbst ohne

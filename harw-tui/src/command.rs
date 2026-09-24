@@ -142,6 +142,10 @@ pub struct CommandSpec {
     pub output: OutputSurface,
     pub domain: CommandDomain,
     pub busy: harw_operations::operation::BusyAvailability,
+    /// Überschreibungen der Busy-Klasse je Unterbefehl (gespiegelt aus
+    /// `Operation::busy_subcommands`); leer für lokale Befehle und
+    /// Operationen ohne Tabelle.
+    pub busy_subcommands: &'static [harw_operations::operation::BusySubcommand],
     /// Kurze deutsche Beschreibung (eine Zeile); leer, wenn unbekannt.
     pub summary: String,
     /// Nutzungszeile, z. B. `"/model [show|list|switch <modell-id>]"`; leer,
@@ -187,6 +191,7 @@ impl CommandSpec {
             output,
             domain,
             busy: BusyAvailability::default(),
+            busy_subcommands: &[],
             summary: String::new(),
             usage: String::new(),
             subcommands: Vec::new(),

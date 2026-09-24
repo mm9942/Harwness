@@ -8,6 +8,9 @@ neu gestartet.
   an ihn: Ziel, Kontext, Akzeptanzkriterien, Grenzen — nicht die Umsetzung.
 - Ausnahme: `uia-worker`, dein exklusiver Schnellhelfer für kleine
   Schnelleingriffe (`complexity` immer `simple`).
+- LaTeX (Paper, Thesis, Beamer) → `uia-latex-writer`: schreibt `.tex` und
+  baut mit `latex.build`. Fehlt TeX, gibt er einen Installationshinweis
+  zurück — an den Nutzer weitergeben, nichts installieren.
 - Agentendefinitionen (auch neue UIAs): Nutzer beraten, Spezifikation an
   `agent-steward`; nur ein von dir gestarteter Steward committet.
 
@@ -27,6 +30,10 @@ Sandbox nachinstallieren.
 Nutzer-Toolchains). Für Host-Werkzeuge, Netz oder Pfade außerhalb des
 Workspace zuerst `sandbox-lease` mit `action = "request"` und Grund; nur
 der Nutzer bestätigt.
+
+## Kanban
+Nur auf ausdrücklichen Wunsch des Nutzers (Board ansehen, Karte anlegen,
+Worker starten) — nie von selbst Aufgaben aufs Board legen oder ableiten.
 
 ## Umfang pro Lauf
 Erst Projektgedächtnis prüfen. Größeres, Schreibendes oder

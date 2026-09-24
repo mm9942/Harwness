@@ -8,7 +8,10 @@
 //! rebuilds over the bounded surface layout are implemented here.
 
 use std::collections::{HashMap, HashSet};
+use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex, OnceLock, PoisonError};
+use std::time::SystemTime;
 
 use serde::{Deserialize, Serialize};
 
@@ -245,76 +248,161 @@ impl KnowledgeIndex {
             );
         }
 
-        index_surface(
-            &mut index,
-            &mut report,
-            store,
-            &root.join("topics"),
-            &canonical_root,
-            ArtifactKind::TopicMemory,
-            "topic",
-        )?;
-        index_surface(
-            &mut index,
-            &mut report,
-            store,
-            &root.join("palace"),
-            &canonical_root,
-            ArtifactKind::PalaceNode,
-            "palace",
-        )?;
-        index_surface(
-            &mut index,
-            &mut report,
-            store,
-            &root.join("diary"),
-            &canonical_root,
-            ArtifactKind::DiaryEntry,
-            "diary",
-        )?;
-        index_surface(
-            &mut index,
-            &mut report,
-            store,
-            &root.join("dreams"),
-            &canonical_root,
-            ArtifactKind::DreamReport,
-            "dream",
-        )?;
-        index_surface(
-            &mut index,
-            &mut report,
-            store,
-            &root.join("workbench"),
-            &canonical_root,
-            ArtifactKind::WorkbenchNote,
-            "workbench",
-        )?;
-        index_surface(
-            &mut index,
-            &mut report,
-            store,
-            &root.join("kanban").join("boards"),
-            &canonical_root,
-            ArtifactKind::KanbanCard,
-            "kanban",
-        )?;
-        // AW5-09: `ContextProposal` artifacts (see `crate::context_proposal`)
-        // live under `context-proposals/`, mirroring the six surfaces above.
-        // Purely additive: a store without this directory is unaffected
-        // (`index_surface` returns `Ok(())` immediately for a missing
-        // directory, exactly as it already does for every other surface).
-        index_surface(
-            &mut index,
-            &mut report,
-            store,
-            &root.join("context-proposals"),
-            &canonical_root,
-            ArtifactKind::ContextProposal,
-            "context-proposal",
-        )?;
+        for (directory, kind, prefix) in SURFACES {
+            index_surface(
+                &mut index,
+                &mut report,
+                store,
+                &surface_path(root, directory),
+                &canonical_root,
+                *kind,
+                prefix,
+            )?;
+        }
 
         Ok((index, report))
+    }
+}
+
+/// Die bekannten Wissensflächen: (Verzeichnis relativ zur Wurzel, Art,
+/// Id-Präfix). Der Verzeichnisaufbau ist der vertrauenswürdige
+/// Typ-Diskriminator; [`KnowledgeIndex::rebuild_with_report`] und die
+/// Cache-Signatur ([`KnowledgeIndex::cached`]) laufen über genau diese Liste.
+///
+/// AW5-09: `ContextProposal`-Artefakte (siehe `crate::context_proposal`)
+/// liegen unter `context-proposals/`; ein Speicher ohne dieses Verzeichnis
+/// ist unberührt (`index_surface` kehrt für fehlende Verzeichnisse sofort
+/// mit `Ok(())` zurück).
+const SURFACES: &[(&str, ArtifactKind, &str)] = &[
+    ("topics", ArtifactKind::TopicMemory, "topic"),
+    ("palace", ArtifactKind::PalaceNode, "palace"),
+    ("diary", ArtifactKind::DiaryEntry, "diary"),
+    ("dreams", ArtifactKind::DreamReport, "dream"),
+    ("workbench", ArtifactKind::WorkbenchNote, "workbench"),
+    ("kanban/boards", ArtifactKind::KanbanCard, "kanban"),
+    (
+        "context-proposals",
+        ArtifactKind::ContextProposal,
+        "context-proposal",
+    ),
+];
+
+/// `root` plus ein `/`-getrennter Flächenpfad aus [`SURFACES`].
+fn surface_path(root: &Path, directory: &str) -> PathBuf {
+    directory
+        .split('/')
+        .fold(root.to_path_buf(), |path, part| path.join(part))
+}
+
+/// Ein Eintrag des prozessweiten Index-Caches ([`KnowledgeIndex::cached`]).
+struct CacheEntry {
+    signature: u64,
+    index: Arc<KnowledgeIndex>,
+}
+
+/// Prozessweiter Index-Cache, geschlüsselt nach Speicherwurzel.
+fn index_cache() -> &'static Mutex<HashMap<PathBuf, CacheEntry>> {
+    static CACHE: OnceLock<Mutex<HashMap<PathBuf, CacheEntry>>> = OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+impl KnowledgeIndex {
+    /// Liefert den Index des Speichers aus dem prozessweiten Cache und baut
+    /// ihn nur neu, wenn sich der Bestand geändert hat.
+    ///
+    /// # Beschreibung
+    /// Der Cache ist nach der Speicherwurzel geschlüsselt. Vor jeder Antwort
+    /// wird eine billige Signatur des Bestands berechnet — Pfad, Größe und
+    /// Änderungszeit (mtime, Nanosekunden) jeder Markdown-Datei derselben
+    /// Flächen, die [`Self::rebuild_with_report`] einliest, plus
+    /// `core/MEMORY.md`. Dafür wird nur `stat` gelesen, nichts geparst.
+    /// Stimmt die Signatur mit dem gecachten Eintrag überein, kommt derselbe
+    /// `Arc` zurück; sonst wird neu aufgebaut und der Eintrag ersetzt. Neue,
+    /// gelöschte, umbenannte und geänderte Dateien invalidieren den Eintrag
+    /// damit zuverlässig; eine Änderung, die weder Größe noch mtime
+    /// verschiebt, bliebe bis zur nächsten sichtbaren Änderung unbemerkt
+    /// (auf Dateisystemen mit Nanosekunden-mtime praktisch ausgeschlossen).
+    ///
+    /// Ein vergifteter Mutex wird übernommen statt zu paniken — der Cache ist
+    /// nur eine Beschleunigung, sein Inhalt bleibt aus der Platte ableitbar.
+    ///
+    /// # Errors
+    /// Wie [`Self::rebuild`]: nur bei Fehlern des Verzeichnisdurchlaufs.
+    pub fn cached(store: &KnowledgeStore) -> KnowledgeResult<Arc<Self>> {
+        let key =
+            std::fs::canonicalize(store.root()).unwrap_or_else(|_| store.root().to_path_buf());
+        let signature = store_signature(store)?;
+        {
+            let cache = index_cache().lock().unwrap_or_else(PoisonError::into_inner);
+            if let Some(entry) = cache.get(&key)
+                && entry.signature == signature
+            {
+                return Ok(Arc::clone(&entry.index));
+            }
+        }
+        let index = Arc::new(Self::rebuild(store)?);
+        let mut cache = index_cache().lock().unwrap_or_else(PoisonError::into_inner);
+        cache.insert(
+            key,
+            CacheEntry {
+                signature,
+                index: Arc::clone(&index),
+            },
+        );
+        Ok(index)
+    }
+
+    /// Verwirft den gecachten Index eines Speichers (z. B. nach einem
+    /// Schreibvorgang, der die mtime-Auflösung unterlaufen könnte).
+    pub fn invalidate_cached(store: &KnowledgeStore) {
+        let key =
+            std::fs::canonicalize(store.root()).unwrap_or_else(|_| store.root().to_path_buf());
+        index_cache()
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .remove(&key);
+    }
+}
+
+/// Signatur des Bestands für [`KnowledgeIndex::cached`]: Hash über Pfad,
+/// Größe und mtime aller indexierten Markdown-Dateien.
+fn store_signature(store: &KnowledgeStore) -> KnowledgeResult<u64> {
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    let root = store.root();
+    if !root.exists() {
+        0u8.hash(&mut hasher);
+        return Ok(hasher.finish());
+    }
+    let canonical_root = std::fs::canonicalize(root)?;
+    hash_file_stamp(&mut hasher, &store.core_memory_path());
+    for (directory, _kind, _prefix) in SURFACES {
+        let surface = surface_path(root, directory);
+        directory.hash(&mut hasher);
+        if !surface.is_dir() {
+            continue;
+        }
+        for file in markdown_files(&surface, &canonical_root)? {
+            hash_file_stamp(&mut hasher, &file);
+        }
+    }
+    Ok(hasher.finish())
+}
+
+/// Hasht Pfad, Größe und mtime einer Datei; eine fehlende Datei zählt als
+/// eigener Zustand.
+fn hash_file_stamp(hasher: &mut impl Hasher, path: &Path) {
+    path.hash(hasher);
+    match std::fs::metadata(path) {
+        Ok(metadata) => {
+            metadata.len().hash(hasher);
+            let modified = metadata
+                .modified()
+                .ok()
+                .and_then(|time| time.duration_since(SystemTime::UNIX_EPOCH).ok())
+                .map(|elapsed| elapsed.as_nanos());
+            modified.hash(hasher);
+        }
+        Err(_) => u64::MAX.hash(hasher),
     }
 }
 
@@ -679,6 +767,85 @@ mod tests {
             .map_err(crate::test_support::ctx("remove temporary knowledge root"))?;
         std::fs::remove_dir_all(external)
             .map_err(crate::test_support::ctx("remove temporary external root"))?;
+        Ok(())
+    }
+
+    /// D4: `cached` liefert bei unverändertem Bestand denselben Index und
+    /// baut bei neuer, geänderter oder gelöschter Datei neu auf.
+    #[test]
+    fn cached_index_is_reused_until_the_store_changes() -> TestResult {
+        use crate::memory::topic;
+
+        let root = temporary_root("harw-knowledge-index-cache")?;
+        let store = KnowledgeStore::new(&root);
+        topic::write(&store, "a", frontmatter(), "eins")
+            .map_err(crate::test_support::ctx("write topic a"))?;
+
+        let first =
+            KnowledgeIndex::cached(&store).map_err(crate::test_support::ctx("first cached"))?;
+        let again =
+            KnowledgeIndex::cached(&store).map_err(crate::test_support::ctx("second cached"))?;
+        assert!(
+            Arc::ptr_eq(&first, &again),
+            "unchanged store reuses the index"
+        );
+        assert_eq!(first.len(), 1);
+
+        // Neue Datei → neu aufbauen.
+        topic::write(&store, "b", frontmatter(), "zwei")
+            .map_err(crate::test_support::ctx("write topic b"))?;
+        let added =
+            KnowledgeIndex::cached(&store).map_err(crate::test_support::ctx("cached after add"))?;
+        assert!(!Arc::ptr_eq(&first, &added));
+        assert_eq!(added.len(), 2);
+
+        // Geänderter Inhalt → neu aufbauen, neuer Body sichtbar.
+        topic::write(&store, "a", frontmatter(), "eins, jetzt deutlich länger")
+            .map_err(crate::test_support::ctx("rewrite topic a"))?;
+        let changed = KnowledgeIndex::cached(&store)
+            .map_err(crate::test_support::ctx("cached after change"))?;
+        assert!(!Arc::ptr_eq(&added, &changed));
+        let body = &changed
+            .get(&ArtifactId::new("topic/a"))
+            .ok_or(TestError::Missing("topic/a indexed"))?
+            .body;
+        assert!(body.contains("deutlich"), "{body}");
+
+        // Gelöschte Datei → neu aufbauen.
+        std::fs::remove_file(store.topic_path("b"))
+            .map_err(crate::test_support::ctx("remove topic b"))?;
+        let removed = KnowledgeIndex::cached(&store)
+            .map_err(crate::test_support::ctx("cached after remove"))?;
+        assert_eq!(removed.len(), 1);
+
+        // Ausdrückliches Verwerfen erzwingt einen frischen Aufbau.
+        KnowledgeIndex::invalidate_cached(&store);
+        let fresh = KnowledgeIndex::cached(&store)
+            .map_err(crate::test_support::ctx("cached after invalidate"))?;
+        assert!(!Arc::ptr_eq(&removed, &fresh));
+
+        std::fs::remove_dir_all(root)
+            .map_err(crate::test_support::ctx("remove temporary knowledge root"))?;
+        Ok(())
+    }
+
+    /// Zwei Speicher im selben Prozess teilen sich keinen Cache-Eintrag.
+    #[test]
+    fn cached_index_is_keyed_by_store_root() -> TestResult {
+        use crate::memory::topic;
+
+        let first_root = temporary_root("harw-knowledge-index-cache-a")?;
+        let second_root = temporary_root("harw-knowledge-index-cache-b")?;
+        let first = KnowledgeStore::new(&first_root);
+        let second = KnowledgeStore::new(&second_root);
+        topic::write(&first, "only-here", frontmatter(), "x")
+            .map_err(crate::test_support::ctx("write topic"))?;
+        let a = KnowledgeIndex::cached(&first).map_err(crate::test_support::ctx("cached a"))?;
+        let b = KnowledgeIndex::cached(&second).map_err(crate::test_support::ctx("cached b"))?;
+        assert_eq!(a.len(), 1);
+        assert!(b.is_empty());
+        std::fs::remove_dir_all(first_root).ok();
+        std::fs::remove_dir_all(second_root).ok();
         Ok(())
     }
 }

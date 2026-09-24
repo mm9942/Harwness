@@ -264,8 +264,8 @@ pub struct FieldScope {
 /// Die zentrale, öffentliche Deklarationstabelle: ein Eintrag pro
 /// `HarnessConfig`-Blattfeld (`docs/design/config-scopes.md` Abschnitt 6.3),
 /// in derselben Reihenfolge wie Abschnitt 1/6.3 der Spezifikation, damit die
-/// Tabelle 1:1 dagegen geprüft werden kann. Exakt 92 Einträge (Abschnitt 6.3
-/// Kontrollsumme: `ProfileReplaces` 44 · `GlobalOnly` 11 · `MinBound` 12 ·
+/// Tabelle 1:1 dagegen geprüft werden kann. Exakt 98 Einträge (Abschnitt 6.3
+/// Kontrollsumme: `ProfileReplaces` 50 · `GlobalOnly` 11 · `MinBound` 12 ·
 /// `CompositeMember` 11 · `Intersection` 4 · `OrBool` 3 · `Union` 2 ·
 /// `AndBool` 2 · `StricterOf` 2 · `PerFileValidated` 1).
 ///
@@ -384,6 +384,16 @@ pub static FIELD_TABLE: &[FieldScope] = &[
     FieldScope { path: "guards.no_progress_rounds_warn", scope: Scope::Global, merge: MergeRule::MinBound, ordering: None, intersection_key: None, security_critical: false },
     FieldScope { path: "guards.no_progress_rounds_abort", scope: Scope::Global, merge: MergeRule::MinBound, ordering: None, intersection_key: None, security_critical: false },
     FieldScope { path: "guards.plan_stale_rounds", scope: Scope::Global, merge: MergeRule::MinBound, ordering: None, intersection_key: None, security_critical: false },
+    // 1.17 [knowledge] (1) — Plan D3: Diary-Aufbewahrung; kein Sicherheitsbezug
+    // (die Wartung verschiebt ins Rollup, sie löscht nichts).
+    FieldScope { path: "knowledge.diary.retention_days", scope: Scope::Profile, merge: MergeRule::ProfileReplaces, ordering: None, intersection_key: None, security_critical: false },
+    // 1.18 [dream] (5) — Plan D5: Traum-Scheduler; kein Sicherheitsbezug
+    // (Träume schreiben nur review-gated Berichte, keine Werkzeuge).
+    FieldScope { path: "dream.enabled", scope: Scope::Profile, merge: MergeRule::ProfileReplaces, ordering: None, intersection_key: None, security_critical: false },
+    FieldScope { path: "dream.budget", scope: Scope::Profile, merge: MergeRule::ProfileReplaces, ordering: None, intersection_key: None, security_critical: false },
+    FieldScope { path: "dream.idle_minutes", scope: Scope::Profile, merge: MergeRule::ProfileReplaces, ordering: None, intersection_key: None, security_critical: false },
+    FieldScope { path: "dream.cooldown_minutes", scope: Scope::Profile, merge: MergeRule::ProfileReplaces, ordering: None, intersection_key: None, security_critical: false },
+    FieldScope { path: "dream.schedule", scope: Scope::Profile, merge: MergeRule::ProfileReplaces, ordering: None, intersection_key: None, security_critical: false },
 ];
 
 #[cfg(test)]
@@ -392,8 +402,8 @@ mod merge_rule_tests {
     use crate::test_support::{TestError, TestResult};
 
     #[test]
-    fn test_field_table_has_exactly_92_entries() {
-        assert_eq!(FIELD_TABLE.len(), 92);
+    fn test_field_table_has_exactly_98_entries() {
+        assert_eq!(FIELD_TABLE.len(), 98);
     }
 
     #[test]
@@ -408,7 +418,7 @@ mod merge_rule_tests {
     #[test]
     fn test_merge_rule_variant_control_sum_matches_abschnitt_6_3() {
         let count = |rule: MergeRule| FIELD_TABLE.iter().filter(|f| f.merge == rule).count();
-        assert_eq!(count(MergeRule::ProfileReplaces), 44);
+        assert_eq!(count(MergeRule::ProfileReplaces), 50);
         assert_eq!(count(MergeRule::GlobalOnly), 11);
         assert_eq!(count(MergeRule::MinBound), 12);
         assert_eq!(count(MergeRule::CompositeMember), 11);

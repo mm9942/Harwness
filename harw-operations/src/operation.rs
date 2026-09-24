@@ -97,33 +97,115 @@ impl OperationCategory {
 /// Verfügbarkeit einer Operation während eines laufenden ("busy") Turns.
 ///
 /// # Beschreibung
-/// Solange ein Turn läuft, werden eingehende Befehle standardmäßig
-/// eingereiht und erst nach Turn-Ende ausgeführt ([`DeferredUntilTurnEnd`],
-/// heutiges Verhalten aller Befehle). Eine Operation kann sich stattdessen als
-/// [`Immediate`] deklarieren, wenn sie während eines laufenden Turns sofort
-/// ausgeführt werden darf — das ist ausschließlich für reine Lese-/
-/// Steuerbefehle gedacht, die keine Session-Mutation über die Turn-Grenze
-/// hinweg vornehmen.
+/// Solange ein Turn läuft, gilt je Befehl genau eine von drei Klassen:
+/// - [`DeferredUntilTurnEnd`] (Standard): der Befehl wird eingereiht und erst
+///   nach Turn-Ende ausgeführt — für alles, was Sitzung, Verlauf oder Wissen
+///   schreibt.
+/// - [`Immediate`]: der Befehl läuft sofort, nebenläufig zum Turn — nur für
+///   reine Lese-/Steuerbefehle ohne Session-Mutation über die Turn-Grenze.
+/// - [`Staged`]: der Befehl läuft sofort, merkt seine Änderung aber nur über
+///   den `SessionController` bzw. Config-Zellen vor; sie gilt ab dem nächsten
+///   Turn (z. B. `/model switch`, `/effort`, `/mode`).
+///
+/// Eine Operation kann die Klasse je Unterbefehl überschreiben, siehe
+/// [`BusySubcommand`] und [`Operation::busy_subcommands`].
 ///
 /// [`DeferredUntilTurnEnd`]: BusyAvailability::DeferredUntilTurnEnd
 /// [`Immediate`]: BusyAvailability::Immediate
+/// [`Staged`]: BusyAvailability::Staged
 ///
 /// # Beispiel
 /// ```rust
 /// use harw_operations::operation::BusyAvailability;
 ///
 /// assert_eq!(BusyAvailability::default(), BusyAvailability::DeferredUntilTurnEnd);
+/// assert!(BusyAvailability::Staged.runs_during_turn());
 /// ```
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 pub enum BusyAvailability {
     /// Standard: Der Befehl wird während eines laufenden Turns eingereiht und
-    /// erst nach Turn-Ende ausgeführt (heutiges Verhalten aller Befehle).
+    /// erst nach Turn-Ende ausgeführt.
     #[default]
     DeferredUntilTurnEnd,
     /// Der Befehl darf während eines laufenden ("busy") Turns sofort
     /// ausgeführt werden — nur für reine Lese-/Steuerbefehle ohne
     /// Session-Mutation über die Turn-Grenze gedacht.
     Immediate,
+    /// Der Befehl läuft während eines Turns sofort, seine Änderung wird aber
+    /// nur vorgemerkt (Controller/Config-Zelle) und gilt ab dem nächsten Turn.
+    Staged,
+}
+
+impl BusyAvailability {
+    /// `true`, wenn ein Befehl dieser Klasse während eines laufenden Turns
+    /// sofort ausgeführt wird ([`Self::Immediate`] und [`Self::Staged`]).
+    ///
+    /// # Rückgabe
+    /// `false` nur für [`Self::DeferredUntilTurnEnd`].
+    #[must_use]
+    pub const fn runs_during_turn(self) -> bool {
+        !matches!(self, Self::DeferredUntilTurnEnd)
+    }
+}
+
+/// Überschreibt die [`BusyAvailability`] einer Operation für einen
+/// Unterbefehl (erstes Argument-Token der Befehlszeile).
+///
+/// # Beschreibung
+/// `subcommand = None` steht für den Aufruf **ohne** Argument (bare Form).
+/// Unterbefehle ohne Eintrag erben [`OperationMeta::busy`]. Das
+/// `#[operation]`-Makro erzeugt die Tabelle aus dem Schlüssel
+/// `busy_subcommands = "show=immediate, switch=staged, -=immediate"` (`-` ist
+/// die bare Form).
+///
+/// # Beispiel
+/// ```rust
+/// use harw_operations::operation::{BusyAvailability, BusySubcommand};
+///
+/// const TABLE: &[BusySubcommand] = &[
+///     BusySubcommand::new(Some("show"), BusyAvailability::Immediate),
+///     BusySubcommand::new(None, BusyAvailability::Immediate),
+/// ];
+/// let class = BusySubcommand::resolve(BusyAvailability::Staged, TABLE, Some("show"));
+/// assert_eq!(class, BusyAvailability::Immediate);
+/// let class = BusySubcommand::resolve(BusyAvailability::Staged, TABLE, Some("switch"));
+/// assert_eq!(class, BusyAvailability::Staged);
+/// ```
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct BusySubcommand {
+    /// Erstes Argument-Token; `None` für die bare Form.
+    pub subcommand: Option<&'static str>,
+    /// Klasse dieses Unterbefehls.
+    pub busy: BusyAvailability,
+}
+
+impl BusySubcommand {
+    /// Erzeugt einen Tabelleneintrag (in `const`-Tabellen verwendbar).
+    #[must_use]
+    pub const fn new(subcommand: Option<&'static str>, busy: BusyAvailability) -> Self {
+        Self { subcommand, busy }
+    }
+
+    /// Löst die Klasse einer Befehlszeile auf.
+    ///
+    /// # Argumente
+    /// - `default`: [`OperationMeta::busy`] der Operation.
+    /// - `table`: die Unterbefehls-Tabelle der Operation.
+    /// - `first_arg`: erstes Argument-Token der Zeile, `None` ohne Argument.
+    ///
+    /// # Rückgabe
+    /// Die Klasse des passenden Eintrags (exakter Vergleich), sonst `default`.
+    #[must_use]
+    pub fn resolve(
+        default: BusyAvailability,
+        table: &[BusySubcommand],
+        first_arg: Option<&str>,
+    ) -> BusyAvailability {
+        table
+            .iter()
+            .find(|entry| entry.subcommand == first_arg)
+            .map_or(default, |entry| entry.busy)
+    }
 }
 
 /// Geordnete Mindest-Berechtigungsstufe für eine Operation.
@@ -591,7 +673,9 @@ pub struct OperationMeta {
     /// eingereiht und erst nach Turn-Ende ausgeführt. `Immediate` — der
     /// Befehl darf während busy sofort ausgeführt werden; nur für reine
     /// Lese-/Steuerbefehle ohne Session-Mutation über die Turn-Grenze
-    /// gedacht.
+    /// gedacht. `Staged` — läuft sofort, merkt die Änderung aber nur vor
+    /// (gilt ab dem nächsten Turn). Überschreibungen je Unterbefehl liefert
+    /// [`Operation::busy_subcommands`].
     pub busy: BusyAvailability,
 }
 
@@ -942,6 +1026,32 @@ pub trait Operation: Send + Sync {
     /// ausgeführt werden. Implementierungen dürfen `&self` und `&ctx` für die Dauer des
     /// Futures borgen; sie müssen aber sicherstellen, dass der Borrow `Send` ist.
     fn run<'a>(&'a self, ctx: &'a OpContext, input: OpInput) -> OpFuture<'a>;
+
+    /// Unterbefehls-Überschreibungen der Busy-Klasse (siehe [`BusySubcommand`]).
+    ///
+    /// # Rückgabe
+    /// Standard: leer — jeder Aufruf erbt [`OperationMeta::busy`]. Das
+    /// `#[operation]`-Makro überschreibt die Methode, wenn
+    /// `busy_subcommands = "..."` gesetzt ist.
+    fn busy_subcommands(&self) -> &'static [BusySubcommand] {
+        &[]
+    }
+
+    /// Busy-Klasse eines konkreten Aufrufs.
+    ///
+    /// # Argumente
+    /// - `args`: Argument-Tokens der Befehlszeile (ohne Befehlsnamen).
+    ///
+    /// # Rückgabe
+    /// [`BusySubcommand::resolve`] über [`OperationMeta::busy`] und
+    /// [`Self::busy_subcommands`] mit dem ersten Token.
+    fn busy_for(&self, args: &[String]) -> BusyAvailability {
+        BusySubcommand::resolve(
+            self.meta().busy,
+            self.busy_subcommands(),
+            args.first().map(String::as_str),
+        )
+    }
 }
 
 #[cfg(test)]
@@ -1317,6 +1427,41 @@ mod tests {
         let b = BusyAvailability::Immediate;
         let b2 = b;
         assert_eq!(b, b2);
+    }
+
+    #[test]
+    fn test_busy_availability_runs_during_turn() {
+        assert!(BusyAvailability::Immediate.runs_during_turn());
+        assert!(BusyAvailability::Staged.runs_during_turn());
+        assert!(!BusyAvailability::DeferredUntilTurnEnd.runs_during_turn());
+    }
+
+    #[test]
+    fn test_busy_subcommand_resolve_prefers_table_and_bare_entry() {
+        use super::BusySubcommand;
+        const TABLE: &[BusySubcommand] = &[
+            BusySubcommand::new(Some("show"), BusyAvailability::Immediate),
+            BusySubcommand::new(Some("switch"), BusyAvailability::Staged),
+            BusySubcommand::new(None, BusyAvailability::Immediate),
+        ];
+        let deferred = BusyAvailability::DeferredUntilTurnEnd;
+        assert_eq!(
+            BusySubcommand::resolve(deferred, TABLE, Some("show")),
+            BusyAvailability::Immediate
+        );
+        assert_eq!(
+            BusySubcommand::resolve(deferred, TABLE, Some("switch")),
+            BusyAvailability::Staged
+        );
+        assert_eq!(
+            BusySubcommand::resolve(deferred, TABLE, None),
+            BusyAvailability::Immediate
+        );
+        assert_eq!(
+            BusySubcommand::resolve(deferred, TABLE, Some("test")),
+            deferred
+        );
+        assert_eq!(BusySubcommand::resolve(deferred, &[], None), deferred);
     }
 
     // ── Surface ───────────────────────────────────────────────────────────────

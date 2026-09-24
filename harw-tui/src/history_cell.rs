@@ -1318,14 +1318,20 @@ pub(crate) fn truncate_chars(text: &str, max_chars: usize) -> String {
 // ─── ToolCell (Plan Schritt 2 / Contract A5) ──────────────────────────────────
 
 /// Höchstzahl der in eingeklappter Darstellung gezeigten Ergebniszeilen
-/// (Zusammenfassungszeile ausgenommen) einer [`ToolCell`].
+/// (Zusammenfassungszeile ausgenommen) einer [`ToolCell`] — gezählt in
+/// umgebrochenen Bildschirmzeilen, nicht in logischen Zeilen.
 const TOOL_CELL_COLLAPSED_LINES: usize = 3;
 
 /// Höchstzahl der in ausgeklappter Darstellung gezeigten Ergebniszeilen
-/// einer [`ToolCell`], bevor auch dort eine Sammelzeile die Anzahl der
+/// (umgebrochene Bildschirmzeilen) einer [`ToolCell`], bevor auch dort eine Sammelzeile die Anzahl der
 /// ausgelassenen Zeilen nennt — ein Terminal, das tausende Zeilen Rohausgabe
 /// zeigt, ist unbrauchbar (dieselbe Erwägung wie bei [`PLAN_GRAPH_MAX_NODES`]).
 const TOOL_CELL_EXPANDED_LINES: usize = 200;
+
+/// Höchstzahl der Zeichen je Vorschauzeile einer [`ToolCell`] (siehe
+/// [`ToolCell::complete`]); längere Zeilen werden über [`truncate_chars`]
+/// mit `…` gekürzt.
+const TOOL_CELL_PREVIEW_MAX_CHARS: usize = 500;
 
 /// Höchstzahl der Zeilen der rohen Aufrufargumente in [`ToolVerbosity::Verbose`].
 const TOOL_CELL_VERBOSE_ARGUMENT_LINES: usize = 20;
@@ -1591,8 +1597,8 @@ fn parse_read_pdf_page_summary(header: &str) -> Option<String> {
 /// Whitespace um `{`/`}`/`[`/`]`/`,`/`:`, ohne den Werteinhalt zu verändern.
 /// Zeichen innerhalb einer Zeichenkette (erkannt an unescaped `"`) werden
 /// unverändert durchgereicht, damit ein `,` oder `{` im Wert selbst keinen
-/// Zeilenumbruch auslöst. Ausschließlich für [`ToolVerbosity::Verbose`]
-/// genutzt — `harw-tui` führt `serde_json` bewusst nicht als direkte
+/// Zeilenumbruch auslöst. Genutzt für [`ToolVerbosity::Verbose`] und die
+/// ausgeklappte Darstellung der `explore.*`-Ergebnisse — `harw-tui` führt `serde_json` bewusst nicht als direkte
 /// Abhängigkeit (siehe `approval.rs`), ein `serde_json::to_string_pretty`
 /// steht deshalb hier nicht zur Verfügung.
 ///
@@ -1722,9 +1728,19 @@ impl ToolCell {
     ///   (siehe [`parse_read_pdf_page_summary`]) — dann keine `preview`-Zeilen,
     ///   analog zu `fs.read`. Sonst (Kopfzeile nicht parsebar) `summary =
     ///   None` und eine generische Vorschau wie im Fallback-Zweig unten.
+    /// - `explore.projects`/`explore.find`/`explore.relations`: `summary`
+    ///   `"N Projekte"`/`"N Treffer"`/`"N Beziehungen"` (bzw. ein vorhandenes
+    ///   `summary`-Feld, außer bei `explore.projects`), `preview` je Eintrag
+    ///   eine Zeile (`root (kind)`, `path (kind)`, `from → to (kind)`),
+    ///   `full_output` das formatierte JSON ([`pretty_print_json`]).
     /// - alle anderen Werkzeuge: `summary = None`, `preview` die ersten drei
     ///   Zeilen einer kompakten Klartext-Darstellung (Zeichenketten
     ///   unverändert, Objekte als `schlüssel: wert`-Zeilen).
+    ///
+    ///
+    /// Jede Vorschauzeile wird danach auf [`TOOL_CELL_PREVIEW_MAX_CHARS`]
+    /// Zeichen gekappt. Die Anzeige begrenzt zusätzlich in umgebrochenen
+    /// Bildschirmzeilen (siehe [`ToolCell::display_lines_with`]).
     ///
     /// # Argumente
     /// - `result` (`&ToolCallResult`): das vom Kern festgehaltene Ergebnis.
@@ -1734,6 +1750,14 @@ impl ToolCell {
         match result {
             ToolCallResult::Error { message } => self.apply_error(message),
             ToolCallResult::Success { .. } => self.apply_success(result),
+        }
+        // Jede Vorschauzeile zusätzlich hart kappen: auch umgebrochen und
+        // zeilenbegrenzt soll eine 64-KiB-Zeile nicht bei jedem Rendern
+        // vollständig umgebrochen werden.
+        for line in &mut self.preview {
+            if line.chars().count() > TOOL_CELL_PREVIEW_MAX_CHARS {
+                *line = truncate_chars(line, TOOL_CELL_PREVIEW_MAX_CHARS);
+            }
         }
     }
 
@@ -1840,6 +1864,94 @@ impl ToolCell {
                     self.hidden_lines = lines.len().saturating_sub(self.preview.len());
                 }
                 self.full_output = lines;
+            }
+            "explore.projects" | "explore.find" | "explore.relations" => {
+                // Eigene Darstellung statt des generischen `schlüssel: wert`-
+                // Fallbacks, der das ganze Array zu einer Riesenzeile machte.
+                let (array_key, noun) = match self.tool_name.as_str() {
+                    "explore.projects" => ("projects", "Projekte"),
+                    "explore.find" => ("matches", "Treffer"),
+                    _ => ("relations", "Beziehungen"),
+                };
+                let is_relations = self.tool_name == "explore.relations";
+                let entries = value.get(array_key).and_then(|v| v.as_array());
+                self.state = ToolState::Succeeded;
+                self.preview = entries
+                    .map(|entries| {
+                        entries
+                            .iter()
+                            .map(|entry| {
+                                let field = |key: &str| {
+                                    entry.get(key).and_then(|v| v.as_str()).unwrap_or("?")
+                                };
+                                if is_relations {
+                                    format!(
+                                        "{} → {} ({})",
+                                        field("from"),
+                                        field("to"),
+                                        field("kind")
+                                    )
+                                } else if array_key == "projects" {
+                                    format!("{} ({})", field("root"), field("kind"))
+                                } else {
+                                    format!("{} ({})", field("path"), field("kind"))
+                                }
+                            })
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                let total = value
+                    .get("total")
+                    .or_else(|| value.get("count"))
+                    .and_then(|v| v.as_u64())
+                    .map_or(self.preview.len(), |n| {
+                        usize::try_from(n).unwrap_or(usize::MAX)
+                    });
+                let truncated = value
+                    .get("truncated")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false);
+                let mut summary = match value.get("summary").and_then(|v| v.as_str()) {
+                    Some(text) if array_key != "projects" => text.to_owned(),
+                    _ => format!("{total} {noun}"),
+                };
+                if truncated {
+                    summary.push_str(" (gekürzt)");
+                }
+                self.summary = Some(summary);
+                self.hidden_lines = 0;
+                self.full_output = pretty_print_json(&value.to_string())
+                    .lines()
+                    .map(str::to_owned)
+                    .collect();
+            }
+            // Runde 4, Teil E: fehlt LaTeX, muss die Nutzerin das sehen —
+            // Zusammenfassung mit den fehlenden Programmen, `user_message`
+            // (je Hinweis eine Zeile) aufgeklappt statt verschluckt. Übrige
+            // `latex.build`-Ergebnisse laufen über den generischen Arm.
+            "latex.build"
+                if value.get("status").and_then(|v| v.as_str()) == Some("not_installed") =>
+            {
+                let missing: Vec<&str> = value
+                    .get("missing")
+                    .and_then(|v| v.as_array())
+                    .map(|items| items.iter().filter_map(|item| item.as_str()).collect())
+                    .unwrap_or_default();
+                let message = value
+                    .get("user_message")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("LaTeX ist nicht installiert.");
+                let lines: Vec<String> = message
+                    .split(" · ")
+                    .map(|part| part.trim().to_owned())
+                    .filter(|part| !part.is_empty())
+                    .collect();
+                self.state = ToolState::Failed;
+                self.summary = Some(format!("LaTeX nicht installiert: {}", missing.join(", ")));
+                self.preview = lines.clone();
+                self.hidden_lines = 0;
+                self.full_output = lines;
+                self.expanded = true;
             }
             "fs.search" | "fs.grep" => {
                 let count = value
@@ -1981,9 +2093,9 @@ impl ToolCell {
         }
 
         let mut body_first = true;
-        let mut push_body = |content: &str, lines: &mut Vec<Line<'static>>| {
-            let lead = if body_first {
-                body_first = false;
+        let push_body = |content: &str, lines: &mut Vec<Line<'static>>, body_first: &mut bool| {
+            let lead = if *body_first {
+                *body_first = false;
                 TOOL_RESULT_LEAD
             } else {
                 TOOL_RESULT_CONTINUATION
@@ -1992,29 +2104,106 @@ impl ToolCell {
         };
 
         if let Some(summary) = &self.summary {
-            push_body(summary, &mut lines);
+            push_body(summary, &mut lines, &mut body_first);
         }
 
+        // Beide Zweige rechnen in umgebrochenen Bildschirmzeilen (Vorbild
+        // `ReasoningHistoryCell`): eine einzelne 64-KiB-Zeile darf weder
+        // eingeklappt noch ausgeklappt den Bildschirm füllen.
         if expanded {
-            let cap = TOOL_CELL_EXPANDED_LINES;
-            for row in self.full_output.iter().take(cap) {
-                push_body(row, &mut lines);
-            }
-            if self.full_output.len() > cap {
-                let elided = self.full_output.len() - cap;
-                push_body(&format!("… +{elided} Zeilen"), &mut lines);
+            let hidden = self.push_body_rows(
+                &mut lines,
+                &mut body_first,
+                self.full_output.iter(),
+                TOOL_CELL_EXPANDED_LINES,
+                width,
+                dim,
+            );
+            if hidden > 0 {
+                push_body(&format!("… +{hidden} Zeilen"), &mut lines, &mut body_first);
             }
         } else {
-            for row in self.preview.iter().take(TOOL_CELL_COLLAPSED_LINES) {
-                push_body(row, &mut lines);
-            }
-            if self.hidden_lines > 0 {
-                let note = format!("… +{} Zeilen (ctrl+o zum Ausklappen)", self.hidden_lines);
-                push_body(&note, &mut lines);
+            let mut hidden = self.push_body_rows(
+                &mut lines,
+                &mut body_first,
+                self.preview.iter(),
+                TOOL_CELL_COLLAPSED_LINES,
+                width,
+                dim,
+            );
+            hidden += self
+                .hidden_tail()
+                .iter()
+                .map(|row| wrapped_row_count(row, width, TOOL_RESULT_CONTINUATION))
+                .sum::<usize>();
+            if hidden > 0 {
+                let note = format!("… +{hidden} Zeilen (ctrl+o zum Ausklappen)");
+                push_body(&note, &mut lines, &mut body_first);
             }
         }
 
         lines
+    }
+
+    /// Rendert `rows` als Ergebniszeilen mit einem Budget von höchstens
+    /// `max_rows` **umgebrochenen Bildschirmzeilen** (siehe
+    /// [`push_indented_wrapped_capped`]).
+    ///
+    /// # Argumente
+    /// - `lines`: Ziel-Vektor.
+    /// - `body_first`: `true`, solange noch keine Ergebniszeile gerendert
+    ///   wurde (dann erhält die nächste Zeile [`TOOL_RESULT_LEAD`]).
+    /// - `rows`: die logischen Zeilen.
+    /// - `max_rows`: Budget in Bildschirmzeilen.
+    /// - `width`: Gesamtbreite in Spalten.
+    /// - `style`: Stil der Zeilen.
+    ///
+    /// # Rückgabe
+    /// Zahl der wegen des Budgets nicht gezeigten Bildschirmzeilen (Rest der
+    /// zuletzt gekürzten Zeile plus alle folgenden Zeilen, umgebrochen).
+    fn push_body_rows<'a>(
+        &self,
+        lines: &mut Vec<Line<'static>>,
+        body_first: &mut bool,
+        rows: impl Iterator<Item = &'a String>,
+        max_rows: usize,
+        width: u16,
+        style: Style,
+    ) -> usize {
+        let mut remaining = max_rows;
+        let mut hidden = 0usize;
+        for row in rows {
+            if remaining == 0 {
+                hidden += wrapped_row_count(row, width, TOOL_RESULT_CONTINUATION);
+                continue;
+            }
+            let lead = if *body_first {
+                TOOL_RESULT_LEAD
+            } else {
+                TOOL_RESULT_CONTINUATION
+            };
+            let before = lines.len();
+            hidden += push_indented_wrapped_capped(lines, row, width, lead, style, remaining);
+            *body_first = false;
+            remaining = remaining.saturating_sub(lines.len() - before);
+        }
+        hidden
+    }
+
+    /// Die bei eingeklappter Darstellung zusätzlich zur Vorschau
+    /// verborgenen logischen Zeilen: die letzten `hidden_lines` Einträge
+    /// von `full_output`.
+    ///
+    /// # Beschreibung
+    /// In allen Zweigen von [`ToolCell::apply_success`]/`apply_error`, die
+    /// `hidden_lines > 0` setzen, folgen die verborgenen Zeilen in
+    /// `full_output` auf die Vorschau. Bei `shell.exec` (Vorschau aus
+    /// nicht-leeren Zeilen) ist das eine Näherung: gezählt werden die
+    /// letzten `hidden_lines` Zeilen, leere eingeschlossen — sie überlappen
+    /// die Vorschau nie.
+    fn hidden_tail(&self) -> &[String] {
+        let start = self.full_output.len().saturating_sub(self.hidden_lines);
+        &self.full_output[start..]
     }
 }
 
@@ -2135,6 +2324,76 @@ fn push_indented_wrapped(
         let prefix = if i == 0 { lead } else { continuation.as_str() };
         lines.push(Line::from(Span::styled(format!("{prefix}{raw}"), style)));
     }
+}
+
+/// Zahl der Bildschirmzeilen, die [`push_indented_wrapped`] für `content`
+/// bei Breite `width` und Präfix `lead` erzeugen würde (mindestens 1).
+fn wrapped_row_count(content: &str, width: u16, lead: &str) -> usize {
+    let lead_width = u16::try_from(lead.chars().count()).unwrap_or(u16::MAX);
+    let inner_width = width.saturating_sub(lead_width).max(1);
+    wrap_plain(&sanitize_inline(content), inner_width)
+        .len()
+        .max(1)
+}
+
+/// Wie [`push_indented_wrapped`], aber mit höchstens `max_rows`
+/// Bildschirmzeilen.
+///
+/// # Beschreibung
+/// Passt `content` umgebrochen nicht in `max_rows` Zeilen, endet die letzte
+/// gezeigte Zeile mit `…` (bei voller Breite ersetzt `…` das letzte
+/// Zeichen). Bei `max_rows == 0` wird nichts angehängt.
+///
+/// # Argumente
+/// - `lines`: Ziel-Vektor.
+/// - `content`: die (unsanitisierte) logische Zeile.
+/// - `width`: Gesamtbreite in Spalten (inklusive Präfix).
+/// - `lead`: Präfix der ersten Teilzeile (Folgezeilen gleich breit eingerückt).
+/// - `style`: Stil aller Teilzeilen.
+/// - `max_rows`: Höchstzahl der angehängten Bildschirmzeilen.
+///
+/// # Rückgabe
+/// Zahl der nicht gezeigten Bildschirmzeilen dieser logischen Zeile.
+fn push_indented_wrapped_capped(
+    lines: &mut Vec<Line<'static>>,
+    content: &str,
+    width: u16,
+    lead: &str,
+    style: Style,
+    max_rows: usize,
+) -> usize {
+    let lead_chars = lead.chars().count();
+    let lead_width = u16::try_from(lead_chars).unwrap_or(u16::MAX);
+    let inner_width = width.saturating_sub(lead_width).max(1);
+    let sanitized = sanitize_inline(content);
+    let wrapped: Vec<String> = wrap_plain(&sanitized, inner_width)
+        .into_iter()
+        .map(|piece| piece.spans.iter().map(|s| s.content.as_ref()).collect())
+        .collect();
+    let total = wrapped.len().max(1);
+    if max_rows == 0 {
+        return total;
+    }
+    if wrapped.is_empty() {
+        lines.push(Line::from(Span::styled(lead.to_owned(), style)));
+        return 0;
+    }
+    let shown = wrapped.len().min(max_rows);
+    let hidden = wrapped.len() - shown;
+    let continuation = " ".repeat(lead_chars);
+    for (i, raw) in wrapped.into_iter().take(shown).enumerate() {
+        let prefix = if i == 0 { lead } else { continuation.as_str() };
+        let text = if hidden > 0 && i + 1 == shown {
+            let keep = usize::from(inner_width).saturating_sub(1);
+            let mut cut: String = raw.chars().take(keep).collect();
+            cut.push('…');
+            cut
+        } else {
+            raw
+        };
+        lines.push(Line::from(Span::styled(format!("{prefix}{text}"), style)));
+    }
+    hidden
 }
 
 /// Sammelzelle für aufeinanderfolgende, lesende `fs.*`-Aufrufe desselben
@@ -3341,6 +3600,37 @@ mod tests {
         assert!(cell.preview.is_empty());
     }
 
+    /// `latex.build` mit `status = not_installed`: Zusammenfassung nennt die
+    /// fehlenden Programme, der Hinweis für die Nutzerin steht vollständig
+    /// und aufgeklappt in der Zelle.
+    #[test]
+    fn test_tool_cell_latex_build_not_installed_shows_user_message() {
+        let call = make_tool_call(
+            "latex.build",
+            harw_tools::serde_json::json!({ "file": "main.tex" }),
+        );
+        let mut cell = ToolCell::started(&call);
+        let result = harw_protocol::items::ToolCallResult::success(harw_tools::serde_json::json!({
+            "status": "not_installed",
+            "missing": ["latexmk", "xelatex"],
+            "user_message": "LaTeX fehlt: latexmk, xelatex. · Debian/Ubuntu: sudo apt install latexmk",
+        }));
+        cell.complete(&result, 1);
+
+        assert_eq!(
+            cell.summary.as_deref(),
+            Some("LaTeX nicht installiert: latexmk, xelatex")
+        );
+        assert!(cell.expanded, "Hinweis darf nicht eingeklappt sein");
+        assert_eq!(
+            cell.full_output,
+            vec![
+                "LaTeX fehlt: latexmk, xelatex.".to_owned(),
+                "Debian/Ubuntu: sudo apt install latexmk".to_owned(),
+            ]
+        );
+    }
+
     /// `fs.search`-Erfolg zählt die Treffer im Feld `matches`.
     #[test]
     fn test_tool_cell_complete_fs_search_counts_matches() {
@@ -3450,6 +3740,159 @@ mod tests {
                 "Zeile {line} fehlt: {verbose:?}"
             );
         }
+    }
+
+    /// Eine einzelne sehr lange Zeile (generischer Fallback) bleibt bei
+    /// Breite 80 eingeklappt auf Kopfzeile + 3 Zeilen + Hinweis begrenzt;
+    /// der Hinweis zählt die versteckten Bildschirmzeilen.
+    #[test]
+    fn test_tool_cell_long_single_line_collapses_to_three_rows() -> TestResult {
+        let call = make_tool_call("custom.tool", harw_tools::serde_json::json!({}));
+        let mut cell = ToolCell::started(&call);
+        let long = "wort ".repeat(4000);
+        let result = harw_protocol::items::ToolCallResult::success(
+            harw_tools::serde_json::Value::String(long.clone()),
+        );
+        cell.complete(&result, 1);
+        assert!(cell.preview.iter().all(|l| l.chars().count() <= 500));
+
+        let collapsed = lines_to_strings(&cell.display_lines(80, style::Theme::Dark));
+        assert!(collapsed.len() <= 1 + 3 + 1, "war: {collapsed:?}");
+        let hint = collapsed.last().ok_or(TestError::Missing("letzte Zeile"))?;
+        assert!(hint.contains("ctrl+o zum Ausklappen"), "war: {collapsed:?}");
+        assert!(collapsed[3].trim_end().ends_with('…'), "war: {collapsed:?}");
+        // Versteckt: Rest der gekappten Vorschauzeile (500 Zeichen ≈ 7
+        // Bildschirmzeilen, davon 3 gezeigt).
+        assert!(!hint.contains("+0 "), "war: {hint}");
+
+        cell.set_expanded(true);
+        let expanded = lines_to_strings(&cell.display_lines(80, style::Theme::Dark));
+        assert!(expanded.len() > collapsed.len(), "war: {expanded:?}");
+        assert!(expanded.len() <= 1 + TOOL_CELL_EXPANDED_LINES + 1);
+        assert!(
+            expanded.join(" ").contains("wort wort"),
+            "war: {expanded:?}"
+        );
+        assert!(!expanded.join("\n").contains("ctrl+o"));
+        Ok(())
+    }
+
+    /// Ausgeklappt gilt das Limit in Bildschirmzeilen: eine einzige Zeile,
+    /// die umgebrochen weit über [`TOOL_CELL_EXPANDED_LINES`] Zeilen hätte,
+    /// wird gekappt und der Rest gezählt.
+    #[test]
+    fn test_tool_cell_expanded_caps_wrapped_rows() -> TestResult {
+        let call = make_tool_call("custom.tool", harw_tools::serde_json::json!({}));
+        let mut cell = ToolCell::started(&call);
+        let long = "x".repeat(64 * 1024);
+        let result = harw_protocol::items::ToolCallResult::success(
+            harw_tools::serde_json::Value::String(long),
+        );
+        cell.complete(&result, 1);
+        cell.set_expanded(true);
+
+        let lines = lines_to_strings(&cell.display_lines(80, style::Theme::Dark));
+        assert_eq!(
+            lines.len(),
+            1 + TOOL_CELL_EXPANDED_LINES + 1,
+            "{}",
+            lines.len()
+        );
+        let last = lines.last().ok_or(TestError::Missing("letzte Zeile"))?;
+        assert!(
+            last.contains("Zeilen") && last.contains("… +"),
+            "war: {last}"
+        );
+        Ok(())
+    }
+
+    /// `explore.projects`: Zusammenfassung „N Projekte“, je Projekt eine
+    /// Vorschauzeile `root (kind)`, ausgeklappt formatiertes JSON.
+    #[test]
+    fn test_tool_cell_explore_projects_previews_one_line_per_project() -> TestResult {
+        let call = make_tool_call("explore.projects", harw_tools::serde_json::json!({}));
+        let mut cell = ToolCell::started(&call);
+        let result = harw_protocol::items::ToolCallResult::success(harw_tools::serde_json::json!({
+            "projects": [
+                { "root": ".", "kind": "cargo-workspace", "name": "ws", "manifest": "Cargo.toml", "members": ["a", "b"] },
+                { "root": "a", "kind": "cargo-crate", "name": "a", "manifest": "a/Cargo.toml", "members": [] },
+            ],
+            "total": 2,
+            "summary": "13 Einträge (dir 5) · 2 Projekte",
+            "truncated": false,
+        }));
+        cell.complete(&result, 1);
+
+        assert_eq!(cell.summary.as_deref(), Some("2 Projekte"));
+        assert_eq!(cell.preview, vec![". (cargo-workspace)", "a (cargo-crate)"]);
+        assert_eq!(cell.hidden_lines, 0);
+
+        let lines = lines_to_strings(&cell.display_lines(80, style::Theme::Dark));
+        assert_eq!(lines.len(), 1 + 1 + 2, "war: {lines:?}");
+        assert!(lines[2].contains(". (cargo-workspace)"), "war: {lines:?}");
+        assert!(lines[3].contains("a (cargo-crate)"), "war: {lines:?}");
+
+        cell.set_expanded(true);
+        let expanded = lines_to_strings(&cell.display_lines(80, style::Theme::Dark));
+        assert!(
+            expanded.iter().any(|l| l.trim() == "\"members\": ["),
+            "war: {expanded:?}"
+        );
+        Ok(())
+    }
+
+    /// Mehr Projekte als das Budget: drei Zeilen, der Rest im Hinweis.
+    #[test]
+    fn test_tool_cell_explore_projects_many_projects_hint_counts_rest() -> TestResult {
+        let call = make_tool_call("explore.projects", harw_tools::serde_json::json!({}));
+        let mut cell = ToolCell::started(&call);
+        let projects: Vec<_> = (0..10)
+            .map(|i| harw_tools::serde_json::json!({ "root": format!("p{i}"), "kind": "git" }))
+            .collect();
+        let result = harw_protocol::items::ToolCallResult::success(harw_tools::serde_json::json!({
+            "projects": projects,
+            "total": 10,
+            "truncated": false,
+        }));
+        cell.complete(&result, 1);
+
+        let lines = lines_to_strings(&cell.display_lines(80, style::Theme::Dark));
+        assert_eq!(lines.len(), 1 + 1 + 3 + 1, "war: {lines:?}");
+        let hint = lines.last().ok_or(TestError::Missing("letzte Zeile"))?;
+        assert!(
+            hint.contains("+7 Zeilen (ctrl+o zum Ausklappen)"),
+            "war: {hint}"
+        );
+        Ok(())
+    }
+
+    /// `explore.find` und `explore.relations`: je Eintrag eine Zeile.
+    #[test]
+    fn test_tool_cell_explore_find_and_relations_preview() {
+        let call = make_tool_call(
+            "explore.find",
+            harw_tools::serde_json::json!({ "query": "lib" }),
+        );
+        let mut cell = ToolCell::started(&call);
+        let result = harw_protocol::items::ToolCallResult::success(harw_tools::serde_json::json!({
+            "count": 1,
+            "matches": [{ "path": "src/lib.rs", "kind": "rust", "size": 10 }],
+            "truncated": false,
+        }));
+        cell.complete(&result, 1);
+        assert_eq!(cell.summary.as_deref(), Some("1 Treffer"));
+        assert_eq!(cell.preview, vec!["src/lib.rs (rust)"]);
+
+        let call = make_tool_call("explore.relations", harw_tools::serde_json::json!({}));
+        let mut cell = ToolCell::started(&call);
+        let result = harw_protocol::items::ToolCallResult::success(harw_tools::serde_json::json!({
+            "relations": [{ "from": ".", "to": "a", "kind": "member", "label": null }],
+            "total": 1,
+            "truncated": true,
+        }));
+        cell.complete(&result, 1);
+        assert_eq!(cell.summary.as_deref(), Some("1 Beziehungen (gekürzt)"));
+        assert_eq!(cell.preview, vec![". → a (member)"]);
     }
 
     /// `ToolGroupCell::accepts` grenzt lesende `fs.*`-Aufrufe von

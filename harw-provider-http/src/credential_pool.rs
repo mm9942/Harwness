@@ -29,6 +29,11 @@
 //! global — ein Provider ohne Pool ist von einem Pool eines anderen
 //! Providers nicht betroffen.
 //!
+//! Nicht auflösbare Pool-Einträge (z. B. ein Codex-Login-Verweis, dessen
+//! Token nur für `chatgpt.com/backend-api/codex` freigegeben ist, auf der
+//! API-Route) werden beim Aufbau mit `tracing::warn!` übersprungen statt den
+//! Start abzubrechen; das primäre `provider.auth` bleibt ein harter Fehler.
+//!
 //! Ein `base_url`-Override eines Pool-Eintrags (`CredentialEntry::base_url`)
 //! gilt nur, während genau dieser Eintrag aktiv ist — das primäre Credential
 //! nutzt stets `provider.base_url` (bzw. bei Anthropic die von
@@ -143,13 +148,18 @@ impl<T> CredentialPool<T> {
     ///   Übersetzung Secret → Aufrufer-Repräsentation.
     ///
     /// # Returns
-    /// `Ok(None)`, wenn für `provider_name` kein Pool konfiguriert ist (der
-    /// Aufrufer fällt dann auf `provider.auth` zurück, siehe Moduldoku).
-    /// Sonst `Ok(Some(pool))` mit mindestens einem Eintrag.
+    /// `Ok(None)`, wenn für `provider_name` kein Pool konfiguriert ist oder
+    /// kein Eintrag auflösbar war (der Aufrufer fällt dann auf
+    /// `provider.auth` zurück, siehe Moduldoku). Sonst `Ok(Some(pool))` mit
+    /// mindestens einem Eintrag.
     ///
     /// # Errors
-    /// Jeder Fehler, den [`crate::resolve_secret`] oder `build` für einen
-    /// der Einträge liefert (die Auflösung bricht beim ersten Fehler ab).
+    /// Keine für einzelne Einträge: ein Eintrag, den
+    /// [`crate::resolve_secret`] oder `build` ablehnt, wird mit
+    /// `tracing::warn!` (Provider, Index, Label, Grund — kein Secret)
+    /// übersprungen. Pool-Einträge sind nur Failover; das primäre
+    /// Credential (`provider.auth`) löst der Aufrufer selbst auf, und dort
+    /// bleibt ein Fehler hart.
     pub(crate) fn from_auth_config(
         auth: &AuthConfig,
         provider_name: &str,
@@ -162,8 +172,27 @@ impl<T> CredentialPool<T> {
         }
         let mut entries = Vec::with_capacity(ordered.len());
         for (index, entry) in ordered.into_iter().enumerate() {
-            let secret = crate::resolve_secret(&entry.secret, sources)?;
-            let value = build(secret)?;
+            // Ein veralteter Pool-Eintrag (z. B. ein Codex-Login-Verweis nach
+            // dem Wechsel auf die API-Route) darf den Start nicht blockieren:
+            // Pool-Einträge sind Failover, das primäre Credential wird vom
+            // Aufrufer separat und hart aufgelöst. Geloggt werden nur
+            // Provider, Index/Label und der Fehlergrund — nie ein Secret.
+            let resolved = crate::resolve_secret(&entry.secret, sources).and_then(&build);
+            let value = match resolved {
+                Ok(value) => value,
+                Err(error) => {
+                    tracing::warn!(
+                        provider = provider_name,
+                        entry = index,
+                        label = entry.label.as_deref().unwrap_or(""),
+                        reason = %error,
+                        "credential_pool.entry_skipped: nicht auflösbarer Failover-Eintrag \
+                         übersprungen; entferne ihn aus credential_pool.{provider_name} in \
+                         auth.toml oder führe `harw onboard` erneut aus"
+                    );
+                    continue;
+                }
+            };
             let label = entry
                 .label
                 .clone()
@@ -173,6 +202,9 @@ impl<T> CredentialPool<T> {
                 base_url: entry.base_url.clone(),
                 label,
             });
+        }
+        if entries.is_empty() {
+            return Ok(None);
         }
         let entry_count = entries.len();
         Ok(Some(Self {
@@ -384,6 +416,39 @@ mod tests {
             .map_err(ctx("resolves"))?
             .ok_or(TestError::Missing("pool present"))?;
         assert_eq!(pool.entry(0).label, "openai#0");
+        Ok(())
+    }
+
+    #[test]
+    fn test_from_auth_config_skips_unresolvable_failover_entry() -> TestResult {
+        let mut env_layer = BTreeMap::new();
+        env_layer.insert("OPENAI_A".to_owned(), "value-a".to_owned());
+        let auth = auth_with_pool(
+            "openai",
+            vec![
+                entry(
+                    "file-json:/nonexistent-harw-test-home/.codex/auth.json#/tokens/access_token",
+                    0,
+                    Some("stale-codex"),
+                )?,
+                entry("env:OPENAI_A", 0, Some("key"))?,
+            ],
+        );
+        let pool = CredentialPool::from_auth_config(&auth, "openai", sources(&env_layer), Ok)
+            .map_err(ctx("stale entry must be skipped, not fail"))?
+            .ok_or(TestError::Missing("pool present"))?;
+        assert_eq!(pool.len(), 1);
+        assert_eq!(pool.entry(0).label, "key");
+        Ok(())
+    }
+
+    #[test]
+    fn test_from_auth_config_all_entries_unresolvable_yields_none() -> TestResult {
+        let env_layer = BTreeMap::new();
+        let auth = auth_with_pool("openai", vec![entry("env:HARW_TEST_MISSING", 0, None)?]);
+        let pool = CredentialPool::from_auth_config(&auth, "openai", sources(&env_layer), Ok)
+            .map_err(ctx("unresolvable entries are skipped"))?;
+        assert!(pool.is_none());
         Ok(())
     }
 

@@ -103,9 +103,9 @@ pub use context::{OpContext, ServiceMap};
 pub use error::OpError;
 pub use op_schema::OpArgsSchema;
 pub use operation::{
-    ApprovalPolicy, CommandVisibility, FromRawArgs, OpFuture, OpInput, OpInvocation, OpOutput,
-    Operation, OperationCategory, OperationDomain, OperationMeta, PermissionTier, Surface,
-    WebMethod,
+    ApprovalPolicy, BusyAvailability, BusySubcommand, CommandVisibility, FromRawArgs, OpFuture,
+    OpInput, OpInvocation, OpOutput, Operation, OperationCategory, OperationDomain, OperationMeta,
+    PermissionTier, Surface, WebMethod,
 };
 pub use session_control::{
     ContextUsageSnapshot, LastCompaction, NullSessionController, SessionControlError,

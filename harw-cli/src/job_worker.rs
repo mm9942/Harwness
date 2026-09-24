@@ -26,6 +26,16 @@
 //!   Success and failure both flow back into the plan, so a node can never be
 //!   left `InProgress` forever.
 //!
+//! * [`JobKind::Custom`] named `kanban_card`
+//!   (`harw_runtime::job_ledger::KANBAN_JOB_KIND`) — eine Karte einer
+//!   Kanban-Worker-Lane (Plan D2, Modul [`kanban_card`]). Ohne
+//!   Kanban-Freigabe des Operators startet kein Agent: der Job wird mit
+//!   `kanban:AwaitingApproval` blockiert und die Freigabe an der Karte
+//!   angefragt. Mit Freigabe läuft der Rollen-Agent wie ein Plan-Knoten
+//!   (`EntryKind::JobPlanNode`, verengt auf Lesen bzw. Lesen+Schreiben nach
+//!   der Rolle); Ergebnis und Verlauf landen an der Karte. Ohne
+//!   [`JobWorkerContext::knowledge`] bleiben diese Jobs unberührt.
+//!
 //! # Runtime assembly (W2d-2 J1, CONTRACTS-W2d2.md §1.3)
 //! Every executed job is assembled through
 //! `crate::runtime_jobs::job_assembly` and gets its root session from
@@ -80,6 +90,9 @@ use harw_types::{SessionId, ThreadRef};
 use crate::runtime_jobs::{JobAssemblyInputs, JobEntry, job_assembly, job_principal};
 use jiff::{SignedDuration, Timestamp};
 use tokio::sync::watch;
+
+#[path = "job_worker_kanban.rs"]
+mod kanban_card;
 
 const WORKER_ID: &str = "harw-serve-job-worker";
 const LEASE_TTL_SECONDS: i64 = 120;
@@ -156,6 +169,10 @@ pub struct JobWorkerContext {
     /// Home and cwd of the job runtimes; `None` blocks every executed job with
     /// `"job runtime requires a HARW home"` before any model call.
     pub runtime_root: Option<JobRuntimeRoot>,
+    /// Wissensspeicher des Profils (`harw_home::knowledge_dir`), in dem die
+    /// Kanban-Karten liegen. `None`: `kanban_card`-Jobs bleiben unberührt
+    /// (siehe [`kanban_card`]).
+    pub knowledge: Option<Arc<harw_knowledge::KnowledgeStore>>,
 }
 
 /// The services a `plan-node` job needs on top of the plain job pipeline.
@@ -289,6 +306,16 @@ pub async fn run_job_worker_once(
         if record.not_before > Timestamp::now() || !is_supported_kind(&record.job.kind) {
             continue;
         }
+        // Kanban-Karten: Freigabe vor dem Claim prüfen (gebunden an die
+        // gelesene Revision); ohne Wissensspeicher bleiben sie liegen.
+        let kanban = if kanban_card::is_kanban_kind(&record.job.kind) {
+            match kanban_card::gate(&store, &record, &context) {
+                Some(gate) => Some(gate),
+                None => continue,
+            }
+        } else {
+            None
+        };
 
         let work_id = record.job.id.clone();
         let input = record.input.clone();
@@ -317,6 +344,7 @@ pub async fn run_job_worker_once(
                             services,
                             operation_control,
                             context,
+                            kanban,
                         ),
                     )
                 },
@@ -396,6 +424,7 @@ fn is_supported_kind(kind: &JobKind) -> bool {
         JobKind::Custom(name) => {
             name == PLAN_NODE_JOB_KIND
                 || name == harw_channel_telegram::TELEGRAM_WORK_REQUEST_JOB_KIND
+                || name == harw_runtime::job_ledger::KANBAN_JOB_KIND
         }
     }
 }
@@ -417,6 +446,9 @@ fn is_telegram_work_kind(kind: &JobKind) -> bool {
 // Claim dispatch
 // ──────────────────────────────────────────────────────────────────────────────
 
+// Acht Argumente: der Dispatcher reicht jeden Dienst nur an genau einen
+// Ausführungspfad weiter; ein Bündel-Struct hätte keinen weiteren Nutzer.
+#[allow(clippy::too_many_arguments)]
 async fn execute_claim(
     claim: JobClaim,
     input: serde_json::Value,
@@ -425,8 +457,19 @@ async fn execute_claim(
     plan_services: Option<Arc<PlanNodeServices>>,
     control: Arc<WorkerExecutionControl>,
     context: Arc<JobWorkerContext>,
+    kanban: Option<kanban_card::KanbanGate>,
 ) -> JobOutcome {
-    let outcome = if is_plan_node_kind(&claim.job.kind) {
+    let outcome = if let Some(gate) = kanban {
+        kanban_card::execute_kanban_claim(
+            claim,
+            gate,
+            provider,
+            job_store,
+            Arc::clone(&control),
+            &context,
+        )
+        .await
+    } else if is_plan_node_kind(&claim.job.kind) {
         execute_plan_node_claim(
             claim,
             input,
@@ -2580,6 +2623,7 @@ mod tests {
             transcript_root: root.to_path_buf(),
             configured_submitters: operator_submitters(),
             runtime_root: Some(runtime_root_under(root)?),
+            knowledge: None,
         }))
     }
 
@@ -3689,6 +3733,7 @@ mod tests {
             transcript_root: temp.path().to_path_buf(),
             configured_submitters: operator_submitters(),
             runtime_root: None,
+            knowledge: None,
         });
 
         let completed = run_job_worker_once(
@@ -3711,6 +3756,255 @@ mod tests {
             ));
         };
         assert_eq!(reason, "job runtime requires a HARW home");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_kanban_card_asks_for_approval_and_runs_only_after_approve() -> TestResult {
+        use harw_knowledge::kanban::board::{BlockKind, BoardId, CardId, CardState};
+        use harw_knowledge::kanban::lifecycle::JobTransitions;
+        use harw_knowledge::kanban::notes::{self, HistoryEvent};
+
+        let temp = temp_dir()?;
+        let store = Arc::new(JobStore::new(temp.path()));
+        let knowledge = Arc::new(harw_knowledge::KnowledgeStore::new(
+            &temp.path().join("knowledge"),
+        ));
+        let transitions = harw_runtime::job_ledger::JobStoreTransitions::new(
+            Arc::clone(&store),
+            harw_job_runtime::JobScope::new(
+                TenantId::from_str("local"),
+                WorkspaceId::from_str("kanban"),
+                ApprovalActor::Operator {
+                    id: "local-tui".to_owned(),
+                },
+            ),
+        );
+        let operator = harw_knowledge::AgentId::new("operator");
+        let kanban = |tokens: &[&str]| {
+            harw_ops::kanban::run_kanban(
+                &knowledge,
+                Some(&transitions as &dyn JobTransitions),
+                &operator,
+                &tokens.iter().map(|t| (*t).to_owned()).collect::<Vec<_>>(),
+                Timestamp::now(),
+            )
+            .map(|output| output.text)
+        };
+        let created = kanban(&["create", "Lesen", "--assignee=explorer"])
+            .map_err(|error| TestError::Unexpected(error.to_string()))?;
+        assert!(created.contains("(ready)"), "{created}");
+
+        let provider = Arc::new(RecordingModelProvider::new());
+        let context = Arc::new(JobWorkerContext {
+            transcript_root: temp.path().to_path_buf(),
+            configured_submitters: operator_submitters(),
+            runtime_root: None,
+            knowledge: Some(Arc::clone(&knowledge)),
+        });
+        let poll = || {
+            run_job_worker_once(
+                Arc::clone(&store),
+                Arc::new(JobExecutionRegistry::new()),
+                Arc::clone(&provider) as Arc<dyn ModelProvider>,
+                None,
+                Arc::clone(&context),
+            )
+        };
+
+        // 1. Ohne Freigabe: kein Modellaufruf, Karte wartet.
+        assert_eq!(poll().await, 1);
+        assert!(provider.recorded().is_empty());
+        let board_id = BoardId::new("default");
+        let card_id = CardId::new("card-1");
+        let card =
+            harw_knowledge::kanban::board::load_card(&knowledge, &board_id, &card_id, &transitions)
+                .map_err(ctx("load card"))?;
+        assert_eq!(
+            card.state,
+            CardState::Blocked {
+                reason_kind: BlockKind::AwaitingApproval
+            }
+        );
+        let history = notes::load_notes(&knowledge, &board_id, &card_id)
+            .map_err(ctx("notes"))?
+            .history;
+        assert_eq!(history[0].event, HistoryEvent::ApprovalRequested);
+        assert!(history[0].detail.contains("Risiko low"), "{:?}", history[0]);
+
+        // Ein bloßes unblock am Ledger ist keine Freigabe: erneut anfragen.
+        let work_id = card.work_id.clone().ok_or(TestError::Missing("work_id"))?;
+        transitions.unblock(&work_id).map_err(ctx("unblock"))?;
+        assert_eq!(poll().await, 1);
+        assert!(provider.recorded().is_empty());
+        let history = notes::load_notes(&knowledge, &board_id, &card_id)
+            .map_err(ctx("notes 2"))?
+            .history;
+        assert_eq!(history.len(), 2);
+        assert_eq!(history[1].event, HistoryEvent::ApprovalRequested);
+
+        // 2. Freigabe: der Worker geht in die Ausführung (hier ohne HARW-Home
+        //    sichtbar blockiert, weiterhin ohne Modellaufruf).
+        kanban(&["approve", "card-1", "los"])
+            .map_err(|error| TestError::Unexpected(error.to_string()))?;
+        assert_eq!(poll().await, 1);
+        assert!(provider.recorded().is_empty());
+        let history = notes::load_notes(&knowledge, &board_id, &card_id)
+            .map_err(ctx("notes 3"))?
+            .history;
+        let events: Vec<HistoryEvent> = history.iter().map(|entry| entry.event).collect();
+        assert_eq!(
+            events,
+            vec![
+                HistoryEvent::ApprovalRequested,
+                HistoryEvent::ApprovalRequested,
+                HistoryEvent::Approved,
+                HistoryEvent::Blocked,
+            ]
+        );
+        let JobOutcome::Blocked { reason } = completion_of(&store, work_id.as_str())? else {
+            return Err(TestError::Unexpected(
+                "expected a blocked kanban job".into(),
+            ));
+        };
+        assert_eq!(reason, "kanban:Capability");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_approved_kanban_card_runs_the_role_agent_and_records_the_result() -> TestResult {
+        use harw_knowledge::kanban::board::{BoardId, CardId, CardState};
+        use harw_knowledge::kanban::lifecycle::JobTransitions;
+        use harw_knowledge::kanban::notes::{self, HistoryEvent, ResultStatus};
+
+        let temp = temp_dir()?;
+        let store = Arc::new(JobStore::new(temp.path()));
+        let knowledge = Arc::new(harw_knowledge::KnowledgeStore::new(
+            &temp.path().join("knowledge"),
+        ));
+        let transitions = harw_runtime::job_ledger::JobStoreTransitions::new(
+            Arc::clone(&store),
+            harw_job_runtime::JobScope::new(
+                TenantId::from_str("local"),
+                WorkspaceId::from_str("kanban"),
+                ApprovalActor::Operator {
+                    id: "local-tui".to_owned(),
+                },
+            ),
+        );
+        let operator = harw_knowledge::AgentId::new("operator");
+        let kanban = |tokens: &[&str]| {
+            harw_ops::kanban::run_kanban(
+                &knowledge,
+                Some(&transitions as &dyn JobTransitions),
+                &operator,
+                &tokens.iter().map(|t| (*t).to_owned()).collect::<Vec<_>>(),
+                Timestamp::now(),
+            )
+            .map(|output| output.text)
+            .map_err(|error| TestError::Unexpected(error.to_string()))
+        };
+        kanban(&["create", "Lesen", "--assignee=explorer"])?;
+        kanban(&["create", "Schreiben", "--assignee=coding"])?;
+        let context = Arc::new(JobWorkerContext {
+            transcript_root: temp.path().join("transcripts"),
+            configured_submitters: operator_submitters(),
+            runtime_root: Some(runtime_root_under(temp.path())?),
+            knowledge: Some(Arc::clone(&knowledge)),
+        });
+        let provider: Arc<dyn ModelProvider> = Arc::new(EchoModelProvider::new("Karte erledigt"));
+        let poll = || {
+            run_job_worker_once(
+                Arc::clone(&store),
+                Arc::new(JobExecutionRegistry::new()),
+                Arc::clone(&provider),
+                None,
+                Arc::clone(&context),
+            )
+        };
+        assert_eq!(poll().await, 2, "both cards ask for approval");
+        kanban(&["approve", "card-1"])?;
+        kanban(&["approve", "card-2"])?;
+        assert_eq!(poll().await, 2, "both approved cards run");
+
+        let board_id = BoardId::new("default");
+        for (card, role) in [("card-1", "explorer"), ("card-2", "coding")] {
+            let card_id = CardId::new(card);
+            let view = harw_knowledge::kanban::board::load_card(
+                &knowledge,
+                &board_id,
+                &card_id,
+                &transitions,
+            )
+            .map_err(ctx("load card"))?;
+            assert_eq!(view.state, CardState::Done, "{card}");
+            let card_notes =
+                notes::load_notes(&knowledge, &board_id, &card_id).map_err(ctx("notes"))?;
+            let result = card_notes.result.ok_or(TestError::Missing("result"))?;
+            assert_eq!(result.status, ResultStatus::Succeeded);
+            assert_eq!(result.summary, "Karte erledigt");
+            assert_eq!(result.role.as_deref(), Some(role));
+            let events: Vec<HistoryEvent> =
+                card_notes.history.iter().map(|entry| entry.event).collect();
+            assert_eq!(
+                events,
+                vec![
+                    HistoryEvent::ApprovalRequested,
+                    HistoryEvent::Approved,
+                    HistoryEvent::Started,
+                    HistoryEvent::Completed,
+                ],
+                "{card}"
+            );
+        }
+        let shown = kanban(&["show", "card-2"])?;
+        assert!(shown.contains("Ergebnis (erledigt"), "{shown}");
+        assert!(shown.contains("Risiko high"), "{shown}");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_kanban_jobs_stay_untouched_without_a_knowledge_store() -> TestResult {
+        let temp = temp_dir()?;
+        let store = Arc::new(JobStore::new(temp.path()));
+        let knowledge = harw_knowledge::KnowledgeStore::new(&temp.path().join("knowledge"));
+        let transitions = harw_runtime::job_ledger::JobStoreTransitions::new(
+            Arc::clone(&store),
+            harw_job_runtime::JobScope::new(
+                TenantId::from_str("local"),
+                WorkspaceId::from_str("kanban"),
+                ApprovalActor::Operator {
+                    id: "local-tui".to_owned(),
+                },
+            ),
+        );
+        harw_ops::kanban::run_kanban(
+            &knowledge,
+            Some(&transitions),
+            &harw_knowledge::AgentId::new("operator"),
+            &[
+                "create".to_owned(),
+                "x".to_owned(),
+                "--assignee=explorer".to_owned(),
+            ],
+            Timestamp::now(),
+        )
+        .map_err(|error| TestError::Unexpected(error.to_string()))?;
+        let context = Arc::new(JobWorkerContext {
+            transcript_root: temp.path().to_path_buf(),
+            configured_submitters: operator_submitters(),
+            runtime_root: None,
+            knowledge: None,
+        });
+        let completed = run_job_worker_once(
+            Arc::clone(&store),
+            Arc::new(JobExecutionRegistry::new()),
+            Arc::new(RecordingModelProvider::new()) as Arc<dyn ModelProvider>,
+            None,
+            context,
+        )
+        .await;
+        assert_eq!(completed, 0);
         Ok(())
     }
 
@@ -4178,6 +4472,7 @@ mod prompt_claim_guard_tests {
             transcript_root: root.to_path_buf(),
             configured_submitters,
             runtime_root: Some(JobRuntimeRoot { home, cwd }),
+            knowledge: None,
         }))
     }
 

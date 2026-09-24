@@ -1,0 +1,4 @@
+name = "latex-writing"
+description = "LaTeX-Quellen schreiben und statisch prüfen: wissenschaftliche Arbeiten mit BibLaTeX/biber, Beamer mit Aussage-Titeln, deutsche Typografie mit KOMA-Script, Mathe und Diagramme, Minimalvorlagen, .latexmkrc, Log-Fehler und eine Prüfliste ohne Ausführung."
+instructions_file = "instructions.md"
+tools = ["filesystem.read", "filesystem.write"]

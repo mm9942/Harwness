@@ -340,7 +340,12 @@ pub(crate) fn resolved_config(
     permission = "operator",
     aliases = ["p"],
     category = "model",
-    command(path = "/provider", visibility = "tui_only", busy = "immediate"),
+    command(
+        path = "/provider",
+        visibility = "tui_only",
+        busy = "immediate",
+        busy_subcommands = "test=deferred"
+    ),
 )]
 async fn provider(ctx: &OpContext, args: ProviderArgs) -> Result<OpOutput, OpError> {
     let sub = args.cmd.as_deref().unwrap_or("show");
@@ -1238,7 +1243,12 @@ async fn provider_concurrency(
     domain = "catalog_config",
     permission = "operator",
     category = "model",
-    command(path = "/uia-provider", visibility = "tui_only")
+    command(
+        path = "/uia-provider",
+        visibility = "tui_only",
+        busy = "staged",
+        busy_subcommands = "-=immediate, show=immediate, list=immediate, test=deferred"
+    )
 )]
 async fn uia_provider(ctx: &OpContext, args: ProviderArgs) -> Result<OpOutput, OpError> {
     let sub = args.cmd.as_deref().unwrap_or("show");

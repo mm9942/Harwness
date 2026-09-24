@@ -92,6 +92,8 @@
 //! assert_eq!(app.cells_len(), 1);
 //! ```
 
+mod busy_queue;
+
 use std::cell::Cell;
 use std::collections::{HashMap, HashSet};
 use std::io::{self, Stdout, Write as _};
@@ -144,8 +146,7 @@ use crate::chat_scroll::{ChatScroll, ScrollAction};
 use crate::choice_dialog::{ChoiceAction, ChoiceDialog};
 use crate::clipboard::{self, ClipboardTarget};
 use crate::command_exec::{
-    ShellRunOutcome, busy_availability_for, dispatch_command_with_shell_result,
-    dispatch_slash_command, execute_command_as,
+    ShellRunOutcome, busy_availability_for, dispatch_command_with_shell_result, execute_command_as,
 };
 use crate::command_popup::{CommandPopup, PopupAction, PopupMode, TabOutcome};
 use crate::events::{HarwEvent, HarwEventSender};
@@ -164,6 +165,7 @@ use crate::keybindings::{KeyAction, KeyBindings};
 use crate::model_switch_picker::{
     ModelEntry, ModelSwitchPicker, PickerAction as ModelSwitchAction, PickerTarget, ProviderEntry,
 };
+use busy_queue::{BusyCommand, BusyDispatch, BusyJobDone, BusyJobs, FetchTarget};
 // Hinweis: die drei obigen Typen sind Re-Exporte aus
 // `harw_tool_shell::host_permit_prompt` (siehe `crate::host_permit_dialog`-
 // Moduldoku) — der Fragevertrag und die Ausstellungslogik leben dort bzw. in
@@ -955,6 +957,9 @@ pub struct ChatApp {
     /// abgebrochen oder vermischt werden; diese FIFO wird ausschließlich an
     /// Turn-Grenzen abgearbeitet.
     pending_turns: std::collections::VecDeque<String>,
+    /// Befehle und Datenabrufe, die während eines laufenden Turns nebenläufig
+    /// laufen (Runde 4, Teil H; siehe [`busy_queue`]).
+    busy_jobs: BusyJobs,
     /// Kooperativer Abbruchgriff für den gerade laufenden Turn. `Ctrl+C`
     /// löst ihn auch dann aus, wenn kein Freigabe-Dialog sichtbar ist.
     active_cancel: Option<CancelToken>,
@@ -965,13 +970,15 @@ pub struct ChatApp {
     /// (`active_cancel` wird neu gesetzt) und beim Ende des laufenden Turns
     /// (`active_cancel = None`) wieder gelöscht.
     cancel_requested_at: Option<Instant>,
-    /// Zeitpunkt, zu dem `Ctrl+C` zuletzt tatsächlich eine nicht-leere
-    /// Eingabe-Warteschlange (`deferred_input`/`pending_turns`) verworfen hat
-    /// (Fix E / Teil 1b). Rein transienter Statuszeilen-Hinweis (siehe
-    /// [`render_viewport`]), analog zu `cancel_requested_at` — erzeugt KEINE
-    /// dauerhafte Verlaufszeile. Wird an denselben Stellen wie
-    /// `cancel_requested_at` zurückgesetzt (neuer Turn, Turn-Ende).
-    queue_cleared_at: Option<Instant>,
+    /// Zeitpunkt, zu dem `Ctrl+C` einen Turn abgebrochen hat, während die
+    /// Eingabe-Warteschlange (`deferred_input`/`pending_turns`) nicht leer war
+    /// (Runde 4: die Warteschlange bleibt erhalten und wird nach dem Abbruch
+    /// ausgeliefert, statt verworfen zu werden). Rein transienter
+    /// Statuszeilen-Hinweis (siehe [`render_viewport`]), analog zu
+    /// `cancel_requested_at` — erzeugt KEINE dauerhafte Verlaufszeile. Wird an
+    /// denselben Stellen wie `cancel_requested_at` zurückgesetzt (neuer Turn,
+    /// Turn-Ende).
+    queue_kept_at: Option<Instant>,
     /// Ein erstes Escape schließt nur Popup/History-Navigation; ein zweites
     /// Escape leert den Composer.
     escape_armed: bool,
@@ -1014,7 +1021,8 @@ pub struct ChatApp {
     /// `/`-Command-Adapter, gebaut aus der `OperationRegistry`
     /// (`CommandAdapter::from_operation` pro registrierter Op). Treibt die
     /// echte Ausführung von `/command`-Zeilen (siehe [`Self::adapters`]).
-    adapters: Vec<CommandAdapter>,
+    /// Geteilt (`Arc`), damit Busy-Tasks sie ohne Kopie mitnehmen.
+    adapters: Arc<[CommandAdapter]>,
     /// Authority-Boundary für alle Operation-Dispatches dieser Chat-Session.
     sandbox: SandboxSpec,
     /// Stabile Session-ID, die in jeden [`harw_operations::OpContext`] dieser
@@ -1183,7 +1191,7 @@ pub struct ChatApp {
     /// [`Self::take_needs_terminal_reassert`] konsumiert.
     needs_terminal_reassert: bool,
     /// Werkbank-Panel (rechte Spalte, `F5`); lädt über
-    /// [`WorkbenchPane::REFRESH_COMMAND`], sobald sichtbar und veraltet.
+    /// [`WorkbenchPane::refresh_command`] (Sitzung oder Projekt), sobald sichtbar und veraltet.
     workbench: WorkbenchPane,
     /// Geöffnetes `@`-Erwähnungs-Popup oder `None`.
     mention_popup: Option<MentionPopup>,
@@ -1306,9 +1314,10 @@ impl ChatApp {
             input,
             deferred_input: std::collections::VecDeque::new(),
             pending_turns: std::collections::VecDeque::new(),
+            busy_jobs: BusyJobs::new(),
             active_cancel: None,
             cancel_requested_at: None,
-            queue_cleared_at: None,
+            queue_kept_at: None,
             escape_armed: false,
             scroll: ChatScroll::new(),
             input_history,
@@ -1325,7 +1334,7 @@ impl ChatApp {
             agent_detail: None,
             key_bindings: KeyBindings::default(),
             explorer: None,
-            adapters,
+            adapters: adapters.into(),
             sandbox,
             session_id,
             memory,
@@ -2248,7 +2257,9 @@ impl ChatApp {
     /// Leert den Live-Bus nicht-blockierend in den [`crate::agent_monitor::AgentMonitor`].
     /// Matrix-Spielereignisse gehen stattdessen an eine offene generische
     /// Ansicht ([`OverlayView::apply_event`]); ist das die Matrix-Ansicht,
-    /// wird ihr Zustand nachgeladen.
+    /// wird ihr Zustand nachgeladen. Wissensänderungen
+    /// (`AgentEventKind::Knowledge`) markieren nur die betroffenen Panels als
+    /// veraltet ([`Self::apply_knowledge_event`]).
     /// Liefert `true`, wenn sich Sichtbares geändert hat.
     pub(crate) fn drain_agent_events(&mut self) -> bool {
         let mut changed = self.poll_explorer();
@@ -2256,18 +2267,21 @@ impl ChatApp {
             return changed;
         };
         let mut matrix_events: Vec<serde_json::Value> = Vec::new();
+        let mut knowledge_areas: Vec<String> = Vec::new();
         loop {
             match rx.try_recv() {
-                Ok(event) => {
-                    if let harw_core::AgentEventKind::Matrix { run_id, event } = &event.kind {
+                Ok(event) => match &event.kind {
+                    harw_core::AgentEventKind::Matrix { run_id, event } => {
                         matrix_events.push(serde_json::json!({
                             "run_id": run_id,
                             "event": event,
                         }));
-                    } else {
-                        changed |= self.agent_monitor.apply(&event);
                     }
-                }
+                    harw_core::AgentEventKind::Knowledge { area, .. } => {
+                        knowledge_areas.push(area.clone());
+                    }
+                    _ => changed |= self.agent_monitor.apply(&event),
+                },
                 Err(tokio::sync::broadcast::error::TryRecvError::Lagged(skipped)) => {
                     tracing::debug!(skipped, "tui.agent_events.lagged");
                 }
@@ -2281,7 +2295,41 @@ impl ChatApp {
         if !matrix_events.is_empty() {
             changed |= self.apply_matrix_events(&matrix_events);
         }
+        for area in &knowledge_areas {
+            changed |= self.apply_knowledge_event(area);
+        }
         changed
+    }
+
+    /// Markiert nach einer Wissensänderung die betroffenen Panels als
+    /// veraltet: das Werkbank-Panel bei `workbench`, eine offene generische
+    /// Ansicht (Kanban-Board, KnowledgeBrowser), deren Nachlade-Befehl mit
+    /// `/<area>` beginnt. Nachgeladen wird über den normalen Datenabruf
+    /// (sichtbarkeitsgeprüfte Op), nicht aus dem Event.
+    ///
+    /// # Rückgabe
+    /// `true`, wenn ein Panel markiert wurde.
+    fn apply_knowledge_event(&mut self, area: &str) -> bool {
+        let mut marked = false;
+        if area == "workbench" {
+            self.workbench.mark_stale();
+            marked = true;
+        }
+        let command = format!("/{area}");
+        let matches_view = match &self.overlay {
+            Some(Overlay::View(view)) => view.refresh_command().is_some_and(|refresh| {
+                refresh
+                    .split_whitespace()
+                    .next()
+                    .is_some_and(|head| head == command)
+            }),
+            _ => false,
+        };
+        if matches_view {
+            self.queue_overlay_refresh();
+            marked = true;
+        }
+        marked
     }
 
     /// Reicht Matrix-Ereignisse an die offene generische Ansicht weiter und
@@ -2437,6 +2485,21 @@ impl ChatApp {
     #[must_use]
     pub(crate) fn adapters(&self) -> &[CommandAdapter] {
         &self.adapters
+    }
+
+    /// Geklonte Dispatch-Daten für einen Busy-Task (Runde 4, Teil H).
+    fn busy_dispatch(&self) -> BusyDispatch {
+        BusyDispatch {
+            runtime: self.runtime.clone(),
+            adapters: Arc::clone(&self.adapters),
+            sandbox: self.sandbox.clone(),
+            session_id: self.session_id.clone(),
+            #[cfg(test)]
+            test_controller: self
+                .busy_jobs
+                .dispatches_without_runtime()
+                .then(|| Arc::clone(&self.session_controller)),
+        }
     }
 
     /// Gibt die Authority-Boundary für Operation-Dispatches zurück.
@@ -2749,12 +2812,11 @@ impl ChatApp {
         if tail.is_empty() {
             head.push(' ');
         }
-        self.input.clear();
-        self.input.insert_str(&head);
-        self.input.insert_str(tail);
-        for _ in 0..tail.graphemes(true).count() {
-            self.input.move_left();
-        }
+        // Puffer ersetzen, ohne gemerkte Pastes zu verlieren: ein Platzhalter
+        // vor oder nach der Erwähnung bleibt beim Absenden auflösbar.
+        let cursor = head.len();
+        self.input
+            .replace_text_keeping_pastes(&format!("{head}{tail}"), cursor);
     }
 
     /// Gibt `true` zurück wenn das `/command`-Popup aktuell geöffnet ist.
@@ -2858,7 +2920,7 @@ impl ChatApp {
             PaneCommand::None => false,
             PaneCommand::Redraw => true,
             PaneCommand::Run(command) => {
-                if command == WorkbenchPane::REFRESH_COMMAND {
+                if command == self.workbench.refresh_command() {
                     // Neu laden ohne Chat-Ausgabe.
                     self.workbench.mark_stale();
                 } else {
@@ -3179,20 +3241,6 @@ fn is_workbench_command(raw: &str) -> bool {
     raw.split_whitespace().next() == Some("/workbench")
 }
 
-/// `true`, wenn `raw` ein TUI-lokaler Befehl ist (keine Operation dahinter).
-fn is_tui_local_command(registry: &CommandRegistry, raw: &str) -> bool {
-    let Some(name) = raw
-        .trim()
-        .strip_prefix('/')
-        .and_then(|rest| rest.split_whitespace().next())
-    else {
-        return false;
-    };
-    registry
-        .find(name)
-        .is_some_and(|spec| spec.origin == crate::CommandOrigin::TuiLocal)
-}
-
 /// Baut den [`LocalCommandContext`] aus dem App-Zustand und fragt
 /// [`local_commands::intercept`]. Das Ergebnis besitzt keine Borrows auf
 /// `app`, der Aufrufer darf danach mutieren.
@@ -3317,69 +3365,112 @@ async fn fetch_command_data(
     .await
 }
 
+/// Nimmt alle ausstehenden Datenabrufe (siehe [`DataFetch`]) aus dem
+/// App-Zustand und ergänzt das Werkbank-Panel, wenn es sichtbar und veraltet
+/// ist und nicht schon ein Abruf dafür läuft.
+///
+/// # Beschreibung
+/// Abrufe für eine inzwischen ersetzte oder geschlossene Ansicht werden
+/// schon hier verworfen. Gemeinsame Vorstufe für den Leerlauf
+/// ([`process_pending_fetches`]) und den Busy-Pfad ([`spawn_busy_fetches`]).
+///
+/// # Rückgabe
+/// `(ziel, befehlszeile)` je Abruf, in Einreihungsreihenfolge.
+fn take_fetch_requests(app: &mut ChatApp) -> Vec<(FetchTarget, String)> {
+    let mut fetches = std::mem::take(&mut app.pending_fetches);
+    if app.workbench_needs_refresh()
+        && !app.busy_jobs.workbench_in_flight()
+        && !fetches.contains(&DataFetch::Workbench)
+    {
+        fetches.push(DataFetch::Workbench);
+    }
+    fetches
+        .into_iter()
+        .filter_map(|fetch| match fetch {
+            DataFetch::Overlay {
+                command,
+                generation,
+            } => (generation == app.overlay_generation
+                && matches!(app.overlay, Some(Overlay::View(_))))
+            .then_some((FetchTarget::Overlay { generation }, command)),
+            DataFetch::Workbench => Some((
+                FetchTarget::Workbench,
+                app.workbench.refresh_command().to_owned(),
+            )),
+        })
+        .collect()
+}
+
+/// Wendet das Ergebnis eines Datenabrufs auf Ansicht bzw. Werkbank an.
+///
+/// # Beschreibung
+/// Ein Ergebnis für eine inzwischen ersetzte Ansicht (andere Generation)
+/// wird verworfen.
+fn apply_fetch_result(app: &mut ChatApp, target: FetchTarget, result: Result<OpOutput, String>) {
+    match target {
+        FetchTarget::Overlay { generation } => {
+            if generation != app.overlay_generation {
+                return;
+            }
+            if let Some(Overlay::View(view)) = app.overlay.as_mut() {
+                match result {
+                    Ok(output) => match output.data {
+                        Some(data) => view.apply_data(&data),
+                        None => view.apply_error(&output.text),
+                    },
+                    Err(error) => view.apply_error(&error),
+                }
+            }
+        }
+        FetchTarget::Workbench => match result {
+            Ok(output) => match output.data {
+                Some(data) => app.workbench.apply_data(&data),
+                None => app.workbench.apply_error(output.text),
+            },
+            Err(error) => app.workbench.apply_error(error),
+        },
+    }
+}
+
 /// Arbeitet alle ausstehenden Datenabrufe ab (siehe [`DataFetch`]); lädt
 /// zusätzlich das Werkbank-Panel, wenn es sichtbar und veraltet ist.
 ///
 /// # Rückgabe
 /// `true`, wenn mindestens ein Abruf lief (Redraw nötig).
 async fn process_pending_fetches(app: &mut ChatApp) -> bool {
-    let mut fetches = std::mem::take(&mut app.pending_fetches);
-    if app.workbench_needs_refresh() && !fetches.contains(&DataFetch::Workbench) {
-        fetches.push(DataFetch::Workbench);
-    }
-    if fetches.is_empty() {
+    let requests = take_fetch_requests(app);
+    if requests.is_empty() {
         return false;
     }
-    for fetch in fetches {
-        match fetch {
-            DataFetch::Overlay {
-                command,
-                generation,
-            } => {
-                if generation != app.overlay_generation
-                    || !matches!(app.overlay, Some(Overlay::View(_)))
-                {
-                    continue;
-                }
-                let result = fetch_command_data(
-                    app.runtime.as_ref(),
-                    &app.adapters,
-                    &app.sandbox,
-                    &app.session_id,
-                    &command,
-                )
-                .await;
-                if generation != app.overlay_generation {
-                    continue;
-                }
-                if let Some(Overlay::View(view)) = app.overlay.as_mut() {
-                    match result {
-                        Ok(output) => match output.data {
-                            Some(data) => view.apply_data(&data),
-                            None => view.apply_error(&output.text),
-                        },
-                        Err(error) => view.apply_error(&error),
-                    }
-                }
-            }
-            DataFetch::Workbench => {
-                let result = fetch_command_data(
-                    app.runtime.as_ref(),
-                    &app.adapters,
-                    &app.sandbox,
-                    &app.session_id,
-                    WorkbenchPane::REFRESH_COMMAND,
-                )
-                .await;
-                match result {
-                    Ok(output) => match output.data {
-                        Some(data) => app.workbench.apply_data(&data),
-                        None => app.workbench.apply_error(output.text),
-                    },
-                    Err(error) => app.workbench.apply_error(error),
-                }
-            }
-        }
+    for (target, command) in requests {
+        let result = fetch_command_data(
+            app.runtime.as_ref(),
+            &app.adapters,
+            &app.sandbox,
+            &app.session_id,
+            &command,
+        )
+        .await;
+        apply_fetch_result(app, target, result);
+    }
+    true
+}
+
+/// Busy-Gegenstück zu [`process_pending_fetches`]: startet jeden
+/// ausstehenden Datenabruf als eigenen Task, statt ihn im `select!`-Arm
+/// abzuwarten (Runde 4, Teil H). Die Ergebnisse kommen über
+/// [`ChatApp::busy_jobs`] zurück ([`apply_busy_job_done`]).
+///
+/// # Rückgabe
+/// `true`, wenn mindestens ein Abruf gestartet wurde.
+fn spawn_busy_fetches(app: &mut ChatApp) -> bool {
+    let requests = take_fetch_requests(app);
+    if requests.is_empty() {
+        return false;
+    }
+    let dispatch = app.busy_dispatch();
+    for (target, command) in requests {
+        app.busy_jobs.start_fetch(&dispatch, target, command);
     }
     true
 }
@@ -4094,8 +4185,21 @@ pub(crate) async fn run_loop(
 
     let mut spinner = Spinner::new();
     let mut provider_error_streak = 0_u32;
+    // Ein fertiger Busy-Auftrag weckt die Schleife über einen Frame, auch
+    // wenn sein Turn schon vorbei ist (Runde 4, Teil H).
+    app.busy_jobs.set_waker(frame_req.clone());
 
     loop {
+        // Ergebnisse von Befehlen/Abrufen, die während des letzten Turns
+        // gestartet wurden und erst danach fertig wurden.
+        let mut busy_results = false;
+        while let Some(done) = app.busy_jobs.try_recv() {
+            apply_busy_job_done(app, done);
+            busy_results = true;
+        }
+        if busy_results {
+            frame_req.schedule_frame();
+        }
         // Slash-Zeilen aus synchronen Pfaden (Werkbank-Tasten) laufen über
         // denselben Command-Kanal wie getippte Befehle.
         while let Some(command) = app.pending_commands.pop_front() {
@@ -6118,8 +6222,10 @@ fn scroll_and_composer_key(app: &mut ChatApp, key: KeyEvent, bus: &HarwEventSend
             app.command_popup = None;
             return true;
         }
-        // Plain Enter ohne Auswahl: getippte Zeile absenden.
-        let line = app.input.text().to_owned();
+        // Plain Enter ohne Auswahl: getippte Zeile absenden — mit aufgelösten
+        // Paste-Platzhaltern, sonst bekäme das Modell nur
+        // `[Pasted text #<id> +<n> lines]` statt des eingefügten Texts.
+        let line = app.input.submission_text();
         app.input.clear();
         app.command_popup = None;
         app.mention_popup = None;
@@ -6331,9 +6437,9 @@ async fn run_turn_streaming(
     // Ein neuer Turn startet: ein evtl. noch angezeigter "Abbruch
     // angefordert …"-Hinweis aus einem vorherigen, jetzt abgeschlossenen Turn
     // gehört nicht mehr zum aktuellen Zustand. Derselbe Reset gilt für den
-    // "Warteschlange verworfen"-Hinweis (Fix E / Teil 1b).
+    // "Warteschlange wird gesendet"-Hinweis.
     app.cancel_requested_at = None;
-    app.queue_cleared_at = None;
+    app.queue_kept_at = None;
     // Welle 4c, Punkt 8: denselben `ManagedAgentSpawner`, den die Wurzelsitzung
     // beim Admittieren von Kindern befragt ([`ChatApp::managed_spawner`] ist
     // exakt `RuntimeAssembly::spawner()` — siehe deren Montage in
@@ -6368,9 +6474,9 @@ async fn run_turn_streaming(
     app.active_cancel = None;
     // Turn ist beendet (egal ob normal, per Fehler oder per Abbruch) — der
     // transiente Abbruch-Hinweis hat damit ausgedient. Derselbe Reset gilt
-    // für den "Warteschlange verworfen"-Hinweis (Fix E / Teil 1b).
+    // für den "Warteschlange wird gesendet"-Hinweis.
     app.cancel_requested_at = None;
-    app.queue_cleared_at = None;
+    app.queue_kept_at = None;
 
     let reply = reply?;
 
@@ -6594,13 +6700,8 @@ async fn drive_turn_animated(
                                 }
                                 app.pending_host_permit_dialog = None;
                                 host_permit_shown_at = None;
-                                match handle_busy_event(app, TuiEvent::Key(key)) {
-                                    BusyKeyOutcome::Redraw => draw_viewport(guard, app, spinner, app.pending_quit.map(|arm| arm.label))?,
-                                    BusyKeyOutcome::Idle => {}
-                                    BusyKeyOutcome::RunImmediate(raw) => {
-                                        run_immediate_busy_command(guard, app, spinner, &raw).await?;
-                                    }
-                                }
+                                let outcome = handle_busy_event(app, TuiEvent::Key(key));
+                                settle_busy_outcome(guard, app, spinner, outcome)?;
                             }
                             Some(TuiEvent::Key(key)) if app.pending_host_permit.is_some() => {
                                 // Dasselbe Arming-Delay wie beim Freigabe-Panel
@@ -6615,13 +6716,10 @@ async fn drive_turn_animated(
                                     continue;
                                 };
                                 match dialog.handle_key(key) {
-                                    ChoiceAction::Stay => match queue_busy_key(app, key) {
-                                        BusyKeyOutcome::Redraw => draw_viewport(guard, app, spinner, app.pending_quit.map(|arm| arm.label))?,
-                                        BusyKeyOutcome::Idle => {}
-                                        BusyKeyOutcome::RunImmediate(raw) => {
-                                            run_immediate_busy_command(guard, app, spinner, &raw).await?;
-                                        }
-                                    },
+                                    ChoiceAction::Stay => {
+                                        let outcome = queue_busy_key(app, key);
+                                        settle_busy_outcome(guard, app, spinner, outcome)?;
+                                    }
                                     ChoiceAction::Cancel => {
                                         if let Some(prompt) = app.pending_host_permit.take() {
                                             prompt.deny();
@@ -6649,13 +6747,10 @@ async fn drive_turn_animated(
                                     }
                                 }
                             }
-                            Some(event) => match handle_busy_event(app, event) {
-                                BusyKeyOutcome::Redraw => draw_viewport(guard, app, spinner, app.pending_quit.map(|arm| arm.label))?,
-                                BusyKeyOutcome::Idle => {}
-                                BusyKeyOutcome::RunImmediate(raw) => {
-                                    run_immediate_busy_command(guard, app, spinner, &raw).await?;
-                                }
-                            },
+                            Some(event) => {
+                                let outcome = handle_busy_event(app, event);
+                                settle_busy_outcome(guard, app, spinner, outcome)?;
+                            }
                             None => input_open = false,
                         }
                     }
@@ -6676,9 +6771,18 @@ async fn drive_turn_animated(
                             }
                         }
                     }
+                    // Runde 4, Teil H: Ergebnisse nebenläufiger Busy-Befehle und
+                    // -Datenabrufe; der Turn läuft währenddessen ungebremst weiter.
+                    Some(done) = app.busy_jobs.recv() => {
+                        apply_busy_job_done(app, done);
+                        start_busy_work(app);
+                        draw_viewport(guard, app, spinner, app.pending_quit.map(|arm| arm.label))?;
+                    }
                     _ = tokio::time::sleep(SPINNER_INTERVAL) => {
                         spinner.tick();
                         app.drain_agent_events();
+                        // Ansichten füllen sich auch während eines Turns.
+                        start_busy_work(app);
                         draw_viewport(guard, app, spinner, app.pending_quit.map(|arm| arm.label))?;
                     }
                 }
@@ -7282,7 +7386,8 @@ struct PendingApprovalPrompt {
 /// Bricht den laufenden Turn ab und lehnt/verweigert eine offene Freigabe-
 /// oder Host-Permit-Frage — die Ctrl+C-Kernlogik innerhalb von
 /// [`drive_pauses_to_completion`], solange ein solcher Dialog sichtbar ist
-/// (Fix E / Teil 1b).
+/// (Fix E / Teil 1b; seit Runde 4 bleibt die Eingabe-Warteschlange dabei
+/// erhalten und wird nach dem Abbruch ausgeliefert).
 ///
 /// # Beschreibung
 /// Vor diesem Fix lehnte Ctrl+C bei offenem Dialog **nur** den Dialog ab —
@@ -7291,8 +7396,9 @@ struct PendingApprovalPrompt {
 /// ergänzt **zusätzlich** zum bestehenden Ablehnen/Verweigern denselben
 /// kooperativen Abbruch (`active_cancel.cancel(CancelReason::User)`) und
 /// dieselbe zweistufige Beenden-Scharfstellung ([`ChatApp::pending_quit`])
-/// wie [`handle_busy_event`] ohne offenen Dialog, inklusive Leeren bereits
-/// eingereihter Eingaben (`deferred_input`/`pending_turns`). Aus dem
+/// wie [`handle_busy_event`] ohne offenen Dialog. Bereits eingereihte
+/// Eingaben (`deferred_input`/`pending_turns`) bleiben erhalten und werden
+/// nach dem Abbruch ausgeliefert. Aus dem
 /// `tokio::select!`-Zweig von [`drive_pauses_to_completion`] extrahiert,
 /// damit die Kernlogik ohne den vollen Ereignis-Loop testbar ist.
 ///
@@ -7322,11 +7428,10 @@ async fn cancel_turn_and_reject_open_dialogs(
         label: "Ctrl+C",
         at: Instant::now(),
     });
-    let had_queued_input = !app.deferred_input.is_empty() || !app.pending_turns.is_empty();
-    app.deferred_input.clear();
-    app.pending_turns.clear();
-    if had_queued_input {
-        app.queue_cleared_at = Some(Instant::now());
+    // Bereits abgeschickte, aber noch nicht ausgelieferte Eingaben bleiben
+    // stehen: `run_loop` liefert sie an der nächsten Turn-Grenze aus.
+    if !app.deferred_input.is_empty() || !app.pending_turns.is_empty() {
+        app.queue_kept_at = Some(Instant::now());
     }
     // Bestehendes Ablehnen/Verweigern des offenen Dialogs bleibt
     // zusätzlich bestehen, wird nicht ersetzt.
@@ -7531,13 +7636,8 @@ async fn drive_pauses_to_completion(
             maybe_event = tui_rx.recv(), if input_open => {
                 match maybe_event {
                     Some(event) if pending.is_none() && app.pending_host_permit.is_none() => {
-                        match handle_busy_event(app, event) {
-                            BusyKeyOutcome::Redraw => draw_viewport(guard, app, spinner, app.pending_quit.map(|arm| arm.label))?,
-                            BusyKeyOutcome::Idle => {}
-                            BusyKeyOutcome::RunImmediate(raw) => {
-                                run_immediate_busy_command(guard, app, spinner, &raw).await?;
-                            }
-                        }
+                        let outcome = handle_busy_event(app, event);
+                        settle_busy_outcome(guard, app, spinner, outcome)?;
                     }
                     Some(TuiEvent::Key(key)) => {
                         // Strg+Pos1/Strg+Ende gehen bei nicht-leerer Eingabe
@@ -7577,13 +7677,10 @@ async fn drive_pauses_to_completion(
                                 continue;
                             };
                             match dialog.handle_key(key, armed) {
-                                DialogAction::Stay => match queue_busy_key(app, key) {
-                                    BusyKeyOutcome::Redraw => draw_viewport(guard, app, spinner, app.pending_quit.map(|arm| arm.label))?,
-                                    BusyKeyOutcome::Idle => {}
-                                    BusyKeyOutcome::RunImmediate(raw) => {
-                                        run_immediate_busy_command(guard, app, spinner, &raw).await?;
-                                    }
-                                },
+                                DialogAction::Stay => {
+                                    let outcome = queue_busy_key(app, key);
+                                    settle_busy_outcome(guard, app, spinner, outcome)?;
+                                }
                                 DialogAction::ToggleDetails => {
                                     draw_viewport(guard, app, spinner, app.pending_quit.map(|arm| arm.label))?;
                                 }
@@ -7609,13 +7706,10 @@ async fn drive_pauses_to_completion(
                                 continue;
                             };
                             match dialog.handle_key(key) {
-                                ChoiceAction::Stay => match queue_busy_key(app, key) {
-                                    BusyKeyOutcome::Redraw => draw_viewport(guard, app, spinner, app.pending_quit.map(|arm| arm.label))?,
-                                    BusyKeyOutcome::Idle => {}
-                                    BusyKeyOutcome::RunImmediate(raw) => {
-                                        run_immediate_busy_command(guard, app, spinner, &raw).await?;
-                                    }
-                                },
+                                ChoiceAction::Stay => {
+                                    let outcome = queue_busy_key(app, key);
+                                    settle_busy_outcome(guard, app, spinner, outcome)?;
+                                }
                                 ChoiceAction::Cancel => {
                                     if let Some(prompt) = app.pending_host_permit.take() {
                                         prompt.deny();
@@ -7644,18 +7738,10 @@ async fn drive_pauses_to_completion(
                         draw_viewport(guard, app, spinner, app.pending_quit.map(|arm| arm.label))?;
                     }
                     Some(TuiEvent::Mouse(mouse)) => {
-                        // Ein Maus-Ereignis kann `handle_busy_event` niemals in
-                        // `BusyKeyOutcome::RunImmediate` überführen (nur ein
-                        // fertig abgeschicktes Slash-Kommando kann das) — der
-                        // volle Match bleibt trotzdem, damit ein künftiger
-                        // Enum-Zweig hier nicht stillschweigend ignoriert wird.
-                        match handle_busy_event(app, TuiEvent::Mouse(mouse)) {
-                            BusyKeyOutcome::Redraw => draw_viewport(guard, app, spinner, app.pending_quit.map(|arm| arm.label))?,
-                            BusyKeyOutcome::Idle => {}
-                            BusyKeyOutcome::RunImmediate(raw) => {
-                                run_immediate_busy_command(guard, app, spinner, &raw).await?;
-                            }
-                        }
+                        // Maus-Ereignisse laufen über denselben Abschluss wie
+                        // Tasten (`settle_busy_outcome`).
+                        let outcome = handle_busy_event(app, TuiEvent::Mouse(mouse));
+                        settle_busy_outcome(guard, app, spinner, outcome)?;
                     }
                     // Pasted text never answers an approval prompt.
                     Some(TuiEvent::Paste(_)) => {}
@@ -7695,9 +7781,18 @@ async fn drive_pauses_to_completion(
                     }
                 }
             }
+            // Runde 4, Teil H: Ergebnisse nebenläufiger Busy-Befehle und
+            // -Datenabrufe; der Turn läuft währenddessen ungebremst weiter.
+            Some(done) = app.busy_jobs.recv() => {
+                apply_busy_job_done(app, done);
+                start_busy_work(app);
+                draw_viewport(guard, app, spinner, app.pending_quit.map(|arm| arm.label))?;
+            }
             _ = tokio::time::sleep(SPINNER_INTERVAL) => {
                 spinner.tick();
                 app.drain_agent_events();
+                // Ansichten füllen sich auch während eines Turns.
+                start_busy_work(app);
                 draw_viewport(guard, app, spinner, app.pending_quit.map(|arm| arm.label))?;
             }
         }
@@ -7705,112 +7800,241 @@ async fn drive_pauses_to_completion(
 }
 
 /// Ergebnis eines Tastendrucks/Ereignisses während eines laufenden Turns
-/// (Welle 4b, `queue_busy_key`/`handle_busy_event`).
+/// (`queue_busy_key`/`handle_busy_event`).
 ///
 /// # Beschreibung
-/// Ersetzt das frühere `bool` (`true` → Redraw, `false` → Idle): ein fertig
-/// abgeschickter Slash-Befehl mit `BusyAvailability::Immediate`
-/// ([`busy_availability_for`]) läuft nicht mehr über `deferred_input`, sondern
-/// wird von den beiden `select!`-Schleifen (`drive_turn_animated`,
-/// `drive_pauses_to_completion`) sofort über [`dispatch_slash_command`]
-/// ausgeführt — der laufende Turn, der Composer, `pending_turns` und
-/// `deferred_input` bleiben dabei unberührt.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// Runde 4, Teil H: ein fertig abgeschickter Befehl wird eingestuft
+/// ([`route_busy_command`]). Busy-sichere TUI-lokale Befehle wirken sofort
+/// ([`Self::Local`]); `Immediate`-/`Staged`-Operationen landen in
+/// [`ChatApp::busy_jobs`] und werden vom Aufrufer über
+/// [`settle_busy_outcome`] als eigene Tasks gestartet
+/// ([`Self::Dispatch`]) — der `select!`-Arm wartet nie auf sie. Alles
+/// andere wird wie bisher als Paste+Enter bis zum Turn-Ende zurückgestellt.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum BusyKeyOutcome {
     /// Kein sichtbarer Zustand geändert — kein Redraw nötig.
     Idle,
     /// Sichtbarer Zustand geändert — Redraw nötig.
     Redraw,
-    /// Eine fertig abgeschickte `/command`-Zeile mit
-    /// `BusyAvailability::Immediate`; der Aufrufer dispatcht sie sofort über
-    /// [`dispatch_slash_command`] und zeigt die Ausgabe wie im Idle-Pfad.
-    RunImmediate(String),
+    /// Ein busy-sicherer TUI-lokaler Befehl (Overlay, Picker, Panel,
+    /// Systemzeile …) wurde sofort angewendet.
+    Local,
+    /// Ein Befehl der angegebenen Klasse (`Immediate`/`Staged`) wurde in
+    /// [`ChatApp::busy_jobs`] eingereiht; der Aufrufer startet ihn.
+    Dispatch(BusyAvailability),
 }
 
-/// Führt einen während eines laufenden Turns als
-/// [`BusyKeyOutcome::RunImmediate`] gemeldeten Slash-Befehl sofort aus und
-/// zeigt die Ausgabe wie im Idle-Pfad (Welle 4b).
+/// Startet eingereihte Busy-Befehle und ausstehende Datenabrufe als eigene
+/// Tasks und zeichnet neu, wenn `outcome` das verlangt.
 ///
 /// # Beschreibung
-/// Derselbe Anzeigepfad wie der `HarwEvent::Command`-Zweig im Idle-Teil von
-/// [`run_loop`] (mehrzeilige Ausgabe an `\n` aufgeteilt, `app.push_lines`),
-/// gebaut über den wiederverwendbaren Helfer [`dispatch_slash_command`]. Der
-/// laufende Turn, der Composer, `pending_turns` und `deferred_input` bleiben
-/// dabei unberührt — nur die Ausgabe landet im Verlauf, gefolgt von einem
-/// Redraw.
-///
-/// # Argumente
-/// - `guard` (`&mut TerminalGuard`): Terminal-Guard zum Zeichnen des Frames.
-/// - `app` (`&mut ChatApp`): liefert Runtime/Adapter/Sandbox/Session-ID und
-///   nimmt die Ausgabezeilen auf.
-/// - `spinner` (`&Spinner`): aktueller Spinner-Frame für den Redraw.
-/// - `raw` (`&str`): die abgeschickte `/command`-Zeile.
+/// Gemeinsamer Abschluss aller Busy-Tastenpfade in [`drive_turn_animated`]
+/// und [`drive_pauses_to_completion`]. Kehrt sofort zurück — die Befehle
+/// laufen nebenläufig, ihre Ergebnisse kommen über
+/// [`BusyJobs::recv`] zurück ([`apply_busy_job_done`]).
 ///
 /// # Fehler
 /// [`TuiError::Io`] beim Zeichnen.
-async fn run_immediate_busy_command(
+fn settle_busy_outcome(
     guard: &mut TerminalGuard,
     app: &mut ChatApp,
     spinner: &Spinner,
-    raw: &str,
+    outcome: BusyKeyOutcome,
 ) -> Result<(), TuiError> {
-    if raw.trim() == "/agent" {
-        app.open_agent_tree();
-        return draw_viewport(guard, app, spinner, app.pending_quit.map(|arm| arm.label));
+    if outcome == BusyKeyOutcome::Idle {
+        return Ok(());
     }
-    let output = dispatch_slash_command(
-        app.runtime(),
-        app.adapters(),
-        app.sandbox(),
-        app.session_id(),
-        raw,
-    )
-    .await;
-    let lines: Vec<Line<'static>> = output
-        .split('\n')
-        .map(|line| Line::from(line.to_owned()))
-        .collect();
-    app.push_lines(lines);
+    start_busy_work(app);
     draw_viewport(guard, app, spinner, app.pending_quit.map(|arm| arm.label))
 }
 
+/// Startet alle eingereihten Busy-Befehle und ausstehenden Datenabrufe.
+///
+/// # Nebenläufigkeit
+/// Muss in einer Tokio-Runtime laufen (`tokio::spawn`); kehrt sofort zurück.
+fn start_busy_work(app: &mut ChatApp) {
+    if !app.busy_jobs.queued().is_empty() {
+        let dispatch = app.busy_dispatch();
+        app.busy_jobs.start_queued(&dispatch);
+    }
+    spawn_busy_fetches(app);
+}
+
+/// Wendet ein Ergebnis aus [`ChatApp::busy_jobs`] an.
+///
+/// # Beschreibung
+/// - Befehl: Ausgabe als Systemzeilen mit „(während Turn)“ (bei `Staged`
+///   zusätzlich „gilt ab nächstem Turn“, aber nur bei Erfolg); danach wie
+///   im Idle-Pfad eine offene
+///   Ansicht neu laden und die Werkbank bei `/workbench …` als veraltet
+///   markieren.
+/// - Datenabruf: an Ansicht bzw. Werkbank ([`apply_fetch_result`]).
+fn apply_busy_job_done(app: &mut ChatApp, done: BusyJobDone) {
+    match done {
+        BusyJobDone::Command {
+            command,
+            text,
+            succeeded,
+        } => {
+            tracing::debug!(command = %command.raw, succeeded, "tui.busy.command_finished");
+            app.push_lines(busy_queue::command_result_lines(&command, &text, succeeded));
+            app.queue_overlay_refresh();
+            if is_workbench_command(&command.raw) {
+                app.workbench.mark_stale();
+            }
+        }
+        BusyJobDone::Fetch { target, result } => apply_fetch_result(app, target, result),
+    }
+}
+
+/// `true` für lokale Abfänge, die während eines laufenden Turns gefahrlos
+/// sofort wirken (Runde 4, Teil H).
+///
+/// # Beschreibung
+/// Sofort: Ansichten, Picker, Agentenbaum, Panels, ausführliche Anzeige,
+/// Systemzeilen und die reine Anzeige-Umbenennung. Zurückgestellt bleiben
+/// Sitzungsauswahl (beendet den Loop), das Leeren des Transkripts (würde
+/// laufende Zellen verlieren) und `Rewrite` (dessen Ziel neu eingestuft
+/// werden müsste; läuft nach dem Turn über den normalen Pfad).
+fn is_busy_safe_intercept(intercept: &LocalIntercept) -> bool {
+    matches!(
+        intercept,
+        LocalIntercept::OpenOverlay(_)
+            | LocalIntercept::OpenModelPicker(_)
+            | LocalIntercept::OpenUiaWorkerPicker
+            | LocalIntercept::OpenEffortChoice(_)
+            | LocalIntercept::OpenAgentTree
+            | LocalIntercept::TogglePanel(_)
+            | LocalIntercept::ToggleVerbose
+            | LocalIntercept::System(_)
+            | LocalIntercept::RenameSession(_)
+    )
+}
+
+/// Stellt eine `/command`-Zeile bis zum Turn-Ende zurück (Paste+Enter in
+/// `deferred_input`): nach dem Turn läuft sie über denselben autorisierten
+/// Command-Kanal wie interaktiv eingegebene Befehle.
+fn defer_busy_command(app: &mut ChatApp, raw: String) {
+    app.deferred_input.push_back(TuiEvent::Paste(raw));
+    app.deferred_input.push_back(TuiEvent::Key(KeyEvent::new(
+        KeyCode::Enter,
+        KeyModifiers::NONE,
+    )));
+}
+
+/// Stuft eine während eines Turns abgeschickte `/command`-Zeile ein und
+/// wendet sie an (Runde 4, Teil H).
+///
+/// # Beschreibung
+/// 1. Lokaler Abfang ([`local_intercept_for`]): busy-sicher
+///    ([`is_busy_safe_intercept`]) → sofort anwenden, [`BusyKeyOutcome::Local`];
+///    `Chat` → in `pending_turns`; sonst zurückstellen.
+/// 2. Sonst [`busy_availability_for`]: `Immediate`/`Staged` → in
+///    [`ChatApp::busy_jobs`] einreihen, [`BusyKeyOutcome::Dispatch`];
+///    `DeferredUntilTurnEnd` → zurückstellen ([`defer_busy_command`]).
+///
+/// Nie wird hier die Session selbst verändert: `Staged`-Befehle merken ihre
+/// Änderung nur im Controller vor, angewendet wird sie an der nächsten
+/// Turn-Grenze.
+fn route_busy_command(app: &mut ChatApp, raw: String) -> BusyKeyOutcome {
+    if let Some(intercepted) = local_intercept_for(app, &raw) {
+        if is_busy_safe_intercept(&intercepted) {
+            // Busy-sichere Abfänge senden nichts auf den Bus (nur `Rewrite`
+            // täte das); der Wegwerf-Kanal fängt es trotzdem sicher ab.
+            let (scratch, _scratch_rx) = crate::events::harw_event_channel();
+            let _ = apply_local_intercept(app, intercepted, &scratch);
+            return BusyKeyOutcome::Local;
+        }
+        if let LocalIntercept::Chat(text) = intercepted {
+            app.pending_turns.push_back(text);
+            return BusyKeyOutcome::Redraw;
+        }
+        defer_busy_command(app, raw);
+        return BusyKeyOutcome::Redraw;
+    }
+    let class = busy_availability_for(&app.command_registry, &raw);
+    if class.runs_during_turn() {
+        app.busy_jobs.queue(BusyCommand { raw, class });
+        return BusyKeyOutcome::Dispatch(class);
+    }
+    defer_busy_command(app, raw);
+    BusyKeyOutcome::Redraw
+}
+
+/// Leitet eine Taste während eines laufenden Turns an das offene Overlay
+/// weiter (Runde 4, Teil H).
+///
+/// # Beschreibung
+/// Nutzt denselben [`handle_overlay_key`] wie der Leerlauf, aber mit einem
+/// Wegwerf-Bus: Befehle, die Ansichten und Picker absenden (z. B. `/model
+/// switch <id>` aus dem Modell-Picker, `/effort high` aus der
+/// Effort-Auswahl), werden über [`route_busy_command`] neu eingestuft —
+/// `Staged` merkt den Controller sofort vor (nie `apply_to_session` mitten im
+/// Turn), alles Zurückgestellte wartet bis zum Turn-Ende.
+fn route_busy_overlay_key(app: &mut ChatApp, key: KeyEvent) -> BusyKeyOutcome {
+    let (scratch, mut scratch_rx) = crate::events::harw_event_channel();
+    handle_overlay_key(app, key, &scratch);
+    let mut outcome = BusyKeyOutcome::Redraw;
+    while let Ok(event) = scratch_rx.try_recv() {
+        match event {
+            HarwEvent::Command(raw) => {
+                let routed = route_busy_command(app, raw);
+                if matches!(routed, BusyKeyOutcome::Dispatch(_)) {
+                    outcome = routed;
+                }
+            }
+            HarwEvent::Submit(text) => app.pending_turns.push_back(text),
+            HarwEvent::SystemMessage(message) => app.push_lines(
+                message
+                    .split('\n')
+                    .map(|line| Line::from(line.to_owned()))
+                    .collect(),
+            ),
+            HarwEvent::Quit => {
+                tracing::debug!("tui.busy.overlay_quit_ignored");
+            }
+        }
+    }
+    outcome
+}
+
+/// Holt die zuletzt eingereihte Nachricht zurück in den (leeren) Composer
+/// (Alt+↑ während eines Turns, Runde 4, Teil H).
+///
+/// # Rückgabe
+/// `true`, wenn eine Nachricht zurückgeholt wurde.
+fn recall_last_pending_turn(app: &mut ChatApp) -> bool {
+    if !app.input.is_empty() {
+        return false;
+    }
+    let Some(text) = app.pending_turns.pop_back() else {
+        return false;
+    };
+    app.input.insert_paste(&text);
+    app.sync_popup();
+    true
+}
+
 /// Bearbeitet den Composer während eines laufenden Turns. Chat-Zeilen gehen
-/// direkt in die FIFO. Ein fertig abgeschickter Slash-Befehl mit
-/// `BusyAvailability::Immediate` ([`busy_availability_for`]) wird als
-/// [`BusyKeyOutcome::RunImmediate`] gemeldet, statt in `deferred_input`
-/// eingereiht zu werden; jeder andere Slash-Befehl bleibt wie bisher als
-/// Paste-plus-Enter in der nachgelagerten Eingabe-Queue: nach dem Turn läuft
-/// er dadurch über denselben autorisierten Command-Kanal wie interaktiv
-/// eingegebene Befehle, statt im Composer stecken zu bleiben oder still
-/// verloren zu gehen.
+/// direkt in die FIFO (`pending_turns`, sichtbar im Warteschlangen-Block über
+/// dem Composer); eine fertig abgeschickte `/command`-Zeile stuft
+/// [`route_busy_command`] ein (lokal sofort, `Immediate`/`Staged`
+/// nebenläufig, sonst zurückgestellt).
 fn queue_busy_key(app: &mut ChatApp, key: KeyEvent) -> BusyKeyOutcome {
     match app.input.handle_key(key) {
         InputAction::Submit(text) => {
             app.remember_input(&text);
             app.mention_popup = None;
             match classify_line(&text) {
-                LineAction::Chat(text) => app.pending_turns.push_back(text),
-                LineAction::Command(raw) => {
-                    if raw.trim() == "/agent" {
-                        return BusyKeyOutcome::RunImmediate(raw);
-                    }
-                    // TUI-lokale Befehle haben keinen Adapter; sie laufen
-                    // nach dem Turn über den regulären Abfang in `run_loop`.
-                    if busy_availability_for(&app.command_registry, &raw)
-                        == BusyAvailability::Immediate
-                        && !is_tui_local_command(&app.command_registry, &raw)
-                    {
-                        return BusyKeyOutcome::RunImmediate(raw);
-                    }
-                    app.deferred_input.push_back(TuiEvent::Paste(raw));
-                    app.deferred_input.push_back(TuiEvent::Key(KeyEvent::new(
-                        KeyCode::Enter,
-                        KeyModifiers::NONE,
-                    )));
+                LineAction::Chat(text) => {
+                    app.pending_turns.push_back(text);
+                    BusyKeyOutcome::Redraw
                 }
-                LineAction::Quit | LineAction::Ignore | LineAction::System(_) => {}
+                LineAction::Command(raw) => route_busy_command(app, raw),
+                LineAction::Quit | LineAction::Ignore | LineAction::System(_) => {
+                    BusyKeyOutcome::Redraw
+                }
             }
-            BusyKeyOutcome::Redraw
         }
         InputAction::Redraw => {
             app.sync_popup();
@@ -7840,13 +8064,28 @@ fn handle_busy_event(app: &mut ChatApp, event: TuiEvent) -> BusyKeyOutcome {
             app.pending_quit = None;
         }
     }
-    // `/agent` kann während eines Turns als Immediate-Befehl geöffnet werden.
-    // Danach gehören seine Navigation und sein scoped `s`-Abbruch exklusiv
-    // dem Overlay, auch während der Spinner weiterläuft.
     if let TuiEvent::Key(key) = &event {
-        if matches!(app.overlay.as_ref(), Some(Overlay::AgentTree(_))) {
-            handle_agent_tree_key(app, *key);
-            return BusyKeyOutcome::Redraw;
+        let is_ctrl_c = key.modifiers.contains(KeyModifiers::CONTROL)
+            && matches!(key.code, KeyCode::Char('c' | 'C'));
+        if !is_ctrl_c {
+            // Runde 4, Teil H: Ansichten (F1/F6/…) öffnen auch während eines
+            // Turns, und ein offenes Overlay (Hilfe, Picker, Wissensbrowser,
+            // Agentenbaum …) bekommt seine Tasten — Esc schließt es, statt den
+            // Turn zu unterbrechen. Ctrl+C bleibt der Turn-Abbruch.
+            if handle_view_hotkey(app, *key).is_some() {
+                return BusyKeyOutcome::Local;
+            }
+            if app.overlay.is_some() {
+                return route_busy_overlay_key(app, *key);
+            }
+            // Alt+↑ holt die zuletzt eingereihte Nachricht zum Bearbeiten
+            // zurück in den leeren Composer.
+            if key.code == KeyCode::Up
+                && key.modifiers == KeyModifiers::ALT
+                && recall_last_pending_turn(app)
+            {
+                return BusyKeyOutcome::Redraw;
+            }
         }
         // Panels bleiben auch während eines Turns bedienbar — gerade dann
         // will man den Agenten zusehen.
@@ -7880,26 +8119,7 @@ fn handle_busy_event(app: &mut ChatApp, event: TuiEvent) -> BusyKeyOutcome {
                 app.hard_quit_requested = true;
                 return BusyKeyOutcome::Redraw;
             }
-            if let Some(cancel) = &app.active_cancel {
-                cancel.cancel(CancelReason::User);
-                // Nur ein transienter Statuszeilen-Hinweis (siehe
-                // `render_viewport`) — keine dauerhafte `push_line`-Zeile, da
-                // dieser Hinweis mit dem Turn-Ende oder einem neuen Turn
-                // automatisch wieder verschwinden muss.
-                app.cancel_requested_at = Some(Instant::now());
-                // Fix E (Teil 1b): ein einziger Ctrl+C-Druck wirft bereits
-                // eingereihte Eingaben weg — sonst würden während des Turns
-                // eingereihte Nachrichten/Befehle nach dem Abbruch automatisch
-                // als nächster Turn ausgeliefert (siehe `run_loop`, wo
-                // `pending_turns`/`deferred_input` an Turn-Grenzen gedraint
-                // werden).
-                let had_queued_input =
-                    !app.deferred_input.is_empty() || !app.pending_turns.is_empty();
-                app.deferred_input.clear();
-                app.pending_turns.clear();
-                if had_queued_input {
-                    app.queue_cleared_at = Some(Instant::now());
-                }
+            if interrupt_turn(app) {
                 app.pending_quit = Some(QuitArm {
                     label: "Ctrl+C",
                     at: Instant::now(),
@@ -7942,8 +8162,47 @@ fn handle_busy_event(app: &mut ChatApp, event: TuiEvent) -> BusyKeyOutcome {
             app.sync_popup();
             BusyKeyOutcome::Redraw
         }
+        // Runde 4 (Nutzerwunsch): Esc unterbricht den laufenden Turn wie ein
+        // erster Ctrl+C-Druck — nur ohne Beenden-Scharfstellung, damit Esc
+        // nie die App schließt. Ein offenes Popup schließt Esc zuerst (über
+        // `queue_busy_key`); der Composer-Text bleibt stehen.
+        TuiEvent::Key(key)
+            if key.code == KeyCode::Esc
+                && key.modifiers.is_empty()
+                && !app.has_popup()
+                && app.active_cancel.is_some() =>
+        {
+            if interrupt_turn(app) {
+                BusyKeyOutcome::Redraw
+            } else {
+                BusyKeyOutcome::Idle
+            }
+        }
         TuiEvent::Key(key) => queue_busy_key(app, key),
     }
+}
+
+/// Bricht den laufenden Turn kooperativ ab (Ctrl+C und Esc im Busy-Pfad).
+///
+/// # Beschreibung
+/// Während des Turns abgeschickte Nachrichten und Befehle bleiben in
+/// `pending_turns`/`deferred_input` stehen: sie sind abgeschickt, also gehen
+/// sie raus — `run_loop` liefert sie direkt nach dem Abbruch an der
+/// Turn-Grenze aus (Runde 4, Nutzerwunsch). Beide Hinweise sind nur
+/// transiente Statuszeilen-Hinweise (siehe `render_viewport`).
+///
+/// # Rückgabe
+/// `true`, wenn ein laufender Turn abgebrochen wurde.
+fn interrupt_turn(app: &mut ChatApp) -> bool {
+    let Some(cancel) = &app.active_cancel else {
+        return false;
+    };
+    cancel.cancel(CancelReason::User);
+    app.cancel_requested_at = Some(Instant::now());
+    if !app.deferred_input.is_empty() || !app.pending_turns.is_empty() {
+        app.queue_kept_at = Some(Instant::now());
+    }
+    true
 }
 
 /// Übernimmt die finale Antwort als Zelle.
@@ -8113,18 +8372,41 @@ fn render_viewport(
         }
     };
 
-    // History | permanente Statuszeile | Eingabe. Der Sicherheitsmodus muss
-    // sichtbar bleiben und darf nicht vom Verlauf verdrängt werden.
+    // Runde 4, Teil H: während eines Turns abgeschickte Nachrichten und
+    // zurückgestellte Befehle stehen sichtbar über dem Composer, bis sie
+    // ausgeliefert werden (auch nach einem Abbruch).
+    let queue_lines = busy_queue::queue_block_lines(
+        app.pending_turns.iter().map(String::as_str),
+        app.deferred_input.iter().filter_map(|event| match event {
+            TuiEvent::Paste(text) => Some(text.as_str()),
+            _ => None,
+        }),
+        area.width,
+    );
+    // Der Block darf den Verlauf nie ganz verdrängen.
+    let queue_height = (queue_lines.len() as u16).min(area.height.saturating_sub(input_height + 4));
+
+    // History | Warteschlange | permanente Statuszeile | Eingabe. Der
+    // Sicherheitsmodus muss sichtbar bleiben und darf nicht vom Verlauf
+    // verdrängt werden.
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Min(3),
+            Constraint::Length(queue_height),
             Constraint::Length(1),
             Constraint::Length(input_height),
         ])
         .split(area);
-    let status_area = chunks[1];
-    let input_area = chunks[2];
+    let queue_area = chunks[1];
+    let status_area = chunks[2];
+    let input_area = chunks[3];
+    if queue_height > 0 {
+        frame.render_widget(
+            Paragraph::new(queue_lines).style(Style::default().fg(style::border_color(theme))),
+            queue_area,
+        );
+    }
     // Seitenpanels (Explorer links, Agenten rechts) teilen sich die obere
     // Fläche mit dem Verlauf; auf schmalen Terminals bleibt nur der Chat.
     let pane_areas = crate::panes::split(chunks[0], &app.panels);
@@ -8234,13 +8516,13 @@ fn render_viewport(
     } else {
         ""
     };
-    // Transienter Hinweis, dass Ctrl+C eine nicht-leere Eingabe-Warteschlange
-    // (`deferred_input`/`pending_turns`) tatsächlich verworfen hat (Fix E /
-    // Teil 1b) — analog zu `cancel_suffix` oben, keine dauerhafte
+    // Transienter Hinweis, dass nach einem Ctrl+C-Abbruch die nicht-leere
+    // Eingabe-Warteschlange (`deferred_input`/`pending_turns`) ausgeliefert
+    // wird — analog zu `cancel_suffix` oben, keine dauerhafte
     // Verlaufszeile, verschwindet an denselben Stellen wieder
-    // (`queue_cleared_at`-Reset an [`ChatApp`]).
-    let queue_cleared_suffix = if app.queue_cleared_at.is_some() {
-        " · Warteschlange verworfen"
+    // (`queue_kept_at`-Reset an [`ChatApp`]).
+    let queue_cleared_suffix = if app.queue_kept_at.is_some() {
+        " · Warteschlange wird gesendet"
     } else {
         ""
     };
@@ -8251,29 +8533,11 @@ fn render_viewport(
         Some(label) => format!(" · nochmal {label} zum Beenden"),
         None => String::new(),
     };
-    // Sichtbarkeit für bereits eingereihte, aber noch nicht gesendete
-    // Nachrichten (`pending_turns`, siehe [`ChatApp`]): ohne diesen Hinweis
-    // verschwindet eine während eines laufenden Turns abgeschickte Nachricht
-    // scheinbar spurlos, bis sie beim Drainen der Queue plötzlich auftaucht.
-    let queue_suffix = if app.pending_turns.is_empty() {
-        String::new()
-    } else if app.pending_turns.len() <= 2 {
-        let preview: String = app
-            .pending_turns
-            .front()
-            .map(|text| {
-                let trimmed = text.trim();
-                if trimmed.chars().count() > 30 {
-                    let truncated: String = trimmed.chars().take(30).collect();
-                    format!("{truncated}…")
-                } else {
-                    trimmed.to_owned()
-                }
-            })
-            .unwrap_or_default();
-        format!(" · wartet: \"{preview}\"")
-    } else {
-        format!(" · {n} Nachricht(en) warten", n = app.pending_turns.len())
+    // Eingereihte Nachrichten zeigt der Warteschlangen-Block über dem
+    // Composer (siehe oben); die Statuszeile trägt nur noch ihre Anzahl.
+    let queue_suffix = match app.pending_turns.len() {
+        0 => String::new(),
+        n => format!(" · {n} wartend"),
     };
     let tool_suffix = if app.has_collapsed_tool_cells() {
         " · Ctrl+O: Werkzeug-/Reasoning-Details"
@@ -9259,11 +9523,11 @@ mod tests {
         // `deferred_input` zwischengelagert, sondern live in `app.input`
         // editiert — der Composer bleibt beim Tippen sichtbar aktuell.
         // Fertige Chat-Zeilen landen direkt in `pending_turns`; nur ein
-        // fertiges Slash-Kommando ohne `BusyAvailability::Immediate` wird für
-        // die autorisierte Nach-Turn-Ausführung als Paste+Enter in
-        // `deferred_input` gelegt (Welle 4b: ein `Immediate`-Kommando meldet
-        // stattdessen `BusyKeyOutcome::RunImmediate`, siehe die eigenen Tests
-        // dafür unten). Diese Assertions prüfen jetzt genau das, statt die
+        // fertiges, zurückgestelltes Slash-Kommando wird für die autorisierte
+        // Nach-Turn-Ausführung als Paste+Enter in `deferred_input` gelegt
+        // (Runde 4, Teil H: `Immediate`/`Staged` meldet
+        // `BusyKeyOutcome::Dispatch`, lokale Befehle `Local`, siehe die
+        // eigenen Tests dafür unten). Diese Assertions prüfen jetzt genau das, statt die
         // alte Roh-Event-Warteschlange: Scrollen wirkt weiterhin sofort, und
         // Tippen + Einfügen bleiben in der Reihenfolge im Composer erhalten.
         let mut app = test_chat_app()?;
@@ -9292,40 +9556,48 @@ mod tests {
         Ok(())
     }
 
-    /// Welle 4b: `/status` trägt `BusyAvailability::Immediate` und nur seine
-    /// Anzeige läuft — `queue_busy_key` meldet `RunImmediate` statt den
-    /// Befehl in `deferred_input` einzureihen; Composer und `deferred_input`
-    /// bleiben unberührt (die eigentliche Ausführung obliegt dem Aufrufer,
-    /// siehe `run_immediate_busy_command`).
+    /// `/status` trägt `BusyAvailability::Immediate` — `queue_busy_key`
+    /// reiht ihn in `busy_jobs` ein und meldet `Dispatch(Immediate)`, statt
+    /// ihn in `deferred_input` zurückzustellen; der Aufrufer startet ihn als
+    /// eigenen Task (`settle_busy_outcome`).
     #[test]
-    fn busy_turn_immediate_command_reports_run_immediate_without_touching_deferred_input()
-    -> TestResult {
+    fn busy_turn_immediate_command_is_dispatched_without_touching_deferred_input() -> TestResult {
         let mut app = test_chat_app()?;
         app.input.insert_str("/status");
 
         let outcome = queue_busy_key(&mut app, KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
-        assert_eq!(outcome, BusyKeyOutcome::RunImmediate("/status".to_owned()));
+        assert_eq!(
+            outcome,
+            BusyKeyOutcome::Dispatch(BusyAvailability::Immediate)
+        );
+        assert_eq!(
+            app.busy_jobs.queued().front(),
+            Some(&BusyCommand {
+                raw: "/status".to_owned(),
+                class: BusyAvailability::Immediate,
+            })
+        );
         assert!(app.input.is_empty());
         assert!(app.deferred_input.is_empty());
         Ok(())
     }
 
-    /// `/mode plan` bleibt `DeferredUntilTurnEnd` (kein `Immediate`-Befehl aus
-    /// Welle 2d/3d/4a) — unverändertes Verhalten: Paste+Enter in
+    /// `/compact` bleibt `DeferredUntilTurnEnd`: Paste+Enter in
     /// `deferred_input`, für die autorisierte Ausführung nach Turn-Ende.
     #[test]
     fn busy_turn_queues_submitted_command_for_authorized_dispatch_after_turn() -> TestResult {
         let mut app = test_chat_app()?;
-        app.input.insert_str("/mode plan");
+        app.input.insert_str("/compact");
 
         assert_eq!(
             queue_busy_key(&mut app, KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
             BusyKeyOutcome::Redraw
         );
         assert!(app.input.is_empty());
+        assert!(app.busy_jobs.queued().is_empty());
         assert_eq!(
             app.deferred_input.pop_front(),
-            Some(TuiEvent::Paste("/mode plan".to_owned()))
+            Some(TuiEvent::Paste("/compact".to_owned()))
         );
         assert_eq!(
             app.deferred_input.pop_front(),
@@ -9338,29 +9610,28 @@ mod tests {
         Ok(())
     }
 
-    /// `/model switch x` bleibt eingereiht (Welle 4b-Sonderfall: `model` ist
-    /// `Immediate` markiert, aber nur `show`/`list` dürfen sofort laufen).
+    /// `/model switch x` und `/mode plan` sind `Staged`: sie laufen sofort,
+    /// merken ihre Änderung aber nur im Controller vor (gilt ab dem nächsten
+    /// Turn).
     #[test]
-    fn busy_turn_model_switch_with_argument_stays_deferred() -> TestResult {
-        let mut app = test_chat_app()?;
-        app.input.insert_str("/model switch x");
-
-        assert_eq!(
-            queue_busy_key(&mut app, KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
-            BusyKeyOutcome::Redraw
-        );
-        assert_eq!(
-            app.deferred_input.pop_front(),
-            Some(TuiEvent::Paste("/model switch x".to_owned()))
-        );
-        assert_eq!(
-            app.deferred_input.pop_front(),
-            Some(TuiEvent::Key(KeyEvent::new(
-                KeyCode::Enter,
-                KeyModifiers::NONE,
-            )))
-        );
-        assert!(app.deferred_input.is_empty());
+    fn busy_turn_staged_commands_are_dispatched_as_staged() -> TestResult {
+        for raw in ["/model switch x", "/mode plan", "/effort high"] {
+            let mut app = test_chat_app()?;
+            app.input.insert_str(raw);
+            assert_eq!(
+                queue_busy_key(&mut app, KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+                BusyKeyOutcome::Dispatch(BusyAvailability::Staged),
+                "{raw}"
+            );
+            assert_eq!(
+                app.busy_jobs
+                    .queued()
+                    .front()
+                    .map(|command| command.raw.as_str()),
+                Some(raw)
+            );
+            assert!(app.deferred_input.is_empty(), "{raw}");
+        }
         Ok(())
     }
 
@@ -9449,15 +9720,15 @@ mod tests {
         Ok(())
     }
 
-    /// Fix E (Teil 1b): ein erster Ctrl+C-Druck wirft bereits eingereihte
-    /// Eingaben weg, statt sie nach dem Abbruch automatisch als nächsten Turn
-    /// auszuliefern (`run_loop`, das `pending_turns`/`deferred_input` an
-    /// Turn-Grenzen abarbeitet). Vor diesem Fix blieben beide Warteschlangen
-    /// unangetastet und die eingereihte Nachricht liefe unverändert nach.
+    /// Runde 4 (Nutzerwunsch): ein Ctrl+C-Abbruch bricht nur den laufenden
+    /// Turn ab. Bereits abgeschickte, aber noch nicht ausgelieferte Eingaben
+    /// bleiben in `pending_turns`/`deferred_input` und werden von `run_loop`
+    /// an der nächsten Turn-Grenze ausgeliefert; die Statuszeile meldet das.
     #[test]
-    fn ctrl_c_during_busy_clears_deferred_input_and_pending_turns() -> TestResult {
+    fn ctrl_c_during_busy_keeps_queued_input_for_delivery() -> TestResult {
         let mut app = test_chat_app()?;
-        app.active_cancel = Some(CancelToken::new());
+        let cancel = CancelToken::new();
+        app.active_cancel = Some(cancel.clone());
         app.deferred_input.push_back(TuiEvent::Key(KeyEvent::new(
             KeyCode::Char('x'),
             KeyModifiers::NONE,
@@ -9469,21 +9740,54 @@ mod tests {
         assert_eq!(handle_busy_event(&mut app, ctrl_c), BusyKeyOutcome::Redraw);
 
         assert!(
-            app.deferred_input.is_empty(),
-            "Ctrl+C muss bereits eingereihte Tastatur-/Paste-Ereignisse verwerfen"
+            cancel.is_cancelled(),
+            "Ctrl+C muss den laufenden Turn abbrechen"
         );
-        assert!(
-            app.pending_turns.is_empty(),
-            "Ctrl+C muss bereits abgeschickte, aber noch nicht ausgelieferte Nachrichten verwerfen"
+        assert_eq!(
+            app.pending_turns.front().map(String::as_str),
+            Some("noch nicht gesendet"),
+            "abgeschickte Nachrichten müssen nach dem Abbruch ausgeliefert werden"
         );
+        assert_eq!(app.deferred_input.len(), 1);
         assert!(
-            app.queue_cleared_at.is_some(),
-            "eine tatsächlich geleerte Warteschlange muss den transienten Statuszeilen-Hinweis setzen"
+            app.queue_kept_at.is_some(),
+            "eine nicht-leere Warteschlange muss den Statuszeilen-Hinweis setzen"
         );
         Ok(())
     }
 
-    /// Leere Warteschlangen dürfen den „Warteschlange verworfen“-Hinweis
+    /// Runde 4: Esc unterbricht einen laufenden Turn wie Ctrl+C, behält die
+    /// Warteschlange und den Composer-Text, scharft aber kein Beenden.
+    #[test]
+    fn esc_during_busy_interrupts_and_keeps_queue_without_quit_arm() -> TestResult {
+        let mut app = test_chat_app()?;
+        let cancel = CancelToken::new();
+        app.active_cancel = Some(cancel.clone());
+        app.pending_turns.push_back("gleich danach".to_owned());
+        app.input.insert_str("angefangen");
+        let esc = TuiEvent::Key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+
+        assert_eq!(handle_busy_event(&mut app, esc), BusyKeyOutcome::Redraw);
+
+        assert!(
+            cancel.is_cancelled(),
+            "Esc muss den laufenden Turn abbrechen"
+        );
+        assert_eq!(
+            app.pending_turns.front().map(String::as_str),
+            Some("gleich danach")
+        );
+        assert!(app.queue_kept_at.is_some());
+        assert_eq!(app.input(), "angefangen", "Composer-Text bleibt stehen");
+        assert!(
+            app.pending_quit.is_none(),
+            "Esc darf nie das Beenden scharfstellen"
+        );
+        assert!(!app.hard_quit_requested);
+        Ok(())
+    }
+
+    /// Leere Warteschlangen dürfen den „Warteschlange wird gesendet“-Hinweis
     /// nicht fälschlich scharfstellen — sonst zeigte die Statuszeile bei
     /// jedem Ctrl+C einen Hinweis, obwohl nichts verworfen wurde.
     #[test]
@@ -9497,7 +9801,7 @@ mod tests {
         assert_eq!(handle_busy_event(&mut app, ctrl_c), BusyKeyOutcome::Redraw);
 
         assert!(
-            app.queue_cleared_at.is_none(),
+            app.queue_kept_at.is_none(),
             "ohne eingereihte Eingaben gibt es nichts zu verwerfen"
         );
         Ok(())
@@ -10764,10 +11068,12 @@ forbidden = [{forbidden}]
             ),
             "Ctrl+C muss den zweistufigen Beenden-Hinweis scharfstellen"
         );
-        assert!(
-            app.pending_turns.is_empty(),
-            "bereits eingereihte Nachrichten müssen verworfen werden"
+        assert_eq!(
+            app.pending_turns.front().map(String::as_str),
+            Some("noch nicht gesendet"),
+            "abgeschickte Nachrichten bleiben für die Auslieferung nach dem Abbruch"
         );
+        assert!(app.queue_kept_at.is_some());
         assert!(pending.is_none(), "die Frage muss konsumiert sein");
         assert!(dialog_shown_at.is_none());
         assert!(app.pending_approval_dialog.is_none());
@@ -11733,6 +12039,44 @@ forbidden = [{forbidden}]
         Ok(())
     }
 
+    /// Knowledge-Ereignisse markieren nur die passenden Panels als veraltet:
+    /// `kanban` lädt ein offenes Board nach, `workbench` das Werkbank-Panel,
+    /// fremde Flächen lassen die offene Ansicht in Ruhe.
+    #[test]
+    fn knowledge_events_mark_the_matching_panels_stale() -> TestResult {
+        let mut app = test_chat_app()?;
+        let hub = harw_core::AgentEventHub::default();
+        app.attach_agent_events(&hub);
+        app.open_overlay_view(Box::new(KanbanBoard::new()));
+        app.pending_fetches.clear();
+
+        hub.publish_knowledge(app.session_id.clone(), "palace", None);
+        assert!(!app.drain_agent_events());
+        assert!(app.pending_fetches.is_empty());
+
+        hub.publish_knowledge(
+            app.session_id.clone(),
+            "kanban",
+            Some("default/card-1".to_owned()),
+        );
+        assert!(app.drain_agent_events());
+        assert_eq!(
+            app.pending_fetches,
+            vec![DataFetch::Overlay {
+                command: crate::kanban_board::REFRESH_COMMAND.to_owned(),
+                generation: app.overlay_generation,
+            }]
+        );
+
+        app.workbench
+            .apply_data(&serde_json::json!({"scope": "session:s"}));
+        assert!(!app.workbench.is_stale());
+        hub.publish_knowledge(app.session_id.clone(), "workbench", None);
+        assert!(app.drain_agent_events());
+        assert!(app.workbench.is_stale());
+        Ok(())
+    }
+
     /// Ein Abruf für eine inzwischen ersetzte Ansicht wird verworfen.
     #[tokio::test]
     async fn stale_overlay_fetch_is_dropped_after_view_replaced() -> TestResult {
@@ -11859,25 +12203,364 @@ forbidden = [{forbidden}]
         assert!(!subcommand_query_is_empty("/model s"));
     }
 
-    /// Lokale Befehle laufen während eines Turns nie sofort (kein Adapter),
-    /// sondern werden eingereiht.
+    /// Busy-sichere lokale Befehle wirken während eines Turns sofort
+    /// (`Local`); Sitzungswechsel, Transkript-Leeren und Befehle ohne
+    /// busy-sichere Klasse werden zurückgestellt (Runde 4, Teil H).
     #[test]
-    fn busy_local_command_is_deferred() -> TestResult {
+    fn busy_local_commands_run_locally_and_session_commands_are_deferred() -> TestResult {
+        let local_app = || -> TestResult<ChatApp> {
+            let mut app = test_chat_app()?;
+            app.command_registry = CommandRegistry::built_in()
+                .map_err(ctx("built_in"))?
+                .with_local_specs(crate::command_catalog::local_command_specs());
+            Ok(app)
+        };
+        let enter = KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE);
+        for raw in [
+            "/help",
+            "/models",
+            "/workbench",
+            "/keys",
+            "/whoami",
+            "/agent",
+        ] {
+            let mut app = local_app()?;
+            app.input.insert_str(raw);
+            assert_eq!(
+                queue_busy_key(&mut app, enter),
+                BusyKeyOutcome::Local,
+                "{raw}"
+            );
+            assert!(app.deferred_input.is_empty(), "{raw}");
+            assert!(app.busy_jobs.queued().is_empty(), "{raw}");
+        }
+        // `/whoami` schreibt seine Systemzeile sofort, `/help` öffnet das Overlay.
+        let mut app = local_app()?;
+        app.input.insert_str("/help");
+        queue_busy_key(&mut app, enter);
+        assert!(app.overlay.is_some());
+
+        for raw in [
+            "/clear",
+            "/resume",
+            "/compact",
+            "/tools",
+            "/new",
+            "/sessions",
+        ] {
+            let mut app = local_app()?;
+            app.input.insert_str(raw);
+            assert_eq!(
+                queue_busy_key(&mut app, enter),
+                BusyKeyOutcome::Redraw,
+                "{raw}"
+            );
+            assert_eq!(
+                app.deferred_input.pop_front(),
+                Some(TuiEvent::Paste(raw.to_owned())),
+                "{raw}"
+            );
+            assert!(app.busy_jobs.queued().is_empty(), "{raw}");
+        }
+        Ok(())
+    }
+
+    /// Klartext aller Verlaufszellen (Testhilfe).
+    fn history_plain(app: &ChatApp) -> String {
+        app.cells
+            .iter()
+            .flat_map(|cell| cell.display_lines(200, style::Theme::Dark))
+            .map(|line| {
+                line.spans
+                    .iter()
+                    .map(|span| span.content.as_ref())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    /// Ein offenes Overlay bekommt während eines Turns seine Tasten: Esc
+    /// schließt die Hilfe, statt den Turn zu unterbrechen.
+    #[test]
+    fn busy_keys_reach_open_overlay_and_esc_closes_it_without_interrupt() -> TestResult {
         let mut app = test_chat_app()?;
         app.command_registry = CommandRegistry::built_in()
             .map_err(ctx("built_in"))?
             .with_local_specs(crate::command_catalog::local_command_specs());
-        assert!(is_tui_local_command(&app.command_registry, "/whoami"));
-        assert!(!is_tui_local_command(&app.command_registry, "/status"));
-        app.input.insert_str("/whoami");
+        let cancel = CancelToken::new();
+        app.active_cancel = Some(cancel.clone());
+        app.input.insert_str("/help");
         assert_eq!(
-            queue_busy_key(&mut app, KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+            handle_busy_event(
+                &mut app,
+                TuiEvent::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+            ),
+            BusyKeyOutcome::Local
+        );
+        assert!(matches!(app.overlay, Some(Overlay::View(_))));
+
+        // Tippen landet im Overlay, nicht im Composer.
+        handle_busy_event(
+            &mut app,
+            TuiEvent::Key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE)),
+        );
+        assert!(app.input.is_empty());
+
+        handle_busy_event(
+            &mut app,
+            TuiEvent::Key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)),
+        );
+        assert!(app.overlay.is_none(), "Esc schließt das Overlay");
+        assert!(
+            !cancel.is_cancelled(),
+            "Esc im Overlay unterbricht den Turn nicht"
+        );
+        assert!(app.cancel_requested_at.is_none());
+        Ok(())
+    }
+
+    /// Alt+↑ holt die zuletzt eingereihte Nachricht zurück in den leeren
+    /// Composer.
+    #[test]
+    fn busy_alt_up_recalls_last_pending_turn() -> TestResult {
+        let mut app = test_chat_app()?;
+        app.pending_turns.push_back("erste".to_owned());
+        app.pending_turns.push_back("zweite".to_owned());
+        let alt_up = TuiEvent::Key(KeyEvent::new(KeyCode::Up, KeyModifiers::ALT));
+        assert_eq!(
+            handle_busy_event(&mut app, alt_up.clone()),
             BusyKeyOutcome::Redraw
         );
+        assert_eq!(app.input.submission_text(), "zweite");
+        assert_eq!(app.pending_turns.len(), 1);
+        // Mit Text im Composer holt Alt+↑ nichts zurück.
+        handle_busy_event(&mut app, alt_up);
+        assert_eq!(app.pending_turns.len(), 1);
+        Ok(())
+    }
+
+    /// App mit allen `harw-ops`-Adaptern und Dispatch ohne Montage.
+    fn ops_chat_app() -> TestResult<ChatApp> {
+        let mut ops = OperationRegistry::new();
+        harw_ops::register_all(&mut ops);
+        let adapters: Vec<CommandAdapter> = ops
+            .iter()
+            .flat_map(|op| CommandAdapter::from_operation(Arc::clone(op)))
+            .collect();
+        let mut app = ChatApp::new(adapters, test_sandbox()?, SessionId::new());
+        app.busy_jobs.enable_dispatch_without_runtime();
+        Ok(app)
+    }
+
+    /// Ein Picker-Accept während eines Turns (Effort-Auswahl) wird als
+    /// `Staged` eingestuft, läuft sofort und merkt die Änderung nur im
+    /// Controller vor — die Session selbst ändert sich erst an der
+    /// Turn-Grenze (`apply_pending_controller_state`).
+    #[tokio::test]
+    async fn busy_picker_accept_stages_controller_without_touching_session() -> TestResult {
+        let sandbox = test_sandbox()?;
+        let (event_tx, _event_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (turn_event_tx, _turn_event_rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut session = AgentSession::new_with_id(
+            SessionId::new(),
+            AgentRole::Assistant,
+            None,
+            ExtensionRegistry::builder().build(),
+            event_tx,
+        )
+        .with_spawn_context(test_spawn_context(&sandbox))
+        .with_turn_event_sink(turn_event_tx);
+        let mut app = ops_chat_app()?;
+        app.active_cancel = Some(CancelToken::new());
+
+        app.input.insert_str("/effort");
+        let enter = TuiEvent::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
         assert_eq!(
-            app.deferred_input.pop_front(),
-            Some(TuiEvent::Paste("/whoami".to_owned()))
+            handle_busy_event(&mut app, enter.clone()),
+            BusyKeyOutcome::Local
         );
+        assert!(matches!(app.overlay, Some(Overlay::EffortChoice { .. })));
+
+        assert_eq!(
+            handle_busy_event(&mut app, enter),
+            BusyKeyOutcome::Dispatch(BusyAvailability::Staged)
+        );
+        assert!(app.overlay.is_none());
+        assert!(app.deferred_input.is_empty());
+        let queued = app
+            .busy_jobs
+            .queued()
+            .front()
+            .cloned()
+            .ok_or(TestError::Missing("eingereihter /effort-Befehl"))?;
+        assert!(queued.raw.starts_with("/effort "), "{queued:?}");
+
+        start_busy_work(&mut app);
+        let done = tokio::time::timeout(Duration::from_secs(5), app.busy_jobs.recv())
+            .await
+            .map_err(ctx("Busy-Ergebnis"))?
+            .ok_or(TestError::Missing("Busy-Ergebnis"))?;
+        apply_busy_job_done(&mut app, done);
+
+        let history = history_plain(&app);
+        assert!(history.contains("gilt ab nächstem Turn"), "{history}");
+        assert!(history.contains("Reasoning-Effort gesetzt"), "{history}");
+        assert!(app.session_controller.snapshot().reasoning_effort.is_some());
+        // Die Session selbst ist unberührt, bis die Turn-Grenze anwendet.
+        assert!(app.apply_pending_controller_state(&mut session));
+        Ok(())
+    }
+
+    /// Testoperation, die vor ihrer Antwort wartet.
+    struct SlowOperation {
+        meta: harw_operations::OperationMeta,
+        delay: Duration,
+    }
+
+    impl SlowOperation {
+        fn new(delay: Duration) -> Self {
+            Self {
+                meta: harw_operations::OperationMeta {
+                    name: "slow",
+                    summary: "Wartet und antwortet dann.",
+                    permission: harw_operations::PermissionTier::Observer,
+                    surfaces: vec![harw_operations::Surface::Command {
+                        path: "/slow",
+                        visibility: harw_operations::CommandVisibility::TuiOnly,
+                    }],
+                    busy: BusyAvailability::Immediate,
+                    ..harw_operations::OperationMeta::default()
+                },
+                delay,
+            }
+        }
+    }
+
+    impl harw_operations::Operation for SlowOperation {
+        fn meta(&self) -> &harw_operations::OperationMeta {
+            &self.meta
+        }
+
+        fn run<'a>(
+            &'a self,
+            _ctx: &'a harw_operations::OpContext,
+            _input: harw_operations::OpInput,
+        ) -> harw_operations::OpFuture<'a> {
+            Box::pin(async move {
+                tokio::time::sleep(self.delay).await;
+                Ok(OpOutput::from("langsam fertig".to_owned()))
+            })
+        }
+    }
+
+    fn slow_chat_app(delay: Duration) -> TestResult<ChatApp> {
+        let adapters = CommandAdapter::from_operation(Arc::new(SlowOperation::new(delay)));
+        let mut app = ChatApp::new(adapters, test_sandbox()?, SessionId::new());
+        app.busy_jobs.enable_dispatch_without_runtime();
+        Ok(app)
+    }
+
+    /// Ein langsamer Sofortbefehl blockiert die Busy-Schleife nicht: das
+    /// Starten kehrt sofort zurück, und ein Turn-Ereignis, das während der
+    /// Ausführung eintrifft, wird vor dem Befehlsergebnis bedient.
+    #[tokio::test]
+    async fn slow_immediate_command_does_not_stop_turn_events() -> TestResult {
+        let mut app = slow_chat_app(Duration::from_millis(400))?;
+        app.input.insert_str("/slow");
+        assert_eq!(
+            queue_busy_key(&mut app, KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+            BusyKeyOutcome::Dispatch(BusyAvailability::Immediate)
+        );
+        let started = Instant::now();
+        start_busy_work(&mut app);
+        assert!(started.elapsed() < Duration::from_millis(200));
+        assert_eq!(app.busy_jobs.running(), 1);
+
+        let (turn_tx, mut turn_rx) = tokio::sync::mpsc::unbounded_channel::<u32>();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(30)).await;
+            let _ = turn_tx.send(7);
+        });
+        tokio::select! {
+            event = turn_rx.recv() => assert_eq!(event, Some(7)),
+            _ = app.busy_jobs.recv() => {
+                return Err(TestError::Unexpected(
+                    "der langsame Befehl darf das Turn-Ereignis nicht überholen".to_owned(),
+                ));
+            }
+        }
+
+        let done = tokio::time::timeout(Duration::from_secs(5), app.busy_jobs.recv())
+            .await
+            .map_err(ctx("Busy-Ergebnis"))?
+            .ok_or(TestError::Missing("Busy-Ergebnis"))?;
+        apply_busy_job_done(&mut app, done);
+        assert_eq!(app.busy_jobs.running(), 0);
+        let history = history_plain(&app);
+        assert!(history.contains("/slow (während Turn)"), "{history}");
+        assert!(history.contains("langsam fertig"), "{history}");
+        Ok(())
+    }
+
+    /// Überschreitet ein Befehl das Zeitlimit, meldet der Busy-Pfad das
+    /// statt ewig zu warten.
+    #[tokio::test]
+    async fn busy_command_timeout_is_reported() -> TestResult {
+        let mut app = slow_chat_app(Duration::from_secs(5))?;
+        app.busy_jobs.set_timeout(Duration::from_millis(50));
+        app.busy_jobs.queue(BusyCommand {
+            raw: "/slow".to_owned(),
+            class: BusyAvailability::Immediate,
+        });
+        start_busy_work(&mut app);
+        let done = tokio::time::timeout(Duration::from_secs(5), app.busy_jobs.recv())
+            .await
+            .map_err(ctx("Busy-Ergebnis"))?
+            .ok_or(TestError::Missing("Busy-Ergebnis"))?;
+        apply_busy_job_done(&mut app, done);
+        assert!(history_plain(&app).contains("Zeitlimit überschritten"));
+        Ok(())
+    }
+
+    /// Der Warteschlangen-Block steht über dem Composer, solange Nachrichten
+    /// warten, und verschwindet, sobald sie ausgeliefert sind.
+    #[test]
+    fn queue_block_renders_until_delivery() -> TestResult {
+        let mut app = test_chat_app()?;
+        let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(60, 20))
+            .map_err(ctx("test terminal"))?;
+        let screen = |terminal: &ratatui::Terminal<ratatui::backend::TestBackend>| {
+            let buffer = terminal.backend().buffer();
+            (0..buffer.area.height)
+                .map(|y| {
+                    (0..buffer.area.width)
+                        .map(|x| buffer[(x, y)].symbol())
+                        .collect::<String>()
+                })
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+        app.pending_turns
+            .push_back("bitte danach prüfen".to_owned());
+        terminal
+            .draw(|frame| render_viewport(frame, &app, &Spinner::new(), None))
+            .map_err(ctx("draw"))?;
+        let with_queue = screen(&terminal);
+        assert!(
+            with_queue.contains("Wartet auf den nächsten Turn"),
+            "{with_queue}"
+        );
+        assert!(with_queue.contains("bitte danach prüfen"), "{with_queue}");
+
+        // Auslieferung an der Turn-Grenze (`run_loop` nimmt sie aus der FIFO).
+        let delivered = app.pending_turns.pop_front();
+        assert_eq!(delivered.as_deref(), Some("bitte danach prüfen"));
+        terminal
+            .draw(|frame| render_viewport(frame, &app, &Spinner::new(), None))
+            .map_err(ctx("draw"))?;
+        let after = screen(&terminal);
+        assert!(!after.contains("Wartet auf den nächsten Turn"), "{after}");
         Ok(())
     }
 
@@ -12356,10 +13039,12 @@ mod approval_arming_tests {
             ),
             "Ctrl+C muss den zweistufigen Beenden-Hinweis scharfstellen"
         );
-        assert!(
-            app.deferred_input.is_empty(),
-            "bereits eingereihte Eingaben müssen verworfen werden"
+        assert_eq!(
+            app.deferred_input.len(),
+            1,
+            "eingereihte Eingaben bleiben für die Auslieferung nach dem Abbruch"
         );
+        assert!(app.queue_kept_at.is_some());
         assert!(app.pending_host_permit.is_none());
         assert!(app.pending_host_permit_dialog.is_none());
         assert!(host_permit_shown_at.is_none());

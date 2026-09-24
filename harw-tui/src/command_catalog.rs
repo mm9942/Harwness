@@ -157,6 +157,12 @@ const MEMORY: &[SubcommandHint] = &[
     SubcommandHint::new("forget", "<name>", "Fakt löschen"),
     SubcommandHint::new("maintain", "", "Speicher aufräumen"),
     SubcommandHint::new("consolidate", "[--project|--global]", "Fakten verdichten"),
+    SubcommandHint::new(
+        "promote",
+        "<fact-id> [--project|--global] [--slug <slug>]",
+        "Fakt als Thema (provisional) übernehmen",
+    ),
+    SubcommandHint::new("topics", "", "Vorläufige Themen auflisten"),
 ];
 
 /// `/agent`, Grammatik aus `harw-ops/src/agent.rs`.
@@ -187,16 +193,31 @@ const SANDBOX_LEASE: &[SubcommandHint] = &[
     SubcommandHint::new("revoke", "", "Host-Freigabe sofort widerrufen"),
 ];
 
-/// `/workbench`, Grammatik aus `harw-ops/src/workbench.rs`.
+/// `/workbench`, Grammatik aus `harw-ops/src/workbench.rs`; jeder
+/// Subcommand akzeptiert `--scope=session|project|project:<slug>`.
 const WORKBENCH: &[SubcommandHint] = &[
-    SubcommandHint::new("show", "[--scope=…]", "Arbeitsfläche anzeigen"),
+    SubcommandHint::new(
+        "show",
+        "[--scope=session|project]",
+        "Arbeitsfläche anzeigen",
+    ),
     SubcommandHint::new("pin", "<pfad> [notiz]", "Datei anheften"),
     SubcommandHint::new("unpin", "<pfad>", "Datei lösen"),
     SubcommandHint::new("note", "<text>", "Notiz anhängen"),
     SubcommandHint::new(
+        "note",
+        "edit <n> <text> | rm <n>",
+        "Notiz bearbeiten oder löschen",
+    ),
+    SubcommandHint::new(
         "hypothesis",
         "add|confirm|reject <text>",
         "Hypothese anlegen oder entscheiden",
+    ),
+    SubcommandHint::new(
+        "retention",
+        "[keep|<tage>d] [--scope=project]",
+        "Aufbewahrung anzeigen oder setzen",
     ),
 ];
 
@@ -219,6 +240,11 @@ const KANBAN: &[SubcommandHint] = &[
     SubcommandHint::new("unblock", "<karte>", "Blockade aufheben"),
     SubcommandHint::new("done", "<karte>", "Karte erledigen"),
     SubcommandHint::new("archive", "<karte>", "Karte archivieren"),
+    SubcommandHint::new("edit", "<karte> <text>", "Kartentext ersetzen"),
+    SubcommandHint::new("comment", "<karte> <text>", "Kommentar anhängen"),
+    SubcommandHint::new("evidence", "<karte> <pfad|url>", "Beleg verknüpfen"),
+    SubcommandHint::new("approve", "<karte> [notiz]", "Worker-Karte freigeben"),
+    SubcommandHint::new("reject", "<karte> [grund]", "Worker-Karte ablehnen"),
 ];
 
 /// `/palace`, Grammatik aus `harw-ops/src/palace.rs` plus `list` (Vertrag).
@@ -230,13 +256,35 @@ const PALACE: &[SubcommandHint] = &[
         "<anfrage> [--max-hops=n] [--max=n]",
         "Graph durchsuchen",
     ),
-    SubcommandHint::new("promote", "<thema>", "Thema in den Palast übernehmen"),
+    SubcommandHint::new(
+        "promote",
+        "<thema>",
+        "Thema in den Palast übernehmen (established)",
+    ),
+    SubcommandHint::new(
+        "supersede",
+        "<alt> <neu> [--confirm]",
+        "Knoten durch Nachfolger ersetzen",
+    ),
+    SubcommandHint::new(
+        "edit",
+        "<id> <text…> [--confirm]",
+        "Knotentext ersetzen (neue Revision)",
+    ),
+    SubcommandHint::new("link", "<a> <b> [--confirm]", "Verweis a → b ergänzen"),
 ];
 
-/// `/dream` (Vertrag).
+/// `/dream`, Grammatik aus `harw-ops/src/dream.rs` (D5).
 const DREAM: &[SubcommandHint] = &[
     SubcommandHint::new("list", "", "Traumberichte auflisten"),
     SubcommandHint::new("show", "<id>", "Traumbericht anzeigen"),
+    SubcommandHint::new("run", "", "Traumlauf starten"),
+    SubcommandHint::new("status", "", "Stand des Traumlaufs anzeigen"),
+    SubcommandHint::new(
+        "review",
+        "[<id>] | <id> accept|reject <p-id> [grund]",
+        "Vorschläge prüfen, annehmen oder ablehnen",
+    ),
 ];
 
 /// `/learn`, Grammatik aus `harw-ops/src/learn.rs`: schlägt nur vor, jede
@@ -259,9 +307,15 @@ const DIARY: &[SubcommandHint] = &[
     SubcommandHint::new("today", "", "Heutige Einträge anzeigen"),
     SubcommandHint::new(
         "show",
-        "[agent] [--date=YYYY-MM-DD]",
-        "Einträge eines Tages anzeigen",
+        "[agent] [--date=YYYY-MM-DD | --from=… [--to=…]]",
+        "Einträge eines Tages oder Bereichs anzeigen",
     ),
+    SubcommandHint::new(
+        "search",
+        "<text> [--agent=<id>] [--from=…] [--to=…]",
+        "Tagebücher durchsuchen",
+    ),
+    SubcommandHint::new("agents", "", "Agenten mit Tagebuch auflisten"),
     SubcommandHint::new("note", "<text>", "Tagebuchnotiz schreiben"),
 ];
 
@@ -345,7 +399,7 @@ const HINT_TABLE: &[(&str, &str, &[SubcommandHint])] = &[
     ),
     (
         "memory",
-        "/memory [list|stats|recall|record|forget|maintain|consolidate] …",
+        "/memory [list|stats|recall|record|forget|promote|topics|maintain|consolidate] …",
         MEMORY,
     ),
     (
@@ -365,7 +419,7 @@ const HINT_TABLE: &[(&str, &str, &[SubcommandHint])] = &[
     ),
     (
         "workbench",
-        "/workbench [show|pin|unpin|note|hypothesis] …",
+        "/workbench [show|pin|unpin|note [edit|rm]|hypothesis|retention] [--scope=…] …",
         WORKBENCH,
     ),
     (
@@ -375,16 +429,24 @@ const HINT_TABLE: &[(&str, &str, &[SubcommandHint])] = &[
     ),
     (
         "palace",
-        "/palace [list|show <id>|search <anfrage>|promote <thema>]",
+        "/palace [list|show <id>|search <anfrage>|promote <thema>|supersede|edit|link] …",
         PALACE,
     ),
-    ("dream", "/dream [list|show <id>]", DREAM),
+    (
+        "dream",
+        "/dream [list|show <id>|run|status|review [<id>] [accept|reject <p-id>]]",
+        DREAM,
+    ),
     (
         "learn",
         "/learn [scan|note <text>|list [--all]|show <id>|accept <id>|reject <id>]",
         LEARN,
     ),
-    ("diary", "/diary [today|show [agent]|note <text>]", DIARY),
+    (
+        "diary",
+        "/diary [today|show [agent] [--date|--from/--to]|search <text>|agents|note <text>]",
+        DIARY,
+    ),
     (
         "matrix",
         "/matrix [start <szenario>|step|auto <n>|pause|inject|show|end|…]",
@@ -542,7 +604,7 @@ pub(crate) const FALLBACK_COMMANDS: &[&str] = &["mode", "matrix"];
 /// die Operation — Ersatz-Spezifikationen verschwinden also automatisch,
 /// sobald die Operation registriert ist.
 pub(crate) fn local_command_specs() -> Vec<CommandSpec> {
-    use BusyAvailability::{DeferredUntilTurnEnd as Deferred, Immediate};
+    use BusyAvailability::{DeferredUntilTurnEnd as Deferred, Immediate, Staged};
     use CommandDomain::{AgentTopology, Execution, Misc, SessionLifecycle};
     use PermissionTier::{Observer, Operator};
 
@@ -552,7 +614,7 @@ pub(crate) fn local_command_specs() -> Vec<CommandSpec> {
             "tools",
             Execution,
             Operator,
-            Immediate,
+            Deferred,
             "Werkzeuge anzeigen, ein-/ausschalten, Profil wählen",
             "",
         ),
@@ -576,7 +638,7 @@ pub(crate) fn local_command_specs() -> Vec<CommandSpec> {
             "exit",
             SessionLifecycle,
             Observer,
-            Immediate,
+            Deferred,
             "TUI beenden (wie /quit)",
             "/exit",
         ),
@@ -616,7 +678,7 @@ pub(crate) fn local_command_specs() -> Vec<CommandSpec> {
             "rename",
             SessionLifecycle,
             Operator,
-            Deferred,
+            Immediate,
             "Sitzung umbenennen",
             "/rename <titel>",
         ),
@@ -633,7 +695,7 @@ pub(crate) fn local_command_specs() -> Vec<CommandSpec> {
             "mode",
             SessionLifecycle,
             Operator,
-            Immediate,
+            Staged,
             "Interaktionsmodus anzeigen oder wechseln",
             "",
         ),
@@ -768,6 +830,29 @@ mod tests {
                 "end", "replay", "show", "list", "compare"
             ]
         );
+        assert_eq!(names("dream"), ["list", "show", "run", "status", "review"]);
+        assert_eq!(
+            names("palace"),
+            [
+                "list",
+                "show",
+                "search",
+                "promote",
+                "supersede",
+                "edit",
+                "link"
+            ]
+        );
+        assert_eq!(
+            names("diary"),
+            ["today", "show", "search", "agents", "note"]
+        );
+        assert!(names("memory").contains(&"promote"));
+        assert!(names("memory").contains(&"topics"));
+        for sub in ["edit", "comment", "evidence", "approve", "reject"] {
+            assert!(names("kanban").contains(&sub), "{sub}");
+        }
+        assert!(names("workbench").contains(&"retention"));
         assert!(subcommand_hints("no-such-command").is_empty());
     }
 

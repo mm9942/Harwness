@@ -130,6 +130,38 @@ impl std::fmt::Display for AgentSpawnError {
 }
 impl std::error::Error for AgentSpawnError {}
 
+/// Ein laufendes Kind hat eine Budget-Dimension erschöpft.
+///
+/// # Beschreibung
+/// Laufzeitfehler eines bereits gestarteten Kindes — ausdrücklich **kein**
+/// Spawn-Fehler: die Meldung beginnt deshalb nicht mit „agent spawn failed",
+/// sondern bleibt beim maschinenlesbaren Format
+/// `budget_exceeded: <dimension> (limit=<n>, used=<m>)`. Das Token-Budget
+/// erzeugt diesen Fehler nicht mehr: dort liefert der Spawner ein
+/// Teilergebnis mit `budget_exhausted = true` (siehe
+/// `harw_core::child_controller::ChildRunResult`). Übrig bleiben Wanduhr und
+/// Werkzeugaufrufe.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ChildBudgetExhausted {
+    /// Die erschöpfte Dimension (`"tokens"`, `"tool_calls"`, `"wall_time"`).
+    pub dimension: String,
+    /// Das Limit in der Einheit der Dimension.
+    pub limit: u64,
+    /// Der gemessene Verbrauch in derselben Einheit.
+    pub used: u64,
+}
+
+impl std::fmt::Display for ChildBudgetExhausted {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "budget_exceeded: {} (limit={}, used={})",
+            self.dimension, self.limit, self.used
+        )
+    }
+}
+impl std::error::Error for ChildBudgetExhausted {}
+
 #[cfg(test)]
 mod tests {
     use super::*;

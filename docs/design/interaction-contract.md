@@ -117,63 +117,194 @@ ones in §5.1/§5.3 of the TUI annex, following the same "structured
 Supersedes TUI annex §2.6 (which reserved the names only). Tiers use the
 TUI annex's `PermissionTier`; parity uses `CommandScope`.
 
-**`/memory`** — durable cross-session agent memory (core + topic layers).
+> **Ist-Stand Runde 4 (2026-09-24).** The tables below describe the grammar
+> the operations in `harw-ops/src/{memory,diary,dream,palace,workbench,kanban,learn,matrix}/…`
+> actually parse. Every operation is declared `permission = "operator"`; the
+> Tier column keeps the finer read/write/maintenance distinction of the
+> original contract. Parity is declared **per operation** in code (one
+> `visibility` per `#[operation]`), so a per-subcommand `-` below means
+> "meaningless or refused from a channel", not a separate registry entry.
+> The `busy` column uses the classes from §2.6.3 (`sofort` = `Immediate`,
+> `—` = deferred until the running turn ends). Model-facing read tools for
+> the same surfaces are listed at the end of this section.
+>
+> The read forms of `/kanban`, `/dream` and `/diary` carry
+> `busy_subcommands` on their operations and run immediately during a turn;
+> writing forms defer. The classification table test in
+> `harw-tui/src/command_exec.rs` (`EXPECTED_BUSY_CLASSES`) is authoritative.
 
-| Subcommand | Args | Tier | Parity | Notes |
-|---|---|---|---|---|
-| `/memory recall` | `<query> [--tags=t1,t2] [--kind=core\|topic\|palace] [--max=n]` | Op | Y | Bounded `RecallQuery` (§2.3, knowledge annex); prints hits with provenance |
-| `/memory write` | `<topic> <text>` | Op | Y | Appends/creates a topic memory file in the caller's authored scope; never touches core memory directly |
-| `/memory show` | `<ArtifactRef>` | Obs | Y | Renders one artifact's frontmatter + body |
+**`/memory`** — durable cross-session agent memory (v2 HOT/WARM/COLD layer
+plus the v3 fact store; `harw-ops/src/memory.rs`). Op parity: `Y`.
 
-**`/diary`** — per-agent narrative log.
+| Subcommand | Args | Tier | Parity | busy | Notes |
+|---|---|---|---|---|---|
+| `/memory` / `list` | — | Obs | Y | — | HOT tier (≤100 lines) |
+| `/memory stats` | — | Obs | Y | — | Counters over HOT/WARM/COLD and open signals |
+| `/memory recall` | `<stichwort…>` | Obs | Y | — | Searches project facts before global facts, with provenance |
+| `/memory record` | `<text…> [--project\|--global]` | Op | Y | — | Writes a fact (default `--project`) |
+| `/memory forget` | `<name>` | Op | Y | — | Removes the fact from project and global roots |
+| `/memory promote` | `<fact-id> [--project\|--global] [--slug <slug>]` | Op | Y | — | **Runde 4, bridge fact → topic.** Writes `knowledge/topics/<slug>.md` as palace status `provisional` with origin `{kind: "fact", …}`; never overwrites an existing topic (use `--slug`). `established` only via `/palace promote`. |
+| `/memory maintain` | — | Maint | Y | — | Idempotent v2 consolidation |
+| `/memory consolidate` | `[--project\|--global]` | Maint | Y | — | Deterministic phase-2 consolidation only |
+| `/memory topics` | — | Obs | Y | — | `provisional` topics visible to the caller as `{slug, title, status, origin}` (source for the promote offer) |
 
-| Subcommand | Args | Tier | Parity | Notes |
-|---|---|---|---|---|
-| `/diary show` | `[AgentRef] [--date=YYYY-MM-DD]` | Obs | Y | Renders one day's entries; bare form is caller's own diary, today |
-| `/diary note` | `<text>` | Op | R | Out-of-band append outside the automatic end-of-session/compaction triggers; channel form is plain text only, rate-limited the same as any other write path |
+The original `/memory write <topic> <text>` and `/memory show <ArtifactRef>`
+were not built: topics are created through `/memory promote` or an accepted
+dream suggestion, and read through `/palace show`.
+
+**`/diary`** — per-agent narrative log (`harw-ops/src/diary.rs`). Op parity: `R`.
+
+| Subcommand | Args | Tier | Parity | busy | Notes |
+|---|---|---|---|---|---|
+| `/diary` / `today` | — | Obs | R | sofort | Caller's own diary, today (UTC) |
+| `/diary show` | `[AgentRef] [--date=YYYY-MM-DD]` | Obs | R | sofort | One day |
+| `/diary show` | `[AgentRef] --from=YYYY-MM-DD [--to=YYYY-MM-DD]` | Obs | R | sofort | **Runde 4.** Range view (bounded number of days); not combinable with `--date` |
+| `/diary search` | `<text> [--agent=<id>] [--from=…] [--to=…]` | Obs | R | sofort | **Runde 4.** Case-insensitive full-text search over the structured entries of all visible diaries; bounded hits, newest first |
+| `/diary note` | `<text>` | Op | R | — | Out-of-band entry (`DiaryTrigger::Manual`) |
+| `/diary agents` | — | Obs | R | sofort | Agents with diary entries (`{"agents":[…]}`); a non-operator caller only sees itself. Used by the browser's agent picker |
 
 The `#` prefix shortcut (§3, TUI annex) is sugar for `/diary note` on both
 front-ends — this document confirms that mapping is exact, not merely
 similar, so `#` and `/diary note` share one code path and one audit trail.
 
-**`/dream`** — idle-time consolidation, a governed `harw-job-runtime` job.
+Automatic entries (Runde 4, D3) do not go through the command:
+`harw-runtime/src/diary_wiring.rs` records `compaction` (after a
+model-summarised compaction) and `end-of-session` (close, quit, `/new`,
+`/resume`, one-shot end) for the root session's agent; a dream run adds
+`dream-reflection` entries only when a `diary_reflection` suggestion is
+accepted. Visibility is the real caller's (operator → `OperatorOnly`, agent
+→ `SelfOnly`); an invisible day reads like a missing one.
 
-| Subcommand | Args | Tier | Parity | Notes |
-|---|---|---|---|---|
-| `/dream run` | `[--now] [--budget=Duration]` | Maint | - | Enqueues a dream job; idle-time default, `--now` forces immediate scheduling |
-| `/dream status` | `[--mine]` | Obs | Y | Lists running/recent dream jobs as governed work items — same shape as `/kanban` |
-| `/dream review` | `<WorkId> [--approve=ArtifactRef,...] [--reject=ArtifactRef,...]` | Maint | - | Opens a `DreamReport`; per-proposal approve/reject is the only path a proposal becomes a committed artifact |
+**`/dream`** — idle-time reflection as a governed job (`harw-ops/src/dream.rs`,
+`harw-ops/src/dream_run.rs`). Op parity: `R`.
 
-**`/palace`** — the linked long-term memory graph.
+| Subcommand | Args | Tier | Parity | busy | Notes |
+|---|---|---|---|---|---|
+| `/dream` / `list` | — | Obs | R | sofort | Visible dream reports, newest first, with proposal counts |
+| `/dream show` | `<id>` | Obs | R | sofort | One report; `<id>` = `dream/<date>/<work-id>`, `<date>/<work-id>` or an unambiguous work id |
+| `/dream run` | — | Maint | R | — | **Runde 4.** Starts one run through the same core as the gateway scheduler (lock, `JobKind::Dream` in the job ledger, structured JSON output with one repair turn, budget from `[dream] budget`, maintenance). Only where the runtime provides a dream launcher (TUI, one-shot) |
+| `/dream status` | — | Obs | R | sofort | **Runde 4.** Scheduler state from `dreams/state.json` and `[dream]`: enabled, trigger, last/next run, running?, ledger state of the last job, open suggestions |
+| `/dream review` | `[<id>]` | Obs | R | — | **Runde 4.** Open suggestions of all reports or one report |
+| `/dream review` | `<id> accept\|reject <p-id> [grund…]` | Maint | R | — | **Runde 4.** Decides one suggestion. `accept` runs the write path: `topic`/`palace` → topic `provisional` (as `/memory promote`), `diary_reflection` → diary entry, `skill_idea`/`agent_idea` → a `/learn` proposal (never live), `follow_up`/`maintenance` → status only |
 
-| Subcommand | Args | Tier | Parity | Notes |
-|---|---|---|---|---|
-| `/palace show` | `<ArtifactRef>` | Obs | Y | Node body + outgoing links + computed backlinks |
-| `/palace search` | `<query> [--max-hops=n] [--max=n]` | Obs | Y | Graph-aware recall variant; bounded per §2.3 of the knowledge annex |
-| `/palace promote` | `<ArtifactRef>` | Maint | - | Starts topic→palace promotion (knowledge annex §2.5); lands as an immediate write only if the caller's scope authorizes direct promotion, else a pending review item |
+The earlier sketch `/dream run [--now] [--budget=Duration]` and
+`/dream review <WorkId> [--approve=…] [--reject=…]` is replaced by the grammar
+above; the budget is configuration (`[dream]`, `config-scopes.md` §1.18),
+not a flag. A dream never writes knowledge directly: every suggestion is
+stored `pending` in the report's structured side file until a human decides.
 
-**`/workbench`** — persistent scratch/working-set surface. Parity is decided
-per subcommand rather than for the surface as a whole (this resolves TUI
-annex open question §7.3 for `/workbench` specifically — see §6, item 3):
+**`/palace`** — the linked long-term memory graph (`harw-ops/src/palace.rs`).
+Op parity: `Y`.
 
-| Subcommand | Args | Tier | Parity | Notes |
-|---|---|---|---|---|
-| `/workbench pin` | `<path> [note]` | Op | - | Requires local filesystem path resolution against the TUI's own working directory; meaningless from a remote channel |
-| `/workbench note` | `<text>` | Op | R | Pure text append, no path resolution — safe to reduce-expose on channels |
-| `/workbench hypothesis` | `add\|confirm\|reject <text>` | Op | R | Structured list mutation, no path resolution |
-| `/workbench` (bare) | `[--scope=session\|project:<slug>]` | Obs | - | Opens the always-visible TUI panel (knowledge annex §5.2); has no channel analogue by construction |
+| Subcommand | Args | Tier | Parity | busy | Notes |
+|---|---|---|---|---|---|
+| `/palace` / `list` | — | Obs | Y | sofort | All visible nodes |
+| `/palace show` | `<ArtifactRef>` | Obs | Y | sofort | Node body + outgoing links + computed backlinks (filtered to visible sources) |
+| `/palace search` | `<query> [--max-hops=n] [--max=n]` | Obs | Y | sofort | Graph-aware recall; bounded per §2.3 of the knowledge annex |
+| `/palace promote` | `<topic-ref>` | Maint | Y | — | Topic → palace node, lands `established` (the explicit command is the review) |
+| `/palace supersede` | `<alt> <neu> [--confirm]` | Maint | Y | — | **Runde 4.** `alt` becomes `superseded` and points to `neu` |
+| `/palace edit` | `<id> <text…> [--confirm]` | Maint | Y | — | **Runde 4.** Replaces the body; `[[wikilinks]]` become frontmatter links |
+| `/palace link` | `<a> <b> [--confirm]` | Maint | Y | — | **Runde 4.** Adds a `[[palace/b]]` reference to `a` |
 
-**`/kanban`** — visual board projection of the work graph.
+Review gate for the Runde-4 write paths: operator only (an agent principal
+gets `NotAvailable`); a `provisional` node may change freely; a change to an
+`established` node is a new revision and requires `--confirm` (the previous
+version is appended to `palace/<slug>.history.jsonl`); a `superseded` node is
+frozen. Nodes are never deleted. Index reads use an mtime-invalidated cache.
 
-| Subcommand | Args | Tier | Parity | Notes |
-|---|---|---|---|---|
-| `/kanban create` | `<title> --lane=<LaneRef> [--assignee=<AgentRoleRef>] [--parent=<CardRef>]` | Op | Y | Creates a card; already a `WorkId` if the lane is a worker lane and the card is created `Ready` |
-| `/kanban show` | `<CardRef>` | Obs | Y | Full card state plus its `WorkId`'s job history |
-| `/kanban claim` | `<CardRef>` | Op | Y | Thin wrapper over `harw-job-runtime::claim`; subject to the `RiskLevel::High` approval gate (knowledge annex §6.4) |
-| `/kanban complete` | `<CardRef>` | Op | Y | Moves to `Done`, or to `Blocked{ReviewRequired}` if the card is tagged `review-required` |
-| `/kanban block` | `<CardRef> --reason=<Dependency\|NeedsInput\|Capability\|Transient\|ReviewRequired>` | Op | Y | |
-| `/kanban unblock` | `<CardRef>` | Op | Y | |
-| `/kanban archive` | `<CardRef>` | Maint | R | Rejected outright if unresolved child cards exist (structural invariant, not just a permission gate); reduced on channels because the dependent-card check is easiest to review with the full board visible |
+**`/workbench`** — persistent scratch/working-set surface
+(`harw-ops/src/workbench.rs`). Op parity: `R` (the operation carries one
+visibility; `pin` and the bare panel are still meaningless from a channel).
+
+| Subcommand | Args | Tier | Parity | busy | Notes |
+|---|---|---|---|---|---|
+| `/workbench` / `show` | `[--scope=session\|project\|project:<slug>]` | Obs | - | sofort | Panel text plus structured data: pins with status (`present\|changed\|missing\|not_a_file`) and preview, hypotheses, notes |
+| `/workbench pin` | `<path> [note]` | Op | - | — | Resolved against the TUI's working directory |
+| `/workbench unpin` | `<path>` | Op | - | — | |
+| `/workbench note` | `<text>` | Op | R | — | Appends to `NOTES.md` |
+| `/workbench note edit` | `<n> <text>` | Op | R | — | **Runde 4.** `<n>` = `#<n>`/`<n>` (1-based) or the note's timestamp |
+| `/workbench note rm` | `<n>` | Op | R | — | **Runde 4.** |
+| `/workbench hypothesis` | `add\|confirm\|reject <text>` | Op | R | — | `confirm`/`reject` by exact text or `#<n>` |
+| `/workbench retention` | `[keep\|<tage>d]` | Op | R | — | **Runde 4.** Shows or sets the scope's retention; defaults: session scopes expire after 14 days without change, project scopes `keep` |
+
+Every subcommand accepts `--scope=` (also `--scope <s>`); without it the
+active session is meant, `--scope=project` without a slug means the project
+of the working directory. Expired scopes are pruned by the maintenance step
+of a dream run.
+
+**`/kanban`** — visual board projection of the work graph
+(`harw-ops/src/kanban.rs`). Op parity: `Y`. `--board=<b>` is accepted
+globally; `LaneRef` may be `board:<b>/<lane>`.
+
+| Subcommand | Args | Tier | Parity | busy | Notes |
+|---|---|---|---|---|---|
+| `/kanban` / `list` / `show` | `[--board=<b>] [--all]` | Obs | Y | sofort | Cards per lane (worker lanes carry role and risk); `--all` includes archived |
+| `/kanban boards` | — | Obs | Y | sofort | All boards |
+| `/kanban create` (`add`) | `<title> [--lane=<LaneRef>] [--assignee=<AgentRoleRef>] [--parent=<CardRef>]… [--tag=<t>]… [--board=<b>]` | Op | Y | — | Without `--lane` → `triage`; `--assignee=<role>` routes to `worker/<role>` and creates the job (`Todo`, `Ready` once all parents are `Done`) |
+| `/kanban show` | `<CardRef>` | Obs | Y | sofort | Full card state, ledger snapshot, comments, evidence, history, result |
+| `/kanban edit` | `<CardRef> <text…>` | Op | Y | — | **Runde 4.** Replaces the card body |
+| `/kanban comment` | `<CardRef> <text…>` | Op | Y | — | **Runde 4.** Comment with time and author |
+| `/kanban evidence` | `<CardRef> <pfad\|url>` | Op | Y | — | **Runde 4.** Evidence reference (`evidence: [..]`) |
+| `/kanban approve` | `<CardRef> [notiz…]` | Op | Y | — | **Runde 4.** Releases a worker card waiting in `blocked (AwaitingApproval)`; the job worker then starts the role agent |
+| `/kanban reject` | `<CardRef> [grund…]` | Op | Y | — | **Runde 4.** Archives the waiting card (job cancelled) |
+| `/kanban todo` / `ready` | `<CardRef>` | Op | Y | — | `Triage → Todo`, `Todo → Ready` (parent gate) |
+| `/kanban claim` | `<CardRef>` | Op | Y | — | Explicit operator claim; the command itself is the approval (`ApprovedOnce`), risk from the role table |
+| `/kanban complete` (`done`) | `<CardRef>` | Op | Y | — | |
+| `/kanban block` | `<CardRef> <BlockKind>` (also `--reason=`) | Op | Y | — | |
+| `/kanban unblock` | `<CardRef>` | Op | Y | — | Refused on cards awaiting approval, so unblocking is never mistaken for approval |
+| `/kanban archive` | `<CardRef>` | Maint | Y | — | |
+| `/kanban move` | `<CardRef> <todo\|ready\|running\|done\|blocked\|archived> [<BlockKind>]` | Op | Y | — | TUI alias that picks the matching lifecycle transition |
+
+Kanban worker (Runde 4, D2): the job worker of `harw serve` picks up `Ready`
+cards in worker lanes but **never starts an agent without approval**: it
+blocks the card with `AwaitingApproval` and records "Freigabe angefragt" in
+the history. Risk per role comes from the role's registry profile (read-only
+roles `Low`, writing roles `Medium`, process/secret/plugin rights and unknown
+roles `High`, fail-closed). Result and job history are written to the card.
+Dream runs are recorded as `JobKind::Dream` in the job ledger. A mirror card
+on a `dream` board (plan D5) was **deliberately dropped**: nothing is put on
+the kanban board automatically; Kanban is used only on the user's explicit
+request. `kanban.list`/`kanban.show` are offered only to the UIA root and the
+root orchestrator, always ask for approval, and their tool descriptions carry
+that usage rule.
+
+**`/learn`** — learning loop, proposals only (`harw-ops/src/learn.rs`,
+Runde 3). Op parity: `R`.
+
+| Subcommand | Args | Tier | Parity | busy | Notes |
+|---|---|---|---|---|---|
+| `/learn` / `scan` | — | Op | R | — | Scans the current session and files proposals |
+| `/learn note` | `<text…> [--target memory\|skill\|agent]` | Op | R | — | Proposal from text; `skill` goes through the skill-proposal store (`/skills accept`) |
+| `/learn list` | `[--all]` | Obs | R | — | Open (or all) proposals |
+| `/learn show` | `<id>` | Obs | R | — | |
+| `/learn accept` / `reject` | `<id> [grund…]` | Op | R | — | **Marks only** (targets `memory`/`agent`) and names the command the operator runs to apply it; `/learn` never writes a fact, skill, agent or context program itself |
+
+**`/matrix`** — matrix game (`harw-ops/src/matrix/mod.rs`, Runde 3; design in
+`matrix-game.md`). Op parity: `R`. Only the Runde-3 additions are listed;
+the full grammar (`step`, `auto N`, `pause`, `inject`, `override`, `veto`,
+`reveal`, `fork`, `end`, `replay`, `show`, `list`) is in the module doc.
+
+| Subcommand | Args | Tier | Parity | busy | Notes |
+|---|---|---|---|---|---|
+| `/matrix start` | `<szenario-id\|pfad> [--seed N] [--package <id>]` | Op | R | — | `--package` loads an inject package from the scenario library |
+| `/matrix compare` | `<lauf> <lauf> […]` | Obs | R | — | Compares two or more runs (e.g. with and without a package) |
+| `/matrix show` / `list` | — | Obs | R | sofort | Panel data (also F9) |
+
+**Model-facing read tools (Runde 4).** Agents may *read* the knowledge
+surfaces through read-only tools; all writes stay operator commands or pass
+through review:
+
+| Tool | Scope |
+|---|---|
+| `workbench.show` | The session's own workbench (plus the project scope of the bound workspace); a context provider also places pins and hypotheses, capped, into the session context |
+| `diary.read` | Only the calling agent's own entries, by date range, capped |
+| `palace.search`, `palace.recall` | Only `established` nodes, bounded hops |
+| `kanban.list`, `kanban.show` | Read-only board and card view |
+
+`workbench.note`/`workbench.hypothesis` remain the only model-side writes
+to a knowledge surface (no path pinning). The read tools are registered only
+for profiles whose rights admit them (`ReadWorkspace`); `NoTools` and the
+Telegram workspace profile (`WorkspaceEdit`) get none of them.
 
 ### 2.3 `/plugins` — extension bundle management
 
@@ -421,36 +552,97 @@ Unterbefehl dieser beiden Operationen ist sofort verfügbar, siehe §2.6.3.
 
 ### 2.6.3 Busy-Verfügbarkeit während eines laufenden Turns
 
-Grammatik-Metadatum `OperationMeta.busy` (`BusyAvailability::Immediate` vs.
-`DeferredUntilTurnEnd`, Default) ist auf allen 13 vorgesehenen Operationen
-gesetzt und `harw-tui`'s `CommandSpec` übernimmt es bereits:
+Stand Runde 4, Teil H (`harw-operations/src/operation.rs`,
+`harw-tui/src/command_exec.rs`, `harw-tui/src/app.rs`,
+`harw-tui/src/app/busy_queue.rs`).
 
-| Sofort während eines Turns | Bis Turn-Ende eingereiht (Auswahl) |
+**Drei Klassen** (`BusyAvailability`):
+
+| Klasse | Verhalten während eines Turns |
 |---|---|
-| `/status` `/ps` `/usage` `/help` `/diff` `/work` `/review` `/model show`/`list` `/provider show`/`list` (inkl. bare `/provider`) `/approve` `/deny` `/cancel` `/stop` `/sandbox-lease` (`status`/`revoke`) | `/mode` `/effort` `/uia-effort` `/uia-model` `/uia-worker-model` `/uia-provider` `/provider-concurrency` `/permissions` `/plugins` `/skills` `/new` `/compact` `/memory` `/export` `/quit` `/model switch`/bare `/model` `/provider test` |
+| `Immediate` | läuft sofort; reine Lese- oder Steuerbefehle ohne Sitzungsänderung über die Turn-Grenze |
+| `Staged` | läuft sofort, die Änderung wird aber nur im `SessionController` bzw. in einer Config-Zelle vorgemerkt und gilt **ab dem nächsten Turn**; Rückmeldung „— gilt ab nächstem Turn“ |
+| `DeferredUntilTurnEnd` (Vorgabe) | wird eingereiht und nach Turn-Ende über denselben autorisierten Befehlskanal ausgeführt |
+
+**Deklaration an der Operation.** `#[operation(command(busy = "…",
+busy_subcommands = "…"))]`: `busy` ist die Klasse der Operation,
+`busy_subcommands` überschreibt sie je Unterbefehl (erstes Argument-Token),
+z. B. `busy_subcommands = "show=immediate, list=immediate, -=immediate"`
+(`-` steht für die bare Form). `Operation::busy_for(args)` und
+`BusySubcommand::resolve` werten das aus; die früher in
+`busy_availability_for` fest verdrahteten Sonderfälle für `/model` und
+`/provider` sind damit entfallen.
+
+**Einstufung (Auszug, maßgeblich ist `EXPECTED_BUSY_CLASSES` in
+`harw-tui/src/command_exec.rs`, ein Tabellentest über den ganzen Katalog):**
+
+| Klasse | Befehle |
+|---|---|
+| `Immediate` | `/help` `/status` `/ps` `/usage` `/diff` `/work` `/review` `/approve` `/deny` `/cancel` `/stop` `/agent` `/models` `/attach` `/sandbox-lease` `/provider-concurrency`; `/provider` (außer `test`); `/plugins` (außer `install`/`activate`/`uninstall`); lesende Formen: `/permissions` bare/`show`/`mode`/`set`, `/skills` bare/`list`/`show`, `/workbench` bare/`show`, `/diary` bare/`show`/`today`/`search`, `/palace` bare/`list`/`show`/`search`, `/matrix show`/`list`, `/model show`/`list`, `/effort`/`/mode`/`/uia-*` bare bzw. `show`/`list`; bei aktivem Planungs-Gate `/plan` bare/`inspect`/`ready`/`waves` und `/goal` bare/`show`/`check`. TUI-lokal: `/keys` `/whoami` `/verbose` `/agents` `/rename` |
+| `Staged` | `/model` (bare mit Picker und `switch <id>`), `/effort`, `/mode`, `/uia-model`, `/uia-worker-model`, `/uia-provider`, `/uia-effort` — jeweils die ändernden Formen |
+| `DeferredUntilTurnEnd` | `/compact` `/tools` `/new` `/resume` `/sessions` `/clear` `/quit` `/exit` `/export` `/add-workdir` `/retry` `/memory` `/learn` `/context-proposal` `/bug-report`; `/provider test`; `/permissions allow`/`deny`/`remove`; `/matrix` außer `show`/`list`; `/research*`, `/explore`, `/analyze`; alle schreibenden Unterbefehle von `/workbench`, `/kanban`, `/diary`, `/palace`, `/dream` |
+
+Ein `/provider switch` gibt es nicht (nur `show`/`list`/`test`); der
+Anbieterwechsel läuft über `/model` bzw. den Modell-Picker.
+
+**Nachzügler (beim Schreiben noch offen):** Für `/kanban`
+(`list`/`show`/`boards`/bare) und `/dream` (`list`/`show`/`status`/bare) sind
+laut Plan die lesenden Formen `Immediate`; die `busy_subcommands` waren an den
+beiden Operationen noch nicht gesetzt, beide wurden deshalb vollständig
+zurückgestellt.
+
+**TUI-Ablauf** (`route_busy_command` in `harw-tui/src/app.rs`):
+
+1. Zuerst der lokale Abfang (`local_intercept_for`). Busy-sichere Abfänge
+   wirken sofort: Overlays und Ansichten, Modell- und Effort-Picker,
+   UIA-Worker-Picker, Agentenbaum, Panels, ausführliche Anzeige,
+   Systemzeilen, Umbenennen. Zurückgestellt bleiben Sitzungsauswahl,
+   Transkript leeren und `Rewrite`.
+2. Sonst `busy_availability_for`: `Immediate`/`Staged` laufen als eigener
+   Tokio-Task mit geklonten `Arc`s (`BusyJobs`), Zeitlimit 60 s; der
+   Busy-`select!` wartet nie auf sie, Streaming und Freigaben laufen weiter.
+   Das Ergebnis erscheint als Systemzeile „<befehl> (während Turn)“, bei
+   `Staged` mit dem Zusatz „— gilt ab nächstem Turn“. Ansichten öffnen als
+   Overlay bzw. Panel.
+3. Alles andere wird als Paste+Enter in `deferred_input` zurückgestellt.
+
+Während eines Turns bekommen offene Overlays die Tasten
+(`route_busy_overlay_key`); ein aus einem Overlay oder Picker erzeugter
+Befehl wird neu eingestuft (`Staged` → Controller sofort vormerken, nie
+`apply_to_session` mitten im Turn). Esc schließt dort zuerst das Overlay,
+ohne den Turn abzubrechen. Ausstehende Datenabrufe offener Ansichten laufen
+auch im Busy-Pfad (`spawn_busy_fetches`), damit sich Ansichten füllen.
+
+**Sichtbare Warteschlange.** Während eines Turns abgeschickte Nachrichten
+(`pending_turns`) stehen als Block „Wartet auf den nächsten Turn (N)“ über dem
+Composer (je Nachricht höchstens 3 Zeilen, insgesamt höchstens 10). Sie
+bleiben dort, bis sie im nächsten Turn ausgeliefert werden, und erscheinen
+dann normal im Verlauf; das gilt auch nach einem Abbruch (§2.6.4). Alt+↑ holt
+die zuletzt eingereihte Nachricht zurück in den Composer.
 
 `/cancel` und `/stop` wirken auf den `JobStore` (Hintergrund-Jobs), **nicht**
-auf den laufenden Turn selbst — dafür bleibt Ctrl+C exklusiv zuständig (siehe
+auf den laufenden Turn selbst — dafür sind Ctrl+C und Esc zuständig (siehe
 §2.6.4).
 
-**Fertig:** Die Metadaten-Verdrahtung (`harw-ops`,
-`harw-tui/src/command.rs`/`registry.rs`) sowie der eigentliche Sofort-Dispatch
-in der TUI (`queue_busy_key` in `harw-tui/src/app.rs`, delegiert an
-`busy_availability_for`/`dispatch_slash_command` in
-`harw-tui/src/command_exec.rs`) sind vollständig verdrahtet. `queue_busy_key`
-verzweigt bei jedem abgeschickten Slash-Befehl auf `busy_availability_for`:
-`BusyAvailability::Immediate` läuft sofort über `dispatch_slash_command`,
-alles andere landet weiterhin in `deferred_input`. `busy_availability_for`
-verfeinert `/model` und `/provider` zusätzlich unterhalb der
-`OperationMeta`-Ebene (§2.6.1, Anmerkung zur Granularität): nur `show`/`list`
-sind tatsächlich sofort, `switch` und `test` bleiben eingereiht.
-
-### 2.6.4 Ctrl+C — harter Interrupt
+### 2.6.4 Ctrl+C und Esc — Interrupt ohne Verlust der Warteschlange
 
 Nutzerauftrag: Ctrl+C soll ein echter harter Interrupt sein (Modellaufruf,
 Shell-/Sandbox-Prozesse, Kind-Agenten), nicht nur ein kooperativ geprüftes
-Signal.
+Signal. Runde 4 (Teil F): Ein Abbruch verwirft keine bereits abgeschickten
+Nachrichten mehr.
 
+- **Warteschlange bleibt (Runde 4, Teil F):** Ctrl+C und Esc brechen nur den
+  laufenden Turn ab (`interrupt_turn` in `harw-tui/src/app.rs`). Während des
+  Turns abgeschickte Nachrichten und Befehle (`pending_turns`,
+  `deferred_input`) bleiben eingereiht und werden direkt nach dem Abbruch an
+  der Turn-Grenze ausgeliefert; die Statuszeile zeigt kurz „Warteschlange
+  wird gesendet“ (`queue_kept_at`). Das gilt auch, wenn beim Abbruch ein
+  Freigabe- oder Host-Permit-Dialog offen ist. Bis Runde 3 verwarf Ctrl+C
+  die Warteschlange.
+- **Esc:** schließt zuerst ein offenes Popup bzw. Overlay und lässt den
+  Composer-Text stehen. Ist nichts offen und läuft ein Turn, unterbricht Esc
+  ihn wie ein erster Ctrl+C-Druck, scharft aber **kein** Beenden — Esc
+  schließt nie die App.
 - **Modellaufruf:** `harw-core/src/turn_loop.rs` racet den Modellaufruf
   gegen `CancelToken::cancelled()` (`tokio::select!`, `biased`); ein Treffer
   **und** ein `Err(ModelError::Cancelled)` aus dem Provider (racet dort
@@ -471,12 +663,11 @@ Signal.
 - **Doppel-Tap Idle/Busy:** `ChatApp::pending_quit`/`hard_quit_requested`
   (`harw-tui/src/app.rs`) vereinheitlichen den `QuitArm`/
   `QUIT_HINT_WINDOW`-Mechanismus (2 Sekunden Fenster) über Idle- und
-  Busy-Pfad: `handle_busy_event` cancelt beim ersten Ctrl+C-Druck den
-  laufenden Turn kooperativ (`active_cancel.cancel(...)`) und armt
-  `pending_quit`; ein zweiter Druck derselben Taste binnen des Fensters setzt
-  `hard_quit_requested`, das `run_loop` direkt nach dem laufenden
-  `run_turn_streaming(...)`-Aufruf prüft und dann sofort beendet — derselbe
-  Ausgang wie `HarwEvent::Quit` im Idle-Pfad. **Fertig.**
+  Busy-Pfad: der erste Ctrl+C-Druck im Busy-Pfad bricht den laufenden Turn
+  kooperativ ab und armt `pending_quit`; ein zweiter Druck derselben Taste
+  binnen des Fensters setzt `hard_quit_requested`, das `run_loop` direkt
+  nach dem laufenden Turn prüft und dann sofort beendet — derselbe Ausgang
+  wie `HarwEvent::Quit` im Idle-Pfad. **Fertig.**
 
 ### 2.6.5 Reasoning-Effort-Standards (Rangfolge)
 

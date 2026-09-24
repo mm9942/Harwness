@@ -37,6 +37,16 @@ admitted = [
   "explore.projects",
   "explore.relations",
   "explore.find",
+  # Lesende Wissenswerkzeuge (Plan Teil D, Entscheidung der Nutzerin
+  # „Agenten dürfen Workbench, Palace und Diary lesen“): nur lesend,
+  # `ReadWorkspace`. Die Composition-Root montiert sie, sobald ein
+  # Wissensspeicher existiert — siehe
+  # `harw_registry_defaults::profile::knowledge_tools_for_role`. Kanban
+  # bleibt der UIA-Wurzel und dem Root-Orchestrator vorbehalten.
+  "workbench.show",
+  "diary.read",
+  "palace.search",
+  "palace.recall",
 ]
 # `ReadOnlyExplore` registriert zusaetzlich `web.fetch`/`web.search` fuer den
 # `explorer` (Nutzerentscheidung "der Explorer durchsucht auch das Internet").

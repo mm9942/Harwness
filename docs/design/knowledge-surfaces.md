@@ -4,13 +4,45 @@ Status: design draft. No code exists yet for `harw-knowledge`, `harw-session-sto
 `harw-job-runtime`, `harw-catalog`, or `harw-policy` — this document specifies the
 shape they must have before implementation starts.
 
-> **Ist-Stand (2026-09)**: The "no code exists yet" claim above is outdated.
-> `harw-knowledge`, `harw-session-store`, `harw-job-runtime`, and `harw-catalog`
-> all exist in the tree. Store, index, recall, and visibility are implemented.
-> `ArtifactKind` has 12 variants (more than the 8 sketched in §8.1). Diary,
-> workbench, and kanban exist only as types — no callers wire them up yet.
-> `harw-policy` still does not exist as a crate; cross-tree visibility
-> enforcement (referenced throughout §7) remains an open gap.
+> **Ist-Stand (2026-09-24, Runde 4).** The "no code exists yet" line above is
+> historical. `harw-knowledge`, `harw-session-store`, `harw-job-runtime` and
+> `harw-catalog` exist; store, index, recall and visibility are implemented,
+> and `ArtifactKind` has more variants than the 8 sketched in §8.1. All five
+> surfaces are wired as operator commands in `harw-ops` and registered in
+> `register_all` (grammar: `interaction-contract.md` §2.2):
+>
+> - **Common base (D0):** one shared argument parser
+>   (`harw-ops/src/knowledge_args.rs`); cross-process file locks
+>   (`harw-knowledge/src/lock.rs`, `fs4` advisory `flock`/`LockFileEx` on a
+>   hidden `.<name>.lock` neighbour, with timeout) for diary appends, kanban
+>   cards/boards, workbench manifests and palace nodes; structured side files
+>   (diary `.jsonl`, dream report data) instead of re-parsing Markdown; reads
+>   use the real caller's principal (operator → `OperatorOnly`, agent →
+>   `SelfOnly`, fail-closed); live updates via
+>   `AgentEventKind::Knowledge { area, id }` on the `AgentEventHub`.
+> - **Workbench (D1):** note edit/remove, per-scope retention, read tool
+>   `workbench.show` and a context provider for pins and hypotheses.
+> - **Kanban (D2):** worker lanes are served by the job worker, but a card
+>   never starts an agent without `/kanban approve`; risk per role; edit,
+>   comments, evidence, history and result on the card; read tools
+>   `kanban.list`/`kanban.show`.
+> - **Diary (D3):** automatic `compaction` and `end-of-session` entries
+>   (`harw-runtime/src/diary_wiring.rs`), range view and search, read tool
+>   `diary.read` (own entries only), retention `[knowledge.diary]
+>   retention_days` (`config-scopes.md` §1.17).
+> - **Palace (D4):** bridge `/memory promote` (fact → `provisional` topic),
+>   `/palace supersede|edit|link` behind an operator review gate, an
+>   mtime-invalidated index cache, read tools `palace.search`/`palace.recall`
+>   (`established` only, bounded hops).
+> - **Dream (D5):** `/dream run|status|review`, structured JSON output with
+>   one repair turn, a `JobKind::Dream` ledger job, `[dream]` configuration
+>   (`config-scopes.md` §1.18), knowledge maintenance on every run
+>   (diary rollup/gc, workbench retention, palace staleness *suggestions*).
+>
+> Still open: `harw-policy` does not exist as a crate, so cross-tree
+> visibility enforcement (§7) remains a gap; child sessions have no diary
+> recorder. A dream mirror card on the kanban board was deliberately dropped
+> (Kanban only on the user's explicit request).
 
 ## 0. Why one document
 
@@ -703,6 +735,17 @@ never show a state the job ledger disagrees with.
    toward surface-only to keep palace writes strictly promotion-gated, but
    worth deciding before `harw-knowledge` v1 locks the `Confidence` enum.
 
+   **Status (Runde 4): decided — surface only, never auto-downgrade.**
+   Every dream run looks for staleness candidates
+   (`harw_knowledge::dream::palace_stale_candidates`, called from
+   `run_maintenance` in `harw-ops/src/dream_run.rs`): `provisional` entries
+   unchanged for more than `DREAM_PALACE_STALE_DAYS` = 30 days (promote or
+   discard), and `established` nodes that link to a `superseded` entry
+   (update the link). Both land only as `maintenance` suggestions in the
+   dream report; accepting one only records its status. Changing a node
+   stays an explicit `/palace edit|supersede … --confirm`; `established` is
+   never downgraded automatically and nodes are never deleted.
+
 2. **Workbench durability for project-scoped surfaces** — §5.2 sets
    `workbench.retention: session-lifetime` as the default, but project-scoped
    workbenches (shared across many sessions over weeks) plausibly need a
@@ -710,10 +753,29 @@ never show a state the job ledger disagrees with.
    property of the `WorkbenchScope` variant rather than one global config
    key?
 
+   **Status (Runde 4): decided — retention per scope.**
+   `harw_knowledge::workbench::Retention` belongs to the scope
+   (`retention.json` in the scope directory), not to a global key. Defaults:
+   session scopes expire after 14 days without change
+   (`DEFAULT_SESSION_RETENTION_DAYS`), project scopes `keep`. Set with
+   `/workbench retention [keep|<tage>d] [--scope=…]`; expired scopes are
+   pruned by the maintenance step of every dream run (`prune_expired`). The
+   diary, by contrast, has one profile key, `[knowledge.diary]
+   retention_days` (default 90; older days move into the monthly rollup).
+
 3. **Dream job budget defaults** — §4.3 leaves `max_tool_calls` "near-zero"
    without a number. Needs a concrete default once `harw-job-runtime`'s
    `Budget` type is implemented and its units (tokens vs. wall-time vs. tool
    invocations) are finalized — this doc can't pick a number in a vacuum.
+
+   **Status (Runde 4): decided.** `[dream] budget` = 16 384 tokens per run
+   (profile key, `config-scopes.md` §1.18) plus a fixed wall-clock limit of
+   300 s (`DREAM_MAX_WALL`); exceeding either aborts the run before a report
+   is written. `max_tool_calls` is effectively 0: the dream turn runs with
+   no tools at all (`harw-runtime/src/dream_run.rs`) and only reads a capped
+   context from transcripts, diary, topics and palace, framed as untrusted.
+   Triggering is `idle_minutes` (15) or a cron `schedule`, with a minimum gap
+   of `cooldown_minutes` (60).
 
 4. **Kanban storage under concurrent writers** — §1.1 rejects a database in
    favor of one-file-per-card markdown, consistent with the rest of
@@ -724,11 +786,29 @@ never show a state the job ledger disagrees with.
    a concrete mechanism (advisory flock? a per-board write-serializing
    actor?) before that becomes a real race instead of a theoretical one.
 
+   **Status (Runde 4): decided — advisory file locks via `fs4`.**
+   `harw_knowledge::lock::KnowledgeLock` takes an exclusive `flock` (or
+   `LockFileEx`) on a hidden neighbour file `.<name>.lock`, polling with a
+   timeout instead of blocking. The lock is released on drop and when the
+   holder crashes, so a leftover `.lock` file is never a stuck lock. It
+   guards every card file (`board::save_card`; notes and history under the
+   card lock), the board lock during `create`, diary appends, workbench
+   manifests and palace nodes. A dream run additionally holds
+   `dreams/.run.lock`; a second concurrent run ends immediately as busy.
+
 5. **Cross-agent palace visibility beyond `DescendantTree`** — §7 allows
    `ExplicitlyGranted` widening for the palace, but doesn't yet specify who
    is authorized to *grant* that widening (the promoting agent? only an
    operator?). This likely needs to fold into `harw-policy`'s broader
    approval model rather than being decided locally in this document.
+
+   **Status (Runde 4): partly decided.** For the new read tools, agents see
+   through `palace.search`/`palace.recall` only `established` nodes, including
+   ones with `OperatorOnly` visibility: the operator's explicit
+   `/palace promote` is the release to agents. `provisional` topics stay
+   invisible to agents. Still open: who may grant an `ExplicitlyGranted`
+   widening beyond `DescendantTree`; that still depends on `harw-policy`,
+   which does not exist yet.
 
 6. **Diary as evidence in kanban review** — Hermes's convention drops
    structured audit metadata into `kanban_comment` before blocking a card for
@@ -737,3 +817,11 @@ never show a state the job ledger disagrees with.
    arguably shouldn't). Should `CardState::Blocked { reason_kind:
    ReviewRequired }` transitions *require* a linked diary entry, or is that
    over-engineering a convention Hermes gets away with as just a convention?
+
+   **Status (Runde 4): partly decided — convention, not a requirement.**
+   Cards have their own evidence field (`evidence`, `/kanban evidence
+   <karte> <pfad|url>`), timestamped comments with author, and a history;
+   the kanban worker writes result and job history to the card. A linked
+   diary entry is **not** required for `ReviewRequired`, but a diary entry
+   can be linked as evidence by its path. Whether a requirement is worth it
+   later stays open.

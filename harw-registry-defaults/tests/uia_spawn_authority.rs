@@ -114,7 +114,13 @@ fn test_plain_explore_and_research_roles_are_worker_and_denied_to_uia() -> TestR
 fn test_uia_explorer_and_uia_writer_are_uia_worker_and_allowed_for_uia() -> TestResult {
     let roles = resolved_roles()?;
 
-    for role_name in [role_names::UIA_EXPLORER, role_names::UIA_WRITER] {
+    // Runde 4, Teil E: `uia-latex-writer` ist dieselbe Organisationsrolle
+    // `UiaWorker` und damit ohne Freigabeliste für die UIA spawnbar.
+    for role_name in [
+        role_names::UIA_EXPLORER,
+        role_names::UIA_WRITER,
+        role_names::UIA_LATEX_WRITER,
+    ] {
         let ir = roles.get(role_name).ok_or(TestError::Unexpected(format!(
             "builtin role '{role_name}' must be registered"
         )))?;

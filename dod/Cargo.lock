@@ -1090,6 +1090,7 @@ dependencies = [
 name = "harw-knowledge"
 version = "0.3.0"
 dependencies = [
+ "fs4",
  "harw-agent-dsl",
  "harw-context",
  "harw-dod-rules",

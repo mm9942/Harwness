@@ -11,6 +11,8 @@ pub mod ceiling;
 pub mod children;
 pub mod config;
 pub mod contributors;
+pub mod diary_wiring;
+pub mod dream_run;
 pub mod error;
 pub mod guard_wiring;
 pub mod handoff;

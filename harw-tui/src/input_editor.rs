@@ -374,8 +374,37 @@ impl InputEditor {
     ///
     /// # Returns
     /// Borrowed `&str` des internen Puffers (beinhaltet ggf. `\n`-Zeichen).
+    /// Paste-Platzhalter stehen hier noch als `[Pasted text #<id> +<n>
+    /// lines]` — wer den Text **absendet**, nimmt
+    /// [`Self::submission_text`].
     pub fn text(&self) -> &str {
         &self.buffer
+    }
+
+    /// Der Text, der beim Absenden ans Modell bzw. die Befehls-Pipeline
+    /// geht: der Puffer mit jedem Paste-Platzhalter zurück in seinen vollen
+    /// Text aufgelöst (siehe Moduldoku "Paste-Platzhalter"). Der Puffer
+    /// selbst bleibt unverändert.
+    #[must_use]
+    pub fn submission_text(&self) -> String {
+        self.expand_pastes()
+    }
+
+    /// Ersetzt den Puffer durch `text` und setzt den Cursor auf das
+    /// Byte-Offset `cursor` (auf die nächste gültige Grenze geklemmt), ohne
+    /// die gemerkten Pastes zu verlieren: Platzhalter, die in `text`
+    /// weiterhin vorkommen, bleiben auflösbar (anders als
+    /// [`Self::clear`] + [`Self::insert_str`]).
+    pub fn replace_text_keeping_pastes(&mut self, text: &str, cursor: usize) {
+        self.buffer = text.to_owned();
+        let mut cursor = cursor.min(self.buffer.len());
+        while !self.buffer.is_char_boundary(cursor) {
+            cursor -= 1;
+        }
+        self.cursor = cursor;
+        self.last_recalled = None;
+        self.burst_start = None;
+        self.prune_pastes();
     }
 
     /// Gibt die aktuelle Cursor-Position als Byte-Offset zurück.
@@ -2166,6 +2195,27 @@ mod tests {
         ed.insert_paste("line1\nline2");
         assert_eq!(ed.text(), "line1\nline2");
         assert!(ed.pastes().is_empty());
+    }
+
+    // Runde 4: Absende-Text löst Platzhalter auf, Ersetzen behält Pastes.
+    #[test]
+    fn test_submission_text_expands_and_replace_keeps_pastes() {
+        let mut editor = InputEditor::new();
+        let big: String = (0..40).map(|i| format!("zeile {i}\n")).collect();
+        editor.insert_str("bitte prüfen: ");
+        editor.insert_paste(&big);
+        assert!(editor.text().contains("[Pasted text #"));
+        assert!(editor.submission_text().contains("zeile 39"));
+        assert!(!editor.submission_text().contains("[Pasted text #"));
+
+        let rewritten = format!("@datei.rs {}", editor.text());
+        editor.replace_text_keeping_pastes(&rewritten, 9);
+        assert!(
+            editor
+                .submission_text()
+                .starts_with("@datei.rs bitte prüfen: ")
+        );
+        assert!(editor.submission_text().contains("zeile 39"));
     }
 
     // 31. large_paste_becomes_placeholder

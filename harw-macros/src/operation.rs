@@ -20,9 +20,13 @@
 //! abgeleitet; `method` macht sie zu einer eigenständigen Pflichtangabe, ein
 //! fehlender Schlüssel ist ein Compile-Fehler); `map_busy_availability` mappt
 //! den optionalen `busy`-Schlüssel von `command(...)` (Werte `"immediate"` /
-//! `"deferred"`, Default `"deferred"`) auf das TOP-LEVEL-Feld
+//! `"staged"` / `"deferred"`, Default `"deferred"`) auf das TOP-LEVEL-Feld
 //! `OperationMeta::busy` (`harw_operations::operation::BusyAvailability`) —
-//! nicht auf ein `Surface::Command`-Feld. Diese Funktionen sind die
+//! nicht auf ein `Surface::Command`-Feld. Der optionale Schlüssel
+//! `busy_subcommands = "show=immediate, switch=staged, -=immediate"` von
+//! `command(...)` überschreibt die Klasse je Unterbefehl (`-` = bare Form);
+//! `parse_busy_subcommands` erzeugt daraus eine Überschreibung von
+//! `Operation::busy_subcommands`. Diese Funktionen sind die
 //! Einstiegspunkte, die die `#[proc_macro_attribute] operation`-Funktion im
 //! Crate-Root (`lib.rs`) aufruft.
 
@@ -75,6 +79,10 @@ pub(crate) struct OperationArgs {
     /// `map_busy_availability`). Absent ⇒ `BusyAvailability::DeferredUntilTurnEnd`
     /// (today's behavior for every command).
     cmd_busy: Option<LitStr>,
+    /// `busy_subcommands = "..."` sub-key of `command(...)` → override of
+    /// `Operation::busy_subcommands` (see `parse_busy_subcommands`). Absent ⇒
+    /// no override (every invocation inherits `busy`).
+    cmd_busy_subcommands: Option<LitStr>,
     has_model_tool: bool,
     mt_readonly: bool,
     mt_approval: Option<LitStr>,
@@ -140,6 +148,7 @@ pub(crate) fn parse_operation_args(attr: proc_macro2::TokenStream) -> syn::Resul
     let mut cmd_path: Option<LitStr> = None;
     let mut cmd_visibility: Option<LitStr> = None;
     let mut cmd_busy: Option<LitStr> = None;
+    let mut cmd_busy_subcommands: Option<LitStr> = None;
     let mut has_command = false;
     // model_tool(...) fields
     let mut mt_readonly = false;
@@ -191,9 +200,14 @@ pub(crate) fn parse_operation_args(attr: proc_macro2::TokenStream) -> syn::Resul
                     let lit: LitStr = nested.value()?.parse()?;
                     cmd_busy = Some(lit);
                     Ok(())
+                } else if nested.path.is_ident("busy_subcommands") {
+                    let lit: LitStr = nested.value()?.parse()?;
+                    cmd_busy_subcommands = Some(lit);
+                    Ok(())
                 } else {
                     Err(nested.error(
-                        "unsupported `operation` `command` key (expected `path`, `visibility`, or `busy`)",
+                        "unsupported `operation` `command` key \
+                         (expected `path`, `visibility`, `busy`, or `busy_subcommands`)",
                     ))
                 }
             })
@@ -296,6 +310,7 @@ pub(crate) fn parse_operation_args(attr: proc_macro2::TokenStream) -> syn::Resul
         cmd_path,
         cmd_visibility,
         cmd_busy,
+        cmd_busy_subcommands,
         has_model_tool,
         mt_readonly,
         mt_approval,
@@ -345,6 +360,7 @@ pub(crate) fn expand_operation(
         cmd_path,
         cmd_visibility,
         cmd_busy,
+        cmd_busy_subcommands,
         has_model_tool,
         mt_readonly,
         mt_approval,
@@ -407,6 +423,25 @@ pub(crate) fn expand_operation(
         .unwrap_or_else(|| {
             quote! { ::harw_operations::operation::BusyAvailability::DeferredUntilTurnEnd }
         });
+    // Optional per-subcommand override (`busy_subcommands = "..."`): emitted
+    // as an override of `Operation::busy_subcommands`; absent ⇒ the trait's
+    // default (empty table).
+    let busy_subcommands_tokens = match cmd_busy_subcommands.as_ref() {
+        Some(lit) => {
+            let entries = parse_busy_subcommands(lit)?;
+            quote! {
+                fn busy_subcommands(
+                    &self,
+                ) -> &'static [::harw_operations::operation::BusySubcommand] {
+                    const TABLE: &[::harw_operations::operation::BusySubcommand] = &[
+                        #( #entries ),*
+                    ];
+                    TABLE
+                }
+            }
+        }
+        None => quote! {},
+    };
 
     // --- Build category token (explicit or derived from domain) --------------
     let category_tokens = match op_category.as_ref() {
@@ -685,6 +720,8 @@ pub(crate) fn expand_operation(
                 })
             }
 
+            #busy_subcommands_tokens
+
             fn run<'a>(
                 &'a self,
                 ctx: &'a ::harw_operations::OpContext,
@@ -792,28 +829,106 @@ fn map_visibility(lit: &LitStr) -> syn::Result<proc_macro2::TokenStream> {
 /// Map a `command(...)` `busy` string literal to its
 /// `::harw_operations::operation::BusyAvailability` variant tokens.
 ///
-/// `BusyAvailability` is not re-exported at the `harw_operations` crate root
-/// (as `ApprovalPolicy`/`Surface` are), so the emitted tokens qualify through
-/// the `operation` module — the same pattern this file already uses for
-/// `WebMethod`.
+/// The emitted tokens qualify through the `operation` module — the same
+/// pattern this file already uses for `WebMethod`.
 ///
 /// # Errors
-/// Returns `syn::Error` when the string is neither `"immediate"` nor
+/// Returns `syn::Error` when the string is not `"immediate"`, `"staged"` or
 /// `"deferred"`.
 ///
 /// # Design-doc reference
 /// Plan-Referenz: `recursive-cooking-lobster.md`, Abschnitt "Welle 1 — 1b".
 fn map_busy_availability(lit: &LitStr) -> syn::Result<proc_macro2::TokenStream> {
-    match lit.value().as_str() {
-        "immediate" => Ok(quote! { ::harw_operations::operation::BusyAvailability::Immediate }),
-        "deferred" => {
-            Ok(quote! { ::harw_operations::operation::BusyAvailability::DeferredUntilTurnEnd })
-        }
-        other => Err(syn::Error::new_spanned(
+    busy_class_tokens(&lit.value()).ok_or_else(|| {
+        syn::Error::new_spanned(
             lit,
-            format!("busy muss 'immediate' oder 'deferred' sein, war: '{other}'"),
-        )),
+            format!(
+                "busy muss 'immediate', 'staged' oder 'deferred' sein, war: '{}'",
+                lit.value()
+            ),
+        )
+    })
+}
+
+/// Tokens der `BusyAvailability`-Variante für einen Klassennamen.
+///
+/// # Rückgabe
+/// `None` für einen unbekannten Namen.
+fn busy_class_tokens(value: &str) -> Option<proc_macro2::TokenStream> {
+    match value {
+        "immediate" => Some(quote! { ::harw_operations::operation::BusyAvailability::Immediate }),
+        "staged" => Some(quote! { ::harw_operations::operation::BusyAvailability::Staged }),
+        "deferred" => {
+            Some(quote! { ::harw_operations::operation::BusyAvailability::DeferredUntilTurnEnd })
+        }
+        _ => None,
     }
+}
+
+/// Parse `busy_subcommands = "show=immediate, switch=staged, -=immediate"`
+/// into `BusySubcommand::new(..)` constructor tokens.
+///
+/// # Beschreibung
+/// Einträge sind komma-getrennt, je `unterbefehl=klasse`; `-` steht für die
+/// bare Form (kein Argument). Leerraum um Einträge wird ignoriert.
+///
+/// # Errors
+/// `syn::Error` bei leerer Liste, fehlendem `=`, leerem Namen, unbekannter
+/// Klasse oder doppeltem Unterbefehl.
+fn parse_busy_subcommands(lit: &LitStr) -> syn::Result<Vec<proc_macro2::TokenStream>> {
+    let value = lit.value();
+    let mut seen: Vec<String> = Vec::new();
+    let mut entries = Vec::new();
+    for raw in value.split(',') {
+        let raw = raw.trim();
+        if raw.is_empty() {
+            continue;
+        }
+        let Some((name, class)) = raw.split_once('=') else {
+            return Err(syn::Error::new_spanned(
+                lit,
+                format!("busy_subcommands: Eintrag '{raw}' braucht die Form 'unterbefehl=klasse'"),
+            ));
+        };
+        let (name, class) = (name.trim(), class.trim());
+        if name.is_empty() || name.contains(char::is_whitespace) {
+            return Err(syn::Error::new_spanned(
+                lit,
+                format!("busy_subcommands: ungültiger Unterbefehl in '{raw}'"),
+            ));
+        }
+        if seen.iter().any(|prior| prior == name) {
+            return Err(syn::Error::new_spanned(
+                lit,
+                format!("busy_subcommands: Unterbefehl '{name}' doppelt"),
+            ));
+        }
+        seen.push(name.to_owned());
+        let class_tokens = busy_class_tokens(class).ok_or_else(|| {
+            syn::Error::new_spanned(
+                lit,
+                format!(
+                    "busy_subcommands: Klasse muss 'immediate', 'staged' oder 'deferred' sein, \
+                     war: '{class}'"
+                ),
+            )
+        })?;
+        let sub_tokens = if name == "-" {
+            quote! { ::core::option::Option::None }
+        } else {
+            quote! { ::core::option::Option::Some(#name) }
+        };
+        entries.push(quote! {
+            ::harw_operations::operation::BusySubcommand::new(#sub_tokens, #class_tokens)
+        });
+    }
+    if entries.is_empty() {
+        return Err(syn::Error::new_spanned(
+            lit,
+            "busy_subcommands: mindestens ein Eintrag 'unterbefehl=klasse' nötig",
+        ));
+    }
+    Ok(entries)
 }
 
 /// Map an `approval` string literal to its `::harw_operations::ApprovalPolicy` variant tokens.
@@ -1266,8 +1381,81 @@ mod operation_tests {
         };
         assert_eq!(
             error.to_string(),
-            "busy muss 'immediate' oder 'deferred' sein, war: 'invalid-wert'"
+            "busy muss 'immediate', 'staged' oder 'deferred' sein, war: 'invalid-wert'"
         );
+        Ok(())
+    }
+
+    #[test]
+    fn expand_operation_command_busy_staged_is_honored() -> TestResult {
+        let flat = expand_with_attr(quote! {
+            name = "demo", summary = "Demo.", domain = "misc", permission = "observer",
+            command(path = "/demo", visibility = "tui_only", busy = "staged")
+        })?;
+        assert!(flat.contains("busy:::harw_operations::operation::BusyAvailability::Staged"));
+        Ok(())
+    }
+
+    #[test]
+    fn expand_operation_busy_subcommands_emits_override() -> TestResult {
+        let flat = expand_with_attr(quote! {
+            name = "demo", summary = "Demo.", domain = "misc", permission = "observer",
+            command(
+                path = "/demo",
+                visibility = "tui_only",
+                busy = "staged",
+                busy_subcommands = "show=immediate, -=immediate, test=deferred"
+            )
+        })?;
+        assert!(flat.contains("fnbusy_subcommands(&self,)"), "{flat}");
+        assert!(flat.contains(
+            "BusySubcommand::new(::core::option::Option::Some(\"show\"),::harw_operations::operation::BusyAvailability::Immediate)"
+        ));
+        assert!(flat.contains(
+            "BusySubcommand::new(::core::option::Option::None,::harw_operations::operation::BusyAvailability::Immediate)"
+        ));
+        assert!(flat.contains(
+            "BusySubcommand::new(::core::option::Option::Some(\"test\"),::harw_operations::operation::BusyAvailability::DeferredUntilTurnEnd)"
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn expand_operation_without_busy_subcommands_has_no_override() -> TestResult {
+        let flat = expand_with_attr(quote! {
+            name = "demo", summary = "Demo.", domain = "misc", permission = "observer",
+            command(path = "/demo", visibility = "tui_only", busy = "immediate")
+        })?;
+        assert!(!flat.contains("fnbusy_subcommands"));
+        Ok(())
+    }
+
+    #[test]
+    fn expand_operation_rejects_malformed_busy_subcommands() -> TestResult {
+        for (value, needle) in [
+            ("show", "braucht die Form"),
+            ("show=sofort", "Klasse muss"),
+            ("show=immediate, show=staged", "doppelt"),
+            (" , ", "mindestens ein Eintrag"),
+        ] {
+            let attr = quote! {
+                name = "demo", summary = "Demo.", domain = "misc", permission = "observer",
+                command(path = "/demo", visibility = "tui_only", busy_subcommands = #value)
+            };
+            let args = parse_operation_args(attr).map_err(ctx("parse"))?;
+            let func: ItemFn = syn::parse_quote! {
+                async fn demo_op(ctx: &OpContext, args: DemoArgs) -> Result<OpOutput, OpError> {
+                    let _ = (ctx, args);
+                    Ok(OpOutput { text: String::new() })
+                }
+            };
+            let Err(error) = expand_operation(func, args) else {
+                return Err(TestError::Unexpected(format!(
+                    "'{value}' muss abgewiesen werden"
+                )));
+            };
+            assert!(error.to_string().contains(needle), "{value}: {error}");
+        }
         Ok(())
     }
 

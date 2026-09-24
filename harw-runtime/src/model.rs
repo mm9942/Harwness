@@ -307,6 +307,29 @@ fn resolve_default_model(config: &ResolvedConfig) -> DefaultModelResolution {
     DefaultModelResolution::NoneUsable
 }
 
+/// Die Modellkennung, die der Wurzel-Baum (`default_tree_model`)
+/// tatsächlich anspricht (Teil C).
+///
+/// # Beschreibung
+/// Dieselbe Auflösung wie [`build_root_model_with_registry_and_resolver`]:
+/// das konfigurierte `default_model`, bei einem unbrauchbaren Vorgabe-Paar
+/// das erste nutzbare Katalogmodell ([`resolve_default_model`]). Grundlage
+/// für das Kontextfenster ungepinnter Kinder — mit dem rohen
+/// `default_model` fiel ein solches Kind ohne gesetztes Vorgabemodell auf das
+/// konservative Rückfallfenster, obwohl es ein bekanntes Modell ruft.
+///
+/// # Returns
+/// Die Modellkennung oder `None`, wenn kein Modell konfiguriert ist.
+#[must_use]
+pub(crate) fn effective_default_model_id(config: &ResolvedConfig) -> Option<String> {
+    match resolve_default_model(config) {
+        DefaultModelResolution::Fallback { model, .. } => Some(model),
+        DefaultModelResolution::AsConfigured | DefaultModelResolution::NoneUsable => {
+            config.harness.default_model.clone()
+        }
+    }
+}
+
 /// Ergebnis der UIA-Provider/-Modell-Auflösung (siehe [`resolve_uia_model`]).
 enum UiaModelResolution {
     /// `uia_provider`/`uia_model` sind nicht beide nutzbar gesetzt — die
@@ -661,7 +684,7 @@ fn resolve_uia_worker_model(config: &ResolvedConfig) -> Option<String> {
 }
 
 /// Baut das Modell der uia-worker-Rollenfamilie (`uia-worker`,
-/// `uia-explorer`, `uia-writer`, `uia-shell-worker`).
+/// `uia-explorer`, `uia-writer`, `uia-shell-worker`, `uia-latex-writer`).
 ///
 /// # Description
 /// Kann nicht fehlschlagen — degradiert nur: liefert
@@ -997,6 +1020,27 @@ mod tests {
             resolve_default_model(&config),
             DefaultModelResolution::AsConfigured
         ));
+    }
+
+    #[test]
+    fn effective_default_model_id_follows_the_fallback_model() -> TestResult {
+        let config = loopback_config();
+        assert_eq!(
+            effective_default_model_id(&config),
+            config.harness.default_model.clone()
+        );
+        let mut dangling = loopback_config();
+        dangling.harness.default_model = None;
+        dangling.models.insert(
+            "catalog-model".to_owned(),
+            model_toml("catalog-model", "local"),
+        );
+        assert_eq!(
+            effective_default_model_id(&dangling).as_deref(),
+            Some("catalog-model"),
+            "ohne Vorgabemodell ruft der Wurzel-Baum das erste nutzbare Katalogmodell"
+        );
+        Ok(())
     }
 
     #[test]

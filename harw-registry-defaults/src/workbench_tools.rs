@@ -23,6 +23,17 @@
 //! Workspace nötig wäre. Größenobergrenzen (`harw_knowledge::workbench::
 //! MAX_NOTE_BYTES`/`MAX_LINE_BYTES`) begrenzen den Effekt.
 //!
+//! # Lesende Fläche (Runde 4, D1)
+//! Getrennt davon, in eigenen Typen:
+//! - [`WorkbenchReadToolProvider`] mit `workbench.show` — **rein lesend**,
+//!   liefert Pins (nur Pfad + Notiz, nie Dateiinhalte), Hypothesen und das
+//!   Notiz-Ende der aufrufenden Sitzung bzw. — mit `scope: "project"` — des
+//!   bei der Montage festgelegten Projekts; gedeckelt auf
+//!   [`WORKBENCH_SHOW_MAX_BYTES`]. Kein Argument wählt eine fremde Sitzung
+//!   oder ein fremdes Projekt (SelfOnly-Semantik).
+//! - [`WorkbenchContextProvider`] — Kontextbeitrag „Werkbank" (Pins + offene
+//!   Hypothesen der Sitzung, gedeckelt auf [`WORKBENCH_CONTEXT_MAX_BYTES`]).
+//!
 //! # Nebenläufigkeit
 //! `Send + Sync`; hält nur ein `Arc<KnowledgeStore>`. Die Read-Modify-Write-
 //! Zyklen serialisiert `harw_knowledge::workbench` prozessweit.
@@ -34,12 +45,13 @@
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
-use harw_extension_api::contributors::ToolProvider;
+use harw_extension_api::contributors::{ContextProvider, ExtFuture, ToolProvider};
+use harw_extension_api::types::{ContextFragment, TurnInputContext};
 use harw_extension_api::{
     ToolCall, ToolExecutionContext, ToolExecutor, ToolExecutorFuture, ToolName, ToolOutput,
     ToolSpec,
 };
-use harw_knowledge::workbench::{self, WorkbenchScope};
+use harw_knowledge::workbench::{self, DigestOptions, WorkbenchScope};
 use harw_knowledge::{AgentId, KnowledgeStore};
 use harw_tools::{AdditionalProperties, FunctionToolSpec, JsonSchema, JsonSchemaType, Permission};
 use serde::Deserialize;
@@ -49,6 +61,21 @@ pub const WORKBENCH_NOTE: &str = "workbench.note";
 
 /// Name des Hypothesen-Werkzeugs.
 pub const WORKBENCH_HYPOTHESIS: &str = "workbench.hypothesis";
+
+/// Name des lesenden Werkzeugs.
+pub const WORKBENCH_SHOW: &str = "workbench.show";
+
+/// Obergrenze der Ausgabe von `workbench.show` in Bytes.
+pub const WORKBENCH_SHOW_MAX_BYTES: usize = 4 * 1024;
+
+/// Obergrenze des Kontextbeitrags „Werkbank" in Bytes.
+pub const WORKBENCH_CONTEXT_MAX_BYTES: usize = 1536;
+
+/// Namensraum und Fragment-Label des Kontextbeitrags.
+pub const WORKBENCH_CONTEXT_NAMESPACE: &str = "workbench";
+
+/// Notizzeilen, die `workbench.show` aus dem Tail zeigt.
+const SHOW_NOTES_LINES: usize = 12;
 
 /// Die Workbench-Modell-Werkzeuge über einem geteilten Wissensspeicher.
 #[derive(Debug, Clone)]
@@ -281,6 +308,230 @@ fn execute_hypothesis(
     }
 }
 
+// --- Lesende Fläche -----------------------------------------------------------
+
+/// Das rein lesende Werkzeug `workbench.show`.
+///
+/// # Rechteklasse
+/// [`Permission::ReadWorkspace`]; liest nur harness-eigene Workbench-Dateien
+/// des eigenen Scopes, nie angeheftete Dateien selbst. Darum für
+/// `AUTO_APPROVED_TOOLS` geeignet.
+#[derive(Debug, Clone)]
+pub struct WorkbenchReadToolProvider {
+    store: Arc<KnowledgeStore>,
+    project: Option<WorkbenchScope>,
+}
+
+impl WorkbenchReadToolProvider {
+    /// Die Werkzeugnamen in Provider-Reihenfolge.
+    pub const TOOL_NAMES: &'static [&'static str] = &[WORKBENCH_SHOW];
+
+    /// Die Rechteklasse je Werkzeug, parallel zu [`Self::TOOL_NAMES`].
+    pub const TOOL_PERMISSIONS: &'static [Option<Permission>] = &[Some(Permission::ReadWorkspace)];
+
+    /// Baut den Provider; ohne [`Self::with_project`] kennt er nur die Sitzung.
+    #[must_use]
+    pub fn new(store: Arc<KnowledgeStore>) -> Self {
+        Self {
+            store,
+            project: None,
+        }
+    }
+
+    /// Legt das Projekt der Sitzung fest (z. B.
+    /// `WorkbenchScope::project_for_path(<Projektwurzel>)`); nur ein
+    /// [`WorkbenchScope::Project`] wird übernommen.
+    #[must_use]
+    pub fn with_project(mut self, project: Option<WorkbenchScope>) -> Self {
+        self.project = project.filter(|scope| !scope.is_session());
+        self
+    }
+}
+
+impl ToolProvider for WorkbenchReadToolProvider {
+    fn tools(&self) -> Vec<ToolSpec> {
+        vec![show_spec()]
+    }
+
+    fn executor(&self, name: &ToolName) -> Option<Arc<dyn ToolExecutor>> {
+        (name.as_str() == WORKBENCH_SHOW).then(|| {
+            Arc::new(WorkbenchShowExecutor {
+                store: Arc::clone(&self.store),
+                project: self.project.clone(),
+            }) as Arc<dyn ToolExecutor>
+        })
+    }
+
+    fn parallel_safe(&self, name: &ToolName) -> bool {
+        name.as_str() == WORKBENCH_SHOW
+    }
+}
+
+fn show_spec() -> ToolSpec {
+    let mut props = BTreeMap::new();
+    let mut scope = string_property(
+        "\"session\": die Workbench DIESER Sitzung; \"project\": die Projekt-Workbench \
+         des aktuellen Projekts (falls bekannt).",
+    );
+    scope.enum_values = Some(vec![
+        serde_json::json!("session"),
+        serde_json::json!("project"),
+    ]);
+    props.insert("scope".to_owned(), scope);
+    ToolSpec::Function(FunctionToolSpec {
+        name: ToolName::new(WORKBENCH_SHOW),
+        description: "Liest die Workbench (nur lesend): angeheftete Dateien (Pfad + Begründung, \
+             kein Dateiinhalt), Hypothesen mit Nummer #<n> und das Ende der Notizen. \
+             Gekürzt auf 4 KiB. Nur die eigene Sitzung bzw. das eigene Projekt."
+            .to_owned(),
+        parameters: object_schema(props),
+        strict: true,
+    })
+}
+
+struct WorkbenchShowExecutor {
+    store: Arc<KnowledgeStore>,
+    project: Option<WorkbenchScope>,
+}
+
+impl ToolExecutor for WorkbenchShowExecutor {
+    fn execute<'a>(
+        &'a self,
+        context: &'a ToolExecutionContext,
+        call: &'a ToolCall,
+    ) -> ToolExecutorFuture<'a> {
+        let session_id = context.session_id().as_str().to_owned();
+        let arguments = call.arguments.clone();
+        Box::pin(async move {
+            Ok(execute_show(
+                &self.store,
+                &session_id,
+                self.project.as_ref(),
+                arguments,
+            ))
+        })
+    }
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ShowArgs {
+    scope: String,
+}
+
+/// Kern von `workbench.show` (testbar ohne Sandbox-Kontext).
+fn execute_show(
+    store: &KnowledgeStore,
+    session_id: &str,
+    project: Option<&WorkbenchScope>,
+    arguments: serde_json::Value,
+) -> ToolOutput {
+    let args: ShowArgs = match serde_json::from_value(arguments) {
+        Ok(args) => args,
+        Err(error) => {
+            return ToolOutput::error(format!("{WORKBENCH_SHOW}: ungültige Argumente: {error}"));
+        }
+    };
+    let scope = match args.scope.as_str() {
+        "session" => WorkbenchScope::Session(session_id.to_owned()),
+        "project" => match project {
+            Some(project) => project.clone(),
+            None => {
+                return ToolOutput::error(format!(
+                    "{WORKBENCH_SHOW}: für diese Sitzung ist kein Projekt bekannt"
+                ));
+            }
+        },
+        other => {
+            return ToolOutput::error(format!(
+                "{WORKBENCH_SHOW}: unbekannter scope '{other}' (session, project)"
+            ));
+        }
+    };
+    match workbench::load(store, &scope) {
+        Ok(bench) => {
+            let body = workbench::digest(
+                &bench,
+                DigestOptions {
+                    max_bytes: WORKBENCH_SHOW_MAX_BYTES,
+                    notes_lines: SHOW_NOTES_LINES,
+                    include_decided: true,
+                },
+            );
+            let scope_name = scope.path_component();
+            if body.is_empty() {
+                ToolOutput::text(format!("Workbench {scope_name} ist leer."))
+            } else {
+                ToolOutput::text(format!("Workbench {scope_name}\n{body}"))
+            }
+        }
+        Err(error) => ToolOutput::error(format!("{WORKBENCH_SHOW}: {error}")),
+    }
+}
+
+/// Kontextbeitrag „Werkbank": Pins und offene Hypothesen der Sitzung.
+///
+/// # Beschreibung
+/// Liest je Turn den Sitzungs-Scope von
+/// [`TurnInputContext::session_id`] und liefert höchstens ein Fragment
+/// (Label [`WORKBENCH_CONTEXT_NAMESPACE`]), gedeckelt auf
+/// [`WORKBENCH_CONTEXT_MAX_BYTES`]; Notizen bleiben draußen (die liest das
+/// Modell bei Bedarf über `workbench.show`). Leerer Scope oder Lesefehler →
+/// kein Fragment (Fehler nur als `tracing::debug`). Vertrauensklasse ist die
+/// Vorgabe `TrustClass::Data`: Pins und Hypothesen sind Nutzer-/Modelltext.
+#[derive(Debug, Clone)]
+pub struct WorkbenchContextProvider {
+    store: Arc<KnowledgeStore>,
+}
+
+impl WorkbenchContextProvider {
+    /// Baut den Provider über dem Speicher der Montage.
+    #[must_use]
+    pub fn new(store: Arc<KnowledgeStore>) -> Self {
+        Self { store }
+    }
+}
+
+impl ContextProvider for WorkbenchContextProvider {
+    fn contribute<'a>(&'a self, ctx: &'a TurnInputContext) -> ExtFuture<'a, Vec<ContextFragment>> {
+        let session_id = ctx.session_id.as_str().to_owned();
+        Box::pin(async move {
+            workbench_context_fragment(&self.store, &session_id)
+                .into_iter()
+                .collect()
+        })
+    }
+
+    fn namespace(&self) -> &'static str {
+        WORKBENCH_CONTEXT_NAMESPACE
+    }
+}
+
+/// Kern von [`WorkbenchContextProvider`] (testbar ohne Laufzeit).
+fn workbench_context_fragment(store: &KnowledgeStore, session_id: &str) -> Option<ContextFragment> {
+    let scope = WorkbenchScope::Session(session_id.to_owned());
+    let bench = match workbench::load(store, &scope) {
+        Ok(bench) => bench,
+        Err(error) => {
+            tracing::debug!(%error, "workbench.context.load_failed");
+            return None;
+        }
+    };
+    const HEADER: &str = "Werkbank dieser Sitzung (workbench.show für Details):\n";
+    let body = workbench::digest(
+        &bench,
+        DigestOptions {
+            max_bytes: WORKBENCH_CONTEXT_MAX_BYTES.saturating_sub(HEADER.len()),
+            notes_lines: 0,
+            include_decided: false,
+        },
+    );
+    (!body.is_empty()).then(|| ContextFragment {
+        label: WORKBENCH_CONTEXT_NAMESPACE.to_owned(),
+        content: format!("{HEADER}{body}"),
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -371,6 +622,188 @@ mod tests {
             serde_json::json!({ "text": "   " }),
             now
         )));
+        Ok(())
+    }
+
+    fn show_text(output: ToolOutput) -> TestResult<String> {
+        match output {
+            ToolOutput::Text { content } => Ok(content),
+            other => Err(TestError::Unexpected(format!("{other:?}"))),
+        }
+    }
+
+    #[test]
+    fn read_provider_lists_only_show_and_is_read_only() {
+        let provider = WorkbenchReadToolProvider::new(Arc::new(KnowledgeStore::new(
+            std::path::Path::new("/x"),
+        )));
+        let names: Vec<String> = provider
+            .tools()
+            .iter()
+            .map(|spec| {
+                let ToolSpec::Function(function) = spec;
+                function.name.as_str().to_owned()
+            })
+            .collect();
+        assert_eq!(names, vec![WORKBENCH_SHOW.to_owned()]);
+        assert!(provider.executor(&ToolName::new(WORKBENCH_SHOW)).is_some());
+        assert!(provider.executor(&ToolName::new(WORKBENCH_NOTE)).is_none());
+        assert!(provider.parallel_safe(&ToolName::new(WORKBENCH_SHOW)));
+        assert_eq!(
+            WorkbenchReadToolProvider::TOOL_PERMISSIONS,
+            &[Some(Permission::ReadWorkspace)]
+        );
+    }
+
+    #[test]
+    fn show_reads_only_the_callers_session_and_own_project() -> TestResult {
+        let store = temporary_store("show")?;
+        let now = jiff::Timestamp::now();
+        let author = AgentId::new("operator");
+        let own = WorkbenchScope::Session("s-1".to_owned());
+        let foreign = WorkbenchScope::Session("s-2".to_owned());
+        let project = WorkbenchScope::Project("harw".to_owned());
+        workbench::pin(&store, &own, &author, "/abs/eigen.rs", "Einstieg", now)
+            .map_err(ctx("pin"))?;
+        workbench::add_hypothesis(&store, &own, &author, "Cache kalt", now)
+            .map_err(ctx("hypothesis"))?;
+        workbench::append_note(&store, &own, &author, "eigene Notiz", now).map_err(ctx("note"))?;
+        workbench::append_note(&store, &foreign, &author, "fremd geheim", now)
+            .map_err(ctx("foreign"))?;
+        workbench::append_note(&store, &project, &author, "Projektnotiz", now)
+            .map_err(ctx("project"))?;
+
+        let text = show_text(execute_show(
+            &store,
+            "s-1",
+            Some(&project),
+            serde_json::json!({ "scope": "session" }),
+        ))?;
+        assert!(text.contains("/abs/eigen.rs — Einstieg"), "{text}");
+        assert!(text.contains("#1 Cache kalt"), "{text}");
+        assert!(text.contains("eigene Notiz"), "{text}");
+        assert!(!text.contains("fremd geheim"), "{text}");
+
+        let project_text = show_text(execute_show(
+            &store,
+            "s-1",
+            Some(&project),
+            serde_json::json!({ "scope": "project" }),
+        ))?;
+        assert!(project_text.contains("Projektnotiz"), "{project_text}");
+
+        // Ohne Projekt, fremde Felder oder Scope-Werte: Fehler statt Fremdzugriff.
+        for (project, args) in [
+            (None, serde_json::json!({ "scope": "project" })),
+            (
+                Some(&project),
+                serde_json::json!({ "scope": "session:s-2" }),
+            ),
+            (
+                Some(&project),
+                serde_json::json!({ "scope": "session", "session": "s-2" }),
+            ),
+        ] {
+            assert!(is_error(&execute_show(&store, "s-1", project, args)));
+        }
+        std::fs::remove_dir_all(store.root()).ok();
+        Ok(())
+    }
+
+    #[test]
+    fn show_output_is_capped() -> TestResult {
+        let store = temporary_store("show-cap")?;
+        let now = jiff::Timestamp::now();
+        let own = WorkbenchScope::Session("s-1".to_owned());
+        for index in 0..40 {
+            workbench::add_hypothesis(
+                &store,
+                &own,
+                &AgentId::new("operator"),
+                &format!("Hypothese {index} {}", "x".repeat(200)),
+                now,
+            )
+            .map_err(ctx("hypothesis"))?;
+        }
+        let text = show_text(execute_show(
+            &store,
+            "s-1",
+            None,
+            serde_json::json!({ "scope": "session" }),
+        ))?;
+        assert!(
+            text.len() <= WORKBENCH_SHOW_MAX_BYTES + 64,
+            "{}",
+            text.len()
+        );
+        assert!(text.ends_with("(gekürzt)"));
+        let empty = show_text(execute_show(
+            &store,
+            "leer",
+            None,
+            serde_json::json!({ "scope": "session" }),
+        ))?;
+        assert!(empty.ends_with("ist leer."));
+        std::fs::remove_dir_all(store.root()).ok();
+        Ok(())
+    }
+
+    #[test]
+    fn context_fragment_carries_pins_and_open_hypotheses_only() -> TestResult {
+        let store = temporary_store("context")?;
+        let now = jiff::Timestamp::now();
+        let own = WorkbenchScope::Session("s-1".to_owned());
+        let author = AgentId::new("operator");
+        assert!(workbench_context_fragment(&store, "s-1").is_none());
+        workbench::pin(&store, &own, &author, "/abs/k.rs", "", now).map_err(ctx("pin"))?;
+        workbench::add_hypothesis(&store, &own, &author, "offen", now).map_err(ctx("h1"))?;
+        workbench::add_hypothesis(&store, &own, &author, "verworfen", now).map_err(ctx("h2"))?;
+        workbench::reject(&store, &own, &author, "#2", now).map_err(ctx("reject"))?;
+        workbench::append_note(&store, &own, &author, "nicht im Kontext", now)
+            .map_err(ctx("note"))?;
+        let fragment =
+            workbench_context_fragment(&store, "s-1").ok_or(TestError::Missing("fragment"))?;
+        assert_eq!(fragment.label, WORKBENCH_CONTEXT_NAMESPACE);
+        assert!(fragment.content.contains("/abs/k.rs"));
+        assert!(fragment.content.contains("#1 offen"));
+        assert!(!fragment.content.contains("verworfen"));
+        assert!(!fragment.content.contains("nicht im Kontext"));
+        assert!(fragment.content.len() <= WORKBENCH_CONTEXT_MAX_BYTES);
+        assert!(workbench_context_fragment(&store, "s-2").is_none());
+        std::fs::remove_dir_all(store.root()).ok();
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn context_provider_reads_the_turns_session() -> TestResult {
+        let store = temporary_store("context-provider")?;
+        let session = harw_types::SessionId::new();
+        let own = WorkbenchScope::Session(session.as_str().to_owned());
+        workbench::add_hypothesis(
+            &store,
+            &own,
+            &AgentId::new("operator"),
+            "im Turn",
+            jiff::Timestamp::now(),
+        )
+        .map_err(ctx("hypothesis"))?;
+        let provider = WorkbenchContextProvider::new(Arc::clone(&store));
+        assert_eq!(provider.namespace(), WORKBENCH_CONTEXT_NAMESPACE);
+        let turn = TurnInputContext {
+            session_id: session,
+            turn_id: harw_types::TurnId::new(),
+            metadata: serde_json::Value::Null,
+        };
+        let fragments = provider.contribute(&turn).await;
+        assert_eq!(fragments.len(), 1);
+        assert!(fragments[0].content.contains("im Turn"));
+        let other = TurnInputContext {
+            session_id: harw_types::SessionId::new(),
+            turn_id: harw_types::TurnId::new(),
+            metadata: serde_json::Value::Null,
+        };
+        assert!(provider.contribute(&other).await.is_empty());
+        std::fs::remove_dir_all(store.root()).ok();
         Ok(())
     }
 

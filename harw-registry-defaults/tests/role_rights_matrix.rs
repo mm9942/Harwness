@@ -7,7 +7,10 @@
 //! 2. **Profil × Rechtesatz** (`RegistryProfile::ALL.len()` × 2⁷):
 //!    `tool_names_for(granted)` registriert nie ein Werkzeug ohne gewährtes
 //!    Recht; `fs.write` nur in `Full`/`MemoryStewardship`/`UiaWriter`/
-//!    `WorkspaceEdit` (Runde 3, Welle D: nie mit `shell.*`/`web.*`),
+//!    `WorkspaceEdit` (Runde 3, Welle D: nie mit `shell.*`/`web.*`)/
+//!    `UiaLatexWriter` (Runde 4, Teil E), `latex.build` nur in
+//!    `UiaLatexWriter` und nur mit `ExecuteProcess` (nie mit `shell.*`,
+//!    `process.*`, `web.*` oder `deps.*`),
 //!    `shell.exec` nur in `Full`/`ShellExecution`/`UiaQuickHelper`
 //!    (Addendum I)/`UiaShellWorker`, jeweils nur mit dem passenden Recht;
 //!    `deps.source_*` nur mit `ReadCargoRegistry`; `web.*` nur in `Research`
@@ -239,6 +242,15 @@ fn expected_role_table() -> Vec<(&'static str, RegistryProfile, AuthorityReducer
             RegistryProfile::UiaShellWorker,
             AuthorityReducer::ReadOnly,
         ),
+        // LaTeX-Schreibspezialisierung der UIA (Runde 4, Teil E):
+        // `RegistryProfile::UiaLatexWriter` mit `ReadOnly` — nie Netz;
+        // `fs.write` und `latex.build` bleiben die Reducer-Ausnahme nach dem
+        // `executor`-Muster.
+        (
+            role_names::UIA_LATEX_WRITER,
+            RegistryProfile::UiaLatexWriter,
+            AuthorityReducer::ReadOnly,
+        ),
         // Read-only Erkundungsspezialisierung der UIA: `RegistryProfile::
         // UiaExplorer` mit `ReadWorkspaceNetwork` (Workspace lesen plus
         // egress-gebundenes Netz, kein Registry-Quellcache) — trägt ihr
@@ -333,6 +345,7 @@ fn test_profile_by_permission_matrix_never_registers_ungranted_tools() -> TestRe
                     | RegistryProfile::MemoryStewardship
                     | RegistryProfile::UiaWriter
                     | RegistryProfile::WorkspaceEdit
+                    | RegistryProfile::UiaLatexWriter
             );
             let may_exec = matches!(
                 *profile,
@@ -385,6 +398,27 @@ fn test_profile_by_permission_matrix_never_registers_ungranted_tools() -> TestRe
                     );
                 }
                 assert!(granted.contains(Permission::NetworkAccess));
+            }
+            // Runde 4, Teil E: `latex.build` (festes `latexmk`-argv in der
+            // Sandbox) führt ausschließlich `UiaLatexWriter`, und nur mit
+            // `ExecuteProcess`; das Profil bringt nie eine freie Shell,
+            // Prozesswerkzeuge, Netz oder `deps.*` mit.
+            assert_eq!(
+                has("latex.build"),
+                *profile == RegistryProfile::UiaLatexWriter
+                    && granted.contains(Permission::ExecuteProcess),
+                "{profile:?}: latex.build"
+            );
+            if *profile == RegistryProfile::UiaLatexWriter {
+                assert!(
+                    !tools.iter().any(|tool| tool.starts_with("shell.")
+                        || tool.starts_with("process.")
+                        || tool.starts_with("web.")
+                        || tool.starts_with("deps.")
+                        || tool.starts_with("explore.")
+                        || *tool == "lens.ask"),
+                    "UiaLatexWriter darf nur fs.*, doc.read_pdf und latex.build führen: {tools:?}"
+                );
             }
             if *profile == RegistryProfile::WorkspaceEdit {
                 assert!(
@@ -443,6 +477,7 @@ fn test_role_by_permission_matrix_after_reducer() {
                 assert!(
                     *tool != "fs.write"
                         && *tool != "shell.exec"
+                        && *tool != "latex.build"
                         && (is_uia_worker_browser_open || !BROWSER.contains(tool)),
                     "{role}: {tool} darf nie sichtbar sein"
                 );
@@ -525,8 +560,8 @@ fn test_role_tomls_never_admit_write_shell_or_browser_and_researcher_web_is_web_
         // test_authority_reducer_for_role_covers_every_role_and_bounds_its_profile`
         // (dort `exempt_from_subset_bound`) statt einer zweiten,
         // handgepflegten Rollenliste: `executor`, `memory-steward`,
-        // `uia-worker`, `uia-writer`, `uia-shell-worker` und `agent-steward`
-        // sind dokumentierte Ausnahmen — ihr Profil braucht ein Recht
+        // `uia-worker`, `uia-writer`, `uia-shell-worker`, `uia-latex-writer`
+        // und `agent-steward` sind dokumentierte Ausnahmen — ihr Profil braucht ein Recht
         // (`WriteWorkspace`/`ExecuteProcess`),
         // das der `AuthorityReducer` ihrer Rolle nie trägt, weil sie es über
         // ihre feste Profilzuweisung bei der Registry-Montage bekommen (siehe

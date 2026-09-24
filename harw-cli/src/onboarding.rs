@@ -424,7 +424,8 @@ fn persist_outcome(home: &Path, outcome: &harw_tui::SetupOutcome) -> Result<(), 
         )?;
     }
 
-    // Credential-Pool-Eintrag (nur wenn eine Referenz vorliegt).
+    // Credential-Pool-Eintrag (nur wenn eine Referenz vorliegt): wird
+    // ersetzt, nicht angehängt — siehe `replace_pool_entries`.
     if let Some(secret) = &auth_ref {
         let auth_path = harw_home::auth_path(home);
         let mut auth = load_auth(&auth_path)?;
@@ -432,17 +433,7 @@ fn persist_outcome(home: &Path, outcome: &harw_tui::SetupOutcome) -> Result<(), 
             .credential_pool
             .entry(outcome.provider_id.clone())
             .or_default();
-        if !pool.iter().any(|entry| {
-            entry.secret.to_string() == secret.to_string()
-                && entry.base_url.as_deref() == Some(outcome.base_url.as_str())
-        }) {
-            pool.push(harw_config::CredentialEntry {
-                secret: secret.clone(),
-                label: None,
-                priority: 0,
-                base_url: Some(outcome.base_url.clone()),
-            });
-        }
+        replace_pool_entries(pool, secret, &outcome.base_url);
         write_file(
             &auth_path.clone(),
             &toml::to_string_pretty(&auth).map_err(|e| format!("auth serialisieren: {e}"))?,
@@ -472,6 +463,188 @@ fn persist_outcome(home: &Path, outcome: &harw_tui::SetupOutcome) -> Result<(), 
         profile.display()
     );
     Ok(())
+}
+
+/// Ersetzt den Credential-Pool eines Providers nach einem Onboarding.
+///
+/// # Description
+/// Codex-Login und API-Key teilen sich die Provider-ID `openai`. Früher wurde
+/// hier nur angehängt; nach einem Wechsel Codex → API blieb der
+/// Codex-Login-Verweis (`…/.codex/auth.json#/tokens/access_token`) im Pool
+/// stehen und ließ den Start scheitern, weil das Token nur für die
+/// Codex-Route freigegeben ist. Jetzt gilt:
+/// - der neue Verweis steht an erster Stelle (mit `base_url` der neuen Route);
+/// - frühere Einträge bleiben nur erhalten, wenn sie zur neuen Route passen:
+///   Codex-Login-Verweise nur auf der Codex-Route, alle anderen nur auf
+///   Nicht-Codex-Routen (Erkennung über
+///   [`harw_provider_http::is_codex_login_reference`] und
+///   [`harw_provider_http::is_codex_base_url`]);
+/// - ein früherer Eintrag mit demselben Verweis entfällt (Duplikat).
+///
+/// # Arguments
+/// - `pool` (`&mut Vec<CredentialEntry>`): Pool-Einträge des Providers.
+/// - `secret` (`&SecretRef`): neuer Verweis aus dem Onboarding.
+/// - `base_url` (`&str`): Basis-URL der neuen Route.
+fn replace_pool_entries(
+    pool: &mut Vec<harw_config::CredentialEntry>,
+    secret: &SecretRef,
+    base_url: &str,
+) {
+    let codex_route = harw_provider_http::is_codex_login_reference(secret)
+        || harw_provider_http::is_codex_base_url(base_url);
+    let new_ref = secret.to_string();
+    let previous = std::mem::take(pool);
+    pool.push(harw_config::CredentialEntry {
+        secret: secret.clone(),
+        label: None,
+        priority: 0,
+        base_url: Some(base_url.to_owned()),
+    });
+    pool.extend(previous.into_iter().filter(|entry| {
+        entry.secret.to_string() != new_ref
+            && harw_provider_http::is_codex_login_reference(&entry.secret) == codex_route
+    }));
+}
+
+/// Indizes der Pool-Einträge, die nicht zur Route des Providers passen.
+///
+/// # Description
+/// Dieselbe Regel wie [`replace_pool_entries`], angewandt auf einen
+/// bestehenden Pool ohne neuen Eintrag: die Route ist Codex, wenn
+/// `provider.auth` ein Codex-Login-Verweis ist oder `provider.base_url` die
+/// Codex-Basis-URL; dann bleiben nur Codex-Login-Verweise, sonst nur
+/// Nicht-Codex-Verweise. Zusätzlich gilt jeder spätere Eintrag mit demselben
+/// Verweis wie ein früherer, behaltener Eintrag als veraltet (Duplikat).
+/// Secrets werden dabei nie aufgelöst — nur die Verweise verglichen.
+///
+/// # Arguments
+/// - `pool`: die Pool-Einträge des Providers in Dateireihenfolge.
+/// - `provider`: seine Konfiguration; `None` (Provider unbekannt) → nichts
+///   ist veraltet (ohne Route keine Aussage).
+///
+/// # Returns
+/// Aufsteigende Indizes in `pool`.
+pub(crate) fn stale_pool_indices(
+    pool: &[harw_config::CredentialEntry],
+    provider: Option<&harw_config::ProviderToml>,
+) -> Vec<usize> {
+    let Some(provider) = provider else {
+        return Vec::new();
+    };
+    let codex_route = provider
+        .auth
+        .as_ref()
+        .is_some_and(harw_provider_http::is_codex_login_reference)
+        || harw_provider_http::is_codex_base_url(&provider.base_url);
+    let mut kept: Vec<String> = Vec::new();
+    let mut stale = Vec::new();
+    for (index, entry) in pool.iter().enumerate() {
+        let reference = entry.secret.to_string();
+        if harw_provider_http::is_codex_login_reference(&entry.secret) != codex_route
+            || kept.contains(&reference)
+        {
+            stale.push(index);
+        } else {
+            kept.push(reference);
+        }
+    }
+    stale
+}
+
+/// Ergebnis von [`prune_credential_pools`] je Provider: Name und die
+/// entfernten Einträge als `(Index, Label)` — nie der Verweis selbst.
+pub(crate) type PrunedPool = (String, Vec<(usize, Option<String>)>);
+
+/// Entfernt veraltete Pool-Einträge ([`stale_pool_indices`]) aus der
+/// `auth.toml` unter `auth_path`.
+///
+/// # Arguments
+/// - `auth_path`: `harw_home::auth_path(home)`.
+/// - `config`: aufgelöste Konfiguration (liefert `providers`).
+/// - `only`: nur diesen Provider prüfen; `None` → alle Pools.
+///
+/// # Returns
+/// Je betroffenem Provider (sortiert) die entfernten `(Index, Label)`. Die
+/// Datei wird nur geschrieben, wenn etwas entfernt wurde.
+///
+/// # Errors
+/// Lese-, Parse-, Serialisierungs- oder Schreibfehler der `auth.toml`.
+pub(crate) fn prune_credential_pools(
+    auth_path: &Path,
+    config: &harw_config::ResolvedConfig,
+    only: Option<&str>,
+) -> Result<Vec<PrunedPool>, String> {
+    let mut auth = load_auth(auth_path)?;
+    let mut providers: Vec<String> = auth
+        .credential_pool
+        .keys()
+        .filter(|name| only.is_none_or(|only| only == name.as_str()))
+        .cloned()
+        .collect();
+    providers.sort();
+    let mut removed = Vec::new();
+    for name in providers {
+        let Some(pool) = auth.credential_pool.get_mut(&name) else {
+            continue;
+        };
+        let stale = stale_pool_indices(pool, config.providers.get(&name));
+        if stale.is_empty() {
+            continue;
+        }
+        let labels: Vec<(usize, Option<String>)> = stale
+            .iter()
+            .filter_map(|index| pool.get(*index).map(|entry| (*index, entry.label.clone())))
+            .collect();
+        let mut index = 0usize;
+        pool.retain(|_| {
+            let keep = !stale.contains(&index);
+            index += 1;
+            keep
+        });
+        removed.push((name, labels));
+    }
+    if !removed.is_empty() {
+        write_file(
+            &auth_path.to_path_buf(),
+            &toml::to_string_pretty(&auth).map_err(|e| format!("auth serialisieren: {e}"))?,
+        )?;
+    }
+    Ok(removed)
+}
+
+/// Hinweiszeile für `stderr` beim Start, wenn ein Pool veraltete Einträge
+/// trägt (die der Provider-Aufbau sonst nur per `tracing::warn!`
+/// überspringt).
+///
+/// # Returns
+/// `None` ohne Befund; sonst ein Satz mit den betroffenen Providern und dem
+/// Befehl `harw auth prune`. Nennt nie einen Verweis oder ein Secret.
+pub(crate) fn stale_pool_hint(config: &harw_config::ResolvedConfig) -> Option<String> {
+    let mut affected: Vec<(String, usize)> = config
+        .auth
+        .credential_pool
+        .iter()
+        .map(|(name, pool)| {
+            (
+                name.clone(),
+                stale_pool_indices(pool, config.providers.get(name)).len(),
+            )
+        })
+        .filter(|(_, count)| *count > 0)
+        .collect();
+    if affected.is_empty() {
+        return None;
+    }
+    affected.sort();
+    let list: Vec<String> = affected
+        .iter()
+        .map(|(name, count)| format!("{name} ({count})"))
+        .collect();
+    Some(format!(
+        "Hinweis: veraltete Credential-Pool-Einträge werden übersprungen: {}. \
+         Aufräumen mit `harw auth prune`.",
+        list.join(", ")
+    ))
 }
 
 /// Encode API identifiers as a single collision-free filename component.
@@ -909,6 +1082,167 @@ mod tests {
         assert_eq!(auth.credential_pool["cloudflare"].len(), 1);
         assert_ne!(model_filename("a/b"), model_filename("a%2Fb"));
         assert!(!model_filename("../../escape").contains('/'));
+        Ok(())
+    }
+
+    /// Onboardet `openai` nacheinander mit zwei Verweisen und liefert den
+    /// resultierenden Pool als kanonische Referenz-Strings.
+    fn pool_after_two_onboardings(
+        first: (&str, &str),
+        second: (&str, &str),
+    ) -> TestResult<Vec<String>> {
+        let home = tempfile::tempdir().map_err(ctx("tempdir"))?;
+        harw_home::ensure_home(home.path()).map_err(ctx("ensure_home"))?;
+        for (base_url, secret_ref) in [first, second] {
+            let outcome = harw_tui::SetupOutcome {
+                provider_id: "openai".into(),
+                base_url: base_url.into(),
+                api: "openai-responses".into(),
+                model: "gpt-5.4".into(),
+                secret_ref: Some(secret_ref.into()),
+                auth_header: None,
+            };
+            persist_outcome(home.path(), &outcome).map_err(ctx("persist_outcome"))?;
+        }
+        let auth = load_auth(&harw_home::auth_path(home.path())).map_err(ctx("load_auth"))?;
+        Ok(auth.credential_pool["openai"]
+            .iter()
+            .map(|entry| entry.secret.to_string())
+            .collect())
+    }
+
+    const CODEX_REF: &str =
+        "file-json:/nonexistent-harw-test-home/.codex/auth.json#/tokens/access_token";
+
+    #[test]
+    fn persist_outcome_codex_then_api_key_keeps_only_key_in_pool() -> TestResult {
+        let pool = pool_after_two_onboardings(
+            ("https://chatgpt.com/backend-api/codex", CODEX_REF),
+            ("https://api.openai.com/v1", "env:OPENAI_API_KEY"),
+        )?;
+        assert_eq!(pool, vec!["env:OPENAI_API_KEY".to_owned()]);
+        Ok(())
+    }
+
+    #[test]
+    fn persist_outcome_api_key_then_codex_keeps_only_codex_login_in_pool() -> TestResult {
+        let pool = pool_after_two_onboardings(
+            ("https://api.openai.com/v1", "env:OPENAI_API_KEY"),
+            ("https://chatgpt.com/backend-api/codex", CODEX_REF),
+        )?;
+        assert_eq!(pool.len(), 1);
+        assert!(pool[0].ends_with(".codex/auth.json#/tokens/access_token"));
+        Ok(())
+    }
+
+    fn provider(base_url: &str, auth: &str) -> TestResult<harw_config::ProviderToml> {
+        toml::from_str(&format!(
+            "name = \"openai\"\napi = \"openai-responses\"\nbase_url = \"{base_url}\"\nauth = \"{auth}\"\n"
+        ))
+        .map_err(ctx("provider toml"))
+    }
+
+    fn pool_entry(
+        reference: &str,
+        label: Option<&str>,
+    ) -> TestResult<harw_config::CredentialEntry> {
+        Ok(harw_config::CredentialEntry {
+            secret: reference.parse().map_err(ctx("secret ref"))?,
+            label: label.map(str::to_owned),
+            priority: 0,
+            base_url: None,
+        })
+    }
+
+    #[test]
+    fn stale_pool_indices_drop_wrong_route_entries_and_duplicates() -> TestResult {
+        let pool = vec![
+            pool_entry("env:OPENAI_API_KEY", Some("key"))?,
+            pool_entry(CODEX_REF, Some("codex"))?,
+            pool_entry("env:OPENAI_API_KEY", Some("dup"))?,
+            pool_entry("env:OPENAI_OTHER", None)?,
+        ];
+        let api = provider("https://api.openai.com/v1", "env:OPENAI_API_KEY")?;
+        assert_eq!(stale_pool_indices(&pool, Some(&api)), vec![1, 2]);
+        let codex = provider("https://chatgpt.com/backend-api/codex", CODEX_REF)?;
+        assert_eq!(stale_pool_indices(&pool, Some(&codex)), vec![0, 2, 3]);
+        // Ohne Provider-Konfiguration keine Aussage.
+        assert!(stale_pool_indices(&pool, None).is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn prune_credential_pools_rewrites_auth_toml_and_hint_names_the_provider() -> TestResult {
+        let home = tempfile::tempdir().map_err(ctx("tempdir"))?;
+        let auth_path = home.path().join("auth.toml");
+        let mut auth = harw_config::AuthConfig::default();
+        auth.credential_pool.insert(
+            "openai".to_owned(),
+            vec![
+                pool_entry("env:OPENAI_API_KEY", Some("key"))?,
+                pool_entry(CODEX_REF, Some("codex"))?,
+            ],
+        );
+        auth.credential_pool
+            .insert("other".to_owned(), vec![pool_entry("env:OTHER_KEY", None)?]);
+        std::fs::write(
+            &auth_path,
+            toml::to_string_pretty(&auth).map_err(ctx("auth toml"))?,
+        )
+        .map_err(ctx("write auth"))?;
+        let mut config = harw_config::ResolvedConfig::default();
+        config.providers.insert(
+            "openai".to_owned(),
+            provider("https://api.openai.com/v1", "env:OPENAI_API_KEY")?,
+        );
+        config.auth = auth;
+
+        let hint = stale_pool_hint(&config).ok_or(TestError::Missing("hint"))?;
+        assert!(hint.contains("openai (1)"), "{hint}");
+        assert!(hint.contains("harw auth prune"), "{hint}");
+        assert!(
+            !hint.contains("codex/auth.json"),
+            "kein Verweis im Hinweis: {hint}"
+        );
+
+        // Nur `other` angefragt: nichts zu tun, Datei bleibt.
+        let none = prune_credential_pools(&auth_path, &config, Some("other"))
+            .map_err(ctx("prune other"))?;
+        assert!(none.is_empty());
+
+        let removed =
+            prune_credential_pools(&auth_path, &config, None).map_err(ctx("prune all"))?;
+        assert_eq!(
+            removed,
+            vec![("openai".to_owned(), vec![(1, Some("codex".to_owned()))])]
+        );
+        let reloaded = load_auth(&auth_path).map_err(ctx("reload auth"))?;
+        let refs: Vec<String> = reloaded.credential_pool["openai"]
+            .iter()
+            .map(|entry| entry.secret.to_string())
+            .collect();
+        assert_eq!(refs, vec!["env:OPENAI_API_KEY".to_owned()]);
+        assert_eq!(reloaded.credential_pool["other"].len(), 1);
+
+        config.auth = reloaded;
+        assert!(stale_pool_hint(&config).is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn replace_pool_entries_puts_new_first_and_keeps_matching_route_entries() -> TestResult {
+        let old_key: SecretRef = "env:OPENAI_OLD".parse().map_err(ctx("old ref"))?;
+        let new_key: SecretRef = "env:OPENAI_NEW".parse().map_err(ctx("new ref"))?;
+        let entry = |secret: &SecretRef| harw_config::CredentialEntry {
+            secret: secret.clone(),
+            label: None,
+            priority: 0,
+            base_url: None,
+        };
+        let mut pool = vec![entry(&old_key), entry(&new_key)];
+        replace_pool_entries(&mut pool, &new_key, "https://api.openai.com/v1");
+        let refs: Vec<String> = pool.iter().map(|e| e.secret.to_string()).collect();
+        assert_eq!(refs, vec!["env:OPENAI_NEW", "env:OPENAI_OLD"]);
         Ok(())
     }
 

@@ -30,6 +30,9 @@
 //! (siehe [`harw_config::AuthConfig::credential_pool_ordered`]). Fehlt
 //! `provider.auth`, wird stattdessen der erste Pool-Eintrag primär. Ist der
 //! Pool leer oder für den Provider nicht konfiguriert, ändert sich nichts.
+//! Ein nicht auflösbarer Pool-Eintrag (z. B. ein veralteter Codex-Login-
+//! Verweis nach dem Wechsel auf die API-Route) wird mit Warnung übersprungen;
+//! nur ein nicht auflösbares `provider.auth` bricht den Start ab.
 //! Schlägt der aktive Eintrag mit 401/403 oder Kontingent-Erschöpfung fehl,
 //! wird er bounded (60 s) abgekühlt und derselbe Request **genau einmal**
 //! mit dem nächsten Eintrag wiederholt (siehe `credential_pool`-Modul).
@@ -113,6 +116,7 @@ pub use anthropic::{
     DEFAULT_ANTHROPIC_BASE_URL, anthropic_messages_url, build_messages_body,
     extract_anthropic_text,
 };
+pub use codex::{is_codex_base_url, is_codex_login_reference};
 pub use error::{HttpProviderError, HttpProviderResult};
 pub use retry::{
     JitterSource, RetryDecision, RetryPolicy, RetrySleeper, RetryingProvider, SleepFuture,
@@ -5475,6 +5479,72 @@ mod tests {
         );
 
         assert!(result.is_none());
+        Ok(())
+    }
+
+    /// Konfiguration mit Provider `openai` (API-Route), gültigem primärem
+    /// `env:`-Verweis und einem veralteten Codex-Login-Verweis als
+    /// Failover im Pool — der Zustand nach „Codex-Import, dann API-Key".
+    fn config_with_stale_codex_failover(primary_env: &str) -> harw_config::ResolvedConfig {
+        let mut config = harw_config::ResolvedConfig::default();
+        config.harness.default_provider = Some("openai".to_owned());
+        config.harness.default_model = Some("gpt-test".to_owned());
+        config.providers.insert(
+            "openai".to_owned(),
+            configured_provider(
+                "openai",
+                "https://api.openai.com/v1".to_owned(),
+                vec!["gpt-test"],
+                primary_env,
+            ),
+        );
+        config
+            .env_layer
+            .insert("OPENAI_API_KEY".to_owned(), "sk-test".to_owned());
+        config.auth.credential_pool.insert(
+            "openai".to_owned(),
+            vec![harw_config::CredentialEntry {
+                secret: harw_config::SecretRef::FileJson {
+                    path: "/nonexistent-harw-test-home/.codex/auth.json".to_owned(),
+                    pointer: "/tokens/access_token".to_owned(),
+                },
+                label: None,
+                priority: 0,
+                base_url: None,
+            }],
+        );
+        config
+    }
+
+    #[test]
+    fn test_build_provider_skips_stale_codex_failover_entry() -> TestResult {
+        let config = config_with_stale_codex_failover("OPENAI_API_KEY");
+        build_provider(&config).map_err(ctx("stale failover must not block startup"))?;
+        Ok(())
+    }
+
+    #[test]
+    fn test_build_provider_broken_primary_reference_is_hard_error() {
+        let config = config_with_stale_codex_failover("HARW_TEST_MISSING_PRIMARY_KEY");
+        assert!(build_provider(&config).is_err());
+    }
+
+    #[test]
+    fn test_is_codex_login_reference_matches_only_access_token() -> TestResult {
+        let codex: harw_config::SecretRef =
+            "file-json:/home/u/.codex/auth.json#/tokens/access_token"
+                .parse()
+                .map_err(ctx("codex ref"))?;
+        let api_key: harw_config::SecretRef = "file-json:/home/u/.codex/auth.json#/OPENAI_API_KEY"
+            .parse()
+            .map_err(ctx("api key ref"))?;
+        assert!(is_codex_login_reference(&codex));
+        assert!(!is_codex_login_reference(&api_key));
+        assert!(!is_codex_login_reference(&harw_config::SecretRef::Env(
+            "OPENAI_API_KEY".to_owned()
+        )));
+        assert!(is_codex_base_url("https://chatgpt.com/backend-api/codex/"));
+        assert!(!is_codex_base_url("https://api.openai.com/v1"));
         Ok(())
     }
 

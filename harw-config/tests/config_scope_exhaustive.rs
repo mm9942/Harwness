@@ -25,7 +25,8 @@ mod common;
 use common::{TestResult, ctx};
 
 use harw_config::harness_config::{
-    CompactionToml, GuardsToml, OnboardingSection, OnboardingSeen, ReasoningWeightsToml,
+    CompactionToml, DiaryToml, DreamToml, GuardsToml, KnowledgeToml, OnboardingSection,
+    OnboardingSeen, ReasoningWeightsToml,
 };
 use harw_config::{
     CargoSandboxModeToml, CargoSandboxToml, FIELD_TABLE, HarnessConfig, InternalModelChoice,
@@ -78,6 +79,8 @@ fn test_field_table_exhaustive_harness_config() {
         compaction: _,
         reasoning: _,
         guards: _,
+        knowledge: _,
+        dream: _,
         base_dir: _, // #[serde(skip)], kein TOML-Feld, keine FIELD_TABLE-Zeile
     } = HarnessConfig::default();
     // Kein `..` — ein neues Feld auf HarnessConfig, das hier nicht
@@ -609,6 +612,43 @@ fn test_field_table_exhaustive_guards_toml() {
         "guards.no_progress_rounds_warn",
         "guards.no_progress_rounds_abort",
         "guards.plan_stale_rounds",
+    ] {
+        assert_path_in_field_table_exactly_once(path);
+    }
+}
+
+// ---------------------------------------------------------------------
+// [knowledge] (Abschnitt 1.17, 1 Feld)
+// ---------------------------------------------------------------------
+
+#[test]
+fn test_field_table_exhaustive_knowledge_toml() {
+    let KnowledgeToml { diary } = KnowledgeToml::default();
+    let DiaryToml { retention_days } = diary;
+    let _ = retention_days;
+    assert_path_in_field_table_exactly_once("knowledge.diary.retention_days");
+}
+
+// ---------------------------------------------------------------------
+// [dream] (Abschnitt 1.18, 5 Felder)
+// ---------------------------------------------------------------------
+
+#[test]
+fn test_field_table_exhaustive_dream_toml() {
+    let DreamToml {
+        enabled,
+        budget,
+        idle_minutes,
+        cooldown_minutes,
+        schedule,
+    } = DreamToml::default();
+    let _ = (enabled, budget, idle_minutes, cooldown_minutes, schedule);
+    for path in [
+        "dream.enabled",
+        "dream.budget",
+        "dream.idle_minutes",
+        "dream.cooldown_minutes",
+        "dream.schedule",
     ] {
         assert_path_in_field_table_exactly_once(path);
     }

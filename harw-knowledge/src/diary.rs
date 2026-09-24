@@ -9,10 +9,19 @@
 //! Frontmatter-Helfer — dieses Modul öffnet nie selbst eine Datei zum
 //! Schreiben, außer über `write_atomic`/`write_artifact`.
 //!
+//! # Strukturierte Seitendatei
+//! Jeder [`append`] schreibt zusätzlich eine JSON-Zeile
+//! ([`DiaryRecord`]: Zeit, Trigger, Text) nach
+//! `diary/<agent-id>/<YYYY-MM-DD>.jsonl`. [`read_day_entries`] liest die
+//! Einträge strukturiert und fällt auf das Zurückparsen des Markdowns
+//! zurück, wenn die Seitendatei fehlt oder nicht zum `entry_count` der
+//! Markdown-Datei passt (Altbestand, abgebrochener Append). Das Markdown
+//! bleibt die kanonische, indexierte Quelle.
+//!
 //! # Concurrency
-//! Reine, threadsichere Datenfunktionen ohne eigenes Locking. Gleichzeitige
-//! `append`-/`gc`-Aufrufe für denselben Agenten müssen vom Aufrufer
-//! serialisiert werden (read-modify-write auf derselben Tages-/Rollup-Datei).
+//! [`append`] und [`gc`] serialisieren ihre Read-Modify-Write-Zyklen über
+//! [`crate::lock::KnowledgeLock`] auf der Tages- bzw. Rollup-Datei —
+//! prozessübergreifend und zwischen Threads.
 //!
 //! # Fehler
 //! Jeder fehlschlagende Pfad liefert [`crate::error::KnowledgeError`] /
@@ -21,14 +30,20 @@
 use std::path::{Path, PathBuf};
 
 use jiff::{SignedDuration, Timestamp};
+use serde::{Deserialize, Serialize};
 
 use crate::artifact::{ArtifactId, ArtifactKind, Frontmatter, KnowledgeArtifact};
 use crate::error::KnowledgeResult;
+use crate::lock::KnowledgeLock;
 use crate::store::{KnowledgeStore, parse_frontmatter};
 use crate::visibility::{AgentId, VisibilityScope};
 
 /// Why a diary entry was appended rather than edited in place.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+///
+/// Serialisiert als [`Self::label`] (`end-of-session`, `compaction`,
+/// `dream-reflection`, `manual`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
 pub enum DiaryTrigger {
     EndOfSession,
     Compaction,
@@ -46,6 +61,47 @@ impl DiaryTrigger {
             Self::Manual => "manual",
         }
     }
+
+    /// Umkehrung von [`Self::label`]; `None` für unbekannte Bezeichnungen.
+    #[must_use]
+    pub fn from_label(label: &str) -> Option<Self> {
+        [
+            Self::EndOfSession,
+            Self::Compaction,
+            Self::DreamReflection,
+            Self::Manual,
+        ]
+        .into_iter()
+        .find(|trigger| trigger.label() == label.trim())
+    }
+}
+
+/// Ein Diary-Eintrag in strukturierter Form (eine Zeile der
+/// `.jsonl`-Seitendatei bzw. aus dem Markdown zurückgewonnen).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DiaryRecord {
+    /// Zeitpunkt des Eintrags.
+    pub recorded_at: Timestamp,
+    /// Auslöser.
+    pub trigger: DiaryTrigger,
+    /// Eintragstext.
+    pub text: String,
+}
+
+/// Ein Diary-Tag in strukturierter Form ([`read_day_entries`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DiaryDay {
+    /// Halter des Tagebuchs.
+    pub agent_id: AgentId,
+    /// Datum `YYYY-MM-DD`.
+    pub date: String,
+    /// Sichtbarkeit der Tagesdatei (aus dem Markdown-Frontmatter).
+    pub visibility: VisibilityScope,
+    /// Einträge in Schreibreihenfolge.
+    pub entries: Vec<DiaryRecord>,
+    /// `true`, wenn die Einträge aus der `.jsonl`-Seitendatei stammen;
+    /// `false` beim Rückfall auf das Markdown.
+    pub structured: bool,
 }
 
 /// One immutable append in a per-agent, per-day diary file.
@@ -130,15 +186,16 @@ fn entry_count(frontmatter: &Frontmatter) -> u64 {
 /// Tagesdatei.
 ///
 /// # Fehler
-/// - [`crate::error::KnowledgeError::Io`]\: Lese-/Schreib-/Rename-Fehler.
+/// - [`crate::error::KnowledgeError::Io`]\: Lese-/Schreib-/Rename-Fehler,
+///   `TimedOut`, wenn die Tagessperre nicht rechtzeitig frei wird.
 /// - [`crate::error::KnowledgeError::MalformedFrontmatter`] /
 ///   [`crate::error::KnowledgeError::Frontmatter`]: eine bestehende
 ///   Tagesdatei ließ sich nicht als gültiges Frontmatter-Dokument parsen.
 ///
 /// # Nebenläufigkeit
-/// Kein eigenes Locking; diese Funktion liest, ändert im Speicher und
-/// schreibt dann atomar zurück — gleichzeitige `append`-Aufrufe für denselben
-/// Tag desselben Agenten muss der Aufrufer serialisieren.
+/// Der Read-Modify-Write-Zyklus läuft unter [`KnowledgeLock`] auf der
+/// Tagesdatei; gleichzeitige `append`-Aufrufe (auch aus anderen Prozessen)
+/// verlieren keinen Eintrag. Die Sperre ist nicht wiedereintrittsfähig.
 ///
 /// # Examples
 /// ```rust,no_run
@@ -160,6 +217,7 @@ pub fn append(store: &KnowledgeStore, entry: &DiaryEntry) -> KnowledgeResult<Kno
     let date = day_key(entry.recorded_at);
     let path = store.diary_path(&entry.agent_id, &date);
     let id = diary_artifact_id(&entry.agent_id, &date);
+    let _lock = KnowledgeLock::for_target(&path)?;
 
     let mut artifact = if path.is_file() {
         store.read_artifact(&path, id, ArtifactKind::DiaryEntry)?
@@ -183,14 +241,124 @@ pub fn append(store: &KnowledgeStore, entry: &DiaryEntry) -> KnowledgeResult<Kno
     artifact
         .frontmatter
         .extra
-        .insert(DATE_KEY.to_owned(), serde_json::Value::String(date));
+        .insert(DATE_KEY.to_owned(), serde_json::Value::String(date.clone()));
     artifact.frontmatter.extra.insert(
         ENTRY_COUNT_KEY.to_owned(),
         serde_json::Value::from(next_count),
     );
 
     store.write_artifact(&path, &artifact)?;
+    // Erst nach dem kanonischen Markdown: scheitert dieser Schritt, passt die
+    // Seitendatei nicht mehr zum `entry_count` und `read_day_entries` fällt
+    // auf das Markdown zurück — es geht nichts verloren.
+    append_record(
+        &store.diary_log_path(&entry.agent_id, &date),
+        &DiaryRecord {
+            recorded_at: entry.recorded_at,
+            trigger: entry.trigger,
+            text: entry.body.clone(),
+        },
+    )?;
     Ok(artifact)
+}
+
+/// Hängt eine JSON-Zeile an eine `.jsonl`-Seitendatei an.
+fn append_record(path: &Path, record: &DiaryRecord) -> KnowledgeResult<()> {
+    use std::io::Write;
+
+    let mut line = serde_json::to_string(record)?;
+    line.push('\n');
+    let mut file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)?;
+    file.write_all(line.as_bytes())?;
+    file.sync_all()?;
+    Ok(())
+}
+
+/// Liest einen Diary-Tag strukturiert.
+///
+/// # Beschreibung
+/// Bevorzugt die `.jsonl`-Seitendatei; sie gilt nur, wenn ihre Zeilenzahl
+/// dem `entry_count` der Markdown-Datei entspricht und jede Zeile gültig ist.
+/// Sonst werden die `### HH:MM:SS — <trigger>`-Abschnitte des Markdowns
+/// zurückgeparst (Altbestand); ein unbekannter Trigger wird dabei zu
+/// [`DiaryTrigger::Manual`]. Reiner Lesezugriff.
+///
+/// # Rückgabe
+/// `None`, wenn es für den Tag keine Markdown-Datei gibt.
+///
+/// # Fehler
+/// Wie [`read_day`].
+pub fn read_day_entries(
+    store: &KnowledgeStore,
+    agent_id: &AgentId,
+    date: &str,
+) -> KnowledgeResult<Option<DiaryDay>> {
+    let Some(artifact) = read_day(store, agent_id, date)? else {
+        return Ok(None);
+    };
+    let expected = entry_count(&artifact.frontmatter);
+    let structured = read_records(&store.diary_log_path(agent_id, date))
+        .filter(|records| records.len() as u64 == expected && expected > 0);
+    let (entries, structured) = match structured {
+        Some(records) => (records, true),
+        None => (parse_markdown_entries(date, &artifact), false),
+    };
+    Ok(Some(DiaryDay {
+        agent_id: agent_id.clone(),
+        date: date.to_owned(),
+        visibility: artifact.frontmatter.visibility.clone(),
+        entries,
+        structured,
+    }))
+}
+
+/// Liest alle Zeilen einer `.jsonl`-Seitendatei; `None` bei fehlender Datei
+/// oder irgendeiner ungültigen Zeile (dann gilt das Markdown).
+fn read_records(path: &Path) -> Option<Vec<DiaryRecord>> {
+    let content = std::fs::read_to_string(path).ok()?;
+    content
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .map(|line| serde_json::from_str::<DiaryRecord>(line).ok())
+        .collect()
+}
+
+/// Zerlegt einen Tages-Body in `### HH:MM:SS — <trigger>`-Einträge.
+fn parse_markdown_entries(date: &str, artifact: &KnowledgeArtifact) -> Vec<DiaryRecord> {
+    let mut entries: Vec<DiaryRecord> = Vec::new();
+    for line in artifact.body.lines() {
+        let header = line
+            .strip_prefix("### ")
+            .and_then(|rest| rest.split_once(" — "));
+        match header {
+            Some((time, trigger)) => {
+                let recorded_at = format!("{date}T{}Z", time.trim())
+                    .parse::<Timestamp>()
+                    .unwrap_or(artifact.frontmatter.created_at);
+                entries.push(DiaryRecord {
+                    recorded_at,
+                    trigger: DiaryTrigger::from_label(trigger).unwrap_or(DiaryTrigger::Manual),
+                    text: String::new(),
+                });
+            }
+            None => {
+                if let Some(entry) = entries.last_mut()
+                    && (!entry.text.is_empty() || !line.trim().is_empty())
+                {
+                    entry.text.push_str(line);
+                    entry.text.push('\n');
+                }
+            }
+        }
+    }
+    for entry in &mut entries {
+        let trimmed = entry.text.trim_end().to_owned();
+        entry.text = trimmed;
+    }
+    entries
 }
 
 /// Liest die Tagesdatei eines Agenten, falls vorhanden.
@@ -296,8 +464,9 @@ pub struct DiaryGcReport {
 /// Keine.
 ///
 /// # Nebenläufigkeit
-/// Kein eigenes Locking; ein `gc`-Lauf darf nicht parallel zu einem `append`
-/// oder einem weiteren `gc`-Lauf für denselben Agenten laufen.
+/// Jeder Tag wird unter [`KnowledgeLock`] auf Tages- und Rollup-Datei
+/// übernommen (Reihenfolge Tag → Rollup); parallele `append`-/`gc`-Aufrufe
+/// sind damit sicher.
 ///
 /// # Examples
 /// ```rust,no_run
@@ -357,6 +526,13 @@ pub fn gc(
     for (date, path) in eligible {
         let year_month = date[..MONTH_PREFIX_LEN].to_owned();
         let rollup_path = store.diary_rollup_path(agent_id, &year_month);
+        // Sperrreihenfolge Tag → Rollup; `append` hält nur die Tagessperre.
+        let _day_lock = KnowledgeLock::for_target(&path)?;
+        let _rollup_lock = KnowledgeLock::for_target(&rollup_path)?;
+        if !path.is_file() {
+            // Ein paralleler `gc` hat den Tag inzwischen übernommen.
+            continue;
+        }
         roll_day_into_month(
             store,
             agent_id,
@@ -366,7 +542,15 @@ pub fn gc(
             &rollup_path,
             now,
         )?;
+        let day_log = store.diary_log_path(agent_id, &date);
+        if day_log.is_file() {
+            let lines = std::fs::read_to_string(&day_log)?;
+            append_raw(&store.diary_rollup_log_path(agent_id, &year_month), &lines)?;
+        }
         std::fs::remove_file(&path)?;
+        if day_log.is_file() {
+            std::fs::remove_file(&day_log)?;
+        }
 
         report.rolled_up_days.push(date);
         if !report.touched_months.contains(&year_month) {
@@ -375,6 +559,28 @@ pub fn gc(
     }
 
     Ok(report)
+}
+
+/// Hängt rohe `.jsonl`-Zeilen an eine Seitendatei an (Rollup).
+fn append_raw(path: &Path, lines: &str) -> KnowledgeResult<()> {
+    use std::io::Write;
+
+    if lines.trim().is_empty() {
+        return Ok(());
+    }
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let mut file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)?;
+    file.write_all(lines.as_bytes())?;
+    if !lines.ends_with('\n') {
+        file.write_all(b"\n")?;
+    }
+    file.sync_all()?;
+    Ok(())
 }
 
 /// Hängt eine einzelne Tagesdatei an ihre monatliche Rollup-Datei an.
@@ -437,6 +643,258 @@ fn roll_day_into_month(
     );
 
     store.write_artifact(rollup_path, &rollup)
+}
+
+/// Obergrenze eines automatischen Eintrags ([`record`]) in Bytes; längere
+/// Texte werden zeichensicher gekürzt und mit `…` markiert.
+pub const MAX_AUTOMATIC_ENTRY_BYTES: usize = 4 * 1024;
+
+/// Prüft, dass eine Agent-Id als einzelne Pfadkomponente taugt
+/// (`diary/<agent-id>/…`).
+///
+/// # Fehler
+/// [`crate::error::KnowledgeError::Io`] mit `InvalidInput` für leere Ids,
+/// `.`/`..`, Pfadtrenner oder Steuerzeichen.
+pub fn validate_agent_id(agent_id: &AgentId) -> KnowledgeResult<()> {
+    let raw = agent_id.as_str();
+    let unsafe_id = raw.trim().is_empty()
+        || raw == "."
+        || raw == ".."
+        || raw.chars().any(|c| c == '/' || c == '\\' || c.is_control());
+    if unsafe_id {
+        return Err(invalid_input(format!("ungültige Agent-Id '{raw}'")));
+    }
+    Ok(())
+}
+
+fn invalid_input(detail: String) -> crate::error::KnowledgeError {
+    crate::error::KnowledgeError::Io(std::io::Error::new(
+        std::io::ErrorKind::InvalidInput,
+        detail,
+    ))
+}
+
+/// Kürzt `text` zeichensicher auf höchstens `max_bytes` Bytes (inklusive
+/// der `…`-Markierung).
+#[must_use]
+pub fn truncate_entry_text(text: &str, max_bytes: usize) -> String {
+    if text.len() <= max_bytes {
+        return text.to_owned();
+    }
+    const MARK: &str = "…";
+    let mut end = max_bytes.saturating_sub(MARK.len());
+    while end > 0 && !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}{MARK}", text[..end].trim_end())
+}
+
+/// Schreibt einen automatischen Diary-Eintrag (Compaction, Sitzungsende,
+/// Traum-Reflexion).
+///
+/// # Beschreibung
+/// Gemeinsamer Schreibweg der Automatik (Plan D3): trimmt `text`, kürzt ihn
+/// auf [`MAX_AUTOMATIC_ENTRY_BYTES`] und hängt ihn über [`append`] mit
+/// Sichtbarkeit `OperatorOnly` an das Tagebuch von `agent_id` an — der
+/// Operator liest es mit `/diary`, der Agent selbst nur über das
+/// Lese-Werkzeug `diary.read`, das die Agent-Id statt der Sichtbarkeit
+/// prüft.
+///
+/// # Fehler
+/// - [`crate::error::KnowledgeError::Io`] mit `InvalidInput`: leerer Text
+///   oder ungültige Agent-Id ([`validate_agent_id`]).
+/// - alle Fehler von [`append`].
+pub fn record(
+    store: &KnowledgeStore,
+    agent_id: &AgentId,
+    trigger: DiaryTrigger,
+    text: &str,
+    now: Timestamp,
+) -> KnowledgeResult<KnowledgeArtifact> {
+    validate_agent_id(agent_id)?;
+    let text = text.trim();
+    if text.is_empty() {
+        return Err(invalid_input(format!(
+            "leerer Diary-Eintrag ({})",
+            trigger.label()
+        )));
+    }
+    append(
+        store,
+        &DiaryEntry {
+            agent_id: agent_id.clone(),
+            recorded_at: now,
+            trigger,
+            visibility: VisibilityScope::OperatorOnly,
+            body: truncate_entry_text(text, MAX_AUTOMATIC_ENTRY_BYTES),
+        },
+    )
+}
+
+/// Schreib-API für die Traum-Reflexion (D5): [`record`] mit
+/// [`DiaryTrigger::DreamReflection`].
+///
+/// # Fehler
+/// Wie [`record`].
+pub fn record_dream_reflection(
+    store: &KnowledgeStore,
+    agent_id: &AgentId,
+    text: &str,
+    now: Timestamp,
+) -> KnowledgeResult<KnowledgeArtifact> {
+    record(store, agent_id, DiaryTrigger::DreamReflection, text, now)
+}
+
+/// Alle Agenten mit einem Diary-Verzeichnis, sortiert.
+///
+/// # Fehler
+/// [`crate::error::KnowledgeError::Io`] beim Auflisten; ein fehlendes
+/// `diary/`-Verzeichnis ergibt eine leere Liste.
+pub fn list_agents(store: &KnowledgeStore) -> KnowledgeResult<Vec<AgentId>> {
+    let dir = store.root().join("diary");
+    if !dir.is_dir() {
+        return Ok(Vec::new());
+    }
+    let mut agents = Vec::new();
+    for entry in std::fs::read_dir(&dir)? {
+        let path = entry?.path();
+        if !path.is_dir() {
+            continue;
+        }
+        if let Some(name) = path.file_name().and_then(|name| name.to_str()) {
+            let agent = AgentId::new(name);
+            if validate_agent_id(&agent).is_ok() {
+                agents.push(agent);
+            }
+        }
+    }
+    agents.sort_by(|a, b| a.as_str().cmp(b.as_str()));
+    Ok(agents)
+}
+
+/// Alle Tagesdaten (`YYYY-MM-DD`) eines Agenten, aufsteigend. Aufgeräumte
+/// Tage (Rollup) zählen nicht dazu.
+///
+/// # Fehler
+/// [`crate::error::KnowledgeError::Io`] beim Auflisten.
+pub fn list_days(store: &KnowledgeStore, agent_id: &AgentId) -> KnowledgeResult<Vec<String>> {
+    validate_agent_id(agent_id)?;
+    let dir = store.root().join("diary").join(agent_id.as_str());
+    if !dir.is_dir() {
+        return Ok(Vec::new());
+    }
+    let mut days = Vec::new();
+    for entry in std::fs::read_dir(&dir)? {
+        let path = entry?.path();
+        let is_day = path.is_file() && path.extension().is_some_and(|ext| ext == "md");
+        if !is_day {
+            continue;
+        }
+        if let Some(stem) = path.file_stem().and_then(|stem| stem.to_str())
+            && is_day_key(stem)
+        {
+            days.push(stem.to_owned());
+        }
+    }
+    days.sort();
+    Ok(days)
+}
+
+/// `true` für ein wohlgeformtes `YYYY-MM-DD` aus Ziffern.
+#[must_use]
+pub fn is_day_key(raw: &str) -> bool {
+    raw.len() == DAY_STEM_LEN
+        && raw.char_indices().all(|(index, c)| match index {
+            4 | 7 => c == '-',
+            _ => c.is_ascii_digit(),
+        })
+}
+
+/// Liest alle Tage eines Agenten im Bereich `from..=to` strukturiert
+/// ([`read_day_entries`]), aufsteigend.
+///
+/// # Beschreibung
+/// Reiner Lesezugriff; prüft keine Sichtbarkeit — das ist Sache des
+/// Aufrufers (`DiaryDay::visibility`). Aufgeräumte Tage (Rollup) sind nicht
+/// enthalten.
+///
+/// # Fehler
+/// - `InvalidInput`, wenn `from`/`to` kein `YYYY-MM-DD` ist oder die
+///   Agent-Id ungültig ist.
+/// - wie [`read_day_entries`].
+pub fn read_range(
+    store: &KnowledgeStore,
+    agent_id: &AgentId,
+    from: &str,
+    to: &str,
+) -> KnowledgeResult<Vec<DiaryDay>> {
+    for bound in [from, to] {
+        if !is_day_key(bound) {
+            return Err(invalid_input(format!(
+                "ungültiges Datum '{bound}' (YYYY-MM-DD)"
+            )));
+        }
+    }
+    let mut days = Vec::new();
+    for date in list_days(store, agent_id)? {
+        if date.as_str() < from || date.as_str() > to {
+            continue;
+        }
+        if let Some(day) = read_day_entries(store, agent_id, &date)? {
+            days.push(day);
+        }
+    }
+    Ok(days)
+}
+
+/// Ergebnis von [`maintain`]: ein [`DiaryGcReport`] je Agent mit Wirkung.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct DiaryMaintenanceReport {
+    /// Angewandtes Aufbewahrungsfenster in Tagen.
+    pub retention_days: i64,
+    /// Nur Agenten, bei denen mindestens ein Tag aufgeräumt wurde.
+    pub agents: Vec<DiaryGcReport>,
+}
+
+impl DiaryMaintenanceReport {
+    /// Summe aller aufgeräumten Tage.
+    #[must_use]
+    pub fn rolled_up_days(&self) -> usize {
+        self.agents
+            .iter()
+            .map(|report| report.rolled_up_days.len())
+            .sum()
+    }
+}
+
+/// Diary-Wartung für alle Agenten (Plan D3/D5): Tage älter als
+/// `retention_days` wandern per [`gc`] in die Monats-Rollups.
+///
+/// # Beschreibung
+/// Ruft [`gc`] für jeden Agenten aus [`list_agents`]; `retention_days`
+/// stammt aus `[knowledge.diary] retention_days`
+/// (Default [`DEFAULT_DIARY_RETENTION_DAYS`]). Ein Fehler bei einem Agenten
+/// bricht die Wartung ab (die bereits übernommenen Tage bleiben konsistent,
+/// weil [`gc`] je Tag atomar arbeitet).
+///
+/// # Fehler
+/// Wie [`gc`] und [`list_agents`].
+pub fn maintain(
+    store: &KnowledgeStore,
+    now: Timestamp,
+    retention_days: i64,
+) -> KnowledgeResult<DiaryMaintenanceReport> {
+    let mut report = DiaryMaintenanceReport {
+        retention_days: retention_days.max(0),
+        agents: Vec::new(),
+    };
+    for agent in list_agents(store)? {
+        let agent_report = gc(store, &agent, now, retention_days)?;
+        if !agent_report.rolled_up_days.is_empty() {
+            report.agents.push(agent_report);
+        }
+    }
+    Ok(report)
 }
 
 #[cfg(test)]
@@ -534,6 +992,88 @@ mod tests {
     }
 
     #[test]
+    fn test_read_day_entries_prefers_the_structured_side_file() -> TestResult {
+        let root = temporary_root("harw-knowledge-diary-structured")?;
+        let store = KnowledgeStore::new(&root);
+        let agent = AgentId::new("agent-1");
+        let at = Timestamp::from_second(1_700_000_000)
+            .map_err(crate::test_support::ctx("valid timestamp"))?;
+        // Ein Text, der wie ein Markdown-Eintragskopf aussieht, zerlegt nur
+        // das Rückparsen — die Seitendatei bleibt exakt.
+        let tricky = "Erstens.\n### 00:00:00 — manual\nkein Kopf";
+        append(&store, &entry(&agent, at, DiaryTrigger::Compaction, tricky))?;
+        let day = read_day_entries(&store, &agent, &day_key(at))?
+            .ok_or(TestError::Missing("day exists"))?;
+        assert!(day.structured);
+        assert_eq!(day.visibility, VisibilityScope::SelfOnly);
+        assert_eq!(
+            day.entries,
+            vec![DiaryRecord {
+                recorded_at: at,
+                trigger: DiaryTrigger::Compaction,
+                text: tricky.to_owned(),
+            }]
+        );
+        let line = std::fs::read_to_string(store.diary_log_path(&agent, &day_key(at)))?;
+        assert!(line.contains("\"trigger\":\"compaction\""), "{line}");
+        std::fs::remove_dir_all(root)?;
+        Ok(())
+    }
+
+    #[test]
+    fn test_read_day_entries_falls_back_to_markdown_for_legacy_days() -> TestResult {
+        let root = temporary_root("harw-knowledge-diary-legacy")?;
+        let store = KnowledgeStore::new(&root);
+        let agent = AgentId::new("agent-1");
+        let at = Timestamp::from_second(1_700_000_000)
+            .map_err(crate::test_support::ctx("valid timestamp"))?;
+        append(&store, &entry(&agent, at, DiaryTrigger::Manual, "Eins."))?;
+        append(
+            &store,
+            &entry(&agent, at, DiaryTrigger::EndOfSession, "Zwei."),
+        )?;
+        // Altbestand: keine Seitendatei.
+        std::fs::remove_file(store.diary_log_path(&agent, &day_key(at)))?;
+        let day = read_day_entries(&store, &agent, &day_key(at))?
+            .ok_or(TestError::Missing("day exists"))?;
+        assert!(!day.structured);
+        assert_eq!(day.entries.len(), 2);
+        assert_eq!(day.entries[0].text, "Eins.");
+        assert_eq!(day.entries[0].recorded_at, at);
+        assert_eq!(day.entries[1].trigger, DiaryTrigger::EndOfSession);
+        assert_eq!(read_day_entries(&store, &agent, "2020-01-01")?, None);
+        std::fs::remove_dir_all(root)?;
+        Ok(())
+    }
+
+    #[test]
+    fn test_parallel_appends_lose_no_entry() -> TestResult {
+        let root = temporary_root("harw-knowledge-diary-parallel")?;
+        let store = KnowledgeStore::new(&root);
+        let agent = AgentId::new("agent-1");
+        let at = Timestamp::from_second(1_700_000_000)
+            .map_err(crate::test_support::ctx("valid timestamp"))?;
+        let handles: Vec<_> = (0..6)
+            .map(|index| {
+                let store = store.clone();
+                let entry = entry(&agent, at, DiaryTrigger::Manual, &format!("E{index}"));
+                std::thread::spawn(move || append(&store, &entry).map(|_| ()))
+            })
+            .collect();
+        for handle in handles {
+            handle
+                .join()
+                .map_err(|_| TestError::Unexpected("thread panicked".to_owned()))??;
+        }
+        let day = read_day_entries(&store, &agent, &day_key(at))?
+            .ok_or(TestError::Missing("day exists"))?;
+        assert!(day.structured);
+        assert_eq!(day.entries.len(), 6);
+        std::fs::remove_dir_all(root)?;
+        Ok(())
+    }
+
+    #[test]
     fn test_read_day_returns_none_for_a_day_that_never_happened() -> TestResult {
         let root = temporary_root("harw-knowledge-diary-read-missing")?;
         let store = KnowledgeStore::new(&root);
@@ -604,6 +1144,10 @@ mod tests {
             .map_err(crate::test_support::ctx("rollup file exists"))?;
         assert!(rollup_content.contains("Alter Eintrag."));
         assert!(rollup_content.contains(&format!("## {}", day_key(old))));
+        assert!(!store.diary_log_path(&agent, &day_key(old)).is_file());
+        let rollup_log = std::fs::read_to_string(store.diary_rollup_log_path(&agent, &year_month))
+            .map_err(crate::test_support::ctx("rollup side file exists"))?;
+        assert!(rollup_log.contains("Alter Eintrag."));
 
         std::fs::remove_dir_all(root).map_err(crate::test_support::ctx("remove temporary root"))?;
         Ok(())
@@ -698,6 +1242,89 @@ mod tests {
 
         assert!(report.rolled_up_days.is_empty());
         assert!(report.touched_months.is_empty());
+        std::fs::remove_dir_all(root).map_err(crate::test_support::ctx("remove temporary root"))?;
+        Ok(())
+    }
+
+    #[test]
+    fn test_record_writes_trimmed_bounded_operator_visible_entries() -> TestResult {
+        let root = temporary_root("harw-knowledge-diary-record")?;
+        let store = KnowledgeStore::new(&root);
+        let agent = AgentId::new("explorer");
+        let now =
+            Timestamp::from_second(1_700_000_000).map_err(crate::test_support::ctx("valid now"))?;
+        let long = "ä".repeat(MAX_AUTOMATIC_ENTRY_BYTES);
+        record(&store, &agent, DiaryTrigger::Compaction, &long, now)
+            .map_err(crate::test_support::ctx("record compaction"))?;
+        record_dream_reflection(&store, &agent, "  Traum  ", now)
+            .map_err(crate::test_support::ctx("record reflection"))?;
+
+        let day = read_day_entries(&store, &agent, &day_key(now))
+            .map_err(crate::test_support::ctx("read day"))?
+            .ok_or(TestError::Missing("day"))?;
+        assert!(day.structured);
+        assert_eq!(day.visibility, VisibilityScope::OperatorOnly);
+        assert_eq!(day.entries.len(), 2);
+        assert_eq!(day.entries[0].trigger, DiaryTrigger::Compaction);
+        assert!(day.entries[0].text.len() <= MAX_AUTOMATIC_ENTRY_BYTES);
+        assert!(day.entries[0].text.ends_with('…'));
+        assert_eq!(day.entries[1].trigger, DiaryTrigger::DreamReflection);
+        assert_eq!(day.entries[1].text, "Traum");
+
+        assert!(record(&store, &agent, DiaryTrigger::EndOfSession, "   ", now).is_err());
+        assert!(
+            record(
+                &store,
+                &AgentId::new("../x"),
+                DiaryTrigger::Manual,
+                "x",
+                now
+            )
+            .is_err()
+        );
+        std::fs::remove_dir_all(root).map_err(crate::test_support::ctx("remove temporary root"))?;
+        Ok(())
+    }
+
+    #[test]
+    fn test_read_range_and_maintain_cover_every_agent() -> TestResult {
+        let root = temporary_root("harw-knowledge-diary-maintain")?;
+        let store = KnowledgeStore::new(&root);
+        let day = 86_400;
+        let now = Timestamp::from_second(1_700_000_000 + 200 * day)
+            .map_err(crate::test_support::ctx("valid now"))?;
+        let old =
+            Timestamp::from_second(1_700_000_000).map_err(crate::test_support::ctx("valid old"))?;
+        let recent = Timestamp::from_second(1_700_000_000 + 199 * day)
+            .map_err(crate::test_support::ctx("valid recent"))?;
+        for name in ["a", "b"] {
+            let agent = AgentId::new(name);
+            record(&store, &agent, DiaryTrigger::Manual, "alt", old)
+                .map_err(crate::test_support::ctx("old entry"))?;
+            record(&store, &agent, DiaryTrigger::Manual, "neu", recent)
+                .map_err(crate::test_support::ctx("recent entry"))?;
+        }
+        let a = AgentId::new("a");
+        let all = read_range(&store, &a, "2000-01-01", "2999-12-31")
+            .map_err(crate::test_support::ctx("range"))?;
+        assert_eq!(all.len(), 2);
+        let only_recent = read_range(&store, &a, &day_key(recent), &day_key(now))
+            .map_err(crate::test_support::ctx("recent range"))?;
+        assert_eq!(only_recent.len(), 1);
+        assert!(read_range(&store, &a, "gestern", "heute").is_err());
+
+        let report = maintain(&store, now, DEFAULT_DIARY_RETENTION_DAYS)
+            .map_err(crate::test_support::ctx("maintain"))?;
+        assert_eq!(report.agents.len(), 2);
+        assert_eq!(report.rolled_up_days(), 2);
+        assert_eq!(
+            list_days(&store, &a).map_err(crate::test_support::ctx("days"))?,
+            vec![day_key(recent)]
+        );
+        assert_eq!(
+            list_agents(&store).map_err(crate::test_support::ctx("agents"))?,
+            vec![a.clone(), AgentId::new("b")]
+        );
         std::fs::remove_dir_all(root).map_err(crate::test_support::ctx("remove temporary root"))?;
         Ok(())
     }

@@ -594,6 +594,80 @@ struct TurnMeter {
     model_rounds: u32,
     tool_calls: u32,
     usage: TokenUsage,
+    /// Ob die Abschluss-Anweisung des Token-Budgets bereits ausgelöst wurde
+    /// (nur für das einmalige Log; die Anweisung selbst bleibt danach aktiv).
+    wrap_up_announced: bool,
+}
+
+/// Vorgabe-Schwelle (Prozent des Limits), ab der ein Turn mit
+/// [`TurnTokenBudget`] die Abschluss-Anweisung
+/// ([`TOKEN_BUDGET_WRAP_UP_INSTRUCTION`]) in jede weitere Anfrage legt.
+pub const DEFAULT_TOKEN_BUDGET_WRAP_UP_PERCENT: u64 = 80;
+
+/// Abschluss-Anweisung, sobald ein Token-Budget zu
+/// [`TurnTokenBudget::wrap_up_percent`] verbraucht ist.
+pub const TOKEN_BUDGET_WRAP_UP_INSTRUCTION: &str = "Dein Token-Budget für diesen Auftrag ist \
+fast aufgebraucht. Beginne keine neuen Erkundungen und rufe nur noch Werkzeuge auf, wenn sie für \
+den Abschluss unverzichtbar sind. Fasse jetzt zusammen, was du herausgefunden hast, und liefere \
+dein Ergebnis im verlangten Format ab; offene Punkte nennst du ausdrücklich als offen.";
+
+/// Token-Budget eines Turns, gemessen in **neuen** Tokens (Teil C).
+///
+/// # Beschreibung
+/// Gezählt wird [`TokenUsage::fresh_tokens`] jeder Modellrunde: ungecachte
+/// Eingabe plus Ausgabe. Ein erneut gesendeter, gecachter Verlauf zählt
+/// damit nicht jede Runde erneut — das alte Maß
+/// (`input_tokens + output_tokens` kumuliert) ließ ein Kind mit 60 000
+/// Tokens Budget schon nach wenigen Runden bei „210 426 verbraucht"
+/// scheitern. `used_before` trägt den Verbrauch früherer Turns derselben
+/// Sitzung (das Budget gilt für die ganze Kindsitzung).
+///
+/// Geprüft wird vor **jeder** Modellrunde ([`TurnControl`]-Prüfpunkt):
+/// - ab `wrap_up_percent` % legt der Turn die Abschluss-Anweisung
+///   [`TOKEN_BUDGET_WRAP_UP_INSTRUCTION`] in jede weitere Anfrage;
+/// - ab 100 % endet der Turn wie jede andere Grenze mit
+///   `TurnOutcome::Cancelled { reason: CancelReason::Budget }`; der Aufrufer
+///   (`ManagedAgentSpawner`) macht daraus ein Teilergebnis.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TurnTokenBudget {
+    /// Obergrenze der neuen Tokens (inklusive `used_before`).
+    pub limit: u64,
+    /// Bereits vor diesem Turn verbrauchte neue Tokens der Sitzung.
+    pub used_before: u64,
+    /// Schwelle der Abschluss-Anweisung in Prozent von `limit`.
+    pub wrap_up_percent: u64,
+}
+
+impl TurnTokenBudget {
+    /// Budget mit `limit`, Vorverbrauch `used_before` und der Vorgabe-Schwelle
+    /// [`DEFAULT_TOKEN_BUDGET_WRAP_UP_PERCENT`].
+    #[must_use]
+    pub const fn new(limit: u64, used_before: u64) -> Self {
+        Self {
+            limit,
+            used_before,
+            wrap_up_percent: DEFAULT_TOKEN_BUDGET_WRAP_UP_PERCENT,
+        }
+    }
+
+    /// Ersetzt die Schwelle der Abschluss-Anweisung (Prozent, auf 100 gekappt).
+    #[must_use]
+    pub const fn with_wrap_up_percent(mut self, percent: u64) -> Self {
+        self.wrap_up_percent = if percent > 100 { 100 } else { percent };
+        self
+    }
+
+    /// `true`, wenn `used` die Abschluss-Schwelle erreicht.
+    #[must_use]
+    pub fn wrap_up_reached(&self, used: u64) -> bool {
+        u128::from(used) * 100 >= u128::from(self.limit) * u128::from(self.wrap_up_percent)
+    }
+
+    /// `true`, wenn `used` das Limit erreicht.
+    #[must_use]
+    pub const fn exhausted(&self, used: u64) -> bool {
+        used >= self.limit
+    }
 }
 
 /// Steuerblock eines Turns: Abbruch, Grenzwerte, Serveruhr und Zähler.
@@ -633,6 +707,7 @@ pub struct TurnControl {
     limits: TurnLimits,
     clock: Arc<dyn Clock>,
     meter: Arc<Mutex<TurnMeter>>,
+    token_budget: Option<TurnTokenBudget>,
 }
 
 impl std::fmt::Debug for TurnControl {
@@ -640,6 +715,7 @@ impl std::fmt::Debug for TurnControl {
         f.debug_struct("TurnControl")
             .field("cancel", &self.cancel)
             .field("limits", &self.limits)
+            .field("token_budget", &self.token_budget)
             .finish_non_exhaustive()
     }
 }
@@ -662,7 +738,66 @@ impl TurnControl {
             limits: TurnLimits::unlimited(),
             clock: Arc::new(SystemClock),
             meter: Arc::new(Mutex::new(TurnMeter::default())),
+            token_budget: None,
         }
+    }
+
+    /// Setzt ein Token-Budget über neue, ungecachte Tokens
+    /// ([`TurnTokenBudget`]), das vor jeder Modellrunde geprüft wird.
+    ///
+    /// # Arguments
+    /// - `budget` (`TurnTokenBudget`): Limit, Vorverbrauch und
+    ///   Abschluss-Schwelle.
+    #[must_use]
+    pub fn with_token_budget(mut self, budget: TurnTokenBudget) -> Self {
+        self.token_budget = Some(budget);
+        self
+    }
+
+    /// Das gesetzte Token-Budget, falls vorhanden.
+    #[must_use]
+    pub fn token_budget(&self) -> Option<TurnTokenBudget> {
+        self.token_budget
+    }
+
+    /// Neue Tokens dieses Turns plus Vorverbrauch des Budgets
+    /// ([`TurnTokenBudget::used_before`], `0` ohne Budget).
+    #[must_use]
+    pub fn fresh_tokens_used(&self) -> u64 {
+        let own = self.meter().usage.fresh_tokens();
+        self.token_budget
+            .map_or(own, |budget| budget.used_before.saturating_add(own))
+    }
+
+    /// `true`, wenn ein gesetztes Token-Budget erschöpft ist.
+    #[must_use]
+    pub fn token_budget_exhausted(&self) -> bool {
+        self.token_budget
+            .is_some_and(|budget| budget.exhausted(self.fresh_tokens_used()))
+    }
+
+    /// `true`, sobald ein gesetztes Token-Budget die Abschluss-Schwelle
+    /// erreicht hat; die erste Feststellung wird einmal geloggt.
+    #[must_use]
+    pub fn token_budget_wrap_up_due(&self) -> bool {
+        let Some(budget) = self.token_budget else {
+            return false;
+        };
+        let used = self.fresh_tokens_used();
+        if !budget.wrap_up_reached(used) {
+            return false;
+        }
+        let mut meter = self.meter();
+        if !meter.wrap_up_announced {
+            meter.wrap_up_announced = true;
+            tracing::info!(
+                limit = budget.limit,
+                used,
+                percent = budget.wrap_up_percent,
+                "turn_loop.token_budget_wrap_up"
+            );
+        }
+        true
     }
 
     /// Replaces the cancellation token (e.g. a child of the caller's token).
@@ -778,9 +913,23 @@ impl TurnControl {
             return Some(reason);
         }
         let meter = self.meter();
+        let fresh_exhausted = self.token_budget.is_some_and(|budget| {
+            budget.exhausted(
+                budget
+                    .used_before
+                    .saturating_add(meter.usage.fresh_tokens()),
+            )
+        });
         let exhausted = meter.model_rounds >= self.limits.max_model_rounds
             || meter.usage.output_tokens >= self.limits.max_output_tokens_total
+            || fresh_exhausted
             || self.wall_time_exceeded(&meter);
+        if fresh_exhausted {
+            tracing::warn!(
+                limit = self.token_budget.map_or(0, |budget| budget.limit),
+                "turn_loop.token_budget_exhausted"
+            );
+        }
         exhausted.then_some(CancelReason::Budget)
     }
 
@@ -1013,15 +1162,23 @@ fn delegation_targets_fragment(names: &[String]) -> Option<harw_context::Fragmen
 /// Fehlschlag der Newtype-Validierung ist kein Turn-Fehler: ohne den Hinweis
 /// liefert der Provider eben eine zweiteilige statt einer nahtlosen Antwort.
 fn continuation_fragment(body: &str) -> Option<harw_context::Fragment> {
-    let label = harw_context::FragmentLabel::try_new("continuation.instruction").ok()?;
-    let section = harw_context::SectionName::try_new("continuation.instruction").ok()?;
+    instruction_fragment("continuation.instruction", "turn_loop.continuation", body)
+}
+
+/// Wickelt eine vom Turn-Loop selbst erzeugte Anweisung in einen
+/// [`harw_context::Fragment`]-Block (Trust-Klasse `Instruction`); `name` ist
+/// Label und Abschnitt zugleich, `provider` die Herkunft. `None`, wenn die
+/// Newtype-Validierung scheitert (dann fehlt nur der Hinweis).
+fn instruction_fragment(name: &str, provider: &str, body: &str) -> Option<harw_context::Fragment> {
+    let label = harw_context::FragmentLabel::try_new(name).ok()?;
+    let section = harw_context::SectionName::try_new(name).ok()?;
     Some(harw_context::Fragment {
         label,
         section,
         trust: harw_context::TrustClass::Instruction,
         stability: harw_context::Stability::Stable,
         origin: harw_context::FragmentOrigin {
-            provider: "turn_loop.continuation".to_owned(),
+            provider: provider.to_owned(),
             namespace: "core".to_owned(),
             produced_at: jiff::Timestamp::now(),
         },
@@ -1385,24 +1542,30 @@ impl PreparedApprovals {
     }
 }
 
-/// Liest die optionale Leitfrage eines Handoff-Calls aus dessen Argumenten.
+/// Liest den angezeigten Auftrag eines Handoff-Calls aus dessen Argumenten.
 ///
 /// # Beschreibung
-/// Nur ein JSON-String unter dem Schlüssel `"question"` zählt. Jede andere Form
-/// (Objekt, Zahl, fehlender Schlüssel) ergibt `None`: die Argumente stammen vom
-/// Modell, und ein Ereignisfeld darf keinen Wert behaupten, den das Modell so
-/// nicht geliefert hat.
+/// Zuerst zählt ein nicht leerer JSON-String unter `"task"` (die heutige
+/// Schreibweise der Handoff-Werkzeuge), danach einer unter `"question"` (die
+/// ältere). Jede andere Form (Objekt, Zahl, fehlender Schlüssel, leerer
+/// Text) ergibt `None`: die Argumente stammen vom Modell, und ein
+/// Ereignisfeld darf keinen Wert behaupten, den das Modell so nicht geliefert
+/// hat. Ohne diese Reihenfolge zeigte die Oberfläche für jeden Handoff mit
+/// `task` „(kein Auftrag angegeben)".
 ///
 /// # Arguments
 /// - `arguments` (`&serde_json::Value`): die Argumente des Handoff-Calls.
 ///
 /// # Returns
-/// `Some(frage)` als eigener `String`, sonst `None`.
+/// `Some(auftrag)` als eigener `String`, sonst `None`.
 fn child_question(arguments: &serde_json::Value) -> Option<String> {
-    arguments
-        .get("question")
-        .and_then(serde_json::Value::as_str)
-        .map(ToOwned::to_owned)
+    ["task", "question"].iter().find_map(|field| {
+        arguments
+            .get(*field)
+            .and_then(serde_json::Value::as_str)
+            .filter(|text| !text.trim().is_empty())
+            .map(ToOwned::to_owned)
+    })
 }
 
 /// Argumentfelder eines Handoff-Calls, die — in dieser Reihenfolge — als
@@ -2922,11 +3085,13 @@ async fn drive_turn(
                 "turn_loop.preflight_emergency_compaction",
             );
             let target = budget.emergency_target(EMERGENCY_PREFLIGHT_TARGET_PERCENT);
+            let overhead = request_overhead_tokens(&request, session.token_calibration());
             if let Some(outcome) = run_budget_compaction(
                 session,
                 model,
                 store,
                 target,
+                overhead,
                 crate::auto_compact::CompactDecision::Emergency,
             )
             .await
@@ -2948,6 +3113,9 @@ async fn drive_turn(
                 session.token_calibration(),
             );
         }
+        // Nicht-Historien-Anteil dieses Requests (System, Fragmente,
+        // Werkzeuge) — für jede weitere Notfall-Verdichtung dieser Runde.
+        let request_overhead = request_overhead_tokens(&request, session.token_calibration());
         if budget.overflows(estimated_tokens) {
             return Err(context_exhausted_error(
                 estimated_tokens,
@@ -3027,6 +3195,7 @@ async fn drive_turn(
                     model,
                     store,
                     target,
+                    request_overhead,
                     crate::auto_compact::CompactDecision::Emergency,
                 )
                 .await
@@ -3130,6 +3299,7 @@ async fn drive_turn(
                 model,
                 store,
                 target,
+                request_overhead,
                 crate::auto_compact::CompactDecision::Emergency,
             )
             .await
@@ -3948,7 +4118,7 @@ async fn maybe_compact(
         .context_window_tokens()
         .saturating_mul(REGULAR_COMPACTION_TARGET_PERCENT)
         / 100;
-    if let Some(outcome) = run_budget_compaction(session, model, store, target, decision).await {
+    if let Some(outcome) = run_budget_compaction(session, model, store, target, 0, decision).await {
         *last_compaction_tokens_after = Some(outcome.tokens_after);
     }
 }
@@ -4098,6 +4268,19 @@ async fn assemble_round_request(
             }
         }
     }
+    // Teil C: ab der Abschluss-Schwelle des Token-Budgets bekommt jede
+    // weitere Anfrage die Anweisung, jetzt zusammenzufassen — damit beim
+    // harten Limit eine verwertbare letzte Antwort als Teilergebnis vorliegt.
+    if control.token_budget_wrap_up_due() {
+        match instruction_fragment(
+            "budget.wrap_up",
+            "turn_loop.token_budget",
+            TOKEN_BUDGET_WRAP_UP_INSTRUCTION,
+        ) {
+            Some(fragment) => fragments.push(fragment),
+            None => tracing::warn!("turn_loop.wrap_up_fragment_unavailable"),
+        }
+    }
     let instructions = load_instructions(session).await;
     let mut tools = collect_tools(session)?;
 
@@ -4169,14 +4352,28 @@ async fn assemble_round_request(
 /// die Verdichtung scheiterte (nur geloggt — ein Compact-Fehlschlag bricht
 /// den Turn nie ab; der Aufrufer entscheidet, ob er ohne Verdichtung
 /// weitermacht).
+///
+/// `overhead_tokens` ist der Nicht-Historien-Anteil des zuletzt gebauten
+/// Requests (System-Prompt, Fragmente, Werkzeugschemata; Teil C): das Ziel
+/// gilt dann für den ganzen Request, nicht nur für die Historie. Die
+/// reguläre Auto-Verdichtung übergibt `0` (ihr Ziel ist ein Historienziel).
 async fn run_budget_compaction(
     session: &mut AgentSession,
     model: &dyn ModelProvider,
     store: &dyn StateStore,
     target_tokens: u64,
+    overhead_tokens: u64,
     reason: crate::auto_compact::CompactDecision,
 ) -> Option<crate::compaction::CompactionOutcome> {
-    match crate::compaction::compact_for_budget(session, model, target_tokens, Some(reason)).await {
+    match crate::compaction::compact_for_budget(
+        session,
+        model,
+        target_tokens,
+        overhead_tokens,
+        Some(reason),
+    )
+    .await
+    {
         Ok(outcome) => {
             session.set_pending_compaction(false);
             if outcome.no_op {
@@ -4235,6 +4432,18 @@ fn appended_tokens_since(session: &AgentSession, mark: usize) -> u64 {
             total.saturating_add(u64::try_from(len).unwrap_or(u64::MAX))
         });
     session.token_calibration().bytes_to_tokens(bytes)
+}
+
+/// Geschätzte Tokens eines gebauten Requests außerhalb seiner Historie
+/// (System-Prompt, Fragmente, Datenblock, Werkzeugschemata), mit derselben
+/// Rechnung wie [`crate::compaction::CompactionBudget::with_request_overhead`].
+fn request_overhead_tokens(
+    request: &ModelRequest,
+    calibration: &crate::context_budget::TokenCalibration,
+) -> u64 {
+    crate::context_budget::estimate_request_tokens(request, calibration).saturating_sub(
+        crate::compaction::estimate_history_tokens(&request.history, calibration),
+    )
 }
 
 /// Fehler „Kontext erschöpft": der Request passt auch nach einer
@@ -6620,8 +6829,24 @@ mod tests {
             child_question(&serde_json::json!({"question": {"text": "x"}})),
             None
         );
-        assert_eq!(child_question(&serde_json::json!({"task": "x"})), None);
         assert_eq!(child_question(&serde_json::Value::Null), None);
+    }
+
+    #[test]
+    fn child_question_prefers_the_task_field() {
+        assert_eq!(
+            child_question(&serde_json::json!({"task": "Baue X"})),
+            Some("Baue X".to_owned())
+        );
+        assert_eq!(
+            child_question(&serde_json::json!({"task": "Baue X", "question": "alt"})),
+            Some("Baue X".to_owned())
+        );
+        assert_eq!(
+            child_question(&serde_json::json!({"task": "  ", "question": "alt"})),
+            Some("alt".to_owned())
+        );
+        assert_eq!(child_question(&serde_json::json!({"task": 3})), None);
     }
 
     struct FixedChildSpawner {
@@ -6691,7 +6916,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn handoff_without_a_question_argument_reports_none() -> TestResult {
+    async fn handoff_with_only_a_task_argument_reports_the_task() -> TestResult {
         let child = SessionId::new();
         let (tx, _rx) = mpsc::unbounded_channel();
         let (turn_tx, mut turn_rx) = mpsc::unbounded_channel();
@@ -6718,9 +6943,12 @@ mod tests {
             .into_iter()
             .find(|event| matches!(event, TurnEvent::ChildSpawned { .. }))
             .ok_or(TestError::Missing("ein Handoff meldet ein ChildSpawned"))?;
+        // Teil C: `task` ist der angezeigte Auftrag — früher stand hier
+        // `None`, und die Oberfläche zeigte „(kein Auftrag angegeben)".
         assert!(matches!(
             spawned,
-            TurnEvent::ChildSpawned { question: None, role, .. } if role == "reviewer"
+            TurnEvent::ChildSpawned { question: Some(question), role, .. }
+                if role == "reviewer" && question == "review"
         ));
         Ok(())
     }

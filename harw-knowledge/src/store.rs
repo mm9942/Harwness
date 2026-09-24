@@ -73,6 +73,28 @@ impl KnowledgeStore {
             .join(format!("{date}.md"))
     }
 
+    /// Strukturierte Seitendatei eines Diary-Tages
+    /// (`diary/<agent-id>/<YYYY-MM-DD>.jsonl`): eine JSON-Zeile je Eintrag
+    /// ([`crate::diary::DiaryRecord`]), geschrieben neben der Markdown-Datei.
+    #[must_use]
+    pub fn diary_log_path(&self, agent_id: &AgentId, date: &str) -> PathBuf {
+        self.root
+            .join("diary")
+            .join(agent_id.as_str())
+            .join(format!("{date}.jsonl"))
+    }
+
+    /// Strukturierte Seitendatei eines Monats-Rollups
+    /// (`diary/<agent-id>/rollup/<YYYY-MM>.jsonl`).
+    #[must_use]
+    pub fn diary_rollup_log_path(&self, agent_id: &AgentId, year_month: &str) -> PathBuf {
+        self.root
+            .join("diary")
+            .join(agent_id.as_str())
+            .join("rollup")
+            .join(format!("{year_month}.jsonl"))
+    }
+
     /// Pfad zu einer monatlichen Diary-Rollup-Datei
     /// (`diary/<agent-id>/rollup/<YYYY-MM>.md`, §3.3), in die `diary::gc`
     /// Tages-Dateien komprimiert, die älter als `retention_days` sind.
@@ -92,6 +114,16 @@ impl KnowledgeStore {
             .join("dreams")
             .join(date)
             .join(format!("{job_id}.md"))
+    }
+
+    /// Strukturierte Seitendatei eines Traumberichts
+    /// (`dreams/<YYYY-MM-DD>/<job-id>.json`, [`crate::dream::DreamReportData`]).
+    #[must_use]
+    pub fn dream_data_path(&self, date: &str, job_id: &str) -> PathBuf {
+        self.root
+            .join("dreams")
+            .join(date)
+            .join(format!("{job_id}.json"))
     }
 
     /// Directory for a workbench scope (`workbench/<scope-id>/`).
@@ -165,7 +197,9 @@ impl KnowledgeStore {
     }
 
     /// Schreibt einen [`DreamReport`] mit gültigem YAML-Frontmatter nach
-    /// `dreams/<YYYY-MM-DD>/<work-id>.md` (Datum = UTC-Tag von `created_at`).
+    /// `dreams/<YYYY-MM-DD>/<work-id>.md` (Datum = UTC-Tag von `created_at`)
+    /// und daneben die strukturierte Seitendatei `<work-id>.json`
+    /// ([`DreamReport::to_data`], [`crate::dream::write_report_data`]).
     ///
     /// Nutzt denselben Frontmatter-Writer wie [`Self::write_artifact`], sodass
     /// [`crate::index::KnowledgeIndex::rebuild`] den Bericht als
@@ -182,15 +216,17 @@ impl KnowledgeStore {
     pub fn write_dream_report(&self, report: &DreamReport) -> KnowledgeResult<PathBuf> {
         let job_id = report.work_id.as_str();
         ensure_path_component(job_id)?;
-        let path = self.dream_path(&report.report_date(), job_id);
+        let date = report.report_date();
+        let path = self.dream_path(&date, job_id);
         self.write_artifact(&path, &report.to_artifact())?;
+        crate::dream::write_report_data(self, &date, job_id, &report.to_data())?;
         Ok(path)
     }
 }
 
 /// Lehnt Werte ab, die als einzelne Pfadkomponente unter dem Store-Root
 /// entkommen oder unlesbare Dateinamen erzeugen könnten.
-fn ensure_path_component(component: &str) -> KnowledgeResult<()> {
+pub(crate) fn ensure_path_component(component: &str) -> KnowledgeResult<()> {
     let unsafe_component = component.is_empty()
         || component == "."
         || component == ".."

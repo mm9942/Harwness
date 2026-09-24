@@ -329,6 +329,7 @@ impl CommandRegistry {
                         domain,
                     ) {
                         cmd_spec.busy = meta.busy;
+                        cmd_spec.busy_subcommands = op.busy_subcommands();
                         cmd_spec.summary = meta.summary.to_owned();
                         crate::command_catalog::enrich(&mut cmd_spec);
                         // Record in indexes after successful spec construction.
@@ -470,6 +471,7 @@ impl CommandRegistry {
                 output: OutputSurface::Inline,
                 domain: map_domain(meta.domain),
                 busy: meta.busy,
+                busy_subcommands: adapter.operation().busy_subcommands(),
                 summary: meta.summary.to_owned(),
                 usage: String::new(),
                 subcommands: Vec::new(),
@@ -1078,7 +1080,7 @@ mod tests {
     }
 
     /// Test 8: `from_operation_registry` copies `OperationMeta::busy` into
-    /// `CommandSpec::busy` — both for an operation that opts into `Immediate`
+    /// `CommandSpec::busy` — both for an operation that opts into `Staged`
     /// (`/model`) and one that keeps the `DeferredUntilTurnEnd` default (`/new`).
     #[test]
     fn test_from_operation_registry_maps_busy_availability() -> TestResult {
@@ -1091,8 +1093,16 @@ mod tests {
             .ok_or(TestError::Missing("'model' spec must exist"))?;
         assert_eq!(
             model_spec.busy,
-            harw_operations::operation::BusyAvailability::Immediate,
-            "'/model' declares busy=\"immediate\"; spec must carry Immediate"
+            harw_operations::operation::BusyAvailability::Staged,
+            "'/model' declares busy=\"staged\"; spec must carry Staged"
+        );
+        assert!(
+            model_spec
+                .busy_subcommands
+                .iter()
+                .any(|entry| entry.subcommand == Some("show")
+                    && entry.busy == harw_operations::operation::BusyAvailability::Immediate),
+            "'/model' busy_subcommands must be mirrored into the spec"
         );
 
         let new_spec = registry
@@ -1123,8 +1133,12 @@ mod tests {
             .ok_or(TestError::Missing("'model' spec must exist"))?;
         assert_eq!(
             model_spec.busy,
-            harw_operations::operation::BusyAvailability::Immediate,
-            "'/model' declares busy=\"immediate\"; adapter-derived spec must carry Immediate"
+            harw_operations::operation::BusyAvailability::Staged,
+            "'/model' declares busy=\"staged\"; adapter-derived spec must carry Staged"
+        );
+        assert!(
+            !model_spec.busy_subcommands.is_empty(),
+            "'/model' busy_subcommands must be mirrored into the adapter-derived spec"
         );
 
         let new_spec = registry

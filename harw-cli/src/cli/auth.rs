@@ -31,4 +31,16 @@ pub enum AuthAction {
     },
     /// Vorhandene Credential-Quellen anzeigen (ohne Secrets).
     Status,
+    /// Veraltete Credential-Pool-Einträge entfernen.
+    ///
+    /// Entfernt aus `credential_pool.<provider>` in `auth.toml` jeden Eintrag,
+    /// der nicht zur Route des Providers passt (`provider.auth`/`base_url`:
+    /// Codex-Login-Verweise nur auf der Codex-Route, alle anderen nur
+    /// daneben) sowie doppelte Einträge — dieselbe Regel wie beim
+    /// Onboarding. Ohne Provider werden alle Pools geprüft. Gibt nur Index
+    /// und Label aus, nie ein Secret.
+    Prune {
+        /// Provider-Id (z. B. `openai`); ohne Angabe alle Pools.
+        provider: Option<String>,
+    },
 }

@@ -8,8 +8,8 @@ Konsumenten, `harw-plan-bridge` ist die Naht zwischen Goal, Plan, Findings und
 Jobs.
 **Scope:** Host-Sensorik, Sicherheits-Triage, Durchsetzung, Telemetrie,
 Selbstüberwachung des Systems einschließlich seiner eigenen Struktur
-**Ankerdokumente:** `philosophy.md`, `coding-philosophy.md`,
-`agent-definition-dsl.md`, `knowledge-surfaces.md`, `secrets-and-audit.md`,
+**Ankerdokumente:** `docs/philosophy/philosophy.md`, `docs/philosophy/coding-philosophy.md`,
+`docs/design/agent-definition-dsl.md`, `knowledge-surfaces.md`, `secrets-and-audit.md`,
 `model-catalog-v2.md`, `memory-v2.md`, `planning-tool-v1.md`
 
 ---

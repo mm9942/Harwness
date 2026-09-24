@@ -55,10 +55,10 @@ pub use auto_compact::{
 };
 pub use capture::{ToolOutcome, ToolOutcomeObserver, ToolOutcomeStatus};
 pub use child_controller::{
-    AgentBudget, BudgetDimension, ChildLimits, ChildRecord, ChildRegistryFactory, ChildRunResult,
-    ChildUsage, ContextWindowResolver, DEFAULT_CHILD_CONTEXT_WINDOW, ExpiredChild, FanoutRequest,
-    JoinSemantics, ManagedAgentSpawner, OrchestrationObserver, ParentGrant, RoleEffortWeights,
-    TaskComplexity,
+    AgentBudget, BudgetDimension, ChildContextOverload, ChildLimits, ChildRecord,
+    ChildRegistryFactory, ChildRunError, ChildRunResult, ChildUsage, ContextWindowResolver,
+    DEFAULT_CHILD_CONTEXT_WINDOW, ExpiredChild, FanoutRequest, JoinSemantics, ManagedAgentSpawner,
+    ModelKnownProbe, OrchestrationObserver, ParentGrant, RoleEffortWeights, TaskComplexity,
 };
 pub use compaction::{
     CompactionObserver, CompactionOutcome, CompactionPlan, SUMMARY_MARKER, compact_session,
@@ -104,7 +104,7 @@ pub use state_store::{
 pub use stream::{ModelStreamEvent, StreamSink};
 pub use testing::RecordingModelProvider;
 pub use turn_loop::{
-    ApprovalResolution, TurnInput, TurnOutcome, resume_after_approval,
+    ApprovalResolution, TurnInput, TurnOutcome, TurnTokenBudget, resume_after_approval,
     resume_after_approval_durable, resume_after_child, resume_after_child_durable, run_turn,
     run_turn_durable,
 };

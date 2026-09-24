@@ -22,6 +22,22 @@
 //!   [`unique_slug`]).
 //! - `forget <name>` (Design §6) — löscht den Fakt `<name>` aus Projekt
 //!   **und** Global, wo immer er existiert (bestes Bemühen je Wurzel).
+//! - `promote <fact-id> [--project|--global] [--slug <slug>]` (Runde 4 D4,
+//!   Brücke Fakt → Thema) — liest den Fakt (ohne Scope-Flag: Projekt vor
+//!   Global) und schreibt ihn über
+//!   [`harw_knowledge::memory::topic::propose_topic`] als
+//!   `knowledge/topics/<slug>.md` mit Palace-Status `provisional` und
+//!   Herkunft (`extra.origin = {kind: "fact", id, detail: <scope>, at}`).
+//!   Ein bestehendes Thema wird nie überschrieben (Konflikt →
+//!   [`OpError::InvalidArguments`] mit Hinweis auf `--slug`). Zu
+//!   `established` wird das Thema erst über `/palace promote` (Review-Gate).
+//!   Danach geht `AgentEventKind::Knowledge { area: "palace", id:
+//!   "topic/<slug>" }` über den Hub. Sichtbarkeit des Themas = Sicht des
+//!   Aufrufers (Operator → `OperatorOnly`).
+//! - `topics` — listet die `provisional` Themen aus `knowledge/topics/`, die
+//!   der Aufrufer sehen darf (Kandidaten für `/palace promote`, Angebot im
+//!   Wissensbrowser der TUI); `data = {"topics":[{"slug","title","status",
+//!   "origin"}]}`, `origin` ist die Herkunft (`extra.origin`) oder `null`.
 //! - `maintain` — führt den idempotenten v2-Konsolidierungslauf aus.
 //! - `consolidate [--project|--global]` (Default `--project`, Design
 //!   §5.3/§6) — stößt Phase 2 (Konsolidierung) sofort an, siehe
@@ -55,9 +71,16 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+use harw_knowledge::KnowledgeStore;
+use harw_knowledge::memory::topic;
 use harw_macros::operation;
 use harw_memory::{Fact, FactScope, FactStore, FactType, Memory, slugify};
 use harw_operations::{OpContext, OpError, OpOutput};
+
+use crate::knowledge_args::{FlagSpec, KnowledgeArgs};
+use crate::knowledge_common::{
+    AREA_PALACE, KnowledgeCaller, knowledge_store, map_knowledge_error, publish_knowledge,
+};
 
 /// Obergrenze der Treffer je Wurzel bei `recall` (wie zuvor bei der
 /// WARM-Suche des v2-Backends).
@@ -108,7 +131,7 @@ impl harw_operations::FromRawArgs for MemoryArgs {
 /// Siehe Modul-Doku.
 #[operation(
     name = "memory",
-    summary = "Long-Term-Memory: list, recall, record, forget, stats, maintain.",
+    summary = "Long-Term-Memory: list, recall, record, forget, promote <fact-id>, topics, stats, maintain.",
     domain = "session",
     permission = "operator",
     command(path = "/memory", visibility = "channel_parity")
@@ -121,10 +144,15 @@ async fn memory(ctx: &OpContext, args: MemoryArgs) -> Result<OpOutput, OpError> 
         "recall" => render_fact_recall(ctx, &args.tail),
         "record" => record_dispatch(ctx, &args.tail),
         "forget" => forget_fact(ctx, &args.tail),
+        "promote" => promote_dispatch(ctx, &args.tail),
+        "topics" => {
+            let knowledge = knowledge_store(ctx)?;
+            list_provisional_topics(&knowledge, &KnowledgeCaller::from_context(ctx))
+        }
         "maintain" => run_maintain(&*memory_store(ctx)?),
         "consolidate" => consolidate_dispatch(ctx, &args.tail),
         other => Err(OpError::InvalidArguments(format!(
-            "unbekannter /memory-Subcommand: {other} (list, stats, recall, record, forget, maintain, consolidate)"
+            "unbekannter /memory-Subcommand: {other} (list, stats, recall, record, forget, promote, topics, maintain, consolidate)"
         ))),
     }
 }
@@ -459,6 +487,230 @@ fn forget_fact(ctx: &OpContext, tail: &[String]) -> Result<OpOutput, OpError> {
     }
 }
 
+// ── Brücke Fakt → Thema (Runde 4 D4) ───────────────────────────────────────
+
+/// Flags von `/memory promote`.
+const PROMOTE_FLAGS: &[FlagSpec] = &[
+    FlagSpec::switch("project"),
+    FlagSpec::switch("global"),
+    FlagSpec::value("slug"),
+];
+
+/// Grammatik von `/memory promote`.
+const PROMOTE_USAGE: &str = "/memory promote <fact-id> [--project|--global] [--slug <slug>]";
+
+/// `/memory promote <fact-id> [--project|--global] [--slug <slug>]`.
+///
+/// # Beschreibung
+/// Sucht den Fakt im gewählten Scope bzw. ohne Flag erst im Projekt, dann
+/// global, und übergibt ihn an [`promote_fact`]. Meldet nach Erfolg das
+/// Knowledge-Ereignis `palace`/`topic/<slug>`.
+///
+/// # Errors
+/// - [`OpError::InvalidArguments`] — Grammatik, widersprüchliche Flags,
+///   unbekannter Fakt, Themen-Konflikt.
+/// - [`OpError::NotAvailable`] — kein Knowledge-Store im Kontext.
+/// - [`OpError::Execution`] — Lese-/Schreibfehler.
+fn promote_dispatch(ctx: &OpContext, tail: &[String]) -> Result<OpOutput, OpError> {
+    let args = KnowledgeArgs::parse(tail, PROMOTE_FLAGS)?;
+    let [fact_id] = args.positionals() else {
+        return Err(OpError::InvalidArguments(PROMOTE_USAGE.to_owned()));
+    };
+    let scopes: Vec<FactScope> = match (args.switch("project"), args.switch("global")) {
+        (true, true) => {
+            return Err(OpError::InvalidArguments(
+                "widersprüchliche Scope-Flags: nur eines von --project/--global ist erlaubt"
+                    .to_owned(),
+            ));
+        }
+        (true, false) => vec![FactScope::Project],
+        (false, true) => vec![FactScope::Global],
+        (false, false) => vec![FactScope::Project, FactScope::Global],
+    };
+    let mut found: Option<Fact> = None;
+    for scope in scopes {
+        let root = match scope {
+            FactScope::Project => project_memories_root(ctx),
+            FactScope::Global => global_memories_root(),
+        };
+        let Ok(root) = root else { continue };
+        let Ok(store) = FactStore::open(&root, scope) else {
+            continue;
+        };
+        if let Some(fact) = store
+            .read(fact_id)
+            .map_err(|error| OpError::Execution(format!("Fakt lesen fehlgeschlagen: {error}")))?
+        {
+            found = Some(fact);
+            break;
+        }
+    }
+    let fact = found.ok_or_else(|| {
+        OpError::InvalidArguments(format!("/memory promote: kein Fakt '{fact_id}' gefunden"))
+    })?;
+    let knowledge = knowledge_store(ctx)?;
+    let caller = KnowledgeCaller::from_context(ctx);
+    let output = promote_fact(
+        &knowledge,
+        &caller,
+        &fact,
+        args.value("slug"),
+        jiff::Timestamp::now(),
+    )?;
+    let id = output
+        .data
+        .as_ref()
+        .and_then(|data| data.get("id"))
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_owned);
+    publish_knowledge(ctx, AREA_PALACE, id);
+    Ok(output)
+}
+
+/// `/memory topics` — die `provisional` Themen, die `caller` sehen darf.
+///
+/// # Beschreibung
+/// Liest jede `knowledge/topics/<slug>.md` über [`topic::read`]; nicht
+/// lesbare Dateien werden übersprungen (Wartung meldet sie woanders), nur
+/// Themen mit Palace-Status `provisional` und für den Aufrufer sichtbarer
+/// Sichtbarkeit ([`KnowledgeCaller::can_read`]) erscheinen, sortiert nach
+/// Slug.
+///
+/// # Rückgabe
+/// `OpOutput` mit `data = {"topics":[{"slug","title","status","origin"}]}`.
+///
+/// # Errors
+/// [`OpError::Execution`], wenn das Themenverzeichnis existiert, aber nicht
+/// gelesen werden kann.
+pub fn list_provisional_topics(
+    store: &KnowledgeStore,
+    caller: &KnowledgeCaller,
+) -> Result<OpOutput, OpError> {
+    use harw_knowledge::memory::palace::{PalaceStatus, artifact_status};
+
+    let dir = store.root().join("topics");
+    let mut slugs: Vec<String> = Vec::new();
+    if dir.is_dir() {
+        let entries = fs::read_dir(&dir).map_err(|error| {
+            OpError::Execution(format!("Themenverzeichnis lesen fehlgeschlagen: {error}"))
+        })?;
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.extension().and_then(|ext| ext.to_str()) != Some("md") {
+                continue;
+            }
+            if let Some(slug) = path.file_stem().and_then(|stem| stem.to_str()) {
+                slugs.push(slug.to_owned());
+            }
+        }
+    }
+    slugs.sort();
+    let mut topics: Vec<serde_json::Value> = Vec::new();
+    let mut lines: Vec<String> = Vec::new();
+    for slug in slugs {
+        let Ok(artifact) = topic::read(store, &slug) else {
+            continue;
+        };
+        if artifact_status(&artifact) != PalaceStatus::Provisional
+            || !caller.can_read(&artifact.frontmatter.visibility)
+        {
+            continue;
+        }
+        let title = artifact
+            .frontmatter
+            .extra
+            .get(harw_knowledge::memory::palace::TITLE_KEY)
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or(slug.as_str())
+            .to_owned();
+        let origin = artifact
+            .frontmatter
+            .extra
+            .get(topic::ORIGIN_KEY)
+            .cloned()
+            .unwrap_or(serde_json::Value::Null);
+        lines.push(format!("· topic/{slug} — {title}"));
+        topics.push(serde_json::json!({
+            "slug": slug,
+            "title": title,
+            "status": PalaceStatus::Provisional.label(),
+            "origin": origin,
+        }));
+    }
+    let text = if lines.is_empty() {
+        "Keine vorläufigen Themen.".to_owned()
+    } else {
+        format!(
+            "{} vorläufige Themen (mit /palace promote übernehmen):\n{}",
+            lines.len(),
+            lines.join("\n")
+        )
+    };
+    Ok(OpOutput {
+        text,
+        data: Some(serde_json::json!({ "topics": topics })),
+    })
+}
+
+/// Kern der Brücke Fakt → Thema (testbar ohne `OpContext`).
+///
+/// # Beschreibung
+/// Baut über [`topic::from_fact`] einen Vorschlag und schreibt ihn mit
+/// [`topic::propose_topic`] als `provisional` Thema in der Sicht des
+/// Aufrufers. `slug` überschreibt den aus dem Fakt-Namen abgeleiteten Slug.
+///
+/// # Rückgabe
+/// `OpOutput` mit `data = {"id": "topic/<slug>", "slug", "status":
+/// "provisional", "fact"}`.
+///
+/// # Errors
+/// - [`OpError::InvalidArguments`] — Thema existiert bereits (mit Hinweis),
+///   leerer Fakt oder ungültiger Slug.
+/// - [`OpError::Execution`] — Sperr-/Schreibfehler.
+pub fn promote_fact(
+    store: &KnowledgeStore,
+    caller: &KnowledgeCaller,
+    fact: &Fact,
+    slug: Option<&str>,
+    now: jiff::Timestamp,
+) -> Result<OpOutput, OpError> {
+    let mut proposal = topic::from_fact(
+        &fact.name,
+        &fact.description,
+        &fact.body,
+        &fact.tags,
+        &fact.scope.to_string(),
+    );
+    if let Some(slug) = slug {
+        proposal.slug = Some(slug.to_owned());
+    }
+    let written = topic::propose_topic(store, &proposal, &caller.agent, caller.viewer.clone(), now)
+        .map_err(|error| match &error {
+            harw_knowledge::KnowledgeError::Io(io)
+                if io.kind() == std::io::ErrorKind::AlreadyExists =>
+            {
+                OpError::InvalidArguments(format!(
+                    "{io} — anderen Slug mit --slug wählen oder das bestehende Thema \
+                 über /palace promote bzw. direkt pflegen"
+                ))
+            }
+            _ => map_knowledge_error(error),
+        })?;
+    Ok(OpOutput {
+        text: format!(
+            "Fakt '{}' → topic/{written} (provisional). Mit /palace promote {written} \
+             zu established machen.",
+            fact.name
+        ),
+        data: Some(serde_json::json!({
+            "id": format!("topic/{written}"),
+            "slug": written,
+            "status": "provisional",
+            "fact": fact.name,
+        })),
+    })
+}
+
 // ── Konsolidierung (Phase 2, Design §5.3/§6) ────────────────────────────────
 
 /// `/memory consolidate [--project|--global]` (Default `--project`).
@@ -622,7 +874,8 @@ fn run_consolidate(root: &Path, scope: FactScope) -> Result<OpOutput, OpError> {
 #[cfg(test)]
 mod tests {
     use super::{
-        MemoryArgs, MemoryOperation, parse_memory_scope_flags, truncate_description, unique_slug,
+        MemoryArgs, MemoryOperation, list_provisional_topics, parse_memory_scope_flags,
+        promote_fact, truncate_description, unique_slug,
     };
     use crate::test_support::{TestError, TestResult, ctx};
     use crate::testutil::toks;
@@ -822,6 +1075,89 @@ mod tests {
                 .map_err(ctx("read after delete"))?
                 .is_none()
         );
+        Ok(())
+    }
+
+    // -- promote_fact (Brücke Fakt → Thema, D4) ----------------------------
+
+    #[test]
+    fn promote_fact_writes_a_provisional_topic_with_origin_and_never_overwrites() -> TestResult {
+        use harw_knowledge::memory::palace::{PalaceStatus, artifact_status};
+        use harw_knowledge::memory::topic;
+        use harw_knowledge::{AgentId, VisibilityScope};
+
+        let store = crate::knowledge_test_support::temporary_store("memory-promote")?;
+        let caller = crate::knowledge_common::KnowledgeCaller::operator(AgentId::new("operator"));
+        let mut fact = sample_fact("deploy-canary", "Deploys laufen immer erst über Canary.");
+        fact.description = "Canary vor Deploy".to_owned();
+        fact.tags = vec!["ops".to_owned()];
+        let now = jiff::Timestamp::UNIX_EPOCH;
+
+        let output = promote_fact(&store, &caller, &fact, None, now).map_err(ctx("promote"))?;
+        let data = output.data.ok_or(TestError::Missing("promote data"))?;
+        assert_eq!(data["id"], "topic/deploy-canary");
+        let written = topic::read(&store, "deploy-canary").map_err(ctx("read topic"))?;
+        assert_eq!(artifact_status(&written), PalaceStatus::Provisional);
+        assert_eq!(
+            written.frontmatter.visibility,
+            VisibilityScope::OperatorOnly
+        );
+        assert_eq!(written.frontmatter.extra["origin"]["kind"], "fact");
+        assert_eq!(written.frontmatter.extra["origin"]["id"], "deploy-canary");
+        assert_eq!(written.frontmatter.extra["origin"]["detail"], "project");
+        assert_eq!(written.frontmatter.extra["origin"]["at"], now.to_string());
+        assert_eq!(written.frontmatter.extra["title"], "Canary vor Deploy");
+        assert_eq!(
+            written.body.trim(),
+            "Deploys laufen immer erst über Canary."
+        );
+
+        match promote_fact(&store, &caller, &fact, None, now) {
+            Err(OpError::InvalidArguments(message)) => {
+                assert!(message.contains("--slug"), "{message}");
+            }
+            other => {
+                return Err(TestError::Unexpected(format!(
+                    "second promote must conflict, got {other:?}"
+                )));
+            }
+        }
+        let renamed = promote_fact(&store, &caller, &fact, Some("Canary Regel"), now)
+            .map_err(ctx("promote with slug"))?;
+        assert!(
+            renamed.text.contains("topic/canary-regel"),
+            "{}",
+            renamed.text
+        );
+
+        // `/memory topics` bietet beide vorläufigen Themen an (Browser).
+        let listed = list_provisional_topics(&store, &caller).map_err(ctx("topics"))?;
+        let data = listed.data.ok_or(TestError::Missing("topics data"))?;
+        assert_eq!(data["topics"].as_array().map(Vec::len), Some(2));
+        assert_eq!(data["topics"][0]["slug"], "canary-regel");
+        assert_eq!(data["topics"][1]["slug"], "deploy-canary");
+        assert_eq!(data["topics"][1]["title"], "Canary vor Deploy");
+        assert_eq!(data["topics"][1]["status"], "provisional");
+        assert_eq!(data["topics"][1]["origin"]["kind"], "fact");
+        // Ein Agent ohne Operator-Sicht sieht die Operator-Themen nicht.
+        let agent = crate::knowledge_common::KnowledgeCaller {
+            agent: AgentId::new("explorer"),
+            viewer: VisibilityScope::SelfOnly,
+        };
+        let hidden = list_provisional_topics(&store, &agent).map_err(ctx("topics as agent"))?;
+        let data = hidden.data.ok_or(TestError::Missing("agent topics data"))?;
+        assert_eq!(data["topics"].as_array().map(Vec::len), Some(0));
+
+        // Danach führt /palace promote das Thema zu established.
+        let promoted = crate::palace::run_palace(
+            &store,
+            &AgentId::new("operator"),
+            &toks(&["promote", "deploy-canary"]),
+            now,
+        )
+        .map_err(ctx("palace promote"))?;
+        assert!(promoted.text.contains("established"), "{}", promoted.text);
+        std::fs::remove_dir_all(store.root()).ok();
         Ok(())
     }
 

@@ -7,8 +7,22 @@
 //! The `[[wikilink]]` scanner is implemented fully; topic->palace promotion is
 //! the strictest gate (§2.5) and refuses to commit without a recorded review.
 
-use crate::artifact::ArtifactId;
+use crate::artifact::{ArtifactId, ArtifactKind, Frontmatter, KnowledgeArtifact};
 use crate::error::{KnowledgeError, KnowledgeResult};
+use crate::visibility::VisibilityScope;
+
+/// Frontmatter-`extra`-Schlüssel für den Titel eines Knotens bzw. Themas.
+pub const TITLE_KEY: &str = "title";
+
+/// Frontmatter-`extra`-Schlüssel des [`PalaceStatus`] (historischer Name
+/// `confidence`, siehe [`PalaceStatus`]).
+pub const STATUS_KEY: &str = "confidence";
+
+/// Frontmatter-`extra`-Schlüssel des Nachfolgers eines ersetzten Knotens.
+pub const SUPERSEDED_BY_KEY: &str = "superseded_by";
+
+/// Frontmatter-`extra`-Schlüssel der Revisionsnummer eines Knotens.
+pub const REVISION_KEY: &str = "revision";
 
 /// Lifecycle status of a palace node; nodes are superseded, never deleted
 /// (§2.2).
@@ -103,6 +117,76 @@ impl PalaceNode {
     }
 }
 
+impl PalaceStatus {
+    /// Wire-Form (`established`/`provisional`/`superseded`).
+    #[must_use]
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Established => "established",
+            Self::Provisional => "provisional",
+            Self::Superseded => "superseded",
+        }
+    }
+
+    /// Umkehrung von [`Self::label`]; unbekannte Werte ergeben `None`.
+    #[must_use]
+    pub fn from_label(label: &str) -> Option<Self> {
+        match label {
+            "established" => Some(Self::Established),
+            "provisional" => Some(Self::Provisional),
+            "superseded" => Some(Self::Superseded),
+            _ => None,
+        }
+    }
+}
+
+/// Liest den [`PalaceStatus`] aus dem Frontmatter eines Knotens oder Themas.
+///
+/// # Beschreibung
+/// Fehlt `extra.confidence` oder ist der Wert unbekannt, gilt der Eintrag
+/// als [`PalaceStatus::Provisional`] — nie als `established` (fail-closed:
+/// nur ein ausdrücklich promoteter Eintrag ist geteiltes Wissen).
+#[must_use]
+pub fn artifact_status(artifact: &KnowledgeArtifact) -> PalaceStatus {
+    artifact
+        .frontmatter
+        .extra
+        .get(STATUS_KEY)
+        .and_then(serde_json::Value::as_str)
+        .and_then(PalaceStatus::from_label)
+        .unwrap_or(PalaceStatus::Provisional)
+}
+
+/// Setzt den [`PalaceStatus`] im Frontmatter (`extra.confidence`).
+pub fn set_status(frontmatter: &mut Frontmatter, status: PalaceStatus) {
+    frontmatter.extra.insert(
+        STATUS_KEY.to_owned(),
+        serde_json::Value::String(status.label().to_owned()),
+    );
+}
+
+/// Ob ein Artefakt über die Palace-Lesewerkzeuge für Agenten sichtbar ist.
+///
+/// # Beschreibung
+/// Agenten sehen ausschließlich Palace-Knoten mit Status
+/// [`PalaceStatus::Established`] (§2.2/§2.5: der Review-Gate von
+/// `/palace promote` ist die Freigabe als geteiltes Wissen). Von diesen nur
+/// solche mit [`VisibilityScope::OperatorOnly`] — das ist die Sichtbarkeit,
+/// die der Operator-Promote-Pfad vergibt. Knoten mit `SelfOnly`,
+/// `DescendantTree` oder `ExplicitlyGranted` bleiben verborgen, weil der
+/// Werkzeug-Kontext keine Identität trägt, die diese Scopes belegen könnte
+/// (fail-closed wie [`VisibilityScope::visible_to_caller`]). `provisional`
+/// und `superseded` sind nie sichtbar.
+#[must_use]
+pub fn is_agent_readable(artifact: &KnowledgeArtifact) -> bool {
+    artifact.kind == ArtifactKind::PalaceNode
+        && artifact_status(artifact) == PalaceStatus::Established
+        && matches!(
+            artifact.frontmatter.visibility,
+            VisibilityScope::OperatorOnly
+        )
+}
+
 /// Extract `[[target]]` wikilink targets from body text (§2.2).
 ///
 /// Supports Obsidian-style `[[target|alias]]` (the target before `|` is used).
@@ -168,10 +252,14 @@ pub fn ensure_promotion_reviewed(
 
 #[cfg(test)]
 mod tests {
-    use super::{PalaceNode, PalaceStatus, ensure_promotion_reviewed, scan_wikilinks};
-    use crate::artifact::ArtifactId;
+    use super::{
+        PalaceNode, PalaceStatus, artifact_status, ensure_promotion_reviewed, is_agent_readable,
+        scan_wikilinks, set_status,
+    };
+    use crate::artifact::{ArtifactId, ArtifactKind, Frontmatter, KnowledgeArtifact};
     use crate::error::KnowledgeError;
     use crate::test_support::{TestError, TestResult};
+    use crate::visibility::{AgentId, VisibilityScope};
 
     #[test]
     fn test_scan_wikilinks_extracts_targets_and_strips_aliases() {
@@ -196,6 +284,76 @@ mod tests {
         };
         assert!(matches!(error, KnowledgeError::PromotionNotReviewed { .. }));
         Ok(())
+    }
+
+    fn node(status: Option<PalaceStatus>, visibility: VisibilityScope) -> KnowledgeArtifact {
+        let mut frontmatter = Frontmatter::new(
+            AgentId::new("operator"),
+            visibility,
+            jiff::Timestamp::UNIX_EPOCH,
+        );
+        if let Some(status) = status {
+            set_status(&mut frontmatter, status);
+        }
+        KnowledgeArtifact::new(
+            ArtifactId::new("palace/n"),
+            ArtifactKind::PalaceNode,
+            frontmatter,
+            "body",
+        )
+    }
+
+    #[test]
+    fn missing_or_unknown_status_reads_as_provisional() {
+        assert_eq!(
+            artifact_status(&node(None, VisibilityScope::OperatorOnly)),
+            PalaceStatus::Provisional
+        );
+        let mut unknown = node(None, VisibilityScope::OperatorOnly);
+        unknown
+            .frontmatter
+            .extra
+            .insert("confidence".to_owned(), serde_json::json!("certain"));
+        assert_eq!(artifact_status(&unknown), PalaceStatus::Provisional);
+        for status in [
+            PalaceStatus::Established,
+            PalaceStatus::Provisional,
+            PalaceStatus::Superseded,
+        ] {
+            assert_eq!(
+                artifact_status(&node(Some(status), VisibilityScope::OperatorOnly)),
+                status
+            );
+            assert_eq!(PalaceStatus::from_label(status.label()), Some(status));
+        }
+    }
+
+    #[test]
+    fn only_established_operator_nodes_are_agent_readable() {
+        assert!(is_agent_readable(&node(
+            Some(PalaceStatus::Established),
+            VisibilityScope::OperatorOnly
+        )));
+        for hidden in [
+            node(
+                Some(PalaceStatus::Provisional),
+                VisibilityScope::OperatorOnly,
+            ),
+            node(
+                Some(PalaceStatus::Superseded),
+                VisibilityScope::OperatorOnly,
+            ),
+            node(None, VisibilityScope::OperatorOnly),
+            node(Some(PalaceStatus::Established), VisibilityScope::SelfOnly),
+        ] {
+            assert!(!is_agent_readable(&hidden), "{hidden:?}");
+        }
+        let mut topic = node(
+            Some(PalaceStatus::Established),
+            VisibilityScope::OperatorOnly,
+        );
+        topic.kind = ArtifactKind::TopicMemory;
+        assert!(!is_agent_readable(&topic), "topics are never palace reads");
     }
 
     #[test]

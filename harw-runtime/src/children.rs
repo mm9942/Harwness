@@ -76,8 +76,8 @@ use crate::error::{RuntimeError, RuntimeResult};
 ///
 /// Die gesamte `uia-worker`-Rollenfamilie (`AgentRoleId::UiaWorker`:
 /// [`role_names::UIA_WORKER`], [`role_names::UIA_EXPLORER`],
-/// [`role_names::UIA_WRITER`], [`role_names::UIA_SHELL_WORKER`]) fällt
-/// **absichtlich** auf `None` durch (Welle 3a) — sie hängt seither nicht mehr
+/// [`role_names::UIA_WRITER`], [`role_names::UIA_SHELL_WORKER`],
+/// [`role_names::UIA_LATEX_WRITER`]) fällt **absichtlich** auf `None` durch (Welle 3a) — sie hängt seither nicht mehr
 /// an einer über [`resolve_internal_models_for_children`] aufgelösten
 /// internen Modellstelle des Eltern-Modells, sondern bekommt ihr eigenes,
 /// von der UIA-Sitzung abgeleitetes Modell direkt über die eigene
@@ -163,7 +163,8 @@ pub fn role_gets_delegate_wave(role: &str) -> bool {
 /// Der Nutzer verlangt, dass UIA und die gesamte `uia-worker`-Rollenfamilie
 /// (`AgentRoleId::UiaWorker`: [`role_names::UIA_WORKER`],
 /// [`role_names::UIA_EXPLORER`], [`role_names::UIA_WRITER`],
-/// [`role_names::UIA_SHELL_WORKER`]) **nie** mit mehr als einer gleichzeitig
+/// [`role_names::UIA_SHELL_WORKER`], [`role_names::UIA_LATEX_WRITER`]) **nie**
+/// mit mehr als einer gleichzeitig
 /// laufenden Instanz gefanoutet werden dürfen — unabhängig vom
 /// Aufrufer-`max_parallel`-Wert (`analyze(max_parallel: N)`, `explore`,
 /// `delegate_task` o. ä.). Diese Funktion selbst deckelt **nichts**: sie ist
@@ -353,6 +354,11 @@ pub struct RuntimeChildRegistryFactory {
     /// (derselbe Default, den eine explizit mit diesen Werten aufgerufene
     /// Fabrik ergäbe).
     main_model_selection: Option<(Option<String>, Option<String>)>,
+    /// Die Modellkennung, die der **ungepinnte** Kind-Provider dieser Fabrik
+    /// tatsächlich anspricht (Teil C, [`Self::with_effective_main_model`]):
+    /// Grundlage für das Kontextfenster eines Kindes ohne Rollen-Pin.
+    /// `None`: keine Aussage, der Spawner folgt dem Modell des Elternteils.
+    effective_main_model: Option<String>,
     /// Das Sandbox-Profil, mit dem jeder für ein Kind gebaute
     /// [`harw_tool_shell::ShellToolProvider`] montiert wird (Teil B4). Vorgabe
     /// [`harw_sandbox::SandboxProfile::Strict`] — bit-identisch zum
@@ -378,6 +384,18 @@ pub struct RuntimeChildRegistryFactory {
     /// Operation wird dennoch montiert, scheitert dann aber beim Aufruf
     /// fail-closed mit `OpError::NotAvailable` (kein StateStore).
     delegate_wave_store: Option<Arc<dyn StateStore>>,
+    /// Wissensspeicher (und optional Kanban-Ledger) für die lesenden
+    /// Wissenswerkzeuge der Kinder (Plan Teil D). `None`, solange
+    /// [`Self::with_knowledge`] nicht aufgerufen wurde — dann bekommt kein
+    /// Kind `workbench.show`/`diary.read`/`palace.*`/`kanban.*`.
+    knowledge: Option<ChildKnowledgeWiring>,
+}
+
+/// Wissensquellen der lesenden Kind-Werkzeuge (Plan Teil D).
+#[derive(Clone)]
+struct ChildKnowledgeWiring {
+    store: Arc<harw_knowledge::KnowledgeStore>,
+    kanban_ledger: Option<Arc<dyn harw_knowledge::kanban::lifecycle::JobTransitions>>,
 }
 
 /// Der Skill-Katalog einer Kind-Fabrik: ein über die ganze Lebensdauer des
@@ -400,6 +418,13 @@ impl std::fmt::Debug for RuntimeChildRegistryFactory {
             .finish()
     }
 }
+
+/// Quelle der lesenden Wissenswerkzeuge für Kinder (Plan Teil D):
+/// Wissensspeicher plus optionales Kanban-Ledger.
+pub type ChildKnowledgeSource = (
+    Arc<harw_knowledge::KnowledgeStore>,
+    Option<Arc<dyn harw_knowledge::kanban::lifecycle::JobTransitions>>,
+);
 
 impl RuntimeChildRegistryFactory {
     /// Senkt die eingebauten Agentendefinitionen einmalig und hält sie für die
@@ -466,10 +491,12 @@ impl RuntimeChildRegistryFactory {
             spawner_slot: Arc::new(OnceLock::new()),
             reasoning_effort_config: None,
             main_model_selection: None,
+            effective_main_model: None,
             sandbox_profile: harw_sandbox::SandboxProfile::Strict,
             host_permit_wiring: None,
             skill_catalog: None,
             delegate_wave_store: None,
+            knowledge: None,
         }
     }
 
@@ -607,6 +634,26 @@ impl RuntimeChildRegistryFactory {
         self
     }
 
+    /// Setzt die Modellkennung, die der ungepinnte Kind-Provider dieser
+    /// Fabrik tatsächlich anspricht (Teil C).
+    ///
+    /// # Description
+    /// Für die Hauptfabrik das effektive Vorgabemodell des Wurzel-Baums
+    /// (einschließlich des Rückfalls auf das erste nutzbare Katalogmodell),
+    /// für die UIA-Worker-Fabrik das Modell der UIA-Sitzung. Der Spawner
+    /// budgetiert damit das Kontextfenster eines Kindes ohne Rollen-Pin
+    /// ([`ChildRegistryFactory::main_model_for_task`]) und setzt es als
+    /// `active_model` des Kindes. Ohne Aufruf liefert die Fabrik keine
+    /// Aussage.
+    ///
+    /// # Arguments
+    /// - `model` (`Option<String>`): die Modellkennung oder `None`.
+    #[must_use]
+    pub fn with_effective_main_model(mut self, model: Option<String>) -> Self {
+        self.effective_main_model = model;
+        self
+    }
+
     /// Ergänzt Sandbox-Profil und Host-Permit-Verdrahtung, mit denen jede
     /// Kind-Registry montiert wird (Teil B4).
     ///
@@ -705,6 +752,155 @@ impl RuntimeChildRegistryFactory {
     pub fn with_delegate_wave_store(mut self, state_store: Arc<dyn StateStore>) -> Self {
         self.delegate_wave_store = Some(state_store);
         self
+    }
+
+    /// Hinterlegt den Wissensspeicher für die lesenden Wissenswerkzeuge der
+    /// Kinder (Plan Teil D: „Agenten dürfen Workbench, Palace und Diary
+    /// lesen“; Kanban nur der Root-Orchestrator).
+    ///
+    /// # Beschreibung
+    /// Reiner Erbauer-Schritt. [`ChildRegistryFactory::build_registry`]
+    /// montiert danach für eine Rolle aus
+    /// [`harw_registry_defaults::profile::knowledge_tools_for_role`] genau die
+    /// Provider, deren Werkzeuge die eingebaute Definition der Rolle
+    /// admittiert (`[tools].admitted`) und deren Rechteklasse
+    /// (`ReadWorkspace`) das Profil der Rolle trägt — nie pauschal. Die
+    /// Werkzeuge sind rein lesend: `workbench.show` auf das Projekt des
+    /// Elternteils gedeckelt, `diary.read` auf die Einträge des Kindes
+    /// (Agent-Id = Rollenname), `palace.*` auf `established`-Knoten,
+    /// `kanban.*` (nur Root-Orchestrator, jeder Aufruf fragt) ohne Übergang.
+    ///
+    /// # Arguments
+    /// - `store` (`Arc<KnowledgeStore>`): derselbe Speicher wie
+    ///   `RuntimeServices::knowledge_store` der Wurzel.
+    /// - `kanban_ledger`: das Job-Ledger für den Kartenzustand (nur
+    ///   `snapshot`); `None` → gebundene Karten zeigen `unknown`.
+    #[must_use]
+    pub fn with_knowledge(
+        mut self,
+        store: Arc<harw_knowledge::KnowledgeStore>,
+        kanban_ledger: Option<Arc<dyn harw_knowledge::kanban::lifecycle::JobTransitions>>,
+    ) -> Self {
+        self.knowledge = Some(ChildKnowledgeWiring {
+            store,
+            kanban_ledger,
+        });
+        self
+    }
+
+    /// Wie [`Self::with_knowledge`], aber mit optionaler Quelle — `None`
+    /// lässt die Fabrik unverändert (Montage ohne Profilverzeichnis).
+    #[must_use]
+    pub fn with_optional_knowledge(self, knowledge: Option<ChildKnowledgeSource>) -> Self {
+        match knowledge {
+            Some((store, kanban_ledger)) => self.with_knowledge(store, kanban_ledger),
+            None => self,
+        }
+    }
+
+    /// Hängt die lesenden Wissens-Provider an die Kind-Registry von `role`
+    /// (siehe [`Self::with_knowledge`]).
+    ///
+    /// # Rückgabe
+    /// Der Builder, ergänzt um jeden zugelassenen Provider; unverändert ohne
+    /// Wissensspeicher, für eine Rolle ohne Wissenszugang, ohne eingebaute
+    /// Definition oder ohne `ReadWorkspace` im Profil.
+    fn with_knowledge_readers(
+        &self,
+        role: &str,
+        profile: harw_registry_defaults::RegistryProfile,
+        mut builder: harw_extension_api::ExtensionRegistryBuilder,
+    ) -> harw_extension_api::ExtensionRegistryBuilder {
+        let Some(knowledge) = &self.knowledge else {
+            return builder;
+        };
+        let offered = harw_registry_defaults::profile::knowledge_tools_for_role(role);
+        let Some(ir) = self.builtin_definitions.get(role) else {
+            return builder;
+        };
+        let granted = profile.required_permissions();
+        // Nur Werkzeuge, die die Rolle angeboten bekommt, ihre Definition
+        // admittiert und deren Recht ihr Profil trägt.
+        let admits = |names: &[&str], permissions: &[Option<harw_authority::Permission>]| {
+            permissions
+                .iter()
+                .flatten()
+                .all(|needed| granted.contains(*needed))
+                && names.iter().any(|name| {
+                    offered.contains(name)
+                        && ir
+                            .tool_surface()
+                            .admitted()
+                            .iter()
+                            .any(|admitted| admitted == name)
+                })
+        };
+        let store = &knowledge.store;
+        if admits(
+            harw_registry_defaults::WorkbenchReadToolProvider::TOOL_NAMES,
+            harw_registry_defaults::WorkbenchReadToolProvider::TOOL_PERMISSIONS,
+        ) {
+            builder = builder.tool_provider(Arc::new(
+                harw_registry_defaults::WorkbenchReadToolProvider::new(Arc::clone(store))
+                    .with_project(harw_knowledge::workbench::WorkbenchScope::project_for_path(
+                        &self.project.project_root,
+                    )),
+            ));
+        }
+        if admits(
+            harw_registry_defaults::DiaryToolProvider::TOOL_NAMES,
+            harw_registry_defaults::DiaryToolProvider::TOOL_PERMISSIONS,
+        ) {
+            builder =
+                builder.tool_provider(Arc::new(harw_registry_defaults::DiaryToolProvider::new(
+                    Arc::clone(store),
+                    harw_knowledge::AgentId::new(role.to_owned()),
+                )));
+        }
+        if admits(
+            harw_registry_defaults::PalaceToolProvider::TOOL_NAMES,
+            harw_registry_defaults::PalaceToolProvider::TOOL_PERMISSIONS,
+        ) {
+            builder = builder.tool_provider(Arc::new(
+                harw_registry_defaults::PalaceToolProvider::new(Arc::clone(store)),
+            ));
+        }
+        if admits(
+            harw_registry_defaults::KanbanReadToolProvider::TOOL_NAMES,
+            harw_registry_defaults::KanbanReadToolProvider::TOOL_PERMISSIONS,
+        ) {
+            builder = builder.tool_provider(Arc::new(
+                harw_registry_defaults::KanbanReadToolProvider::new(Arc::clone(store))
+                    .with_ledger(knowledge.kanban_ledger.clone()),
+            ));
+        }
+        builder
+    }
+
+    /// Die interne Modellstelle eines Kind-Starts mit Aufgabenkomplexität
+    /// (Addendum D+E): die Stelle der Rolle ([`Self::internal_point_for_child`]),
+    /// sonst — nur für Worker-Rollen laut eingebauter IR —
+    /// [`InternalModelPoint::WorkerSimple`] bzw.
+    /// [`InternalModelPoint::WorkerComplex`]; sonst `None` (Eltern-Modell).
+    fn internal_point_for_task(
+        &self,
+        role: &str,
+        complexity: Option<harw_core::TaskComplexity>,
+    ) -> Option<InternalModelPoint> {
+        if let Some(point) = self.internal_point_for_child(role) {
+            return Some(point);
+        }
+        let is_worker = self
+            .builtin_definitions
+            .get(role)
+            .is_some_and(|ir| ir.role() == harw_agent_dsl::roles::AgentRoleId::Worker);
+        if !is_worker {
+            return None;
+        }
+        Some(match complexity {
+            Some(harw_core::TaskComplexity::Simple) => InternalModelPoint::WorkerSimple,
+            Some(harw_core::TaskComplexity::Complex) | None => InternalModelPoint::WorkerComplex,
+        })
     }
 
     /// Die interne Modellstelle einer Kind-Rolle (Addendum C + R1).
@@ -1062,6 +1258,9 @@ impl ChildRegistryFactory for RuntimeChildRegistryFactory {
             registry_builder =
                 registry_builder.tool_provider(Arc::new(self.delegate_wave_provider()));
         }
+        // Plan Teil D: lesende Wissenswerkzeuge nur für zugelassene Rollen,
+        // deren Definition sie admittiert (siehe `with_knowledge_readers`).
+        registry_builder = self.with_knowledge_readers(role, profile, registry_builder);
         let registry = registry_builder.build();
         tracing::debug!(
             role,
@@ -1146,21 +1345,33 @@ impl ChildRegistryFactory for RuntimeChildRegistryFactory {
         role: &str,
         complexity: Option<harw_core::TaskComplexity>,
     ) -> Result<Arc<dyn ModelProvider>, AgentSpawnError> {
-        if let Some(point) = self.internal_point_for_child(role) {
-            return Ok(self.pinned_model_for_point(role, point));
+        match self.internal_point_for_task(role, complexity) {
+            Some(point) => Ok(self.pinned_model_for_point(role, point)),
+            None => Ok(Arc::clone(&self.model)),
         }
-        let is_worker = self
-            .builtin_definitions
-            .get(role)
-            .is_some_and(|ir| ir.role() == harw_agent_dsl::roles::AgentRoleId::Worker);
-        if !is_worker {
-            return Ok(Arc::clone(&self.model));
+    }
+
+    /// Das Modell, das ein ungepinntes Kind dieser Rolle ruft (Teil C).
+    ///
+    /// # Beschreibung
+    /// [`Self::with_effective_main_model`], solange die Rolle nicht auf eine
+    /// aufgelöste, vom Hauptmodell abweichende interne Modellstelle fällt —
+    /// dort bestimmt der Pin das Modell (oder, bei einer Stelle ohne eigenes
+    /// Modell, der gepinnte Provider), und das Hauptmodell wäre die falsche
+    /// Aussage.
+    fn main_model_for_task(
+        &self,
+        role: &str,
+        complexity: Option<harw_core::TaskComplexity>,
+    ) -> Option<String> {
+        let pinned_point = self
+            .internal_point_for_task(role, complexity)
+            .and_then(|point| self.internal_models.get(&point))
+            .is_some_and(|resolved| !resolved.is_main_model());
+        if pinned_point {
+            return None;
         }
-        let point = match complexity {
-            Some(harw_core::TaskComplexity::Simple) => InternalModelPoint::WorkerSimple,
-            Some(harw_core::TaskComplexity::Complex) | None => InternalModelPoint::WorkerComplex,
-        };
-        Ok(self.pinned_model_for_point(role, point))
+        self.effective_main_model.clone()
     }
 
     /// Die eingebaute Agent-IR einer Rolle.
@@ -1575,6 +1786,7 @@ mod tests {
             role_names::UIA_EXPLORER,
             role_names::UIA_WRITER,
             role_names::UIA_SHELL_WORKER,
+            role_names::UIA_LATEX_WRITER,
         ] {
             assert_eq!(
                 internal_point_for_role(role),
@@ -1648,6 +1860,7 @@ mod tests {
             role_names::UIA_EXPLORER,
             role_names::UIA_WRITER,
             role_names::UIA_SHELL_WORKER,
+            role_names::UIA_LATEX_WRITER,
         ] {
             assert_eq!(
                 max_concurrent_instances_for_role(role, &definitions),
@@ -1862,6 +2075,50 @@ mod tests {
             factory.reasoning_effort_defaults_for_role_task(role_names::AGENT_STEWARD, None);
         assert_eq!(provider_default, None);
         assert_eq!(model_default, None);
+        Ok(())
+    }
+
+    #[test]
+    fn main_model_for_task_names_the_main_model_only_for_unpinned_roles() -> TestResult {
+        let chain = test_chain(&harw_config::ResolvedConfig::default());
+        let mut internal_models = HashMap::new();
+        internal_models.insert(
+            InternalModelPoint::WorkerComplex,
+            harw_config::ResolvedInternalModel {
+                point: InternalModelPoint::WorkerComplex,
+                provider: Some("acme".to_owned()),
+                model: Some("acme-model".to_owned()),
+                source: harw_config::InternalModelSource::Explicit,
+            },
+        );
+        let factory = RuntimeChildRegistryFactory::new(
+            test_project(),
+            Arc::new(harw_core::EchoModelProvider::new("echo")),
+            chain,
+        )
+        .map_err(ctx("factory builds"))?
+        .with_internal_models(internal_models)
+        .with_effective_main_model(Some("main-model".to_owned()));
+        // Teil C: ohne Pin ruft das Kind das Hauptmodell der Fabrik.
+        assert_eq!(
+            factory.main_model_for_task(role_names::ROOT_ORCHESTRATOR, None),
+            Some("main-model".to_owned())
+        );
+        assert_eq!(
+            factory.main_model_for_task("some-repo-local-role", None),
+            Some("main-model".to_owned())
+        );
+        // Eine aufgelöste, abweichende Stelle pinnt — dort gilt der Pin.
+        assert_eq!(
+            factory.main_model_for_task(role_names::AGENT_STEWARD, None),
+            None
+        );
+        assert_eq!(
+            factory
+                .pinned_model_for_task(role_names::AGENT_STEWARD, None)
+                .as_deref(),
+            Some("acme-model")
+        );
         Ok(())
     }
 
@@ -2506,6 +2763,90 @@ mod tests {
                 .map(|spec| spec.name().to_owned())
                 .collect();
         assert_eq!(names, vec![harw_core_bridge::DELEGATE_WAVE_TOOL.to_owned()]);
+        Ok(())
+    }
+
+    /// Die Werkzeugnamen, die [`RuntimeChildRegistryFactory::with_knowledge_readers`]
+    /// für `role` an einen leeren Builder hängt.
+    fn knowledge_tools_mounted_for(
+        factory: &RuntimeChildRegistryFactory,
+        role: &str,
+    ) -> Vec<String> {
+        let Some(profile) = profile_for_role(role) else {
+            return Vec::new();
+        };
+        let registry = factory
+            .with_knowledge_readers(
+                role,
+                profile,
+                harw_extension_api::ExtensionRegistryBuilder::default(),
+            )
+            .build();
+        let mut names: Vec<String> = registry
+            .tool_providers()
+            .iter()
+            .flat_map(|provider| provider.tools())
+            .map(|spec| spec.name().to_owned())
+            .collect();
+        names.sort();
+        names
+    }
+
+    /// Plan Teil D: eine Leserolle bekommt mit Wissensspeicher genau die
+    /// lesenden Wissenswerkzeuge, die ihre Definition admittiert; eine Rolle
+    /// außerhalb von `knowledge_tools_for_role` (hier `researcher-web`,
+    /// `executor`, `uia-latex-writer`) bekommt keines, und ohne
+    /// `with_knowledge` bekommt niemand etwas.
+    #[test]
+    fn knowledge_readers_are_mounted_only_for_admitting_reader_roles() -> TestResult {
+        let without = RuntimeChildRegistryFactory::new(
+            test_project(),
+            Arc::new(harw_core::EchoModelProvider::new("echo")),
+            test_chain(&harw_config::ResolvedConfig::default()),
+        )
+        .map_err(ctx("factory builds"))?;
+        assert!(knowledge_tools_mounted_for(&without, role_names::EXPLORER).is_empty());
+
+        let store = Arc::new(harw_knowledge::KnowledgeStore::new(std::path::Path::new(
+            "/nonexistent/r4/knowledge",
+        )));
+        let factory = without.with_knowledge(store, None);
+        for role in harw_registry_defaults::profile::KNOWLEDGE_READER_ROLES {
+            let mut expected: Vec<String> =
+                harw_registry_defaults::profile::knowledge_tools_for_role(role)
+                    .iter()
+                    .map(|tool| (*tool).to_owned())
+                    .collect();
+            expected.sort();
+            assert_eq!(
+                knowledge_tools_mounted_for(&factory, role),
+                expected,
+                "{role}"
+            );
+        }
+        // Kanban nur für den Root-Orchestrator (ausdrücklicher Nutzerwunsch).
+        assert!(
+            knowledge_tools_mounted_for(&factory, role_names::ROOT_ORCHESTRATOR)
+                .iter()
+                .any(|tool| tool == "kanban.list")
+        );
+        assert!(
+            !knowledge_tools_mounted_for(&factory, role_names::EXPLORER)
+                .iter()
+                .any(|tool| tool.starts_with("kanban."))
+        );
+        for role in [
+            role_names::RESEARCHER_WEB,
+            role_names::EXECUTOR,
+            role_names::UIA_LATEX_WRITER,
+            role_names::MATRIX_PLAYER,
+            "some-repo-local-role",
+        ] {
+            assert!(
+                knowledge_tools_mounted_for(&factory, role).is_empty(),
+                "{role}"
+            );
+        }
         Ok(())
     }
 }

@@ -68,7 +68,9 @@ use harw_tool_explorer::ExplorerToolProvider;
 use harw_tool_fs::FsToolProvider;
 use harw_tool_lens::LensToolProvider;
 use harw_tool_process::ProcessToolProvider;
-use harw_tool_shell::{HostPermitPromptSender, HostPermitVariant, ShellToolProvider};
+use harw_tool_shell::{
+    HostPermitPromptSender, HostPermitVariant, LatexToolProvider, ShellToolProvider,
+};
 use harw_tool_web::WebToolProvider;
 
 #[cfg(feature = "browser")]
@@ -296,6 +298,18 @@ pub mod role_names {
     /// [`RegistryProfile::UiaShellWorker`] und `agents/uia-shell-worker.toml`).
     pub const UIA_SHELL_WORKER: &str = "uia-shell-worker";
 
+    /// LaTeX-Schreibspezialisierung der UIA (Runde 4, Teil E): dieselbe
+    /// Begründung wie [`UIA_EXPLORER`]/[`UIA_WRITER`] — die Spawn-Matrix
+    /// lässt der UIA nie den regulären `Worker`, deshalb trägt die Rolle
+    /// `role = "uia-worker"`. Nutzerentscheidung: lesende `fs.*`,
+    /// `fs.write`, `doc.read_pdf` und das typisierte `latex.build` (festes
+    /// `latexmk`-argv in der Sandbox, kein freies `shell.exec`) — kein Netz,
+    /// keine `deps.*`, kein `lens.ask`. LaTeX wird als installiert
+    /// vorausgesetzt, nie nachinstalliert. Siehe
+    /// `agents/uia-latex-writer.toml` und
+    /// [`RegistryProfile::UiaLatexWriter`].
+    pub const UIA_LATEX_WRITER: &str = "uia-latex-writer";
+
     /// Setzt Agentendefinitionen um (Addendum K + Nachtrag K): die UIA und der
     /// Root-Orchestrator dürfen ihn spawnen (`AgentRoleId::AgentSteward`,
     /// `harw-agent-dsl/src/roles.rs`), er selbst spawnt nichts. Validiert
@@ -365,6 +379,7 @@ pub mod role_names {
         UIA_EXPLORER,
         UIA_WRITER,
         UIA_SHELL_WORKER,
+        UIA_LATEX_WRITER,
         AGENT_STEWARD,
         CODING_ORCHESTRATOR,
         RESEARCH_ORCHESTRATOR,
@@ -420,6 +435,117 @@ pub const ORCHESTRATION_TOOLS: &[&str] = &["delegate_wave"];
 pub fn composition_tools_for_role(role: &str) -> &'static [&'static str] {
     if is_orchestrator_role(role) {
         ORCHESTRATION_TOOLS
+    } else {
+        &[]
+    }
+}
+
+/// Die lesenden Wissenswerkzeuge (Plan Teil D), die die Composition-Root
+/// neben der Profil-Registry an Wurzel und ausgewählte Kind-Rollen hängt:
+/// `workbench.show`, `diary.read`, `palace.search`, `palace.recall`.
+/// Die Kanban-Lesewerkzeuge stehen getrennt in [`KANBAN_READ_TOOLS`].
+///
+/// # Warum nicht Teil eines [`RegistryProfile`]
+/// Die Provider brauchen den `KnowledgeStore` des Profil-Homes (und für
+/// `diary.read` die Agent-Id der Sitzung) — Zustand der Composition-Root,
+/// nicht des Projekts. Ohne Wissensspeicher werden sie nie registriert.
+/// Jedes Werkzeug ist rein lesend mit `Permission::ReadWorkspace` (siehe
+/// [`crate::authority::tool_permission`]) und steht in
+/// [`crate::AUTO_APPROVED_TOOLS`].
+///
+/// # Deckung
+/// Wie bei [`ORCHESTRATION_TOOLS`] vergleichen die Deckungstests die
+/// TOML-Seite gegen `profile.tool_names()` ∪ [`composition_tools_for_role`]
+/// ∪ [`knowledge_tools_for_role`].
+pub const KNOWLEDGE_READ_TOOLS: &[&str] = &[
+    "workbench.show",
+    "diary.read",
+    "palace.search",
+    "palace.recall",
+];
+
+/// Die lesenden Kanban-Werkzeuge (Plan D2): `kanban.list`, `kanban.show`.
+///
+/// # Beschreibung
+/// Rein lesend (`Permission::ReadWorkspace`), aber auf Wunsch der Nutzerin
+/// **nicht** in [`crate::AUTO_APPROVED_TOOLS`] — jeder Aufruf fragt — und nur
+/// für die UIA-Wurzel (Montage der Composition-Root) und
+/// [`role_names::ROOT_ORCHESTRATOR`]. Kanban wird nur auf ausdrücklichen
+/// Wunsch der Nutzerin benutzt; kein Agent legt von selbst Aufgaben aufs
+/// Board oder leitet sie daraus ab.
+pub const KANBAN_READ_TOOLS: &[&str] = &["kanban.list", "kanban.show"];
+
+/// [`KNOWLEDGE_READ_TOOLS`] ∪ [`KANBAN_READ_TOOLS`] — die Fläche des
+/// Root-Orchestrators.
+const ROOT_ORCHESTRATOR_KNOWLEDGE_TOOLS: &[&str] = &[
+    "workbench.show",
+    "diary.read",
+    "palace.search",
+    "palace.recall",
+    "kanban.list",
+    "kanban.show",
+];
+
+/// Die eingebauten Rollen, denen die Composition-Root die lesenden
+/// Wissenswerkzeuge ([`KNOWLEDGE_READ_TOOLS`]) anbietet (Entscheidung der
+/// Nutzerin: „Agenten dürfen Workbench, Palace und Diary lesen“; Kanban nur
+/// der Root-Orchestrator, siehe [`KANBAN_READ_TOOLS`]).
+///
+/// # Beschreibung
+/// Aufgenommen sind die Orchestratoren und die lesenden bzw. schreibenden
+/// Rollen mit Workspace-Lesezugriff. Bewusst **nicht** aufgenommen:
+/// - reine Exec-Rollen (`executor`, `uia-shell-worker`) — ihre Fläche ist
+///   absichtlich nur der Prozesspfad (plus Lesen bei der Shell-UIA-Rolle);
+/// - `researcher-web` — nur `web.*`, kein Workspace;
+/// - die vier Security-Triage-Rollen und die Matrix-Sitze — feste,
+///   exakt geprüfte Werkzeugmengen ohne Wissenszugriff;
+/// - `memory-steward`, `agent-steward`, `uia-latex-writer` — eng
+///   zugeschnittene Schreibrollen.
+pub const KNOWLEDGE_READER_ROLES: &[&str] = &[
+    role_names::ROOT_ORCHESTRATOR,
+    role_names::CODING_ORCHESTRATOR,
+    role_names::RESEARCH_ORCHESTRATOR,
+    role_names::ANALYSIS_ORCHESTRATOR,
+    role_names::PLANNER,
+    role_names::ANALYST,
+    role_names::EXPLORER,
+    role_names::RESEARCHER,
+    role_names::RESEARCHER_DEPS,
+    role_names::DEPENDENCY_RESEARCHER,
+    role_names::UIA_EXPLORER,
+    role_names::UIA_WORKER,
+    role_names::UIA_WRITER,
+];
+
+/// Liefert die lesenden Wissenswerkzeuge, die die Composition-Root für
+/// `role` zusätzlich zur Profil-Registry beisteuern **darf**.
+///
+/// # Argumente
+/// - `role` (`&str`): Rollenname, üblicherweise aus [`role_names`].
+///
+/// # Rückgabe
+/// Für [`role_names::ROOT_ORCHESTRATOR`] [`KNOWLEDGE_READ_TOOLS`] und
+/// [`KANBAN_READ_TOOLS`], für jede andere Rolle aus
+/// [`KNOWLEDGE_READER_ROLES`] [`KNOWLEDGE_READ_TOOLS`], sonst eine leere
+/// Liste. Die Kind-Registry-Fabrik montiert einen Provider
+/// zusätzlich nur, wenn die Definition der Rolle mindestens eines seiner
+/// Werkzeuge admittiert und ein Wissensspeicher vorliegt.
+///
+/// # Beispiele
+/// ```rust
+/// use harw_registry_defaults::profile::{knowledge_tools_for_role, role_names};
+///
+/// assert!(knowledge_tools_for_role(role_names::EXPLORER).contains(&"palace.search"));
+/// assert!(!knowledge_tools_for_role(role_names::EXPLORER).contains(&"kanban.list"));
+/// assert!(knowledge_tools_for_role(role_names::ROOT_ORCHESTRATOR).contains(&"kanban.list"));
+/// assert!(knowledge_tools_for_role(role_names::RESEARCHER_WEB).is_empty());
+/// ```
+#[must_use]
+pub fn knowledge_tools_for_role(role: &str) -> &'static [&'static str] {
+    if role == role_names::ROOT_ORCHESTRATOR {
+        ROOT_ORCHESTRATOR_KNOWLEDGE_TOOLS
+    } else if KNOWLEDGE_READER_ROLES.contains(&role) {
+        KNOWLEDGE_READ_TOOLS
     } else {
         &[]
     }
@@ -615,6 +741,14 @@ const AGENT_DEFINITION_TOOLS: &[&str] = &[
 /// Die Werkzeuge von `harw-tool-shell`.
 pub(crate) const SHELL_TOOLS: &[&str] = &["shell.exec"];
 
+/// Das typisierte LaTeX-Build-Werkzeug von `harw-tool-shell`
+/// (`harw_tool_shell::LatexToolProvider`, Runde 4 Teil E): startet
+/// ausschließlich `latexmk` mit festem argv in der Bubblewrap-Sandbox, ohne
+/// Netz und ohne Shell-Escape. Verlangt `Permission::ExecuteProcess`, steht
+/// nicht in der Auto-Freigabe. Nur [`RegistryProfile::UiaLatexWriter`]
+/// registriert es.
+pub(crate) const LATEX_TOOLS: &[&str] = &[harw_tool_shell::LATEX_BUILD_TOOL];
+
 /// Die Werkzeuge von `harw-tool-process`: `process.list` (Vorschau, sendet
 /// nie ein Signal) und `process.kill` (destruktiv, immer freigabepflichtig
 /// über [`crate::ALWAYS_ASK_TOOLS`]). Beide verlangen
@@ -731,6 +865,10 @@ pub(crate) const BROWSER_TOOLS: &[&str] = &[
 ///   `fs.write`), aber kein `shell.*`, kein `web.*`, kein `lens.ask`; Rechte
 ///   genau `{ReadWorkspace, WriteWorkspace}` (siehe
 ///   [`RegistryProfile::WorkspaceEdit`]).
+/// - `UiaLatexWriter` — lesende `fs.*` plus `fs.write` plus `doc.read_pdf`
+///   plus `latex.build` unter der UIA-Organisationsrolle; kein `shell.*`,
+///   kein `process.*`, kein `web.*`, kein `deps.*`, kein `explore.*`, kein
+///   `lens.ask` (siehe [`RegistryProfile::UiaLatexWriter`]).
 ///
 /// # Warum `NoTools` und nicht `ReadOnlyExplore` für die Triage-Rollen
 /// Die vier `security-*-triage`-Rollen (siehe [`role_names`]) haben
@@ -994,6 +1132,35 @@ pub enum RegistryProfile {
     /// Reducer der Rollen bleibt
     /// [`crate::authority::AuthorityReducer::ReadOnly`] — kein Netz.
     MatrixReader,
+    /// LaTeX-Schreibspezialisierung der UIA: alle sechs `fs.*`-Werkzeuge
+    /// inklusive `fs.write` ([`FS_FULL_TOOLS`]) plus [`DOC_TOOLS`]
+    /// (`doc.read_pdf`) plus [`LATEX_TOOLS`] (`latex.build`) — kein
+    /// `shell.*`, kein `process.*`, kein `web.*`, kein `deps.*`, kein
+    /// `explore.*`, kein `lens.ask`. Rechte genau
+    /// `{ReadWorkspace, WriteWorkspace, ExecuteProcess}`.
+    ///
+    /// # Warum dieses Profil existiert (Runde 4, Teil E)
+    /// Nutzerentscheidung: der mitgelieferte LaTeX-Worker der UIA liest
+    /// Quellen, legt `.tex`/`.bib` an und ändert sie, liest PDFs als Vorlage
+    /// und darf einen Build **starten** — aber nur über das typisierte
+    /// `latex.build` (festes `latexmk`-argv, Sandbox ohne Netz, kein
+    /// Shell-Escape, Freigabe je Aufruf), nie über eine freie Shell. LaTeX
+    /// wird als installiert vorausgesetzt; fehlt es, meldet `latex.build`
+    /// `not_installed` samt Hinweis für die Nutzerin.
+    /// Kein bestehendes Profil passt genau: [`RegistryProfile::WorkspaceEdit`]
+    /// bringt `explore.*` und `deps.graph`/`deps.locked` mit,
+    /// [`RegistryProfile::UiaWriter`] `web.*` und `deps.*`, und
+    /// [`RegistryProfile::MemoryStewardship`] hat zwar dieselbe
+    /// Werkzeugmenge, ist aber der Gedächtnis-Konsolidierung vorbehalten und
+    /// trägt deren Rollenbeschreibung; `UiaShellWorker` bringt die freie
+    /// Shell mit. `fs.edit` gibt es in `harw-tool-fs` (noch) nicht; kommt es
+    /// hinzu, gehört es hierher. Rolle: [`role_names::UIA_LATEX_WRITER`],
+    /// Reducer [`crate::authority::AuthorityReducer::ReadOnly`] — ohne Netz;
+    /// `fs.write` (`WriteWorkspace`) und `latex.build` (`ExecuteProcess`)
+    /// sind wie bei `uia-writer`/`uia-shell-worker` die dokumentierte
+    /// Ausnahme nach Muster `executor` (kein Reducer trägt Schreib- oder
+    /// Ausführungsrecht weiter).
+    UiaLatexWriter,
 }
 
 impl RegistryProfile {
@@ -1016,6 +1183,7 @@ impl RegistryProfile {
         RegistryProfile::ReadOnlyResearch,
         RegistryProfile::WorkspaceEdit,
         RegistryProfile::MatrixReader,
+        RegistryProfile::UiaLatexWriter,
     ];
 
     /// Liefert die Rollenbeschreibung, die im System-Prompt erscheint.
@@ -1054,6 +1222,9 @@ impl RegistryProfile {
             RegistryProfile::ReadOnlyResearch => "read-only research agent",
             RegistryProfile::WorkspaceEdit => "workspace editing agent without shell",
             RegistryProfile::MatrixReader => "matrix game seat reading its materials",
+            RegistryProfile::UiaLatexWriter => {
+                "LaTeX writing specialization of the user interface agent"
+            }
         }
     }
 
@@ -1068,8 +1239,9 @@ impl RegistryProfile {
     /// Agentendefinitions-Werkzeuge `agents.write_definition`/
     /// `agents.write_uia`), [`RegistryProfile::UiaWriter`] (registriert
     /// `fs.write`), [`RegistryProfile::UiaShellWorker`] (registriert
-    /// `shell.exec`) und [`RegistryProfile::WorkspaceEdit`] (registriert
-    /// `fs.write`). Alle übrigen Profile — inklusive
+    /// `shell.exec`), [`RegistryProfile::WorkspaceEdit`] (registriert
+    /// `fs.write`) und [`RegistryProfile::UiaLatexWriter`] (registriert
+    /// `fs.write` und `latex.build`). Alle übrigen Profile — inklusive
     /// [`RegistryProfile::UiaExplorer`] — sind read-only und dürfen weder
     /// `fs.write` noch `shell.exec` sehen.
     ///
@@ -1093,6 +1265,7 @@ impl RegistryProfile {
                 | RegistryProfile::UiaWriter
                 | RegistryProfile::UiaShellWorker
                 | RegistryProfile::WorkspaceEdit
+                | RegistryProfile::UiaLatexWriter
         )
     }
 
@@ -1257,6 +1430,17 @@ impl RegistryProfile {
             RegistryProfile::MatrixReader => FS_READ_ONLY_TOOLS
                 .iter()
                 .chain(DOC_TOOLS.iter())
+                .copied()
+                .collect(),
+            // LaTeX-Schreibspezialisierung der UIA (siehe die Begründung bei
+            // `RegistryProfile::UiaLatexWriter`): alle sechs `fs.*`
+            // (inklusive `fs.write`) plus `doc.read_pdf` plus `latex.build`
+            // — kein Netz, keine freie Shell, keine `deps.*`, kein
+            // `explore.*`.
+            RegistryProfile::UiaLatexWriter => FS_FULL_TOOLS
+                .iter()
+                .chain(DOC_TOOLS.iter())
+                .chain(LATEX_TOOLS.iter())
                 .copied()
                 .collect(),
         }
@@ -1445,6 +1629,10 @@ pub fn profile_for_role(role: &str) -> Option<RegistryProfile> {
         // Host-Shell-Spezialisierung der UIA — siehe die Begründung bei
         // `RegistryProfile::UiaShellWorker` und `agents/uia-shell-worker.toml`.
         role_names::UIA_SHELL_WORKER => Some(RegistryProfile::UiaShellWorker),
+        // LaTeX-Schreibspezialisierung der UIA („nur schreiben“) — siehe die
+        // Begründung bei `RegistryProfile::UiaLatexWriter` und
+        // `agents/uia-latex-writer.toml`.
+        role_names::UIA_LATEX_WRITER => Some(RegistryProfile::UiaLatexWriter),
         // Einzige eingebaute Rolle mit den Agentendefinitions-Werkzeugen —
         // siehe die Begründung bei `RegistryProfile::AgentStewardship` und
         // `agents/agent-steward.toml`.
@@ -2048,6 +2236,18 @@ fn profile_tool_providers(
             ));
             let doc: Arc<dyn ToolProvider> = Arc::new(DocToolProvider);
             vec![filesystem, doc]
+        }
+        // LaTeX-Schreibspezialisierung der UIA: voller, ungefilterter
+        // FS-Provider (alle sechs `fs.*`, inklusive `fs.write`) + lesender
+        // Doc-Provider + `LatexToolProvider` (`latex.build`, festes argv in
+        // der Bubblewrap-Sandbox, nie Host) — kein Shell-, Web-, Deps- oder
+        // Explorer-Provider. Siehe die Begründung bei
+        // `RegistryProfile::UiaLatexWriter`.
+        RegistryProfile::UiaLatexWriter => {
+            let filesystem: Arc<dyn ToolProvider> = Arc::new(FsToolProvider::default());
+            let doc: Arc<dyn ToolProvider> = Arc::new(DocToolProvider);
+            let latex: Arc<dyn ToolProvider> = Arc::new(LatexToolProvider::new());
+            vec![filesystem, doc, latex]
         }
     }
 }
@@ -3122,6 +3322,41 @@ mod tests {
         Ok(())
     }
 
+    /// `UiaLatexWriter` (Runde 4, Teil E): exakt `fs.*` inklusive
+    /// `fs.write`, `doc.read_pdf` und `latex.build` — nie `shell.*`,
+    /// `process.*`, `web.*`, `deps.*`, `explore.*`, `lens.ask`; die montierte
+    /// Registry trägt tatsächlich einen Executor für `latex.build`.
+    #[test]
+    fn test_uia_latex_writer_profile_exact_tool_surface() -> TestResult {
+        let expected = vec![
+            "fs.read",
+            "fs.write",
+            "fs.list",
+            "fs.search",
+            "fs.glob",
+            "fs.grep",
+            "doc.read_pdf",
+            "latex.build",
+        ];
+        assert_eq!(RegistryProfile::UiaLatexWriter.tool_names(), expected);
+        assert_eq!(
+            profile_for_role(role_names::UIA_LATEX_WRITER),
+            Some(RegistryProfile::UiaLatexWriter)
+        );
+        let assembled = assemble(RegistryProfile::UiaLatexWriter)?;
+        let expected_owned: Vec<String> = expected.iter().map(|t| (*t).to_owned()).collect();
+        assert_eq!(registered_names(&assembled), expected_owned);
+        assert!(
+            assembled
+                .registry
+                .tool_providers()
+                .iter()
+                .any(|provider| provider.executor(&ToolName::new("latex.build")).is_some()),
+            "latex.build braucht einen Executor"
+        );
+        Ok(())
+    }
+
     /// Die Wurzel der UIA-Sitzung (Einstieg `Tui` → `RegistryProfile::Full`)
     /// registriert nie ein `web.*`-Werkzeug — Netz-Recherche bleibt den
     /// UIA-Helfern vorbehalten, auch wenn die Wurzel egress-gebundenes Netz
@@ -3588,6 +3823,48 @@ mod tests {
         assert!(composition_tools_for_role("unbekannt").is_empty());
     }
 
+    /// Plan Teil D: die lesenden Wissenswerkzeuge sind ausnahmslos
+    /// `ReadWorkspace`, von keinem Profil selbst registriert und nur für die
+    /// dokumentierten Leserollen angeboten; Workbench/Diary/Palace sind
+    /// auto-freigegeben, Kanban nie und nur für den Root-Orchestrator.
+    #[test]
+    fn test_knowledge_tools_are_read_only_and_offered_only_to_reader_roles() {
+        let all: Vec<&str> = [KNOWLEDGE_READ_TOOLS, KANBAN_READ_TOOLS].concat();
+        assert_eq!(ROOT_ORCHESTRATOR_KNOWLEDGE_TOOLS, all.as_slice());
+        for tool in &all {
+            assert_eq!(
+                crate::authority::tool_permission(tool),
+                Some(harw_authority::Permission::ReadWorkspace),
+                "{tool}"
+            );
+            assert_eq!(
+                crate::AUTO_APPROVED_TOOLS.contains(tool),
+                !KANBAN_READ_TOOLS.contains(tool),
+                "{tool}"
+            );
+            for profile in RegistryProfile::ALL {
+                assert!(
+                    !profile.registered_tool_names().contains(tool),
+                    "{profile:?} darf {tool} nicht selbst registrieren"
+                );
+            }
+        }
+        for role in role_names::ALL {
+            let expected: &[&str] = if *role == role_names::ROOT_ORCHESTRATOR {
+                ROOT_ORCHESTRATOR_KNOWLEDGE_TOOLS
+            } else if KNOWLEDGE_READER_ROLES.contains(role) {
+                KNOWLEDGE_READ_TOOLS
+            } else {
+                &[]
+            };
+            assert_eq!(knowledge_tools_for_role(role), expected, "{role}");
+        }
+        for role in KNOWLEDGE_READER_ROLES {
+            assert!(role_names::ALL.contains(role), "{role}");
+        }
+        assert!(knowledge_tools_for_role("unbekannt").is_empty());
+    }
+
     #[test]
     fn test_child_orchestrators_are_listed_in_all() {
         for role in role_names::CHILD_ORCHESTRATORS {
@@ -3645,6 +3922,7 @@ mod tests {
         assert!(!RegistryProfile::UiaWriter.is_read_only());
         assert!(!RegistryProfile::UiaShellWorker.is_read_only());
         assert!(!RegistryProfile::WorkspaceEdit.is_read_only());
+        assert!(!RegistryProfile::UiaLatexWriter.is_read_only());
         for profile in RegistryProfile::ALL.iter().filter(|profile| {
             !matches!(
                 **profile,
@@ -3656,6 +3934,7 @@ mod tests {
                     | RegistryProfile::UiaWriter
                     | RegistryProfile::UiaShellWorker
                     | RegistryProfile::WorkspaceEdit
+                    | RegistryProfile::UiaLatexWriter
             )
         }) {
             assert!(profile.is_read_only(), "{profile:?} muss read-only sein");

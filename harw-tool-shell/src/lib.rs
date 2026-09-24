@@ -24,6 +24,8 @@
 //!   [`HostPermitHandles`] (gebündelter ServiceMap-Eintrag, Plan Teil B3) und
 //!   [`SANDBOX_LEASE_WORKER_DEFINITION`] (Worker-Definition der
 //!   `sandbox-lease`-Operation, Plan Teil B5)
+//! - [`latex`] — [`LatexToolProvider`]: typisiertes Werkzeug `latex.build`
+//!   (festes `latexmk`-argv in derselben Bubblewrap-Sandbox, Runde 4 Teil E)
 //! - `capture` (intern) — streamende, gekappte Erfassung von stdout/stderr (W1-03)
 
 #![forbid(unsafe_code)]
@@ -31,6 +33,7 @@
 mod capture;
 pub mod exec;
 pub mod host_permit_prompt;
+pub mod latex;
 pub mod limits;
 
 pub use exec::{
@@ -41,6 +44,7 @@ pub use host_permit_prompt::{
     HostPermitHandles, HostPermitPrompt, HostPermitPromptReceiver, HostPermitPromptSender,
     HostPermitVariant, SANDBOX_LEASE_WORKER_DEFINITION, host_permit_prompt_channel,
 };
+pub use latex::{LATEX_BUILD_TOOL, LatexEngine, LatexToolProvider};
 pub use limits::{ShellLimits, ShellLimitsError};
 
 // Test-Fehlertyp (Bible R087/R165/R182), nur für Tests.

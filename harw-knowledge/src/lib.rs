@@ -17,6 +17,8 @@
 //! - [`diary`]   — append-only daily journal
 //! - [`dream`]   — dream job payload/output types (the `Job` lives in `harw-job-runtime`)
 //! - [`workbench`]— per-session/per-project scratch surface
+//! - [`lock`]    — prozessübergreifende Dateisperre ([`lock::KnowledgeLock`])
+//!   für Read-Modify-Write-Zyklen (Diary, Kanban-Karten, Workbench)
 //! - [`kanban`]  — typed board / lane / card model + lifecycle
 //! - [`security`]— `SecurityFinding` / `Baseline` durable security artifacts (AW4-05)
 //! - [`visibility`]— `VisibilityScope`, applied uniformly
@@ -110,6 +112,7 @@ pub mod dream;
 pub mod error;
 pub mod index;
 pub mod kanban;
+pub mod lock;
 pub mod memory;
 pub mod model_behavior_proposal;
 pub mod security;
@@ -124,11 +127,15 @@ pub use context_provider::{
     KNOWLEDGE_CONTEXT_MAX_TRUST, KNOWLEDGE_CONTEXT_MAY_CARRY_USER_CONTENT,
     KNOWLEDGE_CONTEXT_NAMESPACE, KnowledgeContextProvider,
 };
-pub use dream::DreamReport;
+pub use dream::{
+    DreamReport, DreamReportData, DreamRunStatus, DreamSchedulerState, DreamSuggestion,
+    DreamSuggestionKind, DreamSuggestionStatus,
+};
 pub use error::{KnowledgeError, KnowledgeResult};
 pub use index::{ArtifactRef, KnowledgeIndex};
 pub use kanban::board::{
     BlockKind, Board, BoardId, Card, CardId, CardState, Lane, LaneId, LaneKind,
 };
+pub use lock::KnowledgeLock;
 pub use store::KnowledgeStore;
 pub use visibility::{AgentId, AgentRoleRef, VisibilityScope};

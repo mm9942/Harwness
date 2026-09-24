@@ -331,6 +331,13 @@ fn expand_backlinks(
                 // what this caller may see).
                 continue;
             }
+            if !query.kinds.is_empty() && !query.kinds.contains(&backref.kind) {
+                // Same rule for the kind filter: an artifact of an excluded
+                // kind (e.g. a topic during a palace-only search) is neither
+                // a hit nor a stepping stone — otherwise its id would leak
+                // into the `hop_path` of a later hit.
+                continue;
+            }
             let next_depth = depth + 1;
             let score = base_score * HOP_DECAY.powi(i32::from(next_depth));
             let mut next_path = path.clone();
@@ -482,6 +489,63 @@ mod tests {
             .map(|hit| hit.artifact.id.clone())
             .collect();
         assert_eq!(ids, vec![ArtifactId::new("security/critical-vuln")]);
+        Ok(())
+    }
+
+    /// Backlink hops honour `query.kinds`: a palace-only search neither
+    /// returns a linked topic nor walks through it to further nodes.
+    #[test]
+    fn test_backlink_expansion_respects_the_kind_filter() -> TestResult {
+        let mut index = KnowledgeIndex::new();
+        index.insert(artifact(
+            "palace/deploy",
+            ArtifactKind::PalaceNode,
+            VisibilityScope::OperatorOnly,
+            "deploy canary pipeline",
+            Vec::new(),
+        ));
+        index.insert(artifact(
+            "topic/notes",
+            ArtifactKind::TopicMemory,
+            VisibilityScope::OperatorOnly,
+            "loose notes",
+            vec![ArtifactId::new("palace/deploy")],
+        ));
+        index.insert(artifact(
+            "palace/behind-topic",
+            ArtifactKind::PalaceNode,
+            VisibilityScope::OperatorOnly,
+            "unrelated body",
+            vec![ArtifactId::new("topic/notes")],
+        ));
+
+        let mut query = RecallQuery::new("canary", VisibilityScope::OperatorOnly);
+        query.kinds = vec![ArtifactKind::PalaceNode];
+        query.max_hops = 2;
+        let result = search(&index, &query)
+            .map_err(crate::test_support::ctx("bounded recall query succeeds"))?;
+        let ids: Vec<ArtifactId> = result
+            .hits
+            .iter()
+            .map(|hit| hit.artifact.id.clone())
+            .collect();
+        assert_eq!(ids, vec![ArtifactId::new("palace/deploy")]);
+
+        // Without a kind filter the same hops reach both linked artifacts.
+        let mut open = RecallQuery::new("canary", VisibilityScope::OperatorOnly);
+        open.max_hops = 2;
+        let result = search(&index, &open)
+            .map_err(crate::test_support::ctx("bounded recall query succeeds"))?;
+        let ids: Vec<ArtifactId> = result
+            .hits
+            .iter()
+            .map(|hit| hit.artifact.id.clone())
+            .collect();
+        assert!(ids.contains(&ArtifactId::new("topic/notes")), "{ids:?}");
+        assert!(
+            ids.contains(&ArtifactId::new("palace/behind-topic")),
+            "{ids:?}"
+        );
         Ok(())
     }
 

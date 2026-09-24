@@ -38,7 +38,8 @@ pub struct HarnessConfig {
     #[serde(default)]
     pub uia_model: Option<String>,
     /// Pinnt das Modell der uia-worker-Rollenfamilie (`uia-worker`,
-    /// `uia-explorer`, `uia-writer`, `uia-shell-worker`) unabhängig von
+    /// `uia-explorer`, `uia-writer`, `uia-shell-worker`, `uia-latex-writer`)
+    /// unabhängig von
     /// `default_model`/`uia_model`. Der Provider ist hier bewusst **nicht**
     /// separat wählbar — er muss zwingend mit dem effektiven `uia_provider`
     /// übereinstimmen (Kopplungsregel, wird an anderer Stelle durchgesetzt,
@@ -107,6 +108,14 @@ pub struct HarnessConfig {
     /// (Addendum F+G). Siehe [`GuardsToml`].
     #[serde(default)]
     pub guards: GuardsToml,
+    /// `[knowledge]` — Wissensflächen, derzeit `[knowledge.diary]`
+    /// (Plan D3). Siehe [`KnowledgeToml`].
+    #[serde(default)]
+    pub knowledge: KnowledgeToml,
+    /// `[dream]` — Traum-Scheduler und Traumläufe (Plan D5). Siehe
+    /// [`DreamToml`].
+    #[serde(default)]
+    pub dream: DreamToml,
     #[serde(skip)]
     pub base_dir: Option<std::path::PathBuf>,
 }
@@ -128,6 +137,115 @@ pub struct CompactionToml {
     /// Auto-Compaction vor jeder stillen Byte-Kappung greift.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_history_bytes: Option<usize>,
+}
+
+/// Standard-Aufbewahrung von Diary-Tagesdateien in Tagen, wenn
+/// `[knowledge.diary] retention_days` fehlt (entspricht
+/// `harw_knowledge::diary::DEFAULT_DIARY_RETENTION_DAYS`).
+pub const DEFAULT_DIARY_RETENTION_DAYS: u32 = 90;
+
+/// `[knowledge]` — Konfiguration der Wissensflächen (Plan Teil D).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct KnowledgeToml {
+    /// `[knowledge.diary]` — Aufbewahrung des Tagebuchs.
+    #[serde(default)]
+    pub diary: DiaryToml,
+}
+
+/// `[knowledge.diary]` — Aufbewahrung des Tagebuchs (Plan D3).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DiaryToml {
+    /// Tage, die eine Diary-Tagesdatei erhalten bleibt, bevor die Wartung
+    /// (`harw_knowledge::diary::maintain`) sie ins Monats-Rollup übernimmt.
+    /// `None` → [`DEFAULT_DIARY_RETENTION_DAYS`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retention_days: Option<u32>,
+}
+
+impl DiaryToml {
+    /// Das wirksame Aufbewahrungsfenster in Tagen.
+    #[must_use]
+    pub fn effective_retention_days(&self) -> u32 {
+        self.retention_days.unwrap_or(DEFAULT_DIARY_RETENTION_DAYS)
+    }
+}
+
+/// Vorgabe für `[dream] enabled` (der Gateway-Scheduler träumt).
+pub const DEFAULT_DREAM_ENABLED: bool = true;
+/// Vorgabe für `[dream] budget` (Token je Traumlauf).
+pub const DEFAULT_DREAM_BUDGET_TOKENS: u64 = 16_384;
+/// Vorgabe für `[dream] idle_minutes`.
+pub const DEFAULT_DREAM_IDLE_MINUTES: u32 = 15;
+/// Vorgabe für `[dream] cooldown_minutes`.
+pub const DEFAULT_DREAM_COOLDOWN_MINUTES: u32 = 60;
+
+/// `[dream]` — Traum-Scheduler und Traumläufe (Plan D5).
+///
+/// # Beschreibung
+/// - `enabled`: ob der Gateway-Scheduler selbständig träumt (Vorgabe
+///   `true`); `/dream run` bleibt davon unberührt.
+/// - `budget`: Token-Budget eines Laufs (Vorgabe 16 384).
+/// - `idle_minutes`/`cooldown_minutes`: Leerlauf vor einem Traum bzw.
+///   Mindestabstand zwischen zwei Läufen (Vorgabe 15/60).
+/// - `schedule`: optionaler 5-Feld-Cron-Ausdruck (UTC). Gesetzt ersetzt er
+///   die Leerlauf-Auslösung; der Cooldown gilt weiter. Geprüft wird er erst
+///   beim Scheduler (`harw_knowledge::context_steward::DreamSchedule`).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DreamToml {
+    /// Scheduler an/aus; `None` → [`DEFAULT_DREAM_ENABLED`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub enabled: Option<bool>,
+    /// Token-Budget je Lauf; `None` → [`DEFAULT_DREAM_BUDGET_TOKENS`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub budget: Option<u64>,
+    /// Leerlauf in Minuten; `None` → [`DEFAULT_DREAM_IDLE_MINUTES`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub idle_minutes: Option<u32>,
+    /// Mindestabstand in Minuten; `None` → [`DEFAULT_DREAM_COOLDOWN_MINUTES`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cooldown_minutes: Option<u32>,
+    /// Optionaler Cron-Ausdruck (5 Felder, UTC).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub schedule: Option<String>,
+}
+
+impl DreamToml {
+    /// Wirksames `enabled`.
+    #[must_use]
+    pub fn effective_enabled(&self) -> bool {
+        self.enabled.unwrap_or(DEFAULT_DREAM_ENABLED)
+    }
+
+    /// Wirksames Token-Budget (mindestens 1).
+    #[must_use]
+    pub fn effective_budget(&self) -> u64 {
+        self.budget.unwrap_or(DEFAULT_DREAM_BUDGET_TOKENS).max(1)
+    }
+
+    /// Wirksamer Leerlauf in Minuten.
+    #[must_use]
+    pub fn effective_idle_minutes(&self) -> u32 {
+        self.idle_minutes.unwrap_or(DEFAULT_DREAM_IDLE_MINUTES)
+    }
+
+    /// Wirksamer Mindestabstand in Minuten.
+    #[must_use]
+    pub fn effective_cooldown_minutes(&self) -> u32 {
+        self.cooldown_minutes
+            .unwrap_or(DEFAULT_DREAM_COOLDOWN_MINUTES)
+    }
+
+    /// Der Cron-Ausdruck, sofern gesetzt und nicht leer.
+    #[must_use]
+    pub fn effective_schedule(&self) -> Option<&str> {
+        self.schedule
+            .as_deref()
+            .map(str::trim)
+            .filter(|schedule| !schedule.is_empty())
+    }
 }
 
 /// `[reasoning]` — Rollen-Reasoning-Effort-Gewichtung (Addendum F+G,

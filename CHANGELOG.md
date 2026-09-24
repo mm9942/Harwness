@@ -6,6 +6,142 @@ Semantic Versioning within the 0.x pre-release range.
 
 ## [Unreleased]
 
+### Runde 4 (2026-09-24)
+
+**Fehlerbehebungen**
+- Onboarding Codex → API: `harw onboard` *ersetzt* jetzt den Credential-Pool
+  des Providers, statt nur anzuhängen. Der neue Verweis steht vorn; frühere
+  Einträge bleiben nur, wenn sie zur neuen Route passen (Codex-Login-Verweise
+  nur auf der Codex-Route). `CredentialPool::from_auth_config` überspringt
+  einen nicht auflösbaren *Failover*-Eintrag mit Warnung; ein kaputter
+  primärer Verweis bleibt ein harter Fehler. Vorher startete `harw` nach dem
+  Wechsel nicht (`file credential must be an absolute path below
+  <home>/secrets`).
+- TUI: lange Werkzeug-Ausgaben bleiben eingeklappt. Die Zelle rechnet in
+  umgebrochenen Bildschirmzeilen (höchstens 3 Zeilen plus Hinweis, Ctrl+O
+  klappt auf); auch aufgeklappt gilt ein Zeilenlimit. `explore.projects`,
+  `explore.find` und `explore.relations` haben eine eigene Vorschau.
+- Kind-Agenten: das Kontextfenster eines Kindes kommt vom Modell, das es
+  wirklich ruft (Rückfall auf das Modell des Parents statt 32k-Vorgabe;
+  unbekanntes Modell mit Warnung). Übergroße Aufträge werden gekürzt, die
+  Verdichtung rechnet mit dem festen Overhead aus System-Prompt und
+  Werkzeugen. Das Token-Budget zählt nur neue, ungecachte Eingabe plus
+  Ausgabe und wird je Runde geprüft; ab 80 % kommt eine Abschluss-Anweisung,
+  beim Limit liefert das Kind seine letzte Antwort als Teilergebnis
+  (`budget_exhausted: true`, Fehlertyp `ChildBudgetExhausted` statt
+  `AgentSpawnError`). Die Anzeige liest den Auftrag aus `task`.
+- TUI: eingefügter Text kam beim Agenten nur als Platzhalter
+  `[Pasted text #…]` an; `InputEditor::submission_text()` liefert jetzt den
+  aufgelösten Text.
+
+**Unterbrechen und Warteschlange (TUI)**
+- Ctrl+C und Esc brechen nur den laufenden Turn ab; bereits abgeschickte
+  Nachrichten und Befehle bleiben eingereiht und werden direkt danach
+  ausgeliefert („Warteschlange wird gesendet“), auch bei offenem Freigabe-
+  oder Host-Permit-Dialog. Esc schließt zuerst ein offenes Popup und scharft
+  nie das Beenden.
+- Befehle während eines Turns: `BusyAvailability` hat die drei Klassen
+  `Immediate`, `Staged` (Änderung gilt ab dem nächsten Turn, z. B. `/model`,
+  `/effort`, `/mode`, `/uia-*`) und `DeferredUntilTurnEnd`; Überschreibung je
+  Unterbefehl über `busy_subcommands` am `#[operation]`. Sofort- und
+  Staged-Befehle laufen als eigene Tasks (Zeitlimit 60 s) und blockieren
+  Streaming und Freigaben nicht; busy-sichere lokale Befehle (Overlays,
+  Picker, Panels) wirken sofort, Overlays bekommen Tasten. Eingereihte
+  Nachrichten stehen sichtbar über dem Composer („Wartet auf den nächsten
+  Turn“), Alt+↑ holt die letzte zurück. Ein Tabellentest über den ganzen
+  Befehlskatalog hält die Einstufung fest.
+
+**Wissensfläche (Workbench, Kanban, Diary, Palace, Dream)**
+- Fundament: gemeinsamer Argument-Parser (`harw-ops/src/knowledge_args.rs`),
+  prozessübergreifende Dateisperren (`harw-knowledge/src/lock.rs`, `fs4`),
+  strukturierte Seitendateien für Diary und Traumberichte, Sichtbarkeit nach
+  dem echten Aufrufer, Live-Updates über `AgentEventKind::Knowledge`.
+- Neue Lese-Werkzeuge für Agenten: `workbench.show` (plus Kontext-Provider
+  für Pins und Hypothesen), `kanban.list`/`kanban.show`, `diary.read` (nur
+  eigene Einträge), `palace.search`/`palace.recall` (nur `established`). Kein
+  Schreibwerkzeug; Telegram bekommt keines davon.
+- `/workbench note edit|rm`, `/workbench retention [keep|<tage>d]`,
+  `--scope=project`; Aufbewahrung je Scope (Sitzung 14 Tage, Projekt
+  unbegrenzt).
+- `/kanban edit|comment|evidence|approve|reject`; der Job-Worker holt Karten
+  aus Worker-Spalten ab, startet den Rollen-Agenten aber erst nach
+  `/kanban approve` (Risiko je Rolle) und schreibt Ergebnis und Verlauf an
+  die Karte.
+- Diary: automatische Einträge nach einer Verdichtung und am Sitzungsende;
+  `/diary show --from/--to`, `/diary search`; `[knowledge.diary]
+  retention_days`.
+- Palace: `/memory promote <fakt-id>` macht aus einem Fakt ein
+  `provisional`-Thema; `/palace supersede|edit|link` mit Review-Gate
+  (`--confirm` bei `established`, Vorfassung im Verlauf); Index-Cache mit
+  mtime-Prüfung.
+- Dream: `/dream run|status|review`, strukturierte JSON-Vorschläge mit einem
+  Reparaturversuch, Job `JobKind::Dream` im Ledger, Wissenspflege je Lauf
+  (Diary-Rollup, Workbench-Aufbewahrung, Palace-Veraltung nur als
+  Vorschlag). Neue Config `[dream]` (`enabled`, `budget`, `idle_minutes`,
+  `cooldown_minutes`, `schedule`).
+- TUI-Wissensbrowser: Diary nach Datum und Agent mit Suche und
+  Bereichsansicht, Palace mit Links/Backlinks und Promote/Supersede mit
+  Bestätigung, Dream-Review je Vorschlag; Kanban-Board mit Board-Auswahl,
+  Worker-Spalten und Freigabe-Taste.
+
+**LaTeX-Worker**
+- Neue Rolle `uia-latex-writer` und Bundle-Agent `latex-writer`: schreibt
+  LaTeX im Workspace, ohne Shell, Netz oder `deps.*`.
+- Neues Werkzeug `latex.build`: startet nur `latexmk` in der Sandbox
+  (`-no-shell-escape`, `-halt-on-error`, festes Argv, Zeitlimit, begrenzte
+  Ausgabe), Freigabe je Aufruf. Fehlt TeX, meldet es `status: not_installed`
+  mit Installationshinweisen, installiert aber nichts.
+- Neue Skills `latex-writing` und `xelatex-compile`.
+
+**Doku**
+- `README.md` überarbeitet (MCP-Connectors allgemein, Wissensfläche,
+  Matrix-Game, Bundle-Rollen und -Skills). Philosophie-Dokumente liegen
+  unter `docs/philosophy/`, die DSL-Spezifikation unter
+  `docs/design/agent-definition-dsl.md`, Sitzungsprotokolle unter
+  `docs/sessions/`.
+- `knowledge-surfaces.md` (Status, offene Fragen), `interaction-contract.md`
+  §2.2/§2.6.3/§2.6.4, `tui-command-contract.md` und `config-scopes.md`
+  (§1.17 `[knowledge]`, §1.18 `[dream]`) nachgezogen.
+
+### Runde 3 (2026-09-24)
+
+**Matrix-Game**
+- `/matrix` mit umpire-geführtem Mehrspieler-Spiel: deterministischer
+  Spielleiter in Rust, versiegelte Einreichung, Journal mit Replay, Sitze
+  sehen nur ihre Projektion; Panel mit F9.
+- Verhaltensprofile, Red Cell (neue Rolle `matrix-redcell`),
+  Verdachtsleiter, Präzedenzregister, Inject-Pakete
+  (`/matrix start <szenario> --package <id>`) und Laufvergleich
+  (`/matrix compare`). Matrix-Sitze lesen nur Unterlagen-Kopien des Runners
+  (Profil `MatrixReader`).
+
+**Agenten und Recherche**
+- `--agent NAME` startet die Sitzung mit dieser Agentendefinition als Wurzel;
+  `/agent use NAME` (bzw. `--clear`) merkt die Wahl ab der nächsten Sitzung.
+  Das SDK verlangt bei `--agent` keine UIA.
+- Startmodus ist `chat` (`[mode] default`, `--mode`).
+- `/research` für allgemeine Recherche durch ein read-only Kind
+  (`researcher`); `/research-deps --generic` recherchiert
+  ökosystem-neutral über `dependency-researcher`.
+- Autor-Pipeline: Bundle-Agenten `business-author`, `business-reviewer`,
+  `slides-builder`, `matrix-scenario-author`.
+
+**Lernen und Skills**
+- `/learn` legt dauerhafte Erkenntnisse der Sitzung nur als Vorschläge ab;
+  jede Übernahme braucht ein ausdrückliches `accept` und einen eigenen
+  Schritt des Operators.
+- Neue Skills `business-writing-pyramid`, `learning-loop`,
+  `author-review-pipeline`, `matrix-scenario-design`.
+
+**Telegram**
+- Ein Telegram-Chat mit gebundenem Workspace bekommt das Profil
+  `WorkspaceEdit`: Lesen läuft ohne Rückfrage, jedes Schreiben fragt per
+  Button (erzwungen `Delegated`), keine Shell, kein Netz.
+
+**Modellkatalog**
+- GPT-6 Sol und GPT-6 Luna mit Daten aus den Modellkarten (Kontext
+  1.050.000, Output 128.000) und OpenRouter-IDs.
+
 **Neuer Befehlsbaum der Kommandozeile (`harw`)**
 - Befehle nach Aufgaben geordnet: `chat`, `exec`, `analyze`, `session`,
   `config`, `provider`, `model`, `auth`, `project`, `agent`, `knowledge`,
