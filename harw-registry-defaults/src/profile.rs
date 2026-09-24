@@ -3049,6 +3049,29 @@ mod tests {
             RegistryProfile::WorkspaceEdit.required_permissions(),
             set(&[Permission::ReadWorkspace, Permission::WriteWorkspace])
         );
+        assert_eq!(
+            RegistryProfile::MatrixReader.required_permissions(),
+            set(&[Permission::ReadWorkspace])
+        );
+    }
+
+    /// `MatrixReader` (Runde 3, Matrix-Unterlagen): exakt die lesenden
+    /// `fs.*` plus `doc.read_pdf`, read-only, registriert wie beworben.
+    #[test]
+    fn test_matrix_reader_profile_exact_tool_surface() -> TestResult {
+        let expected = vec![
+            "fs.read",
+            "fs.list",
+            "fs.search",
+            "fs.glob",
+            "fs.grep",
+            "doc.read_pdf",
+        ];
+        assert_eq!(RegistryProfile::MatrixReader.tool_names(), expected);
+        assert!(RegistryProfile::MatrixReader.is_read_only());
+        let assembled = assemble(RegistryProfile::MatrixReader)?;
+        assert_eq!(registered_names(&assembled), expected);
+        Ok(())
     }
 
     /// `WorkspaceEdit` (Runde 3, Welle D): exakt `fs.*` inklusive

@@ -15,13 +15,16 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
+use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
 use crate::commitments::{DOMAIN, from_hex, sha256_parts, to_hex};
 use crate::error::{MatrixError, MatrixResult};
 use crate::phases::{EffectContext, EffectOp, validate_effects};
-use crate::state::{Audience, AudienceSpec, Ongoing, PlayerId, SecretRecord, VarValue, WorldVar};
+use crate::state::{
+    Audience, AudienceSpec, Ongoing, PlayerId, Seat, SecretRecord, VarValue, WorldVar,
+};
 
 /// Schema-Kennung, die jedes Szenario tragen muss.
 pub const SCHEMA: &str = "harwness.matrix-scenario/v1";
@@ -629,6 +632,9 @@ pub struct ClassicScenario {
     /// Injects.
     #[serde(default)]
     pub injects: Vec<ClassicInject>,
+    /// Unterlagen-Ordner (optional).
+    #[serde(default)]
+    pub materials: Option<MaterialsSpec>,
 }
 
 fn default_rounds() -> u32 {
@@ -1032,6 +1038,107 @@ pub struct BusinessScenario {
     /// Modelle.
     #[serde(default)]
     pub models: Option<ModelSettings>,
+    /// Unterlagen-Ordner (optional).
+    #[serde(default)]
+    pub materials: Option<MaterialsSpec>,
+}
+
+// ---------------------------------------------------------------------------
+// Unterlagen (`[materials]`)
+// ---------------------------------------------------------------------------
+
+/// `[materials]`: Ordner mit Unterlagen, die Sitze lesend einsehen dürfen.
+///
+/// Quell-Layout unter `dir`:
+/// - `geteilt/**` → alle Sitze (gemeinsamer Ordner),
+/// - `<seat_id>/**` → nur dieser Sitz,
+/// - `paare/<a>+<b>/**` → nur die Sitze `a` und `b` (alphabetisch, siehe
+///   [`pair_folder_members`]),
+/// - `umpire/**` → nur der Schiedsrichter.
+///
+/// Der Schiedsrichter sieht alles. Dieses Crate liest **keine** Dateien; der
+/// Runner kopiert gemäß [`materials_for_seat`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MaterialsSpec {
+    /// Ordner: relativ zur Szenario-Datei, absolut oder mit führendem `~`.
+    pub dir: PathBuf,
+}
+
+/// Welche Teile des Unterlagen-Ordners ein Sitz erhält (rein, ohne IO).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MaterialsSelection {
+    /// `geteilt/` (für alle).
+    pub shared: bool,
+    /// Eigener Sitz-Ordner `<seat_id>/` → Kopie `eigene/`.
+    pub own: Option<String>,
+    /// Paarordner, in denen der Sitz Mitglied ist → Kopie `mit-<partner>/`.
+    pub pairs_with: bool,
+    /// Alle Sitz-Ordner (Schiedsrichter) → Kopie `sitze/<id>/`.
+    pub all_seats: bool,
+    /// Alle Paarordner (Schiedsrichter) → Kopie `paare/<a>+<b>/`.
+    pub all_pairs: bool,
+    /// `umpire/` → Kopie `schiedsrichter/`.
+    pub umpire: bool,
+}
+
+/// Auswahl der Unterlagen für einen Sitz: Spieler erhalten `geteilt/`, den
+/// eigenen Ordner und ihre Paarordner; der Schiedsrichter erhält alles.
+#[must_use]
+pub fn materials_for_seat(seat: &Seat) -> MaterialsSelection {
+    match seat {
+        Seat::Player(p) => MaterialsSelection {
+            shared: true,
+            own: Some(p.as_str().to_owned()),
+            pairs_with: true,
+            all_seats: false,
+            all_pairs: false,
+            umpire: false,
+        },
+        Seat::Umpire => MaterialsSelection {
+            shared: true,
+            own: None,
+            pairs_with: false,
+            all_seats: true,
+            all_pairs: true,
+            umpire: true,
+        },
+    }
+}
+
+/// Zerlegt den Namen eines Paarordners `a+b` in seine beiden Sitze.
+///
+/// Gültig nur, wenn genau ein `+` vorkommt, beide Teile nicht leer sind,
+/// keine Pfadtrenner oder `.`/`..` enthalten und `a < b` (alphabetisch,
+/// damit jedes Paar genau einen Ordnernamen hat).
+#[must_use]
+pub fn pair_folder_members(name: &str) -> Option<(String, String)> {
+    let (a, b) = name.split_once('+')?;
+    let ok = |part: &str| {
+        !part.is_empty() && !part.contains(['+', '/', '\\', '\0']) && part != "." && part != ".."
+    };
+    (ok(a) && ok(b) && a < b).then(|| (a.to_owned(), b.to_owned()))
+}
+
+/// Löst `dir` auf: absolut bleibt, `~`/`~/…` über `home`, sonst relativ zum
+/// Ordner der Szenario-Datei (ohne Datei: unverändert). `None`, wenn `~`
+/// verwendet wird, aber kein Home-Verzeichnis bekannt ist.
+fn resolve_materials_dir(
+    dir: &Path,
+    scenario_path: Option<&Path>,
+    home: Option<&Path>,
+) -> Option<PathBuf> {
+    if let Ok(rest) = dir.strip_prefix("~") {
+        let home = home.filter(|h| !h.as_os_str().is_empty())?;
+        return Some(home.join(rest));
+    }
+    if dir.is_absolute() {
+        return Some(dir.to_path_buf());
+    }
+    match scenario_path.and_then(Path::parent) {
+        Some(base) => Some(base.join(dir)),
+        None => Some(dir.to_path_buf()),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1155,6 +1262,15 @@ impl Scenario {
         match self {
             Self::Classic(s) => &s.rules,
             Self::Business(s) => &s.rules,
+        }
+    }
+
+    /// Unterlagen-Ordner (`[materials]`), falls angegeben.
+    #[must_use]
+    pub fn materials(&self) -> Option<&MaterialsSpec> {
+        match self {
+            Self::Classic(s) => s.materials.as_ref(),
+            Self::Business(s) => s.materials.as_ref(),
         }
     }
 
@@ -1306,6 +1422,11 @@ impl Scenario {
             Self::Business(s) => validate_business(s, &mut errors, &mut warnings),
         }
         validate_rules(self.rules(), &mut errors);
+        if let Some(m) = self.materials() {
+            if m.dir.as_os_str().to_string_lossy().trim().is_empty() {
+                errors.push("materials.dir ist leer".to_owned());
+            }
+        }
         self.validate_injects_effects(&mut errors);
         if errors.is_empty() {
             Ok(warnings)
@@ -1449,6 +1570,19 @@ pub struct LoadedScenario {
     pub warnings: Vec<String>,
     /// SHA-256 des TOML-Quelltexts (Hex).
     pub source_hash: String,
+}
+
+impl LoadedScenario {
+    /// Aufgelöster Unterlagen-Ordner: relativ zum Ordner der Szenario-Datei
+    /// (`scenario_path`), absolut unverändert, führendes `~` über `HOME`.
+    /// `None` ohne `[materials]` oder wenn `~` ohne gesetztes `HOME` steht.
+    /// Prüft nicht, ob der Ordner existiert (kein IO).
+    #[must_use]
+    pub fn materials_dir(&self, scenario_path: Option<&Path>) -> Option<PathBuf> {
+        let spec = self.scenario.materials()?;
+        let home = std::env::var_os("HOME").map(PathBuf::from);
+        resolve_materials_dir(&spec.dir, scenario_path, home.as_deref())
+    }
 }
 
 /// Parst und validiert ein Szenario aus TOML.

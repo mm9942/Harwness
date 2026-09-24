@@ -316,8 +316,10 @@ pub fn reduce_to_read_workspace_network(granted: &PermissionSet) -> PermissionSe
 ///   (Profil `NoTools`, sie brauchen gar kein Recht; `ReadOnly` ist die engste
 ///   Kennung des Vokabulars).
 /// - die drei Matrix-Game-Sitze `matrix-player`, `matrix-umpire`,
-///   `matrix-market` → [`AuthorityReducer::ReadOnly`] (Profil `NoTools`,
-///   dieselbe Begründung wie bei den Triage-Rollen).
+///   `matrix-market` → [`AuthorityReducer::ReadOnly`] (Profil
+///   `MatrixReader`: lesende `fs.*` plus `doc.read_pdf`, braucht genau
+///   `ReadWorkspace` — die Obergrenze von `ReadOnly`; nie Netz, nie
+///   Schreiben, nie Exec).
 /// - `memory-steward` → [`AuthorityReducer::ReadRegistry`] (Profil
 ///   `MemoryStewardship`; nächstliegender Reducer gleicher Lese-Reichweite).
 /// - `executor` → [`AuthorityReducer::ReadOnly`] (Profil `ShellExecution`;
@@ -424,8 +426,9 @@ pub fn authority_reducer_for_role(role: &str) -> Option<AuthorityReducer> {
         | role_names::SECURITY_STRUCTURE_TRIAGE
         | role_names::SECURITY_ENDPOINT_TRIAGE
         | role_names::EXECUTOR => Some(AuthorityReducer::ReadOnly),
-        // Die drei Matrix-Game-Sitze (Profil `NoTools`): brauchen gar kein
-        // Recht; `ReadOnly` ist die engste Kennung — nie Netz, nie Schreiben.
+        // Die drei Matrix-Game-Sitze (Profil `MatrixReader`): brauchen genau
+        // `ReadWorkspace` für ihre Unterlagen; `ReadOnly` trägt genau das —
+        // nie Netz, nie Schreiben, nie Exec.
         role_names::MATRIX_PLAYER | role_names::MATRIX_UMPIRE | role_names::MATRIX_MARKET => {
             Some(AuthorityReducer::ReadOnly)
         }
