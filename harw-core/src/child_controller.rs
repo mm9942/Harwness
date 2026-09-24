@@ -2203,11 +2203,13 @@ impl ManagedAgentSpawner {
     /// Die UIA-Wurzel darf regulär keine `Worker` erzeugen, weil ein Worker
     /// Werkzeuge (Schreiben, Shell, Netz) tragen kann, die die UIA selbst
     /// bewusst nicht direkt delegieren soll. In diese Liste gehören daher
-    /// **nur werkzeuglose, netzlose Rollen** (Registry-Profil `NoTools`,
-    /// Authority-Reducer `ReadOnly`), deren Kind-Sitzung nichts ausführen
-    /// kann, sondern nur Parameter/Text verarbeitet. Diese Eigenschaft prüft
-    /// der Controller nicht selbst — er kennt nur Namen und
-    /// Organisationsrollen. Sie sicherzustellen ist Verantwortung des
+    /// **nur lesende Rollen ohne Netz, Schreiben oder Exec** (für die
+    /// Matrix-Sitze Registry-Profil `MatrixReader`: höchstens lesende
+    /// Datei-Werkzeuge wie `fs.read`/`fs.list`/`fs.search`/`fs.glob`/
+    /// `fs.grep`/`doc.read_pdf`; Authority-Reducer `ReadOnly`), deren
+    /// Kind-Sitzung nichts schreiben, ausführen oder ins Netz tragen kann.
+    /// Diese Eigenschaft prüft der Controller nicht selbst — er kennt nur
+    /// Namen und Organisationsrollen. Sie sicherzustellen ist Verantwortung des
     /// Aufrufers (Runtime-Montage); für die Matrix-Rollen belegt das
     /// `harw-registry-defaults/tests/uia_spawn_authority.rs`.
     ///
@@ -4826,8 +4828,9 @@ impl ManagedAgentSpawner {
         // `delegation_visibility::visible_delegation_targets` verwendet —
         // damit kann die dem Modell gezeigte Zielliste nie von der
         // tatsächlichen Admission abweichen. Einzige Ergänzung: die enge
-        // UIA-Freigabeliste für werkzeuglose Worker-Rollen
-        // (`Self::with_uia_spawnable_roles`, z. B. `/matrix`-Sitze).
+        // UIA-Freigabeliste für nur lesende Worker-Rollen ohne Netz,
+        // Schreiben oder Exec (`Self::with_uia_spawnable_roles`, z. B.
+        // `/matrix`-Sitze).
         if !self.spawn_permitted(
             parent_context.organizational_role,
             definition.organizational_role,
@@ -6343,7 +6346,7 @@ specialization = "child-controller-test"
         let child = spawner
             .admit("matrix-player", spawn_input(parent.clone()), sandbox, None)
             .map_err(ctx(
-                "listed tool-less worker role is admitted for a UIA parent",
+                "listed read-only worker role is admitted for a UIA parent",
             ))?;
 
         let record = spawner

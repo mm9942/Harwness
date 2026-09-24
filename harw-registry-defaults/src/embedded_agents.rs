@@ -2600,11 +2600,14 @@ mod tests {
 
     // ── Matrix-Game-Sitze (Runde 3, Welle E) ───────────────────────────────
 
-    /// Die drei Matrix-Sitz-Rollen: organisatorisch `Worker`, ohne jedes
-    /// Werkzeug, nicht pausierbar, ohne eigene Ebene darunter und mit einem
+    /// Die drei Matrix-Sitz-Rollen: organisatorisch `Worker`, admittieren
+    /// genau die lesenden Unterlagen-Werkzeuge (fünf lesende `fs.*` plus
+    /// `doc.read_pdf`, Runde 3 „Matrix-Unterlagen“) und verbieten Schreiben,
+    /// Exec und Netz ausdrücklich; nicht pausierbar, ohne eigene Ebene
+    /// darunter, mit höchstens 16 Werkzeugaufrufen und einem
     /// Text-Rückgabevertrag.
     #[test]
-    fn test_matrix_seat_roles_are_tool_less_non_pausing_text_workers() -> TestResult {
+    fn test_matrix_seat_roles_are_read_only_non_pausing_text_workers() -> TestResult {
         let definitions = builtin()?;
         for role in role_names::MATRIX_ROLES {
             let ir = definitions
@@ -2615,17 +2618,44 @@ mod tests {
                 harw_agent_dsl::roles::AgentRoleId::Worker,
                 "{role}"
             );
-            assert!(
-                ir.tool_surface().admitted().is_empty(),
-                "{role} muss werkzeuglos sein: {:?}",
-                ir.tool_surface().admitted()
+            let admitted: std::collections::BTreeSet<&str> = ir
+                .tool_surface()
+                .admitted()
+                .iter()
+                .map(String::as_str)
+                .collect();
+            let expected: std::collections::BTreeSet<&str> = [
+                "fs.read",
+                "fs.list",
+                "fs.search",
+                "fs.glob",
+                "fs.grep",
+                "doc.read_pdf",
+            ]
+            .into();
+            assert_eq!(
+                admitted, expected,
+                "{role} admittiert genau die lesenden Unterlagen-Werkzeuge"
             );
-            for tool in ["fs.write", "shell.exec", "web.fetch", "web.search"] {
+            for tool in [
+                "fs.write",
+                "shell.exec",
+                "process.kill",
+                "web.fetch",
+                "web.search",
+                "web.docs_rs",
+                "web.crates_io",
+            ] {
                 assert!(
                     ir.tool_surface().forbidden().iter().any(|t| t == tool),
                     "{role} muss {tool} ausdrücklich verbieten"
                 );
             }
+            let budget = ir
+                .spawn_contract()
+                .budget()
+                .ok_or_else(|| TestError::Unexpected(format!("{role} ohne [spawn.budget]")))?;
+            assert_eq!(budget.max_tool_calls(), Some(16), "{role}");
             assert!(!ir.lifecycle_machine().allow_pause(), "{role}");
             assert_eq!(ir.spawn_contract().max_depth(), Some(0), "{role}");
             let contract = ir
