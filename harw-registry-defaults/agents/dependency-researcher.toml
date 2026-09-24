@@ -1,0 +1,91 @@
+# Eingebauter oekosystem-neutraler Dependency-Rechercheur — Registry-Profil
+# `ReadOnlyResearch`.
+#
+# Harwness ist nicht Rust-zentriert: diese Rolle beantwortet
+# Abhaengigkeitsfragen fuer jedes Paket-Oekosystem — npm/pnpm/yarn
+# (`package.json`, `package-lock.json`, `pnpm-lock.yaml`, `yarn.lock`),
+# PyPI/uv/poetry (`pyproject.toml`, `uv.lock`, `poetry.lock`,
+# `requirements*.txt`), Go-Module (`go.mod`, `go.sum`), Maven/Gradle
+# (`pom.xml`, `build.gradle(.kts)`, `gradle.lockfile`) und auch Cargo
+# (`Cargo.toml`, `Cargo.lock`), wenn keine Cargo-Spezialwerkzeuge noetig sind.
+#
+# Werkzeuge: lesender Workspace (`fs.*` ohne `fs.write`, `doc.read_pdf`),
+# projektunabhaengiger Ueberblick (`explore.*`, findet Manifeste und
+# Lockfiles je Teilprojekt) und Netz (`web.fetch`/`web.search`) fuer die
+# offiziellen Registries und Dokus (npmjs.com, pypi.org, pkg.go.dev,
+# search.maven.org, crates.io …). Bewusst **kein** `deps.*`: diese Werkzeuge
+# lesen ausschliesslich `Cargo.lock` und den Cargo-Registry-Cache — dafuer
+# gibt es den Rust-Spezialisten `researcher-deps`, den
+# `harw-ops/src/research.rs` bei einer Crate-Frage in einem Cargo-Projekt
+# waehlt.
+#
+# Netz nie weiter als beim Elternteil: Reducer `reduce_to_read_workspace_network`
+# (`AuthorityReducer::ReadWorkspaceNetwork`), die Hosts bestimmt der
+# egress-gebundene Scope des Elternteils; ohne konfigurierte Hosts bleibt die
+# Rolle offline und belegt nur aus Manifesten und Lockfiles.
+#
+# Rueckgabe: `ResearchFinding` — sprachneutral je Paket ueber
+# `verified_versions[].package` + `verified_versions[].ecosystem` (npm, pypi,
+# go, maven, cargo …) und Belege der Art `package_registry_source` (bzw.
+# `cargo_registry_source` fuer Cargo), `official_docs`, `release_notes`.
+
+schema = "harwness.agent/v1"
+id = "harwness.agent.dependency-researcher@1"
+version = "1.0.0"
+extends = { id = "harwness.agent.worker-base@1" }
+role = "worker"
+specialization = "dependency-researcher"
+
+name = "Dependency Researcher"
+description = "Oekosystem-neutrale Dependency-Recherche (npm/pnpm/yarn, PyPI/uv/poetry, Go-Module, Maven/Gradle, Cargo): belegt je Paket Version, Lizenz, Kompatibilitaet und Verhalten aus Manifesten, Lockfiles und den offiziellen Paket-Registries; liefert ein ResearchFinding mit package/ecosystem je Eintrag und Belegen der Art package_registry_source."
+
+[work]
+mode = "read-only-research"
+may_write_code = false
+may_research_web = true
+
+[research]
+ecosystems = ["npm", "pypi", "go", "maven", "cargo"]
+sources = ["manifests", "lockfiles", "package-registries", "official-docs", "release-notes"]
+primary_sources_required = true
+output = "structured-evidence"
+may_write_code = false
+
+[tools]
+admitted = [
+  "fs.read",
+  "fs.list",
+  "fs.search",
+  "fs.glob",
+  "fs.grep",
+  "doc.read_pdf",
+  "explore.tree",
+  "explore.projects",
+  "explore.relations",
+  "explore.find",
+  "web.fetch",
+  "web.search",
+]
+forbidden = [
+  "fs.write",
+  "shell.exec",
+  "deps.graph",
+  "deps.locked",
+  "deps.source_read",
+  "deps.source_search",
+  "deps.source_list",
+  "web.docs_rs",
+  "web.crates_io",
+  "lens.ask",
+]
+
+[spawn]
+max_depth = 1
+
+[spawn.budget]
+max_tokens = 60000
+max_tool_calls = 40
+max_wall_secs = 180
+
+[return]
+contract = "harwness.return.research-finding@1"

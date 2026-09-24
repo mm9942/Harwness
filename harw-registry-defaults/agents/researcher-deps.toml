@@ -1,8 +1,20 @@
-# Eingebauter Dependency-Rechercheur (AP W3-04) — Registry-Profil `ReadOnlyExplore`.
+# Eingebauter Rust/Cargo-Dependency-Spezialist (AP W3-04) — Registry-Profil
+# `ReadOnlyExplore`.
 #
-# Beantwortet "wie funktioniert diese Abhaengigkeit wirklich" aus dem lokal
-# bereits entpackten Registry-Quellcode und aus `Cargo.lock` — nicht aus dem
-# Gedaechtnis des Modells und nicht aus dem Netz.
+# Beantwortet "wie funktioniert diese Rust/Cargo-Abhaengigkeit wirklich" aus
+# `Cargo.lock` und dem lokal bereits entpackten Registry-Quellcode — nicht aus
+# dem Gedaechtnis des Modells. Die Rolle ist bewusst der **Rust-Spezialist**:
+# fuer npm/pnpm/yarn, PyPI/uv/poetry, Go-Module, Maven/Gradle (oder eine
+# Frage, die nicht an einem Cargo-Projekt haengt) ist
+# `dependency-researcher` zustaendig (`harw-ops/src/research.rs` waehlt
+# zwischen beiden).
+#
+# docs.rs/crates.io: `web.docs_rs`/`web.crates_io` waeren die passenden
+# Netz-Werkzeuge, aber diese Rolle bleibt (wie bisher) ohne Netz — ihr Profil
+# `ReadOnlyExplore` registriert die beiden Crate-Werkzeuge nicht und ihr
+# Reducer `ReadRegistry` traegt kein `NetworkAccess`. docs.rs/crates.io
+# werden deshalb ueber `researcher-web` bzw. die UIA-Helfer abgefragt; diese
+# Rolle liest die lokal gespiegelten Quellen derselben Crates.
 
 schema = "harwness.agent/v1"
 id = "harwness.agent.researcher-deps@1"
@@ -11,10 +23,11 @@ extends = { id = "harwness.agent.worker-base@1" }
 role = "worker"
 specialization = "researcher-deps"
 
-name = "Dependency Researcher"
-description = "Belegt Dependency-Verhalten aus Cargo.lock und dem lokalen Registry-Quellcache."
+name = "Rust/Cargo Dependency Researcher"
+description = "Rust-Spezialist fuer Rust/Cargo-Abhaengigkeiten (Cargo.lock, Registry-Cache, docs.rs, crates.io): belegt Version, MSRV, Features und Verhalten je Crate aus Cargo.lock und dem lokalen Registry-Quellcache. Andere Oekosysteme uebernimmt dependency-researcher."
 
 [research]
+ecosystems = ["cargo"]
 sources = ["source-tree", "lockfiles", "local-docs"]
 primary_sources_required = true
 output = "structured-evidence"
