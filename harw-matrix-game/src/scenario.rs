@@ -799,7 +799,9 @@ impl TeamAudience {
     fn check(&self, teams: &BTreeSet<&str>, context: &str, errors: &mut Vec<String>) {
         match self {
             Self::Keyword(k) if k == "all" => {}
-            Self::Keyword(k) => errors.push(format!("{context}: audience `{k}` unbekannt (erlaubt: \"all\" oder Team-Liste)")),
+            Self::Keyword(k) => errors.push(format!(
+                "{context}: audience `{k}` unbekannt (erlaubt: \"all\" oder Team-Liste)"
+            )),
             Self::Teams(ids) => {
                 if ids.is_empty() {
                     errors.push(format!("{context}: leere Team-Liste"));
@@ -1189,8 +1191,17 @@ impl Scenario {
     #[must_use]
     pub fn seat_order(&self) -> Vec<PlayerId> {
         match self {
-            Self::Classic(s) => s.seating.order.iter().map(|id| PlayerId::new(id.as_str())).collect(),
-            Self::Business(s) => s.teams.iter().map(|t| PlayerId::new(t.id.as_str())).collect(),
+            Self::Classic(s) => s
+                .seating
+                .order
+                .iter()
+                .map(|id| PlayerId::new(id.as_str()))
+                .collect(),
+            Self::Business(s) => s
+                .teams
+                .iter()
+                .map(|t| PlayerId::new(t.id.as_str()))
+                .collect(),
         }
     }
 
@@ -1309,8 +1320,11 @@ impl Scenario {
     }
 
     fn validate_injects_effects(&self, errors: &mut Vec<String>) {
-        let vars: BTreeMap<String, WorldVar> =
-            self.initial_vars().into_iter().map(|v| (v.id.clone(), v)).collect();
+        let vars: BTreeMap<String, WorldVar> = self
+            .initial_vars()
+            .into_iter()
+            .map(|v| (v.id.clone(), v))
+            .collect();
         let ongoing: BTreeMap<String, Ongoing> = BTreeMap::new();
         let secrets: BTreeMap<String, SecretRecord> = BTreeMap::new();
         let players = self.seat_order();
@@ -1450,7 +1464,10 @@ pub struct LoadedScenario {
 pub fn load_scenario(source: &str) -> MatrixResult<LoadedScenario> {
     let table: toml::Table =
         toml::from_str(source).map_err(|e| MatrixError::ScenarioParse(e.to_string()))?;
-    let schema = table.get("schema").and_then(toml::Value::as_str).unwrap_or_default();
+    let schema = table
+        .get("schema")
+        .and_then(toml::Value::as_str)
+        .unwrap_or_default();
     if schema != SCHEMA {
         return Err(MatrixError::ScenarioParse(format!(
             "schema `{schema}` statt `{SCHEMA}`"
@@ -1491,7 +1508,9 @@ fn check_id(id: &str, context: &str, errors: &mut Vec<String>) {
     if id.trim().is_empty() {
         errors.push(format!("{context}: leere ID"));
     } else if id.contains([':', ',', ' ', '[', ']']) {
-        errors.push(format!("{context}: ID `{id}` enthält unzulässige Zeichen (: , Leerzeichen [ ])"));
+        errors.push(format!(
+            "{context}: ID `{id}` enthält unzulässige Zeichen (: , Leerzeichen [ ])"
+        ));
     }
 }
 
@@ -1503,7 +1522,9 @@ fn check_visibility(
 ) {
     for p in vis.referenced_players() {
         if !players.contains(p.as_str()) {
-            errors.push(format!("{context}: Sichtbarkeit verweist auf unbekannten Sitz `{p}`"));
+            errors.push(format!(
+                "{context}: Sichtbarkeit verweist auf unbekannten Sitz `{p}`"
+            ));
         }
     }
 }
@@ -1583,7 +1604,11 @@ fn validate_classic(s: &ClassicScenario, errors: &mut Vec<String>, warnings: &mu
             ));
         }
     }
-    let levels: BTreeSet<&str> = s.factions.iter().filter_map(|f| f.level.as_deref()).collect();
+    let levels: BTreeSet<&str> = s
+        .factions
+        .iter()
+        .filter_map(|f| f.level.as_deref())
+        .collect();
     if levels.len() > 1 {
         warnings.push(format!(
             "uneinheitliche Fraktionsebenen ({}) — Rollen sollten auf ähnlicher Ebene operieren",
@@ -1611,7 +1636,10 @@ fn validate_classic(s: &ClassicScenario, errors: &mut Vec<String>, warnings: &mu
     for t in &s.world.tracks {
         add_var(&t.id, errors);
         if t.min >= t.max {
-            errors.push(format!("Track `{}`: min ({}) muss < max ({}) sein", t.id, t.min, t.max));
+            errors.push(format!(
+                "Track `{}`: min ({}) muss < max ({}) sein",
+                t.id, t.min, t.max
+            ));
         }
         if t.start < t.min || t.start > t.max {
             errors.push(format!(
@@ -1619,7 +1647,12 @@ fn validate_classic(s: &ClassicScenario, errors: &mut Vec<String>, warnings: &mu
                 t.id, t.start, t.min, t.max
             ));
         }
-        check_visibility(&t.visibility, &faction_ids, &format!("Track `{}`", t.id), errors);
+        check_visibility(
+            &t.visibility,
+            &faction_ids,
+            &format!("Track `{}`", t.id),
+            errors,
+        );
     }
     if s.world.tracks.len() > TRACK_WARNING_THRESHOLD {
         warnings.push(format!(
@@ -1637,9 +1670,17 @@ fn validate_classic(s: &ClassicScenario, errors: &mut Vec<String>, warnings: &mu
             errors.push(format!("State `{}`: values nicht eindeutig", st.id));
         }
         if !st.values.contains(&st.start) {
-            errors.push(format!("State `{}`: start `{}` nicht in values", st.id, st.start));
+            errors.push(format!(
+                "State `{}`: start `{}` nicht in values",
+                st.id, st.start
+            ));
         }
-        check_visibility(&st.visibility, &faction_ids, &format!("State `{}`", st.id), errors);
+        check_visibility(
+            &st.visibility,
+            &faction_ids,
+            &format!("State `{}`", st.id),
+            errors,
+        );
     }
     for o in &s.world.objects {
         add_var(&o.id, errors);
@@ -1653,12 +1694,20 @@ fn validate_classic(s: &ClassicScenario, errors: &mut Vec<String>, warnings: &mu
     for p in &s.world.projects {
         add_var(&p.id, errors);
         if !(1..=3).contains(&p.stages) {
-            errors.push(format!("Projekt `{}`: stages {} (erlaubt 1..=3)", p.id, p.stages));
+            errors.push(format!(
+                "Projekt `{}`: stages {} (erlaubt 1..=3)",
+                p.id, p.stages
+            ));
         }
         if p.progress > p.stages {
             errors.push(format!("Projekt `{}`: progress > stages", p.id));
         }
-        check_visibility(&p.visibility, &faction_ids, &format!("Projekt `{}`", p.id), errors);
+        check_visibility(
+            &p.visibility,
+            &faction_ids,
+            &format!("Projekt `{}`", p.id),
+            errors,
+        );
     }
     // Injects
     let mut inject_ids: BTreeSet<&str> = BTreeSet::new();
@@ -1770,15 +1819,28 @@ fn validate_business(s: &BusinessScenario, errors: &mut Vec<String>, warnings: &
         if let Some(scale) = &t.assessment_scale {
             let ok = scale.len() == 2 && scale.first() < scale.get(1);
             if !ok {
-                errors.push(format!("Team `{}`: assessment_scale muss [min, max] sein", t.id));
+                errors.push(format!(
+                    "Team `{}`: assessment_scale muss [min, max] sein",
+                    t.id
+                ));
             }
         }
     }
-    let companies = s.teams.iter().filter(|t| t.role == TeamRole::Company).count();
+    let companies = s
+        .teams
+        .iter()
+        .filter(|t| t.role == TeamRole::Company)
+        .count();
     if companies != 1 {
-        errors.push(format!("genau ein Team mit role = \"company\" erforderlich, gefunden {companies}"));
+        errors.push(format!(
+            "genau ein Team mit role = \"company\" erforderlich, gefunden {companies}"
+        ));
     }
-    let markets = s.teams.iter().filter(|t| t.role == TeamRole::Market).count();
+    let markets = s
+        .teams
+        .iter()
+        .filter(|t| t.role == TeamRole::Market)
+        .count();
     match s.business.market_role {
         MarketRole::Player if markets != 1 => errors.push(format!(
             "market_role = \"player\" erfordert genau ein Team mit role = \"market\", gefunden {markets}"
@@ -1812,10 +1874,16 @@ fn validate_business(s: &BusinessScenario, errors: &mut Vec<String>, warnings: &
         let Some(start) = &t.start else { continue };
         for (seg, share) in &start.share {
             if !segment_ids.contains(seg.as_str()) {
-                errors.push(format!("Team `{}`: Startanteil für unbekanntes Segment `{seg}`", t.id));
+                errors.push(format!(
+                    "Team `{}`: Startanteil für unbekanntes Segment `{seg}`",
+                    t.id
+                ));
             }
             if !share.is_finite() || *share < 0.0 {
-                errors.push(format!("Team `{}`: Startanteil `{seg}` muss ≥ 0 sein", t.id));
+                errors.push(format!(
+                    "Team `{}`: Startanteil `{seg}` muss ≥ 0 sein",
+                    t.id
+                ));
             }
             *share_sums.entry(seg.as_str()).or_insert(0.0) += *share;
         }
@@ -1825,14 +1893,18 @@ fn validate_business(s: &BusinessScenario, errors: &mut Vec<String>, warnings: &
     }
     for (seg, sum) in share_sums {
         if sum > 1.0 + 1e-9 {
-            errors.push(format!("Segment `{seg}`: Summe der Startanteile {sum:.3} > 1"));
+            errors.push(format!(
+                "Segment `{seg}`: Summe der Startanteile {sum:.3} > 1"
+            ));
         }
     }
 
     // Aktionsarten, Regeln, Modell
     for kind in &s.business.action_kinds {
         if !BUSINESS_ACTION_KINDS.contains(&kind.as_str()) {
-            errors.push(format!("business.action_kinds: unbekannte Aktionsart `{kind}`"));
+            errors.push(format!(
+                "business.action_kinds: unbekannte Aktionsart `{kind}`"
+            ));
         }
     }
     let mut rule_ids = BTreeSet::new();
@@ -1875,7 +1947,8 @@ fn validate_business(s: &BusinessScenario, errors: &mut Vec<String>, warnings: &
 
     // Offenlegung
     for (i, d) in s.business.disclosure.iter().enumerate() {
-        d.audience.check(&team_ids, &format!("business.disclosure[{i}]"), errors);
+        d.audience
+            .check(&team_ids, &format!("business.disclosure[{i}]"), errors);
         if d.on.trim().is_empty() {
             errors.push(format!("business.disclosure[{i}]: on leer"));
         }
@@ -1894,7 +1967,10 @@ fn validate_business(s: &BusinessScenario, errors: &mut Vec<String>, warnings: &
         i.audience.check(&team_ids, &ctx, errors);
         if let Some(at) = &i.at {
             if at.move_number == 0 || at.move_number > moves {
-                errors.push(format!("{ctx}: at.move {} außerhalb 1..={moves}", at.move_number));
+                errors.push(format!(
+                    "{ctx}: at.move {} außerhalb 1..={moves}",
+                    at.move_number
+                ));
             }
             if !BUSINESS_MOVE_PHASES.contains(&at.phase.as_str()) {
                 errors.push(format!("{ctx}: at.phase `{}` unbekannt", at.phase));
@@ -1926,7 +2002,9 @@ fn validate_business(s: &BusinessScenario, errors: &mut Vec<String>, warnings: &
     }
 
     if s.debrief.is_none() {
-        warnings.push("kein [debrief]-Abschnitt — Debriefing ist der wichtigste Teil des Spiels".to_owned());
+        warnings.push(
+            "kein [debrief]-Abschnitt — Debriefing ist der wichtigste Teil des Spiels".to_owned(),
+        );
     }
 }
 
@@ -1995,8 +2073,14 @@ mod tests {
         assert_eq!(loaded.scenario.injects_for_round(2).len(), 1);
         // Kasse ist teamprivat, Anteile sind öffentlich
         let vars = loaded.scenario.initial_vars();
-        let cash = vars.iter().find(|v| v.id == "company.cash").ok_or("cash fehlt")?;
-        assert_eq!(cash.visibility, VarVisibility::Seat(PlayerId::new("company")));
+        let cash = vars
+            .iter()
+            .find(|v| v.id == "company.cash")
+            .ok_or("cash fehlt")?;
+        assert_eq!(
+            cash.visibility,
+            VarVisibility::Seat(PlayerId::new("company"))
+        );
         let share = vars
             .iter()
             .find(|v| v.id == "company.share.sme")
@@ -2038,19 +2122,28 @@ mod tests {
             "schema = \"harwness.matrix-scenario/v1\"",
             "schema = \"x/v2\"",
         )?;
-        assert!(matches!(load_scenario(&src), Err(MatrixError::ScenarioParse(_))));
+        assert!(matches!(
+            load_scenario(&src),
+            Err(MatrixError::ScenarioParse(_))
+        ));
         let src = classic_with(
             "schema = \"harwness.matrix-scenario/v1\"",
             "schema = \"harwness.matrix-scenario/v1\"\nmode = \"chess\"",
         )?;
-        assert!(matches!(load_scenario(&src), Err(MatrixError::ScenarioParse(_))));
+        assert!(matches!(
+            load_scenario(&src),
+            Err(MatrixError::ScenarioParse(_))
+        ));
         Ok(())
     }
 
     #[test]
     fn rejects_unknown_fields() -> TestResult {
         let src = classic_with("rounds = 6", "rounds = 6\nbogus = 1")?;
-        assert!(matches!(load_scenario(&src), Err(MatrixError::ScenarioParse(_))));
+        assert!(matches!(
+            load_scenario(&src),
+            Err(MatrixError::ScenarioParse(_))
+        ));
         Ok(())
     }
 
@@ -2067,7 +2160,10 @@ mod tests {
 
     #[test]
     fn rejects_unknown_visibility_seat() -> TestResult {
-        let src = classic_with("visibility = \"seat:gilde\"", "visibility = \"seat:piraten\"")?;
+        let src = classic_with(
+            "visibility = \"seat:gilde\"",
+            "visibility = \"seat:piraten\"",
+        )?;
         let errs = invalid_errors(&src);
         assert!(errs.iter().any(|e| e.contains("piraten")), "{errs:?}");
         Ok(())
@@ -2093,7 +2189,10 @@ mod tests {
             "goals.public = [\"a\", \"b\", \"c\", \"d\", \"e\"]",
         )?;
         let errs = invalid_errors(&src);
-        assert!(errs.iter().any(|e| e.contains("öffentliche Ziele")), "{errs:?}");
+        assert!(
+            errs.iter().any(|e| e.contains("öffentliche Ziele")),
+            "{errs:?}"
+        );
         let src = classic_with(
             "effects = [{ op = \"add\", var = \"water\", by = -1 }]",
             "effects = [{ op = \"add\", var = \"wasser\", by = -1 }]",
@@ -2105,18 +2204,28 @@ mod tests {
             "effects = [{ op = \"add\", var = \"water\", by = -2 }]",
         )?;
         let errs = invalid_errors(&src);
-        assert!(errs.iter().any(|e| e.contains("max_track_step")), "{errs:?}");
+        assert!(
+            errs.iter().any(|e| e.contains("max_track_step")),
+            "{errs:?}"
+        );
         Ok(())
     }
 
     #[test]
     fn rejects_three_factions() -> TestResult {
-        let start = KARST.find("[[factions]]\nid = \"mission\"").ok_or("mission fehlt")?;
+        let start = KARST
+            .find("[[factions]]\nid = \"mission\"")
+            .ok_or("mission fehlt")?;
         let end = KARST.find("[seating]").ok_or("seating fehlt")?;
-        let src = format!("{}{}", &KARST[..start], &KARST[end..])
-            .replace("order = [\"rat\", \"gilde\", \"nord\", \"mission\"]", "order = [\"rat\", \"gilde\", \"nord\"]");
+        let src = format!("{}{}", &KARST[..start], &KARST[end..]).replace(
+            "order = [\"rat\", \"gilde\", \"nord\", \"mission\"]",
+            "order = [\"rat\", \"gilde\", \"nord\"]",
+        );
         let errs = invalid_errors(&src);
-        assert!(errs.iter().any(|e| e.contains("genau 4 Fraktionen")), "{errs:?}");
+        assert!(
+            errs.iter().any(|e| e.contains("genau 4 Fraktionen")),
+            "{errs:?}"
+        );
         Ok(())
     }
 
@@ -2133,7 +2242,10 @@ mod tests {
         let end = CLOUD.find("[business]").ok_or("business fehlt")?;
         let src = format!("{}{}", &CLOUD[..start], &CLOUD[end..]);
         let errs = invalid_errors(&src);
-        assert!(errs.iter().any(|e| e.contains("Schlüsselfrage")), "{errs:?}");
+        assert!(
+            errs.iter().any(|e| e.contains("Schlüsselfrage")),
+            "{errs:?}"
+        );
 
         let src = business_with("role = \"company\"", "role = \"competitor\"")?;
         let errs = invalid_errors(&src);
@@ -2143,10 +2255,7 @@ mod tests {
 
     #[test]
     fn business_market_role_consistency() -> TestResult {
-        let src = business_with(
-            "market_role = \"player\"",
-            "market_role = \"white_cell\"",
-        )?;
+        let src = business_with("market_role = \"player\"", "market_role = \"white_cell\"")?;
         let errs = invalid_errors(&src);
         assert!(errs.iter().any(|e| e.contains("white_cell")), "{errs:?}");
         Ok(())
@@ -2156,7 +2265,10 @@ mod tests {
     fn business_share_sum_and_segment_sizes() -> TestResult {
         let src = business_with("share = { sme = 0.05,", "share = { sme = 0.55,")?;
         let errs = invalid_errors(&src);
-        assert!(errs.iter().any(|e| e.contains("Summe der Startanteile")), "{errs:?}");
+        assert!(
+            errs.iter().any(|e| e.contains("Summe der Startanteile")),
+            "{errs:?}"
+        );
         let src = business_with("size_meur = [800, 950, 1300]", "size_meur = [800, 950]")?;
         let errs = invalid_errors(&src);
         assert!(errs.iter().any(|e| e.contains("size_meur")), "{errs:?}");
@@ -2168,7 +2280,10 @@ mod tests {
         let src = business_with("p = 0.25", "p = 1.5")?;
         let errs = invalid_errors(&src);
         assert!(errs.iter().any(|e| e.contains("INJ-3")), "{errs:?}");
-        let src = business_with("audience = [\"competitor_b\"]", "audience = [\"competitor_z\"]")?;
+        let src = business_with(
+            "audience = [\"competitor_b\"]",
+            "audience = [\"competitor_z\"]",
+        )?;
         let errs = invalid_errors(&src);
         assert!(errs.iter().any(|e| e.contains("competitor_z")), "{errs:?}");
         let src = business_with("when = \"cash < 0\"", "when = \"cash < (0\"")?;

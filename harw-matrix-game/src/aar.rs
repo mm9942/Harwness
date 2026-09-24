@@ -54,7 +54,10 @@ pub fn validate_goal_ratings(ratings: &[GoalRating], scenario: &Scenario) -> Vec
                     &f.public_goals
                 };
                 if !goals.contains(&r.goal) {
-                    errors.push(format!("{label}: Ziel `{}` gehört nicht zu `{}`", r.goal, r.faction));
+                    errors.push(format!(
+                        "{label}: Ziel `{}` gehört nicht zu `{}`",
+                        r.goal, r.faction
+                    ));
                 }
             }
         }
@@ -91,7 +94,10 @@ pub struct DisclosureCheck {
 ///
 /// # Errors
 /// [`crate::MatrixError::Json`] bei nicht serialisierbarem Inhalt.
-pub fn disclosure_checks(journal: &Journal, state: &GameState) -> MatrixResult<Vec<DisclosureCheck>> {
+pub fn disclosure_checks(
+    journal: &Journal,
+    state: &GameState,
+) -> MatrixResult<Vec<DisclosureCheck>> {
     let master = state.master_seed().ok();
     let mut checks = Vec::new();
     for entry in journal.entries() {
@@ -112,12 +118,18 @@ pub fn disclosure_checks(journal: &Journal, state: &GameState) -> MatrixResult<V
                 salt_hex,
                 commitment: revealed_commitment,
                 ..
-            } if sid == secret_id => Some((content.clone(), salt_hex.clone(), revealed_commitment.clone())),
+            } if sid == secret_id => Some((
+                content.clone(),
+                salt_hex.clone(),
+                revealed_commitment.clone(),
+            )),
             _ => None,
         });
         let check = if let Some((content, salt_hex, revealed_commitment)) = revealed {
             let verified = match Salt::from_hex(&salt_hex) {
-                Some(salt) => verify(&content, &salt, commitment)? && &revealed_commitment == commitment,
+                Some(salt) => {
+                    verify(&content, &salt, commitment)? && &revealed_commitment == commitment
+                }
                 None => false,
             };
             DisclosureCheck {
@@ -316,7 +328,11 @@ fn write_argument(out: &mut String, scenario: &Scenario, a: &ArgInfo) {
         .map_or_else(|| "öffentlich".to_owned(), |s| format!("geheim #{s}"));
     push_line(
         out,
-        &format!("#### {} — {} ({kind})", a.id, scenario.display_name(&a.seat)),
+        &format!(
+            "#### {} — {} ({kind})",
+            a.id,
+            scenario.display_name(&a.seat)
+        ),
     );
     push_line(out, "");
     push_line(out, &format!("**Aktion:** {}", a.body.action));
@@ -339,7 +355,10 @@ fn write_argument(out: &mut String, scenario: &Scenario, a: &ArgInfo) {
     }
     if let Some((r, net, target, pct)) = &a.ruling {
         for con in &r.umpire_cons {
-            push_line(out, &format!("- Contra (Umpire): {} (Gewicht {})", con.text, con.weight));
+            push_line(
+                out,
+                &format!("- Contra (Umpire): {} (Gewicht {})", con.text, con.weight),
+            );
         }
         if r.context_modifier != 0 {
             push_line(
@@ -351,7 +370,8 @@ fn write_argument(out: &mut String, scenario: &Scenario, a: &ArgInfo) {
                 ),
             );
         }
-        let target_text = target.map_or_else(|| format!("{pct} %"), |t| format!("Ziel {t}+ ({pct} %)"));
+        let target_text =
+            target.map_or_else(|| format!("{pct} %"), |t| format!("Ziel {t}+ ({pct} %)"));
         push_line(out, &format!("- Netto {net:+} → {target_text}"));
         if let Some(rationale) = &r.public_rationale {
             push_line(out, &format!("- Umpire (öffentlich): {rationale}"));
@@ -380,7 +400,10 @@ fn write_argument(out: &mut String, scenario: &Scenario, a: &ArgInfo) {
     }
     if let Some((outcome, grade)) = a.outcome {
         let grade = grade.map_or_else(String::new, |g| format!(" ({})", grade_label(g)));
-        push_line(out, &format!("- **Ergebnis:** {}{grade}", outcome_label(outcome)));
+        push_line(
+            out,
+            &format!("- **Ergebnis:** {}{grade}", outcome_label(outcome)),
+        );
     }
     for n in &a.narrations {
         push_line(out, &format!("- Erzählung: {n}"));
@@ -403,21 +426,42 @@ pub fn build_aar(input: &AarInput<'_>) -> MatrixResult<String> {
     let mut out = String::new();
 
     // 1. Kopf
-    push_line(&mut out, &format!("# After-Action-Review: {}", scenario.title()));
+    push_line(
+        &mut out,
+        &format!("# After-Action-Review: {}", scenario.title()),
+    );
     push_line(&mut out, "");
     push_line(&mut out, "| Feld | Wert |");
     push_line(&mut out, "|---|---|");
     push_line(&mut out, &format!("| Szenario | `{}` |", scenario.id()));
     push_line(&mut out, &format!("| Modus | {:?} |", scenario.mode()));
-    push_line(&mut out, &format!("| Zweck | {} |", cell(scenario.purpose())));
-    let seed = state.master_seed_hex.as_deref().unwrap_or("—");
-    push_line(&mut out, &format!("| Seed | `{}…` |", seed.get(..16).unwrap_or(seed)));
     push_line(
         &mut out,
-        &format!("| Szenario-Hash | `{}…` |", input.loaded.source_hash.get(..16).unwrap_or("")),
+        &format!("| Zweck | {} |", cell(scenario.purpose())),
     );
-    push_line(&mut out, &format!("| Runden | {} von {} |", state.round, scenario.rounds()));
-    push_line(&mut out, &format!("| Modelle | {} |", cell(input.models.unwrap_or("Harness-Default"))));
+    let seed = state.master_seed_hex.as_deref().unwrap_or("—");
+    push_line(
+        &mut out,
+        &format!("| Seed | `{}…` |", seed.get(..16).unwrap_or(seed)),
+    );
+    push_line(
+        &mut out,
+        &format!(
+            "| Szenario-Hash | `{}…` |",
+            input.loaded.source_hash.get(..16).unwrap_or("")
+        ),
+    );
+    push_line(
+        &mut out,
+        &format!("| Runden | {} von {} |", state.round, scenario.rounds()),
+    );
+    push_line(
+        &mut out,
+        &format!(
+            "| Modelle | {} |",
+            cell(input.models.unwrap_or("Harness-Default"))
+        ),
+    );
     push_line(&mut out, "");
     push_line(
         &mut out,
@@ -493,7 +537,10 @@ pub fn build_aar(input: &AarInput<'_>) -> MatrixResult<String> {
         for (id, first) in &start {
             let mut row = format!("| `{id}` | {} |", cell(first));
             for (_, snap) in &snapshots {
-                row.push_str(&format!(" {} |", cell(snap.get(id).map_or("—", String::as_str))));
+                row.push_str(&format!(
+                    " {} |",
+                    cell(snap.get(id).map_or("—", String::as_str))
+                ));
             }
             push_line(&mut out, &row);
         }
@@ -509,7 +556,9 @@ pub fn build_aar(input: &AarInput<'_>) -> MatrixResult<String> {
     for entry in journal.entries() {
         let note = match &entry.kind {
             EntryKind::Forfeit { text, .. } => Some(text.clone()),
-            EntryKind::InjectApplied { inject_id, text, .. } => Some(format!("Inject `{inject_id}`: {text}")),
+            EntryKind::InjectApplied {
+                inject_id, text, ..
+            } => Some(format!("Inject `{inject_id}`: {text}")),
             EntryKind::Narrated {
                 argument_id: None,
                 text,
@@ -547,7 +596,10 @@ pub fn build_aar(input: &AarInput<'_>) -> MatrixResult<String> {
     if checks.is_empty() {
         push_line(&mut out, "Keine geheimen Argumente.");
     } else {
-        push_line(&mut out, "| Geheimnis | Argument | Sitz | Commitment | Offengelegt | Prüfung |");
+        push_line(
+            &mut out,
+            "| Geheimnis | Argument | Sitz | Commitment | Offengelegt | Prüfung |",
+        );
         push_line(&mut out, "|---|---|---|---|---|---|");
         for c in &checks {
             push_line(
@@ -558,8 +610,16 @@ pub fn build_aar(input: &AarInput<'_>) -> MatrixResult<String> {
                     c.argument_id,
                     c.seat,
                     c.announced.short(),
-                    if c.revealed_in_game { "im Spiel" } else { "erst im AAR" },
-                    if c.verified { "Commitment bestätigt" } else { "Commitment NICHT bestätigt" }
+                    if c.revealed_in_game {
+                        "im Spiel"
+                    } else {
+                        "erst im AAR"
+                    },
+                    if c.verified {
+                        "Commitment bestätigt"
+                    } else {
+                        "Commitment NICHT bestätigt"
+                    }
                 ),
             );
         }
@@ -583,7 +643,10 @@ pub fn build_aar(input: &AarInput<'_>) -> MatrixResult<String> {
                     channel_order.push(channel.clone());
                 }
                 let [a, b] = members;
-                channel_heads.insert(channel.clone(), format!("{a} ⇄ {b}, eröffnet in Runde {}", entry.round));
+                channel_heads.insert(
+                    channel.clone(),
+                    format!("{a} ⇄ {b}, eröffnet in Runde {}", entry.round),
+                );
                 channel_lines
                     .entry(channel.clone())
                     .or_default()
@@ -635,7 +698,10 @@ pub fn build_aar(input: &AarInput<'_>) -> MatrixResult<String> {
                 argument_id,
                 seat,
                 text,
-            } => Some(format!("- r{} {seat} zu {argument_id}: {text}", entry.round)),
+            } => Some(format!(
+                "- r{} {seat} zu {argument_id}: {text}",
+                entry.round
+            )),
             EntryKind::Briefed {
                 seat,
                 intent: Some(intent),
@@ -669,8 +735,13 @@ pub fn build_aar(input: &AarInput<'_>) -> MatrixResult<String> {
     // 5. Zielerreichung
     push_line(&mut out, "## Zielerreichung");
     push_line(&mut out, "");
-    let ratings: &[GoalRating] = input.synthesis.map_or(&[][..], |s| s.goal_ratings.as_slice());
-    push_line(&mut out, "| Fraktion | Ziel | Art | Bewertung (0–3) | Begründung |");
+    let ratings: &[GoalRating] = input
+        .synthesis
+        .map_or(&[][..], |s| s.goal_ratings.as_slice());
+    push_line(
+        &mut out,
+        "| Fraktion | Ziel | Art | Bewertung (0–3) | Begründung |",
+    );
     push_line(&mut out, "|---|---|---|---|---|");
     for faction in scenario.factions() {
         let goals = faction
@@ -679,9 +750,9 @@ pub fn build_aar(input: &AarInput<'_>) -> MatrixResult<String> {
             .map(|g| (g, false))
             .chain(faction.secret_goals.iter().map(|g| (g, true)));
         for (goal, secret) in goals {
-            let rating = ratings
-                .iter()
-                .find(|r| r.faction == faction.id.as_str() && &r.goal == goal && r.secret == secret);
+            let rating = ratings.iter().find(|r| {
+                r.faction == faction.id.as_str() && &r.goal == goal && r.secret == secret
+            });
             let (score, rationale) = rating.map_or_else(
                 || ("nicht bewertet".to_owned(), "—".to_owned()),
                 |r| (r.score.to_string(), r.rationale.clone()),
@@ -729,7 +800,9 @@ pub fn build_aar(input: &AarInput<'_>) -> MatrixResult<String> {
         push_line(&mut out, "## Spieler-Debrief");
         push_line(&mut out, "");
         for player in &state.players {
-            let Some(d) = input.debriefs.get(player) else { continue };
+            let Some(d) = input.debriefs.get(player) else {
+                continue;
+            };
             push_line(&mut out, &format!("### {}", scenario.display_name(player)));
             push_line(&mut out, "");
             push_line(&mut out, &format!("- Wollte: {}", d.wanted));
@@ -764,13 +837,17 @@ pub fn build_aar(input: &AarInput<'_>) -> MatrixResult<String> {
     let mut seen_injects = BTreeSet::new();
     for entry in journal.entries() {
         match &entry.kind {
-            EntryKind::InjectApplied { inject_id, text, .. } if seen_injects.insert(inject_id.clone()) => {
+            EntryKind::InjectApplied {
+                inject_id, text, ..
+            } if seen_injects.insert(inject_id.clone()) => {
                 interventions.push(format!("- r{} Inject `{inject_id}`: {text}", entry.round));
             }
             EntryKind::FacilitatorNote { command, detail } => {
                 interventions.push(format!("- r{} {command}: {detail}", entry.round));
             }
-            EntryKind::LeakSuspect { source, findings, .. } => {
+            EntryKind::LeakSuspect {
+                source, findings, ..
+            } => {
                 interventions.push(format!(
                     "- r{} Leak-Verdacht ({source}): {}",
                     entry.round,
@@ -867,11 +944,20 @@ mod tests {
         assert!(md.contains("Commitment bestätigt"));
         assert!(!md.contains("NICHT bestätigt"));
         assert!(md.contains(NORD_REPLY), "private Kanäle werden offengelegt");
-        assert!(md.contains("Nur für uns"), "private Notizen werden offengelegt");
-        assert!(md.contains("smuggling_net"), "verdeckte Tracks im Endzustand");
+        assert!(
+            md.contains("Nur für uns"),
+            "private Notizen werden offengelegt"
+        );
+        assert!(
+            md.contains("smuggling_net"),
+            "verdeckte Tracks im Endzustand"
+        );
         assert!(md.contains("| 3 | Die Anlage blieb beim Rat. |"));
         assert!(md.contains("nicht bewertet"));
-        assert!(md.contains("bringt kein Argument vor"), "Forfeit-Text der Mission");
+        assert!(
+            md.contains("bringt kein Argument vor"),
+            "Forfeit-Text der Mission"
+        );
         Ok(())
     }
 

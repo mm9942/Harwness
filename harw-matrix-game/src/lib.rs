@@ -98,7 +98,10 @@ pub(crate) mod test_support {
             PlayerId::new("rat"),
             argument(
                 "Der Inselrat stellt die Entsalzungsanlage unter Polizeischutz.",
-                &["Die Inselpolizei ist bereits vor Ort.", "Der Rat hat das Mandat der Wähler."],
+                &[
+                    "Die Inselpolizei ist bereits vor Ort.",
+                    "Der Rat hat das Mandat der Wähler.",
+                ],
                 false,
                 None,
             ),
@@ -107,7 +110,10 @@ pub(crate) mod test_support {
             PlayerId::new("gilde"),
             argument(
                 "Die Gilde schleust nachts zusätzliche Tanker am Zoll vorbei.",
-                &["Die Hafengilde kontrolliert die Kräne.", "Der Zoll ist unterbesetzt."],
+                &[
+                    "Die Hafengilde kontrolliert die Kräne.",
+                    "Der Zoll ist unterbesetzt.",
+                ],
                 true,
                 Some("Nur für uns: das Netz muss bis Runde drei stehen."),
             ),
@@ -201,7 +207,12 @@ pub(crate) mod test_support {
         UmpireAdjudication {
             rulings: vec![a1, a2, a3],
             conflicts: Vec::new(),
-            standing: vec!["nord".to_owned(), "rat".to_owned(), "gilde".to_owned(), "mission".to_owned()],
+            standing: vec![
+                "nord".to_owned(),
+                "rat".to_owned(),
+                "gilde".to_owned(),
+                "mission".to_owned(),
+            ],
         }
     }
 

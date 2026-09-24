@@ -244,7 +244,9 @@ fn build_view(journal: &Journal, viewer: Viewer, keep: impl Fn(&GameEntry) -> bo
             continue;
         }
         fold_world(&mut world, entry);
-        let n = u32::try_from(entries.len()).unwrap_or(u32::MAX).saturating_add(1);
+        let n = u32::try_from(entries.len())
+            .unwrap_or(u32::MAX)
+            .saturating_add(1);
         entries.push(ViewEntry {
             n,
             round: entry.round,
@@ -327,10 +329,9 @@ impl LeakFinding {
                 "5-Gramm „{s}“ aus {} (Runde {})",
                 self.source_audience, self.source_round
             ),
-            LeakKind::HiddenVariable(v) => format!(
-                "verdeckte Variable `{v}` ({})",
-                self.source_audience
-            ),
+            LeakKind::HiddenVariable(v) => {
+                format!("verdeckte Variable `{v}` ({})", self.source_audience)
+            }
         }
     }
 }
@@ -521,7 +522,10 @@ mod tests {
     }
 
     fn players() -> Vec<PlayerId> {
-        ["rat", "gilde", "nord", "mission"].into_iter().map(PlayerId::new).collect()
+        ["rat", "gilde", "nord", "mission"]
+            .into_iter()
+            .map(PlayerId::new)
+            .collect()
     }
 
     fn entry(audience: Audience, marker: &str) -> GameEntry {
@@ -599,9 +603,15 @@ mod tests {
             let a = project(&base, &seat, &cfg).to_canonical_json()?;
             let view = project(&mixed, &seat, &cfg);
             let b = view.to_canonical_json()?;
-            assert_eq!(a, b, "Trial {trial}: Projektion von {p} hängt von fremden Einträgen ab");
+            assert_eq!(
+                a, b,
+                "Trial {trial}: Projektion von {p} hängt von fremden Einträgen ab"
+            );
             for marker in &foreign_markers {
-                assert!(!b.contains(marker.as_str()), "Trial {trial}: Marker {marker} sichtbar für {p}");
+                assert!(
+                    !b.contains(marker.as_str()),
+                    "Trial {trial}: Marker {marker} sichtbar für {p}"
+                );
             }
         }
         Ok(())
@@ -625,7 +635,11 @@ mod tests {
                 for i in 0..20 {
                     let a = all[pick(&mut rng, 4)].clone();
                     let b = all[pick(&mut rng, 4)].clone();
-                    let aud = if a == b { Audience::Seat(a) } else { Audience::pair(a, b) };
+                    let aud = if a == b {
+                        Audience::Seat(a)
+                    } else {
+                        Audience::pair(a, b)
+                    };
                     journal.append(entry(aud, &format!("m{i}")), None);
                 }
                 for p in &all {
@@ -709,8 +723,10 @@ mod tests {
 
     #[test]
     fn projection_identical_whether_or_not_others_negotiated() -> TestResult {
-        let (_, with) = scripted_game_with(&[11u8; 32], &["rat", "gilde", "nord", "mission"], true)?;
-        let (_, without) = scripted_game_with(&[11u8; 32], &["rat", "gilde", "nord", "mission"], false)?;
+        let (_, with) =
+            scripted_game_with(&[11u8; 32], &["rat", "gilde", "nord", "mission"], true)?;
+        let (_, without) =
+            scripted_game_with(&[11u8; 32], &["rat", "gilde", "nord", "mission"], false)?;
         assert_ne!(with.journal, without.journal);
         let cfg = VisibilityCfg::default();
         for seat in [Seat::player("gilde"), Seat::player("mission"), Seat::Umpire] {
@@ -730,7 +746,13 @@ mod tests {
     #[test]
     fn umpire_cited_and_full_modes() -> TestResult {
         let (_, log) = scripted_game(&[12u8; 32], &["rat", "gilde", "nord", "mission"])?;
-        let channel = log.state.channels.keys().next().cloned().ok_or("kein Kanal")?;
+        let channel = log
+            .state
+            .channels
+            .keys()
+            .next()
+            .cloned()
+            .ok_or("kein Kanal")?;
         let none = project(&log.journal, &Seat::Umpire, &VisibilityCfg::default());
         assert!(!none.contains_text(RAT_OPENING)?);
         let cited = VisibilityCfg {
@@ -751,7 +773,13 @@ mod tests {
     #[test]
     fn cited_channels_require_membership() -> TestResult {
         let (_, log) = scripted_game(&[13u8; 32], &["rat", "gilde", "nord", "mission"])?;
-        let channel = log.state.channels.keys().next().cloned().ok_or("kein Kanal")?;
+        let channel = log
+            .state
+            .channels
+            .keys()
+            .next()
+            .cloned()
+            .ok_or("kein Kanal")?;
         let mk = |seat: &str| RoundArgument {
             id: "r2-a1".to_owned(),
             round: 2,
@@ -784,12 +812,23 @@ mod tests {
         assert!(project(&before, &Seat::player("gilde"), &cfg).contains_text(secret_action)?);
         assert!(project(&before, &Seat::Umpire, &cfg).contains_text(secret_action)?);
         // Die Ankündigung ist öffentlich.
-        assert!(project(&before, &Seat::player("rat"), &cfg).contains_text("geheimes Argument vor (#s1)")?);
+        assert!(
+            project(&before, &Seat::player("rat"), &cfg)
+                .contains_text("geheimes Argument vor (#s1)")?
+        );
         // Verdeckte Variable des Eigentümers ist für andere unsichtbar.
         let rat_view = project(&before, &Seat::player("rat"), &cfg);
         assert!(!rat_view.world().contains_key("smuggling_net"));
-        assert!(project(&before, &Seat::player("gilde"), &cfg).world().contains_key("smuggling_net"));
-        assert!(project(&before, &Seat::Umpire, &cfg).world().contains_key("plant_sabotage_risk"));
+        assert!(
+            project(&before, &Seat::player("gilde"), &cfg)
+                .world()
+                .contains_key("smuggling_net")
+        );
+        assert!(
+            project(&before, &Seat::Umpire, &cfg)
+                .world()
+                .contains_key("plant_sabotage_risk")
+        );
         assert!(!rat_view.world().contains_key("plant_sabotage_risk"));
         // Nach Spielende ist das geheime Argument für alle sichtbar.
         assert!(project(&log.journal, &Seat::player("rat"), &cfg).contains_text(secret_action)?);
@@ -802,8 +841,12 @@ mod tests {
     #[test]
     fn projection_has_no_sequence_numbers_or_timestamps() -> TestResult {
         let (_, log) = scripted_game(&[15u8; 32], &["rat", "gilde", "nord", "mission"])?;
-        let json = project(&log.journal, &Seat::player("mission"), &VisibilityCfg::default())
-            .to_canonical_json()?;
+        let json = project(
+            &log.journal,
+            &Seat::player("mission"),
+            &VisibilityCfg::default(),
+        )
+        .to_canonical_json()?;
         assert!(!json.contains("\"seq\""));
         assert!(!json.contains("\"at\""));
         assert!(!json.contains("master_seed"));
@@ -818,7 +861,9 @@ mod tests {
         let leaky = "Der Umpire hört: wir brauchen Tankschiffe aber ohne Fahnen, heißt es.";
         let findings = scan_public_text(leaky, &log.journal);
         assert!(
-            findings.iter().any(|f| matches!(&f.kind, LeakKind::Shingle(_))),
+            findings
+                .iter()
+                .any(|f| matches!(&f.kind, LeakKind::Shingle(_))),
             "{findings:?}"
         );
         assert_eq!(
@@ -843,9 +888,11 @@ mod tests {
         );
         // Nennung einer verdeckten Variablen.
         let named = scan_public_text("Das Schmuggelnetz der Gilde wächst.", &log.journal);
-        assert!(named
-            .iter()
-            .any(|f| f.kind == LeakKind::HiddenVariable("smuggling_net".to_owned())));
+        assert!(
+            named
+                .iter()
+                .any(|f| f.kind == LeakKind::HiddenVariable("smuggling_net".to_owned()))
+        );
         // Öffentliche Inhalte sind kein Leck.
         let public = scan_public_text(
             "Der Inselrat stellt die Entsalzungsanlage unter Polizeischutz.",
@@ -880,7 +927,11 @@ mod tests {
     #[test]
     fn entries_since_returns_delta() -> TestResult {
         let (_, log) = scripted_game(&[18u8; 32], &["rat", "gilde", "nord", "mission"])?;
-        let view = project(&log.journal, &Seat::player("nord"), &VisibilityCfg::default());
+        let view = project(
+            &log.journal,
+            &Seat::player("nord"),
+            &VisibilityCfg::default(),
+        );
         let total = view.entries().len();
         assert_eq!(view.entries_since(0).len(), total);
         assert_eq!(view.entries_since(u32::try_from(total)?).len(), 0);

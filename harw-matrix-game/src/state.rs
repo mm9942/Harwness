@@ -104,7 +104,11 @@ impl Audience {
     /// Normalisiertes Paar (`a < b`).
     #[must_use]
     pub fn pair(a: PlayerId, b: PlayerId) -> Self {
-        if a <= b { Self::Pair(a, b) } else { Self::Pair(b, a) }
+        if a <= b {
+            Self::Pair(a, b)
+        } else {
+            Self::Pair(b, a)
+        }
     }
 
     /// Parst die Textform: `public`/`all`, `umpire`, `observer`, `seat:x`,
@@ -140,7 +144,9 @@ impl Audience {
                 [a, b] if !a.is_empty() && !b.is_empty() && a != b => {
                     Ok(Self::pair(PlayerId::new(*a), PlayerId::new(*b)))
                 }
-                _ => Err(format!("Audience `{text}`: pair braucht zwei verschiedene Sitze")),
+                _ => Err(format!(
+                    "Audience `{text}`: pair braucht zwei verschiedene Sitze"
+                )),
             };
         }
         Err(format!(
@@ -735,7 +741,10 @@ impl EntryKind {
                 out.extend(proposal.as_deref());
                 out.extend(accept.as_deref());
             }
-            Self::ArgumentRevealed { argument, .. } | Self::SecretRevealed { content: argument, .. } => {
+            Self::ArgumentRevealed { argument, .. }
+            | Self::SecretRevealed {
+                content: argument, ..
+            } => {
                 out.push(&argument.action);
                 out.extend(argument.pros.iter().map(String::as_str));
             }
@@ -851,7 +860,9 @@ impl Journal {
 
     /// Hängt einen Eintrag an; Rückgabe ist die Sequenznummer.
     pub fn append(&mut self, entry: GameEntry, at: Option<Timestamp>) -> u64 {
-        let seq = u64::try_from(self.records.len()).unwrap_or(u64::MAX).saturating_add(1);
+        let seq = u64::try_from(self.records.len())
+            .unwrap_or(u64::MAX)
+            .saturating_add(1);
         self.records.push(JournalRecord { seq, at, entry });
         seq
     }
@@ -1101,11 +1112,13 @@ impl GameState {
             EntryKind::ChannelOpened {
                 channel, members, ..
             } => {
-                self.channels.entry(channel.clone()).or_insert_with(|| Channel {
-                    id: channel.clone(),
-                    members: members.clone(),
-                    round: entry.round,
-                });
+                self.channels
+                    .entry(channel.clone())
+                    .or_insert_with(|| Channel {
+                        id: channel.clone(),
+                        members: members.clone(),
+                        round: entry.round,
+                    });
             }
             EntryKind::SecretArgumentAnnounced {
                 argument_id,
@@ -1115,7 +1128,9 @@ impl GameState {
                 ..
             } => {
                 if self.secrets.contains_key(secret_id) {
-                    return Err(MatrixError::State(format!("Geheimnis `{secret_id}` doppelt")));
+                    return Err(MatrixError::State(format!(
+                        "Geheimnis `{secret_id}` doppelt"
+                    )));
                 }
                 self.secrets.insert(
                     secret_id.clone(),
@@ -1146,10 +1161,9 @@ impl GameState {
                 }
             }
             EntryKind::WorldDelta { var, from, to, .. } => {
-                let current = self
-                    .vars
-                    .get_mut(var)
-                    .ok_or_else(|| MatrixError::State(format!("WorldDelta: unbekannte Variable `{var}`")))?;
+                let current = self.vars.get_mut(var).ok_or_else(|| {
+                    MatrixError::State(format!("WorldDelta: unbekannte Variable `{var}`"))
+                })?;
                 if current.value != *from && current.value != *to {
                     return Err(MatrixError::State(format!(
                         "WorldDelta `{var}`: Ausgangswert passt nicht ({} statt {})",
@@ -1169,12 +1183,16 @@ impl GameState {
             }
             EntryKind::OngoingStopped { id } => {
                 if self.ongoing.remove(id).is_none() {
-                    return Err(MatrixError::State(format!("OngoingStopped: `{id}` läuft nicht")));
+                    return Err(MatrixError::State(format!(
+                        "OngoingStopped: `{id}` läuft nicht"
+                    )));
                 }
             }
             EntryKind::SecretRevealed { secret_id, .. } => {
                 let record = self.secrets.get_mut(secret_id).ok_or_else(|| {
-                    MatrixError::State(format!("SecretRevealed: unbekanntes Geheimnis `{secret_id}`"))
+                    MatrixError::State(format!(
+                        "SecretRevealed: unbekanntes Geheimnis `{secret_id}`"
+                    ))
                 })?;
                 record.revealed = true;
             }
@@ -1218,7 +1236,11 @@ impl GameLog {
     ///
     /// # Errors
     /// Erster Fehler aus [`GameLog::record`].
-    pub fn record_all(&mut self, entries: Vec<GameEntry>, at: Option<Timestamp>) -> MatrixResult<()> {
+    pub fn record_all(
+        &mut self,
+        entries: Vec<GameEntry>,
+        at: Option<Timestamp>,
+    ) -> MatrixResult<()> {
         for entry in entries {
             self.record(entry, at)?;
         }
@@ -1277,7 +1299,10 @@ mod tests {
     #[test]
     fn audience_pair_is_normalized() {
         let a = Audience::pair(PlayerId::new("nord"), PlayerId::new("gilde"));
-        assert_eq!(a, Audience::Pair(PlayerId::new("gilde"), PlayerId::new("nord")));
+        assert_eq!(
+            a,
+            Audience::Pair(PlayerId::new("gilde"), PlayerId::new("nord"))
+        );
     }
 
     #[test]
@@ -1293,7 +1318,10 @@ mod tests {
             assert_eq!(Audience::parse(text)?.to_string(), text);
         }
         assert_eq!(Audience::parse("all")?, Audience::Public);
-        assert_eq!(Audience::parse("pair:nord,gilde")?.to_string(), "pair:gilde,nord");
+        assert_eq!(
+            Audience::parse("pair:nord,gilde")?.to_string(),
+            "pair:gilde,nord"
+        );
         assert!(Audience::parse("pair:rat,rat").is_err());
         assert!(Audience::parse("pair:rat").is_err());
         assert!(Audience::parse("seat:").is_err());
@@ -1308,7 +1336,9 @@ mod tests {
         assert!(Audience::Seat(a.clone()).is_within(&Audience::Public, &players));
         assert!(Audience::Seat(a.clone()).is_within(&Audience::SeatAndUmpire(a.clone()), &players));
         assert!(!Audience::Public.is_within(&Audience::SeatAndUmpire(a.clone()), &players));
-        assert!(!Audience::Seat(b.clone()).is_within(&Audience::SeatAndUmpire(a.clone()), &players));
+        assert!(
+            !Audience::Seat(b.clone()).is_within(&Audience::SeatAndUmpire(a.clone()), &players)
+        );
         assert!(Audience::UmpireOnly.is_within(&Audience::SeatAndUmpire(a), &players));
         assert!(!Audience::pair(PlayerId::new("a"), b).is_within(&Audience::UmpireOnly, &players));
     }
@@ -1333,7 +1363,13 @@ mod tests {
     fn sample_journal() -> Journal {
         let mut j = Journal::new();
         j.append(
-            GameEntry::new(0, Audience::Public, EntryKind::PhaseEntered { phase: Phase::Setup }),
+            GameEntry::new(
+                0,
+                Audience::Public,
+                EntryKind::PhaseEntered {
+                    phase: Phase::Setup,
+                },
+            ),
             None,
         );
         j.append(
@@ -1441,7 +1477,10 @@ mod tests {
         state.apply(&delta(0, 1))?;
         // idempotent (Mehrfach-Audience derselben Änderung)
         state.apply(&delta(0, 1))?;
-        assert!(matches!(state.apply(&delta(2, 3)), Err(MatrixError::State(_))));
+        assert!(matches!(
+            state.apply(&delta(2, 3)),
+            Err(MatrixError::State(_))
+        ));
         Ok(())
     }
 

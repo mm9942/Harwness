@@ -192,7 +192,11 @@ pub fn roll_d100(seed: [u8; 32]) -> u8 {
 pub fn top3_sum(weights: &[u8]) -> i32 {
     let mut sorted: Vec<u8> = weights.to_vec();
     sorted.sort_unstable_by(|a, b| b.cmp(a));
-    sorted.iter().take(COUNTED_REASONS).map(|w| i32::from(*w)).sum()
+    sorted
+        .iter()
+        .take(COUNTED_REASONS)
+        .map(|w| i32::from(*w))
+        .sum()
 }
 
 /// Netto aus Gewichten und Modifikator.
@@ -241,7 +245,11 @@ pub fn grade_2d6(sum: u16, target: u8, success: bool) -> Grade {
     let sum = i32::from(sum);
     let target = i32::from(target);
     if success {
-        if sum >= target + 3 { Grade::StrongSuccess } else { Grade::Success }
+        if sum >= target + 3 {
+            Grade::StrongSuccess
+        } else {
+            Grade::Success
+        }
     } else if sum <= target - 3 {
         Grade::StrongFailure
     } else {
@@ -317,12 +325,21 @@ pub fn roll_once(
             let [a, b] = dice;
             let total = u16::from(a) + u16::from(b);
             let success = is_success_2d6(dice, target);
-            (vec![a, b], total, success, grade_2d6(total, target, success))
+            (
+                vec![a, b],
+                total,
+                success,
+                grade_2d6(total, target, success),
+            )
         }
         DiceSystem::D100 => {
             let value = roll_d100(seed);
             let success = value <= target;
-            let grade = if success { Grade::Success } else { Grade::Failure };
+            let grade = if success {
+                Grade::Success
+            } else {
+                Grade::Failure
+            };
             (vec![value], u16::from(value), success, grade)
         }
     };
@@ -431,12 +448,32 @@ pub fn resolve_conflict(
     let mut rolls = Vec::new();
     let mut last: Option<(DiceRoll, DiceRoll)> = None;
     for attempt in 0..CONFLICT_CAP {
-        let a = roll_once(master_seed, round, RollKind::Conflict, id_a, attempt, DiceSystem::TwoD6, target_a);
-        let b = roll_once(master_seed, round, RollKind::Conflict, id_b, attempt, DiceSystem::TwoD6, target_b);
+        let a = roll_once(
+            master_seed,
+            round,
+            RollKind::Conflict,
+            id_a,
+            attempt,
+            DiceSystem::TwoD6,
+            target_a,
+        );
+        let b = roll_once(
+            master_seed,
+            round,
+            RollKind::Conflict,
+            id_b,
+            attempt,
+            DiceSystem::TwoD6,
+            target_b,
+        );
         rolls.push(a.clone());
         rolls.push(b.clone());
         if a.success != b.success {
-            let (winner, loser) = if a.success { (id_a, id_b) } else { (id_b, id_a) };
+            let (winner, loser) = if a.success {
+                (id_a, id_b)
+            } else {
+                (id_b, id_a)
+            };
             return ConflictOutcome {
                 winner: winner.to_owned(),
                 loser: loser.to_owned(),
@@ -456,7 +493,11 @@ pub fn resolve_conflict(
         ),
         None => (0, 0, 0),
     };
-    let (winner, loser) = if margin_b > margin_a { (id_b, id_a) } else { (id_a, id_b) };
+    let (winner, loser) = if margin_b > margin_a {
+        (id_b, id_a)
+    } else {
+        (id_a, id_b)
+    };
     ConflictOutcome {
         winner: winner.to_owned(),
         loser: loser.to_owned(),
@@ -519,10 +560,22 @@ mod tests {
 
     #[test]
     fn invalid_weights_and_modifier_are_rejected() {
-        assert!(matches!(net_value(&[3], &[], 0), Err(MatrixError::Contract(_))));
-        assert!(matches!(net_value(&[1], &[5], 0), Err(MatrixError::Contract(_))));
-        assert!(matches!(net_value(&[1], &[], 3), Err(MatrixError::Contract(_))));
-        assert!(matches!(net_value(&[1], &[], -3), Err(MatrixError::Contract(_))));
+        assert!(matches!(
+            net_value(&[3], &[], 0),
+            Err(MatrixError::Contract(_))
+        ));
+        assert!(matches!(
+            net_value(&[1], &[5], 0),
+            Err(MatrixError::Contract(_))
+        ));
+        assert!(matches!(
+            net_value(&[1], &[], 3),
+            Err(MatrixError::Contract(_))
+        ));
+        assert!(matches!(
+            net_value(&[1], &[], -3),
+            Err(MatrixError::Contract(_))
+        ));
     }
 
     #[test]
@@ -600,7 +653,10 @@ mod tests {
     fn seed_components_all_matter() {
         let m = master(2);
         let base = sub_seed(&m, 1, RollKind::Argument, "r1-a1", 0);
-        assert_ne!(base, sub_seed(&master(3), 1, RollKind::Argument, "r1-a1", 0));
+        assert_ne!(
+            base,
+            sub_seed(&master(3), 1, RollKind::Argument, "r1-a1", 0)
+        );
         assert_ne!(base, sub_seed(&m, 2, RollKind::Argument, "r1-a1", 0));
         assert_ne!(base, sub_seed(&m, 1, RollKind::Conflict, "r1-a1", 0));
         assert_ne!(base, sub_seed(&m, 1, RollKind::Argument, "r1-a2", 0));
@@ -668,10 +724,26 @@ mod tests {
             if first.success {
                 continue;
             }
-            let without = resolve_roll(&m, 1, RollKind::Argument, "r1-a1", DiceSystem::TwoD6, 11, false);
+            let without = resolve_roll(
+                &m,
+                1,
+                RollKind::Argument,
+                "r1-a1",
+                DiceSystem::TwoD6,
+                11,
+                false,
+            );
             assert_eq!(without.rolls.len(), 1);
             assert!(!without.used_fail_chit);
-            let with = resolve_roll(&m, 1, RollKind::Argument, "r1-a1", DiceSystem::TwoD6, 11, true);
+            let with = resolve_roll(
+                &m,
+                1,
+                RollKind::Argument,
+                "r1-a1",
+                DiceSystem::TwoD6,
+                11,
+                true,
+            );
             assert_eq!(with.rolls.len(), 2);
             assert!(with.used_fail_chit);
             assert_eq!(with.rolls.get(1).map(|r| r.attempt), Some(1));

@@ -205,7 +205,10 @@ mod tests {
         let value = json!({"b": 1, "a": [true, "x"]});
         assert_eq!(canonical_json(&value)?, r#"{"a":[true,"x"],"b":1}"#);
         let nested = json!({"z": {"y": 1, "x": null}, "a": "ä"});
-        assert_eq!(canonical_json(&nested)?, r#"{"a":"ä","z":{"x":null,"y":1}}"#);
+        assert_eq!(
+            canonical_json(&nested)?,
+            r#"{"a":"ä","z":{"x":null,"y":1}}"#
+        );
         Ok(())
     }
 

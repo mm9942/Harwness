@@ -14,14 +14,14 @@
 //!   registriert (z. B. via `inventory::submit!` durch Extension-Crate).
 //!
 //! # Op-Set
-//! **Grundausstattung** ([`register_all`], 42 Ops): `help`, `status`, `quit`,
+//! **Grundausstattung** ([`register_all`], 43 Ops): `help`, `status`, `quit`,
 //! `new`, `work`, `ps`, `attach`, `stop`, `diff`, `agent`, `skills`, `plugins`,
 //! `model`, `provider`, `uia-model`, `uia-provider`, `permissions`, `compact`,
 //! `memory`, `effort`, `mode`, `context-proposal`, `approval.pending`,
 //! `approval.resolve`, `add-workdir`, `export`, `usage`, `bug-report`,
 //! `approve`, `deny`, `review`, `cancel`, `retry`, `provider-concurrency`,
 //! `uia-worker-model`, `uia-effort`, `sandbox-lease`, `models`, `workbench`,
-//! `kanban`, `diary`, `palace`.
+//! `kanban`, `diary`, `palace`, `dream`.
 //! `uia-worker-model` (Welle 2, harw-ops/src/model.rs) und `uia-effort`
 //! (harw-ops/src/effort.rs) waren implementiert, aber bis zu diesem Knoten
 //! nicht in `register_all` eingetragen — dadurch existierten `/uia-worker-model`
@@ -163,6 +163,7 @@ pub mod context_proposal;
 pub mod deny;
 pub mod diary;
 pub mod diff;
+pub mod dream;
 pub mod effort;
 pub mod explore;
 pub mod export;
@@ -243,7 +244,7 @@ fn compact_unavailable_output() -> OpOutput {
     OpOutput::from(crate::compact::COMPACT_HINT.to_owned())
 }
 
-/// Registriert alle 42 in dieser Crate definierten Kern-Operationen in der Registry.
+/// Registriert alle 43 in dieser Crate definierten Kern-Operationen in der Registry.
 ///
 /// # Beschreibung
 /// Fügt der übergebenen [`OperationRegistry`] eine `Arc<dyn Operation>`-Instanz
@@ -253,7 +254,7 @@ fn compact_unavailable_output() -> OpOutput {
 /// memory, effort, mode, context-proposal, approval.pending, approval.resolve,
 /// add-workdir, export, usage, bug-report, approve, deny, review, cancel, retry,
 /// provider-concurrency, uia-worker-model, uia-effort, sandbox-lease, models,
-/// workbench, kanban, diary, palace`.
+/// workbench, kanban, diary, palace, dream`.
 ///
 /// Die Reihenfolge steuert nur die `iter()`-Reihenfolge und den Fallback-Namens-
 /// Vorschlag; die eigentliche Auflösung erfolgt über `find_by_name` /
@@ -273,7 +274,7 @@ fn compact_unavailable_output() -> OpOutput {
 ///
 /// let mut registry = OperationRegistry::new();
 /// harw_ops::register_all(&mut registry);
-/// assert_eq!(registry.len(), 42);
+/// assert_eq!(registry.len(), 43);
 /// assert!(registry.find_by_name("help").is_some());
 /// assert!(registry.find_by_command("/uia-provider").is_some());
 /// assert!(registry.find_by_command("/uia-model").is_some());
@@ -300,9 +301,10 @@ fn compact_unavailable_output() -> OpOutput {
 /// assert!(registry.find_by_command("/kanban").is_some());
 /// assert!(registry.find_by_command("/diary").is_some());
 /// assert!(registry.find_by_command("/palace").is_some());
+/// assert!(registry.find_by_command("/dream").is_some());
 /// ```
 pub fn register_all(registry: &mut OperationRegistry) {
-    let ops: [Arc<dyn Operation>; 42] = [
+    let ops: [Arc<dyn Operation>; 43] = [
         Arc::new(help::HelpOperation),
         Arc::new(status::StatusOperation),
         Arc::new(quit::QuitOperation),
@@ -391,13 +393,14 @@ pub fn register_all(registry: &mut OperationRegistry) {
         // interne Stellen) — Katalog-/Konfigurationsfläche wie `model` oben,
         // Grundausstattung statt Planungsfläche.
         Arc::new(models::ModelsOperation),
-        // Wissensfläche (`workbench`, `kanban`, `diary`, `palace`): Operator-
+        // Wissensfläche (`workbench`, `kanban`, `diary`, `palace`, `dream`): Operator-
         // Befehle auf dem Knowledge-Store der Session, unabhängig vom
         // `[tools.plan]`-Gate.
         Arc::new(workbench::WorkbenchOperation),
         Arc::new(kanban::KanbanOperation),
         Arc::new(diary::DiaryOperation),
         Arc::new(palace::PalaceOperation),
+        Arc::new(dream::DreamOperation),
     ];
     for op in ops {
         registry.register(op);
@@ -717,10 +720,10 @@ mod tests {
     }
 
     #[test]
-    fn register_all_adds_forty_two_operations() {
+    fn register_all_adds_forty_three_operations() {
         let mut reg = OperationRegistry::new();
         register_all(&mut reg);
-        assert_eq!(reg.len(), 42);
+        assert_eq!(reg.len(), 43);
     }
 
     #[test]
@@ -816,6 +819,7 @@ mod tests {
             "/kanban",
             "/diary",
             "/palace",
+            "/dream",
         ] {
             assert!(
                 reg.find_by_command(path).is_some(),
@@ -927,6 +931,7 @@ mod tests {
             "kanban",
             "diary",
             "palace",
+            "dream",
             "plan",
             "goal",
             "explore",
@@ -976,8 +981,8 @@ mod tests {
         register_all(&mut reg);
         assert_eq!(
             reg.len(),
-            42,
-            "first register_all must produce exactly 42 ops"
+            43,
+            "first register_all must produce exactly 43 ops"
         );
 
         // Attempt to register HelpOperation a second time via the fallible path.
@@ -991,8 +996,8 @@ mod tests {
         // Registry must not have grown — the rejected op was not inserted.
         assert_eq!(
             reg.len(),
-            42,
-            "registry must stay at 42 after a rejected duplicate"
+            43,
+            "registry must stay at 43 after a rejected duplicate"
         );
     }
 }

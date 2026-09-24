@@ -122,12 +122,14 @@ pub enum MatrixGameEvent {
 pub fn events_for_entry(entry: &GameEntry) -> Vec<MatrixGameEvent> {
     let round = entry.round;
     let audience = entry.audience.clone();
-    let message = |from: Option<Seat>, channel: Option<String>, text: String| MatrixGameEvent::MessagePosted {
-        round,
-        audience: audience.clone(),
-        from,
-        channel,
-        text,
+    let message = |from: Option<Seat>, channel: Option<String>, text: String| {
+        MatrixGameEvent::MessagePosted {
+            round,
+            audience: audience.clone(),
+            from,
+            channel,
+            text,
+        }
     };
     match &entry.kind {
         EntryKind::PhaseEntered { phase } => {
@@ -159,7 +161,10 @@ pub fn events_for_entry(entry: &GameEntry) -> Vec<MatrixGameEvent> {
             ),
         ],
         EntryKind::NegotiationPosted {
-            channel, from, text, ..
+            channel,
+            from,
+            text,
+            ..
         } => vec![message(
             Some(Seat::Player(from.clone())),
             Some(channel.clone()),
@@ -256,7 +261,10 @@ mod tests {
         let (_, log) = scripted_game(&[31u8; 32], &["rat", "gilde", "nord", "mission"])?;
         let events = events_for_journal(&log.journal);
         let has = |pred: &dyn Fn(&MatrixGameEvent) -> bool| events.iter().any(pred);
-        assert!(has(&|e| matches!(e, MatrixGameEvent::RoundStarted { round: 1 })));
+        assert!(has(&|e| matches!(
+            e,
+            MatrixGameEvent::RoundStarted { round: 1 }
+        )));
         assert!(has(&|e| matches!(e, MatrixGameEvent::PhaseEntered { .. })));
         assert!(has(&|e| matches!(e, MatrixGameEvent::ChannelOpened { .. })));
         assert!(has(&|e| matches!(
@@ -266,11 +274,17 @@ mod tests {
                 ..
             }
         )));
-        assert!(has(&|e| matches!(e, MatrixGameEvent::ActionSubmitted { .. })));
+        assert!(has(&|e| matches!(
+            e,
+            MatrixGameEvent::ActionSubmitted { .. }
+        )));
         assert!(has(&|e| matches!(e, MatrixGameEvent::DiceRolled { .. })));
         assert!(has(&|e| matches!(e, MatrixGameEvent::Adjudicated { .. })));
         assert!(has(&|e| matches!(e, MatrixGameEvent::WorldChanged { .. })));
-        assert!(has(&|e| matches!(e, MatrixGameEvent::SecretRevealed { verified: true, .. })));
+        assert!(has(&|e| matches!(
+            e,
+            MatrixGameEvent::SecretRevealed { verified: true, .. }
+        )));
         assert!(has(&|e| matches!(e, MatrixGameEvent::GameEnded { .. })));
         // JSON-Roundtrip für die TUI-Anbindung
         for e in &events {

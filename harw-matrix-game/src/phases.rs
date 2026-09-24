@@ -23,7 +23,7 @@ use crate::scenario::{
 };
 use crate::state::{
     Audience, AudienceSpec, EntryKind, GameEntry, GameLog, GameState, Ongoing, PlayerId,
-    RevealedBy, SecretRecord, Seat, VarValue, WorldVar,
+    RevealedBy, Seat, SecretRecord, VarValue, WorldVar,
 };
 
 // ---------------------------------------------------------------------------
@@ -761,7 +761,9 @@ pub fn validate_player_argument(
             .is_some_and(|c| c.has_member(player));
         if !own {
             // Existenz fremder Kanäle wird nicht bestätigt.
-            errors.push(format!("cites_negotiation: `{channel}` ist kein eigener Kanal"));
+            errors.push(format!(
+                "cites_negotiation: `{channel}` ist kein eigener Kanal"
+            ));
         }
     }
     if let Some(target) = &argument.conflict_target {
@@ -801,8 +803,13 @@ pub fn validate_counter_argument(
     let mut seen = BTreeSet::new();
     for (i, entry) in counter.counters.iter().enumerate() {
         let label = format!("counters[{i}] ({})", entry.argument_id);
-        match args.iter().find(|a| a.id == entry.argument_id && !a.is_secret()) {
-            None => errors.push(format!("{label}: unbekanntes oder nicht öffentliches Argument")),
+        match args
+            .iter()
+            .find(|a| a.id == entry.argument_id && !a.is_secret())
+        {
+            None => errors.push(format!(
+                "{label}: unbekanntes oder nicht öffentliches Argument"
+            )),
             Some(a) if &a.seat == player => errors.push(format!("{label}: eigenes Argument")),
             Some(_) => {}
         }
@@ -816,7 +823,12 @@ pub fn validate_counter_argument(
             if con.trim().is_empty() {
                 errors.push(format!("{label}: cons[{j}] leer"));
             }
-            check_len(con, MAX_REASON_CHARS, &format!("{label}: cons[{j}]"), &mut errors);
+            check_len(
+                con,
+                MAX_REASON_CHARS,
+                &format!("{label}: cons[{j}]"),
+                &mut errors,
+            );
         }
     }
     contract_result(errors)
@@ -856,7 +868,12 @@ pub fn validate_negotiation_request(
         if r.opening.trim().is_empty() {
             errors.push(format!("requests[{i}]: opening leer"));
         }
-        check_len(&r.opening, n.max_message_chars, &format!("requests[{i}].opening"), &mut errors);
+        check_len(
+            &r.opening,
+            n.max_message_chars,
+            &format!("requests[{i}].opening"),
+            &mut errors,
+        );
     }
     contract_result(errors)
 }
@@ -879,10 +896,16 @@ pub fn validate_negotiation_messages(
             .get(&m.channel)
             .is_some_and(|c| c.has_member(player));
         if !own {
-            errors.push(format!("messages[{i}]: `{}` ist kein eigener Kanal", m.channel));
+            errors.push(format!(
+                "messages[{i}]: `{}` ist kein eigener Kanal",
+                m.channel
+            ));
         }
         if !seen.insert(m.channel.as_str()) {
-            errors.push(format!("messages[{i}]: mehrere Nachrichten für `{}`", m.channel));
+            errors.push(format!(
+                "messages[{i}]: mehrere Nachrichten für `{}`",
+                m.channel
+            ));
         }
         if m.text.trim().is_empty() && !m.decline && m.accept.is_none() {
             errors.push(format!("messages[{i}]: text leer"));
@@ -913,17 +936,25 @@ fn validate_ruling(
         ));
     }
     if ruling.context_modifier != 0 && blank(ruling.context_reason.as_deref()) {
-        errors.push(format!("{label}: context_reason ist bei Modifikator ≠ 0 Pflicht"));
+        errors.push(format!(
+            "{label}: context_reason ist bei Modifikator ≠ 0 Pflicht"
+        ));
     }
     let cons: Vec<u8> = if arg.is_secret() {
         if !ruling.con_weights.is_empty() {
-            errors.push(format!("{label}: geheimes Argument — con_weights müssen leer sein, umpire_cons verwenden"));
+            errors.push(format!(
+                "{label}: geheimes Argument — con_weights müssen leer sein, umpire_cons verwenden"
+            ));
         }
         if ruling.public_rationale.is_some() {
-            errors.push(format!("{label}: geheimes Argument — public_rationale muss null sein"));
+            errors.push(format!(
+                "{label}: geheimes Argument — public_rationale muss null sein"
+            ));
         }
         if ruling.verdict == Verdict::Veto && blank(ruling.private_notes.as_deref()) {
-            errors.push(format!("{label}: Veto eines geheimen Arguments braucht private_notes"));
+            errors.push(format!(
+                "{label}: Veto eines geheimen Arguments braucht private_notes"
+            ));
         }
         for (i, c) in ruling.umpire_cons.iter().enumerate() {
             if c.text.trim().is_empty() {
@@ -948,7 +979,9 @@ fn validate_ruling(
         }
         for (player, cons) in &arg.counters {
             if !cons.is_empty() && !ruling.con_weights.contains_key(player.as_str()) {
-                errors.push(format!("{label}: Gewichte für Contras von `{player}` fehlen"));
+                errors.push(format!(
+                    "{label}: Gewichte für Contras von `{player}` fehlen"
+                ));
             }
         }
         if ruling.verdict == Verdict::Veto && blank(ruling.public_rationale.as_deref()) {
@@ -972,7 +1005,10 @@ fn validate_ruling(
     }
     match rules.adjudication {
         AdjudicationSystem::EstimativeD100 => {
-            if !ruling.probability.is_some_and(|p| dice::LADDER.contains(&p)) {
+            if !ruling
+                .probability
+                .is_some_and(|p| dice::LADDER.contains(&p))
+            {
                 errors.push(format!(
                     "{label}: probability muss eine Leiterstufe sein ({:?})",
                     dice::LADDER
@@ -986,15 +1022,24 @@ fn validate_ruling(
         }
     }
     if ruling.inconsistent_with.as_deref() == Some(arg.id.as_str()) {
-        errors.push(format!("{label}: inconsistent_with verweist auf sich selbst"));
+        errors.push(format!(
+            "{label}: inconsistent_with verweist auf sich selbst"
+        ));
     }
     if let Some(secret) = &ruling.triggers_secret {
         if !state.secrets.get(secret).is_some_and(|s| !s.revealed) {
-            errors.push(format!("{label}: triggers_secret `{secret}` unbekannt oder offen"));
+            errors.push(format!(
+                "{label}: triggers_secret `{secret}` unbekannt oder offen"
+            ));
         }
     }
     if let Some(text) = &ruling.public_rationale {
-        check_len(text, MAX_NOTE_CHARS, &format!("{label}: public_rationale"), errors);
+        check_len(
+            text,
+            MAX_NOTE_CHARS,
+            &format!("{label}: public_rationale"),
+            errors,
+        );
     }
     let owner = arg.is_secret().then(|| arg.seat.clone());
     let ctx = EffectContext::for_state(state, rules, arg.audience(), owner);
@@ -1243,7 +1288,11 @@ struct Scratch {
     reveals: Vec<String>,
 }
 
-fn secret_guard(ctx: &EffectContext<'_>, var: &WorldVar, visibility: &VarVisibility) -> Result<(), String> {
+fn secret_guard(
+    ctx: &EffectContext<'_>,
+    var: &WorldVar,
+    visibility: &VarVisibility,
+) -> Result<(), String> {
     if let Some(owner) = &ctx.secret_owner {
         let ok = match visibility {
             VarVisibility::Umpire => true,
@@ -1298,7 +1347,14 @@ impl Scratch {
             .ok_or_else(|| format!("unbekannte Variable `{id}`"))
     }
 
-    fn change(&mut self, round: u32, before: &WorldVar, to: VarValue, cause: &str, out: &mut Vec<GameEntry>) {
+    fn change(
+        &mut self,
+        round: u32,
+        before: &WorldVar,
+        to: VarValue,
+        cause: &str,
+        out: &mut Vec<GameEntry>,
+    ) {
         out.extend(delta_entries(round, before, &to, cause));
         if let Some(v) = self.vars.get_mut(&before.id) {
             v.value = to;
@@ -1351,11 +1407,7 @@ impl Scratch {
             }
             EffectOp::Set { var, value } => {
                 let current = self.var(var)?;
-                let VarValue::State {
-                    value: old,
-                    values,
-                } = &current.value
-                else {
+                let VarValue::State { value: old, values } = &current.value else {
                     return Err(format!("`{var}` ist kein State"));
                 };
                 if !values.contains(value) {
@@ -1417,7 +1469,9 @@ impl Scratch {
                 for (i, inner) in each_round.iter().enumerate() {
                     if matches!(
                         inner,
-                        EffectOp::Ongoing { .. } | EffectOp::StopOngoing { .. } | EffectOp::RevealSecret { .. }
+                        EffectOp::Ongoing { .. }
+                            | EffectOp::StopOngoing { .. }
+                            | EffectOp::RevealSecret { .. }
                     ) {
                         return Err(format!("each_round[{i}]: `{}` nicht erlaubt", inner.name()));
                     }
@@ -1529,7 +1583,9 @@ impl Scratch {
                     return Err(format!("`{object}` ist kein Objekt"));
                 };
                 if hidden {
-                    return Err(format!("`{object}` ist verdeckt — erst discover, dann breach"));
+                    return Err(format!(
+                        "`{object}` ist verdeckt — erst discover, dann breach"
+                    ));
                 }
                 if protection == 0 {
                     return Err(format!("`{object}` hat keine Schutzstufe mehr"));
@@ -1552,7 +1608,9 @@ impl Scratch {
                     return Err("reveal_secret nicht in each_round".to_owned());
                 }
                 if !ctx.secrets.get(secret_id).is_some_and(|s| !s.revealed) {
-                    return Err(format!("Geheimnis `{secret_id}` unbekannt oder bereits offen"));
+                    return Err(format!(
+                        "Geheimnis `{secret_id}` unbekannt oder bereits offen"
+                    ));
                 }
                 if !self.reveals.contains(secret_id) {
                     self.reveals.push(secret_id.clone());
@@ -1567,7 +1625,12 @@ impl Scratch {
 /// ungültige zu [`EffectViolation`]s (sie werden verworfen, nicht teilweise
 /// angewendet). Tracks werden auf `[min, max]` geklemmt.
 #[must_use]
-pub fn plan_effects(ctx: &EffectContext<'_>, round: u32, ops: &[EffectOp], cause: &str) -> EffectPlan {
+pub fn plan_effects(
+    ctx: &EffectContext<'_>,
+    round: u32,
+    ops: &[EffectOp],
+    cause: &str,
+) -> EffectPlan {
     let mut scratch = Scratch::new(ctx);
     let mut plan = EffectPlan::default();
     for (index, op) in ops.iter().enumerate() {
@@ -1717,7 +1780,11 @@ pub fn open_game(
     )];
     for var in scenario.initial_vars() {
         for audience in var.visibility.audiences() {
-            entries.push(GameEntry::new(0, audience, EntryKind::VarDeclared { var: var.clone() }));
+            entries.push(GameEntry::new(
+                0,
+                audience,
+                EntryKind::VarDeclared { var: var.clone() },
+            ));
         }
     }
     let situation = scenario.public_situation();
@@ -1757,7 +1824,9 @@ pub fn open_game(
     entries.push(GameEntry::new(
         0,
         Audience::Public,
-        EntryKind::PhaseEntered { phase: Phase::Setup },
+        EntryKind::PhaseEntered {
+            phase: Phase::Setup,
+        },
     ));
     log.record_all(entries, at)?;
     Ok(log)
@@ -1767,7 +1836,11 @@ pub fn open_game(
 ///
 /// # Errors
 /// Zustandsfehler.
-pub fn enter_phase(log: &mut GameLog, cursor: RoundCursor, at: Option<Timestamp>) -> MatrixResult<()> {
+pub fn enter_phase(
+    log: &mut GameLog,
+    cursor: RoundCursor,
+    at: Option<Timestamp>,
+) -> MatrixResult<()> {
     log.record(
         GameEntry::new(
             cursor.round,
@@ -1842,7 +1915,9 @@ pub fn open_channels(
     let players = log.state.players.clone();
     let mut opened = Vec::new();
     for player in &players {
-        let Some(request) = requests.get(player) else { continue };
+        let Some(request) = requests.get(player) else {
+            continue;
+        };
         for r in &request.requests {
             let to = PlayerId::new(r.to.as_str());
             if &to == player || !players.contains(&to) {
@@ -1897,7 +1972,9 @@ pub fn post_messages(
             .get(&m.channel)
             .filter(|c| c.has_member(player))
             .cloned()
-            .ok_or_else(|| MatrixError::State(format!("`{}` ist kein Kanal von `{player}`", m.channel)))?;
+            .ok_or_else(|| {
+                MatrixError::State(format!("`{}` ist kein Kanal von `{player}`", m.channel))
+            })?;
         let [a, b] = channel.members;
         log.record(
             GameEntry::new(
@@ -2142,7 +2219,9 @@ pub fn resolve_argument(
                 .probability
                 .filter(|p| dice::LADDER.contains(p))
                 .ok_or_else(|| {
-                    MatrixError::Contract(vec!["probability fehlt oder liegt nicht auf der Leiter".to_owned()])
+                    MatrixError::Contract(vec![
+                        "probability fehlt oder liegt nicht auf der Leiter".to_owned(),
+                    ])
                 })?;
             (DiceSystem::D100, p, p)
         }
@@ -2177,7 +2256,9 @@ pub fn resolve_argument(
     }
     let (outcome, grade, fail_chit_delta) = match ruling.verdict {
         Verdict::Veto => (Outcome::Vetoed, None, 0),
-        Verdict::NoRoll if dice::auto_success_allowed(net, rules) => (Outcome::AutoSuccess, None, 0),
+        Verdict::NoRoll if dice::auto_success_allowed(net, rules) => {
+            (Outcome::AutoSuccess, None, 0)
+        }
         Verdict::NoRoll | Verdict::Roll => {
             let chit_available = rules.fail_chits
                 && arg.body.use_fail_chit_if_failed
@@ -2193,8 +2274,12 @@ pub fn resolve_argument(
             );
             for roll in &resolved.rolls {
                 entries.push(
-                    GameEntry::new(round, result_audience.clone(), EntryKind::DiceRolled { roll: roll.clone() })
-                        .with_secret(secret.clone()),
+                    GameEntry::new(
+                        round,
+                        result_audience.clone(),
+                        EntryKind::DiceRolled { roll: roll.clone() },
+                    )
+                    .with_secret(secret.clone()),
                 );
             }
             let mut delta = 0;
@@ -2295,7 +2380,10 @@ pub fn reveal_secret(
             _ => None,
         })
         .ok_or_else(|| {
-            MatrixError::State(format!("Inhalt von `{}` fehlt im Journal", record.argument_id))
+            MatrixError::State(format!(
+                "Inhalt von `{}` fehlt im Journal",
+                record.argument_id
+            ))
         })?;
     let master = log.state.master_seed()?;
     let salt = Salt::derive(&master, &record.argument_id);
@@ -2356,7 +2444,11 @@ pub fn record_narration(
             at,
         )?;
     }
-    if let Some(summary) = narration.round_summary.as_ref().filter(|s| !s.trim().is_empty()) {
+    if let Some(summary) = narration
+        .round_summary
+        .as_ref()
+        .filter(|s| !s.trim().is_empty())
+    {
         log.record(
             GameEntry::new(
                 round,
@@ -2376,14 +2468,22 @@ pub fn record_narration(
 ///
 /// # Errors
 /// Zustandsfehler.
-pub fn record_standing(log: &mut GameLog, standing: &[String], at: Option<Timestamp>) -> MatrixResult<()> {
+pub fn record_standing(
+    log: &mut GameLog,
+    standing: &[String],
+    at: Option<Timestamp>,
+) -> MatrixResult<()> {
     if standing.is_empty() {
         return Ok(());
     }
     let order = standing.iter().map(|s| PlayerId::new(s.as_str())).collect();
     let round = log.state.round;
     log.record(
-        GameEntry::new(round, Audience::UmpireOnly, EntryKind::StandingSet { order }),
+        GameEntry::new(
+            round,
+            Audience::UmpireOnly,
+            EntryKind::StandingSet { order },
+        ),
         at,
     )?;
     Ok(())
@@ -2418,7 +2518,11 @@ pub fn apply_inject(
     let widest = if inject.audiences.iter().any(Audience::is_public) {
         Audience::Public
     } else {
-        inject.audiences.first().cloned().unwrap_or(Audience::UmpireOnly)
+        inject
+            .audiences
+            .first()
+            .cloned()
+            .unwrap_or(Audience::UmpireOnly)
     };
     let plan = {
         let ctx = EffectContext::for_state(&log.state, rules, widest, None);
@@ -2444,7 +2548,11 @@ pub fn apply_inject(
 ///
 /// # Errors
 /// Zustandsfehler.
-pub fn close_round(log: &mut GameLog, rules: &Rules, at: Option<Timestamp>) -> MatrixResult<String> {
+pub fn close_round(
+    log: &mut GameLog,
+    rules: &Rules,
+    at: Option<Timestamp>,
+) -> MatrixResult<String> {
     let round = log.state.round;
     let ongoing: Vec<Ongoing> = log.state.ongoing.values().cloned().collect();
     for o in ongoing {
@@ -2570,7 +2678,10 @@ mod tests {
         let steps = walk(&cfg(false, false, true));
         assert!(!steps.iter().any(|(_, p)| *p == Phase::Verhandlung));
         assert!(!steps.iter().any(|(_, p)| *p == Phase::Gegenargumente));
-        assert_eq!(steps.iter().rev().nth(1).map(|s| s.1), Some(Phase::Schlussargumente));
+        assert_eq!(
+            steps.iter().rev().nth(1).map(|s| s.1),
+            Some(Phase::Schlussargumente)
+        );
         assert_eq!(steps.last().map(|s| s.1), Some(Phase::Aar));
     }
 
@@ -2580,7 +2691,10 @@ mod tests {
             round: 1,
             phase: Phase::Argumente,
         };
-        assert_eq!(c.end_early(&cfg(true, true, false)).map(|c| c.phase), Some(Phase::Aar));
+        assert_eq!(
+            c.end_early(&cfg(true, true, false)).map(|c| c.phase),
+            Some(Phase::Aar)
+        );
         assert_eq!(
             c.end_early(&cfg(true, true, true)).map(|c| c.phase),
             Some(Phase::Schlussargumente)
@@ -2589,18 +2703,47 @@ mod tests {
 
     #[test]
     fn expected_calls_per_phase() {
-        let players: Vec<PlayerId> = ["a", "b", "c", "d"].into_iter().map(PlayerId::new).collect();
+        let players: Vec<PlayerId> = ["a", "b", "c", "d"]
+            .into_iter()
+            .map(PlayerId::new)
+            .collect();
         let rules = Rules::default();
-        let members: BTreeSet<PlayerId> = [PlayerId::new("b"), PlayerId::new("d")].into_iter().collect();
-        assert_eq!(expected_calls(Phase::Briefing, PhaseStep::Main, &players, &members, &rules).len(), 5);
-        let exchange = expected_calls(Phase::Verhandlung, PhaseStep::Exchange(1), &players, &members, &rules);
+        let members: BTreeSet<PlayerId> = [PlayerId::new("b"), PlayerId::new("d")]
+            .into_iter()
+            .collect();
+        assert_eq!(
+            expected_calls(Phase::Briefing, PhaseStep::Main, &players, &members, &rules).len(),
+            5
+        );
+        let exchange = expected_calls(
+            Phase::Verhandlung,
+            PhaseStep::Exchange(1),
+            &players,
+            &members,
+            &rules,
+        );
         assert_eq!(
             exchange.iter().map(|c| c.seat.clone()).collect::<Vec<_>>(),
             vec![Seat::player("b"), Seat::player("d")]
         );
-        assert!(expected_calls(Phase::Rundenende, PhaseStep::Main, &players, &members, &rules).is_empty());
+        assert!(
+            expected_calls(
+                Phase::Rundenende,
+                PhaseStep::Main,
+                &players,
+                &members,
+                &rules
+            )
+            .is_empty()
+        );
         assert_eq!(
-            expected_calls(Phase::Adjudikation, PhaseStep::Main, &players, &members, &rules),
+            expected_calls(
+                Phase::Adjudikation,
+                PhaseStep::Main,
+                &players,
+                &members,
+                &rules
+            ),
             vec![ExpectedCall {
                 seat: Seat::Umpire,
                 contract: ContractKind::UmpireAdjudication
@@ -2610,7 +2753,16 @@ mod tests {
             argument_system: ArgumentSystem::ThreeReasons,
             ..Rules::default()
         };
-        assert!(expected_calls(Phase::Gegenargumente, PhaseStep::Main, &players, &members, &three).is_empty());
+        assert!(
+            expected_calls(
+                Phase::Gegenargumente,
+                PhaseStep::Main,
+                &players,
+                &members,
+                &three
+            )
+            .is_empty()
+        );
     }
 
     #[test]
@@ -2678,10 +2830,17 @@ mod tests {
 
     #[test]
     fn contracts_deny_unknown_fields() {
-        assert!(parse_contract::<PlayerArgument>(r#"{"action":"x","pros":["a"],"extra":1}"#).is_err());
-        assert!(parse_contract::<EffectOp>(r#"{"op":"add","var":"x","by":1,"sneaky":true}"#).is_err());
+        assert!(
+            parse_contract::<PlayerArgument>(r#"{"action":"x","pros":["a"],"extra":1}"#).is_err()
+        );
+        assert!(
+            parse_contract::<EffectOp>(r#"{"op":"add","var":"x","by":1,"sneaky":true}"#).is_err()
+        );
         assert!(parse_contract::<EffectOp>(r#"{"op":"teleport","var":"x"}"#).is_err());
-        assert!(parse_contract::<Narration>(r#"{"argument_id":"a","audience":"everyone","text":"x"}"#).is_err());
+        assert!(
+            parse_contract::<Narration>(r#"{"argument_id":"a","audience":"everyone","text":"x"}"#)
+                .is_err()
+        );
     }
 
     #[test]
@@ -2698,7 +2857,9 @@ mod tests {
     }
 
     fn ctx_for<'a>(log: &'a GameLog, rules: &'a Rules, owner: Option<&str>) -> EffectContext<'a> {
-        let audience = owner.map_or(Audience::Public, |o| Audience::SeatAndUmpire(PlayerId::new(o)));
+        let audience = owner.map_or(Audience::Public, |o| {
+            Audience::SeatAndUmpire(PlayerId::new(o))
+        });
         EffectContext::for_state(&log.state, rules, audience, owner.map(PlayerId::new))
     }
 
@@ -2708,49 +2869,130 @@ mod tests {
         let rules = loaded.scenario.rules();
         let ctx = ctx_for(&log, rules, None);
         let reasons = |ops: Vec<EffectOp>| -> Vec<String> {
-            validate_effects(&ctx, &ops).into_iter().map(|v| v.reason).collect()
+            validate_effects(&ctx, &ops)
+                .into_iter()
+                .map(|v| v.reason)
+                .collect()
         };
-        assert!(reasons(vec![EffectOp::Add { var: "water".into(), by: 1 }]).is_empty());
-        assert!(!reasons(vec![EffectOp::Add { var: "wasser".into(), by: 1 }]).is_empty());
-        assert!(!reasons(vec![EffectOp::Add { var: "water".into(), by: 2 }]).is_empty());
-        assert!(!reasons(vec![EffectOp::Add { var: "water".into(), by: 0 }]).is_empty());
+        assert!(
+            reasons(vec![EffectOp::Add {
+                var: "water".into(),
+                by: 1
+            }])
+            .is_empty()
+        );
+        assert!(
+            !reasons(vec![EffectOp::Add {
+                var: "wasser".into(),
+                by: 1
+            }])
+            .is_empty()
+        );
+        assert!(
+            !reasons(vec![EffectOp::Add {
+                var: "water".into(),
+                by: 2
+            }])
+            .is_empty()
+        );
+        assert!(
+            !reasons(vec![EffectOp::Add {
+                var: "water".into(),
+                by: 0
+            }])
+            .is_empty()
+        );
         // Summe je Argument zählt
         let r = reasons(vec![
-            EffectOp::Add { var: "water".into(), by: 1 },
-            EffectOp::Add { var: "water".into(), by: 1 },
+            EffectOp::Add {
+                var: "water".into(),
+                by: 1,
+            },
+            EffectOp::Add {
+                var: "water".into(),
+                by: 1,
+            },
         ]);
         assert_eq!(r.len(), 1);
-        assert!(!reasons(vec![EffectOp::Add { var: "plant_control".into(), by: 1 }]).is_empty());
-        assert!(reasons(vec![EffectOp::Set { var: "plant_control".into(), value: "gilde".into() }]).is_empty());
-        assert!(!reasons(vec![EffectOp::Set { var: "plant_control".into(), value: "piraten".into() }]).is_empty());
+        assert!(
+            !reasons(vec![EffectOp::Add {
+                var: "plant_control".into(),
+                by: 1
+            }])
+            .is_empty()
+        );
+        assert!(
+            reasons(vec![EffectOp::Set {
+                var: "plant_control".into(),
+                value: "gilde".into()
+            }])
+            .is_empty()
+        );
+        assert!(
+            !reasons(vec![EffectOp::Set {
+                var: "plant_control".into(),
+                value: "piraten".into()
+            }])
+            .is_empty()
+        );
         // Big Project: +1 je Argument
         let r = reasons(vec![
-            EffectOp::ProjectAdvance { id: "pipeline".into() },
-            EffectOp::ProjectAdvance { id: "pipeline".into() },
+            EffectOp::ProjectAdvance {
+                id: "pipeline".into(),
+            },
+            EffectOp::ProjectAdvance {
+                id: "pipeline".into(),
+            },
         ]);
         assert_eq!(r.len(), 1);
         // erst discover, dann breach
-        assert!(!reasons(vec![EffectOp::Breach { object: "reservoir_altmark".into() }]).is_empty());
-        assert!(reasons(vec![
-            EffectOp::Discover { object: "reservoir_altmark".into() },
-            EffectOp::Breach { object: "reservoir_altmark".into() },
-        ])
-        .is_empty());
+        assert!(
+            !reasons(vec![EffectOp::Breach {
+                object: "reservoir_altmark".into()
+            }])
+            .is_empty()
+        );
+        assert!(
+            reasons(vec![
+                EffectOp::Discover {
+                    object: "reservoir_altmark".into()
+                },
+                EffectOp::Breach {
+                    object: "reservoir_altmark".into()
+                },
+            ])
+            .is_empty()
+        );
         // ongoing: keine Verschachtelung, gültige inneren Ops
-        assert!(reasons(vec![EffectOp::Ongoing {
-            id: "streik".into(),
-            text: "Hafenstreik".into(),
-            each_round: vec![EffectOp::Add { var: "stability".into(), by: -1 }],
-        }])
-        .is_empty());
-        assert!(!reasons(vec![EffectOp::Ongoing {
-            id: "x".into(),
-            text: "x".into(),
-            each_round: vec![EffectOp::Add { var: "nix".into(), by: -1 }],
-        }])
-        .is_empty());
+        assert!(
+            reasons(vec![EffectOp::Ongoing {
+                id: "streik".into(),
+                text: "Hafenstreik".into(),
+                each_round: vec![EffectOp::Add {
+                    var: "stability".into(),
+                    by: -1
+                }],
+            }])
+            .is_empty()
+        );
+        assert!(
+            !reasons(vec![EffectOp::Ongoing {
+                id: "x".into(),
+                text: "x".into(),
+                each_round: vec![EffectOp::Add {
+                    var: "nix".into(),
+                    by: -1
+                }],
+            }])
+            .is_empty()
+        );
         assert!(!reasons(vec![EffectOp::StopOngoing { id: "nie".into() }]).is_empty());
-        assert!(!reasons(vec![EffectOp::RevealSecret { secret_id: "s9".into() }]).is_empty());
+        assert!(
+            !reasons(vec![EffectOp::RevealSecret {
+                secret_id: "s9".into()
+            }])
+            .is_empty()
+        );
         Ok(())
     }
 
@@ -2763,7 +3005,15 @@ mod tests {
         for _ in 0..5 {
             let plan = {
                 let ctx = EffectContext::for_state(&state, rules, Audience::Public, None);
-                plan_effects(&ctx, 1, &[EffectOp::Add { var: "stability".into(), by: 1 }], "t")
+                plan_effects(
+                    &ctx,
+                    1,
+                    &[EffectOp::Add {
+                        var: "stability".into(),
+                        by: 1,
+                    }],
+                    "t",
+                )
             };
             assert!(plan.violations.is_empty());
             for e in &plan.entries {
@@ -2771,7 +3021,14 @@ mod tests {
             }
         }
         let v = state.vars.get("stability").ok_or("stability fehlt")?;
-        assert_eq!(v.value, VarValue::Track { value: 3, min: -3, max: 3 });
+        assert_eq!(
+            v.value,
+            VarValue::Track {
+                value: 3,
+                min: -3,
+                max: 3
+            }
+        );
         Ok(())
     }
 
@@ -2780,24 +3037,67 @@ mod tests {
         let (loaded, log) = fresh_log()?;
         let rules = loaded.scenario.rules();
         let ctx = ctx_for(&log, rules, Some("gilde"));
-        assert!(validate_effects(&ctx, &[EffectOp::Add { var: "smuggling_net".into(), by: 1 }]).is_empty());
-        assert!(validate_effects(&ctx, &[EffectOp::Add { var: "plant_sabotage_risk".into(), by: 1 }]).is_empty());
-        assert!(!validate_effects(&ctx, &[EffectOp::Add { var: "water".into(), by: 1 }]).is_empty());
-        assert!(!validate_effects(&ctx, &[EffectOp::Add { var: "north_agents".into(), by: 1 }]).is_empty());
+        assert!(
+            validate_effects(
+                &ctx,
+                &[EffectOp::Add {
+                    var: "smuggling_net".into(),
+                    by: 1
+                }]
+            )
+            .is_empty()
+        );
+        assert!(
+            validate_effects(
+                &ctx,
+                &[EffectOp::Add {
+                    var: "plant_sabotage_risk".into(),
+                    by: 1
+                }]
+            )
+            .is_empty()
+        );
+        assert!(
+            !validate_effects(
+                &ctx,
+                &[EffectOp::Add {
+                    var: "water".into(),
+                    by: 1
+                }]
+            )
+            .is_empty()
+        );
+        assert!(
+            !validate_effects(
+                &ctx,
+                &[EffectOp::Add {
+                    var: "north_agents".into(),
+                    by: 1
+                }]
+            )
+            .is_empty()
+        );
         // Fakten nicht weiter als das Argument
-        assert!(!validate_effects(
-            &ctx,
-            &[EffectOp::Fact { text: "x".into(), audience: AudienceSpec(Audience::Public) }]
-        )
-        .is_empty());
-        assert!(validate_effects(
-            &ctx,
-            &[EffectOp::Fact {
-                text: "x".into(),
-                audience: AudienceSpec(Audience::Seat(PlayerId::new("gilde")))
-            }]
-        )
-        .is_empty());
+        assert!(
+            !validate_effects(
+                &ctx,
+                &[EffectOp::Fact {
+                    text: "x".into(),
+                    audience: AudienceSpec(Audience::Public)
+                }]
+            )
+            .is_empty()
+        );
+        assert!(
+            validate_effects(
+                &ctx,
+                &[EffectOp::Fact {
+                    text: "x".into(),
+                    audience: AudienceSpec(Audience::Seat(PlayerId::new("gilde")))
+                }]
+            )
+            .is_empty()
+        );
         Ok(())
     }
 
@@ -2822,7 +3122,9 @@ mod tests {
         bad.conflict_target = Some("gilde".into());
         bad.cites_negotiation = vec!["neg-deadbeef".into()];
         bad.project = Some("reservoir_altmark".into());
-        let Err(MatrixError::Contract(errs)) = validate_player_argument(&bad, &gilde, &log.state, rules, false) else {
+        let Err(MatrixError::Contract(errs)) =
+            validate_player_argument(&bad, &gilde, &log.state, rules, false)
+        else {
             return Err("erwartete Contract-Fehler".into());
         };
         assert_eq!(errs.len(), 4, "{errs:?}");
@@ -2845,8 +3147,14 @@ mod tests {
             private_note: None,
         };
         sealed.seal(PlayerId::new("rat"), arg.clone())?;
-        assert!(matches!(sealed.seal(PlayerId::new("rat"), arg), Err(MatrixError::Phase(_))));
-        assert!(matches!(sealed.forfeit(PlayerId::new("rat")), Err(MatrixError::Phase(_))));
+        assert!(matches!(
+            sealed.seal(PlayerId::new("rat"), arg),
+            Err(MatrixError::Phase(_))
+        ));
+        assert!(matches!(
+            sealed.forfeit(PlayerId::new("rat")),
+            Err(MatrixError::Phase(_))
+        ));
         sealed.forfeit(PlayerId::new("nord"))?;
         assert!(!sealed.is_complete(&[PlayerId::new("rat"), PlayerId::new("gilde")]));
         Ok(())
@@ -2855,7 +3163,14 @@ mod tests {
     #[test]
     fn reveal_requires_all_submissions() -> TestResult {
         let (loaded, mut log) = fresh_log()?;
-        enter_phase(&mut log, RoundCursor { round: 1, phase: Phase::Argumente }, None)?;
+        enter_phase(
+            &mut log,
+            RoundCursor {
+                round: 1,
+                phase: Phase::Argumente,
+            },
+            None,
+        )?;
         let mut sealed = ArgumentBox::new(1);
         sealed.forfeit(PlayerId::new("rat"))?;
         assert!(matches!(
@@ -2901,7 +3216,10 @@ mod tests {
         };
         text = format!("{}{}", &text[..pos], replaced);
         let tampered = crate::state::Journal::from_jsonl(&text)?;
-        assert!(matches!(replay(&loaded.scenario, &tampered), Err(MatrixError::Replay(_))));
+        assert!(matches!(
+            replay(&loaded.scenario, &tampered),
+            Err(MatrixError::Replay(_))
+        ));
 
         // Verdeckten Weltwert manipulieren, den kein Argument berührt →
         // state_hash am Rundenende weicht ab.
@@ -2912,7 +3230,10 @@ mod tests {
         }
         let changed = text.replacen(needle, &needle.replace("\"value\":1", "\"value\":2"), 1);
         let tampered = crate::state::Journal::from_jsonl(&changed)?;
-        assert!(matches!(replay(&loaded.scenario, &tampered), Err(MatrixError::Replay(_))));
+        assert!(matches!(
+            replay(&loaded.scenario, &tampered),
+            Err(MatrixError::Replay(_))
+        ));
         Ok(())
     }
 
@@ -2963,7 +3284,10 @@ mod tests {
         let mut subs = scripted_submissions();
         let arg = subs.remove(&gilde).ok_or("gilde fehlt")?;
         assert!(arg.secret);
-        assert!(validate_player_argument(&arg, &gilde, &log.state, loaded.scenario.rules(), false).is_err());
+        assert!(
+            validate_player_argument(&arg, &gilde, &log.state, loaded.scenario.rules(), false)
+                .is_err()
+        );
         Ok(())
     }
 
