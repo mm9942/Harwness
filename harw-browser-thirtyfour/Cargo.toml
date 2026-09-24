@@ -7,7 +7,7 @@ rust-version.workspace = true
 
 [dependencies]
 async-trait = "0.1.89"
-base64 = "0.22.1"
+base64 = "0.23.1"
 futures-util = "0.3.32"
 harw-browser = { path = "../harw-browser" }
 # Direct dependency only to build a proxy-free, non-redirecting WebDriver HTTP
