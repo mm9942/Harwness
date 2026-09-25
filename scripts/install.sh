@@ -1,355 +1,160 @@
-#!/bin/sh
-# Harwness installer — installs `harw`, `killer` and `harw-agent-runner` by building from
-# source or by downloading a prebuilt release tarball.
-#
-# Usage:
-#   curl -fsSL https://get.harw.dev/harw/install.sh | sh
-#   scripts/install.sh [--help]
-#   scripts/install.sh [--source]              # build from source (default when cargo is present)
-#   scripts/install.sh --binary [--version TAG] # download a prebuilt release tarball
-#
-# Modes:
-#   --source   Build all three binaries with the release profiles (needs
-#              a Rust toolchain). This is the default when `cargo` is on
-#              PATH. If `make` is also available, this delegates to
-#              `make install BINDIR=…` (the repo's single entry point,
-#              see the root Makefile) instead of calling cargo directly.
-#   --binary   Download a release tarball instead of building. This is the
-#              default when `cargo` is NOT on PATH and whenever the script
-#              does not run from a source checkout (e.g. piped from curl).
-#              Tarballs come from https://get.harw.dev/harw (HARW_BASE_URL),
-#              or from GitHub releases when HARW_REPO is set. The
-#              tarball contains `harw`, `killer`, `harw-agent-runner`,
-#              licenses and `README.md`; all three binaries are
-#              installed.
-#
-# Environment:
-#   HARW_INSTALL_DIR   Target bin directory (default: $HOME/.local/bin)
-#   HARW_BASE_URL      Download base for --binary mode
-#                       (default: https://get.harw.dev/harw). Layout:
-#                       <base>/latest (a tag), <base>/<tag>/SHA256SUMS,
-#                       <base>/<tag>/harw-<tag>-<target>.tar.gz.
-#   HARW_REPO          Download from this GitHub repo's releases instead,
-#                       as "owner/repo" or a full git/https remote URL.
-#   HARW_VERSION       Release tag to install in --binary mode
-#                       (default: the latest release).
-#
-# The installer is idempotent: it never duplicates PATH entries, never
-# overwrites an existing ~/.harw configuration (that is `harw`'s own job on
-# first run), and re-running it simply re-installs the same binaries.
-# POSIX sh (dash, busybox, bash, zsh): no bashisms, so `curl … | sh` works.
-set -eu
-# pipefail where the shell has it (bash, zsh, newer dash); every pipeline
-# below also checks its result, so shells without it stay safe.
-(set -o pipefail) 2>/dev/null && set -o pipefail
+#!/usr/bin/env bash
+# Install Harwness from the source archive published at get.harw.dev.
+# Usage: curl -fsSL https://get.harw.dev/harw/install.sh | bash
+set -euo pipefail
 
-# Piped from curl, `$0` is the shell, not this file: there is no checkout.
-in_checkout=false
-repo_root=""
-if [ -f "$0" ]; then
-  repo_root="$(cd "$(dirname "$0")/.." && pwd)"
-  if [ -f "$repo_root/Cargo.toml" ] && [ -f "$repo_root/scripts/install.sh" ]; then
-    in_checkout=true
-  fi
-fi
-
-usage() {
-  if [ "$in_checkout" = true ]; then
-    sed -n '2,39p' "$0"
-  else
-    printf '%s\n' "Usage: curl -fsSL https://get.harw.dev/harw/install.sh | sh" \
-      "       ... | sh -s -- [--binary] [--version TAG]"
-  fi
-  exit 0
-}
-
-base_url_default="${HARW_BASE_URL:-https://get.harw.dev/harw}"
+base_url="${HARW_BASE_URL:-https://get.harw.dev/harw}"
+archive_name="Harwness-main.zip"
 install_dir="${HARW_INSTALL_DIR:-$HOME/.local/bin}"
-mode=""
-version="${HARW_VERSION:-}"
+sources_dir="${HARW_SOURCES_DIR:-$HOME/.local/share/harw/sources}"
 
 log() { printf '\033[1m==>\033[0m %s\n' "$*"; }
-warn() { printf '\033[33mwarn:\033[0m %s\n' "$*" >&2; }
 die() { printf '\033[31merror:\033[0m %s\n' "$*" >&2; exit 1; }
 
-# --- Argument parsing --------------------------------------------------------
-while [ $# -gt 0 ]; do
-  case "$1" in
-    --help|-h) usage ;;
-    --binary) mode="binary" ;;
-    --source) mode="source" ;;
-    --version)
-      shift
-      [ $# -gt 0 ] || die "--version requires an argument"
-      version="$1"
-      ;;
-    *) die "unknown argument: $1 (see --help)" ;;
-  esac
-  shift
-done
+case "${1:-}" in
+  -h|--help)
+    cat <<'EOF'
+Usage: curl -fsSL https://get.harw.dev/harw/install.sh | bash
+       bash scripts/install.sh [--source]
 
-# --- Prerequisites ------------------------------------------------------------
-os="$(uname -s)"
-case "$os" in
-  Linux|Darwin) ;;
-  *) die "unsupported OS: $os (Linux/macOS only)";;
+The piped installer downloads Harwness-main.zip, installs missing Linux
+build dependencies, installs Rustup with the stable default toolchain when
+needed, then runs make install in a persistent extracted source directory.
+
+Environment: HARW_BASE_URL, HARW_INSTALL_DIR, HARW_SOURCES_DIR, HARW_HOME.
+EOF
+    exit 0 ;;
+  ''|--source) ;;
+  *) die "unknown argument: $1 (see --help)" ;;
 esac
+[ "$#" -le 1 ] || die "too many arguments (see --help)"
+[ "$(uname -s)" = Linux ] || die "this source installer currently supports Linux only"
 
-if [ -z "$mode" ]; then
-  if [ "$in_checkout" = false ]; then
-    mode="binary"
-  elif command -v cargo >/dev/null 2>&1; then
-    mode="source"
+# `sudo` and `doas` use /dev/tty for a password when this script is piped.
+as_root() {
+  if [ "$(id -u)" -eq 0 ]; then
+    "$@"
+  elif command -v sudo >/dev/null 2>&1; then
+    sudo "$@"
+  elif command -v doas >/dev/null 2>&1; then
+    doas "$@"
   else
-    mode="binary"
-    warn "cargo not found — falling back to --binary install"
+    die "missing system packages; install them as root or provide sudo/doas"
   fi
-fi
-
-if [ "$os" = "Linux" ] && ! command -v bwrap >/dev/null 2>&1; then
-  warn "bubblewrap (bwrap) not found — the sandbox will be unavailable until it is installed"
-fi
-
-# --- Mode: source -------------------------------------------------------------
-install_from_source() {
-  [ "$in_checkout" = true ] || die "--source needs a Harwness source checkout; run scripts/install.sh from a clone, or use --binary"
-  command -v cargo >/dev/null 2>&1 || die "cargo not found — install Rust via https://rustup.rs and re-run, or use --binary"
-
-  if command -v make >/dev/null 2>&1 && [ -f "$repo_root/Makefile" ]; then
-    log "Building and installing harw + killer via 'make install'…"
-    ( cd "$repo_root" && make install BINDIR="$install_dir" )
-    return 0
-  fi
-
-  log "Building harw + killer (release)…"
-  ( cd "$repo_root" && cargo build --release --bin harw --bin killer )
-  log "Building harw-agent-runner (release-runner)…"
-  ( cd "$repo_root" && cargo build --profile release-runner --bin harw-agent-runner )
-
-  built_harw="$repo_root/target/release/harw"
-  built_killer="$repo_root/target/release/killer"
-  built_runner="$repo_root/target/release-runner/harw-agent-runner"
-  [ -x "$built_harw" ] || die "build did not produce $built_harw"
-  [ -x "$built_killer" ] || die "build did not produce $built_killer"
-  [ -x "$built_runner" ] || die "build did not produce $built_runner"
-
-  mkdir -p "$install_dir"
-  install -m 0755 "$built_harw" "$install_dir/harw"
-  install -m 0755 "$built_killer" "$install_dir/killer"
-  install -m 0755 "$built_runner" "$install_dir/harw-agent-runner"
-  log "Installed $install_dir/harw, $install_dir/killer and $install_dir/harw-agent-runner"
-
-  # Same runner cache layout as `make install` (see root Makefile): a copy
-  # keyed by host target triple and workspace version, so a compiled agent
-  # can find a matching runner without re-resolving the build.
-  harw_home="${HARW_HOME:-$HOME/.harw}"
-  host_target="$(rustc -vV | sed -n 's/^host: //p')"
-  harw_version="$(awk -F'"' '/^version = /{print $2; exit}' "$repo_root/Cargo.toml")"
-  runner_cache_dir="$harw_home/bin/.runners/$host_target/$harw_version"
-  mkdir -p "$runner_cache_dir"
-  install -m 0755 "$built_runner" "$runner_cache_dir/harw-agent-runner"
-  log "Runner copy: $runner_cache_dir/harw-agent-runner"
-
-  "$install_dir/harw" agent install-record --source-dir "$repo_root" --bindir "$install_dir"
-  "$install_dir/harw" agent auto-build-uia || true
 }
 
-# --- Mode: binary --------------------------------------------------------------
-# Normalizes an "owner/repo" value out of a raw HARW_REPO setting, which may
-# already be "owner/repo" or a git/https remote URL.
-normalize_repo() {
-  raw="$1"
-  case "$raw" in
-    git@github.com:*)
-      raw="${raw#git@github.com:}"
-      raw="${raw%.git}"
-      ;;
-    https://github.com/*|http://github.com/*)
-      raw="${raw#*github.com/}"
-      raw="${raw%.git}"
-      ;;
-    */*)
-      : # already looks like owner/repo
-      ;;
-    *)
-      die "cannot parse HARW_REPO value: $1 (expected owner/repo or a GitHub remote URL)"
-      ;;
-  esac
-  printf '%s\n' "$raw"
-}
-
-resolve_repo() {
-  if [ -n "${HARW_REPO:-}" ]; then
-    normalize_repo "$HARW_REPO"
-    return 0
+install_linux_dependencies() {
+  local missing=() tool
+  for tool in make cc pkg-config cmake unzip bwrap prlimit git; do
+    command -v "$tool" >/dev/null 2>&1 || missing+=("$tool")
+  done
+  if command -v pkg-config >/dev/null 2>&1 && ! pkg-config --exists dbus-1; then
+    missing+=("dbus-1 development files")
   fi
+  [ "${#missing[@]}" -eq 0 ] && return 0
 
-  if [ -n "$repo_root" ] && [ -d "$repo_root/.git" ] && command -v git >/dev/null 2>&1; then
-    origin_url="$(cd "$repo_root" && git remote get-url origin 2>/dev/null || true)"
-    if [ -n "$origin_url" ]; then
-      normalize_repo "$origin_url"
-      return 0
-    fi
+  log "Installing missing Linux dependencies: ${missing[*]}"
+  if command -v apt-get >/dev/null 2>&1; then
+    as_root apt-get update
+    as_root apt-get install -y bubblewrap util-linux build-essential pkg-config cmake libdbus-1-dev git unzip
+  elif command -v dnf >/dev/null 2>&1; then
+    as_root dnf install -y bubblewrap util-linux gcc gcc-c++ make pkgconf-pkg-config cmake dbus-devel git unzip
+  elif command -v yum >/dev/null 2>&1; then
+    as_root yum install -y bubblewrap util-linux gcc gcc-c++ make pkgconfig cmake dbus-devel git unzip
+  elif command -v pacman >/dev/null 2>&1; then
+    as_root pacman -S --noconfirm --needed bubblewrap util-linux base-devel pkgconf cmake dbus git unzip
+  elif command -v zypper >/dev/null 2>&1; then
+    as_root zypper --non-interactive install bubblewrap util-linux gcc gcc-c++ make pkg-config cmake dbus-1-devel git unzip
+  elif command -v apk >/dev/null 2>&1; then
+    as_root apk add bubblewrap util-linux build-base pkgconf cmake dbus-dev git unzip
+  elif command -v xbps-install >/dev/null 2>&1; then
+    as_root xbps-install -Sy bubblewrap util-linux base-devel pkg-config cmake dbus-devel git unzip
+  else
+    die "unsupported package manager; install manually: ${missing[*]}"
   fi
-
-  die "HARW_REPO is not set and no origin remote was found — set HARW_REPO=owner/repo (see --help)"
-}
-
-detect_target() {
-  arch="$(uname -m)"
-  case "$os:$arch" in
-    Linux:x86_64) printf '%s\n' "x86_64-unknown-linux-gnu" ;;
-    Linux:aarch64|Linux:arm64) printf '%s\n' "aarch64-unknown-linux-gnu" ;;
-    *) die "no prebuilt binary for $os/$arch — use --source instead" ;;
-  esac
+  for tool in make cc pkg-config cmake unzip bwrap prlimit git; do
+    command -v "$tool" >/dev/null 2>&1 || die "$tool is still missing after package installation"
+  done
+  pkg-config --exists dbus-1 || die "dbus-1 development files are still missing"
 }
 
 fetch() {
-  # fetch URL OUT_FILE
-  url="$1"
-  out="$2"
+  local url="$1" output="$2"
   if command -v curl >/dev/null 2>&1; then
-    curl -fsSL "$url" -o "$out"
+    curl -fsSL --retry 3 "$url" -o "$output"
   elif command -v wget >/dev/null 2>&1; then
-    wget -q "$url" -O "$out"
+    wget -q "$url" -O "$output"
   else
-    die "neither curl nor wget is available to download release assets"
+    die "curl or wget is required to download $url"
   fi
 }
 
-sha256_check() {
-  # sha256_check FILE SUMS_FILE
-  file="$1"
-  sums="$2"
-  name="$(basename "$file")"
-  dir="$(dirname "$file")"
-  line="$(grep -F " $name" "$sums" || true)"
-  [ -n "$line" ] || die "no checksum entry for $name in $(basename "$sums")"
+ensure_rustup() {
+  if ! command -v rustup >/dev/null 2>&1 && [ -x "$HOME/.cargo/bin/rustup" ]; then
+    export PATH="$HOME/.cargo/bin:$PATH"
+  fi
+  if ! command -v rustup >/dev/null 2>&1; then
+    local rustup_script="$1/rustup-init.sh"
+    log "Installing Rustup and the stable Rust toolchain"
+    fetch https://sh.rustup.rs "$rustup_script"
+    sh "$rustup_script" -y --default-toolchain stable --profile default
+    export PATH="$HOME/.cargo/bin:$PATH"
+  fi
+  command -v cargo >/dev/null 2>&1 || die "Rustup was installed, but cargo is unavailable"
+  command -v rustc >/dev/null 2>&1 || die "Rustup was installed, but rustc is unavailable"
+}
+
+archive_hash() {
   if command -v sha256sum >/dev/null 2>&1; then
-    ( cd "$dir" && printf '%s\n' "$line" | sha256sum -c - >/dev/null ) \
-      || die "checksum verification failed for $name"
+    sha256sum "$1" | cut -d ' ' -f 1
   elif command -v shasum >/dev/null 2>&1; then
-    expected="$(printf '%s\n' "$line" | awk '{print $1}')"
-    actual="$(shasum -a 256 "$file" | awk '{print $1}')"
-    [ "$expected" = "$actual" ] || die "checksum verification failed for $name"
+    shasum -a 256 "$1" | cut -d ' ' -f 1
   else
-    die "neither sha256sum nor shasum is available to verify the download"
+    die "sha256sum or shasum is required to identify the source archive"
   fi
 }
 
-fetch_text() {
-  # fetch_text URL — prints the body on stdout
-  if command -v curl >/dev/null 2>&1; then
-    curl -fsSL "$1"
-  elif command -v wget >/dev/null 2>&1; then
-    wget -qO- "$1"
-  else
-    die "neither curl nor wget is available"
-  fi
-}
-
-install_from_binary() {
-  target="$(detect_target)"
-  tag="$version"
-
-  if [ -z "${HARW_REPO:-}" ]; then
-    # Default source: the release mirror behind get.harw.dev.
-    source_label="$base_url_default"
-    if [ -z "$tag" ]; then
-      tag="$(fetch_text "$base_url_default/latest" | tr -d '[:space:]')" \
-        || die "could not read $base_url_default/latest"
-      [ -n "$tag" ] || die "$base_url_default/latest is empty"
-    fi
-    base_url="$base_url_default/$tag"
-  else
-    repo="$(resolve_repo)"
-    source_label="$repo"
-    install_from_github_tag
-    base_url="https://github.com/$repo/releases/download/$tag"
-  fi
-  install_from_url
-}
-
-install_from_github_tag() {
-  if [ -z "$tag" ]; then
-    if command -v curl >/dev/null 2>&1; then
-      tag="$(curl -fsSL "https://api.github.com/repos/$repo/releases/latest" \
-        | grep -m1 '"tag_name"' | sed -E 's/.*"tag_name":[[:space:]]*"([^"]+)".*/\1/')"
-    elif command -v wget >/dev/null 2>&1; then
-      tag="$(wget -qO- "https://api.github.com/repos/$repo/releases/latest" \
-        | grep -m1 '"tag_name"' | sed -E 's/.*"tag_name":[[:space:]]*"([^"]+)".*/\1/')"
-    else
-      die "neither curl nor wget is available to resolve the latest release"
-    fi
-    [ -n "$tag" ] || die "could not resolve the latest release tag for $repo"
-  fi
-}
-
-install_from_url() {
-  asset="harw-${tag}-${target}.tar.gz"
-
-  work_dir="$(mktemp -d)"
+install_linux_dependencies
+checkout=""
+if [ "${1:-}" = --source ]; then
+  [ -f scripts/install.sh ] && [ -f Cargo.toml ] && [ -f Makefile ] \
+    || die "--source must be run from the Harwness repository root"
+  checkout="$PWD"
+else
+  # A script piped to bash has no checkout. Keep the source after installation:
+  # `make install` records this path for later agent builds.
+  mkdir -p "$sources_dir"
+  work_dir="$(mktemp -d "$sources_dir/.download-XXXXXX")"
   trap 'rm -rf "$work_dir"' EXIT
-
-  log "Downloading $asset ($source_label @ $tag)…"
-  fetch "$base_url/$asset" "$work_dir/$asset"
-  fetch "$base_url/SHA256SUMS" "$work_dir/SHA256SUMS"
-
-  log "Verifying checksum…"
-  sha256_check "$work_dir/$asset" "$work_dir/SHA256SUMS"
-
-  log "Extracting…"
-  tar -xzf "$work_dir/$asset" -C "$work_dir"
-
-  extracted_harw="$(find "$work_dir" -type f -name harw -perm -u+x | head -n1)"
-  [ -n "$extracted_harw" ] || extracted_harw="$(find "$work_dir" -type f -name harw | head -n1)"
-  [ -n "$extracted_harw" ] || die "downloaded archive did not contain a 'harw' binary"
-
-  extracted_killer="$(find "$work_dir" -type f -name killer -perm -u+x | head -n1)"
-  [ -n "$extracted_killer" ] || extracted_killer="$(find "$work_dir" -type f -name killer | head -n1)"
-  [ -n "$extracted_killer" ] || die "downloaded archive did not contain a 'killer' binary"
-
-  extracted_runner="$(find "$work_dir" -type f -name harw-agent-runner -perm -u+x | head -n1)"
-  [ -n "$extracted_runner" ] || extracted_runner="$(find "$work_dir" -type f -name harw-agent-runner | head -n1)"
-  [ -n "$extracted_runner" ] || die "downloaded archive did not contain a 'harw-agent-runner' binary"
-
-  mkdir -p "$install_dir"
-  install -m 0755 "$extracted_harw" "$install_dir/harw"
-  install -m 0755 "$extracted_killer" "$install_dir/killer"
-  install -m 0755 "$extracted_runner" "$install_dir/harw-agent-runner"
-  log "Installed $install_dir/harw, $install_dir/killer and $install_dir/harw-agent-runner ($tag, $target)"
-
-  # A downloaded installation has no source checkout. Record only its bin
-  # directory; the native backend can still use an explicit HARW_SRC.
-  "$install_dir/harw" agent install-record --bindir "$install_dir"
-  "$install_dir/harw" agent auto-build-uia || true
-}
-
-# --- Run ----------------------------------------------------------------------
-case "$mode" in
-  source) install_from_source ;;
-  binary) install_from_binary ;;
-  *) die "internal error: unknown mode $mode" ;;
-esac
-
-# --- PATH wiring (idempotent) ----------------------------------------------
-add_path_line='export PATH="$HOME/.local/bin:$PATH"  # added by harw installer'
-for rc in "$HOME/.bashrc" "$HOME/.zshrc"; do
-  [ -e "$rc" ] || continue
-  if ! grep -q "added by harw installer" "$rc" 2>/dev/null; then
-    if ! printf '%s' "$PATH" | tr ':' '\n' | grep -qx "$install_dir"; then
-      printf '\n%s\n' "$add_path_line" >> "$rc"
-      log "Added $install_dir to PATH in $rc (open a new shell to pick it up)"
-    fi
+  log "Downloading $base_url/$archive_name"
+  fetch "$base_url/$archive_name" "$work_dir/$archive_name"
+  hash="$(archive_hash "$work_dir/$archive_name")"
+  checkout="$sources_dir/$hash"
+  if [ ! -f "$checkout/Makefile" ]; then
+    mkdir -p "$work_dir/unpacked"
+    unzip -q "$work_dir/$archive_name" -d "$work_dir/unpacked"
+    extracted="$work_dir/unpacked/Harwness-main"
+    [ -f "$extracted/Cargo.toml" ] && [ -f "$extracted/Makefile" ] \
+      || die "$archive_name has no Harwness source root"
+    [ ! -e "$checkout" ] || die "incomplete source directory exists: $checkout"
+    mv "$extracted" "$checkout"
   fi
-done
+fi
 
-# --- Done -------------------------------------------------------------------
-"$install_dir/harw" --version || true
-cat <<EOF
+ensure_rustup "${work_dir:-$checkout}"
+mkdir -p "$install_dir"
+log "Building in $checkout with its pinned Rust toolchain"
+(cd "$checkout" && make install BINDIR="$install_dir")
 
-Harwness installed. Next:
-  harw                      # first run launches onboarding, then the chat TUI
-  harw completions --install    # shell completions (detects \$SHELL; bash|zsh|fish|elvish|powershell)
-  harw doctor               # validate config + health checks
-EOF
+if [ "$install_dir" = "$HOME/.local/bin" ]; then
+  for rc in "$HOME/.bashrc" "$HOME/.zshrc"; do
+    [ -f "$rc" ] || continue
+    if ! grep -q 'added by harw installer' "$rc"; then
+      printf '\n%s\n' 'export PATH="$HOME/.local/bin:$PATH"  # added by harw installer' >> "$rc"
+    fi
+  done
+fi
+
+log "Harwness installed from $checkout"
+"$install_dir/harw" --version
+printf '%s\n' 'Next: harw doctor; then harw to start onboarding.'
