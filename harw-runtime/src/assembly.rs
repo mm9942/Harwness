@@ -7366,6 +7366,56 @@ mod tests {
         Ok(())
     }
 
+    /// #22 Welle 3C: ein gesetztes `RuntimeSpec::child_backend` erreicht den
+    /// gebauten `ManagedAgentSpawner`. `ManagedAgentSpawner::child_backend()`
+    /// ist `pub(crate)` zu `harw-core` und von hier nicht lesbar, deshalb
+    /// prüft dieser Test über die Referenzzählung des `Arc`s: hält der
+    /// Spawner eine eigene Kopie, bleibt `strong_count` über den ursprünglich
+    /// gebauten Wert hinaus erhöht, solange `assembly` (und damit sein
+    /// Spawner) lebt.
+    #[test]
+    fn test_child_backend_reaches_the_built_spawner() -> TestResult {
+        struct FakeChildBackend;
+        impl harw_core::child_backend::ChildBackend for FakeChildBackend {
+            fn run<'a>(
+                &'a self,
+                _spec: harw_core::child_backend::ChildRunSpec,
+                _io: &'a dyn harw_core::child_backend::ChildIo,
+            ) -> harw_core::child_backend::ChildBackendFuture<'a> {
+                Box::pin(async {
+                    harw_core::child_backend::ChildRunOutcome {
+                        status: harw_core::child_backend::ChildRunStatus::Completed,
+                        text: None,
+                        usage: harw_core::ChildUsage::default(),
+                        continuation: None,
+                    }
+                })
+            }
+        }
+
+        let fixture = build_fixture()?;
+        let (events, _event_rx) = tokio::sync::mpsc::unbounded_channel::<SessionEvent>();
+        let backend: Arc<dyn harw_core::child_backend::ChildBackend> = Arc::new(FakeChildBackend);
+        let mut builder = fixture_builder(EntryKind::Tui, &fixture).session_events(events);
+        builder.spec.child_backend = Some(ChildBackendHandle(Arc::clone(&backend)));
+        let strong_before = Arc::strong_count(&backend);
+
+        let assembly = builder
+            .build()
+            .map_err(ctx("Tui mit ChildBackend montiert"))?;
+
+        assert!(
+            assembly.spawner().is_some(),
+            "EntryKind::Tui montiert einen Spawner (SpawnerPolicy::BuiltinRoles)"
+        );
+        assert!(
+            Arc::strong_count(&backend) > strong_before,
+            "der gebaute ManagedAgentSpawner muss eine eigene Arc-Referenz auf \
+             das ChildBackend halten"
+        );
+        Ok(())
+    }
+
     /// Runde 5, Teil F: die Plan-Werkzeuge hängen an der Wurzel der vollen
     /// Modell-Werkzeugfläche, die Wurzel ist gebunden (Kinder nie), und nur
     /// die TUI hat einen Plan-Fragekanal (take-once). Ohne Kanal antworten

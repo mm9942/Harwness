@@ -484,6 +484,8 @@ mod tests {
         root: PathBuf,
         session: SessionId,
         with_config: bool,
+        hidden_commands: Vec<String>,
+        model_switch_allowlist: Option<Vec<(String, String)>>,
     }
 
     const ROLES: &[&str] = &["explorer", "worker-simple"];
@@ -497,7 +499,24 @@ mod tests {
                 root: PathBuf::from("."),
                 session: SessionId::new(),
                 with_config: true,
+                hidden_commands: Vec::new(),
+                model_switch_allowlist: None,
             }
+        }
+
+        fn with_hidden(mut self, hidden: &[&str]) -> Self {
+            self.hidden_commands = hidden.iter().map(|name| (*name).to_owned()).collect();
+            self
+        }
+
+        fn with_model_switch_allowlist(mut self, allowed: &[(&str, &str)]) -> Self {
+            self.model_switch_allowlist = Some(
+                allowed
+                    .iter()
+                    .map(|(provider, model)| ((*provider).to_owned(), (*model).to_owned()))
+                    .collect(),
+            );
+            self
         }
 
         fn ctx(&self) -> LocalCommandContext<'_> {
@@ -513,6 +532,8 @@ mod tests {
                 session_id: &self.session,
                 tier: PermissionTier::Operator,
                 known_roles: ROLES,
+                hidden_commands: &self.hidden_commands,
+                model_switch_allowlist: self.model_switch_allowlist.as_deref(),
             }
         }
 

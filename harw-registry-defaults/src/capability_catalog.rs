@@ -590,13 +590,12 @@ mod tests {
     /// nur noch rechtlose Klassen).
     #[test]
     fn test_agents_build_is_at_least_as_strict_as_shell_exec() {
-        let shell_exec = lookup("shell.exec").expect("shell.exec hat eine Katalogzeile");
-        let agents_build = lookup("agents.build").expect("agents.build hat eine Katalogzeile");
+        let shell_exec_class = lookup("shell.exec").map(|entry| entry.class);
+        let agents_build_class = lookup("agents.build").map(|entry| entry.class);
+        assert_eq!(shell_exec_class, Some(CapabilityClass::Shell));
         assert!(
-            agents_build.class >= shell_exec.class,
-            "agents.build: Klasse {:?} ist weniger streng als shell.exec ({:?})",
-            agents_build.class,
-            shell_exec.class
+            agents_build_class.is_some_and(|class| class >= CapabilityClass::Shell),
+            "agents.build: Klasse {agents_build_class:?} ist weniger streng als shell.exec"
         );
     }
 
