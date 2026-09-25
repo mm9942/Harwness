@@ -63,7 +63,13 @@
 //! let assembly = Arc::new(wiring.install(builder).build()?);
 //! run_tui(
 //!     assembly,
-//!     TuiRunOptions { wiring, resume: None, verbose_tools: false, keybindings_path: None },
+//!     TuiRunOptions {
+//!         wiring,
+//!         resume: None,
+//!         verbose_tools: false,
+//!         keybindings_path: None,
+//!         fixed_agent: None,
+//!     },
 //! )?;
 //! # Ok(())
 //! # }
@@ -588,6 +594,7 @@ impl std::fmt::Debug for TuiRunOptions {
 ///         resume: None,
 ///         verbose_tools: false,
 ///         keybindings_path: None,
+///         fixed_agent: None,
 ///     },
 /// )
 /// # }
@@ -598,6 +605,7 @@ pub fn run_tui(assembly: Arc<RuntimeAssembly>, options: TuiRunOptions) -> Result
         resume,
         verbose_tools,
         keybindings_path,
+        fixed_agent,
     } = options;
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -618,6 +626,18 @@ pub fn run_tui(assembly: Arc<RuntimeAssembly>, options: TuiRunOptions) -> Result
         resume.as_ref().map(|r| r.session_store_root.as_path()),
         verbose_tools,
     )?;
+    // R10 Welle 3B: fixed-agent-Beschränkungen auf den frisch gebauten
+    // Renderer-Zustand anwenden. `resume` ist für einen kompilierten Agenten
+    // immer `None` (siehe `crate::fixed_agent::run_fixed_agent`), daher ist
+    // dies die einzige `ChatApp`-Bau-Stelle dieses Laufs — `/new`/`/resume`
+    // scheitern ohnehin mit [`RESUME_NOT_CONFIGURED`], bevor eine zweite
+    // Montage entstünde.
+    if let Some(restrictions) = fixed_agent.as_ref() {
+        app = app
+            .with_hidden_commands(restrictions.hidden_commands.clone())
+            .with_title_override(restrictions.title.clone())
+            .with_model_switch_allowlist(restrictions.model_switch_allowlist.clone());
+    }
     // Ein Ladefehler bricht den Start nicht ab: Standardbelegung behalten und
     // die Meldung nach der Willkommenszeile anzeigen.
     let (key_bindings, key_bindings_error) = match keybindings_path.as_deref() {

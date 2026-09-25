@@ -381,7 +381,8 @@ pub const fn forced_approval_mode(entry: EntryKind) -> Option<ApprovalMode> {
         | EntryKind::McpServe
         | EntryKind::JobPrompt
         | EntryKind::JobPlanNode
-        | EntryKind::GatewayDream => None,
+        | EntryKind::GatewayDream
+        | EntryKind::CompiledAgent => None,
     }
 }
 

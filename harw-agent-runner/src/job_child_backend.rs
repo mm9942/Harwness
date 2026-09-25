@@ -794,6 +794,33 @@ mod tests {
         }
     }
 
+    /// Same fixture script as [`hello_then_result_completes`], but driven
+    /// through [`JobChildBackend::with_spawner_and_job_manager`] instead of
+    /// the direct-spawn path: the child runs as a real `harw_tool_job` job
+    /// (its own process group, `stdout.log`/`stderr.log`, `job.status`), and
+    /// `run_job_managed` still completes the handshake and relay over the
+    /// piped stdin/stdout `start_piped` hands back.
+    #[tokio::test]
+    async fn job_managed_path_completes_through_job_manager() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let config = harw_tool_job::JobManagerConfig::new(dir.path());
+        let job_manager = harw_tool_job::JobManager::new(config, Arc::new(harw_tool_job::NoopNotifier))
+            .expect("job manager");
+        let backend = JobChildBackend::with_spawner_and_job_manager(
+            ShellSpawner {
+                script: hello_then_result_script(),
+            },
+            job_manager,
+        );
+        let io = RecordingIo;
+        let outcome = backend
+            .run(spec(harw_types::cancel::CancelToken::new()), &io)
+            .await;
+        assert_eq!(outcome.status, ChildRunStatus::Completed);
+        assert_eq!(outcome.text.as_deref(), Some("done"));
+        assert_eq!(outcome.usage.tokens, 3);
+    }
+
     #[tokio::test]
     async fn cancel_kills_the_child_before_a_result() {
         // Prints Hello, reads its two frames, then sleeps far longer than

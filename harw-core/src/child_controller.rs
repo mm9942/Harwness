@@ -2721,6 +2721,29 @@ impl ManagedAgentSpawner {
         self.set_status(child, ChildStatus::Failed);
     }
 
+    /// Wave 3C: entnimmt den zuletzt vom [`crate::child_backend::ChildBackend`]
+    /// gemeldeten Fortsetzungs-Token eines Kindes (einmalig), für
+    /// [`crate::child_backend::ChildRunSpec::continue_from`] seines nächsten
+    /// Laufs.
+    fn take_backend_resume(&self, child: &SessionId) -> Option<String> {
+        self.child_tasks
+            .lock()
+            .ok()
+            .and_then(|mut tasks| tasks.get_mut(child.as_str())?.backend_resume.take())
+    }
+
+    /// Wave 3C: hinterlegt den Fortsetzungs-Token, den ein
+    /// [`crate::child_backend::ChildBackend`] für einen erneuten Lauf
+    /// desselben Kindes gemeldet hat.
+    fn set_backend_resume(&self, child: &SessionId, token: String) {
+        match self.child_tasks.lock() {
+            Ok(mut tasks) => {
+                tasks.entry(child.as_str().to_owned()).or_default().backend_resume = Some(token);
+            }
+            Err(_) => tracing::warn!(child = %child, "child_task_state.lock_poisoned"),
+        }
+    }
+
     /// Entnimmt den noch nicht verbrauchten Auftrag eines Kindes (einmalig).
     fn take_pending_task(&self, child: &SessionId) -> Option<String> {
         self.child_tasks
@@ -5497,6 +5520,13 @@ impl ManagedAgentSpawner {
         let record = self
             .child_record(child)
             .ok_or_else(|| Self::reject(format!("child {child} is not admitted")))?;
+        // Wave 3C: a wired `ChildBackend` runs this child somewhere other
+        // than in-process (`crate::child_backend`); everything below this
+        // branch is the in-process path and stays untouched when no
+        // backend is wired (the default inside `harw`).
+        if let Some(backend) = self.child_backend() {
+            return self.run_child_via_backend(child, &record, backend, input).await;
+        }
         let factory = self
             .roles
             .get(&record.role)

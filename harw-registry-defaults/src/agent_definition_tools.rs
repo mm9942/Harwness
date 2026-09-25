@@ -2414,6 +2414,542 @@ impl ToolProvider for AgentDefinitionToolProvider {
     }
 }
 
+// ---------------------------------------------------------------------------
+// `agents.build` (#22 Welle 2B, R10-Plan „harw-agent-compiler + CLI")
+// ---------------------------------------------------------------------------
+//
+// Eigenständiger, von [`AgentDefinitionToolProvider`] unabhängiger Provider:
+// er kompiliert eine Agentendefinition zu einem eigenständigen Programm
+// (`harw-agent-compiler`, derselbe Weg wie `/agent build` in `harw-ops`).
+// Läuft **immer** als Hintergrund-Job — auch `--native` (kann Minuten
+// dauern) blockiert damit nie den Aufrufer; der Rückgabewert ist die
+// Job-Kennung, nicht das fertige Ergebnis. Freigabepflichtig wie
+// `shell.exec` (nicht in [`crate::AUTO_APPROVED_TOOLS`]) und **nie** in ein
+// eingebautes `RegistryProfile` verdrahtet — nur eine ausdrückliche
+// Agentendefinition, die `agents.build` in `tools.admitted` aufführt, darf
+// diesen Provider bekommen (die tatsächliche Montage dieses Falls liegt
+// außerhalb dieses Crates, siehe Abschlussbericht).
+
+/// Abstraktion über [`harw_tool_job::JobManager::start`], austauschbar in
+/// Tests (ein Fake zeichnet die Anfrage auf, ohne je einen Prozess zu
+/// starten).
+trait AgentBuildJobStarter: Send + Sync {
+    /// Startet den vorbereiteten Build-Prozess als Job.
+    fn start(
+        &self,
+        request: harw_tool_job::StartRequest,
+        prepared: harw_tool_job::PreparedJob,
+    ) -> Result<harw_tool_job::JobStatus, harw_tool_job::JobError>;
+}
+
+/// Startet über eine echte [`harw_tool_job::JobManager`]-Instanz.
+struct RealJobStarter(std::sync::Arc<harw_tool_job::JobManager>);
+
+impl AgentBuildJobStarter for RealJobStarter {
+    fn start(
+        &self,
+        request: harw_tool_job::StartRequest,
+        prepared: harw_tool_job::PreparedJob,
+    ) -> Result<harw_tool_job::JobStatus, harw_tool_job::JobError> {
+        self.0.start(request, prepared)
+    }
+}
+
+/// Deserialisierte Argumente für `agents.build`.
+#[derive(Debug, Deserialize)]
+struct AgentsBuildArgs {
+    /// Name einer bekannten Agentendefinition oder Pfad zu einer
+    /// `definition.toml`.
+    name_or_path: String,
+    /// Zu bündelnde Schnittstellen (`cli`, `repl`, `mcp`, `http`, `tui`);
+    /// `None` = die Vorgabe des Compilers (alle).
+    #[serde(default)]
+    interfaces: Option<Vec<String>>,
+    /// `true` baut mit `--native` (dauert Minuten — läuft wie jeder
+    /// `agents.build`-Aufruf ohnehin als Job).
+    #[serde(default)]
+    native: Option<bool>,
+}
+
+fn agents_build_spec() -> ToolSpec {
+    let mut props = BTreeMap::new();
+    props.insert(
+        "name_or_path".to_owned(),
+        JsonSchema {
+            schema_type: Some(JsonSchemaType::String),
+            description: Some(
+                "Name einer bekannten Agentendefinition oder Pfad zu einer definition.toml."
+                    .to_owned(),
+            ),
+            ..Default::default()
+        },
+    );
+    props.insert(
+        "interfaces".to_owned(),
+        JsonSchema {
+            schema_type: Some(JsonSchemaType::Array),
+            items: Some(Box::new(JsonSchema {
+                schema_type: Some(JsonSchemaType::String),
+                ..Default::default()
+            })),
+            description: Some(
+                "Zu bündelnde Schnittstellen (cli, repl, mcp, http, tui); Vorgabe: alle."
+                    .to_owned(),
+            ),
+            ..Default::default()
+        },
+    );
+    props.insert(
+        "native".to_owned(),
+        JsonSchema {
+            schema_type: Some(JsonSchemaType::Boolean),
+            description: Some(
+                "true baut mit --native (kann Minuten dauern; läuft immer als Job).".to_owned(),
+            ),
+            ..Default::default()
+        },
+    );
+    ToolSpec::Function(FunctionToolSpec {
+        name: ToolName::new("agents.build"),
+        description: "Kompiliert eine Agentendefinition zu einem eigenständigen Programm \
+             (harw-agent-compiler, wie `/agent build`). Läuft immer als Hintergrund-Job; die \
+             Antwort trägt die Job-Kennung, Fortschritt und Ergebnis stehen über job.status/ \
+             job.logs. Freigabepflichtig wie shell.exec."
+            .to_owned(),
+        parameters: JsonSchema {
+            schema_type: Some(JsonSchemaType::Object),
+            properties: Some(props),
+            required: Some(vec!["name_or_path".to_owned()]),
+            additional_properties: Some(Box::new(AdditionalProperties::Bool(false))),
+            ..Default::default()
+        },
+        strict: true,
+    })
+}
+
+/// Die Argument-Tokens für den Subprozess `harw agent build … --json`
+/// (dieselbe Zuordnung wie `harw-ops`s `agent::start_build_job`).
+fn agents_build_argv(args: &AgentsBuildArgs) -> Vec<String> {
+    let mut argv = vec![
+        "agent".to_owned(),
+        "build".to_owned(),
+        args.name_or_path.clone(),
+    ];
+    if let Some(interfaces) = args
+        .interfaces
+        .as_ref()
+        .filter(|interfaces| !interfaces.is_empty())
+    {
+        argv.push("--interface".to_owned());
+        argv.push(interfaces.join(","));
+    }
+    if args.native.unwrap_or(false) {
+        argv.push("--native".to_owned());
+    }
+    argv.push("--json".to_owned());
+    argv
+}
+
+struct AgentsBuildExecutor {
+    starter: std::sync::Arc<dyn AgentBuildJobStarter>,
+}
+
+impl ToolExecutor for AgentsBuildExecutor {
+    fn execute<'a>(
+        &'a self,
+        context: &'a ToolExecutionContext,
+        call: &'a ToolCall,
+    ) -> ToolExecutorFuture<'a> {
+        let arguments = call.arguments.clone();
+        Box::pin(async move {
+            let args: AgentsBuildArgs = match serde_json::from_value(arguments) {
+                Ok(args) => args,
+                Err(error) => {
+                    return Ok(ToolOutput::error(format!(
+                        "agents.build: ungültige Argumente: {error}"
+                    )));
+                }
+            };
+            if args.name_or_path.trim().is_empty() {
+                return Ok(ToolOutput::error(
+                    "agents.build: name_or_path darf nicht leer sein".to_owned(),
+                ));
+            }
+            if let Some(denied) = harw_tools::sandbox_guard::require_permission(
+                context,
+                harw_authority::Permission::ExecuteProcess,
+                "agents.build",
+            ) {
+                return Ok(denied);
+            }
+            let exe = match std::env::current_exe() {
+                Ok(exe) => exe,
+                Err(error) => {
+                    return Ok(ToolOutput::error(format!(
+                        "agents.build: harw-Programm nicht auffindbar: {error}"
+                    )));
+                }
+            };
+            let cwd = context.sandbox().workspace().canonical_root().to_path_buf();
+            let argv = agents_build_argv(&args);
+            let display = format!("harw {}", argv.join(" "));
+            let mut command = tokio::process::Command::new(&exe);
+            command
+                .args(&argv)
+                .current_dir(&cwd)
+                .stdin(std::process::Stdio::null())
+                .kill_on_drop(false);
+            #[cfg(unix)]
+            command.process_group(0);
+            let request = harw_tool_job::StartRequest {
+                name: format!("agents.build {}", args.name_or_path),
+                command: display,
+                cwd: Some(cwd),
+                env_keys: Vec::new(),
+                notify_every: std::time::Duration::from_secs(10),
+                owner: harw_tool_job::JobOwner::new(context.session_id().as_str(), Vec::new()),
+            };
+            let prepared = harw_tool_job::PreparedJob {
+                command,
+                executed_on_host: true,
+            };
+            match self.starter.start(request, prepared) {
+                Ok(status) => Ok(ToolOutput::json(serde_json::json!({
+                    "job_id": status.meta.job_id.as_str(),
+                    "note": "Build läuft als Hintergrund-Job. Fortschritt: job.status/job.logs.",
+                }))),
+                Err(error) => Ok(ToolOutput::error(format!("agents.build: {error}"))),
+            }
+        })
+    }
+}
+
+/// Der Provider für `agents.build` (#22 Welle 2B).
+///
+/// # Description
+/// Ohne [`harw_tool_job::JobManager`] (`manager = None`) bewirbt er nichts —
+/// fail-closed, wie [`AgentDefinitionToolProvider`] ohne Urheber-Decke.
+/// **Kein** eingebautes `RegistryProfile` konstruiert diesen Provider; er
+/// steht nur einer expliziten Agentendefinition zur Verfügung, deren
+/// `tools.admitted` `agents.build` nennt.
+pub struct AgentBuildToolProvider {
+    /// `None` unterdrückt die Registrierung vollständig.
+    starter: Option<std::sync::Arc<dyn AgentBuildJobStarter>>,
+}
+
+impl AgentBuildToolProvider {
+    /// Erstellt den Provider über der Job-Verwaltung der Sitzung.
+    ///
+    /// # Arguments
+    /// - `manager` (`Option<Arc<JobManager>>`): `None` registriert
+    ///   `agents.build` gar nicht (fail-closed ohne Job-Verwaltung).
+    #[must_use]
+    pub fn new(manager: Option<std::sync::Arc<harw_tool_job::JobManager>>) -> Self {
+        Self {
+            starter: manager.map(|manager| {
+                std::sync::Arc::new(RealJobStarter(manager)) as std::sync::Arc<dyn AgentBuildJobStarter>
+            }),
+        }
+    }
+}
+
+impl ToolProvider for AgentBuildToolProvider {
+    fn tools(&self) -> Vec<ToolSpec> {
+        if self.starter.is_some() {
+            vec![agents_build_spec()]
+        } else {
+            Vec::new()
+        }
+    }
+
+    fn executor(&self, name: &ToolName) -> Option<std::sync::Arc<dyn ToolExecutor>> {
+        match name.as_str() {
+            "agents.build" => self.starter.clone().map(|starter| {
+                std::sync::Arc::new(AgentsBuildExecutor { starter }) as std::sync::Arc<dyn ToolExecutor>
+            }),
+            _ => None,
+        }
+    }
+
+    /// Startet jedes Mal einen neuen Prozess — nicht commutative.
+    fn parallel_safe(&self, _name: &ToolName) -> bool {
+        false
+    }
+}
+
+#[cfg(test)]
+mod agents_build_tests {
+    use super::{
+        AgentBuildJobStarter, AgentBuildToolProvider, AgentsBuildExecutor, agents_build_argv,
+    };
+    use crate::test_support::{TestError, TestResult, ctx};
+    use harw_authority::{
+        Permission, PermissionSet, SandboxSpec, WorkspaceRegistration, WorkspaceRegistry,
+    };
+    use harw_extension_api::{ToolCall, ToolExecutionContext, ToolExecutor, ToolName, ToolOutput};
+    use harw_extension_api::contributors::ToolProvider;
+    use harw_types::{SessionId, TenantId, TurnId, WorkspaceId};
+    use std::sync::{Arc, Mutex};
+
+    fn sandbox(dir: &std::path::Path, permissions: Vec<Permission>) -> TestResult<SandboxSpec> {
+        let ws = dir.join("project");
+        std::fs::create_dir_all(&ws).map_err(ctx("Workspace anlegen"))?;
+        let registry = WorkspaceRegistry::build(
+            dir,
+            [WorkspaceRegistration {
+                tenant: TenantId::from_str("test-tenant"),
+                workspace: WorkspaceId::from_str("project"),
+                root: ws,
+            }],
+        )
+        .map_err(ctx("Registry bauen"))?;
+        let binding = registry
+            .resolve(
+                &TenantId::from_str("test-tenant"),
+                &WorkspaceId::from_str("project"),
+            )
+            .map_err(ctx("Registry auflösen"))?;
+        Ok(SandboxSpec::from_resolved(
+            binding,
+            PermissionSet::from_policy(permissions),
+        ))
+    }
+
+    fn make_ctx(sandbox: SandboxSpec) -> ToolExecutionContext {
+        ToolExecutionContext::new(SessionId::new(), TurnId::new(), sandbox)
+    }
+
+    fn build_call(arguments: serde_json::Value) -> ToolCall {
+        ToolCall {
+            id: Default::default(),
+            name: ToolName::new("agents.build"),
+            arguments,
+        }
+    }
+
+    /// Zeichnet jede Startanfrage auf und liefert eine feste Job-Kennung,
+    /// ohne je einen echten Prozess zu starten (Bible R087/R165/R182: Tests
+    /// dürfen nichts wirklich ausführen, was Minuten dauert oder das
+    /// Testsystem verändert).
+    struct FakeStarter {
+        recorded: Mutex<Vec<harw_tool_job::StartRequest>>,
+        job_id: &'static str,
+    }
+
+    impl FakeStarter {
+        fn new(job_id: &'static str) -> Self {
+            Self {
+                recorded: Mutex::new(Vec::new()),
+                job_id,
+            }
+        }
+
+        fn recorded(&self) -> Vec<harw_tool_job::StartRequest> {
+            self.recorded
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone()
+        }
+    }
+
+    impl AgentBuildJobStarter for FakeStarter {
+        fn start(
+            &self,
+            request: harw_tool_job::StartRequest,
+            _prepared: harw_tool_job::PreparedJob,
+        ) -> Result<harw_tool_job::JobStatus, harw_tool_job::JobError> {
+            self.recorded
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .push(request.clone());
+            let Some(job_id) = harw_tool_job::JobId::parse(self.job_id) else {
+                return Err(harw_tool_job::JobError::Spawn(
+                    "ungültige Test-Job-Kennung".to_owned(),
+                ));
+            };
+            let meta = harw_tool_job::JobMeta {
+                version: 1,
+                job_id,
+                name: request.name,
+                command: request.command,
+                cwd: request.cwd.map(|cwd| cwd.display().to_string()),
+                env_keys: request.env_keys,
+                state: harw_tool_job::JobState::Running,
+                pid: None,
+                proc_start_ticks: None,
+                executed_on_host: true,
+                harw_instance: String::new(),
+                owner: request.owner,
+                created_at: jiff::Timestamp::UNIX_EPOCH,
+                started_at: None,
+                ended_at: None,
+                exit_code: None,
+                signal: None,
+                stop_requested: false,
+                detached: false,
+                notify_every_secs: request.notify_every.as_secs(),
+                progress: None,
+                warnings: 0,
+                errors: 0,
+                launch_error: None,
+            };
+            Ok(harw_tool_job::JobStatus {
+                meta,
+                runtime_secs: None,
+                stdout_lines: 0,
+                stderr_lines: 0,
+                last_lines: Vec::new(),
+                log_dir: std::path::PathBuf::new(),
+            })
+        }
+    }
+
+    #[test]
+    fn test_agents_build_argv_maps_interfaces_and_native() {
+        let args = super::AgentsBuildArgs {
+            name_or_path: "explorer".to_owned(),
+            interfaces: Some(vec!["cli".to_owned(), "mcp".to_owned()]),
+            native: Some(true),
+        };
+        assert_eq!(
+            agents_build_argv(&args),
+            vec![
+                "agent", "build", "explorer", "--interface", "cli,mcp", "--native", "--json",
+            ]
+        );
+    }
+
+    #[test]
+    fn test_agents_build_argv_omits_absent_optionals() {
+        let args = super::AgentsBuildArgs {
+            name_or_path: "worker".to_owned(),
+            interfaces: None,
+            native: None,
+        };
+        assert_eq!(
+            agents_build_argv(&args),
+            vec!["agent", "build", "worker", "--json"]
+        );
+    }
+
+    /// Ohne Job-Verwaltung bewirbt der Provider `agents.build` nicht — kein
+    /// Aufrufer kann es also je erreichen.
+    #[test]
+    fn test_provider_without_manager_registers_nothing() {
+        let provider = AgentBuildToolProvider::new(None);
+        assert!(provider.tools().is_empty());
+        assert!(provider.executor(&ToolName::new("agents.build")).is_none());
+    }
+
+    /// Mit Job-Verwaltung bewirbt der Provider genau `agents.build`.
+    #[test]
+    fn test_provider_with_manager_registers_agents_build() {
+        let provider = AgentBuildToolProvider {
+            starter: Some(Arc::new(FakeStarter::new("job-test-001"))),
+        };
+        let tools = provider.tools();
+        assert_eq!(tools.len(), 1);
+        assert!(provider.executor(&ToolName::new("agents.build")).is_some());
+        assert!(provider.executor(&ToolName::new("agents.validate")).is_none());
+    }
+
+    /// Ohne `Permission::ExecuteProcess` lehnt der Executor ab, bevor er
+    /// überhaupt einen Job anfragt.
+    #[tokio::test]
+    async fn test_execute_without_process_permission_is_denied() -> TestResult {
+        let dir = tempfile::tempdir().map_err(ctx("Tempdir anlegen"))?;
+        let sandbox = sandbox(dir.path(), vec![Permission::ReadWorkspace])?;
+        let ctx = make_ctx(sandbox);
+        let starter = Arc::new(FakeStarter::new("job-test-002"));
+        let executor = AgentsBuildExecutor {
+            starter: starter.clone(),
+        };
+        let call = build_call(serde_json::json!({ "name_or_path": "explorer" }));
+        let output = executor
+            .execute(&ctx, &call)
+            .await
+            .map_err(|error| TestError::Unexpected(format!("{error:?}")))?;
+        match output {
+            ToolOutput::Error { .. } => {}
+            other => {
+                return Err(TestError::Unexpected(format!(
+                    "expected a permission error, got {other:?}"
+                )));
+            }
+        }
+        assert!(
+            starter.recorded().is_empty(),
+            "eine abgelehnte Ausführung darf keinen Job anfragen"
+        );
+        Ok(())
+    }
+
+    /// Mit `Permission::ExecuteProcess` startet der Executor einen Job und
+    /// gibt dessen Kennung zurück, ohne je einen echten Prozess zu starten
+    /// (der Fake spawnt nicht).
+    #[tokio::test]
+    async fn test_execute_with_process_permission_returns_job_id() -> TestResult {
+        let dir = tempfile::tempdir().map_err(ctx("Tempdir anlegen"))?;
+        let sandbox = sandbox(dir.path(), vec![Permission::ExecuteProcess])?;
+        let ctx = make_ctx(sandbox);
+        let starter = Arc::new(FakeStarter::new("job-test-003"));
+        let executor = AgentsBuildExecutor {
+            starter: starter.clone(),
+        };
+        let call = build_call(serde_json::json!({
+            "name_or_path": "explorer",
+            "native": true,
+        }));
+        let output = executor
+            .execute(&ctx, &call)
+            .await
+            .map_err(|error| TestError::Unexpected(format!("{error:?}")))?;
+        match output {
+            ToolOutput::Json { content } => {
+                assert_eq!(content["job_id"], serde_json::json!("job-test-003"));
+            }
+            other => {
+                return Err(TestError::Unexpected(format!(
+                    "expected a json job id, got {other:?}"
+                )));
+            }
+        }
+        let recorded = starter.recorded();
+        assert_eq!(recorded.len(), 1);
+        assert!(recorded[0].command.contains("--native"));
+        assert!(recorded[0].command.contains("explorer"));
+        Ok(())
+    }
+
+    /// Ein leerer `name_or_path` lehnt ab, ohne die Berechtigung zu prüfen
+    /// oder einen Job anzufragen.
+    #[tokio::test]
+    async fn test_execute_rejects_empty_name_or_path() -> TestResult {
+        let dir = tempfile::tempdir().map_err(ctx("Tempdir anlegen"))?;
+        let sandbox = sandbox(dir.path(), vec![Permission::ExecuteProcess])?;
+        let ctx = make_ctx(sandbox);
+        let starter = Arc::new(FakeStarter::new("job-test-004"));
+        let executor = AgentsBuildExecutor {
+            starter: starter.clone(),
+        };
+        let call = build_call(serde_json::json!({ "name_or_path": "   " }));
+        let output = executor
+            .execute(&ctx, &call)
+            .await
+            .map_err(|error| TestError::Unexpected(format!("{error:?}")))?;
+        match output {
+            ToolOutput::Error { message } => assert!(message.contains("name_or_path")),
+            other => {
+                return Err(TestError::Unexpected(format!(
+                    "expected an error output, got {other:?}"
+                )));
+            }
+        }
+        assert!(starter.recorded().is_empty());
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

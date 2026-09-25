@@ -393,8 +393,8 @@ Every command accepts `--json`; in the TUI the same commands run as
 | `harw agent new <name> [--role worker\|child-orchestrator] [--extends ID] [--dir DIR]` | a commented `definition.toml` plus `system.md` (default `~/.harw/agents/<name>`). Nothing is built. |
 | `harw agent fmt [paths] [--check]` | canonical formatting (below). |
 | `harw agent diff <a> <b>` | IR difference of two definitions, installed versions (`name@version`) or artifacts; widening rights are marked `!!`. |
-| `harw agent test [name]` | validate, build in memory, run the cases in `tests/*.toml` next to the definition. |
-| `harw agent run <artifact\|name> [prompt]` | runs an artifact directly; needs the runner (wave 3) and exits 69 until then. |
+| `harw agent test [name]` | validate, build in memory, run the cases in `tests/*.toml` next to the definition; manifest checks run immediately, answer checks (`contains`/`not_contains`) run the located runner as a throwaway one-shot subprocess. |
+| `harw agent run <artifact\|name> [prompt]` | runs an artifact or an installed agent directly, out of process (§10); exits 69 (`EXIT_RUNNER_UNAVAILABLE`) if no matching runner can be located. |
 | `harw agent versions <name>` / `harw agent use <name> <version\|digest>` | installed versions, switch the current one. |
 | `harw agent clean [--all] [--older-than DAYS] [--keep N] [--dry-run]` | trims the native build cache and old versions (keeps the current version plus N, default 3). |
 | `harw agent doctor` | runner and its capabilities, native prerequisites, install record, cache size, `~/.harw/bin` on `PATH` (with the line for your shell rc), last automatic UIA build. |
@@ -421,7 +421,7 @@ prompt = "Prüfe die Quelle in report.md"
 [expect]
 tools = ["fs.read"]            # must be in the manifest (checked now)
 not_tools = ["shell.exec"]     # must not be (checked now)
-contains = ["Behalten"]        # answer checks: pending until the runner exists
+contains = ["Behalten"]        # answer check: runs the located runner as a subprocess
 ```
 
 ## 10. Where things are found
