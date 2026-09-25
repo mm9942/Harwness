@@ -5981,12 +5981,14 @@ impl ManagedAgentSpawner {
             task,
             context,
             continue_from,
-            // `harw-core` selbst kennt keine Rechte (siehe die Moduldoku von
-            // `crate::child_backend`): der Aufrufer, der `with_child_backend`
-            // verdrahtet (`JobChildBackend` in `harw-agent-runner`), narrows
-            // dies mit den echten `EffectiveRights` von Kind und Elternteil
-            // weiter ein, bevor er den Lauf tatsächlich startet.
-            rights: crate::child_backend::ChildBackendRights::default(),
+            // Die aktuellen effektiven Rechte des Kindes, wie sie der
+            // in-process Pfad hätte (Werkzeugfläche nach dem Eltern-Schnitt,
+            // Sandbox, Freigabemodus; siehe `Self::backend_rights`). Das
+            // Backend reicht sie unverändert weiter (`JobChildBackend` in
+            // `harw-agent-runner` verengt nicht selbst); das Kind schneidet
+            // sie nur noch mit seinem Manifest. Leere Rechte hießen: ein
+            // job-gestartetes Kind darf gar nichts.
+            rights: self.backend_rights(child, &record.parent),
             budget: self.remaining_budget(child).map(agent_budget_to_dsl_budget),
             live_mode: !plan_mode,
             cancel: token.child(),
@@ -5998,6 +6000,139 @@ impl ManagedAgentSpawner {
         };
         let outcome = backend.run(spec, &io).await;
         self.finish_backend_outcome(child, outcome).await
+    }
+
+    /// Die Rechte, mit denen ein über den [`crate::child_backend::ChildBackend`]
+    /// laufendes Kind startet: genau seine aktuelle in-process Fläche.
+    ///
+    /// # Beschreibung
+    /// - `tools`: die Werkzeuge, die [`crate::turn_loop::collect_tools`] dem
+    ///   Kind jetzt zeigen würde (Registry ∩ Aktivierung nach Agent-IR,
+    ///   Eltern-Schnitt und Modus), zusätzlich geschnitten mit der
+    ///   Eltern-Aktivierung, gegen die die Admission das Kind geschnitten hat
+    ///   (Basis bei Live-Modus, sonst die aktuelle; siehe
+    ///   [`Self::parent_rights_ceiling`]).
+    /// - `write`/`shell`/`network_open`: die Rechte der aktuellen
+    ///   Kind-Sandbox (`WriteWorkspace`, `ExecuteProcess`, `NetworkAccess`
+    ///   aus [`harw_authority::Permission`]), die auch die Eltern-Sandbox
+    ///   hält.
+    /// - `network_hosts`: die Hosts des Kind-Netz-Scopes, die der Eltern-Scope
+    ///   zulässt. `PublicDns`- und CIDR-Ziele haben in
+    ///   [`crate::child_backend::ChildBackendRights`] keine Entsprechung und
+    ///   fallen weg (fail-closed).
+    /// - `host`: ein Host-Werkzeug (`host.*`,
+    ///   [`harw_agent_dsl::classify::LabelClassifier`]) ist in `tools`.
+    /// - `full_access`: die Zelle aus [`Self::with_approval_mode`] liest
+    ///   [`harw_extension_api::ApprovalMode::FullAccess`].
+    ///
+    /// Fail-closed: ist das Kind, seine Sandbox oder der Elternteil nicht
+    /// auffindbar oder ein Lock vergiftet, sind die Rechte leer.
+    ///
+    /// # Concurrency
+    /// Nimmt `manager`, darunter kurz `checked_out` und `active` (dieselbe
+    /// Reihenfolge wie die Admission).
+    fn backend_rights(
+        &self,
+        child: &SessionId,
+        parent: &SessionId,
+    ) -> crate::child_backend::ChildBackendRights {
+        use crate::child_backend::ChildBackendRights;
+        use harw_agent_dsl::classify::{LabelClassifier, ToolClassifier};
+        use harw_authority::Permission;
+
+        let Ok(manager) = self.manager.lock() else {
+            return ChildBackendRights::default();
+        };
+        let Ok(session) = manager.get(child) else {
+            return ChildBackendRights::default();
+        };
+        let Some(child_sandbox) = session
+            .spawn_context()
+            .map(|context| context.sandbox.clone())
+        else {
+            return ChildBackendRights::default();
+        };
+        let Ok(specs) = crate::turn_loop::collect_tools(session) else {
+            return ChildBackendRights::default();
+        };
+        let Some((parent_activation, parent_sandbox)) =
+            self.parent_rights_ceiling(&manager, parent)
+        else {
+            return ChildBackendRights::default();
+        };
+        drop(manager);
+
+        let tools: BTreeSet<String> = specs
+            .iter()
+            .map(|spec| spec.name().to_owned())
+            .filter(|name| {
+                parent_activation.is_tool_enabled(&harw_tools::ToolName::new(name.as_str()))
+            })
+            .collect();
+        let granted = |permission: Permission| {
+            child_sandbox.permissions().contains(permission)
+                && parent_sandbox.permissions().contains(permission)
+        };
+        let network_hosts: BTreeSet<String> = child_sandbox
+            .network_scope()
+            .hosts()
+            .filter(|host| parent_sandbox.network_scope().allows(host))
+            .map(ToOwned::to_owned)
+            .collect();
+        let host = tools.iter().any(|tool| {
+            LabelClassifier
+                .classify(tool)
+                .is_some_and(|classes| classes.host)
+        });
+        let full_access = self.approval_mode.as_ref().is_some_and(|mode| {
+            mode.get() == harw_extension_api::approval_mode::ApprovalMode::FullAccess
+        });
+        ChildBackendRights {
+            network_open: granted(Permission::NetworkAccess),
+            write: granted(Permission::WriteWorkspace),
+            shell: granted(Permission::ExecuteProcess),
+            host,
+            full_access,
+            network_hosts,
+            tools,
+        }
+    }
+
+    /// Aktivierung und Sandbox von `parent`, gegen die die Admission ein Kind
+    /// schneidet: bei veröffentlichtem Live-Modus die Basis (ohne
+    /// Modus-Schnitt), sonst der aktuelle Stand — wie in [`Self::admit`].
+    /// Deckt Manager-Sitzungen, Elternteile mit laufendem Turn
+    /// ([`CheckedOutParent`]) und die externe Wurzel ab; `None` für einen
+    /// unbekannten Elternteil oder einen ohne Sandbox-Kontext.
+    fn parent_rights_ceiling(
+        &self,
+        manager: &SessionManager,
+        parent: &SessionId,
+    ) -> Option<(SessionActivation, SandboxSpec)> {
+        let follows_live_mode = self.live_mode.current().is_some();
+        if let Ok(session) = manager.get(parent) {
+            let sandbox = session.spawn_context().map(|context| &context.sandbox)?;
+            return Some(if follows_live_mode {
+                (
+                    session.base_activation().clone(),
+                    session.base_sandbox().unwrap_or(sandbox).clone(),
+                )
+            } else {
+                (session.activation().clone(), sandbox.clone())
+            });
+        }
+        if let Some(view) = self.checked_out_parent(parent) {
+            let sandbox = view.spawn_context.map(|context| context.sandbox)?;
+            return Some(if follows_live_mode {
+                (view.base_activation, view.base_sandbox.unwrap_or(sandbox))
+            } else {
+                (view.activation, sandbox)
+            });
+        }
+        self.external_root_parent
+            .as_ref()
+            .filter(|root| &root.session_id == parent)
+            .map(|root| (root.activation.clone(), root.spawn_context.sandbox.clone()))
     }
 
     /// Wave 3C: maps a finished [`crate::child_backend::ChildRunOutcome`]

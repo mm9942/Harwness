@@ -88,13 +88,26 @@ fn report_error(error: &RunnerError) -> ExitCode {
     ExitCode::from(error.exit_code())
 }
 
-/// Prints a one-line manifest banner to stderr, unless `--json` was given
-/// (a machine-reading caller of `--json` gets nothing but the JSON it
-/// asked for on stdout).
-fn print_banner(ir: &harw_agent_dsl::ir_v2::AgentIr, json: bool) {
-    if json {
-        return;
+/// Whether [`run`] prints the one-line manifest banner (to stderr) before
+/// handing over to `interface`. Skipped for:
+/// - `--json`: a machine-reading caller gets nothing but the JSON it asked
+///   for on stdout;
+/// - `--child`: the parent owns the child's stdio (`child_protocol`), so a
+///   stray human line is noise in its log;
+/// - MCP over stdio (`mcp` without `--listen`): the MCP client owns the
+///   process's stdio and typically logs stderr as server diagnostics.
+///
+/// A pure function so the policy is unit tested without an artifact.
+fn banner_wanted(args: &RunnerArgs, interface: Interface) -> bool {
+    if args.json || args.child.is_some() {
+        return false;
     }
+    !(interface == Interface::Mcp && args.listen.is_none())
+}
+
+/// Prints the one-line manifest banner to stderr; [`banner_wanted`]
+/// decides whether it is printed at all.
+fn print_banner(ir: &harw_agent_dsl::ir_v2::AgentIr) {
     eprintln!(
         "harw-agent-runner: {} v{} ({})",
         ir.id, ir.version.0, ir.specialization
@@ -255,8 +268,8 @@ fn run(load: impl FnOnce() -> Result<(Artifact, Bundle), RunnerError>) -> ExitCo
         EffectiveRights::from_manifest(&agent.root_ir().permissions).narrowed_by(&args.flags);
     let agent = Arc::new(agent.with_rights(rights));
 
-    print_banner(agent.root_ir(), args.json);
-
+    // No banner in `--child` mode (see `banner_wanted`): the interface is
+    // not chosen there, so the check is `args.child` alone.
     if let Some(child_id) = args.child.clone() {
         let ctx = RunnerContext {
             bundle,
@@ -274,6 +287,9 @@ fn run(load: impl FnOnce() -> Result<(Artifact, Bundle), RunnerError>) -> ExitCo
         Ok(interface) => interface,
         Err(error) => return report_error(&error),
     };
+    if banner_wanted(&args, interface) {
+        print_banner(agent.root_ir());
+    }
     let ctx = RunnerContext {
         bundle,
         agent,

@@ -2424,6 +2424,25 @@ impl RuntimeAssemblyBuilder {
                 ),
             ));
         }
+        // #22: `agents.build` nur für einen ausdrücklich gewählten Agenten,
+        // dessen Definition es admittiert, innerhalb der Sandbox-Rechte und
+        // mit Job-Verwaltung (nur TUI) — nie für UIA oder eingebaute Rollen.
+        if let Some(ir) = agent_ir.as_ref() {
+            use harw_registry_defaults::agent_definition_tools::{
+                AgentBuildWithheld, agent_build_provider_for,
+            };
+            match agent_build_provider_for(
+                Some(ir.tool_surface()),
+                sandbox.permissions(),
+                session_jobs.as_ref().map(|jobs| Arc::clone(&jobs.manager)),
+            ) {
+                Ok(provider) => {
+                    registry_builder = registry_builder.tool_provider(Arc::new(provider));
+                }
+                Err(AgentBuildWithheld::NotAdmitted) => {}
+                Err(withheld) => tracing::info!(reason = %withheld, "runtime.agents_build.withheld"),
+            }
+        }
 
         // 7b. Plan-Dienste: expliziter Builder-Wert gewinnt; sonst eingebaute
         //     Vorgabe für interaktive TUI-Einstiege, sofern `[tools.plan]`

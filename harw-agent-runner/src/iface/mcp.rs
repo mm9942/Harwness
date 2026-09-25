@@ -1462,7 +1462,7 @@ mod tests {
             json!({"jsonrpc": "2.0", "id": 10, "method": "ping"})
         );
         let mut output: Vec<u8> = Vec::new();
-        server.serve_stdio(input.as_bytes(), &mut output);
+        let _ = server.serve_stdio(input.as_bytes(), &mut output);
         let text = String::from_utf8(output)?;
         let mut lines = text.lines();
         let first: Value = serde_json::from_str(lines.next().ok_or("a parse error line")?)?;

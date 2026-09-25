@@ -216,12 +216,19 @@ way, made two decisions this record did not anticipate:
   field (`"job"`, the default, or `"in-process"`) and a matching wire
   protocol, `harwness.agent-child/v1`
   ([`agent-child-protocol-v1.md`](../design/agent-child-protocol-v1.md)):
-  a job-executed child is a separate `harw-agent-runner --child` process,
-  its own process group, killed as a group on cancel, with its rights
-  narrowed to `min(its own manifest, the parent's current rights)`. This
-  is additive to §2.6's `min(manifest, flags)` rule, not a change to it: a
-  child's rights are still never wider than its own manifest, only
-  possibly narrower still because of its parent.
+  a job-executed child is a separate `harw-agent-runner --child <id>
+  --child-protocol stdio` process (`stdio` is the transport label; the
+  protocol version is checked in the child's `Hello` frame), run as a job
+  in its own process group, stopped as a group on cancel. The parent must
+  send a `Rights` frame before the `Task`; without it the child sends
+  `Error` and exits. The child's rights are `its own manifest ∩ the
+  runner flags ∩ the parent's Rights frame`, where the parent sends the
+  child's real current rights and `full_access` is AND'd at every step
+  (#22 wave 6); the child applies the result to its own session
+  (`EmbeddedAgent::with_rights`). This is additive to §2.6's
+  `min(manifest, flags)` rule, not a change to it: a child's rights are
+  still never wider than its own manifest, only possibly narrower still
+  because of its parent. A `Budget` frame likewise only tightens.
 - **The runner's own interfaces are one crate, `cli`/`repl`/`mcp`/`http`
   behind cargo features, `tui` reusing `harw-tui`'s existing renderer**
   (`harw_tui::fixed_agent`) rather than a new one — §2.5 left this
@@ -244,10 +251,11 @@ rediscovered from the code:
   and are tested against real spawned processes, and
   `harw-agent-runner::context::RunnerContext::builder` now sets
   `RuntimeSpec::child_backend` for `EntryKind::CompiledAgent` whenever
-  the definition's `[binary].child_execution` is `"job"` (the default)
-  and the process is not itself a `--child` run — a root agent's own
-  delegation reaches a separate child process without any explicit
-  invocation. The mini TUI (`harw-agent-runner/src/iface/tui.rs`) builds
+  the current agent's `[binary].child_execution` is `"job"` (the
+  default) — a root agent's own delegation reaches a separate child
+  process without any explicit invocation, and a `--child` process whose
+  agent delegates further does the same, so isolation holds at every
+  depth. The mini TUI (`harw-agent-runner/src/iface/tui.rs`) builds
   its own `RuntimeSpec` and sets the same backend under the same
   condition. `harw-runtime/src/assembly.rs` passes the backend through
   to the `ManagedAgentSpawner`.

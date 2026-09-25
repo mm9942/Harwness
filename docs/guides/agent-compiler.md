@@ -173,7 +173,7 @@ what this build does have.
 | `--read-only` | drop write and shell rights for this run. |
 | `--max-tokens <n>` | cap the token budget at `n`, tightening (never loosening) the manifest's own budget. |
 | `--listen <addr>` | bind address for `http` (default `127.0.0.1:8787`) and for `mcp`'s Streamable HTTP transport (§5.3, §5.4). |
-| `--child <id>` / `--child-protocol <label>` | run as a delegated child instead of a top-level interface (§5.6); both flags are required together. |
+| `--child <id>` / `--child-protocol <label>` | run as a delegated child instead of a top-level interface (§5.7); both flags are required together. |
 
 Every flag above except `--manifest`/`--verify`/`--version`/`--capabilities`
 narrows the manifest before the chosen interface starts

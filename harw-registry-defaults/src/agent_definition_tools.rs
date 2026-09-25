@@ -3114,10 +3114,7 @@ admitted = ["fs.read", "agents.build"]
         let names: Vec<String> = provider
             .tools()
             .iter()
-            .map(|spec| match spec {
-                harw_tools::ToolSpec::Function(function) => function.name.as_str().to_owned(),
-                other => format!("{other:?}"),
-            })
+            .map(|spec| spec.name().to_owned())
             .collect();
         assert_eq!(names, vec!["agents.build".to_owned()]);
         assert!(provider.executor(&ToolName::new("agents.build")).is_some());

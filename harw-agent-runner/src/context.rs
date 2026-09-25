@@ -10,16 +10,49 @@
 //! interface embeds the same agent the same way.
 
 use std::io;
-use std::sync::Arc;
+use std::sync::{Arc, Once};
 
 use harw_agent_artifact::Bundle;
-use harw_agent_dsl::ir_v2::{AgentIr, ChildExecution};
+use harw_agent_dsl::ir_v2::{AgentIr, ChildExecution, Interface};
 use harw_runtime::EmbeddedAgent;
 use harwness_sdk::{Harwness, HarwnessBuilder};
 
 use crate::args::RunnerArgs;
 use crate::error::RunnerError;
 use crate::job_child_backend::JobChildBackend;
+
+/// The environment variable that carries the offline echo's reply text.
+pub const OFFLINE_ECHO_ENV: &str = "HARW_OFFLINE_ECHO";
+
+/// The reply the offline echo gives with `--offline-echo` but no
+/// [`OFFLINE_ECHO_ENV`] text.
+const DEFAULT_OFFLINE_ECHO_REPLY: &str = "offline echo";
+
+/// The stderr line whenever the offline echo replaces the agent's model.
+const OFFLINE_ECHO_NOTICE: &str = "offline echo: model calls are answered locally";
+
+/// The stderr line when [`OFFLINE_ECHO_ENV`] is set but not honored (a
+/// release build without `--offline-echo`).
+const OFFLINE_ECHO_IGNORED_NOTICE: &str =
+    "offline echo: HARW_OFFLINE_ECHO is ignored in a release build without --offline-echo";
+
+/// Decides whether the offline echo replaces the embedded agent's model.
+///
+/// # Description
+/// An environment variable alone must not silently change what a
+/// distributed binary does: [`OFFLINE_ECHO_ENV`] is honored only in a
+/// build with `debug_assertions` (tests and dev builds, where the e2e tests
+/// set it on `CARGO_BIN_EXE_harw-agent-runner`). The explicit
+/// `--offline-echo` flag enables the echo in every build, with the
+/// variable's text as reply when set.
+///
+/// - `env_set` (`bool`): [`OFFLINE_ECHO_ENV`] is present.
+/// - `flag` (`bool`): `--offline-echo` was given.
+/// - `debug` (`bool`): `cfg!(debug_assertions)`.
+#[must_use]
+pub fn offline_echo_enabled(env_set: bool, flag: bool, debug: bool) -> bool {
+    flag || (env_set && debug)
+}
 
 /// One runner invocation: the verified bundle, the embedded agent built
 /// from it (with rights already narrowed by the command line), and the
@@ -85,10 +118,44 @@ impl RunnerContext {
         if self.root_ir().binary.child_execution == ChildExecution::Job {
             builder = builder.child_backend(self.job_child_backend()?);
         }
-        if let Ok(reply) = std::env::var("HARW_OFFLINE_ECHO") {
-            builder = builder.offline_echo(reply);
+        let env_reply = std::env::var(OFFLINE_ECHO_ENV).ok();
+        if offline_echo_enabled(
+            env_reply.is_some(),
+            self.args.offline_echo,
+            cfg!(debug_assertions),
+        ) {
+            self.notice_once(OFFLINE_ECHO_NOTICE);
+            builder = builder
+                .offline_echo(env_reply.unwrap_or_else(|| DEFAULT_OFFLINE_ECHO_REPLY.to_owned()));
+        } else if env_reply.is_some() {
+            self.notice_once(OFFLINE_ECHO_IGNORED_NOTICE);
         }
         Ok(builder)
+    }
+
+    /// Whether a human-facing notice may go to stderr for this invocation:
+    /// not with `--json` (a machine reader), not in MCP stdio mode (the
+    /// client owns the process's pipes) and not as a delegated `--child`
+    /// (the parent already printed it). The resolved interface follows
+    /// `crate::choose_interface`'s precedence: the `--interface` flag, else
+    /// the manifest's default.
+    fn notice_wanted(&self) -> bool {
+        let interface = self
+            .args
+            .interface
+            .unwrap_or(self.root_ir().binary.default_interface);
+        let mcp_stdio = interface == Interface::Mcp && self.args.listen.is_none();
+        !self.args.json && !mcp_stdio && self.args.child.is_none()
+    }
+
+    /// Prints `line` on stderr at most once per process (an interface such
+    /// as `mcp`/`http` calls [`Self::builder`] once per request), and only
+    /// when [`Self::notice_wanted`] allows it.
+    fn notice_once(&self, line: &str) {
+        static PRINTED: Once = Once::new();
+        if self.notice_wanted() {
+            PRINTED.call_once(|| eprintln!("{line}"));
+        }
     }
 
     /// Builds the job-backed [`harw_core::child_backend::ChildBackend`] for
@@ -121,6 +188,30 @@ impl RunnerContext {
 
 #[cfg(test)]
 mod tests {
+    use super::offline_echo_enabled;
+
+    #[test]
+    fn test_offline_echo_truth_table() {
+        // (env_set, flag, debug) -> enabled
+        let table = [
+            ((false, false, false), false),
+            ((false, false, true), false),
+            ((false, true, false), true),
+            ((false, true, true), true),
+            ((true, false, false), false),
+            ((true, false, true), true),
+            ((true, true, false), true),
+            ((true, true, true), true),
+        ];
+        for ((env_set, flag, debug), expected) in table {
+            assert_eq!(
+                offline_echo_enabled(env_set, flag, debug),
+                expected,
+                "env_set={env_set} flag={flag} debug={debug}"
+            );
+        }
+    }
+
     // `RunnerContext::harwness` needs a real `EmbeddedAgent`, which only
     // exists once `harw-runtime`'s `embedded` module (agent 3, wave 3) is
     // implemented; `crate::verify` and `crate::lib` tests build a

@@ -42,16 +42,26 @@ pub type ChildBackendFuture<'a> = Pin<Box<dyn Future<Output = ChildRunOutcome> +
 /// the child protocol's `Answer.text` (plan §3C).
 pub type ChildAnswerFuture<'a> = Pin<Box<dyn Future<Output = String> + Send + 'a>>;
 
-/// Rights a child run may use, already narrowed to
-/// `min(child manifest, the parent's current rights)` by the caller — a
-/// [`ChildBackend`] only ever narrows further, never widens.
+/// Rights a child run may use: the child's current effective rights as the
+/// parent's runtime sees them — exactly what the same child would get
+/// in-process (its tool surface after the parent-authority cut, its sandbox,
+/// the tree's approval mode), filled by
+/// `crate::child_controller::ManagedAgentSpawner` and never more than the
+/// parent holds. A [`ChildBackend`] passes them on unchanged or narrows
+/// further, never widens; the child itself then intersects them with its
+/// own manifest.
+///
+/// `Default` is "no rights at all" (every set empty, every flag `false`).
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ChildBackendRights {
     /// Exact tool names the child may call.
     pub tools: BTreeSet<String>,
-    /// Hosts the child may reach over the network.
+    /// Hosts the child may reach over the network (only meaningful with
+    /// `network_open`).
     pub network_hosts: BTreeSet<String>,
-    /// Unrestricted network access (beyond `network_hosts`).
+    /// Network access is allowed at all. Despite the name (kept for the
+    /// child protocol's `ChildRights::network_open`) this is not
+    /// "unrestricted": only `network_hosts` are reachable.
     pub network_open: bool,
     /// Write access to the workspace.
     pub write: bool,
@@ -59,7 +69,8 @@ pub struct ChildBackendRights {
     pub shell: bool,
     /// Host-level (unsandboxed) execution.
     pub host: bool,
-    /// The manifest's full-access escape hatch.
+    /// Automatic approval inside the rights above (the parent runs in full
+    /// access); never widens any of them.
     pub full_access: bool,
 }
 
@@ -79,7 +90,8 @@ pub struct ChildRunSpec {
     /// Opaque continuation token from a prior budget-ended run of the same
     /// child, if this run resumes one.
     pub continue_from: Option<String>,
-    /// Rights for this run (already narrowed; see struct docs).
+    /// Rights for this run (the child's current effective rights; see
+    /// [`ChildBackendRights`]).
     pub rights: ChildBackendRights,
     /// Budget for this run, if any.
     pub budget: Option<Budget>,
