@@ -17,8 +17,11 @@ use crate::web_toml::WebSection;
 use harw_agent_dsl::layers::DefinitionLayer;
 use harw_agent_dsl::parse::parse_toml as parse_agent_definition_toml;
 use harw_agent_dsl::raw::RawAgentDefinition;
+use harw_agent_dsl::bind::ContextProgramLibrary;
+use harw_agent_dsl::diagnostics::{Severity, SourceFile};
+use harw_agent_dsl::lower_v2::{FsInstructionsLoader, LowerSources, diagnostic_for_error, lower_v2};
 use harw_agent_dsl::resolve::resolve_definition;
-use harw_agent_dsl::{ExecutableAgentIr, lower};
+use harw_agent_dsl::{AgentIr, ExecutableAgentIr};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
@@ -67,10 +70,10 @@ impl std::fmt::Display for ConfigDiagnostic {
 /// (Plan R9, Teil B).
 ///
 /// # Description
-/// [`ExecutableAgentIr`] trägt nur, was die Laufzeit durchsetzt. Für den
-/// Agenten-Katalog und die Instruktionen eines benutzerdefinierten Agenten
-/// braucht der Roster zusätzlich Name, Beschreibung, Herkunftsschicht und den
-/// Text der per `instructions_file` referenzierten Datei.
+/// Seit #22 Welle 1B eine dünne Sicht auf die typisierte IR
+/// ([`ResolvedConfig::agent_irs`]): Name, Beschreibung, Instruktionen und
+/// Delegationsziele werden aus der [`AgentIr`] übernommen; nur die
+/// Herkunftsschicht kommt aus der Discovery selbst.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct AgentDefinitionMeta {
     /// Optionaler Anzeigename (`name = "..."`).
@@ -79,9 +82,9 @@ pub struct AgentDefinitionMeta {
     pub description: Option<String>,
     /// Die höchste Schicht, aus der die Definition stammt.
     pub layer: Option<DefinitionLayer>,
-    /// Inhalt der per `instructions_file = "system.md"` referenzierten Datei
-    /// (relativ zum Agentenordner der Definition, die das Feld setzt), falls
-    /// vorhanden und nicht leer.
+    /// Instruktionstext der IR (`instructions_file`, relativ zum
+    /// Agentenordner der Definition, die das Feld setzt, sonst ein
+    /// `system.md` neben der Definition), falls nicht leer.
     pub instructions: Option<String>,
     /// `[delegation].targets` der aufgelösten Definition, falls vorhanden —
     /// die namentliche Zielliste eines Orchestrators (ein Filter über seine
@@ -99,7 +102,16 @@ pub struct ResolvedConfig {
     pub harness: HarnessConfig,
     pub agents: HashMap<String, AgentToml>,
     /// Compiled agent definitions, keyed by their canonical `DefinitionId`.
+    /// Since #22 wave 1B the legacy runtime view of [`Self::agent_irs`]
+    /// (`ExecutableAgentIr::from(&ir)`), kept so existing consumers compile.
     pub executable_agents: HashMap<String, ExecutableAgentIr>,
+    /// The typed Agent IR v2 of every discovered definition (#22 wave 1B),
+    /// keyed like [`Self::executable_agents`] by `DefinitionId`. Lowered with
+    /// `harw_agent_dsl::lower_v2::lower_v2` over the built-in definitions,
+    /// the instruction files of the agent directories and the context-program
+    /// library (built-in programs plus `agents/context-programs/*.toml` of the
+    /// trusted layers).
+    pub agent_irs: HashMap<String, AgentIr>,
     /// Agentenordner der final aufgelösten DSL-Definitionen. Der Runtime-Pfad
     /// verwendet ihn ausschließlich für die optionalen, benutzerpflegbaren
     /// UIA-Dateien `Personality.md` und `USER.md`.
@@ -665,8 +677,8 @@ pub fn discover_config_with_restricted_and_project_settings(
     project_settings: Option<&Path>,
 ) -> ConfigResult<ResolvedConfig> {
     let mut resolved = ResolvedConfig::default();
-    let mut definition_layers =
-        BTreeMap::<String, Vec<(DefinitionLayer, RawAgentDefinition, PathBuf)>>::new();
+    let mut definition_layers = BTreeMap::<String, DiscoveredDefinitionLayers>::new();
+    let mut context_programs: Vec<(DefinitionLayer, String, String, PathBuf)> = Vec::new();
 
     // Env-Layer aus allen Layer-Verzeichnissen laden (letzte gewinnt).
     // Die Prozess-Umgebung wird nicht verändert.
@@ -752,6 +764,9 @@ pub fn discover_config_with_restricted_and_project_settings(
             DefinitionLayer::UserGlobal
         };
         discover_agent_definitions(base, definition_layer, &mut definition_layers)?;
+        // #22 Welle 1B: eigene Kontextprogramme der Schicht
+        // (`agents/context-programs/*.toml`).
+        discover_context_programs(base, definition_layer, &mut context_programs)?;
 
         // providers/*.toml
         discover_flat_dir::<ProviderToml>(base, "providers", &mut resolved.providers)?;
@@ -785,22 +800,21 @@ pub fn discover_config_with_restricted_and_project_settings(
     // Definitionen aufgelöst (Plan R9, Teil B): so lösen `extends` auf
     // `harwness.agent.worker-base@1`, `…child-orchestrator-base@1` oder eine
     // eingebaute Rolle auf, statt mit `MissingBase` zu scheitern.
-    let all_definitions = definition_layers
-        .values()
-        .flat_map(|definitions| {
-            definitions
-                .iter()
-                .map(|(layer, definition, _)| (*layer, definition.clone()))
-        })
-        .collect::<Vec<_>>();
-    for (id, definitions) in definition_layers {
-        let (executable, meta, definition_dir) =
-            resolve_discovered_definition(&id, &definitions, &all_definitions)?;
-        resolved
-            .agent_definition_dirs
-            .insert(id.clone(), definition_dir);
-        resolved.agent_definition_meta.insert(id.clone(), meta);
-        resolved.executable_agents.insert(id, executable);
+    if !definition_layers.is_empty() {
+        let library = context_program_library(&context_programs)?;
+        let stack = DefinitionStack::new(&definition_layers);
+        for (id, definitions) in &definition_layers {
+            let (ir, meta, definition_dir) =
+                resolve_discovered_definition(id, definitions, &stack, &library)?;
+            resolved
+                .agent_definition_dirs
+                .insert(id.clone(), definition_dir);
+            resolved.agent_definition_meta.insert(id.clone(), meta);
+            resolved
+                .executable_agents
+                .insert(id.clone(), ExecutableAgentIr::from(&ir));
+            resolved.agent_irs.insert(id.clone(), ir);
+        }
     }
 
     if let Some(repo) = restricted_repo {
@@ -1137,10 +1151,94 @@ fn legacy_provider(name: &str, enabled: bool) -> Option<ProviderToml> {
 }
 
 /// Discovered source layers of one definition id: `(layer, raw, file)`.
-type DiscoveredDefinitionLayers = Vec<(DefinitionLayer, RawAgentDefinition, PathBuf)>;
+/// Eine entdeckte Definitionsdatei: Schicht, geparste Rohform, Pfad und
+/// Quelltext (der Quelltext speist Spannen und eigene Tabellen des
+/// IR-v2-Senkens, #22 Welle 1B).
+type DiscoveredDefinitionLayers = Vec<(DefinitionLayer, RawAgentDefinition, PathBuf, String)>;
+
+/// Alle entdeckten Definitionen eines Discovery-Laufs als Auflösungsstapel
+/// (Rohformen) und als Quelldateien (#22 Welle 1B).
+struct DefinitionStack {
+    raw: Vec<(DefinitionLayer, RawAgentDefinition)>,
+    files: Vec<SourceFile>,
+}
+
+impl DefinitionStack {
+    fn new(definition_layers: &BTreeMap<String, DiscoveredDefinitionLayers>) -> Self {
+        let mut raw = Vec::new();
+        let mut files = Vec::new();
+        for definitions in definition_layers.values() {
+            for (layer, definition, path, text) in definitions {
+                raw.push((*layer, definition.clone()));
+                files.push(SourceFile::new(*layer, path.clone(), text.clone()));
+            }
+        }
+        Self { raw, files }
+    }
+}
+
+/// Baut die Kontextprogramm-Bibliothek: die eingebauten Programme plus die
+/// eigenen Programme der vertrauten Schichten (#22 Welle 1B).
+///
+/// # Errors
+/// [`ConfigError::Invalid`], wenn ein Programm nicht parst oder ein Name mit
+/// einer anderen Programm-ID doppelt vergeben ist.
+fn context_program_library(
+    programs: &[(DefinitionLayer, String, String, PathBuf)],
+) -> ConfigResult<ContextProgramLibrary> {
+    let mut library =
+        crate::builtin_definitions::builtin_context_program_library().map_err(|error| {
+            ConfigError::Invalid(format!("built-in context programs do not parse: {error}"))
+        })?;
+    for (layer, name, source, path) in programs {
+        library
+            .insert_sources(*layer, &[(name.as_str(), source.as_str())])
+            .map_err(|error| {
+                ConfigError::Invalid(format!(
+                    "context program {}: {error}",
+                    path.display()
+                ))
+            })?;
+    }
+    Ok(library)
+}
+
+/// Entdeckt die eigenen Kontextprogramme eines Layers:
+/// `agents/context-programs/*.toml`, Name ist der Dateistamm (#22 Welle 1B).
+///
+/// # Errors
+/// Lesefehler.
+fn discover_context_programs(
+    base: &Path,
+    layer: DefinitionLayer,
+    target: &mut Vec<(DefinitionLayer, String, String, PathBuf)>,
+) -> ConfigResult<()> {
+    let dir = base
+        .join("agents")
+        .join(crate::builtin_definitions::CONTEXT_PROGRAMS_DIR);
+    if !dir.is_dir() {
+        return Ok(());
+    }
+    for entry in read_sorted_dir_entries(&dir)? {
+        let path = entry.path();
+        if path.extension().and_then(|ext| ext.to_str()) != Some("toml") || !path.is_file() {
+            continue;
+        }
+        let Some(name) = path
+            .file_stem()
+            .and_then(|stem| stem.to_str())
+            .map(str::to_owned)
+        else {
+            continue;
+        };
+        let source = read_file(&path)?;
+        target.push((layer, name, source, path));
+    }
+    Ok(())
+}
 
 /// Löst eine entdeckte Definition über den eingebauten Definitionen auf und
-/// senkt sie (Plan R9, Teil B).
+/// senkt sie zur typisierten [`AgentIr`] (Plan R9, Teil B; #22 Welle 1B).
 ///
 /// # Description
 /// Der Auflösungsstapel besteht aus
@@ -1151,24 +1249,31 @@ type DiscoveredDefinitionLayers = Vec<(DefinitionLayer, RawAgentDefinition, Path
 ///    und nie als Overlay über die eingebaute Rolle gelegt (die eingebaute
 ///    Rolle selbst bleibt davon unberührt, siehe
 ///    `harw_registry_defaults::embedded_agents::builtin_agent_definitions`),
-/// 2. allen entdeckten Definitionen aller vertrauten Layer (`all`), damit
+/// 2. allen entdeckten Definitionen aller vertrauten Layer (`stack`), damit
 ///    lokale Definitionen einander erweitern können.
 ///
+/// Gesenkt wird mit `lower_v2` über denselben Dateien (Spannen, eigene
+/// Tabellen), dem [`FsInstructionsLoader`] (`instructions_file` bzw.
+/// `system.md` im Agentenordner) und der Kontextprogramm-Bibliothek — eine
+/// Nutzerdefinition bekommt ihr `[context] program` damit gebunden wie jede
+/// eingebaute Rolle. Warnungen und Hinweise werden geloggt.
+///
 /// # Returns
-/// Die gesenkte IR, ihre [`AgentDefinitionMeta`] und den Agentenordner der
-/// höchsten Quelle.
+/// Die IR, ihre [`AgentDefinitionMeta`] (Sicht auf die IR) und den
+/// Agentenordner der höchsten Quelle.
 ///
 /// # Errors
-/// [`ConfigError::Invalid`], wenn Auflösung oder Senken scheitern oder eine
-/// `instructions_file` den Agentenordner verlässt bzw. zu groß ist.
+/// [`ConfigError::Invalid`] mit den gerenderten Diagnosen (Code,
+/// `datei:zeile:spalte`, Hilfetext), wenn Auflösung oder Senken scheitern.
 fn resolve_discovered_definition(
     id: &str,
     definitions: &DiscoveredDefinitionLayers,
-    all: &[(DefinitionLayer, RawAgentDefinition)],
-) -> ConfigResult<(ExecutableAgentIr, AgentDefinitionMeta, PathBuf)> {
+    stack: &DefinitionStack,
+    programs: &ContextProgramLibrary,
+) -> ConfigResult<(AgentIr, AgentDefinitionMeta, PathBuf)> {
     let paths = definitions
         .iter()
-        .map(|(_, _, path)| path.display().to_string())
+        .map(|(_, _, path, _)| path.display().to_string())
         .collect::<Vec<_>>()
         .join(", ");
     let first = definitions.first().ok_or_else(|| {
@@ -1177,75 +1282,78 @@ fn resolve_discovered_definition(
         ))
     })?;
     let target_id = &first.1.id;
+    let target_label = target_id.to_string();
     let mut resolver_layers = crate::builtin_definitions::builtin_definition_layers()
         .iter()
         .filter(|builtin| &builtin.id != target_id)
         .map(|builtin| (DefinitionLayer::BuiltIn, builtin.clone()))
         .collect::<Vec<_>>();
-    resolver_layers.extend(all.iter().cloned());
+    resolver_layers.extend(stack.raw.iter().cloned());
+    let mut files: Vec<SourceFile> = crate::builtin_definitions::builtin_source_files()
+        .iter()
+        .filter(|(_, declared)| declared.as_deref() != Some(target_label.as_str()))
+        .map(|(file, _)| file.clone())
+        .collect();
+    files.extend(stack.files.iter().cloned());
+
     let resolved_definition =
         resolve_definition(target_id, &resolver_layers, OffsetDateTime::now_utc()).map_err(
             |error| {
+                let diagnostic = diagnostic_for_error(&error, &files, target_id);
                 ConfigError::Invalid(format!(
-                    "failed to resolve agent definition '{id}' from {paths}: {error}"
+                    "failed to resolve agent definition '{id}' from {paths}:\n{diagnostic}"
                 ))
             },
         )?;
-    let executable = lower(&resolved_definition).map_err(|error| {
+    let loader = FsInstructionsLoader::new();
+    let sources = LowerSources::new(&files)
+        .with_instructions(&loader)
+        .with_context_programs(programs);
+    let ir = lower_v2(&resolved_definition, &sources).map_err(|diagnostics| {
         ConfigError::Invalid(format!(
-            "failed to lower agent definition '{id}' from {paths}: {error}"
+            "failed to lower agent definition '{id}' from {paths}:\n{diagnostics}"
         ))
     })?;
+    for diagnostic in &ir.trace.diagnostics {
+        if diagnostic.severity == Severity::Warning {
+            tracing::warn!(
+                definition = %id,
+                code = %diagnostic.code,
+                "config.agent_definition.diagnostic: {diagnostic}"
+            );
+        } else {
+            tracing::debug!(
+                definition = %id,
+                code = %diagnostic.code,
+                "config.agent_definition.diagnostic: {diagnostic}"
+            );
+        }
+    }
     let last_source = definitions.last().ok_or_else(|| {
         ConfigError::Invalid(format!(
             "resolved agent definition '{id}' from {paths} has no source layer"
         ))
     })?;
     let definition_dir = parent_dir(&last_source.2)?;
+    let meta = AgentDefinitionMeta::from_ir(&ir, Some(last_source.0));
+    Ok((ir, meta, definition_dir))
+}
 
-    // `instructions_file` gilt relativ zum Ordner der Definition, die das
-    // Feld selbst setzt — die höchste solche Quelle gewinnt.
-    let instructions = definitions
-        .iter()
-        .rev()
-        .find_map(|(_, raw, path)| {
-            raw.tables
-                .get(INSTRUCTIONS_FILE_KEY)
-                .and_then(|value| value.as_str())
-                .map(|file| (file.to_owned(), path.clone()))
-        })
-        .map(|(file, path)| {
-            let dir = parent_dir(&path)?;
-            crate::loader::load_agent_instructions(&dir, &file).map_err(|error| {
-                ConfigError::Invalid(format!(
-                    "agent definition '{id}' from {paths}: {INSTRUCTIONS_FILE_KEY}: {error}"
-                ))
-            })
-        })
-        .transpose()?
-        .filter(|text| !text.trim().is_empty());
-
-    let delegation_targets = resolved_definition
-        .config
-        .get("delegation")
-        .and_then(|value| value.as_table())
-        .and_then(|table| table.get("targets"))
-        .and_then(|value| value.as_array())
-        .map(|targets| {
-            targets
-                .iter()
-                .filter_map(|value| value.as_str())
-                .map(str::to_owned)
-                .collect::<Vec<_>>()
-        });
-    let meta = AgentDefinitionMeta {
-        name: resolved_definition.name.clone(),
-        description: resolved_definition.description.clone(),
-        layer: Some(last_source.0),
-        instructions,
-        delegation_targets,
-    };
-    Ok((executable, meta, definition_dir))
+impl AgentDefinitionMeta {
+    /// Die Sicht auf eine [`AgentIr`] (#22 Welle 1B): Name, Beschreibung,
+    /// nicht leerer Instruktionstext und `[delegation].targets` aus der IR,
+    /// dazu die Herkunftsschicht.
+    #[must_use]
+    pub fn from_ir(ir: &AgentIr, layer: Option<DefinitionLayer>) -> Self {
+        let text = ir.instructions.text.as_str();
+        Self {
+            name: ir.name.clone(),
+            description: ir.description.clone(),
+            layer,
+            instructions: (!text.trim().is_empty()).then(|| text.to_owned()),
+            delegation_targets: ir.spawn.delegation_targets.clone(),
+        }
+    }
 }
 
 /// Der Elternordner einer Definitionsdatei.
@@ -1317,6 +1425,7 @@ fn discover_agent_definitions(
             layer,
             definition,
             definition_path,
+            content,
         ));
     }
 
@@ -1351,7 +1460,7 @@ fn discover_agent_definitions(
         target
             .entry(id)
             .or_default()
-            .push((layer, definition, flat_path));
+            .push((layer, definition, flat_path, content));
     }
 
     Ok(())
@@ -1397,19 +1506,17 @@ pub fn discover_run_agent_definitions(
     let run_base = project_harw_dir.join("state").join("runs").join(run_id);
     let mut definition_layers = BTreeMap::<String, DiscoveredDefinitionLayers>::new();
     discover_agent_definitions(&run_base, DefinitionLayer::RunLocal, &mut definition_layers)?;
-    let all_definitions = definition_layers
-        .values()
-        .flat_map(|definitions| {
-            definitions
-                .iter()
-                .map(|(layer, definition, _)| (*layer, definition.clone()))
-        })
-        .collect::<Vec<_>>();
+    let mut context_programs = Vec::new();
+    discover_context_programs(&run_base, DefinitionLayer::RunLocal, &mut context_programs)?;
     let mut out = HashMap::new();
-    for (id, definitions) in definition_layers {
-        let (executable, meta, _) =
-            resolve_discovered_definition(&id, &definitions, &all_definitions)?;
-        out.insert(id, (executable, meta));
+    if definition_layers.is_empty() {
+        return Ok(out);
+    }
+    let library = context_program_library(&context_programs)?;
+    let stack = DefinitionStack::new(&definition_layers);
+    for (id, definitions) in &definition_layers {
+        let (ir, meta, _) = resolve_discovered_definition(id, definitions, &stack, &library)?;
+        out.insert(id.clone(), (ExecutableAgentIr::from(&ir), meta));
     }
     Ok(out)
 }
@@ -3280,6 +3387,202 @@ allowed_cgroup_prefixes = ["/sys/fs/cgroup/evil.slice/"]
 
         std::fs::remove_dir_all(home).map_err(ctx("Home-Verzeichnis entfernen"))?;
         std::fs::remove_dir_all(repo).map_err(ctx("Repo-Verzeichnis entfernen"))?;
+        Ok(())
+    }
+
+    /// #22 Welle 1B: eine Nutzerdefinition bekommt ihr `[context] program`
+    /// gebunden — ein eingebautes wie ein eigenes aus
+    /// `agents/context-programs/` — und liegt als typisierte IR vor.
+    #[test]
+    fn user_definitions_get_their_context_program_bound() -> TestResult {
+        let base = test_directory("context-program-binding")?;
+        let explore_id = "user.agent.scout@1";
+        write_definition(
+            &base,
+            "scout",
+            &format!(
+                r#"schema = "harwness.agent/v1"
+id = "{explore_id}"
+version = "1.0.0"
+extends = {{ id = "harwness.agent.worker-base@1" }}
+role = "worker"
+specialization = "scout"
+
+[tools]
+admitted = ["fs.read"]
+
+[context]
+program = "explore"
+"#
+            ),
+        )?;
+        let own_id = "user.agent.digest@1";
+        write_definition(
+            &base,
+            "digest",
+            &format!(
+                r#"schema = "harwness.agent/v1"
+id = "{own_id}"
+version = "1.0.0"
+extends = {{ id = "harwness.agent.worker-base@1" }}
+role = "worker"
+specialization = "digest"
+
+[tools]
+admitted = ["fs.read"]
+
+[context]
+program = "digest"
+"#
+            ),
+        )?;
+        let programs = base.join("agents").join("context-programs");
+        std::fs::create_dir_all(&programs).map_err(ctx("Programmordner"))?;
+        std::fs::write(
+            programs.join("digest.toml"),
+            r#"schema = "harwness.context/v1"
+id = "user.context.digest@1"
+version = "1.0.0"
+
+[[sections]]
+name = "task.objective"
+strength = "must-include"
+detail = "full"
+trust = "instruction"
+
+[[sections]]
+name = "plan.current"
+strength = "must-include"
+detail = "summary"
+trust = "data"
+"#,
+        )
+        .map_err(ctx("digest.toml"))?;
+
+        let config =
+            discover_config(std::slice::from_ref(&base)).map_err(ctx("discover config"))?;
+        let scout = config
+            .agent_irs
+            .get(explore_id)
+            .ok_or(TestError::Missing("scout IR"))?;
+        assert_eq!(scout.context.program.as_deref(), Some("explore"));
+        assert_eq!(
+            scout.context.program_id.as_deref(),
+            Some("harwness.context.explore@1")
+        );
+        assert!(!scout.context.sections.is_empty());
+        let digest = config
+            .agent_irs
+            .get(own_id)
+            .ok_or(TestError::Missing("digest IR"))?;
+        assert_eq!(digest.context.program.as_deref(), Some("digest"));
+        assert!(
+            digest
+                .context
+                .must_include
+                .iter()
+                .any(|section| section == "task.objective")
+        );
+        // `plan.current` liegt außerhalb der Wurzeldecke: benannt, aber
+        // zurückgestellt statt beim Start verlangt.
+        assert_eq!(digest.context.deferred, ["plan.current"]);
+        // Die Laufzeitsicht trägt dieselbe Politik.
+        let view = config
+            .executable_agents
+            .get(own_id)
+            .ok_or(TestError::Missing("digest view"))?;
+        assert_eq!(
+            view.context_program().context_policy(),
+            Some("user.context.digest@1")
+        );
+        std::fs::remove_dir_all(base).map_err(ctx("Testverzeichnis entfernen"))?;
+        Ok(())
+    }
+
+    /// #22 Welle 1B: eine defekte Nutzerdefinition scheitert mit den
+    /// gerenderten Diagnosen — stabiler Code plus `datei:zeile:spalte`.
+    #[test]
+    fn broken_user_definition_reports_diagnostic_codes_with_spans() -> TestResult {
+        let base = test_directory("broken-definition")?;
+        write_definition(
+            &base,
+            "broken",
+            r#"schema = "harwness.agent/v1"
+id = "user.agent.broken@1"
+version = "1.0.0"
+role = "worker"
+specialization = "broken"
+
+[tols]
+admitted = ["fs.read"]
+
+[return]
+contract = "harwness.return.nope@1"
+"#,
+        )?;
+        let error = match discover_config(std::slice::from_ref(&base)) {
+            Ok(_) => {
+                return Err(TestError::Unexpected(
+                    "a broken definition must not load".to_owned(),
+                ));
+            }
+            Err(error) => error.to_string(),
+        };
+        assert!(error.contains("HARW-SCHEMA-002"), "{error}");
+        assert!(error.contains("HARW-RETURN-001"), "{error}");
+        // `--> <pfad>/definition.toml:<zeile>:<spalte>`
+        assert!(error.contains("definition.toml:"), "{error}");
+        assert!(error.contains("-->"), "{error}");
+        assert!(error.contains("user.agent.broken@1"), "{error}");
+        std::fs::remove_dir_all(base).map_err(ctx("Testverzeichnis entfernen"))?;
+        Ok(())
+    }
+
+    /// #22 Welle 1B: `AgentDefinitionMeta` ist eine Sicht auf die IR —
+    /// Instruktionen (auch ein implizites `system.md`), Beschreibung und
+    /// Delegationsziele stimmen mit ihr überein.
+    #[test]
+    fn definition_meta_is_a_view_of_the_ir() -> TestResult {
+        let base = test_directory("meta-view")?;
+        let id = "user.agent.lead@1";
+        write_definition(
+            &base,
+            "lead",
+            &format!(
+                r#"schema = "harwness.agent/v1"
+id = "{id}"
+version = "1.0.0"
+extends = {{ id = "harwness.agent.child-orchestrator-base@1" }}
+role = "child-orchestrator"
+specialization = "lead"
+description = "Leitet eine Prüfung."
+
+[delegation]
+targets = ["explorer", "analyst"]
+"#
+            ),
+        )?;
+        std::fs::write(
+            base.join("agents").join("lead").join("system.md"),
+            "Plane zuerst, delegiere dann.",
+        )
+        .map_err(ctx("system.md"))?;
+        let config =
+            discover_config(std::slice::from_ref(&base)).map_err(ctx("discover config"))?;
+        let ir = config.agent_irs.get(id).ok_or(TestError::Missing("IR"))?;
+        let meta = config
+            .agent_definition_meta
+            .get(id)
+            .ok_or(TestError::Missing("meta"))?;
+        assert_eq!(meta, &AgentDefinitionMeta::from_ir(ir, meta.layer));
+        assert_eq!(meta.instructions.as_deref(), Some("Plane zuerst, delegiere dann."));
+        assert_eq!(ir.instructions.source.as_deref(), Some("system.md"));
+        assert_eq!(
+            meta.delegation_targets,
+            Some(vec!["explorer".to_owned(), "analyst".to_owned()])
+        );
+        assert_eq!(meta.layer, Some(DefinitionLayer::UserGlobal));
+        std::fs::remove_dir_all(base).map_err(ctx("Testverzeichnis entfernen"))?;
         Ok(())
     }
 }

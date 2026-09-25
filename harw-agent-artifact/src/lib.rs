@@ -67,6 +67,15 @@
 //! that no bytes remain. The first failure is returned; there is no partial
 //! result.
 //!
+//! # Bundles: shared payload pool and agent entries
+//!
+//! A compiled agent (with its whole delegation closure) is stored as a
+//! [`bundle`]: every file once in a content-addressed pool
+//! (`pool/<blake3>`), one entry per agent (`agents/<id>.json`, IR plus
+//! references), and a header with the root and the agent index.
+//! [`Bundle::from_artifact`] verifies the layout (refs resolve, no
+//! unreferenced blob).
+//!
 //! # Embedding in an executable
 //!
 //! A built binary is `runner ‖ artifact ‖ footer`; see the [`embed`] module
@@ -98,6 +107,7 @@
 #![forbid(unsafe_code)]
 
 mod artifact;
+pub mod bundle;
 mod canonical;
 mod digest;
 pub mod embed;
@@ -108,6 +118,10 @@ mod path;
 pub use artifact::{
     ARTIFACT_MAGIC, Artifact, ArtifactBuilder, FORMAT_FLAGS, FORMAT_VERSION, MAX_ARTIFACT_LEN,
     MAX_HEADER_LEN, MAX_PAYLOAD_COUNT, MAX_PAYLOAD_LEN, Payload,
+};
+pub use bundle::{
+    AgentEntry, AgentInput, Bundle, BundleBuilder, BundleError, BundleHeader, ChildLink,
+    PayloadRef, PoolStats,
 };
 pub use canonical::canonical_json;
 pub use digest::{ArtifactDigest, InvalidArtifactDigest};

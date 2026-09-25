@@ -73,9 +73,11 @@ install: build ## Install harw and killer into BINDIR (default ~/.local/bin)
 		*) echo "Hint: $(BINDIR) is not on your PATH. Add e.g. 'export PATH=\"$(BINDIR):\$$PATH\"' to your shell profile." ;; \
 	esac
 
-uninstall: ## Remove harw and killer from BINDIR (never touches ~/.harw)
-	rm -f $(BINDIR)/harw $(BINDIR)/killer
-	@echo "Removed $(BINDIR)/harw and $(BINDIR)/killer (~/.harw was left untouched)"
+uninstall: ## Remove harw, killer and the agent runner from BINDIR, plus the regenerable agent-build cache
+	rm -f $(BINDIR)/harw $(BINDIR)/killer $(BINDIR)/harw-agent-runner
+	rm -rf "$${HARW_HOME:-$$HOME/.harw}/cache/agent-builds"
+	rm -f "$${HARW_HOME:-$$HOME/.harw}/install.toml"
+	@echo "Removed $(BINDIR)/harw, killer, harw-agent-runner and the agent-build cache (the rest of ~/.harw was left untouched)"
 
 service: install ## Install and enable the user systemd services, incl. the gateway
 	$(BINDIR)/harw service install

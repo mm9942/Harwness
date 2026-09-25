@@ -69,9 +69,140 @@ pub fn home_dir() -> HomeResult<PathBuf> {
             Ok(path)
         }
         None => {
+            if let Some(path) = HOME_OVERRIDE.get() {
+                return Ok(path.clone());
+            }
             let base = user_home_directory().ok_or(HomeError::NoHomeDirectory)?;
             Ok(base.join(HOME_DIR_NAME))
         }
+    }
+}
+
+/// Prozessweiter Root-Space-Override (siehe [`set_home_override`]).
+static HOME_OVERRIDE: OnceLock<PathBuf> = OnceLock::new();
+
+/// Setzt den Root-Space prozessweit (#22: eine nativ gebaute,
+/// personalisierte harw mit eingebetteter UIA lebt in ihrem eigenen
+/// `~/.<name>`).
+///
+/// # Beschreibung
+/// [`home_dir`] liefert danach diesen Pfad statt `~/.harw`; `HARW_HOME` hat
+/// weiterhin Vorrang. Der Override lässt sich genau einmal setzen, und zwar
+/// vor dem ersten Pfadzugriff; ein erneuter Aufruf mit demselben Pfad ist
+/// wirkungslos und erfolgreich. Ersetzt das Setzen von `HARW_HOME`, das ohne
+/// `unsafe` nicht möglich ist.
+///
+/// # Errors
+/// [`HomeError::HomeNotADirectory`], wenn `path` eine existierende
+/// Nicht-Verzeichnis-Datei ist oder bereits ein **anderer** Override gesetzt
+/// wurde.
+pub fn set_home_override(path: PathBuf) -> HomeResult<()> {
+    set_home_override_in(&HOME_OVERRIDE, path)
+}
+
+/// Kern von [`set_home_override`] über eine explizite Zelle (testbar).
+fn set_home_override_in(cell: &OnceLock<PathBuf>, path: PathBuf) -> HomeResult<()> {
+    if path.exists() && !path.is_dir() {
+        return Err(HomeError::HomeNotADirectory { path });
+    }
+    let stored = cell.get_or_init(|| path.clone());
+    if *stored == path {
+        Ok(())
+    } else {
+        Err(HomeError::HomeNotADirectory { path })
+    }
+}
+
+/// Prozessweiter Name des projekt-lokalen Verzeichnisses (siehe
+/// [`project_dir_name`]).
+static PROJECT_DIR_OVERRIDE: OnceLock<String> = OnceLock::new();
+
+/// Name des projekt-lokalen harw-Verzeichnisses im Projekt-Root: `.harw`,
+/// in einer personalisierten harw (#22, [`set_named_home`]) `.<name>`.
+///
+/// # Beschreibung
+/// Die eine Quelle für `<project>/.harw`: Projekt-Konfigurationslayer
+/// ([`config_layers_report_at`]), [`crate::project::ProjectHome`]
+/// (Pläne, Goals, Zustand, Erinnerungen) und der Vertrauens-Digest
+/// ([`crate::trust::project_digest`]).
+#[must_use]
+pub fn project_dir_name() -> &'static str {
+    PROJECT_DIR_OVERRIDE
+        .get()
+        .map_or(HOME_DIR_NAME, String::as_str)
+}
+
+/// Richtet einen eigenen, unabhängigen Root-Space `~/.<name>` samt
+/// projekt-lokalem Verzeichnis `<project>/.<name>` ein (#22: die native
+/// personalisierte harw mit eingebetteter UIA).
+///
+/// # Beschreibung
+/// Muss vor dem ersten Pfadzugriff laufen. `HARW_HOME` behält Vorrang für
+/// den Root-Space; das projekt-lokale Verzeichnis folgt immer `name`.
+///
+/// # Returns
+/// Den Root-Space, den [`home_dir`] ab jetzt liefert.
+///
+/// # Errors
+/// Wie [`set_home_override`] und [`named_home_dir`].
+pub fn set_named_home(name: &str) -> HomeResult<PathBuf> {
+    let clean = sanitize_home_name(name);
+    let path = named_home_dir(&clean)?;
+    set_home_override(path)?;
+    let dir_name = format!(".{clean}");
+    let stored = PROJECT_DIR_OVERRIDE.get_or_init(|| dir_name.clone());
+    if *stored != dir_name {
+        return Err(HomeError::InvalidProfileName { name: dir_name });
+    }
+    home_dir()
+}
+
+/// Der gesetzte Root-Space-Override, falls vorhanden.
+#[must_use]
+pub fn home_override() -> Option<&'static Path> {
+    HOME_OVERRIDE.get().map(PathBuf::as_path)
+}
+
+/// `~/.<name>`: der eigene Root-Space einer personalisierten harw (#22).
+///
+/// # Beschreibung
+/// `name` wird bereinigt ([`sanitize_home_name`]); ein leerer Rest ergibt
+/// `harw-uia`.
+///
+/// # Errors
+/// [`HomeError::NoHomeDirectory`], wenn kein Benutzerverzeichnis bekannt ist.
+pub fn named_home_dir(name: &str) -> HomeResult<PathBuf> {
+    let base = user_home_directory().ok_or(HomeError::NoHomeDirectory)?;
+    Ok(base.join(format!(".{}", sanitize_home_name(name))))
+}
+
+/// Bereinigt einen Namen für `~/.<name>`: Kleinbuchstaben, `[a-z0-9._-]`,
+/// alles andere wird `-`, führende Punkte und Bindestriche entfallen, höchstens
+/// 64 Zeichen; leer ergibt `harw-uia`.
+#[must_use]
+pub fn sanitize_home_name(name: &str) -> String {
+    let mapped: String = name
+        .trim()
+        .to_lowercase()
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-') {
+                c
+            } else {
+                '-'
+            }
+        })
+        .collect();
+    let trimmed: String = mapped
+        .trim_start_matches(['.', '-'])
+        .trim_end_matches('-')
+        .chars()
+        .take(64)
+        .collect();
+    if trimmed.is_empty() {
+        "harw-uia".to_owned()
+    } else {
+        trimmed
     }
 }
 
@@ -571,7 +702,7 @@ pub(crate) fn config_layers_report_in(
     };
     let project = crate::project::discover_project(cwd, &[])?;
     let cwd = project.root.as_path();
-    let repo_local = cwd.join(HOME_DIR_NAME);
+    let repo_local = cwd.join(project_dir_name());
     if !repo_local.is_dir() {
         return Ok(report);
     }
@@ -628,6 +759,26 @@ fn user_home_directory() -> Option<PathBuf> {
 mod tests {
     use super::*;
     use crate::test_support::TestResult;
+
+    #[test]
+    fn test_home_override_is_set_once() {
+        let cell = OnceLock::new();
+        let first = PathBuf::from("/nonexistent/.mia");
+        assert!(set_home_override_in(&cell, first.clone()).is_ok());
+        assert!(set_home_override_in(&cell, first.clone()).is_ok(), "same path again is fine");
+        assert!(set_home_override_in(&cell, PathBuf::from("/nonexistent/.other")).is_err());
+        assert_eq!(cell.get(), Some(&first));
+    }
+
+    #[test]
+    fn test_sanitize_home_name() {
+        assert_eq!(sanitize_home_name("Mia"), "mia");
+        assert_eq!(sanitize_home_name("terminal-ui"), "terminal-ui");
+        assert_eq!(sanitize_home_name(" Mein Agent! "), "mein-agent");
+        assert_eq!(sanitize_home_name("../etc"), "etc");
+        assert_eq!(sanitize_home_name("..."), "harw-uia");
+        assert_eq!(sanitize_home_name(&"x".repeat(100)).len(), 64);
+    }
 
     #[test]
     fn profile_override_validates_and_rejects_a_different_second_value() {

@@ -1,0 +1,40 @@
+[package]
+publish.workspace = true
+name = "harw-agent-compiler"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+# #22 wave 2B: the agent compiler. Discovery, the front end (parse/resolve/
+# lower_v2 in `harw-agent-dsl`), the compiler passes, the artifact backend
+# (artifact + prebuilt `harw-agent-runner`) and the native backend (generated
+# crate + `cargo build`), plus the shared `harw agent …` command surface that
+# `harw-cli` and the `/agent` op both call. No `harw-runtime`: compiling never
+# starts an agent.
+[dependencies]
+harw-agent-artifact = { path = "../harw-agent-artifact" }
+harw-agent-dsl = { path = "../harw-agent-dsl" }
+# `SkillIndex` for `ResolveSkills` (skill layers plus the bundled skills).
+harw-catalog = { path = "../harw-catalog" }
+# `home_dir`, `config_layers_report_at` (discovery layers) and the bundled
+# agent definitions (`bundled_files`) as the lowest user-facing layer.
+harw-home = { path = "../harw-home" }
+# Built-in definitions and bases (rights ceilings), the context-program
+# library and the capability catalog.
+harw-registry-defaults = { path = "../harw-registry-defaults" }
+serde = { workspace = true }
+serde_json = { workspace = true }
+# Same version line as `harw-agent-dsl` (resolution timestamps).
+time = { version = "0.3.53", features = ["formatting"] }
+toml = { workspace = true }
+# `harw agent fmt`: comment-preserving TOML formatting (already in the lockfile
+# through `harw-ops`/`harw-cli`).
+toml_edit = "0.25.13"
+
+[dev-dependencies]
+tempfile = { workspace = true }
+
+[lints]
+workspace = true

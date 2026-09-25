@@ -107,7 +107,14 @@ harw agent build evidence-critic --interface cli,mcp -o ./ec
 - `--interface` sets the built-in interfaces for this build and overrides
   `[binary].interfaces`. Choices: `cli` (one-shot), `repl`, `mcp`, `http`,
   `tui`.
-- `-o` is the output file.
+- Without `-o` the binary is installed as `~/.harw/bin/<name>` (the name
+  from `[binary].name`, else the specialization). Every build is kept as a
+  version under `~/.harw/bin/.versions/<name>/<version>-<digest>/` with a
+  `build.json`; `~/.harw/bin/<name>` is a symlink to the current one.
+  `harw agent versions <name>` lists them, `harw agent use <name>
+  <version|digest>` switches back.
+- `-o` additionally copies the result to a file or directory.
+- `--artifact-only` writes only the `.harwa` artifact (no runner needed).
 - `--target` picks a target triple other than the host (default backend:
   a runner for that target must be installed).
 
@@ -230,3 +237,92 @@ not bake them into wrapper scripts that you distribute with the binary.
   Editing the definition changes nothing until you build again.
 - **State.** Sessions and logs go to an optional state directory; without
   one, nothing is written except what the agent's tools write.
+
+## 9. Command reference
+
+Every command accepts `--json`; in the TUI the same commands run as
+`/agent <command> …` (a build then runs as a job, see `/jobs`).
+
+| Command | Does |
+|---|---|
+| `harw agent check [name\|path]…` | parse, resolve, lower and run the compiler passes; diagnostics with code, `file:line:column`, a source excerpt with a caret and a help line. Exit code 1 on errors. Without arguments: every definition of your layers. |
+| `harw agent build <name\|path> [--interface …] [--native] [--artifact-only] [--runner P] [-o OUT] [--target T] [--harw-src DIR]` | compile and install (section 4). |
+| `harw agent inspect <binary\|artifact\|name>` | manifest, artifact hash, snapshot, interfaces, skills, every agent of the bundle with its references, pool dedup savings, models, `required_env`. |
+| `harw agent graph [name\|--all] [--format text\|dot\|mermaid\|json] [--kind delegation\|resolution\|rights\|all]` | who can start whom (depth, read-only or writing), the resolution chain (`extends` → mixins → patches per layer), the rights flow (manifest ≤ base role ≤ author ceiling). |
+| `harw agent explain <name> [field]` | where a value comes from (layer, `file:line`, patch operator); `tool:<name>` explains why a tool is admitted, forbidden or pruned. `harw agent explain HARW-PATCH-003` explains a diagnostic code with an example and the fix. |
+| `harw agent new <name> [--role worker\|child-orchestrator] [--extends ID] [--dir DIR]` | a commented `definition.toml` plus `system.md` (default `~/.harw/agents/<name>`). Nothing is built. |
+| `harw agent fmt [paths] [--check]` | canonical formatting (below). |
+| `harw agent diff <a> <b>` | IR difference of two definitions, installed versions (`name@version`) or artifacts; widening rights are marked `!!`. |
+| `harw agent test [name]` | validate, build in memory, run the cases in `tests/*.toml` next to the definition. |
+| `harw agent run <artifact\|name> [prompt]` | runs an artifact directly; needs the runner (wave 3) and exits 69 until then. |
+| `harw agent versions <name>` / `harw agent use <name> <version\|digest>` | installed versions, switch the current one. |
+| `harw agent clean [--all] [--older-than DAYS] [--keep N] [--dry-run]` | trims the native build cache and old versions (keeps the current version plus N, default 3). |
+| `harw agent doctor` | runner and its capabilities, native prerequisites, install record, cache size, `~/.harw/bin` on `PATH` (with the line for your shell rc), last automatic UIA build. |
+| `harw agent list` | the roster: `eingebaut`, `eigene Definition`, and the compiled copies in `~/.harw/bin`, with snapshot and build state (current or stale). |
+
+### Formatting (`fmt`)
+
+`fmt` works on the `toml_edit` document model and keeps every comment. It
+only changes layout: the header keys first in DSL order (`schema`, `id`,
+`version`, `extends`, `mixins`, `role`, `specialization`, `name`,
+`description`, `reasoning_effort`, `instructions_file`, `skills`), one space
+around `=`, no trailing whitespace, single blank lines, one final newline.
+A comment above a key moves with the key. Arrays, inline tables and strings
+stay as written. The result must parse to the same values; `fmt` is
+idempotent.
+
+### Test cases
+
+```toml
+# tests/reviews-a-claim.toml
+name = "reviews a sourced claim"
+prompt = "Prüfe die Quelle in report.md"
+
+[expect]
+tools = ["fs.read"]            # must be in the manifest (checked now)
+not_tools = ["shell.exec"]     # must not be (checked now)
+contains = ["Behalten"]        # answer checks: pending until the runner exists
+```
+
+## 10. Where things are found
+
+- **Runner** (default backend), in this order: `--runner`, next to `harw`,
+  the `bindir` of `~/.harw/install.toml`,
+  `~/.harw/bin/.runners/<target>/<version>/`, `~/.harw/runners/<target>/<version>/`.
+  A missing runner names every path and the fix (`make install`,
+  `--artifact-only`, `--native`).
+- **Runner capabilities**: the build calls `harw-agent-runner --capabilities`,
+  which prints one JSON object (`schema`
+  `harwness.agent-runner.capabilities/v1`, `runner_version`, `target`,
+  `artifact_formats`, `ir_schema`, `interfaces`, `features`,
+  `child_protocol`). A runner that lacks an interface or a tool-provider
+  feature the agent needs is rejected with a hint to `--native`.
+- **harw sources** (`--native`): `--harw-src`, `HARW_SRC`, else the
+  `source_dir` of `~/.harw/install.toml`, which `make install` writes
+  (`harw agent install-record --source-dir … --bindir …`).
+- **cargo**: every `PATH` entry, then `~/.cargo/bin`. Without it: install
+  with `curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh`
+  (harw never installs it for you).
+- **Native build cache**: `~/.harw/cache/agent-builds/` — one shared cargo
+  target dir, one generated crate per build, a blob store. It is capped at
+  5 GiB (`[agent_compiler] cache_max_bytes`) and collected after every
+  native build; `[agent_compiler] keep_versions` also trims old versions
+  then. Uninstalling removes it.
+
+## 11. User-interface agents
+
+- The active UIA (`active_uia_definition`) is the one agent harw builds on
+  its own: on a TUI start and after `harw agent uia-new`, in the background,
+  with the artifact backend only, and only when its definition, its bundle
+  files, harw or the runner changed. The result is
+  `~/.harw/bin/<name>` (`[binary].name`, else `harw-uia-<specialization>`)
+  with the interfaces `tui`, `repl`, `cli` unless `[binary]` says
+  otherwise. `[agent_compiler] auto_build_uia = false` turns it off.
+- `harw agent build <uia> --native` builds a **complete, personalized harw**
+  (all of harw with the UIA as its fixed root) named `harw-<name>`. It uses
+  its own home `~/.<name>` and project directory `.<name>` (no inheritance
+  from `~/.harw`); on its first start it offers to import provider settings
+  and credentials from `~/.harw`, and in a project with a `.harw` it offers
+  once to copy the project configuration (never state).
+- Built-in roles stay embedded in harw. Building one (`harw agent build
+  explorer`) only makes a copy in `~/.harw/bin`.

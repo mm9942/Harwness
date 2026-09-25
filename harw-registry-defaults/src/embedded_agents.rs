@@ -672,6 +672,28 @@ pub fn builtin_agent_toml() -> &'static [(&'static str, &'static str)] {
 pub fn builtin_agent_definitions(
     existing: &HashMap<String, ExecutableAgentIr>,
 ) -> Result<HashMap<String, ExecutableAgentIr>, RegistryDefaultsError> {
+    // #22 Welle 1B: die eingebauten Rollen entstehen über IR v2; die
+    // Laufzeitsicht ist `ExecutableAgentIr::from(&ir)` (golden-geprüft gegen
+    // den Legacy-Pfad, siehe `builtin_agent_definitions_legacy`).
+    let irs = builtin_agent_irs(OffsetDateTime::now_utc())?;
+    let mut definitions = HashMap::with_capacity(irs.len());
+    for (name, ir) in &irs {
+        warn_on_local_collision(name, &ir.id, existing);
+        definitions.insert(name.clone(), ExecutableAgentIr::from(ir));
+    }
+    Ok(definitions)
+}
+
+/// Der frühere Senkpfad der eingebauten Rollen (`resolve` → Programmbindung →
+/// Legacy-`lower`), nur noch als Vergleichsbasis für die Golden-Tests
+/// (`tests/golden_ir.rs`): die IR-v2-Sicht muss ihm für jede Rolle gleichen.
+///
+/// # Fehler
+/// Wie [`builtin_agent_definitions`].
+#[doc(hidden)]
+pub fn builtin_agent_definitions_legacy(
+    existing: &HashMap<String, ExecutableAgentIr>,
+) -> Result<HashMap<String, ExecutableAgentIr>, RegistryDefaultsError> {
     require_worker_base(builtin_agent_toml())?;
     reject_duplicate_names(builtin_agent_toml(), "Agentenrolle")?;
 
@@ -758,6 +780,21 @@ fn warn_on_local_collision(
 /// # Fehler
 /// Wie [`builtin_agent_definitions`].
 pub fn builtin_base_definitions()
+-> Result<HashMap<String, ExecutableAgentIr>, RegistryDefaultsError> {
+    // #22 Welle 1B: wie die Rollen über IR v2.
+    Ok(builtin_base_irs(OffsetDateTime::now_utc())?
+        .iter()
+        .map(|(name, ir)| (name.clone(), ExecutableAgentIr::from(ir)))
+        .collect())
+}
+
+/// Der frühere Senkpfad der Basis-Layer, nur als Vergleichsbasis der
+/// Golden-Tests (siehe [`builtin_agent_definitions_legacy`]).
+///
+/// # Fehler
+/// Wie [`builtin_agent_definitions`].
+#[doc(hidden)]
+pub fn builtin_base_definitions_legacy()
 -> Result<HashMap<String, ExecutableAgentIr>, RegistryDefaultsError> {
     let now = OffsetDateTime::now_utc();
     let programs = ContextProgramLibrary::parse(builtin_context_program_toml())?;
@@ -2151,7 +2188,7 @@ mod tests {
                 "{role}: read-only Kinder dürfen nie auf eine Rückfrage warten"
             );
             assert!(ir.lifecycle_machine().allow_rerun(), "{role}");
-            assert_eq!(ir.lifecycle_machine().max_attempts(), Some(2), "{role}");
+            assert_eq!(ir.lifecycle_machine().max_attempts(), Some(4), "{role}");
             assert!(
                 ir.return_pipeline().contract().is_some(),
                 "{role} braucht einen Rückgabevertrag"

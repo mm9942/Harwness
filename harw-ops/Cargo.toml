@@ -106,6 +106,9 @@ harw-matrix-game = { path = "../harw-matrix-game" }
 # Plan R9, Teil F: `/jobs` (Hintergrund-Jobs der Sitzung ansehen, stoppen,
 # Logs lesen). Kein Zyklus: `harw-tool-job` hängt nicht von `harw-ops` ab.
 harw-tool-job = { path = "../harw-tool-job" }
+# #22 Welle 2B: `/agent check|build|inspect|graph|explain|…` (dieselben
+# Befehle wie `harw agent …`; `build` läuft als Job).
+harw-agent-compiler = { path = "../harw-agent-compiler" }
 
 [features]
 # Forwards to harw-provider's ChatGPT OAuth flag so `--features chatgpt-oauth`

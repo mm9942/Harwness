@@ -515,6 +515,12 @@ fn spawn_task_text(instructions: Option<&str>, context: &serde_json::Value) -> O
     }
 }
 
+/// #22 Welle 1B: die Nummer des Versuchs, den eine Fortsetzung nach `used`
+/// bereits gebundenen Fortsetzungen wäre (der erste Lauf ist Versuch 1).
+fn next_attempt(used: u32) -> u32 {
+    used.saturating_add(2)
+}
+
 /// Rechnet ein Token-Budget des Auftrags mit der kalibrierten Rate in Bytes
 /// um (abgerundet, mindestens 1 KiB).
 fn task_tokens_to_bytes(
@@ -6269,7 +6275,71 @@ impl ManagedAgentSpawner {
         }
         let ledger = self.handoff_ledger.lock().ok()?;
         let entry = ledger.get(&child).filter(|entry| &entry.parent == caller)?;
-        (ledger.continuations_left(&entry.origin) > 0).then(|| entry.role.clone())
+        // #22 Welle 1B: auch der Lebenszyklus der Rolle muss eine weitere
+        // Ausführung zulassen (`allow_rerun`, `max_attempts`).
+        let lifecycle_admits = match self.lifecycle_max_attempts(&entry.role) {
+            Ok(None) => true,
+            Ok(Some(max_attempts)) => {
+                next_attempt(ledger.continuations_used(&entry.origin)) <= max_attempts
+            }
+            Err(_) => false,
+        };
+        (ledger.continuations_left(&entry.origin) > 0 && lifecycle_admits)
+            .then(|| entry.role.clone())
+    }
+
+    /// #22 Welle 1B: der Lebenszyklus der Agent-IR einer Rolle für
+    /// Fortsetzungen (`continue_from` ist eine erneute Ausführung desselben
+    /// Auftrags).
+    ///
+    /// # Returns
+    /// `Ok(None)` ohne IR oder ohne `max_attempts` (dann gilt allein
+    /// [`crate::child_handoff::MAX_CONTINUATIONS`]), sonst
+    /// `Ok(Some(max_attempts))` — Versuche **einschließlich** des ersten.
+    ///
+    /// # Errors
+    /// [`AgentSpawnError`] mit Präfix `continue_from:`, wenn die IR
+    /// `allow_rerun = false` trägt.
+    fn lifecycle_max_attempts(&self, role_name: &str) -> Result<Option<u32>, AgentSpawnError> {
+        let Some(ir) = self
+            .roles
+            .get(role_name)
+            .and_then(|definition| definition.registry_factory.executable_agent_ir(role_name))
+        else {
+            return Ok(None);
+        };
+        let lifecycle = ir.lifecycle_machine();
+        if !lifecycle.allow_rerun() {
+            return Err(Self::reject(format!(
+                "continue_from: die Rolle '{role_name}' erlaubt keine erneute Ausführung \
+                 ([lifecycle] allow_rerun = false) — starte statt einer Fortsetzung ein neues \
+                 Kind mit vollständigem Auftrag"
+            )));
+        }
+        Ok(lifecycle.max_attempts())
+    }
+
+    /// #22 Welle 1B: prüft, ob nach `used` Fortsetzungen der Kette mit
+    /// Ursprung `origin` noch ein Versuch innerhalb von `max_attempts` liegt.
+    ///
+    /// # Errors
+    /// [`AgentSpawnError`] mit Präfix `continue_from:` und der Grenze.
+    fn check_attempts(
+        role_name: &str,
+        max_attempts: u32,
+        used: u32,
+        origin: &SessionId,
+    ) -> Result<(), AgentSpawnError> {
+        let attempt = next_attempt(used);
+        if attempt > max_attempts {
+            return Err(Self::reject(format!(
+                "continue_from: die Rolle '{role_name}' erlaubt höchstens {max_attempts} \
+                 Versuche ([lifecycle] max_attempts = {max_attempts}); die Fortsetzung wäre \
+                 Versuch {attempt} des ursprünglichen Kindes {origin}. Führe die Übergaben \
+                 selbst zusammen oder schneide den Auftrag neu und kleiner zu."
+            )));
+        }
+        Ok(())
     }
 
     /// Runde 5, Teil J: prüft, ob `caller` das budget-beendete Kind `from`
@@ -6299,11 +6369,24 @@ impl ManagedAgentSpawner {
         from: &SessionId,
         role: &str,
     ) -> Result<crate::child_handoff::ContinuationSeed, AgentSpawnError> {
-        self.handoff_ledger
+        let ledger = self
+            .handoff_ledger
             .lock()
-            .map_err(|_| Self::reject("child handoff ledger lock is poisoned"))?
+            .map_err(|_| Self::reject("child handoff ledger lock is poisoned"))?;
+        let seed = ledger
             .prepare(caller, from, role)
-            .map_err(|error| Self::reject(error.0))
+            .map_err(|error| Self::reject(error.0))?;
+        // #22 Welle 1B: erst nach der Eigentumsprüfung (kein Orakel über
+        // fremde Kinder) — dann der Lebenszyklus der Rolle.
+        if let Some(max_attempts) = self.lifecycle_max_attempts(role)? {
+            Self::check_attempts(
+                role,
+                max_attempts,
+                ledger.continuations_used(&seed.origin),
+                &seed.origin,
+            )?;
+        }
+        Ok(seed)
     }
 
     /// Runde 5, Teil J: bindet ein frisch admittiertes Kind als Fortsetzung.
@@ -6356,12 +6439,25 @@ impl ManagedAgentSpawner {
                 seed.of
             ))
         })?;
-        let link = self
-            .handoff_ledger
-            .lock()
-            .map_err(|_| Self::reject("child handoff ledger lock is poisoned"))?
-            .bind(seed)
-            .map_err(|error| Self::reject(error.0))?;
+        // #22 Welle 1B: der Lebenszyklus der Rolle wird unter derselben
+        // Sperre wie die Kettenzählung geprüft — zwei gleichzeitige
+        // Fortsetzungen können `max_attempts` nicht gemeinsam überschreiten.
+        let max_attempts = self.lifecycle_max_attempts(&record.role)?;
+        let link = {
+            let mut ledger = self
+                .handoff_ledger
+                .lock()
+                .map_err(|_| Self::reject("child handoff ledger lock is poisoned"))?;
+            if let Some(max_attempts) = max_attempts {
+                Self::check_attempts(
+                    &record.role,
+                    max_attempts,
+                    ledger.continuations_used(&seed.origin),
+                    &seed.origin,
+                )?;
+            }
+            ledger.bind(seed).map_err(|error| Self::reject(error.0))?
+        };
         match self.child_tasks.lock() {
             Ok(mut tasks) => {
                 let state = tasks.entry(child.as_str().to_owned()).or_default();
@@ -14769,6 +14865,96 @@ max_depth = 0
             .ok_or(TestError::Missing("record"))?
             .lease_expires_at;
         assert!(renewed > soon, "{renewed} > {soon}");
+        Ok(())
+    }
+
+    // --- #22 Welle 1B: Lebenszyklus der Agent-IR für Fortsetzungen -------
+
+    /// Ein Spawner mit der Rolle `worker`, deren IR `lifecycle` trägt, und
+    /// ein Übergabe-Eintrag für ein (fiktives) beendetes Kind `first` des
+    /// Elternteils — ohne Modelllauf, direkt im Fortsetzungs-Buch.
+    fn lifecycle_spawner(
+        lifecycle: &str,
+    ) -> TestResult<(ManagedAgentSpawner, SessionId, SandboxSpec, SessionId)> {
+        let ir = test_agent_ir(&format!("[tools]\nadmitted = [\"fs.read\"]\n\n{lifecycle}"))?;
+        let (spawner, parent, sandbox) =
+            window_test_spawner(Arc::new(IrChildRegistry { ir }), None)?;
+        let first = SessionId::new();
+        spawner
+            .handoff_ledger
+            .lock()
+            .map_err(|_| TestError::Unexpected("ledger lock poisoned".to_owned()))?
+            .record(crate::child_handoff::HandoffRecord {
+                child: first.clone(),
+                parent: parent.clone(),
+                role: "worker".to_owned(),
+                sandbox: Some(sandbox.clone()),
+                handoff: "Zwischenstand".to_owned(),
+                kind: crate::child_handoff::BudgetHandoff::LastAnswer,
+                origin: first.clone(),
+                end: crate::child_handoff::PredecessorEnd::BudgetExhausted,
+            });
+        Ok((spawner, parent, sandbox, first))
+    }
+
+    #[test]
+    fn continue_from_is_refused_when_the_lifecycle_forbids_a_rerun() -> TestResult {
+        let (spawner, parent, _sandbox, first) =
+            lifecycle_spawner("[lifecycle]\nallow_rerun = false\nmax_attempts = 5\n")?;
+        let refused = spawner.prepare_continuation(&parent, &first, "worker");
+        let message = match refused {
+            Ok(_) => return Err(TestError::Unexpected("rerun must be refused".to_owned())),
+            Err(error) => error.message,
+        };
+        assert!(message.contains("allow_rerun = false"), "{message}");
+        assert!(crate::child_handoff::is_continuation_rejection(&message));
+        assert_eq!(spawner.resumable_child_role(&parent, first.as_str()), None);
+        // Fremde Kinder bekommen weiterhin dieselbe Antwort wie unbekannte —
+        // der Lebenszyklus verrät nichts vor der Eigentumsprüfung.
+        let stranger = spawner.prepare_continuation(&SessionId::new(), &first, "worker");
+        assert!(stranger.is_err_and(|error| error.message.contains("kein eigenes")));
+        Ok(())
+    }
+
+    #[test]
+    fn continue_from_is_refused_beyond_max_attempts() -> TestResult {
+        let (spawner, parent, sandbox, first) =
+            lifecycle_spawner("[lifecycle]\nallow_rerun = true\nmax_attempts = 2\n")?;
+        assert_eq!(
+            spawner.resumable_child_role(&parent, first.as_str()),
+            Some("worker".to_owned())
+        );
+        // Versuch 2 (die erste Fortsetzung) liegt innerhalb von max_attempts.
+        let seed = spawner
+            .prepare_continuation(&parent, &first, "worker")
+            .map_err(|error| TestError::Unexpected(error.message))?;
+        let second = spawner
+            .admit("worker", spawn_input(parent.clone()), sandbox.clone(), None)
+            .map_err(|error| TestError::Unexpected(error.message))?;
+        let link = spawner
+            .bind_continuation(&second, &seed)
+            .map_err(|error| TestError::Unexpected(error.message))?;
+        assert_eq!(link.number, 1);
+        spawner
+            .release_child(&second)
+            .map_err(|error| TestError::Unexpected(error.message))?;
+
+        // Versuch 3 überschreitet max_attempts = 2 — obwohl die allgemeine
+        // Kettengrenze (MAX_CONTINUATIONS = 3) noch Platz hätte.
+        let refused = spawner.prepare_continuation(&parent, &first, "worker");
+        assert!(
+            refused.is_err_and(|error| error.message.contains("max_attempts = 2")
+                && crate::child_handoff::is_continuation_rejection(&error.message)),
+        );
+        let third = spawner
+            .admit("worker", spawn_input(parent.clone()), sandbox, None)
+            .map_err(|error| TestError::Unexpected(error.message))?;
+        let late_bind = spawner.bind_continuation(&third, &seed);
+        assert!(
+            late_bind.is_err_and(|error| error.message.contains("max_attempts")),
+            "auch ein früher vorbereiteter Seed bindet nicht über die Grenze"
+        );
+        assert_eq!(spawner.resumable_child_role(&parent, first.as_str()), None);
         Ok(())
     }
 }

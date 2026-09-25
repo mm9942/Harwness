@@ -30,7 +30,8 @@ use harw_agent_dsl::lower_v2::{LowerSources, MapInstructionsLoader, compile_agen
 use harw_agent_dsl::parse::parse_toml;
 use harw_agent_dsl::{AgentIr, ExecutableAgentIr};
 use harw_registry_defaults::embedded_agents::{
-    builtin_agent_definitions, builtin_agent_irs, builtin_base_definitions, builtin_base_irs,
+    builtin_agent_definitions, builtin_agent_definitions_legacy, builtin_agent_irs,
+    builtin_base_definitions, builtin_base_definitions_legacy, builtin_base_irs,
     builtin_context_program_library, builtin_source_files,
 };
 use time::OffsetDateTime;
@@ -301,7 +302,9 @@ fn assert_view_equals(name: &str, ir: &AgentIr, legacy: &ExecutableAgentIr) {
 
 #[test]
 fn test_v2_view_equals_legacy_lowering_for_every_builtin() -> TestResult {
-    let legacy = builtin_agent_definitions(&HashMap::new()).map_err(ctx("legacy roles"))?;
+    // #22 wave 1B: `builtin_agent_definitions` is itself built from IR v2
+    // now; the comparison runs against the former lowering path.
+    let legacy = builtin_agent_definitions_legacy(&HashMap::new()).map_err(ctx("legacy roles"))?;
     let irs = builtin_agent_irs(OffsetDateTime::now_utc()).map_err(ctx("v2 roles"))?;
     assert_eq!(
         legacy.keys().collect::<BTreeSet<_>>(),
@@ -314,7 +317,7 @@ fn test_v2_view_equals_legacy_lowering_for_every_builtin() -> TestResult {
         assert_view_equals(name, ir, old);
     }
 
-    let legacy_bases = builtin_base_definitions().map_err(ctx("legacy bases"))?;
+    let legacy_bases = builtin_base_definitions_legacy().map_err(ctx("legacy bases"))?;
     let base_irs = builtin_base_irs(OffsetDateTime::now_utc()).map_err(ctx("v2 bases"))?;
     assert_eq!(legacy_bases.len(), base_irs.len());
     for (name, ir) in &base_irs {
@@ -357,5 +360,44 @@ fn test_bundled_definitions_carry_their_instructions() -> TestResult {
     assert!(!critic.instructions.text.is_empty());
     assert_eq!(critic.skill_names(), ["evidence-quality-review"]);
     assert_eq!(critic.binary.name, "evidence-critic");
+    Ok(())
+}
+
+/// #22 wave 1B: the runtime view of every built-in (`builtin_agent_definitions`,
+/// now built from IR v2) keeps exactly the tool surface of the committed
+/// goldens — the tool-surface snapshot from before the runtime switched to
+/// the typed IR.
+#[test]
+fn test_runtime_tool_surface_equals_the_golden_snapshot_for_every_builtin() -> TestResult {
+    let runtime = builtin_agent_definitions(&HashMap::new()).map_err(ctx("runtime roles"))?;
+    let bases = builtin_base_definitions().map_err(ctx("runtime bases"))?;
+    let mut checked = 0_usize;
+    for (kind, definitions) in [("builtin", &runtime), ("base", &bases)] {
+        for (name, view) in definitions {
+            let path = golden_dir().join(format!("{kind}-{name}.json"));
+            let text = std::fs::read_to_string(&path)
+                .map_err(|error| TestError::Unexpected(format!("{}: {error}", path.display())))?;
+            let golden: AgentIr = serde_json::from_str(&text)
+                .map_err(|error| TestError::Unexpected(format!("{}: {error}", path.display())))?;
+            assert_eq!(
+                view.tool_surface().admitted(),
+                golden.tools.admitted.as_slice(),
+                "{kind}-{name}: admitted tools"
+            );
+            assert_eq!(
+                view.tool_surface().forbidden(),
+                golden.tools.forbidden.as_slice(),
+                "{kind}-{name}: forbidden tools"
+            );
+            assert_eq!(
+                view.spawn_contract().max_depth(),
+                golden.spawn.max_depth,
+                "{kind}-{name}: max_depth"
+            );
+            assert_eq!(view.role(), golden.role, "{kind}-{name}: role");
+            checked += 1;
+        }
+    }
+    assert!(checked > 2, "every built-in role and base was compared");
     Ok(())
 }

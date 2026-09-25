@@ -7,6 +7,16 @@ license.workspace = true
 repository.workspace = true
 rust-version.workspace = true
 
+# #22: the whole program is a library (`harw_cli::main_entry`), so a native,
+# personalized harw build (`harw agent build <uia> --native`) can link it
+# with an embedded UIA (`harw_cli::run_with_embedded_uia`). The `harw` binary
+# is a three-line `main.rs`. Doc tests stay off: the modules' examples were
+# written for a binary crate and reference private items.
+[lib]
+name = "harw_cli"
+path = "src/lib.rs"
+doctest = false
+
 [[bin]]
 name = "harw"
 path = "src/main.rs"
@@ -22,6 +32,10 @@ jemalloc = ["dep:tikv-jemallocator"]
 harw-authority = { path = "../harw-authority" }
 harw-config = { path = "../harw-config" }
 harw-agent-dsl = { path = "../harw-agent-dsl" }
+# #22 Welle 2B: `harw agent check|build|inspect|…` (der Agenten-Compiler) und
+# das eingebettete Artefakt einer personalisierten harw.
+harw-agent-compiler = { path = "../harw-agent-compiler" }
+harw-agent-artifact = { path = "../harw-agent-artifact" }
 harw-channel = { path = "../harw-channel" }
 harw-channel-telegram = { path = "../harw-channel-telegram" }
 harw-channel-telegram-transport = { path = "../harw-channel-telegram-transport" }

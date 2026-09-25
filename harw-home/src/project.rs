@@ -385,7 +385,8 @@ fn path_bytes(path: &Path) -> Vec<u8> {
     path.to_string_lossy().as_bytes().to_vec()
 }
 
-/// Projekt-lokaler Zustand unter `<root>/.harw`.
+/// Projekt-lokaler Zustand unter `<root>/.harw` (bzw. dem Verzeichnis aus
+/// [`crate::paths::project_dir_name`]).
 ///
 /// # Examples
 /// ```rust,no_run
@@ -408,7 +409,7 @@ impl ProjectHome {
     #[must_use]
     pub fn at(root: &ProjectRoot) -> Self {
         Self {
-            dir: root.root.join(".harw"),
+            dir: root.root.join(crate::paths::project_dir_name()),
         }
     }
 

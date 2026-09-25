@@ -143,6 +143,11 @@ pub struct DiagnosticCode {
     pub title: &'static str,
     /// Default help text.
     pub help: &'static str,
+    /// A minimal definition fragment that triggers the code
+    /// (`harw agent explain HARW-…`).
+    pub example: &'static str,
+    /// How the example is fixed.
+    pub fix: &'static str,
 }
 
 /// All diagnostic codes of this crate, grouped by area.
@@ -154,7 +159,16 @@ pub mod codes {
     use super::{Area, DiagnosticCode, Severity};
 
     macro_rules! code {
-        ($name:ident, $code:literal, $area:ident, $sev:ident, $title:literal, $help:literal) => {
+        (
+            $name:ident,
+            $code:literal,
+            $area:ident,
+            $sev:ident,
+            $title:literal,
+            $help:literal,
+            $example:literal,
+            $fix:literal
+        ) => {
             #[doc = $title]
             pub const $name: DiagnosticCode = DiagnosticCode {
                 code: $code,
@@ -162,6 +176,8 @@ pub mod codes {
                 severity: Severity::$sev,
                 title: $title,
                 help: $help,
+                example: $example,
+                fix: $fix,
             };
         };
     }
@@ -173,7 +189,9 @@ pub mod codes {
         Parse,
         Error,
         "TOML syntax error",
-        "fix the TOML syntax at the reported location"
+        "fix the TOML syntax at the reported location",
+        "schema = [unclosed",
+        "close the array or string and keep one value per key, e.g. `schema = \"harwness.agent/v1\"`"
     );
     code!(
         PARSE_STRUCTURE,
@@ -181,7 +199,9 @@ pub mod codes {
         Parse,
         Error,
         "the definition header does not deserialize (missing or wrongly typed required field)",
-        "a definition needs `schema`, `id`, `version`, `role` and `specialization` with the documented types"
+        "a definition needs `schema`, `id`, `version`, `role` and `specialization` with the documented types",
+        "schema = \"harwness.agent/v1\"\nid = \"acme.agent.t@1\"\nversion = \"1.0.0\"\nspecialization = \"t\"",
+        "add the missing required key: `role = \"worker\"`"
     );
     code!(
         PARSE_WRONG_TYPE,
@@ -189,7 +209,9 @@ pub mod codes {
         Parse,
         Error,
         "a value has the wrong TOML type",
-        "use the type documented for this key; a wrongly typed value is an error, not an absent value"
+        "use the type documented for this key; a wrongly typed value is an error, not an absent value",
+        "[spawn]\nmax_depth = \"one\"",
+        "write the documented type: `max_depth = 1`"
     );
     code!(
         PARSE_OUT_OF_RANGE,
@@ -197,7 +219,9 @@ pub mod codes {
         Parse,
         Error,
         "an integer is negative or too large",
-        "use a non-negative integer within the documented range"
+        "use a non-negative integer within the documented range",
+        "[spawn]\nmax_depth = -1",
+        "use a non-negative value: `max_depth = 0`"
     );
 
     // ── SCHEMA ─────────────────────────────────────────────────────────
@@ -207,7 +231,9 @@ pub mod codes {
         Schema,
         Error,
         "unsupported `schema` value",
-        "agent definitions use `schema = \"harwness.agent/v1\"`, mixins `harwness.mixin/v1`"
+        "agent definitions use `schema = \"harwness.agent/v1\"`, mixins `harwness.mixin/v1`",
+        "schema = \"harwness.agent/v9\"",
+        "use `schema = \"harwness.agent/v1\"`"
     );
     code!(
         SCHEMA_UNKNOWN_TABLE,
@@ -215,7 +241,9 @@ pub mod codes {
         Schema,
         Error,
         "unknown table in the definition",
-        "remove the table or fix its name; unknown tables are never ignored"
+        "remove the table or fix its name; unknown tables are never ignored",
+        "[tols]\nadmitted = [\"fs.read\"]",
+        "rename the table to the suggested name: `[tools]`"
     );
     code!(
         SCHEMA_UNLOWERED_TABLE,
@@ -223,7 +251,9 @@ pub mod codes {
         Schema,
         Warning,
         "known table that this version does not lower yet",
-        "the table is documented in the DSL but has no effect yet; it is kept out of the IR"
+        "the table is documented in the DSL but has no effect yet; it is kept out of the IR",
+        "[compatibility]\nmin_harwness = \"0.1.0\"",
+        "remove the table, or keep it knowing that it has no effect yet"
     );
     code!(
         SCHEMA_UNKNOWN_KEY,
@@ -231,7 +261,9 @@ pub mod codes {
         Schema,
         Error,
         "unknown key in a known table",
-        "remove the key or fix its name; the help lists the known keys"
+        "remove the key or fix its name; the help lists the known keys",
+        "[tools]\nadmited = [\"fs.read\"]",
+        "fix the key name: `admitted = [\"fs.read\"]`"
     );
     code!(
         SCHEMA_ALIAS_CONFLICT,
@@ -239,7 +271,9 @@ pub mod codes {
         Schema,
         Error,
         "a table is given under both its name and its alias",
-        "use one name only, e.g. `[spawn]` instead of `[spawn]` plus `[spawn_contract]`"
+        "use one name only, e.g. `[spawn]` instead of `[spawn]` plus `[spawn_contract]`",
+        "[spawn]\nmax_depth = 1\n\n[spawn_contract]\nmax_depth = 1",
+        "keep only `[spawn]` and delete `[spawn_contract]`"
     );
     code!(
         SCHEMA_EMPTY_SPECIALIZATION,
@@ -247,7 +281,9 @@ pub mod codes {
         Schema,
         Error,
         "`specialization` is empty",
-        "give the definition a non-empty specialization (DSL §10)"
+        "give the definition a non-empty specialization (DSL §10)",
+        "specialization = \"\"",
+        "name the specialization: `specialization = \"evidence-critic\"`"
     );
     code!(
         SCHEMA_INSTRUCTIONS,
@@ -255,7 +291,9 @@ pub mod codes {
         Schema,
         Error,
         "the instructions file cannot be loaded",
-        "`instructions_file` is a relative path inside the agent directory that names a readable UTF-8 file"
+        "`instructions_file` is a relative path inside the agent directory that names a readable UTF-8 file",
+        "instructions_file = \"missing.md\"",
+        "create `missing.md` next to `definition.toml`, or point `instructions_file` at an existing relative file such as `system.md`"
     );
 
     // ── RESOLVE ────────────────────────────────────────────────────────
@@ -265,7 +303,9 @@ pub mod codes {
         Resolve,
         Error,
         "the `extends` base definition does not exist",
-        "check the base ID and version, and that the base is installed in a lower layer"
+        "check the base ID and version, and that the base is installed in a lower layer",
+        "extends = { id = \"acme.agent.nope@1\" }",
+        "extend an installed definition, e.g. `extends = { id = \"harwness.agent.worker-base@1\" }`"
     );
     code!(
         RESOLVE_MISSING_MIXIN,
@@ -273,7 +313,9 @@ pub mod codes {
         Resolve,
         Error,
         "a mixin does not exist",
-        "check the mixin ID and version"
+        "check the mixin ID and version",
+        "mixins = [{ id = \"acme.mixin.nope@1\" }]",
+        "install the mixin in a lower layer or remove it from `mixins`"
     );
     code!(
         RESOLVE_CYCLE,
@@ -281,7 +323,9 @@ pub mod codes {
         Resolve,
         Error,
         "inheritance cycle",
-        "break the cycle in the `extends` chain"
+        "break the cycle in the `extends` chain",
+        "id = \"acme.agent.t@1\"\nextends = { id = \"acme.agent.t@1\" }",
+        "extend a different definition; a definition can never be its own ancestor"
     );
     code!(
         RESOLVE_SHADOWED_TABLE,
@@ -289,7 +333,9 @@ pub mod codes {
         Resolve,
         Warning,
         "a table of this definition is shadowed by its base",
-        "the base already defines this table, so the resolver keeps the base's table; use `[patch.<table>]` to change inherited values"
+        "the base already defines this table, so the resolver keeps the base's table; use `[patch.<table>]` to change inherited values",
+        "# the base already has [work]\nextends = { id = \"acme.agent.base@1\" }\n\n[work]\nmode = \"own-mode\"",
+        "change inherited values with a patch: `[patch.work]` with `mode = { replace = \"own-mode\" }`"
     );
     code!(
         RESOLVE_INVALID_ID,
@@ -297,7 +343,9 @@ pub mod codes {
         Resolve,
         Error,
         "invalid definition ID",
-        "IDs have the form `<namespace>.<kind>.<name>@<major>`"
+        "IDs have the form `<namespace>.<kind>.<name>@<major>`",
+        "id = \"not-an-id\"",
+        "use the form `<namespace>.<kind>.<name>@<major>`, e.g. `id = \"acme.agent.reviewer@1\"`"
     );
     code!(
         RESOLVE_INVALID_VERSION,
@@ -305,7 +353,9 @@ pub mod codes {
         Resolve,
         Error,
         "invalid semantic version",
-        "use a full semantic version such as `1.0.0`"
+        "use a full semantic version such as `1.0.0`",
+        "version = \"1.0\"",
+        "write a full semantic version: `version = \"1.0.0\"`"
     );
     code!(
         RESOLVE_IO,
@@ -313,7 +363,9 @@ pub mod codes {
         Resolve,
         Error,
         "a definition file cannot be read",
-        "check that the file exists and is readable"
+        "check that the file exists and is readable",
+        "# agents/t/definition.toml exists but is not readable (chmod 000)",
+        "restore read permission on the file, e.g. `chmod 644 agents/t/definition.toml`"
     );
 
     // ── PATCH ──────────────────────────────────────────────────────────
@@ -323,7 +375,9 @@ pub mod codes {
         Patch,
         Error,
         "unknown merge operator or malformed patch value",
-        "known operators: replace, append, prepend, remove, intersect, min, max-within-parent"
+        "known operators: replace, append, prepend, remove, intersect, min, max-within-parent",
+        "[patch]\ntools = 3",
+        "patch a path with a table of one operator, e.g. `[patch.tools.admitted]` with `append = [\"fs.read\"]`"
     );
     code!(
         PATCH_MISSING_PATH,
@@ -331,7 +385,9 @@ pub mod codes {
         Patch,
         Error,
         "the patch path names no inherited field",
-        "only `replace` may introduce a field; every other operator needs an inherited value"
+        "only `replace` may introduce a field; every other operator needs an inherited value",
+        "[patch.nothere]\nappend = [\"x\"]",
+        "patch a field the base defines, or use `replace` to introduce it"
     );
     code!(
         PATCH_TYPE_MISMATCH,
@@ -339,7 +395,9 @@ pub mod codes {
         Patch,
         Error,
         "merge operator applied to a value of the wrong type",
-        "array operators need arrays, `min`/`max-within-parent` need numbers, nested paths need tables"
+        "array operators need arrays, `min`/`max-within-parent` need numbers, nested paths need tables",
+        "[patch.skills]\nappend = \"x\"",
+        "give the operator a value of the right type: `append = [\"x\"]`"
     );
     code!(
         PATCH_EXCEEDS_PARENT,
@@ -347,7 +405,9 @@ pub mod codes {
         Patch,
         Error,
         "`max-within-parent` asks for more than the parent allows",
-        "request at most the inherited value, or use `min`"
+        "request at most the inherited value, or use `min`",
+        "# the base sets [limits] max_tool_calls = 40\n[patch.limits]\nmax_tool_calls = { max-within-parent = 41 }",
+        "ask for at most the inherited value: `max_tool_calls = { max-within-parent = 40 }`, or use `min`"
     );
     code!(
         PATCH_AMBIGUOUS,
@@ -355,7 +415,9 @@ pub mod codes {
         Patch,
         Error,
         "a patch table mixes operators with nested keys",
-        "split the patch: operators apply to this path, nested keys to paths below it"
+        "split the patch: operators apply to this path, nested keys to paths below it",
+        "[patch.x]\nreplace = 1\ny = { append = [] }",
+        "split it into `[patch.x]` with `replace = 1` and `[patch.x.y]` with `append = []`"
     );
 
     // ── AUTH ───────────────────────────────────────────────────────────
@@ -365,7 +427,9 @@ pub mod codes {
         Auth,
         Error,
         "authority elevation",
-        "a definition may only keep or reduce the capabilities it inherits"
+        "a definition may only keep or reduce the capabilities it inherits",
+        "[authority]\ncapabilities = [\"filesystem.read\"]\n\n[patch.authority.capabilities]\nappend = [\"agent.spawn.child-orchestrator\"]",
+        "drop the added capability; authority can only be narrowed with `intersect` or `remove`"
     );
     code!(
         AUTH_FORBIDDEN_OP,
@@ -373,7 +437,9 @@ pub mod codes {
         Auth,
         Error,
         "operator not allowed on an authority-bearing set",
-        "authority capabilities accept only `intersect` and `remove`"
+        "authority capabilities accept only `intersect` and `remove`",
+        "[patch.authority.capabilities]\nreplace = [\"filesystem.read\"]",
+        "narrow with `intersect = [\"filesystem.read\"]` or `remove = [...]` instead of `replace`"
     );
 
     // ── ROLE ───────────────────────────────────────────────────────────
@@ -383,7 +449,9 @@ pub mod codes {
         Role,
         Error,
         "a mixin has a role incompatible with the definition",
-        "mixins may not change the role (DSL §6)"
+        "mixins may not change the role (DSL §6)",
+        "# acme.mixin.m@1 declares role = \"root-orchestrator\"\nrole = \"worker\"\nmixins = [{ id = \"acme.mixin.m@1\" }]",
+        "use a mixin with the same role as the definition, or remove it"
     );
     code!(
         ROLE_SPAWN_MATRIX,
@@ -391,7 +459,9 @@ pub mod codes {
         Role,
         Error,
         "the role may not spawn child orchestrators",
-        "only orchestrator roles may list `spawn.child_orchestrators`"
+        "only orchestrator roles may list `spawn.child_orchestrators`",
+        "role = \"worker\"\n\n[spawn]\nchild_orchestrators = [\"coding-orchestrator\"]",
+        "remove `child_orchestrators`, or make the definition `role = \"child-orchestrator\"`"
     );
 
     // ── TOOL ───────────────────────────────────────────────────────────
@@ -401,7 +471,9 @@ pub mod codes {
         Tool,
         Error,
         "a tool is both admitted and forbidden",
-        "remove the tool from one of `tools.admitted` and `tools.forbidden`"
+        "remove the tool from one of `tools.admitted` and `tools.forbidden`",
+        "[tools]\nadmitted = [\"fs.read\"]\nforbidden = [\"fs.read\"]",
+        "keep the tool in exactly one of the two lists"
     );
     code!(
         TOOL_DUPLICATE,
@@ -409,7 +481,9 @@ pub mod codes {
         Tool,
         Warning,
         "a tool is listed twice",
-        "remove the duplicate entry"
+        "remove the duplicate entry",
+        "[tools]\nadmitted = [\"fs.read\", \"fs.read\"]",
+        "list each tool once: `admitted = [\"fs.read\"]`"
     );
     code!(
         TOOL_INVALID_NAME,
@@ -417,7 +491,9 @@ pub mod codes {
         Tool,
         Error,
         "invalid tool name",
-        "tool names are non-empty and contain no whitespace or control characters"
+        "tool names are non-empty and contain no whitespace or control characters",
+        "[tools]\nadmitted = [\"fs read\"]",
+        "use the tool name without whitespace: `admitted = [\"fs.read\"]`"
     );
 
     // ── CTX ────────────────────────────────────────────────────────────
@@ -427,7 +503,9 @@ pub mod codes {
         Ctx,
         Error,
         "unknown context program",
-        "`[context] program` names a program of the context-program library"
+        "`[context] program` names a program of the context-program library",
+        "[context]\nprogram = \"nope\"",
+        "name a program of the library, e.g. `program = \"explore\"`"
     );
     code!(
         CTX_PROGRAM_RESOLUTION,
@@ -435,7 +513,9 @@ pub mod codes {
         Ctx,
         Error,
         "the context program cannot be resolved",
-        "fix the context program definition"
+        "fix the context program definition",
+        "# the program file exists but does not parse or extends a missing program\n[context]\nprogram = \"broken\"",
+        "fix the program file under `context-programs/` (schema, id, sections)"
     );
     code!(
         CTX_DEFERRED_SECTIONS,
@@ -443,7 +523,9 @@ pub mod codes {
         Ctx,
         Note,
         "must-include sections outside the root context ceiling are deferred",
-        "these sections stay named by the program but are not required at child start"
+        "these sections stay named by the program but are not required at child start",
+        "[context]\nprogram = \"plan\"   # has must-include sections outside the root ceiling",
+        "nothing to fix; list the sections in `[context] must_include` if the child really needs them at start"
     );
 
     // ── RETURN ─────────────────────────────────────────────────────────
@@ -453,15 +535,20 @@ pub mod codes {
         Return,
         Error,
         "unknown return contract",
-        "use one of the known return contracts; an unknown contract is not treated as free text"
+        "use one of the known return contracts; an unknown contract is not treated as free text",
+        "[return]\ncontract = \"harwness.return.freeform@1\"",
+        "use a known contract, e.g. `contract = \"harwness.return.execution-summary@1\"`"
     );
     code!(
         RETURN_INVALID_VALIDATOR,
         "HARW-RETURN-002",
         Return,
         Error,
-        "invalid validator label",
-        "validator labels are non-empty and contain no whitespace"
+        "invalid or unknown validator label",
+        "validator labels are non-empty, contain no whitespace and name a known validator \
+         (non-empty, json, json-object); the runtime runs every listed validator",
+        "[return]\nvalidators = [\"not valid\"]",
+        "use a known validator label: `validators = [\"non-empty\"]` (known: non-empty, json, json-object)"
     );
 
     // ── MODEL ──────────────────────────────────────────────────────────
@@ -471,7 +558,9 @@ pub mod codes {
         Model,
         Error,
         "unknown effort label",
-        "use one of: minimal, low, medium, high, xhigh, max"
+        "use one of: minimal, low, medium, high, xhigh, max",
+        "[models]\neffort = \"ultra\"",
+        "use a known level: `effort = \"high\"`"
     );
     code!(
         MODEL_INVALID_ENV,
@@ -479,7 +568,9 @@ pub mod codes {
         Model,
         Error,
         "invalid environment variable name",
-        "environment variable names match `[A-Z_][A-Z0-9_]*`"
+        "environment variable names match `[A-Z_][A-Z0-9_]*`",
+        "[models]\nrequired_env = [\"anthropic-key\"]",
+        "use an upper-case variable name: `required_env = [\"ANTHROPIC_API_KEY\"]`"
     );
     code!(
         MODEL_INVALID_FALLBACK,
@@ -487,7 +578,9 @@ pub mod codes {
         Model,
         Error,
         "malformed model fallback",
-        "fallbacks have the form `provider/model`"
+        "fallbacks have the form `provider/model`",
+        "[models]\nfallbacks = [\"gpt-5\"]",
+        "name provider and model: `fallbacks = [\"openai/gpt-5\"]`"
     );
 
     // ── SKILL ──────────────────────────────────────────────────────────
@@ -497,7 +590,9 @@ pub mod codes {
         Skill,
         Error,
         "invalid skill entry",
-        "skill names match `[a-z0-9-]{1,64}` and appear once"
+        "skill names match `[a-z0-9-]{1,64}` and appear once",
+        "skills = [\"Evidence Review\"]",
+        "use the skill name: `skills = [\"evidence-quality-review\"]`"
     );
 
     // ── BINARY ─────────────────────────────────────────────────────────
@@ -507,7 +602,9 @@ pub mod codes {
         Binary,
         Error,
         "unknown binary interface",
-        "known interfaces: cli, repl, mcp, http, tui"
+        "known interfaces: cli, repl, mcp, http, tui",
+        "[binary]\ninterfaces = [\"grpc\"]",
+        "choose from cli, repl, mcp, http, tui: `interfaces = [\"cli\", \"mcp\"]`"
     );
     code!(
         BINARY_DEFAULT_NOT_LISTED,
@@ -515,7 +612,9 @@ pub mod codes {
         Binary,
         Error,
         "`default_interface` is not one of `interfaces`",
-        "add the default interface to `interfaces` or choose a listed one"
+        "add the default interface to `interfaces` or choose a listed one",
+        "[binary]\ninterfaces = [\"cli\"]\ndefault_interface = \"http\"",
+        "add it to the list (`interfaces = [\"cli\", \"http\"]`) or pick a listed one (`default_interface = \"cli\"`)"
     );
     code!(
         BINARY_EMPTY_INTERFACES,
@@ -523,7 +622,9 @@ pub mod codes {
         Binary,
         Error,
         "`interfaces` is empty",
-        "list at least one interface or omit the key for the default `[\"cli\"]`"
+        "list at least one interface or omit the key for the default `[\"cli\"]`",
+        "[binary]\ninterfaces = []",
+        "list at least one interface (`interfaces = [\"cli\"]`) or delete the key"
     );
     code!(
         BINARY_INVALID_NAME,
@@ -531,7 +632,9 @@ pub mod codes {
         Binary,
         Error,
         "invalid binary name",
-        "binary names match `[a-z0-9][a-z0-9._-]{0,63}`"
+        "binary names match `[a-z0-9][a-z0-9._-]{0,63}`",
+        "[binary]\nname = \"Evidence Critic\"",
+        "use a file-name-safe name: `name = \"evidence-critic\"`"
     );
     code!(
         BINARY_DUPLICATE_INTERFACE,
@@ -539,7 +642,9 @@ pub mod codes {
         Binary,
         Warning,
         "an interface is listed twice",
-        "remove the duplicate entry"
+        "remove the duplicate entry",
+        "[binary]\ninterfaces = [\"cli\", \"cli\"]",
+        "list each interface once: `interfaces = [\"cli\"]`"
     );
 }
 
@@ -1110,6 +1215,15 @@ pub fn parse_source(file: &SourceFile) -> Result<crate::raw::RawAgentDefinition,
 mod tests {
     use super::*;
     use crate::test_support::{TestError, TestResult};
+
+    #[test]
+    fn test_every_catalog_entry_has_an_example_and_a_fix() {
+        for entry in CATALOG {
+            assert!(!entry.example.trim().is_empty(), "{}: no example", entry.code);
+            assert!(!entry.fix.trim().is_empty(), "{}: no fix", entry.code);
+            assert_ne!(entry.fix, entry.help, "{}: fix repeats help", entry.code);
+        }
+    }
 
     #[test]
     fn test_catalog_codes_are_unique_and_well_formed() {

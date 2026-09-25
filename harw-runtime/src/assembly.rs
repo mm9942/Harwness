@@ -787,6 +787,71 @@ fn root_activation(ir: Option<&ExecutableAgentIr>) -> SessionActivation {
     activation
 }
 
+/// Das Kontextprogramm der Wurzel-IR, geprüft gegen die Wurzeldecke
+/// (#22 Welle 1B).
+///
+/// # Beschreibung
+/// Dieselbe Regel wie bei der Kind-Admission
+/// (`ManagedAgentSpawner::describe_context_program_ceiling_violation`): jede
+/// Sektion aus `must_include` und `section_detail` muss in der Decke liegen.
+/// Ein leeres Programm (`ContextProgram::default()`, keine Deklaration)
+/// ergibt `None` — die Wurzel rendert dann genau wie bisher. Unter einer
+/// geschlossenen Decke (keine Sektion, Einstiege ohne Spawner) gilt kein
+/// Programm; die Wurzel läuft ohne und das wird geloggt.
+///
+/// # Fehler
+/// [`RuntimeError::Registry`], wenn das Programm eine Sektion außerhalb der
+/// Wurzeldecke verlangt: fail-closed, die Wurzel startet nicht mit einem
+/// Programm, das sie nicht einhalten kann.
+fn root_context_program(
+    ir: Option<&ExecutableAgentIr>,
+    ceiling: &ContextCeiling,
+) -> RuntimeResult<Option<harw_agent_dsl::executable::ContextProgram>> {
+    let Some(ir) = ir else {
+        return Ok(None);
+    };
+    let program = ir.context_program();
+    if program == &harw_agent_dsl::executable::ContextProgram::default() {
+        return Ok(None);
+    }
+    if ceiling.sections.is_empty() {
+        // Geschlossene Decke (`CeilingPolicy::Closed`: Web, MCP, Jobs,
+        // Gateways — Einstiege ohne Spawner): dort kann kein Programm
+        // gelten, und auch kein Kind mit Programm würde zugelassen. Die
+        // Wurzel läuft ohne Programm; das wird sichtbar gemeldet.
+        tracing::warn!(
+            agent = ir.specialization(),
+            policy = program.context_policy().unwrap_or("<none>"),
+            "runtime.root_context_program.skipped_under_closed_ceiling"
+        );
+        return Ok(None);
+    }
+    let outside = program
+        .must_include()
+        .iter()
+        .map(String::as_str)
+        .chain(
+            program
+                .section_detail()
+                .iter()
+                .map(harw_agent_dsl::executable::SectionDetail::name),
+        )
+        .find(|name| {
+            !harw_context::SectionName::try_new(*name)
+                .is_ok_and(|section| ceiling.sections.contains(&section))
+        });
+    if let Some(name) = outside {
+        return Err(RuntimeError::Registry {
+            detail: format!(
+                "root agent '{}' declares context section '{name}' outside the root context \
+                 ceiling; refusing to start with a context program it cannot honour",
+                ir.specialization()
+            ),
+        });
+    }
+    Ok(Some(program.clone()))
+}
+
 /// Eine Verengung, die der Aufrufer über die Rechte seines Einstiegs legt.
 ///
 /// # Beschreibung
@@ -1815,6 +1880,11 @@ impl RuntimeAssemblyBuilder {
         // Tool-Calls als Text). Enkel ⊆ Kind ⊆ Wurzel gilt so gegen die echte
         // Wurzel.
         let activation = root_activation(agent_ir.as_ref());
+        // #22 Welle 1B: die Wurzel (explizit gewählter Agent, sonst die UIA)
+        // bringt ihr Kontextprogramm mit wie jedes Kind — geprüft gegen die
+        // Wurzeldecke mit derselben Regel wie die Kind-Admission.
+        let root_context_program =
+            root_context_program(agent_ir.as_ref().or(uia_ir.as_ref()), &ceiling)?;
         // Welle 8: Provider-/Modell-/Agenten-Reasoning-Effort-Vorgaben der
         // Wurzel-UIA, einmalig hier bestimmt (nicht in
         // [`Self::new_root_session`], das keinen Zugriff auf `uia_ir` selbst
@@ -2986,6 +3056,7 @@ impl RuntimeAssemblyBuilder {
             extra_roots,
             approval_timeout,
             agent_ir,
+            root_context_program,
             activation,
             operations,
             services,
@@ -4839,6 +4910,10 @@ pub struct RuntimeAssembly {
     /// Effektives Freigabe-Timeout (Projekt > Global > Vorgabe), für die TUI.
     approval_timeout: Duration,
     agent_ir: Option<ExecutableAgentIr>,
+    /// #22 Welle 1B: das Kontextprogramm der Wurzel (explizit gewählter
+    /// Agent, sonst UIA), bereits gegen die Wurzeldecke geprüft; `None` ohne
+    /// deklariertes Programm.
+    root_context_program: Option<harw_agent_dsl::executable::ContextProgram>,
     activation: SessionActivation,
     operations: Arc<OperationRegistry>,
     /// Hinter einem `Arc`, weil die Modell-Tool-Fläche der Operationen
@@ -5324,6 +5399,16 @@ impl RuntimeAssembly {
         &self.activation
     }
 
+    /// #22 Welle 1B: das Kontextprogramm, das die Wurzelsitzung trägt
+    /// (explizit gewählter Agent, sonst UIA), bereits gegen die Wurzeldecke
+    /// geprüft; `None` ohne deklariertes Programm.
+    #[must_use]
+    pub const fn root_context_program(
+        &self,
+    ) -> Option<&harw_agent_dsl::executable::ContextProgram> {
+        self.root_context_program.as_ref()
+    }
+
     /// Das Budget des Wurzel-Agenten.
     #[must_use]
     pub const fn budget(&self) -> &RootBudget {
@@ -5725,6 +5810,12 @@ impl RuntimeAssembly {
         }
         if let Some(ir) = self.agent_ir.as_ref() {
             session = session.with_executable_agent_ir(ir);
+        }
+        // #22 Welle 1B: wie ein Kind (`ManagedAgentSpawner::admit`) trägt die
+        // Wurzel das Programm ihrer Definition; ohne Programm bleibt die
+        // Kontextmontage unverändert.
+        if let Some(program) = self.root_context_program.clone() {
+            session = session.with_context_program(program);
         }
         // Welle 3: jede Modellanfrage der Wurzel fordert höchstens die
         // Ausgabereserve an, die die Auto-Verdichtung vom Fenster abzieht.

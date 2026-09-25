@@ -166,6 +166,11 @@ IR v2 stays in `harw-agent-dsl` as a new module.
 
 **3C – Child agents of a compiled parent via the job system** (Mia's decision)
 - **Build:** a compiled orchestrator bundles its reachable child agents (`delegation_targets` / `child_orchestrators`, transitively) as sub-artifacts: new `PayloadKind::Agent` (a nested artifact per child) in `harw-agent-artifact`. The compiler resolves the family closure, and its rights check verifies child ≤ parent.
+- **Content-addressed shared payload pool** (a review suggestion):
+  - The parent artifact stores every payload exactly once, under `pool/<blake3>`. Agents are small entries (IR plus `payload_refs`) with no copies of their own, so several children sharing skills store them only once.
+  - The runner resolves refs from the pool and fails closed on a missing or tampered blob.
+  - The build cache and the GC also work on shared blobs.
+  - `inspect` shows the dedup savings.
 - **Runtime:** instead of in-process `ManagedAgentSpawner` children, the runner starts each child as a **job** via `harw-tool-job` (`JobManager`). The child is the same binary with `--child <agent-id> --child-protocol stdio`.
   - The JobManager provides process group, start/stop/status, logs, progress and end events to the parent (`JobNotifier`), with no tmux, systemd or shell in between.
   - The direct control channel is a JSON-lines protocol over the job's stdin/stdout. Parent → child: `task`, `message`, `answer`, `cancel`, `budget`, `mode`. Child → parent: `event` (in the `SdkEvent` format), `question`, `approval_request`, `result`, `usage`. `ManagedAgentSpawner` gets a new backend `JobChildBackend`, so `transfer_to_*`, `agents.delegate`, `delegate_wave`, `agent.message/status/result` and the TUI panel work unchanged.

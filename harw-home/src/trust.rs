@@ -83,7 +83,6 @@ use harw_fsutil::{
 use serde::{Deserialize, Serialize};
 
 use crate::error::{HomeError, HomeResult};
-use crate::paths::HOME_DIR_NAME;
 
 /// Dateiname des Trust-Stores unterhalb des Root-Space.
 pub const TRUST_STORE_FILE: &str = "trusted-projects.toml";
@@ -452,7 +451,7 @@ pub fn project_trust_status(home: &Path, root: &Path) -> HomeResult<TrustStatus>
 ///   oder Größen-/Tiefen-/Anzahl-/Zeitgrenzen sind überschritten.
 /// - [`HomeError::Io`][]: Lesefehler.
 pub fn project_digest(root: &Path) -> HomeResult<String> {
-    let harw_dir = root.join(HOME_DIR_NAME);
+    let harw_dir = root.join(crate::paths::project_dir_name());
     let mut entries: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
     match std::fs::symlink_metadata(&harw_dir) {
         Ok(meta) if meta.file_type().is_symlink() => {

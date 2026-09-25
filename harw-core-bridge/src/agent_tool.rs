@@ -150,6 +150,7 @@ use harw_operations::error::OpError;
 use harw_operations::operation::{OpOutput, Operation, Surface};
 
 use crate::context_ext::OpContextCoreExt;
+use crate::return_validators::run_return_validators;
 
 // ── Adapter ───────────────────────────────────────────────────────────────────
 
@@ -497,7 +498,14 @@ impl AgentToolAdapter {
                 ))
             })?;
 
-            let contract = resolve_child_contract(ctx, self.child_name);
+            // #22 Welle 1B: ein unbekannter Contract startet kein Kind.
+            let contract = resolve_child_contract(ctx, self.child_name).map_err(|error| {
+                OpError::NotAvailable(format!(
+                    "Child-Agent '{}' kann nicht gestartet werden: {error}",
+                    self.child_name
+                ))
+            })?;
+            let validators = resolve_child_validators(ctx, self.child_name);
 
             let reducer = resolve_authority_reducer(self.authority_reducer);
             let child_sandbox = reducer(ctx.sandbox());
@@ -647,6 +655,35 @@ impl AgentToolAdapter {
                         contract = contract.as_label(),
                         "AgentToolAdapter: Child-Agent-Turn abgeschlossen"
                     );
+                    // #22 Welle 1B: die Rückgabe-Validatoren der IR laufen
+                    // auf dem ungekürzten Text, vor dem Contract.
+                    if !validators.is_empty() {
+                        let text =
+                            full_child_return_text(&spawner, &run_result).map_err(|error| {
+                                OpError::NotAvailable(format!(
+                                    "Child-Agent-Abschlussantwort nicht verfügbar: {error}"
+                                ))
+                            })?;
+                        if let Err(violation) = run_return_validators(&validators, &text) {
+                            tracing::warn!(
+                                child = %run_result.child,
+                                validator = %violation.validator,
+                                error = %violation.message,
+                                "AgentToolAdapter: Rückgabe-Validator verletzt"
+                            );
+                            let mut report = violation.to_json();
+                            if let Value::Object(map) = &mut report {
+                                map.insert(
+                                    "contract".to_owned(),
+                                    Value::String(contract.as_label().to_owned()),
+                                );
+                            }
+                            return Ok(OpOutput {
+                                text: report.to_string(),
+                                data: None,
+                            });
+                        }
+                    }
                     match contract {
                         // Rückwärtskompatibel: der Freitext des Kindes geht
                         // unverändert (und ohne JSON-Quoting) an das Parent-Modell.
@@ -1378,13 +1415,16 @@ fn invalid_hint(hint: &str, reason: &str) -> OpError {
 /// Rohtext, sodass das Parent gezielt nachsteuern (erneut fragen, Vertrag
 /// erklären, Ergebnis verwerfen) kann.
 ///
-/// ## Warum unbekannte Labels auf `Text` fallen
-/// Ein unbekanntes Contract-Label bedeutet: dieses Werkzeug kann die Antwort
-/// nicht prüfen. Dann darf es auch nicht so tun — der Freitext geht ungeprüft
-/// durch, begleitet von einem `warn`. Das ist die **umgekehrte** Polarität zum
-/// Authority-Reducer ([`resolve_authority_reducer`]), der bei einer unbekannten
-/// Kennung auf die *restriktivste* Variante fällt: dort geht es um Rechte (im
-/// Zweifel weniger), hier um eine Behauptung (im Zweifel keine).
+/// ## Unbekannte Labels sind ein Fehler (#22 Welle 1B)
+/// Früher fiel ein unbekanntes Label still auf `Text` zurück. Seit der
+/// Agent-IR v2 ist das Vokabular geschlossen
+/// ([`harw_agent_dsl::ir_v2::ReturnContract`], `HARW-RETURN-001` beim
+/// Senken): [`Self::parse`] ist strikt. Bekannte **Text**-Contracts
+/// (`execution-summary`, `coding-task`, …, die Matrix-Contracts) werden als
+/// [`Self::Text`] durchgereicht — ihr Label dokumentiert die erwartete Form,
+/// dieses Werkzeug prüft sie nicht strukturell. Ein unbekanntes Label ist
+/// [`UnknownReturnContract`]; das Agent-Werkzeug startet dann kein Kind,
+/// `delegate_wave` meldet das Ziel als `failed`.
 ///
 /// # Der vierte Arm — `SecurityVerdict` (AW6-02)
 /// [`Self::SecurityVerdict`] validiert die Kind-Antwort gegen
@@ -1437,21 +1477,25 @@ impl ChildReturnContract {
     /// etwas fehlschlägt.
     pub const SECURITY_VERDICT_ID: &'static str = harw_dod_signals::SecurityVerdict::CONTRACT_ID;
 
-    /// Bildet ein Contract-Label der Agent-IR auf die Auswertung ab.
+    /// Bildet ein Contract-Label der Agent-IR auf die Auswertung ab — strikt
+    /// (#22 Welle 1B).
     ///
     /// # Argumente
-    /// - `id` (`&str`): das undurchsichtige Label aus `[return] contract = …`.
+    /// - `id` (`&str`): das Label aus `[return] contract = …`.
     ///
     /// # Returns
     /// [`Self::ResearchFinding`] für `"harwness.return.research-finding@1"`,
     /// [`Self::ReturnEnvelope`] für `"harwness.return.envelope@1"`,
     /// [`Self::SecurityVerdict`] für [`Self::SECURITY_VERDICT_ID`]
-    /// (`"harwness.security-verdict/v1"`), sonst [`Self::Text`]. Bewusst
-    /// kein `Result`: ein Label, das dieses Werkzeug nicht kennt (etwa
-    /// `"harwness.return.coding-task@1"` oder eine künftige
-    /// `"harwness.security-verdict/v2"`), darf nicht als „ungültig" gelten —
-    /// es wird nur nicht geprüft (siehe [`resolve_child_contract`] für den
-    /// begleitenden `warn`).
+    /// (`"harwness.security-verdict/v1"`), [`Self::Text`] für jeden anderen
+    /// **bekannten** Contract der Agent-IR v2
+    /// ([`harw_agent_dsl::ir_v2::ReturnContract::ALL`], etwa
+    /// `"harwness.return.coding-task@1"`).
+    ///
+    /// # Errors
+    /// [`UnknownReturnContract`] für ein Label außerhalb des Vokabulars
+    /// (auch eine künftige `"harwness.security-verdict/v2"`) — kein stiller
+    /// Rückfall auf Freitext.
     ///
     /// # Concurrency
     /// Reine Funktion; aus jedem Thread aufrufbar.
@@ -1462,27 +1506,32 @@ impl ChildReturnContract {
     ///
     /// assert_eq!(
     ///     ChildReturnContract::parse("harwness.return.research-finding@1"),
-    ///     ChildReturnContract::ResearchFinding
+    ///     Ok(ChildReturnContract::ResearchFinding)
     /// );
     /// assert_eq!(
     ///     ChildReturnContract::parse("harwness.security-verdict/v1"),
-    ///     ChildReturnContract::SecurityVerdict
+    ///     Ok(ChildReturnContract::SecurityVerdict)
     /// );
     /// assert_eq!(
     ///     ChildReturnContract::parse("harwness.return.coding-task@1"),
-    ///     ChildReturnContract::Text
+    ///     Ok(ChildReturnContract::Text)
     /// );
+    /// assert!(ChildReturnContract::parse("harwness.return.nope@1").is_err());
     /// ```
-    #[must_use]
-    pub fn parse(id: &str) -> Self {
+    pub fn parse(id: &str) -> Result<Self, UnknownReturnContract> {
         let trimmed = id.trim();
         if trimmed == Self::SECURITY_VERDICT_ID {
-            return Self::SecurityVerdict;
+            return Ok(Self::SecurityVerdict);
         }
         match trimmed {
-            "harwness.return.research-finding@1" => Self::ResearchFinding,
-            "harwness.return.envelope@1" => Self::ReturnEnvelope,
-            _ => Self::Text,
+            "harwness.return.research-finding@1" => Ok(Self::ResearchFinding),
+            "harwness.return.envelope@1" => Ok(Self::ReturnEnvelope),
+            other => match harw_agent_dsl::ir_v2::ReturnContract::parse(other) {
+                Some(known) if !known.is_structured() => Ok(Self::Text),
+                _ => Err(UnknownReturnContract {
+                    label: other.to_owned(),
+                }),
+            },
         }
     }
 
@@ -1505,6 +1554,31 @@ impl ChildReturnContract {
         }
     }
 }
+
+/// Ein Return-Contract-Label außerhalb des Vokabulars der Agent-IR v2
+/// ([`ChildReturnContract::parse`], #22 Welle 1B).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UnknownReturnContract {
+    /// Das unbekannte Label.
+    pub label: String,
+}
+
+impl std::fmt::Display for UnknownReturnContract {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "unbekannter Return-Contract '{}' (bekannt: {})",
+            self.label,
+            harw_agent_dsl::ir_v2::ReturnContract::ALL
+                .iter()
+                .map(|contract| contract.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
+        )
+    }
+}
+
+impl std::error::Error for UnknownReturnContract {}
 
 /// Maximale Länge des Rohtext-Auszugs in einem Vertragsbruch-Report.
 const RAW_EXCERPT_CHARS: usize = 512;
@@ -1605,45 +1679,58 @@ fn excerpt(raw: &str, limit: usize) -> String {
 /// `Arc<dyn ChildRegistryFactory>` — dieselbe Factory, die der Spawner bei der
 /// Admission benutzt — und liest daraus `return_pipeline().contract()`.
 ///
-/// Ist keine Factory registriert (der heutige Normalfall, weil die Composition
-/// Roots nur Spawner und `StateStore` registrieren), gilt [`ChildReturnContract::Text`]:
-/// ohne IR gibt es keine Vertragsbehauptung, die dieses Werkzeug prüfen könnte.
+/// Ist keine Factory registriert oder nennt die IR keinen Contract, gilt
+/// [`ChildReturnContract::Text`]: ohne IR gibt es keine Vertragsbehauptung,
+/// die dieses Werkzeug prüfen könnte.
 ///
 /// # Argumente
 /// - `ctx` (`&OpContext`): liefert die optionale Registry-Factory.
 /// - `role` (`&str`): der Rollenname des Kindes (= `child_name` der Fläche).
 ///
-/// # Returns
-/// Der aufgelöste [`ChildReturnContract`]; [`ChildReturnContract::Text`] als
-/// Rückfallebene.
+/// # Errors
+/// [`UnknownReturnContract`], wenn die IR ein Label außerhalb des
+/// Vokabulars trägt (#22 Welle 1B: kein stiller Freitext-Rückfall).
 ///
 /// # Concurrency
 /// Nur lesend; die Factory ist per Supertrait `Send + Sync`.
-fn resolve_child_contract(ctx: &OpContext, role: &str) -> ChildReturnContract {
+fn resolve_child_contract(
+    ctx: &OpContext,
+    role: &str,
+) -> Result<ChildReturnContract, UnknownReturnContract> {
     let Some(factory) = ctx.service::<Arc<dyn ChildRegistryFactory>>() else {
         tracing::debug!(
             role,
             "agent_tool.contract.no_registry_factory: Freitext-Rückfallebene"
         );
-        return ChildReturnContract::Text;
+        return Ok(ChildReturnContract::Text);
     };
     let Some(label) = factory
         .executable_agent_ir(role)
         .and_then(|ir| ir.return_pipeline().contract())
     else {
-        return ChildReturnContract::Text;
+        return Ok(ChildReturnContract::Text);
     };
-    let contract = ChildReturnContract::parse(label);
-    if contract == ChildReturnContract::Text {
+    ChildReturnContract::parse(label).inspect_err(|error| {
         tracing::warn!(
             role,
             contract = label,
-            known = "harwness.return.research-finding@1, harwness.return.envelope@1, \
-                     harwness.security-verdict/v1",
-            "agent_tool.contract.unknown_label: Ergebnis wird ungeprüft als Freitext gereicht"
+            %error,
+            "agent_tool.contract.unknown_label: das Kind wird nicht gestartet"
         );
-    }
-    contract
+    })
+}
+
+/// Die Rückgabe-Validatoren eines Kindes aus seiner Agent-IR
+/// (`[return] validators`, #22 Welle 1B), in Deklarationsreihenfolge; leer
+/// ohne Registry-Factory oder IR.
+pub(crate) fn resolve_child_validators(ctx: &OpContext, role: &str) -> Vec<String> {
+    ctx.service::<Arc<dyn ChildRegistryFactory>>()
+        .and_then(|factory| {
+            factory
+                .executable_agent_ir(role)
+                .map(|ir| ir.return_pipeline().validators().to_vec())
+        })
+        .unwrap_or_default()
 }
 
 /// Wertet den Kind-Text gegen einen Contract aus.
@@ -2253,10 +2340,8 @@ pub(crate) async fn fanout_children_with(
     // `uia-worker`-Rollenfamilie darf nie mit mehr als einer gleichzeitig
     // laufenden Instanz gefanoutet werden, unabhängig vom Aufrufer-Wunsch.
     // `max_concurrent_instances_for_role` kapselt die Organisationsrollen-
-    // Fallunterscheidung vollständig in `harw-core`, weil diese Crate
-    // `harw-agent-dsl` nur als `[dev-dependencies]` führt (siehe die
-    // Argument-Doku oben) und den Rollen-Enum-Typ im produktiven Build gar
-    // nicht benennen kann.
+    // Fallunterscheidung vollständig in `harw-core` (die Regel gehört dem
+    // Spawner, nicht diesem Adapter).
     let slots = requested_slots.min(spawner.max_concurrent_instances_for_role(role));
     if slots < requested_slots {
         tracing::info!(
@@ -2270,6 +2355,8 @@ pub(crate) async fn fanout_children_with(
     // Je Position die Session-ID, sobald das Kind admittiert ist — nur damit
     // der Scheduler laufende Geschwister kooperativ abbrechen kann.
     let admitted: Vec<OnceLock<SessionId>> = (0..total).map(|_| OnceLock::new()).collect();
+    // #22 Welle 1B: die Rückgabe-Validatoren der Zielrolle.
+    let validators = resolve_child_validators(ctx, role);
     let shared = FanoutShared {
         ctx,
         spawner: spawner.as_ref(),
@@ -2278,6 +2365,7 @@ pub(crate) async fn fanout_children_with(
         child_sandbox: &child_sandbox,
         budget,
         contract,
+        validators: &validators,
         winner: &winner,
         continuation,
     };
@@ -2374,6 +2462,8 @@ struct FanoutShared<'a> {
     child_sandbox: &'a SandboxSpec,
     budget: AgentBudget,
     contract: ChildReturnContract,
+    /// #22 Welle 1B: `[return] validators` der Zielrolle.
+    validators: &'a [String],
     /// Gesetzt, sobald bei `AnyTerminal` ein Gewinner feststeht.
     winner: &'a AtomicBool,
     /// Runde 5, Teil J: bindet jedes Kind als Fortsetzung dieses Vorgängers.
@@ -2515,6 +2605,7 @@ async fn run_fanout_slot(
         shared.store,
         effective,
         shared.contract,
+        shared.validators,
         &run,
         question,
     )
@@ -2559,6 +2650,7 @@ async fn fanout_child_value(
     store: &dyn StateStore,
     budget: AgentBudget,
     contract: ChildReturnContract,
+    validators: &[String],
     result: &ChildRunResult,
     question: &Value,
 ) -> Result<FanoutValue, String> {
@@ -2631,6 +2723,13 @@ async fn fanout_child_value(
     let text = full_child_return_text(spawner, result).map_err(|error| {
         format!(
             "Child-Agent-Abschlussantwort von '{}' nicht verfügbar: {error}",
+            result.child
+        )
+    })?;
+    // #22 Welle 1B: die Rückgabe-Validatoren der IR vor dem Contract.
+    run_return_validators(validators, &text).map_err(|violation| {
+        format!(
+            "Child-Agent '{}' (Rolle '{role}'): {violation}",
             result.child
         )
     })?;
@@ -3164,7 +3263,7 @@ mod tests {
         contract_output, count_child_tool_calls, evaluate_return_with_grounding,
         evaluate_with_repair, model_effort_field, parse_budget_hint, paused_child_result,
         reducer_ceiling, repair_prompt, resolve_authority_reducer, resolve_child_contract,
-        tighten_budget,
+        resolve_child_validators, run_return_validators, tighten_budget,
     };
     use crate::context_ext::OpContextCoreExt;
     use crate::test_support::{TestError, TestResult};
@@ -3279,6 +3378,11 @@ mod tests {
 
     /// Lowert eine Test-Agent-IR mit dem angegebenen `[return]`-Abschnitt.
     fn ir_with_contract(contract: &str) -> TestResult<ExecutableAgentIr> {
+        ir_with_return(&format!("contract = \"{contract}\""))
+    }
+
+    /// Wie [`ir_with_contract`], mit dem vollständigen Inhalt von `[return]`.
+    fn ir_with_return(return_table: &str) -> TestResult<ExecutableAgentIr> {
         let raw = parse_toml(&format!(
             r#"
 schema = "harwness.agent/v1"
@@ -3288,7 +3392,7 @@ role = "worker"
 specialization = "bridge-contract-test"
 
 [return]
-contract = "{contract}"
+{return_table}
 "#
         ))
         .map_err(crate::test_support::ctx(
@@ -3572,31 +3676,48 @@ contract = "{contract}"
     fn test_child_return_contract_parse_maps_known_ids() {
         assert_eq!(
             ChildReturnContract::parse("harwness.return.research-finding@1"),
-            ChildReturnContract::ResearchFinding
+            Ok(ChildReturnContract::ResearchFinding)
         );
         assert_eq!(
             ChildReturnContract::parse("harwness.return.envelope@1"),
-            ChildReturnContract::ReturnEnvelope
+            Ok(ChildReturnContract::ReturnEnvelope)
         );
     }
 
+    /// #22 Welle 1B: bekannte Text-Contracts werden als ungeprüfter Freitext
+    /// durchgereicht, ein unbekanntes Label ist ein Fehler — kein stiller
+    /// Rückfall mehr.
     #[test]
-    fn test_child_return_contract_parse_falls_back_to_text() {
+    fn test_child_return_contract_parse_is_strict() {
         for id in [
             "harwness.return.coding-task@1",
             "harwness.return.plan-proposal@1",
+            "harwness.return.execution-summary@1",
+            "harwness.matrix.umpire-ruling@1",
+        ] {
+            assert_eq!(
+                ChildReturnContract::parse(id),
+                Ok(ChildReturnContract::Text),
+                "bekanntes Text-Label {id:?} behauptet keine Prüfung"
+            );
+        }
+        for id in [
             "",
             "nonsense",
             // Eine hypothetische künftige Fassung des Verdict-Vertrags: wird
             // erkannt als "nicht v1", nicht geraten gegen das heutige Schema
-            // geprüft.
+            // geprüft — und nicht mehr still als Freitext durchgereicht.
             "harwness.security-verdict/v2",
         ] {
-            assert_eq!(
-                ChildReturnContract::parse(id),
-                ChildReturnContract::Text,
-                "unbekanntes Label {id:?} darf keine Prüfung behaupten"
+            let parsed = ChildReturnContract::parse(id);
+            assert!(
+                parsed.as_ref().is_err_and(|error| error.label == id.trim()),
+                "unbekanntes Label {id:?} ist ein Fehler: {parsed:?}"
             );
+        }
+        // Jedes Label des IR-Vokabulars ist bekannt.
+        for contract in harw_agent_dsl::ir_v2::ReturnContract::ALL {
+            assert!(ChildReturnContract::parse(contract.as_str()).is_ok());
         }
     }
 
@@ -3606,7 +3727,7 @@ contract = "{contract}"
         // `test_child_return_contract_parse_maps_known_ids` oben, unverändert).
         assert_eq!(
             ChildReturnContract::parse("harwness.security-verdict/v1"),
-            ChildReturnContract::SecurityVerdict
+            Ok(ChildReturnContract::SecurityVerdict)
         );
         assert_eq!(
             ChildReturnContract::SecurityVerdict.as_label(),
@@ -3850,7 +3971,7 @@ contract = "{contract}"
         std::fs::remove_dir_all(tmp).ok();
         assert_eq!(
             contract,
-            ChildReturnContract::Text,
+            Ok(ChildReturnContract::Text),
             "ohne Registry-Factory gibt es keine IR und damit keine Vertragsbehauptung"
         );
         Ok(())
@@ -3867,7 +3988,7 @@ contract = "{contract}"
 
         let contract = resolve_child_contract(&ctx, "explorer");
         std::fs::remove_dir_all(tmp).ok();
-        assert_eq!(contract, ChildReturnContract::ResearchFinding);
+        assert_eq!(contract, Ok(ChildReturnContract::ResearchFinding));
         Ok(())
     }
 
@@ -3882,12 +4003,12 @@ contract = "{contract}"
 
         let contract = resolve_child_contract(&ctx, "security-triage-1");
         std::fs::remove_dir_all(tmp).ok();
-        assert_eq!(contract, ChildReturnContract::SecurityVerdict);
+        assert_eq!(contract, Ok(ChildReturnContract::SecurityVerdict));
         Ok(())
     }
 
     #[test]
-    fn test_resolve_child_contract_falls_back_on_an_unknown_ir_label() -> TestResult {
+    fn test_resolve_child_contract_passes_a_known_text_contract_through() -> TestResult {
         let factory: Arc<dyn ChildRegistryFactory> = Arc::new(IrRegistryFactory {
             ir: ir_with_contract("harwness.return.coding-task@1")?,
         });
@@ -3899,9 +4020,35 @@ contract = "{contract}"
         std::fs::remove_dir_all(tmp).ok();
         assert_eq!(
             contract,
-            ChildReturnContract::Text,
-            "ein nicht implementierter Contract darf nicht als geprüft gelten"
+            Ok(ChildReturnContract::Text),
+            "ein bekannter Text-Contract wird nicht strukturell geprüft"
         );
+        Ok(())
+    }
+
+    /// #22 Welle 1B: die Rückgabe-Validatoren kommen aus der IR des Kindes,
+    /// in Deklarationsreihenfolge; ohne Factory gibt es keine.
+    #[test]
+    fn test_resolve_child_validators_reads_the_agent_ir() -> TestResult {
+        let (ctx, tmp) = make_test_ctx()?;
+        assert!(resolve_child_validators(&ctx, "researcher").is_empty());
+        std::fs::remove_dir_all(tmp).ok();
+
+        let factory: Arc<dyn ChildRegistryFactory> = Arc::new(IrRegistryFactory {
+            ir: ir_with_return(
+                "contract = \"harwness.return.research-finding@1\"\n\
+                 validators = [\"non-empty\", \"json-object\"]",
+            )?,
+        });
+        let mut services = ServiceMap::new();
+        services.insert(factory);
+        let (ctx, tmp) = make_test_ctx_with(services)?;
+        let validators = resolve_child_validators(&ctx, "explorer");
+        std::fs::remove_dir_all(tmp).ok();
+        assert_eq!(validators, ["non-empty", "json-object"]);
+        // Ein gültiges Finding besteht beide Validatoren, Freitext nicht.
+        assert!(run_return_validators(&validators, VALID_FINDING).is_ok());
+        assert!(run_return_validators(&validators, "nur Freitext").is_err());
         Ok(())
     }
 
@@ -4850,10 +4997,8 @@ contract = "{contract}"
     /// `fanout_children` (siehe oben, `agent_tool.rs`) deckelt `max_parallel` für
     /// eine `uia-worker`-Rolle über
     /// [`ManagedAgentSpawner::max_concurrent_instances_for_role`] statt über einen
-    /// direkten `harw_agent_dsl::roles::AgentRoleId`-Vergleich in dieser Datei:
-    /// `harw-core-bridge` führt `harw-agent-dsl` nur als `[dev-dependencies]`
-    /// (`harw-core-bridge/Cargo.toml`), der Rollen-Enum-Typ ist im produktiven
-    /// Build dieser Crate also gar nicht benennbar. Dieser Test belegt, dass die
+    /// direkten `harw_agent_dsl::roles::AgentRoleId`-Vergleich in dieser Datei
+    /// (die Regel gehört dem Spawner). Dieser Test belegt, dass die
     /// Deckelungsmethode selbst — von genau hier aus, derselben Crate, aus der
     /// `fanout_children` sie aufruft — für eine registrierte `uia-worker`-Rolle
     /// `1` liefert und für eine andere Rolle unbeschränkt bleibt. Der volle

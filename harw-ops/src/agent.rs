@@ -46,6 +46,7 @@
 //!     action: Some("stop".to_owned()),
 //!     target: Some("abc-42".to_owned()),
 //!     value: None,
+//!     rest: None,
 //! };
 //! assert_eq!(args.action.as_deref(), Some("stop"));
 //! assert_eq!(args.target.as_deref(), Some("abc-42"));
@@ -102,6 +103,12 @@ pub struct AgentArgs {
     #[serde(default)]
     #[raw(nth = 2)]
     pub value: Option<String>,
+    /// Alle Token ab Token 1, mit Leerzeichen verbunden: die Argumente der
+    /// Compiler-Befehle (`/agent check|build|inspect|graph|explain|new|fmt|
+    /// diff|test|run|versions|clean|doctor …`, #22 Welle 2B).
+    #[serde(default)]
+    #[raw(join_from = 1)]
+    pub rest: Option<String>,
 }
 
 /// Verwaltet ausschließlich die vom aufrufenden Parent besessenen Kinder.
@@ -151,8 +158,26 @@ pub struct AgentArgs {
     command(path = "/agent", visibility = "channel_parity", busy = "immediate")
 )]
 async fn agent(ctx: &OpContext, args: AgentArgs) -> Result<OpOutput, OpError> {
+    // #22 Welle 2B: `/agent use <name> <version|digest>` schaltet die
+    // installierte Version eines kompilierten Agenten um; mit nur einem
+    // Argument bleibt `use` die Wahl der Wurzel-Agentendefinition.
+    if args.action.as_deref() == Some("use") && args.value.is_some() {
+        let tokens = compiler_tokens(&args);
+        let (name, version) = (tokens.get(1).cloned(), tokens.get(2).cloned());
+        if let (Some(name), Some(version)) = (name, version) {
+            return run_compiler(ctx, harw_agent_compiler::AgentCommand::Use { name, version });
+        }
+    }
     if args.action.as_deref() == Some("use") {
         return agent_use(ctx, args.target.as_deref());
+    }
+    // #22 Welle 2B: die Compiler-Befehle (`/agent check|build|…`).
+    if args
+        .action
+        .as_deref()
+        .is_some_and(|action| harw_agent_compiler::commands::COMPILER_ACTIONS.contains(&action))
+    {
+        return agent_compiler(ctx, &args);
     }
     // Plan R9, Teil C: die startbaren Definitionen (Roster: eingebaut und
     // benutzerdefiniert) brauchen keinen Spawner.
@@ -246,6 +271,124 @@ async fn agent(ctx: &OpContext, args: AgentArgs) -> Result<OpOutput, OpError> {
     }
 }
 
+/// Die Token eines Compiler-Befehls: Action plus alle weiteren Token.
+fn compiler_tokens(args: &AgentArgs) -> Vec<String> {
+    let mut tokens: Vec<String> = args.action.iter().cloned().collect();
+    tokens.extend(
+        args.rest
+            .as_deref()
+            .unwrap_or_default()
+            .split_whitespace()
+            .map(str::to_owned),
+    );
+    tokens
+}
+
+/// Der Compiler-Kontext der Sitzung: Root-Space aus `harw_home::home_dir`,
+/// Arbeitsverzeichnis = Workspace-Wurzel der Sitzung.
+fn compiler_env(ctx: &OpContext) -> Result<harw_agent_compiler::CompilerEnv, OpError> {
+    let cwd = ctx.sandbox().workspace().canonical_root().to_path_buf();
+    harw_agent_compiler::CompilerEnv::detect(None, cwd)
+        .map_err(|error| OpError::Execution(error.to_string()))
+}
+
+/// Führt einen Compiler-Befehl synchron aus (Fortschritt landet vor dem
+/// Ergebnis im Text).
+fn run_compiler(
+    ctx: &OpContext,
+    command: harw_agent_compiler::AgentCommand,
+) -> Result<OpOutput, OpError> {
+    let env = compiler_env(ctx)?;
+    let mut progress_lines: Vec<String> = Vec::new();
+    let mut progress = |line: &str| progress_lines.push(line.to_owned());
+    let mut command_ctx = harw_agent_compiler::CommandContext {
+        env,
+        probe: &harw_agent_compiler::ProcessProbe,
+        case_runner: &harw_agent_compiler::testing::EchoStub,
+        progress: &mut progress,
+    };
+    let output = harw_agent_compiler::run_command(&mut command_ctx, command);
+    let mut text = progress_lines.join("\n");
+    if !text.is_empty() {
+        text.push('\n');
+    }
+    text.push_str(&output.text);
+    if output.exit_code == 0 {
+        Ok(OpOutput {
+            text,
+            data: Some(output.json),
+        })
+    } else {
+        Err(OpError::Execution(text))
+    }
+}
+
+/// `/agent check|build|inspect|graph|explain|new|fmt|diff|test|run|versions|
+/// clean|doctor …` (#22 Welle 2B).
+///
+/// # Beschreibung
+/// Dieselben Befehle wie `harw agent …` im Terminal
+/// ([`harw_agent_compiler::commands`]). `build` läuft, wenn die Sitzung
+/// eine Job-Verwaltung hat, als Job (`harw agent build … --json` als eigener
+/// Prozess; Fortschritt und Ergebnis im Job-Log, `/jobs`); ohne
+/// Job-Verwaltung synchron.
+fn agent_compiler(ctx: &OpContext, args: &AgentArgs) -> Result<OpOutput, OpError> {
+    let tokens = compiler_tokens(args);
+    let command = harw_agent_compiler::parse_tokens(&tokens)
+        .map_err(OpError::InvalidArguments)?
+        .ok_or_else(|| OpError::InvalidArguments(format!("unknown /agent action '{}'", tokens.join(" "))))?;
+    let job_manager = matches!(command, harw_agent_compiler::AgentCommand::Build(_))
+        .then(|| ctx.service::<std::sync::Arc<harw_tool_job::JobManager>>())
+        .flatten();
+    if let Some(manager) = job_manager {
+        return start_build_job(ctx, manager, &tokens);
+    }
+    run_compiler(ctx, command)
+}
+
+/// Startet `harw agent build … --json` als Job der Sitzung.
+fn start_build_job(
+    ctx: &OpContext,
+    manager: &std::sync::Arc<harw_tool_job::JobManager>,
+    tokens: &[String],
+) -> Result<OpOutput, OpError> {
+    let exe = std::env::current_exe()
+        .map_err(|error| OpError::Execution(format!("harw executable unknown: {error}")))?;
+    let cwd = ctx.sandbox().workspace().canonical_root().to_path_buf();
+    let mut argv: Vec<String> = vec!["agent".to_owned()];
+    argv.extend(tokens.iter().cloned());
+    argv.push("--json".to_owned());
+    let mut command = tokio::process::Command::new(&exe);
+    command
+        .args(&argv)
+        .current_dir(&cwd)
+        .stdin(std::process::Stdio::null())
+        .kill_on_drop(false);
+    #[cfg(unix)]
+    command.process_group(0);
+    let display = format!("harw {}", argv.join(" "));
+    let request = harw_tool_job::StartRequest {
+        name: format!("agent build {}", tokens.get(1).map_or("", String::as_str)),
+        command: display.clone(),
+        cwd: Some(cwd),
+        env_keys: Vec::new(),
+        notify_every: manager.config().effective_notify_every(None),
+        owner: harw_tool_job::JobOwner::new(ctx.session_id().as_str(), Vec::new()),
+    };
+    let prepared = harw_tool_job::PreparedJob {
+        command,
+        executed_on_host: true,
+    };
+    let status = manager
+        .start(request, prepared)
+        .map_err(|error| OpError::Execution(format!("build job could not start: {error}")))?;
+    Ok(OpOutput::from(format!(
+        "Build läuft als Job {} ({display}); Fortschritt und Ergebnis: /jobs show {}",
+        status.meta.job_id.as_str(),
+        status.meta.job_id.as_str()
+    )))
+}
+
 /// `/agent defs [suchbegriff]`: die startbaren Agentendefinitionen des
 /// Laufs (Plan R9, Teil C).
 ///
@@ -273,11 +416,75 @@ fn agent_definitions(ctx: &OpContext, query: Option<&str>) -> Result<OpOutput, O
     })?;
     let roster = harw_registry_defaults::AgentRoster::from_config(&builtin, &config)
         .map_err(|error| OpError::Execution(format!("Agenten-Roster nicht baubar: {error}")))?;
-    Ok(OpOutput::from(format_definitions(&roster, query)))
+    let compiled = compiled_info(ctx, &roster);
+    Ok(OpOutput::from(format_definitions(&roster, query, &compiled)))
+}
+
+/// Snapshot und Build-Zustand je Agent sowie die kompilierten Agenten in
+/// `~/.harw/bin` (#22 Welle 2B), für `/agent defs` und `harw agent list`.
+#[derive(Debug, Clone, Default)]
+struct CompiledInfo {
+    /// Name → Zusatz hinter der Zeile (Snapshot, installierte Version).
+    annotations: std::collections::BTreeMap<String, String>,
+    /// Zeilen der kompilierten Agenten in `~/.harw/bin`.
+    installed: Vec<String>,
+}
+
+/// Sammelt [`CompiledInfo`]; ein Fehler (kein Home, defekte Quellen) lässt
+/// die Liste ohne Zusätze.
+fn compiled_info(ctx: &OpContext, roster: &harw_registry_defaults::AgentRoster) -> CompiledInfo {
+    let Ok(env) = compiler_env(ctx) else {
+        return CompiledInfo::default();
+    };
+    let names: Vec<String> = roster.names().map(str::to_owned).collect();
+    let snapshots = harw_agent_compiler::commands::definition_snapshots(&env, &names);
+    let installed = harw_agent_compiler::commands::installed_agents(&env);
+    let mut info = CompiledInfo::default();
+    for name in &names {
+        let Some((id, snapshot)) = snapshots.get(name) else {
+            continue;
+        };
+        let build = installed
+            .iter()
+            .find(|agent| agent.definition_id.as_deref() == Some(id.as_str()));
+        let state = match build {
+            None => "nicht kompiliert".to_owned(),
+            Some(agent) if agent.source_snapshot.as_deref() == Some(snapshot.as_str()) => {
+                format!("kompiliert {} (aktuell)", agent.current.as_deref().unwrap_or("-"))
+            }
+            Some(agent) => format!(
+                "kompiliert {} (veraltet: Definition geändert)",
+                agent.current.as_deref().unwrap_or("-")
+            ),
+        };
+        info.annotations.insert(
+            name.clone(),
+            format!("snapshot {}; {state}", snapshot.chars().take(12).collect::<String>()),
+        );
+    }
+    let bin = env.bin_dir();
+    for agent in installed {
+        info.installed.push(format!(
+            "- {} [kompiliert ({}); {}{}]",
+            agent.name,
+            bin.display(),
+            agent.current.as_deref().unwrap_or("keine aktuelle Version"),
+            if agent.auto { "; auto-kompiliert" } else { "" }
+        ));
+    }
+    info
 }
 
 /// Die Textform von `/agent defs` (rein, testbar).
-fn format_definitions(roster: &harw_registry_defaults::AgentRoster, query: Option<&str>) -> String {
+///
+/// Drei Arten: `eingebaut` (in harw eingebettet), `eigene Definition`
+/// (Profil/Projekt) und `kompiliert (~/.harw/bin)`; ein kompilierter Build
+/// ersetzt nie die eingebaute Rolle oder die Definition, aus der er stammt.
+fn format_definitions(
+    roster: &harw_registry_defaults::AgentRoster,
+    query: Option<&str>,
+    compiled: &CompiledInfo,
+) -> String {
     let query = query
         .map(str::trim)
         .filter(|query| !query.is_empty())
@@ -299,7 +506,7 @@ fn format_definitions(roster: &harw_registry_defaults::AgentRoster, query: Optio
     }
     let custom = entries.iter().filter(|entry| entry.is_custom()).count();
     let mut lines = vec![format!(
-        "{} Agenten ({} eingebaut, {custom} benutzerdefiniert):",
+        "{} Agenten ({} eingebaut, {custom} eigene Definition(en)):",
         entries.len(),
         entries.len() - custom
     )];
@@ -307,8 +514,8 @@ fn format_definitions(roster: &harw_registry_defaults::AgentRoster, query: Optio
         let source = match &entry.source {
             harw_registry_defaults::RosterSource::BuiltIn => "eingebaut".to_owned(),
             harw_registry_defaults::RosterSource::Custom { layer, .. } => match layer {
-                Some(layer) => format!("benutzerdefiniert, {layer:?}"),
-                None => "benutzerdefiniert".to_owned(),
+                Some(layer) => format!("eigene Definition, {layer:?}"),
+                None => "eigene Definition".to_owned(),
             },
         };
         let description = entry
@@ -316,8 +523,13 @@ fn format_definitions(roster: &harw_registry_defaults::AgentRoster, query: Optio
             .as_deref()
             .and_then(|text| text.lines().next())
             .unwrap_or("-");
+        let annotation = compiled
+            .annotations
+            .get(&entry.name)
+            .map(|annotation| format!(" · {annotation}"))
+            .unwrap_or_default();
         lines.push(format!(
-            "- {} [{}; {source}; {}] — {description}",
+            "- {} [{}; {source}; {}] — {description}{annotation}",
             entry.name,
             harw_core::delegation_visibility::role_label(entry.role),
             if entry.read_only {
@@ -326,6 +538,14 @@ fn format_definitions(roster: &harw_registry_defaults::AgentRoster, query: Optio
                 "schreibend"
             },
         ));
+    }
+    if !compiled.installed.is_empty() {
+        lines.push(String::new());
+        lines.push(format!(
+            "{} kompilierte Agenten (Kopien; die Quelle bleibt die Definition):",
+            compiled.installed.len()
+        ));
+        lines.extend(compiled.installed.iter().cloned());
     }
     lines.join("\n")
 }
@@ -677,6 +897,7 @@ mod tests {
                     action: Some("list".to_owned()),
                     target: None,
                     value: None,
+                    rest: None,
                 },
             )
             .await,
@@ -698,6 +919,7 @@ mod tests {
                 action: Some(action.to_owned()),
                 target: Some(target.to_owned()),
                 value: Some(value.to_owned()),
+                rest: None,
             },
         )
         .await;
@@ -785,6 +1007,7 @@ mod tests {
                 action: Some("stop".to_owned()),
                 target: Some("unknown-child".to_owned()),
                 value: None,
+                rest: None,
             },
         )
         .await;
@@ -943,6 +1166,7 @@ mod tests {
                 action: Some("budget".to_owned()),
                 target: None,
                 value: None,
+                rest: None,
             },
         )
         .await;
@@ -971,6 +1195,7 @@ mod tests {
                 action: Some("budget".to_owned()),
                 target: Some("sensitive-agent-id".to_owned()),
                 value: Some("secret-budget".to_owned()),
+                rest: None,
             },
         )
         .await;
@@ -999,6 +1224,7 @@ mod tests {
                 action: Some("budget".to_owned()),
                 target: Some("unknown-child".to_owned()),
                 value: None,
+                rest: None,
             },
         )
         .await;
@@ -1043,6 +1269,7 @@ mod tests {
             action: Some("use".to_owned()),
             target: target.map(str::to_owned),
             value: None,
+            rest: None,
         }
     }
 
@@ -1152,26 +1379,45 @@ admitted = ["fs.read"]
         let roster = harw_registry_defaults::AgentRoster::from_config(&builtin, &config)
             .map_err(ctx_err("Roster"))?;
 
-        let text = super::format_definitions(&roster, None);
+        let text = super::format_definitions(&roster, None, &super::CompiledInfo::default());
         assert!(
             text.contains("- explorer [worker; eingebaut; lesend] — "),
             "{text}"
         );
         assert!(
-            text.contains("- zettel-sammler [worker; benutzerdefiniert"),
+            text.contains("- zettel-sammler [worker; eigene Definition"),
             "{text}"
         );
         assert!(text.contains("Sammelt Zettelkasten-Einträge"), "{text}");
 
-        let filtered = super::format_definitions(&roster, Some("ZETTEL"));
+        let filtered =
+            super::format_definitions(&roster, Some("ZETTEL"), &super::CompiledInfo::default());
         assert!(
-            filtered.starts_with("1 Agenten (0 eingebaut, 1 benutzerdefiniert):"),
+            filtered.starts_with("1 Agenten (0 eingebaut, 1 eigene Definition(en)):"),
             "{filtered}"
         );
         assert_eq!(
-            super::format_definitions(&roster, Some("gibt-es-nicht-xyz")),
+            super::format_definitions(
+                &roster,
+                Some("gibt-es-nicht-xyz"),
+                &super::CompiledInfo::default()
+            ),
             "Keine passenden Agentendefinitionen."
         );
+
+        // #22: Snapshot, Build-Zustand und die kompilierten Agenten.
+        let mut compiled = super::CompiledInfo::default();
+        compiled.annotations.insert(
+            "zettel-sammler".to_owned(),
+            "snapshot 0123456789ab; kompiliert 1.0.0-abc (aktuell)".to_owned(),
+        );
+        compiled
+            .installed
+            .push("- harw-uia-terminal-ui [kompiliert (/h/bin); 1.0.0-x; auto-kompiliert]".to_owned());
+        let annotated = super::format_definitions(&roster, Some("zettel"), &compiled);
+        assert!(annotated.contains("Zettelkasten-Einträge · snapshot 0123456789ab; kompiliert"), "{annotated}");
+        assert!(annotated.contains("1 kompilierte Agenten"), "{annotated}");
+        assert!(annotated.contains("auto-kompiliert"), "{annotated}");
         Ok(())
     }
 }

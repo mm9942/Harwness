@@ -41,6 +41,7 @@
 //! - [`lower_v2`](mod@lower_v2) — [`lower_v2`](lower_v2::lower_v2), [`compile_agent`](lower_v2::compile_agent), [`LowerSources`](lower_v2::LowerSources)
 //! - [`diagnostics`](mod@diagnostics) — [`Diagnostic`](diagnostics::Diagnostic), Code-Katalog [`CATALOG`](diagnostics::CATALOG)
 //! - [`bind`](mod@bind) — [`ContextProgramLibrary`](bind::ContextProgramLibrary), [`bind_context_program`](bind::bind_context_program)
+//! - [`classify`] — [`reclassify_permissions`](classify::reclassify_permissions): the manifest from a tool catalog
 //! - [`context_program`] — [`RawContextProgramDefinition`](context_program::RawContextProgramDefinition),
 //!   [`resolve_context_program`](context_program::resolve_context_program), Deckenprüfung über
 //!   [`ContextCeilingAdmission`](context_program::ContextCeilingAdmission) (Knoten AW2-01)
@@ -73,6 +74,7 @@
 
 pub mod authority;
 pub mod bind;
+pub mod classify;
 pub mod context_program;
 pub mod diagnostics;
 pub mod error;

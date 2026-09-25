@@ -68,6 +68,10 @@ artifact reader rejects any header that is not in exactly this form. The reader 
 with `deny_unknown_fields`; an unknown field or a different schema string
 is an error.
 
+A compiled agent is stored as a bundle (§10): its header is the bundle
+header, whose `ir` field holds this canonical `AgentIr` of the root, next to
+the index of every agent in the closure.
+
 The header contains the rights manifest (`Permissions`), the interface
 selection (`Binary`) and the model requirements (`Models`). It never
 contains a secret, only the *names* of required environment variables.
@@ -218,3 +222,92 @@ and adding one needs its own ADR covering key management and trust roots.
 The `flags` field is reserved for it: a future version would set a flag
 bit and place a signature block after `artifact_hash`, and a v1 reader
 rejects such an artifact rather than silently ignoring the signature.
+
+## 10. Shared payload pool and agent entries
+
+A compiled agent carries its whole delegation closure: an orchestrator
+bundles every agent it can start, transitively. The artifact therefore does
+not nest one artifact per child (each with its own copy of shared skills);
+it is a **bundle** of three parts. This section is normative; the
+implementation is `harw_agent_artifact::bundle` (`BundleBuilder`,
+`Bundle::from_artifact`).
+
+### 10.1 Layout
+
+| Part | Payload kind | Path | Content |
+|---|---|---|---|
+| pool blob | `other` · `blob` | `pool/<blake3-hex>` | the bytes of one file, stored once |
+| agent entry | `other` · `agent` | `agents/<agent-id>.json` | canonical JSON of the agent entry (§10.2) |
+
+The **header** (§3) is not a bare `AgentIr` but the bundle header:
+
+```json
+{
+  "schema": "harwness.agent-bundle/v1",
+  "root": "<root agent id>",
+  "ir": { "...": "the root's AgentIr v2, without trace" },
+  "agents": {
+    "<agent id>": { "entry": "agents/<agent id>.json", "snapshot": "<v7 snapshot hex>" }
+  }
+}
+```
+
+Every agent has an entry, the root included. The built-in payload kinds
+1–5 (§4) do not occur in a bundle; their meaning moves into the references.
+
+### 10.2 Agent entry
+
+```json
+{
+  "schema": "harwness.agent-entry/v1",
+  "id": "<agent id>",
+  "name": "<lookup name>",
+  "ir": { "...": "the agent's AgentIr v2, without trace" },
+  "payload_refs": [
+    { "kind": "skill", "logical_path": "skills/<name>/instructions.md", "blake3": "<hex>" }
+  ],
+  "children": [ { "name": "<target name>", "id": "<agent id>", "via": "delegation" } ]
+}
+```
+
+`kind` is what the file is to the agent (`instructions`, `skill`,
+`knowledge`); `logical_path` is where the agent sees it; `blake3` names the
+pool blob. `payload_refs` is sorted by `(kind, logical_path)`; `children`
+lists the direct children in declaration order (`via`: `delegation` or
+`child-orchestrator`).
+
+| IR field | Reference |
+|---|---|
+| `instructions.blake3` (non-empty text) | `instructions` · `instructions/system.md` |
+| `skills.entries[i].hash` | `skill` · `skills/<name>/instructions.md` |
+| bundle files of a user-interface agent | `knowledge` · `knowledge/<file>` |
+
+### 10.3 Rules (fail closed)
+
+A reader rejects the artifact unless:
+
+1. the header has schema `harwness.agent-bundle/v1` and its `root` is in
+   `agents`;
+2. every indexed entry exists, parses with schema `harwness.agent-entry/v1`
+   and carries the indexed ID; every agent payload is indexed;
+3. **the dedup key is BLAKE3**: every blob's path is `pool/<hex>` of the
+   BLAKE3 of its own bytes;
+4. **every reference resolves**: a blob with the referenced hash exists;
+5. **no blob is unreferenced**;
+6. no payload of another kind is present.
+
+These checks run after the artifact checks of §7. A runner resolves an
+agent's files only through its references; it never reads a blob by
+guessing a path.
+
+### 10.4 Determinism and reuse
+
+Entries are canonical JSON; the payload table is sorted by `(kind, path)`
+(§4), so agent entries come out ordered by ID and pool blobs by hash. The
+same closure gives the same bytes. The native build cache
+(`~/.harw/cache/agent-builds/blobs/<hash>`) stores the blobs of every build
+once as well; each cached crate records the hashes it references, and the
+cache collector removes only blobs no remaining crate references.
+
+`harw agent inspect` lists every agent with its references and the pool's
+dedup savings.

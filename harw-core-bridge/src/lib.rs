@@ -45,10 +45,12 @@ mod agent_result;
 mod agent_tool;
 mod context_ext;
 mod delegate_wave;
+// #22 Welle 1B: `[return] validators` der Agent-IR v2.
+pub mod return_validators;
 
 pub use agent_tool::{
-    AgentProductAdapter, AgentToolAdapter, ChildReturnContract, fanout_children, parse_budget_hint,
-    tighten_budget,
+    AgentProductAdapter, AgentToolAdapter, ChildReturnContract, UnknownReturnContract,
+    fanout_children, parse_budget_hint, tighten_budget,
 };
 // Runde 5, Teil K.
 pub use agent_background::{

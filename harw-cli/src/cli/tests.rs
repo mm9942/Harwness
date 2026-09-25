@@ -1854,3 +1854,138 @@ fn auth_prune_parses_with_and_without_provider() -> TestResult {
     );
     Ok(())
 }
+
+// ── #22 Welle 2B: die Compiler-Befehle von `harw agent` ─────────────────
+
+fn agent_action(args: &[&str]) -> TestResult<AgentAction> {
+    let mut argv = vec!["harw", "agent"];
+    argv.extend_from_slice(args);
+    let cli = Cli::try_parse_from(argv).map_err(ctx("harw agent … sollte parsen"))?;
+    match cli.command {
+        Some(Command::Agent { action }) => Ok(action),
+        other => Err(TestError::Unexpected(format!("erwartete Agent, bekam {other:?}"))),
+    }
+}
+
+#[test]
+fn test_agent_compiler_subcommands_parse() -> TestResult {
+    assert!(matches!(
+        agent_action(&["check", "a", "./b"])?,
+        AgentAction::Check { targets } if targets == ["a", "./b"]
+    ));
+    assert!(matches!(agent_action(&["check"])?, AgentAction::Check { targets } if targets.is_empty()));
+    let AgentAction::Build {
+        agent,
+        interface,
+        native,
+        artifact_only,
+        runner,
+        output,
+        target_triple,
+        harw_src,
+    } = agent_action(&[
+        "build",
+        "evidence-critic",
+        "--interface",
+        "cli,mcp",
+        "--native",
+        "--runner",
+        "/r",
+        "-o",
+        "out",
+        "--target",
+        "aarch64-unknown-linux-gnu",
+        "--harw-src",
+        "/src",
+    ])?
+    else {
+        return Err(TestError::Unexpected("build".into()));
+    };
+    assert_eq!(agent, "evidence-critic");
+    assert_eq!(interface, ["cli", "mcp"]);
+    assert!(native && !artifact_only);
+    assert_eq!(runner, Some(PathBuf::from("/r")));
+    assert_eq!(output, Some(PathBuf::from("out")));
+    assert_eq!(target_triple.as_deref(), Some("aarch64-unknown-linux-gnu"));
+    assert_eq!(harw_src, Some(PathBuf::from("/src")));
+    assert!(
+        Cli::try_parse_from(["harw", "agent", "build", "x", "--native", "--artifact-only"]).is_err(),
+        "--native and --artifact-only exclude each other"
+    );
+    assert!(matches!(
+        agent_action(&["build", "x", "--artifact-only"])?,
+        AgentAction::Build { artifact_only: true, .. }
+    ));
+    assert!(matches!(agent_action(&["inspect", "./ec"])?, AgentAction::Inspect { .. }));
+    assert!(matches!(
+        agent_action(&["graph", "--all", "--format", "mermaid", "--kind", "delegation"])?,
+        AgentAction::Graph { all: true, agent: None, .. }
+    ));
+    assert!(Cli::try_parse_from(["harw", "agent", "graph"]).is_err(), "a name or --all");
+    assert!(matches!(
+        agent_action(&["explain", "HARW-PATCH-003"])?,
+        AgentAction::Explain { field: None, .. }
+    ));
+    assert!(matches!(
+        agent_action(&["explain", "ec", "tools.admitted"])?,
+        AgentAction::Explain { field: Some(field), .. } if field == "tools.admitted"
+    ));
+    assert!(matches!(
+        agent_action(&["new", "x", "--role", "child-orchestrator", "--extends", "a.agent.b@1", "--dir", "d"])?,
+        AgentAction::New { role, extends: Some(_), dir: Some(_), .. } if role == "child-orchestrator"
+    ));
+    assert!(matches!(agent_action(&["fmt", "--check"])?, AgentAction::Fmt { check: true, .. }));
+    assert!(matches!(agent_action(&["diff", "a", "b@1.0.0"])?, AgentAction::Diff { .. }));
+    assert!(matches!(agent_action(&["test"])?, AgentAction::Test { agent: None }));
+    assert!(matches!(
+        agent_action(&["run", "ec", "Prüfe", "die", "Quelle"])?,
+        AgentAction::Run { prompt, .. } if prompt.len() == 3
+    ));
+    assert!(matches!(agent_action(&["versions", "ec"])?, AgentAction::Versions { .. }));
+    assert!(matches!(agent_action(&["use", "ec", "1.0.0"])?, AgentAction::Use { .. }));
+    assert!(matches!(
+        agent_action(&["clean", "--all", "--older-than", "7", "--keep", "2", "--dry-run"])?,
+        AgentAction::Clean { all: true, older_than: Some(7), keep: Some(2), dry_run: true }
+    ));
+    assert!(matches!(agent_action(&["doctor"])?, AgentAction::Doctor));
+    assert!(matches!(
+        agent_action(&["install-record", "--source-dir", "/src", "--bindir", "/bin"])?,
+        AgentAction::InstallRecord { .. }
+    ));
+    assert!(matches!(
+        agent_action(&["auto-build-uia", "--release-lock"])?,
+        AgentAction::AutoBuildUia { release_lock: true }
+    ));
+    let cli = Cli::try_parse_from(["harw", "agent", "check", "x", "--json"])
+        .map_err(ctx("--json nach dem Unterbefehl"))?;
+    assert!(cli.global.json, "every command supports --json");
+    Ok(())
+}
+
+#[test]
+fn test_agent_compiler_actions_map_to_commands() -> TestResult {
+    use harw_agent_compiler::commands::AgentCommand;
+    let command = crate::agent_cmd::compiler_command(agent_action(&[
+        "build", "ec", "--interface", "cli", "--interface", "mcp",
+    ])?)
+    .map_err(TestError::Unexpected)?;
+    let AgentCommand::Build(args) = command else {
+        return Err(TestError::Unexpected("build".into()));
+    };
+    assert_eq!(
+        args.interfaces,
+        Some(vec![
+            harw_agent_dsl::ir_v2::Interface::Cli,
+            harw_agent_dsl::ir_v2::Interface::Mcp
+        ])
+    );
+    assert!(
+        crate::agent_cmd::compiler_command(agent_action(&["build", "ec", "--interface", "grpc"])?)
+            .is_err()
+    );
+    assert!(
+        crate::agent_cmd::compiler_command(agent_action(&["graph", "x", "--format", "svg"])?)
+            .is_err()
+    );
+    Ok(())
+}

@@ -200,6 +200,68 @@ impl ReturnContract {
     }
 }
 
+/// The known return validators (`[return] validators`, #22 wave 1B).
+///
+/// # Description
+/// A validator is a cheap structural check the runtime runs on a child's
+/// final answer before the contract is evaluated
+/// (`harw_core_bridge::return_validators`). The IR keeps validators as
+/// labels (declaration order is semantic); lowering rejects a label outside
+/// [`ReturnValidator::ALL`] with `HARW-RETURN-002`, so a compiled agent never
+/// names a check the runtime cannot run.
+///
+/// | Label | Check |
+/// |---|---|
+/// | `non-empty` | the answer contains at least one non-whitespace character |
+/// | `json` | the answer (optionally inside one ```` ``` ```` fence) is valid JSON |
+/// | `json-object` | like `json`, and the top-level value is an object |
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ReturnValidator {
+    /// `non-empty`
+    NonEmpty,
+    /// `json`
+    Json,
+    /// `json-object`
+    JsonObject,
+}
+
+impl ReturnValidator {
+    /// Every known validator.
+    pub const ALL: [ReturnValidator; 3] = [
+        ReturnValidator::NonEmpty,
+        ReturnValidator::Json,
+        ReturnValidator::JsonObject,
+    ];
+
+    /// The label (`"non-empty"`, …).
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            ReturnValidator::NonEmpty => "non-empty",
+            ReturnValidator::Json => "json",
+            ReturnValidator::JsonObject => "json-object",
+        }
+    }
+
+    /// Parses an exact label; `None` for an unknown validator.
+    #[must_use]
+    pub fn parse(label: &str) -> Option<Self> {
+        Self::ALL
+            .into_iter()
+            .find(|validator| validator.as_str() == label)
+    }
+
+    /// The known labels joined by `", "` (for help texts).
+    #[must_use]
+    pub fn known_labels() -> String {
+        Self::ALL
+            .iter()
+            .map(|validator| validator.as_str())
+            .collect::<Vec<_>>()
+            .join(", ")
+    }
+}
+
 /// An interface a compiled agent binary can expose (`[binary] interfaces`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -793,6 +855,168 @@ impl AgentIr {
     #[must_use]
     pub fn skill_names(&self) -> Vec<String> {
         self.skills.names()
+    }
+
+    /// Clamps this IR under `ceiling` (#22 wave 1B).
+    ///
+    /// # Description
+    /// Same rules as [`crate::ExecutableAgentIr::clamped_to`], applied to the
+    /// typed IR so the runtime can keep one clamped `AgentIr` per custom
+    /// agent (roster) and derive the legacy view from it:
+    /// - tools: admitted only if the ceiling admits them, forbidden is the
+    ///   union of both sides;
+    /// - `spawn.max_depth`, every budget field: the minimum; the effort cap
+    ///   the lower level ([`Effort::ALL`] order);
+    /// - `spawn.child_orchestrators`: the intersection;
+    /// - `authority`: the intersection if the ceiling names any capability
+    ///   (an empty ceiling makes no statement);
+    /// - `lifecycle`: pause and rerun only if both sides allow them,
+    ///   `max_attempts` the minimum.
+    ///
+    /// Identity, instructions, skills, context, return pipeline, models and
+    /// the other descriptive sections stay those of `self`. The permission
+    /// manifest is derived again from the clamped sections and the v7
+    /// snapshot recomputed.
+    #[must_use]
+    pub fn clamped_to(&self, ceiling: &AgentIr) -> AgentIr {
+        self.clamped_to_with(ceiling, &[])
+    }
+
+    /// Like [`Self::clamped_to`], but treats `extra_allowed` as if the
+    /// ceiling admitted (and did not forbid) these tools. Never widens
+    /// `self`: a tool `self` does not admit or forbids stays out.
+    #[must_use]
+    pub fn clamped_to_with(&self, ceiling: &AgentIr, extra_allowed: &[&str]) -> AgentIr {
+        let is_extra = |tool: &String| extra_allowed.contains(&tool.as_str());
+        let mut forbidden = self.tools.forbidden.clone();
+        for tool in &ceiling.tools.forbidden {
+            if !forbidden.contains(tool) && !is_extra(tool) {
+                forbidden.push(tool.clone());
+            }
+        }
+        let mut admitted: Vec<String> = Vec::new();
+        for tool in &self.tools.admitted {
+            let allowed = ceiling.tools.admitted.contains(tool) || is_extra(tool);
+            if allowed && !forbidden.contains(tool) && !admitted.contains(tool) {
+                admitted.push(tool.clone());
+            }
+        }
+        let budget = match (&self.spawn.budget, &ceiling.spawn.budget) {
+            (own, None) => own.clone(),
+            (None, Some(limit)) => Some(limit.clone()),
+            (Some(own), Some(limit)) => Some(Budget {
+                max_tokens: min_option(own.max_tokens, limit.max_tokens),
+                max_tool_calls: min_option(own.max_tool_calls, limit.max_tool_calls),
+                max_wall_secs: min_option(own.max_wall_secs, limit.max_wall_secs),
+                effort_cap: lower_effort(own.effort_cap, limit.effort_cap),
+            }),
+        };
+        let child_orchestrators: Vec<String> = self
+            .spawn
+            .child_orchestrators
+            .iter()
+            .filter(|name| ceiling.spawn.child_orchestrators.contains(name))
+            .cloned()
+            .collect();
+        let capabilities = if ceiling.authority.capabilities.is_empty() {
+            self.authority.capabilities.clone()
+        } else {
+            let mut kept: Vec<String> = self
+                .authority
+                .capabilities
+                .iter()
+                .filter(|capability| ceiling.authority.capabilities.contains(capability))
+                .cloned()
+                .collect();
+            kept.sort();
+            kept.dedup();
+            kept
+        };
+        let mut clamped = self.clone();
+        clamped.tools = ToolSurface {
+            admitted,
+            forbidden,
+        };
+        clamped.spawn.max_depth = min_option(self.spawn.max_depth, ceiling.spawn.max_depth);
+        clamped.spawn.budget = budget;
+        clamped.spawn.child_orchestrators = child_orchestrators;
+        clamped.authority = Authority { capabilities };
+        clamped.lifecycle = Lifecycle {
+            allow_pause: self.lifecycle.allow_pause && ceiling.lifecycle.allow_pause,
+            allow_rerun: self.lifecycle.allow_rerun && ceiling.lifecycle.allow_rerun,
+            max_attempts: min_option(self.lifecycle.max_attempts, ceiling.lifecycle.max_attempts),
+        };
+        clamped.rederive()
+    }
+
+    /// Adds `tools` to the admitted tools unless `self` forbids them.
+    ///
+    /// # Description
+    /// For cross-cutting catalogue tools a custom definition need not list
+    /// itself; the caller passes only tools the base role admits, so the
+    /// ceiling is never exceeded (mirror of
+    /// [`crate::ExecutableAgentIr::with_additional_admitted`]).
+    #[must_use]
+    pub fn with_additional_admitted(&self, tools: &[&str]) -> AgentIr {
+        let mut ir = self.clone();
+        for tool in tools {
+            let tool = (*tool).to_owned();
+            if !ir.tools.admitted.contains(&tool) && !ir.tools.forbidden.contains(&tool) {
+                ir.tools.admitted.push(tool);
+            }
+        }
+        ir.rederive()
+    }
+
+    /// Caps `spawn.max_depth` at `max_depth` (mirror of
+    /// [`crate::ExecutableAgentIr::with_max_depth_at_most`]).
+    #[must_use]
+    pub fn with_max_depth_at_most(&self, max_depth: u32) -> AgentIr {
+        let mut ir = self.clone();
+        ir.spawn.max_depth = Some(
+            ir.spawn
+                .max_depth
+                .map_or(max_depth, |own| own.min(max_depth)),
+        );
+        ir.rederive()
+    }
+
+    /// Derives the permission manifest again from the current sections
+    /// (keeping the declared network hosts) and recomputes the snapshot.
+    fn rederive(mut self) -> AgentIr {
+        let hosts = self.permissions.network.hosts.clone();
+        self.permissions = crate::lower_v2::derive_permissions(
+            &self.tools,
+            &self.authority,
+            &self.spawn,
+            self.models.as_ref(),
+            &hosts,
+        );
+        self.with_snapshot()
+    }
+}
+
+/// Minimum of two optional upper bounds; a missing side is no bound.
+fn min_option<T: Ord + Copy>(left: Option<T>, right: Option<T>) -> Option<T> {
+    match (left, right) {
+        (Some(left), Some(right)) => Some(left.min(right)),
+        (Some(value), None) | (None, Some(value)) => Some(value),
+        (None, None) => None,
+    }
+}
+
+/// The lower of two optional effort caps ([`Effort::ALL`] order).
+fn lower_effort(own: Option<Effort>, limit: Option<Effort>) -> Option<Effort> {
+    let rank = |effort: Effort| {
+        Effort::ALL
+            .iter()
+            .position(|candidate| *candidate == effort)
+            .unwrap_or(usize::MAX)
+    };
+    match (own, limit) {
+        (Some(own), Some(limit)) => Some(if rank(own) < rank(limit) { own } else { limit }),
+        (Some(value), None) | (None, Some(value)) => Some(value),
+        (None, None) => None,
     }
 }
 

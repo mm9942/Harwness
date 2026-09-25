@@ -56,6 +56,7 @@ use crate::ir_v2::{
     AGENT_IR_SCHEMA, AgentIr, Authority, Binary, Budget, ContextProgram, ContextSection, Effort,
     FilesystemPermissions, Instructions, Interface, Job, Lifecycle, Limits, ModelRef, Models,
     NetworkMode, NetworkPermissions, Permissions, Research, ReturnContract, ReturnPipeline,
+    ReturnValidator,
     SkillEntry, Skills, SpawnContract, SpawnPermissions, ToolSurface, Trace, TraceStep,
     Verification, WORKSPACE_WRITE_PATH, Work,
 };
@@ -1056,6 +1057,16 @@ fn lower_return(cx: &mut Cx<'_>, config: &toml::Table) -> ReturnPipeline {
                 &format!("{name}.validators[{index}]"),
                 format!("invalid validator label `{validator}`"),
             );
+        } else if ReturnValidator::parse(validator).is_none() {
+            // #22 wave 1B: the runtime runs every listed validator on the
+            // child's answer; a label it does not know is rejected here, not
+            // silently skipped at run time.
+            cx.report_help(
+                &codes::RETURN_INVALID_VALIDATOR,
+                &format!("{name}.validators[{index}]"),
+                format!("unknown validator `{validator}`"),
+                format!("known validators: {}", ReturnValidator::known_labels()),
+            );
         }
     }
     ReturnPipeline {
@@ -1429,11 +1440,11 @@ fn lower_instructions(
 }
 
 /// Tool-label prefixes that reach the network.
-const NETWORK_TOOL_PREFIXES: &[&str] = &["web.", "browser."];
+pub(crate) const NETWORK_TOOL_PREFIXES: &[&str] = &["web.", "browser."];
 /// Tools that write into the workspace file tree.
-const FS_WRITE_TOOLS: &[&str] = &["fs.write", "fs.edit"];
+pub(crate) const FS_WRITE_TOOLS: &[&str] = &["fs.write", "fs.edit"];
 /// Known tools that write outside the workspace file tree.
-const OTHER_WRITE_TOOLS: &[&str] = &[
+pub(crate) const OTHER_WRITE_TOOLS: &[&str] = &[
     "agents.commit_proposal",
     "agents.write_definition",
     "agents.write_uia",
@@ -1442,13 +1453,13 @@ const OTHER_WRITE_TOOLS: &[&str] = &[
     "skills.propose",
 ];
 /// Tool-label prefixes that read the workspace.
-const READ_TOOL_PREFIXES: &[&str] = &["fs.", "doc.", "deps.", "explore.", "lens."];
+pub(crate) const READ_TOOL_PREFIXES: &[&str] = &["fs.", "doc.", "deps.", "explore.", "lens."];
 /// Tools that start processes.
-const SHELL_TOOLS: &[&str] = &["shell.exec", "job.start"];
+pub(crate) const SHELL_TOOLS: &[&str] = &["shell.exec", "job.start"];
 /// Tool-label prefixes that start processes.
-const SHELL_TOOL_PREFIXES: &[&str] = &["process."];
+pub(crate) const SHELL_TOOL_PREFIXES: &[&str] = &["process."];
 /// Tool-label prefixes that act on the host outside the sandbox.
-const HOST_TOOL_PREFIXES: &[&str] = &["host."];
+pub(crate) const HOST_TOOL_PREFIXES: &[&str] = &["host."];
 
 /// `true` if `tool` starts with one of `prefixes`.
 fn has_prefix(tool: &str, prefixes: &[&str]) -> bool {
@@ -1466,7 +1477,10 @@ fn sorted_unique<'i>(values: impl IntoIterator<Item = &'i String>) -> Vec<String
 }
 
 /// Derives the rights manifest (§ [`Permissions`]).
-fn derive_permissions(
+///
+/// Also used by [`AgentIr::clamped_to`] to derive the manifest of a clamped
+/// IR again.
+pub(crate) fn derive_permissions(
     tools: &ToolSurface,
     authority: &Authority,
     spawn: &SpawnContract,

@@ -36,7 +36,7 @@ description = "Gemeinsame Lebenszyklus- und Kontextregeln aller eingebauten read
 [lifecycle]
 allow_pause = false
 allow_rerun = true
-max_attempts = 2
+max_attempts = 4  # erster Lauf + 3 Fortsetzungen (MAX_CONTINUATIONS)
 
 # Kontextmontage: das Kind sieht seinen Auftrag und seinen Lesebereich, aber
 # niemals das Elterntranskript oder die Transkripte seiner Geschwister.

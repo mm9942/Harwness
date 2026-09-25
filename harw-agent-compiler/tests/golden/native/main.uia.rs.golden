@@ -1,0 +1,16 @@
+//! `harw-mia`: a personalized harw (harw <harw-version>) with the
+//! user-interface agent user.agent.mia@1 1.0.0 as its fixed root, compiled by
+//! `harw agent build --native`.
+//!
+//! It is a complete harw with its own, independent home `~/.mia`
+//! (project-local: `.mia`); nothing is inherited from `~/.harw`.
+//! The embedded agent is the fixed root.
+
+#![forbid(unsafe_code)]
+
+fn main() -> std::process::ExitCode {
+    harw_cli::run_with_embedded_uia(
+        include_bytes!("../agent.harwa"),
+        harw_cli::HomeChoice::Named("mia"),
+    )
+}

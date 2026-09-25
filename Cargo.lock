@@ -1800,6 +1800,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "harw-agent-compiler"
+version = "0.3.0"
+dependencies = [
+ "harw-agent-artifact",
+ "harw-agent-dsl",
+ "harw-catalog",
+ "harw-home",
+ "harw-registry-defaults",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "time",
+ "toml 1.1.3+spec-1.1.0",
+ "toml_edit 0.25.13+spec-1.1.0",
+]
+
+[[package]]
 name = "harw-agent-dsl"
 version = "0.3.0"
 dependencies = [
@@ -1932,6 +1949,8 @@ version = "0.3.0"
 dependencies = [
  "clap",
  "clap_complete",
+ "harw-agent-artifact",
+ "harw-agent-compiler",
  "harw-agent-dsl",
  "harw-authority",
  "harw-channel",
@@ -2237,6 +2256,7 @@ dependencies = [
  "harw-fsutil",
  "serde",
  "sha2 0.11.0",
+ "tempfile",
  "toml 1.1.3+spec-1.1.0",
  "uuid",
 ]
@@ -2633,6 +2653,7 @@ dependencies = [
 name = "harw-ops"
 version = "0.3.0"
 dependencies = [
+ "harw-agent-compiler",
  "harw-agent-dsl",
  "harw-authority",
  "harw-catalog",
