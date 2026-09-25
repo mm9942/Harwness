@@ -61,3 +61,6 @@ docs/archive/
 **/codex-session-*
 auth.toml
 *.key
+
+# Python bytecode (scripts/tests)
+__pycache__/
