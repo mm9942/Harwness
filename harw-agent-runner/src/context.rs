@@ -13,7 +13,7 @@ use std::io;
 use std::sync::{Arc, Once};
 
 use harw_agent_artifact::Bundle;
-use harw_agent_dsl::ir_v2::{AgentIr, ChildExecution, Interface};
+use harw_agent_dsl::ir_v2::{AgentIr, ChildExecution};
 use harw_runtime::EmbeddedAgent;
 use harwness_sdk::{Harwness, HarwnessBuilder};
 
@@ -144,8 +144,7 @@ impl RunnerContext {
             .args
             .interface
             .unwrap_or(self.root_ir().binary.default_interface);
-        let mcp_stdio = interface == Interface::Mcp && self.args.listen.is_none();
-        !self.args.json && !mcp_stdio && self.args.child.is_none()
+        crate::banner_wanted(&self.args, interface)
     }
 
     /// Prints `line` on stderr at most once per process (an interface such

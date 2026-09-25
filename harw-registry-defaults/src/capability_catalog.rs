@@ -325,7 +325,8 @@ pub const CATALOG: &[CapabilityEntry] = &[
     // granted to a built-in role by default (no `RegistryProfile` registers
     // `crate::agent_definition_tools::AgentBuildToolProvider`); only an
     // explicit agent definition that lists `agents.build` in
-    // `tools.admitted` can carry it.
+    // `tools.admitted` can carry it (gate:
+    // `crate::agent_definition_tools::agent_build_provider_for`).
     row!("agents.build", JOB, Shell),
     // processes
     row!("process.list", PROCESS, Shell),

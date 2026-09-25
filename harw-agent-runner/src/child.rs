@@ -204,7 +204,6 @@ async fn run_child_async(mut ctx: RunnerContext, agent_id: String) -> ExitCode {
     let selected = match ctx.agent.for_agent(&agent_id) {
         Ok(agent) => agent,
         Err(error) => {
-            eprintln!("harw-agent-runner: cannot select child: {error}");
             return fail_with(outbound_tx, writer, format!("cannot select child: {error}")).await;
         }
     };
@@ -226,6 +225,9 @@ async fn run_child_async(mut ctx: RunnerContext, agent_id: String) -> ExitCode {
     }) {
         Ok(harwness) => harwness,
         Err(error) => {
+            // `approvals` holds a sender too; the writer only ends once
+            // every sender is gone.
+            drop(approvals);
             return fail_with(
                 outbound_tx,
                 writer,
@@ -244,6 +246,8 @@ async fn run_child_async(mut ctx: RunnerContext, agent_id: String) -> ExitCode {
     let mut session = match opened {
         Ok(session) => session,
         Err(error) => {
+            drop(harwness);
+            drop(approvals);
             let what = if continue_from.is_some() {
                 "resume"
             } else {
@@ -402,23 +406,46 @@ fn min_limit<T: Ord>(left: Option<T>, right: Option<T>) -> Option<T> {
     }
 }
 
-/// Derives protocol rights from the typed permissions manifest.
-fn manifest_rights_of(ir: &AgentIr) -> ChildRights {
-    let rights = harw_runtime::embedded::EffectiveRights::from_manifest(&ir.permissions);
-    ChildRights {
-        tools: rights.tools,
-        network_hosts: rights.network_hosts,
-        network_open: rights.network_open,
-        write: rights.write,
-        shell: rights.shell,
-        host: rights.host,
-        // Automatic approval is a parent choice, not a tool permission.
+/// This process's own ceiling for the child: its manifest narrowed by the
+/// command-line flags (`--deny-tool`, `--no-network`, `--read-only`,
+/// `--max-tokens`).
+///
+/// `full_access` is taken from the manifest ceiling (`true`), not from the
+/// own flags: a job child is never started with `--full-access`, so ANDing
+/// that flag in here would make the parent's grant unreachable. Whether
+/// automatic approval is effective is decided by the parent's `Rights`
+/// frame in [`effective_child_rights`] — never wider than the parent.
+fn own_ceiling(permissions: &Permissions, flags: &RightsFlags) -> EffectiveRights {
+    let flags = RightsFlags {
         full_access: true,
-    }
+        ..flags.clone()
+    };
+    EffectiveRights::from_manifest(permissions).narrowed_by(&flags)
 }
 
-/// `min(manifest, from_parent)`: tools/hosts intersect, every boolean right
-/// is AND'd. A child never ends up with more than either side allows.
+/// `ceiling ∩ from_parent`, with `budget` (the parent's `Budget` frames) as
+/// the parent's resource limits: sets intersect, every boolean — including
+/// `full_access` — is AND'd, and each budget limit takes the stricter value
+/// (`EffectiveRights::intersect`).
+fn effective_child_rights(
+    ceiling: EffectiveRights,
+    from_parent: &ChildRights,
+    budget: Option<&Budget>,
+) -> EffectiveRights {
+    ceiling.intersect(&EffectiveRights {
+        tools: from_parent.tools.clone(),
+        network_hosts: from_parent.network_hosts.clone(),
+        network_open: from_parent.network_open,
+        write: from_parent.write,
+        shell: from_parent.shell,
+        host: from_parent.host,
+        full_access: from_parent.full_access,
+        budget: budget.cloned(),
+    })
+}
+
+/// `min(previous, next)` over two parent `Rights` frames: tools/hosts
+/// intersect, every boolean right is AND'd. A later frame can only narrow.
 fn narrow_rights(manifest: &ChildRights, from_parent: &ChildRights) -> ChildRights {
     ChildRights {
         tools: manifest
@@ -556,9 +583,16 @@ pub(crate) fn translate_event(event: &SdkEvent) -> serde_json::Value {
 
 /// Translates a completed [`TurnReport`] into the child's `Result` frame.
 /// Pure and side-effect free.
+///
+/// A turn the budget cancelled becomes `BudgetExhausted` and carries the
+/// session id as its `continuation` token (see the module doc); every other
+/// end carries none.
 pub(crate) fn translate_turn_report(report: &TurnReport) -> ChildToParent {
     let status = match &report.status {
         TurnStatus::Completed => ChildResultStatus::Completed,
+        TurnStatus::Cancelled { reason } if reason == "budget" => {
+            ChildResultStatus::BudgetExhausted
+        }
         TurnStatus::Cancelled { .. } => ChildResultStatus::Cancelled,
         TurnStatus::Truncated | TurnStatus::Refused { .. } | TurnStatus::Failed { .. } => {
             ChildResultStatus::Failed
@@ -568,9 +602,12 @@ pub(crate) fn translate_turn_report(report: &TurnReport) -> ChildToParent {
         // above, consistent with `iface::mcp`'s equivalent match.
         _ => ChildResultStatus::Failed,
     };
+    let continuation =
+        (status == ChildResultStatus::BudgetExhausted).then(|| report.session_id.to_string());
     ChildToParent::Result {
         status,
         text: report.text.clone(),
+        continuation,
         usage: ChildUsage {
             input_tokens: report.usage.input_tokens,
             output_tokens: report.usage.output_tokens,

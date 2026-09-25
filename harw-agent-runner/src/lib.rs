@@ -98,7 +98,7 @@ fn report_error(error: &RunnerError) -> ExitCode {
 ///   process's stdio and typically logs stderr as server diagnostics.
 ///
 /// A pure function so the policy is unit tested without an artifact.
-fn banner_wanted(args: &RunnerArgs, interface: Interface) -> bool {
+pub(crate) fn banner_wanted(args: &RunnerArgs, interface: Interface) -> bool {
     if args.json || args.child.is_some() {
         return false;
     }

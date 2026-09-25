@@ -176,13 +176,13 @@ what this build does have.
 | `--child <id>` / `--child-protocol <label>` | run as a delegated child instead of a top-level interface (§5.7); both flags are required together. |
 | `--offline-echo` | answer every model call locally (reply text from `HARW_OFFLINE_ECHO`, if set) and say so in one stderr line; not a rights flag. Release builds ignore `HARW_OFFLINE_ECHO` without this flag. |
 
-Every flag above except `--manifest`/`--verify`/`--version`/`--capabilities`
+Every flag above except `--manifest`/`--verify`/`--version`/`--capabilities`/`--offline-echo`
 narrows the manifest before the chosen interface starts
 (`harw_runtime::embedded::EffectiveRights::from_manifest(&permissions)
 .narrowed_by(&flags)`): the effective right for tools, network, write,
 shell, host and budget is always `min(manifest, flags)`, one right at a
 time, never the other way around. The manifest is also printed as a
-one-line banner at startup (suppressed by `--json`), so you can always see
+one-line banner at startup (suppressed by `--json`, MCP over stdio and `--child`), so you can always see
 what the agent is allowed to do before it does anything.
 
 ### 5.2 `cli` — one-shot

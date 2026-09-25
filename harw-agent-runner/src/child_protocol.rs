@@ -209,6 +209,13 @@ pub enum ChildToParent {
         /// Consumption of this run.
         #[serde(default)]
         usage: ChildUsage,
+        /// Opaque token a later [`ParentToChild::Task::continue_from`] hands
+        /// back to resume this run (today the child's SDK session id). Set
+        /// only with [`ChildResultStatus::BudgetExhausted`]; absent
+        /// otherwise. Additive: an older peer omits it and it decodes as
+        /// `None`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        continuation: Option<String>,
     },
     /// A standalone usage update, sent independently of [`Self::Result`]
     /// (e.g. after each model round) so the parent can show live
@@ -233,11 +240,13 @@ pub enum ChildToParent {
 pub enum ChildResultStatus {
     /// Regular completion.
     Completed,
-    /// Cancelled (via [`ParentToChild::Cancel`] or the child's own budget).
+    /// Cancelled (via [`ParentToChild::Cancel`], or any cancel reason other
+    /// than the budget).
     Cancelled,
     /// Any other non-successful end (provider/turn error, refusal, ...).
     Failed,
-    /// The run's budget ended it; `text` is the last (or handed-off) answer.
+    /// The run's budget ended it; `text` is the last (or handed-off) answer
+    /// and the `Result` frame's `continuation` resumes it.
     BudgetExhausted,
 }
 
