@@ -10403,23 +10403,42 @@ mod tests {
         Ok(())
     }
 
-    /// Ein versteckter Befehl verschwindet auch aus dem `/`-Popup
-    /// (Namens-Vervollständigung), nicht nur aus `find`.
+    /// Ein versteckter Befehl verschwindet auch aus dem `/`-Popup: es liest
+    /// ausschließlich `command_registry.specs()`
+    /// ([`CommandPopup::new`]), das [`ChatApp::with_hidden_commands`] bereits
+    /// gefiltert hat.
     #[test]
     fn with_hidden_commands_removes_the_command_from_the_popup() -> TestResult {
+        use crate::command::{CommandDomain, CommandScope, OutputSurface, PermissionTier};
+
+        let solo_spec = |name: &str| -> TestResult<crate::CommandSpec> {
+            crate::CommandSpec::new(
+                name,
+                Vec::<String>::new(),
+                CommandScope::TuiOnly,
+                PermissionTier::Operator,
+                OutputSurface::Inline,
+                CommandDomain::Misc,
+            )
+            .map_err(ctx("spec"))
+        };
         let mut app = test_chat_app()?;
-        app.command_registry = CommandRegistry::built_in().map_err(ctx("built_in"))?;
-        let mut app = app.with_hidden_commands(vec!["model".to_owned()]);
-        app.input.insert_str("/mod");
+        app.command_registry = CommandRegistry::new(vec![solo_spec("model")?, solo_spec("diary")?]);
+        app.input.insert_str("/mo");
         app.sync_popup();
-        let names: Vec<String> = app
-            .command_popup
-            .as_ref()
-            .map(CommandPopup::visible_names)
-            .unwrap_or_default();
         assert!(
-            !names.iter().any(|name| name == "model"),
-            "{names:?} must not offer the hidden command"
+            !app.command_popup.as_ref().is_some_and(CommandPopup::is_empty),
+            "model should still match /mo before hiding it"
+        );
+
+        let mut app = app.with_hidden_commands(vec!["model".to_owned()]);
+        app.command_popup = None;
+        app.input.clear();
+        app.input.insert_str("/mo");
+        app.sync_popup();
+        assert!(
+            app.command_popup.as_ref().is_some_and(CommandPopup::is_empty),
+            "hidden /model must no longer match /mo in the popup"
         );
         Ok(())
     }

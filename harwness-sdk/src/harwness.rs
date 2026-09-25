@@ -132,6 +132,7 @@ impl SpecInputs {
             approval_override: None,
             model_override: None,
             embedded: self.embedded.clone(),
+            child_backend: self.child_backend.clone(),
         }
     }
 }

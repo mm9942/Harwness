@@ -95,40 +95,60 @@ impl ChildProcessSpawner for CurrentExeSpawner {
 }
 
 /// [`ChildBackend`] that runs each child as a separate OS process speaking
-/// `harwness.agent-child/v1` (see module docs for why it does not currently
-/// go through `harw_tool_job::JobManager`).
+/// `harwness.agent-child/v1` — as a real job through `harw_tool_job::JobManager`
+/// in production, or spawned directly in tests (see module docs).
 pub struct JobChildBackend<S: ChildProcessSpawner = CurrentExeSpawner> {
     spawner: S,
+    /// `Some`: run through `JobManager::start_piped` (production — every
+    /// child is a job, visible in `job.status`/`job.logs`, `job.stop` kills
+    /// its whole process group). `None`: spawn `spawner`'s command directly
+    /// and drive/kill it here (the test seam).
+    job_manager: Option<Arc<JobManager>>,
 }
 
 impl JobChildBackend<CurrentExeSpawner> {
-    /// The production backend: spawns the current executable.
+    /// The production backend: runs each child as a job through `job_manager`.
     #[must_use]
-    pub fn new() -> Self {
+    pub fn new(job_manager: Arc<JobManager>) -> Self {
         Self {
             spawner: CurrentExeSpawner,
+            job_manager: Some(job_manager),
         }
     }
 }
 
-impl Default for JobChildBackend<CurrentExeSpawner> {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
 impl<S: ChildProcessSpawner> JobChildBackend<S> {
-    /// Builds a backend with a custom spawner (tests use this with a plain
-    /// `/bin/sh` command).
+    /// Builds a backend that spawns `spawner`'s command itself, without a
+    /// `JobManager` (tests use this with a plain `/bin/sh` command).
     #[must_use]
     pub fn with_spawner(spawner: S) -> Self {
-        Self { spawner }
+        Self {
+            spawner,
+            job_manager: None,
+        }
+    }
+
+    /// Builds a backend that runs `spawner`'s command as a job through
+    /// `job_manager` (tests exercising the job-managed path against a
+    /// substitute spawner instead of the real [`CurrentExeSpawner`]).
+    #[cfg(test)]
+    #[must_use]
+    fn with_spawner_and_job_manager(spawner: S, job_manager: Arc<JobManager>) -> Self {
+        Self {
+            spawner,
+            job_manager: Some(job_manager),
+        }
     }
 }
 
 impl<S: ChildProcessSpawner> ChildBackend for JobChildBackend<S> {
     fn run<'a>(&'a self, spec: ChildRunSpec, io: &'a dyn ChildIo) -> ChildBackendFuture<'a> {
-        Box::pin(async move { run_one(&self.spawner, spec, io).await })
+        Box::pin(async move {
+            match &self.job_manager {
+                Some(job_manager) => run_job_managed(job_manager, &self.spawner, spec, io).await,
+                None => run_direct(&self.spawner, spec, io).await,
+            }
+        })
     }
 }
 
@@ -165,7 +185,145 @@ fn kill_process_group(child: &Child) {
 #[cfg(not(unix))]
 fn kill_process_group(_child: &Child) {}
 
-async fn run_one<S: ChildProcessSpawner>(
+/// Source of the child's stdout lines, unified so [`drive_protocol`] does
+/// not care whether it runs against a directly-spawned [`Child`] or a
+/// [`PipedJob`] from `JobManager::start_piped` — in both cases an error or a
+/// closed stream just means "no more lines" (already how the direct path
+/// treated a read error before this was introduced).
+enum StdoutSource {
+    Direct(tokio::io::Lines<BufReader<tokio::process::ChildStdout>>),
+    JobManaged(mpsc::UnboundedReceiver<String>),
+}
+
+impl StdoutSource {
+    async fn next_line(&mut self) -> Option<String> {
+        match self {
+            Self::Direct(lines) => lines.next_line().await.ok().flatten(),
+            Self::JobManaged(receiver) => receiver.recv().await,
+        }
+    }
+}
+
+/// Runs `spec` as a job through `job_manager` (production path): the child
+/// is `spawner`'s command, started with `JobManager::start_piped` so it gets
+/// the same process-group/log/monitor machinery as any other job.
+async fn run_job_managed<S: ChildProcessSpawner>(
+    job_manager: &Arc<JobManager>,
+    spawner: &S,
+    spec: ChildRunSpec,
+    io: &dyn ChildIo,
+) -> ChildRunOutcome {
+    let command = spawner.command_for(&spec.agent_id);
+    let command_text = describe_command(&command);
+    let prepared = PreparedJob {
+        command,
+        executed_on_host: true,
+    };
+    let request = StartRequest {
+        name: format!("agent-child-{}", spec.agent_id),
+        command: command_text,
+        cwd: None,
+        env_keys: Vec::new(),
+        notify_every: Duration::ZERO,
+        owner: JobOwner::new(spec.parent.as_str(), Vec::new()),
+    };
+    let piped = match job_manager.start_piped(request, prepared) {
+        Ok(piped) => piped,
+        Err(err) => {
+            return ChildRunOutcome {
+                status: ChildRunStatus::Crashed {
+                    exit_code: None,
+                    stderr_tail: format!("failed to start child job: {err}"),
+                },
+                text: None,
+                usage: ChildUsage::default(),
+                continuation: None,
+            };
+        }
+    };
+    let PipedJob {
+        job_id,
+        mut stdin,
+        stdout_lines,
+        ..
+    } = piped;
+    let caller_session = spec.parent.as_str().to_owned();
+    let mut source = StdoutSource::JobManaged(stdout_lines);
+
+    let outcome = tokio::select! {
+        biased;
+        () = spec.cancel.cancelled() => {
+            let _ = job_manager
+                .stop(&job_id, Caller::Agent(&caller_session), JobSignal::Term)
+                .await;
+            ChildRunOutcome {
+                status: ChildRunStatus::Cancelled { reason: cancel_reason_label(spec.cancel.reason()) },
+                text: None,
+                usage: ChildUsage::default(),
+                continuation: None,
+            }
+        }
+        outcome = drive_protocol(&mut stdin, &mut source, &spec, io) => outcome,
+    };
+
+    if matches!(outcome.status, ChildRunStatus::Crashed { .. }) {
+        let exit_code = match job_manager
+            .wait(&job_id, Caller::Agent(&caller_session), JOB_EXIT_WAIT, None)
+            .await
+        {
+            Ok((_, status)) => status.meta.exit_code,
+            Err(_) => None,
+        };
+        let stderr_tail = job_managed_stderr_tail(job_manager, &job_id, &caller_session);
+        return ChildRunOutcome {
+            status: ChildRunStatus::Crashed {
+                exit_code,
+                stderr_tail,
+            },
+            ..outcome
+        };
+    }
+    outcome
+}
+
+/// The last few lines of a job's `STDERR_LOG`, best-effort (an unreadable
+/// log or an unknown job just yields an empty tail — `job.logs` remains the
+/// authoritative way to inspect it).
+fn job_managed_stderr_tail(job_manager: &JobManager, job_id: &JobId, caller_session: &str) -> String {
+    let Ok(dir) = job_manager.log_dir(job_id, Caller::Agent(caller_session)) else {
+        return String::new();
+    };
+    let query = harw_tool_job::LogQuery {
+        tail: Some(STDERR_TAIL_LINES),
+        max_lines: STDERR_TAIL_LINES,
+        max_bytes: 64 * 1024,
+        ..harw_tool_job::LogQuery::default()
+    };
+    harw_tool_job::logs::read_log(&dir.join(harw_tool_job::model::STDERR_LOG), &query)
+        .unwrap_or_default()
+        .lines
+        .into_iter()
+        .map(|(_, text)| text)
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// A short, human-readable rendering of `command`'s program and arguments
+/// (`meta.json`'s `command` field; not meant to be re-parsed/re-executed).
+fn describe_command(command: &Command) -> String {
+    let std_command = command.as_std();
+    let mut parts = vec![std_command.get_program().to_string_lossy().into_owned()];
+    parts.extend(
+        std_command
+            .get_args()
+            .map(|arg| arg.to_string_lossy().into_owned()),
+    );
+    parts.join(" ")
+}
+
+/// Runs `spec` by spawning `spawner`'s command directly and driving/killing
+/// it here (the test seam — production goes through [`run_job_managed`]).
+async fn run_direct<S: ChildProcessSpawner>(
     spawner: &S,
     spec: ChildRunSpec,
     io: &dyn ChildIo,

@@ -706,4 +706,38 @@ mod tests {
             harw_types::ReasoningEffort::High
         );
     }
+
+    /// #22 Welle 3C: [`HarwnessBuilder::child_backend`] legt genau die
+    /// übergebene `Arc`-Instanz im Feld ab, das [`HarwnessBuilder::build`]
+    /// in [`SpecInputs::child_backend`] weiterreicht.
+    #[test]
+    fn child_backend_sets_the_field() {
+        struct FakeBackend;
+        impl harw_core::child_backend::ChildBackend for FakeBackend {
+            fn run<'a>(
+                &'a self,
+                _spec: harw_core::child_backend::ChildRunSpec,
+                _io: &'a dyn harw_core::child_backend::ChildIo,
+            ) -> harw_core::child_backend::ChildBackendFuture<'a> {
+                Box::pin(async {
+                    harw_core::child_backend::ChildRunOutcome {
+                        status: harw_core::child_backend::ChildRunStatus::Completed,
+                        text: None,
+                        usage: harw_core::ChildUsage::default(),
+                        continuation: None,
+                    }
+                })
+            }
+        }
+
+        let backend: Arc<dyn harw_core::child_backend::ChildBackend> = Arc::new(FakeBackend);
+        let builder = HarwnessBuilder::default().child_backend(Arc::clone(&backend));
+        assert!(
+            builder
+                .child_backend
+                .as_ref()
+                .is_some_and(|installed| Arc::ptr_eq(installed, &backend)),
+            "child_backend() muss die übergebene Arc-Instanz im Feld ablegen"
+        );
+    }
 }
