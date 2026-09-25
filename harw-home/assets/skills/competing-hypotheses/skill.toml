@@ -1,0 +1,4 @@
+name = "competing-hypotheses"
+description = "Konkurrierende Hypothesen systematisch prüfen: Hypothesen-Evidenz-Matrix, widerlegende Belege statt Bestätigung, Diagnostizität, Sensitivität, Indikatoren (competing hypotheses, ACH matrix, disconfirming evidence, diagnosticity)."
+instructions_file = "instructions.md"
+tools = ["filesystem.read"]

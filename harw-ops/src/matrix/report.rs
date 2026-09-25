@@ -32,7 +32,7 @@ use harw_matrix_game::dice::Outcome;
 use harw_matrix_game::scenario::Scenario;
 use harw_matrix_game::state::{EntryKind, GameEntry, PlayerId, VarValue};
 
-use super::runner::{MatrixRun, entry_text};
+use super::runner::{MatrixRun, entry_text, forfeit_causes_markdown, last_technical_stop};
 
 /// Baut den Markdown-Bericht eines (in der Regel beendeten) Laufs.
 ///
@@ -60,6 +60,14 @@ pub fn build_report(run: &MatrixRun) -> String {
         scenario.rounds()
     );
     let _ = writeln!(out, "| Status | {} |\n", run.status().as_str());
+    // Runde 9, E7: ein technischer Abbruch steht vor allem anderen — der
+    // Bericht darf nicht als Spielergebnis gelesen werden.
+    if let Some(stop) = last_technical_stop(&log.journal) {
+        let _ = writeln!(
+            out,
+            "> **Technischer Abbruch im Lauf — die betroffenen Phasen sind kein Spielergebnis:** {stop}\n"
+        );
+    }
 
     purpose_section(scenario, &mut out);
     actors_section(scenario, &mut out);
@@ -414,8 +422,12 @@ fn recommendations_section(run: &MatrixRun, out: &mut String) {
     if forfeits > 0 {
         let _ = writeln!(
             out,
-            "- {forfeits} Zug/Züge wurden gepasst (Fehler, Zeitlimit oder ungültige Antwort) — Ergebnis entsprechend vorsichtig lesen."
+            "- {forfeits} Zug/Züge wurden gepasst — Ergebnis entsprechend vorsichtig lesen. Ursachen:"
         );
+        // Runde 9, E7: jede Ursache einmal, mit den betroffenen Sitzen.
+        for line in forfeit_causes_markdown(&run.log().journal).lines() {
+            let _ = writeln!(out, "  {line}");
+        }
         any = true;
     }
     let leaks = run
@@ -483,6 +495,82 @@ mod tests {
         }
         assert!(text.contains("Spielende"));
         assert_eq!(build_report(&run), text);
+        Ok(())
+    }
+
+    /// Plan R9: ein recherchierter Fakt landet mit Belegen im Journal, alle
+    /// Sitze sehen ihn als öffentliche Lage, und der Bericht nennt die Quelle
+    /// als „Fakt: … (Quelle: URL, abgerufen …)“.
+    #[tokio::test]
+    async fn research_fact_is_journaled_with_sources_and_the_report_cites_them() -> TestResult {
+        use harw_matrix_game::state::{Audience, FactSource};
+
+        let tmp = tempfile::tempdir()?;
+        let loaded = load_scenario(CLOUD)?;
+        let seed = master_seed_for(&loaded, Some(5));
+        let mut run = MatrixRun::start(
+            loaded,
+            CLOUD.to_owned(),
+            None,
+            seed,
+            "research-fact-test".to_owned(),
+            Some(tmp.path().join("lauf")),
+            false,
+            None,
+        )?;
+        let line = run.add_research_fact(
+            "Das Projekt steht unter MIT oder Apache-2.0 und hat eine SECURITY.md.",
+            vec![
+                FactSource {
+                    url: "https://example.org/repo/LICENSE-MIT".to_owned(),
+                    retrieved: "2026-09-24".to_owned(),
+                    rating: Some("A1".to_owned()),
+                },
+                FactSource {
+                    url: "SECURITY.md:1".to_owned(),
+                    retrieved: "2026-09-24".to_owned(),
+                    rating: None,
+                },
+            ],
+        )?;
+        assert!(
+            line.contains("(Quelle: https://example.org/repo/LICENSE-MIT, abgerufen 2026-09-24, Einstufung A1; Quelle: SECURITY.md:1, abgerufen 2026-09-24)"),
+            "{line}"
+        );
+        // Ohne Beleg kein Fakt: Annahmen gehören ins Szenario.
+        assert!(
+            run.add_research_fact("Unbelegte Behauptung.", Vec::new())
+                .is_err()
+        );
+        let fact = run
+            .log()
+            .journal
+            .entries()
+            .find_map(|entry| match &entry.kind {
+                EntryKind::FactAdded { text, sources } if !sources.is_empty() => {
+                    Some((entry.audience.clone(), text.clone(), sources.len()))
+                }
+                _ => None,
+            })
+            .ok_or("recherchierter Fakt fehlt im Journal")?;
+        assert_eq!(fact.0, Audience::Public);
+        assert!(fact.1.starts_with("Das Projekt steht unter MIT"));
+        assert_eq!(fact.2, 2);
+        let journal = std::fs::read_to_string(tmp.path().join("lauf").join("journal.jsonl"))?;
+        assert!(
+            journal.contains("\"sources\""),
+            "Belege fehlen in journal.jsonl"
+        );
+        run.verify_replay()?;
+
+        run.request_end()?;
+        let mut driver = NullDriver;
+        run.step_with(&mut driver).await?;
+        let text = std::fs::read_to_string(run.report_path().ok_or("report.md fehlt")?)?;
+        assert!(
+            text.contains("- **Fakt:** Das Projekt steht unter MIT oder Apache-2.0 und hat eine SECURITY.md. (Quelle: https://example.org/repo/LICENSE-MIT, abgerufen 2026-09-24"),
+            "Bericht nennt die Quelle nicht:\n{text}"
+        );
         Ok(())
     }
 }

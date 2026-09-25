@@ -1,5 +1,5 @@
-//! `harw agent uia-new|skills|plugins`: Agenten, Skills und Plugins
-//! verwalten.
+//! `harw agent uia-new|list|skills|plugins`: Agenten, Skills und Plugins
+//! verwalten (`list` zeigt die startbaren Agenten wie `/agent defs`).
 //!
 //! `uia-new` startet den Einrichtungsdialog für einen weiteren
 //! Benutzeroberflächen-Agenten; `skills` und `plugins` rufen dieselben
@@ -20,6 +20,12 @@ pub fn run(g: &GlobalArgs, a: AgentAction) -> Result<(), String> {
         AgentAction::UiaNew => {
             Printer::new(g.output()).require_text("harw agent uia-new")?;
             crate::uia_bootstrap::run_new_uia_command(g.home.clone())
+        }
+        // Plan R9, Teil C: derselbe Roster wie `/agent defs` in der TUI.
+        AgentAction::List { query } => {
+            let mut args = vec!["defs".to_owned()];
+            args.extend(query);
+            run_and_print(g, "/agent", args)
         }
         AgentAction::Skills { args } => run_and_print(g, "/skills", args),
         AgentAction::Plugins { args } => run_and_print(g, "/plugins", args),

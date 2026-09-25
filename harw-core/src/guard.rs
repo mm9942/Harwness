@@ -149,6 +149,12 @@ pub trait PitfallAdvisor: Send + Sync {
     /// `Some(hinweis)`, falls ein Fakt zutrifft (Hinweistext ≤ 300 Bytes lt.
     /// Vertrag der Implementierung); sonst `None`.
     fn advise(&self, tool_name: &str, arguments: &serde_json::Value) -> Option<String>;
+
+    /// Runde 9, E3: meldet einen **erfolgreichen** Aufruf. Ein Berater
+    /// verwirft daraufhin die Pitfalls, die auf genau diesen Aufruf passten —
+    /// ein gelöster Fehler hängt danach nicht mehr an späteren Ergebnissen.
+    /// Der Default tut nichts.
+    fn resolved(&self, _tool_name: &str, _arguments: &serde_json::Value) {}
 }
 
 /// Wird nach jeder Modellrunde und jedem Tool-Ergebnis benachrichtigt, damit

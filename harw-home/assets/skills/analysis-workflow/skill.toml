@@ -1,0 +1,4 @@
+name = "analysis-workflow"
+description = "Zusammenspiel der Analyse-Familie: welcher Agent was tut, Wellen Sammeln → Prüfen → Verdichten → Belegcheck, Auftragsformat, Übergaben, welche Methoden-Skills wann laden (analysis workflow, intelligence analysis team, orchestration, evidence-collector, evidence-critic, synthesis-writer, wargaming)."
+instructions_file = "instructions.md"
+tools = ["filesystem.read"]

@@ -33,8 +33,11 @@
 //! mit `ModeUnsupported` ab; das wird als [`OpError::NotAvailable`] gemeldet.
 //!
 //! `/mode default <modus>` berührt die laufende Sitzung nicht, sondern schreibt
-//! bestes Bemühen `[mode] default` über
-//! [`crate::config_util::persist_default_interaction_mode`].
+//! bestes Bemühen `[mode] default` über den Persistenz-Dienst
+//! ([`crate::config_util::SelectionPersistence::persist_default_interaction_mode`],
+//! Standard: [`crate::config_util::persist_default_interaction_mode`]); mit
+//! registriertem [`crate::live_config::SharedLiveConfig`] zeigt das folgende
+//! `/mode show` den neuen Standard sofort.
 //!
 //! # Schlüsseltypen
 //! - [`ModeArgs`] — positionale Argumente `action target`.
@@ -337,10 +340,12 @@ async fn mode(ctx: &OpContext, args: ModeArgs) -> Result<OpOutput, OpError> {
     let command = args.command()?;
 
     if let ModeCommand::SetDefault(mode) = command {
-        return Ok(handle_set_default(
-            mode,
-            crate::config_util::persist_default_interaction_mode,
-        ));
+        // Über den Persistenz-Dienst, damit der Live-Schnappschuss den neuen
+        // Standard sofort zeigt (`/mode show`, Modus-Auswahl F7).
+        let persistence = crate::config_util::selection_persistence(ctx);
+        return Ok(handle_set_default(mode, |name| {
+            persistence.persist_default_interaction_mode(name)
+        }));
     }
 
     // Ohne Controller gibt es keinen Adressaten — für Anzeige und Wechsel ein
@@ -699,6 +704,51 @@ mod tests {
         let data = output.data.unwrap_or_default();
         assert_eq!(data["default"], serde_json::json!("explore"));
         assert_eq!(data["persisted"], serde_json::json!(true));
+    }
+
+    /// Live-Schnappschuss: nach `/mode default work` meldet `/mode show`
+    /// sofort den neuen Standard (Grundlage der Modus-Auswahl F7).
+    #[tokio::test]
+    async fn test_mode_default_is_visible_in_the_following_show() -> TestResult {
+        let (base, root) = test_context(true)?;
+        let recorder = Arc::new(crate::config_util::RecordingSelectionPersistence::new());
+        let persistence: Arc<dyn crate::config_util::SelectionPersistence> = recorder.clone();
+        let live: crate::live_config::SharedLiveConfig = Arc::new(
+            crate::live_config::LiveConfig::new(Arc::new(harw_config::ResolvedConfig::default())),
+        );
+        let mut services = ServiceMap::new();
+        services.insert(persistence);
+        services.insert(Arc::clone(&live));
+        let controller: harw_operations::SharedSessionController =
+            Arc::new(harw_operations::session_control::NullSessionController::new());
+        services.insert(controller);
+        let op_ctx = OpContext::new(
+            SessionId::new(),
+            TurnId::new(),
+            base.sandbox().clone(),
+            services,
+        );
+
+        let set = super::mode(&op_ctx, args(&["default", "work"])?).await;
+        let shown = super::mode(&op_ctx, args(&["show"])?).await;
+        std::fs::remove_dir_all(root).ok();
+
+        assert!(set.is_ok(), "{set:?}");
+        let report = shown
+            .map_err(|error| TestError::Unexpected(format!("/mode show: {error}")))?
+            .data
+            .ok_or(TestError::Missing("OpOutput.data"))?;
+        assert_eq!(report["default"], serde_json::json!("work"));
+        assert_eq!(live.current().harness.mode.default, "work");
+        assert_eq!(
+            recorder.calls(),
+            vec![
+                crate::config_util::RecordedSelectionPersistCall::DefaultInteractionMode {
+                    mode: "work".to_owned(),
+                }
+            ]
+        );
+        Ok(())
     }
 
     #[test]

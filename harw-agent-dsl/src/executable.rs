@@ -909,6 +909,226 @@ impl ExecutableAgentIr {
     pub fn snapshot_id(&self) -> SnapshotId {
         self.snapshot_id.clone()
     }
+
+    /// Klemmt diese IR unter eine Obergrenze (`ceiling`) — die Rechtedecke
+    /// eines benutzerdefinierten Agenten (Plan R9, Teil B).
+    ///
+    /// # Description
+    /// Ein Agent aus Profil oder vertrautem Projekt darf nie mehr als die
+    /// eingebaute Rolle, auf der er aufsetzt. Die Klemmung ist rein
+    /// verengend und wirkt feldweise:
+    ///
+    /// - `tool_surface.admitted`: nur Werkzeuge, die **beide** Seiten
+    ///   admittieren und die keine Seite verbietet (Reihenfolge von `self`).
+    /// - `tool_surface.forbidden`: Vereinigung beider Seiten.
+    /// - `spawn_contract.max_depth`: Minimum; fehlt eine Seite, gilt die
+    ///   andere.
+    /// - `spawn_contract.budget`: feldweises Minimum; fehlt ein Wert bei
+    ///   `self`, gilt der der Decke. Die Effort-Obergrenze übernimmt die
+    ///   niedrigere Stufe (`low` < `medium` < `high`); ein unbekanntes Label
+    ///   fällt auf das der Decke zurück.
+    /// - `spawn_contract.child_orchestrators`: Schnittmenge.
+    /// - `authority`: Schnittmenge, sofern die Decke überhaupt Capabilities
+    ///   nennt (eine leere Decke trifft keine Aussage).
+    /// - `lifecycle_machine`: `allow_pause`/`allow_rerun` nur, wenn beide
+    ///   Seiten es erlauben; `max_attempts` als Minimum.
+    ///
+    /// Identität (`id`, `role`, `specialization`), Skills, Kontextprogramm,
+    /// Rückgabevertrag und Trace bleiben die von `self`. Der
+    /// [`SnapshotId`] wird über den geklemmten Inhalt neu berechnet.
+    ///
+    /// # Arguments
+    /// - `ceiling` (`&ExecutableAgentIr`): die gesenkte Basisrolle.
+    ///
+    /// # Returns
+    /// Eine neue IR, die nie mehr erlaubt als `self` oder `ceiling` allein.
+    ///
+    /// # Concurrency
+    /// Rein; von jedem Thread aus sicher.
+    #[must_use]
+    pub fn clamped_to(&self, ceiling: &ExecutableAgentIr) -> ExecutableAgentIr {
+        self.clamped_to_with(ceiling, &[])
+    }
+
+    /// Wie [`Self::clamped_to`], behandelt aber `extra_allowed` so, als
+    /// admittierte die Decke diese Werkzeuge zusätzlich (und verböte sie
+    /// nicht). Für eine Decke, die aus einer eingebauten Rolle plus einer
+    /// dokumentierten Erweiterung besteht (Plan R9, Teil B: generischer
+    /// schreibender Worker = Analyst-Decke plus `fs.write`/`fs.edit`).
+    ///
+    /// `extra_allowed` erweitert nie `self`: ein Werkzeug, das `self` nicht
+    /// admittiert oder selbst verbietet, bleibt draußen.
+    #[must_use]
+    pub fn clamped_to_with(
+        &self,
+        ceiling: &ExecutableAgentIr,
+        extra_allowed: &[&str],
+    ) -> ExecutableAgentIr {
+        let is_extra = |tool: &String| extra_allowed.contains(&tool.as_str());
+        let forbidden: Vec<String> = {
+            let mut forbidden = self.tool_surface.forbidden.clone();
+            for tool in &ceiling.tool_surface.forbidden {
+                if !forbidden.contains(tool) && !is_extra(tool) {
+                    forbidden.push(tool.clone());
+                }
+            }
+            forbidden
+        };
+        let admitted: Vec<String> = self
+            .tool_surface
+            .admitted
+            .iter()
+            .filter(|tool| ceiling.tool_surface.admitted.contains(*tool) || is_extra(tool))
+            .filter(|tool| !forbidden.contains(tool))
+            .fold(Vec::new(), |mut acc, tool| {
+                if !acc.contains(tool) {
+                    acc.push(tool.clone());
+                }
+                acc
+            });
+
+        let max_depth = min_option(
+            self.spawn_contract.max_depth,
+            ceiling.spawn_contract.max_depth,
+        );
+        let budget = match (&self.spawn_contract.budget, &ceiling.spawn_contract.budget) {
+            (own, None) => own.clone(),
+            (None, Some(limit)) => Some(limit.clone()),
+            (Some(own), Some(limit)) => Some(BudgetSpec {
+                max_tokens: min_option(own.max_tokens, limit.max_tokens),
+                max_tool_calls: min_option(own.max_tool_calls, limit.max_tool_calls),
+                max_wall_secs: min_option(own.max_wall_secs, limit.max_wall_secs),
+                effort_cap: lower_effort_cap(
+                    own.effort_cap.as_deref(),
+                    limit.effort_cap.as_deref(),
+                ),
+            }),
+        };
+        let child_orchestrators: Vec<String> = self
+            .spawn_contract
+            .child_orchestrators
+            .iter()
+            .filter(|name| ceiling.spawn_contract.child_orchestrators.contains(name))
+            .cloned()
+            .collect();
+        let authority = if ceiling.authority.capabilities.is_empty() {
+            self.authority.clone()
+        } else {
+            self.authority.intersect(&ceiling.authority)
+        };
+
+        let mut ir = ExecutableAgentIr {
+            id: self.id.clone(),
+            role: self.role,
+            specialization: self.specialization.clone(),
+            authority,
+            reasoning_effort: self.reasoning_effort.clone(),
+            skills: self.skills.clone(),
+            spawn_contract: SpawnContract {
+                workspace_hint: self.spawn_contract.workspace_hint.clone(),
+                budget,
+                max_depth,
+                child_orchestrators,
+            },
+            job_template: self.job_template.clone(),
+            context_program: self.context_program.clone(),
+            tool_surface: ResolvedToolSurface {
+                admitted,
+                forbidden,
+            },
+            lifecycle_machine: LifecycleMachine {
+                allow_pause: self.lifecycle_machine.allow_pause
+                    && ceiling.lifecycle_machine.allow_pause,
+                allow_rerun: self.lifecycle_machine.allow_rerun
+                    && ceiling.lifecycle_machine.allow_rerun,
+                max_attempts: min_option(
+                    self.lifecycle_machine.max_attempts,
+                    ceiling.lifecycle_machine.max_attempts,
+                ),
+            },
+            return_pipeline: self.return_pipeline.clone(),
+            trace: self.trace.clone(),
+            snapshot_id: SnapshotId(String::new()),
+        };
+        ir.snapshot_id = compute_snapshot_id(&ir);
+        ir
+    }
+
+    /// Nimmt `tools` in die admittierte Werkzeugmenge auf, sofern `self` sie
+    /// nicht ausdrücklich verbietet (Plan R9, Teil B).
+    ///
+    /// # Description
+    /// Für querschnittliche, rein lesende Katalogwerkzeuge (`skills.search`,
+    /// `skills.load`, später `agents.catalog`/`agents.delegate`), die eine
+    /// benutzerdefinierte Definition nicht selbst aufzählen muss. Der
+    /// Aufrufer übergibt nur Werkzeuge, die die Basisrolle ohnehin admittiert
+    /// — die Decke wird damit nie überschritten.
+    #[must_use]
+    pub fn with_additional_admitted(&self, tools: &[&str]) -> ExecutableAgentIr {
+        let mut ir = self.clone();
+        for tool in tools {
+            let tool = (*tool).to_owned();
+            if !ir.tool_surface.admitted.contains(&tool)
+                && !ir.tool_surface.forbidden.contains(&tool)
+            {
+                ir.tool_surface.admitted.push(tool);
+            }
+        }
+        ir.snapshot_id = compute_snapshot_id(&ir);
+        ir
+    }
+
+    /// Wie [`Self::clamped_to`], begrenzt die Spawn-Tiefe aber zusätzlich
+    /// auf höchstens `max_depth`.
+    ///
+    /// # Arguments
+    /// - `max_depth` (`u32`): absolute Obergrenze der Spawn-Tiefe.
+    ///
+    /// # Returns
+    /// Eine neue IR mit `spawn_contract.max_depth <= max_depth`.
+    #[must_use]
+    pub fn with_max_depth_at_most(&self, max_depth: u32) -> ExecutableAgentIr {
+        let mut ir = self.clone();
+        ir.spawn_contract.max_depth = Some(
+            ir.spawn_contract
+                .max_depth
+                .map_or(max_depth, |own| own.min(max_depth)),
+        );
+        ir.snapshot_id = compute_snapshot_id(&ir);
+        ir
+    }
+}
+
+/// Minimum zweier optionaler Obergrenzen; fehlt eine, gilt die andere.
+fn min_option<T: Ord + Copy>(left: Option<T>, right: Option<T>) -> Option<T> {
+    match (left, right) {
+        (Some(left), Some(right)) => Some(left.min(right)),
+        (Some(value), None) | (None, Some(value)) => Some(value),
+        (None, None) => None,
+    }
+}
+
+/// Die niedrigere zweier Effort-Obergrenzen (`low` < `medium` < `high`).
+///
+/// Fehlt eine Seite, gilt die andere. Ein unbekanntes Label ist nicht
+/// vergleichbar; dann gewinnt fail-closed die Obergrenze der Decke (`limit`).
+fn lower_effort_cap(own: Option<&str>, limit: Option<&str>) -> Option<String> {
+    fn rank(label: &str) -> Option<u8> {
+        match label.to_ascii_lowercase().as_str() {
+            "low" => Some(1),
+            "medium" => Some(2),
+            "high" => Some(3),
+            _ => None,
+        }
+    }
+    match (own, limit) {
+        (None, None) => None,
+        (Some(value), None) | (None, Some(value)) => Some(value.to_owned()),
+        (Some(own), Some(limit)) => match (rank(own), rank(limit)) {
+            (Some(own_rank), Some(limit_rank)) if own_rank < limit_rank => Some(own.to_owned()),
+            _ => Some(limit.to_owned()),
+        },
+    }
 }
 
 impl SpawnContract {
@@ -2732,6 +2952,138 @@ skills = ["rust", "code-review"]
         )?;
         let ir = lower(&resolved).map_err(ctx("lower should succeed"))?;
         assert_eq!(ir.skills(), ["rust", "code-review"]);
+        Ok(())
+    }
+
+    /// Senkt eine Definition aus TOML-Quelltext (ohne `extends`).
+    fn lower_toml(source: &str) -> TestResult<ExecutableAgentIr> {
+        let raw = crate::parse::parse_toml(source)?;
+        let id = raw.id.clone();
+        let resolved = crate::resolve::resolve_definition(
+            &id,
+            &[(crate::layers::DefinitionLayer::BuiltIn, raw)],
+            time::OffsetDateTime::now_utc(),
+        )?;
+        lower(&resolved).map_err(ctx("lower should succeed"))
+    }
+
+    #[test]
+    fn test_clamped_to_only_narrows_tools_depth_and_budget() -> TestResult {
+        let ceiling = lower_toml(
+            r#"
+schema = "harwness.agent/v1"
+id = "harwness.agent.base-role@1"
+version = "1.0.0"
+role = "worker"
+specialization = "base-role"
+
+[tools]
+admitted = ["fs.read", "fs.grep", "web.fetch"]
+forbidden = ["fs.write"]
+
+[spawn]
+max_depth = 1
+child_orchestrators = []
+
+[spawn.budget]
+max_tokens = 1000
+max_tool_calls = 10
+effort_cap = "medium"
+
+[lifecycle]
+allow_pause = false
+allow_rerun = true
+max_attempts = 2
+"#,
+        )?;
+        let wide = lower_toml(
+            r#"
+schema = "harwness.agent/v1"
+id = "user.agent.wide@1"
+version = "1.0.0"
+role = "worker"
+specialization = "wide"
+skills = ["planning"]
+
+[tools]
+admitted = ["fs.read", "fs.write", "shell.exec", "web.fetch"]
+forbidden = ["web.fetch"]
+
+[spawn]
+max_depth = 3
+child_orchestrators = ["research-orchestrator"]
+
+[spawn.budget]
+max_tokens = 999999
+effort_cap = "high"
+
+[lifecycle]
+allow_pause = true
+allow_rerun = true
+max_attempts = 9
+"#,
+        )?;
+        let clamped = wide.clamped_to(&ceiling);
+        assert_eq!(clamped.tool_surface().admitted(), ["fs.read"]);
+        assert!(
+            clamped
+                .tool_surface()
+                .forbidden()
+                .iter()
+                .any(|tool| tool == "fs.write")
+        );
+        assert_eq!(clamped.spawn_contract().max_depth(), Some(1));
+        assert!(clamped.spawn_contract().child_orchestrators().is_empty());
+        let budget = clamped
+            .spawn_contract()
+            .budget()
+            .ok_or(TestError::Missing("budget"))?;
+        assert_eq!(budget.max_tokens(), Some(1000));
+        assert_eq!(budget.max_tool_calls(), Some(10));
+        assert_eq!(budget.effort_cap(), Some("medium"));
+        assert!(!clamped.lifecycle_machine().allow_pause());
+        assert_eq!(clamped.lifecycle_machine().max_attempts(), Some(2));
+        // Identität und Skills bleiben die des Kandidaten.
+        assert_eq!(clamped.specialization(), "wide");
+        assert_eq!(clamped.skills(), ["planning"]);
+        assert_ne!(clamped.snapshot_id(), wide.snapshot_id());
+        assert_eq!(
+            clamped
+                .with_max_depth_at_most(0)
+                .spawn_contract()
+                .max_depth(),
+            Some(0)
+        );
+
+        // Eine dokumentierte Erweiterung der Decke hebt deren Verbot auf,
+        // erweitert aber nie den Kandidaten selbst.
+        let writing = wide.clamped_to_with(&ceiling, &["fs.write", "fs.edit"]);
+        assert_eq!(writing.tool_surface().admitted(), ["fs.read", "fs.write"]);
+        assert!(
+            !writing
+                .tool_surface()
+                .forbidden()
+                .iter()
+                .any(|tool| tool == "fs.write")
+        );
+
+        // Querschnittswerkzeuge werden aufgenommen, außer der Kandidat
+        // verbietet sie selbst.
+        let with_catalog = clamped.with_additional_admitted(&["skills.search", "web.fetch"]);
+        assert!(
+            with_catalog
+                .tool_surface()
+                .admitted()
+                .iter()
+                .any(|tool| tool == "skills.search")
+        );
+        assert!(
+            !with_catalog
+                .tool_surface()
+                .admitted()
+                .iter()
+                .any(|tool| tool == "web.fetch")
+        );
         Ok(())
     }
 }

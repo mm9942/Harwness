@@ -73,7 +73,7 @@ pub use delegate_wave::{
     DEFAULT_MAX_PARALLEL, DELEGATE_WAVE_TOOL, DeclaredTargets, DelegateWaveOperation,
     DelegateWavePolicy, DelegateWaveReport, DelegateWaveRequest, MAX_WAVE_TARGETS, ReducerForRole,
     TargetReport, TargetStatus, TargetsForCaller, WaveComplexity, WaveJoin, WaveTarget,
-    admit_targets, delegate_wave, wave_budget_cap,
+    admit_targets, delegable_roles, delegate_wave, wave_budget_cap,
 };
 pub use harw_core::child_controller::AGENT_RESULT_TOOL;
 

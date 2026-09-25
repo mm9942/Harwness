@@ -3,7 +3,7 @@
 //!
 //! # Verantwortungsbereich
 //! ```text
-//! agent.message  { child_id, text }              // Eltern → eigenes, laufendes Kind
+//! agent.message  { child_id, text }              // Eltern → eigenes Kind
 //! parent.message { text, kind?: info|question }  // Kind → direkter Elternteil
 //! ```
 //!
@@ -25,7 +25,10 @@
 //! Sitzungen und verleihen keine Rechte. Die aufrufende Sitzung kommt aus
 //! dem Ausführungskontext (`OpContext::session_id`), nie aus
 //! Modell-Argumenten; die Eltern-Kind-Bindung prüft der Spawner. Fremde,
-//! unbekannte und beendete Kinder bekommen dieselbe Ablehnung. Nachrichten
+//! unbekannte und nicht fortsetzbare Kinder bekommen dieselbe Ablehnung.
+//! Runde 9, E3: ein eigenes, beendetes Kind erreicht diese Operation gar
+//! nicht — der Turn-Loop setzt es über `continue_from` mit der Nachricht als
+//! Auftrag fort (`harw_core::turn_loop`, `message_resume_handoff`). Nachrichten
 //! sind auf 4 KiB gedeckelt, Postfächer begrenzt. Keine Freigabepflicht
 //! (`AUTO_APPROVED_TOOLS`), nie in `ALWAYS_ASK_TOOLS`.
 //!
@@ -157,6 +160,11 @@ pub fn agent_message(ctx: &OpContext, request: &AgentMessageRequest) -> Result<O
     let spawner = ctx.managed_spawner().ok_or_else(|| {
         OpError::NotAvailable("kein Agent-Spawner in diesem Kontext konfiguriert".to_owned())
     })?;
+    // Runde 9, E3: die offene Frage vor der Zustellung merken, damit der
+    // Elternteil sieht, worauf sein Text als Antwort ging.
+    let question = harw_types::SessionId::try_from_str(request.child_id.clone())
+        .ok()
+        .and_then(|child| spawner.child_comms().pending_question_excerpt(&child));
     let delivery = spawner
         .send_message_to_child(ctx.session_id(), &request.child_id, &request.text)
         .map_err(|error| {
@@ -164,7 +172,9 @@ pub fn agent_message(ctx: &OpContext, request: &AgentMessageRequest) -> Result<O
         })?;
     let text = match delivery {
         harw_core::MessageDelivery::AnsweredQuestion => format!(
-            "Antwort an {} zugestellt; das Kind arbeitet damit sofort weiter.",
+            "Als Antwort auf die offene Frage „{}“ an {} zugestellt; das Kind arbeitet damit \
+             sofort weiter.",
+            question.as_deref().unwrap_or("…"),
             request.child_id
         ),
         harw_core::MessageDelivery::Queued => format!(

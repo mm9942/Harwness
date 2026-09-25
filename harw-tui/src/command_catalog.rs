@@ -200,6 +200,12 @@ const MEMORY: &[SubcommandHint] = &[
 /// `/agent`, Grammatik aus `harw-ops/src/agent.rs`.
 const AGENT: &[SubcommandHint] = &[
     SubcommandHint::new("list", "", "Aktive Kind-Agenten auflisten"),
+    // Plan R9, Teil C: startbare Agenten (eingebaut und benutzerdefiniert).
+    SubcommandHint::new(
+        "defs",
+        "[suchbegriff]",
+        "Startbare Agenten mit Herkunft auflisten",
+    ),
     SubcommandHint::new("stop", "<agent-id>", "Kind-Agenten abbrechen"),
     SubcommandHint::new("budget", "[agent-id]", "Budget und Lease anzeigen"),
     // Runde 5, Teil I: TUI-lokal abgefangen (vor der Operation `/agent`).
@@ -374,6 +380,18 @@ const MATRIX: &[SubcommandHint] = &[
     ),
 ];
 
+/// `/jobs`, Grammatik aus `harw-ops/src/jobs.rs` (Plan R9, Teil F).
+const JOBS: &[SubcommandHint] = &[
+    SubcommandHint::new("list", "", "Hintergrund-Jobs der Sitzung auflisten"),
+    SubcommandHint::new("show", "<id>", "Zustand, Befehl und letzte Zeilen"),
+    SubcommandHint::new(
+        "stop",
+        "<id> [TERM|INT|HUP|KILL]",
+        "Job samt Prozessgruppe stoppen",
+    ),
+    SubcommandHint::new("logs", "<id> [n]", "Letzte Log-Zeilen (stdout/stderr)"),
+];
+
 /// `/tools`, Grammatik aus `crate::tools_command`.
 const TOOLS: &[SubcommandHint] = &[
     SubcommandHint::new("on", "<name>", "Werkzeug einschalten"),
@@ -431,7 +449,7 @@ const HINT_TABLE: &[(&str, &str, &[SubcommandHint])] = &[
     ),
     (
         "agent",
-        "/agent [list|stop <agent-id>|budget [agent-id]|stream <orchestrators|all|none>|bg|cancel <agent-id>]",
+        "/agent [list|defs [suche]|stop <agent-id>|budget [agent-id]|stream <orchestrators|all|none>|bg|cancel <agent-id>]",
         AGENT,
     ),
     (
@@ -478,6 +496,11 @@ const HINT_TABLE: &[(&str, &str, &[SubcommandHint])] = &[
         "matrix",
         "/matrix [show|list|replay|compare <lauf> <lauf>] — Start über die UIA (Game Master)",
         MATRIX,
+    ),
+    (
+        "jobs",
+        "/jobs [list|show <id>|stop <id> [signal]|logs <id> [n]]",
+        JOBS,
     ),
     (
         "tools",
@@ -869,6 +892,7 @@ mod tests {
         assert!(names("mode").contains(&"default"));
         assert!(names("tools").contains(&"profile"));
         assert_eq!(names("matrix"), ["show", "list", "replay", "compare"]);
+        assert_eq!(names("jobs"), ["list", "show", "stop", "logs"]);
         assert_eq!(names("dream"), ["list", "show", "run", "status", "review"]);
         assert_eq!(
             names("palace"),

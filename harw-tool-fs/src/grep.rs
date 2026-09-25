@@ -16,12 +16,14 @@
 //!
 //! # Ziel-Validierung (Datei oder Verzeichnis)
 //! `args.path` bezeichnet entweder eine einzelne Datei oder ein
-//! Unterverzeichnis. Bevor irgendein Suchmotor läuft, öffnet
-//! [`resolve_target`] den Pfad symlinkfrei über `Workspace::open_any` und
-//! entscheidet anhand der Metadaten zwischen Datei- und Verzeichnis-Modus;
-//! jeder andere Typ (Socket, FIFO, …) sowie ein Symlink-Glied im Pfad münden
-//! in denselben Fehler. Das garantiert, dass der Startpfad innerhalb des
-//! Workspace liegt und keinem Symlink folgt — unabhängig vom Suchmotor.
+//! Unterverzeichnis. Bevor irgendein Suchmotor läuft, löst
+//! `crate::symlink::open_start` Symlinks im Pfad auf (nach innen frei, nach
+//! außen nur mit Freigabe — dann ist das freigegebene Verzeichnis die
+//! Wurzel), und [`resolve_target`] öffnet den aufgelösten Pfad symlinkfrei
+//! über `Workspace::open_any` und entscheidet anhand der Metadaten zwischen
+//! Datei- und Verzeichnis-Modus; jeder andere Typ (Socket, FIFO, …) mündet in
+//! denselben Fehler. Der Startpfad liegt damit immer unter einer erlaubten
+//! Wurzel — unabhängig vom Suchmotor.
 //!
 //! # ripgrep-Integration
 //! Ist ein `rg`-Binary in `PATH` auffindbar (einmal je Prozess ermittelt,
@@ -74,6 +76,7 @@
 //! Pfadauflösungsfehler münden alle in `Ok(ToolOutput::error(...))`. Kein Panic.
 
 use crate::blocking::run_blocking;
+use crate::symlink::open_start;
 use crate::tree::{
     HARD_MAX_RESULTS, MAX_LINE_BYTES, MAX_OUTPUT_BYTES, MAX_SCAN_FILE_BYTES, StopReason,
     WalkOptions, Workspace, normalize_relative, open_file_in, read_bounded, truncate_line,
@@ -348,11 +351,11 @@ fn resolve_target(
         Ok((_, meta)) if meta.is_dir() => Ok(Target::Dir),
         Ok(_) => Err(ToolOutput::error(format!(
             "fs.grep: '{start_input}' ist weder eine lesbare Datei noch ein lesbares \
-             Verzeichnis (Symlinks werden nicht verfolgt)"
+             Verzeichnis"
         ))),
         Err(err) => Err(ToolOutput::error(format!(
             "fs.grep: '{start_input}' ist weder eine lesbare Datei noch ein lesbares \
-             Verzeichnis (Symlinks werden nicht verfolgt): {err}"
+             Verzeichnis: {err}"
         ))),
     }
 }
@@ -616,10 +619,21 @@ fn grep_with_engine(root: &Path, args: &GrepArgs, rg: Option<&Path>) -> ToolOutp
         None => None,
     };
 
-    let workspace = match Workspace::open(root) {
-        Ok(workspace) => workspace,
-        Err(err) => return ToolOutput::error(format!("fs.grep: Workspace nicht lesbar: {err}")),
+    // Symlinks im Startpfad: nach innen frei, nach außen nur mit Freigabe
+    // (siehe `crate::symlink`). Interne Suche und ripgrep arbeiten danach auf
+    // dem aufgelösten Pfad unter der passenden Wurzel.
+    let start = match open_start(root, &start_rel, "fs.grep", start_input) {
+        Ok(start) => start,
+        Err(err) => {
+            return ToolOutput::error(format!(
+                "fs.grep: '{start_input}' ist weder eine lesbare Datei noch ein lesbares \
+                 Verzeichnis: {err}"
+            ));
+        }
     };
+    let search_root = start.root().to_path_buf();
+    let root = search_root.as_path();
+    let (workspace, start_rel) = (start.workspace, start.rel);
 
     let target = match resolve_target(&workspace, start_input, &start_rel) {
         Ok(target) => target,
@@ -693,8 +707,7 @@ fn grep_with_engine(root: &Path, args: &GrepArgs, rg: Option<&Path>) -> ToolOutp
                 Ok(stop) => stop,
                 Err(err) => {
                     return ToolOutput::error(format!(
-                        "fs.grep: '{start_input}' ist kein lesbares Verzeichnis \
-                         (Symlinks werden nicht verfolgt): {err}"
+                        "fs.grep: '{start_input}' ist kein lesbares Verzeichnis: {err}"
                     ));
                 }
             }
@@ -979,7 +992,7 @@ mod tests {
         );
         assert!(text.starts_with("nested/own.txt:1:"), "{text}");
 
-        for path in ["link_dir", "loop", "nested/up", "../outside"] {
+        for path in ["link_dir", "../outside"] {
             let mut args = grep_args(SECRET);
             args.path = Some(path.to_owned());
             let output = fs_grep(&ctx, args).await?;
@@ -989,6 +1002,13 @@ mod tests {
             );
             assert!(!render(&output)?.contains("secret.txt"));
         }
+        // `loop` -> `.` bleibt im Workspace und wird aufgelöst; der Walk
+        // folgt trotzdem keinem Symlink nach außen.
+        let mut args = grep_args(SECRET);
+        args.path = Some("loop".to_owned());
+        let text = text_of(fs_grep(&ctx, args).await?)?;
+        assert_eq!(text.lines().count(), 1, "{text}");
+        assert!(text.starts_with("nested/own.txt:1:"), "{text}");
         Ok(())
     }
 

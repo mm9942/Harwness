@@ -68,6 +68,16 @@ const EXPLORE_TOOLS: &[&str] = &[
     "status",
     "ps",
     "diff",
+    // Plan R9, Teil A: Skill-Katalog lesen (Host-Prozess, keine Rechteklasse).
+    "skills.search",
+    "skills.load",
+    // Plan R9, Teil F: laufende Jobs nur ansehen bzw. auf sie warten
+    // (`harw-tool-job`, eigene Jobs und die der Nachfahren). `job.start`
+    // und `job.stop` bleiben außerhalb.
+    "job.status",
+    "job.logs",
+    "job.list",
+    "job.wait",
 ];
 
 /// Werkzeuge von [`InteractionMode::Plan`].
@@ -92,6 +102,12 @@ const PLAN_TOOLS: &[&str] = &[
     "status",
     "ps",
     "diff",
+    "skills.search",
+    "skills.load",
+    "job.status",
+    "job.logs",
+    "job.list",
+    "job.wait",
     // — Planungs- und Rechercheerweiterung —
     "plan",
     "goal",
@@ -110,6 +126,18 @@ const PLAN_TOOLS: &[&str] = &[
     "plan.write",
     "plan.exit",
     "ask_user",
+    // — Plan R9, E1: lesende Delegation im Plan-Modus —
+    // Delegieren verändert selbst nichts; Kinder erben den Plan-Modus, und
+    // nur lesende Ziele sind delegierbar
+    // (`delegation_visibility::delegable_in_mode`). Die Kommunikation mit
+    // eigenen Kindern (Status, Ergebnis, Nachricht) bleibt möglich.
+    "delegate_wave",
+    "agents.catalog",
+    "agents.delegate",
+    "agent.status",
+    "agent.result",
+    "agent.message",
+    "parent.message",
 ];
 
 /// Prompt-Abschnitt für [`InteractionMode::Chat`].
@@ -636,6 +664,8 @@ mod tests {
             "plan",
             "goal",
             "research_web",
+            "job.start",
+            "job.stop",
         ] {
             assert!(
                 !explore.contains(&forbidden),
@@ -668,6 +698,14 @@ mod tests {
             "status",
             "ps",
             "diff",
+            // Plan R9, Teil A.
+            "skills.search",
+            "skills.load",
+            // Plan R9, Teil F: nur lesende Job-Werkzeuge.
+            "job.status",
+            "job.logs",
+            "job.list",
+            "job.wait",
         ];
         assert_eq!(InteractionMode::Explore.allowed_tools(), Some(expected));
     }
@@ -689,6 +727,12 @@ mod tests {
             "status",
             "ps",
             "diff",
+            "skills.search",
+            "skills.load",
+            "job.status",
+            "job.logs",
+            "job.list",
+            "job.wait",
             "plan",
             "goal",
             "web.fetch",
@@ -702,6 +746,14 @@ mod tests {
             "plan.write",
             "plan.exit",
             "ask_user",
+            // Plan R9, E1.
+            "delegate_wave",
+            "agents.catalog",
+            "agents.delegate",
+            "agent.status",
+            "agent.result",
+            "agent.message",
+            "parent.message",
         ];
         assert_eq!(InteractionMode::Plan.allowed_tools(), Some(expected));
     }
@@ -743,13 +795,18 @@ mod tests {
             "host.sudo_exec",
             "process.kill",
             "plan.enter",
+            // Plan R9, Teil F: Jobs nur ansehen, nie starten oder stoppen.
+            "job.start",
+            "job.stop",
         ] {
             assert!(
                 !plan.contains(&forbidden),
                 "Plan bleibt mutationsfrei: '{forbidden}'"
             );
         }
-        assert_eq!(plan.len(), explore.len() + 12);
+        // 12 Planungs-/Recherche-/Plan-Datei-Werkzeuge plus die sieben
+        // Delegations-/Kommunikationswerkzeuge aus Plan R9, E1.
+        assert_eq!(plan.len(), explore.len() + 19);
         Ok(())
     }
 

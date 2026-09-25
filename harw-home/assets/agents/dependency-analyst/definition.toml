@@ -1,0 +1,20 @@
+# Mitgelieferter Agent `dependency-analyst` (Plan R9, Teil B: migriert aus dem
+# Legacy-Format `agent.toml`; `system.md` bleibt die Arbeitsanweisung und
+# wird per `instructions_file` in den Kontext des Kindes gelegt).
+#
+# Erweitert die eingebaute Rolle `researcher-deps`: deren Werkzeuge, Budget und
+# Rückgabevertrag gelten unverändert (eigene Sektionen gleichen Namens
+# würden verworfen); hier stehen nur Identität, Skills und Anweisung.
+
+schema = "harwness.agent/v1"
+id = "harwness.agent.dependency-analyst@1"
+version = "1.0.0"
+extends = { id = "harwness.agent.researcher-deps@1" }
+role = "worker"
+specialization = "dependency-analyst"
+
+name = "Dependency Analyst"
+description = "Analyzes version compatibility, transitive impact, licenses, and upgrade paths."
+instructions_file = "system.md"
+
+skills = ["dependency-research"]

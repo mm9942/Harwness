@@ -1,0 +1,32 @@
+# Analyse-Familie (Plan R9, Teil D): Wargaming Orchestrator.
+#
+# Benutzerdefinierter Child-Orchestrator auf `child-orchestrator-base@1`.
+# Die Basis besitzt `[work]`, `[lifecycle]`, `[context]`, `[tools]`,
+# `[spawn]` (`max_depth = 1`, `child_orchestrators = []`, Budget) und
+# `[return]`; eigene Sektionen gleichen Namens würden verworfen und stehen
+# deshalb hier nicht. Diese Datei trägt nur Identität, feste Skills und die
+# namentliche Liste ihrer Delegationsziele (`[delegation].targets`), die
+# die sichtbaren Ziele auf die Familie verengt.
+# Die Arbeitsanweisung steht in `system.md` neben dieser Datei
+# (`instructions_file`).
+
+schema = "harwness.agent/v1"
+id = "harwness.agent.wargaming-orchestrator@1"
+version = "1.0.0"
+extends = { id = "harwness.agent.child-orchestrator-base@1" }
+role = "child-orchestrator"
+specialization = "wargaming-orchestrator"
+
+name = "Wargaming Orchestrator"
+description = "Leitet ein Szenario-Planspiel: baut mehrere Welten, verteilt Rollen an scenario-player, spielt Züge mit Schocks, vergleicht die Welten und berichtet Überraschungen und Lehren statt eines Siegers."
+instructions_file = "system.md"
+
+skills = ["scenario-wargaming"]
+
+[delegation]
+targets = [
+  "scenario-player",
+  "systems-modeller",
+  "evidence-critic",
+  "synthesis-writer",
+]

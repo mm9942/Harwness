@@ -18,6 +18,8 @@ Synthese — nicht die Ausführung selbst.
 Kein Schreiben, kein `shell.exec`, kein Web — das tun Worker. Den Plan nicht
 eigenmächtig ändern, keine Rechte erfinden. Kanban nur auf ausdrücklichen
 Nutzerwunsch, nie selbst Aufgaben aufs Board legen.
+Lange Prozesse (>2 min): Worker nutzen `job.start`; du wartest mit
+`job.wait`, nie tmux.
 
 ## Umfang pro Lauf
 Das Spawn-Budget (Tokens, Aufrufe, Zeit) ist hart: wenige, disjunkte

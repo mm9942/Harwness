@@ -14,14 +14,14 @@
 //!   registriert (z. B. via `inventory::submit!` durch Extension-Crate).
 //!
 //! # Op-Set
-//! **Grundausstattung** ([`register_all`], 45 Ops): `help`, `status`, `quit`,
+//! **Grundausstattung** ([`register_all`], 46 Ops): `help`, `status`, `quit`,
 //! `new`, `work`, `ps`, `attach`, `stop`, `diff`, `agent`, `skills`, `plugins`,
 //! `model`, `provider`, `uia-model`, `uia-provider`, `permissions`, `compact`,
 //! `memory`, `effort`, `mode`, `context-proposal`, `approval.pending`,
 //! `approval.resolve`, `add-workdir`, `export`, `usage`, `bug-report`,
 //! `approve`, `deny`, `review`, `cancel`, `retry`, `provider-concurrency`,
 //! `uia-worker-model`, `uia-effort`, `sandbox-lease`, `models`, `workbench`,
-//! `kanban`, `diary`, `palace`, `dream`, `learn`, `matrix`.
+//! `kanban`, `diary`, `palace`, `dream`, `learn`, `matrix`, `jobs`.
 //! `uia-worker-model` (Welle 2, harw-ops/src/model.rs) und `uia-effort`
 //! (harw-ops/src/effort.rs) waren implementiert, aber bis zu diesem Knoten
 //! nicht in `register_all` eingetragen — dadurch existierten `/uia-worker-model`
@@ -170,12 +170,15 @@ pub mod explore;
 pub mod export;
 pub mod goal;
 pub mod help;
+pub mod jobs;
 pub mod kanban;
 pub mod knowledge_args;
 pub mod knowledge_common;
 #[cfg(test)]
 pub(crate) mod knowledge_test_support;
 pub mod learn;
+// Live-Stand der aufgelösten Konfiguration (Spiegel gelungener Persistenz).
+pub mod live_config;
 // Live-Übernahme von Modellwechseln (Provider-Neubau, Rollenwahl).
 pub mod live_model;
 pub mod matrix;
@@ -257,7 +260,7 @@ fn compact_unavailable_output() -> OpOutput {
     OpOutput::from(crate::compact::COMPACT_HINT.to_owned())
 }
 
-/// Registriert alle 45 in dieser Crate definierten Kern-Operationen in der Registry.
+/// Registriert alle 46 in dieser Crate definierten Kern-Operationen in der Registry.
 ///
 /// # Beschreibung
 /// Fügt der übergebenen [`OperationRegistry`] eine `Arc<dyn Operation>`-Instanz
@@ -287,7 +290,7 @@ fn compact_unavailable_output() -> OpOutput {
 ///
 /// let mut registry = OperationRegistry::new();
 /// harw_ops::register_all(&mut registry);
-/// assert_eq!(registry.len(), 45);
+/// assert_eq!(registry.len(), 46);
 /// assert!(registry.find_by_name("help").is_some());
 /// assert!(registry.find_by_command("/uia-provider").is_some());
 /// assert!(registry.find_by_command("/uia-model").is_some());
@@ -317,7 +320,7 @@ fn compact_unavailable_output() -> OpOutput {
 /// assert!(registry.find_by_command("/dream").is_some());
 /// ```
 pub fn register_all(registry: &mut OperationRegistry) {
-    let ops: [Arc<dyn Operation>; 45] = [
+    let ops: [Arc<dyn Operation>; 46] = [
         Arc::new(help::HelpOperation),
         Arc::new(status::StatusOperation),
         Arc::new(quit::QuitOperation),
@@ -416,6 +419,9 @@ pub fn register_all(registry: &mut OperationRegistry) {
         Arc::new(dream::DreamOperation),
         Arc::new(learn::LearnOperation),
         Arc::new(matrix::MatrixOperation),
+        // Plan R9, Teil F: Hintergrund-Jobs der Sitzung (`/jobs`, nur TUI,
+        // handelt als Bedienerin; kein Modell-Werkzeug).
+        Arc::new(jobs::JobsOperation),
     ];
     for op in ops {
         registry.register(op);
@@ -745,10 +751,10 @@ mod tests {
     }
 
     #[test]
-    fn register_all_adds_forty_five_operations() {
+    fn register_all_adds_forty_six_operations() {
         let mut reg = OperationRegistry::new();
         register_all(&mut reg);
-        assert_eq!(reg.len(), 45);
+        assert_eq!(reg.len(), 46);
     }
 
     #[test]
@@ -962,6 +968,7 @@ mod tests {
             "dream",
             "learn",
             "matrix",
+            "jobs",
             "plan",
             "goal",
             "explore",
@@ -1012,8 +1019,8 @@ mod tests {
         register_all(&mut reg);
         assert_eq!(
             reg.len(),
-            45,
-            "first register_all must produce exactly 45 ops"
+            46,
+            "first register_all must produce exactly 46 ops"
         );
 
         // Attempt to register HelpOperation a second time via the fallible path.
@@ -1027,8 +1034,8 @@ mod tests {
         // Registry must not have grown — the rejected op was not inserted.
         assert_eq!(
             reg.len(),
-            45,
-            "registry must stay at 45 after a rejected duplicate"
+            46,
+            "registry must stay at 46 after a rejected duplicate"
         );
     }
 }

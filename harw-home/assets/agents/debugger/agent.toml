@@ -1,7 +1,0 @@
-name = "debugger"
-role = "worker"
-description = "Reproduces faults, isolates causes, and proposes minimal fixes with regressions."
-system_file = "system.md"
-skills = ["debugging"]
-timeout_seconds = 240
-max_retries = 1

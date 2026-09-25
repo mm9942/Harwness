@@ -15,6 +15,16 @@
 //! | [`MATRIX_START`] | eröffnet einen Lauf (Setup, Laufverzeichnis) | immer |
 //! | [`MATRIX_RUN`] | spielt Runden mit Sitz-Agenten (Kosten, Budget) | immer |
 //! | [`MATRIX_FINISH`] | Schlussargumente, AAR, `report.md`, Kopie in den Workspace | immer |
+//! | [`MATRIX_ADD_FACT`] | recherchierter Fakt mit Belegen als öffentliche Lage (Plan R9) | keine (nur Journal des eigenen Laufs) |
+//!
+//! # Recherche (Plan R9)
+//! Der Game Master grundiert ein Szenario **vor** dem Entwurf mit einer
+//! Recherche-Welle (Web über `intel-web-researcher`, Repo/Git über
+//! `evidence-collector`, Prüfung über `evidence-critic`) und kann **zwischen**
+//! Runden eine eng gefasste Frage recherchieren lassen („Recherche-Inject“).
+//! Das Ergebnis trägt [`MATRIX_ADD_FACT`] als `FactAdded` mit `sources` ins
+//! Journal ein; Sitz-Projektionen, Live-Events und `report.md` zeigen es als
+//! „… (Quelle: URL, abgerufen …)“. Die Sitze selbst bleiben offline.
 //!
 //! # Warum Operationen mit `model_tool`, aber nicht in `register_all`
 //! Die Operationen tragen ihre Freigabe ehrlich im `#[operation]`-Attribut.
@@ -60,7 +70,7 @@ use super::runner::{AAR_FILE, RunStatus};
 use super::{
     BUNDLED, MAX_AUTO_ROUNDS, SCENARIOS_DIR, StopReason, advance, end_loop, invalid, matrix_root,
     output, put_run, resolve_known_scenario, sanitize, saved_scenarios, session_run_id,
-    show_output, start_run, take_run,
+    show_output, start_run, take_run, with_run,
 };
 
 /// Werkzeugname: Szenario entwerfen/validieren/speichern.
@@ -73,6 +83,8 @@ pub const MATRIX_RUN: &str = "matrix.run";
 pub const MATRIX_STATUS: &str = "matrix.status";
 /// Werkzeugname: Spiel abschließen (AAR, Bericht).
 pub const MATRIX_FINISH: &str = "matrix.finish";
+/// Werkzeugname: recherchierten Fakt mit Belegen eintragen (Plan R9).
+pub const MATRIX_ADD_FACT: &str = "matrix.add_fact";
 
 /// Zeitbudget eines `matrix.run`-Aufrufs: danach endet er an der nächsten
 /// Phasengrenze und meldet „fortsetzen mit matrix.run“.
@@ -93,7 +105,8 @@ pub fn game_master_operations() -> Vec<Arc<dyn Operation>> {
     let start: Arc<dyn Operation> = Arc::new(MatrixStartOperation);
     let run: Arc<dyn Operation> = Arc::new(MatrixRunOperation);
     let finish: Arc<dyn Operation> = Arc::new(MatrixFinishOperation);
-    vec![draft, status, start, run, finish]
+    let add_fact: Arc<dyn Operation> = Arc::new(MatrixAddFactOperation);
+    vec![draft, status, start, run, finish, add_fact]
 }
 
 fn model_only(name: &str) -> OpError {
@@ -160,6 +173,47 @@ pub struct FinishArgs {
     pub run_id: Option<String>,
 }
 
+/// Argumente von `matrix.add_fact` (Plan R9).
+#[derive(Debug, Default, serde::Deserialize, harw_macros::OpArgs)]
+pub struct AddFactArgs {
+    /// Lauf-ID; Vorgabe: der zuletzt von dieser Sitzung gestartete Lauf.
+    #[serde(default)]
+    pub run_id: Option<String>,
+    /// Der Fakt in einem bis drei Sätzen, nur so weit die Belege tragen.
+    #[serde(default)]
+    pub text: String,
+    /// 1–5 Belege, je `"<URL oder pfad:zeile> | <Abrufdatum JJJJ-MM-TT> | <Einstufung, optional, z. B. B2>"`.
+    #[serde(default)]
+    pub sources: Vec<String>,
+}
+
+/// Zerlegt die Belege aus [`AddFactArgs::sources`]
+/// (`"<fundstelle> | <abrufdatum> | <einstufung?>"`).
+///
+/// # Errors
+/// [`OpError::InvalidArguments`], wenn ein Beleg Fundstelle oder
+/// Abrufdatum vermissen lässt.
+fn parse_fact_sources(raw: &[String]) -> Result<Vec<harw_matrix_game::state::FactSource>, OpError> {
+    raw.iter()
+        .map(|entry| {
+            let mut parts = entry.split('|').map(str::trim);
+            let url = parts.next().unwrap_or_default();
+            let retrieved = parts.next().unwrap_or_default();
+            let rating = parts.next().filter(|rating| !rating.is_empty());
+            if url.is_empty() || retrieved.is_empty() {
+                return Err(invalid(format!(
+                    "Beleg `{entry}` unvollständig — Form: \"<URL oder pfad:zeile> | <Abrufdatum> | <Einstufung>\""
+                )));
+            }
+            Ok(harw_matrix_game::state::FactSource {
+                url: url.to_owned(),
+                retrieved: retrieved.to_owned(),
+                rating: rating.map(str::to_owned),
+            })
+        })
+        .collect()
+}
+
 macro_rules! model_only_raw_args {
     ($ty:ty, $name:expr) => {
         impl harw_operations::FromRawArgs for $ty {
@@ -175,6 +229,7 @@ model_only_raw_args!(StatusArgs, MATRIX_STATUS);
 model_only_raw_args!(StartArgs, MATRIX_START);
 model_only_raw_args!(RunArgs, MATRIX_RUN);
 model_only_raw_args!(FinishArgs, MATRIX_FINISH);
+model_only_raw_args!(AddFactArgs, MATRIX_ADD_FACT);
 
 // ── Szenario-Entwurf ─────────────────────────────────────────────────────────
 
@@ -468,18 +523,24 @@ async fn matrix_run(ctx: &OpContext, args: RunArgs) -> Result<OpOutput, OpError>
     run.set_cancel(None);
     let out = result.map(|(lines, reason)| {
         let next = match reason {
-            StopReason::Ended => "Spiel beendet — weiter mit matrix.finish.",
+            StopReason::Ended => "Spiel beendet — weiter mit matrix.finish.".to_owned(),
             StopReason::Rounds => {
                 "Runde(n) gespielt — Zwischenstand melden, dann matrix.run oder matrix.finish."
+                    .to_owned()
             }
             StopReason::Leak => {
                 "Angehalten: Leak-Verdacht — Beobachter-Protokoll prüfen, dann matrix.run."
+                    .to_owned()
             }
-            StopReason::Cancelled => "Abgebrochen.",
-            StopReason::Deadline => "Zeitbudget des Aufrufs erschöpft — fortsetzen mit matrix.run.",
+            StopReason::Cancelled => "Abgebrochen.".to_owned(),
+            StopReason::Deadline => {
+                "Zeitbudget des Aufrufs erschöpft — fortsetzen mit matrix.run.".to_owned()
+            }
             StopReason::StepCap => {
-                "Sicherheitsnetz der Phasenzahl erreicht — fortsetzen mit matrix.run."
+                "Sicherheitsnetz der Phasenzahl erreicht — fortsetzen mit matrix.run.".to_owned()
             }
+            // Runde 9, E7: klare Zeile für Game Master und UIA.
+            StopReason::Technical(causes) => technical_stop_text(&causes),
         };
         output(
             &run,
@@ -488,6 +549,18 @@ async fn matrix_run(ctx: &OpContext, args: RunArgs) -> Result<OpOutput, OpError>
     });
     put_run(run)?;
     out
+}
+
+/// Runde 9, E7: Werkzeugtext nach einem technischen Abbruch — für den Game
+/// Master und die UIA unmissverständlich kein Spielergebnis.
+fn technical_stop_text(causes: &str) -> String {
+    format!(
+        "TECHNISCHER FEHLER — KEIN SPIELERGEBNIS: Alle Sitz-Aufrufe der letzten Phase \
+         scheiterten technisch, kein Sitz-Modell hat geantwortet. Ursache: {causes}. \
+         Der Lauf ist pausiert. Melde der UIA genau diese Ursache als technischen Fehler \
+         (nicht als Pässe der Akteure) und starte matrix.run nicht blind erneut — erst \
+         wenn die Ursache behoben ist."
+    )
 }
 
 /// Legt eine Kopie des Berichts als neue Datei unter
@@ -602,6 +675,38 @@ async fn matrix_finish(ctx: &OpContext, args: FinishArgs) -> Result<OpOutput, Op
     Ok(out)
 }
 
+/// `matrix.add_fact`: recherchierten Fakt mit Belegen als öffentliche Lage
+/// eintragen (Plan R9, Grundierung vor Runde 1 bzw. „Recherche-Inject“
+/// zwischen Runden).
+///
+/// # Errors
+/// [`OpError::InvalidArguments`] ohne Text, ohne oder mit unvollständigem
+/// Beleg, bei unbekanntem oder beendetem Lauf.
+#[operation(
+    name = "matrix.add_fact",
+    summary = "Trägt einen recherchierten Fakt mit Quellen (URL bzw. Fundstelle, Abrufdatum, Einstufung) als öffentliche Lage in den eigenen Lauf ein; alle Sitze sehen ihn, der Bericht nennt die Quellen. Nur belegte Fakten, keine Annahmen.",
+    domain = "knowledge",
+    permission = "operator",
+    model_tool(approval = "none")
+)]
+async fn matrix_add_fact(ctx: &OpContext, args: AddFactArgs) -> Result<OpOutput, OpError> {
+    let sources = parse_fact_sources(&args.sources)?;
+    let id = session_run_id(args.run_id, ctx.session_id().as_str())?;
+    with_run(&id, |run| {
+        let line = run.add_research_fact(&args.text, sources)?;
+        let round = run.log().state.round;
+        let when = if round == 0 {
+            "Ausgangslage vor Runde 1".to_owned()
+        } else {
+            format!("Lage ab Runde {round}")
+        };
+        Ok(output(
+            run,
+            format!("Fakt eingetragen ({when}, für alle Sitze sichtbar): {line}"),
+        ))
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -629,7 +734,10 @@ mod tests {
                     format!("{} muss eine Modell-Werkzeug-Fläche tragen", meta.name).into(),
                 );
             };
-            let free = matches!(meta.name, MATRIX_STATUS | MATRIX_DRAFT_SCENARIO);
+            let free = matches!(
+                meta.name,
+                MATRIX_STATUS | MATRIX_DRAFT_SCENARIO | MATRIX_ADD_FACT
+            );
             assert_eq!(*approval == ApprovalPolicy::None, free, "{}", meta.name);
             assert_eq!(*readonly, meta.name == MATRIX_STATUS, "{}", meta.name);
             assert!(
@@ -641,6 +749,25 @@ mod tests {
                 assert!(!meta.name.contains(human), "{}", meta.name);
             }
         }
+        Ok(())
+    }
+
+    /// Plan R9: Belege brauchen Fundstelle und Abrufdatum; die Einstufung
+    /// ist optional.
+    #[test]
+    fn fact_sources_parse_and_reject_incomplete_entries() -> TestResult {
+        let parsed = parse_fact_sources(&[
+            "https://example.org/LICENSE | 2026-09-24 | A1".to_owned(),
+            "SECURITY.md:1 | 2026-09-24".to_owned(),
+        ])?;
+        assert_eq!(parsed.len(), 2);
+        assert_eq!(parsed[0].url, "https://example.org/LICENSE");
+        assert_eq!(parsed[0].retrieved, "2026-09-24");
+        assert_eq!(parsed[0].rating.as_deref(), Some("A1"));
+        assert_eq!(parsed[1].rating, None);
+        assert!(parse_fact_sources(&["https://example.org".to_owned()]).is_err());
+        assert!(parse_fact_sources(&[" | 2026-09-24".to_owned()]).is_err());
+        assert!(AddFactArgs::from_raw_args(&[]).is_err());
         Ok(())
     }
 

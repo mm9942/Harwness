@@ -412,7 +412,10 @@ counted). The current, authoritative count is `FIELD_TABLE.len()` in
 and this document is not re-counted on every addition).
 
 Parsed from the same `config.toml`, with the same layer mechanics, but
-outside `HarnessConfig` itself: `[network]` (3 fields), `[browser]`
+outside `HarnessConfig` itself: `[network]` (4 fields: `allow_hosts`,
+`allow_private`, `researcher_web_hosts` and `research_web` —
+`"allowlist"` (default) or `"open"`; a restricted layer may only move
+`research_web` towards `"allowlist"`), `[browser]`
 (5 fields), `[dod]` (4 fields), `[web]` (3 fields) — see Section 3. These four
 sections are **not** `HarnessConfig` fields (`harness_config.rs` does not
 reference them), but are extracted per layer from the same file

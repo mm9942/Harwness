@@ -1,0 +1,28 @@
+# Mitgelieferter Agent `security-inspection-orchestrator` (Plan R9, Teil B: migriert aus dem
+# Legacy-Format `agent.toml`; `system.md` bleibt die Arbeitsanweisung und
+# wird per `instructions_file` in den Kontext des Kindes gelegt).
+#
+# Benutzerdefinierter Child-Orchestrator auf `child-orchestrator-base@1`:
+# die Basis besitzt Werkzeuge, Tiefe (`max_depth = 1`) und Budget; hier
+# stehen nur Identität, Skills und die namentlichen Delegationsziele.
+
+schema = "harwness.agent/v1"
+id = "harwness.agent.security-inspection-orchestrator@1"
+version = "1.0.0"
+extends = { id = "harwness.agent.child-orchestrator-base@1" }
+role = "child-orchestrator"
+specialization = "security-inspection-orchestrator"
+
+name = "Security Inspection Orchestrator"
+description = "Coordinates evidence-led security inspection and reports risk without making unsupported claims."
+instructions_file = "system.md"
+
+skills = ["security-inspection", "dependency-research", "verification"]
+
+[delegation]
+targets = [
+  "security-auditor",
+  "secret-scanner",
+  "dependency-security-reviewer",
+  "explorer",
+]

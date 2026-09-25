@@ -612,10 +612,21 @@ fn the_child_registry_inherits_the_config_approval_policy() -> TestResult {
     // `install_over_default` hängt keine zweite `DefaultApprovalPolicy` neben
     // die, die `assemble_registry_for_project` schon registriert hat
     // (Befund Z2c-06).
+    // Plan R9: dazu kommt genau ein Handler, die Domain-Freigabe des offenen
+    // Recherche-Netzes (`OpenWebApprovalPolicy`, ohne `research_web = "open"`
+    // wirkungslos).
     assert_eq!(
         registry.approval_handlers().len(),
-        child_chain.len(),
+        child_chain.len() + 1,
         "die Kind-Registry bildet die Kind-Kette ab, ohne Dublette: {child_chain:?}"
+    );
+    assert_eq!(
+        registry
+            .approval_handlers()
+            .iter()
+            .filter(|handler| handler.label() == "open-web")
+            .count(),
+        1
     );
     Ok(())
 }

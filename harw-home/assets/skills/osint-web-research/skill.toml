@@ -1,0 +1,4 @@
+name = "osint-web-research"
+description = "Offene Web-Recherche mit Quellen: Suchstrategie (Varianten, Sprachen, Zeitfilter), Primärquellen zuerst, Querprüfung unabhängiger Quellen, Abrufdatum, Einstufung von Quelle (A–F) und Information (1–6), Evidenzpaket; keine Personendaten, keine Logins, keine Paywall-Umgehung (OSINT, open source research, web research, source reliability, fact checking, evidence packet)."
+instructions_file = "instructions.md"
+tools = ["web.search", "web.fetch"]

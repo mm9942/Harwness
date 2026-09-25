@@ -27,7 +27,7 @@ role = "worker"
 specialization = "tmux-inspector-worker"
 
 name = "tmux Inspector Worker"
-description = "Führt tmux-Operationen über einen einzelnen validierten Socket in isolierter Sandbox aus."
+description = "Führt tmux-Operationen über einen einzelnen validierten Socket in isolierter Sandbox aus — nur für bestehende tmux-Sitzungen der Nutzerin; lange Prozesse starten Worker mit job.start."
 
 [work]
 mode = "delegated-execution"
@@ -37,6 +37,15 @@ may_research_web = false
 [tools]
 admitted = ["shell.exec"]
 forbidden = [
+  # Plan R9, Teil F: dieser Worker liest nur bestehende tmux-Sitzungen der
+  # Nutzerin; eigene lang laufende Prozesse startet er nie (dafür `job.*`
+  # der Shell-Worker).
+  "job.start",
+  "job.status",
+  "job.logs",
+  "job.stop",
+  "job.list",
+  "job.wait",
   "fs.read",
   "fs.search",
   "fs.list",

@@ -1,4 +1,4 @@
 name = "business-writing-pyramid"
-description = "Geschäftstexte von der Kernaussage her aufbauen: Einleitung aus Lage, Störung und Leserfrage, Frage-Antwort-Logik nach unten, überschneidungsfreie Gruppen, geordnete Argumente, Checkliste."
+description = "Geschäftstexte von der Kernaussage her aufbauen: Einleitung aus Lage, Störung und Leserfrage, Frage-Antwort-Logik nach unten, überschneidungsfreie Gruppen, geordnete Argumente, Checkliste. Stichwörter: Pyramidenprinzip, Pyramide, Minto-Pyramide, SCQ, Kernaussage zuerst, Memo, Entscheidungsvorlage, Management-Zusammenfassung."
 instructions_file = "instructions.md"
 tools = ["filesystem.read"]

@@ -83,7 +83,8 @@ use harw_matrix_game::scenario::{
     materials_for_seat, pair_folder_members,
 };
 use harw_matrix_game::state::{
-    Audience, EntryKind, GameEntry, GameLog, Journal, PlayerId, RevealedBy, Seat, replay,
+    Audience, EntryKind, FactSource, GameEntry, GameLog, Journal, PlayerId, RevealedBy, Seat,
+    replay,
 };
 use harw_matrix_game::visibility::{
     GuardDecision, LeakFinding, VisibilityCfg, cited_channels, guard_public_text,
@@ -115,6 +116,31 @@ const SEAT_SLOT_WAIT: Duration = Duration::from_secs(120);
 /// Reparaturversuche nach einer ungültigen Antwort (danach `Forfeit`).
 const REPAIR_ATTEMPTS: u32 = 1;
 
+/// Runde 9, E7: Restbudget (neue Tokens), unter dem ein gehaltener Sitz vor
+/// seinem nächsten Zug durch ein frisches Kind ersetzt wird. Das Token-Budget
+/// eines Kindes gilt für seine ganze Sitzung; ohne diesen Wechsel liefe ein
+/// Sitz mitten im Spiel in sein Budget und passte.
+const SEAT_RECYCLE_BELOW_TOKENS: u64 = 15_000;
+
+/// Runde 9, E7: Höchstlänge einer Verzichtsursache in Zusammenfassungen.
+const CAUSE_SUMMARY_MAX_CHARS: usize = 180;
+
+/// Kommando der Journal-Notiz eines verwirkten Sitz-Aufrufs.
+pub const FORFEIT_NOTE: &str = "forfeit";
+
+/// Kommando der Journal-Notiz eines technischen Abbruchs (Runde 9, E7).
+pub const TECHNICAL_STOP_NOTE: &str = "technischer-abbruch";
+
+/// Ursache eines ungültigen Zugs in Zusammenfassungen (die Einzelheiten
+/// stehen in der `forfeit`-Notiz des Journals).
+const INVALID_ANSWER_CAUSE: &str = "ungültige Antwort nach Reparaturversuch";
+
+/// Mittelteil der `forfeit`-Notiz eines technisch gescheiterten Aufrufs.
+const FAILED_CALL: &str = "Aufruf fehlgeschlagen";
+
+/// Mittelteil der `forfeit`-Notiz einer auch nach Reparatur ungültigen Antwort.
+const INVALID_ANSWER: &str = "Antwort auch nach Reparaturversuch ungültig";
+
 /// Hartes Zeitlimit eines Sitz-Aufrufs (Runde 7, Teil M): Admission-Warten
 /// ([`SEAT_SLOT_WAIT`]) plus Turn-Budget (300 s) plus Reserve. Danach gilt
 /// der Sitz für diesen Aufruf als gepasst, sein Kind wird abgebrochen und
@@ -136,6 +162,12 @@ pub const MATERIALS_DIR: &str = "materials";
 pub const MAX_MATERIAL_FILE_BYTES: u64 = 5 * 1024 * 1024;
 /// Höchstgröße aller Unterlagen einer Sitz-Kopie.
 pub const MAX_MATERIAL_TOTAL_BYTES: u64 = 50 * 1024 * 1024;
+
+/// Plan R9: Höchstlänge eines recherchierten Fakts (Zeichen).
+pub const MAX_RESEARCH_FACT_CHARS: usize = 1_200;
+
+/// Plan R9: höchstens so viele Belege je recherchiertem Fakt.
+pub const MAX_RESEARCH_FACT_SOURCES: usize = 5;
 /// Höchste Verzeichnistiefe beim Kopieren.
 const MAX_MATERIAL_DEPTH: usize = 16;
 
@@ -175,10 +207,38 @@ pub struct StepReport {
     pub calls: usize,
     /// Sitze, die in dieser Phase gepasst haben (ungültig oder Fehler).
     pub forfeits: Vec<String>,
+    /// Runde 9, E7: je gepasstem Aufruf Sitz, Ursache und Art (gleiche
+    /// Reihenfolge wie [`Self::forfeits`]).
+    pub forfeit_causes: Vec<SeatForfeit>,
     /// Anzahl der Leak-Befunde (`LeakSuspect`-Einträge).
     pub leaks: usize,
     /// Spiel nach diesem Schritt beendet.
     pub ended: bool,
+    /// Runde 9, E7: jeder Sitz-Aufruf dieser Phase scheiterte technisch; der
+    /// Lauf ist pausiert. Inhalt: die (entdoppelten) Ursachen.
+    pub technical_stop: Option<String>,
+}
+
+/// Art eines verwirkten Sitz-Aufrufs (Runde 9, E7).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ForfeitKind {
+    /// Technischer Fehler: Spawn/Admission, Lauf, Zeitlimit, fehlende Antwort.
+    Technical,
+    /// Antwort auch nach dem Reparaturversuch ungültig (ein Spielzug).
+    InvalidAnswer,
+    /// Der Lauf wurde abgebrochen.
+    Cancelled,
+}
+
+/// Ein verwirkter Sitz-Aufruf mit Ursache (Runde 9, E7).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SeatForfeit {
+    /// Sitz-Schlüssel.
+    pub seat: String,
+    /// Kurze Ursache für Zusammenfassungen (volle Fassung im Journal).
+    pub cause: String,
+    /// Art des Verzichts.
+    pub kind: ForfeitKind,
 }
 
 impl StepReport {
@@ -188,12 +248,15 @@ impl StepReport {
             phase: cursor.phase,
             calls: 0,
             forfeits: Vec::new(),
+            forfeit_causes: Vec::new(),
             leaks: 0,
             ended: false,
+            technical_stop: None,
         }
     }
 
-    /// Einzeilige deutsche Zusammenfassung.
+    /// Einzeilige deutsche Zusammenfassung; gepasste Sitze erscheinen je
+    /// Ursache gruppiert, z. B. `gepasst: rat, gilde (Spawn fehlgeschlagen: …)`.
     #[must_use]
     pub fn summary(&self) -> String {
         let mut line = format!(
@@ -202,7 +265,12 @@ impl StepReport {
             self.phase.label(),
             self.calls
         );
-        if !self.forfeits.is_empty() {
+        if !self.forfeit_causes.is_empty() {
+            line.push_str(&format!(
+                " · gepasst: {}",
+                group_forfeits(&self.forfeit_causes)
+            ));
+        } else if !self.forfeits.is_empty() {
             line.push_str(&format!(" · gepasst: {}", self.forfeits.join(", ")));
         }
         if self.leaks > 0 {
@@ -211,8 +279,188 @@ impl StepReport {
         if self.ended {
             line.push_str(" · Spiel beendet");
         }
+        if self.technical_stop.is_some() {
+            line.push_str(" · technischer Abbruch, Lauf pausiert");
+        }
         line
     }
+
+    fn push_forfeit(&mut self, seat: String, cause: String, kind: ForfeitKind) {
+        self.forfeits.push(seat.clone());
+        self.forfeit_causes.push(SeatForfeit {
+            seat,
+            cause: shorten_cause(&cause),
+            kind,
+        });
+    }
+
+    /// `Some(ursachen)`, wenn die Phase Sitze aufrief und **jeder** Aufruf
+    /// technisch scheiterte (nicht: ungültige Antwort, Abbruch).
+    fn all_calls_failed_technically(&self) -> Option<String> {
+        let all_technical = self.calls > 0
+            && self.forfeit_causes.len() >= self.calls
+            && self
+                .forfeit_causes
+                .iter()
+                .all(|forfeit| forfeit.kind == ForfeitKind::Technical);
+        all_technical.then(|| distinct_causes(&self.forfeit_causes).join("; "))
+    }
+}
+
+/// Kürzt eine Ursache für Zusammenfassungen (eine Zeile, begrenzte Länge).
+fn shorten_cause(cause: &str) -> String {
+    let line = cause.split_whitespace().collect::<Vec<_>>().join(" ");
+    if line.chars().count() <= CAUSE_SUMMARY_MAX_CHARS {
+        return line;
+    }
+    let mut short: String = line.chars().take(CAUSE_SUMMARY_MAX_CHARS).collect();
+    short.push('…');
+    short
+}
+
+/// Entdoppelte Ursachen in der Reihenfolge ihres ersten Auftretens.
+fn distinct_causes(forfeits: &[SeatForfeit]) -> Vec<String> {
+    let mut causes: Vec<String> = Vec::new();
+    for forfeit in forfeits {
+        if !causes.contains(&forfeit.cause) {
+            causes.push(forfeit.cause.clone());
+        }
+    }
+    causes
+}
+
+/// `sitz, sitz (ursache); sitz (ursache)` — je Ursache einmal, Sitze
+/// entdoppelt, Reihenfolge des ersten Auftretens.
+#[must_use]
+pub fn group_forfeits(forfeits: &[SeatForfeit]) -> String {
+    distinct_causes(forfeits)
+        .into_iter()
+        .map(|cause| {
+            let mut seats: Vec<&str> = Vec::new();
+            for forfeit in forfeits.iter().filter(|f| f.cause == cause) {
+                if !seats.contains(&forfeit.seat.as_str()) {
+                    seats.push(&forfeit.seat);
+                }
+            }
+            format!("{} ({cause})", seats.join(", "))
+        })
+        .collect::<Vec<_>>()
+        .join("; ")
+}
+
+/// Verzichte eines Laufs mit gleicher Ursache (Runde 9, E7), aus den
+/// `forfeit`-Notizen des Journals gelesen — damit auch ein per Replay
+/// geladener Lauf seine Ursachen kennt.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ForfeitGroup {
+    /// Kurze Ursache (technischer Fehler) bzw. „ungültige Antwort …“.
+    pub cause: String,
+    /// Betroffene Sitze, entdoppelt, in Reihenfolge des ersten Auftretens.
+    pub seats: Vec<String>,
+    /// Anzahl der verwirkten Aufrufe mit dieser Ursache.
+    pub count: usize,
+    /// `true` für technische Fehler (nicht: ungültige Antwort).
+    pub technical: bool,
+}
+
+/// Liest eine `forfeit`-Notiz: `(sitz, ursache, technisch)`.
+fn parse_forfeit_note(detail: &str) -> Option<(String, String, bool)> {
+    let rest = detail.strip_prefix("Sitz `")?;
+    let (seat, rest) = rest.split_once('`')?;
+    let (head, cause) = rest.split_once(" — ")?;
+    if head.ends_with(INVALID_ANSWER) {
+        return Some((seat.to_owned(), INVALID_ANSWER_CAUSE.to_owned(), false));
+    }
+    let technical = cause.trim() != "Lauf abgebrochen";
+    Some((seat.to_owned(), shorten_cause(cause), technical))
+}
+
+/// Alle Verzichte eines Journals, je Ursache gruppiert (Reihenfolge des
+/// ersten Auftretens).
+#[must_use]
+pub fn forfeit_groups(journal: &Journal) -> Vec<ForfeitGroup> {
+    let mut groups: Vec<ForfeitGroup> = Vec::new();
+    for entry in journal.entries() {
+        let EntryKind::FacilitatorNote { command, detail } = &entry.kind else {
+            continue;
+        };
+        if command != FORFEIT_NOTE {
+            continue;
+        }
+        let Some((seat, cause, technical)) = parse_forfeit_note(detail) else {
+            continue;
+        };
+        match groups.iter_mut().find(|group| group.cause == cause) {
+            Some(group) => {
+                group.count += 1;
+                if !group.seats.contains(&seat) {
+                    group.seats.push(seat);
+                }
+            }
+            None => groups.push(ForfeitGroup {
+                cause,
+                seats: vec![seat],
+                count: 1,
+                technical,
+            }),
+        }
+    }
+    groups
+}
+
+/// Letzter technischer Abbruch eines Journals (Detail der Notiz), falls es
+/// einen gab.
+#[must_use]
+pub fn last_technical_stop(journal: &Journal) -> Option<String> {
+    journal
+        .entries()
+        .filter_map(|entry| match &entry.kind {
+            EntryKind::FacilitatorNote { command, detail } if command == TECHNICAL_STOP_NOTE => {
+                Some(detail.clone())
+            }
+            _ => None,
+        })
+        .last()
+}
+
+/// Hängt dem AAR einen Abschnitt mit den Verzichtsursachen an (und, falls
+/// der Lauf technisch abbrach, den Hinweis, dass das kein Spielergebnis ist).
+fn with_forfeit_causes(mut markdown: String, journal: &Journal) -> String {
+    let causes = forfeit_causes_markdown(journal);
+    if causes.is_empty() {
+        return markdown;
+    }
+    if !markdown.ends_with('\n') {
+        markdown.push('\n');
+    }
+    markdown.push_str("\n## Verzichte und ihre Ursachen\n\n");
+    if let Some(stop) = last_technical_stop(journal) {
+        markdown.push_str(&format!(
+            "**Technischer Abbruch im Lauf — die betroffenen Phasen sind kein Spielergebnis:** {stop}\n\n"
+        ));
+    }
+    markdown.push_str(&causes);
+    markdown
+}
+
+/// Markdown-Liste der Verzichtsursachen (leer ohne Verzichte).
+#[must_use]
+pub fn forfeit_causes_markdown(journal: &Journal) -> String {
+    let mut out = String::new();
+    for group in forfeit_groups(journal) {
+        let kind = if group.technical {
+            ", technischer Fehler"
+        } else {
+            ""
+        };
+        out.push_str(&format!(
+            "- {} — {} ({}×{kind})\n",
+            group.cause,
+            group.seats.join(", "),
+            group.count
+        ));
+    }
+    out
 }
 
 // ── Sitz-Treiber ─────────────────────────────────────────────────────────────
@@ -253,6 +501,14 @@ pub trait SeatDriver: Send {
     fn take_warnings(&mut self) -> Vec<String> {
         Vec::new()
     }
+
+    /// Runde 9, E7: `true`, wenn der nächste Aufruf dieses Sitzes an ein
+    /// Kind geht, das seine früheren Züge noch kennt. Bei `false` schickt der
+    /// Runner ein volles Lagebild statt nur des Deltas. Der Treiber darf hier
+    /// gehaltene Kinder erneuern (Lease) oder gezielt ersetzen (Restbudget).
+    fn keeps_context(&mut self, _seat_key: &str) -> bool {
+        true
+    }
 }
 
 /// Treiber ohne Agenten: jeder Aufruf scheitert (Sitz passt). Dient `end`
@@ -280,6 +536,11 @@ pub struct SpawnerDriver {
     cancel: CancelToken,
     budget: AgentBudget,
     children: BTreeMap<String, SessionId>,
+    /// Runde 9, E7: letzter Aufruf je gehaltenem Sitz (für die Verdrängung,
+    /// wenn der Fan-out-Deckel weniger gleichzeitige Kinder erlaubt, als das
+    /// Szenario Sitze hat).
+    last_used: BTreeMap<String, u64>,
+    tick: u64,
     /// `<run_dir>/materials`, falls Unterlagen-Kopien existieren.
     materials_root: Option<PathBuf>,
     /// Präfix der Workspace-IDs der Sitz-Sandboxen.
@@ -314,6 +575,8 @@ impl SpawnerDriver {
             cancel: ctx.cancel_token().cloned().unwrap_or_else(CancelToken::new),
             budget: parse_budget_hint(SEAT_TURN_BUDGET)?,
             children: BTreeMap::new(),
+            last_used: BTreeMap::new(),
+            tick: 0,
             materials_root: None,
             run_tag: String::new(),
             warnings: Vec::new(),
@@ -362,11 +625,59 @@ impl SpawnerDriver {
     /// Vergisst einen Sitz und gibt sein Kind frei (nach einem Fehler; der
     /// nächste Aufruf startet ein frisches Kind).
     fn forget(&mut self, seat_key: &str) {
+        self.last_used.remove(seat_key);
         if let Some(child) = self.children.remove(seat_key) {
             if let Err(error) = self.spawner.release_child(&child) {
                 tracing::warn!(child = %child, error = %error, "matrix.seat_release_failed");
             }
         }
+    }
+
+    /// Runde 9, E7: verlängert die Lease aller gehaltenen Sitze. Ein Sitz
+    /// wartet zwischen seinen Zügen oft länger als die Lease (15 min), weil
+    /// die anderen Sitze nacheinander ziehen; ohne Verlängerung räumte der
+    /// Reaper ihn ab und sein nächster Zug scheiterte an einem fehlenden
+    /// Admission-Record.
+    fn renew_held_leases(&self) {
+        let now = Timestamp::now();
+        for child in self.children.values() {
+            if let Err(error) = self.spawner.renew_lease(child, now) {
+                tracing::debug!(child = %child, error = %error, "matrix.seat_lease_renew_failed");
+            }
+        }
+    }
+
+    /// Runde 9, E7: macht vor dem Start eines neuen Sitzes Platz, wenn der
+    /// Fan-out-Deckel des Spawners (`max_active_children_per_parent`, aus dem
+    /// Modellprofil, oft 3–4) schon von gehaltenen Sitzen belegt ist: der am
+    /// längsten nicht gefragte Sitz wird freigegeben und beim nächsten Zug
+    /// frisch gestartet (mit vollem Lagebild).
+    ///
+    /// # Errors
+    /// Deutsche Beschreibung, wenn der Deckel 0 ist (Modell ohne Delegation).
+    fn make_room_for(&mut self, key: &str) -> Result<(), String> {
+        let limit = self.spawner.limits().max_active_children_per_parent;
+        if limit == 0 {
+            return Err(
+                "Spawn fehlgeschlagen: das Modellprofil erlaubt keine Kind-Agenten \
+                 (max_child_fanout = 0) — Sitze können nicht starten"
+                    .to_owned(),
+            );
+        }
+        while self.children.len() >= limit {
+            let Some(victim) = self
+                .children
+                .keys()
+                .filter(|seat| seat.as_str() != key)
+                .min_by_key(|seat| self.last_used.get(seat.as_str()).copied().unwrap_or(0))
+                .cloned()
+            else {
+                break;
+            };
+            tracing::info!(seat = %victim, limit, "matrix.seat_evicted_for_capacity");
+            self.forget(&victim);
+        }
+        Ok(())
     }
 }
 
@@ -381,6 +692,7 @@ impl SeatDriver for SpawnerDriver {
                     // weist die Admission sie ab, verwirkt der Sitz den Zug
                     // (fail-closed).
                     let bound = self.seat_sandbox_for(key)?;
+                    self.make_room_for(key)?;
                     let input = harw_extension_api::SpawnInput {
                         parent_session_id: self.parent.clone(),
                         handoff_call_id: ToolCallId::new(),
@@ -407,9 +719,13 @@ impl SeatDriver for SpawnerDriver {
                     child
                 }
             };
+            self.tick += 1;
+            self.last_used.insert(key.to_owned(), self.tick);
             let Some(declared) = self.spawner.child_budget(&child) else {
                 self.forget(key);
-                return Err(format!("Admission-Record von `{child}` fehlt"));
+                return Err(format!(
+                    "Admission-Record von `{child}` fehlt (Sitz-Agent wurde freigegeben, z. B. Lease abgelaufen)"
+                ));
             };
             let budget = tighten_budget(self.budget, declared);
             let run = match self
@@ -457,6 +773,30 @@ impl SeatDriver for SpawnerDriver {
             tracing::info!(child = %child, requested, "matrix.seat_abandoned");
         }
         self.forget(seat_key);
+    }
+
+    fn keeps_context(&mut self, seat_key: &str) -> bool {
+        self.renew_held_leases();
+        let Some(child) = self.children.get(seat_key).cloned() else {
+            return false;
+        };
+        // Vom Reaper oder anderswo freigegeben: frisch starten statt am
+        // fehlenden Admission-Record zu scheitern.
+        let Some(remaining) = self.spawner.remaining_budget(&child) else {
+            self.children.remove(seat_key);
+            self.last_used.remove(seat_key);
+            return false;
+        };
+        // Fast aufgebrauchtes Sitzungsbudget: rechtzeitig ersetzen.
+        if remaining
+            .max_tokens
+            .is_some_and(|left| left < SEAT_RECYCLE_BELOW_TOKENS)
+        {
+            tracing::info!(seat = seat_key, child = %child, "matrix.seat_recycled_for_budget");
+            self.forget(seat_key);
+            return false;
+        }
+        true
     }
 
     fn take_warnings(&mut self) -> Vec<String> {
@@ -1067,6 +1407,25 @@ impl MatrixRun {
             Phase::Schlussargumente => self.run_final_arguments(driver, &mut report).await?,
             Phase::Aar => self.run_aar(driver, &mut report).await?,
         }
+        // Runde 9, E7: scheiterte jeder Sitz-Aufruf der Phase technisch
+        // (Spawn, Admission, Lauf, Zeitlimit), ist das kein Spielergebnis —
+        // der Lauf pausiert mit der Ursache, statt weitere Runden leerer
+        // Pässe zu spielen.
+        if self.status != RunStatus::Ended
+            && let Some(causes) = report.all_calls_failed_technically()
+        {
+            self.status = RunStatus::Paused;
+            self.note(
+                TECHNICAL_STOP_NOTE,
+                format!(
+                    "Runde {} · Phase {}: alle {} Sitz-Aufrufe scheiterten technisch — {causes}",
+                    self.cursor.round,
+                    self.cursor.phase.label(),
+                    report.calls
+                ),
+            )?;
+            report.technical_stop = Some(causes);
+        }
         self.flush()?;
         report.round = self.cursor.round;
         report.ended = self.status == RunStatus::Ended;
@@ -1117,6 +1476,11 @@ impl MatrixRun {
         let role = SeatRole::for_seat(&self.loaded, &call.seat);
         let system = prompts::system_prompt(role, &self.loaded, Some(&call.seat));
         let view = project(&self.log.journal, &call.seat, vis);
+        // Runde 9, E7: ein frisch (wieder) gestarteter Sitz kennt nichts —
+        // dann volles Lagebild statt Delta.
+        if !driver.keeps_context(&key) {
+            self.seen.remove(&key);
+        }
         let since = self.seen.get(&key).copied().unwrap_or(0);
         let situation = since == 0
             || self.cursor.phase == Phase::Briefing
@@ -1129,7 +1493,9 @@ impl MatrixRun {
         report.calls += 1;
         let mut last_error = String::new();
         for attempt in 0..=REPAIR_ATTEMPTS {
+            let mut kind = ForfeitKind::Technical;
             let answer = if self.is_cancelled() {
+                kind = ForfeitKind::Cancelled;
                 Err("Lauf abgebrochen".to_owned())
             } else {
                 let outcome = guarded(
@@ -1154,6 +1520,7 @@ impl MatrixRun {
                     }
                     Guarded::Cancelled => {
                         driver.abandon(&key);
+                        kind = ForfeitKind::Cancelled;
                         Err("Lauf abgebrochen".to_owned())
                     }
                 }
@@ -1167,13 +1534,13 @@ impl MatrixRun {
                     // Ein neues Kind kennt nichts — beim nächsten Mal volles Lagebild.
                     self.seen.remove(&key);
                     self.note(
-                        "forfeit",
+                        FORFEIT_NOTE,
                         format!(
-                            "Sitz `{key}` ({:?}): Aufruf fehlgeschlagen — {error}",
+                            "Sitz `{key}` ({:?}): {FAILED_CALL} — {error}",
                             call.contract
                         ),
                     )?;
-                    report.forfeits.push(key);
+                    report.push_forfeit(key, error, kind);
                     return Ok(None);
                 }
             };
@@ -1189,13 +1556,17 @@ impl MatrixRun {
             last_error = error;
         }
         self.note(
-            "forfeit",
+            FORFEIT_NOTE,
             format!(
-                "Sitz `{key}` ({:?}): Antwort auch nach Reparaturversuch ungültig — {last_error}",
+                "Sitz `{key}` ({:?}): {INVALID_ANSWER} — {last_error}",
                 call.contract
             ),
         )?;
-        report.forfeits.push(key);
+        report.push_forfeit(
+            key,
+            INVALID_ANSWER_CAUSE.to_owned(),
+            ForfeitKind::InvalidAnswer,
+        );
         Ok(None)
     }
 
@@ -1720,6 +2091,8 @@ impl MatrixRun {
             models: None,
         })
         .map_err(matrix_err)?;
+        // Runde 9, E7: jeder Verzicht mit seiner konkreten Ursache.
+        let markdown = with_forfeit_causes(markdown, &self.log.journal);
         if let Some(dir) = &self.run_dir {
             let path = dir.join(AAR_FILE);
             std::fs::write(&path, &markdown)
@@ -1740,6 +2113,99 @@ impl MatrixRun {
             self.report_path = Some(path);
         }
         Ok(())
+    }
+
+    // ── Recherche-Fakten (Plan R9) ─────────────────────────────────────────
+
+    /// Journalisiert einen recherchierten Fakt mit Belegen als öffentliche
+    /// Lage („Recherche-Inject“ bzw. Grundierung vor Runde 1).
+    ///
+    /// # Beschreibung
+    /// Der Game Master lässt eine eng gefasste Frage vom Web-Rechercheur
+    /// (`intel-web-researcher`) oder aus Repo-/Git-Belegen
+    /// (`evidence-collector`) beantworten und trägt das Ergebnis hier ein. Der
+    /// Eintrag ist ein [`EntryKind::FactAdded`] mit `sources`
+    /// (Audience öffentlich): alle Sitze sehen ihn als „Lage: … (Quelle: …)“
+    /// — die Sitze selbst bleiben offline. Vor Runde 1 (Runde 0) erscheint er
+    /// in der Ausgangslage jeder Sitz-Projektion. Ein Beobachter-Vermerk
+    /// `research` hält fest, dass der Fakt von außen kam.
+    ///
+    /// # Errors
+    /// [`OpError::InvalidArguments`] bei leerem Text, ohne Beleg, bei einem
+    /// Beleg ohne Fundstelle oder Abrufdatum, bei zu langen Texten und nach
+    /// Spielende; [`OpError::Execution`] bei Zustands- oder Schreibfehlern.
+    pub fn add_research_fact(
+        &mut self,
+        text: &str,
+        sources: Vec<FactSource>,
+    ) -> Result<String, OpError> {
+        let text = text.trim();
+        if text.is_empty() {
+            return Err(OpError::InvalidArguments(
+                "Recherche-Fakt braucht einen Text".to_owned(),
+            ));
+        }
+        if text.chars().count() > MAX_RESEARCH_FACT_CHARS {
+            return Err(OpError::InvalidArguments(format!(
+                "Recherche-Fakt ist länger als {MAX_RESEARCH_FACT_CHARS} Zeichen — kürzer fassen \
+                 oder in mehrere Fakten teilen"
+            )));
+        }
+        if sources.is_empty() {
+            return Err(OpError::InvalidArguments(
+                "Recherche-Fakt braucht mindestens eine Quelle (url, retrieved) — Annahmen \
+                 gehören ins Szenario, nicht in die Lage"
+                    .to_owned(),
+            ));
+        }
+        if sources.len() > MAX_RESEARCH_FACT_SOURCES {
+            return Err(OpError::InvalidArguments(format!(
+                "höchstens {MAX_RESEARCH_FACT_SOURCES} Quellen je Fakt"
+            )));
+        }
+        let mut cleaned = Vec::with_capacity(sources.len());
+        for source in sources {
+            let url = source.url.trim().to_owned();
+            let retrieved = source.retrieved.trim().to_owned();
+            if url.is_empty() || retrieved.is_empty() {
+                return Err(OpError::InvalidArguments(
+                    "jede Quelle braucht `url` (URL oder Workspace-Fundstelle) und `retrieved` \
+                     (Abrufdatum)"
+                        .to_owned(),
+                ));
+            }
+            if url.chars().count() > 500 || retrieved.chars().count() > 40 {
+                return Err(OpError::InvalidArguments(
+                    "Quelle zu lang (url höchstens 500, retrieved höchstens 40 Zeichen)".to_owned(),
+                ));
+            }
+            cleaned.push(FactSource {
+                url,
+                retrieved,
+                rating: source
+                    .rating
+                    .map(|rating| rating.trim().to_owned())
+                    .filter(|rating| !rating.is_empty() && rating.chars().count() <= 20),
+            });
+        }
+        if self.status == RunStatus::Ended {
+            return Err(OpError::InvalidArguments(
+                "Lauf ist beendet — keine neuen Fakten".to_owned(),
+            ));
+        }
+        let round = self.log.state.round;
+        let line = harw_matrix_game::state::sourced_fact_text(text, &cleaned);
+        self.record(GameEntry::new(
+            round,
+            Audience::Public,
+            EntryKind::FactAdded {
+                text: text.to_owned(),
+                sources: cleaned,
+            },
+        ))?;
+        self.note("research", format!("Runde {round}: {line}"))?;
+        self.flush()?;
+        Ok(line)
     }
 
     // ── Facilitator ─────────────────────────────────────────────────────────
@@ -2307,9 +2773,13 @@ pub fn entry_text(kind: &EntryKind, scenario: &Scenario) -> String {
         | EntryKind::PrivateNote { text, .. }
         | EntryKind::Forfeit { text, .. }
         | EntryKind::Narrated { text, .. }
-        | EntryKind::FactAdded { text }
         | EntryKind::InjectApplied { text, .. }
         | EntryKind::SuspicionRaised { text, .. } => text.clone(),
+        // Plan R9: ein recherchierter Fakt nennt seine Belege
+        // („Fakt (Quelle: URL, abgerufen …)“ im Bericht).
+        EntryKind::FactAdded { text, sources } => {
+            harw_matrix_game::state::sourced_fact_text(text, sources)
+        }
         EntryKind::BehaviorBriefing { faction, profile } => format!(
             "Verhaltensprofil {}: {} Regel(n), Risiko {:.1}, {} rote Linie(n)",
             scenario.display_name(faction),
@@ -2770,6 +3240,10 @@ mod tests {
     use super::*;
     use harw_matrix_game::scenario::load_scenario;
 
+    // Runde 9, E7: echter `SpawnerDriver`-Pfad in der Kette UIA → Game
+    // Master (Kind) → Sitze (`runner/tests/spawner_chain.rs`).
+    mod spawner_chain;
+
     type TestResult = Result<(), Box<dyn std::error::Error>>;
 
     const KARST: &str = include_str!("../../../harw-matrix-game/scenarios/karst-islands.toml");
@@ -2989,6 +3463,112 @@ mod tests {
         let briefing = run.step_with(&mut driver).await?;
         assert_eq!(briefing.phase, Phase::Briefing);
         assert_eq!(briefing.forfeits, vec!["gilde".to_owned()]);
+        Ok(())
+    }
+
+    /// Treiber, dessen Sitze alle an der Admission scheitern — wie im
+    /// Live-Lauf mit dem Game Master als Kind der UIA.
+    struct SpawnFailingDriver {
+        asked: usize,
+    }
+
+    /// Fehlertext aus dem Live-Lauf (Runde 9, E7).
+    const SPAWN_ERROR: &str = "Spawn fehlgeschlagen: unknown child parent: 891e693a";
+
+    impl SeatDriver for SpawnFailingDriver {
+        fn ask<'a>(&'a mut self, _request: SeatRequest<'a>) -> SeatFuture<'a> {
+            self.asked += 1;
+            Box::pin(async { Err(SPAWN_ERROR.to_owned()) })
+        }
+    }
+
+    /// Runde 9, E7: scheitert jeder Sitz einer Phase technisch, pausiert der
+    /// Lauf nach genau dieser Phase; Zusammenfassung, AAR und Bericht nennen
+    /// die konkrete Ursache (entdoppelt), nicht nur „gepasst“.
+    #[tokio::test]
+    async fn all_technical_forfeits_pause_the_run_and_name_the_cause() -> TestResult {
+        let tmp = tempfile::tempdir()?;
+        let loaded = load_scenario(KARST)?;
+        let seed = master_seed_for(&loaded, Some(7));
+        let mut run = MatrixRun::start(
+            loaded,
+            KARST.to_owned(),
+            None,
+            seed,
+            "technical-stop".to_owned(),
+            Some(tmp.path().join("lauf")),
+            false,
+            None,
+        )?;
+        let mut driver = SpawnFailingDriver { asked: 0 };
+        let briefing = run.step_with(&mut driver).await?;
+        assert_eq!(briefing.phase, Phase::Briefing);
+        assert_eq!(driver.asked, 5, "4 Spieler + Umpire");
+        assert_eq!(run.status(), RunStatus::Paused, "Lauf pausiert sofort");
+        let causes = briefing
+            .technical_stop
+            .as_deref()
+            .ok_or("technischer Abbruch fehlt")?;
+        assert_eq!(causes, SPAWN_ERROR, "Ursache genau einmal");
+        let summary = briefing.summary();
+        assert!(summary.contains(&format!("({SPAWN_ERROR})")), "{summary}");
+        for seat in ["rat", "gilde", "nord", "mission", "umpire"] {
+            assert!(summary.contains(seat), "{seat} fehlt: {summary}");
+        }
+        assert_eq!(
+            summary.matches(SPAWN_ERROR).count(),
+            1,
+            "Ursache entdoppelt: {summary}"
+        );
+        assert!(summary.contains("technischer Abbruch"), "{summary}");
+        assert!(run.log().journal.entries().any(|entry| matches!(
+            &entry.kind,
+            EntryKind::FacilitatorNote { command, detail }
+                if command == TECHNICAL_STOP_NOTE && detail.contains(SPAWN_ERROR)
+        )));
+
+        // Ein einzelner technischer Fehler neben gültigen Antworten hält den
+        // Lauf nicht an (siehe `failing_seat_forfeits_and_game_continues`);
+        // hier endet der Lauf regulär über das AAR.
+        run.request_end()?;
+        for _ in 0..3 {
+            if run.status() == RunStatus::Ended {
+                break;
+            }
+            run.step_with(&mut driver).await?;
+        }
+        assert_eq!(run.status(), RunStatus::Ended);
+        let aar = run.aar().ok_or("AAR fehlt")?;
+        assert!(aar.contains("## Verzichte und ihre Ursachen"), "{aar}");
+        assert!(aar.contains(SPAWN_ERROR), "{aar}");
+        let report_path = run.report_path().ok_or("report.md fehlt")?;
+        let report = std::fs::read_to_string(report_path)?;
+        assert!(report.contains("Technischer Abbruch im Lauf"), "{report}");
+        assert!(report.contains(SPAWN_ERROR), "{report}");
+        assert!(report.contains("technischer Fehler"), "{report}");
+        Ok(())
+    }
+
+    /// Runde 9, E7: ungültige Antworten sind Spielzüge, kein technischer
+    /// Fehler — auch wenn alle Sitze so passen, läuft das Spiel weiter.
+    #[tokio::test]
+    async fn invalid_answers_do_not_trigger_a_technical_stop() -> TestResult {
+        struct GarbageDriver;
+        impl SeatDriver for GarbageDriver {
+            fn ask<'a>(&'a mut self, _request: SeatRequest<'a>) -> SeatFuture<'a> {
+                Box::pin(async { Ok("kein JSON".to_owned()) })
+            }
+        }
+        let mut run = run()?;
+        let briefing = run.step_with(&mut GarbageDriver).await?;
+        assert_eq!(briefing.forfeits.len(), briefing.calls);
+        assert!(briefing.technical_stop.is_none());
+        assert_eq!(run.status(), RunStatus::Running);
+        assert!(
+            briefing.summary().contains(INVALID_ANSWER_CAUSE),
+            "{}",
+            briefing.summary()
+        );
         Ok(())
     }
 

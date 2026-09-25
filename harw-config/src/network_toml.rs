@@ -10,7 +10,9 @@
 //! der `researcher-web`-Rolle offen stehen
 //! ([`NetworkSection::researcher_web_hosts`] — Annahme A5 des Plans:
 //! `researcher-web` verliert `fs.*`/`deps.source_*`, bleibt aber auf eine
-//! eigene Web-Hostliste beschränkt). Durchsetzung (`harw_egress::EgressPolicy`,
+//! eigene Web-Hostliste beschränkt) und ob die Recherche-Rollen zusätzlich
+//! das offene öffentliche Web lesen dürfen ([`NetworkSection::research_web`],
+//! Plan R9: `"allowlist"` oder `"open"`). Durchsetzung (`harw_egress::EgressPolicy`,
 //! Landlock/netns) liegt beim Consumer; dieses Modul beschreibt nur die
 //! Konfiguration und deren Invarianten ([`NetworkSection::validate`]).
 //!
@@ -59,6 +61,55 @@ pub struct NetworkSection {
     /// Werkzeuge nicht implizit auch der Recherche-Rolle zufällt).
     #[serde(default)]
     pub researcher_web_hosts: Vec<String>,
+    /// Netz-Modus der Recherche-Rollen (`researcher-web`, `researcher`,
+    /// `dependency-researcher` und davon abgeleitete Agenten wie
+    /// `intel-web-researcher`):
+    /// - [`ResearchWebMode::Allowlist`] (Default, bisheriges Verhalten): nur
+    ///   die Hosts aus den Allowlists; leere Listen heißen kein Netz.
+    /// - [`ResearchWebMode::Open`]: zusätzlich jeder **öffentliche**
+    ///   DNS-Host, nur lesend (`GET`, ohne Zugangsdaten und Cookies).
+    ///   Private, Loopback- und Link-Local-Ziele bleiben immer gesperrt; unter
+    ///   `ask`/`auto` fragt der erste Abruf je Domain die Nutzerin (für die
+    ///   Sitzung gemerkt), unter `full` nicht.
+    #[serde(default)]
+    pub research_web: ResearchWebMode,
+}
+
+/// `[network].research_web` — Netz-Modus der Recherche-Rollen.
+///
+/// # Examples
+/// ```rust
+/// use harw_config::{NetworkSection, ResearchWebMode};
+///
+/// let section: NetworkSection = toml::from_str("research_web = \"open\"").unwrap();
+/// assert_eq!(section.research_web, ResearchWebMode::Open);
+/// assert_eq!(NetworkSection::default().research_web, ResearchWebMode::Allowlist);
+/// ```
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ResearchWebMode {
+    /// Nur die konfigurierten Allowlists (Default).
+    #[default]
+    Allowlist,
+    /// Öffentliches Web für Recherche-Rollen, mit Domain-Freigabe.
+    Open,
+}
+
+impl ResearchWebMode {
+    /// `true` für [`ResearchWebMode::Open`].
+    #[must_use]
+    pub const fn is_open(self) -> bool {
+        matches!(self, Self::Open)
+    }
+
+    /// Der Konfigurationswert (`"allowlist"` bzw. `"open"`).
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Allowlist => "allowlist",
+            Self::Open => "open",
+        }
+    }
 }
 
 impl NetworkSection {
@@ -104,6 +155,7 @@ mod tests {
         assert!(section.allow_hosts.is_empty());
         assert!(!section.allow_private);
         assert!(section.researcher_web_hosts.is_empty());
+        assert_eq!(section.research_web, ResearchWebMode::Allowlist);
         assert_eq!(section, NetworkSection::default());
         Ok(())
     }
@@ -145,6 +197,25 @@ mod tests {
             ));
         };
         assert!(error.to_string().contains("unknown field"));
+        Ok(())
+    }
+
+    #[test]
+    fn test_research_web_mode_parses_open_and_rejects_unknown_values() -> TestResult {
+        let section: NetworkSection =
+            toml::from_str("research_web = \"open\"").map_err(ctx("parse open"))?;
+        assert_eq!(section.research_web, ResearchWebMode::Open);
+        assert!(section.research_web.is_open());
+        let section: NetworkSection =
+            toml::from_str("research_web = \"allowlist\"").map_err(ctx("parse allowlist"))?;
+        assert_eq!(section.research_web, ResearchWebMode::Allowlist);
+        assert!(toml::from_str::<NetworkSection>("research_web = \"everything\"").is_err());
+        let encoded = toml::to_string(&NetworkSection {
+            research_web: ResearchWebMode::Open,
+            ..NetworkSection::default()
+        })
+        .map_err(ctx("encode"))?;
+        assert!(encoded.contains("research_web = \"open\""), "{encoded}");
         Ok(())
     }
 

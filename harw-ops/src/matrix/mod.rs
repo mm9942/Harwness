@@ -564,7 +564,7 @@ async fn step_once(
 }
 
 /// Grund, aus dem ein Durchlauf endete.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 enum StopReason {
     /// Gewünschte Rundenzahl erreicht.
     Rounds,
@@ -578,6 +578,9 @@ enum StopReason {
     Deadline,
     /// Sicherheitsnetz der Phasenzahl.
     StepCap,
+    /// Runde 9, E7: jeder Sitz-Aufruf einer Phase scheiterte technisch; der
+    /// Lauf ist pausiert. Inhalt: die entdoppelten Ursachen.
+    Technical(String),
 }
 
 /// Spielt bis zu `rounds` Runden (bis zum Rundenende) bzw. bis Spielende,
@@ -608,6 +611,11 @@ async fn advance(
         lines.push(report.summary());
         if report.ended {
             return Ok((lines, StopReason::Ended));
+        }
+        // Runde 9, E7: `step` hat den Lauf bereits pausiert und die Ursache
+        // journalisiert — keine weiteren Runden leerer Pässe.
+        if let Some(causes) = report.technical_stop {
+            return Ok((lines, StopReason::Technical(causes)));
         }
         if report.leaks > 0 {
             run.set_status(RunStatus::Paused);

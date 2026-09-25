@@ -26,6 +26,8 @@ pub mod handoff;
 // Runde 5, Teil N: Host-Mode-Anfrage aus dem Orchestrator-Baum.
 pub mod host_escalation_wiring;
 pub mod job_ledger;
+// Plan R9, Teil F: Job-Verwaltung der Sitzung und Zustellung ihrer Ereignisse.
+pub mod job_wiring;
 // Live-Modellwechsel: Kinder, Rollenwahl und Provider-Neubau ohne Neustart.
 pub mod live_model;
 pub mod mcp_wiring;

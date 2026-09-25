@@ -232,7 +232,7 @@ pub struct DefinitionAuthorCeiling {
 /// # Description
 /// `agents.write_definition` schreibt nur im Sonderfall `scope = "run"` mit
 /// leeren Rechte-Deltas sofort (nach `<project_agents_dir>/../state/runs/
-/// <run_id>/agents/<name>.toml`); sonst legt es — wie `agents.write_uia`
+/// <run_id>/agents/<name>/definition.toml`); sonst legt es — wie `agents.write_uia`
 /// immer — einen Vorschlag unter `profile_agents_dir/.proposals/<id>/` ab.
 ///
 /// # Concurrency
@@ -737,16 +737,57 @@ const DEFINITION_FILE_MODE: u32 = 0o644;
 /// Rechte-Bits der UIA-Bundle-Dateien (persönlich, nie welt-/gruppenlesbar).
 const UIA_FILE_MODE: u32 = 0o600;
 
+/// Der kanonische Ablageort einer Agentendefinition: `<dir>/<name>/definition.toml`
+/// — genau das Format, das `harw_config::discover_config` liest (Plan R9,
+/// Teil B). Bis Plan R9 schrieb [`commit_definition`] flach nach
+/// `<dir>/<name>.toml`; die Discovery liest solche Altdateien weiterhin (mit
+/// Warnung), siehe [`legacy_flat_definition_path`].
+fn definition_path(target_dir: &Path, name: &str) -> PathBuf {
+    target_dir.join(name).join("definition.toml")
+}
+
+/// Der alte, flache Ablageort `<dir>/<name>.toml` (nur noch gelesen).
+fn legacy_flat_definition_path(target_dir: &Path, name: &str) -> PathBuf {
+    target_dir.join(format!("{name}.toml"))
+}
+
+/// Die vorhandene Zieldatei für ein Diff: zuerst das Verzeichnisformat, sonst
+/// eine flache Altdatei.
+fn existing_definition_path(target_dir: &Path, name: &str) -> PathBuf {
+    let canonical = definition_path(target_dir, name);
+    if canonical.exists() {
+        return canonical;
+    }
+    let legacy = legacy_flat_definition_path(target_dir, name);
+    if legacy.exists() { legacy } else { canonical }
+}
+
 /// Schreibt eine einzelne Agentendefinition atomar nach
-/// `<target_dir>/<name>.toml`, sofern eine dort bereits vorhandene Datei
-/// dieselbe `id` trägt (sonst Fehler, siehe [`existing_definition_id`]).
+/// `<target_dir>/<name>/definition.toml` (siehe [`definition_path`]), sofern
+/// eine dort — oder in einer flachen Altdatei `<target_dir>/<name>.toml` —
+/// bereits vorhandene Definition dieselbe `id` trägt (sonst Fehler, siehe
+/// [`existing_definition_id`]).
+///
+/// Eine flache Altdatei mit derselben `id` wird nach erfolgreichem Schreiben
+/// entfernt, damit Discovery nicht zwei Stände derselben Definition sieht.
 fn commit_definition(
     target_dir: &Path,
     name: &str,
     toml_source: &str,
     new_id: &str,
 ) -> Result<PathBuf, String> {
-    let target_path = target_dir.join(format!("{name}.toml"));
+    let target_path = definition_path(target_dir, name);
+    let legacy_path = legacy_flat_definition_path(target_dir, name);
+    let legacy_id = existing_definition_id(&legacy_path)?;
+    if let Some(existing_id) = &legacy_id {
+        if existing_id != new_id {
+            return Err(format!(
+                "vorhandene Datei {} hat id '{existing_id}', neue Definition hat id '{new_id}' \
+                 — wird nicht überschrieben",
+                legacy_path.display()
+            ));
+        }
+    }
     if let Some(existing_id) = existing_definition_id(&target_path)? {
         if existing_id != new_id {
             return Err(format!(
@@ -762,6 +803,15 @@ fn commit_definition(
             target_path.display()
         )
     })?;
+    if legacy_id.is_some() {
+        if let Err(error) = std::fs::remove_file(&legacy_path) {
+            tracing::warn!(
+                path = %legacy_path.display(),
+                %error,
+                "agents.commit_definition.legacy_flat_file_not_removed"
+            );
+        }
+    }
     Ok(target_path)
 }
 
@@ -1125,7 +1175,7 @@ fn agents_write_definition_spec() -> ToolSpec {
         description: "Validiert eine Agentendefinition zwingend und berechnet die Rechte-Deltas \
              gegen die Urheber-Decke und die Basisrolle. Ein nicht-leeres Urheber-Delta lehnt \
              hart ab (nichts wird geschrieben, auch kein Vorschlag). Bei scope = \"run\" mit \
-             leeren Deltas wird sofort nach <project>/../state/runs/<run_id>/agents/<name>.toml \
+             leeren Deltas wird sofort nach <project>/../state/runs/<run_id>/agents/<name>/definition.toml \
              geschrieben (review_level \"none\"). Sonst wird immer nur ein Vorschlag abgelegt, \
              den die UIA über agents.commit_proposal freigeben muss (review_level \"uia\" oder \
              \"user_required\"). Freigabepflichtig."
@@ -1268,7 +1318,7 @@ impl AgentsWriteDefinitionExecutor {
         };
         let existing_target = target_dir
             .as_ref()
-            .map(|dir| dir.join(format!("{}.toml", args.name)));
+            .map(|dir| existing_definition_path(dir, &args.name));
         let review_level = review_level_for("definition", &evaluated.rights_delta_base_role);
         match propose_definition(
             profile_agents_dir,
@@ -2379,6 +2429,83 @@ mod tests {
             budget_tokens: 0,
             effort_cap: None,
         }
+    }
+
+    const COMMITTED_WORKER: &str = r#"
+schema = "harwness.agent/v1"
+id = "user.agent.note-taker@1"
+version = "1.0.0"
+extends = { id = "harwness.agent.worker-base@1" }
+role = "worker"
+specialization = "note-taker"
+
+[tools]
+admitted = ["fs.read"]
+"#;
+
+    #[test]
+    fn test_commit_definition_writes_the_directory_layout_discovery_reads() -> TestResult {
+        let home = tempfile::tempdir().map_err(ctx("tempdir"))?;
+        let agents = home.path().join("agents");
+        let path = commit_definition(
+            &agents,
+            "note-taker",
+            COMMITTED_WORKER,
+            "user.agent.note-taker@1",
+        )
+        .map_err(TestError::Unexpected)?;
+        assert_eq!(path, agents.join("note-taker").join("definition.toml"));
+
+        let config = harw_config::discover_config(&[home.path().to_path_buf()])
+            .map_err(ctx("discovery muss die committete Definition lesen"))?;
+        let ir = config
+            .executable_agents
+            .get("user.agent.note-taker@1")
+            .ok_or(TestError::Missing(
+                "committete Definition fehlt in der Discovery",
+            ))?;
+        assert_eq!(ir.specialization(), "note-taker");
+        Ok(())
+    }
+
+    #[test]
+    fn test_commit_definition_replaces_a_legacy_flat_file_with_the_same_id() -> TestResult {
+        let home = tempfile::tempdir().map_err(ctx("tempdir"))?;
+        let agents = home.path().join("agents");
+        std::fs::create_dir_all(&agents).map_err(ctx("agents"))?;
+        let legacy = agents.join("note-taker.toml");
+        std::fs::write(&legacy, COMMITTED_WORKER).map_err(ctx("Altdatei"))?;
+        assert_eq!(existing_definition_path(&agents, "note-taker"), legacy);
+
+        commit_definition(
+            &agents,
+            "note-taker",
+            COMMITTED_WORKER,
+            "user.agent.note-taker@1",
+        )
+        .map_err(TestError::Unexpected)?;
+        assert!(!legacy.exists(), "die flache Altdatei wird entfernt");
+        assert_eq!(
+            existing_definition_path(&agents, "note-taker"),
+            agents.join("note-taker").join("definition.toml")
+        );
+
+        // Eine Altdatei mit fremder ID wird nie überschrieben.
+        std::fs::write(
+            agents.join("other.toml"),
+            COMMITTED_WORKER.replace("note-taker@1", "other@1"),
+        )
+        .map_err(ctx("fremde Altdatei"))?;
+        assert!(
+            commit_definition(
+                &agents,
+                "other",
+                COMMITTED_WORKER,
+                "user.agent.note-taker@1"
+            )
+            .is_err()
+        );
+        Ok(())
     }
 
     #[test]

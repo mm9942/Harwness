@@ -1,0 +1,4 @@
+name = "method-validation"
+description = "Prüfen, ob eine Analysemethode wirklich funktioniert: Validität, Kalibrierung, Reproduzierbarkeit, Prozessqualität vs. Produktqualität, Rückschau- und Ergebnisfehler, Methodenbewertung mit Punktzahl und Begründung (method validation, calibration, reproducibility, process vs outcome, efficacy, audit)."
+instructions_file = "instructions.md"
+tools = ["filesystem.read"]

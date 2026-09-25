@@ -21,9 +21,17 @@
 # Kernfragen an die UIA.
 #
 # ── Tiefe / Budget ──────────────────────────────────────────────────────────
-# `max_depth = 1`: unter ihm entstehen nur die Sitz-Agenten (Worker); er
-# startet keine Orchestratoren und übergibt an keinen anderen Worker (die
-# Übergaben sind unten ausdrücklich verboten).
+# `max_depth = 1`: unter ihm entstehen nur Worker — die Sitz-Agenten (der
+# Runner startet sie mit einer Lesesicht ohne Netz) und, seit Plan R9, drei
+# Recherche-Worker für die Faktenlage (`[delegation].targets`):
+# `intel-web-researcher` (offenes Web mit Quellen; erbt `researcher-web`,
+# kein Workspace-Zugriff), `evidence-collector` und `evidence-critic`
+# (Repo-/Git-Belege, read-only). Ihre Befunde trägt er mit `matrix.add_fact`
+# als belegte öffentliche Lage ein; die Sitze bleiben offline. Er startet
+# keine Orchestratoren; Übergaben an die übrigen Rollen sind unten
+# ausdrücklich verboten. Sein Reducer bleibt `ReadOnly` (gilt nur für
+# `delegate_wave`, das er nicht führt); Handoff-Kinder erben seine Sandbox,
+# das Netz des Rechercheurs ist damit nie breiter als das der UIA-Wurzel.
 
 schema = "harwness.agent/v1"
 id = "harwness.agent.matrix-game-master@1"
@@ -66,9 +74,16 @@ admitted = [
   "matrix.start",
   "matrix.run",
   "matrix.finish",
+  # Plan R9: recherchierter Fakt mit Quellen als öffentliche Lage (ohne
+  # Freigabe, nur Journal des eigenen Laufs).
+  "matrix.add_fact",
   # Zwischenstand (info) oder eine der höchstens drei Kernfragen (question)
   # an die UIA (siehe `harw_registry_defaults::profile::parent_message_tools_for_role`).
   "parent.message",
+  # Plan R9, Teil A: Skills nur über den Katalog finden und laden
+  # (`harw_registry_defaults::profile::skill_catalog_tools_for_role`).
+  "skills.search",
+  "skills.load",
 ]
 forbidden = [
   "fs.write",
@@ -101,10 +116,23 @@ forbidden = [
 max_depth = 1
 child_orchestrators = []
 
+# Runde 9, E7: der Verbrauch der Sitz-Agenten wird dem Game Master
+# angerechnet (Tokens, Werkzeugaufrufe, Wanduhrzeit — `charge_run_usage`), und
+# ein erschöpftes Restbudget lehnt jede weitere Sitz-Admission ab. Ein ganzes
+# Spiel (bis zu sechs Sitze × fünf Phasen × mehrere Runden, Sitze werden bei
+# knappem Sitzungsbudget frisch gestartet) braucht deshalb deutlich mehr als
+# ein gewöhnlicher Orchestrator; `matrix.run` begrenzt jeden Aufruf zusätzlich
+# auf 25 Minuten.
 [spawn.budget]
-max_tokens = 120000
-max_tool_calls = 80
-max_wall_secs = 3600
+max_tokens = 1500000
+max_tool_calls = 600
+max_wall_secs = 14400
 
 [return]
 contract = "harwness.matrix.game-report@1"
+
+# Plan R9: die einzigen Delegationsziele des Game Masters — Recherche für
+# belegte Fakten (vor dem Szenario-Entwurf und als „Recherche-Inject“
+# zwischen Runden). Die Sitz-Rollen startet ausschließlich der Runner.
+[delegation]
+targets = ["intel-web-researcher", "evidence-collector", "evidence-critic"]

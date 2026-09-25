@@ -495,6 +495,65 @@ pub fn child_result_tools_for_role(role: &str) -> &'static [&'static str] {
     }
 }
 
+// ── Plan R9, Teil A: `skills.search` / `skills.load` ────────────────────────
+
+/// Die lesenden Skill-Katalog-Werkzeuge
+/// ([`crate::skill_tools::SkillCatalogToolProvider`]): `skills.search` findet
+/// Skills, `skills.load` lädt sie.
+///
+/// # Warum nicht Teil eines [`RegistryProfile`]
+/// Der Provider braucht den bei der Montage gebauten
+/// [`harw_catalog::SkillIndex`] (vertraute Config-Layer plus eingebettetes
+/// Bündel) — Zustand der Composition-Root. Sie hängt ihn an die Wurzel und an
+/// die Registry jeder Rolle aus [`skill_catalog_tools_for_role`]; die
+/// `SessionActivation` des Kindes schaltet die Werkzeuge nur frei, wenn seine
+/// Definition sie admittiert.
+///
+/// # Rechte
+/// Keine Sandbox-Rechteklasse (`tool_permission` liefert `None`), keine
+/// Freigabepflicht ([`crate::AUTO_APPROVED_TOOLS`], nie
+/// [`crate::ALWAYS_ASK_TOOLS`]): Lesen im Host-Prozess, ohne Workspace, Netz
+/// oder Prozess.
+pub const SKILL_CATALOG_TOOLS: &[&str] = &["skills.search", "skills.load"];
+
+/// Die eingebauten Rollen **ohne** Skill-Katalog: die vier
+/// Security-Triage-Rollen (bewusst werkzeuglos, `admitted = []`) und die vier
+/// Matrix-Sitze (feste, exakt geprüfte Leseflächen; ihre Anweisungen kommen
+/// vom Matrix-Runner).
+pub const SKILL_CATALOG_EXCLUDED_ROLES: &[&str] = &[
+    role_names::SECURITY_EGRESS_TRIAGE,
+    role_names::SECURITY_BASELINE_TRIAGE,
+    role_names::SECURITY_STRUCTURE_TRIAGE,
+    role_names::SECURITY_ENDPOINT_TRIAGE,
+    role_names::MATRIX_PLAYER,
+    role_names::MATRIX_UMPIRE,
+    role_names::MATRIX_MARKET,
+    role_names::MATRIX_REDCELL,
+];
+
+/// Liefert [`SKILL_CATALOG_TOOLS`] für jede Rolle außer
+/// [`SKILL_CATALOG_EXCLUDED_ROLES`] — also für UIA-Helfer, Worker,
+/// Orchestratoren, Stewards und den Game Master.
+///
+/// # Beispiele
+/// ```rust
+/// use harw_registry_defaults::profile::{role_names, skill_catalog_tools_for_role};
+///
+/// assert_eq!(
+///     skill_catalog_tools_for_role(role_names::EXPLORER),
+///     &["skills.search", "skills.load"]
+/// );
+/// assert!(skill_catalog_tools_for_role(role_names::MATRIX_PLAYER).is_empty());
+/// ```
+#[must_use]
+pub fn skill_catalog_tools_for_role(role: &str) -> &'static [&'static str] {
+    if SKILL_CATALOG_EXCLUDED_ROLES.contains(&role) {
+        &[]
+    } else {
+        SKILL_CATALOG_TOOLS
+    }
+}
+
 // ── Runde 5, Teil M: `agent.message` / `parent.message` ─────────────────────
 
 /// Das Werkzeug `agent.message` (`harw_core_bridge::AgentMessageOperation`,
@@ -653,9 +712,13 @@ pub fn sudo_tools_for_role(role: &str) -> &'static [&'static str] {
 /// Game Masters: `matrix.draft_scenario` (validiert ein Szenario und legt es
 /// unter `<profil>/knowledge/matrix/scenarios/` ab — harness-eigener
 /// Speicher, wie `plan.write` die Plan-Datei) und `matrix.status` (rein
-/// lesend). Beide deklarieren `model_tool(approval = "none")` und stehen in
+/// lesend). Plan R9: dazu `matrix.add_fact` — trägt einen recherchierten
+/// Fakt mit Belegen als öffentliche Lage ins Journal des eigenen Laufs ein
+/// (nur Matrix-Speicher, kein Workspace, kein Netz). Alle drei deklarieren
+/// `model_tool(approval = "none")` und stehen in
 /// [`crate::AUTO_APPROVED_TOOLS`].
-pub const MATRIX_GAME_MASTER_READ_TOOLS: &[&str] = &["matrix.draft_scenario", "matrix.status"];
+pub const MATRIX_GAME_MASTER_READ_TOOLS: &[&str] =
+    &["matrix.draft_scenario", "matrix.status", "matrix.add_fact"];
 
 /// Alle Werkzeuge des Game Masters in Provider-Reihenfolge
 /// (`harw_ops::matrix::game_master::game_master_operations`).
@@ -676,6 +739,8 @@ pub const MATRIX_GAME_MASTER_TOOLS: &[&str] = &[
     "matrix.start",
     "matrix.run",
     "matrix.finish",
+    // Plan R9: recherchierter Fakt mit Quellen als öffentliche Lage.
+    "matrix.add_fact",
 ];
 
 /// Liefert [`MATRIX_GAME_MASTER_TOOLS`] für [`role_names::MATRIX_GAME_MASTER`],
@@ -999,6 +1064,49 @@ const AGENT_DEFINITION_TOOLS: &[&str] = &[
 
 /// Die Werkzeuge von `harw-tool-shell`.
 pub(crate) const SHELL_TOOLS: &[&str] = &["shell.exec"];
+
+/// Plan R9, Teil F: die sechs Werkzeuge von `harw-tool-job`
+/// (`job.start/status/logs/stop/list/wait`) in Registrierungsreihenfolge.
+///
+/// # Beschreibung
+/// Stehen in jedem Profil direkt hinter [`SHELL_TOOLS`]: `job.start` läuft
+/// über einen Klon desselben `ShellToolProvider` (Profil, Permit-Ledger,
+/// Fragekanal, Host-PATH, Host-Lease), nur mit großzügigeren rlimits
+/// (`ShellLimits::for_jobs`). Tatsächlich montiert werden sie nur mit einer
+/// [`JobWiring`] (eine Job-Verwaltung je harw-Sitzung); ohne sie bleibt die
+/// Liste die statische Vertrags-Obermenge und nichts wird beworben (siehe
+/// [`assemble_registry_for_sandbox_with_definition_access_and_sandbox_profile_and_permits`]).
+pub const JOB_TOOLS: &[&str] = &harw_tool_job::JOB_TOOL_NAMES;
+
+/// Plan R9, Teil F: die Job-Werkzeuge der Orchestratoren (ohne Shell):
+/// `job.status/logs/stop/list/wait` — kein `job.start`.
+///
+/// # Warum nicht Teil eines [`RegistryProfile`]
+/// Wie [`SUDO_TOOLS`]: die Composition-Root hängt sie über
+/// [`JobWiring::control_provider`] an die Registry der Rollen aus
+/// [`job_control_tools_for_role`], sobald es eine Job-Verwaltung gibt.
+pub const JOB_CONTROL_TOOLS: &[&str] = &harw_tool_job::JOB_CONTROL_TOOLS;
+
+/// Liefert [`JOB_CONTROL_TOOLS`] für Orchestrator-Rollen
+/// ([`is_orchestrator_role`]), sonst nichts. Shell-Rollen bekommen `job.*`
+/// über ihr Profil ([`JOB_TOOLS`]).
+///
+/// # Beispiele
+/// ```rust
+/// use harw_registry_defaults::profile::{job_control_tools_for_role, role_names};
+///
+/// assert!(job_control_tools_for_role(role_names::ROOT_ORCHESTRATOR).contains(&"job.wait"));
+/// assert!(!job_control_tools_for_role(role_names::CODING_ORCHESTRATOR).contains(&"job.start"));
+/// assert!(job_control_tools_for_role(role_names::EXECUTOR).is_empty());
+/// ```
+#[must_use]
+pub fn job_control_tools_for_role(role: &str) -> &'static [&'static str] {
+    if is_orchestrator_role(role) {
+        JOB_CONTROL_TOOLS
+    } else {
+        &[]
+    }
+}
 
 /// Die typisierten LaTeX-Werkzeuge von `harw-tool-shell`
 /// (`harw_tool_shell::LatexToolProvider`), in Registrierungsreihenfolge des
@@ -1578,10 +1686,15 @@ impl RegistryProfile {
                 .chain(DOC_TOOLS.iter())
                 .chain(EXPLORER_TOOLS.iter())
                 .chain(SHELL_TOOLS.iter())
+                .chain(JOB_TOOLS.iter())
                 .chain(PROCESS_TOOLS.iter())
                 .copied()
                 .collect(),
-            RegistryProfile::ShellExecution => SHELL_TOOLS.to_vec(),
+            RegistryProfile::ShellExecution => SHELL_TOOLS
+                .iter()
+                .chain(JOB_TOOLS.iter())
+                .copied()
+                .collect(),
             RegistryProfile::ReadOnlyExplore => FS_READ_ONLY_TOOLS
                 .iter()
                 .chain(DOC_TOOLS.iter())
@@ -1628,6 +1741,7 @@ impl RegistryProfile {
                 .iter()
                 .chain(DOC_TOOLS.iter())
                 .chain(SHELL_TOOLS.iter())
+                .chain(JOB_TOOLS.iter())
                 .chain(DEPS_TOOLS.iter())
                 .chain(UIA_HELPER_WEB_TOOLS.iter())
                 .chain(UIA_QUICK_HELPER_BROWSER_TOOLS.iter())
@@ -1679,6 +1793,7 @@ impl RegistryProfile {
                 .iter()
                 .chain(DOC_TOOLS.iter())
                 .chain(SHELL_TOOLS.iter())
+                .chain(JOB_TOOLS.iter())
                 .copied()
                 .collect(),
             // Lesende Recherche mit Netz (siehe die Begründung bei
@@ -2230,6 +2345,77 @@ pub struct HostPermitWiring {
     /// `harw_tool_shell::DEFAULT_MAX_TIMEOUT_SECS`. Reist mit dieser
     /// Verdrahtung, weil sie jeden Shell-Provider (Wurzel und Kinder) erreicht.
     pub shell_max_timeout_secs: Option<u64>,
+    /// Plan R9, Teil F: die Job-Verwaltung der harw-Sitzung samt
+    /// Elternkette. `Some` montiert `job.*` neben jedem `shell.exec`
+    /// ([`JOB_TOOLS`]) und die Kontrollwerkzeuge der Orchestratoren
+    /// ([`JOB_CONTROL_TOOLS`]); reist wie `sudo_prompts` zu jeder
+    /// Kind-Fabrik. `None`: keine Job-Werkzeuge.
+    pub jobs: Option<JobWiring>,
+}
+
+/// Plan R9, Teil F: Job-Verwaltung und Elternkette für `job.*`.
+///
+/// # Beschreibung
+/// Eine [`harw_tool_job::JobManager`] je harw-Sitzung (Wurzel und alle
+/// Kinder teilen sie); die Elternkette ([`harw_tool_job::JobLineage`])
+/// liefert der Agentenbaum der Montage. Besitz eines Jobs: Erzeuger plus
+/// Vorfahren (die aufrufende Sitzung kommt aus dem Ausführungskontext).
+#[derive(Clone)]
+pub struct JobWiring {
+    /// Die Job-Verwaltung der Sitzung.
+    pub manager: Arc<harw_tool_job::JobManager>,
+    /// Elternkette einer Agenten-Sitzung (Besitz und Weiterleitung).
+    pub lineage: Arc<dyn harw_tool_job::JobLineage>,
+}
+
+impl std::fmt::Debug for JobWiring {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("JobWiring")
+            .field("manager", &self.manager)
+            .finish_non_exhaustive()
+    }
+}
+
+impl JobWiring {
+    /// Bündelt Verwaltung und Elternkette.
+    #[must_use]
+    pub fn new(
+        manager: Arc<harw_tool_job::JobManager>,
+        lineage: Arc<dyn harw_tool_job::JobLineage>,
+    ) -> Self {
+        Self { manager, lineage }
+    }
+
+    /// Die sechs `job.*`-Werkzeuge über einem Klon von `shell`.
+    ///
+    /// # Beschreibung
+    /// `job.start` geht durch
+    /// `ShellToolProvider::prepare_background_launch` desselben (geklonten)
+    /// Providers — Profil, Permit-Ledger, Fragekanal, Host-PATH und
+    /// Host-Lease verhalten sich wie bei `shell.exec`. Nur die rlimits sind
+    /// die großzügigen Job-Grenzen ([`harw_tool_shell::ShellLimits::for_jobs`]:
+    /// kein Adressraum- und kein Dateigrößen-Deckel; die CPU-Grenze wächst
+    /// mit dem CPU-Budget der Verwaltung wie bei `shell.exec`).
+    #[must_use]
+    pub fn tool_provider(&self, shell: &ShellToolProvider) -> harw_tool_job::JobToolProvider {
+        let mut launcher_shell = shell.clone();
+        launcher_shell.limits = harw_tool_shell::ShellLimits::for_jobs();
+        harw_tool_job::job_tools(
+            Arc::clone(&self.manager),
+            Arc::new(harw_tool_job::ShellJobLauncher::new(launcher_shell)),
+            Arc::clone(&self.lineage),
+        )
+    }
+
+    /// Nur [`JOB_CONTROL_TOOLS`] (lesen, warten, stoppen — kein
+    /// `job.start`) für Orchestratoren ohne Shell. Der Startweg ist ein
+    /// Sandbox-Standard-Shell-Provider, aber über den Filter nie erreichbar.
+    #[must_use]
+    pub fn control_provider(&self) -> Arc<dyn ToolProvider> {
+        let provider: Arc<dyn ToolProvider> =
+            Arc::new(self.tool_provider(&ShellToolProvider::default()));
+        Arc::new(RestrictedToolProvider::new(provider, JOB_CONTROL_TOOLS))
+    }
 }
 
 impl HostPermitWiring {
@@ -2249,7 +2435,16 @@ impl HostPermitWiring {
             sudo_prompts: None,
             host_escalation: None,
             shell_max_timeout_secs: None,
+            jobs: None,
         }
+    }
+
+    /// Plan R9, Teil F: hängt die Job-Verwaltung an (`job.*` neben jedem
+    /// `shell.exec`, Kontrollwerkzeuge für Orchestratoren).
+    #[must_use]
+    pub fn with_jobs(mut self, jobs: Option<JobWiring>) -> Self {
+        self.jobs = jobs;
+        self
     }
 
     /// Runde 5, Teil N: hängt die Verdrahtung für Host-Mode-Anfragen an
@@ -2325,7 +2520,7 @@ fn profile_tool_providers(
     // weiterhin ausschließlich, ob die angehängte Registry eine aktive
     // Sitzungs- oder Einmalfreigabe für die aufrufende Session meldet — ohne
     // eine solche Freigabe läuft der Aufruf unverändert in bwrap.
-    let build_shell_provider = |sandbox_profile: &SandboxProfile| -> Arc<dyn ToolProvider> {
+    let build_shell = |sandbox_profile: &SandboxProfile| -> ShellToolProvider {
         let mut provider =
             ShellToolProvider::default().with_sandbox_profile(sandbox_profile.clone());
         if let Some(wiring) = host_permits {
@@ -2343,7 +2538,20 @@ fn profile_tool_providers(
                 provider = provider.with_max_timeout_secs(max_timeout_secs);
             }
         }
-        Arc::new(provider)
+        provider
+    };
+    // Plan R9, Teil F: `shell.exec` plus — mit Job-Verdrahtung — direkt
+    // dahinter `job.*` über einem Klon **desselben** Shell-Providers
+    // ([`JobWiring::tool_provider`]); Reihenfolge wie [`JOB_TOOLS`] hinter
+    // [`SHELL_TOOLS`] in [`RegistryProfile::registered_tool_names`].
+    let build_shell_providers = |sandbox_profile: &SandboxProfile| -> Vec<Arc<dyn ToolProvider>> {
+        let shell = build_shell(sandbox_profile);
+        let jobs = host_permits
+            .and_then(|wiring| wiring.jobs.as_ref())
+            .map(|jobs| Arc::new(jobs.tool_provider(&shell)) as Arc<dyn ToolProvider>);
+        let mut providers: Vec<Arc<dyn ToolProvider>> = vec![Arc::new(shell)];
+        providers.extend(jobs);
+        providers
     };
     // Der read-only Anteil ist für drei Profile identisch: der gefilterte
     // FS-Provider plus der lesende Doc-Provider (`doc.read_pdf`, Anbindung
@@ -2365,11 +2573,14 @@ fn profile_tool_providers(
             let filesystem: Arc<dyn ToolProvider> = Arc::new(FsToolProvider::default());
             let doc: Arc<dyn ToolProvider> = Arc::new(DocToolProvider);
             let explorer: Arc<dyn ToolProvider> = Arc::new(ExplorerToolProvider::new());
-            let shell = build_shell_provider(sandbox_profile);
+            let shell = build_shell_providers(sandbox_profile);
             let process: Arc<dyn ToolProvider> = Arc::new(ProcessToolProvider::new());
-            vec![filesystem, doc, explorer, shell, process]
+            let mut providers = vec![filesystem, doc, explorer];
+            providers.extend(shell);
+            providers.push(process);
+            providers
         }
-        RegistryProfile::ShellExecution => vec![build_shell_provider(sandbox_profile)],
+        RegistryProfile::ShellExecution => build_shell_providers(sandbox_profile),
         // Der Web-Provider wird auf `EXPLORER_WEB_TOOLS` gefiltert, damit
         // `web.docs_rs`/`web.crates_io` nicht per Namensraten erreichbar sind.
         RegistryProfile::ReadOnlyExplore => {
@@ -2419,13 +2630,17 @@ fn profile_tool_providers(
                 FS_READ_ONLY_TOOLS,
             ));
             let doc: Arc<dyn ToolProvider> = Arc::new(DocToolProvider);
-            let shell = build_shell_provider(sandbox_profile);
+            let shell = build_shell_providers(sandbox_profile);
             let dependencies: Arc<dyn ToolProvider> = Arc::new(DepsToolProvider::new());
             let web: Arc<dyn ToolProvider> = Arc::new(RestrictedToolProvider::new(
                 Arc::new(WebToolProvider::new()),
                 UIA_HELPER_WEB_TOOLS,
             ));
-            vec![filesystem, doc, shell, dependencies, web]
+            let mut providers = vec![filesystem, doc];
+            providers.extend(shell);
+            providers.push(dependencies);
+            providers.push(web);
+            providers
         }
         // `agent-steward` (Addendum K + Nachtrag K/K2/K3): gefilterter,
         // lesender FS-Provider + der Agentendefinitions-Provider, dessen
@@ -2528,8 +2743,9 @@ fn profile_tool_providers(
                 FS_READ_ONLY_TOOLS,
             ));
             let doc: Arc<dyn ToolProvider> = Arc::new(DocToolProvider);
-            let shell = build_shell_provider(&SandboxProfile::Host);
-            vec![filesystem, doc, shell]
+            let mut providers = vec![filesystem, doc];
+            providers.extend(build_shell_providers(&SandboxProfile::Host));
+            providers
         }
         // Lesende Recherche mit Netz: gefilterter, lesender FS-Provider +
         // lesender Doc-Provider + Explorer-Provider + auf
@@ -3321,9 +3537,13 @@ mod tests {
                 continue;
             }
             let assembled = assemble(*profile)?;
+            // Plan R9, Teil F: `job.*` montiert nur eine `JobWiring`;
+            // `assemble()` hat keine (siehe
+            // `test_job_tools_follow_shell_exec_with_job_wiring`).
             let expected: Vec<String> = profile
                 .registered_tool_names()
                 .iter()
+                .filter(|name| !JOB_TOOLS.contains(name))
                 .map(|name| (*name).to_owned())
                 .collect();
             assert_eq!(
@@ -3483,6 +3703,7 @@ mod tests {
             "web.search",
         ];
         let quick = registered_names(&assemble(RegistryProfile::UiaQuickHelper)?);
+        // Ohne `JobWiring` (`assemble`) montiert kein Profil `job.*`.
         let mut expected_quick: Vec<&str> = FS_READ_ONLY_TOOLS
             .iter()
             .chain(DOC_TOOLS.iter())
@@ -3934,9 +4155,11 @@ mod tests {
                 continue;
             }
             let assembled = assemble(*profile)?;
+            // Plan R9, Teil F: ohne `JobWiring` wird `job.*` nicht beworben.
             let expected: Vec<String> = profile
                 .tool_names()
                 .iter()
+                .filter(|name| !JOB_TOOLS.contains(name))
                 .map(|name| (*name).to_owned())
                 .collect();
             assert_eq!(
@@ -4220,6 +4443,118 @@ mod tests {
         assert!(wiring.with_sudo_prompts(Some(sudo)).sudo_prompts.is_some());
     }
 
+    /// Plan R9, Teil F: jedes Profil mit `shell.exec` bewirbt direkt dahinter
+    /// die sechs `job.*`-Werkzeuge; kein Profil ohne Shell tut das.
+    #[test]
+    fn test_shell_profiles_carry_job_tools_right_after_shell_exec() {
+        for profile in RegistryProfile::ALL {
+            let names = profile.registered_tool_names();
+            match names.iter().position(|name| *name == "shell.exec") {
+                Some(index) => assert_eq!(
+                    &names[index + 1..index + 1 + JOB_TOOLS.len()],
+                    JOB_TOOLS,
+                    "{profile:?}"
+                ),
+                None => {
+                    for tool in JOB_TOOLS {
+                        assert!(!names.contains(tool), "{profile:?}: {tool} ohne Shell");
+                    }
+                }
+            }
+        }
+        // Orchestratoren (ohne Shell) bekommen nur die Kontrollwerkzeuge.
+        for role in role_names::ALL {
+            let expected: &[&str] = if is_orchestrator_role(role) {
+                JOB_CONTROL_TOOLS
+            } else {
+                &[]
+            };
+            assert_eq!(job_control_tools_for_role(role), expected, "{role}");
+        }
+        assert!(!JOB_CONTROL_TOOLS.contains(&"job.start"));
+    }
+
+    /// Plan R9, Teil F: mit `JobWiring` montiert jedes Shell-Profil `job.*`
+    /// direkt hinter `shell.exec` — die statische Liste stimmt dann exakt
+    /// mit der Registry überein.
+    #[test]
+    fn test_job_tools_follow_shell_exec_with_job_wiring() -> TestResult {
+        let dir = tempfile::tempdir().map_err(ctx("tempdir"))?;
+        let manager = harw_tool_job::JobManager::new(
+            harw_tool_job::JobManagerConfig::new(dir.path()),
+            Arc::new(harw_tool_job::NoopNotifier),
+        )
+        .map_err(ctx("job manager"))?;
+        let (sender, _receiver) = harw_tool_shell::host_permit_prompt_channel();
+        let wiring = HostPermitWiring::new(
+            Arc::new(ProcessPermitLedger::default()),
+            Arc::new(HostPermitSessionRegistry::default()),
+            sender,
+        )
+        .with_jobs(Some(JobWiring::new(
+            manager,
+            Arc::new(harw_tool_job::NoLineage),
+        )));
+        let cwd = std::env::current_dir().map_err(ctx("cwd"))?;
+        let project = harw_project_discovery::discover_project(
+            &cwd,
+            &harw_project_discovery::DiscoveryConfig::default(),
+        )
+        .map_err(ctx("discover"))?;
+        for profile in [
+            RegistryProfile::Full,
+            RegistryProfile::ShellExecution,
+            RegistryProfile::UiaShellWorker,
+            RegistryProfile::ReadOnlyExplore,
+        ] {
+            let granted = profile.required_permissions();
+            let assembled =
+                assemble_registry_for_sandbox_with_definition_access_and_sandbox_profile_and_permits(
+                    profile,
+                    &project,
+                    IdentityOverrides::default(),
+                    ApprovalModeCell::default(),
+                    &granted,
+                    None,
+                    &SandboxProfile::default(),
+                    Some(wiring.clone()),
+                )
+                .map_err(ctx("assemble with job wiring"))?;
+            let expected: Vec<String> = profile
+                .registered_tool_names()
+                .iter()
+                .map(|name| (*name).to_owned())
+                .collect();
+            assert_eq!(registered_names(&assembled), expected, "{profile:?}");
+            assert_eq!(assembled.identity.tools_available, expected, "{profile:?}");
+        }
+        // Orchestratoren: nur lesen, warten, stoppen.
+        let jobs = wiring
+            .jobs
+            .as_ref()
+            .ok_or(TestError::Missing("job wiring"))?;
+        let control: Vec<String> = jobs
+            .control_provider()
+            .tools()
+            .iter()
+            .map(|spec| spec.name().to_owned())
+            .collect();
+        let mut expected_control: Vec<String> = JOB_CONTROL_TOOLS
+            .iter()
+            .map(|name| (*name).to_owned())
+            .collect();
+        expected_control.sort();
+        let mut control_sorted = control.clone();
+        control_sorted.sort();
+        assert_eq!(control_sorted, expected_control);
+        assert!(
+            jobs.control_provider()
+                .executor(&ToolName::new("job.start"))
+                .is_none()
+        );
+        Ok(())
+    }
+
     /// Plan Teil D: die lesenden Wissenswerkzeuge sind ausnahmslos
     /// `ReadWorkspace`, von keinem Profil selbst registriert und nur für die
     /// dokumentierten Leserollen angeboten; Workbench/Diary/Palace sind
@@ -4301,6 +4636,8 @@ mod tests {
             "doc.read_pdf",
         ]
         .into_iter()
+        // Plan R9, Teil F: `job.*` gehört zu jedem `shell.exec`.
+        .chain(JOB_TOOLS.iter().copied())
         .collect();
         assert_eq!(advertised, expected);
         assert!(!RegistryProfile::UiaShellWorker.is_read_only());
@@ -4442,7 +4779,7 @@ mod tests {
         let discovered: BTreeSet<&str> = crate::embedded_agents::builtin_agent_toml()
             .iter()
             .map(|(name, _)| *name)
-            .filter(|name| *name != crate::embedded_agents::WORKER_BASE_NAME)
+            .filter(|name| !crate::embedded_agents::BASE_DEFINITION_NAMES.contains(name))
             .filter(|name| !PENDING_EXCLUSIONS.contains(name))
             .collect();
 

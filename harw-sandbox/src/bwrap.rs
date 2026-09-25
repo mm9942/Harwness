@@ -814,6 +814,119 @@ impl BwrapLauncher {
         Ok(BwrapCommandPlan { args })
     }
 
+    /// Plant einen **rein lesenden** Hilfsprozess mit festem argv (z. B. das
+    /// `diff`-Werkzeug mit `git diff/status/log/show/rev-parse`).
+    ///
+    /// # Beschreibung
+    /// Anders als [`Self::plan`] verlangt dieser Plan nur
+    /// [`Permission::ReadWorkspace`], nicht `ExecuteProcess`: der Aufrufer
+    /// startet kein vom Modell bestimmtes Programm, sondern ein festes,
+    /// lesendes Werkzeug — dasselbe Recht, mit dem `fs.read` den Workspace
+    /// liest. Damit das kein Hintertürchen für Ausführung wird, ist der Plan
+    /// strenger als jeder `plan`-Plan und unabhängig von der
+    /// Launcher-Konfiguration:
+    /// - Workspace **immer** `--ro-bind` (auch mit `WriteWorkspace`), kein
+    ///   anderer beschreibbarer Host-Pfad; `/tmp` ist ein leeres tmpfs;
+    /// - immer `--unshare-all --unshare-net` (kein Netz, auch kein Proxy),
+    ///   `--clearenv`, Minimal-`PATH`, `HOME=/tmp/home`;
+    /// - nur `/usr`, `/bin`, `/lib`, `/lib64` und die NSS-Dateien nur lesend;
+    ///   keine Cargo-/tmux-/Host-`PATH`-/Zusatzpfad-Bindungen;
+    /// - `env` wird nach `--clearenv` gesetzt (nur feste Paare des Aufrufers).
+    ///
+    /// Code, den ein Repository über Konfiguration auslösen könnte (Filter,
+    /// Hooks), liefe damit in einer netzlosen Sandbox ohne Schreibzugriff.
+    ///
+    /// # Errors
+    /// - [`SandboxError::ProcessExecutionDenied`], wenn `ReadWorkspace` fehlt.
+    /// - [`SandboxError::MissingSandboxCommand`], wenn `command` leer ist.
+    /// - [`SandboxError::InvalidSandboxWorkspaceDestination`], wenn der
+    ///   Workspace-Pfad ungültig ist.
+    pub fn plan_read_only(
+        &self,
+        sandbox: &SandboxSpec,
+        env: &[(&str, &str)],
+        command: &[OsString],
+    ) -> SandboxResult<BwrapCommandPlan> {
+        if !sandbox.permissions().contains(Permission::ReadWorkspace) {
+            return Err(SandboxError::ProcessExecutionDenied);
+        }
+        if command.is_empty() {
+            return Err(SandboxError::MissingSandboxCommand);
+        }
+        let workspace = sandbox.workspace().canonical_root();
+        let mut args = vec![
+            OsString::from("--die-with-parent"),
+            OsString::from("--new-session"),
+            OsString::from("--unshare-all"),
+            OsString::from("--unshare-net"),
+        ];
+        if let Some((uid, gid)) = self.identity.or_else(resolve_process_identity) {
+            args.extend([
+                OsString::from("--unshare-user"),
+                OsString::from("--uid"),
+                OsString::from(uid.to_string()),
+                OsString::from("--gid"),
+                OsString::from(gid.to_string()),
+            ]);
+        }
+        args.extend(
+            [
+                "--clearenv",
+                "--proc",
+                "/proc",
+                "--dev",
+                "/dev",
+                "--tmpfs",
+                "/tmp",
+                "--dir",
+                "/tmp/home",
+                "--setenv",
+                "HOME",
+                "/tmp/home",
+                "--setenv",
+                "PATH",
+                "/usr/local/bin:/usr/bin:/bin",
+            ]
+            .map(OsString::from),
+        );
+        for (name, value) in env {
+            args.extend([
+                OsString::from("--setenv"),
+                OsString::from(name),
+                OsString::from(value),
+            ]);
+        }
+        for directory in ["/usr", "/bin", "/lib", "/lib64"] {
+            let path = Path::new(directory);
+            if path.exists() {
+                args.extend([
+                    OsString::from("--ro-bind"),
+                    path.as_os_str().to_owned(),
+                    path.as_os_str().to_owned(),
+                ]);
+            }
+        }
+        append_destination_dirs(&mut args, Path::new("/etc"))?;
+        for nss_file in ["/etc/passwd", "/etc/group", "/etc/nsswitch.conf"] {
+            args.extend([
+                OsString::from("--ro-bind-try"),
+                OsString::from(nss_file),
+                OsString::from(nss_file),
+            ]);
+        }
+        append_destination_dirs(&mut args, workspace)?;
+        args.extend([
+            OsString::from("--ro-bind"),
+            workspace.as_os_str().to_owned(),
+            workspace.as_os_str().to_owned(),
+            OsString::from("--chdir"),
+            workspace.as_os_str().to_owned(),
+            OsString::from("--"),
+        ]);
+        args.extend(command.iter().cloned());
+        Ok(BwrapCommandPlan { args })
+    }
+
     /// Executes a previously checked command through Bubblewrap. The plan is
     /// deliberately built first so callers can audit/log its non-secret mount
     /// shape before process creation.
@@ -1250,6 +1363,50 @@ mod tests {
         assert!(args.contains(&"--unshare-all".to_owned()));
         assert!(!args.contains(&"--share-net".to_owned()));
         assert!(args.contains(&"--ro-bind".to_owned()));
+        Ok(())
+    }
+
+    #[test]
+    fn read_only_helper_plan_needs_only_read_workspace_and_never_writes() -> TestResult {
+        // Ohne `ExecuteProcess` (Plan-/Explore-Modus), aber auch mit
+        // `WriteWorkspace`: der Workspace bleibt `--ro-bind`, kein Netz.
+        for permissions in [
+            vec![Permission::ReadWorkspace],
+            vec![
+                Permission::ReadWorkspace,
+                Permission::WriteWorkspace,
+                Permission::NetworkAccess,
+            ],
+        ] {
+            let spec = sandbox(PermissionSet::from_policy(permissions))?;
+            let workspace = spec.workspace().canonical_root().display().to_string();
+            let plan = BwrapLauncher::default()
+                .plan_read_only(
+                    &spec,
+                    &[("GIT_OPTIONAL_LOCKS", "0")],
+                    &[OsString::from("/usr/bin/git"), OsString::from("status")],
+                )
+                .map_err(TestError::Sandbox)?;
+            let args = strings(&plan);
+            assert!(args.contains(&"--unshare-net".to_owned()));
+            assert!(!args.contains(&"--bind".to_owned()), "{args:?}");
+            assert!(
+                args.windows(3)
+                    .any(|w| w[0] == "--ro-bind" && w[1] == workspace && w[2] == workspace),
+                "{args:?}"
+            );
+            assert!(
+                args.windows(3)
+                    .any(|w| w == ["--setenv", "GIT_OPTIONAL_LOCKS", "0"]),
+                "{args:?}"
+            );
+            assert_eq!(args.last().map(String::as_str), Some("status"));
+        }
+        let denied = sandbox(PermissionSet::from_policy([Permission::ExecuteProcess]))?;
+        assert!(matches!(
+            BwrapLauncher::default().plan_read_only(&denied, &[], &[OsString::from("/bin/true")]),
+            Err(SandboxError::ProcessExecutionDenied)
+        ));
         Ok(())
     }
 

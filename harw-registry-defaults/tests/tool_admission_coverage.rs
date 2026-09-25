@@ -64,6 +64,10 @@ use harw_registry_defaults::profile::{
 };
 // Runde 7, Teil M: die Matrix-Werkzeuge des Game Masters ebenso.
 use harw_registry_defaults::profile::{MATRIX_GAME_MASTER_TOOLS, matrix_tools_for_role};
+// Plan R9, Teil A: `skills.search`/`skills.load` ebenso.
+use harw_registry_defaults::profile::{
+    SKILL_CATALOG_EXCLUDED_ROLES, SKILL_CATALOG_TOOLS, skill_catalog_tools_for_role,
+};
 
 mod common;
 use common::{TestError, TestResult, ctx};
@@ -116,6 +120,14 @@ fn every_role_admitted_tool_is_registered_by_its_profile() -> TestResult {
             .chain(parent_message_tools_for_role(role).iter().copied())
             // Runde 7, Teil M: `matrix.*` (nur Game Master).
             .chain(matrix_tools_for_role(role).iter().copied())
+            // Plan R9, Teil A: `skills.search`/`skills.load` (Skill-Katalog).
+            .chain(skill_catalog_tools_for_role(role).iter().copied())
+            // Plan R9, Teil F: Job-Kontrolle der Orchestratoren.
+            .chain(
+                harw_registry_defaults::profile::job_control_tools_for_role(role)
+                    .iter()
+                    .copied(),
+            )
             .collect();
 
         for admitted in ir.tool_surface().admitted() {
@@ -286,6 +298,8 @@ fn agent_steward_admits_the_commit_mode_tool_set_even_though_two_tools_are_mode_
         .iter()
         .map(String::as_str)
         .filter(|tool| !PARENT_MESSAGE_TOOLS.contains(tool))
+        // Plan R9, Teil A: der Skill-Katalog wird unabhängig vom Profil montiert.
+        .filter(|tool| !matches!(*tool, "skills.search" | "skills.load"))
         .collect();
 
     let profile = profile_for_role(role_names::AGENT_STEWARD)
@@ -611,6 +625,8 @@ fn uia_latex_writer_admits_exactly_files_pdf_and_latex_build() -> TestResult {
     // (reiner Text an den Elternteil, keine Rechteklasse).
     let mut expected_admitted = expected.clone();
     expected_admitted.extend(PARENT_MESSAGE_TOOLS.iter().copied());
+    // Plan R9, Teil A: dazu der Skill-Katalog (ohne Rechteklasse).
+    expected_admitted.extend(SKILL_CATALOG_TOOLS.iter().copied());
     assert_eq!(admitted, expected_admitted, "{role}: admitted");
     assert_eq!(advertised, expected, "{profile:?}: beworben");
     let forbidden: BTreeSet<&str> = ir
@@ -638,18 +654,10 @@ fn uia_latex_writer_admits_exactly_files_pdf_and_latex_build() -> TestResult {
         Some("harwness.return.execution-summary@1"),
         "{role}"
     );
-    // Runde 7, Teil T5: die vier Skills sind fest an die Rolle gebunden
-    // (Vorlage, Handwerk, Build, Pyramide), das Budget ist realistisch.
-    assert_eq!(
-        ir.skills(),
-        [
-            "latex-report",
-            "latex-writing",
-            "xelatex-compile",
-            "business-writing-pyramid"
-        ],
-        "{role}: skills"
-    );
+    // Runde 7, Teil T5 / Plan R9: nur `latex-report` (Vorlage, Werkzeuge,
+    // Übergabe) ist fest gebunden; Handwerk, Build und Pyramide lädt der
+    // Writer bei Bedarf über `skills.load`. Das Budget ist realistisch.
+    assert_eq!(ir.skills(), ["latex-report"], "{role}: skills");
     let budget = ir
         .spawn_contract()
         .budget()
@@ -885,6 +893,8 @@ fn game_master_admits_exactly_its_matrix_tools() -> TestResult {
     ]
     .into_iter()
     .chain(MATRIX_GAME_MASTER_TOOLS.iter().copied())
+    // Plan R9, Teil A: Skill-Katalog (ohne Rechteklasse).
+    .chain(SKILL_CATALOG_TOOLS.iter().copied())
     .collect();
     assert_eq!(admitted, expected, "{role}");
     assert_eq!(profile_for_role(role), Some(RegistryProfile::MatrixReader));
@@ -922,4 +932,102 @@ fn game_master_admits_exactly_its_matrix_tools() -> TestResult {
         assert!(matrix_tools_for_role(other).is_empty(), "{other}");
     }
     Ok(())
+}
+
+/// Plan R9, Teil A: jede eingebaute Rolle außer den dokumentierten
+/// Ausnahmen (werkzeuglose Security-Triage, Matrix-Sitze) admittiert
+/// `skills.search` und `skills.load` und verbietet keines davon — sonst hängt
+/// die Kind-Registry den Katalog-Provider an, den die deny-by-default-
+/// Aktivierung nie freischaltet, und der Agent könnte Skills nur raten. Die
+/// Ausnahmen admittieren keines. Beide Werkzeuge gehören zu keinem
+/// `RegistryProfile` und tragen keine Sandbox-Rechteklasse.
+#[test]
+fn every_role_admits_the_skill_catalog_tools_except_the_documented_ones() -> TestResult {
+    let roles = resolved_roles()?;
+    for role in role_names::ALL {
+        let ir = roles
+            .get(*role)
+            .ok_or(TestError::Unexpected(format!("{role} fehlt")))?;
+        let excluded = SKILL_CATALOG_EXCLUDED_ROLES.contains(role);
+        assert_eq!(
+            skill_catalog_tools_for_role(role).is_empty(),
+            excluded,
+            "{role}: Angebot"
+        );
+        for tool in SKILL_CATALOG_TOOLS {
+            assert_eq!(
+                ir.tool_surface().admitted().iter().any(|name| name == tool),
+                !excluded,
+                "{role}: {tool} admittiert"
+            );
+            assert!(
+                !ir.tool_surface()
+                    .forbidden()
+                    .iter()
+                    .any(|name| name == tool),
+                "{role} verbietet {tool}"
+            );
+            assert_eq!(
+                harw_registry_defaults::tool_permission(tool),
+                None,
+                "{tool} trägt keine Rechteklasse"
+            );
+            if let Some(profile) = profile_for_role(role) {
+                assert!(
+                    !profile.tool_names().contains(tool),
+                    "{profile:?} ({role}) darf {tool} nicht selbst registrieren"
+                );
+            }
+        }
+    }
+    for role in [
+        role_names::UIA_WORKER,
+        role_names::UIA_WRITER,
+        role_names::UIA_EXPLORER,
+        role_names::UIA_SHELL_WORKER,
+        role_names::UIA_LATEX_WRITER,
+        role_names::ROOT_ORCHESTRATOR,
+        role_names::CODING_ORCHESTRATOR,
+        role_names::RESEARCH_ORCHESTRATOR,
+        role_names::ANALYSIS_ORCHESTRATOR,
+        role_names::AGENT_STEWARD,
+        role_names::MEMORY_STEWARD,
+        role_names::EXPLORER,
+        role_names::EXECUTOR,
+        role_names::MATRIX_GAME_MASTER,
+    ] {
+        assert_eq!(
+            skill_catalog_tools_for_role(role),
+            SKILL_CATALOG_TOOLS,
+            "{role}"
+        );
+    }
+    Ok(())
+}
+
+/// Plan R9, Teil A/E5: jede Organisationsrolle erfährt aus ihrem Regelwerk,
+/// dass Skills nur über `skills.search` gefunden und mit `skills.load`
+/// geladen werden — nie über das Dateisystem, nie „gibt es nicht“ ohne Suche.
+#[test]
+fn every_organizational_role_knows_how_to_find_and_load_skills() {
+    use harw_agent_dsl::roles::AgentRoleId;
+    use harw_registry_defaults::embedded_agents::builtin_organization_knowledge;
+
+    for role in [
+        AgentRoleId::UserInterface,
+        AgentRoleId::RootOrchestrator,
+        AgentRoleId::ChildOrchestrator,
+        AgentRoleId::Worker,
+        AgentRoleId::UiaWorker,
+        AgentRoleId::AgentSteward,
+    ] {
+        let text = builtin_organization_knowledge(role);
+        for needle in [
+            "`skills.search`",
+            "`skills.load`",
+            "nie im Dateisystem suchen",
+        ] {
+            assert!(text.contains(needle), "{role:?}: fehlt {needle}");
+        }
+    }
 }

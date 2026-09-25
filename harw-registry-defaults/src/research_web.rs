@@ -22,7 +22,16 @@
 //! - Quelle ist **nur** `researcher_web_hosts`; `allow_hosts` (die allgemeine
 //!   Harness-Liste) fließt nicht ein.
 //! - Leere Liste = kein Netz: die Policy lässt dann kein Ziel zu
-//!   (`EgressPolicy` mit leerer Allowlist, fail-closed).
+//!   (`EgressPolicy` mit leerer Allowlist, fail-closed) — außer im
+//!   **offenen Recherche-Netz** (`[network].research_web = "open"`, Plan R9):
+//!   dann zusätzlich jeder öffentliche DNS-Host
+//!   (`EgressPolicy::with_open_public`, Scope-Ziel
+//!   `harw_authority::EgressTarget::PublicDns`), nur lesend. Die erste Anfrage
+//!   je Domain fragt unter `ask`/`auto` die Nutzerin
+//!   ([`OpenWebApprovalPolicy`], für die Sitzung gemerkt in
+//!   `harw_tool_web::open_web`), unter `full` nicht; offenes Web lesen nur
+//!   Recherche-Rollen ([`OPEN_WEB_ROLES`] und davon abgeleitete Agenten wie
+//!   `intel-web-researcher`).
 //! - `allow_private` ist für diese Rolle immer `false`, unabhängig von
 //!   `[network].allow_private`: eine Web-Recherche braucht keine Ziele in
 //!   privaten Netzen, und Loopback/LAN wären genau der Exfiltrations- bzw.
@@ -52,9 +61,15 @@
 
 use std::sync::Arc;
 
-use harw_authority::NetworkScope;
+use harw_authority::{EgressTarget, NetworkScope};
 use harw_config::NetworkSection;
 use harw_egress::EgressPolicy;
+use harw_extension_api::approval_mode::{ApprovalMode, ApprovalModeCell};
+use harw_extension_api::contributors::ApprovalHandlerKind;
+use harw_extension_api::{ApprovalDecision, ApprovalHandler, ExtFuture, ToolCall};
+use harw_tool_web::open_web::{OpenWebAccess, OpenWebReview, OpenWebSettings};
+
+use crate::profile::role_names;
 
 use crate::error::{RegistryDefaultsError, RegistryDefaultsResult};
 
@@ -93,7 +108,8 @@ pub fn researcher_web_policy(
     network: &NetworkSection,
 ) -> RegistryDefaultsResult<Arc<EgressPolicy>> {
     let policy = EgressPolicy::new(network.researcher_web_hosts.to_vec(), false)
-        .map_err(|source| RegistryDefaultsError::ResearcherWebPolicy { source })?;
+        .map_err(|source| RegistryDefaultsError::ResearcherWebPolicy { source })?
+        .with_open_public(network.research_web.is_open());
     Ok(Arc::new(policy))
 }
 
@@ -132,7 +148,151 @@ pub fn researcher_web_policy(
 /// ```
 #[must_use]
 pub fn researcher_web_network_scope(policy: &EgressPolicy) -> NetworkScope {
-    NetworkScope::from_hosts(policy.allow_hosts().iter().cloned())
+    let listed = NetworkScope::from_hosts(policy.allow_hosts().iter().cloned());
+    if !policy.open_public() {
+        return listed;
+    }
+    NetworkScope::from_targets(
+        listed
+            .targets()
+            .cloned()
+            .chain(std::iter::once(EgressTarget::PublicDns)),
+    )
+}
+
+/// Die eingebauten Recherche-Rollen, die im offenen Recherche-Netz
+/// (`[network].research_web = "open"`) öffentliche Hosts lesen dürfen.
+/// Benutzerdefinierte Agenten gelten über ihre Basisrolle
+/// (`intel-web-researcher` → `researcher-web`).
+pub const OPEN_WEB_ROLES: &[&str] = &[
+    role_names::RESEARCHER_WEB,
+    role_names::RESEARCHER,
+    role_names::DEPENDENCY_RESEARCHER,
+];
+
+/// Ob eine (Basis-)Rolle das offene Recherche-Netz nutzen darf.
+///
+/// # Examples
+/// ```rust
+/// use harw_registry_defaults::research_web::role_may_use_open_web;
+///
+/// assert!(role_may_use_open_web("researcher-web"));
+/// assert!(!role_may_use_open_web("explorer"));
+/// assert!(!role_may_use_open_web("matrix-player"));
+/// ```
+#[must_use]
+pub fn role_may_use_open_web(base_role: &str) -> bool {
+    OPEN_WEB_ROLES.contains(&base_role)
+}
+
+/// Freigabepolitik des offenen Recherche-Netzes (Plan R9).
+///
+/// # Beschreibung
+/// Betrifft nur `web.fetch` auf einen öffentlichen, nicht gelisteten Host,
+/// solange `[network].research_web = "open"` gilt
+/// ([`harw_tool_web::open_web::OpenWebAccess::review_call`]); alles andere
+/// lässt sie mit [`ApprovalDecision::Allow`] unberührt (die übrige Kette
+/// entscheidet wie bisher). Sonst:
+/// - Rolle ohne Recht auf offenes Web → immer [`ApprovalDecision::Deny`] mit
+///   Hinweis auf die Recherche-Rollen (auch für eine bereits freigegebene
+///   Domain: andere Rollen lesen nur gelistete Hosts);
+/// - bereits freigegebene Domain → [`ApprovalDecision::Allow`];
+/// - [`ApprovalMode::FullAccess`] → Domain sofort freigegeben, keine Frage;
+/// - `ask`/`auto` → der Aufruf wird vermerkt
+///   ([`OpenWebAccess::approve_call`]) und der Nutzerin vorgelegt
+///   ([`ApprovalDecision::AskUser`]); führt das Werkzeug ihn aus, ist die
+///   Domain für die Sitzung gemerkt. Der Dialog nennt die Domain
+///   ([`open_web_approval_notice`]).
+///
+/// Die Aggregation `Deny` > `AskUser` > `Allow` der Kette sorgt dafür, dass
+/// diese Politik nie etwas freigibt, was eine andere ablehnt.
+#[derive(Debug)]
+pub struct OpenWebApprovalPolicy {
+    mode: ApprovalModeCell,
+    research_role: bool,
+    access: &'static OpenWebAccess,
+}
+
+impl OpenWebApprovalPolicy {
+    /// Politik über der Modus-Zelle einer Sitzung, gegen den prozessweiten
+    /// Freigabezustand ([`harw_tool_web::open_web::global`]).
+    ///
+    /// # Arguments
+    /// - `mode`: die Freigabemodus-Zelle der Sitzung (live gelesen).
+    /// - `research_role`: [`role_may_use_open_web`] der Basisrolle.
+    #[must_use]
+    pub fn new(mode: ApprovalModeCell, research_role: bool) -> Self {
+        Self::with_access(mode, research_role, harw_tool_web::open_web::global())
+    }
+
+    /// Wie [`Self::new`], mit eigenem Freigabezustand (Tests).
+    #[must_use]
+    pub fn with_access(
+        mode: ApprovalModeCell,
+        research_role: bool,
+        access: &'static OpenWebAccess,
+    ) -> Self {
+        Self {
+            mode,
+            research_role,
+            access,
+        }
+    }
+
+    /// Die synchrone Entscheidung (siehe Typdoku).
+    #[must_use]
+    pub fn decide(&self, call: &ToolCall) -> ApprovalDecision {
+        let (domain, granted) = match self.access.review_call(call.name.as_str(), &call.arguments) {
+            OpenWebReview::NotApplicable => return ApprovalDecision::Allow,
+            OpenWebReview::Granted { domain } => (domain, true),
+            OpenWebReview::NeedsApproval { domain } => (domain, false),
+        };
+        // Auch eine bereits (von einer Recherche-Rolle) freigegebene Domain
+        // bleibt für andere Rollen zu: sie lesen nur gelistete Hosts.
+        if !self.research_role {
+            return ApprovalDecision::Deny(format!(
+                "Offenes Web ({domain}) lesen nur Recherche-Rollen (researcher-web, \
+                 intel-web-researcher, researcher, dependency-researcher) — delegiere die \
+                 Frage an eine davon oder nutze einen gelisteten Host."
+            ));
+        }
+        if granted {
+            return ApprovalDecision::Allow;
+        }
+        if self.mode.get() == ApprovalMode::FullAccess {
+            self.access.grant(&domain);
+            return ApprovalDecision::Allow;
+        }
+        self.access
+            .approve_call(call.name.as_str(), &call.arguments, &domain);
+        ApprovalDecision::AskUser(Default::default())
+    }
+}
+
+impl ApprovalHandler for OpenWebApprovalPolicy {
+    fn review<'a>(&'a self, call: &'a ToolCall) -> ExtFuture<'a, ApprovalDecision> {
+        let decision = self.decide(call);
+        Box::pin(async move { decision })
+    }
+
+    fn kind(&self) -> ApprovalHandlerKind {
+        ApprovalHandlerKind::Other
+    }
+
+    fn label(&self) -> &'static str {
+        "open-web"
+    }
+}
+
+/// Hinweis für den Freigabedialog: nennt die Domain, wenn `call` die erste
+/// Anfrage an eine Domain des offenen Recherche-Netzes ist; sonst `None`.
+#[must_use]
+pub fn open_web_approval_notice(call: &ToolCall) -> Option<String> {
+    harw_tool_web::open_web::approval_notice(
+        harw_tool_web::open_web::global(),
+        call.name.as_str(),
+        &call.arguments,
+    )
 }
 
 /// Richtet die Netz-Werkzeuge (`web.fetch`, `web.docs_rs`, `web.crates_io`,
@@ -195,8 +355,15 @@ pub fn install_web_tools(
         .collect();
     hosts.sort();
     hosts.dedup();
+    let open = config.network.research_web.is_open();
+    // Plan R9: gelistete Hosts fragen im offenen Recherche-Netz nie.
+    harw_tool_web::open_web::global().install(OpenWebSettings {
+        open,
+        allowlisted: hosts.clone(),
+    });
     let policy = EgressPolicy::new(hosts, config.network.allow_private)
-        .map_err(|source| RegistryDefaultsError::ResearcherWebPolicy { source })?;
+        .map_err(|source| RegistryDefaultsError::ResearcherWebPolicy { source })?
+        .with_open_public(open);
     let research = &config.harness.research;
     let options = harw_tool_web::WebFetchOptions {
         ttl: std::time::Duration::from_secs(research.cache_ttl_secs),
@@ -229,7 +396,174 @@ mod tests {
             allow_hosts: allow_hosts.iter().map(|host| (*host).to_owned()).collect(),
             allow_private,
             researcher_web_hosts: researcher.iter().map(|host| (*host).to_owned()).collect(),
+            ..NetworkSection::default()
         }
+    }
+
+    fn open_section(researcher: &[&str]) -> NetworkSection {
+        NetworkSection {
+            research_web: harw_config::ResearchWebMode::Open,
+            ..section(&[], true, researcher)
+        }
+    }
+
+    fn call(tool: &str, url: &str) -> ToolCall {
+        ToolCall {
+            id: Default::default(),
+            name: harw_extension_api::ToolName::new(tool),
+            arguments: serde_json::json!({ "url": url }),
+        }
+    }
+
+    /// Ein eigener, geleakter Freigabezustand je Test (die Politik hält
+    /// `&'static`, wie der prozessweite).
+    fn open_access(allowlisted: &[&str]) -> &'static OpenWebAccess {
+        let access: &'static OpenWebAccess = Box::leak(Box::default());
+        access.install(OpenWebSettings {
+            open: true,
+            allowlisted: allowlisted.iter().map(|host| (*host).to_owned()).collect(),
+        });
+        access
+    }
+
+    #[test]
+    fn test_open_mode_allows_a_public_host_and_refuses_private_and_loopback() -> TestResult {
+        let policy = researcher_web_policy(&open_section(&[])).map_err(ctx("offen"))?;
+        assert!(policy.open_public());
+        assert!(
+            !policy.allow_private(),
+            "Recherche nie privat, auch mit allow_private"
+        );
+        assert!(policy.check_url("https://www.destatis.de/DE/Home/").is_ok());
+        for url in [
+            "http://127.0.0.1/",
+            "http://localhost:8080/",
+            "http://10.1.2.3/",
+            "http://169.254.169.254/latest/meta-data/",
+            "http://printer.local/",
+        ] {
+            assert!(policy.check_url(url).is_err(), "{url}");
+        }
+        let scope = researcher_web_network_scope(&policy);
+        assert!(scope.allows_public_dns());
+        assert!(scope.allows("www.destatis.de"));
+        assert!(!scope.allows("127.0.0.1"));
+        assert!(!scope.allows("printer.local"));
+        Ok(())
+    }
+
+    #[test]
+    fn test_allowlist_mode_is_unchanged() -> TestResult {
+        let policy =
+            researcher_web_policy(&section(&[], false, &["docs.rs"])).map_err(ctx("allowlist"))?;
+        assert!(!policy.open_public());
+        assert!(policy.check_url("https://docs.rs/").is_ok());
+        assert!(policy.check_url("https://www.destatis.de/").is_err());
+        let scope = researcher_web_network_scope(&policy);
+        assert!(!scope.allows_public_dns());
+        assert!(!scope.allows("www.destatis.de"));
+        // Allowlist-Modus: die Freigabepolitik greift nie ein.
+        let access: &'static OpenWebAccess = Box::leak(Box::default());
+        let gate = OpenWebApprovalPolicy::with_access(ApprovalModeCell::default(), true, access);
+        assert!(matches!(
+            gate.decide(&call("web.fetch", "https://www.destatis.de/")),
+            ApprovalDecision::Allow
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn test_first_request_per_domain_asks_and_is_remembered() {
+        let access = open_access(&["docs.rs"]);
+        let mode = ApprovalModeCell::default();
+        assert_ne!(mode.get(), ApprovalMode::FullAccess);
+        let gate = OpenWebApprovalPolicy::with_access(mode, true, access);
+        let first = call("web.fetch", "https://www.destatis.de/DE/Home/");
+        assert!(matches!(gate.decide(&first), ApprovalDecision::AskUser(_)));
+        // Gelistete Hosts und andere Werkzeuge fragen nie.
+        assert!(matches!(
+            gate.decide(&call("web.fetch", "https://docs.rs/serde")),
+            ApprovalDecision::Allow
+        ));
+        assert!(matches!(
+            gate.decide(&call("web.search", "https://www.destatis.de/")),
+            ApprovalDecision::Allow
+        ));
+        // Genehmigt: das Werkzeug führt genau diesen Aufruf aus …
+        assert!(
+            access
+                .admit_fetch("https://www.destatis.de/DE/Home/")
+                .is_ok()
+        );
+        // … und die Domain ist für die Sitzung gemerkt.
+        assert!(matches!(
+            gate.decide(&call("web.fetch", "https://destatis.de/andere-seite")),
+            ApprovalDecision::Allow
+        ));
+        assert!(matches!(
+            gate.decide(&call("web.fetch", "https://www.bundesbank.de/")),
+            ApprovalDecision::AskUser(_)
+        ));
+    }
+
+    #[test]
+    fn test_full_access_does_not_ask_for_a_new_domain() {
+        let access = open_access(&[]);
+        let mode = ApprovalModeCell::default();
+        mode.set(ApprovalMode::FullAccess);
+        let gate = OpenWebApprovalPolicy::with_access(mode, true, access);
+        assert!(matches!(
+            gate.decide(&call("web.fetch", "https://github.com/rust-lang/rust")),
+            ApprovalDecision::Allow
+        ));
+        assert!(
+            access
+                .admit_fetch("https://github.com/rust-lang/rust")
+                .is_ok()
+        );
+        assert_eq!(access.granted_domains(), ["github.com"]);
+    }
+
+    #[test]
+    fn test_only_research_roles_may_read_the_open_web() -> TestResult {
+        let access = open_access(&[]);
+        let mode = ApprovalModeCell::default();
+        mode.set(ApprovalMode::FullAccess);
+        let gate = OpenWebApprovalPolicy::with_access(mode, false, access);
+        let decision = gate.decide(&call("web.fetch", "https://www.destatis.de/"));
+        let ApprovalDecision::Deny(reason) = decision else {
+            return Err(TestError::Unexpected(
+                "eine Nicht-Recherche-Rolle darf kein offenes Web lesen".to_owned(),
+            ));
+        };
+        assert!(reason.contains("intel-web-researcher"), "{reason}");
+        assert!(access.granted_domains().is_empty());
+        // Auch eine von einer Recherche-Rolle freigegebene Domain bleibt zu.
+        access.grant("destatis.de");
+        assert!(matches!(
+            gate.decide(&call("web.fetch", "https://www.destatis.de/")),
+            ApprovalDecision::Deny(_)
+        ));
+        // Gelistete Hosts lesen alle Rollen mit Netz wie bisher.
+        let listed = open_access(&["docs.rs"]);
+        let gate = OpenWebApprovalPolicy::with_access(ApprovalModeCell::default(), false, listed);
+        assert!(matches!(
+            gate.decide(&call("web.fetch", "https://docs.rs/serde")),
+            ApprovalDecision::Allow
+        ));
+        for role in OPEN_WEB_ROLES {
+            assert!(role_may_use_open_web(role), "{role}");
+        }
+        for role in [
+            role_names::EXPLORER,
+            role_names::UIA_WORKER,
+            role_names::MATRIX_PLAYER,
+            role_names::MATRIX_UMPIRE,
+            role_names::MATRIX_GAME_MASTER,
+        ] {
+            assert!(!role_may_use_open_web(role), "{role}");
+        }
+        Ok(())
     }
 
     #[test]

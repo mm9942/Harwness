@@ -18,8 +18,9 @@
 //! # Fehler
 //! Permission-Fehler → `Ok(ToolOutput::error(...))`. Kein Panic.
 
+use crate::symlink::open_start;
 use crate::tree::{
-    HARD_MAX_ENTRIES, StopReason, WALK_DEADLINE, Workspace, normalize_relative, read_dir_limited,
+    HARD_MAX_ENTRIES, StopReason, WALK_DEADLINE, normalize_relative, read_dir_limited,
 };
 use harw_authority::Permission;
 use harw_fsutil::EntryType;
@@ -138,19 +139,25 @@ impl FsListExecutor {
             .min(self.max_entries)
             .min(HARD_MAX_ENTRIES);
 
-        let listed =
-            Workspace::open(ctx.sandbox().workspace().canonical_root()).and_then(|workspace| {
-                let dir = workspace.open_dir(&relative)?;
-                let deadline = Instant::now() + WALK_DEADLINE;
-                read_dir_limited(&workspace, &dir, &relative, cap, deadline)
-            });
+        // Symlinks im Pfad: nach innen frei, nach außen nur mit Freigabe
+        // (siehe `crate::symlink`).
+        let listed = open_start(
+            ctx.sandbox().workspace().canonical_root(),
+            &relative,
+            "fs.list",
+            &args.path,
+        )
+        .and_then(|start| {
+            let dir = start.workspace.open_dir(&start.rel)?;
+            let deadline = Instant::now() + WALK_DEADLINE;
+            read_dir_limited(&start.workspace, &dir, &start.rel, cap, deadline)
+        });
         let (children, stop) = match listed {
             Ok(listed) => listed,
             Err(err) => {
                 return Ok(ToolOutput::error(format!(
-                    "fs.list: '{}' ist kein lesbares Verzeichnis \
-                     (Symlinks werden nicht verfolgt): {err}; erwartet ein Verzeichnis; für \
-                     einzelne Dateien fs.read oder fs.grep verwenden",
+                    "fs.list: '{}' ist kein lesbares Verzeichnis: {err}; erwartet ein \
+                     Verzeichnis; für einzelne Dateien fs.read oder fs.grep verwenden",
                     args.path
                 )));
             }
@@ -379,13 +386,9 @@ mod tests {
         }
         assert!(!render(&output)?.contains("secret.txt"));
 
-        for path in [
-            "link_dir",
-            "loop",
-            "nested/up",
-            "link_dir/deep",
-            "../outside",
-        ] {
+        // `loop` und `nested/up` lösen innerhalb des Arbeitsbereichs auf
+        // (Plan R9, E8) und sind lesbar; nur Ziele außerhalb bleiben gesperrt.
+        for path in ["link_dir", "link_dir/deep", "../outside"] {
             let output =
                 executor.list_dir(&ctx, &call("fs.list", serde_json::json!({ "path": path })))?;
             assert!(
@@ -453,6 +456,47 @@ mod tests {
                 "max_entries={max_entries}"
             );
         }
+        Ok(())
+    }
+
+    #[test]
+    fn test_fs_list_follows_directory_symlink_inside_workspace() -> TestResult {
+        let fixture = Fixture::new()?;
+        fixture.plant_escapes()?;
+        // Wie `vcpkg_installed/<triplet>/share/angle` -> `../../packages/...`.
+        fs::create_dir_all(fixture.ws.join("packages/angle"))?;
+        fs::write(fixture.ws.join("packages/angle/copyright"), "x")?;
+        fs::create_dir_all(fixture.ws.join("installed/share"))?;
+        std::os::unix::fs::symlink(
+            "../../packages/angle",
+            fixture.ws.join("installed/share/angle"),
+        )?;
+        let executor = FsListExecutor {
+            max_entries: DEFAULT_MAX_ENTRIES,
+        };
+        let ctx = fixture.ctx(vec![Permission::ReadWorkspace])?;
+
+        let output = executor.list_dir(
+            &ctx,
+            &call(
+                "fs.list",
+                serde_json::json!({ "path": "installed/share/angle" }),
+            ),
+        )?;
+        assert!(matches!(output, ToolOutput::Json { .. }), "{output:?}");
+        assert!(render(&output)?.contains("copyright"));
+
+        let output = executor.list_dir(
+            &ctx,
+            &call("fs.list", serde_json::json!({ "path": "link_dir" })),
+        )?;
+        assert!(matches!(output, ToolOutput::Error { .. }), "{output:?}");
+        let rendered = render(&output)?;
+        assert!(
+            rendered.contains("Symlink zeigt außerhalb des Arbeitsbereichs"),
+            "{rendered}"
+        );
+        assert!(!rendered.contains("secret.txt"), "{rendered}");
         Ok(())
     }
 

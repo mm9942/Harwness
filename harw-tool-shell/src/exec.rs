@@ -96,6 +96,10 @@ pub use timeouts::{BUILD_COMMAND_DEFAULT_TIMEOUT_SECS, DEFAULT_MAX_TIMEOUT_SECS}
 // (ohne bwrap und ohne Freigabe, mit denselben Bausteinen wie
 // `run_host_command`).
 mod operator;
+// Plan R9, Teil F: derselbe Rechte-/Freigabeweg für Hintergrund-Jobs
+// (`job.start` in `harw-tool-job`), ohne Wanduhr-Zeitlimit.
+mod background;
+pub use background::BackgroundLaunch;
 pub use operator::{
     OPERATOR_DEFAULT_TIMEOUT_SECS, OperatorCommand, OperatorEnd, OperatorOutcome,
     operator_escalation_message, run_operator_command,
@@ -525,6 +529,13 @@ impl ShellExecutor {
 
         if variant == HostPermitVariant::SessionLease {
             registry.mark_session_approved(request.session.clone());
+            // Eine Host-Arbeitsphase gilt prozessweit — wie `/sandbox-lease`
+            // und die Host-Mode-Anfrage (`exec/escalation.rs`). Vorher galt
+            // sie nur für die fragende (Kind-)Sitzung: jedes neue
+            // `uia-shell-worker`-Kind fragte erneut und die TUI meldete
+            // „Host-Arbeitsphase freigegeben“ jedes Mal wieder. Strg+H
+            // (`ChatApp::end_host_mode`) widerruft die globale Freigabe.
+            registry.mark_global_approval();
         }
         let (scope, ttl) = match variant {
             HostPermitVariant::SingleExecution => (
@@ -1348,6 +1359,7 @@ impl ToolExecutor for ShellExecutor {
 /// assert!(provider.executor(&ToolName::new("shell.exec")).is_some());
 /// assert!(provider.executor(&ToolName::new("other.tool")).is_none());
 /// ```
+#[derive(Clone)]
 pub struct ShellToolProvider {
     /// Maximum time in seconds a single shell command may run.
     pub timeout_secs: u64,
@@ -3465,6 +3477,72 @@ mod tests {
                 .authorize_host_command(&second, &sandbox, "s1")
                 .await
                 .is_ok()
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_active_host_lease_covers_consecutive_shell_worker_children_without_prompt()
+    -> TestResult {
+        // Holy-Export: trotz aktiver Host-Arbeitsphase fragte jedes neue
+        // `uia-shell-worker`-Kind (eigene Session-ID) erneut. Erstes Kind
+        // beantwortet die Frage mit „Host-Arbeitsphase“; zwei weitere Kinder
+        // mit frischen Session-IDs dürfen danach keine Frage mehr auslösen.
+        let tmp = make_temp_workspace()?;
+        let sandbox = make_sandbox(&tmp, vec![Permission::ExecuteProcess])?;
+        let ledger = Arc::new(ProcessPermitLedger::default());
+        let registry = Arc::new(HostPermitSessionRegistry::default());
+        let (sender, mut receiver) = crate::host_permit_prompt::host_permit_prompt_channel();
+        let mut executor = host_executor(&ledger, &registry);
+        executor.host_permit_prompts = Some(sender);
+
+        let responder = tokio::spawn(async move {
+            let prompt = receiver.recv().await.ok_or(TestError::Missing("prompt"))?;
+            assert!(prompt.approve(HostPermitVariant::SessionLease));
+            Ok::<_, TestError>(receiver)
+        });
+        assert!(
+            executor
+                .authorize_host_command(&args_for("mkdir -p a"), &sandbox, "child-1")
+                .await
+                .is_ok()
+        );
+        let mut receiver = responder
+            .await
+            .map_err(ctx("responder task must not panic"))??;
+
+        for child in ["child-2", "child-3"] {
+            assert!(
+                executor
+                    .authorize_host_command(&args_for("ls -la"), &sandbox, child)
+                    .await
+                    .is_ok(),
+                "{child}: the active lease must cover a new child session"
+            );
+        }
+        assert!(
+            receiver.try_recv().is_err(),
+            "no further host-permit prompt (and thus no repeated host-mode notice) may be sent"
+        );
+
+        // Ebenso mit einer vorab über `/sandbox-lease` (global) erteilten Phase.
+        let registry = Arc::new(HostPermitSessionRegistry::default());
+        registry.mark_global_approval();
+        let (sender, mut receiver) = crate::host_permit_prompt::host_permit_prompt_channel();
+        let mut executor = host_executor(&ledger, &registry);
+        executor.host_permit_prompts = Some(sender);
+        for child in ["child-a", "child-b"] {
+            assert!(
+                executor
+                    .authorize_host_command(&args_for("true"), &sandbox, child)
+                    .await
+                    .is_ok(),
+                "{child}"
+            );
+        }
+        assert!(
+            receiver.try_recv().is_err(),
+            "no prompt under an active lease"
         );
         Ok(())
     }

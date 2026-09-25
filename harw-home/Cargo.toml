@@ -24,6 +24,10 @@ toml = { workspace = true }
 
 [dev-dependencies]
 harw-config = { path = "../harw-config" }
+# Plan R9, Teil D: `tests/analysis_family.rs` parst die mitgelieferten
+# `definition.toml` als `RawAgentDefinition`. Nur Test-Kante, kein Zyklus:
+# harw-agent-dsl hängt nicht von harw-home ab.
+harw-agent-dsl = { path = "../harw-agent-dsl" }
 
 [lints]
 workspace = true

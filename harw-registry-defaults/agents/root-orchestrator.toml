@@ -79,6 +79,17 @@ admitted = [
   # Elternteil; nur Text, keine Rechte (siehe
   # `harw_registry_defaults::profile::parent_message_tools_for_role`).
   "parent.message",
+  # Plan R9, Teil A: Skills nur über den Katalog finden und laden
+  # (`harw_registry_defaults::profile::skill_catalog_tools_for_role`).
+  "skills.search",
+  "skills.load",
+  # Plan R9, Teil F: Jobs der eigenen Worker verfolgen und stoppen (kein
+  # `job.start`; siehe `harw_registry_defaults::profile::job_control_tools_for_role`).
+  "job.status",
+  "job.logs",
+  "job.stop",
+  "job.list",
+  "job.wait",
 ]
 forbidden = ["fs.write", "fs.edit", "shell.exec", "web.fetch", "web.search", "web.docs_rs", "web.crates_io"]
 
@@ -116,13 +127,19 @@ child_orchestrators = [
   "analysis-orchestrator",
 ]
 
+# Plan R9, Teil C: der Verbrauch aller Nachkommen wird dem Orchestrator
+# angerechnet (`ManagedAgentSpawner::charge_run_usage`, Wanduhr summiert über
+# parallele Kinder). Seit Delegation mitten im Turn wirklich funktioniert,
+# reichten 120k/80/3600 s nicht für eine einzige größere Welle; die Deckel
+# folgen deshalb dem Matrix-Game-Master (ebenfalls ein Elternteil vieler
+# Kinder). Die eigene Turn-Disziplin (Abschluss-Anweisung ab 80 %) bleibt.
 [spawn.budget]
-max_tokens = 120000
-max_tool_calls = 80
-# Runde 5, Teil O: 60 min statt 15 — Orchestratoren arbeiten länger als
-# Worker; die Lease (15 min) ist davon getrennt und wird per Herzschlag
-# verlängert, solange das Kind arbeitet.
-max_wall_secs = 3600
+max_tokens = 1500000
+max_tool_calls = 600
+# Runde 5, Teil O: Orchestratoren arbeiten länger als Worker; die Lease
+# (15 min) ist davon getrennt und wird per Herzschlag verlängert, solange das
+# Kind arbeitet.
+max_wall_secs = 14400
 
 [return]
 contract = "harwness.return.execution-summary@1"

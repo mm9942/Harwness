@@ -34,8 +34,8 @@ use std::sync::{Arc, OnceLock, Weak};
 
 use harw_agent_dsl::ExecutableAgentIr;
 use harw_catalog::{
-    CatalogSnapshot, SkillRuntimeSnapshot, SpawnCapabilitySnapshot, load_skill_runtime_snapshot,
-    resolve_skill_directory,
+    CatalogSnapshot, SkillIndex, SkillRuntimeSnapshot, SpawnCapabilitySnapshot,
+    load_skill_runtime_snapshot, resolve_skill_directory,
 };
 use harw_config::{
     InternalModelPoint, ResolvedConfig, ResolvedInternalModel, SkillToml, resolve_internal_model,
@@ -402,6 +402,13 @@ pub struct RuntimeChildRegistryFactory {
     /// Controller-Auswahl und Rollenwahl für **neu** gestartete Kinder. Nur
     /// bei der Fabrik des Wurzel-Baums gesetzt; `None` → Stand des Starts.
     live_models: Option<Arc<crate::live_model::LiveModelRouting>>,
+    /// Plan R9, Teil B: benutzerdefinierte Agenten aus dem Roster
+    /// ([`harw_registry_defaults::AgentRoster::custom_wiring`]), nach
+    /// Spawn-Name. Ihre geklemmte IR liegt in [`Self::builtin_definitions`];
+    /// hier stehen Basisrolle (für alle namensgebundenen Tabellen), Profil und
+    /// Instruktionen. Leer, solange [`Self::with_custom_agents`] nicht
+    /// aufgerufen wurde.
+    custom_agents: HashMap<String, harw_registry_defaults::CustomAgentWiring>,
 }
 
 /// Wissensquellen der lesenden Kind-Werkzeuge (Plan Teil D).
@@ -418,6 +425,10 @@ struct ChildKnowledgeWiring {
 struct SkillCatalogWiring {
     catalog: CatalogSnapshot,
     roots: Vec<PathBuf>,
+    /// Plan R9, Teil A: der lesende Skill-Katalog über dieselben Layer plus
+    /// eingebettetem Bündel — Quelle für `skills.search`/`skills.load` und
+    /// Rückfall für fest gebundene Skills, die kein Layer führt.
+    index: Arc<SkillIndex>,
 }
 
 impl std::fmt::Debug for RuntimeChildRegistryFactory {
@@ -513,6 +524,7 @@ impl RuntimeChildRegistryFactory {
             diary: None,
             uia_worker_routing: None,
             live_models: None,
+            custom_agents: HashMap::new(),
         }
     }
 
@@ -529,6 +541,43 @@ impl RuntimeChildRegistryFactory {
     pub fn with_live_models(mut self, live: Arc<crate::live_model::LiveModelRouting>) -> Self {
         self.live_models = Some(live);
         self
+    }
+
+    /// Hängt die benutzerdefinierten Agenten des Rosters an (Plan R9, Teil B).
+    ///
+    /// # Description
+    /// `custom_agents` stammt aus
+    /// [`harw_registry_defaults::AgentRoster::custom_wiring`]; die geklemmten
+    /// IRs derselben Namen müssen in den Definitionen dieser Fabrik liegen
+    /// ([`Self::with_definitions`] mit [`harw_registry_defaults::AgentRoster::definitions`]).
+    /// Für jeden solchen Namen gelten danach Profil und Instruktionen des
+    /// Roster-Eintrags und die namensgebundenen Tabellen seiner Basisrolle.
+    #[must_use]
+    pub fn with_custom_agents(
+        mut self,
+        custom_agents: HashMap<String, harw_registry_defaults::CustomAgentWiring>,
+    ) -> Self {
+        self.custom_agents = custom_agents;
+        self
+    }
+
+    /// Die eingebaute Rolle, deren namensgebundene Tabellen (Composition-
+    /// Werkzeuge, Reducer, Delegationsziele, interne Modellstelle) für
+    /// `role` gelten: für einen benutzerdefinierten Agenten seine Basisrolle,
+    /// sonst `role` selbst (Plan R9, Teil B).
+    fn lookup_role<'a>(&'a self, role: &'a str) -> &'a str {
+        self.custom_agents
+            .get(role)
+            .map_or(role, |wiring| wiring.base_role.as_str())
+    }
+
+    /// Das Registry-Profil von `role`: für einen benutzerdefinierten Agenten
+    /// das seines Roster-Eintrags, sonst [`profile_for_role`].
+    fn registry_profile_for(&self, role: &str) -> Option<harw_registry_defaults::RegistryProfile> {
+        match self.custom_agents.get(role) {
+            Some(wiring) => Some(wiring.profile),
+            None => profile_for_role(role),
+        }
     }
 
     /// Aktuelle Auflösung einer internen Modellstelle (live, sonst Start).
@@ -810,11 +859,69 @@ impl RuntimeChildRegistryFactory {
             CatalogSnapshot::from_config(config).map_err(|error| RuntimeError::Registry {
                 detail: format!("could not freeze the skill catalog for children: {error}"),
             })?;
+        let index = Arc::new(SkillIndex::build(&skill_roots));
         self.skill_catalog = Some(SkillCatalogWiring {
             catalog,
             roots: skill_roots,
+            index,
         });
         Ok(self)
+    }
+
+    /// Hängt `skills.search`/`skills.load` (Plan R9, Teil A) an die
+    /// Kind-Registry von `role`.
+    ///
+    /// # Beschreibung
+    /// Nur mit Skill-Katalog ([`Self::with_skill_catalog`]) und für jede
+    /// Rolle aus [`harw_registry_defaults::profile::skill_catalog_tools_for_role`]
+    /// — eingebaut oder eigene Definition. Bewusst **unabhängig** von
+    /// `[tools].admitted`: die Sitzung schaltet beide Werkzeuge immer frei
+    /// ([`harw_core::activation::ALWAYS_AVAILABLE_TOOLS`]), damit kein
+    /// Zuschnitt einer Definition (etwa das Klemmen auf die Basisrolle) sie
+    /// entfernt. Ein ausdrückliches `forbidden` der Definition gewinnt: dann
+    /// bleibt auch die Kontextzeile weg.
+    ///
+    /// # Rückgabe
+    /// Der Builder, ergänzt um den Katalog-Provider, oder unverändert.
+    fn with_skill_catalog_tools(
+        &self,
+        role: &str,
+        builder: harw_extension_api::ExtensionRegistryBuilder,
+    ) -> harw_extension_api::ExtensionRegistryBuilder {
+        match self.skill_catalog_index_for(role) {
+            Some(index) => builder.tool_provider(Arc::new(
+                harw_registry_defaults::SkillCatalogToolProvider::new(index),
+            )),
+            None => builder,
+        }
+    }
+
+    /// Der Skill-Index, wenn `role` die Katalog-Werkzeuge bekommt (siehe
+    /// [`Self::with_skill_catalog_tools`]).
+    fn skill_catalog_index_for(&self, role: &str) -> Option<Arc<SkillIndex>> {
+        let wiring = self.skill_catalog.as_ref()?;
+        let offered = harw_registry_defaults::profile::skill_catalog_tools_for_role(role);
+        let forbidden = self.builtin_definitions.get(role).is_some_and(|ir| {
+            offered.iter().any(|tool| {
+                ir.tool_surface()
+                    .forbidden()
+                    .iter()
+                    .any(|forbidden| forbidden == tool)
+            })
+        });
+        (!offered.is_empty() && !forbidden).then(|| Arc::clone(&wiring.index))
+    }
+
+    /// Die Kontextfragmente einer Kind-Rolle: fest gebundene Skills
+    /// ([`Self::skill_fragments_for_role`]) und — wenn die Rolle den
+    /// Skill-Katalog bekommt — die einzeilige Katalog-Zeile
+    /// ([`harw_registry_defaults::skill_catalog_hint`]).
+    fn skill_context_for_role(&self, role: &str) -> Result<Vec<String>, AgentSpawnError> {
+        let mut fragments = self.skill_fragments_for_role(role)?;
+        if let Some(index) = self.skill_catalog_index_for(role) {
+            fragments.push(harw_registry_defaults::skill_catalog_hint(index.len()));
+        }
+        Ok(fragments)
     }
 
     /// Hinterlegt den geteilten `StateStore` für die `delegate_wave`-Fläche
@@ -926,7 +1033,8 @@ impl RuntimeChildRegistryFactory {
         let Some(knowledge) = &self.knowledge else {
             return builder;
         };
-        let offered = harw_registry_defaults::profile::knowledge_tools_for_role(role);
+        let offered =
+            harw_registry_defaults::profile::knowledge_tools_for_role(self.lookup_role(role));
         let Some(ir) = self.builtin_definitions.get(role) else {
             return builder;
         };
@@ -1014,7 +1122,7 @@ impl RuntimeChildRegistryFactory {
         else {
             return builder;
         };
-        let offered = harw_registry_defaults::profile::sudo_tools_for_role(role);
+        let offered = harw_registry_defaults::profile::sudo_tools_for_role(self.lookup_role(role));
         let admitted = self.builtin_definitions.get(role).is_some_and(|ir| {
             offered.iter().any(|tool| {
                 ir.tool_surface()
@@ -1029,6 +1137,51 @@ impl RuntimeChildRegistryFactory {
         builder.tool_provider(Arc::new(harw_tool_shell::SudoToolProvider::new(
             sender, role,
         )))
+    }
+
+    /// Plan R9, Teil F: hängt die Job-Kontrollwerkzeuge
+    /// ([`harw_registry_defaults::profile::JOB_CONTROL_TOOLS`]) an die
+    /// Kind-Registry einer Orchestrator-Rolle.
+    ///
+    /// # Beschreibung
+    /// Fail-closed wie [`Self::with_sudo_exec`]: ohne Job-Verwaltung in der
+    /// Host-Permit-Verdrahtung (jeder Nicht-TUI-Einstieg) gibt es nichts; eine
+    /// Rolle außerhalb von
+    /// [`harw_registry_defaults::profile::job_control_tools_for_role`], eine
+    /// Rolle, deren Profil selbst `shell.exec` (und damit `job.*`) trägt, und
+    /// eine Rolle ohne eingebaute Definition, die die Werkzeuge admittiert,
+    /// bekommen keinen Provider. Besitzprüfung: nur Jobs der eigenen
+    /// Nachfahren (Elternkette der Job-Verdrahtung).
+    fn with_job_control(
+        &self,
+        role: &str,
+        profile: harw_registry_defaults::RegistryProfile,
+        builder: harw_extension_api::ExtensionRegistryBuilder,
+    ) -> harw_extension_api::ExtensionRegistryBuilder {
+        let Some(jobs) = self
+            .host_permit_wiring
+            .as_ref()
+            .and_then(|wiring| wiring.jobs.as_ref())
+        else {
+            return builder;
+        };
+        if profile.registered_tool_names().contains(&"shell.exec") {
+            return builder;
+        }
+        let offered =
+            harw_registry_defaults::profile::job_control_tools_for_role(self.lookup_role(role));
+        let admitted = self.builtin_definitions.get(role).is_some_and(|ir| {
+            offered.iter().any(|tool| {
+                ir.tool_surface()
+                    .admitted()
+                    .iter()
+                    .any(|admitted| admitted == tool)
+            })
+        });
+        if !admitted {
+            return builder;
+        }
+        builder.tool_provider(jobs.control_provider())
     }
 
     /// Die interne Modellstelle eines Kind-Starts mit Aufgabenkomplexität
@@ -1066,7 +1219,7 @@ impl RuntimeChildRegistryFactory {
     /// ([`orchestrator_point_for_organizational_role`]). Eine Rolle ohne
     /// eingebaute Definition bekommt nie eine Orchestrator-Stelle.
     fn internal_point_for_child(&self, role: &str) -> Option<InternalModelPoint> {
-        internal_point_for_role(role).or_else(|| {
+        internal_point_for_role(self.lookup_role(role)).or_else(|| {
             self.builtin_definitions
                 .get(role)
                 .map(ExecutableAgentIr::role)
@@ -1092,12 +1245,35 @@ impl RuntimeChildRegistryFactory {
     /// Dienste, scheitert `delegate_wave` selbst fail-closed mit
     /// `OpError::NotAvailable`.
     fn delegate_wave_provider(&self) -> ModelToolProvider {
+        // Plan R9, Teil B: ein benutzerdefinierter Agent (als Ziel oder als
+        // Aufrufer) gilt mit Reducer und Delegationszielen seiner Basisrolle.
+        // Eigene `[delegation].targets` eines benutzerdefinierten Aufrufers
+        // gehen vor (sie filtern nur, was sichtbar und registriert ist).
+        let custom: Arc<HashMap<String, harw_registry_defaults::CustomAgentWiring>> =
+            Arc::new(self.custom_agents.clone());
+        let custom_names: Arc<std::collections::HashSet<String>> =
+            Arc::new(self.custom_agents.keys().cloned().collect());
+        let target_custom = Arc::clone(&custom);
         let policy = harw_core_bridge::DelegateWavePolicy::new(
-            |role: &str| {
+            move |role: &str| {
+                let role = target_custom
+                    .get(role)
+                    .map_or(role, |wiring| wiring.base_role.as_str());
                 harw_registry_defaults::authority_reducer_for_role(role).map(|reducer| reducer.id())
             },
-            harw_registry_defaults::authority::delegation_targets_for_role,
+            move |role: &str| match custom.get(role) {
+                Some(wiring) => wiring.delegation_targets.clone().or_else(|| {
+                    harw_registry_defaults::authority::delegation_targets_for_role(
+                        &wiring.base_role,
+                    )
+                }),
+                None => harw_registry_defaults::authority::delegation_targets_for_role(role),
+            },
         );
+        // Plan R9, Teil C: benutzerdefinierte Agenten bleiben sichtbar, wenn
+        // eine eingebaute Deklaration nur eingebaute Rollen nennt.
+        let custom_targets = Arc::clone(&custom_names);
+        let policy = policy.with_custom_targets(move |role: &str| custom_targets.contains(role));
         let operation: Arc<dyn Operation> =
             Arc::new(harw_core_bridge::DelegateWaveOperation::new(policy));
         let slot = Arc::clone(&self.spawner_slot);
@@ -1208,12 +1384,15 @@ impl RuntimeChildRegistryFactory {
         if names.is_empty() {
             return Ok(Vec::new());
         }
-        let snapshots =
-            load_enabled_skills(|name| wiring.catalog.skill(name), &wiring.roots, &names).map_err(
-                |detail| AgentSpawnError {
-                    message: format!("could not load the skills of child role '{role}': {detail}"),
-                },
-            )?;
+        let snapshots = load_enabled_skills(
+            |name| wiring.catalog.skill(name),
+            &wiring.roots,
+            Some(&wiring.index),
+            &names,
+        )
+        .map_err(|detail| AgentSpawnError {
+            message: format!("could not load the skills of child role '{role}': {detail}"),
+        })?;
         for snapshot in &snapshots {
             tracing::debug!(
                 role,
@@ -1392,12 +1571,20 @@ impl ChildRegistryFactory for RuntimeChildRegistryFactory {
         input: &SpawnInput,
         _suggestions: Option<&harw_catalog::AgentSuggestions>,
     ) -> Result<ExtensionRegistry, AgentSpawnError> {
-        let profile = profile_for_role(role).ok_or_else(|| AgentSpawnError {
-            message: format!(
-                "refusing to assemble a child registry for unknown role '{role}': \
+        // Plan R9, Teil B: ein benutzerdefinierter Agent läuft mit dem Profil
+        // seines Roster-Eintrags; alle namensgebundenen Tabellen
+        // (Composition-Werkzeuge, Matrix, Wissen, sudo) gelten für seine
+        // Basisrolle (`lookup`). Identität, IR, Skills und Instruktionen
+        // bleiben die des Agenten selbst (`role`).
+        let lookup = self.lookup_role(role);
+        let profile = self
+            .registry_profile_for(role)
+            .ok_or_else(|| AgentSpawnError {
+                message: format!(
+                    "refusing to assemble a child registry for unknown role '{role}': \
                  no registry profile is declared for it"
-            ),
-        })?;
+                ),
+            })?;
         let overrides = IdentityOverrides {
             agent_name: Some(role.to_owned()),
             // Addendum F+G: die organisatorische Rolle eines Kindes ist die
@@ -1413,11 +1600,20 @@ impl ChildRegistryFactory for RuntimeChildRegistryFactory {
             // Instruktionsfragmente (leer ohne Skill-Katalog). Runde 7,
             // Teil M: rollenspezifische Regeln (Game Master) stehen davor.
             extra_context: {
-                let mut fragments = self.skill_fragments_for_role(role)?;
+                let mut fragments = self.skill_context_for_role(role)?;
                 if let Some(prompt) =
                     harw_registry_defaults::embedded_agents::builtin_role_prompt(role)
                 {
                     fragments.insert(0, prompt.to_owned());
+                }
+                // Plan R9, Teil B: die Arbeitsanweisung eines
+                // benutzerdefinierten Agenten (`instructions_file`).
+                if let Some(instructions) = self
+                    .custom_agents
+                    .get(role)
+                    .and_then(|wiring| wiring.instructions.as_deref())
+                {
+                    fragments.insert(0, format!("# Arbeitsanweisung ({role})\n{instructions}"));
                 }
                 fragments
             },
@@ -1480,7 +1676,18 @@ impl ChildRegistryFactory for RuntimeChildRegistryFactory {
             .install_over_default(assembled.registry)
             .spawner(Arc::new(DeferredManagedSpawner {
                 slot: Arc::clone(&self.spawner_slot),
-            }));
+            }))
+            // Plan R9, offenes Recherche-Netz (`[network].research_web =
+            // "open"`): erste Anfrage je Domain fragt (unter `full` nicht),
+            // offenes Web lesen nur Recherche-Rollen — gemessen an der
+            // Basisrolle (`intel-web-researcher` → `researcher-web`). Ohne
+            // offenes Netz lässt die Politik jeden Aufruf unberührt.
+            .approval_handler(Arc::new(
+                harw_registry_defaults::OpenWebApprovalPolicy::new(
+                    child_chain.mode().clone(),
+                    harw_registry_defaults::role_may_use_open_web(lookup),
+                ),
+            ));
         #[cfg(feature = "browser")]
         if self.browser.grants_role(role) {
             let browser_provider =
@@ -1497,20 +1704,20 @@ impl ChildRegistryFactory for RuntimeChildRegistryFactory {
         // `delegate_wave` nur für Orchestrator-Rollen (Root oder Child); die
         // `SessionActivation` des Kindes schaltet das Werkzeug zusätzlich nur
         // frei, wenn seine Definition es admittiert.
-        if role_gets_delegate_wave(role) {
+        if role_gets_delegate_wave(lookup) {
             registry_builder =
                 registry_builder.tool_provider(Arc::new(self.delegate_wave_provider()));
         }
         // Runde 7, Teil M: die Matrix-Werkzeuge ausschließlich für den Game
         // Master (rollengebundener `ModelToolProvider`, siehe
         // `matrix_game_master_provider`).
-        if !harw_registry_defaults::profile::matrix_tools_for_role(role).is_empty() {
+        if !harw_registry_defaults::profile::matrix_tools_for_role(lookup).is_empty() {
             registry_builder =
                 registry_builder.tool_provider(Arc::new(self.matrix_game_master_provider()));
         }
         // Runde 5, Teil H: `agent.result` für jede Rolle, die Kinder starten
         // darf; der Spawner wird wie bei `delegate_wave` nur schwach gehalten.
-        if !harw_registry_defaults::profile::child_result_tools_for_role(role).is_empty() {
+        if !harw_registry_defaults::profile::child_result_tools_for_role(lookup).is_empty() {
             let slot = Arc::clone(&self.spawner_slot);
             registry_builder = registry_builder.tool_provider(Arc::new(
                 crate::agent_result_wiring::agent_result_provider(move || {
@@ -1522,7 +1729,7 @@ impl ChildRegistryFactory for RuntimeChildRegistryFactory {
         // darf, `parent.message` für jede Kind-Rolle mit Elternteil; die
         // `SessionActivation` schaltet sie nur frei, wenn die Definition sie
         // admittiert. Spawner schwach gehalten wie oben.
-        if !harw_registry_defaults::profile::child_message_tools_for_role(role).is_empty() {
+        if !harw_registry_defaults::profile::child_message_tools_for_role(lookup).is_empty() {
             let slot = Arc::clone(&self.spawner_slot);
             registry_builder = registry_builder.tool_provider(Arc::new(
                 crate::agent_messaging_wiring::agent_message_provider(move || {
@@ -1530,7 +1737,7 @@ impl ChildRegistryFactory for RuntimeChildRegistryFactory {
                 }),
             ));
         }
-        if !harw_registry_defaults::profile::parent_message_tools_for_role(role).is_empty() {
+        if !harw_registry_defaults::profile::parent_message_tools_for_role(lookup).is_empty() {
             let slot = Arc::clone(&self.spawner_slot);
             registry_builder = registry_builder.tool_provider(Arc::new(
                 crate::agent_messaging_wiring::parent_message_provider(move || {
@@ -1545,6 +1752,13 @@ impl ChildRegistryFactory for RuntimeChildRegistryFactory {
         // mit sudo-Fragekanal (TUI) und nur, wenn die Definition der Rolle es
         // admittiert (siehe `with_sudo_exec`).
         registry_builder = self.with_sudo_exec(role, registry_builder);
+        // Plan R9, Teil F: Job-Kontrolle (`job.status/logs/stop/list/wait`)
+        // für Orchestratoren ohne Shell (siehe `with_job_control`); Rollen
+        // mit `shell.exec` tragen `job.*` bereits über ihr Profil.
+        registry_builder = self.with_job_control(role, profile, registry_builder);
+        // Plan R9, Teil A: `skills.search`/`skills.load` für jede Rolle außer
+        // den dokumentierten Ausnahmen (siehe `with_skill_catalog_tools`).
+        registry_builder = self.with_skill_catalog_tools(role, registry_builder);
         let registry = registry_builder.build();
         tracing::debug!(
             role,
@@ -1847,7 +2061,7 @@ impl ChildRegistryFactory for RuntimeChildRegistryFactory {
                 .builtin_definitions
                 .get(role)
                 .map(ExecutableAgentIr::role),
-            extra_context: self.skill_fragments_for_role(role)?,
+            extra_context: self.skill_context_for_role(role)?,
             ..IdentityOverrides::default()
         };
         // Runde 7, Teil A6: wie in `build_registry`.
@@ -1887,11 +2101,14 @@ impl ChildRegistryFactory for RuntimeChildRegistryFactory {
                 message: format!("could not assemble child registry for role '{role}': {error}"),
             })?;
         // `install_over_default`: siehe Begründung in `build_registry`.
-        let registry = child_chain
+        let registry_builder = child_chain
             .install_over_default(assembled.registry)
             .spawner(Arc::new(DeferredManagedSpawner {
                 slot: Arc::clone(&self.spawner_slot),
-            }))
+            }));
+        // Plan R9, Teil A: auch der Steward findet und lädt Skills.
+        let registry = self
+            .with_skill_catalog_tools(role, registry_builder)
             .build();
         tracing::debug!(
             role,
@@ -1921,11 +2138,15 @@ fn merge_skill_names(catalog: &[String], definition: &[String]) -> Vec<String> {
 ///
 /// # Beschreibung
 /// Doppelte Namen zählen einmal, deaktivierte Skills werden übersprungen.
-/// Ein Name, den der Katalog nicht kennt oder dessen Verzeichnis sich in den
-/// Wurzeln nicht findet, ist ein Fehler (fail-closed).
+/// Ein Name, den der Katalog nicht kennt, wird aus `index` geladen (Plan R9:
+/// eingebettetes Bündel ohne Scaffold); ein dort deaktivierter Name wird
+/// übersprungen. Ein Name, den weder Katalog noch Index kennen oder dessen
+/// Verzeichnis sich in den Wurzeln nicht findet, ist ein Fehler
+/// (fail-closed).
 fn load_enabled_skills<'a>(
     lookup: impl Fn(&str) -> Option<&'a SkillToml>,
     roots: &[PathBuf],
+    index: Option<&SkillIndex>,
     names: &[String],
 ) -> Result<Vec<SkillRuntimeSnapshot>, String> {
     let mut seen = std::collections::BTreeSet::new();
@@ -1934,7 +2155,19 @@ fn load_enabled_skills<'a>(
         if !seen.insert(name.as_str()) {
             continue;
         }
-        let skill = lookup(name).ok_or_else(|| format!("skill '{name}' is not configured"))?;
+        let Some(skill) = lookup(name) else {
+            match index {
+                Some(index) if index.is_disabled(name) => continue,
+                Some(index) => match index.get(name).filter(|entry| entry.name == *name) {
+                    Some(entry) => {
+                        snapshots.push(entry.snapshot().clone());
+                        continue;
+                    }
+                    None => return Err(format!("skill '{name}' is not configured")),
+                },
+                None => return Err(format!("skill '{name}' is not configured")),
+            }
+        };
         if !skill.enabled {
             continue;
         }
@@ -1975,8 +2208,28 @@ pub fn skill_instruction_fragments(
     skill_roots: &[PathBuf],
     skill_names: &[String],
 ) -> RuntimeResult<Vec<String>> {
-    let snapshots = load_enabled_skills(|name| config.skills.get(name), skill_roots, skill_names)
-        .map_err(|detail| RuntimeError::Registry {
+    skill_instruction_fragments_with_index(config, skill_roots, None, skill_names)
+}
+
+/// Wie [`skill_instruction_fragments`], aber mit dem Skill-Index als Rückfall
+/// für Namen, die die Konfiguration nicht führt (Plan R9: eingebettete
+/// Skills ohne Scaffold).
+///
+/// # Errors
+/// Wie [`skill_instruction_fragments`].
+pub fn skill_instruction_fragments_with_index(
+    config: &ResolvedConfig,
+    skill_roots: &[PathBuf],
+    index: Option<&SkillIndex>,
+    skill_names: &[String],
+) -> RuntimeResult<Vec<String>> {
+    let snapshots = load_enabled_skills(
+        |name| config.skills.get(name),
+        skill_roots,
+        index,
+        skill_names,
+    )
+    .map_err(|detail| RuntimeError::Registry {
         detail: format!("could not load skills: {detail}"),
     })?;
     Ok(snapshots
@@ -1999,6 +2252,42 @@ pub fn agent_skill_fragments(
         Some(agent) => skill_instruction_fragments(config, skill_roots, &agent.skills),
         None => Ok(Vec::new()),
     }
+}
+
+/// Die fest gebundenen Skill-Fragmente einer Wurzel (UIA oder `--agent`),
+/// Plan R9, Teil A.
+///
+/// # Beschreibung
+/// Vereinigt die Skills eines gleichnamigen Legacy-`agent.toml`
+/// (`config.agents[legacy_agent].skills`, zuerst) mit dem `skills`-Feld der
+/// Definition der Wurzel ([`ExecutableAgentIr::skills`]); Duplikate zählen
+/// einmal. Früher suchte die Montage nur `config.agents[<Definitions-Id>]` —
+/// ein Schlüssel, den es nie gibt (`config.agents` ist nach dem schlichten
+/// Namen geschlüsselt) —, sodass die UIA-Wurzel nie ihre Skills bekam.
+/// Namen, die die Konfiguration nicht führt, kommen aus `index` (vertraute
+/// Layer plus eingebettetes Bündel).
+///
+/// # Errors
+/// Wie [`skill_instruction_fragments`]: ein aktivierter, aber nicht
+/// ladbarer oder gänzlich unbekannter Skill lässt die Montage scheitern
+/// (fail-closed).
+pub fn root_skill_fragments(
+    config: &ResolvedConfig,
+    skill_roots: &[PathBuf],
+    index: &SkillIndex,
+    root_ir: Option<&ExecutableAgentIr>,
+    legacy_agent: Option<&str>,
+) -> RuntimeResult<Vec<String>> {
+    let legacy: &[String] = legacy_agent
+        .and_then(|agent| config.agents.get(agent))
+        .map(|agent| agent.skills.as_slice())
+        .unwrap_or(&[]);
+    let definition: &[String] = root_ir.map(ExecutableAgentIr::skills).unwrap_or(&[]);
+    let names = merge_skill_names(legacy, definition);
+    if names.is_empty() {
+        return Ok(Vec::new());
+    }
+    skill_instruction_fragments_with_index(config, skill_roots, Some(index), &names)
 }
 
 /// Die Fragmente **aller** aktivierten Skills der Konfiguration, nach Namen
@@ -2080,6 +2369,42 @@ impl AgentSpawner for DeferredManagedSpawner {
             .map_or_else(Vec::new, |spawner| {
                 spawner.delegation_target_names(parent_session_id)
             })
+    }
+
+    // Plan R9, Teil C/E1: Katalog, Plan-Modus-Regel und benannte Gründe
+    // auch unterhalb der Wurzel (sonst gälte der Trait-Default: im Plan-Modus
+    // kein Ziel, keine Beschreibungen).
+    fn delegation_targets(
+        &self,
+        parent_session_id: &harw_types::SessionId,
+        plan_mode: bool,
+    ) -> Result<harw_extension_api::DelegationTargets, harw_extension_api::DelegationUnavailable>
+    {
+        match self.slot.get().and_then(Weak::upgrade) {
+            Some(spawner) => spawner.delegation_targets(parent_session_id, plan_mode),
+            None => Err(harw_extension_api::DelegationUnavailable::NoSpawnContext {
+                detail: "managed child spawner is not available".to_owned(),
+            }),
+        }
+    }
+
+    fn note_caller_mode(&self, caller: &harw_types::SessionId, plan_mode: bool) {
+        if let Some(spawner) = self.slot.get().and_then(Weak::upgrade) {
+            spawner.note_caller_mode(caller, plan_mode);
+        }
+    }
+
+    // Runde 9, E3: `agent.message` an ein eigenes, beendetes Kind wird auch
+    // unterhalb der Wurzel zur Fortsetzung.
+    fn resumable_child_role(
+        &self,
+        caller: &harw_types::SessionId,
+        child_id: &str,
+    ) -> Option<String> {
+        self.slot
+            .get()
+            .and_then(Weak::upgrade)
+            .and_then(|spawner| spawner.resumable_child_role(caller, child_id))
     }
 }
 
@@ -3034,14 +3359,14 @@ mod tests {
         Ok((layer, config))
     }
 
-    /// Runde 7, Teil T5: der LaTeX-Writer der UIA bekommt über seine
-    /// eingebaute Definition genau die vier Skills `latex-report`,
-    /// `latex-writing`, `xelatex-compile`, `business-writing-pyramid` — in
-    /// dieser Reihenfolge und aus den mitgelieferten Skill-Dateien. Der Skill
-    /// `latex-report` trägt dabei Vorlage, Werkzeuge und Übergabeformat
-    /// (Registry-Kinder bekommen kein `system.md`).
+    /// Runde 7, Teil T5 / Plan R9: der LaTeX-Writer der UIA bekommt über
+    /// seine eingebaute Definition fest nur `latex-report` aus den
+    /// mitgelieferten Skill-Dateien — die übrigen drei lädt er bei Bedarf
+    /// über `skills.load`, auf die der Skill verweist. `latex-report` trägt
+    /// Vorlage, Werkzeuge und Übergabeformat (Registry-Kinder bekommen kein
+    /// `system.md`). Dazu kommt die einzeilige Katalog-Zeile.
     #[test]
-    fn uia_latex_writer_receives_its_four_bundled_skills() -> TestResult {
+    fn uia_latex_writer_receives_only_latex_report_and_the_catalog_hint() -> TestResult {
         let (layer, config) = bundled_skill_layer()?;
         let factory = RuntimeChildRegistryFactory::new(
             test_project(),
@@ -3055,26 +3380,140 @@ mod tests {
         let fragments = factory
             .skill_fragments_for_role(role_names::UIA_LATEX_WRITER)
             .map_err(|error| crate::test_support::TestError::Unexpected(error.message))?;
-        let expected = [
-            "latex-report",
-            "latex-writing",
-            "xelatex-compile",
-            "business-writing-pyramid",
-        ];
-        assert_eq!(fragments.len(), expected.len(), "{fragments:?}");
-        for (fragment, name) in fragments.iter().zip(expected) {
-            assert!(
-                fragment.starts_with(&format!("# Skill: {name} (sha256 ")),
-                "{name}: {}",
-                fragment.lines().next().unwrap_or_default()
-            );
-        }
-        for phrase in ["latex.template", "latex.check", "doc.read_pdf", "Overfull"] {
+        assert_eq!(fragments.len(), 1, "{fragments:?}");
+        assert!(
+            fragments[0].starts_with("# Skill: latex-report (sha256 "),
+            "{}",
+            fragments[0].lines().next().unwrap_or_default()
+        );
+        for phrase in [
+            "latex.template",
+            "latex.check",
+            "doc.read_pdf",
+            "Overfull",
+            "skills.load",
+        ] {
             assert!(
                 fragments[0].contains(phrase),
                 "latex-report muss {phrase} nennen"
             );
         }
+        let context = factory
+            .skill_context_for_role(role_names::UIA_LATEX_WRITER)
+            .map_err(|error| crate::test_support::TestError::Unexpected(error.message))?;
+        assert_eq!(context.len(), 2, "{context:?}");
+        assert!(context[1].contains("skills.search") && !context[1].contains('\n'));
+        Ok(())
+    }
+
+    /// Plan R9, Teil A: ohne Scaffold (kein Layer führt `latex-report`)
+    /// lädt der Writer seinen festen Skill aus dem eingebetteten Bündel,
+    /// statt den Start zu verweigern; die Rolle bekommt Katalog-Werkzeuge
+    /// und -Zeile, eine Matrix-Sitz-Rolle keines von beiden.
+    #[test]
+    fn fixed_skills_fall_back_to_the_bundle_and_roles_get_the_catalog() -> TestResult {
+        let empty = tempfile::tempdir().map_err(ctx("tempdir"))?;
+        let config = harw_config::ResolvedConfig::default();
+        let factory = RuntimeChildRegistryFactory::new(
+            test_project(),
+            Arc::new(harw_core::EchoModelProvider::new("echo")),
+            test_chain(&config),
+        )
+        .map_err(ctx("factory builds"))?
+        .with_skill_catalog(&config, vec![empty.path().to_path_buf()])
+        .map_err(ctx("skill catalog"))?;
+        let fragments = factory
+            .skill_fragments_for_role(role_names::UIA_LATEX_WRITER)
+            .map_err(|error| crate::test_support::TestError::Unexpected(error.message))?;
+        assert_eq!(fragments.len(), 1, "{fragments:?}");
+        assert!(fragments[0].starts_with("# Skill: latex-report (sha256 "));
+
+        for role in [
+            role_names::EXPLORER,
+            role_names::EXECUTOR,
+            role_names::UIA_WORKER,
+            role_names::ROOT_ORCHESTRATOR,
+            role_names::AGENT_STEWARD,
+        ] {
+            assert!(factory.skill_catalog_index_for(role).is_some(), "{role}");
+            let registry = factory
+                .with_skill_catalog_tools(
+                    role,
+                    harw_extension_api::ExtensionRegistryBuilder::default(),
+                )
+                .build();
+            let mut names: Vec<String> = registry
+                .tool_providers()
+                .iter()
+                .flat_map(|provider| provider.tools())
+                .map(|spec| spec.name().to_owned())
+                .collect();
+            names.sort();
+            assert_eq!(names, ["skills.load", "skills.search"], "{role}");
+            let context = factory
+                .skill_context_for_role(role)
+                .map_err(|error| crate::test_support::TestError::Unexpected(error.message))?;
+            assert!(
+                context
+                    .last()
+                    .is_some_and(|line| line.contains("Skills verfügbar")),
+                "{role}: {context:?}"
+            );
+        }
+        assert!(
+            factory
+                .skill_catalog_index_for(role_names::MATRIX_PLAYER)
+                .is_none()
+        );
+        // Eine eigene (nicht eingebaute) Rolle bekommt den Katalog ebenfalls.
+        assert!(factory.skill_catalog_index_for("eigene-rolle").is_some());
+        // Drei Stellen nennen dieselben zwei Werkzeuge: die immer
+        // freigeschaltete Aktivierung (harw-core), das Rollenangebot und der
+        // Provider (harw-registry-defaults).
+        assert_eq!(
+            harw_core::activation::ALWAYS_AVAILABLE_TOOLS,
+            harw_registry_defaults::profile::SKILL_CATALOG_TOOLS
+        );
+        assert_eq!(
+            harw_registry_defaults::profile::SKILL_CATALOG_TOOLS,
+            harw_registry_defaults::SkillCatalogToolProvider::TOOL_NAMES
+        );
+        Ok(())
+    }
+
+    /// Plan R9, Teil A (Bugfix): die Wurzel bekommt die festen Skills aus
+    /// ihrer eigenen Definition (UIA-/`--agent`-IR), vereinigt mit einem
+    /// gleichnamigen Legacy-`agent.toml` — auch ohne Scaffold aus dem Bündel.
+    #[test]
+    fn root_skill_fragments_read_the_root_definition() -> TestResult {
+        let index = SkillIndex::build(&[]);
+        let config = harw_config::ResolvedConfig::default();
+        let uia = ir_with_skills(&["latex-report", "business-writing-pyramid"])?;
+        let fragments = root_skill_fragments(&config, &[], &index, Some(&uia), None)
+            .map_err(ctx("root fragments"))?;
+        assert_eq!(fragments.len(), 2, "{fragments:?}");
+        assert!(fragments[0].starts_with("# Skill: latex-report (sha256 "));
+        assert!(fragments[1].starts_with("# Skill: business-writing-pyramid (sha256 "));
+        assert!(
+            root_skill_fragments(&config, &[], &index, None, None)
+                .map_err(ctx("no root"))?
+                .is_empty()
+        );
+
+        // Legacy-`agent.toml` zuerst, Definitions-Skills dedupliziert dahinter.
+        let (layer, config) = skill_fixture("assistant")?;
+        let roots = vec![layer.path().to_path_buf()];
+        let index = SkillIndex::build(&roots);
+        let root = ir_with_skills(&["review", "latex-report"])?;
+        let merged = root_skill_fragments(&config, &roots, &index, Some(&root), Some("assistant"))
+            .map_err(ctx("merged fragments"))?;
+        assert_eq!(merged.len(), 2, "{merged:?}");
+        assert!(merged[0].starts_with("# Skill: review (sha256 "));
+        assert!(merged[1].starts_with("# Skill: latex-report (sha256 "));
+
+        // Ein gänzlich unbekannter fester Skill bleibt fail-closed.
+        let unknown = ir_with_skills(&["gibt-es-nicht"])?;
+        assert!(root_skill_fragments(&config, &roots, &index, Some(&unknown), None).is_err());
         Ok(())
     }
 
@@ -3565,6 +4004,94 @@ mod tests {
         let _ = factory.child_session_observers(role_names::PLANNER, &idle);
         factory.child_session_released(role_names::PLANNER, &idle);
         assert!(diary_entries(&store, role_names::PLANNER, at)?.is_empty());
+        Ok(())
+    }
+
+    /// Plan R9, Teil B: ein benutzerdefinierter Agent aus dem Roster läuft
+    /// mit seiner geklemmten IR, dem Profil seines Roster-Eintrags und den
+    /// namensgebundenen Tabellen seiner Basisrolle.
+    #[test]
+    fn custom_roster_agents_use_their_clamped_ir_and_base_role_tables() -> TestResult {
+        let home = tempfile::tempdir().map_err(ctx("tempdir"))?;
+        for (dir, source) in [
+            (
+                "note-taker",
+                r#"schema = "harwness.agent/v1"
+id = "user.agent.note-taker@1"
+version = "1.0.0"
+extends = { id = "harwness.agent.worker-base@1" }
+role = "worker"
+specialization = "note-taker"
+instructions_file = "system.md"
+
+[tools]
+admitted = ["fs.read", "shell.exec"]
+"#,
+            ),
+            (
+                "web-scout",
+                r#"schema = "harwness.agent/v1"
+id = "user.agent.web-scout@1"
+version = "1.0.0"
+extends = { id = "harwness.agent.explorer@1" }
+role = "worker"
+specialization = "web-scout"
+"#,
+            ),
+        ] {
+            let path = home.path().join("agents").join(dir);
+            std::fs::create_dir_all(&path).map_err(ctx("Agentenordner"))?;
+            std::fs::write(path.join("definition.toml"), source).map_err(ctx("definition"))?;
+            std::fs::write(path.join("system.md"), "Notizen knapp zusammenfassen.")
+                .map_err(ctx("system.md"))?;
+        }
+        let config =
+            harw_config::discover_config(&[home.path().to_path_buf()]).map_err(ctx("Discovery"))?;
+        let builtin = builtin_agent_definitions(&HashMap::new()).map_err(ctx("Rollen"))?;
+        let roster = harw_registry_defaults::AgentRoster::from_config(&builtin, &config)
+            .map_err(ctx("Roster"))?;
+
+        let factory = RuntimeChildRegistryFactory::with_definitions(
+            test_project(),
+            Arc::new(harw_core::EchoModelProvider::new("echo")),
+            test_chain(&harw_config::ResolvedConfig::default()),
+            roster.definitions().clone(),
+        )
+        .with_custom_agents(roster.custom_wiring());
+
+        let ir = factory
+            .executable_agent_ir("note-taker")
+            .ok_or(crate::test_support::TestError::Missing("note-taker IR"))?;
+        assert!(
+            !ir.tool_surface()
+                .admitted()
+                .iter()
+                .any(|tool| tool == "shell.exec"),
+            "die Decke entfernt shell.exec"
+        );
+        assert_eq!(
+            factory.registry_profile_for("note-taker"),
+            Some(harw_registry_defaults::RegistryProfile::ReadOnlyExplore)
+        );
+        assert_eq!(factory.lookup_role("note-taker"), role_names::ANALYST);
+        assert_eq!(
+            factory.lookup_role(role_names::EXPLORER),
+            role_names::EXPLORER
+        );
+        assert!(
+            factory
+                .custom_agents
+                .get("note-taker")
+                .and_then(|wiring| wiring.instructions.as_deref())
+                .is_some_and(|text| text.contains("Notizen"))
+        );
+        // Die interne Modellstelle folgt der Basisrolle.
+        assert_eq!(
+            factory.internal_point_for_child("web-scout"),
+            internal_point_for_role(role_names::EXPLORER)
+        );
+        // Unbekannte Namen bleiben fail-closed.
+        assert_eq!(factory.registry_profile_for("not-registered"), None);
         Ok(())
     }
 }

@@ -1,0 +1,29 @@
+# Mitgelieferter Agent `debug-orchestrator` (Plan R9, Teil B: migriert aus dem
+# Legacy-Format `agent.toml`; `system.md` bleibt die Arbeitsanweisung und
+# wird per `instructions_file` in den Kontext des Kindes gelegt).
+#
+# Benutzerdefinierter Child-Orchestrator auf `child-orchestrator-base@1`:
+# die Basis besitzt Werkzeuge, Tiefe (`max_depth = 1`) und Budget; hier
+# stehen nur Identität, Skills und die namentlichen Delegationsziele.
+
+schema = "harwness.agent/v1"
+id = "harwness.agent.debug-orchestrator@1"
+version = "1.0.0"
+extends = { id = "harwness.agent.child-orchestrator-base@1" }
+role = "child-orchestrator"
+specialization = "debug-orchestrator"
+
+name = "Debug Orchestrator"
+description = "Coordinates reproducible incident triage, diagnosis, remediation, and regression verification."
+instructions_file = "system.md"
+
+skills = ["debugging", "incident-response", "verification"]
+
+[delegation]
+targets = [
+  "debugger",
+  "log-analyst",
+  "incident-triager",
+  "test-engineer",
+  "explorer",
+]

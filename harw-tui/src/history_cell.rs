@@ -1480,7 +1480,8 @@ pub(crate) type SharedToolCell = Arc<Mutex<ToolCell>>;
 ///   Darstellungsform wie `fs.read`, nur mit optionalem Seitenbereich);
 ///   geht die Datei an einen Remote-OCR-Dienst, folgt
 ///   `→ remote OCR (<Host>)`.
-/// - `transfer_to_<rolle>` → `Agent(<rolle>)`.
+/// - `transfer_to_<rolle>` → `Agent(<rolle>)`, ebenso
+///   `agents.delegate {agent: <rolle>}` (Plan R9, Teil C).
 /// - alles andere → `name(schlüssel: wert, …)` mit den ersten bis zu drei
 ///   **skalaren** Argumenten (Zeichenketten in Anführungszeichen, auf 40
 ///   Zeichen gekürzt); verschachtelte Objekte/Arrays werden übersprungen,
@@ -1535,6 +1536,10 @@ pub(crate) fn tool_label(call: &ToolCall) -> String {
         }
         other if other.len() > "transfer_to_".len() && other.starts_with("transfer_to_") => {
             format!("Agent({})", &other["transfer_to_".len()..])
+        }
+        // Plan R9, Teil C: `agents.delegate` ist derselbe Handoff.
+        "agents.delegate" if str_arg("agent").is_some() => {
+            format!("Agent({})", str_arg("agent").unwrap_or_default())
         }
         _ => unknown_tool_label(call),
     }
@@ -3535,6 +3540,12 @@ mod tests {
     fn test_tool_label_transfer_to_role_is_agent() {
         let call = make_tool_call("transfer_to_explorer", harw_tools::serde_json::json!({}));
         assert_eq!(tool_label(&call), "Agent(explorer)");
+        // Plan R9, Teil C: `agents.delegate` zeigt denselben Handoff.
+        let call = make_tool_call(
+            "agents.delegate",
+            harw_tools::serde_json::json!({ "agent": "evidence-critic", "task": "prüfe" }),
+        );
+        assert_eq!(tool_label(&call), "Agent(evidence-critic)");
     }
 
     /// Unbekannte Werkzeuge zeigen niemals eine rohe JSON-Klammer — auch

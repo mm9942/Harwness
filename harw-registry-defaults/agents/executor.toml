@@ -68,7 +68,22 @@ may_research_web = false
 # Werkzeuge ausdruecklich, damit ein Konsument die Ablehnung begruenden kann,
 # statt nur "nicht in admitted" zu melden.
 [tools]
-admitted = ["shell.exec"]
+admitted = [
+  "shell.exec",
+  # Plan R9, Teil F: lang laufende/verfolgbare Prozesse (Builds, Restores,
+  # Testläufe, alles über ~2 min) als Job statt tmux; gleicher Rechte- und
+  # Freigabeweg wie `shell.exec` (`harw_registry_defaults::profile::JOB_TOOLS`).
+  "job.start",
+  "job.status",
+  "job.logs",
+  "job.stop",
+  "job.list",
+  "job.wait",
+  # Plan R9, Teil A: Skills nur über den Katalog finden und laden
+  # (`harw_registry_defaults::profile::skill_catalog_tools_for_role`).
+  "skills.search",
+  "skills.load",
+]
 forbidden = [
   "fs.read",
   "fs.search",

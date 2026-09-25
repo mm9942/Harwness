@@ -777,6 +777,10 @@ fn root_activation(ir: Option<&ExecutableAgentIr>) -> SessionActivation {
     for name in ir.tool_surface().admitted() {
         activation.enable_tool(ToolName::new(name.clone()));
     }
+    // Plan R9, Teil A: wortgleich zu `with_executable_agent_ir`.
+    for name in harw_core::activation::ALWAYS_AVAILABLE_TOOLS {
+        activation.enable_tool(ToolName::new(*name));
+    }
     for name in ir.tool_surface().forbidden() {
         activation.disable_tool(ToolName::new(name.clone()));
     }
@@ -1773,6 +1777,20 @@ impl RuntimeAssemblyBuilder {
         } else {
             HashMap::new()
         };
+        // Plan R9, Teil B: der Roster aller startbaren Agenten — eingebaute
+        // Rollen plus die benutzerdefinierten Agenten aus Profil und
+        // vertrautem Projekt (geklemmt unter ihre Basisrolle). Der Spawner
+        // registriert genau diese Namen; Welle 2 (Katalog, `agents.delegate`)
+        // liest ihn über `RuntimeAssembly::agent_roster`.
+        let agent_roster = Arc::new(if needs_definitions {
+            harw_registry_defaults::AgentRoster::from_config(&agent_definitions, &config).map_err(
+                |error| RuntimeError::Registry {
+                    detail: format!("could not build the agent roster: {error}"),
+                },
+            )?
+        } else {
+            harw_registry_defaults::AgentRoster::default()
+        });
         // Runde 3, Welle C1: ein explizit gewählter Wurzel-Agent
         // (`--agent`, `harness.active_agent_definition`) gewinnt über die UIA;
         // die UIA ist dann nicht Pflicht. Als Wurzel zugelassen sind nur
@@ -1914,25 +1932,54 @@ impl RuntimeAssemblyBuilder {
                 overrides.extra_context.extend(fragments);
             }
         }
-        // Welle 4 (Skill-Proposals): die direkt konfigurierten Skills des
-        // Wurzel-Agenten (`agents/<agent>/agent.toml`, Feld `skills`) als
-        // Instruktionsfragmente mit SHA-256-Provenienz — derselbe Weg wie für
-        // Kinder (`RuntimeChildRegistryFactory::with_skill_catalog`). Der
-        // Agent ist die aktive UIA, sonst der benannte Wurzel-Agent; ohne
-        // `agent.toml` bleibt die Liste leer. Ein aktivierter, aber nicht
+        // Welle 4 (Skill-Proposals) / Plan R9, Teil A: die fest gebundenen
+        // Skills der Wurzel als Instruktionsfragmente mit SHA-256-Provenienz
+        // — derselbe Weg wie für Kinder
+        // (`RuntimeChildRegistryFactory::with_skill_catalog`). Quelle ist das
+        // `skills`-Feld der Definition der Wurzel (aktive UIA bzw.
+        // `--agent`-IR), vereinigt mit einem gleichnamigen Legacy-
+        // `agents/<agent>/agent.toml`. Früher wurde nur
+        // `config.agents[<Definitions-Id>]` gesucht, ein Schlüssel, den es nie
+        // gibt — die UIA bekam deshalb nie Skills. Namen ohne Layer kommen aus
+        // dem eingebetteten Bündel (`SkillIndex`). Ein aktivierter, aber nicht
         // ladbarer Skill lässt die Montage scheitern (fail-closed).
+        // `root_skill_agent` bleibt die Agent-Id des Tagebuchs (Diary, 12a).
         let root_skill_agent = uia_ir
             .as_ref()
             .map(|ir| ir.id().to_string())
             .or_else(|| overrides.agent_name.clone());
-        if let Some(agent) = root_skill_agent.as_deref() {
+        let skill_index = Arc::new(harw_catalog::SkillIndex::build(&trust_report.layers));
+        let legacy_skill_agent = match uia_ir.as_ref() {
+            Some(uia) => Some(uia.specialization().to_owned()),
+            None => overrides.agent_name.clone(),
+        };
+        overrides
+            .extra_context
+            .extend(crate::children::root_skill_fragments(
+                &config,
+                &trust_report.layers,
+                &skill_index,
+                uia_ir.as_ref().or(agent_ir.as_ref()),
+                legacy_skill_agent.as_deref(),
+            )?);
+        // Plan R9, Teil A: `skills.search`/`skills.load` an der Wurzel — nicht
+        // für werkzeuglose Einstiege (`NoTools`) und nicht für den entfernten
+        // Telegram-Chat (`WorkspaceEdit`, wie Workbench/Palace); eine
+        // `--agent`-Wurzel nur, wenn ihre Definition beide admittiert. Dazu
+        // genau eine Kontextzeile mit der Anzahl verfügbarer Skills.
+        let skill_catalog_at_root = !matches!(
+            registry_profile,
+            RegistryProfile::NoTools | RegistryProfile::WorkspaceEdit
+        ) && (agent_ir.is_none()
+            || harw_registry_defaults::profile::SKILL_CATALOG_TOOLS
+                .iter()
+                .all(|tool| activation.is_tool_enabled(&ToolName::new((*tool).to_owned()))));
+        if skill_catalog_at_root {
             overrides
                 .extra_context
-                .extend(crate::children::agent_skill_fragments(
-                    &config,
-                    &trust_report.layers,
-                    agent,
-                )?);
+                .push(harw_registry_defaults::skill_catalog_hint(
+                    skill_index.len(),
+                ));
         }
         let narrowed_root = narrowing
             .as_ref()
@@ -2015,6 +2062,28 @@ impl RuntimeAssemblyBuilder {
             // Runde 5, Teil N: `[shell] max_timeout_secs` für jeden
             // Shell-Provider (Wurzel und Kinder).
             .with_shell_max_timeout_secs(config.harness.shell.effective_max_timeout_secs());
+        // Plan R9, Teil F: eine Job-Verwaltung je interaktiver TUI-Sitzung
+        // (`<projekt>/.harw/state/jobs/`). Sie reist mit der Host-Permit-
+        // Verdrahtung zu Wurzel und Kind-Fabriken: `job.*` neben jedem
+        // `shell.exec` (Klon desselben Shell-Providers), Kontrollwerkzeuge
+        // für Orchestratoren. Andere Einstiege enden mit ihrem Prozess und
+        // bekommen keine Jobs.
+        let (session_jobs, job_notifications) = if spec.entry == EntryKind::Tui {
+            match crate::job_wiring::SessionJobs::open(&home_project.state_dir()) {
+                Ok((jobs, receiver)) => (Some(jobs), Some(receiver)),
+                Err(error) => {
+                    tracing::warn!(error = %error, "runtime.jobs.open_failed");
+                    (None, None)
+                }
+            }
+        } else {
+            (None, None)
+        };
+        let host_permit_wiring = host_permit_wiring.with_jobs(
+            session_jobs
+                .as_ref()
+                .map(crate::job_wiring::SessionJobs::wiring),
+        );
         let host_root_label: Option<String> = if uia_ir.is_some() {
             Some(crate::host_escalation_wiring::UIA_ROOT_LABEL.to_owned())
         } else {
@@ -2075,6 +2144,12 @@ impl RuntimeAssemblyBuilder {
                                     .permissions()
                                     .contains(harw_authority::Permission::ReadWorkspace)
                             }),
+                    )
+                    // Plan R9, Teil A: den Skill-Katalog trägt jede Sitzung.
+                    .chain(
+                        harw_registry_defaults::profile::SKILL_CATALOG_TOOLS
+                            .iter()
+                            .copied(),
                     )
                     .map(str::to_owned)
                     .collect(),
@@ -2139,6 +2214,12 @@ impl RuntimeAssemblyBuilder {
                     agent_dir,
                     AgentRoleId::UserInterface,
                 ),
+            ));
+        }
+        // Plan R9, Teil A: der lesende Skill-Katalog (siehe oben).
+        if skill_catalog_at_root {
+            registry_builder = registry_builder.tool_provider(Arc::new(
+                harw_registry_defaults::SkillCatalogToolProvider::new(Arc::clone(&skill_index)),
             ));
         }
         // Skill-Proposals: nur die UIA-Wurzel prüft und committet
@@ -2300,7 +2381,7 @@ impl RuntimeAssemblyBuilder {
                 spawn_context: &spawn_context,
                 reasoning_effort: spec.reasoning_effort,
                 activation: &activation,
-                definitions: &agent_definitions,
+                roster: &agent_roster,
                 guard_policy,
                 pitfall_advisor: pitfall_advisor.clone(),
                 profile_agents_dir: profile_agents_dir.clone(),
@@ -2356,6 +2437,30 @@ impl RuntimeAssemblyBuilder {
                         "runtime.child_reaper.no_tokio_runtime_skipping"
                     );
                 }
+            }
+        }
+
+        // Plan R9, Teil F: Zustellung der Job-Ereignisse — Kinder über die
+        // Journale des Spawners, sonst die Wurzel; dazu das Signal für die
+        // Jobs-Gruppe des Agenten-Panels. Ein Wurzel-Profil ohne Shell (etwa
+        // eine Orchestrator-Wurzel) verfolgt und stoppt Jobs seiner Kinder
+        // über die Kontrollwerkzeuge.
+        if let Some(jobs) = session_jobs.as_ref() {
+            jobs.router.bind(
+                spawner
+                    .as_ref()
+                    .map(|spawner| Arc::clone(spawner.child_comms())),
+                root_session_id.clone(),
+            );
+            jobs.router.attach_agent_events(agent_events.clone());
+            if let Some(receiver) = job_notifications {
+                crate::job_wiring::spawn_forwarder(Arc::clone(&jobs.router), receiver);
+            }
+            let root_has_shell = registry_profile
+                .registered_tool_names()
+                .contains(&"shell.exec");
+            if !root_has_shell && registry_profile != RegistryProfile::NoTools {
+                registry_builder = registry_builder.tool_provider(jobs.wiring().control_provider());
             }
         }
 
@@ -2453,9 +2558,21 @@ impl RuntimeAssemblyBuilder {
         .with_agent_events(Arc::new(agent_events.clone()));
         // Live-Modellwechsel: `/model switch` & Co. bauen darüber einen
         // Provider-Client neu bzw. übernehmen die Rollenwahl.
+        // Plan R9, Teil F: `/jobs` und die Jobs-Gruppe der TUI (Slash-Fläche).
+        let services = match session_jobs.as_ref() {
+            Some(jobs) => services.with_job_manager(Arc::clone(&jobs.manager)),
+            None => services,
+        };
         let services = services.with_live_model_control(
             Arc::clone(&live_models) as harw_ops::live_model::SharedLiveModelControl
         );
+        // Live-Stand der Konfiguration: gespeicherte Änderungen (`/models
+        // set`, `/model switch`, `/mode default`, …) sind sofort in jeder
+        // neu gebauten `ServiceMap` sichtbar — Ansichten zeigen nie mehr den
+        // Stand des Starts.
+        let services = services.with_live_config(Arc::new(harw_ops::live_config::LiveConfig::new(
+            Arc::clone(&config),
+        )));
         // Runde 5, Teil E: `/permissions log` liest das Auto-Modus-Protokoll.
         let services = match chain.auto_mode() {
             Some(auto) => services.with_auto_decision_log(auto.log().clone()),
@@ -2876,6 +2993,7 @@ impl RuntimeAssemblyBuilder {
             stores,
             spawner,
             spawner_roles,
+            agent_roster,
             agent_events,
             lifecycle_hooks,
             tools,
@@ -2901,6 +3019,8 @@ impl RuntimeAssemblyBuilder {
             // Runde 5, Teil G.
             uia_worker_routing,
             live_models,
+            // Plan R9, Teil F.
+            session_jobs,
         })
     }
 }
@@ -2908,11 +3028,11 @@ impl RuntimeAssemblyBuilder {
 /// Senkt die eingebauten Rollen **einmal** je Montage.
 ///
 /// # Beschreibung
-/// `existing` ist `config.executable_agents` — die aus `[agents]` gelowerten
-/// Rollen. [`builtin_agent_definitions`] überspringt jede eingebaute Rolle,
-/// deren Namen eine lokale Definition bereits belegt
-/// (`harw-registry-defaults/src/embedded_agents.rs:645-647`); die lokale Rolle
-/// gewinnt damit, ohne dass hier etwas zusammengeführt werden müsste.
+/// `existing` ist `config.executable_agents` — die gesenkten lokalen
+/// DSL-Definitionen, nach `DefinitionId`. Seit Plan R9 (Teil B) ersetzt keine
+/// davon eine eingebaute Rolle: [`builtin_agent_definitions`] meldet eine
+/// Kollision nur und behält die eingebaute Rolle. Lokale Agenten werden unter
+/// ihrem eigenen Namen startbar (`harw_registry_defaults::AgentRoster`).
 ///
 /// # Fehler
 /// [`RuntimeError::Registry`], wenn eine eingebettete Definition nicht senkt.
@@ -4312,8 +4432,9 @@ struct SpawnerInputs<'a> {
     reasoning_effort: Option<harw_types::ReasoningEffort>,
     /// Die Basis-Aktivierung der Wurzel; Kinder werden dagegen geschnitten.
     activation: &'a SessionActivation,
-    /// Die **einmal** gesenkten eingebauten Rollen.
-    definitions: &'a HashMap<String, ExecutableAgentIr>,
+    /// Der Roster aller startbaren Agenten (Plan R9, Teil B): eingebaute
+    /// Rollen und geklemmte benutzerdefinierte Agenten, je mit ihrer IR.
+    roster: &'a harw_registry_defaults::AgentRoster,
     /// Wächter-Schwellen dieses Laufs (Addendum F+G); jedes über diesen
     /// Spawner admittierte Kind bekommt dieselbe Politik wie die Wurzel
     /// (`children.rs`-Brief: "Kind-Sessions bekommen dieselbe GuardPolicy +
@@ -4395,7 +4516,7 @@ fn build_spawner(
         spawn_context,
         reasoning_effort,
         activation,
-        definitions,
+        roster,
         guard_policy,
         pitfall_advisor,
         profile_agents_dir,
@@ -4442,8 +4563,11 @@ fn build_spawner(
             project.clone(),
             Arc::clone(model),
             chain.clone(),
-            definitions.clone(),
+            roster.definitions().clone(),
         )
+        // Plan R9, Teil B: Basisrolle, Profil und Instruktionen der
+        // benutzerdefinierten Agenten.
+        .with_custom_agents(roster.custom_wiring())
         .with_internal_models(crate::children::resolve_internal_models_for_children(
             config,
         ))
@@ -4509,8 +4633,11 @@ fn build_spawner(
             project.clone(),
             Arc::clone(uia_worker_model),
             chain.clone(),
-            definitions.clone(),
+            roster.definitions().clone(),
         )
+        // Plan R9, Teil B: Basisrolle, Profil und Instruktionen der
+        // benutzerdefinierten Agenten.
+        .with_custom_agents(roster.custom_wiring())
         .with_profile_agents_dir(profile_agents_dir)
         .with_browser_config(config.browser.clone())
         .with_spawner_slot(Arc::clone(&spawner_slot))
@@ -4600,15 +4727,22 @@ fn build_spawner(
             role_names::MATRIX_ROLES
                 .iter()
                 .map(|role| (*role).to_owned()),
-        );
-    let mut roles: Vec<String> = Vec::with_capacity(role_names::ALL.len());
-    for role in role_names::ALL {
+        )
+        // Plan R9, Teil C/E1: Katalogdaten des Rosters — Beschreibung,
+        // Skills, Rechte, Budget, Herkunft und die Lese-Eigenschaft, nach der
+        // im Plan-Modus nur lesende Ziele delegierbar bleiben.
+        .with_delegation_catalog(roster.entries().map(delegation_target_info));
+    // Plan R9, Teil B: registriert wird der ganze Roster — die eingebauten
+    // Rollen (`role_names::ALL`) und daneben jeder benutzerdefinierte Agent.
+    let mut roles: Vec<String> = Vec::with_capacity(roster.len());
+    for role in roster.names() {
         // Welle 3a, Teil A, Schritt 5: dieselbe Organisationsrolle, die
         // `RuntimeChildRegistryFactory::build_registry` für `role` gleich
         // noch einmal liest — trifft automatisch alle vier
         // UIA-Spezialisierungen, ohne eine Namensliste zu pflegen.
-        let organizational_role = definitions
-            .get(*role)
+        let organizational_role = roster
+            .definitions()
+            .get(role)
             .map_or(AgentRoleId::Worker, ExecutableAgentIr::role);
         let role_factory = if organizational_role == AgentRoleId::UiaWorker {
             Arc::clone(&uia_worker_factory)
@@ -4616,9 +4750,9 @@ fn build_spawner(
             Arc::clone(&factory)
         };
         spawner = spawner.with_role(
-            (*role).to_owned(),
+            role.to_owned(),
             AgentRole::Agent {
-                name: (*role).to_owned(),
+                name: role.to_owned(),
             },
             // The registered target's sealed role comes from its frozen
             // definition. Unknown/missing definitions fail closed as workers,
@@ -4626,7 +4760,7 @@ fn build_spawner(
             organizational_role,
             role_factory,
         );
-        roles.push((*role).to_owned());
+        roles.push(role.to_owned());
     }
     roles.sort();
 
@@ -4649,6 +4783,24 @@ fn build_spawner(
         })?;
 
     Ok((Some(spawner), roles))
+}
+
+/// Plan R9, Teil C: die Katalogdaten eines Roster-Eintrags für
+/// `agents.catalog`, `transfer_to_*`-Beschreibungen und die Plan-Modus-Regel
+/// ([`harw_core::delegation_visibility::delegable_in_mode`]).
+fn delegation_target_info(
+    entry: &harw_registry_defaults::RosterEntry,
+) -> harw_extension_api::DelegationTargetInfo {
+    harw_extension_api::DelegationTargetInfo {
+        name: entry.name.clone(),
+        role: harw_core::delegation_visibility::role_label(entry.role).to_owned(),
+        description: entry.description.clone(),
+        skills: entry.skills.clone(),
+        profile_summary: entry.profile_summary(),
+        read_only: entry.read_only,
+        budget_tokens: entry.budget_tokens,
+        custom: entry.is_custom(),
+    }
 }
 
 /// Die fertige Montage eines Laufs.
@@ -4697,6 +4849,9 @@ pub struct RuntimeAssembly {
     stores: RuntimeStores,
     spawner: Option<Arc<ManagedAgentSpawner>>,
     spawner_roles: Vec<String>,
+    /// Plan R9, Teil B: der Roster aller startbaren Agenten dieses Laufs
+    /// (leer ohne Spawner-Politik bzw. ohne Definitionen).
+    agent_roster: Arc<harw_registry_defaults::AgentRoster>,
     /// Agenten-übergreifender Live-Bus (Wurzel + alle Kinder).
     agent_events: harw_core::AgentEventHub,
     lifecycle_hooks: Vec<Arc<dyn SessionLifecycleHook>>,
@@ -4784,6 +4939,9 @@ pub struct RuntimeAssembly {
     uia_worker_routing: Arc<crate::uia_worker_routing::UiaWorkerRouting>,
     /// Live-Modellwahl der Montage (siehe [`Self::live_models`]).
     live_models: Arc<crate::live_model::LiveModelRouting>,
+    /// Plan R9, Teil F: Job-Verwaltung und Zustellung (nur TUI), siehe
+    /// [`Self::session_jobs`].
+    session_jobs: Option<crate::job_wiring::SessionJobs>,
 }
 
 impl std::fmt::Debug for RuntimeAssembly {
@@ -4841,10 +4999,35 @@ impl RuntimeAssembly {
         &self.profile
     }
 
-    /// Die aufgelöste Konfiguration.
+    /// Plan R9, Teil F: Job-Verwaltung und Ereignis-Zustellung dieser
+    /// Sitzung — `Some` nur für die interaktive TUI.
+    ///
+    /// # Beschreibung
+    /// Die TUI liest darüber die Jobs-Gruppe des Agenten-Panels
+    /// (`manager.list(Caller::Operator)`), holt die Notizen an die Wurzel
+    /// (`router.take_root_notes`) und Oberflächen-Ereignisse
+    /// (`router.take_ui_events`) ab und fragt beim Beenden, ob laufende Jobs
+    /// gestoppt oder abgelöst werden (`stop_all`/`detach_all`).
+    #[must_use]
+    pub fn session_jobs(&self) -> Option<&crate::job_wiring::SessionJobs> {
+        self.session_jobs.as_ref()
+    }
+
+    /// Die aufgelöste Konfiguration **des Starts**.
+    ///
+    /// Für Anzeigen, die gespeicherte Änderungen dieses Laufs zeigen müssen
+    /// (Modellwahl je Rolle, Standardmodus, …), gilt
+    /// [`Self::current_config`].
     #[must_use]
     pub fn config(&self) -> &Arc<ResolvedConfig> {
         &self.config
+    }
+
+    /// Der aktuelle Stand der Konfiguration: Start-Stand plus alle seither
+    /// gespeicherten Änderungen ([`RuntimeServices::current_config`]).
+    #[must_use]
+    pub fn current_config(&self) -> Arc<ResolvedConfig> {
+        self.services.current_config()
     }
 
     /// Der einmal je Montage instanziierte Permit-Ledger für Host-Profil-
@@ -5288,6 +5471,16 @@ impl RuntimeAssembly {
         self.spawner.as_ref()
     }
 
+    /// Der Roster aller startbaren Agenten dieses Laufs (Plan R9, Teil B):
+    /// eingebaute Rollen plus benutzerdefinierte Agenten aus Profil und
+    /// vertrautem Projekt, je mit Rolle, Beschreibung, Skills und
+    /// Profilzusammenfassung ([`harw_registry_defaults::AgentRoster::entries`]).
+    /// Leer, wenn der Lauf keinen Spawner hat.
+    #[must_use]
+    pub fn agent_roster(&self) -> &Arc<harw_registry_defaults::AgentRoster> {
+        &self.agent_roster
+    }
+
     /// Der agenten-übergreifende Live-Bus dieses Laufs. Beobachter (TUI,
     /// Web, Telemetrie) abonnieren ihn über
     /// [`harw_core::AgentEventHub::subscribe`].
@@ -5538,6 +5731,11 @@ impl RuntimeAssembly {
         session.set_max_output_tokens(Some(output_reserve));
         if let Some(mode) = self.spec.mode_override {
             session.set_mode(mode);
+            // Runde 9, E6: Kinder dieses Baums starten im Modus der Wurzel
+            // und folgen späteren Wechseln (`ManagedAgentSpawner::live_mode`).
+            if let Some(spawner) = self.spawner.as_ref() {
+                spawner.live_mode().publish(mode);
+            }
         }
 
         tracing::info!(
@@ -6950,6 +7148,52 @@ mod tests {
         Ok(())
     }
 
+    /// Plan R9, Teil F: nur die TUI bekommt eine Job-Verwaltung; ihre
+    /// Wurzel führt `job.*` neben `shell.exec`, die Slash-Fläche trägt die
+    /// Verwaltung für `/jobs`, und der Router ist an die Wurzel gebunden.
+    #[test]
+    fn test_jobs_exist_only_for_the_tui_and_follow_shell_exec() -> TestResult {
+        let fixture = build_fixture()?;
+        let (events, _event_rx) = tokio::sync::mpsc::unbounded_channel::<SessionEvent>();
+        let tui = fixture_builder(EntryKind::Tui, &fixture)
+            .session_events(events)
+            .build()
+            .map_err(ctx("Tui montiert"))?;
+        let jobs = tui
+            .session_jobs()
+            .ok_or(TestError::Missing("TUI hat eine Job-Verwaltung"))?;
+        assert_eq!(jobs.router.root(), Some(tui.root_session_id()));
+        let tools = tui.rights_snapshot().tools;
+        if tools.iter().any(|tool| tool == "shell.exec") {
+            for name in harw_tool_job::JOB_TOOL_NAMES {
+                assert!(
+                    tools.iter().any(|tool| tool == name),
+                    "TUI-Wurzel muss {name} führen: {tools:?}"
+                );
+            }
+        }
+        assert!(
+            tui.services()
+                .service_map(ServiceSurface::Slash)
+                .get::<Arc<harw_tool_job::JobManager>>()
+                .is_some(),
+            "/jobs findet die Verwaltung"
+        );
+
+        let echo = fixture_builder(EntryKind::LocalEcho, &fixture)
+            .build()
+            .map_err(ctx("LocalEcho montiert"))?;
+        assert!(echo.session_jobs().is_none());
+        assert!(
+            !echo
+                .rights_snapshot()
+                .tools
+                .iter()
+                .any(|tool| tool.starts_with("job."))
+        );
+        Ok(())
+    }
+
     /// Regressionstest: ohne konfigurierten Provider-/Modell-/Agenten-
     /// Standard bleibt die UIA-Wurzel unverändert bei `role_effort_weights.uia`
     /// (Addendum F+G, bisheriges Verhalten).
@@ -7071,6 +7315,8 @@ mod tests {
             harw_registry_defaults::PalaceToolProvider::TOOL_NAMES,
             harw_registry_defaults::KanbanReadToolProvider::TOOL_NAMES,
             harw_registry_defaults::DiaryToolProvider::TOOL_NAMES,
+            // Plan R9, Teil A: der lesende Skill-Katalog (keine Rechteklasse).
+            harw_registry_defaults::SkillCatalogToolProvider::TOOL_NAMES,
         ]
         .concat();
         assert!(

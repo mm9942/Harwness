@@ -31,7 +31,7 @@
 //! nur über `tracing::warn!` gemeldet — ein Problem der Wächter-Infrastruktur
 //! darf weder einen Tool-Aufruf noch den Reaper-Task scheitern lassen.
 
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock, PoisonError};
 
 use harw_config::ResolvedConfig;
 use harw_core::{
@@ -87,6 +87,10 @@ pub struct MemoryPitfallAdvisor {
     store: Arc<FactStore>,
     /// Einmalig gefüllter Cache der Pitfall-Fakten.
     cache: OnceLock<Vec<Fact>>,
+    /// Runde 9, E3: Namen der Pitfalls, die ein späterer Erfolg desselben
+    /// Aufrufs gelöst hat ([`PitfallAdvisor::resolved`]); sie melden sich
+    /// nicht mehr.
+    resolved: Mutex<Vec<String>>,
 }
 
 impl MemoryPitfallAdvisor {
@@ -101,6 +105,7 @@ impl MemoryPitfallAdvisor {
         Self {
             store,
             cache: OnceLock::new(),
+            resolved: Mutex::new(Vec::new()),
         }
     }
 
@@ -136,10 +141,23 @@ impl PitfallAdvisor for MemoryPitfallAdvisor {
     /// `Some(hint)` mit einem auf höchstens 300 Bytes gekürzten Hinweistext
     /// beim ersten Treffer; sonst `None`.
     fn advise(&self, tool_name: &str, arguments: &serde_json::Value) -> Option<String> {
+        let resolved = self.resolved.lock().unwrap_or_else(PoisonError::into_inner);
         self.pitfalls()
             .iter()
+            .filter(|fact| !resolved.contains(&fact.name))
             .find(|fact| pitfall_applies(fact, tool_name, arguments))
             .map(|fact| truncate_hint(&fact.description))
+    }
+
+    /// Runde 9, E3: ein erfolgreicher Aufruf löst jeden Pitfall, der auf ihn
+    /// passte.
+    fn resolved(&self, tool_name: &str, arguments: &serde_json::Value) {
+        let mut resolved = self.resolved.lock().unwrap_or_else(PoisonError::into_inner);
+        for fact in self.pitfalls() {
+            if pitfall_applies(fact, tool_name, arguments) && !resolved.contains(&fact.name) {
+                resolved.push(fact.name.clone());
+            }
+        }
     }
 }
 
@@ -156,7 +174,10 @@ pub const MIN_PITFALL_CONFIDENCE: f32 = 0.5;
 ///   ([`pitfall_names_tool`]); ein bloßes Vorkommen des Namens irgendwo im
 ///   Text genügt nicht mehr (früher trafen so `fs.read`-Fallen auch
 ///   `fs.read_many` oder Fallen fremder Werkzeuge, die es nur erwähnten).
-/// - Mindestens ein Argument-Schlüssel oder -Wert kommt im Text vor.
+/// - Mindestens ein Argument-**Wert** (das Ziel: Pfad, Kind-ID, Befehl …)
+///   kommt im Text vor. Runde 9, E3: bloße Schlüssel wie `child_id` zählen
+///   nicht mehr — sonst hing ein Fehler zu einem Ziel an jedem späteren
+///   Aufruf desselben Werkzeugs mit anderem Ziel.
 ///
 /// # Arguments
 /// - `fact` (`&Fact`): ein `pitfall`-Fakt.
@@ -202,15 +223,21 @@ fn pitfall_names_tool(fact: &Fact, tool_name: &str) -> bool {
             .any(|tag| tag.trim().eq_ignore_ascii_case(tool))
 }
 
-/// Prüft, ob mindestens ein Argument-Schlüssel oder -Wert in `haystack`
-/// (bereits kleingeschrieben) vorkommt.
+/// Mindestlänge (Zeichen) eines Argument-Werts, damit er als Ziel zählt —
+/// kürzere Werte („B", „ja") träfen fast jeden Text.
+const MIN_PITFALL_VALUE_CHARS: usize = 4;
+
+/// Prüft, ob mindestens ein Argument-Wert in `haystack` (bereits
+/// kleingeschrieben) vorkommt; Schlüssel zählen nicht.
 fn argument_matches(haystack: &str, arguments: &serde_json::Value) -> bool {
     match arguments {
-        serde_json::Value::Object(map) => map.iter().any(|(key, value)| {
-            haystack.contains(&key.to_ascii_lowercase()) || argument_matches(haystack, value)
-        }),
+        serde_json::Value::Object(map) => {
+            map.values().any(|value| argument_matches(haystack, value))
+        }
         serde_json::Value::String(text) => {
-            !text.is_empty() && haystack.contains(&text.to_ascii_lowercase())
+            let text = text.trim();
+            text.chars().count() >= MIN_PITFALL_VALUE_CHARS
+                && haystack.contains(&text.to_ascii_lowercase())
         }
         serde_json::Value::Array(items) => {
             items.iter().any(|item| argument_matches(haystack, item))
@@ -633,6 +660,32 @@ mod pitfall_advisor_tests {
             advisor
                 .advise("shell.exec", &json!({ "path": "Cargo.lock" }))
                 .is_some()
+        );
+        Ok(())
+    }
+
+    /// Runde 9, E3: ein Pitfall zu einem Ziel (hier einer Kind-ID) hängt
+    /// nicht an Aufrufen mit anderem Ziel — der Schlüssel allein genügt
+    /// nicht — und verschwindet nach einem Erfolg für dasselbe Ziel.
+    #[test]
+    fn pitfall_is_scoped_to_its_target_and_cleared_by_a_success() -> TestResult {
+        let (advisor, _dir) = advisor_with(&[(
+            "agent-message-stale",
+            "agent.message: kein eigenes, laufendes Kind mit der ID ffe02b1b child_id",
+            "agent.message",
+            0.9,
+        )])?;
+        let other = json!({ "child_id": "4ce96c7a", "text": "B" });
+        assert!(
+            advisor.advise("agent.message", &other).is_none(),
+            "anderes Ziel, nur der Schlüssel passt"
+        );
+        let same = json!({ "child_id": "ffe02b1b", "text": "weiter" });
+        assert!(advisor.advise("agent.message", &same).is_some());
+        advisor.resolved("agent.message", &same);
+        assert!(
+            advisor.advise("agent.message", &same).is_none(),
+            "nach einem Erfolg kein veralteter Hinweis mehr"
         );
         Ok(())
     }

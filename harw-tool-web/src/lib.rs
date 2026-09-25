@@ -80,6 +80,7 @@ pub mod error;
 pub mod fetch;
 pub mod hop;
 pub mod html;
+pub mod open_web;
 pub mod provider;
 pub mod search;
 

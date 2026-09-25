@@ -1,0 +1,67 @@
+# Mitgelieferter Agent `security-auditor` (Plan R9, Teil B: migriert aus dem
+# Legacy-Format `agent.toml`; `system.md` bleibt die Arbeitsanweisung und
+# wird per `instructions_file` in den Kontext des Kindes gelegt).
+#
+# Benutzerdefinierter Worker auf `worker-base@1`. Die Laufzeit klemmt ihn
+# unter die Decke des generischen read-only Workers (Analyst-
+# Decke, ohne Netz, Spawn-Tiefe höchstens 1) — siehe
+# `harw_registry_defaults::roster`.
+
+schema = "harwness.agent/v1"
+id = "harwness.agent.security-auditor@1"
+version = "1.0.0"
+extends = { id = "harwness.agent.worker-base@1" }
+role = "worker"
+specialization = "security-auditor"
+
+name = "Security Auditor"
+description = "Inspects authentication, authorization, input handling, and trust boundaries."
+instructions_file = "system.md"
+
+skills = ["security-inspection"]
+
+[work]
+mode = "inspection"
+may_write_code = false
+may_research_web = false
+
+[tools]
+admitted = [
+  "fs.read",
+  "fs.list",
+  "fs.search",
+  "fs.glob",
+  "fs.grep",
+  "doc.read_pdf",
+  "explore.tree",
+  "explore.projects",
+  "explore.relations",
+  "explore.find",
+  "workbench.show",
+  "diary.read",
+  "palace.search",
+  "palace.recall",
+  "parent.message",
+  "skills.search",
+  "skills.load",
+]
+forbidden = [
+  "fs.write",
+  "fs.edit",
+  "shell.exec",
+  "web.fetch",
+  "web.search",
+  "web.docs_rs",
+  "web.crates_io",
+]
+
+[spawn]
+max_depth = 0
+
+[spawn.budget]
+max_tokens = 100000
+max_tool_calls = 50
+max_wall_secs = 300
+
+[return]
+contract = "harwness.return.execution-summary@1"

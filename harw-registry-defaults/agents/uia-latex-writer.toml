@@ -48,13 +48,14 @@
 # derselben Sandbox wie `latex.build`, verlangt `ExecuteProcess`) kommen
 # dazu. Beide stellt `harw_tool_shell::LatexToolProvider` bereit.
 #
-# `skills` bindet die vier Skills fest an die Rolle; der Kind-Spawn
+# `skills` bindet `latex-report` fest an die Rolle (Plan R9: die drei
+# uebrigen laedt der Writer bei Bedarf per `skills.load`); der Kind-Spawn
 # (`RuntimeChildRegistryFactory::skill_fragments_for_role`) injiziert sie
 # als Instruktionsfragmente und startet fail-closed nicht ohne sie. Der
 # Skill `latex-report` traegt zugleich Rolle, Grenzen und Uebergabeformat
 # des Writers (Abschnitt 0): Registry-Kinder bekommen kein `system.md` aus
 # `agents/latex-writer/`, sondern Rollenregel (`knowledge/roles/
-# uia-worker.md`) plus diese Skills.
+# uia-worker.md`) plus diesen Skill.
 #
 # Budget: realistisch fuer Vorlage + Schreiben + Build + bis zu drei
 # Korrekturrunden + PDF-Stichprobe (greift seit Runde 7, Teil A1 auch im
@@ -72,7 +73,11 @@ version = "1.0.0"
 extends = { id = "harwness.agent.worker-base@1" }
 role = "uia-worker"
 specialization = "uia-latex-writer"
-skills = ["latex-report", "latex-writing", "xelatex-compile", "business-writing-pyramid"]
+# Plan R9, Teil A/E2: nur `latex-report` ist fest injiziert (Vorlage,
+# Werkzeuge, Uebergabe). `latex-writing`, `xelatex-compile` und
+# `business-writing-pyramid` laedt der Writer bei Bedarf mit `skills.load`
+# (siehe `latex-report`), statt ~54 KB in jeder Runde mitzuschleppen.
+skills = ["latex-report"]
 
 name = "UIA LaTeX Writer"
 description = "Schreibt und ueberarbeitet LaTeX-Quellen (.tex/.bib) im Workspace fuer die UIA und baut sie ueber das typisierte latex.build (Sandbox, ohne freie Shell und ohne Netz), unter der zugelassenen Organisationsrolle uia-worker."
@@ -101,6 +106,10 @@ admitted = [
   # Elternteil; nur Text, keine Rechte (siehe
   # `harw_registry_defaults::profile::parent_message_tools_for_role`).
   "parent.message",
+  # Plan R9, Teil A: Skills nur über den Katalog finden und laden
+  # (`harw_registry_defaults::profile::skill_catalog_tools_for_role`).
+  "skills.search",
+  "skills.load",
 ]
 forbidden = [
   "shell.exec",

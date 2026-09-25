@@ -48,6 +48,9 @@ members = [
     "harw-tool-web",
     "harw-tool-doc",
     "harw-tool-shell",
+    # Plan R9, Teil F: eingebautes Job-System (job.start/status/logs/stop/
+    # list/wait) für lang laufende Prozesse statt tmux.
+    "harw-tool-job",
     # Runde 5, Teil F: Plan-Modus (plan.write/plan.exit/plan.enter/ask_user).
     "harw-tool-plan",
     "harw-browser",

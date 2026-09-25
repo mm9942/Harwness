@@ -89,6 +89,17 @@ admitted = [
   # Elternteil; nur Text, keine Rechte (siehe
   # `harw_registry_defaults::profile::parent_message_tools_for_role`).
   "parent.message",
+  # Plan R9, Teil A: Skills nur über den Katalog finden und laden
+  # (`harw_registry_defaults::profile::skill_catalog_tools_for_role`).
+  "skills.search",
+  "skills.load",
+  # Plan R9, Teil F: Jobs der eigenen Worker verfolgen und stoppen (kein
+  # `job.start`; siehe `harw_registry_defaults::profile::job_control_tools_for_role`).
+  "job.status",
+  "job.logs",
+  "job.stop",
+  "job.list",
+  "job.wait",
 ]
 forbidden = ["fs.write", "fs.edit", "shell.exec", "web.fetch", "web.search", "web.docs_rs", "web.crates_io"]
 
@@ -109,10 +120,12 @@ targets = [
 max_depth = 1
 child_orchestrators = []
 
+# Plan R9, Teil C: der Verbrauch der Nachkommen wird angerechnet (siehe
+# `root-orchestrator.toml`); die Deckel bleiben unter denen des Roots.
 [spawn.budget]
-max_tokens = 80000
-max_tool_calls = 60
-max_wall_secs = 600
+max_tokens = 1000000
+max_tool_calls = 400
+max_wall_secs = 7200
 
 [return]
 contract = "harwness.return.envelope@1"

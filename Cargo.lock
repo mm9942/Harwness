@@ -1852,6 +1852,7 @@ name = "harw-catalog"
 version = "0.3.0"
 dependencies = [
  "harw-config",
+ "harw-home",
  "serde_json",
  "sha2 0.11.0",
  "tempfile",
@@ -2009,6 +2010,7 @@ dependencies = [
  "harw-fsutil",
  "harw-macros",
  "harw-types",
+ "include_dir",
  "serde",
  "serde_json",
  "tempfile",
@@ -2220,6 +2222,7 @@ name = "harw-home"
 version = "0.3.0"
 dependencies = [
  "blake3",
+ "harw-agent-dsl",
  "harw-config",
  "harw-fsutil",
  "serde",
@@ -2622,6 +2625,7 @@ version = "0.3.0"
 dependencies = [
  "harw-agent-dsl",
  "harw-authority",
+ "harw-catalog",
  "harw-code-graph",
  "harw-config",
  "harw-core",
@@ -2644,6 +2648,7 @@ dependencies = [
  "harw-research",
  "harw-sandbox",
  "harw-session-store",
+ "harw-tool-job",
  "harw-tool-plan",
  "harw-tool-shell",
  "harw-tools",
@@ -2772,6 +2777,7 @@ dependencies = [
  "harw-authority",
  "harw-browser",
  "harw-browser-thirtyfour",
+ "harw-catalog",
  "harw-config",
  "harw-egress",
  "harw-extension-api",
@@ -2784,6 +2790,7 @@ dependencies = [
  "harw-tool-doc",
  "harw-tool-explorer",
  "harw-tool-fs",
+ "harw-tool-job",
  "harw-tool-lens",
  "harw-tool-plan",
  "harw-tool-process",
@@ -2847,6 +2854,7 @@ dependencies = [
  "harw-sandbox",
  "harw-secrets",
  "harw-session-store",
+ "harw-tool-job",
  "harw-tool-plan",
  "harw-tool-shell",
  "harw-types",
@@ -3004,6 +3012,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "harw-tool-job"
+version = "0.3.0"
+dependencies = [
+ "harw-authority",
+ "harw-extension-api",
+ "harw-tool-shell",
+ "harw-tools",
+ "harw-types",
+ "jiff",
+ "rustix 1.1.5",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "harw-tool-lens"
 version = "0.3.0"
 dependencies = [
@@ -3143,6 +3169,7 @@ dependencies = [
  "harw-runtime",
  "harw-sandbox",
  "harw-session-store",
+ "harw-tool-job",
  "harw-tool-plan",
  "harw-tool-shell",
  "harw-tools",

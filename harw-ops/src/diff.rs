@@ -1,69 +1,90 @@
 //! `/diff` — read-only git diff operation.
 //!
 //! # Responsibility
-//! Implements `/diff` as a channel-parity command and read-only model tool. The
-//! operation delegates exclusively to `shell.exec` through `ShellToolProvider`;
-//! the provider derives its Bubblewrap plan and process authority from the
-//! immutable sandbox in [`OpContext`]. It never launches a host process itself.
+//! Implements `/diff` as a channel-parity command and read-only model tool.
+//! `git` runs as a **read-only helper process** in its own Bubblewrap sandbox
+//! ([`harw_sandbox::BwrapLauncher::plan_read_only`]), not through
+//! `shell.exec`. The tool therefore needs only `ReadWorkspace` — the same
+//! right `fs.read` uses — and works in the read-only `plan`/`explore` modes,
+//! which never grant `ExecuteProcess` (Ladybird export: "shell.exec denied:
+//! ExecuteProcess permission missing").
 //!
 //! # Security boundary
-//! `shell.exec` (`harw-tool-shell/src/exec.rs`) has no argv/env parameters of
-//! its own — its `ShellExecArgs` accepts exactly one `command` string, run as
-//! `/bin/sh -c <command>`. This operation therefore builds a fully-hardened
-//! git invocation as a pure [`GitDiffPlan`] (argv + env), then renders it into
-//! that single command string with every token POSIX single-quoted:
+//! - **Fixed argv allowlist.** Only a plan built here is ever run, and
+//!   [`ensure_allowlisted`] re-checks it right before the launch: the exact
+//!   hardening prefix [`GIT_HARDENING_PREFIX`] followed by one of
+//!   [`ALLOWED_GIT_SUBCOMMANDS`] (`diff`, `status`, `log`, `show`,
+//!   `rev-parse`). Nothing the model sends becomes a git option: the only
+//!   model input is an optional path, validated by
+//!   [`validate_relative_pathspec`] and bound as `:(literal)<path>` after
+//!   `--`.
+//! - **Hardened git.** `-c core.fsmonitor= -c core.hooksPath=/dev/null
+//!   -c diff.external= -c core.pager=cat --no-pager diff --no-textconv
+//!   --no-ext-diff --no-color` neutralises the config- and attribute-driven
+//!   code-execution paths a bare `git diff` would honour from repo-local
+//!   state; `GIT_CONFIG_NOSYSTEM=1`, `GIT_CONFIG_GLOBAL=/dev/null` and
+//!   `GIT_ATTR_NOSYSTEM=1` keep host-wide config out; `GIT_OPTIONAL_LOCKS=0`
+//!   stops git from refreshing `.git/index` (a read must not write);
+//!   `GIT_TERMINAL_PROMPT=0` and `GIT_PAGER=cat` keep it non-interactive.
+//! - **Read-only sandbox.** The Bubblewrap plan binds the workspace with
+//!   `--ro-bind` regardless of `WriteWorkspace`, has no network, a cleared
+//!   environment and an empty tmpfs `/tmp`. Anything a repository might still
+//!   trigger (e.g. a clean filter from `.gitattributes`) runs without write
+//!   access and without network. Only the workspace is visible: a repository
+//!   above the workspace root is out of reach by design.
+//! - **Bounded.** stdout is capped at [`MAX_OUTPUT_BYTES`] (the reader is
+//!   dropped at the cap, git ends on `EPIPE`), stderr at
+//!   [`MAX_STDERR_BYTES`], the whole run at [`GIT_TIMEOUT`]; the child is
+//!   killed on drop.
 //!
-//! - `git -c core.fsmonitor= -c core.hooksPath=/dev/null -c diff.external=
-//!   -c core.pager=cat --no-pager diff --no-textconv --no-ext-diff --no-color`
-//!   neutralises the config- and attribute-driven code-execution paths a bare
-//!   `git diff` would otherwise honor from repo-local state the sandbox does
-//!   not control: `core.fsmonitor`'s hook, `.git/hooks/*` via `hooksPath`,
-//!   `diff.external`/`GIT_EXTERNAL_DIFF`, `diff.<driver>.textconv` from
-//!   `.gitattributes`, and the pager.
-//! - `GIT_CONFIG_NOSYSTEM=1` and `GIT_CONFIG_GLOBAL=/dev/null` stop the
-//!   system and global git config — which live outside the sandboxed
-//!   workspace and are not covered by the `-c` overrides above — from
-//!   reintroducing any of the same hooks. `GIT_TERMINAL_PROMPT=0` stops an
-//!   interactive credential prompt from blocking the call until its timeout.
-//! - An optional workspace-relative path is validated (no leading `/`, no
-//!   `..` component, no leading `:`) and bound as `:(literal)<path>` so git's
-//!   pathspec "magic" (`:/`, `:(top)`, `:(glob)`, `:(exclude)`, …) cannot
-//!   widen or redirect the diff.
+//! Because the process is sandboxed read-only, the operation stays
+//! `approval = "always"` as before (F-022/F-191/G-027); only the permission
+//! it needs changed.
 //!
-//! `ExecuteProcess` remains an executor-enforced sandbox permission: this
-//! operation only clones the caller's sandbox and cannot grant capabilities.
-//! Because it still starts a real process under sandbox-derived authority,
-//! its `ModelTool` surface requires `approval = "always"` rather than
-//! auto-approval — see the `#[operation]` attribute below.
-//!
-//! # Output
-//! Successful shell JSON output is rendered deterministically from `stdout` and
-//! `stderr`. Executor failures, tool errors, malformed output, and non-zero git
-//! exit statuses (unless the process tree was killed by `shell.exec`'s output
-//! limit — see below) are translated to [`OpError::Execution`].
-//!
-//! `harw-tool-shell` caps combined `stdout`/`stderr` at `max_output_bytes`
-//! (64 KiB default) and reports that in the result JSON via `truncated` and,
-//! when the cap was hit *while the process was still running* and its tree
-//! was killed, `killed_by_output_limit` (with a synthetic `exit_code: -1`).
-//! `render_shell_output` treats both as a **truncated success** — the
-//! available partial diff plus a trailing "Diff gekürzt bei 64 KiB" note —
-//! rather than an error; only a non-zero `exit_code` *without* a kill (a real
-//! `git` failure) is still an error.
+//! # Output and errors
+//! - Workspace without `.git`: [`not_a_repo_message`] — "Kein Git-Repository
+//!   in <root>; diff braucht ein Repo (Unterordner: …)", listing the direct
+//!   subfolders that are repositories (holy export: a folder with several
+//!   projects gave the opaque "git diff exited with status 129", which is
+//!   git's usage error for an implicit `--no-index` outside a repository).
+//!   The same message is used if git itself reports "not a git repository".
+//! - Any other non-zero exit carries git's (bounded) stderr, never stdout.
+//! - A truncated diff is a success with a trailing "Diff gekürzt bei 64 KiB"
+//!   note.
 
-use harw_extension_api::contributors::ToolProvider;
+use harw_authority::{Permission, SandboxSpec};
 use harw_macros::operation;
 use harw_operations::{OpContext, OpError, OpOutput};
-use harw_tool_shell::ShellToolProvider;
-use harw_tools::{ToolCall, ToolExecutionContext, ToolOutput, spec::ToolName};
-use harw_types::ToolCallId;
-use serde_json::{Value, json};
+use harw_sandbox::{BwrapLauncher, SandboxError};
+use std::ffi::OsString;
+use std::path::{Path, PathBuf};
+use std::process::Stdio;
+use std::time::Duration;
+use tokio::io::{AsyncRead, AsyncReadExt};
 
-const SHELL_EXEC_TOOL: &str = "shell.exec";
+/// Upper bound of the rendered diff (stdout) in bytes.
+const MAX_OUTPUT_BYTES: usize = 64 * 1024;
 
-/// Fixed argv prefix for the hardened `git diff` invocation. See the module
-/// doc for why each `-c` and flag is present; none of them are optional.
-const GIT_DIFF_BASE_ARGV: &[&str] = &[
+/// Upper bound of git's stderr kept for an error message.
+const MAX_STDERR_BYTES: usize = 4 * 1024;
+
+/// Wall-clock limit of one git run (including sandbox setup).
+const GIT_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Fixed places where `git` is looked up (never `PATH`); all lie under the
+/// directories the read-only sandbox binds (`/usr`, `/bin`).
+const GIT_CANDIDATES: [&str; 3] = ["/usr/bin/git", "/usr/local/bin/git", "/bin/git"];
+
+/// The only git subcommands this operation may ever run.
+const ALLOWED_GIT_SUBCOMMANDS: [&str; 5] = ["diff", "status", "log", "show", "rev-parse"];
+
+/// At most this many repository subfolders are named in the "no repository"
+/// message.
+const MAX_LISTED_SUBREPOS: usize = 20;
+
+/// Global options every git invocation starts with, in exactly this order.
+/// See the module doc for why each one is present; none are optional.
+const GIT_HARDENING_PREFIX: [&str; 10] = [
     "git",
     "-c",
     "core.fsmonitor=",
@@ -74,18 +95,19 @@ const GIT_DIFF_BASE_ARGV: &[&str] = &[
     "-c",
     "core.pager=cat",
     "--no-pager",
-    "diff",
-    "--no-textconv",
-    "--no-ext-diff",
-    "--no-color",
 ];
 
-/// Environment applied only to this git invocation (not the harness's own
-/// process environment). See the module doc for rationale.
+/// Subcommand and flags of the hardened `git diff` after the prefix.
+const GIT_DIFF_SUBCOMMAND: [&str; 4] = ["diff", "--no-textconv", "--no-ext-diff", "--no-color"];
+
+/// Environment applied only inside the git sandbox (after `--clearenv`).
 const GIT_DIFF_ENV: &[(&str, &str)] = &[
     ("GIT_CONFIG_NOSYSTEM", "1"),
     ("GIT_CONFIG_GLOBAL", "/dev/null"),
+    ("GIT_ATTR_NOSYSTEM", "1"),
     ("GIT_TERMINAL_PROMPT", "0"),
+    ("GIT_OPTIONAL_LOCKS", "0"),
+    ("GIT_PAGER", "cat"),
 ];
 
 /// Argument container for the `/diff` operation.
@@ -123,10 +145,9 @@ impl harw_operations::FromRawArgs for DiffArgs {
     }
 }
 
-/// A pure, side-effect-free plan for the single `/bin/sh -c` string that
-/// `shell.exec` accepts. Kept as a struct — rather than folded straight into
-/// a `String` — so tests can assert on the exact argv and env instead of
-/// parsing shell-quoting back out of a rendered command line.
+/// A pure, side-effect-free plan for one git run: argv (with the literal
+/// `git` as `argv[0]`, replaced by the pinned binary at launch) and the
+/// environment set inside the sandbox.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct GitDiffPlan {
     /// argv in exec order; `argv[0] == "git"`.
@@ -138,8 +159,9 @@ struct GitDiffPlan {
 /// Build the [`GitDiffPlan`] for one `/diff` call. Pure function: no I/O, no
 /// sandbox access — everything needed comes from `args`.
 fn build_git_diff_plan(args: &DiffArgs) -> Result<GitDiffPlan, OpError> {
-    let mut argv: Vec<String> = GIT_DIFF_BASE_ARGV
+    let mut argv: Vec<String> = GIT_HARDENING_PREFIX
         .iter()
+        .chain(GIT_DIFF_SUBCOMMAND.iter())
         .map(|token| (*token).to_owned())
         .collect();
     if args.stat_only {
@@ -181,110 +203,222 @@ fn validate_relative_pathspec(path: &str) -> Result<&str, OpError> {
     Ok(path)
 }
 
-/// Render a [`GitDiffPlan`] into the one `command` string `shell.exec`
-/// accepts. Every token — env assignment and argv element alike — is POSIX
-/// single-quoted, so correctness never depends on which of the (currently
-/// all-static) tokens do or do not contain shell metacharacters.
-fn render_shell_command(plan: &GitDiffPlan) -> String {
-    let mut parts = Vec::with_capacity(plan.env.len() + plan.argv.len());
-    for (name, value) in &plan.env {
-        parts.push(format!("{name}={}", shell_quote(value)));
-    }
-    for token in &plan.argv {
-        parts.push(shell_quote(token));
-    }
-    parts.join(" ")
-}
-
-/// POSIX single-quote one shell word: wraps in `'…'`, escaping an embedded
-/// `'` as `'\''` (close quote, escaped literal quote, reopen quote).
-fn shell_quote(token: &str) -> String {
-    format!("'{}'", token.replace('\'', "'\\''"))
-}
-
-fn shell_call(command: String) -> ToolCall {
-    ToolCall {
-        id: ToolCallId::new(),
-        name: ToolName::new(SHELL_EXEC_TOOL),
-        arguments: json!({ "command": command }),
+/// Checks the fixed argv allowlist: exactly [`GIT_HARDENING_PREFIX`], then one
+/// of [`ALLOWED_GIT_SUBCOMMANDS`]. Returns the subcommand.
+///
+/// # Errors
+/// [`OpError::Execution`] for any other argv — defense in depth, since every
+/// plan is built in this module.
+fn ensure_allowlisted(argv: &[String]) -> Result<&str, OpError> {
+    let prefix_ok = argv.len() > GIT_HARDENING_PREFIX.len()
+        && argv
+            .iter()
+            .zip(GIT_HARDENING_PREFIX)
+            .all(|(token, expected)| token == expected);
+    match argv.get(GIT_HARDENING_PREFIX.len()).map(String::as_str) {
+        Some(subcommand) if prefix_ok && ALLOWED_GIT_SUBCOMMANDS.contains(&subcommand) => {
+            Ok(subcommand)
+        }
+        other => Err(OpError::Execution(format!(
+            "diff: git-Aufruf außerhalb der festen Erlaubnisliste abgelehnt ({other:?}; erlaubt: \
+             {})",
+            ALLOWED_GIT_SUBCOMMANDS.join(", ")
+        ))),
     }
 }
 
-fn render_shell_output(content: Value) -> Result<String, OpError> {
-    let object = content.as_object().ok_or_else(|| {
-        OpError::Execution("shell.exec returned JSON that was not an object".to_owned())
+/// First trusted `git` binary from [`GIT_CANDIDATES`].
+fn find_git() -> Option<PathBuf> {
+    GIT_CANDIDATES
+        .iter()
+        .map(PathBuf::from)
+        .find(|candidate| candidate.is_file())
+}
+
+/// Whether `dir` itself carries a `.git` entry (directory, gitfile or link).
+fn has_git_entry(dir: &Path) -> bool {
+    dir.join(".git").symlink_metadata().is_ok()
+}
+
+/// Direct subfolders of `root` (no symlinks) that are git repositories,
+/// sorted, at most [`MAX_LISTED_SUBREPOS`].
+fn repository_subfolders(root: &Path) -> Vec<String> {
+    let Ok(entries) = std::fs::read_dir(root) else {
+        return Vec::new();
+    };
+    let mut repos: Vec<String> = entries
+        .filter_map(Result::ok)
+        .filter(|entry| entry.file_type().is_ok_and(|kind| kind.is_dir()))
+        .filter(|entry| has_git_entry(&entry.path()))
+        .map(|entry| entry.file_name().to_string_lossy().into_owned())
+        .collect();
+    repos.sort();
+    repos.truncate(MAX_LISTED_SUBREPOS);
+    repos
+}
+
+/// The clear "no repository" message for `root`.
+fn not_a_repo_message(root: &Path) -> String {
+    let repos = repository_subfolders(root);
+    let subfolders = if repos.is_empty() {
+        "Unterordner: keiner ist ein Git-Repository".to_owned()
+    } else {
+        format!("Unterordner: {}", repos.join(", "))
+    };
+    let mut message = format!(
+        "Kein Git-Repository in {}; diff braucht ein Repo ({subfolders})",
+        root.display()
+    );
+    if root.ancestors().skip(1).any(has_git_entry) {
+        message.push_str(
+            "; ein Repository oberhalb des Arbeitsbereichs ist in der Sandbox nicht sichtbar",
+        );
+    }
+    message
+}
+
+/// Result of one bounded git run.
+#[derive(Debug, Default)]
+struct GitOutput {
+    /// Exit code; `None` when git ended by a signal (e.g. `SIGPIPE` after
+    /// the stdout cap).
+    exit_code: Option<i32>,
+    stdout: Vec<u8>,
+    /// stdout hit [`MAX_OUTPUT_BYTES`]; the rest was dropped.
+    stdout_truncated: bool,
+    stderr: Vec<u8>,
+}
+
+/// Reads at most `cap` bytes; `true` when more was available.
+async fn read_capped<R: AsyncRead + Unpin>(reader: R, cap: usize) -> (Vec<u8>, bool) {
+    let mut buffer = Vec::new();
+    let limit = u64::try_from(cap).unwrap_or(u64::MAX).saturating_add(1);
+    // A read error just ends the capture; the exit status tells the rest.
+    let _ = reader.take(limit).read_to_end(&mut buffer).await;
+    let truncated = buffer.len() > cap;
+    buffer.truncate(cap);
+    (buffer, truncated)
+}
+
+/// Runs an allowlisted git plan read-only in its own sandbox.
+///
+/// # Errors
+/// [`OpError::Execution`] when the argv is not allowlisted, `ReadWorkspace`
+/// is missing, no git/bubblewrap is available, the start fails or the run
+/// exceeds [`GIT_TIMEOUT`].
+async fn run_read_only_git(
+    sandbox: &SandboxSpec,
+    plan: &GitDiffPlan,
+) -> Result<GitOutput, OpError> {
+    ensure_allowlisted(&plan.argv)?;
+    let git = find_git().ok_or_else(|| {
+        OpError::Execution(format!(
+            "diff: kein git gefunden (gesucht: {})",
+            GIT_CANDIDATES.join(", ")
+        ))
     })?;
-    let exit_code = object
-        .get("exit_code")
-        .and_then(Value::as_i64)
-        .ok_or_else(|| {
-            OpError::Execution("shell.exec JSON did not contain an integer exit_code".to_owned())
+    let launcher = BwrapLauncher::discover().map_err(|error| {
+        OpError::Execution(format!(
+            "diff: Lese-Sandbox (bubblewrap) nicht verfügbar: {error}"
+        ))
+    })?;
+    let mut command: Vec<OsString> = Vec::with_capacity(plan.argv.len());
+    command.push(git.into_os_string());
+    command.extend(plan.argv.iter().skip(1).map(OsString::from));
+    let bwrap_plan = launcher
+        .plan_read_only(sandbox, &plan.env, &command)
+        .map_err(|error| match error {
+            SandboxError::ProcessExecutionDenied => {
+                OpError::Execution("diff: Berechtigung ReadWorkspace fehlt".to_owned())
+            }
+            other => OpError::Execution(format!("diff: Lese-Sandbox abgelehnt: {other}")),
         })?;
-    let stdout = object
-        .get("stdout")
-        .and_then(Value::as_str)
-        .ok_or_else(|| {
-            OpError::Execution("shell.exec JSON did not contain string stdout".to_owned())
-        })?;
-    let stderr = object
-        .get("stderr")
-        .and_then(Value::as_str)
-        .ok_or_else(|| {
-            OpError::Execution("shell.exec JSON did not contain string stderr".to_owned())
-        })?;
-    // `harw-tool-shell` (W1-03) kappt die kombinierte Ausgabe bei `max_output_bytes`
-    // (64 KiB Default, `ShellToolProvider::new()`, siehe `exec.rs` `DEFAULT_MAX_OUTPUT_BYTES`)
-    // und tötet den Prozessbaum, wenn die Grenze *während* des Laufs überschritten wird:
-    // `killed_by_output_limit == true` dann zusammen mit `exit_code == -1` (kein echter
-    // git-Exitstatus, siehe `exec.rs::completed_output`). Ein durch das Byte-Budget nur
-    // *nachträglich* gekürztes, aber vollständig gelaufenes `git diff` setzt stattdessen
-    // `truncated == true` bei einem echten `exit_code`. Beide Fälle sind ein gekürzter
-    // Erfolg, kein Fehler (R1-01/R1-02) — nur ein `exit_code != 0` ohne Kill bleibt ein
-    // echter git-Fehler.
-    let truncated = object
-        .get("truncated")
-        .and_then(Value::as_bool)
-        .unwrap_or(false);
-    let killed_by_output_limit = object
-        .get("killed_by_output_limit")
-        .and_then(Value::as_bool)
-        .unwrap_or(false);
-
-    if exit_code != 0 && !killed_by_output_limit {
-        return Err(OpError::Execution(format!(
-            "git diff exited with status {exit_code}"
-        )));
+    let mut child = tokio::process::Command::new(launcher.executable())
+        .args(bwrap_plan.args())
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true)
+        .spawn()
+        .map_err(|error| OpError::Execution(format!("diff: git-Start fehlgeschlagen: {error}")))?;
+    let (Some(stdout), Some(stderr)) = (child.stdout.take(), child.stderr.take()) else {
+        return Err(OpError::Execution(
+            "diff: git-Ausgabekanäle fehlen".to_owned(),
+        ));
+    };
+    let run = async {
+        let ((stdout, stdout_truncated), (stderr, _)) = tokio::join!(
+            read_capped(stdout, MAX_OUTPUT_BYTES),
+            read_capped(stderr, MAX_STDERR_BYTES)
+        );
+        let status = child.wait().await;
+        (stdout, stdout_truncated, stderr, status)
+    };
+    match tokio::time::timeout(GIT_TIMEOUT, run).await {
+        Ok((stdout, stdout_truncated, stderr, status)) => {
+            let status = status
+                .map_err(|error| OpError::Execution(format!("diff: Warten auf git: {error}")))?;
+            Ok(GitOutput {
+                exit_code: status.code(),
+                stdout,
+                stdout_truncated,
+                stderr,
+            })
+        }
+        // `child` fällt mit `kill_on_drop` und wird beendet.
+        Err(_elapsed) => Err(OpError::Execution(format!(
+            "diff: git antwortete nicht innerhalb von {} s",
+            GIT_TIMEOUT.as_secs()
+        ))),
     }
+}
 
+/// Renders a finished git run. A non-zero exit is an error carrying git's
+/// stderr (never stdout); a truncated diff is a success with a note.
+fn render_git_output(output: &GitOutput, root: &Path) -> Result<String, OpError> {
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let stderr = stderr.trim();
+    if output.exit_code != Some(0) && !output.stdout_truncated {
+        if stderr.contains("not a git repository") {
+            return Err(OpError::Execution(not_a_repo_message(root)));
+        }
+        let status = output
+            .exit_code
+            .map_or_else(|| "Signal".to_owned(), |code| code.to_string());
+        return Err(OpError::Execution(if stderr.is_empty() {
+            format!("git diff exited with status {status}")
+        } else {
+            format!("git diff exited with status {status}: {stderr}")
+        }));
+    }
     let body = match (stdout.is_empty(), stderr.is_empty()) {
         (true, true) => "git diff produced no output.".to_owned(),
-        (false, true) => stdout.to_owned(),
+        (false, true) => stdout.into_owned(),
         (true, false) => format!("stderr:\n{stderr}"),
         (false, false) => format!("{stdout}\nstderr:\n{stderr}"),
     };
-
-    if truncated || killed_by_output_limit {
+    if output.stdout_truncated {
         Ok(format!(
-            "{body}\n[Diff gekürzt bei 64 KiB: shell.exec-Ausgabegrenze erreicht]"
+            "{body}\n[Diff gekürzt bei 64 KiB: Ausgabegrenze erreicht]"
         ))
     } else {
         Ok(body)
     }
 }
 
-/// Execute the current workspace's read-only git diff through the sandboxed
-/// shell tool. The cloned sandbox preserves, rather than expands, authority.
+/// Show the current workspace's git diff through a read-only, sandboxed git
+/// process (see the module doc). Needs only `ReadWorkspace`.
 #[operation(
     name = "diff",
     summary = "Zeigt den aktuellen git-Diff des Workspaces.",
     domain = "knowledge",
     permission = "observer",
     command(path = "/diff", visibility = "channel_parity", busy = "immediate"),
-    // `diff` starts a real process (git, via shell.exec) under the caller's
-    // sandbox. Auto-approval let repo-controlled git config/attributes run
-    // code without a prompt (F-022/F-191/G-027); every model-initiated call
-    // now requires explicit approval even though the git invocation itself
-    // is hardened above.
+    // `diff` starts a real (read-only, sandboxed) git process. Repo-controlled
+    // git config/attributes are neutralised above, and the sandbox has no
+    // write access and no network; every model-initiated call still requires
+    // explicit approval (F-022/F-191/G-027).
     model_tool(readonly, approval = "always"),
     // Web-Fläche übernimmt dieselbe Achse wie das ModelTool: `git diff` ist
     // ein reiner Lesevorgang auf dem Workspace, keine Mutation.
@@ -292,60 +426,44 @@ fn render_shell_output(content: Value) -> Result<String, OpError> {
 )]
 async fn diff(ctx: &OpContext, args: DiffArgs) -> Result<OpOutput, OpError> {
     let plan = build_git_diff_plan(&args)?;
-    let command = render_shell_command(&plan);
-    let execution_context = ToolExecutionContext::new(
-        ctx.session_id().clone(),
-        ctx.turn_id().clone(),
-        ctx.sandbox().clone(),
-    );
-    let provider = ShellToolProvider::new();
-    let tool_name = ToolName::new(SHELL_EXEC_TOOL);
-    let executor = provider
-        .executor(&tool_name)
-        .ok_or_else(|| OpError::Execution("shell.exec executor is unavailable".to_owned()))?;
-    let call = shell_call(command);
-
-    let output = executor
-        .execute(&execution_context, &call)
-        .await
-        .map_err(|error| OpError::Execution(format!("shell.exec executor failed: {error}")))?;
-
-    let text = match output {
-        ToolOutput::Json { content } => render_shell_output(content)?,
-        ToolOutput::Error { message } => {
-            return Err(OpError::Execution(format!(
-                "shell.exec rejected git diff: {message}"
-            )));
-        }
-        ToolOutput::Text { .. } => {
-            return Err(OpError::Execution(
-                "shell.exec returned an unexpected text output".to_owned(),
-            ));
-        }
-    };
-
-    Ok(OpOutput::from(text))
+    let sandbox = ctx.sandbox();
+    if !sandbox.permissions().contains(Permission::ReadWorkspace) {
+        return Err(OpError::Execution(
+            "diff: Berechtigung ReadWorkspace fehlt".to_owned(),
+        ));
+    }
+    let root = sandbox.workspace().canonical_root();
+    if !has_git_entry(root) {
+        return Err(OpError::Execution(not_a_repo_message(root)));
+    }
+    let output = run_read_only_git(sandbox, &plan).await?;
+    Ok(OpOutput::from(render_git_output(&output, root)?))
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
-        DiffArgs, DiffOperation, GIT_DIFF_BASE_ARGV, GIT_DIFF_ENV, build_git_diff_plan, diff,
-        render_shell_command, render_shell_output, validate_relative_pathspec,
+        ALLOWED_GIT_SUBCOMMANDS, DiffArgs, DiffOperation, GIT_DIFF_ENV, GIT_DIFF_SUBCOMMAND,
+        GIT_HARDENING_PREFIX, GitOutput, build_git_diff_plan, diff, ensure_allowlisted, find_git,
+        not_a_repo_message, render_git_output, validate_relative_pathspec,
     };
     use crate::test_support::{TestError, TestResult, ctx};
     use crate::testutil::toks;
-    use harw_authority::{PermissionSet, SandboxSpec, WorkspaceRegistration, WorkspaceRegistry};
+    use harw_authority::{
+        Permission, PermissionSet, SandboxSpec, WorkspaceRegistration, WorkspaceRegistry,
+    };
     use harw_operations::{
         ApprovalPolicy, FromRawArgs, OpContext, OpError, Operation, Surface, context::ServiceMap,
     };
     use harw_types::{SessionId, TenantId, TurnId, WorkspaceId};
     use std::{
-        path::PathBuf,
+        path::{Path, PathBuf},
         sync::atomic::{AtomicU64, Ordering},
     };
 
-    fn test_context() -> TestResult<(OpContext, PathBuf)> {
+    /// Context with `permissions` over a fresh `<tmp>/…/workspace`; returns
+    /// the context, the temp base (to remove) and the canonical workspace.
+    fn test_context(permissions: &[Permission]) -> TestResult<(OpContext, PathBuf, PathBuf)> {
         static COUNTER: AtomicU64 = AtomicU64::new(0);
         let id = COUNTER.fetch_add(1, Ordering::Relaxed);
         let root = std::env::temp_dir().join(format!("harw-diff-test-{}-{id}", std::process::id()));
@@ -365,15 +483,24 @@ mod tests {
                 &WorkspaceId::from_str("workspace"),
             )
             .map_err(ctx("resolve workspace binding"))?;
+        let workspace = binding.canonical_root().to_path_buf();
         Ok((
             OpContext::new(
                 SessionId::new(),
                 TurnId::new(),
-                SandboxSpec::from_resolved(binding, PermissionSet::empty()),
+                SandboxSpec::from_resolved(
+                    binding,
+                    PermissionSet::from_policy(permissions.iter().copied()),
+                ),
                 ServiceMap::new(),
             ),
             root,
+            workspace,
         ))
+    }
+
+    fn argv(tokens: &[&str]) -> Vec<String> {
+        tokens.iter().map(|token| (*token).to_owned()).collect()
     }
 
     #[test]
@@ -420,12 +547,11 @@ mod tests {
     fn test_build_git_diff_plan_defaults_have_hardening_argv_and_env() -> TestResult {
         let plan = build_git_diff_plan(&DiffArgs::default()).map_err(ctx("build plan"))?;
 
-        // Exact argv for the default (no `--stat`, no path filter) case: this
-        // pins every hardening flag from the module doc — fsmonitor hook,
-        // hooksPath, diff.external, pager (twice), and the textconv/ext-diff
-        // disable flags — so a future edit cannot silently drop one.
-        let expected_argv: Vec<String> = GIT_DIFF_BASE_ARGV
+        // Exact argv for the default case: pins every hardening flag from the
+        // module doc so a future edit cannot silently drop one.
+        let expected_argv: Vec<String> = GIT_HARDENING_PREFIX
             .iter()
+            .chain(GIT_DIFF_SUBCOMMAND.iter())
             .map(|token| (*token).to_owned())
             .collect();
         assert_eq!(plan.argv, expected_argv);
@@ -434,10 +560,17 @@ mod tests {
             vec![
                 ("GIT_CONFIG_NOSYSTEM", "1"),
                 ("GIT_CONFIG_GLOBAL", "/dev/null"),
+                ("GIT_ATTR_NOSYSTEM", "1"),
                 ("GIT_TERMINAL_PROMPT", "0"),
+                ("GIT_OPTIONAL_LOCKS", "0"),
+                ("GIT_PAGER", "cat"),
             ]
         );
         assert_eq!(plan.env, GIT_DIFF_ENV.to_vec());
+        assert_eq!(
+            ensure_allowlisted(&plan.argv).map_err(ctx("allowlist"))?,
+            "diff"
+        );
         Ok(())
     }
 
@@ -482,147 +615,116 @@ mod tests {
     }
 
     #[test]
-    fn test_render_shell_command_quotes_every_token_for_default_plan() -> TestResult {
-        let plan = build_git_diff_plan(&DiffArgs::default()).map_err(ctx("build plan"))?;
-        let command = render_shell_command(&plan);
-        assert_eq!(
-            command,
-            "GIT_CONFIG_NOSYSTEM='1' GIT_CONFIG_GLOBAL='/dev/null' GIT_TERMINAL_PROMPT='0' \
-             'git' '-c' 'core.fsmonitor=' '-c' 'core.hooksPath=/dev/null' '-c' \
-             'diff.external=' '-c' 'core.pager=cat' '--no-pager' 'diff' '--no-textconv' \
-             '--no-ext-diff' '--no-color'"
-        );
-        Ok(())
+    fn test_allowlist_accepts_only_read_only_subcommands_after_the_exact_prefix() {
+        for subcommand in ALLOWED_GIT_SUBCOMMANDS {
+            let mut tokens: Vec<&str> = GIT_HARDENING_PREFIX.to_vec();
+            tokens.push(subcommand);
+            assert!(ensure_allowlisted(&argv(&tokens)).is_ok(), "{subcommand}");
+        }
+        let mut rejected: Vec<Vec<&str>> = ["push", "config", "commit", "-c", "checkout"]
+            .into_iter()
+            .map(|subcommand| {
+                let mut tokens: Vec<&str> = GIT_HARDENING_PREFIX.to_vec();
+                tokens.push(subcommand);
+                tokens
+            })
+            .collect();
+        // Ein zusätzliches `-c` vor dem Unterbefehl verschiebt das Präfix.
+        rejected.push(vec![
+            "git",
+            "-c",
+            "core.pager=less",
+            "-c",
+            "core.hooksPath=/dev/null",
+            "-c",
+            "diff.external=",
+            "-c",
+            "core.pager=cat",
+            "--no-pager",
+            "diff",
+        ]);
+        rejected.push(vec!["git", "diff"]);
+        rejected.push(GIT_HARDENING_PREFIX.to_vec());
+        for tokens in rejected {
+            assert!(
+                matches!(
+                    ensure_allowlisted(&argv(&tokens)),
+                    Err(OpError::Execution(_))
+                ),
+                "{tokens:?}"
+            );
+        }
     }
 
     #[test]
-    fn test_render_shell_command_escapes_quotes_in_malicious_literal_path() -> TestResult {
-        let plan = build_git_diff_plan(&DiffArgs {
-            path: Some("src/'; touch owned; echo '".to_owned()),
-            stat_only: true,
-        })
-        .map_err(ctx("build plan"))?;
-        let command = render_shell_command(&plan);
-
-        // Exact tail: `--` then the fully quoted, `'\''`-escaped literal
-        // pathspec — no unescaped `'` reaches the shell.
-        let expected_tail = concat!("'--' ", r"':(literal)src/'\''; touch owned; echo '\'''");
-        assert!(
-            command.ends_with(expected_tail),
-            "unexpected quoting: {command}"
-        );
-        Ok(())
-    }
-
-    #[test]
-    fn test_nonzero_git_status_does_not_echo_diff_output() -> TestResult {
-        let result = render_shell_output(serde_json::json!({
-            "exit_code": 1,
-            "stdout": "sensitive diff content",
-            "stderr": "sensitive diagnostic",
-        }));
-        let Err(error) = result else {
+    fn test_nonzero_git_status_surfaces_stderr_but_never_stdout() -> TestResult {
+        let output = GitOutput {
+            exit_code: Some(128),
+            stdout: b"sensitive diff content".to_vec(),
+            stdout_truncated: false,
+            stderr: b"fatal: bad revision 'HEAD'\n".to_vec(),
+        };
+        let Err(OpError::Execution(message)) = render_git_output(&output, Path::new("/ws")) else {
             return Err(TestError::Unexpected(
                 "nonzero git status must fail".to_owned(),
             ));
         };
-
-        match error {
-            OpError::Execution(message) => {
-                assert_eq!(message, "git diff exited with status 1");
-                assert!(!message.contains("sensitive"));
-            }
-            other => {
-                return Err(TestError::Unexpected(format!(
-                    "expected execution error, got {other:?}"
-                )));
-            }
-        }
-        Ok(())
-    }
-
-    #[test]
-    fn test_killed_by_output_limit_returns_truncated_ok_not_error() -> TestResult {
-        let text = render_shell_output(serde_json::json!({
-            "exit_code": -1,
-            "stdout": "diff --git a/x b/x\n+partial",
-            "stderr": "",
-            "truncated": true,
-            "killed_by_output_limit": true,
-        }))
-        .map_err(ctx(
-            "killed-by-output-limit must be a truncated success, not an error",
-        ))?;
-
-        assert!(text.starts_with("diff --git a/x b/x\n+partial"));
-        assert!(
-            text.contains("Diff gekürzt bei 64 KiB"),
-            "missing truncation notice: {text}"
+        assert_eq!(
+            message,
+            "git diff exited with status 128: fatal: bad revision 'HEAD'"
         );
+        assert!(!message.contains("sensitive"));
         Ok(())
     }
 
     #[test]
-    fn test_truncated_without_kill_returns_ok_with_notice() -> TestResult {
-        let text = render_shell_output(serde_json::json!({
-            "exit_code": 0,
-            "stdout": "diff --git a/x b/x\n+full run, output just capped",
-            "stderr": "",
-            "truncated": true,
-            "killed_by_output_limit": false,
-        }))
-        .map_err(ctx("truncated-but-completed output must be Ok"))?;
-
-        assert!(text.starts_with("diff --git a/x b/x\n+full run, output just capped"));
-        assert!(
-            text.contains("Diff gekürzt bei 64 KiB"),
-            "missing truncation notice: {text}"
-        );
-        Ok(())
-    }
-
-    #[test]
-    fn test_real_git_failure_without_kill_is_still_an_error() -> TestResult {
-        let result = render_shell_output(serde_json::json!({
-            "exit_code": 1,
-            "stdout": "",
-            "stderr": "fatal: not a git repository",
-            "truncated": false,
-            "killed_by_output_limit": false,
-        }));
-        let Err(error) = result else {
-            return Err(TestError::Unexpected(
-                "a genuine non-zero git exit without a kill must stay an error".to_owned(),
-            ));
+    fn test_git_not_a_repository_stderr_maps_to_the_clear_message() -> TestResult {
+        let output = GitOutput {
+            exit_code: Some(128),
+            stderr: b"fatal: not a git repository (or any of the parent directories): .git"
+                .to_vec(),
+            ..GitOutput::default()
         };
-
-        match error {
-            OpError::Execution(message) => {
-                assert_eq!(message, "git diff exited with status 1");
-            }
-            other => {
-                return Err(TestError::Unexpected(format!(
-                    "expected execution error, got {other:?}"
-                )));
-            }
-        }
+        let Err(OpError::Execution(message)) =
+            render_git_output(&output, Path::new("/nonexistent/holy"))
+        else {
+            return Err(TestError::Unexpected("must fail".to_owned()));
+        };
+        assert!(
+            message.starts_with("Kein Git-Repository in /nonexistent/holy; diff braucht ein Repo"),
+            "{message}"
+        );
         Ok(())
     }
 
     #[test]
-    fn test_missing_truncation_fields_default_to_false() -> TestResult {
-        // Older/foreign JSON without `truncated`/`killed_by_output_limit` must
-        // behave exactly as before: success without a notice, error on
-        // nonzero exit.
-        let text = render_shell_output(serde_json::json!({
-            "exit_code": 0,
-            "stdout": "diff --git a/x b/x\n+ok",
-            "stderr": "",
-        }))
-        .map_err(ctx(
-            "missing optional fields must default to false, not fail parsing",
-        ))?;
-        assert_eq!(text, "diff --git a/x b/x\n+ok");
+    fn test_truncated_output_returns_ok_with_notice_even_after_sigpipe() -> TestResult {
+        let text = render_git_output(
+            &GitOutput {
+                exit_code: None,
+                stdout: b"diff --git a/x b/x\n+partial".to_vec(),
+                stdout_truncated: true,
+                stderr: Vec::new(),
+            },
+            Path::new("/ws"),
+        )
+        .map_err(ctx("a capped diff is a truncated success"))?;
+        assert!(text.starts_with("diff --git a/x b/x\n+partial"));
+        assert!(text.contains("Diff gekürzt bei 64 KiB"), "{text}");
+        Ok(())
+    }
+
+    #[test]
+    fn test_clean_run_without_output_says_so() -> TestResult {
+        let text = render_git_output(
+            &GitOutput {
+                exit_code: Some(0),
+                ..GitOutput::default()
+            },
+            Path::new("/ws"),
+        )
+        .map_err(ctx("clean run"))?;
+        assert_eq!(text, "git diff produced no output.");
         Ok(())
     }
 
@@ -639,15 +741,133 @@ mod tests {
         )));
     }
 
+    /// Holy export: a folder with several projects, no repository at the root.
     #[tokio::test]
-    async fn test_diff_without_execute_process_fails_before_process_invocation() -> TestResult {
-        let (ctx, root) = test_context()?;
-        let result = diff(&ctx, DiffArgs::default()).await;
-        std::fs::remove_dir_all(root).map_err(crate::test_support::ctx("remove test workspace"))?;
+    async fn test_diff_in_a_non_repository_names_the_repository_subfolders() -> TestResult {
+        let (ctx_, base, workspace) = test_context(&[Permission::ReadWorkspace])?;
+        for (folder, git) in [("Aquarium", true), ("Holy-Cow-Alt", true), ("notes", false)] {
+            std::fs::create_dir_all(workspace.join(folder)).map_err(ctx("create folder"))?;
+            if git {
+                std::fs::create_dir_all(workspace.join(folder).join(".git"))
+                    .map_err(ctx("create .git"))?;
+            }
+        }
+        let result = diff(
+            &ctx_,
+            DiffArgs {
+                path: None,
+                stat_only: true,
+            },
+        )
+        .await;
+        std::fs::remove_dir_all(&base).map_err(ctx("remove test workspace"))?;
 
+        let Err(OpError::Execution(message)) = result else {
+            return Err(TestError::Unexpected(format!(
+                "expected an error, got {result:?}"
+            )));
+        };
+        assert_eq!(
+            message,
+            format!(
+                "Kein Git-Repository in {}; diff braucht ein Repo (Unterordner: Aquarium, \
+                 Holy-Cow-Alt)",
+                workspace.display()
+            )
+        );
+        assert!(!message.contains("129"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_diff_without_read_workspace_is_refused() -> TestResult {
+        let (ctx_, base, _) = test_context(&[])?;
+        let result = diff(&ctx_, DiffArgs::default()).await;
+        std::fs::remove_dir_all(&base).map_err(ctx("remove test workspace"))?;
         assert!(
-            matches!(result, Err(OpError::Execution(message)) if message.contains("ExecuteProcess permission missing"))
+            matches!(&result, Err(OpError::Execution(message)) if message.contains("ReadWorkspace")),
+            "{result:?}"
         );
         Ok(())
+    }
+
+    #[test]
+    fn test_not_a_repo_message_without_repository_subfolders() -> TestResult {
+        let (_, base, workspace) = test_context(&[Permission::ReadWorkspace])?;
+        let message = not_a_repo_message(&workspace);
+        std::fs::remove_dir_all(&base).map_err(ctx("remove test workspace"))?;
+        assert!(
+            message.contains("(Unterordner: keiner ist ein Git-Repository)"),
+            "{message}"
+        );
+        Ok(())
+    }
+
+    /// Ladybird export: in plan mode (`ReadWorkspace` only, no
+    /// `ExecuteProcess`) `diff` failed with "ExecuteProcess permission
+    /// missing". With the read-only git sandbox it must run. Needs a host with
+    /// git and a working bubblewrap; elsewhere only the permission part is
+    /// checked.
+    #[tokio::test]
+    async fn test_diff_works_with_plan_mode_permissions() -> TestResult {
+        let (ctx_, base, workspace) = test_context(&[Permission::ReadWorkspace])?;
+        let outcome = async {
+            let Some(git) = find_git() else {
+                return Ok(None);
+            };
+            let run = |args: &[&str]| {
+                std::process::Command::new(&git)
+                    .args(args)
+                    .current_dir(&workspace)
+                    .env("GIT_CONFIG_NOSYSTEM", "1")
+                    .env("GIT_CONFIG_GLOBAL", "/dev/null")
+                    .output()
+                    .map_err(ctx("run host git for the fixture"))
+            };
+            std::fs::write(workspace.join("a.txt"), "one\n").map_err(ctx("write a.txt"))?;
+            run(&["init", "-q"])?;
+            run(&["-c", "user.name=t", "-c", "user.email=t@t", "add", "a.txt"])?;
+            run(&[
+                "-c",
+                "user.name=t",
+                "-c",
+                "user.email=t@t",
+                "commit",
+                "-q",
+                "-m",
+                "init",
+            ])?;
+            std::fs::write(workspace.join("a.txt"), "one\ntwo\n").map_err(ctx("edit a.txt"))?;
+            Ok::<_, TestError>(Some(
+                diff(
+                    &ctx_,
+                    DiffArgs {
+                        path: None,
+                        stat_only: true,
+                    },
+                )
+                .await,
+            ))
+        }
+        .await;
+        std::fs::remove_dir_all(&base).map_err(ctx("remove test workspace"))?;
+
+        match outcome? {
+            None => Ok(()),
+            Some(Ok(output)) => {
+                assert!(output.text.contains("a.txt"), "{}", output.text);
+                Ok(())
+            }
+            Some(Err(OpError::Execution(message)))
+                if message.contains("bubblewrap") || message.contains("bwrap") =>
+            {
+                // Kein nutzbares bwrap (Container ohne User-Namespaces).
+                assert!(!message.contains("ExecuteProcess"), "{message}");
+                Ok(())
+            }
+            Some(Err(error)) => Err(TestError::Unexpected(format!(
+                "diff must work with ReadWorkspace only: {error:?}"
+            ))),
+        }
     }
 }

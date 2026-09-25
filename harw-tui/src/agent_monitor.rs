@@ -29,6 +29,7 @@ use ratatui::{
 };
 
 use crate::chat_scroll::ChatScroll;
+use crate::jobs_panel::JobRow;
 use crate::sanitize::{sanitize_display, sanitize_inline};
 use crate::status_line::{display_width, fit_width, model_segment};
 use crate::style::{self, Theme};
@@ -558,6 +559,13 @@ pub(crate) enum PanelEntry<'a> {
     },
     /// Sammelzeile der fertigen Agenten (Enter/`f` klappt auf/zu).
     Finished,
+    /// Plan R9, Teil F: ein Hintergrund-Job (Jobs-Gruppe unter den Agenten).
+    Job {
+        /// Schnappschuss des Jobs.
+        row: &'a JobRow,
+    },
+    /// Plan R9, Teil F: Sammelzeile beendeter Jobs (Enter/`f` klappt auf/zu).
+    JobsFinished,
 }
 
 /// Zustand aller beobachteten Agenten plus interne Nutzung.
@@ -578,6 +586,9 @@ pub(crate) struct AgentMonitor {
     follow_selection: Cell<bool>,
     /// Innenhöhe des Panels beim letzten Zeichnen (Seitengröße für Bild↑↓).
     panel_height: Cell<usize>,
+    /// Plan R9, Teil F: Schnappschuss der Hintergrund-Jobs der Sitzung
+    /// (Jobs-Gruppe), älteste zuerst; nachgeführt über [`Self::set_jobs`].
+    jobs: Vec<JobRow>,
 }
 
 impl AgentMonitor {
@@ -984,7 +995,58 @@ impl AgentMonitor {
         } else {
             entries.extend(finished);
         }
+        // Plan R9, Teil F: die Jobs-Gruppe — laufende Jobs einzeln, beendete
+        // ab `FINISHED_COLLAPSE_MIN` als Sammelzeile (dieselbe Taste `f`).
+        entries.extend(
+            self.jobs
+                .iter()
+                .filter(|row| row.active)
+                .map(|row| PanelEntry::Job { row }),
+        );
+        let finished_jobs: Vec<PanelEntry<'_>> = self
+            .jobs
+            .iter()
+            .filter(|row| !row.active)
+            .map(|row| PanelEntry::Job { row })
+            .collect();
+        if finished_jobs.len() >= FINISHED_COLLAPSE_MIN {
+            entries.push(PanelEntry::JobsFinished);
+            if self.finished_expanded {
+                entries.extend(finished_jobs);
+            }
+        } else {
+            entries.extend(finished_jobs);
+        }
         entries
+    }
+
+    /// Plan R9, Teil F: übernimmt den aktuellen Job-Schnappschuss.
+    ///
+    /// # Rückgabe
+    /// `true`, wenn sich Sichtbares änderte.
+    pub(crate) fn set_jobs(&mut self, jobs: Vec<JobRow>) -> bool {
+        if self.jobs == jobs {
+            return false;
+        }
+        self.jobs = jobs;
+        let len = self.panel_entries().len();
+        self.selected = self.selected.min(len.saturating_sub(1));
+        true
+    }
+
+    /// Plan R9, Teil F: der aktuelle Job-Schnappschuss.
+    #[must_use]
+    pub(crate) fn jobs(&self) -> &[JobRow] {
+        &self.jobs
+    }
+
+    /// Plan R9, Teil F: Kennung des ausgewählten Jobs (Detailansicht).
+    #[must_use]
+    pub(crate) fn selected_job(&self) -> Option<String> {
+        match self.panel_entries().get(self.selected) {
+            Some(PanelEntry::Job { row }) => Some(row.id.clone()),
+            _ => None,
+        }
     }
 
     /// Bewegt die Auswahl um eine Zeile (umlaufend).
@@ -1067,7 +1129,7 @@ impl AgentMonitor {
     pub(crate) fn selected_is_summary(&self) -> bool {
         matches!(
             self.panel_entries().get(self.selected),
-            Some(PanelEntry::Finished)
+            Some(PanelEntry::Finished | PanelEntry::JobsFinished)
         )
     }
 
@@ -1800,9 +1862,47 @@ fn panel_rows(
     let selected = monitor.selected.min(entries.len().saturating_sub(1));
     let mut rows: Vec<PanelRow> = Vec::new();
     let mut gauges: Vec<Option<Line<'static>>> = Vec::new();
+    let finished_jobs: Vec<&JobRow> = monitor.jobs.iter().filter(|row| !row.active).collect();
+    let mut jobs_header_done = false;
     for (index, entry) in entries.iter().enumerate() {
         let is_selected = focused && index == selected;
+        // Plan R9, Teil F: eine (nicht auswählbare) Kopfzeile vor der
+        // Jobs-Gruppe.
+        if !jobs_header_done && matches!(entry, PanelEntry::Job { .. } | PanelEntry::JobsFinished) {
+            jobs_header_done = true;
+            let active = monitor.jobs.iter().filter(|row| row.active).count();
+            rows.push(PanelRow {
+                line: crate::jobs_panel::group_header_line(
+                    active,
+                    monitor.jobs.len(),
+                    width,
+                    theme,
+                ),
+                entry: None,
+            });
+            gauges.push(None);
+        }
         match entry {
+            PanelEntry::Job { row } => {
+                rows.push(PanelRow {
+                    line: crate::jobs_panel::job_line(row, is_selected, width, theme),
+                    entry: Some(index),
+                });
+                gauges.push(None);
+            }
+            PanelEntry::JobsFinished => {
+                rows.push(PanelRow {
+                    line: crate::jobs_panel::finished_jobs_line(
+                        &finished_jobs,
+                        monitor.finished_expanded,
+                        is_selected,
+                        width,
+                        theme,
+                    ),
+                    entry: Some(index),
+                });
+                gauges.push(None);
+            }
             PanelEntry::Agent { depth, live } => {
                 let duplicate = role_counts.get(live.role.as_str()).copied().unwrap_or(0) > 1;
                 let label = row_label(live, duplicate);
@@ -1966,6 +2066,11 @@ pub(crate) fn render_agents_panel(
     }
     if finished > 0 {
         title.push_str(&format!("· {finished} fertig "));
+    }
+    // Plan R9, Teil F: laufende Hintergrund-Jobs im Titel.
+    let running_jobs = monitor.jobs.iter().filter(|row| row.active).count();
+    if running_jobs > 0 {
+        title.push_str(&format!("· ⚙ {running_jobs} Jobs "));
     }
     let inner_width = usize::from(area.width.saturating_sub(2));
     let title = fit_width(&title, inner_width);
@@ -2784,6 +2889,92 @@ mod tests {
         monitor.toggle_finished();
         let expanded = panel_screen(&monitor, 44, 20, false)?.join("\n");
         assert_eq!(expanded.matches("uia-explorer").count(), 2, "{expanded}");
+        Ok(())
+    }
+
+    fn job_row(id: &str, name: &str, active: bool, failed: bool) -> JobRow {
+        JobRow {
+            id: id.to_owned(),
+            name: name.to_owned(),
+            state: if active {
+                "läuft"
+            } else if failed {
+                "fehlgeschlagen"
+            } else {
+                "fertig"
+            },
+            progress: if active {
+                "ninja 120/900 13%".to_owned()
+            } else {
+                "—".to_owned()
+            },
+            runtime: "4m10s".to_owned(),
+            active,
+            failed,
+        }
+    }
+
+    /// Plan R9, Teil F: die Jobs-Gruppe steht unter den Agenten (Kopfzeile,
+    /// laufende Jobs einzeln, beendete als Sammelzeile), keine Zeile bricht
+    /// um, Auswahl und Sammelzeile folgen den Panel-Konventionen.
+    #[test]
+    fn jobs_group_renders_one_line_per_job_without_wrapping() -> TestResult {
+        let mut monitor = busy_monitor()?;
+        assert!(monitor.set_jobs(vec![
+            job_row(
+                "job-a",
+                "ladybird build mit einem sehr langen Namen",
+                true,
+                false
+            ),
+            job_row("job-b", "vcpkg restore", false, false),
+            job_row("job-c", "tests", false, true),
+        ]));
+        assert!(!monitor.set_jobs(monitor.jobs().to_vec()), "unverändert");
+        for width in [16u16, 24, 30, 44, 60, 100] {
+            for height in [6u16, 12, 30] {
+                let inner = usize::from(width - 2);
+                for row in panel_rows(&monitor, inner, usize::from(height - 2), Theme::Dark, true) {
+                    assert!(
+                        row.line.width() <= inner,
+                        "{width}x{height}: {:?}",
+                        row.line
+                    );
+                }
+            }
+        }
+        let rows = panel_screen(&monitor, 60, 30, true)?;
+        let shown = rows.join("\n");
+        assert!(rows[0].contains("⚙ 1 Jobs"), "{shown}");
+        let header = rows
+            .iter()
+            .position(|row| row.contains("── Jobs · 1 aktiv"))
+            .ok_or("Kopfzeile der Jobs-Gruppe fehlt")?;
+        let running = rows
+            .iter()
+            .position(|row| row.contains("ladybird build") && row.contains("läuft"))
+            .ok_or("laufender Job fehlt")?;
+        let summary = rows
+            .iter()
+            .position(|row| row.contains("✓ 2 Jobs beendet"))
+            .ok_or("Sammelzeile der Jobs fehlt")?;
+        assert!(header < running && running < summary, "{shown}");
+        assert!(!shown.contains("vcpkg restore"), "eingeklappt: {shown}");
+
+        // Auswahl: der laufende Job ist wählbar, die Sammelzeile klappt auf.
+        let job_index = monitor
+            .panel_entries()
+            .iter()
+            .position(|entry| matches!(entry, PanelEntry::Job { .. }))
+            .ok_or("Job-Eintrag")?;
+        monitor.selected = job_index;
+        assert_eq!(monitor.selected_job().as_deref(), Some("job-a"));
+        assert!(monitor.selected_agent().is_none());
+        monitor.select_next();
+        assert!(monitor.selected_is_summary());
+        monitor.toggle_finished();
+        let expanded = panel_screen(&monitor, 60, 30, true)?.join("\n");
+        assert!(expanded.contains("vcpkg restore"), "{expanded}");
         Ok(())
     }
 

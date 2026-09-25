@@ -1,0 +1,20 @@
+# Mitgelieferter Agent `latex-writer` (Plan R9, Teil B: migriert aus dem
+# Legacy-Format `agent.toml`; `system.md` bleibt die Arbeitsanweisung und
+# wird per `instructions_file` in den Kontext des Kindes gelegt).
+#
+# Erweitert die eingebaute UIA-Rolle `uia-latex-writer` (Organisationsrolle
+# `uia-worker`): Werkzeuge, Budget und Rückgabevertrag der Basis gelten
+# unverändert; hier stehen nur Identität, Skills und Anweisung.
+
+schema = "harwness.agent/v1"
+id = "harwness.agent.latex-writer@1"
+version = "1.0.0"
+extends = { id = "harwness.agent.uia-latex-writer@1" }
+role = "uia-worker"
+specialization = "latex-writer"
+
+name = "LaTeX Writer"
+description = "Schreibt und überarbeitet LaTeX-Quellen (Arbeiten, Paper, Beamer-Folien, Literatur), prüft sie statisch und baut sie mit latex.build, ohne freie Shell und ohne Installationen."
+instructions_file = "system.md"
+
+skills = ["latex-report", "latex-writing", "xelatex-compile"]

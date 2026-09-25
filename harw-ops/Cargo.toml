@@ -41,8 +41,10 @@ harw-tools = { path = "../harw-tools" }
 # darf, wenn es selbst als Abhängigkeit deklariert ist — auch wenn `tokio`
 # bereits transitiv über harw-tool-shell im Graphen liegt. Nur `time`
 # zusätzlich zur ohnehin vorhandenen dev-dependency-Featureliste, keine neue
-# externe Crate.
-tokio = { version = "1.52.3", features = ["time"] }
+# externe Crate. `process`/`io-util`/`macros`: das `diff`-Werkzeug startet
+# `git` als rein lesenden Prozess in einer eigenen bwrap-Sandbox
+# (`src/diff.rs`), mit Zeitlimit und begrenzter Ausgabe.
+tokio = { version = "1.52.3", features = ["time", "process", "io-util", "macros"] }
 # UIA-Delegationsrouting (`explore`/`research_web`): `AgentRoleId` wird
 # gebraucht, um die aufrufende `organizational_role` gegen `UserInterface`
 # zu prüfen. Vormals nur dev-dependency für Test-Fixtures — jetzt auch in
@@ -101,6 +103,9 @@ toml_edit = "0.25.13"
 # Journal, Sichtbarkeit, Phasen, Prompts, AAR). Kein Zyklus: `harw-matrix-game`
 # hat keine harw-Abhängigkeiten.
 harw-matrix-game = { path = "../harw-matrix-game" }
+# Plan R9, Teil F: `/jobs` (Hintergrund-Jobs der Sitzung ansehen, stoppen,
+# Logs lesen). Kein Zyklus: `harw-tool-job` hängt nicht von `harw-ops` ab.
+harw-tool-job = { path = "../harw-tool-job" }
 
 [features]
 # Forwards to harw-provider's ChatGPT OAuth flag so `--features chatgpt-oauth`
@@ -114,6 +119,11 @@ secrecy = "0.8"
 # `/memory`) gegen ein temporäres Verzeichnis statt echter `HARW_HOME`/`HOME`-
 # Env-Mutation (nicht thread-sicher, würde parallele Tests gefährden).
 tempfile = { workspace = true }
+# Runde 9, E7: `runner/tests/spawner_chain.rs` implementiert
+# `ChildRegistryFactory`, dessen Signatur `harw_catalog::AgentSuggestions`
+# nennt. Kein Zyklus: harw-catalog hängt nicht von harw-ops ab (liegt ohnehin
+# transitiv über harw-core im Graphen).
+harw-catalog = { path = "../harw-catalog" }
 # AW5-09: `context_proposal.rs`-Tests bauen einen `DefinitionId`
 # (`harwness.context.base@1`) als Fixture. Kein Zyklus: `harw-agent-dsl`
 # hängt nicht von `harw-ops` ab (geprüft).

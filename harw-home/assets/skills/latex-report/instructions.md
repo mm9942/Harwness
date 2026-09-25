@@ -4,7 +4,7 @@
 
 **Warum:** Die Vorlage bringt Schriften, deutsche Silbentrennung ohne `ngerman.ldf`, Farben, Hinweiskästen, Tabellenspalten und großzügige Umbruchregeln bereits mit. Wer sie benutzt, spart Build-Runden und vermeidet die typischen Fehler: englische Trennung im deutschen Text, Zeilen im Rand, zusammengeklebte Nummern im Inhaltsverzeichnis („10.1Was“). Ein Build mit `status = ok` heißt noch nicht, dass das PDF gut aussieht. Erst der Build-Bericht (Seiten, Overfull, Warnungen) und ein Blick ins PDF zeigen das.
 
-> Eigene Worte, keine Handbuchtexte. Dieser Skill ergänzt `latex-writing` (Handwerk, statische Prüfliste), `xelatex-compile` (Build, Schriften, Log-Diagnose) und `business-writing-pyramid` (Aufbau von Geschäftstexten).
+> Eigene Worte, keine Handbuchtexte. Dieser Skill ergänzt `latex-writing` (Handwerk, statische Prüfliste), `xelatex-compile` (Build, Schriften, Log-Diagnose) und `business-writing-pyramid` (Aufbau von Geschäftstexten). Diese drei sind nicht vorab geladen: Lade sie bei Bedarf mit `skills.load` (ganz oder mit `section` nur den gebrauchten Abschnitt), spätestens vor der Prüfliste, vor dem ersten Build-Fehler bzw. vor einem Geschäftstext.
 
 ## 0. Rolle, Grenzen und Übergabe
 

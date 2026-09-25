@@ -8,6 +8,34 @@ pub fn load_system_prompt(agent_dir: &Path, system_file: Option<&str>) -> Config
     read_optional_file(&path)
 }
 
+/// Obergrenze für eine per `instructions_file` referenzierte Instruktionsdatei
+/// einer Agentendefinition (Plan R9, Teil B).
+pub const MAX_AGENT_INSTRUCTIONS_BYTES: usize = 64 * 1024;
+
+/// Lädt die Instruktionsdatei einer Agentendefinition (`instructions_file =
+/// "system.md"` in `definition.toml`) relativ zu ihrem Agentenordner.
+///
+/// # Description
+/// Dieselbe Pfadprüfung wie [`load_system_prompt`]: kein absoluter Pfad, kein
+/// `..`, Symlinks werden vor der Enthaltenseinsprüfung aufgelöst. Eine
+/// fehlende Datei ergibt einen leeren Text.
+///
+/// # Errors
+/// - [`ConfigError::Invalid`]: Pfad verlässt den Agentenordner, oder die
+///   Datei ist größer als [`MAX_AGENT_INSTRUCTIONS_BYTES`].
+/// - [`ConfigError::ReadFailed`]: jeder I/O-Fehler außer „nicht gefunden“.
+pub fn load_agent_instructions(agent_dir: &Path, instructions_file: &str) -> ConfigResult<String> {
+    let path = configured_file_path(agent_dir, instructions_file, "instructions_file")?;
+    let content = read_optional_file(&path)?;
+    if content.len() > MAX_AGENT_INSTRUCTIONS_BYTES {
+        return Err(ConfigError::Invalid(format!(
+            "instructions_file {} is larger than {MAX_AGENT_INSTRUCTIONS_BYTES} bytes",
+            path.display()
+        )));
+    }
+    Ok(content)
+}
+
 /// Lädt den freien Identitätstext einer UIA aus `identity.md` in ihrem
 /// Agentenordner.
 ///

@@ -1568,7 +1568,10 @@ impl Scratch {
                 out.push(GameEntry::new(
                     round,
                     audience.0.clone(),
-                    EntryKind::FactAdded { text: text.clone() },
+                    EntryKind::FactAdded {
+                        text: text.clone(),
+                        sources: Vec::new(),
+                    },
                 ));
             }
             EffectOp::Ongoing {
@@ -1984,6 +1987,7 @@ pub fn open_game(
             Audience::Public,
             EntryKind::FactAdded {
                 text: situation.trim().to_owned(),
+                sources: Vec::new(),
             },
         ));
     }

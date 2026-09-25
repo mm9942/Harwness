@@ -225,8 +225,9 @@ fn egress_denial(error: &EgressError, label: &str) -> WebToolError {
         EgressError::InvalidUrl(inner) => return url_error(inner, label),
         EgressError::HostNotAllowed { host } => {
             format!(
-                "Host {} ist nicht in der Egress-Allowlist",
-                redact_host(host)
+                "Host {} ist nicht in der Egress-Allowlist — {}",
+                redact_host(host),
+                harw_tools::sandbox_guard::NETWORK_ENABLE_HINT
             )
         }
         EgressError::LocalHostName { .. } => {

@@ -9,6 +9,7 @@ pub mod agent_limits;
 pub mod agent_toml;
 pub mod auth_toml;
 pub mod browser_toml;
+pub mod builtin_definitions;
 pub mod channel_toml;
 pub mod discovery;
 pub mod dod_toml;
@@ -44,8 +45,9 @@ pub use auth_toml::{AuthConfig, CredentialEntry, KekConfig, KekProvenance, Secre
 pub use browser_toml::BrowserSection;
 pub use channel_toml::{ChannelFileToml, ChannelSectionToml, ChannelToml, TelegramChannelToml};
 pub use discovery::{
-    HasName, ResolvedConfig, default_config_layers, discover_config,
-    discover_config_with_restricted, discover_config_with_restricted_and_project_settings,
+    AgentDefinitionMeta, HasName, INSTRUCTIONS_FILE_KEY, ResolvedConfig, default_config_layers,
+    discover_config, discover_config_with_restricted,
+    discover_config_with_restricted_and_project_settings, discover_run_agent_definitions,
 };
 pub use dod_toml::DodSection;
 pub use dotenv::{
@@ -72,13 +74,14 @@ pub use internal_models::{
     openrouter_available, resolve_internal_model,
 };
 pub use loader::{
-    load_skill_instructions, load_system_prompt, load_uia_personalization, load_uia_user_name,
+    MAX_AGENT_INSTRUCTIONS_BYTES, load_agent_instructions, load_skill_instructions,
+    load_system_prompt, load_uia_personalization, load_uia_user_name,
 };
 pub use mcp_toml::{McpServerToml, McpTransportToml};
 pub use merge::{LayerRole, ScopeDiagnostic, merge_layer_into};
 pub use mode_toml::ModeSection;
 pub use model_toml::{ModelCapabilitiesToml, ModelToml, PromptCachingMode};
-pub use network_toml::NetworkSection;
+pub use network_toml::{NetworkSection, ResearchWebMode};
 pub use permissions_toml::{PermissionsSection, RuleToml};
 pub use plan_toml::{DocSection, PlanSection, RemoteOcrMode, ToolsSection};
 pub use plugin_toml::{PluginCapabilitiesToml, PluginToml};

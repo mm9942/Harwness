@@ -1,7 +1,0 @@
-name = "test-engineer"
-role = "worker"
-description = "Creates and runs targeted verification for stated behavior and regressions."
-system_file = "system.md"
-skills = ["verification"]
-timeout_seconds = 240
-max_retries = 1

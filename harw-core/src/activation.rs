@@ -123,6 +123,22 @@ impl ToolProfile {
 // SessionActivation
 // ---------------------------------------------------------------------------
 
+/// Werkzeuge, die jede Agent-Sitzung unabhängig von `[tools].admitted` ihrer
+/// Definition freischaltet (Plan R9, Teil A): der lesende Skill-Katalog
+/// `skills.search`/`skills.load`.
+///
+/// # Beschreibung
+/// Beide lesen nur den bei der Montage eingefrorenen Skill-Katalog im
+/// Host-Prozess — kein Workspace, kein Netz, kein Prozess, keine
+/// Rechteklasse. Damit kein Zuschnitt (z. B. das Klemmen einer eigenen
+/// Definition auf ihre Basisrolle) sie versehentlich entfernt, schaltet
+/// [`crate::session::AgentSession::with_executable_agent_ir`] sie nach den
+/// admittierten Namen immer ein; ein ausdrückliches `forbidden` der
+/// Definition gewinnt weiterhin. Ob ein Werkzeug überhaupt sichtbar ist,
+/// entscheidet weiter die Registry: ohne montierten Provider bleibt der
+/// Name wirkungslos.
+pub const ALWAYS_AVAILABLE_TOOLS: &[&str] = &["skills.search", "skills.load"];
+
 /// Session-scoped filter over the [`harw_extension_api::ExtensionRegistry`].
 ///
 /// # Description

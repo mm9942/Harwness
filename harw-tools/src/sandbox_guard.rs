@@ -90,6 +90,10 @@ pub fn require_permission(
 ) -> Option<ToolOutput> {
     if ctx.sandbox().permissions().contains(required) {
         None
+    } else if required == Permission::NetworkAccess {
+        Some(ToolOutput::error(format!(
+            "{tool_name} denied: {required:?} permission missing — {NETWORK_ENABLE_HINT}"
+        )))
     } else {
         Some(ToolOutput::error(format!(
             "{tool_name} denied: {required:?} permission missing"
@@ -162,16 +166,21 @@ pub fn require_host_access(
         .contains(Permission::NetworkAccess)
     {
         return Some(ToolOutput::error(format!(
-            "Tool '{tool_name}' benötigt Permission NetworkAccess"
+            "Tool '{tool_name}' benötigt Permission NetworkAccess — {NETWORK_ENABLE_HINT}"
         )));
     }
     if !ctx.sandbox().network_scope().allows(host) {
         return Some(ToolOutput::error(format!(
-            "Tool '{tool_name}': Host '{host}' ist nicht in der erlaubten Host-Liste dieser Sandbox"
+            "Tool '{tool_name}': Host '{host}' ist nicht in der erlaubten Host-Liste dieser Sandbox — {NETWORK_ENABLE_HINT}"
         )));
     }
     None
 }
+
+/// Hinweis an Modell und Nutzerin, wie sich Netz für die Recherche
+/// freischalten lässt (Teil jeder Netz-Ablehnung dieses Guards und der
+/// Egress-Ablehnung von `web.fetch`). Ohne Konfiguration hat harw kein Netz.
+pub const NETWORK_ENABLE_HINT: &str = "Netz für Recherche freischalten: in der Konfiguration [network].research_web = \"open\" setzen (öffentliches Web, Freigabe je Domain) oder die Hosts in [network].researcher_web_hosts bzw. [network].allow_hosts eintragen";
 
 /// Extrahiert den normalisierten Hostnamen aus einer absoluten `http`/`https`-URL.
 ///
@@ -352,6 +361,42 @@ mod tests {
                     "message must contain permission variant name, got: {message:?}"
                 );
             }
+            other => {
+                return Err(TestError::Unexpected(format!(
+                    "expected ToolOutput::Error, got: {other:?}"
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    /// Plan R9: eine Netz-Ablehnung sagt, wie man Netz für die Recherche
+    /// freischaltet (`[network].research_web = "open"` oder Hosts eintragen).
+    #[test]
+    fn test_network_denials_explain_how_to_enable_research_network() -> TestResult {
+        let (_base, offline) = make_sandbox("network_hint_offline", vec![])?;
+        let ctx = make_ctx(offline);
+        for output in [
+            require_permission(&ctx, Permission::NetworkAccess, "web.fetch"),
+            require_host_access(&ctx, "docs.rs", "web.fetch"),
+        ] {
+            match output.ok_or(TestError::Missing("Netz-Ablehnung"))? {
+                ToolOutput::Error { message } => {
+                    assert!(message.contains("research_web = \"open\""), "{message}");
+                    assert!(message.contains("researcher_web_hosts"), "{message}");
+                }
+                other => {
+                    return Err(TestError::Unexpected(format!(
+                        "expected ToolOutput::Error, got: {other:?}"
+                    )));
+                }
+            }
+        }
+        // Andere Rechte bekommen keinen Netz-Hinweis.
+        match require_permission(&ctx, Permission::ExecuteProcess, "shell.exec")
+            .ok_or(TestError::Missing("Exec-Ablehnung"))?
+        {
+            ToolOutput::Error { message } => assert!(!message.contains("research_web")),
             other => {
                 return Err(TestError::Unexpected(format!(
                     "expected ToolOutput::Error, got: {other:?}"

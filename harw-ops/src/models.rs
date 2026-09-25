@@ -940,6 +940,67 @@ mod tests {
         Ok(())
     }
 
+    /// Live-Schnappschuss: eine gespeicherte Rollenwahl steht im folgenden
+    /// `/models show` (Datenquelle der Übersicht F8) sofort drin — auch nach
+    /// einem Zurücksetzen. Vorher blieb die Tabelle bis zum Neustart beim
+    /// Stand des Starts.
+    #[tokio::test]
+    async fn models_set_and_reset_are_visible_in_the_following_show() -> TestResult {
+        let base = fixture(test_config(), None)?;
+        let persistence: Arc<dyn SelectionPersistence> = base.recorder.clone();
+        let live: crate::live_config::SharedLiveConfig =
+            Arc::new(crate::live_config::LiveConfig::new(Arc::new(test_config())));
+        let mut services = ServiceMap::new();
+        services.insert(persistence);
+        services.insert(Arc::new(test_config()));
+        services.insert(Arc::clone(&live));
+        let live_ctx = OpContext::new(
+            SessionId::new(),
+            TurnId::new(),
+            base.ctx.sandbox().clone(),
+            services,
+        );
+        async fn run_in(ctx: &OpContext, tokens: &[&str]) -> Result<OpOutput, OpError> {
+            let args = ModelsArgs::from_raw_args(&toks(tokens))?;
+            super::models(ctx, args).await
+        }
+        let row = |output: &OpOutput, role: &str| -> TestResult<serde_json::Value> {
+            data(output)?["roles"]
+                .as_array()
+                .and_then(|roles| roles.iter().find(|row| row["role"] == role).cloned())
+                .ok_or(TestError::Missing("role row"))
+        };
+
+        run_in(
+            &live_ctx,
+            &["set", "explorer", "openrouter/vendor/router-model"],
+        )
+        .await
+        .map_err(ctx("set explorer"))?;
+        run_in(&live_ctx, &["set", "uia", "model-a"])
+            .await
+            .map_err(ctx("set uia"))?;
+        let shown = run_in(&live_ctx, &["show"]).await.map_err(ctx("show"))?;
+        let explorer = row(&shown, "explorer")?;
+        assert_eq!(explorer["provider"], serde_json::json!("openrouter"));
+        assert_eq!(explorer["model"], serde_json::json!("vendor/router-model"));
+        let uia = row(&shown, "uia")?;
+        assert_eq!(uia["provider"], serde_json::json!("provider-a"));
+        assert_eq!(uia["model"], serde_json::json!("model-a-2026"));
+
+        run_in(&live_ctx, &["reset", "explorer"])
+            .await
+            .map_err(ctx("reset explorer"))?;
+        let shown = run_in(&live_ctx, &["show"])
+            .await
+            .map_err(ctx("show after reset"))?;
+        assert_ne!(
+            row(&shown, "explorer")?["model"],
+            serde_json::json!("vendor/router-model")
+        );
+        Ok(())
+    }
+
     /// Runde 5, Teil G: ein UIA-Worker-Modell eines anderen Providers als
     /// die UIA wird angenommen und als eigene Rollenwahl gespeichert.
     #[tokio::test]

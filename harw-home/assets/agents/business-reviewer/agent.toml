@@ -1,7 +1,0 @@
-name = "business-reviewer"
-role = "worker"
-description = "Prüft Business-Entwürfe auf Logik, Kernaussage-zuerst, überschneidungsfreie Gruppierung, Belege und Risiken und liefert strukturierte Befunde, ohne umzuschreiben."
-system_file = "system.md"
-skills = ["author-review-pipeline", "business-writing-pyramid"]
-timeout_seconds = 240
-max_retries = 1

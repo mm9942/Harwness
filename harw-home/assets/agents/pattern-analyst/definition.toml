@@ -1,0 +1,64 @@
+# Analyse-Familie (Plan R9, Teil D): Pattern Analyst.
+#
+# Benutzerdefinierter Worker auf `worker-base@1`. Die Basis besitzt
+# `[lifecycle]` und `[context]`; diese Datei besitzt `[work]`, `[tools]`,
+# `[spawn]` und `[return]`. Die Laufzeit klemmt die Definition unter die
+# Rechtedecke ihrer Basisrolle: `[tools]` kann nur verengen, nie erweitern.
+# Die Arbeitsanweisung steht in `system.md` neben dieser Datei
+# (`instructions_file`); weitere Methoden-Skills lädt der Agent bei Bedarf
+# über `skills.load`.
+
+schema = "harwness.agent/v1"
+id = "harwness.agent.pattern-analyst@1"
+version = "1.0.0"
+extends = { id = "harwness.agent.worker-base@1" }
+role = "worker"
+specialization = "pattern-analyst"
+
+name = "Pattern Analyst"
+description = "Findet Verbindungen, Zeitlinien, Cluster und Anomalien in Objektmengen und prüft konkurrierende Erklärungen mit einer Hypothesenmatrix. Read-only."
+instructions_file = "system.md"
+
+skills = ["link-and-pattern-analysis"]
+
+[work]
+mode = "read-only-analysis"
+may_write_code = false
+may_research_web = false
+
+[tools]
+admitted = [
+  "fs.read",
+  "fs.list",
+  "fs.search",
+  "fs.glob",
+  "fs.grep",
+  "doc.read_pdf",
+  "workbench.show",
+  "diary.read",
+  "palace.search",
+  "palace.recall",
+  "parent.message",
+  "skills.search",
+  "skills.load",
+]
+forbidden = [
+  "fs.write",
+  "fs.edit",
+  "shell.exec",
+  "web.fetch",
+  "web.search",
+  "web.docs_rs",
+  "web.crates_io",
+]
+
+[spawn]
+max_depth = 0
+
+[spawn.budget]
+max_tokens = 100000
+max_tool_calls = 60
+max_wall_secs = 900
+
+[return]
+contract = "harwness.return.execution-summary@1"

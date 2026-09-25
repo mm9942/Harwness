@@ -16,6 +16,13 @@ use harw_config::{
 };
 use sha2::{Digest, Sha256};
 
+mod skill_index;
+
+pub use skill_index::{
+    BUNDLED_SKILL_SOURCE, MAX_SKILL_LOAD_BYTES, SHORT_DESCRIPTION_CHARS, SkillHeading, SkillIndex,
+    SkillIndexEntry, SkillSearchHit, SkillSource, SkippedSkill, bundled_skill_files,
+};
+
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub enum SuggestionKind {
     Skill,

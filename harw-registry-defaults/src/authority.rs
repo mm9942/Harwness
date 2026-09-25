@@ -576,6 +576,9 @@ fn delegation_targets_of(tables: &toml::Table) -> Option<Vec<String>> {
 /// - `doc.read_pdf` → `ReadWorkspace` (`harw-tool-doc/src/tool.rs`, dieselbe
 ///   Berechtigung wie `fs.read`: Datei muss innerhalb des Workspace liegen).
 /// - `shell.exec` → `ExecuteProcess` (`harw-tool-shell/src/exec.rs:574`).
+/// - `job.start` → `ExecuteProcess` (derselbe Startweg wie `shell.exec`);
+///   `job.status/logs/stop/list/wait` → `ReadWorkspace` (Plan R9, Teil F:
+///   kein Prozessstart, nur eigene Jobs bzw. die der Nachfahren).
 /// - `deps.graph`, `deps.locked` → `ReadWorkspace`, `deps.source_*` →
 ///   `ReadCargoRegistry` (`harw-tool-deps/src/{graph_tool.rs:195,
 ///   locked_tool.rs:209, source_tool.rs:803,855,918}`).
@@ -642,6 +645,8 @@ pub fn tool_permission(tool: &str) -> Option<Permission> {
     {
         Some(Permission::WriteWorkspace)
     } else if listed(SHELL_TOOLS)
+        // Plan R9, Teil F: `job.start` startet einen Prozess wie `shell.exec`.
+        || tool == harw_tool_job::JOB_START_TOOL
         || listed(PROCESS_TOOLS)
         || listed(LATEX_TOOLS)
         || listed(crate::profile::SUDO_TOOLS)
@@ -665,6 +670,10 @@ pub fn tool_permission(tool: &str) -> Option<Permission> {
         // Plan-Decke (ohne `WriteWorkspace`) laufen; die übrigen drei lesen
         // nur die Antwort der Nutzerin. Registriert nur für die Wurzel.
         || listed(harw_tool_plan::PlanToolProvider::TOOL_NAMES)
+        // Plan R9, Teil F: `job.status/logs/stop/list/wait` starten nichts;
+        // sie lesen bzw. beenden nur Jobs des Aufrufers und seiner
+        // Nachfahren (Besitzprüfung in `harw-tool-job`).
+        || listed(&harw_tool_job::JOB_CONTROL_TOOLS)
     {
         Some(Permission::ReadWorkspace)
     } else if listed(DEPS_SOURCE_TOOLS) {
@@ -751,6 +760,17 @@ mod tests {
             tool_permission("shell.exec"),
             Some(Permission::ExecuteProcess)
         );
+        assert_eq!(
+            tool_permission("job.start"),
+            Some(Permission::ExecuteProcess)
+        );
+        for tool in harw_tool_job::JOB_CONTROL_TOOLS {
+            assert_eq!(
+                tool_permission(tool),
+                Some(Permission::ReadWorkspace),
+                "{tool}"
+            );
+        }
         assert_eq!(tool_permission("plan"), None);
         assert_eq!(tool_permission("delegate_wave"), None);
         // Runde 5, Teil H: `agent.result` liest nur eigene Kind-Ergebnisse —

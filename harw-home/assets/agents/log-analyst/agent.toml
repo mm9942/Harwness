@@ -1,7 +1,0 @@
-name = "log-analyst"
-role = "worker"
-description = "Correlates logs and traces into reproducible diagnostic hypotheses."
-system_file = "system.md"
-skills = ["debugging"]
-timeout_seconds = 240
-max_retries = 1

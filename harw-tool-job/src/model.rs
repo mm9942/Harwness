@@ -1,0 +1,317 @@
+//! Datenmodell der Job-Verwaltung: [`JobId`], [`JobState`], [`JobOwner`],
+//! [`JobMeta`] (Inhalt von `meta.json`) und [`JobStatus`] (Sicht für
+//! Werkzeuge und Oberfläche).
+//!
+//! # Nebenläufigkeit
+//! Reine Werttypen, `Send + Sync`.
+
+use crate::progress::ProgressSnapshot;
+use jiff::Timestamp;
+use serde::{Deserialize, Serialize};
+use std::fmt;
+use std::path::PathBuf;
+
+/// Formatversion von `meta.json`.
+pub const META_VERSION: u32 = 1;
+
+/// Höchstlänge einer [`JobId`].
+const MAX_JOB_ID_LEN: usize = 64;
+
+/// Kennung eines Jobs; zugleich der Verzeichnisname unter `<state>/jobs/`.
+///
+/// # Description
+/// Nur `[A-Za-z0-9_-]`, 1–64 Zeichen: eine aus Modell-Argumenten geparste
+/// Kennung kann deshalb nie aus dem Job-Verzeichnis herausführen (`..`, `/`).
+///
+/// # Examples
+/// ```rust
+/// use harw_tool_job::JobId;
+///
+/// assert!(JobId::parse("job-20260924-101112-001").is_some());
+/// assert!(JobId::parse("../etc").is_none());
+/// ```
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(try_from = "String", into = "String")]
+pub struct JobId(String);
+
+impl JobId {
+    /// Prüft und übernimmt eine Kennung.
+    ///
+    /// # Returns
+    /// `None` für leere, zu lange oder unzulässige Zeichen enthaltende Werte.
+    #[must_use]
+    pub fn parse(raw: &str) -> Option<Self> {
+        let raw = raw.trim();
+        let valid = !raw.is_empty()
+            && raw.len() <= MAX_JOB_ID_LEN
+            && raw
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-' || byte == b'_');
+        valid.then(|| Self(raw.to_owned()))
+    }
+
+    /// Die Kennung als Text.
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl fmt::Display for JobId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl TryFrom<String> for JobId {
+    type Error = String;
+
+    fn try_from(value: String) -> Result<Self, Self::Error> {
+        Self::parse(&value).ok_or_else(|| format!("invalid job id `{value}`"))
+    }
+}
+
+impl From<JobId> for String {
+    fn from(value: JobId) -> Self {
+        value.0
+    }
+}
+
+/// Zustand eines Jobs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum JobState {
+    /// Angelegt, Prozess noch nicht gestartet.
+    Queued,
+    /// Läuft unter Aufsicht dieser harw-Sitzung.
+    Running,
+    /// Mit Exit-Code 0 beendet.
+    Succeeded,
+    /// Mit Exit-Code ≠ 0 oder durch ein fremdes Signal beendet, oder der
+    /// Start schlug fehl.
+    Failed,
+    /// Durch `job.stop` (bzw. die Oberfläche) beendet.
+    Stopped,
+    /// Aus einer früheren harw-Sitzung (oder abgelöst): der Prozess lebt
+    /// noch, wird aber nicht mehr beaufsichtigt (kein Exit-Code verfügbar).
+    Detached,
+    /// Aus einer früheren harw-Sitzung: der Prozess existiert nicht mehr
+    /// (oder die PID gehört inzwischen einem anderen Prozess); das Ergebnis
+    /// ist unbekannt.
+    Unknown,
+}
+
+impl JobState {
+    /// `true` für Endzustände (nichts läuft mehr).
+    #[must_use]
+    pub fn is_terminal(self) -> bool {
+        matches!(
+            self,
+            Self::Succeeded | Self::Failed | Self::Stopped | Self::Unknown
+        )
+    }
+
+    /// Kurzname (`running`, `succeeded`, …).
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Queued => "queued",
+            Self::Running => "running",
+            Self::Succeeded => "succeeded",
+            Self::Failed => "failed",
+            Self::Stopped => "stopped",
+            Self::Detached => "detached",
+            Self::Unknown => "unknown",
+        }
+    }
+}
+
+impl fmt::Display for JobState {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// Besitzer eines Jobs: die erzeugende Agenten-Sitzung und ihre Elternkette.
+///
+/// # Description
+/// `ancestors` ist nächstliegend zuerst geordnet (Elternteil, Großelternteil,
+/// …, Wurzel/UIA) und wird beim Start **einmal** über
+/// [`crate::JobLineage`] festgehalten. Steuern (`status`, `logs`, `stop`,
+/// `wait`) dürfen genau der Erzeuger und seine Vorfahren; Geschwister und
+/// Kinder des Erzeugers nicht.
+///
+/// # Examples
+/// ```rust
+/// use harw_tool_job::JobOwner;
+///
+/// let owner = JobOwner::new("child", vec!["parent".into(), "uia".into()]);
+/// assert!(owner.may_control("child"));
+/// assert!(owner.may_control("uia"));
+/// assert!(!owner.may_control("sibling"));
+/// ```
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct JobOwner {
+    /// Sitzungskennung des erzeugenden Agenten.
+    pub session: String,
+    /// Elternkette, nächstliegend zuerst.
+    #[serde(default)]
+    pub ancestors: Vec<String>,
+}
+
+impl JobOwner {
+    /// Baut einen Besitzer.
+    #[must_use]
+    pub fn new(session: impl Into<String>, ancestors: Vec<String>) -> Self {
+        Self {
+            session: session.into(),
+            ancestors,
+        }
+    }
+
+    /// Ob `caller` diesen Job steuern darf (Erzeuger oder Vorfahr).
+    #[must_use]
+    pub fn may_control(&self, caller: &str) -> bool {
+        !caller.is_empty()
+            && (self.session == caller || self.ancestors.iter().any(|entry| entry == caller))
+    }
+
+    /// Erzeuger und Vorfahren in Zustellreihenfolge: zuerst der Erzeuger,
+    /// dann der nächste Vorfahr, … (für die Weiterleitung einer Meldung,
+    /// wenn der Erzeuger bereits beendet ist).
+    pub fn delivery_chain(&self) -> impl Iterator<Item = &str> {
+        std::iter::once(self.session.as_str()).chain(self.ancestors.iter().map(String::as_str))
+    }
+}
+
+/// Inhalt von `<state>/jobs/<job_id>/meta.json`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct JobMeta {
+    /// Formatversion ([`META_VERSION`]).
+    pub version: u32,
+    /// Kennung.
+    pub job_id: JobId,
+    /// Anzeigename.
+    pub name: String,
+    /// Befehl, wie der Agent ihn angegeben hat (bei `argv` shell-gequotet).
+    pub command: String,
+    /// Arbeitsverzeichnis (absolut), falls angegeben.
+    #[serde(default)]
+    pub cwd: Option<String>,
+    /// Namen der gesetzten Umgebungsvariablen (Werte werden nie gespeichert).
+    #[serde(default)]
+    pub env_keys: Vec<String>,
+    /// Zustand.
+    pub state: JobState,
+    /// PID des Gruppenführers (= PGID).
+    #[serde(default)]
+    pub pid: Option<u32>,
+    /// Startzeit des Prozesses in Clock-Ticks seit Boot (`/proc/<pid>/stat`,
+    /// Feld 22); erkennt PID-Wiederverwendung nach einem Neustart von harw.
+    #[serde(default)]
+    pub proc_start_ticks: Option<u64>,
+    /// `true`, wenn der Prozess direkt auf dem Host läuft (ohne `bwrap`).
+    #[serde(default)]
+    pub executed_on_host: bool,
+    /// Kennung der harw-Instanz, die den Job gestartet hat.
+    pub harw_instance: String,
+    /// Besitzer.
+    pub owner: JobOwner,
+    /// Anlagezeitpunkt.
+    pub created_at: Timestamp,
+    /// Startzeitpunkt des Prozesses.
+    #[serde(default)]
+    pub started_at: Option<Timestamp>,
+    /// Endzeitpunkt (sofern bekannt).
+    #[serde(default)]
+    pub ended_at: Option<Timestamp>,
+    /// Exit-Code (sofern bekannt).
+    #[serde(default)]
+    pub exit_code: Option<i32>,
+    /// Beendendes Signal (sofern bekannt).
+    #[serde(default)]
+    pub signal: Option<i32>,
+    /// `job.stop` wurde angefordert.
+    #[serde(default)]
+    pub stop_requested: bool,
+    /// Vom Nutzer abgelöst (`detach`): läuft nach dem Ende von harw weiter.
+    #[serde(default)]
+    pub detached: bool,
+    /// Periodische Fortschrittsmeldung alle so vielen Sekunden (0 = aus).
+    pub notify_every_secs: u64,
+    /// Zuletzt erkannter Fortschritt.
+    #[serde(default)]
+    pub progress: Option<ProgressSnapshot>,
+    /// Zahl erkannter Warnzeilen.
+    #[serde(default)]
+    pub warnings: u64,
+    /// Zahl erkannter Fehlerzeilen.
+    #[serde(default)]
+    pub errors: u64,
+    /// Fehlermeldung, falls der Start selbst scheiterte.
+    #[serde(default)]
+    pub launch_error: Option<String>,
+}
+
+/// Sicht auf einen Job für Werkzeuge und Oberfläche.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct JobStatus {
+    /// Persistierter Zustand.
+    #[serde(flatten)]
+    pub meta: JobMeta,
+    /// Laufzeit in Sekunden (bis jetzt bzw. bis zum Ende), sofern bekannt.
+    pub runtime_secs: Option<u64>,
+    /// Vollständige stdout-Zeilen, die diese Sitzung gesehen hat.
+    pub stdout_lines: u64,
+    /// Vollständige stderr-Zeilen, die diese Sitzung gesehen hat.
+    pub stderr_lines: u64,
+    /// Letzte Ausgabezeilen (stdout und stderr in ungefährer Ankunftsfolge).
+    pub last_lines: Vec<String>,
+    /// Verzeichnis mit `stdout.log`, `stderr.log`, `meta.json`.
+    pub log_dir: PathBuf,
+}
+
+/// Dateiname von stdout im Job-Verzeichnis.
+pub const STDOUT_LOG: &str = "stdout.log";
+/// Dateiname von stderr im Job-Verzeichnis.
+pub const STDERR_LOG: &str = "stderr.log";
+/// Dateiname der Metadaten im Job-Verzeichnis.
+pub const META_FILE: &str = "meta.json";
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_job_id_rejects_path_traversal_and_bad_chars() {
+        assert!(JobId::parse("job-1_a").is_some());
+        assert!(JobId::parse("  job-1  ").is_some_and(|id| id.as_str() == "job-1"));
+        for bad in ["", " ", "../x", "a/b", "a.b", "a b", "ä", &"x".repeat(65)] {
+            assert!(JobId::parse(bad).is_none(), "accepted {bad:?}");
+        }
+    }
+
+    #[test]
+    fn test_owner_may_control_only_creator_and_ancestors() {
+        let owner = JobOwner::new("worker", vec!["orchestrator".into(), "uia".into()]);
+        assert!(owner.may_control("worker"));
+        assert!(owner.may_control("orchestrator"));
+        assert!(owner.may_control("uia"));
+        assert!(!owner.may_control("sibling-worker"));
+        assert!(!owner.may_control("grandchild"));
+        assert!(!owner.may_control(""));
+        let chain: Vec<&str> = owner.delivery_chain().collect();
+        assert_eq!(chain, vec!["worker", "orchestrator", "uia"]);
+    }
+
+    #[test]
+    fn test_state_terminal_classification() {
+        assert!(!JobState::Queued.is_terminal());
+        assert!(!JobState::Running.is_terminal());
+        assert!(!JobState::Detached.is_terminal());
+        assert!(JobState::Succeeded.is_terminal());
+        assert!(JobState::Failed.is_terminal());
+        assert!(JobState::Stopped.is_terminal());
+        assert!(JobState::Unknown.is_terminal());
+    }
+}
