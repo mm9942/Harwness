@@ -16,11 +16,16 @@
 //! the oldest *finished* run is evicted to make room (a run still in
 //! flight is never evicted).
 //!
-//! # Auth
+//! # Auth and request hardening
 //! A bearer token from `HARW_AGENT_HTTP_TOKEN` is required to start the
 //! listener on a non-loopback address, optional (but checked if the
 //! environment variable is set) on loopback. Comparison is constant-time.
-//! `GET /healthz` is exempt so liveness probes don't need the token.
+//! A browser `Origin` that does not name a loopback host is refused with
+//! `403` (an absent `Origin` passes), and a body nested deeper than
+//! `child_protocol::MAX_JSON_NESTING_DEPTH` is refused with `400` before
+//! it is parsed. `GET /healthz` is exempt so liveness probes don't need
+//! the token. The checks themselves live in `iface::net`, shared with the
+//! MCP interface's Streamable HTTP transport.
 //!
 //! # Approvals
 //! Like the MCP interface: no interactive approval loop. Whatever
@@ -54,10 +59,9 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use bytes::Bytes;
 use futures_core::Stream;
-use http_body_util::combinators::BoxBody;
-use http_body_util::{BodyExt, Channel, Full, LengthLimitError, Limited};
+use http_body_util::{BodyExt, Channel};
 use hyper::body::Incoming;
-use hyper::header::{AUTHORIZATION, CACHE_CONTROL, CONTENT_LENGTH, CONTENT_TYPE, HeaderValue};
+use hyper::header::{CACHE_CONTROL, CONTENT_TYPE, HeaderValue};
 use hyper::service::service_fn;
 use hyper::{HeaderMap, Method, Request, Response, StatusCode};
 use hyper_util::rt::{TokioExecutor, TokioIo};
@@ -71,6 +75,10 @@ use tokio_stream::StreamExt as _;
 
 use harwness_sdk::{CancelHandle, Harwness};
 
+use super::net::{
+    HttpResponse, bearer_authorized, json_response, origin_is_loopback, read_json_body,
+    validate_listen_requirements,
+};
 use crate::context::RunnerContext;
 
 /// Default bind address when `--listen` is not given.
@@ -88,7 +96,6 @@ const EVENT_CHANNEL_CAPACITY: usize = 256;
 /// published but not yet observed by the event pump.
 const EVENT_DRAIN_GRACE: Duration = Duration::from_millis(20);
 
-type HttpResponse = Response<BoxBody<Bytes, Infallible>>;
 type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 
 /// Runs the HTTP/JSON interface until the process is asked to stop.
@@ -115,7 +122,8 @@ pub fn run(ctx: RunnerContext) -> ExitCode {
     let token = std::env::var("HARW_AGENT_HTTP_TOKEN")
         .ok()
         .filter(|value| !value.is_empty());
-    if let Err(reason) = validate_listen_requirements(addr, token.as_deref()) {
+    if let Err(reason) = validate_listen_requirements(addr, token.as_deref(), "the HTTP interface")
+    {
         eprintln!("harw-agent-runner: {reason}");
         return ExitCode::FAILURE;
     }
@@ -147,17 +155,6 @@ pub fn run(ctx: RunnerContext) -> ExitCode {
         }
     };
     runtime.block_on(serve(addr, state))
-}
-
-/// A bind address requires a configured token unless it is loopback-only.
-fn validate_listen_requirements(addr: SocketAddr, token: Option<&str>) -> Result<(), String> {
-    if !addr.ip().is_loopback() && token.is_none() {
-        return Err(
-            "the HTTP interface on a non-loopback address requires HARW_AGENT_HTTP_TOKEN"
-                .to_owned(),
-        );
-    }
-    Ok(())
 }
 
 /// The manifest surfaced at `GET /manifest`: the root IR's rights manifest,
@@ -229,9 +226,9 @@ async fn handle(
     Ok(dispatch(&state, &method, &path, &headers, body).await)
 }
 
-/// The transport-independent router: auth, then the route table. Every
-/// test in this module calls this directly instead of going through a real
-/// socket.
+/// The transport-independent router: `/healthz`, then auth, then Origin,
+/// then the route table. Every test in this module calls this directly
+/// instead of going through a real socket.
 async fn dispatch(
     state: &AppState,
     method: &Method,
@@ -242,8 +239,14 @@ async fn dispatch(
     if path == "/healthz" {
         return json_response(StatusCode::OK, &json!({"status": "ok"}));
     }
-    if !authorize(state, headers) {
+    if !bearer_authorized(state.token.as_deref(), headers) {
         return json_response(StatusCode::UNAUTHORIZED, &json!({"error": "unauthorized"}));
+    }
+    if !origin_is_loopback(headers) {
+        return json_response(
+            StatusCode::FORBIDDEN,
+            &json!({"error": "origin_not_allowed"}),
+        );
     }
     route(state, method, path, body).await
 }
@@ -264,36 +267,6 @@ fn path_segments(path: &str) -> Vec<&str> {
     path.split('/')
         .filter(|segment| !segment.is_empty())
         .collect()
-}
-
-/// Constant-time bearer check; `None` (no configured token) always passes.
-fn authorize(state: &AppState, headers: &HeaderMap) -> bool {
-    let Some(expected) = state.token.as_deref() else {
-        return true;
-    };
-    let Some(header) = headers
-        .get(AUTHORIZATION)
-        .and_then(|value| value.to_str().ok())
-    else {
-        return false;
-    };
-    let Some(presented) = header
-        .strip_prefix("Bearer ")
-        .or_else(|| header.strip_prefix("bearer "))
-    else {
-        return false;
-    };
-    constant_time_eq(expected, presented.as_bytes())
-}
-
-fn constant_time_eq(left: &[u8], right: &[u8]) -> bool {
-    let mut difference = left.len() ^ right.len();
-    for index in 0..left.len().max(right.len()) {
-        difference |= usize::from(
-            left.get(index).copied().unwrap_or(0) ^ right.get(index).copied().unwrap_or(0),
-        );
-    }
-    difference == 0
 }
 
 // ── Run request/response bodies ─────────────────────────────────────────
@@ -933,65 +906,6 @@ fn sdk_event_envelope(event: &harwness_sdk::SdkEvent) -> Value {
     }
 }
 
-// ── Small HTTP helpers ───────────────────────────────────────────────────
-
-// The `Err` variant carries a fully-built `HttpResponse` (as `harw-web`'s
-// equivalent helper does) so callers return it unchanged; it outlives this
-// one call on the stack and is never cloned, so the size is not a real cost.
-#[allow(clippy::result_large_err)]
-async fn read_json_body(
-    request: Request<Incoming>,
-    max_bytes: usize,
-    read_timeout: Duration,
-) -> Result<Value, HttpResponse> {
-    let declared_len = request
-        .headers()
-        .get(CONTENT_LENGTH)
-        .and_then(|value| value.to_str().ok())
-        .and_then(|value| value.parse::<u64>().ok());
-    if declared_len.is_some_and(|len| len > max_bytes as u64) {
-        return Err(json_response(
-            StatusCode::PAYLOAD_TOO_LARGE,
-            &json!({"error": "payload_too_large"}),
-        ));
-    }
-    let limited = Limited::new(request.into_body(), max_bytes);
-    let bytes = match tokio::time::timeout(read_timeout, limited.collect()).await {
-        Ok(Ok(collected)) => collected.to_bytes(),
-        Ok(Err(error)) if error.downcast_ref::<LengthLimitError>().is_some() => {
-            return Err(json_response(
-                StatusCode::PAYLOAD_TOO_LARGE,
-                &json!({"error": "payload_too_large"}),
-            ));
-        }
-        Ok(Err(_)) => {
-            return Err(json_response(
-                StatusCode::BAD_REQUEST,
-                &json!({"error": "bad_request"}),
-            ));
-        }
-        Err(_elapsed) => {
-            return Err(json_response(
-                StatusCode::REQUEST_TIMEOUT,
-                &json!({"error": "request_timeout"}),
-            ));
-        }
-    };
-    if bytes.is_empty() {
-        return Ok(Value::Null);
-    }
-    serde_json::from_slice(&bytes)
-        .map_err(|_| json_response(StatusCode::BAD_REQUEST, &json!({"error": "invalid_json"})))
-}
-
-fn json_response(status: StatusCode, body: &Value) -> HttpResponse {
-    Response::builder()
-        .status(status)
-        .header(CONTENT_TYPE, "application/json")
-        .body(Full::new(Bytes::from(body.to_string())).boxed())
-        .unwrap_or_else(|_| Response::new(Full::new(Bytes::new()).boxed()))
-}
-
 #[cfg(test)]
 mod tests {
     use std::sync::atomic::{AtomicBool, Ordering};
@@ -1032,7 +946,11 @@ mod tests {
 
     impl RunSession for EchoSession {
         fn events(&mut self) -> Pin<Box<dyn Stream<Item = Value> + Send>> {
-            let receiver = self.events_rx.take().expect("events() called once");
+            // Called at most once per session (see `RunSession::events`); a
+            // second call gets an empty stream rather than a panic.
+            let Some(receiver) = self.events_rx.take() else {
+                return Box::pin(tokio_stream::empty::<Value>());
+            };
             Box::pin(tokio_stream::wrappers::UnboundedReceiverStream::new(
                 receiver,
             ))

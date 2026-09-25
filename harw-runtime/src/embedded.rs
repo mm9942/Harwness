@@ -231,12 +231,34 @@ fn decode_ir(value: &serde_json::Value, id: &str) -> RuntimeResult<AgentIr> {
 /// Rechte eines eingebetteten Laufs.
 ///
 /// # Beschreibung
-/// `EffectiveRights::from_manifest` liest ausschließlich das Manifest;
+/// `EffectiveRights::from_manifest` liest ausschließlich das Manifest und
+/// liefert die **Obergrenze** (Ceiling) eines Laufs;
 /// [`Self::narrowed_by`] wendet Laufzeit-Flags an und kann Rechte nur
 /// **wegnehmen**, nie hinzufügen — auch `--full-access`
 /// ([`RightsFlags::full_access`]) erweitert keine der Mengen unten, es
 /// ändert nur, ob ein Aufruf innerhalb dieser Mengen automatisch freigegeben
 /// wird.
+///
+/// # Monotonie-Regel
+/// Jede Kombination zweier Rechte ist streng monoton: [`Self::intersect`]
+/// schneidet jede Menge, verUNDet **jeden** Wahrheitswert (auch
+/// [`Self::full_access`]) und nimmt pro Budgetgrenze die striktere;
+/// [`Self::narrowed_by`] verUNDet `full_access` mit dem Flag und setzt alle
+/// übrigen Wahrheitswerte höchstens auf `false`. Kein Schritt kann also
+/// einen `false`-Wert wieder auf `true` setzen — auch nicht
+/// [`EmbeddedAgent::with_rights`] oder [`EmbeddedAgent::for_agent`].
+///
+/// # `full_access`: Obergrenze und Flag
+/// Das Manifest ([`Permissions`]) hat bewusst keinen Schlüssel für
+/// automatische Freigabe: sie gewährt keine Fähigkeit, sondern überspringt
+/// nur Rückfragen innerhalb dessen, was das Manifest ohnehin admittiert.
+/// Die Manifest-Obergrenze ist daher immer `full_access = true` („darf
+/// eingeschaltet werden“); effektiv wird sie erst durch
+/// `narrowed_by(&RightsFlags { full_access: true, .. })` — ohne
+/// `--full-access` ergibt `narrowed_by` `false`. Effektiv gilt also
+/// `full_access = Obergrenze ∧ Flag`, und jede spätere Verengung (z. B.
+/// eine Elternbeschränkung mit `full_access = false`) schaltet es
+/// endgültig ab.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EffectiveRights {
     /// Effektive Werkzeugnamen (`Permissions::tools`: admittiert minus
@@ -245,8 +267,13 @@ pub struct EffectiveRights {
     /// Erreichbare Hosts (`Permissions::network::hosts`); bedeutungslos ohne
     /// [`Self::network_open`].
     pub network_hosts: BTreeSet<String>,
-    /// Ob überhaupt ein Netzwerkmodus zugelassen ist
-    /// (`NetworkMode::Allowlist`).
+    /// Ob Netzzugriff überhaupt zugelassen ist (`NetworkMode::Allowlist`).
+    ///
+    /// Trotz des Namens **nicht** „uneingeschränkt“: auch mit `true` ist
+    /// nur [`Self::network_hosts`] erreichbar (die Sandbox baut ihren
+    /// `NetworkScope` ausschließlich aus dieser Liste); `false` sperrt das
+    /// Netz ganz. Der Name bleibt aus Kompatibilität mit dem Kindprotokoll
+    /// (`ChildRights::network_open`) bestehen.
     pub network_open: bool,
     /// Ob ein schreibendes Workspace-Werkzeug admittiert ist.
     pub write: bool,
@@ -255,15 +282,21 @@ pub struct EffectiveRights {
     /// Ob ein Host-Werkzeug (außerhalb der Sandbox) admittiert ist.
     pub host: bool,
     /// Ob Werkzeugaufrufe innerhalb der obigen Mengen automatisch freigegeben
-    /// werden (`--full-access`). Erweitert nie eine der Mengen selbst.
+    /// werden (`--full-access`). Erweitert nie eine der Mengen selbst. In
+    /// [`Self::from_manifest`] die Obergrenze (`true`), effektiv erst nach
+    /// [`Self::narrowed_by`] (Obergrenze ∧ Flag); siehe Typdoku.
     pub full_access: bool,
     /// Das Ressourcenbudget des Manifests, falls vorhanden.
     pub budget: Option<Budget>,
 }
 
 impl EffectiveRights {
-    /// Intersects capabilities and every resource limit. Automatic approval
-    /// follows the requested policy without granting additional capabilities.
+    /// Intersects capabilities and every resource limit.
+    ///
+    /// Strictly monotonic: every set is intersected and **every** boolean is
+    /// AND'd, `full_access` included, so no argument can switch a `false`
+    /// right (or automatic approval) back on. Budget limits take the
+    /// stricter value per field.
     #[must_use]
     pub fn intersect(mut self, ceiling: &Self) -> Self {
         self.tools.retain(|tool| ceiling.tools.contains(tool));
@@ -273,7 +306,7 @@ impl EffectiveRights {
         self.write &= ceiling.write;
         self.shell &= ceiling.shell;
         self.host &= ceiling.host;
-        self.full_access = ceiling.full_access;
+        self.full_access &= ceiling.full_access;
         self.budget = match (self.budget, ceiling.budget.as_ref()) {
             (Some(mut budget), Some(cap)) => {
                 budget.max_tokens = intersect_limit(budget.max_tokens, cap.max_tokens);
@@ -290,8 +323,14 @@ impl EffectiveRights {
         self
     }
 
-    /// Leitet die unverengten Rechte eines Manifests ab (`full_access:
-    /// false`).
+    /// Leitet die unverengten Rechte (die Obergrenze) eines Manifests ab.
+    ///
+    /// `full_access` ist hier `true`: das Manifest verbietet automatische
+    /// Freigabe nie (es kennt keinen Schlüssel dafür), effektiv wird sie
+    /// erst durch [`Self::narrowed_by`] mit gesetztem
+    /// [`RightsFlags::full_access`]. Ein Aufrufer, der effektive Rechte
+    /// braucht, wendet deshalb immer `narrowed_by` an (auch mit
+    /// `RightsFlags::default()`).
     #[must_use]
     pub fn from_manifest(permissions: &Permissions) -> Self {
         Self {
@@ -301,13 +340,15 @@ impl EffectiveRights {
             write: permissions.filesystem.write,
             shell: permissions.shell,
             host: permissions.host,
-            full_access: false,
+            full_access: true,
             budget: permissions.budget.clone(),
         }
     }
 
     /// Wendet `flags` an. Verengt ausschließlich: jede Menge wird höchstens
-    /// kleiner, nie größer, unabhängig davon, was `flags` verlangt.
+    /// kleiner, nie größer, und kein Wahrheitswert wechselt von `false` auf
+    /// `true`, unabhängig davon, was `flags` verlangt. `full_access` wird mit
+    /// [`RightsFlags::full_access`] verUNDet (siehe Typdoku).
     #[must_use]
     pub fn narrowed_by(mut self, flags: &RightsFlags) -> Self {
         for tool in &flags.deny_tools {
@@ -323,8 +364,9 @@ impl EffectiveRights {
         }
         // `full_access` erweitert keine der Mengen oben — es ändert nur das
         // Freigabeverhalten innerhalb dessen, was das Manifest ohnehin
-        // zulässt. Deshalb ist ein direktes Setzen hier keine Erweiterung.
-        self.full_access = flags.full_access;
+        // zulässt. Auch hier nur verUNDet: effektiv ist es genau dann, wenn
+        // Obergrenze und Flag es erlauben; ohne Flag bleibt es aus.
+        self.full_access &= flags.full_access;
         self.budget = narrow_budget(self.budget, flags.max_tokens);
         self
     }
@@ -364,7 +406,9 @@ pub struct RightsFlags {
     pub no_network: bool,
     /// Schreiben und Shell abschalten, unabhängig vom Manifest.
     pub read_only: bool,
-    /// Werkzeugaufrufe innerhalb des Manifests automatisch freigeben.
+    /// Werkzeugaufrufe innerhalb des Manifests automatisch freigeben; wirkt
+    /// nur, solange die Obergrenze ([`EffectiveRights::full_access`]) es
+    /// erlaubt.
     pub full_access: bool,
     /// Zusätzliche Obergrenze der Modell-Tokens.
     pub max_tokens: Option<u64>,
@@ -584,7 +628,9 @@ admitted = ["fs.read"]
         assert!(rights.shell);
         assert!(rights.network_open);
         assert!(rights.network_hosts.contains("example.com"));
-        assert!(!rights.full_access);
+        // Die Manifest-Obergrenze erlaubt automatische Freigabe; effektiv
+        // wird sie erst über `narrowed_by` mit dem Flag.
+        assert!(rights.full_access);
         assert_eq!(
             rights.budget.as_ref().and_then(|budget| budget.max_tokens),
             Some(10000)
