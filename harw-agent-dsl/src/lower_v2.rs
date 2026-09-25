@@ -1245,9 +1245,14 @@ fn lower_binary(cx: &mut Cx<'_>, config: &toml::Table, specialization: &str) -> 
             name: default_name,
             interfaces: vec![Interface::Cli],
             default_interface: Interface::Cli,
+            child_execution: ChildExecution::default(),
         };
     };
-    cx.check_keys(table, name, &["name", "interfaces", "default_interface"]);
+    cx.check_keys(
+        table,
+        name,
+        &["name", "interfaces", "default_interface", "child_execution"],
+    );
     let binary_name = match cx.opt_str(table, name, "name") {
         Some(binary_name) => {
             if !valid_binary_name(&binary_name) {
@@ -1313,10 +1318,25 @@ fn lower_binary(cx: &mut Cx<'_>, config: &toml::Table, specialization: &str) -> 
             }
         },
     };
+    let child_execution = match cx.opt_str(table, name, "child_execution") {
+        None => ChildExecution::default(),
+        Some(label) => match ChildExecution::parse(&label) {
+            Some(child_execution) => child_execution,
+            None => {
+                cx.report(
+                    &codes::BINARY_UNKNOWN_CHILD_EXECUTION,
+                    "binary.child_execution",
+                    format!("unknown child execution mode `{label}`"),
+                );
+                ChildExecution::default()
+            }
+        },
+    };
     Binary {
         name: binary_name,
         interfaces,
         default_interface,
+        child_execution,
     }
 }
 

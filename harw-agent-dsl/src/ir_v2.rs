@@ -309,6 +309,51 @@ impl Interface {
     }
 }
 
+/// How a compiled binary runs its child agents (`[binary] child_execution`).
+///
+/// # Description
+/// `Job` starts each child as a separate process through the job system
+/// (`harw-tool-job`); this is the default for compiled binaries. `InProcess`
+/// keeps the legacy in-process spawner, which is how harw itself always
+/// runs its children regardless of this setting.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ChildExecution {
+    /// Each child runs as a separate job-managed process (the default).
+    #[default]
+    Job,
+    /// Children run in-process, like inside harw itself.
+    InProcess,
+}
+
+impl ChildExecution {
+    /// The label (`"job"`, `"in-process"`).
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            ChildExecution::Job => "job",
+            ChildExecution::InProcess => "in-process",
+        }
+    }
+
+    /// Parses an exact label.
+    #[must_use]
+    pub fn parse(label: &str) -> Option<Self> {
+        match label {
+            "job" => Some(ChildExecution::Job),
+            "in-process" => Some(ChildExecution::InProcess),
+            _ => None,
+        }
+    }
+
+    /// `true` for [`ChildExecution::Job`], the default that the snapshot
+    /// hash and the golden IR JSON must not see (`#[serde(skip_serializing_if)]`).
+    #[must_use]
+    pub const fn is_default(&self) -> bool {
+        matches!(self, ChildExecution::Job)
+    }
+}
+
 /// Network mode of the permission manifest.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
@@ -615,6 +660,9 @@ pub struct Binary {
     pub interfaces: Vec<Interface>,
     /// Interface used when none is chosen; one of `interfaces`.
     pub default_interface: Interface,
+    /// How the binary runs its child agents; `Job` by default.
+    #[serde(default, skip_serializing_if = "ChildExecution::is_default")]
+    pub child_execution: ChildExecution,
 }
 
 /// Filesystem part of the permission manifest.
