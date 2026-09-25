@@ -48,6 +48,9 @@ esac
             self.executable(mocks / "pkg-config", "#!/bin/sh\nexit 0\n")
             self.executable(mocks / "cmake", "#!/bin/sh\nexit 0\n")
             self.executable(mocks / "git", "#!/bin/sh\nexit 0\n")
+            self.executable(mocks / "cc", "#!/bin/sh\nexit 0\n")
+            self.executable(mocks / "bwrap", "#!/bin/sh\nexit 0\n")
+            self.executable(mocks / "prlimit", "#!/bin/sh\nexit 0\n")
             self.executable(mocks / "make", """#!/bin/sh
 printf '%s|%s\\n' "$PWD" "$*" >> "$HARW_TEST_MAKE"
 mkdir -p "$HARW_INSTALL_DIR"
