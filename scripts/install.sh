@@ -17,9 +17,9 @@ case "${1:-}" in
 Usage: curl -fsSL https://get.harw.dev/harw/install.sh | bash
        bash scripts/install.sh [--source]
 
-The piped installer downloads Harwness-main.zip, installs missing Linux
-build dependencies, installs Rustup with the stable default toolchain when
-needed, then runs make install in a persistent extracted source directory.
+The piped installer downloads and extracts Harwness-main.zip, installs
+Rustup with the stable default toolchain when needed, installs missing
+Linux build dependencies including Bubblewrap, then runs make install.
 
 Environment: HARW_BASE_URL, HARW_INSTALL_DIR, HARW_SOURCES_DIR, HARW_HOME.
 EOF
@@ -43,9 +43,57 @@ as_root() {
   fi
 }
 
+install_packages() {
+  local phase="$1"
+  local packages=()
+  if command -v apt-get >/dev/null 2>&1; then
+    if [ "$phase" = unzip ]; then
+      packages=(unzip)
+    else
+      packages=(bubblewrap util-linux build-essential pkg-config cmake libdbus-1-dev git)
+    fi
+    as_root apt-get update
+    as_root apt-get install -y "${packages[@]}"
+  elif command -v dnf >/dev/null 2>&1; then
+    if [ "$phase" = unzip ]; then packages=(unzip)
+    else packages=(bubblewrap util-linux gcc gcc-c++ make pkgconf-pkg-config cmake dbus-devel git); fi
+    as_root dnf install -y "${packages[@]}"
+  elif command -v yum >/dev/null 2>&1; then
+    if [ "$phase" = unzip ]; then packages=(unzip)
+    else packages=(bubblewrap util-linux gcc gcc-c++ make pkgconfig cmake dbus-devel git); fi
+    as_root yum install -y "${packages[@]}"
+  elif command -v pacman >/dev/null 2>&1; then
+    if [ "$phase" = unzip ]; then packages=(unzip)
+    else packages=(bubblewrap util-linux base-devel pkgconf cmake dbus git); fi
+    as_root pacman -S --noconfirm --needed "${packages[@]}"
+  elif command -v zypper >/dev/null 2>&1; then
+    if [ "$phase" = unzip ]; then packages=(unzip)
+    else packages=(bubblewrap util-linux gcc gcc-c++ make pkg-config cmake dbus-1-devel git); fi
+    as_root zypper --non-interactive install "${packages[@]}"
+  elif command -v apk >/dev/null 2>&1; then
+    if [ "$phase" = unzip ]; then packages=(unzip)
+    else packages=(bubblewrap util-linux build-base pkgconf cmake dbus-dev git); fi
+    as_root apk add "${packages[@]}"
+  elif command -v xbps-install >/dev/null 2>&1; then
+    if [ "$phase" = unzip ]; then packages=(unzip)
+    else packages=(bubblewrap util-linux base-devel pkg-config cmake dbus-devel git); fi
+    as_root xbps-install -Sy "${packages[@]}"
+  else
+    die "unsupported package manager; install missing packages manually ($phase)"
+  fi
+}
+
+ensure_unzip() {
+  if ! command -v unzip >/dev/null 2>&1; then
+    log "Installing unzip to extract the downloaded archive"
+    install_packages unzip
+  fi
+  command -v unzip >/dev/null 2>&1 || die "unzip is still missing after package installation"
+}
+
 install_linux_dependencies() {
   local missing=() tool
-  for tool in make cc pkg-config cmake unzip bwrap prlimit git; do
+  for tool in make cc pkg-config cmake bwrap prlimit git; do
     command -v "$tool" >/dev/null 2>&1 || missing+=("$tool")
   done
   if command -v pkg-config >/dev/null 2>&1 && ! pkg-config --exists dbus-1; then
@@ -54,25 +102,8 @@ install_linux_dependencies() {
   [ "${#missing[@]}" -eq 0 ] && return 0
 
   log "Installing missing Linux dependencies: ${missing[*]}"
-  if command -v apt-get >/dev/null 2>&1; then
-    as_root apt-get update
-    as_root apt-get install -y bubblewrap util-linux build-essential pkg-config cmake libdbus-1-dev git unzip
-  elif command -v dnf >/dev/null 2>&1; then
-    as_root dnf install -y bubblewrap util-linux gcc gcc-c++ make pkgconf-pkg-config cmake dbus-devel git unzip
-  elif command -v yum >/dev/null 2>&1; then
-    as_root yum install -y bubblewrap util-linux gcc gcc-c++ make pkgconfig cmake dbus-devel git unzip
-  elif command -v pacman >/dev/null 2>&1; then
-    as_root pacman -S --noconfirm --needed bubblewrap util-linux base-devel pkgconf cmake dbus git unzip
-  elif command -v zypper >/dev/null 2>&1; then
-    as_root zypper --non-interactive install bubblewrap util-linux gcc gcc-c++ make pkg-config cmake dbus-1-devel git unzip
-  elif command -v apk >/dev/null 2>&1; then
-    as_root apk add bubblewrap util-linux build-base pkgconf cmake dbus-dev git unzip
-  elif command -v xbps-install >/dev/null 2>&1; then
-    as_root xbps-install -Sy bubblewrap util-linux base-devel pkg-config cmake dbus-devel git unzip
-  else
-    die "unsupported package manager; install manually: ${missing[*]}"
-  fi
-  for tool in make cc pkg-config cmake unzip bwrap prlimit git; do
+  install_packages build
+  for tool in make cc pkg-config cmake bwrap prlimit git; do
     command -v "$tool" >/dev/null 2>&1 || die "$tool is still missing after package installation"
   done
   pkg-config --exists dbus-1 || die "dbus-1 development files are still missing"
@@ -114,12 +145,13 @@ archive_hash() {
   fi
 }
 
-install_linux_dependencies
 checkout=""
 if [ "${1:-}" = --source ]; then
   [ -f scripts/install.sh ] && [ -f Cargo.toml ] && [ -f Makefile ] \
     || die "--source must be run from the Harwness repository root"
   checkout="$PWD"
+  work_dir="$(mktemp -d)"
+  trap 'rm -rf "$work_dir"' EXIT
 else
   # A script piped to bash has no checkout. Keep the source after installation:
   # `make install` records this path for later agent builds.
@@ -128,6 +160,7 @@ else
   trap 'rm -rf "$work_dir"' EXIT
   log "Downloading $base_url/$archive_name"
   fetch "$base_url/$archive_name" "$work_dir/$archive_name"
+  ensure_unzip
   hash="$(archive_hash "$work_dir/$archive_name")"
   checkout="$sources_dir/$hash"
   if [ ! -f "$checkout/Makefile" ]; then
@@ -141,7 +174,8 @@ else
   fi
 fi
 
-ensure_rustup "${work_dir:-$checkout}"
+ensure_rustup "$work_dir"
+install_linux_dependencies
 mkdir -p "$install_dir"
 log "Building in $checkout with its pinned Rust toolchain"
 (cd "$checkout" && make install BINDIR="$install_dir")
