@@ -384,72 +384,93 @@ async fn drive_protocol(
         crash_if_stream_ended!();
     }
 
+    // Cancellation while this loop runs is handled by `run_one`'s own
+    // `tokio::select!` around this whole function: dropping this future ends
+    // the loop without a graceful `Cancel` frame, and `run_one` kills the
+    // process group right after. That keeps exactly one place responsible
+    // for "is this run cancelled".
     loop {
-        tokio::select! {
-            biased;
-            () = spec.cancel.cancelled() => {
-                let _ = write_frame(stdin, &ParentToChild::Cancel).await;
+        let Ok(Some(line)) = stdout_lines.next_line().await else {
+            crash_if_stream_ended!();
+        };
+        match decode_line::<ChildToParent>(&line) {
+            Ok(ChildToParent::Hello { .. }) => {
+                // A second Hello is a protocol violation, not a reason to
+                // restart the handshake.
                 return ChildRunOutcome {
-                    status: ChildRunStatus::Cancelled { reason: cancel_reason_label(spec.cancel.reason()) },
+                    status: ChildRunStatus::Failed {
+                        reason: "unexpected second Hello".to_owned(),
+                    },
                     text: None,
                     usage: ChildUsage::default(),
                     continuation: None,
                 };
             }
-            line = stdout_lines.next_line() => {
-                let Ok(Some(line)) = line else {
+            Ok(ChildToParent::Event { sdk_event }) => io.on_event(sdk_event),
+            Ok(ChildToParent::Usage { .. }) => {}
+            Ok(ChildToParent::Question { id, text }) => {
+                let answer = io.on_question(id.clone(), text).await;
+                if write_frame(
+                    stdin,
+                    &ParentToChild::Answer {
+                        question_id: id,
+                        text: answer,
+                    },
+                )
+                .await
+                .is_err()
+                {
                     crash_if_stream_ended!();
-                };
-                match decode_line::<ChildToParent>(&line) {
-                    Ok(ChildToParent::Hello { .. }) => {
-                        // A second Hello is a protocol violation, not a
-                        // reason to restart the handshake.
-                        return ChildRunOutcome {
-                            status: ChildRunStatus::Failed { reason: "unexpected second Hello".to_owned() },
-                            text: None,
-                            usage: ChildUsage::default(),
-                            continuation: None,
-                        };
-                    }
-                    Ok(ChildToParent::Event { sdk_event }) => io.on_event(sdk_event),
-                    Ok(ChildToParent::Usage { .. }) => {}
-                    Ok(ChildToParent::Question { id, text }) => {
-                        let answer = io.on_question(id.clone(), text).await;
-                        if write_frame(stdin, &ParentToChild::Answer { question_id: id, text: answer }).await.is_err() {
-                            crash_if_stream_ended!();
-                        }
-                    }
-                    Ok(ChildToParent::ApprovalRequest { id, tool, args_summary }) => {
-                        let answer = io.on_approval_request(id.clone(), tool, args_summary).await;
-                        if write_frame(stdin, &ParentToChild::Answer { question_id: id, text: answer }).await.is_err() {
-                            crash_if_stream_ended!();
-                        }
-                    }
-                    Ok(ChildToParent::Error { message }) => {
-                        return ChildRunOutcome {
-                            status: ChildRunStatus::Failed { reason: message },
-                            text: None,
-                            usage: ChildUsage::default(),
-                            continuation: None,
-                        };
-                    }
-                    Ok(ChildToParent::Result { status, text, usage }) => {
-                        return ChildRunOutcome {
-                            status: from_wire_status(status),
-                            text,
-                            usage: from_wire_usage(usage),
-                            continuation: None,
-                        };
-                    }
-                    Err(error) => {
-                        return ChildRunOutcome {
-                            status: ChildRunStatus::Failed { reason: error.to_string() },
-                            text: None,
-                            usage: ChildUsage::default(),
-                            continuation: None,
-                        };
-                    }
                 }
+            }
+            Ok(ChildToParent::ApprovalRequest {
+                id,
+                tool,
+                args_summary,
+            }) => {
+                let answer = io.on_approval_request(id.clone(), tool, args_summary).await;
+                if write_frame(
+                    stdin,
+                    &ParentToChild::Answer {
+                        question_id: id,
+                        text: answer,
+                    },
+                )
+                .await
+                .is_err()
+                {
+                    crash_if_stream_ended!();
+                }
+            }
+            Ok(ChildToParent::Error { message }) => {
+                return ChildRunOutcome {
+                    status: ChildRunStatus::Failed { reason: message },
+                    text: None,
+                    usage: ChildUsage::default(),
+                    continuation: None,
+                };
+            }
+            Ok(ChildToParent::Result {
+                status,
+                text,
+                usage,
+            }) => {
+                return ChildRunOutcome {
+                    status: from_wire_status(status),
+                    text,
+                    usage: from_wire_usage(usage),
+                    continuation: None,
+                };
+            }
+            Err(error) => {
+                return ChildRunOutcome {
+                    status: ChildRunStatus::Failed {
+                        reason: error.to_string(),
+                    },
+                    text: None,
+                    usage: ChildUsage::default(),
+                    continuation: None,
+                };
             }
         }
     }
