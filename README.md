@@ -65,13 +65,13 @@ The `harw` binary provides the interactive terminal UI, one-shot runs, durable p
 ### One line
 
 ```bash
-curl -fsSL https://get.harw.dev/harw/install.sh | bash
+curl -fsSL https://get.harw.dev/harw/install.sh | sh
 ```
 
 This downloads the latest release for your machine from `get.harw.dev`,
 checks its SHA-256 checksum and installs `harw`, `killer` and
 `harw-agent-runner` into `~/.local/bin`. Pick a version with
-`… | bash -s -- --version v0.3.0`; set `HARW_INSTALL_DIR` for another
+`… | sh -s -- --version v0.3.0`; set `HARW_INSTALL_DIR` for another
 target directory. Linux (x86_64, aarch64) only for now.
 
 ### Download a release

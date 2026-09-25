@@ -116,7 +116,7 @@ jobs:
 
   mirror:
     # Mirrors the release to the R2 bucket behind https://get.harw.dev/harw,
-    # the default source of `curl -fsSL https://get.harw.dev/harw/install.sh | bash`.
+    # the default source of `curl -fsSL https://get.harw.dev/harw/install.sh | sh`.
     # Skipped (not failed) until the R2 secrets are configured.
     name: Mirror to get.harw.dev
     needs: release

@@ -1,9 +1,9 @@
-#!/usr/bin/env bash
+#!/bin/sh
 # Harwness installer — installs `harw`, `killer` and `harw-agent-runner` by building from
 # source or by downloading a prebuilt release tarball.
 #
 # Usage:
-#   curl -fsSL https://get.harw.dev/harw/install.sh | bash
+#   curl -fsSL https://get.harw.dev/harw/install.sh | sh
 #   scripts/install.sh [--help]
 #   scripts/install.sh [--source]              # build from source (default when cargo is present)
 #   scripts/install.sh --binary [--version TAG] # download a prebuilt release tarball
@@ -37,22 +37,28 @@
 # The installer is idempotent: it never duplicates PATH entries, never
 # overwrites an existing ~/.harw configuration (that is `harw`'s own job on
 # first run), and re-running it simply re-installs the same binaries.
-set -euo pipefail
+# POSIX sh (dash, busybox, bash, zsh): no bashisms, so `curl … | sh` works.
+set -eu
+# pipefail where the shell has it (bash, zsh, newer dash); every pipeline
+# below also checks its result, so shells without it stay safe.
+(set -o pipefail) 2>/dev/null && set -o pipefail
 
 # Piped from curl, `$0` is the shell, not this file: there is no checkout.
 in_checkout=false
 repo_root=""
 if [ -f "$0" ]; then
   repo_root="$(cd "$(dirname "$0")/.." && pwd)"
-  [ -f "$repo_root/Cargo.toml" ] && in_checkout=true
+  if [ -f "$repo_root/Cargo.toml" ] && [ -f "$repo_root/scripts/install.sh" ]; then
+    in_checkout=true
+  fi
 fi
 
 usage() {
-  if [ -f "$0" ]; then
-    sed -n '2,36p' "$0"
+  if [ "$in_checkout" = true ]; then
+    sed -n '2,39p' "$0"
   else
-    printf '%s\n' "Usage: curl -fsSL https://get.harw.dev/harw/install.sh | bash" \
-      "       ... | bash -s -- [--binary|--source] [--version TAG]"
+    printf '%s\n' "Usage: curl -fsSL https://get.harw.dev/harw/install.sh | sh" \
+      "       ... | sh -s -- [--binary] [--version TAG]"
   fi
   exit 0
 }

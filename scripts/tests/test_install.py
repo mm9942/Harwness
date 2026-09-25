@@ -14,7 +14,7 @@ INSTALLER = Path(__file__).resolve().parents[1] / "install.sh"
 
 
 class BinaryInstallTests(unittest.TestCase):
-    def install_fixture(self, *, runner=True, piped=False):
+    def install_fixture(self, *, runner=True, piped=False, shell="sh"):
         temporary = tempfile.TemporaryDirectory()
         self.addCleanup(temporary.cleanup)
         root = Path(temporary.name)
@@ -62,13 +62,13 @@ class BinaryInstallTests(unittest.TestCase):
             # `curl … | bash`: the script arrives on stdin, `$0` is the shell.
             env["HARW_BASE_URL"] = "https://mirror.test/harw"
             result = subprocess.run(
-                ["bash"], input=INSTALLER.read_text(),
+                [shell], input=INSTALLER.read_text(),
                 env=env, capture_output=True, text=True, timeout=20,
             )
         else:
             env["HARW_REPO"] = "fixture/harw"
             result = subprocess.run(
-                ["bash", str(INSTALLER), "--binary", "--version", "v0.3.0"],
+                [shell, str(INSTALLER), "--binary", "--version", "v0.3.0"],
                 env=env, capture_output=True, text=True, timeout=20,
             )
         return result, bindir, calls
@@ -91,7 +91,13 @@ class BinaryInstallTests(unittest.TestCase):
         self.assertFalse(calls.exists())
 
     def test_piped_install_uses_the_mirror_and_its_latest_tag(self):
-        result, bindir, calls = self.install_fixture(piped=True)
+        # `curl … | sh` must work with a plain POSIX shell as well as bash.
+        for shell in ("dash", "bash"):
+            with self.subTest(shell=shell):
+                self.check_piped_install(shell)
+
+    def check_piped_install(self, shell):
+        result, bindir, calls = self.install_fixture(piped=True, shell=shell)
         self.assertEqual(result.returncode, 0, result.stderr)
         for name in ("harw", "killer", "harw-agent-runner"):
             self.assertTrue(os.access(bindir / name, os.X_OK), name)
