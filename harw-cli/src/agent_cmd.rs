@@ -72,10 +72,13 @@ fn compiler_env(g: &GlobalArgs) -> Result<CompilerEnv, String> {
 /// Prozess bei einem Exit-Code ungleich 0.
 fn run_compiler(g: &GlobalArgs, env: CompilerEnv, command: AgentCommand) -> Result<(), String> {
     let mut progress = |line: &str| eprintln!("harw: {line}");
+    // `harw agent test` prüft Antworten über den installierten Runner.
+    let runner_env = env.clone();
+    let case_runner = harw_agent_compiler::testing::SubprocessCaseRunner::new(&runner_env);
     let mut ctx = CommandContext {
         env,
         probe: &ProcessProbe,
-        case_runner: &harw_agent_compiler::testing::EchoStub,
+        case_runner: &case_runner,
         progress: &mut progress,
     };
     let output = run_command(&mut ctx, command);

@@ -304,10 +304,13 @@ fn run_compiler(
     let env = compiler_env(ctx)?;
     let mut progress_lines: Vec<String> = Vec::new();
     let mut progress = |line: &str| progress_lines.push(line.to_owned());
+    // `/agent test` prüft Antworten über den installierten Runner.
+    let runner_env = env.clone();
+    let case_runner = harw_agent_compiler::testing::SubprocessCaseRunner::new(&runner_env);
     let mut command_ctx = harw_agent_compiler::CommandContext {
         env,
         probe: &harw_agent_compiler::ProcessProbe,
-        case_runner: &harw_agent_compiler::testing::EchoStub,
+        case_runner: &case_runner,
         progress: &mut progress,
     };
     let output = harw_agent_compiler::run_command(&mut command_ctx, command);

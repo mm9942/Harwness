@@ -181,7 +181,6 @@ async fn run_one<S: ChildProcessSpawner>(
     spec: ChildRunSpec,
     io: &dyn ChildIo,
 ) -> ChildRunOutcome {
-    let start = std::time::Instant::now();
     let mut command = spawner.command_for(&spec.agent_id);
     let mut child = match command.spawn() {
         Ok(child) => child,
@@ -238,16 +237,18 @@ async fn run_one<S: ChildProcessSpawner>(
         outcome = drive_protocol(&mut stdin, &mut stdout_lines, &spec, io) => outcome,
     };
 
-    if let Some(stderr_task) = stderr_task {
-        stderr_task.abort();
-    }
-
     // `Completed`/`BudgetExhausted`/`Cancelled` leave the child running its
-    // own shutdown, which we do not block on; only a crash (the stream ended
-    // without a `Result`) is worth an exit code and a stderr tail.
-    let _ = start.elapsed();
+    // own shutdown, so the stderr tail is not worth waiting for — abort the
+    // collector right away. A crash (the stream ended without a `Result`) is
+    // worth an exit code and a tail: the process has already exited by then
+    // (its stdout pipe only closes at exit), so its stderr pipe closes too
+    // and the collector task finishes on its own almost immediately.
     if matches!(outcome.status, ChildRunStatus::Crashed { .. }) {
         let exit_code = child.wait().await.ok().and_then(|status| status.code());
+        if let Some(stderr_task) = stderr_task {
+            let _ =
+                tokio::time::timeout(std::time::Duration::from_secs(2), stderr_task).await;
+        }
         let outcome = ChildRunOutcome {
             status: ChildRunStatus::Crashed {
                 exit_code,
@@ -256,6 +257,9 @@ async fn run_one<S: ChildProcessSpawner>(
             ..outcome
         };
         return fill_stderr_tail(outcome, &stderr_tail);
+    }
+    if let Some(stderr_task) = stderr_task {
+        stderr_task.abort();
     }
     outcome
 }
