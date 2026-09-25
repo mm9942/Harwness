@@ -24,6 +24,8 @@ toml = { workspace = true }
 
 [dev-dependencies]
 harw-config = { path = "../harw-config" }
+# #22: temporäre Verzeichnisse in den Import-Tests (`src/import.rs`).
+tempfile = { workspace = true }
 # Plan R9, Teil D: `tests/analysis_family.rs` parst die mitgelieferten
 # `definition.toml` als `RawAgentDefinition`. Nur Test-Kante, kein Zyklus:
 # harw-agent-dsl hängt nicht von harw-home ab.

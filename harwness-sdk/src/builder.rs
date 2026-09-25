@@ -127,6 +127,8 @@ pub struct HarwnessBuilder {
     approvals: Arc<dyn ApprovalHandler>,
     tools: Vec<Arc<dyn Tool>>,
     contexts: Vec<Arc<dyn ContextSource>>,
+    embedded: Option<Arc<harw_runtime::EmbeddedAgent>>,
+    child_backend: Option<Arc<dyn harw_core::child_backend::ChildBackend>>,
     #[cfg(feature = "unstable-internals")]
     raw: RawExtensions,
 }
@@ -149,6 +151,8 @@ impl Default for HarwnessBuilder {
             approvals: approval::default_handler(),
             tools: Vec::new(),
             contexts: Vec::new(),
+            embedded: None,
+            child_backend: None,
             #[cfg(feature = "unstable-internals")]
             raw: RawExtensions::default(),
         }
@@ -171,6 +175,8 @@ impl std::fmt::Debug for HarwnessBuilder {
             .field("approval_policy", &self.approval_policy)
             .field("tools", &self.tools.len())
             .field("contexts", &self.contexts.len())
+            .field("embedded", &self.embedded.is_some())
+            .field("child_backend", &self.child_backend.is_some())
             .finish_non_exhaustive()
     }
 }
@@ -314,6 +320,36 @@ impl HarwnessBuilder {
         self
     }
 
+    /// Bettet ein kompiliertes Agenten-Artefakt ein (#22 Welle 3A):
+    /// Konfiguration, Agent, Skills und Wissen kommen dann ausschließlich aus
+    /// `agent` (`harw_runtime::config::load_config_embedded`) statt aus
+    /// `~/.harw`. [`Self::build`] überspringt dafür die Pflicht einer
+    /// konfigurierten UIA ([`harw_config::HarnessConfig::active_uia_definition`])
+    /// und eines konfigurierten Standard-Providers — beides ersetzt das
+    /// Manifest des Artefakts (`[models]` seiner Wurzel-IR). [`Self::home`]
+    /// bleibt dabei ausdrücklich nutzbar: nur für Sitzungen und Protokolle,
+    /// nie für Agenten, Skills oder Profil.
+    #[must_use]
+    pub fn embedded(mut self, agent: Arc<harw_runtime::EmbeddedAgent>) -> Self {
+        self.embedded = Some(agent);
+        self
+    }
+
+    /// Verdrahtet ein [`harw_core::child_backend::ChildBackend`] (#22 Welle
+    /// 3C): jedes Kind, das die Wurzelmontage über ihren
+    /// `ManagedAgentSpawner` admittiert, läuft dann über dieses Backend
+    /// (typischerweise `harw-agent-runner`s `JobChildBackend`) statt
+    /// in-process. Ohne diesen Aufruf bleibt jeder Kind-Lauf in-process — der
+    /// bestehende Pfad.
+    #[must_use]
+    pub fn child_backend(
+        mut self,
+        backend: Arc<dyn harw_core::child_backend::ChildBackend>,
+    ) -> Self {
+        self.child_backend = Some(backend);
+        self
+    }
+
     /// **Instabil.** Hängt einen rohen internen Tool-Provider an.
     #[cfg(feature = "unstable-internals")]
     #[must_use]
@@ -446,26 +482,53 @@ impl HarwnessBuilder {
         #[cfg(not(feature = "unstable-internals"))]
         let model = self.model;
 
+        // #22 Welle 3A: ein eingebettetes Artefakt bestimmt seinen
+        // Wurzel-Agenten selbst (dieselbe Rolle wie `--agent`); ein
+        // ausdrücklich gesetzter `agent()` behält Vorrang.
+        let agent = self.agent.or_else(|| {
+            self.embedded
+                .as_ref()
+                .map(|agent| agent.root_id().to_owned())
+        });
         let spec_inputs = SpecInputs {
             home,
             cwd: validated.cwd,
             principal_id: self.principal_id,
             mode: self.mode,
             reasoning_effort: self.reasoning_effort,
-            agent: self.agent,
+            agent,
+            embedded: self.embedded.clone(),
+            child_backend: self
+                .child_backend
+                .clone()
+                .map(harw_runtime::ChildBackendHandle),
         };
-        let (config, _trust) =
-            harw_runtime::load_config(&spec_inputs.spec()).map_err(SdkError::from_runtime)?;
+        let config = if self.embedded.is_some() {
+            harw_runtime::load_config_embedded(&spec_inputs.spec())
+                .map_err(SdkError::from_runtime)?
+        } else {
+            let (config, _trust) =
+                harw_runtime::load_config(&spec_inputs.spec()).map_err(SdkError::from_runtime)?;
+            config
+        };
         // Ein explizit gewählter Agent ersetzt die UIA als Wurzel; nur ohne ihn
-        // ist eine aktive UIA Pflicht.
-        if spec_inputs.agent.is_none() && config.harness.active_uia_definition.is_none() {
+        // ist eine aktive UIA Pflicht. Ein eingebettetes Artefakt bringt seine
+        // eigene Wurzel mit (oben gesetzt) und braucht daher nie eine UIA.
+        if self.embedded.is_none()
+            && spec_inputs.agent.is_none()
+            && config.harness.active_uia_definition.is_none()
+        {
             return Err(SdkError::Config {
                 detail: "no active UIA is configured (harness.active_uia_definition); \
                          run `harw` once interactively or set it in the profile config"
                     .to_owned(),
             });
         }
-        if matches!(model, ModelChoice::Configured)
+        // Ebenso ersetzt das Manifest des eingebetteten Artefakts
+        // (`[models]` seiner Wurzel-IR, bereits von `load_config_embedded`
+        // geprüft) die Pflicht eines konfigurierten Standard-Providers.
+        if self.embedded.is_none()
+            && matches!(model, ModelChoice::Configured)
             && self.provider_id.is_none()
             && config.harness.default_provider.is_none()
         {
@@ -646,6 +709,40 @@ mod tests {
         assert_eq!(
             ReasoningEffort::High.to_core(),
             harw_types::ReasoningEffort::High
+        );
+    }
+
+    /// #22 Welle 3C: [`HarwnessBuilder::child_backend`] legt genau die
+    /// übergebene `Arc`-Instanz im Feld ab, das [`HarwnessBuilder::build`]
+    /// in [`SpecInputs::child_backend`] weiterreicht.
+    #[test]
+    fn child_backend_sets_the_field() {
+        struct FakeBackend;
+        impl harw_core::child_backend::ChildBackend for FakeBackend {
+            fn run<'a>(
+                &'a self,
+                _spec: harw_core::child_backend::ChildRunSpec,
+                _io: &'a dyn harw_core::child_backend::ChildIo,
+            ) -> harw_core::child_backend::ChildBackendFuture<'a> {
+                Box::pin(async {
+                    harw_core::child_backend::ChildRunOutcome {
+                        status: harw_core::child_backend::ChildRunStatus::Completed,
+                        text: None,
+                        usage: harw_core::ChildUsage::default(),
+                        continuation: None,
+                    }
+                })
+            }
+        }
+
+        let backend: Arc<dyn harw_core::child_backend::ChildBackend> = Arc::new(FakeBackend);
+        let builder = HarwnessBuilder::default().child_backend(Arc::clone(&backend));
+        assert!(
+            builder
+                .child_backend
+                .as_ref()
+                .is_some_and(|installed| Arc::ptr_eq(installed, &backend)),
+            "child_backend() muss die übergebene Arc-Instanz im Feld ablegen"
         );
     }
 }

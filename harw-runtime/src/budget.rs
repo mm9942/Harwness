@@ -31,6 +31,7 @@ use std::time::Duration;
 use harw_config::ResolvedConfig;
 use harw_core::ChildLimits;
 
+use crate::embedded::EffectiveRights;
 use crate::spec::{EntryKind, RootBudget};
 
 /// Maximale Modellrunden einer lokal-vertrauten Wurzelsitzung.
@@ -147,6 +148,17 @@ impl RootBudget {
             | EntryKind::Analyze
             | EntryKind::Doctor
             | EntryKind::Web => Self::unbounded_local(),
+            // #22 Welle 3A: ein kompilierter Agent läuft wie ein lokales
+            // CLI-Werkzeug (derselbe Mensch, dieselbe Maschine); diese
+            // Tabellenzeile ist nur die Obergrenze der Konfiguration
+            // ("config limit" — hier `unbounded_local`, da `ResolvedConfig`
+            // heute kein eigenes Budgetfeld trägt, siehe Moduldoku). Die
+            // engere Grenze aus seinem Manifest (`EmbeddedAgent::rights()
+            // .budget`) sowie `--max-tokens` (`RightsFlags::max_tokens`,
+            // bereits verengt in [`EffectiveRights::narrowed_by`]) verdrahtet
+            // [`RootBudget::for_embedded`], das diese Zeile als Obergrenze
+            // nimmt und nie erweitert.
+            EntryKind::CompiledAgent => Self::unbounded_local(),
             EntryKind::McpServe | EntryKind::JobPrompt | EntryKind::JobPlanNode => Self {
                 max_model_rounds: JOB_MAX_ROUNDS,
                 max_total_tokens: JOB_MAX_TOKENS,
@@ -167,6 +179,55 @@ impl RootBudget {
             "runtime.root_budget.derived"
         );
         budget
+    }
+
+    /// Das Wurzelbudget eines kompilierten Agenten (`EntryKind::CompiledAgent`).
+    ///
+    /// # Beschreibung
+    /// Verdrahtet die im Modulkopf beschriebene, bisher fehlende Verbindung:
+    /// `min(Manifest-Budget, --max-tokens, Konfigurationsgrenze)`, niemals
+    /// mehr als das Manifest erlaubt. Die Konfigurationsgrenze ist
+    /// [`Self::from_config`] mit [`EntryKind::CompiledAgent`] (heute
+    /// [`Self::unbounded_local`], siehe Moduldoku); `rights.budget`
+    /// ([`EffectiveRights::budget`]) trägt bereits `min(Manifest,
+    /// --max-tokens)`, da [`EffectiveRights::narrowed_by`] `max_tokens` nur
+    /// verengt, nie erweitert. Diese Funktion nimmt deshalb pro Feld das
+    /// striktere von beidem — nie eine Erweiterung der Konfigurationsgrenze
+    /// über das Manifest hinaus, nie eine Erweiterung des Manifests über die
+    /// Konfigurationsgrenze hinaus.
+    ///
+    /// Fehlt `[spawn.budget]` im Manifest ganz und wurde auch kein
+    /// `--max-tokens` gesetzt (`rights.budget == None`), bleibt es beim
+    /// bisherigen Verhalten: der Konfigurationsgrenze unverändert.
+    ///
+    /// # Argumente
+    /// - `rights` (`&`[`EffectiveRights`]): die bereits verengten Rechte des
+    ///   eingebetteten Laufs (Manifest ∩ Laufzeit-Flags).
+    /// - `config` (`&ResolvedConfig`): die aufgelöste Konfiguration, siehe
+    ///   [`Self::from_config`].
+    ///
+    /// # Rückgabe
+    /// Das engste [`RootBudget`] aus Konfigurationsgrenze und
+    /// Manifest-/Flag-Budget.
+    #[must_use]
+    pub fn for_embedded(rights: &EffectiveRights, config: &ResolvedConfig) -> Self {
+        let base = Self::from_config(config, EntryKind::CompiledAgent);
+        let Some(budget) = rights.budget.as_ref() else {
+            return base;
+        };
+        Self {
+            max_model_rounds: budget
+                .max_tool_calls
+                .map_or(base.max_model_rounds, |calls| {
+                    base.max_model_rounds.min(calls)
+                }),
+            max_total_tokens: budget.max_tokens.map_or(base.max_total_tokens, |tokens| {
+                base.max_total_tokens.min(tokens)
+            }),
+            max_wall: budget.max_wall_secs.map_or(base.max_wall, |secs| {
+                base.max_wall.min(Duration::from_secs(secs))
+            }),
+        }
     }
 }
 
@@ -229,7 +290,25 @@ pub fn child_limits(config: &ResolvedConfig, model_id: &str) -> ChildLimits {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::embedded::RightsFlags;
+    use harw_agent_dsl::ir_v2::Budget;
     use harw_model_catalog::runtime::DelegationPolicy;
+
+    /// Rechte ohne Werkzeuge/Netz/Schreiben, nur mit dem gegebenen Budget —
+    /// alles, was [`RootBudget::for_embedded`] aus [`EffectiveRights`]
+    /// braucht.
+    fn rights_with_budget(budget: Option<Budget>) -> EffectiveRights {
+        EffectiveRights {
+            tools: Default::default(),
+            network_hosts: Default::default(),
+            network_open: false,
+            write: false,
+            shell: false,
+            host: false,
+            full_access: false,
+            budget,
+        }
+    }
 
     const ALL_ENTRIES: [EntryKind; 11] = [
         EntryKind::Tui,
@@ -381,6 +460,60 @@ mod tests {
         assert_eq!(
             limits.max_active_children_per_parent,
             usize::from(fallback.max_child_fanout)
+        );
+    }
+
+    #[test]
+    fn for_embedded_manifest_cap_wins_over_a_larger_config_limit() {
+        let config = ResolvedConfig::default();
+        let base = RootBudget::from_config(&config, EntryKind::CompiledAgent);
+        let rights = rights_with_budget(Some(Budget {
+            max_tokens: Some(100),
+            ..Budget::default()
+        }));
+        let budget = RootBudget::for_embedded(&rights, &config);
+        assert_eq!(budget.max_total_tokens, 100);
+        assert!(budget.max_total_tokens < base.max_total_tokens);
+    }
+
+    #[test]
+    fn for_embedded_max_tokens_flag_narrows_further() {
+        let config = ResolvedConfig::default();
+        let rights = rights_with_budget(Some(Budget {
+            max_tokens: Some(100_000),
+            ..Budget::default()
+        }))
+        .narrowed_by(&RightsFlags {
+            max_tokens: Some(500),
+            ..RightsFlags::default()
+        });
+        let budget = RootBudget::for_embedded(&rights, &config);
+        assert_eq!(budget.max_total_tokens, 500);
+    }
+
+    #[test]
+    fn for_embedded_flag_never_widens_past_the_manifest() {
+        let config = ResolvedConfig::default();
+        let rights = rights_with_budget(Some(Budget {
+            max_tokens: Some(100),
+            ..Budget::default()
+        }))
+        .narrowed_by(&RightsFlags {
+            max_tokens: Some(100_000),
+            ..RightsFlags::default()
+        });
+        let budget = RootBudget::for_embedded(&rights, &config);
+        assert_eq!(budget.max_total_tokens, 100);
+    }
+
+    #[test]
+    fn for_embedded_without_a_manifest_budget_falls_back_to_the_old_behavior() {
+        let config = ResolvedConfig::default();
+        let rights = rights_with_budget(None);
+        let budget = RootBudget::for_embedded(&rights, &config);
+        assert_eq!(
+            budget,
+            RootBudget::from_config(&config, EntryKind::CompiledAgent)
         );
     }
 }

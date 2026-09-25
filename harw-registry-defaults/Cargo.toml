@@ -10,6 +10,7 @@ rust-version.workspace = true
 [dependencies]
 tracing = "0.1"
 harw-authority = { path = "../harw-authority" }
+harw-home = { path = "../harw-home" }
 harw-agent-dsl = { path = "../harw-agent-dsl" }
 harw-catalog = { path = "../harw-catalog" }
 # `[network]`-Sektion (`NetworkSection::researcher_web_hosts`) als einzige
@@ -71,6 +72,9 @@ harw-tools = { version = "0.3.0", path = "../harw-tools" }
 harw-knowledge = { path = "../harw-knowledge" }
 # Zeitstempel der Workbench-Einträge (`harw_knowledge::workbench` datiert in `jiff`).
 jiff = { workspace = true }
+# `agents.build` startet `harw agent build` als Job; `harw_tool_job::PreparedJob`
+# nimmt ein `tokio::process::Command`.
+tokio = { version = "1", features = ["process"] }
 
 [features]
 # Opt-in surface for the Harwness browser tool set (`browser.open`,

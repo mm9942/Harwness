@@ -51,6 +51,7 @@
 pub mod bundle;
 pub mod bundle_manifest;
 pub mod error;
+pub mod import;
 pub mod paths;
 pub mod project;
 pub mod scaffold;
@@ -64,7 +65,7 @@ pub use error::{HomeError, HomeResult};
 pub use paths::{
     LayerReport, active_profile_name, active_profile_path, auth_path, config_layers,
     config_layers_report, config_layers_report_at, home_dir, knowledge_dir, logs_dir, matrix_dir,
-    profile_dir,
+    profile_dir, project_dir_name, set_home_override, set_named_home,
 };
 pub use project::{
     ProjectHome, ProjectKind, ProjectRoot, discover_project, project_key, project_settings_dir,

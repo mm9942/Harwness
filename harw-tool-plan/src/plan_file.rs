@@ -1,4 +1,6 @@
-//! Plan-Dateien unter `.harw/plans/<slug>.md` (Runde 5, Teil F, Punkt 1).
+//! Plan-Dateien unter `.harw/plans/<slug>.md` (Runde 5, Teil F, Punkt 1) —
+//! `.<name>/plans/<slug>.md` in einer personalisierten harw (#22, siehe
+//! [`plan_display_prefix`]).
 //!
 //! # Verantwortung
 //! Einzige Stelle, an der Plan-Markdown gelesen, geschrieben und aufgelistet
@@ -35,8 +37,19 @@ pub const SLUG_MAX_CHARS: usize = 64;
 /// Dateiendung einer Plan-Datei.
 pub const PLAN_FILE_EXTENSION: &str = "md";
 
-/// Anzeigepräfix relativ zur Projektwurzel.
-pub const PLAN_DISPLAY_PREFIX: &str = ".harw/plans";
+/// Anzeigepräfix relativ zur Projektwurzel (`.harw/plans`, in einer
+/// personalisierten harw (#22) `.<name>/plans`).
+///
+/// # Description
+/// Nutzt [`harw_home::project_dir_name`] statt eines fest verdrahteten
+/// `.harw` — der Anzeigepfad muss demselben Namen folgen wie das tatsächlich
+/// gemountete Plan-Verzeichnis (`harw_home::project::ProjectHome::plans_dir`),
+/// sonst weist [`PlanDir::resolve`] einen vom Modell zurückgegebenen, gültigen
+/// Anzeigepfad fälschlich zurück.
+#[must_use]
+pub fn plan_display_prefix() -> String {
+    format!("{}/plans", harw_home::project_dir_name())
+}
 
 /// Fehler rund um Plan-Dateien. Trägt nie Planinhalt.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -73,13 +86,16 @@ impl fmt::Display for PlanFileError {
             ),
             Self::OutsidePlansDir(reference) => write!(
                 f,
-                "„{reference}“ liegt nicht direkt in {PLAN_DISPLAY_PREFIX}/ — Pläne gibt es nur dort"
+                "„{reference}“ liegt nicht direkt in {}/ — Pläne gibt es nur dort",
+                plan_display_prefix()
             ),
             Self::TooLarge { bytes } => write!(
                 f,
                 "Plan ist zu groß ({bytes} Bytes, höchstens {PLAN_MAX_BYTES})"
             ),
-            Self::NotFound(slug) => write!(f, "kein Plan „{slug}“ unter {PLAN_DISPLAY_PREFIX}/"),
+            Self::NotFound(slug) => {
+                write!(f, "kein Plan „{slug}“ unter {}/", plan_display_prefix())
+            }
             Self::Symlink(path) => write!(
                 f,
                 "{} ist ein symbolischer Link — Plan-Dateien werden dort nicht geschrieben",
@@ -172,7 +188,7 @@ pub fn fallback_slug() -> String {
 /// Anzeigepfad eines Plans relativ zur Projektwurzel.
 #[must_use]
 pub fn display_path(slug: &str) -> String {
-    format!("{PLAN_DISPLAY_PREFIX}/{slug}.{PLAN_FILE_EXTENSION}")
+    format!("{}/{slug}.{PLAN_FILE_EXTENSION}", plan_display_prefix())
 }
 
 /// Ergebnis eines Schreibvorgangs.
@@ -270,7 +286,7 @@ impl PlanDir {
                     return Err(outside());
                 }
             }
-            Some(parent) if parent != Path::new(PLAN_DISPLAY_PREFIX) => {
+            Some(parent) if parent != Path::new(&plan_display_prefix()) => {
                 return Err(outside());
             }
             Some(_) => {}

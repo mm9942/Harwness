@@ -1,0 +1,222 @@
+{
+  "schema": "harwness.agent-ir/v2",
+  "id": "harwness.agent.dependency-analyst@1",
+  "version": "1.0.0",
+  "name": "Dependency Analyst",
+  "description": "Analyzes version compatibility, transitive impact, licenses, and upgrade paths.",
+  "role": "worker",
+  "specialization": "dependency-analyst",
+  "reasoning_effort": null,
+  "authority": {
+    "capabilities": []
+  },
+  "instructions": {
+    "text": "# dependency-analyst\n\nAnalyzes version compatibility, transitive impact, licenses, and upgrade paths.\n\nAccept only the declared task scope. State assumptions, preserve relevant evidence, and return concise findings, changed paths (if any), verification performed, residual risks, and blockers. Never expand privileges, alter unrelated files, or represent a hypothesis as a fact. Stop and escalate when approval, a broader scope, or a security decision is required.\n\n## Was ich NICHT tue\n\nKeine Agenten spawnen, keine Rechte ausweiten, keine fremden Dateien ändern. Keine Abhängigkeiten hinzufügen oder aktualisieren; keine Versionen aus dem Gedächtnis; keine Lizenzbewertung ohne Quelle.\n\n## Umfang pro Lauf\n\nNur der erklärte Auftrag; Budget und Laufzeitgrenze (`timeout_seconds = 240`) sind hart. Stoppe und gib zurück, sobald Kompatibilität, transitive Wirkung und Lizenz je Kandidat belegt sind, das Budget knapp wird oder Freigabe, breiterer Scope bzw. eine Sicherheitsentscheidung nötig ist.\n\n## Übergabe\n\nAn den Auftraggeber nach Return-Contract: Kandidaten mit Version, Kompatibilität, transitiver Wirkung, Lizenz, Upgrade-Pfad und Quellen; dazu Annahmen, durchgeführte Prüfung, Restrisiken, Blocker. Keine Rohausgaben, keine Wiederholung des Auftrags.\n",
+    "source": "system.md",
+    "blake3": "89b21d08d29d5621f300e6a6a0daa94019430f496441e0053bd624ff2c0f4372"
+  },
+  "tools": {
+    "admitted": [
+      "fs.read",
+      "fs.list",
+      "fs.search",
+      "fs.glob",
+      "fs.grep",
+      "doc.read_pdf",
+      "deps.graph",
+      "deps.locked",
+      "deps.source_read",
+      "deps.source_search",
+      "deps.source_list",
+      "explore.tree",
+      "explore.projects",
+      "explore.relations",
+      "explore.find",
+      "workbench.show",
+      "diary.read",
+      "palace.search",
+      "palace.recall",
+      "parent.message",
+      "skills.search",
+      "skills.load"
+    ],
+    "forbidden": [
+      "fs.write",
+      "fs.edit",
+      "shell.exec",
+      "web.fetch",
+      "web.search",
+      "web.docs_rs",
+      "web.crates_io"
+    ]
+  },
+  "spawn": {
+    "max_depth": 1,
+    "child_orchestrators": [],
+    "delegation_targets": null,
+    "workspace_hint": null,
+    "budget": {
+      "max_tokens": 60000,
+      "max_tool_calls": 40,
+      "max_wall_secs": 180,
+      "effort_cap": null
+    }
+  },
+  "job": {
+    "goal_kind": null
+  },
+  "lifecycle": {
+    "allow_pause": false,
+    "allow_rerun": true,
+    "max_attempts": 4
+  },
+  "context": {
+    "program": null,
+    "program_id": null,
+    "policy": null,
+    "sections": [],
+    "must_include": [
+      "task.objective",
+      "task.read_scope",
+      "new.trigger_return"
+    ],
+    "exclude": [
+      "full_parent_transcript",
+      "sibling_transcripts"
+    ],
+    "deferred": []
+  },
+  "return": {
+    "contract": "harwness.return.research-finding@1",
+    "validators": []
+  },
+  "models": null,
+  "limits": null,
+  "work": null,
+  "research": {
+    "sources": [
+      "source-tree",
+      "lockfiles",
+      "local-docs"
+    ],
+    "freshness": null,
+    "primary_sources_required": true,
+    "output": "structured-evidence",
+    "ecosystems": [
+      "cargo"
+    ],
+    "may_write_code": false,
+    "tradecraft": []
+  },
+  "verification": null,
+  "skills": {
+    "entries": [
+      {
+        "name": "dependency-research",
+        "hash": null
+      }
+    ]
+  },
+  "binary": {
+    "name": "dependency-analyst",
+    "interfaces": [
+      "cli"
+    ],
+    "default_interface": "cli"
+  },
+  "permissions": {
+    "tools": [
+      "deps.graph",
+      "deps.locked",
+      "deps.source_list",
+      "deps.source_read",
+      "deps.source_search",
+      "diary.read",
+      "doc.read_pdf",
+      "explore.find",
+      "explore.projects",
+      "explore.relations",
+      "explore.tree",
+      "fs.glob",
+      "fs.grep",
+      "fs.list",
+      "fs.read",
+      "fs.search",
+      "palace.recall",
+      "palace.search",
+      "parent.message",
+      "skills.load",
+      "skills.search",
+      "workbench.show"
+    ],
+    "forbidden_tools": [
+      "fs.edit",
+      "fs.write",
+      "shell.exec",
+      "web.crates_io",
+      "web.docs_rs",
+      "web.fetch",
+      "web.search"
+    ],
+    "capabilities": [],
+    "filesystem": {
+      "read": true,
+      "write": false,
+      "write_paths": [],
+      "other_write_tools": []
+    },
+    "network": {
+      "mode": "off",
+      "tools": [],
+      "hosts": []
+    },
+    "shell": false,
+    "host": false,
+    "spawn": {
+      "max_depth": 1,
+      "child_orchestrators": [],
+      "delegation_targets": []
+    },
+    "budget": {
+      "max_tokens": 60000,
+      "max_tool_calls": 40,
+      "max_wall_secs": 180,
+      "effort_cap": null
+    },
+    "required_env": []
+  },
+  "trace": {
+    "steps": [
+      {
+        "source": "harwness.agent.worker-base@1",
+        "kind": "patch",
+        "applied_at": "1970-01-01T00:00:00Z"
+      },
+      {
+        "source": "harwness.agent.worker-base@1",
+        "kind": "base",
+        "applied_at": "1970-01-01T00:00:00Z"
+      },
+      {
+        "source": "harwness.agent.researcher-deps@1",
+        "kind": "patch",
+        "applied_at": "1970-01-01T00:00:00Z"
+      },
+      {
+        "source": "harwness.agent.researcher-deps@1",
+        "kind": "base",
+        "applied_at": "1970-01-01T00:00:00Z"
+      },
+      {
+        "source": "harwness.agent.dependency-analyst@1",
+        "kind": "patch",
+        "applied_at": "1970-01-01T00:00:00Z"
+      }
+    ],
+    "diagnostics": []
+  },
+  "snapshot": {
+    "domain": "harwness.agent-ir.snapshot/v7",
+    "digest": "8791bc674cd6b861ecef699ad2394724dc30093774030f9719562c4b7cd9f83d"
+  }
+}

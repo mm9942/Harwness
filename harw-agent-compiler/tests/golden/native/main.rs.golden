@@ -1,0 +1,17 @@
+//! `evidence-critic`: the agent harwness.agent.evidence-critic@1 1.0.0, compiled by
+//! `harw agent build --native` (harw <harw-version>).
+//!
+//! The artifact next to this crate is embedded verbatim; the runner
+//! verifies its hashes before the agent starts.
+
+#![forbid(unsafe_code)]
+
+fn main() -> std::process::ExitCode {
+    if let Err(error) = harw_agent_artifact::EmbeddedArtifact::verify_current_exe_matches(
+        include_bytes!("../agent.harwa"),
+    ) {
+        eprintln!("agent integrity check failed: {error}");
+        return std::process::ExitCode::FAILURE;
+    }
+    harw_agent_runner::run_embedded(include_bytes!("../agent.harwa"))
+}

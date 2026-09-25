@@ -39,7 +39,7 @@ aggregates_child_returns = true
 [lifecycle]
 allow_pause = false
 allow_rerun = true
-max_attempts = 2
+max_attempts = 4  # erster Lauf + 3 Fortsetzungen (MAX_CONTINUATIONS)
 
 [context]
 # Kontextprogramm (Runde 3, Welle C2): `agents/context-programs/orchestrate.toml`;

@@ -1,0 +1,181 @@
+{
+  "schema": "harwness.agent-ir/v2",
+  "id": "harwness.agent.evidence-collector@1",
+  "version": "1.0.0",
+  "name": "Evidence Collector",
+  "description": "Beantwortet eine eng gefasste Teilfrage aus einem vorgegebenen Korpus (Dateien, Dokumente, PDFs) mit Belegen und genauen Fundstellen; liefert Befunde, kein Gesamturteil. Read-only.",
+  "role": "worker",
+  "specialization": "evidence-collector",
+  "reasoning_effort": null,
+  "authority": {
+    "capabilities": []
+  },
+  "instructions": {
+    "text": "# evidence-collector\n\nDu bist der Sammler der Analyse-Familie. Du beantwortest **genau eine** eng gefasste Teilfrage aus einem vorgegebenen Korpus und lieferst Befunde mit genauen Fundstellen. Das Gesamturteil fällen andere.\n\n## Vorgehen\n\n1. **Auftrag lesen.** Leitfrage, deine Teilfrage, Lesebereich, gewünschtes Rückgabeformat, „Nicht tun“. Fehlt der Lesebereich oder ist die Teilfrage so breit, dass sie dein Budget sprengt, frag über `parent.message` nach, statt zu raten.\n2. **Skills laden, wenn genannt.** Der Auftrag nennt unter „Lade zuerst“ die Skills. Sonst: `skills.load evidence-quality-review` für die Einstufung deiner Quellen. Skills findest du mit `skills.search`, nie über das Dateisystem.\n3. **Gezielt suchen.** Erst Überblick (`fs.list`, `fs.glob`), dann gezielt (`fs.grep`, `fs.search`), dann lesen (`fs.read`, `doc.read_pdf`). Such auch nach Belegen, die gegen die naheliegende Antwort sprechen.\n4. **Jeden Befund festhalten** mit: Aussage in einem Satz, wörtlich kurzer Anker (höchstens ein Satzteil), Fundstelle (Pfad, Seite oder Zeile), Einstufung von Quelle und Information.\n5. **Lücken benennen.** Was hättest du erwartet zu finden und nicht gefunden? Wo hast du nicht gesucht?\n6. **Aufhören, wenn die Teilfrage beantwortet ist.** Nicht weitersammeln, um das Budget auszunutzen.\n\n## Rückgabe\n\n```markdown\n**Teilfrage:** …\n**Kurzantwort:** <ein bis zwei Sätze, nur so weit die Belege tragen>\n\n| # | Befund | Fundstelle | Quelle | Information | spricht für / gegen |\n|---|---|---|---|---|---|\n| F1 | … | pfad/datei.md:42 | zuverlässig | bestätigt | für |\n\n**Gegenbelege:** …\n**Lücken / nicht durchsucht:** …\n**Durchsucht:** <Pfade, Suchbegriffe>\n```\n\n## Was ich NICHT tue\n\n- Kein Gesamturteil über die Leitfrage, keine Empfehlung, keine Sicherheitsangabe zur Leitfrage.\n- Keine Befunde ohne Fundstelle; nichts aus dem Gedächtnis ergänzen.\n- Keine Dateien schreiben, keine Prozesse, kein Netz.\n- Keine anderen Agenten starten.\n- Keine langen Zitate: Fundstelle und kurzer Anker genügen.\n",
+    "source": "system.md",
+    "blake3": "b37cdff22d5bc777bad2f9197217490de95a9df8c801a90022aa657feb767575"
+  },
+  "tools": {
+    "admitted": [
+      "fs.read",
+      "fs.list",
+      "fs.search",
+      "fs.glob",
+      "fs.grep",
+      "doc.read_pdf",
+      "workbench.show",
+      "diary.read",
+      "palace.search",
+      "palace.recall",
+      "parent.message",
+      "skills.search",
+      "skills.load"
+    ],
+    "forbidden": [
+      "fs.write",
+      "fs.edit",
+      "shell.exec",
+      "web.fetch",
+      "web.search",
+      "web.docs_rs",
+      "web.crates_io"
+    ]
+  },
+  "spawn": {
+    "max_depth": 0,
+    "child_orchestrators": [],
+    "delegation_targets": null,
+    "workspace_hint": null,
+    "budget": {
+      "max_tokens": 80000,
+      "max_tool_calls": 50,
+      "max_wall_secs": 600,
+      "effort_cap": null
+    }
+  },
+  "job": {
+    "goal_kind": null
+  },
+  "lifecycle": {
+    "allow_pause": false,
+    "allow_rerun": true,
+    "max_attempts": 4
+  },
+  "context": {
+    "program": null,
+    "program_id": null,
+    "policy": null,
+    "sections": [],
+    "must_include": [
+      "task.objective",
+      "task.read_scope",
+      "new.trigger_return"
+    ],
+    "exclude": [
+      "full_parent_transcript",
+      "sibling_transcripts"
+    ],
+    "deferred": []
+  },
+  "return": {
+    "contract": "harwness.return.execution-summary@1",
+    "validators": []
+  },
+  "models": null,
+  "limits": null,
+  "work": {
+    "mode": "read-only-analysis",
+    "may_write_code": false,
+    "may_research_web": false,
+    "may_change_plan": null,
+    "aggregates_child_returns": null
+  },
+  "research": null,
+  "verification": null,
+  "skills": {
+    "entries": []
+  },
+  "binary": {
+    "name": "evidence-collector",
+    "interfaces": [
+      "cli"
+    ],
+    "default_interface": "cli"
+  },
+  "permissions": {
+    "tools": [
+      "diary.read",
+      "doc.read_pdf",
+      "fs.glob",
+      "fs.grep",
+      "fs.list",
+      "fs.read",
+      "fs.search",
+      "palace.recall",
+      "palace.search",
+      "parent.message",
+      "skills.load",
+      "skills.search",
+      "workbench.show"
+    ],
+    "forbidden_tools": [
+      "fs.edit",
+      "fs.write",
+      "shell.exec",
+      "web.crates_io",
+      "web.docs_rs",
+      "web.fetch",
+      "web.search"
+    ],
+    "capabilities": [],
+    "filesystem": {
+      "read": true,
+      "write": false,
+      "write_paths": [],
+      "other_write_tools": []
+    },
+    "network": {
+      "mode": "off",
+      "tools": [],
+      "hosts": []
+    },
+    "shell": false,
+    "host": false,
+    "spawn": {
+      "max_depth": 0,
+      "child_orchestrators": [],
+      "delegation_targets": []
+    },
+    "budget": {
+      "max_tokens": 80000,
+      "max_tool_calls": 50,
+      "max_wall_secs": 600,
+      "effort_cap": null
+    },
+    "required_env": []
+  },
+  "trace": {
+    "steps": [
+      {
+        "source": "harwness.agent.worker-base@1",
+        "kind": "patch",
+        "applied_at": "1970-01-01T00:00:00Z"
+      },
+      {
+        "source": "harwness.agent.worker-base@1",
+        "kind": "base",
+        "applied_at": "1970-01-01T00:00:00Z"
+      },
+      {
+        "source": "harwness.agent.evidence-collector@1",
+        "kind": "patch",
+        "applied_at": "1970-01-01T00:00:00Z"
+      }
+    ],
+    "diagnostics": []
+  },
+  "snapshot": {
+    "domain": "harwness.agent-ir.snapshot/v7",
+    "digest": "b6c36f0cd92d7ac29682a628f1571b6787a41fefc381d872e33f47c2d7173803"
+  }
+}

@@ -62,6 +62,8 @@ mod error;
 
 pub mod agent_definition_tools;
 pub mod authority;
+// #22 wave 2B: tool name → provider, capability class, runner feature.
+pub mod capability_catalog;
 pub mod diary_tools;
 pub mod embedded_agents;
 pub mod kanban_tools;

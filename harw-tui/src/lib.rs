@@ -33,6 +33,9 @@ mod error;
 pub(crate) mod events;
 pub(crate) mod explorer_panel;
 pub mod export;
+// R10 wave 3B: the mini-TUI seam for a compiled agent (`harw-agent-runner`'s
+// `iface::tui`) — the normal TUI fixed to one embedded agent.
+pub mod fixed_agent;
 pub(crate) mod frame_requester;
 pub mod gateway;
 pub(crate) mod help_overlay;
@@ -107,7 +110,10 @@ pub use registry::{
     ShellCapability,
 };
 pub use relative_time::relative_time;
-pub use runtime_root::{TuiAssemblyFactory, TuiResume, TuiRunOptions, TuiSessionWiring, run_tui};
+pub use runtime_root::{
+    FixedAgentUiRestrictions, TuiAssemblyFactory, TuiResume, TuiRunOptions, TuiSessionWiring,
+    run_tui,
+};
 pub use session_picker::{PickerAction, SessionEntry, SessionPicker};
 pub use setup::{SetupApp, SetupOutcome, SetupStage, run_setup};
 

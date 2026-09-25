@@ -38,13 +38,18 @@
 //!   `agents.catalog`/`agents.delegate`) werden nicht vom Schnitt entfernt:
 //!   admittiert die Basisrolle sie, bekommt der Agent sie auch ohne eigene
 //!   Aufzählung — außer er verbietet sie ausdrücklich.
-//! - **Rechtedecke:** Registry-Profil, Reducer, Composition-Werkzeuge und
-//!   Delegationsziele sind die der Basisrolle
-//!   ([`AgentRoster::base_role`]). Die IR wird unter die der Basis geklemmt
-//!   ([`ExecutableAgentIr::clamped_to`]): Werkzeuge nur im Schnitt,
-//!   Budget und `max_depth` höchstens die der Basis. Eine Definition kann
-//!   ihre Rechte damit nur verengen, nie erweitern. Rechte über der Basis
-//!   gibt es weiterhin nur über den Steward und `user_required`.
+//! - **Rechtedecke:** Reducer und Composition-Werkzeuge sind die der
+//!   Basisrolle ([`AgentRoster::base_role`]). Die typisierte IR wird unter
+//!   die der Basis geklemmt ([`AgentIr::clamped_to`]): Werkzeuge nur im
+//!   Schnitt, Budget und `max_depth` höchstens die der Basis. Eine
+//!   Definition kann ihre Rechte damit nur verengen, nie erweitern. Rechte
+//!   über der Basis gibt es weiterhin nur über den Steward und
+//!   `user_required`.
+//! - **Aus der IR (#22 Welle 1B):** Instruktionen, Beschreibung,
+//!   Delegationsziele (`[delegation].targets`, sonst die der Basisrolle) und
+//!   das Rechte-Manifest kommen aus der geklemmten [`AgentIr`]
+//!   ([`RosterEntry::ir`]); das Registry-Profil eines eigenen Agenten folgt
+//!   aus Manifest plus Basisrolle ([`custom_registry_profile`]).
 //!
 //! # Konsumenten
 //! `harw-runtime` registriert [`AgentRoster::names`] im Spawner und reicht
@@ -55,17 +60,19 @@
 //! Nach [`AgentRoster::build`] unveränderlich; `Send + Sync`.
 
 use std::collections::{BTreeMap, HashMap};
-use std::sync::OnceLock;
+use std::sync::Arc;
 
-use harw_agent_dsl::ExecutableAgentIr;
+use harw_agent_dsl::ir_v2::{NetworkMode, Permissions};
 use harw_agent_dsl::layers::DefinitionLayer;
 use harw_agent_dsl::roles::AgentRoleId;
+use harw_agent_dsl::{AgentIr, ExecutableAgentIr};
 use harw_authority::Permission;
 use harw_config::AgentDefinitionMeta;
+use time::OffsetDateTime;
 
 use crate::embedded_agents::{
-    BASE_DEFINITION_NAMES, CHILD_ORCHESTRATOR_BASE_NAME, WORKER_BASE_NAME, builtin_agent_toml,
-    builtin_base_definitions,
+    BASE_DEFINITION_NAMES, CHILD_ORCHESTRATOR_BASE_NAME, WORKER_BASE_NAME, builtin_agent_irs,
+    builtin_base_irs,
 };
 use crate::error::RegistryDefaultsError;
 use crate::profile::{RegistryProfile, profile_for_role, role_names};
@@ -119,14 +126,18 @@ pub struct CustomAgentWiring {
     /// (Composition-Werkzeuge, Reducer, Delegationsziele, interne
     /// Modellstelle).
     pub base_role: String,
-    /// Das Registry-Profil, mit dem die Kind-Registry montiert wird.
+    /// Das Registry-Profil, mit dem die Kind-Registry montiert wird
+    /// ([`custom_registry_profile`]).
     pub profile: RegistryProfile,
-    /// Instruktionstext aus `instructions_file`, falls vorhanden.
+    /// Instruktionstext der IR (`instructions_file` bzw. `system.md`), falls
+    /// nicht leer.
     pub instructions: Option<String>,
-    /// Eigene `[delegation].targets` der Definition, falls vorhanden; sonst
-    /// gelten die der Basisrolle
+    /// Eigene `[delegation].targets` der IR, falls vorhanden; sonst gelten
+    /// die der Basisrolle
     /// ([`crate::authority::delegation_targets_for_role`]).
     pub delegation_targets: Option<Vec<String>>,
+    /// Die geklemmte, typisierte IR des Agenten (#22 Welle 1B).
+    pub ir: Arc<AgentIr>,
 }
 
 /// Woher ein Roster-Eintrag stammt.
@@ -136,7 +147,7 @@ pub enum RosterSource {
     BuiltIn,
     /// Eine benutzerdefinierte Definition aus Profil oder vertrautem Projekt.
     Custom {
-        /// Die kanonische `DefinitionId` (`ResolvedConfig::executable_agents`).
+        /// Die kanonische `DefinitionId` (`ResolvedConfig::agent_irs`).
         definition_id: String,
         /// Die höchste Schicht, aus der die Definition stammt.
         layer: Option<DefinitionLayer>,
@@ -150,14 +161,16 @@ pub struct RosterEntry {
     pub name: String,
     /// Die Organisationsrolle aus der IR.
     pub role: AgentRoleId,
-    /// Menschenlesbare Beschreibung aus der Definition, falls vorhanden.
+    /// Menschenlesbare Beschreibung aus der IR, falls vorhanden.
     pub description: Option<String>,
     /// Die fest gebundenen Skills der Definition.
     pub skills: Vec<String>,
-    /// Die eingebaute Rolle, deren Profil, Reducer und Composition-Werkzeuge
+    /// Die eingebaute Rolle, deren Reducer und Composition-Werkzeuge
     /// gelten. Für eingebaute Rollen der eigene Name.
     pub base_role: String,
-    /// Das Registry-Profil der Basisrolle.
+    /// Das Registry-Profil: für eingebaute Rollen das ihrer Rollentabelle,
+    /// für benutzerdefinierte aus Rechte-Manifest und Basisrolle
+    /// ([`custom_registry_profile`]).
     pub profile: RegistryProfile,
     /// Die effektiv admittierten Werkzeuge (geklemmte IR).
     pub tools: Vec<String>,
@@ -169,22 +182,31 @@ pub struct RosterEntry {
     pub budget_tokens: Option<u64>,
     /// Herkunft.
     pub source: RosterSource,
+    /// Die (für benutzerdefinierte Agenten geklemmte) typisierte IR — Quelle
+    /// von Instruktionen, Delegationszielen und Rechte-Manifest (#22 Welle 1B).
+    pub ir: Arc<AgentIr>,
 }
 
 impl RosterEntry {
-    /// Eine einzeilige Zusammenfassung der Rechte, z. B.
-    /// `"read-only exploration agent; read-only; 18 tools"`.
+    /// Eine einzeilige Zusammenfassung der Rechte aus dem Rechte-Manifest der
+    /// IR, z. B. `"read-only exploration agent; read-only; 18 tools"` (mit
+    /// `"; network"`, wenn das Manifest Netzwerkzeuge admittiert).
     #[must_use]
     pub fn profile_summary(&self) -> String {
         format!(
-            "{}; {}; {} tools",
+            "{}; {}; {} tools{}",
             self.profile.role_description(),
             if self.read_only {
                 "read-only"
             } else {
                 "writes/executes"
             },
-            self.tools.len()
+            self.tools.len(),
+            if self.ir.permissions.network.mode == NetworkMode::Off {
+                ""
+            } else {
+                "; network"
+            }
         )
     }
 
@@ -193,6 +215,13 @@ impl RosterEntry {
     pub fn is_custom(&self) -> bool {
         matches!(self.source, RosterSource::Custom { .. })
     }
+
+    /// Der nicht leere Instruktionstext der IR.
+    #[must_use]
+    pub fn instructions(&self) -> Option<&str> {
+        let text = self.ir.instructions.text.as_str();
+        (!text.trim().is_empty()).then_some(text)
+    }
 }
 
 /// Der Roster aller startbaren Agenten eines Laufs.
@@ -200,12 +229,12 @@ impl RosterEntry {
 pub struct AgentRoster {
     /// Einträge nach Spawn-Name.
     entries: BTreeMap<String, RosterEntry>,
-    /// Die (für benutzerdefinierte Agenten geklemmten) IRs nach Spawn-Name.
+    /// Die Laufzeitsicht der (für benutzerdefinierte Agenten geklemmten) IRs
+    /// nach Spawn-Name, `ExecutableAgentIr::from(&entry.ir)`.
     definitions: HashMap<String, ExecutableAgentIr>,
-    /// Instruktionstext benutzerdefinierter Agenten nach Spawn-Name.
+    /// Instruktionstexte benutzerdefinierter Agenten nach Spawn-Name (aus
+    /// der IR, für [`Self::all_instructions`]).
     instructions: HashMap<String, String>,
-    /// Eigene `[delegation].targets` benutzerdefinierter Agenten.
-    delegation_targets: HashMap<String, Vec<String>>,
 }
 
 /// Welche Basis ein benutzerdefinierter Agent in seiner Kette trägt.
@@ -217,40 +246,61 @@ enum Ancestor<'a> {
 }
 
 impl AgentRoster {
-    /// Baut den Roster aus den eingebauten Rollen und der aufgelösten Config.
+    /// Baut den Roster aus den eingebauten Rollen und der aufgelösten Config
+    /// (Kompatibilitätsweg für Aufrufer mit der Laufzeitsicht).
+    ///
+    /// # Description
+    /// `builtin` bestimmt nur, **welche** eingebauten Rollen aufgenommen
+    /// werden; ihre typisierte IR wird über
+    /// [`crate::embedded_agents::builtin_agent_irs`] gesenkt (die Sicht ist
+    /// golden-geprüft gleich). Wer die IRs schon hat, nimmt
+    /// [`Self::from_irs`].
     ///
     /// # Errors
-    /// Wie [`Self::build`].
+    /// Wie [`Self::build`], dazu das Senken der eingebauten Rollen.
     pub fn from_config(
         builtin: &HashMap<String, ExecutableAgentIr>,
         config: &harw_config::ResolvedConfig,
     ) -> Result<Self, RegistryDefaultsError> {
-        Self::build(
-            builtin,
-            &config.executable_agents,
-            &config.agent_definition_meta,
-        )
+        let irs: HashMap<String, AgentIr> = builtin_agent_irs(OffsetDateTime::now_utc())?
+            .into_iter()
+            .filter(|(name, _)| builtin.contains_key(name))
+            .collect();
+        Self::from_irs(&irs, config)
+    }
+
+    /// Baut den Roster aus den typisierten eingebauten Rollen
+    /// ([`crate::embedded_agents::builtin_agent_irs`]) und der aufgelösten
+    /// Config (`ResolvedConfig::agent_irs`, #22 Welle 1B).
+    ///
+    /// # Errors
+    /// Wie [`Self::build`].
+    pub fn from_irs(
+        builtin: &HashMap<String, AgentIr>,
+        config: &harw_config::ResolvedConfig,
+    ) -> Result<Self, RegistryDefaultsError> {
+        Self::build(builtin, &config.agent_irs, &config.agent_definition_meta)
     }
 
     /// Baut den Roster.
     ///
     /// # Arguments
-    /// - `builtin`: die gesenkten eingebauten Rollen
-    ///   ([`crate::embedded_agents::builtin_agent_definitions`]), nach
-    ///   Rollenname.
-    /// - `local`: die gesenkten Definitionen der vertrauten Layer
-    ///   (`ResolvedConfig::executable_agents`), nach `DefinitionId`.
-    /// - `meta`: Beschreibung und Instruktionen dazu
-    ///   (`ResolvedConfig::agent_definition_meta`), nach `DefinitionId`.
+    /// - `builtin`: die typisierten eingebauten Rollen
+    ///   ([`crate::embedded_agents::builtin_agent_irs`]), nach Rollenname.
+    /// - `local`: die typisierten Definitionen der vertrauten Layer
+    ///   (`ResolvedConfig::agent_irs`), nach `DefinitionId`.
+    /// - `meta`: Herkunftsschicht dazu (`ResolvedConfig::agent_definition_meta`),
+    ///   nach `DefinitionId`. Beschreibung, Instruktionen und
+    ///   Delegationsziele liest der Roster aus der IR.
     ///
     /// # Errors
-    /// [`RegistryDefaultsError::AgentDefinition`], wenn eine eingebaute Basis
-    /// nicht senkt (Defekt der eingebetteten Dateien). Eine ungeeignete
+    /// [`RegistryDefaultsError`], wenn eine eingebaute Basis nicht senkt
+    /// (Defekt der eingebetteten Dateien). Eine ungeeignete
     /// benutzerdefinierte Definition ist nie ein Fehler, sondern wird mit
     /// Warnung übersprungen.
     pub fn build(
-        builtin: &HashMap<String, ExecutableAgentIr>,
-        local: &HashMap<String, ExecutableAgentIr>,
+        builtin: &HashMap<String, AgentIr>,
+        local: &HashMap<String, AgentIr>,
         meta: &HashMap<String, AgentDefinitionMeta>,
     ) -> Result<Self, RegistryDefaultsError> {
         let mut roster = Self::default();
@@ -259,43 +309,41 @@ impl AgentRoster {
                 tracing::warn!(role = %name, "registry.roster.builtin_role_without_profile");
                 continue;
             };
-            roster.entries.insert(
-                name.clone(),
+            roster.insert(
                 entry_for(
                     name,
-                    ir,
+                    Arc::new(ir.clone()),
                     name,
                     profile,
-                    builtin_description(name),
                     RosterSource::BuiltIn,
                 ),
+                false,
             );
-            roster.definitions.insert(name.clone(), ir.clone());
         }
         if local.is_empty() {
             return Ok(roster);
         }
 
-        let bases = builtin_base_definitions()?;
+        let bases = builtin_base_irs(OffsetDateTime::now_utc())?;
         let builtin_by_id: HashMap<String, &str> = builtin
             .iter()
-            .map(|(name, ir)| (ir.id().to_string(), name.as_str()))
+            .map(|(name, ir)| (ir.id.to_string(), name.as_str()))
             .collect();
         let base_by_id: HashMap<String, &str> = bases
             .iter()
-            .map(|(name, ir)| (ir.id().to_string(), name.as_str()))
+            .map(|(name, ir)| (ir.id.to_string(), name.as_str()))
             .collect();
 
-        let mut sorted: Vec<(&String, &ExecutableAgentIr)> = local.iter().collect();
+        let mut sorted: Vec<(&String, &AgentIr)> = local.iter().collect();
         sorted.sort_by_key(|(id, _)| *id);
         for (id, ir) in sorted {
             if !matches!(
-                ir.role(),
+                ir.role,
                 AgentRoleId::Worker | AgentRoleId::UiaWorker | AgentRoleId::ChildOrchestrator
             ) {
                 continue;
             }
-            let name = ir.specialization().to_owned();
+            let name = ir.specialization.clone();
             if builtin_by_id.contains_key(id) || base_by_id.contains_key(id) {
                 tracing::warn!(
                     definition = %id,
@@ -329,21 +377,8 @@ impl AgentRoster {
                 tracing::warn!(
                     agent = %name,
                     definition = %id,
-                    role = ?ir.role(),
+                    role = ?ir.role,
                     "registry.roster.no_matching_base_role: skipped"
-                );
-                continue;
-            };
-            let base_profile = if writes {
-                Some(GENERIC_WRITING_WORKER_PROFILE)
-            } else {
-                profile_for_role(base_role)
-            };
-            let Some(profile) = base_profile else {
-                tracing::warn!(
-                    agent = %name,
-                    base = %base_role,
-                    "registry.roster.base_role_without_profile: skipped"
                 );
                 continue;
             };
@@ -361,8 +396,8 @@ impl AgentRoster {
                 .copied()
                 .filter(|tool| {
                     ceiling
-                        .tool_surface()
-                        .admitted()
+                        .tools
+                        .admitted
                         .iter()
                         .any(|admitted| admitted == tool)
                 })
@@ -379,35 +414,51 @@ impl AgentRoster {
             if !jobs.is_empty() {
                 clamped = clamped.with_additional_admitted(&jobs);
             }
-            let definition_meta = meta.get(id);
+            // #22 Welle 1B: das Profil folgt dem Rechte-Manifest der
+            // geklemmten IR plus der Basisrolle, nie weiter als die Basis.
+            let Some(profile) = custom_registry_profile(base_role, &clamped.permissions, writes)
+            else {
+                tracing::warn!(
+                    agent = %name,
+                    base = %base_role,
+                    "registry.roster.base_role_without_profile: skipped"
+                );
+                continue;
+            };
             let entry = entry_for(
                 &name,
-                &clamped,
+                Arc::new(clamped),
                 base_role,
                 profile,
-                definition_meta.and_then(|meta| meta.description.clone()),
                 RosterSource::Custom {
                     definition_id: id.clone(),
-                    layer: definition_meta.and_then(|meta| meta.layer),
+                    layer: meta.get(id).and_then(|meta| meta.layer),
                 },
             );
-            if let Some(instructions) = definition_meta.and_then(|meta| meta.instructions.clone()) {
-                roster.instructions.insert(name.clone(), instructions);
-            }
-            if let Some(targets) = definition_meta.and_then(|meta| meta.delegation_targets.clone())
-            {
-                roster.delegation_targets.insert(name.clone(), targets);
-            }
             tracing::debug!(
                 agent = %name,
                 base = %base_role,
                 definition = %id,
+                profile = ?profile,
                 "registry.roster.custom_agent_registered"
             );
-            roster.entries.insert(name.clone(), entry);
-            roster.definitions.insert(name, clamped);
+            roster.insert(entry, true);
         }
         Ok(roster)
+    }
+
+    /// Nimmt einen Eintrag samt Laufzeitsicht (und bei eigenen Agenten
+    /// Instruktionen) auf.
+    fn insert(&mut self, entry: RosterEntry, custom: bool) {
+        if custom && let Some(text) = entry.instructions() {
+            self.instructions
+                .insert(entry.name.clone(), text.to_owned());
+        }
+        self.definitions.insert(
+            entry.name.clone(),
+            ExecutableAgentIr::from(entry.ir.as_ref()),
+        );
+        self.entries.insert(entry.name.clone(), entry);
     }
 
     /// Alle Einträge, nach Spawn-Name sortiert.
@@ -438,16 +489,31 @@ impl AgentRoster {
         self.entries.is_empty()
     }
 
-    /// Die IRs aller Einträge nach Spawn-Name — eingebaute unverändert,
-    /// benutzerdefinierte geklemmt. Die Kind-Fabriken lesen daraus Aktivierung,
-    /// Budget, Skills und Organisationsrolle.
+    /// Die Laufzeitsicht aller Einträge nach Spawn-Name — eingebaute
+    /// unverändert, benutzerdefinierte geklemmt. Die Kind-Fabriken lesen
+    /// daraus Aktivierung, Budget, Skills und Organisationsrolle.
     #[must_use]
     pub fn definitions(&self) -> &HashMap<String, ExecutableAgentIr> {
         &self.definitions
     }
 
-    /// Die eingebaute Rolle, deren namensgebundene Tabellen (Profil,
-    /// Reducer, Composition-Werkzeuge, Delegationsziele) für `name` gelten.
+    /// Die typisierte IR eines Eintrags (#22 Welle 1B).
+    #[must_use]
+    pub fn ir(&self, name: &str) -> Option<&Arc<AgentIr>> {
+        self.entries.get(name).map(|entry| &entry.ir)
+    }
+
+    /// Die typisierten IRs aller Einträge nach Spawn-Name.
+    #[must_use]
+    pub fn irs(&self) -> HashMap<String, Arc<AgentIr>> {
+        self.entries
+            .iter()
+            .map(|(name, entry)| (name.clone(), Arc::clone(&entry.ir)))
+            .collect()
+    }
+
+    /// Die eingebaute Rolle, deren namensgebundene Tabellen (Reducer,
+    /// Composition-Werkzeuge, Delegationsziele) für `name` gelten.
     #[must_use]
     pub fn base_role(&self, name: &str) -> Option<&str> {
         self.entries.get(name).map(|entry| entry.base_role.as_str())
@@ -463,32 +529,33 @@ impl AgentRoster {
             .collect()
     }
 
-    /// Der Instruktionstext eines benutzerdefinierten Agenten
-    /// (`instructions_file`), falls vorhanden.
+    /// Der Instruktionstext eines benutzerdefinierten Agenten (aus der IR),
+    /// falls vorhanden.
     #[must_use]
     pub fn instructions(&self, name: &str) -> Option<&str> {
         self.instructions.get(name).map(String::as_str)
     }
 
-    /// Die Delegationsziele eines Eintrags: die eigene `[delegation].targets`
-    /// eines benutzerdefinierten Agenten, sonst die seiner Basisrolle bzw.
-    /// der eingebauten Rolle selbst. `None` heißt: keine Deklaration.
+    /// Die Delegationsziele eines Eintrags: die `[delegation].targets` seiner
+    /// IR, sonst die seiner Basisrolle bzw. der eingebauten Rolle selbst.
+    /// `None` heißt: keine Deklaration.
     #[must_use]
     pub fn delegation_targets(&self, name: &str) -> Option<Vec<String>> {
-        if let Some(targets) = self.delegation_targets.get(name) {
+        let entry = self.entries.get(name)?;
+        if let Some(targets) = &entry.ir.spawn.delegation_targets {
             return Some(targets.clone());
         }
-        crate::authority::delegation_targets_for_role(self.base_role(name)?)
+        crate::authority::delegation_targets_for_role(&entry.base_role)
     }
 
-    /// Alle Instruktionstexte nach Spawn-Name.
+    /// Alle Instruktionstexte benutzerdefinierter Agenten nach Spawn-Name.
     #[must_use]
     pub fn all_instructions(&self) -> &HashMap<String, String> {
         &self.instructions
     }
 
     /// Die Laufzeit-Verdrahtung aller benutzerdefinierten Agenten nach
-    /// Spawn-Name (Basisrolle, Profil, Instruktionen).
+    /// Spawn-Name (Basisrolle, Profil, Instruktionen, IR).
     #[must_use]
     pub fn custom_wiring(&self) -> HashMap<String, CustomAgentWiring> {
         self.entries
@@ -500,8 +567,9 @@ impl AgentRoster {
                     CustomAgentWiring {
                         base_role: entry.base_role.clone(),
                         profile: entry.profile,
-                        instructions: self.instructions.get(&entry.name).cloned(),
-                        delegation_targets: self.delegation_targets.get(&entry.name).cloned(),
+                        instructions: entry.instructions().map(str::to_owned),
+                        delegation_targets: entry.ir.spawn.delegation_targets.clone(),
+                        ir: Arc::clone(&entry.ir),
                     },
                 )
             })
@@ -509,12 +577,62 @@ impl AgentRoster {
     }
 }
 
+/// Das Registry-Profil eines benutzerdefinierten Agenten aus seinem
+/// Rechte-Manifest und seiner Basisrolle (#22 Welle 1B).
+///
+/// # Description
+/// Ausgangspunkt ist das Profil der Basisrolle (bzw. für einen generischen
+/// schreibenden Worker [`GENERIC_WRITING_WORKER_PROFILE`]); das Manifest
+/// kann es nur **verengen**, nie erweitern:
+/// - Nutzt das Manifest kein einziges Werkzeug des Basisprofils und
+///   verlangt weder Lesen, Schreiben, Shell, Host noch Netz, gilt
+///   [`RegistryProfile::NoTools`] — die Kind-Registry montiert dann keinen
+///   Werkzeug-Provider, dessen Rechte der Agent nicht braucht.
+/// - Sonst bleibt es beim Basisprofil; die Aktivierung der Sitzung schaltet
+///   ohnehin nur die admittierten Werkzeuge frei, und die Rechte der
+///   Kind-Registry werden zusätzlich auf das Manifest geschnitten
+///   ([`crate::authority::granted_for_ir`]).
+///
+/// Eingebaute Rollen nutzen weiterhin ausschließlich [`profile_for_role`]
+/// (keine Verhaltensänderung); der Test
+/// `builtin_manifests_stay_within_their_registry_profiles` hält fest, dass
+/// ihr Manifest innerhalb dessen liegt, was ihr Profil gewährt.
+///
+/// # Returns
+/// `None`, wenn die Basisrolle kein Profil hat.
+#[must_use]
+pub fn custom_registry_profile(
+    base_role: &str,
+    permissions: &Permissions,
+    generic_writer: bool,
+) -> Option<RegistryProfile> {
+    let base = if generic_writer {
+        GENERIC_WRITING_WORKER_PROFILE
+    } else {
+        profile_for_role(base_role)?
+    };
+    let base_tools = base.tool_names();
+    let uses_profile_tool = permissions
+        .tools
+        .iter()
+        .any(|tool| base_tools.contains(&tool.as_str()));
+    let needs_rights = permissions.filesystem.read
+        || permissions.filesystem.write
+        || permissions.shell
+        || permissions.host
+        || permissions.network.mode != NetworkMode::Off;
+    if !uses_profile_tool && !needs_rights {
+        return Some(RegistryProfile::NoTools);
+    }
+    Some(base)
+}
+
 /// Die Rechtedecke eines benutzerdefinierten Agenten.
 struct Ceiling<'a> {
     /// Eingebaute Rolle für namensgebundene Tabellen.
     base_role: &'a str,
     /// Die IR, unter die geklemmt wird.
-    ir: &'a ExecutableAgentIr,
+    ir: &'a AgentIr,
     /// Zusätzliche absolute Tiefenobergrenze.
     depth_cap: Option<u32>,
     /// Generischer schreibender Worker ([`GENERIC_WORKER_WRITE_TOOLS`],
@@ -529,18 +647,15 @@ struct Ceiling<'a> {
 /// `job.start` nur, wenn die (geklemmte) Definition `shell.exec` admittiert;
 /// die lesenden/steuernden Werkzeuge (`job.status/logs/stop/list/wait`)
 /// immer. In jedem Fall nur, was die Basis selbst admittiert.
-fn job_companion_tools<'a>(
-    clamped: &ExecutableAgentIr,
-    ceiling: &'a ExecutableAgentIr,
-) -> Vec<&'a str> {
+fn job_companion_tools<'a>(clamped: &AgentIr, ceiling: &'a AgentIr) -> Vec<&'a str> {
     let admits_shell = clamped
-        .tool_surface()
-        .admitted()
+        .tools
+        .admitted
         .iter()
         .any(|tool| tool == "shell.exec");
     ceiling
-        .tool_surface()
-        .admitted()
+        .tools
+        .admitted
         .iter()
         .map(String::as_str)
         .filter(|tool| crate::profile::JOB_TOOLS.contains(tool))
@@ -551,14 +666,14 @@ fn job_companion_tools<'a>(
 /// Bestimmt Basisrolle, Rechtedecke und optionale Tiefenobergrenze eines
 /// benutzerdefinierten Agenten. `None`, wenn keine passende Basis existiert.
 fn ceiling_for<'a>(
-    ir: &ExecutableAgentIr,
+    ir: &AgentIr,
     builtin_by_id: &HashMap<String, &'a str>,
     base_by_id: &HashMap<String, &'a str>,
-    builtin: &'a HashMap<String, ExecutableAgentIr>,
-    bases: &'a HashMap<String, ExecutableAgentIr>,
+    builtin: &'a HashMap<String, AgentIr>,
+    bases: &'a HashMap<String, AgentIr>,
 ) -> Option<Ceiling<'a>> {
     let ancestor = ir
-        .trace()
+        .trace
         .steps
         .iter()
         .rev()
@@ -573,11 +688,11 @@ fn ceiling_for<'a>(
                         .map(|name| Ancestor::Base(name))
                 })
         });
-    let role = ir.role();
+    let role = ir.role;
     match ancestor {
         Some(Ancestor::Role(name)) => {
             let ceiling = builtin.get(name)?;
-            (ceiling.role() == role).then_some(Ceiling {
+            (ceiling.role == role).then_some(Ceiling {
                 base_role: name,
                 ir: ceiling,
                 depth_cap: None,
@@ -600,25 +715,22 @@ fn ceiling_for<'a>(
 
 /// Die generische Decke einer Rolle ohne eingebaute Rolle in der Kette.
 ///
-/// Ein generischer Worker, dessen Definition `fs.write`/`fs.edit`
-/// admittiert, bekommt die Decke eines schreibenden Workers
-/// ([`GENERIC_WRITING_WORKER_PROFILE`] plus [`GENERIC_WORKER_WRITE_TOOLS`]
-/// über der Analyst-Decke); Shell und Netz bleiben draußen.
+/// Ein generischer Worker, dessen Rechte-Manifest Schreibzugriff trägt
+/// (`fs.write`/`fs.edit` admittiert, nicht verboten), bekommt die Decke eines
+/// schreibenden Workers ([`GENERIC_WRITING_WORKER_PROFILE`] plus
+/// [`GENERIC_WORKER_WRITE_TOOLS`] über der Analyst-Decke); Shell und Netz
+/// bleiben draußen.
 fn generic_ceiling<'a>(
-    ir: &ExecutableAgentIr,
-    builtin: &'a HashMap<String, ExecutableAgentIr>,
-    bases: &'a HashMap<String, ExecutableAgentIr>,
+    ir: &AgentIr,
+    builtin: &'a HashMap<String, AgentIr>,
+    bases: &'a HashMap<String, AgentIr>,
 ) -> Option<Ceiling<'a>> {
-    match ir.role() {
+    match ir.role {
         AgentRoleId::Worker => Some(Ceiling {
             base_role: GENERIC_WORKER_BASE,
             ir: builtin.get(GENERIC_WORKER_BASE)?,
             depth_cap: Some(GENERIC_WORKER_MAX_DEPTH),
-            writes: ir
-                .tool_surface()
-                .admitted()
-                .iter()
-                .any(|tool| GENERIC_WORKER_WRITE_TOOLS.contains(&tool.as_str())),
+            writes: ir.permissions.filesystem.write,
         }),
         AgentRoleId::UiaWorker => Some(Ceiling {
             base_role: GENERIC_UIA_WORKER_BASE,
@@ -639,62 +751,52 @@ fn generic_ceiling<'a>(
 /// Baut einen Roster-Eintrag aus einer (ggf. geklemmten) IR.
 fn entry_for(
     name: &str,
-    ir: &ExecutableAgentIr,
+    ir: Arc<AgentIr>,
     base_role: &str,
     profile: RegistryProfile,
-    description: Option<String>,
     source: RosterSource,
 ) -> RosterEntry {
-    let tools = ir.tool_surface().admitted().to_vec();
-    let writes = tools.iter().any(|tool| {
+    let tools = ir.tools.admitted.clone();
+    // Registry-genau über `tool_permission`, zusätzlich jedes schreibende
+    // oder ausführende Merkmal des Rechte-Manifests (#22 Welle 1B).
+    let writes_by_tool = tools.iter().any(|tool| {
         matches!(
             crate::authority::tool_permission(tool),
             Some(Permission::WriteWorkspace | Permission::ExecuteProcess)
         )
     });
+    let permissions = &ir.permissions;
+    let writes_by_manifest = permissions.filesystem.write
+        || permissions.shell
+        || permissions.host
+        || !permissions.filesystem.other_write_tools.is_empty();
     RosterEntry {
         name: name.to_owned(),
-        role: ir.role(),
-        description,
-        skills: ir.skills().to_vec(),
+        role: ir.role,
+        description: ir.description.clone(),
+        skills: ir.skill_names(),
         base_role: base_role.to_owned(),
         profile,
         tools,
-        read_only: !writes,
-        max_depth: ir.spawn_contract().max_depth(),
+        read_only: !(writes_by_tool || writes_by_manifest),
+        max_depth: ir.spawn.max_depth,
         budget_tokens: ir
-            .spawn_contract()
-            .budget()
-            .and_then(harw_agent_dsl::executable::BudgetSpec::max_tokens),
+            .spawn
+            .budget
+            .as_ref()
+            .and_then(|budget| budget.max_tokens),
         source,
+        ir,
     }
-}
-
-/// Die Beschreibung einer eingebauten Rolle aus ihrer TOML-Datei.
-fn builtin_description(name: &str) -> Option<String> {
-    static DESCRIPTIONS: OnceLock<HashMap<&'static str, String>> = OnceLock::new();
-    DESCRIPTIONS
-        .get_or_init(|| {
-            builtin_agent_toml()
-                .iter()
-                .filter_map(|(name, source)| {
-                    let raw = harw_agent_dsl::parse::parse_toml(source).ok()?;
-                    Some((*name, raw.description?))
-                })
-                .collect()
-        })
-        .get(name)
-        .cloned()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::embedded_agents::builtin_agent_definitions;
     use crate::test_support::{TestError, TestResult, ctx};
 
-    fn builtin() -> TestResult<HashMap<String, ExecutableAgentIr>> {
-        builtin_agent_definitions(&HashMap::new()).map_err(ctx("eingebaute Rollen senken"))
+    fn builtin() -> TestResult<HashMap<String, AgentIr>> {
+        builtin_agent_irs(OffsetDateTime::now_utc()).map_err(ctx("eingebaute Rollen senken"))
     }
 
     /// Schreibt `definitions` als Profil-Layer und entdeckt ihn.
@@ -770,7 +872,7 @@ max_tokens = 999999
             )
             .as_str(),
         )])?;
-        let roster = AgentRoster::from_config(&builtin, &config).map_err(ctx("Roster"))?;
+        let roster = AgentRoster::from_irs(&builtin, &config).map_err(ctx("Roster"))?;
         let entry = roster
             .entry("note-taker")
             .ok_or(TestError::Missing("note-taker muss startbar sein"))?;
@@ -788,9 +890,10 @@ max_tokens = 999999
         assert_eq!(entry.description.as_deref(), Some("Test-Worker note-taker"));
         assert_eq!(entry.max_depth, Some(GENERIC_WORKER_MAX_DEPTH));
         let analyst_budget = builtin[GENERIC_WORKER_BASE]
-            .spawn_contract()
-            .budget()
-            .and_then(harw_agent_dsl::executable::BudgetSpec::max_tokens);
+            .spawn
+            .budget
+            .as_ref()
+            .and_then(|budget| budget.max_tokens);
         assert_eq!(entry.budget_tokens, analyst_budget);
         assert_eq!(roster.base_role("note-taker"), Some(GENERIC_WORKER_BASE));
         let ir = roster
@@ -820,7 +923,7 @@ max_tokens = 999999
             )
             .as_str(),
         )])?;
-        let roster = AgentRoster::from_config(&builtin, &config).map_err(ctx("Roster"))?;
+        let roster = AgentRoster::from_irs(&builtin, &config).map_err(ctx("Roster"))?;
         let entry = roster
             .entry("report-writer")
             .ok_or(TestError::Missing("report-writer"))?;
@@ -868,16 +971,13 @@ role = "worker"
 specialization = "web-scout"
 "#,
         )])?;
-        let roster = AgentRoster::from_config(&builtin, &config).map_err(ctx("Roster"))?;
+        let roster = AgentRoster::from_irs(&builtin, &config).map_err(ctx("Roster"))?;
         let entry = roster
             .entry("web-scout")
             .ok_or(TestError::Missing("web-scout"))?;
         assert_eq!(entry.base_role, role_names::EXPLORER);
         assert_eq!(entry.profile, RegistryProfile::ReadOnlyExplore);
-        assert_eq!(
-            entry.tools,
-            builtin[role_names::EXPLORER].tool_surface().admitted()
-        );
+        assert_eq!(entry.tools, builtin[role_names::EXPLORER].tools.admitted);
         Ok(())
     }
 
@@ -909,7 +1009,7 @@ specialization = "web-scout"
                 .as_str(),
             ),
         ])?;
-        let roster = AgentRoster::from_config(&builtin, &config).map_err(ctx("Roster"))?;
+        let roster = AgentRoster::from_irs(&builtin, &config).map_err(ctx("Roster"))?;
         let runner = roster
             .entry("build-runner")
             .ok_or(TestError::Missing("build-runner"))?;
@@ -942,7 +1042,7 @@ specialization = "web-scout"
             )
             .as_str(),
         )])?;
-        let roster = AgentRoster::from_config(&builtin, &config).map_err(ctx("Roster"))?;
+        let roster = AgentRoster::from_irs(&builtin, &config).map_err(ctx("Roster"))?;
         let entry = roster
             .entry(role_names::EXPLORER)
             .ok_or(TestError::Missing("explorer"))?;
@@ -972,7 +1072,7 @@ specialization = "review-lead"
 targets = ["explorer", "analyst"]
 "#,
         )])?;
-        let roster = AgentRoster::from_config(&builtin, &config).map_err(ctx("Roster"))?;
+        let roster = AgentRoster::from_irs(&builtin, &config).map_err(ctx("Roster"))?;
         let entry = roster
             .entry("review-lead")
             .ok_or(TestError::Missing("review-lead"))?;
@@ -1026,9 +1126,178 @@ specialization = "fake-lead"
 "#,
             ),
         ])?;
-        let roster = AgentRoster::from_config(&builtin, &config).map_err(ctx("Roster"))?;
+        let roster = AgentRoster::from_irs(&builtin, &config).map_err(ctx("Roster"))?;
         assert!(roster.entry("own-root").is_none());
         assert!(roster.entry("fake-lead").is_none());
+        Ok(())
+    }
+
+    /// #22 Welle 1B: Instruktionen, Beschreibung und Rechte-Manifest eines
+    /// eigenen Agenten stammen aus seiner (geklemmten) IR; `system.md`
+    /// neben der Definition wird ohne `instructions_file` gefunden.
+    #[test]
+    fn custom_agent_entry_carries_the_clamped_ir_and_its_instructions() -> TestResult {
+        let builtin = builtin()?;
+        let home = tempfile::tempdir().map_err(ctx("tempdir"))?;
+        let dir = home.path().join("agents").join("note-taker");
+        std::fs::create_dir_all(&dir).map_err(ctx("Agentenordner"))?;
+        std::fs::write(
+            dir.join("definition.toml"),
+            worker(
+                "user.agent.note-taker@1",
+                "note-taker",
+                "harwness.agent.worker-base@1",
+                r#""fs.read", "fs.grep", "shell.exec""#,
+            ),
+        )
+        .map_err(ctx("definition.toml"))?;
+        std::fs::write(dir.join("system.md"), "Schreibe knappe Notizen.")
+            .map_err(ctx("system.md"))?;
+        let config =
+            harw_config::discover_config(&[home.path().to_path_buf()]).map_err(ctx("Discovery"))?;
+        let roster = AgentRoster::from_irs(&builtin, &config).map_err(ctx("Roster"))?;
+        let entry = roster
+            .entry("note-taker")
+            .ok_or(TestError::Missing("note-taker"))?;
+        assert_eq!(entry.instructions(), Some("Schreibe knappe Notizen."));
+        assert_eq!(
+            roster.instructions("note-taker"),
+            Some("Schreibe knappe Notizen.")
+        );
+        assert_eq!(entry.ir.tools.admitted, entry.tools);
+        assert!(
+            !entry.ir.permissions.shell,
+            "shell.exec liegt über der Decke"
+        );
+        assert!(entry.ir.verify_snapshot());
+        assert_eq!(
+            roster
+                .definitions()
+                .get("note-taker")
+                .map(ExecutableAgentIr::snapshot_id),
+            Some(ExecutableAgentIr::from(entry.ir.as_ref()).snapshot_id())
+        );
+        let wiring = roster.custom_wiring();
+        let wired = wiring
+            .get("note-taker")
+            .ok_or(TestError::Missing("wiring"))?;
+        assert_eq!(
+            wired.instructions.as_deref(),
+            Some("Schreibe knappe Notizen.")
+        );
+        assert!(entry.profile_summary().contains("read-only"));
+        Ok(())
+    }
+
+    /// #22 Welle 1B: ein eigener Worker, dessen Manifest kein Werkzeug des
+    /// Basisprofils und kein Recht braucht, bekommt `NoTools` statt des
+    /// Analyst-Profils — das Profil folgt dem Manifest, nie weiter als die
+    /// Basis.
+    #[test]
+    fn custom_profile_follows_the_manifest_and_never_widens() -> TestResult {
+        let builtin = builtin()?;
+        let (_home, config) = discover(&[(
+            "skill-reader",
+            worker(
+                "user.agent.skill-reader@1",
+                "skill-reader",
+                "harwness.agent.worker-base@1",
+                r#""skills.search""#,
+            )
+            .as_str(),
+        )])?;
+        let roster = AgentRoster::from_irs(&builtin, &config).map_err(ctx("Roster"))?;
+        let entry = roster
+            .entry("skill-reader")
+            .ok_or(TestError::Missing("skill-reader"))?;
+        assert_eq!(entry.profile, RegistryProfile::NoTools);
+        assert!(
+            RegistryProfile::NoTools
+                .required_permissions()
+                .is_subset_of(
+                    &profile_for_role(GENERIC_WORKER_BASE)
+                        .ok_or(TestError::Missing("analyst profile"))?
+                        .required_permissions()
+                )
+        );
+
+        let reader = builtin
+            .get(role_names::EXPLORER)
+            .ok_or(TestError::Missing("explorer"))?;
+        assert_eq!(
+            custom_registry_profile(role_names::EXPLORER, &reader.permissions, false),
+            Some(RegistryProfile::ReadOnlyExplore)
+        );
+        assert_eq!(
+            custom_registry_profile("unbekannt", &reader.permissions, false),
+            None
+        );
+        Ok(())
+    }
+
+    /// #22 Welle 1B, Gegenprobe: das Rechte-Manifest jeder eingebauten Rolle
+    /// liegt innerhalb dessen, was ihr Registry-Profil (plus die
+    /// rollengebundenen Composition-Werkzeuge) gewährt. Eine Abweichung
+    /// zwischen IR und Rollentabelle wird hier sichtbar.
+    #[test]
+    fn builtin_manifests_stay_within_their_registry_profiles() -> TestResult {
+        use crate::profile::{
+            child_message_tools_for_role, child_result_tools_for_role, composition_tools_for_role,
+            job_control_tools_for_role, knowledge_tools_for_role, matrix_tools_for_role,
+            parent_message_tools_for_role, skill_catalog_tools_for_role, sudo_tools_for_role,
+        };
+        let builtin = builtin()?;
+        assert_eq!(builtin.len(), role_names::ALL.len());
+        for (name, ir) in &builtin {
+            let profile = profile_for_role(name)
+                .ok_or_else(|| TestError::Unexpected(format!("{name}: kein Profil")))?;
+            let surface: Vec<&str> = profile
+                .tool_names()
+                .into_iter()
+                .chain(composition_tools_for_role(name).iter().copied())
+                .chain(knowledge_tools_for_role(name).iter().copied())
+                .chain(sudo_tools_for_role(name).iter().copied())
+                .chain(child_result_tools_for_role(name).iter().copied())
+                .chain(child_message_tools_for_role(name).iter().copied())
+                .chain(parent_message_tools_for_role(name).iter().copied())
+                .chain(matrix_tools_for_role(name).iter().copied())
+                .chain(skill_catalog_tools_for_role(name).iter().copied())
+                .chain(job_control_tools_for_role(name).iter().copied())
+                .collect();
+            let granted = crate::authority::permissions_of(&surface);
+            let manifest = &ir.permissions;
+            for tool in &manifest.tools {
+                assert!(
+                    surface.contains(&tool.as_str()),
+                    "{name}: Manifest-Werkzeug {tool} fehlt in {profile:?}"
+                );
+            }
+            if manifest.filesystem.write {
+                assert!(
+                    granted.contains(Permission::WriteWorkspace),
+                    "{name}: write"
+                );
+            }
+            if manifest.shell || manifest.host {
+                assert!(
+                    granted.contains(Permission::ExecuteProcess),
+                    "{name}: shell/host"
+                );
+            }
+            if manifest.network.mode != NetworkMode::Off {
+                assert!(
+                    granted.contains(Permission::NetworkAccess),
+                    "{name}: network"
+                );
+            }
+            if manifest.filesystem.read {
+                assert!(
+                    granted.contains(Permission::ReadWorkspace)
+                        || granted.contains(Permission::ReadCargoRegistry),
+                    "{name}: read"
+                );
+            }
+        }
         Ok(())
     }
 }

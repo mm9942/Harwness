@@ -143,6 +143,8 @@ pub trait AssemblyContributor: Send + Sync {
 ///   Wurzelsitzung, wenn `[browser].roles` `"root"` enthält.
 #[must_use]
 pub fn default_contributors() -> Vec<Arc<dyn AssemblyContributor>> {
+    // `mut` wird nur mit Feature `browser` gebraucht.
+    #[cfg_attr(not(feature = "browser"), allow(unused_mut))]
     let mut contributors: Vec<Arc<dyn AssemblyContributor>> =
         vec![Arc::new(crate::mcp_wiring::McpContributor)];
     #[cfg(feature = "browser")]

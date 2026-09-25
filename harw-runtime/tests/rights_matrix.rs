@@ -133,6 +133,8 @@ fn spec_for(entry: EntryKind, fixture: &Fixture) -> RuntimeSpec {
         reasoning_effort: None,
         approval_override: None,
         model_override: None,
+        embedded: None,
+        child_backend: None,
     }
 }
 
@@ -273,6 +275,19 @@ fn expected(entry: EntryKind) -> Expected {
             spawner_empty: true,
         },
         EntryKind::McpServe | EntryKind::JobPrompt | EntryKind::GatewayDream => Expected {
+            permissions: NONE,
+            tools_empty: true,
+            approval_chain: DEFAULT_AND_ASK,
+            ceiling_empty: true,
+            spawner_empty: true,
+        },
+        // #22 Welle 3A: `EntryKind::CompiledAgent` hat keine Tabellenzeile —
+        // `EntryKind::profile()` liefert dafür nur die engste Rückfallzeile
+        // (leere Rechte, `RegistryProfile::NoTools`); die tatsächliche Zeile
+        // entsteht zur Montagezeit aus dem Manifest
+        // (`EntryProfile::for_embedded`), nicht hier. `ALL_ENTRIES` ruft
+        // diesen Zweig deshalb nie auf; er hält nur `expected` erschöpfend.
+        EntryKind::CompiledAgent => Expected {
             permissions: NONE,
             tools_empty: true,
             approval_chain: DEFAULT_AND_ASK,
@@ -763,6 +778,57 @@ fn root_activation_matches_the_session_base_activation() -> TestResult {
     // Aktivierung geschnitten als die, unter der die Wurzel läuft (W2A-02).
     let base = root.session.base_activation();
     assert_eq!(base.profile(), harw_core::ToolProfile::Minimal);
+    Ok(())
+}
+
+/// #22 Welle 1B: die Wurzel bringt das Kontextprogramm ihrer Definition mit
+/// wie jedes Kind — geprüft gegen die Wurzeldecke — und die eröffnete
+/// Wurzelsitzung trägt es. Eine geschlossene Decke (Einstieg ohne Spawner)
+/// lässt die Wurzel ohne Programm laufen.
+#[test]
+fn the_root_session_carries_the_context_program_of_its_agent() -> TestResult {
+    let fixture = fixture()?;
+    let (events, _event_rx) = tokio::sync::mpsc::unbounded_channel::<SessionEventAlias>();
+    let state_store: Arc<dyn StateStore> = Arc::new(InMemoryStateStore::new());
+    let mut spec = spec_for(EntryKind::Analyze, &fixture);
+    spec.active_agent = Some(role_names::EXPLORER.to_owned());
+    let assembly = RuntimeAssembly::builder(spec)
+        .model(ModelSource::Echo("echo".to_owned()))
+        .stores(RuntimeStores {
+            state_store,
+            job_store: None,
+            approval_store: None,
+        })
+        .session_events(events.clone())
+        .build()
+        .map_err(ctx("montiert"))?;
+    let program = assembly
+        .root_context_program()
+        .cloned()
+        .ok_or(TestError::Missing("das Programm des Erkunders"))?;
+    assert_eq!(program.context_policy(), Some("harwness.context.explore@1"));
+    assert!(
+        program
+            .must_include()
+            .iter()
+            .any(|section| section == "task.objective")
+    );
+
+    let (turn_events, _turn_rx) = tokio::sync::mpsc::unbounded_channel::<TurnEventAlias>();
+    let root = assembly
+        .new_root_session(
+            assembly.root_session_id().clone(),
+            events,
+            turn_events,
+            None,
+        )
+        .map_err(ctx("Wurzelsitzung"))?;
+    assert_eq!(root.session.context_program(), Some(&program));
+
+    // Ohne Agenten-Programm (UIA-Fixture ohne `[context]`) bleibt es leer.
+    let plain = build_with_spec(spec_for(EntryKind::Analyze, &fixture))
+        .map_err(ctx("ohne Agent montiert"))?;
+    assert!(plain.root_context_program().is_none());
     Ok(())
 }
 

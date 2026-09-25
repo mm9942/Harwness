@@ -20,6 +20,9 @@ pub mod cancel;
 pub mod capture;
 // Runde 5, Teil O: Freigabe-Fragen von Kindern an die Nutzerin.
 pub mod child_approval;
+// Wave 3, part 3C: seam so `ManagedAgentSpawner` may delegate a child's run
+// to a job-backed `ChildBackend` instead of the in-process session.
+pub mod child_backend;
 // Runde 5, Teil M: Aktivitätsjournal, Endbericht und Eltern-Kind-Nachrichten.
 pub mod child_comms;
 pub mod child_controller;

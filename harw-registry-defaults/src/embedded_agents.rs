@@ -127,11 +127,21 @@
 //! Eine Rolle bindet ein Programm aus `agents/context-programs/` per
 //! `[context] program = "<name>"` (Name = Dateistamm, z. B. `"explore"`).
 //! [`builtin_agent_definitions`] löst es über
-//! `harw_agent_dsl::context_program::resolve_context_program` auf und schreibt
-//! es vor `lower` in die aufgelöste `[context]`-Tabelle; inline deklarierte
-//! Selektoren ergänzen das Programm. Ein unbekannter Name ist ein harter
-//! Fehler. Einzelheiten und die Grenze durch die Wurzel-Kontextdecke stehen
-//! bei `bind_context_program` und `ROOT_CEILING_SECTIONS`.
+//! `harw_agent_dsl::bind::bind_context_program` auf (seit #22 Welle 1 liegt
+//! die Bindung in der DSL-Crate; dieses Modul reicht nur die eingebaute
+//! Bibliothek und die Wurzeldecke hinein) und schreibt es vor `lower` in die
+//! aufgelöste `[context]`-Tabelle; inline deklarierte Selektoren ergänzen das
+//! Programm. Ein unbekannter Name ist ein harter Fehler. Einzelheiten und die
+//! Grenze durch die Wurzel-Kontextdecke stehen bei `bind_context_program` und
+//! `ROOT_CEILING_SECTIONS`.
+//!
+//! # IR v2
+//! [`builtin_agent_irs`] und [`builtin_base_irs`] senken dieselben Rollen über
+//! `harw_agent_dsl::lower_v2::compile_agent` zur typisierten
+//! [`AgentIr`]; [`builtin_context_program_library`] und
+//! [`builtin_source_files`] liefern die Eingaben dafür auch einzeln. Die
+//! Sicht `ExecutableAgentIr::from(&ir)` ist für jede eingebaute Rolle gleich
+//! dem Ergebnis von [`builtin_agent_definitions`].
 //!
 //! # Fehler
 //! Alle Fehler dieses Moduls sind
@@ -147,20 +157,22 @@
 use std::collections::HashMap;
 use std::sync::OnceLock;
 
-use harw_agent_dsl::context_program::{
-    RawContextProgramDefinition, ResolvedContextProgramDefinition, SectionStrength,
-    resolve_context_program,
-};
+use std::marker::PhantomData;
+
+use harw_agent_dsl::bind::ContextProgramLibrary as DslContextProgramLibrary;
+use harw_agent_dsl::context_program::RawContextProgramDefinition;
+use harw_agent_dsl::diagnostics::SourceFile;
 use harw_agent_dsl::error::DslError;
 use harw_agent_dsl::family::{RawFamilyDefinition, resolve_family};
 use harw_agent_dsl::ids::DefinitionId;
 use harw_agent_dsl::layers::DefinitionLayer;
+use harw_agent_dsl::lower_v2::{LowerSources, compile_agent};
 use harw_agent_dsl::organization::{RawOrganizationDefinition, resolve_organization};
 use harw_agent_dsl::parse::parse_toml;
 use harw_agent_dsl::raw::RawAgentDefinition;
 use harw_agent_dsl::resolve::resolve_definition;
 use harw_agent_dsl::roles::AgentRoleId;
-use harw_agent_dsl::{ExecutableAgentIr, lower};
+use harw_agent_dsl::{AgentIr, ExecutableAgentIr, lower};
 use include_dir::{Dir, DirEntry, File, include_dir};
 use time::OffsetDateTime;
 
@@ -660,6 +672,28 @@ pub fn builtin_agent_toml() -> &'static [(&'static str, &'static str)] {
 pub fn builtin_agent_definitions(
     existing: &HashMap<String, ExecutableAgentIr>,
 ) -> Result<HashMap<String, ExecutableAgentIr>, RegistryDefaultsError> {
+    // #22 Welle 1B: die eingebauten Rollen entstehen über IR v2; die
+    // Laufzeitsicht ist `ExecutableAgentIr::from(&ir)` (golden-geprüft gegen
+    // den Legacy-Pfad, siehe `builtin_agent_definitions_legacy`).
+    let irs = builtin_agent_irs(OffsetDateTime::now_utc())?;
+    let mut definitions = HashMap::with_capacity(irs.len());
+    for (name, ir) in &irs {
+        warn_on_local_collision(name, &ir.id, existing);
+        definitions.insert(name.clone(), ExecutableAgentIr::from(ir));
+    }
+    Ok(definitions)
+}
+
+/// Der frühere Senkpfad der eingebauten Rollen (`resolve` → Programmbindung →
+/// Legacy-`lower`), nur noch als Vergleichsbasis für die Golden-Tests
+/// (`tests/golden_ir.rs`): die IR-v2-Sicht muss ihm für jede Rolle gleichen.
+///
+/// # Fehler
+/// Wie [`builtin_agent_definitions`].
+#[doc(hidden)]
+pub fn builtin_agent_definitions_legacy(
+    existing: &HashMap<String, ExecutableAgentIr>,
+) -> Result<HashMap<String, ExecutableAgentIr>, RegistryDefaultsError> {
     require_worker_base(builtin_agent_toml())?;
     reject_duplicate_names(builtin_agent_toml(), "Agentenrolle")?;
 
@@ -747,6 +781,21 @@ fn warn_on_local_collision(
 /// Wie [`builtin_agent_definitions`].
 pub fn builtin_base_definitions()
 -> Result<HashMap<String, ExecutableAgentIr>, RegistryDefaultsError> {
+    // #22 Welle 1B: wie die Rollen über IR v2.
+    Ok(builtin_base_irs(OffsetDateTime::now_utc())?
+        .iter()
+        .map(|(name, ir)| (name.clone(), ExecutableAgentIr::from(ir)))
+        .collect())
+}
+
+/// Der frühere Senkpfad der Basis-Layer, nur als Vergleichsbasis der
+/// Golden-Tests (siehe [`builtin_agent_definitions_legacy`]).
+///
+/// # Fehler
+/// Wie [`builtin_agent_definitions`].
+#[doc(hidden)]
+pub fn builtin_base_definitions_legacy()
+-> Result<HashMap<String, ExecutableAgentIr>, RegistryDefaultsError> {
     let now = OffsetDateTime::now_utc();
     let programs = ContextProgramLibrary::parse(builtin_context_program_toml())?;
     let mut layers: Vec<(DefinitionLayer, RawAgentDefinition)> =
@@ -776,9 +825,6 @@ pub fn builtin_base_definitions()
 /// Reserviertes Root-Unterverzeichnis der Kontextprogramm-Bibliothek (siehe
 /// [`NON_ROLE_ROOT_DIRS`]).
 const CONTEXT_PROGRAMS_DIR: &str = "context-programs";
-
-/// Schlüssel der Programmbindung in der `[context]`-Tabelle einer Rolle.
-const CONTEXT_PROGRAM_KEY: &str = "program";
 
 /// Cache für [`builtin_context_program_toml`].
 static CONTEXT_PROGRAM_TOML: OnceLock<Vec<(&'static str, &'static str)>> = OnceLock::new();
@@ -864,13 +910,19 @@ pub fn builtin_context_program_toml() -> &'static [(&'static str, &'static str)]
         .as_slice()
 }
 
-/// Die geparste Kontextprogramm-Bibliothek: Name → ID plus der gemeinsame
-/// [`DefinitionLayer::BuiltIn`]-Stapel für `resolve_context_program`.
+/// Die geparste Kontextprogramm-Bibliothek — dünne Hülle um
+/// [`harw_agent_dsl::bind::ContextProgramLibrary`] (seit #22 Welle 1 liegt die
+/// Bindung in der DSL-Crate).
+///
+/// Die Hülle behält den Parser mit den benannten Fehlern dieses Moduls
+/// (`context-programs/<name>`, doppelte Namen) und setzt die Decke auf
+/// [`ROOT_CEILING_SECTIONS`].
 struct ContextProgramLibrary<'a> {
-    /// (Dateistamm, deklarierte ID) je Programm.
-    ids: Vec<(&'a str, DefinitionId)>,
-    /// Alle Programme als Layer, damit `extends` (auf `base`) auflöst.
-    layers: Vec<(DefinitionLayer, RawContextProgramDefinition)>,
+    /// Die Bibliothek der DSL-Crate.
+    inner: DslContextProgramLibrary,
+    /// Hält die Lebensdauer der Quellnamen fest (API-kompatibel zur früheren
+    /// Fassung, die die Namen entlieh).
+    _sources: PhantomData<&'a str>,
 }
 
 impl<'a> ContextProgramLibrary<'a> {
@@ -882,186 +934,157 @@ impl<'a> ContextProgramLibrary<'a> {
     /// eine Datei nicht als `harwness.context/v1` parst.
     fn parse(sources: &[(&'a str, &str)]) -> Result<Self, RegistryDefaultsError> {
         reject_duplicate_names(sources, "Kontextprogramm")?;
-        let mut ids = Vec::with_capacity(sources.len());
-        let mut layers = Vec::with_capacity(sources.len());
+        let mut inner =
+            DslContextProgramLibrary::new().with_ceiling_sections(ROOT_CEILING_SECTIONS);
         for (name, source) in sources {
+            let file_name = format!("{CONTEXT_PROGRAMS_DIR}/{name}");
             let raw = toml::from_str::<RawContextProgramDefinition>(source).map_err(|error| {
-                definition_error(
-                    &format!("{CONTEXT_PROGRAMS_DIR}/{name}"),
-                    dsl_error_from_toml(error.to_string()),
-                )
+                definition_error(&file_name, dsl_error_from_toml(error.to_string()))
             })?;
-            ids.push((*name, raw.id.clone()));
-            layers.push((DefinitionLayer::BuiltIn, raw));
+            inner
+                .insert(name, DefinitionLayer::BuiltIn, raw)
+                .map_err(|error| definition_error(&file_name, error))?;
         }
-        Ok(Self { ids, layers })
+        Ok(Self {
+            inner,
+            _sources: PhantomData,
+        })
     }
 
-    /// Löst das Programm `name` über `resolve_context_program` auf.
-    ///
-    /// # Errors
-    /// [`DslError::Parse`], wenn kein Programm so heißt (die Meldung nennt die
-    /// bekannten Namen) oder die Auflösung scheitert.
+    /// Löst das Programm `name` auf (siehe
+    /// [`harw_agent_dsl::bind::ContextProgramLibrary::resolve`]).
+    #[cfg(test)]
     fn resolve(
         &self,
         name: &str,
         now: OffsetDateTime,
-    ) -> Result<ResolvedContextProgramDefinition, DslError> {
-        let Some((_, id)) = self.ids.iter().find(|(known, _)| *known == name) else {
-            let known: Vec<&str> = self.ids.iter().map(|(known, _)| *known).collect();
-            return Err(DslError::Parse(format!(
-                "unbekanntes Kontextprogramm '{name}' in [context].{CONTEXT_PROGRAM_KEY} — bekannt sind: {}",
-                known.join(", ")
-            )));
-        };
-        resolve_context_program(id, &self.layers, now).map_err(|error| {
-            DslError::Parse(format!(
-                "Kontextprogramm '{name}' lässt sich nicht auflösen: {error}"
-            ))
-        })
+    ) -> Result<harw_agent_dsl::context_program::ResolvedContextProgramDefinition, DslError> {
+        self.inner.resolve(name, now)
     }
 }
 
-/// Die `[context]`-Tabelle einer TOML-Tabelle, falls vorhanden.
-fn context_table(tables: &toml::Table) -> Option<&toml::Table> {
-    tables.get("context").and_then(toml::Value::as_table)
-}
-
-/// Liest eine String-Liste aus `table[field]`; fehlt sie, ist sie leer.
-fn table_strings(table: Option<&toml::Table>, field: &str) -> Vec<String> {
-    table
-        .and_then(|table| table.get(field))
-        .and_then(toml::Value::as_array)
-        .map(|values| {
-            values
-                .iter()
-                .filter_map(toml::Value::as_str)
-                .map(str::to_owned)
-                .collect()
-        })
-        .unwrap_or_default()
-}
-
-/// Liest die explizite Kontext-Politik (`policy` bzw. `context_policy`).
-fn table_policy(table: Option<&toml::Table>) -> Option<String> {
-    let table = table?;
-    ["policy", "context_policy"]
-        .iter()
-        .find_map(|field| table.get(*field).and_then(toml::Value::as_str))
-        .map(str::to_owned)
-}
-
-/// Hängt `value` an, sofern noch nicht enthalten.
-fn push_unique(list: &mut Vec<String>, value: &str) {
-    if !list.iter().any(|existing| existing == value) {
-        list.push(value.to_owned());
-    }
-}
-
-/// Der gebundene Programmname: zuerst aus den eigenen Tabellen der Rolle,
-/// sonst aus der aufgelösten Config (geerbt oder eigene Sektion ohne Basis).
+/// Die eingebaute Kontextprogramm-Bibliothek als DSL-Typ, zum Weiterreichen
+/// an [`harw_agent_dsl::lower_v2::LowerSources::with_context_programs`].
+///
+/// # Beschreibung
+/// Enthält alle Programme aus `agents/context-programs/` auf
+/// [`DefinitionLayer::BuiltIn`], mit der Wurzeldecke dieses Moduls. Eigene
+/// Programme höherer Schichten fügt der Aufrufer per
+/// [`harw_agent_dsl::bind::ContextProgramLibrary::insert_sources`] hinzu.
 ///
 /// # Errors
-/// [`DslError::Toml`], wenn `program` kein String ist.
-fn context_program_name(
-    own_tables: &toml::Table,
-    resolved_config: &toml::Table,
-) -> Result<Option<String>, DslError> {
-    let value = context_table(own_tables)
-        .and_then(|table| table.get(CONTEXT_PROGRAM_KEY))
-        .or_else(|| {
-            context_table(resolved_config).and_then(|table| table.get(CONTEXT_PROGRAM_KEY))
-        });
-    match value {
-        None => Ok(None),
-        Some(toml::Value::String(name)) => Ok(Some(name.clone())),
-        Some(other) => Err(DslError::Toml(format!(
-            "[context].{CONTEXT_PROGRAM_KEY} muss ein String sein, gefunden: {}",
-            other.type_str()
-        ))),
-    }
+/// Wie [`builtin_agent_definitions`] für eine defekte Programmdatei.
+pub fn builtin_context_program_library() -> Result<DslContextProgramLibrary, RegistryDefaultsError>
+{
+    Ok(ContextProgramLibrary::parse(builtin_context_program_toml())?.inner)
 }
 
 /// Bindet das per `[context] program = "<name>"` benannte Kontextprogramm
 /// in die aufgelöste Config, bevor `lower` sie liest.
 ///
 /// # Beschreibung
-/// Ohne Bindung bleibt `resolved_config` unverändert. Mit Bindung entsteht
-/// eine neue `[context]`-Tabelle:
-///
-/// - `policy`: eine inline gesetzte `policy`/`context_policy` gewinnt, sonst
-///   die kanonische ID des Programms (z. B. `harwness.context.explore@1`).
-/// - `must_include`: zuerst die `must-include`-Sektionen des aufgelösten
-///   Programms in Deklarationsreihenfolge, soweit [`ROOT_CEILING_SECTIONS`]
-///   sie zulässt, danach die inline deklarierten Selektoren (geerbt aus der
-///   Basis, dann die eigenen der Rolle). Doppelte werden entfernt.
-/// - `exclude`: zuerst die Ausschlüsse des Programms, danach die inline
-///   deklarierten. Ein Programm-Ausschluss, den die Rolle inline exakt als
-///   `must_include` führt, entfällt: inline gewinnt.
+/// Dünne Hülle um [`harw_agent_dsl::bind::bind_context_program`] (dort die
+/// vollständige Regel für `policy`, `must_include` und `exclude`). Die
+/// Rückgabe der DSL-Funktion — das vollständige Programm mit Detailmodus und
+/// Vertrauensklasse je Sektion — braucht der Legacy-Pfad nicht; IR v2
+/// ([`builtin_agent_irs`]) trägt sie.
 ///
 /// # Errors
 /// - [`DslError::Toml`]: `program` ist kein String.
-/// - [`DslError::Parse`]: kein eingebautes Programm trägt diesen Namen, oder
-///   seine Auflösung scheitert. Ein unbekannter Name ist ein harter Fehler,
-///   kein stiller Rückfall auf die Basis.
+/// - [`DslError::UnknownContextProgram`] /
+///   [`DslError::ContextProgramResolution`]: kein eingebautes Programm trägt
+///   diesen Namen, oder seine Auflösung scheitert. Ein unbekannter Name ist
+///   ein harter Fehler, kein stiller Rückfall auf die Basis.
 fn bind_context_program(
     own_tables: &toml::Table,
     resolved_config: &mut toml::Table,
     programs: &ContextProgramLibrary<'_>,
     now: OffsetDateTime,
 ) -> Result<(), DslError> {
-    let Some(name) = context_program_name(own_tables, resolved_config)? else {
-        return Ok(());
-    };
-    let program = programs.resolve(&name, now)?;
+    harw_agent_dsl::bind::bind_context_program(own_tables, resolved_config, &programs.inner, now)
+        .map(|_| ())
+}
 
-    let inherited = context_table(resolved_config);
-    let own = context_table(own_tables);
+/// Die eingebetteten Rollen- und Basisdefinitionen als Quelldateien für
+/// [`harw_agent_dsl::lower_v2::compile_agent`].
+///
+/// # Beschreibung
+/// Der Pfad jeder Datei ist `builtin/<name>.toml` — ein Etikett für Spannen
+/// in Diagnosen, kein Dateisystempfad (der eingebettete Baum hat keinen).
+/// Alle Dateien liegen auf [`DefinitionLayer::BuiltIn`].
+#[must_use]
+pub fn builtin_source_files() -> Vec<SourceFile> {
+    builtin_agent_toml()
+        .iter()
+        .map(|(name, source)| {
+            SourceFile::new(
+                DefinitionLayer::BuiltIn,
+                format!("builtin/{name}.toml"),
+                *source,
+            )
+        })
+        .collect()
+}
 
-    let mut inline_must_include = table_strings(inherited, "must_include");
-    for selector in table_strings(own, "must_include") {
-        push_unique(&mut inline_must_include, &selector);
-    }
-    let mut inline_exclude = table_strings(inherited, "exclude");
-    for selector in table_strings(own, "exclude") {
-        push_unique(&mut inline_exclude, &selector);
-    }
-    let policy = table_policy(own)
-        .or_else(|| table_policy(inherited))
-        .unwrap_or_else(|| program.id.to_string());
+/// Senkt die eingebauten Rollen über IR v2 ([`AgentIr`], #22 Welle 1).
+///
+/// # Beschreibung
+/// Dieselbe Auswahl wie [`builtin_agent_definitions`] (alle Rollen aus
+/// [`role_names::ALL`]), aber über
+/// [`harw_agent_dsl::lower_v2::compile_agent`] mit der eingebauten
+/// Kontextprogramm-Bibliothek. `ExecutableAgentIr::from(&ir)` ergibt für jede
+/// Rolle dieselbe IR wie [`builtin_agent_definitions`] (Test
+/// `test_v2_view_equals_legacy_lowering_for_every_builtin`).
+///
+/// # Argumente
+/// - `now` (`OffsetDateTime`): Zeitstempel der Auflösungsschritte im Trace.
+///
+/// # Errors
+/// - [`RegistryDefaultsError::AgentDefinition`]: Basis fehlt, doppelte Namen,
+///   defekte Programmdatei.
+/// - [`RegistryDefaultsError::AgentIr`]: das Senken einer Rolle meldet
+///   Fehlerdiagnosen.
+pub fn builtin_agent_irs(
+    now: OffsetDateTime,
+) -> Result<HashMap<String, AgentIr>, RegistryDefaultsError> {
+    builtin_irs(role_names::ALL, now)
+}
 
-    let mut must_include: Vec<String> = Vec::new();
-    for section in &program.sections {
-        if section.strength == SectionStrength::MustInclude
-            && ROOT_CEILING_SECTIONS.contains(&section.name.as_str())
-        {
-            push_unique(&mut must_include, &section.name);
+/// Wie [`builtin_agent_irs`], für die Basis-Layer ([`BASE_DEFINITION_NAMES`]).
+///
+/// # Errors
+/// Wie [`builtin_agent_irs`].
+pub fn builtin_base_irs(
+    now: OffsetDateTime,
+) -> Result<HashMap<String, AgentIr>, RegistryDefaultsError> {
+    builtin_irs(BASE_DEFINITION_NAMES, now)
+}
+
+/// Senkt die eingebauten Definitionen `names` über IR v2.
+fn builtin_irs(
+    names: &[&str],
+    now: OffsetDateTime,
+) -> Result<HashMap<String, AgentIr>, RegistryDefaultsError> {
+    require_worker_base(builtin_agent_toml())?;
+    reject_duplicate_names(builtin_agent_toml(), "Agentenrolle")?;
+    let library = builtin_context_program_library()?;
+    let files = builtin_source_files();
+    let sources = LowerSources::new(&files).with_context_programs(&library);
+    let mut irs = HashMap::with_capacity(names.len());
+    for (name, source) in builtin_agent_toml() {
+        if !names.contains(name) {
+            continue;
         }
+        let raw = parse_toml(source).map_err(|error| definition_error(name, error))?;
+        let ir = compile_agent(&raw.id, &sources, now).map_err(|diagnostics| {
+            RegistryDefaultsError::AgentIr {
+                name: (*name).to_owned(),
+                diagnostics: Box::new(diagnostics),
+            }
+        })?;
+        irs.insert((*name).to_owned(), ir);
     }
-    for selector in &inline_must_include {
-        push_unique(&mut must_include, selector);
-    }
-
-    let mut exclude: Vec<String> = Vec::new();
-    for selector in &program.exclude {
-        if !inline_must_include.contains(selector) {
-            push_unique(&mut exclude, selector);
-        }
-    }
-    for selector in &inline_exclude {
-        push_unique(&mut exclude, selector);
-    }
-
-    let to_array = |values: Vec<String>| {
-        toml::Value::Array(values.into_iter().map(toml::Value::String).collect())
-    };
-    let mut context = toml::Table::new();
-    context.insert(CONTEXT_PROGRAM_KEY.to_owned(), toml::Value::String(name));
-    context.insert("policy".to_owned(), toml::Value::String(policy));
-    context.insert("must_include".to_owned(), to_array(must_include));
-    context.insert("exclude".to_owned(), to_array(exclude));
-    resolved_config.insert("context".to_owned(), toml::Value::Table(context));
-    Ok(())
+    Ok(irs)
 }
 
 /// Baut den typisierten Fehler für eine benannte eingebaute Definition.
@@ -1073,7 +1096,7 @@ fn bind_context_program(
 fn definition_error(name: &str, source: DslError) -> RegistryDefaultsError {
     RegistryDefaultsError::AgentDefinition {
         name: name.to_owned(),
-        source,
+        source: Box::new(source),
     }
 }
 
@@ -1555,7 +1578,24 @@ mod tests {
 
     use super::*;
     use crate::test_support::{TestError, TestResult, ctx};
+    use harw_agent_dsl::context_program::{ResolvedContextProgramDefinition, SectionStrength};
     use harw_agent_dsl::organization::{CellBarrier, CellKind, CellWritePartition};
+
+    /// Liest eine String-Liste aus `table[field]`; fehlt sie, ist sie leer
+    /// (Testhilfe; die Bindung selbst liegt in `harw_agent_dsl::bind`).
+    fn table_strings(table: Option<&toml::Table>, field: &str) -> Vec<String> {
+        table
+            .and_then(|table| table.get(field))
+            .and_then(toml::Value::as_array)
+            .map(|values| {
+                values
+                    .iter()
+                    .filter_map(toml::Value::as_str)
+                    .map(str::to_owned)
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
 
     fn builtin() -> TestResult<HashMap<String, ExecutableAgentIr>> {
         builtin_agent_definitions(&HashMap::new())
@@ -2148,7 +2188,7 @@ mod tests {
                 "{role}: read-only Kinder dürfen nie auf eine Rückfrage warten"
             );
             assert!(ir.lifecycle_machine().allow_rerun(), "{role}");
-            assert_eq!(ir.lifecycle_machine().max_attempts(), Some(2), "{role}");
+            assert_eq!(ir.lifecycle_machine().max_attempts(), Some(4), "{role}");
             assert!(
                 ir.return_pipeline().contract().is_some(),
                 "{role} braucht einen Rückgabevertrag"

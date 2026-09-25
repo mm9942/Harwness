@@ -1,0 +1,238 @@
+{
+  "schema": "harwness.agent-ir/v2",
+  "id": "harwness.agent.source-researcher@1",
+  "version": "1.0.0",
+  "name": "Source Researcher",
+  "description": "Finds primary-source documentation, release notes, and repository evidence.",
+  "role": "worker",
+  "specialization": "source-researcher",
+  "reasoning_effort": null,
+  "authority": {
+    "capabilities": []
+  },
+  "instructions": {
+    "text": "# source-researcher\n\nFinds primary-source documentation, release notes, and repository evidence.\n\nAccept only the declared task scope. State assumptions, preserve relevant evidence, and return concise findings, changed paths (if any), verification performed, residual risks, and blockers. Never expand privileges, alter unrelated files, or represent a hypothesis as a fact. Stop and escalate when approval, a broader scope, or a security decision is required.\n\n## Was ich NICHT tue\n\nKeine Agenten spawnen, keine Rechte ausweiten, keine fremden Dateien ändern. Keine Sekundärquellen als Beleg, wenn eine Primärquelle existiert; nichts ändern oder installieren; nichts aus dem Gedächtnis zitieren.\n\n## Umfang pro Lauf\n\nNur der erklärte Auftrag; Budget und Laufzeitgrenze (`timeout_seconds = 240`) sind hart. Stoppe und gib zurück, sobald jede Aussage eine Primärquelle hat, das Budget knapp wird oder Freigabe, breiterer Scope bzw. eine Sicherheitsentscheidung nötig ist.\n\n## Übergabe\n\nAn den Auftraggeber nach Return-Contract: Aussagen mit Primärquelle (URL/Pfad, Version, Datum); dazu Annahmen, durchgeführte Prüfung, Restrisiken, Blocker. Keine Rohausgaben, keine Wiederholung des Auftrags.\n",
+    "source": "system.md",
+    "blake3": "d8ef91bb8b9c36bd62d337a4366e9763b963a8e1cb2441d1d2ac43bf6969b0c0"
+  },
+  "tools": {
+    "admitted": [
+      "fs.read",
+      "fs.list",
+      "fs.search",
+      "fs.glob",
+      "fs.grep",
+      "doc.read_pdf",
+      "explore.tree",
+      "explore.projects",
+      "explore.relations",
+      "explore.find",
+      "web.fetch",
+      "web.search",
+      "workbench.show",
+      "diary.read",
+      "palace.search",
+      "palace.recall",
+      "parent.message",
+      "skills.search",
+      "skills.load"
+    ],
+    "forbidden": [
+      "fs.write",
+      "fs.edit",
+      "shell.exec",
+      "deps.graph",
+      "deps.locked",
+      "deps.source_read",
+      "deps.source_search",
+      "deps.source_list",
+      "web.docs_rs",
+      "web.crates_io",
+      "lens.ask"
+    ]
+  },
+  "spawn": {
+    "max_depth": 1,
+    "child_orchestrators": [],
+    "delegation_targets": null,
+    "workspace_hint": null,
+    "budget": {
+      "max_tokens": 60000,
+      "max_tool_calls": 40,
+      "max_wall_secs": 180,
+      "effort_cap": null
+    }
+  },
+  "job": {
+    "goal_kind": null
+  },
+  "lifecycle": {
+    "allow_pause": false,
+    "allow_rerun": true,
+    "max_attempts": 4
+  },
+  "context": {
+    "program": null,
+    "program_id": null,
+    "policy": null,
+    "sections": [],
+    "must_include": [
+      "task.objective",
+      "task.read_scope",
+      "new.trigger_return"
+    ],
+    "exclude": [
+      "full_parent_transcript",
+      "sibling_transcripts"
+    ],
+    "deferred": []
+  },
+  "return": {
+    "contract": "harwness.return.research-finding@1",
+    "validators": []
+  },
+  "models": null,
+  "limits": null,
+  "work": {
+    "mode": "read-only-research",
+    "may_write_code": false,
+    "may_research_web": true,
+    "may_change_plan": null,
+    "aggregates_child_returns": null
+  },
+  "research": {
+    "sources": [
+      "official-docs",
+      "standards",
+      "reports",
+      "workspace-documents",
+      "web"
+    ],
+    "freshness": "required",
+    "primary_sources_required": true,
+    "output": "verified-research-records",
+    "ecosystems": [],
+    "may_write_code": null,
+    "tradecraft": [
+      "hypotheses",
+      "key-assumptions",
+      "source-grading",
+      "likelihood-vs-confidence"
+    ]
+  },
+  "verification": null,
+  "skills": {
+    "entries": [
+      {
+        "name": "dependency-research",
+        "hash": null
+      }
+    ]
+  },
+  "binary": {
+    "name": "source-researcher",
+    "interfaces": [
+      "cli"
+    ],
+    "default_interface": "cli"
+  },
+  "permissions": {
+    "tools": [
+      "diary.read",
+      "doc.read_pdf",
+      "explore.find",
+      "explore.projects",
+      "explore.relations",
+      "explore.tree",
+      "fs.glob",
+      "fs.grep",
+      "fs.list",
+      "fs.read",
+      "fs.search",
+      "palace.recall",
+      "palace.search",
+      "parent.message",
+      "skills.load",
+      "skills.search",
+      "web.fetch",
+      "web.search",
+      "workbench.show"
+    ],
+    "forbidden_tools": [
+      "deps.graph",
+      "deps.locked",
+      "deps.source_list",
+      "deps.source_read",
+      "deps.source_search",
+      "fs.edit",
+      "fs.write",
+      "lens.ask",
+      "shell.exec",
+      "web.crates_io",
+      "web.docs_rs"
+    ],
+    "capabilities": [],
+    "filesystem": {
+      "read": true,
+      "write": false,
+      "write_paths": [],
+      "other_write_tools": []
+    },
+    "network": {
+      "mode": "allowlist",
+      "tools": [
+        "web.fetch",
+        "web.search"
+      ],
+      "hosts": []
+    },
+    "shell": false,
+    "host": false,
+    "spawn": {
+      "max_depth": 1,
+      "child_orchestrators": [],
+      "delegation_targets": []
+    },
+    "budget": {
+      "max_tokens": 60000,
+      "max_tool_calls": 40,
+      "max_wall_secs": 180,
+      "effort_cap": null
+    },
+    "required_env": []
+  },
+  "trace": {
+    "steps": [
+      {
+        "source": "harwness.agent.worker-base@1",
+        "kind": "patch",
+        "applied_at": "1970-01-01T00:00:00Z"
+      },
+      {
+        "source": "harwness.agent.worker-base@1",
+        "kind": "base",
+        "applied_at": "1970-01-01T00:00:00Z"
+      },
+      {
+        "source": "harwness.agent.researcher@1",
+        "kind": "patch",
+        "applied_at": "1970-01-01T00:00:00Z"
+      },
+      {
+        "source": "harwness.agent.researcher@1",
+        "kind": "base",
+        "applied_at": "1970-01-01T00:00:00Z"
+      },
+      {
+        "source": "harwness.agent.source-researcher@1",
+        "kind": "patch",
+        "applied_at": "1970-01-01T00:00:00Z"
+      }
+    ],
+    "diagnostics": []
+  },
+  "snapshot": {
+    "domain": "harwness.agent-ir.snapshot/v7",
+    "digest": "f995cf11974858e48759351bf94ae6880dd55f4664a0f727b020658a4087fe36"
+  }
+}

@@ -2,7 +2,7 @@
 
 # Harwness Agent Definition DSL
 
-> Status: partially implemented · Last reviewed: 2026-09-24
+> Status: partially implemented · Last reviewed: 2026-09-25
 
 **Status:** Normative design draft  
 **Scope:** User-extensible TOML definitions for roles, specializations, families, clans, cells, context policies, return contracts, and organization templates  
@@ -281,6 +281,26 @@ intersect = ["filesystem.read", "filesystem.write.scoped", "process.spawn.sandbo
 
 Attempts to append authority fail validation.
 
+**Implementation status (IR v2, #22 wave 1).** All seven operators are
+implemented in `harw-agent-dsl/src/merge.rs`, which is authoritative:
+
+| Operator | Applies to | Result |
+|---|---|---|
+| `replace` | any value | the given value |
+| `append` / `prepend` | arrays | given elements after / before the inherited ones |
+| `remove` | arrays | inherited elements minus the given ones |
+| `intersect` | arrays | only elements present in both |
+| `min` | numbers | the smaller of the inherited and the given value; a patch can only tighten |
+| `max-within-parent` | numbers | the given value, but never more than the parent's value; asking for more is a diagnostic, not a silent clamp |
+
+Patch paths may be nested. `[patch.context.must_include]` addresses the
+key `must_include` inside `[context]`, and `[patch.limits]` with
+`max_tool_calls = { min = 24 }` addresses a single key of `[limits]`.
+A path that does not name an inherited field, an operator applied to a
+value of the wrong type, and a non-reducing operator on an
+authority-bearing set are all errors with a `HARW-PATCH-*` or `HARW-AUTH-*`
+diagnostic (§20). Earlier versions ignored nested patch paths silently.
+
 ---
 
 ## 8. Core Agent Definition Syntax
@@ -349,6 +369,80 @@ max_tool_calls = 40
 max_agent_tool_calls = 4
 max_wall_time_seconds = 1800
 ```
+
+Under IR v2 every table above is lowered into a typed section of `AgentIr`
+([`agent-ir-v1.md`](agent-ir-v1.md) §6) or rejected with a diagnostic. No
+table is read out of band, and none is dropped silently.
+
+### 8.1 Model preferences: `[models]`
+
+`[models]` states which model an agent prefers and what it needs at
+runtime. It is lowered into the `Models` section of `AgentIr`; the
+compiler's `ResolveModels` pass copies `required_env` into the rights
+manifest of a compiled agent.
+
+```toml
+[models]
+provider = "anthropic"
+model = "claude-sonnet-5"
+effort = "high"
+fallbacks = ["openai/gpt-5.6-codex", "ollama/qwen3-coder"]
+required_env = ["ANTHROPIC_API_KEY"]
+```
+
+| Key | Type | Meaning |
+|---|---|---|
+| `provider` | string | preferred provider id |
+| `model` | string | preferred model id at that provider |
+| `effort` | string | reasoning effort: `minimal`, `low`, `medium`, `high`, `xhigh` or `max` |
+| `fallbacks` | array of `"provider/model"` | tried in order when the preferred model is unavailable |
+| `required_env` | array of strings | environment variables the agent needs (for example API keys); read through `env:` references, never stored in the definition or an artifact |
+
+Model preferences are behavior, not authority (§19): a user overlay may
+change them, and a runtime without the preferred model falls back or
+reports an error instead of running a different agent.
+
+### 8.2 Binary settings: `[binary]`
+
+`[binary]` configures the standalone binary that `harw agent build`
+produces from this definition (**planned in #22**, see
+[ADR 0001](../adr/0001-agent-compiler.md) and the
+[agent compiler guide](../guides/agent-compiler.md)). It is lowered into the
+`Binary` section of `AgentIr` and has no effect when the definition runs
+inside harw.
+
+```toml
+[binary]
+name = "evidence-critic"
+interfaces = ["cli", "mcp"]
+default_interface = "cli"
+child_execution = "job"
+```
+
+| Key | Type | Meaning |
+|---|---|---|
+| `name` | string | file name of the built binary and name it reports on `--version`; defaults to the specialization |
+| `interfaces` | array | interfaces built in by default: `cli` (one-shot), `repl`, `mcp`, `http`, `tui` |
+| `default_interface` | string | the interface used when none is chosen at runtime; must be one of `interfaces` |
+| `child_execution` | string | how the binary runs its child agents: `"job"` or `"in-process"`; defaults to `"job"` |
+
+`harw agent build --interface …` overrides `interfaces` for one build; at
+runtime `--interface` picks one of the interfaces that were built in. An
+unknown interface name, an empty list and a `default_interface` outside
+the list are `HARW-BINARY-*` errors (§20).
+
+`child_execution` controls how a compiled binary starts its child agents
+(delegation targets and child orchestrators). `"job"`, the default for
+compiled binaries, starts each child as a separate process through the job
+system (`harw-tool-job`): the same binary re-invoked as
+`--child <agent-id> --child-protocol stdio`, with process group control,
+logs and crash containment. `"in-process"` keeps the legacy in-process
+spawner instead. Inside harw itself, child agents always run in-process
+regardless of this key — it only takes effect in a compiled binary. An
+unknown `child_execution` value is `HARW-BINARY-006`. The default `"job"`
+never appears in the IR JSON and never changes the v7 snapshot hash (§18):
+it is written into `AgentIr` only when a definition sets it explicitly to
+something other than `"job"`.
 
 ---
 
@@ -920,6 +1014,35 @@ The UIA may help author definitions, but it only proposes file changes.
 
 The runtime validates and persists them.
 
+### 16.1 The `harw agent` compiler commands
+
+> Status: **planned in #22** (wave 2). The `harwness agent …` lines above
+> remain illustrative; the commands below are the decided CLI surface.
+
+The compiler is exposed as four subcommands of `harw agent`:
+
+```text
+harw agent check   <name|path>                       # diagnostics only
+harw agent build   <name|path> [--interface cli,repl,mcp,http,tui]
+                               [--native] [-o <out>] [--target <triple>]
+harw agent inspect <binary|artifact>                 # manifest, hash, interfaces, skills
+harw agent run     <artifact> [task]                 # run an artifact without building
+```
+
+- `check` runs the pipeline of §17 up to and including the compiler passes
+  and prints diagnostics (§20). It exits non-zero on any error.
+- `build` also runs a backend (§17) and writes one executable. Builds run
+  as a job with progress in the panel.
+- `inspect` reads an artifact or a built binary and shows its rights
+  manifest, artifact hash, interfaces and embedded skills. It verifies the
+  hash first.
+- `run` executes an artifact directly, with the same rights rules as a
+  built binary.
+
+Inside harw, `/agent build` offers the same build, and agents may call an
+`agents.build` tool. That tool carries rights like `shell.exec` and always
+needs approval. User guide: [`guides/agent-compiler.md`](../guides/agent-compiler.md).
+
 ---
 
 ## 17. Definition Compiler Pipeline
@@ -944,6 +1067,37 @@ discover
 → compute definition hash
 → compile typed definition
 ```
+
+**IR v2 and the agent compiler.** With [ADR 0001](../adr/0001-agent-compiler.md)
+the pipeline becomes concrete. Stages 1–3 exist inside harw; stages 4–5
+belong to `harw-agent-compiler` and are **planned in #22**.
+
+```text
+1. frontend     discover → parse → resolve IDs and versions → load base
+                → apply mixins → apply patches (all §7 operators, nested paths)
+                (harw-agent-dsl: parse.rs, resolve.rs, merge.rs)
+2. lowering     lower_v2(resolved, sources) → AgentIr
+                schema "harwness.agent-ir/v2"; every table lowered or rejected;
+                instructions and context programs bound; snapshot hash v7
+3. view         ExecutableAgentIr = From<&AgentIr>  → runtime inside harw
+4. passes       ValidateRoles     role and spawn matrix admissible
+                RightsCheck       manifest ≤ base role ≤ author ceiling
+                ResolveSkills     skills from the SkillIndex, content embedded
+                ReachableTools    tool providers the admitted tools need
+                PruneUnusedTools  drop providers nothing reaches
+                ResolveModels     model preferences; required env into the manifest
+5. backend      A (default): artifact appended to the prebuilt harw-agent-runner
+                B (--native): generated Rust crate, only needed features, cargo build
+```
+
+Every stage reports diagnostics with stable codes (§20) and stops at the
+first stage that produced an error. Both backends embed the same artifact
+([`agent-artifact-v1.md`](agent-artifact-v1.md)), so the artifact hash
+does not depend on the backend.
+
+The Rust types below are the original design sketch. The implemented IR
+is `AgentIr` ([`agent-ir-v1.md`](agent-ir-v1.md) §6); the typed
+`CompiledAgentDefinition<R, S>` remains a design direction.
 
 Rust representations:
 
@@ -1030,6 +1184,22 @@ propose definition upgrade
 → resume with migrated definitions
 ```
 
+**IR v2.** The resolved snapshot is the canonical JSON of `AgentIr`, and
+the definition hash is its v7 snapshot hash, which covers the version, the
+instructions, the skill content hashes and the rights manifest
+([`agent-ir-v1.md`](agent-ir-v1.md) §6.2).
+
+**The artifact as the frozen snapshot** (**planned in #22**). A compiled
+agent takes this one step further: the artifact
+([`agent-artifact-v1.md`](agent-artifact-v1.md)) *is* the frozen snapshot.
+It holds the `AgentIr` header and every input the agent reads at runtime
+(instructions, skills, knowledge, context programs, templates) with a
+BLAKE3 hash each, plus a hash over the whole artifact. A built binary
+reads nothing from `~/.harw` or the definition layers, so editing a TOML
+file cannot change it; only a new build can. The upgrade path above does
+not apply to compiled agents: a new definition means a new binary with a
+new artifact hash.
+
 ---
 
 ## 19. User Overrides and Safety
@@ -1098,6 +1268,35 @@ error[HARW-ORG-011]:
   organizations may contain only the existing root plus descendants;
   a clan leader must be a ChildOrchestrator
 ```
+
+### 20.1 Diagnostic codes
+
+With IR v2 every diagnostic carries a stable code `HARW-<AREA>-NNN`, a
+severity (`error`, `warning`, `note`), a source location
+(`file:line:column`, taken from TOML spans) and a help text. `harw agent
+check` prints them in the format above. The catalog in
+`harw-agent-dsl/src/diagnostics.rs` is authoritative: it lists every code,
+and a code is never reused for a different meaning. The areas are:
+
+| Area | Covers | Example |
+|---|---|---|
+| `PARSE` | TOML syntax, wrongly typed values (formerly read as absent) | a string where a number is expected |
+| `SCHEMA` | the `schema` field, unknown tables or keys | `schema = "harwness.agent/v9"` |
+| `RESOLVE` | IDs, versions, `extends`, mixins, cycles | unknown base definition |
+| `PATCH` | patch paths and operators (§7) | nested path that names no inherited field |
+| `AUTH` | authority monotonicity and ceilings | `HARW-AUTH-004` above |
+| `ROLE` | role compatibility, spawn matrix | worker declares a spawn target |
+| `TOOL` | tool surface, unknown tools, providers | admitted tool not in the capability catalog |
+| `CTX` | context policy and program binding | unknown context program |
+| `RETURN` | return contracts and validators | unknown return contract (formerly a silent `Text` fallback) |
+| `MODEL` | `[models]` | `effort` outside the allowed values |
+| `SKILL` | skill references and content | skill not found in the `SkillIndex` |
+| `BINARY` | `[binary]` and interface selection | `default_interface` not in `interfaces` |
+| `ORG` | families, clans, organizations | `HARW-ORG-011` above |
+| `BUILD` | compiler backends (**planned in #22**) | requested interface missing from the installed runner |
+
+Codes shown in this document are examples. The number within an area is
+assigned in the catalog, not here.
 
 ---
 

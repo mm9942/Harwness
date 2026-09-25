@@ -1478,6 +1478,8 @@ impl ReturnPipeline {
 ///   specialization is a hard precondition for the executable IR (§10).
 /// - [`DslError::InvalidSkill`]: if `resolved.config` carries a malformed
 ///   `skills` entry (not a string array, invalid name, duplicate).
+/// - [`DslError::UnknownReturnContract`]: if `[return] contract` names a
+///   contract outside [`crate::ir_v2::ReturnContract`].
 ///
 /// # Concurrency
 /// Pure function — safe from any thread. Does not touch I/O.
@@ -1594,6 +1596,19 @@ pub fn lower(resolved: &ResolvedAgentDefinition) -> Result<ExecutableAgentIr, Ds
         contract: config_string(&resolved.config, &["return", "return_pipeline"], "contract"),
     };
 
+    // Ein unbekannter Rückgabevertrag ist ein Fehler (IR v2, #22 Welle 1):
+    // früher fiel er beim Konsumenten still auf Freitext zurück.
+    if let Some(contract) = return_pipeline
+        .contract
+        .as_ref()
+        .filter(|contract| crate::ir_v2::ReturnContract::parse(contract).is_none())
+    {
+        return Err(DslError::UnknownReturnContract {
+            of: Box::new(resolved.id.clone()),
+            contract: contract.clone(),
+        });
+    }
+
     // Streng (fail-closed): ein fehlerhafter `skills`-Eintrag in einer von
     // Hand gebauten Config wird abgelehnt, nicht verschluckt.
     let skills = crate::skills::skills_from_config_strict(&resolved.id, &resolved.config)?;
@@ -1619,6 +1634,91 @@ pub fn lower(resolved: &ResolvedAgentDefinition) -> Result<ExecutableAgentIr, Ds
     // snapshot_id itself and trace are excluded from the digest.
     ir.snapshot_id = compute_snapshot_id(&ir);
     Ok(ir)
+}
+
+impl From<&crate::ir_v2::AgentIr> for ExecutableAgentIr {
+    /// Builds the legacy runtime view of an [`crate::ir_v2::AgentIr`].
+    ///
+    /// # Description
+    /// Every field of [`ExecutableAgentIr`] has a direct counterpart in the
+    /// v2 IR; labels of closed vocabularies (effort, return contract) are
+    /// written back as their canonical strings. `section_detail` stays empty,
+    /// exactly as [`lower`] leaves it for the `[context]` path: the runtime
+    /// checks every `section_detail` entry against the context ceiling, and a
+    /// bound program names sections outside it. The complete program
+    /// (strength, detail, trust of every section) lives in
+    /// [`crate::ir_v2::AgentIr::context`]. The snapshot is the v6 digest of
+    /// the view, so it equals the digest [`lower`] computes for the same
+    /// definition.
+    fn from(ir: &crate::ir_v2::AgentIr) -> Self {
+        let mut view = ExecutableAgentIr {
+            id: ir.id.clone(),
+            role: ir.role,
+            specialization: ir.specialization.clone(),
+            authority: AuthorityCeiling {
+                capabilities: ir.authority.capabilities.clone(),
+            },
+            reasoning_effort: ir.reasoning_effort.map(|effort| effort.as_str().to_owned()),
+            skills: ir.skills.names(),
+            spawn_contract: SpawnContract {
+                workspace_hint: ir.spawn.workspace_hint.clone(),
+                budget: ir.spawn.budget.as_ref().map(|budget| BudgetSpec {
+                    max_tokens: budget.max_tokens,
+                    max_tool_calls: budget.max_tool_calls,
+                    max_wall_secs: budget.max_wall_secs,
+                    effort_cap: budget.effort_cap.map(|effort| effort.as_str().to_owned()),
+                }),
+                max_depth: ir.spawn.max_depth,
+                child_orchestrators: ir.spawn.child_orchestrators.clone(),
+            },
+            job_template: JobTemplate {
+                goal_kind: ir.job.goal_kind.clone(),
+            },
+            context_program: ContextProgram {
+                context_policy: ir.context.policy.clone(),
+                must_include: ir.context.must_include.clone(),
+                exclude: ir.context.exclude.clone(),
+                section_detail: Vec::new(),
+            },
+            tool_surface: ResolvedToolSurface {
+                admitted: ir.tools.admitted.clone(),
+                forbidden: ir.tools.forbidden.clone(),
+            },
+            lifecycle_machine: LifecycleMachine {
+                allow_pause: ir.lifecycle.allow_pause,
+                allow_rerun: ir.lifecycle.allow_rerun,
+                max_attempts: ir.lifecycle.max_attempts,
+            },
+            return_pipeline: ReturnPipeline {
+                validators: ir.return_pipeline.validators.clone(),
+                contract: ir
+                    .return_pipeline
+                    .contract
+                    .map(|contract| contract.as_str().to_owned()),
+            },
+            trace: ResolutionTrace {
+                steps: ir
+                    .trace
+                    .steps
+                    .iter()
+                    .map(|step| crate::resolved::ResolutionStep {
+                        source: step.source.clone(),
+                        kind: step.kind.clone(),
+                        applied_at: step.applied_at,
+                    })
+                    .collect(),
+            },
+            snapshot_id: SnapshotId(String::new()),
+        };
+        view.snapshot_id = compute_snapshot_id(&view);
+        view
+    }
+}
+
+impl From<crate::ir_v2::AgentIr> for ExecutableAgentIr {
+    fn from(ir: crate::ir_v2::AgentIr) -> Self {
+        ExecutableAgentIr::from(&ir)
+    }
 }
 
 /// Reads a string field from one of the supported executable-config tables.

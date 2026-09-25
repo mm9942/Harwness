@@ -1,0 +1,186 @@
+{
+  "schema": "harwness.agent-ir/v2",
+  "id": "harwness.agent.method-auditor@1",
+  "version": "1.0.0",
+  "name": "Method Auditor",
+  "description": "Bewertet die Methode eines Analyseprodukts: Passung zur Frage, Prozess- und Produktqualität, Reproduzierbarkeit, Kalibrierung, Wirksamkeitsnachweis; liefert Punktzahl mit Begründung. Read-only.",
+  "role": "worker",
+  "specialization": "method-auditor",
+  "reasoning_effort": null,
+  "authority": {
+    "capabilities": []
+  },
+  "instructions": {
+    "text": "# method-auditor\n\nDu bewertest die **Methode** eines Analyseprodukts: Passt sie zur Frage, wurde sie sauber angewandt, taugt das Produkt, wäre es reproduzierbar, und gibt es Belege, dass die Methode funktioniert? Du lieferst eine Punktzahl mit Begründung je Kriterium.\n\nDer Skill `method-validation` ist fest geladen. Lade `confidence-and-uncertainty` über `skills.load`, um die Sicherheitsangaben zu prüfen.\n\n## Vorgehen\n\n1. **Material sichten.** Produkt, Auftrag (Leitfrage, Leser), Beschreibung des Vorgehens (Wellen, eingesetzte Agenten, geladene Skills), Zwischenergebnisse.\n2. **Methode und Anspruch benennen.** Was wurde gemacht, was verspricht es?\n3. **Prozess und Produkt getrennt bewerten** nach den Kriterien in `method-validation`.\n4. **Reproduzierbarkeit.** Wo hängt das Ergebnis erkennbar an einem einzelnen Bearbeiter oder einer einzelnen Quelle? Schlag vor, welcher Teilschritt unabhängig wiederholt werden sollte.\n5. **Kalibrierung.** Gibt es frühere Einschätzungen mit bekanntem Ausgang (Diary, Palace, Workbench)? Wenn nein, als Lücke benennen.\n6. **Sicherheitsangaben prüfen.** Feste Begriffe verwendet? Wahrscheinlichkeit und Vertrauen getrennt? Passt das Vertrauen zur Belegprüfung?\n7. **Punktzahl und Empfehlung.**\n\n## Rückgabe\n\nDie Tabelle und die Schlusszeilen aus `method-validation`, ergänzt um:\n\n```markdown\n**Wiederholung empfohlen für:** <Teilschritt, warum>\n**Sicherheitsangaben:** konsistent | Mängel: …\n```\n\n## Was ich NICHT tue\n\n- Ich bewerte nicht, ob mir das Ergebnis gefällt, sondern ob es sauber zustande kam und trägt.\n- Ein gutes Ergebnis wertet einen schwachen Prozess nicht auf und umgekehrt.\n- Ich gebe nichts frei; meine Bewertung ist ein Vorschlag.\n- Ich schreibe das Produkt nicht um.\n- Keine Dateien schreiben, keine Prozesse, kein Netz, keine anderen Agenten starten.\n",
+    "source": "system.md",
+    "blake3": "b17c6bccedf3bdb82d524bcd93348e84be63c828eeeae40aefe368e18e97e208"
+  },
+  "tools": {
+    "admitted": [
+      "fs.read",
+      "fs.list",
+      "fs.search",
+      "fs.glob",
+      "fs.grep",
+      "doc.read_pdf",
+      "workbench.show",
+      "diary.read",
+      "palace.search",
+      "palace.recall",
+      "parent.message",
+      "skills.search",
+      "skills.load"
+    ],
+    "forbidden": [
+      "fs.write",
+      "fs.edit",
+      "shell.exec",
+      "web.fetch",
+      "web.search",
+      "web.docs_rs",
+      "web.crates_io"
+    ]
+  },
+  "spawn": {
+    "max_depth": 0,
+    "child_orchestrators": [],
+    "delegation_targets": null,
+    "workspace_hint": null,
+    "budget": {
+      "max_tokens": 60000,
+      "max_tool_calls": 40,
+      "max_wall_secs": 480,
+      "effort_cap": null
+    }
+  },
+  "job": {
+    "goal_kind": null
+  },
+  "lifecycle": {
+    "allow_pause": false,
+    "allow_rerun": true,
+    "max_attempts": 4
+  },
+  "context": {
+    "program": null,
+    "program_id": null,
+    "policy": null,
+    "sections": [],
+    "must_include": [
+      "task.objective",
+      "task.read_scope",
+      "new.trigger_return"
+    ],
+    "exclude": [
+      "full_parent_transcript",
+      "sibling_transcripts"
+    ],
+    "deferred": []
+  },
+  "return": {
+    "contract": "harwness.return.execution-summary@1",
+    "validators": []
+  },
+  "models": null,
+  "limits": null,
+  "work": {
+    "mode": "review",
+    "may_write_code": false,
+    "may_research_web": false,
+    "may_change_plan": null,
+    "aggregates_child_returns": null
+  },
+  "research": null,
+  "verification": null,
+  "skills": {
+    "entries": [
+      {
+        "name": "method-validation",
+        "hash": null
+      }
+    ]
+  },
+  "binary": {
+    "name": "method-auditor",
+    "interfaces": [
+      "cli"
+    ],
+    "default_interface": "cli"
+  },
+  "permissions": {
+    "tools": [
+      "diary.read",
+      "doc.read_pdf",
+      "fs.glob",
+      "fs.grep",
+      "fs.list",
+      "fs.read",
+      "fs.search",
+      "palace.recall",
+      "palace.search",
+      "parent.message",
+      "skills.load",
+      "skills.search",
+      "workbench.show"
+    ],
+    "forbidden_tools": [
+      "fs.edit",
+      "fs.write",
+      "shell.exec",
+      "web.crates_io",
+      "web.docs_rs",
+      "web.fetch",
+      "web.search"
+    ],
+    "capabilities": [],
+    "filesystem": {
+      "read": true,
+      "write": false,
+      "write_paths": [],
+      "other_write_tools": []
+    },
+    "network": {
+      "mode": "off",
+      "tools": [],
+      "hosts": []
+    },
+    "shell": false,
+    "host": false,
+    "spawn": {
+      "max_depth": 0,
+      "child_orchestrators": [],
+      "delegation_targets": []
+    },
+    "budget": {
+      "max_tokens": 60000,
+      "max_tool_calls": 40,
+      "max_wall_secs": 480,
+      "effort_cap": null
+    },
+    "required_env": []
+  },
+  "trace": {
+    "steps": [
+      {
+        "source": "harwness.agent.worker-base@1",
+        "kind": "patch",
+        "applied_at": "1970-01-01T00:00:00Z"
+      },
+      {
+        "source": "harwness.agent.worker-base@1",
+        "kind": "base",
+        "applied_at": "1970-01-01T00:00:00Z"
+      },
+      {
+        "source": "harwness.agent.method-auditor@1",
+        "kind": "patch",
+        "applied_at": "1970-01-01T00:00:00Z"
+      }
+    ],
+    "diagnostics": []
+  },
+  "snapshot": {
+    "domain": "harwness.agent-ir.snapshot/v7",
+    "digest": "7dbd524731a775c17886684b87b64a85f98fd85a7a314549bc077d1a49f7de74"
+  }
+}

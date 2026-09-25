@@ -918,10 +918,16 @@ pub async fn delegate_wave(
             None => target.payload(position, size),
         });
     }
-    let contracts: Vec<ChildReturnContract> = request
+    // #22 Welle 1B: ein unbekannter Contract ist ein Fehler des Ziels, kein
+    // stiller Freitext-Rückfall.
+    let contract_results: Vec<Result<ChildReturnContract, String>> = request
         .targets
         .iter()
         .map(|target| child_contract(ctx, &target.role))
+        .collect();
+    let contracts: Vec<ChildReturnContract> = contract_results
+        .iter()
+        .map(|contract| contract.clone().unwrap_or(ChildReturnContract::Text))
         .collect();
 
     let mut queue: VecDeque<(usize, &'static str)> = VecDeque::new();
@@ -929,6 +935,10 @@ pub async fn delegate_wave(
         match reducer {
             // Eine abgelehnte Fortsetzung steht schon als `failed` fest.
             Ok(_) if statuses[position].is_some() => {}
+            Ok(_) if contract_results[position].is_err() => {
+                let message = contract_results[position].clone().err().unwrap_or_default();
+                statuses[position] = Some(TargetStatus::Failed(message));
+            }
             Ok(reducer) => queue.push_back((position, reducer)),
             Err(message) => statuses[position] = Some(TargetStatus::Unavailable(message)),
         }
@@ -1024,15 +1034,24 @@ pub async fn delegate_wave(
 /// Der Return-Contract einer Zielrolle — dieselbe Auflösung wie
 /// `resolve_child_contract` in `agent_tool.rs`: ohne Registry-Factory oder
 /// ohne Label gilt [`ChildReturnContract::Text`].
-fn child_contract(ctx: &OpContext, role: &str) -> ChildReturnContract {
-    ctx.service::<Arc<dyn ChildRegistryFactory>>()
+///
+/// # Errors
+/// Die Meldung für den `failed`-Eintrag, wenn die IR ein unbekanntes
+/// Contract-Label trägt (#22 Welle 1B, [`ChildReturnContract::parse`]).
+fn child_contract(ctx: &OpContext, role: &str) -> Result<ChildReturnContract, String> {
+    let Some(label) = ctx
+        .service::<Arc<dyn ChildRegistryFactory>>()
         .and_then(|factory| {
             factory
                 .executable_agent_ir(role)
                 .and_then(|ir| ir.return_pipeline().contract())
-                .map(ChildReturnContract::parse)
+                .map(str::to_owned)
         })
-        .unwrap_or(ChildReturnContract::Text)
+    else {
+        return Ok(ChildReturnContract::Text);
+    };
+    ChildReturnContract::parse(&label)
+        .map_err(|error| format!("Zielrolle '{role}' kann nicht gestartet werden: {error}"))
 }
 
 /// Runde 5, Teil J: prüft ein `continue_from`-Ziel gegen das

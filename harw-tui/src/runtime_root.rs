@@ -63,7 +63,13 @@
 //! let assembly = Arc::new(wiring.install(builder).build()?);
 //! run_tui(
 //!     assembly,
-//!     TuiRunOptions { wiring, resume: None, verbose_tools: false, keybindings_path: None },
+//!     TuiRunOptions {
+//!         wiring,
+//!         resume: None,
+//!         verbose_tools: false,
+//!         keybindings_path: None,
+//!         fixed_agent: None,
+//!     },
 //! )?;
 //! # Ok(())
 //! # }
@@ -478,6 +484,26 @@ impl std::fmt::Debug for TitleJobContext {
     }
 }
 
+/// R10 Welle 3B: Beschränkungen der mini-TUI eines kompilierten Agenten
+/// (`harw-agent-runner`, `iface::tui`), angewendet auf [`ChatApp`] direkt
+/// nach ihrem Bau in [`build_root_runtime`]. `None` (in
+/// [`TuiRunOptions::fixed_agent`]) ist die normale, uneingeschränkte TUI.
+///
+/// Erzeugt von [`crate::fixed_agent::run_fixed_agent`] aus dessen
+/// `FixedAgentOptions`; siehe dort für die Herleitung der einzelnen Felder.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FixedAgentUiRestrictions {
+    /// Kanonische Namen, die [`ChatApp::with_hidden_commands`] versteckt.
+    pub hidden_commands: Vec<String>,
+    /// Titel für [`ChatApp::with_title_override`] (Statuszeile).
+    pub title: String,
+    /// Erlaubte `/model switch`-Ziele für
+    /// [`ChatApp::with_model_switch_allowlist`]; `None` lässt `/model
+    /// switch` uneingeschränkt (nur sinnvoll, wenn `model` nicht zugleich in
+    /// `hidden_commands` steht).
+    pub model_switch_allowlist: Option<Vec<(String, String)>>,
+}
+
 /// Eingaben von [`run_tui`] neben der Montage.
 pub struct TuiRunOptions {
     /// Die Verdrahtung, die in den Builder der übergebenen Montage gelegt wurde.
@@ -492,6 +518,9 @@ pub struct TuiRunOptions {
     /// Standardbelegung; eine ungültige erscheint als Systemzeile, und die
     /// Standardbelegung bleibt aktiv.
     pub keybindings_path: Option<PathBuf>,
+    /// R10 Welle 3B: fixed-agent-Beschränkungen der mini-TUI, `None` für die
+    /// normale TUI. Siehe [`FixedAgentUiRestrictions`].
+    pub fixed_agent: Option<FixedAgentUiRestrictions>,
 }
 
 /// Handgeschriebenes `Debug`: [`TuiSessionWiring`] enthält Kanäle.
@@ -503,6 +532,7 @@ impl std::fmt::Debug for TuiRunOptions {
             .field("resume", &self.resume)
             .field("verbose_tools", &self.verbose_tools)
             .field("keybindings_path", &self.keybindings_path)
+            .field("fixed_agent", &self.fixed_agent)
             .finish()
     }
 }
@@ -564,6 +594,7 @@ impl std::fmt::Debug for TuiRunOptions {
 ///         resume: None,
 ///         verbose_tools: false,
 ///         keybindings_path: None,
+///         fixed_agent: None,
 ///     },
 /// )
 /// # }
@@ -574,6 +605,7 @@ pub fn run_tui(assembly: Arc<RuntimeAssembly>, options: TuiRunOptions) -> Result
         resume,
         verbose_tools,
         keybindings_path,
+        fixed_agent,
     } = options;
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -594,6 +626,18 @@ pub fn run_tui(assembly: Arc<RuntimeAssembly>, options: TuiRunOptions) -> Result
         resume.as_ref().map(|r| r.session_store_root.as_path()),
         verbose_tools,
     )?;
+    // R10 Welle 3B: fixed-agent-Beschränkungen auf den frisch gebauten
+    // Renderer-Zustand anwenden. `resume` ist für einen kompilierten Agenten
+    // immer `None` (siehe `crate::fixed_agent::run_fixed_agent`), daher ist
+    // dies die einzige `ChatApp`-Bau-Stelle dieses Laufs — `/new`/`/resume`
+    // scheitern ohnehin mit [`RESUME_NOT_CONFIGURED`], bevor eine zweite
+    // Montage entstünde.
+    if let Some(restrictions) = fixed_agent.as_ref() {
+        app = app
+            .with_hidden_commands(restrictions.hidden_commands.clone())
+            .with_title_override(restrictions.title.clone())
+            .with_model_switch_allowlist(restrictions.model_switch_allowlist.clone());
+    }
     // Ein Ladefehler bricht den Start nicht ab: Standardbelegung behalten und
     // die Meldung nach der Willkommenszeile anzeigen.
     let (key_bindings, key_bindings_error) = match keybindings_path.as_deref() {
@@ -1457,6 +1501,8 @@ pub(crate) mod tests {
             reasoning_effort: None,
             approval_override: None,
             model_override: None,
+            embedded: None,
+            child_backend: None,
         };
         let state_store: Arc<dyn StateStore> = Arc::new(harw_core::InMemoryStateStore::new());
         RuntimeAssembly::builder(spec)

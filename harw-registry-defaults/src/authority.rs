@@ -685,6 +685,116 @@ pub fn tool_permission(tool: &str) -> Option<Permission> {
     }
 }
 
+/// Das Recht, das ein Capability-Label aus `[authority] capabilities`
+/// benennt (#22 Welle 1B).
+///
+/// # Beschreibung
+/// Capability-Labels sind offen (`security.advisory.correlate` benennt eine
+/// fachliche Fähigkeit, kein Recht). Nur Labels aus dem folgenden
+/// Rechte-Vokabular (das Label selbst oder mit weiterem `.`-Suffix, etwa
+/// `filesystem.write.scoped` aus der DSL-Spezifikation §7) bilden auf ein
+/// [`Permission`] ab:
+///
+/// | Label-Präfix | Recht |
+/// |---|---|
+/// | `filesystem.read`, `workspace.read` | `ReadWorkspace` |
+/// | `filesystem.write`, `workspace.write` | `WriteWorkspace` |
+/// | `process`, `shell` | `ExecuteProcess` |
+/// | `network`, `web` | `NetworkAccess` |
+/// | `secrets.read` | `ReadSecrets` |
+/// | `plugins.manage` | `ManagePlugins` |
+/// | `cargo.registry.read` | `ReadCargoRegistry` |
+///
+/// # Rückgabe
+/// `None` für ein fachliches Label ohne Rechtebezug.
+#[must_use]
+pub fn capability_permission(label: &str) -> Option<Permission> {
+    let matches = |prefix: &str| {
+        label == prefix
+            || label
+                .strip_prefix(prefix)
+                .is_some_and(|rest| rest.starts_with('.'))
+    };
+    if matches("filesystem.read") || matches("workspace.read") {
+        Some(Permission::ReadWorkspace)
+    } else if matches("filesystem.write") || matches("workspace.write") {
+        Some(Permission::WriteWorkspace)
+    } else if matches("process") || matches("shell") {
+        Some(Permission::ExecuteProcess)
+    } else if matches("network") || matches("web") {
+        Some(Permission::NetworkAccess)
+    } else if matches("secrets.read") {
+        Some(Permission::ReadSecrets)
+    } else if matches("plugins.manage") {
+        Some(Permission::ManagePlugins)
+    } else if matches("cargo.registry.read") {
+        Some(Permission::ReadCargoRegistry)
+    } else {
+        None
+    }
+}
+
+/// Die Rechte, die `[authority] capabilities` einer IR zulassen.
+///
+/// # Rückgabe
+/// `None`, wenn kein Label ein Recht benennt — dann trifft die Autorität
+/// keine Aussage über Rechte (nur fachliche Labels oder gar keine), und der
+/// Schnitt in [`granted_for_ir`] lässt die Profilrechte unverändert.
+#[must_use]
+pub fn authority_permissions(capabilities: &[String]) -> Option<PermissionSet> {
+    let rights: Vec<Permission> = capabilities
+        .iter()
+        .filter_map(|label| capability_permission(label))
+        .collect();
+    (!rights.is_empty()).then(|| PermissionSet::from_policy(rights))
+}
+
+/// Die Rechte, mit denen die Kind-Registry eines Agenten montiert wird
+/// (#22 Welle 1B): die Rechte seines Registry-Profils, geschnitten mit
+///
+/// 1. den Rechten seiner `[authority] capabilities` ([`authority_permissions`]),
+///    sofern die Autorität überhaupt ein Recht benennt, und
+/// 2. mit `narrow_to_manifest` zusätzlich den Rechten, die die Werkzeuge
+///    seines Rechte-Manifests brauchen (für benutzerdefinierte Agenten,
+///    deren Profil von einer Basisrolle geerbt ist).
+///
+/// Ein reiner Schnitt: das Ergebnis ist immer eine Teilmenge von
+/// `profile_rights` — die Autorität einer Definition kann Rechte nur
+/// entziehen, nie hinzufügen.
+#[must_use]
+pub fn granted_for_ir(
+    profile_rights: &PermissionSet,
+    ir: &harw_agent_dsl::AgentIr,
+    narrow_to_manifest: bool,
+) -> PermissionSet {
+    granted_for_capabilities(
+        profile_rights,
+        &ir.authority.capabilities,
+        narrow_to_manifest.then_some(ir.permissions.tools.as_slice()),
+    )
+}
+
+/// Wie [`granted_for_ir`], mit den Capability-Labels und (optional) den
+/// Manifest-Werkzeugen direkt — für Aufrufer, die nur die Laufzeitsicht
+/// (`ExecutableAgentIr::authority`) einer eingebauten Rolle halten.
+#[must_use]
+pub fn granted_for_capabilities(
+    profile_rights: &PermissionSet,
+    capabilities: &[String],
+    manifest_tools: Option<&[String]>,
+) -> PermissionSet {
+    let mut granted: Vec<Permission> = profile_rights.iter().collect();
+    if let Some(authority) = authority_permissions(capabilities) {
+        granted.retain(|permission| authority.contains(*permission));
+    }
+    if let Some(tools) = manifest_tools {
+        let tools: Vec<&str> = tools.iter().map(String::as_str).collect();
+        let manifest = permissions_of(&tools);
+        granted.retain(|permission| manifest.contains(*permission));
+    }
+    PermissionSet::from_policy(granted)
+}
+
 /// Die Rechte, die eine Rolle bräuchte, um jedes Werkzeug ihres Profils nutzen
 /// zu können — Hilfsfunktion für
 /// [`crate::profile::RegistryProfile::required_permissions`].
@@ -1314,6 +1424,92 @@ mod tests {
             .map_err(crate::test_support::ctx("Test-TOML muss parsen"))?;
         assert_eq!(delegation_targets_of(&without), None);
         assert_eq!(delegation_targets_of(&toml::Table::new()), None);
+        Ok(())
+    }
+
+    #[test]
+    fn test_capability_permission_maps_only_the_rights_vocabulary() {
+        assert_eq!(
+            capability_permission("filesystem.read"),
+            Some(Permission::ReadWorkspace)
+        );
+        assert_eq!(
+            capability_permission("filesystem.write.scoped"),
+            Some(Permission::WriteWorkspace)
+        );
+        assert_eq!(
+            capability_permission("process.spawn.sandboxed"),
+            Some(Permission::ExecuteProcess)
+        );
+        assert_eq!(
+            capability_permission("network"),
+            Some(Permission::NetworkAccess)
+        );
+        // Fachliche Labels und Beinahe-Treffer benennen kein Recht.
+        assert_eq!(capability_permission("security.advisory.correlate"), None);
+        assert_eq!(capability_permission("filesystem.reader"), None);
+        assert_eq!(capability_permission("networking"), None);
+        assert!(authority_permissions(&["security.context.read".to_owned()]).is_none());
+        assert!(authority_permissions(&[]).is_none());
+    }
+
+    /// #22 Welle 1B: `[authority] capabilities` schneidet die Profilrechte —
+    /// für jede Kombination aus Profil und Autorität ist das Ergebnis eine
+    /// Teilmenge des Profils, nie mehr.
+    #[test]
+    fn test_granted_for_ir_never_widens_the_profile_rights() -> crate::test_support::TestResult {
+        let irs = crate::embedded_agents::builtin_agent_irs(time::OffsetDateTime::UNIX_EPOCH)
+            .map_err(crate::test_support::ctx("eingebaute Rollen senken"))?;
+        let explorer = irs
+            .get(role_names::EXPLORER)
+            .ok_or(crate::test_support::TestError::Missing("explorer"))?;
+        let labels = [
+            "filesystem.read",
+            "filesystem.write",
+            "process.spawn",
+            "network",
+            "secrets.read",
+            "security.verdict.propose",
+        ];
+        let profiles = [
+            RegistryProfile::ReadOnlyExplore,
+            RegistryProfile::ShellExecution,
+            RegistryProfile::Research,
+            RegistryProfile::NoTools,
+            RegistryProfile::WorkspaceEdit,
+        ];
+        for profile in profiles {
+            let rights = profile.required_permissions();
+            // Jede Teilmenge der Labels als Autorität.
+            for mask in 0_u32..(1 << labels.len()) {
+                let mut ir = explorer.clone();
+                ir.authority.capabilities = labels
+                    .iter()
+                    .enumerate()
+                    .filter(|(index, _)| mask & (1 << index) != 0)
+                    .map(|(_, label)| (*label).to_owned())
+                    .collect();
+                for narrow in [false, true] {
+                    let granted = granted_for_ir(&rights, &ir, narrow);
+                    assert!(granted.is_subset_of(&rights), "{profile:?} {mask} {narrow}");
+                    if let Some(authority) = authority_permissions(&ir.authority.capabilities) {
+                        assert!(granted.is_subset_of(&authority), "{profile:?} {mask}");
+                    }
+                }
+            }
+        }
+        // Ohne Rechte-Label bleibt das Profil unverändert.
+        let mut domain_only = explorer.clone();
+        domain_only.authority.capabilities = vec!["security.context.read".to_owned()];
+        let rights = RegistryProfile::ReadOnlyExplore.required_permissions();
+        assert_eq!(granted_for_ir(&rights, &domain_only, false), rights);
+        // Eine Autorität nur mit Lesen entzieht einem Schreibprofil das Schreiben.
+        let mut read_only = explorer.clone();
+        read_only.authority.capabilities = vec!["filesystem.read".to_owned()];
+        let edit = RegistryProfile::WorkspaceEdit.required_permissions();
+        let granted = granted_for_ir(&edit, &read_only, false);
+        assert!(granted.contains(Permission::ReadWorkspace));
+        assert!(!granted.contains(Permission::WriteWorkspace));
         Ok(())
     }
 }

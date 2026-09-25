@@ -132,8 +132,39 @@ pub struct HarnessConfig {
     /// [`crate::shell_limits::ShellToml`].
     #[serde(default)]
     pub shell: crate::shell_limits::ShellToml,
+    /// `[agent_compiler]` — Build-Cache und Versionsaufbewahrung von
+    /// `harw agent build` (#22 Welle 2B). Gelesen von
+    /// `harw-agent-compiler` direkt aus den Layer-`config.toml`; hier nur
+    /// deklariert, damit der Abschnitt die Konfiguration nicht ungültig macht.
+    #[serde(default)]
+    pub agent_compiler: AgentCompilerToml,
     #[serde(skip)]
     pub base_dir: Option<std::path::PathBuf>,
+}
+
+/// `[agent_compiler]` — Grenzen des Agenten-Compilers (#22 Welle 2B).
+///
+/// # Description
+/// `cache_max_bytes` begrenzt den nativen Build-Cache
+/// (`~/.harw/cache/agent-builds`, Vorgabe 5 GiB); `keep_versions` lässt die
+/// automatische Bereinigung nach jedem nativen Build ältere installierte
+/// Versionen unter `~/.harw/bin/.versions/` bis auf so viele entfernen
+/// (ohne den Schlüssel geschieht das nur mit `harw agent clean`).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AgentCompilerToml {
+    /// Obergrenze des Build-Caches in Bytes.
+    #[serde(default)]
+    pub cache_max_bytes: Option<u64>,
+    /// Anzahl aufbewahrter älterer Versionen je Agent (zusätzlich zur
+    /// aktuellen).
+    #[serde(default)]
+    pub keep_versions: Option<usize>,
+    /// Die aktive UIA automatisch (Artefakt-Backend, im Hintergrund) nach
+    /// `~/.harw/bin` kompilieren, wenn sich ihre Definition oder die
+    /// harw-/Runner-Version ändert. Vorgabe `true`.
+    #[serde(default)]
+    pub auto_build_uia: Option<bool>,
 }
 
 /// `[compaction]` — Verdichtungs-Konfiguration (Addendum D+E,

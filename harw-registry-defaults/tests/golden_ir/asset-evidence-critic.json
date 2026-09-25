@@ -1,0 +1,186 @@
+{
+  "schema": "harwness.agent-ir/v2",
+  "id": "harwness.agent.evidence-critic@1",
+  "version": "1.0.0",
+  "name": "Evidence Critic",
+  "description": "Prüft Belege eines Analyseprodukts: Quellenzuverlässigkeit, Auswahlverzerrung, plausible aber unbelegte Behauptungen, Wirksamkeitsnachweise, Rahmung; liefert eine Behalten/Verwerfen-Liste. Read-only.",
+  "role": "worker",
+  "specialization": "evidence-critic",
+  "reasoning_effort": null,
+  "authority": {
+    "capabilities": []
+  },
+  "instructions": {
+    "text": "# evidence-critic\n\nDu bist der Belegprüfer der Analyse-Familie. Du prüfst, ob die Belege eines Analyseprodukts oder einer Befundsammlung die Aussagen tragen, und lieferst eine Behalten/Verwerfen-Liste. Du bist Prüfer, nicht Co-Autor.\n\nDer Skill `evidence-quality-review` ist fest geladen. Lade bei Bedarf `key-assumptions-check` (tragende Annahmen) und `confidence-and-uncertainty` (passt die Sicherheitsangabe?) über `skills.load`.\n\n## Vorgehen\n\n1. **Material sichten.** Aussagen des Produkts (oder die Leitfrage) und die zugehörigen Belege mit Fundstellen. Fehlen Fundstellen, ist das der erste Befund.\n2. **Stichproben an der Quelle.** Lies die Fundstellen der tragenden Belege selbst nach (`fs.read`, `doc.read_pdf`). Stimmt die Wiedergabe? Ist der Kontext richtig?\n3. **Quelle, Information, Auswahl getrennt bewerten** nach `evidence-quality-review`.\n4. **Wirksamkeitsbehauptungen prüfen.** Gibt es einen Nachweis über die Plausibilität hinaus? Sonst als „plausibel, aber unbelegt“ markieren.\n5. **Rahmung offenlegen.** Welche Belegarten waren zugelassen, welche Fragen bleiben dadurch unbeantwortbar?\n6. **Tragende Annahmen.** Die zwei bis fünf Annahmen, an denen die Kernaussage hängt, mit Belastbarkeit.\n7. **Urteil je Beleg** und Folgen für die Aussagen.\n\n## Rückgabe\n\n```markdown\n**Geprüft:** <Produkt / Befundsammlung, Umfang>\n**Gesamtbild:** <ein Satz: tragen die Belege die Kernaussage?>\n\n| ID | Beleg (Fundstelle) | stützt | Quelle | Information | Auswahlrisiko | Urteil | Grund |\n|---|---|---|---|---|---|---|---|\n\n**Plausibel, aber unbelegt:** …\n**Rahmung:** …\n**Tragende Annahmen:** A1 … (Belastbarkeit)\n**Aussagen ohne tragfähige Stütze:** …\n**Sicherheitsangabe passt?** ja | zu hoch | zu niedrig – <Grund>\n**Nachsammeln (Vorschlag):** <gezielte Teilfragen>\n```\n\n## Was ich NICHT tue\n\n- Ich schreibe das Produkt nicht um und liefere keine Ersatzfassung.\n- Ich gebe nichts frei. Meine Liste ist ein Vorschlag an den Auftraggeber.\n- Ich recherchiere keine neuen Belege, sondern benenne Lücken als Nachsammel-Fragen.\n- Ich prüfe keine Fakten aus dem Gedächtnis und erfinde keine Gegenbelege.\n- Keine Dateien schreiben, keine Prozesse, kein Netz, keine anderen Agenten starten.\n",
+    "source": "system.md",
+    "blake3": "561d6b4aa836c1711a364514621d62c3ccaf7bccad9bed4028e3aadc73622fe1"
+  },
+  "tools": {
+    "admitted": [
+      "fs.read",
+      "fs.list",
+      "fs.search",
+      "fs.glob",
+      "fs.grep",
+      "doc.read_pdf",
+      "workbench.show",
+      "diary.read",
+      "palace.search",
+      "palace.recall",
+      "parent.message",
+      "skills.search",
+      "skills.load"
+    ],
+    "forbidden": [
+      "fs.write",
+      "fs.edit",
+      "shell.exec",
+      "web.fetch",
+      "web.search",
+      "web.docs_rs",
+      "web.crates_io"
+    ]
+  },
+  "spawn": {
+    "max_depth": 0,
+    "child_orchestrators": [],
+    "delegation_targets": null,
+    "workspace_hint": null,
+    "budget": {
+      "max_tokens": 80000,
+      "max_tool_calls": 50,
+      "max_wall_secs": 600,
+      "effort_cap": null
+    }
+  },
+  "job": {
+    "goal_kind": null
+  },
+  "lifecycle": {
+    "allow_pause": false,
+    "allow_rerun": true,
+    "max_attempts": 4
+  },
+  "context": {
+    "program": null,
+    "program_id": null,
+    "policy": null,
+    "sections": [],
+    "must_include": [
+      "task.objective",
+      "task.read_scope",
+      "new.trigger_return"
+    ],
+    "exclude": [
+      "full_parent_transcript",
+      "sibling_transcripts"
+    ],
+    "deferred": []
+  },
+  "return": {
+    "contract": "harwness.return.execution-summary@1",
+    "validators": []
+  },
+  "models": null,
+  "limits": null,
+  "work": {
+    "mode": "review",
+    "may_write_code": false,
+    "may_research_web": false,
+    "may_change_plan": null,
+    "aggregates_child_returns": null
+  },
+  "research": null,
+  "verification": null,
+  "skills": {
+    "entries": [
+      {
+        "name": "evidence-quality-review",
+        "hash": null
+      }
+    ]
+  },
+  "binary": {
+    "name": "evidence-critic",
+    "interfaces": [
+      "cli"
+    ],
+    "default_interface": "cli"
+  },
+  "permissions": {
+    "tools": [
+      "diary.read",
+      "doc.read_pdf",
+      "fs.glob",
+      "fs.grep",
+      "fs.list",
+      "fs.read",
+      "fs.search",
+      "palace.recall",
+      "palace.search",
+      "parent.message",
+      "skills.load",
+      "skills.search",
+      "workbench.show"
+    ],
+    "forbidden_tools": [
+      "fs.edit",
+      "fs.write",
+      "shell.exec",
+      "web.crates_io",
+      "web.docs_rs",
+      "web.fetch",
+      "web.search"
+    ],
+    "capabilities": [],
+    "filesystem": {
+      "read": true,
+      "write": false,
+      "write_paths": [],
+      "other_write_tools": []
+    },
+    "network": {
+      "mode": "off",
+      "tools": [],
+      "hosts": []
+    },
+    "shell": false,
+    "host": false,
+    "spawn": {
+      "max_depth": 0,
+      "child_orchestrators": [],
+      "delegation_targets": []
+    },
+    "budget": {
+      "max_tokens": 80000,
+      "max_tool_calls": 50,
+      "max_wall_secs": 600,
+      "effort_cap": null
+    },
+    "required_env": []
+  },
+  "trace": {
+    "steps": [
+      {
+        "source": "harwness.agent.worker-base@1",
+        "kind": "patch",
+        "applied_at": "1970-01-01T00:00:00Z"
+      },
+      {
+        "source": "harwness.agent.worker-base@1",
+        "kind": "base",
+        "applied_at": "1970-01-01T00:00:00Z"
+      },
+      {
+        "source": "harwness.agent.evidence-critic@1",
+        "kind": "patch",
+        "applied_at": "1970-01-01T00:00:00Z"
+      }
+    ],
+    "diagnostics": []
+  },
+  "snapshot": {
+    "domain": "harwness.agent-ir.snapshot/v7",
+    "digest": "ecb3a7e29cc046e5133c3a32402478b7bebcdb6d95aecb30f390ddeee8ee86c8"
+  }
+}

@@ -580,6 +580,31 @@ impl RuntimeChildRegistryFactory {
         }
     }
 
+    /// Die Rechte, mit denen die Kind-Registry von `role` montiert wird
+    /// (#22 Welle 1B): die Rechte von `profile`, geschnitten mit den
+    /// Rechte-Labels aus `[authority] capabilities` der IR und — für einen
+    /// benutzerdefinierten Agenten — mit den Rechten seines Rechte-Manifests
+    /// ([`harw_registry_defaults::authority::granted_for_capabilities`]).
+    /// Nie mehr als `profile.required_permissions()`.
+    fn granted_for(
+        &self,
+        role: &str,
+        profile: harw_registry_defaults::RegistryProfile,
+    ) -> harw_authority::PermissionSet {
+        let rights = profile.required_permissions();
+        if let Some(wiring) = self.custom_agents.get(role) {
+            return harw_registry_defaults::authority::granted_for_ir(&rights, &wiring.ir, true);
+        }
+        match self.builtin_definitions.get(role) {
+            Some(ir) => harw_registry_defaults::authority::granted_for_capabilities(
+                &rights,
+                &ir.authority().capabilities,
+                None,
+            ),
+            None => rights,
+        }
+    }
+
     /// Aktuelle Auflösung einer internen Modellstelle (live, sonst Start).
     fn resolved_point(&self, point: InternalModelPoint) -> Option<ResolvedInternalModel> {
         match &self.live_models {
@@ -1607,13 +1632,23 @@ impl ChildRegistryFactory for RuntimeChildRegistryFactory {
                     fragments.insert(0, prompt.to_owned());
                 }
                 // Plan R9, Teil B: die Arbeitsanweisung eines
-                // benutzerdefinierten Agenten (`instructions_file`).
+                // benutzerdefinierten Agenten (aus seiner IR:
+                // `instructions_file` bzw. `system.md`, #22 Welle 1B).
                 if let Some(instructions) = self
                     .custom_agents
                     .get(role)
                     .and_then(|wiring| wiring.instructions.as_deref())
                 {
                     fragments.insert(0, format!("# Arbeitsanweisung ({role})\n{instructions}"));
+                }
+                // #22 Welle 1B: `job.goal_kind` und `spawn.workspace_hint`
+                // der IR als Auftragsrahmen des Kindes.
+                if let Some(note) = self
+                    .builtin_definitions
+                    .get(role)
+                    .and_then(|ir| spawn_metadata_note(role, ir))
+                {
+                    fragments.push(note);
                 }
                 fragments
             },
@@ -1652,13 +1687,18 @@ impl ChildRegistryFactory for RuntimeChildRegistryFactory {
         // `self.sandbox_profile`/`self.host_permit_wiring` — ohne
         // [`Self::with_host_permits`] bleiben das `SandboxProfile::Strict`/
         // `None` und das Verhalten ist bit-identisch zu vorher.
+        // #22 Welle 1B: die Rechte der Kind-Registry sind die des Profils,
+        // geschnitten mit `[authority] capabilities` der IR und — für einen
+        // benutzerdefinierten Agenten — mit den Rechten seines Manifests.
+        // Ein reiner Schnitt: nie mehr als das Profil.
+        let granted = self.granted_for(role, profile);
         let assembled =
             assemble_registry_for_sandbox_with_definition_access_and_sandbox_profile_and_permits(
                 profile,
                 &self.project,
                 overrides,
                 child_chain.mode().clone(),
-                &profile.required_permissions(),
+                &granted,
                 None,
                 &self.sandbox_profile,
                 self.host_permit_wiring.clone(),
@@ -2083,7 +2123,12 @@ impl ChildRegistryFactory for RuntimeChildRegistryFactory {
             }
         });
         let access = harw_registry_defaults::profile::AgentDefinitionAccess {
-            project_agents_dir: Some(self.project.project_root.join(".harw").join("agents")),
+            project_agents_dir: Some(
+                self.project
+                    .project_root
+                    .join(harw_home::project_dir_name())
+                    .join("agents"),
+            ),
             profile_agents_dir: self.profile_agents_dir.clone(),
             mode: definition_write_mode_for_parent_role(parent.role),
             ceiling,
@@ -2119,6 +2164,38 @@ impl ChildRegistryFactory for RuntimeChildRegistryFactory {
         );
         Ok(registry)
     }
+}
+
+/// #22 Welle 1B: der Auftragsrahmen eines Kindes aus seiner IR —
+/// `job.goal_kind` und `spawn.workspace_hint` — als Instruktionsfragment.
+///
+/// # Description
+/// Die Laufzeit hat keinen Mechanismus, den Arbeitsbereich eines Kindes nach
+/// einem Hinweis zu wählen: die Sandbox des Kindes ist immer ein Schnitt der
+/// Eltern-Sandbox (`ManagedAgentSpawner::admit`). `workspace_hint` ist daher
+/// **beratend** und wird dem Kind nur mitgeteilt; `goal_kind` benennt die Art
+/// des Auftrags.
+///
+/// # Returns
+/// `None`, wenn die IR keins von beiden trägt.
+pub(crate) fn spawn_metadata_note(role: &str, ir: &ExecutableAgentIr) -> Option<String> {
+    let goal_kind = ir.job_template().goal_kind();
+    let workspace_hint = ir.spawn_contract().workspace_hint();
+    if goal_kind.is_none() && workspace_hint.is_none() {
+        return None;
+    }
+    let mut note = format!("# Auftragsrahmen ({role})");
+    if let Some(goal_kind) = goal_kind {
+        note.push_str(&format!("\n- Zielart (goal_kind): {goal_kind}"));
+    }
+    if let Some(hint) = workspace_hint {
+        note.push_str(&format!(
+            "\n- Arbeitsbereich-Hinweis (workspace_hint, beratend): {hint} — der \
+             Arbeitsbereich selbst ist durch die Sandbox des Elternteils festgelegt; \
+             arbeite innerhalb dieses Hinweises, soweit die Sandbox ihn umfasst."
+        ));
+    }
+    Some(note)
 }
 
 /// Vereinigt Katalog- und Definitions-Skills einer Rolle: Katalog zuerst,
@@ -4092,6 +4169,109 @@ specialization = "web-scout"
         );
         // Unbekannte Namen bleiben fail-closed.
         assert_eq!(factory.registry_profile_for("not-registered"), None);
+        Ok(())
+    }
+
+    /// #22 Welle 1B: `job.goal_kind` und `spawn.workspace_hint` erreichen das
+    /// Kind als Auftragsrahmen (der Hinweis ausdrücklich beratend); ohne
+    /// beide entsteht kein Fragment.
+    #[test]
+    fn spawn_metadata_note_carries_goal_kind_and_the_advisory_workspace_hint() -> TestResult {
+        let raw = harw_agent_dsl::parse::parse_toml(
+            "schema = \"harwness.agent/v1\"\n\
+             id = \"harwness.agent.framed-child@1\"\n\
+             version = \"1.0.0\"\n\
+             role = \"worker\"\n\
+             specialization = \"framed-child\"\n\n\
+             [job]\n\
+             goal_kind = \"review\"\n\n\
+             [spawn]\n\
+             workspace_hint = \"crates/foo\"\n",
+        )
+        .map_err(ctx("parse test definition"))?;
+        let resolved = harw_agent_dsl::resolved::ResolvedAgentDefinition {
+            id: raw.id,
+            version: raw.version,
+            role: raw.role,
+            specialization: raw.specialization,
+            name: raw.name,
+            description: raw.description,
+            reasoning_effort: raw.reasoning_effort,
+            authority: harw_agent_dsl::authority::AuthorityCeiling::default(),
+            trace: harw_agent_dsl::resolved::ResolutionTrace { steps: Vec::new() },
+            config: raw.tables,
+        };
+        let ir = harw_agent_dsl::lower(&resolved).map_err(ctx("lower test definition"))?;
+        let note = spawn_metadata_note("framed-child", &ir)
+            .ok_or(crate::test_support::TestError::Missing("Auftragsrahmen"))?;
+        assert!(note.contains("goal_kind): review"), "{note}");
+        assert!(note.contains("crates/foo"), "{note}");
+        assert!(note.contains("beratend"), "{note}");
+        let plain = ir_with_skills(&[])?;
+        assert!(spawn_metadata_note("skill-child", &plain).is_none());
+        Ok(())
+    }
+
+    /// #22 Welle 1B: `[authority] capabilities` eines eigenen Agenten
+    /// schneidet die Rechte seiner Kind-Registry — nie weiter als das
+    /// Profil. Eine eingebaute Rolle ohne Autorität behält ihr Profil.
+    #[test]
+    fn custom_agent_authority_narrows_the_child_registry_rights() -> TestResult {
+        use harw_authority::Permission;
+        let home = tempfile::tempdir().map_err(ctx("tempdir"))?;
+        let path = home.path().join("agents").join("scribe");
+        std::fs::create_dir_all(&path).map_err(ctx("Agentenordner"))?;
+        std::fs::write(
+            path.join("definition.toml"),
+            r#"schema = "harwness.agent/v1"
+id = "user.agent.scribe@1"
+version = "1.0.0"
+role = "worker"
+specialization = "scribe"
+
+[authority]
+capabilities = ["filesystem.read"]
+
+[tools]
+admitted = ["fs.read", "fs.write"]
+"#,
+        )
+        .map_err(ctx("definition"))?;
+        let config =
+            harw_config::discover_config(&[home.path().to_path_buf()]).map_err(ctx("Discovery"))?;
+        let builtin = builtin_agent_definitions(&HashMap::new()).map_err(ctx("Rollen"))?;
+        let roster = harw_registry_defaults::AgentRoster::from_config(&builtin, &config)
+            .map_err(ctx("Roster"))?;
+        let factory = RuntimeChildRegistryFactory::with_definitions(
+            test_project(),
+            Arc::new(harw_core::EchoModelProvider::new("echo")),
+            test_chain(&harw_config::ResolvedConfig::default()),
+            roster.definitions().clone(),
+        )
+        .with_custom_agents(roster.custom_wiring());
+
+        let profile = factory
+            .registry_profile_for("scribe")
+            .ok_or(crate::test_support::TestError::Missing("scribe profile"))?;
+        assert_eq!(
+            profile,
+            harw_registry_defaults::RegistryProfile::WorkspaceEdit,
+            "der generische Schreib-Worker"
+        );
+        let granted = factory.granted_for("scribe", profile);
+        assert!(granted.is_subset_of(&profile.required_permissions()));
+        assert!(granted.contains(Permission::ReadWorkspace));
+        assert!(
+            !granted.contains(Permission::WriteWorkspace),
+            "die Autorität nennt nur filesystem.read"
+        );
+
+        let explorer = profile_for_role(role_names::EXPLORER)
+            .ok_or(crate::test_support::TestError::Missing("explorer profile"))?;
+        assert_eq!(
+            factory.granted_for(role_names::EXPLORER, explorer),
+            explorer.required_permissions()
+        );
         Ok(())
     }
 }

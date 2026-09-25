@@ -1,0 +1,251 @@
+{
+  "schema": "harwness.agent-ir/v2",
+  "id": "harwness.agent.researcher-deps@1",
+  "version": "1.0.0",
+  "name": "Rust/Cargo Dependency Researcher",
+  "description": "Rust-Spezialist fuer Rust/Cargo-Abhaengigkeiten, offline: belegt Version, MSRV, Features und Verhalten je Crate aus Cargo.lock und dem lokalen Registry-Quellcache, ohne Netzzugang (docs.rs/crates.io fragt researcher-web ab). Andere Oekosysteme uebernimmt dependency-researcher.",
+  "role": "worker",
+  "specialization": "researcher-deps",
+  "reasoning_effort": null,
+  "authority": {
+    "capabilities": []
+  },
+  "instructions": {
+    "text": "",
+    "source": null,
+    "blake3": "af1349b9f5f9a1a6a0404dea36dcc9499bcb25c9adc112b7cc9a93cae41f3262"
+  },
+  "tools": {
+    "admitted": [
+      "fs.read",
+      "fs.list",
+      "fs.search",
+      "fs.glob",
+      "fs.grep",
+      "doc.read_pdf",
+      "deps.graph",
+      "deps.locked",
+      "deps.source_read",
+      "deps.source_search",
+      "deps.source_list",
+      "explore.tree",
+      "explore.projects",
+      "explore.relations",
+      "explore.find",
+      "workbench.show",
+      "diary.read",
+      "palace.search",
+      "palace.recall",
+      "parent.message",
+      "skills.search",
+      "skills.load"
+    ],
+    "forbidden": [
+      "fs.write",
+      "fs.edit",
+      "shell.exec",
+      "web.fetch",
+      "web.search",
+      "web.docs_rs",
+      "web.crates_io"
+    ]
+  },
+  "spawn": {
+    "max_depth": 1,
+    "child_orchestrators": [],
+    "delegation_targets": null,
+    "workspace_hint": null,
+    "budget": {
+      "max_tokens": 60000,
+      "max_tool_calls": 40,
+      "max_wall_secs": 180,
+      "effort_cap": null
+    }
+  },
+  "job": {
+    "goal_kind": null
+  },
+  "lifecycle": {
+    "allow_pause": false,
+    "allow_rerun": true,
+    "max_attempts": 4
+  },
+  "context": {
+    "program": "research-deps",
+    "program_id": "harwness.context.research-deps@1",
+    "policy": "harwness.context.research-deps@1",
+    "sections": [
+      {
+        "name": "task.objective",
+        "strength": "must-include",
+        "detail": "full",
+        "trust": "instruction"
+      },
+      {
+        "name": "history.tail",
+        "strength": "must-include",
+        "detail": "summary",
+        "trust": "evidence"
+      },
+      {
+        "name": "task.read_scope",
+        "strength": "must-include",
+        "detail": "full",
+        "trust": "data"
+      },
+      {
+        "name": "deps.lockfile_index",
+        "strength": "must-include",
+        "detail": "summary",
+        "trust": "evidence"
+      }
+    ],
+    "must_include": [
+      "task.objective",
+      "history.tail",
+      "task.read_scope",
+      "new.trigger_return"
+    ],
+    "exclude": [
+      "credential.*",
+      "secret.*",
+      "sibling_transcripts",
+      "full_parent_transcript",
+      "web.*"
+    ],
+    "deferred": [
+      "deps.lockfile_index"
+    ]
+  },
+  "return": {
+    "contract": "harwness.return.research-finding@1",
+    "validators": []
+  },
+  "models": null,
+  "limits": null,
+  "work": null,
+  "research": {
+    "sources": [
+      "source-tree",
+      "lockfiles",
+      "local-docs"
+    ],
+    "freshness": null,
+    "primary_sources_required": true,
+    "output": "structured-evidence",
+    "ecosystems": [
+      "cargo"
+    ],
+    "may_write_code": false,
+    "tradecraft": []
+  },
+  "verification": null,
+  "skills": {
+    "entries": []
+  },
+  "binary": {
+    "name": "researcher-deps",
+    "interfaces": [
+      "cli"
+    ],
+    "default_interface": "cli"
+  },
+  "permissions": {
+    "tools": [
+      "deps.graph",
+      "deps.locked",
+      "deps.source_list",
+      "deps.source_read",
+      "deps.source_search",
+      "diary.read",
+      "doc.read_pdf",
+      "explore.find",
+      "explore.projects",
+      "explore.relations",
+      "explore.tree",
+      "fs.glob",
+      "fs.grep",
+      "fs.list",
+      "fs.read",
+      "fs.search",
+      "palace.recall",
+      "palace.search",
+      "parent.message",
+      "skills.load",
+      "skills.search",
+      "workbench.show"
+    ],
+    "forbidden_tools": [
+      "fs.edit",
+      "fs.write",
+      "shell.exec",
+      "web.crates_io",
+      "web.docs_rs",
+      "web.fetch",
+      "web.search"
+    ],
+    "capabilities": [],
+    "filesystem": {
+      "read": true,
+      "write": false,
+      "write_paths": [],
+      "other_write_tools": []
+    },
+    "network": {
+      "mode": "off",
+      "tools": [],
+      "hosts": []
+    },
+    "shell": false,
+    "host": false,
+    "spawn": {
+      "max_depth": 1,
+      "child_orchestrators": [],
+      "delegation_targets": []
+    },
+    "budget": {
+      "max_tokens": 60000,
+      "max_tool_calls": 40,
+      "max_wall_secs": 180,
+      "effort_cap": null
+    },
+    "required_env": []
+  },
+  "trace": {
+    "steps": [
+      {
+        "source": "harwness.agent.worker-base@1",
+        "kind": "patch",
+        "applied_at": "1970-01-01T00:00:00Z"
+      },
+      {
+        "source": "harwness.agent.worker-base@1",
+        "kind": "base",
+        "applied_at": "1970-01-01T00:00:00Z"
+      },
+      {
+        "source": "harwness.agent.researcher-deps@1",
+        "kind": "patch",
+        "applied_at": "1970-01-01T00:00:00Z"
+      }
+    ],
+    "diagnostics": [
+      {
+        "code": "HARW-CTX-003",
+        "severity": "note",
+        "message": "program `research-deps` requires sections outside the context ceiling; deferred: deps.lockfile_index",
+        "help": "these sections stay named by the program but are not required at child start",
+        "span": {
+          "file": "builtin/researcher-deps.toml",
+          "line": 102,
+          "column": 11
+        },
+        "path": "context.program"
+      }
+    ]
+  },
+  "snapshot": {
+    "domain": "harwness.agent-ir.snapshot/v7",
+    "digest": "20ef396ea5db97a804639aabdac6af6e7de209352abf28d2cd3d8a7130b95682"
+  }
+}

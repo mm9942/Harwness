@@ -1,0 +1,186 @@
+{
+  "schema": "harwness.agent-ir/v2",
+  "id": "harwness.agent.scenario-player@1",
+  "version": "1.0.0",
+  "name": "Scenario Player",
+  "description": "Spielt in einem Szenario-Planspiel genau eine zugewiesene Rolle oder Welt: Züge mit Begründung, erwartete Reaktionen, Überraschungskandidaten. Read-only.",
+  "role": "worker",
+  "specialization": "scenario-player",
+  "reasoning_effort": null,
+  "authority": {
+    "capabilities": []
+  },
+  "instructions": {
+    "text": "# scenario-player\n\nDu spielst in einem Szenario-Planspiel **genau eine** zugewiesene Rolle (eine Partei, die Gegenspieler-Zelle oder das Umfeld) in **einer** Welt. Du handelst mit den Zielen, Mitteln und dem Wissen dieser Rolle, nicht mit denen des Auftraggebers.\n\nDer Skill `scenario-wargaming` ist fest geladen. Für die Gegenspieler-Zelle lade zusätzlich `premortem-and-red-team` über `skills.load`.\n\n## Vorgehen\n\n1. **Spielbuch lesen.** Welt, Rolle, Ziele, Mittel, Zwänge, was du weißt und was nicht, Zugnummer, bisherige Rückmeldungen der Spielleitung. Lies Unterlagen im Lesebereich nur, soweit deine Rolle sie kennen würde.\n2. **In der Rolle denken.** Schreib aus der Ich-Perspektive der Rolle. Frag: Was will ich in diesem Zug erreichen? Was fürchte ich? Was glaube ich, dass die anderen tun?\n3. **Zug festlegen.** Eine bis drei konkrete Handlungen mit Begründung aus Sicht der Rolle. Ein Zug ist eine Entscheidung, keine Absichtserklärung.\n4. **Erwartungen notieren.** Welche Reaktion der anderen erwartest du? Daran misst die Spielleitung später Überraschungen.\n5. **Überraschungen melden.** Was an der letzten Rückmeldung hat dich überrascht? Wo lag deine Annahme über die anderen daneben?\n6. **Als Gegenspieler-Zelle:** Such gezielt die Züge, mit denen niemand rechnet: Täuschung, Umgehung, Ausnutzen von Regeln, Timing. Fair im Rahmen der Welt, aber nicht nett.\n\n## Rückgabe\n\n```markdown\n**Rolle / Welt / Zug:** <Rolle> · <Welt> · Zug <n>\n**Ziel dieses Zugs:** …\n**Handlungen:**\n1. <Handlung> – <Begründung aus Sicht der Rolle>\n**Erwartete Reaktionen:** <Partei → erwartete Reaktion>\n**Überraschungen aus dem letzten Zug:** …\n**Überraschungskandidaten für die anderen:** <was sie vermutlich nicht erwarten>\n**Annahmen der Rolle:** <worauf der Zug baut>\n```\n\n## Was ich NICHT tue\n\n- Ich spiele keine zweite Rolle und bewerte nicht, wer „gewinnt“.\n- Ich nutze kein Wissen, das meine Rolle nicht haben kann (auch nicht aus anderen Welten).\n- Ich lege die Reaktion der anderen nicht fest; das tut die Spielleitung.\n- Keine Dateien schreiben, keine Prozesse, kein Netz, keine anderen Agenten starten.\n",
+    "source": "system.md",
+    "blake3": "539d7636bc49e2eb1ffd56c5e2a8fc03c5389f089f7b5f51e14cdee179d6fd40"
+  },
+  "tools": {
+    "admitted": [
+      "fs.read",
+      "fs.list",
+      "fs.search",
+      "fs.glob",
+      "fs.grep",
+      "doc.read_pdf",
+      "workbench.show",
+      "diary.read",
+      "palace.search",
+      "palace.recall",
+      "parent.message",
+      "skills.search",
+      "skills.load"
+    ],
+    "forbidden": [
+      "fs.write",
+      "fs.edit",
+      "shell.exec",
+      "web.fetch",
+      "web.search",
+      "web.docs_rs",
+      "web.crates_io"
+    ]
+  },
+  "spawn": {
+    "max_depth": 0,
+    "child_orchestrators": [],
+    "delegation_targets": null,
+    "workspace_hint": null,
+    "budget": {
+      "max_tokens": 60000,
+      "max_tool_calls": 30,
+      "max_wall_secs": 480,
+      "effort_cap": null
+    }
+  },
+  "job": {
+    "goal_kind": null
+  },
+  "lifecycle": {
+    "allow_pause": false,
+    "allow_rerun": true,
+    "max_attempts": 4
+  },
+  "context": {
+    "program": null,
+    "program_id": null,
+    "policy": null,
+    "sections": [],
+    "must_include": [
+      "task.objective",
+      "task.read_scope",
+      "new.trigger_return"
+    ],
+    "exclude": [
+      "full_parent_transcript",
+      "sibling_transcripts"
+    ],
+    "deferred": []
+  },
+  "return": {
+    "contract": "harwness.return.execution-summary@1",
+    "validators": []
+  },
+  "models": null,
+  "limits": null,
+  "work": {
+    "mode": "read-only-analysis",
+    "may_write_code": false,
+    "may_research_web": false,
+    "may_change_plan": null,
+    "aggregates_child_returns": null
+  },
+  "research": null,
+  "verification": null,
+  "skills": {
+    "entries": [
+      {
+        "name": "scenario-wargaming",
+        "hash": null
+      }
+    ]
+  },
+  "binary": {
+    "name": "scenario-player",
+    "interfaces": [
+      "cli"
+    ],
+    "default_interface": "cli"
+  },
+  "permissions": {
+    "tools": [
+      "diary.read",
+      "doc.read_pdf",
+      "fs.glob",
+      "fs.grep",
+      "fs.list",
+      "fs.read",
+      "fs.search",
+      "palace.recall",
+      "palace.search",
+      "parent.message",
+      "skills.load",
+      "skills.search",
+      "workbench.show"
+    ],
+    "forbidden_tools": [
+      "fs.edit",
+      "fs.write",
+      "shell.exec",
+      "web.crates_io",
+      "web.docs_rs",
+      "web.fetch",
+      "web.search"
+    ],
+    "capabilities": [],
+    "filesystem": {
+      "read": true,
+      "write": false,
+      "write_paths": [],
+      "other_write_tools": []
+    },
+    "network": {
+      "mode": "off",
+      "tools": [],
+      "hosts": []
+    },
+    "shell": false,
+    "host": false,
+    "spawn": {
+      "max_depth": 0,
+      "child_orchestrators": [],
+      "delegation_targets": []
+    },
+    "budget": {
+      "max_tokens": 60000,
+      "max_tool_calls": 30,
+      "max_wall_secs": 480,
+      "effort_cap": null
+    },
+    "required_env": []
+  },
+  "trace": {
+    "steps": [
+      {
+        "source": "harwness.agent.worker-base@1",
+        "kind": "patch",
+        "applied_at": "1970-01-01T00:00:00Z"
+      },
+      {
+        "source": "harwness.agent.worker-base@1",
+        "kind": "base",
+        "applied_at": "1970-01-01T00:00:00Z"
+      },
+      {
+        "source": "harwness.agent.scenario-player@1",
+        "kind": "patch",
+        "applied_at": "1970-01-01T00:00:00Z"
+      }
+    ],
+    "diagnostics": []
+  },
+  "snapshot": {
+    "domain": "harwness.agent-ir.snapshot/v7",
+    "digest": "e2fd2d772a87a5f644eb667911aab60dc8364d001dff999471bb0bf30ac5bc49"
+  }
+}

@@ -21,14 +21,17 @@ harw-research = { path = "../harw-research" }
 # `harw-dod-warden-proto`: dieser Adapter darf aus einem Verdikt keine
 # `WardenAction` bauen können (siehe `agent_tool.rs`, `ChildReturnContract`).
 harw-dod-signals = { path = "../dod/crates/harw-dod-signals" }
+# #22 Welle 1B: das geschlossene Vokabular der Return-Contracts und
+# -Validatoren der Agent-IR v2 (`ChildReturnContract::parse` ist strikt).
+harw-agent-dsl = { path = "../harw-agent-dsl" }
 serde_json = "1.0.150"
 tracing = "0.1.44"
 
 [dev-dependencies]
 tokio = { version = "1.52.3", features = ["rt", "rt-multi-thread", "macros"] }
-# Nur für Tests: eine gefrorene Agent-IR bauen bzw. eine ChildRegistryFactory
-# implementieren, um die Contract-Auflösung über den OpContext zu prüfen.
-harw-agent-dsl = { path = "../harw-agent-dsl" }
+# Nur für Tests: eine ChildRegistryFactory implementieren, um die
+# Contract-Auflösung über den OpContext zu prüfen (`harw-agent-dsl` ist seit
+# #22 Welle 1B eine reguläre Abhängigkeit, siehe oben).
 harw-catalog = { path = "../harw-catalog" }
 # Nur für Tests: schaltet `harw_authority::SandboxSpec::from_resolved_for_test`
 # frei, das eine Sandbox mit einem echten, nicht-leeren `NetworkScope` baut —

@@ -82,6 +82,9 @@ const fn tenant_name(entry: EntryKind) -> &'static str {
         EntryKind::JobPrompt | EntryKind::JobPlanNode => "job",
         EntryKind::GatewayTelegram => "gateway-telegram",
         EntryKind::GatewayDream => "gateway-dream",
+        // #22 Welle 3A: ein kompilierter Agent bindet seine Wurzel-Sandbox
+        // wie die CLI (`OneShot`/`LocalEcho`/…) — derselbe lokale Mensch.
+        EntryKind::CompiledAgent => "cli",
     }
 }
 
@@ -182,8 +185,22 @@ pub fn root_sandbox_with_network(
     project_root: &Path,
     network_scope: NetworkScope,
 ) -> RuntimeResult<SandboxSpec> {
+    root_sandbox_with_permissions(
+        entry,
+        project_root,
+        network_scope,
+        entry.profile().permissions,
+    )
+}
+
+/// Binds a root using the already resolved manifest permission ceiling.
+pub(crate) fn root_sandbox_with_permissions(
+    entry: EntryKind,
+    project_root: &Path,
+    network_scope: NetworkScope,
+    permissions: PermissionSet,
+) -> RuntimeResult<SandboxSpec> {
     let binding = bind_project(tenant_name(entry), project_root)?;
-    let permissions = entry.profile().permissions;
     if permissions.contains(Permission::NetworkAccess) && !network_scope.is_empty() {
         return Ok(SandboxSpec::from_resolved_with_network(
             binding,

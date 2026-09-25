@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Harwness installer — installs `harw` and `killer` either by building from
+# Harwness installer — installs `harw`, `killer` and `harw-agent-runner` by building from
 # source or by downloading a prebuilt release tarball.
 #
 # Usage:
@@ -8,7 +8,7 @@
 #   scripts/install.sh --binary [--version TAG] # download a prebuilt release tarball
 #
 # Modes:
-#   --source   Build `harw` and `killer` with `cargo build --release` (needs
+#   --source   Build all three binaries with the release profiles (needs
 #              a Rust toolchain). This is the default when `cargo` is on
 #              PATH. If `make` is also available, this delegates to
 #              `make install BINDIR=…` (the repo's single entry point,
@@ -17,8 +17,8 @@
 #              default when `cargo` is NOT on PATH. Requires HARW_REPO (see
 #              below) unless run inside a git checkout of the Harwness repo,
 #              in which case the origin remote is used to find it. The
-#              tarball contains `harw`, `killer`, `LICENSE-MIT`,
-#              `LICENSE-APACHE` and `README.md`; only the two binaries are
+#              tarball contains `harw`, `killer`, `harw-agent-runner`,
+#              licenses and `README.md`; all three binaries are
 #              installed.
 #
 # Environment:
@@ -97,16 +97,35 @@ install_from_source() {
 
   log "Building harw + killer (release)…"
   ( cd "$repo_root" && cargo build --release --bin harw --bin killer )
+  log "Building harw-agent-runner (release-runner)…"
+  ( cd "$repo_root" && cargo build --profile release-runner --bin harw-agent-runner )
 
   built_harw="$repo_root/target/release/harw"
   built_killer="$repo_root/target/release/killer"
+  built_runner="$repo_root/target/release-runner/harw-agent-runner"
   [ -x "$built_harw" ] || die "build did not produce $built_harw"
   [ -x "$built_killer" ] || die "build did not produce $built_killer"
+  [ -x "$built_runner" ] || die "build did not produce $built_runner"
 
   mkdir -p "$install_dir"
   install -m 0755 "$built_harw" "$install_dir/harw"
   install -m 0755 "$built_killer" "$install_dir/killer"
-  log "Installed $install_dir/harw and $install_dir/killer"
+  install -m 0755 "$built_runner" "$install_dir/harw-agent-runner"
+  log "Installed $install_dir/harw, $install_dir/killer and $install_dir/harw-agent-runner"
+
+  # Same runner cache layout as `make install` (see root Makefile): a copy
+  # keyed by host target triple and workspace version, so a compiled agent
+  # can find a matching runner without re-resolving the build.
+  harw_home="${HARW_HOME:-$HOME/.harw}"
+  host_target="$(rustc -vV | sed -n 's/^host: //p')"
+  harw_version="$(awk -F'"' '/^version = /{print $2; exit}' "$repo_root/Cargo.toml")"
+  runner_cache_dir="$harw_home/bin/.runners/$host_target/$harw_version"
+  mkdir -p "$runner_cache_dir"
+  install -m 0755 "$built_runner" "$runner_cache_dir/harw-agent-runner"
+  log "Runner copy: $runner_cache_dir/harw-agent-runner"
+
+  "$install_dir/harw" agent install-record --source-dir "$repo_root" --bindir "$install_dir"
+  "$install_dir/harw" agent auto-build-uia || true
 }
 
 # --- Mode: binary --------------------------------------------------------------
@@ -234,10 +253,20 @@ install_from_binary() {
   [ -n "$extracted_killer" ] || extracted_killer="$(find "$work_dir" -type f -name killer | head -n1)"
   [ -n "$extracted_killer" ] || die "downloaded archive did not contain a 'killer' binary"
 
+  extracted_runner="$(find "$work_dir" -type f -name harw-agent-runner -perm -u+x | head -n1)"
+  [ -n "$extracted_runner" ] || extracted_runner="$(find "$work_dir" -type f -name harw-agent-runner | head -n1)"
+  [ -n "$extracted_runner" ] || die "downloaded archive did not contain a 'harw-agent-runner' binary"
+
   mkdir -p "$install_dir"
   install -m 0755 "$extracted_harw" "$install_dir/harw"
   install -m 0755 "$extracted_killer" "$install_dir/killer"
-  log "Installed $install_dir/harw and $install_dir/killer ($tag, $target)"
+  install -m 0755 "$extracted_runner" "$install_dir/harw-agent-runner"
+  log "Installed $install_dir/harw, $install_dir/killer and $install_dir/harw-agent-runner ($tag, $target)"
+
+  # A downloaded installation has no source checkout. Record only its bin
+  # directory; the native backend can still use an explicit HARW_SRC.
+  "$install_dir/harw" agent install-record --bindir "$install_dir"
+  "$install_dir/harw" agent auto-build-uia || true
 }
 
 # --- Run ----------------------------------------------------------------------

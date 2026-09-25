@@ -434,6 +434,12 @@ pub static FIELD_TABLE: &[FieldScope] = &[
     // Zeitlimits. Home und Profil setzen frei, ein nicht vertrautes Projekt
     // senkt nur (`merge_shell_limits`); Klemmen erst beim Lesen.
     FieldScope { path: "shell.max_timeout_secs", scope: Scope::Profile, merge: MergeRule::MinBound, ordering: None, intersection_key: None, security_critical: true },
+    // [agent_compiler] (3) — #22 Welle 2B: Build-Cache, Versionsaufbewahrung
+    // und UIA-Autobuild. Reine Komfort-Grenzen ohne Rechtewirkung; ein nicht
+    // vertrautes Projekt darf sie nicht setzen (`merge_agent_compiler`).
+    FieldScope { path: "agent_compiler.cache_max_bytes", scope: Scope::Profile, merge: MergeRule::ProfileReplaces, ordering: None, intersection_key: None, security_critical: false },
+    FieldScope { path: "agent_compiler.keep_versions", scope: Scope::Profile, merge: MergeRule::ProfileReplaces, ordering: None, intersection_key: None, security_critical: false },
+    FieldScope { path: "agent_compiler.auto_build_uia", scope: Scope::Profile, merge: MergeRule::ProfileReplaces, ordering: None, intersection_key: None, security_critical: false },
 ];
 
 #[cfg(test)]
@@ -452,7 +458,8 @@ mod merge_rule_tests {
         // Runde 7, Teil A2: +2 für `guards.orchestrator_read_*`.
         // Runde 7, Teil L4: +1 für `permissions.auto_classifier_timeout_secs`.
         // `[tools.doc]`: +1 für `tools.doc.remote_ocr`.
-        assert_eq!(FIELD_TABLE.len(), 115);
+        // #22 Welle 2B: +3 für `agent_compiler.*`.
+        assert_eq!(FIELD_TABLE.len(), 118);
     }
 
     #[test]
@@ -469,7 +476,8 @@ mod merge_rule_tests {
         let count = |rule: MergeRule| FIELD_TABLE.iter().filter(|f| f.merge == rule).count();
         // Runde 5: Teil E +1 (`internal_models.auto_classifier`), Teil G +5
         // (`uia_worker_models.*`), Teil I +1 (`tui.child_stream`).
-        assert_eq!(count(MergeRule::ProfileReplaces), 57);
+        // #22 Welle 2B: +3 (`agent_compiler.*`).
+        assert_eq!(count(MergeRule::ProfileReplaces), 60);
         assert_eq!(count(MergeRule::GlobalOnly), 11);
         // Runde 5, Teil K: +4 (`agents.*`); Teil N: +1 (`shell.max_timeout_secs`).
         // Runde 7: Teil A2 +2 (`guards.orchestrator_read_*`), Teil L4 +1

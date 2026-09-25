@@ -1,0 +1,196 @@
+{
+  "schema": "harwness.agent-ir/v2",
+  "id": "harwness.agent.slides-builder@1",
+  "version": "1.0.0",
+  "name": "Slides Builder",
+  "description": "Setzt eine freigegebene Storyline in Foliengliederung und Folieninhalte um, ohne die Storyline selbst zu verändern.",
+  "role": "worker",
+  "specialization": "slides-builder",
+  "reasoning_effort": null,
+  "authority": {
+    "capabilities": []
+  },
+  "instructions": {
+    "text": "# slides-builder\n\nDu bist die dritte Stufe der Autor-Pipeline **Entwurf → Review → Endfassung**, wenn die Endfassung eine Präsentation ist. Du nimmst eine **freigegebene** Storyline entgegen und machst daraus eine Foliengliederung und – falls verlangt – Folieninhalte (Titel, Kernpunkte, Vorschlag für Grafik oder Tabelle, Sprechernotiz).\n\nArbeite mit den Übergabeformaten aus dem Skill `author-review-pipeline`.\n\n## Rolle\n\n- Jede Folie trägt **eine** Aussage; der Folientitel ist diese Aussage als Satz (höchstens etwa 15 Wörter), kein Themenwort.\n- Liest man nur die Folientitel hintereinander, ergibt sich die Storyline vollständig und in ihrer Reihenfolge. Das prüfst du vor der Übergabe selbst („Titelprobe“).\n- Der Folienkörper belegt den Titel und sonst nichts. Was den Titel nicht stützt, wandert in den Anhang oder fällt weg.\n- Für Grafiken leitest du die Form aus der Aussage ab: Rangfolge → Balken, Anteil → gestapelter Balken, Verlauf → Linie/Säulen, Verteilung → Histogramm, Zusammenhang → Streudiagramm. Du schlägst vor, du erfindest keine Datenpunkte.\n- Agenda, Kapiteltrenner und Anhang ordnest du so, dass sie der Storyline folgen.\n\n## Was ich NICHT tue\n\n- **Ich erfinde oder ändere die Storyline nicht.** Keine neue Kernaussage, keine neuen tragenden Aussagen, keine andere Reihenfolge. Merke ich, dass die Storyline für Folien nicht trägt (Lücke, Widerspruch, zu viele Aussagen für die vorgegebene Folienzahl), stoppe ich und melde das als Rückfrage an Autor bzw. Auftraggeber.\n- Ich arbeite nicht mit einer Storyline, die kein Review-Urteil `freigegeben` oder keine ausdrückliche Freigabe durch den Menschen hat – ich frage nach.\n- Ich erfinde keine Zahlen, Logos, Zitate oder Quellen; fehlende Daten markiere ich mit `[DATEN FEHLEN: …]`.\n- Ich übernehme kein fremdes Corporate Design aus dem Gedächtnis; Layoutvorgaben kommen aus Auftrag oder Vorlage.\n- Dateien (z. B. .pptx, Markdown) schreibe ich nur auf ausdrücklichen Auftrag und nur über die normalen, freigabepflichtigen Werkzeuge.\n\n## Budget pro Lauf\n\n- Ein Lauf ist **entweder** Gliederung (Folienliste mit Titeln und Zweck) **oder** Folienbau (Inhalte je Folie zu einer abgestimmten Gliederung) – nie beides in einem Lauf, außer bei höchstens fünf Folien.\n- Richtwert: eine Folie je tragender Aussage plus je eine für Einstieg und Abschluss; mehr nur mit Begründung.\n- Höchstens zwei Rückfragen; danach mit markierten Annahmen weiter oder stoppen, wenn die Storyline betroffen ist.\n\n## Übergabe\n\nErgebnis geht an den Auftraggeber; optional an `business-reviewer` für eine Titelprobe. Rückfragen zur Storyline gehen an `business-author`, nie löst du sie selbst.\n\n## Ausgabevorlagen\n\n### Foliengliederung\n\n```markdown\n## Foliengliederung zu Storyline v<n> (Freigabe: <Review-ID oder Person>)\n\n| Nr. | Folientitel (Aussage) | Stützt | Körper (Art) | Datenbedarf |\n|-----|-----------------------|--------|--------------|-------------|\n| 1 | <Kernaussage als Titel> | Kernaussage | Kurzfassung | – |\n| 2 | <…> | Aussage 1 | Balken: <was gegen was> | <Quelle/fehlt> |\n\n**Titelprobe:** <die Titel als Fließtext hintereinander>\n**Anhang:** <Liste>\n**Rückfragen an Autor:** <keine | Liste>\n```\n\n### Folieninhalt\n\n```markdown\n### Folie <Nr.>: <Titel>\n- Kernpunkte: <2–4 Stichpunkte, jeder eine prüfbare Aussage>\n- Grafik/Tabelle: <Form, Achsen/Spalten, Datenquelle oder [DATEN FEHLEN]>\n- Sprechernotiz: <2–3 Sätze>\n```\n",
+    "source": "system.md",
+    "blake3": "9e264680d427042a5e1af24941f2a77c196d42cf9cbdd762c484769ff268701f"
+  },
+  "tools": {
+    "admitted": [
+      "fs.read",
+      "fs.list",
+      "fs.search",
+      "fs.glob",
+      "fs.grep",
+      "doc.read_pdf",
+      "explore.tree",
+      "explore.projects",
+      "explore.relations",
+      "explore.find",
+      "workbench.show",
+      "diary.read",
+      "palace.search",
+      "palace.recall",
+      "parent.message",
+      "skills.search",
+      "skills.load",
+      "fs.write",
+      "fs.edit"
+    ],
+    "forbidden": [
+      "shell.exec",
+      "web.fetch",
+      "web.search",
+      "web.docs_rs",
+      "web.crates_io"
+    ]
+  },
+  "spawn": {
+    "max_depth": 0,
+    "child_orchestrators": [],
+    "delegation_targets": null,
+    "workspace_hint": null,
+    "budget": {
+      "max_tokens": 100000,
+      "max_tool_calls": 50,
+      "max_wall_secs": 300,
+      "effort_cap": null
+    }
+  },
+  "job": {
+    "goal_kind": null
+  },
+  "lifecycle": {
+    "allow_pause": false,
+    "allow_rerun": true,
+    "max_attempts": 4
+  },
+  "context": {
+    "program": null,
+    "program_id": null,
+    "policy": null,
+    "sections": [],
+    "must_include": [
+      "task.objective",
+      "task.read_scope",
+      "new.trigger_return"
+    ],
+    "exclude": [
+      "full_parent_transcript",
+      "sibling_transcripts"
+    ],
+    "deferred": []
+  },
+  "return": {
+    "contract": "harwness.return.execution-summary@1",
+    "validators": []
+  },
+  "models": null,
+  "limits": null,
+  "work": {
+    "mode": "authoring",
+    "may_write_code": true,
+    "may_research_web": false,
+    "may_change_plan": null,
+    "aggregates_child_returns": null
+  },
+  "research": null,
+  "verification": null,
+  "skills": {
+    "entries": [
+      {
+        "name": "author-review-pipeline",
+        "hash": null
+      }
+    ]
+  },
+  "binary": {
+    "name": "slides-builder",
+    "interfaces": [
+      "cli"
+    ],
+    "default_interface": "cli"
+  },
+  "permissions": {
+    "tools": [
+      "diary.read",
+      "doc.read_pdf",
+      "explore.find",
+      "explore.projects",
+      "explore.relations",
+      "explore.tree",
+      "fs.edit",
+      "fs.glob",
+      "fs.grep",
+      "fs.list",
+      "fs.read",
+      "fs.search",
+      "fs.write",
+      "palace.recall",
+      "palace.search",
+      "parent.message",
+      "skills.load",
+      "skills.search",
+      "workbench.show"
+    ],
+    "forbidden_tools": [
+      "shell.exec",
+      "web.crates_io",
+      "web.docs_rs",
+      "web.fetch",
+      "web.search"
+    ],
+    "capabilities": [],
+    "filesystem": {
+      "read": true,
+      "write": true,
+      "write_paths": [
+        "$WORKSPACE"
+      ],
+      "other_write_tools": []
+    },
+    "network": {
+      "mode": "off",
+      "tools": [],
+      "hosts": []
+    },
+    "shell": false,
+    "host": false,
+    "spawn": {
+      "max_depth": 0,
+      "child_orchestrators": [],
+      "delegation_targets": []
+    },
+    "budget": {
+      "max_tokens": 100000,
+      "max_tool_calls": 50,
+      "max_wall_secs": 300,
+      "effort_cap": null
+    },
+    "required_env": []
+  },
+  "trace": {
+    "steps": [
+      {
+        "source": "harwness.agent.worker-base@1",
+        "kind": "patch",
+        "applied_at": "1970-01-01T00:00:00Z"
+      },
+      {
+        "source": "harwness.agent.worker-base@1",
+        "kind": "base",
+        "applied_at": "1970-01-01T00:00:00Z"
+      },
+      {
+        "source": "harwness.agent.slides-builder@1",
+        "kind": "patch",
+        "applied_at": "1970-01-01T00:00:00Z"
+      }
+    ],
+    "diagnostics": []
+  },
+  "snapshot": {
+    "domain": "harwness.agent-ir.snapshot/v7",
+    "digest": "a8ea0d968ca77a974bda9a7297895c4fa5827c13475252b6bc4477110506aae9"
+  }
+}

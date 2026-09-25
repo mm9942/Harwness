@@ -69,8 +69,9 @@ impl PlanModeGate {
         }
         Some(format!(
             "Plan-Modus aktiv: „{tool}“ ist gesperrt. Im Plan-Modus sind nur lesende \
-             Werkzeuge, Recherche, plan.write (nur .harw/plans/) und ask_user erlaubt. \
-             Schreibe den Plan mit plan.write und lege ihn mit plan.exit zur Freigabe vor."
+             Werkzeuge, Recherche, plan.write (nur {}/) und ask_user erlaubt. \
+             Schreibe den Plan mit plan.write und lege ihn mit plan.exit zur Freigabe vor.",
+            crate::plan_file::plan_display_prefix()
         ))
     }
 }

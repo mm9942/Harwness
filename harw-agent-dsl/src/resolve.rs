@@ -22,10 +22,41 @@ use crate::authority::AuthorityCeiling;
 use crate::error::{DiagLocation, DslError, DslResult};
 use crate::ids::DefinitionId;
 use crate::layers::DefinitionLayer;
-use crate::merge::{MergeOp, apply_merge_op};
+use crate::merge::{MergeOp, PATCH_OPERATOR_KEYS, apply_merge_op};
 use crate::raw::RawAgentDefinition;
 use crate::resolved::{ResolutionStep, ResolutionTrace, ResolvedAgentDefinition};
 use crate::skills::{SKILLS_CONFIG_KEY, union_skills, validate_skill_list, validate_skill_name};
+
+/// Schema-Label einer Agentendefinition.
+pub const AGENT_SCHEMA: &str = "harwness.agent/v1";
+
+/// Schema-Label eines Mixins.
+pub const MIXIN_SCHEMA: &str = "harwness.mixin/v1";
+
+/// Zulässige Schemata für Ziel- und `extends`-Definitionen.
+const AGENT_SCHEMAS: &[&str] = &[AGENT_SCHEMA];
+
+/// Zulässige Schemata für Mixins (ein Mixin darf auch als Agent deklariert sein).
+const MIXIN_SCHEMAS: &[&str] = &[MIXIN_SCHEMA, AGENT_SCHEMA];
+
+/// Prüft das `schema`-Feld einer Definition.
+///
+/// # Errors
+/// [`DslError::SchemaMismatch`], wenn `definition.schema` nicht in `accepted` liegt.
+fn check_schema(
+    definition: &RawAgentDefinition,
+    accepted: &'static [&'static str],
+) -> DslResult<()> {
+    if accepted.contains(&definition.schema.as_str()) {
+        return Ok(());
+    }
+    Err(DslError::SchemaMismatch {
+        of: Box::new(definition.id.clone()),
+        expected: accepted,
+        found: definition.schema.clone(),
+        location: DiagLocation::field("schema"),
+    })
+}
 
 /// Löst eine geschichtete Definitions-Menge in eine [`ResolvedAgentDefinition`] auf.
 ///
@@ -55,6 +86,10 @@ use crate::skills::{SKILLS_CONFIG_KEY, union_skills, validate_skill_list, valida
 /// - [`DslError::MissingBase`]: wenn `extends` auf eine nicht vorhandene Definition zeigt.
 /// - [`DslError::MissingMixin`]: wenn ein `mixin` nicht in den Schichten gefunden wird.
 /// - [`DslError::AuthorityElevation`]: wenn ein Patch Authority unzulässig erhöht.
+/// - [`DslError::SchemaMismatch`]: wenn eine Ziel- oder Basisdefinition nicht
+///   `harwness.agent/v1` bzw. ein Mixin weder `harwness.mixin/v1` noch
+///   `harwness.agent/v1` deklariert.
+/// - `DslError::Patch*`: wenn ein Patch-Pfad oder -Operator ungültig ist (§7).
 ///
 /// # Nebenläufigkeit
 /// Zustandslos; thread-sicher.
@@ -120,6 +155,9 @@ pub fn resolve_definition(
             location: DiagLocation::none(),
         })?;
     let authoritative_role = base_target.role;
+    for definition in &target_layers {
+        check_schema(definition, AGENT_SCHEMAS)?;
+    }
 
     let mut ctx = ResolveCtx {
         target_id,
@@ -249,6 +287,7 @@ fn resolve_extends(
         });
     }
 
+    check_schema(base, AGENT_SCHEMAS)?;
     active_extends.push((base.id.clone(), base.version.clone()));
     resolve_extends(base, ctx, active_extends)?;
     active_extends.pop();
@@ -278,6 +317,7 @@ fn apply_mixins(
                 referenced: Box::new(mixin_ref.clone()),
                 location: DiagLocation::field(format!("mixins[{mixin_idx}]")),
             })?;
+        check_schema(mixin, MIXIN_SCHEMAS)?;
         // Mixins dürfen die Rolle nicht ändern (§6)
         if mixin.role != authoritative_role {
             return Err(DslError::IllegalRoleForMixin {
@@ -457,6 +497,16 @@ fn merge_overlay_tables(target: &mut toml::Table, source: &toml::Table) {
 }
 
 /// Wendet alle Patch-Operationen an und prüft Authority-Monotonie.
+///
+/// # Beschreibung
+/// Jeder Schlüssel unter `[patch]` ist ein Pfad in die akkumulierte Config.
+/// Eine Patch-Tabelle führt entweder Operatoren (`replace`, `append`, …,
+/// siehe [`PATCH_OPERATOR_KEYS`]) für genau diesen Pfad oder verschachtelte
+/// Schlüssel für tiefere Pfade — `[patch.context.must_include] append = […]`
+/// wirkt also auf `context.must_include` (§7). Beides zugleich ist
+/// mehrdeutig und ein Fehler. `[patch.skills]` hat einen eigenen Pfad
+/// ([`apply_skills_patch`]), `[patch.authority]` ebenfalls
+/// ([`apply_authority_patch`]).
 fn apply_patches(
     config: &mut toml::Table,
     authority: &mut AuthorityCeiling,
@@ -470,46 +520,151 @@ fn apply_patches(
             continue;
         }
         if field == "authority" {
-            // Authority-Patch: nur Intersect erlaubt
-            let patch_table = match patch_value.as_table() {
-                Some(t) => t,
-                None => continue,
+            apply_authority_patch(authority, patch_value, target_id, parent_authority)?;
+            continue;
+        }
+        apply_patch_path(config, field, patch_value, field)?;
+    }
+    Ok(())
+}
+
+/// `true`, wenn `key` ein Merge-Operator einer Patch-Tabelle ist.
+fn is_operator_key(key: &str) -> bool {
+    PATCH_OPERATOR_KEYS.contains(&key)
+}
+
+/// Wendet den Patch `patch_value` auf `parent[key]` an; `path` ist der
+/// punktierte Pfad relativ zur Config (für Fehlermeldungen).
+///
+/// # Errors
+/// - [`DslError::UnknownMergeOp`]: `patch_value` ist keine Tabelle.
+/// - [`DslError::PatchAmbiguous`]: Operatoren und verschachtelte Schlüssel gemischt.
+/// - [`DslError::PatchPathMissing`]: der Pfad existiert nicht und der Patch
+///   ist kein `replace`.
+/// - [`DslError::PatchTypeMismatch`] / [`DslError::PatchExceedsParent`]: aus
+///   dem Operator selbst.
+fn apply_patch_path(
+    parent: &mut toml::Table,
+    key: &str,
+    patch_value: &toml::Value,
+    path: &str,
+) -> DslResult<()> {
+    let location_path = format!("patch.{path}");
+    let Some(patch_table) = patch_value.as_table() else {
+        return Err(DslError::UnknownMergeOp {
+            name: format!(
+                "patch value at '{location_path}' must be a table of operators or nested keys, found {}",
+                patch_value.type_str()
+            ),
+        });
+    };
+    let has_operators = patch_table.keys().any(|k| is_operator_key(k));
+    let has_nested = patch_table.keys().any(|k| !is_operator_key(k));
+    if has_operators && has_nested {
+        return Err(DslError::PatchAmbiguous {
+            path: path.to_owned(),
+            location: DiagLocation::field(location_path),
+        });
+    }
+    if has_operators {
+        if !parent.contains_key(key) {
+            if !patch_table.contains_key("replace") {
+                return Err(DslError::PatchPathMissing {
+                    path: path.to_owned(),
+                    location: DiagLocation::field(location_path),
+                });
+            }
+            parent.insert(key.to_owned(), toml::Value::Table(toml::Table::new()));
+        }
+        let Some(slot) = parent.get_mut(key) else {
+            return Err(DslError::PatchPathMissing {
+                path: path.to_owned(),
+                location: DiagLocation::field(location_path),
+            });
+        };
+        return try_apply_table_op(slot, patch_table)
+            .map_err(|error| error.with_field_path(&location_path));
+    }
+    if patch_table.is_empty() {
+        return Ok(());
+    }
+    let Some(slot) = parent.get_mut(key) else {
+        return Err(DslError::PatchPathMissing {
+            path: path.to_owned(),
+            location: DiagLocation::field(location_path),
+        });
+    };
+    let found = slot.type_str();
+    let Some(slot_table) = slot.as_table_mut() else {
+        return Err(DslError::PatchTypeMismatch {
+            op: "nested patch path".to_owned(),
+            expected: "table",
+            found,
+            location: DiagLocation::field(location_path),
+        });
+    };
+    for (sub_key, sub_value) in patch_table {
+        apply_patch_path(slot_table, sub_key, sub_value, &format!("{path}.{sub_key}"))?;
+    }
+    Ok(())
+}
+
+/// Wendet `[patch.authority]` an: nur `capabilities` mit `intersect` oder
+/// `remove` (§7). `append` ist eine Elevation, jeder andere Operator ist
+/// verboten.
+fn apply_authority_patch(
+    authority: &mut AuthorityCeiling,
+    patch_value: &toml::Value,
+    target_id: &DefinitionId,
+    parent_authority: &AuthorityCeiling,
+) -> DslResult<()> {
+    let Some(patch_table) = patch_value.as_table() else {
+        return Err(DslError::PatchTypeMismatch {
+            op: "patch".to_owned(),
+            expected: "table",
+            found: patch_value.type_str(),
+            location: DiagLocation::field("patch.authority"),
+        });
+    };
+    for (key, caps_patch) in patch_table {
+        if key != "capabilities" {
+            return Err(DslError::PatchPathMissing {
+                path: format!("authority.{key}"),
+                location: DiagLocation::field(format!("patch.authority.{key}")),
+            });
+        }
+        let Some(operators) = caps_patch.as_table() else {
+            return Err(DslError::PatchTypeMismatch {
+                op: "patch".to_owned(),
+                expected: "table",
+                found: caps_patch.type_str(),
+                location: DiagLocation::field("patch.authority.capabilities"),
+            });
+        };
+        for (op, values) in operators {
+            let location = DiagLocation::field(format!("patch.authority.capabilities.{op}"));
+            let Some(array) = values.as_array() else {
+                if !is_operator_key(op) {
+                    return Err(DslError::UnknownMergeOp { name: op.clone() });
+                }
+                return Err(DslError::PatchTypeMismatch {
+                    op: op.clone(),
+                    expected: "array",
+                    found: values.type_str(),
+                    location,
+                });
             };
-            if let Some(caps_patch) = patch_table.get("capabilities") {
-                let patch_caps_table = caps_patch.as_table();
-                if let Some(pt) = patch_caps_table {
-                    if let Some(intersect_val) = pt.get("intersect") {
-                        // Intersect-Operation auf authority.capabilities
-                        let intersect_caps: Vec<String> = intersect_val
-                            .as_array()
-                            .unwrap_or(&vec![])
-                            .iter()
-                            .filter_map(|v| v.as_str().map(str::to_owned))
-                            .collect();
-
-                        let intersect_ceiling = AuthorityCeiling {
-                            capabilities: intersect_caps,
-                        };
-
-                        *authority = authority.intersect(&intersect_ceiling);
-
-                        // Prüfe, dass das Ergebnis keine neuen Caps gegenüber parent enthält
-                        let added = authority.added_relative_to(parent_authority);
-                        if !added.is_empty() && !parent_authority.capabilities.is_empty() {
-                            return Err(DslError::AuthorityElevation {
-                                of: Box::new(target_id.clone()),
-                                added_capabilities: added,
-                                location: DiagLocation::field("authority.capabilities"),
-                            });
-                        }
-                    } else if let Some(append_val) = pt.get("append") {
-                        // Append auf authority.capabilities ist verboten (§7)
-                        let added: Vec<String> = append_val
-                            .as_array()
-                            .unwrap_or(&vec![])
-                            .iter()
-                            .filter_map(|v| v.as_str().map(str::to_owned))
-                            .collect();
+            let caps: Vec<String> = array
+                .iter()
+                .filter_map(|v| v.as_str().map(str::to_owned))
+                .collect();
+            match op.as_str() {
+                "intersect" => {
+                    let intersect_ceiling = AuthorityCeiling { capabilities: caps };
+                    *authority = authority.intersect(&intersect_ceiling);
+                    // Prüfe, dass das Ergebnis keine neuen Caps gegenüber parent enthält
+                    let added = authority.added_relative_to(parent_authority);
+                    if !added.is_empty() && !parent_authority.capabilities.is_empty() {
                         return Err(DslError::AuthorityElevation {
                             of: Box::new(target_id.clone()),
                             added_capabilities: added,
@@ -517,16 +672,31 @@ fn apply_patches(
                         });
                     }
                 }
-            }
-        } else {
-            // Normaler Patch auf config-Tabelle
-            let current = config
-                .entry(field.clone())
-                .or_insert_with(|| toml::Value::Table(toml::Table::new()));
-
-            // Patch-Value als Tabelle mit op-Schlüssel interpretieren
-            if let Some(patch_table) = patch_value.as_table() {
-                try_apply_table_op(current, patch_table)?;
+                "remove" => {
+                    authority
+                        .capabilities
+                        .retain(|capability| !caps.contains(capability));
+                }
+                "append" | "prepend" => {
+                    // Hinzufügen zu authority.capabilities ist verboten (§7)
+                    return Err(DslError::AuthorityElevation {
+                        of: Box::new(target_id.clone()),
+                        added_capabilities: caps,
+                        location: DiagLocation::field("authority.capabilities"),
+                    });
+                }
+                other if is_operator_key(other) => {
+                    return Err(DslError::AuthorityOpForbidden {
+                        of: Box::new(target_id.clone()),
+                        op: other.to_owned(),
+                        location,
+                    });
+                }
+                other => {
+                    return Err(DslError::UnknownMergeOp {
+                        name: other.to_owned(),
+                    });
+                }
             }
         }
     }
@@ -544,10 +714,16 @@ fn apply_skills_patch(
     of: &DefinitionId,
 ) -> DslResult<()> {
     let Some(patch_table) = patch_value.as_table() else {
-        return Ok(());
+        return Err(DslError::PatchTypeMismatch {
+            op: "patch".to_owned(),
+            expected: "table",
+            found: patch_value.type_str(),
+            location: DiagLocation::field("patch.skills"),
+        });
     };
     let mut current = toml::Value::Array(skills.drain(..).map(toml::Value::String).collect());
-    try_apply_table_op(&mut current, patch_table)?;
+    try_apply_table_op(&mut current, patch_table)
+        .map_err(|error| error.with_field_path("patch.skills"))?;
     let Some(values) = current.as_array() else {
         return Err(DslError::InvalidSkill {
             of: Box::new(of.clone()),
@@ -582,25 +758,59 @@ fn apply_skills_patch(
     Ok(())
 }
 
-/// Versucht, eine Tabellen-basierte Merge-Op anzuwenden (z. B. `{ append = [...] }`).
+/// Wendet eine Tabelle von Merge-Operatoren an (z. B. `{ append = [...] }`).
+///
+/// # Beschreibung
+/// Alle vorhandenen Operatoren laufen in der Reihenfolge von
+/// [`PATCH_OPERATOR_KEYS`] (`replace`, `prepend`, `append`, `remove`,
+/// `intersect`, `min`, `max-within-parent`). Ein unbekannter Schlüssel ist
+/// ein Fehler, bevor irgendein Operator läuft; ein Array-Operator mit einem
+/// Nicht-Array-Wert ebenfalls (früher wurde er still zu „keine Elemente“).
 fn try_apply_table_op(current: &mut toml::Value, patch_table: &toml::Table) -> DslResult<()> {
-    if let Some(val) = patch_table.get("replace") {
-        let op = MergeOp::Replace { value: val.clone() };
+    if let Some(unknown) = patch_table.keys().find(|key| !is_operator_key(key)) {
+        return Err(DslError::UnknownMergeOp {
+            name: unknown.clone(),
+        });
+    }
+    for key in PATCH_OPERATOR_KEYS {
+        let Some(val) = patch_table.get(*key) else {
+            continue;
+        };
+        let op = match *key {
+            "replace" => MergeOp::Replace { value: val.clone() },
+            "prepend" => MergeOp::Prepend {
+                values: operator_values(key, val)?,
+            },
+            "append" => MergeOp::Append {
+                values: operator_values(key, val)?,
+            },
+            "remove" => MergeOp::Remove {
+                values: operator_values(key, val)?,
+            },
+            "intersect" => MergeOp::Intersect {
+                values: operator_values(key, val)?,
+            },
+            "min" => MergeOp::Min { value: val.clone() },
+            _ => MergeOp::MaxWithinParent { value: val.clone() },
+        };
         apply_merge_op(current, op)?;
-    } else if let Some(vals) = patch_table.get("append") {
-        let values = vals.as_array().cloned().unwrap_or_default();
-        apply_merge_op(current, MergeOp::Append { values })?;
-    } else if let Some(vals) = patch_table.get("prepend") {
-        let values = vals.as_array().cloned().unwrap_or_default();
-        apply_merge_op(current, MergeOp::Prepend { values })?;
-    } else if let Some(vals) = patch_table.get("remove") {
-        let values = vals.as_array().cloned().unwrap_or_default();
-        apply_merge_op(current, MergeOp::Remove { values })?;
-    } else if let Some(vals) = patch_table.get("intersect") {
-        let values = vals.as_array().cloned().unwrap_or_default();
-        apply_merge_op(current, MergeOp::Intersect { values })?;
     }
     Ok(())
+}
+
+/// Der Array-Wert eines Array-Operators.
+///
+/// # Errors
+/// [`DslError::PatchTypeMismatch`], wenn `val` kein Array ist.
+fn operator_values(op: &str, val: &toml::Value) -> DslResult<Vec<toml::Value>> {
+    val.as_array()
+        .cloned()
+        .ok_or_else(|| DslError::PatchTypeMismatch {
+            op: op.to_owned(),
+            expected: "array",
+            found: val.type_str(),
+            location: DiagLocation::none(),
+        })
 }
 
 /// Extrahiert eine `AuthorityCeiling` aus einer TOML-Tabelle, falls vorhanden.
@@ -1844,6 +2054,384 @@ mixins = [{ id = "harwness.mixin.skills-bad-mixin@1" }]
         ];
         let result = resolve_definition(&id, &layers, now());
         assert!(matches!(result, Err(DslError::InvalidSkill { .. })));
+        Ok(())
+    }
+
+    // -----------------------------------------------------------------
+    // IR v2 wave 1: schema check, nested patch paths, min / max-within-parent
+    // -----------------------------------------------------------------
+
+    const PATCH_BASE: &str = r#"
+schema = "harwness.agent/v1"
+id = "harwness.agent.patch-base@1"
+version = "1.0.0"
+role = "worker"
+specialization = "patch-base"
+
+[context]
+must_include = ["task.objective"]
+exclude = ["secret.*"]
+
+[limits]
+max_tool_calls = 40
+max_wall_time_seconds = 1800
+"#;
+
+    fn resolve_with_base(child: &str, id: &str) -> DslResult<ResolvedAgentDefinition> {
+        let base = parse_toml(PATCH_BASE)?;
+        let child = parse_toml(child)?;
+        let id = DefinitionId::parse(id)?;
+        resolve_definition(
+            &id,
+            &[
+                (DefinitionLayer::BuiltIn, base),
+                (DefinitionLayer::BuiltIn, child),
+            ],
+            now(),
+        )
+    }
+
+    #[test]
+    fn test_schema_mismatch_is_rejected() -> TestResult {
+        let raw = parse_toml(
+            r#"
+schema = "harwness.agent/v9"
+id = "harwness.agent.schema-bad@1"
+version = "1.0.0"
+role = "worker"
+specialization = "bad"
+"#,
+        )?;
+        let id = DefinitionId::parse("harwness.agent.schema-bad@1")?;
+        match resolve_definition(&id, &[(DefinitionLayer::BuiltIn, raw)], now()) {
+            Err(DslError::SchemaMismatch {
+                found, location, ..
+            }) => {
+                assert_eq!(found, "harwness.agent/v9");
+                assert_eq!(location.field_path.as_deref(), Some("schema"));
+                Ok(())
+            }
+            other => Err(TestError::Unexpected(format!(
+                "SchemaMismatch expected, got {other:?}"
+            ))),
+        }
+    }
+
+    #[test]
+    fn test_schema_mismatch_in_base_is_rejected() -> TestResult {
+        let base = parse_toml(
+            r#"
+schema = "harwness.mixin/v1"
+id = "harwness.agent.schema-base@1"
+version = "1.0.0"
+role = "worker"
+specialization = "base"
+"#,
+        )?;
+        let child = parse_toml(
+            r#"
+schema = "harwness.agent/v1"
+id = "harwness.agent.schema-child@1"
+version = "1.0.0"
+role = "worker"
+specialization = "child"
+extends = { id = "harwness.agent.schema-base@1" }
+"#,
+        )?;
+        let id = DefinitionId::parse("harwness.agent.schema-child@1")?;
+        let result = resolve_definition(
+            &id,
+            &[
+                (DefinitionLayer::BuiltIn, base),
+                (DefinitionLayer::BuiltIn, child),
+            ],
+            now(),
+        );
+        assert!(matches!(result, Err(DslError::SchemaMismatch { .. })));
+        Ok(())
+    }
+
+    #[test]
+    fn test_nested_patch_path_appends_to_nested_value() -> TestResult {
+        let resolved = resolve_with_base(
+            r#"
+schema = "harwness.agent/v1"
+id = "harwness.agent.patch-nested@1"
+version = "1.0.0"
+role = "worker"
+specialization = "nested"
+extends = { id = "harwness.agent.patch-base@1" }
+
+[patch.context.must_include]
+append = ["task.acceptance_criteria"]
+
+[patch.context.exclude]
+remove = ["secret.*"]
+"#,
+            "harwness.agent.patch-nested@1",
+        )?;
+        assert_eq!(
+            resolved.config["context"]["must_include"].as_array(),
+            Some(&vec![
+                toml::Value::String("task.objective".to_owned()),
+                toml::Value::String("task.acceptance_criteria".to_owned()),
+            ])
+        );
+        assert_eq!(
+            resolved.config["context"]["exclude"].as_array(),
+            Some(&vec![])
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn test_patch_table_applies_every_operator_in_fixed_order() -> TestResult {
+        let resolved = resolve_with_base(
+            r#"
+schema = "harwness.agent/v1"
+id = "harwness.agent.patch-multi@1"
+version = "1.0.0"
+role = "worker"
+specialization = "multi"
+extends = { id = "harwness.agent.patch-base@1" }
+
+[patch.context.must_include]
+append = ["b"]
+remove = ["task.objective"]
+"#,
+            "harwness.agent.patch-multi@1",
+        )?;
+        assert_eq!(
+            resolved.config["context"]["must_include"].as_array(),
+            Some(&vec![toml::Value::String("b".to_owned())])
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn test_patch_min_and_max_within_parent_on_nested_limits() -> TestResult {
+        let resolved = resolve_with_base(
+            r#"
+schema = "harwness.agent/v1"
+id = "harwness.agent.patch-limits@1"
+version = "1.0.0"
+role = "worker"
+specialization = "limits"
+extends = { id = "harwness.agent.patch-base@1" }
+
+[patch.limits]
+max_tool_calls = { min = 24 }
+max_wall_time_seconds = { max-within-parent = 900 }
+"#,
+            "harwness.agent.patch-limits@1",
+        )?;
+        assert_eq!(
+            resolved.config["limits"]["max_tool_calls"].as_integer(),
+            Some(24)
+        );
+        assert_eq!(
+            resolved.config["limits"]["max_wall_time_seconds"].as_integer(),
+            Some(900)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn test_patch_min_never_raises() -> TestResult {
+        let resolved = resolve_with_base(
+            r#"
+schema = "harwness.agent/v1"
+id = "harwness.agent.patch-min@1"
+version = "1.0.0"
+role = "worker"
+specialization = "min"
+extends = { id = "harwness.agent.patch-base@1" }
+
+[patch.limits]
+max_tool_calls = { min = 100 }
+"#,
+            "harwness.agent.patch-min@1",
+        )?;
+        assert_eq!(
+            resolved.config["limits"]["max_tool_calls"].as_integer(),
+            Some(40)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn test_patch_max_within_parent_above_parent_is_an_error() -> TestResult {
+        let result = resolve_with_base(
+            r#"
+schema = "harwness.agent/v1"
+id = "harwness.agent.patch-max@1"
+version = "1.0.0"
+role = "worker"
+specialization = "max"
+extends = { id = "harwness.agent.patch-base@1" }
+
+[patch.limits]
+max_tool_calls = { max-within-parent = 41 }
+"#,
+            "harwness.agent.patch-max@1",
+        );
+        match result {
+            Err(DslError::PatchExceedsParent { location, .. }) => {
+                assert_eq!(
+                    location.field_path.as_deref(),
+                    Some("patch.limits.max_tool_calls")
+                );
+                Ok(())
+            }
+            other => Err(TestError::Unexpected(format!(
+                "PatchExceedsParent expected, got {other:?}"
+            ))),
+        }
+    }
+
+    #[test]
+    fn test_patch_nested_path_that_names_no_field_is_an_error() -> TestResult {
+        let result = resolve_with_base(
+            r#"
+schema = "harwness.agent/v1"
+id = "harwness.agent.patch-missing@1"
+version = "1.0.0"
+role = "worker"
+specialization = "missing"
+extends = { id = "harwness.agent.patch-base@1" }
+
+[patch.context.nope]
+append = ["x"]
+"#,
+            "harwness.agent.patch-missing@1",
+        );
+        assert!(
+            matches!(result, Err(DslError::PatchPathMissing { ref path, .. }) if path == "context.nope"),
+            "{result:?}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn test_patch_replace_may_introduce_a_nested_field() -> TestResult {
+        let resolved = resolve_with_base(
+            r#"
+schema = "harwness.agent/v1"
+id = "harwness.agent.patch-introduce@1"
+version = "1.0.0"
+role = "worker"
+specialization = "introduce"
+extends = { id = "harwness.agent.patch-base@1" }
+
+[patch.context.policy]
+replace = "harwness.context.custom@1"
+"#,
+            "harwness.agent.patch-introduce@1",
+        )?;
+        assert_eq!(
+            resolved.config["context"]["policy"].as_str(),
+            Some("harwness.context.custom@1")
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn test_patch_mixing_operators_and_nested_keys_is_an_error() -> TestResult {
+        let result = resolve_with_base(
+            r#"
+schema = "harwness.agent/v1"
+id = "harwness.agent.patch-mixed@1"
+version = "1.0.0"
+role = "worker"
+specialization = "mixed"
+extends = { id = "harwness.agent.patch-base@1" }
+
+[patch.context]
+replace = {}
+must_include = { append = ["x"] }
+"#,
+            "harwness.agent.patch-mixed@1",
+        );
+        assert!(
+            matches!(result, Err(DslError::PatchAmbiguous { .. })),
+            "{result:?}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn test_patch_array_operator_with_non_array_value_is_an_error() -> TestResult {
+        let result = resolve_with_base(
+            r#"
+schema = "harwness.agent/v1"
+id = "harwness.agent.patch-scalar@1"
+version = "1.0.0"
+role = "worker"
+specialization = "scalar"
+extends = { id = "harwness.agent.patch-base@1" }
+
+[patch.context.must_include]
+append = "x"
+"#,
+            "harwness.agent.patch-scalar@1",
+        );
+        assert!(
+            matches!(result, Err(DslError::PatchTypeMismatch { .. })),
+            "{result:?}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn test_authority_remove_is_allowed_and_replace_is_forbidden() -> TestResult {
+        let base = r#"
+schema = "harwness.agent/v1"
+id = "harwness.agent.auth-base@1"
+version = "1.0.0"
+role = "worker"
+specialization = "base"
+
+[authority]
+capabilities = ["filesystem.read", "filesystem.write"]
+"#;
+        let removing = r#"
+schema = "harwness.agent/v1"
+id = "harwness.agent.auth-remove@1"
+version = "1.0.0"
+role = "worker"
+specialization = "remove"
+extends = { id = "harwness.agent.auth-base@1" }
+
+[patch.authority.capabilities]
+remove = ["filesystem.write"]
+"#;
+        let id = DefinitionId::parse("harwness.agent.auth-remove@1")?;
+        let resolved = resolve_definition(
+            &id,
+            &[
+                (DefinitionLayer::BuiltIn, parse_toml(base)?),
+                (DefinitionLayer::BuiltIn, parse_toml(removing)?),
+            ],
+            now(),
+        )?;
+        assert_eq!(resolved.authority.capabilities, vec!["filesystem.read"]);
+
+        let replacing = removing
+            .replace("auth-remove", "auth-replace")
+            .replace("remove = [", "replace = [");
+        let id = DefinitionId::parse("harwness.agent.auth-replace@1")?;
+        let result = resolve_definition(
+            &id,
+            &[
+                (DefinitionLayer::BuiltIn, parse_toml(base)?),
+                (DefinitionLayer::BuiltIn, parse_toml(&replacing)?),
+            ],
+            now(),
+        );
+        assert!(
+            matches!(result, Err(DslError::AuthorityOpForbidden { .. })),
+            "{result:?}"
+        );
         Ok(())
     }
 }

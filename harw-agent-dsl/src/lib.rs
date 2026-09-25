@@ -11,11 +11,16 @@
 //! Organisationen mit Clan-/Cell-Deklaration und Strukturprüfung
 //! ([`organization`]).
 //!
+//! Seit #22 Welle 1 zusätzlich: die typisierte, serialisierbare Agent-IR v2
+//! ([`ir_v2::AgentIr`], Schema `harwness.agent-ir/v2`, Snapshot-Hash v7),
+//! ihr Lowering ([`lower_v2::lower_v2`], [`lower_v2::compile_agent`]), stabile
+//! Diagnose-Codes `HARW-<AREA>-NNN` mit Quellspannen ([`diagnostics`]) und die
+//! Kontextprogramm-Bindung ([`bind`]).
+//!
 //! Nicht enthalten (Folge-Waves): Specialization-Registry (`specialization`
 //! bleibt ein freies Label), Ausführung von Clans/Cells (hier nur Deklaration
 //! und Validierung — das Laufzeitverhalten liegt außerhalb dieses Crates),
-//! stabile Diagnostics-Codes (es gibt nur [`DiagLocation`](error::DiagLocation)
-//! mit Schicht/Feldpfad), Migration eingefrorener Snapshots über
+//! Migration eingefrorener Snapshots über
 //! Hash-Domänen hinweg (ein Verweis aus einer älteren Domäne wird nur
 //! abgelehnt, nicht übersetzt) sowie die Übersetzung von `reasoning_effort`
 //! in Runtime-Typen (Aufgabe der Konsumenten).
@@ -32,6 +37,11 @@
 //! - [`resolved`] — [`ResolvedAgentDefinition`](resolved::ResolvedAgentDefinition), [`ResolutionTrace`](resolved::ResolutionTrace)
 //! - [`resolve`] — [`resolve_definition`](resolve::resolve_definition)
 //! - [`skills`] — Namensregeln und Vererbung der Skill-Liste einer Definition
+//! - [`ir_v2`](mod@ir_v2) — [`AgentIr`](ir_v2::AgentIr) (IR v2, serde, Snapshot v7)
+//! - [`lower_v2`](mod@lower_v2) — [`lower_v2`](lower_v2::lower_v2), [`compile_agent`](lower_v2::compile_agent), [`LowerSources`](lower_v2::LowerSources)
+//! - [`diagnostics`](mod@diagnostics) — [`Diagnostic`](diagnostics::Diagnostic), Code-Katalog [`CATALOG`](diagnostics::CATALOG)
+//! - [`bind`](mod@bind) — [`ContextProgramLibrary`](bind::ContextProgramLibrary), [`bind_context_program`](bind::bind_context_program)
+//! - [`classify`] — [`reclassify_permissions`](classify::reclassify_permissions): the manifest from a tool catalog
 //! - [`context_program`] — [`RawContextProgramDefinition`](context_program::RawContextProgramDefinition),
 //!   [`resolve_context_program`](context_program::resolve_context_program), Deckenprüfung über
 //!   [`ContextCeilingAdmission`](context_program::ContextCeilingAdmission) (Knoten AW2-01)
@@ -63,12 +73,17 @@
 #![forbid(unsafe_code)]
 
 pub mod authority;
+pub mod bind;
+pub mod classify;
 pub mod context_program;
+pub mod diagnostics;
 pub mod error;
 pub mod executable;
 pub mod family;
 pub mod ids;
+pub mod ir_v2;
 pub mod layers;
+pub mod lower_v2;
 pub mod merge;
 pub mod organization;
 pub mod parse;
@@ -80,4 +95,7 @@ pub mod skills;
 #[cfg(test)]
 mod test_support;
 
+pub use diagnostics::{Diagnostic, Diagnostics};
 pub use executable::{ExecutableAgentIr, lower};
+pub use ir_v2::{AGENT_IR_SCHEMA, AGENT_IR_SNAPSHOT_DOMAIN, AgentIr};
+pub use lower_v2::{LowerSources, compile_agent, lower_v2};

@@ -1,0 +1,27 @@
+[package]
+publish.workspace = true
+name = "harw-agent-artifact"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+# Low-level leaf crate: the `agent-artifact-v1` container format (header,
+# payload table, BLAKE3 trailer) and the executable footer that embeds an
+# artifact into a runner binary. No harw-* dependency and no runtime layer:
+# the compiler writes artifacts, the runner reads them, both through here.
+[dependencies]
+# Payload hashes, the trailer and the footer hash. Same pinned version as
+# `harw-digest`; see the C-build note there (`C_BUILD_EXCEPTIONS`).
+blake3 = { workspace = true }
+# `ArtifactDigest` travels as a hex string (hand-written Serialize/Deserialize).
+serde = { workspace = true }
+# The header is canonical JSON; `canonical_json` walks a `serde_json::Value`.
+serde_json = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+
+[lints]
+workspace = true

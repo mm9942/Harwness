@@ -52,10 +52,24 @@ use std::path::{Component, Path};
 const NEW_FILE_MODE: u32 = 0o644;
 
 /// Pfadkomponenten, unter die `fs.write` nie schreibt.
+///
+/// `.harw` bleibt fest geschützt, auch wenn eine personalisierte harw (#22)
+/// gerade unter einem anderen Namen läuft — ein Projekt kann Zustand unter
+/// beiden Namen tragen (etwa nach einem Namenswechsel), und beide bleiben
+/// schreibgeschützt. Der jeweils *aktuelle* projekt-lokale Name kommt zur
+/// Prüfzeit aus [`harw_home::project_dir_name`] hinzu, siehe
+/// [`protected_component`].
 const PROTECTED_COMPONENTS: &[&str] = &[".git", ".harw"];
 
 /// Liefert die erste geschützte Komponente von `relative`, falls vorhanden.
+///
+/// Geschützt sind `.git`, `.harw` und — falls verschieden — der aktuell
+/// aktive, projekt-lokale Name einer personalisierten harw (#22,
+/// [`harw_home::project_dir_name`]), damit `fs.write`/`fs.edit` niemals in
+/// den eigenen Harness-Zustand schreiben, unabhängig davon, unter welchem
+/// Namen dieser gerade lebt.
 pub(crate) fn protected_component(relative: &Path) -> Option<&'static str> {
+    let named = harw_home::project_dir_name();
     relative.components().find_map(|component| {
         let Component::Normal(part) = component else {
             return None;
@@ -64,6 +78,7 @@ pub(crate) fn protected_component(relative: &Path) -> Option<&'static str> {
         PROTECTED_COMPONENTS
             .iter()
             .copied()
+            .chain(std::iter::once(named))
             .find(|protected| part.eq_ignore_ascii_case(protected))
     })
 }
@@ -441,6 +456,54 @@ mod tests {
             FsWriteExecutor.write_file(&ctx, &call)?,
             ToolOutput::Text { .. }
         ));
+        Ok(())
+    }
+
+    /// #22: sobald eine personalisierte harw ihren eigenen projekt-lokalen
+    /// Namen gesetzt hat ([`harw_home::set_named_home`]), bleibt `.harw`
+    /// weiterhin geschützt (ein Projekt kann Zustand unter beiden Namen
+    /// tragen), und der neue Name wird zusätzlich geschützt. Läuft in einer
+    /// eigenen Funktion, weil [`harw_home::paths::set_named_home`] einen
+    /// prozessweiten `OnceLock` setzt (genau einmal, für den ganzen
+    /// Testbinary-Prozess) — beide Zustände (vorher/nachher) müssen deshalb
+    /// hier, in dieser Reihenfolge, geprüft werden statt in zwei Tests, die
+    /// parallel laufen könnten.
+    #[test]
+    fn test_fs_write_protects_both_dot_harw_and_the_active_named_dir() -> TestResult {
+        let fixture = Fixture::new()?;
+        fs::create_dir_all(fixture.ws.join(".harw"))?;
+        fs::create_dir_all(fixture.ws.join(".mia"))?;
+        let ctx = fixture.ctx(vec![Permission::WriteWorkspace])?;
+
+        // Vor `set_named_home`: nur `.harw` ist geschützt, `.mia` noch ein
+        // gewöhnliches Verzeichnis.
+        assert_eq!(
+            protected_component(Path::new(".harw/config.toml")),
+            Some(".harw")
+        );
+        assert_eq!(protected_component(Path::new(".mia/config.toml")), None);
+
+        harw_home::set_named_home("mia")
+            .map_err(|error| TestError::Unexpected(format!("set_named_home(\"mia\"): {error}")))?;
+        assert_eq!(harw_home::project_dir_name(), ".mia");
+
+        // Danach: beide Namen sind geschützt.
+        for path in [".harw/config.toml", ".mia/config.toml"] {
+            let args = serde_json::json!({ "path": path, "content": "x" });
+            let call = call("fs.write", args);
+            match FsWriteExecutor.write_file(&ctx, &call)? {
+                ToolOutput::Error { message } => {
+                    assert!(message.contains("geschützt"), "{path}: {message}");
+                }
+                other => {
+                    return Err(TestError::Unexpected(format!(
+                        "{path}: expected error, got {other:?}"
+                    )));
+                }
+            }
+        }
+        assert!(!fixture.ws.join(".harw/config.toml").exists());
+        assert!(!fixture.ws.join(".mia/config.toml").exists());
         Ok(())
     }
 

@@ -515,6 +515,12 @@ fn spawn_task_text(instructions: Option<&str>, context: &serde_json::Value) -> O
     }
 }
 
+/// #22 Welle 1B: die Nummer des Versuchs, den eine Fortsetzung nach `used`
+/// bereits gebundenen Fortsetzungen wäre (der erste Lauf ist Versuch 1).
+fn next_attempt(used: u32) -> u32 {
+    used.saturating_add(2)
+}
+
 /// Rechnet ein Token-Budget des Auftrags mit der kalibrierten Rate in Bytes
 /// um (abgerundet, mindestens 1 KiB).
 fn task_tokens_to_bytes(
@@ -575,6 +581,11 @@ struct ChildTaskState {
     /// Runde 5, Teil J: gesetzt, wenn dieses Kind die Fortsetzung eines
     /// budget-beendeten Vorgängers ist ([`ManagedAgentSpawner::bind_continuation`]).
     continuation: Option<crate::child_handoff::ContinuationLink>,
+    /// Wave 3C: der zuletzt vom angebundenen [`crate::child_backend::ChildBackend`]
+    /// gemeldete Fortsetzungs-Token ([`crate::child_backend::ChildRunOutcome::continuation`]),
+    /// für [`crate::child_backend::ChildRunSpec::continue_from`] eines erneuten
+    /// Laufs desselben Kindes. `None` ohne Backend oder ohne meldbare Fortsetzung.
+    backend_resume: Option<String>,
 }
 
 /// Ziel der [`TurnEvent::ChildProgress`]-Meldungen eines Kindes: der
@@ -967,6 +978,95 @@ fn tighten_agent_budget(left: AgentBudget, right: AgentBudget) -> AgentBudget {
         max_tool_calls: tighter(left.max_tool_calls, right.max_tool_calls),
         max_wall_time_ms: tighter(left.max_wall_time_ms, right.max_wall_time_ms),
         reasoning_effort: tighter(left.reasoning_effort, right.reasoning_effort),
+    }
+}
+
+/// Wave 3C: maps this crate's own [`AgentBudget`] (dimension-wise remaining
+/// budget, [`ManagedAgentSpawner::remaining_budget`]) onto the DSL's
+/// [`harw_agent_dsl::ir_v2::Budget`] — the shape
+/// [`crate::child_backend::ChildRunSpec::budget`] carries. `reasoning_effort`
+/// has no counterpart in that DSL type here and is dropped;
+/// `max_wall_time_ms` rounds up to whole seconds.
+fn agent_budget_to_dsl_budget(budget: AgentBudget) -> harw_agent_dsl::ir_v2::Budget {
+    harw_agent_dsl::ir_v2::Budget {
+        max_tokens: budget.max_tokens,
+        max_tool_calls: budget.max_tool_calls,
+        max_wall_secs: budget.max_wall_time_ms.map(|ms| ms.div_ceil(1_000)),
+        effort_cap: None,
+    }
+}
+
+/// Wave 3C: [`crate::child_backend::ChildIo`] for a backend-driven child —
+/// relays activity into the same progress/journal machinery a locally run
+/// child uses ([`ManagedAgentSpawner::progress_observer`]), and questions /
+/// approval requests into the existing parent relays
+/// ([`ManagedAgentSpawner::ask_parent`], [`crate::child_approval::ChildApprovalRelay`]).
+/// This keeps a compiled parent's TUI panel and `agent.status`/`agent.result`
+/// working the same regardless of where the child actually runs.
+struct ControllerChildIo<'a> {
+    spawner: &'a ManagedAgentSpawner,
+    child: SessionId,
+    role: String,
+}
+
+impl crate::child_backend::ChildIo for ControllerChildIo<'_> {
+    fn on_event(&self, event_json: serde_json::Value) {
+        let observer = self.spawner.progress_observer();
+        observer.on_progress(&self.child);
+        if let Some(text) = event_json.get("assistant_text").and_then(|v| v.as_str()) {
+            observer.on_assistant_text(&self.child, text);
+        }
+    }
+
+    fn on_question<'a>(
+        &'a self,
+        id: String,
+        text: String,
+    ) -> crate::child_backend::ChildAnswerFuture<'a> {
+        let spawner = self.spawner;
+        let child = self.child.clone();
+        Box::pin(async move {
+            // `id` ist die Korrelations-ID des Backends für sein eigenes
+            // Protokoll; der bestehende Frage-Relais führt seinen eigenen
+            // Zähler (`ManagedAgentSpawner::ask_parent`).
+            let _ = id;
+            spawner
+                .ask_parent(&child, &text, crate::child_comms::PARENT_QUESTION_TIMEOUT)
+                .await
+                .map(|(answer, _delivered)| answer)
+                .unwrap_or_else(|_| crate::child_comms::NO_ANSWER_REPLY.to_owned())
+        })
+    }
+
+    fn on_approval_request<'a>(
+        &'a self,
+        id: String,
+        tool: String,
+        args_summary: String,
+    ) -> crate::child_backend::ChildAnswerFuture<'a> {
+        let spawner = self.spawner;
+        let child = self.child.clone();
+        let role = self.role.clone();
+        Box::pin(async move {
+            let call = harw_tools::ToolCall {
+                id: ToolCallId::from_str(id),
+                name: harw_tools::ToolName::new(tool),
+                arguments: serde_json::json!({ "summary": args_summary }),
+            };
+            let request = crate::child_approval::ChildApprovalRequest {
+                child: child.clone(),
+                role,
+                tree_path: spawner.child_tree_path(&child),
+                call,
+                timeout: spawner.child_approval_relay().timeout(),
+            };
+            match spawner.child_approval_relay().resolve(request).await {
+                crate::turn_loop::ApprovalResolution::Approve => "approve".to_owned(),
+                crate::turn_loop::ApprovalResolution::Reject { reason } => {
+                    format!("deny: {reason}")
+                }
+            }
+        })
     }
 }
 
@@ -2255,6 +2355,17 @@ pub struct ManagedAgentSpawner {
     /// Runde 5, Teil O: optionaler Freigabe-Kanal zur Oberfläche
     /// (`crate::child_approval`); leer = bisheriges fail-closed-Verhalten.
     pub(crate) child_approvals: Arc<crate::child_approval::ChildApprovalRelay>,
+    /// Wave 3, part 3C: when set, a compiled parent's children run through
+    /// this backend (e.g. as jobs, see `crate::child_backend`) instead of
+    /// the in-process session below. `None` (the default) keeps every
+    /// existing behavior unchanged.
+    child_backend: Option<Arc<dyn crate::child_backend::ChildBackend>>,
+    /// Freigabemodus der Wurzel dieses Baums (dieselbe Zelle, der die
+    /// Kind-Ketten über `ApprovalModeCell::follower` folgen). Liest er
+    /// [`harw_extension_api::ApprovalMode::FullAccess`], bekommt ein über [`Self::child_backend`]
+    /// laufendes Kind `full_access` (siehe [`Self::backend_rights`]).
+    /// `None` = fail-closed: nie automatische Freigabe.
+    approval_mode: Option<harw_extension_api::approval_mode::ApprovalModeCell>,
 }
 
 /// Ein archivierter, ungekürzter Antworttext eines abgeschlossenen
@@ -2705,6 +2816,32 @@ impl ManagedAgentSpawner {
         self.set_status(child, ChildStatus::Failed);
     }
 
+    /// Wave 3C: entnimmt den zuletzt vom [`crate::child_backend::ChildBackend`]
+    /// gemeldeten Fortsetzungs-Token eines Kindes (einmalig), für
+    /// [`crate::child_backend::ChildRunSpec::continue_from`] seines nächsten
+    /// Laufs.
+    fn take_backend_resume(&self, child: &SessionId) -> Option<String> {
+        self.child_tasks
+            .lock()
+            .ok()
+            .and_then(|mut tasks| tasks.get_mut(child.as_str())?.backend_resume.take())
+    }
+
+    /// Wave 3C: hinterlegt den Fortsetzungs-Token, den ein
+    /// [`crate::child_backend::ChildBackend`] für einen erneuten Lauf
+    /// desselben Kindes gemeldet hat.
+    fn set_backend_resume(&self, child: &SessionId, token: String) {
+        match self.child_tasks.lock() {
+            Ok(mut tasks) => {
+                tasks
+                    .entry(child.as_str().to_owned())
+                    .or_default()
+                    .backend_resume = Some(token);
+            }
+            Err(_) => tracing::warn!(child = %child, "child_task_state.lock_poisoned"),
+        }
+    }
+
     /// Entnimmt den noch nicht verbrauchten Auftrag eines Kindes (einmalig).
     fn take_pending_task(&self, child: &SessionId) -> Option<String> {
         self.child_tasks
@@ -2958,7 +3095,47 @@ impl ManagedAgentSpawner {
             comms: Arc::new(crate::child_comms::ChildComms::default()),
             // Runde 5, Teil O.
             child_approvals: Arc::new(crate::child_approval::ChildApprovalRelay::default()),
+            // Wave 3, part 3C.
+            child_backend: None,
+            approval_mode: None,
         }
+    }
+
+    /// Wires a [`crate::child_backend::ChildBackend`]: every child this
+    /// spawner admits from now on runs through it instead of the in-process
+    /// session (plan §3C). `None` by default, which keeps every existing
+    /// behavior unchanged; callers that delegate to it are responsible for
+    /// mapping [`crate::child_backend::ChildRunOutcome`] onto the same
+    /// journal/end-report path the in-process run uses.
+    #[must_use]
+    pub fn with_child_backend(
+        mut self,
+        backend: Arc<dyn crate::child_backend::ChildBackend>,
+    ) -> Self {
+        self.child_backend = Some(backend);
+        self
+    }
+
+    /// Binds the approval-mode cell of this tree's root: while it reads
+    /// [`harw_extension_api::ApprovalMode::FullAccess`], a child run through
+    /// [`Self::with_child_backend`] gets
+    /// [`crate::child_backend::ChildBackendRights::full_access`] — the same
+    /// "no confirmations" an in-process child gets through its follower
+    /// cell. Without a cell a backend-run child never auto-approves.
+    #[must_use]
+    pub fn with_approval_mode(
+        mut self,
+        mode: harw_extension_api::approval_mode::ApprovalModeCell,
+    ) -> Self {
+        self.approval_mode = Some(mode);
+        self
+    }
+
+    /// The wired [`crate::child_backend::ChildBackend`], if any (see
+    /// [`Self::with_child_backend`]).
+    #[must_use]
+    pub(crate) fn child_backend(&self) -> Option<Arc<dyn crate::child_backend::ChildBackend>> {
+        self.child_backend.clone()
     }
 
     /// Erlaubt einem `UserInterface`-Elternteil (der UIA-Wurzelsitzung), die
@@ -4789,6 +4966,18 @@ impl ManagedAgentSpawner {
         let result = self
             .enforce_child_budget(child, store, approvals, input, budget, started)
             .await;
+        if self.child_backend().is_some() {
+            // Wave 3C: a backend-run child's local session never changes
+            // (its turn history lives with the backend), so the
+            // session-manager deltas below would always read as zero.
+            // `run.usage` already carries the backend's own accounting
+            // (`crate::child_backend::ChildRunOutcome::usage`, mapped in
+            // `Self::finish_backend_outcome`) — charge and keep it as-is.
+            if let Ok(run) = &result {
+                self.charge_run_usage(child, run.usage);
+            }
+            return result;
+        }
         // Auch ein gescheiterter oder über das Budget gelaufener Lauf hat
         // verbraucht — die Anrechnung erfolgt auf jedem Ausgang. Ist die
         // Session inzwischen verworfen, gilt der Ausgangsstand (Differenz 0).
@@ -5460,6 +5649,15 @@ impl ManagedAgentSpawner {
         let record = self
             .child_record(child)
             .ok_or_else(|| Self::reject(format!("child {child} is not admitted")))?;
+        // Wave 3C: a wired `ChildBackend` runs this child somewhere other
+        // than in-process (`crate::child_backend`); everything below this
+        // branch is the in-process path and stays untouched when no
+        // backend is wired (the default inside `harw`).
+        if let Some(backend) = self.child_backend() {
+            return self
+                .run_child_via_backend(child, &record, backend, input)
+                .await;
+        }
         let factory = self
             .roles
             .get(&record.role)
@@ -5703,6 +5901,325 @@ impl ManagedAgentSpawner {
                     budget_exhausted: false,
                     budget_handoff: None,
                 })
+            }
+        }
+    }
+
+    /// Wave 3C: runs `child` through the wired
+    /// [`crate::child_backend::ChildBackend`] instead of the in-process turn
+    /// loop above. Called from [`Self::run_child_with_approvals`] once
+    /// [`Self::child_backend`] is `Some`; mirrors that function's own
+    /// admission bookkeeping (running status, pending-task consumption, task
+    /// truncation) so a caller sees the same [`ChildRunResult`] shape
+    /// whichever path ran the child.
+    ///
+    /// # Beschreibung
+    /// The child's local [`AgentSession`] stays parked in the manager —
+    /// unlike the in-process path it is never checked out — because a
+    /// backend-run child keeps its own turn history elsewhere; leaving the
+    /// session in place is what keeps sandbox/continuation bookkeeping
+    /// ([`Self::child_sandbox`], [`Self::finalize_child_end`]) working
+    /// unchanged. Cancellation is the backend's own job (see
+    /// [`crate::child_backend::ChildRunSpec::cancel`]'s docs): this method
+    /// only derives the token and hands it over.
+    ///
+    /// # Errors
+    /// Never returns an error from the backend itself — every
+    /// [`crate::child_backend::ChildRunStatus`] maps to either an
+    /// `Ok(ChildRunResult)` (`Completed`, `BudgetExhausted`) or an
+    /// [`AgentSpawnError`] carrying the finalized end cause (see
+    /// [`Self::finish_backend_outcome`]). Only admission bookkeeping ahead
+    /// of the run (child already running, already cancelled) can fail.
+    async fn run_child_via_backend(
+        &self,
+        child: &SessionId,
+        record: &ChildRecord,
+        backend: Arc<dyn crate::child_backend::ChildBackend>,
+        mut input: TurnInput,
+    ) -> Result<ChildRunResult, AgentSpawnError> {
+        let token = self
+            .child_cancel_token(child)
+            .ok_or_else(|| Self::reject(format!("child {child} has no cancellation token")))?;
+        // Cancel ist terminal (F-182), wie im in-process Pfad oben.
+        if token.is_cancelled() {
+            self.set_status(child, ChildStatus::Cancelled);
+            if let Some(cause) = Self::cancel_cause(token.reason()) {
+                self.finalize_child_end(child, cause).await;
+            }
+            return Err(Self::cancelled_error(child, token.reason()));
+        }
+        self.mark_running(child)?;
+        if let (Some(root), Some(snapshot)) = (self.root_for(child), self.child_record(child)) {
+            self.observe_orchestration(root, &snapshot, None, AgentOrchestrationStatus::Running);
+        }
+        // Derselbe Auftragsdeckel wie im in-process Pfad (siehe dort).
+        let pending_task = self.take_pending_task(child);
+        let has_user_text = input
+            .user_text
+            .as_deref()
+            .is_some_and(|text| !text.trim().is_empty());
+        if !has_user_text && let Some(task) = pending_task {
+            input.user_text = Some(task);
+        }
+        if let Some(max_bytes) = self.child_task_max_bytes(child)
+            && let Some(text) = input.user_text.as_deref()
+            && text.len() > max_bytes
+        {
+            input.user_text = Some(cap_task_text(text, max_bytes));
+        }
+        let task = input.user_text.clone().unwrap_or_default();
+        let context = (!input.metadata.is_null()).then(|| input.metadata.clone());
+        let continue_from = self.take_backend_resume(child);
+        let plan_mode = match self.manager.lock() {
+            Ok(manager) => self.lineage_in_plan_mode(&manager, child),
+            Err(_) => false,
+        };
+        let spec = crate::child_backend::ChildRunSpec {
+            child: child.clone(),
+            parent: record.parent.clone(),
+            agent_id: record.role.clone(),
+            task,
+            context,
+            continue_from,
+            // Die aktuellen effektiven Rechte des Kindes, wie sie der
+            // in-process Pfad hätte (Werkzeugfläche nach dem Eltern-Schnitt,
+            // Sandbox, Freigabemodus; siehe `Self::backend_rights`). Das
+            // Backend reicht sie unverändert weiter (`JobChildBackend` in
+            // `harw-agent-runner` verengt nicht selbst); das Kind schneidet
+            // sie nur noch mit seinem Manifest. Leere Rechte hießen: ein
+            // job-gestartetes Kind darf gar nichts.
+            rights: self.backend_rights(child, &record.parent),
+            budget: self.remaining_budget(child).map(agent_budget_to_dsl_budget),
+            live_mode: !plan_mode,
+            cancel: token.child(),
+        };
+        let io = ControllerChildIo {
+            spawner: self,
+            child: child.clone(),
+            role: record.role.clone(),
+        };
+        let outcome = backend.run(spec, &io).await;
+        self.finish_backend_outcome(child, outcome).await
+    }
+
+    /// Die Rechte, mit denen ein über den [`crate::child_backend::ChildBackend`]
+    /// laufendes Kind startet: genau seine aktuelle in-process Fläche.
+    ///
+    /// # Beschreibung
+    /// - `tools`: die Werkzeuge, die [`crate::turn_loop::collect_tools`] dem
+    ///   Kind jetzt zeigen würde (Registry ∩ Aktivierung nach Agent-IR,
+    ///   Eltern-Schnitt und Modus), zusätzlich geschnitten mit der
+    ///   Eltern-Aktivierung, gegen die die Admission das Kind geschnitten hat
+    ///   (Basis bei Live-Modus, sonst die aktuelle; siehe
+    ///   [`Self::parent_rights_ceiling`]).
+    /// - `write`/`shell`/`network_open`: die Rechte der aktuellen
+    ///   Kind-Sandbox (`WriteWorkspace`, `ExecuteProcess`, `NetworkAccess`
+    ///   aus [`harw_authority::Permission`]), die auch die Eltern-Sandbox
+    ///   hält.
+    /// - `network_hosts`: die Hosts des Kind-Netz-Scopes, die der Eltern-Scope
+    ///   zulässt. `PublicDns`- und CIDR-Ziele haben in
+    ///   [`crate::child_backend::ChildBackendRights`] keine Entsprechung und
+    ///   fallen weg (fail-closed).
+    /// - `host`: ein Host-Werkzeug (`host.*`,
+    ///   [`harw_agent_dsl::classify::LabelClassifier`]) ist in `tools`.
+    /// - `full_access`: die Zelle aus [`Self::with_approval_mode`] liest
+    ///   [`harw_extension_api::ApprovalMode::FullAccess`].
+    ///
+    /// Fail-closed: ist das Kind, seine Sandbox oder der Elternteil nicht
+    /// auffindbar oder ein Lock vergiftet, sind die Rechte leer.
+    ///
+    /// # Concurrency
+    /// Nimmt `manager`, darunter kurz `checked_out` und `active` (dieselbe
+    /// Reihenfolge wie die Admission).
+    fn backend_rights(
+        &self,
+        child: &SessionId,
+        parent: &SessionId,
+    ) -> crate::child_backend::ChildBackendRights {
+        use crate::child_backend::ChildBackendRights;
+        use harw_agent_dsl::classify::{LabelClassifier, ToolClassifier};
+        use harw_authority::Permission;
+
+        let Ok(manager) = self.manager.lock() else {
+            return ChildBackendRights::default();
+        };
+        let Ok(session) = manager.get(child) else {
+            return ChildBackendRights::default();
+        };
+        let Some(child_sandbox) = session
+            .spawn_context()
+            .map(|context| context.sandbox.clone())
+        else {
+            return ChildBackendRights::default();
+        };
+        let Ok(specs) = crate::turn_loop::collect_tools(session) else {
+            return ChildBackendRights::default();
+        };
+        let Some((parent_activation, parent_sandbox)) =
+            self.parent_rights_ceiling(&manager, parent)
+        else {
+            return ChildBackendRights::default();
+        };
+        drop(manager);
+
+        let tools: BTreeSet<String> = specs
+            .iter()
+            .map(|spec| spec.name().to_owned())
+            .filter(|name| {
+                parent_activation.is_tool_enabled(&harw_tools::ToolName::new(name.as_str()))
+            })
+            .collect();
+        let granted = |permission: Permission| {
+            child_sandbox.permissions().contains(permission)
+                && parent_sandbox.permissions().contains(permission)
+        };
+        let network_hosts: BTreeSet<String> = child_sandbox
+            .network_scope()
+            .hosts()
+            .filter(|host| parent_sandbox.network_scope().allows(host))
+            .map(ToOwned::to_owned)
+            .collect();
+        let host = tools.iter().any(|tool| {
+            LabelClassifier
+                .classify(tool)
+                .is_some_and(|classes| classes.host)
+        });
+        let full_access = self.approval_mode.as_ref().is_some_and(|mode| {
+            mode.get() == harw_extension_api::approval_mode::ApprovalMode::FullAccess
+        });
+        ChildBackendRights {
+            network_open: granted(Permission::NetworkAccess),
+            write: granted(Permission::WriteWorkspace),
+            shell: granted(Permission::ExecuteProcess),
+            host,
+            full_access,
+            network_hosts,
+            tools,
+        }
+    }
+
+    /// Aktivierung und Sandbox von `parent`, gegen die die Admission ein Kind
+    /// schneidet: bei veröffentlichtem Live-Modus die Basis (ohne
+    /// Modus-Schnitt), sonst der aktuelle Stand — wie in [`Self::admit`].
+    /// Deckt Manager-Sitzungen, Elternteile mit laufendem Turn
+    /// ([`CheckedOutParent`]) und die externe Wurzel ab; `None` für einen
+    /// unbekannten Elternteil oder einen ohne Sandbox-Kontext.
+    fn parent_rights_ceiling(
+        &self,
+        manager: &SessionManager,
+        parent: &SessionId,
+    ) -> Option<(SessionActivation, SandboxSpec)> {
+        let follows_live_mode = self.live_mode.current().is_some();
+        if let Ok(session) = manager.get(parent) {
+            let sandbox = session.spawn_context().map(|context| &context.sandbox)?;
+            return Some(if follows_live_mode {
+                (
+                    session.base_activation().clone(),
+                    session.base_sandbox().unwrap_or(sandbox).clone(),
+                )
+            } else {
+                (session.activation().clone(), sandbox.clone())
+            });
+        }
+        if let Some(view) = self.checked_out_parent(parent) {
+            let sandbox = view.spawn_context.map(|context| context.sandbox)?;
+            return Some(if follows_live_mode {
+                (view.base_activation, view.base_sandbox.unwrap_or(sandbox))
+            } else {
+                (view.activation, sandbox)
+            });
+        }
+        self.external_root_parent
+            .as_ref()
+            .filter(|root| &root.session_id == parent)
+            .map(|root| (root.activation.clone(), root.spawn_context.sandbox.clone()))
+    }
+
+    /// Wave 3C: maps a finished [`crate::child_backend::ChildRunOutcome`]
+    /// onto the existing [`ChildRunResult`], finalizing a non-regular end
+    /// through [`Self::finalize_child_end`] exactly like the in-process
+    /// path. Never panics: every
+    /// [`crate::child_backend::ChildRunStatus`] variant — including
+    /// [`crate::child_backend::ChildRunStatus::Crashed`] — becomes a
+    /// `ChildEnd` with a cause instead.
+    async fn finish_backend_outcome(
+        &self,
+        child: &SessionId,
+        outcome: crate::child_backend::ChildRunOutcome,
+    ) -> Result<ChildRunResult, AgentSpawnError> {
+        use crate::child_backend::ChildRunStatus;
+        let crate::child_backend::ChildRunOutcome {
+            status,
+            text,
+            usage,
+            continuation,
+        } = outcome;
+        if let Some(token) = continuation {
+            self.set_backend_resume(child, token);
+        }
+        match status {
+            ChildRunStatus::Completed => {
+                if let Some(text) = text.as_deref() {
+                    self.set_outcome_detail(child, text);
+                    self.comms.set_last_assistant(child, text);
+                }
+                self.set_status(child, ChildStatus::Completed);
+                self.archive_completed_child(child, text.as_deref());
+                self.record_completed_continuation(child, text.as_deref());
+                Ok(ChildRunResult {
+                    child: child.clone(),
+                    outcome: TurnOutcome::Completed,
+                    full_text: text,
+                    usage,
+                    budget_exhausted: false,
+                    budget_handoff: None,
+                })
+            }
+            ChildRunStatus::BudgetExhausted => {
+                if let Some(text) = text.as_deref() {
+                    self.set_outcome_detail(child, text);
+                    self.comms.set_last_assistant(child, text);
+                }
+                self.set_status(child, ChildStatus::Completed);
+                self.comms.clear_end(child);
+                self.archive_completed_child(child, text.as_deref());
+                self.record_budget_handoff(
+                    child,
+                    crate::child_handoff::BudgetHandoff::LastAnswer,
+                    text.as_deref(),
+                );
+                Ok(ChildRunResult {
+                    child: child.clone(),
+                    outcome: TurnOutcome::Completed,
+                    full_text: text,
+                    usage,
+                    budget_exhausted: true,
+                    budget_handoff: Some(crate::child_handoff::BudgetHandoff::LastAnswer),
+                })
+            }
+            other => {
+                let cause = other.to_child_end_cause();
+                let message = match &cause {
+                    Some(crate::child_comms::ChildEndCause::Cancelled { reason }) => {
+                        self.set_status(child, ChildStatus::Cancelled);
+                        format!(
+                            "child {child} was cancelled before its turn completed (reason: {reason})"
+                        )
+                    }
+                    Some(crate::child_comms::ChildEndCause::TurnError(reason)) => {
+                        self.set_failed(child, reason);
+                        reason.clone()
+                    }
+                    _ => {
+                        let reason = "child backend run ended unexpectedly".to_owned();
+                        self.set_failed(child, &reason);
+                        reason
+                    }
+                };
+                if let Some(cause) = cause {
+                    self.finalize_child_end(child, cause).await;
+                }
+                Err(Self::reject(message))
             }
         }
     }
@@ -6269,7 +6786,71 @@ impl ManagedAgentSpawner {
         }
         let ledger = self.handoff_ledger.lock().ok()?;
         let entry = ledger.get(&child).filter(|entry| &entry.parent == caller)?;
-        (ledger.continuations_left(&entry.origin) > 0).then(|| entry.role.clone())
+        // #22 Welle 1B: auch der Lebenszyklus der Rolle muss eine weitere
+        // Ausführung zulassen (`allow_rerun`, `max_attempts`).
+        let lifecycle_admits = match self.lifecycle_max_attempts(&entry.role) {
+            Ok(None) => true,
+            Ok(Some(max_attempts)) => {
+                next_attempt(ledger.continuations_used(&entry.origin)) <= max_attempts
+            }
+            Err(_) => false,
+        };
+        (ledger.continuations_left(&entry.origin) > 0 && lifecycle_admits)
+            .then(|| entry.role.clone())
+    }
+
+    /// #22 Welle 1B: der Lebenszyklus der Agent-IR einer Rolle für
+    /// Fortsetzungen (`continue_from` ist eine erneute Ausführung desselben
+    /// Auftrags).
+    ///
+    /// # Returns
+    /// `Ok(None)` ohne IR oder ohne `max_attempts` (dann gilt allein
+    /// [`crate::child_handoff::MAX_CONTINUATIONS`]), sonst
+    /// `Ok(Some(max_attempts))` — Versuche **einschließlich** des ersten.
+    ///
+    /// # Errors
+    /// [`AgentSpawnError`] mit Präfix `continue_from:`, wenn die IR
+    /// `allow_rerun = false` trägt.
+    fn lifecycle_max_attempts(&self, role_name: &str) -> Result<Option<u32>, AgentSpawnError> {
+        let Some(ir) = self
+            .roles
+            .get(role_name)
+            .and_then(|definition| definition.registry_factory.executable_agent_ir(role_name))
+        else {
+            return Ok(None);
+        };
+        let lifecycle = ir.lifecycle_machine();
+        if !lifecycle.allow_rerun() {
+            return Err(Self::reject(format!(
+                "continue_from: die Rolle '{role_name}' erlaubt keine erneute Ausführung \
+                 ([lifecycle] allow_rerun = false) — starte statt einer Fortsetzung ein neues \
+                 Kind mit vollständigem Auftrag"
+            )));
+        }
+        Ok(lifecycle.max_attempts())
+    }
+
+    /// #22 Welle 1B: prüft, ob nach `used` Fortsetzungen der Kette mit
+    /// Ursprung `origin` noch ein Versuch innerhalb von `max_attempts` liegt.
+    ///
+    /// # Errors
+    /// [`AgentSpawnError`] mit Präfix `continue_from:` und der Grenze.
+    fn check_attempts(
+        role_name: &str,
+        max_attempts: u32,
+        used: u32,
+        origin: &SessionId,
+    ) -> Result<(), AgentSpawnError> {
+        let attempt = next_attempt(used);
+        if attempt > max_attempts {
+            return Err(Self::reject(format!(
+                "continue_from: die Rolle '{role_name}' erlaubt höchstens {max_attempts} \
+                 Versuche ([lifecycle] max_attempts = {max_attempts}); die Fortsetzung wäre \
+                 Versuch {attempt} des ursprünglichen Kindes {origin}. Führe die Übergaben \
+                 selbst zusammen oder schneide den Auftrag neu und kleiner zu."
+            )));
+        }
+        Ok(())
     }
 
     /// Runde 5, Teil J: prüft, ob `caller` das budget-beendete Kind `from`
@@ -6299,11 +6880,24 @@ impl ManagedAgentSpawner {
         from: &SessionId,
         role: &str,
     ) -> Result<crate::child_handoff::ContinuationSeed, AgentSpawnError> {
-        self.handoff_ledger
+        let ledger = self
+            .handoff_ledger
             .lock()
-            .map_err(|_| Self::reject("child handoff ledger lock is poisoned"))?
+            .map_err(|_| Self::reject("child handoff ledger lock is poisoned"))?;
+        let seed = ledger
             .prepare(caller, from, role)
-            .map_err(|error| Self::reject(error.0))
+            .map_err(|error| Self::reject(error.0))?;
+        // #22 Welle 1B: erst nach der Eigentumsprüfung (kein Orakel über
+        // fremde Kinder) — dann der Lebenszyklus der Rolle.
+        if let Some(max_attempts) = self.lifecycle_max_attempts(role)? {
+            Self::check_attempts(
+                role,
+                max_attempts,
+                ledger.continuations_used(&seed.origin),
+                &seed.origin,
+            )?;
+        }
+        Ok(seed)
     }
 
     /// Runde 5, Teil J: bindet ein frisch admittiertes Kind als Fortsetzung.
@@ -6356,12 +6950,25 @@ impl ManagedAgentSpawner {
                 seed.of
             ))
         })?;
-        let link = self
-            .handoff_ledger
-            .lock()
-            .map_err(|_| Self::reject("child handoff ledger lock is poisoned"))?
-            .bind(seed)
-            .map_err(|error| Self::reject(error.0))?;
+        // #22 Welle 1B: der Lebenszyklus der Rolle wird unter derselben
+        // Sperre wie die Kettenzählung geprüft — zwei gleichzeitige
+        // Fortsetzungen können `max_attempts` nicht gemeinsam überschreiten.
+        let max_attempts = self.lifecycle_max_attempts(&record.role)?;
+        let link = {
+            let mut ledger = self
+                .handoff_ledger
+                .lock()
+                .map_err(|_| Self::reject("child handoff ledger lock is poisoned"))?;
+            if let Some(max_attempts) = max_attempts {
+                Self::check_attempts(
+                    &record.role,
+                    max_attempts,
+                    ledger.continuations_used(&seed.origin),
+                    &seed.origin,
+                )?;
+            }
+            ledger.bind(seed).map_err(|error| Self::reject(error.0))?
+        };
         match self.child_tasks.lock() {
             Ok(mut tasks) => {
                 let state = tasks.entry(child.as_str().to_owned()).or_default();
@@ -7993,6 +8600,7 @@ impl ManagedAgentSpawner {
                         admission_warning,
                         task_max_bytes,
                         continuation: None,
+                        backend_resume: None,
                     },
                 );
             }
@@ -8313,6 +8921,10 @@ mod tests {
     // Gründe, Eltern-Schnitt gegen die Basis
     // (`child_controller/tests/plan_delegation.rs`).
     mod plan_delegation;
+
+    // Welle 6: ein über den `ChildBackend` laufendes Kind bekommt seine
+    // in-process Rechte (`child_controller/tests/child_backend_run.rs`).
+    mod child_backend_run;
 
     // ── cap_child_return_text (Vertrag CHILD_RETURN_MAX_BYTES) ─────────────
 
@@ -12418,6 +13030,7 @@ max_depth = 0
                     admission_warning: None,
                     task_max_bytes: None,
                     continuation: None,
+                    backend_resume: None,
                 },
             );
     }
@@ -14769,6 +15382,96 @@ max_depth = 0
             .ok_or(TestError::Missing("record"))?
             .lease_expires_at;
         assert!(renewed > soon, "{renewed} > {soon}");
+        Ok(())
+    }
+
+    // --- #22 Welle 1B: Lebenszyklus der Agent-IR für Fortsetzungen -------
+
+    /// Ein Spawner mit der Rolle `worker`, deren IR `lifecycle` trägt, und
+    /// ein Übergabe-Eintrag für ein (fiktives) beendetes Kind `first` des
+    /// Elternteils — ohne Modelllauf, direkt im Fortsetzungs-Buch.
+    fn lifecycle_spawner(
+        lifecycle: &str,
+    ) -> TestResult<(ManagedAgentSpawner, SessionId, SandboxSpec, SessionId)> {
+        let ir = test_agent_ir(&format!("[tools]\nadmitted = [\"fs.read\"]\n\n{lifecycle}"))?;
+        let (spawner, parent, sandbox) =
+            window_test_spawner(Arc::new(IrChildRegistry { ir }), None)?;
+        let first = SessionId::new();
+        spawner
+            .handoff_ledger
+            .lock()
+            .map_err(|_| TestError::Unexpected("ledger lock poisoned".to_owned()))?
+            .record(crate::child_handoff::HandoffRecord {
+                child: first.clone(),
+                parent: parent.clone(),
+                role: "worker".to_owned(),
+                sandbox: Some(sandbox.clone()),
+                handoff: "Zwischenstand".to_owned(),
+                kind: crate::child_handoff::BudgetHandoff::LastAnswer,
+                origin: first.clone(),
+                end: crate::child_handoff::PredecessorEnd::BudgetExhausted,
+            });
+        Ok((spawner, parent, sandbox, first))
+    }
+
+    #[test]
+    fn continue_from_is_refused_when_the_lifecycle_forbids_a_rerun() -> TestResult {
+        let (spawner, parent, _sandbox, first) =
+            lifecycle_spawner("[lifecycle]\nallow_rerun = false\nmax_attempts = 5\n")?;
+        let refused = spawner.prepare_continuation(&parent, &first, "worker");
+        let message = match refused {
+            Ok(_) => return Err(TestError::Unexpected("rerun must be refused".to_owned())),
+            Err(error) => error.message,
+        };
+        assert!(message.contains("allow_rerun = false"), "{message}");
+        assert!(crate::child_handoff::is_continuation_rejection(&message));
+        assert_eq!(spawner.resumable_child_role(&parent, first.as_str()), None);
+        // Fremde Kinder bekommen weiterhin dieselbe Antwort wie unbekannte —
+        // der Lebenszyklus verrät nichts vor der Eigentumsprüfung.
+        let stranger = spawner.prepare_continuation(&SessionId::new(), &first, "worker");
+        assert!(stranger.is_err_and(|error| error.message.contains("kein eigenes")));
+        Ok(())
+    }
+
+    #[test]
+    fn continue_from_is_refused_beyond_max_attempts() -> TestResult {
+        let (spawner, parent, sandbox, first) =
+            lifecycle_spawner("[lifecycle]\nallow_rerun = true\nmax_attempts = 2\n")?;
+        assert_eq!(
+            spawner.resumable_child_role(&parent, first.as_str()),
+            Some("worker".to_owned())
+        );
+        // Versuch 2 (die erste Fortsetzung) liegt innerhalb von max_attempts.
+        let seed = spawner
+            .prepare_continuation(&parent, &first, "worker")
+            .map_err(|error| TestError::Unexpected(error.message))?;
+        let second = spawner
+            .admit("worker", spawn_input(parent.clone()), sandbox.clone(), None)
+            .map_err(|error| TestError::Unexpected(error.message))?;
+        let link = spawner
+            .bind_continuation(&second, &seed)
+            .map_err(|error| TestError::Unexpected(error.message))?;
+        assert_eq!(link.number, 1);
+        spawner
+            .release_child(&second)
+            .map_err(|error| TestError::Unexpected(error.message))?;
+
+        // Versuch 3 überschreitet max_attempts = 2 — obwohl die allgemeine
+        // Kettengrenze (MAX_CONTINUATIONS = 3) noch Platz hätte.
+        let refused = spawner.prepare_continuation(&parent, &first, "worker");
+        assert!(
+            refused.is_err_and(|error| error.message.contains("max_attempts = 2")
+                && crate::child_handoff::is_continuation_rejection(&error.message)),
+        );
+        let third = spawner
+            .admit("worker", spawn_input(parent.clone()), sandbox, None)
+            .map_err(|error| TestError::Unexpected(error.message))?;
+        let late_bind = spawner.bind_continuation(&third, &seed);
+        assert!(
+            late_bind.is_err_and(|error| error.message.contains("max_attempts")),
+            "auch ein früher vorbereiteter Seed bindet nicht über die Grenze"
+        );
+        assert_eq!(spawner.resumable_child_role(&parent, first.as_str()), None);
         Ok(())
     }
 }

@@ -1,7 +1,15 @@
 [workspace]
 resolver = "2"
 members = [
+    # R10 Wave 2A: agent-artifact-v1 container + executable footer (leaf crate).
+    "harw-agent-artifact",
+    # R10 Wave 2B: compiler driver, passes, backends, `harw agent …` commands.
+    "harw-agent-compiler",
     "harw-agent-dsl",
+    # R10 Wave 3: standalone runner binary a compiled agent artifact is
+    # embedded into (`harw-agent-compiler` probes/ships it; see
+    # `[profile.release-runner]` below).
+    "harw-agent-runner",
     "harw-authority",
     "harw-code-graph",
     "harw-explorer",
@@ -157,3 +165,17 @@ codegen-units = 16
 
 [profile.dev]
 opt-level = 0
+
+# R10 Wave 4 (docs/adr/0001-agent-compiler.md): the profile `make build`/
+# `make install` use for `harw-agent-runner`. A compiled agent embeds this
+# binary and ships it to end users, so its size and runtime cost matter more
+# than the runner's own build time — unlike `[profile.release]` above, which
+# every workspace crate builds under during normal development. `panic =
+# "abort"` is safe here: the runner has no library consumer that must unwind
+# across an `extern "Rust"` boundary, only its own `main`.
+[profile.release-runner]
+inherits = "release"
+lto = "fat"
+codegen-units = 1
+strip = true
+panic = "abort"

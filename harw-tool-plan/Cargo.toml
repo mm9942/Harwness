@@ -14,6 +14,7 @@ rust-version.workspace = true
 [dependencies]
 harw-authority = { path = "../harw-authority" }
 harw-extension-api = { path = "../harw-extension-api" }
+harw-home = { path = "../harw-home" }
 harw-tools = { path = "../harw-tools" }
 harw-types = { path = "../harw-types" }
 serde = { workspace = true, features = ["derive"] }

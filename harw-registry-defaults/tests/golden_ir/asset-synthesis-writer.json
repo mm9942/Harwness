@@ -1,0 +1,188 @@
+{
+  "schema": "harwness.agent-ir/v2",
+  "id": "harwness.agent.synthesis-writer@1",
+  "version": "1.0.0",
+  "name": "Synthesis Writer",
+  "description": "Verdichtet geprüfte Befunde der Analyse-Familie zu einem Produkt mit Kernaussage zuerst und kalibrierter Sicherheitsangabe; schreibt ausschließlich an den im Auftrag zugewiesenen Ausgabepfad.",
+  "role": "worker",
+  "specialization": "synthesis-writer",
+  "reasoning_effort": null,
+  "authority": {
+    "capabilities": []
+  },
+  "instructions": {
+    "text": "# synthesis-writer\n\nDu verdichtest geprüfte Befunde der Analyse-Familie zu **einem** Produkt: Kernaussage zuerst, klare Gliederung, kalibrierte Sicherheitsangabe, offene Punkte. Du schreibst ausschließlich an den **Ausgabepfad, den der Auftrag nennt**.\n\nDer Skill `confidence-and-uncertainty` ist fest geladen. Lade vor dem Schreiben `business-writing-pyramid` über `skills.load`; er bestimmt Aufbau und Einleitung.\n\n## Vorgehen\n\n1. **Auftrag prüfen.** Leitfrage, Leser, Verwendungszweck, Ausgabepfad, Format (Markdown, Länge). Fehlt der Ausgabepfad, schreibst du **keine** Datei und gibst das Produkt als Text zurück.\n2. **Eingaben ordnen.** Befunde mit Einstufung (behalten / mit Vorbehalt / verworfen), Methodenbefund, Planspiel- oder Strukturergebnisse. Verworfene Belege tragen keine Aussage.\n3. **Storyline bauen** nach `business-writing-pyramid`: Leser, Frage, Antwort in einem Satz; zwei bis fünf tragende Aussagen; Belege darunter.\n4. **Sicherheit festlegen** nach `confidence-and-uncertainty`: Wahrscheinlichkeitsbegriff plus Vertrauen in die Grundlage, wichtigste Lücke, Umschlagpunkte, abweichende Sicht.\n5. **Schreiben.** Jede tragende Aussage mit Fundstelle (Verweis auf die Befund-ID oder den Pfad). Belege mit Vorbehalt nur mit Hinweis.\n6. **Selbstcheck** mit der Checkliste aus `business-writing-pyramid`, dann Datei schreiben (`fs.write`, Korrekturen mit `fs.edit`), nur am Ausgabepfad.\n\n## Aufbau des Produkts\n\n```markdown\n# <Kernaussage als Satz>\n\n**Einschätzung:** … (<Begriff>, Vertrauen: <Stufe>)\n\n<Einleitung: Lage – Störung – Frage – Antwort>\n\n## <Tragende Aussage 1 als Satz>\n…\n## Sicherheit und Grenzen\nWichtigste Lücke · Umschlagpunkte · abweichende Sicht · tragende Annahmen\n## Grundlage\nBefund-IDs / Fundstellen · Methode in zwei Sätzen · Prüfbefund\n```\n\n## Rückgabe an den Auftraggeber\n\n```markdown\n**Geschrieben:** <Ausgabepfad> | nicht geschrieben (kein Pfad) – Produkt folgt als Text\n**Kernaussage:** …\n**Sicherheit:** <Begriff>, Vertrauen <Stufe>\n**Nicht verwendet:** <verworfene Befunde, Grund>\n**Offen:** …\n```\n\n## Was ich NICHT tue\n\n- Ich schreibe an keinen anderen Pfad als den zugewiesenen, lege keine Hilfsdateien an und ändere keine Quellen.\n- Ich führe keine neuen Belege ein und recherchiere nicht nach; Lücken benenne ich.\n- Ich hebe keine Sicherheit an, die die Prüfung nicht trägt, und glätte keine Widersprüche weg.\n- Ich prüfe mein Produkt nicht selbst ab; der Belegcheck danach gehört anderen.\n- Keine Prozesse, kein Netz, keine anderen Agenten starten.\n",
+    "source": "system.md",
+    "blake3": "6252e4a6c800d04a06823f24d5ea2b9d6f55e25f7ee67c3362668f389ddf1ed6"
+  },
+  "tools": {
+    "admitted": [
+      "fs.read",
+      "fs.list",
+      "fs.search",
+      "fs.glob",
+      "fs.grep",
+      "doc.read_pdf",
+      "fs.write",
+      "fs.edit",
+      "workbench.show",
+      "diary.read",
+      "palace.search",
+      "palace.recall",
+      "parent.message",
+      "skills.search",
+      "skills.load"
+    ],
+    "forbidden": [
+      "shell.exec",
+      "web.fetch",
+      "web.search",
+      "web.docs_rs",
+      "web.crates_io"
+    ]
+  },
+  "spawn": {
+    "max_depth": 0,
+    "child_orchestrators": [],
+    "delegation_targets": null,
+    "workspace_hint": null,
+    "budget": {
+      "max_tokens": 120000,
+      "max_tool_calls": 50,
+      "max_wall_secs": 900,
+      "effort_cap": null
+    }
+  },
+  "job": {
+    "goal_kind": null
+  },
+  "lifecycle": {
+    "allow_pause": false,
+    "allow_rerun": true,
+    "max_attempts": 4
+  },
+  "context": {
+    "program": null,
+    "program_id": null,
+    "policy": null,
+    "sections": [],
+    "must_include": [
+      "task.objective",
+      "task.read_scope",
+      "new.trigger_return"
+    ],
+    "exclude": [
+      "full_parent_transcript",
+      "sibling_transcripts"
+    ],
+    "deferred": []
+  },
+  "return": {
+    "contract": "harwness.return.execution-summary@1",
+    "validators": []
+  },
+  "models": null,
+  "limits": null,
+  "work": {
+    "mode": "synthesis",
+    "may_write_code": false,
+    "may_research_web": false,
+    "may_change_plan": null,
+    "aggregates_child_returns": null
+  },
+  "research": null,
+  "verification": null,
+  "skills": {
+    "entries": [
+      {
+        "name": "confidence-and-uncertainty",
+        "hash": null
+      }
+    ]
+  },
+  "binary": {
+    "name": "synthesis-writer",
+    "interfaces": [
+      "cli"
+    ],
+    "default_interface": "cli"
+  },
+  "permissions": {
+    "tools": [
+      "diary.read",
+      "doc.read_pdf",
+      "fs.edit",
+      "fs.glob",
+      "fs.grep",
+      "fs.list",
+      "fs.read",
+      "fs.search",
+      "fs.write",
+      "palace.recall",
+      "palace.search",
+      "parent.message",
+      "skills.load",
+      "skills.search",
+      "workbench.show"
+    ],
+    "forbidden_tools": [
+      "shell.exec",
+      "web.crates_io",
+      "web.docs_rs",
+      "web.fetch",
+      "web.search"
+    ],
+    "capabilities": [],
+    "filesystem": {
+      "read": true,
+      "write": true,
+      "write_paths": [
+        "$WORKSPACE"
+      ],
+      "other_write_tools": []
+    },
+    "network": {
+      "mode": "off",
+      "tools": [],
+      "hosts": []
+    },
+    "shell": false,
+    "host": false,
+    "spawn": {
+      "max_depth": 0,
+      "child_orchestrators": [],
+      "delegation_targets": []
+    },
+    "budget": {
+      "max_tokens": 120000,
+      "max_tool_calls": 50,
+      "max_wall_secs": 900,
+      "effort_cap": null
+    },
+    "required_env": []
+  },
+  "trace": {
+    "steps": [
+      {
+        "source": "harwness.agent.worker-base@1",
+        "kind": "patch",
+        "applied_at": "1970-01-01T00:00:00Z"
+      },
+      {
+        "source": "harwness.agent.worker-base@1",
+        "kind": "base",
+        "applied_at": "1970-01-01T00:00:00Z"
+      },
+      {
+        "source": "harwness.agent.synthesis-writer@1",
+        "kind": "patch",
+        "applied_at": "1970-01-01T00:00:00Z"
+      }
+    ],
+    "diagnostics": []
+  },
+  "snapshot": {
+    "domain": "harwness.agent-ir.snapshot/v7",
+    "digest": "bf41feaa0b8045827c8d9c65f05a92feed10c168092dd14d3e66368073d6ffc0"
+  }
+}

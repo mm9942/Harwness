@@ -62,7 +62,8 @@ pub use event::{
 pub use launcher::{JobLauncher, LaunchFuture, PreparedJob, ShellJobLauncher};
 pub use logs::{LogQuery, LogSlice};
 pub use manager::{
-    Caller, DetachSummary, JobError, JobManager, JobManagerConfig, StartRequest, WaitOutcome,
+    Caller, DEFAULT_MAX_PIPED_LINE_BYTES, DetachSummary, JobError, JobManager, JobManagerConfig,
+    PipedJob, PipedLineError, StartRequest, WaitOutcome,
 };
 pub use model::{JobId, JobMeta, JobOwner, JobState, JobStatus};
 pub use procfs::JobSignal;

@@ -42,10 +42,34 @@ use harw_config::{ResolvedConfig, SessionSection};
 use harw_core::{InMemoryStateStore, SessionThreadMapper, StateStore, TranscriptStateStore};
 use harw_home::{active_profile_name, profile_dir};
 use harw_protocol::SessionEvent;
-use harw_runtime::{EntryKind, ModelSource, RuntimeAssembly, RuntimeSpec, RuntimeStores};
+use harw_runtime::{
+    EmbeddedAgent, EntryKind, ModelSource, RuntimeAssembly, RuntimeSpec, RuntimeStores,
+};
 use harw_session_store::TranscriptStore;
 use harw_types::{IngressSurface, PermissionTier, Principal, PrincipalKind};
 use tokio::sync::mpsc::UnboundedSender;
+
+/// Baut das [`EmbeddedAgent`] aus der verifizierten eingebetteten UIA
+/// ([`crate::embedded_uia::EmbeddedUia`]), falls dieser Prozess eine native,
+/// personalisierte harw ist.
+///
+/// # Beschreibung
+/// [`crate::embedded_uia::verify_embedded`] verifiziert das Artefakt und
+/// dessen `user-interface`-Rolle bereits beim Start; diese Funktion baut
+/// daraus zusätzlich das vollständige [`EmbeddedAgent`]
+/// (`harw-runtime`, Welle 3A), über das die Montage die UIA erreicht
+/// ([`RuntimeSpec::embedded`]) — dieselbe Struktur, die
+/// `EntryKind::CompiledAgent` für einen eigenständigen kompilierten Agenten
+/// nutzt. `None`, wenn dieser Prozess keine eingebettete UIA trägt oder das
+/// Artefakt (das schon einmal verifiziert wurde) sich unerwartet nicht noch
+/// einmal als Bundle lesen lässt.
+fn embedded_uia_agent() -> Option<Arc<EmbeddedAgent>> {
+    let uia = crate::embedded_uia::embedded_uia()?;
+    let bundle = harw_agent_artifact::Bundle::from_artifact(&uia.artifact).ok()?;
+    EmbeddedAgent::from_bundle(bundle, &uia.artifact)
+        .ok()
+        .map(Arc::new)
+}
 
 /// Baut die Eingangsbeschreibung eines Laufs ohne explizite Overrides.
 ///
@@ -81,6 +105,17 @@ pub(crate) fn runtime_spec(
         reasoning_effort: None,
         approval_override: None,
         model_override: None,
+        // #22 Welle 3: eine native, personalisierte harw trägt ihre UIA im
+        // Binary (`crate::embedded_uia::embedded_uia`); die Laufzeit selbst
+        // kennt `harw-cli` nicht und bekommt sie ausschließlich hierüber
+        // (`RuntimeAssembly` bevorzugt sie dann über
+        // `harness.active_uia_definition`, siehe
+        // `harw-runtime/src/assembly.rs::resolve_embedded_uia`). `None` in
+        // jedem gewöhnlichen (nicht personalisierten) Build.
+        embedded: embedded_uia_agent(),
+        // #22 Welle 3C: `harw-cli` verdrahtet kein `ChildBackend` — jeder
+        // Kind-Lauf bleibt in-process wie bisher.
+        child_backend: None,
     }
 }
 

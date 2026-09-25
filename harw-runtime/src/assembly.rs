@@ -347,7 +347,8 @@ pub const fn default_approval_mode(entry: EntryKind) -> ApprovalMode {
         | EntryKind::McpServe
         | EntryKind::JobPrompt
         | EntryKind::JobPlanNode
-        | EntryKind::GatewayDream => ApprovalMode::Delegated,
+        | EntryKind::GatewayDream
+        | EntryKind::CompiledAgent => ApprovalMode::Delegated,
     }
 }
 
@@ -380,7 +381,8 @@ pub const fn forced_approval_mode(entry: EntryKind) -> Option<ApprovalMode> {
         | EntryKind::McpServe
         | EntryKind::JobPrompt
         | EntryKind::JobPlanNode
-        | EntryKind::GatewayDream => None,
+        | EntryKind::GatewayDream
+        | EntryKind::CompiledAgent => None,
     }
 }
 
@@ -769,6 +771,43 @@ const fn root_organizational_role(spawner: SpawnerPolicy) -> AgentRoleId {
 /// # Rückgabe
 /// Ohne IR [`SessionActivation::default`] (Profil `Full`) — genau der Wert,
 /// den `AgentSession::new_with_id` setzt, also kein Schnitt.
+fn compiled_workspace_root(
+    root: &Path,
+    ir: &harw_agent_dsl::ir_v2::AgentIr,
+) -> RuntimeResult<PathBuf> {
+    let paths = &ir.permissions.filesystem.write_paths;
+    let requested = match paths.as_slice() {
+        [] if !ir.permissions.filesystem.write => return Ok(root.to_path_buf()),
+        [path] if path == harw_agent_dsl::ir_v2::WORKSPACE_WRITE_PATH => {
+            return Ok(root.to_path_buf());
+        }
+        [path] => root.join(path),
+        _ => {
+            return Err(RuntimeError::Sandbox {
+                detail: "compiled write permission requires exactly one workspace write path"
+                    .to_owned(),
+            });
+        }
+    };
+    let canonical = requested
+        .canonicalize()
+        .map_err(|error| RuntimeError::Sandbox {
+            detail: format!(
+                "compiled workspace '{}' cannot be resolved: {error}",
+                requested.display()
+            ),
+        })?;
+    if !canonical.is_dir() || !canonical.starts_with(root) {
+        return Err(RuntimeError::Sandbox {
+            detail: format!(
+                "compiled write path '{}' is outside the permitted workspace",
+                requested.display()
+            ),
+        });
+    }
+    Ok(canonical)
+}
+
 fn root_activation(ir: Option<&ExecutableAgentIr>) -> SessionActivation {
     let Some(ir) = ir else {
         return SessionActivation::default();
@@ -785,6 +824,71 @@ fn root_activation(ir: Option<&ExecutableAgentIr>) -> SessionActivation {
         activation.disable_tool(ToolName::new(name.clone()));
     }
     activation
+}
+
+/// Das Kontextprogramm der Wurzel-IR, geprüft gegen die Wurzeldecke
+/// (#22 Welle 1B).
+///
+/// # Beschreibung
+/// Dieselbe Regel wie bei der Kind-Admission
+/// (`ManagedAgentSpawner::describe_context_program_ceiling_violation`): jede
+/// Sektion aus `must_include` und `section_detail` muss in der Decke liegen.
+/// Ein leeres Programm (`ContextProgram::default()`, keine Deklaration)
+/// ergibt `None` — die Wurzel rendert dann genau wie bisher. Unter einer
+/// geschlossenen Decke (keine Sektion, Einstiege ohne Spawner) gilt kein
+/// Programm; die Wurzel läuft ohne und das wird geloggt.
+///
+/// # Fehler
+/// [`RuntimeError::Registry`], wenn das Programm eine Sektion außerhalb der
+/// Wurzeldecke verlangt: fail-closed, die Wurzel startet nicht mit einem
+/// Programm, das sie nicht einhalten kann.
+fn root_context_program(
+    ir: Option<&ExecutableAgentIr>,
+    ceiling: &ContextCeiling,
+) -> RuntimeResult<Option<harw_agent_dsl::executable::ContextProgram>> {
+    let Some(ir) = ir else {
+        return Ok(None);
+    };
+    let program = ir.context_program();
+    if program == &harw_agent_dsl::executable::ContextProgram::default() {
+        return Ok(None);
+    }
+    if ceiling.sections.is_empty() {
+        // Geschlossene Decke (`CeilingPolicy::Closed`: Web, MCP, Jobs,
+        // Gateways — Einstiege ohne Spawner): dort kann kein Programm
+        // gelten, und auch kein Kind mit Programm würde zugelassen. Die
+        // Wurzel läuft ohne Programm; das wird sichtbar gemeldet.
+        tracing::warn!(
+            agent = ir.specialization(),
+            policy = program.context_policy().unwrap_or("<none>"),
+            "runtime.root_context_program.skipped_under_closed_ceiling"
+        );
+        return Ok(None);
+    }
+    let outside = program
+        .must_include()
+        .iter()
+        .map(String::as_str)
+        .chain(
+            program
+                .section_detail()
+                .iter()
+                .map(harw_agent_dsl::executable::SectionDetail::name),
+        )
+        .find(|name| {
+            !harw_context::SectionName::try_new(*name)
+                .is_ok_and(|section| ceiling.sections.contains(&section))
+        });
+    if let Some(name) = outside {
+        return Err(RuntimeError::Registry {
+            detail: format!(
+                "root agent '{}' declares context section '{name}' outside the root context \
+                 ceiling; refusing to start with a context program it cannot honour",
+                ir.specialization()
+            ),
+        });
+    }
+    Ok(Some(program.clone()))
 }
 
 /// Eine Verengung, die der Aufrufer über die Rechte seines Einstiegs legt.
@@ -1590,7 +1694,14 @@ impl RuntimeAssemblyBuilder {
             detail: "no stores were given to the runtime builder".to_owned(),
         })?;
 
-        let profile = spec.entry.profile();
+        // #22 Welle 3A: `EntryKind::CompiledAgent` hat keine Tabellenzeile —
+        // ihr Profil entsteht aus den Manifest-Rechten des eingebetteten
+        // Agenten, nicht aus `EntryKind::profile()` (dessen Zeile für diese
+        // Art nur die engste Rückfallzeile ist, siehe `spec.rs`).
+        let profile = match spec.embedded.as_ref() {
+            Some(embedded) => crate::spec::EntryProfile::for_embedded(embedded.rights()),
+            None => spec.entry.profile(),
+        };
 
         // 0. Verengung des Aufrufers — fail-closed, bevor irgendetwas gelesen
         //    oder gebaut wird (CONTRACTS-W2d2 §1.1).
@@ -1604,8 +1715,22 @@ impl RuntimeAssemblyBuilder {
         };
         ensure_narrowing_fits_operations(spec.entry, &profile, narrowing.as_ref())?;
 
-        // 1. Konfiguration mit Vertrauensbericht.
-        let (config, trust_report) = load_config(&spec)?;
+        // 1. Konfiguration mit Vertrauensbericht. Ein eingebetteter Lauf
+        //    liest sie vollständig aus dem Speicher (`load_config_embedded`)
+        //    und trägt deshalb keinen Vertrauensbericht über `~/.harw`-Layer;
+        //    `trust_report` bleibt für ihn leer (kein Layer, kein
+        //    nicht-vertrautes Repo).
+        let (config, trust_report) = match spec.embedded.as_ref() {
+            Some(_) => (
+                crate::config::load_config_embedded(&spec)?,
+                ConfigTrustReport {
+                    layers: Vec::new(),
+                    untrusted_repo: None,
+                    trust_status: None,
+                },
+            ),
+            None => load_config(&spec)?,
+        };
         let config = Arc::new(config);
         // Netz-Werkzeuge (web.fetch/web.search/…) einmal je Prozess mit der
         // Egress-Policy aus `[network]`/`[research]` und dem Such-Backend aus
@@ -1736,11 +1861,31 @@ impl RuntimeAssemblyBuilder {
         //      Netz (nur `Tui`/`OneShot`): Hosts ausschließlich aus der
         //      Egress-Allowlist; ohne Allowlist kein Host und kein Netzrecht.
         let bound_root = sandbox_root(&project.project_root, narrowing.as_ref())?;
-        let unrestricted = root_sandbox_with_network(
-            spec.entry,
-            &bound_root,
-            root_network_scope(spec.entry, &config),
-        )?;
+        let bound_root = if let Some(embedded) = spec.embedded.as_ref() {
+            compiled_workspace_root(&bound_root, embedded.root_ir())?
+        } else {
+            bound_root
+        };
+        let unrestricted = if let Some(embedded) = spec.embedded.as_ref() {
+            let rights = embedded.rights();
+            let scope = if rights.network_open {
+                NetworkScope::from_hosts(rights.network_hosts.iter().cloned())
+            } else {
+                NetworkScope::empty()
+            };
+            crate::sandbox::root_sandbox_with_permissions(
+                spec.entry,
+                &bound_root,
+                scope,
+                profile.permissions.clone(),
+            )?
+        } else {
+            root_sandbox_with_network(
+                spec.entry,
+                &bound_root,
+                root_network_scope(spec.entry, &config),
+            )?
+        };
         if narrowing
             .as_ref()
             .is_some_and(|narrowing| narrowing.workspace_root.is_some())
@@ -1798,10 +1943,27 @@ impl RuntimeAssemblyBuilder {
         // ([`resolve_explicit_root_agent`]). Ohne expliziten Agenten hat ein
         // UI-Einstieg genau einen Root: die UIA. Die Werkzeuge bleiben in
         // jedem Fall durch Einstiegsprofil und Sandbox gedeckelt.
-        let agent_ir =
-            resolve_explicit_root_agent(spec.active_agent.as_deref(), &config, &agent_definitions)?;
+        let agent_ir = if spec.entry == EntryKind::CompiledAgent {
+            spec.embedded
+                .as_ref()
+                .map(|embedded| ExecutableAgentIr::from(embedded.root_ir()))
+        } else {
+            resolve_explicit_root_agent(spec.active_agent.as_deref(), &config, &agent_definitions)?
+        };
+        // #22 Welle 3: eine native, personalisierte harw bringt ihre UIA
+        // bereits eingebettet mit (`spec.embedded`, von `harw-cli` aus
+        // `embedded_uia()` gesetzt); die gewinnt dann über
+        // `harness.active_uia_definition`. Nur für `Tui`/`OneShot` — dieselbe
+        // Gattung wie [`resolve_active_uia`] selbst prüft; `spec.embedded`
+        // gehört sonst (Welle 3A) `EntryKind::CompiledAgent`, dessen
+        // eingebetteter Wurzel-Agent typischerweise keine UIA ist und dessen
+        // Rolle diese Funktion deshalb nicht abfragen darf.
         let uia_ir = if agent_ir.is_some() {
             None
+        } else if matches!(spec.entry, EntryKind::Tui | EntryKind::OneShot)
+            && let Some(embedded) = spec.embedded.as_deref()
+        {
+            Some(resolve_embedded_uia(embedded.root_ir())?)
         } else {
             resolve_active_uia(spec.entry, &config, &agent_definitions)?
         };
@@ -1815,6 +1977,11 @@ impl RuntimeAssemblyBuilder {
         // Tool-Calls als Text). Enkel ⊆ Kind ⊆ Wurzel gilt so gegen die echte
         // Wurzel.
         let activation = root_activation(agent_ir.as_ref());
+        // #22 Welle 1B: die Wurzel (explizit gewählter Agent, sonst die UIA)
+        // bringt ihr Kontextprogramm mit wie jedes Kind — geprüft gegen die
+        // Wurzeldecke mit derselben Regel wie die Kind-Admission.
+        let root_context_program =
+            root_context_program(agent_ir.as_ref().or(uia_ir.as_ref()), &ceiling)?;
         // Welle 8: Provider-/Modell-/Agenten-Reasoning-Effort-Vorgaben der
         // Wurzel-UIA, einmalig hier bestimmt (nicht in
         // [`Self::new_root_session`], das keinen Zugriff auf `uia_ir` selbst
@@ -1948,7 +2115,22 @@ impl RuntimeAssemblyBuilder {
             .as_ref()
             .map(|ir| ir.id().to_string())
             .or_else(|| overrides.agent_name.clone());
-        let skill_index = Arc::new(harw_catalog::SkillIndex::build(&trust_report.layers));
+        // #22 Welle 3A: ein eingebetteter Lauf (`spec.embedded`) liest keine
+        // Skills aus `~/.harw`-Layern — sie kommen ausschließlich aus dem
+        // Blob-Pool des Artefakts (`EmbeddedAgent::skill_bundle`),
+        // `build_with_bundle` nimmt dieses in-Memory-Bündel bereits ohne
+        // Änderung an `harw-catalog` entgegen.
+        let skill_index = Arc::new(match spec.embedded.as_ref() {
+            Some(embedded) => {
+                let bundle = embedded.skill_bundle();
+                let refs: Vec<(&str, &str)> = bundle
+                    .iter()
+                    .map(|(path, content)| (path.as_str(), content.as_str()))
+                    .collect();
+                harw_catalog::SkillIndex::build_with_bundle(&[], &refs)
+            }
+            None => harw_catalog::SkillIndex::build(&trust_report.layers),
+        });
         let legacy_skill_agent = match uia_ir.as_ref() {
             Some(uia) => Some(uia.specialization().to_owned()),
             None => overrides.agent_name.clone(),
@@ -2159,7 +2341,12 @@ impl RuntimeAssemblyBuilder {
                 effort_cap: Some(role_effort_weights.uia.to_string()),
             };
             let access = harw_registry_defaults::profile::AgentDefinitionAccess {
-                project_agents_dir: Some(project.project_root.join(".harw").join("agents")),
+                project_agents_dir: Some(
+                    project
+                        .project_root
+                        .join(harw_home::project_dir_name())
+                        .join("agents"),
+                ),
                 profile_agents_dir: profile_agents_dir.clone(),
                 mode: harw_registry_defaults::agent_definition_tools::DefinitionWriteMode::Commit,
                 ceiling: Some(ceiling),
@@ -2237,6 +2424,27 @@ impl RuntimeAssemblyBuilder {
                 ),
             ));
         }
+        // #22: `agents.build` nur für einen ausdrücklich gewählten Agenten,
+        // dessen Definition es admittiert, innerhalb der Sandbox-Rechte und
+        // mit Job-Verwaltung (nur TUI) — nie für UIA oder eingebaute Rollen.
+        if let Some(ir) = agent_ir.as_ref() {
+            use harw_registry_defaults::agent_definition_tools::{
+                AgentBuildWithheld, agent_build_provider_for,
+            };
+            match agent_build_provider_for(
+                Some(ir.tool_surface()),
+                sandbox.permissions(),
+                session_jobs.as_ref().map(|jobs| Arc::clone(&jobs.manager)),
+            ) {
+                Ok(provider) => {
+                    registry_builder = registry_builder.tool_provider(Arc::new(provider));
+                }
+                Err(AgentBuildWithheld::NotAdmitted) => {}
+                Err(withheld) => {
+                    tracing::info!(reason = %withheld, "runtime.agents_build.withheld");
+                }
+            }
+        }
 
         // 7b. Plan-Dienste: expliziter Builder-Wert gewinnt; sonst eingebaute
         //     Vorgabe für interaktive TUI-Einstiege, sofern `[tools.plan]`
@@ -2252,7 +2460,10 @@ impl RuntimeAssemblyBuilder {
         // 8. Operationen nach der Fläche des Einstiegs.
         let operations = build_operations(profile.operations, plan_services.as_ref());
 
-        let budget = RootBudget::from_config(&config, spec.entry);
+        let budget = match spec.embedded.as_ref() {
+            Some(embedded) => RootBudget::for_embedded(embedded.rights(), &config),
+            None => RootBudget::from_config(&config, spec.entry),
+        };
         let turn_limits = TurnLimits::from_root_budget(&budget);
 
         // 9. Modell, dann Spawner (die Kind-Fabrik braucht den Anbieter).
@@ -2406,6 +2617,12 @@ impl RuntimeAssemblyBuilder {
                 skill_roots: trust_report.layers.clone(),
                 // Plan Teil D: lesende Wissenswerkzeuge der Kinder.
                 knowledge: child_knowledge,
+                // Welle 3C: reicht `RuntimeSpec::child_backend` an den
+                // gebauten `ManagedAgentSpawner` durch.
+                child_backend: spec
+                    .child_backend
+                    .as_ref()
+                    .map(|handle| Arc::clone(&handle.0)),
             },
             session_events,
         )?;
@@ -2963,6 +3180,16 @@ impl RuntimeAssemblyBuilder {
             }
         }
 
+        let registry_builder = if let Some(embedded) = spec.embedded.as_ref() {
+            let allowed: Vec<&str> = embedded.rights().tools.iter().map(String::as_str).collect();
+            registry_builder.map_tool_providers(|provider| {
+                Arc::new(harw_registry_defaults::RestrictedToolProvider::new(
+                    provider, &allowed,
+                ))
+            })
+        } else {
+            registry_builder
+        };
         let registry = registry_builder.build();
         let tools = registered_tool_names(&registry);
 
@@ -2986,6 +3213,7 @@ impl RuntimeAssemblyBuilder {
             extra_roots,
             approval_timeout,
             agent_ir,
+            root_context_program,
             activation,
             operations,
             services,
@@ -3077,6 +3305,41 @@ fn resolve_active_uia(
         });
     }
     Ok(Some(ir))
+}
+
+/// Senkt die eingebettete UIA einer personalisierten harw (#22) und prüft
+/// ihre Rolle, wie [`resolve_active_uia`] es für `harness.active_uia_definition`
+/// tut.
+///
+/// # Beschreibung
+/// Aufgerufen anstelle von [`resolve_active_uia`] für `Tui`/`OneShot`, wenn
+/// `spec.embedded` ([`crate::embedded::EmbeddedAgent`], Welle 3A) gesetzt ist
+/// — die native, personalisierte harw trägt ihre UIA bereits als
+/// eingebettetes Artefakt (`harw-cli::embedded_uia` reicht sie über
+/// [`crate::spec::RuntimeSpec::embedded`] durch); sie gewinnt über eine
+/// konfigurierte `harness.active_uia_definition`, muss sich aber denselben
+/// Rollen- und Senkungs-Regeln stellen wie diese. `harw-runtime` kennt
+/// `harw-cli::embedded_uia` nicht selbst.
+///
+/// # Errors
+/// [`RuntimeError::Registry`], wenn die eingebettete Definition nicht die
+/// Rolle `user-interface` trägt (etwa `EmbeddedAgent::root_ir` eines
+/// `EntryKind::CompiledAgent`-Artefakts, das keine UIA ist — der Aufrufer
+/// gattet deshalb bereits auf `Tui`/`OneShot`, bevor er hierher kommt).
+fn resolve_embedded_uia(
+    embedded: &harw_agent_dsl::ir_v2::AgentIr,
+) -> RuntimeResult<ExecutableAgentIr> {
+    let ir = ExecutableAgentIr::from(embedded);
+    if ir.role() != AgentRoleId::UserInterface {
+        return Err(RuntimeError::Registry {
+            detail: format!(
+                "embedded UIA '{}' has role {:?}, expected user-interface",
+                embedded.id,
+                ir.role()
+            ),
+        });
+    }
+    Ok(ir)
 }
 
 /// Löst einen explizit gewählten Wurzel-Agenten auf und prüft seine Rolle.
@@ -4481,6 +4744,10 @@ struct SpawnerInputs<'a> {
     /// [`RuntimeChildRegistryFactory::with_knowledge`] an `factory` **und**
     /// `uia_worker_factory`. `None` → kein Kind bekommt sie.
     knowledge: Option<crate::children::ChildKnowledgeSource>,
+    /// [`RuntimeSpec::child_backend`] des Laufs (#22 Welle 3C); `Some` lässt
+    /// den gebauten `ManagedAgentSpawner` jedes Kind über dieses
+    /// [`harw_core::child_backend::ChildBackend`] statt in-process laufen.
+    child_backend: Option<Arc<dyn harw_core::child_backend::ChildBackend>>,
 }
 
 /// Montiert den Spawner eines Laufs nach seiner [`SpawnerPolicy`].
@@ -4527,6 +4794,7 @@ fn build_spawner(
         agent_events,
         skill_roots,
         knowledge,
+        child_backend,
     } = inputs;
 
     let events = session_events.ok_or_else(|| RuntimeError::Spawner {
@@ -4732,6 +5000,16 @@ fn build_spawner(
         // Skills, Rechte, Budget, Herkunft und die Lese-Eigenschaft, nach der
         // im Plan-Modus nur lesende Ziele delegierbar bleiben.
         .with_delegation_catalog(roster.entries().map(delegation_target_info));
+    // Welle 3C: ein gesetztes `RuntimeSpec::child_backend` lässt jedes über
+    // diesen Spawner admittierte Kind über dieses `ChildBackend` laufen
+    // (z. B. `harw-agent-runner`s `JobChildBackend`) statt in-process.
+    if let Some(backend) = child_backend {
+        // Welle 6: der Freigabemodus der Wurzel, damit ein Job-Kind
+        // `full_access` nur erbt, wenn die Wurzel gerade Full Access hat.
+        spawner = spawner
+            .with_child_backend(backend)
+            .with_approval_mode(chain.mode().clone());
+    }
     // Plan R9, Teil B: registriert wird der ganze Roster — die eingebauten
     // Rollen (`role_names::ALL`) und daneben jeder benutzerdefinierte Agent.
     let mut roles: Vec<String> = Vec::with_capacity(roster.len());
@@ -4839,6 +5117,10 @@ pub struct RuntimeAssembly {
     /// Effektives Freigabe-Timeout (Projekt > Global > Vorgabe), für die TUI.
     approval_timeout: Duration,
     agent_ir: Option<ExecutableAgentIr>,
+    /// #22 Welle 1B: das Kontextprogramm der Wurzel (explizit gewählter
+    /// Agent, sonst UIA), bereits gegen die Wurzeldecke geprüft; `None` ohne
+    /// deklariertes Programm.
+    root_context_program: Option<harw_agent_dsl::executable::ContextProgram>,
     activation: SessionActivation,
     operations: Arc<OperationRegistry>,
     /// Hinter einem `Arc`, weil die Modell-Tool-Fläche der Operationen
@@ -5324,6 +5606,16 @@ impl RuntimeAssembly {
         &self.activation
     }
 
+    /// #22 Welle 1B: das Kontextprogramm, das die Wurzelsitzung trägt
+    /// (explizit gewählter Agent, sonst UIA), bereits gegen die Wurzeldecke
+    /// geprüft; `None` ohne deklariertes Programm.
+    #[must_use]
+    pub const fn root_context_program(
+        &self,
+    ) -> Option<&harw_agent_dsl::executable::ContextProgram> {
+        self.root_context_program.as_ref()
+    }
+
     /// Das Budget des Wurzel-Agenten.
     #[must_use]
     pub const fn budget(&self) -> &RootBudget {
@@ -5726,6 +6018,12 @@ impl RuntimeAssembly {
         if let Some(ir) = self.agent_ir.as_ref() {
             session = session.with_executable_agent_ir(ir);
         }
+        // #22 Welle 1B: wie ein Kind (`ManagedAgentSpawner::admit`) trägt die
+        // Wurzel das Programm ihrer Definition; ohne Programm bleibt die
+        // Kontextmontage unverändert.
+        if let Some(program) = self.root_context_program.clone() {
+            session = session.with_context_program(program);
+        }
         // Welle 3: jede Modellanfrage der Wurzel fordert höchstens die
         // Ausgabereserve an, die die Auto-Verdichtung vom Fenster abzieht.
         session.set_max_output_tokens(Some(output_reserve));
@@ -5838,6 +6136,7 @@ impl RuntimeAssembly {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::spec::ChildBackendHandle;
     use crate::test_support::{TestError, TestResult, ctx};
 
     #[test]
@@ -6007,6 +6306,144 @@ mod tests {
             resolve_active_uia(EntryKind::Doctor, &config, &definitions)
                 .map_err(ctx("doctor has no UIA requirement"))?
                 .is_none()
+        );
+        Ok(())
+    }
+
+    /// Senkt eine minimale Agentendefinition zur `AgentIr`, wie
+    /// [`crate::embedded::EmbeddedAgent::root_ir`] sie liefert — derselbe
+    /// Weg wie `crate::embedded::tests::compile`.
+    fn compile_ir(source: &str, target: &str) -> TestResult<harw_agent_dsl::ir_v2::AgentIr> {
+        use harw_agent_dsl::diagnostics::SourceFile;
+        use harw_agent_dsl::ids::DefinitionId;
+        use harw_agent_dsl::layers::DefinitionLayer;
+        use harw_agent_dsl::lower_v2::{LowerSources, compile_agent};
+        let files = vec![SourceFile::new(
+            DefinitionLayer::UserGlobal,
+            "agents/embedded/definition.toml",
+            source,
+        )];
+        let sources = LowerSources::new(&files);
+        let target = DefinitionId::parse(target).map_err(ctx("target id"))?;
+        compile_agent(&target, &sources, time::OffsetDateTime::UNIX_EPOCH)
+            .map_err(|diagnostics| TestError::Unexpected(format!("compile: {diagnostics}")))
+    }
+
+    #[test]
+    fn compiled_assembly_applies_manifest_tools_network_and_budget() -> TestResult {
+        let fixture = build_fixture()?;
+        let ir = compile_ir(
+            "schema = \"harwness.agent/v1\"\nid = \"acme.agent.manifest@1\"\nversion = \"1.0.0\"\nrole = \"worker\"\nspecialization = \"manifest\"\n[tools]\nadmitted = [\"fs.read\", \"fs.write\", \"web.fetch\"]\n[network]\nhosts = [\"example.com\"]\n[spawn.budget]\nmax_tokens = 71\n",
+            "acme.agent.manifest@1",
+        )?;
+        let artifact =
+            harw_agent_artifact::BundleBuilder::new(harw_agent_artifact::bundle::AgentInput {
+                id: ir.id.to_string(),
+                name: "manifest".to_owned(),
+                ir: serde_json::to_value(&ir).map_err(ctx("serialize IR"))?,
+                files: Vec::new(),
+                children: Vec::new(),
+            })
+            .build()
+            .map_err(ctx("bundle"))?;
+        let bundle =
+            harw_agent_artifact::Bundle::from_artifact(&artifact).map_err(ctx("read bundle"))?;
+        let embedded =
+            crate::EmbeddedAgent::from_bundle(bundle, &artifact).map_err(ctx("embedded"))?;
+        let rights = embedded.rights().clone().narrowed_by(&crate::RightsFlags {
+            deny_tools: vec!["fs.write".to_owned()],
+            full_access: true,
+            ..crate::RightsFlags::default()
+        });
+        let mut builder = fixture_builder(EntryKind::CompiledAgent, &fixture);
+        builder.spec.embedded = Some(Arc::new(embedded.with_rights(rights)));
+        let (events, _receiver) = tokio::sync::mpsc::unbounded_channel::<SessionEvent>();
+        let assembly = builder
+            .session_events(events)
+            .build()
+            .map_err(ctx("compiled assembly"))?;
+        assert!(
+            assembly
+                .sandbox()
+                .permissions()
+                .contains(harw_authority::Permission::ReadWorkspace)
+        );
+        assert!(assembly.sandbox().network_scope().allows("example.com"));
+        assert!(
+            !assembly
+                .sandbox()
+                .network_scope()
+                .allows("unlisted.example")
+        );
+        assert_eq!(assembly.budget.max_total_tokens, 71);
+        assert!(assembly.tools.iter().any(|name| name == "fs.read"));
+        assert!(!assembly.tools.iter().any(|name| name == "fs.write"));
+        assert!(
+            assembly
+                .tools
+                .iter()
+                .all(|name| matches!(name.as_str(), "fs.read" | "web.fetch"))
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn compiled_workspace_hint_binds_inside_workspace_and_rejects_escape() -> TestResult {
+        let fixture = build_fixture()?;
+        let root = fixture
+            .project
+            .canonicalize()
+            .map_err(ctx("canonical root"))?;
+        let nested = root.join("nested");
+        std::fs::create_dir_all(&nested).map_err(ctx("nested"))?;
+        let mut ir = compile_ir(
+            "schema = \"harwness.agent/v1\"\nid = \"acme.agent.paths@1\"\nversion = \"1.0.0\"\nrole = \"worker\"\nspecialization = \"paths\"\n[tools]\nadmitted = [\"fs.write\"]\n[spawn]\nworkspace_hint = \"nested\"\n",
+            "acme.agent.paths@1",
+        )?;
+        assert_eq!(
+            compiled_workspace_root(&root, &ir).map_err(ctx("bound root"))?,
+            nested
+        );
+        ir.permissions.filesystem.write_paths = vec!["..".to_owned()];
+        assert!(compiled_workspace_root(&root, &ir).is_err());
+        ir.permissions.filesystem.write_paths.clear();
+        assert!(compiled_workspace_root(&root, &ir).is_err());
+        Ok(())
+    }
+
+    /// #22 Welle 3: die eingebettete UIA einer personalisierten harw
+    /// (`spec.embedded`, `EntryKind::Tui`/`OneShot`) wird genau wie eine
+    /// über `harness.active_uia_definition` konfigurierte UIA auf die Rolle
+    /// `user-interface` geprüft — [`resolve_embedded_uia`] ist der Kern
+    /// dieser Prüfung, den die Montage anstelle von [`resolve_active_uia`]
+    /// aufruft, sobald `spec.embedded` gesetzt ist (siehe Aufrufstelle in
+    /// [`RuntimeAssembly::builder`]).
+    #[test]
+    fn resolve_embedded_uia_accepts_user_interface_role_and_rejects_others() -> TestResult {
+        let uia_ir = compile_ir(
+            "schema = \"harwness.agent/v1\"\n\
+             id = \"acme.agent.embedded-uia@1\"\n\
+             version = \"1.0.0\"\n\
+             role = \"user-interface\"\n\
+             specialization = \"terminal-ui\"\n",
+            "acme.agent.embedded-uia@1",
+        )?;
+        let worker_ir = compile_ir(
+            "schema = \"harwness.agent/v1\"\n\
+             id = \"acme.agent.embedded-worker@1\"\n\
+             version = \"1.0.0\"\n\
+             role = \"worker\"\n\
+             specialization = \"embedded-worker\"\n",
+            "acme.agent.embedded-worker@1",
+        )?;
+
+        let resolved = resolve_embedded_uia(&uia_ir).map_err(ctx("embedded uia should resolve"))?;
+        assert_eq!(resolved.role(), AgentRoleId::UserInterface);
+
+        let rejected = resolve_embedded_uia(&worker_ir);
+        assert!(
+            matches!(rejected, Err(RuntimeError::Registry { .. })),
+            "{rejected:?}"
         );
         Ok(())
     }
@@ -6366,6 +6803,8 @@ mod tests {
             reasoning_effort: None,
             approval_override: None,
             model_override: None,
+            embedded: None,
+            child_backend: None,
         }
     }
 
@@ -6754,6 +7193,8 @@ mod tests {
             reasoning_effort: None,
             approval_override: None,
             model_override: None,
+            embedded: None,
+            child_backend: None,
         };
 
         let builder = RuntimeAssembly::builder(spec).secret_resolver(Arc::new(FakeResolver));
@@ -6921,6 +7362,8 @@ mod tests {
             reasoning_effort: None,
             approval_override: None,
             model_override: None,
+            embedded: None,
+            child_backend: None,
         };
         let state_store: Arc<dyn StateStore> = Arc::new(harw_core::InMemoryStateStore::new());
         RuntimeAssembly::builder(spec)
@@ -7103,6 +7546,56 @@ mod tests {
         assert!(
             echo.take_sudo_prompts().is_none(),
             "Nicht-TUI-Einstiege haben keinen sudo-Kanal"
+        );
+        Ok(())
+    }
+
+    /// #22 Welle 3C: ein gesetztes `RuntimeSpec::child_backend` erreicht den
+    /// gebauten `ManagedAgentSpawner`. `ManagedAgentSpawner::child_backend()`
+    /// ist `pub(crate)` zu `harw-core` und von hier nicht lesbar, deshalb
+    /// prüft dieser Test über die Referenzzählung des `Arc`s: hält der
+    /// Spawner eine eigene Kopie, bleibt `strong_count` über den ursprünglich
+    /// gebauten Wert hinaus erhöht, solange `assembly` (und damit sein
+    /// Spawner) lebt.
+    #[test]
+    fn test_child_backend_reaches_the_built_spawner() -> TestResult {
+        struct FakeChildBackend;
+        impl harw_core::child_backend::ChildBackend for FakeChildBackend {
+            fn run<'a>(
+                &'a self,
+                _spec: harw_core::child_backend::ChildRunSpec,
+                _io: &'a dyn harw_core::child_backend::ChildIo,
+            ) -> harw_core::child_backend::ChildBackendFuture<'a> {
+                Box::pin(async {
+                    harw_core::child_backend::ChildRunOutcome {
+                        status: harw_core::child_backend::ChildRunStatus::Completed,
+                        text: None,
+                        usage: harw_core::ChildUsage::default(),
+                        continuation: None,
+                    }
+                })
+            }
+        }
+
+        let fixture = build_fixture()?;
+        let (events, _event_rx) = tokio::sync::mpsc::unbounded_channel::<SessionEvent>();
+        let backend: Arc<dyn harw_core::child_backend::ChildBackend> = Arc::new(FakeChildBackend);
+        let mut builder = fixture_builder(EntryKind::Tui, &fixture).session_events(events);
+        builder.spec.child_backend = Some(ChildBackendHandle(Arc::clone(&backend)));
+        let strong_before = Arc::strong_count(&backend);
+
+        let assembly = builder
+            .build()
+            .map_err(ctx("Tui mit ChildBackend montiert"))?;
+
+        assert!(
+            assembly.spawner().is_some(),
+            "EntryKind::Tui montiert einen Spawner (SpawnerPolicy::BuiltinRoles)"
+        );
+        assert!(
+            Arc::strong_count(&backend) > strong_before,
+            "der gebaute ManagedAgentSpawner muss eine eigene Arc-Referenz auf \
+             das ChildBackend halten"
         );
         Ok(())
     }

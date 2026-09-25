@@ -61,21 +61,48 @@ fmt: ## Format check without changing anything
 check: ## Fast type check of the whole workspace
 	$(CARGO) check --workspace --all-features
 
-build: ## Release-build harw and killer
+build: ## Release-build harw, killer and the agent runner
 	$(CARGO) build --release --bin harw --bin killer
+	$(CARGO) build --profile release-runner --bin harw-agent-runner
 
-install: build ## Install harw and killer into BINDIR (default ~/.local/bin)
+# HARW_HOME follows the same default the Rust side uses (harw-home::paths,
+# `HARW_HOME` env override, else `~/.harw`) — kept in sync by hand since Make
+# cannot call into that crate without invoking cargo. `?=` already leaves an
+# inherited `HARW_HOME` environment variable untouched.
+HARW_HOME ?= $(HOME)/.harw
+
+# Host target triple, read from `rustc -vV` (not `cargo`) at install time —
+# see `docs/adr/0001-agent-compiler.md`: this runs once per install,
+# never inside an agent's build, so it does not fall under the
+# subagents-never-build rule above.
+HARW_HOST_TARGET = $(shell rustc -vV | sed -n 's/^host: //p')
+
+# Workspace version, read straight from the root Cargo.toml's
+# `[workspace.package]` table (the same value `harw-agent-compiler`'s
+# `HARW_VERSION` embeds via `CARGO_PKG_VERSION`), so Make needs no cargo
+# subprocess to know it.
+HARW_VERSION = $(shell awk -F'"' '/^version = /{print $$2; exit}' Cargo.toml)
+
+install: build ## Install harw, killer and the agent runner into BINDIR (default ~/.local/bin)
 	install -Dm755 target/release/harw $(BINDIR)/harw
 	install -Dm755 target/release/killer $(BINDIR)/killer
-	@echo "Installed $(BINDIR)/harw and $(BINDIR)/killer"
+	install -Dm755 target/release-runner/harw-agent-runner $(BINDIR)/harw-agent-runner
+	install -Dm755 target/release-runner/harw-agent-runner \
+		"$(HARW_HOME)/bin/.runners/$(HARW_HOST_TARGET)/$(HARW_VERSION)/harw-agent-runner"
+	@echo "Installed $(BINDIR)/harw, $(BINDIR)/killer and $(BINDIR)/harw-agent-runner"
+	@echo "Runner copy: $(HARW_HOME)/bin/.runners/$(HARW_HOST_TARGET)/$(HARW_VERSION)/harw-agent-runner"
 	@case ":$$PATH:" in \
 		*":$(BINDIR):"*) ;; \
 		*) echo "Hint: $(BINDIR) is not on your PATH. Add e.g. 'export PATH=\"$(BINDIR):\$$PATH\"' to your shell profile." ;; \
 	esac
+	$(BINDIR)/harw agent install-record --source-dir $(CURDIR) --bindir $(BINDIR)
+	$(BINDIR)/harw agent auto-build-uia || true
 
-uninstall: ## Remove harw and killer from BINDIR (never touches ~/.harw)
-	rm -f $(BINDIR)/harw $(BINDIR)/killer
-	@echo "Removed $(BINDIR)/harw and $(BINDIR)/killer (~/.harw was left untouched)"
+uninstall: ## Remove harw, killer and the agent runner from BINDIR, plus the regenerable agent-build cache
+	rm -f $(BINDIR)/harw $(BINDIR)/killer $(BINDIR)/harw-agent-runner
+	rm -rf "$${HARW_HOME:-$$HOME/.harw}/cache/agent-builds"
+	rm -f "$${HARW_HOME:-$$HOME/.harw}/install.toml"
+	@echo "Removed $(BINDIR)/harw, killer, harw-agent-runner and the agent-build cache (the rest of ~/.harw was left untouched)"
 
 service: install ## Install and enable the user systemd services, incl. the gateway
 	$(BINDIR)/harw service install

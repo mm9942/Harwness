@@ -30,6 +30,9 @@
 
 use std::sync::OnceLock;
 
+use harw_agent_dsl::bind::ContextProgramLibrary;
+use harw_agent_dsl::diagnostics::SourceFile;
+use harw_agent_dsl::layers::DefinitionLayer;
 use harw_agent_dsl::parse::parse_toml;
 use harw_agent_dsl::raw::RawAgentDefinition;
 use include_dir::{Dir, DirEntry, include_dir};
@@ -135,6 +138,82 @@ pub fn builtin_definition_layers() -> &'static [RawAgentDefinition] {
         .as_slice()
 }
 
+/// Reserviertes Unterverzeichnis der Kontextprogramm-Bibliothek (Spiegel
+/// von `harw_registry_defaults::embedded_agents`).
+pub const CONTEXT_PROGRAMS_DIR: &str = "context-programs";
+
+/// Cache für [`builtin_source_files`].
+static BUILTIN_SOURCE_FILES: OnceLock<Vec<(SourceFile, Option<String>)>> = OnceLock::new();
+
+/// Die eingebauten Definitionen als Quelldateien für
+/// `harw_agent_dsl::lower_v2::lower_v2` (#22 Welle 1B), jeweils mit der
+/// deklarierten `id` (einmal je Prozess ermittelt).
+///
+/// # Description
+/// Der Pfad ist `builtin/<relativer Pfad>` — ein Etikett für Spannen in
+/// Diagnosen, kein Dateisystempfad. Alle Dateien liegen auf
+/// [`DefinitionLayer::BuiltIn`].
+#[must_use]
+pub fn builtin_source_files() -> &'static [(SourceFile, Option<String>)] {
+    BUILTIN_SOURCE_FILES
+        .get_or_init(|| {
+            builtin_agent_sources()
+                .into_iter()
+                .map(|(path, source)| {
+                    let file = SourceFile::new(
+                        DefinitionLayer::BuiltIn,
+                        format!("builtin/{path}"),
+                        source,
+                    );
+                    let id = file.declared_id();
+                    (file, id)
+                })
+                .collect()
+        })
+        .as_slice()
+}
+
+/// Die eingebauten Kontextprogramme als `(Name, TOML)`: jede `.toml`-Datei
+/// direkt unter `agents/context-programs/`, Name ist der Dateistamm, nach
+/// Namen sortiert (wie `harw_registry_defaults::embedded_agents::builtin_context_program_toml`).
+#[must_use]
+pub fn builtin_context_program_sources() -> Vec<(&'static str, &'static str)> {
+    let mut out = Vec::new();
+    if let Some(dir) = BUILTIN_AGENTS_DIR.get_dir(CONTEXT_PROGRAMS_DIR) {
+        for entry in dir.entries() {
+            let DirEntry::File(file) = entry else {
+                continue;
+            };
+            let path = file.path();
+            if path.extension().and_then(|ext| ext.to_str()) != Some("toml") {
+                continue;
+            }
+            let (Some(stem), Some(contents)) = (
+                path.file_stem().and_then(|stem| stem.to_str()),
+                file.contents_utf8(),
+            ) else {
+                continue;
+            };
+            out.push((stem, contents));
+        }
+    }
+    out.sort_by_key(|(name, _)| *name);
+    out
+}
+
+/// Die Kontextprogramm-Bibliothek der eingebauten Schicht (#22 Welle 1B):
+/// alle eingebauten Programme auf [`DefinitionLayer::BuiltIn`], mit der
+/// Wurzeldecke `harw_context::ceiling::ROOT_CONTEXT_SECTIONS`. Eigene
+/// Programme der Layer fügt die Discovery hinzu.
+///
+/// # Errors
+/// Die Meldung des DSL-Crates, wenn ein eingebautes Programm nicht parst
+/// (ein Defekt der eingebetteten Dateien).
+pub fn builtin_context_program_library() -> Result<ContextProgramLibrary, String> {
+    ContextProgramLibrary::from_builtin_sources(&builtin_context_program_sources())
+        .map_err(|error| error.to_string())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -152,5 +231,25 @@ mod tests {
         );
         assert!(ids.iter().any(|id| id == "harwness.agent.explorer@1"));
         assert!(!ids.iter().any(|id| id.starts_with("harwness.context.")));
+    }
+
+    #[test]
+    fn builtin_sources_and_context_programs_are_embedded() -> Result<(), String> {
+        let files = builtin_source_files();
+        assert!(
+            files
+                .iter()
+                .any(|(_, id)| id.as_deref() == Some("harwness.agent.worker-base@1"))
+        );
+        assert!(
+            files
+                .iter()
+                .all(|(file, _)| file.label().starts_with("builtin/"))
+        );
+        let programs = builtin_context_program_sources();
+        assert!(programs.iter().any(|(name, _)| *name == "explore"));
+        let library = builtin_context_program_library()?;
+        assert!(library.names().contains(&"explore"));
+        Ok(())
     }
 }

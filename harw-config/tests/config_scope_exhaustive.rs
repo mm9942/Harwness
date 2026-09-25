@@ -87,6 +87,8 @@ fn test_field_table_exhaustive_harness_config() {
         agents: _,
         // Runde 5, Teil N: `[shell]`, eigener Abschnittstest unten.
         shell: _,
+        // #22 Welle 2B: `[agent_compiler]`, eigener Abschnittstest unten.
+        agent_compiler: _,
         base_dir: _, // #[serde(skip)], kein TOML-Feld, keine FIELD_TABLE-Zeile
     } = HarnessConfig::default();
     // Kein `..` — ein neues Feld auf HarnessConfig, das hier nicht
@@ -732,6 +734,27 @@ fn test_field_table_exhaustive_shell_toml() {
     let harw_config::ShellToml { max_timeout_secs } = harw_config::ShellToml::default();
     let _ = max_timeout_secs;
     assert_path_in_field_table_exactly_once("shell.max_timeout_secs");
+}
+
+// ---------------------------------------------------------------------
+// [agent_compiler] (3 Felder) — #22 Welle 2B
+// ---------------------------------------------------------------------
+
+#[test]
+fn test_field_table_exhaustive_agent_compiler_toml() {
+    let harw_config::AgentCompilerToml {
+        cache_max_bytes,
+        keep_versions,
+        auto_build_uia,
+    } = harw_config::AgentCompilerToml::default();
+    let _ = (cache_max_bytes, keep_versions, auto_build_uia);
+    for path in [
+        "agent_compiler.cache_max_bytes",
+        "agent_compiler.keep_versions",
+        "agent_compiler.auto_build_uia",
+    ] {
+        assert_path_in_field_table_exactly_once(path);
+    }
 }
 
 // ---------------------------------------------------------------------

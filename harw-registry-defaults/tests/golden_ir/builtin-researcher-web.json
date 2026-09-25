@@ -1,0 +1,252 @@
+{
+  "schema": "harwness.agent-ir/v2",
+  "id": "harwness.agent.researcher-web@1",
+  "version": "1.0.0",
+  "name": "Web Documentation Researcher",
+  "description": "Holt offizielle Dokumentation, Release-Notes und Paket-Metadaten ueber die Host-Allowlist der Sandbox; liest keine Workspace-Daten.",
+  "role": "worker",
+  "specialization": "researcher-web",
+  "reasoning_effort": null,
+  "authority": {
+    "capabilities": []
+  },
+  "instructions": {
+    "text": "",
+    "source": null,
+    "blake3": "af1349b9f5f9a1a6a0404dea36dcc9499bcb25c9adc112b7cc9a93cae41f3262"
+  },
+  "tools": {
+    "admitted": [
+      "web.fetch",
+      "web.docs_rs",
+      "web.crates_io",
+      "web.search",
+      "parent.message",
+      "skills.search",
+      "skills.load"
+    ],
+    "forbidden": [
+      "fs.read",
+      "fs.write",
+      "fs.edit",
+      "fs.list",
+      "fs.search",
+      "fs.glob",
+      "fs.grep",
+      "shell.exec",
+      "deps.graph",
+      "deps.locked",
+      "deps.source_read",
+      "deps.source_search",
+      "deps.source_list",
+      "lens.ask",
+      "browser.open",
+      "browser.observe",
+      "browser.find",
+      "browser.act",
+      "browser.wait",
+      "browser.events",
+      "browser.close"
+    ]
+  },
+  "spawn": {
+    "max_depth": 1,
+    "child_orchestrators": [],
+    "delegation_targets": null,
+    "workspace_hint": null,
+    "budget": {
+      "max_tokens": 60000,
+      "max_tool_calls": 40,
+      "max_wall_secs": 180,
+      "effort_cap": null
+    }
+  },
+  "job": {
+    "goal_kind": null
+  },
+  "lifecycle": {
+    "allow_pause": false,
+    "allow_rerun": true,
+    "max_attempts": 4
+  },
+  "context": {
+    "program": "research-web",
+    "program_id": "harwness.context.research-web@1",
+    "policy": "harwness.context.research-web@1",
+    "sections": [
+      {
+        "name": "task.objective",
+        "strength": "must-include",
+        "detail": "full",
+        "trust": "instruction"
+      },
+      {
+        "name": "history.tail",
+        "strength": "must-include",
+        "detail": "references",
+        "trust": "evidence"
+      },
+      {
+        "name": "task.read_scope",
+        "strength": "must-include",
+        "detail": "full",
+        "trust": "data"
+      },
+      {
+        "name": "web.fetch_allowlist",
+        "strength": "must-include",
+        "detail": "full",
+        "trust": "instruction"
+      }
+    ],
+    "must_include": [
+      "task.objective",
+      "history.tail",
+      "task.read_scope",
+      "new.trigger_return"
+    ],
+    "exclude": [
+      "credential.*",
+      "secret.*",
+      "sibling_transcripts",
+      "full_parent_transcript",
+      "deps.lockfile_index"
+    ],
+    "deferred": [
+      "web.fetch_allowlist"
+    ]
+  },
+  "return": {
+    "contract": "harwness.return.research-finding@1",
+    "validators": []
+  },
+  "models": null,
+  "limits": null,
+  "work": null,
+  "research": {
+    "sources": [
+      "official-docs",
+      "official-repositories",
+      "release-notes"
+    ],
+    "freshness": "required",
+    "primary_sources_required": true,
+    "output": "verified-research-records",
+    "ecosystems": [],
+    "may_write_code": null,
+    "tradecraft": []
+  },
+  "verification": null,
+  "skills": {
+    "entries": []
+  },
+  "binary": {
+    "name": "researcher-web",
+    "interfaces": [
+      "cli"
+    ],
+    "default_interface": "cli"
+  },
+  "permissions": {
+    "tools": [
+      "parent.message",
+      "skills.load",
+      "skills.search",
+      "web.crates_io",
+      "web.docs_rs",
+      "web.fetch",
+      "web.search"
+    ],
+    "forbidden_tools": [
+      "browser.act",
+      "browser.close",
+      "browser.events",
+      "browser.find",
+      "browser.observe",
+      "browser.open",
+      "browser.wait",
+      "deps.graph",
+      "deps.locked",
+      "deps.source_list",
+      "deps.source_read",
+      "deps.source_search",
+      "fs.edit",
+      "fs.glob",
+      "fs.grep",
+      "fs.list",
+      "fs.read",
+      "fs.search",
+      "fs.write",
+      "lens.ask",
+      "shell.exec"
+    ],
+    "capabilities": [],
+    "filesystem": {
+      "read": false,
+      "write": false,
+      "write_paths": [],
+      "other_write_tools": []
+    },
+    "network": {
+      "mode": "allowlist",
+      "tools": [
+        "web.crates_io",
+        "web.docs_rs",
+        "web.fetch",
+        "web.search"
+      ],
+      "hosts": []
+    },
+    "shell": false,
+    "host": false,
+    "spawn": {
+      "max_depth": 1,
+      "child_orchestrators": [],
+      "delegation_targets": []
+    },
+    "budget": {
+      "max_tokens": 60000,
+      "max_tool_calls": 40,
+      "max_wall_secs": 180,
+      "effort_cap": null
+    },
+    "required_env": []
+  },
+  "trace": {
+    "steps": [
+      {
+        "source": "harwness.agent.worker-base@1",
+        "kind": "patch",
+        "applied_at": "1970-01-01T00:00:00Z"
+      },
+      {
+        "source": "harwness.agent.worker-base@1",
+        "kind": "base",
+        "applied_at": "1970-01-01T00:00:00Z"
+      },
+      {
+        "source": "harwness.agent.researcher-web@1",
+        "kind": "patch",
+        "applied_at": "1970-01-01T00:00:00Z"
+      }
+    ],
+    "diagnostics": [
+      {
+        "code": "HARW-CTX-003",
+        "severity": "note",
+        "message": "program `research-web` requires sections outside the context ceiling; deferred: web.fetch_allowlist",
+        "help": "these sections stay named by the program but are not required at child start",
+        "span": {
+          "file": "builtin/researcher-web.toml",
+          "line": 92,
+          "column": 11
+        },
+        "path": "context.program"
+      }
+    ]
+  },
+  "snapshot": {
+    "domain": "harwness.agent-ir.snapshot/v7",
+    "digest": "b02527e8b51359589252035a07f25bdc15420c8eac68faed3b9ea3d8efbafe89"
+  }
+}

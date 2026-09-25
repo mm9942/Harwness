@@ -1,0 +1,194 @@
+{
+  "schema": "harwness.agent-ir/v2",
+  "id": "harwness.agent.incident-triager@1",
+  "version": "1.0.0",
+  "name": "Incident Triager",
+  "description": "Classifies incidents, preserves evidence, and proposes safe containment steps.",
+  "role": "worker",
+  "specialization": "incident-triager",
+  "reasoning_effort": null,
+  "authority": {
+    "capabilities": []
+  },
+  "instructions": {
+    "text": "# incident-triager\n\nClassifies incidents, preserves evidence, and proposes safe containment steps.\n\nAccept only the declared task scope. State assumptions, preserve relevant evidence, and return concise findings, changed paths (if any), verification performed, residual risks, and blockers. Never expand privileges, alter unrelated files, or represent a hypothesis as a fact. Stop and escalate when approval, a broader scope, or a security decision is required.\n\n## Was ich NICHT tue\n\nKeine Agenten spawnen, keine Rechte ausweiten, keine fremden Dateien ändern. Keine Eindämmung selbst ausführen; keine Beweise verändern oder löschen; keine Schuldzuweisung ohne Beleg.\n\n## Umfang pro Lauf\n\nNur der erklärte Auftrag; Budget und Laufzeitgrenze (`timeout_seconds = 240`) sind hart. Stoppe und gib zurück, sobald Klassifikation und gesicherte Beweise vorliegen, das Budget knapp wird oder Freigabe, breiterer Scope bzw. eine Sicherheitsentscheidung nötig ist.\n\n## Übergabe\n\nAn den Auftraggeber nach Return-Contract: Klassifikation, Zeitlinie, gesicherte Beweise, vorgeschlagene sichere Eindämmungsschritte; dazu Annahmen, durchgeführte Prüfung, Restrisiken, Blocker. Keine Rohausgaben, keine Wiederholung des Auftrags.\n",
+    "source": "system.md",
+    "blake3": "36028c30e161e12df8d377f81d8be7f51bf2e8885c1f58b192b343f365e94c4b"
+  },
+  "tools": {
+    "admitted": [
+      "fs.read",
+      "fs.list",
+      "fs.search",
+      "fs.glob",
+      "fs.grep",
+      "doc.read_pdf",
+      "explore.tree",
+      "explore.projects",
+      "explore.relations",
+      "explore.find",
+      "workbench.show",
+      "diary.read",
+      "palace.search",
+      "palace.recall",
+      "parent.message",
+      "skills.search",
+      "skills.load"
+    ],
+    "forbidden": [
+      "fs.write",
+      "fs.edit",
+      "shell.exec",
+      "web.fetch",
+      "web.search",
+      "web.docs_rs",
+      "web.crates_io"
+    ]
+  },
+  "spawn": {
+    "max_depth": 0,
+    "child_orchestrators": [],
+    "delegation_targets": null,
+    "workspace_hint": null,
+    "budget": {
+      "max_tokens": 100000,
+      "max_tool_calls": 50,
+      "max_wall_secs": 300,
+      "effort_cap": null
+    }
+  },
+  "job": {
+    "goal_kind": null
+  },
+  "lifecycle": {
+    "allow_pause": false,
+    "allow_rerun": true,
+    "max_attempts": 4
+  },
+  "context": {
+    "program": null,
+    "program_id": null,
+    "policy": null,
+    "sections": [],
+    "must_include": [
+      "task.objective",
+      "task.read_scope",
+      "new.trigger_return"
+    ],
+    "exclude": [
+      "full_parent_transcript",
+      "sibling_transcripts"
+    ],
+    "deferred": []
+  },
+  "return": {
+    "contract": "harwness.return.execution-summary@1",
+    "validators": []
+  },
+  "models": null,
+  "limits": null,
+  "work": {
+    "mode": "triage",
+    "may_write_code": false,
+    "may_research_web": false,
+    "may_change_plan": null,
+    "aggregates_child_returns": null
+  },
+  "research": null,
+  "verification": null,
+  "skills": {
+    "entries": [
+      {
+        "name": "incident-response",
+        "hash": null
+      }
+    ]
+  },
+  "binary": {
+    "name": "incident-triager",
+    "interfaces": [
+      "cli"
+    ],
+    "default_interface": "cli"
+  },
+  "permissions": {
+    "tools": [
+      "diary.read",
+      "doc.read_pdf",
+      "explore.find",
+      "explore.projects",
+      "explore.relations",
+      "explore.tree",
+      "fs.glob",
+      "fs.grep",
+      "fs.list",
+      "fs.read",
+      "fs.search",
+      "palace.recall",
+      "palace.search",
+      "parent.message",
+      "skills.load",
+      "skills.search",
+      "workbench.show"
+    ],
+    "forbidden_tools": [
+      "fs.edit",
+      "fs.write",
+      "shell.exec",
+      "web.crates_io",
+      "web.docs_rs",
+      "web.fetch",
+      "web.search"
+    ],
+    "capabilities": [],
+    "filesystem": {
+      "read": true,
+      "write": false,
+      "write_paths": [],
+      "other_write_tools": []
+    },
+    "network": {
+      "mode": "off",
+      "tools": [],
+      "hosts": []
+    },
+    "shell": false,
+    "host": false,
+    "spawn": {
+      "max_depth": 0,
+      "child_orchestrators": [],
+      "delegation_targets": []
+    },
+    "budget": {
+      "max_tokens": 100000,
+      "max_tool_calls": 50,
+      "max_wall_secs": 300,
+      "effort_cap": null
+    },
+    "required_env": []
+  },
+  "trace": {
+    "steps": [
+      {
+        "source": "harwness.agent.worker-base@1",
+        "kind": "patch",
+        "applied_at": "1970-01-01T00:00:00Z"
+      },
+      {
+        "source": "harwness.agent.worker-base@1",
+        "kind": "base",
+        "applied_at": "1970-01-01T00:00:00Z"
+      },
+      {
+        "source": "harwness.agent.incident-triager@1",
+        "kind": "patch",
+        "applied_at": "1970-01-01T00:00:00Z"
+      }
+    ],
+    "diagnostics": []
+  },
+  "snapshot": {
+    "domain": "harwness.agent-ir.snapshot/v7",
+    "digest": "1200bd07338a10faf3820b28a55eead343b98fc9a88b79c4abac45551822abf6"
+  }
+}

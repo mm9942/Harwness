@@ -1,0 +1,62 @@
+# hello-analyst: the smallest useful example for `harw agent build`.
+#
+# A read-only worker on `worker-base@1` (docs/design/agent-definition-dsl.md
+# §8, harw-registry-defaults/agents/worker-base.toml) that only ever reads
+# files and reports what it found — no writes, no shell, no network. It
+# exists to show a complete, buildable definition end to end; see
+# docs/guides/agent-compiler.md for what each section does and
+# ./README.md for the exact commands to run against it.
+
+schema = "harwness.agent/v1"
+id = "harwness.example.hello-analyst@1"
+version = "1.0.0"
+extends = { id = "harwness.agent.worker-base@1" }
+role = "worker"
+specialization = "hello-analyst"
+
+name = "Hello Analyst"
+description = "Reads a folder and summarizes what it finds. Read-only; the example for the agent compiler guide."
+instructions_file = "system.md"
+
+[work]
+mode = "review"
+may_write_code = false
+may_research_web = false
+
+[tools]
+admitted = [
+  "fs.read",
+  "fs.list",
+  "fs.search",
+  "fs.glob",
+  "fs.grep",
+]
+forbidden = [
+  "fs.write",
+  "fs.edit",
+  "shell.exec",
+  "web.fetch",
+  "web.search",
+]
+
+[spawn]
+max_depth = 0
+
+[spawn.budget]
+max_tokens = 20000
+max_tool_calls = 20
+max_wall_secs = 180
+
+[return]
+contract = "harwness.return.execution-summary@1"
+
+[models]
+provider = "anthropic"
+model = "claude-sonnet-5"
+effort = "medium"
+required_env = ["ANTHROPIC_API_KEY"]
+
+[binary]
+name = "hello-analyst"
+interfaces = ["cli", "mcp"]
+default_interface = "cli"

@@ -1,0 +1,44 @@
+//! Test-Fehlertyp dieses Crates: ersetzt `panic!`/`unwrap`/`expect` in Tests
+//! (Rust Coding Bible R087/R165/R182). Tests geben [`TestResult`] zurück und
+//! melden Fehlschläge als `Err` statt zu paniken.
+
+use std::fmt;
+
+/// Fehler eines Tests; jeder Fehlschlag wird als `Err` zurückgegeben.
+pub(crate) enum TestError {
+    /// Ein Fremdfehler mit Kontext (ersetzt `expect("…")`).
+    Context {
+        /// Was gerade versucht wurde.
+        context: &'static str,
+        /// Gerenderter Quellfehler.
+        source: String,
+    },
+}
+
+/// Ergebnis einer Testfunktion bzw. eines Test-Helfers.
+pub(crate) type TestResult<T = ()> = Result<T, TestError>;
+
+impl fmt::Display for TestError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Context { context, source } => write!(f, "{context}: {source}"),
+        }
+    }
+}
+
+// Debug delegiert an Display (Bible R081), damit fehlgeschlagene Tests lesbar bleiben.
+impl fmt::Debug for TestError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt::Display::fmt(self, f)
+    }
+}
+
+impl std::error::Error for TestError {}
+
+/// Liefert einen `map_err`-Adapter, der einen Fremdfehler mit Kontext versieht.
+pub(crate) fn ctx<E: fmt::Display>(context: &'static str) -> impl FnOnce(E) -> TestError {
+    move |error| TestError::Context {
+        context,
+        source: error.to_string(),
+    }
+}

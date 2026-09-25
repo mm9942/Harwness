@@ -10,10 +10,19 @@ HARW_INSTALL_DIR=/opt/bin scripts/install.sh   # custom target
 ```
 
 The installer checks prerequisites (cargo, optional bwrap), builds
-`harw` and `killer` in release mode (through `make install` when `make` is
-available), installs both binaries (mode 0755), and wires
-`~/.local/bin` into `~/.bashrc`/`~/.zshrc` idempotently. It never touches an
-existing `~/.harw` — first `harw` run performs onboarding.
+`harw`, `killer` and `harw-agent-runner` in release mode (through `make
+install` when `make` is available; the runner builds under the
+`release-runner` profile — fat LTO, one codegen unit, stripped — see the
+root `Cargo.toml`), installs all three binaries (mode 0755) plus a runner
+copy under `~/.harw/bin/.runners/<target>/<version>/` for `harw agent
+build`, and wires `~/.local/bin` into `~/.bashrc`/`~/.zshrc` idempotently.
+It never touches an existing `~/.harw` beyond that — first `harw` run
+performs onboarding.
+
+`scripts/install.sh --binary` installs the same three binaries from the
+release archive and records their installation directory. It requires no
+Rust toolchain. An archive missing the agent runner is rejected before an
+existing installation is replaced.
 
 ## Homebrew
 

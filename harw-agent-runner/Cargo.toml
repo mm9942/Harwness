@@ -1,0 +1,166 @@
+[package]
+publish.workspace = true
+name = "harw-agent-runner"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "Standalone runner binary a compiled agent artifact is embedded into (R10 wave 3)."
+
+# The runner is both a library (`harw-agent-compiler` links it as a base and
+# probes a built one with `--capabilities`) and the `harw-agent-runner`
+# binary itself, which `append_to_executable` (`harw-agent-artifact`) turns
+# into a compiled agent by appending its artifact and footer.
+[lib]
+name = "harw_agent_runner"
+path = "src/lib.rs"
+
+[[bin]]
+name = "harw-agent-runner"
+path = "src/main.rs"
+
+[features]
+# Every built-in interface plus every provider feature is on by default: a
+# generic runner binary (the one `harw-agent-compiler` probes and ships
+# before a native build narrows it) must serve any compiled agent.
+default = [
+    "cli",
+    "repl",
+    "mcp",
+    "http",
+    "tui",
+    "authoring",
+    "core",
+    "knowledge",
+    "matrix",
+    "tool-browser",
+    "tool-deps",
+    "tool-doc",
+    "tool-explorer",
+    "tool-fs",
+    "tool-job",
+    "tool-latex",
+    "tool-lens",
+    "tool-plan",
+    "tool-process",
+    "tool-shell",
+    "tool-sudo",
+    "tool-web",
+]
+
+# Built-in interfaces (`iface::*`, `RunnerArgs::interface`).
+cli = []
+repl = []
+# `iface::mcp`: needs `futures-core` for its event stream (`tokio` is
+# already a base dependency of this crate, see below) plus the same small
+# hyper 1/hyper-util/http-body-util/bytes stack as `http` for its own
+# Streamable HTTP transport (`--listen`; see that module's doc for why it is
+# its own loopback listener, not a reuse of `http`'s or `harw-mcp-server`'s).
+mcp = [
+    "dep:futures-core",
+    "dep:hyper",
+    "dep:hyper-util",
+    "dep:http-body-util",
+    "dep:bytes",
+]
+# `iface::http`: its own small hyper-based listener (same stack/versions as
+# `harw-web`/`harw-mcp-server`; see that module's doc for why it does not
+# reuse either directly).
+http = [
+    "dep:hyper",
+    "dep:hyper-util",
+    "dep:http-body-util",
+    "dep:bytes",
+    "dep:tokio-stream",
+    "dep:futures-core",
+]
+# `iface::tui`: `harw-tui::fixed_agent` runs the embedded agent's mini TUI.
+tui = ["dep:harw-tui"]
+
+# One empty feature per distinct
+# `harw_registry_defaults::capability_catalog::ToolProvider::feature` (the
+# `PROVIDER_FEATURES` table). `--capabilities` reports the enabled ones so
+# the compiler can check a runner covers an agent's tool surface; wiring an
+# actual provider crate behind each is out of scope here (wave 4+).
+authoring = []
+core = []
+knowledge = []
+matrix = []
+tool-browser = []
+tool-deps = []
+tool-doc = []
+tool-explorer = []
+tool-fs = []
+tool-job = []
+tool-latex = []
+tool-lens = []
+tool-plan = []
+tool-process = []
+tool-shell = []
+tool-sudo = []
+tool-web = []
+
+[dependencies]
+# The artifact container: `EmbeddedArtifact::from_current_exe`, `Bundle`.
+harw-agent-artifact = { path = "../harw-agent-artifact" }
+# `AgentIr`, `Permissions` — typed access to the embedded manifest.
+harw-agent-dsl = { path = "../harw-agent-dsl" }
+# `EmbeddedAgent`, `EffectiveRights`, `RightsFlags` (wave 3 contract).
+harw-runtime = { path = "../harw-runtime", default-features = false }
+# `Harwness::builder().embedded(..)` — the embedding API the interfaces run
+# sessions through.
+harwness-sdk = { path = "../harwness-sdk", default-features = false }
+# `capability_catalog::PROVIDER_FEATURES` — the feature-name contract this
+# crate's Cargo features mirror.
+harw-registry-defaults = { path = "../harw-registry-defaults" }
+# `iface::tui`'s `FixedAgentOptions`/`fixed_agent_title` and its
+# `IngressSurface`/`Principal` argument types (optional: only `tui`).
+harw-tui = { path = "../harw-tui", optional = true }
+harw-home = { path = "../harw-home" }
+harw-types = { path = "../harw-types" }
+tracing = { workspace = true }
+# Kein `[workspace.dependencies]`-Eintrag für tokio; Version = Cargo.lock
+# (wie `harw-runtime`/`harwness-sdk`). Deckt die Interfaces (cli/repl/mcp/
+# http/tui) mit ab, damit deren Agenten nicht je eine eigene Fassung ziehen.
+# `signal` added in wave 3B for `iface::repl`'s Ctrl+C → `CancelHandle`
+# wiring (`tokio::signal::ctrl_c`); `io-util` for `crate::child`'s
+# `AsyncBufReadExt`/`AsyncWriteExt` over its child process's stdio pipes;
+# `io-std` for `tokio::io::{stdin, stdout}` those same pipes are built on.
+tokio = { version = "1.53.0", features = ["rt", "rt-multi-thread", "macros", "sync", "time", "net", "signal", "io-util", "io-std", "process"] }
+serde = { workspace = true }
+# `job_child_backend`: `ChildBackend` trait and the child process group.
+harw-core = { path = "../harw-core" }
+# `job_child_backend`/`context`: `JobManager`, `JobManagerConfig`,
+# `NoopNotifier` — runs each compiled agent's child as a real job (#22 wave
+# 3C).
+harw-tool-job = { path = "../harw-tool-job" }
+rustix = { workspace = true, features = ["process"] }
+serde_json = { workspace = true }
+# `iface::mcp`'s event stream (optional: only pulled in by the `mcp`
+# feature); also a base dep of `iface::http`'s SSE stream via `http`'s own
+# `dep:futures-core`-equivalent below (kept as one optional dep either way
+# pulls in only once).
+futures-core = { version = "0.3.32", optional = true }
+# `iface::http`'s hyper-based listener (optional: only `http`). Same
+# versions as `harw-web`/`harw-mcp-server`.
+hyper = { version = "1", features = ["server", "http1"], optional = true }
+hyper-util = { version = "0.1", features = ["server", "http1", "tokio"], optional = true }
+http-body-util = { version = "0.1", features = ["channel"], optional = true }
+bytes = { version = "1", optional = true }
+tokio-stream = { version = "0.1.18", features = ["sync"], optional = true }
+
+# The end-to-end tests drive the CLI, REPL, MCP and HTTP interfaces of the
+# real runner binary, so they only build when all of them are compiled in.
+[[test]]
+name = "e2e_compiled_agent"
+required-features = ["cli", "repl", "mcp", "http"]
+
+[dev-dependencies]
+# `RunnerCapabilities::parse` — the fixture our `--capabilities` JSON must
+# satisfy exactly. No cycle: `harw-agent-compiler` does not depend on us.
+harw-agent-compiler = { path = "../harw-agent-compiler" }
+tempfile = { workspace = true }
+
+[lints]
+workspace = true

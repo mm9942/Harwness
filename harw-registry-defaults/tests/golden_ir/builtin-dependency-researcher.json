@@ -1,0 +1,224 @@
+{
+  "schema": "harwness.agent-ir/v2",
+  "id": "harwness.agent.dependency-researcher@1",
+  "version": "1.0.0",
+  "name": "Dependency Researcher",
+  "description": "Oekosystem-neutrale Dependency-Recherche (npm/pnpm/yarn, PyPI/uv/poetry, Go-Module, Maven/Gradle, Cargo): belegt je Paket Version, Lizenz, Kompatibilitaet und Verhalten aus Manifesten, Lockfiles und den offiziellen Paket-Registries; liefert ein ResearchFinding mit package/ecosystem je Eintrag und Belegen der Art package_registry_source.",
+  "role": "worker",
+  "specialization": "dependency-researcher",
+  "reasoning_effort": null,
+  "authority": {
+    "capabilities": []
+  },
+  "instructions": {
+    "text": "",
+    "source": null,
+    "blake3": "af1349b9f5f9a1a6a0404dea36dcc9499bcb25c9adc112b7cc9a93cae41f3262"
+  },
+  "tools": {
+    "admitted": [
+      "fs.read",
+      "fs.list",
+      "fs.search",
+      "fs.glob",
+      "fs.grep",
+      "doc.read_pdf",
+      "explore.tree",
+      "explore.projects",
+      "explore.relations",
+      "explore.find",
+      "web.fetch",
+      "web.search",
+      "workbench.show",
+      "diary.read",
+      "palace.search",
+      "palace.recall",
+      "parent.message",
+      "skills.search",
+      "skills.load"
+    ],
+    "forbidden": [
+      "fs.write",
+      "fs.edit",
+      "shell.exec",
+      "deps.graph",
+      "deps.locked",
+      "deps.source_read",
+      "deps.source_search",
+      "deps.source_list",
+      "web.docs_rs",
+      "web.crates_io",
+      "lens.ask"
+    ]
+  },
+  "spawn": {
+    "max_depth": 1,
+    "child_orchestrators": [],
+    "delegation_targets": null,
+    "workspace_hint": null,
+    "budget": {
+      "max_tokens": 60000,
+      "max_tool_calls": 40,
+      "max_wall_secs": 180,
+      "effort_cap": null
+    }
+  },
+  "job": {
+    "goal_kind": null
+  },
+  "lifecycle": {
+    "allow_pause": false,
+    "allow_rerun": true,
+    "max_attempts": 4
+  },
+  "context": {
+    "program": null,
+    "program_id": null,
+    "policy": null,
+    "sections": [],
+    "must_include": [
+      "task.objective",
+      "task.read_scope",
+      "new.trigger_return"
+    ],
+    "exclude": [
+      "full_parent_transcript",
+      "sibling_transcripts"
+    ],
+    "deferred": []
+  },
+  "return": {
+    "contract": "harwness.return.research-finding@1",
+    "validators": []
+  },
+  "models": null,
+  "limits": null,
+  "work": {
+    "mode": "read-only-research",
+    "may_write_code": false,
+    "may_research_web": true,
+    "may_change_plan": null,
+    "aggregates_child_returns": null
+  },
+  "research": {
+    "sources": [
+      "manifests",
+      "lockfiles",
+      "package-registries",
+      "official-docs",
+      "release-notes"
+    ],
+    "freshness": null,
+    "primary_sources_required": true,
+    "output": "structured-evidence",
+    "ecosystems": [
+      "npm",
+      "pypi",
+      "go",
+      "maven",
+      "cargo"
+    ],
+    "may_write_code": false,
+    "tradecraft": []
+  },
+  "verification": null,
+  "skills": {
+    "entries": []
+  },
+  "binary": {
+    "name": "dependency-researcher",
+    "interfaces": [
+      "cli"
+    ],
+    "default_interface": "cli"
+  },
+  "permissions": {
+    "tools": [
+      "diary.read",
+      "doc.read_pdf",
+      "explore.find",
+      "explore.projects",
+      "explore.relations",
+      "explore.tree",
+      "fs.glob",
+      "fs.grep",
+      "fs.list",
+      "fs.read",
+      "fs.search",
+      "palace.recall",
+      "palace.search",
+      "parent.message",
+      "skills.load",
+      "skills.search",
+      "web.fetch",
+      "web.search",
+      "workbench.show"
+    ],
+    "forbidden_tools": [
+      "deps.graph",
+      "deps.locked",
+      "deps.source_list",
+      "deps.source_read",
+      "deps.source_search",
+      "fs.edit",
+      "fs.write",
+      "lens.ask",
+      "shell.exec",
+      "web.crates_io",
+      "web.docs_rs"
+    ],
+    "capabilities": [],
+    "filesystem": {
+      "read": true,
+      "write": false,
+      "write_paths": [],
+      "other_write_tools": []
+    },
+    "network": {
+      "mode": "allowlist",
+      "tools": [
+        "web.fetch",
+        "web.search"
+      ],
+      "hosts": []
+    },
+    "shell": false,
+    "host": false,
+    "spawn": {
+      "max_depth": 1,
+      "child_orchestrators": [],
+      "delegation_targets": []
+    },
+    "budget": {
+      "max_tokens": 60000,
+      "max_tool_calls": 40,
+      "max_wall_secs": 180,
+      "effort_cap": null
+    },
+    "required_env": []
+  },
+  "trace": {
+    "steps": [
+      {
+        "source": "harwness.agent.worker-base@1",
+        "kind": "patch",
+        "applied_at": "1970-01-01T00:00:00Z"
+      },
+      {
+        "source": "harwness.agent.worker-base@1",
+        "kind": "base",
+        "applied_at": "1970-01-01T00:00:00Z"
+      },
+      {
+        "source": "harwness.agent.dependency-researcher@1",
+        "kind": "patch",
+        "applied_at": "1970-01-01T00:00:00Z"
+      }
+    ],
+    "diagnostics": []
+  },
+  "snapshot": {
+    "domain": "harwness.agent-ir.snapshot/v7",
+    "digest": "c0e30e8cdd31d32183ba1a4cd21363db2600e00d393b5e8d36f7ff7db9d029f5"
+  }
+}

@@ -1,0 +1,277 @@
+{
+  "schema": "harwness.agent-ir/v2",
+  "id": "harwness.agent.wargaming-orchestrator@1",
+  "version": "1.0.0",
+  "name": "Wargaming Orchestrator",
+  "description": "Leitet ein Szenario-Planspiel: baut mehrere Welten, verteilt Rollen an scenario-player, spielt Züge mit Schocks, vergleicht die Welten und berichtet Überraschungen und Lehren statt eines Siegers.",
+  "role": "child-orchestrator",
+  "specialization": "wargaming-orchestrator",
+  "reasoning_effort": null,
+  "authority": {
+    "capabilities": []
+  },
+  "instructions": {
+    "text": "# wargaming-orchestrator\n\nDu leitest ein Szenario-Planspiel. Du baust Welten, verteilst Rollen, spielst Züge, streust Schocks ein, vergleichst die Welten und berichtest **Überraschungen und Lehren, keinen Sieger**.\n\nDer Skill `scenario-wargaming` ist fest geladen. Lade `analysis-workflow` für das Auftragsformat und bei Bedarf `feedback-loops-and-thresholds` oder `premortem-and-red-team` über `skills.load`.\n\n## Deine Ziele\n\n`scenario-player` (je Rolle und Welt einer), `systems-modeller` (Dynamik der Welten), `evidence-critic` (prüft die Ausgangsannahmen und Spielbücher), `synthesis-writer` (Auswertungsbericht). Nur diese.\n\n## Ablauf\n\n0. **Lernziel klären.** Welche Frage soll das Spiel beantworten? Welche Strategie wird getestet? Lesebereich, Ausgabepfad. Ohne Lernziel kein Spiel; frag über `parent.message`.\n1. **Welten und Spielbücher.** Zwei bis vier Welten entlang der zwei unsichersten, folgenreichsten Treiber. Optional ein `systems-modeller` für die tragenden Rückkopplungen. Spielbücher je Partei; Gegenspieler bekommen dieselbe Sorgfalt wie das eigene Team. Optional `evidence-critic` auf die Ausgangsannahmen.\n2. **Rollen zuteilen.** Je Welt: eigenes Team, Gegenspieler, eine Gegenspieler-Zelle, Umfeld. Jeder `scenario-player` bekommt genau eine Rolle in genau einer Welt und nur das Wissen dieser Rolle.\n3. **Züge spielen** (meist drei). Pro Zug eine `delegate_wave` über alle Rollen einer Welt (oder aller Welten, wenn das Budget reicht). Danach wertest **du** das Zusammenspiel aus und gibst jeder Rolle nur die Rückmeldung, die sie realistisch sähe (`agent.message` bei laufenden, neuer Auftrag mit `continue_from` bei abgeschlossenen Kindern). In mindestens einem Zug je Welt ein Schock.\n4. **Überraschungen einsammeln** nach jedem Zug: erwartete vs. tatsächliche Reaktionen aus den Rückgaben.\n5. **Welten vergleichen.** Robust (alle Welten) vs. weltabhängig; welche Züge der getesteten Strategie überall tragen.\n6. **Bericht.** `synthesis-writer` mit Lernziel, Überraschungskandidaten, Vergleich und Ausgabepfad; ohne Pfad Rückgabe als Text.\n\nPlan-Modus: Alles bis einschließlich Weltvergleich ist lesend und läuft; den Bericht lieferst du dann als Text zurück statt über `synthesis-writer`.\n\n## Budget\n\nWelten × Rollen × Züge wächst schnell. Beginne mit zwei Welten und vier Rollen; erweitere nur, wenn das Lernziel es verlangt. Halte Spielbücher und Rückgabeformate kurz.\n\n## Rückgabe\n\n```markdown\n**Lernziel:** …\n**Welten:** … · **Rollen:** … · **Züge:** <n>\n**Überraschungskandidaten (Top 5):** <Überraschung – Welt – Auslöser – Relevanz>\n**Robust vs. weltabhängig:** …\n**Lehren für die getestete Strategie:** …\n**Frühwarnzeichen je Welt:** …\n**Grenzen des Spiels:** <fehlende Parteien, nicht gespielte Welten>\n**Bericht:** <Ausgabepfad> | inline\n```\n\n## Was ich NICHT tue\n\n- Ich küre keinen Sieger und ranke keine Parteien.\n- Ich lege Reaktionen nicht vorab fest; ich werte aus, was die Rollen tun.\n- Ich gebe Spielergebnisse nicht als Prognose aus.\n- Ich schreibe keine Dateien und starte keine Agenten außerhalb meiner Ziele.\n",
+    "source": "system.md",
+    "blake3": "27a8261675fb27fc471de88d4e72a2c5da8d1bc592fade47ce00b0b507fda3c1"
+  },
+  "tools": {
+    "admitted": [
+      "fs.read",
+      "fs.list",
+      "fs.search",
+      "fs.glob",
+      "fs.grep",
+      "doc.read_pdf",
+      "deps.graph",
+      "deps.locked",
+      "deps.source_read",
+      "deps.source_search",
+      "deps.source_list",
+      "lens.ask",
+      "explore.tree",
+      "explore.projects",
+      "explore.relations",
+      "explore.find",
+      "delegate_wave",
+      "agent.result",
+      "workbench.show",
+      "diary.read",
+      "palace.search",
+      "palace.recall",
+      "agent.message",
+      "parent.message",
+      "skills.search",
+      "skills.load",
+      "job.status",
+      "job.logs",
+      "job.stop",
+      "job.list",
+      "job.wait"
+    ],
+    "forbidden": [
+      "fs.write",
+      "fs.edit",
+      "shell.exec",
+      "web.fetch",
+      "web.search",
+      "web.docs_rs",
+      "web.crates_io"
+    ]
+  },
+  "spawn": {
+    "max_depth": 1,
+    "child_orchestrators": [],
+    "delegation_targets": [
+      "scenario-player",
+      "systems-modeller",
+      "evidence-critic",
+      "synthesis-writer"
+    ],
+    "workspace_hint": null,
+    "budget": {
+      "max_tokens": 1000000,
+      "max_tool_calls": 400,
+      "max_wall_secs": 7200,
+      "effort_cap": null
+    }
+  },
+  "job": {
+    "goal_kind": null
+  },
+  "lifecycle": {
+    "allow_pause": false,
+    "allow_rerun": true,
+    "max_attempts": 4
+  },
+  "context": {
+    "program": "orchestrate",
+    "program_id": "harwness.context.orchestrate@1",
+    "policy": "harwness.context.orchestrate@1",
+    "sections": [
+      {
+        "name": "task.objective",
+        "strength": "must-include",
+        "detail": "full",
+        "trust": "instruction"
+      },
+      {
+        "name": "history.tail",
+        "strength": "must-include",
+        "detail": "summary",
+        "trust": "evidence"
+      },
+      {
+        "name": "plan.current",
+        "strength": "must-include",
+        "detail": "full",
+        "trust": "evidence"
+      },
+      {
+        "name": "child.returns",
+        "strength": "must-include",
+        "detail": "summary",
+        "trust": "evidence"
+      }
+    ],
+    "must_include": [
+      "task.objective",
+      "history.tail",
+      "task.read_scope",
+      "new.trigger_return"
+    ],
+    "exclude": [
+      "credential.*",
+      "secret.*",
+      "sibling_transcripts",
+      "full_parent_transcript",
+      "child.raw_transcript.*"
+    ],
+    "deferred": [
+      "plan.current",
+      "child.returns"
+    ]
+  },
+  "return": {
+    "contract": "harwness.return.envelope@1",
+    "validators": []
+  },
+  "models": null,
+  "limits": null,
+  "work": {
+    "mode": "orchestration",
+    "may_write_code": false,
+    "may_research_web": false,
+    "may_change_plan": false,
+    "aggregates_child_returns": true
+  },
+  "research": null,
+  "verification": null,
+  "skills": {
+    "entries": [
+      {
+        "name": "scenario-wargaming",
+        "hash": null
+      }
+    ]
+  },
+  "binary": {
+    "name": "wargaming-orchestrator",
+    "interfaces": [
+      "cli"
+    ],
+    "default_interface": "cli"
+  },
+  "permissions": {
+    "tools": [
+      "agent.message",
+      "agent.result",
+      "delegate_wave",
+      "deps.graph",
+      "deps.locked",
+      "deps.source_list",
+      "deps.source_read",
+      "deps.source_search",
+      "diary.read",
+      "doc.read_pdf",
+      "explore.find",
+      "explore.projects",
+      "explore.relations",
+      "explore.tree",
+      "fs.glob",
+      "fs.grep",
+      "fs.list",
+      "fs.read",
+      "fs.search",
+      "job.list",
+      "job.logs",
+      "job.status",
+      "job.stop",
+      "job.wait",
+      "lens.ask",
+      "palace.recall",
+      "palace.search",
+      "parent.message",
+      "skills.load",
+      "skills.search",
+      "workbench.show"
+    ],
+    "forbidden_tools": [
+      "fs.edit",
+      "fs.write",
+      "shell.exec",
+      "web.crates_io",
+      "web.docs_rs",
+      "web.fetch",
+      "web.search"
+    ],
+    "capabilities": [],
+    "filesystem": {
+      "read": true,
+      "write": false,
+      "write_paths": [],
+      "other_write_tools": []
+    },
+    "network": {
+      "mode": "off",
+      "tools": [],
+      "hosts": []
+    },
+    "shell": false,
+    "host": false,
+    "spawn": {
+      "max_depth": 1,
+      "child_orchestrators": [],
+      "delegation_targets": [
+        "evidence-critic",
+        "scenario-player",
+        "synthesis-writer",
+        "systems-modeller"
+      ]
+    },
+    "budget": {
+      "max_tokens": 1000000,
+      "max_tool_calls": 400,
+      "max_wall_secs": 7200,
+      "effort_cap": null
+    },
+    "required_env": []
+  },
+  "trace": {
+    "steps": [
+      {
+        "source": "harwness.agent.child-orchestrator-base@1",
+        "kind": "patch",
+        "applied_at": "1970-01-01T00:00:00Z"
+      },
+      {
+        "source": "harwness.agent.child-orchestrator-base@1",
+        "kind": "base",
+        "applied_at": "1970-01-01T00:00:00Z"
+      },
+      {
+        "source": "harwness.agent.wargaming-orchestrator@1",
+        "kind": "patch",
+        "applied_at": "1970-01-01T00:00:00Z"
+      }
+    ],
+    "diagnostics": [
+      {
+        "code": "HARW-CTX-003",
+        "severity": "note",
+        "message": "program `orchestrate` requires sections outside the context ceiling; deferred: plan.current, child.returns",
+        "help": "these sections stay named by the program but are not required at child start",
+        "span": {
+          "file": "builtin/security-structure-triage.toml",
+          "line": 122,
+          "column": 11
+        },
+        "path": "context.program"
+      }
+    ]
+  },
+  "snapshot": {
+    "domain": "harwness.agent-ir.snapshot/v7",
+    "digest": "42f0b74dbdfa41b9d5638276ca567c2774ce4a023b9b0d83ba089ae8b27442c3"
+  }
+}

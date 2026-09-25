@@ -1790,6 +1790,33 @@ dependencies = [
 ]
 
 [[package]]
+name = "harw-agent-artifact"
+version = "0.3.0"
+dependencies = [
+ "blake3",
+ "serde",
+ "serde_json",
+ "tempfile",
+]
+
+[[package]]
+name = "harw-agent-compiler"
+version = "0.3.0"
+dependencies = [
+ "harw-agent-artifact",
+ "harw-agent-dsl",
+ "harw-catalog",
+ "harw-home",
+ "harw-registry-defaults",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "time",
+ "toml 1.1.3+spec-1.1.0",
+ "toml_edit 0.25.13+spec-1.1.0",
+]
+
+[[package]]
 name = "harw-agent-dsl"
 version = "0.3.0"
 dependencies = [
@@ -1800,6 +1827,35 @@ dependencies = [
  "serde_json",
  "time",
  "toml 1.1.3+spec-1.1.0",
+]
+
+[[package]]
+name = "harw-agent-runner"
+version = "0.3.0"
+dependencies = [
+ "bytes",
+ "futures-core",
+ "harw-agent-artifact",
+ "harw-agent-compiler",
+ "harw-agent-dsl",
+ "harw-core",
+ "harw-home",
+ "harw-registry-defaults",
+ "harw-runtime",
+ "harw-tool-job",
+ "harw-tui",
+ "harw-types",
+ "harwness-sdk",
+ "http-body-util",
+ "hyper",
+ "hyper-util",
+ "rustix 1.1.5",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "tokio-stream",
+ "tracing",
 ]
 
 [[package]]
@@ -1922,6 +1978,8 @@ version = "0.3.0"
 dependencies = [
  "clap",
  "clap_complete",
+ "harw-agent-artifact",
+ "harw-agent-compiler",
  "harw-agent-dsl",
  "harw-authority",
  "harw-channel",
@@ -2227,6 +2285,7 @@ dependencies = [
  "harw-fsutil",
  "serde",
  "sha2 0.11.0",
+ "tempfile",
  "toml 1.1.3+spec-1.1.0",
  "uuid",
 ]
@@ -2623,6 +2682,7 @@ dependencies = [
 name = "harw-ops"
 version = "0.3.0"
 dependencies = [
+ "harw-agent-compiler",
  "harw-agent-dsl",
  "harw-authority",
  "harw-catalog",
@@ -2781,6 +2841,7 @@ dependencies = [
  "harw-config",
  "harw-egress",
  "harw-extension-api",
+ "harw-home",
  "harw-instructions",
  "harw-knowledge",
  "harw-project-discovery",
@@ -2824,6 +2885,7 @@ dependencies = [
 name = "harw-runtime"
 version = "0.3.0"
 dependencies = [
+ "harw-agent-artifact",
  "harw-agent-dsl",
  "harw-authority",
  "harw-catalog",
@@ -2863,6 +2925,7 @@ dependencies = [
  "serde",
  "serde_json",
  "tempfile",
+ "time",
  "tokio",
  "toml 1.1.3+spec-1.1.0",
  "tracing",
@@ -2998,6 +3061,7 @@ dependencies = [
  "harw-authority",
  "harw-extension-api",
  "harw-fsutil",
+ "harw-home",
  "harw-macros",
  "harw-sandbox",
  "harw-tools",
@@ -3055,6 +3119,7 @@ version = "0.3.0"
 dependencies = [
  "harw-authority",
  "harw-extension-api",
+ "harw-home",
  "harw-tools",
  "harw-types",
  "serde",
@@ -3147,6 +3212,7 @@ name = "harw-tui"
 version = "0.3.0"
 dependencies = [
  "crossterm 0.29.0",
+ "harw-agent-artifact",
  "harw-agent-dsl",
  "harw-authority",
  "harw-catalog",
@@ -3228,6 +3294,8 @@ name = "harwness-sdk"
 version = "0.3.0"
 dependencies = [
  "futures-core",
+ "harw-agent-artifact",
+ "harw-agent-dsl",
  "harw-config",
  "harw-core",
  "harw-extension-api",
@@ -3240,6 +3308,7 @@ dependencies = [
  "harw-types",
  "serde_json",
  "tempfile",
+ "time",
  "tokio",
  "tokio-stream",
  "tracing",

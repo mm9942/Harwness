@@ -40,15 +40,16 @@ use jiff::Timestamp;
 use std::collections::{BTreeMap, VecDeque};
 use std::fmt;
 use std::fs::{self, File};
-use std::io;
+use std::io::{self, Write as _};
 use std::os::unix::process::ExitStatusExt;
 use std::path::{Path, PathBuf};
 use std::process::{ExitStatus, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant};
-use tokio::process::Child;
-use tokio::sync::watch;
+use tokio::io::{AsyncBufReadExt, BufReader};
+use tokio::process::{Child, ChildStdin, ChildStdout};
+use tokio::sync::{mpsc, watch};
 use tokio::task::JoinHandle;
 use tracing::{debug, info, warn};
 
@@ -64,6 +65,10 @@ const EVENT_LINE_CHARS: usize = 400;
 const KILL_WAIT: Duration = Duration::from_secs(3);
 /// Abfrageintervall für Prozesse ohne eigenen Überwachungs-Task.
 const FOREIGN_POLL: Duration = Duration::from_millis(200);
+/// Vorgabe-Höchstlänge einer stdout-Zeile eines [`JobManager::start_piped`]-Jobs
+/// in Bytes (ohne `\n`): 1 MiB, gleich `harw-agent-runner`s
+/// `child_protocol::MAX_FRAME_BYTES`.
+pub const DEFAULT_MAX_PIPED_LINE_BYTES: usize = 1024 * 1024;
 
 /// Einstellungen der Job-Verwaltung.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -169,6 +174,60 @@ pub struct StartRequest {
     /// Besitzer.
     pub owner: JobOwner,
 }
+
+/// Ergebnis von [`JobManager::start_piped`]: derselbe Job wie [`JobManager::start`]
+/// (Prozessgruppe, Logs, `meta.json`, Überwachung, Ereignisse), zusätzlich
+/// mit offener stdin und einem Zeilenstrom der stdout — für einen Job, dessen
+/// Prozess über sein eigenes Protokoll auf seiner stdio spricht (ein
+/// job-gebundenes Kind, `harw-agent-runner::job_child_backend`).
+///
+/// # Description
+/// stdout wird zusätzlich vollständig in `STDOUT_LOG` mitgeschrieben
+/// (`job.logs`/`job.status` sehen sie wie bei jedem anderen Job); stderr
+/// geht wie bisher direkt in `STDERR_LOG`. Der Überwachungs-Task erkennt
+/// weiterhin Ende, Prozessgruppe und Ereignisse.
+#[derive(Debug)]
+pub struct PipedJob {
+    /// Kennung.
+    pub job_id: JobId,
+    /// Zustand direkt nach dem Start.
+    pub status: JobStatus,
+    /// stdin des Kindes; der Aufrufer schreibt sein Protokoll hinein.
+    pub stdin: ChildStdin,
+    /// Zeilen der stdout, in Ankunftsreihenfolge (dieselben Zeilen landen
+    /// auch in `STDOUT_LOG`). Endet (liefert `None`), wenn der Prozess seine
+    /// stdout schließt. Eine zu lange oder nicht-UTF-8-Zeile liefert genau
+    /// ein `Err` ([`PipedLineError`]); danach endet der Strom, und die
+    /// stdout-Pipe ist geschlossen (der Prozess sieht beim nächsten
+    /// Schreiben `EPIPE`/`SIGPIPE`).
+    pub stdout_lines: mpsc::UnboundedReceiver<Result<String, PipedLineError>>,
+}
+
+/// Warum der stdout-Zeilenstrom eines [`PipedJob`] vorzeitig endete.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PipedLineError {
+    /// Eine Zeile wurde länger als `limit` Bytes (ohne `\n`), bevor ihr `\n`
+    /// kam; gelesen wurde höchstens `limit` Bytes davon.
+    TooLong {
+        /// Die überschrittene Grenze.
+        limit: usize,
+    },
+    /// Eine Zeile war kein gültiges UTF-8.
+    InvalidUtf8,
+}
+
+impl fmt::Display for PipedLineError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::TooLong { limit } => {
+                write!(f, "job stdout line exceeds the {limit}-byte limit")
+            }
+            Self::InvalidUtf8 => f.write_str("job stdout line is not valid UTF-8"),
+        }
+    }
+}
+
+impl std::error::Error for PipedLineError {}
 
 /// Ausgang von [`JobManager::wait`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -617,6 +676,160 @@ impl JobManager {
         Ok(entry.status())
     }
 
+    /// Wie [`JobManager::start`], aber stdin bleibt offen (`Stdio::piped()`
+    /// statt `Stdio::null()`) und stdout wird zusätzlich zu `STDOUT_LOG` als
+    /// Zeilenstrom zurückgegeben; stderr geht unverändert direkt in
+    /// `STDERR_LOG`. Für einen job-gebundenen Kindprozess, der sein eigenes
+    /// Protokoll über stdio spricht (`harw-agent-runner::job_child_backend`):
+    /// derselbe Prozessgruppen-/Log-/Überwachungsweg wie jeder andere Job.
+    ///
+    /// # Description
+    /// Muss innerhalb einer Tokio-Runtime laufen (Überwachungs- und
+    /// Mitschreib-Task).
+    ///
+    /// # Errors
+    /// [`JobError::Capacity`], [`JobError::Io`] (Verzeichnis/Logdateien) oder
+    /// [`JobError::Spawn`] (Start scheiterte oder eine der stdio-Pipes fehlt);
+    /// ein gescheiterter Start bleibt als [`JobState::Failed`] mit
+    /// `launch_error` sichtbar.
+    pub fn start_piped(
+        self: &Arc<Self>,
+        request: StartRequest,
+        prepared: PreparedJob,
+    ) -> Result<PipedJob, JobError> {
+        self.start_piped_with_line_limit(request, prepared, DEFAULT_MAX_PIPED_LINE_BYTES)
+    }
+
+    /// Wie [`JobManager::start_piped`], aber mit eigener Höchstlänge einer
+    /// stdout-Zeile (`max_line_bytes`, ohne `\n`). Eine längere Zeile wird
+    /// nie über die Grenze hinaus gepuffert: das Mitschreib-Task hört auf zu
+    /// lesen, vermerkt es in `STDOUT_LOG`, schickt
+    /// [`PipedLineError::TooLong`] und schließt Strom und Pipe.
+    ///
+    /// # Errors
+    /// Wie [`JobManager::start_piped`].
+    pub fn start_piped_with_line_limit(
+        self: &Arc<Self>,
+        request: StartRequest,
+        prepared: PreparedJob,
+        max_line_bytes: usize,
+    ) -> Result<PipedJob, JobError> {
+        self.check_capacity()?;
+        let (id, dir) = self.allocate()?;
+        let stdout_log_path = dir.join(STDOUT_LOG);
+        let stdout_log = File::create(&stdout_log_path).map_err(io_err("create stdout.log"))?;
+        let stderr = File::create(dir.join(STDERR_LOG)).map_err(io_err("create stderr.log"))?;
+
+        let mut meta = JobMeta {
+            version: META_VERSION,
+            job_id: id.clone(),
+            name: request.name,
+            command: request.command,
+            cwd: request.cwd.map(|cwd| cwd.display().to_string()),
+            env_keys: request.env_keys,
+            state: JobState::Queued,
+            pid: None,
+            proc_start_ticks: None,
+            executed_on_host: prepared.executed_on_host,
+            harw_instance: self.instance.clone(),
+            owner: request.owner,
+            created_at: Timestamp::now(),
+            started_at: None,
+            ended_at: None,
+            exit_code: None,
+            signal: None,
+            stop_requested: false,
+            detached: false,
+            notify_every_secs: request.notify_every.as_secs(),
+            progress: None,
+            warnings: 0,
+            errors: 0,
+            launch_error: None,
+        };
+
+        let mut command = prepared.command;
+        command
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::from(stderr))
+            .kill_on_drop(false);
+        let mut child = match command.spawn() {
+            Ok(child) => child,
+            Err(err) => {
+                return Err(self.record_piped_launch_failure(dir, meta, err.to_string()));
+            }
+        };
+        let (Some(stdin), Some(stdout)) = (child.stdin.take(), child.stdout.take()) else {
+            // `Stdio::piped()` above always gives both back; unreachable in
+            // practice, but a job that spawned without stdio it needs must
+            // not linger.
+            let _ = child.start_kill();
+            return Err(self.record_piped_launch_failure(
+                dir,
+                meta,
+                "child process is missing a stdio pipe".to_owned(),
+            ));
+        };
+
+        let pid = child.id();
+        meta.pid = pid;
+        meta.proc_start_ticks = pid.and_then(process_start_ticks);
+        meta.state = JobState::Running;
+        meta.started_at = Some(Timestamp::now());
+        let entry = Arc::new(JobEntry::new(dir, meta.clone(), true));
+        entry.persist();
+        lock(&self.jobs).insert(id.clone(), Arc::clone(&entry));
+        info!(job_id = %id, pid, executed_on_host = meta.executed_on_host, "piped job started");
+
+        self.notifier.notify(JobNotification {
+            owner: meta.owner.clone(),
+            event: JobEvent::Started {
+                job_id: id.clone(),
+                name: meta.name.clone(),
+                command: meta.command.clone(),
+                pid,
+                executed_on_host: meta.executed_on_host,
+            },
+        });
+
+        let (line_tx, line_rx) = mpsc::unbounded_channel();
+        let tee = tokio::spawn(tee_stdout(stdout, stdout_log, line_tx, max_line_bytes));
+
+        let monitor = Monitor {
+            entry: Arc::clone(&entry),
+            notifier: Arc::clone(&self.notifier),
+            config: self.config.clone(),
+            notify_every: request.notify_every,
+        };
+        let handle = tokio::spawn(monitor.run_piped(child, tee));
+        *lock(&entry.monitor) = Some(handle);
+        Ok(PipedJob {
+            job_id: id,
+            status: entry.status(),
+            stdin,
+            stdout_lines: line_rx,
+        })
+    }
+
+    /// Verbucht einen gescheiterten `start_piped`-Aufruf genau wie [`JobManager::start`]
+    /// es für seinen eigenen Startfehler tut: Job bleibt als [`JobState::Failed`]
+    /// sichtbar, mit `launch_error`.
+    fn record_piped_launch_failure(
+        &self,
+        dir: PathBuf,
+        mut meta: JobMeta,
+        error: String,
+    ) -> JobError {
+        warn!(job_id = %meta.job_id, error = %error, "piped job spawn failed");
+        meta.state = JobState::Failed;
+        meta.ended_at = Some(Timestamp::now());
+        meta.launch_error = Some(error.clone());
+        let entry = Arc::new(JobEntry::new(dir, meta.clone(), false));
+        entry.persist();
+        lock(&self.jobs).insert(meta.job_id, entry);
+        JobError::Spawn(error)
+    }
+
     /// Zustand eines Jobs.
     ///
     /// # Errors
@@ -939,6 +1152,100 @@ async fn cancelled(cancel: Option<&CancelToken>) {
     }
 }
 
+/// Liest Zeilen aus der stdout-Pipe eines `start_piped`-Jobs, schreibt jede
+/// vollständig (mit Zeilenende) in `stdout_log` und schickt sie zusätzlich an
+/// `sender` — bis die Pipe schließt (Prozessende) oder ein Lesefehler
+/// auftritt. Ist der Empfänger bereits verworfen, wird trotzdem bis zum Ende
+/// weiter mitgeschrieben (nur `STDOUT_LOG` zählt dann noch).
+///
+/// # Description
+/// Anders als `AsyncBufReadExt::lines` puffert es eine Zeile höchstens bis
+/// `max_line_bytes`: wird sie länger (oder ist sie kein UTF-8), vermerkt es
+/// das in `stdout_log`, schickt genau ein `Err` und endet. Damit schließt es
+/// die Pipe; der Rest der Zeile wird nie gelesen, und Überwachung und
+/// `stop` laufen wie bei jedem anderen Job weiter.
+async fn tee_stdout(
+    stdout: ChildStdout,
+    mut stdout_log: File,
+    sender: mpsc::UnboundedSender<Result<String, PipedLineError>>,
+    max_line_bytes: usize,
+) {
+    let mut reader = BufReader::new(stdout);
+    let mut buf = Vec::new();
+    loop {
+        let failure = match read_bounded_line(&mut reader, &mut buf, max_line_bytes).await {
+            Ok(BoundedLine::Line) => match String::from_utf8(std::mem::take(&mut buf)) {
+                Ok(line) => {
+                    if let Err(err) = writeln!(stdout_log, "{line}") {
+                        debug!(error = %err, "job stdout tee: log write failed");
+                    }
+                    let _ = sender.send(Ok(line));
+                    continue;
+                }
+                Err(_) => PipedLineError::InvalidUtf8,
+            },
+            Ok(BoundedLine::Eof) => break,
+            Ok(BoundedLine::TooLong) => PipedLineError::TooLong {
+                limit: max_line_bytes,
+            },
+            Err(err) => {
+                debug!(error = %err, "job stdout tee: read failed");
+                break;
+            }
+        };
+        warn!(error = %failure, "job stdout tee: stopped reading stdout");
+        if let Err(err) = writeln!(stdout_log, "[harw] {failure}; stopped reading stdout") {
+            debug!(error = %err, "job stdout tee: log write failed");
+        }
+        let _ = sender.send(Err(failure));
+        break;
+    }
+}
+
+/// Ausgang von [`read_bounded_line`].
+enum BoundedLine {
+    /// Eine Zeile (ohne `\n` und ohne abschließendes `\r`) steht im Puffer.
+    Line,
+    /// Sauberes Ende der Pipe ohne offene Bytes.
+    Eof,
+    /// Die Zeile wurde länger als die Grenze; ihr Rest ist ungelesen.
+    TooLong,
+}
+
+/// Liest die nächste Zeile aus `reader` nach `buf` (vorher geleert) und
+/// kopiert dabei höchstens `limit` Inhalts-Bytes (ohne `\n`). Eine letzte
+/// Zeile ohne `\n` vor dem Pipe-Ende zählt als Zeile (wie bei `lines()`).
+async fn read_bounded_line<R: tokio::io::AsyncBufRead + Unpin>(
+    reader: &mut R,
+    buf: &mut Vec<u8>,
+    limit: usize,
+) -> io::Result<BoundedLine> {
+    buf.clear();
+    loop {
+        let available = reader.fill_buf().await?;
+        if available.is_empty() {
+            return Ok(if buf.is_empty() {
+                BoundedLine::Eof
+            } else {
+                BoundedLine::Line
+            });
+        }
+        let newline = available.iter().position(|&byte| byte == b'\n');
+        let content_len = newline.unwrap_or(available.len());
+        if buf.len().saturating_add(content_len) > limit {
+            return Ok(BoundedLine::TooLong);
+        }
+        buf.extend_from_slice(&available[..content_len]);
+        reader.consume(newline.map_or(content_len, |index| index + 1));
+        if newline.is_some() {
+            if buf.last() == Some(&b'\r') {
+                buf.pop();
+            }
+            return Ok(BoundedLine::Line);
+        }
+    }
+}
+
 /// Meilenstein-Schlüssel: 10-%-Stufe, sonst das erste Wort der Phase.
 fn milestone_key(snapshot: &ProgressSnapshot) -> (ProgressSource, Option<u8>, String) {
     match snapshot.percent {
@@ -976,7 +1283,19 @@ struct MonitorState {
 }
 
 impl Monitor {
-    async fn run(self, mut child: Child) {
+    async fn run(self, child: Child) {
+        self.run_inner(child, None).await;
+    }
+
+    /// Wie [`Monitor::run`], aber wartet nach dem Prozessende zusätzlich auf
+    /// `tee` (das Mitschreib-Task von [`JobManager::start_piped`]), damit die
+    /// letzte Ausgabe sicher in `STDOUT_LOG` steht, bevor der Ende-Bericht
+    /// den Tail liest.
+    async fn run_piped(self, child: Child, tee: JoinHandle<()>) {
+        self.run_inner(child, Some(tee)).await;
+    }
+
+    async fn run_inner(self, mut child: Child, tee: Option<JoinHandle<()>>) {
         let started = Instant::now();
         let mut run = MonitorState {
             stdout: LogFollower::new(self.entry.dir.join(STDOUT_LOG)),
@@ -1006,6 +1325,12 @@ impl Monitor {
                 }
             }
         };
+        if let Some(tee) = tee {
+            // Der Prozess ist beendet; das Mitschreib-Task endet, sobald es
+            // das Ende seiner stdout-Pipe sieht (kurz danach). Erst danach
+            // steht die letzte Ausgabe vollständig in `STDOUT_LOG`.
+            let _ = tee.await;
+        }
         self.ingest(&mut run, true);
         self.finish(&mut run, status, started);
     }

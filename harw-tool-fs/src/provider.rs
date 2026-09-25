@@ -202,6 +202,20 @@ impl ToolProvider for FsToolProvider {
 // Tool spec builders
 // ---------------------------------------------------------------------------
 
+/// Beschreibt die geschützten Wurzelkomponenten für Tool-Beschreibungen
+/// (`.git/` und `.harw/` — dazu, falls verschieden, der aktuell aktive,
+/// projekt-lokale Name einer personalisierten harw (#22,
+/// [`harw_home::project_dir_name`])). Muss mit
+/// [`crate::write::protected_component`] übereinstimmen.
+fn protected_areas_description() -> String {
+    let named = harw_home::project_dir_name();
+    if named.eq_ignore_ascii_case(".harw") {
+        ".git/ and .harw/".to_owned()
+    } else {
+        format!(".git/, .harw/ and {named}/")
+    }
+}
+
 fn fs_read_spec() -> ToolSpec {
     let mut props = BTreeMap::new();
     props.insert(
@@ -321,12 +335,14 @@ fn fs_write_spec() -> ToolSpec {
 
     ToolSpec::Function(FunctionToolSpec {
         name: ToolName::new("fs.write"),
-        description: "Write content to a file relative to the workspace root, atomically. \
+        description: format!(
+            "Write content to a file relative to the workspace root, atomically. \
              Creates the file if it does not exist; overwrites if it does. Parent directories \
              are not created. Requires WriteWorkspace permission. Symlinks in the path are \
              followed only when their target stays inside the workspace; path traversal, \
-             symlinks leading outside and the protected areas .git/ and .harw/ are rejected."
-            .to_owned(),
+             symlinks leading outside and the protected areas {} are rejected.",
+            protected_areas_description()
+        ),
         parameters: JsonSchema {
             schema_type: Some(JsonSchemaType::Object),
             properties: Some(props),
@@ -384,15 +400,17 @@ fn fs_edit_spec() -> ToolSpec {
 
     ToolSpec::Function(FunctionToolSpec {
         name: ToolName::new("fs.edit"),
-        description: "Replace text in an existing UTF-8 file relative to the workspace root, \
+        description: format!(
+            "Replace text in an existing UTF-8 file relative to the workspace root, \
              atomically. old_string must occur exactly once unless replace_all is true; \
-             otherwise the call fails and reports the match count. Returns {path, \
-             replacements, diff_excerpt}. Prefer fs.edit over fs.write for changes to \
+             otherwise the call fails and reports the match count. Returns {{path, \
+             replacements, diff_excerpt}}. Prefer fs.edit over fs.write for changes to \
              existing files. Requires WriteWorkspace permission. Symlinks in the path are \
              followed only inside the workspace; path traversal, symlinks leading outside and \
-             the protected areas .git/ and .harw/ are rejected; files larger than 8 MiB are \
-             not edited."
-            .to_owned(),
+             the protected areas {} are rejected; files larger than 8 MiB are \
+             not edited.",
+            protected_areas_description()
+        ),
         parameters: JsonSchema {
             schema_type: Some(JsonSchemaType::Object),
             properties: Some(props),

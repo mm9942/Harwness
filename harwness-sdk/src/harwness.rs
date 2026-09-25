@@ -81,20 +81,41 @@ pub(crate) struct SpecInputs {
     pub(crate) mode: Option<Mode>,
     pub(crate) reasoning_effort: Option<ReasoningEffort>,
     pub(crate) agent: Option<String>,
+    /// Ein eingebettetes Agenten-Artefakt (#22 Welle 3A,
+    /// [`HarwnessBuilder::embedded`]). `Some` wählt
+    /// [`EntryKind::CompiledAgent`] statt [`EntryKind::Tui`] und reicht das
+    /// Artefakt in die [`RuntimeSpec`] durch.
+    pub(crate) embedded: Option<Arc<harw_runtime::EmbeddedAgent>>,
+    /// Ein verdrahtetes [`harw_core::child_backend::ChildBackend`] (#22
+    /// Welle 3C, [`HarwnessBuilder::child_backend`]). `Some` reicht es
+    /// unverändert an [`harw_runtime::RuntimeSpec::child_backend`] durch;
+    /// `None` lässt jeden Kind-Lauf in-process.
+    pub(crate) child_backend: Option<harw_runtime::ChildBackendHandle>,
 }
 
 impl SpecInputs {
     /// Die Eingangsbeschreibung eines Laufs.
     ///
     /// # Beschreibung
-    /// Einstieg [`EntryKind::Tui`]: das einzige Profil, dessen Rückfragen
-    /// jemand beantwortet ([`harw_runtime::AskResolution::Interactive`]) —
-    /// hier der [`ApprovalHandler`] des Einbettenden. Der Principal ist ein
-    /// lokaler Mensch an der Terminal-Fläche, damit die Runtime ihm einen
-    /// Freigabe-Akteur zuordnet.
+    /// Ohne [`Self::embedded`] ist [`EntryKind::Tui`] der einzige Einstieg,
+    /// dessen Rückfragen jemand beantwortet
+    /// ([`harw_runtime::AskResolution::Interactive`]) — hier der
+    /// [`ApprovalHandler`] des Einbettenden. Der Principal ist ein lokaler
+    /// Mensch an der Terminal-Fläche, damit die Runtime ihm einen
+    /// Freigabe-Akteur zuordnet. Mit [`Self::embedded`] ist der Einstieg
+    /// [`EntryKind::CompiledAgent`] (#22 Welle 3A): dessen Zeile entsteht aus
+    /// den Manifest-Rechten des Artefakts
+    /// (`harw_runtime::spec::EntryProfile::for_embedded`), nicht aus dieser
+    /// Tabelle — der Principal bleibt trotzdem ein lokaler Mensch, denn ein
+    /// eingebetteter Lauf startet wie die TUI direkt am Terminal.
     pub(crate) fn spec(&self) -> RuntimeSpec {
+        let entry = if self.embedded.is_some() {
+            EntryKind::CompiledAgent
+        } else {
+            EntryKind::Tui
+        };
         RuntimeSpec {
-            entry: EntryKind::Tui,
+            entry,
             home: self.home.clone(),
             cwd: self.cwd.clone(),
             principal: Principal::trusted_ingress(
@@ -110,6 +131,8 @@ impl SpecInputs {
             // (ApprovalPolicy bzw. Builder-Overrides), nicht über die Spec.
             approval_override: None,
             model_override: None,
+            embedded: self.embedded.clone(),
+            child_backend: self.child_backend.clone(),
         }
     }
 }
