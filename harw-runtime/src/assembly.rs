@@ -1857,7 +1857,6 @@ impl RuntimeAssemblyBuilder {
         // Startfehler, nie ein stiller Full-Tool-Fallback.
         let needs_definitions = spec.active_agent.is_some()
             || config.harness.active_uia_definition.is_some()
-            || spec.embedded.is_some()
             || matches!(profile.spawner, SpawnerPolicy::BuiltinRoles);
         let agent_definitions = if needs_definitions {
             lower_agent_definitions(&config)?
@@ -3209,17 +3208,20 @@ fn resolve_active_uia(
 /// tut.
 ///
 /// # Beschreibung
-/// Aufgerufen anstelle von [`resolve_active_uia`], wenn `spec.embedded`
-/// gesetzt ist — die native, personalisierte harw trägt ihre UIA bereits im
-/// Binary; sie gewinnt über eine konfigurierte
-/// `harness.active_uia_definition`, muss sich aber denselben Rollen- und
-/// Senkungs-Regeln stellen. `harw-runtime` kennt `harw-cli::embedded_uia`
-/// nicht selbst — der Aufrufer (`harw-cli`) reicht die verifizierte IR über
-/// `RuntimeSpec` durch.
+/// Aufgerufen anstelle von [`resolve_active_uia`] für `Tui`/`OneShot`, wenn
+/// `spec.embedded` ([`crate::embedded::EmbeddedAgent`], Welle 3A) gesetzt ist
+/// — die native, personalisierte harw trägt ihre UIA bereits als
+/// eingebettetes Artefakt (`harw-cli::embedded_uia` reicht sie über
+/// [`crate::spec::RuntimeSpec::embedded`] durch); sie gewinnt über eine
+/// konfigurierte `harness.active_uia_definition`, muss sich aber denselben
+/// Rollen- und Senkungs-Regeln stellen wie diese. `harw-runtime` kennt
+/// `harw-cli::embedded_uia` nicht selbst.
 ///
 /// # Errors
 /// [`RuntimeError::Registry`], wenn die eingebettete Definition nicht die
-/// Rolle `user-interface` trägt.
+/// Rolle `user-interface` trägt (etwa `EmbeddedAgent::root_ir` eines
+/// `EntryKind::CompiledAgent`-Artefakts, das keine UIA ist — der Aufrufer
+/// gattet deshalb bereits auf `Tui`/`OneShot`, bevor er hierher kommt).
 fn resolve_embedded_uia(
     embedded: &harw_agent_dsl::ir_v2::AgentIr,
 ) -> RuntimeResult<ExecutableAgentIr> {
@@ -6184,6 +6186,63 @@ mod tests {
             resolve_active_uia(EntryKind::Doctor, &config, &definitions)
                 .map_err(ctx("doctor has no UIA requirement"))?
                 .is_none()
+        );
+        Ok(())
+    }
+
+    /// Senkt eine minimale Agentendefinition zur `AgentIr`, wie
+    /// [`crate::embedded::EmbeddedAgent::root_ir`] sie liefert — derselbe
+    /// Weg wie `crate::embedded::tests::compile`.
+    fn compile_ir(source: &str, target: &str) -> TestResult<harw_agent_dsl::ir_v2::AgentIr> {
+        use harw_agent_dsl::diagnostics::SourceFile;
+        use harw_agent_dsl::ids::DefinitionId;
+        use harw_agent_dsl::layers::DefinitionLayer;
+        use harw_agent_dsl::lower_v2::{LowerSources, compile_agent};
+        let files = vec![SourceFile::new(
+            DefinitionLayer::UserGlobal,
+            "agents/embedded/definition.toml",
+            source,
+        )];
+        let sources = LowerSources::new(&files);
+        let target = DefinitionId::parse(target).map_err(ctx("target id"))?;
+        compile_agent(&target, &sources, time::OffsetDateTime::UNIX_EPOCH)
+            .map_err(|diagnostics| TestError::Unexpected(format!("compile: {diagnostics}")))
+    }
+
+    /// #22 Welle 3: die eingebettete UIA einer personalisierten harw
+    /// (`spec.embedded`, `EntryKind::Tui`/`OneShot`) wird genau wie eine
+    /// über `harness.active_uia_definition` konfigurierte UIA auf die Rolle
+    /// `user-interface` geprüft — [`resolve_embedded_uia`] ist der Kern
+    /// dieser Prüfung, den die Montage anstelle von [`resolve_active_uia`]
+    /// aufruft, sobald `spec.embedded` gesetzt ist (siehe Aufrufstelle in
+    /// [`RuntimeAssembly::builder`]).
+    #[test]
+    fn resolve_embedded_uia_accepts_user_interface_role_and_rejects_others() -> TestResult {
+        let uia_ir = compile_ir(
+            "schema = \"harwness.agent/v1\"\n\
+             id = \"acme.agent.embedded-uia@1\"\n\
+             version = \"1.0.0\"\n\
+             role = \"user-interface\"\n\
+             specialization = \"terminal-ui\"\n",
+            "acme.agent.embedded-uia@1",
+        )?;
+        let worker_ir = compile_ir(
+            "schema = \"harwness.agent/v1\"\n\
+             id = \"acme.agent.embedded-worker@1\"\n\
+             version = \"1.0.0\"\n\
+             role = \"worker\"\n\
+             specialization = \"embedded-worker\"\n",
+            "acme.agent.embedded-worker@1",
+        )?;
+
+        let resolved =
+            resolve_embedded_uia(&uia_ir).map_err(ctx("embedded uia should resolve"))?;
+        assert_eq!(resolved.role(), AgentRoleId::UserInterface);
+
+        let rejected = resolve_embedded_uia(&worker_ir);
+        assert!(
+            matches!(rejected, Err(RuntimeError::Registry { .. })),
+            "{rejected:?}"
         );
         Ok(())
     }

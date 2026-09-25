@@ -46,6 +46,11 @@ tracing = { workspace = true }
 [dev-dependencies]
 tempfile = { workspace = true }
 tokio = { version = "1.53.0", features = ["rt", "rt-multi-thread", "sync", "time", "macros", "signal"] }
+# `tests/embedded_session.rs` (#22 Welle 3A): baut ein Test-Artefakt direkt
+# über den Compiler- und Artefakt-Weg, kein Netz, keine Laufzeitkopplung.
+harw-agent-artifact = { path = "../harw-agent-artifact" }
+harw-agent-dsl = { path = "../harw-agent-dsl" }
+time = "0.3.53"
 
 [[example]]
 name = "minimal_chat"

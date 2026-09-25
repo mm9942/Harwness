@@ -127,6 +127,7 @@ pub struct HarwnessBuilder {
     approvals: Arc<dyn ApprovalHandler>,
     tools: Vec<Arc<dyn Tool>>,
     contexts: Vec<Arc<dyn ContextSource>>,
+    embedded: Option<Arc<harw_runtime::EmbeddedAgent>>,
     #[cfg(feature = "unstable-internals")]
     raw: RawExtensions,
 }
@@ -149,6 +150,7 @@ impl Default for HarwnessBuilder {
             approvals: approval::default_handler(),
             tools: Vec::new(),
             contexts: Vec::new(),
+            embedded: None,
             #[cfg(feature = "unstable-internals")]
             raw: RawExtensions::default(),
         }
@@ -171,6 +173,7 @@ impl std::fmt::Debug for HarwnessBuilder {
             .field("approval_policy", &self.approval_policy)
             .field("tools", &self.tools.len())
             .field("contexts", &self.contexts.len())
+            .field("embedded", &self.embedded.is_some())
             .finish_non_exhaustive()
     }
 }
@@ -314,6 +317,21 @@ impl HarwnessBuilder {
         self
     }
 
+    /// Bettet ein kompiliertes Agenten-Artefakt ein (#22 Welle 3A):
+    /// Konfiguration, Agent, Skills und Wissen kommen dann ausschließlich aus
+    /// `agent` (`harw_runtime::config::load_config_embedded`) statt aus
+    /// `~/.harw`. [`Self::build`] überspringt dafür die Pflicht einer
+    /// konfigurierten UIA ([`harw_config::HarnessConfig::active_uia_definition`])
+    /// und eines konfigurierten Standard-Providers — beides ersetzt das
+    /// Manifest des Artefakts (`[models]` seiner Wurzel-IR). [`Self::home`]
+    /// bleibt dabei ausdrücklich nutzbar: nur für Sitzungen und Protokolle,
+    /// nie für Agenten, Skills oder Profil.
+    #[must_use]
+    pub fn embedded(mut self, agent: Arc<harw_runtime::EmbeddedAgent>) -> Self {
+        self.embedded = Some(agent);
+        self
+    }
+
     /// **Instabil.** Hängt einen rohen internen Tool-Provider an.
     #[cfg(feature = "unstable-internals")]
     #[must_use]
@@ -446,26 +464,47 @@ impl HarwnessBuilder {
         #[cfg(not(feature = "unstable-internals"))]
         let model = self.model;
 
+        // #22 Welle 3A: ein eingebettetes Artefakt bestimmt seinen
+        // Wurzel-Agenten selbst (dieselbe Rolle wie `--agent`); ein
+        // ausdrücklich gesetzter `agent()` behält Vorrang.
+        let agent = self
+            .agent
+            .or_else(|| self.embedded.as_ref().map(|agent| agent.root_id().to_owned()));
         let spec_inputs = SpecInputs {
             home,
             cwd: validated.cwd,
             principal_id: self.principal_id,
             mode: self.mode,
             reasoning_effort: self.reasoning_effort,
-            agent: self.agent,
+            agent,
+            embedded: self.embedded.clone(),
         };
-        let (config, _trust) =
-            harw_runtime::load_config(&spec_inputs.spec()).map_err(SdkError::from_runtime)?;
+        let config = if self.embedded.is_some() {
+            harw_runtime::load_config_embedded(&spec_inputs.spec())
+                .map_err(SdkError::from_runtime)?
+        } else {
+            let (config, _trust) =
+                harw_runtime::load_config(&spec_inputs.spec()).map_err(SdkError::from_runtime)?;
+            config
+        };
         // Ein explizit gewählter Agent ersetzt die UIA als Wurzel; nur ohne ihn
-        // ist eine aktive UIA Pflicht.
-        if spec_inputs.agent.is_none() && config.harness.active_uia_definition.is_none() {
+        // ist eine aktive UIA Pflicht. Ein eingebettetes Artefakt bringt seine
+        // eigene Wurzel mit (oben gesetzt) und braucht daher nie eine UIA.
+        if self.embedded.is_none()
+            && spec_inputs.agent.is_none()
+            && config.harness.active_uia_definition.is_none()
+        {
             return Err(SdkError::Config {
                 detail: "no active UIA is configured (harness.active_uia_definition); \
                          run `harw` once interactively or set it in the profile config"
                     .to_owned(),
             });
         }
-        if matches!(model, ModelChoice::Configured)
+        // Ebenso ersetzt das Manifest des eingebetteten Artefakts
+        // (`[models]` seiner Wurzel-IR, bereits von `load_config_embedded`
+        // geprüft) die Pflicht eines konfigurierten Standard-Providers.
+        if self.embedded.is_none()
+            && matches!(model, ModelChoice::Configured)
             && self.provider_id.is_none()
             && config.harness.default_provider.is_none()
         {

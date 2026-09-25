@@ -324,12 +324,12 @@ async fn handle_run(state: &AppState, body: Value) -> HttpResponse {
     };
     let cancel = session.cancel_handle();
 
-    let run_id = state.runs.lock().unwrap_or_else(|poison| poison.into_inner()).alloc_id();
+    let run_id = state.runs.lock().unwrap_or_else(std::sync::PoisonError::into_inner).alloc_id();
     let record = Arc::new(Mutex::new(RunRecord::new(request.context, cancel)));
     state
         .runs
         .lock()
-        .unwrap_or_else(|poison| poison.into_inner())
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
         .insert(run_id.clone(), Arc::clone(&record));
 
     if request.background {
@@ -342,16 +342,16 @@ async fn handle_run(state: &AppState, body: Value) -> HttpResponse {
         drive_run(Arc::clone(&record), session, request.prompt).await;
         let snapshot = record
             .lock()
-            .unwrap_or_else(|poison| poison.into_inner())
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
             .snapshot(&run_id);
         json_response(StatusCode::OK, &snapshot)
     }
 }
 
 fn handle_get_run(state: &AppState, id: &str) -> HttpResponse {
-    match state.runs.lock().unwrap_or_else(|poison| poison.into_inner()).get(id) {
+    match state.runs.lock().unwrap_or_else(std::sync::PoisonError::into_inner).get(id) {
         Some(record) => {
-            let guard = record.lock().unwrap_or_else(|poison| poison.into_inner());
+            let guard = record.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
             json_response(StatusCode::OK, &guard.snapshot(id))
         }
         None => json_response(StatusCode::NOT_FOUND, &json!({"error": "not_found"})),
@@ -359,10 +359,10 @@ fn handle_get_run(state: &AppState, id: &str) -> HttpResponse {
 }
 
 fn handle_cancel(state: &AppState, id: &str) -> HttpResponse {
-    match state.runs.lock().unwrap_or_else(|poison| poison.into_inner()).get(id) {
+    match state.runs.lock().unwrap_or_else(std::sync::PoisonError::into_inner).get(id) {
         Some(record) => {
             let cancelled = {
-                let guard = record.lock().unwrap_or_else(|poison| poison.into_inner());
+                let guard = record.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
                 guard.cancel.cancel()
             };
             json_response(StatusCode::OK, &json!({"run_id": id, "cancelled": cancelled}))
@@ -372,11 +372,11 @@ fn handle_cancel(state: &AppState, id: &str) -> HttpResponse {
 }
 
 fn handle_events(state: &AppState, id: &str) -> HttpResponse {
-    let Some(record) = state.runs.lock().unwrap_or_else(|poison| poison.into_inner()).get(id) else {
+    let Some(record) = state.runs.lock().unwrap_or_else(std::sync::PoisonError::into_inner).get(id) else {
         return json_response(StatusCode::NOT_FOUND, &json!({"error": "not_found"}));
     };
     let (buffered, mut receiver, already_finished) = {
-        let guard = record.lock().unwrap_or_else(|poison| poison.into_inner());
+        let guard = record.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         (
             guard.events.clone(),
             guard.event_tx.subscribe(),
@@ -433,13 +433,15 @@ fn sse_frame(envelope: &Value) -> Bytes {
 /// and publishes a terminal `run.finished` marker event.
 async fn drive_run(record: Arc<Mutex<RunRecord>>, mut session: Box<dyn RunSession>, prompt: String) {
     {
-        let mut guard = record.lock().unwrap_or_else(|poison| poison.into_inner());
+        let mut guard = record.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         guard.status = RunStatus::Running;
     }
 
     let mut events = session.events();
-    let send_future = session.send(prompt);
-    tokio::pin!(send_future);
+    // `send()` already returns a `Pin<Box<dyn Future>>`; `Box` is
+    // unconditionally `Unpin`, so this can be reused across `select!`
+    // iterations by `&mut` reference without an extra `tokio::pin!`.
+    let mut send_future = session.send(prompt);
 
     let outcome = loop {
         tokio::select! {
@@ -458,7 +460,7 @@ async fn drive_run(record: Arc<Mutex<RunRecord>>, mut session: Box<dyn RunSessio
         record_event(&record, envelope);
     }
 
-    let mut guard = record.lock().unwrap_or_else(|poison| poison.into_inner());
+    let mut guard = record.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
     match outcome {
         Ok(result) => {
             guard.status = result.status;
@@ -476,7 +478,7 @@ async fn drive_run(record: Arc<Mutex<RunRecord>>, mut session: Box<dyn RunSessio
 }
 
 fn record_event(record: &Arc<Mutex<RunRecord>>, envelope: Value) {
-    let mut guard = record.lock().unwrap_or_else(|poison| poison.into_inner());
+    let mut guard = record.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
     guard.events.push(envelope.clone());
     let _ = guard.event_tx.send(envelope);
 }
@@ -524,9 +526,10 @@ struct RunRecord {
     text: Option<String>,
     usage: Option<Value>,
     error: Option<String>,
-    /// Echoed back only via `snapshot`'s absence — kept for future use
-    /// (e.g. re-derived prompts); not sent to the model today (see the
-    /// crate report for why `context` has no SDK-side meaning yet).
+    /// `POST /run`'s optional `context` field, kept for callers that poll a
+    /// run back. `harwness_sdk::Session::send` has no separate "context"
+    /// input today, so it is not fed to the model; stored here so a future
+    /// SDK hook (or a caller reading it back) has it without an API change.
     #[allow(dead_code)]
     context: Option<Value>,
     events: Vec<Value>,
@@ -591,7 +594,7 @@ impl Runs {
             let evictable = self.order.iter().position(|id| {
                 self.map
                     .get(id)
-                    .is_some_and(|record| record.lock().unwrap_or_else(|poison| poison.into_inner()).status.is_finished())
+                    .is_some_and(|record| record.lock().unwrap_or_else(std::sync::PoisonError::into_inner).status.is_finished())
             });
             match evictable {
                 Some(index) => {
@@ -837,6 +840,10 @@ fn sdk_event_envelope(event: &harwness_sdk::SdkEvent) -> Value {
 
 // ── Small HTTP helpers ───────────────────────────────────────────────────
 
+// The `Err` variant carries a fully-built `HttpResponse` (as `harw-web`'s
+// equivalent helper does) so callers return it unchanged; it outlives this
+// one call on the stack and is never cloned, so the size is not a real cost.
+#[allow(clippy::result_large_err)]
 async fn read_json_body(
     request: Request<Incoming>,
     max_bytes: usize,

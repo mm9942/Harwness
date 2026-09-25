@@ -198,10 +198,18 @@ async fn run_one_shot(
 }
 
 fn role_prefix(source: &EventSource) -> String {
-    if source.is_root() {
+    role_prefix_parts(source.is_root(), &source.role)
+}
+
+/// [`role_prefix`]'s actual logic, taking `EventSource`'s two relevant
+/// fields directly. `EventSource` is a `#[non_exhaustive]` struct with no
+/// public constructor, so this crate cannot build one to test against —
+/// this split keeps the logic itself testable from here regardless.
+fn role_prefix_parts(is_root: bool, role: &str) -> String {
+    if is_root {
         String::new()
     } else {
-        format!("[{}] ", source.role)
+        format!("[{role}] ")
     }
 }
 
@@ -212,6 +220,30 @@ fn eprintln_dim(line: &str) {
         eprintln!("\x1b[2m{line}\x1b[0m");
     } else {
         eprintln!("{line}");
+    }
+}
+
+/// [`ToolOutput`]'s JSON shape, factored out of [`event_json`] so it is
+/// testable on its own: `ToolOutput` (unlike [`EventSource`]) is an enum
+/// whose existing variants a downstream crate can still construct even
+/// though the enum itself is `#[non_exhaustive]`.
+fn tool_output_json(output: &ToolOutput) -> serde_json::Value {
+    match output {
+        ToolOutput::Success { value } => serde_json::json!({"success": true, "value": value}),
+        ToolOutput::Error { message } => serde_json::json!({"success": false, "message": message}),
+        // `ToolOutput` is `#[non_exhaustive]`.
+        _ => serde_json::json!({"success": false, "message": "unknown tool output"}),
+    }
+}
+
+/// [`FinishStatus`]'s JSON label, factored out for the same reason as
+/// [`tool_output_json`].
+fn finish_status_str(status: &FinishStatus) -> &'static str {
+    match status {
+        FinishStatus::Completed => "completed",
+        FinishStatus::Aborted => "aborted",
+        // `FinishStatus` is `#[non_exhaustive]`.
+        _ => "unknown",
     }
 }
 
@@ -272,12 +304,7 @@ fn event_json(event: &SdkEvent) -> serde_json::Value {
             "source": source_json(source),
             "call_id": call_id,
             "duration_ms": duration.as_millis() as u64,
-            "output": match output {
-                ToolOutput::Success { value } => serde_json::json!({"success": true, "value": value}),
-                ToolOutput::Error { message } => serde_json::json!({"success": false, "message": message}),
-                // `ToolOutput` is `#[non_exhaustive]`.
-                _ => serde_json::json!({"success": false, "message": "unknown tool output"}),
-            },
+            "output": tool_output_json(output),
         }),
         SdkEvent::ChildSpawned {
             source,
@@ -329,12 +356,7 @@ fn event_json(event: &SdkEvent) -> serde_json::Value {
         } => serde_json::json!({
             "type": "finished",
             "source": source_json(source),
-            "status": match status {
-                FinishStatus::Completed => "completed",
-                FinishStatus::Aborted => "aborted",
-                // `FinishStatus` is `#[non_exhaustive]`.
-                _ => "unknown",
-            },
+            "status": finish_status_str(status),
             "usage": usage.as_ref().map(usage_json),
         }),
         SdkEvent::Lagged { skipped } => serde_json::json!({
@@ -350,52 +372,49 @@ fn event_json(event: &SdkEvent) -> serde_json::Value {
 mod tests {
     use super::*;
 
+    // `EventSource` and `SdkEvent` are `#[non_exhaustive]` with no public
+    // constructor `harwness-sdk` exposes (a real one only ever comes from a
+    // live session), so `event_json`'s outer dispatch and `role_prefix`'s
+    // outer wrapper cannot be exercised with fabricated values from this
+    // crate. What they *do* besides destructure-and-delegate — the JSON
+    // shape of a tool result, a finish status, and the role-prefix rule
+    // itself — is fully testable through the plain-data helpers they
+    // delegate to, below.
+
     #[test]
-    fn test_event_json_lines_are_valid_json_and_tagged() {
-        let source = EventSource {
-            session_id: harwness_sdk::SessionId::new("s").expect("valid id"),
-            parent: None,
-            role: "assistant".to_owned(),
-        };
-        let events = [
-            SdkEvent::TextDelta {
-                source: source.clone(),
-                text: "hi".to_owned(),
+    fn test_tool_output_json_lines_are_valid_json_and_tagged() {
+        let outputs = [
+            ToolOutput::Success {
+                value: serde_json::json!({"lines": 3}),
             },
-            SdkEvent::ToolCall {
-                source: source.clone(),
-                call_id: "c1".to_owned(),
-                tool: "fs.read".to_owned(),
-                arguments: serde_json::json!({"path": "a"}),
-            },
-            SdkEvent::Finished {
-                source,
-                status: FinishStatus::Completed,
-                usage: None,
+            ToolOutput::Error {
+                message: "not found".to_owned(),
             },
         ];
-        for event in &events {
-            let value = event_json(event);
+        for output in &outputs {
+            let value = tool_output_json(output);
             let line = serde_json::to_string(&value).expect("serializable");
             let reparsed: serde_json::Value =
                 serde_json::from_str(&line).expect("valid json line");
-            assert!(reparsed["type"].is_string(), "{line}");
+            assert!(reparsed["success"].is_boolean(), "{line}");
         }
+        assert_eq!(
+            tool_output_json(&ToolOutput::Error {
+                message: "nope".to_owned()
+            })["message"],
+            "nope"
+        );
     }
 
     #[test]
-    fn test_role_prefix_is_empty_for_the_root() {
-        let root = EventSource {
-            session_id: harwness_sdk::SessionId::new("root").expect("valid id"),
-            parent: None,
-            role: "assistant".to_owned(),
-        };
-        assert_eq!(role_prefix(&root), "");
-        let child = EventSource {
-            session_id: harwness_sdk::SessionId::new("child").expect("valid id"),
-            parent: Some(harwness_sdk::SessionId::new("root").expect("valid id")),
-            role: "explorer".to_owned(),
-        };
-        assert_eq!(role_prefix(&child), "[explorer] ");
+    fn test_finish_status_str_names_every_status() {
+        assert_eq!(finish_status_str(&FinishStatus::Completed), "completed");
+        assert_eq!(finish_status_str(&FinishStatus::Aborted), "aborted");
+    }
+
+    #[test]
+    fn test_role_prefix_parts_is_empty_for_the_root() {
+        assert_eq!(role_prefix_parts(true, "assistant"), "");
+        assert_eq!(role_prefix_parts(false, "explorer"), "[explorer] ");
     }
 }
