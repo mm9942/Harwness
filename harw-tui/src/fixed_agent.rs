@@ -162,7 +162,9 @@ pub fn filter_command_specs(specs: Vec<CommandSpec>, opts: &FixedAgentOptions) -
 /// against a [`harw_agent_dsl::ir_v2::Models`] fixture without constructing
 /// a full [`AgentIr`] (whose other sections this function never reads).
 #[must_use]
-pub fn allowed_models_from_models(models: Option<&harw_agent_dsl::ir_v2::Models>) -> Vec<(String, String)> {
+pub fn allowed_models_from_models(
+    models: Option<&harw_agent_dsl::ir_v2::Models>,
+) -> Vec<(String, String)> {
     let mut out: Vec<(String, String)> = Vec::new();
     if let Some(models) = models {
         if let (Some(provider), Some(model)) = (models.provider.as_ref(), models.model.as_ref()) {
@@ -225,7 +227,10 @@ pub fn short_digest(digest: &harw_agent_artifact::ArtifactDigest) -> String {
 /// The title-bar text for a fixed-agent session: agent name and short
 /// digest.
 #[must_use]
-pub fn fixed_agent_title(opts: &FixedAgentOptions, digest: &harw_agent_artifact::ArtifactDigest) -> String {
+pub fn fixed_agent_title(
+    opts: &FixedAgentOptions,
+    digest: &harw_agent_artifact::ArtifactDigest,
+) -> String {
     format!("{} · {}", opts.title, short_digest(digest))
 }
 
@@ -287,7 +292,11 @@ pub fn run_fixed_agent(spec: RuntimeSpec, opts: FixedAgentOptions) -> Result<(),
         .model(ModelSource::Configured)
         .stores(stores)
         .build()
-        .map_err(|error| TuiError::Core(format!("could not assemble the fixed-agent runtime: {error}")))?;
+        .map_err(|error| {
+            TuiError::Core(format!(
+                "could not assemble the fixed-agent runtime: {error}"
+            ))
+        })?;
 
     let title = match digest.as_ref() {
         Some(digest) => fixed_agent_title(&opts, digest),
@@ -297,9 +306,7 @@ pub fn run_fixed_agent(spec: RuntimeSpec, opts: FixedAgentOptions) -> Result<(),
         .into_iter()
         .map(|name| name.to_owned())
         .collect();
-    let model_switch_allowlist = opts
-        .allow_model_switch
-        .then(|| opts.allowed_models.clone());
+    let model_switch_allowlist = opts.allow_model_switch.then(|| opts.allowed_models.clone());
     let restrictions = FixedAgentUiRestrictions {
         hidden_commands,
         title,
@@ -325,7 +332,7 @@ mod tests {
     use super::*;
     use crate::command::{CommandDomain, CommandScope, OutputSurface, PermissionTier};
     use harw_agent_artifact::ArtifactDigest;
-    use harw_agent_dsl::ir_v2::{Models, ModelRef};
+    use harw_agent_dsl::ir_v2::{ModelRef, Models};
 
     fn opts(allow_model_switch: bool, allowed_models: Vec<(&str, &str)>) -> FixedAgentOptions {
         FixedAgentOptions {

@@ -767,14 +767,20 @@ mod tests {
                 "expected an error, got {result:?}"
             )));
         };
-        assert_eq!(
-            message,
-            format!(
-                "Kein Git-Repository in {}; diff braucht ein Repo (Unterordner: Aquarium, \
-                 Holy-Cow-Alt)",
-                workspace.display()
-            )
+        // Liegt oberhalb des Test-Temp-Verzeichnisses ein `.git` (etwa ein
+        // verirrtes `/tmp/.git`), hängt `not_a_repo_message` zu Recht den
+        // Hinweis auf das unsichtbare Eltern-Repository an.
+        let mut expected = format!(
+            "Kein Git-Repository in {}; diff braucht ein Repo (Unterordner: Aquarium, \
+             Holy-Cow-Alt)",
+            workspace.display()
         );
+        if workspace.ancestors().skip(1).any(super::has_git_entry) {
+            expected.push_str(
+                "; ein Repository oberhalb des Arbeitsbereichs ist in der Sandbox nicht sichtbar",
+            );
+        }
+        assert_eq!(message, expected);
         assert!(!message.contains("129"));
         Ok(())
     }

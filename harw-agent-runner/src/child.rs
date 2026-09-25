@@ -26,21 +26,24 @@
 //! exercised against a real (but offline) `harwness_sdk::Session` without a
 //! child process, a parent, or a bundle on disk — see the tests below.
 
+#[cfg(test)]
 use std::collections::BTreeSet;
 use std::process::ExitCode;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use harw_agent_dsl::ir_v2::AgentIr;
+#[cfg(test)]
+use harwness_sdk::Harwness;
 use harwness_sdk::{
-    ApprovalHandler, ApprovalRequest, BoxFuture, Decision, FinishStatus, Harwness, SdkEvent,
-    TurnReport, TurnStatus,
+    ApprovalHandler, ApprovalRequest, BoxFuture, Decision, FinishStatus, SdkEvent, TurnReport,
+    TurnStatus,
 };
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::sync::{mpsc, oneshot};
 
 use crate::child_protocol::{
-    ChildResultStatus, ChildRights, ChildToParent, ChildUsage, ParentToChild, PROTOCOL_VERSION,
+    ChildResultStatus, ChildRights, ChildToParent, ChildUsage, PROTOCOL_VERSION, ParentToChild,
     decode_line, encode_line,
 };
 use crate::context::RunnerContext;
@@ -69,7 +72,7 @@ pub fn run_child(ctx: RunnerContext, agent_id: &str) -> ExitCode {
     runtime.block_on(run_child_async(ctx, agent_id))
 }
 
-async fn run_child_async(ctx: RunnerContext, agent_id: String) -> ExitCode {
+async fn run_child_async(mut ctx: RunnerContext, agent_id: String) -> ExitCode {
     let Some(child_ir) = ctx.agent.agent_ir(&agent_id).cloned() else {
         eprintln!("harw-agent-runner: unknown child agent id '{agent_id}' in this bundle");
         return ExitCode::FAILURE;
@@ -94,24 +97,57 @@ async fn run_child_async(ctx: RunnerContext, agent_id: String) -> ExitCode {
     let mut stdin = BufReader::new(tokio::io::stdin()).lines();
     let manifest_rights = manifest_rights_of(&child_ir);
     let mut rights = manifest_rights.clone();
+    let mut received_rights = false;
+    let mut budget = harw_agent_dsl::ir_v2::Budget::default();
+    let mut mode = harwness_sdk::Mode::Plan;
 
     // The first `Task` starts the run; `Rights`/`Budget`/`Mode` may arrive
     // before it and are applied once the session exists. `Cancel` or a
     // closed stdin before any `Task` ends this process cleanly — there is
     // nothing to report a result for.
-    let (task, context, _continue_from) = loop {
+    let (task, context, continue_from) = loop {
         match stdin.next_line().await {
             Ok(Some(line)) => match decode_line::<ParentToChild>(&line) {
                 Ok(ParentToChild::Task {
                     task,
                     context,
                     continue_from,
-                }) => break (task, context, continue_from),
-                Ok(ParentToChild::Rights { rights: from_parent }) => {
-                    rights = narrow_rights(&manifest_rights, &from_parent);
+                }) if received_rights => break (task, context, continue_from),
+                Ok(ParentToChild::Task { .. }) => {
+                    let _ = outbound_tx.send(ChildToParent::Error {
+                        message: "Rights must precede Task".to_owned(),
+                    });
+                    drop(outbound_tx);
+                    let _ = writer.await;
+                    return ExitCode::FAILURE;
+                }
+                Ok(ParentToChild::Rights {
+                    rights: from_parent,
+                }) => {
+                    rights = narrow_rights(&rights, &from_parent);
+                    received_rights = true;
                 }
                 Ok(ParentToChild::Cancel) => return ExitCode::SUCCESS,
-                Ok(_) => { /* Message/Budget/Mode before a Task: nothing to apply yet. */ }
+                Ok(ParentToChild::Budget {
+                    max_tokens,
+                    max_tool_calls,
+                    max_wall_time_ms,
+                }) => {
+                    budget.max_tokens = min_limit(budget.max_tokens, max_tokens);
+                    budget.max_tool_calls = min_limit(
+                        budget.max_tool_calls,
+                        max_tool_calls.map(|v| u32::try_from(v).unwrap_or(u32::MAX)),
+                    );
+                    budget.max_wall_secs =
+                        min_limit(budget.max_wall_secs, max_wall_time_ms.map(|v| v / 1_000));
+                }
+                Ok(ParentToChild::Mode { mode: next }) => {
+                    mode = match next {
+                        crate::child_protocol::ChildMode::Plan => harwness_sdk::Mode::Plan,
+                        crate::child_protocol::ChildMode::Live => harwness_sdk::Mode::Work,
+                    };
+                }
+                Ok(_) => {}
                 Err(error) => {
                     let _ = outbound_tx.send(ChildToParent::Error {
                         message: error.to_string(),
@@ -125,21 +161,47 @@ async fn run_child_async(ctx: RunnerContext, agent_id: String) -> ExitCode {
             }
         }
     };
-    let _ = &rights; // Applied to the built session below once that seam exists (see module docs).
-
+    if continue_from.is_some() {
+        let _ = outbound_tx.send(ChildToParent::Error {
+            message: "job child continuation is not supported".to_owned(),
+        });
+        drop(outbound_tx);
+        let _ = writer.await;
+        return ExitCode::FAILURE;
+    }
+    let selected = match ctx.agent.for_agent(&agent_id) {
+        Ok(agent) => agent,
+        Err(error) => {
+            eprintln!("harw-agent-runner: cannot select child: {error}");
+            return ExitCode::FAILURE;
+        }
+    };
+    ctx.agent = Arc::new(
+        selected.with_rights(harw_runtime::embedded::EffectiveRights {
+            tools: rights.tools,
+            network_hosts: rights.network_hosts,
+            network_open: rights.network_open,
+            write: rights.write,
+            shell: rights.shell,
+            host: rights.host,
+            full_access: rights.full_access,
+            budget: Some(budget),
+        }),
+    );
     let approvals = Arc::new(RelayApprovals::new(outbound_tx.clone()));
-    let harwness = match Harwness::builder()
-        .embedded(Arc::clone(&ctx.agent))
-        .approval_handler_arc(approvals.clone())
-        .build()
-    {
+    let harwness = match ctx.builder().and_then(|builder| {
+        builder
+            .mode(mode)
+            .approval_handler_arc(approvals.clone())
+            .build()
+            .map_err(crate::error::RunnerError::from)
+    }) {
         Ok(harwness) => harwness,
         Err(error) => {
             let _ = outbound_tx.send(ChildToParent::Error {
                 message: format!("failed to build the child session: {error}"),
             });
-            drop(outbound_tx);
-            let _ = writer.await;
+            writer.abort();
             return ExitCode::FAILURE;
         }
     };
@@ -149,8 +211,7 @@ async fn run_child_async(ctx: RunnerContext, agent_id: String) -> ExitCode {
             let _ = outbound_tx.send(ChildToParent::Error {
                 message: format!("failed to start the child session: {error}"),
             });
-            drop(outbound_tx);
-            let _ = writer.await;
+            writer.abort();
             return ExitCode::FAILURE;
         }
     };
@@ -180,11 +241,20 @@ async fn run_child_async(ctx: RunnerContext, agent_id: String) -> ExitCode {
     let cancel_handle = session.cancel_handle();
     // Reuses the same `stdin` the handshake loop read from — a second,
     // independent `BufReader` over the same fd would race it for bytes.
-    let reader = tokio::spawn(run_reader(stdin, approvals, cancel_handle));
+    let reader = tokio::spawn(run_reader(
+        stdin,
+        approvals,
+        cancel_handle,
+        outbound_tx.clone(),
+    ));
 
     let result = session.send(turn_text).await;
     event_forwarder.abort();
     reader.abort();
+    let _ = event_forwarder.await;
+    let _ = reader.await;
+    drop(session);
+    drop(harwness);
 
     let frame = match result {
         Ok(report) => translate_turn_report(&report),
@@ -206,6 +276,7 @@ async fn run_reader(
     mut stdin: tokio::io::Lines<BufReader<tokio::io::Stdin>>,
     approvals: Arc<RelayApprovals>,
     cancel: harwness_sdk::CancelHandle,
+    outbound: mpsc::UnboundedSender<ChildToParent>,
 ) {
     loop {
         match stdin.next_line().await {
@@ -217,9 +288,19 @@ async fn run_reader(
                     cancel.cancel();
                     break;
                 }
-                _ => {}
+                Ok(_) | Err(_) => {
+                    let _ = outbound.send(ChildToParent::Error {
+                        message: "unsupported or malformed mid-turn control frame; child cancelled"
+                            .to_owned(),
+                    });
+                    cancel.cancel();
+                    break;
+                }
             },
-            _ => break,
+            _ => {
+                cancel.cancel();
+                break;
+            }
         }
     }
 }
@@ -244,34 +325,25 @@ async fn run_writer(
     }
 }
 
-/// A child's manifest rights derived from its own `AgentIr`.
-///
-/// # Description
-/// Best-effort mapping from the tool surface/authority ceiling this crate
-/// can already see (`harw_agent_dsl::ir_v2`); the richer
-/// `harw_runtime::embedded::EffectiveRights::from_manifest` (wave 3, agent 3)
-/// should replace this once it exists — see the module docs' note on the
-/// exact seam.
+fn min_limit<T: Ord>(left: Option<T>, right: Option<T>) -> Option<T> {
+    match (left, right) {
+        (Some(a), Some(b)) => Some(a.min(b)),
+        (a, b) => a.or(b),
+    }
+}
+
+/// Derives protocol rights from the typed permissions manifest.
 fn manifest_rights_of(ir: &AgentIr) -> ChildRights {
-    // `Authority::capabilities` is a flat label list (see
-    // `harw_agent_dsl::authority::AuthorityCeiling`), not the boolean shape
-    // `ChildRights` wants — best-effort prefix match until wave 3 lands a
-    // proper `EffectiveRights::from_manifest`-style conversion (see module
-    // docs).
-    let has = |label: &str| {
-        ir.authority
-            .capabilities
-            .iter()
-            .any(|cap| cap == label || cap.starts_with(&format!("{label}.")))
-    };
+    let rights = harw_runtime::embedded::EffectiveRights::from_manifest(&ir.permissions);
     ChildRights {
-        tools: ir.tools.admitted.iter().cloned().collect(),
-        network_hosts: BTreeSet::new(),
-        network_open: has("network"),
-        write: has("filesystem.write") || has("write"),
-        shell: has("shell"),
-        host: has("host"),
-        full_access: has("full_access") || has("full-access"),
+        tools: rights.tools,
+        network_hosts: rights.network_hosts,
+        network_open: rights.network_open,
+        write: rights.write,
+        shell: rights.shell,
+        host: rights.host,
+        // Automatic approval is a parent choice, not a tool permission.
+        full_access: true,
     }
 }
 
@@ -405,6 +477,10 @@ pub(crate) fn translate_event(event: &SdkEvent) -> serde_json::Value {
         SdkEvent::Lagged { skipped } => serde_json::json!({
             "kind": "lagged", "skipped": skipped,
         }),
+        // `SdkEvent` is `#[non_exhaustive]`: a later SDK version's new
+        // variant still becomes a valid (if uninformative) JSON frame,
+        // matching `iface::cli`/`iface::http`'s equivalent translators.
+        _ => serde_json::json!({"kind": "unknown"}),
     }
 }
 
@@ -417,6 +493,10 @@ pub(crate) fn translate_turn_report(report: &TurnReport) -> ChildToParent {
         TurnStatus::Truncated | TurnStatus::Refused { .. } | TurnStatus::Failed { .. } => {
             ChildResultStatus::Failed
         }
+        // `TurnStatus` is `#[non_exhaustive]`; treat anything future as the
+        // same conservative outcome as the other named failure variants
+        // above, consistent with `iface::mcp`'s equivalent match.
+        _ => ChildResultStatus::Failed,
     };
     ChildToParent::Result {
         status,
@@ -507,7 +587,6 @@ fn summarize_arguments(arguments: &serde_json::Value) -> String {
 mod tests {
     use super::*;
     use harwness_sdk::Session;
-    use harwness_sdk::prelude::*;
     use std::path::{Path, PathBuf};
 
     struct Fixture {

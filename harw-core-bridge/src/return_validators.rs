@@ -120,13 +120,7 @@ fn strip_fence(text: &str) -> &str {
         return text;
     };
     match inner.split_once('\n') {
-        Some((info, body))
-            if !info
-                .trim_start()
-                .starts_with(|c: char| c == '{' || c == '[') =>
-        {
-            body.trim()
-        }
+        Some((info, body)) if !info.trim_start().starts_with(['{', '[']) => body.trim(),
         _ => inner.trim(),
     }
 }

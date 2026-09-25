@@ -1107,7 +1107,11 @@ async fn cancelled(cancel: Option<&CancelToken>) {
 /// `sender` — bis die Pipe schließt (Prozessende) oder ein Lesefehler
 /// auftritt. Ist der Empfänger bereits verworfen, wird trotzdem bis zum Ende
 /// weiter mitgeschrieben (nur `STDOUT_LOG` zählt dann noch).
-async fn tee_stdout(stdout: ChildStdout, mut stdout_log: File, sender: mpsc::UnboundedSender<String>) {
+async fn tee_stdout(
+    stdout: ChildStdout,
+    mut stdout_log: File,
+    sender: mpsc::UnboundedSender<String>,
+) {
     let mut lines = BufReader::new(stdout).lines();
     loop {
         match lines.next_line().await {

@@ -196,7 +196,7 @@ harw agent build evidence-critic --interface cli,mcp -o ./ec
 ./ec --manifest
 ```
 
-`harw agent inspect`, `graph`, `explain`, `diff`, `test`, `fmt`, `new`, `versions`/`use` and `doctor` round out the CLI; `make install` also installs `harw-agent-runner` so builds work with no further setup. Flags at runtime can only narrow the baked-in rights, and a modified binary refuses to start. The runner's own interfaces (`cli`, `repl`, `mcp` over stdio, `http`, and a mini `tui`) run a compiled agent end to end; MCP's Streamable HTTP transport and a compiled binary's automatic job-backed child execution are still being wired — see the [agent compiler guide](docs/guides/agent-compiler.md) for current status and full detail.
+`harw agent inspect`, `graph`, `explain`, `diff`, `test`, `fmt`, `new`, `versions`/`use` and `doctor` round out the CLI; `make install` also installs `harw-agent-runner` so builds work with no further setup. Flags at runtime can only narrow the baked-in rights, and a modified binary refuses to start. The runner's own interfaces (`cli`, `repl`, `mcp` over stdio and Streamable HTTP via `--listen`, `http`, and a mini `tui`) run a compiled agent end to end; a compiled root agent runs its bundled children as separate runner processes automatically when `[binary].child_execution = "job"` (the default). See the [agent compiler guide](docs/guides/agent-compiler.md) for full detail.
 
 ## Context and model interaction
 

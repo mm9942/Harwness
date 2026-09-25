@@ -522,7 +522,10 @@ async fn test_start_piped_echoes_stdin_tees_stdout_and_detects_exit() -> TestRes
     assert_eq!(status.meta.state, JobState::Succeeded);
     assert_eq!(status.meta.exit_code, Some(0));
 
-    let dir = env.manager.log_dir(&id, Caller::Agent("agent-a")).map_err(ctx("log dir"))?;
+    let dir = env
+        .manager
+        .log_dir(&id, Caller::Agent("agent-a"))
+        .map_err(ctx("log dir"))?;
     assert_eq!(read_all(&dir.join(STDOUT_LOG))?, vec!["hello".to_owned()]);
     Ok(())
 }

@@ -720,9 +720,8 @@ mod tests {
         )];
         let sources = LowerSources::new(&files);
         let target = DefinitionId::parse(target).map_err(ctx("target id"))?;
-        compile_agent(&target, &sources, OffsetDateTime::UNIX_EPOCH).map_err(|diagnostics| {
-            TestError::Unexpected(format!("compile: {diagnostics}"))
-        })
+        compile_agent(&target, &sources, OffsetDateTime::UNIX_EPOCH)
+            .map_err(|diagnostics| TestError::Unexpected(format!("compile: {diagnostics}")))
     }
 
     fn embedded_agent(root_def: &str, root_id: &str) -> TestResult<EmbeddedAgent> {
@@ -735,7 +734,8 @@ mod tests {
             children: Vec::new(),
         };
         let artifact = BundleBuilder::new(root).build().map_err(ctx("build"))?;
-        let bundle = harw_agent_artifact::Bundle::from_artifact(&artifact).map_err(ctx("verify"))?;
+        let bundle =
+            harw_agent_artifact::Bundle::from_artifact(&artifact).map_err(ctx("verify"))?;
         EmbeddedAgent::from_bundle(bundle, &artifact).map_err(TestError::Runtime)
     }
 
@@ -851,10 +851,7 @@ required_env = ["EMBEDDED_TEST_MISSING_VAR"]
                 "expected a config error naming the missing variable, got {result:?}"
             )));
         };
-        assert!(
-            detail.contains("EMBEDDED_TEST_MISSING_VAR"),
-            "{detail}"
-        );
+        assert!(detail.contains("EMBEDDED_TEST_MISSING_VAR"), "{detail}");
         Ok(())
     }
 }

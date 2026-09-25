@@ -335,6 +335,17 @@ impl std::fmt::Debug for ExtensionRegistryBuilder {
 }
 
 impl ExtensionRegistryBuilder {
+    /// Wraps all registered tool providers before the registry is finalized.
+    /// Used to apply an immutable manifest ceiling after contributors run.
+    #[must_use]
+    pub fn map_tool_providers(
+        mut self,
+        mut map: impl FnMut(Arc<dyn ToolProvider>) -> Arc<dyn ToolProvider>,
+    ) -> Self {
+        self.tool_providers = self.tool_providers.into_iter().map(&mut map).collect();
+        self
+    }
+
     pub fn tool_provider(mut self, p: Arc<dyn ToolProvider>) -> Self {
         self.tool_providers.push(p);
         self

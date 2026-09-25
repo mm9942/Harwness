@@ -21,8 +21,11 @@
 use std::process::ExitCode;
 use std::sync::Arc;
 
-use harw_runtime::{EntryKind, RuntimeSpec};
-use harw_tui::fixed_agent::{FixedAgentOptions, allowed_models_from_ir, fixed_agent_title, run_fixed_agent};
+use harw_agent_dsl::ir_v2::ChildExecution;
+use harw_runtime::{ChildBackendHandle, EntryKind, RuntimeSpec};
+use harw_tui::fixed_agent::{
+    FixedAgentOptions, allowed_models_from_ir, fixed_agent_title, run_fixed_agent,
+};
 use harw_types::{IngressSurface, PermissionTier, Principal, PrincipalKind};
 
 use crate::context::RunnerContext;
@@ -109,6 +112,19 @@ pub fn run(ctx: RunnerContext) -> ExitCode {
             return ExitCode::from(EXIT_SOFTWARE);
         }
     };
+    // Wie `RunnerContext::builder`: `[binary].child_execution = "job"` (der
+    // Standard) lässt jedes Kind als eigenen Job-Prozess laufen.
+    let child_backend = if root_ir.binary.child_execution == ChildExecution::Job {
+        match ctx.job_child_backend() {
+            Ok(backend) => Some(ChildBackendHandle(backend)),
+            Err(error) => {
+                eprintln!("harw-agent-runner: tui: {error}");
+                return ExitCode::from(EXIT_SOFTWARE);
+            }
+        }
+    } else {
+        None
+    };
     let spec = RuntimeSpec {
         entry: EntryKind::CompiledAgent,
         home,
@@ -120,11 +136,7 @@ pub fn run(ctx: RunnerContext) -> ExitCode {
         approval_override: None,
         model_override: None,
         embedded: Some(Arc::clone(&ctx.agent)),
-        // #22 Welle 3C: die Mini-TUI baut ihre Montage hier direkt statt über
-        // `RunnerContext::harwness()` — dieselbe Root-Montage bekommt daher
-        // kein `ChildBackend` (kein Kind-Lauf für einen kompilierten Agenten
-        // in dieser Oberfläche, siehe `crate::context`).
-        child_backend: None,
+        child_backend,
     };
 
     match run_fixed_agent(spec, opts) {
@@ -151,7 +163,12 @@ fn local_principal() -> Principal {
         .ok()
         .filter(|name| !name.trim().is_empty())
         .unwrap_or_else(|| "local".to_owned());
-    Principal::trusted_ingress(PrincipalKind::Human, id, IngressSurface::Tui, PermissionTier::Operator)
+    Principal::trusted_ingress(
+        PrincipalKind::Human,
+        id,
+        IngressSurface::Tui,
+        PermissionTier::Operator,
+    )
 }
 
 #[cfg(test)]

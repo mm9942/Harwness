@@ -8,16 +8,8 @@
 //! result and talk to it as a real process.
 //!
 //! # Offline-only scope
-//! No test here ever lets the compiled agent talk to a model provider.
-//! `RunnerContext::harwness`/`iface::approval::build_harwness` (what every
-//! interface actually builds its session on) never call
-//! `HarwnessBuilder::offline_echo`, and no env var switches the runner
-//! itself to the built-in echo — that knob only exists on the SDK builder,
-//! which this binary does not expose on its command line. So every test
-//! that would have to run a turn (an actual model round trip) is
-//! `#[ignore]`d with that reason instead of guessing at network access.
-//! Everything that only needs the embedded artifact, the manifest, or the
-//! protocol layer above a session runs for real.
+//! Every process uses `HARW_OFFLINE_ECHO` for deterministic model replies.
+//! No provider credentials or network model calls are required.
 //!
 //! # Isolation
 //! Each spawned child gets its own `HARW_HOME` (a fresh temp directory), so
@@ -73,7 +65,9 @@ fn worker_definition(name: &str) -> String {
 
 /// An isolated `harw` home with `definitions` under `agents/<name>/`, mirroring
 /// `harw-agent-compiler/tests/compile.rs`'s `home_with`.
-fn home_with(definitions: &[(&str, &str)]) -> Result<(tempfile::TempDir, CompilerEnv), Box<dyn std::error::Error>> {
+fn home_with(
+    definitions: &[(&str, &str)],
+) -> Result<(tempfile::TempDir, CompilerEnv), Box<dyn std::error::Error>> {
     let root = tempfile::tempdir()?;
     let home = root.path().join("home");
     for (name, text) in definitions {
@@ -197,6 +191,7 @@ fn run_with_timeout(
         Command::new(exe)
             .args(args)
             .env("HARW_HOME", home)
+            .env("HARW_OFFLINE_ECHO", "echo: hello there")
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -248,7 +243,8 @@ fn run_with_timeout(
 /// background thread reads response lines into a channel so `recv` can be
 /// bounded by a timeout instead of blocking on `BufRead::read_line` forever.
 struct McpClient {
-    guard: ChildGuard,
+    // Held only so the child is killed and reaped when the client drops.
+    _guard: ChildGuard,
     stdin: std::process::ChildStdin,
     lines: mpsc::Receiver<String>,
 }
@@ -259,6 +255,7 @@ impl McpClient {
             Command::new(exe)
                 .args(["--interface", "mcp"])
                 .env("HARW_HOME", home)
+                .env("HARW_OFFLINE_ECHO", "echo: hello there")
                 .stdin(Stdio::piped())
                 .stdout(Stdio::piped())
                 .stderr(Stdio::null())
@@ -283,7 +280,11 @@ impl McpClient {
                 }
             }
         });
-        Ok(Self { guard, stdin, lines: rx })
+        Ok(Self {
+            _guard: guard,
+            stdin,
+            lines: rx,
+        })
     }
 
     fn send(&mut self, request: &Value) -> Result<(), Box<dyn std::error::Error>> {
@@ -375,6 +376,20 @@ fn read_http_response(
     Ok((code, body))
 }
 
+/// Case-insensitively finds `name`'s value among `response`'s headers (the
+/// part before the first `\r\n\r\n`), trimmed of surrounding whitespace.
+/// Used to carry the `Mcp-Session-Id` the server issues on `initialize`
+/// (Streamable HTTP transport spec) into this test's later requests, which
+/// each open a fresh `TcpStream` and so share no connection state of their
+/// own to fall back on.
+fn header_value<'a>(response: &'a str, name: &str) -> Option<&'a str> {
+    let head = response.split("\r\n\r\n").next().unwrap_or(response);
+    head.lines().find_map(|line| {
+        let (key, value) = line.split_once(':')?;
+        key.trim().eq_ignore_ascii_case(name).then(|| value.trim())
+    })
+}
+
 /// A free `127.0.0.1` port: bind a listener to port `0`, read back what the
 /// OS assigned, then drop it — the small race until the next bind is the
 /// usual, accepted cost of this pattern in tests.
@@ -448,10 +463,7 @@ fn test_manifest_json_reports_the_compiled_permissions() -> TestResult {
     let tools = permissions["tools"]
         .as_array()
         .ok_or("permissions.tools must be an array")?;
-    assert!(
-        tools.iter().any(|tool| tool == "fs.read"),
-        "{permissions}"
-    );
+    assert!(tools.iter().any(|tool| tool == "fs.read"), "{permissions}");
     assert_eq!(permissions["shell"], Value::Bool(false), "{permissions}");
     assert_eq!(permissions["host"], Value::Bool(false), "{permissions}");
     Ok(())
@@ -491,12 +503,7 @@ fn test_requesting_an_interface_the_manifest_does_not_allow_reports_a_clear_erro
     // is compiled into this runner build (it is a default feature) but not
     // one this agent's manifest allows, so this must fail with
     // `RunnerError::UnknownInterface`, not `NotCompiled`.
-    let finished = run_with_timeout(
-        &exe,
-        &["--interface", "repl"],
-        home.path(),
-        SHORT_TIMEOUT,
-    )?;
+    let finished = run_with_timeout(&exe, &["--interface", "repl"], home.path(), SHORT_TIMEOUT)?;
     assert_eq!(
         finished.code,
         Some(i32::from(EXIT_USAGE)),
@@ -504,7 +511,11 @@ fn test_requesting_an_interface_the_manifest_does_not_allow_reports_a_clear_erro
         finished.stdout,
         finished.stderr
     );
-    assert!(finished.stderr.contains("is not available"), "{}", finished.stderr);
+    assert!(
+        finished.stderr.contains("is not available"),
+        "{}",
+        finished.stderr
+    );
     assert!(finished.stderr.contains("cli"), "{}", finished.stderr);
     Ok(())
 }
@@ -575,6 +586,7 @@ fn test_http_healthz_and_manifest() -> TestResult {
         Command::new(&exe)
             .args(["--interface", "http", "--listen", addr.as_str()])
             .env("HARW_HOME", home.path())
+            .env("HARW_OFFLINE_ECHO", "echo: hello there")
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::piped())
@@ -625,10 +637,6 @@ fn test_identical_input_builds_byte_identical_artifacts() -> TestResult {
 // ---------------------------------------------------------------------------
 
 #[test]
-#[ignore = "needs a real (or offline-echo) model provider: iface::cli's \
-            build_harwness never calls HarwnessBuilder::offline_echo, so a \
-            one-shot prompt here would try the manifest's configured \
-            provider over the network"]
 fn test_cli_one_shot_answers_with_echo() -> TestResult {
     let (_root, artifact) = compile_worker("clione")?;
     let out_dir = tempfile::tempdir()?;
@@ -642,9 +650,6 @@ fn test_cli_one_shot_answers_with_echo() -> TestResult {
 }
 
 #[test]
-#[ignore = "needs a real (or offline-echo) model provider: HarwnessPromptRunner \
-            builds its Harwness the same un-echoed way as iface::cli, so \
-            tools/call run would try to reach a network provider"]
 fn test_mcp_tools_call_run_answers_with_echo() -> TestResult {
     let (_root, artifact) = compile_worker("mcprun")?;
     let out_dir = tempfile::tempdir()?;
@@ -668,9 +673,6 @@ fn test_mcp_tools_call_run_answers_with_echo() -> TestResult {
 }
 
 #[test]
-#[ignore = "needs a real (or offline-echo) model provider: iface::http builds \
-            its Harwness (the AppState backend) the same un-echoed way, so \
-            POST /run would try to reach a network provider"]
 fn test_http_post_run_answers_with_echo() -> TestResult {
     let (_root, artifact) = compile_worker("httprun")?;
     let out_dir = tempfile::tempdir()?;
@@ -683,6 +685,7 @@ fn test_http_post_run_answers_with_echo() -> TestResult {
         Command::new(&exe)
             .args(["--interface", "http", "--listen", addr.as_str()])
             .env("HARW_HOME", home.path())
+            .env("HARW_OFFLINE_ECHO", "echo: hello there")
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::piped())
@@ -713,12 +716,163 @@ fn test_http_post_run_answers_with_echo() -> TestResult {
     let mut response = Vec::new();
     stream.read_to_end(&mut response)?;
     let text = String::from_utf8_lossy(&response).into_owned();
-    let response_body = text
-        .splitn(2, "\r\n\r\n")
-        .nth(1)
-        .ok_or("empty HTTP response")?;
+    let (_, response_body) = text.split_once("\r\n\r\n").ok_or("empty HTTP response")?;
     let payload: Value = serde_json::from_str(response_body)?;
     let text = payload["text"].as_str().ok_or("/run must return text")?;
     assert!(text.contains("echo:"), "{text}");
+    Ok(())
+}
+
+/// Run the actual bundled children through the same JobManager backend a
+/// compiled orchestrator uses, with two concurrent, isolated OS processes.
+#[tokio::test]
+async fn compiled_family_runs_two_workers_as_jobs() -> TestResult {
+    use harw_agent_runner::job_child_backend::{ChildProcessSpawner, JobChildBackend};
+    use harw_core::child_backend::{ChildBackend, ChildIo, ChildRunSpec, ChildRunStatus};
+    use std::sync::Arc;
+
+    struct Spawner {
+        exe: PathBuf,
+        home: PathBuf,
+    }
+    impl ChildProcessSpawner for Spawner {
+        fn command_for(&self, id: &str) -> tokio::process::Command {
+            let mut command = tokio::process::Command::new(&self.exe);
+            command
+                .args(["--child", id, "--child-protocol", "stdio"])
+                .env("HARW_HOME", &self.home)
+                .env("HARW_OFFLINE_ECHO", "worker completed")
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped());
+            #[cfg(unix)]
+            command.process_group(0);
+            command
+        }
+    }
+    struct Io;
+    impl ChildIo for Io {
+        fn on_event(&self, _: Value) {}
+        fn on_question<'a>(
+            &'a self,
+            _: String,
+            _: String,
+        ) -> harw_core::child_backend::ChildAnswerFuture<'a> {
+            Box::pin(async { "answer".to_owned() })
+        }
+        fn on_approval_request<'a>(
+            &'a self,
+            _: String,
+            _: String,
+            _: String,
+        ) -> harw_core::child_backend::ChildAnswerFuture<'a> {
+            Box::pin(async { "deny".to_owned() })
+        }
+    }
+    let lead = "schema = \"harwness.agent/v1\"\nid = \"acme.agent.lead@1\"\nversion = \"1.0.0\"\nextends = { id = \"harwness.agent.child-orchestrator-base@1\" }\nrole = \"child-orchestrator\"\nspecialization = \"lead\"\n[delegation]\ntargets = [\"reader\", \"writer\"]\n";
+    let reader = worker_definition("reader");
+    let writer = worker_definition("writer");
+    let (_root, env) = home_with(&[("lead", lead), ("reader", &reader), ("writer", &writer)])?;
+    let compiled = compile(&env, "lead")?;
+    let out = tempfile::tempdir()?;
+    let exe = build_agent_binary(out.path(), "lead", &compiled.artifact)?;
+    let home = tempfile::tempdir()?;
+    let manager = harw_tool_job::JobManager::new(
+        harw_tool_job::JobManagerConfig::new(home.path()),
+        Arc::new(harw_tool_job::NoopNotifier),
+    )?;
+    let backend = JobChildBackend::with_spawner_and_job_manager(
+        Spawner {
+            exe,
+            home: home.path().to_path_buf(),
+        },
+        manager.clone(),
+    );
+    let parent = harw_types::SessionId::new();
+    let spec = |name: &str| ChildRunSpec {
+        child: harw_types::SessionId::new(),
+        parent: parent.clone(),
+        agent_id: format!("acme.agent.{name}@1"),
+        task: "work".to_owned(),
+        context: None,
+        continue_from: None,
+        rights: Default::default(),
+        budget: None,
+        live_mode: false,
+        cancel: harw_types::cancel::CancelToken::new(),
+    };
+    let results = tokio::time::timeout(SHORT_TIMEOUT, async {
+        tokio::join!(
+            backend.run(spec("reader"), &Io),
+            backend.run(spec("writer"), &Io)
+        )
+    })
+    .await?;
+    for result in [results.0, results.1] {
+        assert_eq!(result.status, ChildRunStatus::Completed, "{result:?}");
+        assert_eq!(result.text.as_deref(), Some("worker completed"));
+    }
+    assert_eq!(manager.list(harw_tool_job::Caller::Operator).len(), 2);
+    manager.stop_all().await;
+    Ok(())
+}
+
+#[test]
+fn mcp_http_initialize_and_run_offline() -> TestResult {
+    let (_root, artifact) = compile_worker("mcphttp")?;
+    let out = tempfile::tempdir()?;
+    let exe = build_agent_binary(out.path(), "mcphttp", &artifact)?;
+    let home = tempfile::tempdir()?;
+    let addr = format!("127.0.0.1:{}", free_loopback_port()?);
+    let _child = ChildGuard(
+        Command::new(exe)
+            .args(["--interface", "mcp", "--listen", &addr])
+            .env("HARW_HOME", home.path())
+            .env("HARW_OFFLINE_ECHO", "echo: mcp http")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .spawn()?,
+    );
+    assert_eq!(http_get(&addr, "/healthz")?.0, 200);
+    // Per the MCP Streamable HTTP spec, `initialize` carries no
+    // `Mcp-Session-Id` (the server issues one in its response); every
+    // request after that must carry the id the server issued. Each
+    // iteration below opens its own fresh `TcpStream` (no connection to
+    // inherit state from), so the id is captured off `initialize`'s
+    // response headers and forwarded by hand on the requests that follow.
+    let mut session_id: Option<String> = None;
+    for (request, expected) in [
+        (
+            json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":MCP_PROTOCOL_VERSION,"capabilities":{},"clientInfo":{"name":"test","version":"1"}}}),
+            "protocolVersion",
+        ),
+        (
+            json!({"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"run","arguments":{"prompt":"hello"}}}),
+            "echo: mcp http",
+        ),
+    ] {
+        let body = request.to_string();
+        let mut stream = TcpStream::connect(&addr)?;
+        stream.set_read_timeout(Some(IO_TIMEOUT))?;
+        let session_header = session_id
+            .as_ref()
+            .map(|id| format!("Mcp-Session-Id: {id}\r\n"))
+            .unwrap_or_default();
+        write!(
+            stream,
+            "POST /mcp HTTP/1.1\r\nHost: {addr}\r\nContent-Type: application/json\r\nAccept: application/json, text/event-stream\r\nMCP-Protocol-Version: {MCP_PROTOCOL_VERSION}\r\n{session_header}Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        )?;
+        let mut response = String::new();
+        stream.read_to_string(&mut response)?;
+        assert!(response.starts_with("HTTP/1.1 200"), "{response}");
+        assert!(response.contains(expected), "{response}");
+        if session_id.is_none()
+            && let Some(id) = header_value(&response, "mcp-session-id")
+        {
+            session_id = Some(id.to_owned());
+        }
+    }
     Ok(())
 }

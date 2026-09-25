@@ -74,7 +74,7 @@ pub struct Compiler {
     skills: SkillIndex,
     ceilings: BuiltinCeilings,
     options: CompilerOptions,
-    children: Mutex<BTreeMap<String, Result<ResolvedChild, String>>>,
+    children: Mutex<BTreeMap<Vec<String>, Result<ResolvedChild, String>>>,
 }
 
 impl std::fmt::Debug for Compiler {
@@ -349,11 +349,15 @@ impl ChildResolver for Compiler {
         _depth: u32,
         stack: &[String],
     ) -> Result<ResolvedChild, String> {
+        // Depths and cycle diagnostics depend on the complete ancestry, not
+        // just the definition name. Never reuse a result from another branch.
+        let mut key = stack.to_vec();
+        key.push(name.to_owned());
         if let Some(cached) = self
             .children
             .lock()
             .ok()
-            .and_then(|cache| cache.get(name).cloned())
+            .and_then(|cache| cache.get(&key).cloned())
         {
             return cached;
         }
@@ -378,6 +382,7 @@ impl ChildResolver for Compiler {
                                     .unwrap_or_default(),
                                 entries,
                                 children: unit.children.clone(),
+                                features: unit.features,
                                 ir: unit.ir,
                             })
                         }
@@ -392,7 +397,7 @@ impl ChildResolver for Compiler {
             }
         };
         if let Ok(mut cache) = self.children.lock() {
-            cache.insert(name.to_owned(), result.clone());
+            cache.insert(key, result.clone());
         }
         result
     }

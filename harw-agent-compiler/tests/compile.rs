@@ -33,10 +33,11 @@ impl RunnerProbe for FullRunner {
                 .iter()
                 .map(|i| i.as_str().to_owned())
                 .collect(),
+            // Wie `harw-agent-runner --capabilities`: Interfaces stehen nur
+            // unter `interfaces`, nie unter `features`.
             features: harw_registry_defaults::capability_catalog::PROVIDER_FEATURES
                 .iter()
                 .map(|feature| (*feature).to_owned())
-                .chain(Interface::ALL.iter().map(|i| i.as_str().to_owned()))
                 .collect(),
             child_protocol: None,
         })
@@ -137,6 +138,62 @@ fn test_resolve_skills_embeds_and_hashes() -> TestResult {
         bundle
             .file(&compiled.artifact, &root, "instructions/system.md")
             .is_some()
+    );
+    let manifest = bundle
+        .file(
+            &compiled.artifact,
+            &root,
+            "skills/evidence-quality-review/skill.toml",
+        )
+        .ok_or("skill manifest in the pool")?;
+    let manifest_text = std::str::from_utf8(manifest)?;
+    let table: toml::Table = toml::from_str(manifest_text)?;
+    assert_eq!(
+        table.get("name").and_then(toml::Value::as_str),
+        Some("evidence-quality-review"),
+        "{manifest_text}"
+    );
+    Ok(())
+}
+
+#[test]
+fn test_embedded_skill_bundle_builds_a_skill_index() -> TestResult {
+    let (_root, env) = home_with(&[])?;
+    let compiled = compile(&env, "evidence-critic")?;
+    let bundle = Bundle::from_artifact(&compiled.artifact)?;
+    let root = bundle.header.root.clone();
+    let entry = bundle.root().ok_or("root entry")?;
+    let mut refs: Vec<(String, String)> = Vec::new();
+    for reference in &entry.payload_refs {
+        if reference.kind != "skill" {
+            continue;
+        }
+        let bytes = bundle
+            .file(&compiled.artifact, &root, &reference.logical_path)
+            .ok_or("skill payload in the pool")?;
+        let text = std::str::from_utf8(bytes)?.to_owned();
+        refs.push((reference.logical_path.clone(), text));
+    }
+    let refs_as_str_pairs: Vec<(&str, &str)> = refs
+        .iter()
+        .map(|(path, contents)| (path.as_str(), contents.as_str()))
+        .collect();
+    let index = harw_catalog::SkillIndex::build_with_bundle(&[], &refs_as_str_pairs);
+    let indexed = index
+        .get("evidence-quality-review")
+        .ok_or("skill in the index built from the embedded bundle")?;
+    let instructions = bundle
+        .file(
+            &compiled.artifact,
+            &root,
+            "skills/evidence-quality-review/instructions.md",
+        )
+        .ok_or("instructions in the pool")?;
+    let expected = std::str::from_utf8(instructions)?;
+    assert_eq!(
+        indexed.snapshot().instructions,
+        expected,
+        "the index's instructions are the embedded instructions.md text"
     );
     Ok(())
 }
@@ -253,6 +310,13 @@ fn test_child_closure_embeds_the_family_and_graphs_render() -> TestResult {
     assert_eq!(names, ["reader", "writer"]);
     assert!(compiled.unit.children[0].read_only);
     assert!(!compiled.unit.children[1].read_only);
+    for child in ["reader", "writer"] {
+        let child = compile(&env, child)?;
+        assert!(
+            child.unit.features.is_subset(&compiled.unit.features),
+            "the shared executable must link every child's tool providers"
+        );
+    }
     let bundle = Bundle::from_artifact(&compiled.artifact)?;
     assert_eq!(
         bundle.agents.len(),
@@ -290,6 +354,28 @@ fn test_child_closure_embeds_the_family_and_graphs_render() -> TestResult {
     assert!(
         rights.contains("base role analysis-orchestrator"),
         "{rights}"
+    );
+    Ok(())
+}
+
+#[test]
+fn test_child_cache_keeps_ancestry_and_depth_separate() -> TestResult {
+    use harw_agent_compiler::passes::ChildResolver;
+
+    let reader = worker("reader", "[spawn]\nmax_depth = 0\n");
+    let writer = worker("writer", "[spawn]\nmax_depth = 0\n");
+    let (_root, env) = home_with(&[("lead", LEAD), ("reader", &reader), ("writer", &writer)])?;
+    let compiler = Compiler::new(env, CompilerOptions::default())?;
+    let first = compiler.compile_child("lead", 1, &["root".to_owned()])?;
+    assert!(first.children.iter().all(|child| child.depth == 2));
+    let deeper =
+        compiler.compile_child("lead", 2, &["another-root".to_owned(), "middle".to_owned()])?;
+    assert!(deeper.children.iter().all(|child| child.depth == 3));
+    assert!(
+        compiler
+            .compile_child("lead", 1, &["reader".to_owned()])
+            .is_err(),
+        "a successful cache entry must not hide a cycle in another ancestry"
     );
     Ok(())
 }
@@ -516,21 +602,42 @@ fn test_children_sharing_a_skill_store_it_once() -> TestResult {
     let compiled = compile(&env, "lead")?;
     let bundle = Bundle::from_artifact(&compiled.artifact)?;
     let stats = bundle.pool_stats();
-    let skill_refs = bundle
+    let is_instructions = |reference: &&harw_agent_artifact::PayloadRef| {
+        reference.kind == "skill" && reference.logical_path.ends_with("/instructions.md")
+    };
+    let is_manifest = |reference: &&harw_agent_artifact::PayloadRef| {
+        reference.kind == "skill" && reference.logical_path.ends_with("/skill.toml")
+    };
+    let instructions_refs = bundle
         .agents
         .values()
         .flat_map(|entry| entry.payload_refs.iter())
-        .filter(|reference| reference.kind == "skill")
+        .filter(is_instructions)
         .count();
-    assert_eq!(skill_refs, 2, "both children reference the skill");
-    let skill_blobs: std::collections::BTreeSet<_> = bundle
+    assert_eq!(instructions_refs, 2, "both children reference the skill");
+    let instructions_blobs: std::collections::BTreeSet<_> = bundle
         .agents
         .values()
         .flat_map(|entry| entry.payload_refs.iter())
-        .filter(|reference| reference.kind == "skill")
+        .filter(is_instructions)
         .map(|reference| reference.blake3)
         .collect();
-    assert_eq!(skill_blobs.len(), 1, "stored once");
+    assert_eq!(instructions_blobs.len(), 1, "stored once");
+    let manifest_refs = bundle
+        .agents
+        .values()
+        .flat_map(|entry| entry.payload_refs.iter())
+        .filter(is_manifest)
+        .count();
+    assert_eq!(manifest_refs, 2, "both children reference the manifest");
+    let manifest_blobs: std::collections::BTreeSet<_> = bundle
+        .agents
+        .values()
+        .flat_map(|entry| entry.payload_refs.iter())
+        .filter(is_manifest)
+        .map(|reference| reference.blake3)
+        .collect();
+    assert_eq!(manifest_blobs.len(), 1, "identical manifest is stored once");
     assert!(stats.saved_bytes() > 0);
 
     // inspect shows the refs per agent and the savings.

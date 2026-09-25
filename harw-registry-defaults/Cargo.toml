@@ -72,6 +72,9 @@ harw-tools = { version = "0.3.0", path = "../harw-tools" }
 harw-knowledge = { path = "../harw-knowledge" }
 # Zeitstempel der Workbench-Einträge (`harw_knowledge::workbench` datiert in `jiff`).
 jiff = { workspace = true }
+# `agents.build` startet `harw agent build` als Job; `harw_tool_job::PreparedJob`
+# nimmt ein `tokio::process::Command`.
+tokio = { version = "1", features = ["process"] }
 
 [features]
 # Opt-in surface for the Harwness browser tool set (`browser.open`,

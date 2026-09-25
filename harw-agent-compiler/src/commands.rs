@@ -1394,17 +1394,20 @@ mod tests {
         );
         assert_eq!(output.exit_code, 1);
         assert!(
-            output.text.contains("neither a file nor an agent installed"),
+            output
+                .text
+                .contains("neither a file nor an agent installed"),
             "{}",
             output.text
         );
     }
 
     #[test]
-    fn test_run_reports_the_missing_runner_for_a_bare_artifact() -> Result<(), Box<dyn std::error::Error>>
-    {
+    fn test_run_reports_the_missing_runner_for_a_bare_artifact()
+    -> Result<(), Box<dyn std::error::Error>> {
         let dir = tempfile::tempdir()?;
-        let artifact = harw_agent_artifact::ArtifactBuilder::new(&json!({"name": "demo"})).build()?;
+        let artifact =
+            harw_agent_artifact::ArtifactBuilder::new(&json!({"name": "demo"})).build()?;
         let artifact_path = dir.path().join("demo.harwa");
         std::fs::write(&artifact_path, artifact.to_bytes())?;
         let env = CompilerEnv::isolated(dir.path().join("home"), dir.path().to_path_buf());
@@ -1429,10 +1432,11 @@ mod tests {
 
     #[test]
     #[cfg(unix)]
-    fn test_run_execs_a_bare_artifact_through_a_located_runner() -> Result<(), Box<dyn std::error::Error>>
-    {
+    fn test_run_execs_a_bare_artifact_through_a_located_runner()
+    -> Result<(), Box<dyn std::error::Error>> {
         let dir = tempfile::tempdir()?;
-        let artifact = harw_agent_artifact::ArtifactBuilder::new(&json!({"name": "demo"})).build()?;
+        let artifact =
+            harw_agent_artifact::ArtifactBuilder::new(&json!({"name": "demo"})).build()?;
         let artifact_path = dir.path().join("demo.harwa");
         std::fs::write(&artifact_path, artifact.to_bytes())?;
         let home = dir.path().join("home");
@@ -1441,7 +1445,9 @@ mod tests {
         // artifact bytes appended after it — a real runner exits the same
         // way for a denied approval, and this exercises exit-code passthrough
         // without needing a real `harw-agent-runner` binary.
-        let runner_path = env.home_runner_dir(&env.host_target).join("harw-agent-runner");
+        let runner_path = env
+            .home_runner_dir(&env.host_target)
+            .join("harw-agent-runner");
         std::fs::create_dir_all(runner_path.parent().ok_or("parent")?)?;
         harw_agent_artifact::write_executable(&runner_path, b"#!/bin/sh\nexit 3\n")?;
         let mut progress = |_: &str| {};

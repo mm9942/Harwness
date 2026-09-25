@@ -30,9 +30,21 @@ impl Pass for RightsCheck<'_> {
     fn run(&self, unit: &mut CompileUnit) -> Diagnostics {
         let mut diagnostics = Diagnostics::new();
         // Unknown tools keep their label classification here;
-        // `ReachableTools` reports them.
-        let _unknown = reclassify_permissions(&mut unit.ir, &CapabilityCatalog);
+        // `ReachableTools` reports them (HARW-BUILD-003, with suggestions).
+        // They must also be left out of the widening checks below: a base
+        // role's ceiling never lists a nonexistent tool either, so an
+        // unrecognized (e.g. mistyped) tool name would otherwise look like a
+        // widening and fail with HARW-BUILD-004 here — which stops the pass
+        // pipeline before `ReachableTools` ever runs, hiding the real,
+        // suggestion-bearing diagnostic behind a misleading one.
+        let unknown: BTreeSet<String> = reclassify_permissions(&mut unit.ir, &CapabilityCatalog)
+            .into_iter()
+            .collect();
         let manifest = RightsSet::claimed_by(&unit.ir);
+        let known = RightsSet {
+            tools: manifest.tools.difference(&unknown).cloned().collect(),
+            ..manifest.clone()
+        };
         let handoffs: BTreeSet<String> = unit
             .child_names()
             .into_iter()
@@ -56,7 +68,7 @@ impl Pass for RightsCheck<'_> {
                 ),
             )),
             Some(base) => {
-                flow.over_base = delta(&manifest, &base.rights, &handoffs);
+                flow.over_base = delta(&known, &base.rights, &handoffs);
                 flow.narrowed_tools = base
                     .rights
                     .tools
@@ -74,7 +86,7 @@ impl Pass for RightsCheck<'_> {
             }
         }
         if let Some(author) = self.author {
-            flow.over_ceiling = delta(&manifest, author, &handoffs);
+            flow.over_ceiling = delta(&known, author, &handoffs);
             report(
                 &mut diagnostics,
                 unit,

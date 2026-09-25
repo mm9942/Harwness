@@ -29,7 +29,7 @@ fn agent(binary_body: &str) -> String {
 
 fn compile(binary_body: &str) -> TestResult<AgentIr> {
     let target = DefinitionId::parse(TARGET).map_err(ctx("target id"))?;
-    let file = SourceFile::new(DefinitionLayer::UserGlobal, TARGET_PATH, &agent(binary_body));
+    let file = SourceFile::new(DefinitionLayer::UserGlobal, TARGET_PATH, agent(binary_body));
     let files = [file];
     let sources = LowerSources::new(&files);
     compile_agent(&target, &sources, OffsetDateTime::UNIX_EPOCH)

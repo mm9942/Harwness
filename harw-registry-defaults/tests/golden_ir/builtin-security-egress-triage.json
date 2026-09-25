@@ -44,7 +44,7 @@
   "lifecycle": {
     "allow_pause": false,
     "allow_rerun": true,
-    "max_attempts": 2
+    "max_attempts": 4
   },
   "context": {
     "program": "triage",
@@ -190,6 +190,6 @@
   },
   "snapshot": {
     "domain": "harwness.agent-ir.snapshot/v7",
-    "digest": "2693c281a08b5d583eb87b751d790ef2fb39bfb27e63e527ed1c8d8945596fdc"
+    "digest": "7b8e96c3fcb987eef9263eaea3e8c96d5eae94dc1fba0d6848c663b0f3f83672"
   }
 }

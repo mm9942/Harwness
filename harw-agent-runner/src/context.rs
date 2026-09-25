@@ -54,12 +54,8 @@ impl RunnerContext {
     /// handler, model overrides and event sink on top.
     ///
     /// # Description
-    /// A child process itself (`self.args.child.is_some()`, i.e. this
-    /// process was started with `--child <id>`) never gets a
-    /// [`JobChildBackend`] here: `crate::child::run_child` drives that
-    /// agent's own turn directly and has no children of its own to spawn
-    /// through one — wiring a backend there would only start a job manager
-    /// this process never uses.
+    /// Nested child orchestrators use the same job backend, so the entire
+    /// bundled delegation closure keeps process isolation at every depth.
     ///
     /// # Errors
     /// [`RunnerError::Sdk`] if [`harwness_sdk::HarwnessBuilder::build`]
@@ -86,10 +82,11 @@ impl RunnerContext {
             source,
         })?;
         let mut builder = Harwness::builder().embedded(self.agent.clone()).cwd(cwd);
-        if self.args.child.is_none()
-            && self.root_ir().binary.child_execution == ChildExecution::Job
-        {
+        if self.root_ir().binary.child_execution == ChildExecution::Job {
             builder = builder.child_backend(self.job_child_backend()?);
+        }
+        if let Ok(reply) = std::env::var("HARW_OFFLINE_ECHO") {
+            builder = builder.offline_echo(reply);
         }
         Ok(builder)
     }
@@ -105,7 +102,9 @@ impl RunnerContext {
     /// # Errors
     /// [`RunnerError::Io`] if the root space cannot be resolved or the job
     /// manager's state directory cannot be created.
-    fn job_child_backend(&self) -> Result<Arc<dyn harw_core::child_backend::ChildBackend>, RunnerError> {
+    pub(crate) fn job_child_backend(
+        &self,
+    ) -> Result<Arc<dyn harw_core::child_backend::ChildBackend>, RunnerError> {
         let home = harw_home::home_dir().map_err(|source| RunnerError::Io {
             context: "resolve the root space for the job-backed child backend",
             source: io::Error::other(source),

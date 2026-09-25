@@ -58,12 +58,6 @@ use crate::paths;
 /// wird.
 const DEFAULT_MARKER: &str = ".git";
 
-/// Fallback-Regel für die Gitignore im Projektroot (ohne
-/// [`paths::set_named_home`]): der gesamte Harw-Zustand bleibt lokal. Eine
-/// personalisierte harw (#22) trägt stattdessen `.<name>/`
-/// ([`paths::project_dir_name`]) ein; siehe [`ensure_ignore_rule`].
-const ROOT_GITIGNORE_RULE: &str = ".harw/";
-
 /// Obergrenze für die `.git`-Datei eines Worktrees und ihre `commondir`.
 ///
 /// Beide Dateien sind normalerweise wenige Dutzend Bytes lang; die Grenze
@@ -542,12 +536,11 @@ fn ensure_ignore_rule_named(gitignore: &Path, project_dir_name: &str) -> HomeRes
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => String::new(),
         Err(error) => return Err(HomeError::io(gitignore, error)),
     };
+    // Nur die eigene Regel zählt: eine vorhandene `.harw/`-Zeile deckt den
+    // Ordner einer personalisierten harw (`.<name>/`) nicht ab.
     let matches_rule = |line: &str| {
         let trimmed = line.trim();
-        trimmed == ROOT_GITIGNORE_RULE
-            || trimmed == format!("/{ROOT_GITIGNORE_RULE}")
-            || trimmed == rule
-            || trimmed == format!("/{rule}")
+        trimmed == rule || trimmed == format!("/{rule}")
     };
     if existing.lines().any(matches_rule) {
         return Ok(());
@@ -906,8 +899,8 @@ mod tests {
     /// jeden anderen Test dieses Testbinaries mit einer personalisierten
     /// harw zurücklassen).
     #[test]
-    fn ensure_ignore_rule_named_writes_the_given_name_and_keeps_a_prior_dot_harw_rule()
-    -> TestResult {
+    fn ensure_ignore_rule_named_writes_the_given_name_and_keeps_a_prior_dot_harw_rule() -> TestResult
+    {
         let repo = TempDir::new("ensure-named-repo")?;
         let gitignore = repo.path().join(".gitignore");
         std::fs::write(&gitignore, ".harw/\n")?;

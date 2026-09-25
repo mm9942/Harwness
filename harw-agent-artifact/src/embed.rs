@@ -8,15 +8,14 @@
 //! |---|---|---|
 //! | 0 | 8 | `artifact_offset` (u64 LE): file offset of the artifact's first byte |
 //! | 8 | 8 | `artifact_len` (u64 LE): artifact length in bytes |
-//! | 16 | 32 | `artifact_hash`: copy of the artifact's trailing hash |
-//! | 48 | 8 | `footer_magic`: ASCII `HARWAEND` |
+//! | 16 | 32 | `executable_hash`: BLAKE3 of runner, artifact, offset and length |
+//! | 48 | 8 | `footer_magic`: ASCII `HARWAEN2` |
 //!
 //! Extraction is fail-closed: no footer magic means
 //! [`ArtifactError::NotEmbedded`]; an offset/length that does not end exactly
-//! at the footer, or a hash copy that differs from the artifact's trailer,
-//! means [`ArtifactError::Tampered`] with [`TamperScope::Footer`]. The runner
-//! bytes are not covered by any hash here; the artifact hash is the identity
-//! of the agent, not of the binary.
+//! at the footer, or an executable hash mismatch, means
+//! [`ArtifactError::Tampered`] with [`TamperScope::Footer`]. The old
+//! `HARWAEND` footer is rejected: rebuild to cover the runner bytes too.
 
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
@@ -26,7 +25,7 @@ use crate::artifact::{Artifact, HASH_LEN, MAX_ARTIFACT_LEN};
 use crate::error::{ArtifactError, Limit, TamperScope};
 
 /// Last eight bytes of a binary that carries an artifact.
-pub const FOOTER_MAGIC: &[u8; 8] = b"HARWAEND";
+pub const FOOTER_MAGIC: &[u8; 8] = b"HARWAEN2";
 /// Size of the executable footer in bytes.
 pub const FOOTER_LEN: usize = 8 + 8 + HASH_LEN + 8;
 
@@ -51,7 +50,8 @@ pub fn append_to_executable(runner_bytes: &[u8], artifact: &Artifact) -> Vec<u8>
     out.extend_from_slice(encoded);
     out.extend_from_slice(&(runner_bytes.len() as u64).to_le_bytes());
     out.extend_from_slice(&(encoded.len() as u64).to_le_bytes());
-    out.extend_from_slice(artifact.digest().as_bytes());
+    let executable_hash = blake3::hash(&out);
+    out.extend_from_slice(executable_hash.as_bytes());
     out.extend_from_slice(FOOTER_MAGIC);
     out
 }
@@ -119,15 +119,16 @@ impl EmbeddedArtifact {
         let artifact_bytes = bytes
             .get(start..footer_start)
             .ok_or(ArtifactError::Tampered(TamperScope::Footer))?;
-        let artifact = verify(artifact_bytes, &footer)?;
+        let artifact = verify_artifact(artifact_bytes)?;
+        verify_hash(blake3::hash(&bytes[..footer_start + 16]), &footer)?;
         Ok(Self {
             artifact,
             runner_len: footer.offset,
         })
     }
 
-    /// Reads the artifact embedded in the file at `path`. Only the footer
-    /// and the artifact are read, not the runner bytes in front of them.
+    /// Reads the artifact embedded in the file at `path` and streams the
+    /// executable through BLAKE3 without allocating the runner bytes.
     ///
     /// # Errors
     /// As [`EmbeddedArtifact::from_executable_bytes`], plus
@@ -152,7 +153,20 @@ impl EmbeddedArtifact {
         let mut artifact_bytes = vec![0u8; footer.len];
         file.read_exact(&mut artifact_bytes)
             .map_err(io("read embedded artifact"))?;
-        let artifact = verify(&artifact_bytes, &footer)?;
+        let artifact = verify_artifact(&artifact_bytes)?;
+        file.seek(SeekFrom::Start(0))
+            .map_err(io("seek to executable start"))?;
+        let mut hasher = blake3::Hasher::new();
+        let mut remaining = file_len - FOOTER_LEN as u64 + 16;
+        let mut buffer = [0u8; 65536];
+        while remaining > 0 {
+            let count = remaining.min(buffer.len() as u64) as usize;
+            file.read_exact(&mut buffer[..count])
+                .map_err(io("hash executable"))?;
+            hasher.update(&buffer[..count]);
+            remaining -= count as u64;
+        }
+        verify_hash(hasher.finalize(), &footer)?;
         Ok(Self {
             artifact,
             runner_len: footer.offset,
@@ -171,6 +185,19 @@ impl EmbeddedArtifact {
             source,
         })?;
         Self::from_path(&path)
+    }
+
+    /// Verifies the complete native executable and its statically embedded
+    /// artifact agree. A generated binary must be sealed before execution.
+    ///
+    /// # Errors
+    /// As [`Self::from_current_exe`], or a tamper error if the artifacts differ.
+    pub fn verify_current_exe_matches(expected: &[u8]) -> Result<(), ArtifactError> {
+        let embedded = Self::from_current_exe()?;
+        if embedded.artifact.as_bytes() != expected {
+            return Err(ArtifactError::Tampered(TamperScope::Artifact));
+        }
+        Ok(())
     }
 
     /// The verified artifact.
@@ -197,6 +224,9 @@ impl EmbeddedArtifact {
 /// starts, and the size limit, in that order, before anything is read.
 fn parse_footer(tail: &[u8], file_len: u64) -> Result<Footer, ArtifactError> {
     let field = |range: std::ops::Range<usize>| tail.get(range).ok_or(ArtifactError::NotEmbedded);
+    if field(48..56)? == b"HARWAEND" {
+        return Err(ArtifactError::LegacyExecutableFooter);
+    }
     if field(48..56)? != FOOTER_MAGIC {
         return Err(ArtifactError::NotEmbedded);
     }
@@ -229,22 +259,24 @@ fn parse_footer(tail: &[u8], file_len: u64) -> Result<Footer, ArtifactError> {
     Ok(Footer { offset, len, hash })
 }
 
-/// Recomputes the artifact hash and compares it with both the artifact's
-/// own trailer and the footer's copy before any byte of the artifact is
-/// interpreted; only then parses it.
-fn verify(artifact_bytes: &[u8], footer: &Footer) -> Result<Artifact, ArtifactError> {
-    let trailer_start = artifact_bytes
+/// Checks the digest covering the executable and footer location fields.
+fn verify_artifact(bytes: &[u8]) -> Result<Artifact, ArtifactError> {
+    let trailer = bytes
         .len()
         .checked_sub(HASH_LEN)
-        .ok_or(ArtifactError::Tampered(TamperScope::Footer))?;
-    let (body, trailer) = artifact_bytes.split_at(trailer_start);
-    if trailer != footer.hash.as_slice() {
-        return Err(ArtifactError::Tampered(TamperScope::Footer));
-    }
-    if blake3::hash(body).as_bytes().as_slice() != trailer {
+        .ok_or(ArtifactError::Tampered(TamperScope::Artifact))?;
+    if blake3::hash(&bytes[..trailer]).as_bytes().as_slice() != &bytes[trailer..] {
         return Err(ArtifactError::Tampered(TamperScope::Artifact));
     }
-    Artifact::from_bytes(artifact_bytes)
+    Artifact::from_bytes(bytes)
+}
+
+/// Checks the digest covering the executable and footer location fields.
+fn verify_hash(hash: blake3::Hash, footer: &Footer) -> Result<(), ArtifactError> {
+    if hash.as_bytes() != &footer.hash {
+        return Err(ArtifactError::Tampered(TamperScope::Footer));
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -291,7 +323,7 @@ mod tests {
             RUNNER.len() + artifact.as_bytes().len() + FOOTER_LEN
         );
         assert!(binary.starts_with(RUNNER));
-        assert!(binary.ends_with(b"HARWAEND"));
+        assert!(binary.ends_with(b"HARWAEN2"));
         let embedded = EmbeddedArtifact::from_executable_bytes(&binary).map_err(ctx("extract"))?;
         assert_eq!(embedded.runner_len(), RUNNER.len() as u64);
         assert_eq!(embedded.artifact(), &artifact);
@@ -330,7 +362,7 @@ mod tests {
         let artifact = sample().map_err(ctx("build sample"))?;
         let binary = append_to_executable(RUNNER, &artifact);
         let footer = binary.len() - FOOTER_LEN;
-        // offset, length and hash copy.
+        // offset, length and executable hash.
         for index in [footer, footer + 8, footer + 16, footer + 47] {
             assert!(
                 matches!(
@@ -366,21 +398,43 @@ mod tests {
                 index - start
             );
         }
-        // The trailer: it no longer matches the footer's copy.
+        // The artifact's own trailer is verified as well.
         assert!(matches!(
             EmbeddedArtifact::from_executable_bytes(&flipped(&binary, end - 1)),
+            Err(ArtifactError::Tampered(TamperScope::Artifact))
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn test_runner_tampering_is_rejected_in_memory_and_on_disk() -> TestResult {
+        let artifact = sample().map_err(ctx("build sample"))?;
+        let binary = append_to_executable(RUNNER, &artifact);
+        let tampered = flipped(&binary, 3);
+        assert!(matches!(
+            EmbeddedArtifact::from_executable_bytes(&tampered),
+            Err(ArtifactError::Tampered(TamperScope::Footer))
+        ));
+        let dir = tempfile::tempdir().map_err(ctx("tempdir"))?;
+        let path = dir.path().join("tampered-agent");
+        std::fs::write(&path, tampered).map_err(ctx("write tampered"))?;
+        assert!(matches!(
+            EmbeddedArtifact::from_path(&path),
             Err(ArtifactError::Tampered(TamperScope::Footer))
         ));
         Ok(())
     }
 
     #[test]
-    fn test_runner_bytes_are_not_part_of_the_artifact_hash() -> TestResult {
+    fn test_legacy_footer_requires_a_rebuild() -> TestResult {
         let artifact = sample().map_err(ctx("build sample"))?;
-        let binary = append_to_executable(RUNNER, &artifact);
-        let embedded = EmbeddedArtifact::from_executable_bytes(&flipped(&binary, 3))
-            .map_err(ctx("runner change does not touch the artifact"))?;
-        assert_eq!(embedded.artifact().digest(), artifact.digest());
+        let mut binary = append_to_executable(RUNNER, &artifact);
+        let magic = binary.len() - 8;
+        binary[magic..].copy_from_slice(b"HARWAEND");
+        assert!(matches!(
+            EmbeddedArtifact::from_executable_bytes(&binary),
+            Err(ArtifactError::LegacyExecutableFooter)
+        ));
         Ok(())
     }
 
@@ -438,7 +492,7 @@ mod tests {
         footer.extend_from_slice(&0u64.to_le_bytes());
         footer.extend_from_slice(&len.to_le_bytes());
         footer.extend_from_slice(&[0u8; 32]);
-        footer.extend_from_slice(b"HARWAEND");
+        footer.extend_from_slice(b"HARWAEN2");
         file.write_all(&footer).map_err(ctx("write footer"))?;
         drop(file);
         assert!(matches!(

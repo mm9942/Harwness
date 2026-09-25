@@ -63,7 +63,7 @@
   "lifecycle": {
     "allow_pause": false,
     "allow_rerun": true,
-    "max_attempts": 2
+    "max_attempts": 4
   },
   "context": {
     "program": null,
@@ -189,6 +189,6 @@
   },
   "snapshot": {
     "domain": "harwness.agent-ir.snapshot/v7",
-    "digest": "b0b1b1348317e3460a8fb98a4534b89ada59b3f67a7255c13115d76958e36fc1"
+    "digest": "9f58ca7d54838c0a5e632662dafb7cb6e8a6ad250b25b55f60959b24e5565b74"
   }
 }

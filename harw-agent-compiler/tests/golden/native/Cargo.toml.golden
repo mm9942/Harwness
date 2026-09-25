@@ -12,6 +12,7 @@ name = "evidence-critic"
 path = "src/main.rs"
 
 [dependencies]
+harw-agent-artifact = { path = "/opt/harw-src/harw-agent-artifact" }
 harw-agent-runner = { path = "/opt/harw-src/harw-agent-runner", default-features = false, features = [
     "cli",
     "core",

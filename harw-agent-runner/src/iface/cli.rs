@@ -105,9 +105,7 @@ fn resolve_prompt(ctx: &RunnerContext) -> Result<String, String> {
         .read_to_string(&mut text)
         .map_err(|error| format!("could not read the prompt from stdin: {error}"))?;
     if text.trim().is_empty() {
-        return Err(
-            "no prompt: give one on the command line or pipe it on stdin".to_owned(),
-        );
+        return Err("no prompt: give one on the command line or pipe it on stdin".to_owned());
     }
     Ok(text)
 }
@@ -155,10 +153,7 @@ async fn run_one_shot(
                     arguments,
                     ..
                 } => {
-                    eprintln_dim(&format!(
-                        "{}→ {tool}({arguments})",
-                        role_prefix(source)
-                    ));
+                    eprintln_dim(&format!("{}→ {tool}({arguments})", role_prefix(source)));
                 }
                 SdkEvent::ToolResult {
                     source,
@@ -394,8 +389,7 @@ mod tests {
         for output in &outputs {
             let value = tool_output_json(output);
             let line = serde_json::to_string(&value).expect("serializable");
-            let reparsed: serde_json::Value =
-                serde_json::from_str(&line).expect("valid json line");
+            let reparsed: serde_json::Value = serde_json::from_str(&line).expect("valid json line");
             assert!(reparsed["success"].is_boolean(), "{line}");
         }
         assert_eq!(

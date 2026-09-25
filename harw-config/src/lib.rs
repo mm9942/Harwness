@@ -46,8 +46,7 @@ pub use browser_toml::BrowserSection;
 pub use channel_toml::{ChannelFileToml, ChannelSectionToml, ChannelToml, TelegramChannelToml};
 pub use discovery::{
     AgentDefinitionMeta, HasName, INSTRUCTIONS_FILE_KEY, ResolvedConfig, default_config_layers,
-    default_config_layers_named,
-    discover_config, discover_config_with_restricted,
+    default_config_layers_named, discover_config, discover_config_with_restricted,
     discover_config_with_restricted_and_project_settings, discover_run_agent_definitions,
 };
 pub use dod_toml::DodSection;

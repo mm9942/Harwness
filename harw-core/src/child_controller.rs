@@ -1018,7 +1018,11 @@ impl crate::child_backend::ChildIo for ControllerChildIo<'_> {
         }
     }
 
-    fn on_question<'a>(&'a self, id: String, text: String) -> crate::child_backend::ChildAnswerFuture<'a> {
+    fn on_question<'a>(
+        &'a self,
+        id: String,
+        text: String,
+    ) -> crate::child_backend::ChildAnswerFuture<'a> {
         let spawner = self.spawner;
         let child = self.child.clone();
         Box::pin(async move {
@@ -2823,7 +2827,10 @@ impl ManagedAgentSpawner {
     fn set_backend_resume(&self, child: &SessionId, token: String) {
         match self.child_tasks.lock() {
             Ok(mut tasks) => {
-                tasks.entry(child.as_str().to_owned()).or_default().backend_resume = Some(token);
+                tasks
+                    .entry(child.as_str().to_owned())
+                    .or_default()
+                    .backend_resume = Some(token);
             }
             Err(_) => tracing::warn!(child = %child, "child_task_state.lock_poisoned"),
         }
@@ -3094,7 +3101,10 @@ impl ManagedAgentSpawner {
     /// mapping [`crate::child_backend::ChildRunOutcome`] onto the same
     /// journal/end-report path the in-process run uses.
     #[must_use]
-    pub fn with_child_backend(mut self, backend: Arc<dyn crate::child_backend::ChildBackend>) -> Self {
+    pub fn with_child_backend(
+        mut self,
+        backend: Arc<dyn crate::child_backend::ChildBackend>,
+    ) -> Self {
         self.child_backend = Some(backend);
         self
     }
@@ -5622,7 +5632,9 @@ impl ManagedAgentSpawner {
         // branch is the in-process path and stays untouched when no
         // backend is wired (the default inside `harw`).
         if let Some(backend) = self.child_backend() {
-            return self.run_child_via_backend(child, &record, backend, input).await;
+            return self
+                .run_child_via_backend(child, &record, backend, input)
+                .await;
         }
         let factory = self
             .roles
@@ -8431,6 +8443,7 @@ impl ManagedAgentSpawner {
                         admission_warning,
                         task_max_bytes,
                         continuation: None,
+                        backend_resume: None,
                     },
                 );
             }
@@ -12856,6 +12869,7 @@ max_depth = 0
                     admission_warning: None,
                     task_max_bytes: None,
                     continuation: None,
+                    backend_resume: None,
                 },
             );
     }

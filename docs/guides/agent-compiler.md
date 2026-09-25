@@ -1,22 +1,18 @@
 # Compiling agents into standalone binaries
 
-> Status: implemented (#22, wave 3: `docs/plans/r10-agent-compiler.md`).
+> Status: implemented (#22, wave 5: `docs/plans/r10-agent-compiler.md`).
 > `harw agent check/build/inspect/graph/explain/new/fmt/diff/test/versions/
 > use/clean/doctor` and the `~/.harw/bin` version store described below are
 > in `harw-agent-compiler` and wired into the CLI. The runner's own
-> interfaces — `cli`, `repl`, `mcp` (stdio), `http` and the mini `tui` — run
-> an actual task end to end today; §5 documents each one and the flags they
-> share. A few pieces of wave 3 are still being wired rather than finished:
-> the MCP interface's Streamable HTTP transport (`--listen`) is not
-> implemented, only stdio (§5.4); a child agent delegated from a compiled
-> binary runs its own process and speaks `harwness.agent-child/v1`
-> ([spec](../design/agent-child-protocol-v1.md)), but nothing in the
-> embedded runtime yet spawns that process automatically for
-> `[binary].child_execution = "job"` runs — only `harw-agent-runner --child`
-> invoked directly exercises it (§5.7); and the mini TUI's agent/model-switch
-> restriction (§5.6) is decided in code but not yet enforced by `harw-tui`'s
+> interfaces — `cli`, `repl`, `mcp` (stdio and Streamable HTTP via
+> `--listen`), `http` and the mini `tui` — run an actual task end to end
+> today; §5 documents each one and the flags they share. A compiled root
+> agent delegates to its bundled children as separate runner processes
+> automatically when `[binary].child_execution = "job"` (the default),
+> and the mini TUI's fixed-agent restrictions (hidden UIA/agent-switch
+> commands, disabled `/model switch`) are enforced by `harw-tui`'s
 > command registry. See [ADR 0001](../adr/0001-agent-compiler.md) for the
-> full design and its "Wave 3 consequences" section for the exact list.
+> full design.
 
 This guide shows how to turn an agent definition into a single executable
 that runs one fixed agent with one fixed set of rights, without a harw
@@ -176,7 +172,7 @@ what this build does have.
 | `--no-network` | clear network access entirely for this run, regardless of the manifest. |
 | `--read-only` | drop write and shell rights for this run. |
 | `--max-tokens <n>` | cap the token budget at `n`, tightening (never loosening) the manifest's own budget. |
-| `--listen <addr>` | bind address for `http` (default `127.0.0.1:8787`); rejected as not implemented for `mcp` (§5.3). |
+| `--listen <addr>` | bind address for `http` (default `127.0.0.1:8787`) and for `mcp`'s Streamable HTTP transport (§5.3, §5.4). |
 | `--child <id>` / `--child-protocol <label>` | run as a delegated child instead of a top-level interface (§5.6); both flags are required together. |
 
 Every flag above except `--manifest`/`--verify`/`--version`/`--capabilities`
@@ -223,7 +219,7 @@ turn. The REPL itself exits `0` on `/exit` or end-of-input regardless of
 how the last turn ended — a failed or cancelled turn is not a failed
 session.
 
-### 5.4 `mcp` — Model Context Protocol (stdio only)
+### 5.4 `mcp` — Model Context Protocol (stdio or Streamable HTTP)
 
 Implements `initialize`, `tools/list`, `tools/call` (`run`, `status`,
 `cancel`), `notifications/cancelled` and `ping` over newline-delimited
@@ -235,14 +231,19 @@ JSON-RPC 2.0 on stdin/stdout, protocol version `2025-06-18`. `run` takes
 `--full-access`, a call that needed approval is denied and the response
 says so; `--full-access` approves everything already inside the manifest.
 
-**Only the stdio transport is implemented.** `--listen <addr>` is refused
-with an error naming the reason: `harw-mcp-server`'s Streamable HTTP
-transport is built around a durable job supervisor and tenant/workspace
-principals a compiled, embedded single-agent runner has none of, and a
-small self-contained JSON-RPC loop was not worth reimplementing that
-machinery underneath. A future HTTP transport for this interface is its
-own loopback listener, tracked separately — see
-`harw-agent-runner/src/iface/mcp.rs`'s module docs.
+**Two transports are implemented.** Without `--listen`, the stdio
+JSON-RPC loop runs to completion (client closed stdin, or a fatal I/O
+error). With `--listen <addr>`, the interface runs its own small
+loopback-oriented HTTP transport (`POST /mcp` plus `GET /healthz`),
+carrying the same JSON-RPC messages: a single active session (this is a
+single-agent, effectively single-client server), the same approval
+story, and the same auth rule as `http` — a bearer token from
+`HARW_AGENT_HTTP_TOKEN` is required on any non-loopback address and
+still checked (constant-time) on loopback if set. It deliberately does
+not reuse `harw-mcp-server`'s Streamable HTTP transport, which is built
+around a durable job supervisor and tenant/workspace principals a
+compiled, embedded single-agent runner has none of — see
+`harw-agent-runner/src/iface/mcp.rs`'s module docs for that reasoning.
 
 ### 5.5 `http` — JSON API
 
@@ -275,15 +276,19 @@ only way to let a manifest-permitted tool call through unattended.
 The normal `harw` terminal UI, restricted to this one embedded agent: same
 renderer and command loop, with the title bar set from the manifest's
 `name` (falling back to `specialization`) and the manifest's model plus
-its fallbacks as the only allowed models. **Not fully enforced yet**: the
-restriction is decided by tested, pure logic
-(`harw_tui::fixed_agent::{hidden_command_names, is_model_switch_target_allowed}`),
-but the hook that would apply it inside `harw-tui`'s command registry and
-`/model switch` validation is not wired in this wave — today `/model
-switch` stays disabled outright rather than restricted-but-open, and the
-UIA-switch/agent-selection commands a fixed session should hide are not
-yet filtered out of the popup. See `harw-tui/src/fixed_agent.rs`'s module
-docs for the exact spot.
+its fallbacks as the only allowed models. The restrictions are enforced:
+`run_fixed_agent` feeds `harw_tui::fixed_agent::hidden_command_names`
+into `harw-tui`'s command registry (`ChatApp::with_hidden_commands`), so
+the UIA-switch and agent-selection commands a fixed session should hide
+are removed from the popup, tab-completion and dispatch, and a
+`/model switch` attempt is refused by the local-command gate
+(`harw-tui/src/local_commands.rs`) before it can run. Today the compiled
+runner passes `allow_model_switch: false`, so `/model switch` stays
+disabled outright rather than restricted-but-open — the allowlist
+(`allowed_models`) is already carried and wired, and flipping the flag
+at the single call site (`harw-agent-runner/src/iface/tui.rs`) is the
+only change a restricted-but-open switch needs. See
+`harw-tui/src/fixed_agent.rs`'s module docs for the exact spots.
 
 ### 5.7 Delegated children (`--child`)
 
@@ -302,14 +307,18 @@ arrives; a parent can only narrow a child below its own manifest, never
 grant it more.
 
 `harw-agent-runner` ships the process-driving side of this
-(`JobChildBackend`, tested standalone against a real spawned process) and
-the child-process side (`crate::child::run_child`), but **nothing in the
-embedded runtime yet wires `JobChildBackend` into a compiled agent's own
-run** for `child_execution = "job"` — the seam exists
-(`RuntimeSpec::child_backend`) but no call site sets it for
-`EntryKind::CompiledAgent` today. Until that lands, `--child` only runs
-when something explicitly invokes it (as the backend's own tests do), not
-as an automatic effect of a root agent delegating to a child.
+(`JobChildBackend`, tested standalone against real spawned processes:
+hello/result, two crash shapes, the job-managed path and cancel) and the
+child-process side (`crate::child::run_child`). For a compiled root
+agent the wiring is automatic: when `RunnerContext::builder` assembles
+the embedded runtime and the definition's `[binary].child_execution` is
+`"job"` (the default) and the process is not itself a `--child` run, it
+sets the job-backed child backend on the assembly, so a root agent's own
+delegation starts each child as a separate runner process speaking
+`harwness.agent-child/v1` — no explicit `--child` invocation needed. The
+seam is `RuntimeSpec::child_backend` (`harw-runtime/src/assembly.rs`
+passes it through to the `ManagedAgentSpawner`); `[binary]
+child_execution = "in-process"` keeps the legacy in-process spawner.
 
 ### Inspect a binary
 

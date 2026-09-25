@@ -5105,7 +5105,9 @@ mod tests {
 
     #[test]
     fn test_jemalloc_allocator_is_feature_gated() -> TestResult {
-        let source = include_str!("main.rs");
+        // Seit #22 lebt der Allokator in der Bibliothek (`main.rs` ruft nur
+        // `main_entry`), damit auch eine native, personalisierte harw ihn erbt.
+        let source = include_str!("lib.rs");
         let allocator = source
             .find("#[global_allocator]")
             .ok_or(TestError::Missing("global allocator declaration present"))?;

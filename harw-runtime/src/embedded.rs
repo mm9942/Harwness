@@ -65,23 +65,21 @@ impl EmbeddedAgent {
                 if blobs.contains_key(&reference.blake3) {
                     continue;
                 }
-                let bytes = bundle
-                    .resolve(artifact, reference)
-                    .ok_or_else(|| RuntimeError::Config {
-                        detail: format!(
-                            "agent {id}: {} references the missing blob {}",
-                            reference.logical_path, reference.blake3
-                        ),
-                    })?;
+                let bytes =
+                    bundle
+                        .resolve(artifact, reference)
+                        .ok_or_else(|| RuntimeError::Config {
+                            detail: format!(
+                                "agent {id}: {} references the missing blob {}",
+                                reference.logical_path, reference.blake3
+                            ),
+                        })?;
                 blobs.insert(reference.blake3, bytes.to_vec());
             }
         }
         if !agent_irs.contains_key(&bundle.header.root) {
             return Err(RuntimeError::Config {
-                detail: format!(
-                    "bundle root '{}' has no agent entry",
-                    bundle.header.root
-                ),
+                detail: format!("bundle root '{}' has no agent entry", bundle.header.root),
             });
         }
         let root_permissions = agent_irs[&bundle.header.root].permissions.clone();
@@ -119,7 +117,6 @@ impl EmbeddedAgent {
 
     /// Alle Agenten-IDs der Delegationshülle (Wurzel eingeschlossen),
     /// aufsteigend sortiert.
-    #[must_use]
     pub fn agent_ids(&self) -> impl Iterator<Item = &str> + '_ {
         self.agent_irs.keys().map(String::as_str)
     }
@@ -172,13 +169,27 @@ impl EmbeddedAgent {
         &self.rights
     }
 
-    /// Ersetzt die geltenden Rechte. Aufrufer verengen zuerst über
-    /// [`EffectiveRights::narrowed_by`] — dieser Setter selbst prüft nichts,
-    /// er ist der reine Ablagepunkt.
+    /// Verengt die geltenden Rechte; auch direkte SDK-Aufrufer können das
+    /// Manifest oder eine zuvor angewendete Einschränkung nicht erweitern.
     #[must_use]
     pub fn with_rights(mut self, rights: EffectiveRights) -> Self {
-        self.rights = rights;
+        self.rights = self.rights.intersect(&rights);
         self
+    }
+
+    /// Selects a bundled agent as the root while retaining the parent's
+    /// current permission ceiling.
+    ///
+    /// # Errors
+    /// Returns a configuration error when the agent is not bundled.
+    pub fn for_agent(&self, id: &str) -> RuntimeResult<Self> {
+        let ir = self.agent_ir(id).ok_or_else(|| RuntimeError::Config {
+            detail: format!("agent '{id}' is not present in the compiled bundle"),
+        })?;
+        let mut selected = self.clone();
+        selected.bundle.header.root = id.to_owned();
+        selected.rights = EffectiveRights::from_manifest(&ir.permissions).intersect(&self.rights);
+        Ok(selected)
     }
 
     /// Die Bytes einer Payload eines Agenten (`kind`/`logical_path` genau wie
@@ -251,6 +262,34 @@ pub struct EffectiveRights {
 }
 
 impl EffectiveRights {
+    /// Intersects capabilities and every resource limit. Automatic approval
+    /// follows the requested policy without granting additional capabilities.
+    #[must_use]
+    pub fn intersect(mut self, ceiling: &Self) -> Self {
+        self.tools.retain(|tool| ceiling.tools.contains(tool));
+        self.network_hosts
+            .retain(|host| ceiling.network_hosts.contains(host));
+        self.network_open &= ceiling.network_open;
+        self.write &= ceiling.write;
+        self.shell &= ceiling.shell;
+        self.host &= ceiling.host;
+        self.full_access = ceiling.full_access;
+        self.budget = match (self.budget, ceiling.budget.as_ref()) {
+            (Some(mut budget), Some(cap)) => {
+                budget.max_tokens = intersect_limit(budget.max_tokens, cap.max_tokens);
+                budget.max_tool_calls = intersect_limit(budget.max_tool_calls, cap.max_tool_calls);
+                budget.max_wall_secs = intersect_limit(budget.max_wall_secs, cap.max_wall_secs);
+                budget.effort_cap = match (budget.effort_cap, cap.effort_cap) {
+                    (Some(a), Some(b)) => Some(if (a as u8) <= (b as u8) { a } else { b }),
+                    (a, b) => a.or(b),
+                };
+                Some(budget)
+            }
+            (budget, cap) => budget.or_else(|| cap.cloned()),
+        };
+        self
+    }
+
     /// Leitet die unverengten Rechte eines Manifests ab (`full_access:
     /// false`).
     #[must_use]
@@ -288,6 +327,13 @@ impl EffectiveRights {
         self.full_access = flags.full_access;
         self.budget = narrow_budget(self.budget, flags.max_tokens);
         self
+    }
+}
+
+fn intersect_limit<T: Ord>(a: Option<T>, b: Option<T>) -> Option<T> {
+    match (a, b) {
+        (Some(a), Some(b)) => Some(a.min(b)),
+        (a, b) => a.or(b),
     }
 }
 
@@ -372,10 +418,11 @@ admitted = ["fs.read"]
         )];
         let sources = LowerSources::new(&files);
         let target = DefinitionId::parse(target)?;
-        compile_agent(&target, &sources, OffsetDateTime::UNIX_EPOCH)
-            .map_err(|diagnostics: Diagnostics| -> Box<dyn std::error::Error> {
+        compile_agent(&target, &sources, OffsetDateTime::UNIX_EPOCH).map_err(
+            |diagnostics: Diagnostics| -> Box<dyn std::error::Error> {
                 diagnostics.to_string().into()
-            })
+            },
+        )
     }
 
     fn build_bundle() -> TestResult<(Bundle, Artifact)> {
@@ -410,6 +457,57 @@ admitted = ["fs.read"]
         let artifact = BundleBuilder::new(root).add_agent(child).build()?;
         let bundle = Bundle::from_artifact(&artifact)?;
         Ok((bundle, artifact))
+    }
+
+    #[test]
+    fn selected_child_keeps_its_identity_and_parent_restrictions() -> TestResult {
+        let (bundle, artifact) = build_bundle()?;
+        let parent = EmbeddedAgent::from_bundle(bundle, &artifact)?.with_rights(
+            EffectiveRights::from_manifest(
+                &compile(ROOT_DEF, "acme.agent.embedded-root@1")?.permissions,
+            )
+            .narrowed_by(&RightsFlags {
+                deny_tools: vec!["fs.read".to_owned()],
+                max_tokens: Some(7),
+                ..RightsFlags::default()
+            }),
+        );
+        let child = parent.for_agent("child")?;
+        assert_eq!(child.root_id(), "child");
+        assert_eq!(child.root_ir().specialization, "embedded-child");
+        assert!(child.rights().tools.is_empty());
+        assert!(!child.rights().write);
+        assert_eq!(
+            child.rights().budget.as_ref().and_then(|b| b.max_tokens),
+            Some(7)
+        );
+        assert!(parent.for_agent("missing").is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn replacing_rights_cannot_restore_denied_capabilities_or_budgets() -> TestResult {
+        let (bundle, artifact) = build_bundle()?;
+        let agent = EmbeddedAgent::from_bundle(bundle, &artifact)?;
+        let original = agent.rights().clone();
+        let restricted = original.clone().narrowed_by(&RightsFlags {
+            deny_tools: vec!["fs.write".to_owned()],
+            no_network: true,
+            read_only: true,
+            max_tokens: Some(3),
+            ..RightsFlags::default()
+        });
+        let agent = agent.with_rights(restricted).with_rights(original);
+        assert!(!agent.rights().tools.contains("fs.write"));
+        assert!(!agent.rights().network_open);
+        assert!(agent.rights().network_hosts.is_empty());
+        assert!(!agent.rights().write);
+        assert!(!agent.rights().shell);
+        assert_eq!(
+            agent.rights().budget.as_ref().and_then(|b| b.max_tokens),
+            Some(3)
+        );
+        Ok(())
     }
 
     #[test]
@@ -469,7 +567,10 @@ admitted = ["fs.read"]
         let artifact = BundleBuilder::new(root).build()?;
         let bundle = Bundle::from_artifact(&artifact)?;
         let result = EmbeddedAgent::from_bundle(bundle, &artifact);
-        assert!(matches!(result, Err(RuntimeError::Config { .. })), "{result:?}");
+        assert!(
+            matches!(result, Err(RuntimeError::Config { .. })),
+            "{result:?}"
+        );
         Ok(())
     }
 

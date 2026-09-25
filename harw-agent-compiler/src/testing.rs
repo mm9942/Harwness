@@ -95,9 +95,8 @@ impl CaseRunner for SubprocessCaseRunner<'_> {
     fn run(&self, artifact: &Artifact, prompt: &str) -> Result<String, String> {
         let runner = locate_runner(self.env, None, &self.env.host_target)
             .map_err(|error| error.to_string())?;
-        let runner_bytes = std::fs::read(&runner.path).map_err(|error| {
-            format!("read {}: {error}", runner.path.display())
-        })?;
+        let runner_bytes = std::fs::read(&runner.path)
+            .map_err(|error| format!("read {}: {error}", runner.path.display()))?;
         let binary = harw_agent_artifact::append_to_executable(&runner_bytes, artifact);
         let temp = std::env::temp_dir().join(format!(
             "harw-agent-test-{}-{}",
@@ -131,8 +130,7 @@ impl SubprocessCaseRunner<'_> {
             ));
         }
         let stdout = String::from_utf8_lossy(&output.stdout);
-        final_answer(&stdout)
-            .ok_or_else(|| "the runner reported no final answer".to_owned())
+        final_answer(&stdout).ok_or_else(|| "the runner reported no final answer".to_owned())
     }
 }
 
@@ -162,10 +160,7 @@ fn final_answer(json_lines: &str) -> Option<String> {
                 }
             }
             Some("message") if event.get("final_answer") == Some(&Value::Bool(true)) => {
-                message = event
-                    .get("text")
-                    .and_then(Value::as_str)
-                    .map(str::to_owned);
+                message = event.get("text").and_then(Value::as_str).map(str::to_owned);
             }
             _ => {}
         }
@@ -458,14 +453,14 @@ mod tests {
     }
 
     #[test]
-    fn test_subprocess_runner_reports_a_missing_runner() -> Result<(), Box<dyn std::error::Error>>
-    {
+    fn test_subprocess_runner_reports_a_missing_runner() -> Result<(), Box<dyn std::error::Error>> {
         let dir = tempfile::tempdir()?;
         let env = CompilerEnv::isolated(dir.path().join("home"), dir.path().to_path_buf());
         let runner = SubprocessCaseRunner::new(&env);
         assert!(runner.is_real());
-        let artifact = harw_agent_artifact::ArtifactBuilder::new(&serde_json::json!({"name": "demo"}))
-            .build()?;
+        let artifact =
+            harw_agent_artifact::ArtifactBuilder::new(&serde_json::json!({"name": "demo"}))
+                .build()?;
         let Err(error) = runner.run(&artifact, "hi") else {
             return Err("expected no runner to be installed".into());
         };
@@ -488,12 +483,22 @@ mod tests {
         // prompt it was given (its second positional argument: `--json
         // <prompt>`), then exits 0 — a real runner's `--json` shape for a
         // one-shot completed turn, just without an actual model behind it.
+        // The explicit `exit 0` matters here: `run()` above appends the
+        // artifact's raw bytes straight after this script via
+        // `append_to_executable`, and `/bin/sh` parses a script file top to
+        // bottom rather than stopping at some logical end, so without an
+        // explicit exit it walks into the appended binary and can trip on a
+        // stray byte that looks like shell syntax (e.g. `)`) — the same
+        // reason `test_run_execs_a_bare_artifact_through_a_located_runner`
+        // in `commands.rs` ends its fake runner with `exit 3`.
         let script = "#!/bin/sh\n\
-            printf '{\"type\":\"message\",\"source\":{\"parent\":null},\"text\":\"echo: %s\",\"final_answer\":true}\\n' \"$2\"\n";
+            printf '{\"type\":\"message\",\"source\":{\"parent\":null},\"text\":\"echo: %s\",\"final_answer\":true}\\n' \"$2\"\n\
+            exit 0\n";
         harw_agent_artifact::write_executable(&runner_path, script.as_bytes())?;
         let runner = SubprocessCaseRunner::new(&env);
-        let artifact = harw_agent_artifact::ArtifactBuilder::new(&serde_json::json!({"name": "demo"}))
-            .build()?;
+        let artifact =
+            harw_agent_artifact::ArtifactBuilder::new(&serde_json::json!({"name": "demo"}))
+                .build()?;
         let answer = runner.run(&artifact, "hi there")?;
         assert_eq!(answer, "echo: hi there");
         Ok(())

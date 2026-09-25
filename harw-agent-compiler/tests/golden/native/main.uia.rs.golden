@@ -9,6 +9,12 @@
 #![forbid(unsafe_code)]
 
 fn main() -> std::process::ExitCode {
+    if let Err(error) = harw_agent_artifact::EmbeddedArtifact::verify_current_exe_matches(
+        include_bytes!("../agent.harwa"),
+    ) {
+        eprintln!("agent integrity check failed: {error}");
+        return std::process::ExitCode::FAILURE;
+    }
     harw_cli::run_with_embedded_uia(
         include_bytes!("../agent.harwa"),
         harw_cli::HomeChoice::Named("mia"),

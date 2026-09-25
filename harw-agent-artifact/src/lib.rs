@@ -79,7 +79,7 @@
 //! # Embedding in an executable
 //!
 //! A built binary is `runner ‖ artifact ‖ footer`; see the [`embed`] module
-//! for the 56-byte footer ending in [`FOOTER_MAGIC`] (`HARWAEND`).
+//! for the 56-byte footer ending in [`FOOTER_MAGIC`] (`HARWAEN2`).
 //! [`append_to_executable`] produces it, [`write_executable`] writes it with
 //! mode `0o755`, and [`EmbeddedArtifact`] finds and verifies it again. No
 //! footer is [`ArtifactError::NotEmbedded`]; any mismatch is

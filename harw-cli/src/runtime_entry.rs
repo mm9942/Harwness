@@ -42,7 +42,9 @@ use harw_config::{ResolvedConfig, SessionSection};
 use harw_core::{InMemoryStateStore, SessionThreadMapper, StateStore, TranscriptStateStore};
 use harw_home::{active_profile_name, profile_dir};
 use harw_protocol::SessionEvent;
-use harw_runtime::{EmbeddedAgent, EntryKind, ModelSource, RuntimeAssembly, RuntimeSpec, RuntimeStores};
+use harw_runtime::{
+    EmbeddedAgent, EntryKind, ModelSource, RuntimeAssembly, RuntimeSpec, RuntimeStores,
+};
 use harw_session_store::TranscriptStore;
 use harw_types::{IngressSurface, PermissionTier, Principal, PrincipalKind};
 use tokio::sync::mpsc::UnboundedSender;

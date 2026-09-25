@@ -212,7 +212,10 @@ async fn serve(addr: SocketAddr, state: Arc<AppState>) -> ExitCode {
 }
 
 /// Reads a raw hyper request into the pieces [`dispatch`] needs.
-async fn handle(state: Arc<AppState>, request: Request<Incoming>) -> Result<HttpResponse, Infallible> {
+async fn handle(
+    state: Arc<AppState>,
+    request: Request<Incoming>,
+) -> Result<HttpResponse, Infallible> {
     let method = request.method().clone();
     let path = request.uri().path().to_owned();
     let headers = request.headers().clone();
@@ -258,7 +261,9 @@ async fn route(state: &AppState, method: &Method, path: &str, body: Value) -> Ht
 }
 
 fn path_segments(path: &str) -> Vec<&str> {
-    path.split('/').filter(|segment| !segment.is_empty()).collect()
+    path.split('/')
+        .filter(|segment| !segment.is_empty())
+        .collect()
 }
 
 /// Constant-time bearer check; `None` (no configured token) always passes.
@@ -266,7 +271,10 @@ fn authorize(state: &AppState, headers: &HeaderMap) -> bool {
     let Some(expected) = state.token.as_deref() else {
         return true;
     };
-    let Some(header) = headers.get(AUTHORIZATION).and_then(|value| value.to_str().ok()) else {
+    let Some(header) = headers
+        .get(AUTHORIZATION)
+        .and_then(|value| value.to_str().ok())
+    else {
         return false;
     };
     let Some(presented) = header
@@ -316,7 +324,7 @@ async fn handle_run(state: &AppState, body: Value) -> HttpResponse {
         );
     }
 
-    let mut session = match state.backend.open() {
+    let session = match state.backend.open() {
         Ok(session) => session,
         Err(error) => {
             return json_response(StatusCode::INTERNAL_SERVER_ERROR, &json!({"error": error}));
@@ -324,7 +332,11 @@ async fn handle_run(state: &AppState, body: Value) -> HttpResponse {
     };
     let cancel = session.cancel_handle();
 
-    let run_id = state.runs.lock().unwrap_or_else(std::sync::PoisonError::into_inner).alloc_id();
+    let run_id = state
+        .runs
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .alloc_id();
     let record = Arc::new(Mutex::new(RunRecord::new(request.context, cancel)));
     state
         .runs
@@ -349,9 +361,16 @@ async fn handle_run(state: &AppState, body: Value) -> HttpResponse {
 }
 
 fn handle_get_run(state: &AppState, id: &str) -> HttpResponse {
-    match state.runs.lock().unwrap_or_else(std::sync::PoisonError::into_inner).get(id) {
+    match state
+        .runs
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .get(id)
+    {
         Some(record) => {
-            let guard = record.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            let guard = record
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             json_response(StatusCode::OK, &guard.snapshot(id))
         }
         None => json_response(StatusCode::NOT_FOUND, &json!({"error": "not_found"})),
@@ -359,24 +378,41 @@ fn handle_get_run(state: &AppState, id: &str) -> HttpResponse {
 }
 
 fn handle_cancel(state: &AppState, id: &str) -> HttpResponse {
-    match state.runs.lock().unwrap_or_else(std::sync::PoisonError::into_inner).get(id) {
+    match state
+        .runs
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .get(id)
+    {
         Some(record) => {
             let cancelled = {
-                let guard = record.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+                let guard = record
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
                 guard.cancel.cancel()
             };
-            json_response(StatusCode::OK, &json!({"run_id": id, "cancelled": cancelled}))
+            json_response(
+                StatusCode::OK,
+                &json!({"run_id": id, "cancelled": cancelled}),
+            )
         }
         None => json_response(StatusCode::NOT_FOUND, &json!({"error": "not_found"})),
     }
 }
 
 fn handle_events(state: &AppState, id: &str) -> HttpResponse {
-    let Some(record) = state.runs.lock().unwrap_or_else(std::sync::PoisonError::into_inner).get(id) else {
+    let Some(record) = state
+        .runs
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .get(id)
+    else {
         return json_response(StatusCode::NOT_FOUND, &json!({"error": "not_found"}));
     };
     let (buffered, mut receiver, already_finished) = {
-        let guard = record.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let guard = record
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         (
             guard.events.clone(),
             guard.event_tx.subscribe(),
@@ -431,9 +467,15 @@ fn sse_frame(envelope: &Value) -> Bytes {
 /// Runs a turn to completion, forwarding every SDK event into the run's
 /// buffer/broadcast as it happens, then records the final status/text/usage
 /// and publishes a terminal `run.finished` marker event.
-async fn drive_run(record: Arc<Mutex<RunRecord>>, mut session: Box<dyn RunSession>, prompt: String) {
+async fn drive_run(
+    record: Arc<Mutex<RunRecord>>,
+    mut session: Box<dyn RunSession>,
+    prompt: String,
+) {
     {
-        let mut guard = record.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut guard = record
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         guard.status = RunStatus::Running;
     }
 
@@ -460,7 +502,9 @@ async fn drive_run(record: Arc<Mutex<RunRecord>>, mut session: Box<dyn RunSessio
         record_event(&record, envelope);
     }
 
-    let mut guard = record.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    let mut guard = record
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     match outcome {
         Ok(result) => {
             guard.status = result.status;
@@ -478,7 +522,9 @@ async fn drive_run(record: Arc<Mutex<RunRecord>>, mut session: Box<dyn RunSessio
 }
 
 fn record_event(record: &Arc<Mutex<RunRecord>>, envelope: Value) {
-    let mut guard = record.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    let mut guard = record
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     guard.events.push(envelope.clone());
     let _ = guard.event_tx.send(envelope);
 }
@@ -592,9 +638,13 @@ impl Runs {
     fn evict_finished_over_cap(&mut self) {
         while self.map.len() > MAX_RUNS {
             let evictable = self.order.iter().position(|id| {
-                self.map
-                    .get(id)
-                    .is_some_and(|record| record.lock().unwrap_or_else(std::sync::PoisonError::into_inner).status.is_finished())
+                self.map.get(id).is_some_and(|record| {
+                    record
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .status
+                        .is_finished()
+                })
             });
             match evictable {
                 Some(index) => {
@@ -697,7 +747,11 @@ impl RunSession for SdkSession {
 
     fn send(&mut self, prompt: String) -> BoxFuture<'_, Result<RunOutcome, String>> {
         Box::pin(async move {
-            let report = self.0.send(prompt).await.map_err(|error| error.to_string())?;
+            let report = self
+                .0
+                .send(prompt)
+                .await
+                .map_err(|error| error.to_string())?;
             Ok(RunOutcome {
                 status: status_from_turn(&report.status),
                 text: report.text,
@@ -765,60 +819,101 @@ fn sdk_event_envelope(event: &harwness_sdk::SdkEvent) -> Value {
             "source": source_json(source),
             "text": text,
         }),
-        SdkEvent::Message { source, text, final_answer } => json!({
+        SdkEvent::Message {
+            source,
+            text,
+            final_answer,
+        } => json!({
             "event": "message",
             "source": source_json(source),
             "text": text,
             "final_answer": final_answer,
         }),
-        SdkEvent::ToolCall { source, call_id, tool, arguments } => json!({
+        SdkEvent::ToolCall {
+            source,
+            call_id,
+            tool,
+            arguments,
+        } => json!({
             "event": "tool_call",
             "source": source_json(source),
             "call_id": call_id,
             "tool": tool,
             "arguments": arguments,
         }),
-        SdkEvent::ToolResult { source, call_id, output, duration } => json!({
+        SdkEvent::ToolResult {
+            source,
+            call_id,
+            output,
+            duration,
+        } => json!({
             "event": "tool_result",
             "source": source_json(source),
             "call_id": call_id,
             "output": tool_output_json(output),
             "duration_ms": duration.as_millis() as u64,
         }),
-        SdkEvent::ChildSpawned { source, child, role, task } => json!({
+        SdkEvent::ChildSpawned {
+            source,
+            child,
+            role,
+            task,
+        } => json!({
             "event": "child_spawned",
             "source": source_json(source),
             "child": child.to_string(),
             "role": role,
             "task": task,
         }),
-        SdkEvent::ChildCompleted { source, child, outcome, duration } => json!({
+        SdkEvent::ChildCompleted {
+            source,
+            child,
+            outcome,
+            duration,
+        } => json!({
             "event": "child_completed",
             "source": source_json(source),
             "child": child.to_string(),
             "outcome": outcome,
             "duration_ms": duration.as_millis() as u64,
         }),
-        SdkEvent::Usage { source, round, turn_total, final_round } => json!({
+        SdkEvent::Usage {
+            source,
+            round,
+            turn_total,
+            final_round,
+        } => json!({
             "event": "usage",
             "source": source_json(source),
             "round": usage_json(&UsageInfo::from_sdk(round)),
             "turn_total": usage_json(&UsageInfo::from_sdk(turn_total)),
             "final_round": final_round,
         }),
-        SdkEvent::Context { source, used_tokens, window_tokens } => json!({
+        SdkEvent::Context {
+            source,
+            used_tokens,
+            window_tokens,
+        } => json!({
             "event": "context",
             "source": source_json(source),
             "used_tokens": used_tokens,
             "window_tokens": window_tokens,
         }),
-        SdkEvent::Error { source, message, retryable } => json!({
+        SdkEvent::Error {
+            source,
+            message,
+            retryable,
+        } => json!({
             "event": "error",
             "source": source_json(source),
             "message": message,
             "retryable": retryable,
         }),
-        SdkEvent::Finished { source, status, usage } => json!({
+        SdkEvent::Finished {
+            source,
+            status,
+            usage,
+        } => json!({
             "event": "finished",
             "source": source_json(source),
             "status": match status {
@@ -885,12 +980,8 @@ async fn read_json_body(
     if bytes.is_empty() {
         return Ok(Value::Null);
     }
-    serde_json::from_slice(&bytes).map_err(|_| {
-        json_response(
-            StatusCode::BAD_REQUEST,
-            &json!({"error": "invalid_json"}),
-        )
-    })
+    serde_json::from_slice(&bytes)
+        .map_err(|_| json_response(StatusCode::BAD_REQUEST, &json!({"error": "invalid_json"})))
 }
 
 fn json_response(status: StatusCode, body: &Value) -> HttpResponse {
@@ -942,7 +1033,9 @@ mod tests {
     impl RunSession for EchoSession {
         fn events(&mut self) -> Pin<Box<dyn Stream<Item = Value> + Send>> {
             let receiver = self.events_rx.take().expect("events() called once");
-            Box::pin(tokio_stream::wrappers::UnboundedReceiverStream::new(receiver))
+            Box::pin(tokio_stream::wrappers::UnboundedReceiverStream::new(
+                receiver,
+            ))
         }
 
         fn cancel_handle(&self) -> Arc<dyn Cancellable> {
@@ -1037,14 +1130,28 @@ mod tests {
     #[tokio::test]
     async fn missing_token_configuration_allows_any_request() {
         let state = test_state(None);
-        let response = dispatch(&state, &Method::GET, "/manifest", &HeaderMap::new(), Value::Null).await;
+        let response = dispatch(
+            &state,
+            &Method::GET,
+            "/manifest",
+            &HeaderMap::new(),
+            Value::Null,
+        )
+        .await;
         assert_eq!(response.status(), StatusCode::OK);
     }
 
     #[tokio::test]
     async fn wrong_token_yields_401() -> TestResult {
         let state = test_state(Some("correct-token"));
-        let response = dispatch(&state, &Method::GET, "/manifest", &bearer("wrong")?, Value::Null).await;
+        let response = dispatch(
+            &state,
+            &Method::GET,
+            "/manifest",
+            &bearer("wrong")?,
+            Value::Null,
+        )
+        .await;
         assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
         Ok(())
     }
@@ -1067,7 +1174,14 @@ mod tests {
     #[tokio::test]
     async fn healthz_bypasses_auth() {
         let state = test_state(Some("secret"));
-        let response = dispatch(&state, &Method::GET, "/healthz", &HeaderMap::new(), Value::Null).await;
+        let response = dispatch(
+            &state,
+            &Method::GET,
+            "/healthz",
+            &HeaderMap::new(),
+            Value::Null,
+        )
+        .await;
         assert_eq!(response.status(), StatusCode::OK);
     }
 
@@ -1196,7 +1310,10 @@ mod tests {
         .await;
         assert_eq!(events_response.status(), StatusCode::OK);
         assert_eq!(
-            events_response.headers().get(CONTENT_TYPE).and_then(|v| v.to_str().ok()),
+            events_response
+                .headers()
+                .get(CONTENT_TYPE)
+                .and_then(|v| v.to_str().ok()),
             Some("text/event-stream; charset=utf-8")
         );
 
@@ -1287,10 +1404,7 @@ mod tests {
                 None,
                 Arc::new(FlagCancel(Arc::new(AtomicBool::new(false)))),
             )));
-            record
-                .lock()
-                .map_err(|_| "poisoned lock")?
-                .status = RunStatus::Completed;
+            record.lock().map_err(|_| "poisoned lock")?.status = RunStatus::Completed;
             runs.insert(format!("run-{index}"), record);
         }
         assert!(runs.map.len() <= MAX_RUNS, "map grew to {}", runs.map.len());
@@ -1312,10 +1426,7 @@ mod tests {
                 None,
                 Arc::new(FlagCancel(Arc::new(AtomicBool::new(false)))),
             )));
-            record
-                .lock()
-                .map_err(|_| "poisoned lock")?
-                .status = RunStatus::Completed;
+            record.lock().map_err(|_| "poisoned lock")?.status = RunStatus::Completed;
             runs.insert(format!("run-{index}"), record);
         }
         assert!(runs.map.contains_key("in-flight"));

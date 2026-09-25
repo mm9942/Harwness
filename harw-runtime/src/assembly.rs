@@ -128,8 +128,8 @@ use crate::model::ModelSource;
 use crate::sandbox::{root_network_scope, root_sandbox_with_network};
 use crate::services::{PlanServices, RuntimeServices, RuntimeServicesParts, ServiceSurface};
 use crate::spec::{
-    AskResolution, ChildBackendHandle, EntryKind, EntryProfile, OperationSurface, RootBudget,
-    RuntimeSpec, SpawnerPolicy,
+    AskResolution, EntryKind, EntryProfile, OperationSurface, RootBudget, RuntimeSpec,
+    SpawnerPolicy,
 };
 use crate::trace::new_root_trace;
 
@@ -771,6 +771,43 @@ const fn root_organizational_role(spawner: SpawnerPolicy) -> AgentRoleId {
 /// # Rückgabe
 /// Ohne IR [`SessionActivation::default`] (Profil `Full`) — genau der Wert,
 /// den `AgentSession::new_with_id` setzt, also kein Schnitt.
+fn compiled_workspace_root(
+    root: &Path,
+    ir: &harw_agent_dsl::ir_v2::AgentIr,
+) -> RuntimeResult<PathBuf> {
+    let paths = &ir.permissions.filesystem.write_paths;
+    let requested = match paths.as_slice() {
+        [] if !ir.permissions.filesystem.write => return Ok(root.to_path_buf()),
+        [path] if path == harw_agent_dsl::ir_v2::WORKSPACE_WRITE_PATH => {
+            return Ok(root.to_path_buf());
+        }
+        [path] => root.join(path),
+        _ => {
+            return Err(RuntimeError::Sandbox {
+                detail: "compiled write permission requires exactly one workspace write path"
+                    .to_owned(),
+            });
+        }
+    };
+    let canonical = requested
+        .canonicalize()
+        .map_err(|error| RuntimeError::Sandbox {
+            detail: format!(
+                "compiled workspace '{}' cannot be resolved: {error}",
+                requested.display()
+            ),
+        })?;
+    if !canonical.is_dir() || !canonical.starts_with(root) {
+        return Err(RuntimeError::Sandbox {
+            detail: format!(
+                "compiled write path '{}' is outside the permitted workspace",
+                requested.display()
+            ),
+        });
+    }
+    Ok(canonical)
+}
+
 fn root_activation(ir: Option<&ExecutableAgentIr>) -> SessionActivation {
     let Some(ir) = ir else {
         return SessionActivation::default();
@@ -1824,11 +1861,31 @@ impl RuntimeAssemblyBuilder {
         //      Netz (nur `Tui`/`OneShot`): Hosts ausschließlich aus der
         //      Egress-Allowlist; ohne Allowlist kein Host und kein Netzrecht.
         let bound_root = sandbox_root(&project.project_root, narrowing.as_ref())?;
-        let unrestricted = root_sandbox_with_network(
-            spec.entry,
-            &bound_root,
-            root_network_scope(spec.entry, &config),
-        )?;
+        let bound_root = if let Some(embedded) = spec.embedded.as_ref() {
+            compiled_workspace_root(&bound_root, embedded.root_ir())?
+        } else {
+            bound_root
+        };
+        let unrestricted = if let Some(embedded) = spec.embedded.as_ref() {
+            let rights = embedded.rights();
+            let scope = if rights.network_open {
+                NetworkScope::from_hosts(rights.network_hosts.iter().cloned())
+            } else {
+                NetworkScope::empty()
+            };
+            crate::sandbox::root_sandbox_with_permissions(
+                spec.entry,
+                &bound_root,
+                scope,
+                profile.permissions.clone(),
+            )?
+        } else {
+            root_sandbox_with_network(
+                spec.entry,
+                &bound_root,
+                root_network_scope(spec.entry, &config),
+            )?
+        };
         if narrowing
             .as_ref()
             .is_some_and(|narrowing| narrowing.workspace_root.is_some())
@@ -1886,8 +1943,13 @@ impl RuntimeAssemblyBuilder {
         // ([`resolve_explicit_root_agent`]). Ohne expliziten Agenten hat ein
         // UI-Einstieg genau einen Root: die UIA. Die Werkzeuge bleiben in
         // jedem Fall durch Einstiegsprofil und Sandbox gedeckelt.
-        let agent_ir =
-            resolve_explicit_root_agent(spec.active_agent.as_deref(), &config, &agent_definitions)?;
+        let agent_ir = if spec.entry == EntryKind::CompiledAgent {
+            spec.embedded
+                .as_ref()
+                .map(|embedded| ExecutableAgentIr::from(embedded.root_ir()))
+        } else {
+            resolve_explicit_root_agent(spec.active_agent.as_deref(), &config, &agent_definitions)?
+        };
         // #22 Welle 3: eine native, personalisierte harw bringt ihre UIA
         // bereits eingebettet mit (`spec.embedded`, von `harw-cli` aus
         // `embedded_uia()` gesetzt); die gewinnt dann über
@@ -2377,7 +2439,10 @@ impl RuntimeAssemblyBuilder {
         // 8. Operationen nach der Fläche des Einstiegs.
         let operations = build_operations(profile.operations, plan_services.as_ref());
 
-        let budget = RootBudget::from_config(&config, spec.entry);
+        let budget = match spec.embedded.as_ref() {
+            Some(embedded) => RootBudget::for_embedded(embedded.rights(), &config),
+            None => RootBudget::from_config(&config, spec.entry),
+        };
         let turn_limits = TurnLimits::from_root_budget(&budget);
 
         // 9. Modell, dann Spawner (die Kind-Fabrik braucht den Anbieter).
@@ -3094,6 +3159,16 @@ impl RuntimeAssemblyBuilder {
             }
         }
 
+        let registry_builder = if let Some(embedded) = spec.embedded.as_ref() {
+            let allowed: Vec<&str> = embedded.rights().tools.iter().map(String::as_str).collect();
+            registry_builder.map_tool_providers(|provider| {
+                Arc::new(harw_registry_defaults::RestrictedToolProvider::new(
+                    provider, &allowed,
+                ))
+            })
+        } else {
+            registry_builder
+        };
         let registry = registry_builder.build();
         let tools = registered_tool_names(&registry);
 
@@ -6036,6 +6111,7 @@ impl RuntimeAssembly {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::spec::ChildBackendHandle;
     use crate::test_support::{TestError, TestResult, ctx};
 
     #[test]
@@ -6228,6 +6304,88 @@ mod tests {
             .map_err(|diagnostics| TestError::Unexpected(format!("compile: {diagnostics}")))
     }
 
+    #[test]
+    fn compiled_assembly_applies_manifest_tools_network_and_budget() -> TestResult {
+        let fixture = build_fixture()?;
+        let ir = compile_ir(
+            "schema = \"harwness.agent/v1\"\nid = \"acme.agent.manifest@1\"\nversion = \"1.0.0\"\nrole = \"worker\"\nspecialization = \"manifest\"\n[tools]\nadmitted = [\"fs.read\", \"fs.write\", \"web.fetch\"]\n[network]\nhosts = [\"example.com\"]\n[spawn.budget]\nmax_tokens = 71\n",
+            "acme.agent.manifest@1",
+        )?;
+        let artifact =
+            harw_agent_artifact::BundleBuilder::new(harw_agent_artifact::bundle::AgentInput {
+                id: ir.id.to_string(),
+                name: "manifest".to_owned(),
+                ir: serde_json::to_value(&ir).map_err(ctx("serialize IR"))?,
+                files: Vec::new(),
+                children: Vec::new(),
+            })
+            .build()
+            .map_err(ctx("bundle"))?;
+        let bundle =
+            harw_agent_artifact::Bundle::from_artifact(&artifact).map_err(ctx("read bundle"))?;
+        let embedded =
+            crate::EmbeddedAgent::from_bundle(bundle, &artifact).map_err(ctx("embedded"))?;
+        let rights = embedded.rights().clone().narrowed_by(&crate::RightsFlags {
+            deny_tools: vec!["fs.write".to_owned()],
+            full_access: true,
+            ..crate::RightsFlags::default()
+        });
+        let mut builder = fixture_builder(EntryKind::CompiledAgent, &fixture);
+        builder.spec.embedded = Some(Arc::new(embedded.with_rights(rights)));
+        let (events, _receiver) = tokio::sync::mpsc::unbounded_channel::<SessionEvent>();
+        let assembly = builder
+            .session_events(events)
+            .build()
+            .map_err(ctx("compiled assembly"))?;
+        assert!(
+            assembly
+                .sandbox()
+                .permissions()
+                .contains(harw_authority::Permission::ReadWorkspace)
+        );
+        assert!(assembly.sandbox().network_scope().allows("example.com"));
+        assert!(
+            !assembly
+                .sandbox()
+                .network_scope()
+                .allows("unlisted.example")
+        );
+        assert_eq!(assembly.budget.max_total_tokens, 71);
+        assert!(assembly.tools.iter().any(|name| name == "fs.read"));
+        assert!(!assembly.tools.iter().any(|name| name == "fs.write"));
+        assert!(
+            assembly
+                .tools
+                .iter()
+                .all(|name| matches!(name.as_str(), "fs.read" | "web.fetch"))
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn compiled_workspace_hint_binds_inside_workspace_and_rejects_escape() -> TestResult {
+        let fixture = build_fixture()?;
+        let root = fixture
+            .project
+            .canonicalize()
+            .map_err(ctx("canonical root"))?;
+        let nested = root.join("nested");
+        std::fs::create_dir_all(&nested).map_err(ctx("nested"))?;
+        let mut ir = compile_ir(
+            "schema = \"harwness.agent/v1\"\nid = \"acme.agent.paths@1\"\nversion = \"1.0.0\"\nrole = \"worker\"\nspecialization = \"paths\"\n[tools]\nadmitted = [\"fs.write\"]\n[spawn]\nworkspace_hint = \"nested\"\n",
+            "acme.agent.paths@1",
+        )?;
+        assert_eq!(
+            compiled_workspace_root(&root, &ir).map_err(ctx("bound root"))?,
+            nested
+        );
+        ir.permissions.filesystem.write_paths = vec!["..".to_owned()];
+        assert!(compiled_workspace_root(&root, &ir).is_err());
+        ir.permissions.filesystem.write_paths.clear();
+        assert!(compiled_workspace_root(&root, &ir).is_err());
+        Ok(())
+    }
+
     /// #22 Welle 3: die eingebettete UIA einer personalisierten harw
     /// (`spec.embedded`, `EntryKind::Tui`/`OneShot`) wird genau wie eine
     /// über `harness.active_uia_definition` konfigurierte UIA auf die Rolle
@@ -6254,8 +6412,7 @@ mod tests {
             "acme.agent.embedded-worker@1",
         )?;
 
-        let resolved =
-            resolve_embedded_uia(&uia_ir).map_err(ctx("embedded uia should resolve"))?;
+        let resolved = resolve_embedded_uia(&uia_ir).map_err(ctx("embedded uia should resolve"))?;
         assert_eq!(resolved.role(), AgentRoleId::UserInterface);
 
         let rejected = resolve_embedded_uia(&worker_ir);

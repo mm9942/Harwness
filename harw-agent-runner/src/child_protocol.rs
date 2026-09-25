@@ -36,6 +36,15 @@ use serde::{Deserialize, Serialize};
 /// [`ChildToParent::Hello`] and checked by the parent via [`verify_protocol`].
 pub const PROTOCOL_VERSION: &str = "harwness.agent-child/v1";
 
+/// Maximum `[`/`{` nesting depth a single protocol line — or, via
+/// `iface::mcp`, an MCP JSON-RPC message or Streamable HTTP request body —
+/// is allowed to reach before it is rejected by [`json_nesting_too_deep`].
+/// `serde_json`'s recursive-descent parser has no depth limit of its own and
+/// can exhaust the call stack on a deeply-nested-but-otherwise-tiny payload
+/// (e.g. megabytes of `[[[[...`), so every untrusted JSON entry point in
+/// this crate checks this bound first.
+pub const MAX_JSON_NESTING_DEPTH: usize = 64;
+
 /// One frame sent from the parent to a child, over the child's stdin.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
@@ -298,11 +307,71 @@ pub fn encode_line<T: Serialize>(frame: &T) -> Result<String, ProtocolError> {
 /// Decodes one line (without its trailing newline) as a frame.
 ///
 /// # Errors
-/// [`ProtocolError::Malformed`] if `line` is not valid JSON or does not
-/// match any tagged variant of `T`.
+/// [`ProtocolError::Malformed`] if `line` nests `[`/`{` past
+/// [`MAX_JSON_NESTING_DEPTH`] (checked before parsing, so a hostile deeply
+/// nested line never reaches `serde_json`'s recursive-descent parser), or if
+/// it is not valid JSON, or does not match any tagged variant of `T`.
 pub fn decode_line<T: for<'de> Deserialize<'de>>(line: &str) -> Result<T, ProtocolError> {
-    serde_json::from_str(line.trim_end_matches(['\n', '\r']))
-        .map_err(|error| ProtocolError::Malformed(error.to_string()))
+    let trimmed = line.trim_end_matches(['\n', '\r']);
+    if json_nesting_too_deep(trimmed, MAX_JSON_NESTING_DEPTH) {
+        return Err(ProtocolError::Malformed(
+            "line nested too deeply".to_owned(),
+        ));
+    }
+    serde_json::from_str(trimmed).map_err(|error| ProtocolError::Malformed(error.to_string()))
+}
+
+/// Scans `input` for `[`/`{` nesting deeper than `max_depth`, without
+/// parsing or allocating.
+///
+/// # Description
+/// A single linear byte scan: `[`/`{` increment a depth counter and `]`/`}`
+/// decrement it (saturating — an unbalanced closing bracket never underflows
+/// past zero). Both are ignored while the scan is inside a JSON string,
+/// tracked by a `"` toggle with `\"`/`\\` escapes handled so an escaped
+/// quote does not end the string early. Returns as soon as the depth would
+/// exceed `max_depth`, without scanning the remainder of `input`.
+///
+/// # Arguments
+/// - `input` (`impl AsRef<[u8]>`): the raw bytes to scan — a `&str` protocol
+///   line and a request-body byte buffer both work without conversion.
+/// - `max_depth` (`usize`): the greatest nesting depth still accepted.
+///
+/// # Returns
+/// `true` if `input` contains `[`/`{` nesting strictly deeper than
+/// `max_depth`; `false` otherwise. This is a cheap pre-filter against
+/// pathological nesting, not a JSON validator — malformed JSON that never
+/// nests that deep still returns `false` here and is left for the real
+/// parser to reject.
+#[must_use]
+pub fn json_nesting_too_deep(input: impl AsRef<[u8]>, max_depth: usize) -> bool {
+    let mut depth: usize = 0;
+    let mut in_string = false;
+    let mut escaped = false;
+    for &byte in input.as_ref() {
+        if in_string {
+            if escaped {
+                escaped = false;
+            } else if byte == b'\\' {
+                escaped = true;
+            } else if byte == b'"' {
+                in_string = false;
+            }
+            continue;
+        }
+        match byte {
+            b'"' => in_string = true,
+            b'[' | b'{' => {
+                depth += 1;
+                if depth > max_depth {
+                    return true;
+                }
+            }
+            b']' | b'}' => depth = depth.saturating_sub(1),
+            _ => {}
+        }
+    }
+    false
 }
 
 /// Checks a child's reported protocol string (from [`ChildToParent::Hello`])
@@ -466,5 +535,40 @@ mod tests {
             wall_time_ms: 0,
         };
         assert_eq!(usage.fresh_tokens(), 150);
+    }
+
+    #[test]
+    fn test_json_nesting_too_deep_shallow_object_ok() {
+        assert!(!json_nesting_too_deep(r#"{"a":[1,2,3]}"#, 64));
+    }
+
+    #[test]
+    fn test_json_nesting_too_deep_depth_exactly_max_ok() {
+        let nested = format!("{}{}", "[".repeat(64), "]".repeat(64));
+        assert!(!json_nesting_too_deep(&nested, 64));
+    }
+
+    #[test]
+    fn test_json_nesting_too_deep_depth_max_plus_one_true() {
+        let nested = format!("{}{}", "[".repeat(65), "]".repeat(65));
+        assert!(json_nesting_too_deep(&nested, 64));
+    }
+
+    #[test]
+    fn test_json_nesting_too_deep_brackets_inside_strings_ignored() {
+        assert!(!json_nesting_too_deep(r#""[[[[[""#, 1));
+    }
+
+    #[test]
+    fn test_json_nesting_too_deep_escaped_quote_inside_string_handled() {
+        // The `\"` does not close the string, so the following `[[[` stay
+        // inside it (and are ignored) rather than being read as three
+        // separate opening brackets.
+        assert!(!json_nesting_too_deep(r#""a\"[[[""#, 1));
+    }
+
+    #[test]
+    fn test_json_nesting_too_deep_unbalanced_closing_brackets_do_not_underflow() {
+        assert!(!json_nesting_too_deep("]]]]]]", 0));
     }
 }

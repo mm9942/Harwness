@@ -44,8 +44,7 @@ use crate::context::RunnerContext;
 use crate::error::RunnerError;
 
 /// Reason given to the model when no terminal can answer interactively.
-pub const NON_INTERACTIVE_DENY_REASON: &str =
-    "approval denied: no terminal is attached to ask interactively (pass --full-access for an \
+pub const NON_INTERACTIVE_DENY_REASON: &str = "approval denied: no terminal is attached to ask interactively (pass --full-access for an \
      unattended run within the manifest)";
 
 /// Reason given to the model when a human typed anything but yes/always.
@@ -157,10 +156,9 @@ impl TerminalApproval {
         }
         let owned_tool = tool.to_owned();
         let owned_arguments = arguments.clone();
-        let choice =
-            tokio::task::spawn_blocking(move || Self::ask(&owned_tool, &owned_arguments))
-                .await
-                .unwrap_or(Choice::Deny);
+        let choice = tokio::task::spawn_blocking(move || Self::ask(&owned_tool, &owned_arguments))
+            .await
+            .unwrap_or(Choice::Deny);
         match choice {
             Choice::Approve => Decision::Approve,
             Choice::AlwaysThisSession => {
@@ -184,11 +182,16 @@ impl ApprovalHandler for TerminalApproval {
 /// Builds this invocation's [`Harwness`] with `approvals` wired in.
 ///
 /// # Description
-/// [`RunnerContext::harwness`] builds without an approval handler on
-/// purpose; this repeats its two settings (`.embedded(..)`, `.cwd(..)`) and
-/// adds `.approval_handler_arc(approvals)`, so `iface::cli` and
+/// Starts from [`RunnerContext::builder`] — the same `.embedded(..)`,
+/// `.cwd(..)`, conditional [`crate::job_child_backend::JobChildBackend`]
+/// wiring, and `HARW_OFFLINE_ECHO` pickup [`RunnerContext::harwness`] uses —
+/// and adds `.approval_handler_arc(approvals)` on top, so `iface::cli` and
 /// `iface::repl` embed the agent exactly the way every other interface
-/// does, plus the one thing only they need.
+/// does, plus the one thing only they need. An earlier version of this
+/// function rebuilt the chain by hand and, in doing so, silently dropped
+/// the offline-echo and job-backend wiring — a `HARW_OFFLINE_ECHO` run
+/// through `cli`/`repl` would then try to reach a real model provider
+/// instead of answering offline.
 ///
 /// # Errors
 /// [`RunnerError::Io`] if the current working directory cannot be read;
@@ -198,13 +201,7 @@ pub fn build_harwness(
     ctx: &RunnerContext,
     approvals: Arc<dyn ApprovalHandler>,
 ) -> Result<Harwness, RunnerError> {
-    let cwd = std::env::current_dir().map_err(|source| RunnerError::Io {
-        context: "read the current working directory",
-        source,
-    })?;
-    Harwness::builder()
-        .embedded(ctx.agent.clone())
-        .cwd(cwd)
+    ctx.builder()?
         .approval_handler_arc(approvals)
         .build()
         .map_err(RunnerError::from)
@@ -218,7 +215,9 @@ mod tests {
     #[tokio::test]
     async fn full_access_approves_without_asking_and_never_marks_denied() {
         let handler = TerminalApproval::with_interactive(true, false);
-        let decision = handler.decide_tool("shell.exec", &json!({"cmd": "rm -rf /"})).await;
+        let decision = handler
+            .decide_tool("shell.exec", &json!({"cmd": "rm -rf /"}))
+            .await;
         assert_eq!(decision, Decision::Approve);
         assert!(!handler.any_denied());
     }

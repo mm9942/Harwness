@@ -218,13 +218,15 @@ impl RootBudget {
         Self {
             max_model_rounds: budget
                 .max_tool_calls
-                .map_or(base.max_model_rounds, |calls| base.max_model_rounds.min(calls)),
-            max_total_tokens: budget
-                .max_tokens
-                .map_or(base.max_total_tokens, |tokens| base.max_total_tokens.min(tokens)),
-            max_wall: budget
-                .max_wall_secs
-                .map_or(base.max_wall, |secs| base.max_wall.min(Duration::from_secs(secs))),
+                .map_or(base.max_model_rounds, |calls| {
+                    base.max_model_rounds.min(calls)
+                }),
+            max_total_tokens: budget.max_tokens.map_or(base.max_total_tokens, |tokens| {
+                base.max_total_tokens.min(tokens)
+            }),
+            max_wall: budget.max_wall_secs.map_or(base.max_wall, |secs| {
+                base.max_wall.min(Duration::from_secs(secs))
+            }),
         }
     }
 }

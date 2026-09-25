@@ -10427,7 +10427,9 @@ mod tests {
         app.input.insert_str("/mo");
         app.sync_popup();
         assert!(
-            !app.command_popup.as_ref().is_some_and(CommandPopup::is_empty),
+            !app.command_popup
+                .as_ref()
+                .is_some_and(CommandPopup::is_empty),
             "model should still match /mo before hiding it"
         );
 
@@ -10437,7 +10439,9 @@ mod tests {
         app.input.insert_str("/mo");
         app.sync_popup();
         assert!(
-            app.command_popup.as_ref().is_some_and(CommandPopup::is_empty),
+            app.command_popup
+                .as_ref()
+                .is_some_and(CommandPopup::is_empty),
             "hidden /model must no longer match /mo in the popup"
         );
         Ok(())

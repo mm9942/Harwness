@@ -37,7 +37,7 @@ use std::io::{BufRead, IsTerminal, Write};
 use std::process::ExitCode;
 use std::sync::Arc;
 
-use harwness_sdk::{Session, SdkEvent, ToolOutput, TurnStatus};
+use harwness_sdk::{SdkEvent, Session, ToolOutput, TurnStatus};
 
 use super::approval::{TerminalApproval, build_harwness};
 use crate::context::RunnerContext;
@@ -138,7 +138,9 @@ async fn repl_loop(
                 let permissions = &ctx.root_ir().permissions;
                 match serde_json::to_string_pretty(permissions) {
                     Ok(text) => println!("{text}"),
-                    Err(error) => eprintln!("harw-agent-runner: could not render manifest: {error}"),
+                    Err(error) => {
+                        eprintln!("harw-agent-runner: could not render manifest: {error}")
+                    }
                 }
             }
             Line::Cancel => {
@@ -184,10 +186,14 @@ async fn run_turn(session: &mut Session, prompt: String) {
                     let _ = stdout.write_all(text.as_bytes());
                     let _ = stdout.flush();
                 }
-                SdkEvent::ToolCall { tool, arguments, .. } => {
+                SdkEvent::ToolCall {
+                    tool, arguments, ..
+                } => {
                     dim(&format!("→ {tool}({arguments})"));
                 }
-                SdkEvent::ToolResult { output, duration, .. } => {
+                SdkEvent::ToolResult {
+                    output, duration, ..
+                } => {
                     let outcome = match output {
                         ToolOutput::Success { .. } => "ok".to_owned(),
                         ToolOutput::Error { message } => format!("error: {message}"),

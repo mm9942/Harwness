@@ -166,6 +166,15 @@ build_code!(
     "role = \"child-orchestrator\"\n# no [delegation]",
     "add `[delegation]` with `targets = [\"explorer\"]`"
 );
+build_code!(
+    CHILD_CYCLE,
+    "HARW-BUILD-017",
+    Error,
+    "a delegation chain embeds one of its own ancestors",
+    "unlike a diamond (the same agent reachable through two different paths, `HARW-BUILD-014`), this name is already on the path from the compiled root down to here; embedding it would recurse forever",
+    "# a → b → a",
+    "remove the delegation back to the ancestor, or restructure the family so it is a DAG"
+);
 
 /// Every compiler code, in number order.
 pub const BUILD_CATALOG: &[DiagnosticCode] = &[
@@ -185,6 +194,7 @@ pub const BUILD_CATALOG: &[DiagnosticCode] = &[
     CHILD_REPEATED,
     NO_BASE_ROLE,
     DEPTH_WITHOUT_CHILDREN,
+    CHILD_CYCLE,
 ];
 
 /// Looks a code up in the DSL catalog and in [`BUILD_CATALOG`]

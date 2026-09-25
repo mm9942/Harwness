@@ -125,8 +125,9 @@ tracing = { workspace = true }
 # http/tui) mit ab, damit deren Agenten nicht je eine eigene Fassung ziehen.
 # `signal` added in wave 3B for `iface::repl`'s Ctrl+C → `CancelHandle`
 # wiring (`tokio::signal::ctrl_c`); `io-util` for `crate::child`'s
-# `AsyncBufReadExt`/`AsyncWriteExt` over its child process's stdio pipes.
-tokio = { version = "1.53.0", features = ["rt", "rt-multi-thread", "macros", "sync", "time", "net", "signal", "io-util", "process"] }
+# `AsyncBufReadExt`/`AsyncWriteExt` over its child process's stdio pipes;
+# `io-std` for `tokio::io::{stdin, stdout}` those same pipes are built on.
+tokio = { version = "1.53.0", features = ["rt", "rt-multi-thread", "macros", "sync", "time", "net", "signal", "io-util", "io-std", "process"] }
 serde = { workspace = true }
 # `job_child_backend`: `ChildBackend` trait and the child process group.
 harw-core = { path = "../harw-core" }

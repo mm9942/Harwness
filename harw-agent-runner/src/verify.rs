@@ -133,10 +133,7 @@ pub fn run_manifest(
                 permissions.network.hosts.join(", ")
             }
         );
-        println!(
-            "shell: {} host: {}",
-            permissions.shell, permissions.host
-        );
+        println!("shell: {} host: {}", permissions.shell, permissions.host);
         if let Some(budget) = &permissions.budget {
             println!(
                 "budget: max_tokens={:?} max_tool_calls={:?} max_wall_secs={:?}",

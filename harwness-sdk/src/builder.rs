@@ -342,7 +342,10 @@ impl HarwnessBuilder {
     /// in-process. Ohne diesen Aufruf bleibt jeder Kind-Lauf in-process — der
     /// bestehende Pfad.
     #[must_use]
-    pub fn child_backend(mut self, backend: Arc<dyn harw_core::child_backend::ChildBackend>) -> Self {
+    pub fn child_backend(
+        mut self,
+        backend: Arc<dyn harw_core::child_backend::ChildBackend>,
+    ) -> Self {
         self.child_backend = Some(backend);
         self
     }
@@ -482,9 +485,11 @@ impl HarwnessBuilder {
         // #22 Welle 3A: ein eingebettetes Artefakt bestimmt seinen
         // Wurzel-Agenten selbst (dieselbe Rolle wie `--agent`); ein
         // ausdrücklich gesetzter `agent()` behält Vorrang.
-        let agent = self
-            .agent
-            .or_else(|| self.embedded.as_ref().map(|agent| agent.root_id().to_owned()));
+        let agent = self.agent.or_else(|| {
+            self.embedded
+                .as_ref()
+                .map(|agent| agent.root_id().to_owned())
+        });
         let spec_inputs = SpecInputs {
             home,
             cwd: validated.cwd,

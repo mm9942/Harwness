@@ -314,7 +314,6 @@ impl EntryKind {
             },
         }
     }
-
 }
 
 impl EntryProfile {
@@ -552,7 +551,7 @@ mod tests {
         use RegistryProfile as P;
         use SpawnerPolicy as S;
 
-        let expected: [Row; 11] = [
+        let expected: [Row; 12] = [
             (
                 EntryKind::Tui,
                 &[R, W, X, N],
@@ -937,8 +936,7 @@ mod tests {
 
     #[test]
     fn for_embedded_picks_full_only_when_shell_is_admitted() {
-        let profile =
-            EntryProfile::for_embedded(&rights(&["shell.exec"], &[], false, false, true));
+        let profile = EntryProfile::for_embedded(&rights(&["shell.exec"], &[], false, false, true));
         assert!(profile.permissions.contains(Permission::ExecuteProcess));
         assert_eq!(profile.registry_profile, RegistryProfile::Full);
     }
@@ -956,7 +954,11 @@ mod tests {
 
         let without_hosts =
             EntryProfile::for_embedded(&rights(&["web.fetch"], &[], true, false, false));
-        assert!(!without_hosts.permissions.contains(Permission::NetworkAccess));
+        assert!(
+            !without_hosts
+                .permissions
+                .contains(Permission::NetworkAccess)
+        );
     }
 
     #[test]

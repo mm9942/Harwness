@@ -13,6 +13,7 @@ name = "harw-mia"
 path = "src/main.rs"
 
 [dependencies]
+harw-agent-artifact = { path = "/opt/harw-src/harw-agent-artifact" }
 # harw-cli with its default features: a normal harw.
 harw-cli = { path = "/opt/harw-src/harw-cli" }
 

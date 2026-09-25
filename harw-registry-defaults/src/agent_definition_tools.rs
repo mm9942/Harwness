@@ -2647,7 +2647,8 @@ impl AgentBuildToolProvider {
     pub fn new(manager: Option<std::sync::Arc<harw_tool_job::JobManager>>) -> Self {
         Self {
             starter: manager.map(|manager| {
-                std::sync::Arc::new(RealJobStarter(manager)) as std::sync::Arc<dyn AgentBuildJobStarter>
+                std::sync::Arc::new(RealJobStarter(manager))
+                    as std::sync::Arc<dyn AgentBuildJobStarter>
             }),
         }
     }
@@ -2665,7 +2666,8 @@ impl ToolProvider for AgentBuildToolProvider {
     fn executor(&self, name: &ToolName) -> Option<std::sync::Arc<dyn ToolExecutor>> {
         match name.as_str() {
             "agents.build" => self.starter.clone().map(|starter| {
-                std::sync::Arc::new(AgentsBuildExecutor { starter }) as std::sync::Arc<dyn ToolExecutor>
+                std::sync::Arc::new(AgentsBuildExecutor { starter })
+                    as std::sync::Arc<dyn ToolExecutor>
             }),
             _ => None,
         }
@@ -2686,8 +2688,8 @@ mod agents_build_tests {
     use harw_authority::{
         Permission, PermissionSet, SandboxSpec, WorkspaceRegistration, WorkspaceRegistry,
     };
-    use harw_extension_api::{ToolCall, ToolExecutionContext, ToolExecutor, ToolName, ToolOutput};
     use harw_extension_api::contributors::ToolProvider;
+    use harw_extension_api::{ToolCall, ToolExecutionContext, ToolExecutor, ToolName, ToolOutput};
     use harw_types::{SessionId, TenantId, TurnId, WorkspaceId};
     use std::sync::{Arc, Mutex};
 
@@ -2814,7 +2816,13 @@ mod agents_build_tests {
         assert_eq!(
             agents_build_argv(&args),
             vec![
-                "agent", "build", "explorer", "--interface", "cli,mcp", "--native", "--json",
+                "agent",
+                "build",
+                "explorer",
+                "--interface",
+                "cli,mcp",
+                "--native",
+                "--json",
             ]
         );
     }
@@ -2845,12 +2853,18 @@ mod agents_build_tests {
     #[test]
     fn test_provider_with_manager_registers_agents_build() {
         let provider = AgentBuildToolProvider {
-            starter: Some(Arc::new(FakeStarter::new("job-test-001")) as Arc<dyn AgentBuildJobStarter>),
+            starter: Some(
+                Arc::new(FakeStarter::new("job-test-001")) as Arc<dyn AgentBuildJobStarter>
+            ),
         };
         let tools = provider.tools();
         assert_eq!(tools.len(), 1);
         assert!(provider.executor(&ToolName::new("agents.build")).is_some());
-        assert!(provider.executor(&ToolName::new("agents.validate")).is_none());
+        assert!(
+            provider
+                .executor(&ToolName::new("agents.validate"))
+                .is_none()
+        );
     }
 
     /// Ohne `Permission::ExecuteProcess` lehnt der Executor ab, bevor er

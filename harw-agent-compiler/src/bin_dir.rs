@@ -480,6 +480,7 @@ mod tests {
         let versions = bin.versions("ec")?;
         assert_eq!(versions.len(), 2);
         assert_eq!(versions[0].dir_name, first.dir_name, "oldest first");
+        assert_eq!(versions[1].dir_name, second.dir_name);
         assert!(versions[1].current && !versions[0].current);
         assert_eq!(bin.names(), ["ec"]);
         Ok(())

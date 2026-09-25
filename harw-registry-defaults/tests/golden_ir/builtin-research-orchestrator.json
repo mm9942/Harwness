@@ -84,7 +84,7 @@
   "lifecycle": {
     "allow_pause": false,
     "allow_rerun": true,
-    "max_attempts": 2
+    "max_attempts": 4
   },
   "context": {
     "program": "orchestrate",
@@ -261,6 +261,6 @@
   },
   "snapshot": {
     "domain": "harwness.agent-ir.snapshot/v7",
-    "digest": "9cdfe496cbaba297a24744a343f774febb590d10d1129082e0aa464527d766ee"
+    "digest": "866b513ac07f11b09c8710272692be1c76aa65a81140f0e8ff52fec6168a60fe"
   }
 }

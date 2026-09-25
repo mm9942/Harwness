@@ -189,15 +189,33 @@ mod tests {
         }
         let unknown: Vec<&str> = harw_registry_defaults::capability_catalog::PROVIDER_FEATURES
             .iter()
-            .filter(|feature| !matches!(
-                **feature,
-                "authoring" | "core" | "knowledge" | "matrix" | "tool-browser" | "tool-deps"
-                    | "tool-doc" | "tool-explorer" | "tool-fs" | "tool-job" | "tool-latex"
-                    | "tool-lens" | "tool-plan" | "tool-process" | "tool-shell" | "tool-sudo"
-                    | "tool-web"
-            ))
+            .filter(|feature| {
+                !matches!(
+                    **feature,
+                    "authoring"
+                        | "core"
+                        | "knowledge"
+                        | "matrix"
+                        | "tool-browser"
+                        | "tool-deps"
+                        | "tool-doc"
+                        | "tool-explorer"
+                        | "tool-fs"
+                        | "tool-job"
+                        | "tool-latex"
+                        | "tool-lens"
+                        | "tool-plan"
+                        | "tool-process"
+                        | "tool-shell"
+                        | "tool-sudo"
+                        | "tool-web"
+                )
+            })
             .copied()
             .collect();
-        assert!(unknown.is_empty(), "capabilities.rs is missing: {unknown:?}");
+        assert!(
+            unknown.is_empty(),
+            "capabilities.rs is missing: {unknown:?}"
+        );
     }
 }

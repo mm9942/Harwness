@@ -483,9 +483,8 @@ mod tests {
         );
         assert_eq!(protected_component(Path::new(".mia/config.toml")), None);
 
-        harw_home::set_named_home("mia").map_err(|error| {
-            TestError::Unexpected(format!("set_named_home(\"mia\"): {error}"))
-        })?;
+        harw_home::set_named_home("mia")
+            .map_err(|error| TestError::Unexpected(format!("set_named_home(\"mia\"): {error}")))?;
         assert_eq!(harw_home::project_dir_name(), ".mia");
 
         // Danach: beide Namen sind geschützt.

@@ -303,6 +303,7 @@ pub fn run_chat(
                         open_picker_at_start,
                         factory: Box::new(factory),
                     }),
+                    fixed_agent: None,
                 },
             )
             .map_err(|error| error.to_string())

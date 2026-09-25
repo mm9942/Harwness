@@ -219,7 +219,10 @@ pub fn build(
                 runner.source
             ));
             let capabilities = probe.capabilities(&runner.path)?;
-            let feature_list: Vec<String> = features.iter().cloned().collect();
+            // Nur die Tool-Provider: `required_features` enthält zusätzlich die
+            // Interfaces (Cargo-Features des nativen Builds), die der Runner
+            // unter `interfaces` meldet und `problems` getrennt prüft.
+            let feature_list: Vec<String> = compiled.unit.features.iter().cloned().collect();
             let problems = capabilities.problems(&report.interfaces, &feature_list);
             if !problems.is_empty() {
                 return Err(CompileError::RunnerIncompatible {
@@ -276,6 +279,8 @@ pub fn build(
                 "read {}",
                 output.binary.display()
             )))?;
+            let bytes = append_to_executable(&bytes, &compiled.artifact);
+            EmbeddedArtifact::from_executable_bytes(&bytes)?;
             report.native = Some(output);
             (bytes, true)
         }

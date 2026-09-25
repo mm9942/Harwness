@@ -41,9 +41,9 @@
 pub mod args;
 mod child;
 mod child_protocol;
-mod job_child_backend;
 pub mod context;
 pub mod error;
+pub mod job_child_backend;
 
 pub mod capabilities;
 pub mod iface;
@@ -135,7 +135,10 @@ pub fn choose_interface(
     if !compiled.contains(&candidate.as_str()) {
         return Err(RunnerError::NotCompiled {
             requested: candidate.as_str().to_owned(),
-            compiled: compiled.iter().map(|feature| (*feature).to_owned()).collect(),
+            compiled: compiled
+                .iter()
+                .map(|feature| (*feature).to_owned())
+                .collect(),
         });
     }
     Ok(candidate)
@@ -248,8 +251,8 @@ fn run(load: impl FnOnce() -> Result<(Artifact, Bundle), RunnerError>) -> ExitCo
         Ok(agent) => agent,
         Err(error) => return report_error(&RunnerError::Runtime(error)),
     };
-    let rights = EffectiveRights::from_manifest(&agent.root_ir().permissions)
-        .narrowed_by(&args.flags);
+    let rights =
+        EffectiveRights::from_manifest(&agent.root_ir().permissions).narrowed_by(&args.flags);
     let agent = Arc::new(agent.with_rights(rights));
 
     print_banner(agent.root_ir(), args.json);

@@ -20,8 +20,10 @@ land in wave 1 of #22. The artifact crate, the compiler and the
 own interfaces (`cli`, `repl`, `mcp` over stdio, `http`, the mini `tui`)
 and the child protocol between a compiled binary and its delegated
 children land in wave 3 — see "Wave 3 consequences" in §3 for what wave 3
-changed against what this record originally decided, and what it still
-leaves half-wired.
+changed against what this record originally decided. Wave 5 closed the
+two pieces wave 3 left half-wired (MCP's Streamable HTTP transport and
+the automatic job-backed child execution) and enforced the mini TUI's
+fixed-agent restrictions; §3 lists the details.
 
 ---
 
@@ -225,29 +227,45 @@ way, made two decisions this record did not anticipate:
   (`harw_tui::fixed_agent`) rather than a new one — §2.5 left this
   unspecified beyond naming the five interface labels.
 
-Two pieces §2.5–§2.6 implied are not fully wired by the end of wave 3, and
-are recorded here rather than left to be rediscovered from the code:
+Two pieces §2.5–§2.6 implied were not fully wired by the end of wave 3;
+wave 5 closed both, and they are recorded here rather than left to be
+rediscovered from the code:
 
-- **MCP is stdio only.** `harw-mcp-server`'s existing Streamable HTTP
-  transport is built around a durable job supervisor and tenant/workspace
-  principals a compiled, embedded single-agent runner has none of;
-  building this interface's own loopback HTTP transport instead is future
-  work, not a wave-3 regression.
-- **`child_execution = "job"` is not yet automatic.** The process-driving
-  side (`harw-agent-runner::job_child_backend::JobChildBackend`) and the
-  child-process side (`harw-agent-runner::child::run_child`) both exist and
-  are tested against a real spawned process, but nothing in
-  `harw-runtime`'s embedded assembly yet sets `RuntimeSpec::child_backend`
-  for `EntryKind::CompiledAgent`, so a root agent's own delegation does not
-  yet reach a separate process automatically — only an explicit `--child`
-  invocation exercises the protocol today. Wiring that one call site is the
-  remaining piece of §2.5's promise that a compiled binary runs its
-  children, not a new decision.
+- **MCP Streamable HTTP is implemented.** Wave 5 added the `mcp`
+  interface's own small loopback HTTP transport (`--listen <addr>`,
+  `POST /mcp` plus `GET /healthz`, one active session, the same bearer
+  token and loopback rule as the `http` interface) instead of reusing
+  `harw-mcp-server`'s transport, which stays built around a durable job
+  supervisor and tenant/workspace principals a compiled, embedded
+  single-agent runner has none of (`harw-agent-runner/src/iface/mcp.rs`).
+- **`child_execution = "job"` is automatic.** The process-driving side
+  (`harw-agent-runner::job_child_backend::JobChildBackend`) and the
+  child-process side (`harw-agent-runner::child::run_child`) both exist
+  and are tested against real spawned processes, and
+  `harw-agent-runner::context::RunnerContext::builder` now sets
+  `RuntimeSpec::child_backend` for `EntryKind::CompiledAgent` whenever
+  the definition's `[binary].child_execution` is `"job"` (the default)
+  and the process is not itself a `--child` run — a root agent's own
+  delegation reaches a separate child process without any explicit
+  invocation. The mini TUI (`harw-agent-runner/src/iface/tui.rs`) builds
+  its own `RuntimeSpec` and sets the same backend under the same
+  condition. `harw-runtime/src/assembly.rs` passes the backend through
+  to the `ManagedAgentSpawner`.
+- **The mini TUI's restrictions are enforced.** `run_fixed_agent`
+  (`harw-tui/src/fixed_agent.rs`) feeds
+  `hidden_command_names` into the command registry via
+  `ChatApp::with_hidden_commands` and gates `/model switch` through the
+  local-command intercept (`harw-tui/src/local_commands.rs`); the
+  compiled runner currently passes `allow_model_switch: false`, so a
+  restricted-but-open switch remains a one-flag change at the call site,
+  not a missing hook.
 
 ## 4. Security
 
 - **Tamper detection.** The artifact ends in a BLAKE3 hash over all of its
-  bytes, and the executable footer repeats the hash. The runner recomputes
+  preceding bytes. The `HARWAEN2` executable footer additionally hashes the
+  runner, artifact, offset and length; legacy `HARWAEND` binaries require a
+  rebuild. The runner recomputes
   it before it parses the header and refuses to start on any mismatch
   (fail closed). `--verify` performs the same check and exits.
 - **The manifest cannot widen rights.** `RightsCheck` rejects a manifest

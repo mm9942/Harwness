@@ -19,6 +19,11 @@ build`, and wires `~/.local/bin` into `~/.bashrc`/`~/.zshrc` idempotently.
 It never touches an existing `~/.harw` beyond that — first `harw` run
 performs onboarding.
 
+`scripts/install.sh --binary` installs the same three binaries from the
+release archive and records their installation directory. It requires no
+Rust toolchain. An archive missing the agent runner is rejected before an
+existing installation is replaced.
+
 ## Homebrew
 
 `harw.rb` is a formula template. Before publishing, fill in the `url`,

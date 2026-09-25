@@ -103,7 +103,7 @@ for overlapping or out-of-range offsets.
 | `kind` | Name | Typical path | Content |
 |---|---|---|---|
 | 1 | instructions | `instructions/system.md` | the resolved instruction text |
-| 2 | skill | `skills/<name>/instructions.md` | embedded skill files (`ResolveSkills`) |
+| 2 | skill | `skills/<name>/instructions.md`, `skills/<name>/skill.toml` | embedded skill files: instructions text and manifest (`ResolveSkills`) |
 | 3 | knowledge | `knowledge/<path>` | knowledge files the agent may read |
 | 4 | context program | `context/<program-id>.toml` | bound context programs |
 | 5 | template | `templates/<path>` | prompt and output templates |
@@ -114,6 +114,15 @@ separator, contain no empty, `.` or `..` components, no NUL and no
 backslash, and are unique within an artifact. The runner serves payloads
 from memory under these logical paths; they are never written to disk
 by path.
+
+Each skill embeds two payloads under kind `skill`: `instructions.md`, the
+resolved instruction text, and `skill.toml`, a manifest with the keys
+`name`, `description`, `tools` and `mcps` (no `enabled` or
+`instructions_file` key, so the reader's defaults apply — enabled,
+`instructions.md` — and no host path or hash, so the artifact stays
+reproducible). `skills.entries[i].hash` in the IR is the BLAKE3 of
+`instructions.md` alone; the manifest is not covered by that hash, only by
+its own payload-table entry.
 
 The header references payloads by path and hash (for example the source
 hash of the instructions and the content hash of each skill). A reader
@@ -137,11 +146,12 @@ by a fixed 56-byte footer at the very end of the file:
 |---|---|---|
 | 0 | 8 | `artifact_offset` — file offset of the artifact's first byte |
 | 8 | 8 | `artifact_len` — artifact length in bytes |
-| 16 | 32 | `artifact_hash` — copy of the artifact's trailing hash |
-| 48 | 8 | `footer_magic` — ASCII `HARWAEND` |
+| 16 | 32 | `executable_hash` — BLAKE3 of runner, artifact, offset and length |
+| 48 | 8 | `footer_magic` — ASCII `HARWAEN2` |
 
 The magic comes last so that a reader can recognise the footer from the
-last 8 bytes of the file.
+last 8 bytes of the file. The legacy `HARWAEND` footer is rejected with a
+rebuild diagnostic because it did not cover the runner bytes.
 
 **How the runner locates its artifact** (`EmbeddedArtifact::from_current_exe`):
 
@@ -153,10 +163,11 @@ last 8 bytes of the file.
    must sit directly before the footer.
 4. Check `artifact_len` against the size limits (§8) before reading it.
 5. Read the artifact, recompute BLAKE3 over all but its last 32 bytes, and
-   compare the result with both the artifact's own `artifact_hash` and the
-   footer's copy.
-6. Only then parse the header and the payload table, and run the checks of
-   §4 and §7.
+   compare the result with the artifact's own `artifact_hash`, then parse
+   and validate the artifact (§4 and §7).
+6. Stream the file from its first byte through the footer's offset and
+   length fields through BLAKE3 and compare it with `executable_hash`.
+   No agent starts before this check passes.
 
 Any failure is fatal: the runner does not start, does not fall back to a
 different agent and does not continue with a partial artifact.
@@ -269,7 +280,8 @@ Every agent has an entry, the root included. The built-in payload kinds
   "name": "<lookup name>",
   "ir": { "...": "the agent's AgentIr v2, without trace" },
   "payload_refs": [
-    { "kind": "skill", "logical_path": "skills/<name>/instructions.md", "blake3": "<hex>" }
+    { "kind": "skill", "logical_path": "skills/<name>/instructions.md", "blake3": "<hex>" },
+    { "kind": "skill", "logical_path": "skills/<name>/skill.toml", "blake3": "<hex>" }
   ],
   "children": [ { "name": "<target name>", "id": "<agent id>", "via": "delegation" } ]
 }
@@ -284,7 +296,8 @@ lists the direct children in declaration order (`via`: `delegation` or
 | IR field | Reference |
 |---|---|
 | `instructions.blake3` (non-empty text) | `instructions` · `instructions/system.md` |
-| `skills.entries[i].hash` | `skill` · `skills/<name>/instructions.md` |
+| `skills.entries[i].hash` (BLAKE3 of the instructions text only) | `skill` · `skills/<name>/instructions.md` |
+| `skills.entries[i]` (`name`, `description`, `tools`, `mcps`) | `skill` · `skills/<name>/skill.toml` (generated manifest; no IR hash field) |
 | bundle files of a user-interface agent | `knowledge` · `knowledge/<file>` |
 
 ### 10.3 Rules (fail closed)

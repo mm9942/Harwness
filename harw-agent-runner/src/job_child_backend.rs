@@ -34,8 +34,10 @@ use harw_core::child_backend::{
     ChildBackend, ChildBackendFuture, ChildIo, ChildRunOutcome, ChildRunSpec, ChildRunStatus,
 };
 use harw_core::child_controller::ChildUsage;
+use harw_tool_job::{
+    Caller, JobId, JobManager, JobOwner, JobSignal, PipedJob, PreparedJob, StartRequest,
+};
 use harw_types::cancel::CancelReason;
-use harw_tool_job::{Caller, JobId, JobManager, JobOwner, JobSignal, PipedJob, PreparedJob, StartRequest};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, ChildStdin, Command};
 use tokio::sync::mpsc;
@@ -131,9 +133,8 @@ impl<S: ChildProcessSpawner> JobChildBackend<S> {
     /// Builds a backend that runs `spawner`'s command as a job through
     /// `job_manager` (tests exercising the job-managed path against a
     /// substitute spawner instead of the real [`CurrentExeSpawner`]).
-    #[cfg(test)]
     #[must_use]
-    fn with_spawner_and_job_manager(spawner: S, job_manager: Arc<JobManager>) -> Self {
+    pub fn with_spawner_and_job_manager(spawner: S, job_manager: Arc<JobManager>) -> Self {
         Self {
             spawner,
             job_manager: Some(job_manager),
@@ -266,6 +267,11 @@ async fn run_job_managed<S: ChildProcessSpawner>(
         outcome = drive_protocol(&mut stdin, &mut source, &spec, io) => outcome,
     };
 
+    if matches!(outcome.status, ChildRunStatus::Failed { .. }) {
+        let _ = job_manager
+            .stop(&job_id, Caller::Agent(&caller_session), JobSignal::Term)
+            .await;
+    }
     if matches!(outcome.status, ChildRunStatus::Crashed { .. }) {
         let exit_code = match job_manager
             .wait(&job_id, Caller::Agent(&caller_session), JOB_EXIT_WAIT, None)
@@ -289,7 +295,11 @@ async fn run_job_managed<S: ChildProcessSpawner>(
 /// The last few lines of a job's `STDERR_LOG`, best-effort (an unreadable
 /// log or an unknown job just yields an empty tail — `job.logs` remains the
 /// authoritative way to inspect it).
-fn job_managed_stderr_tail(job_manager: &JobManager, job_id: &JobId, caller_session: &str) -> String {
+fn job_managed_stderr_tail(
+    job_manager: &JobManager,
+    job_id: &JobId,
+    caller_session: &str,
+) -> String {
     let Ok(dir) = job_manager.log_dir(job_id, Caller::Agent(caller_session)) else {
         return String::new();
     };
@@ -357,7 +367,9 @@ async fn run_direct<S: ChildProcessSpawner>(
         tokio::spawn(async move {
             let mut lines = BufReader::new(stderr).lines();
             while let Ok(Some(line)) = lines.next_line().await {
-                let mut tail = tail.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+                let mut tail = tail
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
                 if tail.len() >= STDERR_TAIL_LINES {
                     tail.pop_front();
                 }
@@ -373,6 +385,7 @@ async fn run_direct<S: ChildProcessSpawner>(
         biased;
         () = spec.cancel.cancelled() => {
             kill_process_group(&child);
+            let _ = child.kill().await;
             let _ = child.wait().await;
             ChildRunOutcome {
                 status: ChildRunStatus::Cancelled { reason: cancel_reason_label(spec.cancel.reason()) },
@@ -384,6 +397,11 @@ async fn run_direct<S: ChildProcessSpawner>(
         outcome = drive_protocol(&mut stdin, &mut source, &spec, io) => outcome,
     };
 
+    if matches!(outcome.status, ChildRunStatus::Failed { .. }) {
+        kill_process_group(&child);
+        let _ = child.kill().await;
+        let _ = child.wait().await;
+    }
     // `Completed`/`BudgetExhausted`/`Cancelled` leave the child running its
     // own shutdown, so the stderr tail is not worth waiting for — abort the
     // collector right away. A crash (the stream ended without a `Result`) is
@@ -393,8 +411,7 @@ async fn run_direct<S: ChildProcessSpawner>(
     if matches!(outcome.status, ChildRunStatus::Crashed { .. }) {
         let exit_code = child.wait().await.ok().and_then(|status| status.code());
         if let Some(stderr_task) = stderr_task {
-            let _ =
-                tokio::time::timeout(std::time::Duration::from_secs(2), stderr_task).await;
+            let _ = tokio::time::timeout(std::time::Duration::from_secs(2), stderr_task).await;
         }
         let outcome = ChildRunOutcome {
             status: ChildRunStatus::Crashed {
@@ -530,6 +547,21 @@ async fn drive_protocol(
     }
     if write_frame(
         stdin,
+        &ParentToChild::Mode {
+            mode: if spec.live_mode {
+                crate::child_protocol::ChildMode::Live
+            } else {
+                crate::child_protocol::ChildMode::Plan
+            },
+        },
+    )
+    .await
+    .is_err()
+    {
+        crash_if_stream_ended!();
+    }
+    if write_frame(
+        stdin,
         &ParentToChild::Task {
             task: spec.task.clone(),
             context: spec.context.clone(),
@@ -635,8 +667,7 @@ async fn drive_protocol(
 }
 
 async fn write_frame(stdin: &mut ChildStdin, frame: &ParentToChild) -> std::io::Result<()> {
-    let line = encode_line(frame)
-        .map_err(|error| std::io::Error::other(error.to_string()))?;
+    let line = encode_line(frame).map_err(|error| std::io::Error::other(error.to_string()))?;
     stdin.write_all(line.as_bytes()).await?;
     stdin.flush().await
 }
@@ -742,7 +773,7 @@ mod tests {
     /// prints `Hello` followed by `Result`.
     fn hello_then_result_script() -> String {
         format!(
-            r#"printf '{{"type":"hello","agent_id":"fixture-child","protocol":"{version}","digest":"d"}}\n'; read _rights; read _task; printf '{{"type":"result","status":"completed","text":"done","usage":{{"input_tokens":1,"output_tokens":2,"cached_input_tokens":0,"tool_calls":0,"wall_time_ms":0}}}}\n'"#,
+            r#"printf '{{"type":"hello","agent_id":"fixture-child","protocol":"{version}","digest":"d"}}\n'; read _rights; read _mode; read _task; printf '{{"type":"result","status":"completed","text":"done","usage":{{"input_tokens":1,"output_tokens":2,"cached_input_tokens":0,"tool_calls":0,"wall_time_ms":0}}}}\n'"#,
             version = crate::child_protocol::PROTOCOL_VERSION,
         )
     }
@@ -762,6 +793,23 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn questions_and_approvals_are_relayed() {
+        let script = format!(
+            r#"printf '{{"type":"hello","agent_id":"fixture-child","protocol":"{version}","digest":"d"}}\n'; read _rights; read _mode; read _task; printf '{{"type":"question","id":"question-1","text":"Proceed?"}}\n'; read answer; case "$answer" in *question-1*approve*) ;; *) exit 3;; esac; printf '{{"type":"approval_request","id":"approval-1","tool":"fs.write","args_summary":"file"}}\n'; read answer; case "$answer" in *approval-1*approve*) ;; *) exit 4;; esac; printf '{{"type":"result","status":"completed","text":"relayed","usage":{{"input_tokens":0,"output_tokens":0,"cached_input_tokens":0,"tool_calls":0,"wall_time_ms":0}}}}\n'"#,
+            version = crate::child_protocol::PROTOCOL_VERSION,
+        );
+        let backend = JobChildBackend::with_spawner(ShellSpawner { script });
+        let outcome = tokio::time::timeout(
+            Duration::from_secs(5),
+            backend.run(spec(harw_types::cancel::CancelToken::new()), &RecordingIo),
+        )
+        .await
+        .expect("relay must complete");
+        assert_eq!(outcome.status, ChildRunStatus::Completed);
+        assert_eq!(outcome.text.as_deref(), Some("relayed"));
+    }
+
+    #[tokio::test]
     async fn a_crash_before_hello_is_reported_as_crashed() {
         // Exits immediately without printing anything: no Hello ever
         // arrives, so this must not hang and must be reported as a crash.
@@ -778,7 +826,7 @@ mod tests {
     #[tokio::test]
     async fn a_crash_after_hello_reports_a_stderr_tail() {
         let script = format!(
-            r#"printf '{{"type":"hello","agent_id":"fixture-child","protocol":"{version}","digest":"d"}}\n'; read _rights; read _task; >&2 echo "boom: out of memory"; exit 1"#,
+            r#"printf '{{"type":"hello","agent_id":"fixture-child","protocol":"{version}","digest":"d"}}\n'; read _rights; read _mode; read _task; >&2 echo "boom: out of memory"; exit 1"#,
             version = crate::child_protocol::PROTOCOL_VERSION,
         );
         let backend = JobChildBackend::with_spawner(ShellSpawner { script });
@@ -804,8 +852,9 @@ mod tests {
     async fn job_managed_path_completes_through_job_manager() {
         let dir = tempfile::tempdir().expect("tempdir");
         let config = harw_tool_job::JobManagerConfig::new(dir.path());
-        let job_manager = harw_tool_job::JobManager::new(config, Arc::new(harw_tool_job::NoopNotifier))
-            .expect("job manager");
+        let job_manager =
+            harw_tool_job::JobManager::new(config, Arc::new(harw_tool_job::NoopNotifier))
+                .expect("job manager");
         let backend = JobChildBackend::with_spawner_and_job_manager(
             ShellSpawner {
                 script: hello_then_result_script(),
@@ -826,7 +875,7 @@ mod tests {
         // Prints Hello, reads its two frames, then sleeps far longer than
         // the test waits — only `cancel` should end this run.
         let script = format!(
-            r#"printf '{{"type":"hello","agent_id":"fixture-child","protocol":"{version}","digest":"d"}}\n'; read _rights; read _task; sleep 30"#,
+            r#"printf '{{"type":"hello","agent_id":"fixture-child","protocol":"{version}","digest":"d"}}\n'; read _rights; read _mode; read _task; sleep 30"#,
             version = crate::child_protocol::PROTOCOL_VERSION,
         );
         let backend = JobChildBackend::with_spawner(ShellSpawner { script });

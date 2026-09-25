@@ -161,7 +161,9 @@ pub enum ArtifactError {
     NonCanonicalHeader,
     /// A hash check failed.
     Tampered(TamperScope),
-    /// The executable carries no `HARWAEND` footer.
+    /// The executable uses the old footer that did not cover runner bytes.
+    LegacyExecutableFooter,
+    /// The executable carries no `HARWAEN2` footer.
     NotEmbedded,
     /// Reading or writing a file failed.
     Io {
@@ -201,6 +203,9 @@ impl fmt::Display for ArtifactError {
             Self::NonCanonicalHeader => f.write_str("artifact header is not canonical JSON"),
             Self::Tampered(scope) => write!(f, "agent artifact tampered: {scope}"),
             Self::NotEmbedded => f.write_str("executable carries no embedded agent artifact"),
+            Self::LegacyExecutableFooter => f.write_str(
+                "legacy HARWAEND executable footer does not verify runner bytes; rebuild the agent with the current compiler",
+            ),
             Self::Io { context, source } => write!(f, "{context}: {source}"),
         }
     }

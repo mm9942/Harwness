@@ -23,6 +23,8 @@ pub struct ResolvedChild {
     pub snapshot: String,
     /// The child's own (transitive) children.
     pub children: Vec<CompiledChild>,
+    /// Provider features required by this child and its entire family.
+    pub features: BTreeSet<String>,
 }
 
 /// Compiles a child agent by name (implemented by the driver).
@@ -79,7 +81,22 @@ impl Pass for ChildClosure<'_> {
             } else {
                 "spawn.child_orchestrators"
             };
-            if stack.contains(&name) || !embedded.insert(name.clone()) {
+            if stack.contains(&name) {
+                // A genuine cycle (`name` is an ancestor of this unit, not
+                // just reachable through another branch): embedding it would
+                // recurse forever, so unlike the diamond case below this is
+                // fatal, not a note.
+                diagnostics.push(unit.diagnostic(
+                    &codes::CHILD_CYCLE,
+                    path,
+                    format!(
+                        "`{name}` is already an ancestor of `{}` in the delegation graph",
+                        unit.name
+                    ),
+                ));
+                continue;
+            }
+            if !embedded.insert(name.clone()) {
                 diagnostics.push(unit.diagnostic(
                     &codes::CHILD_REPEATED,
                     path,
@@ -112,6 +129,9 @@ impl Pass for ChildClosure<'_> {
                 );
             }
             let child_rights = RightsSet::claimed_by(&child.ir);
+            // Every child runs the same executable, including in job mode.
+            // Native linking must therefore include the whole family's tools.
+            unit.features.extend(child.features);
             for entry in child.entries {
                 if !unit.agents.iter().any(|known| known.id == entry.id) {
                     unit.agents.push(entry);
