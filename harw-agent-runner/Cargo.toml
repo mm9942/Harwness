@@ -56,8 +56,12 @@ repl = []
 # stream; `tokio` is already a base dependency of this crate (see below), so
 # only the extra dep is feature-gated.
 mcp = ["dep:futures-core"]
-http = []
-tui = []
+# `iface::http`: its own small hyper-based listener (same stack/versions as
+# `harw-web`/`harw-mcp-server`; see that module's doc for why it does not
+# reuse either directly).
+http = ["dep:hyper", "dep:hyper-util", "dep:http-body-util", "dep:bytes", "dep:tokio-stream"]
+# `iface::tui`: `harw-tui::fixed_agent` runs the embedded agent's mini TUI.
+tui = ["dep:harw-tui"]
 
 # One empty feature per distinct
 # `harw_registry_defaults::capability_catalog::ToolProvider::feature` (the

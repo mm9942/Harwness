@@ -248,14 +248,25 @@ async fn run_writer(
 /// should replace this once it exists — see the module docs' note on the
 /// exact seam.
 fn manifest_rights_of(ir: &AgentIr) -> ChildRights {
+    // `Authority::capabilities` is a flat label list (see
+    // `harw_agent_dsl::authority::AuthorityCeiling`), not the boolean shape
+    // `ChildRights` wants — best-effort prefix match until wave 3 lands a
+    // proper `EffectiveRights::from_manifest`-style conversion (see module
+    // docs).
+    let has = |label: &str| {
+        ir.authority
+            .capabilities
+            .iter()
+            .any(|cap| cap == label || cap.starts_with(&format!("{label}.")))
+    };
     ChildRights {
-        tools: ir.tools.allow.iter().cloned().collect(),
+        tools: ir.tools.admitted.iter().cloned().collect(),
         network_hosts: BTreeSet::new(),
-        network_open: ir.authority.network,
-        write: ir.authority.write,
-        shell: ir.authority.shell,
-        host: ir.authority.host,
-        full_access: ir.authority.full_access,
+        network_open: has("network"),
+        write: has("filesystem.write") || has("write"),
+        shell: has("shell"),
+        host: has("host"),
+        full_access: has("full_access") || has("full-access"),
     }
 }
 
