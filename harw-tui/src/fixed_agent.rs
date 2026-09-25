@@ -15,7 +15,7 @@
 //! [`crate::runtime_root::FixedAgentUiRestrictions`] from `opts` (and the
 //! embedded artifact's digest) and hands it to [`run_tui`] via
 //! [`crate::runtime_root::TuiRunOptions::fixed_agent`].
-//! [`crate::runtime_root::build_root_runtime`] applies it to the freshly
+//! `crate::runtime_root::build_root_runtime` applies it to the freshly
 //! built [`crate::app::ChatApp`] right after construction, through three
 //! builders that mirror `with_verbose_tools`'s style:
 //! - [`crate::app::ChatApp::with_hidden_commands`] — fed
