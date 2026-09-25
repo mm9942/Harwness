@@ -581,6 +581,11 @@ struct ChildTaskState {
     /// Runde 5, Teil J: gesetzt, wenn dieses Kind die Fortsetzung eines
     /// budget-beendeten Vorgängers ist ([`ManagedAgentSpawner::bind_continuation`]).
     continuation: Option<crate::child_handoff::ContinuationLink>,
+    /// Wave 3C: der zuletzt vom angebundenen [`crate::child_backend::ChildBackend`]
+    /// gemeldete Fortsetzungs-Token ([`crate::child_backend::ChildRunOutcome::continuation`]),
+    /// für [`crate::child_backend::ChildRunSpec::continue_from`] eines erneuten
+    /// Laufs desselben Kindes. `None` ohne Backend oder ohne meldbare Fortsetzung.
+    backend_resume: Option<String>,
 }
 
 /// Ziel der [`TurnEvent::ChildProgress`]-Meldungen eines Kindes: der

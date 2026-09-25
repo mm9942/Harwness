@@ -146,10 +146,6 @@ same artifact hash.
 
 ## 5. Run it
 
-> The interfaces below (`cli`, `repl`, `mcp`, `http`, `tui`) are the wave-3
-> runner contract; `--manifest` and `--verify` work against any built
-> binary today, but a built binary does not yet run a task end to end.
-
 ```sh
 export ANTHROPIC_API_KEY=…
 
@@ -158,35 +154,162 @@ export ANTHROPIC_API_KEY=…
 ./ec --interface mcp                           # MCP server over stdio
 ```
 
-Useful flags of every built binary:
+The interface actually used is chosen in this order: `--interface`, else
+the manifest's `[binary] default_interface`, else the first entry of
+`[binary] interfaces`. Asking for an interface the manifest does not list
+is an error; asking for one the manifest lists but this runner build was
+not compiled with (`--interface`'s cargo feature) is also an error, naming
+what this build does have.
+
+### 5.1 Flags every built binary understands
 
 | Flag | Effect |
 |---|---|
-| `--manifest` | print the rights manifest, the artifact hash and the built-in interfaces, then exit |
-| `--verify` | check the embedded artifact's hashes and exit `0` if intact |
-| `--version` | print the agent name and version, the harw version and the artifact hash |
-| `--interface <name>` | choose one of the built-in interfaces |
-| `--full-access` | skip approval prompts, but only for rights inside the manifest |
+| `--manifest` | print the rights manifest (`AgentIr::permissions`) as text, or as JSON with `--json`, then exit. Never starts a session. |
+| `--verify` | recompute and check the embedded artifact's hashes; prints the digest and exits `0` if intact, non-zero (with the failing check) otherwise. Never starts a session. |
+| `--version` | print the runner's own version (`CARGO_PKG_VERSION`) and exit. |
+| `--capabilities` | print the `harwness.agent-runner.capabilities/v1` JSON `harw-agent-compiler` uses to pick a runner (schema, target, artifact formats, IR schema, compiled interfaces and provider features, child protocol). Never starts a session. |
+| `--interface <name>` | choose one of `cli`, `repl`, `mcp`, `http`, `tui` for this run, overriding the manifest's default. |
+| `--json` | machine-readable output: one JSON object per SDK event on stdout for `cli`, JSON for `--manifest`. |
+| `--full-access` | approve every tool call automatically, but only for rights already inside the (possibly narrowed) manifest — it never adds a tool, host or path. |
+| `--deny-tool <name>` | remove one tool from the effective rights; repeatable. |
+| `--no-network` | clear network access entirely for this run, regardless of the manifest. |
+| `--read-only` | drop write and shell rights for this run. |
+| `--max-tokens <n>` | cap the token budget at `n`, tightening (never loosening) the manifest's own budget. |
+| `--listen <addr>` | bind address for `http` (default `127.0.0.1:8787`); rejected as not implemented for `mcp` (§5.3). |
+| `--child <id>` / `--child-protocol <label>` | run as a delegated child instead of a top-level interface (§5.6); both flags are required together. |
 
-The manifest is also printed at startup, so you can always see what the
-agent is allowed to do.
+Every flag above except `--manifest`/`--verify`/`--version`/`--capabilities`
+narrows the manifest before the chosen interface starts
+(`harw_runtime::embedded::EffectiveRights::from_manifest(&permissions)
+.narrowed_by(&flags)`): the effective right for tools, network, write,
+shell, host and budget is always `min(manifest, flags)`, one right at a
+time, never the other way around. The manifest is also printed as a
+one-line banner at startup (suppressed by `--json`), so you can always see
+what the agent is allowed to do before it does anything.
 
-### Interfaces
+### 5.2 `cli` — one-shot
 
-- **`cli`** — one task from the command line, answer on stdout, approvals
-  in the terminal.
-- **`repl`** — interactive session in the terminal.
-- **`mcp`** — the agent as an MCP server with a `run` tool (plus `status`
-  and `cancel`), over stdio or Streamable HTTP. Register it with any MCP
-  client like other stdio servers.
-- **`http`** — JSON API: `POST /run`, `GET /runs/{id}`, and server-sent
-  events in the SDK event schema. Requires a bearer token from an
-  environment variable.
-- **`tui`** — the harw terminal UI fixed to this agent; agent and model
-  switching is hidden or limited to the manifest.
+Runs exactly one turn. The prompt is the positional command-line words, or
+all of stdin if none are given. The answer streams to stdout as it
+arrives; tool calls and their results are dim lines on stderr, so stdout
+stays exactly the agent's answer for a shell pipeline. `--json` replaces
+both with one JSON object per SDK event on stdout instead. Approval asks
+interactively at the terminal (`[j]a / [n]ein / [i]mmer für diese
+Sitzung`) unless `--full-access` is given or no terminal is attached, in
+which case every call is denied.
 
-Asking for an interface that was not built in is an error; rebuild with
-`--interface`.
+Exit codes: `0` completed, `1` the turn failed/refused/was truncated (or no
+prompt was given), `2` cancelled, `3` at least one tool call was denied
+approval (even if the turn otherwise finished).
+
+### 5.3 `repl` — interactive session
+
+One session for the whole process: every line is a new turn on the same
+conversation, so history carries across turns (unlike `cli`, which exits
+after one). Commands, read one per line:
+
+- `/exit` — ends the REPL (also end-of-input: piped stdin, Ctrl+D).
+- `/manifest` — prints the embedded agent's permissions as JSON; not a
+  turn.
+- `/cancel` — cancels the turn currently running. Typed while nothing is
+  running, it has nothing to cancel and says so.
+- **Ctrl+C** (`SIGINT`) cancels a turn that is actually in flight, the same
+  way `/cancel` does, without needing a second line of input.
+
+Approval is the same terminal handler `cli` uses, and remembers an
+"immer"/always answer for the rest of the session, not just the current
+turn. The REPL itself exits `0` on `/exit` or end-of-input regardless of
+how the last turn ended — a failed or cancelled turn is not a failed
+session.
+
+### 5.4 `mcp` — Model Context Protocol (stdio only)
+
+Implements `initialize`, `tools/list`, `tools/call` (`run`, `status`,
+`cancel`), `notifications/cancelled` and `ping` over newline-delimited
+JSON-RPC 2.0 on stdin/stdout, protocol version `2025-06-18`. `run` takes
+`{"prompt": …, "context": …, "background": …}`; a foreground call streams
+`notifications/progress` and returns the final text plus usage, a
+`background: true` call returns a `run_id` immediately for `status`/
+`cancel` to poll. There is no interactive approval channel here: without
+`--full-access`, a call that needed approval is denied and the response
+says so; `--full-access` approves everything already inside the manifest.
+
+**Only the stdio transport is implemented.** `--listen <addr>` is refused
+with an error naming the reason: `harw-mcp-server`'s Streamable HTTP
+transport is built around a durable job supervisor and tenant/workspace
+principals a compiled, embedded single-agent runner has none of, and a
+small self-contained JSON-RPC loop was not worth reimplementing that
+machinery underneath. A future HTTP transport for this interface is its
+own loopback listener, tracked separately — see
+`harw-agent-runner/src/iface/mcp.rs`'s module docs.
+
+### 5.5 `http` — JSON API
+
+- `POST /run` — `{"prompt": …, "background": …}`; synchronous by default,
+  or `background: true` for an immediate `202` with a `run_id`.
+- `GET /runs/{id}` — status (`pending`/`running`/`completed`/`failed`/
+  `cancelled`), text and usage of a run.
+- `GET /runs/{id}/events` — a server-sent-events stream of the run's SDK
+  events, one JSON object per `data:` line, `event:` set to the event's
+  kind, ending in a `run.finished` marker.
+- `POST /runs/{id}/cancel` — cancel a running (or not yet finished) run.
+- `GET /manifest` — the root IR's permissions, declared interfaces and
+  artifact digest.
+- `GET /healthz` — liveness; never behind auth.
+
+Runs live in an in-memory map capped at 64; once over the cap, the oldest
+*finished* run is evicted — a run still in flight is never evicted.
+
+**Auth and the loopback rule.** A bearer token from `HARW_AGENT_HTTP_TOKEN`
+is required to bind any **non-loopback** address (anything but
+`127.0.0.1`/`::1`); starting without one there is a startup error, not a
+silent open listener. On loopback, the token is optional but still checked
+(constant-time comparison) if the variable happens to be set. `/healthz`
+is exempt either way, so liveness probes never need the token. Same
+approval story as `mcp`: no interactive channel, `--full-access` is the
+only way to let a manifest-permitted tool call through unattended.
+
+### 5.6 `tui` — mini terminal UI
+
+The normal `harw` terminal UI, restricted to this one embedded agent: same
+renderer and command loop, with the title bar set from the manifest's
+`name` (falling back to `specialization`) and the manifest's model plus
+its fallbacks as the only allowed models. **Not fully enforced yet**: the
+restriction is decided by tested, pure logic
+(`harw_tui::fixed_agent::{hidden_command_names, is_model_switch_target_allowed}`),
+but the hook that would apply it inside `harw-tui`'s command registry and
+`/model switch` validation is not wired in this wave — today `/model
+switch` stays disabled outright rather than restricted-but-open, and the
+UIA-switch/agent-selection commands a fixed session should hide are not
+yet filtered out of the popup. See `harw-tui/src/fixed_agent.rs`'s module
+docs for the exact spot.
+
+### 5.7 Delegated children (`--child`)
+
+A compiled binary's bundle can hold more than the root agent (the
+delegation closure). `[binary] child_execution` decides how the root runs
+those children: `"job"` (the default) means each child is meant to run as
+its own OS process; `"in-process"` keeps the legacy in-process spawner, the
+same way harw itself always runs its children. A child process is started
+as `harw-agent-runner --child <agent-id> --child-protocol
+harwness.agent-child/v1`, speaking that JSON-lines protocol on its own
+stdio (stderr stays plain logs, never a protocol frame) — see
+[`agent-child-protocol-v1.md`](../design/agent-child-protocol-v1.md) for
+every frame. A child's effective rights are `min(its own manifest, the
+parent's current rights)`, applied once the parent's `Rights` frame
+arrives; a parent can only narrow a child below its own manifest, never
+grant it more.
+
+`harw-agent-runner` ships the process-driving side of this
+(`JobChildBackend`, tested standalone against a real spawned process) and
+the child-process side (`crate::child::run_child`), but **nothing in the
+embedded runtime yet wires `JobChildBackend` into a compiled agent's own
+run** for `child_execution = "job"` — the seam exists
+(`RuntimeSpec::child_backend`) but no call site sets it for
+`EntryKind::CompiledAgent` today. Until that lands, `--child` only runs
+when something explicitly invokes it (as the backend's own tests do), not
+as an automatic effect of a root agent delegating to a child.
 
 ### Inspect a binary
 

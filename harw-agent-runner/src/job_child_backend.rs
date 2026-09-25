@@ -367,7 +367,7 @@ async fn run_direct<S: ChildProcessSpawner>(
     });
 
     let mut stdin = stdin;
-    let mut stdout_lines = BufReader::new(stdout).lines();
+    let mut source = StdoutSource::Direct(BufReader::new(stdout).lines());
 
     let outcome = tokio::select! {
         biased;
@@ -381,7 +381,7 @@ async fn run_direct<S: ChildProcessSpawner>(
                 continuation: None,
             }
         }
-        outcome = drive_protocol(&mut stdin, &mut stdout_lines, &spec, io) => outcome,
+        outcome = drive_protocol(&mut stdin, &mut source, &spec, io) => outcome,
     };
 
     // `Completed`/`BudgetExhausted`/`Cancelled` leave the child running its
@@ -449,12 +449,12 @@ fn fill_stderr_tail(
 }
 
 /// The handshake plus the frame-relay loop, run against whichever process
-/// [`run_one`] spawned. Returns once the child sends `Result`, the process
-/// exits without one (a crash), or a protocol violation makes the stream
-/// unusable.
+/// [`run_direct`] or [`run_job_managed`] spawned. Returns once the child
+/// sends `Result`, the process exits without one (a crash), or a protocol
+/// violation makes the stream unusable.
 async fn drive_protocol(
     stdin: &mut ChildStdin,
-    stdout_lines: &mut tokio::io::Lines<BufReader<tokio::process::ChildStdout>>,
+    stdout_lines: &mut StdoutSource,
     spec: &ChildRunSpec,
     io: &dyn ChildIo,
 ) -> ChildRunOutcome {
@@ -474,7 +474,7 @@ async fn drive_protocol(
 
     // Handshake: the child's first line must be `Hello` with a matching
     // protocol version.
-    let Ok(Some(line)) = stdout_lines.next_line().await else {
+    let Some(line) = stdout_lines.next_line().await else {
         crash_if_stream_ended!();
     };
     match decode_line::<ChildToParent>(&line) {
@@ -542,13 +542,13 @@ async fn drive_protocol(
         crash_if_stream_ended!();
     }
 
-    // Cancellation while this loop runs is handled by `run_one`'s own
-    // `tokio::select!` around this whole function: dropping this future ends
-    // the loop without a graceful `Cancel` frame, and `run_one` kills the
-    // process group right after. That keeps exactly one place responsible
-    // for "is this run cancelled".
+    // Cancellation while this loop runs is handled by the caller's own
+    // `tokio::select!` around this whole function (`run_direct` kills the
+    // process group right after; `run_job_managed` calls `JobManager::stop`):
+    // dropping this future ends the loop without a graceful `Cancel` frame.
+    // That keeps exactly one place responsible for "is this run cancelled".
     loop {
-        let Ok(Some(line)) = stdout_lines.next_line().await else {
+        let Some(line) = stdout_lines.next_line().await else {
             crash_if_stream_ended!();
         };
         match decode_line::<ChildToParent>(&line) {

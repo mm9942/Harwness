@@ -347,7 +347,8 @@ pub const fn default_approval_mode(entry: EntryKind) -> ApprovalMode {
         | EntryKind::McpServe
         | EntryKind::JobPrompt
         | EntryKind::JobPlanNode
-        | EntryKind::GatewayDream => ApprovalMode::Delegated,
+        | EntryKind::GatewayDream
+        | EntryKind::CompiledAgent => ApprovalMode::Delegated,
     }
 }
 

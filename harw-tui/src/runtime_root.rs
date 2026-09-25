@@ -478,6 +478,26 @@ impl std::fmt::Debug for TitleJobContext {
     }
 }
 
+/// R10 Welle 3B: Beschränkungen der mini-TUI eines kompilierten Agenten
+/// (`harw-agent-runner`, `iface::tui`), angewendet auf [`ChatApp`] direkt
+/// nach ihrem Bau in [`build_root_runtime`]. `None` (in
+/// [`TuiRunOptions::fixed_agent`]) ist die normale, uneingeschränkte TUI.
+///
+/// Erzeugt von [`crate::fixed_agent::run_fixed_agent`] aus dessen
+/// `FixedAgentOptions`; siehe dort für die Herleitung der einzelnen Felder.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FixedAgentUiRestrictions {
+    /// Kanonische Namen, die [`ChatApp::with_hidden_commands`] versteckt.
+    pub hidden_commands: Vec<String>,
+    /// Titel für [`ChatApp::with_title_override`] (Statuszeile).
+    pub title: String,
+    /// Erlaubte `/model switch`-Ziele für
+    /// [`ChatApp::with_model_switch_allowlist`]; `None` lässt `/model
+    /// switch` uneingeschränkt (nur sinnvoll, wenn `model` nicht zugleich in
+    /// `hidden_commands` steht).
+    pub model_switch_allowlist: Option<Vec<(String, String)>>,
+}
+
 /// Eingaben von [`run_tui`] neben der Montage.
 pub struct TuiRunOptions {
     /// Die Verdrahtung, die in den Builder der übergebenen Montage gelegt wurde.
@@ -492,6 +512,9 @@ pub struct TuiRunOptions {
     /// Standardbelegung; eine ungültige erscheint als Systemzeile, und die
     /// Standardbelegung bleibt aktiv.
     pub keybindings_path: Option<PathBuf>,
+    /// R10 Welle 3B: fixed-agent-Beschränkungen der mini-TUI, `None` für die
+    /// normale TUI. Siehe [`FixedAgentUiRestrictions`].
+    pub fixed_agent: Option<FixedAgentUiRestrictions>,
 }
 
 /// Handgeschriebenes `Debug`: [`TuiSessionWiring`] enthält Kanäle.
@@ -503,6 +526,7 @@ impl std::fmt::Debug for TuiRunOptions {
             .field("resume", &self.resume)
             .field("verbose_tools", &self.verbose_tools)
             .field("keybindings_path", &self.keybindings_path)
+            .field("fixed_agent", &self.fixed_agent)
             .finish()
     }
 }

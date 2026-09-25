@@ -573,7 +573,7 @@ fn test_http_healthz_and_manifest() -> TestResult {
 
     let _guard = ChildGuard(
         Command::new(&exe)
-            .args(["--interface", "http", "--listen", &addr])
+            .args(["--interface", "http", "--listen", addr.as_str()])
             .env("HARW_HOME", home.path())
             .stdin(Stdio::null())
             .stdout(Stdio::null())
@@ -681,7 +681,7 @@ fn test_http_post_run_answers_with_echo() -> TestResult {
 
     let _guard = ChildGuard(
         Command::new(&exe)
-            .args(["--interface", "http", "--listen", &addr])
+            .args(["--interface", "http", "--listen", addr.as_str()])
             .env("HARW_HOME", home.path())
             .stdin(Stdio::null())
             .stdout(Stdio::null())
