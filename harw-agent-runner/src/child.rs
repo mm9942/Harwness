@@ -217,9 +217,7 @@ async fn run_child_async(mut ctx: RunnerContext, agent_id: String) -> ExitCode {
     ctx.agent = Arc::new(selected.with_rights(rights));
     let approvals = Arc::new(RelayApprovals::new(outbound_tx.clone()));
     let harwness = match ctx.builder().and_then(|builder| {
-        let builder = builder
-            .mode(mode)
-            .approval_handler_arc(approvals.clone());
+        let builder = builder.mode(mode).approval_handler_arc(approvals.clone());
         let builder = if auto_approve {
             builder.approval_policy(ApprovalPolicy::FullAccess)
         } else {
@@ -918,11 +916,8 @@ mod tests {
             max_tool_calls: Some(3),
             ..Budget::default()
         };
-        let rights = effective_child_rights(
-            ceiling(),
-            &ChildRights::default(),
-            Some(&parent_budget),
-        );
+        let rights =
+            effective_child_rights(ceiling(), &ChildRights::default(), Some(&parent_budget));
         let budget = rights.budget.unwrap_or_default();
         assert_eq!(budget.max_tokens, Some(500));
         assert_eq!(budget.max_tool_calls, Some(3));
@@ -960,7 +955,10 @@ mod tests {
             ..RightsFlags::default()
         };
         let rights = own_ceiling(&permissions, &flags);
-        assert!(rights.full_access, "the ceiling leaves the grant to the parent");
+        assert!(
+            rights.full_access,
+            "the ceiling leaves the grant to the parent"
+        );
         assert!(!rights.tools.contains("fs.write"));
         assert!(!rights.write);
     }

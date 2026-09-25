@@ -628,8 +628,7 @@ async fn test_start_piped_line_at_limit_passes() -> TestResult {
 #[tokio::test]
 async fn test_start_piped_overlong_line_ends_stream_with_error() -> TestResult {
     let env = Env::new()?;
-    let (items, log) =
-        run_piped_script(&env, "printf 'abc\\nabcdefghi\\nafter\\n'", 8).await?;
+    let (items, log) = run_piped_script(&env, "printf 'abc\\nabcdefghi\\nafter\\n'", 8).await?;
     assert_eq!(
         items,
         vec![

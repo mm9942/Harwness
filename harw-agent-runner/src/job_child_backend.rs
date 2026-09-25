@@ -259,8 +259,7 @@ async fn run_job_managed<S: ChildProcessSpawner>(
         notify_every: Duration::ZERO,
         owner: JobOwner::new(spec.parent.as_str(), Vec::new()),
     };
-    let piped = match job_manager.start_piped_with_line_limit(request, prepared, MAX_FRAME_BYTES)
-    {
+    let piped = match job_manager.start_piped_with_line_limit(request, prepared, MAX_FRAME_BYTES) {
         Ok(piped) => piped,
         Err(err) => {
             return ChildRunOutcome {

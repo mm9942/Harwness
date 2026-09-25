@@ -932,11 +932,9 @@ fn run_http(ctx: RunnerContext, listen: String) -> ExitCode {
     let token = std::env::var("HARW_AGENT_HTTP_TOKEN")
         .ok()
         .filter(|value| !value.is_empty());
-    if let Err(reason) = validate_listen_requirements(
-        addr,
-        token.as_deref(),
-        "the MCP Streamable HTTP interface",
-    ) {
+    if let Err(reason) =
+        validate_listen_requirements(addr, token.as_deref(), "the MCP Streamable HTTP interface")
+    {
         eprintln!("harw-agent-runner: {reason}");
         return ExitCode::FAILURE;
     }
@@ -1638,8 +1636,7 @@ mod tests {
             let state = test_http_state(None);
             let mut headers = HeaderMap::new();
             headers.insert(ORIGIN, HeaderValue::from_static(origin));
-            let request =
-                json!({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}});
+            let request = json!({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}});
             let response = dispatch_http(&state, &Method::POST, "/mcp", &headers, request).await;
             assert_eq!(response.status(), StatusCode::OK, "{origin}");
         }

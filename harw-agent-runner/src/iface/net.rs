@@ -197,12 +197,10 @@ where
     let limited = Limited::new(request.into_body(), max_bytes);
     match tokio::time::timeout(read_timeout, limited.collect()).await {
         Ok(Ok(collected)) => Ok(collected.to_bytes()),
-        Ok(Err(error)) if error.downcast_ref::<LengthLimitError>().is_some() => Err(
-            json_response(
-                StatusCode::PAYLOAD_TOO_LARGE,
-                &json!({"error": "payload_too_large"}),
-            ),
-        ),
+        Ok(Err(error)) if error.downcast_ref::<LengthLimitError>().is_some() => Err(json_response(
+            StatusCode::PAYLOAD_TOO_LARGE,
+            &json!({"error": "payload_too_large"}),
+        )),
         Ok(Err(_)) => Err(json_response(
             StatusCode::BAD_REQUEST,
             &json!({"error": "bad_request"}),
@@ -263,7 +261,10 @@ mod tests {
     fn loopback_binds_without_token_are_allowed() -> TestResult {
         for text in ["127.0.0.1:8787", "[::1]:8787"] {
             let addr: SocketAddr = text.parse()?;
-            assert!(validate_listen_requirements(addr, None, "x").is_ok(), "{text}");
+            assert!(
+                validate_listen_requirements(addr, None, "x").is_ok(),
+                "{text}"
+            );
         }
         Ok(())
     }
@@ -369,8 +370,8 @@ mod tests {
 
     #[test]
     fn decode_valid_body_parses() -> TestResult {
-        let value = decode_json_body(br#"{"prompt":"hi"}"#)
-            .map_err(|_| "valid body must decode")?;
+        let value =
+            decode_json_body(br#"{"prompt":"hi"}"#).map_err(|_| "valid body must decode")?;
         assert_eq!(value["prompt"], "hi");
         Ok(())
     }

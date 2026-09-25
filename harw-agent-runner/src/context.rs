@@ -181,7 +181,10 @@ impl RunnerContext {
                 context: "start the job manager for the job-backed child backend",
                 source,
             })?;
-        Ok(Arc::new(JobChildBackend::new(manager, self.args.offline_echo)))
+        Ok(Arc::new(JobChildBackend::new(
+            manager,
+            self.args.offline_echo,
+        )))
     }
 }
 

@@ -1001,7 +1001,11 @@ fn test_child_protocol_hello_rights_task_result() -> TestResult {
 
     let hello = client.recv_of(&["hello"])?;
     assert_eq!(hello["protocol"], "harwness.agent-child/v1", "{hello}");
-    assert_eq!(hello["agent_id"].as_str(), Some(agent_id.as_str()), "{hello}");
+    assert_eq!(
+        hello["agent_id"].as_str(),
+        Some(agent_id.as_str()),
+        "{hello}"
+    );
 
     client.send(&json!({"type": "rights", "rights": {"tools": ["fs.read"]}}))?;
     client.send(&json!({"type": "mode", "mode": "plan"}))?;

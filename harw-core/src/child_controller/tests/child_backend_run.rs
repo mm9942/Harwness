@@ -302,7 +302,11 @@ async fn the_backend_gets_the_in_process_rights_never_more_than_the_parent() -> 
 
     fixture
         .spawner
-        .run_child(&fixture.child, &InMemoryStateStore::new(), TurnInput::default())
+        .run_child(
+            &fixture.child,
+            &InMemoryStateStore::new(),
+            TurnInput::default(),
+        )
         .await
         .map_err(|error| TestError::Unexpected(error.message))?;
     let rights = only_spec(&fixture.backend)?.rights;
@@ -377,7 +381,11 @@ async fn a_completed_backend_run_maps_to_the_answer() -> TestResult {
     )?;
     let result = fixture
         .spawner
-        .run_child(&fixture.child, &InMemoryStateStore::new(), TurnInput::default())
+        .run_child(
+            &fixture.child,
+            &InMemoryStateStore::new(),
+            TurnInput::default(),
+        )
         .await
         .map_err(|error| TestError::Unexpected(error.message))?;
     assert!(matches!(result.outcome, TurnOutcome::Completed));
@@ -409,7 +417,11 @@ async fn crashed_and_failed_backend_runs_become_a_child_end_with_the_matching_ca
         let fixture = backend_fixture(vec![Script::Return(outcome(status, None, None))], None)?;
         let result = fixture
             .spawner
-            .run_child(&fixture.child, &InMemoryStateStore::new(), TurnInput::default())
+            .run_child(
+                &fixture.child,
+                &InMemoryStateStore::new(),
+                TurnInput::default(),
+            )
             .await;
         let Err(error) = result else {
             return Err(TestError::Unexpected(
