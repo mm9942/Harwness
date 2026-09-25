@@ -16,7 +16,12 @@
 //! - Zyklische Vererbung (`InheritanceCycle`)
 //! - Authority-Verletzungen (`AuthorityElevation`)
 //! - Rollenkonflikte bei Mixins (`IllegalRoleForMixin`)
-//! - Unbekannte Merge-Operatoren (`UnknownMergeOp`)
+//! - Unbekannte Merge-Operatoren (`UnknownMergeOp`) und ungültige Patches
+//!   (`PatchPathMissing`, `PatchTypeMismatch`, `PatchExceedsParent`,
+//!   `PatchAmbiguous`, `AuthorityOpForbidden`)
+//! - Falsches `schema` (`SchemaMismatch`), unbekannter Rückgabevertrag
+//!   (`UnknownReturnContract`), Kontextprogramm-Bindung
+//!   (`UnknownContextProgram`, `ContextProgramResolution`)
 //! - I/O-Fehler (`Io`)
 //!
 //! # Nebenläufigkeit
@@ -207,6 +212,92 @@ pub enum DslError {
         name: String,
     },
 
+    /// A patch path names no inherited field (§7): only `replace` may
+    /// introduce a field.
+    PatchPathMissing {
+        /// Dotted patch path, e.g. `"context.must_include"`.
+        path: String,
+        /// Field path context (§20).
+        location: DiagLocation,
+    },
+
+    /// A merge operator was applied to a value of the wrong type (§7).
+    PatchTypeMismatch {
+        /// The operator, e.g. `"append"` or `"min"`.
+        op: String,
+        /// What the operator needs (`"array"`, `"number"`, `"table"`).
+        expected: &'static str,
+        /// TOML type actually found.
+        found: &'static str,
+        /// Field path context (§20).
+        location: DiagLocation,
+    },
+
+    /// `max-within-parent` asked for more than the inherited value (§7).
+    PatchExceedsParent {
+        /// Requested value.
+        requested: String,
+        /// Inherited (parent) value.
+        parent: String,
+        /// Field path context (§20).
+        location: DiagLocation,
+    },
+
+    /// A patch table mixes operators with nested keys (§7).
+    PatchAmbiguous {
+        /// Dotted patch path.
+        path: String,
+        /// Field path context (§20).
+        location: DiagLocation,
+    },
+
+    /// An operator other than `intersect`/`remove` targets an
+    /// authority-bearing set (§7).
+    AuthorityOpForbidden {
+        /// ID of the patching definition (boxed).
+        of: Box<DefinitionId>,
+        /// The rejected operator.
+        op: String,
+        /// Field path context (§20).
+        location: DiagLocation,
+    },
+
+    /// The `schema` field names an unsupported schema.
+    SchemaMismatch {
+        /// ID of the definition (boxed).
+        of: Box<DefinitionId>,
+        /// Accepted schema labels.
+        expected: &'static [&'static str],
+        /// Found schema label.
+        found: String,
+        /// Field path context (§20), always `schema`.
+        location: DiagLocation,
+    },
+
+    /// `[return] contract` names a contract this crate does not know.
+    UnknownReturnContract {
+        /// ID of the definition (boxed).
+        of: Box<DefinitionId>,
+        /// The unknown contract label.
+        contract: String,
+    },
+
+    /// `[context] program` names no program of the library.
+    UnknownContextProgram {
+        /// The requested program name.
+        name: String,
+        /// Names the library knows, sorted.
+        known: Vec<String>,
+    },
+
+    /// A context program exists but cannot be resolved.
+    ContextProgramResolution {
+        /// The requested program name.
+        name: String,
+        /// Resolver message.
+        message: String,
+    },
+
     /// TOML-Deserialisierungsfehler.
     Toml(String),
 
@@ -227,6 +318,31 @@ pub enum DslError {
 /// # Beschreibung
 /// Vereinfacht Funktionssignaturen im gesamten Crate.
 pub type DslResult<T> = Result<T, DslError>;
+
+impl DslError {
+    /// Sets the field path of a patch error that does not carry one yet.
+    ///
+    /// # Description
+    /// [`crate::merge::apply_merge_op`] does not know where in the definition
+    /// its value lives; the resolver adds the dotted patch path here. Other
+    /// variants and variants that already carry a path are returned
+    /// unchanged.
+    #[must_use]
+    pub fn with_field_path(mut self, path: &str) -> Self {
+        match &mut self {
+            DslError::PatchTypeMismatch { location, .. }
+            | DslError::PatchExceedsParent { location, .. }
+            | DslError::PatchPathMissing { location, .. }
+            | DslError::PatchAmbiguous { location, .. }
+                if location.field_path.is_none() =>
+            {
+                location.field_path = Some(path.to_owned());
+            }
+            _ => {}
+        }
+        self
+    }
+}
 
 impl std::fmt::Display for DslError {
     /// Gibt eine menschenlesbare Fehlerbeschreibung aus.
@@ -322,6 +438,64 @@ impl std::fmt::Display for DslError {
             DslError::UnknownMergeOp { name } => {
                 write!(f, "Unbekannte Merge-Operation: '{name}'")
             }
+            DslError::PatchPathMissing { path, location } => write!(
+                f,
+                "patch path '{path}' names no inherited field; only 'replace' may introduce one{}",
+                location.format_suffix()
+            ),
+            DslError::PatchTypeMismatch {
+                op,
+                expected,
+                found,
+                location,
+            } => write!(
+                f,
+                "merge operator '{op}' needs a {expected}, found {found}{}",
+                location.format_suffix()
+            ),
+            DslError::PatchExceedsParent {
+                requested,
+                parent,
+                location,
+            } => write!(
+                f,
+                "'max-within-parent' requests {requested}, but the parent allows at most {parent}{}",
+                location.format_suffix()
+            ),
+            DslError::PatchAmbiguous { path, location } => write!(
+                f,
+                "patch table '{path}' mixes merge operators with nested keys{}",
+                location.format_suffix()
+            ),
+            DslError::AuthorityOpForbidden { of, op, location } => write!(
+                f,
+                "definition '{of}' applies '{op}' to an authority-bearing set; only 'intersect' and 'remove' are allowed{}",
+                location.format_suffix()
+            ),
+            DslError::SchemaMismatch {
+                of,
+                expected,
+                found,
+                location,
+            } => write!(
+                f,
+                "definition '{of}' declares schema '{found}', expected {}{}",
+                expected.join(" or "),
+                location.format_suffix()
+            ),
+            DslError::UnknownReturnContract { of, contract } => write!(
+                f,
+                "definition '{of}' names unknown return contract '{contract}' (field: return.contract)"
+            ),
+            DslError::UnknownContextProgram { name, known } => write!(
+                f,
+                "unbekanntes Kontextprogramm '{name}' in [context].program — bekannt sind: {}",
+                known.join(", ")
+            ),
+            DslError::ContextProgramResolution { name, message } => write!(
+                f,
+                "Kontextprogramm '{name}' lässt sich nicht auflösen: {message}"
+            ),
             DslError::Toml(msg) => {
                 write!(f, "TOML-Deserialisierungsfehler: {msg}")
             }
@@ -426,6 +600,48 @@ mod tests {
             },
             DslError::Toml("ungültige Tabelle".to_owned()),
             DslError::Semver("kein semver".to_owned()),
+            DslError::PatchPathMissing {
+                path: "context.nope".to_owned(),
+                location: DiagLocation::field("patch.context.nope"),
+            },
+            DslError::PatchTypeMismatch {
+                op: "append".to_owned(),
+                expected: "array",
+                found: "string",
+                location: DiagLocation::none(),
+            },
+            DslError::PatchExceedsParent {
+                requested: "41".to_owned(),
+                parent: "40".to_owned(),
+                location: DiagLocation::none(),
+            },
+            DslError::PatchAmbiguous {
+                path: "context".to_owned(),
+                location: DiagLocation::none(),
+            },
+            DslError::AuthorityOpForbidden {
+                of: Box::new(make_id()?),
+                op: "replace".to_owned(),
+                location: DiagLocation::none(),
+            },
+            DslError::SchemaMismatch {
+                of: Box::new(make_id()?),
+                expected: &["harwness.agent/v1"],
+                found: "harwness.agent/v9".to_owned(),
+                location: DiagLocation::field("schema"),
+            },
+            DslError::UnknownReturnContract {
+                of: Box::new(make_id()?),
+                contract: "harwness.return.nope@1".to_owned(),
+            },
+            DslError::UnknownContextProgram {
+                name: "nope".to_owned(),
+                known: vec!["explore".to_owned()],
+            },
+            DslError::ContextProgramResolution {
+                name: "p".to_owned(),
+                message: "missing base".to_owned(),
+            },
             DslError::Io {
                 path: PathBuf::from("/tmp/test.toml"),
                 source: std::io::Error::new(std::io::ErrorKind::NotFound, "nicht gefunden"),

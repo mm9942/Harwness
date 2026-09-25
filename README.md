@@ -186,6 +186,18 @@ Roles are a closed Rust enum. The spawn matrix is enforced by the runtime and ca
 
 The full specification is in [docs/design/agent-definition-dsl.md](docs/design/agent-definition-dsl.md).
 
+## Compiling agents
+
+*Planned in #22.* `harw agent build` will compile a definition into a single executable that runs that one agent with its rights manifest baked in, as a CLI, REPL, MCP server, HTTP API or TUI:
+
+```sh
+harw agent check evidence-critic
+harw agent build evidence-critic --interface cli,mcp -o ./ec
+./ec --manifest
+```
+
+Flags at runtime can only narrow the baked-in rights, and a modified binary refuses to start. See the [agent compiler guide](docs/guides/agent-compiler.md) and [ADR 0001](docs/adr/0001-agent-compiler.md).
+
 ## Context and model interaction
 
 Context is assembled as a typed program. Sections identify their source, trust class, strength, and detail level. This lets the runtime distinguish instructions from evidence and ordinary data, apply context ceilings, and reduce context predictably when budgets are tight.

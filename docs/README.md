@@ -18,11 +18,20 @@ code wins and the document is a bug.
 
 - [`harw` command line](cli.md)
 - [Background orchestrators: control, messaging, handoff](guides/background-agents.md)
+- [Compiling agents into standalone binaries](guides/agent-compiler.md) — *planned in #22*
 
 ## Philosophy
 
 - [Harwness Coding Philosophy](philosophy/coding-philosophy.md)
 - [Agent harnesses as an operating-system layer for long-lived, model-heterogeneous AI agents](philosophy/philosophy.md)
+
+## Architecture decisions
+
+Architecture decision records live in [`adr/`](adr/), numbered in order.
+
+| ADR | Status |
+| --- | --- |
+| [0001 — Agent compiler: IR v2, artifacts and standalone binaries](adr/0001-agent-compiler.md) | accepted, partially implemented |
 
 ## Architecture
 
@@ -39,6 +48,7 @@ code wins and the document is a bug.
 | [CONTRACT MASTER — Setup & Install Lifecycle](design/CONTRACT-setup-install.md) | implemented |
 | [Agent Composition Contract — Design Only (post-0.2.0)](design/agent-composition-contract.md) | proposal |
 | [Harwness Agent Definition DSL](design/agent-definition-dsl.md) | partially implemented |
+| [Agent Artifact v1 — the binary format of a compiled agent](design/agent-artifact-v1.md) | proposal |
 | [Agent IR v1 — the existing pipeline as an explicit compiler channel](design/agent-ir-v1.md) | partially implemented |
 | [Agent-as-tool execution contract](design/agent-tool-loop.md) | implemented |
 | [Agents as Tools](design/agents-as-tools.md) | implemented |

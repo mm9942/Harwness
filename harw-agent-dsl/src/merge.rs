@@ -10,7 +10,11 @@
 //! # Invarianten (§7)
 //! - Jedes geerbte Feld folgt genau einem expliziten Operator.
 //! - Für Authority-tragende Felder ist nur `Intersect` und `Remove` erlaubt.
-//! - `min`/`max-within-parent` sind für eine Folge-Wave reserviert.
+//! - `min` ergibt das Kleinere aus geerbtem und gegebenem Zahlenwert (ein
+//!   Patch kann nur verschärfen); `max-within-parent` übernimmt den gegebenen
+//!   Wert, verlangt aber, dass er den geerbten nicht übersteigt — mehr zu
+//!   verlangen ist ein Fehler ([`DslError::PatchExceedsParent`]), keine
+//!   stille Kappung.
 //!
 //! # Nebenläufigkeit
 //! `apply_merge_op` ist zustandslos und thread-sicher.
@@ -32,6 +36,8 @@ use crate::error::DslError;
 /// - `Prepend` — stellt Elemente einem Array voran.
 /// - `Remove` — entfernt Elemente aus einem Array.
 /// - `Intersect` — behält nur Elemente, die in beiden Mengen vorkommen.
+/// - `Min` — das Kleinere aus geerbtem und gegebenem Zahlenwert.
+/// - `MaxWithinParent` — der gegebene Zahlenwert, höchstens der geerbte.
 ///
 /// # Beispiele
 /// ```rust
@@ -67,7 +73,49 @@ pub enum MergeOp {
         /// Referenzmenge für die Schnittbildung.
         values: Vec<toml::Value>,
     },
+    /// Das Kleinere aus geerbtem und gegebenem Zahlenwert (§7 `min`).
+    Min {
+        /// Gegebener Zahlenwert (Integer oder Float).
+        value: toml::Value,
+    },
+    /// Der gegebene Zahlenwert, sofern er den geerbten nicht übersteigt
+    /// (§7 `max-within-parent`); sonst [`DslError::PatchExceedsParent`].
+    #[serde(rename = "max-within-parent")]
+    MaxWithinParent {
+        /// Gegebener Zahlenwert (Integer oder Float).
+        value: toml::Value,
+    },
 }
+
+impl MergeOp {
+    /// Der Operatorname, wie er in `[patch.*]`-Tabellen steht.
+    #[must_use]
+    pub fn name(&self) -> &'static str {
+        match self {
+            MergeOp::Replace { .. } => "replace",
+            MergeOp::Append { .. } => "append",
+            MergeOp::Prepend { .. } => "prepend",
+            MergeOp::Remove { .. } => "remove",
+            MergeOp::Intersect { .. } => "intersect",
+            MergeOp::Min { .. } => "min",
+            MergeOp::MaxWithinParent { .. } => "max-within-parent",
+        }
+    }
+}
+
+/// Die Schlüssel, unter denen eine Patch-Tabelle Operatoren führt (§7), in
+/// Anwendungsreihenfolge. `max_within_parent` ist als Schreibweise ohne
+/// Bindestrich zusätzlich zugelassen.
+pub const PATCH_OPERATOR_KEYS: &[&str] = &[
+    "replace",
+    "prepend",
+    "append",
+    "remove",
+    "intersect",
+    "min",
+    "max-within-parent",
+    "max_within_parent",
+];
 
 /// Wendet eine [`MergeOp`] auf einen `toml::Value`-Slot an.
 ///
@@ -84,7 +132,10 @@ pub enum MergeOp {
 /// `Ok(())` bei Erfolg.
 ///
 /// # Fehler
-/// - [`DslError::UnknownMergeOp`]: wenn eine Array-Operation auf einem Nicht-Array ausgeführt wird.
+/// - [`DslError::PatchTypeMismatch`]: wenn eine Array-Operation auf einem
+///   Nicht-Array oder `min`/`max-within-parent` auf einer Nicht-Zahl läuft.
+/// - [`DslError::PatchExceedsParent`]: wenn `max-within-parent` mehr verlangt
+///   als der geerbte Wert.
 ///
 /// # Nebenläufigkeit
 /// Zustandslos; thread-sicher unter exklusivem Zugriff auf `current`.
@@ -110,25 +161,46 @@ pub fn apply_merge_op(current: &mut toml::Value, op: MergeOp) -> Result<(), DslE
             Ok(())
         }
         MergeOp::Append { values } => {
-            let arr = require_array(current)?;
+            let arr = require_array(current, "append")?;
             arr.extend(values);
             Ok(())
         }
         MergeOp::Prepend { values } => {
-            let arr = require_array(current)?;
+            let arr = require_array(current, "prepend")?;
             let mut new_arr = values;
             new_arr.append(arr);
             *arr = new_arr;
             Ok(())
         }
         MergeOp::Remove { values } => {
-            let arr = require_array(current)?;
+            let arr = require_array(current, "remove")?;
             arr.retain(|item| !values.contains(item));
             Ok(())
         }
         MergeOp::Intersect { values } => {
-            let arr = require_array(current)?;
+            let arr = require_array(current, "intersect")?;
             arr.retain(|item| values.contains(item));
+            Ok(())
+        }
+        MergeOp::Min { value } => {
+            let inherited = require_number(current, "min")?;
+            let given = require_number(&value, "min")?;
+            if given < inherited {
+                *current = value;
+            }
+            Ok(())
+        }
+        MergeOp::MaxWithinParent { value } => {
+            let inherited = require_number(current, "max-within-parent")?;
+            let given = require_number(&value, "max-within-parent")?;
+            if given > inherited {
+                return Err(DslError::PatchExceedsParent {
+                    requested: value.to_string(),
+                    parent: current.to_string(),
+                    location: crate::error::DiagLocation::none(),
+                });
+            }
+            *current = value;
             Ok(())
         }
     }
@@ -137,12 +209,41 @@ pub fn apply_merge_op(current: &mut toml::Value, op: MergeOp) -> Result<(), DslE
 /// Erzwingt, dass `val` ein `toml::Value::Array` ist, und gibt eine mutable Referenz zurück.
 ///
 /// # Fehler
-/// - [`DslError::UnknownMergeOp`]: wenn `val` kein Array ist.
-fn require_array(val: &mut toml::Value) -> Result<&mut Vec<toml::Value>, DslError> {
-    let type_name = val.type_str().to_owned();
-    val.as_array_mut().ok_or_else(|| DslError::UnknownMergeOp {
-        name: format!("Array-Operation auf Nicht-Array-Typ '{type_name}'"),
-    })
+/// - [`DslError::PatchTypeMismatch`]: wenn `val` kein Array ist.
+fn require_array<'a>(
+    val: &'a mut toml::Value,
+    op: &str,
+) -> Result<&'a mut Vec<toml::Value>, DslError> {
+    let type_name = val.type_str();
+    val.as_array_mut()
+        .ok_or_else(|| DslError::PatchTypeMismatch {
+            op: op.to_owned(),
+            expected: "array",
+            found: type_name,
+            location: crate::error::DiagLocation::none(),
+        })
+}
+
+/// Liest einen Zahlenwert (Integer oder Float) als `f64` für den Vergleich
+/// von `min`/`max-within-parent`.
+///
+/// Integer bis 2^53 werden exakt verglichen; größere Werte sind für Limits
+/// bedeutungslos.
+///
+/// # Fehler
+/// - [`DslError::PatchTypeMismatch`]: wenn `val` keine Zahl ist.
+#[allow(clippy::cast_precision_loss)]
+fn require_number(val: &toml::Value, op: &str) -> Result<f64, DslError> {
+    match val {
+        toml::Value::Integer(n) => Ok(*n as f64),
+        toml::Value::Float(n) => Ok(*n),
+        other => Err(DslError::PatchTypeMismatch {
+            op: op.to_owned(),
+            expected: "number",
+            found: other.type_str(),
+            location: crate::error::DiagLocation::none(),
+        }),
+    }
 }
 
 #[cfg(test)]
@@ -241,7 +342,93 @@ mod tests {
                 values: vec![str_val("x")],
             },
         );
-        assert!(matches!(result, Err(DslError::UnknownMergeOp { .. })));
+        assert!(matches!(result, Err(DslError::PatchTypeMismatch { .. })));
+    }
+
+    #[test]
+    fn test_min_takes_the_smaller_value() -> TestResult {
+        let mut val = toml::Value::Integer(40);
+        apply_merge_op(
+            &mut val,
+            MergeOp::Min {
+                value: toml::Value::Integer(24),
+            },
+        )?;
+        assert_eq!(val, toml::Value::Integer(24));
+        apply_merge_op(
+            &mut val,
+            MergeOp::Min {
+                value: toml::Value::Integer(100),
+            },
+        )?;
+        assert_eq!(val, toml::Value::Integer(24), "min never raises");
+        Ok(())
+    }
+
+    #[test]
+    fn test_min_on_non_number_is_a_type_mismatch() {
+        let mut val = str_val("x");
+        let result = apply_merge_op(
+            &mut val,
+            MergeOp::Min {
+                value: toml::Value::Integer(1),
+            },
+        );
+        assert!(matches!(result, Err(DslError::PatchTypeMismatch { .. })));
+    }
+
+    #[test]
+    fn test_max_within_parent_sets_value_at_or_below_parent() -> TestResult {
+        let mut val = toml::Value::Integer(40);
+        apply_merge_op(
+            &mut val,
+            MergeOp::MaxWithinParent {
+                value: toml::Value::Integer(40),
+            },
+        )?;
+        assert_eq!(val, toml::Value::Integer(40));
+        apply_merge_op(
+            &mut val,
+            MergeOp::MaxWithinParent {
+                value: toml::Value::Integer(10),
+            },
+        )?;
+        assert_eq!(val, toml::Value::Integer(10));
+        Ok(())
+    }
+
+    #[test]
+    fn test_max_within_parent_above_parent_is_an_error_not_a_clamp() {
+        let mut val = toml::Value::Integer(40);
+        let result = apply_merge_op(
+            &mut val,
+            MergeOp::MaxWithinParent {
+                value: toml::Value::Integer(41),
+            },
+        );
+        assert!(matches!(result, Err(DslError::PatchExceedsParent { .. })));
+        assert_eq!(val, toml::Value::Integer(40), "the value stays unchanged");
+    }
+
+    #[test]
+    fn test_merge_op_names_match_patch_keys() {
+        for op in [
+            MergeOp::Replace {
+                value: str_val("a"),
+            },
+            MergeOp::Append { values: vec![] },
+            MergeOp::Prepend { values: vec![] },
+            MergeOp::Remove { values: vec![] },
+            MergeOp::Intersect { values: vec![] },
+            MergeOp::Min {
+                value: toml::Value::Integer(1),
+            },
+            MergeOp::MaxWithinParent {
+                value: toml::Value::Integer(1),
+            },
+        ] {
+            assert!(PATCH_OPERATOR_KEYS.contains(&op.name()), "{}", op.name());
+        }
     }
 
     #[test]

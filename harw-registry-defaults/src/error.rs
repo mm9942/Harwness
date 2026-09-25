@@ -7,6 +7,7 @@
 use harw_extension_api::registry::ContextProviderRegistrationError;
 use std::fmt;
 
+use harw_agent_dsl::diagnostics::Diagnostics;
 use harw_agent_dsl::error::DslError;
 use harw_egress::EgressError;
 use harw_project_discovery::DiscoveryError;
@@ -35,6 +36,15 @@ pub enum RegistryDefaultsError {
         name: String,
         /// Ursächlicher Fehler aus der Agent-Definition-DSL.
         source: DslError,
+    },
+    /// Eine eingebaute Agentendefinition liess sich nicht zu IR v2
+    /// (`harw_agent_dsl::AgentIr`) senken
+    /// (`embedded_agents::builtin_agent_irs`).
+    AgentIr {
+        /// Name der eingebauten Definition, z. B. `"explorer"`.
+        name: String,
+        /// Die Diagnosen des Senkens (mindestens ein Fehler).
+        diagnostics: Diagnostics,
     },
     /// Ein Kontextanbieter liess sich nicht registrieren.
     ///
@@ -83,6 +93,12 @@ impl fmt::Display for RegistryDefaultsError {
                     "Kontextanbieter konnte nicht registriert werden: {source}"
                 )
             }
+            Self::AgentIr { name, diagnostics } => {
+                write!(
+                    f,
+                    "eingebaute Agentendefinition '{name}' lässt sich nicht zu IR v2 senken:\n{diagnostics}"
+                )
+            }
             Self::ResearcherWebPolicy { source } => {
                 write!(
                     f,
@@ -99,6 +115,7 @@ impl std::error::Error for RegistryDefaultsError {
         match self {
             Self::ProjectDiscovery { source } => Some(source),
             Self::AgentDefinition { source, .. } => Some(source),
+            Self::AgentIr { diagnostics, .. } => Some(diagnostics),
             Self::ContextProviderRegistration { source } => Some(source),
             Self::ResearcherWebPolicy { source } => Some(source),
             Self::BrowserHost(_) => None,

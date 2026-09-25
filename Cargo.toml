@@ -1,6 +1,8 @@
 [workspace]
 resolver = "2"
 members = [
+    # R10 Wave 2A: agent-artifact-v1 container + executable footer (leaf crate).
+    "harw-agent-artifact",
     "harw-agent-dsl",
     "harw-authority",
     "harw-code-graph",

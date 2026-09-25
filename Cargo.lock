@@ -1790,6 +1790,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "harw-agent-artifact"
+version = "0.3.0"
+dependencies = [
+ "blake3",
+ "serde",
+ "serde_json",
+ "tempfile",
+]
+
+[[package]]
 name = "harw-agent-dsl"
 version = "0.3.0"
 dependencies = [
