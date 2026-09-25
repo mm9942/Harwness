@@ -65,6 +65,7 @@ const TESTED_CODES: &[&str] = &[
     "HARW-BINARY-003",
     "HARW-BINARY-004",
     "HARW-BINARY-005",
+    "HARW-BINARY-006",
 ];
 
 const TARGET: &str = "acme.agent.t@1";
@@ -673,6 +674,18 @@ fn test_binary_005_duplicate_interface_is_a_warning() -> TestResult {
             "[binary]\ninterfaces = [\"cli\", \"cli\"]",
         ))],
         "HARW-BINARY-005",
+    )?;
+    Ok(())
+}
+
+#[test]
+fn test_binary_006_unknown_child_execution() -> TestResult {
+    expect_one(
+        &[target_file(&agent(
+            "",
+            "[binary]\nchild_execution = \"thread\"",
+        ))],
+        "HARW-BINARY-006",
     )?;
     Ok(())
 }
