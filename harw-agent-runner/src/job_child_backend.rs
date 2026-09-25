@@ -242,12 +242,19 @@ async fn run_one<S: ChildProcessSpawner>(
         stderr_task.abort();
     }
 
-    // A `Crashed`/protocol-`Failed` outcome from `drive_protocol` already
-    // observed the process ending; everything else (`Completed`,
-    // `BudgetExhausted`, `Cancelled`) leaves the child running its own
-    // shutdown, which we do not block on.
+    // `Completed`/`BudgetExhausted`/`Cancelled` leave the child running its
+    // own shutdown, which we do not block on; only a crash (the stream ended
+    // without a `Result`) is worth an exit code and a stderr tail.
     let _ = start.elapsed();
     if matches!(outcome.status, ChildRunStatus::Crashed { .. }) {
+        let exit_code = child.wait().await.ok().and_then(|status| status.code());
+        let outcome = ChildRunOutcome {
+            status: ChildRunStatus::Crashed {
+                exit_code,
+                stderr_tail: String::new(),
+            },
+            ..outcome
+        };
         return fill_stderr_tail(outcome, &stderr_tail);
     }
     outcome
