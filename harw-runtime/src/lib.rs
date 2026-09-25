@@ -81,7 +81,7 @@ pub use session_title::{
     SessionTitleError, TitleRequest, ensure_title, generate_title, spawn_title_job,
 };
 pub use spec::{
-    AskResolution, CeilingPolicy, EntryKind, EntryProfile, OperationSurface, RightsSnapshot,
-    RootBudget, RuntimeSpec, SpawnerPolicy,
+    AskResolution, CeilingPolicy, ChildBackendHandle, EntryKind, EntryProfile, OperationSurface,
+    RightsSnapshot, RootBudget, RuntimeSpec, SpawnerPolicy,
 };
 pub use trace::new_root_trace;

@@ -320,6 +320,13 @@ pub const CATALOG: &[CapabilityEntry] = &[
     row!("job.stop", JOB, Meta),
     row!("job.list", JOB, Meta),
     row!("job.wait", JOB, Meta),
+    // agent compiler (#22 wave 2B): compiles an agent definition as a
+    // background job, same launch path as `job.start`/`shell.exec`. Never
+    // granted to a built-in role by default (no `RegistryProfile` registers
+    // `crate::agent_definition_tools::AgentBuildToolProvider`); only an
+    // explicit agent definition that lists `agents.build` in
+    // `tools.admitted` can carry it.
+    row!("agents.build", JOB, Shell),
     // processes
     row!("process.list", PROCESS, Shell),
     row!("process.kill", PROCESS, Shell),
@@ -575,5 +582,42 @@ mod tests {
             .unwrap_or_default();
         assert!(classes.write_other && !classes.write_workspace);
         assert_eq!(CapabilityCatalog.classify("nope.tool"), None);
+    }
+
+    /// #22 Welle 2B: `agents.build` hat eine Katalogzeile, deren Klasse
+    /// mindestens so streng ist wie die von `shell.exec` (beide `Shell` —
+    /// `Ord`-Reihenfolge in [`CapabilityClass`]: `Shell` vor `Host`, danach
+    /// nur noch rechtlose Klassen).
+    #[test]
+    fn test_agents_build_is_at_least_as_strict_as_shell_exec() {
+        let shell_exec = lookup("shell.exec").expect("shell.exec hat eine Katalogzeile");
+        let agents_build = lookup("agents.build").expect("agents.build hat eine Katalogzeile");
+        assert!(
+            agents_build.class >= shell_exec.class,
+            "agents.build: Klasse {:?} ist weniger streng als shell.exec ({:?})",
+            agents_build.class,
+            shell_exec.class
+        );
+    }
+
+    /// #22 Welle 2B: kein eingebautes Profil darf `agents.build` von sich aus
+    /// bewerben — nur eine ausdrückliche Agentendefinition, die es in
+    /// `tools.admitted` aufführt, darf es bekommen.
+    #[test]
+    fn test_agents_build_is_not_granted_to_any_builtin_role_by_default() {
+        for profile in RegistryProfile::ALL {
+            assert!(
+                !profile.registered_tool_names().contains(&"agents.build"),
+                "{profile:?} bewirbt agents.build von sich aus"
+            );
+        }
+    }
+
+    /// #22 Welle 2B: `agents.build` ist nicht in [`crate::AUTO_APPROVED_TOOLS`]
+    /// — es fragt wie `shell.exec` immer nach Freigabe.
+    #[test]
+    fn test_agents_build_requires_approval_like_shell_exec() {
+        assert!(!crate::AUTO_APPROVED_TOOLS.contains(&"shell.exec"));
+        assert!(!crate::AUTO_APPROVED_TOOLS.contains(&"agents.build"));
     }
 }

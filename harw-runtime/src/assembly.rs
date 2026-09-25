@@ -2529,6 +2529,12 @@ impl RuntimeAssemblyBuilder {
                 skill_roots: trust_report.layers.clone(),
                 // Plan Teil D: lesende Wissenswerkzeuge der Kinder.
                 knowledge: child_knowledge,
+                // Welle 3C: reicht `RuntimeSpec::child_backend` an den
+                // gebauten `ManagedAgentSpawner` durch.
+                child_backend: spec
+                    .child_backend
+                    .as_ref()
+                    .map(|handle| Arc::clone(&handle.0)),
             },
             session_events,
         )?;
@@ -4640,6 +4646,10 @@ struct SpawnerInputs<'a> {
     /// [`RuntimeChildRegistryFactory::with_knowledge`] an `factory` **und**
     /// `uia_worker_factory`. `None` → kein Kind bekommt sie.
     knowledge: Option<crate::children::ChildKnowledgeSource>,
+    /// [`RuntimeSpec::child_backend`] des Laufs (#22 Welle 3C); `Some` lässt
+    /// den gebauten `ManagedAgentSpawner` jedes Kind über dieses
+    /// [`harw_core::child_backend::ChildBackend`] statt in-process laufen.
+    child_backend: Option<Arc<dyn harw_core::child_backend::ChildBackend>>,
 }
 
 /// Montiert den Spawner eines Laufs nach seiner [`SpawnerPolicy`].
@@ -4686,6 +4696,7 @@ fn build_spawner(
         agent_events,
         skill_roots,
         knowledge,
+        child_backend,
     } = inputs;
 
     let events = session_events.ok_or_else(|| RuntimeError::Spawner {
@@ -4891,6 +4902,12 @@ fn build_spawner(
         // Skills, Rechte, Budget, Herkunft und die Lese-Eigenschaft, nach der
         // im Plan-Modus nur lesende Ziele delegierbar bleiben.
         .with_delegation_catalog(roster.entries().map(delegation_target_info));
+    // Welle 3C: ein gesetztes `RuntimeSpec::child_backend` lässt jedes über
+    // diesen Spawner admittierte Kind über dieses `ChildBackend` laufen
+    // (z. B. `harw-agent-runner`s `JobChildBackend`) statt in-process.
+    if let Some(backend) = child_backend {
+        spawner = spawner.with_child_backend(backend);
+    }
     // Plan R9, Teil B: registriert wird der ganze Roster — die eingebauten
     // Rollen (`role_names::ALL`) und daneben jeder benutzerdefinierte Agent.
     let mut roles: Vec<String> = Vec::with_capacity(roster.len());
@@ -6603,6 +6620,7 @@ mod tests {
             approval_override: None,
             model_override: None,
             embedded: None,
+            child_backend: None,
         }
     }
 
@@ -6992,6 +7010,7 @@ mod tests {
             approval_override: None,
             model_override: None,
             embedded: None,
+            child_backend: None,
         };
 
         let builder = RuntimeAssembly::builder(spec).secret_resolver(Arc::new(FakeResolver));
@@ -7160,6 +7179,7 @@ mod tests {
             approval_override: None,
             model_override: None,
             embedded: None,
+            child_backend: None,
         };
         let state_store: Arc<dyn StateStore> = Arc::new(harw_core::InMemoryStateStore::new());
         RuntimeAssembly::builder(spec)

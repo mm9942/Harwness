@@ -74,6 +74,17 @@ pub(crate) struct LocalCommandContext<'a> {
     pub tier: PermissionTier,
     /// Bekannte Agentenrollen für `@rolle`.
     pub known_roles: &'a [&'a str],
+    /// R10 Welle 3B: kanonische Namen der Befehle, die diese Sitzung
+    /// (kompilierter Agent, [`crate::fixed_agent`]) versteckt — kleingeschrieben,
+    /// leer für die normale TUI. Geprüft **vor** jedem anderen Abfang, damit
+    /// weder eine bare Projektion (`/agent`, `/model`, …) noch ein Fall, den
+    /// `intercept` sonst gar nicht kennt (fällt an die Operation-Dispatch
+    /// durch), einen versteckten Befehl je erreicht.
+    pub hidden_commands: &'a [String],
+    /// R10 Welle 3B: erlaubte `/model switch`-Ziele (`provider`, `model`),
+    /// wenn `Some` — jedes andere Ziel wird abgelehnt. `None` lässt
+    /// `/model switch` uneingeschränkt.
+    pub model_switch_allowlist: Option<&'a [(String, String)]>,
 }
 
 /// Umschaltbare Seitenpanels.
@@ -163,6 +174,23 @@ pub(crate) fn is_bare_or_argless_switch(raw: &str, command: &str) -> bool {
     trimmed == command || trimmed == format!("{command} switch")
 }
 
+/// Whether a `/model switch <target>` argument names one of `allowed`'s
+/// `(provider, model)` pairs (R10 wave 3B).
+///
+/// # Beschreibung
+/// Matches the same two forms `/model switch` itself accepts (identical
+/// logic to [`crate::fixed_agent::is_model_switch_target_allowed`], restated
+/// here over a plain slice so this module does not need a
+/// [`crate::fixed_agent::FixedAgentOptions`] just to check a target):
+/// case-insensitively either a bare model id (`"gpt-5"`) or a qualified
+/// `provider/model` pair (`"openai/gpt-5"`).
+fn model_switch_target_allowed(target: &str, allowed: &[(String, String)]) -> bool {
+    allowed.iter().any(|(provider, model)| {
+        target.eq_ignore_ascii_case(model)
+            || target.eq_ignore_ascii_case(&format!("{provider}/{model}"))
+    })
+}
+
 /// Fängt TUI-lokale Befehle und Präfixe ab.
 ///
 /// # Beschreibung
@@ -190,6 +218,42 @@ pub(crate) fn intercept(raw: &str, ctx: &LocalCommandContext<'_>) -> Option<Loca
         None => (rest, ""),
     };
     let bare = args.is_empty();
+
+    // R10 Welle 3B: versteckte Befehle (fixed-agent-Beschränkung) zuerst
+    // abfangen — vor jeder bare-Projektion (`/agent`, `/model`, …), die
+    // sonst unbedingt öffnen würde, und vor jedem Fall, den diese Funktion
+    // gar nicht kennt (fiele sonst an die Operation-Dispatch durch, die den
+    // Befehl ohnehin nicht mehr kennt, sobald er aus `command_registry`
+    // gefiltert ist — hier aber mit einer eigenen, kurzen Meldung statt
+    // „Unbekannter Command").
+    if ctx
+        .hidden_commands
+        .iter()
+        .any(|hidden| hidden.eq_ignore_ascii_case(name))
+    {
+        return Some(LocalIntercept::System(format!(
+            "/{name} ist in diesem Agenten nicht verfügbar."
+        )));
+    }
+    // R10 Welle 3B: `/model switch <ziel>` gegen die erlaubten Modelle des
+    // kompilierten Agenten prüfen, bevor die Operation dispatcht. Die bare
+    // und die argloses-`switch`-Form laufen weiter über den Picker unten
+    // (unverändert); nur ein konkretes Ziel wird hier geprüft.
+    if name == "model"
+        && let Some(allowlist) = ctx.model_switch_allowlist
+    {
+        let mut parts = args.splitn(2, char::is_whitespace);
+        let sub = parts.next().unwrap_or("");
+        let target = parts.next().map(str::trim).filter(|t| !t.is_empty());
+        if sub.eq_ignore_ascii_case("switch")
+            && let Some(target) = target
+            && !model_switch_target_allowed(target, allowlist)
+        {
+            return Some(LocalIntercept::System(format!(
+                "/model switch {target}: Modell ist für diesen Agenten nicht zugelassen."
+            )));
+        }
+    }
 
     // Picker-Projektionen (bare oder argloses `switch`).
     if is_bare_or_argless_switch(trimmed, "/model") {

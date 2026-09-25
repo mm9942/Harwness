@@ -1074,6 +1074,20 @@ pub struct ChatApp {
     command_registry: CommandRegistry,
     /// Geöffnetes `/command`-Popup oder `None` wenn geschlossen.
     command_popup: Option<CommandPopup>,
+    /// R10 Welle 3B: kanonische Namen der Befehle, die diese Sitzung
+    /// (kompilierter Agent, [`crate::fixed_agent`]) weder im Popup, in der
+    /// Vervollständigung noch beim Dispatch zeigt. Kleingeschrieben; leer für
+    /// die normale, uneingeschränkte TUI. Siehe [`Self::with_hidden_commands`].
+    hidden_commands: Vec<String>,
+    /// R10 Welle 3B: Titel-Überschreibung für die Statuszeile (Name und
+    /// Kurz-Digest des kompilierten Agenten). `None` zeigt keinen
+    /// zusätzlichen Titel. Siehe [`Self::with_title_override`].
+    title_override: Option<String>,
+    /// R10 Welle 3B: erlaubte `/model switch`-Ziele (`provider`, `model`),
+    /// wenn `Some` — ein Ziel außerhalb der Liste wird abgelehnt, statt
+    /// dispatcht zu werden. `None` lässt `/model switch` uneingeschränkt.
+    /// Siehe [`Self::with_model_switch_allowlist`].
+    model_switch_allowlist: Option<Vec<(String, String)>>,
     /// Aktives Terminal-Farbschema, einmalig beim Erzeugen erkannt.
     theme: style::Theme,
     /// Über die Session-Laufzeit aufsummierte Token-Nutzung (aus
@@ -1442,6 +1456,9 @@ impl ChatApp {
             command_registry: CommandRegistry::from_command_adapters(&adapters)
                 .with_local_specs(crate::command_catalog::local_command_specs()),
             command_popup: None,
+            hidden_commands: Vec::new(),
+            title_override: None,
+            model_switch_allowlist: None,
             theme: style::detect_theme(),
             total_usage: TokenUsage::default(),
             agent_monitor: crate::agent_monitor::AgentMonitor::default(),
@@ -1685,6 +1702,88 @@ impl ChatApp {
         } else {
             ToolVerbosity::Compact
         };
+        self
+    }
+
+    /// Hides the named commands from this session's palette, tab-completion
+    /// and dispatch (R10 wave 3B: the fixed-agent mini-TUI,
+    /// [`crate::fixed_agent`]).
+    ///
+    /// # Beschreibung
+    /// Names are matched case-insensitively against each [`CommandSpec`]'s
+    /// canonical name (not its aliases — see
+    /// [`crate::fixed_agent::filter_command_specs`]'s own doc for why that is
+    /// sufficient). Rebuilds `command_registry` immediately from its current
+    /// specs with the hidden ones removed, so the `/`-popup
+    /// ([`CommandPopup::new`]) and subcommand completion
+    /// ([`Self::sync_command_popup`], both read `self.command_registry`)
+    /// never offer a hidden command. [`local_intercept_for`] additionally
+    /// consults [`Self::hidden_commands`] before any other local
+    /// interception, so a hidden command is refused with a short message
+    /// instead of running — even for a form (e.g. a bare `/agent`) that a
+    /// local intercept would otherwise open unconditionally, and even for a
+    /// form the local intercept does not know about at all (falls through to
+    /// the operation-adapter dispatch, which no longer finds the command
+    /// either once it is gone from `command_registry`).
+    ///
+    /// Calling this with an empty `hidden` list is a no-op (normal,
+    /// unrestricted TUI).
+    ///
+    /// # Argumente
+    /// - `hidden` (`Vec<String>`): canonical command names to hide, e.g.
+    ///   `crate::fixed_agent::hidden_command_names(&opts)` mapped to owned
+    ///   `String`s.
+    ///
+    /// # Rückgabe
+    /// `Self` für Builder-Verkettung.
+    #[must_use]
+    pub fn with_hidden_commands(mut self, hidden: Vec<String>) -> Self {
+        let hidden: Vec<String> = hidden
+            .iter()
+            .map(|name| name.to_ascii_lowercase())
+            .collect();
+        if !hidden.is_empty() {
+            let specs: Vec<crate::CommandSpec> = self
+                .command_registry
+                .specs()
+                .iter()
+                .filter(|spec| !hidden.iter().any(|name| name == spec.name.as_str()))
+                .cloned()
+                .collect();
+            self.command_registry = CommandRegistry::new(specs);
+        }
+        self.hidden_commands = hidden;
+        self
+    }
+
+    /// Overrides the title shown in the status line with the compiled
+    /// agent's name and short digest (R10 wave 3B,
+    /// [`crate::fixed_agent::fixed_agent_title`]).
+    ///
+    /// # Rückgabe
+    /// `Self` für Builder-Verkettung.
+    #[must_use]
+    pub fn with_title_override(mut self, title: String) -> Self {
+        self.title_override = Some(title);
+        self
+    }
+
+    /// Restricts `/model switch` targets to this allowlist (R10 wave 3B).
+    ///
+    /// # Beschreibung
+    /// `Some(allowlist)` makes [`local_intercept_for`] refuse any
+    /// `/model switch <target>` whose target is not one of the `(provider,
+    /// model)` pairs in `allowlist` (matched the same way as
+    /// [`crate::fixed_agent::is_model_switch_target_allowed`]: bare model id
+    /// or qualified `provider/model`, case-insensitive) with a short
+    /// message, before the operation dispatch ever sees it. `None` (the
+    /// default) leaves `/model switch` unrestricted.
+    ///
+    /// # Rückgabe
+    /// `Self` für Builder-Verkettung.
+    #[must_use]
+    pub fn with_model_switch_allowlist(mut self, allowlist: Option<Vec<(String, String)>>) -> Self {
+        self.model_switch_allowlist = allowlist;
         self
     }
 
@@ -2383,6 +2482,13 @@ impl ChatApp {
     #[must_use]
     pub(crate) fn active_mode(&self) -> InteractionMode {
         self.active_mode
+    }
+
+    /// R10 Welle 3B: der Titel des kompilierten Agenten für die Statuszeile,
+    /// falls [`Self::with_title_override`] gesetzt wurde.
+    #[must_use]
+    pub(crate) fn title_override(&self) -> Option<&str> {
+        self.title_override.as_deref()
     }
 
     /// Übernimmt einen beobachteten Moduswechsel in den Anzeigezustand.
@@ -3538,6 +3644,10 @@ fn local_intercept_for(app: &ChatApp, raw: &str) -> Option<LocalIntercept> {
         session_id: app.session_id(),
         tier: app.caller_tier(),
         known_roles: KNOWN_ROLES,
+        // R10 Welle 3B: fixed-agent-Beschränkungen, leer/`None` für die
+        // normale, uneingeschränkte TUI.
+        hidden_commands: &app.hidden_commands,
+        model_switch_allowlist: app.model_switch_allowlist.as_deref(),
     };
     local_commands::intercept(raw, &ctx)
 }
@@ -9679,7 +9789,16 @@ fn render_viewport(
         app.pending_permission_stage().is_some(),
     );
     use status_line::StatusSegment as Seg;
+    // R10 Welle 3B: fixierter Agenten-Titel (Name + Kurz-Digest) ganz vorne,
+    // solange die Sitzung eine Titel-Überschreibung trägt
+    // ([`ChatApp::with_title_override`]); mit sehr hoher Priorität, damit er
+    // erst ganz zuletzt gekürzt wird.
+    let title_suffix = app
+        .title_override()
+        .map(|title| format!(" {title} │"))
+        .unwrap_or_default();
     let segments = vec![
+        Seg::optional(255, title_suffix),
         Seg::new(
             150,
             vec![

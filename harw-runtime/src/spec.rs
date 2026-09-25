@@ -430,6 +430,12 @@ pub struct RuntimeSpec {
     /// Sitzungen und Protokolle genutzt. `None` ist der bestehende Pfad
     /// (jeder andere [`EntryKind`]) unverändert.
     pub embedded: Option<Arc<EmbeddedAgent>>,
+    /// Ein [`ChildBackend`], über das jedes von
+    /// [`crate::children::ChildRegistryFactory`] gebaute
+    /// `ManagedAgentSpawner` seine Kinder statt in-process laufen lässt (#22
+    /// Welle 3C, z. B. `harw-agent-runner`s `JobChildBackend`). `None` ist
+    /// der bestehende Pfad (jeder Kind-Lauf bleibt in-process).
+    pub child_backend: Option<ChildBackendHandle>,
 }
 
 /// Seiteneffektfreie Momentaufnahme der effektiven Rechte eines montierten
@@ -854,6 +860,7 @@ mod tests {
             approval_override: None,
             model_override: None,
             embedded: None,
+            child_backend: None,
         };
         let perms = spec.entry.profile().permissions;
         let names: Vec<String> = perms.iter().map(|p| format!("{p:?}")).collect();

@@ -466,7 +466,9 @@ mod tests {
         assert!(runner.is_real());
         let artifact = harw_agent_artifact::ArtifactBuilder::new(&serde_json::json!({"name": "demo"}))
             .build()?;
-        let error = runner.run(&artifact, "hi").expect_err("no runner is installed");
+        let Err(error) = runner.run(&artifact, "hi") else {
+            return Err("expected no runner to be installed".into());
+        };
         assert!(error.contains("harw-agent-runner"), "{error}");
         Ok(())
     }

@@ -281,7 +281,7 @@ fn run(load: impl FnOnce() -> Result<(Artifact, Bundle), RunnerError>) -> ExitCo
 #[cfg(test)]
 mod tests {
     use super::*;
-    use harw_agent_dsl::ir_v2::{Binary, Interface};
+    use harw_agent_dsl::ir_v2::{Binary, ChildExecution, Interface};
 
     type TestResult = Result<(), Box<dyn std::error::Error>>;
 
@@ -290,6 +290,7 @@ mod tests {
             name: "demo".to_owned(),
             interfaces: interfaces.to_vec(),
             default_interface,
+            child_execution: ChildExecution::Job,
         }
     }
 

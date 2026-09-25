@@ -40,14 +40,14 @@ use jiff::Timestamp;
 use std::collections::{BTreeMap, VecDeque};
 use std::fmt;
 use std::fs::{self, File};
-use std::io;
+use std::io::{self, Write as _};
 use std::os::unix::process::ExitStatusExt;
 use std::path::{Path, PathBuf};
 use std::process::{ExitStatus, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant};
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::{Child, ChildStdin, ChildStdout};
 use tokio::sync::{mpsc, watch};
 use tokio::task::JoinHandle;
@@ -1102,6 +1102,30 @@ async fn cancelled(cancel: Option<&CancelToken>) {
     }
 }
 
+/// Liest Zeilen aus der stdout-Pipe eines `start_piped`-Jobs, schreibt jede
+/// vollständig (mit Zeilenende) in `stdout_log` und schickt sie zusätzlich an
+/// `sender` — bis die Pipe schließt (Prozessende) oder ein Lesefehler
+/// auftritt. Ist der Empfänger bereits verworfen, wird trotzdem bis zum Ende
+/// weiter mitgeschrieben (nur `STDOUT_LOG` zählt dann noch).
+async fn tee_stdout(stdout: ChildStdout, mut stdout_log: File, sender: mpsc::UnboundedSender<String>) {
+    let mut lines = BufReader::new(stdout).lines();
+    loop {
+        match lines.next_line().await {
+            Ok(Some(line)) => {
+                if let Err(err) = writeln!(stdout_log, "{line}") {
+                    debug!(error = %err, "job stdout tee: log write failed");
+                }
+                let _ = sender.send(line);
+            }
+            Ok(None) => break,
+            Err(err) => {
+                debug!(error = %err, "job stdout tee: read failed");
+                break;
+            }
+        }
+    }
+}
+
 /// Meilenstein-Schlüssel: 10-%-Stufe, sonst das erste Wort der Phase.
 fn milestone_key(snapshot: &ProgressSnapshot) -> (ProgressSource, Option<u8>, String) {
     match snapshot.percent {
@@ -1139,7 +1163,19 @@ struct MonitorState {
 }
 
 impl Monitor {
-    async fn run(self, mut child: Child) {
+    async fn run(self, child: Child) {
+        self.run_inner(child, None).await;
+    }
+
+    /// Wie [`Monitor::run`], aber wartet nach dem Prozessende zusätzlich auf
+    /// `tee` (das Mitschreib-Task von [`JobManager::start_piped`]), damit die
+    /// letzte Ausgabe sicher in `STDOUT_LOG` steht, bevor der Ende-Bericht
+    /// den Tail liest.
+    async fn run_piped(self, child: Child, tee: JoinHandle<()>) {
+        self.run_inner(child, Some(tee)).await;
+    }
+
+    async fn run_inner(self, mut child: Child, tee: Option<JoinHandle<()>>) {
         let started = Instant::now();
         let mut run = MonitorState {
             stdout: LogFollower::new(self.entry.dir.join(STDOUT_LOG)),
@@ -1169,6 +1205,12 @@ impl Monitor {
                 }
             }
         };
+        if let Some(tee) = tee {
+            // Der Prozess ist beendet; das Mitschreib-Task endet, sobald es
+            // das Ende seiner stdout-Pipe sieht (kurz danach). Erst danach
+            // steht die letzte Ausgabe vollständig in `STDOUT_LOG`.
+            let _ = tee.await;
+        }
         self.ingest(&mut run, true);
         self.finish(&mut run, status, started);
     }

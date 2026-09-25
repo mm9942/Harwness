@@ -3,9 +3,14 @@
 //! # Scope
 //! Implements the tool-calling half of MCP for a single compiled agent:
 //! `initialize`, `tools/list`, `tools/call` (`run`, `status`, `cancel`),
-//! `notifications/cancelled` and `ping`. Only the **stdio** transport is
-//! implemented here (newline-delimited JSON-RPC 2.0 over stdin/stdout, MCP
-//! protocol version [`MCP_PROTOCOL_VERSION`]).
+//! `notifications/cancelled` and `ping`. Two transports share one JSON-RPC
+//! handler ([`McpServer::handle_message`]):
+//! - **stdio**: newline-delimited JSON-RPC 2.0 over stdin/stdout (the
+//!   default, and the only transport when `--listen` is not given).
+//! - **Streamable HTTP** (`--listen <addr>`): `POST /mcp` plus `GET
+//!   /healthz`, this module's own small loopback listener (see below).
+//!
+//! Both advertise MCP protocol version [`MCP_PROTOCOL_VERSION`].
 //!
 //! # Why not `harw-mcp-server`'s Streamable HTTP transport
 //! `harw-mcp-server::transport::BoundMcpListener` is built around a durable
@@ -20,21 +25,34 @@
 //! nothing over a small, self-contained JSON-RPC handler. This module
 //! therefore only takes the one thing worth sharing verbatim — the
 //! advertised protocol version literal — and implements its own minimal
-//! JSON-RPC 2.0 loop.
-//!
-//! `--listen <addr>` (Streamable HTTP) is consequently **not implemented**:
-//! [`run`] prints why and exits with failure instead of silently ignoring
-//! the flag. See the module doc above and the wave-3B report for the
-//! rationale; a future HTTP transport for this interface should be its own
-//! loopback listener, not a reuse of `harw-mcp-server`'s.
+//! JSON-RPC 2.0 loop plus its own minimal HTTP transport (the "Streamable
+//! HTTP transport" section further down in this file), rather than reusing
+//! `harw-mcp-server`'s supervisor-backed one. The HTTP transport
+//! intentionally mirrors (does not import) the auth/Origin logic of
+//! `iface::http` and `harw-mcp-server::transport`: a handful of small,
+//! independent functions, not a shared dependency.
 
 use std::collections::HashMap;
+use std::convert::Infallible;
 use std::io::{BufRead, Write};
+use std::net::{IpAddr, SocketAddr};
 use std::process::ExitCode;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
+use bytes::Bytes;
+use http_body_util::combinators::BoxBody;
+use http_body_util::{BodyExt, Full, LengthLimitError, Limited};
+use hyper::body::Incoming;
+use hyper::header::{ACCEPT, AUTHORIZATION, CONTENT_LENGTH, CONTENT_TYPE, HeaderName, HeaderValue, ORIGIN};
+use hyper::service::service_fn;
+use hyper::{HeaderMap, Method, Request, Response, StatusCode};
+use hyper_util::rt::{TokioExecutor, TokioIo};
+use hyper_util::server::conn::auto::Builder;
 use serde_json::{Value, json};
+use tokio::net::TcpListener;
+use tokio::task::JoinSet;
 
 use crate::context::RunnerContext;
 
@@ -50,20 +68,19 @@ const SERVER_VERSION: &str = env!("CARGO_PKG_VERSION");
 
 /// Entry point for `iface::Interface` (feature `mcp`).
 ///
-/// Runs the stdio JSON-RPC loop to completion (client closed stdin, or a
-/// fatal I/O error) and returns the process exit code.
+/// Without `--listen`, runs the stdio JSON-RPC loop to completion (client
+/// closed stdin, or a fatal I/O error). With `--listen <addr>`, runs the
+/// Streamable HTTP transport (its own small loopback listener; see the
+/// module doc) until `Ctrl-C`/SIGINT. Either way returns the process exit
+/// code.
 pub fn run(ctx: RunnerContext) -> ExitCode {
-    if let Some(addr) = ctx.args.listen.clone() {
-        eprintln!(
-            "harw-agent-runner: MCP Streamable HTTP transport (--listen {addr}) is not \
-             implemented in this build. harw-mcp-server's Streamable HTTP transport is built \
-             around a durable job supervisor and tenant/workspace principals that this \
-             embedded, single-agent runner does not have (see harw-agent-runner/src/iface/mcp.rs \
-             module docs). Re-run without --listen to use the stdio transport."
-        );
-        return ExitCode::FAILURE;
+    match ctx.args.listen.clone() {
+        Some(addr) => run_http(ctx, addr),
+        None => run_stdio(ctx),
     }
+}
 
+fn run_stdio(ctx: RunnerContext) -> ExitCode {
     let ctx = Arc::new(ctx);
     let server = McpServer::new(Arc::clone(&ctx), Arc::new(HarwnessPromptRunner { ctx }));
     let stdin = std::io::stdin();
@@ -415,11 +432,15 @@ impl McpServer {
         ])
     }
 
-    /// Handles one decoded JSON-RPC message. `emit` is called with any
-    /// out-of-band notifications the call produces (`notifications/progress`
-    /// during a foreground `run`). Returns `None` for a notification the
-    /// spec forbids a response to; otherwise the JSON-RPC response object.
-    fn handle(&self, message: &Value, emit: &mut dyn FnMut(Value)) -> Option<Value> {
+    /// Handles one decoded JSON-RPC message. Shared by both transports
+    /// (`serve_stdio` below and the HTTP `POST /mcp` handler in
+    /// `http_transport`). `emit` is called with any out-of-band
+    /// notifications the call produces (`notifications/progress` during a
+    /// foreground `run`); stdio writes each straight to stdout as its own
+    /// line, HTTP buffers them (see `http_transport::handle_post_mcp`).
+    /// Returns `None` for a notification the spec forbids a response to;
+    /// otherwise the JSON-RPC response object.
+    fn handle_message(&self, message: &Value, emit: &mut dyn FnMut(Value)) -> Option<Value> {
         let id = message.get("id").cloned();
         let method = message.get("method").and_then(Value::as_str);
 
@@ -680,7 +701,7 @@ impl McpServer {
                 }
             };
             let mut emit = |notification: Value| write_line(output, &notification);
-            if let Some(response) = self.handle(&message, &mut emit) {
+            if let Some(response) = self.handle_message(&message, &mut emit) {
                 write_line(output, &response);
             }
         }
@@ -704,7 +725,414 @@ fn error_response(id: Option<Value>, code: i64, message: &str) -> Value {
 }
 
 // ---------------------------------------------------------------------------
-// Tests: pure JSON-RPC handler, no stdio, no real Harwness/tokio runtime.
+// Streamable HTTP transport (`--listen <addr>`)
+// ---------------------------------------------------------------------------
+//
+// A small, self-contained loopback listener for [`McpServer::handle_message`]
+// — not a reuse of `harw-mcp-server`'s supervisor-backed transport (see the
+// module doc), and not a shared function with `iface::http` either (that
+// module is not depended on from here; the auth/Origin checks below are a
+// deliberate, small duplicate of its logic, kept in lock-step by convention).
+//
+// - `POST /mcp` takes one JSON-RPC request (batches are not supported: the
+//   stdio transport this shares a handler with does not support them
+//   either, so there is nothing to bridge).
+// - `GET /healthz` is exempt from auth, like `iface::http`.
+// - `Accept: text/event-stream` gets a (fully buffered, not chunked —
+//   simple, since every notification is already known by the time a
+//   synchronous `tools/call` returns) SSE response; otherwise the response
+//   is always a single JSON object.
+// - `initialize` issues an `Mcp-Session-Id`; every other request must
+//   present it.
+
+const MCP_MAX_BODY_BYTES: usize = 256 * 1024;
+const MCP_BODY_READ_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// `Mcp-Session-Id`, as a `const` `HeaderName` (mirrors
+/// `harw-mcp-client`'s `MCP_SESSION_HEADER`, independently — this module
+/// does not depend on that crate).
+const SESSION_HEADER: HeaderName = HeaderName::from_static("mcp-session-id");
+
+type HttpResponse = Response<BoxBody<Bytes, Infallible>>;
+
+/// Shared state for the HTTP transport: the same [`McpServer`] the stdio
+/// loop would have used, plus the bits stdio has no equivalent of (the
+/// bearer token and the one issued session id — this is a single-agent,
+/// effectively single-client server, so one active session is enough).
+struct McpHttpState {
+    server: McpServer,
+    token: Option<Vec<u8>>,
+    session: Mutex<Option<String>>,
+    session_counter: AtomicU64,
+}
+
+fn run_http(ctx: RunnerContext, listen: String) -> ExitCode {
+    let addr: SocketAddr = match listen.parse() {
+        Ok(addr) => addr,
+        Err(error) => {
+            eprintln!("harw-agent-runner: invalid --listen address '{listen}': {error}");
+            return ExitCode::FAILURE;
+        }
+    };
+
+    let token = std::env::var("HARW_AGENT_HTTP_TOKEN")
+        .ok()
+        .filter(|value| !value.is_empty());
+    if let Err(reason) = validate_listen_requirements(addr, token.as_deref()) {
+        eprintln!("harw-agent-runner: {reason}");
+        return ExitCode::FAILURE;
+    }
+
+    let ctx = Arc::new(ctx);
+    let server = McpServer::new(Arc::clone(&ctx), Arc::new(HarwnessPromptRunner { ctx }));
+    let state = Arc::new(McpHttpState {
+        server,
+        token: token.map(String::into_bytes),
+        session: Mutex::new(None),
+        session_counter: AtomicU64::new(0),
+    });
+
+    let runtime = match tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+    {
+        Ok(runtime) => runtime,
+        Err(error) => {
+            eprintln!("harw-agent-runner: could not start the async runtime: {error}");
+            return ExitCode::FAILURE;
+        }
+    };
+    runtime.block_on(serve_http(addr, state))
+}
+
+/// A bind address requires a configured token unless it is loopback-only.
+/// Mirrors `iface::http::validate_listen_requirements` (see this module's
+/// doc for why that is a deliberate duplicate, not an import).
+fn validate_listen_requirements(addr: SocketAddr, token: Option<&str>) -> Result<(), String> {
+    if !addr.ip().is_loopback() && token.is_none() {
+        return Err(
+            "the MCP Streamable HTTP interface on a non-loopback address requires \
+             HARW_AGENT_HTTP_TOKEN"
+                .to_owned(),
+        );
+    }
+    Ok(())
+}
+
+async fn serve_http(addr: SocketAddr, state: Arc<McpHttpState>) -> ExitCode {
+    let listener = match TcpListener::bind(addr).await {
+        Ok(listener) => listener,
+        Err(error) => {
+            eprintln!("harw-agent-runner: could not bind {addr}: {error}");
+            return ExitCode::FAILURE;
+        }
+    };
+
+    let mut connections: JoinSet<()> = JoinSet::new();
+    loop {
+        tokio::select! {
+            _ = tokio::signal::ctrl_c() => break,
+            completed = connections.join_next(), if !connections.is_empty() => {
+                let _ = completed;
+            }
+            accepted = listener.accept() => {
+                let Ok((stream, _addr)) = accepted else { continue };
+                let state = Arc::clone(&state);
+                connections.spawn(async move {
+                    let builder = Builder::new(TokioExecutor::new());
+                    let _ = builder
+                        .serve_connection(
+                            TokioIo::new(stream),
+                            service_fn(move |request| {
+                                let state = Arc::clone(&state);
+                                async move { handle_conn(state, request).await }
+                            }),
+                        )
+                        .await;
+                });
+            }
+        }
+    }
+    connections.abort_all();
+    while connections.join_next().await.is_some() {}
+    ExitCode::SUCCESS
+}
+
+/// Reads a raw hyper request into the pieces [`dispatch_http`] needs.
+async fn handle_conn(state: Arc<McpHttpState>, request: Request<Incoming>) -> Result<HttpResponse, Infallible> {
+    let method = request.method().clone();
+    let path = request.uri().path().to_owned();
+    let headers = request.headers().clone();
+    if path == "/healthz" {
+        return Ok(dispatch_http(&state, &method, &path, &headers, Value::Null).await);
+    }
+    let body = match read_json_body(request, MCP_MAX_BODY_BYTES, MCP_BODY_READ_TIMEOUT).await {
+        Ok(value) => value,
+        Err(response) => return Ok(response),
+    };
+    Ok(dispatch_http(&state, &method, &path, &headers, body).await)
+}
+
+/// The transport-independent router: `/healthz`, then auth, then Origin,
+/// then the one real route. Every test in this module calls this directly
+/// instead of going through a real socket.
+async fn dispatch_http(
+    state: &McpHttpState,
+    method: &Method,
+    path: &str,
+    headers: &HeaderMap,
+    body: Value,
+) -> HttpResponse {
+    if path == "/healthz" {
+        return json_response(StatusCode::OK, &json!({"status": "ok"}));
+    }
+    if !authorize(state, headers) {
+        return json_response(StatusCode::UNAUTHORIZED, &json!({"error": "unauthorized"}));
+    }
+    if !origin_is_loopback(headers) {
+        return json_response(StatusCode::FORBIDDEN, &json!({"error": "origin_not_allowed"}));
+    }
+    if *method == Method::POST && path == "/mcp" {
+        handle_post_mcp(state, headers, body)
+    } else {
+        json_response(StatusCode::NOT_FOUND, &json!({"error": "not_found"}))
+    }
+}
+
+/// Constant-time bearer check; `None` (no configured token) always passes.
+/// Mirrors `iface::http::authorize`.
+fn authorize(state: &McpHttpState, headers: &HeaderMap) -> bool {
+    let Some(expected) = state.token.as_deref() else {
+        return true;
+    };
+    let Some(header) = headers.get(AUTHORIZATION).and_then(|value| value.to_str().ok()) else {
+        return false;
+    };
+    let Some(presented) = header
+        .strip_prefix("Bearer ")
+        .or_else(|| header.strip_prefix("bearer "))
+    else {
+        return false;
+    };
+    constant_time_eq(expected, presented.as_bytes())
+}
+
+/// Mirrors `iface::http::constant_time_eq`.
+fn constant_time_eq(left: &[u8], right: &[u8]) -> bool {
+    let mut difference = left.len() ^ right.len();
+    for index in 0..left.len().max(right.len()) {
+        difference |= usize::from(
+            left.get(index).copied().unwrap_or(0) ^ right.get(index).copied().unwrap_or(0),
+        );
+    }
+    difference == 0
+}
+
+/// Rejects a request whose `Origin` header does not name a loopback host —
+/// MCP's Streamable HTTP transport recommends this to guard against DNS
+/// rebinding attacks from a browser. A native MCP client normally omits
+/// `Origin` entirely, so only a *supplied* one is checked (structurally the
+/// same policy as `harw-mcp-server::transport::origin_is_loopback`,
+/// reimplemented independently here rather than imported — see the module
+/// doc).
+fn origin_is_loopback(headers: &HeaderMap) -> bool {
+    let Some(origin) = headers.get(ORIGIN) else {
+        return true;
+    };
+    let Ok(origin) = origin.to_str() else {
+        return false;
+    };
+    let Some(authority) = origin
+        .strip_prefix("http://")
+        .or_else(|| origin.strip_prefix("https://"))
+    else {
+        return false;
+    };
+    let authority = authority.split(['/', '?', '#']).next().unwrap_or("");
+    if authority.is_empty() {
+        return false;
+    }
+    let host = if let Some(bracketed) = authority.strip_prefix('[') {
+        bracketed.split(']').next().unwrap_or("")
+    } else {
+        authority.split(':').next().unwrap_or(authority)
+    };
+    host.eq_ignore_ascii_case("localhost") || host.parse::<IpAddr>().is_ok_and(|ip| ip.is_loopback())
+}
+
+fn new_session_id(state: &McpHttpState) -> String {
+    let counter = state.session_counter.fetch_add(1, Ordering::Relaxed);
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_nanos())
+        .unwrap_or_default();
+    format!("mcp-{nanos:x}-{counter}")
+}
+
+/// Requires a matching `Mcp-Session-Id` on every request but `initialize`
+/// (which establishes the session in the first place). Returns the ready
+/// error response when the check fails.
+#[allow(clippy::result_large_err)]
+fn check_session(state: &McpHttpState, headers: &HeaderMap, is_initialize: bool) -> Result<(), HttpResponse> {
+    if is_initialize {
+        return Ok(());
+    }
+    let provided = headers.get(&SESSION_HEADER).and_then(|value| value.to_str().ok());
+    let Some(provided) = provided else {
+        return Err(json_response(
+            StatusCode::BAD_REQUEST,
+            &json!({"error": "missing_session", "detail": "Mcp-Session-Id header is required"}),
+        ));
+    };
+    let current = state.session.lock().unwrap_or_else(|e| e.into_inner()).clone();
+    match current {
+        Some(expected) if expected == provided => Ok(()),
+        _ => Err(json_response(
+            StatusCode::NOT_FOUND,
+            &json!({"error": "unknown_session"}),
+        )),
+    }
+}
+
+fn handle_post_mcp(state: &McpHttpState, headers: &HeaderMap, body: Value) -> HttpResponse {
+    let Some(method) = body.get("method").and_then(Value::as_str) else {
+        return json_response(
+            StatusCode::BAD_REQUEST,
+            &json!({"error": "invalid_request", "detail": "missing 'method'"}),
+        );
+    };
+    let is_initialize = method == "initialize";
+    if let Err(response) = check_session(state, headers, is_initialize) {
+        return response;
+    }
+
+    let mut notifications = Vec::new();
+    let mut emit = |notification: Value| notifications.push(notification);
+    let response_value = state.server.handle_message(&body, &mut emit);
+
+    let issued_session = if is_initialize && response_value.as_ref().is_some_and(|value| value.get("error").is_none()) {
+        let id = new_session_id(state);
+        *state.session.lock().unwrap_or_else(|e| e.into_inner()) = Some(id.clone());
+        Some(id)
+    } else {
+        None
+    };
+
+    let wants_sse = headers
+        .get(ACCEPT)
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|value| value.contains("text/event-stream"));
+
+    let mut response = if wants_sse {
+        sse_response(&notifications, response_value.as_ref())
+    } else {
+        match &response_value {
+            Some(value) => json_response(StatusCode::OK, value),
+            // A notification (no `id`): the spec calls for 202 with no body.
+            None => empty_response(StatusCode::ACCEPTED),
+        }
+    };
+    if let Some(id) = issued_session {
+        if let Ok(value) = HeaderValue::from_str(&id) {
+            response.headers_mut().insert(SESSION_HEADER, value);
+        }
+    }
+    response
+}
+
+/// Buffers every notification plus the final response as one SSE body.
+/// There is no live streaming here: by the time a synchronous
+/// `tools/call` returns, every notification it will ever produce has
+/// already been collected, so writing them all at once is both simple and
+/// exactly as timely as a real stream would have been.
+fn sse_response(notifications: &[Value], response: Option<&Value>) -> HttpResponse {
+    let mut text = String::new();
+    for notification in notifications {
+        text.push_str(&format!("event: message\ndata: {notification}\n\n"));
+    }
+    if let Some(response) = response {
+        text.push_str(&format!("event: message\ndata: {response}\n\n"));
+    }
+    Response::builder()
+        .status(StatusCode::OK)
+        .header(CONTENT_TYPE, "text/event-stream")
+        .body(Full::new(Bytes::from(text)).boxed())
+        .unwrap_or_else(|_| Response::new(Full::new(Bytes::new()).boxed()))
+}
+
+fn json_response(status: StatusCode, body: &Value) -> HttpResponse {
+    Response::builder()
+        .status(status)
+        .header(CONTENT_TYPE, "application/json")
+        .body(Full::new(Bytes::from(body.to_string())).boxed())
+        .unwrap_or_else(|_| Response::new(Full::new(Bytes::new()).boxed()))
+}
+
+fn empty_response(status: StatusCode) -> HttpResponse {
+    Response::builder()
+        .status(status)
+        .body(Full::new(Bytes::new()).boxed())
+        .unwrap_or_else(|_| Response::new(Full::new(Bytes::new()).boxed()))
+}
+
+// The `Err` variant carries a fully-built `HttpResponse` (as
+// `iface::http`'s equivalent helper does) so callers return it unchanged;
+// it outlives this one call on the stack and is never cloned, so the size
+// is not a real cost.
+#[allow(clippy::result_large_err)]
+async fn read_json_body(
+    request: Request<Incoming>,
+    max_bytes: usize,
+    read_timeout: Duration,
+) -> Result<Value, HttpResponse> {
+    let declared_len = request
+        .headers()
+        .get(CONTENT_LENGTH)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.parse::<u64>().ok());
+    if declared_len.is_some_and(|len| len > max_bytes as u64) {
+        return Err(json_response(
+            StatusCode::PAYLOAD_TOO_LARGE,
+            &json!({"error": "payload_too_large"}),
+        ));
+    }
+    let limited = Limited::new(request.into_body(), max_bytes);
+    let bytes = match tokio::time::timeout(read_timeout, limited.collect()).await {
+        Ok(Ok(collected)) => collected.to_bytes(),
+        Ok(Err(error)) if error.downcast_ref::<LengthLimitError>().is_some() => {
+            return Err(json_response(
+                StatusCode::PAYLOAD_TOO_LARGE,
+                &json!({"error": "payload_too_large"}),
+            ));
+        }
+        Ok(Err(_)) => {
+            return Err(json_response(
+                StatusCode::BAD_REQUEST,
+                &json!({"error": "bad_request"}),
+            ));
+        }
+        Err(_elapsed) => {
+            return Err(json_response(
+                StatusCode::REQUEST_TIMEOUT,
+                &json!({"error": "request_timeout"}),
+            ));
+        }
+    };
+    if bytes.is_empty() {
+        return Ok(Value::Null);
+    }
+    serde_json::from_slice(&bytes).map_err(|_| {
+        json_response(
+            StatusCode::BAD_REQUEST,
+            &json!({"error": "invalid_json"}),
+        )
+    })
+}
+
+// ---------------------------------------------------------------------------
+// Tests: pure JSON-RPC handler, no stdio, no real Harwness/tokio runtime;
+// HTTP transport tests dispatch in-process (no real socket), same style as
+// `iface::http`'s tests.
 // ---------------------------------------------------------------------------
 
 #[cfg(test)]
@@ -781,7 +1209,7 @@ mod tests {
     fn server_with(runner: Arc<dyn PromptRunner>) -> McpServer {
         let server = McpServer::with_config(test_config(), runner);
         let initialize = json!({"jsonrpc": "2.0", "id": 0, "method": "initialize", "params": {}});
-        server.handle(&initialize, &mut no_emit);
+        server.handle_message(&initialize, &mut no_emit);
         server
     }
 
@@ -791,7 +1219,7 @@ mod tests {
     fn initialize_advertises_the_protocol_version_and_server_info() {
         let server = McpServer::with_config(test_config(), FakeRunner::echoing("hi"));
         let request = json!({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}});
-        let response = server.handle(&request, &mut no_emit).expect("a response");
+        let response = server.handle_message(&request, &mut no_emit).expect("a response");
         assert_eq!(response["id"], json!(1));
         assert_eq!(
             response["result"]["protocolVersion"],
@@ -804,7 +1232,7 @@ mod tests {
     fn tools_list_exposes_run_status_and_cancel_using_the_root_ir() {
         let server = server_with(FakeRunner::echoing("hi"));
         let request = json!({"jsonrpc": "2.0", "id": 2, "method": "tools/list"});
-        let response = server.handle(&request, &mut no_emit).expect("a response");
+        let response = server.handle_message(&request, &mut no_emit).expect("a response");
         let tools = response["result"]["tools"].as_array().expect("tools array");
         let names: Vec<&str> = tools
             .iter()
@@ -833,7 +1261,7 @@ mod tests {
             "method": "tools/call",
             "params": {"name": "run", "arguments": {"prompt": "hello"}}
         });
-        let response = server.handle(&request, &mut no_emit).expect("a response");
+        let response = server.handle_message(&request, &mut no_emit).expect("a response");
         let content = &response["result"]["content"][0]["text"];
         assert_eq!(content, "echoed reply");
         assert_eq!(
@@ -864,7 +1292,7 @@ mod tests {
             "method": "tools/call",
             "params": {"name": "run", "arguments": {"prompt": "do the risky thing"}}
         });
-        let response = server.handle(&request, &mut no_emit).expect("a response");
+        let response = server.handle_message(&request, &mut no_emit).expect("a response");
         let text = response["result"]["content"][0]["text"]
             .as_str()
             .unwrap_or_default();
@@ -879,7 +1307,7 @@ mod tests {
     fn unknown_method_returns_method_not_found() {
         let server = server_with(FakeRunner::echoing("hi"));
         let request = json!({"jsonrpc": "2.0", "id": 5, "method": "not/a/real/method"});
-        let response = server.handle(&request, &mut no_emit).expect("a response");
+        let response = server.handle_message(&request, &mut no_emit).expect("a response");
         assert_eq!(response["error"]["code"], json!(-32601));
     }
 
@@ -895,7 +1323,7 @@ mod tests {
             "method": "tools/call",
             "params": {"name": "run", "arguments": {"prompt": "long task", "background": true}}
         });
-        let started = server.handle(&start, &mut no_emit).expect("a response");
+        let started = server.handle_message(&start, &mut no_emit).expect("a response");
         let run_id = started["result"]["run_id"]
             .as_str()
             .expect("run_id in background start response")
@@ -909,7 +1337,7 @@ mod tests {
             "method": "tools/call",
             "params": {"name": "status", "arguments": {"run_id": run_id}}
         });
-        let status_response = server.handle(&status, &mut no_emit).expect("a response");
+        let status_response = server.handle_message(&status, &mut no_emit).expect("a response");
         assert_eq!(status_response["result"]["status"], json!("running"));
 
         let cancel = json!({
@@ -918,7 +1346,7 @@ mod tests {
             "method": "tools/call",
             "params": {"name": "cancel", "arguments": {"run_id": run_id}}
         });
-        let cancel_response = server.handle(&cancel, &mut no_emit).expect("a response");
+        let cancel_response = server.handle_message(&cancel, &mut no_emit).expect("a response");
         assert!(cancel_response.get("error").is_none(), "{cancel_response}");
 
         // Give the background thread a moment to observe the cancellation
@@ -941,7 +1369,180 @@ mod tests {
             "method": "tools/call",
             "params": {"name": "status", "arguments": {"run_id": "no-such-run"}}
         });
-        let response = server.handle(&request, &mut no_emit).expect("a response");
+        let response = server.handle_message(&request, &mut no_emit).expect("a response");
         assert_eq!(response["error"]["code"], json!(-32602));
+    }
+
+    // ── HTTP transport: in-process dispatch, no real socket ─────────────
+
+    fn test_http_state(token: Option<&str>) -> McpHttpState {
+        McpHttpState {
+            server: McpServer::with_config(test_config(), FakeRunner::echoing("hi")),
+            token: token.map(|value| value.as_bytes().to_vec()),
+            session: Mutex::new(None),
+            session_counter: AtomicU64::new(0),
+        }
+    }
+
+    async fn body_bytes(response: HttpResponse) -> Value {
+        let bytes = response
+            .into_body()
+            .collect()
+            .await
+            .expect("in-memory body always resolves")
+            .to_bytes();
+        if bytes.is_empty() {
+            Value::Null
+        } else {
+            serde_json::from_slice(&bytes).expect("handlers return JSON when a body is present")
+        }
+    }
+
+    fn bearer(token: &str) -> HeaderMap {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            AUTHORIZATION,
+            HeaderValue::from_str(&format!("Bearer {token}")).unwrap(),
+        );
+        headers
+    }
+
+    #[test]
+    fn non_loopback_bind_without_token_is_refused() {
+        let addr: SocketAddr = "0.0.0.0:8787".parse().unwrap();
+        assert!(validate_listen_requirements(addr, None).is_err());
+    }
+
+    #[test]
+    fn non_loopback_bind_with_token_is_allowed() {
+        let addr: SocketAddr = "0.0.0.0:8787".parse().unwrap();
+        assert!(validate_listen_requirements(addr, Some("secret")).is_ok());
+    }
+
+    #[test]
+    fn loopback_bind_without_token_is_allowed() {
+        let addr: SocketAddr = "127.0.0.1:8787".parse().unwrap();
+        assert!(validate_listen_requirements(addr, None).is_ok());
+    }
+
+    #[tokio::test]
+    async fn initialize_over_http_issues_a_session_id() {
+        let state = test_http_state(None);
+        let request = json!({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}});
+        let response = dispatch_http(&state, &Method::POST, "/mcp", &HeaderMap::new(), request).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(
+            response.headers().get(&SESSION_HEADER).is_some(),
+            "initialize should issue an Mcp-Session-Id"
+        );
+    }
+
+    #[tokio::test]
+    async fn tools_list_without_the_session_id_is_rejected() {
+        let state = test_http_state(None);
+        // Establish a session first, as a real client would, so the
+        // rejection below is specifically about the missing header, not
+        // about there being no session at all yet.
+        let init = json!({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}});
+        let init_response = dispatch_http(&state, &Method::POST, "/mcp", &HeaderMap::new(), init).await;
+        assert_eq!(init_response.status(), StatusCode::OK);
+
+        let request = json!({"jsonrpc": "2.0", "id": 2, "method": "tools/list"});
+        let response = dispatch_http(&state, &Method::POST, "/mcp", &HeaderMap::new(), request).await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn tools_list_with_the_matching_session_id_succeeds() {
+        let state = test_http_state(None);
+        let init = json!({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}});
+        let init_response = dispatch_http(&state, &Method::POST, "/mcp", &HeaderMap::new(), init).await;
+        let session_id = init_response
+            .headers()
+            .get(&SESSION_HEADER)
+            .and_then(|value| value.to_str().ok())
+            .expect("session id header")
+            .to_owned();
+
+        let mut headers = HeaderMap::new();
+        headers.insert(SESSION_HEADER, HeaderValue::from_str(&session_id).unwrap());
+        let request = json!({"jsonrpc": "2.0", "id": 2, "method": "tools/list"});
+        let response = dispatch_http(&state, &Method::POST, "/mcp", &headers, request).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let value = body_bytes(response).await;
+        assert!(value["result"]["tools"].is_array());
+    }
+
+    #[tokio::test]
+    async fn wrong_token_yields_401() {
+        let state = test_http_state(Some("correct-token"));
+        let request = json!({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}});
+        let response = dispatch_http(&state, &Method::POST, "/mcp", &bearer("wrong"), request).await;
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn correct_token_is_accepted() {
+        let state = test_http_state(Some("correct-token"));
+        let request = json!({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}});
+        let response = dispatch_http(
+            &state,
+            &Method::POST,
+            "/mcp",
+            &bearer("correct-token"),
+            request,
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn healthz_bypasses_auth() {
+        let state = test_http_state(Some("secret"));
+        let response = dispatch_http(&state, &Method::GET, "/healthz", &HeaderMap::new(), Value::Null).await;
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn a_bad_origin_is_refused() {
+        let state = test_http_state(None);
+        let mut headers = HeaderMap::new();
+        headers.insert(ORIGIN, HeaderValue::from_static("http://evil.example"));
+        let request = json!({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}});
+        let response = dispatch_http(&state, &Method::POST, "/mcp", &headers, request).await;
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn a_loopback_origin_is_accepted() {
+        let state = test_http_state(None);
+        let mut headers = HeaderMap::new();
+        headers.insert(ORIGIN, HeaderValue::from_static("http://localhost:5173"));
+        let request = json!({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}});
+        let response = dispatch_http(&state, &Method::POST, "/mcp", &headers, request).await;
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn sse_accept_header_returns_an_event_stream_body() {
+        let state = test_http_state(None);
+        let mut headers = HeaderMap::new();
+        headers.insert(ACCEPT, HeaderValue::from_static("application/json, text/event-stream"));
+        let request = json!({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}});
+        let response = dispatch_http(&state, &Method::POST, "/mcp", &headers, request).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response.headers().get(CONTENT_TYPE).and_then(|v| v.to_str().ok()),
+            Some("text/event-stream")
+        );
+        let bytes = response
+            .into_body()
+            .collect()
+            .await
+            .expect("in-memory body always resolves")
+            .to_bytes();
+        let text = String::from_utf8_lossy(&bytes);
+        assert!(text.contains("event: message"), "got: {text}");
+        assert!(text.contains("\"protocolVersion\""), "got: {text}");
     }
 }

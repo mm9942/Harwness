@@ -52,10 +52,18 @@ default = [
 # Built-in interfaces (`iface::*`, `RunnerArgs::interface`).
 cli = []
 repl = []
-# `iface::mcp` (harw-mcp-server wiring): needs `futures-core` for its event
-# stream; `tokio` is already a base dependency of this crate (see below), so
-# only the extra dep is feature-gated.
-mcp = ["dep:futures-core"]
+# `iface::mcp`: needs `futures-core` for its event stream (`tokio` is
+# already a base dependency of this crate, see below) plus the same small
+# hyper 1/hyper-util/http-body-util/bytes stack as `http` for its own
+# Streamable HTTP transport (`--listen`; see that module's doc for why it is
+# its own loopback listener, not a reuse of `http`'s or `harw-mcp-server`'s).
+mcp = [
+    "dep:futures-core",
+    "dep:hyper",
+    "dep:hyper-util",
+    "dep:http-body-util",
+    "dep:bytes",
+]
 # `iface::http`: its own small hyper-based listener (same stack/versions as
 # `harw-web`/`harw-mcp-server`; see that module's doc for why it does not
 # reuse either directly).
