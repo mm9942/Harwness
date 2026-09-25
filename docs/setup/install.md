@@ -10,13 +10,13 @@ platform notes) see [`docs/setup/build-prerequisites.md`](build-prerequisites.md
 
 ## Requirements
 
-- **Platform:** Linux, x86_64 or aarch64. `scripts/install.sh` also runs on
-  macOS in `--source` mode, but the sandbox (`bwrap`) is Linux-only.
+- **Platform:** Linux. The source installer works on the host architecture
+  supported by the repository's pinned Rust toolchain.
 - **Sandbox:** [bubblewrap](https://github.com/containers/bubblewrap)
   (`bwrap`) and util-linux, for the sandboxed execution the harness uses to
-  run agent commands. Without `bwrap` on PATH, `harw` still runs but the
-  sandbox is unavailable — the installer warns about this, it does not
-  block installation.
+  run agent commands. The source installer installs the distribution package
+  when `bwrap` is missing; it requires root privileges or sudo/doas for that
+  step.
 - **Optional — PDF reports:** a TeX Live distribution with XeLaTeX, if you
   want `harw`-generated reports rendered to PDF.
 - **Optional — `killer` pidfd path:** Linux kernel ≥ 5.3 for `pidfd`-based
@@ -54,22 +54,24 @@ install -Dm755 killer ~/.local/bin/killer
 The tarball contains `harw`, `killer`, `LICENSE-MIT`, `LICENSE-APACHE` and
 `README.md`.
 
-### (b) `scripts/install.sh`
+### (b) Source installer
 
 ```sh
-scripts/install.sh --binary          # download a release tarball (no Rust toolchain needed)
-scripts/install.sh --source          # build from source (needs cargo)
-scripts/install.sh                   # picks --source if cargo is on PATH, else --binary
+curl -fsSL https://get.harw.dev/harw/install.sh | bash
+# from an existing checkout:
+bash scripts/install.sh --source
 ```
 
-Both modes install `harw` and `killer` into `$HARW_INSTALL_DIR` (default
-`$HOME/.local/bin`) and add that directory to `PATH` in `~/.bashrc`/
-`~/.zshrc` if it isn't already there, without duplicating existing entries.
-`--source` mode uses `make install BINDIR=…` when `make` is available (the
-same path as installing from source directly, below), and falls back to a
-plain `cargo build --release --bin harw --bin killer` otherwise. See
-`scripts/install.sh --help` for the full list of environment variables
-(`HARW_REPO`, `HARW_VERSION`, …).
+The piped script downloads `Harwness-main.zip`, extracts it under
+`$HARW_SOURCES_DIR` (default `~/.local/share/harw/sources`) and leaves the
+source in place for later agent builds. It installs missing dependencies
+with apt, dnf, yum, pacman, zypper, apk or xbps, then installs Rustup from
+`https://sh.rustup.rs` if needed. Rustup starts with stable and its default
+profile; `rust-toolchain.toml` selects the pinned version for the build.
+Finally the script runs `make install BINDIR=…`. Unknown package managers
+produce a manual-install error listing what is missing. The source archive
+is fetched over HTTPS; a separate checksum is not published for it yet.
+`HARW_INSTALL_DIR` defaults to `~/.local/bin`. See `--help` for overrides.
 
 ### (c) From source via `make install`
 
