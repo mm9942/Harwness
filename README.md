@@ -65,14 +65,16 @@ The `harw` binary provides the interactive terminal UI, one-shot runs, durable p
 ### One line
 
 ```bash
-curl -fsSL https://get.harw.dev/harw/install.sh | sh
+curl -fsSL https://get.harw.dev/harw/install.sh | bash
 ```
 
-This downloads the latest release for your machine from `get.harw.dev`,
-checks its SHA-256 checksum and installs `harw`, `killer` and
-`harw-agent-runner` into `~/.local/bin`. Pick a version with
-`… | sh -s -- --version v0.3.0`; set `HARW_INSTALL_DIR` for another
-target directory. Linux (x86_64, aarch64) only for now.
+This downloads `Harwness-main.zip` from `get.harw.dev`, installs missing
+Linux build dependencies and Rustup when needed, then runs `make install`
+from a persistent source directory. It installs `harw`, `killer` and
+`harw-agent-runner` into `~/.local/bin`. Set `HARW_INSTALL_DIR` for another
+target directory; set `HARW_SOURCES_DIR` to choose where the extracted
+source stays. The archive is fetched over HTTPS; no release checksum is
+published for this source-install path yet.
 
 ### Download a release
 
