@@ -369,7 +369,8 @@ mod tests {
 
     #[test]
     fn decode_valid_body_parses() -> TestResult {
-        let value = decode_json_body(br#"{"prompt":"hi"}"#).map_err(|_| "valid body must decode")?;
+        let value = decode_json_body(br#"{"prompt":"hi"}"#)
+            .map_err(|_| "valid body must decode")?;
         assert_eq!(value["prompt"], "hi");
         Ok(())
     }

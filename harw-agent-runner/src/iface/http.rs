@@ -1134,7 +1134,11 @@ mod tests {
     #[tokio::test]
     async fn loopback_origins_are_accepted() {
         let state = test_state(None);
-        for origin in ["http://localhost:5173", "http://127.0.0.1", "http://[::1]:8787"] {
+        for origin in [
+            "http://localhost:5173",
+            "http://127.0.0.1",
+            "http://[::1]:8787",
+        ] {
             let response = dispatch(
                 &state,
                 &Method::GET,

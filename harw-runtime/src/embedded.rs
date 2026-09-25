@@ -779,7 +779,7 @@ admitted = ["fs.read"]
             result.network_hosts,
             std::iter::once("example.com".to_owned()).collect::<BTreeSet<_>>()
         );
-        let budget = result.budget.unwrap_or_default();
+        let budget = result.budget.clone().unwrap_or_default();
         assert_eq!(budget.max_tokens, Some(10));
         assert_eq!(budget.max_tool_calls, Some(5));
         assert_eq!(budget.max_wall_secs, Some(9));
