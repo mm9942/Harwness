@@ -909,6 +909,8 @@ mod tests {
 
     use super::*;
 
+    type TestResult = Result<(), Box<dyn std::error::Error>>;
+
     // ── A fake backend: no real agent bundle needed ─────────────────────
 
     struct FlagCancel(Arc<AtomicBool>);
@@ -993,43 +995,41 @@ mod tests {
         })
     }
 
-    async fn body_json(response: HttpResponse) -> Value {
-        let bytes = response
-            .into_body()
-            .collect()
-            .await
-            .expect("in-memory body always resolves")
-            .to_bytes();
-        serde_json::from_slice(&bytes).expect("handlers always return JSON")
+    async fn body_json(response: HttpResponse) -> Result<Value, Box<dyn std::error::Error>> {
+        let bytes = response.into_body().collect().await?.to_bytes();
+        Ok(serde_json::from_slice(&bytes)?)
     }
 
-    fn bearer(token: &str) -> HeaderMap {
+    fn bearer(token: &str) -> Result<HeaderMap, Box<dyn std::error::Error>> {
         let mut headers = HeaderMap::new();
         headers.insert(
             AUTHORIZATION,
-            HeaderValue::from_str(&format!("Bearer {token}")).unwrap(),
+            HeaderValue::from_str(&format!("Bearer {token}"))?,
         );
-        headers
+        Ok(headers)
     }
 
     // ── Startup requirements ─────────────────────────────────────────────
 
     #[test]
-    fn non_loopback_bind_without_token_is_rejected() {
-        let addr: SocketAddr = "0.0.0.0:8787".parse().unwrap();
+    fn non_loopback_bind_without_token_is_rejected() -> TestResult {
+        let addr: SocketAddr = "0.0.0.0:8787".parse()?;
         assert!(validate_listen_requirements(addr, None).is_err());
+        Ok(())
     }
 
     #[test]
-    fn non_loopback_bind_with_token_is_allowed() {
-        let addr: SocketAddr = "0.0.0.0:8787".parse().unwrap();
+    fn non_loopback_bind_with_token_is_allowed() -> TestResult {
+        let addr: SocketAddr = "0.0.0.0:8787".parse()?;
         assert!(validate_listen_requirements(addr, Some("secret")).is_ok());
+        Ok(())
     }
 
     #[test]
-    fn loopback_bind_without_token_is_allowed() {
-        let addr: SocketAddr = "127.0.0.1:8787".parse().unwrap();
+    fn loopback_bind_without_token_is_allowed() -> TestResult {
+        let addr: SocketAddr = "127.0.0.1:8787".parse()?;
         assert!(validate_listen_requirements(addr, None).is_ok());
+        Ok(())
     }
 
     // ── Auth ─────────────────────────────────────────────────────────────
@@ -1042,24 +1042,26 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn wrong_token_yields_401() {
+    async fn wrong_token_yields_401() -> TestResult {
         let state = test_state(Some("correct-token"));
-        let response = dispatch(&state, &Method::GET, "/manifest", &bearer("wrong"), Value::Null).await;
+        let response = dispatch(&state, &Method::GET, "/manifest", &bearer("wrong")?, Value::Null).await;
         assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        Ok(())
     }
 
     #[tokio::test]
-    async fn correct_token_is_accepted() {
+    async fn correct_token_is_accepted() -> TestResult {
         let state = test_state(Some("correct-token"));
         let response = dispatch(
             &state,
             &Method::GET,
             "/manifest",
-            &bearer("correct-token"),
+            &bearer("correct-token")?,
             Value::Null,
         )
         .await;
         assert_eq!(response.status(), StatusCode::OK);
+        Ok(())
     }
 
     #[tokio::test]
@@ -1072,7 +1074,7 @@ mod tests {
     // ── POST /run (offline echo) ─────────────────────────────────────────
 
     #[tokio::test]
-    async fn run_with_offline_echo_returns_completed_text() {
+    async fn run_with_offline_echo_returns_completed_text() -> TestResult {
         let state = test_state(None);
         let response = dispatch(
             &state,
@@ -1083,9 +1085,10 @@ mod tests {
         )
         .await;
         assert_eq!(response.status(), StatusCode::OK);
-        let value = body_json(response).await;
+        let value = body_json(response).await?;
         assert_eq!(value["status"], "completed");
         assert_eq!(value["text"], "echo: hello");
+        Ok(())
     }
 
     #[tokio::test]
@@ -1105,7 +1108,7 @@ mod tests {
     // ── Background run + status ──────────────────────────────────────────
 
     #[tokio::test]
-    async fn background_run_completes_and_is_queryable() {
+    async fn background_run_completes_and_is_queryable() -> TestResult {
         let state = test_state(None);
         let response = dispatch(
             &state,
@@ -1116,8 +1119,11 @@ mod tests {
         )
         .await;
         assert_eq!(response.status(), StatusCode::ACCEPTED);
-        let value = body_json(response).await;
-        let run_id = value["run_id"].as_str().unwrap().to_owned();
+        let value = body_json(response).await?;
+        let run_id = value["run_id"]
+            .as_str()
+            .ok_or("run_id must be a string")?
+            .to_owned();
 
         let mut status = String::new();
         for _ in 0..100 {
@@ -1129,14 +1135,18 @@ mod tests {
                 Value::Null,
             )
             .await;
-            let poll_value = body_json(poll).await;
-            status = poll_value["status"].as_str().unwrap().to_owned();
+            let poll_value = body_json(poll).await?;
+            status = poll_value["status"]
+                .as_str()
+                .ok_or("status must be a string")?
+                .to_owned();
             if status == "completed" {
                 break;
             }
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
         assert_eq!(status, "completed");
+        Ok(())
     }
 
     #[tokio::test]
@@ -1156,7 +1166,7 @@ mod tests {
     // ── SSE events ───────────────────────────────────────────────────────
 
     #[tokio::test]
-    async fn events_stream_yields_an_event_and_a_finished_marker() {
+    async fn events_stream_yields_an_event_and_a_finished_marker() -> TestResult {
         let state = test_state(None);
         let response = dispatch(
             &state,
@@ -1166,8 +1176,11 @@ mod tests {
             json!({"prompt": "hi", "background": true}),
         )
         .await;
-        let value = body_json(response).await;
-        let run_id = value["run_id"].as_str().unwrap().to_owned();
+        let value = body_json(response).await?;
+        let run_id = value["run_id"]
+            .as_str()
+            .ok_or("run_id must be a string")?
+            .to_owned();
 
         // Let the background run settle so both the echoed message and the
         // terminal marker are already buffered.
@@ -1205,12 +1218,13 @@ mod tests {
         }
         assert!(collected.contains("event: message"), "got: {collected}");
         assert!(collected.contains("run.finished"), "got: {collected}");
+        Ok(())
     }
 
     // ── Cancel ───────────────────────────────────────────────────────────
 
     #[tokio::test]
-    async fn cancel_marks_the_run_as_cancelled() {
+    async fn cancel_marks_the_run_as_cancelled() -> TestResult {
         let state = test_state(None);
         let response = dispatch(
             &state,
@@ -1220,8 +1234,11 @@ mod tests {
             json!({"prompt": "block", "background": true}),
         )
         .await;
-        let value = body_json(response).await;
-        let run_id = value["run_id"].as_str().unwrap().to_owned();
+        let value = body_json(response).await?;
+        let run_id = value["run_id"]
+            .as_str()
+            .ok_or("run_id must be a string")?
+            .to_owned();
 
         tokio::time::sleep(Duration::from_millis(20)).await;
         let cancel_response = dispatch(
@@ -1233,7 +1250,7 @@ mod tests {
         )
         .await;
         assert_eq!(cancel_response.status(), StatusCode::OK);
-        let cancel_value = body_json(cancel_response).await;
+        let cancel_value = body_json(cancel_response).await?;
         assert_eq!(cancel_value["cancelled"], true);
 
         let mut status = String::new();
@@ -1246,30 +1263,38 @@ mod tests {
                 Value::Null,
             )
             .await;
-            let poll_value = body_json(poll).await;
-            status = poll_value["status"].as_str().unwrap().to_owned();
+            let poll_value = body_json(poll).await?;
+            status = poll_value["status"]
+                .as_str()
+                .ok_or("status must be a string")?
+                .to_owned();
             if status == "cancelled" {
                 break;
             }
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
         assert_eq!(status, "cancelled");
+        Ok(())
     }
 
     // ── Run-cap eviction ─────────────────────────────────────────────────
 
     #[test]
-    fn run_cap_evicts_oldest_finished_runs_first() {
+    fn run_cap_evicts_oldest_finished_runs_first() -> TestResult {
         let mut runs = Runs::default();
         for index in 0..(MAX_RUNS + 10) {
             let record = Arc::new(Mutex::new(RunRecord::new(
                 None,
                 Arc::new(FlagCancel(Arc::new(AtomicBool::new(false)))),
             )));
-            record.lock().unwrap().status = RunStatus::Completed;
+            record
+                .lock()
+                .map_err(|_| "poisoned lock")?
+                .status = RunStatus::Completed;
             runs.insert(format!("run-{index}"), record);
         }
         assert!(runs.map.len() <= MAX_RUNS, "map grew to {}", runs.map.len());
+        Ok(())
     }
 
     #[test]

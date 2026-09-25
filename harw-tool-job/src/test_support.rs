@@ -159,6 +159,15 @@ impl Env {
             .await
             .map_err(|output| TestError::Unexpected(format!("prepare refused: {output:?}")))
     }
+
+    /// Bereitet `argv` (kein Shell-Zwischenschritt, stdin bleibt offen) für
+    /// [`JobManager::start_piped`] vor.
+    pub(crate) async fn prepare_piped(&self, argv: &[&str]) -> TestResult<PreparedJob> {
+        let ctx = self.exec_context("prep")?;
+        DirectLauncher::prepare_piped(&ctx, argv)
+            .await
+            .map_err(|output| TestError::Unexpected(format!("prepare refused: {output:?}")))
+    }
 }
 
 /// Startanfrage mit Besitzer `session` und Vorfahren `ancestors`.

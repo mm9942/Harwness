@@ -416,6 +416,7 @@ inside harw.
 name = "evidence-critic"
 interfaces = ["cli", "mcp"]
 default_interface = "cli"
+child_execution = "job"
 ```
 
 | Key | Type | Meaning |
@@ -423,11 +424,25 @@ default_interface = "cli"
 | `name` | string | file name of the built binary and name it reports on `--version`; defaults to the specialization |
 | `interfaces` | array | interfaces built in by default: `cli` (one-shot), `repl`, `mcp`, `http`, `tui` |
 | `default_interface` | string | the interface used when none is chosen at runtime; must be one of `interfaces` |
+| `child_execution` | string | how the binary runs its child agents: `"job"` or `"in-process"`; defaults to `"job"` |
 
 `harw agent build --interface …` overrides `interfaces` for one build; at
 runtime `--interface` picks one of the interfaces that were built in. An
 unknown interface name, an empty list and a `default_interface` outside
 the list are `HARW-BINARY-*` errors (§20).
+
+`child_execution` controls how a compiled binary starts its child agents
+(delegation targets and child orchestrators). `"job"`, the default for
+compiled binaries, starts each child as a separate process through the job
+system (`harw-tool-job`): the same binary re-invoked as
+`--child <agent-id> --child-protocol stdio`, with process group control,
+logs and crash containment. `"in-process"` keeps the legacy in-process
+spawner instead. Inside harw itself, child agents always run in-process
+regardless of this key — it only takes effect in a compiled binary. An
+unknown `child_execution` value is `HARW-BINARY-006`. The default `"job"`
+never appears in the IR JSON and never changes the v7 snapshot hash (§18):
+it is written into `AgentIr` only when a definition sets it explicitly to
+something other than `"job"`.
 
 ---
 

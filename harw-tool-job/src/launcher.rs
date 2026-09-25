@@ -123,3 +123,42 @@ impl JobLauncher for DirectLauncher {
         })
     }
 }
+
+#[cfg(test)]
+impl DirectLauncher {
+    /// Baut `argv[0] argv[1..]` direkt (kein `/bin/sh -c` dazwischen) in
+    /// eigener Prozessgruppe — **nur für Tests** von
+    /// [`crate::JobManager::start_piped`], das die stdin selbst auf
+    /// `Stdio::piped()` setzt (hier unangetastet gelassen). Spiegelt den
+    /// produktiven Weg (`harw-agent-runner`s `CurrentExeSpawner`: exakter
+    /// argv-Aufruf, keine Shell) ohne dessen Rechte-/Protokollteil.
+    ///
+    /// # Errors
+    /// Eine für das Modell lesbare [`ToolOutput::error`], wenn die
+    /// Freigabe fehlt oder `argv` leer ist.
+    pub(crate) async fn prepare_piped(
+        context: &ToolExecutionContext,
+        argv: &[&str],
+    ) -> Result<PreparedJob, ToolOutput> {
+        if let Some(denied) = harw_tools::sandbox_guard::require_permission(
+            context,
+            harw_authority::Permission::ExecuteProcess,
+            crate::JOB_START_TOOL,
+        ) {
+            return Err(denied);
+        }
+        let Some((program, args)) = argv.split_first() else {
+            return Err(ToolOutput::error("prepare_piped: empty argv"));
+        };
+        let mut command_line = TokioCommand::new(program);
+        command_line
+            .args(args)
+            .current_dir(context.sandbox().workspace().canonical_root())
+            .process_group(0)
+            .kill_on_drop(false);
+        Ok(PreparedJob {
+            command: command_line,
+            executed_on_host: true,
+        })
+    }
+}

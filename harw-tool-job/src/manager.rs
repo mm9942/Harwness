@@ -47,8 +47,9 @@ use std::process::{ExitStatus, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant};
-use tokio::process::Child;
-use tokio::sync::watch;
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::process::{Child, ChildStdin, ChildStdout};
+use tokio::sync::{mpsc, watch};
 use tokio::task::JoinHandle;
 use tracing::{debug, info, warn};
 
@@ -168,6 +169,31 @@ pub struct StartRequest {
     pub notify_every: Duration,
     /// Besitzer.
     pub owner: JobOwner,
+}
+
+/// Ergebnis von [`JobManager::start_piped`]: derselbe Job wie [`JobManager::start`]
+/// (Prozessgruppe, Logs, `meta.json`, Überwachung, Ereignisse), zusätzlich
+/// mit offener stdin und einem Zeilenstrom der stdout — für einen Job, dessen
+/// Prozess über sein eigenes Protokoll auf seiner stdio spricht (ein
+/// job-gebundenes Kind, `harw-agent-runner::job_child_backend`).
+///
+/// # Description
+/// stdout wird zusätzlich vollständig in `STDOUT_LOG` mitgeschrieben
+/// (`job.logs`/`job.status` sehen sie wie bei jedem anderen Job); stderr
+/// geht wie bisher direkt in `STDERR_LOG`. Der Überwachungs-Task erkennt
+/// weiterhin Ende, Prozessgruppe und Ereignisse.
+#[derive(Debug)]
+pub struct PipedJob {
+    /// Kennung.
+    pub job_id: JobId,
+    /// Zustand direkt nach dem Start.
+    pub status: JobStatus,
+    /// stdin des Kindes; der Aufrufer schreibt sein Protokoll hinein.
+    pub stdin: ChildStdin,
+    /// Zeilen der stdout, in Ankunftsreihenfolge (dieselben Zeilen landen
+    /// auch in `STDOUT_LOG`). Endet (liefert `None`), wenn der Prozess seine
+    /// stdout schließt.
+    pub stdout_lines: mpsc::UnboundedReceiver<String>,
 }
 
 /// Ausgang von [`JobManager::wait`].
