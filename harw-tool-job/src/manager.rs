@@ -643,6 +643,143 @@ impl JobManager {
         Ok(entry.status())
     }
 
+    /// Wie [`JobManager::start`], aber stdin bleibt offen (`Stdio::piped()`
+    /// statt `Stdio::null()`) und stdout wird zusätzlich zu `STDOUT_LOG` als
+    /// Zeilenstrom zurückgegeben; stderr geht unverändert direkt in
+    /// `STDERR_LOG`. Für einen job-gebundenen Kindprozess, der sein eigenes
+    /// Protokoll über stdio spricht (`harw-agent-runner::job_child_backend`):
+    /// derselbe Prozessgruppen-/Log-/Überwachungsweg wie jeder andere Job.
+    ///
+    /// # Description
+    /// Muss innerhalb einer Tokio-Runtime laufen (Überwachungs- und
+    /// Mitschreib-Task).
+    ///
+    /// # Errors
+    /// [`JobError::Capacity`], [`JobError::Io`] (Verzeichnis/Logdateien) oder
+    /// [`JobError::Spawn`] (Start scheiterte oder eine der stdio-Pipes fehlt);
+    /// ein gescheiterter Start bleibt als [`JobState::Failed`] mit
+    /// `launch_error` sichtbar.
+    pub fn start_piped(
+        self: &Arc<Self>,
+        request: StartRequest,
+        prepared: PreparedJob,
+    ) -> Result<PipedJob, JobError> {
+        self.check_capacity()?;
+        let (id, dir) = self.allocate()?;
+        let stdout_log_path = dir.join(STDOUT_LOG);
+        let stdout_log = File::create(&stdout_log_path).map_err(io_err("create stdout.log"))?;
+        let stderr = File::create(dir.join(STDERR_LOG)).map_err(io_err("create stderr.log"))?;
+
+        let mut meta = JobMeta {
+            version: META_VERSION,
+            job_id: id.clone(),
+            name: request.name,
+            command: request.command,
+            cwd: request.cwd.map(|cwd| cwd.display().to_string()),
+            env_keys: request.env_keys,
+            state: JobState::Queued,
+            pid: None,
+            proc_start_ticks: None,
+            executed_on_host: prepared.executed_on_host,
+            harw_instance: self.instance.clone(),
+            owner: request.owner,
+            created_at: Timestamp::now(),
+            started_at: None,
+            ended_at: None,
+            exit_code: None,
+            signal: None,
+            stop_requested: false,
+            detached: false,
+            notify_every_secs: request.notify_every.as_secs(),
+            progress: None,
+            warnings: 0,
+            errors: 0,
+            launch_error: None,
+        };
+
+        let mut command = prepared.command;
+        command
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::from(stderr))
+            .kill_on_drop(false);
+        let mut child = match command.spawn() {
+            Ok(child) => child,
+            Err(err) => {
+                return Err(self.record_piped_launch_failure(dir, meta, err.to_string()));
+            }
+        };
+        let (Some(stdin), Some(stdout)) = (child.stdin.take(), child.stdout.take()) else {
+            // `Stdio::piped()` above always gives both back; unreachable in
+            // practice, but a job that spawned without stdio it needs must
+            // not linger.
+            let _ = child.start_kill();
+            return Err(self.record_piped_launch_failure(
+                dir,
+                meta,
+                "child process is missing a stdio pipe".to_owned(),
+            ));
+        };
+
+        let pid = child.id();
+        meta.pid = pid;
+        meta.proc_start_ticks = pid.and_then(process_start_ticks);
+        meta.state = JobState::Running;
+        meta.started_at = Some(Timestamp::now());
+        let entry = Arc::new(JobEntry::new(dir, meta.clone(), true));
+        entry.persist();
+        lock(&self.jobs).insert(id.clone(), Arc::clone(&entry));
+        info!(job_id = %id, pid, executed_on_host = meta.executed_on_host, "piped job started");
+
+        self.notifier.notify(JobNotification {
+            owner: meta.owner.clone(),
+            event: JobEvent::Started {
+                job_id: id.clone(),
+                name: meta.name.clone(),
+                command: meta.command.clone(),
+                pid,
+                executed_on_host: meta.executed_on_host,
+            },
+        });
+
+        let (line_tx, line_rx) = mpsc::unbounded_channel();
+        let tee = tokio::spawn(tee_stdout(stdout, stdout_log, line_tx));
+
+        let monitor = Monitor {
+            entry: Arc::clone(&entry),
+            notifier: Arc::clone(&self.notifier),
+            config: self.config.clone(),
+            notify_every: request.notify_every,
+        };
+        let handle = tokio::spawn(monitor.run_piped(child, tee));
+        *lock(&entry.monitor) = Some(handle);
+        Ok(PipedJob {
+            job_id: id,
+            status: entry.status(),
+            stdin,
+            stdout_lines: line_rx,
+        })
+    }
+
+    /// Verbucht einen gescheiterten `start_piped`-Aufruf genau wie [`JobManager::start`]
+    /// es für seinen eigenen Startfehler tut: Job bleibt als [`JobState::Failed`]
+    /// sichtbar, mit `launch_error`.
+    fn record_piped_launch_failure(
+        &self,
+        dir: PathBuf,
+        mut meta: JobMeta,
+        error: String,
+    ) -> JobError {
+        warn!(job_id = %meta.job_id, error = %error, "piped job spawn failed");
+        meta.state = JobState::Failed;
+        meta.ended_at = Some(Timestamp::now());
+        meta.launch_error = Some(error.clone());
+        let entry = Arc::new(JobEntry::new(dir, meta.clone(), false));
+        entry.persist();
+        lock(&self.jobs).insert(meta.job_id, entry);
+        JobError::Spawn(error)
+    }
+
     /// Zustand eines Jobs.
     ///
     /// # Errors

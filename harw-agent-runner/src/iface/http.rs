@@ -1298,7 +1298,7 @@ mod tests {
     }
 
     #[test]
-    fn run_cap_never_evicts_a_run_still_in_flight() {
+    fn run_cap_never_evicts_a_run_still_in_flight() -> TestResult {
         let mut runs = Runs::default();
         // One run that never finishes, then enough finished runs to push
         // well past the cap.
@@ -1312,9 +1312,13 @@ mod tests {
                 None,
                 Arc::new(FlagCancel(Arc::new(AtomicBool::new(false)))),
             )));
-            record.lock().unwrap().status = RunStatus::Completed;
+            record
+                .lock()
+                .map_err(|_| "poisoned lock")?
+                .status = RunStatus::Completed;
             runs.insert(format!("run-{index}"), record);
         }
         assert!(runs.map.contains_key("in-flight"));
+        Ok(())
     }
 }

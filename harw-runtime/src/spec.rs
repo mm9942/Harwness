@@ -25,6 +25,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use harw_authority::{Permission, PermissionSet};
+use harw_core::child_backend::ChildBackend;
 use harw_core::mode::InteractionMode;
 use harw_extension_api::approval_mode::ApprovalMode;
 use harw_extension_api::contributors::ApprovalHandlerKind;
@@ -32,6 +33,29 @@ use harw_registry_defaults::profile::RegistryProfile;
 use harw_types::{ApprovalActor, Principal, ReasoningEffort};
 
 use crate::embedded::{EffectiveRights, EmbeddedAgent};
+
+/// Hält ein [`ChildBackend`] in [`RuntimeSpec`], das selbst `Clone`,
+/// `Debug`, `PartialEq` und `Eq` bleiben muss (Tests vergleichen ganze
+/// Specs). [`ChildBackend`] verlangt keinen dieser Bounds, deshalb bettet
+/// dieser Wrapper das Objekt nur ein und vergleicht über Zeigergleichheit
+/// (dieselbe `Arc`-Instanz), statt seinen Inhalt zu inspizieren (#22 Welle
+/// 3C).
+#[derive(Clone)]
+pub struct ChildBackendHandle(pub Arc<dyn ChildBackend>);
+
+impl std::fmt::Debug for ChildBackendHandle {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_tuple("ChildBackendHandle").finish_non_exhaustive()
+    }
+}
+
+impl PartialEq for ChildBackendHandle {
+    fn eq(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.0, &other.0)
+    }
+}
+
+impl Eq for ChildBackendHandle {}
 
 /// Art des Einstiegs in die Runtime.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
