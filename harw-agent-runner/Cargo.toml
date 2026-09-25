@@ -1,0 +1,115 @@
+[package]
+publish.workspace = true
+name = "harw-agent-runner"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "Standalone runner binary a compiled agent artifact is embedded into (R10 wave 3)."
+
+# The runner is both a library (`harw-agent-compiler` links it as a base and
+# probes a built one with `--capabilities`) and the `harw-agent-runner`
+# binary itself, which `append_to_executable` (`harw-agent-artifact`) turns
+# into a compiled agent by appending its artifact and footer.
+[lib]
+name = "harw_agent_runner"
+path = "src/lib.rs"
+
+[[bin]]
+name = "harw-agent-runner"
+path = "src/main.rs"
+
+[features]
+# Every built-in interface plus every provider feature is on by default: a
+# generic runner binary (the one `harw-agent-compiler` probes and ships
+# before a native build narrows it) must serve any compiled agent.
+default = [
+    "cli",
+    "repl",
+    "mcp",
+    "http",
+    "tui",
+    "authoring",
+    "core",
+    "knowledge",
+    "matrix",
+    "tool-browser",
+    "tool-deps",
+    "tool-doc",
+    "tool-explorer",
+    "tool-fs",
+    "tool-job",
+    "tool-latex",
+    "tool-lens",
+    "tool-plan",
+    "tool-process",
+    "tool-shell",
+    "tool-sudo",
+    "tool-web",
+]
+
+# Built-in interfaces (`iface::*`, `RunnerArgs::interface`).
+cli = []
+repl = []
+# `iface::mcp` (harw-mcp-server wiring): needs `futures-core` for its event
+# stream; `tokio` is already a base dependency of this crate (see below), so
+# only the extra dep is feature-gated.
+mcp = ["dep:futures-core"]
+http = []
+tui = []
+
+# One empty feature per distinct
+# `harw_registry_defaults::capability_catalog::ToolProvider::feature` (the
+# `PROVIDER_FEATURES` table). `--capabilities` reports the enabled ones so
+# the compiler can check a runner covers an agent's tool surface; wiring an
+# actual provider crate behind each is out of scope here (wave 4+).
+authoring = []
+core = []
+knowledge = []
+matrix = []
+tool-browser = []
+tool-deps = []
+tool-doc = []
+tool-explorer = []
+tool-fs = []
+tool-job = []
+tool-latex = []
+tool-lens = []
+tool-plan = []
+tool-process = []
+tool-shell = []
+tool-sudo = []
+tool-web = []
+
+[dependencies]
+# The artifact container: `EmbeddedArtifact::from_current_exe`, `Bundle`.
+harw-agent-artifact = { path = "../harw-agent-artifact" }
+# `AgentIr`, `Permissions` — typed access to the embedded manifest.
+harw-agent-dsl = { path = "../harw-agent-dsl" }
+# `EmbeddedAgent`, `EffectiveRights`, `RightsFlags` (wave 3 contract).
+harw-runtime = { path = "../harw-runtime", default-features = false }
+# `Harwness::builder().embedded(..)` — the embedding API the interfaces run
+# sessions through.
+harwness-sdk = { path = "../harwness-sdk", default-features = false }
+# `capability_catalog::PROVIDER_FEATURES` — the feature-name contract this
+# crate's Cargo features mirror.
+harw-registry-defaults = { path = "../harw-registry-defaults" }
+# Kein `[workspace.dependencies]`-Eintrag für tokio; Version = Cargo.lock
+# (wie `harw-runtime`/`harwness-sdk`). Deckt die Interfaces (cli/repl/mcp/
+# http/tui) mit ab, damit deren Agenten nicht je eine eigene Fassung ziehen.
+# `signal` added in wave 3B for `iface::repl`'s Ctrl+C → `CancelHandle`
+# wiring (`tokio::signal::ctrl_c`); every other feature here predates that.
+tokio = { version = "1.53.0", features = ["rt", "rt-multi-thread", "macros", "sync", "time", "net", "signal"] }
+serde_json = { workspace = true }
+# `iface::mcp`'s event stream (optional: only pulled in by the `mcp` feature).
+futures-core = { version = "0.3.32", optional = true }
+
+[dev-dependencies]
+# `RunnerCapabilities::parse` — the fixture our `--capabilities` JSON must
+# satisfy exactly. No cycle: `harw-agent-compiler` does not depend on us.
+harw-agent-compiler = { path = "../harw-agent-compiler" }
+tempfile = { workspace = true }
+
+[lints]
+workspace = true

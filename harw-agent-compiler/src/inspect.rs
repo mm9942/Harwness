@@ -76,7 +76,8 @@ pub struct InspectReport {
 /// [`CompileError::Io`] or the artifact's verification error (tampering is
 /// [`harw_agent_artifact::ArtifactError::Tampered`]).
 pub fn read_artifact(path: &Path) -> Result<(Artifact, String, Option<u64>), CompileError> {
-    let bytes = std::fs::read(path).map_err(CompileError::io(format!("read {}", path.display())))?;
+    let bytes =
+        std::fs::read(path).map_err(CompileError::io(format!("read {}", path.display())))?;
     if bytes.starts_with(ARTIFACT_MAGIC) {
         return Ok((Artifact::from_bytes(&bytes)?, "artifact".to_owned(), None));
     }
@@ -90,7 +91,10 @@ pub fn read_artifact(path: &Path) -> Result<(Artifact, String, Option<u64>), Com
 ///
 /// # Errors
 /// [`CompileError::Other`] if it is neither.
-pub fn resolve_target(env: &CompilerEnv, raw: &str) -> Result<(PathBuf, Option<BuildRecord>), CompileError> {
+pub fn resolve_target(
+    env: &CompilerEnv,
+    raw: &str,
+) -> Result<(PathBuf, Option<BuildRecord>), CompileError> {
     let path = env.resolve(Path::new(raw));
     if path.is_file() {
         return Ok((path, None));
@@ -110,7 +114,10 @@ pub fn resolve_target(env: &CompilerEnv, raw: &str) -> Result<(PathBuf, Option<B
 /// # Errors
 /// See [`read_artifact`] and [`ir_from_artifact`]; an invalid bundle
 /// layout is [`CompileError::Bundle`].
-pub fn inspect_path(path: &Path, build: Option<BuildRecord>) -> Result<InspectReport, CompileError> {
+pub fn inspect_path(
+    path: &Path,
+    build: Option<BuildRecord>,
+) -> Result<InspectReport, CompileError> {
     let (artifact, container, runner_bytes) = read_artifact(path)?;
     let bundle = bundle_of(&artifact)?;
     let ir = ir_from_artifact(&artifact)?;
@@ -173,11 +180,20 @@ pub fn inspect_path(path: &Path, build: Option<BuildRecord>) -> Result<InspectRe
                             "{} {} {}",
                             reference.kind,
                             reference.logical_path,
-                            reference.blake3.to_hex().chars().take(12).collect::<String>()
+                            reference
+                                .blake3
+                                .to_hex()
+                                .chars()
+                                .take(12)
+                                .collect::<String>()
                         )
                     })
                     .collect(),
-                children: entry.children.iter().map(|child| child.name.clone()).collect(),
+                children: entry
+                    .children
+                    .iter()
+                    .map(|child| child.name.clone())
+                    .collect(),
             })
         })
         .collect();
@@ -224,7 +240,11 @@ impl InspectReport {
             crate::passes::role_label(ir.role),
             self.artifact_digest,
             self.snapshot.as_deref().unwrap_or("-"),
-            if self.snapshot_verified { "verified" } else { "MISMATCH" },
+            if self.snapshot_verified {
+                "verified"
+            } else {
+                "MISMATCH"
+            },
         );
         let interfaces: Vec<&str> = ir.binary.interfaces.iter().map(|i| i.as_str()).collect();
         out.push_str(&format!(
@@ -258,7 +278,10 @@ impl InspectReport {
                 budget.max_tokens, budget.max_tool_calls, budget.max_wall_secs
             ));
         }
-        out.push_str(&format!("  env:        {}\n", list(&permissions.required_env)));
+        out.push_str(&format!(
+            "  env:        {}\n",
+            list(&permissions.required_env)
+        ));
         if let Some(models) = &ir.models {
             out.push_str(&format!(
                 "  models:     {}/{} effort={}\n",
@@ -272,7 +295,11 @@ impl InspectReport {
                 "  skill:      {} {} ({})\n",
                 skill.name,
                 skill.hash.as_deref().unwrap_or("-"),
-                if skill.verified { "verified" } else { "NOT EMBEDDED" }
+                if skill.verified {
+                    "verified"
+                } else {
+                    "NOT EMBEDDED"
+                }
             ));
         }
         for agent in self.agents.iter().skip(1) {

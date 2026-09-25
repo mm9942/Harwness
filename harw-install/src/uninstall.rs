@@ -411,12 +411,8 @@ mod tests {
                 .contains(&os_home.join(".local").join("bin").join("harw"))
         );
         assert!(
-            p.removals.contains(
-                &os_home
-                    .join(".local")
-                    .join("bin")
-                    .join("harw-agent-runner")
-            )
+            p.removals
+                .contains(&os_home.join(".local").join("bin").join("harw-agent-runner"))
         );
         assert!(
             p.removals

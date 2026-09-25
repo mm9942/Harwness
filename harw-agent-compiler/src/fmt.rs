@@ -45,7 +45,9 @@ pub const HEADER_ORDER: &[&str] = &[
 /// # Errors
 /// `Err(message)` if the text is not valid TOML.
 pub fn format_definition(text: &str) -> Result<String, String> {
-    let mut document: DocumentMut = text.parse().map_err(|error: toml_edit::TomlError| error.to_string())?;
+    let mut document: DocumentMut = text
+        .parse()
+        .map_err(|error: toml_edit::TomlError| error.to_string())?;
     let root = document.as_table_mut();
     root.sort_values_by(|left, _, right, _| rank(left.get()).cmp(&rank(right.get())));
     normalize_table(root);
@@ -145,10 +147,7 @@ pub struct FmtResult {
 /// Formats (or with `check`, only checks) files.
 #[must_use]
 pub fn format_files(paths: &[PathBuf], check: bool) -> Vec<FmtResult> {
-    paths
-        .iter()
-        .map(|path| format_file(path, check))
-        .collect()
+    paths.iter().map(|path| format_file(path, check)).collect()
 }
 
 fn format_file(path: &Path, check: bool) -> FmtResult {
@@ -229,12 +228,26 @@ mod tests {
         let role = position("role = \"worker\" # the role\n")?;
         let specialization = position("specialization = \"x\"\n")?;
         assert!(schema < id && id < version && version < role && role < specialization);
-        assert!(formatted.starts_with("schema = "), "no leading blank lines:\n{formatted}");
-        assert!(formatted.contains("# Leading comment stays.\nrole"), "a comment moves with its key");
-        assert!(formatted.contains("# Tools comment stays.\nadmitted = [\"fs.read\", \"fs.list\"]\n"));
+        assert!(
+            formatted.starts_with("schema = "),
+            "no leading blank lines:\n{formatted}"
+        );
+        assert!(
+            formatted.contains("# Leading comment stays.\nrole"),
+            "a comment moves with its key"
+        );
+        assert!(
+            formatted.contains("# Tools comment stays.\nadmitted = [\"fs.read\", \"fs.list\"]\n")
+        );
         assert!(formatted.contains("\n[spawn]\nmax_depth = 0\n"));
-        assert!(!formatted.contains("\n\n\n"), "blank-line runs collapse:\n{formatted}");
-        assert!(!formatted.lines().any(|line| line.ends_with(' ')), "no trailing spaces");
+        assert!(
+            !formatted.contains("\n\n\n"),
+            "blank-line runs collapse:\n{formatted}"
+        );
+        assert!(
+            !formatted.lines().any(|line| line.ends_with(' ')),
+            "no trailing spaces"
+        );
         assert!(formatted.ends_with("max_depth = 0\n"));
         Ok(())
     }
@@ -244,8 +257,10 @@ mod tests {
         let once = format_definition(MESSY)?;
         let twice = format_definition(&once)?;
         assert_eq!(once, twice);
-        let before: toml::Table = toml::from_str(MESSY).map_err(|e: toml::de::Error| e.to_string())?;
-        let after: toml::Table = toml::from_str(&once).map_err(|e: toml::de::Error| e.to_string())?;
+        let before: toml::Table =
+            toml::from_str(MESSY).map_err(|e: toml::de::Error| e.to_string())?;
+        let after: toml::Table =
+            toml::from_str(&once).map_err(|e: toml::de::Error| e.to_string())?;
         assert_eq!(before, after);
         Ok(())
     }
@@ -254,7 +269,8 @@ mod tests {
     fn test_multiline_string_whitespace_is_kept() -> Result<(), String> {
         let text = "schema = \"harwness.agent/v1\"\ndescription = \"\"\"\nline with trailing space   \nend\"\"\"\n";
         let formatted = format_definition(text)?;
-        let before: toml::Table = toml::from_str(text).map_err(|e: toml::de::Error| e.to_string())?;
+        let before: toml::Table =
+            toml::from_str(text).map_err(|e: toml::de::Error| e.to_string())?;
         let after: toml::Table =
             toml::from_str(&formatted).map_err(|e: toml::de::Error| e.to_string())?;
         assert_eq!(before, after, "the string value is unchanged");

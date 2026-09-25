@@ -57,11 +57,12 @@ impl Pass for ResolveModels {
                 format!("`{}` has no `[models]` table", unit.name),
             )),
             Some(models) if models.required_env.is_empty() => {
-                let providers = models
-                    .provider
-                    .iter()
-                    .cloned()
-                    .chain(models.fallbacks.iter().map(|fallback| fallback.provider.clone()));
+                let providers = models.provider.iter().cloned().chain(
+                    models
+                        .fallbacks
+                        .iter()
+                        .map(|fallback| fallback.provider.clone()),
+                );
                 for provider in providers {
                     let Some(env) = provider_env(&provider) else {
                         continue;

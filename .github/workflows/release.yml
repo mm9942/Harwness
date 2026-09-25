@@ -52,11 +52,15 @@ jobs:
 
       - name: Build (cargo)
         if: ${{ !matrix.use_cross }}
-        run: cargo build --release --locked -p harw-cli -p harw-killer --target ${{ matrix.target }}
+        run: |
+          cargo build --release --locked -p harw-cli -p harw-killer --target ${{ matrix.target }}
+          cargo build --profile release-runner --locked -p harw-agent-runner --target ${{ matrix.target }}
 
       - name: Build (cross)
         if: matrix.use_cross
-        run: cross build --release --locked -p harw-cli -p harw-killer --target ${{ matrix.target }}
+        run: |
+          cross build --release --locked -p harw-cli -p harw-killer --target ${{ matrix.target }}
+          cross build --profile release-runner --locked -p harw-agent-runner --target ${{ matrix.target }}
 
       - name: Package
         run: |
@@ -66,6 +70,11 @@ jobs:
           mkdir -p "$stage"
           cp "target/${{ matrix.target }}/release/${BIN_NAME}" "$stage/"
           cp "target/${{ matrix.target }}/release/killer" "$stage/"
+          # `release-runner` (fat LTO, one codegen unit, `panic = "abort"`,
+          # see the root Cargo.toml) — shipped next to `harw` so `harw agent
+          # build` finds it without a further download (Makefile `install`
+          # does the same for a from-source install).
+          cp "target/${{ matrix.target }}/release-runner/harw-agent-runner" "$stage/"
           cp README.md LICENSE-MIT LICENSE-APACHE "$stage/"
           tar -czf "${stage}.tar.gz" "$stage"
           sha256sum "${stage}.tar.gz" > "${stage}.tar.gz.sha256"

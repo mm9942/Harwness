@@ -103,8 +103,9 @@ pub fn bundle_of(artifact: &Artifact) -> Result<Bundle, CompileError> {
 /// no `AgentIr` v2.
 pub fn ir_from_artifact(artifact: &Artifact) -> Result<AgentIr, CompileError> {
     let bundle = bundle_of(artifact)?;
-    serde_json::from_value(bundle.header.ir)
-        .map_err(|error| CompileError::Other(format!("artifact header holds no AgentIr v2: {error}")))
+    serde_json::from_value(bundle.header.ir).map_err(|error| {
+        CompileError::Other(format!("artifact header holds no AgentIr v2: {error}"))
+    })
 }
 
 /// The IR of one agent entry of a bundle.

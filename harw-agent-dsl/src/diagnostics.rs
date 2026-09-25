@@ -1219,7 +1219,11 @@ mod tests {
     #[test]
     fn test_every_catalog_entry_has_an_example_and_a_fix() {
         for entry in CATALOG {
-            assert!(!entry.example.trim().is_empty(), "{}: no example", entry.code);
+            assert!(
+                !entry.example.trim().is_empty(),
+                "{}: no example",
+                entry.code
+            );
             assert!(!entry.fix.trim().is_empty(), "{}: no fix", entry.code);
             assert_ne!(entry.fix, entry.help, "{}: fix repeats help", entry.code);
         }

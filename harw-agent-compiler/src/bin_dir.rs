@@ -273,7 +273,11 @@ impl BinDir {
     ///
     /// # Errors
     /// [`CompileError::Other`] if nothing or more than one version matches.
-    pub fn use_version(&self, name: &str, selector: &str) -> Result<InstalledVersion, CompileError> {
+    pub fn use_version(
+        &self,
+        name: &str,
+        selector: &str,
+    ) -> Result<InstalledVersion, CompileError> {
         let versions = self.versions(name)?;
         if versions.is_empty() {
             return Err(CompileError::Other(format!(
@@ -286,13 +290,14 @@ impl BinDir {
             .collect();
         let matches: Vec<&InstalledVersion> = if exact.is_empty() {
             let selector_lower = selector.to_ascii_lowercase();
-            let by_digest = selector_lower.len() >= 4
-                && selector_lower.chars().all(|c| c.is_ascii_hexdigit());
+            let by_digest =
+                selector_lower.len() >= 4 && selector_lower.chars().all(|c| c.is_ascii_hexdigit());
             versions
                 .iter()
                 .filter(|version| {
                     version.record.version == selector
-                        || (by_digest && version.record.artifact_digest.starts_with(&selector_lower))
+                        || (by_digest
+                            && version.record.artifact_digest.starts_with(&selector_lower))
                 })
                 .collect()
         } else {
@@ -343,13 +348,16 @@ impl BinDir {
     /// [`CompileError::Io`] on failure.
     pub fn set_current(&self, name: &str, dir_name: &str) -> Result<(), CompileError> {
         let dir = self.versions_dir(name).join(dir_name);
-        let record_text = std::fs::read(dir.join(BUILD_RECORD_FILE))
-            .map_err(CompileError::io(format!("read {}", dir.join(BUILD_RECORD_FILE).display())))?;
+        let record_text = std::fs::read(dir.join(BUILD_RECORD_FILE)).map_err(CompileError::io(
+            format!("read {}", dir.join(BUILD_RECORD_FILE).display()),
+        ))?;
         let record: BuildRecord = serde_json::from_slice(&record_text)
             .map_err(|error| CompileError::Other(format!("{}: {error}", dir.display())))?;
         let target_file = dir.join(&record.file);
         let link = self.link(name);
-        let temporary = self.root.join(format!(".{name}.tmp-{}", std::process::id()));
+        let temporary = self
+            .root
+            .join(format!(".{name}.tmp-{}", std::process::id()));
         let _ = std::fs::remove_file(&temporary);
         let relative = Path::new(VERSIONS_DIR)
             .join(name)
@@ -398,8 +406,10 @@ impl BinDir {
         for version in others.into_iter().skip(keep) {
             let bytes = crate::cache::dir_size(&version.dir);
             if !dry_run {
-                std::fs::remove_dir_all(&version.dir)
-                    .map_err(CompileError::io(format!("remove {}", version.dir.display())))?;
+                std::fs::remove_dir_all(&version.dir).map_err(CompileError::io(format!(
+                    "remove {}",
+                    version.dir.display()
+                )))?;
             }
             removed.push(RemovedVersion {
                 name: name.to_owned(),
@@ -452,10 +462,20 @@ mod tests {
         let root = tempfile::tempdir()?;
         let bin = BinDir::new(root.path().join("bin"));
         std::fs::create_dir_all(bin.root())?;
-        let first = bin.install(&record("ec", "1.0.0", &"a".repeat(64), 1), b"one", true, true)?;
+        let first = bin.install(
+            &record("ec", "1.0.0", &"a".repeat(64), 1),
+            b"one",
+            true,
+            true,
+        )?;
         assert_eq!(first.dir_name, "1.0.0-aaaaaaaaaaaa");
         assert_eq!(std::fs::read(bin.link("ec"))?, b"one");
-        let second = bin.install(&record("ec", "1.0.1", &"b".repeat(64), 2), b"two", true, true)?;
+        let second = bin.install(
+            &record("ec", "1.0.1", &"b".repeat(64), 2),
+            b"two",
+            true,
+            true,
+        )?;
         assert_eq!(std::fs::read(bin.link("ec"))?, b"two");
         let versions = bin.versions("ec")?;
         assert_eq!(versions.len(), 2);
@@ -470,15 +490,28 @@ mod tests {
         let root = tempfile::tempdir()?;
         let bin = BinDir::new(root.path().join("bin"));
         std::fs::create_dir_all(bin.root())?;
-        bin.install(&record("ec", "1.0.0", &"a1".repeat(32), 1), b"one", true, true)?;
-        bin.install(&record("ec", "1.0.1", &"b2".repeat(32), 2), b"two", true, true)?;
+        bin.install(
+            &record("ec", "1.0.0", &"a1".repeat(32), 1),
+            b"one",
+            true,
+            true,
+        )?;
+        bin.install(
+            &record("ec", "1.0.1", &"b2".repeat(32), 2),
+            b"two",
+            true,
+            true,
+        )?;
         let chosen = bin.use_version("ec", "1.0.0")?;
         assert!(chosen.current);
         assert_eq!(std::fs::read(bin.link("ec"))?, b"one");
         bin.use_version("ec", "b2b2")?;
         assert_eq!(std::fs::read(bin.link("ec"))?, b"two");
         bin.use_version("ec", "1.0.0-a1a1a1a1a1a1")?;
-        assert_eq!(bin.current("ec").map(|v| v.record.version), Some("1.0.0".to_owned()));
+        assert_eq!(
+            bin.current("ec").map(|v| v.record.version),
+            Some("1.0.0".to_owned())
+        );
         assert!(bin.use_version("ec", "9.9.9").is_err());
         Ok(())
     }
@@ -490,7 +523,12 @@ mod tests {
         std::fs::create_dir_all(bin.root())?;
         for (at, digest) in ["a", "b", "c", "d", "e"].iter().enumerate() {
             let at = i64::try_from(at)?;
-            bin.install(&record("ec", &format!("1.0.{at}"), &digest.repeat(64), at), b"x", true, true)?;
+            bin.install(
+                &record("ec", &format!("1.0.{at}"), &digest.repeat(64), at),
+                b"x",
+                true,
+                true,
+            )?;
         }
         // Make the oldest version current: it must survive any keep.
         bin.use_version("ec", "1.0.0")?;
@@ -499,12 +537,27 @@ mod tests {
         assert_eq!(bin.versions("ec")?.len(), 5, "dry run removes nothing");
         let removed = bin.prune_versions("ec", 1, false)?;
         let names: Vec<&str> = removed.iter().map(|r| r.dir_name.as_str()).collect();
-        assert_eq!(names, ["1.0.3-dddddddddddd", "1.0.2-cccccccccccc", "1.0.1-bbbbbbbbbbbb"]);
-        let left: Vec<String> = bin.versions("ec")?.into_iter().map(|v| v.dir_name).collect();
+        assert_eq!(
+            names,
+            [
+                "1.0.3-dddddddddddd",
+                "1.0.2-cccccccccccc",
+                "1.0.1-bbbbbbbbbbbb"
+            ]
+        );
+        let left: Vec<String> = bin
+            .versions("ec")?
+            .into_iter()
+            .map(|v| v.dir_name)
+            .collect();
         assert_eq!(left, ["1.0.0-aaaaaaaaaaaa", "1.0.4-eeeeeeeeeeee"]);
         assert_eq!(std::fs::read(bin.link("ec"))?, b"x");
         assert_eq!(bin.prune_versions("ec", 0, false)?.len(), 1);
-        assert_eq!(bin.versions("ec")?.len(), 1, "only the current version is left");
+        assert_eq!(
+            bin.versions("ec")?.len(),
+            1,
+            "only the current version is left"
+        );
         Ok(())
     }
 }

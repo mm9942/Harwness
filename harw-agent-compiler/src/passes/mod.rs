@@ -22,9 +22,7 @@ mod rights;
 mod roles;
 mod skills;
 
-pub use children::{
-    ChildClosure, ChildResolver, ResolvedChild, child_problems,
-};
+pub use children::{ChildClosure, ChildResolver, ResolvedChild, child_problems};
 pub use models::{HTTP_TOKEN_ENV, ResolveModels, provider_env};
 pub use prune::PruneUnusedTools;
 pub use reachable::{ReachableTools, collect_providers};

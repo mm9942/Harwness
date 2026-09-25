@@ -1,14 +1,17 @@
 //! Gate 2: Privilegienbudget je Binary.
 //!
 //! # Verantwortungsbereich
-//! Bildet für jedes der vier Binaries die **vollständige Abhängigkeitshülle**
+//! Bildet für jedes überwachte Binary die **vollständige Abhängigkeitshülle**
 //! und prüft sie gegen die deklarierte Berechtigungsklasse. Ein
 //! unprivilegiertes Binary darf nichts erreichen, das eine erhöhte Fähigkeit
 //! braucht.
 //!
-//! Die vier: `harw-sentinel` (unprivilegiert), `harw-probe-fs`
+//! Die vier DoD-Binaries: `harw-sentinel` (unprivilegiert), `harw-probe-fs`
 //! (`CAP_SYS_ADMIN`), `harw-probe-bpf` (`CAP_BPF`), `harw-warden`
-//! (systemd-Socket, kein Netz).
+//! (systemd-Socket, kein Netz). Dazu seit R10 Wave 4 ein fünftes,
+//! Produkt-Workspace-Binary außerhalb der DoD-Capability-Domäne:
+//! `harw-agent-runner` — siehe Abschnitt „`harw-agent-runner`: unprivilegiert,
+//! aber außerhalb der DoD-Tabelle" weiter unten.
 //!
 //! # Warum die *Hülle* und nicht die direkten Abhängigkeiten
 //! Eine Fähigkeit wandert über transitive Kanten. Ein Sensor, der nur
@@ -106,9 +109,43 @@
 //! sie stattdessen explizit als unprivilegiert einzutragen erreicht dieselbe
 //! Wirkung, ohne eine neue Fähigkeit des Graphen vorauszusetzen.
 //!
+//! # `harw-agent-runner`: unprivilegiert, aber außerhalb der DoD-Tabelle
+//! `harw-agent-runner` (R10 Wave 4, `docs/plans/r10-agent-compiler.md`) ist
+//! kein DoD-Sensorbinary: es liegt im Produkt-Workspace, hängt an keiner
+//! Stelle von `dod/` oder einer `harw-dod-*`-Crate ab (geprüft: sein
+//! einziger Pfad zu `harw-core-bridge`/`harw-runtime` führt nie über
+//! `harw-dod-signals` oder eine andere DoD-Crate — siehe die Kommentare in
+//! `harw-runtime/Cargo.toml`), und seine Hülle zieht dutzende gewöhnliche
+//! Produkt-Crates (`harw-runtime`, `harwness-sdk`, `harw-registry-defaults`,
+//! deren jeweilige Abhängigkeiten, …), die niemals eine `Capability`
+//! binden — dieses Vokabular existiert nur innerhalb der DoD-Sensor-Familie.
+//!
+//! Alle diese Produkt-Crates einzeln in [`CRATE_PRIVILEGE`] einzutragen wäre
+//! keine Sicherheitsaussage, nur eine sehr lange Abschreibübung: keine von
+//! ihnen kann strukturell eine `Capability` deklarieren, weil sie nicht Teil
+//! des DoD-Workspace sind, in dem `Capability` überhaupt existiert. Deshalb
+//! trägt [`MonitoredBinary`] ein zweites Feld, [`UnlistedCratePolicy`]:
+//! - [`UnlistedCratePolicy::Violation`] (unverändertes Verhalten, für die
+//!   vier DoD-Binaries): eine nicht eingetragene Crate ist ein Verstoß —
+//!   siehe Abschnitt „Warum eine unbekannte Crate ein Verstoß ist".
+//! - [`UnlistedCratePolicy::DefaultUnprivileged`] (nur `harw-agent-runner`):
+//!   eine nicht eingetragene Crate zählt als [`RequiredPrivilege::Unprivileged`]
+//!   statt als Verstoß.
+//!
+//! Das schwächt die Prüfung **nicht** für die Crates, auf die es ankommt: Ein
+//! `harw-dod-*`-Sensor mit echter `Capability` (z. B. `harw-dod-bpf`) steht
+//! bereits explizit mit seiner erhöhten Klasse in [`CRATE_PRIVILEGE`] — er
+//! ist nicht "unlisted", also greift `DefaultUnprivileged` für ihn gar nicht,
+//! und `BinaryBudget::Unprivileged` lässt ihn weiterhin nicht durch. Sollte
+//! `harw-agent-runner` (heute strukturell unmöglich) je eine Kante zu einer
+//! solchen Crate bekommen, bleibt das ein Verstoß. `DefaultUnprivileged`
+//! senkt also nur die Pflege-Last für strukturell harmlose Produkt-Crates,
+//! nie die Prüftiefe für die DoD-Capability-Domäne.
+//!
 //! # Fehlendes Binary
-//! Alle vier Binaries liegen im eigenständigen DoD-Workspace unter `dod/`.
-//! [`run`] lädt deshalb Produkt- und DoD-Workspace zusammen
+//! Die vier DoD-Binaries liegen im eigenständigen DoD-Workspace unter
+//! `dod/`; `harw-agent-runner` liegt im Produkt-Workspace. [`run`] lädt
+//! deshalb Produkt- und DoD-Workspace zusammen
 //! ([`super::load_all_workspaces`]). Fehlt eines der vier trotzdem im
 //! Graphen, ist das ein **Verstoß**, kein Hinweis: ein Binary, das das Gate
 //! nicht sieht, kann es nicht prüfen, und genau dieser Zustand hat das Gate
@@ -300,7 +337,24 @@ impl BinaryBudget {
     }
 }
 
-/// Eines der vier überwachten Binaries samt seinem deklarierten Budget.
+/// Wie [`evaluate`] eine Crate behandelt, die in [`CRATE_PRIVILEGE`] fehlt —
+/// siehe Moduldoku, Abschnitt „`harw-agent-runner`: unprivilegiert, aber
+/// außerhalb der DoD-Tabelle".
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UnlistedCratePolicy {
+    /// Unverändertes Verhalten: eine fehlende Zeile ist immer ein Verstoß,
+    /// nie eine stille Freigabe. Gilt für die vier DoD-Binaries.
+    Violation,
+    /// Nur für Binaries außerhalb der DoD-Capability-Domäne, deren Hülle
+    /// strukturell keine `harw-dod-*`-Crate erreichen kann: eine fehlende
+    /// Zeile zählt als [`RequiredPrivilege::Unprivileged`]. Eine Crate, die
+    /// explizit mit einer erhöhten Klasse in [`CRATE_PRIVILEGE`] steht, ist
+    /// davon unberührt — sie ist nicht „unlisted" und bleibt ein Verstoß,
+    /// wenn das Budget sie nicht erlaubt.
+    DefaultUnprivileged,
+}
+
+/// Eines der überwachten Binaries samt seinem deklarierten Budget.
 ///
 /// # Description
 /// Ein Eintrag in [`MONITORED_BINARIES`]. Der Binary-Name ist zugleich der
@@ -311,25 +365,40 @@ pub struct MonitoredBinary {
     pub name: &'static str,
     /// Die deklarierte Berechtigungsklasse dieses Binaries.
     pub budget: BinaryBudget,
+    /// Wie eine in [`CRATE_PRIVILEGE`] fehlende, aus diesem Binary heraus
+    /// erreichte Crate gewertet wird.
+    pub unlisted_policy: UnlistedCratePolicy,
 }
 
-/// Die vier Binaries dieses Knotens samt ihrer Klasse aus dem Auftrag.
+/// Die Binaries dieses Knotens samt ihrer Klasse aus dem Auftrag: die vier
+/// DoD-Binaries plus, seit R10 Wave 4, `harw-agent-runner`.
 pub const MONITORED_BINARIES: &[MonitoredBinary] = &[
     MonitoredBinary {
         name: "harw-sentinel",
         budget: BinaryBudget::Unprivileged,
+        unlisted_policy: UnlistedCratePolicy::Violation,
     },
     MonitoredBinary {
         name: "harw-probe-fs",
         budget: BinaryBudget::CapSysAdmin,
+        unlisted_policy: UnlistedCratePolicy::Violation,
     },
     MonitoredBinary {
         name: "harw-probe-bpf",
         budget: BinaryBudget::CapBpf,
+        unlisted_policy: UnlistedCratePolicy::Violation,
     },
     MonitoredBinary {
         name: "harw-warden",
         budget: BinaryBudget::SystemdSocketNoNet,
+        unlisted_policy: UnlistedCratePolicy::Violation,
+    },
+    // R10 Wave 4 (docs/plans/r10-agent-compiler.md): Produkt-Workspace-
+    // Binary außerhalb der DoD-Capability-Domäne — siehe Moduldoku.
+    MonitoredBinary {
+        name: "harw-agent-runner",
+        budget: BinaryBudget::Unprivileged,
+        unlisted_policy: UnlistedCratePolicy::DefaultUnprivileged,
     },
 ];
 
@@ -643,6 +712,12 @@ pub fn evaluate(graph: &WorkspaceGraph) -> GateReport {
         for (crate_name, chain) in reachable_with_chain(spec.name, &by_name) {
             let chain_str = chain.join(" → ");
             match lookup_privilege(&crate_name) {
+                None if spec.unlisted_policy == UnlistedCratePolicy::DefaultUnprivileged => {
+                    // Siehe Moduldoku, „harw-agent-runner …": nur für
+                    // Binaries außerhalb der DoD-Capability-Domäne. Eine
+                    // Crate mit einer echten, erhöhten Klasse steht bereits
+                    // in CRATE_PRIVILEGE und landet nie in diesem Zweig.
+                }
                 None => {
                     violations.push(format!(
                         "{} ({}) erreicht '{}' über {} — keine Fähigkeitszuordnung \
@@ -775,7 +850,7 @@ mod tests {
 
     #[test]
     fn test_evaluate_missing_binary_is_a_violation_and_not_counted() {
-        // Nur harw-sentinel ist im Graphen; die anderen drei Binaries fehlen
+        // Nur harw-sentinel ist im Graphen; die anderen vier Binaries fehlen
         // vollständig — genau der Zustand, als die Gates nur `.` luden.
         let g = bare_graph(vec![
             node("harw-sentinel", &["harw-dod-cpu"]),
@@ -794,9 +869,14 @@ mod tests {
         );
         assert_eq!(
             missing_binaries(&g),
-            vec!["harw-probe-fs", "harw-probe-bpf", "harw-warden"]
+            vec![
+                "harw-probe-fs",
+                "harw-probe-bpf",
+                "harw-warden",
+                "harw-agent-runner"
+            ]
         );
-        assert_eq!(report.violations.len(), 3, "{:?}", report.violations);
+        assert_eq!(report.violations.len(), 4, "{:?}", report.violations);
         assert!(
             report
                 .violations
@@ -957,8 +1037,16 @@ mod tests {
 
         assert!(!report.is_green(), "leerer Graph prüft nichts (G-102)");
         assert_eq!(report.checked, 0);
-        assert_eq!(report.violations.len(), 4, "{:?}", report.violations);
-        assert_eq!(missing_binaries(&bare_graph(Vec::new())).len(), 4);
+        assert_eq!(
+            report.violations.len(),
+            MONITORED_BINARIES.len(),
+            "{:?}",
+            report.violations
+        );
+        assert_eq!(
+            missing_binaries(&bare_graph(Vec::new())).len(),
+            MONITORED_BINARIES.len()
+        );
     }
 
     #[test]
@@ -979,6 +1067,46 @@ mod tests {
             report.violations
         );
         assert_eq!(report.checked, MONITORED_BINARIES.len());
+    }
+
+    #[test]
+    fn test_evaluate_agent_runner_reaching_unlisted_product_crate_is_green() {
+        // harw-runtime, harwness-sdk & co. tauchen bewusst nicht in
+        // CRATE_PRIVILEGE auf — DefaultUnprivileged trägt sie ohne
+        // Tabellenpflege.
+        let g = graph(vec![
+            node("harw-agent-runner", &["harw-runtime", "harwness-sdk"]),
+            node("harw-runtime", &[]),
+            node("harwness-sdk", &[]),
+        ]);
+
+        let report = evaluate(&g);
+
+        assert!(report.is_green(), "{:?}", report.violations);
+        assert_eq!(report.checked, MONITORED_BINARIES.len());
+    }
+
+    #[test]
+    fn test_evaluate_agent_runner_reaching_explicit_bpf_crate_is_still_a_violation() {
+        // DefaultUnprivileged deckt nur *fehlende* Zeilen ab. Eine Crate mit
+        // einer echten, erhöhten Klasse in CRATE_PRIVILEGE bleibt geprüft,
+        // auch wenn harw-agent-runner sie (strukturell unmöglich) erreichen
+        // würde.
+        let g = graph(vec![
+            node("harw-agent-runner", &["harw-dod-bpf"]),
+            node("harw-dod-bpf", &[]),
+        ]);
+
+        let report = evaluate(&g);
+
+        assert!(!report.is_green());
+        assert!(
+            report.violations.iter().any(|v| {
+                v.contains("harw-agent-runner (unprivilegiert)") && v.contains("CAP_BPF")
+            }),
+            "{:?}",
+            report.violations
+        );
     }
 
     #[test]

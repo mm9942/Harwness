@@ -81,6 +81,11 @@ pub(crate) fn runtime_spec(
         reasoning_effort: None,
         approval_override: None,
         model_override: None,
+        // #22 Welle 3: eine native, personalisierte harw trägt ihre UIA im
+        // Binary (`crate::embedded_uia::embedded_uia`); die Laufzeit selbst
+        // kennt `harw-cli` nicht und bekommt sie ausschließlich hierüber.
+        // `None` in jedem gewöhnlichen (nicht personalisierten) Build.
+        embedded: crate::embedded_uia::embedded_uia().map(|embedded| Arc::new(embedded.ir.clone())),
     }
 }
 

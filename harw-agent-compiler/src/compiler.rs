@@ -287,9 +287,9 @@ impl Compiler {
     pub fn compile_input(&mut self, input: &AgentInput) -> Result<Compiled, CompileError> {
         match self.resolve(input)? {
             Target::Entry(entry) => self.compile_entry(&entry),
-            Target::Broken(broken) => Err(CompileError::Diagnostics(
-                self.broken_diagnostics(&broken),
-            )),
+            Target::Broken(broken) => {
+                Err(CompileError::Diagnostics(self.broken_diagnostics(&broken)))
+            }
         }
     }
 
@@ -300,9 +300,9 @@ impl Compiler {
     pub fn lower_input(&mut self, input: &AgentInput) -> Result<CompileUnit, CompileError> {
         match self.resolve(input)? {
             Target::Entry(entry) => Ok(self.front_end(&entry)?),
-            Target::Broken(broken) => Err(CompileError::Diagnostics(
-                self.broken_diagnostics(&broken),
-            )),
+            Target::Broken(broken) => {
+                Err(CompileError::Diagnostics(self.broken_diagnostics(&broken)))
+            }
         }
     }
 }

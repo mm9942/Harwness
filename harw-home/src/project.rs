@@ -58,7 +58,10 @@ use crate::paths;
 /// wird.
 const DEFAULT_MARKER: &str = ".git";
 
-/// Regel für die Gitignore im Projektroot: der gesamte Harw-Zustand bleibt lokal.
+/// Fallback-Regel für die Gitignore im Projektroot (ohne
+/// [`paths::set_named_home`]): der gesamte Harw-Zustand bleibt lokal. Eine
+/// personalisierte harw (#22) trägt stattdessen `.<name>/`
+/// ([`paths::project_dir_name`]) ein; siehe [`ensure_ignore_rule`].
 const ROOT_GITIGNORE_RULE: &str = ".harw/";
 
 /// Obergrenze für die `.git`-Datei eines Worktrees und ihre `commondir`.
@@ -517,17 +520,36 @@ fn ensure_root_gitignore(root: &Path) -> HomeResult<()> {
 }
 
 /// Ergänzt eine Ignore-Datei (`.gitignore` oder `.git/info/exclude`)
-/// idempotent um [`ROOT_GITIGNORE_RULE`].
+/// idempotent um das projekt-lokale Verzeichnis (#22:
+/// [`paths::project_dir_name`], `.harw` ohne [`paths::set_named_home`]).
+///
+/// Erkennt sowohl den Standardnamen `.harw/` als auch den aktuell aktiven,
+/// personalisierten Namen — ein Projekt, das schon einmal mit `.harw` (oder
+/// einem anderen Namen) gestartet wurde und danach unter einer
+/// personalisierten harw weiterläuft, bekommt so keinen doppelten Eintrag,
+/// bewahrt aber auch die ältere Regel bytegenau.
 fn ensure_ignore_rule(gitignore: &Path) -> HomeResult<()> {
+    ensure_ignore_rule_named(gitignore, paths::project_dir_name())
+}
+
+/// Testbarer Kern von [`ensure_ignore_rule`] mit explizitem projekt-lokalen
+/// Namen, ohne den prozessweiten `OnceLock` hinter [`paths::project_dir_name`]
+/// zu berühren.
+fn ensure_ignore_rule_named(gitignore: &Path, project_dir_name: &str) -> HomeResult<()> {
+    let rule = format!("{project_dir_name}/");
     let existing = match std::fs::read_to_string(gitignore) {
         Ok(contents) => contents,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => String::new(),
         Err(error) => return Err(HomeError::io(gitignore, error)),
     };
-    if existing
-        .lines()
-        .any(|line| matches!(line.trim(), ".harw/" | "/.harw/"))
-    {
+    let matches_rule = |line: &str| {
+        let trimmed = line.trim();
+        trimmed == ROOT_GITIGNORE_RULE
+            || trimmed == format!("/{ROOT_GITIGNORE_RULE}")
+            || trimmed == rule
+            || trimmed == format!("/{rule}")
+    };
+    if existing.lines().any(matches_rule) {
         return Ok(());
     }
     let separator = if existing.is_empty() || existing.ends_with('\n') {
@@ -535,7 +557,7 @@ fn ensure_ignore_rule(gitignore: &Path) -> HomeResult<()> {
     } else {
         "\n"
     };
-    let updated = format!("{existing}{separator}{ROOT_GITIGNORE_RULE}\n");
+    let updated = format!("{existing}{separator}{rule}\n");
     write_atomic(
         gitignore,
         updated.as_bytes(),
@@ -871,6 +893,39 @@ mod tests {
         assert_eq!(std::fs::read_to_string(&gitignore)?, "custom\n.harw/\n");
         home.ensure()?;
         assert_eq!(std::fs::read_to_string(&gitignore)?, "custom\n.harw/\n");
+        Ok(())
+    }
+
+    /// #22: eine personalisierte harw trägt ihren eigenen Namen in die
+    /// Gitignore ein, statt eines fest verdrahteten `.harw`, und lässt eine
+    /// bereits vorhandene `.harw/`-Regel unangetastet stehen (ein Projekt
+    /// kann Zustand unter beiden Namen tragen, etwa nach einem
+    /// Namenswechsel). Nutzt den testbaren Kern
+    /// [`ensure_ignore_rule_named`] mit explizitem Namen, statt über
+    /// `set_named_home` den prozessweiten `OnceLock` zu setzen (der würde
+    /// jeden anderen Test dieses Testbinaries mit einer personalisierten
+    /// harw zurücklassen).
+    #[test]
+    fn ensure_ignore_rule_named_writes_the_given_name_and_keeps_a_prior_dot_harw_rule()
+    -> TestResult {
+        let repo = TempDir::new("ensure-named-repo")?;
+        let gitignore = repo.path().join(".gitignore");
+        std::fs::write(&gitignore, ".harw/\n")?;
+
+        ensure_ignore_rule_named(&gitignore, ".mia")?;
+        assert_eq!(
+            std::fs::read_to_string(&gitignore)?,
+            ".harw/\n.mia/\n",
+            "the old rule stays byte-exact, the new name is appended once"
+        );
+        // Idempotent re-run.
+        ensure_ignore_rule_named(&gitignore, ".mia")?;
+        assert_eq!(std::fs::read_to_string(&gitignore)?, ".harw/\n.mia/\n");
+        // A default-named project sees the ".harw/" rule as already present.
+        let other = TempDir::new("ensure-named-repo-default")?;
+        let other_gitignore = other.path().join(".gitignore");
+        ensure_ignore_rule_named(&other_gitignore, ".harw")?;
+        assert_eq!(std::fs::read_to_string(&other_gitignore)?, ".harw/\n");
         Ok(())
     }
 

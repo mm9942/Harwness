@@ -936,10 +936,7 @@ pub async fn delegate_wave(
             // Eine abgelehnte Fortsetzung steht schon als `failed` fest.
             Ok(_) if statuses[position].is_some() => {}
             Ok(_) if contract_results[position].is_err() => {
-                let message = contract_results[position]
-                    .clone()
-                    .err()
-                    .unwrap_or_default();
+                let message = contract_results[position].clone().err().unwrap_or_default();
                 statuses[position] = Some(TargetStatus::Failed(message));
             }
             Ok(reducer) => queue.push_back((position, reducer)),

@@ -394,7 +394,13 @@ impl AgentRoster {
             let always: Vec<&str> = ALWAYS_AVAILABLE_TOOLS
                 .iter()
                 .copied()
-                .filter(|tool| ceiling.tools.admitted.iter().any(|admitted| admitted == tool))
+                .filter(|tool| {
+                    ceiling
+                        .tools
+                        .admitted
+                        .iter()
+                        .any(|admitted| admitted == tool)
+                })
                 .collect();
             if !always.is_empty() {
                 clamped = clamped.with_additional_admitted(&always);
@@ -445,10 +451,13 @@ impl AgentRoster {
     /// Instruktionen) auf.
     fn insert(&mut self, entry: RosterEntry, custom: bool) {
         if custom && let Some(text) = entry.instructions() {
-            self.instructions.insert(entry.name.clone(), text.to_owned());
+            self.instructions
+                .insert(entry.name.clone(), text.to_owned());
         }
-        self.definitions
-            .insert(entry.name.clone(), ExecutableAgentIr::from(entry.ir.as_ref()));
+        self.definitions.insert(
+            entry.name.clone(),
+            ExecutableAgentIr::from(entry.ir.as_ref()),
+        );
         self.entries.insert(entry.name.clone(), entry);
     }
 
@@ -639,7 +648,11 @@ struct Ceiling<'a> {
 /// die lesenden/steuernden Werkzeuge (`job.status/logs/stop/list/wait`)
 /// immer. In jedem Fall nur, was die Basis selbst admittiert.
 fn job_companion_tools<'a>(clamped: &AgentIr, ceiling: &'a AgentIr) -> Vec<&'a str> {
-    let admits_shell = clamped.tools.admitted.iter().any(|tool| tool == "shell.exec");
+    let admits_shell = clamped
+        .tools
+        .admitted
+        .iter()
+        .any(|tool| tool == "shell.exec");
     ceiling
         .tools
         .admitted
@@ -767,7 +780,11 @@ fn entry_for(
         tools,
         read_only: !(writes_by_tool || writes_by_manifest),
         max_depth: ir.spawn.max_depth,
-        budget_tokens: ir.spawn.budget.as_ref().and_then(|budget| budget.max_tokens),
+        budget_tokens: ir
+            .spawn
+            .budget
+            .as_ref()
+            .and_then(|budget| budget.max_tokens),
         source,
         ir,
     }
@@ -960,10 +977,7 @@ specialization = "web-scout"
             .ok_or(TestError::Missing("web-scout"))?;
         assert_eq!(entry.base_role, role_names::EXPLORER);
         assert_eq!(entry.profile, RegistryProfile::ReadOnlyExplore);
-        assert_eq!(
-            entry.tools,
-            builtin[role_names::EXPLORER].tools.admitted
-        );
+        assert_eq!(entry.tools, builtin[role_names::EXPLORER].tools.admitted);
         Ok(())
     }
 
@@ -1146,17 +1160,31 @@ specialization = "fake-lead"
             .entry("note-taker")
             .ok_or(TestError::Missing("note-taker"))?;
         assert_eq!(entry.instructions(), Some("Schreibe knappe Notizen."));
-        assert_eq!(roster.instructions("note-taker"), Some("Schreibe knappe Notizen."));
+        assert_eq!(
+            roster.instructions("note-taker"),
+            Some("Schreibe knappe Notizen.")
+        );
         assert_eq!(entry.ir.tools.admitted, entry.tools);
-        assert!(!entry.ir.permissions.shell, "shell.exec liegt über der Decke");
+        assert!(
+            !entry.ir.permissions.shell,
+            "shell.exec liegt über der Decke"
+        );
         assert!(entry.ir.verify_snapshot());
         assert_eq!(
-            roster.definitions().get("note-taker").map(ExecutableAgentIr::snapshot_id),
+            roster
+                .definitions()
+                .get("note-taker")
+                .map(ExecutableAgentIr::snapshot_id),
             Some(ExecutableAgentIr::from(entry.ir.as_ref()).snapshot_id())
         );
         let wiring = roster.custom_wiring();
-        let wired = wiring.get("note-taker").ok_or(TestError::Missing("wiring"))?;
-        assert_eq!(wired.instructions.as_deref(), Some("Schreibe knappe Notizen."));
+        let wired = wiring
+            .get("note-taker")
+            .ok_or(TestError::Missing("wiring"))?;
+        assert_eq!(
+            wired.instructions.as_deref(),
+            Some("Schreibe knappe Notizen.")
+        );
         assert!(entry.profile_summary().contains("read-only"));
         Ok(())
     }
@@ -1186,9 +1214,11 @@ specialization = "fake-lead"
         assert!(
             RegistryProfile::NoTools
                 .required_permissions()
-                .is_subset_of(&profile_for_role(GENERIC_WORKER_BASE)
-                    .ok_or(TestError::Missing("analyst profile"))?
-                    .required_permissions())
+                .is_subset_of(
+                    &profile_for_role(GENERIC_WORKER_BASE)
+                        .ok_or(TestError::Missing("analyst profile"))?
+                        .required_permissions()
+                )
         );
 
         let reader = builtin
@@ -1243,13 +1273,22 @@ specialization = "fake-lead"
                 );
             }
             if manifest.filesystem.write {
-                assert!(granted.contains(Permission::WriteWorkspace), "{name}: write");
+                assert!(
+                    granted.contains(Permission::WriteWorkspace),
+                    "{name}: write"
+                );
             }
             if manifest.shell || manifest.host {
-                assert!(granted.contains(Permission::ExecuteProcess), "{name}: shell/host");
+                assert!(
+                    granted.contains(Permission::ExecuteProcess),
+                    "{name}: shell/host"
+                );
             }
             if manifest.network.mode != NetworkMode::Off {
-                assert!(granted.contains(Permission::NetworkAccess), "{name}: network");
+                assert!(
+                    granted.contains(Permission::NetworkAccess),
+                    "{name}: network"
+                );
             }
             if manifest.filesystem.read {
                 assert!(

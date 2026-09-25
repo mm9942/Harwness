@@ -349,18 +349,17 @@ impl BuiltinCeilings {
                     .iter()
                     .any(|tool| GENERIC_WORKER_WRITE_TOOLS.contains(&tool.as_str()));
                 if writes {
-                    rights
-                        .tools
-                        .extend(GENERIC_WORKER_WRITE_TOOLS.iter().map(|tool| (*tool).to_owned()));
+                    rights.tools.extend(
+                        GENERIC_WORKER_WRITE_TOOLS
+                            .iter()
+                            .map(|tool| (*tool).to_owned()),
+                    );
                     rights.classes = classes_of(&rights.tools);
                 }
-                rights.max_depth = Some(
-                    rights
-                        .max_depth
-                        .map_or(GENERIC_WORKER_MAX_DEPTH, |depth| {
-                            depth.min(GENERIC_WORKER_MAX_DEPTH)
-                        }),
-                );
+                rights.max_depth =
+                    Some(rights.max_depth.map_or(GENERIC_WORKER_MAX_DEPTH, |depth| {
+                        depth.min(GENERIC_WORKER_MAX_DEPTH)
+                    }));
                 Some(BaseCeiling {
                     base_role: GENERIC_WORKER_BASE.to_owned(),
                     reason: if writes {
@@ -391,10 +390,12 @@ impl BuiltinCeilings {
                 base_role: USER_INTERFACE_BASE.to_owned(),
                 reason: "the user's own agent: every catalog tool, runtime flags narrow".to_owned(),
                 rights: RightsSet::ceiling(
-                    capability_catalog::CATALOG.iter().filter_map(|entry| match entry.pattern {
-                        capability_catalog::ToolPattern::Exact(tool) => Some(tool.to_owned()),
-                        capability_catalog::ToolPattern::Prefix(_) => None,
-                    }),
+                    capability_catalog::CATALOG
+                        .iter()
+                        .filter_map(|entry| match entry.pattern {
+                            capability_catalog::ToolPattern::Exact(tool) => Some(tool.to_owned()),
+                            capability_catalog::ToolPattern::Prefix(_) => None,
+                        }),
                     None,
                     None,
                     None,
@@ -451,7 +452,11 @@ mod tests {
 
     #[test]
     fn test_handoffs_to_declared_targets_are_exempt() {
-        let claimed = set(&["transfer_to_explorer", "transfer_to_executor"], None, None);
+        let claimed = set(
+            &["transfer_to_explorer", "transfer_to_executor"],
+            None,
+            None,
+        );
         let limit = set(&[], None, None);
         let targets: BTreeSet<String> = ["explorer".to_owned()].into();
         let delta = delta(&claimed, &limit, &targets);
@@ -462,7 +467,9 @@ mod tests {
     #[test]
     fn test_generic_worker_ceiling_is_the_analyst() -> Result<(), CompileError> {
         let ceilings = BuiltinCeilings::load(time::OffsetDateTime::UNIX_EPOCH)?;
-        let analyst = ceilings.role("analyst").ok_or(CompileError::Other("analyst".into()))?;
+        let analyst = ceilings
+            .role("analyst")
+            .ok_or(CompileError::Other("analyst".into()))?;
         let ceiling = ceilings
             .ceiling_for(analyst)
             .ok_or(CompileError::Other("ceiling".into()))?;

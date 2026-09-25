@@ -74,7 +74,8 @@ fn compile_one(source: &str, target: &str) -> Result<AgentIr, Diagnostics> {
 }
 
 fn compile(source: &str, target: &str) -> TestResult<AgentIr> {
-    compile_one(source, target).map_err(|diagnostics| TestError::Unexpected(diagnostics.to_string()))
+    compile_one(source, target)
+        .map_err(|diagnostics| TestError::Unexpected(diagnostics.to_string()))
 }
 
 fn pair() -> TestResult<(AgentIr, AgentIr)> {
@@ -90,9 +91,19 @@ fn test_clamped_ir_keeps_only_what_both_sides_allow() -> TestResult {
     let clamped = child.clamped_to(&ceiling);
 
     assert_eq!(clamped.tools.admitted, ["fs.read", "web.fetch"]);
-    assert!(clamped.tools.forbidden.iter().any(|tool| tool == "shell.exec"));
+    assert!(
+        clamped
+            .tools
+            .forbidden
+            .iter()
+            .any(|tool| tool == "shell.exec")
+    );
     assert_eq!(clamped.spawn.max_depth, Some(1));
-    let budget = clamped.spawn.budget.clone().ok_or(TestError::Missing("budget"))?;
+    let budget = clamped
+        .spawn
+        .budget
+        .clone()
+        .ok_or(TestError::Missing("budget"))?;
     assert_eq!(budget.max_tokens, Some(1000));
     assert_eq!(budget.max_tool_calls, Some(7));
     assert_eq!(budget.effort_cap, Some(Effort::Medium));
@@ -106,7 +117,10 @@ fn test_clamped_ir_keeps_only_what_both_sides_allow() -> TestResult {
     assert_eq!(clamped.permissions.network.mode, NetworkMode::Allowlist);
     assert_eq!(clamped.permissions.tools, ["fs.read", "web.fetch"]);
     assert_eq!(clamped.permissions.spawn.max_depth, 1);
-    assert!(clamped.verify_snapshot(), "the snapshot covers the clamped IR");
+    assert!(
+        clamped.verify_snapshot(),
+        "the snapshot covers the clamped IR"
+    );
     assert_ne!(clamped.snapshot, child.snapshot);
 
     // Identity and descriptive sections stay the child's.
@@ -123,7 +137,9 @@ fn test_clamped_ir_never_widens_either_side() -> TestResult {
             assert!(child.permissions.tools.contains(tool), "{tool}");
             assert!(ceiling.permissions.tools.contains(tool), "{tool}");
         }
-        assert!(!clamped.permissions.shell || (child.permissions.shell && ceiling.permissions.shell));
+        assert!(
+            !clamped.permissions.shell || (child.permissions.shell && ceiling.permissions.shell)
+        );
         assert!(
             !clamped.permissions.filesystem.write
                 || (child.permissions.filesystem.write && ceiling.permissions.filesystem.write)
@@ -168,7 +184,9 @@ fn test_clamped_ir_view_equals_the_legacy_clamp() -> TestResult {
         "extra_allowed admits a tool the child itself admits"
     );
 
-    let capped = child.with_max_depth_at_most(0).with_additional_admitted(&["fs.grep"]);
+    let capped = child
+        .with_max_depth_at_most(0)
+        .with_additional_admitted(&["fs.grep"]);
     assert_eq!(capped.spawn.max_depth, Some(0));
     assert!(capped.tools.admitted.iter().any(|tool| tool == "fs.grep"));
     assert!(capped.verify_snapshot());
@@ -198,14 +216,22 @@ fn test_known_validators_lower_and_unknown_ones_are_rejected() -> TestResult {
         "[return]\nvalidators = [\"redact.secrets\"]\n\n[lifecycle]",
     );
     let diagnostics = match compile_one(&unknown, "acme.agent.clamp-child@1") {
-        Ok(_) => return Err(TestError::Unexpected("an unknown validator lowered".to_owned())),
+        Ok(_) => {
+            return Err(TestError::Unexpected(
+                "an unknown validator lowered".to_owned(),
+            ));
+        }
         Err(diagnostics) => diagnostics,
     };
     let diagnostic = diagnostics
         .iter()
         .find(|diagnostic| diagnostic.code == "HARW-RETURN-002")
         .ok_or(TestError::Missing("HARW-RETURN-002"))?;
-    assert!(diagnostic.message.contains("unknown validator"), "{}", diagnostic.message);
+    assert!(
+        diagnostic.message.contains("unknown validator"),
+        "{}",
+        diagnostic.message
+    );
     assert_eq!(diagnostic.path.as_deref(), Some("return.validators[0]"));
     let rendered = diagnostics.to_string();
     assert!(rendered.contains("definition.toml"), "{rendered}");

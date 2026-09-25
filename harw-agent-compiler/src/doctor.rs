@@ -80,7 +80,11 @@ pub fn run_doctor(env: &CompilerEnv, probe: &dyn RunnerProbe) -> Vec<DoctorCheck
     checks.push(match &record {
         Ok(Some(record)) => check(
             "install record",
-            if record.version == HARW_VERSION { DoctorStatus::Ok } else { DoctorStatus::Warn },
+            if record.version == HARW_VERSION {
+                DoctorStatus::Ok
+            } else {
+                DoctorStatus::Warn
+            },
             format!(
                 "{} (harw {}, {}, sources {})",
                 env.home.join(crate::env::INSTALL_RECORD_FILE).display(),
@@ -98,9 +102,17 @@ pub fn run_doctor(env: &CompilerEnv, probe: &dyn RunnerProbe) -> Vec<DoctorCheck
             "install record",
             DoctorStatus::Warn,
             "none (harw was not installed with `make install`)".to_owned(),
-            Some("run `make install` in the harw sources, or pass `--harw-src` to `--native` builds".to_owned()),
+            Some(
+                "run `make install` in the harw sources, or pass `--harw-src` to `--native` builds"
+                    .to_owned(),
+            ),
         ),
-        Err(error) => check("install record", DoctorStatus::Warn, error.to_string(), None),
+        Err(error) => check(
+            "install record",
+            DoctorStatus::Warn,
+            error.to_string(),
+            None,
+        ),
     });
 
     match locate_runner(env, None, &env.host_target) {
@@ -138,7 +150,12 @@ pub fn run_doctor(env: &CompilerEnv, probe: &dyn RunnerProbe) -> Vec<DoctorCheck
     }
 
     checks.push(match find_cargo(env) {
-        Ok(cargo) => check("native: cargo", DoctorStatus::Ok, cargo.display().to_string(), None),
+        Ok(cargo) => check(
+            "native: cargo",
+            DoctorStatus::Ok,
+            cargo.display().to_string(),
+            None,
+        ),
         Err(error) => check(
             "native: cargo",
             DoctorStatus::Info,
@@ -205,7 +222,11 @@ pub fn run_doctor(env: &CompilerEnv, probe: &dyn RunnerProbe) -> Vec<DoctorCheck
     checks.push(match auto_build_state(env) {
         Some(state) => check(
             "UIA auto-build",
-            if state.status == "built" { DoctorStatus::Ok } else { DoctorStatus::Warn },
+            if state.status == "built" {
+                DoctorStatus::Ok
+            } else {
+                DoctorStatus::Warn
+            },
             format!(
                 "{} `{}` ({}){}",
                 state.status,
@@ -263,7 +284,10 @@ mod tests {
         assert!(!on_path(&env, Path::new("/h/bin")));
         env.path_var = Some(std::ffi::OsString::from("/usr/bin:/h/bin"));
         assert!(on_path(&env, Path::new("/h/bin")));
-        assert_eq!(path_line(Path::new("/h/bin")), "export PATH=\"/h/bin:$PATH\"");
+        assert_eq!(
+            path_line(Path::new("/h/bin")),
+            "export PATH=\"/h/bin:$PATH\""
+        );
     }
 
     #[test]

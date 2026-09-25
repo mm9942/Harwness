@@ -226,7 +226,10 @@ mod tests {
             assert!(!entry.example.is_empty() && !entry.fix.is_empty());
         }
         for entry in CATALOG {
-            assert!(!entry.code.starts_with("HARW-BUILD-"), "DSL defines no BUILD codes");
+            assert!(
+                !entry.code.starts_with("HARW-BUILD-"),
+                "DSL defines no BUILD codes"
+            );
         }
     }
 

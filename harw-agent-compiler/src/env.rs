@@ -124,7 +124,8 @@ impl InstallRecord {
         let path = home.join(INSTALL_RECORD_FILE);
         let text = toml::to_string(self)
             .map_err(|error| CompileError::Other(format!("serialize install record: {error}")))?;
-        std::fs::write(&path, text).map_err(CompileError::io(format!("write {}", path.display())))?;
+        std::fs::write(&path, text)
+            .map_err(CompileError::io(format!("write {}", path.display())))?;
         Ok(path)
     }
 }

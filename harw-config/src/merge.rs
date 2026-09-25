@@ -1648,6 +1648,41 @@ fn merge_shell_limits(
     }
 }
 
+// `[agent_compiler]` (#22 Welle 2B) — alle drei Felder `ProfileReplaces`.
+fn merge_agent_compiler(
+    trusted: &mut HarnessConfig,
+    incoming: crate::harness_config::AgentCompilerToml,
+    raw: &toml::Value,
+    role: LayerRole,
+    layer_path: &Path,
+) {
+    let present = |field: &str| field_present(raw, &["agent_compiler", field]);
+    profile_replaces(
+        &mut trusted.agent_compiler.cache_max_bytes,
+        incoming.cache_max_bytes,
+        present("cache_max_bytes"),
+        role,
+        "agent_compiler.cache_max_bytes",
+        layer_path,
+    );
+    profile_replaces(
+        &mut trusted.agent_compiler.keep_versions,
+        incoming.keep_versions,
+        present("keep_versions"),
+        role,
+        "agent_compiler.keep_versions",
+        layer_path,
+    );
+    profile_replaces(
+        &mut trusted.agent_compiler.auto_build_uia,
+        incoming.auto_build_uia,
+        present("auto_build_uia"),
+        role,
+        "agent_compiler.auto_build_uia",
+        layer_path,
+    );
+}
+
 // `[reasoning]` (Abschnitt 1.15) — alle sechs Felder `ProfileReplaces`.
 fn merge_reasoning(
     trusted: &mut HarnessConfig,
@@ -1905,6 +1940,8 @@ pub fn merge_layer_into(
     merge_agent_limits(trusted, incoming.agents, raw, role, layer_path, &mut out);
     // Runde 5, Teil N: `[shell]` — Obergrenze für `shell.exec`-Zeitlimits.
     merge_shell_limits(trusted, incoming.shell, raw, role, layer_path, &mut out);
+    // #22 Welle 2B: `[agent_compiler]` — Build-Cache und Versionen.
+    merge_agent_compiler(trusted, incoming.agent_compiler, raw, role, layer_path);
 
     // `base_dir`: `#[serde(skip)]`, kein TOML-Feld, kein `FIELD_TABLE`-
     // Eintrag (Abschnitt 1.1, "89. Zeile"). Reine Buchführung, die dem

@@ -85,10 +85,7 @@ impl AgentCompilerSettings {
             let Some(section) = table.get("agent_compiler").and_then(toml::Value::as_table) else {
                 continue;
             };
-            if let Some(value) = section
-                .get("auto_build_uia")
-                .and_then(toml::Value::as_bool)
-            {
+            if let Some(value) = section.get("auto_build_uia").and_then(toml::Value::as_bool) {
                 settings.auto_build_uia = Some(value);
             }
             if let Some(value) = section
@@ -148,8 +145,10 @@ impl CacheStamp {
     pub fn write(&self, dir: &Path) -> Result<(), CompileError> {
         let bytes = serde_json::to_vec_pretty(self)
             .map_err(|error| CompileError::Other(format!("serialize cache stamp: {error}")))?;
-        std::fs::write(dir.join(STAMP_FILE), bytes)
-            .map_err(CompileError::io(format!("write {}", dir.join(STAMP_FILE).display())))
+        std::fs::write(dir.join(STAMP_FILE), bytes).map_err(CompileError::io(format!(
+            "write {}",
+            dir.join(STAMP_FILE).display()
+        )))
     }
 
     fn read(dir: &Path) -> Option<Self> {
@@ -265,12 +264,18 @@ fn crate_dirs(root: &Path) -> Vec<CrateDir> {
         })
         .collect();
     // Oldest first, path as tie breaker.
-    dirs.sort_by(|a, b| a.last_used.cmp(&b.last_used).then_with(|| a.path.cmp(&b.path)));
+    dirs.sort_by(|a, b| {
+        a.last_used
+            .cmp(&b.last_used)
+            .then_with(|| a.path.cmp(&b.path))
+    });
     dirs
 }
 
 fn is_protected(path: &Path, protect: &[PathBuf]) -> bool {
-    protect.iter().any(|protected| protected == path || protected.starts_with(path))
+    protect
+        .iter()
+        .any(|protected| protected == path || protected.starts_with(path))
 }
 
 /// Removes a path (unless `dry_run`) and records it.
@@ -394,7 +399,8 @@ pub fn store_blobs(
 ) -> Result<Vec<String>, CompileError> {
     let dir = root.join(BLOBS_DIR);
     std::fs::create_dir_all(&dir).map_err(CompileError::io(format!("create {}", dir.display())))?;
-    let blob_kind = harw_agent_artifact::PayloadKind::Other(harw_agent_artifact::bundle::BLOB_KIND.to_owned());
+    let blob_kind =
+        harw_agent_artifact::PayloadKind::Other(harw_agent_artifact::bundle::BLOB_KIND.to_owned());
     let mut hashes = Vec::new();
     for payload in artifact.payloads() {
         if *payload.kind() != blob_kind {
@@ -542,7 +548,12 @@ mod tests {
 
     type TestResult = Result<(), Box<dyn std::error::Error>>;
 
-    fn crate_dir(root: &Path, name: &str, last_used: u64, bytes: usize) -> Result<PathBuf, Box<dyn std::error::Error>> {
+    fn crate_dir(
+        root: &Path,
+        name: &str,
+        last_used: u64,
+        bytes: usize,
+    ) -> Result<PathBuf, Box<dyn std::error::Error>> {
         let dir = root.join(name);
         std::fs::create_dir_all(&dir)?;
         std::fs::write(dir.join("agent.harwa"), vec![0_u8; bytes])?;
@@ -585,7 +596,10 @@ mod tests {
         std::fs::create_dir_all(target_release.join("deps"))?;
         let output = target_release.join("ec");
         std::fs::write(&output, vec![1_u8; 2000])?;
-        std::fs::write(target_release.join("deps").join("libx.rlib"), vec![2_u8; 2000])?;
+        std::fs::write(
+            target_release.join("deps").join("libx.rlib"),
+            vec![2_u8; 2000],
+        )?;
         // An `-o` output outside the cache.
         let elsewhere = tempfile::tempdir()?;
         let user_output = elsewhere.path().join("ec");
@@ -603,8 +617,16 @@ mod tests {
         assert!(output.exists(), "the current build's binary survives");
         assert!(!other.exists());
         assert!(!target_release.join("deps").exists(), "target cleaned");
-        assert!(user_output.exists(), "outputs outside the cache are untouched");
-        assert!(report.removed.iter().any(|removal| removal.reason == "target-clean"));
+        assert!(
+            user_output.exists(),
+            "outputs outside the cache are untouched"
+        );
+        assert!(
+            report
+                .removed
+                .iter()
+                .any(|removal| removal.reason == "target-clean")
+        );
         Ok(())
     }
 
@@ -705,7 +727,10 @@ mod tests {
             home.path().join("config.toml"),
             "[agent_compiler]\ncache_max_bytes = 100\nkeep_versions = 2\n",
         )?;
-        std::fs::write(profile.join("config.toml"), "[agent_compiler]\ncache_max_bytes = 200\n")?;
+        std::fs::write(
+            profile.join("config.toml"),
+            "[agent_compiler]\ncache_max_bytes = 200\n",
+        )?;
         let mut env = CompilerEnv::isolated(home.path().to_path_buf(), home.path().to_path_buf());
         env.layers.push(profile);
         let settings = AgentCompilerSettings::load(&env);

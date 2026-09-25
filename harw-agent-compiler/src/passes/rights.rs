@@ -125,14 +125,20 @@ fn report(
         diagnostics.push(unit.diagnostic(
             code,
             "spawn.max_depth",
-            format!("`{}` asks for max_depth {claimed}; {limit} allows {bound}", unit.name),
+            format!(
+                "`{}` asks for max_depth {claimed}; {limit} allows {bound}",
+                unit.name
+            ),
         ));
     }
     if let Some((claimed, bound)) = delta.budget {
         diagnostics.push(unit.diagnostic(
             code,
             "spawn.budget.max_tokens",
-            format!("`{}` asks for max_tokens {claimed}; {limit} allows {bound}", unit.name),
+            format!(
+                "`{}` asks for max_tokens {claimed}; {limit} allows {bound}",
+                unit.name
+            ),
         ));
     }
     if let Some((claimed, bound)) = delta.effort {

@@ -115,7 +115,12 @@ pub struct CompileUnit {
 impl CompileUnit {
     /// A unit for a freshly lowered IR.
     #[must_use]
-    pub fn new(name: String, ir: AgentIr, dir: Option<PathBuf>, sources: Arc<Vec<SourceFile>>) -> Self {
+    pub fn new(
+        name: String,
+        ir: AgentIr,
+        dir: Option<PathBuf>,
+        sources: Arc<Vec<SourceFile>>,
+    ) -> Self {
         let source_snapshot = ir.compute_snapshot().digest;
         Self {
             name,
@@ -193,7 +198,8 @@ impl CompileUnit {
 
     /// Adds or replaces a file of this agent.
     pub fn put_file(&mut self, kind: &str, path: String, bytes: Vec<u8>) {
-        self.files.retain(|file| !(file.kind == kind && file.path == path));
+        self.files
+            .retain(|file| !(file.kind == kind && file.path == path));
         self.files.push(UnitFile {
             kind: kind.to_owned(),
             path,
@@ -233,4 +239,3 @@ impl CompileUnit {
         out
     }
 }
-

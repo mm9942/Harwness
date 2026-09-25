@@ -153,7 +153,10 @@ pub fn locate_runner(
         .cloned()
         .ok_or_else(|| CompileError::RunnerNotFound {
             target: target.to_owned(),
-            searched: candidates.into_iter().map(|candidate| candidate.path).collect(),
+            searched: candidates
+                .into_iter()
+                .map(|candidate| candidate.path)
+                .collect(),
         })
 }
 
@@ -394,7 +397,10 @@ mod tests {
         let capabilities = RunnerCapabilities::parse(&text)?;
         assert!(
             capabilities
-                .problems(&["cli".to_owned()], &["core".to_owned(), "tool-fs".to_owned()])
+                .problems(
+                    &["cli".to_owned()],
+                    &["core".to_owned(), "tool-fs".to_owned()]
+                )
                 .is_empty()
         );
         let problems = capabilities.problems(&["http".to_owned()], &["tool-web".to_owned()]);

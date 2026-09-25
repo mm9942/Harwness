@@ -261,9 +261,12 @@ pub fn take_auto_build_notice(env: &CompilerEnv) -> Option<String> {
     }
     state.notified = true;
     save_state(env, &state);
-    state
-        .message
-        .map(|message| format!("automatic build of the UIA `{}` failed: {message}", state.name))
+    state.message.map(|message| {
+        format!(
+            "automatic build of the UIA `{}` failed: {message}",
+            state.name
+        )
+    })
 }
 
 /// Size and modification time of a runner (a cheap change detector).
@@ -327,7 +330,10 @@ pub fn auto_build_uia(env: &CompilerEnv, probe: &dyn RunnerProbe) -> AutoBuildOu
         Err(error) => return fail("", error.to_string()),
     };
     let Some(entry) = find_uia(&sources, &uia) else {
-        return fail("", format!("the active UIA `{uia}` is no user-interface definition in any layer"));
+        return fail(
+            "",
+            format!("the active UIA `{uia}` is no user-interface definition in any layer"),
+        );
     };
     let explicit = explicit_binary(sources.file(&entry.label));
     let name = auto_binary_name(explicit.name.as_deref(), &entry.specialization);
@@ -413,7 +419,10 @@ mod tests {
                 target: crate::env::host_target(),
                 artifact_formats: vec![harw_agent_artifact::FORMAT_VERSION],
                 ir_schema: harw_agent_dsl::AGENT_IR_SCHEMA.to_owned(),
-                interfaces: Interface::ALL.iter().map(|i| i.as_str().to_owned()).collect(),
+                interfaces: Interface::ALL
+                    .iter()
+                    .map(|i| i.as_str().to_owned())
+                    .collect(),
                 features: harw_registry_defaults::capability_catalog::PROVIDER_FEATURES
                     .iter()
                     .map(|feature| (*feature).to_owned())
@@ -453,14 +462,20 @@ mod tests {
             "active_uia_definition = \"user.agent.mia@1\"\n[agent_compiler]\nauto_build_uia = false\n",
         )?;
         install_runner(&env)?;
-        assert_eq!(auto_build_uia(&env, &FullRunner), AutoBuildOutcome::Disabled);
+        assert_eq!(
+            auto_build_uia(&env, &FullRunner),
+            AutoBuildOutcome::Disabled
+        );
 
         let (_root, env) = setup("")?;
         install_runner(&env)?;
         assert_eq!(auto_build_uia(&env, &FullRunner), AutoBuildOutcome::NoUia);
 
         let (_root, env) = setup("active_uia_definition = \"user.agent.mia@1\"\n")?;
-        assert_eq!(auto_build_uia(&env, &FullRunner), AutoBuildOutcome::NoRunner);
+        assert_eq!(
+            auto_build_uia(&env, &FullRunner),
+            AutoBuildOutcome::NoRunner
+        );
         assert!(auto_build_state(&env).is_none(), "a skip leaves no state");
         Ok(())
     }
@@ -496,7 +511,10 @@ mod tests {
 
     #[test]
     fn test_name_derivation() {
-        assert_eq!(auto_binary_name(None, "terminal-ui"), "harw-uia-terminal-ui");
+        assert_eq!(
+            auto_binary_name(None, "terminal-ui"),
+            "harw-uia-terminal-ui"
+        );
         assert_eq!(auto_binary_name(Some("Mia Bot"), "x"), "mia-bot");
         assert_eq!(native_binary_name(None, "mia"), "harw-mia");
         assert_eq!(native_binary_name(Some("my-harw"), "mia"), "my-harw");
@@ -515,7 +533,10 @@ mod tests {
         );
         let explicit = explicit_binary(Some(&file));
         assert_eq!(explicit.name.as_deref(), Some("mia"));
-        assert_eq!(explicit.interfaces, Some(vec![Interface::Cli, Interface::Mcp]));
+        assert_eq!(
+            explicit.interfaces,
+            Some(vec![Interface::Cli, Interface::Mcp])
+        );
         assert_eq!(explicit.default_interface, None);
         assert_eq!(explicit_binary(None), ExplicitBinary::default());
     }

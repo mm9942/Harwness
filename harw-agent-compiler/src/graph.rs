@@ -8,8 +8,8 @@ use serde::Serialize;
 use crate::compiler::Compiled;
 use crate::discovery::SourceSet;
 use crate::passes::role_label;
-use crate::rights::is_writing;
 use crate::rights::RightsSet;
+use crate::rights::is_writing;
 
 /// Output format.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -204,13 +204,23 @@ pub fn resolution_graph(compiled: &Compiled, sources: &SourceSet) -> Graph {
         previous = Some(step.source.clone());
     }
     let target = unit.ir.id.to_string();
-    graph.node(&target, &target, "definition", &[("layer", "target".to_owned())]);
+    graph.node(
+        &target,
+        &target,
+        "definition",
+        &[("layer", "target".to_owned())],
+    );
     if let Some(from) = previous.filter(|from| from != &target) {
         graph.edge(&from, &target, "extends");
     }
     for (path, op) in own_patches(compiled, sources) {
         let id = format!("patch:{path}");
-        graph.node(&id, &format!("{path} ({op})"), "patch", &[("op", op.clone())]);
+        graph.node(
+            &id,
+            &format!("{path} ({op})"),
+            "patch",
+            &[("op", op.clone())],
+        );
         graph.edge(&id, &target, "patch");
     }
     graph
@@ -341,7 +351,11 @@ fn join<'a>(items: impl Iterator<Item = &'a String>) -> String {
 #[must_use]
 pub fn render(graphs: &[Graph], format: GraphFormat) -> String {
     match format {
-        GraphFormat::Text => graphs.iter().map(render_text).collect::<Vec<_>>().join("\n"),
+        GraphFormat::Text => graphs
+            .iter()
+            .map(render_text)
+            .collect::<Vec<_>>()
+            .join("\n"),
         GraphFormat::Dot => graphs.iter().map(render_dot).collect::<Vec<_>>().join("\n"),
         GraphFormat::Mermaid => graphs
             .iter()
@@ -388,7 +402,9 @@ fn quote(text: &str) -> String {
 fn render_dot(graph: &Graph) -> String {
     let mut out = format!("digraph {} {{\n  rankdir=LR;\n", quote(&graph.title));
     for node in &graph.nodes {
-        let shape = if node.kind == "agent" && node.attrs.get("access").map(String::as_str) == Some("writing") {
+        let shape = if node.kind == "agent"
+            && node.attrs.get("access").map(String::as_str) == Some("writing")
+        {
             "box, style=bold"
         } else {
             "box"
@@ -457,13 +473,19 @@ mod tests {
             "lead",
             "lead",
             "agent",
-            &[("role", "child-orchestrator".to_owned()), ("access", "read-only".to_owned())],
+            &[
+                ("role", "child-orchestrator".to_owned()),
+                ("access", "read-only".to_owned()),
+            ],
         );
         graph.node(
             "reader",
             "reader",
             "agent",
-            &[("depth", "1".to_owned()), ("access", "read-only".to_owned())],
+            &[
+                ("depth", "1".to_owned()),
+                ("access", "read-only".to_owned()),
+            ],
         );
         graph.node(
             "writer",
@@ -480,15 +502,24 @@ mod tests {
     fn test_text_dot_and_mermaid_render_a_small_family() {
         let graphs = [family()];
         let text = render(&graphs, GraphFormat::Text);
-        assert!(text.contains("lead [access=read-only, role=child-orchestrator]"), "{text}");
+        assert!(
+            text.contains("lead [access=read-only, role=child-orchestrator]"),
+            "{text}"
+        );
         assert!(text.contains("└─delegation→ writer"), "{text}");
         let dot = render(&graphs, GraphFormat::Dot);
         assert!(dot.starts_with("digraph \"delegation\" {"), "{dot}");
-        assert!(dot.contains("\"lead\" -> \"writer\" [label=\"delegation\"];"), "{dot}");
+        assert!(
+            dot.contains("\"lead\" -> \"writer\" [label=\"delegation\"];"),
+            "{dot}"
+        );
         assert!(dot.contains("style=bold"), "writers are bold: {dot}");
         let mermaid = render(&graphs, GraphFormat::Mermaid);
         assert!(mermaid.contains("graph LR"), "{mermaid}");
-        assert!(mermaid.contains("nlead -->|\"delegation\"| nreader"), "{mermaid}");
+        assert!(
+            mermaid.contains("nlead -->|\"delegation\"| nreader"),
+            "{mermaid}"
+        );
         let json = render(&graphs, GraphFormat::Json);
         assert!(json.contains("\"from\": \"lead\""), "{json}");
     }

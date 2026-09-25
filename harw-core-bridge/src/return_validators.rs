@@ -120,7 +120,11 @@ fn strip_fence(text: &str) -> &str {
         return text;
     };
     match inner.split_once('\n') {
-        Some((info, body)) if !info.trim_start().starts_with(|c: char| c == '{' || c == '[') => {
+        Some((info, body))
+            if !info
+                .trim_start()
+                .starts_with(|c: char| c == '{' || c == '[') =>
+        {
             body.trim()
         }
         _ => inner.trim(),
@@ -164,7 +168,10 @@ mod tests {
     fn test_json_and_json_object() {
         let json = labels(&["json"]);
         assert_eq!(run_return_validators(&json, "[1, 2]"), Ok(()));
-        assert_eq!(run_return_validators(&json, "```json\n{\"a\": 1}\n```"), Ok(()));
+        assert_eq!(
+            run_return_validators(&json, "```json\n{\"a\": 1}\n```"),
+            Ok(())
+        );
         assert!(run_return_validators(&json, "kein json").is_err());
 
         let object = labels(&["json-object"]);
@@ -183,15 +190,19 @@ mod tests {
     #[test]
     fn test_unknown_validator_fails_closed() {
         let violation = run_return_validators(&labels(&["redact.secrets"]), "x");
-        assert!(violation.is_err_and(|violation| violation.validator == "redact.secrets"
-            && violation.message.contains("unbekannter Validator")));
+        assert!(
+            violation.is_err_and(|violation| violation.validator == "redact.secrets"
+                && violation.message.contains("unbekannter Validator"))
+        );
     }
 
     #[test]
     fn test_violations_never_quote_the_answer() {
         let secret = "GEHEIM-1234 kein json";
         let violation = run_return_validators(&labels(&["json"]), secret);
-        assert!(violation.is_err_and(|violation| !violation.message.contains("GEHEIM")
-            && !violation.to_json().to_string().contains("GEHEIM")));
+        assert!(
+            violation.is_err_and(|violation| !violation.message.contains("GEHEIM")
+                && !violation.to_json().to_string().contains("GEHEIM"))
+        );
     }
 }

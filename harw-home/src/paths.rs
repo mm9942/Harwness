@@ -765,7 +765,10 @@ mod tests {
         let cell = OnceLock::new();
         let first = PathBuf::from("/nonexistent/.mia");
         assert!(set_home_override_in(&cell, first.clone()).is_ok());
-        assert!(set_home_override_in(&cell, first.clone()).is_ok(), "same path again is fine");
+        assert!(
+            set_home_override_in(&cell, first.clone()).is_ok(),
+            "same path again is fine"
+        );
         assert!(set_home_override_in(&cell, PathBuf::from("/nonexistent/.other")).is_err());
         assert_eq!(cell.get(), Some(&first));
     }

@@ -29,7 +29,10 @@ impl RunnerProbe for FullRunner {
             target: harw_agent_compiler::env::host_target(),
             artifact_formats: vec![harw_agent_artifact::FORMAT_VERSION],
             ir_schema: harw_agent_dsl::AGENT_IR_SCHEMA.to_owned(),
-            interfaces: Interface::ALL.iter().map(|i| i.as_str().to_owned()).collect(),
+            interfaces: Interface::ALL
+                .iter()
+                .map(|i| i.as_str().to_owned())
+                .collect(),
             features: harw_registry_defaults::capability_catalog::PROVIDER_FEATURES
                 .iter()
                 .map(|feature| (*feature).to_owned())
@@ -41,7 +44,9 @@ impl RunnerProbe for FullRunner {
 }
 
 /// An isolated harw home with the given definitions under `agents/<name>/`.
-fn home_with(definitions: &[(&str, &str)]) -> Result<(tempfile::TempDir, CompilerEnv), Box<dyn std::error::Error>> {
+fn home_with(
+    definitions: &[(&str, &str)],
+) -> Result<(tempfile::TempDir, CompilerEnv), Box<dyn std::error::Error>> {
     let root = tempfile::tempdir()?;
     let home = root.path().join("home");
     for (name, text) in definitions {
@@ -61,10 +66,17 @@ fn compile(env: &CompilerEnv, name: &str) -> Result<Compiled, CompileError> {
 
 fn diagnostics_of(result: Result<Compiled, CompileError>) -> Result<Vec<String>, String> {
     match result {
-        Ok(compiled) => Ok(compiled.diagnostics.codes().iter().map(|c| (*c).to_owned()).collect()),
-        Err(CompileError::Diagnostics(diagnostics)) => {
-            Ok(diagnostics.codes().iter().map(|c| (*c).to_owned()).collect())
-        }
+        Ok(compiled) => Ok(compiled
+            .diagnostics
+            .codes()
+            .iter()
+            .map(|c| (*c).to_owned())
+            .collect()),
+        Err(CompileError::Diagnostics(diagnostics)) => Ok(diagnostics
+            .codes()
+            .iter()
+            .map(|c| (*c).to_owned())
+            .collect()),
         Err(other) => Err(other.to_string()),
     }
 }
@@ -87,13 +99,20 @@ fn test_evidence_critic_artifact_is_reproducible() -> TestResult {
         },
     )?;
     let second = later.compile_input(&AgentInput::Name("evidence-critic".to_owned()))?;
-    assert_eq!(first.artifact.digest(), second.artifact.digest(), "same input, same digest");
+    assert_eq!(
+        first.artifact.digest(),
+        second.artifact.digest(),
+        "same input, same digest"
+    );
     assert_eq!(first.artifact.to_bytes(), second.artifact.to_bytes());
     // The artifact reads back and carries the snapshot of the compiled IR.
     let parsed = Artifact::from_bytes(&first.artifact.to_bytes())?;
     let ir = harw_agent_compiler::artifact_out::ir_from_artifact(&parsed)?;
     assert!(ir.verify_snapshot());
-    assert!(ir.trace.is_empty(), "no trace (timestamps, paths) in the header");
+    assert!(
+        ir.trace.is_empty(),
+        "no trace (timestamps, paths) in the header"
+    );
     Ok(())
 }
 
@@ -106,7 +125,11 @@ fn test_resolve_skills_embeds_and_hashes() -> TestResult {
     let bundle = Bundle::from_artifact(&compiled.artifact)?;
     let root = bundle.header.root.clone();
     let skill = bundle
-        .file(&compiled.artifact, &root, "skills/evidence-quality-review/instructions.md")
+        .file(
+            &compiled.artifact,
+            &root,
+            "skills/evidence-quality-review/instructions.md",
+        )
         .ok_or("skill in the pool")?;
     let expected = harw_agent_artifact::ArtifactDigest::of(skill).to_hex();
     assert_eq!(entry.hash.as_deref(), Some(expected.as_str()));
@@ -138,9 +161,18 @@ fn test_rights_check_rejects_widening_with_a_located_error() -> TestResult {
     assert_eq!(widening.len(), 2, "shell.exec and the depth: {diagnostics}");
     let rendered = render_diagnostics(diagnostics.as_slice(), &compiler.sources().files);
     assert!(rendered.contains("error[HARW-BUILD-004]"), "{rendered}");
-    assert!(rendered.contains("definition.toml:11:"), "file:line of the tool: {rendered}");
-    assert!(rendered.contains("\"shell.exec\","), "the excerpt: {rendered}");
-    assert!(rendered.contains("| ") && rendered.contains('^'), "the caret: {rendered}");
+    assert!(
+        rendered.contains("definition.toml:11:"),
+        "file:line of the tool: {rendered}"
+    );
+    assert!(
+        rendered.contains("\"shell.exec\","),
+        "the excerpt: {rendered}"
+    );
+    assert!(
+        rendered.contains("| ") && rendered.contains('^'),
+        "the caret: {rendered}"
+    );
     Ok(())
 }
 
@@ -176,7 +208,10 @@ fn test_validate_roles_reachable_prune_and_models() -> TestResult {
 
 #[test]
 fn test_prune_drops_spawn_tools_of_a_worker() -> TestResult {
-    let text = worker("pruner", "[tools]\nadmitted = [\"fs.read\", \"agent.status\"]\n");
+    let text = worker(
+        "pruner",
+        "[tools]\nadmitted = [\"fs.read\", \"agent.status\"]\n",
+    );
     let (_root, env) = home_with(&[("pruner", &text)])?;
     // agent.status is outside the analyst ceiling too; the rights check
     // reports it first. The prune pass alone:
@@ -199,27 +234,46 @@ const LEAD: &str = "schema = \"harwness.agent/v1\"\nid = \"acme.agent.lead@1\"\n
 
 #[test]
 fn test_child_closure_embeds_the_family_and_graphs_render() -> TestResult {
-    let reader = worker("reader", "[tools]\nadmitted = [\"fs.read\"]\n\n[spawn]\nmax_depth = 0\n");
+    let reader = worker(
+        "reader",
+        "[tools]\nadmitted = [\"fs.read\"]\n\n[spawn]\nmax_depth = 0\n",
+    );
     let writer = worker(
         "writer",
         "[tools]\nadmitted = [\"fs.read\", \"fs.write\"]\n\n[spawn]\nmax_depth = 0\n",
     );
     let (_root, env) = home_with(&[("lead", LEAD), ("reader", &reader), ("writer", &writer)])?;
     let compiled = compile(&env, "lead")?;
-    let names: Vec<&str> = compiled.unit.children.iter().map(|c| c.name.as_str()).collect();
+    let names: Vec<&str> = compiled
+        .unit
+        .children
+        .iter()
+        .map(|c| c.name.as_str())
+        .collect();
     assert_eq!(names, ["reader", "writer"]);
     assert!(compiled.unit.children[0].read_only);
     assert!(!compiled.unit.children[1].read_only);
     let bundle = Bundle::from_artifact(&compiled.artifact)?;
-    assert_eq!(bundle.agents.len(), 3, "root plus two children, one entry each");
-    let writer = bundle.agents.get("acme.agent.writer@1").ok_or("writer entry")?;
+    assert_eq!(
+        bundle.agents.len(),
+        3,
+        "root plus two children, one entry each"
+    );
+    let writer = bundle
+        .agents
+        .get("acme.agent.writer@1")
+        .ok_or("writer entry")?;
     assert_eq!(
         bundle.header.agents["acme.agent.writer@1"].snapshot,
         compiled.unit.children[1].snapshot
     );
     assert!(writer.children.is_empty());
     let root = bundle.root().ok_or("root entry")?;
-    let links: Vec<&str> = root.children.iter().map(|child| child.name.as_str()).collect();
+    let links: Vec<&str> = root
+        .children
+        .iter()
+        .map(|child| child.name.as_str())
+        .collect();
     assert_eq!(links, ["reader", "writer"]);
 
     let graph = delegation_graph(&[&compiled]);
@@ -228,9 +282,15 @@ fn test_child_closure_embeds_the_family_and_graphs_render() -> TestResult {
     let dot = render(std::slice::from_ref(&graph), GraphFormat::Dot);
     assert!(dot.contains("\"lead\" -> \"reader\""), "{dot}");
     let mermaid = render(std::slice::from_ref(&graph), GraphFormat::Mermaid);
-    assert!(mermaid.contains("nlead -->|\"delegation\"| nwriter"), "{mermaid}");
+    assert!(
+        mermaid.contains("nlead -->|\"delegation\"| nwriter"),
+        "{mermaid}"
+    );
     let rights = render(&[rights_graph(&compiled)], GraphFormat::Text);
-    assert!(rights.contains("base role analysis-orchestrator"), "{rights}");
+    assert!(
+        rights.contains("base role analysis-orchestrator"),
+        "{rights}"
+    );
     Ok(())
 }
 
@@ -286,8 +346,14 @@ fn test_build_install_versions_use_and_inspect() -> TestResult {
     let output = run_command(&mut ctx, AgentCommand::Build(args.clone()));
     assert_eq!(output.exit_code, 0, "{}", output.text);
     let installed = env.bin_dir().join("evidence-critic");
-    assert!(installed.is_file(), "default install path ~/.harw/bin/<name>");
-    assert!(out_dir.path().join("evidence-critic").is_file(), "-o copies as well");
+    assert!(
+        installed.is_file(),
+        "default install path ~/.harw/bin/<name>"
+    );
+    assert!(
+        out_dir.path().join("evidence-critic").is_file(),
+        "-o copies as well"
+    );
 
     // A second build with other interfaces is another version.
     let mut second = args;
@@ -322,9 +388,20 @@ fn test_build_install_versions_use_and_inspect() -> TestResult {
         },
     );
     assert_eq!(output.exit_code, 0, "{}", output.text);
-    assert!(output.text.contains("harwness.agent.evidence-critic@1"), "{}", output.text);
-    assert!(output.text.contains("evidence-quality-review"), "{}", output.text);
-    assert_eq!(output.json["skills"][0]["verified"], serde_json::json!(true));
+    assert!(
+        output.text.contains("harwness.agent.evidence-critic@1"),
+        "{}",
+        output.text
+    );
+    assert!(
+        output.text.contains("evidence-quality-review"),
+        "{}",
+        output.text
+    );
+    assert_eq!(
+        output.json["skills"][0]["verified"],
+        serde_json::json!(true)
+    );
     assert_eq!(output.json["container"], serde_json::json!("binary"));
     Ok(())
 }
@@ -363,10 +440,19 @@ fn test_check_explain_and_fmt_commands() -> TestResult {
         case_runner: &EchoStub,
         progress: &mut progress,
     };
-    let output = run_command(&mut ctx, AgentCommand::Check { targets: vec!["b".to_owned()] });
+    let output = run_command(
+        &mut ctx,
+        AgentCommand::Check {
+            targets: vec!["b".to_owned()],
+        },
+    );
     assert_eq!(output.exit_code, 1);
     assert!(output.text.contains("HARW-TOOL-003"), "{}", output.text);
-    assert!(output.text.contains("definition.toml:8:"), "{}", output.text);
+    assert!(
+        output.text.contains("definition.toml:8:"),
+        "{}",
+        output.text
+    );
 
     let output = run_command(
         &mut ctx,
@@ -406,7 +492,11 @@ fn test_check_explain_and_fmt_commands() -> TestResult {
             check: true,
         },
     );
-    assert_eq!(output.exit_code, 0, "formatted files pass --check: {}", output.text);
+    assert_eq!(
+        output.exit_code, 0,
+        "formatted files pass --check: {}",
+        output.text
+    );
     assert_eq!(std::fs::read_to_string(&path)?, once);
     Ok(())
 }
@@ -450,7 +540,10 @@ fn test_children_sharing_a_skill_store_it_once() -> TestResult {
     let text = report.text();
     assert!(text.contains("einzigartig"), "{text}");
     assert!(text.contains("gespart"), "{text}");
-    assert!(text.contains("skill skills/evidence-quality-review/instructions.md"), "{text}");
+    assert!(
+        text.contains("skill skills/evidence-quality-review/instructions.md"),
+        "{text}"
+    );
     assert_eq!(report.agents.len(), 3);
     Ok(())
 }

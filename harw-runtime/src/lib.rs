@@ -20,6 +20,8 @@ pub mod config;
 pub mod contributors;
 pub mod diary_wiring;
 pub mod dream_run;
+// #22 Welle 3A: eingebettete Agenten-Artefakte (`EntryKind::CompiledAgent`).
+pub mod embedded;
 pub mod error;
 pub mod guard_wiring;
 pub mod handoff;
@@ -57,8 +59,9 @@ pub use auto_classifier::{AutoModeHandle, ModelClassifierBackend, PrefilterConte
 pub use budget::child_limits;
 pub use ceiling::root_ceiling;
 pub use children::RuntimeChildRegistryFactory;
-pub use config::{ConfigTrustReport, load_config};
+pub use config::{ConfigTrustReport, load_config, load_config_embedded};
 pub use contributors::{AssemblyContributor, AssemblyInputs, AssemblyParts, default_contributors};
+pub use embedded::{EffectiveRights, EmbeddedAgent, RightsFlags};
 pub use error::{RuntimeError, RuntimeResult};
 pub use guard_wiring::{
     DriftTracer, MemoryPitfallAdvisor, guard_policy_from_config, role_effort_weights_from_config,

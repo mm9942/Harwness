@@ -10,6 +10,7 @@ rust-version.workspace = true
 [dependencies]
 tracing = "0.1"
 harw-authority = { path = "../harw-authority" }
+harw-home = { path = "../harw-home" }
 harw-agent-dsl = { path = "../harw-agent-dsl" }
 harw-catalog = { path = "../harw-catalog" }
 # `[network]`-Sektion (`NetworkSection::researcher_web_hosts`) als einzige

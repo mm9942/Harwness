@@ -41,9 +41,7 @@ impl RightsChange {
     /// `true` if the right side has rights the left does not.
     #[must_use]
     pub fn widens(&self) -> bool {
-        !self.added_tools.is_empty()
-            || !self.widened.is_empty()
-            || !self.added_hosts.is_empty()
+        !self.added_tools.is_empty() || !self.widened.is_empty() || !self.added_hosts.is_empty()
     }
 }
 
@@ -93,7 +91,10 @@ fn comparable(ir: &AgentIr) -> Value {
 }
 
 fn only_in(left: &[String], right: &[String]) -> Vec<String> {
-    left.iter().filter(|item| !right.contains(item)).cloned().collect()
+    left.iter()
+        .filter(|item| !right.contains(item))
+        .cloned()
+        .collect()
 }
 
 /// Compares two IRs.
@@ -104,7 +105,8 @@ pub fn diff_irs(left_label: &str, left: &AgentIr, right_label: &str, right: &Age
     flatten(&comparable(left), "", &mut left_flat);
     flatten(&comparable(right), "", &mut right_flat);
     let mut changes = Vec::new();
-    let paths: std::collections::BTreeSet<&String> = left_flat.keys().chain(right_flat.keys()).collect();
+    let paths: std::collections::BTreeSet<&String> =
+        left_flat.keys().chain(right_flat.keys()).collect();
     for path in paths {
         let a = left_flat.get(path);
         let b = right_flat.get(path);
@@ -203,7 +205,11 @@ impl IrDiff {
             out.push_str(&format!("     + env {env}\n"));
         }
         out.push_str("fields:\n");
-        let show = |value: &Option<Value>| value.as_ref().map_or_else(|| "∅".to_owned(), Value::to_string);
+        let show = |value: &Option<Value>| {
+            value
+                .as_ref()
+                .map_or_else(|| "∅".to_owned(), Value::to_string)
+        };
         for change in &self.changes {
             out.push_str(&format!(
                 "  {}: {} → {}\n",
@@ -223,7 +229,11 @@ mod tests {
     #[test]
     fn test_flatten_paths() {
         let mut out = BTreeMap::new();
-        flatten(&serde_json::json!({"a": {"b": [1, {"c": true}]}, "e": []}), "", &mut out);
+        flatten(
+            &serde_json::json!({"a": {"b": [1, {"c": true}]}, "e": []}),
+            "",
+            &mut out,
+        );
         assert_eq!(out.get("a.b[0]"), Some(&serde_json::json!(1)));
         assert_eq!(out.get("a.b[1].c"), Some(&serde_json::json!(true)));
         assert_eq!(out.get("e"), Some(&serde_json::json!([])));

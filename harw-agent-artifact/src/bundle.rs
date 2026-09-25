@@ -242,7 +242,11 @@ impl BundleBuilder {
             builder = builder.add_payload(PayloadKind::Other(AGENT_KIND.to_owned()), path, bytes);
         }
         for (hash, bytes) in pool {
-            builder = builder.add_payload(PayloadKind::Other(BLOB_KIND.to_owned()), blob_path(&hash), bytes);
+            builder = builder.add_payload(
+                PayloadKind::Other(BLOB_KIND.to_owned()),
+                blob_path(&hash),
+                bytes,
+            );
         }
         builder.build()
     }
@@ -292,7 +296,10 @@ impl fmt::Display for BundleError {
                 id,
                 logical_path,
                 hash,
-            } => write!(f, "agent {id}: {logical_path} references the missing blob {hash}"),
+            } => write!(
+                f,
+                "agent {id}: {logical_path} references the missing blob {hash}"
+            ),
             Self::UnreferencedBlob(path) => write!(f, "blob {path} is referenced by no agent"),
             Self::UnexpectedPayload(path) => write!(f, "unexpected payload {path}"),
         }
@@ -377,12 +384,13 @@ impl Bundle {
         let mut referenced = BTreeSet::new();
         for (id, index) in &header.agents {
             indexed_paths.insert(index.entry.clone());
-            let payload = artifact
-                .payload(&agent_kind, &index.entry)
-                .ok_or_else(|| BundleError::Entry {
-                    id: id.clone(),
-                    reason: format!("{} is missing", index.entry),
-                })?;
+            let payload =
+                artifact
+                    .payload(&agent_kind, &index.entry)
+                    .ok_or_else(|| BundleError::Entry {
+                        id: id.clone(),
+                        reason: format!("{} is missing", index.entry),
+                    })?;
             let entry: AgentEntry =
                 serde_json::from_slice(payload.bytes()).map_err(|error| BundleError::Entry {
                     id: id.clone(),
@@ -431,13 +439,21 @@ impl Bundle {
     #[must_use]
     pub fn resolve<'a>(&self, artifact: &'a Artifact, reference: &PayloadRef) -> Option<&'a [u8]> {
         artifact
-            .payload(&PayloadKind::Other(BLOB_KIND.to_owned()), &blob_path(&reference.blake3))
+            .payload(
+                &PayloadKind::Other(BLOB_KIND.to_owned()),
+                &blob_path(&reference.blake3),
+            )
             .map(crate::artifact::Payload::bytes)
     }
 
     /// The bytes of an agent's file by logical path.
     #[must_use]
-    pub fn file<'a>(&self, artifact: &'a Artifact, id: &str, logical_path: &str) -> Option<&'a [u8]> {
+    pub fn file<'a>(
+        &self,
+        artifact: &'a Artifact,
+        id: &str,
+        logical_path: &str,
+    ) -> Option<&'a [u8]> {
         let entry = self.agents.get(id)?;
         let reference = entry
             .payload_refs
@@ -457,7 +473,8 @@ impl Bundle {
         for entry in self.agents.values() {
             for reference in &entry.payload_refs {
                 stats.references += 1;
-                stats.referenced_bytes += self.blob_sizes.get(&reference.blake3).copied().unwrap_or(0);
+                stats.referenced_bytes +=
+                    self.blob_sizes.get(&reference.blake3).copied().unwrap_or(0);
             }
         }
         stats
@@ -497,16 +514,24 @@ mod tests {
 
     fn family() -> BundleBuilder {
         let shared: &[u8] = b"# shared skill";
-        BundleBuilder::new(agent("lead", &[("instructions", "instructions/system.md", b"lead".as_slice())], &["a", "b"]))
-            .add_agent(agent("a", &[("skill", "skills/review/instructions.md", shared)], &[]))
-            .add_agent(agent(
-                "b",
-                &[
-                    ("skill", "skills/review/instructions.md", shared),
-                    ("knowledge", "knowledge/x.md", b"x".as_slice()),
-                ],
-                &[],
-            ))
+        BundleBuilder::new(agent(
+            "lead",
+            &[("instructions", "instructions/system.md", b"lead".as_slice())],
+            &["a", "b"],
+        ))
+        .add_agent(agent(
+            "a",
+            &[("skill", "skills/review/instructions.md", shared)],
+            &[],
+        ))
+        .add_agent(agent(
+            "b",
+            &[
+                ("skill", "skills/review/instructions.md", shared),
+                ("knowledge", "knowledge/x.md", b"x".as_slice()),
+            ],
+            &[],
+        ))
     }
 
     #[test]
@@ -529,25 +554,45 @@ mod tests {
     fn test_bundle_is_deterministic() -> TestResult {
         let first = family().build().map_err(ctx("first"))?;
         // Other insertion order, same content.
-        let second = BundleBuilder::new(agent("lead", &[("instructions", "instructions/system.md", b"lead".as_slice())], &["a", "b"]))
-            .add_agent(agent(
-                "b",
-                &[
-                    ("knowledge", "knowledge/x.md", b"x".as_slice()),
-                    ("skill", "skills/review/instructions.md", b"# shared skill".as_slice()),
-                ],
-                &[],
-            ))
-            .add_agent(agent("a", &[("skill", "skills/review/instructions.md", b"# shared skill".as_slice())], &[]))
-            .build()
-            .map_err(ctx("second"))?;
+        let second = BundleBuilder::new(agent(
+            "lead",
+            &[("instructions", "instructions/system.md", b"lead".as_slice())],
+            &["a", "b"],
+        ))
+        .add_agent(agent(
+            "b",
+            &[
+                ("knowledge", "knowledge/x.md", b"x".as_slice()),
+                (
+                    "skill",
+                    "skills/review/instructions.md",
+                    b"# shared skill".as_slice(),
+                ),
+            ],
+            &[],
+        ))
+        .add_agent(agent(
+            "a",
+            &[(
+                "skill",
+                "skills/review/instructions.md",
+                b"# shared skill".as_slice(),
+            )],
+            &[],
+        ))
+        .build()
+        .map_err(ctx("second"))?;
         assert_eq!(first.to_bytes(), second.to_bytes());
         Ok(())
     }
 
     /// Builds an artifact with a hand-made header and payloads.
-    fn raw(header: &BundleHeader, payloads: Vec<(PayloadKind, String, Vec<u8>)>) -> TestResult<Artifact> {
-        let mut builder = ArtifactBuilder::new(&serde_json::to_value(header).map_err(ctx("header"))?);
+    fn raw(
+        header: &BundleHeader,
+        payloads: Vec<(PayloadKind, String, Vec<u8>)>,
+    ) -> TestResult<Artifact> {
+        let mut builder =
+            ArtifactBuilder::new(&serde_json::to_value(header).map_err(ctx("header"))?);
         for (kind, path, bytes) in payloads {
             builder = builder.add_payload(kind, path, bytes);
         }
@@ -579,7 +624,9 @@ mod tests {
             payload_refs: refs,
             children: Vec::new(),
         };
-        Ok(canonical_json(&serde_json::to_value(&entry).map_err(ctx("entry"))?))
+        Ok(canonical_json(
+            &serde_json::to_value(&entry).map_err(ctx("entry"))?,
+        ))
     }
 
     #[test]
@@ -597,8 +644,16 @@ mod tests {
         let tampered = raw(
             &one_agent_header(),
             vec![
-                (agent_kind.clone(), entry_path("r"), entry_bytes(vec![reference.clone()])?),
-                (blob_kind.clone(), blob_path(&good), b"skill, changed".to_vec()),
+                (
+                    agent_kind.clone(),
+                    entry_path("r"),
+                    entry_bytes(vec![reference.clone()])?,
+                ),
+                (
+                    blob_kind.clone(),
+                    blob_path(&good),
+                    b"skill, changed".to_vec(),
+                ),
             ],
         )?;
         assert!(matches!(
@@ -609,7 +664,11 @@ mod tests {
         // A reference to a blob that is not there.
         let missing = raw(
             &one_agent_header(),
-            vec![(agent_kind.clone(), entry_path("r"), entry_bytes(vec![reference.clone()])?)],
+            vec![(
+                agent_kind.clone(),
+                entry_path("r"),
+                entry_bytes(vec![reference.clone()])?,
+            )],
         )?;
         assert!(matches!(
             Bundle::from_artifact(&missing),
@@ -621,7 +680,11 @@ mod tests {
         let unreferenced = raw(
             &one_agent_header(),
             vec![
-                (agent_kind.clone(), entry_path("r"), entry_bytes(vec![reference])?),
+                (
+                    agent_kind.clone(),
+                    entry_path("r"),
+                    entry_bytes(vec![reference])?,
+                ),
                 (blob_kind.clone(), blob_path(&good), b"skill".to_vec()),
                 (blob_kind, blob_path(&orphan), b"orphan".to_vec()),
             ],

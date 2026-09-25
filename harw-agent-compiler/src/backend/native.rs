@@ -271,7 +271,11 @@ pub fn find_sources(
 ) -> Result<(PathBuf, SourcesOrigin), CompileError> {
     let candidate = flag
         .map(|path| (env.resolve(path), SourcesOrigin::Flag))
-        .or_else(|| env.env_harw_src.clone().map(|path| (path, SourcesOrigin::Env)))
+        .or_else(|| {
+            env.env_harw_src
+                .clone()
+                .map(|path| (path, SourcesOrigin::Env))
+        })
         .or_else(|| {
             env.install_record()
                 .and_then(|record| record.source_dir)
@@ -308,8 +312,16 @@ pub fn find_sources(
 /// The cache key of a native build: artifact, features, target, harw
 /// version and source directory.
 #[must_use]
-pub fn cache_key(artifact_digest: &str, features: &BTreeSet<String>, target: &str, src: &Path) -> String {
-    let mut material = format!("{artifact_digest}\n{target}\n{HARW_VERSION}\n{}\n", src.display());
+pub fn cache_key(
+    artifact_digest: &str,
+    features: &BTreeSet<String>,
+    target: &str,
+    src: &Path,
+) -> String {
+    let mut material = format!(
+        "{artifact_digest}\n{target}\n{HARW_VERSION}\n{}\n",
+        src.display()
+    );
     for feature in features {
         material.push_str(feature);
         material.push('\n');
@@ -415,7 +427,11 @@ impl NativeBackend<'_> {
             features: features.clone(),
             artifact: artifact.to_bytes(),
         });
-        progress(&format!("generating {} in {}", generated.package, crate_dir.display()));
+        progress(&format!(
+            "generating {} in {}",
+            generated.package,
+            crate_dir.display()
+        ));
         for (path, bytes) in &generated.files {
             write_if_changed(&crate_dir.join(path), bytes)?;
         }
@@ -450,7 +466,10 @@ impl NativeBackend<'_> {
         if self.target != self.env.host_target {
             command.arg("--target").arg(self.target);
         }
-        progress(&format!("running {} build --release (the first build compiles harw and can take minutes)", cargo.display()));
+        progress(&format!(
+            "running {} build --release (the first build compiles harw and can take minutes)",
+            cargo.display()
+        ));
         let status = command
             .status()
             .map_err(CompileError::io(format!("start {}", cargo.display())))?;
@@ -535,12 +554,22 @@ mod tests {
     fn test_native_codegen_matches_the_golden_files() {
         let generated = native_crate(&spec());
         assert_eq!(generated.package, "harw-agent-evidence-critic");
-        let paths: Vec<&str> = generated.files.iter().map(|(path, _)| path.as_str()).collect();
+        let paths: Vec<&str> = generated
+            .files
+            .iter()
+            .map(|(path, _)| path.as_str())
+            .collect();
         assert_eq!(paths, ["Cargo.toml", "src/main.rs", "agent.harwa"]);
         let cargo_toml = generated.text("Cargo.toml").unwrap_or_default();
         let main_rs = generated.text("src/main.rs").unwrap_or_default();
-        check_golden("Cargo.toml.golden", &cargo_toml.replace(HARW_VERSION, "<harw-version>"));
-        check_golden("main.rs.golden", &main_rs.replace(HARW_VERSION, "<harw-version>"));
+        check_golden(
+            "Cargo.toml.golden",
+            &cargo_toml.replace(HARW_VERSION, "<harw-version>"),
+        );
+        check_golden(
+            "main.rs.golden",
+            &main_rs.replace(HARW_VERSION, "<harw-version>"),
+        );
         assert!(
             toml::from_str::<toml::Table>(&cargo_toml).is_ok(),
             "the generated Cargo.toml parses"
@@ -557,8 +586,14 @@ mod tests {
         let generated = native_crate(&uia);
         let cargo_toml = generated.text("Cargo.toml").unwrap_or_default();
         let main_rs = generated.text("src/main.rs").unwrap_or_default();
-        check_golden("Cargo.uia.toml.golden", &cargo_toml.replace(HARW_VERSION, "<harw-version>"));
-        check_golden("main.uia.rs.golden", &main_rs.replace(HARW_VERSION, "<harw-version>"));
+        check_golden(
+            "Cargo.uia.toml.golden",
+            &cargo_toml.replace(HARW_VERSION, "<harw-version>"),
+        );
+        check_golden(
+            "main.uia.rs.golden",
+            &main_rs.replace(HARW_VERSION, "<harw-version>"),
+        );
         assert!(main_rs.contains("harw_cli::run_with_embedded_uia"));
         assert!(!cargo_toml.contains("harw-agent-runner"));
         assert!(toml::from_str::<toml::Table>(&cargo_toml).is_ok());
@@ -579,10 +614,20 @@ mod tests {
             .err()
             .ok_or("no sources are known, yet sources were found")?;
         assert!(error.to_string().contains("--harw-src"));
-        let error = find_sources(&env, Some(Path::new("/nonexistent/src")), NativeFlavor::Harw)
-            .err()
-            .ok_or("the flag names a missing directory")?;
-        assert!(matches!(error, CompileError::SourcesMissing { candidate: Some(_), .. }));
+        let error = find_sources(
+            &env,
+            Some(Path::new("/nonexistent/src")),
+            NativeFlavor::Harw,
+        )
+        .err()
+        .ok_or("the flag names a missing directory")?;
+        assert!(matches!(
+            error,
+            CompileError::SourcesMissing {
+                candidate: Some(_),
+                ..
+            }
+        ));
         let error = find_cargo(&env)
             .err()
             .ok_or("no PATH and no HOME, yet cargo was found")?;
@@ -596,9 +641,26 @@ mod tests {
         let src = Path::new("/src");
         let base = cache_key("aa", &features, "x86_64-unknown-linux-gnu", src);
         assert_eq!(base.len(), 32);
-        assert_ne!(base, cache_key("ab", &features, "x86_64-unknown-linux-gnu", src));
-        assert_ne!(base, cache_key("aa", &BTreeSet::new(), "x86_64-unknown-linux-gnu", src));
-        assert_ne!(base, cache_key("aa", &features, "aarch64-unknown-linux-gnu", src));
-        assert_ne!(base, cache_key("aa", &features, "x86_64-unknown-linux-gnu", Path::new("/other")));
+        assert_ne!(
+            base,
+            cache_key("ab", &features, "x86_64-unknown-linux-gnu", src)
+        );
+        assert_ne!(
+            base,
+            cache_key("aa", &BTreeSet::new(), "x86_64-unknown-linux-gnu", src)
+        );
+        assert_ne!(
+            base,
+            cache_key("aa", &features, "aarch64-unknown-linux-gnu", src)
+        );
+        assert_ne!(
+            base,
+            cache_key(
+                "aa",
+                &features,
+                "x86_64-unknown-linux-gnu",
+                Path::new("/other")
+            )
+        );
     }
 }

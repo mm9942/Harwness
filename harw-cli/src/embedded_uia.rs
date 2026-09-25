@@ -115,13 +115,20 @@ fn stdin_answer(question: &str) -> bool {
     if std::io::stdin().lock().read_line(&mut line).is_err() {
         return false;
     }
-    matches!(line.trim().to_lowercase().as_str(), "j" | "ja" | "y" | "yes")
+    matches!(
+        line.trim().to_lowercase().as_str(),
+        "j" | "ja" | "y" | "yes"
+    )
 }
 
 /// First start of the own home: scaffold it and offer the provider import.
 ///
 /// Returns the imported files (empty without consent).
-pub fn first_start(home: &Path, interactive: bool, ask: &mut dyn FnMut(&str) -> bool) -> Vec<std::path::PathBuf> {
+pub fn first_start(
+    home: &Path,
+    interactive: bool,
+    ask: &mut dyn FnMut(&str) -> bool,
+) -> Vec<std::path::PathBuf> {
     if home.exists() {
         return Vec::new();
     }
@@ -200,7 +207,10 @@ mod tests {
         let Ok(artifact) = artifact else {
             return;
         };
-        assert!(verify_embedded(&artifact.to_bytes()).is_err(), "no AgentIr header");
+        assert!(
+            verify_embedded(&artifact.to_bytes()).is_err(),
+            "no AgentIr header"
+        );
     }
 
     #[test]

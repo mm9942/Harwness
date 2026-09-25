@@ -150,8 +150,9 @@ impl SourceSet {
     /// broken (a build defect, not a user error).
     pub fn discover(layers: &[PathBuf]) -> Result<Self, CompileError> {
         let mut programs =
-            harw_registry_defaults::embedded_agents::builtin_context_program_library()
-                .map_err(|error| CompileError::Other(format!("built-in context programs: {error}")))?;
+            harw_registry_defaults::embedded_agents::builtin_context_program_library().map_err(
+                |error| CompileError::Other(format!("built-in context programs: {error}")),
+            )?;
         let mut set = Self {
             files: Vec::new(),
             entries: Vec::new(),
@@ -198,15 +199,13 @@ impl SourceSet {
                     label_dir.join("definition.toml"),
                     bundled.contents,
                 );
-                if file
-                    .declared_id()
-                    .is_some_and(|id| layer_ids.contains(&id))
-                {
+                if file.declared_id().is_some_and(|id| layer_ids.contains(&id)) {
                     continue;
                 }
                 set.push(name.to_owned(), file, Origin::Bundled, None);
             } else if file_name.ends_with(".md") && !file_name.contains('/') {
-                set.loader.insert(label_dir.join(file_name), bundled.contents);
+                set.loader
+                    .insert(label_dir.join(file_name), bundled.contents);
             }
         }
         for (name, file, origin, dir) in layer_files {
@@ -254,12 +253,11 @@ impl SourceSet {
         } else {
             path.to_path_buf()
         };
-        let text = std::fs::read_to_string(&file_path).map_err(|error| {
-            CompileError::NotADefinition {
+        let text =
+            std::fs::read_to_string(&file_path).map_err(|error| CompileError::NotADefinition {
                 path: file_path.clone(),
                 reason: error.to_string(),
-            }
-        })?;
+            })?;
         let dir = file_path.parent().map(Path::to_path_buf);
         let name = name_for(&file_path);
         let file = SourceFile::new(DefinitionLayer::RunLocal, file_path.clone(), text);
@@ -574,7 +572,10 @@ mod tests {
 
     #[test]
     fn test_name_for_definition_and_flat_files() {
-        assert_eq!(name_for(Path::new("/a/agents/critic/definition.toml")), "critic");
+        assert_eq!(
+            name_for(Path::new("/a/agents/critic/definition.toml")),
+            "critic"
+        );
         assert_eq!(name_for(Path::new("/a/agents/flat.toml")), "flat");
     }
 
@@ -589,7 +590,10 @@ mod tests {
             "bundled definition"
         );
         assert!(set.find("no-such-agent").is_none());
-        assert!(set.suggestions("evidence-critc").contains(&"evidence-critic".to_owned()));
+        assert!(
+            set.suggestions("evidence-critc")
+                .contains(&"evidence-critic".to_owned())
+        );
         Ok(())
     }
 

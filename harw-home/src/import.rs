@@ -162,10 +162,16 @@ mod tests {
     fn test_provider_import_copies_config_and_auth_only() -> TestResult {
         let source = tempfile::tempdir()?;
         let target = tempfile::tempdir()?;
-        std::fs::write(source.path().join("config.toml"), "default_provider = \"x\"\n")?;
+        std::fs::write(
+            source.path().join("config.toml"),
+            "default_provider = \"x\"\n",
+        )?;
         std::fs::write(source.path().join("auth.toml"), "[x]\nkey = \"env:X\"\n")?;
         std::fs::create_dir_all(source.path().join("providers"))?;
-        std::fs::write(source.path().join("providers").join("x.toml"), "name = \"x\"\n")?;
+        std::fs::write(
+            source.path().join("providers").join("x.toml"),
+            "name = \"x\"\n",
+        )?;
         std::fs::create_dir_all(source.path().join("sessions"))?;
         std::fs::write(source.path().join("sessions").join("s.json"), "{}")?;
         std::fs::write(target.path().join("config.toml"), "# scaffolded\n")?;
@@ -178,7 +184,10 @@ mod tests {
             "the scaffolded default is replaced"
         );
         assert!(target.path().join("providers").join("x.toml").is_file());
-        assert!(!target.path().join("sessions").exists(), "no state is copied");
+        assert!(
+            !target.path().join("sessions").exists(),
+            "no state is copied"
+        );
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
@@ -197,7 +206,10 @@ mod tests {
         let to = project.path().join(".mia");
         std::fs::create_dir_all(from.join("agents").join("a"))?;
         std::fs::write(from.join("config.toml"), "x = 1\n")?;
-        std::fs::write(from.join("agents").join("a").join("definition.toml"), "id = 1\n")?;
+        std::fs::write(
+            from.join("agents").join("a").join("definition.toml"),
+            "id = 1\n",
+        )?;
         for state in ["state", "plans", "memories", "logs"] {
             std::fs::create_dir_all(from.join(state))?;
             std::fs::write(from.join(state).join("f"), "state")?;
@@ -205,7 +217,12 @@ mod tests {
         std::fs::write(from.join("handoff.json"), "{}")?;
         let copied = copy_project_config(&from, &to)?;
         assert_eq!(copied.len(), 2);
-        assert!(to.join("agents").join("a").join("definition.toml").is_file());
+        assert!(
+            to.join("agents")
+                .join("a")
+                .join("definition.toml")
+                .is_file()
+        );
         for state in ["state", "plans", "memories", "logs", "handoff.json"] {
             assert!(!to.join(state).exists(), "{state} is not copied");
         }

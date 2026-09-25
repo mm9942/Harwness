@@ -46,6 +46,7 @@ pub use browser_toml::BrowserSection;
 pub use channel_toml::{ChannelFileToml, ChannelSectionToml, ChannelToml, TelegramChannelToml};
 pub use discovery::{
     AgentDefinitionMeta, HasName, INSTRUCTIONS_FILE_KEY, ResolvedConfig, default_config_layers,
+    default_config_layers_named,
     discover_config, discover_config_with_restricted,
     discover_config_with_restricted_and_project_settings, discover_run_agent_definitions,
 };
@@ -55,7 +56,7 @@ pub use dotenv::{
 };
 pub use error::{ConfigError, ConfigResult};
 pub use harness_config::{
-    CargoSandboxModeToml, CargoSandboxToml, DEFAULT_DIARY_RETENTION_DAYS,
+    AgentCompilerToml, CargoSandboxModeToml, CargoSandboxToml, DEFAULT_DIARY_RETENTION_DAYS,
     DEFAULT_DREAM_BUDGET_TOKENS, DEFAULT_DREAM_COOLDOWN_MINUTES, DEFAULT_DREAM_ENABLED,
     DEFAULT_DREAM_IDLE_MINUTES, DEFAULT_SUDO_SESSION_MINUTES, DiaryToml, DreamToml, HarnessConfig,
     HostToml, KnowledgeToml, LoggingSection, MAX_SUDO_SESSION_MINUTES, McpJobCapabilityToml,

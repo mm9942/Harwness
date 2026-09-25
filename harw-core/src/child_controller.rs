@@ -2261,6 +2261,11 @@ pub struct ManagedAgentSpawner {
     /// Runde 5, Teil O: optionaler Freigabe-Kanal zur Oberfläche
     /// (`crate::child_approval`); leer = bisheriges fail-closed-Verhalten.
     pub(crate) child_approvals: Arc<crate::child_approval::ChildApprovalRelay>,
+    /// Wave 3, part 3C: when set, a compiled parent's children run through
+    /// this backend (e.g. as jobs, see `crate::child_backend`) instead of
+    /// the in-process session below. `None` (the default) keeps every
+    /// existing behavior unchanged.
+    child_backend: Option<Arc<dyn crate::child_backend::ChildBackend>>,
 }
 
 /// Ein archivierter, ungekürzter Antworttext eines abgeschlossenen
@@ -2964,7 +2969,28 @@ impl ManagedAgentSpawner {
             comms: Arc::new(crate::child_comms::ChildComms::default()),
             // Runde 5, Teil O.
             child_approvals: Arc::new(crate::child_approval::ChildApprovalRelay::default()),
+            // Wave 3, part 3C.
+            child_backend: None,
         }
+    }
+
+    /// Wires a [`crate::child_backend::ChildBackend`]: every child this
+    /// spawner admits from now on runs through it instead of the in-process
+    /// session (plan §3C). `None` by default, which keeps every existing
+    /// behavior unchanged; callers that delegate to it are responsible for
+    /// mapping [`crate::child_backend::ChildRunOutcome`] onto the same
+    /// journal/end-report path the in-process run uses.
+    #[must_use]
+    pub fn with_child_backend(mut self, backend: Arc<dyn crate::child_backend::ChildBackend>) -> Self {
+        self.child_backend = Some(backend);
+        self
+    }
+
+    /// The wired [`crate::child_backend::ChildBackend`], if any (see
+    /// [`Self::with_child_backend`]).
+    #[must_use]
+    pub(crate) fn child_backend(&self) -> Option<Arc<dyn crate::child_backend::ChildBackend>> {
+        self.child_backend.clone()
     }
 
     /// Erlaubt einem `UserInterface`-Elternteil (der UIA-Wurzelsitzung), die

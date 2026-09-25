@@ -169,10 +169,13 @@ impl ToolProvider for PlanToolProvider {
         vec![
             Self::spec(
                 PLAN_WRITE_TOOL,
-                "Write (or overwrite) your plan as Markdown to .harw/plans/<slug>.md. The only \
-                 writing tool in plan mode; it cannot write anywhere else. Repeated calls in this \
-                 session overwrite the same plan unless you pass a new slug. Suggested structure: \
-                 Context / Approach in steps / Affected files / Verification.",
+                &format!(
+                    "Write (or overwrite) your plan as Markdown to {}/<slug>.md. The only \
+                     writing tool in plan mode; it cannot write anywhere else. Repeated calls in \
+                     this session overwrite the same plan unless you pass a new slug. Suggested \
+                     structure: Context / Approach in steps / Affected files / Verification.",
+                    plan_file::plan_display_prefix()
+                ),
                 object_schema(
                     &[
                         ("content", string_prop("The complete plan as Markdown.")),
@@ -200,7 +203,10 @@ impl ToolProvider for PlanToolProvider {
                 object_schema(
                     &[(
                         "plan_path",
-                        string_prop("The plan written with plan.write, e.g. .harw/plans/<slug>.md"),
+                        string_prop(&format!(
+                            "The plan written with plan.write, e.g. {}/<slug>.md",
+                            plan_file::plan_display_prefix()
+                        )),
                     )],
                     &["plan_path"],
                 ),

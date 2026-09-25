@@ -166,12 +166,7 @@ pub fn reclassify_permissions(ir: &mut AgentIr, classifier: &dyn ToolClassifier)
         .into_iter()
         .collect();
     let hint = ir.spawn.workspace_hint.clone();
-    reclassify(
-        &mut ir.permissions,
-        &effective,
-        hint.as_deref(),
-        classifier,
-    )
+    reclassify(&mut ir.permissions, &effective, hint.as_deref(), classifier)
 }
 
 #[cfg(test)]
@@ -213,9 +208,24 @@ mod tests {
         let classes = LabelClassifier.classify("fs.write").unwrap_or_default();
         assert!(classes.write_workspace && !classes.read);
         assert!(LabelClassifier.classify("fs.read").unwrap_or_default().read);
-        assert!(LabelClassifier.classify("web.fetch").unwrap_or_default().network);
-        assert!(LabelClassifier.classify("job.start").unwrap_or_default().shell);
-        assert!(LabelClassifier.classify("host.sudo_exec").unwrap_or_default().host);
+        assert!(
+            LabelClassifier
+                .classify("web.fetch")
+                .unwrap_or_default()
+                .network
+        );
+        assert!(
+            LabelClassifier
+                .classify("job.start")
+                .unwrap_or_default()
+                .shell
+        );
+        assert!(
+            LabelClassifier
+                .classify("host.sudo_exec")
+                .unwrap_or_default()
+                .host
+        );
         assert_eq!(
             LabelClassifier.classify("parent.message"),
             Some(ToolClasses::default())

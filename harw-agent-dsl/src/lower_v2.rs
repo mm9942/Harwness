@@ -56,9 +56,8 @@ use crate::ir_v2::{
     AGENT_IR_SCHEMA, AgentIr, Authority, Binary, Budget, ContextProgram, ContextSection, Effort,
     FilesystemPermissions, Instructions, Interface, Job, Lifecycle, Limits, ModelRef, Models,
     NetworkMode, NetworkPermissions, Permissions, Research, ReturnContract, ReturnPipeline,
-    ReturnValidator,
-    SkillEntry, Skills, SpawnContract, SpawnPermissions, ToolSurface, Trace, TraceStep,
-    Verification, WORKSPACE_WRITE_PATH, Work,
+    ReturnValidator, SkillEntry, Skills, SpawnContract, SpawnPermissions, ToolSurface, Trace,
+    TraceStep, Verification, WORKSPACE_WRITE_PATH, Work,
 };
 use crate::raw::RawAgentDefinition;
 use crate::resolve::resolve_definition;

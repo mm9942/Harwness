@@ -14,6 +14,9 @@ browser = ["harw-registry-defaults/browser"]
 [dependencies]
 harw-explorer = { path = "../harw-explorer" }
 harw-authority = { path = "../harw-authority" }
+# #22 Welle 3A: eingebettete Agenten-Artefakte (`EntryKind::CompiledAgent`,
+# `embedded.rs`) — Bundle, Artifact und ArtifactDigest.
+harw-agent-artifact = { path = "../harw-agent-artifact" }
 # Gemeinsame Runtime-Montage (L12): darf nur von `harw-tui` und `harw-cli`
 # genutzt werden, sonst entsteht ein Zyklus.
 harw-agent-dsl = { path = "../harw-agent-dsl" }
@@ -85,6 +88,9 @@ toml = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }
+# `embedded.rs` tests: `compile_agent(..., now: OffsetDateTime, ...)`
+# (`harw-agent-dsl`), Version wie dort (kein `[workspace.dependencies]`-Eintrag).
+time = "0.3.53"
 
 [lints]
 workspace = true

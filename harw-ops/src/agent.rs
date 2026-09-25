@@ -165,7 +165,10 @@ async fn agent(ctx: &OpContext, args: AgentArgs) -> Result<OpOutput, OpError> {
         let tokens = compiler_tokens(&args);
         let (name, version) = (tokens.get(1).cloned(), tokens.get(2).cloned());
         if let (Some(name), Some(version)) = (name, version) {
-            return run_compiler(ctx, harw_agent_compiler::AgentCommand::Use { name, version });
+            return run_compiler(
+                ctx,
+                harw_agent_compiler::AgentCommand::Use { name, version },
+            );
         }
     }
     if args.action.as_deref() == Some("use") {
@@ -336,7 +339,9 @@ fn agent_compiler(ctx: &OpContext, args: &AgentArgs) -> Result<OpOutput, OpError
     let tokens = compiler_tokens(args);
     let command = harw_agent_compiler::parse_tokens(&tokens)
         .map_err(OpError::InvalidArguments)?
-        .ok_or_else(|| OpError::InvalidArguments(format!("unknown /agent action '{}'", tokens.join(" "))))?;
+        .ok_or_else(|| {
+            OpError::InvalidArguments(format!("unknown /agent action '{}'", tokens.join(" ")))
+        })?;
     let job_manager = matches!(command, harw_agent_compiler::AgentCommand::Build(_))
         .then(|| ctx.service::<std::sync::Arc<harw_tool_job::JobManager>>())
         .flatten();
@@ -417,7 +422,9 @@ fn agent_definitions(ctx: &OpContext, query: Option<&str>) -> Result<OpOutput, O
     let roster = harw_registry_defaults::AgentRoster::from_config(&builtin, &config)
         .map_err(|error| OpError::Execution(format!("Agenten-Roster nicht baubar: {error}")))?;
     let compiled = compiled_info(ctx, &roster);
-    Ok(OpOutput::from(format_definitions(&roster, query, &compiled)))
+    Ok(OpOutput::from(format_definitions(
+        &roster, query, &compiled,
+    )))
 }
 
 /// Snapshot und Build-Zustand je Agent sowie die kompilierten Agenten in
@@ -450,7 +457,10 @@ fn compiled_info(ctx: &OpContext, roster: &harw_registry_defaults::AgentRoster) 
         let state = match build {
             None => "nicht kompiliert".to_owned(),
             Some(agent) if agent.source_snapshot.as_deref() == Some(snapshot.as_str()) => {
-                format!("kompiliert {} (aktuell)", agent.current.as_deref().unwrap_or("-"))
+                format!(
+                    "kompiliert {} (aktuell)",
+                    agent.current.as_deref().unwrap_or("-")
+                )
             }
             Some(agent) => format!(
                 "kompiliert {} (veraltet: Definition geändert)",
@@ -459,7 +469,10 @@ fn compiled_info(ctx: &OpContext, roster: &harw_registry_defaults::AgentRoster) 
         };
         info.annotations.insert(
             name.clone(),
-            format!("snapshot {}; {state}", snapshot.chars().take(12).collect::<String>()),
+            format!(
+                "snapshot {}; {state}",
+                snapshot.chars().take(12).collect::<String>()
+            ),
         );
     }
     let bin = env.bin_dir();
@@ -1411,11 +1424,14 @@ admitted = ["fs.read"]
             "zettel-sammler".to_owned(),
             "snapshot 0123456789ab; kompiliert 1.0.0-abc (aktuell)".to_owned(),
         );
-        compiled
-            .installed
-            .push("- harw-uia-terminal-ui [kompiliert (/h/bin); 1.0.0-x; auto-kompiliert]".to_owned());
+        compiled.installed.push(
+            "- harw-uia-terminal-ui [kompiliert (/h/bin); 1.0.0-x; auto-kompiliert]".to_owned(),
+        );
         let annotated = super::format_definitions(&roster, Some("zettel"), &compiled);
-        assert!(annotated.contains("Zettelkasten-Einträge · snapshot 0123456789ab; kompiliert"), "{annotated}");
+        assert!(
+            annotated.contains("Zettelkasten-Einträge · snapshot 0123456789ab; kompiliert"),
+            "{annotated}"
+        );
         assert!(annotated.contains("1 kompilierte Agenten"), "{annotated}");
         assert!(annotated.contains("auto-kompiliert"), "{annotated}");
         Ok(())

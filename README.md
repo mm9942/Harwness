@@ -188,7 +188,7 @@ The full specification is in [docs/design/agent-definition-dsl.md](docs/design/a
 
 ## Compiling agents
 
-*Planned in #22.* `harw agent build` will compile a definition into a single executable that runs that one agent with its rights manifest baked in, as a CLI, REPL, MCP server, HTTP API or TUI:
+`harw agent build` compiles a definition into a single executable that runs that one agent with its rights manifest baked in, as a CLI, REPL, MCP server, HTTP API or TUI (#22, [ADR 0001](docs/adr/0001-agent-compiler.md)):
 
 ```sh
 harw agent check evidence-critic
@@ -196,7 +196,7 @@ harw agent build evidence-critic --interface cli,mcp -o ./ec
 ./ec --manifest
 ```
 
-Flags at runtime can only narrow the baked-in rights, and a modified binary refuses to start. See the [agent compiler guide](docs/guides/agent-compiler.md) and [ADR 0001](docs/adr/0001-agent-compiler.md).
+`harw agent inspect`, `graph`, `explain`, `diff`, `test`, `fmt`, `new`, `versions`/`use` and `doctor` round out the CLI; `make install` also installs `harw-agent-runner` so builds work with no further setup. Flags at runtime can only narrow the baked-in rights, and a modified binary refuses to start. The runner's own interfaces (actually running a compiled agent) are still landing — see the [agent compiler guide](docs/guides/agent-compiler.md) for current status and full detail.
 
 ## Context and model interaction
 

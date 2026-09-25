@@ -19,7 +19,9 @@ use harw_agent_artifact::{EmbeddedArtifact, append_to_executable, write_executab
 use serde::Serialize;
 
 use crate::bin_dir::{BUILD_RECORD_SCHEMA, BinDir, BuildRecord, InstalledVersion, RemovedVersion};
-use crate::cache::{AgentCompilerSettings, GcPolicy, GcReport, collect_garbage, stale_runner_dirs, unix_now};
+use crate::cache::{
+    AgentCompilerSettings, GcPolicy, GcReport, collect_garbage, stale_runner_dirs, unix_now,
+};
 use crate::compiler::Compiled;
 use crate::env::{CompilerEnv, HARW_VERSION};
 use crate::error::CompileError;
@@ -211,7 +213,11 @@ pub fn build(
         BackendKind::ArtifactOnly => (compiled.artifact.to_bytes(), false),
         BackendKind::Artifact => {
             let runner = locate_runner(env, options.runner.as_deref(), &target)?;
-            progress(&format!("runner: {} ({:?})", runner.path.display(), runner.source));
+            progress(&format!(
+                "runner: {} ({:?})",
+                runner.path.display(),
+                runner.source
+            ));
             let capabilities = probe.capabilities(&runner.path)?;
             let feature_list: Vec<String> = features.iter().cloned().collect();
             let problems = capabilities.problems(&report.interfaces, &feature_list);
@@ -242,11 +248,19 @@ pub fn build(
                 NativeFlavor::Runner
             };
             progress(&format!("native flavor: {flavor:?}"));
-            if let Some(home) = options.home_name.as_deref().filter(|_| flavor == NativeFlavor::Harw) {
+            if let Some(home) = options
+                .home_name
+                .as_deref()
+                .filter(|_| flavor == NativeFlavor::Harw)
+            {
                 let path = harw_home::paths::named_home_dir(home)
                     .map_or_else(|_| format!("~/.{home}"), |path| path.display().to_string());
-                progress(&format!("the personalized harw will use its own home {path}"));
-                report.notes.push(format!("home of the personalized harw: {path}"));
+                progress(&format!(
+                    "the personalized harw will use its own home {path}"
+                ));
+                report
+                    .notes
+                    .push(format!("home of the personalized harw: {path}"));
             }
             let output = native.build(
                 flavor,
@@ -258,8 +272,10 @@ pub fn build(
                 &features,
                 progress,
             )?;
-            let bytes = std::fs::read(&output.binary)
-                .map_err(CompileError::io(format!("read {}", output.binary.display())))?;
+            let bytes = std::fs::read(&output.binary).map_err(CompileError::io(format!(
+                "read {}",
+                output.binary.display()
+            )))?;
             report.native = Some(output);
             (bytes, true)
         }
@@ -293,7 +309,10 @@ pub fn build(
         )?;
         for stale in stale_runner_dirs(env) {
             let _ = std::fs::remove_dir_all(&stale);
-            report.notes.push(format!("removed runner of another harw version: {}", stale.display()));
+            report.notes.push(format!(
+                "removed runner of another harw version: {}",
+                stale.display()
+            ));
         }
         if let Some(keep) = settings.keep_versions {
             report.pruned_versions = bin.prune_versions(&name, keep, false)?;

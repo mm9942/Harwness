@@ -1836,6 +1836,7 @@ impl RuntimeAssemblyBuilder {
         // Startfehler, nie ein stiller Full-Tool-Fallback.
         let needs_definitions = spec.active_agent.is_some()
             || config.harness.active_uia_definition.is_some()
+            || spec.embedded.is_some()
             || matches!(profile.spawner, SpawnerPolicy::BuiltinRoles);
         let agent_definitions = if needs_definitions {
             lower_agent_definitions(&config)?
@@ -1865,8 +1866,15 @@ impl RuntimeAssemblyBuilder {
         // jedem Fall durch Einstiegsprofil und Sandbox gedeckelt.
         let agent_ir =
             resolve_explicit_root_agent(spec.active_agent.as_deref(), &config, &agent_definitions)?;
+        // #22 Welle 3: eine native, personalisierte harw bringt ihre UIA
+        // bereits eingebettet mit (`harw-cli::embedded_uia`); die gewinnt
+        // dann über `harness.active_uia_definition` — die Laufzeit selbst
+        // kennt `harw-cli` nicht, sie bekommt die eingebettete Definition
+        // ausschließlich über `spec.embedded` gereicht (s. TODO unten).
         let uia_ir = if agent_ir.is_some() {
             None
+        } else if let Some(embedded) = spec.embedded.as_deref() {
+            Some(resolve_embedded_uia(embedded)?)
         } else {
             resolve_active_uia(spec.entry, &config, &agent_definitions)?
         };
@@ -2229,7 +2237,12 @@ impl RuntimeAssemblyBuilder {
                 effort_cap: Some(role_effort_weights.uia.to_string()),
             };
             let access = harw_registry_defaults::profile::AgentDefinitionAccess {
-                project_agents_dir: Some(project.project_root.join(".harw").join("agents")),
+                project_agents_dir: Some(
+                    project
+                        .project_root
+                        .join(harw_home::project_dir_name())
+                        .join("agents"),
+                ),
                 profile_agents_dir: profile_agents_dir.clone(),
                 mode: harw_registry_defaults::agent_definition_tools::DefinitionWriteMode::Commit,
                 ceiling: Some(ceiling),
@@ -3148,6 +3161,38 @@ fn resolve_active_uia(
         });
     }
     Ok(Some(ir))
+}
+
+/// Senkt die eingebettete UIA einer personalisierten harw (#22) und prüft
+/// ihre Rolle, wie [`resolve_active_uia`] es für `harness.active_uia_definition`
+/// tut.
+///
+/// # Beschreibung
+/// Aufgerufen anstelle von [`resolve_active_uia`], wenn `spec.embedded`
+/// gesetzt ist — die native, personalisierte harw trägt ihre UIA bereits im
+/// Binary; sie gewinnt über eine konfigurierte
+/// `harness.active_uia_definition`, muss sich aber denselben Rollen- und
+/// Senkungs-Regeln stellen. `harw-runtime` kennt `harw-cli::embedded_uia`
+/// nicht selbst — der Aufrufer (`harw-cli`) reicht die verifizierte IR über
+/// `RuntimeSpec` durch.
+///
+/// # Errors
+/// [`RuntimeError::Registry`], wenn die eingebettete Definition nicht die
+/// Rolle `user-interface` trägt.
+fn resolve_embedded_uia(
+    embedded: &harw_agent_dsl::ir_v2::AgentIr,
+) -> RuntimeResult<ExecutableAgentIr> {
+    let ir = ExecutableAgentIr::from(embedded);
+    if ir.role() != AgentRoleId::UserInterface {
+        return Err(RuntimeError::Registry {
+            detail: format!(
+                "embedded UIA '{}' has role {:?}, expected user-interface",
+                embedded.id,
+                ir.role()
+            ),
+        });
+    }
+    Ok(ir)
 }
 
 /// Löst einen explizit gewählten Wurzel-Agenten auf und prüft seine Rolle.

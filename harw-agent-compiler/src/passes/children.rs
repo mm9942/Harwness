@@ -33,7 +33,12 @@ pub trait ChildResolver {
     /// # Errors
     /// `Err(message)` if the name resolves to nothing, or the diagnostics of
     /// a child that does not compile, rendered as text.
-    fn compile_child(&self, name: &str, depth: u32, stack: &[String]) -> Result<ResolvedChild, String>;
+    fn compile_child(
+        &self,
+        name: &str,
+        depth: u32,
+        stack: &[String],
+    ) -> Result<ResolvedChild, String>;
 }
 
 /// Resolves every delegation target and child orchestrator, transitively,

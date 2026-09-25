@@ -160,8 +160,11 @@ pub fn builtin_source_files() -> &'static [(SourceFile, Option<String>)] {
             builtin_agent_sources()
                 .into_iter()
                 .map(|(path, source)| {
-                    let file =
-                        SourceFile::new(DefinitionLayer::BuiltIn, format!("builtin/{path}"), source);
+                    let file = SourceFile::new(
+                        DefinitionLayer::BuiltIn,
+                        format!("builtin/{path}"),
+                        source,
+                    );
                     let id = file.declared_id();
                     (file, id)
                 })
@@ -238,7 +241,11 @@ mod tests {
                 .iter()
                 .any(|(_, id)| id.as_deref() == Some("harwness.agent.worker-base@1"))
         );
-        assert!(files.iter().all(|(file, _)| file.label().starts_with("builtin/")));
+        assert!(
+            files
+                .iter()
+                .all(|(file, _)| file.label().starts_with("builtin/"))
+        );
         let programs = builtin_context_program_sources();
         assert!(programs.iter().any(|(name, _)| *name == "explore"));
         let library = builtin_context_program_library()?;

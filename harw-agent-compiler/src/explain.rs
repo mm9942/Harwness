@@ -92,7 +92,8 @@ fn ir_path(field: &str) -> String {
 }
 
 fn lookup_json<'a>(value: &'a Value, path: &str) -> Option<&'a Value> {
-    path.split('.').try_fold(value, |current, key| current.get(key))
+    path.split('.')
+        .try_fold(value, |current, key| current.get(key))
 }
 
 /// The top-level fields `explain <name>` lists without a field argument.
@@ -121,7 +122,11 @@ pub const DEFAULT_FIELDS: &[&str] = &[
 pub fn explain_field(compiled: &Compiled, sources: &SourceSet, field: &str) -> FieldExplanation {
     if let Some(tool) = field
         .strip_prefix("tool:")
-        .or_else(|| field.strip_prefix("tools.").filter(|rest| rest.contains('.') || rest.contains('_')))
+        .or_else(|| {
+            field
+                .strip_prefix("tools.")
+                .filter(|rest| rest.contains('.') || rest.contains('_'))
+        })
         .filter(|tool| !matches!(*tool, "admitted" | "forbidden"))
     {
         return explain_tool(compiled, sources, tool);
@@ -189,7 +194,9 @@ fn explain_tool(compiled: &Compiled, sources: &SourceSet, tool: &str) -> FieldEx
     match (admitted, forbidden) {
         (true, false) => notes.push(format!("`{tool}` is admitted and in the rights manifest")),
         (_, true) => notes.push(format!("`{tool}` is forbidden (`tools.forbidden`)")),
-        (false, false) => notes.push(format!("`{tool}` is not admitted (not in `tools.admitted`)")),
+        (false, false) => notes.push(format!(
+            "`{tool}` is not admitted (not in `tools.admitted`)"
+        )),
     }
     if let Some((_, reason)) = unit.pruned.iter().find(|(pruned, _)| pruned == tool) {
         notes.push(format!("pruned by the compiler: {reason}"));
@@ -207,7 +214,11 @@ fn explain_tool(compiled: &Compiled, sources: &SourceSet, tool: &str) -> FieldEx
         if let Some(ceiling) = &flow.ceiling {
             notes.push(format!(
                 "the author ceiling {} it",
-                if ceiling.tools.contains(tool) { "admits" } else { "does not admit" }
+                if ceiling.tools.contains(tool) {
+                    "admits"
+                } else {
+                    "does not admit"
+                }
             ));
         }
     }
@@ -218,7 +229,11 @@ fn explain_tool(compiled: &Compiled, sources: &SourceSet, tool: &str) -> FieldEx
             entry.provider.crate_name,
             entry.class.as_str(),
             entry.feature(),
-            if entry.always_available { ", always available" } else { "" }
+            if entry.always_available {
+                ", always available"
+            } else {
+                ""
+            }
         )),
         None => notes.push("catalog: no provider serves this tool".to_owned()),
     }
@@ -264,7 +279,8 @@ mod tests {
 
     #[test]
     fn test_explain_code_has_example_and_fix() -> Result<(), &'static str> {
-        let explanation = explain_code("HARW-PATCH-003").ok_or("HARW-PATCH-003 is in the catalog")?;
+        let explanation =
+            explain_code("HARW-PATCH-003").ok_or("HARW-PATCH-003 is in the catalog")?;
         assert_eq!(explanation.severity, "error");
         let text = explanation.text();
         assert!(text.starts_with("HARW-PATCH-003 (error):"), "{text}");

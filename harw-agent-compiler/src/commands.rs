@@ -15,7 +15,7 @@ use serde::Serialize;
 use serde_json::{Value, json};
 
 use crate::backend::native::NativeFlavor;
-use crate::backend::runner::RunnerProbe;
+use crate::backend::runner::{RunnerProbe, locate_runner};
 use crate::backend::{BuildOptions, build};
 use crate::bin_dir::BinDir;
 use crate::cache::{
@@ -30,14 +30,17 @@ use crate::env::{CompilerEnv, InstallRecord};
 use crate::error::CompileError;
 use crate::explain::{DEFAULT_FIELDS, explain_code, explain_field, render_fields};
 use crate::fmt::{definition_files, format_files};
-use crate::graph::{GraphFormat, GraphKind, delegation_graph, render, resolution_graph, rights_graph};
+use crate::graph::{
+    GraphFormat, GraphKind, delegation_graph, render, resolution_graph, rights_graph,
+};
 use crate::inspect::{inspect_path, read_artifact, resolve_target};
 use crate::render::render_diagnostics;
 use crate::scaffold::{ScaffoldRole, scaffold};
 use crate::testing::{CaseRunner, case_files, render_cases, run_cases};
 use crate::uia::{auto_build_uia, explicit_binary, native_binary_name, native_home_name};
 
-/// Exit code of `harw agent run` until the runner exists (EX_UNAVAILABLE).
+/// Exit code of `harw agent run` when no `harw-agent-runner` can be located
+/// at all for a bare artifact target (EX_UNAVAILABLE); see [`run_agent`].
 pub const EXIT_RUNNER_UNAVAILABLE: i32 = 69;
 
 /// Arguments of `build`.
@@ -173,19 +176,8 @@ pub enum AgentCommand {
 
 /// The subcommand names [`parse_tokens`] understands.
 pub const COMPILER_ACTIONS: &[&str] = &[
-    "check",
-    "build",
-    "inspect",
-    "graph",
-    "explain",
-    "new",
-    "fmt",
-    "diff",
-    "test",
-    "run",
-    "versions",
-    "clean",
-    "doctor",
+    "check", "build", "inspect", "graph", "explain", "new", "fmt", "diff", "test", "run",
+    "versions", "clean", "doctor",
 ];
 
 /// What a command produced.
@@ -269,14 +261,7 @@ pub fn run_command(ctx: &mut CommandContext<'_>, command: AgentCommand) -> Comma
         AgentCommand::Fmt { paths, check } => fmt(ctx, &paths, check),
         AgentCommand::Diff { left, right } => diff(ctx, &left, &right),
         AgentCommand::Test { target } => test(ctx, target.as_deref()),
-        AgentCommand::Run { target, prompt } => CommandOutput {
-            text: format!(
-                "`harw agent run {target}` requires the runner (wave 3): harw-agent-runner is not part of this harw yet{}",
-                if prompt.is_some() { "; the prompt was not sent" } else { "" }
-            ),
-            json: json!({"error": "runner-unavailable", "target": target, "requires": "harw-agent-runner (#22 wave 3)"}),
-            exit_code: EXIT_RUNNER_UNAVAILABLE,
-        },
+        AgentCommand::Run { target, prompt } => run_agent(ctx, &target, prompt.as_deref()),
         AgentCommand::Versions { name } => versions(ctx, &name),
         AgentCommand::Use { name, version } => use_version(ctx, &name, &version),
         AgentCommand::Clean(args) => clean(ctx, &args),
@@ -333,7 +318,8 @@ fn check(ctx: &mut CommandContext<'_>, targets: &[String]) -> CommandOutput {
     };
     if targets.is_empty() {
         return CommandOutput::ok(
-            "no user definitions to check (name one, or create one with `harw agent new`)".to_owned(),
+            "no user definitions to check (name one, or create one with `harw agent new`)"
+                .to_owned(),
             json!({"targets": []}),
         );
     }
@@ -354,7 +340,11 @@ fn check(ctx: &mut CommandContext<'_>, targets: &[String]) -> CommandOutput {
                 let rendered = render_diagnostics(&diagnostics, &files);
                 text.push(format!(
                     "{target}: ok{}",
-                    if rendered.is_empty() { String::new() } else { format!("\n{rendered}") }
+                    if rendered.is_empty() {
+                        String::new()
+                    } else {
+                        format!("\n{rendered}")
+                    }
                 ));
                 results.push(json!({"target": target, "ok": true, "diagnostics": diagnostics}));
             }
@@ -378,7 +368,11 @@ fn check(ctx: &mut CommandContext<'_>, targets: &[String]) -> CommandOutput {
     }
 }
 
-fn entry_for(compiler: &mut Compiler, raw: &str, cwd: &Path) -> Result<DefinitionEntry, CommandOutput> {
+fn entry_for(
+    compiler: &mut Compiler,
+    raw: &str,
+    cwd: &Path,
+) -> Result<DefinitionEntry, CommandOutput> {
     let input = AgentInput::parse(raw, cwd);
     match compiler.resolve(&input) {
         Ok(Target::Entry(entry)) => Ok(entry),
@@ -448,7 +442,10 @@ fn build_command(ctx: &mut CommandContext<'_>, args: &BuildArgs) -> CommandOutpu
                 report.installed.file.display()
             )];
             if report.installed.current {
-                lines.push(format!("current: {}", ctx.env.bin_dir().join(&report.name).display()));
+                lines.push(format!(
+                    "current: {}",
+                    ctx.env.bin_dir().join(&report.name).display()
+                ));
             }
             if let Some(output) = &report.output {
                 lines.push(format!("copied to {}", output.display()));
@@ -459,11 +456,18 @@ fn build_command(ctx: &mut CommandContext<'_>, args: &BuildArgs) -> CommandOutpu
                     "note: a built-in role is only copied; harw keeps running its embedded built-in".to_owned(),
                 );
             }
-            if report.native.as_ref().is_some_and(|native| native.flavor == NativeFlavor::Harw) {
-                lines.push("a complete, personalized harw with this UIA as its fixed root".to_owned());
+            if report
+                .native
+                .as_ref()
+                .is_some_and(|native| native.flavor == NativeFlavor::Harw)
+            {
+                lines.push(
+                    "a complete, personalized harw with this UIA as its fixed root".to_owned(),
+                );
             }
             lines.extend(report.notes.iter().map(|note| format!("note: {note}")));
-            let rendered = render_diagnostics(compiled.diagnostics.as_slice(), &compiler.sources().files);
+            let rendered =
+                render_diagnostics(compiled.diagnostics.as_slice(), &compiler.sources().files);
             if !rendered.is_empty() {
                 lines.push(rendered);
             }
@@ -477,15 +481,130 @@ fn build_command(ctx: &mut CommandContext<'_>, args: &BuildArgs) -> CommandOutpu
 }
 
 fn inspect(ctx: &mut CommandContext<'_>, target: &str) -> CommandOutput {
-    let result = resolve_target(&ctx.env, target).and_then(|(path, record)| inspect_path(&path, record));
+    let result =
+        resolve_target(&ctx.env, target).and_then(|(path, record)| inspect_path(&path, record));
     match result {
         Ok(report) => CommandOutput::ok(report.text(), to_json(&report)),
         Err(error) => CommandOutput::from_error(&error, &[]),
     }
 }
 
-fn compile_named(ctx: &CommandContext<'_>, target: &str) -> Result<(Compiler, Compiled), (CompileError, Vec<harw_agent_dsl::diagnostics::SourceFile>)> {
-    let mut compiler = compiler(&ctx.env, CompilerOptions::default()).map_err(|error| (error, Vec::new()))?;
+/// `harw agent run <artifact|name> [prompt]`.
+///
+/// # Decision (wave 3B): the runner always runs out of process
+/// `harw-agent-compiler` has no dependency on `harw-agent-runner`, and
+/// through it none on `harw-runtime` or `harwness-sdk`. That is not new
+/// here: this crate's `Cargo.toml` already states "compiling never starts
+/// an agent" as a standing invariant, and `harw-agent-runner`'s manifest
+/// only *dev*-depends on the compiler (for its `--capabilities` fixture),
+/// deliberately keeping that a one-way, test-only edge with "no cycle:
+/// `harw-agent-compiler` does not depend on us" spelled out in a comment.
+/// So `run` never links the runner in-process; it always execs it as a
+/// subprocess, the same way `harw agent build`'s default backend locates
+/// one ([`locate_runner`]):
+///
+/// - A target that is already a built binary (an installed agent name, or
+///   a path to one) is executed directly: it already *is*
+///   `harw-agent-runner` fused with that agent's artifact.
+/// - A bare `.harwa` artifact file has no runner of its own: a matching
+///   runner is located, the artifact is appended to a copy of it in memory
+///   (the exact [`harw_agent_artifact::append_to_executable`] the artifact
+///   backend uses at build time), and the combined bytes are written to a
+///   throwaway executable that is exec'ed and then removed.
+///
+/// The prompt, if given, is passed as the runner's one positional argument
+/// (its one-shot mode; see `iface::cli`); without one the runner reads
+/// stdin itself. Stdio is inherited, so streaming output and the terminal
+/// approval handler behave exactly as a direct invocation would. The
+/// runner's own exit code (0 completed, 1 failed, 2 cancelled, 3 approval
+/// denied) passes through unchanged; a runner that cannot be found at all
+/// keeps reporting [`EXIT_RUNNER_UNAVAILABLE`], as `run` always has.
+fn run_agent(ctx: &mut CommandContext<'_>, target: &str, prompt: Option<&str>) -> CommandOutput {
+    let (path, _record) = match resolve_target(&ctx.env, target) {
+        Ok(resolved) => resolved,
+        Err(error) => return CommandOutput::from_error(&error, &[]),
+    };
+    let (artifact, container, _runner_bytes) = match read_artifact(&path) {
+        Ok(read) => read,
+        Err(error) => return CommandOutput::from_error(&error, &[]),
+    };
+    let mut cleanup: Option<PathBuf> = None;
+    let executable = if container == "binary" {
+        path
+    } else {
+        let runner = match locate_runner(&ctx.env, None, &ctx.env.host_target) {
+            Ok(runner) => runner,
+            Err(error @ CompileError::RunnerNotFound { .. }) => {
+                return CommandOutput {
+                    text: format!("error: {error}"),
+                    json: json!({"error": error.kind(), "message": error.to_string()}),
+                    exit_code: EXIT_RUNNER_UNAVAILABLE,
+                };
+            }
+            Err(error) => return CommandOutput::from_error(&error, &[]),
+        };
+        (ctx.progress)(&format!(
+            "runner: {} ({:?})",
+            runner.path.display(),
+            runner.source
+        ));
+        let runner_bytes = match std::fs::read(&runner.path) {
+            Ok(bytes) => bytes,
+            Err(source) => {
+                return CommandOutput::from_error(
+                    &CompileError::Io {
+                        context: format!("read {}", runner.path.display()),
+                        source,
+                    },
+                    &[],
+                );
+            }
+        };
+        let binary = harw_agent_artifact::append_to_executable(&runner_bytes, &artifact);
+        let temp = std::env::temp_dir().join(format!(
+            "harw-agent-run-{}-{}",
+            std::process::id(),
+            artifact.digest()
+        ));
+        if let Err(source) = harw_agent_artifact::write_executable(&temp, &binary) {
+            return CommandOutput::from_error(&CompileError::Artifact(source), &[]);
+        }
+        cleanup = Some(temp.clone());
+        temp
+    };
+    let mut command = std::process::Command::new(&executable);
+    if let Some(prompt) = prompt {
+        command.arg(prompt);
+    }
+    let status = command.status();
+    if let Some(temp) = &cleanup {
+        let _ = std::fs::remove_file(temp);
+    }
+    match status {
+        Ok(status) => {
+            let exit_code = status.code().unwrap_or(1);
+            CommandOutput {
+                text: format!("`{}` exited with {exit_code}", executable.display()),
+                json: json!({"executable": executable, "exit_code": exit_code}),
+                exit_code,
+            }
+        }
+        Err(source) => CommandOutput::from_error(
+            &CompileError::Io {
+                context: format!("run {}", executable.display()),
+                source,
+            },
+            &[],
+        ),
+    }
+}
+
+fn compile_named(
+    ctx: &CommandContext<'_>,
+    target: &str,
+) -> Result<(Compiler, Compiled), (CompileError, Vec<harw_agent_dsl::diagnostics::SourceFile>)> {
+    let mut compiler =
+        compiler(&ctx.env, CompilerOptions::default()).map_err(|error| (error, Vec::new()))?;
     let result = compiler.compile_input(&AgentInput::parse(target, &ctx.env.cwd));
     match result {
         Ok(compiled) => Ok((compiler, compiled)),
@@ -539,7 +658,10 @@ fn graph(
     }
     let mut text = render(&graphs, format);
     if !skipped.is_empty() && format == GraphFormat::Text {
-        text.push_str(&format!("\nskipped (does not compile):\n  {}\n", skipped.join("\n  ")));
+        text.push_str(&format!(
+            "\nskipped (does not compile):\n  {}\n",
+            skipped.join("\n  ")
+        ));
     }
     let json = json!({"graphs": graphs, "skipped": skipped});
     if compiled_all.is_empty() && !skipped.is_empty() {
@@ -565,7 +687,10 @@ fn explain(ctx: &mut CommandContext<'_>, target: &str, field: Option<&str>) -> C
     };
     let fields: Vec<String> = match field {
         Some(field) => vec![field.to_owned()],
-        None => DEFAULT_FIELDS.iter().map(|field| (*field).to_owned()).collect(),
+        None => DEFAULT_FIELDS
+            .iter()
+            .map(|field| (*field).to_owned())
+            .collect(),
     };
     let explanations: Vec<_> = fields
         .iter()
@@ -609,7 +734,12 @@ fn new(
 
 fn fmt(ctx: &mut CommandContext<'_>, paths: &[PathBuf], check: bool) -> CommandOutput {
     let roots: Vec<PathBuf> = if paths.is_empty() {
-        ctx.env.layers.iter().map(|layer| layer.join("agents")).filter(|dir| dir.is_dir()).collect()
+        ctx.env
+            .layers
+            .iter()
+            .map(|layer| layer.join("agents"))
+            .filter(|dir| dir.is_dir())
+            .collect()
     } else {
         paths.iter().map(|path| ctx.env.resolve(path)).collect()
     };
@@ -622,7 +752,10 @@ fn fmt(ctx: &mut CommandContext<'_>, paths: &[PathBuf], check: bool) -> CommandO
     }
     let results = format_files(&files, check);
     let changed = results.iter().filter(|result| result.changed).count();
-    let failed = results.iter().filter(|result| result.error.is_some()).count();
+    let failed = results
+        .iter()
+        .filter(|result| result.error.is_some())
+        .count();
     let mut lines: Vec<String> = results
         .iter()
         .filter(|result| result.changed || result.error.is_some())
@@ -635,7 +768,11 @@ fn fmt(ctx: &mut CommandContext<'_>, paths: &[PathBuf], check: bool) -> CommandO
     lines.push(format!(
         "{} file(s), {changed} {}, {failed} error(s)",
         results.len(),
-        if check { "not formatted" } else { "reformatted" }
+        if check {
+            "not formatted"
+        } else {
+            "reformatted"
+        }
     ));
     let json = json!({"files": results, "changed": changed, "errors": failed, "check": check});
     if failed > 0 || (check && changed > 0) {
@@ -697,7 +834,12 @@ fn test(ctx: &mut CommandContext<'_>, target: Option<&str>) -> CommandOutput {
                 .sources()
                 .entries
                 .iter()
-                .filter(|entry| entry.dir.as_ref().is_some_and(|dir| dir.join("tests").is_dir()))
+                .filter(|entry| {
+                    entry
+                        .dir
+                        .as_ref()
+                        .is_some_and(|dir| dir.join("tests").is_dir())
+                })
                 .map(|entry| entry.name.clone())
                 .collect(),
             Err(error) => return CommandOutput::from_error(&error, &[]),
@@ -723,8 +865,18 @@ fn test(ctx: &mut CommandContext<'_>, target: Option<&str>) -> CommandOutput {
                 continue;
             }
         };
-        let files = compiled.unit.dir.as_deref().map(case_files).unwrap_or_default();
-        match run_cases(&compiled.unit.ir, &compiled.artifact, &files, ctx.case_runner) {
+        let files = compiled
+            .unit
+            .dir
+            .as_deref()
+            .map(case_files)
+            .unwrap_or_default();
+        match run_cases(
+            &compiled.unit.ir,
+            &compiled.artifact,
+            &files,
+            ctx.case_runner,
+        ) {
             Ok(results) => {
                 let ok = results.iter().all(crate::testing::CaseResult::ok);
                 failed |= !ok;
@@ -760,7 +912,10 @@ fn versions(ctx: &mut CommandContext<'_>, name: &str) -> CommandOutput {
     let bin = BinDir::new(ctx.env.bin_dir());
     match bin.versions(name) {
         Ok(versions) if versions.is_empty() => CommandOutput::failed(
-            format!("`{name}` has no installed versions in {}", ctx.env.bin_dir().display()),
+            format!(
+                "`{name}` has no installed versions in {}",
+                ctx.env.bin_dir().display()
+            ),
             json!({"name": name, "versions": []}),
         ),
         Ok(versions) => {
@@ -777,7 +932,10 @@ fn versions(ctx: &mut CommandContext<'_>, name: &str) -> CommandOutput {
                     )
                 })
                 .collect();
-            CommandOutput::ok(lines.join("\n"), json!({"name": name, "versions": versions}))
+            CommandOutput::ok(
+                lines.join("\n"),
+                json!({"name": name, "versions": versions}),
+            )
         }
         Err(error) => CommandOutput::from_error(&error, &[]),
     }
@@ -838,7 +996,11 @@ fn clean(ctx: &mut CommandContext<'_>, args: &CleanArgs) -> CommandOutput {
     } else {
         dir_size(bin.root())
     };
-    let verb = if args.dry_run { "would remove" } else { "removed" };
+    let verb = if args.dry_run {
+        "would remove"
+    } else {
+        "removed"
+    };
     let mut lines = vec![
         format!(
             "build cache {}: {} → {}",
@@ -854,13 +1016,21 @@ fn clean(ctx: &mut CommandContext<'_>, args: &CleanArgs) -> CommandOutput {
         ),
     ];
     for removal in &gc.removed {
-        lines.push(format!("  {verb} {} ({}, {})", removal.path.display(), removal.reason, human_bytes(removal.bytes)));
+        lines.push(format!(
+            "  {verb} {} ({}, {})",
+            removal.path.display(),
+            removal.reason,
+            human_bytes(removal.bytes)
+        ));
     }
     for version in &removed_versions {
         lines.push(format!("  {verb} {} {}", version.name, version.dir_name));
     }
     for dir in &stale {
-        lines.push(format!("  {verb} runner of another harw version {}", dir.display()));
+        lines.push(format!(
+            "  {verb} runner of another harw version {}",
+            dir.display()
+        ));
     }
     CommandOutput::ok(
         lines.join("\n"),
@@ -888,15 +1058,31 @@ pub fn parse_tokens(tokens: &[String]) -> Result<Option<AgentCommand>, String> {
     let mut positional: Vec<String> = Vec::new();
     let mut flags: Vec<(String, Option<String>)> = Vec::new();
     let takes_value = [
-        "--interface", "--runner", "-o", "--output", "--target", "--harw-src", "--format",
-        "--kind", "--role", "--extends", "--dir", "--older-than", "--keep",
+        "--interface",
+        "--runner",
+        "-o",
+        "--output",
+        "--target",
+        "--harw-src",
+        "--format",
+        "--kind",
+        "--role",
+        "--extends",
+        "--dir",
+        "--older-than",
+        "--keep",
     ];
     let mut iter = rest.iter();
     while let Some(token) = iter.next() {
-        if let Some((flag, value)) = token.split_once('=').filter(|(flag, _)| flag.starts_with("--")) {
+        if let Some((flag, value)) = token
+            .split_once('=')
+            .filter(|(flag, _)| flag.starts_with("--"))
+        {
             flags.push((flag.to_owned(), Some(value.to_owned())));
         } else if takes_value.contains(&token.as_str()) {
-            let value = iter.next().ok_or_else(|| format!("{token} needs a value"))?;
+            let value = iter
+                .next()
+                .ok_or_else(|| format!("{token} needs a value"))?;
             flags.push((token.clone(), Some(value.clone())));
         } else if token.starts_with('-') && token.len() > 1 {
             flags.push((token.clone(), None));
@@ -919,10 +1105,14 @@ pub fn parse_tokens(tokens: &[String]) -> Result<Option<AgentCommand>, String> {
             .ok_or_else(|| format!("/agent {action} needs {what}"))
     };
     let command = match action.as_str() {
-        "check" => AgentCommand::Check { targets: positional.clone() },
+        "check" => AgentCommand::Check {
+            targets: positional.clone(),
+        },
         "build" => AgentCommand::Build(BuildArgs {
             target: first("an agent name or path")?,
-            interfaces: value(&["--interface"]).map(|raw| parse_interfaces(&raw)).transpose()?,
+            interfaces: value(&["--interface"])
+                .map(|raw| parse_interfaces(&raw))
+                .transpose()?,
             native: flag("--native"),
             artifact_only: flag("--artifact-only"),
             runner: value(&["--runner"]).map(PathBuf::from),
@@ -930,16 +1120,21 @@ pub fn parse_tokens(tokens: &[String]) -> Result<Option<AgentCommand>, String> {
             target_triple: value(&["--target"]),
             harw_src: value(&["--harw-src"]).map(PathBuf::from),
         }),
-        "inspect" => AgentCommand::Inspect { target: first("a binary, artifact or name")? },
+        "inspect" => AgentCommand::Inspect {
+            target: first("a binary, artifact or name")?,
+        },
         "graph" => AgentCommand::Graph {
             target: positional.first().cloned(),
             all: flag("--all"),
             format: match value(&["--format"]) {
-                Some(raw) => GraphFormat::parse(&raw).ok_or_else(|| format!("unknown format `{raw}` (text, dot, mermaid, json)"))?,
+                Some(raw) => GraphFormat::parse(&raw)
+                    .ok_or_else(|| format!("unknown format `{raw}` (text, dot, mermaid, json)"))?,
                 None => GraphFormat::Text,
             },
             kind: match value(&["--kind"]) {
-                Some(raw) => GraphKind::parse(&raw).ok_or_else(|| format!("unknown kind `{raw}` (delegation, resolution, rights, all)"))?,
+                Some(raw) => GraphKind::parse(&raw).ok_or_else(|| {
+                    format!("unknown kind `{raw}` (delegation, resolution, rights, all)")
+                })?,
                 None => GraphKind::All,
             },
         },
@@ -950,7 +1145,8 @@ pub fn parse_tokens(tokens: &[String]) -> Result<Option<AgentCommand>, String> {
         "new" => AgentCommand::New {
             name: first("a name")?,
             role: match value(&["--role"]) {
-                Some(raw) => ScaffoldRole::parse(&raw).ok_or_else(|| format!("unknown role `{raw}` (worker, child-orchestrator)"))?,
+                Some(raw) => ScaffoldRole::parse(&raw)
+                    .ok_or_else(|| format!("unknown role `{raw}` (worker, child-orchestrator)"))?,
                 None => ScaffoldRole::Worker,
             },
             extends: value(&["--extends"]),
@@ -962,21 +1158,34 @@ pub fn parse_tokens(tokens: &[String]) -> Result<Option<AgentCommand>, String> {
         },
         "diff" => AgentCommand::Diff {
             left: first("two sides")?,
-            right: positional.get(1).cloned().ok_or_else(|| "/agent diff needs two sides".to_owned())?,
+            right: positional
+                .get(1)
+                .cloned()
+                .ok_or_else(|| "/agent diff needs two sides".to_owned())?,
         },
-        "test" => AgentCommand::Test { target: positional.first().cloned() },
+        "test" => AgentCommand::Test {
+            target: positional.first().cloned(),
+        },
         "run" => AgentCommand::Run {
             target: first("an artifact or name")?,
             prompt: (positional.len() > 1).then(|| positional[1..].join(" ")),
         },
-        "versions" => AgentCommand::Versions { name: first("a name")? },
+        "versions" => AgentCommand::Versions {
+            name: first("a name")?,
+        },
         "clean" => AgentCommand::Clean(CleanArgs {
             all: flag("--all"),
             older_than_days: value(&["--older-than"])
-                .map(|raw| raw.parse::<u64>().map_err(|_| format!("--older-than needs days, not `{raw}`")))
+                .map(|raw| {
+                    raw.parse::<u64>()
+                        .map_err(|_| format!("--older-than needs days, not `{raw}`"))
+                })
                 .transpose()?,
             keep: value(&["--keep"])
-                .map(|raw| raw.parse::<usize>().map_err(|_| format!("--keep needs a number, not `{raw}`")))
+                .map(|raw| {
+                    raw.parse::<usize>()
+                        .map_err(|_| format!("--keep needs a number, not `{raw}`"))
+                })
                 .transpose()?,
             dry_run: flag("--dry-run"),
         }),
@@ -1028,8 +1237,12 @@ pub fn installed_agents(env: &CompilerEnv) -> Vec<InstalledSummary> {
             InstalledSummary {
                 auto: auto_name.as_deref() == Some(name.as_str()),
                 current: current.as_ref().map(|version| version.dir_name.clone()),
-                definition_id: current.as_ref().map(|version| version.record.definition_id.clone()),
-                source_snapshot: current.as_ref().map(|version| version.record.source_snapshot.clone()),
+                definition_id: current
+                    .as_ref()
+                    .map(|version| version.record.definition_id.clone()),
+                source_snapshot: current
+                    .as_ref()
+                    .map(|version| version.record.source_snapshot.clone()),
                 name,
             }
         })
@@ -1039,7 +1252,10 @@ pub fn installed_agents(env: &CompilerEnv) -> Vec<InstalledSummary> {
 /// The lowered snapshot of every definition name (front end only), for the
 /// build state in `harw agent list`; names that do not lower are missing.
 #[must_use]
-pub fn definition_snapshots(env: &CompilerEnv, names: &[String]) -> std::collections::BTreeMap<String, (String, String)> {
+pub fn definition_snapshots(
+    env: &CompilerEnv,
+    names: &[String],
+) -> std::collections::BTreeMap<String, (String, String)> {
     let mut out = std::collections::BTreeMap::new();
     let Ok(compiler) = Compiler::new(env.clone(), CompilerOptions::default()) else {
         return out;
@@ -1065,7 +1281,9 @@ mod tests {
 
     #[test]
     fn test_parse_tokens_for_every_action() -> Result<(), String> {
-        let parsed = parse_tokens(&tokens("build ec --interface cli,mcp --native -o out --target x"))?;
+        let parsed = parse_tokens(&tokens(
+            "build ec --interface cli,mcp --native -o out --target x",
+        ))?;
         let Some(AgentCommand::Build(args)) = parsed else {
             return Err(format!("expected build, got {parsed:?}"));
         };
@@ -1075,33 +1293,91 @@ mod tests {
         assert_eq!(args.output, Some(PathBuf::from("out")));
         assert_eq!(args.target_triple.as_deref(), Some("x"));
 
-        assert!(matches!(parse_tokens(&tokens("check a b"))?, Some(AgentCommand::Check { targets }) if targets.len() == 2));
-        assert!(matches!(parse_tokens(&tokens("graph --all --format=dot --kind rights"))?, Some(AgentCommand::Graph { all: true, format: GraphFormat::Dot, kind: GraphKind::Rights, .. })));
-        assert!(matches!(parse_tokens(&tokens("explain HARW-PATCH-003"))?, Some(AgentCommand::Explain { field: None, .. })));
-        assert!(matches!(parse_tokens(&tokens("new x --role child-orchestrator"))?, Some(AgentCommand::New { role: ScaffoldRole::ChildOrchestrator, .. })));
-        assert!(matches!(parse_tokens(&tokens("fmt --check"))?, Some(AgentCommand::Fmt { check: true, .. })));
-        assert!(matches!(parse_tokens(&tokens("diff a b"))?, Some(AgentCommand::Diff { .. })));
-        assert!(matches!(parse_tokens(&tokens("test"))?, Some(AgentCommand::Test { target: None })));
-        assert!(matches!(parse_tokens(&tokens("run x hello world"))?, Some(AgentCommand::Run { prompt: Some(p), .. }) if p == "hello world"));
-        assert!(matches!(parse_tokens(&tokens("versions ec"))?, Some(AgentCommand::Versions { .. })));
-        assert!(matches!(parse_tokens(&tokens("clean --dry-run --keep 2 --older-than 7"))?, Some(AgentCommand::Clean(CleanArgs { dry_run: true, keep: Some(2), older_than_days: Some(7), all: false }))));
-        assert!(matches!(parse_tokens(&tokens("doctor"))?, Some(AgentCommand::Doctor)));
-        assert!(matches!(parse_tokens(&tokens("inspect ./ec"))?, Some(AgentCommand::Inspect { .. })));
-        assert_eq!(parse_tokens(&tokens("list"))?, None, "not a compiler action");
+        assert!(
+            matches!(parse_tokens(&tokens("check a b"))?, Some(AgentCommand::Check { targets }) if targets.len() == 2)
+        );
+        assert!(matches!(
+            parse_tokens(&tokens("graph --all --format=dot --kind rights"))?,
+            Some(AgentCommand::Graph {
+                all: true,
+                format: GraphFormat::Dot,
+                kind: GraphKind::Rights,
+                ..
+            })
+        ));
+        assert!(matches!(
+            parse_tokens(&tokens("explain HARW-PATCH-003"))?,
+            Some(AgentCommand::Explain { field: None, .. })
+        ));
+        assert!(matches!(
+            parse_tokens(&tokens("new x --role child-orchestrator"))?,
+            Some(AgentCommand::New {
+                role: ScaffoldRole::ChildOrchestrator,
+                ..
+            })
+        ));
+        assert!(matches!(
+            parse_tokens(&tokens("fmt --check"))?,
+            Some(AgentCommand::Fmt { check: true, .. })
+        ));
+        assert!(matches!(
+            parse_tokens(&tokens("diff a b"))?,
+            Some(AgentCommand::Diff { .. })
+        ));
+        assert!(matches!(
+            parse_tokens(&tokens("test"))?,
+            Some(AgentCommand::Test { target: None })
+        ));
+        assert!(
+            matches!(parse_tokens(&tokens("run x hello world"))?, Some(AgentCommand::Run { prompt: Some(p), .. }) if p == "hello world")
+        );
+        assert!(matches!(
+            parse_tokens(&tokens("versions ec"))?,
+            Some(AgentCommand::Versions { .. })
+        ));
+        assert!(matches!(
+            parse_tokens(&tokens("clean --dry-run --keep 2 --older-than 7"))?,
+            Some(AgentCommand::Clean(CleanArgs {
+                dry_run: true,
+                keep: Some(2),
+                older_than_days: Some(7),
+                all: false
+            }))
+        ));
+        assert!(matches!(
+            parse_tokens(&tokens("doctor"))?,
+            Some(AgentCommand::Doctor)
+        ));
+        assert!(matches!(
+            parse_tokens(&tokens("inspect ./ec"))?,
+            Some(AgentCommand::Inspect { .. })
+        ));
+        assert_eq!(
+            parse_tokens(&tokens("list"))?,
+            None,
+            "not a compiler action"
+        );
         assert_eq!(parse_tokens(&[])?, None);
         assert!(parse_tokens(&tokens("build")).is_err());
         assert!(parse_tokens(&tokens("build x --interface grpc")).is_err());
         Ok(())
     }
 
-    #[test]
-    fn test_run_reports_the_missing_runner() {
-        struct NoProbe;
-        impl RunnerProbe for NoProbe {
-            fn capabilities(&self, runner: &Path) -> Result<crate::backend::runner::RunnerCapabilities, CompileError> {
-                Err(CompileError::RunnerIncompatible { runner: runner.to_path_buf(), reason: "test".to_owned() })
-            }
+    struct NoProbe;
+    impl RunnerProbe for NoProbe {
+        fn capabilities(
+            &self,
+            runner: &Path,
+        ) -> Result<crate::backend::runner::RunnerCapabilities, CompileError> {
+            Err(CompileError::RunnerIncompatible {
+                runner: runner.to_path_buf(),
+                reason: "test".to_owned(),
+            })
         }
+    }
+
+    #[test]
+    fn test_run_reports_a_target_that_is_neither_a_file_nor_installed() {
         let mut progress = |_: &str| {};
         let mut ctx = CommandContext {
             env: CompilerEnv::isolated(PathBuf::from("/nonexistent"), PathBuf::from("/")),
@@ -1109,8 +1385,80 @@ mod tests {
             case_runner: &crate::testing::EchoStub,
             progress: &mut progress,
         };
-        let output = run_command(&mut ctx, AgentCommand::Run { target: "x".to_owned(), prompt: None });
+        let output = run_command(
+            &mut ctx,
+            AgentCommand::Run {
+                target: "x".to_owned(),
+                prompt: None,
+            },
+        );
+        assert_eq!(output.exit_code, 1);
+        assert!(
+            output.text.contains("neither a file nor an agent installed"),
+            "{}",
+            output.text
+        );
+    }
+
+    #[test]
+    fn test_run_reports_the_missing_runner_for_a_bare_artifact() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let dir = tempfile::tempdir()?;
+        let artifact = harw_agent_artifact::ArtifactBuilder::new(&json!({"name": "demo"})).build()?;
+        let artifact_path = dir.path().join("demo.harwa");
+        std::fs::write(&artifact_path, artifact.to_bytes())?;
+        let env = CompilerEnv::isolated(dir.path().join("home"), dir.path().to_path_buf());
+        let mut progress = |_: &str| {};
+        let mut ctx = CommandContext {
+            env,
+            probe: &NoProbe,
+            case_runner: &crate::testing::EchoStub,
+            progress: &mut progress,
+        };
+        let output = run_command(
+            &mut ctx,
+            AgentCommand::Run {
+                target: artifact_path.display().to_string(),
+                prompt: None,
+            },
+        );
         assert_eq!(output.exit_code, EXIT_RUNNER_UNAVAILABLE);
-        assert!(output.text.contains("requires the runner (wave 3)"));
+        assert_eq!(output.json["error"], "runner-not-found");
+        Ok(())
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn test_run_execs_a_bare_artifact_through_a_located_runner() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let dir = tempfile::tempdir()?;
+        let artifact = harw_agent_artifact::ArtifactBuilder::new(&json!({"name": "demo"})).build()?;
+        let artifact_path = dir.path().join("demo.harwa");
+        std::fs::write(&artifact_path, artifact.to_bytes())?;
+        let home = dir.path().join("home");
+        let env = CompilerEnv::isolated(home.clone(), dir.path().to_path_buf());
+        // A fake runner that exits 3 (approval denied) before reading the
+        // artifact bytes appended after it — a real runner exits the same
+        // way for a denied approval, and this exercises exit-code passthrough
+        // without needing a real `harw-agent-runner` binary.
+        let runner_path = env.home_runner_dir(&env.host_target).join("harw-agent-runner");
+        std::fs::create_dir_all(runner_path.parent().ok_or("parent")?)?;
+        harw_agent_artifact::write_executable(&runner_path, b"#!/bin/sh\nexit 3\n")?;
+        let mut progress = |_: &str| {};
+        let mut ctx = CommandContext {
+            env,
+            probe: &NoProbe,
+            case_runner: &crate::testing::EchoStub,
+            progress: &mut progress,
+        };
+        let output = run_command(
+            &mut ctx,
+            AgentCommand::Run {
+                target: artifact_path.display().to_string(),
+                prompt: Some("hi".to_owned()),
+            },
+        );
+        assert_eq!(output.exit_code, 3);
+        Ok(())
     }
 }

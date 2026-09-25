@@ -21,6 +21,7 @@
 //! Helfer, deren Netz nie breiter ist als das der Wurzel.
 
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::Duration;
 
 use harw_authority::{Permission, PermissionSet};
@@ -29,6 +30,8 @@ use harw_extension_api::approval_mode::ApprovalMode;
 use harw_extension_api::contributors::ApprovalHandlerKind;
 use harw_registry_defaults::profile::RegistryProfile;
 use harw_types::{ApprovalActor, Principal, ReasoningEffort};
+
+use crate::embedded::{EffectiveRights, EmbeddedAgent};
 
 /// Art des Einstiegs in die Runtime.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -55,6 +58,14 @@ pub enum EntryKind {
     GatewayTelegram,
     /// Dream-Gateway.
     GatewayDream,
+    /// Ein kompilierter Agent (#22 Welle 3A): Konfiguration, Agent, Skills
+    /// und Wissen kommen aus [`RuntimeSpec::embedded`] statt aus `~/.harw`.
+    /// [`EntryKind::profile`] liefert dafür nur eine konservative
+    /// Rückfallzeile (leere Rechte) — die tatsächliche Zeile entsteht aus dem
+    /// Manifest über [`EntryProfile::for_embedded`], die die Montage
+    /// (`assembly.rs`) an Stelle von `profile()` aufruft, sobald
+    /// [`RuntimeSpec::embedded`] gesetzt ist.
+    CompiledAgent,
 }
 
 /// Wie eine Rückfrage (`AskUser`) aufgelöst wird, wenn niemand interaktiv
@@ -262,6 +273,83 @@ impl EntryKind {
                 ceiling: CeilingPolicy::Closed,
                 project_context: false,
             },
+            // Keine Zeile der Tabelle: das Manifest bestimmt die Rechte
+            // (siehe [`EntryProfile::for_embedded`]), nicht ein fester
+            // Eintrag. Diese Rückfallzeile gilt nur, falls `profile()` ohne
+            // die Rechte aus [`RuntimeSpec::embedded`] aufgerufen wird — sie
+            // ist absichtlich die engste Zeile der Tabelle (leere Rechte,
+            // kein Werkzeug), nie ein stiller Vollzugriff.
+            EntryKind::CompiledAgent => EntryProfile {
+                permissions: PermissionSet::empty(),
+                registry_profile: RegistryProfile::NoTools,
+                operations: OperationSurface::None,
+                ask: AskResolution::Fail,
+                spawner: SpawnerPolicy::None,
+                ceiling: CeilingPolicy::Closed,
+                project_context: false,
+            },
+        }
+    }
+
+    /// Die tatsächliche Zeile für [`EntryKind::CompiledAgent`]: aus den
+    /// Manifest-Rechten abgeleitet statt aus einer Tabellenzeile (#22 Welle
+    /// 3A).
+    ///
+    /// # Beschreibung
+    /// Bildet [`EffectiveRights`] auf die engste bestehende
+    /// [`RegistryProfile`]-Zeile ab, die sie noch abdeckt:
+    /// - keine Werkzeuge, kein Schreiben, keine Shell ⇒
+    ///   [`RegistryProfile::NoTools`] (leere Rechte, wie [`EntryKind::McpServe`]);
+    /// - eine Shell ist admittiert ⇒ [`RegistryProfile::Full`] (die einzige
+    ///   bestehende Zeile mit `shell.exec`);
+    /// - sonst (mindestens ein Werkzeug oder Schreiben, keine Shell) ⇒
+    ///   [`RegistryProfile::WorkspaceEdit`] (lesen/schreiben, keine Shell,
+    ///   wie [`EntryKind::GatewayTelegram`]).
+    ///
+    /// Die Sandbox-Rechte ([`PermissionSet`]) entstehen unabhängig aus den
+    /// booleschen Feldern von `rights` selbst, nicht aus der gewählten
+    /// `RegistryProfile`-Zeile — das ist die eigentliche „Verengung auf
+    /// `rights.tools`": welches einzelne Werkzeug einer (notwendig
+    /// gröberen) `RegistryProfile`-Zeile am Ende sichtbar bleibt, entscheidet
+    /// die Aktivierung der Sitzung (`SessionActivation`) anhand der IR des
+    /// Agenten selbst (`ir.tools.admitted`, bereits identisch mit
+    /// `rights.tools`) — hier wird nur die tragende Grobzeile gewählt, nie
+    /// eine Rechteklasse erweitert, die `rights` nicht trägt.
+    #[must_use]
+    pub fn for_embedded(rights: &EffectiveRights) -> EntryProfile {
+        use Permission::{ExecuteProcess, NetworkAccess, ReadWorkspace, WriteWorkspace};
+
+        let mut policy = Vec::new();
+        if !rights.tools.is_empty() || rights.write || rights.shell {
+            policy.push(ReadWorkspace);
+        }
+        if rights.write {
+            policy.push(WriteWorkspace);
+        }
+        if rights.shell {
+            policy.push(ExecuteProcess);
+        }
+        if rights.network_open && !rights.network_hosts.is_empty() {
+            policy.push(NetworkAccess);
+        }
+        let permissions = PermissionSet::from_policy(policy);
+
+        let registry_profile = if rights.tools.is_empty() && !rights.write && !rights.shell {
+            RegistryProfile::NoTools
+        } else if rights.shell {
+            RegistryProfile::Full
+        } else {
+            RegistryProfile::WorkspaceEdit
+        };
+
+        EntryProfile {
+            permissions,
+            registry_profile,
+            operations: OperationSurface::None,
+            ask: AskResolution::Interactive,
+            spawner: SpawnerPolicy::BuiltinRoles,
+            ceiling: CeilingPolicy::LocalRoot,
+            project_context: true,
         }
     }
 }
@@ -308,6 +396,13 @@ pub struct RuntimeSpec {
     /// und setzt daraus Vorgabemodell und -anbieter des Laufs; ein unbekanntes
     /// Modell ist ein Konfigurationsfehler. `None` lässt die Vorgabe stehen.
     pub model_override: Option<String>,
+    /// Ein eingebettetes Agenten-Artefakt (#22 Welle 3A). Gesetzt heißt:
+    /// Konfiguration, Agent, Skills und Wissen kommen ausschließlich aus
+    /// diesem Artefakt ([`crate::config::load_config_embedded`]) statt aus
+    /// `~/.harw`; nur ein optionales Zustandsverzeichnis wird noch für
+    /// Sitzungen und Protokolle genutzt. `None` ist der bestehende Pfad
+    /// (jeder andere [`EntryKind`]) unverändert.
+    pub embedded: Option<Arc<EmbeddedAgent>>,
 }
 
 /// Seiteneffektfreie Momentaufnahme der effektiven Rechte eines montierten
@@ -345,7 +440,7 @@ mod tests {
     use super::*;
     use harw_types::{IngressSurface, PermissionTier, PrincipalKind};
 
-    const ALL: [EntryKind; 11] = [
+    const ALL: [EntryKind; 12] = [
         EntryKind::Tui,
         EntryKind::OneShot,
         EntryKind::LocalEcho,
@@ -357,6 +452,7 @@ mod tests {
         EntryKind::JobPlanNode,
         EntryKind::GatewayTelegram,
         EntryKind::GatewayDream,
+        EntryKind::CompiledAgent,
     ];
 
     const ALL_PERMISSIONS: [Permission; 7] = [
@@ -384,6 +480,7 @@ mod tests {
             EntryKind::JobPlanNode => 8,
             EntryKind::GatewayTelegram => 9,
             EntryKind::GatewayDream => 10,
+            EntryKind::CompiledAgent => 11,
         }
     }
 
@@ -525,6 +622,16 @@ mod tests {
             ),
             (
                 EntryKind::GatewayDream,
+                &[],
+                P::NoTools,
+                O::None,
+                A::Fail,
+                S::None,
+                C::Closed,
+                false,
+            ),
+            (
+                EntryKind::CompiledAgent,
                 &[],
                 P::NoTools,
                 O::None,
@@ -719,6 +826,7 @@ mod tests {
             reasoning_effort: Some(ReasoningEffort::High),
             approval_override: None,
             model_override: None,
+            embedded: None,
         };
         let perms = spec.entry.profile().permissions;
         let names: Vec<String> = perms.iter().map(|p| format!("{p:?}")).collect();
@@ -753,5 +861,81 @@ mod tests {
             ]
         );
         assert_eq!(snapshot.clone(), snapshot);
+    }
+
+    fn rights(
+        tools: &[&str],
+        network_hosts: &[&str],
+        network_open: bool,
+        write: bool,
+        shell: bool,
+    ) -> EffectiveRights {
+        EffectiveRights {
+            tools: tools.iter().map(|t| (*t).to_owned()).collect(),
+            network_hosts: network_hosts.iter().map(|h| (*h).to_owned()).collect(),
+            network_open,
+            write,
+            shell,
+            host: false,
+            full_access: false,
+            budget: None,
+        }
+    }
+
+    #[test]
+    fn for_embedded_picks_no_tools_without_any_right() {
+        let profile = EntryProfile::for_embedded(&rights(&[], &[], false, false, false));
+        assert_eq!(profile.permissions, PermissionSet::empty());
+        assert_eq!(profile.registry_profile, RegistryProfile::NoTools);
+    }
+
+    #[test]
+    fn for_embedded_picks_workspace_edit_for_read_write_without_shell() {
+        let profile =
+            EntryProfile::for_embedded(&rights(&["fs.read", "fs.write"], &[], false, true, false));
+        assert_eq!(
+            profile.permissions,
+            set(&[Permission::ReadWorkspace, Permission::WriteWorkspace])
+        );
+        assert!(!profile.permissions.contains(Permission::ExecuteProcess));
+        assert_eq!(profile.registry_profile, RegistryProfile::WorkspaceEdit);
+    }
+
+    #[test]
+    fn for_embedded_picks_full_only_when_shell_is_admitted() {
+        let profile =
+            EntryProfile::for_embedded(&rights(&["shell.exec"], &[], false, false, true));
+        assert!(profile.permissions.contains(Permission::ExecuteProcess));
+        assert_eq!(profile.registry_profile, RegistryProfile::Full);
+    }
+
+    #[test]
+    fn for_embedded_grants_network_only_with_open_hosts() {
+        let with_hosts = EntryProfile::for_embedded(&rights(
+            &["web.fetch"],
+            &["example.com"],
+            true,
+            false,
+            false,
+        ));
+        assert!(with_hosts.permissions.contains(Permission::NetworkAccess));
+
+        let without_hosts =
+            EntryProfile::for_embedded(&rights(&["web.fetch"], &[], true, false, false));
+        assert!(!without_hosts.permissions.contains(Permission::NetworkAccess));
+    }
+
+    #[test]
+    fn for_embedded_never_exceeds_the_tui_profile() {
+        let tui = EntryKind::Tui.profile().permissions;
+        let full_rights = rights(
+            &["fs.read", "fs.write", "shell.exec", "web.fetch"],
+            &["example.com"],
+            true,
+            true,
+            true,
+        );
+        let profile = EntryProfile::for_embedded(&full_rights);
+        assert!(profile.permissions.is_subset_of(&tui));
     }
 }

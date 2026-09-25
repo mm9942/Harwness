@@ -36,7 +36,7 @@
 //! # Concurrency
 //! Static data, `Send + Sync`.
 
-use harw_agent_dsl::classify::{ToolClassifier, ToolClasses};
+use harw_agent_dsl::classify::{ToolClasses, ToolClassifier};
 
 /// What a tool does, as one class per tool.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -107,7 +107,10 @@ impl CapabilityClass {
                 network: true,
                 ..none
             },
-            Self::Shell => ToolClasses { shell: true, ..none },
+            Self::Shell => ToolClasses {
+                shell: true,
+                ..none
+            },
             Self::Host => ToolClasses { host: true, ..none },
             Self::Agent | Self::Knowledge | Self::Interaction | Self::Meta => none,
         }
@@ -478,7 +481,10 @@ mod tests {
             .into_iter()
             .filter(|tool| lookup(tool).is_none())
             .collect();
-        assert!(missing.is_empty(), "tools without a catalog row: {missing:?}");
+        assert!(
+            missing.is_empty(),
+            "tools without a catalog row: {missing:?}"
+        );
     }
 
     #[test]
@@ -520,7 +526,10 @@ mod tests {
             lookup("transfer_to_explorer").map(|entry| entry.provider.id),
             Some("agents")
         );
-        assert!(lookup("transfer_to_").is_none(), "an empty target is no tool");
+        assert!(
+            lookup("transfer_to_").is_none(),
+            "an empty target is no tool"
+        );
         assert!(is_handoff_tool("transfer_to_executor"));
         assert!(!is_handoff_tool("fs.read"));
         assert!(lookup("fs.unknown").is_none());
@@ -535,7 +544,10 @@ mod tests {
             };
             match crate::tool_permission(tool) {
                 Some(Permission::WriteWorkspace) => assert!(
-                    matches!(entry.class, CapabilityClass::Write | CapabilityClass::WriteOther),
+                    matches!(
+                        entry.class,
+                        CapabilityClass::Write | CapabilityClass::WriteOther
+                    ),
                     "{tool}: write permission but class {:?}",
                     entry.class
                 ),
@@ -558,7 +570,9 @@ mod tests {
     fn test_catalog_classifier_feeds_the_dsl_reclassification() {
         let classes = CapabilityCatalog.classify("job.start").unwrap_or_default();
         assert!(classes.shell);
-        let classes = CapabilityCatalog.classify("latex.template").unwrap_or_default();
+        let classes = CapabilityCatalog
+            .classify("latex.template")
+            .unwrap_or_default();
         assert!(classes.write_other && !classes.write_workspace);
         assert_eq!(CapabilityCatalog.classify("nope.tool"), None);
     }

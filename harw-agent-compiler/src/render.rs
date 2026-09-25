@@ -27,7 +27,11 @@ pub fn render_diagnostic(diagnostic: &Diagnostic, files: &[SourceFile]) -> Strin
             gutter = number.len() + 1;
             let pad = " ".repeat(gutter);
             let column = usize::try_from(span.column.saturating_sub(1)).unwrap_or(0);
-            let prefix: String = line.chars().take(column).map(|c| if c == '\t' { '\t' } else { ' ' }).collect();
+            let prefix: String = line
+                .chars()
+                .take(column)
+                .map(|c| if c == '\t' { '\t' } else { ' ' })
+                .collect();
             let width = token_width(&line, column);
             out.push_str(&format!("\n{pad}|"));
             out.push_str(&format!("\n{number} | {line}"));
@@ -111,8 +115,13 @@ mod tests {
 
     #[test]
     fn test_render_shows_file_line_caret_and_help() {
-        let text = "schema = \"harwness.agent/v1\"\n[tools]\nadmitted = [\"fs.read\", \"fs read\"]\n";
-        let file = SourceFile::new(DefinitionLayer::UserGlobal, "agents/x/definition.toml", text);
+        let text =
+            "schema = \"harwness.agent/v1\"\n[tools]\nadmitted = [\"fs.read\", \"fs read\"]\n";
+        let file = SourceFile::new(
+            DefinitionLayer::UserGlobal,
+            "agents/x/definition.toml",
+            text,
+        );
         let line = "admitted = [\"fs.read\", \"fs read\"]";
         let column = line.find("\"fs read\"").unwrap_or_default();
         let diagnostic = Diagnostic::new(&codes::TOOL_INVALID_NAME, "invalid tool name `fs read`")

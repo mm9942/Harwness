@@ -160,10 +160,16 @@ targets = [\"explorer\"]
 #[must_use]
 pub fn instructions_template(name: &str, role: ScaffoldRole) -> String {
     let work = match role {
-        ScaffoldRole::Worker => "Du bearbeitest genau den Auftrag, den du bekommst, und lieferst eine knappe Zusammenfassung mit Fundstellen.",
-        ScaffoldRole::ChildOrchestrator => "Du zerlegst den Auftrag in unabhängige Teilaufträge, delegierst sie an deine Zielagenten und fasst ihre Ergebnisse zusammen.",
+        ScaffoldRole::Worker => {
+            "Du bearbeitest genau den Auftrag, den du bekommst, und lieferst eine knappe Zusammenfassung mit Fundstellen."
+        }
+        ScaffoldRole::ChildOrchestrator => {
+            "Du zerlegst den Auftrag in unabhängige Teilaufträge, delegierst sie an deine Zielagenten und fasst ihre Ergebnisse zusammen."
+        }
     };
-    format!("# {name}\n\n{work}\n\n## Vorgehen\n\n1. Auftrag klären.\n2. Arbeiten.\n3. Ergebnis mit Belegen zurückgeben.\n")
+    format!(
+        "# {name}\n\n{work}\n\n## Vorgehen\n\n1. Auftrag klären.\n2. Arbeiten.\n3. Ergebnis mit Belegen zurückgeben.\n"
+    )
 }
 
 /// Writes `definition.toml` and `system.md` into `dir`.
@@ -224,7 +230,8 @@ mod tests {
     fn test_templates_parse_as_definitions() -> Result<(), String> {
         for role in [ScaffoldRole::Worker, ScaffoldRole::ChildOrchestrator] {
             let text = definition_template("demo", role, None);
-            let raw = harw_agent_dsl::parse::parse_toml(&text).map_err(|error| error.to_string())?;
+            let raw =
+                harw_agent_dsl::parse::parse_toml(&text).map_err(|error| error.to_string())?;
             assert_eq!(raw.id.to_string(), "user.agent.demo@1");
         }
         Ok(())

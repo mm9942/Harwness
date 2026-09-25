@@ -1,9 +1,15 @@
 # Compiling agents into standalone binaries
 
-> Status: **planned in #22.** The commands and flags in this guide are the
-> decided interface from [ADR 0001](../adr/0001-agent-compiler.md); they are
-> not in a release yet. Until they land, `harw agent build` and the runner
-> flags shown here do not exist.
+> Status: implemented (#22, wave 4: `docs/plans/r10-agent-compiler.md`).
+> `harw agent check/build/inspect/graph/explain/new/fmt/diff/test/versions/
+> use/clean/doctor` and the `~/.harw/bin` version store described below are
+> in `harw-agent-compiler` and wired into the CLI today. **Only the
+> runner's own interfaces** (an actual `./ec` binary serving `cli`, `repl`,
+> `mcp`, `http` or `tui` at runtime, wave 3 of the plan) are still in
+> progress — until that lands, a built binary's `--manifest` and `--verify`
+> work, but running a task through it does not yet. `--native` builds are
+> also wave-3-dependent (they embed the same runner). See
+> [ADR 0001](../adr/0001-agent-compiler.md) for the full design.
 
 This guide shows how to turn an agent definition into a single executable
 that runs one fixed agent with one fixed set of rights, without a harw
@@ -132,6 +138,10 @@ Building the same definition twice with the same harw version gives the
 same artifact hash.
 
 ## 5. Run it
+
+> The interfaces below (`cli`, `repl`, `mcp`, `http`, `tui`) are the wave-3
+> runner contract; `--manifest` and `--verify` work against any built
+> binary today, but a built binary does not yet run a task end to end.
 
 ```sh
 export ANTHROPIC_API_KEY=…

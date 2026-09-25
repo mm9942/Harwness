@@ -14,12 +14,14 @@ use crate::plugin_toml::PluginToml;
 use crate::provider_toml::ProviderToml;
 use crate::skill_toml::SkillToml;
 use crate::web_toml::WebSection;
-use harw_agent_dsl::layers::DefinitionLayer;
-use harw_agent_dsl::parse::parse_toml as parse_agent_definition_toml;
-use harw_agent_dsl::raw::RawAgentDefinition;
 use harw_agent_dsl::bind::ContextProgramLibrary;
 use harw_agent_dsl::diagnostics::{Severity, SourceFile};
-use harw_agent_dsl::lower_v2::{FsInstructionsLoader, LowerSources, diagnostic_for_error, lower_v2};
+use harw_agent_dsl::layers::DefinitionLayer;
+use harw_agent_dsl::lower_v2::{
+    FsInstructionsLoader, LowerSources, diagnostic_for_error, lower_v2,
+};
+use harw_agent_dsl::parse::parse_toml as parse_agent_definition_toml;
+use harw_agent_dsl::raw::RawAgentDefinition;
 use harw_agent_dsl::resolve::resolve_definition;
 use harw_agent_dsl::{AgentIr, ExecutableAgentIr};
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -547,13 +549,52 @@ pub fn default_config_layers() -> Vec<PathBuf> {
     )
 }
 
+/// Wie [`default_config_layers`], aber mit einem projekt-lokalen
+/// Verzeichnisnamen ungleich `.harw`.
+///
+/// # Description
+/// `harw-config` darf `harw-home` nicht selbst abhängen (Zyklus: `harw-home`
+/// hängt bereits von `harw-config` ab), kann den Namen des projekt-lokalen
+/// Verzeichnisses einer personalisierten harw (#22,
+/// [`harw_home::project_dir_name`](../../harw-home/src/paths.rs)) also nicht
+/// selbst auflösen. Ein Aufrufer, der den Namen bereits kennt — etwa
+/// `harw-home` selbst, oder `harw-cli` —, reicht ihn hier explizit ein statt
+/// den fest verdrahteten Namen `.harw` zu bekommen. Der Home-Layer (`~/.harw`
+/// bzw. der Root-Space) bleibt unverändert: er ist bereits über
+/// `harw_home::home_dir`/`set_home_override` personalisierbar und wird hier
+/// nur noch für die reine `$HOME`-Auflösung ohne Override verwendet.
+///
+/// # Hinweis
+/// Der eigentliche, überridefähige Pfad läuft nicht über diese Funktion,
+/// sondern über `harw_home::config_layers_report_at`, die bereits
+/// `project_dir_name()` nutzt. Diese Funktion bleibt der env-basierte
+/// Fallback für Aufrufer ohne `harw-home`-Kontext.
+pub fn default_config_layers_named(project_dir_name: &str) -> Vec<PathBuf> {
+    default_config_layers_from_named(
+        std::env::var_os("HOME").map(PathBuf::from),
+        std::env::current_dir().ok(),
+        project_dir_name,
+    )
+}
+
 fn default_config_layers_from(
     home_directory: Option<PathBuf>,
     cwd: Option<PathBuf>,
 ) -> Vec<PathBuf> {
+    default_config_layers_from_named(home_directory, cwd, ".harw")
+}
+
+fn default_config_layers_from_named(
+    home_directory: Option<PathBuf>,
+    cwd: Option<PathBuf>,
+    project_dir_name: &str,
+) -> Vec<PathBuf> {
     let mut layers = Vec::with_capacity(3);
 
-    // Home-Layer: ~/.harw/
+    // Home-Layer: ~/.harw/ — dies ist der Root-Space selbst, nicht das
+    // projekt-lokale Verzeichnis; er bleibt `.harw`, da eine personalisierte
+    // harw ihn ohnehin über `harw_home::home_dir`/`set_home_override` (bzw.
+    // `HARW_HOME`) ersetzt, nicht über diese env-basierte Auflösung.
     if let Some(home) = home_directory {
         let harw_home = home.join(".harw");
         layers.push(harw_home.clone());
@@ -566,9 +607,9 @@ fn default_config_layers_from(
         }
     }
 
-    // Repo-lokaler Layer: .harw/ im aktuellen Arbeitsverzeichnis
+    // Repo-lokaler Layer: <project_dir_name>/ im aktuellen Arbeitsverzeichnis
     if let Some(cwd) = cwd {
-        layers.push(cwd.join(".harw"));
+        layers.push(cwd.join(project_dir_name));
     }
 
     layers
@@ -1194,10 +1235,7 @@ fn context_program_library(
         library
             .insert_sources(*layer, &[(name.as_str(), source.as_str())])
             .map_err(|error| {
-                ConfigError::Invalid(format!(
-                    "context program {}: {error}",
-                    path.display()
-                ))
+                ConfigError::Invalid(format!("context program {}: {error}", path.display()))
             })?;
     }
     Ok(library)
@@ -3096,6 +3134,28 @@ pinned_identities = [123456789]
     }
 
     #[test]
+    fn default_layers_named_uses_the_given_project_dir_name_for_the_repo_layer() -> TestResult {
+        // #22: eine personalisierte harw meldet ihren projekt-lokalen Namen
+        // hier explizit an, statt sich auf einen fest verdrahteten `.harw`
+        // zu verlassen — der Home-Layer (Root-Space) bleibt `.harw`, weil
+        // diese env-basierte Auflösung `HARW_HOME`/`set_home_override` nicht
+        // kennt (siehe Doku von `default_config_layers_named`).
+        let root = test_directory("named-project-dir-layer")?;
+        let home_directory = root.join("home");
+        let harw_home = home_directory.join(".harw");
+        let cwd = root.join("workspace");
+        std::fs::create_dir_all(&harw_home).map_err(ctx("harw_home anlegen"))?;
+        std::fs::create_dir_all(&cwd).map_err(ctx("cwd anlegen"))?;
+
+        let layers =
+            default_config_layers_from_named(Some(home_directory), Some(cwd.clone()), ".mia");
+
+        assert_eq!(layers, vec![harw_home, cwd.join(".mia")]);
+        std::fs::remove_dir_all(root).map_err(ctx("Testverzeichnis entfernen"))?;
+        Ok(())
+    }
+
+    #[test]
     fn default_layers_skip_unreadable_or_unsafe_active_profile_pointers() -> TestResult {
         let root = test_directory("unsafe-active-profile")?;
         let home_directory = root.join("home");
@@ -3575,7 +3635,10 @@ targets = ["explorer", "analyst"]
             .get(id)
             .ok_or(TestError::Missing("meta"))?;
         assert_eq!(meta, &AgentDefinitionMeta::from_ir(ir, meta.layer));
-        assert_eq!(meta.instructions.as_deref(), Some("Plane zuerst, delegiere dann."));
+        assert_eq!(
+            meta.instructions.as_deref(),
+            Some("Plane zuerst, delegiere dann.")
+        );
         assert_eq!(ir.instructions.source.as_deref(), Some("system.md"));
         assert_eq!(
             meta.delegation_targets,

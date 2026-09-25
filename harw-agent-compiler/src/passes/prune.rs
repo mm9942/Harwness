@@ -40,8 +40,7 @@ impl Pass for PruneUnusedTools {
             .collect();
         let role = unit.ir.role;
         let is_root = role == AgentRoleId::RootOrchestrator;
-        let can_spawn = is_root
-            || (role == AgentRoleId::ChildOrchestrator && !children.is_empty());
+        let can_spawn = is_root || (role == AgentRoleId::ChildOrchestrator && !children.is_empty());
         let mut seen: BTreeSet<String> = BTreeSet::new();
         let mut kept: Vec<String> = Vec::new();
         let mut pruned: Vec<(String, String)> = Vec::new();

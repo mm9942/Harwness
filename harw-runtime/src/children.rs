@@ -2123,7 +2123,12 @@ impl ChildRegistryFactory for RuntimeChildRegistryFactory {
             }
         });
         let access = harw_registry_defaults::profile::AgentDefinitionAccess {
-            project_agents_dir: Some(self.project.project_root.join(".harw").join("agents")),
+            project_agents_dir: Some(
+                self.project
+                    .project_root
+                    .join(harw_home::project_dir_name())
+                    .join("agents"),
+            ),
             profile_agents_dir: self.profile_agents_dir.clone(),
             mode: definition_write_mode_for_parent_role(parent.role),
             ceiling,

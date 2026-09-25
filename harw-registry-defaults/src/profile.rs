@@ -3393,7 +3393,12 @@ pub fn assemble_registry_for_sandbox_with_definition_access_and_sandbox_profile_
     host_permits: Option<HostPermitWiring>,
 ) -> RegistryDefaultsResult<AssembledRegistry> {
     let agent_definition_access = access.unwrap_or_else(|| AgentDefinitionAccess {
-        project_agents_dir: Some(project.project_root.join(".harw").join("agents")),
+        project_agents_dir: Some(
+            project
+                .project_root
+                .join(harw_home::project_dir_name())
+                .join("agents"),
+        ),
         profile_agents_dir: None,
         mode: DefinitionWriteMode::ProposalOnly,
         ceiling: None,
@@ -3618,7 +3623,12 @@ mod tests {
         let project = discover_project(&cwd, &DiscoveryConfig::default())
             .map_err(ctx("Discovery im Workspace"))?;
         let access = AgentDefinitionAccess {
-            project_agents_dir: Some(project.project_root.join(".harw").join("agents")),
+            project_agents_dir: Some(
+                project
+                    .project_root
+                    .join(harw_home::project_dir_name())
+                    .join("agents"),
+            ),
             profile_agents_dir: None,
             mode: DefinitionWriteMode::Commit,
             ceiling: Some(DefinitionAuthorCeiling {
