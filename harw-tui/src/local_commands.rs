@@ -638,6 +638,54 @@ mod tests {
         assert!(fx.run("/effort high").is_none());
     }
 
+    /// R10 Welle 3B: ein versteckter Befehl wird immer als
+    /// [`LocalIntercept::System`] abgefangen — auch die bare Form
+    /// (`/agent`), die ohne Beschränkung unbedingt den Baum öffnen würde, und
+    /// auch eine Form mit Argumenten, die `intercept` sonst gar nicht kennt
+    /// (fiele ohne die Beschränkung an die Operation-Dispatch durch).
+    #[test]
+    fn hidden_commands_are_refused_regardless_of_form() -> TestResult {
+        let fx = empty().with_hidden(&["agent", "model"]);
+        assert!(matches!(fx.run("/agent"), Some(LocalIntercept::System(_))));
+        let text = system(fx.run("/agent stop foo-1"))?;
+        assert!(text.contains("/agent"), "{text}");
+        let text = system(fx.run("/model switch gpt-x"))?;
+        assert!(text.contains("/model"), "{text}");
+        Ok(())
+    }
+
+    /// Ein nicht versteckter Befehl bleibt von der Beschränkung unberührt.
+    #[test]
+    fn hidden_commands_do_not_affect_other_commands() {
+        let fx = empty().with_hidden(&["agent"]);
+        assert!(matches!(
+            fx.run("/model"),
+            Some(LocalIntercept::OpenModelPicker(PickerTarget::Orchestrator))
+        ));
+    }
+
+    /// R10 Welle 3B: ein `/model switch`-Ziel außerhalb der Erlaubnisliste
+    /// wird mit einer eigenen Meldung abgelehnt, ein zugelassenes Ziel bleibt
+    /// Text-Dispatch (`None`, unverändert an die Operation gereicht).
+    #[test]
+    fn model_switch_target_outside_allowlist_is_refused() -> TestResult {
+        let fx = empty().with_model_switch_allowlist(&[("openai", "gpt-5")]);
+        let text = system(fx.run("/model switch claude-x"))?;
+        assert!(text.contains("claude-x"), "{text}");
+        assert!(fx.run("/model switch gpt-5").is_none());
+        assert!(fx.run("/model switch openai/gpt-5").is_none());
+        assert!(fx.run("/model switch GPT-5").is_none());
+        Ok(())
+    }
+
+    /// Ohne Erlaubnisliste (`None`) bleibt `/model switch` unverändert
+    /// uneingeschränkt (Rückfallverhalten).
+    #[test]
+    fn model_switch_without_allowlist_is_unrestricted() {
+        let fx = empty();
+        assert!(fx.run("/model switch anything-at-all").is_none());
+    }
+
     #[test]
     fn tools_compact_provider_and_unknown_pass_through() {
         let fx = empty();

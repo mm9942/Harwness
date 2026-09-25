@@ -120,6 +120,11 @@ pub fn run(ctx: RunnerContext) -> ExitCode {
         approval_override: None,
         model_override: None,
         embedded: Some(Arc::clone(&ctx.agent)),
+        // #22 Welle 3C: die Mini-TUI baut ihre Montage hier direkt statt über
+        // `RunnerContext::harwness()` — dieselbe Root-Montage bekommt daher
+        // kein `ChildBackend` (kein Kind-Lauf für einen kompilierten Agenten
+        // in dieser Oberfläche, siehe `crate::context`).
+        child_backend: None,
     };
 
     match run_fixed_agent(spec, opts) {

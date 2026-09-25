@@ -128,8 +128,8 @@ use crate::model::ModelSource;
 use crate::sandbox::{root_network_scope, root_sandbox_with_network};
 use crate::services::{PlanServices, RuntimeServices, RuntimeServicesParts, ServiceSurface};
 use crate::spec::{
-    AskResolution, EntryKind, EntryProfile, OperationSurface, RootBudget, RuntimeSpec,
-    SpawnerPolicy,
+    AskResolution, ChildBackendHandle, EntryKind, EntryProfile, OperationSurface, RootBudget,
+    RuntimeSpec, SpawnerPolicy,
 };
 use crate::trace::new_root_trace;
 

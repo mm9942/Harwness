@@ -86,6 +86,11 @@ pub(crate) struct SpecInputs {
     /// [`EntryKind::CompiledAgent`] statt [`EntryKind::Tui`] und reicht das
     /// Artefakt in die [`RuntimeSpec`] durch.
     pub(crate) embedded: Option<Arc<harw_runtime::EmbeddedAgent>>,
+    /// Ein verdrahtetes [`harw_core::child_backend::ChildBackend`] (#22
+    /// Welle 3C, [`HarwnessBuilder::child_backend`]). `Some` reicht es
+    /// unverändert an [`harw_runtime::RuntimeSpec::child_backend`] durch;
+    /// `None` lässt jeden Kind-Lauf in-process.
+    pub(crate) child_backend: Option<harw_runtime::ChildBackendHandle>,
 }
 
 impl SpecInputs {

@@ -41,6 +41,7 @@
 pub mod args;
 mod child;
 mod child_protocol;
+mod job_child_backend;
 pub mod context;
 pub mod error;
 

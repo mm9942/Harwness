@@ -1458,6 +1458,7 @@ pub(crate) mod tests {
             approval_override: None,
             model_override: None,
             embedded: None,
+            child_backend: None,
         };
         let state_store: Arc<dyn StateStore> = Arc::new(harw_core::InMemoryStateStore::new());
         RuntimeAssembly::builder(spec)

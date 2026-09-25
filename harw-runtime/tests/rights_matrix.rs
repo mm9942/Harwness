@@ -134,6 +134,7 @@ fn spec_for(entry: EntryKind, fixture: &Fixture) -> RuntimeSpec {
         approval_override: None,
         model_override: None,
         embedded: None,
+        child_backend: None,
     }
 }
 

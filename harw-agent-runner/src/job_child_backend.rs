@@ -2,41 +2,23 @@
 //! OS process speaking `harwness.agent-child/v1` on its stdio (plan
 //! `docs/plans/r10-agent-compiler.md`, §3C).
 //!
-//! # Why this does not call `harw_tool_job::JobManager` directly
-//! The plan asks a job-backed child to get the same process-group/logs
-//! machinery as any other job, via `JobManager::start`. Two things in
-//! `harw-tool-job` as it stands today make that impossible without changing
-//! it:
-//!
-//! - `harw_tool_job::launcher::{ShellJobLauncher, DirectLauncher}` both
-//!   hardcode `stdin(Stdio::null())` on the [`PreparedJob`](harw_tool_job::launcher::PreparedJob)
-//!   they build — a job's stdin is never meant to receive anything.
-//! - `JobManager::start` always does `command.stdout(Stdio::from(stdout_log_file))`
-//!   and `.stderr(Stdio::from(stderr_log_file))`, then moves the spawned
-//!   `tokio::process::Child` **into its own monitor task**
-//!   (`tokio::spawn(monitor.run(child))`) and returns only a `JobStatus`.
-//!   There is no way for a caller to get the child's `ChildStdin`/
-//!   `ChildStdout` back — they are consumed before `start` even returns.
-//!
-//! **The needed `harw-tool-job` change**, so a future wave can route this
-//! through `JobManager` properly (process listing, `job.logs`, `job.stop`
-//! parity with every other job): add a `StartRequest` flag (or a sibling
-//! method, e.g. `JobManager::start_piped`) that (a) leaves `stdin` piped
-//! instead of null on the prepared command, (b) still tees stdout into
-//! `STDOUT_LOG` for `job.logs`/`job.status` (e.g. by reading through a
-//! `tokio::io::split` and fanning out to both the log file and a returned
-//! channel) instead of redirecting the raw fd there, and (c) returns a
-//! small handle (`ChildStdin` plus a `Receiver<String>` of stdout lines)
-//! alongside the `JobId`, while the existing monitor task keeps doing exit
-//! detection/logging exactly as it does today.
-//!
-//! Until that lands, this module spawns the process itself against
-//! [`ChildProcessSpawner`], a small trait scoped to exactly what this
-//! backend needs (own process group, piped stdio) — the same process-group
-//! setup `harw_tool_job::launcher::DirectLauncher` already uses for its own
-//! tests, minus the shell-tool permission gate a job-backed child does not
-//! need (its rights come from the protocol's `Rights` frame, enforced
-//! inside the child by `crate::child::run_child`, not by the launcher).
+//! # Two ways to run the child process
+//! - **Production** ([`JobChildBackend::new`], `S = `[`CurrentExeSpawner`]):
+//!   goes through [`harw_tool_job::JobManager::start_piped`] — the child is a
+//!   real job (own process group, `stdout.log`/`stderr.log`,
+//!   [`harw_tool_job::JobManager::stop`] on cancel), the same machinery
+//!   every other job gets, minus the shell-tool permission gate a
+//!   job-backed child does not need (its rights come from the protocol's
+//!   `Rights` frame, enforced inside the child by `crate::child::run_child`,
+//!   not by the launcher). `start_piped` leaves stdin piped instead of null
+//!   and tees stdout into `STDOUT_LOG` while also handing this backend a
+//!   line stream of it; stderr goes straight into `STDERR_LOG` as for any
+//!   other job.
+//! - **Tests** ([`JobChildBackend::with_spawner`], no `JobManager`): spawns
+//!   [`ChildProcessSpawner::command_for`]'s command itself — a plain
+//!   `/bin/sh -c <script>` standing in for a real compiled child, so the
+//!   backend's framing/relay/crash/cancel logic is exercised against a real
+//!   process without a real bundle or a `JobManager`.
 //!
 //! # Concurrency
 //! [`JobChildBackend::run`] drives one child process per call; several may
@@ -46,19 +28,26 @@
 use std::collections::VecDeque;
 use std::process::Stdio;
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use harw_core::child_backend::{
     ChildBackend, ChildBackendFuture, ChildIo, ChildRunOutcome, ChildRunSpec, ChildRunStatus,
 };
 use harw_core::child_controller::ChildUsage;
 use harw_types::cancel::CancelReason;
+use harw_tool_job::{Caller, JobId, JobManager, JobOwner, JobSignal, PipedJob, PreparedJob, StartRequest};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, ChildStdin, Command};
+use tokio::sync::mpsc;
 
 use crate::child_protocol::{
     ChildResultStatus, ChildRights, ChildToParent, ChildUsage as WireUsage, ParentToChild,
     decode_line, encode_line, verify_protocol,
 };
+
+/// How long the job-managed path waits for the job's own monitor to record
+/// an exit code after the protocol stream ends, before giving up on it.
+const JOB_EXIT_WAIT: Duration = Duration::from_secs(5);
 
 /// How many trailing stderr lines a crashed child reports in
 /// [`ChildRunStatus::Crashed::stderr_tail`].

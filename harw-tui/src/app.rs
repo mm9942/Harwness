@@ -10374,6 +10374,56 @@ mod tests {
         Ok(app)
     }
 
+    /// R10 Welle 3B: [`ChatApp::with_hidden_commands`] entfernt die
+    /// benannten Befehle aus `command_registry` — nicht mehr per `find`
+    /// auffindbar, also weder im Popup noch in der Vervollständigung, und
+    /// die übrigen Einträge bleiben unverändert.
+    #[test]
+    fn with_hidden_commands_removes_specs_from_the_registry() -> TestResult {
+        let mut app = test_chat_app()?;
+        app.command_registry = CommandRegistry::built_in().map_err(ctx("built_in"))?;
+        assert!(app.command_registry.find("model").is_some());
+        assert!(app.command_registry.find("agent").is_some());
+        let app = app.with_hidden_commands(vec!["Model".to_owned(), "agent".to_owned()]);
+        assert!(app.command_registry.find("model").is_none());
+        assert!(app.command_registry.find("agent").is_none());
+        // Ein nicht versteckter Befehl bleibt erreichbar.
+        assert!(app.command_registry.find("mode").is_some());
+        Ok(())
+    }
+
+    /// Ein leerer Filter ist ein No-Op: die Registry bleibt unverändert.
+    #[test]
+    fn with_hidden_commands_empty_list_is_a_no_op() -> TestResult {
+        let mut app = test_chat_app()?;
+        app.command_registry = CommandRegistry::built_in().map_err(ctx("built_in"))?;
+        let before = app.command_registry.specs().len();
+        let app = app.with_hidden_commands(Vec::new());
+        assert_eq!(app.command_registry.specs().len(), before);
+        Ok(())
+    }
+
+    /// Ein versteckter Befehl verschwindet auch aus dem `/`-Popup
+    /// (Namens-Vervollständigung), nicht nur aus `find`.
+    #[test]
+    fn with_hidden_commands_removes_the_command_from_the_popup() -> TestResult {
+        let mut app = test_chat_app()?;
+        app.command_registry = CommandRegistry::built_in().map_err(ctx("built_in"))?;
+        let mut app = app.with_hidden_commands(vec!["model".to_owned()]);
+        app.input.insert_str("/mod");
+        app.sync_popup();
+        let names: Vec<String> = app
+            .command_popup
+            .as_ref()
+            .map(CommandPopup::visible_names)
+            .unwrap_or_default();
+        assert!(
+            !names.iter().any(|name| name == "model"),
+            "{names:?} must not offer the hidden command"
+        );
+        Ok(())
+    }
+
     /// Enter im Agenten-Panel öffnet die Detailansicht (Panel maximiert),
     /// Tasten scrollen/schalten dort, Esc kehrt zur Liste zurück, ohne den
     /// Fokus an den Chat abzugeben, und stellt den Vollbild-Zustand wieder her.

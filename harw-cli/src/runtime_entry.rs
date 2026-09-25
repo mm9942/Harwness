@@ -111,6 +111,9 @@ pub(crate) fn runtime_spec(
         // `harw-runtime/src/assembly.rs::resolve_embedded_uia`). `None` in
         // jedem gewöhnlichen (nicht personalisierten) Build.
         embedded: embedded_uia_agent(),
+        // #22 Welle 3C: `harw-cli` verdrahtet kein `ChildBackend` — jeder
+        // Kind-Lauf bleibt in-process wie bisher.
+        child_backend: None,
     }
 }
 

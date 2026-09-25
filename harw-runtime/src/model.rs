@@ -830,6 +830,7 @@ mod tests {
             approval_override: None,
             model_override: None,
             embedded: None,
+            child_backend: None,
         }
     }
 

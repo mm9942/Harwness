@@ -128,6 +128,7 @@ pub struct HarwnessBuilder {
     tools: Vec<Arc<dyn Tool>>,
     contexts: Vec<Arc<dyn ContextSource>>,
     embedded: Option<Arc<harw_runtime::EmbeddedAgent>>,
+    child_backend: Option<Arc<dyn harw_core::child_backend::ChildBackend>>,
     #[cfg(feature = "unstable-internals")]
     raw: RawExtensions,
 }
@@ -151,6 +152,7 @@ impl Default for HarwnessBuilder {
             tools: Vec::new(),
             contexts: Vec::new(),
             embedded: None,
+            child_backend: None,
             #[cfg(feature = "unstable-internals")]
             raw: RawExtensions::default(),
         }
@@ -174,6 +176,7 @@ impl std::fmt::Debug for HarwnessBuilder {
             .field("tools", &self.tools.len())
             .field("contexts", &self.contexts.len())
             .field("embedded", &self.embedded.is_some())
+            .field("child_backend", &self.child_backend.is_some())
             .finish_non_exhaustive()
     }
 }
@@ -332,6 +335,18 @@ impl HarwnessBuilder {
         self
     }
 
+    /// Verdrahtet ein [`harw_core::child_backend::ChildBackend`] (#22 Welle
+    /// 3C): jedes Kind, das die Wurzelmontage über ihren
+    /// `ManagedAgentSpawner` admittiert, läuft dann über dieses Backend
+    /// (typischerweise `harw-agent-runner`s `JobChildBackend`) statt
+    /// in-process. Ohne diesen Aufruf bleibt jeder Kind-Lauf in-process — der
+    /// bestehende Pfad.
+    #[must_use]
+    pub fn child_backend(mut self, backend: Arc<dyn harw_core::child_backend::ChildBackend>) -> Self {
+        self.child_backend = Some(backend);
+        self
+    }
+
     /// **Instabil.** Hängt einen rohen internen Tool-Provider an.
     #[cfg(feature = "unstable-internals")]
     #[must_use]
@@ -478,6 +493,10 @@ impl HarwnessBuilder {
             reasoning_effort: self.reasoning_effort,
             agent,
             embedded: self.embedded.clone(),
+            child_backend: self
+                .child_backend
+                .clone()
+                .map(harw_runtime::ChildBackendHandle),
         };
         let config = if self.embedded.is_some() {
             harw_runtime::load_config_embedded(&spec_inputs.spec())
