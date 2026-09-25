@@ -27,27 +27,24 @@
 //! advertised protocol version literal — and implements its own minimal
 //! JSON-RPC 2.0 loop plus its own minimal HTTP transport (the "Streamable
 //! HTTP transport" section further down in this file), rather than reusing
-//! `harw-mcp-server`'s supervisor-backed one. The HTTP transport
-//! intentionally mirrors (does not import) the auth/Origin logic of
-//! `iface::http` and `harw-mcp-server::transport`: a handful of small,
-//! independent functions, not a shared dependency.
+//! `harw-mcp-server`'s supervisor-backed one. The HTTP transport's
+//! auth/Origin/body checks are the ones `iface::http` uses too, shared via
+//! `iface::net` (same policy as `harw-mcp-server::transport`, not a
+//! dependency on it).
 
 use std::collections::{HashMap, VecDeque};
 use std::convert::Infallible;
 use std::io::{BufRead, Write};
-use std::net::{IpAddr, SocketAddr};
+use std::net::SocketAddr;
 use std::process::ExitCode;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use bytes::Bytes;
-use http_body_util::combinators::BoxBody;
-use http_body_util::{BodyExt, Full, LengthLimitError, Limited};
+use http_body_util::{BodyExt, Full};
 use hyper::body::Incoming;
-use hyper::header::{
-    ACCEPT, AUTHORIZATION, CONTENT_LENGTH, CONTENT_TYPE, HeaderName, HeaderValue, ORIGIN,
-};
+use hyper::header::{ACCEPT, CONTENT_TYPE, HeaderName, HeaderValue};
 use hyper::service::service_fn;
 use hyper::{HeaderMap, Method, Request, Response, StatusCode};
 use hyper_util::rt::{TokioExecutor, TokioIo};
@@ -56,7 +53,10 @@ use serde_json::{Value, json};
 use tokio::net::TcpListener;
 use tokio::task::JoinSet;
 
-use crate::child_protocol::{MAX_JSON_NESTING_DEPTH, json_nesting_too_deep};
+use super::net::{
+    HttpResponse, bearer_authorized, json_response, json_too_deep, origin_is_loopback,
+    read_json_body, validate_listen_requirements,
+};
 use crate::context::RunnerContext;
 
 /// The MCP protocol version this interface implements and advertises during
@@ -757,7 +757,7 @@ impl McpServer {
             if trimmed.is_empty() {
                 continue;
             }
-            if json_nesting_too_deep(trimmed, MAX_JSON_NESTING_DEPTH) {
+            if json_too_deep(trimmed) {
                 write_line(
                     output,
                     &error_response(None, -32700, "parse error: too deeply nested"),
@@ -887,9 +887,8 @@ fn error_response(id: Option<Value>, code: i64, message: &str) -> Value {
 //
 // A small, self-contained loopback listener for [`McpServer::handle_message`]
 // — not a reuse of `harw-mcp-server`'s supervisor-backed transport (see the
-// module doc), and not a shared function with `iface::http` either (that
-// module is not depended on from here; the auth/Origin checks below are a
-// deliberate, small duplicate of its logic, kept in lock-step by convention).
+// module doc). The auth/Origin/body checks are `iface::net`'s, shared with
+// `iface::http`.
 //
 // - `POST /mcp` takes one JSON-RPC request (batches are not supported: the
 //   stdio transport this shares a handler with does not support them
@@ -909,8 +908,6 @@ const MCP_BODY_READ_TIMEOUT: Duration = Duration::from_secs(30);
 /// `harw-mcp-client`'s `MCP_SESSION_HEADER`, independently — this module
 /// does not depend on that crate).
 const SESSION_HEADER: HeaderName = HeaderName::from_static("mcp-session-id");
-
-type HttpResponse = Response<BoxBody<Bytes, Infallible>>;
 
 /// Shared state for the HTTP transport: the same [`McpServer`] the stdio
 /// loop would have used, plus the bits stdio has no equivalent of (the
@@ -935,7 +932,11 @@ fn run_http(ctx: RunnerContext, listen: String) -> ExitCode {
     let token = std::env::var("HARW_AGENT_HTTP_TOKEN")
         .ok()
         .filter(|value| !value.is_empty());
-    if let Err(reason) = validate_listen_requirements(addr, token.as_deref()) {
+    if let Err(reason) = validate_listen_requirements(
+        addr,
+        token.as_deref(),
+        "the MCP Streamable HTTP interface",
+    ) {
         eprintln!("harw-agent-runner: {reason}");
         return ExitCode::FAILURE;
     }
@@ -960,20 +961,6 @@ fn run_http(ctx: RunnerContext, listen: String) -> ExitCode {
         }
     };
     runtime.block_on(serve_http(addr, state))
-}
-
-/// A bind address requires a configured token unless it is loopback-only.
-/// Mirrors `iface::http::validate_listen_requirements` (see this module's
-/// doc for why that is a deliberate duplicate, not an import).
-fn validate_listen_requirements(addr: SocketAddr, token: Option<&str>) -> Result<(), String> {
-    if !addr.ip().is_loopback() && token.is_none() {
-        return Err(
-            "the MCP Streamable HTTP interface on a non-loopback address requires \
-             HARW_AGENT_HTTP_TOKEN"
-                .to_owned(),
-        );
-    }
-    Ok(())
 }
 
 async fn serve_http(addr: SocketAddr, state: Arc<McpHttpState>) -> ExitCode {
@@ -1046,7 +1033,7 @@ async fn dispatch_http(
     if path == "/healthz" {
         return json_response(StatusCode::OK, &json!({"status": "ok"}));
     }
-    if !authorize(state, headers) {
+    if !bearer_authorized(state.token.as_deref(), headers) {
         return json_response(StatusCode::UNAUTHORIZED, &json!({"error": "unauthorized"}));
     }
     if !origin_is_loopback(headers) {
@@ -1064,71 +1051,6 @@ async fn dispatch_http(
     } else {
         json_response(StatusCode::NOT_FOUND, &json!({"error": "not_found"}))
     }
-}
-
-/// Constant-time bearer check; `None` (no configured token) always passes.
-/// Mirrors `iface::http::authorize`.
-fn authorize(state: &McpHttpState, headers: &HeaderMap) -> bool {
-    let Some(expected) = state.token.as_deref() else {
-        return true;
-    };
-    let Some(header) = headers
-        .get(AUTHORIZATION)
-        .and_then(|value| value.to_str().ok())
-    else {
-        return false;
-    };
-    let Some(presented) = header
-        .strip_prefix("Bearer ")
-        .or_else(|| header.strip_prefix("bearer "))
-    else {
-        return false;
-    };
-    constant_time_eq(expected, presented.as_bytes())
-}
-
-/// Mirrors `iface::http::constant_time_eq`.
-fn constant_time_eq(left: &[u8], right: &[u8]) -> bool {
-    let mut difference = left.len() ^ right.len();
-    for index in 0..left.len().max(right.len()) {
-        difference |= usize::from(
-            left.get(index).copied().unwrap_or(0) ^ right.get(index).copied().unwrap_or(0),
-        );
-    }
-    difference == 0
-}
-
-/// Rejects a request whose `Origin` header does not name a loopback host —
-/// MCP's Streamable HTTP transport recommends this to guard against DNS
-/// rebinding attacks from a browser. A native MCP client normally omits
-/// `Origin` entirely, so only a *supplied* one is checked (structurally the
-/// same policy as `harw-mcp-server::transport::origin_is_loopback`,
-/// reimplemented independently here rather than imported — see the module
-/// doc).
-fn origin_is_loopback(headers: &HeaderMap) -> bool {
-    let Some(origin) = headers.get(ORIGIN) else {
-        return true;
-    };
-    let Ok(origin) = origin.to_str() else {
-        return false;
-    };
-    let Some(authority) = origin
-        .strip_prefix("http://")
-        .or_else(|| origin.strip_prefix("https://"))
-    else {
-        return false;
-    };
-    let authority = authority.split(['/', '?', '#']).next().unwrap_or("");
-    if authority.is_empty() {
-        return false;
-    }
-    let host = if let Some(bracketed) = authority.strip_prefix('[') {
-        bracketed.split(']').next().unwrap_or("")
-    } else {
-        authority.split(':').next().unwrap_or(authority)
-    };
-    host.eq_ignore_ascii_case("localhost")
-        || host.parse::<IpAddr>().is_ok_and(|ip| ip.is_loopback())
 }
 
 fn new_session_id(state: &McpHttpState) -> String {
@@ -1245,82 +1167,11 @@ fn sse_response(notifications: &[Value], response: Option<&Value>) -> HttpRespon
         .unwrap_or_else(|_| Response::new(Full::new(Bytes::new()).boxed()))
 }
 
-fn json_response(status: StatusCode, body: &Value) -> HttpResponse {
-    Response::builder()
-        .status(status)
-        .header(CONTENT_TYPE, "application/json")
-        .body(Full::new(Bytes::from(body.to_string())).boxed())
-        .unwrap_or_else(|_| Response::new(Full::new(Bytes::new()).boxed()))
-}
-
 fn empty_response(status: StatusCode) -> HttpResponse {
     Response::builder()
         .status(status)
         .body(Full::new(Bytes::new()).boxed())
         .unwrap_or_else(|_| Response::new(Full::new(Bytes::new()).boxed()))
-}
-
-// The `Err` variant carries a fully-built `HttpResponse` (as
-// `iface::http`'s equivalent helper does) so callers return it unchanged;
-// it outlives this one call on the stack and is never cloned, so the size
-// is not a real cost.
-#[allow(clippy::result_large_err)]
-async fn read_json_body(
-    request: Request<Incoming>,
-    max_bytes: usize,
-    read_timeout: Duration,
-) -> Result<Value, HttpResponse> {
-    let declared_len = request
-        .headers()
-        .get(CONTENT_LENGTH)
-        .and_then(|value| value.to_str().ok())
-        .and_then(|value| value.parse::<u64>().ok());
-    if declared_len.is_some_and(|len| len > max_bytes as u64) {
-        return Err(json_response(
-            StatusCode::PAYLOAD_TOO_LARGE,
-            &json!({"error": "payload_too_large"}),
-        ));
-    }
-    let limited = Limited::new(request.into_body(), max_bytes);
-    let bytes = match tokio::time::timeout(read_timeout, limited.collect()).await {
-        Ok(Ok(collected)) => collected.to_bytes(),
-        Ok(Err(error)) if error.downcast_ref::<LengthLimitError>().is_some() => {
-            return Err(json_response(
-                StatusCode::PAYLOAD_TOO_LARGE,
-                &json!({"error": "payload_too_large"}),
-            ));
-        }
-        Ok(Err(_)) => {
-            return Err(json_response(
-                StatusCode::BAD_REQUEST,
-                &json!({"error": "bad_request"}),
-            ));
-        }
-        Err(_elapsed) => {
-            return Err(json_response(
-                StatusCode::REQUEST_TIMEOUT,
-                &json!({"error": "request_timeout"}),
-            ));
-        }
-    };
-    if bytes.is_empty() {
-        return Ok(Value::Null);
-    }
-    // Reject a shallow-but-deeply-nested body (e.g. megabytes of `[[[[...`)
-    // before handing it to `serde_json`'s recursive-descent parser, which has
-    // no depth limit of its own and can exhaust the stack on such input —
-    // even within the `max_bytes` cap already enforced above.
-    if crate::child_protocol::json_nesting_too_deep(
-        &bytes,
-        crate::child_protocol::MAX_JSON_NESTING_DEPTH,
-    ) {
-        return Err(json_response(
-            StatusCode::BAD_REQUEST,
-            &json!({"error": "invalid_json", "detail": "too deeply nested"}),
-        ));
-    }
-    serde_json::from_slice(&bytes)
-        .map_err(|_| json_response(StatusCode::BAD_REQUEST, &json!({"error": "invalid_json"})))
 }
 
 // ---------------------------------------------------------------------------

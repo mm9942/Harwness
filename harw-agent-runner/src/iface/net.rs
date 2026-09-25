@@ -24,7 +24,7 @@ use std::time::Duration;
 use bytes::Bytes;
 use http_body_util::combinators::BoxBody;
 use http_body_util::{BodyExt, Full, LengthLimitError, Limited};
-use hyper::body::Incoming;
+use hyper::body::Body;
 use hyper::header::{AUTHORIZATION, CONTENT_LENGTH, CONTENT_TYPE, ORIGIN};
 use hyper::{HeaderMap, Request, Response, StatusCode};
 use serde_json::{Value, json};
@@ -155,24 +155,34 @@ pub(crate) fn decode_json_body(bytes: &[u8]) -> Result<Value, HttpResponse> {
 
 /// Reads a request body bounded by `max_bytes` (declared `Content-Length`
 /// and actual length) and `read_timeout`, then [`decode_json_body`]s it.
+/// Generic over the body type so tests can feed an in-memory body; the
+/// listeners pass hyper's `Incoming`.
 // See `decode_json_body` for the `result_large_err` allowance.
 #[allow(clippy::result_large_err)]
-pub(crate) async fn read_json_body(
-    request: Request<Incoming>,
+pub(crate) async fn read_json_body<B>(
+    request: Request<B>,
     max_bytes: usize,
     read_timeout: Duration,
-) -> Result<Value, HttpResponse> {
+) -> Result<Value, HttpResponse>
+where
+    B: Body<Data = Bytes>,
+    B::Error: Into<Box<dyn std::error::Error + Send + Sync>>,
+{
     let bytes = read_body_bytes(request, max_bytes, read_timeout).await?;
     decode_json_body(&bytes)
 }
 
 /// The bounded, time-limited read half of [`read_json_body`].
 #[allow(clippy::result_large_err)]
-async fn read_body_bytes(
-    request: Request<Incoming>,
+async fn read_body_bytes<B>(
+    request: Request<B>,
     max_bytes: usize,
     read_timeout: Duration,
-) -> Result<Bytes, HttpResponse> {
+) -> Result<Bytes, HttpResponse>
+where
+    B: Body<Data = Bytes>,
+    B::Error: Into<Box<dyn std::error::Error + Send + Sync>>,
+{
     let declared_len = request
         .headers()
         .get(CONTENT_LENGTH)
@@ -379,6 +389,58 @@ mod tests {
             .err()
             .ok_or("invalid JSON must be refused")?;
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        Ok(())
+    }
+
+    // ── read_json_body ───────────────────────────────────────────────────
+
+    const TEST_TIMEOUT: Duration = Duration::from_secs(5);
+
+    fn request_with(body: impl Into<Bytes>) -> Request<Full<Bytes>> {
+        Request::new(Full::new(body.into()))
+    }
+
+    #[tokio::test]
+    async fn read_valid_body_parses() -> TestResult {
+        let value = read_json_body(request_with(r#"{"prompt":"hi"}"#), 1024, TEST_TIMEOUT)
+            .await
+            .map_err(|_| "valid body must decode")?;
+        assert_eq!(value["prompt"], "hi");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn read_over_deep_body_is_400() -> TestResult {
+        let body = nested(MAX_JSON_NESTING_DEPTH + 1);
+        let response = read_json_body(request_with(body), 1024 * 1024, TEST_TIMEOUT)
+            .await
+            .err()
+            .ok_or("an over-deep body must be refused")?;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn read_body_over_the_byte_cap_is_413() -> TestResult {
+        let response = read_json_body(request_with(vec![b' '; 64]), 16, TEST_TIMEOUT)
+            .await
+            .err()
+            .ok_or("an oversized body must be refused")?;
+        assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn read_declared_length_over_the_cap_is_413() -> TestResult {
+        let mut request = request_with("{}");
+        request
+            .headers_mut()
+            .insert(CONTENT_LENGTH, HeaderValue::from_static("999999"));
+        let response = read_json_body(request, 16, TEST_TIMEOUT)
+            .await
+            .err()
+            .ok_or("an oversized declared length must be refused")?;
+        assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
         Ok(())
     }
 

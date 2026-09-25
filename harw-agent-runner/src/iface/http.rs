@@ -193,7 +193,7 @@ async fn serve(addr: SocketAddr, state: Arc<AppState>) -> ExitCode {
                     let _ = builder
                         .serve_connection(
                             TokioIo::new(stream),
-                            service_fn(move |request| {
+                            service_fn(move |request: Request<Incoming>| {
                                 let state = Arc::clone(&state);
                                 async move { handle(state, request).await }
                             }),
@@ -208,11 +208,14 @@ async fn serve(addr: SocketAddr, state: Arc<AppState>) -> ExitCode {
     ExitCode::SUCCESS
 }
 
-/// Reads a raw hyper request into the pieces [`dispatch`] needs.
-async fn handle(
-    state: Arc<AppState>,
-    request: Request<Incoming>,
-) -> Result<HttpResponse, Infallible> {
+/// Reads a raw hyper request into the pieces [`dispatch`] needs. Generic
+/// over the body type (the listener passes hyper's `Incoming`) so the body
+/// checks — size cap, JSON depth limit — are testable in-process.
+async fn handle<B>(state: Arc<AppState>, request: Request<B>) -> Result<HttpResponse, Infallible>
+where
+    B: hyper::body::Body<Data = Bytes>,
+    B::Error: Into<Box<dyn std::error::Error + Send + Sync>>,
+{
     let method = request.method().clone();
     let path = request.uri().path().to_owned();
     let headers = request.headers().clone();
@@ -910,7 +913,10 @@ fn sdk_event_envelope(event: &harwness_sdk::SdkEvent) -> Value {
 mod tests {
     use std::sync::atomic::{AtomicBool, Ordering};
 
-    use hyper::header::AUTHORIZATION;
+    use http_body_util::Full;
+    use hyper::header::{AUTHORIZATION, ORIGIN};
+
+    use crate::child_protocol::MAX_JSON_NESTING_DEPTH;
 
     use super::*;
 
@@ -1025,21 +1031,21 @@ mod tests {
     #[test]
     fn non_loopback_bind_without_token_is_rejected() -> TestResult {
         let addr: SocketAddr = "0.0.0.0:8787".parse()?;
-        assert!(validate_listen_requirements(addr, None).is_err());
+        assert!(validate_listen_requirements(addr, None, "the HTTP interface").is_err());
         Ok(())
     }
 
     #[test]
     fn non_loopback_bind_with_token_is_allowed() -> TestResult {
         let addr: SocketAddr = "0.0.0.0:8787".parse()?;
-        assert!(validate_listen_requirements(addr, Some("secret")).is_ok());
+        assert!(validate_listen_requirements(addr, Some("secret"), "the HTTP interface").is_ok());
         Ok(())
     }
 
     #[test]
     fn loopback_bind_without_token_is_allowed() -> TestResult {
         let addr: SocketAddr = "127.0.0.1:8787".parse()?;
-        assert!(validate_listen_requirements(addr, None).is_ok());
+        assert!(validate_listen_requirements(addr, None, "the HTTP interface").is_ok());
         Ok(())
     }
 
@@ -1101,6 +1107,84 @@ mod tests {
         )
         .await;
         assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    // ── Origin guard ─────────────────────────────────────────────────────
+
+    fn with_origin(value: &'static str) -> HeaderMap {
+        let mut headers = HeaderMap::new();
+        headers.insert(ORIGIN, HeaderValue::from_static(value));
+        headers
+    }
+
+    #[tokio::test]
+    async fn a_non_loopback_origin_is_refused() {
+        let state = test_state(None);
+        let response = dispatch(
+            &state,
+            &Method::GET,
+            "/manifest",
+            &with_origin("http://evil.example"),
+            Value::Null,
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn loopback_origins_are_accepted() {
+        let state = test_state(None);
+        for origin in ["http://localhost:5173", "http://127.0.0.1", "http://[::1]:8787"] {
+            let response = dispatch(
+                &state,
+                &Method::GET,
+                "/manifest",
+                &with_origin(origin),
+                Value::Null,
+            )
+            .await;
+            assert_eq!(response.status(), StatusCode::OK, "{origin}");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_bad_origin_is_refused_even_with_a_valid_token() -> TestResult {
+        let state = test_state(Some("tok"));
+        let mut headers = bearer("tok")?;
+        headers.insert(ORIGIN, HeaderValue::from_static("https://evil.example"));
+        let response = dispatch(&state, &Method::GET, "/manifest", &headers, Value::Null).await;
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        Ok(())
+    }
+
+    // ── Body hardening (through `handle`, in-memory body) ────────────────
+
+    #[tokio::test]
+    async fn an_over_deep_json_body_is_400() -> TestResult {
+        let state = test_state(None);
+        let depth = MAX_JSON_NESTING_DEPTH + 1;
+        let body = format!("{}{}", "[".repeat(depth), "]".repeat(depth));
+        let request = Request::builder()
+            .method(Method::POST)
+            .uri("/run")
+            .body(Full::new(Bytes::from(body)))?;
+        let response = handle(state, request).await?;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let value = body_json(response).await?;
+        assert_eq!(value["error"], "invalid_json");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_json_body_within_the_depth_limit_reaches_the_route() -> TestResult {
+        let state = test_state(None);
+        let request = Request::builder()
+            .method(Method::POST)
+            .uri("/run")
+            .body(Full::new(Bytes::from_static(br#"{"prompt":"hi"}"#)))?;
+        let response = handle(state, request).await?;
+        assert_eq!(response.status(), StatusCode::OK);
+        Ok(())
     }
 
     // ── POST /run (offline echo) ─────────────────────────────────────────

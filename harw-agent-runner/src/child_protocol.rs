@@ -45,6 +45,15 @@ pub const PROTOCOL_VERSION: &str = "harwness.agent-child/v1";
 /// this crate checks this bound first.
 pub const MAX_JSON_NESTING_DEPTH: usize = 64;
 
+/// Largest single protocol line, in bytes, excluding its terminating `\n`,
+/// that either side reads (1 MiB). [`FrameReader`] refuses a longer line
+/// before buffering past this bound, so a peer that never sends `\n` (or
+/// sends one enormous frame) cannot grow the reader's memory without limit.
+/// An oversized frame is a protocol error, never truncated and parsed: the
+/// child answers it with [`ChildToParent::Error`] and exits, the parent
+/// fails the run and kills the child's process group.
+pub const MAX_FRAME_BYTES: usize = 1024 * 1024;
+
 /// One frame sent from the parent to a child, over the child's stdin.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
@@ -374,6 +383,116 @@ pub fn json_nesting_too_deep(input: impl AsRef<[u8]>, max_depth: usize) -> bool 
     false
 }
 
+/// Why [`FrameReader::next_frame`] could not produce a line.
+#[derive(Debug)]
+pub enum FrameReadError {
+    /// Reading the underlying stream failed.
+    Io(std::io::Error),
+    /// The line exceeded [`MAX_FRAME_BYTES`] before its `\n` arrived. The
+    /// reader has stopped mid-line and is unusable afterwards: the stream is
+    /// out of sync and the peer must be treated as broken.
+    TooLarge {
+        /// The limit that was exceeded ([`MAX_FRAME_BYTES`] in production).
+        limit: usize,
+    },
+    /// The line was not valid UTF-8.
+    InvalidUtf8,
+}
+
+impl std::fmt::Display for FrameReadError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Io(error) => write!(f, "failed reading a child protocol line: {error}"),
+            Self::TooLarge { limit } => {
+                write!(f, "child protocol frame exceeds the {limit}-byte limit")
+            }
+            Self::InvalidUtf8 => f.write_str("child protocol frame is not valid UTF-8"),
+        }
+    }
+}
+
+impl std::error::Error for FrameReadError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Io(error) => Some(error),
+            Self::TooLarge { .. } | Self::InvalidUtf8 => None,
+        }
+    }
+}
+
+/// A `\n`-delimited line reader with a hard per-line byte limit — the
+/// bounded replacement for `tokio::io::AsyncBufReadExt::lines`, which buffers
+/// an unterminated line without any bound.
+///
+/// # Description
+/// [`Self::next_frame`] copies at most `limit` content bytes of the current
+/// line; as soon as the line would grow past that it returns
+/// [`FrameReadError::TooLarge`] without reading the rest. A final line that
+/// ends at EOF without `\n` is still returned (like `lines()`); a trailing
+/// `\r` is kept and left to [`decode_line`], which trims it.
+pub struct FrameReader<R> {
+    inner: R,
+    buf: Vec<u8>,
+    limit: usize,
+}
+
+impl<R: tokio::io::AsyncBufRead + Unpin> FrameReader<R> {
+    /// A reader over `inner` limited to [`MAX_FRAME_BYTES`] per line.
+    #[must_use]
+    pub fn new(inner: R) -> Self {
+        Self::with_limit(inner, MAX_FRAME_BYTES)
+    }
+
+    /// A reader over `inner` with a custom per-line limit (tests use a small
+    /// one so an oversized frame stays cheap to build).
+    #[must_use]
+    pub fn with_limit(inner: R, limit: usize) -> Self {
+        Self {
+            inner,
+            buf: Vec::new(),
+            limit,
+        }
+    }
+
+    /// Reads the next line without its `\n`.
+    ///
+    /// # Returns
+    /// `Ok(None)` at a clean EOF (no pending bytes).
+    ///
+    /// # Errors
+    /// [`FrameReadError::TooLarge`] once the line exceeds the limit,
+    /// [`FrameReadError::InvalidUtf8`] for a non-UTF-8 line,
+    /// [`FrameReadError::Io`] if the stream fails.
+    pub async fn next_frame(&mut self) -> Result<Option<String>, FrameReadError> {
+        use tokio::io::AsyncBufReadExt;
+
+        self.buf.clear();
+        loop {
+            let available = self.inner.fill_buf().await.map_err(FrameReadError::Io)?;
+            if available.is_empty() {
+                if self.buf.is_empty() {
+                    return Ok(None);
+                }
+                break;
+            }
+            let newline = available.iter().position(|&byte| byte == b'\n');
+            let content_len = newline.unwrap_or(available.len());
+            if self.buf.len().saturating_add(content_len) > self.limit {
+                return Err(FrameReadError::TooLarge { limit: self.limit });
+            }
+            self.buf.extend_from_slice(&available[..content_len]);
+            let consumed = newline.map_or(content_len, |index| index + 1);
+            self.inner.consume(consumed);
+            if newline.is_some() {
+                break;
+            }
+        }
+        String::from_utf8(std::mem::take(&mut self.buf))
+            .map(Some)
+            .map_err(|_| FrameReadError::InvalidUtf8)
+    }
+}
+
 /// Checks a child's reported protocol string (from [`ChildToParent::Hello`])
 /// against [`PROTOCOL_VERSION`].
 ///
@@ -396,14 +515,17 @@ pub fn verify_protocol(reported: &str) -> Result<(), ProtocolError> {
 mod tests {
     use super::*;
 
-    fn roundtrip<T>(frame: T)
+    type TestResult = Result<(), Box<dyn std::error::Error>>;
+
+    fn roundtrip<T>(frame: T) -> TestResult
     where
         T: Serialize + for<'de> Deserialize<'de> + PartialEq + std::fmt::Debug,
     {
-        let line = encode_line(&frame).expect("encode");
+        let line = encode_line(&frame)?;
         assert!(line.ends_with('\n'));
-        let decoded: T = decode_line(&line).expect("decode");
+        let decoded: T = decode_line(&line)?;
         assert_eq!(decoded, frame);
+        Ok(())
     }
 
     #[test]

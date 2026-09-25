@@ -162,8 +162,12 @@ impl EmbeddedAgent {
         &self.digest
     }
 
-    /// Die aktuell geltenden effektiven Rechte (Manifest, ggf. verengt über
+    /// Die aktuell geltenden Rechte (Manifest, ggf. verengt über
     /// [`Self::with_rights`]).
+    ///
+    /// Direkt nach [`Self::from_bundle`] ist das die Manifest-Obergrenze,
+    /// also `full_access = true` (siehe [`EffectiveRights`]); effektiv wird
+    /// es erst durch `with_rights(from_manifest(..).narrowed_by(&flags))`.
     #[must_use]
     pub fn rights(&self) -> &EffectiveRights {
         &self.rights
@@ -696,6 +700,162 @@ admitted = ["fs.read"]
         });
         assert!(!combined.tools.contains("shell.exec"));
         assert!(combined.full_access);
+        Ok(())
+    }
+
+    /// Rechte, deren fünf Wahrheitswerte aus den unteren Bits von `bits`
+    /// stammen (Bit 0 `network_open`, 1 `write`, 2 `shell`, 3 `host`, 4
+    /// `full_access`).
+    fn rights_from_bits(bits: u8) -> EffectiveRights {
+        EffectiveRights {
+            tools: ["fs.read", "fs.write"]
+                .iter()
+                .map(|tool| (*tool).to_owned())
+                .collect(),
+            network_hosts: std::iter::once("example.com".to_owned()).collect(),
+            network_open: (bits & 1) != 0,
+            write: (bits & 2) != 0,
+            shell: (bits & 4) != 0,
+            host: (bits & 8) != 0,
+            full_access: (bits & 16) != 0,
+            budget: None,
+        }
+    }
+
+    fn booleans(rights: &EffectiveRights) -> [bool; 5] {
+        [
+            rights.network_open,
+            rights.write,
+            rights.shell,
+            rights.host,
+            rights.full_access,
+        ]
+    }
+
+    #[test]
+    fn intersect_never_turns_a_false_boolean_true() {
+        // Erschöpfend: alle 2^5 × 2^5 Kombinationen beider Seiten.
+        for left in 0..32_u8 {
+            for right in 0..32_u8 {
+                let a = rights_from_bits(left);
+                let b = rights_from_bits(right);
+                let result = booleans(&a.clone().intersect(&b));
+                let expected = booleans(&a)
+                    .into_iter()
+                    .zip(booleans(&b))
+                    .map(|(x, y)| x && y)
+                    .collect::<Vec<_>>();
+                assert_eq!(result.to_vec(), expected, "{left:05b} ∩ {right:05b}");
+            }
+        }
+    }
+
+    #[test]
+    fn intersect_intersects_sets_and_takes_the_stricter_budget() {
+        let mut left = rights_from_bits(31);
+        left.tools.insert("shell.exec".to_owned());
+        left.network_hosts.insert("left.example".to_owned());
+        left.budget = Some(Budget {
+            max_tokens: Some(10),
+            max_tool_calls: Some(50),
+            max_wall_secs: None,
+            ..Budget::default()
+        });
+        let mut right = rights_from_bits(31);
+        right.tools.remove("fs.write");
+        right.network_hosts.insert("right.example".to_owned());
+        right.budget = Some(Budget {
+            max_tokens: Some(20),
+            max_tool_calls: Some(5),
+            max_wall_secs: Some(9),
+            ..Budget::default()
+        });
+        let result = left.clone().intersect(&right);
+        assert_eq!(
+            result.tools,
+            std::iter::once("fs.read".to_owned()).collect::<BTreeSet<_>>()
+        );
+        assert_eq!(
+            result.network_hosts,
+            std::iter::once("example.com".to_owned()).collect::<BTreeSet<_>>()
+        );
+        let budget = result.budget.unwrap_or_default();
+        assert_eq!(budget.max_tokens, Some(10));
+        assert_eq!(budget.max_tool_calls, Some(5));
+        assert_eq!(budget.max_wall_secs, Some(9));
+        // Symmetrisch: die Reihenfolge ändert nichts an der Schnittmenge.
+        assert_eq!(right.intersect(&left), result);
+    }
+
+    #[test]
+    fn narrowed_by_never_widens_any_set_or_boolean() {
+        let deny_variants: [Vec<String>; 3] = [
+            Vec::new(),
+            vec!["fs.write".to_owned()],
+            vec!["not.admitted".to_owned()],
+        ];
+        for base_bits in 0..32_u8 {
+            let mut base = rights_from_bits(base_bits);
+            base.budget = Some(Budget {
+                max_tokens: Some(100),
+                ..Budget::default()
+            });
+            for flag_bits in 0..8_u8 {
+                for deny_tools in &deny_variants {
+                    for max_tokens in [None, Some(1), Some(1_000)] {
+                        let flags = RightsFlags {
+                            deny_tools: deny_tools.clone(),
+                            no_network: (flag_bits & 1) != 0,
+                            read_only: (flag_bits & 2) != 0,
+                            full_access: (flag_bits & 4) != 0,
+                            max_tokens,
+                        };
+                        let narrowed = base.clone().narrowed_by(&flags);
+                        assert!(narrowed.tools.is_subset(&base.tools));
+                        assert!(narrowed.network_hosts.is_subset(&base.network_hosts));
+                        for (after, before) in booleans(&narrowed).into_iter().zip(booleans(&base))
+                        {
+                            assert!(!after || before, "{flags:?} widened {base_bits:05b}");
+                        }
+                        let after = narrowed.budget.and_then(|budget| budget.max_tokens);
+                        assert!(after.is_some_and(|tokens| tokens <= 100), "{after:?}");
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn full_access_is_effective_only_with_ceiling_and_flag() {
+        for ceiling in [false, true] {
+            for flag in [false, true] {
+                let mut base = rights_from_bits(0);
+                base.full_access = ceiling;
+                let narrowed = base.narrowed_by(&RightsFlags {
+                    full_access: flag,
+                    ..RightsFlags::default()
+                });
+                assert_eq!(narrowed.full_access, ceiling && flag, "{ceiling} ∧ {flag}");
+            }
+        }
+    }
+
+    #[test]
+    fn from_manifest_without_the_flag_has_no_full_access() -> TestResult {
+        let root_ir = compile(ROOT_DEF, "acme.agent.embedded-root@1")?;
+        let ceiling = EffectiveRights::from_manifest(&root_ir.permissions);
+        assert!(ceiling.full_access, "the manifest ceiling permits it");
+        let effective = ceiling.clone().narrowed_by(&RightsFlags::default());
+        assert!(!effective.full_access);
+
+        // Über `with_rights` bleibt es aus, auch wenn danach erneut die
+        // unverengte Obergrenze übergeben wird.
+        let (bundle, artifact) = build_bundle()?;
+        let agent = EmbeddedAgent::from_bundle(bundle, &artifact)?
+            .with_rights(effective)
+            .with_rights(ceiling);
+        assert!(!agent.rights().full_access);
+        assert!(!agent.for_agent("child")?.rights().full_access);
         Ok(())
     }
 }

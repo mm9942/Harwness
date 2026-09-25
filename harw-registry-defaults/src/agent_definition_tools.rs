@@ -2427,8 +2427,114 @@ impl ToolProvider for AgentDefinitionToolProvider {
 // `shell.exec` (nicht in [`crate::AUTO_APPROVED_TOOLS`]) und **nie** in ein
 // eingebautes `RegistryProfile` verdrahtet — nur eine ausdrückliche
 // Agentendefinition, die `agents.build` in `tools.admitted` aufführt, darf
-// diesen Provider bekommen (die tatsächliche Montage dieses Falls liegt
-// außerhalb dieses Crates, siehe Abschlussbericht).
+// diesen Provider bekommen. Die Entscheidung trifft
+// [`agent_build_provider_for`]; die Montage der Wurzel (`harw-runtime`,
+// `assembly.rs`) ruft sie mit der IR des aktiven Agenten, den Rechten der
+// Sandbox und der Job-Verwaltung der Sitzung auf.
+
+/// Warum [`agent_build_provider_for`] `agents.build` **nicht** registriert.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AgentBuildWithheld {
+    /// Keine ausdrückliche Agentendefinition (eingebaute Rolle, UIA ohne
+    /// `--agent`): eingebaute Rollen bekommen `agents.build` nie von sich aus.
+    NoExplicitDefinition,
+    /// Die Definition nennt `agents.build` nicht in `tools.admitted` (oder
+    /// verbietet es ausdrücklich in `tools.forbidden`).
+    NotAdmitted,
+    /// Die Rechte des Elternteils (bei der Wurzel: ihre Sandbox) tragen
+    /// `Permission::ExecuteProcess` nicht — der Build startet einen Prozess.
+    OutsideAuthority,
+    /// Die Sitzung hat keine Job-Verwaltung; `agents.build` läuft nur als Job.
+    NoJobManager,
+}
+
+impl AgentBuildWithheld {
+    /// Eine Zeile für Log und Nutzer.
+    #[must_use]
+    pub const fn reason(self) -> &'static str {
+        match self {
+            Self::NoExplicitDefinition => {
+                "agents.build is not registered: built-in roles never receive it by default"
+            }
+            Self::NotAdmitted => {
+                "agents.build is not registered: the agent definition does not admit it"
+            }
+            Self::OutsideAuthority => {
+                "agents.build is not registered: the parent authority lacks ExecuteProcess"
+            }
+            Self::NoJobManager => {
+                "agents.build is not registered: no job system in this session (agents.build only runs as a background job)"
+            }
+        }
+    }
+}
+
+impl std::fmt::Display for AgentBuildWithheld {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.reason())
+    }
+}
+
+/// Prüft die drei Bedingungen für `agents.build` in fester Reihenfolge.
+///
+/// # Arguments
+/// - `admitted`/`forbidden`: `None` = keine ausdrückliche Definition;
+///   sonst die Werkzeuglisten ihrer aufgelösten Oberfläche.
+/// - `parent_permissions`: die Rechte des Elternteils.
+/// - `has_job_manager`: ob die Sitzung eine Job-Verwaltung trägt.
+fn agent_build_admission(
+    surface: Option<(&[String], &[String])>,
+    parent_permissions: &PermissionSet,
+    has_job_manager: bool,
+) -> Result<(), AgentBuildWithheld> {
+    let Some((admitted, forbidden)) = surface else {
+        return Err(AgentBuildWithheld::NoExplicitDefinition);
+    };
+    // Ausdrücklich: nur der wörtliche Eintrag zählt, kein Präfix und keine
+    // `ALWAYS_AVAILABLE_TOOLS`-Ergänzung.
+    let named = |list: &[String]| list.iter().any(|tool| tool == "agents.build");
+    if !named(admitted) || named(forbidden) {
+        return Err(AgentBuildWithheld::NotAdmitted);
+    }
+    if !parent_permissions.contains(harw_authority::Permission::ExecuteProcess) {
+        return Err(AgentBuildWithheld::OutsideAuthority);
+    }
+    if !has_job_manager {
+        return Err(AgentBuildWithheld::NoJobManager);
+    }
+    Ok(())
+}
+
+/// Baut den [`AgentBuildToolProvider`] für den aktiven Agenten — oder sagt,
+/// warum nicht.
+///
+/// # Description
+/// Registriert wird `agents.build` nur, wenn **alle** drei gelten:
+/// 1. `definition` ist eine ausdrückliche Agentendefinition (`Some`) und
+///    nennt `agents.build` wörtlich in `tools.admitted` (und nicht in
+///    `tools.forbidden`). Eingebaute Rollen (`None`) bekommen es nie; ein
+///    kompilierter Agent, dessen Manifest es nicht nennt, ebenso wenig.
+/// 2. `parent_permissions` trägt `Permission::ExecuteProcess` (innerhalb der
+///    Autorität des Elternteils; bei der Wurzel ist das ihre Sandbox).
+/// 3. `manager` ist `Some` — ohne Job-Verwaltung läuft kein Build.
+///
+/// Die Freigabe ist davon unabhängig: `agents.build` steht nicht in
+/// [`crate::AUTO_APPROVED_TOOLS`] und fragt deshalb wie `shell.exec`.
+///
+/// # Errors
+/// [`AgentBuildWithheld`] mit dem ersten verletzten Kriterium.
+pub fn agent_build_provider_for(
+    definition: Option<&harw_agent_dsl::executable::ResolvedToolSurface>,
+    parent_permissions: &PermissionSet,
+    manager: Option<std::sync::Arc<harw_tool_job::JobManager>>,
+) -> Result<AgentBuildToolProvider, AgentBuildWithheld> {
+    agent_build_admission(
+        definition.map(|surface| (surface.admitted(), surface.forbidden())),
+        parent_permissions,
+        manager.is_some(),
+    )?;
+    Ok(AgentBuildToolProvider::new(manager))
+}
 
 /// Abstraktion über [`harw_tool_job::JobManager::start`], austauschbar in
 /// Tests (ein Fake zeichnet die Anfrage auf, ohne je einen Prozess zu

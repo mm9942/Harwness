@@ -13,6 +13,12 @@
 #[cfg(any(feature = "cli", feature = "repl"))]
 mod approval;
 
+/// Network hardening shared by the two listening interfaces (`http` and
+/// `mcp`'s Streamable HTTP transport): bind/token policy, bearer check,
+/// loopback `Origin` guard, bounded JSON body read with a depth limit.
+#[cfg(any(feature = "http", feature = "mcp"))]
+mod net;
+
 /// One-shot command line: reads `RunnerArgs::prompt`, runs a single turn,
 /// prints the report.
 #[cfg(feature = "cli")]
