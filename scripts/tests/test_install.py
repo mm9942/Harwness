@@ -2,6 +2,7 @@
 
 import os
 from pathlib import Path
+import shutil
 import subprocess
 import tempfile
 import unittest
@@ -31,9 +32,10 @@ for arg do
   prev=$arg
 done
 case "$*" in
-  *Harwness-main.zip*) cp "$HARW_TEST_ARCHIVE" "$output" ;;
+  *Harwness-main.zip*) printf 'zip\\n' >> "$HARW_TEST_EVENTS"; cp "$HARW_TEST_ARCHIVE" "$output" ;;
   *sh.rustup.rs*) cat > "$output" <<'RUSTUP'
 #!/bin/sh
+printf 'rustup\\n' >> "$HARW_TEST_EVENTS"
 printf '%s\\n' "$*" >> "$HARW_TEST_RUSTUP"
 mkdir -p "$HOME/.cargo/bin"
 for name in cargo rustc rustup; do
@@ -51,7 +53,13 @@ esac
             self.executable(mocks / "cc", "#!/bin/sh\nexit 0\n")
             self.executable(mocks / "bwrap", "#!/bin/sh\nexit 0\n")
             self.executable(mocks / "prlimit", "#!/bin/sh\nexit 0\n")
+            self.executable(
+                mocks / "unzip",
+                '#!/bin/sh\nprintf "unzip\\n" >> "$HARW_TEST_EVENTS"\n'
+                f'exec "{shutil.which("unzip")}" "$@"\n',
+            )
             self.executable(mocks / "make", """#!/bin/sh
+printf 'make\\n' >> "$HARW_TEST_EVENTS"
 printf '%s|%s\\n' "$PWD" "$*" >> "$HARW_TEST_MAKE"
 mkdir -p "$HARW_INSTALL_DIR"
 printf '#!/bin/sh\\necho harw-test\\n' > "$HARW_INSTALL_DIR/harw"
@@ -65,6 +73,7 @@ chmod +x "$HARW_INSTALL_DIR/harw"
                 HARW_SOURCES_DIR=str(home / "sources"),
                 HARW_TEST_ARCHIVE=str(archive),
                 HARW_TEST_URLS=str(root / "urls"),
+                HARW_TEST_EVENTS=str(root / "events"),
                 HARW_TEST_RUSTUP=str(root / "rustup"),
                 HARW_TEST_MAKE=str(root / "make"),
                 HARW_BASE_URL="https://mirror.example/harw",
@@ -76,6 +85,7 @@ chmod +x "$HARW_INSTALL_DIR/harw"
             self.assertEqual(result.returncode, 0, result.stderr)
             self.assertIn("https://mirror.example/harw/Harwness-main.zip", (root / "urls").read_text())
             self.assertIn("-y --default-toolchain stable --profile default", (root / "rustup").read_text())
+            self.assertEqual((root / "events").read_text().splitlines(), ["zip", "unzip", "rustup", "make"])
             source, args = (root / "make").read_text().strip().split("|")
             self.assertEqual(args, f"install BINDIR={home / '.local/bin'}")
             self.assertTrue((Path(source) / "Cargo.toml").is_file())
