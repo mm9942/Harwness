@@ -298,6 +298,8 @@ fn agent_steward_admits_the_commit_mode_tool_set_even_though_two_tools_are_mode_
         .iter()
         .map(String::as_str)
         .filter(|tool| !PARENT_MESSAGE_TOOLS.contains(tool))
+        // Plan R9, Teil A: der Skill-Katalog wird unabhängig vom Profil montiert.
+        .filter(|tool| !matches!(*tool, "skills.search" | "skills.load"))
         .collect();
 
     let profile = profile_for_role(role_names::AGENT_STEWARD)

@@ -403,9 +403,10 @@ impl SymlinkAccess {
     /// Merkt eine kanonische Workspace-Wurzel (idempotent).
     pub fn register_root(&self, root: &Path) {
         let mut state = self.state();
-        if !state.roots.iter().any(|known| known == root) {
-            state.roots.push(root.to_path_buf());
-        }
+        // Zuletzt benutzte Wurzel ans Ende: `review_call` prüft von hinten,
+        // so gewinnt bei mehreren Wurzeln die zuletzt aktive.
+        state.roots.retain(|known| known != root);
+        state.roots.push(root.to_path_buf());
     }
 
     /// `true`, wenn `path` in einem freigegebenen Verzeichnis liegt.
@@ -436,6 +437,7 @@ impl SymlinkAccess {
         let roots = self.state().roots.clone();
         roots
             .iter()
+            .rev()
             .find_map(|root| match resolve_in_root(root, &rel) {
                 Ok(Resolution::Outside(target)) if !self.is_granted(&target.canonical) => {
                     Some(target)

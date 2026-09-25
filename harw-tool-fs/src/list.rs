@@ -386,13 +386,9 @@ mod tests {
         }
         assert!(!render(&output)?.contains("secret.txt"));
 
-        for path in [
-            "link_dir",
-            "loop",
-            "nested/up",
-            "link_dir/deep",
-            "../outside",
-        ] {
+        // `loop` und `nested/up` lösen innerhalb des Arbeitsbereichs auf
+        // (Plan R9, E8) und sind lesbar; nur Ziele außerhalb bleiben gesperrt.
+        for path in ["link_dir", "link_dir/deep", "../outside"] {
             let output =
                 executor.list_dir(&ctx, &call("fs.list", serde_json::json!({ "path": path })))?;
             assert!(

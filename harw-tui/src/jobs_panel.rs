@@ -92,7 +92,7 @@ pub(crate) fn job_line(row: &JobRow, selected: bool, width: usize, theme: Theme)
     let name_width = display_width(&row.name);
     let full_right = format!(" {} {}", row.state, row.runtime);
     let short_right = format!(" {}", row.state);
-    let right = if name_width + display_width(&full_right) <= available {
+    let right = if name_width.min(8) + display_width(&full_right) <= available {
         full_right
     } else if name_width.min(8) + display_width(&short_right) <= available {
         short_right

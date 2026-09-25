@@ -951,9 +951,14 @@ mod tests {
             .iter()
             .map(|p| p.tools().len())
             .sum();
+        // Plan R9, Teil F: `job.*` montiert nur eine Montage mit Job-Verdrahtung.
+        let declared = RegistryProfile::Full
+            .registered_tool_names()
+            .into_iter()
+            .filter(|name| !crate::profile::JOB_TOOLS.contains(name))
+            .count();
         assert_eq!(
-            total_tools,
-            RegistryProfile::Full.registered_tool_names().len(),
+            total_tools, declared,
             "das Full-Profil muss genau seine deklarierten Werkzeuge registrieren"
         );
         assert_eq!(ar.registry.instructions_providers().len(), 1);

@@ -292,23 +292,29 @@ fn a_new_child_starts_in_the_current_live_mode() -> TestResult {
     assert_eq!(child_mode(&spawner, &early)?, InteractionMode::Plan);
 
     spawner.live_mode().publish(InteractionMode::Work);
+    // Das früher gestartete Kind hat noch keine Runde gedreht.
+    assert_eq!(child_mode(&spawner, &early)?, InteractionMode::Plan);
+    {
+        let mut manager = spawner
+            .manager
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let session = manager.get_mut(&early).map_err(ctx("erstes Kind"))?;
+        assert_eq!(
+            session.sync_live_mode(),
+            Some((InteractionMode::Plan, InteractionMode::Work))
+        );
+        assert_eq!(session.sync_live_mode(), None, "genau einmal je Wechsel");
+    }
+    // `max_root_orchestrators = 1`: erst freigeben, dann das zweite Kind.
+    spawner
+        .release_child(&early)
+        .map_err(ctx("erstes Kind freigeben"))?;
     let late = spawner
         .admit("root-orchestrator", spawn_input(uia), sandbox, None)
         .map_err(ctx("zweites Kind"))?;
     assert_eq!(child_mode(&spawner, &late)?, InteractionMode::Work);
-    // Das früher gestartete Kind hat noch keine Runde gedreht.
-    assert_eq!(child_mode(&spawner, &early)?, InteractionMode::Plan);
 
-    let mut manager = spawner
-        .manager
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
-    let session = manager.get_mut(&early).map_err(ctx("erstes Kind"))?;
-    assert_eq!(
-        session.sync_live_mode(),
-        Some((InteractionMode::Plan, InteractionMode::Work))
-    );
-    assert_eq!(session.sync_live_mode(), None, "genau einmal je Wechsel");
     Ok(())
 }
 

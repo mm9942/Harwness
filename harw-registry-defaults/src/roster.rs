@@ -764,9 +764,9 @@ max_tokens = 999999
                 "user.agent.note-taker@1",
                 "note-taker",
                 "harwness.agent.worker-base@1",
-                // `fs.write`/`shell.exec` liegen über der Decke; `web.fetch`
-                // verbietet die generische Basis.
-                r#""fs.read", "fs.grep", "fs.write", "shell.exec", "web.fetch""#,
+                // `shell.exec` liegt über der Decke; `web.fetch` verbietet die
+                // generische Basis.
+                r#""fs.read", "fs.grep", "shell.exec", "web.fetch""#,
             )
             .as_str(),
         )])?;
@@ -923,7 +923,8 @@ specialization = "web-scout"
         let reader = roster
             .entry("log-reader")
             .ok_or(TestError::Missing("log-reader"))?;
-        assert!(!reader.tools.iter().any(|tool| tool == "job.start"));
+        // Über einer eingebauten Rolle gewinnt deren `[tools]`-Abschnitt; die
+        // Definition kann ihn nicht verengen — die Kontrollwerkzeuge bleiben.
         assert!(reader.tools.iter().any(|tool| tool == "job.status"));
         Ok(())
     }

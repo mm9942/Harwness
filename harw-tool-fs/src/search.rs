@@ -565,14 +565,9 @@ mod tests {
             "Schleifen müssen terminieren: {content}"
         );
 
-        for path in [
-            "link_dir",
-            "link_file",
-            "loop",
-            "nested/up",
-            "link_dir/deep",
-            "../outside",
-        ] {
+        // `loop` und `nested/up` lösen innerhalb des Arbeitsbereichs auf
+        // (Plan R9, E8); nur Ziele außerhalb bleiben gesperrt.
+        for path in ["link_dir", "link_file", "link_dir/deep", "../outside"] {
             let output = search(
                 &fixture,
                 &DEFAULT_EXECUTOR,
