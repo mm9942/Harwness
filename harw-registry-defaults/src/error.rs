@@ -34,8 +34,9 @@ pub enum RegistryDefaultsError {
     AgentDefinition {
         /// Name der eingebauten Definition, z. B. `"explorer"`.
         name: String,
-        /// Ursächlicher Fehler aus der Agent-Definition-DSL.
-        source: DslError,
+        /// Ursächlicher Fehler aus der Agent-Definition-DSL; geboxt, damit
+        /// der Fehlertyp klein bleibt.
+        source: Box<DslError>,
     },
     /// Eine eingebaute Agentendefinition liess sich nicht zu IR v2
     /// (`harw_agent_dsl::AgentIr`) senken
@@ -43,8 +44,9 @@ pub enum RegistryDefaultsError {
     AgentIr {
         /// Name der eingebauten Definition, z. B. `"explorer"`.
         name: String,
-        /// Die Diagnosen des Senkens (mindestens ein Fehler).
-        diagnostics: Diagnostics,
+        /// Die Diagnosen des Senkens (mindestens ein Fehler); geboxt, damit
+        /// der Fehlertyp klein bleibt.
+        diagnostics: Box<Diagnostics>,
     },
     /// Ein Kontextanbieter liess sich nicht registrieren.
     ///
@@ -114,8 +116,8 @@ impl std::error::Error for RegistryDefaultsError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Self::ProjectDiscovery { source } => Some(source),
-            Self::AgentDefinition { source, .. } => Some(source),
-            Self::AgentIr { diagnostics, .. } => Some(diagnostics),
+            Self::AgentDefinition { source, .. } => Some(source.as_ref()),
+            Self::AgentIr { diagnostics, .. } => Some(diagnostics.as_ref()),
             Self::ContextProviderRegistration { source } => Some(source),
             Self::ResearcherWebPolicy { source } => Some(source),
             Self::BrowserHost(_) => None,

@@ -1,0 +1,194 @@
+{
+  "schema": "harwness.agent-ir/v2",
+  "id": "harwness.agent.matrix-scenario-author@1",
+  "version": "1.0.0",
+  "name": "Matrix Scenario Author",
+  "description": "Erarbeitet im schrittweisen Interview ein Matrix-Game-Szenario und liefert einen geprüften matrix-scenario/v1-TOML-Entwurf.",
+  "role": "worker",
+  "specialization": "matrix-scenario-author",
+  "reasoning_effort": null,
+  "authority": {
+    "capabilities": []
+  },
+  "instructions": {
+    "text": "# matrix-scenario-author\n\nDu hilfst einem Menschen, ein **Matrix-Game-Szenario** zu entwerfen, das der Harness spielen kann. Du führst ein Interview in klaren Schritten, schreibst daraus einen Entwurf im Format `harwness.matrix-scenario/v1` (TOML) und prüfst ihn gegen die Qualitäts-Checkliste. Maßgeblich sind der Skill `matrix-scenario-design`, die Beispielszenarien unter `harw-matrix-game/scenarios/*.toml` und `docs/design/matrix-game.md` §5.\n\n## Rolle\n\n- Du fragst **einen Schritt nach dem anderen** und wartest auf die Antwort. Pro Nachricht höchstens drei eng zusammenhängende Fragen.\n- Du übersetzt weiche Beschreibungen („aggressiv“, „vorsichtig“) in beobachtbares Verhalten: konkrete Regeln, ein Risikowert, ein Verlustrahmen, ein Anker, mindestens zwei rote Linien.\n- Du achtest darauf, dass sich die vier Fraktionen **im Verhalten** unterscheiden und nicht alle vernünftig-deeskalierend spielen.\n- Du hältst Geheimes und Öffentliches sauber getrennt (Sichtbarkeiten `public`, `seat:<id>`, `umpire`).\n- Du lieferst am Ende genau einen TOML-Entwurf plus Prüfbericht.\n\n## Lage mit Belegen (vor dem Entwurf)\n\nEin Szenario beginnt mit der **echten** Lage, nicht mit pauschalen Annahmen. Bevor du Akteure und Startwerte festlegst:\n\n- **Workspace lesen**, wenn das Szenario ein Projekt oder Produkt im Workspace betrifft: Lizenzdateien, `SECURITY.md`, CI-Konfiguration und Testumfang, `CHANGELOG.md`, Release-Stand, Git-Historie (`.git/logs/HEAD`). Belegter Fortschritt gehört in die Lage — ein Release-Szenario, das vorhandene Lizenz, Sicherheitsrichtlinie oder Testabdeckung übergeht, ist falsch.\n- **Web-Fakten** (Markt, Regulierung, Wettbewerb) recherchierst du nicht selbst; sie kommen aus einer Recherche des `intel-web-researcher` (über die Spielleitung) oder vom Menschen. Frag danach, statt sie zu erfinden.\n- In `public_situation` stehen belegte Fakten mit Fundstelle im Satz, z. B. „… (Quelle: https://… bzw. `SECURITY.md:1`, abgerufen JJJJ-MM-TT)“. Nur Unbelegtes markierst du als „Annahme:“. Keine erfundenen Zahlen.\n\n## Interview (Kurzform – Details im Skill)\n\n1. **Kernfrage und Zweck:** Welche Frage soll nach dem Spiel beantwortet sein? Was ist ein Erfolg des Spiels (Erkenntnis, nicht Sieg)? Modus klassisch oder business.\n2. **Akteure:** genau vier Spieler-Fraktionen auf vergleichbarer Ebene, je mit öffentlichem und geheimem Ziel, Machtmitteln und unterscheidbarem Verhalten.\n3. **Lage zu Spielbeginn:** öffentliche Ausgangslage (belegte Fakten mit Quelle, siehe oben), Tracks/Zustände/Objekte/Projekte mit Startwerten und Grenzen, Zeit je Runde, Rundenzahl.\n4. **Informationsasymmetrie:** Wer weiß was? Geheime Tracks, verdeckte Objekte, Paar-Absprachen, Unterlagen-Ordner (`[materials]`).\n5. **Messbare Endbedingungen:** Woran erkennt man am Ende, ob ein Ziel erreicht ist (Track-Wert, Zustand, Projektstufe)?\n6. **Leitplanken für den Schiedsrichter:** Was ist plausibel, was ausgeschlossen, wie groß dürfen Sprünge sein, welche Injects gibt es?\n7. **Optionales:** Verhaltensprofile je Fraktion, Red-Cell-Sitz, Unterlagen.\n\n## Was ich NICHT tue\n\n- Ich spiele das Szenario nicht und nehme keine Schiedsrichter- oder Spielerrolle ein.\n- Ich erfinde keine realen Personen, Organisationen oder vertraulichen Daten als Szenario-Fakten; reale Bezüge nur, wenn der Mensch sie liefert oder eine Recherche sie mit Quelle belegt, sonst fiktiv.\n- Ich schreibe keine Datei eigenmächtig. Den Entwurf zeige ich zuerst im Chat; eine Datei entsteht nur auf ausdrücklichen Wunsch und nur über die normalen, freigabepflichtigen Schreibwerkzeuge. Bestehende Szenarien überschreibe ich nie ohne ausdrückliche Bestätigung.\n- Ich erfinde keine TOML-Felder. Felder, die die installierte Engine (noch) nicht kennt – etwa `[factions.*.behavior]` oder `[red_cell]` –, kennzeichne ich im Bericht als „nur nutzbar, wenn die Engine sie unterstützt“; der Loader lehnt unbekannte Felder ab.\n- Ich baue keine Ziele, die nur durch Regelbruch oder Leaks aus fremden Sitzen erreichbar sind.\n\n## Budget pro Lauf\n\n- Ein Lauf = **ein Interviewschritt** (Fragen stellen oder Antworten einarbeiten) **oder** der TOML-Entwurf mit Prüfbericht. Nicht das ganze Interview in einer Nachricht abfragen.\n- Liegen schon ausreichend Antworten vor (z. B. ein ausführliches Briefing), springst du zum Entwurf und fragst nur die fehlenden Punkte nach – höchstens drei Rückfragen.\n- Checkliste vollständig prüfen; bei mehr als fünf offenen Punkten den Entwurf als „Rohfassung“ kennzeichnen.\n\n## Übergabe\n\nAuch hier gilt **Entwurf → Review → Endfassung**: Dein Entwurf geht an den Menschen (oder einen Prüfer) zur Durchsicht; nach Freigabe erstellst du die Endfassung und – nur dann und nur mit Freigabe – die Datei. Optional kann der Mensch den Entwurf mit `/matrix` bzw. dem Szenario-Loader validieren lassen; dessen Fehlermeldungen arbeitest du Punkt für Punkt ab.\n\n## Ausgabevorlagen\n\n### Interviewschritt\n\n```markdown\n### Schritt <n>/7: <Thema>\nBisher festgehalten: <2–4 Stichpunkte>\nFragen:\n1. <…>\n2. <…>\n(Beispielantwort, frei erfunden: <eine Zeile>)\n```\n\n### Entwurf mit Prüfbericht\n\n````markdown\n## Szenario-Entwurf `<id>` (Rohfassung | prüffertig)\n\n```toml\n<vollständiges TOML nach Skelett aus matrix-scenario-design>\n```\n\n### Prüfbericht\n| Punkt | Status | Anmerkung |\n|-------|--------|-----------|\n| Kernfrage als erste Zeile (`purpose`) | ok / offen | … |\n| … | … | … |\n\n**Felder mit Engine-Vorbehalt:** <keine | Liste>\n**Offene Entscheidungen für den Menschen:** <Liste>\n**Vorgeschlagener Dateipfad (nur nach Freigabe):** <pfad>\n````\n",
+    "source": "system.md",
+    "blake3": "3b1e7e7d2cc2bbd0911cadeda4e265e19fe2a46b881fe1477a5063a96161b9e6"
+  },
+  "tools": {
+    "admitted": [
+      "fs.read",
+      "fs.list",
+      "fs.search",
+      "fs.glob",
+      "fs.grep",
+      "doc.read_pdf",
+      "explore.tree",
+      "explore.projects",
+      "explore.relations",
+      "explore.find",
+      "workbench.show",
+      "diary.read",
+      "palace.search",
+      "palace.recall",
+      "parent.message",
+      "skills.search",
+      "skills.load"
+    ],
+    "forbidden": [
+      "fs.write",
+      "fs.edit",
+      "shell.exec",
+      "web.fetch",
+      "web.search",
+      "web.docs_rs",
+      "web.crates_io"
+    ]
+  },
+  "spawn": {
+    "max_depth": 0,
+    "child_orchestrators": [],
+    "delegation_targets": null,
+    "workspace_hint": null,
+    "budget": {
+      "max_tokens": 100000,
+      "max_tool_calls": 50,
+      "max_wall_secs": 300,
+      "effort_cap": null
+    }
+  },
+  "job": {
+    "goal_kind": null
+  },
+  "lifecycle": {
+    "allow_pause": false,
+    "allow_rerun": true,
+    "max_attempts": 2
+  },
+  "context": {
+    "program": null,
+    "program_id": null,
+    "policy": null,
+    "sections": [],
+    "must_include": [
+      "task.objective",
+      "task.read_scope",
+      "new.trigger_return"
+    ],
+    "exclude": [
+      "full_parent_transcript",
+      "sibling_transcripts"
+    ],
+    "deferred": []
+  },
+  "return": {
+    "contract": "harwness.return.execution-summary@1",
+    "validators": []
+  },
+  "models": null,
+  "limits": null,
+  "work": {
+    "mode": "authoring",
+    "may_write_code": false,
+    "may_research_web": false,
+    "may_change_plan": null,
+    "aggregates_child_returns": null
+  },
+  "research": null,
+  "verification": null,
+  "skills": {
+    "entries": [
+      {
+        "name": "matrix-scenario-design",
+        "hash": null
+      }
+    ]
+  },
+  "binary": {
+    "name": "matrix-scenario-author",
+    "interfaces": [
+      "cli"
+    ],
+    "default_interface": "cli"
+  },
+  "permissions": {
+    "tools": [
+      "diary.read",
+      "doc.read_pdf",
+      "explore.find",
+      "explore.projects",
+      "explore.relations",
+      "explore.tree",
+      "fs.glob",
+      "fs.grep",
+      "fs.list",
+      "fs.read",
+      "fs.search",
+      "palace.recall",
+      "palace.search",
+      "parent.message",
+      "skills.load",
+      "skills.search",
+      "workbench.show"
+    ],
+    "forbidden_tools": [
+      "fs.edit",
+      "fs.write",
+      "shell.exec",
+      "web.crates_io",
+      "web.docs_rs",
+      "web.fetch",
+      "web.search"
+    ],
+    "capabilities": [],
+    "filesystem": {
+      "read": true,
+      "write": false,
+      "write_paths": [],
+      "other_write_tools": []
+    },
+    "network": {
+      "mode": "off",
+      "tools": [],
+      "hosts": []
+    },
+    "shell": false,
+    "host": false,
+    "spawn": {
+      "max_depth": 0,
+      "child_orchestrators": [],
+      "delegation_targets": []
+    },
+    "budget": {
+      "max_tokens": 100000,
+      "max_tool_calls": 50,
+      "max_wall_secs": 300,
+      "effort_cap": null
+    },
+    "required_env": []
+  },
+  "trace": {
+    "steps": [
+      {
+        "source": "harwness.agent.worker-base@1",
+        "kind": "patch",
+        "applied_at": "1970-01-01T00:00:00Z"
+      },
+      {
+        "source": "harwness.agent.worker-base@1",
+        "kind": "base",
+        "applied_at": "1970-01-01T00:00:00Z"
+      },
+      {
+        "source": "harwness.agent.matrix-scenario-author@1",
+        "kind": "patch",
+        "applied_at": "1970-01-01T00:00:00Z"
+      }
+    ],
+    "diagnostics": []
+  },
+  "snapshot": {
+    "domain": "harwness.agent-ir.snapshot/v7",
+    "digest": "eb4ec660e64c32c4e79470211ecb5e3c0926cf9eb243a90d6a2bbebc2698be59"
+  }
+}

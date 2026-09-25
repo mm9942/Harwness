@@ -1,0 +1,260 @@
+{
+  "schema": "harwness.agent-ir/v2",
+  "id": "harwness.agent.matrix-game-master@1",
+  "version": "1.0.0",
+  "name": "Matrix Game Master",
+  "description": "Spielleitung eines Matrix-Games: entwirft aus einem Freitext-Auftrag ein geprüftes Szenario, lässt es freigeben, spielt es mit Sitz-Agenten durch (Würfel nur aus der Engine) und liefert AAR und report.md.",
+  "role": "root-orchestrator",
+  "specialization": "matrix-game-master",
+  "reasoning_effort": null,
+  "authority": {
+    "capabilities": []
+  },
+  "instructions": {
+    "text": "",
+    "source": null,
+    "blake3": "af1349b9f5f9a1a6a0404dea36dcc9499bcb25c9adc112b7cc9a93cae41f3262"
+  },
+  "tools": {
+    "admitted": [
+      "fs.read",
+      "fs.list",
+      "fs.search",
+      "fs.glob",
+      "fs.grep",
+      "doc.read_pdf",
+      "matrix.draft_scenario",
+      "matrix.status",
+      "matrix.start",
+      "matrix.run",
+      "matrix.finish",
+      "matrix.add_fact",
+      "parent.message",
+      "skills.search",
+      "skills.load"
+    ],
+    "forbidden": [
+      "fs.write",
+      "fs.edit",
+      "shell.exec",
+      "process.kill",
+      "web.fetch",
+      "web.search",
+      "web.docs_rs",
+      "web.crates_io",
+      "delegate_wave",
+      "transfer_to_executor",
+      "transfer_to_explorer",
+      "transfer_to_researcher",
+      "transfer_to_researcher-deps",
+      "transfer_to_dependency-researcher",
+      "transfer_to_researcher-web",
+      "transfer_to_planner",
+      "transfer_to_analyst",
+      "transfer_to_memory-steward",
+      "transfer_to_agent-steward",
+      "transfer_to_matrix-player",
+      "transfer_to_matrix-umpire",
+      "transfer_to_matrix-market",
+      "transfer_to_matrix-redcell"
+    ]
+  },
+  "spawn": {
+    "max_depth": 1,
+    "child_orchestrators": [],
+    "delegation_targets": [
+      "intel-web-researcher",
+      "evidence-collector",
+      "evidence-critic"
+    ],
+    "workspace_hint": null,
+    "budget": {
+      "max_tokens": 1500000,
+      "max_tool_calls": 600,
+      "max_wall_secs": 14400,
+      "effort_cap": null
+    }
+  },
+  "job": {
+    "goal_kind": null
+  },
+  "lifecycle": {
+    "allow_pause": false,
+    "allow_rerun": true,
+    "max_attempts": 2
+  },
+  "context": {
+    "program": "orchestrate",
+    "program_id": "harwness.context.orchestrate@1",
+    "policy": "harwness.context.orchestrate@1",
+    "sections": [
+      {
+        "name": "task.objective",
+        "strength": "must-include",
+        "detail": "full",
+        "trust": "instruction"
+      },
+      {
+        "name": "history.tail",
+        "strength": "must-include",
+        "detail": "summary",
+        "trust": "evidence"
+      },
+      {
+        "name": "plan.current",
+        "strength": "must-include",
+        "detail": "full",
+        "trust": "evidence"
+      },
+      {
+        "name": "child.returns",
+        "strength": "must-include",
+        "detail": "summary",
+        "trust": "evidence"
+      }
+    ],
+    "must_include": [
+      "task.objective",
+      "history.tail",
+      "task.read_scope",
+      "new.trigger_return"
+    ],
+    "exclude": [
+      "credential.*",
+      "secret.*",
+      "sibling_transcripts",
+      "full_parent_transcript",
+      "child.raw_transcript.*"
+    ],
+    "deferred": [
+      "plan.current",
+      "child.returns"
+    ]
+  },
+  "return": {
+    "contract": "harwness.matrix.game-report@1",
+    "validators": []
+  },
+  "models": null,
+  "limits": null,
+  "work": {
+    "mode": "orchestration",
+    "may_write_code": false,
+    "may_research_web": false,
+    "may_change_plan": false,
+    "aggregates_child_returns": true
+  },
+  "research": null,
+  "verification": null,
+  "skills": {
+    "entries": []
+  },
+  "binary": {
+    "name": "matrix-game-master",
+    "interfaces": [
+      "cli"
+    ],
+    "default_interface": "cli"
+  },
+  "permissions": {
+    "tools": [
+      "doc.read_pdf",
+      "fs.glob",
+      "fs.grep",
+      "fs.list",
+      "fs.read",
+      "fs.search",
+      "matrix.add_fact",
+      "matrix.draft_scenario",
+      "matrix.finish",
+      "matrix.run",
+      "matrix.start",
+      "matrix.status",
+      "parent.message",
+      "skills.load",
+      "skills.search"
+    ],
+    "forbidden_tools": [
+      "delegate_wave",
+      "fs.edit",
+      "fs.write",
+      "process.kill",
+      "shell.exec",
+      "transfer_to_agent-steward",
+      "transfer_to_analyst",
+      "transfer_to_dependency-researcher",
+      "transfer_to_executor",
+      "transfer_to_explorer",
+      "transfer_to_matrix-market",
+      "transfer_to_matrix-player",
+      "transfer_to_matrix-redcell",
+      "transfer_to_matrix-umpire",
+      "transfer_to_memory-steward",
+      "transfer_to_planner",
+      "transfer_to_researcher",
+      "transfer_to_researcher-deps",
+      "transfer_to_researcher-web",
+      "web.crates_io",
+      "web.docs_rs",
+      "web.fetch",
+      "web.search"
+    ],
+    "capabilities": [],
+    "filesystem": {
+      "read": true,
+      "write": false,
+      "write_paths": [],
+      "other_write_tools": []
+    },
+    "network": {
+      "mode": "off",
+      "tools": [],
+      "hosts": []
+    },
+    "shell": false,
+    "host": false,
+    "spawn": {
+      "max_depth": 1,
+      "child_orchestrators": [],
+      "delegation_targets": [
+        "evidence-collector",
+        "evidence-critic",
+        "intel-web-researcher"
+      ]
+    },
+    "budget": {
+      "max_tokens": 1500000,
+      "max_tool_calls": 600,
+      "max_wall_secs": 14400,
+      "effort_cap": null
+    },
+    "required_env": []
+  },
+  "trace": {
+    "steps": [
+      {
+        "source": "harwness.agent.matrix-game-master@1",
+        "kind": "patch",
+        "applied_at": "1970-01-01T00:00:00Z"
+      }
+    ],
+    "diagnostics": [
+      {
+        "code": "HARW-CTX-003",
+        "severity": "note",
+        "message": "program `orchestrate` requires sections outside the context ceiling; deferred: plan.current, child.returns",
+        "help": "these sections stay named by the program but are not required at child start",
+        "span": {
+          "file": "builtin/matrix-game-master.toml",
+          "line": 58,
+          "column": 11
+        },
+        "path": "context.program"
+      }
+    ]
+  },
+  "snapshot": {
+    "domain": "harwness.agent-ir.snapshot/v7",
+    "digest": "0494de768954a476fa7830b78352a7ad75d7828852f5037a6fdbcdf344a1fe45"
+  }
+}

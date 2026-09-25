@@ -1,0 +1,200 @@
+{
+  "schema": "harwness.agent-ir/v2",
+  "id": "harwness.agent.uia-writer@1",
+  "version": "1.0.0",
+  "name": "UIA Writer",
+  "description": "Erkundung und kleine Code-Aenderungen im Workspace fuer die UIA (bis ca. 3 Dateien bzw. ein Modul, eine Funktion plus Tests), unter der zugelassenen Organisationsrolle uia-worker.",
+  "role": "uia-worker",
+  "specialization": "uia-writer",
+  "reasoning_effort": null,
+  "authority": {
+    "capabilities": []
+  },
+  "instructions": {
+    "text": "",
+    "source": null,
+    "blake3": "af1349b9f5f9a1a6a0404dea36dcc9499bcb25c9adc112b7cc9a93cae41f3262"
+  },
+  "tools": {
+    "admitted": [
+      "fs.read",
+      "fs.list",
+      "fs.search",
+      "fs.glob",
+      "fs.grep",
+      "doc.read_pdf",
+      "fs.write",
+      "fs.edit",
+      "deps.graph",
+      "deps.locked",
+      "deps.source_read",
+      "deps.source_search",
+      "deps.source_list",
+      "web.fetch",
+      "web.docs_rs",
+      "web.crates_io",
+      "web.search",
+      "workbench.show",
+      "diary.read",
+      "palace.search",
+      "palace.recall",
+      "parent.message",
+      "skills.search",
+      "skills.load"
+    ],
+    "forbidden": [
+      "shell.exec",
+      "lens.ask"
+    ]
+  },
+  "spawn": {
+    "max_depth": 0,
+    "child_orchestrators": [],
+    "delegation_targets": null,
+    "workspace_hint": null,
+    "budget": {
+      "max_tokens": 60000,
+      "max_tool_calls": 40,
+      "max_wall_secs": 180,
+      "effort_cap": null
+    }
+  },
+  "job": {
+    "goal_kind": null
+  },
+  "lifecycle": {
+    "allow_pause": false,
+    "allow_rerun": true,
+    "max_attempts": 2
+  },
+  "context": {
+    "program": null,
+    "program_id": null,
+    "policy": null,
+    "sections": [],
+    "must_include": [
+      "task.objective",
+      "task.read_scope",
+      "new.trigger_return"
+    ],
+    "exclude": [
+      "full_parent_transcript",
+      "sibling_transcripts"
+    ],
+    "deferred": []
+  },
+  "return": {
+    "contract": "harwness.return.execution-summary@1",
+    "validators": []
+  },
+  "models": null,
+  "limits": null,
+  "work": {
+    "mode": "delegated-execution",
+    "may_write_code": true,
+    "may_research_web": true,
+    "may_change_plan": null,
+    "aggregates_child_returns": null
+  },
+  "research": null,
+  "verification": null,
+  "skills": {
+    "entries": []
+  },
+  "binary": {
+    "name": "uia-writer",
+    "interfaces": [
+      "cli"
+    ],
+    "default_interface": "cli"
+  },
+  "permissions": {
+    "tools": [
+      "deps.graph",
+      "deps.locked",
+      "deps.source_list",
+      "deps.source_read",
+      "deps.source_search",
+      "diary.read",
+      "doc.read_pdf",
+      "fs.edit",
+      "fs.glob",
+      "fs.grep",
+      "fs.list",
+      "fs.read",
+      "fs.search",
+      "fs.write",
+      "palace.recall",
+      "palace.search",
+      "parent.message",
+      "skills.load",
+      "skills.search",
+      "web.crates_io",
+      "web.docs_rs",
+      "web.fetch",
+      "web.search",
+      "workbench.show"
+    ],
+    "forbidden_tools": [
+      "lens.ask",
+      "shell.exec"
+    ],
+    "capabilities": [],
+    "filesystem": {
+      "read": true,
+      "write": true,
+      "write_paths": [
+        "$WORKSPACE"
+      ],
+      "other_write_tools": []
+    },
+    "network": {
+      "mode": "allowlist",
+      "tools": [
+        "web.crates_io",
+        "web.docs_rs",
+        "web.fetch",
+        "web.search"
+      ],
+      "hosts": []
+    },
+    "shell": false,
+    "host": false,
+    "spawn": {
+      "max_depth": 0,
+      "child_orchestrators": [],
+      "delegation_targets": []
+    },
+    "budget": {
+      "max_tokens": 60000,
+      "max_tool_calls": 40,
+      "max_wall_secs": 180,
+      "effort_cap": null
+    },
+    "required_env": []
+  },
+  "trace": {
+    "steps": [
+      {
+        "source": "harwness.agent.worker-base@1",
+        "kind": "patch",
+        "applied_at": "1970-01-01T00:00:00Z"
+      },
+      {
+        "source": "harwness.agent.worker-base@1",
+        "kind": "base",
+        "applied_at": "1970-01-01T00:00:00Z"
+      },
+      {
+        "source": "harwness.agent.uia-writer@1",
+        "kind": "patch",
+        "applied_at": "1970-01-01T00:00:00Z"
+      }
+    ],
+    "diagnostics": []
+  },
+  "snapshot": {
+    "domain": "harwness.agent-ir.snapshot/v7",
+    "digest": "ebbb13bd7d06ee936718d649714ff9665fb1c27e1570666657f5e34a6d8d6f4e"
+  }
+}

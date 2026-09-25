@@ -1,0 +1,219 @@
+{
+  "schema": "harwness.agent-ir/v2",
+  "id": "harwness.agent.uia-worker@1",
+  "version": "1.0.0",
+  "name": "UIA Quick Helper",
+  "description": "Schnellhelfer der UIA fuer kleine, klar umrissene Pakete: eine Frage, Shell-Griffe (auch cargo fmt/test), Dateien lesen.",
+  "role": "uia-worker",
+  "specialization": "uia-worker",
+  "reasoning_effort": null,
+  "authority": {
+    "capabilities": []
+  },
+  "instructions": {
+    "text": "",
+    "source": null,
+    "blake3": "af1349b9f5f9a1a6a0404dea36dcc9499bcb25c9adc112b7cc9a93cae41f3262"
+  },
+  "tools": {
+    "admitted": [
+      "fs.read",
+      "fs.list",
+      "fs.search",
+      "fs.glob",
+      "fs.grep",
+      "doc.read_pdf",
+      "shell.exec",
+      "job.start",
+      "job.status",
+      "job.logs",
+      "job.stop",
+      "job.list",
+      "job.wait",
+      "deps.graph",
+      "deps.locked",
+      "deps.source_read",
+      "deps.source_search",
+      "deps.source_list",
+      "web.fetch",
+      "web.docs_rs",
+      "web.crates_io",
+      "web.search",
+      "browser.open",
+      "workbench.show",
+      "diary.read",
+      "palace.search",
+      "palace.recall",
+      "parent.message",
+      "skills.search",
+      "skills.load"
+    ],
+    "forbidden": [
+      "fs.write",
+      "fs.edit",
+      "lens.ask",
+      "browser.observe",
+      "browser.find",
+      "browser.act",
+      "browser.wait",
+      "browser.events",
+      "browser.close"
+    ]
+  },
+  "spawn": {
+    "max_depth": 0,
+    "child_orchestrators": [],
+    "delegation_targets": null,
+    "workspace_hint": null,
+    "budget": {
+      "max_tokens": 20000,
+      "max_tool_calls": 16,
+      "max_wall_secs": 180,
+      "effort_cap": "low"
+    }
+  },
+  "job": {
+    "goal_kind": null
+  },
+  "lifecycle": {
+    "allow_pause": false,
+    "allow_rerun": true,
+    "max_attempts": 2
+  },
+  "context": {
+    "program": null,
+    "program_id": null,
+    "policy": null,
+    "sections": [],
+    "must_include": [
+      "task.objective",
+      "task.read_scope",
+      "new.trigger_return"
+    ],
+    "exclude": [
+      "full_parent_transcript",
+      "sibling_transcripts"
+    ],
+    "deferred": []
+  },
+  "return": {
+    "contract": "harwness.return.execution-summary@1",
+    "validators": []
+  },
+  "models": null,
+  "limits": null,
+  "work": null,
+  "research": null,
+  "verification": null,
+  "skills": {
+    "entries": []
+  },
+  "binary": {
+    "name": "uia-worker",
+    "interfaces": [
+      "cli"
+    ],
+    "default_interface": "cli"
+  },
+  "permissions": {
+    "tools": [
+      "browser.open",
+      "deps.graph",
+      "deps.locked",
+      "deps.source_list",
+      "deps.source_read",
+      "deps.source_search",
+      "diary.read",
+      "doc.read_pdf",
+      "fs.glob",
+      "fs.grep",
+      "fs.list",
+      "fs.read",
+      "fs.search",
+      "job.list",
+      "job.logs",
+      "job.start",
+      "job.status",
+      "job.stop",
+      "job.wait",
+      "palace.recall",
+      "palace.search",
+      "parent.message",
+      "shell.exec",
+      "skills.load",
+      "skills.search",
+      "web.crates_io",
+      "web.docs_rs",
+      "web.fetch",
+      "web.search",
+      "workbench.show"
+    ],
+    "forbidden_tools": [
+      "browser.act",
+      "browser.close",
+      "browser.events",
+      "browser.find",
+      "browser.observe",
+      "browser.wait",
+      "fs.edit",
+      "fs.write",
+      "lens.ask"
+    ],
+    "capabilities": [],
+    "filesystem": {
+      "read": true,
+      "write": false,
+      "write_paths": [],
+      "other_write_tools": []
+    },
+    "network": {
+      "mode": "allowlist",
+      "tools": [
+        "browser.open",
+        "web.crates_io",
+        "web.docs_rs",
+        "web.fetch",
+        "web.search"
+      ],
+      "hosts": []
+    },
+    "shell": true,
+    "host": false,
+    "spawn": {
+      "max_depth": 0,
+      "child_orchestrators": [],
+      "delegation_targets": []
+    },
+    "budget": {
+      "max_tokens": 20000,
+      "max_tool_calls": 16,
+      "max_wall_secs": 180,
+      "effort_cap": "low"
+    },
+    "required_env": []
+  },
+  "trace": {
+    "steps": [
+      {
+        "source": "harwness.agent.worker-base@1",
+        "kind": "patch",
+        "applied_at": "1970-01-01T00:00:00Z"
+      },
+      {
+        "source": "harwness.agent.worker-base@1",
+        "kind": "base",
+        "applied_at": "1970-01-01T00:00:00Z"
+      },
+      {
+        "source": "harwness.agent.uia-worker@1",
+        "kind": "patch",
+        "applied_at": "1970-01-01T00:00:00Z"
+      }
+    ],
+    "diagnostics": []
+  },
+  "snapshot": {
+    "domain": "harwness.agent-ir.snapshot/v7",
+    "digest": "84ac792ad5dc63183176c38b3b388f1aa1458d2790deb11d3382fc6eb6de20f3"
+  }
+}

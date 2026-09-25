@@ -1,0 +1,288 @@
+{
+  "schema": "harwness.agent-ir/v2",
+  "id": "harwness.agent.root-orchestrator@1",
+  "version": "1.0.0",
+  "name": "Root Orchestrator",
+  "description": "Koordiniert Child-Orchestrators und Worker, sammelt deren Ergebnisse und liefert der UIA eine belastbare Zusammenfassung.",
+  "role": "root-orchestrator",
+  "specialization": "root-orchestrator",
+  "reasoning_effort": null,
+  "authority": {
+    "capabilities": []
+  },
+  "instructions": {
+    "text": "",
+    "source": null,
+    "blake3": "af1349b9f5f9a1a6a0404dea36dcc9499bcb25c9adc112b7cc9a93cae41f3262"
+  },
+  "tools": {
+    "admitted": [
+      "fs.read",
+      "fs.list",
+      "fs.search",
+      "fs.glob",
+      "fs.grep",
+      "doc.read_pdf",
+      "deps.graph",
+      "deps.locked",
+      "deps.source_read",
+      "deps.source_search",
+      "deps.source_list",
+      "lens.ask",
+      "explore.tree",
+      "explore.projects",
+      "explore.relations",
+      "explore.find",
+      "delegate_wave",
+      "agent.result",
+      "workbench.show",
+      "diary.read",
+      "palace.search",
+      "palace.recall",
+      "kanban.list",
+      "kanban.show",
+      "agent.message",
+      "parent.message",
+      "skills.search",
+      "skills.load",
+      "job.status",
+      "job.logs",
+      "job.stop",
+      "job.list",
+      "job.wait"
+    ],
+    "forbidden": [
+      "fs.write",
+      "fs.edit",
+      "shell.exec",
+      "web.fetch",
+      "web.search",
+      "web.docs_rs",
+      "web.crates_io"
+    ]
+  },
+  "spawn": {
+    "max_depth": 2,
+    "child_orchestrators": [
+      "coding-orchestrator",
+      "research-orchestrator",
+      "analysis-orchestrator"
+    ],
+    "delegation_targets": [
+      "coding-orchestrator",
+      "research-orchestrator",
+      "analysis-orchestrator",
+      "explorer",
+      "researcher",
+      "researcher-deps",
+      "dependency-researcher",
+      "researcher-web",
+      "planner",
+      "analyst",
+      "executor"
+    ],
+    "workspace_hint": null,
+    "budget": {
+      "max_tokens": 1500000,
+      "max_tool_calls": 600,
+      "max_wall_secs": 14400,
+      "effort_cap": null
+    }
+  },
+  "job": {
+    "goal_kind": null
+  },
+  "lifecycle": {
+    "allow_pause": false,
+    "allow_rerun": true,
+    "max_attempts": 2
+  },
+  "context": {
+    "program": "orchestrate",
+    "program_id": "harwness.context.orchestrate@1",
+    "policy": "harwness.context.orchestrate@1",
+    "sections": [
+      {
+        "name": "task.objective",
+        "strength": "must-include",
+        "detail": "full",
+        "trust": "instruction"
+      },
+      {
+        "name": "history.tail",
+        "strength": "must-include",
+        "detail": "summary",
+        "trust": "evidence"
+      },
+      {
+        "name": "plan.current",
+        "strength": "must-include",
+        "detail": "full",
+        "trust": "evidence"
+      },
+      {
+        "name": "child.returns",
+        "strength": "must-include",
+        "detail": "summary",
+        "trust": "evidence"
+      }
+    ],
+    "must_include": [
+      "task.objective",
+      "history.tail",
+      "task.read_scope",
+      "new.trigger_return"
+    ],
+    "exclude": [
+      "credential.*",
+      "secret.*",
+      "sibling_transcripts",
+      "full_parent_transcript",
+      "child.raw_transcript.*"
+    ],
+    "deferred": [
+      "plan.current",
+      "child.returns"
+    ]
+  },
+  "return": {
+    "contract": "harwness.return.execution-summary@1",
+    "validators": []
+  },
+  "models": null,
+  "limits": null,
+  "work": {
+    "mode": "orchestration",
+    "may_write_code": false,
+    "may_research_web": false,
+    "may_change_plan": false,
+    "aggregates_child_returns": true
+  },
+  "research": null,
+  "verification": null,
+  "skills": {
+    "entries": []
+  },
+  "binary": {
+    "name": "root-orchestrator",
+    "interfaces": [
+      "cli"
+    ],
+    "default_interface": "cli"
+  },
+  "permissions": {
+    "tools": [
+      "agent.message",
+      "agent.result",
+      "delegate_wave",
+      "deps.graph",
+      "deps.locked",
+      "deps.source_list",
+      "deps.source_read",
+      "deps.source_search",
+      "diary.read",
+      "doc.read_pdf",
+      "explore.find",
+      "explore.projects",
+      "explore.relations",
+      "explore.tree",
+      "fs.glob",
+      "fs.grep",
+      "fs.list",
+      "fs.read",
+      "fs.search",
+      "job.list",
+      "job.logs",
+      "job.status",
+      "job.stop",
+      "job.wait",
+      "kanban.list",
+      "kanban.show",
+      "lens.ask",
+      "palace.recall",
+      "palace.search",
+      "parent.message",
+      "skills.load",
+      "skills.search",
+      "workbench.show"
+    ],
+    "forbidden_tools": [
+      "fs.edit",
+      "fs.write",
+      "shell.exec",
+      "web.crates_io",
+      "web.docs_rs",
+      "web.fetch",
+      "web.search"
+    ],
+    "capabilities": [],
+    "filesystem": {
+      "read": true,
+      "write": false,
+      "write_paths": [],
+      "other_write_tools": []
+    },
+    "network": {
+      "mode": "off",
+      "tools": [],
+      "hosts": []
+    },
+    "shell": false,
+    "host": false,
+    "spawn": {
+      "max_depth": 2,
+      "child_orchestrators": [
+        "analysis-orchestrator",
+        "coding-orchestrator",
+        "research-orchestrator"
+      ],
+      "delegation_targets": [
+        "analysis-orchestrator",
+        "analyst",
+        "coding-orchestrator",
+        "dependency-researcher",
+        "executor",
+        "explorer",
+        "planner",
+        "research-orchestrator",
+        "researcher",
+        "researcher-deps",
+        "researcher-web"
+      ]
+    },
+    "budget": {
+      "max_tokens": 1500000,
+      "max_tool_calls": 600,
+      "max_wall_secs": 14400,
+      "effort_cap": null
+    },
+    "required_env": []
+  },
+  "trace": {
+    "steps": [
+      {
+        "source": "harwness.agent.root-orchestrator@1",
+        "kind": "patch",
+        "applied_at": "1970-01-01T00:00:00Z"
+      }
+    ],
+    "diagnostics": [
+      {
+        "code": "HARW-CTX-003",
+        "severity": "note",
+        "message": "program `orchestrate` requires sections outside the context ceiling; deferred: plan.current, child.returns",
+        "help": "these sections stay named by the program but are not required at child start",
+        "span": {
+          "file": "builtin/root-orchestrator.toml",
+          "line": 28,
+          "column": 11
+        },
+        "path": "context.program"
+      }
+    ]
+  },
+  "snapshot": {
+    "domain": "harwness.agent-ir.snapshot/v7",
+    "digest": "7e49371f99f72da840b37f18b6088fa495c1b3ec7fc0df480f61e2635ad615c2"
+  }
+}

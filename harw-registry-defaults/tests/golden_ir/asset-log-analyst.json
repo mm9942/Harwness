@@ -1,0 +1,194 @@
+{
+  "schema": "harwness.agent-ir/v2",
+  "id": "harwness.agent.log-analyst@1",
+  "version": "1.0.0",
+  "name": "Log Analyst",
+  "description": "Correlates logs and traces into reproducible diagnostic hypotheses.",
+  "role": "worker",
+  "specialization": "log-analyst",
+  "reasoning_effort": null,
+  "authority": {
+    "capabilities": []
+  },
+  "instructions": {
+    "text": "# log-analyst\n\nCorrelates logs and traces into reproducible diagnostic hypotheses.\n\nAccept only the declared task scope. State assumptions, preserve relevant evidence, and return concise findings, changed paths (if any), verification performed, residual risks, and blockers. Never expand privileges, alter unrelated files, or represent a hypothesis as a fact. Stop and escalate when approval, a broader scope, or a security decision is required.\n\n## Was ich NICHT tue\n\nKeine Agenten spawnen, keine Rechte ausweiten, keine fremden Dateien ändern. Keine Logs verändern oder löschen; keine Systeme umkonfigurieren; Korrelation nicht als Kausalität ausgeben.\n\n## Umfang pro Lauf\n\nNur der erklärte Auftrag; Budget und Laufzeitgrenze (`timeout_seconds = 240`) sind hart. Stoppe und gib zurück, sobald die Hypothesen mit reproduzierbaren Belegstellen stehen, das Budget knapp wird oder Freigabe, breiterer Scope bzw. eine Sicherheitsentscheidung nötig ist.\n\n## Übergabe\n\nAn den Auftraggeber nach Return-Contract: Hypothesen mit Konfidenz und Belegstellen (Log/Trace, Zeitraum); dazu Annahmen, durchgeführte Prüfung, Restrisiken, Blocker. Keine Rohausgaben, keine Wiederholung des Auftrags.\n",
+    "source": "system.md",
+    "blake3": "50c6e80417c9a8c09ab535a86204fdc11c70cb608d54916ed1ae5447cd1374dc"
+  },
+  "tools": {
+    "admitted": [
+      "fs.read",
+      "fs.list",
+      "fs.search",
+      "fs.glob",
+      "fs.grep",
+      "doc.read_pdf",
+      "explore.tree",
+      "explore.projects",
+      "explore.relations",
+      "explore.find",
+      "workbench.show",
+      "diary.read",
+      "palace.search",
+      "palace.recall",
+      "parent.message",
+      "skills.search",
+      "skills.load"
+    ],
+    "forbidden": [
+      "fs.write",
+      "fs.edit",
+      "shell.exec",
+      "web.fetch",
+      "web.search",
+      "web.docs_rs",
+      "web.crates_io"
+    ]
+  },
+  "spawn": {
+    "max_depth": 0,
+    "child_orchestrators": [],
+    "delegation_targets": null,
+    "workspace_hint": null,
+    "budget": {
+      "max_tokens": 100000,
+      "max_tool_calls": 50,
+      "max_wall_secs": 300,
+      "effort_cap": null
+    }
+  },
+  "job": {
+    "goal_kind": null
+  },
+  "lifecycle": {
+    "allow_pause": false,
+    "allow_rerun": true,
+    "max_attempts": 2
+  },
+  "context": {
+    "program": null,
+    "program_id": null,
+    "policy": null,
+    "sections": [],
+    "must_include": [
+      "task.objective",
+      "task.read_scope",
+      "new.trigger_return"
+    ],
+    "exclude": [
+      "full_parent_transcript",
+      "sibling_transcripts"
+    ],
+    "deferred": []
+  },
+  "return": {
+    "contract": "harwness.return.execution-summary@1",
+    "validators": []
+  },
+  "models": null,
+  "limits": null,
+  "work": {
+    "mode": "analysis",
+    "may_write_code": false,
+    "may_research_web": false,
+    "may_change_plan": null,
+    "aggregates_child_returns": null
+  },
+  "research": null,
+  "verification": null,
+  "skills": {
+    "entries": [
+      {
+        "name": "debugging",
+        "hash": null
+      }
+    ]
+  },
+  "binary": {
+    "name": "log-analyst",
+    "interfaces": [
+      "cli"
+    ],
+    "default_interface": "cli"
+  },
+  "permissions": {
+    "tools": [
+      "diary.read",
+      "doc.read_pdf",
+      "explore.find",
+      "explore.projects",
+      "explore.relations",
+      "explore.tree",
+      "fs.glob",
+      "fs.grep",
+      "fs.list",
+      "fs.read",
+      "fs.search",
+      "palace.recall",
+      "palace.search",
+      "parent.message",
+      "skills.load",
+      "skills.search",
+      "workbench.show"
+    ],
+    "forbidden_tools": [
+      "fs.edit",
+      "fs.write",
+      "shell.exec",
+      "web.crates_io",
+      "web.docs_rs",
+      "web.fetch",
+      "web.search"
+    ],
+    "capabilities": [],
+    "filesystem": {
+      "read": true,
+      "write": false,
+      "write_paths": [],
+      "other_write_tools": []
+    },
+    "network": {
+      "mode": "off",
+      "tools": [],
+      "hosts": []
+    },
+    "shell": false,
+    "host": false,
+    "spawn": {
+      "max_depth": 0,
+      "child_orchestrators": [],
+      "delegation_targets": []
+    },
+    "budget": {
+      "max_tokens": 100000,
+      "max_tool_calls": 50,
+      "max_wall_secs": 300,
+      "effort_cap": null
+    },
+    "required_env": []
+  },
+  "trace": {
+    "steps": [
+      {
+        "source": "harwness.agent.worker-base@1",
+        "kind": "patch",
+        "applied_at": "1970-01-01T00:00:00Z"
+      },
+      {
+        "source": "harwness.agent.worker-base@1",
+        "kind": "base",
+        "applied_at": "1970-01-01T00:00:00Z"
+      },
+      {
+        "source": "harwness.agent.log-analyst@1",
+        "kind": "patch",
+        "applied_at": "1970-01-01T00:00:00Z"
+      }
+    ],
+    "diagnostics": []
+  },
+  "snapshot": {
+    "domain": "harwness.agent-ir.snapshot/v7",
+    "digest": "b0b1b1348317e3460a8fb98a4534b89ada59b3f67a7255c13115d76958e36fc1"
+  }
+}

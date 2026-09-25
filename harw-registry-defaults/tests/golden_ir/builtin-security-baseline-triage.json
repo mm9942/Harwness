@@ -1,0 +1,195 @@
+{
+  "schema": "harwness.agent-ir/v2",
+  "id": "harwness.agent.security-baseline-triage@1",
+  "version": "1.0.0",
+  "name": "Security Baseline Triage",
+  "description": "Sichtet Abweichungs-Befunde der BaselineDeviationRule (RuleTriggered vs. Anomaly je Baseline-Status); schlägt ein Verdikt vor, committet nie.",
+  "role": "worker",
+  "specialization": "security-baseline-triage",
+  "reasoning_effort": null,
+  "authority": {
+    "capabilities": []
+  },
+  "instructions": {
+    "text": "",
+    "source": null,
+    "blake3": "af1349b9f5f9a1a6a0404dea36dcc9499bcb25c9adc112b7cc9a93cae41f3262"
+  },
+  "tools": {
+    "admitted": [],
+    "forbidden": [
+      "fs.write",
+      "fs.edit",
+      "shell.exec",
+      "web.fetch",
+      "web.docs_rs",
+      "web.crates_io"
+    ]
+  },
+  "spawn": {
+    "max_depth": 0,
+    "child_orchestrators": [],
+    "delegation_targets": null,
+    "workspace_hint": null,
+    "budget": {
+      "max_tokens": 40000,
+      "max_tool_calls": 20,
+      "max_wall_secs": 120,
+      "effort_cap": null
+    }
+  },
+  "job": {
+    "goal_kind": null
+  },
+  "lifecycle": {
+    "allow_pause": false,
+    "allow_rerun": true,
+    "max_attempts": 2
+  },
+  "context": {
+    "program": "triage",
+    "program_id": "harwness.context.triage@1",
+    "policy": "harwness.context.triage@1",
+    "sections": [
+      {
+        "name": "task.objective",
+        "strength": "must-include",
+        "detail": "full",
+        "trust": "instruction"
+      },
+      {
+        "name": "history.tail",
+        "strength": "must-include",
+        "detail": "full",
+        "trust": "evidence"
+      },
+      {
+        "name": "error.trace",
+        "strength": "must-include",
+        "detail": "full",
+        "trust": "evidence"
+      },
+      {
+        "name": "task.read_scope",
+        "strength": "must-include",
+        "detail": "full",
+        "trust": "data"
+      }
+    ],
+    "must_include": [
+      "task.objective",
+      "history.tail",
+      "task.read_scope",
+      "new.trigger_return"
+    ],
+    "exclude": [
+      "credential.*",
+      "secret.*",
+      "sibling_transcripts",
+      "full_parent_transcript",
+      "plan.*"
+    ],
+    "deferred": [
+      "error.trace"
+    ]
+  },
+  "return": {
+    "contract": "harwness.security-verdict/v1",
+    "validators": []
+  },
+  "models": null,
+  "limits": null,
+  "work": {
+    "mode": "baseline-deviation-triage",
+    "may_write_code": false,
+    "may_research_web": false,
+    "may_change_plan": null,
+    "aggregates_child_returns": null
+  },
+  "research": null,
+  "verification": null,
+  "skills": {
+    "entries": []
+  },
+  "binary": {
+    "name": "security-baseline-triage",
+    "interfaces": [
+      "cli"
+    ],
+    "default_interface": "cli"
+  },
+  "permissions": {
+    "tools": [],
+    "forbidden_tools": [
+      "fs.edit",
+      "fs.write",
+      "shell.exec",
+      "web.crates_io",
+      "web.docs_rs",
+      "web.fetch"
+    ],
+    "capabilities": [],
+    "filesystem": {
+      "read": false,
+      "write": false,
+      "write_paths": [],
+      "other_write_tools": []
+    },
+    "network": {
+      "mode": "off",
+      "tools": [],
+      "hosts": []
+    },
+    "shell": false,
+    "host": false,
+    "spawn": {
+      "max_depth": 0,
+      "child_orchestrators": [],
+      "delegation_targets": []
+    },
+    "budget": {
+      "max_tokens": 40000,
+      "max_tool_calls": 20,
+      "max_wall_secs": 120,
+      "effort_cap": null
+    },
+    "required_env": []
+  },
+  "trace": {
+    "steps": [
+      {
+        "source": "harwness.agent.worker-base@1",
+        "kind": "patch",
+        "applied_at": "1970-01-01T00:00:00Z"
+      },
+      {
+        "source": "harwness.agent.worker-base@1",
+        "kind": "base",
+        "applied_at": "1970-01-01T00:00:00Z"
+      },
+      {
+        "source": "harwness.agent.security-baseline-triage@1",
+        "kind": "patch",
+        "applied_at": "1970-01-01T00:00:00Z"
+      }
+    ],
+    "diagnostics": [
+      {
+        "code": "HARW-CTX-003",
+        "severity": "note",
+        "message": "program `triage` requires sections outside the context ceiling; deferred: error.trace",
+        "help": "these sections stay named by the program but are not required at child start",
+        "span": {
+          "file": "builtin/security-baseline-triage.toml",
+          "line": 125,
+          "column": 11
+        },
+        "path": "context.program"
+      }
+    ]
+  },
+  "snapshot": {
+    "domain": "harwness.agent-ir.snapshot/v7",
+    "digest": "048c3feb638bd66317b3f7be5005417ab126b0ff527313b7547d7a2df8d26c58"
+  }
+}

@@ -1,0 +1,196 @@
+{
+  "schema": "harwness.agent-ir/v2",
+  "id": "harwness.agent.refactorer@1",
+  "version": "1.0.0",
+  "name": "Refactorer",
+  "description": "Performs behavior-preserving, scope-limited structural improvements.",
+  "role": "worker",
+  "specialization": "refactorer",
+  "reasoning_effort": null,
+  "authority": {
+    "capabilities": []
+  },
+  "instructions": {
+    "text": "# refactorer\n\nPerforms behavior-preserving, scope-limited structural improvements.\n\nAccept only the declared task scope. State assumptions, preserve relevant evidence, and return concise findings, changed paths (if any), verification performed, residual risks, and blockers. Never expand privileges, alter unrelated files, or represent a hypothesis as a fact. Stop and escalate when approval, a broader scope, or a security decision is required.\n\n## Was ich NICHT tue\n\nKeine Agenten spawnen, keine Rechte ausweiten, keine fremden Dateien ändern. Kein geändertes Verhalten; keine Dateien außerhalb des Scopes; keine neuen Features oder Abhängigkeiten.\n\n## Umfang pro Lauf\n\nNur der erklärte Auftrag; Budget und Laufzeitgrenze (`timeout_seconds = 240`) sind hart. Stoppe und gib zurück, sobald die Umstrukturierung steht und die bestehenden Tests unverändert grün sind, das Budget knapp wird oder Freigabe, breiterer Scope bzw. eine Sicherheitsentscheidung nötig ist.\n\n## Übergabe\n\nAn den Auftraggeber nach Return-Contract: geänderte Pfade, Nachweis der Verhaltensgleichheit (Tests); dazu Annahmen, durchgeführte Prüfung, Restrisiken, Blocker. Keine Rohausgaben, keine Wiederholung des Auftrags.\n",
+    "source": "system.md",
+    "blake3": "a8de718e59478328af185e5e8e2062dc0864dbe47d362f1f082573b618580a58"
+  },
+  "tools": {
+    "admitted": [
+      "fs.read",
+      "fs.list",
+      "fs.search",
+      "fs.glob",
+      "fs.grep",
+      "doc.read_pdf",
+      "explore.tree",
+      "explore.projects",
+      "explore.relations",
+      "explore.find",
+      "workbench.show",
+      "diary.read",
+      "palace.search",
+      "palace.recall",
+      "parent.message",
+      "skills.search",
+      "skills.load",
+      "fs.write",
+      "fs.edit"
+    ],
+    "forbidden": [
+      "shell.exec",
+      "web.fetch",
+      "web.search",
+      "web.docs_rs",
+      "web.crates_io"
+    ]
+  },
+  "spawn": {
+    "max_depth": 0,
+    "child_orchestrators": [],
+    "delegation_targets": null,
+    "workspace_hint": null,
+    "budget": {
+      "max_tokens": 100000,
+      "max_tool_calls": 50,
+      "max_wall_secs": 300,
+      "effort_cap": null
+    }
+  },
+  "job": {
+    "goal_kind": null
+  },
+  "lifecycle": {
+    "allow_pause": false,
+    "allow_rerun": true,
+    "max_attempts": 2
+  },
+  "context": {
+    "program": null,
+    "program_id": null,
+    "policy": null,
+    "sections": [],
+    "must_include": [
+      "task.objective",
+      "task.read_scope",
+      "new.trigger_return"
+    ],
+    "exclude": [
+      "full_parent_transcript",
+      "sibling_transcripts"
+    ],
+    "deferred": []
+  },
+  "return": {
+    "contract": "harwness.return.execution-summary@1",
+    "validators": []
+  },
+  "models": null,
+  "limits": null,
+  "work": {
+    "mode": "implementation",
+    "may_write_code": true,
+    "may_research_web": false,
+    "may_change_plan": null,
+    "aggregates_child_returns": null
+  },
+  "research": null,
+  "verification": null,
+  "skills": {
+    "entries": [
+      {
+        "name": "implementation",
+        "hash": null
+      }
+    ]
+  },
+  "binary": {
+    "name": "refactorer",
+    "interfaces": [
+      "cli"
+    ],
+    "default_interface": "cli"
+  },
+  "permissions": {
+    "tools": [
+      "diary.read",
+      "doc.read_pdf",
+      "explore.find",
+      "explore.projects",
+      "explore.relations",
+      "explore.tree",
+      "fs.edit",
+      "fs.glob",
+      "fs.grep",
+      "fs.list",
+      "fs.read",
+      "fs.search",
+      "fs.write",
+      "palace.recall",
+      "palace.search",
+      "parent.message",
+      "skills.load",
+      "skills.search",
+      "workbench.show"
+    ],
+    "forbidden_tools": [
+      "shell.exec",
+      "web.crates_io",
+      "web.docs_rs",
+      "web.fetch",
+      "web.search"
+    ],
+    "capabilities": [],
+    "filesystem": {
+      "read": true,
+      "write": true,
+      "write_paths": [
+        "$WORKSPACE"
+      ],
+      "other_write_tools": []
+    },
+    "network": {
+      "mode": "off",
+      "tools": [],
+      "hosts": []
+    },
+    "shell": false,
+    "host": false,
+    "spawn": {
+      "max_depth": 0,
+      "child_orchestrators": [],
+      "delegation_targets": []
+    },
+    "budget": {
+      "max_tokens": 100000,
+      "max_tool_calls": 50,
+      "max_wall_secs": 300,
+      "effort_cap": null
+    },
+    "required_env": []
+  },
+  "trace": {
+    "steps": [
+      {
+        "source": "harwness.agent.worker-base@1",
+        "kind": "patch",
+        "applied_at": "1970-01-01T00:00:00Z"
+      },
+      {
+        "source": "harwness.agent.worker-base@1",
+        "kind": "base",
+        "applied_at": "1970-01-01T00:00:00Z"
+      },
+      {
+        "source": "harwness.agent.refactorer@1",
+        "kind": "patch",
+        "applied_at": "1970-01-01T00:00:00Z"
+      }
+    ],
+    "diagnostics": []
+  },
+  "snapshot": {
+    "domain": "harwness.agent-ir.snapshot/v7",
+    "digest": "066155d880513f33b6d20932cbd01e9aa7a26d59af9e5c7ed3e8d9dcf09c5c4c"
+  }
+}

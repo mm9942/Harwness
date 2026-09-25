@@ -616,6 +616,7 @@ dependencies = [
  "harw-context",
  "semver",
  "serde",
+ "serde_json",
  "time",
  "toml 1.1.6+spec-1.1.0",
 ]

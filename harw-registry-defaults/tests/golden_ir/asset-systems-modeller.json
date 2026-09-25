@@ -1,0 +1,186 @@
+{
+  "schema": "harwness.agent-ir/v2",
+  "id": "harwness.agent.systems-modeller@1",
+  "version": "1.0.0",
+  "name": "Systems Modeller",
+  "description": "Analysiert die Struktur eines Sachverhalts als System: verstärkende und ausgleichende Rückkopplungen, Schwellen und Kipppunkte, Verschiedenartigkeit der Akteure, Hebel; Struktur, keine Simulation. Read-only.",
+  "role": "worker",
+  "specialization": "systems-modeller",
+  "reasoning_effort": null,
+  "authority": {
+    "capabilities": []
+  },
+  "instructions": {
+    "text": "# systems-modeller\n\nDu analysierst die **Struktur** eines Sachverhalts als System: Kreisläufe, Schwellen, Verschiedenartigkeit der Akteure, Hebel. Du lieferst Struktur und Begründung, keine Simulation und keine erfundenen Zahlen.\n\nDer Skill `feedback-loops-and-thresholds` ist fest geladen. Im Planspiel-Kontext lade zusätzlich `scenario-wargaming` über `skills.load`, um die Dynamik je Welt zu liefern.\n\n## Vorgehen\n\n1. **Grenze und Zielgröße** aus dem Auftrag übernehmen oder vorschlagen.\n2. **Material lesen** im Lesebereich: Beschreibungen, Daten, frühere Analysen. Jede Strukturannahme bekommt eine Fundstelle oder die Markierung „Annahme“.\n3. **Kompliziert oder komplex?** Mit Begründung.\n4. **Zwei bis vier tragende Kreisläufe** ausarbeiten (Typ, Stärke grob, Verzögerung, Dominanz heute).\n5. **Schwellen und Frühwarnzeichen**: Wo kippt das Verhalten, woran merkt man die Annäherung?\n6. **Verschiedenartigkeit**: Wie verteilt sind die Reaktionsschwellen der Akteure, und wirkt das unter den dominanten Kreisläufen stabilisierend oder kaskadenfördernd?\n7. **Hebel und Gegenreaktionen** für die im Auftrag genannten Maßnahmen oder Züge.\n\n## Rückgabe\n\nDas Ergebnisformat aus `feedback-loops-and-thresholds`, ergänzt um:\n\n```markdown\n**Fundstellen je Kreislauf:** R1 ← <pfad:zeile> | Annahme\n**Was diese Struktur NICHT sagt:** <Grenzen, fehlende Daten>\n```\n\n## Was ich NICHT tue\n\n- Keine Simulation, keine Zahlenprognose, keine Parameter ohne Daten.\n- Kein Gesamturteil über die Leitfrage; ich liefere einen Baustein.\n- Keine Dateien schreiben, keine Prozesse, kein Netz, keine anderen Agenten starten.\n",
+    "source": "system.md",
+    "blake3": "c617b965f4d8ce8ebf8551a8c0aba14601cf9a428ae13d23ec90b7709af16354"
+  },
+  "tools": {
+    "admitted": [
+      "fs.read",
+      "fs.list",
+      "fs.search",
+      "fs.glob",
+      "fs.grep",
+      "doc.read_pdf",
+      "workbench.show",
+      "diary.read",
+      "palace.search",
+      "palace.recall",
+      "parent.message",
+      "skills.search",
+      "skills.load"
+    ],
+    "forbidden": [
+      "fs.write",
+      "fs.edit",
+      "shell.exec",
+      "web.fetch",
+      "web.search",
+      "web.docs_rs",
+      "web.crates_io"
+    ]
+  },
+  "spawn": {
+    "max_depth": 0,
+    "child_orchestrators": [],
+    "delegation_targets": null,
+    "workspace_hint": null,
+    "budget": {
+      "max_tokens": 80000,
+      "max_tool_calls": 40,
+      "max_wall_secs": 600,
+      "effort_cap": null
+    }
+  },
+  "job": {
+    "goal_kind": null
+  },
+  "lifecycle": {
+    "allow_pause": false,
+    "allow_rerun": true,
+    "max_attempts": 2
+  },
+  "context": {
+    "program": null,
+    "program_id": null,
+    "policy": null,
+    "sections": [],
+    "must_include": [
+      "task.objective",
+      "task.read_scope",
+      "new.trigger_return"
+    ],
+    "exclude": [
+      "full_parent_transcript",
+      "sibling_transcripts"
+    ],
+    "deferred": []
+  },
+  "return": {
+    "contract": "harwness.return.execution-summary@1",
+    "validators": []
+  },
+  "models": null,
+  "limits": null,
+  "work": {
+    "mode": "read-only-analysis",
+    "may_write_code": false,
+    "may_research_web": false,
+    "may_change_plan": null,
+    "aggregates_child_returns": null
+  },
+  "research": null,
+  "verification": null,
+  "skills": {
+    "entries": [
+      {
+        "name": "feedback-loops-and-thresholds",
+        "hash": null
+      }
+    ]
+  },
+  "binary": {
+    "name": "systems-modeller",
+    "interfaces": [
+      "cli"
+    ],
+    "default_interface": "cli"
+  },
+  "permissions": {
+    "tools": [
+      "diary.read",
+      "doc.read_pdf",
+      "fs.glob",
+      "fs.grep",
+      "fs.list",
+      "fs.read",
+      "fs.search",
+      "palace.recall",
+      "palace.search",
+      "parent.message",
+      "skills.load",
+      "skills.search",
+      "workbench.show"
+    ],
+    "forbidden_tools": [
+      "fs.edit",
+      "fs.write",
+      "shell.exec",
+      "web.crates_io",
+      "web.docs_rs",
+      "web.fetch",
+      "web.search"
+    ],
+    "capabilities": [],
+    "filesystem": {
+      "read": true,
+      "write": false,
+      "write_paths": [],
+      "other_write_tools": []
+    },
+    "network": {
+      "mode": "off",
+      "tools": [],
+      "hosts": []
+    },
+    "shell": false,
+    "host": false,
+    "spawn": {
+      "max_depth": 0,
+      "child_orchestrators": [],
+      "delegation_targets": []
+    },
+    "budget": {
+      "max_tokens": 80000,
+      "max_tool_calls": 40,
+      "max_wall_secs": 600,
+      "effort_cap": null
+    },
+    "required_env": []
+  },
+  "trace": {
+    "steps": [
+      {
+        "source": "harwness.agent.worker-base@1",
+        "kind": "patch",
+        "applied_at": "1970-01-01T00:00:00Z"
+      },
+      {
+        "source": "harwness.agent.worker-base@1",
+        "kind": "base",
+        "applied_at": "1970-01-01T00:00:00Z"
+      },
+      {
+        "source": "harwness.agent.systems-modeller@1",
+        "kind": "patch",
+        "applied_at": "1970-01-01T00:00:00Z"
+      }
+    ],
+    "diagnostics": []
+  },
+  "snapshot": {
+    "domain": "harwness.agent-ir.snapshot/v7",
+    "digest": "30f6c686438c2a9df964b2192c50e522ce59cdf72bbda19ced2599cfce1c609b"
+  }
+}

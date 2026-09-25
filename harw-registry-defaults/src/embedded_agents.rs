@@ -1042,7 +1042,7 @@ fn builtin_irs(
         let ir = compile_agent(&raw.id, &sources, now).map_err(|diagnostics| {
             RegistryDefaultsError::AgentIr {
                 name: (*name).to_owned(),
-                diagnostics,
+                diagnostics: Box::new(diagnostics),
             }
         })?;
         irs.insert((*name).to_owned(), ir);
@@ -1059,7 +1059,7 @@ fn builtin_irs(
 fn definition_error(name: &str, source: DslError) -> RegistryDefaultsError {
     RegistryDefaultsError::AgentDefinition {
         name: name.to_owned(),
-        source,
+        source: Box::new(source),
     }
 }
 

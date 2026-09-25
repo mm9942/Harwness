@@ -1,0 +1,281 @@
+{
+  "schema": "harwness.agent-ir/v2",
+  "id": "harwness.agent.intel-analysis-orchestrator@1",
+  "version": "1.0.0",
+  "name": "Intel Analysis Orchestrator",
+  "description": "Führt eine belegte Analyse in vier Wellen: Sammel-Fan-out an evidence-collector (plus pattern-analyst/systems-modeller), Prüfung durch evidence-critic und method-auditor, Verdichtung durch synthesis-writer, Belegcheck vor Abschluss.",
+  "role": "child-orchestrator",
+  "specialization": "intel-analysis-orchestrator",
+  "reasoning_effort": null,
+  "authority": {
+    "capabilities": []
+  },
+  "instructions": {
+    "text": "# intel-analysis-orchestrator\n\nDu führst eine belegte Analyse mit der Analyse-Familie durch. Du planst Wellen, delegierst, liest die Rückgaben und meldest das geprüfte Ergebnis an deinen Auftraggeber. Du analysierst nicht selbst in der Tiefe und schreibst keine Dateien.\n\nDer Skill `analysis-workflow` ist fest geladen; er beschreibt die Mitglieder, das Auftragsformat und die Übergaben. Weitere Skills findest du mit `skills.search` und lädst sie mit `skills.load` (etwa `key-assumptions-check` für die Zerlegung).\n\n## Deine Ziele\n\n`evidence-collector`, `pattern-analyst`, `systems-modeller`, `evidence-critic`, `method-auditor`, `synthesis-writer`. Nur diese; andere Agenten startest du nicht.\n\n## Wellen\n\n0. **Auftrag klären.** Leitfrage in einem Satz, Leser, Lesebereich, Ausgabepfad, Frist. Fehlt Wesentliches, frag über `parent.message`, bevor du Budget verbrauchst. Notiere die tragenden Annahmen.\n1. **Sammeln (Fan-out).** Zerlege die Leitfrage in drei bis sechs überschneidungsfreie Teilfragen. Starte je Teilfrage einen `evidence-collector` in **einer** `delegate_wave`. Braucht die Frage Struktur (Netze, Zeitlinien, Hypothesen) oder Dynamik (Rückkopplungen), nimm `pattern-analyst` bzw. `systems-modeller` in dieselbe Welle. Jeder Auftrag im Format aus `analysis-workflow`.\n2. **Lücken schließen.** Rückgaben mit `agent.result` vollständig lesen. Widersprüche oder offene Teilfragen: höchstens **eine** gezielte Nachschubwelle.\n3. **Prüfen.** `evidence-critic` (Belege aller Sammler) und `method-auditor` (Vorgehen und Zwischenstand) parallel in einer Welle. Beide bekommen das Material, nicht deine Wunschantwort.\n4. **Verdichten.** `synthesis-writer` mit Leitfrage, Leser, geprüften Befunden samt Einstufung, Methodenbefund und **Ausgabepfad**. Ohne Ausgabepfad liefert er Text zurück.\n5. **Belegcheck vor Abschluss.** Das fertige Produkt geht noch einmal an `evidence-critic` (bei Tragweite zusätzlich an `method-auditor`): Steht jede tragende Aussage auf einem behaltenen Beleg, passt die Sicherheitsangabe? Bei einem schweren Mangel: eine Korrekturrunde mit `synthesis-writer`, dann erneuter Check. Mehr als eine Korrekturrunde nur nach Rückfrage beim Auftraggeber.\n\nPlan-Modus: Sammeln und Prüfen sind lesend und laufen. `synthesis-writer` schreibt; im Plan-Modus lässt du ihn weg und lieferst die geprüfte Storyline als Text zurück.\n\n## Budget\n\nDu hast ein festes Budget. Halte die Zahl der Agenten klein: meist drei bis sechs Sammler, zwei Prüfer, ein Schreiber. Kurze Aufträge, knappe Rückgabeformate. Lies Primärquellen nur stichprobenweise selbst.\n\n## Rückgabe\n\n```markdown\n**Leitfrage:** …\n**Kernaussage:** … (<Wahrscheinlichkeitsbegriff>, Vertrauen: <Stufe>)\n**Produkt:** <Ausgabepfad> | inline (siehe unten)\n**Wellen:** Sammeln <n> · Nachschub <ja/nein> · Prüfen · Verdichten · Belegcheck <bestanden | Mängel: …>\n**Prüfbefund:** Belege behalten/Vorbehalt/verworfen: <a/b/c> · Methodenpunktzahl <n>/33 · offene Einwände: …\n**Tragende Annahmen:** …\n**Offen / nächste Schritte:** …\n```\n\n## Was ich NICHT tue\n\n- Ich gebe das Ergebnis nicht ohne Belegcheck ab.\n- Ich bewerte die Arbeit der Familie nicht selbst an Stelle der Prüfer und übergehe ihre Einwände nicht stillschweigend; offene Einwände stehen in der Rückgabe.\n- Ich schreibe keine Dateien und starte keine Agenten außerhalb meiner Ziele.\n- Ich entscheide nicht über Freigaben; das tut mein Auftraggeber.\n",
+    "source": "system.md",
+    "blake3": "217b2f5aff9df47a7ecaf075b41add15b51f8e7441d75ad59864f7fb7b028dbb"
+  },
+  "tools": {
+    "admitted": [
+      "fs.read",
+      "fs.list",
+      "fs.search",
+      "fs.glob",
+      "fs.grep",
+      "doc.read_pdf",
+      "deps.graph",
+      "deps.locked",
+      "deps.source_read",
+      "deps.source_search",
+      "deps.source_list",
+      "lens.ask",
+      "explore.tree",
+      "explore.projects",
+      "explore.relations",
+      "explore.find",
+      "delegate_wave",
+      "agent.result",
+      "workbench.show",
+      "diary.read",
+      "palace.search",
+      "palace.recall",
+      "agent.message",
+      "parent.message",
+      "skills.search",
+      "skills.load",
+      "job.status",
+      "job.logs",
+      "job.stop",
+      "job.list",
+      "job.wait"
+    ],
+    "forbidden": [
+      "fs.write",
+      "fs.edit",
+      "shell.exec",
+      "web.fetch",
+      "web.search",
+      "web.docs_rs",
+      "web.crates_io"
+    ]
+  },
+  "spawn": {
+    "max_depth": 1,
+    "child_orchestrators": [],
+    "delegation_targets": [
+      "evidence-collector",
+      "pattern-analyst",
+      "systems-modeller",
+      "evidence-critic",
+      "method-auditor",
+      "synthesis-writer"
+    ],
+    "workspace_hint": null,
+    "budget": {
+      "max_tokens": 1000000,
+      "max_tool_calls": 400,
+      "max_wall_secs": 7200,
+      "effort_cap": null
+    }
+  },
+  "job": {
+    "goal_kind": null
+  },
+  "lifecycle": {
+    "allow_pause": false,
+    "allow_rerun": true,
+    "max_attempts": 2
+  },
+  "context": {
+    "program": "orchestrate",
+    "program_id": "harwness.context.orchestrate@1",
+    "policy": "harwness.context.orchestrate@1",
+    "sections": [
+      {
+        "name": "task.objective",
+        "strength": "must-include",
+        "detail": "full",
+        "trust": "instruction"
+      },
+      {
+        "name": "history.tail",
+        "strength": "must-include",
+        "detail": "summary",
+        "trust": "evidence"
+      },
+      {
+        "name": "plan.current",
+        "strength": "must-include",
+        "detail": "full",
+        "trust": "evidence"
+      },
+      {
+        "name": "child.returns",
+        "strength": "must-include",
+        "detail": "summary",
+        "trust": "evidence"
+      }
+    ],
+    "must_include": [
+      "task.objective",
+      "history.tail",
+      "task.read_scope",
+      "new.trigger_return"
+    ],
+    "exclude": [
+      "credential.*",
+      "secret.*",
+      "sibling_transcripts",
+      "full_parent_transcript",
+      "child.raw_transcript.*"
+    ],
+    "deferred": [
+      "plan.current",
+      "child.returns"
+    ]
+  },
+  "return": {
+    "contract": "harwness.return.envelope@1",
+    "validators": []
+  },
+  "models": null,
+  "limits": null,
+  "work": {
+    "mode": "orchestration",
+    "may_write_code": false,
+    "may_research_web": false,
+    "may_change_plan": false,
+    "aggregates_child_returns": true
+  },
+  "research": null,
+  "verification": null,
+  "skills": {
+    "entries": [
+      {
+        "name": "analysis-workflow",
+        "hash": null
+      }
+    ]
+  },
+  "binary": {
+    "name": "intel-analysis-orchestrator",
+    "interfaces": [
+      "cli"
+    ],
+    "default_interface": "cli"
+  },
+  "permissions": {
+    "tools": [
+      "agent.message",
+      "agent.result",
+      "delegate_wave",
+      "deps.graph",
+      "deps.locked",
+      "deps.source_list",
+      "deps.source_read",
+      "deps.source_search",
+      "diary.read",
+      "doc.read_pdf",
+      "explore.find",
+      "explore.projects",
+      "explore.relations",
+      "explore.tree",
+      "fs.glob",
+      "fs.grep",
+      "fs.list",
+      "fs.read",
+      "fs.search",
+      "job.list",
+      "job.logs",
+      "job.status",
+      "job.stop",
+      "job.wait",
+      "lens.ask",
+      "palace.recall",
+      "palace.search",
+      "parent.message",
+      "skills.load",
+      "skills.search",
+      "workbench.show"
+    ],
+    "forbidden_tools": [
+      "fs.edit",
+      "fs.write",
+      "shell.exec",
+      "web.crates_io",
+      "web.docs_rs",
+      "web.fetch",
+      "web.search"
+    ],
+    "capabilities": [],
+    "filesystem": {
+      "read": true,
+      "write": false,
+      "write_paths": [],
+      "other_write_tools": []
+    },
+    "network": {
+      "mode": "off",
+      "tools": [],
+      "hosts": []
+    },
+    "shell": false,
+    "host": false,
+    "spawn": {
+      "max_depth": 1,
+      "child_orchestrators": [],
+      "delegation_targets": [
+        "evidence-collector",
+        "evidence-critic",
+        "method-auditor",
+        "pattern-analyst",
+        "synthesis-writer",
+        "systems-modeller"
+      ]
+    },
+    "budget": {
+      "max_tokens": 1000000,
+      "max_tool_calls": 400,
+      "max_wall_secs": 7200,
+      "effort_cap": null
+    },
+    "required_env": []
+  },
+  "trace": {
+    "steps": [
+      {
+        "source": "harwness.agent.child-orchestrator-base@1",
+        "kind": "patch",
+        "applied_at": "1970-01-01T00:00:00Z"
+      },
+      {
+        "source": "harwness.agent.child-orchestrator-base@1",
+        "kind": "base",
+        "applied_at": "1970-01-01T00:00:00Z"
+      },
+      {
+        "source": "harwness.agent.intel-analysis-orchestrator@1",
+        "kind": "patch",
+        "applied_at": "1970-01-01T00:00:00Z"
+      }
+    ],
+    "diagnostics": [
+      {
+        "code": "HARW-CTX-003",
+        "severity": "note",
+        "message": "program `orchestrate` requires sections outside the context ceiling; deferred: plan.current, child.returns",
+        "help": "these sections stay named by the program but are not required at child start",
+        "span": {
+          "file": "builtin/security-structure-triage.toml",
+          "line": 122,
+          "column": 11
+        },
+        "path": "context.program"
+      }
+    ]
+  },
+  "snapshot": {
+    "domain": "harwness.agent-ir.snapshot/v7",
+    "digest": "65300a100a9d372c118d50bef85c5a4c42e33832c82aedda0912a415c4d9b2ac"
+  }
+}

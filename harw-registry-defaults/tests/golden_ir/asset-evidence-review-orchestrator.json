@@ -1,0 +1,268 @@
+{
+  "schema": "harwness.agent-ir/v2",
+  "id": "harwness.agent.evidence-review-orchestrator@1",
+  "version": "1.0.0",
+  "name": "Evidence Review Orchestrator",
+  "description": "Prüfwelle vor jedem Analyseabschluss: startet evidence-critic und method-auditor parallel, führt deren Befunde zu einer Behalten/Verwerfen-Liste mit Methodenbefund zusammen; schlägt vor, gibt nie frei.",
+  "role": "child-orchestrator",
+  "specialization": "evidence-review-orchestrator",
+  "reasoning_effort": null,
+  "authority": {
+    "capabilities": []
+  },
+  "instructions": {
+    "text": "# evidence-review-orchestrator\n\nDu führst die Prüfwelle, die vor jedem Abschluss eines Analyseprodukts steht. Du startest Belegprüfung und Methodenprüfung unabhängig voneinander, führst ihre Befunde zusammen und gibst einen **Vorschlag** zurück. Du gibst nie frei; die Entscheidung liegt beim Auftraggeber.\n\nLade vor dem Start `analysis-workflow` über `skills.load`, um Auftragsformat und Rollen zu kennen; bei Bedarf `evidence-quality-review` und `method-validation`, um die Befunde einordnen zu können.\n\n## Deine Ziele\n\n`evidence-critic` und `method-auditor`. Nur diese.\n\n## Ablauf\n\n1. **Prüfgegenstand klären.** Produkt (Pfad oder Text), Leitfrage, Leser, Belege mit Fundstellen, Beschreibung des Vorgehens. Fehlen Belege oder Vorgehen, meldest du das als ersten Befund und prüfst mit dem, was da ist.\n2. **Prüfwelle.** `evidence-critic` und `method-auditor` parallel in **einer** `delegate_wave`. Beide bekommen dasselbe Material, keiner sieht den Befund des anderen, keiner bekommt eine Wunschantwort.\n3. **Rückgaben lesen** (`agent.result`).\n4. **Zusammenführen.**\n   - Belege: behalten / mit Vorbehalt / verworfen, mit Grund.\n   - Methode: Punktzahl, schwächste Kriterien.\n   - Wo stützen sich die Befunde gegenseitig, wo widersprechen sie? Widersprüche nicht auflösen, sondern benennen.\n   - Folgen: Welche Aussagen des Produkts verlieren ihre Stütze? Passt die Sicherheitsangabe?\n5. **Vorschlag.** Einer von drei: *abschließen* (keine schweren Mängel), *nachbessern* (konkrete Punkte), *zurück an Sammeln* (tragende Aussage ohne Stütze). Immer als Vorschlag formuliert.\n\nPlan-Modus: Die Prüfwelle ist vollständig lesend und läuft unverändert.\n\n## Rückgabe\n\n```markdown\n**Geprüft:** <Produkt>, <Leitfrage>\n**Vorschlag:** abschließen | nachbessern | zurück an Sammeln – Entscheidung beim Auftraggeber\n**Belege:** behalten <a> · Vorbehalt <b> · verworfen <c>\n**Verworfen, mit Grund:** …\n**Methode:** <n>/33 · schwächste Kriterien: …\n**Aussagen ohne tragfähige Stütze:** …\n**Sicherheitsangabe:** passt | zu hoch | zu niedrig – <Grund>\n**Widersprüche zwischen den Prüfern:** …\n**Nachbessern / Nachsammeln:** <konkrete Punkte>\n```\n\n## Was ich NICHT tue\n\n- Ich gebe nicht frei und formuliere nichts als Freigabe. Ich schlage vor.\n- Ich prüfe nicht selbst an Stelle der Prüfer und schreibe das Produkt nicht um.\n- Ich glätte keine Widersprüche zwischen den Prüfern.\n- Ich schreibe keine Dateien und starte keine Agenten außer `evidence-critic` und `method-auditor`.\n",
+    "source": "system.md",
+    "blake3": "d4942f61438e9fedabfba15a04f03c6df7ba887d44d9470a365f8cb723278704"
+  },
+  "tools": {
+    "admitted": [
+      "fs.read",
+      "fs.list",
+      "fs.search",
+      "fs.glob",
+      "fs.grep",
+      "doc.read_pdf",
+      "deps.graph",
+      "deps.locked",
+      "deps.source_read",
+      "deps.source_search",
+      "deps.source_list",
+      "lens.ask",
+      "explore.tree",
+      "explore.projects",
+      "explore.relations",
+      "explore.find",
+      "delegate_wave",
+      "agent.result",
+      "workbench.show",
+      "diary.read",
+      "palace.search",
+      "palace.recall",
+      "agent.message",
+      "parent.message",
+      "skills.search",
+      "skills.load",
+      "job.status",
+      "job.logs",
+      "job.stop",
+      "job.list",
+      "job.wait"
+    ],
+    "forbidden": [
+      "fs.write",
+      "fs.edit",
+      "shell.exec",
+      "web.fetch",
+      "web.search",
+      "web.docs_rs",
+      "web.crates_io"
+    ]
+  },
+  "spawn": {
+    "max_depth": 1,
+    "child_orchestrators": [],
+    "delegation_targets": [
+      "evidence-critic",
+      "method-auditor"
+    ],
+    "workspace_hint": null,
+    "budget": {
+      "max_tokens": 1000000,
+      "max_tool_calls": 400,
+      "max_wall_secs": 7200,
+      "effort_cap": null
+    }
+  },
+  "job": {
+    "goal_kind": null
+  },
+  "lifecycle": {
+    "allow_pause": false,
+    "allow_rerun": true,
+    "max_attempts": 2
+  },
+  "context": {
+    "program": "orchestrate",
+    "program_id": "harwness.context.orchestrate@1",
+    "policy": "harwness.context.orchestrate@1",
+    "sections": [
+      {
+        "name": "task.objective",
+        "strength": "must-include",
+        "detail": "full",
+        "trust": "instruction"
+      },
+      {
+        "name": "history.tail",
+        "strength": "must-include",
+        "detail": "summary",
+        "trust": "evidence"
+      },
+      {
+        "name": "plan.current",
+        "strength": "must-include",
+        "detail": "full",
+        "trust": "evidence"
+      },
+      {
+        "name": "child.returns",
+        "strength": "must-include",
+        "detail": "summary",
+        "trust": "evidence"
+      }
+    ],
+    "must_include": [
+      "task.objective",
+      "history.tail",
+      "task.read_scope",
+      "new.trigger_return"
+    ],
+    "exclude": [
+      "credential.*",
+      "secret.*",
+      "sibling_transcripts",
+      "full_parent_transcript",
+      "child.raw_transcript.*"
+    ],
+    "deferred": [
+      "plan.current",
+      "child.returns"
+    ]
+  },
+  "return": {
+    "contract": "harwness.return.envelope@1",
+    "validators": []
+  },
+  "models": null,
+  "limits": null,
+  "work": {
+    "mode": "orchestration",
+    "may_write_code": false,
+    "may_research_web": false,
+    "may_change_plan": false,
+    "aggregates_child_returns": true
+  },
+  "research": null,
+  "verification": null,
+  "skills": {
+    "entries": []
+  },
+  "binary": {
+    "name": "evidence-review-orchestrator",
+    "interfaces": [
+      "cli"
+    ],
+    "default_interface": "cli"
+  },
+  "permissions": {
+    "tools": [
+      "agent.message",
+      "agent.result",
+      "delegate_wave",
+      "deps.graph",
+      "deps.locked",
+      "deps.source_list",
+      "deps.source_read",
+      "deps.source_search",
+      "diary.read",
+      "doc.read_pdf",
+      "explore.find",
+      "explore.projects",
+      "explore.relations",
+      "explore.tree",
+      "fs.glob",
+      "fs.grep",
+      "fs.list",
+      "fs.read",
+      "fs.search",
+      "job.list",
+      "job.logs",
+      "job.status",
+      "job.stop",
+      "job.wait",
+      "lens.ask",
+      "palace.recall",
+      "palace.search",
+      "parent.message",
+      "skills.load",
+      "skills.search",
+      "workbench.show"
+    ],
+    "forbidden_tools": [
+      "fs.edit",
+      "fs.write",
+      "shell.exec",
+      "web.crates_io",
+      "web.docs_rs",
+      "web.fetch",
+      "web.search"
+    ],
+    "capabilities": [],
+    "filesystem": {
+      "read": true,
+      "write": false,
+      "write_paths": [],
+      "other_write_tools": []
+    },
+    "network": {
+      "mode": "off",
+      "tools": [],
+      "hosts": []
+    },
+    "shell": false,
+    "host": false,
+    "spawn": {
+      "max_depth": 1,
+      "child_orchestrators": [],
+      "delegation_targets": [
+        "evidence-critic",
+        "method-auditor"
+      ]
+    },
+    "budget": {
+      "max_tokens": 1000000,
+      "max_tool_calls": 400,
+      "max_wall_secs": 7200,
+      "effort_cap": null
+    },
+    "required_env": []
+  },
+  "trace": {
+    "steps": [
+      {
+        "source": "harwness.agent.child-orchestrator-base@1",
+        "kind": "patch",
+        "applied_at": "1970-01-01T00:00:00Z"
+      },
+      {
+        "source": "harwness.agent.child-orchestrator-base@1",
+        "kind": "base",
+        "applied_at": "1970-01-01T00:00:00Z"
+      },
+      {
+        "source": "harwness.agent.evidence-review-orchestrator@1",
+        "kind": "patch",
+        "applied_at": "1970-01-01T00:00:00Z"
+      }
+    ],
+    "diagnostics": [
+      {
+        "code": "HARW-CTX-003",
+        "severity": "note",
+        "message": "program `orchestrate` requires sections outside the context ceiling; deferred: plan.current, child.returns",
+        "help": "these sections stay named by the program but are not required at child start",
+        "span": {
+          "file": "builtin/security-structure-triage.toml",
+          "line": 122,
+          "column": 11
+        },
+        "path": "context.program"
+      }
+    ]
+  },
+  "snapshot": {
+    "domain": "harwness.agent-ir.snapshot/v7",
+    "digest": "910534800ab50817ec9825dbaa34c5ec3ea7a3305e6ee72f7dcf1e633b9c71a3"
+  }
+}
