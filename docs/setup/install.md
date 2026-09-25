@@ -64,10 +64,11 @@ bash scripts/install.sh --source
 
 The piped script downloads `Harwness-main.zip`, extracts it under
 `$HARW_SOURCES_DIR` (default `~/.local/share/harw/sources`) and leaves the
-source in place for later agent builds. It installs missing dependencies
-with apt, dnf, yum, pacman, zypper, apk or xbps, then installs Rustup from
-`https://sh.rustup.rs` if needed. Rustup starts with stable and its default
-profile; `rust-toolchain.toml` selects the pinned version for the build.
+source in place for later agent builds. It installs Rustup from
+`https://sh.rustup.rs` if needed, then installs missing dependencies such as
+Bubblewrap with apt, dnf, yum, pacman, zypper, apk or xbps. Only `unzip` may
+be installed earlier to unpack the archive. Rustup starts with stable and
+its default profile; `rust-toolchain.toml` selects the pinned version for the build.
 Finally the script runs `make install BINDIR=…`. Unknown package managers
 produce a manual-install error listing what is missing. The source archive
 is fetched over HTTPS; a separate checksum is not published for it yet.
