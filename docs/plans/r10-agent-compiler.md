@@ -179,6 +179,39 @@ IR v2 stays in `harw-agent-dsl` as a new module.
   - A child crash is reported cleanly.
   - A child's rights never exceed the parent's.
 
+## Must work after `make install` (Mia)
+- `make install` builds and installs `harw-agent-runner` next to `harw`, and writes an install record (`source_dir`, `version`, `target`).
+- `harw agent build` then works with no further setup: the runner is found next to `harw`.
+- `--native` fills in everything itself from the install record: the harw sources, cargo detection, `rust-toolchain.toml`, a build cache under `~/.harw/cache/agent-builds/`, and running as a job. Only a missing Rust toolchain gives a clear hint (rustup one-liner); nothing is installed without approval.
+- `harw agent doctor` checks the runner, the native prerequisites and the install record.
+- **Standard bin in `.harw`** (Mia):
+  - Compiled binaries go to `~/.harw/bin/<name>`, the current version as a symlink.
+  - Every version is kept under `~/.harw/bin/.versions/<name>/<version>-<digest>/` with a `build.json`.
+  - `harw agent versions|use`; `-o` copies in addition.
+  - `harw agent doctor` checks `PATH`.
+  - Runner copies go under `~/.harw/bin/.runners/`.
+  - The cleaner keeps the current version plus N older ones.
+- **Built-in agents stay embedded** (28 roles, bases, bundled agents) and are never built automatically. The compiler is opt-in per agent, and there is no `--all`.
+- **Exception, the UIA is built automatically:**
+  - Triggers: the UIA definition changed (digest comparison), and after `make install` or a version change.
+  - Artifact backend only. It runs in the background, never blocks, is skipped without a runner, and is skipped when the digest is unchanged.
+  - Target is `~/.harw/bin/<name>`; interfaces default to `tui`, `repl` and `cli`.
+  - It can be switched off with `[agent_compiler] auto_build_uia`.
+- **The UIA with `--native` becomes a complete harw:**
+  - The full program (TUI, all roles, tools, commands) with the UIA baked in as the fixed root, i.e. a personalized harw named `harw-<uia-name>`.
+  - It is built from the harw-cli entry plus the embedded UIA artifact.
+  - The auto-build stays artifact-only.
+  - **Own, completely independent home `~/.<uia_name>`** (Mia): no inheritance from `~/.harw`. The first start scaffolds and runs onboarding; providers and credentials can be imported from `~/.harw` on request. It has its own `bin/`, sessions and memory.
+  - **Project folders too:**
+    - Every per-project path derived from the home (project settings, trust store, state dir, jobs, plans, build cache) follows `~/.<uia_name>`.
+    - In the repo it uses `<project>/.<uia_name>/` instead of `.harw/`, from one central `project_dir_name()`.
+    - On first use in a project that has a `.harw`, it offers once to copy only the project configuration; trust is asked again.
+- **Build-cache cleaner:**
+  - Native builds share one cargo target dir, so dependencies compile only once.
+  - After every build an automatic GC runs: a size cap (default 5 GB, configurable), LRU across build dirs, `cargo clean` when the cap is still exceeded, and removal of stale versions. `-o` outputs are never touched.
+  - `harw agent clean [--all|--older-than|--keep|--dry-run]` with a size report.
+  - Uninstall removes the cache.
+
 ## Wave 4: build, release, gates
 - `Cargo.toml` workspace members; `[profile.release-runner]` (lto fat, `codegen-units = 1`, `strip`, `panic = abort`).
 - Release workflow: `harw-agent-runner` for x86_64 and aarch64 in the archive next to `harw`. Makefile `install` also installs the runner.
