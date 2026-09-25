@@ -131,7 +131,7 @@ jobs:
       # Die Warden-Gates lesen `dod/Cargo.lock` und die entpackten Quellen im
       # Registry-Cache; der Root-Build holt nur die Pakete aus `Cargo.lock`.
       - name: Fetch dod dependencies (for xtask gates)
-        run: cargo fetch --locked --manifest-path dod/Cargo.toml --target x86_64-unknown-linux-gnu
+        run: cargo fetch --locked --manifest-path dod/Cargo.toml
 
       # Verbotene Kanten, Privilegienbudget je DoD-Binary, Warden-Hülle und
       # kein C-Build im Warden-Teilbaum. Ein Gate, das nichts geprüft hat,
