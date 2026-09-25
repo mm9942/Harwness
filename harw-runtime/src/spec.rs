@@ -291,6 +291,9 @@ impl EntryKind {
         }
     }
 
+}
+
+impl EntryProfile {
     /// Die tatsächliche Zeile für [`EntryKind::CompiledAgent`]: aus den
     /// Manifest-Rechten abgeleitet statt aus einer Tabellenzeile (#22 Welle
     /// 3A).

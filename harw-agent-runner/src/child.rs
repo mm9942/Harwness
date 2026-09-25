@@ -34,7 +34,7 @@ use std::sync::{Arc, Mutex};
 use harw_agent_dsl::ir_v2::AgentIr;
 use harwness_sdk::{
     ApprovalHandler, ApprovalRequest, BoxFuture, Decision, FinishStatus, Harwness, SdkEvent,
-    Session, TurnReport, TurnStatus,
+    TurnReport, TurnStatus,
 };
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::sync::{mpsc, oneshot};
@@ -506,6 +506,7 @@ fn summarize_arguments(arguments: &serde_json::Value) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use harwness_sdk::Session;
     use harwness_sdk::prelude::*;
     use std::path::{Path, PathBuf};
 

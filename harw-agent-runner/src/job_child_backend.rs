@@ -658,16 +658,26 @@ mod tests {
         let backend = JobChildBackend::with_spawner(ShellSpawner { script });
         let io = RecordingIo;
         let cancel = harw_types::cancel::CancelToken::new();
-        let cancel_clone = cancel.clone();
 
-        let run = tokio::spawn(async move { backend.run(spec(cancel_clone), &io).await });
-        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
-        cancel.cancel(CancelReason::User);
+        // Cancels concurrently with the run below, from a task that touches
+        // nothing but the (cheaply cloneable) token — `backend.run`'s future
+        // borrows `io`/`backend` and so is not `'static`, but is awaited
+        // directly here rather than spawned, which needs no such bound.
+        let canceller = {
+            let cancel = cancel.clone();
+            tokio::spawn(async move {
+                tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+                cancel.cancel(CancelReason::User);
+            })
+        };
 
-        let outcome = tokio::time::timeout(std::time::Duration::from_secs(5), run)
-            .await
-            .expect("cancel must end the run promptly")
-            .expect("task did not panic");
+        let outcome = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            backend.run(spec(cancel), &io),
+        )
+        .await
+        .expect("cancel must end the run promptly");
+        canceller.await.expect("canceller task did not panic");
         match outcome.status {
             ChildRunStatus::Cancelled { reason } => assert_eq!(reason, "user"),
             other => panic!("unexpected: {other:?}"),
