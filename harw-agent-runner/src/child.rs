@@ -116,11 +116,9 @@ async fn run_child_async(mut ctx: RunnerContext, agent_id: String) -> ExitCode {
         return ExitCode::FAILURE;
     }
 
-    let mut stdin = BufReader::new(tokio::io::stdin()).lines();
-    let manifest_rights = manifest_rights_of(&child_ir);
-    let mut rights = manifest_rights.clone();
-    let mut received_rights = false;
-    let mut budget = harw_agent_dsl::ir_v2::Budget::default();
+    let mut stdin: StdinFrames = FrameReader::new(BufReader::new(tokio::io::stdin()));
+    let mut parent_rights: Option<ChildRights> = None;
+    let mut budget: Option<Budget> = None;
     let mut mode = harwness_sdk::Mode::Plan;
 
     // The first `Task` starts the run; `Rights`/`Budget`/`Mode` may arrive
@@ -128,113 +126,135 @@ async fn run_child_async(mut ctx: RunnerContext, agent_id: String) -> ExitCode {
     // closed stdin before any `Task` ends this process cleanly — there is
     // nothing to report a result for.
     let (task, context, continue_from) = loop {
-        match stdin.next_line().await {
-            Ok(Some(line)) => match decode_line::<ParentToChild>(&line) {
-                Ok(ParentToChild::Task {
-                    task,
-                    context,
-                    continue_from,
-                }) if received_rights => break (task, context, continue_from),
-                Ok(ParentToChild::Task { .. }) => {
-                    let _ = outbound_tx.send(ChildToParent::Error {
-                        message: "Rights must precede Task".to_owned(),
-                    });
-                    drop(outbound_tx);
-                    let _ = writer.await;
-                    return ExitCode::FAILURE;
-                }
-                Ok(ParentToChild::Rights {
-                    rights: from_parent,
-                }) => {
-                    rights = narrow_rights(&rights, &from_parent);
-                    received_rights = true;
-                }
-                Ok(ParentToChild::Cancel) => return ExitCode::SUCCESS,
-                Ok(ParentToChild::Budget {
-                    max_tokens,
-                    max_tool_calls,
-                    max_wall_time_ms,
-                }) => {
-                    budget.max_tokens = min_limit(budget.max_tokens, max_tokens);
-                    budget.max_tool_calls = min_limit(
-                        budget.max_tool_calls,
-                        max_tool_calls.map(|v| u32::try_from(v).unwrap_or(u32::MAX)),
-                    );
-                    budget.max_wall_secs =
-                        min_limit(budget.max_wall_secs, max_wall_time_ms.map(|v| v / 1_000));
-                }
-                Ok(ParentToChild::Mode { mode: next }) => {
-                    mode = match next {
-                        crate::child_protocol::ChildMode::Plan => harwness_sdk::Mode::Plan,
-                        crate::child_protocol::ChildMode::Live => harwness_sdk::Mode::Work,
-                    };
-                }
-                Ok(_) => {}
-                Err(error) => {
-                    let _ = outbound_tx.send(ChildToParent::Error {
-                        message: error.to_string(),
-                    });
-                }
-            },
+        let line = match stdin.next_frame().await {
+            Ok(Some(line)) => line,
             Ok(None) => return ExitCode::SUCCESS,
-            Err(error) => {
+            Err(FrameReadError::Io(error)) => {
                 eprintln!("harw-agent-runner: failed reading stdin: {error}");
                 return ExitCode::FAILURE;
             }
+            Err(error) => {
+                // Oversized or non-UTF-8: the stream is out of sync, so
+                // report it once and stop instead of guessing where the next
+                // frame starts.
+                return fail_with(outbound_tx, writer, error.to_string()).await;
+            }
+        };
+        match decode_line::<ParentToChild>(&line) {
+            Ok(ParentToChild::Task {
+                task,
+                context,
+                continue_from,
+            }) => {
+                if parent_rights.is_none() {
+                    return fail_with(outbound_tx, writer, "Rights must precede Task".to_owned())
+                        .await;
+                }
+                break (task, context, continue_from);
+            }
+            Ok(ParentToChild::Rights {
+                rights: from_parent,
+            }) => {
+                // Several frames only ever narrow each other.
+                parent_rights = Some(match parent_rights.take() {
+                    Some(previous) => narrow_rights(&previous, &from_parent),
+                    None => from_parent,
+                });
+            }
+            Ok(ParentToChild::Cancel) => return ExitCode::SUCCESS,
+            Ok(ParentToChild::Budget {
+                max_tokens,
+                max_tool_calls,
+                max_wall_time_ms,
+            }) => {
+                let mut next = budget.take().unwrap_or_default();
+                next.max_tokens = min_limit(next.max_tokens, max_tokens);
+                next.max_tool_calls = min_limit(
+                    next.max_tool_calls,
+                    max_tool_calls.map(|v| u32::try_from(v).unwrap_or(u32::MAX)),
+                );
+                next.max_wall_secs =
+                    min_limit(next.max_wall_secs, max_wall_time_ms.map(|v| v / 1_000));
+                budget = Some(next);
+            }
+            Ok(ParentToChild::Mode { mode: next }) => {
+                mode = match next {
+                    crate::child_protocol::ChildMode::Plan => harwness_sdk::Mode::Plan,
+                    crate::child_protocol::ChildMode::Live => harwness_sdk::Mode::Work,
+                };
+            }
+            Ok(_) => {}
+            Err(error) => {
+                let _ = outbound_tx.send(ChildToParent::Error {
+                    message: error.to_string(),
+                });
+            }
         }
     };
-    if continue_from.is_some() {
-        let _ = outbound_tx.send(ChildToParent::Error {
-            message: "job child continuation is not supported".to_owned(),
-        });
-        drop(outbound_tx);
-        let _ = writer.await;
-        return ExitCode::FAILURE;
-    }
+    // `parent_rights` is always `Some` here: the loop refuses a `Task`
+    // before any `Rights` frame.
+    let Some(parent_rights) = parent_rights else {
+        return fail_with(outbound_tx, writer, "Rights must precede Task".to_owned()).await;
+    };
+    let rights = effective_child_rights(
+        own_ceiling(&child_ir.permissions, &ctx.args.flags),
+        &parent_rights,
+        budget.as_ref(),
+    );
     let selected = match ctx.agent.for_agent(&agent_id) {
         Ok(agent) => agent,
         Err(error) => {
             eprintln!("harw-agent-runner: cannot select child: {error}");
-            return ExitCode::FAILURE;
+            return fail_with(outbound_tx, writer, format!("cannot select child: {error}")).await;
         }
     };
-    ctx.agent = Arc::new(
-        selected.with_rights(harw_runtime::embedded::EffectiveRights {
-            tools: rights.tools,
-            network_hosts: rights.network_hosts,
-            network_open: rights.network_open,
-            write: rights.write,
-            shell: rights.shell,
-            host: rights.host,
-            full_access: rights.full_access,
-            budget: Some(budget),
-        }),
-    );
+    let auto_approve = rights.full_access;
+    // `with_rights` intersects with what `for_agent` already carries, so
+    // this can only narrow further.
+    ctx.agent = Arc::new(selected.with_rights(rights));
     let approvals = Arc::new(RelayApprovals::new(outbound_tx.clone()));
     let harwness = match ctx.builder().and_then(|builder| {
-        builder
+        let builder = builder
             .mode(mode)
-            .approval_handler_arc(approvals.clone())
-            .build()
-            .map_err(crate::error::RunnerError::from)
+            .approval_handler_arc(approvals.clone());
+        let builder = if auto_approve {
+            builder.approval_policy(ApprovalPolicy::FullAccess)
+        } else {
+            builder
+        };
+        builder.build().map_err(crate::error::RunnerError::from)
     }) {
         Ok(harwness) => harwness,
         Err(error) => {
-            let _ = outbound_tx.send(ChildToParent::Error {
-                message: format!("failed to build the child session: {error}"),
-            });
-            writer.abort();
-            return ExitCode::FAILURE;
+            return fail_with(
+                outbound_tx,
+                writer,
+                format!("failed to build the child session: {error}"),
+            )
+            .await;
         }
     };
-    let mut session = match harwness.session() {
+    let opened = match continue_from.as_deref() {
+        Some(token) => match token.parse::<harwness_sdk::SessionId>() {
+            Ok(id) => harwness.resume(&id).await,
+            Err(error) => Err(error),
+        },
+        None => harwness.session(),
+    };
+    let mut session = match opened {
         Ok(session) => session,
         Err(error) => {
-            let _ = outbound_tx.send(ChildToParent::Error {
-                message: format!("failed to start the child session: {error}"),
-            });
-            writer.abort();
-            return ExitCode::FAILURE;
+            let what = if continue_from.is_some() {
+                "resume"
+            } else {
+                "start"
+            };
+            return fail_with(
+                outbound_tx,
+                writer,
+                format!("failed to {what} the child session: {error}"),
+            )
+            .await;
         }
     };
 
@@ -262,7 +282,7 @@ async fn run_child_async(mut ctx: RunnerContext, agent_id: String) -> ExitCode {
     };
     let cancel_handle = session.cancel_handle();
     // Reuses the same `stdin` the handshake loop read from — a second,
-    // independent `BufReader` over the same fd would race it for bytes.
+    // independent reader over the same fd would race it for bytes.
     let reader = tokio::spawn(run_reader(
         stdin,
         approvals,
@@ -274,9 +294,16 @@ async fn run_child_async(mut ctx: RunnerContext, agent_id: String) -> ExitCode {
     event_forwarder.abort();
     reader.abort();
     let _ = event_forwarder.await;
-    let _ = reader.await;
+    // `Ok(true)`: the reader already reported a broken stream with an
+    // `Error` frame and cancelled the turn — no `Result` follows it.
+    let protocol_broken = matches!(reader.await, Ok(true));
     drop(session);
     drop(harwness);
+    if protocol_broken {
+        drop(outbound_tx);
+        let _ = writer.await;
+        return ExitCode::FAILURE;
+    }
 
     let frame = match result {
         Ok(report) => translate_turn_report(&report),
@@ -284,6 +311,7 @@ async fn run_child_async(mut ctx: RunnerContext, agent_id: String) -> ExitCode {
             status: ChildResultStatus::Failed,
             text: Some(error.to_string()),
             usage: ChildUsage::default(),
+            continuation: None,
         },
     };
     let _ = outbound_tx.send(frame);
@@ -292,38 +320,58 @@ async fn run_child_async(mut ctx: RunnerContext, agent_id: String) -> ExitCode {
     ExitCode::SUCCESS
 }
 
+/// Sends one `Error` frame, lets the writer flush it, and returns
+/// `ExitCode::FAILURE` — the child's single way out once it cannot produce a
+/// `Result`.
+async fn fail_with(
+    outbound: mpsc::UnboundedSender<ChildToParent>,
+    writer: tokio::task::JoinHandle<()>,
+    message: String,
+) -> ExitCode {
+    eprintln!("harw-agent-runner: {message}");
+    let _ = outbound.send(ChildToParent::Error { message });
+    drop(outbound);
+    let _ = writer.await;
+    ExitCode::FAILURE
+}
+
 /// Drains the rest of `stdin` for `Answer`/`Cancel` frames that arrive while
 /// the turn runs, resolving pending approvals and cancelling the session.
+///
+/// # Returns
+/// `true` if it stopped on a protocol violation (oversized, non-UTF-8,
+/// malformed or unsupported frame), after sending an `Error` frame and
+/// cancelling the turn; `false` on `Cancel` or a closed/failed stdin.
 async fn run_reader(
-    mut stdin: tokio::io::Lines<BufReader<tokio::io::Stdin>>,
+    mut stdin: StdinFrames,
     approvals: Arc<RelayApprovals>,
     cancel: harwness_sdk::CancelHandle,
     outbound: mpsc::UnboundedSender<ChildToParent>,
-) {
+) -> bool {
     loop {
-        match stdin.next_line().await {
+        let message = match stdin.next_frame().await {
             Ok(Some(line)) => match decode_line::<ParentToChild>(&line) {
                 Ok(ParentToChild::Answer { question_id, text }) => {
                     approvals.resolve(&question_id, text);
+                    continue;
                 }
                 Ok(ParentToChild::Cancel) => {
                     cancel.cancel();
-                    break;
+                    return false;
                 }
                 Ok(_) | Err(_) => {
-                    let _ = outbound.send(ChildToParent::Error {
-                        message: "unsupported or malformed mid-turn control frame; child cancelled"
-                            .to_owned(),
-                    });
-                    cancel.cancel();
-                    break;
+                    "unsupported or malformed mid-turn control frame; child cancelled".to_owned()
                 }
             },
-            _ => {
+            Ok(None) | Err(FrameReadError::Io(_)) => {
                 cancel.cancel();
-                break;
+                return false;
             }
-        }
+            Err(error) => format!("{error}; child cancelled"),
+        };
+        let _ = outbound.send(ChildToParent::Error { message });
+        cancel.cancel();
+        return true;
     }
 }
 

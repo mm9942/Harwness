@@ -1460,4 +1460,34 @@ admitted = ["fs.read"]
         assert!(annotated.contains("auto-kompiliert"), "{annotated}");
         Ok(())
     }
+
+    /// `/agent build` ohne Job-Verwaltung läuft weiter synchron, aber die
+    /// erste Zeile sagt das — im Erfolg wie im Fehler.
+    #[test]
+    fn test_foreground_build_output_starts_with_the_note() -> TestResult {
+        let ok = super::with_foreground_note(Ok(harw_operations::OpOutput {
+            text: "built".to_owned(),
+            data: None,
+        }))
+        .map_err(|error| TestError::Unexpected(error.to_string()))?;
+        let mut lines = ok.text.lines();
+        assert_eq!(lines.next(), Some(super::FOREGROUND_BUILD_NOTE));
+        assert_eq!(lines.next(), Some("built"));
+        assert!(
+            super::FOREGROUND_BUILD_NOTE
+                .contains("no job system in this session, building in the foreground")
+        );
+        match super::with_foreground_note(Err(OpError::Execution("failed".to_owned()))) {
+            Err(OpError::Execution(text)) => {
+                assert!(text.starts_with(super::FOREGROUND_BUILD_NOTE), "{text}");
+                assert!(text.ends_with("failed"), "{text}");
+            }
+            other => {
+                return Err(TestError::Unexpected(format!(
+                    "expected an execution error, got {other:?}"
+                )));
+            }
+        }
+        Ok(())
+    }
 }
