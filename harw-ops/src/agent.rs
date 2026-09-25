@@ -337,7 +337,7 @@ fn run_compiler(
 /// ([`harw_agent_compiler::commands`]). `build` läuft, wenn die Sitzung
 /// eine Job-Verwaltung hat, als Job (`harw agent build … --json` als eigener
 /// Prozess; Fortschritt und Ergebnis im Job-Log, `/jobs`); ohne
-/// Job-Verwaltung synchron.
+/// Job-Verwaltung synchron — mit [`FOREGROUND_BUILD_NOTE`] als erster Zeile.
 fn agent_compiler(ctx: &OpContext, args: &AgentArgs) -> Result<OpOutput, OpError> {
     let tokens = compiler_tokens(args);
     let command = harw_agent_compiler::parse_tokens(&tokens)
@@ -345,13 +345,34 @@ fn agent_compiler(ctx: &OpContext, args: &AgentArgs) -> Result<OpOutput, OpError
         .ok_or_else(|| {
             OpError::InvalidArguments(format!("unknown /agent action '{}'", tokens.join(" ")))
         })?;
-    let job_manager = matches!(command, harw_agent_compiler::AgentCommand::Build(_))
-        .then(|| ctx.service::<std::sync::Arc<harw_tool_job::JobManager>>())
-        .flatten();
-    if let Some(manager) = job_manager {
+    let is_build = matches!(command, harw_agent_compiler::AgentCommand::Build(_));
+    if !is_build {
+        return run_compiler(ctx, command);
+    }
+    if let Some(manager) = ctx.service::<std::sync::Arc<harw_tool_job::JobManager>>() {
         return start_build_job(ctx, manager, &tokens);
     }
-    run_compiler(ctx, command)
+    tracing::info!("{FOREGROUND_BUILD_NOTE}");
+    with_foreground_note(run_compiler(ctx, command))
+}
+
+/// Erste Zeile eines `/agent build`, der mangels Job-Verwaltung synchron
+/// läuft (etwa außerhalb der TUI).
+const FOREGROUND_BUILD_NOTE: &str = "no job system in this session, building in the foreground";
+
+/// Stellt [`FOREGROUND_BUILD_NOTE`] vor den Text eines synchronen Builds —
+/// im Erfolg wie im Fehler.
+fn with_foreground_note(result: Result<OpOutput, OpError>) -> Result<OpOutput, OpError> {
+    let prefix = |text: String| format!("{FOREGROUND_BUILD_NOTE}\n{text}");
+    match result {
+        Ok(output) => Ok(OpOutput {
+            text: prefix(output.text),
+            data: output.data,
+        }),
+        Err(OpError::InvalidArguments(text)) => Err(OpError::InvalidArguments(prefix(text))),
+        Err(OpError::Execution(text)) => Err(OpError::Execution(prefix(text))),
+        Err(OpError::NotAvailable(text)) => Err(OpError::NotAvailable(prefix(text))),
+    }
 }
 
 /// Startet `harw agent build … --json` als Job der Sitzung.

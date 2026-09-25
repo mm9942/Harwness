@@ -174,6 +174,7 @@ what this build does have.
 | `--max-tokens <n>` | cap the token budget at `n`, tightening (never loosening) the manifest's own budget. |
 | `--listen <addr>` | bind address for `http` (default `127.0.0.1:8787`) and for `mcp`'s Streamable HTTP transport (§5.3, §5.4). |
 | `--child <id>` / `--child-protocol <label>` | run as a delegated child instead of a top-level interface (§5.7); both flags are required together. |
+| `--offline-echo` | answer every model call locally (reply text from `HARW_OFFLINE_ECHO`, if set) and say so in one stderr line; not a rights flag. Release builds ignore `HARW_OFFLINE_ECHO` without this flag. |
 
 Every flag above except `--manifest`/`--verify`/`--version`/`--capabilities`
 narrows the manifest before the chosen interface starts
