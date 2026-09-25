@@ -1474,7 +1474,7 @@ pub(crate) const OTHER_WRITE_TOOLS: &[&str] = &[
 /// Tool-label prefixes that read the workspace.
 pub(crate) const READ_TOOL_PREFIXES: &[&str] = &["fs.", "doc.", "deps.", "explore.", "lens."];
 /// Tools that start processes.
-pub(crate) const SHELL_TOOLS: &[&str] = &["shell.exec", "job.start"];
+pub(crate) const SHELL_TOOLS: &[&str] = &["shell.exec", "job.start", "agents.build"];
 /// Tool-label prefixes that start processes.
 pub(crate) const SHELL_TOOL_PREFIXES: &[&str] = &["process."];
 /// Tool-label prefixes that act on the host outside the sandbox.

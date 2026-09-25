@@ -209,7 +209,7 @@ pub enum ChildToParent {
         /// Consumption of this run.
         #[serde(default)]
         usage: ChildUsage,
-        /// Opaque token a later [`ParentToChild::Task::continue_from`] hands
+        /// Opaque token a later [`ParentToChild::Task`]'s `continue_from` hands
         /// back to resume this run (today the child's SDK session id). Set
         /// only with [`ChildResultStatus::BudgetExhausted`]; absent
         /// otherwise. Additive: an older peer omits it and it decodes as
