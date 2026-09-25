@@ -1,8 +1,9 @@
-#!/usr/bin/env bash
+#!/bin/sh
 # Harwness installer — installs `harw`, `killer` and `harw-agent-runner` by building from
 # source or by downloading a prebuilt release tarball.
 #
 # Usage:
+#   curl -fsSL https://get.harw.dev/harw/install.sh | sh
 #   scripts/install.sh [--help]
 #   scripts/install.sh [--source]              # build from source (default when cargo is present)
 #   scripts/install.sh --binary [--version TAG] # download a prebuilt release tarball
@@ -14,33 +15,55 @@
 #              `make install BINDIR=…` (the repo's single entry point,
 #              see the root Makefile) instead of calling cargo directly.
 #   --binary   Download a release tarball instead of building. This is the
-#              default when `cargo` is NOT on PATH. Requires HARW_REPO (see
-#              below) unless run inside a git checkout of the Harwness repo,
-#              in which case the origin remote is used to find it. The
+#              default when `cargo` is NOT on PATH and whenever the script
+#              does not run from a source checkout (e.g. piped from curl).
+#              Tarballs come from https://get.harw.dev/harw (HARW_BASE_URL),
+#              or from GitHub releases when HARW_REPO is set. The
 #              tarball contains `harw`, `killer`, `harw-agent-runner`,
 #              licenses and `README.md`; all three binaries are
 #              installed.
 #
 # Environment:
 #   HARW_INSTALL_DIR   Target bin directory (default: $HOME/.local/bin)
-#   HARW_REPO          GitHub repo to fetch release binaries from, as
-#                       "owner/repo" or a full git/https remote URL.
-#                       Required for --binary mode unless this script is run
-#                       from inside a checkout with an "origin" remote.
+#   HARW_BASE_URL      Download base for --binary mode
+#                       (default: https://get.harw.dev/harw). Layout:
+#                       <base>/latest (a tag), <base>/<tag>/SHA256SUMS,
+#                       <base>/<tag>/harw-<tag>-<target>.tar.gz.
+#   HARW_REPO          Download from this GitHub repo's releases instead,
+#                       as "owner/repo" or a full git/https remote URL.
 #   HARW_VERSION       Release tag to install in --binary mode
-#                       (default: the latest GitHub release).
+#                       (default: the latest release).
 #
 # The installer is idempotent: it never duplicates PATH entries, never
 # overwrites an existing ~/.harw configuration (that is `harw`'s own job on
 # first run), and re-running it simply re-installs the same binaries.
-set -euo pipefail
+# POSIX sh (dash, busybox, bash, zsh): no bashisms, so `curl … | sh` works.
+set -eu
+# pipefail where the shell has it (bash, zsh, newer dash); every pipeline
+# below also checks its result, so shells without it stay safe.
+(set -o pipefail) 2>/dev/null && set -o pipefail
+
+# Piped from curl, `$0` is the shell, not this file: there is no checkout.
+in_checkout=false
+repo_root=""
+if [ -f "$0" ]; then
+  repo_root="$(cd "$(dirname "$0")/.." && pwd)"
+  if [ -f "$repo_root/Cargo.toml" ] && [ -f "$repo_root/scripts/install.sh" ]; then
+    in_checkout=true
+  fi
+fi
 
 usage() {
-  sed -n '2,29p' "$0"
+  if [ "$in_checkout" = true ]; then
+    sed -n '2,39p' "$0"
+  else
+    printf '%s\n' "Usage: curl -fsSL https://get.harw.dev/harw/install.sh | sh" \
+      "       ... | sh -s -- [--binary] [--version TAG]"
+  fi
   exit 0
 }
 
-repo_root="$(cd "$(dirname "$0")/.." && pwd)"
+base_url_default="${HARW_BASE_URL:-https://get.harw.dev/harw}"
 install_dir="${HARW_INSTALL_DIR:-$HOME/.local/bin}"
 mode=""
 version="${HARW_VERSION:-}"
@@ -73,7 +96,9 @@ case "$os" in
 esac
 
 if [ -z "$mode" ]; then
-  if command -v cargo >/dev/null 2>&1; then
+  if [ "$in_checkout" = false ]; then
+    mode="binary"
+  elif command -v cargo >/dev/null 2>&1; then
     mode="source"
   else
     mode="binary"
@@ -87,6 +112,7 @@ fi
 
 # --- Mode: source -------------------------------------------------------------
 install_from_source() {
+  [ "$in_checkout" = true ] || die "--source needs a Harwness source checkout; run scripts/install.sh from a clone, or use --binary"
   command -v cargo >/dev/null 2>&1 || die "cargo not found — install Rust via https://rustup.rs and re-run, or use --binary"
 
   if command -v make >/dev/null 2>&1 && [ -f "$repo_root/Makefile" ]; then
@@ -158,7 +184,7 @@ resolve_repo() {
     return 0
   fi
 
-  if [ -d "$repo_root/.git" ] && command -v git >/dev/null 2>&1; then
+  if [ -n "$repo_root" ] && [ -d "$repo_root/.git" ] && command -v git >/dev/null 2>&1; then
     origin_url="$(cd "$repo_root" && git remote get-url origin 2>/dev/null || true)"
     if [ -n "$origin_url" ]; then
       normalize_repo "$origin_url"
@@ -211,11 +237,40 @@ sha256_check() {
   fi
 }
 
-install_from_binary() {
-  repo="$(resolve_repo)"
-  target="$(detect_target)"
+fetch_text() {
+  # fetch_text URL — prints the body on stdout
+  if command -v curl >/dev/null 2>&1; then
+    curl -fsSL "$1"
+  elif command -v wget >/dev/null 2>&1; then
+    wget -qO- "$1"
+  else
+    die "neither curl nor wget is available"
+  fi
+}
 
+install_from_binary() {
+  target="$(detect_target)"
   tag="$version"
+
+  if [ -z "${HARW_REPO:-}" ]; then
+    # Default source: the release mirror behind get.harw.dev.
+    source_label="$base_url_default"
+    if [ -z "$tag" ]; then
+      tag="$(fetch_text "$base_url_default/latest" | tr -d '[:space:]')" \
+        || die "could not read $base_url_default/latest"
+      [ -n "$tag" ] || die "$base_url_default/latest is empty"
+    fi
+    base_url="$base_url_default/$tag"
+  else
+    repo="$(resolve_repo)"
+    source_label="$repo"
+    install_from_github_tag
+    base_url="https://github.com/$repo/releases/download/$tag"
+  fi
+  install_from_url
+}
+
+install_from_github_tag() {
   if [ -z "$tag" ]; then
     if command -v curl >/dev/null 2>&1; then
       tag="$(curl -fsSL "https://api.github.com/repos/$repo/releases/latest" \
@@ -228,14 +283,15 @@ install_from_binary() {
     fi
     [ -n "$tag" ] || die "could not resolve the latest release tag for $repo"
   fi
+}
 
+install_from_url() {
   asset="harw-${tag}-${target}.tar.gz"
-  base_url="https://github.com/$repo/releases/download/$tag"
 
   work_dir="$(mktemp -d)"
   trap 'rm -rf "$work_dir"' EXIT
 
-  log "Downloading $asset ($repo @ $tag)…"
+  log "Downloading $asset ($source_label @ $tag)…"
   fetch "$base_url/$asset" "$work_dir/$asset"
   fetch "$base_url/SHA256SUMS" "$work_dir/SHA256SUMS"
 

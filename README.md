@@ -62,12 +62,25 @@ The `harw` binary provides the interactive terminal UI, one-shot runs, durable p
 
 ## Install
 
+### One line
+
+```bash
+curl -fsSL https://get.harw.dev/harw/install.sh | sh
+```
+
+This downloads the latest release for your machine from `get.harw.dev`,
+checks its SHA-256 checksum and installs `harw`, `killer` and
+`harw-agent-runner` into `~/.local/bin`. Pick a version with
+`… | sh -s -- --version v0.3.0`; set `HARW_INSTALL_DIR` for another
+target directory. Linux (x86_64, aarch64) only for now.
+
 ### Download a release
 
-Tagged releases (`v*`) publish prebuilt binaries for Linux on GitHub Releases.
+Tagged releases (`v*`) publish prebuilt binaries for Linux on GitHub Releases
+and on `https://get.harw.dev/harw/<version>/`.
 Each tarball contains the `harw` binary, the standalone `killer` binary (see
-[Process control](#process-control)), and the project's license files
-(`LICENSE-MIT`, `LICENSE-APACHE`):
+[Process control](#process-control)), `harw-agent-runner`, and the project's
+license files (`LICENSE-MIT`, `LICENSE-APACHE`):
 
 - `harw-<version>-x86_64-unknown-linux-gnu.tar.gz`
 - `harw-<version>-aarch64-unknown-linux-gnu.tar.gz` (for example Raspberry Pi 4/5, 64-bit)
@@ -76,7 +89,7 @@ Each tarball contains the `harw` binary, the standalone `killer` binary (see
 # pick the archive for your machine from the Releases page, then:
 sha256sum -c SHA256SUMS --ignore-missing
 tar -xzf harw-<version>-x86_64-unknown-linux-gnu.tar.gz
-install -m 0755 harw-<version>-x86_64-unknown-linux-gnu/{harw,killer} ~/.local/bin/
+install -m 0755 harw-<version>-x86_64-unknown-linux-gnu/{harw,killer,harw-agent-runner} ~/.local/bin/
 harw init && harw onboard
 ```
 
@@ -85,7 +98,7 @@ harw init && harw onboard
 ```bash
 git clone https://github.com/mm9942/Harwness.git
 cd Harwness
-make install    # builds and installs `harw` and `killer` into ~/.local/bin
+make install    # builds and installs `harw`, `killer` and `harw-agent-runner` into ~/.local/bin
 harw init && harw onboard
 ```
 

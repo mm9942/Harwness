@@ -113,3 +113,48 @@ jobs:
             dist/*.tar.gz
             dist/SHA256SUMS
           fail_on_unmatched_files: true
+
+  mirror:
+    # Mirrors the release to the R2 bucket behind https://get.harw.dev/harw,
+    # the default source of `curl -fsSL https://get.harw.dev/harw/install.sh | sh`.
+    # Skipped (not failed) until the R2 secrets are configured.
+    name: Mirror to get.harw.dev
+    needs: release
+    runs-on: ubuntu-latest
+    env:
+      R2_ACCOUNT_ID: ${{ secrets.R2_ACCOUNT_ID }}
+      AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+      AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+      AWS_DEFAULT_REGION: auto
+      R2_BUCKET: harw
+      R2_PREFIX: harw
+    steps:
+      - name: Checkout
+        if: env.R2_ACCOUNT_ID != ''
+        uses: actions/checkout@v7
+
+      - name: Download artifacts
+        if: env.R2_ACCOUNT_ID != ''
+        uses: actions/download-artifact@v8
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Upload to R2
+        if: env.R2_ACCOUNT_ID != ''
+        run: |
+          set -euo pipefail
+          tag="${GITHUB_REF_NAME}"
+          endpoint="https://${R2_ACCOUNT_ID}.r2.cloudflarestorage.com"
+          s3() { aws s3 cp --endpoint-url "$endpoint" --only-show-errors "$@"; }
+          cd dist
+          sha256sum -- *.tar.gz > SHA256SUMS
+          for file in *.tar.gz SHA256SUMS; do
+            s3 "$file" "s3://${R2_BUCKET}/${R2_PREFIX}/${tag}/${file}"
+          done
+          s3 ../scripts/install.sh "s3://${R2_BUCKET}/${R2_PREFIX}/install.sh" \
+            --content-type "text/x-shellscript; charset=utf-8" --cache-control "no-cache"
+          # `latest` last, so it never points at a half-uploaded tag.
+          printf '%s\n' "$tag" > latest
+          s3 latest "s3://${R2_BUCKET}/${R2_PREFIX}/latest" \
+            --content-type "text/plain; charset=utf-8" --cache-control "no-cache"
