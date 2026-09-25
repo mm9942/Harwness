@@ -3068,6 +3068,153 @@ mod agents_build_tests {
         assert!(starter.recorded().is_empty());
         Ok(())
     }
+
+    /// Eine Agentendefinition, die `agents.build` ausdrücklich admittiert.
+    const BUILDER_WORKER: &str = r#"
+schema = "harwness.agent/v1"
+id = "user.agent.builder@1"
+version = "1.0.0"
+extends = { id = "harwness.agent.worker-base@1" }
+role = "worker"
+specialization = "builder"
+
+[tools]
+admitted = ["fs.read", "agents.build"]
+"#;
+
+    fn job_manager(dir: &std::path::Path) -> TestResult<Arc<harw_tool_job::JobManager>> {
+        harw_tool_job::JobManager::new(
+            harw_tool_job::JobManagerConfig::new(dir),
+            Arc::new(harw_tool_job::NoopNotifier),
+        )
+        .map_err(ctx("Job-Verwaltung anlegen"))
+    }
+
+    fn builder_ir() -> TestResult<harw_agent_dsl::ExecutableAgentIr> {
+        match super::validate_definition_toml(BUILDER_WORKER) {
+            super::Validated::Ok { ir, .. } => Ok(*ir),
+            super::Validated::Err(errors) => Err(TestError::Unexpected(format!(
+                "Builder-Definition muss lowern: {errors:?}"
+            ))),
+        }
+    }
+
+    /// Definition admittiert `agents.build`, die Rechte tragen
+    /// `ExecuteProcess` und eine Job-Verwaltung existiert → registriert.
+    #[test]
+    fn test_definition_admitting_agents_build_gets_the_tool_with_a_job_manager() -> TestResult {
+        let dir = tempfile::tempdir().map_err(ctx("Tempdir anlegen"))?;
+        let ir = builder_ir()?;
+        let provider = super::agent_build_provider_for(
+            Some(ir.tool_surface()),
+            &PermissionSet::from_policy([Permission::ExecuteProcess]),
+            Some(job_manager(dir.path())?),
+        )
+        .map_err(|withheld| TestError::Unexpected(withheld.to_string()))?;
+        let names: Vec<String> = provider
+            .tools()
+            .iter()
+            .map(|spec| match spec {
+                harw_tools::ToolSpec::Function(function) => function.name.as_str().to_owned(),
+                other => format!("{other:?}"),
+            })
+            .collect();
+        assert_eq!(names, vec!["agents.build".to_owned()]);
+        assert!(provider.executor(&ToolName::new("agents.build")).is_some());
+        Ok(())
+    }
+
+    /// Ohne Job-Verwaltung wird `agents.build` nicht registriert — mit einem
+    /// klaren Grund.
+    #[test]
+    fn test_without_job_manager_agents_build_is_withheld_with_a_reason() -> TestResult {
+        let ir = builder_ir()?;
+        let withheld = match super::agent_build_provider_for(
+            Some(ir.tool_surface()),
+            &PermissionSet::from_policy([Permission::ExecuteProcess]),
+            None,
+        ) {
+            Ok(_) => {
+                return Err(TestError::Unexpected(
+                    "ohne Job-Verwaltung darf agents.build nicht registriert werden".to_owned(),
+                ));
+            }
+            Err(withheld) => withheld,
+        };
+        assert_eq!(withheld, super::AgentBuildWithheld::NoJobManager);
+        assert!(withheld.reason().contains("no job system"));
+        Ok(())
+    }
+
+    /// Außerhalb der Autorität des Elternteils (kein `ExecuteProcess`) wird
+    /// `agents.build` auch mit Job-Verwaltung nicht registriert.
+    #[test]
+    fn test_agents_build_is_withheld_outside_the_parent_authority() -> TestResult {
+        let dir = tempfile::tempdir().map_err(ctx("Tempdir anlegen"))?;
+        let ir = builder_ir()?;
+        let result = super::agent_build_provider_for(
+            Some(ir.tool_surface()),
+            &PermissionSet::from_policy([Permission::ReadWorkspace]),
+            Some(job_manager(dir.path())?),
+        );
+        assert!(matches!(
+            result,
+            Err(super::AgentBuildWithheld::OutsideAuthority)
+        ));
+        Ok(())
+    }
+
+    /// Keine eingebaute Rolle bekommt `agents.build` — weder ohne
+    /// Definition (`None`) noch über ihre eingebaute Werkzeugoberfläche,
+    /// selbst mit vollen Rechten und Job-Verwaltung.
+    #[test]
+    fn test_builtin_roles_never_get_agents_build() -> TestResult {
+        let dir = tempfile::tempdir().map_err(ctx("Tempdir anlegen"))?;
+        let manager = job_manager(dir.path())?;
+        let permissions = PermissionSet::from_policy([
+            Permission::ReadWorkspace,
+            Permission::WriteWorkspace,
+            Permission::ExecuteProcess,
+        ]);
+        assert!(matches!(
+            super::agent_build_provider_for(None, &permissions, Some(Arc::clone(&manager))),
+            Err(super::AgentBuildWithheld::NoExplicitDefinition)
+        ));
+        let builtin =
+            crate::embedded_agents::builtin_agent_definitions(&std::collections::HashMap::new())
+                .map_err(ctx("eingebaute Definitionen"))?;
+        for (role, ir) in &builtin {
+            let result = super::agent_build_provider_for(
+                Some(ir.tool_surface()),
+                &permissions,
+                Some(Arc::clone(&manager)),
+            );
+            assert!(
+                matches!(result, Err(super::AgentBuildWithheld::NotAdmitted)),
+                "{role} darf agents.build nicht bekommen"
+            );
+        }
+        Ok(())
+    }
+
+    /// Ein `agents.build`-Aufruf erzeugt eine Freigabe-Anfrage wie
+    /// `shell.exec` — unter `ask` und `auto` (ohne Regel).
+    #[tokio::test]
+    async fn test_agents_build_call_produces_an_approval_request() -> TestResult {
+        use harw_extension_api::approval_mode::ApprovalModeCell;
+        use harw_extension_api::{ApprovalDecision, ApprovalHandler, ApprovalMode};
+
+        let call = build_call(serde_json::json!({ "name_or_path": "builder" }));
+        for mode in [ApprovalMode::AlwaysAsk, ApprovalMode::Delegated] {
+            let policy = crate::DefaultApprovalPolicy::new(ApprovalModeCell::new(mode));
+            let decision = policy.review(&call).await;
+            assert!(
+                matches!(decision, ApprovalDecision::AskUser(_)),
+                "agents.build muss unter {mode:?} nachfragen, war {decision:?}"
+            );
+        }
+        Ok(())
+    }
 }
 
 #[cfg(test)]

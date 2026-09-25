@@ -529,64 +529,69 @@ mod tests {
     }
 
     #[test]
-    fn parent_to_child_task_roundtrips() {
+    fn parent_to_child_task_roundtrips() -> TestResult {
         roundtrip(ParentToChild::Task {
             task: "review the PR".to_owned(),
             context: Some(serde_json::json!({"pr": 42})),
             continue_from: None,
-        });
+        })?;
+        roundtrip(ParentToChild::Task {
+            task: "go on".to_owned(),
+            context: None,
+            continue_from: Some("session-token".to_owned()),
+        })
     }
 
     #[test]
-    fn parent_to_child_every_variant_roundtrips() {
+    fn parent_to_child_every_variant_roundtrips() -> TestResult {
         roundtrip(ParentToChild::Message {
             text: "hurry up".to_owned(),
-        });
+        })?;
         roundtrip(ParentToChild::Answer {
             question_id: "appr-1".to_owned(),
             text: "approve".to_owned(),
-        });
-        roundtrip(ParentToChild::Cancel);
+        })?;
+        roundtrip(ParentToChild::Cancel)?;
         roundtrip(ParentToChild::Budget {
             max_tokens: Some(1_000),
             max_tool_calls: None,
             max_wall_time_ms: Some(60_000),
-        });
+        })?;
         roundtrip(ParentToChild::Mode {
             mode: ChildMode::Live,
-        });
+        })?;
         roundtrip(ParentToChild::Rights {
             rights: ChildRights {
                 tools: BTreeSet::from(["fs.read".to_owned()]),
                 write: false,
                 ..Default::default()
             },
-        });
+        })
     }
 
     #[test]
-    fn child_to_parent_hello_roundtrips() {
+    fn child_to_parent_hello_roundtrips() -> TestResult {
         roundtrip(ChildToParent::Hello {
             agent_id: "evidence-critic".to_owned(),
             protocol: PROTOCOL_VERSION.to_owned(),
             digest: "blake3:deadbeef".to_owned(),
-        });
+        })
     }
 
     #[test]
-    fn child_to_parent_every_variant_roundtrips() {
+    fn child_to_parent_every_variant_roundtrips() -> TestResult {
         roundtrip(ChildToParent::Event {
             sdk_event: serde_json::json!({"kind": "message", "text": "hi"}),
-        });
+        })?;
         roundtrip(ChildToParent::Question {
             id: "q-1".to_owned(),
             text: "which file?".to_owned(),
-        });
+        })?;
         roundtrip(ChildToParent::ApprovalRequest {
             id: "appr-1".to_owned(),
             tool: "fs.write".to_owned(),
             args_summary: "write 12 lines to src/lib.rs".to_owned(),
-        });
+        })?;
         roundtrip(ChildToParent::Result {
             status: ChildResultStatus::Completed,
             text: Some("done".to_owned()),
@@ -597,25 +602,43 @@ mod tests {
                 tool_calls: 2,
                 wall_time_ms: 1_500,
             },
-        });
+            continuation: None,
+        })?;
+        roundtrip(ChildToParent::Result {
+            status: ChildResultStatus::BudgetExhausted,
+            text: Some("partial".to_owned()),
+            usage: ChildUsage::default(),
+            continuation: Some("session-token".to_owned()),
+        })?;
         roundtrip(ChildToParent::Usage {
             usage: ChildUsage::default(),
-        });
+        })?;
         roundtrip(ChildToParent::Error {
             message: "boom".to_owned(),
-        });
+        })
+    }
+
+    #[test]
+    fn result_without_continuation_field_still_decodes() -> TestResult {
+        let frame: ChildToParent =
+            decode_line(r#"{"type":"result","status":"completed","text":"ok"}"#)?;
+        match frame {
+            ChildToParent::Result { continuation, .. } => assert_eq!(continuation, None),
+            other => return Err(format!("unexpected frame: {other:?}").into()),
+        }
+        Ok(())
     }
 
     #[test]
     fn decode_rejects_malformed_json() {
-        let error = decode_line::<ChildToParent>("not json").unwrap_err();
-        assert!(matches!(error, ProtocolError::Malformed(_)));
+        let result = decode_line::<ChildToParent>("not json");
+        assert!(matches!(result, Err(ProtocolError::Malformed(_))));
     }
 
     #[test]
     fn decode_rejects_unknown_tag() {
-        let error = decode_line::<ChildToParent>(r#"{"type":"not_a_real_frame"}"#).unwrap_err();
-        assert!(matches!(error, ProtocolError::Malformed(_)));
+        let result = decode_line::<ChildToParent>(r#"{"type":"not_a_real_frame"}"#);
+        assert!(matches!(result, Err(ProtocolError::Malformed(_))));
     }
 
     #[test]
@@ -625,26 +648,26 @@ mod tests {
 
     #[test]
     fn verify_protocol_rejects_mismatch() {
-        let error = verify_protocol("harwness.agent-child/v2").unwrap_err();
-        match error {
-            ProtocolError::VersionMismatch { expected, got } => {
-                assert_eq!(expected, PROTOCOL_VERSION);
-                assert_eq!(got, "harwness.agent-child/v2");
-            }
-            other => panic!("unexpected: {other:?}"),
-        }
+        let result = verify_protocol("harwness.agent-child/v2");
+        assert_eq!(
+            result,
+            Err(ProtocolError::VersionMismatch {
+                expected: PROTOCOL_VERSION.to_owned(),
+                got: "harwness.agent-child/v2".to_owned(),
+            })
+        );
     }
 
     #[test]
-    fn hello_serializes_with_a_type_tag() {
+    fn hello_serializes_with_a_type_tag() -> TestResult {
         let line = encode_line(&ChildToParent::Hello {
             agent_id: "a".to_owned(),
             protocol: PROTOCOL_VERSION.to_owned(),
             digest: "d".to_owned(),
-        })
-        .expect("encode");
-        let value: serde_json::Value = serde_json::from_str(line.trim_end()).expect("parse");
+        })?;
+        let value: serde_json::Value = serde_json::from_str(line.trim_end())?;
         assert_eq!(value["type"], "hello");
+        Ok(())
     }
 
     #[test]
@@ -692,5 +715,66 @@ mod tests {
     #[test]
     fn test_json_nesting_too_deep_unbalanced_closing_brackets_do_not_underflow() {
         assert!(!json_nesting_too_deep("]]]]]]", 0));
+    }
+
+    #[tokio::test]
+    async fn frame_reader_splits_lines_and_returns_a_final_unterminated_one() -> TestResult {
+        let input: &[u8] = b"one\ntwo\r\nthree";
+        let mut reader = FrameReader::new(input);
+        assert_eq!(reader.next_frame().await?.as_deref(), Some("one"));
+        assert_eq!(reader.next_frame().await?.as_deref(), Some("two\r"));
+        assert_eq!(reader.next_frame().await?.as_deref(), Some("three"));
+        assert_eq!(reader.next_frame().await?, None);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn frame_reader_accepts_a_line_of_exactly_the_limit() -> TestResult {
+        let input = format!("{}\n", "a".repeat(8));
+        let mut reader = FrameReader::with_limit(input.as_bytes(), 8);
+        assert_eq!(reader.next_frame().await?.map(|line| line.len()), Some(8));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn frame_reader_refuses_a_line_over_the_limit() {
+        let input = format!("{}\nnext\n", "a".repeat(9));
+        let mut reader = FrameReader::with_limit(input.as_bytes(), 8);
+        let result = reader.next_frame().await;
+        assert!(
+            matches!(result, Err(FrameReadError::TooLarge { limit: 8 })),
+            "{result:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn frame_reader_refuses_an_oversized_line_split_across_reads() {
+        // A tiny `BufReader` capacity forces the line through several
+        // `fill_buf` rounds, so the limit must hold across chunks, not only
+        // within one.
+        let input = "a".repeat(64);
+        let buffered = tokio::io::BufReader::with_capacity(4, input.as_bytes());
+        let mut reader = FrameReader::with_limit(buffered, 16);
+        let result = reader.next_frame().await;
+        assert!(
+            matches!(result, Err(FrameReadError::TooLarge { limit: 16 })),
+            "{result:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn frame_reader_rejects_invalid_utf8() {
+        let input: &[u8] = b"\xff\xfe\n";
+        let mut reader = FrameReader::new(input);
+        let result = reader.next_frame().await;
+        assert!(
+            matches!(result, Err(FrameReadError::InvalidUtf8)),
+            "{result:?}"
+        );
+    }
+
+    #[test]
+    fn max_frame_bytes_is_one_mebibyte() {
+        assert_eq!(MAX_FRAME_BYTES, 1024 * 1024);
     }
 }

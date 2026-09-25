@@ -2360,6 +2360,12 @@ pub struct ManagedAgentSpawner {
     /// the in-process session below. `None` (the default) keeps every
     /// existing behavior unchanged.
     child_backend: Option<Arc<dyn crate::child_backend::ChildBackend>>,
+    /// Freigabemodus der Wurzel dieses Baums (dieselbe Zelle, der die
+    /// Kind-Ketten über `ApprovalModeCell::follower` folgen). Liest er
+    /// [`harw_extension_api::ApprovalMode::FullAccess`], bekommt ein über [`Self::child_backend`]
+    /// laufendes Kind `full_access` (siehe [`Self::backend_rights`]).
+    /// `None` = fail-closed: nie automatische Freigabe.
+    approval_mode: Option<harw_extension_api::approval_mode::ApprovalModeCell>,
 }
 
 /// Ein archivierter, ungekürzter Antworttext eines abgeschlossenen
@@ -3091,6 +3097,7 @@ impl ManagedAgentSpawner {
             child_approvals: Arc::new(crate::child_approval::ChildApprovalRelay::default()),
             // Wave 3, part 3C.
             child_backend: None,
+            approval_mode: None,
         }
     }
 
@@ -3106,6 +3113,21 @@ impl ManagedAgentSpawner {
         backend: Arc<dyn crate::child_backend::ChildBackend>,
     ) -> Self {
         self.child_backend = Some(backend);
+        self
+    }
+
+    /// Binds the approval-mode cell of this tree's root: while it reads
+    /// [`harw_extension_api::ApprovalMode::FullAccess`], a child run through
+    /// [`Self::with_child_backend`] gets
+    /// [`crate::child_backend::ChildBackendRights::full_access`] — the same
+    /// "no confirmations" an in-process child gets through its follower
+    /// cell. Without a cell a backend-run child never auto-approves.
+    #[must_use]
+    pub fn with_approval_mode(
+        mut self,
+        mode: harw_extension_api::approval_mode::ApprovalModeCell,
+    ) -> Self {
+        self.approval_mode = Some(mode);
         self
     }
 

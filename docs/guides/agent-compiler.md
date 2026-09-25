@@ -294,31 +294,46 @@ only change a restricted-but-open switch needs. See
 
 A compiled binary's bundle can hold more than the root agent (the
 delegation closure). `[binary] child_execution` decides how the root runs
-those children: `"job"` (the default) means each child is meant to run as
-its own OS process; `"in-process"` keeps the legacy in-process spawner, the
-same way harw itself always runs its children. A child process is started
-as `harw-agent-runner --child <agent-id> --child-protocol
-harwness.agent-child/v1`, speaking that JSON-lines protocol on its own
-stdio (stderr stays plain logs, never a protocol frame) — see
+those children: `"job"` (the default) means each child runs as its own OS
+process; `"in-process"` keeps the legacy in-process spawner, the same way
+harw itself always runs its children. A child process is started as
+`harw-agent-runner --child <agent-id> --child-protocol stdio` and speaks
+the JSON-lines protocol `harwness.agent-child/v1` on its own stdio
+(stderr stays plain logs, never a protocol frame). `stdio` is only the
+transport label; the protocol version is checked in the child's first
+frame (`Hello`). See
 [`agent-child-protocol-v1.md`](../design/agent-child-protocol-v1.md) for
-every frame. A child's effective rights are `min(its own manifest, the
-parent's current rights)`, applied once the parent's `Rights` frame
-arrives; a parent can only narrow a child below its own manifest, never
-grant it more.
+every frame.
+
+The parent sends `Rights`, then `Budget` (if the run has one), then
+`Mode`, then `Task`. `Rights` is mandatory: a child that receives `Task`
+first answers with an `Error` frame and exits. A child's effective rights
+are `its own manifest ∩ the runner flags ∩ the parent's Rights frame`, and
+the parent sends the child's real current rights (#22 wave 6); every
+boolean right, `full_access` included, is AND'd at each step. The result
+is applied to the child's session (`EmbeddedAgent::with_rights`), so a
+parent can only narrow a child below its own manifest, never grant it
+more. A `Budget` frame likewise only tightens the child's budget (wall
+time travels in milliseconds and becomes whole seconds in the child).
+`live` mode runs the child's session in work mode. A resumed run
+(`continue_from`) is not supported by a child process and ends with an
+`Error` frame. Each protocol line is bounded: at most 64 levels of JSON
+nesting, and (#22 wave 6) at most `MAX_FRAME_BYTES` (1 MiB).
 
 `harw-agent-runner` ships the process-driving side of this
 (`JobChildBackend`, tested standalone against real spawned processes:
 hello/result, two crash shapes, the job-managed path and cancel) and the
-child-process side (`crate::child::run_child`). For a compiled root
-agent the wiring is automatic: when `RunnerContext::builder` assembles
-the embedded runtime and the definition's `[binary].child_execution` is
-`"job"` (the default) and the process is not itself a `--child` run, it
-sets the job-backed child backend on the assembly, so a root agent's own
-delegation starts each child as a separate runner process speaking
-`harwness.agent-child/v1` — no explicit `--child` invocation needed. The
-seam is `RuntimeSpec::child_backend` (`harw-runtime/src/assembly.rs`
-passes it through to the `ManagedAgentSpawner`); `[binary]
-child_execution = "in-process"` keeps the legacy in-process spawner.
+child-process side (`crate::child::run_child`). The wiring is automatic:
+when `RunnerContext::builder` assembles the embedded runtime and the
+current agent's `[binary].child_execution` is `"job"` (the default), it
+sets the job-backed child backend, so a root agent's own delegation
+starts each child as a separate runner process — no explicit `--child`
+invocation needed. A `--child` process runs its agent as the embedded
+root, so a child that delegates further starts its own children the same
+way. The seam is `RuntimeSpec::child_backend`
+(`harw-runtime/src/assembly.rs` passes it through to the
+`ManagedAgentSpawner`); `[binary] child_execution = "in-process"` keeps
+the legacy in-process spawner.
 
 ### Inspect a binary
 

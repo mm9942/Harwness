@@ -1183,7 +1183,10 @@ fn empty_response(status: StatusCode) -> HttpResponse {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use hyper::header::{AUTHORIZATION, ORIGIN};
     use std::sync::atomic::AtomicBool;
+
+    type TestResult = Result<(), Box<dyn std::error::Error>>;
 
     /// A [`PromptRunner`] double that returns a canned outcome, records
     /// whether a cancel closure was registered, and lets tests simulate a
@@ -1235,7 +1238,7 @@ mod tests {
             }
             self.outcome
                 .lock()
-                .unwrap()
+                .unwrap_or_else(|e| e.into_inner())
                 .take()
                 .unwrap_or_else(|| Err("outcome already taken".to_owned()))
         }
@@ -1261,28 +1264,31 @@ mod tests {
     fn no_emit(_: Value) {}
 
     #[test]
-    fn initialize_advertises_the_protocol_version_and_server_info() {
+    fn initialize_advertises_the_protocol_version_and_server_info() -> TestResult {
         let server = McpServer::with_config(test_config(), FakeRunner::echoing("hi"));
         let request = json!({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}});
         let response = server
             .handle_message(&request, &mut no_emit)
-            .expect("a response");
+            .ok_or("a response")?;
         assert_eq!(response["id"], json!(1));
         assert_eq!(
             response["result"]["protocolVersion"],
             json!(MCP_PROTOCOL_VERSION)
         );
         assert_eq!(response["result"]["serverInfo"]["name"], json!(SERVER_NAME));
+        Ok(())
     }
 
     #[test]
-    fn tools_list_exposes_run_status_and_cancel_using_the_root_ir() {
+    fn tools_list_exposes_run_status_and_cancel_using_the_root_ir() -> TestResult {
         let server = server_with(FakeRunner::echoing("hi"));
         let request = json!({"jsonrpc": "2.0", "id": 2, "method": "tools/list"});
         let response = server
             .handle_message(&request, &mut no_emit)
-            .expect("a response");
-        let tools = response["result"]["tools"].as_array().expect("tools array");
+            .ok_or("a response")?;
+        let tools = response["result"]["tools"]
+            .as_array()
+            .ok_or("tools array")?;
         let names: Vec<&str> = tools
             .iter()
             .map(|tool| tool["name"].as_str().unwrap_or_default())
@@ -1299,10 +1305,11 @@ mod tests {
             prompt_description.contains("demo-agent"),
             "prompt schema should mention the agent name: {prompt_description}"
         );
+        Ok(())
     }
 
     #[test]
-    fn tools_call_run_with_the_offline_echo_returns_the_text() {
+    fn tools_call_run_with_the_offline_echo_returns_the_text() -> TestResult {
         let server = server_with(FakeRunner::echoing("echoed reply"));
         let request = json!({
             "jsonrpc": "2.0",
@@ -1312,7 +1319,7 @@ mod tests {
         });
         let response = server
             .handle_message(&request, &mut no_emit)
-            .expect("a response");
+            .ok_or("a response")?;
         let content = &response["result"]["content"][0]["text"];
         assert_eq!(content, "echoed reply");
         assert_eq!(
@@ -1323,12 +1330,13 @@ mod tests {
             response["result"]["structuredContent"]["tool_calls"],
             json!(0)
         );
+        Ok(())
     }
 
     #[test]
-    fn tools_call_run_reports_denied_approvals_without_full_access() {
+    fn tools_call_run_reports_denied_approvals_without_full_access() -> TestResult {
         let runner = FakeRunner::echoing("done");
-        *runner.outcome.lock().unwrap() = Some(Ok(PromptOutcome {
+        *runner.outcome.lock().map_err(|_| "poisoned lock")? = Some(Ok(PromptOutcome {
             status: "completed",
             text: Some("done".to_owned()),
             input_tokens: 1,
@@ -1345,7 +1353,7 @@ mod tests {
         });
         let response = server
             .handle_message(&request, &mut no_emit)
-            .expect("a response");
+            .ok_or("a response")?;
         let text = response["result"]["content"][0]["text"]
             .as_str()
             .unwrap_or_default();
@@ -1354,20 +1362,22 @@ mod tests {
             response["result"]["structuredContent"]["approvals_denied"],
             json!(true)
         );
+        Ok(())
     }
 
     #[test]
-    fn unknown_method_returns_method_not_found() {
+    fn unknown_method_returns_method_not_found() -> TestResult {
         let server = server_with(FakeRunner::echoing("hi"));
         let request = json!({"jsonrpc": "2.0", "id": 5, "method": "not/a/real/method"});
         let response = server
             .handle_message(&request, &mut no_emit)
-            .expect("a response");
+            .ok_or("a response")?;
         assert_eq!(response["error"]["code"], json!(-32601));
+        Ok(())
     }
 
     #[test]
-    fn background_run_can_be_cancelled_via_the_cancel_tool() {
+    fn background_run_can_be_cancelled_via_the_cancel_tool() -> TestResult {
         let runner = FakeRunner::blocking();
         let cancelled = Arc::clone(&runner.cancelled);
         let server = server_with(runner);
@@ -1380,10 +1390,10 @@ mod tests {
         });
         let started = server
             .handle_message(&start, &mut no_emit)
-            .expect("a response");
+            .ok_or("a response")?;
         let run_id = started["result"]["run_id"]
             .as_str()
-            .expect("run_id in background start response")
+            .ok_or("run_id in background start response")?
             .to_owned();
         assert_eq!(started["result"]["status"], json!("running"));
 
@@ -1396,7 +1406,7 @@ mod tests {
         });
         let status_response = server
             .handle_message(&status, &mut no_emit)
-            .expect("a response");
+            .ok_or("a response")?;
         assert_eq!(status_response["result"]["status"], json!("running"));
 
         let cancel = json!({
@@ -1407,7 +1417,7 @@ mod tests {
         });
         let cancel_response = server
             .handle_message(&cancel, &mut no_emit)
-            .expect("a response");
+            .ok_or("a response")?;
         assert!(cancel_response.get("error").is_none(), "{cancel_response}");
 
         // Give the background thread a moment to observe the cancellation
@@ -1422,10 +1432,11 @@ mod tests {
             cancelled.load(Ordering::SeqCst),
             "cancel closure should run"
         );
+        Ok(())
     }
 
     #[test]
-    fn status_for_an_unknown_run_id_is_an_error() {
+    fn status_for_an_unknown_run_id_is_an_error() -> TestResult {
         let server = server_with(FakeRunner::echoing("hi"));
         let request = json!({
             "jsonrpc": "2.0",
@@ -1435,8 +1446,30 @@ mod tests {
         });
         let response = server
             .handle_message(&request, &mut no_emit)
-            .expect("a response");
+            .ok_or("a response")?;
         assert_eq!(response["error"]["code"], json!(-32602));
+        Ok(())
+    }
+
+    #[test]
+    fn an_over_deep_stdio_line_is_a_parse_error_and_the_loop_continues() -> TestResult {
+        let server = server_with(FakeRunner::echoing("hi"));
+        let depth = crate::child_protocol::MAX_JSON_NESTING_DEPTH + 1;
+        let input = format!(
+            "{}{}\n{}\n",
+            "[".repeat(depth),
+            "]".repeat(depth),
+            json!({"jsonrpc": "2.0", "id": 10, "method": "ping"})
+        );
+        let mut output: Vec<u8> = Vec::new();
+        server.serve_stdio(input.as_bytes(), &mut output);
+        let text = String::from_utf8(output)?;
+        let mut lines = text.lines();
+        let first: Value = serde_json::from_str(lines.next().ok_or("a parse error line")?)?;
+        assert_eq!(first["error"]["code"], json!(-32700));
+        let second: Value = serde_json::from_str(lines.next().ok_or("a ping response")?)?;
+        assert_eq!(second["id"], json!(10));
+        Ok(())
     }
 
     // ── HTTP transport: in-process dispatch, no real socket ─────────────
@@ -1450,45 +1483,50 @@ mod tests {
         }
     }
 
-    async fn body_bytes(response: HttpResponse) -> Value {
-        let bytes = response
-            .into_body()
-            .collect()
-            .await
-            .expect("in-memory body always resolves")
-            .to_bytes();
+    async fn body_json(response: HttpResponse) -> Result<Value, Box<dyn std::error::Error>> {
+        let bytes = response.into_body().collect().await?.to_bytes();
         if bytes.is_empty() {
-            Value::Null
+            Ok(Value::Null)
         } else {
-            serde_json::from_slice(&bytes).expect("handlers return JSON when a body is present")
+            Ok(serde_json::from_slice(&bytes)?)
         }
     }
 
-    fn bearer(token: &str) -> HeaderMap {
+    fn bearer(token: &str) -> Result<HeaderMap, Box<dyn std::error::Error>> {
         let mut headers = HeaderMap::new();
         headers.insert(
             AUTHORIZATION,
-            HeaderValue::from_str(&format!("Bearer {token}")).unwrap(),
+            HeaderValue::from_str(&format!("Bearer {token}"))?,
         );
-        headers
+        Ok(headers)
+    }
+
+    // The bind policy itself is unit tested in `iface::net`; these only pin
+    // the MCP transport's use of it (and its error wording).
+    const SURFACE: &str = "the MCP Streamable HTTP interface";
+
+    #[test]
+    fn non_loopback_bind_without_token_is_refused() -> TestResult {
+        let addr: SocketAddr = "0.0.0.0:8787".parse()?;
+        let error = validate_listen_requirements(addr, None, SURFACE)
+            .err()
+            .ok_or("expected a refusal")?;
+        assert!(error.contains("MCP"), "{error}");
+        Ok(())
     }
 
     #[test]
-    fn non_loopback_bind_without_token_is_refused() {
-        let addr: SocketAddr = "0.0.0.0:8787".parse().unwrap();
-        assert!(validate_listen_requirements(addr, None).is_err());
+    fn non_loopback_bind_with_token_is_allowed() -> TestResult {
+        let addr: SocketAddr = "0.0.0.0:8787".parse()?;
+        assert!(validate_listen_requirements(addr, Some("secret"), SURFACE).is_ok());
+        Ok(())
     }
 
     #[test]
-    fn non_loopback_bind_with_token_is_allowed() {
-        let addr: SocketAddr = "0.0.0.0:8787".parse().unwrap();
-        assert!(validate_listen_requirements(addr, Some("secret")).is_ok());
-    }
-
-    #[test]
-    fn loopback_bind_without_token_is_allowed() {
-        let addr: SocketAddr = "127.0.0.1:8787".parse().unwrap();
-        assert!(validate_listen_requirements(addr, None).is_ok());
+    fn loopback_bind_without_token_is_allowed() -> TestResult {
+        let addr: SocketAddr = "127.0.0.1:8787".parse()?;
+        assert!(validate_listen_requirements(addr, None, SURFACE).is_ok());
+        Ok(())
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1522,7 +1560,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn tools_list_with_the_matching_session_id_succeeds() {
+    async fn tools_list_with_the_matching_session_id_succeeds() -> TestResult {
         let state = test_http_state(None);
         let init = json!({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}});
         let init_response =
@@ -1531,40 +1569,43 @@ mod tests {
             .headers()
             .get(&SESSION_HEADER)
             .and_then(|value| value.to_str().ok())
-            .expect("session id header")
+            .ok_or("session id header")?
             .to_owned();
 
         let mut headers = HeaderMap::new();
-        headers.insert(SESSION_HEADER, HeaderValue::from_str(&session_id).unwrap());
+        headers.insert(SESSION_HEADER, HeaderValue::from_str(&session_id)?);
         let request = json!({"jsonrpc": "2.0", "id": 2, "method": "tools/list"});
         let response = dispatch_http(&state, &Method::POST, "/mcp", &headers, request).await;
         assert_eq!(response.status(), StatusCode::OK);
-        let value = body_bytes(response).await;
+        let value = body_json(response).await?;
         assert!(value["result"]["tools"].is_array());
+        Ok(())
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn wrong_token_yields_401() {
+    async fn wrong_token_yields_401() -> TestResult {
         let state = test_http_state(Some("correct-token"));
         let request = json!({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}});
         let response =
-            dispatch_http(&state, &Method::POST, "/mcp", &bearer("wrong"), request).await;
+            dispatch_http(&state, &Method::POST, "/mcp", &bearer("wrong")?, request).await;
         assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        Ok(())
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn correct_token_is_accepted() {
+    async fn correct_token_is_accepted() -> TestResult {
         let state = test_http_state(Some("correct-token"));
         let request = json!({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}});
         let response = dispatch_http(
             &state,
             &Method::POST,
             "/mcp",
-            &bearer("correct-token"),
+            &bearer("correct-token")?,
             request,
         )
         .await;
         assert_eq!(response.status(), StatusCode::OK);
+        Ok(())
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1592,17 +1633,20 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn a_loopback_origin_is_accepted() {
-        let state = test_http_state(None);
-        let mut headers = HeaderMap::new();
-        headers.insert(ORIGIN, HeaderValue::from_static("http://localhost:5173"));
-        let request = json!({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}});
-        let response = dispatch_http(&state, &Method::POST, "/mcp", &headers, request).await;
-        assert_eq!(response.status(), StatusCode::OK);
+    async fn loopback_origins_are_accepted() {
+        for origin in ["http://localhost:5173", "http://[::1]:8787"] {
+            let state = test_http_state(None);
+            let mut headers = HeaderMap::new();
+            headers.insert(ORIGIN, HeaderValue::from_static(origin));
+            let request =
+                json!({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}});
+            let response = dispatch_http(&state, &Method::POST, "/mcp", &headers, request).await;
+            assert_eq!(response.status(), StatusCode::OK, "{origin}");
+        }
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn sse_accept_header_returns_an_event_stream_body() {
+    async fn sse_accept_header_returns_an_event_stream_body() -> TestResult {
         let state = test_http_state(None);
         let mut headers = HeaderMap::new();
         headers.insert(
@@ -1619,14 +1663,10 @@ mod tests {
                 .and_then(|v| v.to_str().ok()),
             Some("text/event-stream")
         );
-        let bytes = response
-            .into_body()
-            .collect()
-            .await
-            .expect("in-memory body always resolves")
-            .to_bytes();
+        let bytes = response.into_body().collect().await?.to_bytes();
         let text = String::from_utf8_lossy(&bytes);
         assert!(text.contains("event: message"), "got: {text}");
         assert!(text.contains("\"protocolVersion\""), "got: {text}");
+        Ok(())
     }
 }
