@@ -17,7 +17,14 @@ stages, not in new crates.
 > agent to a standalone binary adds `harw-agent-artifact`,
 > `harw-agent-compiler` and `harw-agent-runner`. The IR itself stays in
 > `harw-agent-dsl` and becomes serializable and fully typed as **IR v2**
-> (§6).
+> (§6). **Wave 3** (#22) lands the runner's own interfaces and the child
+> protocol against this IR without changing it further: `Binary` gains
+> `child_execution` (§6.1) and `Permissions` is read by
+> `harw_runtime::embedded::EffectiveRights::from_manifest`, the one
+> conversion every runner interface narrows by command-line flags. See
+> [ADR 0001](../adr/0001-agent-compiler.md)'s "Wave 3 consequences" section
+> for what still only partly reads this IR (the child protocol's own,
+> best-effort rights mapping has not yet been replaced by that conversion).
 
 ---
 
@@ -151,8 +158,9 @@ nothing less.
 ## 6. IR v2 — serializable and fully typed
 
 > Status: IR v2, the diagnostics catalog and snapshot hash v7 land in wave 1
-> of #22. The compiler passes in §6.4 and the backends are **planned in
-> #22** (waves 2–3). Decision record: [ADR 0001](../adr/0001-agent-compiler.md).
+> of #22. The compiler passes in §6.4 land in wave 2; the two backends and
+> the runner's own interfaces land in wave 3. Decision record:
+> [ADR 0001](../adr/0001-agent-compiler.md).
 
 The fourth stage of §1 gets a successor. `ExecutableAgentIr` was an
 in-memory struct without serde, and several tables of a definition were
@@ -187,7 +195,7 @@ silently ignored key. Its sections are typed:
 | `Models` | preferred provider, model and effort; fallbacks; required environment variables (DSL `[models]`) |
 | `Limits`, `Work`, `Verification` | the corresponding DSL tables, typed |
 | `Skills` | skill names with a content hash each |
-| `Binary` | name, interfaces (`cli`, `repl`, `mcp`, `http`, `tui`), default interface (DSL `[binary]`) |
+| `Binary` | name, interfaces (`cli`, `repl`, `mcp`, `http`, `tui`), default interface, `child_execution` (`job`, the default, or `in-process`; DSL `[binary]`) |
 | `Permissions` | the rights manifest: tools, network hosts and modes, write paths, shell, host access, budgets |
 
 `lower_v2(resolved, sources) -> Result<AgentIr, Diagnostics>` lowers every

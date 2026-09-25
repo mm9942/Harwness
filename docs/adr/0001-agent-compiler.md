@@ -15,9 +15,13 @@ considered*. A later ADR that changes this decision supersedes it by number;
 this file is then marked `superseded by ADR NNNN` and otherwise left as is.
 
 Implementation status: IR v2, the diagnostics catalog and the merge fixes
-land in wave 1 of #22. The artifact crate, the compiler, the runner and the
-`harw agent check|build|inspect|run` commands are **planned in #22**
-(waves 2–4) and are described here as decided, not as shipped.
+land in wave 1 of #22. The artifact crate, the compiler and the
+`harw agent check|build|inspect|run` commands land in wave 2. The runner's
+own interfaces (`cli`, `repl`, `mcp` over stdio, `http`, the mini `tui`)
+and the child protocol between a compiled binary and its delegated
+children land in wave 3 — see "Wave 3 consequences" in §3 for what wave 3
+changed against what this record originally decided, and what it still
+leaves half-wired.
 
 ---
 
@@ -199,6 +203,46 @@ multi-backend executor. This ADR **amends both sections**:
   covered by golden tests; tests never run cargo on it.
 - **Reproducible builds.** The same definition, sources and compiler
   version give the same artifact bytes and hash.
+
+### 3.1 Wave 3 consequences
+
+Wave 3 built the runner this record described in §2.5–§2.6 and, along the
+way, made two decisions this record did not anticipate:
+
+- **`[binary] child_execution`.** §2.5 said nothing about how a compiled
+  binary runs the children it can delegate to; wave 3 adds a `Binary`
+  field (`"job"`, the default, or `"in-process"`) and a matching wire
+  protocol, `harwness.agent-child/v1`
+  ([`agent-child-protocol-v1.md`](../design/agent-child-protocol-v1.md)):
+  a job-executed child is a separate `harw-agent-runner --child` process,
+  its own process group, killed as a group on cancel, with its rights
+  narrowed to `min(its own manifest, the parent's current rights)`. This
+  is additive to §2.6's `min(manifest, flags)` rule, not a change to it: a
+  child's rights are still never wider than its own manifest, only
+  possibly narrower still because of its parent.
+- **The runner's own interfaces are one crate, `cli`/`repl`/`mcp`/`http`
+  behind cargo features, `tui` reusing `harw-tui`'s existing renderer**
+  (`harw_tui::fixed_agent`) rather than a new one — §2.5 left this
+  unspecified beyond naming the five interface labels.
+
+Two pieces §2.5–§2.6 implied are not fully wired by the end of wave 3, and
+are recorded here rather than left to be rediscovered from the code:
+
+- **MCP is stdio only.** `harw-mcp-server`'s existing Streamable HTTP
+  transport is built around a durable job supervisor and tenant/workspace
+  principals a compiled, embedded single-agent runner has none of;
+  building this interface's own loopback HTTP transport instead is future
+  work, not a wave-3 regression.
+- **`child_execution = "job"` is not yet automatic.** The process-driving
+  side (`harw-agent-runner::job_child_backend::JobChildBackend`) and the
+  child-process side (`harw-agent-runner::child::run_child`) both exist and
+  are tested against a real spawned process, but nothing in
+  `harw-runtime`'s embedded assembly yet sets `RuntimeSpec::child_backend`
+  for `EntryKind::CompiledAgent`, so a root agent's own delegation does not
+  yet reach a separate process automatically — only an explicit `--child`
+  invocation exercises the protocol today. Wiring that one call site is the
+  remaining piece of §2.5's promise that a compiled binary runs its
+  children, not a new decision.
 
 ## 4. Security
 

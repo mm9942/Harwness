@@ -8,13 +8,13 @@
 > an actual task end to end today; §5 documents each one and the flags they
 > share. A few pieces of wave 3 are still being wired rather than finished:
 > the MCP interface's Streamable HTTP transport (`--listen`) is not
-> implemented, only stdio (§5.3); a child agent delegated from a compiled
+> implemented, only stdio (§5.4); a child agent delegated from a compiled
 > binary runs its own process and speaks `harwness.agent-child/v1`
 > ([spec](../design/agent-child-protocol-v1.md)), but nothing in the
 > embedded runtime yet spawns that process automatically for
 > `[binary].child_execution = "job"` runs — only `harw-agent-runner --child`
-> invoked directly exercises it; and the mini TUI's agent/model-switch
-> restriction (§5.5) is decided in code but not yet enforced by `harw-tui`'s
+> invoked directly exercises it (§5.7); and the mini TUI's agent/model-switch
+> restriction (§5.6) is decided in code but not yet enforced by `harw-tui`'s
 > command registry. See [ADR 0001](../adr/0001-agent-compiler.md) for the
 > full design and its "Wave 3 consequences" section for the exact list.
 

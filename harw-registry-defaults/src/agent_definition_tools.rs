@@ -2845,7 +2845,7 @@ mod agents_build_tests {
     #[test]
     fn test_provider_with_manager_registers_agents_build() {
         let provider = AgentBuildToolProvider {
-            starter: Some(Arc::new(FakeStarter::new("job-test-001"))),
+            starter: Some(Arc::new(FakeStarter::new("job-test-001")) as Arc<dyn AgentBuildJobStarter>),
         };
         let tools = provider.tools();
         assert_eq!(tools.len(), 1);

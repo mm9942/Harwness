@@ -1,13 +1,18 @@
 # Agent Artifact v1 — the binary format of a compiled agent
 
-> Status: proposal (planned in #22) · Last reviewed: 2026-09-25
+> Status: implemented (#22, wave 3) · Last reviewed: 2026-09-25
 
 **Decision record:** [ADR 0001](../adr/0001-agent-compiler.md).
 **Binds to:** [`agent-ir-v1.md`](agent-ir-v1.md) §6 (IR v2),
-[`agent-definition-dsl.md`](agent-definition-dsl.md) §17–§18.
-**Implemented by (planned):** `harw-agent-artifact` (`ArtifactBuilder::build`,
+[`agent-definition-dsl.md`](agent-definition-dsl.md) §17–§18,
+[`agent-child-protocol-v1.md`](agent-child-protocol-v1.md) (a delegated
+child's own process reads the same bundle, §10).
+**Implemented by:** `harw-agent-artifact` (`ArtifactBuilder::build`,
 `Artifact::from_bytes` (parses and verifies), `EmbeddedArtifact::from_path` /
-`from_current_exe`, `append_to_executable`).
+`from_current_exe`, `append_to_executable`, `bundle::Bundle::from_artifact`)
+and `harw-runtime::embedded::EmbeddedAgent::from_bundle`, which builds the
+in-memory, verified agent every `harw-agent-runner` interface runs against
+(§6, §10).
 
 An **agent artifact** is the frozen, self-contained form of one compiled
 agent: its `AgentIr` plus every file the agent reads at runtime, protected

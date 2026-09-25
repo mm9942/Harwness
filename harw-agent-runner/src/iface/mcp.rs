@@ -32,7 +32,7 @@
 //! `iface::http` and `harw-mcp-server::transport`: a handful of small,
 //! independent functions, not a shared dependency.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::convert::Infallible;
 use std::io::{BufRead, Write};
 use std::net::{IpAddr, SocketAddr};
@@ -54,6 +54,7 @@ use serde_json::{Value, json};
 use tokio::net::TcpListener;
 use tokio::task::JoinSet;
 
+use crate::child_protocol::{MAX_JSON_NESTING_DEPTH, json_nesting_too_deep};
 use crate::context::RunnerContext;
 
 /// The MCP protocol version this interface implements and advertises during
@@ -118,10 +119,19 @@ struct TrackedRun {
     cancel: Option<Box<dyn Fn() + Send + Sync>>,
 }
 
+/// Upper bound on the number of background runs [`RunRegistry`] keeps before
+/// evicting finished ones — mirrors `iface::http`'s `MAX_RUNS`/`Runs` cap, so
+/// an MCP client cannot exhaust memory (and, via `tool_run_background`'s
+/// `std::thread::spawn`, OS threads) by starting unbounded `background: true`
+/// runs and never calling `status`/`cancel`. A run still `Running` is never
+/// evicted, exactly like the HTTP interface's cap.
+const MAX_TRACKED_RUNS: usize = 64;
+
 /// Registry of background runs, keyed by a runner-issued `run_id`.
 #[derive(Default)]
 struct RunRegistry {
     next_id: AtomicU64,
+    order: Mutex<VecDeque<String>>,
     runs: Mutex<HashMap<String, TrackedRun>>,
 }
 
@@ -131,7 +141,33 @@ impl RunRegistry {
         format!("run-{n}")
     }
 
+    /// Evicts the oldest *finished* runs while the map is over
+    /// [`MAX_TRACKED_RUNS`]. A run still [`RunState::Running`] is never
+    /// evicted, even if that temporarily leaves the map over the cap (same
+    /// contract as `iface::http::Runs::evict_finished_over_cap`).
+    fn evict_finished_over_cap(&self) {
+        let mut order = self.order.lock().unwrap_or_else(|e| e.into_inner());
+        let mut runs = self.runs.lock().unwrap_or_else(|e| e.into_inner());
+        while runs.len() > MAX_TRACKED_RUNS {
+            let evictable = order
+                .iter()
+                .position(|id| runs.get(id).is_some_and(|run| run.state != RunState::Running));
+            match evictable {
+                Some(index) => {
+                    if let Some(id) = order.remove(index) {
+                        runs.remove(&id);
+                    }
+                }
+                None => break,
+            }
+        }
+    }
+
     fn insert_running(&self, id: String, cancel: Box<dyn Fn() + Send + Sync>) {
+        self.order
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push_back(id.clone());
         self.runs.lock().unwrap_or_else(|e| e.into_inner()).insert(
             id,
             TrackedRun {
@@ -140,6 +176,7 @@ impl RunRegistry {
                 cancel: Some(cancel),
             },
         );
+        self.evict_finished_over_cap();
     }
 
     fn complete(&self, id: &str, state: RunState, result: Value) {
@@ -153,6 +190,7 @@ impl RunRegistry {
             run.result = Some(result);
             run.cancel = None;
         }
+        self.evict_finished_over_cap();
     }
 
     fn status(&self, id: &str) -> Option<(RunState, Option<Value>)> {
@@ -677,13 +715,21 @@ impl McpServer {
     }
 
     /// Runs the newline-delimited JSON-RPC stdio loop until stdin closes.
+    ///
+    /// Each line is read through [`read_line_bounded`], so a peer that never
+    /// sends `\n` (or sends one absurdly long line) cannot grow `line`
+    /// without bound: [`MCP_STDIO_MAX_LINE_BYTES`] caps it, mirroring the
+    /// HTTP transport's [`MCP_MAX_BODY_BYTES`].
     fn serve_stdio<R: BufRead, W: Write>(&self, mut input: R, output: &mut W) -> ExitCode {
         let mut line = String::new();
         loop {
-            line.clear();
-            match input.read_line(&mut line) {
-                Ok(0) => break,
-                Ok(_) => {}
+            match read_line_bounded(&mut input, &mut line, MCP_STDIO_MAX_LINE_BYTES) {
+                Ok(LineOutcome::Eof) => break,
+                Ok(LineOutcome::Line) => {}
+                Ok(LineOutcome::TooLong) => {
+                    write_line(output, &error_response(None, -32700, "parse error: line too long"));
+                    continue;
+                }
                 Err(error) => {
                     eprintln!("harw-agent-runner: stdio read error: {error}");
                     return ExitCode::FAILURE;
@@ -691,6 +737,10 @@ impl McpServer {
             }
             let trimmed = line.trim();
             if trimmed.is_empty() {
+                continue;
+            }
+            if json_nesting_too_deep(trimmed, MAX_JSON_NESTING_DEPTH) {
+                write_line(output, &error_response(None, -32700, "parse error: too deeply nested"));
                 continue;
             }
             let message: Value = match serde_json::from_str(trimmed) {
@@ -714,6 +764,87 @@ fn write_line<W: Write>(output: &mut W, value: &Value) {
         let _ = writeln!(output, "{text}");
         let _ = output.flush();
     }
+}
+
+/// Upper bound on one stdio JSON-RPC line, mirroring the HTTP transport's
+/// [`MCP_MAX_BODY_BYTES`]: without it, a peer that never sends `\n` (or sends
+/// one absurdly long line) could grow `serve_stdio`'s buffer without bound —
+/// `BufRead::read_line` itself has no length cap.
+const MCP_STDIO_MAX_LINE_BYTES: usize = MCP_MAX_BODY_BYTES;
+
+/// How a bounded line read ([`read_line_bounded`]) ended.
+enum LineOutcome {
+    /// End of input; nothing was read.
+    Eof,
+    /// A complete line (within the limit) is now in the caller's buffer.
+    Line,
+    /// A line exceeded the limit. It has already been fully drained from
+    /// `input` (up to its newline, or to EOF) so the stream stays in sync;
+    /// the caller's buffer is left empty rather than holding a partial,
+    /// truncated line that could be mistaken for a complete message.
+    TooLong,
+}
+
+/// Reads one `\n`-terminated line into `line` (which is cleared first),
+/// refusing to grow it past `max_len` bytes. Unlike `BufRead::read_line`,
+/// this never buffers more than `max_len` bytes of an oversized line before
+/// reporting the problem — it keeps consuming (and discarding) bytes from
+/// `input` until the line's terminator or EOF, so the caller can resume
+/// reading the next line afterward instead of the stream being left
+/// desynchronized.
+fn read_line_bounded<R: BufRead>(
+    input: &mut R,
+    line: &mut String,
+    max_len: usize,
+) -> std::io::Result<LineOutcome> {
+    line.clear();
+    let mut buf: Vec<u8> = Vec::new();
+    let mut overflowed = false;
+    loop {
+        let available = match input.fill_buf() {
+            Ok(available) => available,
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(error) => return Err(error),
+        };
+        if available.is_empty() {
+            return Ok(finish_bounded_line(line, buf, overflowed, true));
+        }
+        if let Some(newline_at) = available.iter().position(|&byte| byte == b'\n') {
+            if !overflowed {
+                if buf.len() + newline_at <= max_len {
+                    buf.extend_from_slice(&available[..newline_at]);
+                } else {
+                    overflowed = true;
+                }
+            }
+            input.consume(newline_at + 1);
+            return Ok(finish_bounded_line(line, buf, overflowed, false));
+        }
+        if !overflowed {
+            if buf.len() + available.len() <= max_len {
+                buf.extend_from_slice(available);
+            } else {
+                overflowed = true;
+            }
+        }
+        let consumed = available.len();
+        input.consume(consumed);
+    }
+}
+
+/// Finalizes a [`read_line_bounded`] read: fills `line` from `buf` (lossily,
+/// same as any other place this crate turns untrusted bytes into a `String`
+/// for a JSON-RPC parse attempt) unless the line overflowed, in which case
+/// `line` stays empty and [`LineOutcome::TooLong`] is reported instead.
+fn finish_bounded_line(line: &mut String, buf: Vec<u8>, overflowed: bool, at_eof: bool) -> LineOutcome {
+    if overflowed {
+        return LineOutcome::TooLong;
+    }
+    if at_eof && buf.is_empty() {
+        return LineOutcome::Eof;
+    }
+    line.push_str(&String::from_utf8_lossy(&buf));
+    LineOutcome::Line
 }
 
 fn result_response(id: Option<Value>, result: Value) -> Value {
@@ -1120,6 +1251,16 @@ async fn read_json_body(
     };
     if bytes.is_empty() {
         return Ok(Value::Null);
+    }
+    // Reject a shallow-but-deeply-nested body (e.g. megabytes of `[[[[...`)
+    // before handing it to `serde_json`'s recursive-descent parser, which has
+    // no depth limit of its own and can exhaust the stack on such input —
+    // even within the `max_bytes` cap already enforced above.
+    if crate::child_protocol::json_nesting_too_deep(&bytes, crate::child_protocol::MAX_JSON_NESTING_DEPTH) {
+        return Err(json_response(
+            StatusCode::BAD_REQUEST,
+            &json!({"error": "invalid_json", "detail": "too deeply nested"}),
+        ));
     }
     serde_json::from_slice(&bytes).map_err(|_| {
         json_response(

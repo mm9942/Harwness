@@ -6,6 +6,7 @@ use crate::logs::{LogQuery, read_log};
 use crate::procfs::is_same_process_alive;
 use crate::test_support::{Env, TestError, TestResult, ctx, eventually, request};
 use std::time::Duration;
+use tokio::io::AsyncWriteExt;
 
 const LIMIT: Duration = Duration::from_secs(10);
 
@@ -482,6 +483,89 @@ async fn test_spawn_failure_is_recorded_as_failed() -> TestResult {
     assert_eq!(jobs.len(), 1);
     assert_eq!(jobs[0].meta.state, JobState::Failed);
     assert!(jobs[0].meta.launch_error.is_some());
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_start_piped_echoes_stdin_tees_stdout_and_detects_exit() -> TestResult {
+    let env = Env::new()?;
+    let prepared = env.prepare_piped(&["/bin/cat"]).await?;
+    let mut piped = env
+        .manager
+        .start_piped(request("echo", "agent-a", &[]), prepared)
+        .map_err(ctx("start_piped"))?;
+    let id = piped.job_id.clone();
+    assert_eq!(piped.status.meta.state, JobState::Running);
+
+    piped
+        .stdin
+        .write_all(b"hello\n")
+        .await
+        .map_err(ctx("write stdin"))?;
+    piped.stdin.flush().await.map_err(ctx("flush stdin"))?;
+
+    let line = tokio::time::timeout(LIMIT, piped.stdout_lines.recv())
+        .await
+        .map_err(ctx("recv timeout"))?
+        .ok_or(TestError::Missing("stdout line"))?;
+    assert_eq!(line, "hello");
+
+    // `cat` sees EOF on stdin and exits 0.
+    drop(piped.stdin);
+
+    let (outcome, status) = env
+        .manager
+        .wait(&id, Caller::Agent("agent-a"), LIMIT, None)
+        .await
+        .map_err(ctx("wait"))?;
+    assert_eq!(outcome, WaitOutcome::Finished);
+    assert_eq!(status.meta.state, JobState::Succeeded);
+    assert_eq!(status.meta.exit_code, Some(0));
+
+    let dir = env.manager.log_dir(&id, Caller::Agent("agent-a")).map_err(ctx("log dir"))?;
+    assert_eq!(read_all(&dir.join(STDOUT_LOG))?, vec!["hello".to_owned()]);
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_start_piped_stop_kills_process_group() -> TestResult {
+    let env = Env::new()?;
+    // Wie `test_stop_kills_whole_process_group`: das Kind ignoriert SIGTERM
+    // und überlebt die Shell — nur ein Signal an die ganze Gruppe trifft es.
+    // Die PID des Kindes kommt über den Zeilenstrom von `start_piped`, nicht
+    // über `STDOUT_LOG`.
+    let prepared = env
+        .prepare_piped(&[
+            "/bin/sh",
+            "-c",
+            "(trap '' TERM; exec sleep 30) & echo $!; wait",
+        ])
+        .await?;
+    let mut piped = env
+        .manager
+        .start_piped(request("group", "agent-a", &[]), prepared)
+        .map_err(ctx("start_piped"))?;
+    let id = piped.job_id.clone();
+
+    let line = tokio::time::timeout(LIMIT, piped.stdout_lines.recv())
+        .await
+        .map_err(ctx("recv timeout"))?
+        .ok_or(TestError::Missing("child pid line"))?;
+    let child_pid: u32 = line
+        .trim()
+        .parse()
+        .map_err(|_| TestError::Unexpected(format!("bad pid line: {line}")))?;
+    assert!(is_same_process_alive(child_pid, None));
+
+    let stopped = env
+        .manager
+        .stop(&id, Caller::Agent("agent-a"), JobSignal::Term)
+        .await
+        .map_err(ctx("stop"))?;
+    assert_eq!(stopped.meta.state, JobState::Stopped);
+
+    let dead = eventually(LIMIT, || !is_same_process_alive(child_pid, None)).await;
+    assert!(dead, "child {child_pid} of the piped job survived job.stop");
     Ok(())
 }
 

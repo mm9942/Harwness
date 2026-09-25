@@ -110,7 +110,10 @@ pub use registry::{
     ShellCapability,
 };
 pub use relative_time::relative_time;
-pub use runtime_root::{TuiAssemblyFactory, TuiResume, TuiRunOptions, TuiSessionWiring, run_tui};
+pub use runtime_root::{
+    FixedAgentUiRestrictions, TuiAssemblyFactory, TuiResume, TuiRunOptions, TuiSessionWiring,
+    run_tui,
+};
 pub use session_picker::{PickerAction, SessionEntry, SessionPicker};
 pub use setup::{SetupApp, SetupOutcome, SetupStage, run_setup};
 

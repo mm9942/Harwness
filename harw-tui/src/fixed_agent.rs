@@ -10,47 +10,38 @@
 //! restriction policy ([`FixedAgentOptions`]) a compiled agent needs —
 //! nothing here may fork or re-implement `crate::app`/`crate::runtime_root`.
 //!
-//! # What is actually restricted today
-//! [`run_fixed_agent`] builds and runs the assembly; it does **not** itself
-//! filter the slash-command popup or gate `/model switch`, because both are
-//! decided deep inside [`crate::app::ChatApp`] (`built_in_registry()`,
-//! private to `harw-tui/src/app.rs`) which this slice is not allowed to
-//! touch (file allowlist: only this module and the one `pub mod
-//! fixed_agent;` line in `lib.rs`). Instead this module ships the
-//! **pure, tested decision logic** a small follow-up hook in `app.rs` would
-//! call:
-//! - [`hidden_command_names`] / [`filter_command_specs`] — which commands a
-//!   fixed-agent session must not expose (UIA switch, agent selection, and a
-//!   forward-compatible slot for definition-writing commands), and a filter
-//!   over `&[CommandSpec]` a caller who owns the registry can apply.
-//! - [`allowed_models_from_ir`] / [`is_model_switch_target_allowed`] — the
-//!   manifest's model plus its fallbacks, and whether a `/model switch`
-//!   argument names one of them.
-//! - [`fixed_agent_title`] — the title-bar text (agent name + short digest).
+//! # What is restricted, and how it is wired
+//! [`run_fixed_agent`] builds the assembly, derives a
+//! [`crate::runtime_root::FixedAgentUiRestrictions`] from `opts` (and the
+//! embedded artifact's digest) and hands it to [`run_tui`] via
+//! [`crate::runtime_root::TuiRunOptions::fixed_agent`].
+//! [`crate::runtime_root::build_root_runtime`] applies it to the freshly
+//! built [`crate::app::ChatApp`] right after construction, through three
+//! builders that mirror `with_verbose_tools`'s style:
+//! - [`crate::app::ChatApp::with_hidden_commands`] — fed
+//!   [`hidden_command_names`] (UIA switch, agent selection, and a
+//!   forward-compatible slot for definition-writing commands, plus `model`
+//!   when `!opts.allow_model_switch`). Rebuilds `command_registry` with
+//!   those names removed, so neither the `/`-popup nor tab-completion offer
+//!   them; `crate::local_commands::intercept` additionally refuses them by
+//!   name before any of its own unconditional local interceptions (a bare
+//!   `/agent`, say) could otherwise run.
+//! - [`crate::app::ChatApp::with_model_switch_allowlist`] — fed
+//!   `opts.allowed_models` when `opts.allow_model_switch` (`None`
+//!   otherwise, which is moot once `hidden_command_names` has already hidden
+//!   `/model` outright). `crate::local_commands::intercept` refuses any
+//!   `/model switch <target>` whose target [`is_model_switch_target_allowed`]
+//!   rejects, restated over a plain slice
+//!   (`crate::local_commands::model_switch_target_allowed`) so that module
+//!   does not need a whole [`FixedAgentOptions`] just to check one target.
+//! - [`crate::app::ChatApp::with_title_override`] — fed [`fixed_agent_title`]
+//!   (agent name + short digest), rendered as the leading, highest-priority
+//!   segment of `harw-tui/src/status_line.rs`'s status line.
 //!
-//! **Exact spot for the missing wiring** (out of this slice's file
-//! allowlist, reported instead of touched):
-//! - `harw-tui/src/app.rs`, the three `built_in_registry()?
-//!   .with_local_specs(crate::command_catalog::local_command_specs())`
-//!   call sites (`ChatApp::with_memory`, plus the two rebuild sites used by
-//!   `/tools` and the popup refresh) need an optional restriction — e.g. a
-//!   `ChatApp::with_hidden_commands(Vec<String>)` builder, mirroring
-//!   `with_verbose_tools`, that stores the names and applies
-//!   `CommandRegistry::new(fixed_agent::filter_command_specs(registry
-//!   .specs().to_vec(), &policy))` right after each of those three
-//!   constructions.
-//! - The `/model switch` target check already validates against the
-//!   *configured model catalog* (`harw-ops/src/model.rs`); the cleanest fix
-//!   is for `harw_runtime::config::load_config_embedded` (agent 3) to build
-//!   that catalog from `opts.allowed_models` directly, so the existing
-//!   validation enforces the restriction with no `harw-tui` change at all.
-//!   `is_model_switch_target_allowed` in this module exists for a caller
-//!   that cannot rely on that and needs the same decision restated.
-//! - The title bar: `harw-tui` has no window-title or persistent-header
-//!   hook today (`app.project_root()` only ever feeds the one-shot startup
-//!   greeting in `runtime_root.rs`). The exact spot for a real fix is a new
-//!   `ChatApp::with_title_override(String)` field rendered by
-//!   `harw-tui/src/status_line.rs`'s header line.
+//! [`allowed_models_from_ir`] remains the shared source for both
+//! `opts.allowed_models` (this module's callers, e.g.
+//! `harw-agent-runner/src/iface/tui.rs`) and [`is_model_switch_target_allowed`]'s
+//! test coverage.
 
 use std::sync::Arc;
 
@@ -60,7 +51,7 @@ use harw_runtime::{ModelSource, RuntimeAssembly, RuntimeSpec, RuntimeStores};
 
 use crate::app::TuiError;
 use crate::command::CommandSpec;
-use crate::runtime_root::{TuiRunOptions, TuiSessionWiring, run_tui};
+use crate::runtime_root::{FixedAgentUiRestrictions, TuiRunOptions, TuiSessionWiring, run_tui};
 
 /// Restriction policy for a compiled agent's mini-TUI session.
 ///
@@ -248,10 +239,16 @@ pub fn fixed_agent_title(opts: &FixedAgentOptions, digest: &harw_agent_artifact:
 /// session store of its own), a fresh [`TuiSessionWiring`], and no explicit
 /// keybindings file override.
 ///
-/// `opts` is accepted so that callers (and the tests in this module) have a
-/// single, stable entry point once the `app.rs` hook this module's
-/// documentation describes lands; until then it only shapes the title text
-/// that would be applied (see the module documentation for the precise gap).
+/// `opts` shapes the [`FixedAgentUiRestrictions`] applied to [`ChatApp`] via
+/// [`TuiRunOptions::fixed_agent`]: which commands are hidden
+/// ([`hidden_command_names`]), the status-line title
+/// ([`fixed_agent_title`], falling back to `opts.title` alone when `spec`
+/// carries no `embedded` artifact to digest — not expected for a real
+/// `EntryKind::CompiledAgent` run, but kept total rather than panicking),
+/// and the `/model switch` allowlist (`opts.allowed_models` when
+/// `opts.allow_model_switch`, else `None` — `hidden_command_names` already
+/// hides `/model` outright in that case, so the allowlist is moot but kept
+/// `None` for clarity).
 ///
 /// # Arguments
 /// - `spec`: the `EntryKind::CompiledAgent` [`RuntimeSpec`] built by
@@ -270,6 +267,10 @@ pub fn fixed_agent_title(opts: &FixedAgentOptions, digest: &harw_agent_artifact:
 /// # Concurrency
 /// Blocks the calling thread, exactly like [`run_tui`].
 pub fn run_fixed_agent(spec: RuntimeSpec, opts: FixedAgentOptions) -> Result<(), TuiError> {
+    // Digested before `spec` moves into the builder below; `ArtifactDigest`
+    // is `Copy`, so this is a cheap snapshot, not a borrow.
+    let digest = spec.embedded.as_ref().map(|agent| *agent.digest());
+
     // A compiled agent binary has no `~/.harw`-style profile session store of
     // its own to persist transcripts into (wave 3 scope); the state store is
     // therefore in-memory for this slice. Wiring a durable store belongs to
@@ -288,12 +289,22 @@ pub fn run_fixed_agent(spec: RuntimeSpec, opts: FixedAgentOptions) -> Result<(),
         .build()
         .map_err(|error| TuiError::Core(format!("could not assemble the fixed-agent runtime: {error}")))?;
 
-    // `opts` is threaded through so the title/model-restriction contract is
-    // stable at this call site even though, absent the `app.rs` hook
-    // described above, it does not yet reach the renderer. Keeping it here
-    // (rather than dropping it) means the follow-up patch touches only
-    // `app.rs` and this line, not every caller of `run_fixed_agent`.
-    let _ = &opts;
+    let title = match digest.as_ref() {
+        Some(digest) => fixed_agent_title(&opts, digest),
+        None => opts.title.clone(),
+    };
+    let hidden_commands: Vec<String> = hidden_command_names(&opts)
+        .into_iter()
+        .map(|name| name.to_owned())
+        .collect();
+    let model_switch_allowlist = opts
+        .allow_model_switch
+        .then(|| opts.allowed_models.clone());
+    let restrictions = FixedAgentUiRestrictions {
+        hidden_commands,
+        title,
+        model_switch_allowlist,
+    };
 
     let wiring = TuiSessionWiring::new();
     let assembly = Arc::new(assembly);
@@ -304,6 +315,7 @@ pub fn run_fixed_agent(spec: RuntimeSpec, opts: FixedAgentOptions) -> Result<(),
             resume: None,
             verbose_tools: false,
             keybindings_path: None,
+            fixed_agent: Some(restrictions),
         },
     )
 }

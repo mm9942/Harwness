@@ -981,6 +981,91 @@ fn tighten_agent_budget(left: AgentBudget, right: AgentBudget) -> AgentBudget {
     }
 }
 
+/// Wave 3C: maps this crate's own [`AgentBudget`] (dimension-wise remaining
+/// budget, [`ManagedAgentSpawner::remaining_budget`]) onto the DSL's
+/// [`harw_agent_dsl::ir_v2::Budget`] — the shape
+/// [`crate::child_backend::ChildRunSpec::budget`] carries. `reasoning_effort`
+/// has no counterpart in that DSL type here and is dropped;
+/// `max_wall_time_ms` rounds up to whole seconds.
+fn agent_budget_to_dsl_budget(budget: AgentBudget) -> harw_agent_dsl::ir_v2::Budget {
+    harw_agent_dsl::ir_v2::Budget {
+        max_tokens: budget.max_tokens,
+        max_tool_calls: budget.max_tool_calls,
+        max_wall_secs: budget.max_wall_time_ms.map(|ms| ms.div_ceil(1_000)),
+        effort_cap: None,
+    }
+}
+
+/// Wave 3C: [`crate::child_backend::ChildIo`] for a backend-driven child —
+/// relays activity into the same progress/journal machinery a locally run
+/// child uses ([`ManagedAgentSpawner::progress_observer`]), and questions /
+/// approval requests into the existing parent relays
+/// ([`ManagedAgentSpawner::ask_parent`], [`crate::child_approval::ChildApprovalRelay`]).
+/// This keeps a compiled parent's TUI panel and `agent.status`/`agent.result`
+/// working the same regardless of where the child actually runs.
+struct ControllerChildIo<'a> {
+    spawner: &'a ManagedAgentSpawner,
+    child: SessionId,
+    role: String,
+}
+
+impl crate::child_backend::ChildIo for ControllerChildIo<'_> {
+    fn on_event(&self, event_json: serde_json::Value) {
+        let observer = self.spawner.progress_observer();
+        observer.on_progress(&self.child);
+        if let Some(text) = event_json.get("assistant_text").and_then(|v| v.as_str()) {
+            observer.on_assistant_text(&self.child, text);
+        }
+    }
+
+    fn on_question<'a>(&'a self, id: String, text: String) -> crate::child_backend::ChildAnswerFuture<'a> {
+        let spawner = self.spawner;
+        let child = self.child.clone();
+        Box::pin(async move {
+            // `id` ist die Korrelations-ID des Backends für sein eigenes
+            // Protokoll; der bestehende Frage-Relais führt seinen eigenen
+            // Zähler (`ManagedAgentSpawner::ask_parent`).
+            let _ = id;
+            spawner
+                .ask_parent(&child, &text, crate::child_comms::PARENT_QUESTION_TIMEOUT)
+                .await
+                .map(|(answer, _delivered)| answer)
+                .unwrap_or_else(|_| crate::child_comms::NO_ANSWER_REPLY.to_owned())
+        })
+    }
+
+    fn on_approval_request<'a>(
+        &'a self,
+        id: String,
+        tool: String,
+        args_summary: String,
+    ) -> crate::child_backend::ChildAnswerFuture<'a> {
+        let spawner = self.spawner;
+        let child = self.child.clone();
+        let role = self.role.clone();
+        Box::pin(async move {
+            let call = harw_tools::ToolCall {
+                id: ToolCallId::from_str(id),
+                name: harw_tools::ToolName::new(tool),
+                arguments: serde_json::json!({ "summary": args_summary }),
+            };
+            let request = crate::child_approval::ChildApprovalRequest {
+                child: child.clone(),
+                role,
+                tree_path: spawner.child_tree_path(&child),
+                call,
+                timeout: spawner.child_approval_relay().timeout(),
+            };
+            match spawner.child_approval_relay().resolve(request).await {
+                crate::turn_loop::ApprovalResolution::Approve => "approve".to_owned(),
+                crate::turn_loop::ApprovalResolution::Reject { reason } => {
+                    format!("deny: {reason}")
+                }
+            }
+        })
+    }
+}
+
 /// Laufende Zähler eines Kindes, fortgeschrieben vom Progress-Observer.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ChildLiveStats {
@@ -4849,6 +4934,18 @@ impl ManagedAgentSpawner {
         let result = self
             .enforce_child_budget(child, store, approvals, input, budget, started)
             .await;
+        if self.child_backend().is_some() {
+            // Wave 3C: a backend-run child's local session never changes
+            // (its turn history lives with the backend), so the
+            // session-manager deltas below would always read as zero.
+            // `run.usage` already carries the backend's own accounting
+            // (`crate::child_backend::ChildRunOutcome::usage`, mapped in
+            // `Self::finish_backend_outcome`) — charge and keep it as-is.
+            if let Ok(run) = &result {
+                self.charge_run_usage(child, run.usage);
+            }
+            return result;
+        }
         // Auch ein gescheiterter oder über das Budget gelaufener Lauf hat
         // verbraucht — die Anrechnung erfolgt auf jedem Ausgang. Ist die
         // Session inzwischen verworfen, gilt der Ausgangsstand (Differenz 0).
@@ -5770,6 +5867,190 @@ impl ManagedAgentSpawner {
                     budget_exhausted: false,
                     budget_handoff: None,
                 })
+            }
+        }
+    }
+
+    /// Wave 3C: runs `child` through the wired
+    /// [`crate::child_backend::ChildBackend`] instead of the in-process turn
+    /// loop above. Called from [`Self::run_child_with_approvals`] once
+    /// [`Self::child_backend`] is `Some`; mirrors that function's own
+    /// admission bookkeeping (running status, pending-task consumption, task
+    /// truncation) so a caller sees the same [`ChildRunResult`] shape
+    /// whichever path ran the child.
+    ///
+    /// # Beschreibung
+    /// The child's local [`AgentSession`] stays parked in the manager —
+    /// unlike the in-process path it is never checked out — because a
+    /// backend-run child keeps its own turn history elsewhere; leaving the
+    /// session in place is what keeps sandbox/continuation bookkeeping
+    /// ([`Self::child_sandbox`], [`Self::finalize_child_end`]) working
+    /// unchanged. Cancellation is the backend's own job (see
+    /// [`crate::child_backend::ChildRunSpec::cancel`]'s docs): this method
+    /// only derives the token and hands it over.
+    ///
+    /// # Errors
+    /// Never returns an error from the backend itself — every
+    /// [`crate::child_backend::ChildRunStatus`] maps to either an
+    /// `Ok(ChildRunResult)` (`Completed`, `BudgetExhausted`) or an
+    /// [`AgentSpawnError`] carrying the finalized end cause (see
+    /// [`Self::finish_backend_outcome`]). Only admission bookkeeping ahead
+    /// of the run (child already running, already cancelled) can fail.
+    async fn run_child_via_backend(
+        &self,
+        child: &SessionId,
+        record: &ChildRecord,
+        backend: Arc<dyn crate::child_backend::ChildBackend>,
+        mut input: TurnInput,
+    ) -> Result<ChildRunResult, AgentSpawnError> {
+        let token = self
+            .child_cancel_token(child)
+            .ok_or_else(|| Self::reject(format!("child {child} has no cancellation token")))?;
+        // Cancel ist terminal (F-182), wie im in-process Pfad oben.
+        if token.is_cancelled() {
+            self.set_status(child, ChildStatus::Cancelled);
+            if let Some(cause) = Self::cancel_cause(token.reason()) {
+                self.finalize_child_end(child, cause).await;
+            }
+            return Err(Self::cancelled_error(child, token.reason()));
+        }
+        self.mark_running(child)?;
+        if let (Some(root), Some(snapshot)) = (self.root_for(child), self.child_record(child)) {
+            self.observe_orchestration(root, &snapshot, None, AgentOrchestrationStatus::Running);
+        }
+        // Derselbe Auftragsdeckel wie im in-process Pfad (siehe dort).
+        let pending_task = self.take_pending_task(child);
+        let has_user_text = input
+            .user_text
+            .as_deref()
+            .is_some_and(|text| !text.trim().is_empty());
+        if !has_user_text && let Some(task) = pending_task {
+            input.user_text = Some(task);
+        }
+        if let Some(max_bytes) = self.child_task_max_bytes(child)
+            && let Some(text) = input.user_text.as_deref()
+            && text.len() > max_bytes
+        {
+            input.user_text = Some(cap_task_text(text, max_bytes));
+        }
+        let task = input.user_text.clone().unwrap_or_default();
+        let context = (!input.metadata.is_null()).then(|| input.metadata.clone());
+        let continue_from = self.take_backend_resume(child);
+        let plan_mode = match self.manager.lock() {
+            Ok(manager) => self.lineage_in_plan_mode(&manager, child),
+            Err(_) => false,
+        };
+        let spec = crate::child_backend::ChildRunSpec {
+            child: child.clone(),
+            parent: record.parent.clone(),
+            agent_id: record.role.clone(),
+            task,
+            context,
+            continue_from,
+            // `harw-core` selbst kennt keine Rechte (siehe die Moduldoku von
+            // `crate::child_backend`): der Aufrufer, der `with_child_backend`
+            // verdrahtet (`JobChildBackend` in `harw-agent-runner`), narrows
+            // dies mit den echten `EffectiveRights` von Kind und Elternteil
+            // weiter ein, bevor er den Lauf tatsächlich startet.
+            rights: crate::child_backend::ChildBackendRights::default(),
+            budget: self.remaining_budget(child).map(agent_budget_to_dsl_budget),
+            live_mode: !plan_mode,
+            cancel: token.child(),
+        };
+        let io = ControllerChildIo {
+            spawner: self,
+            child: child.clone(),
+            role: record.role.clone(),
+        };
+        let outcome = backend.run(spec, &io).await;
+        self.finish_backend_outcome(child, outcome).await
+    }
+
+    /// Wave 3C: maps a finished [`crate::child_backend::ChildRunOutcome`]
+    /// onto the existing [`ChildRunResult`], finalizing a non-regular end
+    /// through [`Self::finalize_child_end`] exactly like the in-process
+    /// path. Never panics: every
+    /// [`crate::child_backend::ChildRunStatus`] variant — including
+    /// [`crate::child_backend::ChildRunStatus::Crashed`] — becomes a
+    /// `ChildEnd` with a cause instead.
+    async fn finish_backend_outcome(
+        &self,
+        child: &SessionId,
+        outcome: crate::child_backend::ChildRunOutcome,
+    ) -> Result<ChildRunResult, AgentSpawnError> {
+        use crate::child_backend::ChildRunStatus;
+        let crate::child_backend::ChildRunOutcome {
+            status,
+            text,
+            usage,
+            continuation,
+        } = outcome;
+        if let Some(token) = continuation {
+            self.set_backend_resume(child, token);
+        }
+        match status {
+            ChildRunStatus::Completed => {
+                if let Some(text) = text.as_deref() {
+                    self.set_outcome_detail(child, text);
+                    self.comms.set_last_assistant(child, text);
+                }
+                self.set_status(child, ChildStatus::Completed);
+                self.archive_completed_child(child, text.as_deref());
+                self.record_completed_continuation(child, text.as_deref());
+                Ok(ChildRunResult {
+                    child: child.clone(),
+                    outcome: TurnOutcome::Completed,
+                    full_text: text,
+                    usage,
+                    budget_exhausted: false,
+                    budget_handoff: None,
+                })
+            }
+            ChildRunStatus::BudgetExhausted => {
+                if let Some(text) = text.as_deref() {
+                    self.set_outcome_detail(child, text);
+                    self.comms.set_last_assistant(child, text);
+                }
+                self.set_status(child, ChildStatus::Completed);
+                self.comms.clear_end(child);
+                self.archive_completed_child(child, text.as_deref());
+                self.record_budget_handoff(
+                    child,
+                    crate::child_handoff::BudgetHandoff::LastAnswer,
+                    text.as_deref(),
+                );
+                Ok(ChildRunResult {
+                    child: child.clone(),
+                    outcome: TurnOutcome::Completed,
+                    full_text: text,
+                    usage,
+                    budget_exhausted: true,
+                    budget_handoff: Some(crate::child_handoff::BudgetHandoff::LastAnswer),
+                })
+            }
+            other => {
+                let cause = other.to_child_end_cause();
+                let message = match &cause {
+                    Some(crate::child_comms::ChildEndCause::Cancelled { reason }) => {
+                        self.set_status(child, ChildStatus::Cancelled);
+                        format!(
+                            "child {child} was cancelled before its turn completed (reason: {reason})"
+                        )
+                    }
+                    Some(crate::child_comms::ChildEndCause::TurnError(reason)) => {
+                        self.set_failed(child, reason);
+                        reason.clone()
+                    }
+                    _ => {
+                        let reason = "child backend run ended unexpectedly".to_owned();
+                        self.set_failed(child, &reason);
+                        reason
+                    }
+                };
+                if let Some(cause) = cause {
+                    self.finalize_child_end(child, cause).await;
+                }
+                Err(Self::reject(message))
             }
         }
     }
