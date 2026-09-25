@@ -1833,16 +1833,26 @@ dependencies = [
 name = "harw-agent-runner"
 version = "0.3.0"
 dependencies = [
+ "bytes",
  "futures-core",
  "harw-agent-artifact",
  "harw-agent-compiler",
  "harw-agent-dsl",
+ "harw-home",
  "harw-registry-defaults",
  "harw-runtime",
+ "harw-tui",
+ "harw-types",
  "harwness-sdk",
+ "http-body-util",
+ "hyper",
+ "hyper-util",
+ "serde",
  "serde_json",
  "tempfile",
  "tokio",
+ "tokio-stream",
+ "tracing",
 ]
 
 [[package]]

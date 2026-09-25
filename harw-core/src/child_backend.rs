@@ -29,6 +29,7 @@ use std::pin::Pin;
 
 use harw_agent_dsl::ir_v2::Budget;
 use harw_types::SessionId;
+use harw_types::cancel::CancelToken;
 
 use crate::child_comms::ChildEndCause;
 use crate::child_controller::ChildUsage;
@@ -84,6 +85,13 @@ pub struct ChildRunSpec {
     pub budget: Option<Budget>,
     /// Whether the tree runs live (vs. plan mode).
     pub live_mode: bool,
+    /// Cancels this run — the same hierarchical primitive
+    /// `ManagedAgentSpawner` already derives per child (`CancelToken::child`).
+    /// A backend awaits this alongside its own work (`tokio::select!`) and,
+    /// once cancelled, ends the run with
+    /// [`ChildRunStatus::Cancelled`] carrying [`CancelToken::reason`]'s
+    /// short label.
+    pub cancel: CancelToken,
 }
 
 /// Sink/source a [`ChildBackend`] uses to relay a running child's activity

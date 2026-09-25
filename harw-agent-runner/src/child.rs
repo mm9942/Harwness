@@ -178,7 +178,9 @@ async fn run_child_async(ctx: RunnerContext, agent_id: String) -> ExitCode {
         task
     };
     let cancel_handle = session.cancel_handle();
-    let reader = tokio::spawn(run_reader(approvals, cancel_handle));
+    // Reuses the same `stdin` the handshake loop read from — a second,
+    // independent `BufReader` over the same fd would race it for bytes.
+    let reader = tokio::spawn(run_reader(stdin, approvals, cancel_handle));
 
     let result = session.send(turn_text).await;
     event_forwarder.abort();
@@ -198,10 +200,13 @@ async fn run_child_async(ctx: RunnerContext, agent_id: String) -> ExitCode {
     ExitCode::SUCCESS
 }
 
-/// Drains `stdin` for `Answer`/`Cancel` frames that arrive while the turn
-/// runs, resolving pending approvals and cancelling the session.
-async fn run_reader(approvals: Arc<RelayApprovals>, cancel: harwness_sdk::CancelHandle) {
-    let mut stdin = BufReader::new(tokio::io::stdin()).lines();
+/// Drains the rest of `stdin` for `Answer`/`Cancel` frames that arrive while
+/// the turn runs, resolving pending approvals and cancelling the session.
+async fn run_reader(
+    mut stdin: tokio::io::Lines<BufReader<tokio::io::Stdin>>,
+    approvals: Arc<RelayApprovals>,
+    cancel: harwness_sdk::CancelHandle,
+) {
     loop {
         match stdin.next_line().await {
             Ok(Some(line)) => match decode_line::<ParentToChild>(&line) {

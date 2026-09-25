@@ -25,7 +25,8 @@
 
 use std::path::PathBuf;
 
-use harw_config::ResolvedConfig;
+use harw_agent_dsl::ExecutableAgentIr;
+use harw_config::{AgentDefinitionMeta, ResolvedConfig};
 use harw_home::{
     HomeError, LayerReport, TrustStatus, active_profile_name, discover_project, project_key,
     project_settings_dir,
@@ -155,6 +156,85 @@ pub fn load_config(spec: &RuntimeSpec) -> RuntimeResult<(ResolvedConfig, ConfigT
         trust_status: status,
     };
     Ok((config, trust))
+}
+
+/// Lädt die Konfiguration eines eingebetteten Laufs (#22 Welle 3A,
+/// `EntryKind::CompiledAgent`) vollständig aus dem Speicher.
+///
+/// # Beschreibung
+/// Anders als [`load_config`] liest diese Funktion **nichts** aus `~/.harw`
+/// für Agenten, Skills oder Profil: die Wurzel-IR und jede Kind-IR der
+/// Delegationshülle kommen aus [`RuntimeSpec::embedded`]
+/// ([`crate::embedded::EmbeddedAgent`]), ebenso die Modellwahl
+/// (`[models]` der Wurzel-IR). Ein `Option`-Zustandsverzeichnis
+/// ([`RuntimeSpec::home`]) bleibt für Sitzungen und Protokolle bestehen,
+/// trägt aber keine Agenten-, Skill- oder Profil-Konfiguration bei — ein
+/// widersprüchlicher Agent gleichen Namens dort hat keine Wirkung.
+///
+/// # Argumente
+/// - `spec` (`&RuntimeSpec`): [`RuntimeSpec::embedded`] muss `Some` sein.
+///
+/// # Errors
+/// - [`RuntimeError::Config`], wenn `spec.embedded` fehlt.
+/// - [`RuntimeError::Config`], wenn die Wurzel-IR eine
+///   `[models].required_env`-Variable nennt, die weder in der
+///   Prozessumgebung noch (der ohnehin leeren) `env_layer` gesetzt ist — die
+///   Meldung nennt jede fehlende Variable.
+pub fn load_config_embedded(spec: &RuntimeSpec) -> RuntimeResult<ResolvedConfig> {
+    let embedded = spec.embedded.as_ref().ok_or_else(|| RuntimeError::Config {
+        detail: "load_config_embedded called without RuntimeSpec::embedded".to_owned(),
+    })?;
+
+    let mut config = ResolvedConfig::default();
+
+    for id in embedded.agent_ids() {
+        let Some(ir) = embedded.agent_ir(id) else {
+            continue;
+        };
+        config
+            .executable_agents
+            .insert(id.to_owned(), ExecutableAgentIr::from(ir));
+        config.agent_irs.insert(id.to_owned(), ir.clone());
+        config.agent_definition_meta.insert(
+            id.to_owned(),
+            AgentDefinitionMeta {
+                name: ir.name.clone(),
+                description: ir.description.clone(),
+                layer: None,
+                instructions: (!ir.instructions.text.is_empty())
+                    .then(|| ir.instructions.text.clone()),
+                delegation_targets: ir.spawn.delegation_targets.clone(),
+            },
+        );
+    }
+
+    config.harness.active_agent_definition = Some(embedded.root_id().to_owned());
+
+    if let Some(models) = embedded.root_ir().models.as_ref() {
+        if let Some(provider) = models.provider.clone() {
+            config.harness.default_provider = Some(provider);
+        }
+        if let Some(model) = models.model.clone() {
+            config.harness.default_model = Some(model);
+        }
+        let missing: Vec<&str> = models
+            .required_env
+            .iter()
+            .map(String::as_str)
+            .filter(|name| std::env::var(name).is_err() && !config.env_layer.contains_key(*name))
+            .collect();
+        if !missing.is_empty() {
+            return Err(RuntimeError::Config {
+                detail: format!(
+                    "the compiled agent's manifest requires the environment variable(s) {} \
+                     ([models].required_env); set them before starting",
+                    missing.join(", ")
+                ),
+            });
+        }
+    }
+
+    Ok(config)
 }
 
 /// Setzt ein explizit gewähltes Modell ([`RuntimeSpec::model_override`]) als
@@ -327,6 +407,7 @@ mod tests {
             reasoning_effort: None,
             approval_override: None,
             model_override: None,
+            embedded: None,
         }
     }
 
@@ -616,5 +697,163 @@ mod tests {
             name: "../escape".to_owned(),
         });
         assert!(matches!(config, RuntimeError::Config { .. }));
+    }
+
+    // -- `load_config_embedded` (#22 Welle 3A) ------------------------------
+
+    use crate::embedded::EmbeddedAgent;
+    use harw_agent_artifact::bundle::{AgentInput, BundleBuilder};
+    use harw_agent_dsl::diagnostics::SourceFile;
+    use harw_agent_dsl::ids::DefinitionId;
+    use harw_agent_dsl::ir_v2::AgentIr;
+    use harw_agent_dsl::layers::DefinitionLayer;
+    use harw_agent_dsl::lower_v2::{LowerSources, compile_agent};
+    use std::sync::Arc;
+    use time::OffsetDateTime;
+
+    fn compile(source: &str, target: &str) -> TestResult<AgentIr> {
+        let files = vec![SourceFile::new(
+            DefinitionLayer::UserGlobal,
+            "agents/embedded/definition.toml",
+            source,
+        )];
+        let sources = LowerSources::new(&files);
+        let target = DefinitionId::parse(target).map_err(ctx("target id"))?;
+        compile_agent(&target, &sources, OffsetDateTime::UNIX_EPOCH).map_err(|diagnostics| {
+            TestError::Unexpected(format!("compile: {diagnostics}"))
+        })
+    }
+
+    fn embedded_agent(root_def: &str, root_id: &str) -> TestResult<EmbeddedAgent> {
+        let ir = compile(root_def, root_id)?;
+        let root = AgentInput {
+            id: "root".to_owned(),
+            name: "root".to_owned(),
+            ir: serde_json::to_value(&ir).map_err(ctx("ir to json"))?,
+            files: Vec::new(),
+            children: Vec::new(),
+        };
+        let artifact = BundleBuilder::new(root).build().map_err(ctx("build"))?;
+        let bundle = harw_agent_artifact::Bundle::from_artifact(&artifact).map_err(ctx("verify"))?;
+        EmbeddedAgent::from_bundle(bundle, &artifact).map_err(TestError::Runtime)
+    }
+
+    const SIMPLE_DEF: &str = r#"
+schema = "harwness.agent/v1"
+id = "acme.agent.embedded-cfg@1"
+version = "1.0.0"
+role = "worker"
+specialization = "embedded-cfg"
+
+[tools]
+admitted = ["fs.read"]
+"#;
+
+    const DEF_WITH_REQUIRED_ENV: &str = r#"
+schema = "harwness.agent/v1"
+id = "acme.agent.embedded-env@1"
+version = "1.0.0"
+role = "worker"
+specialization = "embedded-env"
+
+[tools]
+admitted = ["fs.read"]
+
+[models]
+provider = "anthropic"
+model = "claude-x"
+required_env = ["EMBEDDED_TEST_MISSING_VAR"]
+"#;
+
+    fn spec_with_embedded(home: &Path, cwd: &Path, embedded: EmbeddedAgent) -> RuntimeSpec {
+        let mut spec = spec_for(home, cwd);
+        spec.entry = EntryKind::CompiledAgent;
+        spec.embedded = Some(Arc::new(embedded));
+        spec
+    }
+
+    #[test]
+    fn load_config_embedded_populates_the_root_agent_from_the_bundle() -> TestResult {
+        let home = TempDir::new()?;
+        let cwd = TempDir::new()?;
+        let agent = embedded_agent(SIMPLE_DEF, "acme.agent.embedded-cfg@1")?;
+        let root_id = agent.root_id().to_owned();
+        let spec = spec_with_embedded(home.path(), cwd.path(), agent);
+
+        let config = load_config_embedded(&spec).map_err(TestError::Runtime)?;
+
+        assert_eq!(
+            config.harness.active_agent_definition.as_deref(),
+            Some(root_id.as_str())
+        );
+        let ir = config
+            .agent_irs
+            .get(&root_id)
+            .ok_or(TestError::Missing("agent_irs[root]"))?;
+        assert_eq!(ir.specialization, "embedded-cfg");
+        assert!(config.executable_agents.contains_key(&root_id));
+        Ok(())
+    }
+
+    #[test]
+    fn load_config_embedded_never_reads_a_conflicting_agent_from_home() -> TestResult {
+        let home = TempDir::new()?;
+        let cwd = TempDir::new()?;
+        // Ein widersprüchlicher, gleichnamiger Agent im Root-Space — die
+        // eingebettete Konfiguration darf ihn nie sehen.
+        write_layer_file(
+            home.path(),
+            "agents/embedded-cfg/definition.toml",
+            "schema = \"harwness.agent/v1\"\n\
+             id = \"acme.agent.embedded-cfg@1\"\n\
+             version = \"9.9.9\"\n\
+             role = \"worker\"\n\
+             specialization = \"from-home-not-bundle\"\n",
+        )?;
+        let agent = embedded_agent(SIMPLE_DEF, "acme.agent.embedded-cfg@1")?;
+        let root_id = agent.root_id().to_owned();
+        let spec = spec_with_embedded(home.path(), cwd.path(), agent);
+
+        let config = load_config_embedded(&spec).map_err(TestError::Runtime)?;
+
+        let ir = config
+            .agent_irs
+            .get(&root_id)
+            .ok_or(TestError::Missing("agent_irs[root]"))?;
+        assert_eq!(
+            ir.specialization, "embedded-cfg",
+            "the bundle's own IR must win, never a same-named `~/.harw` agent"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn load_config_embedded_reports_every_missing_required_env_var() -> TestResult {
+        let home = TempDir::new()?;
+        let cwd = TempDir::new()?;
+        // Diese Variable existiert absichtlich in keiner Prozessumgebung
+        // (crate-eigenes `#![forbid(unsafe_code)]` verbietet
+        // `std::env::remove_var`, das seit Rust 1.82 `unsafe fn` ist —
+        // also kein aktives Aufräumen hier, nur ein garantiert unbenutzter Name).
+        if std::env::var("EMBEDDED_TEST_MISSING_VAR").is_ok() {
+            return Err(TestError::Unexpected(
+                "EMBEDDED_TEST_MISSING_VAR must not be set in the test environment".into(),
+            ));
+        }
+        let agent = embedded_agent(DEF_WITH_REQUIRED_ENV, "acme.agent.embedded-env@1")?;
+        let spec = spec_with_embedded(home.path(), cwd.path(), agent);
+
+        let result = load_config_embedded(&spec);
+
+        let Err(RuntimeError::Config { detail }) = result else {
+            return Err(TestError::Unexpected(format!(
+                "expected a config error naming the missing variable, got {result:?}"
+            )));
+        };
+        assert!(
+            detail.contains("EMBEDDED_TEST_MISSING_VAR"),
+            "{detail}"
+        );
+        Ok(())
     }
 }

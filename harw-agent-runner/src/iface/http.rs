@@ -741,6 +741,8 @@ fn sdk_event_envelope(event: &harwness_sdk::SdkEvent) -> Value {
         match output {
             ToolOutput::Success { value } => json!({"success": true, "value": value}),
             ToolOutput::Error { message } => json!({"success": false, "message": message}),
+            // `ToolOutput` is `#[non_exhaustive]`.
+            _ => json!({"success": false, "message": "unknown tool output"}),
         }
     }
 
@@ -819,6 +821,8 @@ fn sdk_event_envelope(event: &harwness_sdk::SdkEvent) -> Value {
             "status": match status {
                 FinishStatus::Completed => "completed",
                 FinishStatus::Aborted => "aborted",
+                // `FinishStatus` is `#[non_exhaustive]`.
+                _ => "unknown",
             },
             "usage": usage.as_ref().map(UsageInfo::from_sdk).as_ref().map(usage_json),
         }),

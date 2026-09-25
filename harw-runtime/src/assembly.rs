@@ -1655,7 +1655,14 @@ impl RuntimeAssemblyBuilder {
             detail: "no stores were given to the runtime builder".to_owned(),
         })?;
 
-        let profile = spec.entry.profile();
+        // #22 Welle 3A: `EntryKind::CompiledAgent` hat keine Tabellenzeile —
+        // ihr Profil entsteht aus den Manifest-Rechten des eingebetteten
+        // Agenten, nicht aus `EntryKind::profile()` (dessen Zeile für diese
+        // Art nur die engste Rückfallzeile ist, siehe `spec.rs`).
+        let profile = match spec.embedded.as_ref() {
+            Some(embedded) => crate::spec::EntryProfile::for_embedded(embedded.rights()),
+            None => spec.entry.profile(),
+        };
 
         // 0. Verengung des Aufrufers — fail-closed, bevor irgendetwas gelesen
         //    oder gebaut wird (CONTRACTS-W2d2 §1.1).
@@ -1669,8 +1676,22 @@ impl RuntimeAssemblyBuilder {
         };
         ensure_narrowing_fits_operations(spec.entry, &profile, narrowing.as_ref())?;
 
-        // 1. Konfiguration mit Vertrauensbericht.
-        let (config, trust_report) = load_config(&spec)?;
+        // 1. Konfiguration mit Vertrauensbericht. Ein eingebetteter Lauf
+        //    liest sie vollständig aus dem Speicher (`load_config_embedded`)
+        //    und trägt deshalb keinen Vertrauensbericht über `~/.harw`-Layer;
+        //    `trust_report` bleibt für ihn leer (kein Layer, kein
+        //    nicht-vertrautes Repo).
+        let (config, trust_report) = match spec.embedded.as_ref() {
+            Some(_) => (
+                crate::config::load_config_embedded(&spec)?,
+                ConfigTrustReport {
+                    layers: Vec::new(),
+                    untrusted_repo: None,
+                    trust_status: None,
+                },
+            ),
+            None => load_config(&spec)?,
+        };
         let config = Arc::new(config);
         // Netz-Werkzeuge (web.fetch/web.search/…) einmal je Prozess mit der
         // Egress-Policy aus `[network]`/`[research]` und dem Such-Backend aus
@@ -2026,7 +2047,22 @@ impl RuntimeAssemblyBuilder {
             .as_ref()
             .map(|ir| ir.id().to_string())
             .or_else(|| overrides.agent_name.clone());
-        let skill_index = Arc::new(harw_catalog::SkillIndex::build(&trust_report.layers));
+        // #22 Welle 3A: ein eingebetteter Lauf (`spec.embedded`) liest keine
+        // Skills aus `~/.harw`-Layern — sie kommen ausschließlich aus dem
+        // Blob-Pool des Artefakts (`EmbeddedAgent::skill_bundle`),
+        // `build_with_bundle` nimmt dieses in-Memory-Bündel bereits ohne
+        // Änderung an `harw-catalog` entgegen.
+        let skill_index = Arc::new(match spec.embedded.as_ref() {
+            Some(embedded) => {
+                let bundle = embedded.skill_bundle();
+                let refs: Vec<(&str, &str)> = bundle
+                    .iter()
+                    .map(|(path, content)| (path.as_str(), content.as_str()))
+                    .collect();
+                harw_catalog::SkillIndex::build_with_bundle(&[], &refs)
+            }
+            None => harw_catalog::SkillIndex::build(&trust_report.layers),
+        });
         let legacy_skill_agent = match uia_ir.as_ref() {
             Some(uia) => Some(uia.specialization().to_owned()),
             None => overrides.agent_name.clone(),

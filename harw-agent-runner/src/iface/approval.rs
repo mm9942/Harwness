@@ -138,36 +138,46 @@ impl TerminalApproval {
     }
 }
 
-impl ApprovalHandler for TerminalApproval {
-    fn decide<'a>(&'a self, request: &'a ApprovalRequest) -> BoxFuture<'a, Decision> {
-        Box::pin(async move {
-            if self.full_access {
-                return Decision::Approve;
-            }
-            if self.remembers(&request.tool) {
-                return Decision::Approve;
-            }
-            if !self.interactive {
-                self.denied.store(true, Ordering::Relaxed);
-                return Decision::deny(NON_INTERACTIVE_DENY_REASON);
-            }
-            let tool = request.tool.clone();
-            let arguments = request.arguments.clone();
-            let choice = tokio::task::spawn_blocking(move || Self::ask(&tool, &arguments))
+impl TerminalApproval {
+    /// The actual decision logic, taking the two [`ApprovalRequest`] fields
+    /// it needs directly rather than the (`#[non_exhaustive]`, so not
+    /// constructible outside `harwness-sdk`) request itself — which lets
+    /// this crate's own tests exercise it without needing a real session to
+    /// produce one. [`Self::decide`] is a thin wrapper around this.
+    async fn decide_tool(&self, tool: &str, arguments: &serde_json::Value) -> Decision {
+        if self.full_access {
+            return Decision::Approve;
+        }
+        if self.remembers(tool) {
+            return Decision::Approve;
+        }
+        if !self.interactive {
+            self.denied.store(true, Ordering::Relaxed);
+            return Decision::deny(NON_INTERACTIVE_DENY_REASON);
+        }
+        let owned_tool = tool.to_owned();
+        let owned_arguments = arguments.clone();
+        let choice =
+            tokio::task::spawn_blocking(move || Self::ask(&owned_tool, &owned_arguments))
                 .await
                 .unwrap_or(Choice::Deny);
-            match choice {
-                Choice::Approve => Decision::Approve,
-                Choice::AlwaysThisSession => {
-                    self.remember(&request.tool);
-                    Decision::Approve
-                }
-                Choice::Deny => {
-                    self.denied.store(true, Ordering::Relaxed);
-                    Decision::deny(USER_DENY_REASON)
-                }
+        match choice {
+            Choice::Approve => Decision::Approve,
+            Choice::AlwaysThisSession => {
+                self.remember(tool);
+                Decision::Approve
             }
-        })
+            Choice::Deny => {
+                self.denied.store(true, Ordering::Relaxed);
+                Decision::deny(USER_DENY_REASON)
+            }
+        }
+    }
+}
+
+impl ApprovalHandler for TerminalApproval {
+    fn decide<'a>(&'a self, request: &'a ApprovalRequest) -> BoxFuture<'a, Decision> {
+        Box::pin(self.decide_tool(&request.tool, &request.arguments))
     }
 }
 
@@ -205,46 +215,41 @@ mod tests {
     use super::*;
     use serde_json::json;
 
-    type TestResult = Result<(), Box<dyn std::error::Error>>;
-
-    fn request(tool: &str) -> Result<ApprovalRequest, harwness_sdk::SdkError> {
-        Ok(ApprovalRequest {
-            session_id: harwness_sdk::SessionId::new("s")?,
-            request_id: "r".into(),
-            call_id: "c".into(),
-            tool: tool.into(),
-            arguments: json!({"path": "a"}),
-        })
-    }
-
     #[tokio::test]
-    async fn full_access_approves_without_asking_and_never_marks_denied() -> TestResult {
+    async fn full_access_approves_without_asking_and_never_marks_denied() {
         let handler = TerminalApproval::with_interactive(true, false);
-        let decision = handler.decide(&request("shell.exec")?).await;
+        let decision = handler.decide_tool("shell.exec", &json!({"cmd": "rm -rf /"})).await;
         assert_eq!(decision, Decision::Approve);
         assert!(!handler.any_denied());
-        Ok(())
     }
 
     #[tokio::test]
-    async fn a_non_interactive_terminal_denies_and_marks_denied() -> TestResult {
+    async fn a_non_interactive_terminal_denies_and_marks_denied() {
         let handler = TerminalApproval::with_interactive(false, false);
-        let decision = handler.decide(&request("fs.write")?).await;
+        let decision = handler.decide_tool("fs.write", &json!({"path": "a"})).await;
         assert_eq!(decision, Decision::deny(NON_INTERACTIVE_DENY_REASON));
         assert!(handler.any_denied());
-        Ok(())
     }
 
     #[tokio::test]
-    async fn remembering_a_tool_skips_asking_again() -> TestResult {
+    async fn remembering_a_tool_skips_asking_again() {
         let handler = TerminalApproval::with_interactive(false, false);
         // Not interactive, so this denies rather than asking — but a
         // remembered tool must short-circuit even that: prove the lookup
         // runs before the interactivity check by remembering first.
         handler.remember("fs.write");
-        let decision = handler.decide(&request("fs.write")?).await;
+        let decision = handler.decide_tool("fs.write", &json!({"path": "a"})).await;
         assert_eq!(decision, Decision::Approve);
         assert!(!handler.any_denied());
-        Ok(())
+    }
+
+    #[tokio::test]
+    async fn different_tools_are_asked_independently() {
+        let handler = TerminalApproval::with_interactive(false, false);
+        handler.remember("fs.write");
+        // A different, non-remembered tool still hits the non-interactive
+        // path (and so denies) even though something else was remembered.
+        let decision = handler.decide_tool("shell.exec", &json!({})).await;
+        assert_eq!(decision, Decision::deny(NON_INTERACTIVE_DENY_REASON));
     }
 }

@@ -59,7 +59,14 @@ mcp = ["dep:futures-core"]
 # `iface::http`: its own small hyper-based listener (same stack/versions as
 # `harw-web`/`harw-mcp-server`; see that module's doc for why it does not
 # reuse either directly).
-http = ["dep:hyper", "dep:hyper-util", "dep:http-body-util", "dep:bytes", "dep:tokio-stream"]
+http = [
+    "dep:hyper",
+    "dep:hyper-util",
+    "dep:http-body-util",
+    "dep:bytes",
+    "dep:tokio-stream",
+    "dep:futures-core",
+]
 # `iface::tui`: `harw-tui::fixed_agent` runs the embedded agent's mini TUI.
 tui = ["dep:harw-tui"]
 
@@ -109,8 +116,9 @@ tracing = { workspace = true }
 # (wie `harw-runtime`/`harwness-sdk`). Deckt die Interfaces (cli/repl/mcp/
 # http/tui) mit ab, damit deren Agenten nicht je eine eigene Fassung ziehen.
 # `signal` added in wave 3B for `iface::repl`'s Ctrl+C → `CancelHandle`
-# wiring (`tokio::signal::ctrl_c`); every other feature here predates that.
-tokio = { version = "1.53.0", features = ["rt", "rt-multi-thread", "macros", "sync", "time", "net", "signal"] }
+# wiring (`tokio::signal::ctrl_c`); `io-util` for `crate::child`'s
+# `AsyncBufReadExt`/`AsyncWriteExt` over its child process's stdio pipes.
+tokio = { version = "1.53.0", features = ["rt", "rt-multi-thread", "macros", "sync", "time", "net", "signal", "io-util"] }
 serde = { workspace = true }
 serde_json = { workspace = true }
 # `iface::mcp`'s event stream (optional: only pulled in by the `mcp`

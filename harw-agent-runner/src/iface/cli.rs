@@ -84,9 +84,9 @@ pub fn run(ctx: RunnerContext) -> ExitCode {
     ExitCode::from(match status {
         TurnStatus::Completed => EXIT_COMPLETED,
         TurnStatus::Cancelled { .. } => EXIT_CANCELLED,
-        TurnStatus::Truncated | TurnStatus::Refused { .. } | TurnStatus::Failed { .. } => {
-            EXIT_FAILED
-        }
+        // `TurnStatus` is `#[non_exhaustive]`: `Truncated`/`Refused`/`Failed`
+        // and anything a later SDK version adds all count as "failed" here.
+        _ => EXIT_FAILED,
     })
 }
 
@@ -169,6 +169,8 @@ async fn run_one_shot(
                     let outcome = match output {
                         ToolOutput::Success { .. } => "ok".to_owned(),
                         ToolOutput::Error { message } => format!("error: {message}"),
+                        // `ToolOutput` is `#[non_exhaustive]`.
+                        _ => "unknown".to_owned(),
                     };
                     eprintln_dim(&format!(
                         "{}← {outcome} ({} ms)",
@@ -273,6 +275,8 @@ fn event_json(event: &SdkEvent) -> serde_json::Value {
             "output": match output {
                 ToolOutput::Success { value } => serde_json::json!({"success": true, "value": value}),
                 ToolOutput::Error { message } => serde_json::json!({"success": false, "message": message}),
+                // `ToolOutput` is `#[non_exhaustive]`.
+                _ => serde_json::json!({"success": false, "message": "unknown tool output"}),
             },
         }),
         SdkEvent::ChildSpawned {
@@ -328,12 +332,17 @@ fn event_json(event: &SdkEvent) -> serde_json::Value {
             "status": match status {
                 FinishStatus::Completed => "completed",
                 FinishStatus::Aborted => "aborted",
+                // `FinishStatus` is `#[non_exhaustive]`.
+                _ => "unknown",
             },
             "usage": usage.as_ref().map(usage_json),
         }),
         SdkEvent::Lagged { skipped } => serde_json::json!({
             "type": "lagged", "skipped": skipped,
         }),
+        // `SdkEvent` is `#[non_exhaustive]`: a later SDK version's new
+        // variant still becomes a valid (if uninformative) JSON line.
+        _ => serde_json::json!({"type": "unknown"}),
     }
 }
 

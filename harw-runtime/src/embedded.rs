@@ -117,6 +117,42 @@ impl EmbeddedAgent {
         self.agent_irs.get(id)
     }
 
+    /// Alle Agenten-IDs der Delegationshülle (Wurzel eingeschlossen),
+    /// aufsteigend sortiert.
+    #[must_use]
+    pub fn agent_ids(&self) -> impl Iterator<Item = &str> + '_ {
+        self.agent_irs.keys().map(String::as_str)
+    }
+
+    /// Jede `skill`-Payload der ganzen Delegationshülle als
+    /// `(logischer Pfad, Inhalt)` — bereit für
+    /// [`harw_catalog::SkillIndex::build_with_bundle`] als eingebettetes
+    /// Bündel. Der erste Agent, der einen gegebenen logischen Pfad
+    /// deklariert, gewinnt (Skills sind ohnehin über den Blob-Pool
+    /// dedupliziert, siehe Moduldoku von `harw_agent_artifact::bundle`). Eine
+    /// Payload, deren Bytes kein gültiges UTF-8 sind, wird übersprungen
+    /// (Skills sind immer Text).
+    #[must_use]
+    pub fn skill_bundle(&self) -> Vec<(String, String)> {
+        let mut seen = BTreeSet::new();
+        let mut out = Vec::new();
+        for entry in self.bundle.agents.values() {
+            for reference in &entry.payload_refs {
+                if reference.kind != "skill" || !seen.insert(reference.logical_path.clone()) {
+                    continue;
+                }
+                let Some(bytes) = self.blobs.get(&reference.blake3) else {
+                    continue;
+                };
+                let Ok(text) = std::str::from_utf8(bytes) else {
+                    continue;
+                };
+                out.push((reference.logical_path.clone(), text.to_owned()));
+            }
+        }
+        out
+    }
+
     /// Das zugrunde liegende Bundle (Kindbeziehungen, Payload-Referenzen).
     #[must_use]
     pub fn bundle(&self) -> &Bundle {
@@ -401,6 +437,20 @@ admitted = ["fs.read"]
         );
         assert_eq!(agent.payload("root", "skill", "skills/missing.md"), None);
         assert_eq!(agent.payload("no-such-agent", "skill", "x"), None);
+
+        let mut ids: Vec<&str> = agent.agent_ids().collect();
+        ids.sort_unstable();
+        assert_eq!(ids, ["child", "root"]);
+
+        let bundle = agent.skill_bundle();
+        assert_eq!(bundle.len(), 1, "the shared skill is deduplicated");
+        assert_eq!(
+            bundle[0],
+            (
+                "skills/review/instructions.md".to_owned(),
+                "# review skill".to_owned()
+            )
+        );
         Ok(())
     }
 

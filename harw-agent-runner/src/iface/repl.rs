@@ -191,6 +191,8 @@ async fn run_turn(session: &mut Session, prompt: String) {
                     let outcome = match output {
                         ToolOutput::Success { .. } => "ok".to_owned(),
                         ToolOutput::Error { message } => format!("error: {message}"),
+                        // `ToolOutput` is `#[non_exhaustive]`.
+                        _ => "unknown".to_owned(),
                     };
                     dim(&format!("← {outcome} ({} ms)", duration.as_millis()));
                 }
@@ -224,6 +226,8 @@ fn status_label(status: &TurnStatus) -> String {
             None => "refused".to_owned(),
         },
         TurnStatus::Failed { reason } => format!("failed: {reason}"),
+        // `TurnStatus` is `#[non_exhaustive]`.
+        _ => "unknown".to_owned(),
     }
 }
 
