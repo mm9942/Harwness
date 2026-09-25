@@ -1888,14 +1888,19 @@ impl RuntimeAssemblyBuilder {
         let agent_ir =
             resolve_explicit_root_agent(spec.active_agent.as_deref(), &config, &agent_definitions)?;
         // #22 Welle 3: eine native, personalisierte harw bringt ihre UIA
-        // bereits eingebettet mit (`harw-cli::embedded_uia`); die gewinnt
-        // dann über `harness.active_uia_definition` — die Laufzeit selbst
-        // kennt `harw-cli` nicht, sie bekommt die eingebettete Definition
-        // ausschließlich über `spec.embedded` gereicht (s. TODO unten).
+        // bereits eingebettet mit (`spec.embedded`, von `harw-cli` aus
+        // `embedded_uia()` gesetzt); die gewinnt dann über
+        // `harness.active_uia_definition`. Nur für `Tui`/`OneShot` — dieselbe
+        // Gattung wie [`resolve_active_uia`] selbst prüft; `spec.embedded`
+        // gehört sonst (Welle 3A) `EntryKind::CompiledAgent`, dessen
+        // eingebetteter Wurzel-Agent typischerweise keine UIA ist und dessen
+        // Rolle diese Funktion deshalb nicht abfragen darf.
         let uia_ir = if agent_ir.is_some() {
             None
-        } else if let Some(embedded) = spec.embedded.as_deref() {
-            Some(resolve_embedded_uia(embedded)?)
+        } else if matches!(spec.entry, EntryKind::Tui | EntryKind::OneShot)
+            && let Some(embedded) = spec.embedded.as_deref()
+        {
+            Some(resolve_embedded_uia(embedded.root_ir())?)
         } else {
             resolve_active_uia(spec.entry, &config, &agent_definitions)?
         };
