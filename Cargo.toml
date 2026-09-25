@@ -166,7 +166,7 @@ codegen-units = 16
 [profile.dev]
 opt-level = 0
 
-# R10 Wave 4 (docs/plans/r10-agent-compiler.md): the profile `make build`/
+# R10 Wave 4 (docs/adr/0001-agent-compiler.md): the profile `make build`/
 # `make install` use for `harw-agent-runner`. A compiled agent embeds this
 # binary and ships it to end users, so its size and runtime cost matter more
 # than the runner's own build time — unlike `[profile.release]` above, which

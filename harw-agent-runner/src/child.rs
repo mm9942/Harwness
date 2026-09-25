@@ -1,5 +1,5 @@
 //! `--child <id> --child-protocol stdio`: this process is one child agent of
-//! a compiled parent (plan `docs/plans/r10-agent-compiler.md`, §3C).
+//! a compiled parent (`docs/adr/0001-agent-compiler.md`).
 //!
 //! # Description
 //! [`run_child`] drives the named agent's own `harwness_sdk::Session`,

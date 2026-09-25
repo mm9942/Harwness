@@ -110,7 +110,7 @@
 //! Wirkung, ohne eine neue Fähigkeit des Graphen vorauszusetzen.
 //!
 //! # `harw-agent-runner`: unprivilegiert, aber außerhalb der DoD-Tabelle
-//! `harw-agent-runner` (R10 Wave 4, `docs/plans/r10-agent-compiler.md`) ist
+//! `harw-agent-runner` (R10 Wave 4, `docs/adr/0001-agent-compiler.md`) ist
 //! kein DoD-Sensorbinary: es liegt im Produkt-Workspace, hängt an keiner
 //! Stelle von `dod/` oder einer `harw-dod-*`-Crate ab (geprüft: sein
 //! einziger Pfad zu `harw-core-bridge`/`harw-runtime` führt nie über
@@ -393,7 +393,7 @@ pub const MONITORED_BINARIES: &[MonitoredBinary] = &[
         budget: BinaryBudget::SystemdSocketNoNet,
         unlisted_policy: UnlistedCratePolicy::Violation,
     },
-    // R10 Wave 4 (docs/plans/r10-agent-compiler.md): Produkt-Workspace-
+    // R10 Wave 4 (docs/adr/0001-agent-compiler.md): Produkt-Workspace-
     // Binary außerhalb der DoD-Capability-Domäne — siehe Moduldoku.
     MonitoredBinary {
         name: "harw-agent-runner",

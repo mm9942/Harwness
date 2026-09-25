@@ -72,7 +72,7 @@ build: ## Release-build harw, killer and the agent runner
 HARW_HOME ?= $(HOME)/.harw
 
 # Host target triple, read from `rustc -vV` (not `cargo`) at install time —
-# see `docs/plans/r10-agent-compiler.md` wave 4: this runs once per install,
+# see `docs/adr/0001-agent-compiler.md`: this runs once per install,
 # never inside an agent's build, so it does not fall under the
 # subagents-never-build rule above.
 HARW_HOST_TARGET = $(shell rustc -vV | sed -n 's/^host: //p')

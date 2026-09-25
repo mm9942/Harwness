@@ -1,6 +1,6 @@
 //! `ChildBackend`: the seam that lets [`crate::child_controller::ManagedAgentSpawner`]
 //! hand "run this child" to something other than the in-process
-//! `AgentSession` (plan `docs/plans/r10-agent-compiler.md`, §3C).
+//! `AgentSession` (`docs/adr/0001-agent-compiler.md`).
 //!
 //! # Description
 //! Nothing in this crate changes behavior on its own: without a backend,

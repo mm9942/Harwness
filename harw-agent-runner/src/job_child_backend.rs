@@ -1,6 +1,6 @@
 //! `JobChildBackend`: [`harw_core::child_backend::ChildBackend`] over a real
-//! OS process speaking `harwness.agent-child/v1` on its stdio (plan
-//! `docs/plans/r10-agent-compiler.md`, §3C).
+//! OS process speaking `harwness.agent-child/v1` on its stdio (see
+//! `docs/adr/0001-agent-compiler.md`).
 //!
 //! # Two ways to run the child process
 //! - **Production** ([`JobChildBackend::new`], `S = `[`CurrentExeSpawner`]):

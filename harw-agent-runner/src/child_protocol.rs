@@ -1,6 +1,6 @@
 //! `harwness.agent-child/v1` — the JSON-lines protocol between a parent
-//! runner and a child agent it runs as a separate process (plan
-//! `docs/plans/r10-agent-compiler.md`, §3C).
+//! runner and a child agent it runs as a separate process (see
+//! `docs/adr/0001-agent-compiler.md`).
 //!
 //! # Description
 //! One JSON object per line, `\n`-terminated, UTF-8. Parent → child frames

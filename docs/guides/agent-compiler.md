@@ -1,6 +1,6 @@
 # Compiling agents into standalone binaries
 
-> Status: implemented (#22, wave 5: `docs/plans/r10-agent-compiler.md`).
+> Status: implemented (#22; decisions in `docs/adr/0001-agent-compiler.md`).
 > `harw agent check/build/inspect/graph/explain/new/fmt/diff/test/versions/
 > use/clean/doctor` and the `~/.harw/bin` version store described below are
 > in `harw-agent-compiler` and wired into the CLI. The runner's own
