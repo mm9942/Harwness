@@ -66,7 +66,9 @@ pub enum ParentToChild {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         context: Option<serde_json::Value>,
         /// Opaque continuation token from a prior budget-ended run of this
-        /// same child, if this resumes one.
+        /// same child (its [`ChildToParent::Result`]'s `continuation`), if
+        /// this resumes one. The child resumes that stored session or, if it
+        /// cannot, answers with [`ChildToParent::Error`].
         #[serde(default, skip_serializing_if = "Option::is_none")]
         continue_from: Option<String>,
     },
