@@ -68,12 +68,25 @@ processes speak over the child's own stdio.
   `decode_line`), so a tiny but deeply nested line cannot exhaust the
   parser's stack. The runner's `mcp` and `http` interfaces use the same
   bound.
-- (#22 wave 6) Every line is length-bounded: a line longer than
-  `MAX_FRAME_BYTES` (1 MiB, excluding the `\n`) is refused by
-  `child_protocol::FrameReader` before it is buffered past that bound,
-  never truncated and parsed. An oversized frame is a protocol error: the
-  child answers it with `Error` and exits; the parent fails the run and
-  kills the child's process group.
+- Every line is length-bounded: a line longer than `MAX_FRAME_BYTES`
+  (1 MiB, excluding the `\n`) is refused by `child_protocol::FrameReader`
+  before it is buffered past that bound, never truncated and parsed; a
+  line that is not valid UTF-8 is refused the same way
+  (`FrameReadError::TooLarge` / `InvalidUtf8`). Either is a protocol
+  error, because the stream is out of sync afterwards:
+  - **Child** (reading stdin): it sends one `Error` frame naming the
+    problem and exits with a failure code, without a `Result`. Before the
+    `Task` it has no session to stop; while a turn runs it cancels the
+    session first (§4.4). A plain read error on stdin ends it without an
+    `Error` frame (a failure exit before the `Task`, a cancelled turn
+    after it).
+  - **Parent** (reading the child's stdout): it fails the run
+    (`ChildRunStatus::Failed` with the reader's message) and stops the
+    child — `JobManager::stop` on the job path, a process-group kill in
+    the test seam (§7). On the job path, stdout lines arrive already split
+    by the job's stdout tee and are checked against `MAX_FRAME_BYTES` on
+    arrival. A plain read error on the direct path counts as the stream
+    ending (a crash, §7 step 6).
 
 ## 3. Handshake and versioning
 
@@ -118,21 +131,29 @@ Starts (or resumes) the child's one turn.
 |---|---|---|
 | `task` | string | The child's task text (its user turn). |
 | `context` | JSON, optional | Structured context handed alongside `task`. |
-| `continue_from` | string, optional | An opaque continuation token from a prior budget-ended run of this same child, if this resumes one. |
+| `continue_from` | string, optional | The `continuation` token of a prior budget-ended `Result` (§5.4) of this same child, if this resumes one. |
 
 The child concatenates `task` and `context` (when present) into one prompt
 text before sending it to its own session
 (`format!("{task}\n\n{context}")` — `child::run_child_async`); `context`
 is not yet passed to the model as a separate structured input.
 
-`continue_from` is carried end to end on the parent side
-(`ChildRunSpec::continue_from`, filled by `run_child_via_backend` from the
-child's stored backend resume token), but the child process does not
-implement continuation: a `Task` with a non-null `continue_from` makes it
-send `Error` (`"job child continuation is not supported"`) and exit with a
-failure code. `JobChildBackend` itself never returns a continuation token
-(`ChildRunOutcome::continuation` is always `None`), so a job-backed child
-never produces one to resume from.
+**Continuation.** Without `continue_from` the child opens a fresh session
+(`Harwness::session`). With it, the child parses the token as an SDK
+session id and resumes that stored session (`Harwness::resume`) instead;
+this works because the resumed process uses the same `HARW_HOME` as the
+run that produced the token, so the session store is the same. The
+resumed session runs under the rights, budget and mode of *this* run's
+frames, not the earlier one's. A token that does not parse or names no
+resumable session makes the child send `Error` (`"failed to resume the
+child session: …"`) and exit with a failure code; no `Result` follows.
+
+On the parent side the token travels end to end: `JobChildBackend` hands
+a budget-ended `Result`'s `continuation` back as
+`ChildRunOutcome::continuation`, `ManagedAgentSpawner` stores it as the
+child's backend resume token, and the next `run_child_via_backend` for
+that child passes it as `ChildRunSpec::continue_from`, which lands in this
+field.
 
 ### 4.2 `Message`
 
@@ -240,12 +261,12 @@ after it, the frame is rejected (§4.4).
 }
 ```
 
-A backend only ever **narrows**: widening a child past its own manifest is
-never valid, and `child::narrow_rights` enforces `min(child manifest,
-rights from this frame)` field by field (tool set and host set
-intersect, every boolean — `full_access` included — is AND'd) the moment
-this frame arrives. §6 describes how the result reaches the child's
-session.
+A backend only ever **narrows**: widening a child past its own ceiling is
+never valid. Several `Rights` frames before the `Task` narrow each other
+(`child::narrow_rights`: tool set and host set intersect, every boolean —
+`full_access` included — is AND'd); the collected value is then
+intersected with the child's own ceiling when the session is built. §6
+describes that step and how the result reaches the child's session.
 
 `ChildRights` (the shape carried in this frame and in `Result`'s
 counterparts) mirrors `harw_runtime::embedded::EffectiveRights`'s shape
@@ -260,7 +281,7 @@ and stay stable independent of that crate's internals:
 | `write` | bool | Write access to the workspace. |
 | `shell` | bool | Shell execution. |
 | `host` | bool | Host-level (unsandboxed) execution. |
-| `full_access` | bool | The manifest's full-access escape hatch. |
+| `full_access` | bool | Automatic approval: when effective, the child's session approves tool calls itself instead of relaying them (§6). |
 
 ## 5. Child-to-parent frames
 
@@ -339,17 +360,28 @@ closing — see §7).
 | Status | Meaning |
 |---|---|
 | `completed` | Regular completion. |
-| `cancelled` | Cancelled, via a `Cancel` frame or the child's own budget. |
+| `cancelled` | Cancelled, via a `Cancel` frame or any cancel reason other than the budget. |
 | `failed` | Any other non-successful end (provider/turn error, refusal, truncation, …). |
-| `budget_exhausted` | The run's budget ended it; `text` is the last (or handed-off) answer. |
+| `budget_exhausted` | The run's budget ended it; `text` is the last (or handed-off) answer and `continuation` resumes it. |
 
 `child::translate_turn_report` maps `harwness_sdk::TurnStatus::Completed`
-to `completed`, `Cancelled` to `cancelled`, and `Truncated`/`Refused`/
+to `completed`, `Cancelled { reason: "budget" }` to `budget_exhausted`,
+every other `Cancelled` to `cancelled`, and `Truncated`/`Refused`/
 `Failed` all to `failed`. A session-level error (the turn could not run
-at all) also becomes `failed`, with the error text as `text`. The child
-side never produces `budget_exhausted` today; that status exists in the
-protocol for a budget-driven continuation flow (`continue_from` in
-`Task`, §4.1) that the child does not implement.
+at all) also becomes `failed`, with the error text as `text`.
+
+`continuation` (string, optional) is the opaque token a later `Task`
+hands back in `continue_from` (§4.1) — today the child's SDK session id.
+The child sets it only with `budget_exhausted` and omits it otherwise:
+
+```json
+{"type": "result", "status": "budget_exhausted", "text": "partial", "continuation": "<session id>"}
+```
+
+The field is additive: a `Result` frame without it (from an older peer)
+still decodes, as `None`. The parent keeps a token only on a
+`budget_exhausted` result; one sent with any other status is dropped
+rather than trusted.
 
 On the parent side (`job_child_backend::from_wire_status`), `completed`
 and `budget_exhausted` map to the `ChildRunStatus` of the same name,
@@ -402,10 +434,11 @@ The child hit an error it could not otherwise report.
 ```
 
 The child sends it for: a line that fails to decode before the `Task`
-(§3); a `Task` before any `Rights` (§3); a `Task` with `continue_from`
-(§4.1); an unsupported or malformed frame while the turn runs (§4.4);
-(#22 wave 6) an oversized line (§2); and a failure to build its
-`Harwness` or start its session.
+(§3); a `Task` before any `Rights` (§3); a `continue_from` token it
+cannot resume (§4.1, `"failed to resume the child session: …"`); an
+unsupported or malformed frame while the turn runs (§4.4); an oversized
+or non-UTF-8 line (§2); and a failure to build its `Harwness` or start
+its session.
 
 Distinct from `Result`'s `failed` status, which is a *result* of a turn
 that ran: `Error` is sent when the child cannot even produce one. The
@@ -415,36 +448,65 @@ stopped (§7).
 
 ## 6. Rights narrowing in the child process
 
-The child's effective rights are the intersection of three sources
-(#22 wave 6):
+The child's effective rights are its own ceiling intersected with every
+`Rights` frame the parent sent:
 
 ```text
-child rights = child manifest ∩ runner flags ∩ parent's Rights frame
+own ceiling  = child manifest narrowed by the child's runner flags
+child rights = own ceiling ∩ parent's Rights frame(s)
 ```
 
-- **Child manifest.** `child::manifest_rights_of` converts the child's
+- **Own ceiling.** `child::own_ceiling` converts the child's
   `AgentIr::permissions` with the same
   `harw_runtime::embedded::EffectiveRights::from_manifest` every
   top-level interface uses (§5.1 of the [agent compiler
-  guide](../guides/agent-compiler.md)), field for field.
-- **Runner flags.** The child process's own rights flags, applied as for
-  any runner invocation (`EffectiveRights::narrowed_by`).
-- **Parent's `Rights` frame.** (#22 wave 6) The parent sends the child's
-  real current rights — the rights its own run grants that child — rather
-  than a placeholder; `child::narrow_rights` intersects them with the
-  manifest side (§4.7).
+  guide](../guides/agent-compiler.md)) and narrows it by the child
+  process's own rights flags (`--deny-tool`, `--no-network`,
+  `--read-only`, `--max-tokens`; `EffectiveRights::narrowed_by`). One
+  exception: `full_access` is forced to `true` in the ceiling. A job
+  child is never started with `--full-access`, so ANDing that flag in
+  would make the parent's grant unreachable.
+- **Parent's `Rights` frame(s).** Several frames before the `Task` narrow
+  each other (§4.7). `child::effective_child_rights` then intersects the
+  result, together with the collected `Budget` (§4.5), with the ceiling
+  (`EffectiveRights::intersect`: sets intersect, booleans are AND'd, each
+  budget limit takes the stricter value).
 
-`full_access` is AND'd at every one of these steps (#22 wave 6): a child
-has automatic approval only if its manifest ceiling, the runner flags and
-the parent's frame all allow it.
+`full_access` is therefore effective only through the parent's grant. When
+it is, the child builds its session with `ApprovalPolicy::FullAccess` and
+approves tool calls itself; otherwise every approval is relayed to the
+parent (§5.3).
 
-The narrowed value is applied to the session the child actually runs:
+**What the parent sends.** `ManagedAgentSpawner::run_child_via_backend`
+(`harw-core/src/child_controller.rs`) fills `ChildRunSpec::rights` from
+`backend_rights`, which computes exactly the rights the child would have
+in-process:
+
+- `tools`: the tools the child's session would see now
+  (`turn_loop::collect_tools`), further intersected with the parent's
+  activation that admission cut the child against.
+- `write`/`shell`/`network_open`: `WriteWorkspace`/`ExecuteProcess`/
+  `NetworkAccess`, each only if both the child's and the parent's sandbox
+  hold it.
+- `network_hosts`: the hosts of the child's network scope that the
+  parent's scope allows. `PublicDns` and CIDR targets have no counterpart
+  in `ChildRights` and are dropped for a job child (fail closed: the
+  child loses that egress rather than gaining a wider one).
+- `host`: set when a host-level tool (`host.*`) is among `tools`.
+- `full_access`: `true` exactly when the root's approval mode reads
+  `ApprovalMode::FullAccess`; without an approval-mode cell, never.
+
+If the child, its sandbox or the parent cannot be found, or a lock is
+poisoned, `backend_rights` fails closed to empty rights: a job child
+started that way may do nothing. `JobChildBackend` passes the value on
+unchanged (`to_wire_rights`); it never narrows or widens it itself.
+
+The result is applied to the session the child actually runs:
 `child::run_child_async` selects the child as the embedded root
 (`EmbeddedAgent::for_agent`) and then calls `EmbeddedAgent::with_rights`
-with the narrowed rights and the collected budget (§4.5). `with_rights`
-intersects, so this step can only narrow further. The session's
-tool/network/write/shell/host behavior therefore comes from the narrowed
-value, not from the bare manifest.
+with the effective rights. `with_rights` intersects, so this step can only
+narrow further. The session's tool/network/write/shell/host behavior
+therefore comes from the effective value, not from the bare manifest.
 
 ## 7. The parent side: `JobChildBackend`
 
@@ -454,8 +516,11 @@ delegation calls (`ManagedAgentSpawner::run_child_via_backend` builds the
 it, over a real OS process:
 
 1. Builds `std::env::current_exe() --child <agent-id> --child-protocol
-   stdio`, stdin/stdout/stderr all piped, in its **own process group**
-   (`process_group(0)` on Unix). In production (`JobChildBackend::new`)
+   stdio`, plus `--offline-echo` when the parent itself runs with it
+   (`JobChildBackend::new`'s `offline_echo`, set by
+   `RunnerContext::builder` from the parent's own flag), stdin/stdout/
+   stderr all piped, in its **own process group** (`process_group(0)` on
+   Unix). In production (`JobChildBackend::new`)
    the command runs as a real job through
    `harw_tool_job::JobManager::start_piped` (job name
    `agent-child-<agent-id>`): stdout is teed into the job's stdout log
@@ -471,9 +536,11 @@ it, over a real OS process:
 4. Relays every subsequent frame: `Event` goes to the caller's `ChildIo`
    sink, `Question`/`ApprovalRequest` are awaited and answered with
    `Answer`, `Usage` is currently read and dropped, `Error` and `Result`
-   end the loop. A second `Hello` or an undecodable line fails the run.
-   After `Failed`, the child's job (or, in the test seam, its process
-   group) is stopped.
+   end the loop. A `Result` becomes the `ChildRunOutcome`; its
+   `continuation` is kept only for `budget_exhausted` (§5.4). A second
+   `Hello`, an undecodable line, or an oversized or non-UTF-8 line (§2)
+   fails the run. After `Failed`, the child's job (or, in the test seam,
+   its process group) is stopped.
 5. On cancellation (`spec.cancel.cancelled()`), stops the job
    (`JobManager::stop` with `SIGTERM`; the test seam kills the process
    group via `rustix::process::kill_process_group`) rather than sending

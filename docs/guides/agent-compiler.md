@@ -137,6 +137,20 @@ installing the full runner.
 Inside the TUI, `/agent build` runs the same build as a job with progress
 in the panel.
 
+An agent can build agents itself through the `agents.build` tool
+(arguments `name_or_path`, `interfaces`, `native`). It is registered only
+for an explicitly chosen agent whose definition names `agents.build`
+literally in `[tools].admitted` (and not in `forbidden`); built-in roles
+and a UIA without an explicit definition never get it. It also needs
+`ExecuteProcess` in the agent's sandbox and a session with a job system:
+the build always runs as a background job, the call returns the job id,
+and progress and result come from `job.status`/`job.logs`. It is not on
+the list of automatically approved tools, so each call asks for approval
+like `shell.exec`. If a condition other than the definition is missing,
+the tool is left out and the reason is logged
+(`runtime.agents_build.withheld`). Child agents do not get `agents.build`
+yet, even when their definition admits it.
+
 Building the same definition twice with the same harw version gives the
 same artifact hash.
 
@@ -309,17 +323,29 @@ every frame.
 The parent sends `Rights`, then `Budget` (if the run has one), then
 `Mode`, then `Task`. `Rights` is mandatory: a child that receives `Task`
 first answers with an `Error` frame and exits. A child's effective rights
-are `its own manifest ∩ the runner flags ∩ the parent's Rights frame`, and
-the parent sends the child's real current rights (#22 wave 6); every
-boolean right, `full_access` included, is AND'd at each step. The result
-is applied to the child's session (`EmbeddedAgent::with_rights`), so a
-parent can only narrow a child below its own manifest, never grant it
-more. A `Budget` frame likewise only tightens the child's budget (wall
-time travels in milliseconds and becomes whole seconds in the child).
-`live` mode runs the child's session in work mode. A resumed run
-(`continue_from`) is not supported by a child process and ends with an
+are `its own ceiling ∩ the parent's Rights frame`, where the ceiling is
+the child's manifest narrowed by the child's own runner flags. The parent
+sends the child's real current rights, exactly what the child would have
+in-process (tools, sandbox rights, allowed hosts); if it cannot determine
+them it sends empty rights. Network targets given as public DNS or CIDR
+ranges have no form on the wire and are dropped for a job child. Every
+boolean right is AND'd. `full_access` is the one exception on the child's
+side: the child's command line never carries it, so it comes only from
+the parent, which grants it when the root runs in full-access approval
+mode; the child's session then approves tool calls itself instead of
+relaying them. The result is applied to the child's session
+(`EmbeddedAgent::with_rights`), so a parent can only narrow a child below
+its own manifest, never grant it more. A `Budget` frame likewise only
+tightens the child's budget (wall time travels in milliseconds and
+becomes whole seconds in the child). `live` mode runs the child's
+session in work mode. A child that runs out of budget reports
+`budget_exhausted` with a `continuation` token (its session id); a later
+`Task` with that token in `continue_from` resumes the stored session from
+the same `HARW_HOME`, and a token the child cannot resume ends with an
 `Error` frame. Each protocol line is bounded: at most 64 levels of JSON
-nesting, and (#22 wave 6) at most `MAX_FRAME_BYTES` (1 MiB).
+nesting and at most `MAX_FRAME_BYTES` (1 MiB); an oversized or non-UTF-8
+line ends the run on either side. A parent started with `--offline-echo`
+passes the flag on to its children.
 
 `harw-agent-runner` ships the process-driving side of this
 (`JobChildBackend`, tested standalone against real spawned processes:

@@ -221,14 +221,27 @@ way, made two decisions this record did not anticipate:
   protocol version is checked in the child's `Hello` frame), run as a job
   in its own process group, stopped as a group on cancel. The parent must
   send a `Rights` frame before the `Task`; without it the child sends
-  `Error` and exits. The child's rights are `its own manifest ∩ the
-  runner flags ∩ the parent's Rights frame`, where the parent sends the
-  child's real current rights and `full_access` is AND'd at every step
-  (#22 wave 6); the child applies the result to its own session
-  (`EmbeddedAgent::with_rights`). This is additive to §2.6's
+  `Error` and exits. The child's rights are `its own ceiling ∩ the
+  parent's Rights frame`, the ceiling being its manifest narrowed by its
+  own runner flags; the child applies the result to its own session
+  (`EmbeddedAgent::with_rights`). The parent
+  (`ManagedAgentSpawner::backend_rights`) sends the child's real
+  in-process rights and fails closed to empty rights when it cannot
+  determine them; network targets given as public DNS or CIDR ranges
+  have no wire form and are dropped. `full_access` is forced on in the
+  child's ceiling (a job child is never started with `--full-access`), so
+  it is effective only through the parent's grant, which follows the
+  root's full-access approval mode; the child's session then uses
+  `ApprovalPolicy::FullAccess`. This is additive to §2.6's
   `min(manifest, flags)` rule, not a change to it: a child's rights are
   still never wider than its own manifest, only possibly narrower still
   because of its parent. A `Budget` frame likewise only tightens.
+  A budget-ended child reports `budget_exhausted` with a `continuation`
+  token (its session id) that a later `Task` resumes through
+  `continue_from` (`Harwness::resume`, same `HARW_HOME`). Every protocol
+  line is bounded by `MAX_FRAME_BYTES` (1 MiB); an oversized or non-UTF-8
+  line ends the run on either side. `--offline-echo` is passed on to
+  children.
 - **The runner's own interfaces are one crate, `cli`/`repl`/`mcp`/`http`
   behind cargo features, `tui` reusing `harw-tui`'s existing renderer**
   (`harw_tui::fixed_agent`) rather than a new one — §2.5 left this

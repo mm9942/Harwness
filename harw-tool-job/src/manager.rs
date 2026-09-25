@@ -65,6 +65,10 @@ const EVENT_LINE_CHARS: usize = 400;
 const KILL_WAIT: Duration = Duration::from_secs(3);
 /// Abfrageintervall für Prozesse ohne eigenen Überwachungs-Task.
 const FOREIGN_POLL: Duration = Duration::from_millis(200);
+/// Vorgabe-Höchstlänge einer stdout-Zeile eines [`JobManager::start_piped`]-Jobs
+/// in Bytes (ohne `\n`): 1 MiB, gleich `harw-agent-runner`s
+/// `child_protocol::MAX_FRAME_BYTES`.
+pub const DEFAULT_MAX_PIPED_LINE_BYTES: usize = 1024 * 1024;
 
 /// Einstellungen der Job-Verwaltung.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -192,9 +196,38 @@ pub struct PipedJob {
     pub stdin: ChildStdin,
     /// Zeilen der stdout, in Ankunftsreihenfolge (dieselben Zeilen landen
     /// auch in `STDOUT_LOG`). Endet (liefert `None`), wenn der Prozess seine
-    /// stdout schließt.
-    pub stdout_lines: mpsc::UnboundedReceiver<String>,
+    /// stdout schließt. Eine zu lange oder nicht-UTF-8-Zeile liefert genau
+    /// ein `Err` ([`PipedLineError`]); danach endet der Strom, und die
+    /// stdout-Pipe ist geschlossen (der Prozess sieht beim nächsten
+    /// Schreiben `EPIPE`/`SIGPIPE`).
+    pub stdout_lines: mpsc::UnboundedReceiver<Result<String, PipedLineError>>,
 }
+
+/// Warum der stdout-Zeilenstrom eines [`PipedJob`] vorzeitig endete.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PipedLineError {
+    /// Eine Zeile wurde länger als `limit` Bytes (ohne `\n`), bevor ihr `\n`
+    /// kam; gelesen wurde höchstens `limit` Bytes davon.
+    TooLong {
+        /// Die überschrittene Grenze.
+        limit: usize,
+    },
+    /// Eine Zeile war kein gültiges UTF-8.
+    InvalidUtf8,
+}
+
+impl fmt::Display for PipedLineError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::TooLong { limit } => {
+                write!(f, "job stdout line exceeds the {limit}-byte limit")
+            }
+            Self::InvalidUtf8 => f.write_str("job stdout line is not valid UTF-8"),
+        }
+    }
+}
+
+impl std::error::Error for PipedLineError {}
 
 /// Ausgang von [`JobManager::wait`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -664,6 +697,23 @@ impl JobManager {
         request: StartRequest,
         prepared: PreparedJob,
     ) -> Result<PipedJob, JobError> {
+        self.start_piped_with_line_limit(request, prepared, DEFAULT_MAX_PIPED_LINE_BYTES)
+    }
+
+    /// Wie [`JobManager::start_piped`], aber mit eigener Höchstlänge einer
+    /// stdout-Zeile (`max_line_bytes`, ohne `\n`). Eine längere Zeile wird
+    /// nie über die Grenze hinaus gepuffert: das Mitschreib-Task hört auf zu
+    /// lesen, vermerkt es in `STDOUT_LOG`, schickt
+    /// [`PipedLineError::TooLong`] und schließt Strom und Pipe.
+    ///
+    /// # Errors
+    /// Wie [`JobManager::start_piped`].
+    pub fn start_piped_with_line_limit(
+        self: &Arc<Self>,
+        request: StartRequest,
+        prepared: PreparedJob,
+        max_line_bytes: usize,
+    ) -> Result<PipedJob, JobError> {
         self.check_capacity()?;
         let (id, dir) = self.allocate()?;
         let stdout_log_path = dir.join(STDOUT_LOG);
@@ -743,7 +793,7 @@ impl JobManager {
         });
 
         let (line_tx, line_rx) = mpsc::unbounded_channel();
-        let tee = tokio::spawn(tee_stdout(stdout, stdout_log, line_tx));
+        let tee = tokio::spawn(tee_stdout(stdout, stdout_log, line_tx, max_line_bytes));
 
         let monitor = Monitor {
             entry: Arc::clone(&entry),
@@ -1107,25 +1157,91 @@ async fn cancelled(cancel: Option<&CancelToken>) {
 /// `sender` — bis die Pipe schließt (Prozessende) oder ein Lesefehler
 /// auftritt. Ist der Empfänger bereits verworfen, wird trotzdem bis zum Ende
 /// weiter mitgeschrieben (nur `STDOUT_LOG` zählt dann noch).
+///
+/// # Description
+/// Anders als `AsyncBufReadExt::lines` puffert es eine Zeile höchstens bis
+/// `max_line_bytes`: wird sie länger (oder ist sie kein UTF-8), vermerkt es
+/// das in `stdout_log`, schickt genau ein `Err` und endet. Damit schließt es
+/// die Pipe; der Rest der Zeile wird nie gelesen, und Überwachung und
+/// `stop` laufen wie bei jedem anderen Job weiter.
 async fn tee_stdout(
     stdout: ChildStdout,
     mut stdout_log: File,
-    sender: mpsc::UnboundedSender<String>,
+    sender: mpsc::UnboundedSender<Result<String, PipedLineError>>,
+    max_line_bytes: usize,
 ) {
-    let mut lines = BufReader::new(stdout).lines();
+    let mut reader = BufReader::new(stdout);
+    let mut buf = Vec::new();
     loop {
-        match lines.next_line().await {
-            Ok(Some(line)) => {
-                if let Err(err) = writeln!(stdout_log, "{line}") {
-                    debug!(error = %err, "job stdout tee: log write failed");
+        let failure = match read_bounded_line(&mut reader, &mut buf, max_line_bytes).await {
+            Ok(BoundedLine::Line) => match String::from_utf8(std::mem::take(&mut buf)) {
+                Ok(line) => {
+                    if let Err(err) = writeln!(stdout_log, "{line}") {
+                        debug!(error = %err, "job stdout tee: log write failed");
+                    }
+                    let _ = sender.send(Ok(line));
+                    continue;
                 }
-                let _ = sender.send(line);
-            }
-            Ok(None) => break,
+                Err(_) => PipedLineError::InvalidUtf8,
+            },
+            Ok(BoundedLine::Eof) => break,
+            Ok(BoundedLine::TooLong) => PipedLineError::TooLong {
+                limit: max_line_bytes,
+            },
             Err(err) => {
                 debug!(error = %err, "job stdout tee: read failed");
                 break;
             }
+        };
+        warn!(error = %failure, "job stdout tee: stopped reading stdout");
+        if let Err(err) = writeln!(stdout_log, "[harw] {failure}; stopped reading stdout") {
+            debug!(error = %err, "job stdout tee: log write failed");
+        }
+        let _ = sender.send(Err(failure));
+        break;
+    }
+}
+
+/// Ausgang von [`read_bounded_line`].
+enum BoundedLine {
+    /// Eine Zeile (ohne `\n` und ohne abschließendes `\r`) steht im Puffer.
+    Line,
+    /// Sauberes Ende der Pipe ohne offene Bytes.
+    Eof,
+    /// Die Zeile wurde länger als die Grenze; ihr Rest ist ungelesen.
+    TooLong,
+}
+
+/// Liest die nächste Zeile aus `reader` nach `buf` (vorher geleert) und
+/// kopiert dabei höchstens `limit` Inhalts-Bytes (ohne `\n`). Eine letzte
+/// Zeile ohne `\n` vor dem Pipe-Ende zählt als Zeile (wie bei `lines()`).
+async fn read_bounded_line<R: tokio::io::AsyncBufRead + Unpin>(
+    reader: &mut R,
+    buf: &mut Vec<u8>,
+    limit: usize,
+) -> io::Result<BoundedLine> {
+    buf.clear();
+    loop {
+        let available = reader.fill_buf().await?;
+        if available.is_empty() {
+            return Ok(if buf.is_empty() {
+                BoundedLine::Eof
+            } else {
+                BoundedLine::Line
+            });
+        }
+        let newline = available.iter().position(|&byte| byte == b'\n');
+        let content_len = newline.unwrap_or(available.len());
+        if buf.len().saturating_add(content_len) > limit {
+            return Ok(BoundedLine::TooLong);
+        }
+        buf.extend_from_slice(&available[..content_len]);
+        reader.consume(newline.map_or(content_len, |index| index + 1));
+        if newline.is_some() {
+            if buf.last() == Some(&b'\r') {
+                buf.pop();
+            }
+            return Ok(BoundedLine::Line);
         }
     }
 }

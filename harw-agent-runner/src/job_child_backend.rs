@@ -35,7 +35,8 @@ use harw_core::child_backend::{
 };
 use harw_core::child_controller::ChildUsage;
 use harw_tool_job::{
-    Caller, JobId, JobManager, JobOwner, JobSignal, PipedJob, PreparedJob, StartRequest,
+    Caller, JobId, JobManager, JobOwner, JobSignal, PipedJob, PipedLineError, PreparedJob,
+    StartRequest,
 };
 use harw_types::cancel::CancelReason;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
@@ -206,9 +207,11 @@ fn kill_process_group(_child: &Child) {}
 enum StdoutSource {
     /// Read here, bounded by [`MAX_FRAME_BYTES`] before buffering past it.
     Direct(FrameReader<BufReader<tokio::process::ChildStdout>>),
-    /// Lines `harw_tool_job`'s stdout tee already split; their length is
-    /// checked against [`MAX_FRAME_BYTES`] on arrival.
-    JobManaged(mpsc::UnboundedReceiver<String>),
+    /// Lines `harw_tool_job`'s stdout tee already split, bounded by
+    /// [`MAX_FRAME_BYTES`] there (`start_piped_with_line_limit`): an
+    /// oversized or non-UTF-8 line arrives as one [`PipedLineError`] instead
+    /// of being buffered. The length is checked again here as a guard.
+    JobManaged(mpsc::UnboundedReceiver<Result<String, PipedLineError>>),
 }
 
 impl StdoutSource {
@@ -219,10 +222,15 @@ impl StdoutSource {
                 other => other,
             },
             Self::JobManaged(receiver) => match receiver.recv().await {
-                Some(line) if line.len() > MAX_FRAME_BYTES => Err(FrameReadError::TooLarge {
+                Some(Ok(line)) if line.len() > MAX_FRAME_BYTES => Err(FrameReadError::TooLarge {
                     limit: MAX_FRAME_BYTES,
                 }),
-                line => Ok(line),
+                Some(Ok(line)) => Ok(Some(line)),
+                Some(Err(PipedLineError::TooLong { limit })) => {
+                    Err(FrameReadError::TooLarge { limit })
+                }
+                Some(Err(PipedLineError::InvalidUtf8)) => Err(FrameReadError::InvalidUtf8),
+                None => Ok(None),
             },
         }
     }
@@ -251,7 +259,8 @@ async fn run_job_managed<S: ChildProcessSpawner>(
         notify_every: Duration::ZERO,
         owner: JobOwner::new(spec.parent.as_str(), Vec::new()),
     };
-    let piped = match job_manager.start_piped(request, prepared) {
+    let piped = match job_manager.start_piped_with_line_limit(request, prepared, MAX_FRAME_BYTES)
+    {
         Ok(piped) => piped,
         Err(err) => {
             return ChildRunOutcome {
@@ -1004,8 +1013,8 @@ mod tests {
         let config = harw_tool_job::JobManagerConfig::new(dir.path());
         let job_manager =
             harw_tool_job::JobManager::new(config, Arc::new(harw_tool_job::NoopNotifier))?;
-        // The job tee splits on `\n`, so this variant ends its oversized
-        // line; the backend still refuses it by length.
+        // This variant ends its oversized line; the job tee refuses it by
+        // length before the `\n` arrives, like the unterminated one below.
         let script = format!(
             r#"printf '{{"type":"hello","agent_id":"fixture-child","protocol":"{version}","digest":"d"}}\n'; read _rights; read _mode; read _task; head -c {size} /dev/zero | tr '\000' a; printf '\n'; sleep 30"#,
             version = crate::child_protocol::PROTOCOL_VERSION,
@@ -1013,6 +1022,38 @@ mod tests {
         );
         let backend = JobChildBackend::with_spawner_and_job_manager(
             ShellSpawner { script },
+            Arc::clone(&job_manager),
+        );
+        let outcome = tokio::time::timeout(
+            Duration::from_secs(10),
+            backend.run(spec(harw_types::cancel::CancelToken::new()), &RecordingIo),
+        )
+        .await?;
+        assert!(
+            matches!(
+                &outcome.status,
+                ChildRunStatus::Failed { reason } if reason.contains("exceeds")
+            ),
+            "{:?}",
+            outcome.status
+        );
+        job_manager.stop_all().await;
+        Ok(())
+    }
+
+    /// Same as [`job_managed_path_refuses_an_oversized_frame`], but the
+    /// oversized line never ends: the job tee must stop at the limit instead
+    /// of buffering it, and the run must still fail rather than hang.
+    #[tokio::test]
+    async fn job_managed_path_refuses_an_unterminated_oversized_frame() -> TestResult {
+        let dir = tempfile::tempdir()?;
+        let config = harw_tool_job::JobManagerConfig::new(dir.path());
+        let job_manager =
+            harw_tool_job::JobManager::new(config, Arc::new(harw_tool_job::NoopNotifier))?;
+        let backend = JobChildBackend::with_spawner_and_job_manager(
+            ShellSpawner {
+                script: oversized_frame_script(),
+            },
             Arc::clone(&job_manager),
         );
         let outcome = tokio::time::timeout(

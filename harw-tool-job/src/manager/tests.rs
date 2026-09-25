@@ -507,7 +507,8 @@ async fn test_start_piped_echoes_stdin_tees_stdout_and_detects_exit() -> TestRes
     let line = tokio::time::timeout(LIMIT, piped.stdout_lines.recv())
         .await
         .map_err(ctx("recv timeout"))?
-        .ok_or(TestError::Missing("stdout line"))?;
+        .ok_or(TestError::Missing("stdout line"))?
+        .map_err(ctx("stdout line"))?;
     assert_eq!(line, "hello");
 
     // `cat` sees EOF on stdin and exits 0.
@@ -553,7 +554,8 @@ async fn test_start_piped_stop_kills_process_group() -> TestResult {
     let line = tokio::time::timeout(LIMIT, piped.stdout_lines.recv())
         .await
         .map_err(ctx("recv timeout"))?
-        .ok_or(TestError::Missing("child pid line"))?;
+        .ok_or(TestError::Missing("child pid line"))?
+        .map_err(ctx("child pid line"))?;
     let child_pid: u32 = line
         .trim()
         .parse()
@@ -569,6 +571,104 @@ async fn test_start_piped_stop_kills_process_group() -> TestResult {
 
     let dead = eventually(LIMIT, || !is_same_process_alive(child_pid, None)).await;
     assert!(dead, "child {child_pid} of the piped job survived job.stop");
+    Ok(())
+}
+
+/// Liest den Zeilenstrom eines `start_piped`-Jobs bis zu seinem Ende.
+async fn drain_lines(
+    lines: &mut mpsc::UnboundedReceiver<Result<String, PipedLineError>>,
+) -> TestResult<Vec<Result<String, PipedLineError>>> {
+    let mut items = Vec::new();
+    while let Some(item) = tokio::time::timeout(LIMIT, lines.recv())
+        .await
+        .map_err(ctx("recv timeout"))?
+    {
+        items.push(item);
+    }
+    Ok(items)
+}
+
+/// Startet `script` über `/bin/sh -c` als `start_piped`-Job mit der
+/// Zeilengrenze `limit` und liefert alle Strom-Einträge sowie die
+/// `STDOUT_LOG`-Zeilen, nachdem der Job beendet ist.
+async fn run_piped_script(
+    env: &Env,
+    script: &str,
+    limit: usize,
+) -> TestResult<(Vec<Result<String, PipedLineError>>, Vec<String>)> {
+    let prepared = env.prepare_piped(&["/bin/sh", "-c", script]).await?;
+    let mut piped = env
+        .manager
+        .start_piped_with_line_limit(request("limit", "agent-a", &[]), prepared, limit)
+        .map_err(ctx("start_piped"))?;
+    let id = piped.job_id.clone();
+    let items = drain_lines(&mut piped.stdout_lines).await?;
+    let (outcome, _) = env
+        .manager
+        .wait(&id, Caller::Agent("agent-a"), LIMIT, None)
+        .await
+        .map_err(ctx("wait"))?;
+    assert_eq!(outcome, WaitOutcome::Finished);
+    let dir = env
+        .manager
+        .log_dir(&id, Caller::Agent("agent-a"))
+        .map_err(ctx("log dir"))?;
+    Ok((items, read_all(&dir.join(STDOUT_LOG))?))
+}
+
+#[tokio::test]
+async fn test_start_piped_line_at_limit_passes() -> TestResult {
+    let env = Env::new()?;
+    let (items, log) = run_piped_script(&env, "printf 'abcdefgh\\nxy\\r\\n'", 8).await?;
+    assert_eq!(items, vec![Ok("abcdefgh".to_owned()), Ok("xy".to_owned())]);
+    assert_eq!(log, vec!["abcdefgh".to_owned(), "xy".to_owned()]);
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_start_piped_overlong_line_ends_stream_with_error() -> TestResult {
+    let env = Env::new()?;
+    let (items, log) =
+        run_piped_script(&env, "printf 'abc\\nabcdefghi\\nafter\\n'", 8).await?;
+    assert_eq!(
+        items,
+        vec![
+            Ok("abc".to_owned()),
+            Err(PipedLineError::TooLong { limit: 8 })
+        ]
+    );
+    assert_eq!(log.first().map(String::as_str), Some("abc"));
+    assert!(
+        log.iter()
+            .any(|line| line.contains("exceeds the 8-byte limit")),
+        "{log:?}"
+    );
+    assert!(!log.iter().any(|line| line.contains("after")), "{log:?}");
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_start_piped_endless_line_is_cut_off_at_the_limit() -> TestResult {
+    let env = Env::new()?;
+    // Eine Zeile ohne `\n`, die ohne Grenze endlos wüchse; `head` ist nur das
+    // Sicherheitsnetz (64 MiB). Mit der Grenze endet der Strom nach 1 MiB,
+    // die Pipe wird geschlossen und die Pipeline stirbt an `SIGPIPE`.
+    let (items, log) = run_piped_script(
+        &env,
+        "yes | tr -d '\\n' | head -c 67108864",
+        DEFAULT_MAX_PIPED_LINE_BYTES,
+    )
+    .await?;
+    assert_eq!(
+        items,
+        vec![Err(PipedLineError::TooLong {
+            limit: DEFAULT_MAX_PIPED_LINE_BYTES
+        })]
+    );
+    assert!(
+        log.iter().all(|line| line.len() < 1024) && log.len() == 1,
+        "{log:?}"
+    );
     Ok(())
 }
 
