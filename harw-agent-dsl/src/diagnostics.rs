@@ -646,6 +646,16 @@ pub mod codes {
         "[binary]\ninterfaces = [\"cli\", \"cli\"]",
         "list each interface once: `interfaces = [\"cli\"]`"
     );
+    code!(
+        BINARY_UNKNOWN_CHILD_EXECUTION,
+        "HARW-BINARY-006",
+        Binary,
+        Error,
+        "unknown `child_execution` value",
+        "known values: `job` (the default, each child runs as a separate job-managed process) and `in-process`",
+        "[binary]\nchild_execution = \"thread\"",
+        "choose from job, in-process: `child_execution = \"job\"`"
+    );
 }
 
 /// Every code of [`codes`], in catalog order.
@@ -694,6 +704,7 @@ pub const CATALOG: &[DiagnosticCode] = &[
     codes::BINARY_EMPTY_INTERFACES,
     codes::BINARY_INVALID_NAME,
     codes::BINARY_DUPLICATE_INTERFACE,
+    codes::BINARY_UNKNOWN_CHILD_EXECUTION,
 ];
 
 /// Looks up a code in [`CATALOG`].

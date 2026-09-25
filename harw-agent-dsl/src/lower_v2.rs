@@ -53,8 +53,9 @@ use crate::diagnostics::{
 use crate::error::DslError;
 use crate::ids::DefinitionId;
 use crate::ir_v2::{
-    AGENT_IR_SCHEMA, AgentIr, Authority, Binary, Budget, ContextProgram, ContextSection, Effort,
-    FilesystemPermissions, Instructions, Interface, Job, Lifecycle, Limits, ModelRef, Models,
+    AGENT_IR_SCHEMA, AgentIr, Authority, Binary, Budget, ChildExecution, ContextProgram,
+    ContextSection, Effort, FilesystemPermissions, Instructions, Interface, Job, Lifecycle, Limits,
+    ModelRef, Models,
     NetworkMode, NetworkPermissions, Permissions, Research, ReturnContract, ReturnPipeline,
     ReturnValidator, SkillEntry, Skills, SpawnContract, SpawnPermissions, ToolSurface, Trace,
     TraceStep, Verification, WORKSPACE_WRITE_PATH, Work,

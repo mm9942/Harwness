@@ -239,11 +239,11 @@ fn run(load: impl FnOnce() -> Result<(Artifact, Bundle), RunnerError>) -> ExitCo
         };
     }
 
-    let (_artifact, bundle) = match load() {
+    let (artifact, bundle) = match load() {
         Ok(pair) => pair,
         Err(error) => return report_error(&error),
     };
-    let agent = match EmbeddedAgent::from_bundle(bundle.clone()) {
+    let agent = match EmbeddedAgent::from_bundle(bundle.clone(), &artifact) {
         Ok(agent) => agent,
         Err(error) => return report_error(&RunnerError::Runtime(error)),
     };
