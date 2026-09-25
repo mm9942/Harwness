@@ -97,16 +97,35 @@ install_from_source() {
 
   log "Building harw + killer (release)…"
   ( cd "$repo_root" && cargo build --release --bin harw --bin killer )
+  log "Building harw-agent-runner (release-runner)…"
+  ( cd "$repo_root" && cargo build --profile release-runner --bin harw-agent-runner )
 
   built_harw="$repo_root/target/release/harw"
   built_killer="$repo_root/target/release/killer"
+  built_runner="$repo_root/target/release-runner/harw-agent-runner"
   [ -x "$built_harw" ] || die "build did not produce $built_harw"
   [ -x "$built_killer" ] || die "build did not produce $built_killer"
+  [ -x "$built_runner" ] || die "build did not produce $built_runner"
 
   mkdir -p "$install_dir"
   install -m 0755 "$built_harw" "$install_dir/harw"
   install -m 0755 "$built_killer" "$install_dir/killer"
-  log "Installed $install_dir/harw and $install_dir/killer"
+  install -m 0755 "$built_runner" "$install_dir/harw-agent-runner"
+  log "Installed $install_dir/harw, $install_dir/killer and $install_dir/harw-agent-runner"
+
+  # Same runner cache layout as `make install` (see root Makefile): a copy
+  # keyed by host target triple and workspace version, so a compiled agent
+  # can find a matching runner without re-resolving the build.
+  harw_home="${HARW_HOME:-$HOME/.harw}"
+  host_target="$(rustc -vV | sed -n 's/^host: //p')"
+  harw_version="$(awk -F'"' '/^version = /{print $2; exit}' "$repo_root/Cargo.toml")"
+  runner_cache_dir="$harw_home/bin/.runners/$host_target/$harw_version"
+  mkdir -p "$runner_cache_dir"
+  install -m 0755 "$built_runner" "$runner_cache_dir/harw-agent-runner"
+  log "Runner copy: $runner_cache_dir/harw-agent-runner"
+
+  "$install_dir/harw" agent install-record --source-dir "$repo_root" --bindir "$install_dir"
+  "$install_dir/harw" agent auto-build-uia || true
 }
 
 # --- Mode: binary --------------------------------------------------------------

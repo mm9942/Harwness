@@ -147,6 +147,13 @@ impl RootBudget {
             | EntryKind::Analyze
             | EntryKind::Doctor
             | EntryKind::Web => Self::unbounded_local(),
+            // #22 Welle 3A: ein kompilierter Agent läuft wie ein lokales
+            // CLI-Werkzeug (derselbe Mensch, dieselbe Maschine); die engere
+            // Obergrenze aus seinem Manifest
+            // (`EmbeddedAgent::rights().budget`) ist eine zusätzliche,
+            // eigene Prüfung außerhalb dieses Root-Budgets, kein Ersatz
+            // dafür (noch nicht verdrahtet — Folgearbeit außerhalb Welle 3A).
+            EntryKind::CompiledAgent => Self::unbounded_local(),
             EntryKind::McpServe | EntryKind::JobPrompt | EntryKind::JobPlanNode => Self {
                 max_model_rounds: JOB_MAX_ROUNDS,
                 max_total_tokens: JOB_MAX_TOKENS,

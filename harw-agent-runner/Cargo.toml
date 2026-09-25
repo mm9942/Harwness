@@ -118,8 +118,11 @@ tracing = { workspace = true }
 # `signal` added in wave 3B for `iface::repl`'s Ctrl+C → `CancelHandle`
 # wiring (`tokio::signal::ctrl_c`); `io-util` for `crate::child`'s
 # `AsyncBufReadExt`/`AsyncWriteExt` over its child process's stdio pipes.
-tokio = { version = "1.53.0", features = ["rt", "rt-multi-thread", "macros", "sync", "time", "net", "signal", "io-util"] }
+tokio = { version = "1.53.0", features = ["rt", "rt-multi-thread", "macros", "sync", "time", "net", "signal", "io-util", "process"] }
 serde = { workspace = true }
+# `job_child_backend`: `ChildBackend` trait and the child process group.
+harw-core = { path = "../harw-core" }
+rustix = { workspace = true, features = ["process"] }
 serde_json = { workspace = true }
 # `iface::mcp`'s event stream (optional: only pulled in by the `mcp`
 # feature); also a base dep of `iface::http`'s SSE stream via `http`'s own

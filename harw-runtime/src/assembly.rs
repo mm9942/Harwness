@@ -6602,6 +6602,7 @@ mod tests {
             reasoning_effort: None,
             approval_override: None,
             model_override: None,
+            embedded: None,
         }
     }
 
@@ -6990,6 +6991,7 @@ mod tests {
             reasoning_effort: None,
             approval_override: None,
             model_override: None,
+            embedded: None,
         };
 
         let builder = RuntimeAssembly::builder(spec).secret_resolver(Arc::new(FakeResolver));
@@ -7157,6 +7159,7 @@ mod tests {
             reasoning_effort: None,
             approval_override: None,
             model_override: None,
+            embedded: None,
         };
         let state_store: Arc<dyn StateStore> = Arc::new(harw_core::InMemoryStateStore::new());
         RuntimeAssembly::builder(spec)

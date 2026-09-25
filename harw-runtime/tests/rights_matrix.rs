@@ -133,6 +133,7 @@ fn spec_for(entry: EntryKind, fixture: &Fixture) -> RuntimeSpec {
         reasoning_effort: None,
         approval_override: None,
         model_override: None,
+        embedded: None,
     }
 }
 
@@ -273,6 +274,19 @@ fn expected(entry: EntryKind) -> Expected {
             spawner_empty: true,
         },
         EntryKind::McpServe | EntryKind::JobPrompt | EntryKind::GatewayDream => Expected {
+            permissions: NONE,
+            tools_empty: true,
+            approval_chain: DEFAULT_AND_ASK,
+            ceiling_empty: true,
+            spawner_empty: true,
+        },
+        // #22 Welle 3A: `EntryKind::CompiledAgent` hat keine Tabellenzeile —
+        // `EntryKind::profile()` liefert dafür nur die engste Rückfallzeile
+        // (leere Rechte, `RegistryProfile::NoTools`); die tatsächliche Zeile
+        // entsteht zur Montagezeit aus dem Manifest
+        // (`EntryProfile::for_embedded`), nicht hier. `ALL_ENTRIES` ruft
+        // diesen Zweig deshalb nie auf; er hält nur `expected` erschöpfend.
+        EntryKind::CompiledAgent => Expected {
             permissions: NONE,
             tools_empty: true,
             approval_chain: DEFAULT_AND_ASK,
