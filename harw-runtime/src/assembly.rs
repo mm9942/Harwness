@@ -5004,7 +5004,11 @@ fn build_spawner(
     // diesen Spawner admittierte Kind über dieses `ChildBackend` laufen
     // (z. B. `harw-agent-runner`s `JobChildBackend`) statt in-process.
     if let Some(backend) = child_backend {
-        spawner = spawner.with_child_backend(backend);
+        // Welle 6: der Freigabemodus der Wurzel, damit ein Job-Kind
+        // `full_access` nur erbt, wenn die Wurzel gerade Full Access hat.
+        spawner = spawner
+            .with_child_backend(backend)
+            .with_approval_mode(chain.mode().clone());
     }
     // Plan R9, Teil B: registriert wird der ganze Roster — die eingebauten
     // Rollen (`role_names::ALL`) und daneben jeder benutzerdefinierte Agent.

@@ -876,3 +876,214 @@ fn mcp_http_initialize_and_run_offline() -> TestResult {
     }
     Ok(())
 }
+
+// ---------------------------------------------------------------------------
+// `--child <id> --child-protocol stdio` driven by hand (harwness.agent-child/v1)
+// ---------------------------------------------------------------------------
+
+/// The protocol's per-frame limit (`child_protocol::MAX_FRAME_BYTES`, which
+/// is crate-private); kept in sync by hand.
+const MAX_FRAME_BYTES: usize = 1024 * 1024;
+
+/// Talks to a spawned `--child` process over its stdio pipes, playing the
+/// parent's side of the protocol. Like [`McpClient`], a background thread
+/// reads stdout lines into a channel so every receive is bounded by
+/// [`IO_TIMEOUT`].
+struct ChildProtocolClient {
+    guard: ChildGuard,
+    stdin: Option<std::process::ChildStdin>,
+    lines: mpsc::Receiver<String>,
+}
+
+impl ChildProtocolClient {
+    fn spawn(exe: &Path, home: &Path, agent_id: &str) -> Result<Self, Box<dyn std::error::Error>> {
+        let mut guard = ChildGuard(
+            Command::new(exe)
+                .args([
+                    "--child",
+                    agent_id,
+                    "--child-protocol",
+                    "stdio",
+                    "--offline-echo",
+                ])
+                .env("HARW_HOME", home)
+                .env("HARW_OFFLINE_ECHO", "child echo")
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::null())
+                .spawn()?,
+        );
+        let stdin = guard.stdin.take().ok_or("no stdin pipe")?;
+        let stdout = guard.stdout.take().ok_or("no stdout pipe")?;
+        let (tx, rx) = mpsc::channel();
+        thread::spawn(move || {
+            let mut reader = BufReader::new(stdout);
+            let mut line = String::new();
+            loop {
+                line.clear();
+                match reader.read_line(&mut line) {
+                    Ok(0) | Err(_) => break,
+                    Ok(_) => {
+                        if tx.send(line.clone()).is_err() {
+                            break;
+                        }
+                    }
+                }
+            }
+        });
+        Ok(Self {
+            guard,
+            stdin: Some(stdin),
+            lines: rx,
+        })
+    }
+
+    /// Writes one frame as a JSON line.
+    fn send(&mut self, frame: &Value) -> Result<(), Box<dyn std::error::Error>> {
+        let stdin = self.stdin.as_mut().ok_or("stdin already closed")?;
+        writeln!(stdin, "{frame}")?;
+        stdin.flush()?;
+        Ok(())
+    }
+
+    /// The next frame whose `type` is one of `types`, skipping every other
+    /// frame (live `event`/`usage` frames arrive in between).
+    fn recv_of(&self, types: &[&str]) -> Result<Value, Box<dyn std::error::Error>> {
+        let deadline = Instant::now() + IO_TIMEOUT;
+        loop {
+            let remaining = deadline
+                .checked_duration_since(Instant::now())
+                .ok_or("timed out waiting for a child protocol frame")?;
+            let line = self.lines.recv_timeout(remaining)?;
+            let frame: Value = serde_json::from_str(&line)?;
+            if frame["type"]
+                .as_str()
+                .is_some_and(|kind| types.contains(&kind))
+            {
+                return Ok(frame);
+            }
+        }
+    }
+
+    /// Closes stdin (as a real parent does once the run ended) and waits up
+    /// to [`IO_TIMEOUT`] for the process to exit on its own.
+    fn wait_exit(&mut self) -> Result<Option<i32>, Box<dyn std::error::Error>> {
+        self.stdin = None;
+        let deadline = Instant::now() + IO_TIMEOUT;
+        loop {
+            if let Some(status) = self.guard.try_wait()? {
+                return Ok(status.code());
+            }
+            if Instant::now() >= deadline {
+                return Err("child did not exit within the timeout".into());
+            }
+            thread::sleep(Duration::from_millis(20));
+        }
+    }
+}
+
+/// Compiles a worker and builds its binary; returns the binary, the bundle
+/// id to pass to `--child`, and the temp dirs that must outlive the test.
+fn child_protocol_fixture(
+    name: &str,
+) -> Result<(PathBuf, String, Vec<tempfile::TempDir>), Box<dyn std::error::Error>> {
+    let (root, artifact) = compile_worker(name)?;
+    let out_dir = tempfile::tempdir()?;
+    let exe = build_agent_binary(out_dir.path(), name, &artifact)?;
+    Ok((exe, format!("acme.agent.{name}@1"), vec![root, out_dir]))
+}
+
+#[test]
+fn test_child_protocol_hello_rights_task_result() -> TestResult {
+    let (exe, agent_id, _dirs) = child_protocol_fixture("childproto")?;
+    let home = tempfile::tempdir()?;
+    let mut client = ChildProtocolClient::spawn(&exe, home.path(), &agent_id)?;
+
+    let hello = client.recv_of(&["hello"])?;
+    assert_eq!(hello["protocol"], "harwness.agent-child/v1", "{hello}");
+    assert_eq!(hello["agent_id"].as_str(), Some(agent_id.as_str()), "{hello}");
+
+    client.send(&json!({"type": "rights", "rights": {"tools": ["fs.read"]}}))?;
+    client.send(&json!({"type": "mode", "mode": "plan"}))?;
+    client.send(&json!({"type": "task", "task": "say something"}))?;
+
+    let result = client.recv_of(&["result", "error"])?;
+    assert_eq!(result["type"], "result", "{result}");
+    assert_eq!(result["status"], "completed", "{result}");
+    assert_eq!(result["text"], "child echo", "{result}");
+    assert!(
+        result.get("continuation").is_none(),
+        "a completed run carries no continuation: {result}"
+    );
+    assert_eq!(client.wait_exit()?, Some(0));
+    Ok(())
+}
+
+#[test]
+fn test_child_protocol_task_before_rights_is_refused() -> TestResult {
+    let (exe, agent_id, _dirs) = child_protocol_fixture("childnorights")?;
+    let home = tempfile::tempdir()?;
+    let mut client = ChildProtocolClient::spawn(&exe, home.path(), &agent_id)?;
+
+    client.recv_of(&["hello"])?;
+    client.send(&json!({"type": "task", "task": "no rights yet"}))?;
+    let error = client.recv_of(&["result", "error"])?;
+    assert_eq!(error["type"], "error", "{error}");
+    assert_ne!(client.wait_exit()?, Some(0));
+    Ok(())
+}
+
+#[test]
+fn test_child_protocol_refuses_an_oversized_frame() -> TestResult {
+    let (exe, agent_id, _dirs) = child_protocol_fixture("childoversized")?;
+    let home = tempfile::tempdir()?;
+    let mut client = ChildProtocolClient::spawn(&exe, home.path(), &agent_id)?;
+
+    client.recv_of(&["hello"])?;
+    // One line past the limit. The child may stop reading (and exit)
+    // before the whole line is written, so a failed write here is expected
+    // and not an error of the test.
+    let oversized = format!(
+        "{{\"type\":\"message\",\"text\":\"{}\"}}\n",
+        "a".repeat(MAX_FRAME_BYTES)
+    );
+    if let Some(stdin) = client.stdin.as_mut() {
+        let _ = stdin.write_all(oversized.as_bytes());
+        let _ = stdin.flush();
+    }
+    let error = client.recv_of(&["result", "error"])?;
+    assert_eq!(error["type"], "error", "{error}");
+    assert!(
+        error["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("exceeds")),
+        "{error}"
+    );
+    assert_ne!(client.wait_exit()?, Some(0));
+    Ok(())
+}
+
+#[test]
+fn test_child_protocol_unknown_continuation_is_a_clear_error() -> TestResult {
+    let (exe, agent_id, _dirs) = child_protocol_fixture("childresume")?;
+    let home = tempfile::tempdir()?;
+    let mut client = ChildProtocolClient::spawn(&exe, home.path(), &agent_id)?;
+
+    client.recv_of(&["hello"])?;
+    client.send(&json!({"type": "rights", "rights": {"tools": ["fs.read"]}}))?;
+    client.send(&json!({
+        "type": "task",
+        "task": "go on",
+        "continue_from": "no-such-session"
+    }))?;
+    let error = client.recv_of(&["result", "error"])?;
+    assert_eq!(error["type"], "error", "{error}");
+    assert!(
+        error["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("resume")),
+        "{error}"
+    );
+    assert_ne!(client.wait_exit()?, Some(0));
+    Ok(())
+}

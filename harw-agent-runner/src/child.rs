@@ -65,10 +65,10 @@ use crate::child_protocol::{
     ChildResultStatus, ChildRights, ChildToParent, ChildUsage, FrameReadError, FrameReader,
     PROTOCOL_VERSION, ParentToChild, decode_line, encode_line,
 };
+use crate::context::RunnerContext;
 
 /// The child's stdin as a bounded frame reader.
 type StdinFrames = FrameReader<BufReader<tokio::io::Stdin>>;
-use crate::context::RunnerContext;
 
 /// Runs this process as the child named `agent_id` in `ctx`'s bundle,
 /// speaking `harwness.agent-child/v1` over stdio.
@@ -91,7 +91,11 @@ pub fn run_child(ctx: RunnerContext, agent_id: &str) -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    runtime.block_on(run_child_async(ctx, agent_id))
+    let code = runtime.block_on(run_child_async(ctx, agent_id));
+    // tokio's stdin reads on a blocking thread that cannot be cancelled; a
+    // plain drop would wait for it (i.e. for the parent to close stdin).
+    runtime.shutdown_background();
+    code
 }
 
 async fn run_child_async(mut ctx: RunnerContext, agent_id: String) -> ExitCode {
@@ -696,41 +700,41 @@ mod tests {
     use harwness_sdk::Session;
     use std::path::{Path, PathBuf};
 
+    type TestResult = Result<(), Box<dyn std::error::Error>>;
+
     struct Fixture {
         _dir: tempfile::TempDir,
         home: PathBuf,
         project: PathBuf,
     }
 
-    fn fixture() -> Fixture {
-        let dir = tempfile::tempdir().expect("tempdir");
+    fn fixture() -> Result<Fixture, Box<dyn std::error::Error>> {
+        let dir = tempfile::tempdir()?;
         let home = dir.path().join("home");
         let project = dir.path().join("project");
-        std::fs::create_dir_all(&home).unwrap();
-        std::fs::create_dir_all(&project).unwrap();
-        std::fs::write(project.join("Cargo.toml"), "[workspace]\n").unwrap();
-        write_fixture_uia(&home);
-        Fixture {
+        std::fs::create_dir_all(&home)?;
+        std::fs::create_dir_all(&project)?;
+        std::fs::write(project.join("Cargo.toml"), "[workspace]\n")?;
+        write_fixture_uia(&home)?;
+        Ok(Fixture {
             _dir: dir,
             home,
             project,
-        }
+        })
     }
 
-    fn write_fixture_uia(home: &Path) {
+    fn write_fixture_uia(home: &Path) -> std::io::Result<()> {
         let profile_dir = home.join("profiles").join("default");
         let agent_dir = profile_dir.join("agents").join("fixture-uia");
-        std::fs::create_dir_all(&agent_dir).unwrap();
+        std::fs::create_dir_all(&agent_dir)?;
         std::fs::write(
             agent_dir.join("definition.toml"),
             "schema = \"harwness.agent/v1\"\nid = \"harwness.agent.fixture-uia@1\"\nversion = \"1.0.0\"\nrole = \"user-interface\"\nspecialization = \"terminal-ui\"\n",
-        )
-        .unwrap();
+        )?;
         std::fs::write(
             profile_dir.join("config.toml"),
             "active_uia_definition = \"harwness.agent.fixture-uia@1\"\n",
         )
-        .unwrap();
     }
 
     /// Builds a real (offline) session so `translate_event`/
@@ -738,41 +742,47 @@ mod tests {
     /// `harwness_sdk` types — those are `#[non_exhaustive]` and cannot be
     /// hand-built outside their own crate, so an "injected session" here
     /// means an offline-echo backend standing in for a model, not a mock.
-    fn offline_session(fixture: &Fixture) -> Session {
-        Harwness::builder()
+    fn offline_session(fixture: &Fixture) -> Result<Session, Box<dyn std::error::Error>> {
+        let session = Harwness::builder()
             .home(&fixture.home)
             .cwd(&fixture.project)
             .scaffold_home(false)
             .ephemeral(true)
             .offline_echo("pong")
-            .build()
-            .expect("build")
-            .session()
-            .expect("session")
+            .build()?
+            .session()?;
+        Ok(session)
     }
 
     #[tokio::test]
-    async fn translate_turn_report_maps_a_completed_turn() {
-        let fixture = fixture();
-        let mut session = offline_session(&fixture);
-        let report = session.send("ping").await.expect("send");
+    async fn translate_turn_report_maps_a_completed_turn() -> TestResult {
+        let fixture = fixture()?;
+        let mut session = offline_session(&fixture)?;
+        let report = session.send("ping").await?;
 
         let frame = translate_turn_report(&report);
         match frame {
-            ChildToParent::Result { status, text, .. } => {
+            ChildToParent::Result {
+                status,
+                text,
+                continuation,
+                ..
+            } => {
                 assert_eq!(status, ChildResultStatus::Completed);
                 assert_eq!(text.as_deref(), Some("pong"));
+                assert_eq!(continuation, None, "only a budget end is resumable");
             }
-            other => panic!("unexpected: {other:?}"),
+            other => return Err(format!("unexpected frame: {other:?}").into()),
         }
+        Ok(())
     }
 
     #[tokio::test]
-    async fn translate_event_covers_a_real_finished_event() {
-        let fixture = fixture();
-        let mut session = offline_session(&fixture);
+    async fn translate_event_covers_a_real_finished_event() -> TestResult {
+        let fixture = fixture()?;
+        let mut session = offline_session(&fixture)?;
         let mut events = session.events();
-        let _report = session.send("ping").await.expect("send");
+        let _report = session.send("ping").await?;
 
         let mut saw_finished = false;
         while let Ok(Some(event)) =
@@ -786,6 +796,7 @@ mod tests {
             }
         }
         assert!(saw_finished, "expected a translated Finished event");
+        Ok(())
     }
 
     #[test]
@@ -820,6 +831,138 @@ mod tests {
         };
         assert!(!narrow_rights(&manifest, &from_parent).full_access);
         assert!(!narrow_rights(&from_parent, &manifest).full_access);
+    }
+
+    /// A ceiling as [`own_ceiling`] yields it: manifest rights, automatic
+    /// approval allowed, a manifest token budget.
+    fn ceiling() -> EffectiveRights {
+        EffectiveRights {
+            tools: BTreeSet::from(["fs.read".to_owned(), "fs.write".to_owned()]),
+            network_hosts: BTreeSet::from(["example.com".to_owned()]),
+            network_open: true,
+            write: true,
+            shell: false,
+            host: false,
+            full_access: true,
+            budget: Some(Budget {
+                max_tokens: Some(10_000),
+                ..Budget::default()
+            }),
+        }
+    }
+
+    #[test]
+    fn effective_child_rights_intersects_ceiling_and_parent() {
+        let from_parent = ChildRights {
+            tools: BTreeSet::from(["fs.read".to_owned(), "shell.exec".to_owned()]),
+            network_hosts: BTreeSet::from(["example.com".to_owned(), "evil.test".to_owned()]),
+            network_open: true,
+            write: false,
+            shell: true,
+            host: true,
+            full_access: false,
+        };
+        let rights = effective_child_rights(ceiling(), &from_parent, None);
+        // A tool/host/right only one side allows never survives.
+        assert_eq!(rights.tools, BTreeSet::from(["fs.read".to_owned()]));
+        assert_eq!(
+            rights.network_hosts,
+            BTreeSet::from(["example.com".to_owned()])
+        );
+        assert!(rights.network_open);
+        assert!(!rights.write, "the parent withheld write");
+        assert!(!rights.shell, "the manifest never admitted a shell");
+        assert!(!rights.host);
+        assert!(!rights.full_access, "no auto-approval without the parent");
+        assert_eq!(
+            rights.budget.as_ref().and_then(|budget| budget.max_tokens),
+            Some(10_000),
+            "the manifest budget survives when the parent sets none"
+        );
+    }
+
+    #[test]
+    fn effective_child_rights_passes_on_the_parents_full_access_grant() {
+        let from_parent = ChildRights {
+            tools: BTreeSet::from(["fs.read".to_owned()]),
+            full_access: true,
+            ..Default::default()
+        };
+        let rights = effective_child_rights(ceiling(), &from_parent, None);
+        assert!(rights.full_access);
+        // …but it never widens a set the parent did not grant.
+        assert_eq!(rights.tools, BTreeSet::from(["fs.read".to_owned()]));
+        assert!(!rights.write);
+    }
+
+    #[test]
+    fn effective_child_rights_never_exceeds_a_narrowed_ceiling() {
+        let mut narrowed = ceiling();
+        narrowed.full_access = false;
+        narrowed.tools = BTreeSet::from(["fs.read".to_owned()]);
+        let from_parent = ChildRights {
+            tools: BTreeSet::from(["fs.read".to_owned(), "fs.write".to_owned()]),
+            write: true,
+            full_access: true,
+            ..Default::default()
+        };
+        let rights = effective_child_rights(narrowed, &from_parent, None);
+        assert!(!rights.full_access);
+        assert_eq!(rights.tools, BTreeSet::from(["fs.read".to_owned()]));
+    }
+
+    #[test]
+    fn effective_child_rights_takes_the_stricter_budget() {
+        let parent_budget = Budget {
+            max_tokens: Some(500),
+            max_tool_calls: Some(3),
+            ..Budget::default()
+        };
+        let rights = effective_child_rights(
+            ceiling(),
+            &ChildRights::default(),
+            Some(&parent_budget),
+        );
+        let budget = rights.budget.unwrap_or_default();
+        assert_eq!(budget.max_tokens, Some(500));
+        assert_eq!(budget.max_tool_calls, Some(3));
+    }
+
+    #[test]
+    fn own_ceiling_allows_full_access_but_keeps_the_other_flags() {
+        use harw_agent_dsl::ir_v2::{
+            FilesystemPermissions, NetworkMode, NetworkPermissions, SpawnPermissions,
+        };
+        let permissions = Permissions {
+            tools: vec!["fs.read".to_owned(), "fs.write".to_owned()],
+            forbidden_tools: Vec::new(),
+            capabilities: Vec::new(),
+            filesystem: FilesystemPermissions {
+                read: true,
+                write: true,
+                ..FilesystemPermissions::default()
+            },
+            network: NetworkPermissions {
+                mode: NetworkMode::Off,
+                tools: Vec::new(),
+                hosts: Vec::new(),
+            },
+            shell: false,
+            host: false,
+            spawn: SpawnPermissions::default(),
+            budget: None,
+            required_env: Vec::new(),
+        };
+        let flags = RightsFlags {
+            deny_tools: vec!["fs.write".to_owned()],
+            read_only: true,
+            full_access: false,
+            ..RightsFlags::default()
+        };
+        let rights = own_ceiling(&permissions, &flags);
+        assert!(rights.full_access, "the ceiling leaves the grant to the parent");
+        assert!(!rights.tools.contains("fs.write"));
+        assert!(!rights.write);
     }
 
     #[test]

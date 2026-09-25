@@ -43,8 +43,8 @@ use tokio::process::{Child, ChildStdin, Command};
 use tokio::sync::mpsc;
 
 use crate::child_protocol::{
-    ChildResultStatus, ChildRights, ChildToParent, ChildUsage as WireUsage, ParentToChild,
-    decode_line, encode_line, verify_protocol,
+    ChildResultStatus, ChildRights, ChildToParent, ChildUsage as WireUsage, FrameReadError,
+    FrameReader, MAX_FRAME_BYTES, ParentToChild, decode_line, encode_line, verify_protocol,
 };
 
 /// How long the job-managed path waits for the job's own monitor to record
@@ -67,10 +67,16 @@ pub trait ChildProcessSpawner: Send + Sync {
 }
 
 /// Spawns `std::env::current_exe()` with `--child <agent_id> --child-protocol
-/// stdio`, in its own process group so [`JobChildBackend`] can kill the
-/// whole group on cancel instead of leaking grandchildren.
+/// stdio` (plus `--offline-echo` when the parent runs with it), in its own
+/// process group so [`JobChildBackend`] can kill the whole group on cancel
+/// instead of leaking grandchildren.
 #[derive(Debug, Clone, Default)]
-pub struct CurrentExeSpawner;
+pub struct CurrentExeSpawner {
+    /// Passes `--offline-echo` on to every child, so a release-build parent
+    /// started with it never has children that call a real provider
+    /// (without the flag a release child ignores `HARW_OFFLINE_ECHO`).
+    offline_echo: bool,
+}
 
 impl ChildProcessSpawner for CurrentExeSpawner {
     fn command_for(&self, agent_id: &str) -> Command {
@@ -81,7 +87,11 @@ impl ChildProcessSpawner for CurrentExeSpawner {
             .arg("--child")
             .arg(agent_id)
             .arg("--child-protocol")
-            .arg("stdio")
+            .arg("stdio");
+        if self.offline_echo {
+            command.arg("--offline-echo");
+        }
+        command
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -109,11 +119,13 @@ pub struct JobChildBackend<S: ChildProcessSpawner = CurrentExeSpawner> {
 }
 
 impl JobChildBackend<CurrentExeSpawner> {
-    /// The production backend: runs each child as a job through `job_manager`.
+    /// The production backend: runs each child as a job through
+    /// `job_manager`. `offline_echo` mirrors the parent's own
+    /// `--offline-echo` flag onto every child it starts.
     #[must_use]
-    pub fn new(job_manager: Arc<JobManager>) -> Self {
+    pub fn new(job_manager: Arc<JobManager>, offline_echo: bool) -> Self {
         Self {
-            spawner: CurrentExeSpawner,
+            spawner: CurrentExeSpawner { offline_echo },
             job_manager: Some(job_manager),
         }
     }
@@ -188,19 +200,30 @@ fn kill_process_group(_child: &Child) {}
 
 /// Source of the child's stdout lines, unified so [`drive_protocol`] does
 /// not care whether it runs against a directly-spawned [`Child`] or a
-/// [`PipedJob`] from `JobManager::start_piped` — in both cases an error or a
-/// closed stream just means "no more lines" (already how the direct path
-/// treated a read error before this was introduced).
+/// [`PipedJob`] from `JobManager::start_piped`. A read error or a closed
+/// stream means "no more lines" (a crash); an oversized or non-UTF-8 frame
+/// is a protocol violation ([`Err`]).
 enum StdoutSource {
-    Direct(tokio::io::Lines<BufReader<tokio::process::ChildStdout>>),
+    /// Read here, bounded by [`MAX_FRAME_BYTES`] before buffering past it.
+    Direct(FrameReader<BufReader<tokio::process::ChildStdout>>),
+    /// Lines `harw_tool_job`'s stdout tee already split; their length is
+    /// checked against [`MAX_FRAME_BYTES`] on arrival.
     JobManaged(mpsc::UnboundedReceiver<String>),
 }
 
 impl StdoutSource {
-    async fn next_line(&mut self) -> Option<String> {
+    async fn next_line(&mut self) -> Result<Option<String>, FrameReadError> {
         match self {
-            Self::Direct(lines) => lines.next_line().await.ok().flatten(),
-            Self::JobManaged(receiver) => receiver.recv().await,
+            Self::Direct(frames) => match frames.next_frame().await {
+                Err(FrameReadError::Io(_)) => Ok(None),
+                other => other,
+            },
+            Self::JobManaged(receiver) => match receiver.recv().await {
+                Some(line) if line.len() > MAX_FRAME_BYTES => Err(FrameReadError::TooLarge {
+                    limit: MAX_FRAME_BYTES,
+                }),
+                line => Ok(line),
+            },
         }
     }
 }
@@ -379,7 +402,7 @@ async fn run_direct<S: ChildProcessSpawner>(
     });
 
     let mut stdin = stdin;
-    let mut source = StdoutSource::Direct(BufReader::new(stdout).lines());
+    let mut source = StdoutSource::Direct(FrameReader::new(BufReader::new(stdout)));
 
     let outcome = tokio::select! {
         biased;
@@ -488,12 +511,26 @@ async fn drive_protocol(
             };
         };
     }
+    // The next stdout line; a closed stream is a crash, an oversized or
+    // non-UTF-8 frame a protocol failure (the caller kills the process
+    // group on `Failed`).
+    macro_rules! next_line_or_end {
+        () => {
+            match stdout_lines.next_line().await {
+                Ok(Some(line)) => line,
+                Ok(None) => {
+                    crash_if_stream_ended!();
+                }
+                Err(error) => {
+                    return failed_outcome(error.to_string());
+                }
+            }
+        };
+    }
 
     // Handshake: the child's first line must be `Hello` with a matching
     // protocol version.
-    let Some(line) = stdout_lines.next_line().await else {
-        crash_if_stream_ended!();
-    };
+    let line = next_line_or_end!();
     match decode_line::<ChildToParent>(&line) {
         Ok(ChildToParent::Hello { protocol, .. }) => {
             if let Err(error) = verify_protocol(&protocol) {
@@ -580,9 +617,7 @@ async fn drive_protocol(
     // dropping this future ends the loop without a graceful `Cancel` frame.
     // That keeps exactly one place responsible for "is this run cancelled".
     loop {
-        let Some(line) = stdout_lines.next_line().await else {
-            crash_if_stream_ended!();
-        };
+        let line = next_line_or_end!();
         match decode_line::<ChildToParent>(&line) {
             Ok(ChildToParent::Hello { .. }) => {
                 // A second Hello is a protocol violation, not a reason to
@@ -644,12 +679,17 @@ async fn drive_protocol(
                 status,
                 text,
                 usage,
+                continuation,
             }) => {
+                // Only a budget end is resumable; a token on any other end
+                // is ignored rather than trusted.
+                let continuation =
+                    continuation.filter(|_| status == ChildResultStatus::BudgetExhausted);
                 return ChildRunOutcome {
                     status: from_wire_status(status),
                     text,
                     usage: from_wire_usage(usage),
-                    continuation: None,
+                    continuation,
                 };
             }
             Err(error) => {
@@ -663,6 +703,16 @@ async fn drive_protocol(
                 };
             }
         }
+    }
+}
+
+/// A [`ChildRunStatus::Failed`] outcome with nothing else to report.
+fn failed_outcome(reason: String) -> ChildRunOutcome {
+    ChildRunOutcome {
+        status: ChildRunStatus::Failed { reason },
+        text: None,
+        usage: ChildUsage::default(),
+        continuation: None,
     }
 }
 
@@ -709,6 +759,8 @@ fn from_wire_usage(usage: WireUsage) -> ChildUsage {
 mod tests {
     use super::*;
     use harw_types::SessionId;
+
+    type TestResult = Result<(), Box<dyn std::error::Error>>;
 
     /// Spawns `/bin/sh -c <script>` — a stand-in child that speaks
     /// `harwness.agent-child/v1` by hand, exercising the real stdio pipes,
@@ -793,7 +845,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn questions_and_approvals_are_relayed() {
+    async fn questions_and_approvals_are_relayed() -> TestResult {
         let script = format!(
             r#"printf '{{"type":"hello","agent_id":"fixture-child","protocol":"{version}","digest":"d"}}\n'; read _rights; read _mode; read _task; printf '{{"type":"question","id":"question-1","text":"Proceed?"}}\n'; read answer; case "$answer" in *question-1*approve*) ;; *) exit 3;; esac; printf '{{"type":"approval_request","id":"approval-1","tool":"fs.write","args_summary":"file"}}\n'; read answer; case "$answer" in *approval-1*approve*) ;; *) exit 4;; esac; printf '{{"type":"result","status":"completed","text":"relayed","usage":{{"input_tokens":0,"output_tokens":0,"cached_input_tokens":0,"tool_calls":0,"wall_time_ms":0}}}}\n'"#,
             version = crate::child_protocol::PROTOCOL_VERSION,
@@ -803,10 +855,10 @@ mod tests {
             Duration::from_secs(5),
             backend.run(spec(harw_types::cancel::CancelToken::new()), &RecordingIo),
         )
-        .await
-        .expect("relay must complete");
+        .await?;
         assert_eq!(outcome.status, ChildRunStatus::Completed);
         assert_eq!(outcome.text.as_deref(), Some("relayed"));
+        Ok(())
     }
 
     #[tokio::test]
@@ -834,12 +886,15 @@ mod tests {
         let outcome = backend
             .run(spec(harw_types::cancel::CancelToken::new()), &io)
             .await;
-        match outcome.status {
-            ChildRunStatus::Crashed { stderr_tail, .. } => {
-                assert!(stderr_tail.contains("boom: out of memory"));
-            }
-            other => panic!("unexpected: {other:?}"),
-        }
+        assert!(
+            matches!(
+                &outcome.status,
+                ChildRunStatus::Crashed { stderr_tail, .. }
+                    if stderr_tail.contains("boom: out of memory")
+            ),
+            "{:?}",
+            outcome.status
+        );
     }
 
     /// Same fixture script as [`hello_then_result_completes`], but driven
@@ -849,12 +904,11 @@ mod tests {
     /// `run_job_managed` still completes the handshake and relay over the
     /// piped stdin/stdout `start_piped` hands back.
     #[tokio::test]
-    async fn job_managed_path_completes_through_job_manager() {
-        let dir = tempfile::tempdir().expect("tempdir");
+    async fn job_managed_path_completes_through_job_manager() -> TestResult {
+        let dir = tempfile::tempdir()?;
         let config = harw_tool_job::JobManagerConfig::new(dir.path());
         let job_manager =
-            harw_tool_job::JobManager::new(config, Arc::new(harw_tool_job::NoopNotifier))
-                .expect("job manager");
+            harw_tool_job::JobManager::new(config, Arc::new(harw_tool_job::NoopNotifier))?;
         let backend = JobChildBackend::with_spawner_and_job_manager(
             ShellSpawner {
                 script: hello_then_result_script(),
@@ -868,10 +922,11 @@ mod tests {
         assert_eq!(outcome.status, ChildRunStatus::Completed);
         assert_eq!(outcome.text.as_deref(), Some("done"));
         assert_eq!(outcome.usage.tokens, 3);
+        Ok(())
     }
 
     #[tokio::test]
-    async fn cancel_kills_the_child_before_a_result() {
+    async fn cancel_kills_the_child_before_a_result() -> TestResult {
         // Prints Hello, reads its two frames, then sleeps far longer than
         // the test waits — only `cancel` should end this run.
         let script = format!(
@@ -898,12 +953,142 @@ mod tests {
             std::time::Duration::from_secs(5),
             backend.run(spec(cancel), &io),
         )
-        .await
-        .expect("cancel must end the run promptly");
-        canceller.await.expect("canceller task did not panic");
-        match outcome.status {
-            ChildRunStatus::Cancelled { reason } => assert_eq!(reason, "user"),
-            other => panic!("unexpected: {other:?}"),
-        }
+        .await?;
+        canceller.await?;
+        assert_eq!(
+            outcome.status,
+            ChildRunStatus::Cancelled {
+                reason: "user".to_owned()
+            }
+        );
+        Ok(())
+    }
+
+    /// Prints a valid `Hello`, reads the three setup frames, then writes a
+    /// stdout line longer than [`MAX_FRAME_BYTES`] without ever ending it and
+    /// sleeps. The backend must refuse the frame as a protocol failure
+    /// before buffering it whole, and kill the process group rather than
+    /// wait out the sleep.
+    fn oversized_frame_script() -> String {
+        format!(
+            r#"printf '{{"type":"hello","agent_id":"fixture-child","protocol":"{version}","digest":"d"}}\n'; read _rights; read _mode; read _task; head -c {size} /dev/zero | tr '\000' a; sleep 30"#,
+            version = crate::child_protocol::PROTOCOL_VERSION,
+            size = MAX_FRAME_BYTES + 1024,
+        )
+    }
+
+    #[tokio::test]
+    async fn an_oversized_frame_fails_the_run_and_kills_the_child() -> TestResult {
+        let backend = JobChildBackend::with_spawner(ShellSpawner {
+            script: oversized_frame_script(),
+        });
+        let outcome = tokio::time::timeout(
+            Duration::from_secs(10),
+            backend.run(spec(harw_types::cancel::CancelToken::new()), &RecordingIo),
+        )
+        .await?;
+        assert!(
+            matches!(
+                &outcome.status,
+                ChildRunStatus::Failed { reason } if reason.contains("exceeds")
+            ),
+            "{:?}",
+            outcome.status
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn job_managed_path_refuses_an_oversized_frame() -> TestResult {
+        let dir = tempfile::tempdir()?;
+        let config = harw_tool_job::JobManagerConfig::new(dir.path());
+        let job_manager =
+            harw_tool_job::JobManager::new(config, Arc::new(harw_tool_job::NoopNotifier))?;
+        // The job tee splits on `\n`, so this variant ends its oversized
+        // line; the backend still refuses it by length.
+        let script = format!(
+            r#"printf '{{"type":"hello","agent_id":"fixture-child","protocol":"{version}","digest":"d"}}\n'; read _rights; read _mode; read _task; head -c {size} /dev/zero | tr '\000' a; printf '\n'; sleep 30"#,
+            version = crate::child_protocol::PROTOCOL_VERSION,
+            size = MAX_FRAME_BYTES + 1024,
+        );
+        let backend = JobChildBackend::with_spawner_and_job_manager(
+            ShellSpawner { script },
+            Arc::clone(&job_manager),
+        );
+        let outcome = tokio::time::timeout(
+            Duration::from_secs(10),
+            backend.run(spec(harw_types::cancel::CancelToken::new()), &RecordingIo),
+        )
+        .await?;
+        assert!(
+            matches!(
+                &outcome.status,
+                ChildRunStatus::Failed { reason } if reason.contains("exceeds")
+            ),
+            "{:?}",
+            outcome.status
+        );
+        job_manager.stop_all().await;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_budget_end_carries_the_continuation_token() -> TestResult {
+        let script = format!(
+            r#"printf '{{"type":"hello","agent_id":"fixture-child","protocol":"{version}","digest":"d"}}\n'; read _rights; read _mode; read _task; printf '{{"type":"result","status":"budget_exhausted","text":"partial","continuation":"sess-1"}}\n'"#,
+            version = crate::child_protocol::PROTOCOL_VERSION,
+        );
+        let backend = JobChildBackend::with_spawner(ShellSpawner { script });
+        let outcome = tokio::time::timeout(
+            Duration::from_secs(5),
+            backend.run(spec(harw_types::cancel::CancelToken::new()), &RecordingIo),
+        )
+        .await?;
+        assert_eq!(outcome.status, ChildRunStatus::BudgetExhausted);
+        assert_eq!(outcome.continuation.as_deref(), Some("sess-1"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_continuation_on_a_completed_run_is_dropped() -> TestResult {
+        let script = format!(
+            r#"printf '{{"type":"hello","agent_id":"fixture-child","protocol":"{version}","digest":"d"}}\n'; read _rights; read _mode; read _task; printf '{{"type":"result","status":"completed","text":"done","continuation":"sess-1"}}\n'"#,
+            version = crate::child_protocol::PROTOCOL_VERSION,
+        );
+        let backend = JobChildBackend::with_spawner(ShellSpawner { script });
+        let outcome = tokio::time::timeout(
+            Duration::from_secs(5),
+            backend.run(spec(harw_types::cancel::CancelToken::new()), &RecordingIo),
+        )
+        .await?;
+        assert_eq!(outcome.status, ChildRunStatus::Completed);
+        assert_eq!(outcome.continuation, None);
+        Ok(())
+    }
+
+    #[test]
+    fn current_exe_spawner_passes_offline_echo_only_when_set() {
+        let args_of = |offline_echo: bool| -> Vec<String> {
+            CurrentExeSpawner { offline_echo }
+                .command_for("worker")
+                .as_std()
+                .get_args()
+                .map(|arg| arg.to_string_lossy().into_owned())
+                .collect()
+        };
+        assert_eq!(
+            args_of(false),
+            ["--child", "worker", "--child-protocol", "stdio"]
+        );
+        assert_eq!(
+            args_of(true),
+            [
+                "--child",
+                "worker",
+                "--child-protocol",
+                "stdio",
+                "--offline-echo"
+            ]
+        );
     }
 }

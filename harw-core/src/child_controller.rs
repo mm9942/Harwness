@@ -8922,6 +8922,10 @@ mod tests {
     // (`child_controller/tests/plan_delegation.rs`).
     mod plan_delegation;
 
+    // Welle 6: ein über den `ChildBackend` laufendes Kind bekommt seine
+    // in-process Rechte (`child_controller/tests/child_backend_run.rs`).
+    mod child_backend_run;
+
     // ── cap_child_return_text (Vertrag CHILD_RETURN_MAX_BYTES) ─────────────
 
     #[test]
