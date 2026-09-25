@@ -2440,7 +2440,9 @@ impl RuntimeAssemblyBuilder {
                     registry_builder = registry_builder.tool_provider(Arc::new(provider));
                 }
                 Err(AgentBuildWithheld::NotAdmitted) => {}
-                Err(withheld) => tracing::info!(reason = %withheld, "runtime.agents_build.withheld"),
+                Err(withheld) => {
+                    tracing::info!(reason = %withheld, "runtime.agents_build.withheld");
+                }
             }
         }
 

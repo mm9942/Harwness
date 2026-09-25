@@ -360,4 +360,53 @@ mod tests {
         let error = RunnerError::NoInterface;
         assert!(error.to_string().contains("no interface"));
     }
+
+    // ── banner_wanted ────────────────────────────────────────────────────
+
+    #[test]
+    fn test_banner_is_printed_for_human_interfaces() {
+        let args = RunnerArgs::default();
+        for interface in [
+            Interface::Cli,
+            Interface::Repl,
+            Interface::Http,
+            Interface::Tui,
+        ] {
+            assert!(banner_wanted(&args, interface), "{interface:?}");
+        }
+    }
+
+    #[test]
+    fn test_banner_is_skipped_for_json() {
+        let args = RunnerArgs {
+            json: true,
+            ..RunnerArgs::default()
+        };
+        assert!(!banner_wanted(&args, Interface::Cli));
+    }
+
+    #[test]
+    fn test_banner_is_skipped_for_mcp_over_stdio() {
+        assert!(!banner_wanted(&RunnerArgs::default(), Interface::Mcp));
+    }
+
+    #[test]
+    fn test_banner_is_printed_for_mcp_with_listen() {
+        let args = RunnerArgs {
+            listen: Some("127.0.0.1:8787".to_owned()),
+            ..RunnerArgs::default()
+        };
+        assert!(banner_wanted(&args, Interface::Mcp));
+    }
+
+    #[test]
+    fn test_banner_is_skipped_in_child_mode() {
+        let args = RunnerArgs {
+            child: Some("parent-1".to_owned()),
+            child_protocol: Some("v1".to_owned()),
+            ..RunnerArgs::default()
+        };
+        assert!(!banner_wanted(&args, Interface::Cli));
+        assert!(!banner_wanted(&args, Interface::Http));
+    }
 }

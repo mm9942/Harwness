@@ -46,6 +46,11 @@ pub struct RunnerArgs {
     pub flags: RightsFlags,
     /// `--listen <addr>`: bind address for the `http`/`mcp` interfaces.
     pub listen: Option<String>,
+    /// `--offline-echo`: answer every model call locally with the offline
+    /// echo (reply text from `HARW_OFFLINE_ECHO` when set). Without this
+    /// flag only a `debug_assertions` build honors `HARW_OFFLINE_ECHO`
+    /// (`crate::context::offline_echo_enabled`).
+    pub offline_echo: bool,
 }
 
 impl RunnerArgs {
@@ -96,6 +101,7 @@ impl RunnerArgs {
                     out.child_protocol = Some(value(&mut iter, "--child-protocol")?);
                 }
                 "--listen" => out.listen = Some(value(&mut iter, "--listen")?),
+                "--offline-echo" => out.offline_echo = true,
                 "--deny-tool" => out.flags.deny_tools.push(value(&mut iter, "--deny-tool")?),
                 "--no-network" => out.flags.no_network = true,
                 "--read-only" => out.flags.read_only = true,
@@ -193,6 +199,15 @@ mod tests {
     fn test_bad_interface_and_max_tokens_are_usage_errors() {
         assert!(RunnerArgs::parse(args(&["--interface", "gopher"])).is_err());
         assert!(RunnerArgs::parse(args(&["--max-tokens", "not-a-number"])).is_err());
+    }
+
+    #[test]
+    fn test_offline_echo_flag() -> TestResult {
+        assert!(!RunnerArgs::parse(args(&[]))?.offline_echo);
+        let parsed = RunnerArgs::parse(args(&["--offline-echo", "hello"]))?;
+        assert!(parsed.offline_echo);
+        assert_eq!(parsed.prompt.as_deref(), Some("hello"));
+        Ok(())
     }
 
     #[test]

@@ -13,12 +13,30 @@
 //! protocol is `crate::job_child_backend::JobChildBackend`.
 //!
 //! # Rights
-//! A child's effective rights are `min(child manifest, the parent's current
-//! rights)` (plan §3C): [`narrow_rights`] does the intersection/AND once the
-//! parent's `Rights` frame arrives, over the child's own manifest rights
-//! ([`manifest_rights_of`], derived from its `AgentIr`). This only ever
-//! narrows — a parent can restrict a child further than its manifest, never
-//! grant it more.
+//! A child's effective rights are `child manifest ∩ this process's own
+//! flags ∩ the parent's Rights frame(s)` ([`own_ceiling`], then
+//! [`effective_child_rights`], both built on
+//! `harw_runtime::embedded::EffectiveRights::{narrowed_by, intersect}`).
+//! This only ever narrows: a parent can restrict a child further than its
+//! manifest, never grant it more, and several `Rights` frames before the
+//! `Task` narrow each other ([`narrow_rights`]). Automatic approval
+//! (`full_access`) is the one right the child's own command line never
+//! carries (a job child is started without `--full-access`), so the ceiling
+//! allows it and only the parent's grant switches it on; when effective, the
+//! child's session runs with `ApprovalPolicy::FullAccess` instead of relaying
+//! approvals.
+//!
+//! # Continuation
+//! A turn the budget ends (`TurnStatus::Cancelled { reason: "budget" }`)
+//! reports `BudgetExhausted` with its SDK session id as the `Result` frame's
+//! `continuation`. A later `Task` naming that token in `continue_from`
+//! resumes the stored session (`Harwness::resume`, same `HARW_HOME`) instead
+//! of starting a fresh one.
+//!
+//! # Frame size
+//! stdin is read through `crate::child_protocol::FrameReader`, bounded by
+//! `MAX_FRAME_BYTES`: an oversized (or non-UTF-8) frame is answered with an
+//! `Error` frame and the process exits with a failure, without a `Result`.
 //!
 //! # Testability
 //! The pure translation ([`translate_event`], [`translate_turn_report`],
@@ -32,20 +50,24 @@ use std::process::ExitCode;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
-use harw_agent_dsl::ir_v2::AgentIr;
+use harw_agent_dsl::ir_v2::{Budget, Permissions};
+use harw_runtime::embedded::{EffectiveRights, RightsFlags};
 #[cfg(test)]
 use harwness_sdk::Harwness;
 use harwness_sdk::{
-    ApprovalHandler, ApprovalRequest, BoxFuture, Decision, FinishStatus, SdkEvent, TurnReport,
-    TurnStatus,
+    ApprovalHandler, ApprovalPolicy, ApprovalRequest, BoxFuture, Decision, FinishStatus, SdkEvent,
+    TurnReport, TurnStatus,
 };
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncWriteExt, BufReader};
 use tokio::sync::{mpsc, oneshot};
 
 use crate::child_protocol::{
-    ChildResultStatus, ChildRights, ChildToParent, ChildUsage, PROTOCOL_VERSION, ParentToChild,
-    decode_line, encode_line,
+    ChildResultStatus, ChildRights, ChildToParent, ChildUsage, FrameReadError, FrameReader,
+    PROTOCOL_VERSION, ParentToChild, decode_line, encode_line,
 };
+
+/// The child's stdin as a bounded frame reader.
+type StdinFrames = FrameReader<BufReader<tokio::io::Stdin>>;
 use crate::context::RunnerContext;
 
 /// Runs this process as the child named `agent_id` in `ctx`'s bundle,
