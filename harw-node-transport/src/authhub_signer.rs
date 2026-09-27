@@ -47,13 +47,23 @@
 //!
 //! # AuthHub call seam
 //! [`AuthHubSign`] is the one call the signer needs: "sign `message` with
-//! the hub key `namespace/key_id`". `harw_infra_client::AuthHubClient` does
-//! not expose the `…:sign` route yet (drift: it has generate/describe/public/
-//! rotate/wrap/unwrap/rewrap only), and `harw-infra-client` is the only crate
+//! the hub key `namespace/key_id`". `harw_infra_client::AuthHubClient`
+//! already has that route (`AuthHubClient::sign(&KeyRef, &[u8])`, `POST
+//! /v1/keys/{namespace}/{id}:sign`); `KeyRef` there is `harw-infra-client`'s
+//! own type (`KeyRef::latest(namespace, id)`), not [`HarwKeyRef`], so what is
+//! missing is only the adapter from this trait's `sign_with_key(namespace,
+//! key_id, message)` to that call. `harw-infra-client` is the only crate
 //! that may open `secure.sock` (masterplan §11/§24/§34 H4), so no socket is
-//! dialled here. Once the client grows `sign`, the production adapter is a
-//! one-line [`AuthHubSign`] impl at the composition root (or here, behind a
-//! `harw-infra-client` dependency).
+//! dialled here. That adapter is a small [`AuthHubSign`] impl, not a
+//! one-liner: it builds `KeyRef::latest(namespace, key_id)` (which can fail),
+//! calls `AuthHubClient::sign`, maps both errors to a [`SignerError`] without
+//! key material or payload bytes, and boxes the call into a [`SignFuture`].
+//! It lives on a newtype around `AuthHubClient` at the composition root (the
+//! orphan rule forbids a direct `impl AuthHubSign for AuthHubClient` in a
+//! crate that owns neither the trait nor the type), or as a direct impl here
+//! behind a `harw-infra-client` dependency. It cannot live in
+//! `harw-infra-client`: layer I may not depend on this layer-A crate
+//! (`xtask/arch-policy.toml`).
 
 use std::fmt;
 use std::sync::Arc;

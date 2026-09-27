@@ -30,11 +30,11 @@
 //!   targets: they are accepted only as *observed* locations (redirects during
 //!   login) via [`OpenBrowserRequest::check_observed_location`].
 //!
-//! Host comparison mirrors `harw_sandbox::egress::host_matches_suffix`
+//! Host comparison mirrors `harw_authority::host_matches_suffix`
 //! (ASCII case-insensitive, one trailing dot tolerated, label boundary
 //! required, IP literals exact). It is re-implemented here because this crate
-//! is the dependency-free L0 contract layer and must not depend on
-//! `harw-sandbox`.
+//! is a dependency-free contract crate (no workspace-internal dependencies,
+//! see `Cargo.toml`) and does not depend on `harw-authority`.
 //!
 //! ## Key types exported
 //! - [`OriginRule`], [`OriginScheme`] — one validated allowlist entry.
@@ -450,7 +450,7 @@ impl OriginRule {
 
 // Exact or strict-subdomain comparison, ASCII case-insensitive, one trailing
 // dot tolerated, label boundary required. Mirrors
-// `harw_sandbox::egress::host_matches_suffix` minus the IP branch (handled by
+// `harw_authority::host_matches_suffix` minus the IP branch (handled by
 // the caller) and plus the apex exclusion for wildcard rules.
 fn domain_matches(rule: &str, host: &str, include_subdomains: bool) -> bool {
     let host = host.strip_suffix('.').unwrap_or(host);

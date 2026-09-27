@@ -96,10 +96,11 @@ impl EgressPolicy {
     /// ```rust
     /// use harw_egress::EgressPolicy;
     ///
-    /// let a = EgressPolicy::new(vec!["Docs.RS.".into(), "crates.io".into()], false).unwrap();
-    /// let b = EgressPolicy::new(vec!["crates.io".into(), "docs.rs".into()], false).unwrap();
+    /// let a = EgressPolicy::new(vec!["Docs.RS.".into(), "crates.io".into()], false)?;
+    /// let b = EgressPolicy::new(vec!["crates.io".into(), "docs.rs".into()], false)?;
     /// assert_eq!(a.digest(), b.digest());
     /// assert!(EgressPolicy::new(vec!["*.docs.rs".into()], false).is_err());
+    /// # Ok::<(), harw_egress::EgressError>(())
     /// ```
     pub fn new(allow_hosts: Vec<String>, allow_private: bool) -> Result<Self, EgressError> {
         let mut normalized = allow_hosts
@@ -128,11 +129,12 @@ impl EgressPolicy {
     /// ```rust
     /// use harw_egress::EgressPolicy;
     ///
-    /// let open = EgressPolicy::new(Vec::new(), true).unwrap().with_open_public(true);
+    /// let open = EgressPolicy::new(Vec::new(), true)?.with_open_public(true);
     /// assert!(open.check_url("https://www.destatis.de/DE/Home/").is_ok());
     /// assert!(open.check_url("http://127.0.0.1/").is_err());
     /// assert!(open.check_url("http://printer.local/").is_err());
-    /// assert!(EgressPolicy::new(Vec::new(), false).unwrap().check_url("https://example.org/").is_err());
+    /// assert!(EgressPolicy::new(Vec::new(), false)?.check_url("https://example.org/").is_err());
+    /// # Ok::<(), harw_egress::EgressError>(())
     /// ```
     #[must_use]
     pub fn with_open_public(mut self, open: bool) -> Self {
@@ -198,12 +200,13 @@ impl EgressPolicy {
     /// ```rust
     /// use harw_egress::{EgressError, EgressPolicy};
     ///
-    /// let policy = EgressPolicy::new(vec!["docs.rs".into()], false).unwrap();
+    /// let policy = EgressPolicy::new(vec!["docs.rs".into()], false)?;
     /// assert!(policy.check_url("https://static.docs.rs/x.css").is_ok());
     /// assert!(matches!(
     ///     policy.check_url("https://evil.com\\@docs.rs/"),
     ///     Err(EgressError::HostNotAllowed { .. })
     /// ));
+    /// # Ok::<(), EgressError>(())
     /// ```
     pub fn check_url(&self, url: &str) -> Result<EgressUrl, EgressError> {
         let parsed = EgressUrl::parse(url)?;
@@ -236,9 +239,10 @@ impl EgressPolicy {
     /// ```rust
     /// use harw_egress::EgressPolicy;
     ///
-    /// let open = EgressPolicy::new(Vec::new(), true).unwrap();
-    /// assert!(open.check_addr("10.0.0.1:443".parse().unwrap()).is_ok());
-    /// assert!(open.check_addr("169.254.169.254:80".parse().unwrap()).is_err());
+    /// let open = EgressPolicy::new(Vec::new(), true)?;
+    /// assert!(open.check_addr("10.0.0.1:443".parse()?).is_ok());
+    /// assert!(open.check_addr("169.254.169.254:80".parse()?).is_err());
+    /// # Ok::<(), Box<dyn std::error::Error>>(())
     /// ```
     pub fn check_addr(&self, addr: SocketAddr) -> Result<(), EgressError> {
         let ip = addr.ip();
@@ -271,9 +275,10 @@ impl EgressPolicy {
     /// ```rust
     /// use harw_egress::EgressPolicy;
     ///
-    /// let strict = EgressPolicy::new(vec!["docs.rs".into()], false).unwrap();
-    /// let open = EgressPolicy::new(vec!["docs.rs".into()], true).unwrap();
+    /// let strict = EgressPolicy::new(vec!["docs.rs".into()], false)?;
+    /// let open = EgressPolicy::new(vec!["docs.rs".into()], true)?;
     /// assert_ne!(strict.digest(), open.digest());
+    /// # Ok::<(), harw_egress::EgressError>(())
     /// ```
     #[must_use]
     pub fn digest(&self) -> [u8; 32] {

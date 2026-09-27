@@ -10,8 +10,9 @@ rust-version.workspace = true
 
 [dependencies]
 harw-authority = { path = "../harw-authority" }
-# W3 C-EGRESS: URL-Parsing und Host-Suffix-Regel kommen ausschließlich aus
-# `harw_sandbox::egress` (EgressUrl, EgressHost, host_matches_suffix) — keine
+# W3 C-EGRESS: URL-Parsing kommt ausschließlich aus `harw_sandbox::egress`
+# (EgressUrl, EgressHost); die Host-Suffix-Regel und die Public-DNS-Prüfung
+# kommen aus `harw_authority` (host_matches_suffix, is_public_dns_name) — keine
 # zweite Parser- oder Suffix-Implementierung (F-002, F-197).
 harw-sandbox = { path = "../harw-sandbox" }
 # Kanonischer Policy-Digest (`EgressPolicy::digest`).

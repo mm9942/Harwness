@@ -85,12 +85,33 @@ pub use harw_sandbox::{EgressHost, EgressUrl, EgressUrlError};
 pub use policy::EgressPolicy;
 pub use proxy::{EgressProxy, ProxyLimits, serve};
 pub use relay::{
-    ChildCommand, DEFAULT_RELAY_MAX_CONNECTIONS, EXIT_BIND_FAILED, EXIT_CHILD_FAILED,
-    EXIT_CHILD_NOT_EXECUTABLE, EXIT_CHILD_NOT_FOUND, EXIT_USAGE, RELAY_USAGE, RelayConfig,
-    RelayDirection, RelayError, RelayReporter, bind_relay, exit_code_from_status, relay_connection,
-    run_child, run_relay,
+    ChildCommand, DEFAULT_RELAY_IDLE_BUDGET, DEFAULT_RELAY_IDLE_POLL,
+    DEFAULT_RELAY_MAX_CONNECTIONS, EXIT_BIND_FAILED, EXIT_CHILD_FAILED, EXIT_CHILD_NOT_EXECUTABLE,
+    EXIT_CHILD_NOT_FOUND, EXIT_USAGE, RELAY_USAGE, RelayConfig, RelayDirection, RelayError,
+    RelayReporter, bind_relay, exit_code_from_status, relay_connection, run_child, run_relay,
 };
 
 // Test-Fehlertyp (Bible R087/R165/R182), nur für Tests.
 #[cfg(test)]
 mod test_support;
+
+#[cfg(test)]
+mod tests {
+    use crate::test_support::TestResult;
+
+    // Re-Export-Probe: `DEFAULT_RELAY_IDLE_POLL` und `DEFAULT_RELAY_IDLE_BUDGET`
+    // müssen am Crate-Root ankommen, sonst können Aufrufer die in
+    // `relay_connection`s Doku genannten Standardwerte nicht referenzieren; das
+    // Budget muss länger sein als eine einzelne Lesefrist (Sibling
+    // `DEFAULT_RELAY_MAX_CONNECTIONS` diente als Vorbild).
+    #[test]
+    fn test_crate_root_reexports_relay_idle_defaults() -> TestResult {
+        let idle_poll = crate::DEFAULT_RELAY_IDLE_POLL;
+        let idle_budget = crate::DEFAULT_RELAY_IDLE_BUDGET;
+        let max_connections = crate::DEFAULT_RELAY_MAX_CONNECTIONS;
+        assert!(idle_poll.as_millis() > 0, "{idle_poll:?}");
+        assert!(idle_budget > idle_poll, "{idle_budget:?} <= {idle_poll:?}");
+        assert!(max_connections > 0, "{max_connections}");
+        Ok(())
+    }
+}
