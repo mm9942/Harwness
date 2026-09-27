@@ -38,12 +38,20 @@ const RULES = A.rules || 'no let-chains (`if let … && …`, MSRV 1.85), forbid
 const BUILD_RULE = 'Subagents and parallel agents must **never** run `cargo` or `rustc` in any form: no `check`, `build`, `test`, `nextest`, `clippy`, `fmt`, `run`, `doc`, `deny`, and no `make` target that calls them. They only read and edit code. At the end they report which tests they added and which commands the central build must run.'
 // root is required (catalog P14): the session's working directory follows a
 // `cd` of the main session, so "the current directory" is not a safe default.
-if (!A.root) throw new Error('root is required: pass the absolute path of the checkout (catalog P14)')
-const ROOT = A.root
-const WHERE = ROOT
-  ? `Repository root: ${ROOT} (a git worktree on its own branch). Every path below is relative to that root: read and edit files only under it, and run git as \`git -C ${ROOT} …\`. Never touch the same path in any other checkout.`
-  : 'Repository: the current working directory (Rust workspace).'
-const GIT = ROOT ? `git -C ${ROOT}` : 'git'
+// It also ends up in shell snippets inside prompts, so it must be a plain
+// absolute path (letters, digits, `._/-`, no `..` segment), and every snippet
+// single-quotes it.
+function checkRoot(root) {
+  const r = String(root || '').replace(/\/+$/, '')
+  if (!r) throw new Error('root is required: pass the absolute path of the checkout (catalog P14)')
+  if (!/^\/[A-Za-z0-9._\/-]+$/.test(r) || r.split('/').includes('..')) {
+    throw new Error('root must be a plain absolute path of [A-Za-z0-9._/-] without ".." segments')
+  }
+  return r
+}
+const ROOT = checkRoot(A.root)
+const GIT = `git -C '${ROOT}'`
+const WHERE = `Repository root: ${ROOT} (a git checkout on its own branch). Every path below is relative to that root: read and edit files only under it, and run git as \`${GIT} …\`. Never touch the same path in any other checkout.`
 const CONTEXT = `${WHERE} Binding code rules: ${RULES}. Pattern catalog: ${CATALOG}. ${BUILD_RULE}`
 
 // Lessons from earlier hunts (catalog P1/P2): fixes caused follow-up findings.
@@ -53,7 +61,8 @@ Binding lessons (catalog P1/P2):
 - New tests and doctests: no unwrap/expect/panic!; use TestResult and the crate's helpers.
 - Do not add pub/pub(crate) items without a production caller; no infrastructure that nothing calls. If the proper fix needs wiring in another file, fix only what is safe here and put the rest in skipped with the exact missing call site.
 - No performance regressions (no whole-tree re-walks, no locks across await).
-- Keep the diff small: if the fix needs more than ~150 changed lines, skip it and explain.`
+- Keep the diff small: if the fix needs more than ~150 changed lines, skip it and explain.
+- Code and docs never refer to your brief, the finding list, a contract, a report, a wave or an agent (catalog P15); write what the code does and why.`
 const REVIEW_RULES = `
 Also check: docs/comments in the file still match the new behaviour; new tests/doctests have no unwrap/expect/panic!; no new pub item without a production caller (grep); no dead or unwired code; no performance regression; diff size proportionate to the finding.`
 
@@ -76,13 +85,19 @@ const REVIEW = {
 const RIPPLE = {
   type: 'object',
   properties: {
-    items: { type: 'array', items: { type: 'object', properties: { file: { type: 'string' }, line: { type: 'integer' }, problem: { type: 'string' }, fix: { type: 'string' } }, required: ['file', 'problem'] } },
+    items: { type: 'array', description: 'concrete problems only, each tied to a real repo-relative file', items: { type: 'object', properties: { file: { type: 'string' }, line: { type: 'integer' }, problem: { type: 'string' }, fix: { type: 'string' } }, required: ['file', 'problem'] } },
+    summary: { type: 'string', description: 'what was checked and found clean; never put a non-problem into items' },
   },
-  required: ['items'],
+  required: ['items', 'summary'],
 }
 
 // Canonical repo-relative paths (catalog P7): one group per file, never two fixers on one file.
-const norm = p => String(p || '').replace(/^\/.*?\/(?=[^/]+\/src\/|docs\/|dod\/|deploy\/|xtask\/|Cargo\.toml)/, '').replace(/^\.\//, '')
+// Paths inside ROOT become repo-relative; an absolute path into any other
+// checkout stays absolute, so a write in the wrong tree shows up (catalog P14).
+const norm = p => {
+  const s = String(p || '').trim().replace(/^\.\//, '')
+  return s.startsWith(ROOT + '/') ? s.slice(ROOT.length + 1) : s
+}
 const byFile = {}
 for (const f of A.findings || []) {
   const file = norm(f.file)
@@ -151,15 +166,22 @@ if (A.ripple !== false && groups.length) {
   phase('Ripple')
   ripple = await agent(`${CONTEXT}
 
-You are the cross-file consistency checker. Files just changed by one-file fixers: ${groups.map(g => g[0]).join(', ')}. Read \`${GIT} diff\` for them and look ONLY for cross-file ripple: callers/tests elsewhere that no longer match a changed signature or behaviour, docs/comments/ledger/guides elsewhere describing the old behaviour, pub helpers without any production caller, the same issue fixed twice in conflicting ways, anything that would fail to compile or fail clippy -D warnings across files. Do not edit. Report concrete items with file:line.`,
+You are the cross-file consistency checker. Files just changed by one-file fixers: ${groups.map(g => g[0]).join(', ')}. Read \`${GIT} diff\` for them and look ONLY for cross-file ripple: callers/tests elsewhere that no longer match a changed signature or behaviour, docs/comments/ledger/guides elsewhere describing the old behaviour, pub helpers without any production caller, the same issue fixed twice in conflicting ways, anything that would fail to compile or fail clippy -D warnings across files. Do not edit. Put only concrete problems into items, each with a repo-relative file and line; put what you checked and found clean into summary. Every item blocks this wave until it is fixed and re-verified, moved into a contract wave, or rejected by verification.`,
     { label: `ripple:${A.key || 'batch'}`, phase: 'Ripple', schema: RIPPLE, model: 'opus', agentType: 'focused-explorer' })
 }
 
 // Completion signal for committing/merging the wave: every file ok or
-// repaired-and-re-reviewed, and the ripple check answered (when it ran).
+// repaired-and-re-reviewed, and the ripple check answered with no item (or
+// deliberately skipped). Ripple is three-state: missing (no answer), clear
+// (answered, no item) or findings (answered with items). Each item gets a
+// stable id (<key>-R<n>, in the checker's order, replayed unchanged on resume)
+// and stays open work: fixed and re-verified, moved into a contract wave, or
+// rejected by verification before the wave may merge.
+const KEY = A.key || 'batch'
 const files = groups.map(([file], i) => results[i] || { file, status: 'unverified', reason: 'pipeline item dropped' })
 const open = files.filter(f => f.status !== 'ok' && f.status !== 'repaired')
-const rippleStatus = A.ripple === false || !groups.length ? 'skipped' : (ripple ? 'ok' : 'missing')
-const complete = open.length === 0 && rippleStatus !== 'missing'
-log(`${A.key || 'batch'}: ${complete ? 'complete' : 'NOT complete'}; ${files.length - open.length}/${files.length} files done, ripple ${rippleStatus}`)
-return { key: A.key || 'batch', complete, open, files, fixReports, reviewReports, rippleStatus, ripple: ripple ? ripple.items : null }
+const rippleItems = ripple ? (ripple.items || []).map((item, i) => ({ id: `${KEY}-R${i + 1}`, ...item, file: norm(item.file) })) : []
+const rippleStatus = A.ripple === false || !groups.length ? 'skipped' : (!ripple ? 'missing' : (rippleItems.length ? 'findings' : 'clear'))
+const complete = open.length === 0 && (rippleStatus === 'clear' || rippleStatus === 'skipped')
+log(`${KEY}: ${complete ? 'complete' : 'NOT complete'}; ${files.length - open.length}/${files.length} files done, ripple ${rippleStatus}${rippleItems.length ? ` (${rippleItems.length} open items)` : ''}`)
+return { key: KEY, complete, open, files, fixReports, reviewReports, rippleStatus, ripple: rippleItems, rippleSummary: ripple ? ripple.summary || '' : null }

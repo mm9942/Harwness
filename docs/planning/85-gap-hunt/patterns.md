@@ -299,3 +299,49 @@ verschiedene Fixes für denselben Fund.
   Änderungen im Worktree werden gemeldet und nach dem Ende aller Wellen
   abgeglichen: Hat der Hauptbaum keinen Fix, wird verschoben; ist er gleich,
   wird verworfen; sind beide verschieden, entscheidet ein Review.
+
+### P15 — Agenten schreiben ihren Auftrag in den Code
+Fixer übernehmen Wörter aus ihrem Auftrag in Kommentare: „Covers the brief's
+three cases“ oder „siehe Bericht des Fixer-Agents“. Der Leser findet weder den
+Auftrag noch den Bericht, und die Zahl im Satz stimmt oft nicht einmal.
+
+**Gegenmittel:** Die Fixer-Regeln verbieten Verweise auf Auftrag, Vertrag,
+Bericht, Welle oder Agent in Code und Doku. Ein `xtask`-Gate sucht nach
+diesen Wörtern.
+
+### P16 — Ripple konvergiert, aber nicht auf null
+Jede Ripple-Runde findet weniger, fast nur Doku. Ab und zu steckt aber ein
+echter Fehler darin, den der Ripple-Fix selbst eingeführt hat. In R16 fand
+die erste Runde nach `wa-egress` 11 Punkte, die zweite 9 und darin einen
+neuen Verhaltensfehler (ein Leerlaufzähler zählte ab Verbindungsbeginn). Nach
+`r16-w4` waren es 14 Punkte, zwei davon HIGH.
+
+**Gegenmittel:**
+- Ein Ripple-Befund blockiert die Welle (`rippleStatus = findings`).
+- Die zweite Runde läuft als Vertragswelle, deren Opus-Nachprüfung die
+  Querprüfung übernimmt. Danach folgt kein weiterer Ripple-Lauf.
+- Reine Doku-Punkte werden gesammelt statt einzeln gejagt.
+
+### P17 — Dieselbe Lösung dreimal
+Sicheres Öffnen einer Datei (kein Symlink, kein FIFO, Größe, Besitzer) haben
+`harw-authority`, `harw-security-hub` und `harw-tool-plan` je selbst gebaut,
+obwohl `harw_fsutil` es anbietet. Denselben Fehler (die euid als Besitzer von
+`/proc/self` lesen) hatten drei Crates. Die Ursache ist die Ein-Datei-Regel:
+Der Fixer darf `Cargo.toml` nicht ändern und baut deshalb lokal nach.
+
+**Gegenmittel:**
+- Finder- und Fixer-Prompts nennen die Workspace-Helfer.
+- Braucht ein Fix eine neue Abhängigkeit, geht er in eine Vertragswelle.
+
+### P18 — Reparatur ohne blockierenden Befund
+`contract-wave` startete für jedes Problem, das der Reviewer nannte, einen
+Reparatur-Agenten. Das galt auch nach `ok=true` und auch für Dateien außerhalb
+des Clusters, die der Reviewer ausdrücklich als „nur zur Info“ markiert hatte.
+Diese Änderungen hat nie jemand nachgeprüft: In `ripple-authz` traf es drei
+fremde Dateien, darunter 69 Zeilen Code.
+
+**Gegenmittel:**
+- Reparaturen laufen nur nach `ok=false` und nur an deklarierten Dateien.
+- Hinweise gehören in ein eigenes Feld `notes`.
+- Ein blockierendes Problem außerhalb des Clusters beendet den Cluster als
+  `unresolved`.

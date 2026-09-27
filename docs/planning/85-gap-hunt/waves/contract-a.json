@@ -1,0 +1,142 @@
+{
+ "schema": 1,
+ "wave": "contract-a",
+ "branch": "claude/r16/contract-a",
+ "base_sha": "1ad90219d83aa305f5bfe2ca531a30b5ab41a829",
+ "head_sha": "72ea67ebd5b715bbbf5b856383bff5ee2bd87424",
+ "files": [
+  "docs/architecture/dependency-review.md",
+  "docs/planning/66-placement/README.md",
+  "docs/planning/67-containers/README.md",
+  "docs/planning/67-containers/cell.md",
+  "dod/crates/harw-dod-warden/src/error.rs",
+  "dod/crates/harw-dod-warden/src/executor.rs",
+  "dod/crates/harw-warden/src/isolation.rs",
+  "harw-catalog/src/skill_index.rs",
+  "harw-config/src/discovery.rs",
+  "harw-config/src/lib.rs",
+  "harw-config/src/merge.rs",
+  "harw-config/tests/config_scope_merge.rs",
+  "harw-home/assets/skills/business-writing-pyramid/skill.toml",
+  "harw-home/assets/skills/latex-report/instructions.md",
+  "harw-knowledge/src/context_steward.rs",
+  "harw-knowledge/src/lib.rs",
+  "harw-ops/src/dream_run.rs",
+  "harw-registry-defaults/src/skill_tools.rs",
+  "harw-secrets/Cargo.toml",
+  "xtask/arch-policy.toml",
+  "xtask/src/gate_arch.rs"
+ ],
+ "findings": [
+  {
+   "id": "F-00611ccebf89",
+   "cluster": "c01",
+   "file": "harw-config/src/merge.rs",
+   "line": 1886,
+   "severity": "low",
+   "pattern": "NEW:public-third-party-type",
+   "title": "`merge_layer_into` exposes `&toml::Value` in the crate-root API, and only in-crate code and tests call it"
+  },
+  {
+   "id": "F-279465809abe",
+   "cluster": "c30",
+   "file": "harw-knowledge/src/context_steward.rs",
+   "line": 1289,
+   "severity": "low",
+   "pattern": "NEW:pub-without-caller",
+   "title": "The Context Steward digest pipeline (AW6-08) has no production caller"
+  },
+  {
+   "id": "F-70b981a0b7a5",
+   "cluster": "c37",
+   "file": "harw-secrets/Cargo.toml",
+   "line": 14,
+   "severity": "low",
+   "title": "harw-secrets still says crypt_guard comes from git"
+  },
+  {
+   "id": "F-773fd64f62dd",
+   "cluster": "c26",
+   "file": "harw-home/assets/skills/latex-report/instructions.md",
+   "line": 110,
+   "severity": "low",
+   "pattern": "NEW:book-author-reference",
+   "title": "Skill assets name an author ('nach Minto', 'Minto-Pyramide')"
+  },
+  {
+   "id": "F-84cf315f2fcc",
+   "cluster": "c33",
+   "file": "xtask/src/gate_arch.rs",
+   "line": 806,
+   "severity": "low",
+   "pattern": "M1",
+   "title": "arch gate *-sys hull skips internal crates' [build-dependencies], yet the doc claims it 'übersieht nichts'"
+  },
+  {
+   "id": "F-85c7161d3f39",
+   "cluster": "c01",
+   "file": "harw-config/src/merge.rs",
+   "line": 629,
+   "severity": "critical",
+   "pattern": "M1",
+   "title": "An untrusted repo .harw can turn on Full Access and switch off the guards whenever the trusted layers leave these keys unset"
+  },
+  {
+   "id": "F-89bbbd3489c9",
+   "cluster": "c23",
+   "file": "dod/crates/harw-dod-warden/src/executor.rs",
+   "line": 167,
+   "severity": "medium",
+   "pattern": "NEW:cgroup-addressing",
+   "title": "Warden can only address top-level cgroups (e.g. system.slice), never a job cgroup below a slice"
+  }
+ ],
+ "workflow_runs": [
+  "wf_7c6db5a9-d11"
+ ],
+ "disposition": {
+  "clusters": [
+   {
+    "id": "c26",
+    "status": "ok",
+    "reason": null
+   },
+   {
+    "id": "c23",
+    "status": "ok",
+    "reason": null
+   },
+   {
+    "id": "c30",
+    "status": "ok",
+    "reason": null
+   },
+   {
+    "id": "c37",
+    "status": "ok",
+    "reason": null
+   },
+   {
+    "id": "c33",
+    "status": "repaired",
+    "reason": null
+   },
+   {
+    "id": "c01",
+    "status": "ok",
+    "reason": null
+   }
+  ]
+ },
+ "central_build": [
+  "env CARGO_INCREMENTAL=0 CARGO_PROFILE_DEV_DEBUG=0 CARGO_PROFILE_TEST_DEBUG=0 (cloud container, every step)",
+  "cargo fmt --all",
+  "cargo clippy --workspace --all-targets -- -D warnings",
+  "cargo test --workspace (including doc tests)",
+  "cargo run -q -p xtask -- gates",
+  "cargo deny check",
+  "make -C dod clippy test",
+  "actionlint"
+ ],
+ "note": "Backfilled after the merge (kit-4); the wave predates the manifest. c33 was re-reviewed by a separate Opus agent after its repair (ok); planning-doc line citations fixed by hand; foreign files from misplaced agents (P14) were excluded."
+}

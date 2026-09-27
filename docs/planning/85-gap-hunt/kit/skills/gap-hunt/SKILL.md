@@ -62,6 +62,30 @@ The pattern catalog is `docs/planning/85-gap-hunt/patterns.md`. The run logs are
   merge it into the integration branch (`--no-ff`), remove the worktree.
 - Remove all worktrees before the central build: some gates walk the tree.
 
+## Completion gates: when a wave may merge
+- **gap-fix:** `complete` is true only when every file is `ok` or
+  `repaired` (repair plus re-review) **and** the ripple check is `clear`
+  (answered, no item) or deliberately `skipped`. `findings` means the
+  checker named cross-file problems: each item has a stable id
+  (`<key>-R<n>`) and stays open until it is fixed and re-verified, moved into
+  a contract wave, or rejected by verification. `missing` means no answer.
+- **contract-wave:** the declared cluster files are the trusted input. The
+  contract must list each of them exactly once (`change=false` for a file
+  that needs no edit) and nothing else, or the cluster ends as
+  `contract-mismatch` before any coder starts. Files the findings name
+  outside the cluster are reported as `uncovered` and fenced off in the
+  contract prompt. Repairs run only after `ok=false` and only on declared
+  files; a blocking problem outside the cluster ends it as `unresolved`.
+- **Commit only the named files** of the wave, never `git add -A`: foreign
+  changes in a worktree come from agents in the wrong checkout (catalog P14)
+  and are reconciled separately.
+- **Manifest:** on top of the content commit, write the wave's immutable
+  manifest with `kit/wave_manifest.py` (base SHA, branch, file set, finding
+  ids, workflow run ids, content head SHA, disposition, central-build
+  commands) into `waves/<wave>.json` and commit it on the wave branch before
+  the merge. A re-cut wave gets a new name; a manifest is never edited.
+- The gate logic has tests: `node kit/tests/workflow-gates.test.js`.
+
 ## Commit rhythm (batched at verified checkpoints)
 - **When to commit:** at the **end of each workflow**, and in between whenever
   about **90 verifications** have finished since the last commit, counted
