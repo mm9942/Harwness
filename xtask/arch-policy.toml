@@ -11,8 +11,9 @@
 # Datei.
 #
 # Was das Gate prüft (Details in xtask/src/gate_arch.rs):
-# - Jedes Paket im Graphen (Wurzel- und `dod/`-Workspace) steht unter
-#   `[packages]`. Ein neues, nicht klassifiziertes Paket ist ein Verstoß.
+# - Jedes Paket im Graphen (seit PL-60 ein Workspace, `dod/crates/*`
+#   eingeschlossen) steht unter `[packages]`. Ein neues, nicht
+#   klassifiziertes Paket ist ein Verstoß.
 #   Hier gelistete, aber (noch) nicht existierende Pakete sind zulässig.
 # - Jede interne normale Kante (`[dependencies]`, nicht dev/build) folgt
 #   `[rules]` — oder steht als `[[exceptions]]`-Eintrag da.
@@ -23,7 +24,8 @@
 #   `[tcb."<name>"].allowed_internal` genannten internen Crates zeigen.
 #   Eine nicht mehr genutzte Allowlist-Zeile ist ebenfalls veraltet.
 # - Schichten mit `forbid_sys_crates = true` und alle TCB-Pakete dürfen in
-#   ihrer transitiven Hülle keine `*-sys`-Crate erreichen, außer den unter
+#   ihrer transitiven Hülle (über `[dependencies]` und
+#   `[build-dependencies]`) keine `*-sys`-Crate erreichen, außer den unter
 #   `[[sys_crates.allow]]` begründeten.
 
 # ---------------------------------------------------------------------------
@@ -55,11 +57,16 @@ A.may_depend_on = ["*"]
 # ---------------------------------------------------------------------------
 # Gilt für Schichten mit `forbid_sys_crates = true` und – über
 # `forbid_for_tcb` – für jedes Paket mit `tcb = true`. Die Hülle wird über
-# die normalen `[dependencies]` der Workspace-Crates und danach über die
-# Kanten in `Cargo.lock` (und `dod/Cargo.lock`, falls vorhanden) gebildet.
-# `Cargo.lock` kennt keine Plattform- oder Feature-Filter; die Hülle ist
-# also eine Überschätzung. Deshalb stehen hier die Crates, deren Name auf
-# `-sys` endet, die aber keinen C-Code bauen.
+# die `[dependencies]` und `[build-dependencies]` der Workspace-Crates und
+# danach über die Kanten in `Cargo.lock` gebildet (seit PL-60 die einzige
+# Lock-Datei). `Cargo.lock` kennt keine Plattform- oder Feature-Filter; die
+# Hülle ist also eine Überschätzung. Deshalb stehen hier die Crates, deren
+# Name auf `-sys` endet, die aber keinen C-Code bauen.
+# Grenze: Tabellen `[target.'cfg(..)'.…]` sieht die Hülle nicht. J-Crates,
+# die ihre plattformspezifischen Abhängigkeiten nur dort deklarieren
+# (z. B. harw-job-linux: rustix, landlock, …), prüft diese Regel damit
+# nicht wirksam (Grenze des Workspace-Graphen, siehe
+# xtask/src/gate_arch.rs).
 [sys_crates]
 forbid_for_tcb = true
 

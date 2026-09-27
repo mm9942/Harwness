@@ -42,8 +42,11 @@ use std::fmt;
 /// Wird von den Ausführungs-Traits in `executor.rs` zurückgegeben.
 #[derive(harw_macros::HarwError)]
 pub enum WardenError {
-    /// Eine cgroup-Kennung enthält Zeichen, die als Dateisystempfad-Segment
-    /// gefährlich wären (`/`, `..`, ein eingebettetes NUL-Byte). `CgroupId`
+    /// Eine cgroup-Kennung ist kein gefahrloser relativer Pfad unterhalb der
+    /// cgroup-Wurzel: ein leeres Segment (also ein führender, abschließender
+    /// oder doppelter `/`), ein Segment `.` oder `..` oder ein Steuerzeichen
+    /// (einschließlich NUL). Mehrstufige Pfade wie `harw.slice/job-1` sind
+    /// zulässig; geprüft wird jedes `/`-getrennte Segment einzeln. `CgroupId`
     /// garantiert laut `harw-types` nur „nicht leer, nicht nur
     /// Leerzeichen" — keine Pfadsicherheit. Da der Warden der Gegenseite
     /// nichts glaubt (Crate-Moduldoku, `lib.rs`), prüft

@@ -124,7 +124,7 @@ pub struct ResolvedConfig {
     /// Legacy-Provider seine Referenz noch auflöst). Siehe
     /// [`ConfigDiagnostic`].
     pub diagnostics: Vec<ConfigDiagnostic>,
-    /// Abgelehnte Scope-Lockerungsversuche aus [`merge_layer_into`]
+    /// Abgelehnte Scope-Lockerungsversuche aus `merge::merge_layer_into`
     /// (`docs/design/config-scopes.md` Abschnitt 7e), akkumuliert über jeden
     /// vertrauten Layer (`discover_config_with_restricted`) und den nicht
     /// vertrauten Projekt-Layer (`apply_restricted_layer`). Nicht-fatal,
@@ -602,23 +602,32 @@ pub fn discover_config(layers: &[PathBuf]) -> ConfigResult<ResolvedConfig> {
 /// `restricted_repo` ist `harw_home::LayerReport::untrusted_repo`. Aus dem
 /// eingeschränkten Layer wird **nur** `config.toml` gelesen, und daraus nur
 /// Schlüssel, die den bereits aufgelösten, vertrauten Stand nachweislich
-/// verengen:
+/// verengen — oder, wenn kein vertrauter Layer den Schlüssel setzt, die
+/// eingebaute Vorgabe. Ein verworfener Lockerungsversuch bei einem der
+/// Schlüssel aus der Tabelle (außer `[network]`/`[browser]`/`[dod]`) landet
+/// in [`ResolvedConfig::scope_warnings`]. Was die Rolle
+/// `LayerRole::UntrustedProject` je Schlüssel übernimmt (Quelle: die
+/// Merge-Helfer in `merge.rs` und `scope::FIELD_TABLE`):
 ///
 /// | Schlüssel | Übernahme |
 /// |---|---|
-/// | `policy.require_approval_for` | Vereinigung (mehr Freigabepflichten) |
-/// | `research.network_allow_hosts` | exakte Schnittmenge mit dem vertrauten Stand |
-/// | `research.cargo_registry_read` | logisches UND |
-/// | `research.max_fetch_bytes`, `research.fetch_timeout_secs` | Minimum, nur Werte > 0 |
-/// | `tools.plan.validate_dependency_cycles` | logisches ODER |
-/// | `tools.plan.validate_write_conflicts` | logisches ODER |
-/// | `tools.plan.max_nodes`, `tools.plan.max_expand_depth` | Minimum, nur Werte > 0 |
+/// | `policy.require_approval_for`, `permissions.deny` | Vereinigung (mehr Freigabepflichten bzw. Verbote) |
+/// | `research.network_allow_hosts`, `permissions.allow`, `permissions.extra_roots`, `mcp_listener.principals` (nach `id`) | Schnittmenge mit dem vertrauten Stand, nur Einträge entfernen |
+/// | `mcp_listener.enabled`, `research.cargo_registry_read` | logisches UND, nur abschalten |
+/// | `tools.plan.validate_dependency_cycles`, `tools.plan.validate_write_conflicts`, `guards.enabled` | logisches ODER, nur einschalten; `guards.enabled` ohne vertrauten Wert gegen die Vorgabe `true` |
+/// | `policy.default_visibility_scope` (`self` vor `everyone`), `permissions.default_mode` (`ask` < `auto` < `full`), `tools.doc.remote_ocr` (`off` < `ask` < `on`) | nur ein strengerer Wert; `permissions.default_mode` ohne vertrauten Wert gegen `auto` |
+/// | `session.retention_days`, `research.max_fetch_bytes`, `research.fetch_timeout_secs`, `tools.plan.max_nodes`, `tools.plan.max_expand_depth`, die sieben `guards.*`-Schwellen | Minimum, nur Werte > 0; die `guards.*`-Schwellen ohne vertrauten Wert gegen die Vorgaben 2/3/4/8/6/4/5 (`repeated_failure_warn`/`_abort`, `no_progress_rounds_warn`/`_abort`, `plan_stale_rounds`, `orchestrator_read_warn`/`_limit`) |
+/// | `permissions.approval_timeout_secs`, `permissions.auto_classifier_timeout_secs`, `compaction.absolute_ceiling_tokens` | Minimum gegen den vertrauten Wert; ohne einen solchen wird der erste Wert übernommen |
+/// | `host.sudo_session_minutes`, `agents.max_*`, `shell.max_timeout_secs` | nur Senken, gegen den vertrauten Wert oder die Vorgabe |
+/// | `[network]`, `[browser]`, `[dod]` | nur verengend (`merge_restricted_*`) |
 ///
 /// Nie übernommen werden insbesondere `providers/`, `models/`, `auth.toml`,
 /// `.env`, `mcps/`, `plugins/`, `skills/`, `agents/`, `channels/`,
-/// `[mcp_listener]`, `default_provider`/`default_model`,
-/// `active_agent_definition`, `[policy].default_visibility_scope`, `[session]`,
-/// `[tui]`, `[logging]`, `[mode]` sowie alle übrigen Schlüssel. Nicht
+/// `default_provider`/`default_model`, `active_agent_definition`,
+/// `policy_profile`, `config_version`, `mcp_listener.listen_addr`/`.path`,
+/// `[session]` außer `retention_days`, `[tui]`, `[logging]`, `[mode]`,
+/// `[sandbox]`, `[onboarding]`, `[internal_models]`, `[web]`,
+/// `[infrastructure]` sowie alle übrigen `ProfileReplaces`-Schlüssel. Nicht
 /// angegebene Schlüssel lassen den vertrauten Wert unverändert (Serde-Defaults
 /// des Repo-Layers wirken nie).
 ///
@@ -1440,7 +1449,9 @@ level = "debug"
         Ok(())
     }
 
-    /// Nicht vertrauter Repo-Layer mit allen Exfiltrations-Hebeln aus F-103.
+    /// Nicht vertrauter Repo-Layer mit allen Exfiltrations-Hebeln aus F-103,
+    /// dazu Lockerungen von `[permissions]`/`[guards]`, die kein vertrauter
+    /// Layer setzt (nur die eingebaute Vorgabe steht dagegen).
     fn hostile_repo_layer(repo: &Path) -> TestResult {
         write_layer_file(
             repo,
@@ -1471,6 +1482,14 @@ enabled = true
 persist = true
 max_nodes = 8
 validate_write_conflicts = false
+
+[permissions]
+default_mode = "full"
+
+[guards]
+enabled = false
+orchestrator_read_limit = 0
+repeated_failure_abort = 999
 "#,
         )?;
         write_layer_file(
@@ -1607,7 +1626,65 @@ max_nodes = 64
         assert!(!config.harness.tools.plan.persist);
         assert_eq!(config.harness.tools.plan.max_nodes, 8);
         assert!(config.harness.tools.plan.validate_write_conflicts);
+
+        // Der Home-Layer setzt weder `[permissions]` noch `[guards]` (wie die
+        // Vorlage aus `harw-home`): die Lockerungen des Repos werden gegen die
+        // eingebauten Vorgaben geprüft, verworfen und sichtbar gemeldet.
+        assert_eq!(config.harness.permissions.default_mode, None);
+        assert_eq!(config.harness.guards.enabled, None);
+        assert_eq!(config.harness.guards.orchestrator_read_limit, None);
+        assert_eq!(config.harness.guards.repeated_failure_abort, None);
+        for field in [
+            "permissions.default_mode",
+            "guards.enabled",
+            "guards.orchestrator_read_limit",
+            "guards.repeated_failure_abort",
+        ] {
+            assert!(
+                config.scope_warnings.iter().any(|d| d.field == field),
+                "fehlende Scope-Warnung für {field}"
+            );
+        }
         assert!(config.validate().is_ok());
+
+        std::fs::remove_dir_all(home).map_err(ctx("Home-Verzeichnis entfernen"))?;
+        std::fs::remove_dir_all(repo).map_err(ctx("Repo-Verzeichnis entfernen"))?;
+        Ok(())
+    }
+
+    #[test]
+    fn restricted_repo_tightens_unset_permissions_and_guards() -> TestResult {
+        let home = test_directory("restricted-tighten-home")?;
+        let repo = test_directory("restricted-tighten-repo")?;
+        // Wie die Vorlage aus `harw-home`: kein `[permissions]`, kein
+        // `[guards]` im vertrauten Stand.
+        write_layer_file(&home, "config.toml", "[logging]\nlevel = \"info\"\n")?;
+        // Beide Werte sind strenger als die eingebaute Vorgabe (`auto`, `3`)
+        // und werden deshalb auch ohne vertrauten Wert übernommen.
+        write_layer_file(
+            &repo,
+            "config.toml",
+            "[permissions]\ndefault_mode = \"ask\"\n[guards]\nrepeated_failure_abort = 2\n",
+        )?;
+
+        let config =
+            discover_config_with_restricted(std::slice::from_ref(&home), Some(repo.as_path()))
+                .map_err(ctx("Eingeschränkte Konfiguration entdecken"))?;
+
+        assert_eq!(
+            config.harness.permissions.default_mode.as_deref(),
+            Some("ask")
+        );
+        assert_eq!(config.harness.guards.repeated_failure_abort, Some(2));
+        assert!(
+            !config
+                .scope_warnings
+                .iter()
+                .any(|d| d.field == "permissions.default_mode"
+                    || d.field == "guards.repeated_failure_abort"),
+            "unerwartete Scope-Warnung: {:?}",
+            config.scope_warnings
+        );
 
         std::fs::remove_dir_all(home).map_err(ctx("Home-Verzeichnis entfernen"))?;
         std::fs::remove_dir_all(repo).map_err(ctx("Repo-Verzeichnis entfernen"))?;

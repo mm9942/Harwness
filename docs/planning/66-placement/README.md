@@ -61,7 +61,7 @@ Die Ergänzungen aus der Sitzung stehen am Ende.
 The proposal:
 - A new ring-**I** crate `harw-placement-model` holds the vocabulary and the pure filter and score functions.
 - A new ring-**A** crate `harw-placement` holds the engine, leases and audit.
-- The crates that own offers today produce them in the I vocabulary. J and A crates may depend on I (`xtask/arch-policy.toml:43-51`).
+- The crates that own offers today produce them in the I vocabulary. J and A crates may depend on I (`xtask/arch-policy.toml:45-53`).
 - The compiler (C) may use the I vocabulary for new DSL keys, but it never sees node topology.
 
 ---

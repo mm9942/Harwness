@@ -1,7 +1,10 @@
-//! Merge-Verhaltens-Tests für `crate::merge::merge_layer_into` und
-//! `discover_config_with_restricted` (Paket C, `docs/design/config-scopes.md`
-//! Abschnitt 7h — alle 27 spezifizierten Tests, inkl. der vier durch die
-//! R1/R2-Entscheidung vom 2026-09-21 neu hinzugekommenen #24–#27).
+//! Merge-Verhaltens-Tests für `harw_config::merge_layer_toml_into` (der
+//! öffentliche `&str`-Einstieg zum crate-internen `merge::merge_layer_into`)
+//! und `discover_config_with_restricted` (Paket C,
+//! `docs/design/config-scopes.md` Abschnitt 7h — alle 27 spezifizierten
+//! Tests, inkl. der vier durch die R1/R2-Entscheidung vom 2026-09-21 neu
+//! hinzugekommenen #24–#27, plus die Schutztests für vom Home-Layer nicht
+//! gesetzte `[permissions]`/`[guards]`-Schlüssel und für ungültiges TOML).
 //!
 //! Ausschließlich öffentliche API (`harw_config::*`) — kein Zugriff auf
 //! interne `#[cfg(test)]`-Module aus `scope.rs`/`merge.rs`/`discovery.rs`.
@@ -18,8 +21,9 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 use common::{TestError, TestResult, ctx};
 use harw_config::{
-    CargoSandboxModeToml, CargoSandboxToml, HarnessConfig, LayerRole, McpJobCapabilityToml,
-    McpPrincipalToml, RuleToml, SecretRef, discover_config_with_restricted, merge_layer_into,
+    CargoSandboxModeToml, CargoSandboxToml, ConfigError, HarnessConfig, LayerRole,
+    McpJobCapabilityToml, McpPrincipalToml, RuleToml, SecretRef, discover_config_with_restricted,
+    merge_layer_toml_into,
 };
 
 // ---------------------------------------------------------------------
@@ -50,14 +54,12 @@ fn write_layer_file(base: &Path, rel: &str, contents: &str) -> TestResult {
     Ok(())
 }
 
-/// Fester Beispielpfad für direkte `merge_layer_into`-Aufrufe, die keinen
-/// echten Tempdir-Layer brauchen (nur `ScopeDiagnostic::file`).
+/// Fester Beispielpfad für direkte `harw_config::merge_layer_toml_into`-
+/// Aufrufe (öffentlicher `&str`-Einstieg zum crate-internen
+/// `merge::merge_layer_into`), die keinen echten Tempdir-Layer brauchen
+/// (nur `ScopeDiagnostic::file`).
 fn layer_path() -> PathBuf {
     PathBuf::from("/home/user/.harw/profiles/default/config.toml")
-}
-
-fn raw_from(src: &str) -> TestResult<toml::Value> {
-    toml::from_str(src).map_err(ctx("valid toml fixture"))
 }
 
 // =======================================================================
@@ -76,15 +78,16 @@ fn test_merge_layer_into_profile_replaces_keeps_home_value_when_profile_omits_fi
     let incoming = HarnessConfig::default();
     // Profil-Layer setzt nur ein völlig anderes Feld — [logging]/[tui]
     // tauchen im rohen TOML dieses Layers gar nicht auf.
-    let raw = raw_from(r#"default_provider = "anthropic""#)?;
+    let raw = r#"default_provider = "anthropic""#;
 
-    let diagnostics = merge_layer_into(
+    let diagnostics = merge_layer_toml_into(
         &mut trusted,
         incoming,
-        &raw,
+        raw,
         LayerRole::Refinement,
         &layer_path(),
-    );
+    )
+    .map_err(ctx("merge_layer_toml_into"))?;
 
     assert_eq!(trusted.logging.level, "debug");
     assert_eq!(trusted.tui.theme, "midnight");
@@ -111,21 +114,20 @@ fn test_merge_layer_into_profile_replaces_internal_models_partial_override_keeps
         provider: Some("openrouter".to_owned()),
         model: Some("nemotron".to_owned()),
     });
-    let raw = raw_from(
-        r#"
+    let raw = r#"
             [internal_models.session_title]
             provider = "openrouter"
             model = "nemotron"
-        "#,
-    )?;
+        "#;
 
-    let diagnostics = merge_layer_into(
+    let diagnostics = merge_layer_toml_into(
         &mut trusted,
         incoming,
-        &raw,
+        raw,
         LayerRole::Refinement,
         &layer_path(),
-    );
+    )
+    .map_err(ctx("merge_layer_toml_into"))?;
 
     assert_eq!(
         trusted.internal_models.session_title,
@@ -164,23 +166,22 @@ fn test_merge_layer_into_global_only_rejects_profile_override_of_sandbox_cargo()
         rustup_home: "/opt/harw/rustup".to_owned(),
         cargo_home: "/opt/harw/cargo-home".to_owned(),
     });
-    let raw = raw_from(
-        r#"
+    let raw = r#"
             [sandbox.cargo]
             mode = "fetch"
             cargo_bin = "/evil/cargo"
             rustup_home = "/opt/harw/rustup"
             cargo_home = "/opt/harw/cargo-home"
-        "#,
-    )?;
+        "#;
 
-    let diagnostics = merge_layer_into(
+    let diagnostics = merge_layer_toml_into(
         &mut trusted,
         incoming,
-        &raw,
+        raw,
         LayerRole::Refinement,
         &layer_path(),
-    );
+    )
+    .map_err(ctx("merge_layer_toml_into"))?;
 
     let cargo = trusted
         .sandbox
@@ -206,20 +207,19 @@ fn test_merge_layer_into_union_combines_policy_require_approval_for_from_both_la
     trusted.policy.require_approval_for = vec!["shell.exec".to_owned()];
     let mut incoming = HarnessConfig::default();
     incoming.policy.require_approval_for = vec!["fs.write".to_owned()];
-    let raw = raw_from(
-        r#"
+    let raw = r#"
             [policy]
             require_approval_for = ["fs.write"]
-        "#,
-    )?;
+        "#;
 
-    let diagnostics = merge_layer_into(
+    let diagnostics = merge_layer_toml_into(
         &mut trusted,
         incoming,
-        &raw,
+        raw,
         LayerRole::Refinement,
         &layer_path(),
-    );
+    )
+    .map_err(ctx("merge_layer_toml_into"))?;
 
     assert_eq!(trusted.policy.require_approval_for.len(), 2);
     assert!(
@@ -266,22 +266,21 @@ fn test_merge_layer_into_intersection_drops_new_permissions_allow_entry() -> Tes
             pattern: None,
         },
     ];
-    let raw = raw_from(
-        r#"
+    let raw = r#"
             [[permissions.allow]]
             tool = "shell.exec"
             [[permissions.allow]]
             tool = "fs.write"
-        "#,
-    )?;
+        "#;
 
-    let diagnostics = merge_layer_into(
+    let diagnostics = merge_layer_toml_into(
         &mut trusted,
         incoming,
-        &raw,
+        raw,
         LayerRole::Refinement,
         &layer_path(),
-    );
+    )
+    .map_err(ctx("merge_layer_toml_into"))?;
 
     assert_eq!(trusted.permissions.allow.len(), 1);
     assert_eq!(trusted.permissions.allow[0].tool, "shell.exec");
@@ -296,20 +295,19 @@ fn test_merge_layer_into_min_bound_rejects_higher_tools_plan_max_nodes() -> Test
     trusted.tools.plan.max_nodes = 64;
     let mut incoming = HarnessConfig::default();
     incoming.tools.plan.max_nodes = 999;
-    let raw = raw_from(
-        r#"
+    let raw = r#"
             [tools.plan]
             max_nodes = 999
-        "#,
-    )?;
+        "#;
 
-    let diagnostics = merge_layer_into(
+    let diagnostics = merge_layer_toml_into(
         &mut trusted,
         incoming,
-        &raw,
+        raw,
         LayerRole::Refinement,
         &layer_path(),
-    );
+    )
+    .map_err(ctx("merge_layer_toml_into"))?;
 
     assert_eq!(trusted.tools.plan.max_nodes, 64);
     assert!(
@@ -328,20 +326,19 @@ fn test_merge_layer_into_min_bound_accepts_lower_tools_plan_max_nodes() -> TestR
     trusted.tools.plan.max_nodes = 64;
     let mut incoming = HarnessConfig::default();
     incoming.tools.plan.max_nodes = 10;
-    let raw = raw_from(
-        r#"
+    let raw = r#"
             [tools.plan]
             max_nodes = 10
-        "#,
-    )?;
+        "#;
 
-    let diagnostics = merge_layer_into(
+    let diagnostics = merge_layer_toml_into(
         &mut trusted,
         incoming,
-        &raw,
+        raw,
         LayerRole::Refinement,
         &layer_path(),
-    );
+    )
+    .map_err(ctx("merge_layer_toml_into"))?;
 
     assert_eq!(trusted.tools.plan.max_nodes, 10);
     assert!(
@@ -361,20 +358,19 @@ fn test_merge_layer_into_and_bool_keeps_mcp_listener_disabled_when_profile_tries
     trusted.mcp_listener.enabled = false;
     let mut incoming = HarnessConfig::default();
     incoming.mcp_listener.enabled = true;
-    let raw = raw_from(
-        r#"
+    let raw = r#"
             [mcp_listener]
             enabled = true
-        "#,
-    )?;
+        "#;
 
-    let diagnostics = merge_layer_into(
+    let diagnostics = merge_layer_toml_into(
         &mut trusted,
         incoming,
-        &raw,
+        raw,
         LayerRole::Refinement,
         &layer_path(),
-    );
+    )
+    .map_err(ctx("merge_layer_toml_into"))?;
 
     assert!(!trusted.mcp_listener.enabled);
     assert!(
@@ -394,20 +390,19 @@ fn test_merge_layer_into_or_bool_keeps_guards_enabled_when_profile_tries_to_disa
     trusted.guards.enabled = Some(true);
     let mut incoming = HarnessConfig::default();
     incoming.guards.enabled = Some(false);
-    let raw = raw_from(
-        r#"
+    let raw = r#"
             [guards]
             enabled = false
-        "#,
-    )?;
+        "#;
 
-    let diagnostics = merge_layer_into(
+    let diagnostics = merge_layer_toml_into(
         &mut trusted,
         incoming,
-        &raw,
+        raw,
         LayerRole::Refinement,
         &layer_path(),
-    );
+    )
+    .map_err(ctx("merge_layer_toml_into"))?;
 
     assert_eq!(trusted.guards.enabled, Some(true));
     assert!(diagnostics.iter().any(|d| d.field == "guards.enabled"));
@@ -421,20 +416,19 @@ fn test_merge_layer_into_stricter_of_rejects_looser_permissions_default_mode() -
     trusted.permissions.default_mode = Some("auto".to_owned());
     let mut incoming = HarnessConfig::default();
     incoming.permissions.default_mode = Some("full".to_owned());
-    let raw = raw_from(
-        r#"
+    let raw = r#"
             [permissions]
             default_mode = "full"
-        "#,
-    )?;
+        "#;
 
-    let diagnostics = merge_layer_into(
+    let diagnostics = merge_layer_toml_into(
         &mut trusted,
         incoming,
-        &raw,
+        raw,
         LayerRole::Refinement,
         &layer_path(),
-    );
+    )
+    .map_err(ctx("merge_layer_toml_into"))?;
 
     assert_eq!(trusted.permissions.default_mode.as_deref(), Some("auto"));
     assert!(
@@ -453,20 +447,19 @@ fn test_merge_layer_into_stricter_of_accepts_stricter_permissions_default_mode()
     trusted.permissions.default_mode = Some("auto".to_owned());
     let mut incoming = HarnessConfig::default();
     incoming.permissions.default_mode = Some("ask".to_owned());
-    let raw = raw_from(
-        r#"
+    let raw = r#"
             [permissions]
             default_mode = "ask"
-        "#,
-    )?;
+        "#;
 
-    let diagnostics = merge_layer_into(
+    let diagnostics = merge_layer_toml_into(
         &mut trusted,
         incoming,
-        &raw,
+        raw,
         LayerRole::Refinement,
         &layer_path(),
-    );
+    )
+    .map_err(ctx("merge_layer_toml_into"))?;
 
     assert_eq!(trusted.permissions.default_mode.as_deref(), Some("ask"));
     assert!(
@@ -492,21 +485,20 @@ fn test_merge_layer_into_composite_member_rule_toml_uses_full_struct_equality() 
         tool: "shell.exec".to_owned(),
         pattern: Some("cargo build".to_owned()),
     }];
-    let raw = raw_from(
-        r#"
+    let raw = r#"
             [[permissions.allow]]
             tool = "shell.exec"
             pattern = "cargo build"
-        "#,
-    )?;
+        "#;
 
-    let diagnostics = merge_layer_into(
+    let diagnostics = merge_layer_toml_into(
         &mut trusted,
         incoming,
-        &raw,
+        raw,
         LayerRole::Refinement,
         &layer_path(),
-    );
+    )
+    .map_err(ctx("merge_layer_toml_into"))?;
 
     // Die Home-Fassung (tool="shell.exec", pattern="cargo check") ist im
     // Profil-Wert nicht enthalten (unterschiedliches `pattern`), fällt also
@@ -538,15 +530,16 @@ fn test_merge_layer_into_per_file_validated_config_version_is_never_inherited() 
         default_provider: Some("anthropic".to_owned()),
         ..Default::default()
     };
-    let raw = raw_from(r#"default_provider = "anthropic""#)?;
+    let raw = r#"default_provider = "anthropic""#;
 
-    let diagnostics = merge_layer_into(
+    let diagnostics = merge_layer_toml_into(
         &mut trusted,
         incoming,
-        &raw,
+        raw,
         LayerRole::Refinement,
         &layer_path(),
-    );
+    )
+    .map_err(ctx("merge_layer_toml_into"))?;
 
     assert_eq!(
         trusted.config_version, 0,
@@ -567,15 +560,16 @@ fn test_security_critical_mcp_listener_enabled_and_bool_rejects_loosening() -> T
     trusted.mcp_listener.enabled = false;
     let mut incoming = HarnessConfig::default();
     incoming.mcp_listener.enabled = true;
-    let raw = raw_from("[mcp_listener]\nenabled = true\n")?;
+    let raw = "[mcp_listener]\nenabled = true\n";
 
-    let diagnostics = merge_layer_into(
+    let diagnostics = merge_layer_toml_into(
         &mut trusted,
         incoming,
-        &raw,
+        raw,
         LayerRole::Refinement,
         &layer_path(),
-    );
+    )
+    .map_err(ctx("merge_layer_toml_into"))?;
 
     assert!(!trusted.mcp_listener.enabled);
     assert!(
@@ -593,15 +587,16 @@ fn test_security_critical_mcp_listener_listen_addr_global_only_rejects_override(
     trusted.mcp_listener.listen_addr = "127.0.0.1:1337".to_owned();
     let mut incoming = HarnessConfig::default();
     incoming.mcp_listener.listen_addr = "0.0.0.0:1337".to_owned();
-    let raw = raw_from("[mcp_listener]\nlisten_addr = \"0.0.0.0:1337\"\n")?;
+    let raw = "[mcp_listener]\nlisten_addr = \"0.0.0.0:1337\"\n";
 
-    let diagnostics = merge_layer_into(
+    let diagnostics = merge_layer_toml_into(
         &mut trusted,
         incoming,
-        &raw,
+        raw,
         LayerRole::Refinement,
         &layer_path(),
-    );
+    )
+    .map_err(ctx("merge_layer_toml_into"))?;
 
     assert_eq!(trusted.mcp_listener.listen_addr, "127.0.0.1:1337");
     assert!(diagnostics.iter().any(
@@ -634,8 +629,7 @@ fn test_security_critical_mcp_listener_principals_intersection_rejects_addition(
     trusted.mcp_listener.principals = vec![p1.clone()];
     let mut incoming = HarnessConfig::default();
     incoming.mcp_listener.principals = vec![p1, intruder];
-    let raw = raw_from(
-        r#"
+    let raw = r#"
             [[mcp_listener.principals]]
             id = "p1"
             credential_ref = "env:P1_TOKEN"
@@ -646,16 +640,16 @@ fn test_security_critical_mcp_listener_principals_intersection_rejects_addition(
             credential_ref = "env:INTRUDER_TOKEN"
             tenant = "evil"
             workspace = "evil"
-        "#,
-    )?;
+        "#;
 
-    let diagnostics = merge_layer_into(
+    let diagnostics = merge_layer_toml_into(
         &mut trusted,
         incoming,
-        &raw,
+        raw,
         LayerRole::Refinement,
         &layer_path(),
-    );
+    )
+    .map_err(ctx("merge_layer_toml_into"))?;
 
     assert_eq!(trusted.mcp_listener.principals.len(), 1);
     assert_eq!(trusted.mcp_listener.principals[0].id, "p1");
@@ -692,22 +686,21 @@ fn test_security_critical_permissions_allow_intersection_rejects_new_entry() -> 
             pattern: None,
         },
     ];
-    let raw = raw_from(
-        r#"
+    let raw = r#"
             [[permissions.allow]]
             tool = "shell.exec"
             [[permissions.allow]]
             tool = "network.fetch"
-        "#,
-    )?;
+        "#;
 
-    let diagnostics = merge_layer_into(
+    let diagnostics = merge_layer_toml_into(
         &mut trusted,
         incoming,
-        &raw,
+        raw,
         LayerRole::Refinement,
         &layer_path(),
-    );
+    )
+    .map_err(ctx("merge_layer_toml_into"))?;
 
     assert_eq!(
         trusted.permissions.allow,
@@ -727,20 +720,19 @@ fn test_security_critical_permissions_extra_roots_intersection_rejects_new_entry
     trusted.permissions.extra_roots = vec![PathBuf::from("/a")];
     let mut incoming = HarnessConfig::default();
     incoming.permissions.extra_roots = vec![PathBuf::from("/a"), PathBuf::from("/b")];
-    let raw = raw_from(
-        r#"
+    let raw = r#"
             [permissions]
             extra_roots = ["/a", "/b"]
-        "#,
-    )?;
+        "#;
 
-    let diagnostics = merge_layer_into(
+    let diagnostics = merge_layer_toml_into(
         &mut trusted,
         incoming,
-        &raw,
+        raw,
         LayerRole::Refinement,
         &layer_path(),
-    );
+    )
+    .map_err(ctx("merge_layer_toml_into"))?;
 
     assert_eq!(trusted.permissions.extra_roots, vec![PathBuf::from("/a")]);
     assert!(
@@ -759,15 +751,16 @@ fn test_security_critical_permissions_default_mode_stricter_of_rejects_looser_va
     trusted.permissions.default_mode = Some("ask".to_owned());
     let mut incoming = HarnessConfig::default();
     incoming.permissions.default_mode = Some("auto".to_owned());
-    let raw = raw_from("[permissions]\ndefault_mode = \"auto\"\n")?;
+    let raw = "[permissions]\ndefault_mode = \"auto\"\n";
 
-    let diagnostics = merge_layer_into(
+    let diagnostics = merge_layer_toml_into(
         &mut trusted,
         incoming,
-        &raw,
+        raw,
         LayerRole::Refinement,
         &layer_path(),
-    );
+    )
+    .map_err(ctx("merge_layer_toml_into"))?;
 
     assert_eq!(trusted.permissions.default_mode.as_deref(), Some("ask"));
     assert!(
@@ -795,23 +788,22 @@ fn test_security_critical_sandbox_cargo_global_only_rejects_override() -> TestRe
         rustup_home: "/opt/harw/rustup".to_owned(),
         cargo_home: "/var/cache/harw/cargo".to_owned(),
     });
-    let raw = raw_from(
-        r#"
+    let raw = r#"
             [sandbox.cargo]
             mode = "fetch"
             cargo_bin = "/tmp/attacker-cargo"
             rustup_home = "/opt/harw/rustup"
             cargo_home = "/var/cache/harw/cargo"
-        "#,
-    )?;
+        "#;
 
-    let diagnostics = merge_layer_into(
+    let diagnostics = merge_layer_toml_into(
         &mut trusted,
         incoming,
-        &raw,
+        raw,
         LayerRole::Refinement,
         &layer_path(),
-    );
+    )
+    .map_err(ctx("merge_layer_toml_into"))?;
 
     let cargo = trusted
         .sandbox
@@ -831,20 +823,19 @@ fn test_security_critical_research_network_allow_hosts_intersection_rejects_new_
     trusted.research.network_allow_hosts = vec!["docs.rs".to_owned()];
     let mut incoming = HarnessConfig::default();
     incoming.research.network_allow_hosts = vec!["docs.rs".to_owned(), "evil.example".to_owned()];
-    let raw = raw_from(
-        r#"
+    let raw = r#"
             [research]
             network_allow_hosts = ["docs.rs", "evil.example"]
-        "#,
-    )?;
+        "#;
 
-    let diagnostics = merge_layer_into(
+    let diagnostics = merge_layer_toml_into(
         &mut trusted,
         incoming,
-        &raw,
+        raw,
         LayerRole::Refinement,
         &layer_path(),
-    );
+    )
+    .map_err(ctx("merge_layer_toml_into"))?;
 
     assert_eq!(
         trusted.research.network_allow_hosts,
@@ -905,7 +896,9 @@ fn test_discover_config_with_restricted_global_require_approval_for_survives_pro
 
 // =======================================================================
 // Abschnitt 7h, Tests 21–23: Schutzwirkung des nicht vertrauten
-// Projekt-Layers bleibt erhalten (und wächst bewusst, Abschnitt 7c)
+// Projekt-Layers bleibt erhalten (und wächst bewusst, Abschnitt 7c),
+// plus 22a (ungesetzte `[permissions]`/`[guards]` gegen die eingebauten
+// Vorgaben) und 22b (ungültiges TOML am `&str`-Einstieg)
 // =======================================================================
 
 // Test 21: alle neun heute schon per (jetzt entfernter) `merge_restricted_
@@ -1029,6 +1022,71 @@ fn test_discover_config_with_restricted_untrusted_project_narrows_newly_protecte
     Ok(())
 }
 
+// Test 22a: der Home-Layer setzt weder `[permissions]` noch `[guards]` (wie
+// die Vorlage aus `harw-home`). Ohne vertrauten Wert wird der nicht
+// vertraute Projekt-Layer gegen die eingebauten Vorgaben geprüft
+// (`default_mode = "auto"`, `guards.enabled = true`,
+// `orchestrator_read_limit = 5`): Lockern (`full`, abschalten, Sentinel `0`)
+// wird verworfen, die Felder bleiben `None` und jeder Versuch landet in
+// `scope_warnings`.
+#[test]
+fn test_discover_config_with_restricted_untrusted_project_cannot_loosen_unset_permissions_or_guards()
+-> TestResult {
+    let home = test_directory("unset-defaults-home")?;
+    let repo = test_directory("unset-defaults-repo")?;
+    write_layer_file(&home, "config.toml", "[logging]\nlevel = \"info\"\n")?;
+    write_layer_file(
+        &repo,
+        "config.toml",
+        r#"
+            [permissions]
+            default_mode = "full"
+
+            [guards]
+            enabled = false
+            orchestrator_read_limit = 0
+        "#,
+    )?;
+
+    let resolved =
+        discover_config_with_restricted(std::slice::from_ref(&home), Some(repo.as_path()))
+            .map_err(ctx("discover_config_with_restricted"))?;
+
+    assert_eq!(resolved.harness.permissions.default_mode, None);
+    assert_eq!(resolved.harness.guards.enabled, None);
+    assert_eq!(resolved.harness.guards.orchestrator_read_limit, None);
+    for field in [
+        "permissions.default_mode",
+        "guards.enabled",
+        "guards.orchestrator_read_limit",
+    ] {
+        assert!(
+            resolved.scope_warnings.iter().any(|d| d.field == field),
+            "fehlende Scope-Warnung für {field}"
+        );
+    }
+
+    std::fs::remove_dir_all(&home).map_err(ctx("home aufräumen"))?;
+    std::fs::remove_dir_all(&repo).map_err(ctx("repo aufräumen"))?;
+    Ok(())
+}
+
+// Test 22b: der öffentliche `&str`-Einstieg meldet ungültiges TOML als
+// `ConfigError::TomlParse`, statt zu mergen.
+#[test]
+fn test_merge_layer_toml_into_rejects_invalid_toml() -> TestResult {
+    let result = merge_layer_toml_into(
+        &mut HarnessConfig::default(),
+        HarnessConfig::default(),
+        "[guards",
+        LayerRole::Refinement,
+        &layer_path(),
+    );
+
+    assert!(matches!(result, Err(ConfigError::TomlParse(_))));
+    Ok(())
+}
+
 // Test 23: [mcp_listener]/sandbox.* bleiben für den nicht vertrauten
 // Projekt-Layer wirkungslos — kein Versuch (Listener aktivieren, neuen
 // Principal hinzufügen, sandbox.cargo überschreiben) schlägt durch, gleich
@@ -1123,20 +1181,19 @@ fn test_merge_layer_into_stricter_of_falls_back_for_unknown_visibility_scope_val
     trusted.policy.default_visibility_scope = "self".to_owned();
     let mut incoming = HarnessConfig::default();
     incoming.policy.default_visibility_scope = "team".to_owned();
-    let raw = raw_from(
-        r#"
+    let raw = r#"
             [policy]
             default_visibility_scope = "team"
-        "#,
-    )?;
+        "#;
 
-    let diagnostics = merge_layer_into(
+    let diagnostics = merge_layer_toml_into(
         &mut trusted,
         incoming,
-        &raw,
+        raw,
         LayerRole::Refinement,
         &layer_path(),
-    );
+    )
+    .map_err(ctx("merge_layer_toml_into"))?;
 
     assert_eq!(trusted.policy.default_visibility_scope, "self");
     assert!(
@@ -1172,23 +1229,22 @@ fn test_merge_layer_into_mcp_listener_principals_removal_is_silent() -> TestResu
     trusted.mcp_listener.principals = vec![p1.clone(), p2];
     let mut incoming = HarnessConfig::default();
     incoming.mcp_listener.principals = vec![p1];
-    let raw = raw_from(
-        r#"
+    let raw = r#"
             [[mcp_listener.principals]]
             id = "p1"
             credential_ref = "env:P1_TOKEN"
             tenant = "alice"
             workspace = "harwness"
-        "#,
-    )?;
+        "#;
 
-    let diagnostics = merge_layer_into(
+    let diagnostics = merge_layer_toml_into(
         &mut trusted,
         incoming,
-        &raw,
+        raw,
         LayerRole::Refinement,
         &layer_path(),
-    );
+    )
+    .map_err(ctx("merge_layer_toml_into"))?;
 
     assert_eq!(trusted.mcp_listener.principals.len(), 1);
     assert_eq!(trusted.mcp_listener.principals[0].id, "p1");
@@ -1223,8 +1279,7 @@ fn test_merge_layer_into_mcp_listener_principals_addition_is_rejected() -> TestR
     trusted.mcp_listener.principals = vec![p1.clone()];
     let mut incoming = HarnessConfig::default();
     incoming.mcp_listener.principals = vec![p1, p3];
-    let raw = raw_from(
-        r#"
+    let raw = r#"
             [[mcp_listener.principals]]
             id = "p1"
             credential_ref = "env:P1_TOKEN"
@@ -1235,16 +1290,16 @@ fn test_merge_layer_into_mcp_listener_principals_addition_is_rejected() -> TestR
             credential_ref = "env:P3_TOKEN"
             tenant = "alice"
             workspace = "harwness"
-        "#,
-    )?;
+        "#;
 
-    let diagnostics = merge_layer_into(
+    let diagnostics = merge_layer_toml_into(
         &mut trusted,
         incoming,
-        &raw,
+        raw,
         LayerRole::Refinement,
         &layer_path(),
-    );
+    )
+    .map_err(ctx("merge_layer_toml_into"))?;
 
     assert_eq!(trusted.mcp_listener.principals.len(), 1);
     assert_eq!(trusted.mcp_listener.principals[0].id, "p1");
@@ -1285,24 +1340,23 @@ fn test_merge_layer_into_mcp_listener_principals_field_change_is_rejected_home_w
     trusted.mcp_listener.principals = vec![home_p1];
     let mut incoming = HarnessConfig::default();
     incoming.mcp_listener.principals = vec![profile_p1];
-    let raw = raw_from(
-        r#"
+    let raw = r#"
             [[mcp_listener.principals]]
             id = "p1"
             credential_ref = "env:P1_TOKEN"
             tenant = "alice"
             workspace = "harwness"
             job_capabilities = ["read_own", "cancel_workspace"]
-        "#,
-    )?;
+        "#;
 
-    let diagnostics = merge_layer_into(
+    let diagnostics = merge_layer_toml_into(
         &mut trusted,
         incoming,
-        &raw,
+        raw,
         LayerRole::Refinement,
         &layer_path(),
-    );
+    )
+    .map_err(ctx("merge_layer_toml_into"))?;
 
     assert_eq!(trusted.mcp_listener.principals.len(), 1);
     assert_eq!(trusted.mcp_listener.principals[0].id, "p1");

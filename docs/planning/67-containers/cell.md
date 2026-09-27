@@ -187,7 +187,7 @@ Vor B2b und B4 muss G3 geschlossen werden. Die heutige Disjunktheitsrelation erk
 - **Vorbild:** `AuthorityCeiling::is_disjoint_from` (`harw-agent-dsl/src/authority.rs:155`, genutzt in `family.rs:1536`).
 
 **Besitz.**
-- `harw-plan` liegt in Ring A (`xtask/arch-policy.toml:326-327`), `harw-agent-dsl` in C (`:98`), und C darf nur auf F, I und C zeigen (`:45`). Die Algebra gehört deshalb nach Ring I, als `harw-authority/src/write_scope.rs` (`:106-107`).
+- `harw-plan` liegt in Ring A (`xtask/arch-policy.toml:333-334`), `harw-agent-dsl` in C (`:105`), und C darf nur auf F, I und C zeigen (`:47`). Die Algebra gehört deshalb nach Ring I, als `harw-authority/src/write_scope.rs` (`:113-114`).
 - Dort liegt sie neben `NetworkScope`, das schon `intersection` und `is_subset_of` hat (`harw-authority/src/lib.rs:320-402`).
 - Die DSL erreicht `harw-authority` bereits über `harw-context` (`harw-agent-dsl/Cargo.toml:13`, `harw-context/Cargo.toml:12`). Die Ringe J, D und A dürfen I ohnehin nutzen (`:46,50,51`).
 
