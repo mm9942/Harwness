@@ -24,7 +24,9 @@ The pattern catalog is `docs/planning/85-gap-hunt/patterns.md`. The run logs are
 2. **Parallel cut** (catalog P6). The concurrency cap applies per workflow, at
    CPUs − 2. So start one `gap-hunt-area` run per area as its own top-level
    Workflow call, not nested with `workflow()`, because nested runs share the
-   cap. Args: `{key, area, crates, exclude}`.
+   cap. Args: `{key, area, crates, exclude, verify?}`.
+   Verification is tiered by pattern and severity (catalog P9/P10); pass
+   `verify: 'classic'` to check every finding with reproduce and intent.
 3. **Consolidate.**
    - Collect all `confirmed` entries and normalise paths.
    - Dedupe by file plus 20-line bucket.

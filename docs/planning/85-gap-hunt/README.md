@@ -34,14 +34,22 @@ Agent baut. Sie ist aus der Runde R15 entstanden.
 - **Nur lesendes Suchen getrennt vom Fixen:** Viele Such-Workflows können
   gleichzeitig laufen, ohne sich in die Quere zu kommen. Geschrieben wird erst
   auf disjunkten Dateimengen.
-- **Drei Prüf-Blickwinkel, der dritte nur bei Uneinigkeit:**
-  - reproduce, intent und scope finden Fehlalarme.
-  - Weil der Host die Parallelität begrenzt (P6), spart der Stichentscheid etwa
-    ein Drittel der Prüfungen.
+- **Gestaffelte Prüfung nach Muster und Schwere (P9/P10), Stichentscheid nur
+  bei Uneinigkeit:**
+  - M3 (Doku-Drift): nur intent, der per grep bestätigt.
+  - critical/high: intent und scope; bei M1 zusätzlich „exploit“
+    (Ausnutzbarkeit).
+  - Alles andere: intent und reproduce, scope als Stichentscheid.
+  - `args.verify = 'classic'` schaltet zurück auf reproduce und intent für
+    jeden Fund.
+  - Weil der Host die Parallelität begrenzt (P6), spart das Prüfungen genau
+    dort, wo fast nie verworfen wird.
+  - Jeder Fund trägt `votes` mit Blickwinkel und Urteil, damit P9 weiter
+    gemessen werden kann.
 - **Opus zum Suchen und für kritische Fixes, Sonnet zum Prüfen und für kleine
   Fixes:**
   - Die Suche braucht Tiefe.
-  - Das Gegenprüfen mit drei Blickwinkeln fängt Fehlalarme günstig ab.
+  - Das gestaffelte Gegenprüfen fängt Fehlalarme günstig ab.
 - **Parallelschnitt:**
   - Die Grenze gleichzeitiger Agenten gilt pro Workflow, bei CPUs − 2.
   - Mehrere Top-Level-Läufe auf getrennten Bereichen nutzen das Kontingent aus,
