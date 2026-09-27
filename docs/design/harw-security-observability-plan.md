@@ -9,7 +9,8 @@ system's self-observation of its own structure.
 `harw-telemetry-integration-plan.md`, `docs/design/runtime-contracts.md`
 
 This document originated as the build plan for the security subsystem
-before its crates were split out into the `dod/` workspace under the
+before its crates were split out into `dod/crates/` (then a separate
+workspace, since PL-60 part of the root workspace) under the
 `harw-dod-*` naming scheme. Where this document once specified crates named
 `harw-signals`, `harw-sensor`, `harw-warden-proto`, `harw-netpolicy`,
 `harw-rules`, `harw-escalate`, the implemented crates are

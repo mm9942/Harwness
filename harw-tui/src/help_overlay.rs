@@ -190,7 +190,11 @@ fn domain_label(domain: CommandDomain) -> (&'static str, u8) {
         CommandDomain::CatalogConfig => ("Modelle & Konfiguration", 4),
         CommandDomain::Knowledge => ("Wissen", 5),
         CommandDomain::Channels => ("Kanäle", 6),
-        CommandDomain::Misc => ("Sonstiges", 7),
+        CommandDomain::Identity => ("Identität & Geräte", 7),
+        CommandDomain::Network => ("Netzwerk", 8),
+        CommandDomain::Security => ("Sicherheit", 9),
+        CommandDomain::Crypto => ("Kryptografie & Schlüssel", 10),
+        CommandDomain::Misc => ("Sonstiges", 11),
     }
 }
 

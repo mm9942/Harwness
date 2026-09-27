@@ -1,10 +1,12 @@
 [package]
 publish.workspace = true
 name = "harw-plan"
+description = "Planning tool: typed nodes, in-memory and file stores, validation, sync API"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
+rust-version.workspace = true
 
 [dependencies]
 harw-macros = { path = "../harw-macros" }

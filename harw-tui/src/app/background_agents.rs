@@ -453,7 +453,7 @@ pub(crate) fn attach_launcher(
         spawner,
         Arc::clone(assembly.state_store()),
         Some(assembly.agent_events().clone()),
-        OrchestratorRoles::from_definitions(assembly.config().executable_agents.values()),
+        OrchestratorRoles::from_definitions(assembly.config_agents().executable_agents.values()),
     );
     driver.with_background(Arc::new(launcher))
 }

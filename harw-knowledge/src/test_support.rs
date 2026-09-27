@@ -24,8 +24,8 @@ pub(crate) enum TestError {
     TomlEncode(toml::ser::Error),
     /// Ein TOML-Deserialisierungsfehler (`board.toml` lesen).
     TomlDecode(toml::de::Error),
-    /// Ein Fehler aus `harw-job-runtime`.
-    Job(harw_job_runtime::JobError),
+    /// Ein Fehler aus `harw-job-core`.
+    Job(harw_job_core::JobError),
     /// Ein Zeitarithmetik-Fehler (`jiff`).
     Time(jiff::Error),
 }
@@ -108,8 +108,8 @@ impl From<toml::de::Error> for TestError {
     }
 }
 
-impl From<harw_job_runtime::JobError> for TestError {
-    fn from(source: harw_job_runtime::JobError) -> Self {
+impl From<harw_job_core::JobError> for TestError {
+    fn from(source: harw_job_core::JobError) -> Self {
         TestError::Job(source)
     }
 }

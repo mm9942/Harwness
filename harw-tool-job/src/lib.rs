@@ -23,7 +23,8 @@
 //! `<state>/jobs/<job_id>/{stdout.log, stderr.log, meta.json}`; Logs und
 //! Metadaten überleben das Ende des Agenten und von harw. Beim nächsten
 //! Start lädt [`JobManager::new`] frühere Jobs (`detached`, wenn der Prozess
-//! noch lebt, sonst `unknown`).
+//! noch lebt **und** seine Identität passt, sonst `unknown`; eine
+//! wiederverwendete PID wird nie signalisiert).
 //!
 //! # Meldungen
 //! [`JobEvent`]s (Start, gedrosselter Fortschritt, entprellte Fehlerzeilen,
@@ -36,7 +37,9 @@
 //! - [`throttle`] — reine Drosselung der Meldungen
 //! - [`event`] — [`JobEvent`], [`JobNotifier`] und Standard-Notifier
 //! - [`logs`] — Mitlesen und begrenzte Abfragen der Logdateien
-//! - [`procfs`] — Prozessidentität, Signale an Prozessgruppen
+//! - [`procfs`] — [`JobSignal`]; intern Prozessidentität und Signale an
+//!   Prozessgruppen (Linux über `harw-job-linux`: pidfd, Wiederherstellungs-
+//!   identität)
 //! - [`launcher`] — [`JobLauncher`], [`ShellJobLauncher`]
 //! - [`manager`] — [`JobManager`]
 //! - [`tools`] — [`JobToolProvider`]
@@ -65,7 +68,7 @@ pub use manager::{
     Caller, DEFAULT_MAX_PIPED_LINE_BYTES, DetachSummary, JobError, JobManager, JobManagerConfig,
     PipedJob, PipedLineError, StartRequest, WaitOutcome,
 };
-pub use model::{JobId, JobMeta, JobOwner, JobState, JobStatus};
+pub use model::{JobId, JobMeta, JobOwner, JobProcessIdentity, JobState, JobStatus};
 pub use procfs::JobSignal;
 pub use progress::{
     ProgressSnapshot, ProgressSource, ProgressTracker, ProgressUpdate, Severity, detect_progress,

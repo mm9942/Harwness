@@ -2885,6 +2885,7 @@ mod agents_build_tests {
                 state: harw_tool_job::JobState::Running,
                 pid: None,
                 proc_start_ticks: None,
+                identity: None,
                 executed_on_host: true,
                 harw_instance: String::new(),
                 owner: request.owner,
@@ -3258,6 +3259,8 @@ admitted = ["fs.read"]
 
         let config = harw_config::discover_config(&[home.path().to_path_buf()])
             .map_err(ctx("discovery muss die committete Definition lesen"))?;
+        let config = crate::config_agents::ConfigAgents::from_config(&config)
+            .map_err(ctx("die committete Definition muss senken"))?;
         let ir = config
             .executable_agents
             .get("user.agent.note-taker@1")

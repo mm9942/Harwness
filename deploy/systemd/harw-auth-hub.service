@@ -1,0 +1,62 @@
+# harw-auth-hub.service -- HARW Auth/Crypto Hub (local KMS, secure.sock).
+#
+# Canonical source: deploy/systemd/ (Crypto Masterplan v2 §22.2, §23, H10).
+# Embedded into harw-install; `harw install --print-systemd harw-auth-hub.service`
+# prints it.
+#
+# Socket-activated only: harw-auth-hub.socket hands over exactly one listening
+# descriptor (LISTEN_FDS=1); `--systemd-socket` makes the daemon take it and
+# fail hard otherwise (no fallback to binding a path). No [Install]
+# section; enable the socket (or harw-infra.target), never this service
+# directly.
+#
+# AF_UNIX only (§23): a remote-transport deployment is a separate, explicit
+# profile and must not widen this unit through a config flag. Private key
+# material lives under the 0700 StateDirectory and never leaves the daemon.
+
+[Unit]
+Description=HARW Auth/Crypto Hub (local KMS, secure.sock)
+Requires=harw-auth-hub.socket
+After=harw-auth-hub.socket
+PartOf=harw-infra.target
+StartLimitIntervalSec=60
+StartLimitBurst=5
+
+[Service]
+Type=simple
+User=harw-auth
+Group=harw-auth
+ExecStart=/usr/bin/harw-auth-hub --systemd-socket
+Sockets=harw-auth-hub.socket
+StateDirectory=harw-auth-hub
+StateDirectoryMode=0700
+UMask=0077
+Restart=on-failure
+RestartSec=5
+
+# -- Hardening --
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelModules=yes
+ProtectKernelTunables=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+ProtectProc=invisible
+ProcSubset=pid
+RestrictNamespaces=yes
+RestrictAddressFamilies=AF_UNIX
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+RemoveIPC=yes
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallErrorNumber=EPERM
+CapabilityBoundingSet=
+AmbientCapabilities=

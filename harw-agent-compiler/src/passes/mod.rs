@@ -8,7 +8,8 @@
 //! | [`ReachableTools`] | the tool providers (and runner features) the manifest needs; unknown tools |
 //! | [`PruneUnusedTools`] | drops tools the compiled agent can never use |
 //! | [`ResolveModels`] | required environment variables into the manifest |
-//! | [`ChildClosure`] | compiles and embeds every agent the orchestrator can start; child ≤ parent |
+//! | [`DeriveRequirements`] | execution requirements (target, process/host/network/write, sandbox levels, limits, kernel) from the pruned manifest (PL-90) |
+//! | [`ChildClosure`] | compiles and embeds every agent the orchestrator can start; child ≤ parent; unions the children's execution requirements into the parent |
 //!
 //! Each pass is a small struct with [`Pass::name`] and [`Pass::run`]; it
 //! reports diagnostics and may change the [`CompileUnit`]. The driver
@@ -18,6 +19,7 @@ mod children;
 mod models;
 mod prune;
 mod reachable;
+mod requirements;
 mod rights;
 mod roles;
 mod skills;
@@ -26,6 +28,7 @@ pub use children::{ChildClosure, ChildResolver, ResolvedChild, child_problems};
 pub use models::{HTTP_TOKEN_ENV, ResolveModels, provider_env};
 pub use prune::PruneUnusedTools;
 pub use reachable::{ReachableTools, collect_providers};
+pub use requirements::{DeriveRequirements, derive_requirements, sandbox_levels};
 pub use rights::RightsCheck;
 pub use roles::{COMPILABLE_ROLES, ValidateRoles, role_label};
 pub use skills::{ResolveSkills, skill_payload_path};
@@ -52,5 +55,6 @@ pub const PASS_NAMES: &[&str] = &[
     "reachable-tools",
     "prune-unused-tools",
     "resolve-models",
+    "derive-requirements",
     "child-closure",
 ];

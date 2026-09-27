@@ -1,6 +1,7 @@
 [package]
 publish.workspace = true
 name = "harw-observe-otlp"
+description = "OTLP/JSON HTTP bridge for buffering and batching harw_observe metrics to external collectors"
 version.workspace = true
 edition.workspace = true
 license.workspace = true

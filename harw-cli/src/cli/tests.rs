@@ -678,6 +678,88 @@ fn test_web_rejects_config_dir_flag() {
     );
 }
 
+// ── harw web: --system / --systemd-socket / --socket-group (H9) ─────────
+
+/// Zerlegt `harw web …` in (socket, system, systemd_socket, socket_group).
+type WebFlags = (Option<PathBuf>, bool, bool, Option<String>);
+
+fn parse_web(args: &[&str]) -> TestResult<WebFlags> {
+    let cli = Cli::try_parse_from(args).map_err(ctx("`harw web …` sollte parsen"))?;
+    match cli.command {
+        Some(Command::Web {
+            socket,
+            system,
+            systemd_socket,
+            socket_group,
+        }) => Ok((socket, system, systemd_socket, socket_group)),
+        other => Err(TestError::Unexpected(format!(
+            "erwartete web, bekam {other:?}"
+        ))),
+    }
+}
+
+#[test]
+fn test_web_without_flags_is_the_dev_fallback() -> TestResult {
+    assert_eq!(parse_web(&["harw", "web"])?, (None, false, false, None));
+    Ok(())
+}
+
+#[test]
+fn test_web_system_flags_parse() -> TestResult {
+    assert_eq!(
+        parse_web(&["harw", "web", "--system"])?,
+        (None, true, false, None)
+    );
+    assert_eq!(
+        parse_web(&[
+            "harw",
+            "web",
+            "--system",
+            "--socket",
+            "/run/harw/infra/control.sock",
+            "--socket-group",
+            "harw-control",
+        ])?,
+        (
+            Some(PathBuf::from("/run/harw/infra/control.sock")),
+            true,
+            false,
+            Some("harw-control".to_owned())
+        )
+    );
+    assert_eq!(
+        parse_web(&["harw", "web", "--systemd-socket"])?,
+        (None, false, true, None)
+    );
+    assert_eq!(
+        parse_web(&["harw", "web", "--system", "--systemd-socket"])?,
+        (None, true, true, None)
+    );
+    Ok(())
+}
+
+#[test]
+fn test_web_rejects_contradicting_listener_flags() {
+    for args in [
+        &["harw", "web", "--systemd-socket", "--socket", "/tmp/x.sock"][..],
+        &[
+            "harw",
+            "web",
+            "--system",
+            "--systemd-socket",
+            "--socket-group",
+            "g",
+        ][..],
+        &["harw", "web", "--socket-group", "g"][..],
+    ] {
+        let result = Cli::try_parse_from(args);
+        assert!(
+            result.is_err(),
+            "{args:?} darf nicht parsen, bekam {result:?}"
+        );
+    }
+}
+
 #[test]
 fn test_cloudflare_mcp_setup_and_check_parse() -> TestResult {
     let setup = Cli::try_parse_from(["harw", "mcp", "setup", "cloudflare"])
@@ -2045,5 +2127,40 @@ fn test_agent_compiler_actions_map_to_commands() -> TestResult {
         crate::agent_cmd::compiler_command(agent_action(&["graph", "x", "--format", "svg"])?)
             .is_err()
     );
+    Ok(())
+}
+
+// ── install --print-systemd (Crypto-Masterplan v2 H10) ──────────────────
+
+#[test]
+fn test_install_print_systemd_without_unit_parses_to_all() -> TestResult {
+    let cli = Cli::try_parse_from(["harw", "install", "--print-systemd"])
+        .map_err(ctx("`harw install --print-systemd` sollte parsen"))?;
+    let Some(Command::Install { print_systemd }) = cli.command else {
+        return Err(TestError::Unexpected("erwartete install".into()));
+    };
+    assert_eq!(print_systemd, Some(None));
+    Ok(())
+}
+
+#[test]
+fn test_install_print_systemd_with_unit_parses_the_name() -> TestResult {
+    let cli = Cli::try_parse_from(["harw", "install", "--print-systemd", "harw-warden.socket"])
+        .map_err(ctx("`harw install --print-systemd UNIT` sollte parsen"))?;
+    let Some(Command::Install { print_systemd }) = cli.command else {
+        return Err(TestError::Unexpected("erwartete install".into()));
+    };
+    assert_eq!(print_systemd, Some(Some("harw-warden.socket".to_owned())));
+    Ok(())
+}
+
+#[test]
+fn test_install_without_flag_parses_to_none() -> TestResult {
+    let cli =
+        Cli::try_parse_from(["harw", "install"]).map_err(ctx("`harw install` sollte parsen"))?;
+    let Some(Command::Install { print_systemd }) = cli.command else {
+        return Err(TestError::Unexpected("erwartete install".into()));
+    };
+    assert_eq!(print_systemd, None);
     Ok(())
 }

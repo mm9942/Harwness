@@ -1,6 +1,7 @@
 [package]
-publish = false
 name = "harw-dod-sentinel"
+description = "Collects sensor readings, manages sensor health degradation, and buffers evidence."
+publish.workspace = true
 version.workspace = true
 edition.workspace = true
 license.workspace = true

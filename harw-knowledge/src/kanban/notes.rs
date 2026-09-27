@@ -36,7 +36,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use harw_job_runtime::WorkId;
+use harw_job_core::WorkId;
 
 use crate::artifact::{ArtifactKind, Frontmatter, KnowledgeArtifact};
 use crate::error::{KnowledgeError, KnowledgeResult};

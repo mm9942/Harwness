@@ -1,6 +1,7 @@
 [package]
-publish = false
+publish.workspace = true
 name = "harw-dod-netcounters"
+description = "Network interface counters from /proc/net/dev: rx/tx bytes, packets, errors, drops."
 version.workspace = true
 edition.workspace = true
 license.workspace = true

@@ -34,6 +34,7 @@ use harw_macros::HarwError;
 ///   `Surface::Web`-Pfad.
 /// - [`WebError::RouteMethodUndeclared`]: Für eine Route ließ sich keine
 ///   `Surface::Web { method, .. }`-Deklaration finden (fail-closed, F-031).
+/// - [`WebError::Activation`]: Die systemd-Socket-Aktivierung war ungültig.
 /// - [`WebError::InvalidEventCapacity`]: Eine [`crate::events::WebEventBus`]
 ///   wurde mit Kapazität `0` angefordert.
 /// - [`WebError::EventEncode`]: Ein [`crate::events::WebEvent`] ließ sich nicht
@@ -106,6 +107,16 @@ pub enum WebError {
         path: String,
         /// Name der Operation, die die Route bereitstellt.
         operation: String,
+    },
+
+    /// Die systemd-Socket-Aktivierung (`--systemd-socket`) ist ungültig:
+    /// `LISTEN_PID`/`LISTEN_FDS` fehlen, sind fehlerhaft oder fremd, oder der
+    /// übergebene Deskriptor ist kein nutzbarer Unix-Stream-Socket (siehe
+    /// [`crate::systemd`]).
+    #[msg("systemd-Socket-Aktivierung ungültig: {reason}")]
+    Activation {
+        /// Warum die Aktivierung abgelehnt wurde.
+        reason: String,
     },
 
     /// Eine [`crate::events::WebEventBus`] wurde mit Kapazität `0` angefordert.
@@ -201,6 +212,17 @@ mod tests {
         assert!(text.contains("/api/analyze"));
         assert!(text.contains("analyze"));
         assert!(text.contains("HTTP-Methode"));
+        assert!(err.source().is_none());
+    }
+
+    #[test]
+    fn test_display_activation_contains_reason() {
+        let err = WebError::Activation {
+            reason: "LISTEN_PID is not set".to_owned(),
+        };
+        let text = err.to_string();
+        assert!(text.contains("LISTEN_PID is not set"));
+        assert!(text.contains("systemd"));
         assert!(err.source().is_none());
     }
 

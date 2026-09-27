@@ -66,6 +66,11 @@ const TESTED_CODES: &[&str] = &[
     "HARW-BINARY-004",
     "HARW-BINARY-005",
     "HARW-BINARY-006",
+    "HARW-DRIVER-001",
+    "HARW-DRIVER-002",
+    "HARW-DRIVER-003",
+    "HARW-DRIVER-004",
+    "HARW-DRIVER-005",
 ];
 
 const TARGET: &str = "acme.agent.t@1";
@@ -687,5 +692,81 @@ fn test_binary_006_unknown_child_execution() -> TestResult {
         ))],
         "HARW-BINARY-006",
     )?;
+    Ok(())
+}
+
+// ── DRIVER ───────────────────────────────────────────────────────────────
+
+/// A child orchestrator that may delegate to `executor`, with `driver`
+/// appended to its `[work_driver]` table.
+fn driver_agent(driver: &str) -> String {
+    agent(
+        "",
+        &format!(
+            "[delegation]\ntargets = [\"executor\"]\n\n[work_driver]\nworker_role = \"executor\"\n{driver}"
+        ),
+    )
+    .replace("role = \"worker\"", "role = \"child-orchestrator\"")
+}
+
+#[test]
+fn test_driver_valid_section_lowers_without_errors() -> TestResult {
+    let diagnostics = run(&[target_file(&driver_agent(""))])?;
+    assert!(!diagnostics.has_errors(), "{diagnostics}");
+    Ok(())
+}
+
+#[test]
+fn test_driver_001_unknown_key() -> TestResult {
+    let diagnostic = expect_one(
+        &[target_file(&driver_agent("max_iteration = 8"))],
+        "HARW-DRIVER-001",
+    )?;
+    assert_eq!(
+        diagnostic.path.as_deref(),
+        Some("work_driver.max_iteration")
+    );
+    assert!(diagnostic.span.is_some());
+    Ok(())
+}
+
+#[test]
+fn test_driver_002_out_of_range() -> TestResult {
+    let diagnostic = expect_one(
+        &[target_file(&driver_agent("max_parallel_workers = 0"))],
+        "HARW-DRIVER-002",
+    )?;
+    assert_eq!(
+        diagnostic.path.as_deref(),
+        Some("work_driver.max_parallel_workers")
+    );
+    Ok(())
+}
+
+#[test]
+fn test_driver_003_invalid_role_reference() -> TestResult {
+    let diagnostic = expect_one(
+        &[target_file(&driver_agent("judge_role = \"Bad Judge\""))],
+        "HARW-DRIVER-003",
+    )?;
+    assert_eq!(diagnostic.path.as_deref(), Some("work_driver.judge_role"));
+    Ok(())
+}
+
+#[test]
+fn test_driver_004_missing_delegation_rights() -> TestResult {
+    let text = driver_agent("").replace("targets = [\"executor\"]", "targets = [\"explorer\"]");
+    let diagnostic = expect_one(&[target_file(&text)], "HARW-DRIVER-004")?;
+    assert_eq!(diagnostic.path.as_deref(), Some("work_driver.worker_role"));
+    Ok(())
+}
+
+#[test]
+fn test_driver_005_invalid_verify_command() -> TestResult {
+    let diagnostic = expect_one(
+        &[target_file(&driver_agent("verify = [\"\"]"))],
+        "HARW-DRIVER-005",
+    )?;
+    assert_eq!(diagnostic.path.as_deref(), Some("work_driver.verify[0]"));
     Ok(())
 }

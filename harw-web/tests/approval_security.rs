@@ -55,6 +55,7 @@ fn issue(store: &ApprovalStore) -> TestResult<(SessionId, ItemId)> {
                 id: "owner".to_owned(),
             },
             issued_at: issued_at(),
+            tenant: None,
         })
         .map_err(ctx("issue"))?;
     Ok((session, request))

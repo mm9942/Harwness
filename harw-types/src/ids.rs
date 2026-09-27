@@ -237,6 +237,33 @@ newtype_id!(
     CgroupId
 );
 
+// --- H1 infrastructure identity IDs (crypto masterplan v2 §13/§25/§34) -------
+// Shared by the Auth/Crypto Hub, NetSec, SecurityHub, `harw-web` and the fleet
+// transport. They live here for the same fan-in reason as the blocks above: no
+// crate may plumb a raw `String` where one of these identities is meant.
+
+newtype_id!(
+    /// Identifies one Harwness node (a runtime installation that holds its own
+    /// node-identity key and can join a fleet).
+    NodeId
+);
+newtype_id!(
+    /// Identifies an enrolled end-user device (laptop, phone, hardware token
+    /// holder) from which a principal authenticates.
+    DeviceId
+);
+newtype_id!(
+    /// Identifies a non-human service identity (daemon, gateway, worker) that
+    /// authenticates with its own key rather than on behalf of a user.
+    ServiceIdentityId
+);
+newtype_id!(
+    /// Identifies one issued [`crate::security::SecurityContext`]. Used as the
+    /// short-lived context reference across process/network boundaries
+    /// (masterplan §25) — the reference alone never grants anything.
+    SecurityContextId
+);
+
 #[cfg(test)]
 mod tests {
     use super::{
@@ -361,6 +388,58 @@ mod aw0_03_ids_tests {
         assert_eq!(round_tripped, cgroup);
 
         assert!(serde_json::from_str::<CgroupId>("\"\"").is_err());
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod h1_infrastructure_ids_tests {
+    use super::{DeviceId, NodeId, SecurityContextId, ServiceIdentityId};
+    use crate::test_support::TestResult;
+
+    macro_rules! assert_fallible_apis_reject_blank_ids {
+        ($id_type:ty) => {
+            assert!(<$id_type>::try_from_str("").is_err());
+            assert!(<$id_type>::parse(" \t\n").is_err());
+            assert!("".parse::<$id_type>().is_err());
+            assert!(<$id_type>::try_from(" \t\n").is_err());
+            assert!(<$id_type>::try_from(String::from("")).is_err());
+        };
+    }
+
+    #[test]
+    fn test_infrastructure_id_types_reject_empty_and_whitespace_only_values() {
+        assert_fallible_apis_reject_blank_ids!(NodeId);
+        assert_fallible_apis_reject_blank_ids!(DeviceId);
+        assert_fallible_apis_reject_blank_ids!(ServiceIdentityId);
+        assert_fallible_apis_reject_blank_ids!(SecurityContextId);
+    }
+
+    #[test]
+    fn test_infrastructure_id_types_serde_roundtrip() -> TestResult {
+        let node = NodeId::try_from_str("node-1")?;
+        assert_eq!(serde_json::to_string(&node)?, "\"node-1\"");
+        let round_tripped: NodeId = serde_json::from_str(&serde_json::to_string(&node)?)?;
+        assert_eq!(round_tripped, node);
+
+        let device = DeviceId::try_from_str("device-1")?;
+        let round_tripped: DeviceId = serde_json::from_str(&serde_json::to_string(&device)?)?;
+        assert_eq!(round_tripped, device);
+
+        let service = ServiceIdentityId::try_from_str("svc-1")?;
+        let round_tripped: ServiceIdentityId =
+            serde_json::from_str(&serde_json::to_string(&service)?)?;
+        assert_eq!(round_tripped, service);
+
+        let context = SecurityContextId::try_from_str("ctx-1")?;
+        let round_tripped: SecurityContextId =
+            serde_json::from_str(&serde_json::to_string(&context)?)?;
+        assert_eq!(round_tripped, context);
+
+        assert!(serde_json::from_str::<NodeId>("\" \"").is_err());
+        assert!(serde_json::from_str::<DeviceId>("\"\"").is_err());
+        assert!(serde_json::from_str::<ServiceIdentityId>("\"\"").is_err());
+        assert!(serde_json::from_str::<SecurityContextId>("\"\"").is_err());
         Ok(())
     }
 }

@@ -1,0 +1,411 @@
+# Architektur-Richtlinie für das Gate `arch` (`cargo run -q -p xtask -- gates arch`).
+#
+# Umsetzung von docs/planning/10-ecosystem-workspace/
+# HARW_ECOSYSTEM_WORKSPACE_ARCHITECTURE.md, §6 (Abhängigkeitsrichtung),
+# §23 (TCB-Budgets), §40–§43 (native Abhängigkeiten, Klassen),
+# §47 (Klassifikation F/I/C/J/D/A + T) und §55–§56 (Architekturtests,
+# Richtliniendatei).
+#
+# Grundsatz (§41): Mitgliedschaft im selben Cargo-Workspace ist KEINE
+# Erlaubnis, voneinander abzuhängen. Die Erlaubnis kommt allein aus dieser
+# Datei.
+#
+# Was das Gate prüft (Details in xtask/src/gate_arch.rs):
+# - Jedes Paket im Graphen (Wurzel- und `dod/`-Workspace) steht unter
+#   `[packages]`. Ein neues, nicht klassifiziertes Paket ist ein Verstoß.
+#   Hier gelistete, aber (noch) nicht existierende Pakete sind zulässig.
+# - Jede interne normale Kante (`[dependencies]`, nicht dev/build) folgt
+#   `[rules]` — oder steht als `[[exceptions]]`-Eintrag da.
+# - Ratsche: eine Ausnahme ohne passende Kante oder für eine ohnehin
+#   erlaubte Kante ist ein Verstoß ("veraltet"). Die Liste kann nur
+#   schrumpfen.
+# - TCB-Pakete (`tcb = true`) dürfen direkt nur auf die in
+#   `[tcb."<name>"].allowed_internal` genannten internen Crates zeigen.
+#   Eine nicht mehr genutzte Allowlist-Zeile ist ebenfalls veraltet.
+# - Schichten mit `forbid_sys_crates = true` und alle TCB-Pakete dürfen in
+#   ihrer transitiven Hülle keine `*-sys`-Crate erreichen, außer den unter
+#   `[[sys_crates.allow]]` begründeten.
+
+# ---------------------------------------------------------------------------
+# Schichten
+# ---------------------------------------------------------------------------
+[layers]
+F = "foundation — breit konsumierbar, kaum Wissen nach außen (§7, §42)"
+I = "shared infrastructure — wiederverwendbare Mechanismen (§13, §17, §42)"
+C = "compiler domain — DSL, Artefakt, Compiler (§11)"
+J = "job infrastructure — ohne Harwness- und DoD-Semantik (§14)"
+D = "DoD domain — dod/crates/* (§18)"
+A = "application/composition — darf breit zusammensetzen (§24)"
+
+# Wer auf welche Schicht zeigen darf. Eine Schicht darf immer nur nach
+# innen (Richtung F) zeigen, nie nach außen (§6).
+[rules]
+F.may_depend_on = ["F"]
+I.may_depend_on = ["F", "I"]
+C.may_depend_on = ["F", "I", "C"]
+J.may_depend_on = ["F", "I", "J"]
+# §14/§40: Job-Infrastruktur baut native Ausführungspfade; keine C-Bindings
+# per `*-sys` in der Hülle.
+J.forbid_sys_crates = true
+D.may_depend_on = ["F", "I", "D"]
+A.may_depend_on = ["*"]
+
+# ---------------------------------------------------------------------------
+# `*-sys`-Crates (§40)
+# ---------------------------------------------------------------------------
+# Gilt für Schichten mit `forbid_sys_crates = true` und – über
+# `forbid_for_tcb` – für jedes Paket mit `tcb = true`. Die Hülle wird über
+# die normalen `[dependencies]` der Workspace-Crates und danach über die
+# Kanten in `Cargo.lock` (und `dod/Cargo.lock`, falls vorhanden) gebildet.
+# `Cargo.lock` kennt keine Plattform- oder Feature-Filter; die Hülle ist
+# also eine Überschätzung. Deshalb stehen hier die Crates, deren Name auf
+# `-sys` endet, die aber keinen C-Code bauen.
+[sys_crates]
+forbid_for_tcb = true
+
+[[sys_crates.allow]]
+name = "linux-raw-sys"
+reason = "reines Rust: Linux-Syscall-ABI-Konstanten für rustix, kein C-Build, kein Linken gegen libc"
+
+[[sys_crates.allow]]
+name = "windows-sys"
+reason = "nur für Windows-Ziele (tokio/mio/rustix/…); auf Linux nie gebaut, Bindings ohne C-Build"
+
+[[sys_crates.allow]]
+name = "js-sys"
+reason = "nur für wasm32-Ziele (uuid/getrandom); auf Linux nie gebaut, kein C-Build"
+
+# ---------------------------------------------------------------------------
+# Klassifikation (§43, §44: bottom-up aus den echten Kanten hergeleitet)
+# ---------------------------------------------------------------------------
+
+# --- F: foundation ---------------------------------------------------------
+[packages."harw-digest"]
+layer = "F"
+[packages."harw-macros"]
+layer = "F"
+# Enthält derzeit auch Laufzeittypen (§10); vorerst F, Aufteilung folgt.
+[packages."harw-types"]
+layer = "F"
+[packages."harw-protocol"]
+layer = "F"
+# Reines Rang-/Retrieval-Vokabular (nur harw-digest + harw-macros);
+# von harw-context/harw-tools/harw-extension-api (I) gebraucht.
+[packages."harw-lens-types"]
+layer = "F"
+
+# --- C: compiler domain ----------------------------------------------------
+[packages."harw-agent-dsl"]
+layer = "C"
+[packages."harw-agent-artifact"]
+layer = "C"
+[packages."harw-agent-compiler"]
+layer = "C"
+
+# --- I: shared infrastructure ---------------------------------------------
+[packages."harw-authority"]
+layer = "I"
+[packages."harw-sandbox"]
+layer = "I"
+[packages."harw-fsutil"]
+layer = "I"
+[packages."harw-observe"]
+layer = "I"
+[packages."harw-observe-file"]
+layer = "I"
+[packages."harw-observe-prom"]
+layer = "I"
+[packages."harw-observe-otlp"]
+layer = "I"
+[packages."harw-extension-api"]
+layer = "I"
+[packages."harw-operations"]
+layer = "I"
+[packages."harw-egress"]
+layer = "I"
+[packages."harw-secrets"]
+layer = "I"
+[packages."harw-context"]
+layer = "I"
+[packages."harw-tools"]
+layer = "I"
+[packages."harw-catalog"]
+layer = "I"
+[packages."harw-config"]
+layer = "I"
+[packages."harw-home"]
+layer = "I"
+# §33: Eigentümerschaft noch zu prüfen; von harw-dod-escalate (D) genutzt.
+[packages."harw-session-store"]
+layer = "I"
+[packages."harw-code-graph"]
+layer = "I"
+[packages."harw-research"]
+layer = "I"
+[packages."harw-completions"]
+layer = "I"
+# Blatt-Crate (pidfd + SIGKILL); Kandidat für harw-job-linux.
+[packages."harw-killer"]
+layer = "I"
+
+# --- J: job infrastructure -------------------------------------------------
+[packages."harw-job-runtime"]
+layer = "J"
+# Angekündigt (§52); dürfen hier stehen, bevor es sie gibt.
+[packages."harw-job-core"]
+layer = "J"
+[packages."harw-job-store"]
+layer = "J"
+[packages."harw-job-linux"]
+layer = "J"
+[packages."harw-job-exec"]
+layer = "J"
+[packages."harw-job-tokio"]
+layer = "J"
+[packages."harw-job-darwin"]
+layer = "J"
+[packages."harw-job-executor-bwrap"]
+layer = "J"
+[packages."harw-job"]
+layer = "J"
+
+# --- D: DoD domain (dod/crates/*) -----------------------------------------
+[packages."harw-dod"]
+layer = "D"
+[packages."harw-dod-authlog"]
+layer = "D"
+[packages."harw-dod-blockio"]
+layer = "D"
+[packages."harw-dod-bpf"]
+layer = "D"
+[packages."harw-dod-cap"]
+layer = "D"
+[packages."harw-dod-cgroup"]
+layer = "D"
+[packages."harw-dod-config"]
+layer = "D"
+[packages."harw-dod-cpu"]
+layer = "D"
+[packages."harw-dod-escalate"]
+layer = "D"
+# Crypto-Masterplan v2 §3/H2: Harw-Schlüsselzwecke, Nutzungsrichtlinie,
+# sichere Rahmen, Abbildung auf crypt_guard_service. Kein TCB; von der
+# Fassade `harw-dod`, Warden, Probes und Sensoren aus unerreichbar
+# (Gate `edges`, FORBIDDEN/FORBIDDEN_REACH).
+[packages."harw-auth-hub"]
+layer = "A"
+
+[packages."harw-infra-client"]
+layer = "I"
+
+[packages."harw-netsec"]
+layer = "A"
+
+[packages."harw-node-transport"]
+layer = "A"
+
+[packages."harw-security-hub"]
+layer = "A"
+
+[packages."harw-dod-encrypt"]
+layer = "D"
+[packages."harw-dod-fixtures"]
+layer = "D"
+[packages."harw-dod-flow"]
+layer = "D"
+[packages."harw-dod-fsmon"]
+layer = "D"
+[packages."harw-dod-gpu"]
+layer = "D"
+[packages."harw-dod-listener"]
+layer = "D"
+[packages."harw-dod-memory"]
+layer = "D"
+[packages."harw-dod-netcounters"]
+layer = "D"
+[packages."harw-dod-netlink"]
+layer = "D"
+[packages."harw-dod-netpolicy"]
+layer = "D"
+[packages."harw-dod-procmon"]
+layer = "D"
+[packages."harw-dod-readfs"]
+layer = "D"
+tcb = true
+[packages."harw-dod-rules"]
+layer = "D"
+[packages."harw-dod-scanreport"]
+layer = "D"
+[packages."harw-dod-sentinel"]
+layer = "D"
+[packages."harw-dod-signals"]
+layer = "D"
+tcb = true
+[packages."harw-dod-thermal"]
+layer = "D"
+[packages."harw-dod-warden"]
+layer = "D"
+tcb = true
+[packages."harw-dod-warden-proto"]
+layer = "D"
+tcb = true
+[packages."harw-dod-workspace"]
+layer = "D"
+[packages."harw-sentinel"]
+layer = "D"
+[packages."harw-probe-fs"]
+layer = "D"
+[packages."harw-probe-bpf"]
+layer = "D"
+[packages."harw-warden"]
+layer = "D"
+tcb = true
+
+# --- A: application/composition -------------------------------------------
+[packages."harw"]
+layer = "A"
+# Setzt die Laufzeit zusammen (harw-runtime, harw-tui) — daher A, nicht C.
+[packages."harw-agent-runner"]
+layer = "A"
+[packages."harw-browser"]
+layer = "A"
+[packages."harw-browser-thirtyfour"]
+layer = "A"
+[packages."harw-channel"]
+layer = "A"
+[packages."harw-channel-telegram"]
+layer = "A"
+[packages."harw-channel-telegram-transport"]
+layer = "A"
+[packages."harw-cli"]
+layer = "A"
+[packages."harw-core"]
+layer = "A"
+[packages."harw-core-bridge"]
+layer = "A"
+[packages."harw-explorer"]
+layer = "A"
+[packages."harw-install"]
+layer = "A"
+[packages."harw-instructions"]
+layer = "A"
+[packages."harw-knowledge"]
+layer = "A"
+[packages."harw-lens"]
+layer = "A"
+[packages."harw-lens-chunk"]
+layer = "A"
+[packages."harw-lens-embed"]
+layer = "A"
+[packages."harw-lens-federation"]
+layer = "A"
+[packages."harw-lens-index"]
+layer = "A"
+[packages."harw-lens-query"]
+layer = "A"
+[packages."harw-lens-rank"]
+layer = "A"
+[packages."harw-lens-source"]
+layer = "A"
+[packages."harw-lens-store"]
+layer = "A"
+[packages."harw-matrix-game"]
+layer = "A"
+[packages."harw-mcp-client"]
+layer = "A"
+[packages."harw-mcp-server"]
+layer = "A"
+[packages."harw-memory"]
+layer = "A"
+[packages."harw-model-catalog"]
+layer = "A"
+[packages."harw-oauth"]
+layer = "A"
+[packages."harw-ops"]
+layer = "A"
+[packages."harw-plan"]
+layer = "A"
+[packages."harw-plan-bridge"]
+layer = "A"
+[packages."harw-project-discovery"]
+layer = "A"
+[packages."harw-provider"]
+layer = "A"
+[packages."harw-provider-http"]
+layer = "A"
+[packages."harw-registry-defaults"]
+layer = "A"
+[packages."harw-runtime"]
+layer = "A"
+[packages."harw-tool-browser"]
+layer = "A"
+[packages."harw-tool-deps"]
+layer = "A"
+[packages."harw-tool-doc"]
+layer = "A"
+[packages."harw-tool-explorer"]
+layer = "A"
+[packages."harw-tool-fs"]
+layer = "A"
+[packages."harw-tool-job"]
+layer = "A"
+[packages."harw-tool-lens"]
+layer = "A"
+[packages."harw-tool-plan"]
+layer = "A"
+[packages."harw-tool-process"]
+layer = "A"
+[packages."harw-tool-shell"]
+layer = "A"
+[packages."harw-tool-web"]
+layer = "A"
+[packages."harw-tui"]
+layer = "A"
+[packages."harw-web"]
+layer = "A"
+[packages."harwness-sdk"]
+layer = "A"
+[packages."xtask"]
+layer = "A"
+
+# ---------------------------------------------------------------------------
+# TCB-Allowlisten (§22, §23, §51): direkte interne Abhängigkeiten.
+# Stand = die heutigen Kanten. Jede neue interne Kante ist ein Verstoß; eine
+# Zeile ohne Kante ist veraltet und muss gestrichen werden.
+# ---------------------------------------------------------------------------
+[tcb."harw-warden"]
+allowed_internal = [
+    "harw-completions",
+    "harw-dod-warden",
+    "harw-dod-warden-proto",
+    "harw-macros",
+    "harw-types",
+]
+
+[tcb."harw-dod-warden"]
+allowed_internal = ["harw-dod-warden-proto", "harw-macros", "harw-types"]
+
+[tcb."harw-dod-warden-proto"]
+allowed_internal = ["harw-macros", "harw-types"]
+
+[tcb."harw-dod-readfs"]
+allowed_internal = ["harw-dod-cap", "harw-macros"]
+
+[tcb."harw-dod-signals"]
+allowed_internal = ["harw-dod-cap", "harw-macros", "harw-observe", "harw-types"]
+
+# ---------------------------------------------------------------------------
+# Ausnahmen: heute existierende Inversionen (§48). Jede trägt Grund und
+# Zieltermin. Ratsche: fällt die Kante weg, muss der Eintrag gehen.
+# ---------------------------------------------------------------------------
+[[exceptions]]
+from = "harw-session-store"
+to = "harw-job-core"
+reason = "I → J: harw-session-store/src/job_store.rs persistiert Job-Modelltypen aus harw-job-core (Budget, JobState, StoredJob …); gehört nach harw-job-store (J, §33, §34)"
+until = "R11 W2"
+
+[[exceptions]]
+from = "harw-session-store"
+to = "harw-job-store"
+reason = "I → J: harw-session-store::JobStore ist ein Adapter über die generische Speichermechanik in harw-job-store (§33); verschwindet, wenn die Job-Persistenz ganz in den J-Ring wandert"
+until = "R12"

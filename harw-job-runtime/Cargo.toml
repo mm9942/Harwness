@@ -6,16 +6,59 @@ edition.workspace = true
 license.workspace = true
 repository.workspace = true
 rust-version.workspace = true
+description = "Job coordinator (Job-Runtime-Doc §14/§15): claims jobs from a fenced store, starts attempts through a platform executor, heartbeats the lease, enforces deadline/cancel, finalizes outcomes and recovers attempts after a restart. Also re-exports the harw-job-core model for its existing dependents."
+
+# Feature layout per Job-Runtime-Doc §17: base model ≠ Linux implementation ≠
+# async implementation ≠ sandbox backend ≠ cgroup backend. The Bubblewrap
+# backend pulls `harw-sandbox`/`harw-authority` and stays opt-in.
+[features]
+default = []
+# `LinuxSandboxBackend::Bwrap` through `harw-job-executor-bwrap`.
+bwrap = ["dep:harw-job-executor-bwrap"]
 
 [dependencies]
+# Job-Doc Phase 1: the governance model moved to `harw-job-core`. This crate
+# re-exports it, so its dependents compile unchanged. The coordinator
+# (`coordinator` module) builds on the generic model (lifecycle, ids, spec,
+# outcome, enforcement).
+harw-job-core = { path = "../harw-job-core" }
+# Durable, fenced job records (JobRecordStore, FsJobRecordStore) and the
+# attempt sidecars (RecordStore::write_sidecar).
+harw-job-store = { path = "../harw-job-store" }
+# `WorkId` is re-exported explicitly (knowledge-surfaces §6.1, §8.1).
 harw-types = { path = "../harw-types" }
-harw-macros = { path = "../harw-macros" }
-# AW1-01: TraceContext lives here (frozen wire form, docs/design/build-history.md §A.4).
-# Path dependency only — AW0-01 builds harw-observe in parallel; no version pin.
-harw-observe = { path = "../harw-observe" }
-serde = { version = "1", features = ["derive"] }
-serde_json = "1"
+# Attempt sidecar (de)serialization; `StoredJob::input` carries the spec
+# envelope as JSON (known inversion in harw-job-core, Eco-Doc §59).
+serde = { workspace = true }
+serde_json = { workspace = true }
+# Darwin sandbox reports: the executor on macOS, and the platform-neutral
+# `DarwinSandbox::report_for` mapping of the host probe (`host`) on every
+# target (the crate is a pure model off macOS).
+harw-job-darwin = { path = "../harw-job-darwin" }
+# Timestamps of leases, deadlines and attempt records.
 jiff = { workspace = true }
+tracing = { workspace = true }
+# rt:    spawn/spawn_blocking (store I/O off the reactor).
+# sync:  attempt event channel, cancellation watch, result oneshot.
+# time:  heartbeat interval, deadline sleep.
+# macros: select!.
+tokio = { version = "1", features = ["rt", "sync", "time", "macros"] }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+# pidfd process groups, recovery identity, cgroup v2 boundary, sandbox policy.
+# `linux-sandbox`: `sandbox::landlock_support` for the host probe (`host`);
+# already unified in through `harw-job-exec`, named here explicitly.
+harw-job-linux = { path = "../harw-job-linux", features = ["linux-cgroup-v2", "linux-sandbox"] }
+# Async pidfd supervision (Supervisor, ProcessEvent, AsyncLinuxProcess).
+harw-job-tokio = { path = "../harw-job-tokio" }
+# Landlock trampoline: ExecPlanV1, TrampolineCommand, read_report (library
+# only; the binary is located at runtime through LinuxSandboxBackend).
+harw-job-exec = { path = "../harw-job-exec" }
+harw-job-executor-bwrap = { path = "../harw-job-executor-bwrap", optional = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "sync", "time", "macros"] }
 
 [lints]
 workspace = true

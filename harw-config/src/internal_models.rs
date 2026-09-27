@@ -62,11 +62,19 @@ pub enum InternalModelPoint {
     /// sondern das schnelle Modell des aktiven Providers
     /// ([`fast_model_for_active_provider`]).
     AutoClassifier,
+    /// WorkDriver-interner Richter-Worker: bewertet in einem Zug, ohne
+    /// Werkzeuge, ob eine Arbeitsrunde bestanden hat (Rolle
+    /// `work-driver-judge`). Antwortet ausschließlich mit
+    /// `{"passed": bool, "comment": ...}`. Ohne explizite Wahl kein
+    /// OpenRouter-Standard, sondern das schnelle Modell des aktiven
+    /// Providers ([`fast_model_for_active_provider`]) — wie
+    /// [`Self::AutoClassifier`].
+    WorkDriverJudge,
 }
 
 impl InternalModelPoint {
     /// Alle Stellen in stabiler Reihenfolge (u. a. für Iteration/Merge).
-    pub const ALL: [InternalModelPoint; 11] = [
+    pub const ALL: [InternalModelPoint; 12] = [
         InternalModelPoint::SessionTitle,
         InternalModelPoint::CompactionSummary,
         InternalModelPoint::MemoryConsolidation,
@@ -78,6 +86,7 @@ impl InternalModelPoint {
         InternalModelPoint::RootOrchestrator,
         InternalModelPoint::SubOrchestrator,
         InternalModelPoint::AutoClassifier,
+        InternalModelPoint::WorkDriverJudge,
     ];
 
     /// TOML-/Config-Schlüssel dieser Stelle, z. B. `"session_title"`.
@@ -95,6 +104,7 @@ impl InternalModelPoint {
             Self::RootOrchestrator => "root_orchestrator",
             Self::SubOrchestrator => "sub_orchestrator",
             Self::AutoClassifier => "auto_classifier",
+            Self::WorkDriverJudge => "work_driver_judge",
         }
     }
 
@@ -132,6 +142,9 @@ impl InternalModelPoint {
             Self::AutoClassifier => {
                 "Beurteilt im Auto-Modus Werkzeugaufrufe (erlauben, fragen, ablehnen)."
             }
+            Self::WorkDriverJudge => {
+                "WorkDriver-Richter: bewertet in einem Zug ohne Werkzeuge, ob eine Arbeitsrunde bestanden hat."
+            }
         }
     }
 
@@ -144,7 +157,10 @@ impl InternalModelPoint {
     pub fn uses_openrouter_default(self) -> bool {
         !matches!(
             self,
-            Self::RootOrchestrator | Self::SubOrchestrator | Self::AutoClassifier
+            Self::RootOrchestrator
+                | Self::SubOrchestrator
+                | Self::AutoClassifier
+                | Self::WorkDriverJudge
         )
     }
 
@@ -170,7 +186,8 @@ impl InternalModelPoint {
             | Self::MemoryConsolidation
             | Self::DreamReflection
             | Self::WorkerSimple
-            | Self::AutoClassifier => "nvidia/nemotron-3.5-lightning",
+            | Self::AutoClassifier
+            | Self::WorkDriverJudge => "nvidia/nemotron-3.5-lightning",
         }
     }
 }
@@ -227,6 +244,9 @@ pub struct InternalModelsToml {
     /// Runde 5, Teil E: `[internal_models.auto_classifier]`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub auto_classifier: Option<InternalModelChoice>,
+    /// WorkDriver-Richter-Worker: `[internal_models.work_driver_judge]`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub work_driver_judge: Option<InternalModelChoice>,
 }
 
 impl Default for InternalModelsToml {
@@ -244,6 +264,7 @@ impl Default for InternalModelsToml {
             root_orchestrator: None,
             sub_orchestrator: None,
             auto_classifier: None,
+            work_driver_judge: None,
         }
     }
 }
@@ -264,6 +285,7 @@ impl InternalModelsToml {
             InternalModelPoint::RootOrchestrator => self.root_orchestrator.as_ref(),
             InternalModelPoint::SubOrchestrator => self.sub_orchestrator.as_ref(),
             InternalModelPoint::AutoClassifier => self.auto_classifier.as_ref(),
+            InternalModelPoint::WorkDriverJudge => self.work_driver_judge.as_ref(),
         }
     }
 
@@ -281,6 +303,7 @@ impl InternalModelsToml {
             InternalModelPoint::RootOrchestrator => self.root_orchestrator = choice,
             InternalModelPoint::SubOrchestrator => self.sub_orchestrator = choice,
             InternalModelPoint::AutoClassifier => self.auto_classifier = choice,
+            InternalModelPoint::WorkDriverJudge => self.work_driver_judge = choice,
         }
     }
 }
@@ -681,8 +704,9 @@ mod tests {
 
     #[test]
     fn test_all_points_have_unique_keys_and_roundtrip() {
-        // Runde 5, Teil E: +1 für `auto_classifier`.
-        assert_eq!(InternalModelPoint::ALL.len(), 11);
+        // Runde 5, Teil E: +1 für `auto_classifier`; +1 für
+        // `work_driver_judge` (WorkDriver-Richter).
+        assert_eq!(InternalModelPoint::ALL.len(), 12);
         for point in InternalModelPoint::ALL {
             assert_eq!(InternalModelPoint::parse(point.key()), Some(point));
             let mut toml = InternalModelsToml::default();
@@ -728,6 +752,40 @@ mod tests {
             InternalModelPoint::parse("auto-classifier"),
             Some(InternalModelPoint::AutoClassifier)
         );
+        Ok(())
+    }
+
+    /// WorkDriver-Richter: kein OpenRouter-Standard, sondern das schnelle
+    /// Modell des aktiven Providers (wie `AutoClassifier`).
+    #[test]
+    fn test_work_driver_judge_never_uses_openrouter_default() -> TestResult {
+        let config = config_with_openrouter(true, true)?;
+        let resolved = resolve_internal_model(&config, InternalModelPoint::WorkDriverJudge);
+        assert_eq!(resolved.source, InternalModelSource::MainModel);
+        assert_eq!(
+            InternalModelPoint::parse("work-driver-judge"),
+            Some(InternalModelPoint::WorkDriverJudge)
+        );
+        Ok(())
+    }
+
+    /// `[internal_models.work_driver_judge]` mit gesetztem `provider`/`model`
+    /// löst als `Explicit` auf.
+    #[test]
+    fn test_work_driver_judge_explicit_choice_resolves_as_explicit() -> TestResult {
+        let mut config = config_with_openrouter(true, true)?;
+        config.harness.internal_models.set_choice(
+            InternalModelPoint::WorkDriverJudge,
+            Some(InternalModelChoice {
+                provider: Some("anthropic".to_owned()),
+                model: Some("claude-haiku".to_owned()),
+            }),
+        );
+
+        let resolved = resolve_internal_model(&config, InternalModelPoint::WorkDriverJudge);
+        assert_eq!(resolved.source, InternalModelSource::Explicit);
+        assert_eq!(resolved.provider.as_deref(), Some("anthropic"));
+        assert_eq!(resolved.model.as_deref(), Some("claude-haiku"));
         Ok(())
     }
 

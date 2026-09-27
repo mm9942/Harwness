@@ -1,0 +1,34 @@
+[package]
+publish.workspace = true
+name = "harw-job-store"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "Durable, fenced job record store: one JSON record per job under a cap-std root, per-record fs4 locks, atomic tempfile+rename+fsync persistence and lease/fencing checks (Job-Runtime-Doc §7, Eco-Doc §33)."
+
+[dependencies]
+# Job model: StoredJob, Lease, LeaseToken, FencingToken, RunnerId, JobState.
+harw-job-core = { path = "../harw-job-core" }
+# Capability-oriented root handle: every file operation is relative to an
+# opened `Dir`, never an ambient path (Job-Runtime-Doc §3.4, §7). Same
+# workspace pin as `harw-job-linux`.
+cap-std = { workspace = true }
+# Per-record advisory locks. fs4 has no cap-std integration; a cap-std file
+# is converted with `into_std()` before locking.
+fs4 = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+jiff = { workspace = true }
+# Skipped/quarantined records are reported, never silently dropped.
+tracing = { workspace = true }
+
+[dev-dependencies]
+# `JobScope` in test fixtures needs TenantId/WorkspaceId/ApprovalActor
+# (known inversion in harw-job-core, see its crate docs). Test-only edge.
+harw-types = { path = "../harw-types" }
+tempfile = { workspace = true }
+
+[lints]
+workspace = true

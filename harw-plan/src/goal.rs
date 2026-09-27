@@ -202,6 +202,16 @@ pub struct Goal {
     /// Zeitpunkt der letzten Aktualisierung (wird vom Store gesetzt).
     #[serde(with = "time::serde::rfc3339")]
     pub updated_at: OffsetDateTime,
+    /// Mandant, dem dieses Ziel gehört (H12, Masterplan v2 §15).
+    ///
+    /// Gesetzt aus dem serverseitigen Mandanten-Scope des anlegenden
+    /// Aufrufers (`OpContext::tenant()`), nie aus Nutzereingaben. `None` ist
+    /// der Einzelnutzer-Betrieb bzw. Altbestand: `#[serde(default)]` hält
+    /// bestehende Snapshots lesbar, `skip_serializing_if` hält ungescopte
+    /// Ziele byte-identisch zum bisherigen Format. Sichtbarkeit regelt
+    /// [`crate::tenant_scope`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tenant: Option<harw_types::TenantId>,
 }
 
 /// Teilaktualisierung eines Goals für [`GoalAction::Refine`].
@@ -327,6 +337,37 @@ pub trait GoalStore: Send + Sync {
     ///   store-spezifische Rechteprüfungen jenseits der reinen Statuslogik durchführt.
     /// - [`PlanError::Io`] / [`PlanError::Serde`] bei Persistenzfehlern.
     fn apply(&self, action: GoalAction, actor: &str) -> PlanResult<GoalEvent>;
+
+    /// Wie [`Self::apply`], prüft aber vorher `guard` gegen das aktuelle Ziel.
+    ///
+    /// # Description
+    /// `guard` sieht das aktuell gespeicherte Ziel (`None`, wenn keins
+    /// existiert) und kann die Aktion mit einem [`PlanError`] abweisen, bevor
+    /// irgendetwas verändert wird. Genutzt vom Mandanten-Filter
+    /// ([`crate::tenant_scope::ScopedGoalStore`]): „gehört das Ziel dem
+    /// Aufrufer?“ und die Mutation müssen dasselbe Ziel sehen.
+    ///
+    /// [`crate::goal_store::InMemoryGoalStore`] und
+    /// [`crate::goal_store::FileGoalStore`] prüfen `guard` unter demselben
+    /// Schreib-Lock wie die Mutation (atomar). Die Standardimplementierung für
+    /// Fremd-Stores liest [`Self::current`] und ruft danach [`Self::apply`] —
+    /// nicht atomar, aber mit derselben Aussage.
+    ///
+    /// # Errors
+    /// Der Fehler von `guard` unverändert, sonst wie [`Self::apply`].
+    fn apply_guarded(
+        &self,
+        action: GoalAction,
+        actor: &str,
+        guard: &dyn Fn(Option<&Goal>) -> PlanResult<()>,
+    ) -> PlanResult<GoalEvent> {
+        match self.current() {
+            Ok(goal) => guard(Some(&goal))?,
+            Err(PlanError::GoalNotFound) => guard(None)?,
+            Err(error) => return Err(error),
+        }
+        self.apply(action, actor)
+    }
 
     /// Gibt die Event-History zurück.
     ///
@@ -699,6 +740,7 @@ mod tests {
             evidence: vec![],
             created_at: OffsetDateTime::UNIX_EPOCH,
             updated_at: OffsetDateTime::UNIX_EPOCH,
+            tenant: None,
         }
     }
 
@@ -735,6 +777,7 @@ mod tests {
             nodes,
             created_at: OffsetDateTime::UNIX_EPOCH,
             updated_at: OffsetDateTime::UNIX_EPOCH,
+            tenant: None,
         }
     }
 
@@ -934,5 +977,42 @@ mod tests {
             "Erwartet coverage 0.5, war {}",
             report.coverage
         );
+    }
+
+    /// Ein ungescoptes Ziel serialisiert kein `tenant`-Feld (Snapshots und
+    /// `history.jsonl` bleiben byte-identisch), ein Snapshot von vor dem Feld
+    /// lädt weiterhin als ungescopt.
+    #[test]
+    fn test_goal_tenant_is_optional_and_omitted_when_absent() -> TestResult {
+        let goal = make_goal(GoalStatus::Active);
+        let json = serde_json::to_string(&goal)?;
+        assert!(
+            !json.contains("tenant"),
+            "kein tenant-Feld erwartet: {json}"
+        );
+
+        let mut value = serde_json::to_value(&goal)?;
+        let obj = value
+            .as_object_mut()
+            .ok_or(TestError::Missing("Goal serialisiert als JSON-Objekt"))?;
+        obj.remove("tenant");
+        let legacy: Goal = serde_json::from_value(value)?;
+        assert_eq!(legacy.tenant, None);
+        assert_eq!(legacy.id.as_str(), "g-test");
+        Ok(())
+    }
+
+    /// Ein gescoptes Ziel überlebt den Serde-Roundtrip mit seinem Mandanten.
+    #[test]
+    fn test_goal_with_tenant_roundtrips() -> TestResult {
+        let goal = Goal {
+            tenant: Some(harw_types::TenantId::from_str("tenant-a")),
+            ..make_goal(GoalStatus::Active)
+        };
+        let json = serde_json::to_string(&goal)?;
+        assert!(json.contains("\"tenant\":\"tenant-a\""), "{json}");
+        let back: Goal = serde_json::from_str(&json)?;
+        assert_eq!(back.tenant, goal.tenant);
+        Ok(())
     }
 }

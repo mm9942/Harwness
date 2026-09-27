@@ -12,11 +12,27 @@ SYSCONFDIR ?= /etc/harw-dod
 LOCALSTATEDIR ?= /var
 STATEDIR ?= $(LOCALSTATEDIR)/lib/harw-dod
 LOGDIR ?= $(LOCALSTATEDIR)/log/harw-dod
-RUNSTATEDIR ?= /run
-RUNTIMEDIR ?= $(RUNSTATEDIR)/harw-dod
+# Runtime sockets live in the fixed /run/harw (deploy/tmpfiles.d/harw.conf);
+# there is no runtime-directory knob.
 SYSTEMD_UNITDIR ?= $(PREFIX)/lib/systemd/system
 SYSUSERSDIR ?= $(PREFIX)/lib/sysusers.d
 TMPFILESDIR ?= $(PREFIX)/lib/tmpfiles.d
+
+# Since PL-60 the DoD crates are members of the root Cargo workspace (one
+# Cargo.toml, one Cargo.lock at the repository root); there is no
+# dod/Cargo.toml any more. Every Cargo call below therefore goes through the
+# root manifest and selects the DoD packages with `-p` (resolver 2 unifies
+# features only across the selected packages, so product-crate features do
+# not leak into DoD builds). check/fmt/clippy/test share the root `target/`.
+#
+# `build` (the packaged, privileged release binaries) deliberately keeps its
+# own target directory `dod/target`: install/install-existing copy from
+# $(BINARY_DIR), and a shared root `target/release` could hold a binary last
+# built by an unrelated `cargo build --release --workspace` with
+# product-crate features unified in. A separate directory guarantees the
+# installed binaries are exactly the package-scoped build below.
+ROOT_MANIFEST ?= $(abspath $(CURDIR)/../Cargo.toml)
+DOD_PACKAGES := $(foreach dir,$(sort $(wildcard $(CURDIR)/crates/*/Cargo.toml)),-p $(notdir $(patsubst %/Cargo.toml,%,$(dir))))
 
 TARGET_DIR ?= $(CURDIR)/target
 BINARY_DIR ?= $(TARGET_DIR)/release
@@ -25,8 +41,8 @@ BPF_ARTIFACT_DIR ?= $(CURDIR)/bpf
 INSTALL_ENV = DESTDIR='$(DESTDIR)' PREFIX='$(PREFIX)' \
 	LIBEXECDIR='$(LIBEXECDIR)' LIBDIR='$(LIBDIR)' BPFDIR='$(BPFDIR)' \
 	SYSCONFDIR='$(SYSCONFDIR)' LOCALSTATEDIR='$(LOCALSTATEDIR)' \
-	STATEDIR='$(STATEDIR)' LOGDIR='$(LOGDIR)' RUNSTATEDIR='$(RUNSTATEDIR)' \
-	RUNTIMEDIR='$(RUNTIMEDIR)' SYSTEMD_UNITDIR='$(SYSTEMD_UNITDIR)' \
+	STATEDIR='$(STATEDIR)' LOGDIR='$(LOGDIR)' \
+	SYSTEMD_UNITDIR='$(SYSTEMD_UNITDIR)' \
 	SYSUSERSDIR='$(SYSUSERSDIR)' TMPFILESDIR='$(TMPFILESDIR)' \
 	BINARY_DIR='$(BINARY_DIR)' BPF_ARTIFACT_DIR='$(BPF_ARTIFACT_DIR)'
 
@@ -45,7 +61,7 @@ help:
 		'  ensure-bpf-toolchain  locate/install clang, bpftool, llvm-objdump' \
 		'  build-bpf    build externally pinned BPF ELF artifacts' \
 		'  build        build release host binaries and BPF artifacts' \
-		'  check/fmt/clippy/test/verify  DoD workspace quality gates' \
+		'  check/fmt/clippy/test/verify  DoD crate quality gates (root workspace, -p)' \
 		'  install      build unprivileged, then install and start DoD on the host' \
 		'  install-existing  install or uninstall already-built artifacts (no Cargo)' \
 		'  stage        DESTDIR-only install for package building' \
@@ -59,7 +75,8 @@ help:
 		'  stage-test   static packaging/placeholder checks (no Cargo invocation)' \
 		'' \
 		'Install variables: DESTDIR PREFIX LIBEXECDIR LIBDIR BPFDIR SYSCONFDIR' \
-		'LOCALSTATEDIR RUNSTATEDIR SYSTEMD_UNITDIR SYSUSERSDIR TMPFILESDIR.'
+		'LOCALSTATEDIR STATEDIR LOGDIR SYSTEMD_UNITDIR SYSUSERSDIR TMPFILESDIR.' \
+		'Units, sysusers and tmpfiles are installed from ../deploy (canonical source).'
 
 doctor:
 	@exec scripts/doctor.sh
@@ -108,25 +125,25 @@ build-bpf: ensure-bpf-toolchain
 build:
 	@set -eu; test "$$(id -u)" -ne 0 || { echo 'build must run unprivileged; do not invoke Cargo as root' >&2; exit 2; }; \
 	command -v cargo >/dev/null 2>&1 || { echo 'cargo is required; run make doctor first' >&2; exit 2; }; \
-	cargo build --manifest-path Cargo.toml --release --target-dir '$(TARGET_DIR)' \
+	cargo build --manifest-path '$(ROOT_MANIFEST)' --locked --release --target-dir '$(TARGET_DIR)' \
 		-p harw-sentinel -p harw-probe-bpf -p harw-probe-fs -p harw-warden; \
 	$(MAKE) build-bpf
 
 check:
 	@set -eu; test "$$(id -u)" -ne 0 || { echo 'check must run unprivileged; do not invoke Cargo as root' >&2; exit 2; }; command -v cargo >/dev/null 2>&1 || { echo 'cargo is required; run make doctor first' >&2; exit 2; }; \
-	cargo check --manifest-path Cargo.toml --workspace
+	cargo check --manifest-path '$(ROOT_MANIFEST)' --locked $(DOD_PACKAGES)
 
 fmt:
 	@set -eu; test "$$(id -u)" -ne 0 || { echo 'fmt must run unprivileged; do not invoke Cargo as root' >&2; exit 2; }; command -v cargo >/dev/null 2>&1 || { echo 'cargo is required; run make doctor first' >&2; exit 2; }; \
-	cargo fmt --manifest-path Cargo.toml --all -- --check
+	cargo fmt --manifest-path '$(ROOT_MANIFEST)' $(DOD_PACKAGES) -- --check
 
 clippy:
 	@set -eu; test "$$(id -u)" -ne 0 || { echo 'clippy must run unprivileged; do not invoke Cargo as root' >&2; exit 2; }; command -v cargo >/dev/null 2>&1 || { echo 'cargo is required; run make doctor first' >&2; exit 2; }; \
-	cargo clippy --manifest-path Cargo.toml --workspace --all-targets -- -D warnings
+	cargo clippy --manifest-path '$(ROOT_MANIFEST)' --locked $(DOD_PACKAGES) --all-targets -- -D warnings
 
 test:
 	@set -eu; test "$$(id -u)" -ne 0 || { echo 'test must run unprivileged; do not invoke Cargo as root' >&2; exit 2; }; command -v cargo >/dev/null 2>&1 || { echo 'cargo is required; run make doctor first' >&2; exit 2; }; \
-	cargo test --manifest-path Cargo.toml --workspace
+	cargo test --manifest-path '$(ROOT_MANIFEST)' --locked $(DOD_PACKAGES)
 
 verify: check fmt clippy test
 	@exec scripts/verify-package.sh
@@ -167,7 +184,7 @@ enable-warden:
 	$(PRIV_ESC) install -d -m 0750 '$(SYSCONFDIR)'; \
 	$(PRIV_ESC) touch '$(SYSCONFDIR)/warden.enable'; \
 	$(PRIV_ESC) systemctl daemon-reload; \
-	$(PRIV_ESC) systemctl enable --now harw-dod-warden.socket; \
+	$(PRIV_ESC) systemctl enable --now harw-warden.socket; \
 	printf '%s\n' 'Warden guard file created and socket enabled/started.'
 
 disable:

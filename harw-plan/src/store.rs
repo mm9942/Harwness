@@ -168,6 +168,46 @@ pub trait PlanStore: Send + Sync {
     /// - [`PlanError::Io`] / [`PlanError::Serde`] bei Persistenzfehlern.
     fn apply(&self, action: PlanAction, actor: &str) -> PlanResult<PlanEvent>;
 
+    /// Legt einen Plan an, der dem Mandanten `tenant` gehört (H12).
+    ///
+    /// # Description
+    /// Wie `apply(PlanAction::Create { plan_id, goal }, actor)`, setzt aber
+    /// zusätzlich [`Plan::tenant`] — im selben Schreibvorgang, sodass nie ein
+    /// ungescopter Zwischenstand sichtbar ist. Das Event bleibt ein
+    /// gewöhnliches `Create` (der Mandant steht im Snapshot, nicht im Event).
+    ///
+    /// Die Standardimplementierung (Fremd- und Test-Stores) kann einen
+    /// Mandanten nicht speichern: ohne Mandant delegiert sie an
+    /// [`Self::apply`], mit Mandant weist sie fail-closed mit
+    /// [`PlanError::CatalogUnsupported`] ab — ein still ungescopter Plan wäre
+    /// für seinen eigenen Anleger unsichtbar und für Ungescopte offen.
+    /// `InMemoryPlanStore` und `FilePlanStore` überschreiben die Methode.
+    ///
+    /// # Arguments
+    /// - `plan_id` (`PlanId`): Bezeichner des neuen Plans.
+    /// - `goal` (`String`): Ziel-Statement.
+    /// - `tenant` (`Option<TenantId>`): Mandant aus dem serverseitigen
+    ///   Kontext; `None` legt einen ungescopten Plan an (bisheriges Verhalten).
+    /// - `actor` (`&str`): Akteur (runtime-gesetzt).
+    ///
+    /// # Errors
+    /// Wie [`Self::apply`] für `Create`; zusätzlich
+    /// [`PlanError::CatalogUnsupported`] (Standardimplementierung mit Mandant).
+    fn create_for_tenant(
+        &self,
+        plan_id: PlanId,
+        goal: String,
+        tenant: Option<harw_types::TenantId>,
+        actor: &str,
+    ) -> PlanResult<PlanEvent> {
+        match tenant {
+            None => self.apply(PlanAction::Create { plan_id, goal }, actor),
+            Some(_) => Err(PlanError::CatalogUnsupported {
+                operation: "create_for_tenant",
+            }),
+        }
+    }
+
     /// Gibt die Event-History zurück.
     ///
     /// # Arguments

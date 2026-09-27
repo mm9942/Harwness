@@ -1,0 +1,54 @@
+# Environment for the GitHub Copilot coding agent ("cloud home" for Copilot).
+# Copilot runs this job before it starts working on an issue. The job name
+# `copilot-setup-steps` is mandatory. It mirrors what the CI jobs install, so
+# Copilot's checks match CI (see .github/copilot-instructions.md).
+name: Copilot Setup Steps
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - .github/workflows/copilot-setup-steps.yml
+  pull_request:
+    paths:
+      - .github/workflows/copilot-setup-steps.yml
+
+permissions:
+  contents: read
+
+jobs:
+  copilot-setup-steps:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      # Disk-quota-friendly builds: test binaries without debug info, no
+      # incremental cache (same settings the central build uses in the cloud).
+      CARGO_INCREMENTAL: "0"
+      CARGO_PROFILE_DEV_DEBUG: "0"
+      CARGO_PROFILE_TEST_DEBUG: "0"
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: System packages (sandbox tests, keyring)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y bubblewrap libdbus-1-dev pkg-config
+
+      # The toolchain comes from rust-toolchain.toml; rustup installs it on
+      # first use. Pre-fetch it here so the agent doesn't pay for it per step.
+      - name: Rust toolchain (from rust-toolchain.toml)
+        run: |
+          rustup show active-toolchain || rustup toolchain install
+          rustup component add rustfmt clippy
+
+      - name: Cargo cache
+        uses: Swatinem/rust-cache@v2
+
+      - name: cargo-deny
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-deny
+
+      - name: Fetch dependencies
+        run: cargo fetch --locked

@@ -1,0 +1,55 @@
+[package]
+publish.workspace = true
+name = "harw-netsec"
+description = "NetSec local network-control daemon: node/zone/route topology behind network.sock (crypto masterplan v2 §6.2, §18, H7)."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+# Architecture class A (application daemon, `xtask/arch-policy.toml`). It
+# composes foundation types (`harw-types`) with a transport stack; nothing in
+# the workspace may depend on it.
+
+[lib]
+path = "src/lib.rs"
+
+[[bin]]
+name = "harw-netsec"
+path = "src/main.rs"
+
+[dependencies]
+# `NodeId` (H1 infrastructure identity vocabulary) and `Clock`/`SystemClock`.
+harw-types = { path = "../harw-types" }
+
+jiff = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+toml = { workspace = true }
+tracing = { workspace = true }
+# Atomic state writes (tempfile + fsync + rename) and the single-writer lock,
+# the same crates and versions `harw-session-store`/`harw-job-store` use.
+tempfile = { workspace = true }
+fs4 = { workspace = true }
+
+# HTTP stack: identical version lines to `harw-web/Cargo.toml` so the
+# workspace keeps one HTTP library and one version resolution.
+hyper = { version = "1", features = ["server", "http1"] }
+hyper-util = { version = "0.1", features = ["server", "http1", "tokio"] }
+http-body-util = "0.1"
+bytes = "1"
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "net", "sync", "macros", "time", "signal", "io-util"] }
+
+# systemd socket activation without `unsafe` in this crate — the same crate
+# and version `harw-warden` uses (`dod/crates/harw-warden/src/systemd.rs`).
+sd-listen-fds = "0.2.0"
+
+# Daemon logging to stderr (journald picks it up), same line as harw-sentinel.
+tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+
+[lints]
+workspace = true

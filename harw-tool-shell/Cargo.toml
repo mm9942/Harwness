@@ -1,6 +1,7 @@
 [package]
 publish.workspace = true
 name = "harw-tool-shell"
+description = "Shell execution tool provider with sandbox isolation for the Harwness agent"
 version.workspace = true
 edition.workspace = true
 license.workspace = true

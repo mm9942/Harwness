@@ -1,0 +1,29 @@
+[package]
+publish.workspace = true
+name = "harw-job-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "Platform-neutral job model: lifecycle state machine, ids, spec, outcomes, budget, lease, retry."
+
+[dependencies]
+# Generic job model (ids, lifecycle, outcome, spec, enforcement) needs only
+# these three. No tokio, no rustix, no procfs (Job-Runtime-Doc §6).
+serde = { workspace = true }
+jiff = { workspace = true }
+# Only used by the moved `stored` module (`serde_json::Value` payloads) and
+# tests. Known inversion, see crate docs (Eco-Doc §59).
+serde_json = { workspace = true }
+# The following three are carried over unchanged with the modules moved out
+# of `harw-job-runtime` (budget/error/job/lease/retry/stored). They are
+# Harwness semantics inside the lowest job layer (Eco-Doc §14/§57/§58) and are
+# listed as "Known inversions (to be removed)" in `src/lib.rs`. The new
+# generic modules do not use them.
+harw-types = { path = "../harw-types" }
+harw-macros = { path = "../harw-macros" }
+harw-observe = { path = "../harw-observe" }
+
+[lints]
+workspace = true

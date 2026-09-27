@@ -1,6 +1,7 @@
 [package]
 publish.workspace = true
 name = "harw-provider"
+description = "Typestate-based provider registry with fallback routing and model invocation"
 version.workspace = true
 edition.workspace = true
 license.workspace = true

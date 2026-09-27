@@ -4,11 +4,11 @@
 use serde::Serialize;
 use serde_json::Value;
 
+use crate::builtins::builtin_defaults;
 use crate::codes::lookup_code;
 use crate::compiler::Compiled;
 use crate::discovery::SourceSet;
 use crate::graph::PATCH_OPS;
-use harw_registry_defaults::capability_catalog;
 
 /// The explanation of a diagnostic code.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -222,13 +222,13 @@ fn explain_tool(compiled: &Compiled, sources: &SourceSet, tool: &str) -> FieldEx
             ));
         }
     }
-    match capability_catalog::lookup(tool) {
+    match builtin_defaults().capability(tool) {
         Some(entry) => notes.push(format!(
             "catalog: provider `{}` ({}), class {}, runner feature `{}`{}",
-            entry.provider.id,
-            entry.provider.crate_name,
-            entry.class.as_str(),
-            entry.feature(),
+            entry.provider_id,
+            entry.crate_name,
+            entry.class,
+            entry.feature,
             if entry.always_available {
                 ", always available"
             } else {

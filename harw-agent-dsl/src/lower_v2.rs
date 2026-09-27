@@ -29,6 +29,7 @@
 //! | `[work]` | [`Work`] |
 //! | `[research]` | [`Research`] |
 //! | `[verification]` | [`Verification`] |
+//! | `[work_driver]` | [`WorkDriverSpec`] (`HARW-DRIVER-*`); also grants `WORK_DRIVER_TOOLS` |
 //! | `[binary]` | [`Binary`] |
 //! | `[network]` | [`Permissions::network`] (`hosts`) |
 //! | `[authority]` | [`Authority`] (from the resolver) |
@@ -57,7 +58,7 @@ use crate::ir_v2::{
     ContextSection, Effort, FilesystemPermissions, Instructions, Interface, Job, Lifecycle, Limits,
     ModelRef, Models, NetworkMode, NetworkPermissions, Permissions, Research, ReturnContract,
     ReturnPipeline, ReturnValidator, SkillEntry, Skills, SpawnContract, SpawnPermissions,
-    ToolSurface, Trace, TraceStep, Verification, WORKSPACE_WRITE_PATH, Work,
+    ToolSurface, Trace, TraceStep, Verification, WORKSPACE_WRITE_PATH, Work, WorkDriverSpec,
 };
 use crate::raw::RawAgentDefinition;
 use crate::resolve::resolve_definition;
@@ -92,6 +93,7 @@ pub const LOWERED_TABLES: &[&str] = &[
     "work",
     "research",
     "verification",
+    "work_driver",
     "binary",
     "network",
     "authority",
@@ -454,8 +456,19 @@ impl Cx<'_> {
         }
     }
 
-    /// Reports every key of `table` not in `allowed`.
+    /// Reports every key of `table` not in `allowed` (`HARW-SCHEMA-004`).
     fn check_keys(&mut self, table: &toml::Table, prefix: &str, allowed: &[&str]) {
+        self.check_keys_as(&codes::SCHEMA_UNKNOWN_KEY, table, prefix, allowed);
+    }
+
+    /// Reports every key of `table` not in `allowed` under `code`.
+    fn check_keys_as(
+        &mut self,
+        code: &DiagnosticCode,
+        table: &toml::Table,
+        prefix: &str,
+        allowed: &[&str],
+    ) {
         for key in table.keys() {
             if allowed.contains(&key.as_str()) {
                 continue;
@@ -465,7 +478,7 @@ impl Cx<'_> {
                 .map(|known| format!("did you mean `{known}`? "))
                 .unwrap_or_default();
             self.report_help(
-                &codes::SCHEMA_UNKNOWN_KEY,
+                code,
                 &path,
                 format!("unknown key `{key}` in `[{prefix}]`"),
                 format!("{suggestion}known keys: {}", allowed.join(", ")),
@@ -631,6 +644,12 @@ fn valid_binary_name(name: &str) -> bool {
         && (first.is_ascii_lowercase() || first.is_ascii_digit())
         && chars
             .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || matches!(c, '.' | '_' | '-'))
+}
+
+/// Role names referenced by `[work_driver]`: the same shape as binary
+/// names, `[a-z0-9][a-z0-9._-]{0,63}` (registry role names are kebab-case).
+fn valid_role_name(name: &str) -> bool {
+    valid_binary_name(name)
 }
 
 /// A valid binary name derived from the specialization.
@@ -1213,6 +1232,257 @@ fn lower_verification(cx: &mut Cx<'_>, config: &toml::Table) -> Option<Verificat
     })
 }
 
+/// Tools a successfully lowered `[work_driver]` grants in addition to
+/// whatever `[tools]` (or an inherited base's `[tools]`) admits.
+///
+/// # Description
+/// `harw-agent-dsl` must not depend on `harw-registry-defaults`, so these
+/// names are defined locally rather than imported; keep them in sync with
+/// `WORK_DRIVER_ENQUEUE_TOOL`, `WORK_DRIVER_STATUS_TOOL`,
+/// `WORK_DRIVER_STOP_TOOL` and `WORK_DRIVER_TOOLS` in
+/// `harw-registry-defaults/src/capability_catalog.rs`. Without `[work_driver]`
+/// there are no such tools: [`lower_v2`] adds them to [`ToolSurface::admitted`]
+/// only when [`lower_work_driver`] returns `Some`.
+pub const WORK_DRIVER_ENQUEUE_TOOL: &str = "work_driver.enqueue";
+/// See [`WORK_DRIVER_ENQUEUE_TOOL`].
+pub const WORK_DRIVER_STATUS_TOOL: &str = "work_driver.status";
+/// See [`WORK_DRIVER_ENQUEUE_TOOL`].
+pub const WORK_DRIVER_STOP_TOOL: &str = "work_driver.stop";
+/// The three WorkDriver tools, in the order they are added to
+/// [`ToolSurface::admitted`].
+pub const WORK_DRIVER_TOOLS: &[&str] = &[
+    WORK_DRIVER_ENQUEUE_TOOL,
+    WORK_DRIVER_STATUS_TOOL,
+    WORK_DRIVER_STOP_TOOL,
+];
+
+/// Keys allowed in `[work_driver]`.
+pub const WORK_DRIVER_KEYS: &[&str] = &[
+    "max_iterations",
+    "max_parallel_workers",
+    "max_attempts_per_worker",
+    "stall_iterations",
+    "worker_role",
+    "judge_role",
+    "verify",
+    "token_budget",
+    "wall_budget_secs",
+];
+
+/// Reads an optional `u32` of `[work_driver]` and checks `min..=max`
+/// (`HARW-DRIVER-002`); a wrong type or a negative value is reported by
+/// [`Cx::opt_u32`].
+fn driver_u32(
+    cx: &mut Cx<'_>,
+    table: &toml::Table,
+    prefix: &str,
+    key: &str,
+    min: u32,
+    max: u32,
+) -> Option<u32> {
+    let value = cx.opt_u32(table, prefix, key)?;
+    if (min..=max).contains(&value) {
+        Some(value)
+    } else {
+        let path = join(prefix, key);
+        cx.report(
+            &codes::DRIVER_OUT_OF_RANGE,
+            &path,
+            format!("`{path}` = {value} is outside {min}..={max}"),
+        );
+        None
+    }
+}
+
+/// Reads an optional positive `u64` budget of `[work_driver]`.
+fn driver_budget(cx: &mut Cx<'_>, table: &toml::Table, prefix: &str, key: &str) -> Option<u64> {
+    let value = cx.opt_u64(table, prefix, key)?;
+    if value == 0 {
+        let path = join(prefix, key);
+        cx.report(
+            &codes::DRIVER_OUT_OF_RANGE,
+            &path,
+            format!("`{path}` = 0 is not a budget; use at least 1 or omit the key"),
+        );
+        return None;
+    }
+    Some(value)
+}
+
+/// Reads an optional role reference of `[work_driver]` and checks its shape
+/// (`HARW-DRIVER-003`); `Some` only for a well-formed name.
+fn driver_role(cx: &mut Cx<'_>, table: &toml::Table, prefix: &str, key: &str) -> Option<String> {
+    let name = cx.opt_str(table, prefix, key)?;
+    if valid_role_name(&name) {
+        Some(name)
+    } else {
+        let path = join(prefix, key);
+        cx.report(
+            &codes::DRIVER_INVALID_ROLE,
+            &path,
+            format!("`{path}` = `{name}` is not a role name"),
+        );
+        None
+    }
+}
+
+/// Lowers `[work_driver]` (DSL §8.3).
+///
+/// # Description
+/// Unknown keys are `HARW-DRIVER-001`, values outside their range
+/// `HARW-DRIVER-002`, a missing or malformed role reference
+/// `HARW-DRIVER-003`. The table also demands the right to delegate
+/// (`HARW-DRIVER-004`): the role must be allowed to spawn workers
+/// ([`can_spawn`]), the spawn depth must not be 0, and `worker_role` (and
+/// `judge_role`, if set) must be a declared spawn target — listed in
+/// `[delegation] targets` or `[spawn] child_orchestrators`. Defaults:
+/// see [`WorkDriverSpec`].
+fn lower_work_driver(
+    cx: &mut Cx<'_>,
+    config: &toml::Table,
+    role: AgentRoleId,
+    spawn: &SpawnContract,
+    lifecycle: &Lifecycle,
+) -> Option<WorkDriverSpec> {
+    let (table, name) = cx.section(config, &["work_driver"])?;
+    cx.check_keys_as(&codes::DRIVER_UNKNOWN_KEY, table, name, WORK_DRIVER_KEYS);
+
+    let max_iterations = driver_u32(
+        cx,
+        table,
+        name,
+        "max_iterations",
+        1,
+        WorkDriverSpec::MAX_ITERATIONS,
+    )
+    .unwrap_or(WorkDriverSpec::DEFAULT_MAX_ITERATIONS);
+    let max_parallel_workers = driver_u32(
+        cx,
+        table,
+        name,
+        "max_parallel_workers",
+        1,
+        WorkDriverSpec::MAX_PARALLEL_WORKERS,
+    )
+    .unwrap_or(WorkDriverSpec::DEFAULT_MAX_PARALLEL_WORKERS);
+    // `[lifecycle] max_attempts` (clamped into range), else the default.
+    let default_attempts = lifecycle.max_attempts.map_or(
+        WorkDriverSpec::DEFAULT_MAX_ATTEMPTS_PER_WORKER,
+        |attempts| attempts.clamp(1, WorkDriverSpec::MAX_ATTEMPTS_PER_WORKER),
+    );
+    let max_attempts_per_worker = driver_u32(
+        cx,
+        table,
+        name,
+        "max_attempts_per_worker",
+        1,
+        WorkDriverSpec::MAX_ATTEMPTS_PER_WORKER,
+    )
+    .unwrap_or(default_attempts);
+    let default_stall = WorkDriverSpec::DEFAULT_STALL_ITERATIONS.min(max_iterations);
+    let stall_iterations =
+        driver_u32(cx, table, name, "stall_iterations", 1, max_iterations).unwrap_or(default_stall);
+    let token_budget = driver_budget(cx, table, name, "token_budget");
+    let wall_budget_secs = driver_budget(cx, table, name, "wall_budget_secs");
+
+    let verify = cx.opt_strings(table, name, "verify").unwrap_or_default();
+    for (index, command) in verify.iter().enumerate() {
+        if command.trim().is_empty() || command.chars().any(char::is_control) {
+            cx.report(
+                &codes::DRIVER_INVALID_VERIFY,
+                &format!("{name}.verify[{index}]"),
+                format!("`{name}.verify[{index}]` is blank or contains control characters"),
+            );
+        }
+    }
+
+    let worker_role = if table.contains_key("worker_role") {
+        driver_role(cx, table, name, "worker_role")
+    } else {
+        cx.report(
+            &codes::DRIVER_INVALID_ROLE,
+            name,
+            format!("`[{name}]` names no `worker_role` to delegate to"),
+        );
+        None
+    };
+    let judge_role = driver_role(cx, table, name, "judge_role");
+
+    // Delegation rights: the driver only ever delegates what the definition
+    // itself may delegate.
+    if !can_spawn(role, AgentRoleId::Worker) {
+        cx.report(
+            &codes::DRIVER_DELEGATION_RIGHTS,
+            name,
+            format!("role `{role:?}` may not delegate work, but declares `[{name}]`"),
+        );
+    }
+    if spawn.max_depth == Some(0) {
+        cx.report(
+            &codes::DRIVER_DELEGATION_RIGHTS,
+            name,
+            format!("`[{name}]` needs a spawn depth above 0, but `max_depth = 0`"),
+        );
+    }
+    let is_target = |candidate: &str| {
+        spawn
+            .delegation_targets
+            .iter()
+            .flatten()
+            .chain(spawn.child_orchestrators.iter())
+            .any(|target| target == candidate)
+    };
+    for (key, reference) in [("worker_role", &worker_role), ("judge_role", &judge_role)] {
+        let Some(reference) = reference else {
+            continue;
+        };
+        if !is_target(reference.as_str()) {
+            cx.report(
+                &codes::DRIVER_DELEGATION_RIGHTS,
+                &format!("{name}.{key}"),
+                format!(
+                    "`{name}.{key}` = `{reference}` is not a spawn target of this definition \
+                     (`[delegation] targets` or `[spawn] child_orchestrators`)"
+                ),
+            );
+        }
+    }
+
+    Some(WorkDriverSpec {
+        max_iterations,
+        max_parallel_workers,
+        max_attempts_per_worker,
+        stall_iterations,
+        worker_role: worker_role?,
+        judge_role,
+        verify,
+        token_budget,
+        wall_budget_secs,
+    })
+}
+
+/// Grants [`WORK_DRIVER_TOOLS`] once `[work_driver]` has lowered
+/// successfully (`work_driver.is_some()`); a no-op without it, since there
+/// are no such tools then.
+///
+/// # Description
+/// Appends each tool of [`WORK_DRIVER_TOOLS`] to `tools.admitted` that is
+/// not already present (deduplicated), preserving `WORK_DRIVER_TOOLS`'
+/// order after whatever the definition (or its base) already admits — the
+/// same declaration-order convention as the rest of
+/// [`ToolSurface::admitted`]. [`derive_permissions`] later folds the result
+/// into the sorted, de-duplicated [`Permissions::tools`].
+fn grant_work_driver_tools(tools: &mut ToolSurface, work_driver: Option<&WorkDriverSpec>) {
+    if work_driver.is_none() {
+        return;
+    }
+    for tool in WORK_DRIVER_TOOLS {
+        if !tools.admitted.iter().any(|admitted| admitted == tool) {
+            tools.admitted.push((*tool).to_owned());
+        }
+    }
+}
+
 fn lower_network_hosts(cx: &mut Cx<'_>, config: &toml::Table) -> Vec<String> {
     let Some((table, name)) = cx.section(config, &["network"]) else {
         return Vec::new();
@@ -1629,7 +1899,7 @@ pub fn lower_v2(
     report_shadowed_tables(&mut cx, &target_files, &resolved.config, bound.is_some());
     classify_top_level(&mut cx, &config);
 
-    let tools = lower_tools(&mut cx, &config);
+    let mut tools = lower_tools(&mut cx, &config);
     let delegation_targets = lower_delegation(&mut cx, &config);
     let spawn = lower_spawn(&mut cx, &config, resolved.role, delegation_targets);
     let job = lower_job(&mut cx, &config);
@@ -1641,6 +1911,8 @@ pub fn lower_v2(
     let work = lower_work(&mut cx, &config);
     let research = lower_research(&mut cx, &config);
     let verification = lower_verification(&mut cx, &config);
+    let work_driver = lower_work_driver(&mut cx, &config, resolved.role, &spawn, &lifecycle);
+    grant_work_driver_tools(&mut tools, work_driver.as_ref());
     let hosts = lower_network_hosts(&mut cx, &config);
     lower_authority_table(&mut cx, &config);
     let binary = lower_binary(&mut cx, &config, &resolved.specialization);
@@ -1688,6 +1960,7 @@ pub fn lower_v2(
         work,
         research,
         verification,
+        work_driver,
         skills: Skills {
             entries: skills
                 .into_iter()
@@ -1696,6 +1969,7 @@ pub fn lower_v2(
         },
         binary,
         permissions,
+        requirements: crate::ir_v2::ExecutionRequirements::default(),
         trace: Trace {
             steps: resolved
                 .trace
@@ -1717,6 +1991,122 @@ pub fn lower_v2(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::{TestError, TestResult};
+
+    /// A minimal `[work_driver]` (defaults filled in, as [`lower_work_driver`]
+    /// would return it).
+    fn sample_work_driver() -> WorkDriverSpec {
+        WorkDriverSpec {
+            max_iterations: WorkDriverSpec::DEFAULT_MAX_ITERATIONS,
+            max_parallel_workers: WorkDriverSpec::DEFAULT_MAX_PARALLEL_WORKERS,
+            max_attempts_per_worker: WorkDriverSpec::DEFAULT_MAX_ATTEMPTS_PER_WORKER,
+            stall_iterations: WorkDriverSpec::DEFAULT_STALL_ITERATIONS,
+            worker_role: "executor".to_owned(),
+            judge_role: None,
+            verify: Vec::new(),
+            token_budget: None,
+            wall_budget_secs: None,
+        }
+    }
+
+    #[test]
+    fn test_work_driver_tools_constant_matches_its_named_consts() {
+        assert_eq!(
+            WORK_DRIVER_TOOLS,
+            [
+                WORK_DRIVER_ENQUEUE_TOOL,
+                WORK_DRIVER_STATUS_TOOL,
+                WORK_DRIVER_STOP_TOOL
+            ]
+        );
+        assert_eq!(WORK_DRIVER_TOOLS.len(), 3);
+        assert_eq!(WORK_DRIVER_ENQUEUE_TOOL, "work_driver.enqueue");
+        assert_eq!(WORK_DRIVER_STATUS_TOOL, "work_driver.status");
+        assert_eq!(WORK_DRIVER_STOP_TOOL, "work_driver.stop");
+    }
+
+    #[test]
+    fn test_grant_work_driver_tools_is_noop_without_a_driver() {
+        let mut tools = ToolSurface {
+            admitted: vec!["fs.read".to_owned()],
+            forbidden: Vec::new(),
+        };
+        grant_work_driver_tools(&mut tools, None);
+        assert_eq!(tools.admitted, ["fs.read".to_owned()]);
+    }
+
+    #[test]
+    fn test_grant_work_driver_tools_appends_all_three_once() {
+        let mut tools = ToolSurface {
+            admitted: vec!["fs.read".to_owned()],
+            forbidden: Vec::new(),
+        };
+        let driver = sample_work_driver();
+        grant_work_driver_tools(&mut tools, Some(&driver));
+        assert_eq!(
+            tools.admitted,
+            [
+                "fs.read".to_owned(),
+                WORK_DRIVER_ENQUEUE_TOOL.to_owned(),
+                WORK_DRIVER_STATUS_TOOL.to_owned(),
+                WORK_DRIVER_STOP_TOOL.to_owned(),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_grant_work_driver_tools_deduplicates_an_already_admitted_tool() {
+        let mut tools = ToolSurface {
+            admitted: vec![WORK_DRIVER_ENQUEUE_TOOL.to_owned()],
+            forbidden: Vec::new(),
+        };
+        let driver = sample_work_driver();
+        grant_work_driver_tools(&mut tools, Some(&driver));
+        assert_eq!(
+            tools.admitted,
+            [
+                WORK_DRIVER_ENQUEUE_TOOL.to_owned(),
+                WORK_DRIVER_STATUS_TOOL.to_owned(),
+                WORK_DRIVER_STOP_TOOL.to_owned(),
+            ],
+            "work_driver.enqueue must not be duplicated"
+        );
+    }
+
+    #[test]
+    fn test_granted_work_driver_tools_reach_the_effective_permissions() -> TestResult {
+        let mut tools = ToolSurface {
+            admitted: vec!["fs.read".to_owned()],
+            forbidden: Vec::new(),
+        };
+        let driver = sample_work_driver();
+        grant_work_driver_tools(&mut tools, Some(&driver));
+        let permissions = derive_permissions(
+            &tools,
+            &Authority::default(),
+            &SpawnContract::default(),
+            None,
+            &[],
+        );
+        permissions
+            .tools
+            .iter()
+            .position(|tool| tool == WORK_DRIVER_ENQUEUE_TOOL)
+            .ok_or(TestError::Missing(
+                "work_driver.enqueue in permissions.tools",
+            ))?;
+        for tool in WORK_DRIVER_TOOLS {
+            assert!(
+                permissions.tools.contains(&(*tool).to_owned()),
+                "{tool} missing from the effective, sorted `permissions.tools`"
+            );
+        }
+        assert!(
+            permissions.tools.windows(2).all(|pair| pair[0] <= pair[1]),
+            "permissions.tools must stay sorted"
+        );
+        Ok(())
+    }
 
     #[test]
     fn test_edit_distance_and_suggestion() {

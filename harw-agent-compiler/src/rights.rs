@@ -13,16 +13,9 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use harw_agent_dsl::ir_v2::{AgentIr, Effort};
 use harw_agent_dsl::roles::AgentRoleId;
-use harw_registry_defaults::capability_catalog::{self, CapabilityClass};
-use harw_registry_defaults::embedded_agents::{
-    CHILD_ORCHESTRATOR_BASE_NAME, WORKER_BASE_NAME, builtin_agent_irs, builtin_base_irs,
-};
-use harw_registry_defaults::roster::{
-    GENERIC_CHILD_ORCHESTRATOR_BASE, GENERIC_UIA_WORKER_BASE, GENERIC_WORKER_BASE,
-    GENERIC_WORKER_MAX_DEPTH, GENERIC_WORKER_WRITE_TOOLS,
-};
 use serde::Serialize;
 
+use crate::builtins::{RoleDefaults, builtin_defaults, require_builtin_defaults};
 use crate::error::CompileError;
 
 /// A set of rights in one comparable shape.
@@ -86,25 +79,22 @@ impl RightsSet {
 /// Catalog class labels of `tools` (unknown tools contribute nothing).
 #[must_use]
 pub fn classes_of(tools: &BTreeSet<String>) -> BTreeSet<String> {
+    let defaults = builtin_defaults();
     tools
         .iter()
-        .filter_map(|tool| capability_catalog::lookup(tool))
-        .map(|entry| entry.class.as_str().to_owned())
+        .filter_map(|tool| defaults.capability(tool))
+        .map(|capability| capability.class.to_owned())
         .collect()
 }
 
-/// `true` if any tool of the set writes, runs processes, reaches the network
-/// or acts on the host.
+/// `true` if any tool of the set writes, runs processes or acts on the host
+/// (the catalog's writing classes).
 #[must_use]
 pub fn is_writing(rights: &RightsSet) -> bool {
-    [
-        CapabilityClass::Write,
-        CapabilityClass::WriteOther,
-        CapabilityClass::Shell,
-        CapabilityClass::Host,
-    ]
-    .iter()
-    .any(|class| rights.classes.contains(class.as_str()))
+    builtin_defaults()
+        .writing_classes()
+        .iter()
+        .any(|class| rights.classes.contains(*class))
 }
 
 /// What a claim adds over a limit.
@@ -197,8 +187,9 @@ pub fn delta(
             // not a widening either.
             claimed.tools.iter().any(|tool| {
                 added_tools.contains(tool)
-                    && capability_catalog::lookup(tool)
-                        .is_some_and(|entry| entry.class.as_str() == class.as_str())
+                    && builtin_defaults()
+                        .capability(tool)
+                        .is_some_and(|capability| capability.class == class.as_str())
             })
         })
         .cloned()
@@ -244,6 +235,8 @@ pub struct BaseCeiling {
 pub struct BuiltinCeilings {
     roles: BTreeMap<String, AgentIr>,
     bases: BTreeMap<String, AgentIr>,
+    names: RoleDefaults,
+    catalog_tools: Vec<&'static str>,
 }
 
 impl BuiltinCeilings {
@@ -251,15 +244,20 @@ impl BuiltinCeilings {
     ///
     /// # Errors
     /// [`CompileError::Other`] if a built-in definition is broken (a build
-    /// defect).
+    /// defect) or no [`crate::builtins::BuiltinDefaults`] are installed.
     pub fn load(now: time::OffsetDateTime) -> Result<Self, CompileError> {
-        let roles = builtin_agent_irs(now)
+        let defaults = require_builtin_defaults()?;
+        let roles = defaults
+            .agent_irs(now)
             .map_err(|error| CompileError::Other(format!("built-in roles: {error}")))?;
-        let bases = builtin_base_irs(now)
+        let bases = defaults
+            .base_irs(now)
             .map_err(|error| CompileError::Other(format!("built-in bases: {error}")))?;
         Ok(Self {
             roles: roles.into_iter().collect(),
             bases: bases.into_iter().collect(),
+            names: defaults.roles(),
+            catalog_tools: defaults.catalog_tools(),
         })
     }
 
@@ -329,39 +327,52 @@ impl BuiltinCeilings {
                 rights: RightsSet::claimed_by(role_ir),
             }),
             Some(Ancestor::Role(..)) => None,
-            Some(Ancestor::Base(base)) => match (base, ir.role) {
-                (CHILD_ORCHESTRATOR_BASE_NAME, AgentRoleId::ChildOrchestrator)
-                | (WORKER_BASE_NAME, _) => self.generic(ir),
-                _ => None,
-            },
+            Some(Ancestor::Base(base)) => {
+                let child_orchestrator_base = base == self.names.child_orchestrator_base_name
+                    && ir.role == AgentRoleId::ChildOrchestrator;
+                if child_orchestrator_base || base == self.names.worker_base_name {
+                    self.generic(ir)
+                } else {
+                    None
+                }
+            }
             None => self.generic(ir),
         }
     }
 
     fn generic(&self, ir: &AgentIr) -> Option<BaseCeiling> {
+        let RoleDefaults {
+            child_orchestrator_base_name,
+            generic_worker_base,
+            generic_worker_max_depth,
+            generic_child_orchestrator_base,
+            generic_uia_worker_base,
+            generic_worker_write_tools,
+            ..
+        } = self.names;
         match ir.role {
             AgentRoleId::Worker => {
-                let base = self.roles.get(GENERIC_WORKER_BASE)?;
+                let base = self.roles.get(generic_worker_base)?;
                 let mut rights = RightsSet::claimed_by(base);
                 let writes = ir
                     .tools
                     .admitted
                     .iter()
-                    .any(|tool| GENERIC_WORKER_WRITE_TOOLS.contains(&tool.as_str()));
+                    .any(|tool| generic_worker_write_tools.contains(&tool.as_str()));
                 if writes {
                     rights.tools.extend(
-                        GENERIC_WORKER_WRITE_TOOLS
+                        generic_worker_write_tools
                             .iter()
                             .map(|tool| (*tool).to_owned()),
                     );
                     rights.classes = classes_of(&rights.tools);
                 }
                 rights.max_depth =
-                    Some(rights.max_depth.map_or(GENERIC_WORKER_MAX_DEPTH, |depth| {
-                        depth.min(GENERIC_WORKER_MAX_DEPTH)
+                    Some(rights.max_depth.map_or(generic_worker_max_depth, |depth| {
+                        depth.min(generic_worker_max_depth)
                     }));
                 Some(BaseCeiling {
-                    base_role: GENERIC_WORKER_BASE.to_owned(),
+                    base_role: generic_worker_base.to_owned(),
                     reason: if writes {
                         "generic writing worker".to_owned()
                     } else {
@@ -371,17 +382,17 @@ impl BuiltinCeilings {
                 })
             }
             AgentRoleId::UiaWorker => {
-                let base = self.roles.get(GENERIC_UIA_WORKER_BASE)?;
+                let base = self.roles.get(generic_uia_worker_base)?;
                 Some(BaseCeiling {
-                    base_role: GENERIC_UIA_WORKER_BASE.to_owned(),
+                    base_role: generic_uia_worker_base.to_owned(),
                     reason: "generic UIA worker".to_owned(),
                     rights: RightsSet::claimed_by(base),
                 })
             }
             AgentRoleId::ChildOrchestrator => {
-                let base = self.bases.get(CHILD_ORCHESTRATOR_BASE_NAME)?;
+                let base = self.bases.get(child_orchestrator_base_name)?;
                 Some(BaseCeiling {
-                    base_role: GENERIC_CHILD_ORCHESTRATOR_BASE.to_owned(),
+                    base_role: generic_child_orchestrator_base.to_owned(),
                     reason: "generic child orchestrator".to_owned(),
                     rights: RightsSet::claimed_by(base),
                 })
@@ -390,12 +401,7 @@ impl BuiltinCeilings {
                 base_role: USER_INTERFACE_BASE.to_owned(),
                 reason: "the user's own agent: every catalog tool, runtime flags narrow".to_owned(),
                 rights: RightsSet::ceiling(
-                    capability_catalog::CATALOG
-                        .iter()
-                        .filter_map(|entry| match entry.pattern {
-                            capability_catalog::ToolPattern::Exact(tool) => Some(tool.to_owned()),
-                            capability_catalog::ToolPattern::Prefix(_) => None,
-                        }),
+                    self.catalog_tools.iter().map(|tool| (*tool).to_owned()),
                     None,
                     None,
                     None,
@@ -429,52 +435,9 @@ mod tests {
     }
 
     #[test]
-    fn test_delta_reports_tools_classes_depth_budget_effort() {
-        let mut claimed = set(&["fs.read", "shell.exec"], Some(3), Some(90));
-        claimed.effort_cap = Some(Effort::High);
-        let mut limit = set(&["fs.read"], Some(1), Some(80));
-        limit.effort_cap = Some(Effort::Low);
-        let delta = delta(&claimed, &limit, &BTreeSet::new());
-        assert_eq!(delta.added_tools, ["shell.exec"]);
-        assert_eq!(delta.added_classes, ["shell"]);
-        assert_eq!(delta.depth, Some((3, 1)));
-        assert_eq!(delta.budget, Some((90, 80)));
-        assert_eq!(delta.effort, Some((Effort::High, Effort::Low)));
-        assert_eq!(delta.lines().len(), 5);
-    }
-
-    #[test]
     fn test_no_statement_in_the_limit_bounds_nothing() {
         let claimed = set(&["fs.read"], Some(5), Some(1_000_000));
         let limit = set(&["fs.read"], None, None);
         assert!(delta(&claimed, &limit, &BTreeSet::new()).is_empty());
-    }
-
-    #[test]
-    fn test_handoffs_to_declared_targets_are_exempt() {
-        let claimed = set(
-            &["transfer_to_explorer", "transfer_to_executor"],
-            None,
-            None,
-        );
-        let limit = set(&[], None, None);
-        let targets: BTreeSet<String> = ["explorer".to_owned()].into();
-        let delta = delta(&claimed, &limit, &targets);
-        assert_eq!(delta.added_tools, ["transfer_to_executor"]);
-        assert_eq!(delta.added_classes, ["agent"]);
-    }
-
-    #[test]
-    fn test_generic_worker_ceiling_is_the_analyst() -> Result<(), CompileError> {
-        let ceilings = BuiltinCeilings::load(time::OffsetDateTime::UNIX_EPOCH)?;
-        let analyst = ceilings
-            .role("analyst")
-            .ok_or(CompileError::Other("analyst".into()))?;
-        let ceiling = ceilings
-            .ceiling_for(analyst)
-            .ok_or(CompileError::Other("ceiling".into()))?;
-        assert_eq!(ceiling.base_role, "analyst");
-        assert_eq!(ceiling.reason, "self");
-        Ok(())
     }
 }

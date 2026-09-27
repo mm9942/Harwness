@@ -11,6 +11,14 @@
 //!   ([`OpContext::with_cancel_token`]/[`OpContext::cancel_token`]), damit
 //!   Operationen (z. B. ein wartendes Kind-Spawn in `harw-core-bridge`) einen
 //!   Turn-Abbruch beobachten können, ohne selbst von `harw-core` abzuhängen.
+//! - Trägt optional den **Mandanten-Scope** des Aufrufers
+//!   ([`OpContext::with_tenant`]/[`OpContext::tenant`]) und eine
+//!   nicht-autoritative [`SecurityContextSummary`]
+//!   ([`OpContext::with_security_context_summary`]) — beide setzt
+//!   ausschließlich der serverseitige Kontextbau (z. B. `harw-web` aus der
+//!   aufgelösten Peer-Identität, Masterplan v2 §14/§15, H12), nie der
+//!   Request-Rumpf. Operationen, die mandantengebundene Daten auflisten,
+//!   filtern mit [`OpContext::tenant_admits`] bzw. [`tenant_admits`].
 //! - Erzeugt selbst KEINE Authority — Authority stammt ausschließlich vom Executor.
 //!
 //! # Schlüsseltypen
@@ -28,7 +36,7 @@
 //! # Beispiel
 //! ```rust,no_run
 //! use harw_operations::context::{OpContext, ServiceMap};
-//! use harw_types::{SessionId, TurnId};
+//! use harw_types::{SecurityContextSummary, SessionId, TenantId, TurnId};
 //!
 //! // Kontext wird vom Executor erzeugt, nicht von der Operation selbst.
 //! let _ = OpContext::new; // Konstruktor existiert; Sandbox erfordert echte Verzeichnisse.
@@ -39,7 +47,7 @@ use std::collections::HashMap;
 
 use harw_authority::SandboxSpec;
 use harw_types::cancel::CancelToken;
-use harw_types::{SessionId, TurnId};
+use harw_types::{SecurityContextSummary, SessionId, TenantId, TurnId};
 
 // ── ServiceMap ────────────────────────────────────────────────────────────────
 
@@ -186,6 +194,8 @@ pub struct OpContext {
     sandbox: SandboxSpec,
     services: ServiceMap,
     cancel: Option<CancelToken>,
+    tenant: Option<TenantId>,
+    security_context: Option<SecurityContextSummary>,
 }
 
 impl OpContext {
@@ -222,7 +232,70 @@ impl OpContext {
             sandbox,
             services,
             cancel: None,
+            tenant: None,
+            security_context: None,
         }
+    }
+
+    /// Bindet diesen Kontext an einen Mandanten (Builder, H12).
+    ///
+    /// # Beschreibung
+    /// Der Mandant stammt ausschließlich aus serverseitig vertrauter
+    /// Identitätsauflösung (in `harw-web`: `ResolvedPeer::tenant`, aus
+    /// `SO_PEERCRED` + Konfiguration bzw. einem vom SecurityHub bestätigten
+    /// Kontext) — **nie** aus `OpInput` oder HTTP-Rumpf/-Headern. Ohne
+    /// diesen Aufruf bleibt [`Self::tenant`] `None` (Einzelnutzer-Betrieb,
+    /// bisheriges Verhalten).
+    ///
+    /// # Argumente
+    /// - `tenant` (`TenantId`): der aufgelöste Mandant des Aufrufers.
+    ///
+    /// # Rückgabe
+    /// `Self` mit `tenant() == Some(&tenant)`.
+    #[must_use]
+    pub fn with_tenant(mut self, tenant: TenantId) -> Self {
+        self.tenant = Some(tenant);
+        self
+    }
+
+    /// Hängt die nicht-autoritative Zusammenfassung des vom SecurityHub
+    /// bestätigten Sicherheitskontexts an (Builder, H12).
+    ///
+    /// # Beschreibung
+    /// Nur zur Anzeige, Protokollierung und Korrelation. Eine Operation darf
+    /// daraus **keine** Autorisierungsentscheidung ableiten (siehe
+    /// `harw_types::security`-Moduldoku); der verbindliche Mandanten-Scope
+    /// ist [`Self::tenant`].
+    #[must_use]
+    pub fn with_security_context_summary(mut self, summary: SecurityContextSummary) -> Self {
+        self.security_context = Some(summary);
+        self
+    }
+
+    /// Der Mandanten-Scope des Aufrufers, falls gesetzt.
+    ///
+    /// # Rückgabe
+    /// - `Some(&TenantId)`: der Aufrufer ist an diesen Mandanten gebunden;
+    ///   mandantengebundene Listen müssen darauf filtern
+    ///   ([`Self::tenant_admits`]).
+    /// - `None`: kein Mandanten-Scope (Einzelnutzer-Betrieb).
+    #[must_use]
+    pub fn tenant(&self) -> Option<&TenantId> {
+        self.tenant.as_ref()
+    }
+
+    /// Die angehängte [`SecurityContextSummary`], falls vorhanden
+    /// (nicht-autoritativ, siehe [`Self::with_security_context_summary`]).
+    #[must_use]
+    pub fn security_context_summary(&self) -> Option<&SecurityContextSummary> {
+        self.security_context.as_ref()
+    }
+
+    /// Darf der Aufrufer dieses Kontexts ein Element mit Mandant
+    /// `item_tenant` sehen? Siehe [`tenant_admits`] für die Regel.
+    #[must_use]
+    pub fn tenant_admits(&self, item_tenant: Option<&TenantId>) -> bool {
+        tenant_admits(self.tenant(), item_tenant)
     }
 
     /// Hängt den [`CancelToken`] des laufenden Turns an diesen Kontext (Builder).
@@ -315,4 +388,61 @@ impl OpContext {
     // Hinweis: `managed_spawner()` und `state_store()` sind in Strang 3 in das
     // `harw-core-bridge`-Crate ausgelagert (Extension-Trait `OpContextCoreExt`),
     // damit `harw-operations` core-frei bleibt.
+}
+
+/// Die eine Filterregel für mandantengebundene Listen (H12, Masterplan v2 §15).
+///
+/// # Beschreibung
+/// - Aufrufer **ohne** Mandanten-Scope (`scope == None`, Einzelnutzer-Betrieb)
+///   sieht alles — das bisherige Verhalten bleibt unverändert.
+/// - Aufrufer **mit** Mandanten-Scope sieht nur Elemente genau seines
+///   Mandanten. Elemente ohne Mandant (Altbestand) sind für ihn
+///   **unsichtbar** (fail-closed): „gehört niemandem" ist nicht „gehört mir".
+///
+/// # Beispiel
+/// ```rust
+/// use harw_operations::context::tenant_admits;
+/// use harw_types::TenantId;
+///
+/// let a = TenantId::from_str("tenant-a");
+/// let b = TenantId::from_str("tenant-b");
+/// assert!(tenant_admits(None, Some(&a)));
+/// assert!(tenant_admits(Some(&a), Some(&a)));
+/// assert!(!tenant_admits(Some(&a), Some(&b)));
+/// assert!(!tenant_admits(Some(&a), None));
+/// ```
+#[must_use]
+pub fn tenant_admits(scope: Option<&TenantId>, item_tenant: Option<&TenantId>) -> bool {
+    match scope {
+        None => true,
+        Some(scope) => item_tenant == Some(scope),
+    }
+}
+
+#[cfg(test)]
+mod tenant_scope_tests {
+    use super::tenant_admits;
+    use harw_types::TenantId;
+
+    #[test]
+    fn test_unscoped_caller_sees_every_item() {
+        let a = TenantId::from_str("tenant-a");
+        assert!(tenant_admits(None, Some(&a)));
+        assert!(tenant_admits(None, None));
+    }
+
+    #[test]
+    fn test_scoped_caller_sees_only_own_tenant() {
+        let a = TenantId::from_str("tenant-a");
+        let b = TenantId::from_str("tenant-b");
+        assert!(tenant_admits(Some(&a), Some(&a)));
+        assert!(!tenant_admits(Some(&a), Some(&b)));
+        assert!(!tenant_admits(Some(&b), Some(&a)));
+    }
+
+    #[test]
+    fn test_scoped_caller_does_not_see_untenanted_items() {
+        let a = TenantId::from_str("tenant-a");
+        assert!(!tenant_admits(Some(&a), None));
+    }
 }

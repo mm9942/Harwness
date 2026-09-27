@@ -69,12 +69,14 @@
 use harw_macros::operation;
 use harw_operations::require_service;
 use harw_operations::{OpContext, OpError, OpOutput};
+use harw_plan::PlanStore;
 use harw_plan::error::PlanError;
 use harw_plan::goal::{
     Constraint, ConstraintKind, Goal, GoalAction, GoalId, GoalPatch, GoalReport, GoalStatus,
     GoalStore, Invariant, evaluate_goal,
 };
 use harw_plan::ids::RevisionId;
+use harw_plan::tenant_scope::{FOREIGN_GOAL_SET_ACTION, ScopedGoalStore, ScopedPlanStore};
 use harw_plan::types::{Criterion, Plan, VerificationStep};
 use harw_plan_bridge::OpContextPlanExt;
 use time::OffsetDateTime;
@@ -350,7 +352,10 @@ async fn goal(ctx: &OpContext, call: GoalCall) -> Result<OpOutput, OpError> {
     }
 
     let store_handle = require_service!(ctx.goal_store(), "Goal-Store");
-    let store: &dyn GoalStore = store_handle.as_ref();
+    // H12: jeder Zugriff sieht nur Ziele des eigenen Mandanten-Scopes; ein
+    // fremdes Ziel verhält sich wie „kein Ziel“ (siehe `harw_plan::tenant_scope`).
+    let scoped = ScopedGoalStore::new(store_handle.as_ref(), ctx.tenant().cloned());
+    let store: &dyn GoalStore = &scoped;
     let actor = crate::plan::require_actor(ctx, call.surface)?;
 
     let text = match call.args {
@@ -369,7 +374,7 @@ async fn goal(ctx: &OpContext, call: GoalCall) -> Result<OpOutput, OpError> {
             let event = apply(
                 store,
                 GoalAction::Set {
-                    goal: new_goal(&id, statement),
+                    goal: new_goal(&id, statement, ctx),
                 },
                 &actor,
             )?;
@@ -659,6 +664,16 @@ fn map_goal_error(error: PlanError) -> OpError {
             "es existiert noch kein Ziel; lege es mit `goal set <goal-id> <statement…>` an"
                 .to_owned(),
         ),
+        // H12: der Store hält ein Ziel außerhalb des eigenen Mandanten-Scopes;
+        // `goal set` würde es ersetzen. Die Meldung nennt weder Ziel noch
+        // Mandant.
+        PlanError::ActorNotAuthorized { action, .. } if action == FOREIGN_GOAL_SET_ACTION => {
+            OpError::NotAvailable(
+                "`goal set` ist in diesem Kontext nicht möglich: der Goal-Store ist durch ein \
+                 Ziel außerhalb deines Mandanten-Scopes belegt"
+                    .to_owned(),
+            )
+        }
         PlanError::ActorNotAuthorized { action, actor } => OpError::NotAvailable(format!(
             "Akteur '{actor}' darf '{action}' nicht ausführen: nur ein menschlicher Akteur darf \
              ein Ziel für erreicht oder für aufgegeben erklären"
@@ -704,8 +719,10 @@ fn parse_constraint_kind(raw: &str) -> Result<ConstraintKind, OpError> {
 /// `Draft → Achieved`, und diese Operation bietet bewusst kein `activate`
 /// an — ein mit `goal set` erklärtes Ziel wird verfolgt, sonst hätte man es
 /// nicht gesetzt. `revision`, `created_at` und `updated_at` sind Platzhalter:
-/// sie gehören dem Store.
-fn new_goal(id: &str, statement: String) -> Goal {
+/// sie gehören dem Store. `tenant` stammt aus dem serverseitigen
+/// Mandanten-Scope des Aufrufers (`OpContext::tenant`, H12), nie aus den
+/// Argumenten.
+fn new_goal(id: &str, statement: String, ctx: &OpContext) -> Goal {
     Goal {
         id: GoalId::new(id),
         revision: 0,
@@ -721,6 +738,7 @@ fn new_goal(id: &str, statement: String) -> Goal {
         evidence: Vec::new(),
         created_at: OffsetDateTime::UNIX_EPOCH,
         updated_at: OffsetDateTime::UNIX_EPOCH,
+        tenant: ctx.tenant().cloned(),
     }
 }
 
@@ -766,12 +784,14 @@ fn new_invariant(existing: usize, statement: &str) -> Invariant {
 /// `(RevisionId, Hinweistext)`; der Hinweistext ist leer, wenn die Revision aus
 /// dem Store stammt.
 fn plan_revision_for(ctx: &OpContext, plan_id: &str) -> (RevisionId, String) {
-    let Some(store) = ctx.plan_store() else {
+    let Some(handle) = ctx.plan_store() else {
         return (
             RevisionId::new(0),
             " Hinweis: kein Plan-Store verfügbar — Revision 0 gebunden.".to_owned(),
         );
     };
+    // H12: ein fremder aktiver Plan zählt wie „kein Plan“.
+    let store = ScopedPlanStore::new(handle.as_ref(), ctx.tenant().cloned());
     match store.current() {
         Ok(plan) if plan.id.as_str() == plan_id => (plan.revision, String::new()),
         Ok(plan) => (
@@ -846,9 +866,14 @@ fn coverage_line(report: &GoalReport, total: usize) -> String {
     )
 }
 
-/// Liest den aktuellen Plan-Snapshot, falls einer verfügbar ist.
+/// Liest den aktuellen Plan-Snapshot, falls einer verfügbar und im
+/// Mandanten-Scope des Aufrufers sichtbar ist (H12).
 fn current_plan(ctx: &OpContext) -> Option<Plan> {
-    ctx.plan_store().and_then(|store| store.current().ok())
+    ctx.plan_store().and_then(|store| {
+        ScopedPlanStore::new(store.as_ref(), ctx.tenant().cloned())
+            .current()
+            .ok()
+    })
 }
 
 /// `goal show` — Statement, Kriterien, Invarianten, Constraints, Status, Coverage.
@@ -936,13 +961,15 @@ fn render_show(store: &dyn GoalStore, ctx: &OpContext) -> Result<String, OpError
 /// - [`OpError::NotAvailable`]: kein Plan-Store konfiguriert.
 fn render_check(store: &dyn GoalStore, ctx: &OpContext) -> Result<String, OpError> {
     let goal = current(store)?;
-    let plan_store = ctx.plan_store().ok_or_else(|| {
+    let plan_handle = ctx.plan_store().ok_or_else(|| {
         OpError::NotAvailable(
             "kein Plan-Store in diesem Kontext konfiguriert; ohne Plan gibt es keine Evidenz, \
              gegen die ein Ziel bewertet werden könnte"
                 .to_owned(),
         )
     })?;
+    // H12: ein fremder aktiver Plan meldet sich wie „noch kein Plan“.
+    let plan_store = ScopedPlanStore::new(plan_handle.as_ref(), ctx.tenant().cloned());
     let plan = plan_store.current().map_err(|error| match error {
         PlanError::PlanNotFound => OpError::InvalidArguments(
             "es existiert noch kein Plan; lege ihn mit `plan create <plan-id> <ziel…>` an"
@@ -1526,14 +1553,15 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn the_second_boundary_rejects_a_model_actor_inside_harw_plan() {
+    async fn the_second_boundary_rejects_a_model_actor_inside_harw_plan() -> TestResult {
         // Defense in depth: dieselbe Aktion direkt am Store, mit einem
         // `model:`-Akteur — die Flächen-Grenze dieses Moduls wird bewusst
         // umgangen, `validate_goal_action` muss trotzdem ablehnen.
         let store = InMemoryGoalStore::default();
+        let (ctx, _root) = context_with(ServiceMap::new())?;
         let seeded = store.apply(
             GoalAction::Set {
-                goal: super::new_goal("g-1", "Zweite Grenze".to_owned()),
+                goal: super::new_goal("g-1", "Zweite Grenze".to_owned(), &ctx),
             },
             "human:tester",
         );
@@ -1557,6 +1585,7 @@ mod tests {
             matches!(result, Err(PlanError::ActorNotAuthorized { .. })),
             "harw-plan muss den model:-Akteur ablehnen, war: {result:?}"
         );
+        Ok(())
     }
 
     // ── Bewertung ────────────────────────────────────────────────────────────
@@ -1807,6 +1836,170 @@ mod tests {
                 )));
             }
         }
+        Ok(())
+    }
+
+    // ── Mandanten-Scope (H12) ────────────────────────────────────────────────
+
+    /// Kontext über **gegebenen** Stores, optional an einen Mandanten gebunden.
+    fn tenant_context(
+        goals: &Arc<dyn GoalStore>,
+        plans: &Arc<dyn PlanStore>,
+        tenant: Option<&str>,
+    ) -> TestResult<(OpContext, std::path::PathBuf)> {
+        let mut services = ServiceMap::new();
+        services.insert(Arc::clone(goals));
+        services.insert(Arc::clone(plans));
+        services.insert(PlanToolConfig::enabled_defaults());
+        let (ctx, root) = context_with(services)?;
+        Ok(match tenant {
+            Some(name) => (ctx.with_tenant(TenantId::from_str(name)), root),
+            None => (ctx, root),
+        })
+    }
+
+    fn fresh_stores() -> (Arc<dyn GoalStore>, Arc<dyn PlanStore>) {
+        (
+            Arc::new(InMemoryGoalStore::default()),
+            Arc::new(InMemoryPlanStore::new()),
+        )
+    }
+
+    #[tokio::test]
+    async fn goal_set_records_the_callers_tenant() -> TestResult {
+        let (goals, plans) = fresh_stores();
+        let (scoped, scoped_root) = tenant_context(&goals, &plans, Some("tenant-a"))?;
+        let set = run_command(&scoped, &["set", "g-a", "Ziel", "von", "A"]).await;
+        let tenant = goals.current().map(|goal| goal.tenant);
+
+        let (other_goals, other_plans) = fresh_stores();
+        let (unscoped, unscoped_root) = tenant_context(&other_goals, &other_plans, None)?;
+        let unscoped_set = run_command(&unscoped, &["set", "g-free", "Ziel"]).await;
+        let untenanted = other_goals.current().map(|goal| goal.tenant);
+        cleanup(scoped_root);
+        cleanup(unscoped_root);
+
+        set.map_err(ctx("gescoptes goal set"))?;
+        unscoped_set.map_err(ctx("ungescoptes goal set"))?;
+        assert_eq!(
+            tenant.map_err(ctx("Ziel lesen"))?,
+            Some(TenantId::from_str("tenant-a"))
+        );
+        assert_eq!(untenanted.map_err(ctx("Ziel lesen"))?, None);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn foreign_goal_fails_exactly_like_a_missing_goal() -> TestResult {
+        let (goals, plans) = fresh_stores();
+        let (owner, owner_root) = tenant_context(&goals, &plans, Some("tenant-a"))?;
+        run_command(&owner, &["set", "g-a", "Ziel", "von", "A"])
+            .await
+            .map_err(ctx("goal set als tenant-a"))?;
+        run_command(&owner, &["criteria", "Tests", "grün"])
+            .await
+            .map_err(ctx("Kriterium als tenant-a"))?;
+        let before = goals.current().map_err(ctx("Ziel vorher"))?;
+
+        let (foreign, foreign_root) = tenant_context(&goals, &plans, Some("tenant-b"))?;
+        let (empty_goals, empty_plans) = fresh_stores();
+        let (missing, missing_root) = tenant_context(&empty_goals, &empty_plans, Some("tenant-b"))?;
+
+        let commands: [&[&str]; 10] = [
+            &["show"],
+            &["check"],
+            &["refine", "Neu"],
+            &["criteria", "mehr"],
+            &["invariant", "stabil"],
+            &["constraint", "budget", "klein"],
+            &["question", "wer?"],
+            &["bind", "p-1"],
+            &["achieve", "fertig"],
+            &["abandon", "egal"],
+        ];
+        let mut mismatches = Vec::new();
+        for command in commands {
+            let seen = run_command(&foreign, command).await;
+            let reference = run_command(&missing, command).await;
+            if seen.is_ok() || format!("{seen:?}") != format!("{reference:?}") {
+                mismatches.push(format!("{command:?}: {seen:?} ≠ {reference:?}"));
+            }
+        }
+        let after = goals.current().map_err(ctx("Ziel nachher"));
+        cleanup(owner_root);
+        cleanup(foreign_root);
+        cleanup(missing_root);
+
+        assert!(mismatches.is_empty(), "{mismatches:#?}");
+        let after = after?;
+        assert_eq!(after.revision, before.revision, "fremdes Ziel unverändert");
+        assert_eq!(after.statement, before.statement);
+        assert_eq!(after.status, GoalStatus::Active);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn goal_set_never_replaces_a_foreign_goal() -> TestResult {
+        let (goals, plans) = fresh_stores();
+        let (owner, owner_root) = tenant_context(&goals, &plans, Some("tenant-a"))?;
+        run_command(&owner, &["set", "g-a", "Ziel", "von", "A"])
+            .await
+            .map_err(ctx("goal set als tenant-a"))?;
+        let (foreign, foreign_root) = tenant_context(&goals, &plans, Some("tenant-b"))?;
+        let result = run_command(&foreign, &["set", "g-b", "Ziel", "von", "B"]).await;
+        let kept = goals.current();
+        cleanup(owner_root);
+        cleanup(foreign_root);
+
+        match result {
+            Err(OpError::NotAvailable(message)) => {
+                assert!(message.contains("Mandanten-Scope"), "{message}");
+                assert!(
+                    !message.contains("tenant-a"),
+                    "nennt den Mandanten: {message}"
+                );
+                assert!(!message.contains("g-a"), "nennt das Ziel: {message}");
+            }
+            other => {
+                return Err(TestError::Unexpected(format!(
+                    "erwartet NotAvailable, war: {other:?}"
+                )));
+            }
+        }
+        let kept = kept.map_err(ctx("Ziel lesen"))?;
+        assert_eq!(kept.id.as_str(), "g-a");
+        assert_eq!(kept.tenant, Some(TenantId::from_str("tenant-a")));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn unscoped_caller_sees_a_tenant_goal_and_scoped_caller_not_a_legacy_one() -> TestResult {
+        let (goals, plans) = fresh_stores();
+        let (owner, owner_root) = tenant_context(&goals, &plans, Some("tenant-a"))?;
+        run_command(&owner, &["set", "g-a", "Ziel", "von", "A"])
+            .await
+            .map_err(ctx("goal set als tenant-a"))?;
+        let (unscoped, unscoped_root) = tenant_context(&goals, &plans, None)?;
+        let shown = run_command(&unscoped, &["show"]).await;
+
+        let (legacy_goals, legacy_plans) = fresh_stores();
+        let (legacy_owner, legacy_root) = tenant_context(&legacy_goals, &legacy_plans, None)?;
+        run_command(&legacy_owner, &["set", "g-legacy", "Altziel"])
+            .await
+            .map_err(ctx("ungescoptes goal set"))?;
+        let (scoped, scoped_root) = tenant_context(&legacy_goals, &legacy_plans, Some("tenant-a"))?;
+        let hidden = run_command(&scoped, &["show"]).await;
+        cleanup(owner_root);
+        cleanup(unscoped_root);
+        cleanup(legacy_root);
+        cleanup(scoped_root);
+
+        let shown = shown.map_err(ctx("ungescoptes goal show"))?;
+        assert!(shown.contains("g-a"), "{shown}");
+        assert!(
+            matches!(hidden, Err(OpError::InvalidArguments(ref message)) if message.contains("goal set")),
+            "{hidden:?}"
+        );
         Ok(())
     }
 }

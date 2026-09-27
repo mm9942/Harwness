@@ -219,11 +219,29 @@ pub enum Command {
         #[arg(long, value_name = "DIR", value_hint = ValueHint::DirPath)]
         config_dir: Option<PathBuf>,
     },
-    /// Startet die lokale Web-Oberfläche auf einem Unix-Socket.
+    /// Startet die lokale Web-Oberfläche (Kontrollebene) auf einem Unix-Socket.
+    ///
+    /// Ohne Flag bindet sie `<home>/web.sock` (Entwicklungs-Rückfall). Mit
+    /// `--system` bindet sie `/run/harw/infra/control.sock` (Modus 0660) und
+    /// fällt nie auf das Home zurück; `--systemd-socket` übernimmt den von
+    /// systemd übergebenen Socket.
     Web {
-        /// Socket-Pfad überschreiben (Vorgabe: `<home>/web.sock`).
+        /// Socket-Pfad überschreiben (Vorgabe: `<home>/web.sock`, mit
+        /// `--system` `/run/harw/infra/control.sock`).
         #[arg(long, value_name = "PATH", value_hint = ValueHint::FilePath)]
         socket: Option<PathBuf>,
+        /// Systembetrieb: `/run/harw/infra/control.sock`, Modus 0660, kein
+        /// Rückfall auf `<home>/web.sock`.
+        #[arg(long)]
+        system: bool,
+        /// Den von systemd übergebenen Socket übernehmen (LISTEN_PID/LISTEN_FDS=1);
+        /// impliziert `--system`, bindet selbst nichts.
+        #[arg(long, conflicts_with_all = ["socket", "socket_group"])]
+        systemd_socket: bool,
+        /// Gruppe (Name oder GID) des selbst gebundenen System-Sockets; ohne
+        /// Angabe bleibt die Gruppe unverändert.
+        #[arg(long, value_name = "GROUP", requires = "system")]
+        socket_group: Option<String>,
     },
     /// Verwaltet den Hintergrunddienst (systemd/launchd).
     Service {
@@ -260,6 +278,15 @@ pub enum Command {
         /// Nur prüfen und Stand anzeigen, nichts installieren.
         #[arg(long, hide = true)]
         check: bool,
+    },
+    /// Zeigt die eingebetteten systemd-Systemunits aus `deploy/`.
+    ///
+    /// Die DoD-Units installiert `make -C dod install` aus derselben Quelle;
+    /// dieser Befehl installiert nichts, er gibt nur aus.
+    Install {
+        /// Eingebettete systemd-Unit ausgeben (z. B. `harw-warden.socket`); ohne UNIT alle.
+        #[arg(long, value_name = "UNIT", num_args = 0..=1, value_hint = ValueHint::Other)]
+        print_systemd: Option<Option<String>>,
     },
     /// Deinstalliert Harwness ganz oder teilweise.
     Uninstall {

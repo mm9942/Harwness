@@ -83,6 +83,14 @@ pub enum CommandDomain {
     CatalogConfig,
     Knowledge,
     Channels,
+    /// Identitäten, Geräte und Schlüssel-Metadaten (`OperationDomain::Identity`).
+    Identity,
+    /// Netzwerk-Topologie: Knoten und Routen (`OperationDomain::Network`).
+    Network,
+    /// Sicherheitslage: Incidents, Policies, Containment (`OperationDomain::Security`).
+    Security,
+    /// Kryptographische Steuerung, z. B. Schlüsselrotation (`OperationDomain::Crypto`).
+    Crypto,
     Misc,
 }
 

@@ -1,0 +1,33 @@
+[package]
+publish.workspace = true
+name = "harw-job-executor-bwrap"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "Bubblewrap job executor backend (PL-40): translates a generic JobSpec + SandboxPolicy into a bwrap launch through harw-sandbox, with a predicted per-dimension SandboxReport. bwrap stays an external executable; no C, no unsafe."
+
+# The whole implementation is Linux-only; on every other target the crate
+# is empty and pulls in nothing.
+[target.'cfg(target_os = "linux")'.dependencies]
+# JobSpec, SandboxReport, EnforcementState (platform-neutral model).
+harw-job-core = { path = "../harw-job-core" }
+# SandboxPolicy / FilesystemPolicy / NetworkPolicy / CapabilityPolicy. Only
+# the always-available policy model is used (no Landlock feature needed);
+# default features are kept so this edge adds no untested feature set.
+harw-job-linux = { path = "../harw-job-linux" }
+# The existing Bubblewrap mechanism: BwrapLauncher (discover/plan),
+# NetworkMode, RelaySpec. bwrap itself stays an external executable.
+harw-sandbox = { path = "../harw-sandbox" }
+# BwrapLauncher::plan takes a harw_authority::SandboxSpec (workspace binding
+# + permission set); harw-sandbox deliberately does not re-export it.
+harw-authority = { path = "../harw-authority" }
+# TenantId / WorkspaceId for the single-workspace registry behind the spec.
+harw-types = { path = "../harw-types" }
+
+[target.'cfg(target_os = "linux")'.dev-dependencies]
+tempfile = { workspace = true }
+
+[lints]
+workspace = true

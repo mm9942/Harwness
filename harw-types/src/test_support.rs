@@ -7,6 +7,7 @@ use std::fmt;
 use crate::error::{ImpactAssessmentError, InvalidId};
 use crate::impact::ParseImpactSeverityError;
 use crate::reasoning::ParseReasoningEffortError;
+use crate::security::SecurityContextError;
 
 /// Fehler eines Tests; jeder Fehlschlag wird als `Err` zurückgegeben statt zu paniken.
 pub(crate) enum TestError {
@@ -29,6 +30,8 @@ pub(crate) enum TestError {
     Effort(ParseReasoningEffortError),
     /// Eine [`crate::impact::ImpactAssessment`]-Invariante wurde verletzt.
     Impact(ImpactAssessmentError),
+    /// Das Ausstellen eines [`crate::security::SecurityContext`] ist fehlgeschlagen.
+    Security(SecurityContextError),
 }
 
 /// Kurzform für `Result<T, TestError>` in Tests dieses Crates.
@@ -45,6 +48,7 @@ impl fmt::Display for TestError {
             Self::Severity(source) => write!(f, "Severity-Parse-Fehler: {source}"),
             Self::Effort(source) => write!(f, "Effort-Parse-Fehler: {source}"),
             Self::Impact(source) => write!(f, "Impact-Assessment-Fehler: {source}"),
+            Self::Security(source) => write!(f, "SecurityContext-Fehler: {source}"),
         }
     }
 }
@@ -63,6 +67,7 @@ impl std::error::Error for TestError {
             Self::Severity(source) => Some(source),
             Self::Effort(source) => Some(source),
             Self::Impact(source) => Some(source),
+            Self::Security(source) => Some(source),
             Self::Missing(_) | Self::Unexpected(_) | Self::Context { .. } => None,
         }
     }
@@ -95,6 +100,12 @@ impl From<ParseReasoningEffortError> for TestError {
 impl From<ImpactAssessmentError> for TestError {
     fn from(source: ImpactAssessmentError) -> Self {
         Self::Impact(source)
+    }
+}
+
+impl From<SecurityContextError> for TestError {
+    fn from(source: SecurityContextError) -> Self {
+        Self::Security(source)
     }
 }
 

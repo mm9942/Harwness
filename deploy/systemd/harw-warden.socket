@@ -1,42 +1,35 @@
-# harw-warden.socket -- Knoten AW7-03.
+# harw-warden.socket -- activation socket of harw-warden.service.
 #
-# Erzeugt genau EINEN Aktivierungs-Deskriptor -- harw-warden/src/systemd.rs
-# ::acquire_listen_socket() verlangt das hart (WardenBinError::
-# UnexpectedListenFdCount, wenn LISTEN_FDS != 1 oder sd_listen_fds::get()
-# nicht genau einen Eintrag liefert). Diese Unit traegt deshalb genau EINE
-# Listen*=-Zeile -- eine zweite (z. B. ein zusaetzlicher Diagnose-Socket)
-# waere fuer dieses Binary ein harter Startfehler, kein harmloser Zuwachs.
+# Canonical source: deploy/systemd/ (Crypto Masterplan v2 §22, H10). Rendered
+# by dod/scripts/install.sh (SYSCONFDIR).
+#
+# Exactly ONE Listen*= line: harw-warden/src/systemd.rs::acquire_listen_socket()
+# fails hard unless LISTEN_FDS == 1. A second socket would be a start error,
+# not a harmless addition.
+#
+# Shipped DISABLED: no [Install] section and the same opt-in guard as the
+# service. `make -C dod enable-warden` starts it explicitly.
 
 [Unit]
-Description=harw-warden Aktivierungssocket (SOCK_SEQPACKET, genau ein Deskriptor)
+Description=HARW DoD Warden activation socket (SOCK_SEQPACKET, disabled by default)
 Documentation=man:harw-warden(1)
+ConditionPathExists=@SYSCONFDIR@/warden.enable
 
 [Socket]
 ListenSequentialPacket=/run/harw/warden.sock
-# ListenSequentialPacket=, nicht ListenStream=: harw-warden erwartet einen
-# SOCK_SEQPACKET-Socket (siehe harw-warden::ipc-Moduldoku, "ein
-# SOCK_SEQPACKET-Unix-Socket mit SO_PEERCRED") -- ListenStream=/
-# ListenDatagram= erzeugten einen anderen Socket-Typ, den das Binary beim
-# ersten accept()/recv() nicht wie erwartet lesen koennte.
+# SOCK_SEQPACKET, not a stream: harw-warden::ipc reads message-bounded
+# frames and authenticates every peer via SO_PEERCRED.
 SocketUser=harw-warden
-SocketGroup=harw-warden
+SocketGroup=harw-warden-clients
 SocketMode=0660
-# Nur der Warden-Nutzer selbst und seine Gruppe duerfen sich verbinden --
-# SO_PEERCRED liest dennoch bei jeder Verbindung die tatsaechliche
-# Peer-Identitaet (siehe harw-warden::ipc-Moduldoku, "Warum SO_PEERCRED,
-# nicht ein Token im Rumpf"); dieser Dateimodus ist eine zusaetzliche,
-# grobere Vorfilterung auf Betriebssystemebene, kein Ersatz fuer die
-# eigentliche Pruefung im Binary.
+# Coarse OS-level pre-filter: only members of harw-warden-clients (empty by
+# default; the operator adds the escalation client) may connect. It does not
+# replace the SO_PEERCRED check in the binary. The probes are deliberately
+# NOT members -- they are push-only towards the sentinel.
+Service=harw-warden.service
 RemoveOnStop=yes
 Accept=no
-# Accept=no: systemd uebergibt den EINEN lauschenden Socket unveraendert an
-# den Dienstprozess (Type=simple, ein einziger LISTEN_FDS-Eintrag) --
-# harw-warden::ipc::serve_forever() ruft selbst wiederholt accept() in
-# einer Schleife auf. Accept=yes wuerde stattdessen fuer JEDE Verbindung
-# einen eigenen Dienstprozess mit einem eigenen, bereits akzeptierten
-# Deskriptor starten -- ein voellig anderes, mit acquire_listen_socket()
-# unvereinbares Modell (das erwartet den lauschenden Socket selbst, nicht
-# eine bereits angenommene Verbindung).
+# Accept=no: the one listening socket is handed to the single service
+# process, which runs its own accept() loop (harw-warden::ipc::serve_forever).
 
-[Install]
-WantedBy=sockets.target
+# No [Install] section: never enabled by install, enable, or the target.

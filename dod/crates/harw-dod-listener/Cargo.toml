@@ -1,6 +1,7 @@
 [package]
 publish = false
 name = "harw-dod-listener"
+description = "Listener socket sensor reporting ports with cgroup association"
 version.workspace = true
 edition.workspace = true
 license.workspace = true

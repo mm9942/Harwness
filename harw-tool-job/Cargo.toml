@@ -24,6 +24,14 @@ serde_json = "1"
 tokio = { version = "1", features = ["process", "time", "io-util", "rt", "macros", "sync"] }
 tracing = "0.1"
 
+# Linux process identity and control (Job-Runtime-Doc §2.1, §15, §25):
+# pidfd for our own children, `procfs`-based `LinuxRecoveryIdentity` for jobs
+# of earlier sessions. Replaces the former hand-written `/proc/<pid>/stat`
+# parser. `harw-job-core` only for `RunnerId`/`AttemptId` of that identity.
+[target.'cfg(target_os = "linux")'.dependencies]
+harw-job-core = { path = "../harw-job-core" }
+harw-job-linux = { path = "../harw-job-linux" }
+
 [dev-dependencies]
 tempfile = "3"
 tokio = { version = "1", features = ["process", "time", "io-util", "rt", "macros", "sync"] }

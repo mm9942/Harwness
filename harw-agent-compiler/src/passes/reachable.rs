@@ -1,9 +1,9 @@
 //! `ReachableTools`.
 
 use harw_agent_dsl::{Diagnostic, Diagnostics};
-use harw_registry_defaults::capability_catalog::{self, CATALOG, CORE_FEATURE};
 
 use super::Pass;
+use crate::builtins::builtin_defaults;
 use crate::codes;
 use crate::discovery::edit_distance;
 use crate::unit::{CompileUnit, ProviderUse};
@@ -18,22 +18,23 @@ pub struct ReachableTools;
 pub fn collect_providers(unit: &mut CompileUnit) -> Vec<String> {
     unit.providers.clear();
     unit.features.clear();
-    unit.features.insert(CORE_FEATURE.to_owned());
+    let defaults = builtin_defaults();
+    unit.features.insert(defaults.core_feature().to_owned());
     let mut unknown = Vec::new();
     for tool in unit.effective_tools() {
-        match capability_catalog::lookup(&tool) {
+        match defaults.capability(&tool) {
             Some(entry) => {
                 let provider = unit
                     .providers
-                    .entry(entry.provider.id.to_owned())
+                    .entry(entry.provider_id.to_owned())
                     .or_insert_with(|| ProviderUse {
-                        id: entry.provider.id.to_owned(),
-                        crate_name: entry.provider.crate_name.to_owned(),
-                        feature: entry.provider.feature.to_owned(),
+                        id: entry.provider_id.to_owned(),
+                        crate_name: entry.crate_name.to_owned(),
+                        feature: entry.feature.to_owned(),
                         tools: Vec::new(),
                     });
                 provider.tools.push(tool);
-                unit.features.insert(entry.feature().to_owned());
+                unit.features.insert(entry.feature.to_owned());
             }
             None => unknown.push(tool),
         }
@@ -49,9 +50,9 @@ impl Pass for ReachableTools {
     fn run(&self, unit: &mut CompileUnit) -> Diagnostics {
         let mut diagnostics = Diagnostics::new();
         for tool in collect_providers(unit) {
-            let mut close: Vec<(usize, String)> = CATALOG
-                .iter()
-                .map(|entry| entry.pattern.label())
+            let mut close: Vec<(usize, String)> = builtin_defaults()
+                .catalog_labels()
+                .into_iter()
                 .map(|label| (edit_distance(&label, &tool), label))
                 .filter(|(distance, _)| *distance <= 3)
                 .collect();

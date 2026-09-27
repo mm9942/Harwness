@@ -1,6 +1,7 @@
 [package]
 publish.workspace = true
 name = "harw-mcp-client"
+description = "Minimal MCP client for remote HTTP servers with JSON-RPC, Bearer auth, and SSE responses"
 version.workspace = true
 edition.workspace = true
 license.workspace = true

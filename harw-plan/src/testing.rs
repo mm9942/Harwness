@@ -210,6 +210,7 @@ pub fn base_plan() -> Plan {
         nodes: Vec::new(),
         created_at: fixture_time(),
         updated_at: fixture_time(),
+        tenant: None,
     }
 }
 

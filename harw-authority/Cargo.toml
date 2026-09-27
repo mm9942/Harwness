@@ -1,6 +1,7 @@
 [package]
 publish.workspace = true
 name = "harw-authority"
+description = "Authority primitives separating requests and snapshots from granted contexts in HARW"
 version.workspace = true
 edition.workspace = true
 license.workspace = true

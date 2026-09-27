@@ -58,9 +58,16 @@ harw-export-*
 docs/sessions/
 docs/archive/
 **/*transcript*
+# Source files that merely have "transcript" in their name (signing
+# transcripts in harw-dod-encrypt) are code, not session transcripts.
+!dod/crates/harw-dod-encrypt/src/transcript.rs
+!dod/crates/harw-dod-encrypt/tests/transcript.rs
 **/codex-session-*
 auth.toml
 *.key
 
 # Python bytecode (scripts/tests)
 __pycache__/
+
+# Obsidian vault state (docs/planning is used as a vault; notes are versioned, UI state is not)
+.obsidian/

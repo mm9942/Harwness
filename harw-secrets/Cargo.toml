@@ -1,6 +1,7 @@
 [package]
 publish.workspace = true
 name = "harw-secrets"
+description = "DEK/KEK envelope sealing plus append-only hash-chained ML-DSA-checkpointed audit log"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -10,10 +11,12 @@ rust-version.workspace = true
 [dependencies]
 aes-gcm-siv = "0.12.1"
 chacha20poly1305 = "0.11.0"
-# Exact pin: persisted secrets depend on crypt_guard's draft-pinned hybrid
-# seed-to-key derivation. Any upgrade must re-bless `tests/fixtures/kem_kat.txt`
-# and ship a migration plan (see `kek.rs` KAT tests).
-crypt_guard = "=3.0.2"
+# crypt_guard 3.1 from git (workspace dependency, commit pinned in
+# Cargo.lock). Persisted secrets depend on the draft-pinned hybrid
+# seed-to-key derivation: the KAT in `tests/fixtures/kem_kat.txt` and the
+# frozen 3.0.2 records in `tests/fixtures/records/` must keep passing
+# unchanged on every upgrade.
+crypt_guard = { workspace = true }
 getrandom = { version = "0.4.2", features = ["std"] }
 # F-006: symlinkfestes Öffnen (korrektes O_NOFOLLOW je Architektur, `harw-fsutil`).
 harw-fsutil = { path = "../harw-fsutil" }

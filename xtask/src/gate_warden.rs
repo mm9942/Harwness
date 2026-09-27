@@ -294,6 +294,13 @@ pub const WARDEN_ROOT: &str = "harw-warden";
 ///
 /// 46 + 5 + 2 + 1 = 54. Die Klinke gilt ab hier wieder: nicht steigen ohne
 /// neuen Absatz hier, jederzeit sinken.
+///
+/// **PL-60 (DoD im Wurzel-Workspace).** Seit `dod/` kein eigener Workspace
+/// mehr ist, misst dieses Gate gegen das Wurzel-`Cargo.lock`. Die
+/// Zusammenführung darf die Zahl **nicht** erhöhen: ein Anstieg hieße, dass
+/// die gemeinsame Auflösung dem Warden neue Knoten untergeschoben hat —
+/// siehe `docs/architecture/dod-workspace-merge-plan.md`, Abschnitt
+/// „TCB-Invarianten".
 pub const MAX_WARDEN_RUNTIME_DEPS: usize = 54;
 
 /// Crate-Namen, deren Anwesenheit als `[build-dependencies]`-Kante ein
@@ -876,14 +883,15 @@ fn resolve_workspace_edge(
 /// mit ihrer Wurzel.
 ///
 /// # Description
-/// Seit DoD ein eigener Workspace ist, erbt ein Crate unter `dod/` seine
-/// `workspace = true`-Angaben aus `dod/Cargo.toml`, ein Produkt-Crate wie
-/// `harw-types` dagegen aus der Wurzel-`Cargo.toml`. Beide Tabellen sind
-/// bewusst gleich gehalten, aber nicht identisch (die Wurzel kennt z. B.
-/// `include_dir`, DoD nicht). Eine einzige Tabelle für alle Kanten würde
-/// eine fehlende Angabe verdecken oder eine fremde Angabe unterschieben;
-/// deshalb wird je Elternteil die Tabelle des Workspace gewählt, in dessen
-/// Verzeichnis sein Manifest liegt ([`Self::for_crate`]).
+/// Entstanden, als DoD ein eigener Workspace war: ein Crate unter `dod/`
+/// erbte seine `workspace = true`-Angaben aus `dod/Cargo.toml`, ein
+/// Produkt-Crate aus der Wurzel-`Cargo.toml`. Seit PL-60 gibt es nur noch
+/// die Wurzel; [`load_and_compute`] lädt deshalb genau eine Tabelle. Die
+/// Struktur bleibt mehrwurzelig, weil sie korrekt bleibt, falls je wieder
+/// ein verschachtelter Workspace entsteht: je Elternteil wird die Tabelle
+/// des Workspace gewählt, in dessen Verzeichnis sein Manifest liegt
+/// ([`Self::for_crate`]) — eine einzige Tabelle für mehrere Workspaces
+/// würde eine fehlende Angabe verdecken oder eine fremde unterschieben.
 #[derive(Debug, Default)]
 struct WorkspaceDependencyTables {
     /// `(Workspace-Wurzel, Tabelle)`, die tiefste Wurzel zuerst, damit
@@ -2002,33 +2010,31 @@ fn evaluate_c_build(result: &ClosureResult) -> GateReport {
 /// Hülle einmalig — gemeinsame Grundlage für beide `run()`-Funktionen.
 ///
 /// # Description
-/// `harw-warden` ist ein Member des DoD-Workspace unter `dod/`. Maßgeblich
-/// für seine Hülle ist deshalb `dod/Cargo.lock` — das Lockfile, mit dem das
-/// Binary tatsächlich gebaut wird, und das auch die per `path` eingebundenen
-/// Produkt-Crates (`harw-types`, `harw-completions`, …) mit deren
-/// aufgelösten Kanten führt. Der Graph umfasst beide Workspaces
-/// ([`super::load_all_workspaces`]); `workspace = true` wird je Crate gegen
-/// die Tabelle seines eigenen Workspace aufgelöst
+/// `harw-warden` liegt unter `dod/crates/` und ist seit PL-60 Member des
+/// Wurzel-Workspace. Maßgeblich für seine Hülle ist deshalb das
+/// Wurzel-`Cargo.lock` — das einzige Lockfile, mit dem das Binary gebaut
+/// wird. Der Graph ist der Wurzel-Workspace
+/// ([`super::load_all_workspaces`]); `workspace = true` wird gegen die
+/// `[workspace.dependencies]` der Wurzel aufgelöst
 /// ([`WorkspaceDependencyTables`]).
 ///
 /// # Arguments
 /// - `repo_root` (`&Path`): Wurzel des Repositorys.
 ///
 /// # Errors
-/// Wenn einer der Workspace-Graphen, `dod/Cargo.lock` oder
+/// Wenn der Workspace-Graph, `Cargo.lock` oder
 /// `CARGO_HOME`/`HOME` nicht gelesen werden können. Ein einzelner nicht
 /// auflösbarer *Knoten* in der Hülle ist dagegen kein `Err` — siehe
 /// Moduldoku.
 fn load_and_compute(repo_root: &Path) -> Result<ClosureResult, String> {
-    let dod_root = repo_root.join(super::DOD_WORKSPACE);
     let graph = super::load_all_workspaces(repo_root)?;
-    let lock = parse_lock_entries(&dod_root)?;
+    let lock = parse_lock_entries(repo_root)?;
     let locator = RegistrySourceLocator::from_env()
         .map_err(|error| format!("Registry-Locator nicht verfügbar: {error}"))?;
     // Neu mit der Feature-Auflösungs-Korrektur: die
     // `[workspace.dependencies]`-Tabellen werden für `dep.workspace = true`
     // gebraucht (siehe Moduldoku, Abschnitt „Feature-Auflösung").
-    let workspace_deps = WorkspaceDependencyTables::load(&[repo_root, dod_root.as_path()])?;
+    let workspace_deps = WorkspaceDependencyTables::load(&[repo_root])?;
 
     Ok(compute_closure(
         WARDEN_ROOT,
@@ -2871,9 +2877,10 @@ dependencies = []
         Ok(())
     }
 
-    /// Gegen den echten Repo-Stand: die Warden-Hülle wird über Produkt- und
-    /// DoD-Workspace hinweg berechnet und prüft etwas. Vorher fand das Gate
-    /// seine Wurzel nicht und meldete nur ein Problem.
+    /// Gegen den echten Repo-Stand: die Warden-Hülle wird über DoD- und
+    /// Produkt-Crates hinweg berechnet (seit PL-60 ein Workspace, ein
+    /// Lockfile) und prüft etwas. Früher fand das Gate seine Wurzel nicht
+    /// und meldete nur ein Problem.
     #[test]
     fn test_load_and_compute_on_real_repo_reaches_across_the_workspace_boundary() -> TestResult {
         let repo_root = Path::new(env!("CARGO_MANIFEST_DIR"))

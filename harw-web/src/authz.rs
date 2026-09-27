@@ -18,6 +18,15 @@
 //! definierte Totalordnung von [`PermissionTier`] — es gibt keine zweite,
 //! web-eigene Rangfolge.
 //!
+//! # Verhältnis zur Identitätsauflösung (H12)
+//! Seit H12 fragt `harw-web` die Stufe über
+//! [`crate::identity::LocalPeerIdentityResolver`] ab. Ein [`PeerAuthorizer`]
+//! bleibt dabei die **Tier-Quelle und der Tier-Deckel** in beiden Modi:
+//! [`crate::identity::TierMapResolver`] reicht [`PeerAuthorizer::tier_for`]
+//! unverändert durch (Modus `tier_map`), und
+//! [`crate::identity::SecurityHubResolver`] kann die so bestimmte Stufe durch
+//! einen Hub-Kontext nur verengen, nie anheben.
+//!
 //! # Nebenläufigkeit
 //! [`PeerAuthorizer`]-Implementierungen müssen `Send + Sync` sein, damit sie
 //! hinter `Arc` über Verbindungs-Tasks geteilt werden können.

@@ -404,7 +404,7 @@ pub fn agent(attr: TokenStream, item: TokenStream) -> TokenStream {
 /// #[operation(
 ///     name = "status",
 ///     summary = "Zeigt den Session-Status.",
-///     domain = "misc",          // session | agents | execution | catalog_config | knowledge | misc
+///     domain = "misc",          // session | agents | execution | catalog_config | knowledge | identity | network | security | crypto | misc
 ///     permission = "observer",  // observer | operator | maintainer | owner
 ///     command(path = "/status", visibility = "channel_parity"),   // optional
 ///     // command(...) kennt zusätzlich `busy = "immediate" | "staged" | "deferred"`

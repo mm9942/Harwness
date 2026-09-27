@@ -6,16 +6,20 @@
 //! [`discovery::discover_config`].
 
 pub mod agent_limits;
+// Ungeparste DSL-Agentendefinitionen der vertrauten Layer; gesenkt wird im
+// Konsumenten (`harw_registry_defaults::config_agents`).
+pub mod agent_sources;
 pub mod agent_toml;
 pub mod auth_toml;
 pub mod browser_toml;
-pub mod builtin_definitions;
 pub mod channel_toml;
 pub mod discovery;
 pub mod dod_toml;
 pub mod dotenv;
 pub mod error;
 pub mod harness_config;
+// Crypto-Infrastruktur H4: `[infrastructure]` — Daemon-Sockets.
+pub mod infrastructure_toml;
 pub mod internal_models;
 pub mod loader;
 pub mod mcp_toml;
@@ -40,14 +44,17 @@ pub mod writer;
 
 // Runde 5, Teil K: `[agents]` — Orchestrierungsgrenzen.
 pub use agent_limits::{AgentLimitsToml, EffectiveAgentLimits};
+pub use agent_sources::{
+    AgentDefinitionSource, AgentDefinitionSources, AgentSourceForm, AgentSourceLayer,
+    CONTEXT_PROGRAMS_DIR, ContextProgramSource, INSTRUCTIONS_FILE_KEY, discover_run_agent_sources,
+};
 pub use agent_toml::{AgentSuggestionsToml, AgentToml};
 pub use auth_toml::{AuthConfig, CredentialEntry, KekConfig, KekProvenance, SecretRef};
 pub use browser_toml::BrowserSection;
 pub use channel_toml::{ChannelFileToml, ChannelSectionToml, ChannelToml, TelegramChannelToml};
 pub use discovery::{
-    AgentDefinitionMeta, HasName, INSTRUCTIONS_FILE_KEY, ResolvedConfig, default_config_layers,
-    default_config_layers_named, discover_config, discover_config_with_restricted,
-    discover_config_with_restricted_and_project_settings, discover_run_agent_definitions,
+    HasName, ResolvedConfig, default_config_layers, default_config_layers_named, discover_config,
+    discover_config_with_restricted, discover_config_with_restricted_and_project_settings,
 };
 pub use dod_toml::DodSection;
 pub use dotenv::{
@@ -66,6 +73,8 @@ pub use harness_config::{
 pub use shell_limits::ShellToml;
 // Runde 5, Teil I: Live-Stream der Kind-Agenten (`[tui] child_stream`).
 pub use harness_config::ChildStreamModeToml;
+// Crypto-Infrastruktur H4: `[infrastructure]`.
+pub use infrastructure_toml::InfrastructureSection;
 // Runde 5, Teil E: `ANTHROPIC_FAST_MODEL`/`fast_model_for_active_provider`
 // (Vorgabe-Modell des Auto-Modus-Klassifizierers).
 pub use internal_models::{
@@ -99,7 +108,7 @@ pub use uia_worker_models::{
     UiaWorkerModelSource, UiaWorkerModelsToml, catalog_provider_of, provider_is_logged_in,
     resolve_uia_worker_model, resolve_uia_worker_models,
 };
-pub use web_toml::{WebSearchToml, WebSection};
+pub use web_toml::{WebIdentityModeToml, WebIdentityToml, WebSearchToml, WebSection};
 pub use writer::{ConfigWriter, RuleKind};
 
 // Test-Fehlertyp (Bible R087/R165/R182), nur für Tests.

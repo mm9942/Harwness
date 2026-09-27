@@ -1,0 +1,48 @@
+[package]
+publish.workspace = true
+name = "harw-security-hub"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "Local SecurityHub (Masterplan v2 H8): policy engine, short-lived SecurityContext delivery and read-only DoD finding correlation over Hyper HTTP/1 on an AF_UNIX socket, authenticated via SO_PEERCRED."
+
+[lib]
+path = "src/lib.rs"
+
+[[bin]]
+name = "harw-security-hub"
+path = "src/main.rs"
+
+[dependencies]
+# Identity vocabulary: SecurityContext / SecurityContextIssuer / TrustZone /
+# AuthStrength (H1), Principal, the id newtypes and ImpactSeverity for DoD
+# findings. The only internal edge of this crate.
+harw-types = { path = "../harw-types" }
+jiff = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+toml = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { version = "0.3.23", features = ["env-filter", "fmt"] }
+clap = { version = "4.6.1", features = ["derive"] }
+# Same majors as harw-auth-hub / harw-web: hyper 1 (HTTP/1 server over the
+# Unix socket), hyper-util for `TokioIo`/`TokioTimer`, http-body-util for
+# bounded request bodies.
+bytes = "1"
+http-body-util = "0.1"
+hyper = { version = "1", features = ["server", "http1"] }
+hyper-util = { version = "0.1.20", features = ["tokio"] }
+tokio = { version = "1.53.1", features = ["rt", "rt-multi-thread", "macros", "net", "signal", "sync", "time"] }
+# systemd socket activation (`--systemd-socket`) without `unsafe` in this
+# crate: the same leaf crate and approach as harw-auth-hub/src/systemd.rs.
+sd-listen-fds = "0.2.0"
+
+[dev-dependencies]
+tempfile = { workspace = true }
+hyper = { version = "1", features = ["client", "server", "http1"] }
+tokio = { version = "1.53.1", features = ["rt", "rt-multi-thread", "macros", "net", "io-util", "signal", "sync", "time"] }
+
+[lints]
+workspace = true

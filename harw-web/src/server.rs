@@ -1,10 +1,10 @@
 //! Unix-Socket-HTTP-Transport — bindet, nimmt Verbindungen an, reicht an
-//! [`crate::router::decide_route`] weiter.
+//! [`crate::router::decide_resolved_route`] weiter.
 //!
 //! # Verantwortungsbereich
 //! Dieses Modul enthält den einzigen Ort dieser Crate, der `hyper` und
 //! einen echten Socket berührt. Es **entscheidet nichts selbst** — jede
-//! Zugriffsentscheidung kommt von [`crate::router::decide_route`], jede
+//! Zugriffsentscheidung kommt von [`crate::router::decide_resolved_route`], jede
 //! Berechtigungsstufe von [`crate::authz::PeerAuthorizer`], jede Identität
 //! von [`crate::peer::read_peer_credentials`]. Dieses Modul übersetzt nur
 //! zwischen HTTP-Semantik (Methode, Statuscode, JSON-Rumpf, SSE-Rahmen) und
@@ -37,11 +37,47 @@
 //! Betriebssignal dieses Moduls) hält die Sequenz auch ohne
 //! Operationsaufrufe sichtbar am Leben.
 //!
+//! # Metarouten `/v1/*` (H9)
+//! `GET /v1/health`, `/v1/version` und `/v1/capabilities` beantwortet
+//! [`handle`] vor der Routentabelle über [`crate::meta`] — sie sind keine
+//! Operationen. `/v1/health` braucht keine Stufe; die beiden anderen die
+//! niedrigste ([`crate::meta::MINIMUM_DESCRIPTIVE_TIER`]) über denselben
+//! [`crate::identity::LocalPeerIdentityResolver`] wie jede Route. Jede andere
+//! Methode als `GET` → `405`.
+//!
+//! # Identitätsauflösung (H12)
+//! Jede autorisierungspflichtige Anfrage (Operationsroute, `GET /events`,
+//! `/v1/version`, `/v1/capabilities`) löst die Identität über den
+//! [`crate::identity::LocalPeerIdentityResolver`] des Servers auf: aus den
+//! `SO_PEERCRED` der Verbindung plus dem optionalen Kontextverweis
+//! ([`crate::identity::SECURITY_CONTEXT_HEADER`], gelesen über
+//! [`crate::identity::presented_context`]). Vorgabe ist
+//! [`crate::identity::TierMapResolver`] über dem übergebenen
+//! [`crate::authz::PeerAuthorizer`] — exakt das Verhalten vor H12;
+//! [`BoundWebServer::with_identity_resolver`] ersetzt ihn (produktiv durch
+//! [`crate::identity::WebIdentityConfig::build_resolver`]). Die
+//! Routenentscheidung trifft [`crate::router::decide_resolved_route`];
+//! scheitert die Auflösung, trägt die `403` den Grund
+//! [`crate::identity::IdentityError::code`]. Bei `Execute` fädelt
+//! [`crate::identity::ResolvedPeer::scope_op_context`] Mandant und
+//! Kontextzusammenfassung in den `OpContext` — nie aus dem Rumpf. Für
+//! unbekannte Pfade und falsche Methoden (`404`/`405`) wird keine Identität
+//! aufgelöst: dort gibt es nichts zu autorisieren, und ein Hub-Aufruf wäre
+//! reine Last.
+//!
+//! # Zwei Wege zum Listener
+//! [`BoundWebServer::bind`] bindet einen Pfad selbst (siehe
+//! „Socket-Pfad" unten); [`BoundWebServer::from_std_listener`] übernimmt
+//! einen bereits lauschenden Listener — den von systemd übergebenen
+//! ([`crate::systemd::listener_from_systemd`], `harw web --systemd-socket`).
+//! Beide münden in dieselbe Annahmeschleife.
+//!
 //! # Zwei CI-Gates
 //! „Keine Route ohne `OperationMeta`" und „Tier-Ablehnungsmatrix" (siehe
 //! `crate::router`-Moduldoku) werden von diesem Modul **konsumiert**, nicht
 //! implementiert: [`handle`] fragt ausschließlich
-//! [`crate::router::decide_route`] und führt nie eine Operation aus, die
+//! [`crate::router::decide_resolved_route`] (derselbe Prüfpfad wie
+//! [`crate::router::decide_route`]) und führt nie eine Operation aus, die
 //! dieses nicht als [`crate::router::RouteDecision::Execute`] freigegeben hat.
 //!
 //! # Nebenläufigkeit
@@ -127,7 +163,7 @@ use http_body_util::{BodyExt, Channel, Full, LengthLimitError, Limited};
 use hyper::body::Incoming;
 use hyper::header::{ACCEPT, CACHE_CONTROL, CONTENT_LENGTH, CONTENT_TYPE, HeaderValue};
 use hyper::service::service_fn;
-use hyper::{Method, Request, Response, StatusCode};
+use hyper::{HeaderMap, Method, Request, Response, StatusCode};
 use hyper_util::rt::{TokioExecutor, TokioIo, TokioTimer};
 use hyper_util::server::conn::auto::Builder;
 use tokio::net::{UnixListener, UnixStream};
@@ -138,12 +174,16 @@ use harw_operations::context::OpContext;
 use harw_operations::error::OpError;
 use harw_operations::operation::PermissionTier;
 
-use crate::authz::PeerAuthorizer;
+use crate::authz::{PeerAuthorizer, tier_permits};
 use crate::error::WebError;
 use crate::events::{WebEventBus, WebEventKind, WebEventReceiveError};
+use crate::identity::{
+    IdentityError, LocalPeerIdentityResolver, ResolvedPeer, TierMapResolver, presented_context,
+};
+use crate::meta::MetaRoute;
 use crate::peer::{PeerCredentials, read_peer_credentials};
 use crate::router::{
-    ForbiddenReason, RouteDecision, WebMethod, WebRouteTable, decide_route, method_name,
+    ForbiddenReason, RouteDecision, WebMethod, WebRouteTable, decide_resolved_route, method_name,
     parse_web_method,
 };
 
@@ -153,7 +193,7 @@ const MAX_BODY_BYTES: usize = 64 * 1024;
 /// `Surface::Web`-Route, da `Surface::Web::path` von der jeweiligen
 /// Operation kommt und `harw-web` diesen Pfad nie an
 /// [`crate::router::WebRouteTable::from_registry`] übergibt.
-const EVENTS_PATH: &str = "/events";
+pub(crate) const EVENTS_PATH: &str = "/events";
 /// Abstand zwischen zwei [`WebEventKind::Heartbeat`]-Ereignissen.
 const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(30);
 /// Frist, in der ein Client die Kopfzeilen einer Anfrage vollständig senden
@@ -201,7 +241,7 @@ pub struct BoundWebServer {
     listener: UnixListener,
     socket_path: PathBuf,
     routes: Arc<WebRouteTable>,
-    authorizer: Arc<dyn PeerAuthorizer>,
+    identity: Arc<dyn LocalPeerIdentityResolver>,
     context_factory: Arc<WebContextFactory>,
     events: Arc<WebEventBus>,
 }
@@ -213,7 +253,9 @@ impl BoundWebServer {
     /// # Arguments
     /// - `config` (`WebServerConfig`): Ziel-Socket-Pfad.
     /// - `routes` (`WebRouteTable`): über [`WebRouteTable::from_registry`] gebaut.
-    /// - `authorizer` (`Arc<dyn PeerAuthorizer>`): serverseitig vertraute Peer→Tier-Richtlinie.
+    /// - `authorizer` (`Arc<dyn PeerAuthorizer>`): serverseitig vertraute
+    ///   Peer→Tier-Richtlinie; Grundlage des vorgegebenen
+    ///   [`TierMapResolver`] (siehe [`Self::with_identity_resolver`]).
     /// - `context_factory` (`Arc<WebContextFactory>`): baut `OpContext` je freigegebenem Aufruf.
     /// - `events` (`Arc<WebEventBus>`): geteilter Ereignisbus für `GET /events`.
     ///
@@ -243,10 +285,83 @@ impl BoundWebServer {
             listener,
             socket_path: config.socket_path,
             routes: Arc::new(routes),
-            authorizer,
+            identity: Arc::new(TierMapResolver::new(authorizer)),
             context_factory,
             events,
         })
+    }
+
+    /// Übernimmt einen bereits lauschenden Unix-Listener (systemd-Socket-
+    /// Aktivierung) statt selbst einen Pfad zu binden.
+    ///
+    /// # Arguments
+    /// - `listener` (`std::os::unix::net::UnixListener`): lauschender,
+    ///   nicht-blockierender Listener, typischerweise aus
+    ///   [`crate::systemd::listener_from_systemd`].
+    /// - übrige Argumente wie bei [`Self::bind`].
+    ///
+    /// # Returns
+    /// Einen bereiten `BoundWebServer`; [`Self::socket_path`] ist der Pfad,
+    /// an den der Listener gebunden ist (leer bei einem unbenannten Socket).
+    ///
+    /// # Errors
+    /// [`WebError::Activation`], wenn der Listener nicht nicht-blockierend
+    /// geschaltet oder nicht an die `tokio`-Runtime übergeben werden kann.
+    ///
+    /// # Concurrency
+    /// Muss innerhalb einer `tokio`-Runtime mit aktiviertem I/O-Treiber
+    /// aufgerufen werden (`tokio::net::UnixListener::from_std`).
+    pub fn from_std_listener(
+        listener: std::os::unix::net::UnixListener,
+        routes: WebRouteTable,
+        authorizer: Arc<dyn PeerAuthorizer>,
+        context_factory: Arc<WebContextFactory>,
+        events: Arc<WebEventBus>,
+    ) -> Result<Self, WebError> {
+        let socket_path = listener
+            .local_addr()
+            .ok()
+            .and_then(|addr| addr.as_pathname().map(Path::to_path_buf))
+            .unwrap_or_default();
+        listener
+            .set_nonblocking(true)
+            .map_err(|error| WebError::Activation {
+                reason: format!("could not set listener non-blocking: {error}"),
+            })?;
+        let listener = UnixListener::from_std(listener).map_err(|error| WebError::Activation {
+            reason: format!("could not register listener with the runtime: {error}"),
+        })?;
+        Ok(Self {
+            listener,
+            socket_path,
+            routes: Arc::new(routes),
+            identity: Arc::new(TierMapResolver::new(authorizer)),
+            context_factory,
+            events,
+        })
+    }
+
+    /// Ersetzt den Identitätsauflöser (Builder, H12).
+    ///
+    /// # Description
+    /// Ohne diesen Aufruf gilt [`TierMapResolver::new`] über dem an
+    /// [`Self::bind`]/[`Self::from_std_listener`] übergebenen
+    /// `PeerAuthorizer` — exakt das Verhalten vor H12. Der neue Resolver
+    /// **ersetzt** diesen vollständig; er muss seinen Tier-Deckel deshalb
+    /// selbst aus derselben Richtlinie beziehen (produktiv:
+    /// [`crate::identity::WebIdentityConfig::build_resolver`] mit demselben
+    /// `authorizer`).
+    ///
+    /// # Arguments
+    /// - `resolver` (`Arc<dyn LocalPeerIdentityResolver>`): serverseitig aus
+    ///   vertrauter Konfiguration gebaut, nie aus einer Anfrage.
+    ///
+    /// # Returns
+    /// `self` mit dem neuen Resolver.
+    #[must_use]
+    pub fn with_identity_resolver(mut self, resolver: Arc<dyn LocalPeerIdentityResolver>) -> Self {
+        self.identity = resolver;
+        self
     }
 
     /// Der Pfad, unter dem dieser Server gebunden wurde.
@@ -373,7 +488,7 @@ impl BoundWebServer {
                         continue;
                     };
                     let routes = Arc::clone(&self.routes);
-                    let authorizer = Arc::clone(&self.authorizer);
+                    let identity = Arc::clone(&self.identity);
                     let context_factory = Arc::clone(&self.context_factory);
                     let events = Arc::clone(&self.events);
                     connections.spawn(async move {
@@ -386,7 +501,7 @@ impl BoundWebServer {
                                         request,
                                         peer,
                                         Arc::clone(&routes),
-                                        Arc::clone(&authorizer),
+                                        Arc::clone(&identity),
                                         Arc::clone(&context_factory),
                                         Arc::clone(&events),
                                     )
@@ -516,27 +631,58 @@ fn accept_backoff(failures: u32) -> Duration {
 /// Bearbeitet eine einzelne HTTP-Anfrage einer bereits identifizierten Verbindung.
 ///
 /// # Description
-/// Trifft selbst keine Zugriffsentscheidung — delegiert vollständig an
-/// [`decide_route`] und übersetzt dessen Ergebnis in eine HTTP-Antwort.
-/// `GET /events` ist der einzige Pfad, den diese Funktion ohne Umweg über
-/// die Routentabelle behandelt (der Ereignisstrom ist keine Operation).
+/// Trifft selbst keine Zugriffsentscheidung — löst die Identität über
+/// `identity` auf (siehe Moduldoku „Identitätsauflösung"), delegiert die
+/// Entscheidung vollständig an [`decide_resolved_route`] und übersetzt deren
+/// Ergebnis in eine HTTP-Antwort. `GET /events` und die Metarouten sind die
+/// einzigen Pfade, die diese Funktion ohne Umweg über die Routentabelle
+/// behandelt (sie sind keine Operationen).
 async fn handle(
     request: Request<Incoming>,
     peer: PeerCredentials,
     routes: Arc<WebRouteTable>,
-    authorizer: Arc<dyn PeerAuthorizer>,
+    identity: Arc<dyn LocalPeerIdentityResolver>,
     context_factory: Arc<WebContextFactory>,
     events: Arc<WebEventBus>,
 ) -> Result<WebResponse, Infallible> {
-    if request.uri().path() == EVENTS_PATH {
-        return Ok(handle_events(&request, &peer, authorizer.as_ref(), &events));
+    let path = request.uri().path().to_owned();
+    // Über `await` hinweg werden nur `&Method`/`&HeaderMap` gehalten, nie
+    // ein `&Request<Incoming>` (dessen Rumpf nicht `Sync` sein muss).
+    if path == EVENTS_PATH {
+        let http_method = request.method();
+        let headers = request.headers();
+        return Ok(handle_events(http_method, headers, &peer, identity.as_ref(), &events).await);
+    }
+    if let Some(meta) = MetaRoute::from_path(&path) {
+        let http_method = request.method();
+        let headers = request.headers();
+        return Ok(handle_meta(
+            http_method,
+            headers,
+            meta,
+            &peer,
+            identity.as_ref(),
+            &routes,
+        )
+        .await);
     }
 
     // Nur exakt GET/POST; HEAD/OPTIONS/… werden nie implizit auf eine
     // deklarierte Methode abgebildet und enden in 405 (F-031).
     let method = parse_web_method(request.method().as_str());
-    let path = request.uri().path().to_owned();
-    let decision = decide_route(&routes, authorizer.as_ref(), &peer, &path, method);
+    // Identität nur auflösen, wenn Route und Methode passen — sonst endet
+    // `decide_resolved_route` ohnehin in 404/405, bevor sie die Stufe fragt.
+    let resolution = if method.is_some() && routes.method_for(&path) == method {
+        let headers = request.headers();
+        Some(resolve_identity(identity.as_ref(), &peer, headers).await)
+    } else {
+        None
+    };
+    let resolved = match &resolution {
+        Some(Ok(resolved)) => Some(resolved),
+        Some(Err(_)) | None => None,
+    };
+    let decision = decide_resolved_route(&routes, resolved, &path, method);
 
     match decision {
         RouteDecision::NotFound => Ok(json_response(
@@ -544,10 +690,14 @@ async fn handle(
             &serde_json::json!({"error": "not_found"}),
         )),
         RouteDecision::MethodNotAllowed { expected } => Ok(method_not_allowed_response(expected)),
-        RouteDecision::Forbidden { reason } => Ok(json_response(
-            StatusCode::FORBIDDEN,
-            &serde_json::json!({"error": "forbidden", "reason": forbidden_reason_str(reason)}),
-        )),
+        RouteDecision::Forbidden { reason } => {
+            // Scheiterte die Auflösung, nennt der Resolver den konkreten Grund.
+            let reason = match (&resolution, reason) {
+                (Some(Err(error)), ForbiddenReason::UnknownPeer) => error.code(),
+                _ => forbidden_reason_str(reason),
+            };
+            Ok(forbidden_response(reason))
+        }
         RouteDecision::ApprovalRequired { route } => Ok(json_response(
             StatusCode::FORBIDDEN,
             &serde_json::json!({
@@ -562,6 +712,12 @@ async fn handle(
                 Err(response) => return Ok(response),
             };
             let ctx = (context_factory)(&peer, caller_tier);
+            // Mandant und Kontextzusammenfassung kommen ausschließlich aus der
+            // aufgelösten Identität (H12), nie aus Rumpf oder Headern.
+            let ctx = match resolved {
+                Some(resolved) => resolved.scope_op_context(ctx),
+                None => ctx,
+            };
             let operation_name = route.operation_name().to_owned();
             let result = route.invoke(&ctx, args).await;
             let ok = result.is_ok();
@@ -579,19 +735,83 @@ async fn handle(
     }
 }
 
-/// Bearbeitet `GET /events` — keine Operation, keine Route, nur der
-/// Ereignisstrom.
-fn handle_events(
-    request: &Request<Incoming>,
+/// Löst die Identität des Peers einer Anfrage auf.
+///
+/// # Description
+/// Liest ausschließlich den Kontextverweis
+/// ([`crate::identity::SECURITY_CONTEXT_HEADER`]) aus den Headern — kein
+/// anderer Header und nie der Rumpf trägt Identität — und reicht ihn mit den
+/// `SO_PEERCRED` der Verbindung an den Resolver.
+///
+/// # Errors
+/// [`IdentityError::InvalidContextReference`] für einen unlesbaren oder
+/// mehrfachen Header, sonst jeder Fehler des Resolvers.
+async fn resolve_identity(
+    identity: &dyn LocalPeerIdentityResolver,
     peer: &PeerCredentials,
-    authorizer: &dyn PeerAuthorizer,
-    events: &Arc<WebEventBus>,
+    headers: &HeaderMap,
+) -> Result<ResolvedPeer, IdentityError> {
+    let presented = presented_context(headers)?;
+    identity.resolve(peer, presented).await
+}
+
+/// `403` mit stabilem Grund.
+fn forbidden_response(reason: &str) -> WebResponse {
+    json_response(
+        StatusCode::FORBIDDEN,
+        &serde_json::json!({"error": "forbidden", "reason": reason}),
+    )
+}
+
+/// Bearbeitet `GET /v1/health`, `/v1/version`, `/v1/capabilities` — keine
+/// Operation, keine Route (siehe [`crate::meta`]).
+///
+/// # Description
+/// Nur `GET` (sonst `405` mit `Allow: GET`). `/v1/health` antwortet jedem
+/// Peer, der den Socket erreicht, ohne Identitätsauflösung;
+/// `/v1/version`/`/v1/capabilities` verlangen [`MetaRoute::required_tier`]
+/// über denselben Resolver wie jede Route (Auflösung gescheitert → `403` mit
+/// [`IdentityError::code`], z. B. `unknown_peer`).
+async fn handle_meta(
+    method: &Method,
+    headers: &HeaderMap,
+    meta: MetaRoute,
+    peer: &PeerCredentials,
+    identity: &dyn LocalPeerIdentityResolver,
+    routes: &WebRouteTable,
 ) -> WebResponse {
-    if *request.method() != Method::GET {
+    if *method != Method::GET {
         return method_not_allowed_response(WebMethod::Get);
     }
-    let accepts_event_stream = request
-        .headers()
+    if let Some(required) = meta.required_tier() {
+        let resolved = match resolve_identity(identity, peer, headers).await {
+            Ok(resolved) => resolved,
+            Err(error) => return forbidden_response(error.code()),
+        };
+        if !tier_permits(resolved.tier(), required) {
+            return forbidden_response(forbidden_reason_str(ForbiddenReason::InsufficientTier));
+        }
+    }
+    let mut response = json_response(StatusCode::OK, &meta.document(routes));
+    response
+        .headers_mut()
+        .insert(CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    response
+}
+
+/// Bearbeitet `GET /events` — keine Operation, keine Route, nur der
+/// Ereignisstrom.
+async fn handle_events(
+    method: &Method,
+    headers: &HeaderMap,
+    peer: &PeerCredentials,
+    identity: &dyn LocalPeerIdentityResolver,
+    events: &Arc<WebEventBus>,
+) -> WebResponse {
+    if *method != Method::GET {
+        return method_not_allowed_response(WebMethod::Get);
+    }
+    let accepts_event_stream = headers
         .get(ACCEPT)
         .and_then(|value| value.to_str().ok())
         .is_none_or(|value| {
@@ -606,13 +826,10 @@ fn handle_events(
             &serde_json::json!({"error": "not_acceptable"}),
         );
     }
-    // Ein unbekannter Peer sieht keinen Ereignisstrom — dieselbe Regel wie
-    // für jede andere Route: keine Autorisierung ohne aufgelöste Stufe.
-    if authorizer.tier_for(peer).is_none() {
-        return json_response(
-            StatusCode::FORBIDDEN,
-            &serde_json::json!({"error": "forbidden", "reason": forbidden_reason_str(ForbiddenReason::UnknownPeer)}),
-        );
+    // Ein nicht auflösbarer Peer sieht keinen Ereignisstrom — dieselbe Regel
+    // wie für jede andere Route: keine Autorisierung ohne aufgelöste Identität.
+    if let Err(error) = resolve_identity(identity, peer, headers).await {
+        return forbidden_response(error.code());
     }
     sse_response(Arc::clone(events))
 }

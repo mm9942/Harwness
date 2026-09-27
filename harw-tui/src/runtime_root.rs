@@ -196,7 +196,10 @@ fn tui_greeting(
 fn active_uia_user_name(assembly: &RuntimeAssembly) -> Option<String> {
     let config = assembly.config();
     let definition = config.harness.active_uia_definition.as_deref()?;
-    let agent_dir = config.agent_definition_dirs.get(definition)?;
+    let agent_dir = assembly
+        .config_agents()
+        .agent_definition_dirs
+        .get(definition)?;
     harw_config::load_uia_user_name(agent_dir).ok().flatten()
 }
 
@@ -1085,7 +1088,7 @@ fn build_root_runtime(
     app = app.with_child_stream(
         assembly.config().harness.tui.child_stream.into(),
         crate::child_stream::OrchestratorRoles::from_definitions(
-            assembly.config().executable_agents.values(),
+            assembly.config_agents().executable_agents.values(),
         ),
     );
     // Runde 5, Teil F: Plan-Fragekanal (`plan.exit`/`plan.enter`/`ask_user`,

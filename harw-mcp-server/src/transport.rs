@@ -853,7 +853,7 @@ async fn tools_call(
                         context.session_id(),
                         McpLifecycleEventKind::JobUpdated {
                             work_id: receipt.work_id.clone(),
-                            state: harw_job_runtime::JobState::Cancelled,
+                            state: harw_job_core::JobState::Cancelled,
                             revision: receipt.revision,
                         },
                     );
@@ -944,7 +944,7 @@ fn parse_submit_arguments(message: &Value) -> Result<McpJobSubmission, &'static 
     })
 }
 
-fn parse_submit_budget(value: &Value) -> Result<harw_job_runtime::Budget, &'static str> {
+fn parse_submit_budget(value: &Value) -> Result<harw_job_core::Budget, &'static str> {
     let Some(budget) = value.as_object() else {
         return Err("invalid harw_job_submit arguments: 'budget' must be an object");
     };
@@ -986,7 +986,7 @@ fn parse_submit_budget(value: &Value) -> Result<harw_job_runtime::Budget, &'stat
                 .map_err(|_| "invalid harw_job_submit arguments: 'max_tool_calls' is too large")
         })
         .transpose()?;
-    Ok(harw_job_runtime::Budget {
+    Ok(harw_job_core::Budget {
         max_tokens,
         max_wall,
         max_tool_calls,
@@ -1129,7 +1129,7 @@ fn json_rpc_error(
 mod tests {
     use super::*;
 
-    use harw_job_runtime::{Budget, Job, JobKind, JobScope, JobState, RetryPolicy};
+    use harw_job_core::{Budget, Job, JobKind, JobScope, JobState, RetryPolicy};
     use harw_session_store::JobStore;
     use harw_types::ApprovalActor;
     use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
@@ -1785,7 +1785,7 @@ mod tests {
         );
         job.mark_ready(now)
             .map_err(ctx("job transitions to ready"))?;
-        let record = harw_job_runtime::StoredJob {
+        let record = harw_job_core::StoredJob {
             job,
             scope: JobScope::new(
                 harw_types::TenantId::from_str("test-tenant"),

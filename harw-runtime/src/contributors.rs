@@ -37,7 +37,7 @@ use harw_project_discovery::ProjectContext;
 use crate::assembly::{SessionLifecycleHook, TurnLimits};
 use crate::config::ConfigTrustReport;
 use crate::error::RuntimeResult;
-use crate::spec::{EntryProfile, RootBudget, RuntimeSpec};
+use crate::spec::{EntryProfile, OperationSurface, RootBudget, RuntimeSpec};
 
 /// Nur-lesende Sicht auf alles, was die Montage bereits entschieden hat.
 ///
@@ -139,17 +139,67 @@ pub trait AssemblyContributor: Send + Sync {
 /// Liste; `.contributor(..)` hängt weitere an. Enthalten:
 /// - [`crate::mcp_wiring::McpContributor`]: konfigurierte MCP-Server als
 ///   Werkzeuge `mcp.<server>.<tool>` (No-op ohne aktive `[mcps.*]`).
+/// - [`InfrastructureContributor`]: die `infra.*`-Operationen, wenn
+///   `[infrastructure]` konfiguriert ist (No-op ohne die Sektion).
 /// - [`BrowserRootContributor`] (Feature `browser`): `browser.*` für die
 ///   Wurzelsitzung, wenn `[browser].roles` `"root"` enthält.
 #[must_use]
 pub fn default_contributors() -> Vec<Arc<dyn AssemblyContributor>> {
     // `mut` wird nur mit Feature `browser` gebraucht.
     #[cfg_attr(not(feature = "browser"), allow(unused_mut))]
-    let mut contributors: Vec<Arc<dyn AssemblyContributor>> =
-        vec![Arc::new(crate::mcp_wiring::McpContributor)];
+    let mut contributors: Vec<Arc<dyn AssemblyContributor>> = vec![
+        Arc::new(crate::mcp_wiring::McpContributor),
+        Arc::new(InfrastructureContributor),
+    ];
     #[cfg(feature = "browser")]
     contributors.push(Arc::new(BrowserRootContributor));
     contributors
+}
+
+/// Registriert die `infra.*`-Operationen (Crypto-Infrastruktur-Masterplan v2
+/// §11.3, §34 H5), sofern `[infrastructure]` konfiguriert ist.
+///
+/// # Beschreibung
+/// Muster: **Registrierung gated, Verfügbarkeit über den Dienst.** Ohne
+/// `[infrastructure]` registriert der Contributor nichts — die Operationen
+/// erscheinen dann weder in `/help` noch als Web-Route. Mit Sektion hängt er
+/// die vier Operationen aus [`harw_ops::infra::register_infrastructure`] an
+/// die Operations-Registry der Wurzel (`infra.status`, `infra.health`,
+/// `infra.auth.keys.describe`, `infra.auth.keys.rotate`). Ob sie dann
+/// tatsächlich arbeiten, entscheidet allein der Dienst
+/// `Arc<InfrastructureAvailability>`, den die Montage aus derselben Sektion
+/// baut ([`crate::infrastructure::build_infrastructure`]) und den
+/// [`crate::services::RuntimeServices`] nur auf Slash und Web legt: ist die
+/// Sektion ungültig, fehlt der Dienst und jede Operation meldet
+/// `OpError::NotAvailable` — ehrlich statt still verschwunden.
+///
+/// Die Operationen tragen **keine** `ModelTool`-Fläche; der Contributor
+/// erweitert die Modell-Werkzeugliste daher nicht. Für einen Einstieg mit
+/// [`OperationSurface::None`] registriert er ebenfalls nichts — die Montage
+/// hat für ihn bewusst eine leere Registry gebaut.
+///
+/// Ein Registrierungskonflikt (etwa ein zweites Mal registriert) wird als
+/// Warnung gemeldet und bricht die Montage nicht ab: Infrastruktur ist
+/// optional.
+#[derive(Debug, Default)]
+pub struct InfrastructureContributor;
+
+impl AssemblyContributor for InfrastructureContributor {
+    fn contribute(
+        &self,
+        inputs: &AssemblyInputs<'_>,
+        parts: &mut AssemblyParts,
+    ) -> RuntimeResult<()> {
+        if inputs.config.infrastructure.is_none()
+            || inputs.profile.operations == OperationSurface::None
+        {
+            return Ok(());
+        }
+        if let Err(error) = harw_ops::infra::register_infrastructure(&mut parts.operations) {
+            tracing::warn!(%error, "runtime.infrastructure_operations_not_registered");
+        }
+        Ok(())
+    }
 }
 
 /// Hängt die Browser-Werkzeuge (Firefox/geckodriver, WebDriver BiDi) an die
@@ -191,5 +241,12 @@ mod tests {
     #[test]
     fn default_contributors_include_mcp() {
         assert!(!default_contributors().is_empty());
+    }
+
+    #[test]
+    fn default_contributors_include_infrastructure() {
+        // MCP + Infrastruktur, plus Browser mit Feature `browser`.
+        let expected = if cfg!(feature = "browser") { 3 } else { 2 };
+        assert_eq!(default_contributors().len(), expected);
     }
 }

@@ -46,13 +46,15 @@ Agents and knowledge
 
 Services
   gateway [install|start|stop|restart|enable|disable|status]
-  serve [--config-dir DIR] | web [--socket PATH]
+  serve [--config-dir DIR]
+  web [--socket PATH] [--system [--socket-group GROUP] | --systemd-socket]
   service install | status | uninstall
   mcp setup [SERVER] | check [SERVER]
   channel connect telegram [--pair CODE]
 
 System
   init | onboard | doctor [--config-dir DIR] | update
+  install --print-systemd [UNIT]
   uninstall [--scope …] [--dry-run] [--yes]
   completions [SHELL] [--install | --uninstall] [--dry-run]
   bug-report [--type …] [--title …] …
@@ -65,6 +67,13 @@ System
 forward all following arguments unchanged, including ones with a leading
 hyphen. They correspond to the chat commands `/skills`, `/plugins`,
 `/memory` and `/context-proposal`.
+
+`install --print-systemd [UNIT]` prints the systemd system units that are
+embedded from `deploy/systemd/` (the single canonical source, see
+[DoD setup](setup/dod.md#systemd-units-and-the-deploy-tree)), rendered with the
+default paths of `dod/scripts/install.sh`. Without `UNIT` it prints every
+unit, each after a `# ---- deploy/systemd/<name> ----` header. It writes,
+enables and starts nothing.
 
 ## Provider (`harw provider`)
 

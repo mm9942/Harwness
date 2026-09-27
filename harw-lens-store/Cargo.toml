@@ -1,6 +1,7 @@
 [package]
 publish.workspace = true
 name = "harw-lens-store"
+description = "Content-addressed storage for chunks and indices in the Harwness-Lens layer."
 version.workspace = true
 edition.workspace = true
 license.workspace = true

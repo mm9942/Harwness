@@ -440,6 +440,7 @@ mod tests {
             nodes,
             created_at: payload_time(),
             updated_at: payload_time(),
+            tenant: None,
         }
     }
 

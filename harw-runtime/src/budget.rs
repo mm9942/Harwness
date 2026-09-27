@@ -12,7 +12,7 @@
 //!
 //! # Warum `ResolvedConfig` heute keine Budgetfelder beisteuert
 //! `harw_config::ResolvedConfig` (`harw-config/src/discovery.rs:24`) trägt
-//! `harness`, `agents`, `executable_agents`, `providers`, `models`, `skills`,
+//! `harness`, `agents`, `agent_sources`, `providers`, `models`, `skills`,
 //! `plugins`, `mcps`, `channels`, `auth` und `env_layer`; `HarnessConfig`
 //! (`harw-config/src/harness_config.rs:11`) trägt `logging`, `tui`,
 //! `session`, `policy`, `mcp_listener`, `onboarding`, `tools`, `mode`,

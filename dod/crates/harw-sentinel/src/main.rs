@@ -237,6 +237,7 @@
 
 mod cli;
 mod error;
+mod export;
 mod findings;
 mod sandbox;
 mod sensors;
@@ -698,7 +699,12 @@ fn run(cli: Cli, settings: DodSettings) -> SentinelBinResult<()> {
         .unwrap_or_else(|| home.join(cli::DEFAULT_SOCKET_FILE_NAME));
     let inbox = spawn_ipc_if_available(&socket_path);
 
-    let roots = sandbox::default_roots(
+    // Optionaler Befund-Export (`--findings-export`): vor Landlock öffnen,
+    // damit ein Konfigurationsfehler sofort im Log steht; das Verzeichnis
+    // bleibt danach für Rotation/Neuanlage beschreibbar (Regel unten).
+    let mut exporter = build_findings_exporter(&cli, sink.as_ref());
+
+    let mut roots = sandbox::default_roots(
         &cli.proc_root,
         &cli.thermal_root,
         &cli.workspace_root,
@@ -707,6 +713,12 @@ fn run(cli: Cli, settings: DodSettings) -> SentinelBinResult<()> {
         &cli.cgroup_root,
         &home,
     );
+    if let Some(dir) = exporter
+        .as_ref()
+        .and_then(export::FindingsExporter::directory)
+    {
+        roots.push(sandbox::SandboxRoot::read_write(dir.to_path_buf()));
+    }
     let outcome = sandbox::restrict_self(&roots);
     // `Sentinel` existiert an dieser Stelle noch nicht (siehe unten) — ein
     // degradiertes Ergebnis wird deshalb zwischengespeichert, statt sofort
@@ -757,12 +769,22 @@ fn run(cli: Cli, settings: DodSettings) -> SentinelBinResult<()> {
     }
 
     if cli.once {
-        poll_once(&mut sentinel, inbox.as_ref(), sink.as_ref());
+        poll_once(
+            &mut sentinel,
+            inbox.as_ref(),
+            sink.as_ref(),
+            exporter.as_mut(),
+        );
         return Ok(());
     }
 
     loop {
-        poll_once(&mut sentinel, inbox.as_ref(), sink.as_ref());
+        poll_once(
+            &mut sentinel,
+            inbox.as_ref(),
+            sink.as_ref(),
+            exporter.as_mut(),
+        );
         std::thread::sleep(timing.interval());
     }
 }
@@ -795,7 +817,14 @@ fn run(cli: Cli, settings: DodSettings) -> SentinelBinResult<()> {
 /// - `sink` (`&dyn harw_observe::TelemetrySink`): dasselbe Sink-Objekt, das
 ///   [`run`] beim Start geöffnet hat — der Ausgabeweg für gemeldete Befunde
 ///   (siehe [`findings`]-Moduldoku).
-fn poll_once(sentinel: &mut Sentinel, inbox: Option<&IpcInboxHandle>, sink: &dyn TelemetrySink) {
+/// - `exporter` (`Option<&mut export::FindingsExporter>`): der optionale
+///   JSON-Lines-Befundexport (`--findings-export`); `None` exportiert nichts.
+fn poll_once(
+    sentinel: &mut Sentinel,
+    inbox: Option<&IpcInboxHandle>,
+    sink: &dyn TelemetrySink,
+    exporter: Option<&mut export::FindingsExporter>,
+) {
     let now = Timestamp::now();
     let reading = sentinel.poll_all(now);
     tracing::debug!(
@@ -817,7 +846,7 @@ fn poll_once(sentinel: &mut Sentinel, inbox: Option<&IpcInboxHandle>, sink: &dyn
                 events = evidence.events.len(),
                 "buffer frozen into evidence"
             );
-            let reported = findings::report_findings(sink, &evidence, now);
+            let reported = findings::report_findings(sink, &evidence, now, exporter);
             tracing::debug!(
                 reported,
                 "security rules evaluated against this cycle's evidence"
@@ -827,6 +856,40 @@ fn poll_once(sentinel: &mut Sentinel, inbox: Option<&IpcInboxHandle>, sink: &dyn
             tracing::warn!(error = %error, "failed to freeze buffer into evidence this round");
         }
     }
+}
+
+/// Baut den optionalen Befund-Export aus `--findings-export`/`--findings-host`.
+///
+/// # Description
+/// Ohne `--findings-export` `None` — nichts wird exportiert. Mit dem Flag
+/// wird das `host`-Feld über [`export::resolve_host`] bestimmt; ist es
+/// weder angegeben noch aus [`export::HOSTNAME_PATH`] lesbar, bleibt der
+/// Export mit einer Warnung aus (ein falscher `host` wäre für den Hub
+/// wertlos). Sonst wird die Datei über
+/// [`export::FindingsExporter::prepare`] vorab geöffnet; ein Fehler dabei
+/// wird gezählt und geloggt, beendet den Prozess aber nie.
+fn build_findings_exporter(
+    cli: &Cli,
+    sink: &dyn TelemetrySink,
+) -> Option<export::FindingsExporter> {
+    let path = cli.findings_export.clone()?;
+    let Some(host) =
+        export::resolve_host(cli.findings_host.as_ref(), Path::new(export::HOSTNAME_PATH))
+    else {
+        tracing::warn!(
+            path = %path.display(),
+            "findings export disabled: no --findings-host and the kernel hostname is unavailable"
+        );
+        return None;
+    };
+    let mut exporter = export::FindingsExporter::new(path, host);
+    exporter.prepare(sink);
+    tracing::info!(
+        path = %exporter.path().display(),
+        max_bytes = export::MAX_EXPORT_BYTES,
+        "findings export enabled"
+    );
+    Some(exporter)
 }
 
 /// Entleert die IPC-Empfangs-Inbox in [`Sentinel::buffer`], über den
@@ -1249,7 +1312,7 @@ egress_allow_cidrs = []
                 Arc::new(harw_observe::NullSink),
                 SentinelConfig::default(),
             );
-            poll_once(&mut sentinel, Some(&inbox), &harw_observe::NullSink);
+            poll_once(&mut sentinel, Some(&inbox), &harw_observe::NullSink, None);
 
             assert_eq!(sentinel.buffer().event_len(), 1);
             let evidence = sentinel
@@ -1279,7 +1342,7 @@ egress_allow_cidrs = []
                     peer: sample_peer(),
                 });
 
-            poll_once(&mut sentinel, Some(&inbox), &harw_observe::NullSink);
+            poll_once(&mut sentinel, Some(&inbox), &harw_observe::NullSink, None);
 
             // Reihenfolge (Frage 1): das intern erzeugte `SensorDegraded`
             // aus `poll_all` steht vor dem extern eingespeisten Ereignis —
@@ -1314,7 +1377,7 @@ egress_allow_cidrs = []
                 Arc::new(harw_observe::NullSink),
                 SentinelConfig::default(),
             );
-            poll_once(&mut sentinel, None, &harw_observe::NullSink);
+            poll_once(&mut sentinel, None, &harw_observe::NullSink, None);
             assert_eq!(sentinel.buffer().event_len(), 0);
         }
     }

@@ -13,7 +13,7 @@
 //! selbst: sie ruft den passenden Übergang auf [`JobTransitions`] auf und
 //! baut die Sicht danach **neu aus dem Ledger** ([`CardRecord::view_with`]).
 //! Lehnt das Ledger ab, bleibt die Karte unverändert. Der Trait wird gegen
-//! `harw-job-runtime` (Job + Lease + Retry) implementiert; diese Crate
+//! `harw-job-core` (Job + Lease + Retry) implementiert; diese Crate
 //! liefert nur die Referenz [`InMemoryJobTransitions`] (Tests,
 //! Einzelprozess-Betrieb ohne durablen Ledger).
 //!
@@ -45,7 +45,7 @@
 use std::collections::HashMap;
 use std::sync::{Mutex, PoisonError};
 
-use harw_job_runtime::{JobRuntimeError, JobState};
+use harw_job_core::{JobRuntimeError, JobState};
 use harw_types::{ReviewDecision, RiskLevel};
 
 use crate::error::{KnowledgeError, KnowledgeResult};
@@ -53,7 +53,7 @@ use crate::visibility::AgentId;
 
 use super::board::{ARCHIVED_TAG, BlockKind, Card, CardRecord, CardState, JobSnapshot};
 
-pub use harw_job_runtime::WorkId;
+pub use harw_job_core::WorkId;
 
 /// Tag that routes [`complete`] to `Blocked { reason_kind: ReviewRequired }`
 /// instead of `Done` (§6.4).
@@ -62,7 +62,7 @@ pub const REVIEW_REQUIRED_TAG: &str = "review-required";
 /// Die Job-Übergänge, über die jede Kartenbewegung läuft (§6.2/§6.3).
 ///
 /// # Beschreibung
-/// Wird später gegen `harw-job-runtime` implementiert (`Job::mark_ready`,
+/// Wird später gegen `harw-job-core` implementiert (`Job::mark_ready`,
 /// `Job::claim` + `Lease`, `Job::complete`, Retry über `record_failure`).
 /// Jede Methode ist ein **Ledger**-Übergang; lehnt das Ledger ihn ab, meldet
 /// die Implementierung einen Fehler (üblich: [`KnowledgeError::Job`]) und
@@ -438,10 +438,10 @@ pub fn archive(
 ///
 /// # Beschreibung
 /// Hält je `WorkId` einen [`JobSnapshot`] hinter einem Mutex und erzwingt
-/// dieselben Zustandsregeln wie `harw_job_runtime::Job` (`mark_ready` nur aus
+/// dieselben Zustandsregeln wie `harw_job_core::Job` (`mark_ready` nur aus
 /// `Pending|Ready`, `claim` nur aus `Ready`, …). Nicht durabel und ohne
 /// Lease-Ablauf/Budget — gedacht für Tests und als Vorlage für den Adapter
-/// über `harw-job-runtime`, nicht als Governance-Ledger.
+/// über `harw-job-core`, nicht als Governance-Ledger.
 #[derive(Debug, Default)]
 pub struct InMemoryJobTransitions {
     jobs: Mutex<HashMap<WorkId, JobSnapshot>>,

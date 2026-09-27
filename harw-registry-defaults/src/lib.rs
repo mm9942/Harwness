@@ -64,6 +64,11 @@ pub mod agent_definition_tools;
 pub mod authority;
 // #22 wave 2B: tool name → provider, capability class, runner feature.
 pub mod capability_catalog;
+// The agent compiler's built-in defaults (`harw_agent_compiler::builtins`).
+pub mod compiler_defaults;
+// Parsen/Senken der Agentendefinitionen einer Konfiguration: `harw-config`
+// (Schicht I) reicht sie ungeparst weiter.
+pub mod config_agents;
 pub mod diary_tools;
 pub mod embedded_agents;
 pub mod kanban_tools;
@@ -101,6 +106,7 @@ pub use agent_definition_tools::{
 pub use authority::{
     AuthorityReducer, authority_reducer_for_role, delegation_targets_for_role, tool_permission,
 };
+pub use config_agents::{AgentDefinitionMeta, ConfigAgents, discover_run_agent_definitions};
 pub use diary_tools::DiaryToolProvider;
 pub use error::{RegistryDefaultsError, RegistryDefaultsResult};
 pub use kanban_tools::KanbanReadToolProvider;

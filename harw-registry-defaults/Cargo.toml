@@ -1,6 +1,7 @@
 [package]
 publish.workspace = true
 name = "harw-registry-defaults"
+description = "Shared coding-agent ExtensionRegistry assembly for consistent tool surface across CLI, TUI, and echo paths"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -12,9 +13,15 @@ tracing = "0.1"
 harw-authority = { path = "../harw-authority" }
 harw-home = { path = "../harw-home" }
 harw-agent-dsl = { path = "../harw-agent-dsl" }
+# `compiler_defaults`: implements `harw_agent_compiler::builtins::BuiltinDefaults`
+# (built-in definitions, capability catalog, generic ceilings). A → C; the
+# compiler depends on this crate only as a dev-dependency (its tests).
+harw-agent-compiler = { path = "../harw-agent-compiler" }
 harw-catalog = { path = "../harw-catalog" }
 # `[network]`-Sektion (`NetworkSection::researcher_web_hosts`) als einzige
-# Quelle des Netz-Scopes der Rolle `researcher-web` (W5 RD, Annahme A5).
+# Quelle des Netz-Scopes der Rolle `researcher-web` (W5 RD, Annahme A5), dazu
+# die ungeparsten Agentendefinitionen (`ResolvedConfig::agent_sources`), die
+# `config_agents` parst und senkt (harw-config, Schicht I, kennt die DSL nicht).
 harw-config = { path = "../harw-config" }
 # `EgressPolicy` für die Web-Werkzeuge der Rolle `researcher-web` (W5 RD).
 harw-egress = { path = "../harw-egress" }

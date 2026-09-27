@@ -13,7 +13,13 @@
 //!    step alone and never reach a session;
 //! 2. narrows the manifest's rights by the command line's rights flags
 //!    (`--deny-tool`/`--no-network`/`--read-only`/`--full-access`/
-//!    `--max-tokens`) and builds the [`harw_runtime::EmbeddedAgent`];
+//!    `--max-tokens`) and builds the [`harw_runtime::EmbeddedAgent`], then
+//!    probes the host once ([`harw_job_runtime::HostReport::probe`]) and
+//!    runs runtime admission ([`admission::check`], PL-90) against the
+//!    root agent's execution requirements: a refusal stops the start with
+//!    [`RunnerError::Admission`] (`--allow-degraded` accepts unmet
+//!    best-effort items, never `required` ones); `--requirements` prints
+//!    the same check without starting;
 //! 3. picks an interface ([`choose_interface`]: `--interface`, else the
 //!    manifest's default, else its first) and hands it a
 //!    [`context::RunnerContext`] built around that agent — or, with
@@ -38,6 +44,7 @@
 
 #![forbid(unsafe_code)]
 
+pub mod admission;
 pub mod args;
 mod child;
 mod child_protocol;
@@ -105,13 +112,27 @@ pub(crate) fn banner_wanted(args: &RunnerArgs, interface: Interface) -> bool {
     !(interface == Interface::Mcp && args.listen.is_none())
 }
 
-/// Prints the one-line manifest banner to stderr; [`banner_wanted`]
-/// decides whether it is printed at all.
-fn print_banner(ir: &harw_agent_dsl::ir_v2::AgentIr) {
+/// Prints the one-line manifest banner to stderr, followed by one warning
+/// line per requirement admission accepted degraded (`--allow-degraded`);
+/// [`banner_wanted`] decides whether it is printed at all.
+fn print_banner(ir: &harw_agent_dsl::ir_v2::AgentIr, admission: &admission::AdmissionReport) {
     eprintln!(
         "harw-agent-runner: {} v{} ({})",
         ir.id, ir.version.0, ir.specialization
     );
+    for line in degraded_warnings(admission) {
+        eprintln!("{line}");
+    }
+}
+
+/// The banner's warning lines for a degraded admission (empty for a full
+/// one). A pure function so the wording is unit tested.
+pub(crate) fn degraded_warnings(admission: &admission::AdmissionReport) -> Vec<String> {
+    admission
+        .degraded
+        .iter()
+        .map(|finding| format!("harw-agent-runner: warning: running degraded: {finding}"))
+        .collect()
 }
 
 /// Picks the interface to run, in the order the contract fixes: the
@@ -255,6 +276,12 @@ fn run(load: impl FnOnce() -> Result<(Artifact, Bundle), RunnerError>) -> ExitCo
             Err(error) => report_error(&error),
         };
     }
+    if args.requirements {
+        return match admission::run_requirements(load, args.json, args.allow_degraded) {
+            Ok(code) => code,
+            Err(error) => report_error(&error),
+        };
+    }
 
     let (artifact, bundle) = match load() {
         Ok(pair) => pair,
@@ -267,6 +294,19 @@ fn run(load: impl FnOnce() -> Result<(Artifact, Bundle), RunnerError>) -> ExitCo
     let rights =
         EffectiveRights::from_manifest(&agent.root_ir().permissions).narrowed_by(&args.flags);
     let agent = Arc::new(agent.with_rights(rights));
+
+    // Runtime admission (PL-90): one side-effect-free host probe, checked
+    // against the root's requirements (which union every embedded child),
+    // before any interface or child protocol starts.
+    let host = harw_job_runtime::HostReport::probe();
+    let admitted = match admission::check(&agent.root_ir().requirements, &host, args.allow_degraded)
+    {
+        Ok(report) => report,
+        Err(refused) => return report_error(&RunnerError::Admission(refused)),
+    };
+    for finding in &admitted.degraded {
+        tracing::warn!(item = %finding.item, "admitted degraded: {finding}");
+    }
 
     // No banner in `--child` mode (see `banner_wanted`): the interface is
     // not chosen there, so the check is `args.child` alone.
@@ -288,7 +328,7 @@ fn run(load: impl FnOnce() -> Result<(Artifact, Bundle), RunnerError>) -> ExitCo
         Err(error) => return report_error(&error),
     };
     if banner_wanted(&args, interface) {
-        print_banner(agent.root_ir());
+        print_banner(agent.root_ir(), &admitted);
     }
     let ctx = RunnerContext {
         bundle,
@@ -397,6 +437,29 @@ mod tests {
             ..RunnerArgs::default()
         };
         assert!(banner_wanted(&args, Interface::Mcp));
+    }
+
+    #[test]
+    fn test_degraded_warnings_name_each_item() {
+        assert!(degraded_warnings(&admission::AdmissionReport::default()).is_empty());
+        let report = admission::AdmissionReport {
+            degraded: vec![admission::AdmissionFinding {
+                item: "sandbox.network".to_owned(),
+                required: "best_effort".to_owned(),
+                available: "not_enforced".to_owned(),
+                overridable: true,
+                message: "sandbox network: best_effort, but this host reaches only `not_enforced`"
+                    .to_owned(),
+            }],
+        };
+        let lines = degraded_warnings(&report);
+        assert_eq!(lines.len(), 1);
+        assert!(
+            lines
+                .iter()
+                .all(|line| line.contains("warning: running degraded: sandbox network")),
+            "{lines:?}"
+        );
     }
 
     #[test]

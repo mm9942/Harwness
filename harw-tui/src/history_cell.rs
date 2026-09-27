@@ -2747,6 +2747,7 @@ mod tests {
             nodes,
             created_at: OffsetDateTime::UNIX_EPOCH,
             updated_at: OffsetDateTime::UNIX_EPOCH,
+            tenant: None,
         }
     }
 

@@ -1,6 +1,7 @@
 [package]
 publish.workspace = true
 name = "harw-types"
+description = "Phase-0 Harness vocabulary: core serde types for IDs, roles, security, and infrastructure"
 version.workspace = true
 edition.workspace = true
 license.workspace = true

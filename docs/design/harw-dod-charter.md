@@ -11,8 +11,8 @@ is, what it may do and what it explicitly may not do.
 
 ## 1. Why a facade at all
 
-The security subsystem is split across roughly thirty crates in the `dod/`
-workspace, at several layers: capability/data vocabulary
+The security subsystem is split across roughly thirty crates under
+`dod/crates/` (members of the root workspace since PL-60), at several layers: capability/data vocabulary
 (`harw-dod-cap`, `harw-dod-signals`, `harw-dod-readfs`, `harw-dod-fixtures`),
 thirteen `Sensor`-implementing crates (`harw-dod-cpu`, `-thermal`, `-memory`,
 `-blockio`, `-netcounters`, `-gpu`, `-cgroup`, `-listener`, `-scanreport`,

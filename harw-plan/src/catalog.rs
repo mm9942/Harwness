@@ -292,6 +292,7 @@ mod tests {
             nodes: vec![done, gone, running, open],
             created_at: OffsetDateTime::UNIX_EPOCH,
             updated_at: OffsetDateTime::UNIX_EPOCH,
+            tenant: None,
         };
         assert_eq!(plan_progress(&plan), (1, 3));
         assert_eq!(

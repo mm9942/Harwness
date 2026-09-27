@@ -1115,7 +1115,8 @@ fn the_operation_surface_reaches_the_assembled_run() -> TestResult {
 /// `ResearchDepsOperation`, `ResearchWebOperation`, `AnalyzeOperation` und
 /// die allgemeine Recherche `research` (Runde 3, Welle B)
 /// (`OperationMeta::name` je Datei in `harw-ops/src/{plan,goal,explore,
-/// research,analyze}.rs`).
+/// research,analyze}.rs`), dazu die WorkDriver-Werkzeuge unter demselben
+/// Gate (`harw-ops/src/work_driver.rs`).
 const PLAN_TOOL_NAMES: &[&str] = &[
     "plan",
     "goal",
@@ -1124,6 +1125,11 @@ const PLAN_TOOL_NAMES: &[&str] = &[
     "research_web",
     "analyze",
     "research",
+    // R14: die WorkDriver-Fläche hängt am selben Gate
+    // (`harw_ops::register_work_driver_tools`).
+    "work_driver.enqueue",
+    "work_driver.status",
+    "work_driver.stop",
 ];
 
 /// Runde 5, Teil H: `agent.result` steht an der Wurzel genau dann, wenn sie

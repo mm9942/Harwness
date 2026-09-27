@@ -1,0 +1,54 @@
+[package]
+publish.workspace = true
+name = "harw-infra-client"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "Typed local clients for the Harwness infrastructure daemons (AuthHub secure.sock, NetSec network.sock, SecurityHub security.sock)."
+
+[dependencies]
+# Wire codec only: `crypt_guard_hyper::codec::{FrameWriter, FrameReader,
+# CONTENT_TYPE}` and `codec::frame::{MAGIC, VERSION}`. No CryptGuard type
+# appears in this crate's public API (masterplan §11, drift report D5).
+crypt_guard_hyper = { workspace = true }
+
+# HTTP/1 over AF_UNIX, one connection per call (masterplan §6, §24). Same
+# major versions as `harw-web` / `harw-mcp-server`.
+hyper = { version = "1", features = ["client", "http1"] }
+hyper-util = { version = "0.1", features = ["tokio"] }
+http = "1"
+http-body-util = "0.1"
+# `Bytes::from_owner` (secret request bodies with a zeroizing owner) needs 1.9.
+bytes = "1.9"
+# `rt`: the `AuthHubDekWrapper` sync bridge builds a short-lived
+# current-thread runtime per call on its own OS thread (`dek` module docs).
+tokio = { version = "1", features = ["net", "time", "macros", "rt"] }
+
+# Plaintext key material and the bearer token live in zeroizing memory.
+zeroize = "1"
+
+# `InfraClientConfig` and the JSON health/version/capabilities contract (§38).
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+# `AuthHubDekWrapper` implements `harw_secrets::DekWrapper` for V3
+# (KMS-wrapped) secret records. `crypt_guard` is used only to build
+# `SecretsError::Open(pq_hpke::Error::AuthenticationFailed)` for a hub `422`
+# on unwrap (parity with the local wrapper); no CryptGuard type is in this
+# crate's own public API.
+harw-secrets = { path = "../harw-secrets" }
+crypt_guard = { workspace = true }
+
+[dev-dependencies]
+# In-test hub: a tiny hyper HTTP/1 server on a tempdir Unix socket.
+hyper = { version = "1", features = ["client", "server", "http1"] }
+hyper-util = { version = "0.1", features = ["tokio"] }
+tokio = { version = "1", features = ["rt", "macros", "net", "time"] }
+tempfile = { workspace = true }
+# `SecretBox` for the `SecretStore` end-to-end test (same version as harw-secrets).
+secrecy = "0.8"
+
+[lints]
+workspace = true

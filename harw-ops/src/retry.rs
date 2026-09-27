@@ -49,16 +49,20 @@ async fn retry(ctx: &OpContext, args: RetryArgs) -> Result<OpOutput, OpError> {
         .service::<Arc<JobStore>>()
         .ok_or_else(|| OpError::NotAvailable("durable job store is not configured".to_owned()))?;
 
-    let event = store
-        .retry(
-            &WorkId::from_str(work_id),
-            &RetryRequest {
-                retried_at: jiff::Timestamp::now(),
-                retried_by: ApprovalActor::Operator {
-                    id: "local-command".to_owned(),
+    let work_id_typed = WorkId::from_str(work_id);
+    // H12: ein fremder Job wird wie ein unbekannter behandelt.
+    let event = crate::job_tenant::ensure_job_visible(ctx, store, &work_id_typed)
+        .and_then(|()| {
+            store.retry(
+                &work_id_typed,
+                &RetryRequest {
+                    retried_at: jiff::Timestamp::now(),
+                    retried_by: ApprovalActor::Operator {
+                        id: "local-command".to_owned(),
+                    },
                 },
-            },
-        )
+            )
+        })
         .map_err(|error| {
             OpError::Execution(format!("could not retry durable job `{work_id}`: {error}"))
         })?;
@@ -289,6 +293,74 @@ mod tests {
             "must not requeue silently"
         );
         assert_eq!(persisted.job.attempts, 2);
+        Ok(())
+    }
+
+    // H12: Mandanten-Filter (unscoped sieht alles, scoped nur den eigenen
+    // Mandanten, fremde Jobs verhalten sich wie unbekannte).
+    #[tokio::test]
+    async fn retry_unscoped_caller_reaches_every_tenant() -> TestResult {
+        use crate::job_tenant::fixtures::{JOB_B, context, state_of, two_tenants};
+        let jobs = two_tenants(JobState::Failed)?;
+        let op_ctx = context(&jobs, None)?;
+        let output = retry(
+            &op_ctx,
+            RetryArgs {
+                work_id: Some(JOB_B.to_owned()),
+            },
+        )
+        .await
+        .map_err(ctx("retry foreign job without scope"))?;
+        assert!(output.text.contains(JOB_B), "{}", output.text);
+        assert_eq!(state_of(&jobs, JOB_B)?, JobState::Ready);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn retry_scoped_caller_reaches_own_tenant() -> TestResult {
+        use crate::job_tenant::fixtures::{JOB_A, TENANT_A, context, state_of, two_tenants};
+        let jobs = two_tenants(JobState::Failed)?;
+        let op_ctx = context(&jobs, Some(TENANT_A))?;
+        let output = retry(
+            &op_ctx,
+            RetryArgs {
+                work_id: Some(JOB_A.to_owned()),
+            },
+        )
+        .await
+        .map_err(ctx("retry own job"))?;
+        assert!(output.text.contains(JOB_A), "{}", output.text);
+        assert_eq!(state_of(&jobs, JOB_A)?, JobState::Ready);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn retry_scoped_caller_foreign_job_is_hidden_like_missing() -> TestResult {
+        use crate::job_tenant::fixtures::{
+            JOB_B, MISSING, TENANT_A, assert_hidden_like_missing, context, state_of, two_tenants,
+        };
+        let jobs = two_tenants(JobState::Failed)?;
+        let op_ctx = context(&jobs, Some(TENANT_A))?;
+        let foreign = retry(
+            &op_ctx,
+            RetryArgs {
+                work_id: Some(JOB_B.to_owned()),
+            },
+        )
+        .await;
+        let missing = retry(
+            &op_ctx,
+            RetryArgs {
+                work_id: Some(MISSING.to_owned()),
+            },
+        )
+        .await;
+        assert_hidden_like_missing(foreign, missing)?;
+        assert_eq!(
+            state_of(&jobs, JOB_B)?,
+            JobState::Failed,
+            "foreign job untouched"
+        );
         Ok(())
     }
 }

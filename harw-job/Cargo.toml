@@ -1,0 +1,32 @@
+[package]
+publish.workspace = true
+name = "harw-job"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "Public facade of the Harw job runtime (Job-Runtime-Doc §16): JobRuntime::builder().store(..).executor(..).build(), submit a JobSpec, wait for its JobResult. Lower layers stay separately consumable."
+
+[features]
+default = []
+# Bubblewrap sandbox backend (`LinuxSandboxBackend::Bwrap`).
+bwrap = ["harw-job-runtime/bwrap"]
+
+[dependencies]
+# Model: JobSpec (+ builder), WorkspacePath, ResourceRequest, sandbox enums,
+# outcomes, ids.
+harw-job-core = { path = "../harw-job-core" }
+# FsJobRecordStore, the default file-backed store.
+harw-job-store = { path = "../harw-job-store" }
+# Coordinator, executors, RuntimeError, JobHandle/JobResult.
+harw-job-runtime = { path = "../harw-job-runtime" }
+# WorkId (job identity of the store records).
+harw-types = { path = "../harw-types" }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+tokio = { version = "1", features = ["rt", "macros", "time"] }
+
+[lints]
+workspace = true

@@ -12,6 +12,7 @@ code wins and the document is a bug.
 - [Build prerequisites](setup/build-prerequisites.md)
 - [Local models: vLLM, LM Studio and Ollama](setup/local-models.md)
 - [DoD (Defense-on-Device)](setup/dod.md) — *partially implemented*
+- [Control plane (`harw web`)](setup/web.md) — *implemented*
 - [`crypt_guard` integration in `harw-secrets`](setup/crypt-guard.md)
 
 ## Using Harwness
@@ -19,6 +20,8 @@ code wins and the document is a bug.
 - [`harw` command line](cli.md)
 - [Background orchestrators: control, messaging, handoff](guides/background-agents.md)
 - [Compiling agents into standalone binaries](guides/agent-compiler.md) — *planned in #22*
+- [KMS operations: the Auth/Crypto Hub](guides/kms-operations.md) — *partially implemented*
+- [Driving workers to a goal: the WorkDriver](guides/work-driver.md) — *partially implemented*
 
 ## Philosophy
 
@@ -90,6 +93,10 @@ Architecture decision records live in [`adr/`](adr/), numbered in order.
 | [Harwness TUI Interaction Contract](design/tui-command-contract.md) | partially implemented |
 | [Roles, Models, Modes, and Approval in the TUI](design/tui-roles-models-modes.md) | implemented |
 | [Business Wargaming, Analytical Tradecraft, and Visualization](design/wargaming-and-analysis.md) | partially implemented |
+
+## Planning
+
+Future architecture lives in [`planning/`](planning/README.md), not here. Planning documents describe intended deltas against a pinned baseline commit and are never implemented status; the [migration ledger](planning/90-migration-ledger/MIGRATION_LEDGER.md) records when a plan lands in code.
 
 ## Audits and research
 

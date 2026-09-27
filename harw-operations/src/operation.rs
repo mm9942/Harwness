@@ -18,6 +18,20 @@
 //! - [`ArgsSchemaFn`] — Zeiger auf das Argument-Schema einer Operation
 //! - [`ArgsSchemaProbe`] — Typ-Sonde, mit der `#[operation]` das Schema bedingt bindet
 //!
+//! # Namenskonvention für Infrastruktur-Operationen
+//! Infrastruktur-Operationen (Auth/Crypto-Hub, NetSec, SecurityHub) heißen
+//! verbindlich `infra.<area>.<noun-plural>.<verb>`, z. B.
+//! `infra.auth.keys.list`, `infra.auth.keys.rotate`,
+//! `infra.network.nodes.drain`, `infra.network.routes.update`,
+//! `infra.security.incidents.list`. Das Nomen steht immer im Plural — auch
+//! wenn das Verb auf genau ein Objekt wirkt (Drain *eines* Knotens heißt
+//! `infra.network.nodes.drain`, nicht `infra.network.node.drain`). Damit ist
+//! die Schreibweise aus Masterplan v2 §1.2 kanonisch; das Singular-Beispiel in
+//! §12.3 ist überholt. Die Domäne solcher Operationen ist eine der
+//! Infrastruktur-Domänen [`OperationDomain::Identity`],
+//! [`OperationDomain::Network`], [`OperationDomain::Security`] oder
+//! [`OperationDomain::Crypto`] — nicht `CatalogConfig` oder `Misc` (§31).
+//!
 //! # Nebenläufigkeit
 //! [`Operation`] ist `Send + Sync`, damit Implementierungen in `Arc<dyn Operation>`
 //! über Thread-Grenzen geteilt werden können. [`OpFuture`] ist `Send`.
@@ -47,7 +61,8 @@ use crate::op_schema::OpArgsSchema;
 /// let d = OperationDomain::Session;
 /// assert_eq!(d, OperationDomain::Session);
 /// ```
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum OperationDomain {
     /// Session-Verwaltung: Starten, Beenden, Auflisten von Sessions.
     Session,
@@ -59,8 +74,90 @@ pub enum OperationDomain {
     CatalogConfig,
     /// Wissensbasis-Operationen: Suche, Indizierung, Annotation.
     Knowledge,
+    /// Identitäten und Schlüssel-Metadaten: Geräte, Principals, Auth-Hub
+    /// (z. B. `infra.auth.keys.list`, `infra.auth.devices.list`).
+    Identity,
+    /// Netzwerk-Topologie: Knoten, Routen, Drain (z. B. `infra.network.nodes.drain`).
+    Network,
+    /// Sicherheitslage: Incidents, Policies, Containment
+    /// (z. B. `infra.security.incidents.list`).
+    Security,
+    /// Kryptographische Steuerung: Schlüsselrotation, Verschlüsselungsformate
+    /// (z. B. `infra.auth.keys.rotate`).
+    Crypto,
     /// Sonstige Operationen ohne spezifische Domäne.
     Misc,
+}
+
+impl OperationDomain {
+    /// Alle Domänen in kanonischer Reihenfolge (Hilfe-/Navigations-Sortierung).
+    pub const ALL: [Self; 10] = [
+        Self::Session,
+        Self::Agents,
+        Self::Execution,
+        Self::CatalogConfig,
+        Self::Knowledge,
+        Self::Identity,
+        Self::Network,
+        Self::Security,
+        Self::Crypto,
+        Self::Misc,
+    ];
+
+    /// Stabiler `snake_case`-Slug; identisch mit dem Serde-Namen und dem
+    /// `domain = "..."`-Literal des `#[operation]`-Makros.
+    ///
+    /// # Beispiel
+    /// ```rust
+    /// use harw_operations::operation::OperationDomain;
+    ///
+    /// assert_eq!(OperationDomain::CatalogConfig.as_str(), "catalog_config");
+    /// assert_eq!(OperationDomain::Crypto.as_str(), "crypto");
+    /// ```
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Session => "session",
+            Self::Agents => "agents",
+            Self::Execution => "execution",
+            Self::CatalogConfig => "catalog_config",
+            Self::Knowledge => "knowledge",
+            Self::Identity => "identity",
+            Self::Network => "network",
+            Self::Security => "security",
+            Self::Crypto => "crypto",
+            Self::Misc => "misc",
+        }
+    }
+
+    /// Parst einen Slug (siehe [`Self::as_str`]); `None` für unbekannte Werte.
+    #[must_use]
+    pub fn from_slug(slug: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|d| d.as_str() == slug)
+    }
+
+    /// Abgeleitete Hilfe-Kategorie, wenn `#[operation]` keine explizite
+    /// `category` angibt. Muss mit dem Makro-Mapping in
+    /// `harw-macros/src/operation.rs` übereinstimmen.
+    #[must_use]
+    pub const fn default_category(self) -> OperationCategory {
+        match self {
+            Self::Session => OperationCategory::Session,
+            Self::Agents => OperationCategory::Agent,
+            Self::Execution | Self::Identity | Self::Network | Self::Security | Self::Crypto => {
+                OperationCategory::System
+            }
+            Self::CatalogConfig => OperationCategory::Model,
+            Self::Knowledge => OperationCategory::Knowledge,
+            Self::Misc => OperationCategory::Misc,
+        }
+    }
+}
+
+impl std::fmt::Display for OperationDomain {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
 }
 
 /// Command grouping for user-facing /help rendering.
@@ -1298,6 +1395,94 @@ mod tests {
     #[test]
     fn test_operation_domain_debug_is_non_empty() {
         assert!(!format!("{:?}", OperationDomain::Misc).is_empty());
+    }
+
+    #[test]
+    fn test_operation_domain_serde_roundtrip_all_variants() -> TestResult {
+        for domain in OperationDomain::ALL {
+            let json = serde_json::to_string(&domain)
+                .map_err(ctx("Serialisierung darf nicht fehlschlagen"))?;
+            assert_eq!(json, format!("\"{}\"", domain.as_str()));
+            let back: OperationDomain = serde_json::from_str(&json)
+                .map_err(ctx("Deserialisierung darf nicht fehlschlagen"))?;
+            assert_eq!(back, domain);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn test_operation_domain_infra_variants_serde_names() -> TestResult {
+        for (domain, slug) in [
+            (OperationDomain::Identity, "\"identity\""),
+            (OperationDomain::Network, "\"network\""),
+            (OperationDomain::Security, "\"security\""),
+            (OperationDomain::Crypto, "\"crypto\""),
+            (OperationDomain::CatalogConfig, "\"catalog_config\""),
+        ] {
+            let json = serde_json::to_string(&domain)
+                .map_err(ctx("Serialisierung darf nicht fehlschlagen"))?;
+            assert_eq!(json, slug);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn test_operation_domain_rejects_unknown_serde_name() {
+        assert!(serde_json::from_str::<OperationDomain>("\"infra\"").is_err());
+        assert!(serde_json::from_str::<OperationDomain>("\"Crypto\"").is_err());
+    }
+
+    #[test]
+    fn test_operation_domain_display_and_from_slug_agree() {
+        for domain in OperationDomain::ALL {
+            assert_eq!(domain.to_string(), domain.as_str());
+            assert_eq!(OperationDomain::from_slug(domain.as_str()), Some(domain));
+        }
+        assert_eq!(OperationDomain::from_slug("unknown"), None);
+    }
+
+    #[test]
+    fn test_operation_domain_all_slugs_unique() {
+        let mut slugs: Vec<&str> = OperationDomain::ALL
+            .into_iter()
+            .map(OperationDomain::as_str)
+            .collect();
+        slugs.sort_unstable();
+        slugs.dedup();
+        assert_eq!(slugs.len(), OperationDomain::ALL.len());
+    }
+
+    #[test]
+    fn test_operation_domain_default_category_mapping() {
+        assert_eq!(
+            OperationDomain::Session.default_category(),
+            OperationCategory::Session
+        );
+        assert_eq!(
+            OperationDomain::Agents.default_category(),
+            OperationCategory::Agent
+        );
+        assert_eq!(
+            OperationDomain::CatalogConfig.default_category(),
+            OperationCategory::Model
+        );
+        assert_eq!(
+            OperationDomain::Knowledge.default_category(),
+            OperationCategory::Knowledge
+        );
+        assert_eq!(
+            OperationDomain::Misc.default_category(),
+            OperationCategory::Misc
+        );
+        for infra in [
+            OperationDomain::Execution,
+            OperationDomain::Identity,
+            OperationDomain::Network,
+            OperationDomain::Security,
+            OperationDomain::Crypto,
+        ] {
+            assert_eq!(infra.default_category(), OperationCategory::System);
+        }
     }
 
     // ── PermissionTier ordering ───────────────────────────────────────────────

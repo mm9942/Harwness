@@ -33,7 +33,7 @@ use std::future::Future;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 
-use harw_job_runtime::{
+use harw_job_core::{
     Budget, Job, JobCompletion, JobKind, JobScope, JobState, Lease, RetryPolicy, StoredJob,
 };
 use harw_session_store::{CancelRequest, JobStore, SessionStoreError};
@@ -1029,7 +1029,7 @@ mod tests {
     use super::*;
     use std::sync::Mutex;
 
-    use harw_job_runtime::{Budget, Job, RetryPolicy};
+    use harw_job_core::{Budget, Job, RetryPolicy};
     use harw_session_store::ClaimRequest;
     use jiff::SignedDuration;
 

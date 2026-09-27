@@ -13,7 +13,9 @@ use crate::policy::{AeadAlgo, KemAlgo};
 ///
 /// The missing-field default is deliberately the legacy direct-HPKE layout:
 /// records written before this discriminator existed were all direct HPKE
-/// records. New records must explicitly use [`Self::DekWrappedV2`].
+/// records. New records must explicitly use [`Self::DekWrappedV2`] or, when a
+/// [`crate::dek_wrapper::DekWrapper`] (KMS) is configured,
+/// [`Self::KmsWrappedV3`].
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub enum SecretEnvelopeFormat {
     /// Legacy record whose payload is sealed directly to the KEK with HPKE.
@@ -23,6 +25,14 @@ pub enum SecretEnvelopeFormat {
     /// Two-layer record: payload under a per-secret DEK, then DEK under the KEK.
     #[serde(rename = "dek_wrapped_v2")]
     DekWrappedV2,
+    /// KMS record (Crypto-Masterplan v2 §16.4): payload under a per-secret DEK
+    /// exactly as in V2 (same payload AAD, so a V2 record migrates without
+    /// re-encrypting its payload), DEK wrapped by a
+    /// [`crate::dek_wrapper::DekWrapper`] (AuthHub KMS or the local HPKE
+    /// wrapper). The record additionally carries [`SecretRecord::key_id`],
+    /// [`SecretRecord::key_generation`] and [`SecretRecord::crypto_profile_id`].
+    #[serde(rename = "kms_wrapped_v3")]
+    KmsWrappedV3,
 }
 
 /// Full on-disk record for one sealed secret. Every byte field here is
@@ -36,15 +46,21 @@ pub struct SecretRecord {
     /// records safely decode as [`SecretEnvelopeFormat::LegacyDirectHpke`].
     #[serde(default)]
     pub envelope_format: SecretEnvelopeFormat,
-    /// Complete `crypt_guard` CGv2 envelope. It contains the ML-KEM
-    /// encapsulation ciphertext, nonce, and authenticated payload; its session
-    /// key is a fresh per-secret derived DEK and is never exported.
+    /// Payload ciphertext. [`SecretEnvelopeFormat::DekWrappedV2`]: the secret
+    /// bytes encrypted locally under a fresh random 32-byte per-secret DEK with
+    /// `aead_algo` (AAD binds the secret id and AEAD). Legacy
+    /// [`SecretEnvelopeFormat::LegacyDirectHpke`]: the complete serialized
+    /// `crypt_guard` v3 PQ HPKE envelope sealing the secret directly to the KEK.
     pub ciphertext: Vec<u8>,
-    /// Bare AEAD nonce, populated only on a future non-`crypt_guard` path
-    /// (CGv2 embeds its own nonce inside `ciphertext`).
+    /// V2: the local payload AEAD nonce (24 bytes XChaCha20-Poly1305, 12 bytes
+    /// AES-GCM-SIV). V1: empty — the HPKE envelope derives its own nonce.
     pub nonce: Vec<u8>,
-    /// ML-KEM encapsulation ciphertext duplicated from the CGv2 envelope. It
-    /// binds the record-level metadata to the envelope's derived DEK reference.
+    /// V2: the serialized `crypt_guard` v3 PQ HPKE envelope (`CGH3`) that wraps
+    /// only the DEK for the KEK; its AAD binds id, `key_version`, KEM and AEAD,
+    /// and rotation rewraps only this field. V1: the HPKE encapsulation
+    /// duplicated from `ciphertext`, cross-checked on open. V3: the opaque
+    /// bytes returned by [`crate::dek_wrapper::DekWrapper::wrap_dek`]; their
+    /// layout belongs to the wrapper's crypto profile.
     pub wrapped_dek: Vec<u8>,
     /// Hybrid KEM that produced `wrapped_dek`. Retired pure ML-KEM levels
     /// (`KemAlgo::Legacy*`) still deserialize, but such records can no longer
@@ -53,7 +69,26 @@ pub struct SecretRecord {
     /// AEAD cipher that produced `ciphertext`.
     pub aead_algo: AeadAlgo,
     /// Which KEK generation wrapped `wrapped_dek`; drives rotation detection.
+    /// V3: mirrors [`Self::key_generation`] (checked on open) so metadata and
+    /// listings show the wrapping generation; the local-KEK rotation and
+    /// generation checks of the store do not apply to V3 records.
     pub key_version: KeyVersion,
+    /// V3 only: KMS key reference `"namespace/id"` that wrapped the DEK.
+    /// Absent (and not serialized) for V1/V2, so their JSON stays
+    /// byte-identical.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub key_id: Option<String>,
+    /// V3 only: generation of [`Self::key_id`] that wrapped the DEK, with
+    /// Harwness [`KeyVersion`] semantics (0-based, `0` = genesis). The
+    /// CryptGuard service `KeyVersion` is 1-based (`NonZeroU32`): CryptGuard
+    /// version = `key_generation + 1`, see
+    /// [`crate::dek_wrapper::crypt_guard_key_version`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub key_generation: Option<u32>,
+    /// V3 only: crypto profile of the wrapper that produced `wrapped_dek`
+    /// (e.g. [`crate::dek_wrapper::LOCAL_HPKE_PROFILE_ID`]).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub crypto_profile_id: Option<String>,
 }
 
 /// Admin-visible metadata for a stored secret. Never contains raw secret
@@ -91,6 +126,9 @@ mod tests {
             kem_algo: KemAlgo::MlKem768X25519,
             aead_algo: AeadAlgo::XChaCha20Poly1305,
             key_version: KeyVersion(7),
+            key_id: None,
+            key_generation: None,
+            crypto_profile_id: None,
         };
 
         let encoded = serde_json::to_string(&record)?;
@@ -112,6 +150,37 @@ mod tests {
             serde_json::to_string(&SecretEnvelopeFormat::LegacyDirectHpke)?,
             r#""direct_hpke_v1""#
         );
+        assert_eq!(
+            serde_json::to_string(&SecretEnvelopeFormat::KmsWrappedV3)?,
+            r#""kms_wrapped_v3""#
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn v3_record_serializes_its_kms_fields_and_round_trips() -> TestResult {
+        let record = SecretRecord {
+            id: SecretId::parse("018f1c2e-4d5a-7b80-9123-456789abcdef")
+                .map_err(crate::test_support::ctx("parse id"))?,
+            envelope_format: SecretEnvelopeFormat::KmsWrappedV3,
+            ciphertext: vec![1],
+            nonce: vec![2],
+            wrapped_dek: vec![3],
+            kem_algo: KemAlgo::MlKem768X25519,
+            aead_algo: AeadAlgo::XChaCha20Poly1305,
+            key_version: KeyVersion(4),
+            key_id: Some("secrets/dek-wrap".to_owned()),
+            key_generation: Some(4),
+            crypto_profile_id: Some("local-hpke-v1".to_owned()),
+        };
+
+        let encoded = serde_json::to_string(&record)?;
+        assert_eq!(
+            encoded,
+            r#"{"id":"018f1c2e-4d5a-7b80-9123-456789abcdef","envelope_format":"kms_wrapped_v3","ciphertext":[1],"nonce":[2],"wrapped_dek":[3],"kem_algo":"ml_kem_768_x25519","aead_algo":"x_chacha20_poly1305","key_version":4,"key_id":"secrets/dek-wrap","key_generation":4,"crypto_profile_id":"local-hpke-v1"}"#
+        );
+        let decoded: SecretRecord = serde_json::from_str(&encoded)?;
+        assert_eq!(decoded, record);
         Ok(())
     }
 

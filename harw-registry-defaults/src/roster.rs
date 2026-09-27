@@ -6,7 +6,7 @@
 //! Bis Plan R9 war nur [`role_names::ALL`] startbar. Eine Definition unter
 //! `~/.harw/profiles/<p>/agents/<name>/definition.toml` oder
 //! `<projekt>/.harw/agents/<name>/definition.toml` wurde zwar entdeckt und
-//! gesenkt (`harw_config::ResolvedConfig::executable_agents`), war aber nie
+//! gesenkt (`config_agents::ConfigAgents::executable_agents`), war aber nie
 //! ein Spawn-Ziel.
 //!
 //! # Regeln für benutzerdefinierte Agenten
@@ -67,9 +67,9 @@ use harw_agent_dsl::layers::DefinitionLayer;
 use harw_agent_dsl::roles::AgentRoleId;
 use harw_agent_dsl::{AgentIr, ExecutableAgentIr};
 use harw_authority::Permission;
-use harw_config::AgentDefinitionMeta;
 use time::OffsetDateTime;
 
+use crate::config_agents::{AgentDefinitionMeta, ConfigAgents};
 use crate::embedded_agents::{
     BASE_DEFINITION_NAMES, CHILD_ORCHESTRATOR_BASE_NAME, WORKER_BASE_NAME, builtin_agent_irs,
     builtin_base_irs,
@@ -147,7 +147,7 @@ pub enum RosterSource {
     BuiltIn,
     /// Eine benutzerdefinierte Definition aus Profil oder vertrautem Projekt.
     Custom {
-        /// Die kanonische `DefinitionId` (`ResolvedConfig::agent_irs`).
+        /// Die kanonische `DefinitionId` (`ConfigAgents::agent_irs`).
         definition_id: String,
         /// Die höchste Schicht, aus der die Definition stammt.
         layer: Option<DefinitionLayer>,
@@ -246,8 +246,9 @@ enum Ancestor<'a> {
 }
 
 impl AgentRoster {
-    /// Baut den Roster aus den eingebauten Rollen und der aufgelösten Config
-    /// (Kompatibilitätsweg für Aufrufer mit der Laufzeitsicht).
+    /// Baut den Roster aus den eingebauten Rollen und den gesenkten
+    /// Definitionen der Config ([`ConfigAgents`]; Kompatibilitätsweg für
+    /// Aufrufer mit der Laufzeitsicht).
     ///
     /// # Description
     /// `builtin` bestimmt nur, **welche** eingebauten Rollen aufgenommen
@@ -260,26 +261,26 @@ impl AgentRoster {
     /// Wie [`Self::build`], dazu das Senken der eingebauten Rollen.
     pub fn from_config(
         builtin: &HashMap<String, ExecutableAgentIr>,
-        config: &harw_config::ResolvedConfig,
+        agents: &ConfigAgents,
     ) -> Result<Self, RegistryDefaultsError> {
         let irs: HashMap<String, AgentIr> = builtin_agent_irs(OffsetDateTime::now_utc())?
             .into_iter()
             .filter(|(name, _)| builtin.contains_key(name))
             .collect();
-        Self::from_irs(&irs, config)
+        Self::from_irs(&irs, agents)
     }
 
     /// Baut den Roster aus den typisierten eingebauten Rollen
-    /// ([`crate::embedded_agents::builtin_agent_irs`]) und der aufgelösten
-    /// Config (`ResolvedConfig::agent_irs`, #22 Welle 1B).
+    /// ([`crate::embedded_agents::builtin_agent_irs`]) und den gesenkten
+    /// Definitionen der Config ([`ConfigAgents::agent_irs`], #22 Welle 1B).
     ///
     /// # Errors
     /// Wie [`Self::build`].
     pub fn from_irs(
         builtin: &HashMap<String, AgentIr>,
-        config: &harw_config::ResolvedConfig,
+        agents: &ConfigAgents,
     ) -> Result<Self, RegistryDefaultsError> {
-        Self::build(builtin, &config.agent_irs, &config.agent_definition_meta)
+        Self::build(builtin, &agents.agent_irs, &agents.agent_definition_meta)
     }
 
     /// Baut den Roster.
@@ -288,8 +289,8 @@ impl AgentRoster {
     /// - `builtin`: die typisierten eingebauten Rollen
     ///   ([`crate::embedded_agents::builtin_agent_irs`]), nach Rollenname.
     /// - `local`: die typisierten Definitionen der vertrauten Layer
-    ///   (`ResolvedConfig::agent_irs`), nach `DefinitionId`.
-    /// - `meta`: Herkunftsschicht dazu (`ResolvedConfig::agent_definition_meta`),
+    ///   ([`ConfigAgents::agent_irs`]), nach `DefinitionId`.
+    /// - `meta`: Herkunftsschicht dazu ([`ConfigAgents::agent_definition_meta`]),
     ///   nach `DefinitionId`. Beschreibung, Instruktionen und
     ///   Delegationsziele liest der Roster aus der IR.
     ///
@@ -382,12 +383,21 @@ impl AgentRoster {
                 );
                 continue;
             };
-            let extra_allowed: &[&str] = if writes {
-                GENERIC_WORKER_WRITE_TOOLS
+            let mut extra_allowed: Vec<&str> = if writes {
+                GENERIC_WORKER_WRITE_TOOLS.to_vec()
             } else {
-                &[]
+                Vec::new()
             };
-            let mut clamped = ir.clamped_to_with(ceiling, extra_allowed);
+            // A custom orchestrator with a `[work_driver]` section gets
+            // `work_driver.enqueue/status/stop` from lowering; without this
+            // they would be dropped again here because the base ceiling
+            // (a plain orchestrator role) does not carry them. Only widen
+            // the clamp for these three names, and only when the IR
+            // actually carries a `[work_driver]` section.
+            if ir.work_driver.is_some() {
+                extra_allowed.extend_from_slice(crate::capability_catalog::WORK_DRIVER_TOOLS);
+            }
+            let mut clamped = ir.clamped_to_with(ceiling, &extra_allowed);
             if let Some(cap) = depth_cap {
                 clamped = clamped.with_max_depth_at_most(cap);
             }
@@ -800,9 +810,7 @@ mod tests {
     }
 
     /// Schreibt `definitions` als Profil-Layer und entdeckt ihn.
-    fn discover(
-        definitions: &[(&str, &str)],
-    ) -> TestResult<(tempfile::TempDir, harw_config::ResolvedConfig)> {
+    fn discover(definitions: &[(&str, &str)]) -> TestResult<(tempfile::TempDir, ConfigAgents)> {
         let home = tempfile::tempdir().map_err(ctx("tempdir"))?;
         for (dir, source) in definitions {
             let path = home.path().join("agents").join(dir);
@@ -811,7 +819,8 @@ mod tests {
         }
         let config =
             harw_config::discover_config(&[home.path().to_path_buf()]).map_err(ctx("Discovery"))?;
-        Ok((home, config))
+        let agents = ConfigAgents::from_config(&config).map_err(ctx("Agenten senken"))?;
+        Ok((home, agents))
     }
 
     fn worker(id: &str, name: &str, extends: &str, tools: &str) -> String {
@@ -1155,6 +1164,7 @@ specialization = "fake-lead"
             .map_err(ctx("system.md"))?;
         let config =
             harw_config::discover_config(&[home.path().to_path_buf()]).map_err(ctx("Discovery"))?;
+        let config = ConfigAgents::from_config(&config).map_err(ctx("Agenten senken"))?;
         let roster = AgentRoster::from_irs(&builtin, &config).map_err(ctx("Roster"))?;
         let entry = roster
             .entry("note-taker")
@@ -1298,6 +1308,90 @@ specialization = "fake-lead"
                 );
             }
         }
+        Ok(())
+    }
+
+    /// A custom orchestrator with a `[work_driver]` section keeps
+    /// `work_driver.enqueue/status/stop` through the clamp even though the
+    /// `child-orchestrator-base` ceiling does not carry them: the clamp's
+    /// `extra_allowed` is widened by exactly `WORK_DRIVER_TOOLS` when the IR
+    /// has a `[work_driver]` section.
+    #[test]
+    fn custom_orchestrator_with_work_driver_keeps_its_three_tools_through_the_clamp() -> TestResult
+    {
+        let builtin = builtin()?;
+        let (_home, config) = discover(&[(
+            "driven-lead",
+            r#"schema = "harwness.agent/v1"
+id = "user.agent.driven-lead@1"
+version = "1.0.0"
+extends = { id = "harwness.agent.child-orchestrator-base@1" }
+role = "child-orchestrator"
+specialization = "driven-lead"
+
+[delegation]
+targets = ["executor", "analyst"]
+
+[tools]
+admitted = ["work_driver.enqueue", "work_driver.status", "work_driver.stop"]
+
+[work_driver]
+worker_role = "executor"
+judge_role = "analyst"
+max_iterations = 4
+max_parallel_workers = 1
+max_attempts_per_worker = 2
+stall_iterations = 1
+verify = ["true"]
+token_budget = 1000
+wall_budget_secs = 60
+"#,
+        )])?;
+        let roster = AgentRoster::from_irs(&builtin, &config).map_err(ctx("Roster"))?;
+        let entry = roster
+            .entry("driven-lead")
+            .ok_or(TestError::Missing("driven-lead"))?;
+        assert!(entry.ir.work_driver.is_some());
+        for tool in crate::capability_catalog::WORK_DRIVER_TOOLS {
+            assert!(
+                entry.tools.iter().any(|admitted| admitted == tool),
+                "{tool}: dropped by the clamp despite [work_driver]"
+            );
+        }
+        Ok(())
+    }
+
+    /// Without a `[work_driver]` section, `work_driver.enqueue` is not on
+    /// the base's tool ceiling, so a definition that lists it anyway loses
+    /// it in the clamp exactly as before this fix.
+    #[test]
+    fn custom_orchestrator_without_work_driver_loses_the_tool_in_the_clamp() -> TestResult {
+        let builtin = builtin()?;
+        let (_home, config) = discover(&[(
+            "plain-lead",
+            r#"schema = "harwness.agent/v1"
+id = "user.agent.plain-lead@1"
+version = "1.0.0"
+extends = { id = "harwness.agent.child-orchestrator-base@1" }
+role = "child-orchestrator"
+specialization = "plain-lead"
+
+[delegation]
+targets = ["executor", "analyst"]
+
+[tools]
+admitted = ["work_driver.enqueue"]
+"#,
+        )])?;
+        let roster = AgentRoster::from_irs(&builtin, &config).map_err(ctx("Roster"))?;
+        let entry = roster
+            .entry("plain-lead")
+            .ok_or(TestError::Missing("plain-lead"))?;
+        assert!(entry.ir.work_driver.is_none());
+        assert!(
+            !entry.tools.iter().any(|tool| tool == "work_driver.enqueue"),
+            "work_driver.enqueue must not survive the clamp without [work_driver]"
+        );
         Ok(())
     }
 }

@@ -16,7 +16,7 @@
 //! The registry is `Send + Sync`; a `std::sync::Mutex` is held only for map
 //! access and never across an `.await`.
 
-use harw_job_runtime::LeaseToken;
+use harw_job_core::LeaseToken;
 use std::collections::HashMap;
 use std::fmt;
 use std::sync::{Arc, Mutex};

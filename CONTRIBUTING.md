@@ -8,8 +8,8 @@ contributions must not weaken, see [SECURITY.md](SECURITY.md).
 
 The Rust toolchain is pinned in [`rust-toolchain.toml`](rust-toolchain.toml)
 (currently `1.98.1`, with `rustfmt` and `clippy`). `rustup` picks this version
-up automatically in the repository root and in the separate `dod/` workspace,
-so your local build uses the same compiler, `rustfmt` and `clippy` as CI.
+up automatically everywhere in the repository (including `dod/`), so your
+local build uses the same compiler, `rustfmt` and `clippy` as CI.
 
 ```bash
 rustup toolchain install   # reads rust-toolchain.toml
@@ -18,16 +18,45 @@ rustc --version
 
 ## Repository layout
 
-This repository holds two independent Cargo workspaces:
+This repository is one Cargo workspace (`Cargo.toml`, one `Cargo.lock`) with
+two domains:
 
-- the root workspace (`Cargo.toml`), with the product crates (`harw`,
-  `harw-cli`, `harw-tui`, `harw-core`, and friends);
-- `dod/`, the Defense-on-Device workspace, with its own `Cargo.toml` and
-  `Cargo.lock`.
+- the product crates at the repository root (`harw`, `harw-cli`, `harw-tui`,
+  `harw-core`, and friends);
+- the Defense-on-Device (DoD) crates under `dod/crates/`, listed explicitly
+  in a separate block of the root `members`.
 
-Path dependencies cross from the root workspace into `dod/crates/...`, but
-`dod/` is never a member of the root workspace (`exclude = ["dod"]`), so each
-workspace builds and locks independently.
+Until PL-60 `dod/` was a separate, nested workspace with its own lockfile; see
+[`docs/architecture/dod-workspace-merge-plan.md`](docs/architecture/dod-workspace-merge-plan.md).
+Workspace membership is build governance, not dependency permission: the
+Warden/Sentinel/probe dependency and privilege budgets are enforced by
+`cargo run -p xtask -- gates`, not by a workspace boundary.
+
+### Architecture layers (`xtask gates arch`)
+
+A crate being a member of the same Cargo workspace does not imply that
+another crate may depend on it. Dependency permission comes from
+[`xtask/arch-policy.toml`](xtask/arch-policy.toml) and is enforced by
+`cargo run -q -p xtask -- gates arch` (part of the default `gates` run):
+
+- Every package is classified into a layer: `F` foundation, `I` shared
+  infrastructure, `C` compiler, `J` jobs, `D` DoD, `A` application/
+  composition. A new crate that is not listed under `[packages]` fails the
+  gate — add it with its layer in the same change.
+- Every internal normal (non-dev, non-build) dependency edge must follow
+  `[rules]` (edges only point inward, e.g. `J` may use `F`, `I`, `J`).
+  Known inversions are listed as `[[exceptions]]` with `reason` and
+  `until`. The list only shrinks: an exception whose edge is gone, or whose
+  edge the rules already allow, fails the gate until it is removed.
+- Packages with `tcb = true` (Warden and its protocol, `harw-dod-readfs`,
+  `harw-dod-signals`) may only depend directly on the internal crates in
+  `[tcb."<name>"].allowed_internal`.
+- Layer `J` and every TCB package may not reach a `*-sys` crate in their
+  transitive dependency closure (built from the workspace manifests and
+  `Cargo.lock`), except the ones justified under `[[sys_crates.allow]]`.
+
+See §6, §23, §40–§43, §47 and §55–§56 of
+[`docs/planning/10-ecosystem-workspace/HARW_ECOSYSTEM_WORKSPACE_ARCHITECTURE.md`](docs/planning/10-ecosystem-workspace/HARW_ECOSYSTEM_WORKSPACE_ARCHITECTURE.md).
 
 ## Building and checking your change
 
@@ -55,10 +84,13 @@ them:
 - `cargo fmt --all -- --check` — formatting.
 - `cargo clippy --workspace --tests -- -D warnings` — lints, warnings treated
   as errors.
-- `cargo nextest run --workspace` — the test suite (root workspace).
+- `cargo nextest run --workspace` — the test suite (all crates, DoD included).
 - `cargo test --workspace --doc` — doc tests, which `nextest` does not run.
-- `cargo test --workspace --locked` in `dod/` — the separate Defense-on-Device
-  workspace, run with its own lockfile.
+- `cargo run -q -p xtask -- gates` — dependency-edge, privilege and Warden
+  budget gates, plus the `arch` layer gate (see below).
+- DoD, package-scoped: the four DoD binaries built and the DoD crates tested
+  with `-p` selections only (`cargo test --locked -p harw-dod-… -p …`), so
+  the result is not masked by feature unification with product crates.
 - `cargo deny check` (`EmbarkStudios/cargo-deny-action`) — license and
   advisory checks against [`deny.toml`](deny.toml).
 - `actionlint` — lints on the GitHub Actions workflows themselves.
@@ -70,7 +102,8 @@ cargo fmt --all -- --check
 cargo clippy --workspace --tests -- -D warnings
 cargo nextest run --workspace   # or: cargo test --workspace
 cargo test --workspace --doc
-(cd dod && cargo test --workspace --locked)
+cargo run -q -p xtask -- gates
+make -C dod test   # DoD crates only, -p selection against the root workspace
 cargo deny check
 ```
 

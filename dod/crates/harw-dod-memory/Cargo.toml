@@ -1,6 +1,7 @@
 [package]
-publish = false
 name = "harw-dod-memory"
+description = "Memory pressure sensor reading MemTotal, MemFree, MemAvailable, SwapTotal, SwapFree from /proc/meminfo"
+publish.workspace = true
 version.workspace = true
 edition.workspace = true
 license.workspace = true

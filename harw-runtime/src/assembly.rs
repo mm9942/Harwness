@@ -102,6 +102,7 @@ use harw_protocol::{
     events::{SessionEvent, TurnEvent},
 };
 use harw_provider_http::{ProviderLoadRegistry, SecretResolver};
+use harw_registry_defaults::ConfigAgents;
 use harw_registry_defaults::embedded_agents::builtin_agent_definitions;
 use harw_registry_defaults::profile::{
     HostPermitWiring, IdentityOverrides, RegistryProfile, role_names,
@@ -121,7 +122,7 @@ use crate::approval::ApprovalChain;
 use crate::budget::child_limits;
 use crate::ceiling::root_ceiling;
 use crate::children::RuntimeChildRegistryFactory;
-use crate::config::{ConfigTrustReport, load_config};
+use crate::config::{ConfigTrustReport, load_config_with_agents};
 use crate::contributors::{AssemblyContributor, AssemblyInputs, AssemblyParts};
 use crate::error::{RuntimeError, RuntimeResult};
 use crate::model::ModelSource;
@@ -1454,7 +1455,9 @@ impl RuntimeAssemblyBuilder {
     }
 
     /// Übergibt die Plan-Dienste; ohne sie registriert die Montage keine
-    /// Plan-Operationen (`harw_ops::register_plan_tools` bleibt ungerufen).
+    /// Plan-Operationen (`harw_ops::register_plan_tools` bleibt ungerufen) und
+    /// auch keine WorkDriver-Operationen (`harw_ops::register_work_driver_tools`
+    /// hängt am selben Gate).
     #[must_use]
     pub fn plan_services(mut self, plan: PlanServices) -> Self {
         self.plan_services = Some(plan);
@@ -1720,18 +1723,26 @@ impl RuntimeAssemblyBuilder {
         //    und trägt deshalb keinen Vertrauensbericht über `~/.harw`-Layer;
         //    `trust_report` bleibt für ihn leer (kein Layer, kein
         //    nicht-vertrautes Repo).
-        let (config, trust_report) = match spec.embedded.as_ref() {
-            Some(_) => (
-                crate::config::load_config_embedded(&spec)?,
-                ConfigTrustReport {
-                    layers: Vec::new(),
-                    untrusted_repo: None,
-                    trust_status: None,
-                },
-            ),
-            None => load_config(&spec)?,
+        //    Die gesenkten Agentendefinitionen der Konfiguration
+        //    (`ConfigAgents`) entstehen dabei genau einmal: `harw-config`
+        //    reicht sie ungeparst weiter.
+        let (config, config_agents, trust_report) = match spec.embedded.as_ref() {
+            Some(_) => {
+                let (config, agents) = crate::config::load_config_embedded_with_agents(&spec)?;
+                (
+                    config,
+                    agents,
+                    ConfigTrustReport {
+                        layers: Vec::new(),
+                        untrusted_repo: None,
+                        trust_status: None,
+                    },
+                )
+            }
+            None => load_config_with_agents(&spec)?,
         };
         let config = Arc::new(config);
+        let config_agents = Arc::new(config_agents);
         // Netz-Werkzeuge (web.fetch/web.search/…) einmal je Prozess mit der
         // Egress-Policy aus `[network]`/`[research]` und dem Such-Backend aus
         // `[web.search]` einrichten — ohne das scheitert jeder Abruf mit
@@ -1918,7 +1929,7 @@ impl RuntimeAssemblyBuilder {
             || config.harness.active_uia_definition.is_some()
             || matches!(profile.spawner, SpawnerPolicy::BuiltinRoles);
         let agent_definitions = if needs_definitions {
-            lower_agent_definitions(&config)?
+            lower_agent_definitions(&config_agents)?
         } else {
             HashMap::new()
         };
@@ -1928,11 +1939,10 @@ impl RuntimeAssemblyBuilder {
         // registriert genau diese Namen; Welle 2 (Katalog, `agents.delegate`)
         // liest ihn über `RuntimeAssembly::agent_roster`.
         let agent_roster = Arc::new(if needs_definitions {
-            harw_registry_defaults::AgentRoster::from_config(&agent_definitions, &config).map_err(
-                |error| RuntimeError::Registry {
+            harw_registry_defaults::AgentRoster::from_config(&agent_definitions, &config_agents)
+                .map_err(|error| RuntimeError::Registry {
                     detail: format!("could not build the agent roster: {error}"),
-                },
-            )?
+                })?
         } else {
             harw_registry_defaults::AgentRoster::default()
         });
@@ -1948,7 +1958,11 @@ impl RuntimeAssemblyBuilder {
                 .as_ref()
                 .map(|embedded| ExecutableAgentIr::from(embedded.root_ir()))
         } else {
-            resolve_explicit_root_agent(spec.active_agent.as_deref(), &config, &agent_definitions)?
+            resolve_explicit_root_agent(
+                spec.active_agent.as_deref(),
+                &config_agents,
+                &agent_definitions,
+            )?
         };
         // #22 Welle 3: eine native, personalisierte harw bringt ihre UIA
         // bereits eingebettet mit (`spec.embedded`, von `harw-cli` aus
@@ -1965,7 +1979,7 @@ impl RuntimeAssemblyBuilder {
         {
             Some(resolve_embedded_uia(embedded.root_ir())?)
         } else {
-            resolve_active_uia(spec.entry, &config, &agent_definitions)?
+            resolve_active_uia(spec.entry, &config, &config_agents, &agent_definitions)?
         };
         // Die Kind-Decke ist die *tatsächliche* Aktivierung der Root-Session:
         // `new_root_session` wendet ausschließlich `agent_ir` an (bei aktiver
@@ -2085,7 +2099,7 @@ impl RuntimeAssemblyBuilder {
         let mut uia_agent_dir_for_self_document: Option<PathBuf> = None;
         if let Some(uia) = uia_ir.as_ref() {
             let definition_id = uia.id().to_string();
-            if let Some(agent_dir) = config.agent_definition_dirs.get(&definition_id) {
+            if let Some(agent_dir) = config_agents.agent_definition_dirs.get(&definition_id) {
                 uia_agent_dir_for_self_document = Some(agent_dir.clone());
                 let fragments =
                     harw_config::load_uia_personalization(agent_dir).map_err(|error| {
@@ -2763,6 +2777,10 @@ impl RuntimeAssemblyBuilder {
                 registry: Arc::clone(&host_permit_registry),
                 prompts: Some(host_permit_prompt_sender.clone()),
             })),
+            // Crypto-Infrastruktur H4: Clients aus `[infrastructure]`. Eine
+            // fehlende oder ungültige Sektion ergibt `None` (Warnung, nie ein
+            // Montagefehler); es wird hier kein Socket geöffnet.
+            infrastructure: crate::infrastructure::build_infrastructure(&config),
         });
         // Plan Teil D: dieselbe Speicher-Instanz wie die Kind-Registries;
         // `with_home_context` legt nur dann einen eigenen an, wenn hier
@@ -2835,6 +2853,25 @@ impl RuntimeAssemblyBuilder {
             }
             None => services,
         };
+        // R14: `work_driver.enqueue` liest seinen Aufrufer-Anker nur, wenn die
+        // Wurzel ein expliziter Agent ist (`agent_ir`), nie über die UIA und
+        // nie für Kind- oder Job-Sessions — die bekommen ihre eigene
+        // `WorkDriverCaller`-Instanz anderswo. Der Rollenname ist derselbe
+        // wie `spawn_context.organizational_role` (siehe dort: bei gesetztem
+        // `agent_ir` ist das exakt `ir.role()`).
+        let services = services.with_work_driver_caller(
+            agent_ir
+                .as_ref()
+                .and_then(|ir| {
+                    harw_ops::work_driver::WorkDriverCaller::from_executable(
+                        harw_core::delegation_visibility::role_label(
+                            spawn_context.organizational_role,
+                        ),
+                        ir,
+                    )
+                })
+                .map(Arc::new),
+        );
         let services = Arc::new(services);
 
         // 12. Modell-Tool-Fläche der Operationen — **nur** für
@@ -3197,6 +3234,7 @@ impl RuntimeAssemblyBuilder {
             spec,
             profile,
             config,
+            config_agents,
             trust_report,
             project,
             home_project_root,
@@ -3256,7 +3294,7 @@ impl RuntimeAssemblyBuilder {
 /// Senkt die eingebauten Rollen **einmal** je Montage.
 ///
 /// # Beschreibung
-/// `existing` ist `config.executable_agents` — die gesenkten lokalen
+/// `existing` ist `agents.executable_agents` — die gesenkten lokalen
 /// DSL-Definitionen, nach `DefinitionId`. Seit Plan R9 (Teil B) ersetzt keine
 /// davon eine eingebaute Rolle: [`builtin_agent_definitions`] meldet eine
 /// Kollision nur und behält die eingebaute Rolle. Lokale Agenten werden unter
@@ -3265,9 +3303,9 @@ impl RuntimeAssemblyBuilder {
 /// # Fehler
 /// [`RuntimeError::Registry`], wenn eine eingebettete Definition nicht senkt.
 fn lower_agent_definitions(
-    config: &ResolvedConfig,
+    agents: &ConfigAgents,
 ) -> RuntimeResult<HashMap<String, ExecutableAgentIr>> {
-    builtin_agent_definitions(&config.executable_agents).map_err(|error| RuntimeError::Registry {
+    builtin_agent_definitions(&agents.executable_agents).map_err(|error| RuntimeError::Registry {
         detail: format!("could not lower builtin agent definitions: {error}"),
     })
 }
@@ -3283,6 +3321,7 @@ fn lower_agent_definitions(
 fn resolve_active_uia(
     entry: EntryKind,
     config: &ResolvedConfig,
+    agents: &ConfigAgents,
     builtin: &HashMap<String, ExecutableAgentIr>,
 ) -> RuntimeResult<Option<ExecutableAgentIr>> {
     if !matches!(entry, EntryKind::Tui | EntryKind::OneShot) {
@@ -3291,7 +3330,7 @@ fn resolve_active_uia(
     let name = config.harness.active_uia_definition.as_deref().ok_or_else(|| RuntimeError::Registry {
         detail: "no active UIA is configured; set harness.active_uia_definition to a user-interface agent definition".to_owned(),
     })?;
-    let ir = resolve_active_agent(Some(name), config, builtin)?.ok_or_else(|| {
+    let ir = resolve_active_agent(Some(name), agents, builtin)?.ok_or_else(|| {
         RuntimeError::Registry {
             detail: format!("UIA '{name}' did not resolve"),
         }
@@ -3356,7 +3395,7 @@ fn resolve_embedded_uia(
 /// # Argumente
 /// - `name` (`Option<&str>`): der explizit gewählte Agent; `None` heißt
 ///   „keiner“.
-/// - `config` / `builtin`: wie [`resolve_active_agent`].
+/// - `agents` / `builtin`: wie [`resolve_active_agent`].
 ///
 /// # Rückgabe
 /// `Ok(None)` ohne Namen, sonst `Ok(Some(ir))`.
@@ -3368,10 +3407,10 @@ fn resolve_embedded_uia(
 ///   trägt.
 fn resolve_explicit_root_agent(
     name: Option<&str>,
-    config: &ResolvedConfig,
+    agents: &ConfigAgents,
     builtin: &HashMap<String, ExecutableAgentIr>,
 ) -> RuntimeResult<Option<ExecutableAgentIr>> {
-    let Some(ir) = resolve_active_agent(name, config, builtin)? else {
+    let Some(ir) = resolve_active_agent(name, agents, builtin)? else {
         return Ok(None);
     };
     match ir.role() {
@@ -3538,8 +3577,9 @@ fn split_root_and_uia_worker_models(
 ///
 /// # Argumente
 /// - `name` (`Option<&str>`): der Wert von `--agent`; `None` heißt „keiner".
-/// - `config` (`&ResolvedConfig`): die aufgelöste Konfiguration. Ihre
-///   `executable_agents` haben **Vorrang** vor den eingebauten Rollen: wer
+/// - `agents` (`&ConfigAgents`): die gesenkten Definitionen der
+///   Konfiguration. Ihre `executable_agents` haben **Vorrang** vor den
+///   eingebauten Rollen: wer
 ///   eine Rolle in `[agents]` konfiguriert, startet sonst nicht (Befund
 ///   Z2c-05). Die Vorrangrichtung ist dieselbe, die
 ///   [`builtin_agent_definitions`] selbst anwendet.
@@ -3552,13 +3592,13 @@ fn split_root_and_uia_worker_models(
 /// vollen Werkzeugsatz, er startet gar nicht.
 fn resolve_active_agent(
     name: Option<&str>,
-    config: &ResolvedConfig,
+    agents: &ConfigAgents,
     builtin: &HashMap<String, ExecutableAgentIr>,
 ) -> RuntimeResult<Option<ExecutableAgentIr>> {
     let Some(name) = name else {
         return Ok(None);
     };
-    if let Some(ir) = config.executable_agents.get(name) {
+    if let Some(ir) = agents.executable_agents.get(name) {
         return Ok(Some(ir.clone()));
     }
     builtin
@@ -3603,6 +3643,13 @@ fn build_operations(surface: OperationSurface, plan: Option<&PlanServices>) -> O
         harw_ops::register_all(&mut registry);
         if let Some(plan) = plan {
             let _registered = harw_ops::register_plan_tools(&mut registry, &plan.plan_config);
+            // R14: WorkDriver-Fläche hängt am selben Gate wie die
+            // Planungsfläche (siehe `harw_ops::register_work_driver_tools`-
+            // Doku) — `work_driver.enqueue` gated zusätzlich zur Laufzeit auf
+            // `Arc<harw_ops::work_driver::WorkDriverCaller>` in der
+            // `ServiceMap`.
+            let _registered =
+                harw_ops::register_work_driver_tools(&mut registry, &plan.plan_config);
         }
         registry
     }
@@ -5092,6 +5139,9 @@ pub struct RuntimeAssembly {
     spec: RuntimeSpec,
     profile: EntryProfile,
     config: Arc<ResolvedConfig>,
+    /// Die gesenkten Agentendefinitionen des Starts (aus
+    /// `config.agent_sources` bzw. dem eingebetteten Bundle).
+    config_agents: Arc<ConfigAgents>,
     trust_report: ConfigTrustReport,
     project: ProjectContext,
     /// Projekt-Root und Trust-Anker nach Contract §3 (`harw_home::project`) —
@@ -5303,6 +5353,17 @@ impl RuntimeAssembly {
     #[must_use]
     pub fn config(&self) -> &Arc<ResolvedConfig> {
         &self.config
+    }
+
+    /// Die gesenkten Agentendefinitionen **des Starts** (lokale
+    /// DSL-Definitionen der vertrauten Layer bzw. die IRs eines
+    /// eingebetteten Bundles), nach `DefinitionId`.
+    ///
+    /// `harw-config` reicht die Definitionen ungeparst weiter; die Montage
+    /// senkt sie genau einmal ([`crate::load_config_with_agents`]).
+    #[must_use]
+    pub fn config_agents(&self) -> &Arc<ConfigAgents> {
+        &self.config_agents
     }
 
     /// Der aktuelle Stand der Konfiguration: Start-Stand plus alle seither
@@ -6268,17 +6329,19 @@ mod tests {
         }
     }
 
-    /// Die gesenkten eingebauten Rollen einer leeren Konfiguration.
-    fn builtin() -> TestResult<(ResolvedConfig, HashMap<String, ExecutableAgentIr>)> {
-        let config = ResolvedConfig::default();
-        let definitions = lower_agent_definitions(&config).map_err(ctx("Rollen senken"))?;
-        Ok((config, definitions))
+    /// Die gesenkten eingebauten Rollen einer Konfiguration ohne eigene
+    /// Agentendefinitionen, dazu deren (leere) [`ConfigAgents`].
+    fn builtin() -> TestResult<(ConfigAgents, HashMap<String, ExecutableAgentIr>)> {
+        let agents = ConfigAgents::default();
+        let definitions = lower_agent_definitions(&agents).map_err(ctx("Rollen senken"))?;
+        Ok((agents, definitions))
     }
 
     #[test]
     fn interactive_entries_require_a_configured_user_interface_agent() -> TestResult {
-        let (config, definitions) = builtin()?;
-        let Err(error) = resolve_active_uia(EntryKind::Tui, &config, &definitions) else {
+        let (agents, definitions) = builtin()?;
+        let mut config = ResolvedConfig::default();
+        let Err(error) = resolve_active_uia(EntryKind::Tui, &config, &agents, &definitions) else {
             return Err(TestError::Unexpected("Err erwartet".into()));
         };
         assert!(matches!(error, RuntimeError::Registry { .. }));
@@ -6287,12 +6350,12 @@ mod tests {
             .get(role_names::EXPLORER)
             .ok_or(TestError::Missing("explorer"))?
             .clone();
-        let mut config = config;
+        let mut agents = agents;
         config.harness.active_uia_definition = Some("not-a-uia".to_owned());
-        config
+        agents
             .executable_agents
             .insert("not-a-uia".to_owned(), explorer);
-        let Err(error) = resolve_active_uia(EntryKind::Tui, &config, &definitions) else {
+        let Err(error) = resolve_active_uia(EntryKind::Tui, &config, &agents, &definitions) else {
             return Err(TestError::Unexpected("Err erwartet".into()));
         };
         assert!(matches!(error, RuntimeError::Registry { .. }));
@@ -6301,9 +6364,10 @@ mod tests {
 
     #[test]
     fn non_interactive_entries_do_not_require_a_uia() -> TestResult {
-        let (config, definitions) = builtin()?;
+        let (agents, definitions) = builtin()?;
+        let config = ResolvedConfig::default();
         assert!(
-            resolve_active_uia(EntryKind::Doctor, &config, &definitions)
+            resolve_active_uia(EntryKind::Doctor, &config, &agents, &definitions)
                 .map_err(ctx("doctor has no UIA requirement"))?
                 .is_none()
         );
