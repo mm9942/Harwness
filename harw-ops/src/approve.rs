@@ -78,15 +78,19 @@ async fn approve(ctx: &OpContext, args: ApproveArgs) -> Result<OpOutput, OpError
         .map(str::trim)
         .filter(|n| !n.is_empty())
         .map(str::to_owned);
-    let event = store
-        .unblock(
-            &WorkId::from_str(work_id),
-            jiff::Timestamp::now(),
-            ApprovalActor::Operator {
-                id: "local-command".to_owned(),
-            },
-            note.clone(),
-        )
+    let work_id_typed = WorkId::from_str(work_id);
+    // H12: ein fremder Job wird wie ein unbekannter behandelt.
+    let event = crate::job_tenant::ensure_job_visible(ctx, store, &work_id_typed)
+        .and_then(|()| {
+            store.unblock(
+                &work_id_typed,
+                jiff::Timestamp::now(),
+                ApprovalActor::Operator {
+                    id: "local-command".to_owned(),
+                },
+                note.clone(),
+            )
+        })
         .map_err(|error| {
             OpError::Execution(format!(
                 "could not approve (unblock) job `{work_id}`: {error}"
@@ -308,6 +312,78 @@ mod tests {
         std::fs::remove_dir_all(root).map_err(crate::test_support::ctx("remove test workspace"))?;
 
         assert!(matches!(result, Err(OpError::Execution(_))));
+        Ok(())
+    }
+
+    // H12: Mandanten-Filter (unscoped sieht alles, scoped nur den eigenen
+    // Mandanten, fremde Jobs verhalten sich wie unbekannte).
+    #[tokio::test]
+    async fn approve_unscoped_caller_reaches_every_tenant() -> TestResult {
+        use crate::job_tenant::fixtures::{JOB_B, context, state_of, two_tenants};
+        let jobs = two_tenants(JobState::Blocked)?;
+        let op_ctx = context(&jobs, None)?;
+        let output = approve(
+            &op_ctx,
+            ApproveArgs {
+                work_id: Some(JOB_B.to_owned()),
+                note: None,
+            },
+        )
+        .await
+        .map_err(ctx("approve foreign job without scope"))?;
+        assert!(output.text.contains(JOB_B), "{}", output.text);
+        assert_eq!(state_of(&jobs, JOB_B)?, JobState::Ready);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn approve_scoped_caller_reaches_own_tenant() -> TestResult {
+        use crate::job_tenant::fixtures::{JOB_A, TENANT_A, context, state_of, two_tenants};
+        let jobs = two_tenants(JobState::Blocked)?;
+        let op_ctx = context(&jobs, Some(TENANT_A))?;
+        let output = approve(
+            &op_ctx,
+            ApproveArgs {
+                work_id: Some(JOB_A.to_owned()),
+                note: None,
+            },
+        )
+        .await
+        .map_err(ctx("approve own job"))?;
+        assert!(output.text.contains(JOB_A), "{}", output.text);
+        assert_eq!(state_of(&jobs, JOB_A)?, JobState::Ready);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn approve_scoped_caller_foreign_job_is_hidden_like_missing() -> TestResult {
+        use crate::job_tenant::fixtures::{
+            JOB_B, MISSING, TENANT_A, assert_hidden_like_missing, context, state_of, two_tenants,
+        };
+        let jobs = two_tenants(JobState::Blocked)?;
+        let op_ctx = context(&jobs, Some(TENANT_A))?;
+        let foreign = approve(
+            &op_ctx,
+            ApproveArgs {
+                work_id: Some(JOB_B.to_owned()),
+                note: None,
+            },
+        )
+        .await;
+        let missing = approve(
+            &op_ctx,
+            ApproveArgs {
+                work_id: Some(MISSING.to_owned()),
+                note: None,
+            },
+        )
+        .await;
+        assert_hidden_like_missing(foreign, missing)?;
+        assert_eq!(
+            state_of(&jobs, JOB_B)?,
+            JobState::Blocked,
+            "foreign job untouched"
+        );
         Ok(())
     }
 }

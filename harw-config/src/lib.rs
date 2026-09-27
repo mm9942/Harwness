@@ -6,10 +6,12 @@
 //! [`discovery::discover_config`].
 
 pub mod agent_limits;
+// Ungeparste DSL-Agentendefinitionen der vertrauten Layer; gesenkt wird im
+// Konsumenten (`harw_registry_defaults::config_agents`).
+pub mod agent_sources;
 pub mod agent_toml;
 pub mod auth_toml;
 pub mod browser_toml;
-pub mod builtin_definitions;
 pub mod channel_toml;
 pub mod discovery;
 pub mod dod_toml;
@@ -42,14 +44,17 @@ pub mod writer;
 
 // Runde 5, Teil K: `[agents]` — Orchestrierungsgrenzen.
 pub use agent_limits::{AgentLimitsToml, EffectiveAgentLimits};
+pub use agent_sources::{
+    AgentDefinitionSource, AgentDefinitionSources, AgentSourceForm, AgentSourceLayer,
+    CONTEXT_PROGRAMS_DIR, ContextProgramSource, INSTRUCTIONS_FILE_KEY, discover_run_agent_sources,
+};
 pub use agent_toml::{AgentSuggestionsToml, AgentToml};
 pub use auth_toml::{AuthConfig, CredentialEntry, KekConfig, KekProvenance, SecretRef};
 pub use browser_toml::BrowserSection;
 pub use channel_toml::{ChannelFileToml, ChannelSectionToml, ChannelToml, TelegramChannelToml};
 pub use discovery::{
-    AgentDefinitionMeta, HasName, INSTRUCTIONS_FILE_KEY, ResolvedConfig, default_config_layers,
-    default_config_layers_named, discover_config, discover_config_with_restricted,
-    discover_config_with_restricted_and_project_settings, discover_run_agent_definitions,
+    HasName, ResolvedConfig, default_config_layers, default_config_layers_named, discover_config,
+    discover_config_with_restricted, discover_config_with_restricted_and_project_settings,
 };
 pub use dod_toml::DodSection;
 pub use dotenv::{

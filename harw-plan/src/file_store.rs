@@ -1014,24 +1014,18 @@ impl FilePlanStore {
     }
 }
 
-impl PlanStore for FilePlanStore {
-    fn current(&self) -> PlanResult<Plan> {
-        let inner = self.read_inner()?;
-        inner
-            .active_slot()
-            .map(|slot| slot.plan.clone())
-            .ok_or(PlanError::PlanNotFound)
-    }
-
-    fn revision(&self) -> RevisionId {
-        let inner = self.inner.read().unwrap_or_else(|e| e.into_inner());
-        match inner.active_slot() {
-            Some(slot) => slot.plan.revision,
-            None => RevisionId::new(0),
-        }
-    }
-
-    fn apply(&self, action: PlanAction, actor: &str) -> PlanResult<PlanEvent> {
+/// Mandanten-fähiger Kern von `apply` (H12).
+///
+/// `tenant` wirkt nur auf `Create` (landet in [`Plan::tenant`]); jede
+/// andere Aktion ignoriert ihn — der Mandant eines Plans ist nach dem
+/// Anlegen unveränderlich.
+impl FilePlanStore {
+    fn apply_with_tenant(
+        &self,
+        action: PlanAction,
+        tenant: Option<harw_types::TenantId>,
+        actor: &str,
+    ) -> PlanResult<PlanEvent> {
         let mut inner = self.write_inner()?;
 
         let now = OffsetDateTime::now_utc();
@@ -1066,6 +1060,7 @@ impl PlanStore for FilePlanStore {
                 nodes: Vec::new(),
                 created_at: now,
                 updated_at: now,
+                tenant,
             };
             let event = PlanEvent {
                 revision,
@@ -1122,6 +1117,38 @@ impl PlanStore for FilePlanStore {
         }
         slot.history.push(event.clone());
         Ok(event)
+    }
+}
+
+impl PlanStore for FilePlanStore {
+    fn current(&self) -> PlanResult<Plan> {
+        let inner = self.read_inner()?;
+        inner
+            .active_slot()
+            .map(|slot| slot.plan.clone())
+            .ok_or(PlanError::PlanNotFound)
+    }
+
+    fn revision(&self) -> RevisionId {
+        let inner = self.inner.read().unwrap_or_else(|e| e.into_inner());
+        match inner.active_slot() {
+            Some(slot) => slot.plan.revision,
+            None => RevisionId::new(0),
+        }
+    }
+
+    fn apply(&self, action: PlanAction, actor: &str) -> PlanResult<PlanEvent> {
+        self.apply_with_tenant(action, None, actor)
+    }
+
+    fn create_for_tenant(
+        &self,
+        plan_id: PlanId,
+        goal: String,
+        tenant: Option<harw_types::TenantId>,
+        actor: &str,
+    ) -> PlanResult<PlanEvent> {
+        self.apply_with_tenant(PlanAction::Create { plan_id, goal }, tenant, actor)
     }
 
     fn apply_batch(

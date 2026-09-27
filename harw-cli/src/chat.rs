@@ -70,6 +70,7 @@ use harw_core::{
 use harw_extension_api::{ApprovalMode, ContextProvider};
 use harw_memory::facts::{FactScope, FactStore};
 use harw_protocol::{SessionEvent, TurnEvent};
+use harw_registry_defaults::ConfigAgents;
 use harw_runtime::{
     AssemblyContributor, AssemblyInputs, AssemblyParts, EntryKind, ModelSource, PlanServices,
     RootSession, RuntimeAssembly, RuntimeAssemblyBuilder, RuntimeError, RuntimeResult, RuntimeSpec,
@@ -220,14 +221,14 @@ pub fn run_chat(
         (EntryKind::Tui, IngressSurface::Tui)
     };
     let spec = runtime_spec(entry, &home, &cwd, local_principal(surface));
-    let mut config = load_chat_config(&spec)?;
+    let (mut config, mut agents) = load_chat_config(&spec)?;
 
     // Ein lokaler Chat braucht immer eine UIA. Fehlt die Auswahl, verwenden
     // wir eine vorhandene UIA oder erzeugen eine minimale lokale Definition;
     // danach wird die Konfiguration neu geladen, damit die Runtime exakt den
     // persistenten Profilwert validiert und montiert.
-    if crate::uia_bootstrap::ensure_active_uia(&home, &config)?.is_some() {
-        config = load_chat_config(&spec)?;
+    if crate::uia_bootstrap::ensure_active_uia(&home, &config, &agents)?.is_some() {
+        (config, agents) = load_chat_config(&spec)?;
     }
 
     // Erststart-Fluss: nur wenn der Home-Workspace noch nicht einsatzbereit ist,
@@ -239,7 +240,7 @@ pub fn run_chat(
         || !config.providers.is_empty();
     if !workspace_ready {
         crate::onboarding::run_wizard(&home)?;
-        config = load_chat_config(&spec)?;
+        (config, agents) = load_chat_config(&spec)?;
     }
     // Veraltete Credential-Pool-Einträge überspringt der Provider-Aufbau nur
     // mit `tracing::warn!` — zusätzlich sichtbar auf stderr, mit dem Befehl
@@ -252,7 +253,7 @@ pub fn run_chat(
         Some(prompt) => {
             // One-shot path: reads the real `default_provider`/`default_model`
             // unmodified — the UIA model pin never applies here.
-            let inputs = ChatRuntimeInputs::new(spec, &config, startup, verbose)?;
+            let inputs = ChatRuntimeInputs::new(spec, &config, &agents, startup, verbose)?;
             run_one_shot(&inputs, &prompt, &add_dirs)
         }
         None => {
@@ -260,7 +261,7 @@ pub fn run_chat(
             // through `TuiSessionController`; keep the assembly config's
             // generic defaults untouched so one-shot and worker paths retain
             // their intentional defaults.
-            let inputs = ChatRuntimeInputs::new(spec, &config, startup, verbose)?;
+            let inputs = ChatRuntimeInputs::new(spec, &config, &agents, startup, verbose)?;
 
             let sessions_root = profile_sessions_root(&home)?;
             let project_key = current_project_key(&cwd);
@@ -311,11 +312,12 @@ pub fn run_chat(
     }
 }
 
-// Lädt die Konfiguration mit Vertrauensbericht; der Bericht selbst wird von
-// der Montage erneut erzeugt und dort ausgewertet.
-fn load_chat_config(spec: &RuntimeSpec) -> Result<ResolvedConfig, String> {
-    harw_runtime::load_config(spec)
-        .map(|(config, _trust_report)| config)
+// Lädt die Konfiguration mit Vertrauensbericht samt gesenkten
+// Agentendefinitionen; der Bericht selbst wird von der Montage erneut erzeugt
+// und dort ausgewertet.
+fn load_chat_config(spec: &RuntimeSpec) -> Result<(ResolvedConfig, ConfigAgents), String> {
+    harw_runtime::load_config_with_agents(spec)
+        .map(|(config, agents, _trust_report)| (config, agents))
         .map_err(|error| error.to_string())
 }
 
@@ -390,6 +392,7 @@ impl ChatRuntimeInputs {
     fn new(
         mut spec: RuntimeSpec,
         config: &ResolvedConfig,
+        agents: &ConfigAgents,
         startup: ChatStartup,
         verbose: bool,
     ) -> Result<Self, String> {
@@ -412,7 +415,7 @@ impl ChatRuntimeInputs {
         let state_store =
             transcript_state_store(&profile_sessions_root(&home)?, cli_thread_for_session);
         let job_store = Arc::new(JobStore::new(&active_profile_job_store_root(&home)?));
-        let memory = build_memory(&home, config);
+        let memory = build_memory(&home, config, agents);
         let secret_resolver = configured_secret_resolver(&home, config)?;
         let (project_facts, global_facts) = open_fact_stores(&home, &spec.cwd);
 
@@ -796,7 +799,7 @@ fn resolve_startup_resume_selection(
 ///
 /// # Beschreibung
 /// Ist eine aktive UIA konfiguriert (`config.harness.active_uia_definition`
-/// löst über `config.agent_definition_dirs`/`config.executable_agents` auf
+/// löst über `agents.agent_definition_dirs`/`agents.executable_agents` auf
 /// eine Definition mit `role = "user-interface"` auf), öffnet diese Funktion
 /// einen [`harw_memory::FileMemoryStore`] unter `<agent_dir>/memory/` — dem
 /// **eigenen** Gedächtnis dieser UIA (Structure Plan §3: "jede UIA-Identität
@@ -810,8 +813,12 @@ fn resolve_startup_resume_selection(
 /// Schlägt die Verzeichnisauflösung oder das Öffnen fehl (Rechte, ungültiger
 /// Pfad), fällt die Funktion auf `None` zurück — die `/memory`-Op meldet dann
 /// `NotAvailable`, der restliche Chat läuft weiter.
-fn build_memory(home: &Path, config: &ResolvedConfig) -> Option<Arc<dyn harw_memory::Memory>> {
-    let root = match uia_agent_memory_root(config) {
+fn build_memory(
+    home: &Path,
+    config: &ResolvedConfig,
+    agents: &ConfigAgents,
+) -> Option<Arc<dyn harw_memory::Memory>> {
+    let root = match uia_agent_memory_root(config, agents) {
         Some(root) => root,
         None => match active_profile_memories_root(home) {
             Ok(root) => root,
@@ -837,14 +844,14 @@ fn build_memory(home: &Path, config: &ResolvedConfig) -> Option<Arc<dyn harw_mem
 /// # Beschreibung
 /// Löst `config.harness.active_uia_definition` (dieselbe Konfiguration, die
 /// `harw-runtime`s `resolve_active_uia` für die Registry-Montage verwendet)
-/// über `config.agent_definition_dirs` auf den Agentenordner auf. Zur
-/// Vorsicht wird zusätzlich über `config.executable_agents` die Rolle
+/// über `agents.agent_definition_dirs` auf den Agentenordner auf. Zur
+/// Vorsicht wird zusätzlich über `agents.executable_agents` die Rolle
 /// geprüft: nur `role = AgentRoleId::UserInterface` liefert einen Pfad — ein
 /// Root-Orchestrator- oder Worker-Einstieg (keine `active_uia_definition`,
 /// oder eine unerwartet andere Rolle) behält die globale Profil-Root.
-fn uia_agent_memory_root(config: &ResolvedConfig) -> Option<PathBuf> {
+fn uia_agent_memory_root(config: &ResolvedConfig, agents: &ConfigAgents) -> Option<PathBuf> {
     let definition_id = config.harness.active_uia_definition.as_deref()?;
-    let is_uia = config
+    let is_uia = agents
         .executable_agents
         .get(definition_id)
         .map(|ir| ir.role() == AgentRoleId::UserInterface)
@@ -852,7 +859,7 @@ fn uia_agent_memory_root(config: &ResolvedConfig) -> Option<PathBuf> {
     if !is_uia {
         return None;
     }
-    let agent_dir = config.agent_definition_dirs.get(definition_id)?;
+    let agent_dir = agents.agent_definition_dirs.get(definition_id)?;
     Some(agent_dir.join("memory"))
 }
 
@@ -1199,8 +1206,9 @@ mod tests {
         startup: ChatStartup,
     ) -> TestResult<ChatRuntimeInputs> {
         let spec = runtime_spec(entry, &fixture.home, &fixture.cwd, local_principal(surface));
-        let config = load_chat_config(&spec).map_err(ctx("load fixture config"))?;
-        ChatRuntimeInputs::new(spec, &config, startup, false).map_err(ctx("build chat inputs"))
+        let (config, agents) = load_chat_config(&spec).map_err(ctx("load fixture config"))?;
+        ChatRuntimeInputs::new(spec, &config, &agents, startup, false)
+            .map_err(ctx("build chat inputs"))
     }
 
     fn startup(mode: InteractionMode) -> ChatStartup {

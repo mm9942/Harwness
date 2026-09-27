@@ -84,9 +84,18 @@ the daemons must implement:
 
 ```text
 GET /v1/health        200 {"status": "ok" | "degraded", "service"?: "…"}   (empty 2xx body = ok)
-GET /v1/version       200 {"service": "…", "version": "…", "protocol": 1}
-GET /v1/capabilities  200 {"service": "…", "protocol": 1, "crypto_profiles": […], "operations": […]}
+GET /v1/version       200 {"service": "…", "version": "…", "protocol": 1,
+                           "store_epoch"?: "<32 hex>", "boot_id"?: "<32 hex>"}
+GET /v1/capabilities  200 {"service": "…", "protocol": 1, "crypto_profiles": […], "operations": […],
+                           "persistence"?: "in-memory" | "sealed-file",
+                           "store_epoch"?: "<32 hex>", "boot_id"?: "<32 hex>"}
 ```
+
+`store_epoch` names the daemon's key store and changes when the store is
+replaced (an in-memory AuthHub gets a new one on every restart; a persistent
+store keeps its epoch). `boot_id` changes with every daemon process. Both are
+optional (`VersionInfo`/`Capabilities` parse them as `Option<String>`), so
+daemons that predate them still parse.
 
 Capabilities only describe the daemon. The client does not use them to grant
 authority or to downgrade anything.
@@ -167,9 +176,18 @@ Error mapping (reasons are payload-free):
 
 | Client error | `SecretsError` |
 |---|---|
-| `Remote(AuthenticationFailed)` (`422`) on unwrap | `Open(pq_hpke::Error::AuthenticationFailed)` |
+| `Remote(AuthenticationFailed)` (`422`) on unwrap, hub `store_epoch` changed | `DekWrapperUnavailable` ("AuthHub key store was replaced (epoch changed); keys are not available") |
+| `Remote(AuthenticationFailed)` (`422`) on unwrap, otherwise | `Open(pq_hpke::Error::AuthenticationFailed)` |
 | `Unavailable`, `Timeout` | `DekWrapperUnavailable` |
 | anything else, and bridge failures | `DekWrapperUnavailable` with the client error's text |
+
+**Store epoch.** The hub answers an unwrap under a key version its store
+does not have with the same `422` as a tampered blob, so a restarted
+in-memory hub would look like tampering. The wrapper records the hub's
+`store_epoch` on its first wrap or unwrap (one extra `GET /v1/version`) and,
+on an unwrap `422`, reads it again: a different epoch is reported as
+`DekWrapperUnavailable` (key store replaced). An unchanged epoch, a hub
+without one, or a failed re-read keep `Open`. Both outcomes fail closed.
 
 **Sync/async bridge.** The trait is synchronous and the client is async.
 Calling `Handle::block_on` from a runtime worker panics, so every
@@ -199,4 +217,7 @@ server on a tempdir Unix socket (`src/test_server.rs`). They cover:
 - config parsing (`deny_unknown_fields`, relative paths, token-file permissions)
 - `AuthHubDekWrapper`: round trip from a plain thread and from inside a
   tokio runtime, generation mismatch, hub down, timeout and error mapping,
-  and a `SecretStore` V3 create/get round trip through the mock hub
+  a `SecretStore` V3 create/get round trip through the mock hub, and the
+  store-epoch check (epoch changed → unavailable, unchanged or unreported →
+  `Open`; the mock hub's epoch is settable via `MockState::set_epoch`)
+- parsing `store_epoch`/`boot_id` with and without the fields

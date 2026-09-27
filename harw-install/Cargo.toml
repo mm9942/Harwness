@@ -1,6 +1,7 @@
 [package]
 publish.workspace = true
 name = "harw-install"
+description = "Installation and operational lifecycle: service management, health checks, updates, config migration, and uninstall."
 version.workspace = true
 edition.workspace = true
 license.workspace = true

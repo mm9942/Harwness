@@ -306,7 +306,23 @@ impl GoalStore for InMemoryGoalStore {
     /// Hält über die gesamte Operation einen exklusiven Schreib-Lock; Validierung
     /// und Mutation sind damit atomar gegenüber anderen Threads.
     fn apply(&self, action: GoalAction, actor: &str) -> PlanResult<GoalEvent> {
+        self.apply_guarded(action, actor, &|_| Ok(()))
+    }
+
+    /// Wie [`GoalStore::apply`]; `guard` sieht das gespeicherte Ziel unter
+    /// demselben exklusiven Schreib-Lock wie Validierung und Mutation (atomar
+    /// gegenüber anderen Threads). Ein abgewiesener `guard` verändert nichts.
+    ///
+    /// # Errors
+    /// Der Fehler von `guard`, sonst wie [`GoalStore::apply`].
+    fn apply_guarded(
+        &self,
+        action: GoalAction,
+        actor: &str,
+        guard: &dyn Fn(Option<&Goal>) -> PlanResult<()>,
+    ) -> PlanResult<GoalEvent> {
         let mut inner = self.inner.write().map_err(|_| poisoned_lock())?;
+        guard(inner.goal.as_ref())?;
 
         // Erste Amtshandlung: die Regeln. Alles danach ist bereits Mutation.
         validate_goal_action(inner.goal.as_ref(), &action, actor)?;
@@ -709,7 +725,23 @@ impl GoalStore for FileGoalStore {
     /// Hält über Validierung, I/O und Cache-Update einen exklusiven
     /// Schreib-Lock; nebenläufige `apply`-Aufrufe werden serialisiert.
     fn apply(&self, action: GoalAction, actor: &str) -> PlanResult<GoalEvent> {
+        self.apply_guarded(action, actor, &|_| Ok(()))
+    }
+
+    /// Wie [`GoalStore::apply`]; `guard` sieht das gespeicherte Ziel unter
+    /// demselben exklusiven Schreib-Lock wie Validierung und Mutation (atomar
+    /// gegenüber anderen Threads). Ein abgewiesener `guard` verändert nichts.
+    ///
+    /// # Errors
+    /// Der Fehler von `guard`, sonst wie [`GoalStore::apply`].
+    fn apply_guarded(
+        &self,
+        action: GoalAction,
+        actor: &str,
+        guard: &dyn Fn(Option<&Goal>) -> PlanResult<()>,
+    ) -> PlanResult<GoalEvent> {
         let mut inner = self.inner.write().map_err(|_| poisoned_lock())?;
+        guard(inner.goal.as_ref())?;
 
         // Erste Amtshandlung: die Regeln — vor jedem Dateizugriff.
         validate_goal_action(inner.goal.as_ref(), &action, actor)?;
@@ -867,6 +899,7 @@ mod tests {
             evidence: Vec::new(),
             created_at: OffsetDateTime::UNIX_EPOCH,
             updated_at: OffsetDateTime::UNIX_EPOCH,
+            tenant: None,
         }
     }
 

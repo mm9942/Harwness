@@ -71,8 +71,8 @@ pub use harw_job_core::{
 #[cfg(target_os = "macos")]
 pub use harw_job_runtime::coordinator::DarwinExecutor;
 pub use harw_job_runtime::coordinator::{
-    Coordinator, CoordinatorConfig, CoordinatorStore, Executor, JobHandle, JobResult, RecoveredJob,
-    RecoveryDecision, RuntimeError,
+    Coordinator, CoordinatorConfig, CoordinatorStore, Executor, JobHandle, JobResult,
+    OutputCapture, RecoveredJob, RecoveryDecision, RuntimeError,
 };
 #[cfg(target_os = "linux")]
 pub use harw_job_runtime::coordinator::{LinuxExecutor, LinuxExecutorOptions, LinuxSandboxBackend};
@@ -130,7 +130,7 @@ pub struct JobRuntimeBuilder<S, E> {
     runner_id: Option<RunnerId>,
     workspace_root: Option<PathBuf>,
     lease_ttl: Option<Duration>,
-    output_limit: Option<usize>,
+    output_capture: Option<OutputCapture>,
 }
 
 impl<S, E> JobRuntimeBuilder<S, E> {
@@ -142,7 +142,7 @@ impl<S, E> JobRuntimeBuilder<S, E> {
             runner_id: self.runner_id,
             workspace_root: self.workspace_root,
             lease_ttl: self.lease_ttl,
-            output_limit: self.output_limit,
+            output_capture: self.output_capture,
         }
     }
 
@@ -154,7 +154,7 @@ impl<S, E> JobRuntimeBuilder<S, E> {
             runner_id: self.runner_id,
             workspace_root: self.workspace_root,
             lease_ttl: self.lease_ttl,
-            output_limit: self.output_limit,
+            output_capture: self.output_capture,
         }
     }
 
@@ -179,9 +179,11 @@ impl<S, E> JobRuntimeBuilder<S, E> {
         self
     }
 
-    /// Sets how many stdout/stderr bytes a [`JobResult`] keeps per stream.
-    pub fn output_limit(mut self, bytes: usize) -> Self {
-        self.output_limit = Some(bytes);
+    /// Sets how much stdout/stderr a [`JobResult`] keeps per stream: the
+    /// first `head_bytes` and the last `tail_bytes` (default
+    /// [`OutputCapture::default`], 16 KiB head + 64 KiB tail).
+    pub fn output_capture(mut self, capture: OutputCapture) -> Self {
+        self.output_capture = Some(capture);
         self
     }
 }
@@ -212,8 +214,8 @@ impl<S: CoordinatorStore, E: Executor> JobRuntimeBuilder<S, E> {
         if let Some(ttl) = self.lease_ttl {
             config.lease_ttl = ttl;
         }
-        if let Some(limit) = self.output_limit {
-            config.output_limit = limit;
+        if let Some(capture) = self.output_capture {
+            config.output_capture = capture;
         }
         Ok(JobRuntime {
             coordinator: Coordinator::new(self.store, self.executor, config)?,
@@ -244,7 +246,7 @@ impl JobRuntime<Unset, Unset> {
             runner_id: None,
             workspace_root: None,
             lease_ttl: None,
-            output_limit: None,
+            output_capture: None,
         }
     }
 }

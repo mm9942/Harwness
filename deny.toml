@@ -66,6 +66,13 @@ allow-wildcard-paths = true
 # Die Zeitachse ist eine bewusste Festlegung: `jiff` für Neues. `time` liegt
 # noch in Bestandscrates und wird nicht im Rahmen dieses Programms migriert.
 skip = []
+# Tier C (docs/architecture/dependency-review.md): kein OpenSSL im Baum.
+# TLS läuft ausschließlich über rustls + aws-lc-rs (Ring A).
+deny = [
+    { crate = "openssl-sys" },
+    { crate = "openssl" },
+    { crate = "native-tls" },
+]
 
 [sources]
 unknown-registry = "deny"

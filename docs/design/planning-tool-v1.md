@@ -251,3 +251,37 @@ Implemented: `harw-plan/src/{types,actions,store,file_store,validate,
 memory_store,ids,config,error}.rs`, plus later additions
 (`admission.rs`, `catalog.rs`, `goal.rs`, `goal_store.rs`, `graph.rs`,
 `mutation.rs`) beyond this original slice.
+
+## Work driver (`harw-plan-bridge::work_driver`)
+
+`WorkDriver::decide(&WorkDriveInput) -> WorkDrivePlan` is the pure decision
+core of a supervisor that drives worker agents toward a `Goal`. Like
+`PlanController::reconcile` it does no I/O, reads no clock (`now` is
+injected; wall time is `now - usage.started_at`) and sorts workers, criteria
+and scope hints, so the same snapshot always yields the same steps.
+
+Input: the goal, its `GoalReport`, the iteration, the current workers
+(`WorkerState`: scope with disjoint `owned_paths` and the criterion indices it
+covers, continuation `attempts`, last `WorkerResultSummary`, context size,
+cache hit ratio), optional scope hints, a `BudgetUsageSnapshot`,
+`WorkDriveLimits`, the wave's `VerificationState` and an optional
+`JudgeVerdict`.
+
+Steps and when they appear:
+
+| Step | When |
+|---|---|
+| `Delegate` | an open criterion no worker covers; up to `max_parallel_workers`; a scope overlapping a running worker is deferred, overlapping new scopes are merged |
+| `Continue` | the default follow-up: same worker, compact appended feedback (open criteria of its scope, failing lines, judge gaps) — keeps its prompt cache warm |
+| `Respawn` | continuation chain exhausted, context above `respawn_context_tokens`, or a hard `Failed`; carries a compact handoff |
+| `Verify` | once per wave, only when every worker is `Done`/`Blocked` |
+| `Judge` | verification green, evidence complete, remaining criteria are manual or have no verification step |
+| `ProposeAchieved` | all criteria and invariants evidenced, verification green, judge satisfied — a proposal only; `Achieved` is set by a human actor |
+| `Escalate` | a `Blocked` worker, or a failure no worker owns |
+| `GiveUp` | iteration, token, wall-time or stall limit reached |
+
+The caller owns the state between rounds: it marks a worker running again
+(`last_result = None`) after `Delegate`/`Continue`/`Respawn`, resets
+`attempts` on respawn, resets verification and judge whenever the wave gets
+new work, re-evaluates the goal after `Verify`, and counts
+`iterations_without_progress`.

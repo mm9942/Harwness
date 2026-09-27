@@ -562,28 +562,27 @@ mod tests {
             2,
             "coding-orchestrator plus der Profil-Default-Worker"
         );
-        let implementer = resolved
-            .executable_agents
-            .get("harwness.agent.rust-implementer@1")
-            .ok_or(crate::test_support::TestError::Missing("rust-implementer"))?;
-        assert_eq!(implementer.specialization(), "rust-implementer");
-        let meta = resolved
-            .agent_definition_meta
-            .get("harwness.agent.rust-implementer@1")
-            .ok_or(crate::test_support::TestError::Missing(
-                "rust-implementer meta",
-            ))?;
-        assert!(
-            meta.instructions
-                .as_deref()
-                .is_some_and(|text| !text.trim().is_empty()),
-            "system.md wird über instructions_file geladen"
-        );
+        // `harw-config` reicht die DSL-Definitionen ungeparst weiter; jede
+        // mitgelieferte `definition.toml` muss als Rohquelle ankommen. Dass
+        // sie auch senken, prüft
+        // `harw_registry_defaults::config_agents::tests::bundled_agents_lower_over_the_home_layer`
+        // (diese Crate kennt die Agenten-DSL nicht).
         let bundled_definitions = crate::bundle::bundled_files()
             .iter()
             .filter(|file| file.relative_path.ends_with("/definition.toml"))
             .count();
-        assert_eq!(resolved.executable_agents.len(), bundled_definitions);
+        assert_eq!(
+            resolved.agent_sources.definitions.len(),
+            bundled_definitions
+        );
+        assert!(
+            resolved
+                .agent_sources
+                .definitions
+                .iter()
+                .any(|source| source.path.ends_with("rust-implementer/definition.toml")),
+            "rust-implementer wird entdeckt"
+        );
 
         std::fs::remove_dir_all(&home).map_err(ctx("remove temporary scaffold"))?;
         Ok(())

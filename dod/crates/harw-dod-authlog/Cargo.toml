@@ -1,6 +1,7 @@
 [package]
-publish = false
 name = "harw-dod-authlog"
+description = "Authentication log interface for Linux login events with pluggable backends."
+publish.workspace = true
 version.workspace = true
 edition.workspace = true
 license.workspace = true

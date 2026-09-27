@@ -10,6 +10,8 @@ use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 
 use bytes::Bytes;
+use harw_auth_hub::sealed::{Kek, SealedProvider};
+use harw_auth_hub::service::KeyStore;
 use harw_auth_hub::{HubConfig, HubError, HubListener, HubService};
 use http::{Method, Request, StatusCode, header};
 use http_body_util::{BodyExt, Full};
@@ -92,8 +94,10 @@ pub fn write_file(path: &Path, content: &[u8], mode: u32) -> TestResult {
 
 /// A hub serving on `<tempdir>/run/secure.sock` (parent created by the hub).
 pub struct RunningHub {
-    /// Keeps the temp dir alive for the test's duration.
-    _dir: TempDir,
+    /// Keeps the temp dir alive for the test's duration. `None` when the
+    /// temp dir is owned elsewhere (see `SealedHub`, which must outlive a
+    /// restart).
+    _dir: Option<TempDir>,
     /// The socket path.
     pub socket: PathBuf,
     stop: Option<oneshot::Sender<()>>,
@@ -101,8 +105,31 @@ pub struct RunningHub {
 }
 
 impl RunningHub {
-    /// Start a hub. `config` receives the temp dir path and returns the TOML
-    /// config text (without `socket_path`, which is set here).
+    /// Parse `config_text`, bind the socket and spawn the server task on
+    /// `store`. Shared by `RunningHub::start` and `SealedHub`.
+    async fn spawn(
+        socket: PathBuf,
+        config_text: &str,
+        store: KeyStore,
+    ) -> TestResult<(oneshot::Sender<()>, JoinHandle<Result<(), HubError>>)> {
+        let mut parsed = HubConfig::from_toml_str(config_text).map_err(ctx("parse config"))?;
+        parsed.socket_path = socket.clone();
+        let bearer = parsed
+            .load_bearer_tokens()
+            .map_err(ctx("load bearer tokens"))?;
+        let listener = HubListener::bind(&socket).map_err(ctx("bind"))?;
+        let hub = HubService::build(&parsed, bearer, store).map_err(ctx("build hub"))?;
+        let (stop, stopped) = oneshot::channel::<()>();
+        let task = tokio::spawn(harw_auth_hub::serve(listener, hub, async move {
+            // Either an explicit stop or a dropped sender ends the server.
+            let _ = stopped.await;
+        }));
+        Ok((stop, task))
+    }
+
+    /// Start a hub with an in-memory key store. `config` receives the temp
+    /// dir path and returns the TOML config text (without `socket_path`,
+    /// which is set here).
     pub async fn start<F>(config: F) -> TestResult<Self>
     where
         F: FnOnce(&Path, u32) -> String,
@@ -110,21 +137,10 @@ impl RunningHub {
         let dir = tempfile::tempdir().map_err(ctx("tempdir"))?;
         let uid = current_uid(dir.path())?;
         let socket = dir.path().join("run").join("secure.sock");
-        let mut parsed =
-            HubConfig::from_toml_str(&config(dir.path(), uid)).map_err(ctx("parse config"))?;
-        parsed.socket_path = socket.clone();
-        let bearer = parsed
-            .load_bearer_tokens()
-            .map_err(ctx("load bearer tokens"))?;
-        let listener = HubListener::bind(&socket).map_err(ctx("bind"))?;
-        let hub = HubService::new(&parsed, bearer);
-        let (stop, stopped) = oneshot::channel::<()>();
-        let task = tokio::spawn(harw_auth_hub::serve(listener, hub, async move {
-            // Either an explicit stop or a dropped sender ends the server.
-            let _ = stopped.await;
-        }));
+        let text = config(dir.path(), uid);
+        let (stop, task) = Self::spawn(socket.clone(), &text, KeyStore::InMemory).await?;
         Ok(Self {
-            _dir: dir,
+            _dir: Some(dir),
             socket,
             stop: Some(stop),
             task,
@@ -156,6 +172,92 @@ impl RunningHub {
             !self.socket.exists(),
             "socket file must be removed on shutdown",
         )
+    }
+}
+
+/// A hub backed by a sealed on-disk key store. Unlike `RunningHub`, the
+/// temp dir, store path and KEK are kept alive here (not inside the inner
+/// `RunningHub`) so the same store can be reopened by `restart` after the
+/// hub has been stopped, to test persistence across a restart.
+pub struct SealedHub {
+    /// The currently running hub.
+    pub hub: RunningHub,
+    /// Keeps the temp dir (and thus the store file) alive across restarts.
+    dir: TempDir,
+    /// Path of the sealed store, inside `dir`.
+    pub store_path: PathBuf,
+    kek: Kek,
+}
+
+impl SealedHub {
+    /// Start a hub over a freshly created sealed store, in a new temp dir,
+    /// under a freshly generated KEK. `config` receives the temp dir path,
+    /// the store path and the uid, and returns the TOML config text
+    /// (without `socket_path`, which is set here).
+    pub async fn start<F>(config: F) -> TestResult<Self>
+    where
+        F: FnOnce(&Path, &Path, u32) -> String,
+    {
+        let dir = tempfile::tempdir().map_err(ctx("tempdir"))?;
+        let uid = current_uid(dir.path())?;
+        let store_path = dir.path().join("keys.store");
+        let kek = Kek::generate().map_err(ctx("generate kek"))?;
+        let provider =
+            SealedProvider::create(&store_path, &kek).map_err(ctx("create sealed store"))?;
+        let socket = dir.path().join("run").join("secure.sock");
+        let text = config(dir.path(), &store_path, uid);
+        let (stop, task) =
+            RunningHub::spawn(socket.clone(), &text, KeyStore::Sealed(provider)).await?;
+        Ok(Self {
+            hub: RunningHub {
+                _dir: None,
+                socket,
+                stop: Some(stop),
+                task,
+            },
+            dir,
+            store_path,
+            kek,
+        })
+    }
+
+    /// Stop the hub and start it again by reopening the same store under
+    /// the same KEK (rather than recreating it), to test persistence
+    /// across a restart. `config` is as for `start`.
+    pub async fn restart<F>(self, config: F) -> TestResult<Self>
+    where
+        F: FnOnce(&Path, &Path, u32) -> String,
+    {
+        self.hub.stop().await?;
+        let uid = current_uid(self.dir.path())?;
+        let provider = SealedProvider::open(&self.store_path, &self.kek)
+            .map_err(ctx("reopen sealed store"))?;
+        let socket = self.dir.path().join("run").join("secure.sock");
+        let text = config(self.dir.path(), &self.store_path, uid);
+        let (stop, task) =
+            RunningHub::spawn(socket.clone(), &text, KeyStore::Sealed(provider)).await?;
+        Ok(Self {
+            hub: RunningHub {
+                _dir: None,
+                socket,
+                stop: Some(stop),
+                task,
+            },
+            dir: self.dir,
+            store_path: self.store_path,
+            kek: self.kek,
+        })
+    }
+
+    /// Open a new HTTP/1 client connection to the currently running hub.
+    pub async fn client(&self) -> TestResult<Client> {
+        self.hub.client().await
+    }
+
+    /// Stop the hub, keeping the temp dir (and thus the store file) alive
+    /// in case the caller wants to inspect it.
+    pub async fn stop(self) -> TestResult {
+        self.hub.stop().await
     }
 }
 

@@ -958,6 +958,7 @@ mod tests {
                     id: "owner".to_owned(),
                 },
                 issued_at,
+                tenant: None,
             })
             .map_err(ctx("issue succeeds against a fresh store"))?;
 

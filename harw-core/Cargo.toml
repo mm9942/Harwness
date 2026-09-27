@@ -1,6 +1,7 @@
 [package]
 publish.workspace = true
 name = "harw-core"
+description = "Agent session finite state machine, turn loop, and session orchestration"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -25,7 +26,7 @@ harw-sandbox = { path = "../harw-sandbox" }
 harw-catalog = { path = "../harw-catalog" }
 harw-config = { path = "../harw-config" }
 harw-session-store = { path = "../harw-session-store" }
-harw-job-runtime = { path = "../harw-job-runtime" }
+harw-job-core = { path = "../harw-job-core" }
 # AW4-01: `context_budget::render_trust_blocks` embeds the canonical data-block
 # notice from `harw_instructions::DATA_BLOCK_NOTICE`, defined exactly once so
 # the system-prompt-level explanation and the rendered data block always agree.

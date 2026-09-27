@@ -4124,8 +4124,10 @@ specialization = "web-scout"
         }
         let config =
             harw_config::discover_config(&[home.path().to_path_buf()]).map_err(ctx("Discovery"))?;
+        let agents = harw_registry_defaults::ConfigAgents::from_config(&config)
+            .map_err(ctx("Agenten senken"))?;
         let builtin = builtin_agent_definitions(&HashMap::new()).map_err(ctx("Rollen"))?;
-        let roster = harw_registry_defaults::AgentRoster::from_config(&builtin, &config)
+        let roster = harw_registry_defaults::AgentRoster::from_config(&builtin, &agents)
             .map_err(ctx("Roster"))?;
 
         let factory = RuntimeChildRegistryFactory::with_definitions(
@@ -4239,8 +4241,10 @@ admitted = ["fs.read", "fs.write"]
         .map_err(ctx("definition"))?;
         let config =
             harw_config::discover_config(&[home.path().to_path_buf()]).map_err(ctx("Discovery"))?;
+        let agents = harw_registry_defaults::ConfigAgents::from_config(&config)
+            .map_err(ctx("Agenten senken"))?;
         let builtin = builtin_agent_definitions(&HashMap::new()).map_err(ctx("Rollen"))?;
-        let roster = harw_registry_defaults::AgentRoster::from_config(&builtin, &config)
+        let roster = harw_registry_defaults::AgentRoster::from_config(&builtin, &agents)
             .map_err(ctx("Roster"))?;
         let factory = RuntimeChildRegistryFactory::with_definitions(
             test_project(),

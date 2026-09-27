@@ -32,7 +32,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use harw_job_runtime::{JobState, WorkId};
+use harw_job_core::{JobState, WorkId};
 
 use crate::artifact::{ArtifactId, ArtifactKind, Frontmatter, KnowledgeArtifact};
 use crate::error::{KnowledgeError, KnowledgeResult};
@@ -201,7 +201,7 @@ pub struct CardRecord {
 ///
 /// # Beschreibung
 /// Wird von [`JobTransitions::snapshot`] geliefert; ein Adapter über
-/// `harw-job-runtime` füllt `state`/`attempts` aus dem `Job`, `holder` aus
+/// `harw-job-core` füllt `state`/`attempts` aus dem `Job`, `holder` aus
 /// dem aktiven `Lease` und `block_reason` aus seiner eigenen Buchführung
 /// (der `JobState` selbst trägt keinen Grund).
 #[derive(Debug, Clone, PartialEq, Eq)]

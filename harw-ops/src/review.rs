@@ -53,8 +53,8 @@ async fn review(ctx: &OpContext, args: ReviewArgs) -> Result<OpOutput, OpError> 
         .service::<Arc<JobStore>>()
         .ok_or_else(|| OpError::NotAvailable("durable job store is not configured".to_owned()))?;
 
-    let record = store
-        .get(&WorkId::from_str(work_id))
+    // H12: fremde Jobs melden sich wie unbekannte (keine Existenz-Preisgabe).
+    let record = crate::job_tenant::get_visible_job(ctx, store, &WorkId::from_str(work_id))
         .map_err(|error| map_get_error(work_id, error))?;
 
     Ok(OpOutput::from(render_review(&record)))
@@ -302,6 +302,70 @@ mod tests {
         assert!(output.text.contains("Lease: none"));
         assert!(output.text.contains("Completion: none"));
         assert!(output.text.contains("Cancellation: none"));
+        Ok(())
+    }
+
+    // H12: Mandanten-Filter (unscoped sieht alles, scoped nur den eigenen
+    // Mandanten, fremde Jobs verhalten sich wie unbekannte).
+    #[tokio::test]
+    async fn review_unscoped_caller_reaches_every_tenant() -> TestResult {
+        use crate::job_tenant::fixtures::{JOB_B, context, two_tenants};
+        use harw_job_runtime::JobState;
+        let jobs = two_tenants(JobState::Ready)?;
+        let op_ctx = context(&jobs, None)?;
+        let output = review(
+            &op_ctx,
+            ReviewArgs {
+                work_id: Some(JOB_B.to_owned()),
+            },
+        )
+        .await
+        .map_err(ctx("review foreign job without scope"))?;
+        assert!(output.text.contains(JOB_B), "{}", output.text);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn review_scoped_caller_reaches_own_tenant() -> TestResult {
+        use crate::job_tenant::fixtures::{JOB_A, TENANT_A, context, two_tenants};
+        use harw_job_runtime::JobState;
+        let jobs = two_tenants(JobState::Ready)?;
+        let op_ctx = context(&jobs, Some(TENANT_A))?;
+        let output = review(
+            &op_ctx,
+            ReviewArgs {
+                work_id: Some(JOB_A.to_owned()),
+            },
+        )
+        .await
+        .map_err(ctx("review own job"))?;
+        assert!(output.text.contains(JOB_A), "{}", output.text);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn review_scoped_caller_foreign_job_is_hidden_like_missing() -> TestResult {
+        use crate::job_tenant::fixtures::{
+            JOB_B, MISSING, TENANT_A, assert_hidden_like_missing, context, two_tenants,
+        };
+        use harw_job_runtime::JobState;
+        let jobs = two_tenants(JobState::Ready)?;
+        let op_ctx = context(&jobs, Some(TENANT_A))?;
+        let foreign = review(
+            &op_ctx,
+            ReviewArgs {
+                work_id: Some(JOB_B.to_owned()),
+            },
+        )
+        .await;
+        let missing = review(
+            &op_ctx,
+            ReviewArgs {
+                work_id: Some(MISSING.to_owned()),
+            },
+        )
+        .await;
+        assert_hidden_like_missing(foreign, missing)?;
         Ok(())
     }
 }

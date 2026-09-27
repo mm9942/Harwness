@@ -1,6 +1,7 @@
 [package]
-publish = false
 name = "harw-dod-fixtures"
+description = "Fixture harness and test generator for sensor implementations"
+publish.workspace = true
 version.workspace = true
 edition.workspace = true
 license.workspace = true

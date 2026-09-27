@@ -52,7 +52,7 @@
 **Tests added/changed:** 20 unit tests in `xtask/src/gate_arch.rs`, including a real-repository run.
 **Architecture gates changed:** new `arch` gate (1966 checks, green).
 **Documentation updated:** `CONTRIBUTING.md`, `docs/setup/install.md`, `docs/architecture/README.md`.
-**Remaining plan items:** resolve the exceptions `harw-config → harw-agent-dsl`, `harw-agent-compiler → harw-registry-defaults`, `harw-session-store → harw-job-*`.
+**Remaining plan items:** resolve the exceptions `harw-agent-compiler → harw-registry-defaults`, `harw-session-store → harw-job-*` (`harw-config → harw-agent-dsl` is resolved: raw `agent_sources` in `harw-config`, lowering in `harw_registry_defaults::config_agents`).
 
 ## MIG-002 — DoD joins the root workspace (PL-60)
 

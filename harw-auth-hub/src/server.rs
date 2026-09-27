@@ -15,17 +15,29 @@
 //! serves each with Hyper HTTP/1, and on shutdown stops accepting, asks
 //! every open connection to finish its in-flight request
 //! (`graceful_shutdown`) and waits up to [`DRAIN_TIMEOUT`].
+//!
+//! Hardening against slow/stalled peers (CryptGuard review finding A7):
+//! a connection that does not finish sending its request headers within
+//! [`HEADER_READ_TIMEOUT`] is dropped by Hyper itself; a connection open for
+//! longer than [`CONNECTION_MAX_LIFETIME`], active or not, is asked to
+//! finish its in-flight request and close (`graceful_shutdown`, the same as
+//! on hub shutdown), bounded by [`CONNECTION_CLOSE_GRACE`] before `serve`
+//! drops it outright; and no more than [`MAX_CONNECTIONS`] connections are
+//! served concurrently — once that many are open, newly accepted connections
+//! are closed immediately (logged, rate-limited) instead of queuing behind
+//! the limit and wedging the accept loop.
 
 use std::fs::{self, DirBuilder};
 use std::future::Future;
 use std::io;
 use std::os::unix::fs::{DirBuilderExt, FileTypeExt, PermissionsExt};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::Duration;
 
-use hyper_util::rt::TokioIo;
+use hyper_util::rt::{TokioIo, TokioTimer};
 use tokio::net::UnixListener;
-use tokio::sync::watch;
+use tokio::sync::{Semaphore, watch};
 use tokio::task::JoinSet;
 
 use crate::auth::PeerCred;
@@ -44,6 +56,37 @@ pub const DRAIN_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Back-off after a failed `accept` (e.g. `EMFILE`), so the loop does not spin.
 const ACCEPT_BACKOFF: Duration = Duration::from_millis(100);
+
+/// How long Hyper waits for a connection to finish sending its request
+/// headers before dropping it (CryptGuard review finding A7: a peer that
+/// opens a connection and trickles headers in, or never sends any, must not
+/// tie up a connection slot indefinitely).
+const HEADER_READ_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Hard cap on how long a single connection is served, active or idle
+/// (CryptGuard review finding A7). This is a lifetime bound, not an idle
+/// timeout: it also fires on a busy keep-alive connection that has simply
+/// been open a long time. When it fires, [`serve`] triggers the same
+/// graceful shutdown as on hub shutdown (finish the in-flight request,
+/// disable keep-alive, then close), bounded by [`CONNECTION_CLOSE_GRACE`],
+/// on top of (not instead of) Hyper's own [`HEADER_READ_TIMEOUT`].
+const CONNECTION_MAX_LIFETIME: Duration = Duration::from_secs(60);
+
+/// How long [`serve`] waits for a connection to finish its graceful
+/// shutdown after [`CONNECTION_MAX_LIFETIME`] fires, before dropping it
+/// outright.
+const CONNECTION_CLOSE_GRACE: Duration = Duration::from_secs(5);
+
+/// Maximum number of connections served concurrently (CryptGuard review
+/// finding A7). Beyond this, `serve` accepts and immediately closes new
+/// connections rather than queuing them, so the accept loop never wedges
+/// behind a burst of slow or stalled peers.
+const MAX_CONNECTIONS: usize = 256;
+
+/// Minimum gap between "connection limit reached" warnings, so a sustained
+/// flood of connections above [`MAX_CONNECTIONS`] logs at a bounded rate
+/// instead of once per rejected connection.
+const CONNECTION_LIMIT_LOG_INTERVAL: Duration = Duration::from_secs(5);
 
 /// A bound `AF_UNIX` stream listener.
 #[derive(Debug)]
@@ -154,6 +197,8 @@ where
     } = listener;
     let (stop_tx, stop_rx) = watch::channel(false);
     let mut connections = JoinSet::new();
+    let connection_slots = Arc::new(Semaphore::new(MAX_CONNECTIONS));
+    let mut last_limit_log: Option<tokio::time::Instant> = None;
     tokio::pin!(shutdown);
 
     loop {
@@ -172,22 +217,64 @@ where
                             continue;
                         }
                     };
+                    // Bound concurrent connections (CryptGuard review finding
+                    // A7): accept and immediately drop rather than queue
+                    // behind the limit, so the accept loop never wedges.
+                    let permit = match Arc::clone(&connection_slots).try_acquire_owned() {
+                        Ok(permit) => permit,
+                        Err(_) => {
+                            let now = tokio::time::Instant::now();
+                            let should_log = last_limit_log
+                                .is_none_or(|previous| now.duration_since(previous) >= CONNECTION_LIMIT_LOG_INTERVAL);
+                            if should_log {
+                                last_limit_log = Some(now);
+                                tracing::warn!(
+                                    max_connections = MAX_CONNECTIONS,
+                                    "connection limit reached; dropping new connection",
+                                );
+                            }
+                            drop(stream);
+                            continue;
+                        }
+                    };
                     tracing::debug!(uid = peer.uid, pid = peer.pid, "connection accepted");
                     let service = hub.for_connection(Some(peer));
                     let mut stop = stop_rx.clone();
                     connections.spawn(async move {
+                        let _permit = permit;
                         let connection = hyper::server::conn::http1::Builder::new()
+                            .timer(TokioTimer::new())
+                            .header_read_timeout(HEADER_READ_TIMEOUT)
                             .serve_connection(TokioIo::new(stream), service);
                         tokio::pin!(connection);
-                        let result = tokio::select! {
-                            result = connection.as_mut() => result,
+                        let served = tokio::select! {
+                            result = connection.as_mut() => Ok(result),
                             _ = stop.changed() => {
                                 connection.as_mut().graceful_shutdown();
-                                connection.as_mut().await
+                                Ok(connection.as_mut().await)
+                            }
+                            () = tokio::time::sleep(CONNECTION_MAX_LIFETIME) => {
+                                connection.as_mut().graceful_shutdown();
+                                match tokio::time::timeout(CONNECTION_CLOSE_GRACE, connection.as_mut()).await {
+                                    Ok(result) => Ok(result),
+                                    Err(_) => Err(()),
+                                }
                             }
                         };
-                        if let Err(error) = result {
-                            tracing::debug!(%error, uid = peer.uid, "connection ended with error");
+                        match served {
+                            Ok(Err(error)) => {
+                                tracing::debug!(%error, uid = peer.uid, "connection ended with error");
+                            }
+                            Ok(Ok(())) => {}
+                            Err(()) => {
+                                tracing::warn!(
+                                    uid = peer.uid,
+                                    pid = peer.pid,
+                                    max_lifetime_secs = CONNECTION_MAX_LIFETIME.as_secs(),
+                                    grace_secs = CONNECTION_CLOSE_GRACE.as_secs(),
+                                    "connection exceeded max lifetime; forced close after grace",
+                                );
+                            }
                         }
                     });
                 }

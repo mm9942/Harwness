@@ -1,8 +1,12 @@
 # Harw workspace inventory (Migration Phase 0/1)
 
-> **Status:** descriptive snapshot, R11 (branch `claude/r11-harw-ecosystem`), derived from
-> every `Cargo.toml` in the root workspace (`Cargo.toml` members) and the nested DoD
-> workspace (`dod/Cargo.toml` members). Plan reference: Eco-Doc §43–§47, §67.
+> **Status:** descriptive snapshot, first written in R11 (branch `claude/r11-harw-ecosystem`),
+> refreshed in R12 for the crates added since (the `harw-job-*` family, `harw-auth-hub`,
+> `harw-infra-client`, `harw-netsec`, `harw-node-transport`, `harw-security-hub`,
+> `harw-dod-encrypt`). Derived from every member `Cargo.toml` of the root workspace. Since
+> PL-60 the DoD crates under `dod/crates/` are ordinary root members (one `Cargo.lock`).
+> Plan reference: Eco-Doc §43–§47, §67. Third-party dependency tiers:
+> [dependency-review.md](dependency-review.md).
 >
 > **Enforced source of truth:** `xtask/arch-policy.toml` (checked by
 > `cargo run -p xtask -- gates`). This document is descriptive only. If the two
@@ -25,13 +29,14 @@
 | Ring | Count | Members |
 |---|---|---|
 | F | 5 | digest, macros, types, protocol, lens-types |
-| I | 36 | authority, sandbox, fsutil, observe(+file/prom/otlp), extension-api, operations, egress, secrets, oauth, home, config, completions, killer, code-graph, explorer, context, tools, catalog, research, browser(+thirtyfour), lens-*, provider, model-catalog, mcp-client |
+| I | 37 | authority, sandbox, fsutil, observe(+file/prom/otlp), extension-api, operations, egress, secrets, oauth, home, config, completions, killer, code-graph, explorer, context, tools, catalog, research, browser(+thirtyfour), lens-*, provider, model-catalog, mcp-client, infra-client |
 | C | 4 | agent-dsl, agent-artifact, agent-compiler, agent-runner |
-| J | 1 (+1 in flight) | job-runtime; `harw-job-core` is being added in R11 W1 (not yet a member in the snapshot) |
-| D / D+T | 22 / 10 | all `dod/crates/*` |
-| A | 36 | core, runtime, cli, tui, `harw`, harwness-sdk, ops, web, tool-*, channel-*, knowledge, memory, plan, plan-bridge, core-bridge, session-store, mcp-server, registry-defaults, install, provider-http, … |
+| J | 9 | job-core, job-store, job-linux, job-darwin, job-exec, job-tokio, job-executor-bwrap, job-runtime, job (facade) |
+| D / D+T | 23 / 10 | all `dod/crates/*` (incl. `harw-dod-encrypt`, D) |
+| A | 40 | core, runtime, cli, tui, `harw`, harwness-sdk, ops, web, tool-*, channel-*, knowledge, memory, plan, plan-bridge, core-bridge, session-store, mcp-server, registry-defaults, install, provider-http, auth-hub, netsec, security-hub, node-transport, … |
 
-Total: 114 packages (81 root incl. `xtask`, 33 DoD).
+Total: 128 packages (all root members since PL-60: 95 outside `dod/`, incl. `xtask`, and
+33 under `dod/crates/`).
 
 ## Column notes
 
@@ -42,9 +47,9 @@ Total: 114 packages (81 root incl. `xtask`, 33 DoD).
 - **Internal deps:** normal `[dependencies]` (incl. target-specific) on workspace packages,
   `harw-` prefix stripped. Dev/build deps are excluded (e.g. `harw-macros` has dev-dep cycles
   for trybuild tests; `harw-dod-rules` dev-depends on `harw-knowledge`).
-- **Rev:** number of packages (both workspaces) with a normal dependency on this package.
-  Cross-workspace path deps are counted (root crates already depend on
-  `dod/crates/harw-dod-{signals,rules,escalate}`).
+- **Rev:** number of workspace packages with a normal dependency on this package
+  (incl. target-specific dependencies). The R12 refresh recomputed it for every row whose
+  value changed.
 - **Privileged:** `xtask/src/gate_privileges.rs`. `CRATE_PRIVILEGE` class, or the
   `MONITORED_BINARIES` budget for the five monitored binaries. `—` = not listed (only
   allowed inside `harw-agent-runner`'s closure, which uses `DefaultUnprivileged`).
@@ -54,11 +59,13 @@ Total: 114 packages (81 root incl. `xtask`, 33 DoD).
 - **Unsafe:** every package has `[lints] workspace = true`. Both workspaces set
   `unsafe_code = "forbid"`. "+ attr" = also `#![forbid(unsafe_code)]` in
   `lib.rs`/`main.rs`. No `allow(unsafe_code)` exists anywhere.
-- **Native deps:** C/asm code that reaches the build, resolved through `Cargo.lock`/
-  `dod/Cargo.lock`: `aws-lc-sys` and `ring` via `reqwest`/rustls, `libdbus-sys` via
+- **Native deps:** C/asm code that reaches the build, resolved through `Cargo.lock`: `aws-lc-sys` and `ring` via `reqwest`/rustls, `libdbus-sys` via
   `keyring` (`sync-secret-service`), `tikv-jemalloc-sys`, and `cc` via `blake3`,
   `crypt_guard` and `oxidize-pdf`. `rustix`, `landlock`, `nix` and `aya` are pure Rust
   (raw syscalls), so they are not native. They make a crate platform-specific instead.
+  The `cc` edge listed for `crypt_guard` consumers runs through `crabgrind`, which
+  `libcrux-secrets` pulls only under `cfg(valgrind_ct_test)`. It is in the lockfile but not
+  built normally (see `dependency-review.md`, Tier C).
 
 ## Inventory
 
@@ -66,9 +73,9 @@ Total: 114 packages (81 root incl. `xtask`, 33 DoD).
 |---|---|---|---|---|---|---|---|---|---|
 | `harw-digest` | `harw-digest` | root | **F** | — | 2 | Unpriv (listed) | portable | forbid (ws) | blake3 (cc) |
 | `harw-lens-types` | `harw-lens-types` | root | **F** | digest, macros | 20 | — | portable | forbid (ws + attr) | — |
-| `harw-macros` | `harw-macros` | root | **F** | — | 69 | Unpriv (listed) | portable | forbid (ws) | blake3 (cc) |
+| `harw-macros` | `harw-macros` | root | **F** | — | 70 | Unpriv (listed) | portable | forbid (ws) | blake3 (cc) |
 | `harw-protocol` | `harw-protocol` | root | **F** | types | 6 | — | portable | forbid (ws + attr) | — |
-| `harw-types` | `harw-types` | root | **F** | digest | 71 | Unpriv (listed) | portable | forbid (ws + attr) | — |
+| `harw-types` | `harw-types` | root | **F** | digest | 77 | Unpriv (listed) | portable | forbid (ws + attr) | — |
 | `harw-authority` | `harw-authority` | root | **I** | types | 37 | Unpriv (listed) | unix cfg | forbid (ws + attr) | blake3 (cc) |
 | `harw-browser` | `harw-browser` | root | **I** | — | 3 | — | portable | forbid (ws) | — |
 | `harw-browser-thirtyfour` | `harw-browser-thirtyfour` | root | **I** | browser | 1 | — | unix cfg | forbid (ws) | aws-lc-sys via thirtyfour/reqwest |
@@ -82,6 +89,7 @@ Total: 114 packages (81 root incl. `xtask`, 33 DoD).
 | `harw-extension-api` | `harw-extension-api` | root | **I** | authority, catalog, context, lens-types, macros, sandbox, tools, types | 26 | — | portable | forbid (ws + attr) | — |
 | `harw-fsutil` | `harw-fsutil` | root | **I** | — | 12 | Unpriv (listed) | portable (linux fast path) | forbid (ws + attr) | — |
 | `harw-home` | `harw-home` | root | **I** | fsutil | 19 | Unpriv (listed) | unix cfg | forbid (ws + attr) | blake3 (cc) |
+| `harw-infra-client` | `harw-infra-client` | root | **I** | secrets | 3 | — | unix (UDS clients for secure/network/security.sock) | forbid (ws) | — (lockfile: `cc`/`bindgen` via cfg-gated `crabgrind` in `crypt_guard`) |
 | `harw-killer` | `harw-killer` | root | **I** | — | 2 | — | linux (pidfd,/proc; non-linux stub) | forbid (ws + attr) | — |
 | `harw-lens` | `harw-lens` | root | **I** | lens-embed, lens-query, lens-source, lens-types, macros | 2 | — | portable | forbid (ws) | — |
 | `harw-lens-chunk` | `harw-lens-chunk` | root | **I** | lens-types, macros, types | 1 | — | portable | forbid (ws + attr) | — |
@@ -95,21 +103,29 @@ Total: 114 packages (81 root incl. `xtask`, 33 DoD).
 | `harw-mcp-client` | `harw-mcp-client` | root | **I** | extension-api, tools | 2 | — | portable | forbid (ws) | aws-lc-sys via reqwest |
 | `harw-model-catalog` | `harw-model-catalog` | root | **I** | config, context, lens-types, types | 6 | — | unix cfg | forbid (ws + attr) | aws-lc-sys via reqwest |
 | `harw-oauth` | `harw-oauth` | root | **I** | config | 2 | — | unix cfg | forbid (ws + attr) | aws-lc-sys via reqwest |
-| `harw-observe` | `harw-observe` | root | **I** | authority, macros | 16 | Unpriv (listed) | portable | forbid (ws) | — |
+| `harw-observe` | `harw-observe` | root | **I** | macros | 16 | Unpriv (listed) | portable | forbid (ws) | — |
 | `harw-observe-file` | `harw-observe-file` | root | **I** | macros, observe | 2 | Unpriv (listed) | portable | forbid (ws) | blake3 (cc) |
 | `harw-observe-otlp` | `harw-observe-otlp` | root | **I** | macros, observe | 1 | Unpriv (listed) | portable | forbid (ws) | — |
 | `harw-observe-prom` | `harw-observe-prom` | root | **I** | macros, observe | 1 | Unpriv (listed) | portable | forbid (ws) | — |
 | `harw-operations` | `harw-operations` | root | **I** | authority, extension-api, sandbox, tools, types | 8 | — | portable | forbid (ws + attr) | — |
 | `harw-provider` | `harw-provider` | root | **I** | macros, types | 3 | — | portable | forbid (ws + attr) | — |
 | `harw-research` | `harw-research` | root | **I** | macros, types | 5 | Unpriv (listed) | portable | forbid (ws + attr) | — |
-| `harw-sandbox` | `harw-sandbox` | root | **I** | authority, types | 24 | Unpriv (listed) | linux (bwrap; unix cfg) | forbid (ws + attr) | — |
-| `harw-secrets` | `harw-secrets` | root | **I** | fsutil, macros, observe | 4 | — | unix cfg | forbid (ws) | cc via crypt_guard; libdbus-sys via keyring (feature `keyring`) |
+| `harw-sandbox` | `harw-sandbox` | root | **I** | authority, types | 25 | Unpriv (listed) | linux (bwrap; unix cfg) | forbid (ws + attr) | — |
+| `harw-secrets` | `harw-secrets` | root | **I** | fsutil, macros, observe | 5 | — | unix cfg | forbid (ws) | cc via crypt_guard; libdbus-sys via keyring (feature `keyring`) |
 | `harw-tools` | `harw-tools` | root | **I** | authority, context, lens-types, macros, sandbox, types | 20 | — | portable | forbid (ws + attr) | — |
 | `harw-agent-artifact` | `harw-agent-artifact` | root | **C** | — | 5 | — | unix cfg | forbid (ws + attr) | blake3 (cc) |
 | `harw-agent-compiler` | `harw-agent-compiler` | root | **C** | agent-artifact, agent-dsl, catalog, home, registry-defaults | 2 | — | unix cfg | forbid (ws + attr) | — |
 | `harw-agent-dsl` | `harw-agent-dsl` | root | **C** | context | 13 | — | portable | forbid (ws + attr) | blake3 (cc) |
-| `harw-agent-runner` | `harw-agent-runner` | root | **C** | agent-artifact, agent-dsl, core, home, registry-defaults, runtime, tool-job, tui, types, harwness-sdk | 0 | bin budget Unprivileged (unlisted=default-unpriv) | unix (rustix) | forbid (ws + attr) | — |
-| `harw-job-runtime` | `harw-job-runtime` | root | **J** | macros, observe, types | 8 | — | portable | forbid (ws + attr) | — |
+| `harw-agent-runner` | `harw-agent-runner` | root | **C** | agent-artifact, agent-dsl, core, harwness-sdk, home, job-runtime, registry-defaults, runtime, tool-job, tui, types | 0 | bin budget Unprivileged (unlisted=default-unpriv) | unix (rustix) | forbid (ws + attr) | — |
+| `harw-job` | `harw-job` | root | **J** | job-core, job-runtime, job-store, types | 0 | — | portable facade (linux/macos cfg) | forbid (ws + attr) | — |
+| `harw-job-core` | `harw-job-core` | root | **J** | macros, observe, types | 11 | — | portable | forbid (ws + attr) | — |
+| `harw-job-darwin` | `harw-job-darwin` | root | **J** | job-core | 1 | — | macOS (rustix target dep; pure model elsewhere) | forbid (ws + attr) | — |
+| `harw-job-exec` | `harw-job-exec` | root | **J** | job-core, job-linux (linux) | 1 | bin budget Unprivileged (unlisted=default-unpriv) | linux (trampoline; non-linux stub) | forbid (ws + attr) | — |
+| `harw-job-executor-bwrap` | `harw-job-executor-bwrap` | root | **J** | authority, job-core, job-linux, sandbox, types (all linux-only) | 1 | — | linux-only (bwrap) | forbid (ws + attr) | — |
+| `harw-job-linux` | `harw-job-linux` | root | **J** | job-core | 5 | — | linux-only (pidfd, procfs, cgroup v2, Landlock) | forbid (ws + attr) | — |
+| `harw-job-runtime` | `harw-job-runtime` | root | **J** | job-core, job-darwin, job-exec, job-executor-bwrap (opt.), job-linux, job-store, job-tokio, types | 6 | — | portable (linux/macos backends, target deps) | forbid (ws + attr) | — |
+| `harw-job-store` | `harw-job-store` | root | **J** | job-core | 3 | — | unix cfg (cap-std, fs4 locks) | forbid (ws + attr) | — |
+| `harw-job-tokio` | `harw-job-tokio` | root | **J** | job-core, job-linux (all linux-only) | 1 | — | linux-only (AsyncFd over pidfd) | forbid (ws + attr) | — |
 | `harw-dod` | `dod/crates/harw-dod` | dod | **D** | authority, dod-authlog, dod-blockio, dod-bpf, dod-cap, dod-cpu, dod-flow, dod-fsmon, dod-gpu, dod-listener, dod-memory, dod-netcounters, dod-procmon, dod-rules, dod-scanreport, dod-sentinel, dod-signals, dod-thermal, dod-workspace | 0 | — | linux (facade over sensors) | forbid (ws) | — |
 | `harw-dod-authlog` | `dod/crates/harw-dod-authlog` | dod | **D+T** | dod-cap, dod-netlink, dod-signals, macros, types | 1 | Netlink | linux-only (netlink) | forbid (ws) | — |
 | `harw-dod-blockio` | `dod/crates/harw-dod-blockio` | dod | **D** | dod-cap, dod-readfs, dod-signals, macros, types | 2 | Unpriv (listed) | linux-only (procfs/sysfs) | forbid (ws) | — |
@@ -118,6 +134,7 @@ Total: 114 packages (81 root incl. `xtask`, 33 DoD).
 | `harw-dod-cgroup` | `dod/crates/harw-dod-cgroup` | dod | **D** | dod-cap, dod-readfs, dod-signals, macros, types | 1 | Unpriv (listed) | linux-only (cgroup v2) | forbid (ws) | — |
 | `harw-dod-config` | `dod/crates/harw-dod-config` | dod | **D** | — | 2 | Unpriv (listed) | unix (rustix) | forbid (ws + attr) | blake3 (cc) |
 | `harw-dod-cpu` | `dod/crates/harw-dod-cpu` | dod | **D** | dod-cap, dod-readfs, dod-signals, macros, types | 2 | Unpriv (listed) | linux-only (procfs) | forbid (ws) | — |
+| `harw-dod-encrypt` | `dod/crates/harw-dod-encrypt` | dod | **D** | macros | 0 | — | portable | forbid (ws) | — (lockfile: `cc`/`bindgen` via cfg-gated `crabgrind` in `crypt_guard_service`) |
 | `harw-dod-escalate` | `dod/crates/harw-dod-escalate` | dod | **D** | authority, dod-rules, dod-signals, dod-warden-proto, macros, session-store, types | 1 | Unpriv (listed) | portable | forbid (ws + attr) | — |
 | `harw-dod-fixtures` | `dod/crates/harw-dod-fixtures` | dod | **D** | dod-cap, dod-readfs, dod-signals, macros, types | 0 | — | linux (fixture fs trees) | forbid (ws) | — |
 | `harw-dod-flow` | `dod/crates/harw-dod-flow` | dod | **D+T** | authority, dod-bpf, dod-cap, dod-signals, macros, sandbox, types | 2 | Bpf | linux-only (bpf) | forbid (ws) | — |
@@ -143,42 +160,45 @@ Total: 114 packages (81 root incl. `xtask`, 33 DoD).
 | `harw-sentinel` | `dod/crates/harw-sentinel` | dod | **D** | authority, completions, dod-blockio, dod-cap, dod-cgroup, dod-config, dod-cpu, dod-gpu, dod-listener, dod-memory, dod-netcounters, dod-rules, dod-scanreport, dod-sentinel, dod-signals, dod-thermal, dod-workspace, home, macros, observe, observe-file, sandbox, types | 0 | bin budget Unprivileged | linux (landlock; non-linux stub) | forbid (ws + attr) | — |
 | `harw-warden` | `dod/crates/harw-warden` | dod | **D+T** | completions, dod-warden, dod-warden-proto, macros, types | 0 | bin budget SystemdSocketNoNet | linux (landlock, socket act.; non-linux stub) | forbid (ws + attr) | — |
 | `harw` | `harw` | root | **A** | agent-dsl, authority, code-graph, core, extension-api, model-catalog, operations, ops, plan, plan-bridge, provider, registry-defaults, research, sandbox, types | 0 | — | portable | forbid (ws) | — |
+| `harw-auth-hub` | `harw-auth-hub` | root | **A** | — | 0 | — (daemon binary, not a monitored binary) | unix (UDS, SO_PEERCRED, socket activation) | forbid (ws + attr) | — (lockfile: `cc`/`bindgen` via cfg-gated `crabgrind` in `crypt_guard_service`) |
 | `harw-channel` | `harw-channel` | root | **A** | macros, secrets, session-store, types | 3 | — | portable | forbid (ws + attr) | — |
 | `harw-channel-telegram` | `harw-channel-telegram` | root | **A** | authority, channel, sandbox, session-store, types | 2 | — | unix cfg | forbid (ws + attr) | — |
 | `harw-channel-telegram-transport` | `harw-channel-telegram-transport` | root | **A** | channel, channel-telegram, config, secrets, types | 1 | — | portable | forbid (ws + attr) | aws-lc-sys via reqwest |
 | `harw-cli` | `harw-cli` | root | **A** | agent-artifact, agent-compiler, agent-dsl, authority, channel, channel-telegram, channel-telegram-transport, completions, config, context, core, extension-api, home, install, job-runtime, killer, knowledge, lens, lens-types, mcp-client, mcp-server, memory, model-catalog, oauth, observe, observe-file, observe-otlp, observe-prom, operations, ops, plan, plan-bridge, protocol, provider-http, registry-defaults, runtime, sandbox, secrets, session-store, tool-doc, tool-lens, tui, types, web | 0 | — | portable (unix/windows/linux cfg) | forbid (ws + attr) | tikv-jemalloc-sys (cc); aws-lc-sys via reqwest; libdbus-sys via keyring |
-| `harw-core` | `harw-core` | root | **A** | agent-dsl, authority, catalog, config, context, extension-api, instructions, job-runtime, lens-types, macros, observe, protocol, sandbox, session-store, tools, types | 10 | — | portable | forbid (ws + attr) | — |
+| `harw-core` | `harw-core` | root | **A** | agent-dsl, authority, catalog, config, context, extension-api, instructions, job-core, lens-types, macros, observe, protocol, sandbox, session-store, tools, types | 10 | — | portable | forbid (ws + attr) | — |
 | `harw-core-bridge` | `harw-core-bridge` | root | **A** | agent-dsl, authority, core, dod-signals, extension-api, operations, research, sandbox, types | 2 | — | portable | forbid (ws) | — |
 | `harw-install` | `harw-install` | root | **A** | config, home | 1 | — | portable (systemd/launchd/schtasks backends) | forbid (ws + attr) | — |
 | `harw-instructions` | `harw-instructions` | root | **A** | extension-api, macros, types | 2 | — | portable | forbid (ws + attr) | — |
-| `harw-knowledge` | `harw-knowledge` | root | **A** | agent-dsl, context, dod-rules, dod-signals, job-runtime, lens-types, macros, model-catalog, observe, plan, session-store, types | 6 | — | unix cfg | forbid (ws + attr) | — |
+| `harw-knowledge` | `harw-knowledge` | root | **A** | agent-dsl, context, dod-rules, dod-signals, job-core, lens-types, macros, model-catalog, observe, plan, session-store, types | 6 | — | unix cfg | forbid (ws + attr) | — |
 | `harw-matrix-game` | `harw-matrix-game` | root | **A** | — | 1 | — | portable | forbid (ws) | — |
-| `harw-mcp-server` | `harw-mcp-server` | root | **A** | job-runtime, session-store, types | 1 | — | portable | forbid (ws + attr) | — |
+| `harw-mcp-server` | `harw-mcp-server` | root | **A** | job-core, session-store, types | 1 | — | portable | forbid (ws + attr) | — |
 | `harw-memory` | `harw-memory` | root | **A** | context, extension-api, fsutil, lens-types, types | 4 | — | unix cfg | forbid (ws) | — |
-| `harw-ops` | `harw-ops` | root | **A** | agent-compiler, agent-dsl, authority, code-graph, config, core, core-bridge, explorer, extension-api, home, job-runtime, knowledge, macros, matrix-game, memory, model-catalog, operations, plan, plan-bridge, provider, provider-http, registry-defaults, research, sandbox, session-store, tool-job, tool-plan, tool-shell, tools, types, web | 4 | — | unix cfg | forbid (ws + attr) | — |
+| `harw-netsec` | `harw-netsec` | root | **A** | types | 0 | — (daemon binary) | unix (UDS, socket activation) | forbid (ws) | — |
+| `harw-node-transport` | `harw-node-transport` | root | **A** | types | 0 | — | portable (TCP + TLS 1.3) | forbid (ws) | aws-lc-sys (cc, cmake, prebuilt NASM) via aws-lc-rs |
+| `harw-ops` | `harw-ops` | root | **A** | agent-compiler, agent-dsl, authority, code-graph, config, core, core-bridge, explorer, extension-api, home, infra-client, job-runtime, knowledge, macros, matrix-game, memory, model-catalog, operations, plan, plan-bridge, provider, provider-http, registry-defaults, research, sandbox, session-store, tool-job, tool-plan, tool-shell, tools, types, web | 4 | — | unix cfg | forbid (ws + attr) | — |
 | `harw-plan` | `harw-plan` | root | **A** | macros, types | 7 | — | portable | forbid (ws + attr) | — |
 | `harw-plan-bridge` | `harw-plan-bridge` | root | **A** | agent-dsl, authority, context, core, dod-escalate, dod-signals, extension-api, home, job-runtime, knowledge, lens-types, macros, observe, operations, plan, research, session-store, types | 4 | — | portable | forbid (ws + attr) | — |
 | `harw-project-discovery` | `harw-project-discovery` | root | **A** | extension-api, macros, types | 2 | — | portable (linux cfg) | forbid (ws + attr) | — |
 | `harw-provider-http` | `harw-provider-http` | root | **A** | config, core, fsutil, oauth, protocol, provider, sandbox, tools, types | 4 | — | portable | forbid (ws + attr) | aws-lc-sys via reqwest; libdbus-sys via keyring |
 | `harw-registry-defaults` | `harw-registry-defaults` | root | **A** | agent-dsl, authority, browser, browser-thirtyfour, catalog, config, egress, extension-api, home, instructions, knowledge, project-discovery, sandbox, tool-browser, tool-deps, tool-doc, tool-explorer, tool-fs, tool-job, tool-lens, tool-plan, tool-process, tool-shell, tool-web, tools | 7 | — | unix cfg | forbid (ws + attr) | — |
-| `harw-runtime` | `harw-runtime` | root | **A** | agent-artifact, agent-dsl, authority, catalog, config, context, core, core-bridge, explorer, extension-api, fsutil, home, job-runtime, knowledge, lens-types, macros, mcp-client, memory, model-catalog, observe, operations, ops, plan, plan-bridge, project-discovery, protocol, provider-http, registry-defaults, sandbox, secrets, session-store, tool-job, tool-plan, tool-shell, types | 4 | — | unix cfg | forbid (ws + attr) | — |
-| `harw-session-store` | `harw-session-store` | root | **A** | fsutil, job-runtime, macros, observe, types | 13 | — | unix cfg (perms/locks) | forbid (ws + attr) | — |
+| `harw-runtime` | `harw-runtime` | root | **A** | agent-artifact, agent-dsl, authority, catalog, config, context, core, core-bridge, explorer, extension-api, fsutil, home, infra-client, job-runtime, knowledge, lens-types, macros, mcp-client, memory, model-catalog, observe, operations, ops, plan, plan-bridge, project-discovery, protocol, provider-http, registry-defaults, sandbox, secrets, session-store, tool-job, tool-plan, tool-shell, types | 4 | — | unix cfg | forbid (ws + attr) | — |
+| `harw-security-hub` | `harw-security-hub` | root | **A** | types | 0 | — (daemon binary) | unix (UDS, SO_PEERCRED, socket activation) | forbid (ws) | — |
+| `harw-session-store` | `harw-session-store` | root | **A** | fsutil, job-core, job-store, macros, observe, types | 13 | — | unix cfg (perms/locks) | forbid (ws + attr) | — |
 | `harw-tool-browser` | `harw-tool-browser` | root | **A** | authority, browser, extension-api, sandbox, tools | 1 | — | portable | forbid (ws) | — |
 | `harw-tool-deps` | `harw-tool-deps` | root | **A** | authority, code-graph, extension-api, macros, sandbox, tools | 1 | — | unix cfg | forbid (ws + attr) | — |
 | `harw-tool-doc` | `harw-tool-doc` | root | **A** | authority, egress, extension-api, fsutil, macros, tools | 3 | — | portable | forbid (ws + attr) | aws-lc-sys via reqwest; cc via oxidize-pdf |
 | `harw-tool-explorer` | `harw-tool-explorer` | root | **A** | authority, explorer, extension-api, macros, sandbox, tools | 1 | — | portable | forbid (ws) | — |
 | `harw-tool-fs` | `harw-tool-fs` | root | **A** | authority, extension-api, fsutil, home, macros, sandbox, tools, types | 1 | — | unix cfg | forbid (ws + attr) | — |
-| `harw-tool-job` | `harw-tool-job` | root | **A (J split)** | authority, extension-api, tool-shell, tools, types | 5 | — | linux-first (/proc stat, rustix pgrp; unix compile) | forbid (ws + attr) | — |
+| `harw-tool-job` | `harw-tool-job` | root | **A (J split)** | authority, extension-api, job-core, job-linux, tool-shell, tools, types | 5 | — | linux-first (/proc stat, rustix pgrp; unix compile) | forbid (ws + attr) | — |
 | `harw-tool-lens` | `harw-tool-lens` | root | **A** | authority, extension-api, home, lens, lens-federation, macros, tools | 2 | — | portable | forbid (ws + attr) | — |
 | `harw-tool-plan` | `harw-tool-plan` | root | **A** | authority, extension-api, home, tools, types | 4 | — | unix cfg | forbid (ws + attr) | — |
 | `harw-tool-process` | `harw-tool-process` | root | **A** | authority, extension-api, killer, macros, tools | 1 | — | linux (target dep) | forbid (ws) | — |
 | `harw-tool-shell` | `harw-tool-shell` | root | **A** | authority, extension-api, macros, observe, sandbox, tools, types | 5 | — | portable | forbid (ws + attr) | blake3 (cc) |
 | `harw-tool-web` | `harw-tool-web` | root | **A** | authority, egress, extension-api, fsutil, macros, sandbox, tool-doc, tools | 1 | — | portable | forbid (ws + attr) | aws-lc-sys via reqwest; blake3 (cc) |
 | `harw-tui` | `harw-tui` | root | **A** | agent-artifact, agent-dsl, authority, catalog, config, context, core, explorer, extension-api, fsutil, home, lens-types, memory, model-catalog, operations, ops, plan, protocol, registry-defaults, runtime, sandbox, session-store, tool-job, tool-plan, tool-shell, tools, types | 2 | — | unix cfg | forbid (ws + attr) | — |
-| `harw-web` | `harw-web` | root | **A** | context, macros, operations, session-store, types | 2 | — | unix (UDS, SO_PEERCRED) | forbid (ws + attr) | — |
+| `harw-web` | `harw-web` | root | **A** | context, infra-client, macros, operations, session-store, types | 2 | — | unix (UDS, SO_PEERCRED) | forbid (ws + attr) | — |
 | `harwness-sdk` | `harwness-sdk` | root | **A** | config, core, extension-api, home, protocol, provider-http, runtime, session-store, tools, types | 1 | — | portable | forbid (ws + attr) | — |
 | `xtask` | `xtask` | root | **A (tooling)** | code-graph | 0 | — | unix cfg | forbid (ws) | — |
-Counter({'I': 36, 'A': 36, 'D': 22, 'D+T': 10, 'F': 5, 'C': 4, 'J': 1})
 
 ## Classification notes
 
@@ -192,7 +212,12 @@ Counter({'I': 36, 'A': 36, 'D': 22, 'D+T': 10, 'F': 5, 'C': 4, 'J': 1})
 | `harw-lens-source` | I, but depends on `harw-knowledge` (A). Recorded as an inversion. |
 | `harw-agent-runner` | C per Eco §43, but it is really a composition binary (depends on core/runtime/tui/registry-defaults/tool-job/sdk). See inversions doc. |
 | `harw-tool-job` | A/J split: tool schema, ownership and notifier stay A. Process supervision (procfs, pgrp kill, `meta.json`) moves to J crates. See `job-extraction-map.md`. |
-| `harw-session-store` | A (session persistence). `job_store.rs` is J material and moves to `harw-job-store` (Eco §33). |
+| `harw-session-store` | A (session persistence). `job_store.rs` is a thin adapter over `harw-job-store` and uses the model types of `harw-job-core` (Eco §33). |
+| `harw-job-*`, `harw-job` | J. `harw-job-core` (model), `harw-job-store` (fenced records), `harw-job-linux` / `harw-job-darwin` (platform mechanics), `harw-job-tokio` (async supervision), `harw-job-exec` (trampoline binary, replaces `pre_exec`), `harw-job-executor-bwrap` (bwrap backend), `harw-job-runtime` (coordinator + compatibility re-exports), `harw-job` (public facade). All forbid unsafe per crate attribute. `harw-job-core` still depends on `harw-macros`/`harw-observe`/`harw-types` (known inversions listed in its `lib.rs`). |
+| `harw-infra-client` | I: typed clients for the three local daemons; consumed by `harw-ops`, `harw-runtime`, `harw-web`. |
+| `harw-auth-hub`, `harw-netsec`, `harw-security-hub` | A: local infrastructure daemons (Crypto Masterplan v2 H3/H7/H8), each a binary behind an AF_UNIX socket. No internal consumers. |
+| `harw-node-transport` | A: remote node transport (rustls + aws-lc-rs, ML-DSA-65 node transcripts). The only direct `aws-lc-rs` user in the workspace. |
+| `harw-dod-encrypt` | D (not T): Harw crypto semantics over `crypt_guard_service`. Unreachable from the DoD facade, warden, probes and sensors (gate `edges`). |
 | `harw-dod-warden`, `harw-dod-warden-proto`, `harw-warden` | D+T: warden TCB (Eco §22). |
 | `harw-probe-fs`, `harw-probe-bpf` | D+T: privileged binaries (CapSysAdmin / CapBpf budgets). |
 | `harw-dod-{bpf,procmon,flow,authlog,fsmon}` | D+T: elevated `CRATE_PRIVILEGE` class (Bpf / Netlink / FileWatch). |
@@ -205,8 +230,9 @@ Counter({'I': 36, 'A': 36, 'D': 22, 'D+T': 10, 'F': 5, 'C': 4, 'J': 1})
 
 | Package(s) | This doc | arch-policy | Comment |
 |---|---|---|---|
-| `harw-session-store` | A | I | Policy treats it as infrastructure with the `→ harw-job-runtime` edge as a W2 exception. Consequence: R4 (`harw-dod-escalate` → session-store) is D→I, which is legal in the policy. |
+| `harw-session-store` | A | I | Policy treats it as infrastructure with the `→ harw-job-core` and `→ harw-job-store` edges as exceptions. Consequence: R4 (`harw-dod-escalate` → session-store) is D→I, which is legal in the policy. |
 | `harw-agent-runner` | C | A | Policy accepts the runner as composition, so R2/R3 are not exceptions there. The split-crate proposal still stands. |
 | `harw-lens*`, `harw-browser*`, `harw-explorer`, `harw-mcp-client`, `harw-model-catalog`, `harw-oauth`, `harw-provider` | I | A | Policy is stricter here. Consequence: R6 (`harw-lens-source` → `harw-knowledge`) is A→A, so it is legal in the policy. |
 | T flag | privileged binaries + elevated `CRATE_PRIVILEGE` crates (probes, bpf/procmon/flow/authlog/fsmon, warden family) | `[tcb.*]` allowlists for the warden family + `harw-dod-readfs` + `harw-dod-signals` | Different meaning: the policy's T = "has a dependency allowlist", this doc's T = "holds privilege". Both views are needed. The privilege view stays enforced by `gate_privileges.rs`. |
-| `harw-job-*` (planned crates) | not listed (not yet members) | J | Pre-declared in the policy. |
+| `harw-job-*`, `harw-job` | J | J | All members now, classified identically. |
+| `harw-auth-hub`, `harw-netsec`, `harw-node-transport`, `harw-security-hub`, `harw-infra-client`, `harw-dod-encrypt` | A, A, A, A, I, D | A, A, A, A, I, D | Identical. |

@@ -18,6 +18,16 @@
 //! principal = "ops-admin"
 //! token_file = "/etc/harw-auth-hub/tokens/ops-admin.token"   # mode 0600
 //! grants = [ { namespace = "app", ops = ["all"] } ]
+//!
+//! [key_store]                                    # optional, default: memory
+//! kind = "sealed"
+//! path = "/var/lib/harw/auth-hub/keys.store"     # sealed: required, absolute
+//! kek_file = "/etc/harw/auth-hub/kek"            # sealed: exactly one of
+//! # kek_credential = "harw-auth-hub-kek"         # kek_file / kek_credential
+//!
+//! [crypto_worker]                                # optional
+//! queue_bound = 128            # > 0
+//! request_timeout_secs = 30    # > 0; omitted keeps the built-in default
 //! ```
 //!
 //! # Operation groups
@@ -44,8 +54,10 @@
 use std::collections::{BTreeSet, HashMap};
 use std::fs::{self, File};
 use std::io::Read;
+use std::num::NonZeroUsize;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use crypt_guard_hyper::BearerTokens;
 use crypt_guard_service::{
@@ -53,6 +65,7 @@ use crypt_guard_service::{
 };
 use serde::Deserialize;
 
+use crate::crypto_worker::CryptoWorkerConfig;
 use crate::error::HubError;
 
 /// Default socket path when neither the config nor the command line names one.
@@ -115,6 +128,39 @@ struct RawConfig {
     peers: Vec<RawPeer>,
     #[serde(default)]
     bearer_tokens: Vec<RawBearer>,
+    #[serde(default)]
+    key_store: Option<RawKeyStore>,
+    #[serde(default)]
+    crypto_worker: Option<RawCryptoWorker>,
+}
+
+/// `kind = "memory" | "sealed"` in `[key_store]`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+enum RawKeyStoreKind {
+    Memory,
+    Sealed,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawKeyStore {
+    kind: RawKeyStoreKind,
+    #[serde(default)]
+    path: Option<PathBuf>,
+    #[serde(default)]
+    kek_file: Option<PathBuf>,
+    #[serde(default)]
+    kek_credential: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawCryptoWorker {
+    #[serde(default)]
+    queue_bound: Option<u64>,
+    #[serde(default)]
+    request_timeout_secs: Option<u64>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -173,6 +219,31 @@ pub struct BearerEntry {
     pub grants: Vec<Grant>,
 }
 
+/// Where the key-encryption key of a [`KeyStoreConfig::Sealed`] store comes
+/// from.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum KekSource {
+    /// A `0600` key file holding exactly 32 raw bytes.
+    File(PathBuf),
+    /// A systemd `LoadCredential=`/`LoadCredentialEncrypted=` name.
+    SystemdCredential(String),
+}
+
+/// Which key store the hub persists keys in.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub enum KeyStoreConfig {
+    /// `crypt_guard_service::InMemoryProvider`: keys are lost on restart.
+    #[default]
+    InMemory,
+    /// [`crate::sealed::SealedProvider`] at `path`, sealed with `kek`.
+    Sealed {
+        /// Absolute path of the store file.
+        path: PathBuf,
+        /// The key-encryption key source.
+        kek: KekSource,
+    },
+}
+
 /// Validated hub configuration.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct HubConfig {
@@ -182,6 +253,10 @@ pub struct HubConfig {
     pub peers: Vec<PeerEntry>,
     /// Optional bearer-token principals.
     pub bearer_tokens: Vec<BearerEntry>,
+    /// Where keys are persisted.
+    pub key_store: KeyStoreConfig,
+    /// Crypto worker thread configuration.
+    pub worker: CryptoWorkerConfig,
 }
 
 impl HubConfig {
@@ -280,11 +355,40 @@ impl HubConfig {
             ));
         }
 
+        let key_store = key_store(raw.key_store)?;
+        let worker = crypto_worker(raw.crypto_worker)?;
+
         Ok(Self {
             socket_path,
             peers,
             bearer_tokens,
+            key_store,
+            worker,
         })
+    }
+
+    /// Load the key-encryption key of [`HubConfig::key_store`].
+    ///
+    /// Returns `None` for [`KeyStoreConfig::InMemory`] (there is no KEK to
+    /// load). For [`KeyStoreConfig::Sealed`] it loads the KEK from the
+    /// configured file or systemd credential.
+    ///
+    /// # Errors
+    ///
+    /// [`HubError::KeyStore`] if the KEK cannot be loaded.
+    pub fn load_kek(&self) -> Result<Option<crate::sealed::Kek>, HubError> {
+        match &self.key_store {
+            KeyStoreConfig::InMemory => Ok(None),
+            KeyStoreConfig::Sealed { kek, .. } => {
+                let kek = match kek {
+                    KekSource::File(path) => crate::sealed::Kek::from_key_file(path)?,
+                    KekSource::SystemdCredential(name) => {
+                        crate::sealed::Kek::from_systemd_credential(name)?
+                    }
+                };
+                Ok(Some(kek))
+            }
+        }
     }
 
     /// The deny-by-default CryptGuard policy of all configured grants.
@@ -424,6 +528,107 @@ fn principal(name: &str) -> Result<CgPrincipal, HubError> {
     }
 }
 
+fn key_store(raw: Option<RawKeyStore>) -> Result<KeyStoreConfig, HubError> {
+    let Some(raw) = raw else {
+        return Ok(KeyStoreConfig::default());
+    };
+    match raw.kind {
+        RawKeyStoreKind::Memory => {
+            if raw.path.is_some() || raw.kek_file.is_some() || raw.kek_credential.is_some() {
+                return Err(invalid(
+                    "key_store.kind = \"memory\" must not set path, kek_file or kek_credential"
+                        .to_owned(),
+                ));
+            }
+            Ok(KeyStoreConfig::InMemory)
+        }
+        RawKeyStoreKind::Sealed => {
+            let path = raw
+                .path
+                .ok_or_else(|| invalid("key_store.kind = \"sealed\" requires path".to_owned()))?;
+            if !path.is_absolute() {
+                return Err(invalid(format!(
+                    "key_store.path '{}' must be absolute",
+                    path.display()
+                )));
+            }
+            let kek = match (raw.kek_file, raw.kek_credential) {
+                (Some(file), None) => {
+                    if !file.is_absolute() {
+                        return Err(invalid(format!(
+                            "key_store.kek_file '{}' must be absolute",
+                            file.display()
+                        )));
+                    }
+                    KekSource::File(file)
+                }
+                (None, Some(name)) => {
+                    if !valid_credential_name(&name) {
+                        return Err(invalid(format!(
+                            "key_store.kek_credential '{name}' must be a non-empty systemd \
+                             credential name of [A-Za-z0-9_.-] with no slash"
+                        )));
+                    }
+                    KekSource::SystemdCredential(name)
+                }
+                (None, None) => {
+                    return Err(invalid(
+                        "key_store.kind = \"sealed\" requires exactly one of kek_file or \
+                         kek_credential"
+                            .to_owned(),
+                    ));
+                }
+                (Some(_), Some(_)) => {
+                    return Err(invalid(
+                        "key_store.kind = \"sealed\" must not set both kek_file and \
+                         kek_credential"
+                            .to_owned(),
+                    ));
+                }
+            };
+            Ok(KeyStoreConfig::Sealed { path, kek })
+        }
+    }
+}
+
+fn valid_credential_name(name: &str) -> bool {
+    !name.is_empty()
+        && name
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'.' | b'-'))
+}
+
+fn crypto_worker(raw: Option<RawCryptoWorker>) -> Result<CryptoWorkerConfig, HubError> {
+    let Some(raw) = raw else {
+        return Ok(CryptoWorkerConfig::default());
+    };
+    let default = CryptoWorkerConfig::default();
+
+    let queue_bound = match raw.queue_bound {
+        None => default.queue_bound,
+        Some(0) => return Err(invalid("crypto_worker.queue_bound must be > 0".to_owned())),
+        Some(bound) => usize::try_from(bound)
+            .ok()
+            .and_then(NonZeroUsize::new)
+            .ok_or_else(|| invalid("crypto_worker.queue_bound must be > 0".to_owned()))?,
+    };
+
+    let request_timeout = match raw.request_timeout_secs {
+        None => default.request_timeout,
+        Some(0) => {
+            return Err(invalid(
+                "crypto_worker.request_timeout_secs must be > 0".to_owned(),
+            ));
+        }
+        Some(secs) => Some(Duration::from_secs(secs)),
+    };
+
+    Ok(CryptoWorkerConfig {
+        queue_bound,
+        request_timeout,
+    })
+}
+
 fn grants(raw: Vec<RawGrant>) -> Result<Vec<Grant>, HubError> {
     raw.into_iter()
         .map(|grant| {
@@ -449,7 +654,7 @@ mod tests {
     use std::fs;
     use std::io::Write;
     use std::os::unix::fs::PermissionsExt;
-    use std::path::Path;
+    use std::path::{Path, PathBuf};
 
     use crypt_guard_service::{OpKind, OpSet, Principal as CgPrincipal};
 
@@ -709,6 +914,215 @@ mod tests {
         };
         assert!(!rendered.contains("super-secret"));
         Ok(())
+    }
+
+    #[test]
+    fn default_key_store_is_in_memory_with_default_worker() -> TestResult {
+        let config = HubConfig::from_toml_str(MINIMAL).map_err(ctx("parse"))?;
+        assert_eq!(config.key_store, super::KeyStoreConfig::InMemory);
+        assert_eq!(
+            config.worker,
+            crate::crypto_worker::CryptoWorkerConfig::default()
+        );
+        assert!(config.load_kek().map_err(ctx("load_kek"))?.is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn sealed_key_store_with_kek_file_parses() -> TestResult {
+        let text = format!(
+            "{MINIMAL}\n[key_store]\nkind = \"sealed\"\n\
+             path = \"/var/lib/harw/auth-hub/keys.store\"\n\
+             kek_file = \"/etc/harw/auth-hub/kek\"\n"
+        );
+        let config = HubConfig::from_toml_str(&text).map_err(ctx("parse"))?;
+        assert_eq!(
+            config.key_store,
+            super::KeyStoreConfig::Sealed {
+                path: PathBuf::from("/var/lib/harw/auth-hub/keys.store"),
+                kek: super::KekSource::File(PathBuf::from("/etc/harw/auth-hub/kek")),
+            }
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn sealed_key_store_with_kek_credential_parses() -> TestResult {
+        let text = format!(
+            "{MINIMAL}\n[key_store]\nkind = \"sealed\"\n\
+             path = \"/var/lib/harw/auth-hub/keys.store\"\n\
+             kek_credential = \"harw-auth-hub-kek\"\n"
+        );
+        let config = HubConfig::from_toml_str(&text).map_err(ctx("parse"))?;
+        assert_eq!(
+            config.key_store,
+            super::KeyStoreConfig::Sealed {
+                path: PathBuf::from("/var/lib/harw/auth-hub/keys.store"),
+                kek: super::KekSource::SystemdCredential("harw-auth-hub-kek".to_owned()),
+            }
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn sealed_key_store_requires_path() {
+        let text =
+            format!("{MINIMAL}\n[key_store]\nkind = \"sealed\"\nkek_file = \"/etc/harw/kek\"\n");
+        assert!(matches!(
+            HubConfig::from_toml_str(&text),
+            Err(HubError::ConfigInvalid(_))
+        ));
+    }
+
+    #[test]
+    fn sealed_key_store_rejects_relative_path() {
+        let text = format!(
+            "{MINIMAL}\n[key_store]\nkind = \"sealed\"\npath = \"keys.store\"\n\
+             kek_file = \"/etc/harw/kek\"\n"
+        );
+        assert!(matches!(
+            HubConfig::from_toml_str(&text),
+            Err(HubError::ConfigInvalid(_))
+        ));
+    }
+
+    #[test]
+    fn sealed_key_store_rejects_relative_kek_file() {
+        let text = format!(
+            "{MINIMAL}\n[key_store]\nkind = \"sealed\"\npath = \"/var/lib/keys.store\"\n\
+             kek_file = \"etc/harw/kek\"\n"
+        );
+        assert!(matches!(
+            HubConfig::from_toml_str(&text),
+            Err(HubError::ConfigInvalid(_))
+        ));
+    }
+
+    #[test]
+    fn sealed_key_store_rejects_missing_kek_source() {
+        let text =
+            format!("{MINIMAL}\n[key_store]\nkind = \"sealed\"\npath = \"/var/lib/keys.store\"\n");
+        assert!(matches!(
+            HubConfig::from_toml_str(&text),
+            Err(HubError::ConfigInvalid(_))
+        ));
+    }
+
+    #[test]
+    fn sealed_key_store_rejects_both_kek_sources() {
+        let text = format!(
+            "{MINIMAL}\n[key_store]\nkind = \"sealed\"\npath = \"/var/lib/keys.store\"\n\
+             kek_file = \"/etc/harw/kek\"\nkek_credential = \"cred\"\n"
+        );
+        assert!(matches!(
+            HubConfig::from_toml_str(&text),
+            Err(HubError::ConfigInvalid(_))
+        ));
+    }
+
+    #[test]
+    fn sealed_key_store_rejects_invalid_credential_name() {
+        let text = format!(
+            "{MINIMAL}\n[key_store]\nkind = \"sealed\"\npath = \"/var/lib/keys.store\"\n\
+             kek_credential = \"has/slash\"\n"
+        );
+        assert!(matches!(
+            HubConfig::from_toml_str(&text),
+            Err(HubError::ConfigInvalid(_))
+        ));
+        let empty = format!(
+            "{MINIMAL}\n[key_store]\nkind = \"sealed\"\npath = \"/var/lib/keys.store\"\n\
+             kek_credential = \"\"\n"
+        );
+        assert!(matches!(
+            HubConfig::from_toml_str(&empty),
+            Err(HubError::ConfigInvalid(_))
+        ));
+    }
+
+    #[test]
+    fn memory_key_store_rejects_path_and_kek_keys() {
+        let with_path =
+            format!("{MINIMAL}\n[key_store]\nkind = \"memory\"\npath = \"/var/lib/keys.store\"\n");
+        assert!(matches!(
+            HubConfig::from_toml_str(&with_path),
+            Err(HubError::ConfigInvalid(_))
+        ));
+        let with_kek_file =
+            format!("{MINIMAL}\n[key_store]\nkind = \"memory\"\nkek_file = \"/etc/harw/kek\"\n");
+        assert!(matches!(
+            HubConfig::from_toml_str(&with_kek_file),
+            Err(HubError::ConfigInvalid(_))
+        ));
+        let with_kek_credential =
+            format!("{MINIMAL}\n[key_store]\nkind = \"memory\"\nkek_credential = \"cred\"\n");
+        assert!(matches!(
+            HubConfig::from_toml_str(&with_kek_credential),
+            Err(HubError::ConfigInvalid(_))
+        ));
+    }
+
+    #[test]
+    fn key_store_rejects_unknown_kind() {
+        let text =
+            format!("{MINIMAL}\n[key_store]\nkind = \"disk\"\npath = \"/var/lib/keys.store\"\n");
+        assert!(matches!(
+            HubConfig::from_toml_str(&text),
+            Err(HubError::ConfigParse(_))
+        ));
+    }
+
+    #[test]
+    fn key_store_rejects_unknown_field() {
+        let text = format!("{MINIMAL}\n[key_store]\nkind = \"memory\"\nbucket = \"s3\"\n");
+        assert!(matches!(
+            HubConfig::from_toml_str(&text),
+            Err(HubError::ConfigParse(_))
+        ));
+    }
+
+    #[test]
+    fn crypto_worker_section_parses_and_defaults() -> TestResult {
+        let text =
+            format!("{MINIMAL}\n[crypto_worker]\nqueue_bound = 64\nrequest_timeout_secs = 5\n");
+        let config = HubConfig::from_toml_str(&text).map_err(ctx("parse"))?;
+        assert_eq!(config.worker.queue_bound.get(), 64);
+        assert_eq!(
+            config.worker.request_timeout,
+            Some(std::time::Duration::from_secs(5))
+        );
+
+        let omitted = format!("{MINIMAL}\n[crypto_worker]\nqueue_bound = 64\n");
+        let config = HubConfig::from_toml_str(&omitted).map_err(ctx("parse omitted timeout"))?;
+        assert_eq!(
+            config.worker.request_timeout,
+            crate::crypto_worker::CryptoWorkerConfig::default().request_timeout
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn crypto_worker_rejects_zero_queue_bound_or_timeout() {
+        let zero_queue = format!("{MINIMAL}\n[crypto_worker]\nqueue_bound = 0\n");
+        assert!(matches!(
+            HubConfig::from_toml_str(&zero_queue),
+            Err(HubError::ConfigInvalid(_))
+        ));
+        let zero_timeout =
+            format!("{MINIMAL}\n[crypto_worker]\nqueue_bound = 8\nrequest_timeout_secs = 0\n");
+        assert!(matches!(
+            HubConfig::from_toml_str(&zero_timeout),
+            Err(HubError::ConfigInvalid(_))
+        ));
+    }
+
+    #[test]
+    fn crypto_worker_rejects_unknown_field() {
+        let text = format!("{MINIMAL}\n[crypto_worker]\nthreads = 4\n");
+        assert!(matches!(
+            HubConfig::from_toml_str(&text),
+            Err(HubError::ConfigParse(_))
+        ));
     }
 
     #[test]

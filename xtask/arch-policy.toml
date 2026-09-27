@@ -399,15 +399,9 @@ allowed_internal = ["harw-dod-cap", "harw-macros", "harw-observe", "harw-types"]
 # Zieltermin. Ratsche: fällt die Kante weg, muss der Eintrag gehen.
 # ---------------------------------------------------------------------------
 [[exceptions]]
-from = "harw-config"
-to = "harw-agent-dsl"
-reason = "I → C: harw-config/src/builtin_definitions.rs parst die eingebauten Agent-Definitionen mit harw-agent-dsl; die Einlesung gehört nach C oder A"
-until = "R11 W2"
-
-[[exceptions]]
 from = "harw-session-store"
-to = "harw-job-runtime"
-reason = "I → J: harw-session-store/src/job_store.rs persistiert Jobs aus harw-job-runtime; gehört nach harw-job-store (J, §33, §34)"
+to = "harw-job-core"
+reason = "I → J: harw-session-store/src/job_store.rs persistiert Job-Modelltypen aus harw-job-core (Budget, JobState, StoredJob …); gehört nach harw-job-store (J, §33, §34)"
 until = "R11 W2"
 
 [[exceptions]]
@@ -415,9 +409,3 @@ from = "harw-session-store"
 to = "harw-job-store"
 reason = "I → J: harw-session-store::JobStore ist ein Adapter über die generische Speichermechanik in harw-job-store (§33); verschwindet, wenn die Job-Persistenz ganz in den J-Ring wandert"
 until = "R12"
-
-[[exceptions]]
-from = "harw-agent-compiler"
-to = "harw-registry-defaults"
-reason = "C → A: harw-agent-compiler (rights.rs, explain.rs) liest capability_catalog/embedded_agents aus harw-registry-defaults; gehört als expliziter Vertrag nach C oder F (§35)"
-until = "R11 W2"

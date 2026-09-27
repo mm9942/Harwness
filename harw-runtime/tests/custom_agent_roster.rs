@@ -37,8 +37,10 @@ fn bundled_roster() -> TestResult<(tempfile::TempDir, AgentRoster, Vec<String>)>
     }
     let config = harw_config::discover_config(&[home.path().to_path_buf()])
         .map_err(ctx("Discovery der mitgelieferten Agenten"))?;
+    let agents = harw_registry_defaults::ConfigAgents::from_config(&config)
+        .map_err(ctx("mitgelieferte Agenten senken"))?;
     let builtin = builtin_agent_definitions(&HashMap::new()).map_err(ctx("eingebaute Rollen"))?;
-    let roster = AgentRoster::from_config(&builtin, &config).map_err(ctx("Roster"))?;
+    let roster = AgentRoster::from_config(&builtin, &agents).map_err(ctx("Roster"))?;
     Ok((home, roster, names))
 }
 

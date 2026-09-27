@@ -16,6 +16,7 @@ The machine-enforced layering policy is `xtask/arch-policy.toml` (arch gate in `
 | Document | Topic |
 |---|---|
 | [harw-workspace-inventory.md](harw-workspace-inventory.md) | Per-crate inventory: ring (F/I/C/J/D/A/T), deps, privilege, platform, unsafe, native deps |
+| [dependency-review.md](dependency-review.md) | Third-party supply-chain tiers A/B/C (approved, restricted, forbidden in J/TCB), per crate version, reason, users and allowed rings |
 | [harw-dependency-inversions.md](harw-dependency-inversions.md) | Edges against the ring direction law, with fix and wave |
 | [dod-workspace-merge-plan.md](dod-workspace-merge-plan.md) | Merging the nested `dod/` workspace into the root workspace |
 | [job-extraction-map.md](job-extraction-map.md) | Current job code → `harw-job-*` target crates, migration order |

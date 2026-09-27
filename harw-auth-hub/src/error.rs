@@ -1,9 +1,9 @@
 //! Error type of the Auth/Crypto Hub process.
 //!
 //! These are *startup and transport* errors (config, token files, socket,
-//! systemd activation, signal registration). Per-request crypto errors never
-//! surface here: they are mapped to HTTP statuses by `crypt_guard_hyper`
-//! without backend detail.
+//! systemd activation, signal registration, the persistent key store, the
+//! crypto worker thread). Per-request crypto errors never surface here: they
+//! are mapped to HTTP statuses by `crypt_guard_hyper` without backend detail.
 
 use std::fmt;
 use std::io;
@@ -60,6 +60,10 @@ pub enum HubError {
     Signal(io::Error),
     /// The Tokio runtime could not be started.
     Runtime(io::Error),
+    /// The persistent key store could not be opened, created or locked.
+    KeyStore(crate::sealed::SealedStoreError),
+    /// The crypto worker thread could not be spawned.
+    Worker(io::Error),
 }
 
 impl fmt::Display for HubError {
@@ -96,6 +100,8 @@ impl fmt::Display for HubError {
             Self::Systemd(message) => write!(f, "systemd socket activation: {message}"),
             Self::Signal(source) => write!(f, "cannot register signal handler: {source}"),
             Self::Runtime(source) => write!(f, "cannot start the Tokio runtime: {source}"),
+            Self::KeyStore(source) => write!(f, "key store: {source}"),
+            Self::Worker(source) => write!(f, "cannot spawn the crypto worker thread: {source}"),
         }
     }
 }
@@ -106,8 +112,61 @@ impl std::error::Error for HubError {
             Self::Read { source, .. }
             | Self::Socket { source, .. }
             | Self::Signal(source)
-            | Self::Runtime(source) => Some(source),
+            | Self::Runtime(source)
+            | Self::Worker(source) => Some(source),
+            Self::KeyStore(source) => Some(source),
             _ => None,
         }
+    }
+}
+
+impl From<crate::sealed::SealedStoreError> for HubError {
+    fn from(source: crate::sealed::SealedStoreError) -> Self {
+        Self::KeyStore(source)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::error::Error as _;
+
+    use crate::sealed::SealedStoreError;
+    use crate::test_support::TestResult;
+
+    use super::HubError;
+
+    #[test]
+    fn key_store_display_prefixes_inner_error() -> TestResult {
+        let inner = SealedStoreError::Locked(std::path::PathBuf::from("/run/harw/store.sealed"));
+        let error = HubError::from(inner);
+        assert_eq!(
+            error.to_string(),
+            "key store: sealed key store: '/run/harw/store.sealed' is locked by another process"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn key_store_source_is_inner_error() -> TestResult {
+        let error = HubError::KeyStore(SealedStoreError::Authentication);
+        assert!(matches!(
+            error
+                .source()
+                .and_then(|source| source.downcast_ref::<SealedStoreError>()),
+            Some(SealedStoreError::Authentication)
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn worker_display_and_source() -> TestResult {
+        let io_error = std::io::Error::other("no threads available");
+        let error = HubError::Worker(io_error);
+        assert_eq!(
+            error.to_string(),
+            "cannot spawn the crypto worker thread: no threads available"
+        );
+        assert!(error.source().is_some());
+        Ok(())
     }
 }

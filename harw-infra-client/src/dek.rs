@@ -6,13 +6,37 @@
 //! key version; the Harw process never holds the long-term KEK.
 //!
 //! # Key reference and generation
-//! The wrapper serves exactly one Harwness key generation (0-based). The hub
-//! key is addressed as `namespace/id@version` with the CryptGuard version
-//! `generation + 1` ([`crypt_guard_key_version`]). [`DekWrapper::key_id`] is
-//! the unversioned `namespace/id` that `harw-secrets` persists and binds into
-//! the record AAD. Unwrapping any other generation is refused with
-//! [`SecretsError::KeyGenerationMismatch`] before the hub is contacted; the
-//! wrapper never falls back to another key version.
+//! The wrapper serves exactly one Harwness key generation (0-based) as its
+//! *current* generation. The hub key is addressed as `namespace/id@version`
+//! with the CryptGuard version `generation + 1`
+//! ([`crypt_guard_key_version`]). [`DekWrapper::key_id`] is the unversioned
+//! `namespace/id` that `harw-secrets` persists and binds into the record
+//! AAD.
+//!
+//! Wrapping always pins the current generation. Unwrapping addresses
+//! exactly the version the record itself names: it accepts any
+//! `key_generation <= self.generation` and asks the hub for that generation's
+//! version, never "primary" and never a different version than the one
+//! recorded — this is not a fallback, the record's own generation is the
+//! only one ever tried. A `key_generation` newer than the wrapper's current
+//! one is refused with [`SecretsError::KeyGenerationMismatch`] before the hub
+//! is contacted, since this wrapper has no CryptGuard version for it yet.
+//!
+//! # Rotation
+//! Wrapping always pins `generation + 1`. The hub's version guard
+//! (`harw-auth-hub` `KmsGuardProvider`) only wraps under the key's *current
+//! primary* version, so once the hub key has been rotated a wrapper still on
+//! the old generation gets `409` and reports
+//! [`SecretsError::DekWrapperUnavailable`] with the reason
+//! `key rotated; reload generation`: new DEKs are never wrapped under a
+//! superseded key. Unwrapping stays allowed for every *enabled* older
+//! version, so records of an old generation remain readable by a wrapper
+//! that has since moved on to a newer generation: the wrapper always asks
+//! the hub for the exact version the record names, whether or not that is
+//! its own current generation. A disabled or destroyed version is refused
+//! by the hub itself; that failure is mapped fail-closed the same way any
+//! other unwrap failure is (see "Error mapping" below), never retried
+//! against another version.
 //!
 //! # Sync/async bridge
 //! [`DekWrapper`] is synchronous while [`AuthHubClient`] is async. The
@@ -36,10 +60,25 @@
 //! # Error mapping
 //! | Client error | Operation | `SecretsError` |
 //! |---|---|---|
-//! | `Remote(AuthenticationFailed)` (422) | unwrap | `Open(pq_hpke::Error::AuthenticationFailed)` (same as the local wrapper) |
+//! | `Remote(AuthenticationFailed)` (422), hub `store_epoch` changed since first use | unwrap | `DekWrapperUnavailable` ("key store was replaced") |
+//! | `Remote(AuthenticationFailed)` (422), otherwise | unwrap | `Open(pq_hpke::Error::AuthenticationFailed)` (same as the local wrapper) |
+//! | `Remote(Conflict)` (409) | wrap | `DekWrapperUnavailable`, reason `key rotated; reload generation` |
 //! | `Unavailable`, `Timeout` | any | `DekWrapperUnavailable` |
 //! | anything else (401/403/404/409/5xx, protocol, 422 on wrap) | any | `DekWrapperUnavailable` with the client error's payload-free text |
 //! | bridge failure (thread spawn, runtime build, worker panic) | any | `DekWrapperUnavailable` |
+//!
+//! # Store epoch
+//! The hub answers an unwrap under a key version its store does not have
+//! with the same `422` as a tampered blob. An in-memory hub loses every key
+//! on restart, so a restart would otherwise look like tampering. The wrapper
+//! therefore records the hub's `store_epoch` (`GET /v1/version`) on its first
+//! wrap or unwrap and, before mapping an unwrap `422` to `Open`, reads it
+//! again: a different epoch means the key store was replaced and the call
+//! fails with `DekWrapperUnavailable` instead. An unchanged epoch, a hub that
+//! does not report one, or a failed re-read keep the `Open` mapping. The
+//! baseline is kept for the wrapper's lifetime (a record wrapped before the
+//! replacement never becomes readable again); a failed first read is retried
+//! on the next use. The check is diagnostic only: both outcomes fail closed.
 //!
 //! Reasons are built only from [`InfraClientError`]'s `Display` (static,
 //! payload-free) and fixed strings: no DEK, wrapped bytes or AAD ever enter
@@ -47,6 +86,7 @@
 
 use core::fmt;
 use std::future::Future;
+use std::sync::OnceLock;
 
 use harw_secrets::dek_wrapper::{
     DekWrapper, Zeroizing, crypt_guard_key_version, validate_wrapper_identity,
@@ -65,8 +105,16 @@ pub const AUTHHUB_DEK_PROFILE_ID: &str = "authhub-cgk1-v1";
 /// wrapper's info, so a locally wrapped DEK is never accepted as a hub one.
 pub const AUTHHUB_DEK_WRAP_INFO: &[u8] = b"harwness:secrets:dek-wrap:v3:authhub";
 
+/// Reason text of a wrap refused with `409`: the pinned version is no
+/// longer the hub key's primary (or is disabled).
+const KEY_ROTATED_REASON: &str = "key rotated; reload generation";
+
 /// Name of the per-call bridge thread.
 const BRIDGE_THREAD_NAME: &str = "harw-authhub-dek";
+
+/// `DekWrapperUnavailable` reason when the hub's `store_epoch` changed.
+const STORE_REPLACED_REASON: &str =
+    "AuthHub key store was replaced (epoch changed); keys are not available";
 
 /// [`DekWrapper`] backed by the AuthHub KMS (`wrap_key` / `unwrap_key` on
 /// one pinned key version). See the module docs for the sync/async bridge.
@@ -75,6 +123,9 @@ pub struct AuthHubDekWrapper {
     key_ref: KeyRef,
     key_id: String,
     generation: u32,
+    /// Hub `store_epoch` seen on first use (`Some(None)`: the hub reports
+    /// none); unset until a `/v1/version` read succeeds.
+    store_epoch: OnceLock<Option<String>>,
 }
 
 impl AuthHubDekWrapper {
@@ -107,6 +158,7 @@ impl AuthHubDekWrapper {
             key_ref,
             key_id,
             generation,
+            store_epoch: OnceLock::new(),
         })
     }
 
@@ -126,6 +178,7 @@ impl fmt::Debug for AuthHubDekWrapper {
             .field("client", &self.client)
             .field("key_ref", &self.key_ref)
             .field("generation", &self.generation)
+            .field("store_epoch", &self.store_epoch.get())
             .finish()
     }
 }
@@ -144,6 +197,7 @@ impl DekWrapper for AuthHubDekWrapper {
     }
 
     fn wrap_dek(&self, dek: &[u8], aad: &[u8]) -> SecretsResult<Vec<u8>> {
+        self.remember_store_epoch();
         let context = Self::context(aad);
         let material = Zeroizing::new(dek.to_vec());
         let client = &self.client;
@@ -159,21 +213,101 @@ impl DekWrapper for AuthHubDekWrapper {
         key_generation: u32,
         aad: &[u8],
     ) -> SecretsResult<Zeroizing<Vec<u8>>> {
-        if key_generation != self.generation {
+        // A generation newer than the one this wrapper was built for has no
+        // CryptGuard version yet (and, being newer, is never "the old
+        // generation" this wrapper exists to keep reading) — refused before
+        // the hub is contacted. Any generation up to and including the
+        // current one is addressed at exactly its own version below; this
+        // is never a fallback, only the version the record names is asked
+        // for.
+        if key_generation > self.generation {
             return Err(SecretsError::KeyGenerationMismatch {
                 key_id: self.key_id.clone(),
                 expected: self.generation,
                 found: key_generation,
             });
         }
+        // `key_generation <= self.generation` and `self.generation` was
+        // validated at construction to have a CryptGuard version, so this is
+        // always `Some`.
+        let Some(version) = crypt_guard_key_version(key_generation) else {
+            return Err(SecretsError::KeyGenerationMismatch {
+                key_id: self.key_id.clone(),
+                expected: self.generation,
+                found: key_generation,
+            });
+        };
+        self.remember_store_epoch();
         let context = Self::context(aad);
         let wrapped = WrappedKey::new(wrapped.to_vec());
+        // Pin to the record's own generation, not to `self.key_ref` (which
+        // stays pinned to the wrapper's current generation for wrapping).
+        let Ok(key) = self.key_ref.clone().with_version(version.get()) else {
+            return Err(SecretsError::KeyGenerationMismatch {
+                key_id: self.key_id.clone(),
+                expected: self.generation,
+                found: key_generation,
+            });
+        };
         let client = &self.client;
-        let key = &self.key_ref;
+        let key = &key;
         run_on_bridge_thread(
             move || async move { client.unwrap_key(key, &context, &wrapped).await },
         )
-        .map_err(|failure| map_failure(Operation::Unwrap, failure))
+        .map_err(|failure| self.map_unwrap_failure(failure))
+    }
+}
+
+/// Store-epoch check (module docs, "Store epoch"). Kept apart from the
+/// generic [`map_failure`] mapping.
+impl AuthHubDekWrapper {
+    /// Record the hub's `store_epoch` as the baseline if none is recorded
+    /// yet. A failed read leaves it unset (retried on the next use); the
+    /// actual call reports the hub's state.
+    fn remember_store_epoch(&self) {
+        if self.store_epoch.get().is_some() {
+            return;
+        }
+        if let Ok(epoch) = self.fetch_store_epoch() {
+            // A concurrent first use may have set it already; either value
+            // is from before this call.
+            let _ = self.store_epoch.set(epoch);
+        }
+    }
+
+    /// `GET /v1/version` → `store_epoch`.
+    fn fetch_store_epoch(&self) -> Result<Option<String>, BridgeFailure> {
+        let client = &self.client;
+        run_on_bridge_thread(move || async move { client.version().await })
+            .map(|version| version.store_epoch)
+    }
+
+    /// Whether the hub now reports a different `store_epoch` than the
+    /// recorded baseline. `false` without a baseline, when the hub reports
+    /// none, or when the re-read fails.
+    fn store_was_replaced(&self) -> bool {
+        let Some(Some(baseline)) = self.store_epoch.get() else {
+            return false;
+        };
+        matches!(self.fetch_store_epoch(), Ok(Some(current)) if current != *baseline)
+    }
+
+    /// Unwrap failure mapping: a `422` after a store replacement is
+    /// "unavailable", everything else goes through [`map_failure`].
+    fn map_unwrap_failure(&self, failure: BridgeFailure) -> SecretsError {
+        let authentication_failed = matches!(
+            failure,
+            BridgeFailure::Client(InfraClientError::Remote(
+                RemoteErrorKind::AuthenticationFailed
+            ))
+        );
+        if authentication_failed && self.store_was_replaced() {
+            return SecretsError::DekWrapperUnavailable {
+                profile: AUTHHUB_DEK_PROFILE_ID.to_owned(),
+                reason: STORE_REPLACED_REASON.to_owned(),
+            };
+        }
+        map_failure(Operation::Unwrap, failure)
     }
 }
 
@@ -243,6 +377,11 @@ fn map_failure(operation: Operation, failure: BridgeFailure) -> SecretsError {
         {
             return SecretsError::Open(crypt_guard::pq_hpke::Error::AuthenticationFailed);
         }
+        BridgeFailure::Client(InfraClientError::Remote(RemoteErrorKind::Conflict))
+            if operation == Operation::Wrap =>
+        {
+            format!("AuthHub wrap failed: {KEY_ROTATED_REASON}")
+        }
         BridgeFailure::Client(InfraClientError::Unavailable) => "AuthHub is unreachable".to_owned(),
         BridgeFailure::Client(InfraClientError::Timeout) => "AuthHub call timed out".to_owned(),
         BridgeFailure::Client(other) => format!("AuthHub {} failed: {other}", operation.name()),
@@ -275,7 +414,7 @@ mod tests {
 
     use super::*;
     use crate::ClientOptions;
-    use crate::test_server::MockHub;
+    use crate::test_server::{MOCK_EPOCH, MockHub, MockState};
     use crate::test_support::{TestError, TestResult, ctx};
 
     /// The mock hub on its own thread and current-thread runtime, so tests
@@ -283,13 +422,14 @@ mod tests {
     /// another runtime without starving the hub.
     struct HubThread {
         socket: PathBuf,
+        state: Arc<MockState>,
         stop: Arc<AtomicBool>,
         handle: Option<std::thread::JoinHandle<()>>,
     }
 
     impl HubThread {
         fn start() -> TestResult<Self> {
-            let (ready_tx, ready_rx) = mpsc::channel::<Result<PathBuf, String>>();
+            let (ready_tx, ready_rx) = mpsc::channel::<Result<(PathBuf, Arc<MockState>), String>>();
             let stop = Arc::new(AtomicBool::new(false));
             let stop_flag = Arc::clone(&stop);
             let handle = std::thread::Builder::new()
@@ -313,19 +453,20 @@ mod tests {
                                 return;
                             }
                         };
-                        let _ = ready_tx.send(Ok(hub.socket.clone()));
+                        let _ = ready_tx.send(Ok((hub.socket.clone(), Arc::clone(&hub.state))));
                         while !stop_flag.load(Ordering::Acquire) {
                             tokio::time::sleep(Duration::from_millis(5)).await;
                         }
                         drop(hub);
                     });
                 })?;
-            let socket = ready_rx
+            let (socket, state) = ready_rx
                 .recv()
                 .map_err(ctx("mock hub thread ended before it was ready"))?
                 .map_err(TestError::Unexpected)?;
             Ok(Self {
                 socket,
+                state,
                 stop,
                 handle: Some(handle),
             })
@@ -428,15 +569,17 @@ mod tests {
     }
 
     #[test]
-    fn test_foreign_generation_is_refused_before_the_hub_is_called() -> TestResult {
-        // No hub at all: the typed refusal must come first.
+    fn test_newer_generation_is_refused_before_the_hub_is_called() -> TestResult {
+        // No hub at all: the typed refusal must come first. A generation
+        // newer than the wrapper's current one has no CryptGuard version to
+        // ask for yet.
         let client = AuthHubClient::new("/nonexistent/hub.sock", None, ClientOptions::default());
         let wrapper = wrapper(client, "secrets", 3)?;
-        match wrapper.unwrap_dek(b"Wxyz", 2, b"aad") {
+        match wrapper.unwrap_dek(b"Wxyz", 4, b"aad") {
             Err(SecretsError::KeyGenerationMismatch {
                 key_id,
                 expected: 3,
-                found: 2,
+                found: 4,
             }) if key_id == "secrets/dek-kek" => Ok(()),
             Err(other) => Err(TestError::Unexpected(format!(
                 "expected KeyGenerationMismatch, got {other}"
@@ -445,6 +588,17 @@ mod tests {
                 "expected KeyGenerationMismatch, got Ok".to_owned(),
             )),
         }
+    }
+
+    #[test]
+    fn test_older_generation_is_no_longer_refused_before_the_hub_is_called() -> TestResult {
+        // An older (but not newer) generation is not a foreign key any
+        // more: it is addressed at its own version, so with no hub at all
+        // the failure must come from the bridge (unreachable), never from
+        // `KeyGenerationMismatch`.
+        let client = AuthHubClient::new("/nonexistent/hub.sock", None, ClientOptions::default());
+        let wrapper = wrapper(client, "secrets", 3)?;
+        expect_unavailable(wrapper.unwrap_dek(b"Wxyz", 2, b"aad"))
     }
 
     #[test]
@@ -496,6 +650,87 @@ mod tests {
         }
     }
 
+    fn expect_open<T>(result: SecretsResult<T>) -> TestResult {
+        match result {
+            Err(SecretsError::Open(crypt_guard::pq_hpke::Error::AuthenticationFailed)) => Ok(()),
+            Err(other) => Err(TestError::Unexpected(format!(
+                "expected Open(AuthenticationFailed), got {other}"
+            ))),
+            Ok(_) => Err(TestError::Unexpected(
+                "expected Open(AuthenticationFailed), got Ok".to_owned(),
+            )),
+        }
+    }
+
+    const REPLACED_EPOCH: &str = "ffffffffffffffffffffffffffffffff";
+
+    #[test]
+    fn test_unwrap_failure_after_store_epoch_change_is_unavailable() -> TestResult {
+        let hub = HubThread::start()?;
+        let wrapper = wrapper(hub.client(), "secrets", 0)?;
+        // First use records the baseline epoch.
+        let wrapped = wrapper
+            .wrap_dek(&[0x42_u8; 32], b"aad")
+            .map_err(secrets_err)?;
+        assert_eq!(
+            wrapper.store_epoch.get(),
+            Some(&Some(MOCK_EPOCH.to_owned()))
+        );
+
+        // The hub restarts with a fresh in-memory store: its keys are gone
+        // and it answers 422 for the old blob (simulated with a foreign one).
+        hub.state.set_epoch(Some(REPLACED_EPOCH));
+        match wrapper.unwrap_dek(b"not-a-hub-blob", 0, b"aad") {
+            Err(SecretsError::DekWrapperUnavailable { profile, reason })
+                if profile == AUTHHUB_DEK_PROFILE_ID && reason == STORE_REPLACED_REASON => {}
+            Err(other) => {
+                return Err(TestError::Unexpected(format!(
+                    "expected DekWrapperUnavailable(store replaced), got {other}"
+                )));
+            }
+            Ok(_) => {
+                return Err(TestError::Unexpected(
+                    "expected DekWrapperUnavailable, got Ok".to_owned(),
+                ));
+            }
+        }
+        // A blob the (mock) hub can still open is unaffected by the check.
+        let dek = wrapper
+            .unwrap_dek(&wrapped, 0, b"aad")
+            .map_err(secrets_err)?;
+        assert_eq!(dek.as_slice(), [0x42_u8; 32].as_slice());
+        Ok(())
+    }
+
+    #[test]
+    fn test_unwrap_failure_with_unchanged_epoch_stays_open() -> TestResult {
+        let hub = HubThread::start()?;
+        let wrapper = wrapper(hub.client(), "secrets", 0)?;
+        wrapper
+            .wrap_dek(&[0x42_u8; 32], b"aad")
+            .map_err(secrets_err)?;
+        // Same store, genuine authentication failure (tampering).
+        expect_open(wrapper.unwrap_dek(b"not-a-hub-blob", 0, b"aad"))?;
+
+        // A hub that stops reporting an epoch cannot prove a replacement.
+        hub.state.set_epoch(None);
+        expect_open(wrapper.unwrap_dek(b"not-a-hub-blob", 0, b"aad"))
+    }
+
+    #[test]
+    fn test_hub_without_store_epoch_keeps_the_open_mapping() -> TestResult {
+        let hub = HubThread::start()?;
+        // An older hub: no `store_epoch` in /v1/version.
+        hub.state.set_epoch(None);
+        let wrapper = wrapper(hub.client(), "secrets", 0)?;
+        expect_open(wrapper.unwrap_dek(b"not-a-hub-blob", 0, b"aad"))?;
+        assert_eq!(wrapper.store_epoch.get(), Some(&None));
+
+        // Later reporting one is not a "change" from an unknown baseline.
+        hub.state.set_epoch(Some(REPLACED_EPOCH));
+        expect_open(wrapper.unwrap_dek(b"not-a-hub-blob", 0, b"aad"))
+    }
+
     #[test]
     fn test_bridge_failure_reasons_carry_no_payload() {
         let err = map_failure(
@@ -513,6 +748,119 @@ mod tests {
             )),
         );
         assert!(matches!(err, SecretsError::DekWrapperUnavailable { .. }));
+    }
+
+    #[test]
+    fn test_wrap_after_rotation_reports_key_rotated() -> TestResult {
+        let hub = HubThread::start()?;
+        // `rotated/*` has primary v2; generation 0 pins the superseded v1.
+        let stale = wrapper(hub.client(), "rotated", 0)?;
+        match stale.wrap_dek(&[0x42_u8; 32], b"aad") {
+            Err(SecretsError::DekWrapperUnavailable { profile, reason })
+                if profile == AUTHHUB_DEK_PROFILE_ID =>
+            {
+                assert_eq!(
+                    reason,
+                    "AuthHub wrap failed: key rotated; reload generation"
+                );
+            }
+            Err(other) => {
+                return Err(TestError::Unexpected(format!(
+                    "expected DekWrapperUnavailable, got {other}"
+                )));
+            }
+            Ok(_) => {
+                return Err(TestError::Unexpected(
+                    "wrap under a superseded version must be refused".to_owned(),
+                ));
+            }
+        }
+
+        // Records of the old generation stay readable (unwrap on v1).
+        let unwrapped = stale
+            .unwrap_dek(b"W\x02\x01", 0, b"aad")
+            .map_err(secrets_err)?;
+        // Der Mock stellt bei einer auf die ältere Version gepinnten
+        // Entschlüsselung die Versionsnummer voran: beweist `@1` statt `@2`.
+        assert_eq!(unwrapped.as_slice(), [0x01_u8, 0x01, 0x02].as_slice());
+
+        // The current generation (1 -> v2) wraps and round-trips.
+        round_trip(&wrapper(hub.client(), "rotated", 1)?)
+    }
+
+    #[test]
+    fn test_unwrap_after_rotation_still_reads_the_old_generation() -> TestResult {
+        let hub = HubThread::start()?;
+        // `rotated/*` has primary v2, v1 still enabled. A wrapper reloaded
+        // to the *current* generation (1 -> v2) must still be able to read
+        // a record wrapped under the old generation (0 -> v1): the hub can
+        // still unwrap an older enabled version, so the wrapper must ask
+        // for exactly that version rather than refusing outright.
+        let current = wrapper(hub.client(), "rotated", 1)?;
+        assert_eq!(
+            current.key_ref(),
+            &KeyRef::versioned("rotated", "dek-kek", 2)?
+        );
+
+        let unwrapped = current
+            .unwrap_dek(b"W\x02\x01", 0, b"aad")
+            .map_err(secrets_err)?;
+        // Der Mock stellt bei einer auf die ältere Version gepinnten
+        // Entschlüsselung die Versionsnummer voran: beweist `@1` statt `@2`.
+        assert_eq!(unwrapped.as_slice(), [0x01_u8, 0x01, 0x02].as_slice());
+        // Reading the old version must not have repinned the wrapper's own
+        // key reference, which stays at the current generation for wrap.
+        assert_eq!(
+            current.key_ref(),
+            &KeyRef::versioned("rotated", "dek-kek", 2)?
+        );
+
+        // A generation newer than the wrapper's current one is still
+        // refused, before the hub is contacted.
+        match current.unwrap_dek(b"Wxyz", 2, b"aad") {
+            Err(SecretsError::KeyGenerationMismatch {
+                key_id,
+                expected: 1,
+                found: 2,
+            }) if key_id == "rotated/dek-kek" => {}
+            Err(other) => {
+                return Err(TestError::Unexpected(format!(
+                    "expected KeyGenerationMismatch, got {other}"
+                )));
+            }
+            Ok(_) => {
+                return Err(TestError::Unexpected(
+                    "expected KeyGenerationMismatch, got Ok".to_owned(),
+                ));
+            }
+        }
+
+        // Wrapping after the rotation still uses the new (current)
+        // generation, not the old one.
+        let wrapped = current
+            .wrap_dek(&[0x99_u8; 8], b"aad")
+            .map_err(secrets_err)?;
+        let unwrapped_new = current
+            .unwrap_dek(&wrapped, 1, b"aad")
+            .map_err(secrets_err)?;
+        assert_eq!(unwrapped_new.as_slice(), [0x99_u8; 8].as_slice());
+        Ok(())
+    }
+
+    #[test]
+    fn test_conflict_maps_to_key_rotated_only_on_wrap() {
+        let conflict =
+            || BridgeFailure::Client(InfraClientError::Remote(RemoteErrorKind::Conflict));
+        let wrap = map_failure(Operation::Wrap, conflict());
+        assert_eq!(
+            wrap.to_string(),
+            "DEK wrapper 'authhub-cgk1-v1' unavailable: AuthHub wrap failed: key rotated; \
+             reload generation"
+        );
+        // On unwrap a 409 means a disabled version, not a rotation.
+        let unwrap = map_failure(Operation::Unwrap, conflict());
+        assert!(matches!(unwrap, SecretsError::DekWrapperUnavailable { .. }));
+        assert!(!unwrap.to_string().contains("key rotated"));
     }
 
     #[test]

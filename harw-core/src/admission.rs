@@ -70,7 +70,7 @@ use std::fmt;
 use std::sync::{Arc, Mutex};
 
 use harw_authority::{AuthorityError, SandboxSpec, WorkspaceBinding, WorkspaceRegistry};
-use harw_job_runtime::{
+use harw_job_core::{
     Budget, BudgetKind, Job, JobKind, JobRuntimeError, JobScope, RetryPolicy, StoredJob,
 };
 use harw_sandbox::SandboxError;
@@ -1064,7 +1064,7 @@ mod tests {
                 .map_err(ctx("stored"))?
                 .job
                 .state,
-            harw_job_runtime::JobState::Ready
+            harw_job_core::JobState::Ready
         );
         Ok(())
     }

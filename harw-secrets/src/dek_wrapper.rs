@@ -56,6 +56,10 @@ pub const MAX_WRAPPER_NAME_LEN: usize = 128;
 ///   `key_generation` it cannot serve (wrong, revoked, or unknown generation:
 ///   [`SecretsError::KeyGenerationMismatch`]) and any `aad` other than the one
 ///   used at wrap time. It must never fall back to another key.
+///   An implementation whose KMS keeps older versions enabled (e.g. across a
+///   rotation) may serve an older generation, addressed at exactly the
+///   version the record names; that is not a fallback. Asking for any
+///   *other* version than the recorded one is.
 /// - An unreachable KMS fails closed with
 ///   [`SecretsError::DekWrapperUnavailable`].
 /// - Errors must never contain DEK bytes, wrapped bytes, or key material.

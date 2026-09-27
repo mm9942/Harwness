@@ -45,9 +45,13 @@ impl RunnerProbe for FullRunner {
 }
 
 /// An isolated harw home with the given definitions under `agents/<name>/`.
+///
+/// Also installs the real built-in defaults (`harw-registry-defaults`), as
+/// the `harw` binary does at start.
 fn home_with(
     definitions: &[(&str, &str)],
 ) -> Result<(tempfile::TempDir, CompilerEnv), Box<dyn std::error::Error>> {
+    harw_registry_defaults::compiler_defaults::install();
     let root = tempfile::tempdir()?;
     let home = root.path().join("home");
     for (name, text) in definitions {

@@ -290,6 +290,10 @@ fn compiler_tokens(args: &AgentArgs) -> Vec<String> {
 /// Der Compiler-Kontext der Sitzung: Root-Space aus `harw_home::home_dir`,
 /// Arbeitsverzeichnis = Workspace-Wurzel der Sitzung.
 fn compiler_env(ctx: &OpContext) -> Result<harw_agent_compiler::CompilerEnv, OpError> {
+    // Der Compiler kennt die eingebauten Vorgaben nur über seinen
+    // Installations-Slot; idempotent, damit auch SDK-Einbettungen ohne
+    // `harw-cli::main_entry` den `/agent`-Pfad nutzen können.
+    harw_registry_defaults::compiler_defaults::install();
     let cwd = ctx.sandbox().workspace().canonical_root().to_path_buf();
     harw_agent_compiler::CompilerEnv::detect(None, cwd)
         .map_err(|error| OpError::Execution(error.to_string()))
@@ -435,15 +439,16 @@ fn start_build_job(
 /// nicht gebaut werden können.
 fn agent_definitions(ctx: &OpContext, query: Option<&str>) -> Result<OpOutput, OpError> {
     let config = crate::provider::resolved_config(ctx)?;
+    let agents = config_agents(&config)?;
     let builtin = harw_registry_defaults::embedded_agents::builtin_agent_definitions(
-        &config.executable_agents,
+        &agents.executable_agents,
     )
     .map_err(|error| {
         OpError::Execution(format!(
             "eingebaute Agentendefinitionen nicht ladbar: {error}"
         ))
     })?;
-    let roster = harw_registry_defaults::AgentRoster::from_config(&builtin, &config)
+    let roster = harw_registry_defaults::AgentRoster::from_config(&builtin, &agents)
         .map_err(|error| OpError::Execution(format!("Agenten-Roster nicht baubar: {error}")))?;
     let compiled = compiled_info(ctx, &roster);
     Ok(OpOutput::from(format_definitions(
@@ -603,7 +608,7 @@ const AGENT_USE_USAGE: &str = "/agent use <name> | /agent use --clear";
 /// # Beschreibung
 /// Mit `--clear` wird `active_agent_definition` aus der Profil-`config.toml`
 /// entfernt. Sonst wird `name` gegen die konfigurierten Agentendefinitionen
-/// (`ResolvedConfig::executable_agents`, Vorrang) und die eingebauten Rollen
+/// (`ConfigAgents::executable_agents`, Vorrang) und die eingebauten Rollen
 /// geprüft ([`validate_root_agent`]) und erst danach gespeichert. Beides
 /// wirkt ab der nächsten Sitzung; die laufende Sitzung bleibt unverändert.
 ///
@@ -627,15 +632,16 @@ fn agent_use(ctx: &OpContext, target: Option<&str>) -> Result<OpOutput, OpError>
         )
     } else {
         let config = crate::provider::resolved_config(ctx)?;
+        let agents = config_agents(&config)?;
         let builtin = harw_registry_defaults::embedded_agents::builtin_agent_definitions(
-            &config.executable_agents,
+            &agents.executable_agents,
         )
         .map_err(|error| {
             OpError::Execution(format!(
                 "eingebaute Agentendefinitionen nicht ladbar: {error}"
             ))
         })?;
-        validate_root_agent(target, &config.executable_agents, &builtin)?;
+        validate_root_agent(target, &agents.executable_agents, &builtin)?;
         (
             format!("Aktiver Agent: {target} – gilt ab nächster Sitzung."),
             persistence.persist_active_agent(Some(target)),
@@ -646,6 +652,23 @@ fn agent_use(ctx: &OpContext, target: Option<&str>) -> Result<OpOutput, OpError>
         text.push_str(&note);
     }
     Ok(OpOutput::from(text))
+}
+
+/// Senkt die Agentendefinitionen der aufgelösten Konfiguration.
+///
+/// # Beschreibung
+/// `harw-config` reicht die DSL-Definitionen ungeparst weiter
+/// (`ResolvedConfig::agent_sources`); gesenkt wird hier, beim Konsumenten
+/// ([`harw_registry_defaults::ConfigAgents::from_config`]).
+///
+/// # Fehler
+/// [`OpError::Execution`], wenn eine Definition nicht parst, auflöst oder
+/// senkt.
+fn config_agents(
+    config: &harw_config::ResolvedConfig,
+) -> Result<harw_registry_defaults::ConfigAgents, OpError> {
+    harw_registry_defaults::ConfigAgents::from_config(config)
+        .map_err(|error| OpError::Execution(format!("Agentendefinitionen nicht ladbar: {error}")))
 }
 
 /// Prüft, ob `name` eine bekannte, als Wurzel startbare Agentendefinition ist.
@@ -1409,11 +1432,12 @@ admitted = ["fs.read"]
         .map_err(ctx_err("definition.toml"))?;
         let config = harw_config::discover_config(&[home.path().to_path_buf()])
             .map_err(ctx_err("Discovery"))?;
+        let agents = super::config_agents(&config).map_err(ctx_err("Agenten senken"))?;
         let builtin = harw_registry_defaults::embedded_agents::builtin_agent_definitions(
-            &config.executable_agents,
+            &agents.executable_agents,
         )
         .map_err(ctx_err("eingebaute Rollen"))?;
-        let roster = harw_registry_defaults::AgentRoster::from_config(&builtin, &config)
+        let roster = harw_registry_defaults::AgentRoster::from_config(&builtin, &agents)
             .map_err(ctx_err("Roster"))?;
 
         let text = super::format_definitions(&roster, None, &super::CompiledInfo::default());

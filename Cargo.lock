@@ -1109,7 +1109,7 @@ dependencies = [
 [[package]]
 name = "crypt_guard"
 version = "3.1.0"
-source = "git+https://github.com/mm9942/crypt_guard?branch=main#9b2df9a59a238b5bde0ebbccb1b16e0b0764b241"
+source = "git+https://github.com/mm9942/crypt_guard?rev=9b2df9a59a238b5bde0ebbccb1b16e0b0764b241#9b2df9a59a238b5bde0ebbccb1b16e0b0764b241"
 dependencies = [
  "crypt_guard_core",
  "crypt_guard_service",
@@ -1118,7 +1118,7 @@ dependencies = [
 [[package]]
 name = "crypt_guard_core"
 version = "3.1.0"
-source = "git+https://github.com/mm9942/crypt_guard?branch=main#9b2df9a59a238b5bde0ebbccb1b16e0b0764b241"
+source = "git+https://github.com/mm9942/crypt_guard?rev=9b2df9a59a238b5bde0ebbccb1b16e0b0764b241#9b2df9a59a238b5bde0ebbccb1b16e0b0764b241"
 dependencies = [
  "aes 0.8.4",
  "aes 0.9.1",
@@ -1158,7 +1158,7 @@ dependencies = [
 [[package]]
 name = "crypt_guard_hyper"
 version = "3.1.0"
-source = "git+https://github.com/mm9942/crypt_guard?branch=main#9b2df9a59a238b5bde0ebbccb1b16e0b0764b241"
+source = "git+https://github.com/mm9942/crypt_guard?rev=9b2df9a59a238b5bde0ebbccb1b16e0b0764b241#9b2df9a59a238b5bde0ebbccb1b16e0b0764b241"
 dependencies = [
  "bytes",
  "crypt_guard_service",
@@ -1174,7 +1174,7 @@ dependencies = [
 [[package]]
 name = "crypt_guard_proc"
 version = "3.1.0"
-source = "git+https://github.com/mm9942/crypt_guard?branch=main#9b2df9a59a238b5bde0ebbccb1b16e0b0764b241"
+source = "git+https://github.com/mm9942/crypt_guard?rev=9b2df9a59a238b5bde0ebbccb1b16e0b0764b241#9b2df9a59a238b5bde0ebbccb1b16e0b0764b241"
 dependencies = [
  "hex",
  "proc-macro2",
@@ -1185,7 +1185,7 @@ dependencies = [
 [[package]]
 name = "crypt_guard_service"
 version = "3.1.0"
-source = "git+https://github.com/mm9942/crypt_guard?branch=main#9b2df9a59a238b5bde0ebbccb1b16e0b0764b241"
+source = "git+https://github.com/mm9942/crypt_guard?rev=9b2df9a59a238b5bde0ebbccb1b16e0b0764b241#9b2df9a59a238b5bde0ebbccb1b16e0b0764b241"
 dependencies = [
  "crypt_guard_core",
  "tower",
@@ -2039,10 +2039,17 @@ dependencies = [
 name = "harw-auth-hub"
 version = "0.3.0"
 dependencies = [
+ "blake3",
  "bytes",
+ "chacha20poly1305 0.11.0",
  "clap",
+ "crypt_guard",
  "crypt_guard_hyper",
  "crypt_guard_service",
+ "fs4",
+ "getrandom 0.4.3",
+ "harw-dod-encrypt",
+ "harw-fsutil",
  "http",
  "http-body-util",
  "hyper",
@@ -2055,6 +2062,7 @@ dependencies = [
  "toml 1.1.3+spec-1.1.0",
  "tracing",
  "tracing-subscriber",
+ "zeroize",
 ]
 
 [[package]]
@@ -2263,15 +2271,12 @@ dependencies = [
 name = "harw-config"
 version = "0.3.0"
 dependencies = [
- "harw-agent-dsl",
  "harw-fsutil",
  "harw-macros",
  "harw-types",
- "include_dir",
  "serde",
  "serde_json",
  "tempfile",
- "time",
  "toml 0.8.23",
  "toml_edit 0.25.13+spec-1.1.0",
  "tracing",
@@ -2301,7 +2306,7 @@ dependencies = [
  "harw-context",
  "harw-extension-api",
  "harw-instructions",
- "harw-job-runtime",
+ "harw-job-core",
  "harw-lens-types",
  "harw-macros",
  "harw-observe",
@@ -3020,7 +3025,7 @@ dependencies = [
  "harw-context",
  "harw-dod-rules",
  "harw-dod-signals",
- "harw-job-runtime",
+ "harw-job-core",
  "harw-lens-types",
  "harw-macros",
  "harw-model-catalog",
@@ -3226,7 +3231,7 @@ name = "harw-mcp-server"
 version = "0.3.0"
 dependencies = [
  "bytes",
- "harw-job-runtime",
+ "harw-job-core",
  "harw-session-store",
  "harw-types",
  "http-body-util",
@@ -3300,6 +3305,7 @@ version = "0.3.0"
 dependencies = [
  "aws-lc-rs",
  "bytes",
+ "harw-dod-encrypt",
  "harw-types",
  "http",
  "http-body",
@@ -3460,6 +3466,7 @@ dependencies = [
 name = "harw-plan-bridge"
 version = "0.3.0"
 dependencies = [
+ "fs4",
  "harw-agent-dsl",
  "harw-authority",
  "harw-context",
@@ -3595,6 +3602,7 @@ dependencies = [
 name = "harw-registry-defaults"
 version = "0.3.0"
 dependencies = [
+ "harw-agent-compiler",
  "harw-agent-dsl",
  "harw-authority",
  "harw-browser",
@@ -3791,7 +3799,7 @@ version = "0.3.0"
 dependencies = [
  "fs4",
  "harw-fsutil",
- "harw-job-runtime",
+ "harw-job-core",
  "harw-job-store",
  "harw-macros",
  "harw-observe",

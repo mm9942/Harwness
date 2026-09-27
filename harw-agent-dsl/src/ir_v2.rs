@@ -27,7 +27,10 @@
 //! instruction text hash, the skill content hashes, the binary settings and
 //! the permission manifest. The execution requirements (PL-90,
 //! [`ExecutionRequirements`]) are hashed as well; their lists (targets,
-//! network hosts) are sorted by construction.
+//! network hosts) are sorted by construction. The optional WorkDriver
+//! settings ([`WorkDriverSpec`], `[work_driver]`) are hashed when present and
+//! left out of the JSON entirely when absent, so an IR without them keeps
+//! the canonical form and the hash it had before the section existed.
 //!
 //! # Concurrency
 //! All types are `Send + Sync` and immutable after construction.
@@ -622,6 +625,62 @@ pub struct Verification {
     pub commands: Vec<String>,
 }
 
+/// WorkDriver settings of an orchestrator (`[work_driver]`, DSL §8.3).
+///
+/// # Description
+/// Present only when the definition has a `[work_driver]` table. Every
+/// numeric field carries its effective value: the lowering fills the
+/// documented defaults ([`Self::DEFAULT_MAX_ITERATIONS`], …) and has already
+/// checked the ranges (`HARW-DRIVER-002`) and the delegation rights
+/// (`HARW-DRIVER-004`: the definition may delegate to `worker_role` and
+/// `judge_role`). The role names are registry role names; whether such a
+/// role exists is checked by the consumer that knows the roster.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WorkDriverSpec {
+    /// Upper bound of driver iterations (`1..=`[`Self::MAX_ITERATIONS`]).
+    pub max_iterations: u32,
+    /// Workers running at the same time
+    /// (`1..=`[`Self::MAX_PARALLEL_WORKERS`]).
+    pub max_parallel_workers: u32,
+    /// Attempts per worker task including the first
+    /// (`1..=`[`Self::MAX_ATTEMPTS_PER_WORKER`]); defaults to
+    /// `[lifecycle] max_attempts`, else [`Self::DEFAULT_MAX_ATTEMPTS_PER_WORKER`].
+    pub max_attempts_per_worker: u32,
+    /// Iterations without progress after which the driver stops
+    /// (`1..=max_iterations`).
+    pub stall_iterations: u32,
+    /// Role the driver delegates work items to.
+    pub worker_role: String,
+    /// Optional evaluator role that judges worker results.
+    pub judge_role: Option<String>,
+    /// Verification commands, declaration order (same shape as
+    /// [`Verification::commands`]).
+    pub verify: Vec<String>,
+    /// Token budget of the whole drive; `None`: no own bound.
+    pub token_budget: Option<u64>,
+    /// Wall-clock budget of the whole drive in seconds; `None`: no own bound.
+    pub wall_budget_secs: Option<u64>,
+}
+
+impl WorkDriverSpec {
+    /// Default of [`Self::max_iterations`].
+    pub const DEFAULT_MAX_ITERATIONS: u32 = 8;
+    /// Default of [`Self::max_parallel_workers`].
+    pub const DEFAULT_MAX_PARALLEL_WORKERS: u32 = 4;
+    /// Default of [`Self::max_attempts_per_worker`] without
+    /// `[lifecycle] max_attempts`.
+    pub const DEFAULT_MAX_ATTEMPTS_PER_WORKER: u32 = 4;
+    /// Default of [`Self::stall_iterations`] (capped at `max_iterations`).
+    pub const DEFAULT_STALL_ITERATIONS: u32 = 2;
+    /// Largest allowed [`Self::max_iterations`].
+    pub const MAX_ITERATIONS: u32 = 1000;
+    /// Largest allowed [`Self::max_parallel_workers`].
+    pub const MAX_PARALLEL_WORKERS: u32 = 64;
+    /// Largest allowed [`Self::max_attempts_per_worker`].
+    pub const MAX_ATTEMPTS_PER_WORKER: u32 = 100;
+}
+
 /// One skill reference.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -1137,6 +1196,11 @@ pub struct AgentIr {
     pub research: Option<Research>,
     /// `[verification]`, if present.
     pub verification: Option<Verification>,
+    /// `[work_driver]`, if present. Absent from the JSON when `None`, so the
+    /// canonical form and the v7 snapshot of an IR without the table are
+    /// unchanged.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub work_driver: Option<WorkDriverSpec>,
     /// Skills.
     pub skills: Skills,
     /// Binary settings.

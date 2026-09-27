@@ -20,6 +20,8 @@ code wins and the document is a bug.
 - [`harw` command line](cli.md)
 - [Background orchestrators: control, messaging, handoff](guides/background-agents.md)
 - [Compiling agents into standalone binaries](guides/agent-compiler.md) — *planned in #22*
+- [KMS operations: the Auth/Crypto Hub](guides/kms-operations.md) — *partially implemented*
+- [Driving workers to a goal: the WorkDriver](guides/work-driver.md) — *partially implemented*
 
 ## Philosophy
 

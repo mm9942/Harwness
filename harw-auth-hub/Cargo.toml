@@ -42,6 +42,24 @@ clap = { version = "4.6.1", features = ["derive"] }
 # systemd socket activation without `unsafe` in this crate: the same leaf
 # crate and the same approach as `dod/crates/harw-warden/src/systemd.rs`.
 sd-listen-fds = "0.2.0"
+# Sealed, persistent key provider (`src/sealed/`): the CryptGuard facade for
+# the ML-DSA `SignAlgorithm` impls and `OsRng` (same workspace dependency and
+# features as `harw-secrets`), XChaCha20-Poly1305 for the store file (same
+# version as `harw-secrets`), BLAKE3 for the KEK → file-key derivation,
+# `getrandom` for nonces/KEKs, `zeroize` for seeds, `harw-fsutil` for
+# symlink-safe opens, the 0600 check and atomic writes, `fs4` for the
+# single-writer store lock (as `harw-netsec`).
+crypt_guard = { workspace = true }
+chacha20poly1305 = "0.11.0"
+blake3 = { workspace = true }
+getrandom = { version = "0.4.2", features = ["std"] }
+zeroize = "1.8.1"
+harw-fsutil = { path = "../harw-fsutil" }
+fs4 = { workspace = true }
+# Purpose-bound signing (`HarwUsageAuthorizer`: sign/verify only over a
+# `SignTranscript`, no signing oracle) and `MAX_SIGNABLE_TRANSCRIPT_LEN`
+# for the sign body limit. Layer A → D, allowed by the arch policy.
+harw-dod-encrypt = { path = "../dod/crates/harw-dod-encrypt" }
 
 [dev-dependencies]
 tempfile = { workspace = true }

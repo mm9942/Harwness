@@ -30,6 +30,12 @@
 //!    außer den unter `[[sys_crates.allow]]` begründeten (§40: native
 //!    Abhängigkeiten dürfen nicht über Feature-Vereinigung einwandern).
 //!    Auch hier gilt die Ratsche für ungenutzte Allowlist-Einträge.
+//!    Dieselbe Prüfung erfasst auch [`C_BUILD_HELPERS`]: C/Asm-Bauhelfer ohne
+//!    `-sys`-Namen (`ring`, `cmake`, `bindgen`, `cc`; Tier C der
+//!    `dependency-review.md`), die der Namens-Suffix allein nicht fände. Für
+//!    `cc` gibt es keinen Allowlist-Eintrag, sondern eine fest codierte,
+//!    begründete Ausnahme (siehe [`CC_EXCEPTION_VIA`]): erlaubt nur, wenn
+//!    *jeder* Pfad zu `cc` über `blake3` läuft, kein Blanket-Allow.
 //!
 //! # Wie die `*-sys`-Hülle entsteht
 //! Innerhalb des Workspace folgt sie den normalen internen und externen
@@ -68,6 +74,32 @@ const WILDCARD: &str = "*";
 
 /// Namensendung, an der eine Crate mit (möglicher) C-Bindung erkannt wird.
 const SYS_SUFFIX: &str = "-sys";
+
+/// C/Asm-Bauhelfer ohne `-sys`-Namensendung (Tier C,
+/// `docs/architecture/dependency-review.md`): `cargo tree -i <name>` findet
+/// sie, der `-sys`-Suffix-Test allein nicht. Werden wie `*-sys`-Crates in
+/// [`sys_hull`] erfasst und in [`evaluate`] geprüft.
+const C_BUILD_HELPERS: &[&str] = &["ring", "cmake", "bindgen", "cc"];
+
+/// Name der Crate, für die es — statt eines Allowlist-Eintrags — eine fest
+/// codierte Ausnahme gibt.
+const CC: &str = "cc";
+
+/// Die einzige Zwischenstation, über die `cc` ein J/TCB-Paket erreichen darf
+/// (Tier A derselben Doku: `harw-types`/`harw-digest` → `blake3` → `cc`).
+///
+/// # Description
+/// Kein Blanket-Allow von `cc`: die Ausnahme gilt nur, wenn **jeder** Pfad
+/// zu `cc` über [`CC_EXCEPTION_VIA`] läuft. [`evaluate`] prüft das, indem es
+/// die Hülle ein zweites Mal bildet, ohne durch [`CC_EXCEPTION_VIA`] zu
+/// treten ([`sys_hull_excluding`]) — bleibt `cc` darin erreichbar, führt ein
+/// Pfad an `blake3` vorbei, und es ist ein Verstoß.
+const CC_EXCEPTION_VIA: &str = "blake3";
+
+/// Ob `name` als `*-sys`-Crate oder als C-Bauhelfer ohne `-sys`-Namen zählt.
+fn is_native_build_crate(name: &str) -> bool {
+    name.ends_with(SYS_SUFFIX) || C_BUILD_HELPERS.contains(&name)
+}
 
 /// Die Regel einer Schicht.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -672,6 +704,22 @@ pub fn evaluate(graph: &WorkspaceGraph, policy: &Policy, lock: &LockIndex) -> Ga
             ));
         }
         for (sys, path) in &hull.sys_crates {
+            if sys.as_str() == CC {
+                // `cc` ist keine Allowlist-Ausnahme, sondern eine fest
+                // codierte: erlaubt nur, wenn *jeder* Pfad zu `cc` über
+                // `blake3` läuft (siehe CC_EXCEPTION_VIA-Doku). Dazu wird
+                // die Hülle ohne diese Zwischenstation neu gebildet — bleibt
+                // `cc` darin erreichbar, führt ein Pfad an ihr vorbei.
+                let bypass = sys_hull_excluding(node, &by_name, lock, CC_EXCEPTION_VIA);
+                if let Some(bypass_path) = bypass.sys_crates.get(sys) {
+                    violations.push(format!(
+                        "{} erreicht die C-Bauhelfer-Crate '{sys}' über {} — nicht über '{CC_EXCEPTION_VIA}', die einzig begründete Ausnahme (Tier C/A, dependency-review.md)",
+                        node.name,
+                        bypass_path.join(" → ")
+                    ));
+                }
+                continue;
+            }
             if let Some((name, _)) = policy.sys_allowed.get_key_value(sys) {
                 used_sys.insert(name.as_str());
             } else {
@@ -680,8 +728,13 @@ pub fn evaluate(graph: &WorkspaceGraph, policy: &Policy, lock: &LockIndex) -> Ga
                 } else {
                     format!("Schicht {}", class.layer)
                 };
+                let kind = if sys.ends_with(SYS_SUFFIX) {
+                    "-sys-Crate"
+                } else {
+                    "C-Bauhelfer-Crate"
+                };
                 violations.push(format!(
-                    "{} erreicht die -sys-Crate '{sys}' über {} — in {scope} verboten, außer mit Begründung unter [[sys_crates.allow]] (§40)",
+                    "{} erreicht die {kind} '{sys}' über {} — in {scope} verboten, außer mit Begründung unter [[sys_crates.allow]] (§40)",
                     node.name,
                     path.join(" → ")
                 ));
@@ -722,12 +775,41 @@ struct SysHull {
 /// Die Breitensuche liefert zu jedem Fund den kürzesten Pfad, damit die
 /// Meldung zeigt, **über wen** die Crate hereinkommt.
 fn sys_hull(root: &CrateNode, by_name: &HashMap<&str, &CrateNode>, lock: &LockIndex) -> SysHull {
+    sys_hull_impl(root, by_name, lock, None)
+}
+
+/// Wie [`sys_hull`], aber tritt nicht durch `blocked`: dessen Kanten werden
+/// nicht weiterverfolgt, `blocked` selbst bleibt ein Sackgassen-Knoten.
+///
+/// # Description
+/// Dient der `cc`-Ausnahme in [`evaluate`]: bleibt eine gesuchte Crate auch
+/// ohne die Zwischenstation [`CC_EXCEPTION_VIA`] erreichbar, führt mindestens
+/// ein Pfad an ihr vorbei — die Ausnahme gilt dann nicht.
+fn sys_hull_excluding(
+    root: &CrateNode,
+    by_name: &HashMap<&str, &CrateNode>,
+    lock: &LockIndex,
+    blocked: &str,
+) -> SysHull {
+    sys_hull_impl(root, by_name, lock, Some(blocked))
+}
+
+fn sys_hull_impl(
+    root: &CrateNode,
+    by_name: &HashMap<&str, &CrateNode>,
+    lock: &LockIndex,
+    blocked: Option<&str>,
+) -> SysHull {
     let mut hull = SysHull::default();
     let mut parent: HashMap<String, String> = HashMap::new();
     let mut seen: HashSet<String> = HashSet::from([root.name.clone()]);
     let mut queue: VecDeque<String> = VecDeque::from([root.name.clone()]);
 
     while let Some(current) = queue.pop_front() {
+        if blocked.is_some_and(|blocked| blocked == current) {
+            // Nicht durch die blockierte Zwischenstation treten.
+            continue;
+        }
         let children: Vec<String> = if let Some(node) = by_name.get(current.as_str()) {
             node.deps
                 .iter()
@@ -750,7 +832,7 @@ fn sys_hull(root: &CrateNode, by_name: &HashMap<&str, &CrateNode>, lock: &LockIn
 
     hull.visited = seen.len().saturating_sub(1);
     for name in &seen {
-        if name.ends_with(SYS_SUFFIX) && *name != root.name {
+        if is_native_build_crate(name) && *name != root.name {
             let mut path = vec![name.clone()];
             let mut cursor = name;
             while let Some(previous) = parent.get(cursor) {
@@ -1091,6 +1173,68 @@ version = "0.2.0"
                 .any(|v| v.contains("'windows-sys'") && v.contains("Ratsche")),
             "{:?}",
             unused.violations
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn test_evaluate_c_build_helper_in_jobs_hull_is_a_violation() -> TestResult {
+        // `ring` trägt keinen `-sys`-Namen, ist aber ein C_BUILD_HELPERS-
+        // Eintrag; muss wie eine `-sys`-Crate in der J-Hülle rot werden.
+        let lock = LOCK.replace(
+            "dependencies = [\"libc\"]",
+            "dependencies = [\"libc\", \"ring\"]",
+        ) + "\n[[package]]\nname = \"ring\"\nversion = \"0.17.0\"\n";
+
+        let report = run_with(base_crates(), POLICY, &lock)?;
+
+        assert!(!report.is_green());
+        assert!(
+            report
+                .violations
+                .iter()
+                .any(|v| v.contains("'ring'") && v.contains("j → tokio → mio → ring")),
+            "die Meldung muss den Pfad nennen: {:?}",
+            report.violations
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn test_evaluate_cc_only_via_blake3_is_green() -> TestResult {
+        // `j` erreicht `cc` ausschließlich über `blake3` — die fest codierte
+        // Ausnahme greift, kein Verstoß.
+        let mut crates = base_crates();
+        crates[2] = node("j", &["f", "i"], &["tokio", "blake3"]);
+        let lock = format!(
+            "{LOCK}\n[[package]]\nname = \"blake3\"\nversion = \"1.0.0\"\ndependencies = [\"cc\"]\n\n[[package]]\nname = \"cc\"\nversion = \"1.0.0\"\n"
+        );
+
+        let report = run_with(crates, POLICY, &lock)?;
+
+        assert!(report.is_green(), "{:?}", report.violations);
+        Ok(())
+    }
+
+    #[test]
+    fn test_evaluate_cc_via_other_path_is_a_violation() -> TestResult {
+        // `j` erreicht `cc` über `tokio`, nicht über `blake3` — die Ausnahme
+        // gilt nicht (kein Blanket-Allow von `cc`).
+        let lock = LOCK.replace(
+            "dependencies = [\"mio\"]",
+            "dependencies = [\"mio\", \"cc\"]",
+        ) + "\n[[package]]\nname = \"cc\"\nversion = \"1.0.0\"\n";
+
+        let report = run_with(base_crates(), POLICY, &lock)?;
+
+        assert!(!report.is_green());
+        assert!(
+            report
+                .violations
+                .iter()
+                .any(|v| v.contains("'cc'") && v.contains("j → tokio → cc")),
+            "die Meldung muss den Bypass-Pfad ohne blake3 nennen: {:?}",
+            report.violations
         );
         Ok(())
     }

@@ -61,7 +61,10 @@ pub use auto_classifier::{AutoModeHandle, ModelClassifierBackend, PrefilterConte
 pub use budget::child_limits;
 pub use ceiling::root_ceiling;
 pub use children::RuntimeChildRegistryFactory;
-pub use config::{ConfigTrustReport, load_config, load_config_embedded};
+pub use config::{
+    ConfigTrustReport, load_config, load_config_embedded, load_config_embedded_with_agents,
+    load_config_with_agents,
+};
 pub use contributors::{
     AssemblyContributor, AssemblyInputs, AssemblyParts, InfrastructureContributor,
     default_contributors,

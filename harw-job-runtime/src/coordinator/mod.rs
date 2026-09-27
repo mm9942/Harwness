@@ -29,8 +29,10 @@
 //! - [`AttemptRecord`]: the per-attempt sidecar with lifecycle, recovery
 //!   identity and enforcement report.
 //! - [`RuntimeError`]: typed failures (§22).
+//! - [`OutputCapture`]: bounded head + tail capture of stdout/stderr.
 
 pub mod attempt;
+pub mod capture;
 #[cfg(target_os = "macos")]
 pub mod darwin;
 pub mod error;
@@ -44,6 +46,7 @@ pub mod store;
 mod tests;
 
 pub use attempt::{ATTEMPT_RECORD_VERSION, ATTEMPTS_SIDECAR, AttemptRecord, attempt_id_for};
+pub use capture::{DEFAULT_OUTPUT_HEAD_BYTES, DEFAULT_OUTPUT_TAIL_BYTES, OutputCapture};
 #[cfg(target_os = "macos")]
 pub use darwin::DarwinExecutor;
 pub use error::RuntimeError;
@@ -55,7 +58,7 @@ pub use executor::{
 #[cfg(target_os = "linux")]
 pub use linux::{LinuxExecutor, LinuxExecutorOptions, LinuxSandboxBackend};
 pub use runner::{
-    Coordinator, CoordinatorConfig, DEFAULT_LEASE_TTL, DEFAULT_OUTPUT_LIMIT, JobHandle, JobResult,
-    MIN_LEASE_TTL, RecoveredJob, RecoveryDecision,
+    Coordinator, CoordinatorConfig, DEFAULT_LEASE_TTL, JobHandle, JobResult, MIN_LEASE_TTL,
+    RecoveredJob, RecoveryDecision,
 };
 pub use store::CoordinatorStore;

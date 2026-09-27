@@ -1,6 +1,7 @@
 [package]
 publish.workspace = true
 name = "xtask"
+description = "Toolkit for CI gates and control plane UI type generation"
 version.workspace = true
 edition.workspace = true
 license.workspace = true

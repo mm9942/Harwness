@@ -1,6 +1,7 @@
 [package]
 publish.workspace = true
 name = "harw-lens-source"
+description = "Source bindings for lens indices: document collection, chunking, and incremental index building"
 version.workspace = true
 edition.workspace = true
 license.workspace = true

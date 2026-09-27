@@ -40,9 +40,10 @@
 //! ```rust,no_run
 //! # use std::path::Path;
 //! # use harw_config::ResolvedConfig;
-//! # fn example(home: &Path, config: &ResolvedConfig) -> Result<(), String> {
+//! # use harw_registry_defaults::ConfigAgents;
+//! # fn example(home: &Path, config: &ResolvedConfig, agents: &ConfigAgents) -> Result<(), String> {
 //! // Vor der TUI-Montage aufrufen; startet ggf. den Einrichtungsdialog.
-//! let activated = crate::uia_bootstrap::ensure_active_uia(home, config)?;
+//! let activated = crate::uia_bootstrap::ensure_active_uia(home, config, agents)?;
 //! # let _ = activated;
 //! # Ok(())
 //! # }
@@ -56,6 +57,7 @@ use std::{
 use harw_agent_dsl::roles::AgentRoleId;
 use harw_config::{ConfigWriter, ResolvedConfig};
 use harw_home::{active_profile_name, profile_dir};
+use harw_registry_defaults::ConfigAgents;
 use toml_edit::value;
 
 /// Neutraler Vorgabetext für `Personality.md`, falls die Persönlichkeitsfrage
@@ -78,6 +80,9 @@ const DEFAULT_PERSONALITY_TEXT: &str = "Sei klar, respektvoll und transparent. E
 ///   Profilverzeichnis und Konfigurationsdatei abgeleitet werden.
 /// - `config` (`&ResolvedConfig`): geliehene, bereits aufgelöste Konfiguration
 ///   des aktiven Profils; wird nur gelesen, nie verändert.
+/// - `agents` (`&ConfigAgents`): die gesenkten Agentendefinitionen derselben
+///   Konfiguration (`harw_runtime::load_config_with_agents`); aus ihnen
+///   stammen die UIA-Kandidaten.
 ///
 /// # Returns
 /// `Ok(None)`, wenn bereits eine `active_uia_definition` gesetzt ist (keine
@@ -100,8 +105,9 @@ const DEFAULT_PERSONALITY_TEXT: &str = "Sei klar, respektvoll und transparent. E
 /// ```rust,no_run
 /// # use std::path::Path;
 /// # use harw_config::ResolvedConfig;
-/// # fn example(home: &Path, config: &ResolvedConfig) -> Result<(), String> {
-/// if let Some(activated) = crate::uia_bootstrap::ensure_active_uia(home, config)? {
+/// # use harw_registry_defaults::ConfigAgents;
+/// # fn example(home: &Path, config: &ResolvedConfig, agents: &ConfigAgents) -> Result<(), String> {
+/// if let Some(activated) = crate::uia_bootstrap::ensure_active_uia(home, config, agents)? {
 ///     eprintln!("UIA {activated} aktiviert");
 /// }
 /// # Ok(())
@@ -110,12 +116,13 @@ const DEFAULT_PERSONALITY_TEXT: &str = "Sei klar, respektvoll und transparent. E
 pub(crate) fn ensure_active_uia(
     home: &Path,
     config: &ResolvedConfig,
+    agents: &ConfigAgents,
 ) -> Result<Option<String>, String> {
     if config.harness.active_uia_definition.is_some() {
         return Ok(None);
     }
 
-    let mut candidates: Vec<String> = config
+    let mut candidates: Vec<String> = agents
         .executable_agents
         .iter()
         .filter(|(_, agent)| agent.role() == AgentRoleId::UserInterface)

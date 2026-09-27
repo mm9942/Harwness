@@ -132,11 +132,13 @@ use harw_operations::{OpContext, OpError, OpOutput};
 use harw_plan::actions::{NodePatch, PlanAction, PlanEvent};
 use harw_plan::error::PlanError;
 // Kein `use harw_plan::goal::GoalStore`: `run_reconcile` arbeitet auf einem
-// `Arc<dyn GoalStore>` aus `ctx.goal_store()`. Bei `dyn Trait` ist der Trait Teil
+// `&dyn GoalStore` (der mandanten-gescopten Hülle um `ctx.goal_store()`, an
+// der einen Cast-Stelle voll qualifiziert). Bei `dyn Trait` ist der Trait Teil
 // des Typs und die Methode wird über die Vtable aufgelöst — ein Import wäre
 // redundant (nur konkrete Typen brauchen den Trait im Scope).
 use harw_plan::graph;
 use harw_plan::ids::{PathOrSymbol, PlanId, RevisionId, TaskId};
+use harw_plan::tenant_scope::{ScopedGoalStore, ScopedPlanStore};
 use harw_plan::types::{EvidenceKind, EvidenceRef, Plan, PlanNode, PlanNodeKind, PlanNodeStatus};
 use harw_plan::{PlanStore, PlanToolConfig};
 use harw_plan_bridge::{
@@ -786,7 +788,11 @@ async fn plan(ctx: &OpContext, call: PlanCall) -> Result<OpOutput, OpError> {
     // Akteur keine Aktion (auch keine lesende — fail-closed, F-049).
     let actor = require_actor(ctx, call.surface)?;
     let store_handle = require_service!(ctx.plan_store(), "Plan-Store");
-    let store: &dyn PlanStore = store_handle.as_ref();
+    // H12: jeder Subcommand sieht nur Pläne des eigenen Mandanten-Scopes
+    // (`ctx.tenant()`); ein fremder Plan scheitert exakt wie ein unbekannter,
+    // `create` legt im eigenen Mandanten an (siehe `harw_plan::tenant_scope`).
+    let scoped = ScopedPlanStore::new(store_handle.as_ref(), ctx.tenant().cloned());
+    let store: &dyn PlanStore = &scoped;
 
     let text = match call.args {
         // Runde 5, Teil P: Katalog, Freigabe und Schritt-Verfolgung
@@ -1552,8 +1558,16 @@ fn run_reconcile(
     actor: &str,
 ) -> Result<String, OpError> {
     let plan = current_plan(store)?;
-    let goal_store = ctx.goal_store();
-    let goal = goal_store.as_ref().and_then(|store| store.current().ok());
+    // H12: dieselbe Mandanten-Sicht wie `/goal` — ein fremdes Ziel ist hier
+    // „kein Ziel“ und wird vom Abgleich weder gelesen noch verändert.
+    let goal_handle = ctx.goal_store();
+    let scoped_goals = goal_handle
+        .as_deref()
+        .map(|goals| ScopedGoalStore::new(goals, ctx.tenant().cloned()));
+    let goal_store = scoped_goals
+        .as_ref()
+        .map(|goals| goals as &dyn harw_plan::goal::GoalStore);
+    let goal = goal_store.and_then(|store| store.current().ok());
 
     let steps = PlanController::reconcile(ReconcileInput {
         goal: goal.as_ref(),
@@ -1564,8 +1578,8 @@ fn run_reconcile(
         now: OffsetDateTime::now_utc(),
     });
 
-    let (events, deferred) = PlanController::apply(&steps, store, goal_store.as_deref(), actor)
-        .map_err(map_bridge_error)?;
+    let (events, deferred) =
+        PlanController::apply(&steps, store, goal_store, actor).map_err(map_bridge_error)?;
 
     let mut lines = vec![format!(
         "Abgleich: {} Schritt(e) berechnet, {} angewandt, {} offen.",
@@ -2983,6 +2997,131 @@ mod tests {
         let from_json: PlanCall = serde_json::from_value(serde_json::json!({"action": "list"}))
             .map_err(ctx("json list"))?;
         assert!(matches!(from_json.args, PlanArgs::List));
+        Ok(())
+    }
+
+    // ── Mandanten-Scope (H12) ────────────────────────────────────────────────
+
+    /// Kontext über einem **gegebenen** Store, optional an einen Mandanten
+    /// gebunden.
+    fn tenant_context(
+        store: &Arc<dyn PlanStore>,
+        tenant: Option<&str>,
+    ) -> TestResult<(OpContext, std::path::PathBuf)> {
+        let mut services = ServiceMap::new();
+        services.insert(Arc::clone(store));
+        services.insert(PlanToolConfig::enabled_defaults());
+        let (ctx, root) = context_with(services)?;
+        Ok(match tenant {
+            Some(name) => (ctx.with_tenant(TenantId::from_str(name)), root),
+            None => (ctx, root),
+        })
+    }
+
+    #[tokio::test]
+    async fn create_records_the_callers_tenant() -> TestResult {
+        let store: Arc<dyn PlanStore> = Arc::new(InMemoryPlanStore::new());
+        let (scoped, scoped_root) = tenant_context(&store, Some("tenant-a"))?;
+        let (unscoped, unscoped_root) = tenant_context(&store, None)?;
+        let created = run_command(&scoped, &["create", "p-a", "Ziel", "A"]).await;
+        let created_free = run_command(&unscoped, &["create", "p-free", "Ziel"]).await;
+        let owned = store.plan_by_id(&PlanId::new("p-a"));
+        let free = store.plan_by_id(&PlanId::new("p-free"));
+        cleanup(scoped_root);
+        cleanup(unscoped_root);
+
+        created.map_err(ctx("gescoptes create"))?;
+        created_free.map_err(ctx("ungescoptes create"))?;
+        assert_eq!(
+            owned.map_err(ctx("p-a lesen"))?.tenant,
+            Some(TenantId::from_str("tenant-a"))
+        );
+        assert_eq!(free.map_err(ctx("p-free lesen"))?.tenant, None);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn scoped_list_shows_only_own_plans() -> TestResult {
+        let store: Arc<dyn PlanStore> = Arc::new(InMemoryPlanStore::new());
+        let (a, a_root) = tenant_context(&store, Some("tenant-a"))?;
+        let (b, b_root) = tenant_context(&store, Some("tenant-b"))?;
+        let (unscoped, unscoped_root) = tenant_context(&store, None)?;
+        run_command(&a, &["create", "p-alpha", "A"])
+            .await
+            .map_err(ctx("create als tenant-a"))?;
+        run_command(&b, &["create", "p-beta", "B"])
+            .await
+            .map_err(ctx("create als tenant-b"))?;
+        run_command(&unscoped, &["create", "p-legacy", "Alt"])
+            .await
+            .map_err(ctx("ungescoptes create"))?;
+        let list_a = run_command(&a, &["list"]).await;
+        let list_all = run_command(&unscoped, &["list"]).await;
+        cleanup(a_root);
+        cleanup(b_root);
+        cleanup(unscoped_root);
+
+        let list_a = list_a.map_err(ctx("list als tenant-a"))?;
+        assert!(list_a.contains("p-alpha"), "{list_a}");
+        assert!(
+            !list_a.contains("p-beta"),
+            "fremder Plan sichtbar: {list_a}"
+        );
+        assert!(
+            !list_a.contains("p-legacy"),
+            "Altbestand sichtbar: {list_a}"
+        );
+        let list_all = list_all.map_err(ctx("ungescoptes list"))?;
+        for id in ["p-alpha", "p-beta", "p-legacy"] {
+            assert!(list_all.contains(id), "{id} fehlt: {list_all}");
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn foreign_plan_fails_exactly_like_an_unknown_one() -> TestResult {
+        let store: Arc<dyn PlanStore> = Arc::new(InMemoryPlanStore::new());
+        let (owner, owner_root) = tenant_context(&store, Some("tenant-a"))?;
+        run_command(&owner, &["create", "p-x", "Geheim"])
+            .await
+            .map_err(ctx("create als tenant-a"))?;
+        let before = store.current().map_err(ctx("Plan vorher"))?;
+
+        let (foreign, foreign_root) = tenant_context(&store, Some("tenant-b"))?;
+        let empty: Arc<dyn PlanStore> = Arc::new(InMemoryPlanStore::new());
+        let (missing, missing_root) = tenant_context(&empty, Some("tenant-b"))?;
+
+        let commands: [&[&str]; 11] = [
+            &["inspect"],
+            &["inspect", "p-x"],
+            &["switch", "p-x"],
+            &["archive", "p-x"],
+            &["ready"],
+            &["waves"],
+            &["add", "t-1", "coding", "bauen"],
+            &["patch", "t-1", "objective", "anders"],
+            &["status", "t-1", "in_progress"],
+            &["evidence", "t-1", "manual", "beleg"],
+            &["bind-goal", "g-1"],
+        ];
+        let mut mismatches = Vec::new();
+        for command in commands {
+            let seen = run_command(&foreign, command).await;
+            let reference = run_command(&missing, command).await;
+            if seen.is_ok() || format!("{seen:?}") != format!("{reference:?}") {
+                mismatches.push(format!("{command:?}: {seen:?} ≠ {reference:?}"));
+            }
+        }
+        let after = store.current().map_err(ctx("Plan nachher"));
+        cleanup(owner_root);
+        cleanup(foreign_root);
+        cleanup(missing_root);
+
+        assert!(mismatches.is_empty(), "{mismatches:#?}");
+        let after = after?;
+        assert_eq!(after.id, before.id, "fremder Plan bleibt aktiv");
+        assert_eq!(after.revision, before.revision, "fremder Plan unverändert");
+        assert!(after.nodes.is_empty());
         Ok(())
     }
 }

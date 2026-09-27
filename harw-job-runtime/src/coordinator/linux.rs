@@ -25,10 +25,25 @@
 //! primary process then (its identity is what recovery verifies); a job
 //! killed by a signal is recorded by the shell as `128 + signal`.
 //!
+//! # Recovery (Job-Runtime-Doc §15)
+//! A reattached process is supervised through its verified pidfd. When its
+//! persisted identity names the attempt's own job cgroup
+//! (`harw-job-<attempt>`), the executor reopens that cgroup beneath its
+//! delegated root ([`CgroupBackend::reopen`]) and accepts it only if the
+//! reopened path equals the persisted one. After the primary ended (on its
+//! own, or through cancel, deadline or lease loss) the whole cgroup is
+//! killed — re-verified by
+//! [`LinuxRecoveryIdentity::kill_job_verified`] — and removed, so no
+//! descendant survives. If the cgroup cannot be reopened (no cgroup root
+//! configured, reopen failure, path mismatch), termination falls back to
+//! the primary process only; the executor logs that and reports it as the
+//! first [`AttemptEvent::Error`] of the attempt, which the coordinator
+//! records in the attempt's reason.
+//!
 //! # Limitations
-//! - A reattached process is supervised through its verified pidfd only
-//!   (no process-group or cgroup handle is rebuilt), so termination of a
-//!   recovered attempt signals the primary, not its descendants.
+//! - A recovered attempt's process group is not rebuilt: the graceful
+//!   termination signal reaches the primary only; descendants are killed
+//!   with the job cgroup (when it could be reopened).
 //! - Between spawn and cgroup attach the child runs for a few microseconds
 //!   outside the cgroup unless the trampoline backend is used (it joins
 //!   the cgroup itself before `exec`).
@@ -343,6 +358,85 @@ impl AttemptControl for SupervisorControl {
 struct AfterExit {
     trampoline_report: Option<PathBuf>,
     resource_limits: EnforcementState,
+    /// Job cgroup of a recovered attempt, killed and removed after exit.
+    recovered_cgroup: Option<RecoveredCgroup>,
+    /// Supervision note reported as the first event (recovery fallback).
+    note: Option<String>,
+}
+
+/// The job cgroup of a recovered attempt, reopened and path-verified.
+struct RecoveredCgroup {
+    backend: Arc<dyn CgroupBackend>,
+    handle: CgroupHandle,
+    identity: LinuxRecoveryIdentity,
+}
+
+impl RecoveredCgroup {
+    /// Kills every remaining member (after re-verifying that the handle is
+    /// the persisted cgroup) and removes the cgroup.
+    async fn kill_and_remove(self) {
+        let killed = self
+            .identity
+            .kill_job_verified(&*self.backend, &self.handle);
+        match killed {
+            Ok(_) => remove_cgroup(JobCgroup::new(self.backend, self.handle)).await,
+            Err(error) => tracing::warn!(
+                cgroup = self.handle.proc_path(),
+                %error,
+                "recovered job cgroup was not killed"
+            ),
+        }
+    }
+}
+
+/// What recovery can do about a recovered attempt's job cgroup.
+#[derive(Debug, PartialEq, Eq)]
+enum CgroupRecovery {
+    /// The attempt ran without a job cgroup: process-only as before.
+    NotUsed,
+    /// The job cgroup was reopened; its path equals the persisted one.
+    Reopened(CgroupHandle),
+    /// The attempt had a job cgroup that cannot be controlled now;
+    /// termination falls back to the primary process (the detail says why).
+    ProcessOnly(String),
+}
+
+/// Reopens the job cgroup a recovered attempt recorded in its identity.
+///
+/// The persisted `cgroup_path` is metadata, not an authority: it only
+/// selects the attempt's own cgroup name (`harw-job-<attempt>`) beneath
+/// the executor's delegated root, and the reopened handle is accepted only
+/// if its path equals the persisted one.
+fn reopen_job_cgroup(
+    backend: Option<&dyn CgroupBackend>,
+    identity: &LinuxRecoveryIdentity,
+    ctx: &AttemptContext,
+) -> CgroupRecovery {
+    let name = cgroup_name(ctx);
+    let Some(recorded) = identity.cgroup_path.as_deref() else {
+        return CgroupRecovery::NotUsed;
+    };
+    if recorded.rsplit('/').next() != Some(name.as_str()) {
+        return CgroupRecovery::NotUsed;
+    }
+    let Some(backend) = backend else {
+        return CgroupRecovery::ProcessOnly(format!(
+            "job cgroup '{recorded}' not reopened: no cgroup root is configured; \
+             termination is limited to the primary process"
+        ));
+    };
+    match backend.reopen(&name) {
+        Ok(handle) if handle.proc_path() == recorded => CgroupRecovery::Reopened(handle),
+        Ok(handle) => CgroupRecovery::ProcessOnly(format!(
+            "job cgroup not reopened: '{}' is not the persisted cgroup '{recorded}'; \
+             termination is limited to the primary process",
+            handle.proc_path()
+        )),
+        Err(error) => CgroupRecovery::ProcessOnly(format!(
+            "job cgroup '{recorded}' not reopened: {error}; \
+             termination is limited to the primary process"
+        )),
+    }
 }
 
 impl AfterExit {
@@ -376,10 +470,15 @@ async fn forward(
     handle: SupervisorHandle,
     mut events: mpsc::Receiver<ProcessEvent>,
     sender: AttemptEventSender,
-    after: AfterExit,
+    mut after: AfterExit,
 ) {
     let mut exit = ExitOutcome::Unknown;
     let mut listening = true;
+    if let Some(note) = after.note.take() {
+        listening = sender
+            .send(AttemptEvent::Error(format!("recovery: {note}")))
+            .await;
+    }
     while let Some(event) = events.recv().await {
         let forwarded = match event {
             ProcessEvent::Stdout(chunk) => Some(AttemptEvent::Stdout(chunk.to_vec())),
@@ -407,6 +506,9 @@ async fn forward(
             }
         }
         Err(error) => tracing::warn!(%error, "supervisor task failed"),
+    }
+    if let Some(cgroup) = after.recovered_cgroup.take() {
+        cgroup.kill_and_remove().await;
     }
     let sandbox = after.late_report();
     let _ = sender
@@ -753,6 +855,8 @@ impl Executor for LinuxExecutor {
             AfterExit {
                 trampoline_report: prepared.trampoline_report,
                 resource_limits,
+                recovered_cgroup: None,
+                note: None,
             },
         );
         Ok(StartedAttempt {
@@ -783,6 +887,38 @@ impl Executor for LinuxExecutor {
             operation: "adopt recovered process",
             detail: error.to_string(),
         })?;
+        // Only for a verified live process: reopen its job cgroup so that
+        // termination reaches every descendant.
+        let backend = self
+            .cgroup
+            .as_ref()
+            .map(|backend| Arc::clone(backend) as Arc<dyn CgroupBackend>);
+        let (recovered_cgroup, note) = match reopen_job_cgroup(backend.as_deref(), identity, ctx) {
+            CgroupRecovery::NotUsed => (None, None),
+            CgroupRecovery::Reopened(handle) => {
+                tracing::info!(
+                    pid = identity.pid,
+                    cgroup = handle.proc_path(),
+                    attempt = %ctx.attempt_id,
+                    "reopened the job cgroup of the recovered attempt"
+                );
+                let recovered = backend.map(|backend| RecoveredCgroup {
+                    backend,
+                    handle,
+                    identity: identity.clone(),
+                });
+                (recovered, None)
+            }
+            CgroupRecovery::ProcessOnly(detail) => {
+                tracing::warn!(
+                    pid = identity.pid,
+                    attempt = %ctx.attempt_id,
+                    %detail,
+                    "recovered attempt falls back to process-only termination"
+                );
+                (None, Some(detail))
+            }
+        };
         tracing::info!(pid = identity.pid, job = %ctx.job_id, attempt = %ctx.attempt_id, "reattached verified process");
         Ok(self.supervise(
             process,
@@ -791,6 +927,8 @@ impl Executor for LinuxExecutor {
             AfterExit {
                 trampoline_report: None,
                 resource_limits: EnforcementState::NotEnforced,
+                recovered_cgroup,
+                note,
             },
         ))
     }
@@ -816,13 +954,160 @@ impl Executor for LinuxExecutor {
 
 #[cfg(test)]
 mod tests {
-    use super::{Launch, cgroup_name, weaker};
+    use super::{CgroupRecovery, Launch, cgroup_name, reopen_job_cgroup, weaker};
     use crate::coordinator::executor::AttemptContext;
     use crate::test_support::{TestResult, ctx};
     use harw_job_core::{AttemptId, EnforcementState, RunnerId};
+    use harw_job_linux::cgroup::{CgroupBackend, CgroupHandle, CgroupSpec, CgroupStats};
+    use harw_job_linux::{CgroupError, LinuxProcess, LinuxRecoveryIdentity};
     use harw_types::WorkId;
     use std::ffi::OsString;
     use std::path::{Path, PathBuf};
+
+    /// A backend whose `reopen` yields a handle with `proc_path` (or
+    /// fails); every other operation fails.
+    struct FakeBackend {
+        proc_path: Option<String>,
+    }
+
+    fn denied(path: &str) -> CgroupError {
+        CgroupError::PermissionDenied {
+            path: path.to_owned(),
+        }
+    }
+
+    impl CgroupBackend for FakeBackend {
+        fn create(&self, spec: &CgroupSpec) -> Result<CgroupHandle, CgroupError> {
+            Err(denied(&spec.name))
+        }
+
+        fn reopen(&self, name: &str) -> Result<CgroupHandle, CgroupError> {
+            match &self.proc_path {
+                Some(path) => Ok(CgroupHandle::new(name.to_owned(), path.clone(), None)),
+                None => Err(denied(name)),
+            }
+        }
+
+        fn attach(&self, group: &CgroupHandle, _process: &LinuxProcess) -> Result<(), CgroupError> {
+            Err(denied(group.name()))
+        }
+
+        fn attach_self(&self, group: &CgroupHandle) -> Result<(), CgroupError> {
+            Err(denied(group.name()))
+        }
+
+        fn freeze(&self, group: &CgroupHandle) -> Result<(), CgroupError> {
+            Err(denied(group.name()))
+        }
+
+        fn thaw(&self, group: &CgroupHandle) -> Result<(), CgroupError> {
+            Err(denied(group.name()))
+        }
+
+        fn kill(&self, group: &CgroupHandle) -> Result<(), CgroupError> {
+            Err(denied(group.name()))
+        }
+
+        fn stats(&self, group: &CgroupHandle) -> Result<CgroupStats, CgroupError> {
+            Err(denied(group.name()))
+        }
+
+        fn remove(&self, group: CgroupHandle) -> Result<(), CgroupError> {
+            Err(denied(group.name()))
+        }
+    }
+
+    fn attempt_context() -> TestResult<AttemptContext> {
+        Ok(AttemptContext {
+            job_id: WorkId::from_str("j"),
+            attempt_id: AttemptId::new("j-e1").map_err(ctx("attempt"))?,
+            runner_id: RunnerId::new("r").map_err(ctx("runner"))?,
+            workspace_root: PathBuf::from("/"),
+        })
+    }
+
+    fn identity(context: &AttemptContext, cgroup_path: Option<&str>) -> LinuxRecoveryIdentity {
+        LinuxRecoveryIdentity {
+            pid: 4242,
+            process_start_time: Some(1),
+            cgroup_path: cgroup_path.map(str::to_owned),
+            executable: None,
+            runner_id: context.runner_id.clone(),
+            attempt_id: context.attempt_id.clone(),
+        }
+    }
+
+    const JOB_CGROUP: &str = "/delegated/harw-job-j-e1";
+
+    #[test]
+    fn recovered_cgroup_is_reopened_only_with_the_persisted_path() -> TestResult {
+        let context = attempt_context()?;
+        let persisted = identity(&context, Some(JOB_CGROUP));
+        let matching = FakeBackend {
+            proc_path: Some(JOB_CGROUP.to_owned()),
+        };
+        assert_eq!(
+            reopen_job_cgroup(Some(&matching as &dyn CgroupBackend), &persisted, &context),
+            CgroupRecovery::Reopened(CgroupHandle::new(
+                "harw-job-j-e1".to_owned(),
+                JOB_CGROUP.to_owned(),
+                None
+            ))
+        );
+        // Same name beneath another root: not the persisted cgroup.
+        let elsewhere = FakeBackend {
+            proc_path: Some("/other/harw-job-j-e1".to_owned()),
+        };
+        assert!(matches!(
+            reopen_job_cgroup(Some(&elsewhere as &dyn CgroupBackend), &persisted, &context),
+            CgroupRecovery::ProcessOnly(detail) if detail.contains("is not the persisted cgroup")
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn recovered_cgroup_falls_back_to_process_only() -> TestResult {
+        let context = attempt_context()?;
+        let persisted = identity(&context, Some(JOB_CGROUP));
+        // No cgroup root configured on the restarted runner.
+        assert!(matches!(
+            reopen_job_cgroup(None, &persisted, &context),
+            CgroupRecovery::ProcessOnly(detail) if detail.contains("no cgroup root is configured")
+        ));
+        // The cgroup cannot be reopened (gone, permissions).
+        let failing = FakeBackend { proc_path: None };
+        assert!(matches!(
+            reopen_job_cgroup(Some(&failing as &dyn CgroupBackend), &persisted, &context),
+            CgroupRecovery::ProcessOnly(detail) if detail.contains("not reopened")
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn attempt_without_job_cgroup_needs_no_reopen() -> TestResult {
+        let context = attempt_context()?;
+        let backend = FakeBackend {
+            proc_path: Some(JOB_CGROUP.to_owned()),
+        };
+        // The runner's own cgroup (no job cgroup was configured at start).
+        let plain = identity(&context, Some("/user.slice/session-1.scope"));
+        assert_eq!(
+            reopen_job_cgroup(Some(&backend as &dyn CgroupBackend), &plain, &context),
+            CgroupRecovery::NotUsed
+        );
+        // Another attempt's job cgroup is never adopted.
+        let foreign = identity(&context, Some("/delegated/harw-job-j-e2"));
+        assert_eq!(
+            reopen_job_cgroup(Some(&backend as &dyn CgroupBackend), &foreign, &context),
+            CgroupRecovery::NotUsed
+        );
+        let unknown = identity(&context, None);
+        assert_eq!(
+            reopen_job_cgroup(None, &unknown, &context),
+            CgroupRecovery::NotUsed
+        );
+        Ok(())
+    }
 
     #[test]
     fn cgroup_names_are_single_safe_components() -> TestResult {

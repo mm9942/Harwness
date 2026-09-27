@@ -5,10 +5,11 @@
 //! ```
 //!
 //! Order: parse the command line, load and validate the config and token
-//! files (fail fast, before any socket exists), start the Tokio runtime,
-//! build the CryptGuard stack, obtain the listener, serve until SIGTERM or
-//! SIGINT, drain, exit. Logs go to stderr via `tracing`; filter with
-//! `RUST_LOG` (default `info`; audit events use the target
+//! files (fail fast, before any socket exists), open the key store (sealed
+//! store creation/unlock also happens before any socket exists), start the
+//! Tokio runtime, build the CryptGuard stack, obtain the listener, serve
+//! until SIGTERM or SIGINT, drain, exit. Logs go to stderr via `tracing`;
+//! filter with `RUST_LOG` (default `info`; audit events use the target
 //! `harw_auth_hub::audit`).
 
 #![forbid(unsafe_code)]
@@ -17,6 +18,9 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 
 use clap::Parser;
+use harw_auth_hub::config::KeyStoreConfig;
+use harw_auth_hub::sealed::SealedProvider;
+use harw_auth_hub::service::KeyStore;
 use harw_auth_hub::{DEFAULT_CONFIG_PATH, HubConfig, HubError, HubListener, HubService};
 
 /// Local Auth/Crypto Hub: CryptGuard KMS over HTTP/1 on an AF_UNIX socket.
@@ -59,6 +63,23 @@ fn run(cli: Cli) -> Result<(), HubError> {
     }
     let bearer = config.load_bearer_tokens()?;
 
+    // Open the key store before any socket exists, so a bad or missing KEK
+    // fails the process fast instead of after it starts accepting peers.
+    let (store, persistence, store_path) = match &config.key_store {
+        KeyStoreConfig::InMemory => (KeyStore::InMemory, "in-memory", None),
+        KeyStoreConfig::Sealed { path, .. } => {
+            let kek = config.load_kek()?.ok_or_else(|| {
+                HubError::ConfigInvalid("sealed key store: no kek configured".to_owned())
+            })?;
+            let provider = SealedProvider::open_or_create(path, &kek)?;
+            (
+                KeyStore::Sealed(provider),
+                "sealed-file",
+                Some(path.clone()),
+            )
+        }
+    };
+
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
@@ -70,17 +91,22 @@ fn run(cli: Cli) -> Result<(), HubError> {
         } else {
             HubListener::bind(&config.socket_path)?
         };
-        let hub = HubService::new(&config, bearer);
+        let hub = HubService::build(&config, bearer, store)?;
         let socket = listener
             .owned_path()
             .map_or_else(|| "<systemd>".to_owned(), |p| p.display().to_string());
+        let store_display = store_path.as_deref().map(|p| p.display().to_string());
         tracing::info!(
             %socket,
             peers = config.peers.len(),
             bearer_tokens = config.bearer_tokens.len(),
-            persistence = harw_auth_hub::meta::PERSISTENCE,
-            "harw-auth-hub listening (keys are lost on restart)"
+            persistence,
+            store_path = store_display.as_deref(),
+            "harw-auth-hub listening"
         );
+        if persistence == "in-memory" {
+            tracing::warn!("in-memory key store: keys are lost on restart");
+        }
         harw_auth_hub::serve(listener, hub, shutdown).await
     })
 }

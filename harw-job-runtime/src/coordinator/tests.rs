@@ -9,11 +9,12 @@ use std::process::Command;
 use std::time::Duration;
 
 use harw_job_core::{
-    CancellationCause, EnforcementState, ExitOutcome, JobClaim, JobOutcome, JobSpec,
-    JobSpecEnvelope, JobState, LifecycleEvent, LifecycleState, ResourceRequest, RunnerId,
-    SandboxRequirement,
+    AttemptId, CancellationCause, EnforcementState, ExitOutcome, JobClaim, JobOutcome, JobSpec,
+    JobSpecEnvelope, JobState, LifecycleEvent, LifecycleState, LifecycleTransition,
+    ResourceRequest, RetryPolicy, RunnerId, SandboxRequirement,
 };
-use harw_job_linux::{LinuxProcess, LinuxRecoveryIdentity, SignalKind};
+use harw_job_linux::cgroup::{CgroupBackend, CgroupV2Fs};
+use harw_job_linux::{CgroupError, LinuxProcess, LinuxRecoveryIdentity, SignalKind};
 use harw_job_store::{
     ClaimTerms, FsJobRecordStore, JobRecordStore, JobTransition, LEASE_EXPIRED_EXHAUSTED_REASON,
 };
@@ -22,9 +23,12 @@ use jiff::{SignedDuration, Timestamp};
 use tempfile::TempDir;
 
 use super::attempt::{AttemptRecord, attempt_id_for};
+use super::capture::OutputCapture;
 use super::executor::AttemptContext;
 use super::linux::{LinuxExecutor, LinuxExecutorOptions};
-use super::runner::{Coordinator, CoordinatorConfig, JobHandle, JobResult, RecoveryDecision};
+use super::runner::{
+    Coordinator, CoordinatorConfig, JobHandle, JobResult, RecoveryDecision, retry_attempt_id,
+};
 use super::store::CoordinatorStore;
 use crate::test_support::{TestError, TestResult, ctx};
 
@@ -65,6 +69,20 @@ impl Fixture {
     ) -> TestResult<LinuxCoordinator> {
         let executor = LinuxExecutor::new(options).map_err(ctx("executor"))?;
         let config = CoordinatorConfig::new(runner.clone(), self.workspace()).with_lease_ttl(ttl);
+        Coordinator::new(self.store()?, executor, config).map_err(ctx("coordinator"))
+    }
+
+    /// A coordinator whose jobs carry `retry`.
+    fn retrying_coordinator(
+        &self,
+        runner: &RunnerId,
+        retry: RetryPolicy,
+    ) -> TestResult<LinuxCoordinator> {
+        let executor =
+            LinuxExecutor::new(LinuxExecutorOptions::default()).map_err(ctx("executor"))?;
+        let config = CoordinatorConfig::new(runner.clone(), self.workspace())
+            .with_lease_ttl(Duration::from_secs(3))
+            .with_retry(retry);
         Coordinator::new(self.store()?, executor, config).map_err(ctx("coordinator"))
     }
 
@@ -232,6 +250,11 @@ async fn echo_succeeds_and_is_recorded() -> TestResult {
     assert_eq!(result.exit, Some(ExitOutcome::Exited(0)));
     assert_eq!(result.stdout, b"hello\n");
     assert_eq!(result.stderr, b"oops\n");
+    assert_eq!(result.stdout_omitted, 0);
+    assert_eq!(result.stderr_omitted, 0);
+    assert!(!result.output_truncated);
+    assert_eq!(result.stdout_tail(), b"hello\n");
+    assert_eq!(result.stdout_total_bytes(), 6);
     assert!(!result.recovered);
     let report = result.sandbox.ok_or(TestError::Missing("sandbox report"))?;
     assert_eq!(report.filesystem, EnforcementState::NotEnforced);
@@ -257,6 +280,37 @@ async fn echo_succeeds_and_is_recorded() -> TestResult {
             LifecycleState::Succeeded
         ]
     );
+    Ok(())
+}
+
+#[tokio::test]
+async fn large_output_keeps_head_and_tail() -> TestResult {
+    let fixture = Fixture::new()?;
+    let runner = runner("runner-large-output")?;
+    let executor = LinuxExecutor::new(LinuxExecutorOptions::default()).map_err(ctx("executor"))?;
+    let mut config =
+        CoordinatorConfig::new(runner, fixture.workspace()).with_lease_ttl(Duration::from_secs(3));
+    config.output_capture = OutputCapture::new(8, 16);
+    let coordinator =
+        Coordinator::new(fixture.store()?, executor, config).map_err(ctx("coordinator"))?;
+    // 5 + 2000 * 10 + 3 = 20008 bytes of stdout, 3 bytes of stderr.
+    let script = "printf BEGIN; i=0; while [ $i -lt 2000 ]; do printf 0123456789; \
+                  i=$((i+1)); done; printf END; printf err >&2";
+    let handle = coordinator
+        .submit(sh(script)?)
+        .await
+        .map_err(ctx("submit"))?;
+    let result = wait(handle).await?;
+    assert_eq!(result.state, LifecycleState::Succeeded, "{result:?}");
+    assert!(result.output_truncated);
+    assert_eq!(result.stdout, b"BEGIN0127890123456789END");
+    assert_eq!(result.stdout_head(), b"BEGIN012");
+    assert_eq!(result.stdout_tail(), b"7890123456789END");
+    assert_eq!(result.stdout_omitted, 20008 - 24);
+    assert_eq!(result.stdout_total_bytes(), 20008);
+    assert_eq!(result.stderr, b"err");
+    assert_eq!(result.stderr_omitted, 0);
+    assert_eq!(result.stderr_tail(), b"err");
     Ok(())
 }
 
@@ -854,6 +908,475 @@ async fn cgroup_limits_are_enforced_and_reported() -> TestResult {
     assert!(
         cgroup.contains("harw-job-"),
         "job ran in its own cgroup: {cgroup}"
+    );
+    Ok(())
+}
+
+/// Reads the delegated cgroup root of the `#[ignore]`d cgroup scenarios.
+fn cgroup_root() -> TestResult<PathBuf> {
+    std::env::var_os("HARW_TEST_CGROUP_ROOT")
+        .map(PathBuf::from)
+        .ok_or(TestError::Missing("HARW_TEST_CGROUP_ROOT"))
+}
+
+/// The job cgroup name of an attempt (mirrors the executor's naming).
+fn job_cgroup_name(attempt: &AttemptId) -> String {
+    let safe: String = attempt
+        .as_str()
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() || matches!(ch, '_' | '.' | '-') {
+                ch
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    format!("harw-job-{safe}")
+}
+
+/// Waits until the job wrote its background child's PID to `path`.
+fn read_pid_file(path: &Path) -> TestResult<u32> {
+    let started = std::time::Instant::now();
+    while started.elapsed() < LIMIT {
+        if let Ok(text) = std::fs::read_to_string(path) {
+            if let Ok(pid) = text.trim().parse::<u32>() {
+                return Ok(pid);
+            }
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    Err(TestError::Missing("pid file"))
+}
+
+/// Whether `pid` is gone (or a zombie awaiting its reaper).
+fn process_gone(pid: u32) -> bool {
+    match std::fs::read_to_string(format!("/proc/{pid}/stat")) {
+        Err(_) => true,
+        Ok(stat) => stat
+            .rsplit(')')
+            .next()
+            .map(str::trim_start)
+            .is_some_and(|rest| rest.starts_with('Z') || rest.starts_with('X')),
+    }
+}
+
+/// Polls until `pid` is gone; `false` if it is still alive after [`LIMIT`].
+fn wait_gone(pid: u32) -> bool {
+    let started = std::time::Instant::now();
+    while started.elapsed() < LIMIT {
+        if process_gone(pid) {
+            return true;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    false
+}
+
+/// Kills and removes a job cgroup a test left behind.
+fn remove_job_cgroup(root: &Path, name: &str) -> TestResult {
+    let backend = CgroupV2Fs::open(root).map_err(ctx("open cgroup root"))?;
+    for _ in 0..100 {
+        let handle = match backend.reopen(name) {
+            Ok(handle) => handle,
+            Err(CgroupError::NotFound { .. }) => return Ok(()),
+            Err(error) => return Err(ctx("reopen cgroup")(error)),
+        };
+        let _ = backend.kill(&handle);
+        match backend.remove(handle) {
+            Ok(()) => return Ok(()),
+            Err(CgroupError::Busy { .. }) => std::thread::sleep(Duration::from_millis(20)),
+            Err(error) => return Err(ctx("remove cgroup")(error)),
+        }
+    }
+    Err(TestError::Unexpected(format!(
+        "job cgroup {name} stayed busy"
+    )))
+}
+
+// ── Retry and requeue (Job-Runtime-Doc §6) ──────────────────────────────────
+
+/// A retry policy of `max_attempts` with a constant `delay`.
+fn retry_policy(max_attempts: u32, delay: SignedDuration) -> TestResult<RetryPolicy> {
+    RetryPolicy::try_new(max_attempts, delay, 2.0, delay).map_err(ctx("retry policy"))
+}
+
+/// Polls until the attempt sidecar exists.
+async fn wait_for_attempt(
+    store: &FsJobRecordStore,
+    attempt: &str,
+) -> TestResult<AttemptRecord<LinuxRecoveryIdentity>> {
+    let started = std::time::Instant::now();
+    while started.elapsed() < LIMIT {
+        if let Some(record) = read_attempt(store, attempt)? {
+            return Ok(record);
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    Err(TestError::Unexpected(format!(
+        "attempt {attempt} was never persisted"
+    )))
+}
+
+/// The id of attempt `number` of the claim that ran attempt `first`.
+fn retry_id(
+    store: &FsJobRecordStore,
+    job: &WorkId,
+    first: &AttemptId,
+    number: u32,
+) -> TestResult<AttemptId> {
+    let record = read_attempt(store, first.as_str())?.ok_or(TestError::Missing("attempt 1"))?;
+    retry_attempt_id(job, record.epoch, number).map_err(ctx("retry attempt id"))
+}
+
+fn runs(fixture: &Fixture) -> TestResult<usize> {
+    let text =
+        std::fs::read_to_string(fixture.workspace().join("runs")).map_err(ctx("runs file"))?;
+    Ok(text.lines().count())
+}
+
+#[tokio::test]
+async fn failed_attempt_is_retried_and_the_second_attempt_succeeds() -> TestResult {
+    let fixture = Fixture::new()?;
+    let runner = runner("runner-retry")?;
+    let coordinator =
+        fixture.retrying_coordinator(&runner, retry_policy(3, SignedDuration::from_millis(50))?)?;
+    // The first run leaves a marker and fails; the second finds it.
+    let script = "echo run >> runs; \
+                  if [ -e marker ]; then echo second; else touch marker; exit 7; fi";
+    let handle = coordinator
+        .submit(sh(script)?)
+        .await
+        .map_err(ctx("submit"))?;
+    let job_id = handle.id().clone();
+    let first = handle.attempt_id().clone();
+    let result = wait(handle).await?;
+    assert_eq!(result.state, LifecycleState::Succeeded, "{result:?}");
+    assert_eq!(result.exit, Some(ExitOutcome::Exited(0)));
+    assert_eq!(result.stdout, b"second\n");
+    assert_eq!(result.reason, None);
+    assert_eq!(runs(&fixture)?, 2);
+
+    let store = coordinator.store();
+    let second = retry_id(store, &job_id, &first, 2)?;
+    assert_eq!(result.attempt_id, second, "the retry decided the outcome");
+    assert_eq!(job_state(store, &job_id)?, JobState::Completed);
+
+    let attempt1 = read_attempt(store, first.as_str())?.ok_or(TestError::Missing("attempt 1"))?;
+    assert_eq!(attempt1.state, LifecycleState::Failed);
+    assert_eq!(attempt1.exit, Some(ExitOutcome::Exited(7)));
+    let attempt2 = read_attempt(store, second.as_str())?.ok_or(TestError::Missing("attempt 2"))?;
+    assert_eq!(attempt2.state, LifecycleState::Succeeded);
+    assert_eq!(
+        attempt2.epoch, attempt1.epoch,
+        "retries run under one claim"
+    );
+    let retry = attempt2
+        .transitions
+        .first()
+        .ok_or(TestError::Missing("retry transition"))?;
+    assert_eq!(retry.source_state(), LifecycleState::Failed);
+    assert_eq!(retry.event(), LifecycleEvent::Retry);
+    let states: Vec<_> = attempt2
+        .transitions
+        .iter()
+        .map(|transition| transition.target_state())
+        .collect();
+    assert_eq!(
+        states,
+        [
+            LifecycleState::Queued,
+            LifecycleState::Claimed,
+            LifecycleState::Starting,
+            LifecycleState::Running,
+            LifecycleState::Succeeded
+        ]
+    );
+    let third = retry_id(store, &job_id, &first, 3)?;
+    assert!(read_attempt(store, third.as_str())?.is_none());
+    Ok(())
+}
+
+#[tokio::test]
+async fn cancelled_attempt_is_never_retried() -> TestResult {
+    let fixture = Fixture::new()?;
+    let runner = runner("runner-retry-cancel")?;
+    let coordinator =
+        fixture.retrying_coordinator(&runner, retry_policy(3, SignedDuration::from_millis(50))?)?;
+    let handle = coordinator
+        .submit(sh("echo run >> runs; sleep 30")?)
+        .await
+        .map_err(ctx("submit"))?;
+    let job_id = handle.id().clone();
+    let first = handle.attempt_id().clone();
+    wait_for_running(coordinator.store(), first.as_str()).await?;
+    handle.cancel();
+    let result = wait(handle).await?;
+    assert_eq!(result.state, LifecycleState::Cancelled, "{result:?}");
+    assert_eq!(result.cancellation, Some(CancellationCause::User));
+    assert_eq!(result.attempt_id, first);
+
+    let store = coordinator.store();
+    assert_eq!(job_state(store, &job_id)?, JobState::Cancelled);
+    let second = retry_id(store, &job_id, &first, 2)?;
+    // Give a (wrongly) scheduled retry the time to show up.
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert!(
+        read_attempt(store, second.as_str())?.is_none(),
+        "a cancelled attempt must not be retried"
+    );
+    assert_eq!(runs(&fixture)?, 1);
+    Ok(())
+}
+
+#[tokio::test]
+async fn retry_limit_ends_the_job_failed() -> TestResult {
+    let fixture = Fixture::new()?;
+    let runner = runner("runner-retry-limit")?;
+    let coordinator =
+        fixture.retrying_coordinator(&runner, retry_policy(2, SignedDuration::from_millis(20))?)?;
+    let handle = coordinator
+        .submit(sh("echo run >> runs; exit 5")?)
+        .await
+        .map_err(ctx("submit"))?;
+    let job_id = handle.id().clone();
+    let first = handle.attempt_id().clone();
+    let result = wait(handle).await?;
+    assert_eq!(result.state, LifecycleState::Failed, "{result:?}");
+    assert_eq!(result.exit, Some(ExitOutcome::Exited(5)));
+    assert_eq!(
+        result.reason.as_deref(),
+        Some("exited with status 5 (attempt 2)")
+    );
+    assert_eq!(runs(&fixture)?, 2, "max_attempts bounds the runs");
+
+    let store = coordinator.store();
+    let second = retry_id(store, &job_id, &first, 2)?;
+    assert_eq!(result.attempt_id, second);
+    let stored = store.load(&job_id).map_err(ctx("load"))?;
+    assert_eq!(stored.job.state, JobState::Failed);
+    assert!(matches!(
+        stored.completion.map(|completion| completion.outcome),
+        Some(JobOutcome::Failed { reason }) if reason.contains("exited with status 5 (attempt 2)")
+    ));
+    for (attempt, number) in [(&first, 1), (&second, 2)] {
+        let record = read_attempt(store, attempt.as_str())?.ok_or(TestError::Missing("attempt"))?;
+        assert_eq!(record.state, LifecycleState::Failed, "attempt {number}");
+    }
+    let third = retry_id(store, &job_id, &first, 3)?;
+    assert!(read_attempt(store, third.as_str())?.is_none());
+    Ok(())
+}
+
+#[tokio::test]
+async fn cancel_during_the_backoff_ends_the_job_cancelled() -> TestResult {
+    let fixture = Fixture::new()?;
+    let runner = runner("runner-retry-backoff")?;
+    let coordinator =
+        fixture.retrying_coordinator(&runner, retry_policy(2, SignedDuration::from_secs(60))?)?;
+    let handle = coordinator
+        .submit(sh("echo run >> runs; exit 1")?)
+        .await
+        .map_err(ctx("submit"))?;
+    let job_id = handle.id().clone();
+    let first = handle.attempt_id().clone();
+    let store = coordinator.store();
+    wait_for_attempt(store, first.as_str()).await?;
+    let second = retry_id(store, &job_id, &first, 2)?;
+    // Attempt 2 is persisted before its (60 s) backoff starts.
+    let pending = wait_for_attempt(store, second.as_str()).await?;
+    assert_eq!(pending.state, LifecycleState::Claimed);
+    handle.cancel();
+    let result = wait(handle).await?;
+    assert_eq!(result.state, LifecycleState::Cancelled, "{result:?}");
+    assert_eq!(result.attempt_id, second);
+    assert_eq!(result.exit, None, "attempt 2 never ran");
+    assert_eq!(job_state(store, &job_id)?, JobState::Cancelled);
+    assert_eq!(runs(&fixture)?, 1);
+    Ok(())
+}
+
+#[tokio::test]
+async fn recovery_resumes_the_latest_retry_attempt() -> TestResult {
+    let fixture = Fixture::new()?;
+    let runner = runner("runner-retry-recover")?;
+    let coordinator =
+        fixture.retrying_coordinator(&runner, retry_policy(3, SignedDuration::from_millis(50))?)?;
+    let mut sleeper = spawn_sleep()?;
+    // Attempt 1 failed; attempt 2 was running when the runner stopped.
+    let first = plant_running_attempt(&coordinator, &runner, |context| capture(&sleeper, context))?;
+    let store = coordinator.store();
+    let mut attempt1 =
+        read_attempt(store, first.attempt_id.as_str())?.ok_or(TestError::Missing("attempt 1"))?;
+    let second_id = retry_attempt_id(&first.job_id, attempt1.epoch, 2).map_err(ctx("id"))?;
+    let now = Timestamp::now();
+    let mut attempt2 = AttemptRecord::claimed(
+        first.job_id.clone(),
+        second_id.clone(),
+        runner.clone(),
+        attempt1.epoch,
+        now,
+    )
+    .map_err(ctx("attempt 2"))?;
+    attempt2.identity = attempt1.identity.take();
+    attempt1
+        .apply(LifecycleEvent::Fail, now)
+        .map_err(ctx("fail attempt 1"))?;
+    attempt2.transitions.insert(
+        0,
+        LifecycleTransition::apply(LifecycleState::Failed, LifecycleEvent::Retry)
+            .map_err(ctx("retry"))?,
+    );
+    for event in [LifecycleEvent::Start, LifecycleEvent::Spawned] {
+        attempt2.apply(event, now).map_err(ctx("attempt 2 event"))?;
+    }
+    for record in [&attempt1, &attempt2] {
+        let bytes = record.to_bytes().map_err(ctx("encode"))?;
+        store
+            .write_attempt(record.attempt_id.as_str(), &bytes)
+            .map_err(ctx("write attempt"))?;
+    }
+
+    let recovered = coordinator.recover(&runner).await.map_err(ctx("recover"))?;
+    let job = recovered
+        .into_iter()
+        .next()
+        .ok_or(TestError::Missing("recovered job"))?;
+    assert_eq!(job.decision, RecoveryDecision::Reattached);
+    let handle = job.handle.ok_or(TestError::Missing("handle"))?;
+    assert_eq!(
+        handle.attempt_id(),
+        &second_id,
+        "the latest attempt is resumed"
+    );
+    assert!(coordinator.cancel(&first.job_id));
+    let result = wait(handle).await?;
+    assert_eq!(result.state, LifecycleState::Cancelled, "{result:?}");
+    assert_eq!(result.attempt_id, second_id);
+    assert!(result.recovered);
+    assert_eq!(job_state(store, &first.job_id)?, JobState::Cancelled);
+    sleeper.wait().map_err(ctx("reap"))?;
+    Ok(())
+}
+
+// ── Recovered job cgroup (needs a delegated root) ───────────────────────────
+
+/// Starts `sleep 30 & …; wait` in a job cgroup, lets the coordinator
+/// "crash", and returns the job, its attempt and the background child.
+fn start_cgroup_job_and_crash(
+    fixture: &Fixture,
+    runner: &RunnerId,
+    options: LinuxExecutorOptions,
+) -> TestResult<(WorkId, AttemptId, u32)> {
+    let crashed = current_thread()?;
+    let (job_id, attempt_id) = crashed.block_on(async {
+        let coordinator = fixture.coordinator(runner, options, Duration::from_secs(5))?;
+        let handle = coordinator
+            // No output: the crashed runtime closes the pipes' read ends.
+            .submit(sh("sleep 30 & echo $! > child.pid; wait")?)
+            .await
+            .map_err(ctx("submit"))?;
+        wait_for_running(coordinator.store(), handle.attempt_id().as_str()).await?;
+        Ok::<_, TestError>((handle.id().clone(), handle.attempt_id().clone()))
+    })?;
+    drop(crashed);
+    let child = read_pid_file(&fixture.workspace().join("child.pid"))?;
+    Ok((job_id, attempt_id, child))
+}
+
+/// Set `HARW_TEST_CGROUP_ROOT` to a delegated cgroup v2 directory and run
+/// with `--ignored`.
+#[test]
+#[ignore = "needs a delegated cgroup v2 root in HARW_TEST_CGROUP_ROOT"]
+fn recovered_cancel_kills_the_reopened_job_cgroup() -> TestResult {
+    let root = cgroup_root()?;
+    let fixture = Fixture::new()?;
+    let runner = runner("runner-cgroup-recover")?;
+    let options = LinuxExecutorOptions {
+        cgroup_root: Some(root.clone()),
+        ..fixture.shim_options()
+    };
+    let (job_id, attempt_id, child) =
+        start_cgroup_job_and_crash(&fixture, &runner, options.clone())?;
+    assert!(!process_gone(child), "the background child runs");
+
+    let restarted = current_thread()?;
+    restarted.block_on(async {
+        let coordinator = fixture.coordinator(&runner, options, Duration::from_secs(5))?;
+        let recovered = coordinator.recover(&runner).await.map_err(ctx("recover"))?;
+        let job = recovered
+            .into_iter()
+            .next()
+            .ok_or(TestError::Missing("recovered job"))?;
+        assert_eq!(job.job_id, job_id);
+        assert_eq!(job.decision, RecoveryDecision::Reattached);
+        let handle = job.handle.ok_or(TestError::Missing("handle"))?;
+        handle.cancel();
+        let result = wait(handle).await?;
+        assert_eq!(result.state, LifecycleState::Cancelled, "{result:?}");
+        assert!(
+            !result
+                .reason
+                .as_deref()
+                .is_some_and(|reason| reason.contains("recovery:")),
+            "the job cgroup was reopened: {result:?}"
+        );
+        Ok::<_, TestError>(())
+    })?;
+    assert!(
+        wait_gone(child),
+        "the descendant died with the reopened job cgroup"
+    );
+    assert!(
+        !root.join(job_cgroup_name(&attempt_id)).exists(),
+        "the recovered job cgroup was removed"
+    );
+    Ok(())
+}
+
+/// Set `HARW_TEST_CGROUP_ROOT` to a delegated cgroup v2 directory and run
+/// with `--ignored`.
+#[test]
+#[ignore = "needs a delegated cgroup v2 root in HARW_TEST_CGROUP_ROOT"]
+fn recovered_job_without_its_cgroup_falls_back_to_the_process() -> TestResult {
+    let root = cgroup_root()?;
+    let fixture = Fixture::new()?;
+    let runner = runner("runner-cgroup-fallback")?;
+    let options = LinuxExecutorOptions {
+        cgroup_root: Some(root.clone()),
+        ..fixture.shim_options()
+    };
+    let (_job_id, attempt_id, child) = start_cgroup_job_and_crash(&fixture, &runner, options)?;
+
+    // The restarted runner has no cgroup root: process-only termination.
+    let restarted = current_thread()?;
+    let outcome = restarted.block_on(async {
+        let coordinator =
+            fixture.coordinator(&runner, fixture.shim_options(), Duration::from_secs(5))?;
+        let recovered = coordinator.recover(&runner).await.map_err(ctx("recover"))?;
+        let job = recovered
+            .into_iter()
+            .next()
+            .ok_or(TestError::Missing("recovered job"))?;
+        assert_eq!(job.decision, RecoveryDecision::Reattached);
+        let handle = job.handle.ok_or(TestError::Missing("handle"))?;
+        handle.cancel();
+        wait(handle).await
+    });
+    let name = job_cgroup_name(&attempt_id);
+    let survived = !process_gone(child);
+    remove_job_cgroup(&root, &name)?;
+    let result = outcome?;
+    assert_eq!(result.state, LifecycleState::Cancelled, "{result:?}");
+    assert!(
+        result.reason.as_deref().is_some_and(|reason| {
+            reason.contains("recovery: job cgroup") && reason.contains("not reopened")
+        }),
+        "the fallback is recorded: {result:?}"
+    );
+    assert!(
+        survived,
+        "process-only termination does not reach the descendant"
     );
     Ok(())
 }

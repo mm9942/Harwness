@@ -36,6 +36,15 @@
 //!   der Rolle); Ergebnis und Verlauf landen an der Karte. Ohne
 //!   [`JobWorkerContext::knowledge`] bleiben diese Jobs unberührt.
 //!
+//! * [`JobKind::Custom`] named `work_driver`
+//!   (`harw_runtime::job_ledger::WORK_DRIVER_JOB_KIND`) — ein Lauf des
+//!   Arbeitstreibers (Modul [`work_driver_job`]): ein Claim fährt die Runden
+//!   von `harw_plan_bridge::WorkDriver` bis zu Vorschlag, Eskalation oder
+//!   Aufgabe; der Rundenzustand liegt im Sidecar von `harw_ops::work_driver`.
+//!   Solche Läufe laufen in einer eigenen Lane (`WorkDriverLane`, höchstens
+//!   `MAX_CONCURRENT_WORK_DRIVER_RUNS` zugleich) neben den übrigen Arten,
+//!   statt sie für die ganze Laufdauer zu blockieren.
+//!
 //! # Runtime assembly (W2d-2 J1, docs/design/runtime-contracts.md §extension)
 //! Every executed job is assembled through
 //! `crate::runtime_jobs::job_assembly` and gets its root session from
@@ -62,7 +71,9 @@
 //! [`JobWorkerContext`].
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::future::Future;
 use std::path::{Component, Path, PathBuf};
+use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 use std::time::SystemTime;
 
@@ -85,7 +96,7 @@ use harw_protocol::{SessionEvent, TurnEvent};
 use harw_registry_defaults::profile::{IdentityOverrides, RegistryProfile};
 use harw_runtime::{RuntimeAssembly, RuntimeNarrowing};
 use harw_session_store::{ClaimRequest, JobListQuery, JobStore, TranscriptStore};
-use harw_types::{SessionId, ThreadRef};
+use harw_types::{SessionId, ThreadRef, WorkId};
 
 use crate::runtime_jobs::{JobAssemblyInputs, JobEntry, job_assembly, job_principal};
 use jiff::{SignedDuration, Timestamp};
@@ -93,6 +104,9 @@ use tokio::sync::watch;
 
 #[path = "job_worker_kanban.rs"]
 mod kanban_card;
+
+#[path = "job_worker_work_driver.rs"]
+mod work_driver_job;
 
 const WORKER_ID: &str = "harw-serve-job-worker";
 const LEASE_TTL_SECONDS: i64 = 120;
@@ -256,6 +270,245 @@ impl PlanNodeServices {
     }
 }
 
+/// Upper bound of `work_driver` runs one worker drives at the same time.
+///
+/// # Description
+/// A work-driver run holds its claim for the whole multi-round run and fans
+/// out worker turns itself, so two concurrent runs already saturate a typical
+/// provider. The bound is enforced by [`WorkDriverLane`]: while the lane is
+/// full, further `work_driver` jobs are not claimed and stay `Ready`.
+const MAX_CONCURRENT_WORK_DRIVER_RUNS: usize = 2;
+
+/// Everything one claimed job needs to run; built per claim inside the
+/// [`DurableJobRunner`] operation and handed to the [`ClaimExecutor`].
+struct ClaimTask {
+    claim: JobClaim,
+    input: serde_json::Value,
+    provider: Arc<dyn ModelProvider>,
+    job_store: Arc<JobStore>,
+    plan_services: Option<Arc<PlanNodeServices>>,
+    control: Arc<WorkerExecutionControl>,
+    context: Arc<JobWorkerContext>,
+    kanban: Option<kanban_card::KanbanGate>,
+}
+
+/// The outcome future of one claimed job.
+type ClaimFuture = Pin<Box<dyn Future<Output = JobOutcome> + Send>>;
+
+/// Turns a claimed job into its outcome future. Production always uses
+/// [`execute_claim`]; tests substitute a controllable executor to exercise
+/// the lanes without real model turns.
+type ClaimExecutor = Arc<dyn Fn(ClaimTask) -> ClaimFuture + Send + Sync>;
+
+/// The services every poll shares; cloning only clones pointers.
+#[derive(Clone)]
+struct WorkerServices {
+    store: Arc<JobStore>,
+    executions: Arc<JobExecutionRegistry>,
+    provider: Arc<dyn ModelProvider>,
+    plan_services: Option<Arc<PlanNodeServices>>,
+    context: Arc<JobWorkerContext>,
+    executor: ClaimExecutor,
+}
+
+impl WorkerServices {
+    fn new(
+        store: Arc<JobStore>,
+        executions: Arc<JobExecutionRegistry>,
+        provider: Arc<dyn ModelProvider>,
+        plan_services: Option<Arc<PlanNodeServices>>,
+        context: Arc<JobWorkerContext>,
+    ) -> Self {
+        Self {
+            store,
+            executions,
+            provider,
+            plan_services,
+            context,
+            executor: Arc::new(|task: ClaimTask| -> ClaimFuture { Box::pin(execute_claim(task)) }),
+        }
+    }
+
+    // Claims `work_id` and drives it to its durable commit under
+    // `DurableJobRunner` (claim, registration under the fenced lease, lease
+    // heartbeat, commit). True once an outcome was committed.
+    async fn run_one(
+        &self,
+        work_id: WorkId,
+        input: serde_json::Value,
+        kanban: Option<kanban_card::KanbanGate>,
+    ) -> bool {
+        let runner = DurableJobRunner::new(Arc::clone(&self.store), Arc::clone(&self.executions));
+        let services = self.clone();
+        let result = runner
+            .run(
+                &work_id,
+                &ClaimRequest {
+                    worker_id: WORKER_ID.to_owned(),
+                    lease_ttl: SignedDuration::from_secs(LEASE_TTL_SECONDS),
+                    now: Timestamp::now(),
+                },
+                move |claim| {
+                    let control = WorkerExecutionControl::new();
+                    let task = ClaimTask {
+                        claim,
+                        input,
+                        provider: services.provider,
+                        job_store: services.store,
+                        plan_services: services.plan_services,
+                        control: Arc::clone(&control),
+                        context: services.context,
+                        kanban,
+                    };
+                    (
+                        control as Arc<dyn ExecutionControl>,
+                        (services.executor)(task),
+                    )
+                },
+            )
+            .await;
+        match result {
+            Ok(_) => true,
+            Err(error) => {
+                tracing::warn!(work_id = %work_id.as_str(), error = %error, "durable job execution failed");
+                false
+            }
+        }
+    }
+}
+
+/// The separate lane `work_driver` runs execute in.
+///
+/// # Description
+/// A work-driver run holds one claim for its whole multi-round run. Driven
+/// inline it would block every other job kind (kanban cards, plan nodes,
+/// prompts) for that long, so each run is spawned onto its own `tokio` task
+/// while the poll keeps claiming other kinds. Inside that task the run is
+/// driven by its own [`DurableJobRunner`], which keeps the lease alive with
+/// its heartbeat, registers the fenced cancellation control in the shared
+/// [`JobExecutionRegistry`] (operator cancellation reaches the run exactly as
+/// before) and commits the outcome under the same fence.
+///
+/// At most [`MAX_CONCURRENT_WORK_DRIVER_RUNS`] runs are in flight: a run only
+/// starts with a semaphore permit, and a job for which no permit is free is
+/// not claimed at all — it stays `Ready` for a later poll instead of being
+/// claimed and parked under a lease.
+///
+/// Dropping the lane (or [`WorkDriverLane::shutdown`]) aborts every in-flight
+/// run: the dropped runner future releases its execution binding, cancels
+/// the job token and stops renewing, so the lease lapses and the store's
+/// expiry reconciliation takes over — the same path as a worker process that
+/// stops mid-run. No outcome is invented for an interrupted run.
+///
+/// # Concurrency
+/// Owned by one worker loop; not shared.
+struct WorkDriverLane {
+    permits: Arc<tokio::sync::Semaphore>,
+    runs: tokio::task::JoinSet<bool>,
+    // Work IDs of spawned runs until their task ends, so a run that has not
+    // claimed yet is never spawned a second time.
+    in_flight: Arc<Mutex<BTreeSet<String>>>,
+}
+
+// Removes a run's work ID from the lane's in-flight set when its task ends,
+// including by abort or panic.
+struct InFlightEntry {
+    in_flight: Arc<Mutex<BTreeSet<String>>>,
+    work_id: String,
+}
+
+impl Drop for InFlightEntry {
+    fn drop(&mut self) {
+        if let Ok(mut in_flight) = self.in_flight.lock() {
+            in_flight.remove(&self.work_id);
+        }
+    }
+}
+
+impl WorkDriverLane {
+    fn new(limit: usize) -> Self {
+        Self {
+            permits: Arc::new(tokio::sync::Semaphore::new(limit)),
+            runs: tokio::task::JoinSet::new(),
+            in_flight: Arc::new(Mutex::new(BTreeSet::new())),
+        }
+    }
+
+    // Spawns `run` for `work_id` if a permit is free and the job is not in
+    // flight already. Without a permit nothing is spawned and nothing is
+    // claimed.
+    fn try_spawn<F>(&mut self, work_id: &WorkId, run: F) -> bool
+    where
+        F: Future<Output = bool> + Send + 'static,
+    {
+        let key = work_id.as_str().to_owned();
+        let Ok(mut in_flight) = self.in_flight.lock() else {
+            return false;
+        };
+        if in_flight.contains(&key) {
+            return false;
+        }
+        let Ok(permit) = Arc::clone(&self.permits).try_acquire_owned() else {
+            tracing::debug!(work_id = %key, "work-driver lane full; job stays ready");
+            return false;
+        };
+        in_flight.insert(key.clone());
+        drop(in_flight);
+        let entry = InFlightEntry {
+            in_flight: Arc::clone(&self.in_flight),
+            work_id: key,
+        };
+        self.runs.spawn(async move {
+            let _permit = permit;
+            let _entry = entry;
+            run.await
+        });
+        true
+    }
+
+    // Collects finished runs without waiting; returns how many committed.
+    fn reap(&mut self) -> usize {
+        let mut committed = 0;
+        while let Some(joined) = self.runs.try_join_next() {
+            committed += Self::committed(joined);
+        }
+        committed
+    }
+
+    // Waits for every in-flight run; returns how many committed.
+    #[cfg(test)]
+    async fn drain(&mut self) -> usize {
+        let mut committed = 0;
+        while let Some(joined) = self.runs.join_next().await {
+            committed += Self::committed(joined);
+        }
+        committed
+    }
+
+    // Aborts every in-flight run and waits until the tasks are gone.
+    async fn shutdown(&mut self) {
+        if !self.runs.is_empty() {
+            tracing::info!(
+                runs = self.runs.len(),
+                "worker shutdown: interrupting in-flight work-driver runs"
+            );
+        }
+        self.runs.shutdown().await;
+    }
+
+    fn committed(joined: Result<bool, tokio::task::JoinError>) -> usize {
+        match joined {
+            Ok(committed) => usize::from(committed),
+            Err(error) => {
+                if !error.is_cancelled() {
+                    tracing::warn!(error = %error, "work-driver run task failed");
+                }
+                0
+            }
+        }
+    }
+}
+
 /// Runs one deterministic poll of Ready durable jobs.
 ///
 /// # Description
@@ -265,6 +518,10 @@ impl PlanNodeServices {
 /// job is *never* skipped, even when `plan_services` is `None` — it then
 /// terminates as [`JobOutcome::Blocked`] with a visible reason, because a
 /// silently skipped plan job leaves its node `InProgress` forever.
+///
+/// `work_driver` jobs run in their own lane (see `WorkDriverLane`) and do
+/// not hold up the other kinds; this one-shot poll waits for the driver runs
+/// it started before returning, so it leaves no run behind.
 ///
 /// # Arguments
 /// - `store` (`Arc<JobStore>`): the durable job store; pointer is cloned.
@@ -280,8 +537,12 @@ impl PlanNodeServices {
 /// The number of jobs that reached a terminal state in this poll.
 ///
 /// # Concurrency
-/// Jobs are executed sequentially inside one poll; every execution is fenced by
-/// [`DurableJobRunner`].
+/// Non-driver jobs are executed sequentially inside one poll; up to
+/// `MAX_CONCURRENT_WORK_DRIVER_RUNS` (2) driver runs proceed alongside them.
+/// Every execution is fenced by [`DurableJobRunner`].
+///
+/// Test entry point: production polls through `drive_worker_loop`.
+#[cfg(test)]
 pub async fn run_job_worker_once(
     store: Arc<JobStore>,
     executions: Arc<JobExecutionRegistry>,
@@ -289,75 +550,61 @@ pub async fn run_job_worker_once(
     plan_services: Option<Arc<PlanNodeServices>>,
     context: Arc<JobWorkerContext>,
 ) -> usize {
-    let page = match store.list(&JobListQuery {
+    let services = WorkerServices::new(store, executions, provider, plan_services, context);
+    let mut lane = WorkDriverLane::new(MAX_CONCURRENT_WORK_DRIVER_RUNS);
+    let completed = poll_ready_jobs(&services, &mut lane).await;
+    completed + lane.drain().await
+}
+
+// One poll: finished driver runs are collected, `work_driver` jobs are handed
+// to the lane (or left Ready when it is full), every other job is driven to
+// its commit in list order. Returns the jobs that reached a terminal state.
+async fn poll_ready_jobs(services: &WorkerServices, lane: &mut WorkDriverLane) -> usize {
+    let mut completed = lane.reap();
+    let page = match services.store.list(&JobListQuery {
         states: Some(vec![JobState::Ready]),
         ..JobListQuery::default()
     }) {
         Ok(page) => page,
         Err(error) => {
             tracing::warn!(error = %error, "durable job poll failed");
-            return 0;
+            return completed;
         }
     };
 
-    let runner = DurableJobRunner::new(Arc::clone(&store), executions);
-    let mut completed = 0;
     for record in page.jobs {
         if record.not_before > Timestamp::now() || !is_supported_kind(&record.job.kind) {
+            continue;
+        }
+        // Arbeitstreiber: eigene Lane, damit ein langer Lauf die übrigen
+        // Arten nicht blockiert; ohne freien Platz bleibt der Job `Ready`.
+        if work_driver_job::is_work_driver_kind(&record.job.kind) {
+            let run_services = services.clone();
+            let work_id = record.job.id.clone();
+            let input = record.input.clone();
+            lane.try_spawn(&record.job.id, async move {
+                run_services.run_one(work_id, input, None).await
+            });
             continue;
         }
         // Kanban-Karten: Freigabe vor dem Claim prüfen (gebunden an die
         // gelesene Revision); ohne Wissensspeicher bleiben sie liegen.
         let kanban = if kanban_card::is_kanban_kind(&record.job.kind) {
-            match kanban_card::gate(&store, &record, &context) {
+            match kanban_card::gate(&services.store, &record, &services.context) {
                 Some(gate) => Some(gate),
                 None => continue,
             }
         } else {
             None
         };
-
-        let work_id = record.job.id.clone();
-        let input = record.input.clone();
-        let provider = Arc::clone(&provider);
-        let job_store = Arc::clone(&store);
-        let services = plan_services.as_ref().map(Arc::clone);
-        let context = Arc::clone(&context);
-        let result = runner
-            .run(
-                &work_id,
-                &ClaimRequest {
-                    worker_id: WORKER_ID.to_owned(),
-                    lease_ttl: SignedDuration::from_secs(LEASE_TTL_SECONDS),
-                    now: Timestamp::now(),
-                },
-                move |claim| {
-                    let control = WorkerExecutionControl::new();
-                    let operation_control = Arc::clone(&control);
-                    (
-                        control as Arc<dyn ExecutionControl>,
-                        execute_claim(
-                            claim,
-                            input,
-                            provider,
-                            job_store,
-                            services,
-                            operation_control,
-                            context,
-                            kanban,
-                        ),
-                    )
-                },
-            )
-            .await;
-        match result {
-            Ok(_) => completed += 1,
-            Err(error) => {
-                tracing::warn!(work_id = %work_id.as_str(), error = %error, "durable job execution failed")
-            }
+        if services
+            .run_one(record.job.id.clone(), record.input.clone(), kanban)
+            .await
+        {
+            completed += 1;
         }
     }
-    completed
+    completed + lane.reap()
 }
 
 /// Polls for durable jobs until `shutdown` is set.
@@ -365,7 +612,10 @@ pub async fn run_job_worker_once(
 /// # Description
 /// This is intentionally a small composition loop. `harw serve` supplies the
 /// shutdown watch channel; all job execution remains fenced by
-/// [`DurableJobRunner`].
+/// [`DurableJobRunner`]. `work_driver` runs live in a lane owned by this loop
+/// (see `WorkDriverLane`) and outlast a single poll; once `shutdown` is
+/// observed, in-flight driver runs are interrupted before the loop returns
+/// (their leases lapse; nothing is committed for them).
 ///
 /// # Arguments
 /// - `store` (`Arc<JobStore>`): the durable job store.
@@ -376,43 +626,46 @@ pub async fn run_job_worker_once(
 /// - `shutdown` (`watch::Receiver<bool>`): set to `true` to end the loop.
 /// - `context` (`Arc<JobWorkerContext>`): transcript root, configured
 ///   submitters and runtime root, handed to every poll; see
-///   [`run_job_worker_once`].
+///   `run_job_worker_once` (tests) and `drive_worker_loop`.
 ///
 /// # Returns
 /// Nothing; returns once `shutdown` is observed as `true` or its sender is
 /// dropped.
 ///
 /// # Concurrency
-/// Intended to be driven by a dedicated `tokio` task.
+/// Intended to be driven by a dedicated `tokio` task. Driver runs are
+/// spawned onto the same runtime; dropping this future aborts them.
 pub async fn run_job_worker(
     store: Arc<JobStore>,
     executions: Arc<JobExecutionRegistry>,
     provider: Arc<dyn ModelProvider>,
     plan_services: Option<Arc<PlanNodeServices>>,
-    mut shutdown: watch::Receiver<bool>,
+    shutdown: watch::Receiver<bool>,
     context: Arc<JobWorkerContext>,
 ) {
+    let services = WorkerServices::new(store, executions, provider, plan_services, context);
+    drive_worker_loop(&services, shutdown).await;
+}
+
+// The loop behind `run_job_worker`; the driver lane lives exactly as long as
+// the loop.
+async fn drive_worker_loop(services: &WorkerServices, mut shutdown: watch::Receiver<bool>) {
+    let mut lane = WorkDriverLane::new(MAX_CONCURRENT_WORK_DRIVER_RUNS);
     loop {
         if *shutdown.borrow() {
-            return;
+            break;
         }
-        let _ = run_job_worker_once(
-            Arc::clone(&store),
-            Arc::clone(&executions),
-            Arc::clone(&provider),
-            plan_services.as_ref().map(Arc::clone),
-            Arc::clone(&context),
-        )
-        .await;
+        let _ = poll_ready_jobs(services, &mut lane).await;
         tokio::select! {
             changed = shutdown.changed() => {
                 if changed.is_err() || *shutdown.borrow() {
-                    return;
+                    break;
                 }
             }
             _ = tokio::time::sleep(std::time::Duration::from_millis(250)) => {}
         }
     }
+    lane.shutdown().await;
 }
 
 // Kinds this worker knows how to execute. Every other kind belongs to another
@@ -425,6 +678,7 @@ fn is_supported_kind(kind: &JobKind) -> bool {
             name == PLAN_NODE_JOB_KIND
                 || name == harw_channel_telegram::TELEGRAM_WORK_REQUEST_JOB_KIND
                 || name == harw_runtime::job_ledger::KANBAN_JOB_KIND
+                || name == harw_runtime::job_ledger::WORK_DRIVER_JOB_KIND
         }
     }
 }
@@ -446,25 +700,36 @@ fn is_telegram_work_kind(kind: &JobKind) -> bool {
 // Claim dispatch
 // ──────────────────────────────────────────────────────────────────────────────
 
-// Acht Argumente: der Dispatcher reicht jeden Dienst nur an genau einen
-// Ausführungspfad weiter; ein Bündel-Struct hätte keinen weiteren Nutzer.
-#[allow(clippy::too_many_arguments)]
-async fn execute_claim(
-    claim: JobClaim,
-    input: serde_json::Value,
-    provider: Arc<dyn ModelProvider>,
-    job_store: Arc<JobStore>,
-    plan_services: Option<Arc<PlanNodeServices>>,
-    control: Arc<WorkerExecutionControl>,
-    context: Arc<JobWorkerContext>,
-    kanban: Option<kanban_card::KanbanGate>,
-) -> JobOutcome {
+// Der Dispatcher reicht jeden Dienst aus dem `ClaimTask` an genau einen
+// Ausführungspfad weiter.
+async fn execute_claim(task: ClaimTask) -> JobOutcome {
+    let ClaimTask {
+        claim,
+        input,
+        provider,
+        job_store,
+        plan_services,
+        control,
+        context,
+        kanban,
+    } = task;
     let outcome = if let Some(gate) = kanban {
         kanban_card::execute_kanban_claim(
             claim,
             gate,
             provider,
             job_store,
+            Arc::clone(&control),
+            &context,
+        )
+        .await
+    } else if work_driver_job::is_work_driver_kind(&claim.job.kind) {
+        work_driver_job::execute_work_driver_claim(
+            claim,
+            input,
+            provider,
+            job_store,
+            plan_services,
             Arc::clone(&control),
             &context,
         )
@@ -3691,6 +3956,283 @@ mod tests {
             nonce: "nonce".to_owned(),
         }));
         Ok(())
+    }
+
+    // ── Work-driver lane ──────────────────────────────────────────────────
+
+    mod work_driver_lane {
+        use super::*;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::time::Duration;
+
+        const WAIT: Duration = Duration::from_secs(10);
+
+        fn driver_record(id: &str) -> TestResult<StoredJob> {
+            ready_record_of_kind(
+                id,
+                JobKind::Custom(harw_runtime::job_ledger::WORK_DRIVER_JOB_KIND.to_owned()),
+                serde_json::json!({}),
+            )
+        }
+
+        fn state_of(store: &JobStore, id: &str) -> TestResult<JobState> {
+            Ok(store
+                .get(&WorkId::from_str(id))
+                .map_err(ctx("get job"))?
+                .job
+                .state)
+        }
+
+        // Resolves once the watched flag is set (or its sender is gone).
+        async fn until_set(mut flag: watch::Receiver<bool>) {
+            loop {
+                if *flag.borrow() {
+                    return;
+                }
+                if flag.changed().await.is_err() {
+                    return;
+                }
+            }
+        }
+
+        // Controls of the test executor: every `work_driver` claim counts
+        // itself in `started`, records its fenced lease token and then holds
+        // its claim until `release` is set or its control is cancelled. Every
+        // other claim succeeds at once, without a model.
+        struct GatedDrivers {
+            started: Arc<AtomicUsize>,
+            tokens: Arc<Mutex<Vec<harw_job_runtime::LeaseToken>>>,
+            release: watch::Sender<bool>,
+        }
+
+        impl GatedDrivers {
+            async fn wait_started(&self, count: usize) -> TestResult {
+                tokio::time::timeout(WAIT, async {
+                    while self.started.load(Ordering::SeqCst) < count {
+                        tokio::time::sleep(Duration::from_millis(5)).await;
+                    }
+                })
+                .await
+                .map_err(ctx("driver runs did not start"))
+            }
+        }
+
+        fn gated_services(
+            store: &Arc<JobStore>,
+            executions: &Arc<JobExecutionRegistry>,
+            context: Arc<JobWorkerContext>,
+        ) -> (WorkerServices, GatedDrivers) {
+            let started = Arc::new(AtomicUsize::new(0));
+            let tokens = Arc::new(Mutex::new(Vec::new()));
+            let (release, release_rx) = watch::channel(false);
+            let executor: ClaimExecutor = {
+                let started = Arc::clone(&started);
+                let tokens = Arc::clone(&tokens);
+                Arc::new(move |task: ClaimTask| -> ClaimFuture {
+                    let started = Arc::clone(&started);
+                    let tokens = Arc::clone(&tokens);
+                    let release = release_rx.clone();
+                    Box::pin(async move {
+                        let work_id = task.claim.job.id.as_str().to_owned();
+                        let outcome = if work_driver_job::is_work_driver_kind(&task.claim.job.kind)
+                        {
+                            if let Ok(mut tokens) = tokens.lock() {
+                                tokens.push(task.claim.token.clone());
+                            }
+                            started.fetch_add(1, Ordering::SeqCst);
+                            tokio::select! {
+                                () = until_set(release) => JobOutcome::Succeeded {
+                                    result: serde_json::json!({ "driver": work_id }),
+                                },
+                                () = until_set(task.control.cancellation()) => JobOutcome::Cancelled {
+                                    reason: "cancelled by trusted supervisor".to_owned(),
+                                },
+                            }
+                        } else {
+                            JobOutcome::Succeeded {
+                                result: serde_json::json!({ "job": work_id }),
+                            }
+                        };
+                        task.control.signal_completion();
+                        outcome
+                    })
+                })
+            };
+            let services = WorkerServices {
+                store: Arc::clone(store),
+                executions: Arc::clone(executions),
+                provider: Arc::new(EchoModelProvider::new("unused")),
+                plan_services: None,
+                context,
+                executor,
+            };
+            (
+                services,
+                GatedDrivers {
+                    started,
+                    tokens,
+                    release,
+                },
+            )
+        }
+
+        #[tokio::test]
+        async fn test_long_running_work_driver_does_not_block_other_jobs() -> TestResult {
+            let temp = temp_dir()?;
+            let store = Arc::new(JobStore::new(temp.path()));
+            let executions = Arc::new(JobExecutionRegistry::new());
+            // Listed first (work-ID order): inline it would block the prompt.
+            admit(&store, &driver_record("a-driver")?)?;
+            admit(
+                &store,
+                &ready_record("b-prompt", serde_json::json!({"prompt": "hello"}))?,
+            )?;
+            let (services, drivers) =
+                gated_services(&store, &executions, job_context(temp.path())?);
+            let mut lane = WorkDriverLane::new(MAX_CONCURRENT_WORK_DRIVER_RUNS);
+
+            let completed = tokio::time::timeout(WAIT, poll_ready_jobs(&services, &mut lane))
+                .await
+                .map_err(ctx("the poll waited for the driver run"))?;
+            assert_eq!(completed, 1, "only the prompt job finishes in this poll");
+            let JobOutcome::Succeeded { result } = completion_of(&store, "b-prompt")? else {
+                return Err(TestError::Unexpected("prompt job should succeed".into()));
+            };
+            assert_eq!(result["job"], "b-prompt");
+
+            drivers.wait_started(1).await?;
+            assert_eq!(state_of(&store, "a-driver")?, JobState::Running);
+            assert_eq!(executions.len(), 1, "the driver run stays registered");
+
+            drivers.release.send_replace(true);
+            let drained = tokio::time::timeout(WAIT, lane.drain())
+                .await
+                .map_err(ctx("driver run did not finish"))?;
+            assert_eq!(drained, 1);
+            let JobOutcome::Succeeded { result } = completion_of(&store, "a-driver")? else {
+                return Err(TestError::Unexpected("driver job should succeed".into()));
+            };
+            assert_eq!(result["driver"], "a-driver");
+            assert!(executions.is_empty());
+            Ok(())
+        }
+
+        #[tokio::test]
+        async fn test_work_driver_lane_limit_leaves_surplus_driver_jobs_ready() -> TestResult {
+            let temp = temp_dir()?;
+            let store = Arc::new(JobStore::new(temp.path()));
+            let executions = Arc::new(JobExecutionRegistry::new());
+            for id in ["d1", "d2", "d3"] {
+                admit(&store, &driver_record(id)?)?;
+            }
+            let (services, drivers) =
+                gated_services(&store, &executions, job_context(temp.path())?);
+            let mut lane = WorkDriverLane::new(MAX_CONCURRENT_WORK_DRIVER_RUNS);
+
+            let completed = poll_ready_jobs(&services, &mut lane).await;
+            assert_eq!(completed, 0);
+            drivers
+                .wait_started(MAX_CONCURRENT_WORK_DRIVER_RUNS)
+                .await?;
+            // A second poll while the lane is full claims nothing more.
+            let completed = poll_ready_jobs(&services, &mut lane).await;
+            assert_eq!(completed, 0);
+            for _ in 0..20 {
+                tokio::task::yield_now().await;
+            }
+            assert_eq!(drivers.started.load(Ordering::SeqCst), 2);
+            assert_eq!(state_of(&store, "d1")?, JobState::Running);
+            assert_eq!(state_of(&store, "d2")?, JobState::Running);
+            assert_eq!(
+                state_of(&store, "d3")?,
+                JobState::Ready,
+                "a driver job beyond the lane limit is not claimed"
+            );
+            assert_eq!(executions.len(), 2);
+
+            drivers.release.send_replace(true);
+            let drained = tokio::time::timeout(WAIT, lane.drain())
+                .await
+                .map_err(ctx("driver runs did not finish"))?;
+            assert_eq!(drained, 2);
+            // The freed lane now takes the remaining job.
+            let completed = poll_ready_jobs(&services, &mut lane).await;
+            let drained = tokio::time::timeout(WAIT, lane.drain())
+                .await
+                .map_err(ctx("third driver run did not finish"))?;
+            assert_eq!(completed + drained, 1);
+            for id in ["d1", "d2", "d3"] {
+                assert!(
+                    matches!(completion_of(&store, id)?, JobOutcome::Succeeded { .. }),
+                    "{id} should succeed"
+                );
+            }
+            Ok(())
+        }
+
+        #[tokio::test]
+        async fn test_cancelling_a_spawned_work_driver_run_commits_cancelled() -> TestResult {
+            let temp = temp_dir()?;
+            let store = Arc::new(JobStore::new(temp.path()));
+            let executions = Arc::new(JobExecutionRegistry::new());
+            admit(&store, &driver_record("driver")?)?;
+            let (services, drivers) =
+                gated_services(&store, &executions, job_context(temp.path())?);
+            let mut lane = WorkDriverLane::new(MAX_CONCURRENT_WORK_DRIVER_RUNS);
+
+            let _ = poll_ready_jobs(&services, &mut lane).await;
+            drivers.wait_started(1).await?;
+            let token = drivers
+                .tokens
+                .lock()
+                .ok()
+                .and_then(|tokens| tokens.first().cloned())
+                .ok_or(TestError::Missing("lease token of the driver run"))?;
+            let cancelled = executions
+                .cancel(&token, WAIT)
+                .await
+                .map_err(ctx("cancel"))?;
+            assert_eq!(cancelled, harw_core::CancellationResult::Graceful);
+            let drained = tokio::time::timeout(WAIT, lane.drain())
+                .await
+                .map_err(ctx("cancelled driver run did not finish"))?;
+            assert_eq!(drained, 1);
+            assert!(matches!(
+                completion_of(&store, "driver")?,
+                JobOutcome::Cancelled { .. }
+            ));
+            Ok(())
+        }
+
+        #[tokio::test]
+        async fn test_worker_shutdown_interrupts_in_flight_work_driver_runs() -> TestResult {
+            let temp = temp_dir()?;
+            let store = Arc::new(JobStore::new(temp.path()));
+            let executions = Arc::new(JobExecutionRegistry::new());
+            admit(&store, &driver_record("driver")?)?;
+            let (services, drivers) =
+                gated_services(&store, &executions, job_context(temp.path())?);
+            let (shutdown_tx, shutdown_rx) = watch::channel(false);
+
+            let worker = tokio::spawn(async move {
+                drive_worker_loop(&services, shutdown_rx).await;
+            });
+            drivers.wait_started(1).await?;
+            assert_eq!(state_of(&store, "driver")?, JobState::Running);
+            shutdown_tx.send_replace(true);
+            tokio::time::timeout(WAIT, worker)
+                .await
+                .map_err(ctx("worker loop did not stop"))?
+                .map_err(ctx("worker loop task"))?;
+            // Interrupted, not finished: no outcome is invented, the
+            // execution binding is gone and the lease is left to lapse.
+            assert!(executions.is_empty());
+            let stored = store
+                .get(&WorkId::from_str("driver"))
+                .map_err(ctx("get job"))?;
+            assert!(stored.completion.is_none());
+            Ok(())
+        }
     }
 
     // ── Summary rendering ─────────────────────────────────────────────────

@@ -444,6 +444,61 @@ never appears in the IR JSON and never changes the v7 snapshot hash (§18):
 it is written into `AgentIr` only when a definition sets it explicitly to
 something other than `"job"`.
 
+### 8.3 WorkDriver settings: `[work_driver]`
+
+`[work_driver]` is an optional table for orchestrator definitions that may
+run a WorkDriver: a loop that hands work items to a worker role, optionally
+has an evaluator role judge the results, runs verification commands and
+stops after a bounded number of iterations or when progress stalls. It is
+lowered into `AgentIr.work_driver` (`WorkDriverSpec`). No shipped
+definition sets it yet.
+
+```toml
+[delegation]
+targets = ["executor", "critic"]
+
+[work_driver]
+worker_role = "executor"
+judge_role = "critic"
+max_iterations = 8
+max_parallel_workers = 4
+max_attempts_per_worker = 3
+stall_iterations = 2
+verify = ["cargo test -p harw-agent-dsl"]
+token_budget = 500000
+wall_budget_secs = 3600
+```
+
+| Key | Type | Default | Range | Meaning |
+|---|---|---|---|---|
+| `worker_role` | string | — (required) | role name | role the driver delegates work items to |
+| `judge_role` | string | none | role name | optional evaluator role that judges worker results |
+| `max_iterations` | integer | `8` | `1..=1000` | upper bound of driver iterations |
+| `max_parallel_workers` | integer | `4` | `1..=64` | workers running at the same time |
+| `max_attempts_per_worker` | integer | `[lifecycle] max_attempts`, else `4` | `1..=100` | attempts per work item, including the first |
+| `stall_iterations` | integer | `2` (at most `max_iterations`) | `1..=max_iterations` | iterations without progress before the driver stops |
+| `verify` | array of strings | `[]` | non-blank | verification commands, one per entry (the same shape as `[verification] commands`, which is not copied implicitly) |
+| `token_budget` | integer | none | `>= 1` | token budget of the whole drive |
+| `wall_budget_secs` | integer | none | `>= 1` | wall-clock budget of the whole drive in seconds |
+
+Role names match `[a-z0-9][a-z0-9._-]{0,63}`. A work driver is authority,
+not behavior: the table grants no new right, it only uses the right to
+delegate the definition already has. The lowering therefore requires an
+orchestrator role (one that may spawn workers, §3), a spawn depth above 0,
+and `worker_role` (and `judge_role`, if set) listed as a spawn target in
+`[delegation] targets` or `[spawn] child_orchestrators`. Whether the named
+role exists in the roster is checked by the consumer that knows the
+roster.
+
+Diagnostics (§20): an unknown key is `HARW-DRIVER-001`, a value outside
+its range `HARW-DRIVER-002`, a missing or malformed role reference
+`HARW-DRIVER-003`, missing delegation rights `HARW-DRIVER-004`, a blank
+`verify` entry `HARW-DRIVER-005`. A wrongly typed value is
+`HARW-PARSE-003` and a negative integer `HARW-PARSE-004`, as everywhere.
+Without the table, `work_driver` does not appear in the IR JSON at all, so
+the canonical form and the v7 snapshot hash (§18) of every existing
+definition are unchanged.
+
 ---
 
 ## 9. User Extension Example
@@ -1294,6 +1349,7 @@ and a code is never reused for a different meaning. The areas are:
 | `MODEL` | `[models]` | `effort` outside the allowed values |
 | `SKILL` | skill references and content | skill not found in the `SkillIndex` |
 | `BINARY` | `[binary]` and interface selection | `default_interface` not in `interfaces` |
+| `DRIVER` | `[work_driver]` keys, ranges, role references and delegation rights | `worker_role` is not a spawn target |
 | `ORG` | families, clans, organizations | `HARW-ORG-011` above |
 | `BUILD` | compiler backends (**planned in #22**) | requested interface missing from the installed runner |
 

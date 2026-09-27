@@ -31,8 +31,8 @@ the process through the API.
 | Method | Path | Purpose |
 |--------|------|---------|
 | GET | `/v1/health` | JSON: `{"status": "ok", "service": "harw-auth-hub"}` |
-| GET | `/v1/version` | JSON: `service`, `version`, `protocol`, `cryptguard` |
-| GET | `/v1/capabilities` | JSON: `service`, `protocol`, `crypto_profiles`, `operations`, `algorithms` (alias of `crypto_profiles`), `persistence: "in-memory"`, `transport`, `authentication` |
+| GET | `/v1/version` | JSON: `service`, `version`, `protocol`, `cryptguard`, `store_epoch`, `boot_id` |
+| GET | `/v1/capabilities` | JSON: `service`, `protocol`, `crypto_profiles`, `operations`, `algorithms` (alias of `crypto_profiles`), `persistence` (`"in-memory"` \| `"sealed-file"`), `transport`, `authentication`, `store_epoch`, `boot_id` |
 | POST | `/v1/keys` | generate |
 | GET | `/v1/keys/{ns}/{id}[@v]` | describe |
 | GET | `/v1/keys/{ns}/{id}[@v]/public` | public key |
@@ -48,6 +48,24 @@ The meta routes answer `application/json` and follow the §38 contract that
 (`meta::PROTOCOL_VERSION`), and `crypto_profiles` lists the CryptGuard wire
 names `KeyProfile::wire_name` uses (`pq-hpke-default`, `ml-dsa-44`,
 `ml-dsa-65`, `ml-dsa-87`). The client ignores the extra fields.
+
+### Store epoch and boot id
+
+`store_epoch` and `boot_id` (both additive, 32 lowercase hex digits = 128
+random bits) let a client tell a replaced key store from tampering:
+
+- `store_epoch` names one key store. It is generated when the store is
+  created (`meta::StoreIdentity`); a persistent (`sealed-file`) store keeps
+  its epoch across restarts, while the in-memory store is new in every
+  process, so **its epoch changes on every hub restart**.
+- `boot_id` is fresh for every hub process (`meta::boot_id`).
+
+An unwrap under a key version the (new) store does not have is answered like
+a failed authentication (`422`). `harw-infra-client`'s `AuthHubDekWrapper`
+therefore re-reads `/v1/version` on an unwrap `422`: a changed `store_epoch`
+is reported as "key store was replaced, keys are not available"
+(`DekWrapperUnavailable`), an unchanged one as the authentication failure it
+is. The fields are descriptive, carry no secret, and are never authority.
 
 The meta routes need no principal: anyone allowed to `connect(2)` to the
 socket (mode `0660`) may read them. They are descriptive, never authority.

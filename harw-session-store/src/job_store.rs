@@ -31,7 +31,7 @@
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use harw_job_runtime::{
+use harw_job_core::{
     JobCancellation, JobClaim, JobCompletion, JobOutcome, JobRuntimeError, JobState, Lease,
     LeaseToken, StoredJob,
 };
@@ -131,7 +131,7 @@ pub struct RetryRequest {
 /// Durable record of who approved a `Blocked → Ready` transition and why.
 ///
 /// # Beschreibung
-/// [`StoredJob`] (`harw-job-runtime`) trägt kein Akteurs-/Freitextfeld für
+/// [`StoredJob`] (`harw-job-core`) trägt kein Akteurs-/Freitextfeld für
 /// eine Freigabe — dessen Schema liegt außerhalb dieser Crate. Diese Struktur
 /// wird deshalb als eigenständiger Sidecar-Datensatz unter `jobs/approvals/`
 /// persistiert, adressiert über dieselbe `WorkId` wie der Job-Datensatz
@@ -383,7 +383,7 @@ impl JobStore {
     /// write. Once the job record is durable, `actor` and `note` are written
     /// to a [`JobApproval`] sidecar (see [`JobStore::get_approval`]) keyed by
     /// the same `work_id` — [`StoredJob`] itself carries no actor/note field
-    /// (that shape lives in `harw-job-runtime`, outside this crate).
+    /// (that shape lives in `harw-job-core`, outside this crate).
     ///
     /// # Arguments
     /// - `work_id` (`&WorkId`): the blocked job.
@@ -563,7 +563,7 @@ impl JobStore {
     }
 
     /// Requeues a terminally `Failed` or `Cancelled` job for another attempt,
-    /// respecting the job's own [`harw_job_runtime::RetryPolicy`] ceiling.
+    /// respecting the job's own [`harw_job_core::RetryPolicy`] ceiling.
     ///
     /// # Description
     /// The source state must be [`JobState::Failed`] or
@@ -662,8 +662,8 @@ impl JobStore {
     /// Gibt einen `Pending`-Job für einen Worker-Claim frei (`Pending → Ready`).
     ///
     /// # Beschreibung
-    /// Unter der Datensatz-Sperre validiert [`harw_job_runtime::Job::mark_ready`]
-    /// den Übergang (Zustandsmaschine aus `harw-job-runtime`); der Job wird
+    /// Unter der Datensatz-Sperre validiert [`harw_job_core::Job::mark_ready`]
+    /// den Übergang (Zustandsmaschine aus `harw-job-core`); der Job wird
     /// `Ready`, `updated_at` wird `now`, die Revision steigt, und nach dem
     /// durablen Schreiben wird ein redigiertes [`JobLifecycleEvent`]
     /// veröffentlicht. `not_before`, Versuche, Lease und Fencing-Epoch bleiben
@@ -739,8 +739,8 @@ impl JobStore {
     /// # Beschreibung
     /// Einzel-Gegenstück zu [`JobStore::reconcile_expired`] mit denselben
     /// Schritten je Job: die Lease wird entfernt, die Fencing-Epoch
-    /// weitergeschaltet, und [`harw_job_runtime::Job::record_failure`]
-    /// (Zustandsmaschine aus `harw-job-runtime`) zählt einen Versuch. Bleibt
+    /// weitergeschaltet, und [`harw_job_core::Job::record_failure`]
+    /// (Zustandsmaschine aus `harw-job-core`) zählt einen Versuch. Bleibt
     /// Budget, wird der Job `Ready` und `not_before` auf `now + Backoff`
     /// gesetzt; ist die Retry-Politik erschöpft, wird er terminal `Failed`
     /// mit einer `JobOutcome::Failed`-Completion — genau wie beim
@@ -1032,7 +1032,7 @@ mod tests {
     use super::*;
     use crate::durability::sync_parent_directory;
     use crate::test_support::{TestError, TestResult, ctx};
-    use harw_job_runtime::{Budget, Job, JobKind, RetryPolicy};
+    use harw_job_core::{Budget, Job, JobKind, RetryPolicy};
     use harw_observe::TraceContext;
     use std::sync::{Arc, Mutex, PoisonError};
 
@@ -1069,7 +1069,7 @@ mod tests {
             .map_err(ctx("mark_ready on a fresh job"))?;
         Ok(StoredJob {
             job,
-            scope: harw_job_runtime::JobScope::new(
+            scope: harw_job_core::JobScope::new(
                 harw_types::TenantId::from_str("test-tenant"),
                 harw_types::WorkspaceId::from_str("test-workspace"),
                 ApprovalActor::Operator {

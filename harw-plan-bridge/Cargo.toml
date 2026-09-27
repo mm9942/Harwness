@@ -1,6 +1,7 @@
 [package]
 publish.workspace = true
 name = "harw-plan-bridge"
+description = "Bridge between goals, plans, findings and jobs: translates research to evidence, proposes plan refinements, coordinates verification."
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -8,6 +9,8 @@ repository.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+# Prozessübergreifende Workspace-Sperre der Verifikation (`verify_exec.rs`).
+fs4 = { workspace = true }
 harw-authority = { path = "../harw-authority" }
 harw-plan = { path = "../harw-plan" }
 harw-research = { path = "../harw-research" }

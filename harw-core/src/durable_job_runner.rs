@@ -56,7 +56,7 @@ use crate::cancel::{CancelReason, CancelToken};
 use crate::execution_registry::{
     ExecutionControl, ExecutionGuard, ExecutionRegistryError, JobExecutionRegistry,
 };
-use harw_job_runtime::{JobClaim, JobCompletion, JobKind, JobOutcome, JobScope, Lease, LeaseToken};
+use harw_job_core::{JobClaim, JobCompletion, JobKind, JobOutcome, JobScope, Lease, LeaseToken};
 use harw_session_store::{
     ClaimRequest, CompleteRequest, JobStore, RenewalRequest, SessionStoreError,
 };
@@ -353,7 +353,7 @@ impl DurableJobRunner {
     ///     .run_with_cancel(work_id, request, move |_claim, token| {
     ///         (control, async move {
     ///             token.cancelled().await;
-    ///             harw_job_runtime::JobOutcome::Cancelled { reason: "stopped".to_owned() }
+    ///             harw_job_core::JobOutcome::Cancelled { reason: "stopped".to_owned() }
     ///         })
     ///     })
     ///     .await;
@@ -692,7 +692,7 @@ mod tests {
     use super::*;
     use crate::execution_registry::ExecutionControl;
     use crate::test_support::{TestResult, ctx};
-    use harw_job_runtime::{Budget, Job, JobKind, RetryPolicy, StoredJob};
+    use harw_job_core::{Budget, Job, JobKind, RetryPolicy, StoredJob};
     use harw_types::{ApprovalActor, TenantId, WorkspaceId};
     use jiff::SignedDuration;
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -750,7 +750,7 @@ mod tests {
         job.mark_ready(now).map_err(ctx("new job is pending"))?;
         Ok(StoredJob {
             job,
-            scope: harw_job_runtime::JobScope::new(
+            scope: harw_job_core::JobScope::new(
                 TenantId::from_str("tenant"),
                 WorkspaceId::from_str("workspace"),
                 ApprovalActor::Operator {
@@ -837,7 +837,7 @@ mod tests {
         assert!(runner.executions().is_empty());
         assert_eq!(
             store.get(&work_id).map_err(ctx("record"))?.job.state,
-            harw_job_runtime::JobState::Completed
+            harw_job_core::JobState::Completed
         );
         Ok(())
     }
@@ -860,7 +860,7 @@ mod tests {
         assert!(runner.executions().is_empty());
         assert_eq!(
             store.get(&work_id).map_err(ctx("record"))?.job.state,
-            harw_job_runtime::JobState::Failed
+            harw_job_core::JobState::Failed
         );
         Ok(())
     }
@@ -929,7 +929,7 @@ mod tests {
             result,
             Err(DurableJobRunnerError::Store(
                 SessionStoreError::JobAlreadyTerminal {
-                    state: harw_job_runtime::JobState::Cancelled,
+                    state: harw_job_core::JobState::Cancelled,
                     ..
                 }
             ))
@@ -937,7 +937,7 @@ mod tests {
         assert!(executions.is_empty());
         assert!(matches!(
             store.get(&work_id).map_err(ctx("record"))?.job.state,
-            harw_job_runtime::JobState::Cancelled
+            harw_job_core::JobState::Cancelled
         ));
         Ok(())
     }

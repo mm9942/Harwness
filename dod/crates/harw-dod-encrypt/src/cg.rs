@@ -17,18 +17,25 @@
 //! # What this module enforces
 //! - [`key_ref`]: the `harw.<purpose>/<owner>[@version]` naming convention.
 //! - [`sign_operation`]: the only sign-request constructor; it refuses any
-//!   transcript whose purpose is not the key's (no signing oracle, §5).
+//!   transcript whose purpose is not the key's (no signing oracle, §5) or
+//!   that exceeds [`MAX_SIGNABLE_TRANSCRIPT_LEN`](crate::MAX_SIGNABLE_TRANSCRIPT_LEN).
 //! - [`HarwUsageAuthorizer`]: a CryptGuard `Authorizer` that applies
 //!   [`KeyUsagePolicy`] to every operation on a `harw.*` namespace before an
 //!   inner authorizer (for example [`namespace_policy_for`]) runs. An
 //!   unknown `harw.*` namespace or unknown operation kind is rejected.
 //!
-//! # Known limit
-//! The authorizer sees operation kinds, not sign payloads: CryptGuard keeps
-//! the message of a `Sign` operation in `SecretBytes`, which an authorizer
-//! cannot read. Transcript binding is therefore enforced where requests are
-//! built ([`sign_operation`]); the Hub (H3) must expose only transcript-typed
-//! sign requests and never forward a raw `CryptoOperation::Sign`.
+//! # Transcript binding on every route
+//! CryptGuard hands the authorizer the whole `CryptoOperation`, including
+//! the `message` of a `Sign` (a `SecretBytes`, readable through
+//! `AsRef<[u8]>`) and of a `Verify`. [`HarwUsageAuthorizer`] therefore
+//! enforces transcript binding itself, independent of how the request was
+//! built: on a `harw.*` namespace, a `Sign` or `Verify` message must pass
+//! [`SignTranscript::validate_for_kms`] and carry exactly the key purpose's
+//! own [`SignPurpose`](crate::SignPurpose); raw bytes, a transcript of a
+//! foreign purpose or an oversize transcript are `Forbidden`. This holds
+//! for requests arriving over the HTTP adapter as well as for requests
+//! built with [`sign_operation`] / [`verify_operation`], which apply the
+//! same checks early so a caller gets a precise [`EncryptError`].
 
 use crypt_guard_service::pq_hpke::{Aead, Kdf, Kem, Suite};
 use crypt_guard_service::{
@@ -213,12 +220,17 @@ pub fn namespace_policy_for(grants: &[HarwGrant]) -> Result<NamespacePolicy, Enc
 /// raw bytes cannot be signed through this API.
 ///
 /// # Errors
-/// [`KeyUsagePolicy::authorize_sign`]'s errors, or a name conversion error.
+/// - [`KeyUsagePolicy::authorize_sign`]'s errors.
+/// - [`EncryptError::TranscriptTooLarge`] above
+///   [`MAX_SIGNABLE_TRANSCRIPT_LEN`](crate::MAX_SIGNABLE_TRANSCRIPT_LEN)
+///   (the KMS would refuse the request).
+/// - A name conversion error.
 pub fn sign_operation(
     key: &HarwKeyRef,
     transcript: SignTranscript,
 ) -> Result<CryptoOperation, EncryptError> {
     KeyUsagePolicy::authorize_sign(key.purpose(), &transcript)?;
+    transcript.ensure_kms_size()?;
     Ok(CryptoOperation::Sign(Sign {
         key: key_ref_of(key)?,
         message: SecretBytes::from_vec(transcript.into_bytes()),
@@ -237,6 +249,7 @@ pub fn verify_operation(
     signature: &[u8],
 ) -> Result<CryptoOperation, EncryptError> {
     KeyUsagePolicy::authorize_sign(key.purpose(), transcript)?;
+    transcript.ensure_kms_size()?;
     Ok(CryptoOperation::Verify(Verify {
         key: key_ref_of(key)?,
         message: MessageBlob::new(transcript.as_bytes().to_vec()),
@@ -275,6 +288,14 @@ pub fn generate_operation(
 /// A CryptGuard `Authorizer` that enforces [`KeyUsagePolicy`] on `harw.*`
 /// namespaces and then delegates to `inner`.
 ///
+/// On a `harw.*` namespace it rejects (`Forbidden`), before `inner` runs:
+/// - an unknown `harw.*` namespace or an operation kind the key purpose
+///   does not permit;
+/// - a `Sign` or `Verify` whose message is not a well-formed transcript
+///   within [`MAX_SIGNABLE_TRANSCRIPT_LEN`](crate::MAX_SIGNABLE_TRANSCRIPT_LEN)
+///   ([`SignTranscript::validate_for_kms`]) of exactly the key purpose's
+///   own sign purpose (transcript binding, §5; see the module docs).
+///
 /// Operations on namespaces outside `harw.*` are judged by `inner` alone.
 #[derive(Debug)]
 pub struct HarwUsageAuthorizer<A> {
@@ -311,7 +332,25 @@ impl<A: Authorizer> Authorizer for HarwUsageAuthorizer<A> {
             if !allows(purpose, kind) {
                 return Err(CryptoServiceError::Forbidden);
             }
+            // Transcript binding: the payload itself, not only the kind.
+            let message: Option<&[u8]> = match op {
+                CryptoOperation::Sign(sign) => Some(sign.message.as_ref()),
+                CryptoOperation::Verify(verify) => Some(verify.message.as_bytes()),
+                _ => None,
+            };
+            if message.is_some_and(|m| !is_own_transcript(purpose, m)) {
+                return Err(CryptoServiceError::Forbidden);
+            }
         }
         self.inner.authorize(ctx, op)
     }
+}
+
+/// Whether `message` is a KMS-sized, well-formed transcript of exactly
+/// `purpose`'s own sign purpose. `false` for purposes that do not sign.
+fn is_own_transcript(purpose: HarwKeyPurpose, message: &[u8]) -> bool {
+    let Some(own) = purpose.sign_purpose() else {
+        return false;
+    };
+    SignTranscript::validate_for_kms(message).is_ok_and(|found| found == own)
 }

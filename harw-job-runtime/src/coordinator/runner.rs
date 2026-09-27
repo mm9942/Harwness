@@ -22,6 +22,24 @@
 //!
 //! A crash between any two steps leaves enough to decide deterministically
 //! in [`Coordinator::recover`]: no identity ⇒ `Lost`; identity ⇒ probe.
+//!
+//! # Retries (Job-Runtime-Doc §6)
+//! When an attempt ends `Failed`, `TimedOut` or `Lost` (never `Cancelled`,
+//! never a policy refusal, never after the lease was lost) and the job's
+//! [`RetryPolicy`] admits another attempt, the coordinator does not
+//! finalize the job record. It closes the attempt sidecar, persists the
+//! next attempt (`<job>-e<epoch>-r<n>`) whose
+//! history starts with the lifecycle `Retry` transition, waits the backoff
+//! of [`RetryPolicy::next_delay`] while it keeps heartbeating the lease and
+//! watching for cancellation, and starts the attempt again. Each attempt
+//! gets its own wall-clock deadline; the job's wall-time [`Budget`] caps
+//! the attempts and backoffs together. The default policy
+//! ([`CoordinatorConfig::new`]) allows a single attempt.
+//!
+//! All attempts of one claim run under the same lease; the job record is
+//! written once, by the attempt that decides the outcome. The store-level
+//! attempt counter (`Job::attempts`) is only advanced by the store's own
+//! reclaim path (lease expiry), which the in-lease retries do not replace.
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -29,9 +47,10 @@ use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
 use harw_job_core::{
-    AttemptId, Budget, CancellationCause, Deadline, ExitOutcome, Job, JobClaim, JobKind,
-    JobOutcome, JobScope, JobSpec, JobSpecEnvelope, LifecycleEvent, LifecycleState, RetryPolicy,
-    RunnerId, SandboxReport, SandboxRequirement, SpecError, StoredJob,
+    AttemptId, Budget, BudgetUsage, CancellationCause, Deadline, ExitOutcome, Job, JobClaim,
+    JobKind, JobOutcome, JobScope, JobSpec, JobSpecEnvelope, LifecycleEvent, LifecycleState,
+    LifecycleTransition, RetryPolicy, RunnerId, SandboxReport, SandboxRequirement, SpecError,
+    StoredJob,
 };
 use harw_job_store::{ClaimTerms, JobTransition, StoreResult};
 use harw_types::{ApprovalActor, TenantId, WorkId, WorkspaceId};
@@ -40,14 +59,13 @@ use tokio::sync::{oneshot, watch};
 use tokio::time::Instant;
 
 use super::attempt::{AttemptRecord, attempt_id_for};
+use super::capture::{Output, OutputCapture};
 use super::error::RuntimeError;
 use super::executor::{AttemptContext, AttemptEvent, AttemptRun, Executor, Probe};
 use super::store::CoordinatorStore;
 
 /// Default lease validity.
 pub const DEFAULT_LEASE_TTL: Duration = Duration::from_secs(30);
-/// Default number of stdout/stderr bytes kept in a [`JobResult`] per stream.
-pub const DEFAULT_OUTPUT_LIMIT: usize = 1024 * 1024;
 /// Shortest accepted lease TTL (the heartbeat runs at TTL/3).
 pub const MIN_LEASE_TTL: Duration = Duration::from_millis(30);
 
@@ -63,17 +81,19 @@ pub struct CoordinatorConfig {
     pub lease_ttl: Duration,
     /// Authority scope recorded on every job record.
     pub scope: JobScope,
-    /// Retry policy recorded on every job record (the coordinator runs one
-    /// attempt per submission; retries are the caller's decision).
+    /// Retry policy recorded on every job record. The coordinator retries a
+    /// retryable attempt outcome while the policy admits another attempt
+    /// (see the module docs); `max_attempts: 1` runs exactly one attempt.
     pub retry: RetryPolicy,
-    /// Bytes of stdout/stderr kept per stream in a [`JobResult`].
-    pub output_limit: usize,
+    /// How much stdout/stderr a [`JobResult`] keeps per stream (first
+    /// `head_bytes` + last `tail_bytes`).
+    pub output_capture: OutputCapture,
 }
 
 impl CoordinatorConfig {
     /// A configuration with defaults: [`DEFAULT_LEASE_TTL`], a local scope
     /// (`local`/`local`, submitted by the runner as operator), a single
-    /// attempt and [`DEFAULT_OUTPUT_LIMIT`].
+    /// attempt and [`OutputCapture::default`] (16 KiB head + 64 KiB tail).
     #[must_use]
     pub fn new(runner_id: RunnerId, workspace_root: impl Into<PathBuf>) -> Self {
         let submitter = ApprovalActor::Operator {
@@ -94,7 +114,7 @@ impl CoordinatorConfig {
                 factor: 2.0,
                 max_delay: SignedDuration::from_secs(1),
             },
-            output_limit: DEFAULT_OUTPUT_LIMIT,
+            output_capture: OutputCapture::default(),
         }
     }
 
@@ -102,6 +122,13 @@ impl CoordinatorConfig {
     #[must_use]
     pub fn with_lease_ttl(mut self, ttl: Duration) -> Self {
         self.lease_ttl = ttl;
+        self
+    }
+
+    /// Sets the retry policy recorded on new jobs (builder style).
+    #[must_use]
+    pub fn with_retry(mut self, retry: RetryPolicy) -> Self {
+        self.retry = retry;
         self
     }
 
@@ -132,7 +159,7 @@ impl CoordinatorConfig {
     }
 }
 
-/// Final result of one attempt.
+/// Final result of a job: the attempt that decided its outcome.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct JobResult {
     /// The job.
@@ -145,18 +172,30 @@ pub struct JobResult {
     pub exit: Option<ExitOutcome>,
     /// Why the attempt was cancelled, if it was.
     pub cancellation: Option<CancellationCause>,
-    /// Reason of a non-success state.
+    /// Reason of a non-success state (with the attempt number when retries
+    /// ran), or supervision notes of a recovered attempt (for example a job
+    /// cgroup that could not be reopened).
     pub reason: Option<String>,
     /// Achieved sandbox enforcement, if known.
     pub sandbox: Option<SandboxReport>,
     /// Whether a restarted coordinator finished this attempt.
     pub recovered: bool,
-    /// Captured standard output (first `output_limit` bytes).
+    /// Captured standard output: the first `head_bytes` followed directly
+    /// by the last `tail_bytes` (see [`OutputCapture`]). The whole output
+    /// when [`Self::stdout_omitted`] is 0.
     pub stdout: Vec<u8>,
-    /// Captured standard error (first `output_limit` bytes).
+    /// Bytes of standard output dropped between head and tail.
+    pub stdout_omitted: u64,
+    /// Captured standard error, like [`Self::stdout`].
     pub stderr: Vec<u8>,
-    /// Whether output beyond the limit was dropped.
+    /// Bytes of standard error dropped between head and tail.
+    pub stderr_omitted: u64,
+    /// Whether any output was dropped (`stdout_omitted` or
+    /// `stderr_omitted` is non-zero).
     pub output_truncated: bool,
+    /// The capture policy the output was taken with; locates the gap in
+    /// [`Self::stdout`] / [`Self::stderr`].
+    pub output_capture: OutputCapture,
 }
 
 impl JobResult {
@@ -165,6 +204,60 @@ impl JobResult {
     pub fn is_success(&self) -> bool {
         self.state == LifecycleState::Succeeded
     }
+
+    /// Standard output before the omitted gap; all of it when nothing was
+    /// omitted.
+    #[must_use]
+    pub fn stdout_head(&self) -> &[u8] {
+        self.output_capture
+            .split(&self.stdout, self.stdout_omitted)
+            .0
+    }
+
+    /// Standard output after the omitted gap (the end of the stream); all
+    /// of it when nothing was omitted.
+    #[must_use]
+    pub fn stdout_tail(&self) -> &[u8] {
+        self.output_capture
+            .split(&self.stdout, self.stdout_omitted)
+            .1
+    }
+
+    /// Standard error before the omitted gap; all of it when nothing was
+    /// omitted.
+    #[must_use]
+    pub fn stderr_head(&self) -> &[u8] {
+        self.output_capture
+            .split(&self.stderr, self.stderr_omitted)
+            .0
+    }
+
+    /// Standard error after the omitted gap (the end of the stream); all of
+    /// it when nothing was omitted.
+    #[must_use]
+    pub fn stderr_tail(&self) -> &[u8] {
+        self.output_capture
+            .split(&self.stderr, self.stderr_omitted)
+            .1
+    }
+
+    /// Bytes the job wrote to standard output in total.
+    #[must_use]
+    pub fn stdout_total_bytes(&self) -> u64 {
+        total_bytes(&self.stdout, self.stdout_omitted)
+    }
+
+    /// Bytes the job wrote to standard error in total.
+    #[must_use]
+    pub fn stderr_total_bytes(&self) -> u64 {
+        total_bytes(&self.stderr, self.stderr_omitted)
+    }
+}
+
+fn total_bytes(captured: &[u8], omitted: u64) -> u64 {
+    u64::try_from(captured.len())
+        .unwrap_or(u64::MAX)
+        .saturating_add(omitted)
 }
 
 type ResultSender = oneshot::Sender<Result<JobResult, RuntimeError>>;
@@ -185,14 +278,16 @@ impl JobHandle {
         &self.job_id
     }
 
-    /// The attempt id.
+    /// The attempt id this handle was created with (the first attempt, or
+    /// the recovered one). Retries run under new ids;
+    /// [`JobResult::attempt_id`] names the attempt that decided the outcome.
     #[must_use]
     pub fn attempt_id(&self) -> &AttemptId {
         &self.attempt_id
     }
 
     /// Requests cancellation ([`CancellationCause::User`]). Idempotent;
-    /// without effect once the attempt ended.
+    /// without effect once the job ended. Also stops a pending retry.
     pub fn cancel(&self) {
         self.cancel.send_replace(true);
     }
@@ -224,8 +319,8 @@ pub enum RecoveryDecision {
     /// status, its identity did not match (it was **not** signalled), or no
     /// identity was persisted.
     Lost(String),
-    /// The attempt sidecar was already terminal; only the job record was
-    /// finalized.
+    /// The attempt sidecar was already terminal; the job record was
+    /// finalized, or the retry the policy admits was scheduled.
     AlreadyFinal,
     /// Recovery of this job failed; the record is untouched.
     Failed(String),
@@ -286,40 +381,6 @@ where
         .await
         .map_err(RuntimeError::task)?
         .map_err(RuntimeError::from_store)
-}
-
-/// Bounded capture of stdout/stderr.
-struct Output {
-    limit: usize,
-    stdout: Vec<u8>,
-    stderr: Vec<u8>,
-    truncated: bool,
-}
-
-impl Output {
-    fn new(limit: usize) -> Self {
-        Self {
-            limit,
-            stdout: Vec::new(),
-            stderr: Vec::new(),
-            truncated: false,
-        }
-    }
-
-    fn push(limit: usize, buffer: &mut Vec<u8>, chunk: &[u8]) -> bool {
-        let room = limit.saturating_sub(buffer.len());
-        let take = chunk.len().min(room);
-        buffer.extend_from_slice(chunk.get(..take).unwrap_or_default());
-        take < chunk.len()
-    }
-
-    fn stdout(&mut self, chunk: &[u8]) {
-        self.truncated |= Self::push(self.limit, &mut self.stdout, chunk);
-    }
-
-    fn stderr(&mut self, chunk: &[u8]) {
-        self.truncated |= Self::push(self.limit, &mut self.stderr, chunk);
-    }
 }
 
 /// Outcome decision inputs.
@@ -488,10 +549,10 @@ impl<S: CoordinatorStore, E: Executor> Coordinator<S, E> {
         })
         .await?;
         let attempt_id = attempt_id_for(&job_id, claim.lease.epoch)?;
-        let (handle, cancel, done) = self.register(&job_id, &attempt_id);
+        let (handle, mut cancel, done) = self.register(&job_id, &attempt_id);
         let inner = Arc::clone(&self.inner);
         tokio::spawn(async move {
-            let result = run_claimed(&inner, claim, attempt_id, spec, cancel).await;
+            let result = run_job(&inner, claim, attempt_id, spec, &mut cancel).await;
             inner.unregister(&job_id);
             let _ = done.send(result);
         });
@@ -501,11 +562,16 @@ impl<S: CoordinatorStore, E: Executor> Coordinator<S, E> {
     /// Recovers every running job whose lease `runner` holds
     /// (Job-Runtime-Doc §15, §21.4).
     ///
-    /// Per job: load the attempt sidecar → probe the persisted identity →
+    /// Per job: load the latest attempt sidecar of the claim (retries
+    /// included) → probe the persisted identity →
     /// - verified alive: reattach and supervise again (heartbeats resume);
     /// - exited: finalize with the recorded exit status, else `Lost`;
     /// - mismatch / unverifiable / no identity: `Lost`. **Nothing is
     ///   signalled** — a PID alone never authorizes a signal.
+    ///
+    /// An outcome decided here is retried like any other when the job's
+    /// retry policy admits another attempt; the handle then waits for the
+    /// retry.
     ///
     /// Must be called within a Tokio runtime.
     ///
@@ -634,20 +700,18 @@ impl<S: CoordinatorStore, E: Executor> Coordinator<S, E> {
             token: lease.token(),
             lease: lease.clone(),
         };
-        let attempt_id = attempt_id_for(&job_id, lease.epoch)?;
-        let requirement = serde_json::from_value::<JobSpecEnvelope>(stored.input.clone())
+        let spec = serde_json::from_value::<JobSpecEnvelope>(stored.input.clone())
             .ok()
-            .and_then(|envelope| envelope.into_spec().ok())
-            .map(|spec| spec.sandbox)
-            .unwrap_or_default();
+            .and_then(|envelope| envelope.into_spec().ok());
+        let requirement = spec.as_ref().map(|spec| spec.sandbox).unwrap_or_default();
+        let (number, attempt_id, bytes) =
+            latest_attempt(inner, &job_id, lease.epoch, stored.job.retry.max_attempts).await?;
         let ctx = AttemptContext {
             job_id: job_id.clone(),
             attempt_id: attempt_id.clone(),
             runner_id: runner.clone(),
             workspace_root: inner.config.workspace_root.clone(),
         };
-        let key = attempt_id.to_string();
-        let bytes = blocking(&inner.store, move |store| store.read_attempt(&key)).await?;
         let mut record = match bytes {
             Some(bytes) => AttemptRecord::<E::Identity>::from_bytes(attempt_id.as_str(), &bytes)?,
             None => AttemptRecord::claimed(
@@ -659,19 +723,16 @@ impl<S: CoordinatorStore, E: Executor> Coordinator<S, E> {
             )?,
         };
         record.recovered = true;
+        let recovering = Recovering {
+            claim,
+            ctx,
+            spec,
+            requirement,
+            number,
+        };
 
         if record.is_terminal() {
-            // Crash between sidecar and record finalization is impossible by
-            // the persistence order, but a record may still be open if the
-            // sidecar was written by an older build: finalize the record.
-            let outcome = job_outcome(&record);
-            let result = finalize_record(inner, &claim, outcome).await;
-            let result = result.map(|()| result_of(&record, Output::new(0)));
-            return Ok(RecoveredJob {
-                job_id: job_id.clone(),
-                decision: RecoveryDecision::AlreadyFinal,
-                handle: Some(Self::resolved(&job_id, &attempt_id, result)),
-            });
+            return self.recover_terminal(recovering, record).await;
         }
 
         let identity = match (record.state, record.identity.clone()) {
@@ -681,7 +742,7 @@ impl<S: CoordinatorStore, E: Executor> Coordinator<S, E> {
                     "attempt was '{state}' when the runner stopped and no recovery identity was persisted; \
                      the process (if any) was not signalled"
                 );
-                return self.finish_lost(claim, ctx, record, reason).await;
+                return self.finish_lost(recovering, record, reason).await;
             }
         };
 
@@ -691,15 +752,40 @@ impl<S: CoordinatorStore, E: Executor> Coordinator<S, E> {
         };
         tracing::info!(job = %job_id, attempt = %attempt_id, ?probe, "recovery probe");
         match probe {
-            Probe::Alive => match inner.executor.reattach(&identity, &ctx) {
+            Probe::Alive => match inner.executor.reattach(&identity, &recovering.ctx) {
                 Ok(run) => {
-                    let (handle, cancel, done) = self.register(&job_id, &attempt_id);
+                    let (handle, mut cancel, done) = self.register(&job_id, &attempt_id);
                     let task_inner = Arc::clone(inner);
                     let task_job = job_id.clone();
                     tokio::spawn(async move {
-                        let result =
-                            supervise(&task_inner, claim, ctx, record, run, requirement, cancel)
-                                .await;
+                        let Recovering {
+                            claim,
+                            ctx,
+                            spec,
+                            requirement,
+                            number,
+                        } = recovering;
+                        let usage = claim.job.usage.clone();
+                        let ended = supervise(
+                            &task_inner,
+                            &claim,
+                            ctx,
+                            record,
+                            run,
+                            requirement,
+                            &mut cancel,
+                        )
+                        .await;
+                        let result = conclude(
+                            &task_inner,
+                            &claim,
+                            spec.as_ref(),
+                            ended,
+                            number,
+                            &mut cancel,
+                            usage,
+                        )
+                        .await;
                         task_inner.unregister(&task_job);
                         let _ = done.send(result);
                     });
@@ -710,39 +796,94 @@ impl<S: CoordinatorStore, E: Executor> Coordinator<S, E> {
                     })
                 }
                 Err(RuntimeError::ProcessAlreadyExited { .. }) => {
-                    self.finish_exited(claim, ctx, record, requirement).await
+                    self.finish_exited(recovering, record).await
                 }
                 Err(error) => {
                     let reason = format!("cannot reattach: {error}; the process was not signalled");
-                    self.finish_lost(claim, ctx, record, reason).await
+                    self.finish_lost(recovering, record, reason).await
                 }
             },
-            Probe::Exited => self.finish_exited(claim, ctx, record, requirement).await,
+            Probe::Exited => self.finish_exited(recovering, record).await,
             Probe::Mismatch(detail) => {
                 let reason =
                     format!("recovery identity mismatch ({detail}); the process was not signalled");
-                self.finish_lost(claim, ctx, record, reason).await
+                self.finish_lost(recovering, record, reason).await
             }
             Probe::Unverifiable(detail) => {
                 let reason = format!(
                     "recovery identity cannot be verified ({detail}); the process was not signalled"
                 );
-                self.finish_lost(claim, ctx, record, reason).await
+                self.finish_lost(recovering, record, reason).await
             }
         }
     }
 
+    /// The latest attempt sidecar was already terminal: the runner stopped
+    /// after closing an attempt and before persisting the next one (or the
+    /// sidecar was written by an older build that finalized the sidecar
+    /// first). Continue with the retry the policy admits, else finalize the
+    /// job record with the recorded outcome.
+    async fn recover_terminal(
+        &self,
+        recovering: Recovering,
+        record: AttemptRecord<E::Identity>,
+    ) -> Result<RecoveredJob, RuntimeError> {
+        let Recovering {
+            claim,
+            ctx,
+            spec,
+            number,
+            ..
+        } = recovering;
+        let job_id = ctx.job_id.clone();
+        let attempt_id = ctx.attempt_id.clone();
+        let mut usage = claim.job.usage.clone();
+        let delay = match &spec {
+            Some(_) => retry_delay(
+                &claim,
+                record.state,
+                record.reason.as_deref(),
+                record.started_at,
+                number,
+                &mut usage,
+            ),
+            None => None,
+        };
+        if let (Some(spec), Some(delay)) = (spec, delay) {
+            let handle = self.spawn_retry(
+                claim,
+                spec,
+                Pending::Closed(record.state),
+                &attempt_id,
+                number,
+                delay,
+                usage,
+            );
+            return Ok(RecoveredJob {
+                job_id,
+                decision: RecoveryDecision::AlreadyFinal,
+                handle: Some(handle),
+            });
+        }
+        let outcome = job_outcome(&record);
+        let result = finalize_record(&self.inner, &claim, outcome).await;
+        let result = result.map(|()| result_of(&record, Output::default()));
+        Ok(RecoveredJob {
+            job_id: job_id.clone(),
+            decision: RecoveryDecision::AlreadyFinal,
+            handle: Some(Self::resolved(&job_id, &attempt_id, result)),
+        })
+    }
+
     async fn finish_exited(
         &self,
-        claim: JobClaim,
-        ctx: AttemptContext,
+        recovering: Recovering,
         mut record: AttemptRecord<E::Identity>,
-        requirement: SandboxRequirement,
     ) -> Result<RecoveredJob, RuntimeError> {
-        let Some(exit) = self.inner.executor.recorded_exit(&ctx) else {
+        let Some(exit) = self.inner.executor.recorded_exit(&recovering.ctx) else {
             let reason =
                 "process exited while the runner was down; its exit status is unknown".to_owned();
-            return self.finish_lost(claim, ctx, record, reason).await;
+            return self.finish_lost(recovering, record, reason).await;
         };
         record.exit = Some(exit);
         let ending = Ending {
@@ -750,53 +891,129 @@ impl<S: CoordinatorStore, E: Executor> Coordinator<S, E> {
             cause: None,
             lease_lost: None,
         };
-        let (event, reason) = decide(&ending, requirement, record.sandbox.as_ref());
-        let job_id = ctx.job_id.clone();
-        let attempt_id = ctx.attempt_id.clone();
-        let result = finish(
-            &self.inner,
-            &claim,
-            &ctx,
+        let (event, reason) = decide(&ending, recovering.requirement, record.sandbox.as_ref());
+        let ended = AttemptEnd {
+            ctx: recovering.ctx.clone(),
             record,
-            Output::new(0),
+            output: Output::default(),
             event,
             reason,
-            true,
-        )
-        .await;
-        Ok(RecoveredJob {
-            job_id: job_id.clone(),
-            decision: RecoveryDecision::ExitedWhileDown,
-            handle: Some(Self::resolved(&job_id, &attempt_id, result)),
-        })
+            write_record: true,
+        };
+        self.conclude_recovered(recovering, ended, RecoveryDecision::ExitedWhileDown)
+            .await
     }
 
     async fn finish_lost(
         &self,
-        claim: JobClaim,
-        ctx: AttemptContext,
+        recovering: Recovering,
         record: AttemptRecord<E::Identity>,
         reason: String,
     ) -> Result<RecoveredJob, RuntimeError> {
-        tracing::warn!(job = %ctx.job_id, attempt = %ctx.attempt_id, %reason, "recovered attempt is lost");
-        let job_id = ctx.job_id.clone();
-        let attempt_id = ctx.attempt_id.clone();
-        let result = finish(
-            &self.inner,
-            &claim,
-            &ctx,
+        tracing::warn!(
+            job = %recovering.ctx.job_id,
+            attempt = %recovering.ctx.attempt_id,
+            %reason,
+            "recovered attempt is lost"
+        );
+        let ended = AttemptEnd {
+            ctx: recovering.ctx.clone(),
             record,
-            Output::new(0),
-            LifecycleEvent::LoseLease,
-            Some(reason.clone()),
-            true,
-        )
-        .await;
+            output: Output::default(),
+            event: LifecycleEvent::LoseLease,
+            reason: Some(reason.clone()),
+            write_record: true,
+        };
+        self.conclude_recovered(recovering, ended, RecoveryDecision::Lost(reason))
+            .await
+    }
+
+    /// Finalizes a recovered attempt that ended while the runner was down,
+    /// or schedules the retry the policy admits.
+    async fn conclude_recovered(
+        &self,
+        recovering: Recovering,
+        ended: AttemptEnd<E::Identity>,
+        decision: RecoveryDecision,
+    ) -> Result<RecoveredJob, RuntimeError> {
+        let Recovering {
+            claim,
+            spec,
+            number,
+            ..
+        } = recovering;
+        let job_id = ended.ctx.job_id.clone();
+        let attempt_id = ended.ctx.attempt_id.clone();
+        let mut usage = claim.job.usage.clone();
+        let delay = match &spec {
+            Some(_) => ended.retry_delay(&claim, number, &mut usage, false),
+            None => None,
+        };
+        let (Some(spec), Some(delay)) = (spec, delay) else {
+            let result = finalize(&self.inner, &claim, ended, number).await;
+            return Ok(RecoveredJob {
+                job_id: job_id.clone(),
+                decision,
+                handle: Some(Self::resolved(&job_id, &attempt_id, result)),
+            });
+        };
+        let handle = self.spawn_retry(
+            claim,
+            spec,
+            Pending::Open(Box::new(ended)),
+            &attempt_id,
+            number,
+            delay,
+            usage,
+        );
         Ok(RecoveredJob {
-            job_id: job_id.clone(),
-            decision: RecoveryDecision::Lost(reason),
-            handle: Some(Self::resolved(&job_id, &attempt_id, result)),
+            job_id,
+            decision,
+            handle: Some(handle),
         })
+    }
+
+    /// Runs the retry of attempt `number` (closing it first if it is still
+    /// open) and every further attempt in a background task.
+    #[allow(clippy::too_many_arguments)]
+    fn spawn_retry(
+        &self,
+        claim: JobClaim,
+        spec: JobSpec,
+        pending: Pending<E::Identity>,
+        attempt_id: &AttemptId,
+        number: u32,
+        delay: SignedDuration,
+        usage: BudgetUsage,
+    ) -> JobHandle {
+        let job_id = claim.job.id.clone();
+        let (handle, mut cancel, done) = self.register(&job_id, attempt_id);
+        let inner = Arc::clone(&self.inner);
+        tokio::spawn(async move {
+            let closed = match pending {
+                Pending::Open(ended) => close(&inner, &claim, *ended).await,
+                Pending::Closed(state) => Ok(state),
+            };
+            let result = match closed {
+                Ok(closed) => {
+                    retry_then_conclude(
+                        &inner,
+                        &claim,
+                        &spec,
+                        closed,
+                        number,
+                        delay,
+                        &mut cancel,
+                        usage,
+                    )
+                    .await
+                }
+                Err(error) => Err(error),
+            };
+            inner.unregister(&job_id);
+            let _ = done.send(result);
+        });
+        handle
     }
 }
 
@@ -849,6 +1066,7 @@ where
 }
 
 fn result_of<I>(record: &AttemptRecord<I>, output: Output) -> JobResult {
+    let output = output.finish();
     JobResult {
         job_id: record.job_id.clone(),
         attempt_id: record.attempt_id.clone(),
@@ -858,9 +1076,12 @@ fn result_of<I>(record: &AttemptRecord<I>, output: Output) -> JobResult {
         reason: record.reason.clone(),
         sandbox: record.sandbox,
         recovered: record.recovered,
+        output_truncated: output.stdout_omitted > 0 || output.stderr_omitted > 0,
         stdout: output.stdout,
+        stdout_omitted: output.stdout_omitted,
         stderr: output.stderr,
-        output_truncated: output.truncated,
+        stderr_omitted: output.stderr_omitted,
+        output_capture: output.policy,
     }
 }
 
@@ -921,49 +1142,529 @@ where
     Ok(result_of(&record, output))
 }
 
-/// Drives one freshly claimed attempt from `Claimed` to a terminal state.
-async fn run_claimed<S, E>(
+/// Prefix of every reason that records a policy refusal (sandbox
+/// requirement not met). Such outcomes are deterministic: never retried.
+const POLICY_PREFIX: &str = "policy:";
+
+/// At most this many supervision notes of a recovered attempt are recorded
+/// in its reason.
+const MAX_RECOVERY_NOTES: usize = 4;
+
+/// The attempt id of attempt `number` (1-based) of the claim with fencing
+/// `epoch` on `job`: attempt 1 is [`attempt_id_for`] (`<job>-e<epoch>`),
+/// every retry under the same claim is `<job>-e<epoch>-r<number>`.
+///
+/// # Errors
+/// As [`attempt_id_for`].
+pub(crate) fn retry_attempt_id(
+    job: &WorkId,
+    epoch: u64,
+    number: u32,
+) -> Result<AttemptId, RuntimeError> {
+    if number <= 1 {
+        return attempt_id_for(job, epoch);
+    }
+    let raw = format!("{}-e{epoch}-r{number}", job.as_str());
+    AttemptId::new(raw.clone()).map_err(|error| RuntimeError::AttemptRecord {
+        attempt: raw,
+        detail: error.to_string(),
+    })
+}
+
+/// How one attempt ended, before the job-level decision (retry or
+/// finalize).
+struct AttemptEnd<I> {
+    ctx: AttemptContext,
+    record: AttemptRecord<I>,
+    output: Output,
+    event: LifecycleEvent,
+    reason: Option<String>,
+    /// `false` once the lease is known to be lost: the job record must not
+    /// be written (and nothing may be retried under that lease).
+    write_record: bool,
+}
+
+impl<I> AttemptEnd<I> {
+    /// The backoff before the next attempt, or `None` if this attempt
+    /// decides the job's outcome.
+    fn retry_delay(
+        &self,
+        claim: &JobClaim,
+        attempt: u32,
+        usage: &mut BudgetUsage,
+        cancelled: bool,
+    ) -> Option<SignedDuration> {
+        if !self.write_record || cancelled {
+            return None;
+        }
+        let state = self.record.state.transition(self.event).ok()?;
+        retry_delay(
+            claim,
+            state,
+            self.reason.as_deref(),
+            self.record.started_at,
+            attempt,
+            usage,
+        )
+    }
+}
+
+/// An attempt a retry follows: still to be closed, or already terminal.
+enum Pending<I> {
+    Open(Box<AttemptEnd<I>>),
+    Closed(LifecycleState),
+}
+
+/// What [`next_attempt`] led to.
+enum Next<I> {
+    /// The next attempt ran and ended.
+    Ended(Box<AttemptEnd<I>>),
+    /// The job ended before the next attempt ran (cancel, lease loss).
+    Final(JobResult),
+}
+
+/// A recovered job's context.
+struct Recovering {
+    claim: JobClaim,
+    ctx: AttemptContext,
+    spec: Option<JobSpec>,
+    requirement: SandboxRequirement,
+    /// 1-based number of the recovered attempt.
+    number: u32,
+}
+
+/// Whether attempt `attempt` (1-based), which ended in the terminal
+/// `state`, is followed by another one; the backoff if so.
+///
+/// Retried are only retryable states (`Failed`, `TimedOut`, `Lost`; never
+/// `Cancelled`) that are not policy refusals, while the job's retry policy
+/// admits another attempt and the job's wall-time budget covers the
+/// attempt's run time plus the backoff (charged onto `usage`).
+fn retry_delay(
+    claim: &JobClaim,
+    state: LifecycleState,
+    reason: Option<&str>,
+    started_at: Option<Timestamp>,
+    attempt: u32,
+    usage: &mut BudgetUsage,
+) -> Option<SignedDuration> {
+    if !state.is_retryable() || reason.is_some_and(|reason| reason.starts_with(POLICY_PREFIX)) {
+        return None;
+    }
+    let delay = claim.job.retry.next_delay(attempt).ok()?;
+    let budget = &claim.job.budget;
+    let ran = started_at.map_or(SignedDuration::ZERO, |started| {
+        Timestamp::now()
+            .duration_since(started)
+            .max(SignedDuration::ZERO)
+    });
+    let charged = budget
+        .charge_wall(usage, ran)
+        .and_then(|()| budget.charge_wall(usage, delay));
+    if let Err(error) = charged {
+        tracing::info!(job = %claim.job.id, attempt, %error, "no retry: wall-time budget exhausted");
+        return None;
+    }
+    Some(delay)
+}
+
+fn attempt_context(
+    config: &CoordinatorConfig,
+    job_id: &WorkId,
+    attempt_id: &AttemptId,
+) -> AttemptContext {
+    AttemptContext {
+        job_id: job_id.clone(),
+        attempt_id: attempt_id.clone(),
+        runner_id: config.runner_id.clone(),
+        workspace_root: config.workspace_root.clone(),
+    }
+}
+
+/// The heartbeat period of a lease: TTL/3, at least 10 ms.
+fn heartbeat_period(config: &CoordinatorConfig) -> Duration {
+    (config.lease_ttl / 3).max(Duration::from_millis(10))
+}
+
+/// The latest persisted attempt of the claim with fencing `epoch`: its
+/// 1-based number, id and sidecar bytes (`None` if not even the first
+/// attempt wrote one).
+async fn latest_attempt<S, E>(
+    inner: &Arc<Inner<S, E>>,
+    job_id: &WorkId,
+    epoch: u64,
+    max_attempts: u32,
+) -> Result<(u32, AttemptId, Option<Vec<u8>>), RuntimeError>
+where
+    S: CoordinatorStore,
+    E: Executor,
+{
+    let mut number = 1;
+    let mut attempt_id = attempt_id_for(job_id, epoch)?;
+    let key = attempt_id.to_string();
+    let mut bytes = blocking(&inner.store, move |store| store.read_attempt(&key)).await?;
+    if bytes.is_none() {
+        return Ok((number, attempt_id, None));
+    }
+    for next in 2..=max_attempts {
+        let candidate = retry_attempt_id(job_id, epoch, next)?;
+        let key = candidate.to_string();
+        match blocking(&inner.store, move |store| store.read_attempt(&key)).await? {
+            Some(found) => {
+                number = next;
+                attempt_id = candidate;
+                bytes = Some(found);
+            }
+            None => break,
+        }
+    }
+    Ok((number, attempt_id, bytes))
+}
+
+/// Runs a freshly claimed job: its first attempt and every retry.
+async fn run_job<S, E>(
     inner: &Arc<Inner<S, E>>,
     claim: JobClaim,
     attempt_id: AttemptId,
     spec: JobSpec,
-    mut cancel: watch::Receiver<bool>,
+    cancel: &mut watch::Receiver<bool>,
 ) -> Result<JobResult, RuntimeError>
 where
     S: CoordinatorStore,
     E: Executor,
 {
-    let job_id = claim.job.id.clone();
-    let ctx = AttemptContext {
-        job_id: job_id.clone(),
-        attempt_id: attempt_id.clone(),
-        runner_id: inner.config.runner_id.clone(),
-        workspace_root: inner.config.workspace_root.clone(),
-    };
-    let mut record = AttemptRecord::<E::Identity>::claimed(
-        job_id,
+    let record = AttemptRecord::<E::Identity>::claimed(
+        claim.job.id.clone(),
         attempt_id,
-        ctx.runner_id.clone(),
+        inner.config.runner_id.clone(),
         claim.lease.epoch,
         Timestamp::now(),
     )?;
+    let ended = run_attempt(inner, &claim, record, &spec, cancel).await?;
+    let usage = claim.job.usage.clone();
+    conclude(inner, &claim, Some(&spec), ended, 1, cancel, usage).await
+}
+
+/// Decides after attempt `attempt` ended: retry (as long as the policy
+/// admits) or finalize the job with the attempt's outcome.
+async fn conclude<S, E>(
+    inner: &Arc<Inner<S, E>>,
+    claim: &JobClaim,
+    spec: Option<&JobSpec>,
+    ended: AttemptEnd<E::Identity>,
+    attempt: u32,
+    cancel: &mut watch::Receiver<bool>,
+    usage: BudgetUsage,
+) -> Result<JobResult, RuntimeError>
+where
+    S: CoordinatorStore,
+    E: Executor,
+{
+    let mut ended = ended;
+    let mut attempt = attempt;
+    let mut usage = usage;
+    loop {
+        let cancelled = *cancel.borrow();
+        let delay = match spec {
+            Some(_) => ended.retry_delay(claim, attempt, &mut usage, cancelled),
+            None => None,
+        };
+        let (Some(spec), Some(delay)) = (spec, delay) else {
+            return finalize(inner, claim, ended, attempt).await;
+        };
+        let closed = close(inner, claim, ended).await?;
+        match next_attempt(inner, claim, spec, closed, attempt, delay, cancel).await? {
+            Next::Ended(next) => {
+                ended = *next;
+                attempt = attempt.saturating_add(1);
+            }
+            Next::Final(result) => return Ok(result),
+        }
+    }
+}
+
+/// Starts the retry after the closed attempt `attempt`, then continues as
+/// [`conclude`].
+#[allow(clippy::too_many_arguments)]
+async fn retry_then_conclude<S, E>(
+    inner: &Arc<Inner<S, E>>,
+    claim: &JobClaim,
+    spec: &JobSpec,
+    closed: LifecycleState,
+    attempt: u32,
+    delay: SignedDuration,
+    cancel: &mut watch::Receiver<bool>,
+    usage: BudgetUsage,
+) -> Result<JobResult, RuntimeError>
+where
+    S: CoordinatorStore,
+    E: Executor,
+{
+    match next_attempt(inner, claim, spec, closed, attempt, delay, cancel).await? {
+        Next::Ended(ended) => {
+            conclude(
+                inner,
+                claim,
+                Some(spec),
+                *ended,
+                attempt.saturating_add(1),
+                cancel,
+                usage,
+            )
+            .await
+        }
+        Next::Final(result) => Ok(result),
+    }
+}
+
+/// Closes an attempt that is followed by a retry: its sidecar records the
+/// terminal state, the job record stays open. Returns the terminal state.
+async fn close<S, E>(
+    inner: &Arc<Inner<S, E>>,
+    claim: &JobClaim,
+    ended: AttemptEnd<E::Identity>,
+) -> Result<LifecycleState, RuntimeError>
+where
+    S: CoordinatorStore,
+    E: Executor,
+{
+    let AttemptEnd {
+        ctx,
+        record,
+        output,
+        event,
+        reason,
+        ..
+    } = ended;
+    finish(inner, claim, &ctx, record, output, event, reason, false)
+        .await
+        .map(|result| result.state)
+}
+
+/// Finalizes the job with the outcome of attempt `attempt`.
+async fn finalize<S, E>(
+    inner: &Arc<Inner<S, E>>,
+    claim: &JobClaim,
+    ended: AttemptEnd<E::Identity>,
+    attempt: u32,
+) -> Result<JobResult, RuntimeError>
+where
+    S: CoordinatorStore,
+    E: Executor,
+{
+    let AttemptEnd {
+        ctx,
+        record,
+        output,
+        event,
+        reason,
+        write_record,
+    } = ended;
+    let reason = if attempt > 1 {
+        reason.map(|reason| format!("{reason} (attempt {attempt})"))
+    } else {
+        reason
+    };
+    finish(
+        inner,
+        claim,
+        &ctx,
+        record,
+        output,
+        event,
+        reason,
+        write_record,
+    )
+    .await
+}
+
+/// Persists attempt `attempt + 1` (history: `Retry`, `Claim`), waits the
+/// backoff while heartbeating, and runs it.
+async fn next_attempt<S, E>(
+    inner: &Arc<Inner<S, E>>,
+    claim: &JobClaim,
+    spec: &JobSpec,
+    closed: LifecycleState,
+    attempt: u32,
+    delay: SignedDuration,
+    cancel: &mut watch::Receiver<bool>,
+) -> Result<Next<E::Identity>, RuntimeError>
+where
+    S: CoordinatorStore,
+    E: Executor,
+{
+    let number = attempt.saturating_add(1);
+    let attempt_id = retry_attempt_id(&claim.job.id, claim.lease.epoch, number)?;
+    let retry = LifecycleTransition::apply(closed, LifecycleEvent::Retry)?;
+    let mut record = AttemptRecord::<E::Identity>::claimed(
+        claim.job.id.clone(),
+        attempt_id,
+        inner.config.runner_id.clone(),
+        claim.lease.epoch,
+        Timestamp::now(),
+    )?;
+    record.transitions.insert(0, retry);
+    persist(inner, &record).await?;
+    tracing::info!(
+        job = %claim.job.id,
+        attempt = %record.attempt_id,
+        number,
+        delay_ms = i64::try_from(delay.as_millis()).unwrap_or(i64::MAX),
+        "retrying job"
+    );
+    let ctx = attempt_context(&inner.config, &claim.job.id, &record.attempt_id);
+    match backoff(inner, claim, delay, cancel).await {
+        Backoff::Elapsed => {}
+        Backoff::Cancelled => {
+            record.cancellation = Some(CancellationCause::User);
+            let reason = Some(CancellationCause::User.to_string());
+            return finish(
+                inner,
+                claim,
+                &ctx,
+                record,
+                Output::default(),
+                LifecycleEvent::Cancel,
+                reason,
+                true,
+            )
+            .await
+            .map(Next::Final);
+        }
+        Backoff::LeaseLost(detail) => {
+            record.cancellation = Some(CancellationCause::LeaseLost);
+            let reason = Some(format!("lease lost: {detail}"));
+            return finish(
+                inner,
+                claim,
+                &ctx,
+                record,
+                Output::default(),
+                LifecycleEvent::LoseLease,
+                reason,
+                false,
+            )
+            .await
+            .map(Next::Final);
+        }
+    }
+    run_attempt(inner, claim, record, spec, cancel)
+        .await
+        .map(|ended| Next::Ended(Box::new(ended)))
+}
+
+/// How a retry backoff ended.
+enum Backoff {
+    Elapsed,
+    Cancelled,
+    LeaseLost(String),
+}
+
+/// Renews the lease of `claim` once.
+async fn renew<S, E>(inner: &Arc<Inner<S, E>>, claim: &JobClaim) -> Result<(), RuntimeError>
+where
+    S: CoordinatorStore,
+    E: Executor,
+{
+    let renew_claim = claim.clone();
+    blocking(&inner.store, move |store| {
+        store.transition(
+            &renew_claim,
+            JobTransition::Renew {
+                now: Timestamp::now(),
+            },
+        )
+    })
+    .await
+    .map(|_| ())
+}
+
+/// Waits `delay` while renewing the lease every TTL/3 and watching for
+/// cancellation; at the end renews once more, so that no attempt starts
+/// without a verified lease.
+async fn backoff<S, E>(
+    inner: &Arc<Inner<S, E>>,
+    claim: &JobClaim,
+    delay: SignedDuration,
+    cancel: &mut watch::Receiver<bool>,
+) -> Backoff
+where
+    S: CoordinatorStore,
+    E: Executor,
+{
+    if *cancel.borrow_and_update() {
+        return Backoff::Cancelled;
+    }
+    // `None` (unrepresentable instant): wait for cancellation or lease loss.
+    let until = Instant::now().checked_add(delay.unsigned_abs());
+    let period = heartbeat_period(&inner.config);
+    let mut heartbeat = tokio::time::interval_at(Instant::now() + period, period);
+    heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    let mut cancel_open = true;
+    loop {
+        tokio::select! {
+            () = sleep_until(until) => break,
+            _ = heartbeat.tick() => match renew(inner, claim).await {
+                Ok(()) => {}
+                Err(error) if error.is_lease_lost() => {
+                    tracing::warn!(job = %claim.job.id, %error, "lease lost during retry backoff");
+                    return Backoff::LeaseLost(error.to_string());
+                }
+                Err(error) => {
+                    tracing::warn!(job = %claim.job.id, %error, "lease renewal failed; retrying");
+                }
+            },
+            changed = cancel.changed(), if cancel_open => {
+                if changed.is_err() {
+                    cancel_open = false;
+                } else if *cancel.borrow_and_update() {
+                    return Backoff::Cancelled;
+                }
+            }
+        }
+    }
+    match renew(inner, claim).await {
+        Err(error) if error.is_lease_lost() => {
+            tracing::warn!(job = %claim.job.id, %error, "lease lost before the retry");
+            Backoff::LeaseLost(error.to_string())
+        }
+        Err(error) => {
+            // Transient: the attempt's own heartbeat decides.
+            tracing::warn!(job = %claim.job.id, %error, "lease renewal before the retry failed");
+            Backoff::Elapsed
+        }
+        Ok(()) => Backoff::Elapsed,
+    }
+}
+
+/// Drives one claimed attempt (`record` is `Claimed`) to its end.
+async fn run_attempt<S, E>(
+    inner: &Arc<Inner<S, E>>,
+    claim: &JobClaim,
+    record: AttemptRecord<E::Identity>,
+    spec: &JobSpec,
+    cancel: &mut watch::Receiver<bool>,
+) -> Result<AttemptEnd<E::Identity>, RuntimeError>
+where
+    S: CoordinatorStore,
+    E: Executor,
+{
+    let mut record = record;
+    let ctx = attempt_context(&inner.config, &claim.job.id, &record.attempt_id);
     record.apply(LifecycleEvent::Start, Timestamp::now())?;
     persist(inner, &record).await?;
 
     if *cancel.borrow_and_update() {
         record.cancellation = Some(CancellationCause::User);
         let reason = Some(CancellationCause::User.to_string());
-        return finish(
-            inner,
-            &claim,
-            &ctx,
+        return Ok(AttemptEnd {
+            ctx,
             record,
-            Output::new(0),
-            LifecycleEvent::Cancel,
+            output: Output::default(),
+            event: LifecycleEvent::Cancel,
             reason,
-            true,
-        )
-        .await;
+            write_record: true,
+        });
     }
 
     let deadline = match spec.resources.wall_timeout {
@@ -980,28 +1681,25 @@ where
         None => None,
     };
 
-    let started = match inner.executor.start(&spec, &ctx) {
+    let started = match inner.executor.start(spec, &ctx) {
         Ok(started) => started,
         Err(error) => {
             let reason = match &error {
                 RuntimeError::SandboxRequirementNotMet { report, .. } => {
                     record.sandbox = Some(*report);
-                    format!("policy: {error}; the job body did not run")
+                    format!("{POLICY_PREFIX} {error}; the job body did not run")
                 }
                 _ => format!("start failed: {error}"),
             };
             tracing::warn!(job = %ctx.job_id, %error, "attempt start failed");
-            return finish(
-                inner,
-                &claim,
-                &ctx,
+            return Ok(AttemptEnd {
+                ctx,
                 record,
-                Output::new(0),
-                LifecycleEvent::Fail,
-                Some(reason),
-                true,
-            )
-            .await;
+                output: Output::default(),
+                event: LifecycleEvent::Fail,
+                reason: Some(reason),
+                write_record: true,
+            });
         }
     };
     record.identity = started.identity;
@@ -1019,20 +1717,17 @@ where
             let exit = drain(&mut run).await;
             record.exit = Some(exit);
             let reason = format!(
-                "policy: sandbox requirement not met (not fully enforced: {}); the job was killed before it counted as running",
+                "{POLICY_PREFIX} sandbox requirement not met (not fully enforced: {}); the job was killed before it counted as running",
                 report.shortfalls().join(", ")
             );
-            return finish(
-                inner,
-                &claim,
-                &ctx,
+            return Ok(AttemptEnd {
+                ctx,
                 record,
-                Output::new(0),
-                LifecycleEvent::Fail,
-                Some(reason),
-                true,
-            )
-            .await;
+                output: Output::default(),
+                event: LifecycleEvent::Fail,
+                reason: Some(reason),
+                write_record: true,
+            });
         }
     }
 
@@ -1045,7 +1740,7 @@ where
         let _ = drain(&mut run).await;
         return Err(error);
     }
-    supervise(inner, claim, ctx, record, run, spec.sandbox, cancel).await
+    Ok(supervise(inner, claim, ctx, record, run, spec.sandbox, cancel).await)
 }
 
 /// Waits until the attempt reports its exit (or the executor vanished).
@@ -1066,22 +1761,26 @@ async fn sleep_until(at: Option<Instant>) {
 }
 
 /// Supervises a `Running` attempt: output capture, heartbeats, deadline,
-/// cancellation, lease loss; then finalizes.
+/// cancellation, lease loss; then reports how it ended.
+///
+/// For a recovered attempt, supervision notes of the executor
+/// ([`AttemptEvent::Error`], e.g. a job cgroup that could not be reopened)
+/// are recorded in the attempt's reason.
 async fn supervise<S, E>(
     inner: &Arc<Inner<S, E>>,
-    claim: JobClaim,
+    claim: &JobClaim,
     ctx: AttemptContext,
     mut record: AttemptRecord<E::Identity>,
     mut run: AttemptRun,
     requirement: SandboxRequirement,
-    mut cancel: watch::Receiver<bool>,
-) -> Result<JobResult, RuntimeError>
+    cancel: &mut watch::Receiver<bool>,
+) -> AttemptEnd<E::Identity>
 where
     S: CoordinatorStore,
     E: Executor,
 {
-    let mut output = Output::new(inner.config.output_limit);
-    let period = (inner.config.lease_ttl / 3).max(Duration::from_millis(10));
+    let mut output = Output::new(inner.config.output_capture);
+    let period = heartbeat_period(&inner.config);
     let mut heartbeat = tokio::time::interval_at(Instant::now() + period, period);
     heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     let deadline_at = record.deadline.map(|deadline| {
@@ -1090,6 +1789,7 @@ where
     });
     let mut cause: Option<CancellationCause> = None;
     let mut lease_lost: Option<String> = None;
+    let mut notes: Vec<String> = Vec::new();
     let mut cancel_open = true;
     if *cancel.borrow_and_update() {
         cause = Some(CancellationCause::User);
@@ -1103,6 +1803,9 @@ where
                 Some(AttemptEvent::Stderr(chunk)) => output.stderr(&chunk),
                 Some(AttemptEvent::Error(message)) => {
                     tracing::warn!(job = %ctx.job_id, %message, "supervision error");
+                    if record.recovered && notes.len() < MAX_RECOVERY_NOTES {
+                        notes.push(message);
+                    }
                 }
                 Some(AttemptEvent::Exited { outcome, sandbox }) => break (outcome, sandbox),
                 None => break (ExitOutcome::Unknown, None),
@@ -1159,27 +1862,50 @@ where
         lease_lost,
     };
     let (event, reason) = decide(&ending, requirement, record.sandbox.as_ref());
+    let reason = if notes.is_empty() {
+        reason
+    } else {
+        let notes = notes.join("; ");
+        Some(match reason {
+            Some(reason) => format!("{reason}; {notes}"),
+            None => notes,
+        })
+    };
     let write_record = ending.lease_lost.is_none();
-    finish(
-        inner,
-        &claim,
-        &ctx,
+    AttemptEnd {
+        ctx,
         record,
         output,
         event,
         reason,
         write_record,
-    )
-    .await
+    }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{Ending, Output, decide};
+    use super::{Ending, decide, retry_attempt_id};
+    use crate::test_support::{TestResult, ctx};
     use harw_job_core::{
         CancellationCause, EnforcementState, ExitOutcome, LifecycleEvent, SandboxReport,
         SandboxRequirement,
     };
+    use harw_types::WorkId;
+
+    #[test]
+    fn retry_attempt_ids_extend_the_claim_attempt_id() -> TestResult {
+        let job = WorkId::from_str("job-1");
+        let first = retry_attempt_id(&job, 4, 1).map_err(ctx("first"))?;
+        assert_eq!(first.as_str(), "job-1-e4");
+        assert_eq!(
+            retry_attempt_id(&job, 4, 0).map_err(ctx("zero"))?.as_str(),
+            "job-1-e4"
+        );
+        let second = retry_attempt_id(&job, 4, 2).map_err(ctx("second"))?;
+        assert_eq!(second.as_str(), "job-1-e4-r2");
+        assert_ne!(first, second);
+        Ok(())
+    }
 
     fn ending(exit: ExitOutcome) -> Ending {
         Ending {
@@ -1223,16 +1949,5 @@ mod tests {
         );
         assert_eq!(event, LifecycleEvent::Fail);
         assert!(reason.is_some_and(|reason| reason.starts_with("policy:")));
-    }
-
-    #[test]
-    fn output_is_capped() {
-        let mut output = Output::new(4);
-        output.stdout(b"ab");
-        output.stdout(b"cdef");
-        output.stderr(b"xy");
-        assert_eq!(output.stdout, b"abcd");
-        assert_eq!(output.stderr, b"xy");
-        assert!(output.truncated);
     }
 }

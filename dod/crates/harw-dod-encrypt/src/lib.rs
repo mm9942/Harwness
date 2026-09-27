@@ -78,6 +78,7 @@ pub use profile::{HarwCryptoProfile, ProfileKind};
 pub use purpose::{HarwKeyPurpose, KeyClass, SignPurpose};
 pub use replay::{REPLAY_WINDOW_BITS, ReplayWindow, SenderReplayWindows};
 pub use transcript::{
+    CG_SIGN_BODY_LIMIT, CGK1_VERIFY_OVERHEAD, MAX_KMS_SIGNATURE_LEN, MAX_SIGNABLE_TRANSCRIPT_LEN,
     MAX_TAG_LEN, MAX_TRANSCRIPT_FIELDS, MAX_TRANSCRIPT_LEN, SignTranscript, SignTranscriptBuilder,
     TRANSCRIPT_MAGIC, TRANSCRIPT_VERSION,
 };

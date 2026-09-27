@@ -104,6 +104,11 @@
 //! Controller-Kreis — Recherche erzeugt Findings, `plan reconcile` macht
 //! Evidenz daraus, `goal check` wertet sie gegen die Kriterien aus.
 //!
+//! **WorkDriver-Fläche** ([`register_work_driver_tools`], 3 Ops, hinter
+//! demselben Gate): `work_driver.enqueue`, `work_driver.status`,
+//! `work_driver.stop`. Nur Modell-Tool- und Web-Flächen, bewusst kein
+//! Command (siehe `work_driver`-Moduldoku).
+//!
 //! # Web-Fläche (`Surface::Web`) — nach welcher Regel entschieden wurde
 //! `Surface::Web` existiert seit UI-00 (samt `WebAdapter`/`WebRouteTable` in
 //! `harw-operations`), wurde aber von keiner Operation deklariert — der
@@ -181,6 +186,8 @@ pub mod help;
 // Nicht Teil von `register_all`: registriert nur der
 // `InfrastructureContributor` der Runtime, wenn `[infrastructure]` gesetzt ist.
 pub mod infra;
+// H12: Mandanten-Sichtbarkeit durabler Jobs (gemeinsam für ps/work/attach/…).
+pub(crate) mod job_tenant;
 pub mod jobs;
 pub mod kanban;
 pub mod knowledge_args;
@@ -222,6 +229,9 @@ pub(crate) mod test_support;
 pub(crate) mod testutil;
 pub mod usage;
 pub mod work;
+// R14: `work_driver.*` (enqueue/status/stop) — nur Tool- und Web-Flächen,
+// registriert über `register_work_driver_tools` neben der Planungsfläche.
+pub mod work_driver;
 pub mod workbench;
 
 use std::sync::{Arc, OnceLock};
@@ -515,6 +525,68 @@ pub fn register_plan_tools(registry: &mut OperationRegistry, config: &PlanToolCo
     PLAN_TOOL_COUNT
 }
 
+/// Anzahl der Operationen, die [`register_work_driver_tools`] bei aktivem Gate hinzufügt.
+pub const WORK_DRIVER_TOOL_COUNT: usize = 3;
+
+/// Registriert die WorkDriver-Operationen — hinter demselben Gate wie die
+/// Planungsfläche.
+///
+/// # Beschreibung
+/// Fügt `work_driver.enqueue`, `work_driver.status` und `work_driver.stop`
+/// hinzu (siehe [`work_driver`]-Moduldoku). Sie hängen am Goal-Store der
+/// Planungsfläche und stehen deshalb hinter `[tools.plan] enabled`; ist das
+/// Gate zu, wird nichts registriert.
+///
+/// Bewusst **nicht** Teil von [`register_plan_tools`]: keine der drei trägt
+/// eine Command-Fläche, und `work_driver.enqueue` ist zur Laufzeit nur für
+/// Orchestratoren nutzbar, deren IR einen `[work_driver]`-Abschnitt hat (die
+/// Runtime legt dafür `Arc<work_driver::WorkDriverCaller>` in den
+/// `OpContext`). Die Runtime ruft diese Funktion direkt nach
+/// [`register_plan_tools`] auf.
+///
+/// # Rückgabe
+/// [`WORK_DRIVER_TOOL_COUNT`] oder `0`.
+///
+/// # Nebenläufigkeit
+/// Erfordert `&mut`-Zugriff auf die Registry; der Aufrufer synchronisiert.
+///
+/// # Beispiel
+/// ```rust
+/// use harw_operations::registry::OperationRegistry;
+/// use harw_plan::config::PlanToolConfig;
+///
+/// let mut registry = OperationRegistry::new();
+/// assert_eq!(
+///     harw_ops::register_work_driver_tools(&mut registry, &PlanToolConfig::default()),
+///     0
+/// );
+/// let added = harw_ops::register_work_driver_tools(
+///     &mut registry,
+///     &PlanToolConfig::enabled_defaults(),
+/// );
+/// assert_eq!(added, harw_ops::WORK_DRIVER_TOOL_COUNT);
+/// assert!(registry.find_by_name("work_driver.enqueue").is_some());
+/// assert!(registry.find_by_name("work_driver.status").is_some());
+/// assert!(registry.find_by_name("work_driver.stop").is_some());
+/// ```
+pub fn register_work_driver_tools(
+    registry: &mut OperationRegistry,
+    config: &PlanToolConfig,
+) -> usize {
+    if !config.enabled {
+        return 0;
+    }
+    let ops: [Arc<dyn Operation>; WORK_DRIVER_TOOL_COUNT] = [
+        Arc::new(work_driver::WorkDriverEnqueueOperation),
+        Arc::new(work_driver::WorkDriverStatusOperation),
+        Arc::new(work_driver::WorkDriverStopOperation),
+    ];
+    for op in ops {
+        registry.register(op);
+    }
+    WORK_DRIVER_TOOL_COUNT
+}
+
 #[cfg(test)]
 mod tests {
     use super::{compact_unavailable_output, register_all};
@@ -530,6 +602,7 @@ mod tests {
         let mut reg = OperationRegistry::new();
         register_all(&mut reg);
         super::register_plan_tools(&mut reg, &PlanToolConfig::enabled_defaults());
+        super::register_work_driver_tools(&mut reg, &PlanToolConfig::enabled_defaults());
         reg
     }
 
@@ -611,6 +684,24 @@ mod tests {
             WebMethod::Post,
             ApprovalPolicy::None,
         ),
+        (
+            "work_driver.enqueue",
+            "/api/work-driver/enqueue",
+            WebMethod::Post,
+            ApprovalPolicy::Always,
+        ),
+        (
+            "work_driver.status",
+            "/api/work-driver/status",
+            WebMethod::Get,
+            ApprovalPolicy::None,
+        ),
+        (
+            "work_driver.stop",
+            "/api/work-driver/stop",
+            WebMethod::Post,
+            ApprovalPolicy::Always,
+        ),
     ];
 
     #[test]
@@ -661,7 +752,14 @@ mod tests {
         for (name, _path, method, _approval) in EXPECTED_WEB_SURFACES {
             let is_mutating = matches!(
                 *name,
-                "stop" | "plan" | "goal" | "approval.resolve" | "permissions" | "analyze"
+                "stop"
+                    | "plan"
+                    | "goal"
+                    | "approval.resolve"
+                    | "permissions"
+                    | "analyze"
+                    | "work_driver.enqueue"
+                    | "work_driver.stop"
             );
             let expected = if is_mutating {
                 WebMethod::Post
@@ -699,6 +797,9 @@ mod tests {
             ("goal", PermissionTier::Operator),
             ("approval.pending", PermissionTier::Observer),
             ("approval.resolve", PermissionTier::Operator),
+            ("work_driver.enqueue", PermissionTier::Operator),
+            ("work_driver.status", PermissionTier::Observer),
+            ("work_driver.stop", PermissionTier::Operator),
         ];
         for (name, tier) in expected_permissions {
             let op = reg.find_by_name(name.trim()).ok_or_else(|| {
@@ -813,6 +914,38 @@ mod tests {
     }
 
     #[test]
+    fn register_work_driver_tools_follows_the_plan_gate() {
+        let mut reg = OperationRegistry::new();
+        register_all(&mut reg);
+        let before = reg.len();
+
+        let closed = super::register_work_driver_tools(&mut reg, &PlanToolConfig::default());
+        assert_eq!(closed, 0, "geschlossenes Gate darf nichts registrieren");
+        assert_eq!(reg.len(), before);
+
+        let added =
+            super::register_work_driver_tools(&mut reg, &PlanToolConfig::enabled_defaults());
+        assert_eq!(added, super::WORK_DRIVER_TOOL_COUNT);
+        assert_eq!(reg.len(), before + super::WORK_DRIVER_TOOL_COUNT);
+        for name in [
+            "work_driver.enqueue",
+            "work_driver.status",
+            "work_driver.stop",
+        ] {
+            let op = reg.find_by_name(name);
+            assert!(op.is_some(), "{name} wurde nicht registriert");
+            assert!(
+                op.is_some_and(|op| !op
+                    .meta()
+                    .surfaces
+                    .iter()
+                    .any(|surface| matches!(surface, Surface::Command { .. }))),
+                "{name} darf keine Command-Fläche tragen (kein TUI-Befehl)"
+            );
+        }
+    }
+
+    #[test]
     fn mode_is_registered_unconditionally_not_behind_the_plan_gate() {
         // `/mode` steuert die Session, nicht die Planungsfläche. Läge es hinter
         // dem Gate, könnte eine Laufzeit ohne Plan-Store den Modus nicht mehr
@@ -915,6 +1048,7 @@ mod tests {
         let mut reg = OperationRegistry::new();
         register_all(&mut reg);
         super::register_plan_tools(&mut reg, &PlanToolConfig::enabled_defaults());
+        super::register_work_driver_tools(&mut reg, &PlanToolConfig::enabled_defaults());
 
         let registered_names: std::collections::BTreeSet<&str> =
             reg.iter().map(|op| op.meta().name).collect();
@@ -987,6 +1121,9 @@ mod tests {
             "research_deps",
             "research_web",
             "analyze",
+            "work_driver.enqueue",
+            "work_driver.status",
+            "work_driver.stop",
         ];
 
         for name in declared_names {

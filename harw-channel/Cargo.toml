@@ -1,6 +1,7 @@
 [package]
 publish.workspace = true
 name = "harw-channel"
+description = "Transport-agnostic channel-ingress core with session management, pairing codes, and admission control"
 version.workspace = true
 edition.workspace = true
 license.workspace = true

@@ -448,6 +448,10 @@ pub struct RuntimeServices {
     /// Plan R9, Teil F: die Job-Verwaltung der Sitzung (nur TUI), für
     /// `/jobs` auf der Slash-Fläche.
     job_manager: Option<Arc<harw_tool_job::JobManager>>,
+    /// R14: der WorkDriver-Aufrufer für `work_driver.enqueue`, nur auf der
+    /// Modell-Werkzeug-Fläche der Wurzel-Sitzung selbst (siehe
+    /// [`Self::with_work_driver_caller`]).
+    work_driver_caller: Option<Arc<harw_ops::work_driver::WorkDriverCaller>>,
 }
 
 /// Legt `service` in `map` ab und merkt sich seinen Typnamen in `names`.
@@ -494,6 +498,7 @@ impl RuntimeServices {
             live_model_control: None,
             live_config: None,
             job_manager: None,
+            work_driver_caller: None,
         }
     }
 
@@ -504,6 +509,22 @@ impl RuntimeServices {
     #[must_use]
     pub fn with_job_manager(mut self, manager: Arc<harw_tool_job::JobManager>) -> Self {
         self.job_manager = Some(manager);
+        self
+    }
+
+    /// R14: legt den WorkDriver-Aufrufer
+    /// (`Arc<harw_ops::work_driver::WorkDriverCaller>`) auf die
+    /// Modell-Werkzeug-Fläche der eigenen (Wurzel-)Sitzung —
+    /// `work_driver.enqueue` liest ihn über
+    /// `ctx.service::<Arc<WorkDriverCaller>>()`. Die Web-Fläche und jede
+    /// Kind-/Job-Fläche bekommen ihn nicht: der Web-Pfad braucht dafür einen
+    /// eigenen Orchestrator, den es noch nicht gibt. `None` ändert nichts.
+    #[must_use]
+    pub fn with_work_driver_caller(
+        mut self,
+        caller: Option<Arc<harw_ops::work_driver::WorkDriverCaller>>,
+    ) -> Self {
+        self.work_driver_caller = caller;
         self
     }
 
@@ -777,6 +798,7 @@ impl RuntimeServices {
     /// | `Arc<dyn LiveModelControl>` (falls gebunden, Live-Modellwechsel) | ✓ | — | — | — |
     /// | `Arc<LiveConfig>` (falls gebunden; `Arc<ResolvedConfig>` ist dann überall der Live-Stand) | ✓ | — | — | — |
     /// | `Arc<InfrastructureAvailability>` (falls vorhanden, `[infrastructure]`) | ✓ | — | ✓ | — |
+    /// | `Arc<`[`harw_ops::work_driver::WorkDriverCaller`]`>` (falls gebunden, R14, `work_driver.enqueue`) | — | ✓ | — | — |
     ///
     /// Die Zeile [`OperationRegistry`] trägt in jeder Fläche dieselbe Menge —
     /// nämlich die, die [`crate::spec::EntryProfile::operations`] dem Einstieg
@@ -913,6 +935,17 @@ impl RuntimeServices {
             .filter(|_| surface == ServiceSurface::Slash)
         {
             insert_service(&mut map, &mut names, Arc::clone(manager));
+        }
+        // R14: nur die Modell-Werkzeug-Fläche der Wurzel-Sitzung selbst —
+        // der Web-Pfad braucht dafür einen eigenen Orchestrator, den es noch
+        // nicht gibt, und Kind-/Job-Flächen ruft `work_driver.enqueue`
+        // ohnehin nicht auf.
+        if let Some(caller) = self
+            .work_driver_caller
+            .as_ref()
+            .filter(|_| surface == ServiceSurface::ModelTool)
+        {
+            insert_service(&mut map, &mut names, Arc::clone(caller));
         }
         // Die vier deklarierten Differenzen — und nur sie.
         if let Some(spawner) = self
@@ -2088,6 +2121,69 @@ mod tests {
             );
         }
         Ok(())
+    }
+
+    /// R14: der WorkDriver-Aufrufer liegt nur auf der Modell-Werkzeug-Fläche
+    /// (`ServiceSurface::ModelTool`) — nicht auf Slash, Web oder Job — und
+    /// nur, wenn die Montage ihn (mit `Some`) gebunden hat; `None` ändert
+    /// nichts.
+    #[test]
+    fn work_driver_caller_is_model_tool_only_once_bound() {
+        use harw_agent_dsl::ir_v2::WorkDriverSpec;
+        use harw_ops::work_driver::WorkDriverCaller;
+
+        fn spec() -> WorkDriverSpec {
+            WorkDriverSpec {
+                max_iterations: 8,
+                max_parallel_workers: 4,
+                max_attempts_per_worker: 4,
+                stall_iterations: 2,
+                worker_role: "executor".to_owned(),
+                judge_role: Some("evaluator".to_owned()),
+                verify: vec!["cargo test".to_owned()],
+                token_budget: Some(1_000_000),
+                wall_budget_secs: None,
+            }
+        }
+
+        let unbound = RuntimeServices::new(full_parts());
+        for surface in ServiceSurface::ALL {
+            assert!(
+                unbound
+                    .service_map(surface)
+                    .get::<Arc<WorkDriverCaller>>()
+                    .is_none()
+            );
+        }
+
+        // `None` ändert nichts.
+        let still_unbound = RuntimeServices::new(full_parts()).with_work_driver_caller(None);
+        for surface in ServiceSurface::ALL {
+            assert!(
+                still_unbound
+                    .service_map(surface)
+                    .get::<Arc<WorkDriverCaller>>()
+                    .is_none()
+            );
+        }
+
+        let caller = Arc::new(WorkDriverCaller {
+            role: "orchestrator".to_owned(),
+            spec: spec(),
+        });
+        let bound =
+            RuntimeServices::new(full_parts()).with_work_driver_caller(Some(Arc::clone(&caller)));
+        for surface in ServiceSurface::ALL {
+            assert_eq!(
+                bound
+                    .service_map(surface)
+                    .get::<Arc<WorkDriverCaller>>()
+                    .is_some(),
+                surface == ServiceSurface::ModelTool,
+                "{}",
+                surface.as_str()
+            );
+        }
     }
 
     /// Runde 5, Teil P: die `plan`-Operation findet den Bestätigungskanal

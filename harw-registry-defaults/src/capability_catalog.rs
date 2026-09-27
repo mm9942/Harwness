@@ -249,6 +249,20 @@ pub const PROVIDER_FEATURES: &[&str] = &[
 /// The runner feature that is always enabled.
 pub const CORE_FEATURE: &str = "core";
 
+/// `work_driver.enqueue` (R14, `harw-ops/src/work_driver.rs`): starts a
+/// durable WorkDriver run.
+pub const WORK_DRIVER_ENQUEUE_TOOL: &str = "work_driver.enqueue";
+/// `work_driver.status`: reads a WorkDriver job and its state sidecar.
+pub const WORK_DRIVER_STATUS_TOOL: &str = "work_driver.status";
+/// `work_driver.stop`: cancels a WorkDriver job through the job cancel path.
+pub const WORK_DRIVER_STOP_TOOL: &str = "work_driver.stop";
+/// The three WorkDriver tools.
+pub const WORK_DRIVER_TOOLS: &[&str] = &[
+    WORK_DRIVER_ENQUEUE_TOOL,
+    WORK_DRIVER_STATUS_TOOL,
+    WORK_DRIVER_STOP_TOOL,
+];
+
 macro_rules! row {
     ($tool:literal, $provider:ident, $class:ident) => {
         CapabilityEntry {
@@ -328,6 +342,18 @@ pub const CATALOG: &[CapabilityEntry] = &[
     // `tools.admitted` can carry it (gate:
     // `crate::agent_definition_tools::agent_build_provider_for`).
     row!("agents.build", JOB, Shell),
+    // WorkDriver (R14): `work_driver.enqueue` admits a durable background
+    // job that runs the orchestrator's `[work_driver] verify` commands and
+    // drives worker agents — the same launch class as `job.start` and
+    // `agents.build` (`Shell`), so a manifest admitting it must carry the
+    // process right. Status and stop only read or cancel a job record
+    // (`Meta`, like `job.status`/`job.stop`). Provider: the agent core — the
+    // operations live in `harw-ops`, the job kind in the CLI job worker; no
+    // tool provider crate of its own. Not `always`: only an orchestrator
+    // whose definition has `[work_driver]` can use it.
+    row!("work_driver.enqueue", AGENTS, Shell),
+    row!("work_driver.status", AGENTS, Meta),
+    row!("work_driver.stop", AGENTS, Meta),
     // processes
     row!("process.list", PROCESS, Shell),
     row!("process.kill", PROCESS, Shell),
@@ -609,6 +635,54 @@ mod tests {
             assert!(
                 !profile.registered_tool_names().contains(&"agents.build"),
                 "{profile:?} bewirbt agents.build von sich aus"
+            );
+        }
+    }
+
+    /// R14: the WorkDriver tools have catalog rows; `enqueue` starts durable
+    /// work and is at least as strict as `job.start`, status/stop are
+    /// rights-free `Meta` like `job.status`/`job.stop`; none is auto-approved
+    /// or served by every runner by default.
+    #[test]
+    fn test_work_driver_tools_are_classified() {
+        let class = |tool: &str| lookup(tool).map(|entry| entry.class);
+        assert_eq!(WORK_DRIVER_TOOLS.len(), 3);
+        assert_eq!(
+            class(WORK_DRIVER_ENQUEUE_TOOL),
+            Some(CapabilityClass::Shell)
+        );
+        assert!(
+            class(WORK_DRIVER_ENQUEUE_TOOL) >= class("job.start"),
+            "work_driver.enqueue must be at least as strict as job.start"
+        );
+        assert_eq!(class(WORK_DRIVER_STATUS_TOOL), Some(CapabilityClass::Meta));
+        assert_eq!(class(WORK_DRIVER_STOP_TOOL), Some(CapabilityClass::Meta));
+
+        let enqueue = CapabilityCatalog
+            .classify(WORK_DRIVER_ENQUEUE_TOOL)
+            .unwrap_or_default();
+        assert!(
+            enqueue.shell,
+            "enqueue needs the process right in a manifest"
+        );
+        assert!(!enqueue.write_workspace && !enqueue.network && !enqueue.host);
+        for tool in [WORK_DRIVER_STATUS_TOOL, WORK_DRIVER_STOP_TOOL] {
+            assert_eq!(
+                CapabilityCatalog.classify(tool),
+                Some(CapabilityClass::Meta.tool_classes()),
+                "{tool} carries no manifest right"
+            );
+        }
+        for tool in WORK_DRIVER_TOOLS {
+            let entry = lookup(tool);
+            assert!(
+                entry.is_some_and(|entry| !entry.always_available),
+                "{tool}: only orchestrators with [work_driver] get it"
+            );
+            assert_eq!(entry.map(CapabilityEntry::feature), Some(CORE_FEATURE));
+            assert!(
+                !crate::AUTO_APPROVED_TOOLS.contains(tool),
+                "{tool} must not be auto-approved"
             );
         }
     }

@@ -4804,12 +4804,20 @@ async fn drive_turn(
 
                     let paused_at = jiff::Timestamp::now();
                     if let Some(approvals) = approvals {
+                        // Mandant der auslösenden Sitzung: die serverseitig
+                        // aufgelöste Workspace-Bindung ihres Sandbox-Scopes.
+                        // Mandantengebundene Leser (`approval.pending`,
+                        // `approval.resolve`) filtern darauf.
+                        let tenant = session
+                            .spawn_context()
+                            .map(|context| context.sandbox.workspace().tenant().clone());
                         approvals.issue(&ApprovalRecord {
                             request: request.clone(),
                             session: session.id().clone(),
                             call_id: call.id.clone(),
                             actor: actor.clone(),
                             issued_at: paused_at,
+                            tenant,
                         })?;
                     }
                     session.begin_approval(call.clone(), request.clone(), actor, paused_at)?;

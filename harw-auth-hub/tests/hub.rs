@@ -7,11 +7,16 @@ mod support;
 
 use std::fs;
 use std::os::unix::fs::{FileTypeExt, PermissionsExt};
+use std::time::Duration;
 
 use crypt_guard_hyper::codec::{FrameReader, FrameWriter};
 use harw_auth_hub::{HubError, HubListener};
+use harw_dod_encrypt::{SignPurpose, SignTranscript};
 use http::{Method, StatusCode};
-use support::{RunningHub, TestError, TestResult, ctx, ensure, write_file};
+use support::{RunningHub, SealedHub, TestError, TestResult, ctx, ensure, write_file};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::UnixStream;
+use tokio::time::timeout;
 
 const TOKEN: &str = "ops-token-0123456789abcdef0123456789";
 
@@ -50,6 +55,13 @@ fn crypt_body(info: &[u8], aad: &[u8], payload: &[u8]) -> TestResult<Vec<u8>> {
     writer.field(info).map_err(ctx("frame info"))?;
     writer.field(aad).map_err(ctx("frame aad"))?;
     writer.field(payload).map_err(ctx("frame payload"))?;
+    Ok(writer.finish())
+}
+
+/// `sign`/`verify` layout: a single `message` field.
+fn sign_body(message: &[u8]) -> TestResult<Vec<u8>> {
+    let mut writer = FrameWriter::new();
+    writer.field(message).map_err(ctx("frame message"))?;
     Ok(writer.finish())
 }
 
@@ -458,4 +470,209 @@ async fn stale_socket_is_replaced_live_socket_and_files_are_kept() -> TestResult
     }
     let kept = fs::read(&regular).map_err(ctx("read regular"))?;
     ensure(kept == b"do not delete", "regular file untouched")
+}
+
+/// Config granting the test process's own uid everything in `app`, for a
+/// [`SealedHub`] (whose config closure also receives the store path, unused
+/// here: the store is already opened by the caller before the config text
+/// is even parsed).
+fn sealed_own_uid_config(
+    _dir: &std::path::Path,
+    _store_path: &std::path::Path,
+    uid: u32,
+) -> String {
+    format!(
+        "[[peers]]\nuid = {uid}\nprincipal = \"harw-web\"\n\
+         grants = [ {{ namespace = \"app\", ops = [\"all\"] }} ]\n"
+    )
+}
+
+#[tokio::test]
+async fn sealed_hub_keeps_keys_and_epoch_across_restart() -> TestResult {
+    let hub = SealedHub::start(sealed_own_uid_config).await?;
+    let mut client = hub.client().await?;
+
+    let (status, body) = client
+        .send(
+            Method::POST,
+            "/v1/keys",
+            generate_body("app", "k1", "pq-hpke-default")?,
+            None,
+        )
+        .await?;
+    ensure(status == StatusCode::OK, "generate status")?;
+    parse_key_created(&body)?;
+
+    let material = b"data-encryption-key-0123456789ab";
+    let (status, wrapped) = client
+        .send(
+            Method::POST,
+            "/v1/keys/app/k1:wrap",
+            crypt_body(b"dek", b"tenant-a", material)?,
+            None,
+        )
+        .await?;
+    ensure(status == StatusCode::OK, "wrap status")?;
+
+    let (status, body) = client.get("/v1/capabilities").await?;
+    ensure(status == StatusCode::OK, "capabilities status")?;
+    let caps = json(&body)?;
+    ensure(
+        caps["persistence"] == "sealed-file",
+        "capabilities.persistence before restart",
+    )?;
+    let epoch_before = caps["store_epoch"]
+        .as_str()
+        .ok_or(TestError::Missing("store_epoch"))?
+        .to_owned();
+
+    drop(client);
+    let hub = hub.restart(sealed_own_uid_config).await?;
+    let mut client = hub.client().await?;
+
+    let (status, body) = client.get("/v1/capabilities").await?;
+    ensure(
+        status == StatusCode::OK,
+        "capabilities status after restart",
+    )?;
+    let caps = json(&body)?;
+    ensure(
+        caps["persistence"] == "sealed-file",
+        "capabilities.persistence after restart",
+    )?;
+    let epoch_after = caps["store_epoch"]
+        .as_str()
+        .ok_or(TestError::Missing("store_epoch"))?
+        .to_owned();
+    ensure(
+        epoch_before == epoch_after,
+        "store_epoch survives a restart",
+    )?;
+
+    let (status, unwrapped) = client
+        .send(
+            Method::POST,
+            "/v1/keys/app/k1:unwrap",
+            crypt_body(b"dek", b"tenant-a", &wrapped)?,
+            None,
+        )
+        .await?;
+    ensure(status == StatusCode::OK, "unwrap after restart status")?;
+    ensure(
+        unwrapped.as_ref() == material,
+        "unwrap after restart recovers material wrapped before the restart",
+    )?;
+
+    drop(client);
+    hub.stop().await
+}
+
+#[tokio::test]
+async fn in_memory_hub_reports_in_memory_persistence() -> TestResult {
+    let hub = RunningHub::start(own_uid_config).await?;
+    let mut client = hub.client().await?;
+
+    let (status, body) = client.get("/v1/capabilities").await?;
+    ensure(status == StatusCode::OK, "capabilities status")?;
+    let caps = json(&body)?;
+    ensure(
+        caps["persistence"] == "in-memory",
+        "capabilities.persistence",
+    )?;
+    ensure(caps["store_epoch"].is_string(), "capabilities.store_epoch")?;
+
+    let (status, body) = client.get("/v1/version").await?;
+    ensure(status == StatusCode::OK, "version status")?;
+    let version = json(&body)?;
+    ensure(version["store_epoch"].is_string(), "version.store_epoch")?;
+
+    drop(client);
+    hub.stop().await
+}
+
+#[tokio::test]
+async fn harw_sign_rejects_a_non_transcript_message() -> TestResult {
+    let hub = RunningHub::start(|_dir, uid| {
+        format!(
+            "[[peers]]\nuid = {uid}\nprincipal = \"harw-web\"\n\
+             grants = [ {{ namespace = \"harw.artifact-signing\", ops = [\"admin\", \"sign\"] }} ]\n"
+        )
+    })
+    .await?;
+    let mut client = hub.client().await?;
+
+    // Generate an artifact-signing key (ML-DSA-87 is the default profile
+    // for `ArtifactSigning`, see `HarwCryptoProfile::default_for`).
+    let (status, body) = client
+        .send(
+            Method::POST,
+            "/v1/keys",
+            generate_body("harw.artifact-signing", "node1", "ml-dsa-87")?,
+            None,
+        )
+        .await?;
+    ensure(status == StatusCode::OK, "generate artifact-signing key")?;
+    parse_key_created(&body)?;
+
+    // A raw, non-transcript message is refused by `HarwUsageAuthorizer`'s
+    // transcript-binding check: `hide_forbidden_keys` may report it as an
+    // opaque 404 rather than 403.
+    let (status, _) = client
+        .send(
+            Method::POST,
+            "/v1/keys/harw.artifact-signing/node1:sign",
+            sign_body(b"just some raw bytes, not a canonical transcript")?,
+            None,
+        )
+        .await?;
+    ensure(
+        status == StatusCode::FORBIDDEN || status == StatusCode::NOT_FOUND,
+        "raw message → 403 or 404",
+    )?;
+
+    // A canonical transcript of the key's own sign purpose is accepted.
+    let transcript = SignTranscript::builder(SignPurpose::ArtifactManifest)
+        .field("manifest", b"artifact-manifest-digest-bytes")
+        .build_for_kms()
+        .map_err(ctx("build transcript"))?;
+    let (status, signature) = client
+        .send(
+            Method::POST,
+            "/v1/keys/harw.artifact-signing/node1:sign",
+            sign_body(transcript.as_bytes())?,
+            None,
+        )
+        .await?;
+    ensure(status == StatusCode::OK, "valid transcript → 200")?;
+    ensure(!signature.is_empty(), "signature present")?;
+
+    drop(client);
+    hub.stop().await
+}
+
+#[tokio::test]
+async fn stalled_header_is_disconnected() -> TestResult {
+    let hub = RunningHub::start(own_uid_config).await?;
+
+    let mut stream = UnixStream::connect(&hub.socket)
+        .await
+        .map_err(ctx("connect"))?;
+    stream
+        .write_all(b"GET / HTTP/1.1\r\n")
+        .await
+        .map_err(ctx("write partial header"))?;
+
+    // The server must close the connection within
+    // `HEADER_READ_TIMEOUT` (10s); give it a margin up to 15s total.
+    let mut buf = [0u8; 1];
+    let read = timeout(Duration::from_secs(15), stream.read(&mut buf))
+        .await
+        .map_err(|_| TestError::Unexpected("connection was not closed within 15s".to_owned()))?
+        .map_err(ctx("read after stall"))?;
+    ensure(
+        read == 0,
+        "stalled connection must be closed (EOF), not answered",
+    )?;
+
+    hub.stop().await
 }

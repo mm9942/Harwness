@@ -6,8 +6,9 @@ mod common;
 use common::{TestError, TestResult, ctx};
 use crypt_guard_service::{
     AllowAll, Authorizer, CiphertextBlob, CryptoContext, CryptoOperation, CryptoServiceError,
-    DescribeKey, KeyAlgorithm, KeyId, KeyNamespace, KeyRef, OpKind, Principal as CgPrincipal,
-    RequestContext, RequestId, RewrapKey, SignatureAlgorithm,
+    DescribeKey, KeyAlgorithm, KeyId, KeyNamespace, KeyRef, MessageBlob, OpKind,
+    Principal as CgPrincipal, RequestContext, RequestId, RewrapKey, SecretBytes, Sign,
+    SignatureAlgorithm, SignatureBlob, Verify,
 };
 use harw_dod_encrypt::cg::{
     self, HarwUsageAuthorizer, allows, generate_operation, harw_key_ref, harw_op, key_ref,
@@ -15,8 +16,10 @@ use harw_dod_encrypt::cg::{
     verify_operation,
 };
 use harw_dod_encrypt::{
-    EncryptError, GrantRole, HarwCryptoProfile, HarwGrant, HarwKeyOp, HarwKeyPurpose, HarwKeyRef,
-    HarwKeyVersion, KeyUsagePolicy, NodeId, SignPurpose, SignTranscript,
+    CG_SIGN_BODY_LIMIT, CGK1_VERIFY_OVERHEAD, EncryptError, GrantRole, HarwCryptoProfile,
+    HarwGrant, HarwKeyOp, HarwKeyPurpose, HarwKeyRef, HarwKeyVersion, KeyUsagePolicy,
+    MAX_KMS_SIGNATURE_LEN, MAX_SIGNABLE_TRANSCRIPT_LEN, MAX_TRANSCRIPT_LEN, NodeId, SignPurpose,
+    SignTranscript,
 };
 
 fn node(name: &str) -> TestResult<NodeId> {
@@ -304,6 +307,301 @@ fn test_authorizer_delegates_to_inner_policy() -> TestResult {
     assert_eq!(
         auth.authorize(&known, &describe("harw.node-identity")?),
         Ok(())
+    );
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Transcript binding in the authorizer (sign/verify payloads)
+// ---------------------------------------------------------------------------
+
+/// An inner authorizer with a distinctive verdict: seeing `Conflict` proves
+/// the request got past the Harw checks and reached `inner`.
+struct InnerMarker;
+
+impl Authorizer for InnerMarker {
+    fn authorize(
+        &self,
+        _ctx: &RequestContext,
+        _op: &CryptoOperation,
+    ) -> Result<(), CryptoServiceError> {
+        Err(CryptoServiceError::Conflict)
+    }
+}
+
+fn raw_sign(key: &KeyRef, message: &[u8]) -> CryptoOperation {
+    CryptoOperation::Sign(Sign {
+        key: key.clone(),
+        message: SecretBytes::copy_from_slice(message),
+    })
+}
+
+fn raw_verify(key: &KeyRef, message: &[u8]) -> CryptoOperation {
+    CryptoOperation::Verify(Verify {
+        key: key.clone(),
+        message: MessageBlob::new(message.to_vec()),
+        signature: SignatureBlob::new(vec![0u8; 16]),
+    })
+}
+
+/// A well-formed transcript of `purpose` whose encoding is exactly `len`
+/// bytes (built with the general, non-KMS limit).
+fn transcript_of_len(purpose: SignPurpose, len: usize) -> TestResult<SignTranscript> {
+    let base = SignTranscript::builder(purpose)
+        .field("pad", b"")
+        .build()
+        .map_err(ctx("base transcript"))?
+        .as_bytes()
+        .len();
+    let pad = len
+        .checked_sub(base)
+        .ok_or(TestError::Missing("pad length"))?;
+    let t = SignTranscript::builder(purpose)
+        .field("pad", &vec![0u8; pad])
+        .build()
+        .map_err(ctx("padded transcript"))?;
+    if t.as_bytes().len() != len {
+        return Err(TestError::Unexpected(format!(
+            "padded transcript has {} bytes, want {len}",
+            t.as_bytes().len()
+        )));
+    }
+    Ok(t)
+}
+
+fn identity_key() -> TestResult<KeyRef> {
+    key_ref(HarwKeyPurpose::NodeIdentity, &node("node-a")?).map_err(ctx("identity key"))
+}
+
+#[test]
+fn test_authorizer_rejects_raw_sign_bytes_on_harw_namespace() -> TestResult {
+    let auth = HarwUsageAuthorizer::new(AllowAll);
+    let key = identity_key()?;
+    let messages: [&[u8]; 3] = [b"raw", b"", b"HARWSIG\0"];
+    for message in messages {
+        assert_eq!(
+            auth.authorize(&ctx0(), &raw_sign(&key, message)),
+            Err(CryptoServiceError::Forbidden)
+        );
+    }
+    // A truncated own-purpose transcript is not a transcript either.
+    let own = transcript(SignPurpose::NodeHandshake)?;
+    let cut = own
+        .as_bytes()
+        .split_last()
+        .map(|(_, rest)| rest)
+        .ok_or(TestError::Missing("transcript bytes"))?;
+    assert_eq!(
+        auth.authorize(&ctx0(), &raw_sign(&key, cut)),
+        Err(CryptoServiceError::Forbidden)
+    );
+    Ok(())
+}
+
+#[test]
+fn test_authorizer_rejects_sign_of_foreign_purpose_transcript() -> TestResult {
+    let auth = HarwUsageAuthorizer::new(AllowAll);
+    let key = identity_key()?;
+    for purpose in [
+        SignPurpose::ArtifactManifest,
+        SignPurpose::SecureFrame,
+        SignPurpose::AuditCheckpoint,
+        SignPurpose::ServiceHandshake,
+    ] {
+        let foreign = transcript(purpose)?;
+        assert_eq!(
+            auth.authorize(&ctx0(), &raw_sign(&key, foreign.as_bytes())),
+            Err(CryptoServiceError::Forbidden),
+            "{purpose:?}"
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn test_authorizer_allows_own_purpose_sign_and_delegates() -> TestResult {
+    let key = identity_key()?;
+    let own = transcript(SignPurpose::NodeHandshake)?;
+
+    // Passes the Harw checks: AllowAll allows ...
+    let allow = HarwUsageAuthorizer::new(AllowAll);
+    assert_eq!(
+        allow.authorize(&ctx0(), &raw_sign(&key, own.as_bytes())),
+        Ok(())
+    );
+    let harw_key = HarwKeyRef::latest(HarwKeyPurpose::NodeIdentity, node("node-a")?);
+    let built = sign_operation(&harw_key, own.clone()).map_err(ctx("sign_operation"))?;
+    assert_eq!(allow.authorize(&ctx0(), &built), Ok(()));
+
+    // ... and the verdict really is the inner authorizer's.
+    let marker = HarwUsageAuthorizer::new(InnerMarker);
+    assert_eq!(
+        marker.authorize(&ctx0(), &raw_sign(&key, own.as_bytes())),
+        Err(CryptoServiceError::Conflict)
+    );
+    // A bad payload is refused before the inner authorizer runs.
+    assert_eq!(
+        marker.authorize(&ctx0(), &raw_sign(&key, b"raw")),
+        Err(CryptoServiceError::Forbidden)
+    );
+    Ok(())
+}
+
+#[test]
+fn test_authorizer_binds_verify_payload_to_key_purpose() -> TestResult {
+    let key = identity_key()?;
+    let allow = HarwUsageAuthorizer::new(AllowAll);
+    let marker = HarwUsageAuthorizer::new(InnerMarker);
+
+    // Raw bytes and foreign transcripts are refused.
+    assert_eq!(
+        allow.authorize(&ctx0(), &raw_verify(&key, b"raw")),
+        Err(CryptoServiceError::Forbidden)
+    );
+    let foreign = transcript(SignPurpose::ArtifactManifest)?;
+    assert_eq!(
+        allow.authorize(&ctx0(), &raw_verify(&key, foreign.as_bytes())),
+        Err(CryptoServiceError::Forbidden)
+    );
+
+    // The own purpose passes and reaches the inner authorizer.
+    let own = transcript(SignPurpose::NodeHandshake)?;
+    assert_eq!(
+        allow.authorize(&ctx0(), &raw_verify(&key, own.as_bytes())),
+        Ok(())
+    );
+    assert_eq!(
+        marker.authorize(&ctx0(), &raw_verify(&key, own.as_bytes())),
+        Err(CryptoServiceError::Conflict)
+    );
+    let harw_key = HarwKeyRef::latest(HarwKeyPurpose::NodeIdentity, node("node-a")?);
+    let built = verify_operation(&harw_key, &own, &[1, 2, 3]).map_err(ctx("verify_operation"))?;
+    assert_eq!(allow.authorize(&ctx0(), &built), Ok(()));
+    Ok(())
+}
+
+#[test]
+fn test_authorizer_leaves_foreign_namespace_payloads_to_inner() -> TestResult {
+    let key = KeyRef::latest(
+        KeyNamespace::new("team-a").map_err(ctx("ns"))?,
+        KeyId::new("k").map_err(ctx("id"))?,
+    );
+    // Raw bytes on a non-harw namespace are not the Harw layer's business.
+    let allow = HarwUsageAuthorizer::new(AllowAll);
+    assert_eq!(allow.authorize(&ctx0(), &raw_sign(&key, b"raw")), Ok(()));
+    assert_eq!(allow.authorize(&ctx0(), &raw_verify(&key, b"raw")), Ok(()));
+    let marker = HarwUsageAuthorizer::new(InnerMarker);
+    assert_eq!(
+        marker.authorize(&ctx0(), &raw_sign(&key, b"raw")),
+        Err(CryptoServiceError::Conflict)
+    );
+    assert_eq!(
+        marker.authorize(&ctx0(), &raw_verify(&key, b"raw")),
+        Err(CryptoServiceError::Conflict)
+    );
+    Ok(())
+}
+
+#[test]
+fn test_kms_transcript_limit_matches_cgk1_framing() {
+    // 64 KiB sign body = CGK1 magic+version (5) + message len (4)
+    // + signature len (4) + ML-DSA-87 signature (4627) + transcript.
+    assert_eq!(CG_SIGN_BODY_LIMIT, 64 * 1024);
+    assert_eq!(MAX_KMS_SIGNATURE_LEN, 4627);
+    assert_eq!(CGK1_VERIFY_OVERHEAD, 5 + 4 + 4 + 4627);
+    assert_eq!(MAX_SIGNABLE_TRANSCRIPT_LEN, 60_896);
+}
+
+// The KMS limit is a strict tightening of the general transcript limit.
+const _: () = assert!(MAX_SIGNABLE_TRANSCRIPT_LEN < MAX_TRANSCRIPT_LEN);
+
+#[test]
+fn test_oversize_transcript_is_rejected_for_kms_use() -> TestResult {
+    let key = identity_key()?;
+    let harw_key = HarwKeyRef::latest(HarwKeyPurpose::NodeIdentity, node("node-a")?);
+    let auth = HarwUsageAuthorizer::new(AllowAll);
+
+    // Exactly at the limit: accepted everywhere.
+    let fits = transcript_of_len(SignPurpose::NodeHandshake, MAX_SIGNABLE_TRANSCRIPT_LEN)?;
+    assert_eq!(fits.ensure_kms_size(), Ok(()));
+    assert_eq!(
+        SignTranscript::validate_for_kms(fits.as_bytes()),
+        Ok(SignPurpose::NodeHandshake)
+    );
+    assert!(sign_operation(&harw_key, fits.clone()).is_ok());
+    assert_eq!(
+        auth.authorize(&ctx0(), &raw_sign(&key, fits.as_bytes())),
+        Ok(())
+    );
+
+    // One byte over: well-formed in general, but not for the KMS.
+    let over = transcript_of_len(SignPurpose::NodeHandshake, MAX_SIGNABLE_TRANSCRIPT_LEN + 1)?;
+    assert_eq!(
+        SignTranscript::validate(over.as_bytes()),
+        Ok(SignPurpose::NodeHandshake)
+    );
+    assert_eq!(
+        over.ensure_kms_size(),
+        Err(EncryptError::TranscriptTooLarge)
+    );
+    assert_eq!(
+        SignTranscript::validate_for_kms(over.as_bytes()),
+        Err(EncryptError::TranscriptTooLarge)
+    );
+    assert_eq!(
+        sign_operation(&harw_key, over.clone()).err(),
+        Some(EncryptError::TranscriptTooLarge)
+    );
+    assert_eq!(
+        verify_operation(&harw_key, &over, &[1]).err(),
+        Some(EncryptError::TranscriptTooLarge)
+    );
+    assert_eq!(
+        auth.authorize(&ctx0(), &raw_sign(&key, over.as_bytes())),
+        Err(CryptoServiceError::Forbidden)
+    );
+    assert_eq!(
+        auth.authorize(&ctx0(), &raw_verify(&key, over.as_bytes())),
+        Err(CryptoServiceError::Forbidden)
+    );
+    Ok(())
+}
+
+#[test]
+fn test_build_for_kms_enforces_the_kms_limit() -> TestResult {
+    let small = SignTranscript::builder(SignPurpose::NodeHandshake)
+        .field("x", b"y")
+        .build_for_kms()
+        .map_err(ctx("small kms transcript"))?;
+    assert_eq!(
+        Some(small),
+        SignTranscript::builder(SignPurpose::NodeHandshake)
+            .field("x", b"y")
+            .build()
+            .ok()
+    );
+
+    let big = vec![0u8; MAX_SIGNABLE_TRANSCRIPT_LEN];
+    assert_eq!(
+        SignTranscript::builder(SignPurpose::NodeHandshake)
+            .field("pad", &big)
+            .build_for_kms()
+            .err(),
+        Some(EncryptError::TranscriptTooLarge)
+    );
+    assert!(
+        SignTranscript::builder(SignPurpose::NodeHandshake)
+            .field("pad", &big)
+            .build()
+            .is_ok()
+    );
+    // Field errors still win over the size check.
+    assert_eq!(
+        SignTranscript::builder(SignPurpose::NodeHandshake)
+            .field("BAD", b"")
+            .build_for_kms()
+            .err(),
+        Some(EncryptError::InvalidTranscriptField)
     );
     Ok(())
 }

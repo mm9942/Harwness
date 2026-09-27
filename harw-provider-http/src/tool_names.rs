@@ -1,12 +1,27 @@
 //! Umkehrbare Abbildung interner Tool-Namen auf provider-taugliche Wire-Namen.
 //!
-//! Harw-Tools heißen z. B. `fs.read`, `shell.exec` oder `context.load`. Die
-//! Anthropic-Messages-API akzeptiert als Tool-Namen aber nur
-//! `^[a-zA-Z0-9_-]{1,128}$` (sonst HTTP 400 `tools.N.custom.name`). Dieser
-//! Codec ersetzt unzulässige Zeichen durch `_`, kürzt auf 128 Zeichen,
-//! löst Kollisionen deterministisch mit einem numerischen Suffix auf und merkt
-//! sich die Rückrichtung, damit `tool_use`-Blöcke der Antwort wieder den
-//! internen Namen tragen.
+//! Harw-Tools heißen z. B. `fs.read`, `shell.exec` oder `context.load`. Wir
+//! sprechen mehrere Provider mit unterschiedlichen, aber überlappenden
+//! Namensregeln für Tool-Namen:
+//!
+//! - Anthropic Messages API: `^[a-zA-Z0-9_-]{1,128}$` (sonst HTTP 400
+//!   `tools.N.custom.name`).
+//! - OpenAI Chat Completions: höchstens 64 Zeichen, Zeichen aus
+//!   `[a-zA-Z0-9_-]`.
+//! - Gemini: höchstens 64 Zeichen, muss mit einem Buchstaben oder `_`
+//!   beginnen, danach `[a-zA-Z0-9_-]`.
+//!
+//! Wir erzeugen Wire-Namen nach der strengsten gemeinsamen Regel aller drei:
+//! `^[A-Za-z_][A-Za-z0-9_-]{0,63}$`. Dieser Codec ersetzt unzulässige Zeichen
+//! durch `_`, stellt bei einem unzulässigen ersten Zeichen (Ziffer oder `-`)
+//! ein `_` voran, kürzt auf 64 Zeichen, löst Kollisionen deterministisch mit
+//! einem numerischen Suffix auf und merkt sich die Rückrichtung, damit
+//! `tool_use`-Blöcke der Antwort wieder den internen Namen tragen.
+//!
+//! Für jeden Namen, der schon vor dieser Änderung gültig war (kein führendes
+//! `-`/Ziffer, ≤ 64 Zeichen), bleibt der Wire-Name bytegleich — wichtig, weil
+//! Prompt-Caches davon abhängen. Nur Namen, die die neue, strengere Grenze
+//! verletzen, ändern sich.
 //!
 //! Die Abbildung hängt nur von der Reihenfolge der Tools und des Verlaufs ab —
 //! derselbe Request ergibt bytegleiche Wire-Namen (cache-stabil).
@@ -14,8 +29,9 @@
 use harw_core::{ModelMessage, ModelRequest};
 use std::collections::BTreeMap;
 
-/// Maximale Länge eines Wire-Tool-Namens (Anthropic- und OpenAI-Grenze).
-const MAX_WIRE_NAME_LEN: usize = 128;
+/// Maximale Länge eines Wire-Tool-Namens (strengste gemeinsame Grenze:
+/// OpenAI Chat Completions und Gemini erlauben höchstens 64 Zeichen).
+const MAX_WIRE_NAME_LEN: usize = 64;
 
 /// Bidirektionale Zuordnung intern ↔ Wire für genau einen Request.
 ///
@@ -109,7 +125,8 @@ impl ToolNameCodec {
     /// - `name` (`&str`): interner Tool-Name, geliehen.
     ///
     /// # Returns
-    /// `String` — der Wire-taugliche Name (`^[a-zA-Z0-9_-]{1,128}$`).
+    /// `String` — der Wire-taugliche Name
+    /// (`^[A-Za-z_][A-Za-z0-9_-]{0,63}$`).
     ///
     /// # Concurrency
     /// Rein lesend; sicher aus mehreren Threads parallel auf derselben
@@ -147,8 +164,10 @@ impl ToolNameCodec {
     }
 }
 
-// Ersetzt alles außerhalb von `[A-Za-z0-9_-]` durch `_` und kürzt auf 128 Bytes
-// (nach der Ersetzung ist der String reines ASCII, Byte-Slicing also sicher).
+// Ersetzt alles außerhalb von `[A-Za-z0-9_-]` durch `_`, stellt bei einem
+// unzulässigen ersten Zeichen (Ziffer oder `-`, von Gemini verboten) ein `_`
+// voran und kürzt auf MAX_WIRE_NAME_LEN Bytes (nach der Ersetzung ist der
+// String reines ASCII, Byte-Slicing also sicher).
 fn sanitize(name: &str) -> String {
     let mut out: String = name
         .chars()
@@ -162,6 +181,9 @@ fn sanitize(name: &str) -> String {
         .collect();
     if out.is_empty() {
         out.push('_');
+    }
+    if out.starts_with(|c: char| c.is_ascii_digit() || c == '-') {
+        out.insert(0, '_');
     }
     out.truncate(MAX_WIRE_NAME_LEN);
     out
@@ -225,11 +247,71 @@ mod tests {
     }
 
     #[test]
-    fn test_sanitize_truncates_to_128_chars() {
+    fn test_sanitize_truncates_to_64_chars() {
         let long_name = "a".repeat(200);
         let sanitized = sanitize(&long_name);
         assert_eq!(sanitized.len(), MAX_WIRE_NAME_LEN);
         assert!(sanitized.chars().all(|c| c == 'a'));
+    }
+
+    #[test]
+    fn test_sanitize_leading_digit_gets_underscore_prefix() {
+        assert_eq!(sanitize("1tool"), "_1tool");
+    }
+
+    #[test]
+    fn test_sanitize_leading_hyphen_gets_underscore_prefix() {
+        assert_eq!(sanitize("-tool"), "_-tool");
+    }
+
+    #[test]
+    fn test_sanitize_100_char_name_becomes_at_most_64_and_round_trips() -> TestResult {
+        let long_name = "x".repeat(100);
+        let request = request_with_tools(vec![function_tool(&long_name)]);
+        let codec = ToolNameCodec::for_request(&request);
+
+        let wire = codec.encode(&long_name);
+        assert!(wire.len() <= MAX_WIRE_NAME_LEN);
+        assert_eq!(codec.decode(&wire), long_name);
+        Ok(())
+    }
+
+    #[test]
+    fn test_for_request_leading_digit_name_round_trips() -> TestResult {
+        let request = request_with_tools(vec![function_tool("123tool")]);
+        let codec = ToolNameCodec::for_request(&request);
+
+        let wire = codec.encode("123tool");
+        assert_eq!(wire, "_123tool");
+        assert_eq!(codec.decode(&wire), "123tool");
+        Ok(())
+    }
+
+    #[test]
+    fn test_work_driver_enqueue_sanitizes_to_work_driver_enqueue() {
+        assert_eq!(sanitize("work_driver.enqueue"), "work_driver_enqueue");
+    }
+
+    #[test]
+    fn test_collisions_after_truncation_stay_distinct() -> TestResult {
+        // Zwei Namen, die erst nach dem Kürzen auf MAX_WIRE_NAME_LEN
+        // identisch würden, müssen trotzdem unterscheidbare Wire-Namen
+        // bekommen und sich beide zurückdekodieren lassen.
+        let prefix = "x".repeat(MAX_WIRE_NAME_LEN);
+        let name_a = format!("{prefix}.a");
+        let name_b = format!("{prefix}.b");
+        let request = request_with_tools(vec![function_tool(&name_a), function_tool(&name_b)]);
+        let codec = ToolNameCodec::for_request(&request);
+
+        let wire_a = codec.encode(&name_a);
+        let wire_b = codec.encode(&name_b);
+
+        assert!(wire_a.len() <= MAX_WIRE_NAME_LEN);
+        assert!(wire_b.len() <= MAX_WIRE_NAME_LEN);
+        assert_ne!(wire_a, wire_b);
+        assert_eq!(codec.decode(&wire_a), name_a);
+        assert_eq!(codec.decode(&wire_b), name_b);
+        Ok(())
     }
 
     #[test]

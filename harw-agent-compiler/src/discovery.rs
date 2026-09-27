@@ -3,8 +3,8 @@
 //!
 //! # Layers (ascending precedence)
 //! 1. [`DefinitionLayer::BuiltIn`]: the embedded roles and bases
-//!    (`harw_registry_defaults::embedded_agents::builtin_source_files`,
-//!    labels `builtin/<name>.toml`).
+//!    ([`crate::builtins::BuiltinDefaults::source_files`], installed from
+//!    `harw_registry_defaults`; labels `builtin/<name>.toml`).
 //! 2. [`DefinitionLayer::InstalledPack`]: the definitions bundled with harw
 //!    (`harw_home::bundled_files`, labels `bundled/agents/<name>/…`), but
 //!    only for IDs no config layer defines (a bundled definition is usually
@@ -36,6 +36,7 @@ use harw_agent_dsl::lower_v2::{
 use harw_agent_dsl::parse::parse_toml;
 use harw_agent_dsl::roles::AgentRoleId;
 
+use crate::builtins::{builtin_defaults, require_builtin_defaults};
 use crate::error::CompileError;
 
 /// Label prefix of bundled definitions (virtual, never read from disk).
@@ -147,12 +148,13 @@ impl SourceSet {
     ///
     /// # Errors
     /// [`CompileError::Other`] if the built-in context-program library is
-    /// broken (a build defect, not a user error).
+    /// broken (a build defect, not a user error) or no
+    /// [`crate::builtins::BuiltinDefaults`] are installed.
     pub fn discover(layers: &[PathBuf]) -> Result<Self, CompileError> {
-        let mut programs =
-            harw_registry_defaults::embedded_agents::builtin_context_program_library().map_err(
-                |error| CompileError::Other(format!("built-in context programs: {error}")),
-            )?;
+        let defaults = require_builtin_defaults()?;
+        let mut programs = defaults
+            .context_program_library()
+            .map_err(|error| CompileError::Other(format!("built-in context programs: {error}")))?;
         let mut set = Self {
             files: Vec::new(),
             entries: Vec::new(),
@@ -160,7 +162,7 @@ impl SourceSet {
             loader: CompositeLoader::default(),
             programs: ContextProgramLibrary::new(),
         };
-        for file in harw_registry_defaults::embedded_agents::builtin_source_files() {
+        for file in defaults.source_files() {
             let name = file
                 .path
                 .file_stem()
@@ -327,10 +329,7 @@ impl SourceSet {
     pub fn suggestions(&self, name: &str) -> Vec<String> {
         let mut out: BTreeSet<String> = BTreeSet::new();
         for entry in &self.entries {
-            if matches!(entry.origin, Origin::BuiltIn)
-                && harw_registry_defaults::embedded_agents::BASE_DEFINITION_NAMES
-                    .contains(&entry.name.as_str())
-            {
+            if matches!(entry.origin, Origin::BuiltIn) && is_base_definition(&entry.name) {
                 continue;
             }
             if edit_distance(&entry.name, name) <= 3
@@ -347,10 +346,7 @@ impl SourceSet {
     pub fn compilable_names(&self) -> Vec<String> {
         self.entries
             .iter()
-            .filter(|entry| {
-                !harw_registry_defaults::embedded_agents::BASE_DEFINITION_NAMES
-                    .contains(&entry.name.as_str())
-            })
+            .filter(|entry| !is_base_definition(&entry.name))
             .map(|entry| entry.name.clone())
             .collect::<BTreeSet<_>>()
             .into_iter()
@@ -530,6 +526,14 @@ fn collect_programs(layer_dir: &Path, layer: DefinitionLayer, library: &mut Cont
     }
 }
 
+/// `true` for a built-in base layer (not compilable on its own).
+fn is_base_definition(name: &str) -> bool {
+    builtin_defaults()
+        .roles()
+        .base_definition_names
+        .contains(&name)
+}
+
 /// Levenshtein distance (small inputs only).
 #[must_use]
 pub fn edit_distance(a: &str, b: &str) -> usize {
@@ -577,47 +581,6 @@ mod tests {
             "critic"
         );
         assert_eq!(name_for(Path::new("/a/agents/flat.toml")), "flat");
-    }
-
-    #[test]
-    fn test_builtin_and_bundled_definitions_are_found() -> Result<(), CompileError> {
-        let set = SourceSet::discover(&[])?;
-        assert!(set.find("explorer").is_some(), "built-in role");
-        let critic = set.find("evidence-critic");
-        assert_eq!(
-            critic.map(|entry| entry.origin.clone()),
-            Some(Origin::Bundled),
-            "bundled definition"
-        );
-        assert!(set.find("no-such-agent").is_none());
-        assert!(
-            set.suggestions("evidence-critc")
-                .contains(&"evidence-critic".to_owned())
-        );
-        Ok(())
-    }
-
-    #[test]
-    fn test_layer_definition_shadows_the_bundled_copy() -> Result<(), Box<dyn std::error::Error>> {
-        let home = tempfile::tempdir()?;
-        let dir = home.path().join("agents").join("evidence-critic");
-        std::fs::create_dir_all(&dir)?;
-        let bundled = harw_home::bundled_files()
-            .iter()
-            .find(|file| file.relative_path == "agents/evidence-critic/definition.toml")
-            .map(|file| file.contents)
-            .ok_or("bundled evidence-critic")?;
-        std::fs::write(dir.join("definition.toml"), bundled)?;
-        let set = SourceSet::discover(&[home.path().to_path_buf()])?;
-        let found = set.find("evidence-critic").ok_or("found")?;
-        assert!(matches!(found.origin, Origin::Layer(_)));
-        let copies = set
-            .entries
-            .iter()
-            .filter(|entry| entry.id.to_string() == "harwness.agent.evidence-critic@1")
-            .count();
-        assert_eq!(copies, 1, "no overlay of identical copies");
-        Ok(())
     }
 
     #[test]

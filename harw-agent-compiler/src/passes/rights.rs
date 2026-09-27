@@ -5,9 +5,9 @@ use std::collections::BTreeSet;
 use harw_agent_dsl::Diagnostics;
 use harw_agent_dsl::classify::reclassify_permissions;
 use harw_agent_dsl::diagnostics::DiagnosticCode;
-use harw_registry_defaults::capability_catalog::CapabilityCatalog;
 
 use super::Pass;
+use crate::builtins::builtin_defaults;
 use crate::codes;
 use crate::rights::{BuiltinCeilings, RightsDelta, RightsSet, delta};
 use crate::unit::{CompileUnit, RightsFlow};
@@ -37,9 +37,10 @@ impl Pass for RightsCheck<'_> {
         // widening and fail with HARW-BUILD-004 here — which stops the pass
         // pipeline before `ReachableTools` ever runs, hiding the real,
         // suggestion-bearing diagnostic behind a misleading one.
-        let unknown: BTreeSet<String> = reclassify_permissions(&mut unit.ir, &CapabilityCatalog)
-            .into_iter()
-            .collect();
+        let unknown: BTreeSet<String> =
+            reclassify_permissions(&mut unit.ir, builtin_defaults().tool_classifier())
+                .into_iter()
+                .collect();
         let manifest = RightsSet::claimed_by(&unit.ir);
         let known = RightsSet {
             tools: manifest.tools.difference(&unknown).cloned().collect(),

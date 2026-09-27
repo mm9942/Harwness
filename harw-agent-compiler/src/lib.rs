@@ -24,6 +24,11 @@
 //! build`, except the automatic artifact build of the active UIA ([`uia`]).
 //! Built-in roles stay embedded in harw; building one only makes a copy.
 //!
+//! The built-in definitions, the capability catalog and the generic role
+//! ceilings come in through [`builtins::BuiltinDefaults`], which the
+//! composition layer installs once per process
+//! (`harw_registry_defaults::compiler_defaults::install`).
+//!
 //! # Command surface
 //! [`commands`] holds every `harw agent` subcommand of the compiler (check,
 //! build, inspect, graph, explain, new, fmt, diff, test, run, versions,
@@ -40,6 +45,7 @@
 pub mod artifact_out;
 pub mod backend;
 pub mod bin_dir;
+pub mod builtins;
 pub mod cache;
 pub mod codes;
 pub mod commands;
@@ -63,6 +69,7 @@ pub mod unit;
 
 pub use backend::runner::{ProcessProbe, RunnerCapabilities, RunnerProbe};
 pub use backend::{BuildOptions, BuildReport, build};
+pub use builtins::{BuiltinDefaults, install_builtin_defaults};
 pub use commands::{AgentCommand, CommandContext, CommandOutput, parse_tokens, run_command};
 pub use compiler::{Compiled, Compiler, CompilerOptions};
 pub use discovery::AgentInput;

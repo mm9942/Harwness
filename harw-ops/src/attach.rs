@@ -107,7 +107,8 @@ async fn attach(ctx: &OpContext, args: AttachArgs) -> Result<OpOutput, OpError> 
         .service::<Arc<JobStore>>()
         .ok_or_else(|| OpError::NotAvailable("durable job store is not configured".to_owned()))?;
     let work_id = WorkId::from_str(job);
-    let record = store.get(&work_id).map_err(|error| {
+    // H12: fremde Jobs melden sich wie unbekannte (keine Existenz-Preisgabe).
+    let record = crate::job_tenant::get_visible_job(ctx, store, &work_id).map_err(|error| {
         OpError::Execution(format!("could not attach to durable job `{job}`: {error}"))
     })?;
     Ok(OpOutput::from(format!(
@@ -280,6 +281,70 @@ mod tests {
         std::fs::remove_dir_all(ctx.sandbox().workspace().canonical_root())
             .map_err(crate::test_support::ctx("remove workspace root"))?;
         std::fs::remove_dir_all(root.1).map_err(crate::test_support::ctx("remove store root"))?;
+        Ok(())
+    }
+
+    // H12: Mandanten-Filter (unscoped sieht alles, scoped nur den eigenen
+    // Mandanten, fremde Jobs verhalten sich wie unbekannte).
+    #[tokio::test]
+    async fn attach_unscoped_caller_reaches_every_tenant() -> TestResult {
+        use crate::job_tenant::fixtures::{JOB_B, context, two_tenants};
+        use harw_job_runtime::JobState;
+        let jobs = two_tenants(JobState::Ready)?;
+        let op_ctx = context(&jobs, None)?;
+        let output = attach(
+            &op_ctx,
+            AttachArgs {
+                job_id: Some(JOB_B.to_owned()),
+            },
+        )
+        .await
+        .map_err(ctx("attach foreign job without scope"))?;
+        assert!(output.text.contains(JOB_B), "{}", output.text);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn attach_scoped_caller_reaches_own_tenant() -> TestResult {
+        use crate::job_tenant::fixtures::{JOB_A, TENANT_A, context, two_tenants};
+        use harw_job_runtime::JobState;
+        let jobs = two_tenants(JobState::Ready)?;
+        let op_ctx = context(&jobs, Some(TENANT_A))?;
+        let output = attach(
+            &op_ctx,
+            AttachArgs {
+                job_id: Some(JOB_A.to_owned()),
+            },
+        )
+        .await
+        .map_err(ctx("attach own job"))?;
+        assert!(output.text.contains(JOB_A), "{}", output.text);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn attach_scoped_caller_foreign_job_is_hidden_like_missing() -> TestResult {
+        use crate::job_tenant::fixtures::{
+            JOB_B, MISSING, TENANT_A, assert_hidden_like_missing, context, two_tenants,
+        };
+        use harw_job_runtime::JobState;
+        let jobs = two_tenants(JobState::Ready)?;
+        let op_ctx = context(&jobs, Some(TENANT_A))?;
+        let foreign = attach(
+            &op_ctx,
+            AttachArgs {
+                job_id: Some(JOB_B.to_owned()),
+            },
+        )
+        .await;
+        let missing = attach(
+            &op_ctx,
+            AttachArgs {
+                job_id: Some(MISSING.to_owned()),
+            },
+        )
+        .await;
+        assert_hidden_like_missing(foreign, missing)?;
         Ok(())
     }
 }

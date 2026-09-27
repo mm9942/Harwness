@@ -287,3 +287,52 @@ jobs:
 
       - name: cargo check (Linux backend compiles empty on macOS)
         run: cargo check --locked -p harw-job-linux
+
+  native-agent:
+    name: native agent build (harw agent build --native)
+    needs: changes
+    # The native backend (harw-agent-compiler/src/backend/native.rs) is
+    # otherwise only covered by golden tests of the generated crate; this job
+    # runs a real `cargo build --release` of it and executes the result
+    # (scripts/native-e2e.sh). A release build of the runner crates takes
+    # minutes: only on main and per Hand (workflow_dispatch), never on PRs.
+    if: >-
+      ${{ !cancelled() && (github.event_name == 'push'
+      || github.event_name == 'workflow_dispatch') }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Install pinned Rust (rust-toolchain.toml)
+        run: |
+          rustup toolchain install
+          rustup show active-toolchain
+          rustc --version
+
+      - name: Cache cargo (native agent)
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: "."
+          key: native
+          # The native build's own target dir (NATIVE_E2E_HOME below), so
+          # harw's runner crates compile in release only when they change.
+          cache-directories: ${{ runner.temp }}/native-e2e-home/cache/agent-builds/target
+
+      # Debug harw plus a release runner build: reclaim disk like `check`.
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+          df -h /
+
+      # bubblewrap for the runner's sandbox admission; libdbus-1-dev +
+      # pkg-config for the OS-keyring backend harw-secrets builds with.
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y bubblewrap libdbus-1-dev pkg-config
+
+      - name: Native backend end to end
+        env:
+          NATIVE_E2E_HOME: ${{ runner.temp }}/native-e2e-home
+        run: sh scripts/native-e2e.sh

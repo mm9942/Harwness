@@ -1,6 +1,7 @@
 [package]
 publish.workspace = true
 name = "harw-context"
+description = "Prompt context vocabulary: fragments, trust classes, budgets, and ceiling constraints"
 version.workspace = true
 edition.workspace = true
 license.workspace = true

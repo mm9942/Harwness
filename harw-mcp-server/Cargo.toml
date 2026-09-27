@@ -1,6 +1,7 @@
 [package]
 publish.workspace = true
 name = "harw-mcp-server"
+description = "Inbound Streamable HTTP MCP authority for Harwness"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -8,7 +9,7 @@ repository.workspace = true
 rust-version.workspace = true
 
 [dependencies]
-harw-job-runtime = { path = "../harw-job-runtime" }
+harw-job-core = { path = "../harw-job-core" }
 harw-session-store = { path = "../harw-session-store" }
 harw-types = { path = "../harw-types" }
 serde = { version = "1", features = ["derive"] }

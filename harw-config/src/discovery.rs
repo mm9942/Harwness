@@ -1,3 +1,6 @@
+use crate::agent_sources::{
+    AgentDefinitionSources, AgentSourceLayer, discover_layer_agent_sources,
+};
 use crate::agent_toml::AgentToml;
 use crate::auth_toml::{AuthConfig, SecretRef};
 use crate::browser_toml::BrowserSection;
@@ -15,20 +18,9 @@ use crate::plugin_toml::PluginToml;
 use crate::provider_toml::ProviderToml;
 use crate::skill_toml::SkillToml;
 use crate::web_toml::WebSection;
-use harw_agent_dsl::bind::ContextProgramLibrary;
-use harw_agent_dsl::diagnostics::{Severity, SourceFile};
-use harw_agent_dsl::layers::DefinitionLayer;
-use harw_agent_dsl::lower_v2::{
-    FsInstructionsLoader, LowerSources, diagnostic_for_error, lower_v2,
-};
-use harw_agent_dsl::parse::parse_toml as parse_agent_definition_toml;
-use harw_agent_dsl::raw::RawAgentDefinition;
-use harw_agent_dsl::resolve::resolve_definition;
-use harw_agent_dsl::{AgentIr, ExecutableAgentIr};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
-use time::OffsetDateTime;
 
 /// Eine nicht-fatale Feststellung aus [`ResolvedConfig::compute_diagnostics`]:
 /// eine hängende Modell-/Provider-Referenz irgendwo im Konfigurations-
@@ -69,62 +61,21 @@ impl std::fmt::Display for ConfigDiagnostic {
     }
 }
 
-/// Nicht ausführbare Angaben einer aufgelösten DSL-Agentendefinition
-/// (Plan R9, Teil B).
-///
-/// # Description
-/// Seit #22 Welle 1B eine dünne Sicht auf die typisierte IR
-/// ([`ResolvedConfig::agent_irs`]): Name, Beschreibung, Instruktionen und
-/// Delegationsziele werden aus der [`AgentIr`] übernommen; nur die
-/// Herkunftsschicht kommt aus der Discovery selbst.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct AgentDefinitionMeta {
-    /// Optionaler Anzeigename (`name = "..."`).
-    pub name: Option<String>,
-    /// Optionale Beschreibung (`description = "..."`).
-    pub description: Option<String>,
-    /// Die höchste Schicht, aus der die Definition stammt.
-    pub layer: Option<DefinitionLayer>,
-    /// Instruktionstext der IR (`instructions_file`, relativ zum
-    /// Agentenordner der Definition, die das Feld setzt, sonst ein
-    /// `system.md` neben der Definition), falls nicht leer.
-    pub instructions: Option<String>,
-    /// `[delegation].targets` der aufgelösten Definition, falls vorhanden —
-    /// die namentliche Zielliste eines Orchestrators (ein Filter über seine
-    /// sichtbaren Ziele, nie eine Erweiterung).
-    pub delegation_targets: Option<Vec<String>>,
-}
-
-/// Top-Level-Schlüssel einer `definition.toml`, der eine Instruktionsdatei
-/// relativ zum Agentenordner benennt (Plan R9, Teil B).
-pub const INSTRUCTIONS_FILE_KEY: &str = "instructions_file";
-
 /// Geladenes Config-Universum nach Discovery + Merge.
 #[derive(Debug, Default, Clone)]
 pub struct ResolvedConfig {
     pub harness: HarnessConfig,
     pub agents: HashMap<String, AgentToml>,
-    /// Compiled agent definitions, keyed by their canonical `DefinitionId`.
-    /// Since #22 wave 1B the legacy runtime view of [`Self::agent_irs`]
-    /// (`ExecutableAgentIr::from(&ir)`), kept so existing consumers compile.
-    pub executable_agents: HashMap<String, ExecutableAgentIr>,
-    /// The typed Agent IR v2 of every discovered definition (#22 wave 1B),
-    /// keyed like [`Self::executable_agents`] by `DefinitionId`. Lowered with
-    /// `harw_agent_dsl::lower_v2::lower_v2` over the built-in definitions,
-    /// the instruction files of the agent directories and the context-program
-    /// library (built-in programs plus `agents/context-programs/*.toml` of the
-    /// trusted layers).
-    pub agent_irs: HashMap<String, AgentIr>,
-    /// Agentenordner der final aufgelösten DSL-Definitionen. Der Runtime-Pfad
-    /// verwendet ihn ausschließlich für die optionalen, benutzerpflegbaren
-    /// UIA-Dateien `Personality.md` und `USER.md`.
-    pub agent_definition_dirs: HashMap<String, PathBuf>,
-    /// Menschenlesbare Angaben und Instruktionstext der aufgelösten
-    /// DSL-Definitionen, geschlüsselt wie [`Self::executable_agents`] nach
-    /// `DefinitionId` (Plan R9, Teil B). Die ausführbare IR trägt weder
-    /// Beschreibung noch Instruktionen; der Roster
-    /// (`harw_registry_defaults::roster`) liest sie hier.
-    pub agent_definition_meta: HashMap<String, AgentDefinitionMeta>,
+    /// Die ungeparsten DSL-Agentendefinitionen und eigenen Kontextprogramme
+    /// der vertrauten Layer (`agents/<name>/definition.toml`,
+    /// `agents/<name>.toml`, `agents/context-programs/*.toml`).
+    ///
+    /// Diese Crate (Schicht I) kennt die Agenten-DSL nicht: Parsen, Auflösen
+    /// über den eingebauten Definitionen und Senken zur IR übernimmt der
+    /// Konsument (`harw_registry_defaults::config_agents::ConfigAgents`),
+    /// ebenso die Prüfung von `active_agent_definition` und
+    /// `active_uia_definition` gegen die gesenkten Definitionen.
+    pub agent_sources: AgentDefinitionSources,
     pub providers: HashMap<String, ProviderToml>,
     pub models: HashMap<String, ModelToml>,
     pub skills: HashMap<String, SkillToml>,
@@ -200,25 +151,10 @@ impl ResolvedConfig {
     /// actually selected/used (`harw-runtime`), not at load time.
     pub fn validate(&self) -> ConfigResult<()> {
         validate_mcp_listener(&self.harness)?;
-        // Nutzer-Definitionen tragen eine versionierte Id (`…@N`) und müssen
-        // hier auflösbar sein. Schlichte Namen (z. B. `root-orchestrator`,
-        // gesetzt per `/agent use`) bezeichnen mitgelieferte Rollen, die
-        // diese Crate nicht kennt; sie prüft die Runtime beim Start
-        // (`resolve_active_agent`, fail-closed).
-        if let Some(definition) = &self.harness.active_agent_definition
-            && (definition.contains('@') || self.executable_agents.contains_key(definition))
-        {
-            require_reference(&self.executable_agents, "agent definition", definition)?;
-        }
-        if let Some(definition) = &self.harness.active_uia_definition {
-            require_reference(&self.executable_agents, "UIA definition", definition)?;
-            let role = self.executable_agents[definition].role();
-            if role != harw_agent_dsl::roles::AgentRoleId::UserInterface {
-                return Err(ConfigError::Invalid(format!(
-                    "UIA definition '{definition}' must have role 'user-interface', found '{role:?}'"
-                )));
-            }
-        }
+        // `active_agent_definition`/`active_uia_definition` prüft der
+        // Konsument gegen die gesenkten Definitionen
+        // (`harw_registry_defaults::config_agents::ConfigAgents::validate_selection`):
+        // diese Crate senkt keine Agentendefinitionen.
 
         for provider_name in sorted_keys(&self.providers) {
             let provider = &self.providers[provider_name];
@@ -728,8 +664,6 @@ pub fn discover_config_with_restricted_and_project_settings(
     project_settings: Option<&Path>,
 ) -> ConfigResult<ResolvedConfig> {
     let mut resolved = ResolvedConfig::default();
-    let mut definition_layers = BTreeMap::<String, DiscoveredDefinitionLayers>::new();
-    let mut context_programs: Vec<(DefinitionLayer, String, String, PathBuf)> = Vec::new();
 
     // Env-Layer aus allen Layer-Verzeichnissen laden (letzte gewinnt).
     // Die Prozess-Umgebung wird nicht verändert.
@@ -811,18 +745,17 @@ pub fn discover_config_with_restricted_and_project_settings(
         // nicht mehr ab (siehe `discover_legacy_agents`).
         discover_legacy_agents(base, &mut resolved.agents)?;
 
-        // agents/*/definition.toml — optional DSL definitions are independent
-        // from legacy agent.toml files. Only a configured final layer is
-        // project-trusted; a single layer remains user-global by contract.
+        // agents/*/definition.toml (und die flache Altform agents/*.toml)
+        // sowie agents/context-programs/*.toml — optional DSL definitions are
+        // independent from legacy agent.toml files and are handed over
+        // unparsed (see `crate::agent_sources`). Only a configured final layer
+        // is project-trusted; a single layer remains user-global by contract.
         let definition_layer = if layers.len() > 1 && layer_index + 1 == layers.len() {
-            DefinitionLayer::Project
+            AgentSourceLayer::Project
         } else {
-            DefinitionLayer::UserGlobal
+            AgentSourceLayer::UserGlobal
         };
-        discover_agent_definitions(base, definition_layer, &mut definition_layers)?;
-        // #22 Welle 1B: eigene Kontextprogramme der Schicht
-        // (`agents/context-programs/*.toml`).
-        discover_context_programs(base, definition_layer, &mut context_programs)?;
+        discover_layer_agent_sources(base, definition_layer, &mut resolved.agent_sources)?;
 
         // providers/*.toml
         discover_flat_dir::<ProviderToml>(base, "providers", &mut resolved.providers)?;
@@ -850,27 +783,6 @@ pub fn discover_config_with_restricted_and_project_settings(
         // channels/*.toml — jede Datei kann mehrere [[channel.telegram]]-
         // Einträge enthalten; Merge nach ChannelId (letzte Layer gewinnt).
         discover_channels(base, &mut resolved.channels)?;
-    }
-
-    // Die Nutzerdefinitionen jedes Ziels werden über den eingebauten
-    // Definitionen aufgelöst (Plan R9, Teil B): so lösen `extends` auf
-    // `harwness.agent.worker-base@1`, `…child-orchestrator-base@1` oder eine
-    // eingebaute Rolle auf, statt mit `MissingBase` zu scheitern.
-    if !definition_layers.is_empty() {
-        let library = context_program_library(&context_programs)?;
-        let stack = DefinitionStack::new(&definition_layers);
-        for (id, definitions) in &definition_layers {
-            let (ir, meta, definition_dir) =
-                resolve_discovered_definition(id, definitions, &stack, &library)?;
-            resolved
-                .agent_definition_dirs
-                .insert(id.clone(), definition_dir);
-            resolved.agent_definition_meta.insert(id.clone(), meta);
-            resolved
-                .executable_agents
-                .insert(id.clone(), ExecutableAgentIr::from(&ir));
-            resolved.agent_irs.insert(id.clone(), ir);
-        }
     }
 
     if let Some(repo) = restricted_repo {
@@ -1210,374 +1122,6 @@ fn legacy_provider(name: &str, enabled: bool) -> Option<ProviderToml> {
     }
 }
 
-/// Discovered source layers of one definition id: `(layer, raw, file)`.
-/// Eine entdeckte Definitionsdatei: Schicht, geparste Rohform, Pfad und
-/// Quelltext (der Quelltext speist Spannen und eigene Tabellen des
-/// IR-v2-Senkens, #22 Welle 1B).
-type DiscoveredDefinitionLayers = Vec<(DefinitionLayer, RawAgentDefinition, PathBuf, String)>;
-
-/// Alle entdeckten Definitionen eines Discovery-Laufs als Auflösungsstapel
-/// (Rohformen) und als Quelldateien (#22 Welle 1B).
-struct DefinitionStack {
-    raw: Vec<(DefinitionLayer, RawAgentDefinition)>,
-    files: Vec<SourceFile>,
-}
-
-impl DefinitionStack {
-    fn new(definition_layers: &BTreeMap<String, DiscoveredDefinitionLayers>) -> Self {
-        let mut raw = Vec::new();
-        let mut files = Vec::new();
-        for definitions in definition_layers.values() {
-            for (layer, definition, path, text) in definitions {
-                raw.push((*layer, definition.clone()));
-                files.push(SourceFile::new(*layer, path.clone(), text.clone()));
-            }
-        }
-        Self { raw, files }
-    }
-}
-
-/// Baut die Kontextprogramm-Bibliothek: die eingebauten Programme plus die
-/// eigenen Programme der vertrauten Schichten (#22 Welle 1B).
-///
-/// # Errors
-/// [`ConfigError::Invalid`], wenn ein Programm nicht parst oder ein Name mit
-/// einer anderen Programm-ID doppelt vergeben ist.
-fn context_program_library(
-    programs: &[(DefinitionLayer, String, String, PathBuf)],
-) -> ConfigResult<ContextProgramLibrary> {
-    let mut library =
-        crate::builtin_definitions::builtin_context_program_library().map_err(|error| {
-            ConfigError::Invalid(format!("built-in context programs do not parse: {error}"))
-        })?;
-    for (layer, name, source, path) in programs {
-        library
-            .insert_sources(*layer, &[(name.as_str(), source.as_str())])
-            .map_err(|error| {
-                ConfigError::Invalid(format!("context program {}: {error}", path.display()))
-            })?;
-    }
-    Ok(library)
-}
-
-/// Entdeckt die eigenen Kontextprogramme eines Layers:
-/// `agents/context-programs/*.toml`, Name ist der Dateistamm (#22 Welle 1B).
-///
-/// # Errors
-/// Lesefehler.
-fn discover_context_programs(
-    base: &Path,
-    layer: DefinitionLayer,
-    target: &mut Vec<(DefinitionLayer, String, String, PathBuf)>,
-) -> ConfigResult<()> {
-    let dir = base
-        .join("agents")
-        .join(crate::builtin_definitions::CONTEXT_PROGRAMS_DIR);
-    if !dir.is_dir() {
-        return Ok(());
-    }
-    for entry in read_sorted_dir_entries(&dir)? {
-        let path = entry.path();
-        if path.extension().and_then(|ext| ext.to_str()) != Some("toml") || !path.is_file() {
-            continue;
-        }
-        let Some(name) = path
-            .file_stem()
-            .and_then(|stem| stem.to_str())
-            .map(str::to_owned)
-        else {
-            continue;
-        };
-        let source = read_file(&path)?;
-        target.push((layer, name, source, path));
-    }
-    Ok(())
-}
-
-/// Löst eine entdeckte Definition über den eingebauten Definitionen auf und
-/// senkt sie zur typisierten [`AgentIr`] (Plan R9, Teil B; #22 Welle 1B).
-///
-/// # Description
-/// Der Auflösungsstapel besteht aus
-/// 1. den eingebauten Definitionen ([`crate::builtin_definitions`]) auf
-///    [`DefinitionLayer::BuiltIn`] — **außer** einer eingebauten Definition
-///    mit derselben ID wie das Ziel: eine lokale Definition, die eine
-///    eingebaute ID wiederverwendet, wird wie bisher eigenständig aufgelöst
-///    und nie als Overlay über die eingebaute Rolle gelegt (die eingebaute
-///    Rolle selbst bleibt davon unberührt, siehe
-///    `harw_registry_defaults::embedded_agents::builtin_agent_definitions`),
-/// 2. allen entdeckten Definitionen aller vertrauten Layer (`stack`), damit
-///    lokale Definitionen einander erweitern können.
-///
-/// Gesenkt wird mit `lower_v2` über denselben Dateien (Spannen, eigene
-/// Tabellen), dem [`FsInstructionsLoader`] (`instructions_file` bzw.
-/// `system.md` im Agentenordner) und der Kontextprogramm-Bibliothek — eine
-/// Nutzerdefinition bekommt ihr `[context] program` damit gebunden wie jede
-/// eingebaute Rolle. Warnungen und Hinweise werden geloggt.
-///
-/// # Returns
-/// Die IR, ihre [`AgentDefinitionMeta`] (Sicht auf die IR) und den
-/// Agentenordner der höchsten Quelle.
-///
-/// # Errors
-/// [`ConfigError::Invalid`] mit den gerenderten Diagnosen (Code,
-/// `datei:zeile:spalte`, Hilfetext), wenn Auflösung oder Senken scheitern.
-fn resolve_discovered_definition(
-    id: &str,
-    definitions: &DiscoveredDefinitionLayers,
-    stack: &DefinitionStack,
-    programs: &ContextProgramLibrary,
-) -> ConfigResult<(AgentIr, AgentDefinitionMeta, PathBuf)> {
-    let paths = definitions
-        .iter()
-        .map(|(_, _, path, _)| path.display().to_string())
-        .collect::<Vec<_>>()
-        .join(", ");
-    let first = definitions.first().ok_or_else(|| {
-        ConfigError::Invalid(format!(
-            "resolved agent definition '{id}' from {paths} has no source layer"
-        ))
-    })?;
-    let target_id = &first.1.id;
-    let target_label = target_id.to_string();
-    let mut resolver_layers = crate::builtin_definitions::builtin_definition_layers()
-        .iter()
-        .filter(|builtin| &builtin.id != target_id)
-        .map(|builtin| (DefinitionLayer::BuiltIn, builtin.clone()))
-        .collect::<Vec<_>>();
-    resolver_layers.extend(stack.raw.iter().cloned());
-    let mut files: Vec<SourceFile> = crate::builtin_definitions::builtin_source_files()
-        .iter()
-        .filter(|(_, declared)| declared.as_deref() != Some(target_label.as_str()))
-        .map(|(file, _)| file.clone())
-        .collect();
-    files.extend(stack.files.iter().cloned());
-
-    let resolved_definition =
-        resolve_definition(target_id, &resolver_layers, OffsetDateTime::now_utc()).map_err(
-            |error| {
-                let diagnostic = diagnostic_for_error(&error, &files, target_id);
-                ConfigError::Invalid(format!(
-                    "failed to resolve agent definition '{id}' from {paths}:\n{diagnostic}"
-                ))
-            },
-        )?;
-    let loader = FsInstructionsLoader::new();
-    let sources = LowerSources::new(&files)
-        .with_instructions(&loader)
-        .with_context_programs(programs);
-    let ir = lower_v2(&resolved_definition, &sources).map_err(|diagnostics| {
-        ConfigError::Invalid(format!(
-            "failed to lower agent definition '{id}' from {paths}:\n{diagnostics}"
-        ))
-    })?;
-    for diagnostic in &ir.trace.diagnostics {
-        if diagnostic.severity == Severity::Warning {
-            tracing::warn!(
-                definition = %id,
-                code = %diagnostic.code,
-                "config.agent_definition.diagnostic: {diagnostic}"
-            );
-        } else {
-            tracing::debug!(
-                definition = %id,
-                code = %diagnostic.code,
-                "config.agent_definition.diagnostic: {diagnostic}"
-            );
-        }
-    }
-    let last_source = definitions.last().ok_or_else(|| {
-        ConfigError::Invalid(format!(
-            "resolved agent definition '{id}' from {paths} has no source layer"
-        ))
-    })?;
-    let definition_dir = parent_dir(&last_source.2)?;
-    let meta = AgentDefinitionMeta::from_ir(&ir, Some(last_source.0));
-    Ok((ir, meta, definition_dir))
-}
-
-impl AgentDefinitionMeta {
-    /// Die Sicht auf eine [`AgentIr`] (#22 Welle 1B): Name, Beschreibung,
-    /// nicht leerer Instruktionstext und `[delegation].targets` aus der IR,
-    /// dazu die Herkunftsschicht.
-    #[must_use]
-    pub fn from_ir(ir: &AgentIr, layer: Option<DefinitionLayer>) -> Self {
-        let text = ir.instructions.text.as_str();
-        Self {
-            name: ir.name.clone(),
-            description: ir.description.clone(),
-            layer,
-            instructions: (!text.trim().is_empty()).then(|| text.to_owned()),
-            delegation_targets: ir.spawn.delegation_targets.clone(),
-        }
-    }
-}
-
-/// Der Elternordner einer Definitionsdatei.
-fn parent_dir(path: &Path) -> ConfigResult<PathBuf> {
-    path.parent().map(Path::to_path_buf).ok_or_else(|| {
-        ConfigError::Invalid(format!(
-            "agent definition file '{}' has no parent directory",
-            path.display()
-        ))
-    })
-}
-
-/// Entdeckt die DSL-Agentendefinitionen eines Layers.
-///
-/// # Description
-/// Kanonisch ist `agents/<name>/definition.toml`. Zusätzlich wird das ältere,
-/// flache Format `agents/<name>.toml` gelesen, das `agents.commit_proposal`
-/// bis Plan R9 geschrieben hat: mit einer `tracing::warn`-Meldung, damit der
-/// Nutzer die Datei in das Verzeichnisformat umzieht. Eine flache Datei, die
-/// nicht parst, wird mit Warnung übersprungen (sie könnte eine beliebige
-/// andere TOML-Datei sein); eine flache Datei, deren ID in diesem Layer schon
-/// als Verzeichnisdefinition vorliegt, ebenfalls — das Verzeichnisformat
-/// gewinnt.
-///
-/// # Errors
-/// Lesefehler und eine nicht parsbare `definition.toml` (fail-closed wie
-/// bisher).
-fn discover_agent_definitions(
-    base: &Path,
-    layer: DefinitionLayer,
-    target: &mut BTreeMap<String, DiscoveredDefinitionLayers>,
-) -> ConfigResult<()> {
-    let dir = base.join("agents");
-    if !dir.exists() {
-        return Ok(());
-    }
-
-    let mut seen_in_layer: HashSet<String> = HashSet::new();
-    let mut flat_files: Vec<PathBuf> = Vec::new();
-    for entry in read_sorted_dir_entries(&dir)? {
-        let entry_path = entry.path();
-        let file_type = entry.file_type().map_err(|error| ConfigError::ReadFailed {
-            path: entry_path.display().to_string(),
-            reason: error.to_string(),
-        })?;
-        if file_type.is_file() {
-            if entry_path.extension().and_then(|ext| ext.to_str()) == Some("toml") {
-                flat_files.push(entry_path);
-            }
-            continue;
-        }
-        if !file_type.is_dir() {
-            continue;
-        }
-
-        let definition_path = entry_path.join("definition.toml");
-        if !definition_path.exists() {
-            continue;
-        }
-        let content = read_file(&definition_path)?;
-        let definition = parse_agent_definition_toml(&content).map_err(|error| {
-            ConfigError::Invalid(format!(
-                "failed to parse agent definition '{}': {error}",
-                definition_path.display()
-            ))
-        })?;
-        seen_in_layer.insert(definition.id.to_string());
-        target.entry(definition.id.to_string()).or_default().push((
-            layer,
-            definition,
-            definition_path,
-            content,
-        ));
-    }
-
-    for flat_path in flat_files {
-        let content = read_file(&flat_path)?;
-        let definition = match parse_agent_definition_toml(&content) {
-            Ok(definition) => definition,
-            Err(error) => {
-                tracing::warn!(
-                    path = %flat_path.display(),
-                    %error,
-                    "config.agent_definition.legacy_flat_file_unparsable_skipped"
-                );
-                continue;
-            }
-        };
-        let id = definition.id.to_string();
-        if seen_in_layer.contains(&id) {
-            tracing::warn!(
-                path = %flat_path.display(),
-                id = %id,
-                "config.agent_definition.legacy_flat_file_shadowed_by_directory"
-            );
-            continue;
-        }
-        tracing::warn!(
-            path = %flat_path.display(),
-            id = %id,
-            "config.agent_definition.legacy_flat_file: move it to agents/<name>/definition.toml"
-        );
-        seen_in_layer.insert(id.clone());
-        target
-            .entry(id)
-            .or_default()
-            .push((layer, definition, flat_path, content));
-    }
-
-    Ok(())
-}
-
-/// Entdeckt die Definitionen eines einzelnen Laufs (`scope = "run"`,
-/// Plan R9, Teil B).
-///
-/// # Description
-/// `agents.write_definition` mit `scope = "run"` legt Definitionen unter
-/// `<projekt>/.harw/state/runs/<run_id>/agents/<name>/definition.toml` ab
-/// (ältere Stände: `…/agents/<name>.toml`, weiter gelesen mit Warnung). Diese
-/// Funktion löst sie als [`DefinitionLayer::RunLocal`] über den eingebauten
-/// Definitionen und den bereits aufgelösten vertrauten Definitionen auf.
-///
-/// # Grenze
-/// Die Laufzeit kennt heute keine Lauf-ID, die sie dem schreibenden Modell
-/// vorgibt: `run_id` ist ein frei gewählter Slug des Aufrufers. Diese
-/// Funktion ist deshalb der dokumentierte Einstieg für einen Aufrufer, der
-/// eine Lauf-ID besitzt; die Montage (`harw-runtime`) ruft sie noch nicht auf.
-///
-/// # Arguments
-/// - `project_harw_dir` (`&Path`): das `.harw`-Verzeichnis des Projekts.
-/// - `run_id` (`&str`): die Lauf-ID; nur `[a-z0-9-]`, sonst leer.
-///
-/// # Returns
-/// Die gesenkten Definitionen nach `DefinitionId`, dazu ihre
-/// [`AgentDefinitionMeta`]. Leer, wenn es das Verzeichnis nicht gibt.
-///
-/// # Errors
-/// Wie [`discover_config`] für Agentendefinitionen.
-pub fn discover_run_agent_definitions(
-    project_harw_dir: &Path,
-    run_id: &str,
-) -> ConfigResult<HashMap<String, (ExecutableAgentIr, AgentDefinitionMeta)>> {
-    let valid_run_id = !run_id.is_empty()
-        && run_id
-            .bytes()
-            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-');
-    if !valid_run_id {
-        return Ok(HashMap::new());
-    }
-    let run_base = project_harw_dir.join("state").join("runs").join(run_id);
-    let mut definition_layers = BTreeMap::<String, DiscoveredDefinitionLayers>::new();
-    discover_agent_definitions(&run_base, DefinitionLayer::RunLocal, &mut definition_layers)?;
-    let mut context_programs = Vec::new();
-    discover_context_programs(&run_base, DefinitionLayer::RunLocal, &mut context_programs)?;
-    let mut out = HashMap::new();
-    if definition_layers.is_empty() {
-        return Ok(out);
-    }
-    let library = context_program_library(&context_programs)?;
-    let stack = DefinitionStack::new(&definition_layers);
-    for (id, definitions) in &definition_layers {
-        let (ir, meta, _) = resolve_discovered_definition(id, definitions, &stack, &library)?;
-        out.insert(id.clone(), (ExecutableAgentIr::from(&ir), meta));
-    }
-    Ok(out)
-}
-
 /// Entdeckt die Legacy-Agenten `agents/*/agent.toml` eines Layers.
 ///
 /// # Description
@@ -1759,7 +1303,7 @@ fn discover_flat_dir<T: serde::de::DeserializeOwned + HasName>(
     Ok(())
 }
 
-fn read_sorted_dir_entries(dir: &Path) -> ConfigResult<Vec<std::fs::DirEntry>> {
+pub(crate) fn read_sorted_dir_entries(dir: &Path) -> ConfigResult<Vec<std::fs::DirEntry>> {
     let entries = std::fs::read_dir(dir).map_err(|error| ConfigError::ReadFailed {
         path: dir.display().to_string(),
         reason: error.to_string(),
@@ -1778,7 +1322,7 @@ fn map_dir_entry_error<T>(dir: &Path, entry: std::io::Result<T>) -> ConfigResult
     })
 }
 
-fn read_file(path: &Path) -> ConfigResult<String> {
+pub(crate) fn read_file(path: &Path) -> ConfigResult<String> {
     std::fs::read_to_string(path).map_err(|e| ConfigError::ReadFailed {
         path: path.display().to_string(),
         reason: e.to_string(),
@@ -2410,152 +1954,6 @@ job_capabilities = ["cancel_workspace"]
     }
 
     #[test]
-    fn discovers_and_lowers_an_agent_definition_without_legacy_agent_toml() -> TestResult {
-        let base = test_directory("definition-discovery")?;
-        let id = "harwness.agent.discovery-worker@1";
-        write_definition(
-            &base,
-            "discovery-worker",
-            &worker_definition(
-                id,
-                "definition-discovery",
-                "admitted = [\"fs.read\"]\nforbidden = [\"network.fetch\"]",
-            ),
-        )?;
-
-        let config =
-            discover_config(std::slice::from_ref(&base)).map_err(ctx("discover config"))?;
-        let executable = config
-            .executable_agents
-            .get(id)
-            .ok_or(TestError::Missing("executable agent for discovery-worker"))?;
-
-        assert_eq!(executable.id().to_string(), id);
-        assert_eq!(executable.specialization(), "definition-discovery");
-        assert_eq!(executable.tool_surface().admitted(), ["fs.read"]);
-        assert_eq!(executable.tool_surface().forbidden(), ["network.fetch"]);
-        assert!(config.agents.is_empty());
-        std::fs::remove_dir_all(base).map_err(ctx("Testverzeichnis entfernen"))?;
-        Ok(())
-    }
-
-    #[test]
-    fn profile_definition_extends_builtin_worker_base() -> TestResult {
-        // Plan R9, Teil B: vorher `MissingBase`, weil die eingebauten
-        // Definitionen nicht im Auflösungsstapel lagen.
-        let base = test_directory("extends-worker-base")?;
-        let id = "user.agent.note-taker@1";
-        write_definition(
-            &base,
-            "note-taker",
-            &format!(
-                r#"schema = "harwness.agent/v1"
-id = "{id}"
-version = "1.0.0"
-extends = {{ id = "harwness.agent.worker-base@1" }}
-role = "worker"
-specialization = "note-taker"
-description = "Fasst Notizen zusammen."
-instructions_file = "system.md"
-
-[tools]
-admitted = ["fs.read"]
-"#
-            ),
-        )?;
-        std::fs::write(
-            base.join("agents").join("note-taker").join("system.md"),
-            "Du fasst Notizen zusammen.",
-        )
-        .map_err(ctx("system.md schreiben"))?;
-
-        let config =
-            discover_config(std::slice::from_ref(&base)).map_err(ctx("discover config"))?;
-        let executable = config
-            .executable_agents
-            .get(id)
-            .ok_or(TestError::Missing("note-taker"))?;
-        assert_eq!(executable.tool_surface().admitted(), ["fs.read"]);
-        // Von worker-base geerbt: Lebenszyklus und Kontext.
-        assert!(!executable.lifecycle_machine().allow_pause());
-        assert!(
-            executable
-                .context_program()
-                .exclude()
-                .iter()
-                .any(|selector| selector == "full_parent_transcript")
-        );
-        let meta = config
-            .agent_definition_meta
-            .get(id)
-            .ok_or(TestError::Missing("meta"))?;
-        assert_eq!(meta.description.as_deref(), Some("Fasst Notizen zusammen."));
-        assert_eq!(
-            meta.instructions.as_deref(),
-            Some("Du fasst Notizen zusammen.")
-        );
-        std::fs::remove_dir_all(base).map_err(ctx("Testverzeichnis entfernen"))?;
-        Ok(())
-    }
-
-    #[test]
-    fn profile_definition_extends_child_orchestrator_base() -> TestResult {
-        let base = test_directory("extends-child-orchestrator-base")?;
-        let id = "user.agent.review-lead@1";
-        write_definition(
-            &base,
-            "review-lead",
-            &format!(
-                r#"schema = "harwness.agent/v1"
-id = "{id}"
-version = "1.0.0"
-extends = {{ id = "harwness.agent.child-orchestrator-base@1" }}
-role = "child-orchestrator"
-specialization = "review-lead"
-"#
-            ),
-        )?;
-        let config =
-            discover_config(std::slice::from_ref(&base)).map_err(ctx("discover config"))?;
-        let executable = config
-            .executable_agents
-            .get(id)
-            .ok_or(TestError::Missing("review-lead"))?;
-        assert_eq!(executable.spawn_contract().max_depth(), Some(1));
-        assert!(
-            executable
-                .tool_surface()
-                .admitted()
-                .iter()
-                .any(|tool| tool == "delegate_wave")
-        );
-        std::fs::remove_dir_all(base).map_err(ctx("Testverzeichnis entfernen"))?;
-        Ok(())
-    }
-
-    #[test]
-    fn legacy_flat_definition_file_is_still_read() -> TestResult {
-        let base = test_directory("legacy-flat-definition")?;
-        let agents = base.join("agents");
-        std::fs::create_dir_all(&agents).map_err(ctx("agents anlegen"))?;
-        let id = "user.agent.flat-worker@1";
-        std::fs::write(
-            agents.join("flat-worker.toml"),
-            worker_definition(id, "flat-worker", "admitted = [\"fs.read\"]"),
-        )
-        .map_err(ctx("flache Datei schreiben"))?;
-        // Eine fremde, nicht parsbare flache Datei bricht die Discovery nicht.
-        std::fs::write(agents.join("notes.toml"), "title = \"keine Definition\"\n")
-            .map_err(ctx("fremde Datei schreiben"))?;
-
-        let config =
-            discover_config(std::slice::from_ref(&base)).map_err(ctx("discover config"))?;
-        assert!(config.executable_agents.contains_key(id));
-        std::fs::remove_dir_all(base).map_err(ctx("Testverzeichnis entfernen"))?;
-        Ok(())
-    }
-
-    #[test]
     fn stale_agent_toml_next_to_definition_does_not_break_discovery() -> TestResult {
         let base = test_directory("stale-agent-toml")?;
         let id = "user.agent.migrated@1";
@@ -2574,7 +1972,15 @@ specialization = "review-lead"
 
         let config =
             discover_config(std::slice::from_ref(&base)).map_err(ctx("discover config"))?;
-        assert!(config.executable_agents.contains_key(id));
+        // Die Definition wird ungeparst weitergereicht (gesenkt wird sie in
+        // `harw_registry_defaults::config_agents`), das veraltete
+        // `agent.toml` daneben wird übersprungen.
+        assert_eq!(config.agent_sources.definitions.len(), 1);
+        assert!(
+            config.agent_sources.definitions[0]
+                .path
+                .ends_with("migrated/definition.toml")
+        );
         assert!(config.agents.is_empty());
         std::fs::remove_dir_all(base).map_err(ctx("Testverzeichnis entfernen"))?;
         Ok(())
@@ -2592,134 +1998,39 @@ specialization = "review-lead"
         Ok(())
     }
 
+    /// Die Discovery parst Agentendefinitionen nicht mehr (Schicht I kennt
+    /// die DSL nicht): eine defekte `definition.toml` kommt unverändert als
+    /// Rohquelle an, mit Schicht und Form. Fail-closed meldet sie der
+    /// Konsument beim Senken (`harw_registry_defaults::config_agents`).
     #[test]
-    fn run_scoped_definitions_are_discovered_for_their_run() -> TestResult {
-        let project_harw = test_directory("run-scoped")?;
-        let dir = project_harw
-            .join("state")
-            .join("runs")
-            .join("run-7")
-            .join("agents")
-            .join("scratch");
-        std::fs::create_dir_all(&dir).map_err(ctx("Run-Verzeichnis anlegen"))?;
-        let id = "user.agent.scratch@1";
-        std::fs::write(
-            dir.join("definition.toml"),
-            worker_definition(id, "scratch", "admitted = [\"fs.read\"]"),
-        )
-        .map_err(ctx("definition.toml schreiben"))?;
-
-        let found =
-            discover_run_agent_definitions(&project_harw, "run-7").map_err(ctx("run discovery"))?;
-        assert!(found.contains_key(id));
-        assert!(
-            discover_run_agent_definitions(&project_harw, "other-run")
-                .map_err(ctx("other run"))?
-                .is_empty()
-        );
-        assert!(
-            discover_run_agent_definitions(&project_harw, "../escape")
-                .map_err(ctx("invalid run id"))?
-                .is_empty()
-        );
-        std::fs::remove_dir_all(project_harw).map_err(ctx("Testverzeichnis entfernen"))?;
-        Ok(())
-    }
-
-    #[test]
-    fn selected_active_agent_definition_validates_when_discovered() -> TestResult {
-        let base = test_directory("selected-agent-definition")?;
-        let id = "harwness.agent.selected-worker@1";
-        std::fs::write(
-            base.join("config.toml"),
-            format!("active_agent_definition = {id:?}\n"),
-        )
-        .map_err(ctx("config.toml schreiben"))?;
+    fn discovery_hands_agent_definitions_over_unparsed_with_their_layer() -> TestResult {
+        let home = test_directory("unparsed-home")?;
+        let project = test_directory("unparsed-project")?;
+        write_definition(&home, "broken", "schema = [kaputt")?;
         write_definition(
-            &base,
-            "selected-worker",
-            &worker_definition(id, "selected", "admitted = [\"fs.read\"]"),
+            &project,
+            "worker",
+            &worker_definition("user.agent.worker@1", "worker", "admitted = []"),
         )?;
+        let programs = project.join("agents").join("context-programs");
+        std::fs::create_dir_all(&programs).map_err(ctx("Programmordner"))?;
+        std::fs::write(programs.join("digest.toml"), "schema = \"x\"\n")
+            .map_err(ctx("digest.toml"))?;
 
-        let config =
-            discover_config(std::slice::from_ref(&base)).map_err(ctx("discover config"))?;
-
-        assert!(config.validate().is_ok());
-        std::fs::remove_dir_all(base).map_err(ctx("Testverzeichnis entfernen"))?;
-        Ok(())
-    }
-
-    #[test]
-    fn validate_rejects_an_unknown_selected_agent_definition() -> TestResult {
-        let mut config = ResolvedConfig::default();
-        config.harness.active_agent_definition = Some("harwness.agent.missing@1".to_owned());
-
-        assert!(matches!(
-            config.validate(),
-            Err(ConfigError::UnresolvedRef { kind, reference })
-                if kind == "agent definition" && reference == "harwness.agent.missing@1"
-        ));
-        Ok(())
-    }
-
-    #[test]
-    fn validate_leaves_bare_builtin_agent_names_to_the_runtime() -> TestResult {
-        let mut config = ResolvedConfig::default();
-        config.harness.active_agent_definition = Some("root-orchestrator".to_owned());
-
-        assert!(config.validate().is_ok());
-        Ok(())
-    }
-
-    #[test]
-    fn final_layer_definition_reduces_the_tool_surface() -> TestResult {
-        let user_layer = test_directory("definition-user-layer")?;
-        let project_layer = test_directory("definition-project-layer")?;
-        let id = "harwness.agent.layered-worker@1";
-        write_definition(
-            &user_layer,
-            "layered-worker",
-            &worker_definition(
-                id,
-                "user-layer",
-                "admitted = [\"fs.read\", \"shell.exec\"]\nforbidden = [\"network.fetch\"]",
-            ),
-        )?;
-        write_definition(
-            &project_layer,
-            "layered-worker",
-            &format!(
-                r#"schema = "harwness.agent/v1"
-id = "{id}"
-version = "1.0.1"
-role = "worker"
-specialization = "project-layer"
-
-[tools]
-admitted = ["fs.read"]
-forbidden = ["network.fetch", "shell.exec"]
-
-[patch.tools]
-replace = {{ admitted = ["fs.read"], forbidden = ["network.fetch", "shell.exec"] }}
-"#
-            ),
-        )?;
-
-        let config = discover_config(&[user_layer.clone(), project_layer.clone()])
-            .map_err(ctx("Konfiguration entdecken"))?;
-        let executable = config
-            .executable_agents
-            .get(id)
-            .ok_or(TestError::Missing("executable agent for layered-worker"))?;
-
-        assert_eq!(executable.specialization(), "project-layer");
-        assert_eq!(executable.tool_surface().admitted(), ["fs.read"]);
-        assert_eq!(
-            executable.tool_surface().forbidden(),
-            ["network.fetch", "shell.exec"]
-        );
-        std::fs::remove_dir_all(user_layer).map_err(ctx("user_layer entfernen"))?;
-        std::fs::remove_dir_all(project_layer).map_err(ctx("project_layer entfernen"))?;
+        let config = discover_config(&[home.clone(), project.clone()]).map_err(ctx(
+            "Discovery darf an einer defekten Definition nicht scheitern",
+        ))?;
+        let sources = &config.agent_sources;
+        assert_eq!(sources.definitions.len(), 2);
+        assert_eq!(sources.definitions[0].layer, AgentSourceLayer::UserGlobal);
+        assert_eq!(sources.definitions[0].text, "schema = [kaputt");
+        assert_eq!(sources.definitions[0].base, home);
+        assert_eq!(sources.definitions[1].layer, AgentSourceLayer::Project);
+        assert_eq!(sources.context_programs.len(), 1);
+        assert_eq!(sources.context_programs[0].name, "digest");
+        assert_eq!(sources.context_programs[0].layer, AgentSourceLayer::Project);
+        std::fs::remove_dir_all(home).map_err(ctx("home entfernen"))?;
+        std::fs::remove_dir_all(project).map_err(ctx("project entfernen"))?;
         Ok(())
     }
 
@@ -3586,205 +2897,6 @@ token_file = "/tmp/evil/auth.token"
 
         std::fs::remove_dir_all(home).map_err(ctx("Home-Verzeichnis entfernen"))?;
         std::fs::remove_dir_all(repo).map_err(ctx("Repo-Verzeichnis entfernen"))?;
-        Ok(())
-    }
-
-    /// #22 Welle 1B: eine Nutzerdefinition bekommt ihr `[context] program`
-    /// gebunden — ein eingebautes wie ein eigenes aus
-    /// `agents/context-programs/` — und liegt als typisierte IR vor.
-    #[test]
-    fn user_definitions_get_their_context_program_bound() -> TestResult {
-        let base = test_directory("context-program-binding")?;
-        let explore_id = "user.agent.scout@1";
-        write_definition(
-            &base,
-            "scout",
-            &format!(
-                r#"schema = "harwness.agent/v1"
-id = "{explore_id}"
-version = "1.0.0"
-extends = {{ id = "harwness.agent.worker-base@1" }}
-role = "worker"
-specialization = "scout"
-
-[tools]
-admitted = ["fs.read"]
-
-[context]
-program = "explore"
-"#
-            ),
-        )?;
-        let own_id = "user.agent.digest@1";
-        write_definition(
-            &base,
-            "digest",
-            &format!(
-                r#"schema = "harwness.agent/v1"
-id = "{own_id}"
-version = "1.0.0"
-extends = {{ id = "harwness.agent.worker-base@1" }}
-role = "worker"
-specialization = "digest"
-
-[tools]
-admitted = ["fs.read"]
-
-[context]
-program = "digest"
-"#
-            ),
-        )?;
-        let programs = base.join("agents").join("context-programs");
-        std::fs::create_dir_all(&programs).map_err(ctx("Programmordner"))?;
-        std::fs::write(
-            programs.join("digest.toml"),
-            r#"schema = "harwness.context/v1"
-id = "user.context.digest@1"
-version = "1.0.0"
-
-[[sections]]
-name = "task.objective"
-strength = "must-include"
-detail = "full"
-trust = "instruction"
-
-[[sections]]
-name = "plan.current"
-strength = "must-include"
-detail = "summary"
-trust = "data"
-"#,
-        )
-        .map_err(ctx("digest.toml"))?;
-
-        let config =
-            discover_config(std::slice::from_ref(&base)).map_err(ctx("discover config"))?;
-        let scout = config
-            .agent_irs
-            .get(explore_id)
-            .ok_or(TestError::Missing("scout IR"))?;
-        assert_eq!(scout.context.program.as_deref(), Some("explore"));
-        assert_eq!(
-            scout.context.program_id.as_deref(),
-            Some("harwness.context.explore@1")
-        );
-        assert!(!scout.context.sections.is_empty());
-        let digest = config
-            .agent_irs
-            .get(own_id)
-            .ok_or(TestError::Missing("digest IR"))?;
-        assert_eq!(digest.context.program.as_deref(), Some("digest"));
-        assert!(
-            digest
-                .context
-                .must_include
-                .iter()
-                .any(|section| section == "task.objective")
-        );
-        // `plan.current` liegt außerhalb der Wurzeldecke: benannt, aber
-        // zurückgestellt statt beim Start verlangt.
-        assert_eq!(digest.context.deferred, ["plan.current"]);
-        // Die Laufzeitsicht trägt dieselbe Politik.
-        let view = config
-            .executable_agents
-            .get(own_id)
-            .ok_or(TestError::Missing("digest view"))?;
-        assert_eq!(
-            view.context_program().context_policy(),
-            Some("user.context.digest@1")
-        );
-        std::fs::remove_dir_all(base).map_err(ctx("Testverzeichnis entfernen"))?;
-        Ok(())
-    }
-
-    /// #22 Welle 1B: eine defekte Nutzerdefinition scheitert mit den
-    /// gerenderten Diagnosen — stabiler Code plus `datei:zeile:spalte`.
-    #[test]
-    fn broken_user_definition_reports_diagnostic_codes_with_spans() -> TestResult {
-        let base = test_directory("broken-definition")?;
-        write_definition(
-            &base,
-            "broken",
-            r#"schema = "harwness.agent/v1"
-id = "user.agent.broken@1"
-version = "1.0.0"
-role = "worker"
-specialization = "broken"
-
-[tols]
-admitted = ["fs.read"]
-
-[return]
-contract = "harwness.return.nope@1"
-"#,
-        )?;
-        let error = match discover_config(std::slice::from_ref(&base)) {
-            Ok(_) => {
-                return Err(TestError::Unexpected(
-                    "a broken definition must not load".to_owned(),
-                ));
-            }
-            Err(error) => error.to_string(),
-        };
-        assert!(error.contains("HARW-SCHEMA-002"), "{error}");
-        assert!(error.contains("HARW-RETURN-001"), "{error}");
-        // `--> <pfad>/definition.toml:<zeile>:<spalte>`
-        assert!(error.contains("definition.toml:"), "{error}");
-        assert!(error.contains("-->"), "{error}");
-        assert!(error.contains("user.agent.broken@1"), "{error}");
-        std::fs::remove_dir_all(base).map_err(ctx("Testverzeichnis entfernen"))?;
-        Ok(())
-    }
-
-    /// #22 Welle 1B: `AgentDefinitionMeta` ist eine Sicht auf die IR —
-    /// Instruktionen (auch ein implizites `system.md`), Beschreibung und
-    /// Delegationsziele stimmen mit ihr überein.
-    #[test]
-    fn definition_meta_is_a_view_of_the_ir() -> TestResult {
-        let base = test_directory("meta-view")?;
-        let id = "user.agent.lead@1";
-        write_definition(
-            &base,
-            "lead",
-            &format!(
-                r#"schema = "harwness.agent/v1"
-id = "{id}"
-version = "1.0.0"
-extends = {{ id = "harwness.agent.child-orchestrator-base@1" }}
-role = "child-orchestrator"
-specialization = "lead"
-description = "Leitet eine Prüfung."
-
-[delegation]
-targets = ["explorer", "analyst"]
-"#
-            ),
-        )?;
-        std::fs::write(
-            base.join("agents").join("lead").join("system.md"),
-            "Plane zuerst, delegiere dann.",
-        )
-        .map_err(ctx("system.md"))?;
-        let config =
-            discover_config(std::slice::from_ref(&base)).map_err(ctx("discover config"))?;
-        let ir = config.agent_irs.get(id).ok_or(TestError::Missing("IR"))?;
-        let meta = config
-            .agent_definition_meta
-            .get(id)
-            .ok_or(TestError::Missing("meta"))?;
-        assert_eq!(meta, &AgentDefinitionMeta::from_ir(ir, meta.layer));
-        assert_eq!(
-            meta.instructions.as_deref(),
-            Some("Plane zuerst, delegiere dann.")
-        );
-        assert_eq!(ir.instructions.source.as_deref(), Some("system.md"));
-        assert_eq!(
-            meta.delegation_targets,
-            Some(vec!["explorer".to_owned(), "analyst".to_owned()])
-        );
-        assert_eq!(meta.layer, Some(DefinitionLayer::UserGlobal));
-        std::fs::remove_dir_all(base).map_err(ctx("Testverzeichnis entfernen"))?;
         Ok(())
     }
 }

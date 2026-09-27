@@ -86,6 +86,12 @@ use jiff::{SignedDuration, Timestamp};
 /// `JobKind::Custom`-Diskriminator aller vom Kanban angelegten Jobs.
 pub const KANBAN_JOB_KIND: &str = "kanban_card";
 
+/// `JobKind::Custom`-Diskriminator der Arbeitstreiber-Jobs (`work_driver`),
+/// wortgleich zu `harw_ops::work_driver::WORK_DRIVER_JOB_KIND`: ein Claim
+/// fährt die Runden von `harw_plan_bridge::WorkDriver`, der Rundenzustand
+/// liegt im Sidecar `<jobs>/work_driver/<work-id>.json`.
+pub const WORK_DRIVER_JOB_KIND: &str = "work_driver";
+
 /// Präfix des `JobOutcome::Blocked`-Grunds, hinter dem das [`BlockKind`]-Label steht.
 pub const KANBAN_BLOCK_REASON_PREFIX: &str = "kanban:";
 

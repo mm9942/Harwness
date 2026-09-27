@@ -6,7 +6,7 @@
 //! `source()` wired through `#[from]` variants) and the `SessionStoreResult<T>`
 //! alias (the enum name ends in `Error`). No `anyhow`/`thiserror`.
 
-use harw_job_runtime::JobState;
+use harw_job_core::JobState;
 use harw_macros::HarwError;
 use harw_types::{CgroupId, FindingId, ItemId, SessionId, WorkId};
 
@@ -188,7 +188,7 @@ pub enum SessionStoreError {
     JobNotRetryable { work_id: WorkId, state: JobState },
 
     /// `JobStore::retry` refused to requeue because the job's own
-    /// [`harw_job_runtime::RetryPolicy`] has no attempts left. The caller must
+    /// [`harw_job_core::RetryPolicy`] has no attempts left. The caller must
     /// not silently requeue past this ceiling.
     #[msg(
         "job '{work_id}' retry limit exhausted: {attempts} attempt(s) already recorded against a policy of {max_attempts}"

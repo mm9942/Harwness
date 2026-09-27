@@ -1,6 +1,7 @@
 [package]
 publish.workspace = true
 name = "harw-secrets"
+description = "DEK/KEK envelope sealing plus append-only hash-chained ML-DSA-checkpointed audit log"
 version.workspace = true
 edition.workspace = true
 license.workspace = true

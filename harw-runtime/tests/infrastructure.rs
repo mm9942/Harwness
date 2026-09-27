@@ -6,7 +6,10 @@
 //! [`ModelSource::Echo`] as model — no network, no provider, no secret. The
 //! configured sockets do not exist: assembling must not dial them.
 
-#[allow(dead_code, reason = "shared helper module; this test uses only part of it")]
+#[allow(
+    dead_code,
+    reason = "shared helper module; this test uses only part of it"
+)]
 mod common;
 
 use std::path::{Path, PathBuf};

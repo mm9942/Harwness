@@ -10,7 +10,10 @@
 //!    domain-separated transcript (both node ids, nonces, timestamps,
 //!    protocol version, TLS exporter) with their long-term ML-DSA-65 key via
 //!    [`NodeSigner`]; the peer checks it against [`PinnedPeers`]. Replay
-//!    protection: nonce cache + time window + exporter binding.
+//!    protection: nonce cache + time window + exporter binding. Keys held
+//!    in the AuthHub sign through [`AuthHubNodeSigner`], which wraps the
+//!    transcript in a `NodeHandshake` sign transcript; their peers verify
+//!    with [`TranscriptWrappedVerifier`] ([`authhub_signer`]).
 //! 3. **Service exposure** — [`NodeTransportServer::serve`] runs a Tower
 //!    service over Hyper HTTP/1 with the [`AuthenticatedPeer`] as request
 //!    extension; [`NodeTransportClient::connect`] dials one node.
@@ -19,6 +22,7 @@
 //! The remote node's IP address is never identity (H11 exit criterion).
 //! See `README.md` for the security model.
 
+pub mod authhub_signer;
 pub mod client;
 pub mod error;
 pub mod handshake;
@@ -33,6 +37,10 @@ mod test_support;
 #[cfg(test)]
 mod tests;
 
+pub use authhub_signer::{
+    AuthHubNodeSigner, AuthHubSign, TranscriptWrappedSigner, TranscriptWrappedVerifier,
+    WRAPPED_TRANSCRIPT_FIELD, WrapError, wrap_transcript,
+};
 pub use client::{BoxError, ClientOptions, NodeBody, NodeTransportClient, empty_body, full_body};
 pub use error::{HandshakeError, PinError, SignerError, TransportError, UplinkError, VerifyError};
 pub use handshake::{

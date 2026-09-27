@@ -1,6 +1,7 @@
 [package]
 publish.workspace = true
 name = "harw-egress"
+description = "Egress policy enforcement with address classification and DNS filtering"
 version.workspace = true
 edition.workspace = true
 license.workspace = true

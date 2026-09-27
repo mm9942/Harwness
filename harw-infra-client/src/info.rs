@@ -7,10 +7,18 @@
 //! GET /v1/health        200 {"status": "ok" | "degraded", "service"?: "<name>"}
 //!                       (an empty 2xx body also counts as "ok")
 //!                       503 → InfraClientError::Unavailable
-//! GET /v1/version       200 {"service": "<name>", "version": "<semver>", "protocol": <u32>}
+//! GET /v1/version       200 {"service": "<name>", "version": "<semver>", "protocol": <u32>,
+//!                            "store_epoch"?: "<hex>", "boot_id"?: "<hex>"}
 //! GET /v1/capabilities  200 {"service": "<name>", "protocol": <u32>,
-//!                            "crypto_profiles"?: ["…"], "operations"?: ["…"]}
+//!                            "crypto_profiles"?: ["…"], "operations"?: ["…"],
+//!                            "persistence"?: "<mode>",
+//!                            "store_epoch"?: "<hex>", "boot_id"?: "<hex>"}
 //! ```
+//!
+//! `store_epoch` names the daemon's key store (it changes when the store is
+//! replaced, e.g. an in-memory AuthHub restarts); `boot_id` changes with
+//! every daemon process. Both are optional: daemons that predate them omit
+//! them and they parse as `None`.
 //!
 //! Unknown JSON fields are ignored (the documents are descriptive and may
 //! grow). Capabilities are descriptive, **not** authority: nothing in this
@@ -62,6 +70,14 @@ pub struct VersionInfo {
     pub version: String,
     /// Wire protocol generation.
     pub protocol: u32,
+    /// Identity of the daemon's key store; changes when the store is
+    /// replaced. `None` from daemons that do not report it.
+    #[serde(default)]
+    pub store_epoch: Option<String>,
+    /// Identity of the daemon process; changes on every restart. `None`
+    /// from daemons that do not report it.
+    #[serde(default)]
+    pub boot_id: Option<String>,
 }
 
 /// `GET /v1/capabilities`. Descriptive only.
@@ -77,6 +93,15 @@ pub struct Capabilities {
     /// Operation names offered (e.g. `key.wrap`).
     #[serde(default)]
     pub operations: Vec<String>,
+    /// Key store persistence (`in-memory`, `sealed-file`), if reported.
+    #[serde(default)]
+    pub persistence: Option<String>,
+    /// See [`VersionInfo::store_epoch`].
+    #[serde(default)]
+    pub store_epoch: Option<String>,
+    /// See [`VersionInfo::boot_id`].
+    #[serde(default)]
+    pub boot_id: Option<String>,
 }
 
 impl Capabilities {
@@ -128,4 +153,61 @@ pub(crate) async fn capabilities(
     response.expect_content_type(JSON)?;
     serde_json::from_slice(&response.body)
         .map_err(|_| InfraClientError::Protocol("malformed capabilities document"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Capabilities, VersionInfo};
+    use crate::test_support::{TestResult, ctx};
+
+    #[test]
+    fn test_version_and_capabilities_parse_store_epoch_and_boot_id() -> TestResult {
+        let version: VersionInfo = serde_json::from_str(
+            r#"{"service":"harw-auth-hub","version":"0.3.0","protocol":1,"cryptguard":"3.1.0",
+                "store_epoch":"00112233445566778899aabbccddeeff",
+                "boot_id":"ffeeddccbbaa99887766554433221100"}"#,
+        )
+        .map_err(ctx("version json"))?;
+        assert_eq!(
+            version.store_epoch.as_deref(),
+            Some("00112233445566778899aabbccddeeff")
+        );
+        assert_eq!(
+            version.boot_id.as_deref(),
+            Some("ffeeddccbbaa99887766554433221100")
+        );
+
+        let caps: Capabilities = serde_json::from_str(
+            r#"{"service":"harw-auth-hub","protocol":1,"crypto_profiles":[],"operations":[],
+                "persistence":"in-memory","store_epoch":"00112233445566778899aabbccddeeff",
+                "boot_id":"ffeeddccbbaa99887766554433221100"}"#,
+        )
+        .map_err(ctx("capabilities json"))?;
+        assert_eq!(caps.persistence.as_deref(), Some("in-memory"));
+        assert_eq!(
+            caps.store_epoch.as_deref(),
+            Some("00112233445566778899aabbccddeeff")
+        );
+        assert_eq!(
+            caps.boot_id.as_deref(),
+            Some("ffeeddccbbaa99887766554433221100")
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn test_documents_without_epoch_fields_still_parse() -> TestResult {
+        let version: VersionInfo =
+            serde_json::from_str(r#"{"service":"old-hub","version":"0.1.0","protocol":1}"#)
+                .map_err(ctx("version json"))?;
+        assert_eq!(version.store_epoch, None);
+        assert_eq!(version.boot_id, None);
+
+        let caps: Capabilities = serde_json::from_str(r#"{"service":"old-hub","protocol":1}"#)
+            .map_err(ctx("capabilities json"))?;
+        assert_eq!(caps.persistence, None);
+        assert_eq!(caps.store_epoch, None);
+        assert_eq!(caps.boot_id, None);
+        Ok(())
+    }
 }

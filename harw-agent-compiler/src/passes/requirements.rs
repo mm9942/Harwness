@@ -31,7 +31,7 @@
 //! Children are unioned into the parent by `ChildClosure`
 //! ([`ExecutionRequirements::union_child`]).
 //!
-//! [`CapabilityClass`]: harw_registry_defaults::capability_catalog::CapabilityClass
+//! [`CapabilityClass`]: crate::builtins::ToolCapability::class
 
 use harw_agent_dsl::Diagnostics;
 use harw_agent_dsl::ir_v2::{
