@@ -102,13 +102,22 @@ impl PermissionRequest {
     }
 }
 
-/// Granted permissions.  Its representation and all constructors for nonempty
-/// grants are private to this crate, except for [`Self::from_policy`], which
-/// is intended for code-defined ceilings that are not derived from a
-/// deserialized policy.
+/// Granted permissions.
 ///
-/// This type deliberately implements neither `Deserialize`, `Default`,
-/// `FromIterator`, nor a public policy constructor.
+/// [`Self::from_policy`] is a public, unrestricted constructor: any caller
+/// may turn an arbitrary iterator of [`Permission`]s into a grant, and it is
+/// in fact the de-facto general-purpose way to build a nonempty
+/// [`PermissionSet`] across the workspace. This type carries no trust
+/// boundary of its own; the boundary lies with the callers that turn a
+/// `PermissionSet` into running authority — [`SandboxSpec::from_resolved`]
+/// and friends for runtime entry points, [`PolicyBootstrap`] for
+/// policy-derived grants. Every other constructor for nonempty grants stays
+/// private to this crate.
+///
+/// This type deliberately implements neither `Deserialize`, `Default`, nor
+/// `FromIterator`: a grant must always be built explicitly from a vouched-for
+/// permission list, never picked up implicitly from a wire payload or an
+/// iterator adapter.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PermissionSet {
     granted: BTreeSet<Permission>,
@@ -123,12 +132,17 @@ impl PermissionSet {
         }
     }
 
-    /// A publicly constructible set of permissions for code-defined ceilings.
+    /// A public, unrestricted constructor for code-defined grants and
+    /// ceilings.
     ///
-    /// The caller vouches that the passed permissions form a safe upper bound.
-    /// This is used by [`harw_core::mode::InteractionMode::permission_ceiling`]
-    /// to express mode-specific ceilings without exposing a generic grant
-    /// constructor.
+    /// The caller vouches that the passed permissions form a safe grant or
+    /// upper bound; this constructor performs no policy check of its own.
+    /// It is, for example, used by `InteractionMode::permission_ceiling` in
+    /// `harw-core` to express mode-specific ceilings, and by production
+    /// callers across the workspace that hand a resolved permission list to
+    /// [`SandboxSpec::from_resolved`]. The trust boundary is not this
+    /// constructor; it is every caller that turns the resulting set into a
+    /// running sandbox or grant.
     #[must_use]
     pub fn from_policy(permissions: impl IntoIterator<Item = Permission>) -> Self {
         Self::from_validated_policy(permissions)
@@ -261,7 +275,7 @@ pub fn is_public_dns_name(host: &str) -> bool {
                 || label.len() > 63
                 || !label
                     .bytes()
-                    .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+                    .all(|b| b.is_ascii_alphanumeric() || b == b'-')
         })
     {
         return false;
@@ -520,9 +534,13 @@ fn target_is_subset(child: &EgressTarget, parent: &EgressTarget) -> bool {
 }
 
 /// Resolved, canonical workspace identity.  Constructing a binding requires a
-/// registry built from trusted operator configuration; wire payloads cannot
-/// create a grant merely by deserializing this scope value.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+/// registry built from trusted operator configuration; this type
+/// deliberately does not implement `Deserialize`, so a wire payload cannot
+/// create a grant-carrying binding — complete with canonical root — merely
+/// by deserializing this scope value.  [`AuthoritySnapshot`] persists only a
+/// [`WorkspaceReference`] (tenant and workspace id, no path) for exactly this
+/// reason.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct WorkspaceBinding {
     tenant: TenantId,
     workspace: WorkspaceId,
@@ -543,6 +561,17 @@ impl WorkspaceBinding {
     #[must_use]
     pub fn canonical_root(&self) -> &Path {
         &self.canonical_root
+    }
+
+    /// The non-authoritative tenant/workspace reference of this binding,
+    /// without the canonical root.  Used to persist [`AuthoritySnapshot`]
+    /// without embedding a path.
+    #[must_use]
+    pub fn reference(&self) -> WorkspaceReference {
+        WorkspaceReference {
+            tenant: self.tenant.clone(),
+            workspace: self.workspace.clone(),
+        }
     }
 
     pub fn resolve_existing(&self, relative: &Path) -> AuthorityResult<PathBuf> {
@@ -601,6 +630,27 @@ impl WorkspaceBinding {
                 workspace: self.workspace.clone(),
             })
         }
+    }
+}
+
+/// A plain, serializable identity reference: tenant and workspace id, no
+/// canonical root and no authority.  Deliberately carries none of
+/// [`WorkspaceBinding`]'s path data, so persisting one (e.g. inside
+/// [`AuthoritySnapshot`]) can never smuggle a canonical root — and therefore
+/// no grant — through deserialization.  [`PolicyBootstrap::reissue`] compares
+/// it against a freshly resolved [`WorkspaceBinding`] instead of trusting a
+/// deserialized path.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorkspaceReference {
+    tenant: TenantId,
+    workspace: WorkspaceId,
+}
+
+impl WorkspaceReference {
+    /// Whether this reference names the same tenant and workspace as `binding`.
+    #[must_use]
+    pub fn matches(&self, binding: &WorkspaceBinding) -> bool {
+        self.tenant == binding.tenant && self.workspace == binding.workspace
     }
 }
 
@@ -864,7 +914,7 @@ impl AuthorityContext {
     #[must_use]
     pub fn snapshot(&self) -> AuthoritySnapshot {
         AuthoritySnapshot {
-            workspace: self.workspace.clone(),
+            workspace: self.workspace.reference(),
             request: PermissionRequest::from_permissions(self.permissions.iter())
                 .with_network_scope(self.network_scope.clone()),
             origin: self.origin.clone(),
@@ -881,18 +931,22 @@ fn harness_read_view_permissions(parent: &PermissionSet) -> PermissionSet {
 
 /// Serializable, non-authoritative display/persistence data.
 ///
-/// A snapshot cannot become a grant by deserialization; callers must pass it to
-/// [`PolicyBootstrap::reissue`] with a freshly resolved workspace binding.
+/// This holds a [`WorkspaceReference`], not a [`WorkspaceBinding`]: a
+/// snapshot never carries a canonical root, so it cannot become a grant by
+/// deserialization even if the binding type itself allowed it.  Callers must
+/// pass it to [`PolicyBootstrap::reissue`] with a freshly resolved workspace
+/// binding, which [`WorkspaceReference::matches`] then checks the reference
+/// against.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AuthoritySnapshot {
-    workspace: WorkspaceBinding,
+    workspace: WorkspaceReference,
     request: PermissionRequest,
     origin: AuthorityOrigin,
 }
 
 impl AuthoritySnapshot {
     #[must_use]
-    pub fn workspace(&self) -> &WorkspaceBinding {
+    pub fn workspace(&self) -> &WorkspaceReference {
         &self.workspace
     }
 
@@ -1152,7 +1206,7 @@ impl PolicyBootstrap {
         workspace: WorkspaceBinding,
         snapshot: &AuthoritySnapshot,
     ) -> AuthorityResult<AuthorityContext> {
-        if workspace != snapshot.workspace {
+        if !snapshot.workspace.matches(&workspace) {
             return Err(AuthorityError::SnapshotWorkspaceMismatch);
         }
         if snapshot.origin.source() != Some(self.source) {
@@ -1234,7 +1288,32 @@ fn read_trusted_policy(source: PolicySource, path: &Path) -> AuthorityResult<Vec
         path: path.to_path_buf(),
         reason: error.to_string(),
     })?;
+    // TOCTOU: `File::open` folgt Symlinks. Zwischen dem `symlink_metadata`-Check
+    // oben und diesem `open` konnte der Pfad ausgetauscht worden sein; das schon
+    // offene File-Handle prüfen wir daher per fstat gegen das vorher per lstat
+    // erfasste (dev, ino), bevor überhaupt gelesen wird.
+    #[cfg(unix)]
+    ensure_policy_not_replaced(path, &symlink_metadata, &metadata)?;
     validate_policy_metadata(source, path, &metadata)?;
+    #[cfg(unix)]
+    if source == PolicySource::OperatorHome {
+        use std::os::unix::fs::MetadataExt;
+        // Primary check: the policy file must actually be owned by the
+        // requesting process, not merely be internally consistent with its
+        // parent (see `matches_process_euid`). Falls back to the
+        // parent-consistency check alone when the euid cannot be resolved
+        // (e.g. no `/proc` on this platform; see `resolve_process_euid`).
+        if let Some(euid) =
+            resolve_process_euid().filter(|&euid| !matches_process_euid(metadata.uid(), euid))
+        {
+            return Err(AuthorityError::OperatorHomePolicyNotProcessOwned {
+                path: path.to_path_buf(),
+                uid: metadata.uid(),
+                euid,
+            });
+        }
+        validate_operator_home_policy_parent(path, metadata.uid())?;
+    }
 
     let mut bytes = Vec::new();
     file.read_to_end(&mut bytes)
@@ -1297,6 +1376,106 @@ fn validate_system_policy_ancestors(path: &Path) -> AuthorityResult<()> {
                 mode,
             });
         }
+    }
+    Ok(())
+}
+
+/// Rejects a policy whose already-open file handle does not point at the
+/// file `symlink_metadata` inspected before the symlink/canonicalize checks.
+/// `File::open` follows symlinks, so without this comparison a path swapped
+/// in during the narrow window between the checks and the `open` call would
+/// be read unnoticed; `(dev, ino)` uniquely identifies the opened file, so a
+/// mismatch here can only mean the path no longer names what was checked.
+#[cfg(unix)]
+fn ensure_policy_not_replaced(
+    path: &Path,
+    checked: &fs::Metadata,
+    opened: &fs::Metadata,
+) -> AuthorityResult<()> {
+    use std::os::unix::fs::MetadataExt;
+
+    if checked.dev() != opened.dev() || checked.ino() != opened.ino() {
+        return Err(AuthorityError::PolicyReplacedDuringOpen {
+            path: path.to_path_buf(),
+        });
+    }
+    Ok(())
+}
+
+/// Resolves the running process's effective uid without `unsafe` and
+/// without a new dependency (`harw-authority` has `#![forbid(unsafe_code)]`
+/// and no dependency able to call `geteuid()` without unsafe FFI): the
+/// owner of the virtual `/proc/self` entry, as reported by
+/// [`std::fs::metadata`], is the calling process's effective uid. Same
+/// technique as `resolve_process_identity` in `harw-sandbox::bwrap`.
+///
+/// `None` when `/proc` is unavailable (e.g. a non-Linux Unix without a
+/// `/proc` compatibility layer, or a sandboxed environment without procfs
+/// mounted) — callers then fall back to the file/parent self-consistency
+/// check ([`owner_matches`]) alone, exactly as before this function existed.
+#[cfg(unix)]
+fn resolve_process_euid() -> Option<u32> {
+    use std::os::unix::fs::MetadataExt;
+
+    fs::metadata("/proc/self").ok().map(|metadata| metadata.uid())
+}
+
+/// Whether a policy file's owner is the resolved effective uid of the
+/// requesting process. The real `file_uid == process_euid` check
+/// [`read_trusted_policy`] uses whenever [`resolve_process_euid`] can
+/// resolve one; kept as a separate, synthetic-input-testable function like
+/// [`owner_matches`] because a test cannot chown a fixture file to an
+/// arbitrary uid without root.
+#[cfg(unix)]
+fn matches_process_euid(file_uid: u32, euid: u32) -> bool {
+    file_uid == euid
+}
+
+/// Whether an operator-home policy's parent directory ownership is
+/// consistent with the policy file's own owner.
+///
+/// This is a secondary, portable check that does not depend on resolving
+/// the process's effective uid: it still closes the concrete attack it
+/// guards against — a different member of a shared group substituting the
+/// policy file through a group-writable `~/.harw` — because the
+/// substituted file would be owned by the substituting uid, not by the
+/// original file's owner. [`read_trusted_policy`] runs this in addition to,
+/// not instead of, the [`matches_process_euid`] check above; it is the only
+/// one of the two still enforced when [`resolve_process_euid`] returns
+/// `None`.
+#[cfg(unix)]
+fn owner_matches(file_uid: u32, ancestor_uid: u32) -> bool {
+    file_uid == ancestor_uid
+}
+
+/// An operator-home policy's immediate parent directory (`~/.harw`) is part
+/// of its trust boundary exactly like the system policy's ancestors: a
+/// group- or world-writable parent lets another user replace the policy
+/// file regardless of the leaf file's own, already-checked mode.  Unlike the
+/// system policy there is no fixed trusted owner (no root); see
+/// [`owner_matches`] for what this checks instead.
+#[cfg(unix)]
+fn validate_operator_home_policy_parent(path: &Path, file_uid: u32) -> AuthorityResult<()> {
+    use std::os::unix::fs::MetadataExt;
+
+    let Some(parent) = path.parent() else {
+        return Ok(());
+    };
+    let metadata = fs::symlink_metadata(parent).map_err(|error| AuthorityError::Io {
+        path: parent.to_path_buf(),
+        reason: error.to_string(),
+    })?;
+    let mode = metadata.mode();
+    if !metadata.is_dir()
+        || metadata.file_type().is_symlink()
+        || !owner_matches(file_uid, metadata.uid())
+        || mode & 0o022 != 0
+    {
+        return Err(AuthorityError::OperatorHomeAncestorUntrusted {
+            path: parent.to_path_buf(),
+            uid: metadata.uid(),
+            mode,
+        });
     }
     Ok(())
 }
@@ -1368,6 +1547,30 @@ pub enum AuthorityError {
         uid: u32,
     },
     SystemPolicyAncestorUntrusted {
+        path: PathBuf,
+        uid: u32,
+        mode: u32,
+    },
+    /// Das bereits geöffnete Policy-File-Handle zeigt auf ein anderes
+    /// `(dev, ino)`, als der `symlink_metadata`-Check vor dem Öffnen erfasst
+    /// hat — der Pfad wurde in der Lücke dazwischen ausgetauscht.
+    PolicyReplacedDuringOpen {
+        path: PathBuf,
+    },
+    /// Die OperatorHome-Policy-Datei gehört nicht der effektiven uid des
+    /// anfragenden Prozesses (`/proc/self`, siehe `resolve_process_euid`) —
+    /// ein fremder Eigentümer der gesamten `~/.harw`-Hierarchie besteht die
+    /// reine Selbstkonsistenz-Prüfung sonst unentdeckt.
+    OperatorHomePolicyNotProcessOwned {
+        path: PathBuf,
+        uid: u32,
+        euid: u32,
+    },
+    /// Der unmittelbare Elternordner einer OperatorHome-Policy (`~/.harw`)
+    /// ist kein vertrauenswürdiges Verzeichnis: Symlink, kein Verzeichnis,
+    /// gruppen-/welt-schreibbar oder von einem anderen Eigentümer als die
+    /// Policy-Datei selbst.
+    OperatorHomeAncestorUntrusted {
         path: PathBuf,
         uid: u32,
         mode: u32,
@@ -1463,6 +1666,21 @@ impl fmt::Display for AuthorityError {
                 "system policy ancestor '{}' is not a root-owned, non-group/world-writable directory (uid {uid}, mode {mode:o})",
                 path.display()
             ),
+            Self::PolicyReplacedDuringOpen { path } => write!(
+                f,
+                "policy path '{}' pointed at a different file when opened than when checked",
+                path.display()
+            ),
+            Self::OperatorHomePolicyNotProcessOwned { path, uid, euid } => write!(
+                f,
+                "operator-home policy '{}' is owned by uid {uid}, not by the requesting process (euid {euid})",
+                path.display()
+            ),
+            Self::OperatorHomeAncestorUntrusted { path, uid, mode } => write!(
+                f,
+                "operator-home policy parent '{}' is not a non-group/world-writable directory owned by the policy file's owner (uid {uid}, mode {mode:o})",
+                path.display()
+            ),
             Self::PolicyDecode { reason } => {
                 write!(f, "trusted authority policy is invalid: {reason}")
             }
@@ -1516,6 +1734,16 @@ impl std::error::Error for AuthorityError {}
 /// let snapshot: AuthoritySnapshot = todo!();
 /// needs_grant(snapshot);
 /// ```
+///
+/// A workspace binding — canonical root included — cannot be deserialized
+/// either; only the path-free [`WorkspaceReference`] can.
+///
+/// ```rust,compile_fail
+/// use harw_authority::WorkspaceBinding;
+///
+/// fn needs_deserialize<T: serde::de::DeserializeOwned>() {}
+/// needs_deserialize::<WorkspaceBinding>();
+/// ```
 const _COMPILE_FAIL_INTENT: () = ();
 
 #[cfg(test)]
@@ -1553,6 +1781,15 @@ mod tests {
             "user@evil.com",
         ] {
             assert!(!is_public_dns_name(local), "{local}");
+        }
+    }
+
+    #[test]
+    fn public_dns_name_rejects_underscore_labels() {
+        // RFC 952/1123: `_` ist in Hostnamen nicht erlaubt; das offene Web
+        // darf hier nicht großzügiger sein als eine echte DNS-Auflösung.
+        for host in ["_dmarc.example.org", "_acme-challenge.example.org"] {
+            assert!(!is_public_dns_name(host), "{host}");
         }
     }
 
@@ -1684,6 +1921,39 @@ network_targets = []
             restrictive.reissue(test_workspace(), &snapshot),
             Err(AuthorityError::RequestExceedsPolicy { .. })
         ));
+        Ok(())
+    }
+
+    #[test]
+    fn reissue_rejects_a_workspace_whose_reference_does_not_match_the_snapshot()
+    -> test_support::TestResult {
+        let bootstrap = PolicyBootstrap::from_test_toml(
+            r#"
+schema_version = 1
+permissions = ["read_workspace"]
+network_targets = []
+"#,
+        )
+        .map_err(test_support::ctx("test policy is structurally valid"))?;
+        let context = bootstrap
+            .issue(
+                test_workspace(),
+                &PermissionRequest::from_permissions([Permission::ReadWorkspace]),
+            )
+            .map_err(test_support::ctx("policy grants request"))?;
+        let snapshot = context.snapshot();
+
+        // Ein frisch aufgelöstes Binding auf einen *anderen* Workspace darf die
+        // Rechte des Snapshots nicht übernehmen, selbst wenn Rechte und Quelle
+        // sonst passen würden.
+        let other = WorkspaceBinding {
+            tenant: harw_types::TenantId::from_str("other-tenant"),
+            ..test_workspace()
+        };
+        assert_eq!(
+            bootstrap.reissue(other, &snapshot),
+            Err(AuthorityError::SnapshotWorkspaceMismatch)
+        );
         Ok(())
     }
 
@@ -1893,5 +2163,180 @@ network_targets = []
             network_scope,
             origin: AuthorityOrigin::TestOnly,
         }
+    }
+
+    /// Eigenes, per `Drop` aufräumendes Scratch-Verzeichnis für
+    /// Dateisystem-Tests. Kein `tempfile`, da diese Crate es nicht als
+    /// Dev-Dependency führt (siehe Bericht des Fixer-Agents).
+    #[cfg(unix)]
+    struct ScratchDir(PathBuf);
+
+    #[cfg(unix)]
+    impl Drop for ScratchDir {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[cfg(unix)]
+    fn scratch_dir(label: &str) -> test_support::TestResult<ScratchDir> {
+        static SEQUENCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|elapsed| elapsed.as_nanos())
+            .unwrap_or_default();
+        let sequence = SEQUENCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!(
+            "harw-authority-test-{label}-{}-{nanos}-{sequence}",
+            std::process::id()
+        ));
+        fs::create_dir_all(&dir).map_err(test_support::ctx("scratch dir must be creatable"))?;
+        let canonical = dir
+            .canonicalize()
+            .map_err(test_support::ctx("scratch dir must canonicalize"))?;
+        Ok(ScratchDir(canonical))
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn owner_matches_requires_identical_uid() {
+        assert!(owner_matches(1000, 1000));
+        assert!(!owner_matches(1000, 1001));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn matches_process_euid_requires_identical_uid() {
+        assert!(matches_process_euid(1000, 1000));
+        assert!(!matches_process_euid(1000, 1001));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn resolve_process_euid_matches_a_file_created_by_this_process() -> test_support::TestResult {
+        use std::os::unix::fs::MetadataExt;
+
+        let Some(euid) = resolve_process_euid() else {
+            // Keine `/proc`-Kompatibilitätsschicht auf dieser Plattform (z. B.
+            // macOS/BSD) — dann greift beim Policy-Lesen ohnehin nur die
+            // portable Selbstkonsistenz-Prüfung (`owner_matches`); hier gibt
+            // es nichts zu prüfen.
+            return Ok(());
+        };
+        let dir = scratch_dir("euid-self")?;
+        let path = dir.0.join("owned-by-this-process");
+        fs::write(&path, b"x").map_err(test_support::ctx("scratch file must be writable"))?;
+        let metadata = fs::symlink_metadata(&path)
+            .map_err(test_support::ctx("scratch file must be stat-able"))?;
+        assert!(matches_process_euid(metadata.uid(), euid));
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn read_trusted_policy_rejects_an_operator_home_policy_not_owned_by_process()
+    -> test_support::TestResult {
+        use std::os::unix::fs::PermissionsExt;
+
+        let Some(euid) = resolve_process_euid() else {
+            // Ohne auflösbare euid greift nur die portable
+            // Selbstkonsistenz-Prüfung; der hier geprüfte euid-Pfad ist auf
+            // dieser Plattform gegenstandslos.
+            return Ok(());
+        };
+        let dir = scratch_dir("foreign-owner")?;
+        fs::set_permissions(&dir.0, fs::Permissions::from_mode(0o755))
+            .map_err(test_support::ctx("scratch dir mode must be settable"))?;
+        let policy_path = dir.0.join("authority.toml");
+        fs::write(&policy_path, b"schema_version = 1\n")
+            .map_err(test_support::ctx("policy must be writable"))?;
+        fs::set_permissions(&policy_path, fs::Permissions::from_mode(0o644))
+            .map_err(test_support::ctx("policy mode must be settable"))?;
+
+        let foreign_uid = if euid == 65_534 { 65_533 } else { 65_534 };
+        if std::os::unix::fs::chown(&policy_path, Some(foreign_uid), None).is_err() {
+            // Kein `CAP_CHOWN`/kein root in dieser Testumgebung — ein
+            // Eigentümerwechsel auf eine fremde uid ist dann grundsätzlich
+            // nicht möglich, und genau deshalb kann die reale Bedrohung, vor
+            // der diese Prüfung schützt, hier gar nicht auftreten.
+            return Ok(());
+        }
+
+        assert!(matches!(
+            read_trusted_policy(PolicySource::OperatorHome, &policy_path),
+            Err(AuthorityError::OperatorHomePolicyNotProcessOwned { .. })
+        ));
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn ensure_policy_not_replaced_detects_a_swapped_file() -> test_support::TestResult {
+        let dir = scratch_dir("swap")?;
+        let original = dir.0.join("policy.toml");
+        let swapped = dir.0.join("other.toml");
+        fs::write(&original, b"schema_version = 1\n")
+            .map_err(test_support::ctx("original policy must be writable"))?;
+        fs::write(&swapped, b"schema_version = 1\nextra = true\n")
+            .map_err(test_support::ctx("swapped-in policy must be writable"))?;
+
+        let checked = fs::symlink_metadata(&original)
+            .map_err(test_support::ctx("original policy must be stat-able"))?;
+        let opened_same = fs::File::open(&original)
+            .and_then(|file| file.metadata())
+            .map_err(test_support::ctx("original policy must be open-able"))?;
+        let opened_other = fs::File::open(&swapped)
+            .and_then(|file| file.metadata())
+            .map_err(test_support::ctx("swapped-in policy must be open-able"))?;
+
+        ensure_policy_not_replaced(&original, &checked, &opened_same)?;
+        assert!(matches!(
+            ensure_policy_not_replaced(&original, &checked, &opened_other),
+            Err(AuthorityError::PolicyReplacedDuringOpen { .. })
+        ));
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn read_trusted_policy_rejects_group_writable_operator_home_parent()
+    -> test_support::TestResult {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = scratch_dir("group-writable")?;
+        fs::set_permissions(&dir.0, fs::Permissions::from_mode(0o777))
+            .map_err(test_support::ctx("scratch dir mode must be settable"))?;
+        let policy_path = dir.0.join("authority.toml");
+        fs::write(&policy_path, b"schema_version = 1\n")
+            .map_err(test_support::ctx("policy must be writable"))?;
+        fs::set_permissions(&policy_path, fs::Permissions::from_mode(0o644))
+            .map_err(test_support::ctx("policy mode must be settable"))?;
+
+        assert!(matches!(
+            read_trusted_policy(PolicySource::OperatorHome, &policy_path),
+            Err(AuthorityError::OperatorHomeAncestorUntrusted { .. })
+        ));
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn read_trusted_policy_accepts_a_well_owned_operator_home_policy() -> test_support::TestResult
+    {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = scratch_dir("well-owned")?;
+        fs::set_permissions(&dir.0, fs::Permissions::from_mode(0o755))
+            .map_err(test_support::ctx("scratch dir mode must be settable"))?;
+        let policy_path = dir.0.join("authority.toml");
+        fs::write(&policy_path, b"schema_version = 1\n")
+            .map_err(test_support::ctx("policy must be writable"))?;
+        fs::set_permissions(&policy_path, fs::Permissions::from_mode(0o644))
+            .map_err(test_support::ctx("policy mode must be settable"))?;
+
+        let bytes = read_trusted_policy(PolicySource::OperatorHome, &policy_path)
+            .map_err(test_support::ctx("well-owned operator-home policy must be accepted"))?;
+        assert_eq!(bytes, b"schema_version = 1\n");
+        Ok(())
     }
 }
