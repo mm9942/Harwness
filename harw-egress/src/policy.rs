@@ -257,7 +257,9 @@ impl EgressPolicy {
     /// `allow_private` (`0`/`1`), die Anzahl der Einträge als `u64`
     /// little-endian, dann je Eintrag seine Länge als `u64` little-endian und
     /// seine Bytes. Die Längenpräfixe verhindern, dass `["ab","c"]` und
-    /// `["a","bc"]` kollidieren.
+    /// `["a","bc"]` kollidieren. Danach, nur wenn `open_public` gesetzt ist,
+    /// folgen die Bytes `\0open-public` (bestehende Digests bleiben dadurch
+    /// unverändert).
     ///
     /// # Returns
     /// 32 Bytes BLAKE3.
@@ -756,6 +758,21 @@ mod tests {
         expected.extend_from_slice(&1_u64.to_le_bytes());
         expected.extend_from_slice(&7_u64.to_le_bytes());
         expected.extend_from_slice(b"docs.rs");
+        assert_eq!(p.digest(), *blake3::hash(&expected).as_bytes());
+        Ok(())
+    }
+
+    #[test]
+    fn test_digest_matches_documented_encoding_with_open_public() -> TestResult {
+        let p = policy(&["docs.rs"], true)?.with_open_public(true);
+        let mut expected = Vec::new();
+        expected.extend_from_slice(b"harw:egress-policy:v1\0");
+        expected.push(1);
+        expected.extend_from_slice(&1_u64.to_le_bytes());
+        expected.extend_from_slice(&7_u64.to_le_bytes());
+        expected.extend_from_slice(b"docs.rs");
+        // Dokumentierter Zusatz: nur bei gesetztem open_public angehängt.
+        expected.extend_from_slice(b"\0open-public");
         assert_eq!(p.digest(), *blake3::hash(&expected).as_bytes());
         Ok(())
     }

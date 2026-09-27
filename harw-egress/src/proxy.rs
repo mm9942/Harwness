@@ -186,9 +186,10 @@ impl EgressProxy {
     /// use std::sync::Arc;
     /// use harw_egress::{EgressPolicy, EgressProxy, ProxyLimits};
     ///
-    /// let policy = Arc::new(EgressPolicy::new(vec!["docs.rs".into()], false).unwrap());
+    /// let policy = Arc::new(EgressPolicy::new(vec!["docs.rs".into()], false)?);
     /// let proxy = EgressProxy::new(policy, ProxyLimits::default());
     /// assert_eq!(proxy.limits().max_connections, 256);
+    /// # Ok::<(), harw_egress::EgressError>(())
     /// ```
     #[must_use]
     pub fn new(policy: Arc<EgressPolicy>, limits: ProxyLimits) -> Self {

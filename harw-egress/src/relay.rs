@@ -32,7 +32,11 @@
 //! # Nebenläufigkeit
 //! Synchron mit `std::thread`: ein Thread je Verbindung plus ein Hilfsthread
 //! für die Gegenrichtung; die Zahl gleichzeitiger Verbindungen ist begrenzt.
-//! Kein async-Runtime, kein `Mutex` auf dem Datenpfad.
+//! Kein async-Runtime, kein `Mutex` auf dem Datenpfad. Endet die
+//! Proxy→Client-Richtung (Proxy schließt, z. B. eigener Idle-Timeout), bekommt
+//! der Hilfsthread eine Lesefrist (`DEFAULT_RELAY_IDLE_POLL`) auf den
+//! Client: schreibt oder schließt der Client danach immer noch nicht, endet
+//! die Verbindung trotzdem, statt den Slot unbegrenzt zu belegen.
 //!
 //! # Fehler
 //! Alle Fehler sind Varianten von [`RelayError`]; Fehler einzelner
@@ -61,8 +65,9 @@ use std::os::unix::process::ExitStatusExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitStatus};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::thread;
+use std::time::Duration;
 
 /// Exit-Code bei ungültigen Argumenten (BSD `EX_USAGE`).
 pub const EXIT_USAGE: u8 = 64;
@@ -76,6 +81,12 @@ pub const EXIT_CHILD_NOT_FOUND: u8 = 127;
 pub const EXIT_CHILD_NOT_EXECUTABLE: u8 = 126;
 /// Standardgrenze gleichzeitiger Verbindungen im Binary.
 pub const DEFAULT_RELAY_MAX_CONNECTIONS: usize = 128;
+/// Standard-Lesefrist für `client_read` in [`relay_connection`]: darüber
+/// merkt der Hilfsthread, dass die Proxy-Seite schon beendet ist, auch wenn
+/// der Client selbst weder schreibt noch schließt. Kein Policy-Timeout —
+/// der sitzt beim Proxy — sondern nur die Reaktionszeit dieses Relays, um
+/// den Verbindungs-Slot danach zuverlässig wieder freizugeben.
+pub const DEFAULT_RELAY_IDLE_POLL: Duration = Duration::from_millis(500);
 
 /// Kurzhilfe für stderr bei [`RelayError::Usage`].
 pub const RELAY_USAGE: &str =
@@ -141,10 +152,10 @@ impl RelayConfig {
     /// let cfg = RelayConfig::from_args(
     ///     ["4444", "/run/egress.sock", "--", "geckodriver", "--port", "4445"]
     ///         .map(std::ffi::OsString::from),
-    /// )
-    /// .unwrap();
+    /// )?;
     /// assert_eq!(cfg.port, 4444);
-    /// assert_eq!(cfg.command.unwrap().args.len(), 2);
+    /// assert_eq!(cfg.command.ok_or("kein Kindprozess")?.args.len(), 2);
+    /// # Ok::<(), Box<dyn std::error::Error>>(())
     /// ```
     pub fn from_args<I>(args: I) -> Result<Self, RelayError>
     where
@@ -223,8 +234,9 @@ fn usage(reason: &str) -> RelayError {
 ///
 /// # Examples
 /// ```rust,no_run
-/// let listener = harw_egress::bind_relay(1080).unwrap();
+/// let listener = harw_egress::bind_relay(1080)?;
 /// # drop(listener);
+/// # Ok::<(), Box<dyn std::error::Error>>(())
 /// ```
 pub fn bind_relay(port: u16) -> Result<TcpListener, RelayError> {
     let addr = SocketAddr::from((Ipv4Addr::LOCALHOST, port));
@@ -235,10 +247,12 @@ pub fn bind_relay(port: u16) -> Result<TcpListener, RelayError> {
 ///
 /// # Description
 /// Nimmt Verbindungen in einer Schleife an. Je Verbindung startet ein Thread
-/// [`relay_connection`]. Ist `max_connections` erreicht, wird die neue
-/// Verbindung sofort geschlossen und [`RelayError::ConnectionLimit`]
-/// gemeldet. `accept`-Fehler werden gemeldet; danach wartet die Schleife
-/// kurz und macht weiter.
+/// [`relay_connection`] mit `DEFAULT_RELAY_IDLE_POLL` als Lesefrist, damit
+/// eine Verbindung, deren Proxy-Seite schon beendet ist, ihren Slot auch bei
+/// einem stummen Client zuverlässig wieder freigibt. Ist `max_connections`
+/// erreicht, wird die neue Verbindung sofort geschlossen und
+/// [`RelayError::ConnectionLimit`] gemeldet. `accept`-Fehler werden gemeldet;
+/// danach wartet die Schleife kurz und macht weiter.
 ///
 /// # Arguments
 /// - `listener` (`TcpListener`): gebundener Loopback-Listener (Eigentum).
@@ -284,7 +298,7 @@ pub fn run_relay(
             .name("harw-relay-conn".to_owned())
             .spawn(move || {
                 let _slot = slot;
-                if let Err(err) = relay_connection(client, &socket) {
+                if let Err(err) = relay_connection(client, &socket, DEFAULT_RELAY_IDLE_POLL) {
                     conn_report(&err);
                 }
             });
@@ -327,16 +341,25 @@ impl Drop for ConnectionSlot {
 /// # Description
 /// Verbindet sich mit `proxy_socket` und kopiert in beide Richtungen. Endet
 /// eine Richtung (EOF), wird die Schreibseite des Gegenübers halb
-/// geschlossen (`shutdown(Write)`), die andere Richtung läuft weiter. Die
-/// Funktion kehrt zurück, wenn beide Richtungen beendet sind. Nutzdaten
-/// werden weder gelesen noch protokolliert.
+/// geschlossen (`shutdown(Write)`), die andere Richtung läuft weiter. Endet
+/// die Proxy→Client-Richtung, bekommt `client_read` außerdem `idle_poll` als
+/// Lesefrist: läuft ein Lesevorgang danach in die Frist, prüft der
+/// Hilfsthread, ob die Proxy-Seite schon beendet ist, und gibt in dem Fall
+/// auf, statt unbegrenzt auf Daten oder ein Schließen durch den Client zu
+/// warten. Die Funktion kehrt zurück, wenn beide Richtungen beendet sind.
+/// Nutzdaten werden weder gelesen noch protokolliert.
 ///
 /// # Arguments
 /// - `client` (`TcpStream`): angenommene Verbindung (Eigentum).
 /// - `proxy_socket` (`&Path`): Unix-Socket des Egress-Proxys.
+/// - `idle_poll` (`Duration`): Lesefrist auf `client_read`, mit der der
+///   Hilfsthread erkennt, dass die Proxy-Seite bereits beendet ist (siehe
+///   `DEFAULT_RELAY_IDLE_POLL`).
 ///
 /// # Returns
-/// `Ok(())`, wenn beide Richtungen ohne I/O-Fehler endeten.
+/// `Ok(())`, wenn beide Richtungen ohne I/O-Fehler endeten — auch, wenn die
+/// Client→Proxy-Richtung wegen `idle_poll` abgebrochen wurde, ohne dass der
+/// Client selbst geschlossen hat.
 ///
 /// # Errors
 /// - [`RelayError::ProxyConnect`]: Proxy-Socket nicht erreichbar (Client wird geschlossen).
@@ -344,18 +367,29 @@ impl Drop for ConnectionSlot {
 /// - [`RelayError::Thread`] / [`RelayError::ThreadPanicked`]: Hilfsthread.
 ///
 /// # Concurrency
-/// Blockiert; startet genau einen Hilfsthread.
+/// Blockiert; startet genau einen Hilfsthread. Kein `Mutex`: das Ende der
+/// Proxy-Seite wird per `AtomicBool` an den Hilfsthread signalisiert.
 ///
 /// # Examples
 /// ```rust,no_run
 /// use std::net::TcpListener;
 /// use std::path::Path;
+/// use std::time::Duration;
 ///
-/// let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-/// let (client, _) = listener.accept().unwrap();
-/// harw_egress::relay_connection(client, Path::new("/run/harw/egress.sock")).unwrap();
+/// let listener = TcpListener::bind("127.0.0.1:0")?;
+/// let (client, _) = listener.accept()?;
+/// harw_egress::relay_connection(
+///     client,
+///     Path::new("/run/harw/egress.sock"),
+///     Duration::from_secs(1),
+/// )?;
+/// # Ok::<(), Box<dyn std::error::Error>>(())
 /// ```
-pub fn relay_connection(client: TcpStream, proxy_socket: &Path) -> Result<(), RelayError> {
+pub fn relay_connection(
+    client: TcpStream,
+    proxy_socket: &Path,
+    idle_poll: Duration,
+) -> Result<(), RelayError> {
     let proxy = UnixStream::connect(proxy_socket).map_err(|source| RelayError::ProxyConnect {
         path: proxy_socket.to_path_buf(),
         source,
@@ -364,16 +398,28 @@ pub fn relay_connection(client: TcpStream, proxy_socket: &Path) -> Result<(), Re
         direction: RelayDirection::ClientToProxy,
         source,
     })?;
+    // Ohne Lesefrist würde dieser Thread nach dem Ende der Gegenrichtung
+    // unbegrenzt auf einen stummen Client warten (Befund: Slot blieb belegt,
+    // bis der Client selbst schreibt oder schließt).
+    client_read
+        .set_read_timeout(Some(idle_poll))
+        .map_err(|source| RelayError::Copy {
+            direction: RelayDirection::ClientToProxy,
+            source,
+        })?;
     let mut proxy_write = proxy.try_clone().map_err(|source| RelayError::Copy {
         direction: RelayDirection::ClientToProxy,
         source,
     })?;
+    let proxy_gone = Arc::new(AtomicBool::new(false));
+    let upstream_proxy_gone = Arc::clone(&proxy_gone);
     let upstream = thread::Builder::new()
         .name("harw-relay-up".to_owned())
         .spawn(move || {
-            let copied = io::copy(&mut client_read, &mut proxy_write);
+            let copied =
+                copy_until_stopped(&mut client_read, &mut proxy_write, &upstream_proxy_gone);
             half_close_unix(&proxy_write);
-            copied.map(|_| ()).map_err(|source| RelayError::Copy {
+            copied.map_err(|source| RelayError::Copy {
                 direction: RelayDirection::ClientToProxy,
                 source,
             })
@@ -389,9 +435,41 @@ pub fn relay_connection(client: TcpStream, proxy_socket: &Path) -> Result<(), Re
             source,
         });
     half_close_tcp(&client_write);
+    // Die Proxy-Seite ist beendet (EOF oder Fehler): der Hilfsthread soll die
+    // Wartezeit auf den Client jetzt auf `idle_poll` begrenzen.
+    proxy_gone.store(true, Ordering::SeqCst);
 
     let upstream = upstream.join().map_err(|_| RelayError::ThreadPanicked)?;
     downstream.and(upstream)
+}
+
+// Wie `io::copy`, bricht aber ohne Fehler ab, sobald `stop` gesetzt ist und
+// der laufende Lesevorgang in die Lesefrist von `reader` läuft (siehe
+// `relay_connection`). So endet der Thread, sobald die Gegenrichtung fertig
+// ist, auch wenn der Reader selbst weder Daten liefert noch schließt.
+fn copy_until_stopped<R, W>(reader: &mut R, writer: &mut W, stop: &AtomicBool) -> io::Result<()>
+where
+    R: io::Read,
+    W: io::Write,
+{
+    let mut buf = [0_u8; 8192];
+    loop {
+        match reader.read(&mut buf) {
+            Ok(0) => return Ok(()),
+            Ok(n) => writer.write_all(&buf[..n])?,
+            Err(source)
+                if matches!(
+                    source.kind(),
+                    io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
+                ) =>
+            {
+                if stop.load(Ordering::SeqCst) {
+                    return Ok(());
+                }
+            }
+            Err(source) => return Err(source),
+        }
+    }
 }
 
 // Halb-Schließen nach EOF. Ein Fehler bedeutet, dass die Gegenseite bereits
@@ -429,8 +507,9 @@ fn half_close_unix(stream: &UnixStream) {
 /// ```rust,no_run
 /// use harw_egress::{ChildCommand, run_child};
 ///
-/// let code = run_child(&ChildCommand { program: "true".into(), args: Vec::new() }).unwrap();
+/// let code = run_child(&ChildCommand { program: "true".into(), args: Vec::new() })?;
 /// assert_eq!(code, 0);
+/// # Ok::<(), Box<dyn std::error::Error>>(())
 /// ```
 pub fn run_child(command: &ChildCommand) -> Result<u8, RelayError> {
     let program = command.program.to_string_lossy().into_owned();
@@ -650,7 +729,7 @@ mod tests {
     use std::io::{Read, Write};
     use std::os::unix::net::UnixListener;
     use std::sync::mpsc;
-    use std::time::Duration;
+    use std::time::{Duration, Instant};
 
     fn os(args: &[&str]) -> Vec<OsString> {
         args.iter().map(OsString::from).collect()
@@ -790,6 +869,18 @@ mod tests {
         }))
     }
 
+    // Unix-Socket-Gegenstelle, die jede Verbindung sofort ohne Antwort
+    // schließt: simuliert einen Proxy, dessen eigener Idle-Timeout bereits
+    // abgelaufen ist, bevor der Client etwas gesendet hat.
+    fn fake_proxy_hangs_up(path: &Path) -> TestResult<thread::JoinHandle<TestResult>> {
+        let listener = UnixListener::bind(path).map_err(ctx("Unix-Socket binden"))?;
+        Ok(thread::spawn(move || {
+            let (stream, _) = listener.accept().map_err(ctx("accept"))?;
+            drop(stream);
+            Ok(())
+        }))
+    }
+
     #[test]
     fn test_run_relay_forwards_with_half_close() -> TestResult {
         let dir = tempfile::tempdir().map_err(ctx("tempdir"))?;
@@ -841,7 +932,7 @@ mod tests {
             Ok(stream.read_to_end(&mut buf).map(|_| buf.len()))
         });
         let (accepted, _) = listener.accept().map_err(ctx("accept"))?;
-        let Err(err) = relay_connection(accepted, &socket) else {
+        let Err(err) = relay_connection(accepted, &socket, DEFAULT_RELAY_IDLE_POLL) else {
             return Err(TestError::Unexpected("Socket fehlt: Err erwartet".into()));
         };
         assert!(matches!(err, RelayError::ProxyConnect { .. }), "{err:?}");
@@ -849,6 +940,84 @@ mod tests {
             .join()
             .map_err(|_| TestError::Unexpected("Client-Thread: Thread panicked".into()))??;
         assert!(matches!(read, Ok(0) | Err(_)), "{read:?}");
+        Ok(())
+    }
+
+    #[test]
+    fn test_relay_connection_bounds_wait_for_silent_client_after_proxy_closes() -> TestResult {
+        let dir = tempfile::tempdir().map_err(ctx("tempdir"))?;
+        let socket = dir.path().join("egress.sock");
+        // Proxy hat schon geschlossen (z. B. eigener Idle-Timeout), bevor der
+        // Client überhaupt etwas geschickt hat.
+        let proxy = fake_proxy_hangs_up(&socket)?;
+        let listener = bind_relay_any_port()?;
+        let addr = listener.local_addr().map_err(ctx("lokale Adresse"))?;
+
+        // Der Client bleibt bewusst stumm: kein Write, kein Close, solange
+        // relay_connection läuft.
+        let silent_client = TcpStream::connect(addr).map_err(ctx("verbinden"))?;
+        let (accepted, _) = listener.accept().map_err(ctx("accept"))?;
+
+        let started = Instant::now();
+        let result = relay_connection(accepted, &socket, Duration::from_millis(50));
+        let elapsed = started.elapsed();
+        proxy
+            .join()
+            .map_err(|_| TestError::Unexpected("Fake-Proxy: Thread panicked".into()))??;
+        drop(silent_client);
+
+        result.map_err(ctx("relay_connection nach Proxy-Ende"))?;
+        assert!(
+            elapsed < Duration::from_secs(2),
+            "Slot nicht rechtzeitig frei: {elapsed:?}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn test_run_relay_frees_slot_after_proxy_closes_and_client_stays_silent() -> TestResult {
+        let dir = tempfile::tempdir().map_err(ctx("tempdir"))?;
+        let socket = dir.path().join("egress.sock");
+        // Proxy, der jede Verbindung sofort ohne Antwort schließt.
+        let unix_listener = UnixListener::bind(&socket).map_err(ctx("Unix-Socket binden"))?;
+        thread::spawn(move || {
+            while let Ok((stream, _)) = unix_listener.accept() {
+                drop(stream);
+            }
+        });
+
+        let listener = bind_relay_any_port()?;
+        let addr = listener.local_addr().map_err(ctx("lokale Adresse"))?;
+        let (tx, rx) = mpsc::channel::<String>();
+        let report: RelayReporter = Arc::new(move |err: &RelayError| {
+            // Testkanal; ein geschlossener Empfänger ist hier bedeutungslos.
+            let _ = tx.send(err.to_string());
+        });
+        let relay_socket = socket.clone();
+        thread::spawn(move || run_relay(listener, &relay_socket, 1, report));
+
+        // Erster Client bleibt stumm und belegt den einzigen Slot.
+        let silent_client = TcpStream::connect(addr).map_err(ctx("verbinden 1"))?;
+        thread::sleep(Duration::from_millis(100));
+
+        // Solange der Slot belegt ist, verwirft `run_relay` neue Verbindungen.
+        let rejected = TcpStream::connect(addr).map_err(ctx("verbinden 2"))?;
+        let message = rx
+            .recv_timeout(Duration::from_secs(2))
+            .map_err(|_| TestError::Missing("ConnectionLimit-Meldung"))?;
+        assert_eq!(message, RelayError::ConnectionLimit { max: 1 }.to_string());
+        drop(rejected);
+
+        // Nach der Lesefrist muss der Slot wieder frei sein: eine dritte
+        // Verbindung darf nicht erneut am Limit scheitern.
+        thread::sleep(DEFAULT_RELAY_IDLE_POLL * 3 + Duration::from_millis(500));
+        let accepted = TcpStream::connect(addr).map_err(ctx("verbinden 3"))?;
+        assert!(
+            rx.recv_timeout(Duration::from_millis(300)).is_err(),
+            "Slot war nach der Lesefrist noch nicht frei"
+        );
+        drop(accepted);
+        drop(silent_client);
         Ok(())
     }
 
