@@ -40,6 +40,9 @@ The mapping/research input has four errors that this note corrects:
 - `ResourceRequest` already has `memory_max`, `cpu_weight`, `pids_max` and `wall_timeout` (`harw-job-core/src/spec.rs:188-200`).
 - The proposed `LinuxSandboxBackend::Container` variant is the wrong shape (see §2).
 
+> **Mode B (harw-Zelle):** harw selbst als Container mit lokal kompilierten
+> Worker-Agenten, siehe [`cell.md`](cell.md).
+
 ## 1. Goal and non-goals
 - **Goal:** harw starts, supervises, reattaches to and cleans up containers as job attempts. It exposes them as `RuntimeOffer`/`NodeOffer` values. DoD observes them and can act on them.
 - **Off by default, zero cost:** everything sits behind Cargo features, following the bwrap precedent (`harw-job-runtime/Cargo.toml:14-17`, `harw-job/Cargo.toml:14`). With the features off, no container client code is compiled.
