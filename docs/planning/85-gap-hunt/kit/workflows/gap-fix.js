@@ -15,11 +15,29 @@ export const meta = {
 //   catalog   pattern catalog path (default docs/planning/85-gap-hunt/patterns.md)
 //   rules     binding code rules (default: the workspace rules below)
 //   ripple    true (default) to run the final cross-file check
+//   reviewOnly  repo-relative files whose fixes are already in the working
+//               tree (e.g. a run died at a session limit after its fixer
+//               finished): skip the fixer, review and repair only
+//   root      absolute path of the checkout to work in (default: the current
+//             working directory). One workflow, one branch: cut a git worktree
+//             per wave and pass its path here, so every wave commits on its own
+//             branch and the main tree stays clean (catalog P11).
+//   partial     repo-relative files a dead fixer may have left half-edited:
+//               the new fixer inspects `git diff -- <file>` first and
+//               completes or corrects that edit instead of starting over
+// After a session limit prefer a resume (Workflow resumeFromRunId): completed
+// agents replay from the journal and failed ones run again. Use reviewOnly and
+// partial when the original args are gone or the batch has to be recut.
 const A = args || {}
 const CATALOG = A.catalog || 'docs/planning/85-gap-hunt/patterns.md'
 const RULES = A.rules || 'no let-chains (`if let … && …`, MSRV 1.85), forbid(unsafe), no unwrap/expect/panic! in library code OR tests/doctests (tests return TestResult and use the crate helpers), no third-party types in public APIs, hand-written error types, match the file\'s comment language and density, no book titles/authors/quotes anywhere'
 const BUILD_RULE = 'Subagents and parallel agents must **never** run `cargo` or `rustc` in any form: no `check`, `build`, `test`, `nextest`, `clippy`, `fmt`, `run`, `doc`, `deny`, and no `make` target that calls them. They only read and edit code. At the end they report which tests they added and which commands the central build must run.'
-const CONTEXT = `Repository: the current working directory (Rust workspace). Binding code rules: ${RULES}. Pattern catalog: ${CATALOG}. ${BUILD_RULE}`
+const ROOT = A.root || ''
+const WHERE = ROOT
+  ? `Repository root: ${ROOT} (a git worktree on its own branch). Every path below is relative to that root: read and edit files only under it, and run git as \`git -C ${ROOT} …\`. Never touch the same path in any other checkout.`
+  : 'Repository: the current working directory (Rust workspace).'
+const GIT = ROOT ? `git -C ${ROOT}` : 'git'
+const CONTEXT = `${WHERE} Binding code rules: ${RULES}. Pattern catalog: ${CATALOG}. ${BUILD_RULE}`
 
 // Lessons from earlier hunts (catalog P1/P2): fixes caused follow-up findings.
 const FIX_RULES = `
@@ -64,14 +82,16 @@ for (const f of A.findings || []) {
   ;(byFile[file] = byFile[file] || []).push({ ...f, file })
 }
 const groups = Object.entries(byFile)
+const REVIEW_ONLY = new Set((A.reviewOnly || []).map(norm))
+const PARTIAL = new Set((A.partial || []).map(norm))
 log(`${A.key || 'batch'}: ${groups.length} files, ${(A.findings || []).length} findings`)
 
 const fixReports = []
 const reviewReports = []
 const results = await pipeline(groups,
-  ([file, fs]) => agent(`${CONTEXT}
+  ([file, fs]) => REVIEW_ONLY.has(file) ? { file, fixed: [], skipped: [], notes: 'fix already applied in the working tree (reviewOnly)' } : agent(`${CONTEXT}
 
-You are a fixer. Edit ONLY this one file: ${file}. Do not create or edit any other file. Use the Edit tool (no temp files). Never commit.
+You are a fixer. Edit ONLY this one file: ${file}.${PARTIAL.has(file) ? ` An earlier fixer for this file died mid-run and may have left a partial edit: read \`${GIT} diff -- ${file}\` first, then complete or correct that edit rather than starting over.` : ''} Do not create or edit any other file. Use the Edit tool (no temp files). Never commit.
 Fix these verified findings (skip one only if the fix would be riskier than the defect, and say why):
 ${fs.map((f, i) => `${i + 1}. [${f.severity}] ${f.title} (line ${f.line})\n   ${f.description}\n   Evidence: ${f.evidence}\n   Fix: ${f.fix}\n   Test idea: ${f.test_idea || '-'}`).join('\n')}
 Add or adjust tests in this file's test module where sensible. Keep public signatures stable unless a finding requires otherwise; callers in other files must still compile.${FIX_RULES}`,
@@ -80,7 +100,7 @@ Add or adjust tests in this file's test module where sensible. Keep public signa
     if (fixRes) fixReports.push(fixRes)
     return agent(`${CONTEXT}
 
-You are an adversarial reviewer of a just-made fix. File: ${file}. Inspect \`git diff -- ${file}\` (it may contain earlier unrelated edits; focus on these findings):
+You are an adversarial reviewer of a just-made fix. File: ${file}. Inspect \`${GIT} diff -- ${file}\` (it may contain earlier unrelated edits; focus on these findings):
 ${fs.map(f => `- ${f.title}: ${f.fix}`).join('\n')}
 Fixer report: ${JSON.stringify(fixRes || {})}
 Check by reading: the defect is really fixed; no new bug; binding rules hold; cfgs compile on all target platforms; no dead code that clippy -D warnings rejects; callers in other files still compile (grep); comment language matches. Do not edit. ok=false only with concrete problems.${REVIEW_RULES}`,
@@ -105,7 +125,7 @@ if (A.ripple !== false && groups.length) {
   phase('Ripple')
   ripple = await agent(`${CONTEXT}
 
-You are the cross-file consistency checker. Files just changed by one-file fixers: ${groups.map(g => g[0]).join(', ')}. Read \`git diff\` for them and look ONLY for cross-file ripple: callers/tests elsewhere that no longer match a changed signature or behaviour, docs/comments/ledger/guides elsewhere describing the old behaviour, pub helpers without any production caller, the same issue fixed twice in conflicting ways, anything that would fail to compile or fail clippy -D warnings across files. Do not edit. Report concrete items with file:line.`,
+You are the cross-file consistency checker. Files just changed by one-file fixers: ${groups.map(g => g[0]).join(', ')}. Read \`${GIT} diff\` for them and look ONLY for cross-file ripple: callers/tests elsewhere that no longer match a changed signature or behaviour, docs/comments/ledger/guides elsewhere describing the old behaviour, pub helpers without any production caller, the same issue fixed twice in conflicting ways, anything that would fail to compile or fail clippy -D warnings across files. Do not edit. Report concrete items with file:line.`,
     { label: `ripple:${A.key || 'batch'}`, phase: 'Ripple', schema: RIPPLE, model: 'opus', agentType: 'focused-explorer' })
 }
 

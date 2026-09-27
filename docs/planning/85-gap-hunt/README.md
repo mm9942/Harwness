@@ -20,10 +20,12 @@ Agent baut. Sie ist aus der Runde R15 entstanden.
 
 | Datei | Zweck |
 |---|---|
-| [patterns.md](patterns.md) | Muster-Katalog (M1–M8, P1–P8). Die Finder taggen Funde damit. |
+| [patterns.md](patterns.md) | Muster-Katalog (M1–M8, P1–P11). Die Finder taggen Funde damit. |
 | [R15-patterns.md](R15-patterns.md) | Lauf-Protokoll R15: Zahlen, Beobachtungen, Lehren |
 | [kit/workflows/gap-hunt-area.js](kit/workflows/gap-hunt-area.js) | Suchen und Prüfen für einen Bereich, nur lesend |
 | [kit/workflows/gap-fix.js](kit/workflows/gap-fix.js) | Fixen, Reviewen und Reparieren für eine disjunkte Dateimenge, dazu der Cross-File-Check |
+| [kit/workflows/gap-verify.js](kit/workflows/gap-verify.js) | Nachprüfen vorhandener Funde (gestaffelt), optional mit Vollständigkeits-Kritiker; auch für Feldberichte |
+| [kit/workflows/contract-wave.js](kit/workflows/contract-wave.js) | Mehrdatei-Funde je Cluster: Opus-Vertrag, ein Coder pro Datei, Opus-Cluster-Review, Reparatur |
 | [kit/skills/gap-hunt/SKILL.md](kit/skills/gap-hunt/SKILL.md) | Ablauf für die orchestrierende Session |
 | [kit/agents/](kit/agents/) | `focused-explorer` (nur lesen) und `focused-coder` (eine Datei, baut nie) |
 
@@ -54,6 +56,10 @@ Agent baut. Sie ist aus der Runde R15 entstanden.
   - Die Grenze gleichzeitiger Agenten gilt pro Workflow, bei CPUs − 2.
   - Mehrere Top-Level-Läufe auf getrennten Bereichen nutzen das Kontingent aus,
     ein einzelner großer Lauf nicht.
+- **Ein Workflow, eine Branch (P11):** Jede Welle arbeitet in einem eigenen
+  git-Worktree auf eigener Branch (`root`-Argument) und committet sofort nach
+  ihrem Review. Eine Integrations-Branch sammelt die Wellen per Merge; nur dort
+  läuft der zentrale Build. Der Haupt-Arbeitsbaum bleibt sauber.
 - **Mehrdatei-Funde als Vertragswelle:** Einzel-Fixer erzeugen sonst
   Halb-Infrastruktur (P2).
 
