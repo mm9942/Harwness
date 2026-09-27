@@ -107,7 +107,7 @@ Jede Overfull-Box über 1 pt ist sichtbar: Text ragt in den Rand. Die Zeilennumm
 
 Für Sachstände, Auswertungen, Dokumentationen eines Vorhabens. Aufbau: Wichtig vorab → Die Idee in drei Sätzen → Inhaltsverzeichnis → Worum es geht (mit Glossar) → Aufbau (Abbildung) → Ergebnisse im Detail → Stand und nächste Schritte → Quellen.
 
-### business-paper (nach Minto)
+### business-paper (Pyramidenprinzip)
 
 Für Entscheidungsvorlagen, Positionspapiere, Empfehlungen. Es gilt der Skill `business-writing-pyramid`:
 

@@ -26,9 +26,10 @@
 //!    Allowlist-Zeile ohne Kante ist ebenfalls veraltet (Ratsche).
 //! 5. **`*-sys`-Verbot.** Schichten mit `forbid_sys_crates = true` und —
 //!    bei `[sys_crates].forbid_for_tcb` — jedes TCB-Paket dürfen in ihrer
-//!    transitiven Hülle keine Crate erreichen, deren Name auf `-sys` endet,
-//!    außer den unter `[[sys_crates.allow]]` begründeten (§40: native
-//!    Abhängigkeiten dürfen nicht über Feature-Vereinigung einwandern).
+//!    transitiven Hülle (einschließlich `[build-dependencies]`) keine Crate
+//!    erreichen, deren Name auf `-sys` endet, außer den unter
+//!    `[[sys_crates.allow]]` begründeten (§40: native Abhängigkeiten dürfen
+//!    nicht über Feature-Vereinigung einwandern).
 //!    Auch hier gilt die Ratsche für ungenutzte Allowlist-Einträge.
 //!    Dieselbe Prüfung erfasst auch [`C_BUILD_HELPERS`]: C/Asm-Bauhelfer ohne
 //!    `-sys`-Namen (`ring`, `cmake`, `bindgen`, `cc`; Tier C der
@@ -38,20 +39,31 @@
 //!    *jeder* Pfad zu `cc` über `blake3` läuft, kein Blanket-Allow.
 //!
 //! # Wie die `*-sys`-Hülle entsteht
-//! Innerhalb des Workspace folgt sie den normalen internen und externen
-//! `[dependencies]` aus dem [`WorkspaceGraph`]. Ab einer externen Crate
-//! folgt sie den `dependencies`-Listen in `Cargo.lock`. `Cargo.lock` kennt
-//! weder Plattform- noch Feature-Filter und führt auch Build-Abhängigkeiten
-//! externer Crates; die Hülle ist deshalb eine **Überschätzung** — sie
-//! übersieht nichts, meldet aber etwa `windows-sys`, das auf Linux nie
-//! gebaut wird. Solche Fälle stehen begründet in der Allowlist. Eine externe
-//! Crate ohne `Cargo.lock`-Eintrag ist ein Verstoß: die Hülle wäre sonst
-//! still unvollständig.
+//! Innerhalb des Workspace folgt sie den internen und externen
+//! `[dependencies]` **und** den `[build-dependencies]` aus dem
+//! [`WorkspaceGraph`]: ein Build-Skript übersetzt C-Code (`cc`, `bindgen`,
+//! `*-sys`) in genau die Crate, die es baut — dort kommt ein C-Bauhelfer
+//! typischerweise herein. `[dev-dependencies]` zählen nicht, sie landen in
+//! keinem ausgelieferten Artefakt. Ab einer externen Crate folgt sie den
+//! `dependencies`-Listen in `Cargo.lock`. `Cargo.lock` kennt weder
+//! Plattform- noch Feature-Filter und führt auch Build-Abhängigkeiten
+//! externer Crates; die Hülle ist deshalb eine **Überschätzung** dessen, was
+//! der Graph sieht — sie meldet etwa `windows-sys`, das auf Linux nie gebaut
+//! wird. Solche Fälle stehen begründet in der Allowlist. Blind ist sie für
+//! Target-Tabellen (siehe den nächsten Abschnitt). Eine externe Crate ohne
+//! `Cargo.lock`-Eintrag ist ein Verstoß: die Hülle wäre sonst still
+//! unvollständig.
 //!
 //! # Was dieses Gate nicht prüft
-//! `[target.'cfg(..)'.dependencies]` sieht der [`WorkspaceGraph`] nicht —
-//! dieselbe Grenze wie bei `edges` und `privileges`. Und es prüft Kanten,
-//! keine Aufrufe.
+//! `[target.'cfg(..)'.dependencies]` samt den `build-`/`dev-`Varianten sieht
+//! der [`WorkspaceGraph`] nicht — dieselbe Grenze wie bei `edges` und
+//! `privileges`. Dort deklarierte Kanten fehlen der Schichtregel, den
+//! TCB-Allowlisten **und** der `*-sys`-Hülle: bei einer J-Crate, die ihre
+//! plattformspezifischen Abhängigkeiten nur dort deklariert (etwa
+//! `harw-job-linux` mit `rustix`/`landlock`), prüft die `*-sys`-Regel genau
+//! diese Kanten nicht; ihren `[dependencies]` folgt die Hülle weiterhin.
+//! Schließen lässt sich das erst mit Target-Kanten im Graphen
+//! (`harw-code-graph`). Und es prüft Kanten, keine Aufrufe.
 //!
 //! # Formfehler der Richtlinie
 //! Eine unlesbare oder in sich widersprüchliche Richtlinie (unbekannte
@@ -499,8 +511,8 @@ impl Policy {
 ///
 /// # Description
 /// Kommt ein Name in mehreren Fassungen vor, werden die Kanten aller
-/// Fassungen vereinigt — eine Überschätzung, die nichts übersieht (siehe
-/// Moduldoku).
+/// Fassungen vereinigt — eine Überschätzung, die keine Fassung übersieht
+/// (siehe Moduldoku).
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct LockIndex {
     deps: HashMap<String, BTreeSet<String>>,
@@ -770,8 +782,9 @@ struct SysHull {
 /// Bildet die transitive Hülle von `root` per Breitensuche.
 ///
 /// # Description
-/// Interne Knoten folgen ihren normalen `[dependencies]` (intern und
-/// extern) aus dem Graphen, externe Knoten den Kanten in `Cargo.lock`.
+/// Interne Knoten folgen ihren `[dependencies]` (intern und extern) und
+/// ihren `[build-dependencies]` aus dem Graphen, externe Knoten den Kanten
+/// in `Cargo.lock`.
 /// Die Breitensuche liefert zu jedem Fund den kürzesten Pfad, damit die
 /// Meldung zeigt, **über wen** die Crate hereinkommt.
 fn sys_hull(root: &CrateNode, by_name: &HashMap<&str, &CrateNode>, lock: &LockIndex) -> SysHull {
@@ -811,9 +824,13 @@ fn sys_hull_impl(
             continue;
         }
         let children: Vec<String> = if let Some(node) = by_name.get(current.as_str()) {
+            // `build_deps` mischt interne und externe Namen; die Unterscheidung
+            // trifft `by_name` beim nächsten Schritt, Unbekanntes landet in
+            // `unresolved`.
             node.deps
                 .iter()
                 .chain(node.external_deps.iter())
+                .chain(node.build_deps.iter())
                 .cloned()
                 .collect()
         } else if let Some(deps) = lock.deps.get(&current) {
@@ -938,6 +955,20 @@ version = "0.2.0"
             node("a", &["j", "i", "f"], &[]),
             node("t", &["f"], &[]),
         ]
+    }
+
+    /// Der Grundgraph, in dem der gleichnamige Knoten durch `replacement` ersetzt ist.
+    fn base_crates_with(replacement: CrateNode) -> Vec<CrateNode> {
+        base_crates()
+            .into_iter()
+            .map(|n| {
+                if n.name == replacement.name {
+                    replacement.clone()
+                } else {
+                    n
+                }
+            })
+            .collect()
     }
 
     fn run_with(crates: Vec<CrateNode>, policy: &str, lock: &str) -> TestResult<GateReport> {
@@ -1236,6 +1267,102 @@ version = "0.2.0"
             "die Meldung muss den Bypass-Pfad ohne blake3 nennen: {:?}",
             report.violations
         );
+        Ok(())
+    }
+
+    #[test]
+    fn test_evaluate_c_build_helper_as_build_dependency_is_a_violation() -> TestResult {
+        // `j` zieht `cc` direkt als `[build-dependencies]` herein, nicht über
+        // `blake3` — die Hülle muss der Build-Kante folgen, und die
+        // `cc`-Ausnahme greift nicht.
+        let mut j = node("j", &["f", "i"], &["tokio"]);
+        j.build_deps = vec!["cc".to_owned()];
+        let lock = format!("{LOCK}\n[[package]]\nname = \"cc\"\nversion = \"1.0.0\"\n");
+
+        let report = run_with(base_crates_with(j), POLICY, &lock)?;
+
+        assert!(!report.is_green());
+        assert!(
+            report
+                .violations
+                .iter()
+                .any(|v| v.contains("'cc'") && v.contains("j → cc")),
+            "die Meldung muss den Bypass-Pfad über die Build-Kante nennen: {:?}",
+            report.violations
+        );
+        assert!(
+            !report
+                .violations
+                .iter()
+                .any(|v| v.contains("keinen Eintrag in Cargo.lock")),
+            "{:?}",
+            report.violations
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn test_evaluate_sys_crate_as_build_dependency_of_hull_member_is_a_violation() -> TestResult {
+        // `i` (Schicht I) darf selbst `*-sys` erreichen, liegt aber in der
+        // Hülle von `j`: auch die Build-Kanten transitiv erreichter interner
+        // Knoten gehören zur Hülle.
+        let mut i = node("i", &["f"], &[]);
+        i.build_deps = vec!["openssl-sys".to_owned()];
+        let lock = format!("{LOCK}\n[[package]]\nname = \"openssl-sys\"\nversion = \"0.9.0\"\n");
+
+        let report = run_with(base_crates_with(i), POLICY, &lock)?;
+
+        assert!(
+            report
+                .violations
+                .iter()
+                .any(|v| v.contains("'openssl-sys'") && v.contains("j → i → openssl-sys")),
+            "die Meldung muss den Pfad über die Build-Kante von i nennen: {:?}",
+            report.violations
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn test_evaluate_build_dependency_without_lock_entry_fails_closed() -> TestResult {
+        // Das TCB-Paket `t` nennt `bindgen` als `[build-dependencies]`, das
+        // weder Workspace-Knoten noch in `Cargo.lock` ist: die Hülle wäre
+        // unvollständig, und der C-Bauhelfer selbst ist verboten.
+        let mut t = node("t", &["f"], &[]);
+        t.build_deps = vec!["bindgen".to_owned()];
+
+        let report = run_with(base_crates_with(t), POLICY, LOCK)?;
+
+        assert!(
+            report
+                .violations
+                .iter()
+                .any(|v| v.contains("t: 'bindgen' hat keinen Eintrag in Cargo.lock")),
+            "{:?}",
+            report.violations
+        );
+        assert!(
+            report
+                .violations
+                .iter()
+                .any(|v| v.contains("t erreicht") && v.contains("'bindgen'") && v.contains("TCB")),
+            "{:?}",
+            report.violations
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn test_evaluate_dev_dependency_is_not_in_sys_hull() -> TestResult {
+        // `j` nennt `openssl-sys` nur als `[dev-dependencies]`: das landet in
+        // keinem ausgelieferten Artefakt und gehört nicht zur Hülle.
+        let mut j = node("j", &["f", "i"], &["tokio"]);
+        j.dev_deps = vec!["openssl-sys".to_owned()];
+        let lock = format!("{LOCK}\n[[package]]\nname = \"openssl-sys\"\nversion = \"0.9.0\"\n");
+
+        let report = run_with(base_crates_with(j), POLICY, &lock)?;
+
+        assert!(report.is_green(), "{:?}", report.violations);
         Ok(())
     }
 

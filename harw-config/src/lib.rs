@@ -87,7 +87,7 @@ pub use loader::{
     load_system_prompt, load_uia_personalization, load_uia_user_name,
 };
 pub use mcp_toml::{McpServerToml, McpTransportToml};
-pub use merge::{LayerRole, ScopeDiagnostic, merge_layer_into};
+pub use merge::{LayerRole, ScopeDiagnostic, merge_layer_toml_into};
 pub use mode_toml::ModeSection;
 pub use model_toml::{ModelCapabilitiesToml, ModelToml, PromptCachingMode};
 pub use network_toml::{NetworkSection, ResearchWebMode};

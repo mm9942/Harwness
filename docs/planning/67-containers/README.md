@@ -32,7 +32,7 @@ related:
 
 # Design note: optional container system (Docker/Podman/Kubernetes as managed instances)
 
-**Short answer.** The idea fits, with one change. Containers become new `Executor` implementations plus new placement offers, and the coordinator stays as it is. The "one DoD crate" part has to be split, because ring D may depend only on F/I/D (`xtask/arch-policy.toml:50`). So D can reach neither the executors (J) nor an API client (A). `harw-dod-container` can only be a host observer that reads cgroupfs and procfs.
+**Short answer.** The idea fits, with one change. Containers become new `Executor` implementations plus new placement offers, and the coordinator stays as it is. The "one DoD crate" part has to be split, because ring D may depend only on F/I/D (`xtask/arch-policy.toml:52`). So D can reach neither the executors (J) nor an API client (A). `harw-dod-container` can only be a host observer that reads cgroupfs and procfs.
 
 The mapping/research input has four errors that this note corrects:
 - The warden budget is **54**, not 12 (`xtask/src/gate_warden.rs:304`). "Twelve" was the count of direct dependencies (`:202-214`).
@@ -55,9 +55,9 @@ The mapping/research input has four errors that this note corrects:
 
 | Crate | Ring | Why |
 |---|---|---|
-| `harw-container-model` | I | Serde-only vocabulary: `InstanceRef`, `OwnerLabels`, `ImageDigest`, `EngineKind`. It is shared by J, A and D, because D cannot import J (`arch-policy.toml:46,50`). |
-| `harw-job-executor-oci` | J | Implements `Executor` (`harw-job-runtime/src/coordinator/executor.rs:177`) for Podman and Docker. Its client is hyper over a Unix domain socket. hyper's lockfile dependencies contain no `-sys` crate (`Cargo.lock:4415-4432`), so `J.forbid_sys_crates` (`arch-policy.toml:49`) stays green. No TLS stack. Third-party types stay internal. A CLI fallback may only use a fixed trusted binary path, the same way bwrap works (`harw-job-executor-bwrap/src/executor.rs:83,95`). |
-| `harw-job-executor-k8s` | **A** | It needs TLS to the API server. The lockfile entry for `rustls` lists `aws-lc-rs` (`Cargo.lock:6212-6222`), and the gate's dependency hull ignores features (`arch-policy.toml:60-61`). So `aws-lc-sys` would land in J's hull, and it is not on the allow list (`:63-76`). A may depend on anything (`:51`); `harw-provider-http` is the precedent (`:334-335`). |
+| `harw-container-model` | I | Serde-only vocabulary: `InstanceRef`, `OwnerLabels`, `ImageDigest`, `EngineKind`. It is shared by J, A and D, because D cannot import J (`arch-policy.toml:48,52`). |
+| `harw-job-executor-oci` | J | Implements `Executor` (`harw-job-runtime/src/coordinator/executor.rs:177`) for Podman and Docker. Its client is hyper over a Unix domain socket. hyper's lockfile dependencies contain no `-sys` crate (`Cargo.lock:4415-4432`), so `J.forbid_sys_crates` (`arch-policy.toml:51`) stays green. No TLS stack. Third-party types stay internal. A CLI fallback may only use a fixed trusted binary path, the same way bwrap works (`harw-job-executor-bwrap/src/executor.rs:83,95`). |
+| `harw-job-executor-k8s` | **A** | It needs TLS to the API server. The lockfile entry for `rustls` lists `aws-lc-rs` (`Cargo.lock:6212-6222`), and the gate's dependency hull ignores features (`arch-policy.toml:62-63`). So `aws-lc-sys` would land in J's hull, and it is not on the allow list (`:70-83`). A may depend on anything (`:53`); `harw-provider-http` is the precedent (`:341-342`). |
 | `harw-dod-container` | D | Sensor only. It reads cgroupfs and procfs through `harw-dod-readfs`. It must not use hyper or tower, because the gate forbids them for sensors (`xtask/src/gate_edges.rs:184-224`). |
 
 **Wiring.** The container executors are separate `Executor` implementations. They are **not** a variant of `LinuxSandboxBackend`. `LinuxExecutor` spawns the process under a pidfd inside a cgroup that it manages itself (`harw-job-runtime/src/coordinator/linux.rs:111-131,162-168`). A container process is a child of the engine, so that model does not fit. `Coordinator<S, E>` is generic over the executor (`runner.rs:352`), and so is the facade builder (`harw-job/src/lib.rs:150`).

@@ -46,11 +46,15 @@
 //!
 //! # Eingabeprüfung
 //! `nft` parst seine Argumente als Skript. Die cgroup-Kennung wird deshalb
-//! strenger geprüft als in `CgroupV2Executor`: nur ASCII-Alphanumerik und
-//! `._-@:+`, kein `.`/`..` als ganzes Segment, höchstens
-//! [`MAX_CGROUP_ID_LEN`] Bytes (Kettennamen sind in nftables auf 255 Byte
-//! begrenzt). Alles andere ist [`WardenError::InvalidCgroupId`], bevor ein
-//! Prozess gestartet wird.
+//! strenger geprüft als in `CgroupV2Executor`. Sie darf aus mehreren durch
+//! `/` getrennten Segmenten bestehen (`harw.slice/job-1`); jedes Segment
+//! wird einzeln geprüft: nicht leer, nicht `.` oder `..`, nur
+//! ASCII-Alphanumerik und `._-@:+`. Ein führendes, doppeltes oder
+//! abschließendes `/` scheitert damit am leeren Segment. Die ganze Kennung
+//! samt `/` hat höchstens [`MAX_CGROUP_ID_LEN`] Bytes (Kettennamen sind in
+//! nftables auf 255 Byte begrenzt). `level` ist die Zahl der Elternsegmente
+//! plus die Zahl der Kennungssegmente. Alles andere ist
+//! [`WardenError::InvalidCgroupId`], bevor ein Prozess gestartet wird.
 //!
 //! # Fehlerbilder
 //! - `nft` fehlt → [`WardenError::Io`] mit `ErrorKind::NotFound` und dem
@@ -93,8 +97,9 @@ pub const DEFAULT_NFT_BINARY: &str = "/usr/sbin/nft";
 /// relativ dazu.
 pub const CGROUP2_MOUNT: &str = "/sys/fs/cgroup";
 
-/// Längste zulässige cgroup-Kennung in Byte: `2 + 2 * 126 = 254` Zeichen
-/// Kettenname passen unter die nftables-Grenze von 255.
+/// Längste zulässige cgroup-Kennung in Byte, gemessen über die ganze
+/// Kennung samt `/`-Trennern: `2 + 2 * 126 = 254` Zeichen Kettenname passen
+/// unter die nftables-Grenze von 255.
 pub const MAX_CGROUP_ID_LEN: usize = 126;
 
 /// Obergrenze für die geloggte `nft`-Fehlerausgabe in Zeichen.
@@ -115,28 +120,34 @@ impl NftCgroupTarget {
     ///
     /// # Arguments
     /// - `parent` (`&[String]`): bereits geprüfte Segmente zwischen
-    ///   Einhängepunkt und cgroup (leer: cgroup liegt direkt darunter).
-    /// - `cgroup` (`&CgroupId`): die zu isolierende cgroup.
+    ///   Einhängepunkt und cgroup (leer: die Kennung ist relativ zum
+    ///   Einhängepunkt).
+    /// - `cgroup` (`&CgroupId`): die zu isolierende cgroup; auch ein
+    ///   mehrstufiger relativer Pfad wie `harw.slice/job-1`.
     ///
     /// # Returns
     /// Das Ziel.
     ///
     /// # Errors
-    /// [`WardenError::InvalidCgroupId`], wenn die Kennung oder ein
-    /// Elternsegment unzulässige Zeichen enthält oder zu lang ist.
+    /// [`WardenError::InvalidCgroupId`], wenn ein Segment der Kennung oder
+    /// ein Elternsegment unzulässig ist (leer, `.`/`..`, unzulässige
+    /// Zeichen) oder die ganze Kennung länger als [`MAX_CGROUP_ID_LEN`]
+    /// Bytes ist.
     pub fn resolve(parent: &[String], cgroup: &CgroupId) -> WardenResult<Self> {
         let id = cgroup.as_str();
-        if !is_safe_segment(id) || id.len() > MAX_CGROUP_ID_LEN {
+        if id.len() > MAX_CGROUP_ID_LEN || !id.split('/').all(is_safe_segment) {
             return Err(WardenError::InvalidCgroupId);
         }
         if !parent.iter().all(|segment| is_safe_segment(segment)) {
             return Err(WardenError::InvalidCgroupId);
         }
         let mut segments: Vec<&str> = parent.iter().map(String::as_str).collect();
-        segments.push(id);
+        segments.extend(id.split('/'));
         Ok(Self {
             path: segments.join("/"),
             level: segments.len(),
+            // Hex über die ganze Kennung samt `/`: bleibt injektiv, und die
+            // Kettennamen einstufiger Kennungen ändern sich nicht.
             chain_stem: hex_encode(id.as_bytes()),
         })
     }
@@ -374,8 +385,8 @@ impl Default for NftNetworkIsolator {
 }
 
 impl NftNetworkIsolator {
-    /// Baut einen Isolator für cgroups direkt unter [`CGROUP2_MOUNT`] mit
-    /// [`DEFAULT_NFT_BINARY`].
+    /// Baut einen Isolator für cgroup-Pfade relativ zu [`CGROUP2_MOUNT`]
+    /// mit [`DEFAULT_NFT_BINARY`].
     ///
     /// # Returns
     /// Den Isolator.
@@ -654,6 +665,42 @@ mod tests {
     }
 
     #[test]
+    fn test_isolate_args_for_multi_segment_id_use_full_path_and_level() -> TestResult {
+        let target = NftCgroupTarget::resolve(&[], &cgroup("harw.slice/job-1")?)
+            .map_err(ctx("valid multi-segment id"))?;
+        assert_eq!(target.path(), "harw.slice/job-1");
+        assert_eq!(target.level(), 2);
+        let args = isolate_command_args(&target);
+        let rule_tail = words("socket cgroupv2 level 2 \"harw.slice/job-1\" counter drop");
+        assert!(
+            args.windows(rule_tail.len())
+                .any(|w| w == rule_tail.as_slice())
+        );
+        // Kettenstamm = Hex der ganzen Kennung samt `/`.
+        let output_chain = "o_686172772e736c6963652f6a6f622d31";
+        assert!(args.iter().any(|arg| arg == output_chain));
+        // Freigeben trifft dieselbe Kette wie das Isolieren.
+        let delete = words("delete chain inet harw_warden o_686172772e736c6963652f6a6f622d31");
+        assert!(
+            release_command_args(&target)
+                .windows(delete.len())
+                .any(|w| w == delete.as_slice())
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn test_multi_segment_id_below_parent_adds_levels() -> TestResult {
+        let isolator = NftNetworkIsolator::from_cgroup_root(Path::new("/sys/fs/cgroup/harw.slice"));
+        let target = isolator
+            .target(&cgroup("job-1.slice/step-2")?)
+            .map_err(ctx("valid multi-segment id"))?;
+        assert_eq!(target.path(), "harw.slice/job-1.slice/step-2");
+        assert_eq!(target.level(), 3);
+        Ok(())
+    }
+
+    #[test]
     fn test_release_args_flush_and_delete_both_chains() -> TestResult {
         let target = NftCgroupTarget::resolve(&[], &cgroup("a")?).map_err(ctx("valid id"))?;
         let expected = words(concat!(
@@ -683,8 +730,15 @@ mod tests {
         // gestartet, käme `Io`, nicht `InvalidCgroupId`.
         let isolator = NftNetworkIsolator::new().with_nft_binary("/nonexistent/harw-test-nft");
         let too_long = "a".repeat(super::MAX_CGROUP_ID_LEN + 1);
+        // Die Grenze gilt für die ganze Kennung samt `/` (127 Byte).
+        let too_long_multi = format!("{}/b", "a".repeat(super::MAX_CGROUP_ID_LEN - 1));
         for id in [
-            "a/b",
+            "/abs",
+            "a//b",
+            "a/",
+            "harw.slice/../x",
+            "harw.slice/./x",
+            "harw.slice/a b",
             "..",
             ".",
             "a\"b",
@@ -692,6 +746,7 @@ mod tests {
             "a;b",
             "a\\b",
             too_long.as_str(),
+            too_long_multi.as_str(),
         ] {
             let result = isolator.isolate(&cgroup(id)?);
             assert!(

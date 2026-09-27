@@ -28,9 +28,20 @@
 //! selbst schon eine Textdatei ist.
 //!
 //! **Zusätzliche, selbst auferlegte Prüfung:** Bevor eine `CgroupId` in
-//! einen Pfad eingebettet wird, weist [`validate_path_segment`] Werte mit
-//! `/`, `..` oder einem eingebetteten NUL-Byte zurück
-//! ([`crate::error::WardenError::InvalidCgroupId`]). `harw-types` garantiert
+//! einen Pfad eingebettet wird, prüft [`validate_path_segment`] jedes durch
+//! `/` getrennte Segment
+//! ([`crate::error::WardenError::InvalidCgroupId`] bei Verstoß). Ein Segment
+//! darf nicht leer sein — damit fallen führender, abschließender und
+//! doppelter `/` heraus; ein führender `/` ließe `Path::join` die Wurzel
+//! ersetzen. Es darf weder `.` noch `..` sein und kein Steuerzeichen
+//! (einschließlich NUL) enthalten. Mehrstufige Pfade wie
+//! `harw.slice/job-1` sind erlaubt, weil Job-cgroups unterhalb eines Slice
+//! liegen (siehe `harw_dod_warden_proto::ProofPolicy::allows_cgroup`,
+//! dieselbe Segment-Grammatik). Eine Präfix-Politik erzwingt dieser Typ
+//! nicht. Symlinks kann cgroupfs nicht enthalten, und in Produktion
+//! beschränkt Landlock (`harw-warden`, `landlock.rs`) Schreibzugriffe auf
+//! die cgroup-Wurzel; `openat2` wird bewusst nicht benutzt, weil es
+//! `unsafe` oder eine neue Abhängigkeit bräuchte. `harw-types` garantiert
 //! für `CgroupId` nur „nicht leer" — keine Pfadsicherheit (siehe
 //! `harw-types/src/ids.rs`, `CgroupId`-Moduldoku zu Kernel-ID-Wiederverwendung,
 //! die aber die *Zeichen* der ID nicht einschränkt). Der Warden glaubt der
@@ -153,18 +164,28 @@ pub trait ProcessTreeKiller {
     fn kill(&self, cgroup: &CgroupId) -> WardenResult<()>;
 }
 
-/// Weist eine cgroup-Kennung als sicheres Dateisystem-Pfadsegment aus.
+/// Weist eine cgroup-Kennung als sicheren relativen Pfad unterhalb der
+/// cgroup-Wurzel aus.
 ///
 /// # Description
-/// Siehe Moduldoku, Abschnitt „Was `CgroupV2Executor` wirklich tut". Lehnt
-/// jede Kennung ab, die einen Verzeichniswechsel ermöglichen würde.
+/// Siehe Moduldoku, Abschnitt „Was `CgroupV2Executor` wirklich tut". Prüft
+/// jedes durch `/` getrennte Segment einzeln und lehnt jede Kennung ab, die
+/// die Wurzel ersetzen oder aus ihr herausführen würde. Mehrstufige Pfade
+/// wie `harw.slice/job-1` sind zulässig; `a..b` ist ein gewöhnlicher Name.
 ///
 /// # Errors
-/// - [`WardenError::InvalidCgroupId`]: die Kennung enthält `/`, `..` oder
-///   ein NUL-Byte.
+/// - [`WardenError::InvalidCgroupId`]: ein Segment ist leer (führender,
+///   abschließender oder doppelter `/`), ein Segment ist `.` oder `..`,
+///   oder ein Segment enthält ein Steuerzeichen (einschließlich NUL).
 fn validate_path_segment(cgroup: &CgroupId) -> WardenResult<&str> {
     let value = cgroup.as_str();
-    if value.contains('/') || value.contains("..") || value.contains('\0') {
+    let valid = value.split('/').all(|segment| {
+        !segment.is_empty()
+            && segment != "."
+            && segment != ".."
+            && !segment.chars().any(char::is_control)
+    });
+    if !valid {
         return Err(WardenError::InvalidCgroupId);
     }
     Ok(value)
@@ -173,7 +194,9 @@ fn validate_path_segment(cgroup: &CgroupId) -> WardenResult<&str> {
 /// Echte cgroup-v2-Ausführung über Dateisystemschreibzugriffe.
 ///
 /// # Description
-/// Siehe Moduldoku, Abschnitt „Was `CgroupV2Executor` wirklich tut". Kein
+/// Siehe Moduldoku, Abschnitt „Was `CgroupV2Executor` wirklich tut".
+/// Adressiert cgroups in beliebiger Tiefe unterhalb von `root`, z. B.
+/// `harw.slice/job-1` → `<root>/harw.slice/job-1/cgroup.freeze`. Kein
 /// Test dieser Crate lässt diesen Typ auf ein echtes `/sys/fs/cgroup`
 /// zugreifen — Tests übergeben ein `tempfile`-Verzeichnis als `root`.
 pub struct CgroupV2Executor {
@@ -195,8 +218,8 @@ impl CgroupV2Executor {
     }
 
     fn control_file(&self, cgroup: &CgroupId, file_name: &str) -> WardenResult<std::path::PathBuf> {
-        let segment = validate_path_segment(cgroup)?;
-        Ok(self.root.join(segment).join(file_name))
+        let relative = validate_path_segment(cgroup)?;
+        Ok(self.root.join(relative).join(file_name))
     }
 
     fn write_control_file(
@@ -354,12 +377,38 @@ mod tests {
     }
 
     #[test]
-    fn test_validate_path_segment_rejects_slash() -> TestResult {
-        let cg = cgroup("a/b")?;
-        let Err(err) = validate_path_segment(&cg) else {
-            return Err(TestError::Unexpected("Err erwartet".into()));
-        };
-        assert!(matches!(err, WardenError::InvalidCgroupId));
+    fn test_validate_path_segment_accepts_nested_path() -> TestResult {
+        let nested = cgroup("harw.slice/job-1")?;
+        assert_eq!(
+            validate_path_segment(&nested).map_err(ctx("validate nested path"))?,
+            "harw.slice/job-1"
+        );
+        // `..` nur als ganzes Segment verboten, nicht als Teil eines Namens.
+        let dotted = cgroup("a..b")?;
+        assert_eq!(
+            validate_path_segment(&dotted).map_err(ctx("validate dotted name"))?,
+            "a..b"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn test_validate_path_segment_rejects_malformed_paths() -> TestResult {
+        for id in [
+            "harw.slice/../x",
+            "harw.slice/./x",
+            "/abs",
+            "a//b",
+            "a/",
+            ".",
+            "..",
+            "a/b\nc",
+        ] {
+            let cg = cgroup(id)?;
+            if !matches!(validate_path_segment(&cg), Err(WardenError::InvalidCgroupId)) {
+                return Err(TestError::Unexpected(format!("{id:?} must be rejected")));
+            }
+        }
         Ok(())
     }
 
@@ -440,6 +489,59 @@ mod tests {
             return Err(TestError::Unexpected("Err erwartet".into()));
         };
         assert!(matches!(err, WardenError::InvalidCgroupId));
+        Ok(())
+    }
+
+    #[test]
+    fn test_cgroup_v2_executor_freeze_writes_nested_control_file() -> TestResult {
+        let dir = tempfile::tempdir().map_err(ctx("tempdir"))?;
+        let slice = dir.path().join("harw.slice");
+        let job = slice.join("job-1");
+        std::fs::create_dir_all(&job).map_err(ctx("create nested cgroup dir"))?;
+        let executor = CgroupV2Executor::new(dir.path());
+
+        let cg = cgroup("harw.slice/job-1")?;
+        executor.freeze(&cg).map_err(ctx("freeze succeeds"))?;
+
+        let written = std::fs::read_to_string(job.join("cgroup.freeze"))
+            .map_err(ctx("nested control file written"))?;
+        assert_eq!(written, "1");
+        // Der Eltern-Slice bleibt unberührt.
+        assert!(!slice.join("cgroup.freeze").exists());
+        Ok(())
+    }
+
+    #[test]
+    fn test_cgroup_v2_executor_kill_writes_nested_control_file() -> TestResult {
+        let dir = tempfile::tempdir().map_err(ctx("tempdir"))?;
+        let job = dir.path().join("harw.slice").join("job-1");
+        std::fs::create_dir_all(&job).map_err(ctx("create nested cgroup dir"))?;
+        let executor = CgroupV2Executor::new(dir.path());
+
+        let cg = cgroup("harw.slice/job-1")?;
+        executor.kill(&cg).map_err(ctx("kill succeeds"))?;
+
+        let written = std::fs::read_to_string(job.join("cgroup.kill"))
+            .map_err(ctx("nested control file written"))?;
+        assert_eq!(written, "1");
+        Ok(())
+    }
+
+    #[test]
+    fn test_cgroup_v2_executor_rejects_absolute_and_nested_traversal() -> TestResult {
+        let dir = tempfile::tempdir().map_err(ctx("tempdir"))?;
+        std::fs::create_dir(dir.path().join("harw.slice")).map_err(ctx("create slice dir"))?;
+        let executor = CgroupV2Executor::new(dir.path());
+
+        for id in ["/abs", "harw.slice/../escape"] {
+            let cg = cgroup(id)?;
+            if !matches!(executor.freeze(&cg), Err(WardenError::InvalidCgroupId)) {
+                return Err(TestError::Unexpected(format!("{id:?} must be rejected")));
+            }
+        }
+        // Abgelehnt, bevor irgendetwas geschrieben wurde.
+        assert!(!dir.path().join("escape").exists());
+        assert!(!dir.path().join("cgroup.freeze").exists());
         Ok(())
     }
 
