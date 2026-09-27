@@ -667,7 +667,7 @@ mod tests {
     fn test_plan_without_tenant_omits_the_field_in_json() -> TestResult {
         let json = serde_json::to_string(&make_plan())?;
         assert!(
-            !json.contains("tenant"),
+            !json.contains("\"tenant\""),
             "kein tenant-Feld erwartet: {json}"
         );
         Ok(())

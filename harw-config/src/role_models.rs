@@ -65,11 +65,13 @@ pub enum ModelRole {
     DreamReflection,
     /// Runde 5, Teil E: Klassifizierer des Auto-Modus.
     AutoClassifier,
+    /// R14: interner Bewerter des work drivers (DEC-002).
+    WorkDriverJudge,
 }
 
 impl ModelRole {
     /// Alle Rollen in stabiler Anzeige-Reihenfolge.
-    pub const ALL: [ModelRole; 13] = [
+    pub const ALL: [ModelRole; 14] = [
         ModelRole::Uia,
         ModelRole::UiaWorker,
         ModelRole::Orchestrator,
@@ -83,6 +85,7 @@ impl ModelRole {
         ModelRole::MemoryConsolidation,
         ModelRole::DreamReflection,
         ModelRole::AutoClassifier,
+        ModelRole::WorkDriverJudge,
     ];
 
     /// Kurzer, stabiler Schlüssel für Befehle (`/models set <rolle> …`).
@@ -102,6 +105,7 @@ impl ModelRole {
             Self::MemoryConsolidation => "memory",
             Self::DreamReflection => "dream",
             Self::AutoClassifier => "auto-classifier",
+            Self::WorkDriverJudge => "work-driver-judge",
         }
     }
 
@@ -122,6 +126,7 @@ impl ModelRole {
             Self::MemoryConsolidation => "Gedächtnis-Konsolidierung",
             Self::DreamReflection => "Traum-Reflexion",
             Self::AutoClassifier => "Auto-Modus-Klassifizierer",
+            Self::WorkDriverJudge => "work-driver-Bewerter",
         }
     }
 
@@ -160,6 +165,7 @@ impl ModelRole {
             Self::MemoryConsolidation => Some(InternalModelPoint::MemoryConsolidation),
             Self::DreamReflection => Some(InternalModelPoint::DreamReflection),
             Self::AutoClassifier => Some(InternalModelPoint::AutoClassifier),
+            Self::WorkDriverJudge => Some(InternalModelPoint::WorkDriverJudge),
         }
     }
 
@@ -327,8 +333,13 @@ fn resolve_provider_model(config: &ResolvedConfig, role: ModelRole) -> ProviderM
         // Runde 5, Teil E: ohne explizite Wahl das schnelle Modell des
         // aktiven Providers (claude-haiku-4-5 bzw. das kleinste), sonst das
         // Hauptmodell.
-        ModelRole::AutoClassifier => {
-            let resolved = resolve_internal_model(config, InternalModelPoint::AutoClassifier);
+        // R14: der work-driver-Bewerter folgt derselben Regel (DEC-002):
+        // explizite Wahl, sonst das schnelle Modell des aktiven Providers.
+        ModelRole::AutoClassifier | ModelRole::WorkDriverJudge => {
+            let point = role
+                .internal_point()
+                .unwrap_or(InternalModelPoint::AutoClassifier);
+            let resolved = resolve_internal_model(config, point);
             match resolved.source {
                 InternalModelSource::Explicit => {
                     (resolved.provider, resolved.model, RoleModelSource::Explicit)
@@ -405,7 +416,8 @@ fn resolve_effort(
         | ModelRole::SessionTitle
         | ModelRole::MemoryConsolidation
         | ModelRole::DreamReflection
-        | ModelRole::AutoClassifier => None,
+        | ModelRole::AutoClassifier
+        | ModelRole::WorkDriverJudge => None,
     };
     if let Some(effort) = non_empty(role_weight) {
         return Some(effort);

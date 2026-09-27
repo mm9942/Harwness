@@ -316,8 +316,18 @@ fn test_absent_section_leaves_json_and_snapshot_unchanged() -> TestResult {
     assert!(with.work_driver.is_some());
     assert_ne!(with.canonical_json(), without.canonical_json());
     assert_ne!(with.snapshot, without.snapshot);
+    // Lowering grants the three `work_driver.*` tools only because of the
+    // table, so stripping the table also strips exactly those grants.
     let mut stripped = with.clone();
     stripped.work_driver = None;
+    stripped
+        .tools
+        .admitted
+        .retain(|tool| !tool.starts_with("work_driver."));
+    stripped
+        .permissions
+        .tools
+        .retain(|tool| !tool.starts_with("work_driver."));
     assert_eq!(stripped.canonical_json(), without.canonical_json());
     assert_eq!(stripped.compute_snapshot(), without.compute_snapshot());
 

@@ -230,8 +230,19 @@ impl SealedHub {
     {
         self.hub.stop().await?;
         let uid = current_uid(self.dir.path())?;
-        let provider = SealedProvider::open(&self.store_path, &self.kek)
-            .map_err(ctx("reopen sealed store"))?;
+        // The crypto worker thread owns the provider and releases the store
+        // lock when it exits, shortly after the last handle is dropped by
+        // the stopped server. Wait for that instead of racing it.
+        let mut attempts = 0u32;
+        let provider = loop {
+            match SealedProvider::open(&self.store_path, &self.kek) {
+                Err(harw_auth_hub::sealed::SealedStoreError::Locked(_)) if attempts < 100 => {
+                    attempts += 1;
+                    tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+                }
+                other => break other.map_err(ctx("reopen sealed store"))?,
+            }
+        };
         let socket = self.dir.path().join("run").join("secure.sock");
         let text = config(self.dir.path(), &self.store_path, uid);
         let (stop, task) =

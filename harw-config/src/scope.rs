@@ -382,6 +382,7 @@ pub static FIELD_TABLE: &[FieldScope] = &[
     FieldScope { path: "internal_models.sub_orchestrator", scope: Scope::Profile, merge: MergeRule::ProfileReplaces, ordering: None, intersection_key: None, security_critical: false },
     // Runde 5, Teil E: Modell des Auto-Modus-Klassifizierers.
     FieldScope { path: "internal_models.auto_classifier", scope: Scope::Profile, merge: MergeRule::ProfileReplaces, ordering: None, intersection_key: None, security_critical: false },
+    FieldScope { path: "internal_models.work_driver_judge", scope: Scope::Profile, merge: MergeRule::ProfileReplaces, ordering: None, intersection_key: None, security_critical: false },
     FieldScope { path: "InternalModelChoice.provider/.model", scope: Scope::Profile, merge: MergeRule::CompositeMember, ordering: None, intersection_key: None, security_critical: false },
     // 1.14 [compaction] (2)
     FieldScope { path: "compaction.absolute_ceiling_tokens", scope: Scope::Global, merge: MergeRule::MinBound, ordering: None, intersection_key: None, security_critical: false },
@@ -459,7 +460,8 @@ mod merge_rule_tests {
         // Runde 7, Teil L4: +1 für `permissions.auto_classifier_timeout_secs`.
         // `[tools.doc]`: +1 für `tools.doc.remote_ocr`.
         // #22 Welle 2B: +3 für `agent_compiler.*`.
-        assert_eq!(FIELD_TABLE.len(), 118);
+        // R14: +1 für `internal_models.work_driver_judge`.
+        assert_eq!(FIELD_TABLE.len(), 119);
     }
 
     #[test]
@@ -477,7 +479,8 @@ mod merge_rule_tests {
         // Runde 5: Teil E +1 (`internal_models.auto_classifier`), Teil G +5
         // (`uia_worker_models.*`), Teil I +1 (`tui.child_stream`).
         // #22 Welle 2B: +3 (`agent_compiler.*`).
-        assert_eq!(count(MergeRule::ProfileReplaces), 60);
+        // R14: +1 (`internal_models.work_driver_judge`).
+        assert_eq!(count(MergeRule::ProfileReplaces), 61);
         assert_eq!(count(MergeRule::GlobalOnly), 11);
         // Runde 5, Teil K: +4 (`agents.*`); Teil N: +1 (`shell.max_timeout_secs`).
         // Runde 7: Teil A2 +2 (`guards.orchestrator_read_*`), Teil L4 +1

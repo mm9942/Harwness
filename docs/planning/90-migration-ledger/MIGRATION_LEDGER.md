@@ -206,3 +206,35 @@
 - Validate the warden/probe capabilities and `SystemCallFilter=` on a real host.
 - Tenant filtering in the individual operations; only the plumbing and `tenant_admits` exist.
 - Harden the key rotation workflow for remote nodes.
+
+## MIG-014 — Work driver, KMS hardening, tenants, dependency inversions (R14)
+
+**Landed delta:**
+- **Work driver:** job kind `work_driver` plus the tools `work_driver.enqueue`, `.status` and `.stop` (no TUI).
+  - `WorkDriver::decide`; the internal judge worker (`work_driver_judge`, `{"passed": bool}`).
+  - AIMD parallelism within provider limits; one verification per workspace at a time (`verify.lock`).
+  - Its own job lane (at most 2 concurrent runs); owned-path checks; resume after a restart.
+  - Decisions DEC-001…DEC-008 in `docs/planning/70-decisions/`.
+- **KMS:**
+  - Sealed persistent key store with a stable store epoch, a KEK from a file or a systemd credential.
+  - `KmsGuardProvider`: rotation is compare-and-set, wrapping uses the primary only.
+  - Purpose-bound signing (`HarwUsageAuthorizer`, no signing oracle), a crypto worker thread, HTTP/1 timeouts and a connection limit.
+  - Client `sign`; unwrap of older generations pinned to the recorded version; `AuthHubNodeSigner`.
+  - ML-DSA is enabled in `crypt_guard_service`.
+- **Tenants** on goals, plans, approvals and work-driver jobs. The tenant filtering left open in MIG-013 is done for these operations.
+- **Architecture:**
+  - The compiler → registry-defaults and config → agent-dsl inversions are removed (install slot, raw `agent_sources`).
+  - harw-core, harw-session-store, harw-mcp-server and harw-knowledge now depend on `harw-job-core`.
+  - The arch gate flags C build helpers; `openssl` is banned; the tool-name codec follows the strictest common provider rule.
+- **Job coordinator:** retry, and the cgroup is reopened after a restart (MIG-006 rest).
+- **Docs:** work-driver and KMS guides; dependency review and inventory; the Remote Sessions plan (`65-cloud-sessions`); Copilot instructions and backlog.
+
+**Verification:**
+- `cargo test --workspace`: 14,408 passed, 0 failed, 180 ignored (the last 6 fixes were re-verified per crate).
+- DoD crates `--locked`: 1,636 passed.
+- clippy `-D warnings`, gates, deny and actionlint are green.
+
+**Remaining:**
+- A sandboxed verify runner for the work driver under `harw serve` (C-09).
+- A provider pacing hook for TPM (C-06).
+- Preventive path-level write rights (DEC-009 proposal, C-08).
