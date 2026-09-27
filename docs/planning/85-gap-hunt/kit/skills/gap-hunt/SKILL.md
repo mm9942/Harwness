@@ -51,6 +51,17 @@ The pattern catalog is `docs/planning/85-gap-hunt/patterns.md`. The run logs are
    - Add a ledger entry.
    - Commit, push, PR to `dev`.
 
+## Branches: one workflow, one branch (catalog P11)
+- Cut one git worktree per writing workflow from the integration base, on its
+  own branch (`<prefix>/<wave>`), under a locally ignored `.worktrees/`
+  directory inside the repo, and pass its absolute path as `root`
+  (`gap-fix`, `contract-wave`). Read-only workflows need no worktree.
+- Waves must stay file-disjoint. A wave that touches files an earlier wave
+  changed is cut after that wave was merged into the integration branch.
+- When a wave finishes its review: commit in its worktree, push its branch,
+  merge it into the integration branch (`--no-ff`), remove the worktree.
+- Remove all worktrees before the central build: some gates walk the tree.
+
 ## Commit rhythm (batched at verified checkpoints)
 - **When to commit:** at the **end of each workflow**, and in between whenever
   about **90 verifications** have finished since the last commit, counted
@@ -61,8 +72,8 @@ The pattern catalog is `docs/planning/85-gap-hunt/patterns.md`. The run logs are
 - **Planning and research:** once a note has passed its critic or review,
   commit it straight to `dev` (docs only).
 - **Fix batches:** once the files have passed review (fixer → reviewer →
-  repair if needed), commit them to the working branch and push. Do not
-  commit them to `dev`.
+  repair if needed), commit them on the wave's own branch, push it and merge
+  it into the integration branch. Do not commit them to `dev`.
 - **Central build green:** open a PR to `dev` or fast-forward `dev`.
 - **Rules:** Commit with `--no-verify`, because the pre-commit hook runs
   `git add -u`, and name the files explicitly. Never commit a file while a

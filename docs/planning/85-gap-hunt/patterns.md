@@ -191,3 +191,21 @@ Anteil der Funde, die die Prüfung überstehen:
 - M3 lässt sich günstig per grep bestätigen statt mit drei Modell-Prüfern.
 - `critical`/`high` von Opus-Findern brauchen einen Prüfer für Umfang und
   Risiko (scope), aber keinen Existenzbeweis.
+
+### P11 — Ein Workflow, eine Branch
+Alle Fixer im selben Arbeitsbaum heißt: Niemand darf committen, solange
+irgendein Fixer schreibt, der Baum ist stundenlang schmutzig, und ein Abbruch
+am Session-Limit hinterlässt halbe Edits mitten zwischen fertigen.
+
+**Gegenmittel:**
+- Jede schreibende Welle bekommt einen eigenen git-Worktree auf eigener Branch
+  und committet sofort nach ihrem Review.
+- Eine Integrations-Branch sammelt die Wellen per Merge; nur dort läuft der
+  zentrale Build.
+- Wellen bleiben dateidisjunkt. Wer Dateien einer früheren Welle berührt,
+  startet erst nach deren Merge.
+- Nach einem Abbruch die Welle fortsetzen (resume): Fertige Agenten kommen aus
+  dem Journal, fehlgeschlagene laufen neu.
+
+Dasselbe Prinzip steckt in DEC-045 für harw selbst: ein Klon je Zellhost mit
+Merge-Barriere statt vieler Schreiber auf einem Workspace.
