@@ -156,3 +156,38 @@ an einer Datei.
 - Buch- oder Autorbezüge.
 
 **Werkzeug:** ein `xtask`-Gate, `cargo-machete`/`udeps` und ein MSRV-Check.
+
+### P9 — Trennschärfe der Prüf-Blickwinkel messen
+Stand der Workspace-Jagd mit 8 Bereichen, rund 260 geprüften Funden von
+Opus-Findern:
+- **reproduce** sagt in 98,5 % der Fälle „echt“ (257 zu 4). Bei präzisen
+  Findern trennt dieser Blickwinkel kaum.
+- **intent** verwirft 10 % (230 zu 25). Er ist praktisch der einzige
+  Blickwinkel, der trennt (siehe P4).
+- **scope** wird als Stichentscheid selten gebraucht (13 Mal) und stimmt immer
+  mit „echt“.
+
+**Gegenmittel:** Die Ausbeute pro Blickwinkel laufend messen. Einen
+Blickwinkel, der nie widerspricht, ersetzen oder nur bei hoher Schwere
+einsetzen. Beispiel: intent zuerst, reproduce nur bei `critical`/`high`.
+Zusätzlich einen gegnerischen Blickwinkel „Ausnutzbarkeit“ für M1-Funde.
+
+### P10 — Vertrauen je Kategorie
+Anteil der Funde, die die Prüfung überstehen:
+
+| Kategorie | übersteht |
+|---|---:|
+| M3 Doku-Drift | 98 % |
+| M1 | 91 % |
+| M2 | 91 % |
+| P5 | 90 % |
+| NEW | 91 % |
+| hohe und kritische Funde | 100 % |
+| niedrige Funde | 89 % |
+
+**Gegenmittel:**
+- Prüfaufwand dorthin lenken, wo verworfen wird, also auf niedrige Funde und
+  auf NEW.
+- M3 lässt sich günstig per grep bestätigen statt mit drei Modell-Prüfern.
+- `critical`/`high` von Opus-Findern brauchen einen Prüfer für Umfang und
+  Risiko (scope), aber keinen Existenzbeweis.

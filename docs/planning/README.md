@@ -999,8 +999,17 @@ docs/
     ├── 65-cloud-sessions/
     │   └── README.md
     │
+    ├── 66-placement/
+    │   └── README.md            (requirements → node + provider + runtime)
+    │
+    ├── 67-containers/
+    │   └── README.md            (optional OCI/K8s executors + DoD container sensor)
+    │
     ├── 70-decisions/
     │   └── README.md            (DEC-001 …)
+    │
+    ├── 75-harness-patterns/
+    │   └── *.md                 (Claude Code, Codex, OpenClaw, gateway contract, cost model)
     │
     ├── 80-copilot-backlog/
     │   └── README.md
