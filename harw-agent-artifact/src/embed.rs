@@ -16,10 +16,16 @@
 //! at the footer, or an executable hash mismatch, means
 //! [`ArtifactError::Tampered`] with [`TamperScope::Footer`]. The old
 //! `HARWAEND` footer is rejected: rebuild to cover the runner bytes too.
+//!
+//! [`write_executable`] writes to a destination the caller chose, and
+//! [`TempExecutable`] writes a throwaway binary into a fresh private
+//! directory and removes it on drop.
 
 use std::fs::{File, OpenOptions};
-use std::io::{Read, Seek, SeekFrom, Write};
-use std::path::Path;
+use std::io::{ErrorKind, Read, Seek, SeekFrom, Write};
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::artifact::{Artifact, HASH_LEN, MAX_ARTIFACT_LEN};
 use crate::error::{ArtifactError, Limit, TamperScope};
@@ -59,8 +65,13 @@ pub fn append_to_executable(runner_bytes: &[u8], artifact: &Artifact) -> Vec<u8>
 /// Writes a built binary to `path` and makes it executable (mode `0o755` on
 /// unix; elsewhere the file is written as is).
 ///
+/// `path` is opened as given, so an existing file is truncated and reused
+/// and a symlink is followed. It is meant for a destination the caller
+/// chose (`-o`, the harw bin dir); a throwaway binary in a shared directory
+/// goes through [`TempExecutable`].
+///
 /// # Errors
-/// [`ArtifactError::Io`] when creating, writing, syncing or chmod-ing fails.
+/// [`ArtifactError::Io`] when creating, writing, chmod-ing or syncing fails.
 pub fn write_executable(path: &Path, bytes: &[u8]) -> Result<(), ArtifactError> {
     let io =
         |context: &'static str| move |source: std::io::Error| ArtifactError::Io { context, source };
@@ -73,16 +84,143 @@ pub fn write_executable(path: &Path, bytes: &[u8]) -> Result<(), ArtifactError> 
     }
     let mut file = options.open(path).map_err(io("create executable file"))?;
     file.write_all(bytes).map_err(io("write executable file"))?;
-    file.sync_all().map_err(io("sync executable file"))?;
     // `mode` above only applies when the file is created (and is masked by
-    // the umask); set it explicitly for an existing file too.
+    // the umask); set it explicitly for an existing file too. The open handle
+    // is chmod-ed, not the path, so a swapped path is never touched.
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755))
+        file.set_permissions(std::fs::Permissions::from_mode(0o755))
             .map_err(io("set executable permissions"))?;
     }
+    file.sync_all().map_err(io("sync executable file"))?;
     Ok(())
+}
+
+/// Process-wide counter that keeps private directory names unique.
+static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+/// Creates a fresh directory `<parent>/<prefix>-<pid>-<nanos>-<n>` (mode
+/// `0o700` on unix) and returns its path. mkdir fails on any existing entry,
+/// including a symlink, so the directory is always new and ours; a name
+/// clash is retried up to 16 times.
+fn create_private_dir(parent: &Path, prefix: &str) -> Result<PathBuf, ArtifactError> {
+    let mut attempt: u32 = 0;
+    loop {
+        let n = TEMP_COUNTER.fetch_add(1, Ordering::Relaxed);
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_or(0, |d| d.subsec_nanos());
+        let candidate = parent.join(format!("{prefix}-{}-{nanos}-{n}", std::process::id()));
+        let mut builder = std::fs::DirBuilder::new();
+        // Not recursive: only `candidate` itself is created, never a parent.
+        builder.recursive(false);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::DirBuilderExt as _;
+            builder.mode(0o700);
+        }
+        match builder.create(&candidate) {
+            Ok(()) => return Ok(candidate),
+            Err(e) if e.kind() == ErrorKind::AlreadyExists && attempt < 16 => attempt += 1,
+            Err(source) => {
+                return Err(ArtifactError::Io {
+                    context: "create private directory",
+                    source,
+                });
+            }
+        }
+    }
+}
+
+/// Writes `bytes` to a new file at `path` (mode `0o755` on unix).
+/// `create_new` is `O_CREAT | O_EXCL`, so it never follows a symlink and
+/// never reuses a file. Nothing is synced: the file is a throwaway.
+fn write_new_executable(path: &Path, bytes: &[u8]) -> Result<(), ArtifactError> {
+    let io =
+        |context: &'static str| move |source: std::io::Error| ArtifactError::Io { context, source };
+    let mut options = OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o755);
+    }
+    let mut file = options.open(path).map_err(io("create executable file"))?;
+    file.write_all(bytes).map_err(io("write executable file"))?;
+    // `mode` above is masked by the umask; undo that on the open handle.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        file.set_permissions(std::fs::Permissions::from_mode(0o755))
+            .map_err(io("set executable permissions"))?;
+    }
+    // Close the write handle before returning, so a later exec of `path`
+    // does not fail with ETXTBSY.
+    drop(file);
+    Ok(())
+}
+
+/// A built binary written to a fresh private directory for one exec; the
+/// directory and the file are removed when this value is dropped.
+#[derive(Debug)]
+pub struct TempExecutable {
+    dir: PathBuf,
+    path: PathBuf,
+}
+
+impl TempExecutable {
+    /// Writes `bytes` to `<parent>/<prefix>-<pid>-<unique>/<prefix>`, where
+    /// `prefix` is a plain file name. The directory is mode `0o700` on unix
+    /// and created exclusively; the file is mode `0o755` and created with
+    /// `create_new`. A shared `parent` such as the system temp dir leaves
+    /// other local users nothing to pre-plant or swap.
+    ///
+    /// # Errors
+    /// [`ArtifactError::Io`] when no fresh directory can be created
+    /// (`AlreadyExists` after 16 name clashes, or any other mkdir error) or
+    /// when writing the file fails, and with `InvalidInput` when `prefix` is
+    /// not a plain file name. Nothing is left behind on error.
+    pub fn create(parent: &Path, prefix: &str, bytes: &[u8]) -> Result<Self, ArtifactError> {
+        // `prefix` names both the directory and the file; a separator or
+        // `..` would place them outside `parent`.
+        if !is_plain_file_name(prefix) {
+            return Err(ArtifactError::Io {
+                context: "check temp executable prefix",
+                source: ErrorKind::InvalidInput.into(),
+            });
+        }
+        let dir = create_private_dir(parent, prefix)?;
+        // From here on an error drops `temp`, which removes the directory.
+        let temp = Self {
+            path: dir.join(prefix),
+            dir,
+        };
+        write_new_executable(&temp.path, bytes)?;
+        Ok(temp)
+    }
+
+    /// Path of the executable file inside the private directory.
+    #[must_use]
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+}
+
+impl Drop for TempExecutable {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.dir);
+    }
+}
+
+/// True when `name` is exactly one normal path component (not empty, no
+/// separator, not `.` or `..`).
+fn is_plain_file_name(name: &str) -> bool {
+    let mut components = Path::new(name).components();
+    match (components.next(), components.next()) {
+        (Some(std::path::Component::Normal(first)), None) => first == name,
+        _ => false,
+    }
 }
 
 /// A verified artifact found at the end of an executable.
@@ -281,13 +419,17 @@ fn verify_hash(hash: blake3::Hash, footer: &Footer) -> Result<(), ArtifactError>
 
 #[cfg(test)]
 mod tests {
-    use super::{EmbeddedArtifact, FOOTER_LEN, append_to_executable, write_executable};
+    use super::{
+        EmbeddedArtifact, FOOTER_LEN, TempExecutable, append_to_executable, write_executable,
+        write_new_executable,
+    };
     use crate::artifact::{Artifact, ArtifactBuilder, MAX_ARTIFACT_LEN};
     use crate::error::{ArtifactError, TamperScope};
     use crate::kind::PayloadKind;
     use crate::test_support::{TestResult, ctx};
     use serde_json::json;
     use std::io::{Seek, SeekFrom, Write};
+    use std::path::Path;
 
     const RUNNER: &[u8] = b"\x7fELF\x02\x01\x01 fake runner blob with some code bytes \x00\x01\x02";
 
@@ -457,6 +599,146 @@ mod tests {
         let embedded = EmbeddedArtifact::from_path(&path).map_err(ctx("read back"))?;
         assert_eq!(embedded.artifact(), &artifact);
         assert_eq!(embedded.runner_len(), RUNNER.len() as u64);
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_write_executable_resets_the_mode_of_an_existing_file() -> TestResult {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().map_err(ctx("tempdir"))?;
+        let path = dir.path().join("agent");
+        std::fs::write(&path, b"older and longer contents").map_err(ctx("pre-write"))?;
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))
+            .map_err(ctx("chmod 0600"))?;
+        write_executable(&path, b"new").map_err(ctx("write executable"))?;
+        assert_eq!(std::fs::read(&path).map_err(ctx("read back"))?, b"new");
+        let mode = std::fs::metadata(&path)
+            .map_err(ctx("stat"))?
+            .permissions()
+            .mode();
+        assert_eq!(mode & 0o777, 0o755);
+        Ok(())
+    }
+
+    #[test]
+    fn test_temp_executable_is_private_and_removed_on_drop() -> TestResult {
+        let parent = tempfile::tempdir().map_err(ctx("tempdir"))?;
+        let artifact = sample().map_err(ctx("build sample"))?;
+        let binary = append_to_executable(RUNNER, &artifact);
+        let temp = TempExecutable::create(parent.path(), "harw-agent-run", &binary)
+            .map_err(ctx("create temp executable"))?;
+        let path = temp.path().to_path_buf();
+        let dir = path
+            .parent()
+            .map(Path::to_path_buf)
+            .ok_or("no private directory")
+            .map_err(ctx("temp executable parent"))?;
+        assert!(path.is_file());
+        assert_eq!(path.parent().and_then(Path::parent), Some(parent.path()));
+        assert_eq!(std::fs::read(&path).map_err(ctx("read back"))?, binary);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let dir_mode = std::fs::metadata(&dir)
+                .map_err(ctx("stat dir"))?
+                .permissions()
+                .mode();
+            assert_eq!(dir_mode & 0o077, 0);
+            let file_mode = std::fs::metadata(&path)
+                .map_err(ctx("stat file"))?
+                .permissions()
+                .mode();
+            assert_eq!(file_mode & 0o777, 0o755);
+        }
+        let embedded = EmbeddedArtifact::from_path(&path).map_err(ctx("read embedded"))?;
+        assert_eq!(embedded.artifact(), &artifact);
+        drop(temp);
+        assert!(!path.exists());
+        assert!(!dir.exists());
+        Ok(())
+    }
+
+    #[test]
+    fn test_temp_executable_names_are_unique() -> TestResult {
+        let parent = tempfile::tempdir().map_err(ctx("tempdir"))?;
+        let first = TempExecutable::create(parent.path(), "harw-agent-run", b"one")
+            .map_err(ctx("create first"))?;
+        let second = TempExecutable::create(parent.path(), "harw-agent-run", b"two")
+            .map_err(ctx("create second"))?;
+        let first_dir = first.path().parent().map(Path::to_path_buf);
+        let second_dir = second.path().parent().map(Path::to_path_buf);
+        assert!(first_dir.is_some());
+        assert!(second_dir.is_some());
+        assert_ne!(first_dir, second_dir);
+        assert!(first.path().is_file());
+        assert!(second.path().is_file());
+        drop(first);
+        drop(second);
+        for dir in [first_dir, second_dir].into_iter().flatten() {
+            assert!(!dir.exists());
+        }
+        let left = std::fs::read_dir(parent.path())
+            .map_err(ctx("list parent"))?
+            .count();
+        assert_eq!(left, 0);
+        Ok(())
+    }
+
+    #[test]
+    fn test_temp_executable_rejects_a_prefix_that_is_not_a_file_name() -> TestResult {
+        let root = tempfile::tempdir().map_err(ctx("tempdir"))?;
+        let parent = root.path().join("parent");
+        std::fs::create_dir(&parent).map_err(ctx("create parent"))?;
+        for prefix in ["", ".", "..", "../escape", "nested/name", "/absolute"] {
+            assert!(
+                matches!(
+                    TempExecutable::create(&parent, prefix, b"x"),
+                    Err(ArtifactError::Io { .. })
+                ),
+                "prefix {prefix:?} accepted"
+            );
+        }
+        // Nothing was created, neither in `parent` nor next to it.
+        let in_parent = std::fs::read_dir(&parent)
+            .map_err(ctx("list parent"))?
+            .count();
+        assert_eq!(in_parent, 0);
+        let in_root = std::fs::read_dir(root.path())
+            .map_err(ctx("list root"))?
+            .count();
+        assert_eq!(in_root, 1);
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_write_new_executable_refuses_a_planted_symlink() -> TestResult {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().map_err(ctx("tempdir"))?;
+        let victim = dir.path().join("victim");
+        std::fs::write(&victim, b"keep").map_err(ctx("write victim"))?;
+        std::fs::set_permissions(&victim, std::fs::Permissions::from_mode(0o600))
+            .map_err(ctx("chmod victim"))?;
+        let link = dir.path().join("link");
+        std::os::unix::fs::symlink(&victim, &link).map_err(ctx("plant symlink"))?;
+        assert!(matches!(
+            write_new_executable(&link, b"evil"),
+            Err(ArtifactError::Io { source, .. })
+                if source.kind() == std::io::ErrorKind::AlreadyExists
+        ));
+        assert_eq!(std::fs::read(&victim).map_err(ctx("read victim"))?, b"keep");
+        let mode = std::fs::metadata(&victim)
+            .map_err(ctx("stat victim"))?
+            .permissions()
+            .mode();
+        assert_eq!(mode & 0o777, 0o600);
+        // A dangling link must not create its target either.
+        let missing = dir.path().join("missing");
+        let dangling = dir.path().join("dangling");
+        std::os::unix::fs::symlink(&missing, &dangling).map_err(ctx("plant dangling symlink"))?;
+        assert!(write_new_executable(&dangling, b"evil").is_err());
+        assert!(!missing.exists());
         Ok(())
     }
 

@@ -510,8 +510,12 @@ fn inspect(ctx: &mut CommandContext<'_>, target: &str) -> CommandOutput {
 /// - A bare `.harwa` artifact file has no runner of its own: a matching
 ///   runner is located, the artifact is appended to a copy of it in memory
 ///   (the exact [`harw_agent_artifact::append_to_executable`] the artifact
-///   backend uses at build time), and the combined bytes are written to a
-///   throwaway executable that is exec'ed and then removed.
+///   backend uses at build time), and the combined bytes are written with
+///   [`harw_agent_artifact::embed::TempExecutable`] into a fresh private
+///   directory under the system temp dir (created exclusively, mode `0o700`
+///   on unix; the file itself with `create_new`), exec'ed, and removed
+///   together with that directory afterwards. Nothing is written to a
+///   predictable path in the shared temp dir.
 ///
 /// The prompt, if given, is passed as the runner's one positional argument
 /// (its one-shot mode; see `iface::cli`); without one the runner reads
@@ -529,9 +533,8 @@ fn run_agent(ctx: &mut CommandContext<'_>, target: &str, prompt: Option<&str>) -
         Ok(read) => read,
         Err(error) => return CommandOutput::from_error(&error, &[]),
     };
-    let mut cleanup: Option<PathBuf> = None;
-    let executable = if container == "binary" {
-        path
+    let (executable, temp) = if container == "binary" {
+        (path, None)
     } else {
         let runner = match locate_runner(&ctx.env, None, &ctx.env.host_target) {
             Ok(runner) => runner,
@@ -562,25 +565,24 @@ fn run_agent(ctx: &mut CommandContext<'_>, target: &str, prompt: Option<&str>) -
             }
         };
         let binary = harw_agent_artifact::append_to_executable(&runner_bytes, &artifact);
-        let temp = std::env::temp_dir().join(format!(
-            "harw-agent-run-{}-{}",
-            std::process::id(),
-            artifact.digest()
-        ));
-        if let Err(source) = harw_agent_artifact::write_executable(&temp, &binary) {
-            return CommandOutput::from_error(&CompileError::Artifact(source), &[]);
-        }
-        cleanup = Some(temp.clone());
-        temp
+        let written = match harw_agent_artifact::embed::TempExecutable::create(
+            &std::env::temp_dir(),
+            "harw-agent-run",
+            &binary,
+        ) {
+            Ok(written) => written,
+            Err(source) => return CommandOutput::from_error(&CompileError::Artifact(source), &[]),
+        };
+        (written.path().to_path_buf(), Some(written))
     };
     let mut command = std::process::Command::new(&executable);
     if let Some(prompt) = prompt {
         command.arg(prompt);
     }
     let status = command.status();
-    if let Some(temp) = &cleanup {
-        let _ = std::fs::remove_file(temp);
-    }
+    // Removes the private directory as soon as the child has exited; the
+    // output below only formats the path.
+    drop(temp);
     match status {
         Ok(status) => {
             let exit_code = status.code().unwrap_or(1);
@@ -1466,6 +1468,62 @@ mod tests {
             },
         );
         assert_eq!(output.exit_code, 3);
+        Ok(())
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn test_run_uses_a_private_temp_dir_and_never_the_predictable_path()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let dir = tempfile::tempdir()?;
+        let artifact =
+            harw_agent_artifact::ArtifactBuilder::new(&json!({"name": "demo"})).build()?;
+        let artifact_path = dir.path().join("demo.harwa");
+        std::fs::write(&artifact_path, artifact.to_bytes())?;
+        let env = CompilerEnv::isolated(dir.path().join("home"), dir.path().to_path_buf());
+        let runner_path = env
+            .home_runner_dir(&env.host_target)
+            .join("harw-agent-runner");
+        std::fs::create_dir_all(runner_path.parent().ok_or("parent")?)?;
+        harw_agent_artifact::write_executable(&runner_path, b"#!/bin/sh\nexit 3\n")?;
+        // Pre-plant a symlink at the path the old implementation wrote to:
+        // following it would overwrite `victim` with the combined binary.
+        let victim = dir.path().join("victim");
+        std::fs::write(&victim, b"keep")?;
+        let link = std::env::temp_dir().join(format!(
+            "harw-agent-run-{}-{}",
+            std::process::id(),
+            artifact.digest()
+        ));
+        let _ = std::fs::remove_file(&link);
+        std::os::unix::fs::symlink(&victim, &link)?;
+        let mut progress = |_: &str| {};
+        let mut ctx = CommandContext {
+            env,
+            probe: &NoProbe,
+            case_runner: &crate::testing::EchoStub,
+            progress: &mut progress,
+        };
+        let output = run_command(
+            &mut ctx,
+            AgentCommand::Run {
+                target: artifact_path.display().to_string(),
+                prompt: Some("hi".to_owned()),
+            },
+        );
+        // Clean up the shared temp dir before any assertion can fail.
+        let removed = std::fs::remove_file(&link);
+        let kept = std::fs::read(&victim)?;
+        removed?;
+        assert_eq!(output.exit_code, 3);
+        assert_eq!(kept, b"keep");
+        let temp_dir = std::env::temp_dir();
+        let exe = Path::new(output.json["executable"].as_str().ok_or("executable")?);
+        assert_ne!(exe.parent(), Some(temp_dir.as_path()));
+        assert_eq!(exe.parent().and_then(Path::parent), Some(temp_dir.as_path()));
+        assert!(!exe.exists(), "{} was not removed", exe.display());
+        let private = exe.parent().ok_or("parent")?;
+        assert!(!private.exists(), "{} was not removed", private.display());
         Ok(())
     }
 }
