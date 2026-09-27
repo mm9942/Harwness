@@ -201,6 +201,8 @@ struct RenderState {
 
 /// Höchstens so lange wartet ein Abschluss (Stream-Ende, Freigabe schließen)
 /// auf ein freies Token der lokalen Buckets, bevor er trotzdem sendet.
+/// Eine neue Freigabe wartet ebenso lange, scheitert danach aber (fail closed),
+/// statt ohne Token zu senden.
 const FINISH_TOKEN_WAIT: Duration = Duration::from_secs(5);
 
 /// Abstand zwischen zwei Versuchen, ein Bucket-Token zu erhalten.
@@ -342,6 +344,14 @@ impl TelegramRenderer {
 
     /// Sends a prepared approval and returns the actual delivery context that
     /// must be used to bind its issued tokens before callback redemption.
+    ///
+    /// Waits at most 5 s for a local bucket token, so an approval sent right
+    /// after a streamed reply is delayed instead of rejected. Unlike
+    /// [`Self::stream_finish_async`] it never sends without a token.
+    ///
+    /// # Errors
+    /// `Draft` strategy, the local 429 (`ApiRejected { code: 429, .. }`) when
+    /// no token frees up within the wait, or a Telegram transport/API error.
     pub async fn send_prepared_approval_async(
         &self,
         chat_id: i64,
@@ -351,9 +361,7 @@ impl TelegramRenderer {
         if self.config.strategy == StreamingStrategy::Draft {
             return Err(draft_error());
         }
-        if !self.take_token(chat_id) {
-            return Err(rate_error("sendMessage"));
-        }
+        self.wait_for_approval_token(chat_id).await?;
         let keyboard = keyboard(&approval.inline_actions);
         let message = self
             .client
@@ -377,9 +385,12 @@ impl TelegramRenderer {
     /// `prompt.request_id` ausgegebenen Tokens widerrufen; ein ungebundener
     /// Button kann danach nie eingelöst werden.
     ///
+    /// Ist der Chat-Bucket gerade leer (etwa direkt nach dem Stream-Ende),
+    /// wartet der Versand höchstens 5 s auf ein Token, statt sofort abzulehnen.
+    ///
     /// # Errors
-    /// Transport-/API-Fehler beim Senden, lokales Ratenlimit, `Draft`-Strategie
-    /// oder eine abgelehnte Token-Bindung.
+    /// Transport-/API-Fehler beim Senden, lokales Ratenlimit (kein Bucket-Token
+    /// binnen 5 s), `Draft`-Strategie oder eine abgelehnte Token-Bindung.
     pub async fn send_bound_approval_async(
         &self,
         chat_id: i64,
@@ -607,6 +618,17 @@ impl TelegramRenderer {
             let step = TOKEN_POLL_STEP.min(self.finish_token_wait.saturating_sub(waited));
             tokio::time::sleep(step).await;
             waited += step;
+        }
+    }
+
+    /// Wartet wie ein Abschluss höchstens `finish_token_wait` auf ein
+    /// Bucket-Token, sendet danach aber nicht trotzdem: eine Freigabe ohne
+    /// Token scheitert mit dem lokalen 429 (fail closed).
+    async fn wait_for_approval_token(&self, chat_id: i64) -> TransportResult<()> {
+        if self.wait_for_token(chat_id).await {
+            Ok(())
+        } else {
+            Err(rate_error("sendMessage"))
         }
     }
 
@@ -980,6 +1002,20 @@ mod tests {
         }
     }
 
+    /// Uhr, die bei jedem Ablesen um `step_ms` vorrückt: ein Bucket füllt sich
+    /// so während `wait_for_token`, ohne dass der Test Sekunden wartet.
+    #[derive(Debug)]
+    struct SteppingClock {
+        now_ms: AtomicU64,
+        step_ms: u64,
+    }
+
+    impl Clock for SteppingClock {
+        fn now(&self) -> Duration {
+            Duration::from_millis(self.now_ms.fetch_add(self.step_ms, Ordering::Relaxed))
+        }
+    }
+
     fn renderer(config: RendererConfig) -> TelegramRenderer {
         TelegramRenderer::with_config_and_clock(
             Arc::new(TelegramClient::new("test-token")),
@@ -1221,7 +1257,7 @@ mod tests {
     #[tokio::test]
     async fn failed_bound_approval_revokes_every_issued_token() -> TestResult {
         let store = Arc::new(ApprovalTokenStore::new());
-        let renderer = TelegramRenderer::with_config_and_clock_and_approval_tokens(
+        let mut renderer = TelegramRenderer::with_config_and_clock_and_approval_tokens(
             Arc::new(TelegramClient::new("test-token")),
             RendererConfig {
                 per_chat_per_sec: 0,
@@ -1230,6 +1266,8 @@ mod tests {
             Arc::new(TestClock::default()),
             Arc::clone(&store),
         );
+        // Ohne Wartezeit: geprüft wird das Scheitern nach Ablauf, nicht das Warten.
+        renderer.finish_token_wait = Duration::ZERO;
         assert!(Arc::ptr_eq(renderer.approval_tokens(), &store));
         let result = renderer
             .send_bound_approval_async(7, None, &approval_prompt(), &PeerId::from_str("42"))
@@ -1244,6 +1282,55 @@ mod tests {
             TelegramTransportError::ApiRejected { code: 429, .. }
         ));
         assert_eq!(store.len(), 0);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn approval_after_a_spent_chat_token_waits_instead_of_failing() -> TestResult {
+        let renderer = TelegramRenderer::with_config_and_clock(
+            Arc::new(TelegramClient::new("test-token")),
+            RendererConfig {
+                per_chat_per_sec: 1,
+                ..RendererConfig::default()
+            },
+            Arc::new(SteppingClock {
+                now_ms: AtomicU64::new(0),
+                step_ms: 250,
+            }),
+        );
+        // Das Stream-Ende verbraucht das einzige Chat-Token (t = 0 s).
+        assert!(renderer.take_token(7));
+        // 0,25 s später ist der Bucket noch leer: hier lehnte der alte Pfad ab.
+        assert!(!renderer.take_token(7));
+        renderer
+            .wait_for_approval_token(7)
+            .await
+            .map_err(ctx("Freigabe muss auf das nachgefüllte Token warten"))?;
+        // Das nachgefüllte Token ist verbraucht, nicht doppelt vergeben.
+        assert!(!renderer.take_token(7));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn approval_token_wait_is_bounded_and_fails_closed() -> TestResult {
+        let mut renderer = renderer(RendererConfig {
+            per_chat_per_sec: 0,
+            ..RendererConfig::default()
+        });
+        renderer.finish_token_wait = Duration::from_millis(200);
+        let Err(error) = renderer.wait_for_approval_token(7).await else {
+            return Err(TestError::Unexpected(
+                "ohne Bucket-Token darf keine Freigabe gesendet werden".into(),
+            ));
+        };
+        assert!(matches!(
+            error,
+            TelegramTransportError::ApiRejected {
+                method: "sendMessage",
+                code: 429,
+                ..
+            }
+        ));
         Ok(())
     }
 

@@ -1,6 +1,6 @@
 # Harwness Crate Inventory (Procurement List)
 
-> Status: partially implemented · Last reviewed: 2026-09-24
+> Status: partially implemented · Last reviewed: 2026-09-27
 
 Design-time inventory, researched 2026-07-14 against crates.io. This is the
 canonical list of external dependencies for the crates planned in
@@ -73,7 +73,6 @@ watch workspace feature unification.
 | reqwest | align with frankenstein's pin (0.12/0.13 line) | HTTP client, rustls TLS |
 | axum | 0.8.6 | webhook listener (plain HTTP on loopback; TLS at the reverse proxy) |
 | governor | 0.10.4 | token-bucket rate limiting (inbound per peer, outbound per chat) |
-| backon | 1.6.0 | retry/backoff (successor of the unmaintained `backoff`) |
 | infer | 0.19.0 | content-based MIME sniffing (never trust Telegram's `mime_type`) |
 | sha2 | 0.10.x stable | attachment-manifest digests (audit-conventional; blake3 documented alternative) |
 
@@ -87,7 +86,8 @@ Hand-rolled: pairing-code primitive, `ChannelAdapter`/`SessionKey` derivation/
 `Admission`/`ChannelCapabilities`, MarkdownV2 downgrade + chunking,
 `update_id` dedup + poll-offset persistence, approval-callback table with
 replay protection, Telegram quota wiring (~1 msg/s/chat, ~30 msg/s global),
-webhook secret-header middleware, config cross-validation.
+webhook secret-header middleware, config cross-validation, long-poll retry
+backoff (`PollBackoff`, exponential 1 s to 30 s).
 
 Future channels: Slack → slack-morphism 2.19; Matrix → matrix-rust-sdk
 (heavy — prefer matrix-sdk-base/-crypto; needs its own research pass).
