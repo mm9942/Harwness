@@ -325,7 +325,7 @@ impl Charge {
 }
 
 /// Veränderlicher Zustand eines Buckets.
-#[derive(Debug)]
+#[derive(Debug, Clone, Copy)]
 struct BudgetState {
     last_refill: Instant,
     requests: Option<TokenBucket>,
@@ -378,19 +378,30 @@ impl BudgetState {
     /// Längste fällige Wartezeit über Sperre und alle Buckets; `None` =
     /// sofort zulassbar.
     fn wait_needed(&self, charge: &Charge, now: Instant) -> Option<Duration> {
+        self.longest_wait([1.0, charge.total(), charge.input, charge.output], now)
+    }
+
+    /// Wie [`Self::wait_needed`], aber mit je `1` Einheit in jedem Bucket
+    /// (Vorschau für das Pacing, siehe [`ProviderBudget::preview_wait`]).
+    fn unit_wait(&self, now: Instant) -> Option<Duration> {
+        self.longest_wait([1.0; 4], now)
+    }
+
+    /// Längste Wartezeit über Sperre und die Buckets RPM, TPM, Eingabe,
+    /// Ausgabe mit den Mengen `amounts` (in dieser Reihenfolge).
+    fn longest_wait(&self, amounts: [f64; 4], now: Instant) -> Option<Duration> {
         let mut longest = self
             .blocked_until
             .map(|until| until.saturating_duration_since(now))
             .filter(|rest| !rest.is_zero());
-        for (bucket, amount) in [
-            (&self.requests, 1.0),
-            (&self.tokens, charge.total()),
-            (&self.input_tokens, charge.input),
-            (&self.output_tokens, charge.output),
-        ] {
-            if let Some(bucket) = bucket
-                && let Some(wait) = bucket.wait_for(amount)
-            {
+        let buckets = [
+            &self.requests,
+            &self.tokens,
+            &self.input_tokens,
+            &self.output_tokens,
+        ];
+        for (bucket, amount) in buckets.into_iter().zip(amounts) {
+            if let Some(wait) = bucket.as_ref().and_then(|bucket| bucket.wait_for(amount)) {
                 longest = Some(longest.map_or(wait, |current| current.max(wait)));
             }
         }
@@ -687,6 +698,26 @@ impl ProviderBudget {
         }
     }
 
+    /// Wartezeit, bis dieser Bucket wieder mindestens eine Einheit je
+    /// Dimension (1 Request, 1 Token) zulässt; berücksichtigt eine
+    /// 429-Sperre.
+    ///
+    /// # Description
+    /// Seiteneffektfrei: arbeitet auf einer Kopie des Zustands (der Lock wird
+    /// nur für das Kopieren gehalten), bucht nichts ab und zählt niemanden
+    /// als wartend. `max_concurrent` fließt nicht ein, weil das Freiwerden
+    /// eines Platzes keine vorhersagbare Dauer hat.
+    ///
+    /// # Returns
+    /// `None`, wenn sofort Kapazität frei ist.
+    #[must_use]
+    pub fn preview_wait(&self) -> Option<Duration> {
+        let now = self.clock.now();
+        let mut probe = *self.lock_state();
+        probe.refill(now);
+        probe.unit_wait(now)
+    }
+
     /// Momentaufnahme für `/status` und das `provider-concurrency`-Tool.
     #[must_use]
     pub fn snapshot(&self) -> BudgetSnapshot {
@@ -938,6 +969,36 @@ impl ProviderBudgets {
         for budget in self.budgets_for(model) {
             budget.penalize(retry_after);
         }
+    }
+
+    /// Längste Wartezeit über **alle** Buckets (Provider und jedes Modell),
+    /// bis jeder wieder mindestens eine Einheit zulässt (siehe
+    /// [`ProviderBudget::preview_wait`]).
+    ///
+    /// # Description
+    /// Seiteneffektfrei; gedacht für das Pacing vor einem Request, dessen
+    /// Modell noch nicht feststeht (daher bewusst konservativ über alle
+    /// Modell-Buckets). Für ein bekanntes Modell siehe
+    /// [`Self::preview_wait_for`].
+    ///
+    /// # Returns
+    /// `None` ohne konfigurierte Buckets oder wenn keiner warten müsste.
+    #[must_use]
+    pub fn preview_wait(&self) -> Option<Duration> {
+        self.provider
+            .iter()
+            .chain(self.model_budgets.iter())
+            .filter_map(|budget| budget.preview_wait())
+            .max()
+    }
+
+    /// Wie [`Self::preview_wait`], aber nur über die für `model` zuständigen
+    /// Buckets (Provider-weit plus ggf. Modell-Override).
+    #[must_use]
+    pub fn preview_wait_for(&self, model: &str) -> Option<Duration> {
+        self.budgets_for(model)
+            .filter_map(|budget| budget.preview_wait())
+            .max()
     }
 
     /// Momentaufnahmen aller Buckets (Provider zuerst, dann Modelle).
@@ -1546,6 +1607,82 @@ mod tests {
         assert_eq!(estimate_wire_tokens(&wire), 5);
         assert_eq!(estimate_tokens_from_bytes(0), 0);
         assert_eq!(estimate_tokens_from_bytes(5), 2);
+    }
+
+    #[test]
+    fn preview_wait_without_budgets_is_none() {
+        let budgets = ProviderBudgets::default();
+        assert_eq!(budgets.preview_wait(), None);
+        assert_eq!(budgets.preview_wait_for("gpt-5"), None);
+    }
+
+    #[tokio::test]
+    async fn preview_wait_reports_exhausted_tpm_bucket() -> TestResult {
+        let clock = ManualClock::new();
+        let budget = budget(
+            &clock,
+            BudgetLimits {
+                tokens_per_minute: Some(1_000),
+                ..BudgetLimits::default()
+            },
+        );
+        let budgets = ProviderBudgets::for_provider(Arc::clone(&budget));
+        assert_eq!(budgets.preview_wait(), None, "a full bucket needs no wait");
+
+        let _permit = tokio::time::timeout(SHORT, budgets.acquire("gpt-5", 1_000, 0)).await??;
+        let wait = budgets
+            .preview_wait()
+            .ok_or("exhausted bucket must report a wait")?;
+        assert!(wait > Duration::ZERO);
+        assert!(
+            wait <= Duration::from_secs(60),
+            "wait {wait:?} exceeds the window"
+        );
+        assert_eq!(budgets.preview_wait_for("gpt-5"), Some(wait));
+
+        // Nach dem Nachlaufen einer Einheit ist keine Wartezeit mehr fällig.
+        clock.advance(wait);
+        assert_eq!(budgets.preview_wait(), None);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn preview_wait_does_not_consume_capacity() -> TestResult {
+        let clock = ManualClock::new();
+        let budget = budget(
+            &clock,
+            BudgetLimits {
+                requests_per_minute: Some(1),
+                tokens_per_minute: Some(1_000),
+                ..BudgetLimits::default()
+            },
+        );
+        let budgets = ProviderBudgets::for_provider(Arc::clone(&budget));
+        let before = budget.snapshot();
+        for _ in 0..10 {
+            assert_eq!(budgets.preview_wait(), None);
+        }
+        assert_eq!(
+            budget.snapshot(),
+            before,
+            "preview must not change the state"
+        );
+
+        let _permit = tokio::time::timeout(SHORT, budgets.acquire("gpt-5", 100, 0)).await??;
+        let admitted = budget.snapshot();
+        assert_eq!(admitted.requests_available, Some(0));
+        assert_eq!(admitted.tokens_available, Some(900));
+        assert_eq!(admitted.admitted_total, 1);
+        assert_eq!(admitted.throttled_total, 0);
+
+        assert!(budgets.preview_wait().is_some(), "rpm bucket is empty now");
+        let after = budget.snapshot();
+        assert_eq!(
+            after, admitted,
+            "a waiting preview is not counted as throttled"
+        );
+        assert_eq!(after.waiting, 0);
+        Ok(())
     }
 
     #[test]

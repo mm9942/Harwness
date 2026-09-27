@@ -78,6 +78,3 @@ deny = [
 unknown-registry = "deny"
 unknown-git = "deny"
 allow-registry = ["https://github.com/rust-lang/crates.io-index"]
-# crypt_guard 3.1 gibt es nur als Git-Quelle (nicht auf crates.io); das ist
-# die einzige erlaubte Git-Quelle, jede andere bleibt über `unknown-git` verboten.
-allow-git = ["https://github.com/mm9942/crypt_guard"]

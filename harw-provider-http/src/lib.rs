@@ -4153,11 +4153,13 @@ impl OpenAiResponsesProvider {
             }
         }
 
-        // Client-seitige RPM/TPM-Budgets (siehe [`budget`]): vor dem
-        // Nebenläufigkeits-Permit reservieren, damit ein auf Budget wartender
-        // Request keinen Slot blockiert. Fail-fast, wenn schon die
-        // Eingabe-Schätzung ein Minutenlimit sprengt. Der Permit lebt bis zum
-        // Abgleich mit der tatsächlichen Nutzung unten.
+        // Client-seitige RPM/TPM-Budgets (siehe [`budget`]) und
+        // Header-Pacing zuerst: eine Wartepause darf keinen
+        // Nebenläufigkeits-Slot belegen, sonst blockiert ein wartender
+        // Request andere, die sofort senden dürften — gleiches Muster wie
+        // `AnthropicMessagesProvider::respond_once`. Fail-fast, wenn schon
+        // die Eingabe-Schätzung ein Minutenlimit sprengt. Der Budget-Permit
+        // lebt bis zum Abgleich mit der tatsächlichen Nutzung unten.
         // Eingabe-Schätzung nur berechnen, wenn Budgets oder der Header-Pacer
         // sie tatsächlich brauchen (Serialisierung des Wire-Bodys).
         let estimated_input = if self.budgets.is_empty() && !self.rate_limiter.is_enabled() {
@@ -4176,6 +4178,10 @@ impl OpenAiResponsesProvider {
                 )
                 .await?
         };
+        self.rate_limiter
+            .wait_for_slot_with_estimate(estimated_input)
+            .await
+            .map_err(rate_budget_error)?;
         // Laufende 429-Abkühlphase dieses Providers abwarten, bevor ein Slot
         // belegt wird (siehe `ProviderRateLimiter::wait_for_cooldown`).
         self.rate_limiter.wait_for_cooldown().await;
@@ -4194,10 +4200,6 @@ impl OpenAiResponsesProvider {
             })?),
             None => None,
         };
-        self.rate_limiter
-            .wait_for_slot_with_estimate(estimated_input)
-            .await
-            .map_err(rate_budget_error)?;
         // Codex-Route: bei einem tatsächlichen 401 genau einmal
         // reaktiv erneuern und den Request genau einmal wiederholen —
         // kein zweiter Refresh-Versuch nach erneutem 401 (siehe
@@ -4466,6 +4468,17 @@ impl ModelProvider for OpenAiResponsesProvider {
             }
         })
     }
+
+    /// Wartezeit bis zum nächsten Request: das Maximum aus Header-Pacing
+    /// bzw. 429-Abkühlphase ([`rate_limiter::ProviderRateLimiter::status_wait`])
+    /// und den konfigurierten Budgets ([`budget::ProviderBudgets::preview_wait`]).
+    /// Seiteneffektfrei; `None`, wenn nicht gewartet werden muss.
+    fn pacing_wait(&self) -> Option<Duration> {
+        match (self.rate_limiter.status_wait(), self.budgets.preview_wait()) {
+            (Some(rate), Some(budget)) => Some(rate.max(budget)),
+            (rate, budget) => rate.or(budget),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -4709,6 +4722,122 @@ mod tests {
         assert!(
             peak.load(std::sync::atomic::Ordering::SeqCst) <= MAX_CONCURRENCY,
             "observed more than {MAX_CONCURRENCY} requests in flight simultaneously"
+        );
+        Ok(())
+    }
+
+    /// Regressionstest für die Reihenfolge in [`OpenAiResponsesProvider::respond_once`]:
+    /// eine Wartepause auf den Header-Pacer (`wait_for_slot_with_estimate`)
+    /// darf — wie bei `AnthropicMessagesProvider::respond_once` — keinen
+    /// Nebenläufigkeits-Slot belegen. Bei `max_concurrency = 1` muss ein
+    /// zweiter, kleiner Request, dessen eigenes Kontingent sofort reicht,
+    /// fertig werden, während der erste, große Request noch auf den Pacer
+    /// wartet — statt hinter dessen (in der alten Reihenfolge belegtem)
+    /// Nebenläufigkeits-Slot festzuhängen.
+    #[tokio::test]
+    async fn respond_once_pacing_wait_does_not_hold_concurrency_permit() -> TestResult {
+        let (base_url, _peak, server) = mock_concurrency_probe_server(2)?;
+        let mut provider =
+            configured_provider("paced", base_url, vec!["gpt-test"], "PACED_PROVIDER_KEY");
+        provider.max_concurrency = Some(1);
+        provider.rate_limit = Some(harw_config::RateLimitToml {
+            enabled: true,
+            // Niedrige Marge, damit nur die Größenschätzung des jeweiligen
+            // Requests (nicht der Sicherheitsabstand) über Warten/Zulassung
+            // entscheidet.
+            safety_margin_pct: 1,
+            ..harw_config::RateLimitToml::default()
+        });
+        provider
+            .validate()
+            .map_err(ctx("max_concurrency = 1 and header pacer are valid"))?;
+
+        let env_layer =
+            BTreeMap::from([("PACED_PROVIDER_KEY".to_owned(), "sk-secret".to_owned())]);
+        let mut config = harw_config::ResolvedConfig::default();
+        config.harness.default_provider = Some("paced".to_owned());
+        config.harness.default_model = Some("gpt-test".to_owned());
+        config.providers.insert("paced".to_owned(), provider.clone());
+
+        let http_provider = std::sync::Arc::new(
+            OpenAiResponsesProvider::from_named_config(
+                "paced",
+                &provider,
+                &config,
+                "gpt-test",
+                test_sources(&env_layer, None, None),
+            )
+            .map_err(ctx("provider builds with header pacer and max_concurrency configured"))?,
+        );
+
+        // Header-Pacer direkt vorladen, ohne einen echten Antwort-Roundtrip:
+        // "tokens"-Kontingent knapp (150 von 10000), Reset in 300 ms.
+        let mut pacing_headers = reqwest::header::HeaderMap::new();
+        for (name, value) in [
+            ("x-ratelimit-limit-tokens", "10000"),
+            ("x-ratelimit-remaining-tokens", "150"),
+            ("x-ratelimit-reset-tokens", "300ms"),
+        ] {
+            pacing_headers.insert(
+                name,
+                reqwest::header::HeaderValue::from_str(value).map_err(ctx("header value"))?,
+            );
+        }
+        http_provider.rate_limiter_handle().observe_headers(&pacing_headers);
+
+        // Request A: groß genug (~500 geschätzte Tokens), um das knappe
+        // Kontingent zu überschreiten -> muss auf den Reset warten, bevor es
+        // überhaupt einen Request absetzt.
+        let mut request_a = request_with_ids(None, None);
+        request_a.system_prompt = "x".repeat(2_000);
+
+        // Request B: minimal, passt klar ins verbleibende Kontingent -> darf
+        // trotz `max_concurrency = 1` nicht hinter A auf den
+        // Nebenläufigkeits-Slot warten müssen.
+        let request_b = request_with_ids(None, None);
+
+        let completion_order = std::sync::Arc::new(AtomicUsize::new(0));
+        let completion_order_for_a = std::sync::Arc::clone(&completion_order);
+
+        let provider_for_a = std::sync::Arc::clone(&http_provider);
+        let task_a = tokio::spawn(async move {
+            let started = std::time::Instant::now();
+            let result = provider_for_a.respond(request_a).await;
+            let elapsed = started.elapsed();
+            let sequence = completion_order_for_a.fetch_add(1, Ordering::SeqCst);
+            (result, elapsed, sequence)
+        });
+
+        // A muss den Pacer erreichen (und dort zu schlafen beginnen), bevor B
+        // startet — sonst könnte B rein zufällig zuerst den einzigen
+        // Nebenläufigkeits-Slot belegen, ohne dass der Fix überhaupt greift.
+        tokio::time::sleep(Duration::from_millis(30)).await;
+
+        let started_b = std::time::Instant::now();
+        let response_b = http_provider
+            .respond(request_b)
+            .await
+            .map_err(ctx("small request is admitted immediately by its own contingent"))?;
+        let elapsed_b = started_b.elapsed();
+        let sequence_b = completion_order.fetch_add(1, Ordering::SeqCst);
+        assert_eq!(response_b.message.as_deref(), Some("mock"));
+
+        let (result_a, elapsed_a, sequence_a) =
+            task_a.await.map_err(ctx("request A task completes"))?;
+        result_a.map_err(ctx("large request eventually admits after its pacing wait"))?;
+        server.join().map_err(join_thread_error)??;
+
+        assert!(
+            elapsed_b < Duration::from_millis(200),
+            "request B must not be blocked behind A's pacing wait, took {elapsed_b:?}"
+        );
+        assert!(
+            elapsed_a >= Duration::from_millis(250),
+            "request A must actually have paced on the rate limiter, took {elapsed_a:?}"
+        );
+        assert!(
+            sequence_b < sequence_a,
+            "B must finish while A is still pacing, not stuck behind A's concurrency permit"
         );
         Ok(())
     }
@@ -5861,6 +5990,33 @@ mod tests {
         let status = provider.load_status();
         assert_eq!(status.budgets.len(), 1);
         assert_eq!(status.budgets[0].admitted_total, 0);
+        Ok(())
+    }
+
+    #[test]
+    fn pacing_wait_reports_rate_limit_cooldown() -> TestResult {
+        let provider = OpenAiResponsesProvider::new(
+            "https://example.test/v1",
+            "gpt-test",
+            SecretString::new("sk-secret".into()),
+        )
+        .map_err(ctx("OpenAiResponsesProvider::new"))?;
+        assert_eq!(
+            ModelProvider::pacing_wait(&provider),
+            None,
+            "a fresh provider must not ask callers to wait"
+        );
+
+        provider
+            .rate_limiter_handle()
+            .note_rate_limit_cooldown(Duration::from_secs(30));
+        let Some(wait) = ModelProvider::pacing_wait(&provider) else {
+            return Err(TestError::Unexpected(
+                "a running 429 cooldown must surface as pacing wait".into(),
+            ));
+        };
+        assert!(wait <= Duration::from_secs(30), "{wait:?}");
+        assert!(!wait.is_zero(), "{wait:?}");
         Ok(())
     }
 

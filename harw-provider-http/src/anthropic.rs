@@ -1233,6 +1233,17 @@ impl AnthropicMessagesProvider {
                     &body,
                 );
                 self.budgets.penalize(model, hint.map(Duration::from_secs));
+                // Gemeinsame Abkühlphase für alle Requests dieses Providers,
+                // unabhängig davon, ob dieses 429 unten als `RateLimited`
+                // oder `QuotaExceeded` klassifiziert wird (siehe
+                // `crate::error::model_error_for_status`) — mirrort die
+                // Reihenfolge des OpenAI-kompatiblen Pfads
+                // (`lib.rs::respond`), der denselben Aufruf ebenfalls vor der
+                // Klassifikation und unabhängig von ihr ausführt.
+                if let Some(secs) = hint {
+                    self.rate_limiter
+                        .note_rate_limit_cooldown(Duration::from_secs(secs));
+                }
             }
             let mut error = anthropic_error_for_status(
                 status.as_u16(),
@@ -1250,8 +1261,12 @@ impl AnthropicMessagesProvider {
                 retry_after_secs, ..
             } = &error
             {
-                // Gemeinsame Abkühlphase für alle Requests dieses Providers
-                // (siehe `ProviderRateLimiter::note_rate_limit_cooldown`).
+                // Verlängert die oben bereits gesetzte Abkühlphase ggf. auf
+                // den durch die Header-Diagnose verfeinerten Wert (siehe
+                // `apply_rate_limit_diagnosis`); `note_rate_limit_cooldown`
+                // verkürzt eine laufende Abkühlphase nie, dieser Aufruf kann
+                // sie also nur verlängern, niemals unter den obigen Wert
+                // absenken.
                 self.rate_limiter
                     .note_rate_limit_cooldown(Duration::from_secs(*retry_after_secs));
             }
@@ -1354,6 +1369,17 @@ impl ModelProvider for AnthropicMessagesProvider {
                 }
             }
         })
+    }
+
+    /// Maximum aus Header-Pacing/429-Abkühlphase
+    /// ([`crate::rate_limiter::ProviderRateLimiter::status_wait`]) und der
+    /// Vorschau der konfigurierten TPM/RPM-Budgets; `None` ohne Wartezeit.
+    /// Seiteneffektfrei.
+    fn pacing_wait(&self) -> Option<Duration> {
+        match (self.rate_limiter.status_wait(), self.budgets.preview_wait()) {
+            (Some(limiter), Some(budget)) => Some(limiter.max(budget)),
+            (limiter, budget) => limiter.or(budget),
+        }
     }
 }
 
@@ -2759,6 +2785,23 @@ mod tests {
         Ok(())
     }
 
+    #[test]
+    fn pacing_wait_reports_rate_limit_cooldown() -> TestResult {
+        let provider = test_provider()?;
+        assert_eq!(ModelProvider::pacing_wait(&provider), None);
+        provider
+            .rate_limiter_handle()
+            .note_rate_limit_cooldown(Duration::from_secs(30));
+        let wait = ModelProvider::pacing_wait(&provider)
+            .ok_or(TestError::Missing("pacing_wait after cooldown"))?;
+        assert!(
+            wait <= Duration::from_secs(30),
+            "wait {wait:?} exceeds 30 s"
+        );
+        assert!(!wait.is_zero());
+        Ok(())
+    }
+
     /// Startet einen Mock-HTTP-Server, der pro Verbindung einen eigenen
     /// Thread spawnt, die aktuell gleichzeitig offenen Verbindungen zählt,
     /// den beobachteten Höchststand (`peak`) trackt, künstlich verzögert und
@@ -2917,6 +2960,75 @@ mod tests {
         };
         assert!(matches!(error, ModelError::RateLimited { .. }));
         assert_eq!(provider.rate_limiter_handle().rate_limited_count(), 1);
+
+        server
+            .join()
+            .map_err(|_| TestError::Unexpected("mock server thread panicked".to_owned()))??;
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn respond_quota_exceeded_429_still_sets_pacing_cooldown() -> TestResult {
+        // Regression: eine 429-Antwort mit Kontingent-Fehlercode (klassifiziert
+        // als `ModelError::QuotaExceeded`, nicht `RateLimited`) muss dieselbe
+        // gemeinsame Abkühlphase setzen wie ein „normales" 429 — siehe
+        // `respond_once`, das den Aufruf jetzt vor der Klassifikation
+        // ausführt (mirrort `lib.rs::respond`).
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+        use std::thread;
+
+        let listener = TcpListener::bind("127.0.0.1:0").map_err(ctx("bind mock server"))?;
+        let base_url = format!(
+            "http://{}/v1/messages",
+            listener.local_addr().map_err(ctx("mock address"))?
+        );
+        let server = thread::spawn(move || -> TestResult {
+            let (mut stream, _) = listener.accept().map_err(ctx("accept mock request"))?;
+            let mut request_buffer = [0_u8; 4096];
+            let _read = stream
+                .read(&mut request_buffer)
+                .map_err(ctx("read mock request"))?;
+            let body = br#"{"type":"error","error":{"type":"insufficient_quota","message":"quota exceeded"}}"#;
+            let headers = format!(
+                "HTTP/1.1 429 Too Many Requests\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\nretry-after: 5\r\n\r\n",
+                body.len()
+            );
+            stream
+                .write_all(headers.as_bytes())
+                .map_err(ctx("write mock response headers"))?;
+            stream
+                .write_all(body)
+                .map_err(ctx("write mock response body"))?;
+            Ok(())
+        });
+
+        let provider = AnthropicMessagesProvider::new(
+            base_url,
+            "configured-model",
+            AnthropicCredential::ApiKey(SecretString::new("sk-secret".into())),
+        )
+        .map_err(ctx("AnthropicMessagesProvider::new"))?;
+
+        assert_eq!(ModelProvider::pacing_wait(&provider), None);
+        let response = provider.respond(request_with_ids(None, None)).await;
+        let Err(error) = response else {
+            return Err(TestError::Unexpected(
+                "quota-exceeded 429 must surface as an error".to_owned(),
+            ));
+        };
+        assert!(
+            matches!(error, ModelError::QuotaExceeded { .. }),
+            "expected QuotaExceeded, got {error:?}"
+        );
+        let wait = ModelProvider::pacing_wait(&provider)
+            .ok_or(TestError::Missing("pacing_wait after quota-exceeded 429"))?;
+        assert!(!wait.is_zero());
+        assert!(
+            wait <= Duration::from_secs(5),
+            "wait {wait:?} exceeds the 5 s retry-after hint"
+        );
 
         server
             .join()

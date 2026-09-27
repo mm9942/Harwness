@@ -22,6 +22,7 @@
 //! ([`crate::model::ModelError`]).
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use crate::model::{ModelFuture, ModelProvider, ModelRequest};
 use harw_types::{ModelId, ProviderId};
@@ -86,9 +87,10 @@ impl ModelProvider for PinnedModelProvider {
     /// gepinnten Werten (sofern gesetzt) und delegiert dann an `inner`.
     ///
     /// # Description
-    /// Neben `respond` überschreibt der Wrapper nur
-    /// [`ModelProvider::pinned_model_id`] (siehe unten); weitere Methoden hat
-    /// der Trait nicht.
+    /// Neben `respond` überschreibt der Wrapper
+    /// [`ModelProvider::pinned_model_id`] und
+    /// [`ModelProvider::pinned_provider_id`] (Pin, sonst innerer Wert) und
+    /// reicht [`ModelProvider::pacing_wait`] unverändert an `inner` durch.
     ///
     /// # Arguments
     /// - `request` (`ModelRequest`): der Request, dessen `model_id`/
@@ -138,15 +140,39 @@ impl ModelProvider for PinnedModelProvider {
             None => self.inner.pinned_provider_id(),
         }
     }
+
+    /// Reicht die Pacing-Wartezeit des inneren Providers unverändert durch;
+    /// das Pinnen von Modell-/Provider-ID ändert dessen Limits nicht.
+    fn pacing_wait(&self) -> Option<Duration> {
+        self.inner.pacing_wait()
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::history::ConversationHistory;
+    use crate::model::EchoModelProvider;
     use crate::test_support::{TestError, TestResult};
     use crate::testing::RecordingModelProvider;
     use harw_extension_api::LoadedInstructions;
+
+    /// Innerer Fake mit fester Pacing-Wartezeit; `respond` delegiert an
+    /// [`EchoModelProvider`].
+    struct PacedModel {
+        echo: EchoModelProvider,
+        wait: Option<Duration>,
+    }
+
+    impl ModelProvider for PacedModel {
+        fn respond<'a>(&'a self, request: ModelRequest) -> ModelFuture<'a> {
+            self.echo.respond(request)
+        }
+
+        fn pacing_wait(&self) -> Option<Duration> {
+            self.wait
+        }
+    }
 
     fn make_request() -> ModelRequest {
         let instructions = LoadedInstructions {
@@ -232,5 +258,16 @@ mod tests {
         ));
         let outer = PinnedModelProvider::new(inner_pinned, None, None);
         assert_eq!(outer.pinned_model_id().as_deref(), Some("inner-model"));
+    }
+
+    #[test]
+    fn test_pacing_wait_forwards_the_inner_provider_wait() {
+        let inner: Arc<dyn ModelProvider> = Arc::new(PacedModel {
+            echo: EchoModelProvider::default(),
+            wait: Some(Duration::from_millis(250)),
+        });
+        let provider =
+            PinnedModelProvider::new(inner, Some(ProviderId::from("p")), Some(ModelId::from("m")));
+        assert_eq!(provider.pacing_wait(), Some(Duration::from_millis(250)));
     }
 }

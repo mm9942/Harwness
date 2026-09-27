@@ -6,13 +6,13 @@
 > sandboxed `VerificationExecutor` (`harw-plan-bridge/src/verify_exec.rs`)
 > and the `work_driver.enqueue` / `.status` / `.stop` operations
 > (`harw-ops/src/work_driver.rs`), which admit, observe and cancel a
-> durable job of kind `work_driver`. Not yet in the tree: the job worker
-> that claims such a job and executes one driver round per claim
-> (`harw-cli/src/job_worker.rs` handles Kanban jobs only), and admission of
-> the `work_driver.*` tools into a custom orchestrator's tool list (a
+> durable job of kind `work_driver`, and the job worker under `harw serve`
+> that executes one driver round per claim
+> (`harw-cli/src/job_worker_work_driver.rs`), with sandboxed verification
+> (§6) and provider pacing (§5). Not yet in the tree: admission of the
+> `work_driver.*` tools into a custom orchestrator's tool list (a
 > definition that extends `child-orchestrator-base@1` inherits the base's
-> `[tools]`, and the runtime clamps it under that base). Until both land, an
-> enqueued run is recorded and observable but does not advance.
+> `[tools]`, and the runtime clamps it under that base).
 
 The WorkDriver is a supervisor loop. Given the current `Active` goal, it
 hands small, isolated pieces of work to worker agents, runs one central
@@ -221,6 +221,20 @@ Every limit is absolute: reached means `GiveUp`.
 The token and wall-clock budgets are also written into the durable job's
 budget, so the job ledger enforces them independently of the driver.
 
+**Provider limits.** Workers share the service's provider instance and its
+rate limiter. The job worker respects the provider's limits instead of
+working around them ([DEC-003](../planning/70-decisions/DEC-003-provider-limits.md)):
+
+- **Pacing:** before each wave chunk it awaits
+  `ModelProvider::pacing_wait()` — the wait that header-reported limits, a
+  429 cooldown and the configured TPM/RPM budgets demand.
+- **Wave width (AIMD):** at most the provider's concurrency minus one slot
+  for orchestrator and judge; halved after an HTTP 429, +1 after a clean
+  wave.
+- **429 back-off:** a 429 is not a worker failure; the worker's session
+  continues after `Retry-After` or an exponential, capped back-off, without
+  using up an attempt.
+
 ## 6. Verification
 
 `VerificationExecutor` runs one verification per call over a list of
@@ -232,7 +246,19 @@ evidence:
   sandbox profile `SandboxProfileName::WorkspaceBuild` and
   `SandboxRequirement::Required`; the
   coordinator refuses to start it if the backend cannot enforce every
-  dimension. Without a sandbox backend the result is `Unverifiable`.
+  dimension. Under `harw serve` the job worker builds this coordinator
+  itself: backend is the Landlock trampoline `harw-job-exec` (next to the
+  `harw` binary or on `PATH`), else `bwrap`; job records go to
+  `<home>/jobs/verify`, the workspace root is the `serve` working
+  directory, and the environment is reduced to `PATH`, `HOME`,
+  `CARGO_HOME` and `RUSTUP_HOME`. Without a sandbox backend every command
+  step escalates as `Unverifiable`; it never runs unsandboxed. The job is
+  always `Required`, which includes enforced resource limits: set
+  `HARW_VERIFY_CGROUP_ROOT` to a delegated cgroup v2 root (for example a
+  `Delegate=yes` subgroup of the `harw serve` unit). Without one, commands
+  also come back `Unverifiable`.
+- Only one verification runs per workspace at a time: the executor holds
+  an exclusive lock on `<workspace>/.harw/verify.lock`.
 - The executor additionally checks the returned sandbox report; if it is
   not fully enforced, the result is discarded as `Unverifiable` even when
   the exit code matches.

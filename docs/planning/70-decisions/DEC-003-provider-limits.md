@@ -60,6 +60,17 @@ Backoff-Budget.
   anschließen, sonst bleibt der Pacer für sie wirkungslos und es bleibt nur
   reaktives 429-Backoff.
 
+## Umsetzung R15
+Proaktives Pacing läuft jetzt über die Trait-Methode
+`ModelProvider::pacing_wait()` mit Default `None`, sodass bestehende
+Provider unverändert bleiben. HTTP-Provider melden das Maximum aus der
+Wartezeit ihres `ProviderRateLimiter` (Kontingent-Header bzw.
+429-Cooldown) und der Vorschau des konfigurierten Budgets
+(`preview_wait`). Wrapper-Provider reichen den Wert durch, der Router fragt
+seinen Default-Backend-Provider. Der Work Driver pausiert vor jedem
+Wellen-Chunk um die gemeldete Wartezeit, statt erst auf ein 429 zu
+reagieren.
+
 ## Wo im Code
 - `harw-config/src/provider_toml.rs` — `ProviderToml::max_concurrency`,
   Validierung gegen `max_concurrency = 0`; `rate_limit.max_concurrent`.
@@ -68,6 +79,7 @@ Backoff-Budget.
 - `harw-provider-http/src/retry.rs` — `RetryPolicy::rate_limit_budget`,
   `rate_limit_backoff_delay`, `rate_limit_decision`, `ModelError::RateLimited`.
 - `harw-plan-bridge/src/work_driver.rs` — `WorkDriveInput::effective_parallel`.
+- `harw-core/src/model.rs` — `ModelProvider::pacing_wait` (Default `None`).
 
 ## Verwandt
 - [DEC-004 Keine parallelen Builds](DEC-004-no-parallel-builds.md)

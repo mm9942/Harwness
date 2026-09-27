@@ -631,6 +631,22 @@ pub trait ModelProvider: Send + Sync {
     fn pinned_provider_id(&self) -> Option<String> {
         None
     }
+
+    /// Wie lange der nächste Request warten soll, damit die Limits dieses
+    /// Providers halten (per Header gemeldete Limits, 429-Cooldown,
+    /// konfigurierte TPM/RPM-Budgets).
+    ///
+    /// # Description
+    /// Seiteneffektfrei: die Abfrage verbraucht kein Budget und verändert
+    /// keinen Zustand. Aufrufer warten die Dauer ab, bevor sie Arbeit starten
+    /// (z. B. eine Welle des Work-Drivers). Wrapper-Provider sollen den Wert
+    /// ihres inneren Providers weiterreichen. Default: `None` (keine Wartezeit).
+    ///
+    /// # Returns
+    /// Die empfohlene Wartezeit oder `None`, wenn nicht gewartet werden muss.
+    fn pacing_wait(&self) -> Option<std::time::Duration> {
+        None
+    }
 }
 
 /// Fehler eines Modell-Aufrufs.
@@ -1167,6 +1183,25 @@ mod tests {
         assert_eq!(provider.pinned_model_id(), None);
         let as_dyn: &dyn ModelProvider = &provider;
         assert_eq!(as_dyn.pinned_model_id(), None);
+    }
+
+    /// Minimaler Provider, der nur `respond` implementiert und alle übrigen
+    /// Trait-Methoden beim Default belässt.
+    struct DefaultsOnlyProvider;
+
+    impl ModelProvider for DefaultsOnlyProvider {
+        fn respond<'a>(&'a self, _request: ModelRequest) -> ModelFuture<'a> {
+            Box::pin(async { Ok(ModelResponse::default()) })
+        }
+    }
+
+    #[test]
+    fn test_model_provider_pacing_wait_defaults_to_none() {
+        let provider = DefaultsOnlyProvider;
+        assert_eq!(provider.pacing_wait(), None);
+        let as_dyn: &dyn ModelProvider = &provider;
+        assert_eq!(as_dyn.pacing_wait(), None);
+        assert_eq!(EchoModelProvider::default().pacing_wait(), None);
     }
 
     #[test]

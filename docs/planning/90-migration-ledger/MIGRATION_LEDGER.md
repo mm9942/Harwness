@@ -238,3 +238,29 @@
 - A sandboxed verify runner for the work driver under `harw serve` (C-09).
 - A provider pacing hook for TPM (C-06).
 - Preventive path-level write rights (DEC-009 proposal, C-08).
+
+## MIG-015 — R15: sandboxed verify, proactive provider pacing, CryptGuard from crates.io
+
+**Status:** round R15 complete on branch `claude/r15-verify-pacing`, still an uncommitted working-tree diff at the time of writing — pending the one central build/test run and the merge to `dev`. `origin/dev` HEAD (`02401aa`) does not contain any of this delta yet.
+
+**Landed delta (on the branch, not yet merged):**
+- **C-09, sandboxed verify for the work driver:**
+  - `harw-cli/src/verify_sandbox.rs` builds a `CoordinatorVerifyRunner` from `FsJobRecordStore` and `LinuxExecutor`, with the Landlock trampoline `harw-job-exec` and bwrap as the fallback.
+  - `harw serve` puts it into `JobWorkerContext.verify_runner`.
+  - Without a backend, Command steps still escalate as unverifiable; they never run unsandboxed.
+- **C-06, proactive pacing:**
+  - `ModelProvider::pacing_wait()` has a default of `None`. The HTTP providers return the larger of the rate limiter wait (headers or 429 cooldown) and the configured budget preview (`preview_wait`).
+  - The wrappers forward it; the router asks its default backend.
+  - The work driver pauses before each wave chunk (the pause can be cancelled).
+- **CryptGuard 3.1.0 now comes from crates.io instead of git.** `deny.toml` no longer allows any git source. The KATs and the frozen V1/V2 fixtures are unchanged.
+
+**Verification:** not yet run. Per the repository's build rule, only the main session builds once, after every agent has finished, over the complete combined state. Once that central build has run green, append the actual results here (matching the MIG-014 pattern) before changing the status to LANDED:
+- `cargo fmt --all` clean.
+- `cargo test --workspace` (incl. doc tests): pass/fail counts.
+- DoD crates, package-scoped `--locked`: pass/fail counts.
+- clippy `-D warnings`, `cargo run -q -p xtask -- gates`, `cargo deny check`, `actionlint`: green/red.
+
+**Remaining:**
+- Merge to `dev` once the central build above is green.
+- Preventive path-level write rights (DEC-009 proposal, C-08).
+- A cloud home proposal (DEC-010, C-10).

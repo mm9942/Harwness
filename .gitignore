@@ -71,3 +71,6 @@ __pycache__/
 
 # Obsidian vault state (docs/planning is used as a vault; notes are versioned, UI state is not)
 .obsidian/
+
+# Gap-hunt kit: local verifier counter state
+.gap-hunt-verify-counter.state
