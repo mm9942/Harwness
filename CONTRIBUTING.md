@@ -76,10 +76,13 @@ full target list.
 
 ## What CI runs
 
-Every pull request runs the following (see
+CI runs the following (see
 [`.github/workflows/ci.yml`](.github/workflows/ci.yml)); path filters skip
 jobs that cannot be affected by a given change, but a full run covers all of
-them:
+them. While GitHub Actions is unavailable for this repository, CI is started
+by hand only (`workflow_dispatch`) and the local central build described in
+`CLAUDE.md` is the gate; the push and pull-request triggers are commented out
+in `ci.yml` and come back once Actions runs again:
 
 - `cargo fmt --all -- --check` — formatting.
 - `cargo clippy --workspace --tests -- -D warnings` — lints, warnings treated
