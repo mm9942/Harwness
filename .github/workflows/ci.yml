@@ -2,7 +2,10 @@ name: CI
 
 on:
   push:
-    branches: [main]
+    # `Dev` is the integration branch; `main` remains the stable line.
+    # Run the same CI on both so changes cannot sit on Dev without a full
+    # repository validation run.
+    branches: [main, Dev]
   # Alle PRs, auch gestapelte (Basis ist ein anderer Feature-Branch).
   pull_request:
     types: [opened, synchronize, reopened, labeled]
