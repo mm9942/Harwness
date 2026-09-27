@@ -155,7 +155,7 @@ Proposed titles without final numbers. They would start at DEC-028 or later, and
 
 1. Hooks are veto-only and fail closed. The Claude Code/Codex wire is an adapter, not the core.
 2. Stop gates can only block stopping. Achieve and abandon stay command-only, and continuations are bounded.
-3. Structured output at the wire uses a harw-owned schema type, with the post-hoc validator kept as a backstop.
+3. Structured output at the wire uses a harw-owned schema type, with the post-hoc validator kept as a backstop. Contract: [structured-output.md](structured-output.md).
 4. The headless contract: one shared encoder, framed per DEC-012, plus a terminal `result`, reusing the runner's exit codes. exec never asks a human; deny rules win in every mode.
 5. Cost authority: per-response usage × price data is authoritative, because reserve/reconcile needs it synchronously. Provider billing APIs and AI Gateway figures are asynchronous cross-checks. Prices are route-keyed data (`prices.toml`, `harw-cost` types) with cache-read and cache-write fields, and the cost state survives resume. This extends DEC-025.
 6. No per-run concurrency caps. The ledger holds provider slots (DEC-003/023) *and* node capacity (CPUs − 2, plus a `BuildSlot` of 1 per workspace, DEC-004). All fan-out (workflows, subagents, schedules) takes ledger leases, and the ledger may only lower `ChildLimits` fan-out. Per-run caps go away, so the parallel cut (P6) stops being a workaround.
