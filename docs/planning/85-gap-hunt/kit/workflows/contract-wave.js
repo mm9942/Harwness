@@ -5,7 +5,7 @@ export const meta = {
   phases: [
     { title: 'Contract', detail: 'Opus writes one contract per cluster: per-file edits, exact signatures, tests' },
     { title: 'Code', detail: 'one focused-coder per file, edits only that file' },
-    { title: 'Review', detail: 'Opus checks the whole cluster diff against its contract; one repair pass per file' },
+    { title: 'Review', detail: 'Opus checks the whole cluster diff against its contract; one repair pass per file, then an Opus re-review' },
   ],
 }
 
@@ -94,7 +94,7 @@ Write a contract that one coder per file can follow without talking to the other
   async (contract, c) => {
     if (!contract) { reports.push({ id: c.id, status: 'no-contract' }); return null }
     if (!contract.feasible) { reports.push({ id: c.id, status: 'needs-decision', decisions: contract.decisions_needed, summary: contract.summary }); return null }
-    const coded = (await parallel(contract.files.map(fp => () => agent(`${CONTEXT}
+    const codedAll = await parallel(contract.files.map(fp => () => agent(`${CONTEXT}
 
 You are a focused coder. Edit ONLY this one file: ${norm(fp.file)}. Use the Edit tool (no temp files). Never commit. Other coders edit the other files of this contract at the same time; do not touch them.
 Contract for cluster ${c.id}: ${contract.summary}
@@ -103,7 +103,10 @@ ${fp.instructions}
 Tests to add in this file: ${fp.tests.join('; ') || 'none'}
 Other files in this contract and what they do: ${contract.files.filter(o => o.file !== fp.file).map(o => `${norm(o.file)}: ${o.instructions.slice(0, 300)}`).join(' | ') || 'none'}
 Update every doc/comment in this file that describes the changed behaviour. If the contract cannot be followed exactly, do the closest safe thing and list it under deviations.`,
-      { label: `code:${norm(fp.file)}`, phase: 'Code', schema: CODED, agentType: 'focused-coder' })))).filter(Boolean)
+      { label: `code:${norm(fp.file)}`, phase: 'Code', schema: CODED, agentType: 'focused-coder' })))
+    const coded = codedAll.filter(Boolean)
+    // One coder result per contracted file, or the cluster is not done.
+    const missingCoders = contract.files.filter((fp, i) => !codedAll[i]).map(fp => norm(fp.file))
     const review = await agent(`${CONTEXT}
 
 You review one contract wave cluster. Read \`${GIT} diff -- ${contract.files.map(f => norm(f.file)).join(' ')}\` and the contract below. Do not edit.
@@ -117,17 +120,43 @@ Check: every finding is really fixed; the files agree with each other (signature
     const problems = (review && review.problems) || []
     const byFile = {}
     for (const p of problems) (byFile[norm(p.file)] = byFile[norm(p.file)] || []).push(p.problem)
-    const repairs = (await parallel(Object.entries(byFile).map(([file, ps]) => () => agent(`${CONTEXT}
+    const repairTargets = Object.entries(byFile)
+    const repairsAll = await parallel(repairTargets.map(([file, ps]) => () => agent(`${CONTEXT}
 
 You are a repair coder. Edit ONLY this one file: ${file} (Edit tool, never commit). The cluster reviewer found:
 - ${ps.join('\n- ')}
 Contract ${c.id}: ${contract.summary}
 Fix these minimally. If a problem needs another file, report it under deviations instead.`,
-      { label: `repair:${file}`, phase: 'Review', schema: CODED, agentType: 'focused-coder' })))).filter(Boolean)
-    reports.push({ id: c.id, status: review ? (review.ok ? 'ok' : 'repaired') : 'no-review', summary: contract.summary, files: contract.files.map(f => norm(f.file)), coded, problems, repairs })
+      { label: `repair:${file}`, phase: 'Review', schema: CODED, agentType: 'focused-coder' })))
+    const repairs = repairsAll.filter(Boolean)
+    const missingRepairs = repairTargets.filter((rt, i) => !repairsAll[i]).map(([file]) => file)
+    const base = { id: c.id, summary: contract.summary, files: contract.files.map(f => norm(f.file)), coded, problems, repairs }
+    // Fail closed: a missing coder, review or repair never reads as done, and a
+    // repaired cluster counts only after a second review of the whole diff.
+    if (missingCoders.length) { reports.push({ ...base, status: 'unresolved', reason: `no coder result for ${missingCoders.join(', ')}` }); return null }
+    if (!review) { reports.push({ ...base, status: 'unverified', reason: 'no cluster review' }); return null }
+    if (review.ok) { reports.push({ ...base, status: 'ok' }); return null }
+    if (!problems.length) { reports.push({ ...base, status: 'unverified', reason: 'review returned ok=false without naming a problem' }); return null }
+    if (missingRepairs.length) { reports.push({ ...base, status: 'unresolved', reason: `no repair result for ${missingRepairs.join(', ')}` }); return null }
+    const recheck = await agent(`${CONTEXT}
+
+You re-review one contract wave cluster after its repair pass. Read \`${GIT} diff -- ${contract.files.map(f => norm(f.file)).join(' ')}\`. Do not edit.
+Contract ${c.id}: ${contract.summary}
+${contract.files.map(f => `- ${norm(f.file)}: ${f.instructions}`).join('\n')}
+The first review found:
+${problems.map(p => `- ${norm(p.file)}: ${p.problem}`).join('\n')}
+Repair reports: ${JSON.stringify(repairs)}
+Check that every problem is resolved, that the files still agree with each other and with the contract, and that the repairs introduced nothing new. ok=false only with concrete problems, each tied to one file.`,
+      { label: `rereview:${c.id}`, phase: 'Review', schema: REVIEW, model: 'opus', agentType: 'focused-explorer' })
+    if (!recheck) { reports.push({ ...base, status: 'unresolved', reason: 'no re-review after repair' }); return null }
+    reports.push({ ...base, status: recheck.ok ? 'repaired' : 'unresolved', rereview: recheck, reason: recheck.ok ? undefined : 're-review still finds problems' })
     return null
   },
 )
 
-log(`${A.key}: ${reports.filter(r => r.status === 'ok' || r.status === 'repaired').length} clusters done, ${reports.filter(r => r.status === 'needs-decision').length} need a decision`)
-return { key: A.key, reports }
+const done = reports.filter(r => r.status === 'ok' || r.status === 'repaired')
+const clusterIds = (A.clusters || []).map(c => c.id)
+const missing = clusterIds.filter(id => !reports.some(r => r.id === id))
+const complete = missing.length === 0 && done.length === clusterIds.length
+log(`${A.key}: ${complete ? 'complete' : 'NOT complete'}; ${done.length}/${clusterIds.length} clusters done, ${reports.filter(r => r.status === 'needs-decision').length} need a decision${missing.length ? `, no report for ${missing.join(', ')}` : ''}`)
+return { key: A.key, complete, missing, reports }

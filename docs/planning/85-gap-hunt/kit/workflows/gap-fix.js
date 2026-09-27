@@ -4,7 +4,7 @@ export const meta = {
   whenToUse: 'After gap-hunt-area runs were consolidated. Pass findings for a DISJOINT file set; run several gap-fix workflows in parallel only if their file sets do not overlap. Multi-file findings go to a contract wave instead.',
   phases: [
     { title: 'Fix', detail: 'one agent per file, edits only that file' },
-    { title: 'Review', detail: 'adversarial review + one repair pass' },
+    { title: 'Review', detail: 'adversarial review, one repair pass, re-review of the repair' },
     { title: 'Ripple', detail: 'Opus cross-file consistency check over the diff (read-only)' },
   ],
 }
@@ -98,25 +98,44 @@ Add or adjust tests in this file's test module where sensible. Keep public signa
     { label: `fix:${file}`, phase: 'Fix', schema: FIXED, model: fs.some(f => f.severity === 'critical' || f.severity === 'high') ? 'opus' : 'sonnet', agentType: 'focused-coder' }),
   (fixRes, [file, fs]) => {
     if (fixRes) fixReports.push(fixRes)
-    return agent(`${CONTEXT}
+    const review = agent(`${CONTEXT}
 
 You are an adversarial reviewer of a just-made fix. File: ${file}. Inspect \`${GIT} diff -- ${file}\` (it may contain earlier unrelated edits; focus on these findings):
 ${fs.map(f => `- ${f.title}: ${f.fix}`).join('\n')}
 Fixer report: ${JSON.stringify(fixRes || {})}
 Check by reading: the defect is really fixed; no new bug; binding rules hold; cfgs compile on all target platforms; no dead code that clippy -D warnings rejects; callers in other files still compile (grep); comment language matches. Do not edit. ok=false only with concrete problems.${REVIEW_RULES}`,
       { label: `review:${file}`, phase: 'Review', schema: REVIEW, model: 'sonnet', agentType: 'focused-explorer' })
+    return review.then(rev => ({ rev, fixRes }))
   },
-  async (rev, [file]) => {
+  // A file is done only with a fixer report AND a successful review. A missing
+  // agent (session limit, crash) never counts as success: it stays
+  // `unverified`; a repair is re-reviewed before it counts as `repaired`.
+  async ({ rev, fixRes }, [file, fs]) => {
     if (rev) reviewReports.push({ file, ...rev })
-    if (!rev || rev.ok || !rev.problems.length) return { file, ok: true }
+    if (!fixRes) return { file, status: 'unverified', reason: 'no fixer report' }
+    if (!rev) return { file, status: 'unverified', reason: 'no review' }
+    if (rev.ok) return { file, status: 'ok' }
+    if (!(rev.problems || []).length) return { file, status: 'unverified', reason: 'review returned ok=false without naming a problem' }
     const repair = await agent(`${CONTEXT}
 
 You are a repair fixer. Edit ONLY this one file: ${file} (Edit tool, no temp files, never commit). A reviewer found these problems in the latest changes to it:
 - ${rev.problems.join('\n- ')}
 Fix them minimally. Do not widen scope: if a problem needs another file, report it instead.${FIX_RULES}`,
       { label: `repair:${file}`, phase: 'Review', schema: FIXED, model: 'sonnet', agentType: 'focused-coder' })
-    if (repair) fixReports.push({ ...repair, repair: true })
-    return { file, ok: false, repaired: Boolean(repair) }
+    if (!repair) return { file, status: 'unresolved', reason: 'repair agent did not answer', problems: rev.problems }
+    fixReports.push({ ...repair, repair: true })
+    const recheck = await agent(`${CONTEXT}
+
+You re-review a repaired fix. File: ${file}. Inspect \`${GIT} diff -- ${file}\`. The first review found:
+- ${rev.problems.join('\n- ')}
+Repair report: ${JSON.stringify(repair)}
+Findings the file must fix:
+${fs.map(f => `- ${f.title}: ${f.fix}`).join('\n')}
+Check that every problem above is resolved and that the repair introduced no new one. Do not edit. ok=false only with concrete problems.${REVIEW_RULES}`,
+      { label: `rereview:${file}`, phase: 'Review', schema: REVIEW, model: 'sonnet', agentType: 'focused-explorer' })
+    if (!recheck) return { file, status: 'unresolved', reason: 'no re-review after repair', problems: rev.problems }
+    reviewReports.push({ file, rereview: true, ...recheck })
+    return recheck.ok ? { file, status: 'repaired' } : { file, status: 'unresolved', reason: 're-review still finds problems', problems: recheck.problems }
   },
 )
 
@@ -129,4 +148,11 @@ You are the cross-file consistency checker. Files just changed by one-file fixer
     { label: `ripple:${A.key || 'batch'}`, phase: 'Ripple', schema: RIPPLE, model: 'opus', agentType: 'focused-explorer' })
 }
 
-return { key: A.key || 'batch', files: results.filter(Boolean), fixReports, reviewReports, ripple: ripple ? ripple.items : null }
+// Completion signal for committing/merging the wave: every file ok or
+// repaired-and-re-reviewed, and the ripple check answered (when it ran).
+const files = groups.map(([file], i) => results[i] || { file, status: 'unverified', reason: 'pipeline item dropped' })
+const open = files.filter(f => f.status !== 'ok' && f.status !== 'repaired')
+const rippleStatus = A.ripple === false || !groups.length ? 'skipped' : (ripple ? 'ok' : 'missing')
+const complete = open.length === 0 && rippleStatus !== 'missing'
+log(`${A.key || 'batch'}: ${complete ? 'complete' : 'NOT complete'}; ${files.length - open.length}/${files.length} files done, ripple ${rippleStatus}`)
+return { key: A.key || 'batch', complete, open, files, fixReports, reviewReports, rippleStatus, ripple: ripple ? ripple.items : null }
