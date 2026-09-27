@@ -108,7 +108,7 @@ ClientFinish {Sig_C(T("client-signs"))}                →
 | Stale or pre-dated messages | `Tc` / `Ts` must lie within ±30 s (`HandshakePolicy::max_clock_skew`) |
 | Reflection (one side's signature presented as the other's) | role label `server-signs` / `client-signs` in the transcript |
 | Mis-addressed connection | server refuses a hello whose `server_id` is not its own; client refuses a server whose id differs from the one it dialled |
-| Cross-protocol use of the node key | fixed domain prefix `TRANSCRIPT_DOMAIN`; `AuthHubNodeSigner` and the hub's own usage policy each permit the node-identity key to sign only payloads with that prefix (masterplan §5: the KMS must not become a signing oracle) |
+| Cross-protocol use of the node key | fixed domain prefix `TRANSCRIPT_DOMAIN`; `AuthHubNodeSigner` refuses any payload without that prefix before it ever reaches the hub, and the hub's own usage policy separately permits the node-identity key to sign only `NodeHandshake` `SignTranscript`s (masterplan §5: the KMS must not become a signing oracle) |
 | Resource exhaustion | handshake deadline (10 s), 16 KiB frame cap before allocation, connection limit (256), HTTP header read timeout (30 s) |
 
 A failed verification is never recorded in the replay cache, so an attacker
@@ -154,13 +154,22 @@ There is no per-frame signature.
 
 ## Not in this crate (yet)
 
-* Missing: an `impl AuthHubSign for AuthHubClient` (or other adapter
-  bridging `AuthHubClient::sign(&KeyRef, &[u8])` to this trait's
-  `sign_with_key(namespace, key_id, message)`). `AuthHubClient::sign`
+* Missing: the production `AuthHubSign` adapter bridging
+  `AuthHubClient::sign(&KeyRef, &[u8])` to this trait's
+  `sign_with_key(namespace, key_id, message)`. `AuthHubClient::sign`
   already exists; `harw-infra-client` is the only crate allowed to dial the
-  hub (masterplan §11/§24/§34 H4), so the adapter lands there, or here
-  behind a `harw-infra-client` dependency. Enrollment / distribution of
-  `PinnedPeers` keys is likewise still outside this crate.
+  hub (masterplan §11/§24/§34 H4). The adapter cannot land there:
+  `harw-infra-client` is layer I (`xtask/arch-policy.toml`) and layer I may
+  depend only on `F` and `I`, so it cannot depend back on this crate (layer
+  A) to implement this crate's `AuthHubSign` trait. It is a small
+  `AuthHubSign` impl (build `KeyRef::latest(namespace, key_id)`, which can
+  fail; call `AuthHubClient::sign`; map both errors to `SignerError`; box
+  the call into a `SignFuture`), either here behind a `harw-infra-client`
+  dependency (layer A may depend on anything), or on a newtype around
+  `AuthHubClient` at the composition root: the orphan rule forbids a direct
+  `impl AuthHubSign for AuthHubClient` in a crate that owns neither the
+  trait nor the type (see `src/authhub_signer.rs`). Enrollment /
+  distribution of `PinnedPeers` keys is likewise still outside this crate.
 * Pin rotation and revocation lists beyond `PinnedPeers::unpin`.
 * A long-lived application-level channel (`ChannelId` actor, CryptGuard
   plan §29): TLS 1.3 already provides directional AEAD keys and sequence

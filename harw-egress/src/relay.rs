@@ -33,10 +33,17 @@
 //! Synchron mit `std::thread`: ein Thread je Verbindung plus ein Hilfsthread
 //! für die Gegenrichtung; die Zahl gleichzeitiger Verbindungen ist begrenzt.
 //! Kein async-Runtime, kein `Mutex` auf dem Datenpfad. Endet die
-//! Proxy→Client-Richtung (Proxy schließt, z. B. eigener Idle-Timeout), bekommt
-//! der Hilfsthread eine Lesefrist (`DEFAULT_RELAY_IDLE_POLL`) auf den
-//! Client: schreibt oder schließt der Client danach immer noch nicht, endet
-//! die Verbindung trotzdem, statt den Slot unbegrenzt zu belegen.
+//! Proxy→Client-Richtung (Proxy schließt, z. B. eigener Idle-Timeout), pollt
+//! der Hilfsthread den Client fortan mit `DEFAULT_RELAY_IDLE_POLL` als
+//! Lesefrist, gibt aber erst auf, wenn der Client nach diesem Ende mindestens
+//! [`DEFAULT_RELAY_IDLE_BUDGET`] ununterbrochen geschwiegen hat (Summe
+//! aufeinanderfolgender Lesefristen, die erst nach dem Ende der Proxy-Seite
+//! begonnen haben; jedes vom Client gelesene Byte setzt sie zurück, Schweigen
+//! davor zählt nicht). Das spiegelt die Leerlauf-Frist, die der Proxy selbst
+//! durchsetzt (`proxy.rs`, `pump`: EOF einer Richtung schließt nur diese
+//! Richtung halb, die andere läuft bis zum eigenen Idle-Timeout weiter) —
+//! ein Client, der nach einer Pause noch einmal sendet, wird also nicht
+//! abgeschnitten. Erst danach gibt der Hilfsthread den Slot frei.
 //!
 //! # Fehler
 //! Alle Fehler sind Varianten von [`RelayError`]; Fehler einzelner
@@ -81,12 +88,25 @@ pub const EXIT_CHILD_NOT_FOUND: u8 = 127;
 pub const EXIT_CHILD_NOT_EXECUTABLE: u8 = 126;
 /// Standardgrenze gleichzeitiger Verbindungen im Binary.
 pub const DEFAULT_RELAY_MAX_CONNECTIONS: usize = 128;
-/// Standard-Lesefrist für `client_read` in [`relay_connection`]: darüber
-/// merkt der Hilfsthread, dass die Proxy-Seite schon beendet ist, auch wenn
-/// der Client selbst weder schreibt noch schließt. Kein Policy-Timeout —
-/// der sitzt beim Proxy — sondern nur die Reaktionszeit dieses Relays, um
-/// den Verbindungs-Slot danach zuverlässig wieder freizugeben.
+/// Standard-Lesefrist für `client_read` in [`relay_connection`]: die
+/// Granularität, mit der der Hilfsthread nach dem Ende der Proxy-Seite
+/// prüft, ob der Client wieder etwas sendet. Für sich allein kein
+/// Policy-Timeout — erst zusammen mit [`DEFAULT_RELAY_IDLE_BUDGET`] ergibt
+/// sich die Frist, nach der der Hilfsthread wirklich aufgibt.
 pub const DEFAULT_RELAY_IDLE_POLL: Duration = Duration::from_millis(500);
+/// Standardbudget an ununterbrochenem Leerlauf auf `client_read`, bevor der
+/// Hilfsthread in [`relay_connection`] nach dem Ende der Proxy→Client-
+/// Richtung aufgibt: die Summe aufeinanderfolgender
+/// `DEFAULT_RELAY_IDLE_POLL`-Fristen, die nach dem Ende der Proxy-Seite
+/// begonnen haben, zurückgesetzt bei jedem vom Client gelesenen Byte. Der
+/// Wert spiegelt `ProxyLimits::default().idle_timeout` (300 s; ein Test in
+/// diesem Modul hält beide Werte gleich): Der Proxy toleriert Pausen bis zu
+/// dieser Frist, auch wenn er die Gegenrichtung schon beendet hat
+/// (`proxy.rs`, `pump`) — das Relay darf einen Client, der danach noch
+/// sendet, also nicht früher abschneiden. Kennt ein Aufrufer die tatsächlich
+/// konfigurierte Frist des Proxys, sollte er sie [`relay_connection`] statt
+/// dieses Defaults übergeben.
+pub const DEFAULT_RELAY_IDLE_BUDGET: Duration = Duration::from_secs(300);
 
 /// Kurzhilfe für stderr bei [`RelayError::Usage`].
 pub const RELAY_USAGE: &str =
@@ -247,12 +267,16 @@ pub fn bind_relay(port: u16) -> Result<TcpListener, RelayError> {
 ///
 /// # Description
 /// Nimmt Verbindungen in einer Schleife an. Je Verbindung startet ein Thread
-/// [`relay_connection`] mit `DEFAULT_RELAY_IDLE_POLL` als Lesefrist, damit
-/// eine Verbindung, deren Proxy-Seite schon beendet ist, ihren Slot auch bei
-/// einem stummen Client zuverlässig wieder freigibt. Ist `max_connections`
-/// erreicht, wird die neue Verbindung sofort geschlossen und
-/// [`RelayError::ConnectionLimit`] gemeldet. `accept`-Fehler werden gemeldet;
-/// danach wartet die Schleife kurz und macht weiter.
+/// [`relay_connection`] mit `DEFAULT_RELAY_IDLE_POLL` als Lesefrist und
+/// `DEFAULT_RELAY_IDLE_BUDGET` als Budget, damit eine Verbindung, deren
+/// Proxy-Seite schon beendet ist, ihren Slot nach diesem Budget (plus
+/// höchstens einer Lesefrist, die vor dem Ende der Proxy-Seite begann)
+/// zuverlässig wieder freigibt — nicht schon nach der ersten Lesefrist,
+/// damit ein Client, der nach einer Pause noch einmal sendet, nicht
+/// abgeschnitten wird. Ist `max_connections` erreicht, wird die neue
+/// Verbindung sofort geschlossen und [`RelayError::ConnectionLimit`]
+/// gemeldet. `accept`-Fehler werden gemeldet; danach wartet die Schleife kurz
+/// und macht weiter.
 ///
 /// # Arguments
 /// - `listener` (`TcpListener`): gebundener Loopback-Listener (Eigentum).
@@ -273,6 +297,28 @@ pub fn run_relay(
     proxy_socket: &Path,
     max_connections: usize,
     report: RelayReporter,
+) -> Infallible {
+    run_relay_with_idle(
+        listener,
+        proxy_socket,
+        max_connections,
+        report,
+        DEFAULT_RELAY_IDLE_POLL,
+        DEFAULT_RELAY_IDLE_BUDGET,
+    )
+}
+
+// Wie `run_relay`, aber mit einstellbarer Lesefrist und Leerlaufbudget: die
+// Produktionsvoreinstellungen setzt `run_relay`, Tests können hier kleinere
+// Werte einsetzen, ohne `DEFAULT_RELAY_IDLE_BUDGET` (300 s) abwarten zu
+// müssen.
+fn run_relay_with_idle(
+    listener: TcpListener,
+    proxy_socket: &Path,
+    max_connections: usize,
+    report: RelayReporter,
+    idle_poll: Duration,
+    idle_budget: Duration,
 ) -> Infallible {
     let proxy_socket: Arc<Path> = Arc::from(proxy_socket);
     let active = Arc::new(AtomicUsize::new(0));
@@ -298,7 +344,7 @@ pub fn run_relay(
             .name("harw-relay-conn".to_owned())
             .spawn(move || {
                 let _slot = slot;
-                if let Err(err) = relay_connection(client, &socket, DEFAULT_RELAY_IDLE_POLL) {
+                if let Err(err) = relay_connection(client, &socket, idle_poll, idle_budget) {
                     conn_report(&err);
                 }
             });
@@ -341,24 +387,30 @@ impl Drop for ConnectionSlot {
 /// # Description
 /// Verbindet sich mit `proxy_socket` und kopiert in beide Richtungen. Endet
 /// eine Richtung (EOF), wird die Schreibseite des Gegenübers halb
-/// geschlossen (`shutdown(Write)`), die andere Richtung läuft weiter. Endet
-/// die Proxy→Client-Richtung, bekommt `client_read` außerdem `idle_poll` als
-/// Lesefrist: läuft ein Lesevorgang danach in die Frist, prüft der
-/// Hilfsthread, ob die Proxy-Seite schon beendet ist, und gibt in dem Fall
-/// auf, statt unbegrenzt auf Daten oder ein Schließen durch den Client zu
-/// warten. Die Funktion kehrt zurück, wenn beide Richtungen beendet sind.
-/// Nutzdaten werden weder gelesen noch protokolliert.
+/// geschlossen (`shutdown(Write)`), die andere Richtung läuft weiter.
+/// `client_read` liest von Anfang an mit `idle_poll` als Lesefrist; solange
+/// die Proxy→Client-Richtung läuft, bleiben diese Lesefristen aber ohne
+/// Wirkung. Erst Lesefristen, deren Lesevorgang nach dem Ende dieser
+/// Richtung begann, summiert der Hilfsthread; jedes gelesene Byte setzt die
+/// Summe zurück. Erreicht sie `idle_budget`, gibt der Hilfsthread auf, statt
+/// unbegrenzt auf Daten oder ein Schließen durch den Client zu warten. Die
+/// Funktion kehrt zurück, wenn beide Richtungen beendet sind. Nutzdaten
+/// werden weder gelesen noch protokolliert.
 ///
 /// # Arguments
 /// - `client` (`TcpStream`): angenommene Verbindung (Eigentum).
 /// - `proxy_socket` (`&Path`): Unix-Socket des Egress-Proxys.
 /// - `idle_poll` (`Duration`): Lesefrist auf `client_read`, mit der der
-///   Hilfsthread erkennt, dass die Proxy-Seite bereits beendet ist (siehe
-///   `DEFAULT_RELAY_IDLE_POLL`).
+///   Hilfsthread nach dem Ende der Proxy-Seite prüft, ob der Client wieder
+///   sendet (siehe `DEFAULT_RELAY_IDLE_POLL`).
+/// - `idle_budget` (`Duration`): Mindestdauer, die der Client nach dem Ende
+///   der Proxy-Seite ununterbrochen schweigen muss, bevor der Hilfsthread
+///   aufgibt (siehe `DEFAULT_RELAY_IDLE_BUDGET`); sollte mindestens der
+///   Leerlauf-Frist des Proxys entsprechen.
 ///
 /// # Returns
 /// `Ok(())`, wenn beide Richtungen ohne I/O-Fehler endeten — auch, wenn die
-/// Client→Proxy-Richtung wegen `idle_poll` abgebrochen wurde, ohne dass der
+/// Client→Proxy-Richtung wegen `idle_budget` abgebrochen wurde, ohne dass der
 /// Client selbst geschlossen hat.
 ///
 /// # Errors
@@ -382,6 +434,7 @@ impl Drop for ConnectionSlot {
 ///     client,
 ///     Path::new("/run/harw/egress.sock"),
 ///     Duration::from_secs(1),
+///     Duration::from_secs(60),
 /// )?;
 /// # Ok::<(), Box<dyn std::error::Error>>(())
 /// ```
@@ -389,6 +442,7 @@ pub fn relay_connection(
     client: TcpStream,
     proxy_socket: &Path,
     idle_poll: Duration,
+    idle_budget: Duration,
 ) -> Result<(), RelayError> {
     let proxy = UnixStream::connect(proxy_socket).map_err(|source| RelayError::ProxyConnect {
         path: proxy_socket.to_path_buf(),
@@ -400,7 +454,9 @@ pub fn relay_connection(
     })?;
     // Ohne Lesefrist würde dieser Thread nach dem Ende der Gegenrichtung
     // unbegrenzt auf einen stummen Client warten (Befund: Slot blieb belegt,
-    // bis der Client selbst schreibt oder schließt).
+    // bis der Client selbst schreibt oder schließt). Die Frist selbst ist nur
+    // die Poll-Granularität für `idle_budget` unten, kein Abbruchgrund für
+    // sich allein.
     client_read
         .set_read_timeout(Some(idle_poll))
         .map_err(|source| RelayError::Copy {
@@ -416,8 +472,13 @@ pub fn relay_connection(
     let upstream = thread::Builder::new()
         .name("harw-relay-up".to_owned())
         .spawn(move || {
-            let copied =
-                copy_until_stopped(&mut client_read, &mut proxy_write, &upstream_proxy_gone);
+            let copied = copy_until_stopped(
+                &mut client_read,
+                &mut proxy_write,
+                &upstream_proxy_gone,
+                idle_poll,
+                idle_budget,
+            );
             half_close_unix(&proxy_write);
             copied.map_err(|source| RelayError::Copy {
                 direction: RelayDirection::ClientToProxy,
@@ -435,36 +496,69 @@ pub fn relay_connection(
             source,
         });
     half_close_tcp(&client_write);
-    // Die Proxy-Seite ist beendet (EOF oder Fehler): der Hilfsthread soll die
-    // Wartezeit auf den Client jetzt auf `idle_poll` begrenzen.
+    // Die Proxy-Seite ist beendet (EOF oder Fehler): der Hilfsthread beginnt
+    // jetzt, ununterbrochenen Leerlauf des Clients gegen `idle_budget` zu
+    // zählen, statt sofort nach der ersten Lesefrist aufzugeben (siehe
+    // `copy_until_stopped`). Lesefristen, die vor diesem Punkt begannen,
+    // zählen nicht.
     proxy_gone.store(true, Ordering::SeqCst);
 
     let upstream = upstream.join().map_err(|_| RelayError::ThreadPanicked)?;
     downstream.and(upstream)
 }
 
-// Wie `io::copy`, bricht aber ohne Fehler ab, sobald `stop` gesetzt ist und
-// der laufende Lesevorgang in die Lesefrist von `reader` läuft (siehe
-// `relay_connection`). So endet der Thread, sobald die Gegenrichtung fertig
-// ist, auch wenn der Reader selbst weder Daten liefert noch schließt.
-fn copy_until_stopped<R, W>(reader: &mut R, writer: &mut W, stop: &AtomicBool) -> io::Result<()>
+// Wie `io::copy`, bricht aber ohne Fehler ab, sobald der Reader nach `stop`
+// lange genug schweigt. `stop` markiert das Ende der Proxy→Client-Richtung
+// (siehe `relay_connection`). Nur Lesefristen, deren Lesevorgang erst nach
+// dem Setzen von `stop` begann, werden in Schritten von `idle_poll` addiert;
+// frühere Lesefristen, auch die, während derer `stop` umspringt, setzen die
+// Summe zurück, ebenso jedes gelesene Byte. Erreicht die Summe
+// `idle_budget`, endet die Richtung ohne Fehler — `Interrupted` wird wie bei
+// `io::copy` wiederholt, statt als Fehler durchgereicht zu werden.
+fn copy_until_stopped<R, W>(
+    reader: &mut R,
+    writer: &mut W,
+    stop: &AtomicBool,
+    idle_poll: Duration,
+    idle_budget: Duration,
+) -> io::Result<()>
 where
     R: io::Read,
     W: io::Write,
 {
     let mut buf = [0_u8; 8192];
+    let mut idle_elapsed = Duration::ZERO;
     loop {
+        // Vor dem Lesen festhalten, ob die Proxy-Seite schon beendet war: nur
+        // eine Lesefrist, die ganz nach `stop` begann, zählt gegen
+        // `idle_budget` (wie `pump` im Proxy, dessen Leerlauf-Frist mit jedem
+        // Ereignis, auch dem EOF der Gegenrichtung, neu beginnt).
+        let counting = stop.load(Ordering::SeqCst);
         match reader.read(&mut buf) {
             Ok(0) => return Ok(()),
-            Ok(n) => writer.write_all(&buf[..n])?,
+            Ok(n) => {
+                idle_elapsed = Duration::ZERO;
+                writer.write_all(&buf[..n])?;
+            }
+            Err(source) if source.kind() == io::ErrorKind::Interrupted => {
+                // Unterbrochener Systemaufruf, kein echter Leerlauf: einfach
+                // erneut versuchen, wie `io::copy` es auch tut.
+            }
             Err(source)
                 if matches!(
                     source.kind(),
                     io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
                 ) =>
             {
-                if stop.load(Ordering::SeqCst) {
-                    return Ok(());
+                if counting {
+                    idle_elapsed = idle_elapsed.saturating_add(idle_poll);
+                    if idle_elapsed >= idle_budget {
+                        return Ok(());
+                    }
+                } else {
+                    // Proxy-Seite läuft noch (oder endete erst während dieses
+                    // Lesevorgangs): Schweigen des Clients zählt noch nicht.
+                    idle_elapsed = Duration::ZERO;
                 }
             }
             Err(source) => return Err(source),
@@ -932,7 +1026,12 @@ mod tests {
             Ok(stream.read_to_end(&mut buf).map(|_| buf.len()))
         });
         let (accepted, _) = listener.accept().map_err(ctx("accept"))?;
-        let Err(err) = relay_connection(accepted, &socket, DEFAULT_RELAY_IDLE_POLL) else {
+        let Err(err) = relay_connection(
+            accepted,
+            &socket,
+            DEFAULT_RELAY_IDLE_POLL,
+            DEFAULT_RELAY_IDLE_BUDGET,
+        ) else {
             return Err(TestError::Unexpected("Socket fehlt: Err erwartet".into()));
         };
         assert!(matches!(err, RelayError::ProxyConnect { .. }), "{err:?}");
@@ -954,12 +1053,19 @@ mod tests {
         let addr = listener.local_addr().map_err(ctx("lokale Adresse"))?;
 
         // Der Client bleibt bewusst stumm: kein Write, kein Close, solange
-        // relay_connection läuft.
+        // relay_connection läuft. Ein kleines `idle_budget` (statt des
+        // 300-s-Defaults) hält den Test schnell, ohne den Zusammenhang
+        // zwischen `idle_poll` und `idle_budget` zu verändern.
         let silent_client = TcpStream::connect(addr).map_err(ctx("verbinden"))?;
         let (accepted, _) = listener.accept().map_err(ctx("accept"))?;
 
         let started = Instant::now();
-        let result = relay_connection(accepted, &socket, Duration::from_millis(50));
+        let result = relay_connection(
+            accepted,
+            &socket,
+            Duration::from_millis(50),
+            Duration::from_millis(50),
+        );
         let elapsed = started.elapsed();
         proxy
             .join()
@@ -993,8 +1099,17 @@ mod tests {
             // Testkanal; ein geschlossener Empfänger ist hier bedeutungslos.
             let _ = tx.send(err.to_string());
         });
+        // Eigenes, kleines Leerlaufbudget statt `DEFAULT_RELAY_IDLE_BUDGET`
+        // (300 s): `run_relay_with_idle` ist die interne Grundlage von
+        // `run_relay` und erlaubt genau das für Tests. Das Budget muss die
+        // feste Wartezeit von 100 ms vor der zweiten Verbindung deutlich
+        // übersteigen, sonst ist der Slot dort womöglich schon wieder frei.
+        let idle_poll = Duration::from_millis(30);
+        let idle_budget = Duration::from_millis(300);
         let relay_socket = socket.clone();
-        thread::spawn(move || run_relay(listener, &relay_socket, 1, report));
+        thread::spawn(move || {
+            run_relay_with_idle(listener, &relay_socket, 1, report, idle_poll, idle_budget)
+        });
 
         // Erster Client bleibt stumm und belegt den einzigen Slot.
         let silent_client = TcpStream::connect(addr).map_err(ctx("verbinden 1"))?;
@@ -1008,13 +1123,13 @@ mod tests {
         assert_eq!(message, RelayError::ConnectionLimit { max: 1 }.to_string());
         drop(rejected);
 
-        // Nach der Lesefrist muss der Slot wieder frei sein: eine dritte
-        // Verbindung darf nicht erneut am Limit scheitern.
-        thread::sleep(DEFAULT_RELAY_IDLE_POLL * 3 + Duration::from_millis(500));
+        // Nach dem Leerlaufbudget muss der Slot wieder frei sein: eine
+        // dritte Verbindung darf nicht erneut am Limit scheitern.
+        thread::sleep(idle_budget + Duration::from_millis(500));
         let accepted = TcpStream::connect(addr).map_err(ctx("verbinden 3"))?;
         assert!(
             rx.recv_timeout(Duration::from_millis(300)).is_err(),
-            "Slot war nach der Lesefrist noch nicht frei"
+            "Slot war nach dem Leerlaufbudget noch nicht frei"
         );
         drop(accepted);
         drop(silent_client);
@@ -1029,6 +1144,165 @@ mod tests {
         drop(first);
         assert!(ConnectionSlot::acquire(&active, 1).is_some());
         assert_eq!(active.load(Ordering::SeqCst), 0);
+        Ok(())
+    }
+
+    // Fest verdrahtete Schritte für `ScriptedReader`: Daten, eine simulierte
+    // Lesefrist (`WouldBlock`) oder eine Lesefrist, während der die
+    // Proxy-Seite endet — ohne echte Sockets oder Zeitabläufe.
+    enum ScriptedStep {
+        Data(&'static [u8]),
+        Timeout,
+        // Setzt `stop` (wie `proxy_gone` in `relay_connection`) und liefert
+        // dann eine Lesefrist: der Lesevorgang begann also noch vor dem Ende
+        // der Proxy-Seite.
+        StopThenTimeout,
+    }
+
+    // Reader, der eine feste Schrittfolge abspult; danach EOF.
+    struct ScriptedReader {
+        steps: std::vec::IntoIter<ScriptedStep>,
+        stop: Arc<AtomicBool>,
+    }
+
+    impl Read for ScriptedReader {
+        fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+            match self.steps.next() {
+                Some(ScriptedStep::Data(data)) => {
+                    buf[..data.len()].copy_from_slice(data);
+                    Ok(data.len())
+                }
+                Some(ScriptedStep::Timeout) => Err(io::Error::from(io::ErrorKind::WouldBlock)),
+                Some(ScriptedStep::StopThenTimeout) => {
+                    self.stop.store(true, Ordering::SeqCst);
+                    Err(io::Error::from(io::ErrorKind::WouldBlock))
+                }
+                None => Ok(0),
+            }
+        }
+    }
+
+    #[test]
+    fn test_copy_until_stopped_resets_idle_sum_on_data() -> TestResult {
+        // Zwei Lesefristen (20 ms) bleiben unter dem Budget (25 ms); das
+        // Datenpaket muss die Summe zurücksetzen, sonst würde der dritte
+        // Timeout-Schritt (der erste nach dem Datenschritt) das Budget schon
+        // vor den letzten beiden Schritten erreichen.
+        let steps = vec![
+            ScriptedStep::Timeout,
+            ScriptedStep::Timeout,
+            ScriptedStep::Data(b"x"),
+            ScriptedStep::Timeout,
+            ScriptedStep::Timeout,
+            ScriptedStep::Timeout,
+        ];
+        let stop = Arc::new(AtomicBool::new(true));
+        let mut reader = ScriptedReader {
+            steps: steps.into_iter(),
+            stop: Arc::clone(&stop),
+        };
+        let mut writer: Vec<u8> = Vec::new();
+        let idle_poll = Duration::from_millis(10);
+        let idle_budget = Duration::from_millis(25);
+        copy_until_stopped(&mut reader, &mut writer, &stop, idle_poll, idle_budget)
+            .map_err(ctx("Lesefristen sind kein Fehler"))?;
+        assert_eq!(writer, b"x");
+        assert_eq!(
+            reader.steps.len(),
+            0,
+            "Summe wurde beim Datenschritt nicht zurückgesetzt, Budget zu früh erreicht"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn test_copy_until_stopped_counts_idle_only_after_stop() -> TestResult {
+        // Fünf Lesefristen (50 ms) vor `stop` sind doppelt so lang wie das
+        // Budget (25 ms), dürfen aber nicht zählen: der Client schweigt, weil
+        // noch der Proxy sendet. Auch die Lesefrist, während der `stop`
+        // gesetzt wird, zählt nicht, denn ihr Lesevorgang begann vorher.
+        // Danach bleiben zwei Lesefristen (20 ms) unter dem Budget, das späte
+        // Datenpaket kommt also durch; drei weitere (30 ms) erreichen das
+        // Budget und beenden die Richtung vor dem letzten Schritt.
+        let steps = vec![
+            ScriptedStep::Timeout,
+            ScriptedStep::Timeout,
+            ScriptedStep::Timeout,
+            ScriptedStep::Timeout,
+            ScriptedStep::Timeout,
+            ScriptedStep::StopThenTimeout,
+            ScriptedStep::Timeout,
+            ScriptedStep::Timeout,
+            ScriptedStep::Data(b"late"),
+            ScriptedStep::Timeout,
+            ScriptedStep::Timeout,
+            ScriptedStep::Timeout,
+            ScriptedStep::Data(b"never"),
+        ];
+        let stop = Arc::new(AtomicBool::new(false));
+        let mut reader = ScriptedReader {
+            steps: steps.into_iter(),
+            stop: Arc::clone(&stop),
+        };
+        let mut writer: Vec<u8> = Vec::new();
+        let idle_poll = Duration::from_millis(10);
+        let idle_budget = Duration::from_millis(25);
+        copy_until_stopped(&mut reader, &mut writer, &stop, idle_poll, idle_budget)
+            .map_err(ctx("Lesefristen sind kein Fehler"))?;
+        assert_eq!(writer, b"late");
+        assert_eq!(
+            reader.steps.len(),
+            1,
+            "Budget wurde nicht ab dem Ende der Proxy-Seite gemessen"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn test_default_idle_budget_matches_proxy_idle_timeout() -> TestResult {
+        // Die Doku von `DEFAULT_RELAY_IDLE_BUDGET` verspricht, die
+        // Standard-Leerlauf-Frist des Proxys zu spiegeln; ändert sich nur
+        // einer der beiden Werte, schlägt dieser Test fehl.
+        assert_eq!(
+            DEFAULT_RELAY_IDLE_BUDGET,
+            crate::ProxyLimits::default().idle_timeout
+        );
+        Ok(())
+    }
+
+    // Reader, der beim ersten Aufruf `Interrupted` liefert und danach EOF —
+    // prüft, dass `copy_until_stopped` das wie `io::copy` wiederholt, statt
+    // als Fehler durchzureichen.
+    struct InterruptOnceThenEof {
+        interrupted: bool,
+    }
+
+    impl Read for InterruptOnceThenEof {
+        fn read(&mut self, _buf: &mut [u8]) -> io::Result<usize> {
+            if !self.interrupted {
+                self.interrupted = true;
+                return Err(io::Error::from(io::ErrorKind::Interrupted));
+            }
+            Ok(0)
+        }
+    }
+
+    #[test]
+    fn test_copy_until_stopped_retries_interrupted() -> TestResult {
+        let mut reader = InterruptOnceThenEof {
+            interrupted: false,
+        };
+        let mut writer: Vec<u8> = Vec::new();
+        let stop = AtomicBool::new(false);
+        copy_until_stopped(
+            &mut reader,
+            &mut writer,
+            &stop,
+            Duration::from_millis(10),
+            Duration::from_millis(10),
+        )
+        .map_err(ctx("Interrupted sollte wiederholt werden, nicht fehlschlagen"))?;
+        assert!(writer.is_empty());
         Ok(())
     }
 }

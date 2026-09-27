@@ -61,3 +61,28 @@ Einzeldatei-Funde (1F = ja) gehen an `gap-fix`. Funde über mehrere Dateien gehe
 | 39 | low | P5 | `harw-web/src/router.rs:198` | ja | unwrap() in doctests of decide_route, from_registry and method_for | Use `?` and end each doctest with `# Ok::<(), harw_web::error::WebError>(())`. |
 | 40 | low | M1 | `harw-web/src/server.rs:717` | ja | Execute path silently runs with an unscoped OpContext if no resolved identity is present | Before building ctx and reading the body: `let Some(resolved) = resolved else { return Ok(forbidden_response(forbidden_reason_str(ForbiddenReason::UnknownPeer))); };`, then `resolved.scope_op_context(ctx)` with no Option. A stronger alternative is to let Ro… |
 | 41 | low | M1 | `harw-web/src/server.rs:831` | nein | GET /events authorizes only at subscription: revoked or expired security contexts keep streaming, and there is no tenant filter | Pass the ResolvedPeer into sse_response. If summary() is Some, end the stream at summary.expires_at (tokio::time::sleep_until in the select) and re-resolve on each heartbeat, closing the stream on failure. Once WebEventKind carries a tenant, filter Operatio… |
+
+## Nachträge zu Fixes
+
+### #20: Relay-Slot nach dem Ende der Proxy-Seite (`harw-egress/src/relay.rs`)
+
+Umgesetzt anders als im Fund verlangt. Der Fund wollte den Slot freigeben,
+sobald die Proxy-Seite ganz weg ist. Der Fix (R16 `wa-egress`, nachgeschärft
+in R16 `ripple-egress`) pollt `client_read` nach dem Ende der
+Proxy→Client-Richtung mit `DEFAULT_RELAY_IDLE_POLL` (500 ms). Er gibt den
+Slot erst frei, wenn der Client `DEFAULT_RELAY_IDLE_BUDGET` (300 s) lang
+ununterbrochen geschwiegen hat; jedes gelesene Byte setzt die Summe zurück.
+
+- Grund: Der Proxy schließt bei EOF einer Richtung nur diese Richtung halb
+  (`proxy.rs`, `pump`). Ein Client, der nach einer Pause noch sendet, darf
+  nicht früher abgeschnitten werden als vom Proxy selbst
+  (`ProxyLimits::default().idle_timeout`, 300 s).
+- Preis: Schließt der Proxy ganz (`PumpEnd::Idle` oder `PumpEnd::ByteLimit`)
+  und der Client schweigt, bleibt der Slot bis zu 300 s belegt. Bei
+  `DEFAULT_RELAY_MAX_CONNECTIONS` = 128 können schweigende Clients alle
+  Slots so lange halten; neue Verbindungen werden in dieser Zeit mit
+  `RelayError::ConnectionLimit` abgewiesen.
+- Offen: den Slot früher freigeben, wenn das Relay erkennt, dass der Proxy
+  beide Richtungen beendet hat und nicht nur halb geschlossen. Das ist eine
+  Abwägung zwischen Halbschließ-Toleranz und Slot-Haltedauer und braucht eine
+  eigene Entscheidung.

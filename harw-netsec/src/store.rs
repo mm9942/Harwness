@@ -21,9 +21,10 @@
 //! that call, not after, so a directory-fsync failure can never make memory
 //! run ahead of a write that in fact did not happen, nor can it make the
 //! caller believe a committed write was lost. Such a failure is still
-//! reported as an error (so operators see it), but it does not roll back the
-//! in-memory state and a retry of the same logical change must not be
-//! treated as a no-op. Same contract as `harw-job-store::fsops` /
+//! reported as an error (so operators see it, and the API answers it with
+//! the code `durability_unconfirmed` rather than `internal`), but it does
+//! not roll back the in-memory state and a retry of the same logical change
+//! must not be treated as a no-op. Same contract as `harw-job-store::fsops` /
 //! `harw-session-store::durability`, reimplemented here because those crates
 //! carry session/job semantics this daemon must not depend on.
 //!
@@ -66,6 +67,13 @@ pub const STATE_FORMAT: &str = "harw-netsec.state";
 pub const STATE_VERSION: u32 = 1;
 /// Upper bound for a state file that will be read at all.
 pub const MAX_STATE_BYTES: u64 = 32 * 1024 * 1024;
+/// `context` of the [`NetsecError::Io`] a mutation returns when its rename
+/// already committed the new state file but the directory fsync after it
+/// failed: the change is applied, only its survival across a crash is
+/// unconfirmed. `crate::server` matches on this exact value to answer
+/// `durability_unconfirmed` instead of the generic `internal`, so this is
+/// the only place the text may be spelled out.
+pub(crate) const DIR_FSYNC_CONTEXT: &str = "fsync state directory (state file already replaced)";
 
 /// On-disk form of the state.
 #[derive(Debug, Serialize, Deserialize)]
@@ -525,27 +533,28 @@ fn write_and_rename(dir: &Path, path: &Path, state: &NetworkState) -> NetsecResu
 ///
 /// Must only be called after [`write_and_rename`] has already succeeded for
 /// the same directory. The caller has therefore already committed the new
-/// state to memory by the time this runs; a failure here is reported as an
-/// error so operators see it, but it must never cause the caller to revert
-/// or repeat that commit — the write on disk already happened.
+/// state to memory by the time this runs; a failure here is reported as
+/// [`NetsecError::Io`] with context [`DIR_FSYNC_CONTEXT`] so operators and
+/// clients see it, but it must never cause the caller to revert or repeat
+/// that commit — the write on disk already happened.
 fn fsync_state_dir(dir: &Path) -> NetsecResult<()> {
     #[cfg(test)]
     if FAIL_DIR_FSYNC.with(std::cell::Cell::get) {
         return Err(NetsecError::Io {
-            context: "fsync state directory (state file already replaced)",
+            context: DIR_FSYNC_CONTEXT,
             source: std::io::Error::other("injected for test"),
         });
     }
     File::open(dir)
         .and_then(|directory| directory.sync_all())
-        .map_err(NetsecError::io("fsync state directory (state file already replaced)"))
+        .map_err(NetsecError::io(DIR_FSYNC_CONTEXT))
 }
 
 /// Test-only fault injection for [`fsync_state_dir`]. Thread-local so
 /// concurrently running tests never see each other's setting.
 #[cfg(test)]
 thread_local! {
-    static FAIL_DIR_FSYNC: std::cell::Cell<bool> = std::cell::Cell::new(false);
+    static FAIL_DIR_FSYNC: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
 #[cfg(test)]
@@ -700,6 +709,35 @@ mod tests {
         // "failed" one.
         store.register_node(registration("n3")?, ts()?)?;
         assert_eq!(store.snapshot()?.node_count(), 3);
+        Ok(())
+    }
+
+    /// The error the store really returns for a failed directory fsync must
+    /// reach the client as `durability_unconfirmed`, not `internal`: the
+    /// store and the server mapping share [`DIR_FSYNC_CONTEXT`], and this
+    /// test fails if either side stops using it.
+    #[test]
+    fn test_directory_fsync_failure_reaches_client_as_durability_unconfirmed() -> TestResult {
+        let temp = tempfile::tempdir()?;
+        let store = open_with_zone(temp.path())?;
+        let registration_n1 = registration("n1")?;
+        let now = ts()?;
+        let error = match with_failed_dir_fsync(|| store.register_node(registration_n1, now)) {
+            Err(error) => error,
+            Ok(record) => {
+                return Err(TestError::Unexpected(format!(
+                    "expected an error, got {record:?}"
+                )));
+            }
+        };
+        assert!(
+            matches!(&error, NetsecError::Io { context: DIR_FSYNC_CONTEXT, .. }),
+            "{error:?}"
+        );
+        assert_eq!(
+            crate::server::ApiError::from(error).code(),
+            "durability_unconfirmed"
+        );
         Ok(())
     }
 

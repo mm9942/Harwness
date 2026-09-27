@@ -22,7 +22,7 @@ use serde::{Deserialize, Serialize};
 ///
 /// # Description
 /// Jede Variante entspricht genau einer `EgressTarget`-Variante aus
-/// `harw-sandbox`: [`Self::AllowHost`] ↔ `EgressTarget::Host`,
+/// `harw-authority`: [`Self::AllowHost`] ↔ `EgressTarget::Host`,
 /// [`Self::AllowDnsSuffix`] ↔ `EgressTarget::DnsSuffix`, [`Self::AllowCidr`]
 /// ↔ `EgressTarget::Cidr`. Die Zuordnung ist verlustfrei — die `From`-Impl
 /// unten kopiert Name bzw. Adressbereich unverändert, ohne Namensauflösung, ohne
@@ -37,7 +37,8 @@ use serde::{Deserialize, Serialize};
 /// stabil sortiert werden kann — Voraussetzung für
 /// [`crate::plan_for_scope`]s Determinismus-Zusage: gleiche Bereiche ergeben
 /// dieselbe Regelreihenfolge, weil die zugrunde liegende
-/// `BTreeSet<EgressTarget>` in `harw-sandbox` bereits dieselbe Ordnung trägt.
+/// `BTreeSet<EgressTarget>` in `harw_authority::NetworkScope` bereits
+/// dieselbe Ordnung trägt.
 ///
 /// # Serialisierung
 /// `#[serde(deny_unknown_fields)]` lässt ein unbekanntes Feld in einer
@@ -149,7 +150,7 @@ impl NetRule {
 /// # Description
 /// Identische Regel zu `harw_authority::NetworkScope`s (nicht exportierter)
 /// Normalisierung: Leerzeichen entfernen, ASCII-Kleinschreibung, führende
-/// Punkte entfernen. Dupliziert, weil `harw-sandbox` diese Funktion nicht
+/// Punkte entfernen. Dupliziert, weil `harw-authority` diese Funktion nicht
 /// öffentlich macht — siehe die Moduldoc von `crate` zum Kopplungsrisiko.
 ///
 /// # Arguments
@@ -163,12 +164,11 @@ pub(crate) fn normalize_host(host: &str) -> String {
 
 // Exakter Treffer oder Suffix-Treffer an einer Punktgrenze. `needle` muss
 // bereits über `normalize_host` normalisiert sein; `allowed` wird defensiv
-// behandelt. Delegiert an `harw_authority::host_matches_suffix` (Re-Export von
-// `harw_sandbox::egress::host_matches_suffix`, `harw-sandbox/src/lib.rs:45`)
-// statt einer eigenen Kopie: zwei Kopien derselben Sicherheitsregel drifteten
-// bereits einmal auseinander (Review Z0-R2, Befund R2-02) — `harw-sandbox`
-// toleriert seit W0B-04 je einen abschließenden Punkt auf beiden Seiten
-// (`egress.rs:305-326`), diese Crate hatte das nicht nachgezogen.
+// behandelt. Delegiert an `harw_authority::host_matches_suffix` statt einer
+// eigenen Kopie: zwei Kopien derselben Sicherheitsregel drifteten bereits
+// einmal auseinander (Review Z0-R2, Befund R2-02) — die gemeinsame Regel
+// toleriert seit W0B-04 je einen abschließenden Punkt auf beiden Seiten,
+// diese Crate hatte das nicht nachgezogen.
 fn host_matches(allowed: &str, needle: &str) -> bool {
     harw_authority::host_matches_suffix(allowed, needle)
 }
@@ -232,12 +232,11 @@ mod tests {
         Ok(())
     }
 
-    /// `host_matches` delegiert an `harw_authority::host_matches_suffix`
-    /// (`harw-sandbox/src/egress.rs:305-326`), das seit W0B-04 je einen
-    /// abschließenden Punkt auf beiden Seiten toleriert (Review Z0-R2,
-    /// Befund R2-02). Ein FQDN mit abschließendem Punkt aus einem
-    /// DNS-Kontext wird deshalb nicht mehr fail-closed abgelehnt, sondern
-    /// wie sein absoluter Name behandelt.
+    /// `host_matches` delegiert an `harw_authority::host_matches_suffix`,
+    /// das seit W0B-04 je einen abschließenden Punkt auf beiden Seiten
+    /// toleriert (Review Z0-R2, Befund R2-02). Ein FQDN mit abschließendem
+    /// Punkt aus einem DNS-Kontext wird deshalb nicht mehr fail-closed
+    /// abgelehnt, sondern wie sein absoluter Name behandelt.
     #[test]
     fn test_allow_dns_suffix_rule_tolerates_one_trailing_dot() {
         let rule = NetRule::AllowDnsSuffix {
