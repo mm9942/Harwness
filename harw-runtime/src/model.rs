@@ -664,6 +664,12 @@ impl ModelProvider for UiaDefaultRouteProvider {
     fn pinned_provider_id(&self) -> Option<String> {
         self.inner.pinned_provider_id()
     }
+
+    /// Reicht die Pacing-Wartezeit des inneren Routers durch — die
+    /// UIA-Standardroute selbst kennt keine Limits.
+    fn pacing_wait(&self) -> Option<std::time::Duration> {
+        self.inner.pacing_wait()
+    }
 }
 
 /// Löst die Modell-Kennung der uia-worker-Rollenfamilie auf.
@@ -1432,5 +1438,41 @@ mod tests {
         let worker_model = build_uia_worker_model(&config, &uia_client);
 
         assert!(Arc::ptr_eq(&uia_client, &worker_model));
+    }
+
+    /// Provider, der nur eine feste Pacing-Wartezeit meldet.
+    struct PacingProvider(Option<std::time::Duration>);
+
+    impl ModelProvider for PacingProvider {
+        fn respond<'a>(&'a self, _request: ModelRequest) -> ModelFuture<'a> {
+            Box::pin(async { Err(ModelError::RequestFailed("unused".to_owned())) })
+        }
+
+        fn pacing_wait(&self) -> Option<std::time::Duration> {
+            self.0
+        }
+    }
+
+    #[test]
+    fn uia_default_route_forwards_pacing_wait_to_inner() {
+        let wait = std::time::Duration::from_millis(1_500);
+        let wrapper = UiaDefaultRouteProvider::new(
+            Arc::new(PacingProvider(Some(wait))),
+            ProviderId::from("local"),
+            ModelId::from("local-model"),
+        );
+        assert_eq!(wrapper.pacing_wait(), Some(wait));
+
+        let idle = UiaDefaultRouteProvider::new(
+            Arc::new(PacingProvider(None)),
+            ProviderId::from("local"),
+            ModelId::from("local-model"),
+        );
+        assert_eq!(idle.pacing_wait(), None);
+    }
+
+    #[test]
+    fn unusable_provider_keeps_default_pacing_wait() {
+        assert_eq!(UnusableModelProvider::new("kaputt").pacing_wait(), None);
     }
 }

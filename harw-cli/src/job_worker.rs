@@ -187,6 +187,10 @@ pub struct JobWorkerContext {
     /// Kanban-Karten liegen. `None`: `kanban_card`-Jobs bleiben unberührt
     /// (siehe [`kanban_card`]).
     pub knowledge: Option<Arc<harw_knowledge::KnowledgeStore>>,
+    /// Sandboxed runner for the work driver's `Command` verify steps
+    /// (`verify_sandbox::build`). `None`: `Command` steps cannot be executed
+    /// and escalate as unverifiable (fail closed).
+    pub(crate) verify_runner: Option<crate::verify_sandbox::SandboxVerifier>,
 }
 
 /// The services a `plan-node` job needs on top of the plain job pipeline.
@@ -1366,6 +1370,18 @@ impl ModelProvider for BudgetedModelProvider {
     /// Reicht die gepinnte Provider-ID des umhüllten Providers durch.
     fn pinned_provider_id(&self) -> Option<String> {
         self.inner.pinned_provider_id()
+    }
+
+    /// Reicht die Wartezeit des umhüllten Providers durch.
+    ///
+    /// # Description
+    /// Das Rundenbudget kennt keine Anbieter-Limits; ohne Weiterreichen
+    /// würde die Hülle die Drosselung des inneren Providers verschlucken.
+    ///
+    /// # Returns
+    /// `self.inner.pacing_wait()`.
+    fn pacing_wait(&self) -> Option<std::time::Duration> {
+        self.inner.pacing_wait()
     }
 }
 
@@ -2894,6 +2910,7 @@ mod tests {
             configured_submitters: operator_submitters(),
             runtime_root: Some(runtime_root_under(root)?),
             knowledge: None,
+            verify_runner: None,
         }))
     }
 
@@ -4281,6 +4298,7 @@ mod tests {
             configured_submitters: operator_submitters(),
             runtime_root: None,
             knowledge: None,
+            verify_runner: None,
         });
 
         let completed = run_job_worker_once(
@@ -4348,6 +4366,7 @@ mod tests {
             configured_submitters: operator_submitters(),
             runtime_root: None,
             knowledge: Some(Arc::clone(&knowledge)),
+            verify_runner: None,
         });
         let poll = || {
             run_job_worker_once(
@@ -4458,6 +4477,7 @@ mod tests {
             configured_submitters: operator_submitters(),
             runtime_root: Some(runtime_root_under(temp.path())?),
             knowledge: Some(Arc::clone(&knowledge)),
+            verify_runner: None,
         });
         let provider: Arc<dyn ModelProvider> = Arc::new(EchoModelProvider::new("Karte erledigt"));
         let poll = || {
@@ -4542,6 +4562,7 @@ mod tests {
             configured_submitters: operator_submitters(),
             runtime_root: None,
             knowledge: None,
+            verify_runner: None,
         });
         let completed = run_job_worker_once(
             Arc::clone(&store),
@@ -5020,6 +5041,7 @@ mod prompt_claim_guard_tests {
             configured_submitters,
             runtime_root: Some(JobRuntimeRoot { home, cwd }),
             knowledge: None,
+            verify_runner: None,
         }))
     }
 
