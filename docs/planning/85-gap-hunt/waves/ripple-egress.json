@@ -1,0 +1,141 @@
+{
+ "schema": 1,
+ "wave": "ripple-egress",
+ "branch": "claude/r16/ripple-egress",
+ "base_sha": "2d122139ed70e0aefd5201e84baa1124245f65ac",
+ "head_sha": "d60e57bfe9bf152fb78d944696862e355996ea10",
+ "files": [
+  "docs/planning/85-gap-hunt/findings/web-authz.md",
+  "dod/crates/harw-dod-netpolicy/src/rule.rs",
+  "harw-browser/src/policy.rs",
+  "harw-egress/Cargo.toml",
+  "harw-egress/src/client.rs",
+  "harw-egress/src/lib.rs",
+  "harw-egress/src/policy.rs",
+  "harw-egress/src/relay.rs",
+  "harw-netsec/README.md",
+  "harw-netsec/src/server.rs",
+  "harw-netsec/src/store.rs",
+  "harw-node-transport/README.md",
+  "harw-node-transport/src/authhub_signer.rs"
+ ],
+ "findings": [
+  {
+   "id": "F-10d75d1fb706",
+   "cluster": "re-docs",
+   "file": "harw-browser/src/policy.rs",
+   "line": 33,
+   "severity": "low",
+   "pattern": "M3",
+   "title": "harw-egress/Cargo.toml:13-16 now correctly says the suffix rule comes from harw_authority, but other crates still name `harw_sandbox::egress"
+  },
+  {
+   "id": "F-15007207331c",
+   "cluster": "re-relay",
+   "file": "harw-egress/src/lib.rs",
+   "line": 87,
+   "severity": "low",
+   "pattern": "P1",
+   "title": "The relay fixer and the lib.rs fixer handled the same kind of issue differently. `DEFAULT_RELAY_IDLE_BUDGET` is declared `pub` at relay.rs:1"
+  },
+  {
+   "id": "F-1bafe4d87602",
+   "cluster": "re-relay",
+   "file": "harw-egress/src/lib.rs",
+   "line": 107,
+   "severity": "low",
+   "pattern": "P1",
+   "title": "The new test `crate_root_reexports_relay_idle_poll_default` is the only test in harw-egress without the `test_` prefix that every other test"
+  },
+  {
+   "id": "F-63384db0b656",
+   "cluster": "re-docs",
+   "file": "harw-node-transport/src/authhub_signer.rs",
+   "line": 57,
+   "severity": "low",
+   "pattern": "M3",
+   "title": "The two changed docs disagree on the shape of the adapter. authhub_signer.rs:57-58 says 'a one-line [`AuthHubSign`] impl at the composition "
+  },
+  {
+   "id": "F-66cda07aa63c",
+   "cluster": "re-netsec",
+   "file": "harw-netsec/README.md",
+   "line": 46,
+   "severity": "low",
+   "pattern": "M3",
+   "title": "The API error-code list (README.md:46-50) does not include the new client-visible code `durability_unconfirmed` (HTTP 500, server.rs:246-250"
+  },
+  {
+   "id": "F-7e993cd547f2",
+   "cluster": "re-relay",
+   "file": "harw-egress/src/relay.rs",
+   "line": 541,
+   "severity": "medium",
+   "pattern": "M6",
+   "title": "The idle count does not work the way the proxy's does, although the docs say it mirrors it. The read timeout is set before the copy thread s"
+  },
+  {
+   "id": "F-883380a80b1c",
+   "cluster": "re-docs",
+   "file": "docs/planning/85-gap-hunt/findings/web-authz.md",
+   "line": 42,
+   "severity": "low",
+   "pattern": "M3",
+   "title": "The fix for finding #20 differs from what the finding asked for, and nothing records the change. #20 asked for the slot to be freed 'once th"
+  },
+  {
+   "id": "F-a4862728bfc4",
+   "cluster": "re-relay",
+   "file": "harw-egress/src/relay.rs",
+   "line": 106,
+   "severity": "low",
+   "pattern": "P1",
+   "title": "DEFAULT_RELAY_IDLE_BUDGET hard-codes 300 s as a copy of `ProxyLimits::default().idle_timeout` (proxy.rs:134). No test or shared constant kee"
+  },
+  {
+   "id": "F-e27f5d7e4a0d",
+   "cluster": "re-netsec",
+   "file": "harw-netsec/src/server.rs",
+   "line": 201,
+   "severity": "low",
+   "pattern": "P1",
+   "title": "The literal 'fsync state directory (state file already replaced)' now exists three times: store.rs:535, store.rs:541 and server.rs:201. The "
+  }
+ ],
+ "workflow_runs": [
+  "wf_c640370e-831",
+  "wf_8156bd4a-ea6"
+ ],
+ "disposition": {
+  "complete": true,
+  "missing": [],
+  "clusters": [
+   {
+    "id": "re-netsec",
+    "status": "ok",
+    "reason": null
+   },
+   {
+    "id": "re-relay",
+    "status": "ok",
+    "reason": null
+   },
+   {
+    "id": "re-docs",
+    "status": "ok",
+    "reason": null
+   }
+  ]
+ },
+ "central_build": [
+  "env CARGO_INCREMENTAL=0 CARGO_PROFILE_DEV_DEBUG=0 CARGO_PROFILE_TEST_DEBUG=0 (cloud container, every step)",
+  "cargo fmt --all",
+  "cargo clippy --workspace --all-targets -- -D warnings",
+  "cargo test --workspace (including doc tests)",
+  "cargo run -q -p xtask -- gates",
+  "cargo deny check",
+  "make -C dod clippy test",
+  "actionlint"
+ ],
+ "note": "Two rounds. Round 1 (script ripple-egress.js, run wf_c640370e-831, old gap-fix logic, all 10 files ok) fixed the 11 ripple items of wa-egress; its own ripple check found 9 items, fixed by round 2 (this manifest's findings and disposition). A comment-only repair in relay.rs after ok=true (catalog P18) was checked by hand."
+}
