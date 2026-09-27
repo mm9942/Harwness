@@ -34,6 +34,13 @@ masterplan §33 it belongs at the network edge (browser ingress), not
 between nodes; a later edge deployment can sit in front of this crate
 without changing it.
 
+**`harw-dod-encrypt`** is a dependency too, but not part of the TLS/crypto
+stack above: it defines the canonical `SignTranscript` encoding the AuthHub
+node-identity key signs (`src/authhub_signer.rs`; see Identity, below). It
+is a workspace member already in the lockfile; its only external dependency
+is `crypt_guard_service`, also already locked — this edge adds nothing to
+the build graph either.
+
 Configuration details (`src/tls.rs`):
 
 * TLS 1.3 only, key exchange **only** `X25519MLKEM768` (a peer without it
@@ -60,6 +67,19 @@ through the `NodeVerifier` trait.
 **The IP address is never identity** (H11 exit criterion, masterplan §28):
 the client names the node it expects at an address, the server names itself,
 and both must prove it with the pinned key.
+
+**Wrapped-transcript fleets (`src/authhub_signer.rs`):** a node whose key
+lives in the Auth/Crypto Hub signs through `AuthHubNodeSigner`, which embeds
+the raw handshake transcript in a canonical `SignTranscript` of purpose
+`NodeHandshake` (`harw-dod-encrypt`) before it reaches the hub — the hub's
+usage authorizer only lets the node-identity key sign that shape. Every peer
+that pins such a node must verify with `TranscriptWrappedVerifier`, never
+plain `PinnedPeers`: `PinnedPeers` checks the raw transcript and rejects
+every wrapped signature (`VerifyError::BadSignature`), and vice versa — a
+mismatch fails closed, it never authenticates. The wrapped form is a
+fleet-wide setting, not negotiated per connection; a fleet must not mix
+wrapped and unwrapped nodes. In-process signers (development, tests) join a
+wrapped fleet through `TranscriptWrappedSigner`.
 
 ### Node handshake (`src/handshake.rs`)
 
@@ -88,7 +108,7 @@ ClientFinish {Sig_C(T("client-signs"))}                →
 | Stale or pre-dated messages | `Tc` / `Ts` must lie within ±30 s (`HandshakePolicy::max_clock_skew`) |
 | Reflection (one side's signature presented as the other's) | role label `server-signs` / `client-signs` in the transcript |
 | Mis-addressed connection | server refuses a hello whose `server_id` is not its own; client refuses a server whose id differs from the one it dialled |
-| Cross-protocol use of the node key | fixed domain prefix `TRANSCRIPT_DOMAIN`; the AuthHub adapter should permit the node-identity key to sign only payloads with that prefix (masterplan §5: the KMS must not become a signing oracle) |
+| Cross-protocol use of the node key | fixed domain prefix `TRANSCRIPT_DOMAIN`; `AuthHubNodeSigner` and the hub's own usage policy each permit the node-identity key to sign only payloads with that prefix (masterplan §5: the KMS must not become a signing oracle) |
 | Resource exhaustion | handshake deadline (10 s), 16 KiB frame cap before allocation, connection limit (256), HTTP header read timeout (30 s) |
 
 A failed verification is never recorded in the replay cache, so an attacker
@@ -134,16 +154,17 @@ There is no per-frame signature.
 
 ## Not in this crate (yet)
 
-* The AuthHub `NodeSigner` adapter (lives with `harw-infra-client` once it
-  exposes signing), and enrollment / distribution of `PinnedPeers`.
+* Missing: an `impl AuthHubSign for AuthHubClient` (or other adapter
+  bridging `AuthHubClient::sign(&KeyRef, &[u8])` to this trait's
+  `sign_with_key(namespace, key_id, message)`). `AuthHubClient::sign`
+  already exists; `harw-infra-client` is the only crate allowed to dial the
+  hub (masterplan §11/§24/§34 H4), so the adapter lands there, or here
+  behind a `harw-infra-client` dependency. Enrollment / distribution of
+  `PinnedPeers` keys is likewise still outside this crate.
 * Pin rotation and revocation lists beyond `PinnedPeers::unpin`.
 * A long-lived application-level channel (`ChannelId` actor, CryptGuard
   plan §29): TLS 1.3 already provides directional AEAD keys and sequence
   numbers; add it only if benchmarks demand it (H11).
-* ML-DSA encoding compatibility with CryptGuard: `PinnedPeers` verifies
-  pure ML-DSA-65 (FIPS 204, empty context) with raw 1952-byte public keys.
-  If the AuthHub signs differently (context string, pre-hash), implement
-  `NodeVerifier` with the matching CryptGuard verifier instead.
 
 ## Tests
 
