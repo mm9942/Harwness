@@ -195,7 +195,7 @@ pub enum RouteDecision<'a> {
 /// use harw_web::router::{RouteDecision, WebRouteTable, decide_route};
 ///
 /// let registry = OperationRegistry::new();
-/// let routes = WebRouteTable::from_registry(&registry).unwrap();
+/// let routes = WebRouteTable::from_registry(&registry)?;
 /// let authz = StaticUidTierMap::with_default(vec![], PermissionTier::Observer);
 /// let decision = decide_route(
 ///     &routes,
@@ -205,6 +205,7 @@ pub enum RouteDecision<'a> {
 ///     None,
 /// );
 /// assert!(matches!(decision, RouteDecision::NotFound));
+/// # Ok::<(), harw_web::error::WebError>(())
 /// ```
 #[must_use]
 pub fn decide_route<'a>(
@@ -361,8 +362,9 @@ impl WebRouteTable {
     /// use harw_web::router::WebRouteTable;
     ///
     /// let registry = OperationRegistry::new();
-    /// let routes = WebRouteTable::from_registry(&registry).unwrap();
+    /// let routes = WebRouteTable::from_registry(&registry)?;
     /// assert!(routes.is_empty());
+    /// # Ok::<(), harw_web::error::WebError>(())
     /// ```
     pub fn from_registry(registry: &OperationRegistry) -> Result<Self, WebError> {
         let mut routes: Vec<WebRoute> = Vec::new();
@@ -432,8 +434,9 @@ impl WebRouteTable {
     /// use harw_operations::registry::OperationRegistry;
     /// use harw_web::router::WebRouteTable;
     ///
-    /// let routes = WebRouteTable::from_registry(&OperationRegistry::new()).unwrap();
+    /// let routes = WebRouteTable::from_registry(&OperationRegistry::new())?;
     /// assert_eq!(routes.method_for("/api/unknown"), None);
+    /// # Ok::<(), harw_web::error::WebError>(())
     /// ```
     #[must_use]
     pub fn method_for(&self, path: &str) -> Option<WebMethod> {

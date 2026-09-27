@@ -157,9 +157,10 @@ impl WebEvent {
     /// use harw_web::events::{WebEvent, WebEventKind};
     ///
     /// let event = WebEvent { sequence: 1, kind: WebEventKind::Heartbeat };
-    /// let frame = event.to_sse_frame().unwrap();
+    /// let frame = event.to_sse_frame()?;
     /// assert!(frame.starts_with("data: "));
     /// assert!(frame.ends_with("\n\n"));
+    /// # Ok::<(), harw_web::error::WebError>(())
     /// ```
     pub fn to_sse_frame(&self) -> Result<String, WebError> {
         let json = serde_json::to_string(self)?;
@@ -234,8 +235,9 @@ impl WebEventBus {
     /// ```rust
     /// use harw_web::events::WebEventBus;
     ///
-    /// let bus = WebEventBus::new(16).unwrap();
+    /// let bus = WebEventBus::new(16)?;
     /// assert_eq!(bus.subscriber_count(), 0);
+    /// # Ok::<(), harw_web::error::WebError>(())
     /// ```
     pub fn new(capacity: usize) -> Result<Self, WebError> {
         if capacity == 0 {
@@ -260,9 +262,10 @@ impl WebEventBus {
     /// ```rust
     /// use harw_web::events::WebEventBus;
     ///
-    /// let bus = WebEventBus::new(4).unwrap();
+    /// let bus = WebEventBus::new(4)?;
     /// let _subscription = bus.subscribe();
     /// assert_eq!(bus.subscriber_count(), 1);
+    /// # Ok::<(), harw_web::error::WebError>(())
     /// ```
     #[must_use]
     pub fn subscribe(&self) -> WebEventSubscription {
@@ -291,9 +294,10 @@ impl WebEventBus {
     /// ```rust
     /// use harw_web::events::{WebEventBus, WebEventKind};
     ///
-    /// let bus = WebEventBus::new(4).unwrap();
+    /// let bus = WebEventBus::new(4)?;
     /// let event = bus.publish(WebEventKind::Heartbeat);
     /// assert_eq!(event.sequence, 1);
+    /// # Ok::<(), harw_web::error::WebError>(())
     /// ```
     pub fn publish(&self, kind: WebEventKind) -> WebEvent {
         // Poisoned nur nach einem Panic während eines Locks — dieser Bus

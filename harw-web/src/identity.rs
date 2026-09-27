@@ -56,10 +56,15 @@
 //!
 //! Fehlt der Header oder ist der Hub nicht erreichbar, entscheidet
 //! `require_context`: `true` → Ablehnung, `false` → Rückfall auf
-//! [`TierMapResolver`]. Ein **vorgelegter, aber ungültiger** Kontext
-//! (falsches Format, unbekannt, abgelaufen/widerrufen, fremder Principal,
-//! fremder Mandant) wird **immer** abgelehnt — ein Rückfall würde einen
-//! kaputten Nachweis stillschweigend in einen Einzelnutzer-Zugang umdeuten.
+//! [`TierMapResolver`] — **außer** die UID hat einen `uid_principals`-
+//! Eintrag, aber `uid_tenants` pinnt für sie keinen Mandanten. Dann würde
+//! der Rückfall den vom Hub zugewiesenen Mandanten stillschweigend fallen
+//! lassen und den Aufrufer unscoped (§15, sieht dann **alle** Mandanten)
+//! weiterlaufen lassen; das wird wie `require_context = true` abgelehnt.
+//! Ein **vorgelegter, aber ungültiger** Kontext (falsches Format,
+//! unbekannt, abgelaufen/widerrufen, fremder Principal, fremder Mandant)
+//! wird **immer** abgelehnt — ein Rückfall würde einen kaputten Nachweis
+//! stillschweigend in einen Einzelnutzer-Zugang umdeuten.
 //!
 //! # Was nie gelesen wird
 //! `harw-web` liest weder `x-harw-principal` noch `x-harw-tenant` noch
@@ -81,7 +86,7 @@
 //! Hub-Anfrage läuft je Web-Anfrage mit Kontext-Header, begrenzt durch
 //! [`HUB_VERIFY_TIMEOUT`].
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fmt;
 use std::future::Future;
 use std::path::PathBuf;
@@ -505,16 +510,30 @@ impl SecurityHubResolver {
     }
 
     /// Rückfall bzw. Ablehnung, wenn kein Kontext genutzt werden kann.
+    ///
+    /// # Description
+    /// `require_context = true` lehnt immer ab. Bei `false` fällt die Regel
+    /// grundsätzlich auf [`TierMapResolver`] zurück — außer die UID ist über
+    /// `uid_principals` an einen Hub-Principal gebunden, aber `uid_tenants`
+    /// pinnt für sie keinen Mandanten: der Kontext (den es hier gerade nicht
+    /// gibt) wäre in diesem Fall die einzige Mandantenquelle, und der
+    /// Rückfall würde den Aufrufer sonst mandantenlos — also mit Sicht auf
+    /// **alle** Mandanten (§15) — weiterlaufen lassen. Dann gilt dieselbe
+    /// Ablehnung wie bei `require_context = true`.
     fn without_context(
         &self,
         peer: &PeerCredentials,
         denial: IdentityError,
     ) -> Result<ResolvedPeer, IdentityError> {
         if self.require_context {
-            Err(denial)
-        } else {
-            self.fallback.resolve_peer(peer)
+            return Err(denial);
         }
+        let has_principal_binding = self.principals.contains_key(&peer.uid);
+        let has_tenant_pin = self.fallback.tenants.get(peer.uid).is_some();
+        if has_principal_binding && !has_tenant_pin {
+            return Err(denial);
+        }
+        self.fallback.resolve_peer(peer)
     }
 
     async fn resolve_inner(
@@ -640,14 +659,22 @@ pub struct WebIdentityConfig {
     #[serde(default)]
     pub security_socket: Option<PathBuf>,
     /// Nur `security_hub`: ohne Kontext bzw. erreichbaren Hub ablehnen statt
-    /// auf die Tier-Tabelle zurückzufallen.
+    /// auf die Tier-Tabelle zurückzufallen. Bei `false` bleibt der Rückfall
+    /// für eine UID mit `uid_principals`-Eintrag aber trotzdem gesperrt,
+    /// solange `uid_tenants` für sie keinen Mandanten pinnt — sonst würde
+    /// der Rückfall den vom Hub zugewiesenen Mandanten stillschweigend
+    /// fallen lassen (siehe Moduldoku).
     #[serde(default)]
     pub require_context: bool,
-    /// UID (als Zeichenkette) → Mandant.
+    /// UID (als Zeichenkette) → Mandant. Schlüssel werden über `parse_uid`
+    /// normalisiert; zwei Schlüssel, die auf dieselbe UID abbilden (z. B.
+    /// `"1000"` und `"01000"`), werden abgelehnt statt stillschweigend die
+    /// Reihenfolge der TOML-Tabelle entscheiden zu lassen.
     #[serde(default)]
     pub uid_tenants: BTreeMap<String, String>,
     /// Nur `security_hub`: UID (als Zeichenkette) → erwartete Principal-Id
-    /// des vorgelegten Kontexts (muss zur Hub-Richtlinie passen).
+    /// des vorgelegten Kontexts (muss zur Hub-Richtlinie passen). Dieselbe
+    /// Normalisierungs-/Duplikatsprüfung wie bei `uid_tenants`.
     #[serde(default)]
     pub uid_principals: BTreeMap<String, String>,
 }
@@ -678,6 +705,16 @@ pub enum IdentityConfigError {
     },
     /// Modus `security_hub` ohne einen einzigen `uid_principals`-Eintrag.
     MissingPrincipals,
+    /// Zwei (nach `parse_uid` normalisierte) Schlüssel in `uid_tenants` bzw.
+    /// `uid_principals` bezeichnen dieselbe UID (z. B. `"1000"` und
+    /// `"01000"`) — welcher Eintrag gewinnt, hinge sonst von der
+    /// TOML-Schlüsselreihenfolge ab.
+    DuplicateUid {
+        /// `"uid_tenants"` oder `"uid_principals"`.
+        field: &'static str,
+        /// Die betroffene UID.
+        uid: u32,
+    },
 }
 
 impl fmt::Display for IdentityConfigError {
@@ -703,6 +740,10 @@ impl fmt::Display for IdentityConfigError {
             Self::MissingPrincipals => f.write_str(
                 "[web.identity] mode = \"security_hub\" needs at least one uid_principals entry",
             ),
+            Self::DuplicateUid { field, uid } => write!(
+                f,
+                "[web.identity] `{field}`: uid {uid} configured more than once (aliased key?)"
+            ),
         }
     }
 }
@@ -720,12 +761,25 @@ fn parse_uid(key: &str) -> Result<u32, IdentityConfigError> {
 impl WebIdentityConfig {
     /// Validiert `uid_tenants`.
     ///
+    /// `parse_uid` normalisiert den Schlüssel (führende Nullen, `+`,
+    /// umgebende Leerzeichen); mehrere Schlüssel, die auf dieselbe UID
+    /// abbilden, würden ohne diese Prüfung von der TOML-Schlüsselreihenfolge
+    /// abhängig kollidieren.
+    ///
     /// # Errors
-    /// [`IdentityConfigError::InvalidUid`] / [`IdentityConfigError::InvalidTenant`].
+    /// [`IdentityConfigError::InvalidUid`] / [`IdentityConfigError::InvalidTenant`]
+    /// / [`IdentityConfigError::DuplicateUid`].
     pub fn tenant_map(&self) -> Result<UidTenantMap, IdentityConfigError> {
+        let mut seen = HashSet::with_capacity(self.uid_tenants.len());
         let mut entries = Vec::with_capacity(self.uid_tenants.len());
         for (key, tenant) in &self.uid_tenants {
             let uid = parse_uid(key)?;
+            if !seen.insert(uid) {
+                return Err(IdentityConfigError::DuplicateUid {
+                    field: "uid_tenants",
+                    uid,
+                });
+            }
             let tenant = TenantId::try_from_str(tenant.trim())
                 .map_err(|_| IdentityConfigError::InvalidTenant { uid })?;
             entries.push((uid, tenant));
@@ -735,12 +789,22 @@ impl WebIdentityConfig {
 
     /// Validiert `uid_principals`.
     ///
+    /// Dieselbe Normalisierungs-/Duplikatsprüfung wie [`Self::tenant_map`].
+    ///
     /// # Errors
-    /// [`IdentityConfigError::InvalidUid`] / [`IdentityConfigError::BlankPrincipal`].
+    /// [`IdentityConfigError::InvalidUid`] / [`IdentityConfigError::BlankPrincipal`]
+    /// / [`IdentityConfigError::DuplicateUid`].
     pub fn principal_map(&self) -> Result<Vec<(u32, String)>, IdentityConfigError> {
+        let mut seen = HashSet::with_capacity(self.uid_principals.len());
         let mut entries = Vec::with_capacity(self.uid_principals.len());
         for (key, principal) in &self.uid_principals {
             let uid = parse_uid(key)?;
+            if !seen.insert(uid) {
+                return Err(IdentityConfigError::DuplicateUid {
+                    field: "uid_principals",
+                    uid,
+                });
+            }
             let principal = principal.trim();
             if principal.is_empty() {
                 return Err(IdentityConfigError::BlankPrincipal { uid });
@@ -1113,6 +1177,58 @@ mod tests {
         Ok(())
     }
 
+    /// Ein Peer, dessen UID an einen Hub-Principal gebunden ist, aber ohne
+    /// gepinnten Mandanten: ohne Header darf `require_context = false` NICHT
+    /// stillschweigend mandantenlos (= alle Mandanten) durchlassen.
+    #[tokio::test]
+    async fn test_security_hub_missing_header_without_tenant_pin_stays_scoped() -> TestResult {
+        let unpinned = SecurityHubResolver::new(
+            TierMapResolver::new(tier_table()),
+            FakeHub::new(Err(VerifierError::Failed)),
+            vec![(ALICE, "alice".to_owned())],
+            false,
+        );
+        expect_err(
+            unpinned.resolve(&peer(ALICE), None).await,
+            IdentityError::ContextRequired,
+        )?;
+
+        // Mit gepinntem Mandanten bleibt der Rückfall erlaubt und scoped.
+        let pinned = SecurityHubResolver::new(
+            TierMapResolver::with_tenants(
+                tier_table(),
+                UidTenantMap::new(vec![(
+                    ALICE,
+                    TenantId::try_from_str("tenant-a").map_err(ctx("tenant"))?,
+                )]),
+            ),
+            FakeHub::new(Err(VerifierError::Failed)),
+            vec![(ALICE, "alice".to_owned())],
+            false,
+        );
+        let resolved = pinned
+            .resolve(&peer(ALICE), None)
+            .await
+            .map_err(ctx("resolve"))?;
+        assert_eq!(resolved.source(), IdentitySource::TierMap);
+        assert_eq!(resolved.tenant().map(TenantId::as_str), Some("tenant-a"));
+
+        // Eine UID ohne `uid_principals`-Eintrag ist von der neuen Sperre
+        // unberührt — sie kann ohnehin nie einen Kontext vorlegen.
+        let unbound = SecurityHubResolver::new(
+            TierMapResolver::new(tier_table()),
+            FakeHub::new(Err(VerifierError::Failed)),
+            vec![(ALICE, "alice".to_owned())],
+            false,
+        );
+        let bob = unbound
+            .resolve(&peer(BOB), None)
+            .await
+            .map_err(ctx("resolve"))?;
+        assert_eq!(bob.tenant(), None);
+        Ok(())
+    }
+
     #[tokio::test]
     async fn test_security_hub_context_of_other_principal_is_denied() -> TestResult {
         // Bob legt Alices (gültigen) Kontext vor.
@@ -1451,6 +1567,46 @@ mod tests {
         assert_eq!(
             blank_principal.build_resolver(tier_table()).err(),
             Some(IdentityConfigError::BlankPrincipal { uid: ALICE })
+        );
+        Ok(())
+    }
+
+    /// Zwei nach `parse_uid` gleichwertige Schlüssel (führende Null, `+`,
+    /// umgebendes Leerzeichen) dürfen nicht stillschweigend nach
+    /// TOML-Schlüsselreihenfolge kollidieren.
+    #[test]
+    fn test_config_rejects_aliased_duplicate_uid_keys() -> TestResult {
+        let dup_tenants = parse(r#"uid_tenants = { "1000" = "tenant-a", "01000" = "tenant-b" }"#)?;
+        assert_eq!(
+            dup_tenants.build_resolver(tier_table()).err(),
+            Some(IdentityConfigError::DuplicateUid {
+                field: "uid_tenants",
+                uid: ALICE
+            })
+        );
+
+        let dup_principals = parse(
+            r#"
+            mode = "security_hub"
+            uid_principals = { "1000" = "alice", "+1000" = "alice2" }
+            "#,
+        )?;
+        assert_eq!(
+            dup_principals.build_resolver(tier_table()).err(),
+            Some(IdentityConfigError::DuplicateUid {
+                field: "uid_principals",
+                uid: ALICE
+            })
+        );
+
+        let dup_whitespace =
+            parse(r#"uid_tenants = { "1000" = "tenant-a", " 1000" = "tenant-b" }"#)?;
+        assert_eq!(
+            dup_whitespace.build_resolver(tier_table()).err(),
+            Some(IdentityConfigError::DuplicateUid {
+                field: "uid_tenants",
+                uid: ALICE
+            })
         );
         Ok(())
     }
