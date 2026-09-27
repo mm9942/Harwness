@@ -996,6 +996,21 @@ docs/
     ├── 60-platform-execution/
     │   └── README.md
     │
+    ├── 65-cloud-sessions/
+    │   └── README.md
+    │
+    ├── 70-decisions/
+    │   └── README.md            (DEC-001 …)
+    │
+    ├── 80-copilot-backlog/
+    │   └── README.md
+    │
+    ├── 85-gap-hunt/
+    │   ├── README.md            (reusable gap-hunt kit)
+    │   ├── patterns.md          (pattern catalog M1–M8, P1–P8)
+    │   ├── R15-patterns.md      (run log)
+    │   └── kit/                 (workflows, skill, agent types)
+    │
     └── 90-migration-ledger/
         └── MIGRATION_LEDGER.md
 ```
