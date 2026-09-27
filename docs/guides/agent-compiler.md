@@ -427,7 +427,9 @@ provider.
 
 CI runs the script in the `native-agent` job on pushes to `main` and on
 manual runs (`workflow_dispatch`), not on pull requests: the first build
-compiles harw's runner crates in release mode. The job caches the native
+compiles harw's runner crates in release mode. While the push trigger is
+commented out in `ci.yml` (see `CONTRIBUTING.md`), only manual runs execute
+it. The job caches the native
 build's target directory next to the usual cargo cache.
 
 ## 7. Secrets

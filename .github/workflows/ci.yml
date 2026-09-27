@@ -1,13 +1,20 @@
 name: CI
 
 on:
-  push:
-    # `dev` ist der Integrationsbranch, `main` die stabile Linie. Beide
-    # bekommen dieselbe volle CI, damit nichts ungeprüft auf `dev` liegt.
-    branches: [main, dev]
-  # Alle PRs, auch gestapelte (Basis ist ein anderer Feature-Branch).
-  pull_request:
-    types: [opened, synchronize, reopened, labeled]
+  # Vorübergehend nur per Hand: GitHub Actions ist auf diesem Konto gesperrt
+  # (Abrechnung), jeder Push und PR erzeugte nur rote, nie gestartete Läufe.
+  # Bis dahin ist der zentrale lokale Build aus CLAUDE.md das Gate. Ein Lauf
+  # wird gezielt per workflow_dispatch gestartet; bleibt er rot, bleiben die
+  # Trigger aus. Zum Reaktivieren die beiden Blöcke wieder einkommentieren;
+  # die Job-Bedingungen unten behandeln `push` und `pull_request` weiterhin.
+  #
+  # push:
+  #   # `dev` ist der Integrationsbranch, `main` die stabile Linie. Beide
+  #   # bekommen dieselbe volle CI, damit nichts ungeprüft auf `dev` liegt.
+  #   branches: [main, dev]
+  # # Alle PRs, auch gestapelte (Basis ist ein anderer Feature-Branch).
+  # pull_request:
+  #   types: [opened, synchronize, reopened, labeled]
   workflow_dispatch:
 
 # Ein neuer Push auf denselben Branch/PR bricht den noch laufenden alten Lauf ab.
@@ -36,8 +43,8 @@ env:
 # (Ökosystem `rust-toolchain`) aktualisiert – keine zweite Versionsangabe im
 # Workflow, die auseinanderlaufen könnte, und keine Dritt-Action.
 #
-# Pfadfilter: Die Filter greifen nur bei `pull_request`. Bei Push auf main
-# laufen immer alle Jobs. Scheitert der Filter-Job selbst, laufen ebenfalls
+# Pfadfilter: Die Filter greifen nur bei `pull_request`. Bei Push (solange
+# aktiviert) und bei workflow_dispatch laufen immer alle Jobs. Scheitert der Filter-Job selbst, laufen ebenfalls
 # alle Jobs (fail-open), damit nie ein Job ungeprüft „grün“ übersprungen wird.
 # Übersprungene Jobs zählen bei GitHub als erfolgreich und blockieren
 # erforderliche Checks nicht.
