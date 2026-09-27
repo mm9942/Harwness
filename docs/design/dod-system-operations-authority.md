@@ -7,16 +7,17 @@ implementation plan, not yet verified against a running host. As of this
 review, substantial parts of it are implemented: `harw-authority` exists as
 a crate in the product workspace, `dod/crates/harw-dod-config` exists,
 `dod/Makefile` implements the FHS-layout install targets described in §5,
-and the systemd units described in §5.2 exist under
-`dod/packaging/systemd/` (`harw-dod.target`, `harw-dod-sentinel.service`,
-`harw-dod-bpf.service`, `harw-dod-warden.service`,
-`harw-dod-warden.socket`). What is confirmed still open: the
+and the systemd units described in §5.2 exist under the canonical
+`deploy/systemd/` tree (`harw-dod.target`, `harw-sentinel.service`,
+`harw-probe-bpf.service`, `harw-probe-fs.service`, `harw-warden.service`,
+`harw-warden.socket`; the former duplicate `dod/packaging/systemd/` was
+removed by Crypto Masterplan v2 H10). What is confirmed still open: the
 `permission_request!` macro described in §6.3 does not exist in
 `harw-macros`. The rest of this document's many detailed acceptance
 criteria (§8) have not been individually re-verified for this pass — treat
 sections below as the original plan's intent, cross-check specifics against
 the code before relying on them, and see `dod/Makefile`,
-`dod/packaging/systemd/`, `harw-authority/src/lib.rs`, and
+`deploy/systemd/`, `harw-authority/src/lib.rs`, and
 `dod/crates/harw-dod-config` for current ground truth.
 
 ## 1. Goal and binding decisions
@@ -266,12 +267,16 @@ Confirmed present in `dod/Makefile`:
 | `/etc/harw-dod/` | system configuration, root and a reading service group; not group-writable |
 | `/var/lib/harw-dod/` | persistent evidence, sentinel-writable only |
 | `/var/log/harw-dod/` | rotating telemetry, sentinel-writable only |
-| `/run/harw-dod/` | volatile sockets/runtime data, narrow group permission |
+| `/run/harw/` | volatile sockets (`sentinel.sock`, `warden.sock`), narrow group permission (H10: the runtime directory is `/run/harw`, not `/run/harw-dod`) |
 
 Configuration file 0640, operating directories 0750, socket 0660. System
 accounts `harw-dod` and `harw-dod-bpf`, no login, no personal home; a
 shared IPC group only for the required socket access. The warden gets no
 probe identity.
+(Superseded by Crypto Masterplan v2 H10: one account per binary —
+`harw-sentinel`, `harw-probe-fs`, `harw-probe-bpf`, `harw-warden` — declared
+in `deploy/sysusers.d/harw.conf`; groups `harw-ipc`, `harw-dod-config`,
+`harw-warden-clients`.)
 
 The sentinel gets separate options for state, telemetry and runtime
 directories; the old shared `--home` must not redirect a system install
@@ -284,9 +289,9 @@ distributions can set `/usr`. Runtime/data paths stay FHS-compliant.
 
 ### 5.2 systemd contract — implemented
 
-Units confirmed present under `dod/packaging/systemd/`: `harw-dod.target`,
-`harw-dod-sentinel.service`, `harw-dod-bpf.service`,
-`harw-dod-warden.service`, `harw-dod-warden.socket`. The observation target
+Units confirmed present under `deploy/systemd/` (the single source since
+H10): `harw-dod.target`, `harw-sentinel.service`, `harw-probe-bpf.service`,
+`harw-probe-fs.service`, `harw-warden.service`, `harw-warden.socket`. The observation target
 is meant to pull up only the sentinel and BPF probe; the warden should
 carry no activation edge from the observation target and ships neither
 enabled nor started.

@@ -20,8 +20,10 @@ use chacha20poly1305::{XChaCha20Poly1305, XNonce, aead::Payload as ChaChaPayload
 use crypt_guard::pq_hpke::{
     Aead as HpkeAead, HpkeEnvelope, Kdf, RecipientPrivateKey, RecipientPublicKey, Suite,
 };
-use secrecy::SecretBox;
+use secrecy::zeroize::Zeroizing;
+use secrecy::{ExposeSecret, SecretBox};
 
+use crate::dek_wrapper::{DekWrapper, validate_wrapper_identity};
 use crate::error::{SecretsError, SecretsResult};
 use crate::id::{KeyVersion, SecretId};
 use crate::kek::{KEK_SEED_LEN, derive_kem_seed};
@@ -33,6 +35,8 @@ const HPKE_INFO_V2: &[u8] = b"harwness:secrets:dek-wrap:v2";
 const V1_AAD_DOMAIN: &[u8] = b"harwness:secrets:hpke:aad:v1";
 const V2_WRAPPER_AAD_DOMAIN: &[u8] = b"harwness:secrets:wrapper:aad:v2";
 const V2_PAYLOAD_AAD_DOMAIN: &[u8] = b"harwness:secrets:payload:aad:v2";
+/// Domain of the AAD a V3 record hands to [`DekWrapper::wrap_dek`].
+const V3_WRAP_AAD_DOMAIN: &[u8] = b"harwness:secrets:dek-wrap:v3";
 const DEK_LEN: usize = 32;
 
 /// The byte outputs of a single seal operation, before they are joined with
@@ -102,16 +106,334 @@ pub fn seal(
 ///
 /// # Errors
 /// - [`SecretsError::UnsupportedLegacyKem`]: the record was sealed under a
-///   retired pure ML-KEM level; such envelopes are unreadable with
-///   `crypt_guard` 3.0.1.
+///   retired pure ML-KEM level; such envelopes are rejected by `harw-secrets`
+///   policy (legacy pure ML-KEM records are read-only metadata), not by a
+///   `crypt_guard` limitation.
 /// - [`SecretsError::EnvelopeDecode`], [`SecretsError::Open`],
 ///   [`SecretsError::PayloadAeadOpen`] and the length errors for malformed or
 ///   tampered records.
+///
+/// [`SecretEnvelopeFormat::KmsWrappedV3`] records cannot be opened with a KEK
+/// seed alone and fail closed with [`SecretsError::DekWrapperUnavailable`];
+/// use [`open_with_wrapper`] or [`open_v3`].
 pub fn open(kek_seed: &[u8], record: &SecretRecord) -> SecretsResult<SecretBox<[u8]>> {
+    open_with_wrapper(Some(kek_seed), None, record)
+}
+
+/// Open a record of any envelope format: V1/V2 with the local root
+/// `kek_seed`, V3 with `wrapper`. A missing input for the record's format
+/// fails closed; there is no fallback between the two paths.
+///
+/// # Errors
+/// - [`SecretsError::KekUnavailable`]: a V1/V2 record but no `kek_seed`.
+/// - [`SecretsError::DekWrapperUnavailable`]: a V3 record but no `wrapper`.
+/// - Everything [`open`] and [`open_v3`] report for their formats.
+pub fn open_with_wrapper(
+    kek_seed: Option<&[u8]>,
+    wrapper: Option<&dyn DekWrapper>,
+    record: &SecretRecord,
+) -> SecretsResult<SecretBox<[u8]>> {
     match record.envelope_format {
-        SecretEnvelopeFormat::DekWrappedV2 => open_v2(kek_seed, record),
-        SecretEnvelopeFormat::LegacyDirectHpke => open_v1(kek_seed, record),
+        SecretEnvelopeFormat::DekWrappedV2 => open_v2(require_kek_seed(kek_seed)?, record),
+        SecretEnvelopeFormat::LegacyDirectHpke => open_v1(require_kek_seed(kek_seed)?, record),
+        SecretEnvelopeFormat::KmsWrappedV3 => match wrapper {
+            Some(wrapper) => open_v3(wrapper, record),
+            None => Err(SecretsError::DekWrapperUnavailable {
+                profile: record
+                    .crypto_profile_id
+                    .clone()
+                    .unwrap_or_else(|| "unknown".to_owned()),
+                reason: "V3 record requires a configured DEK wrapper".to_owned(),
+            }),
+        },
     }
+}
+
+fn require_kek_seed(kek_seed: Option<&[u8]>) -> SecretsResult<&[u8]> {
+    kek_seed.ok_or_else(|| SecretsError::KekUnavailable {
+        kind: "seed".to_owned(),
+        reason: "V1/V2 record requires the local root KEK seed".to_owned(),
+    })
+}
+
+/// Seal a new [`SecretEnvelopeFormat::KmsWrappedV3`] record: a fresh 32-byte
+/// DEK encrypts `plaintext` locally under `policy.aead` with the V2 payload
+/// AAD, and `wrapper` wraps only that DEK under its current key generation.
+///
+/// The wrap AAD binds `"harwness:secrets:dek-wrap:v3" ‖ 0x00 ‖ id ‖ key_id ‖
+/// key_generation ‖ crypto_profile_id ‖ KEM id ‖ AEAD id` (strings are
+/// length-prefixed). `record.key_version` mirrors the generation.
+/// `policy.kem` is recorded (and bound) for the record's suite label; the
+/// wrapper's own crypto profile decides how the DEK is protected.
+///
+/// # Errors
+/// - [`SecretsError::InvalidDekWrapperIdentity`]: the wrapper reports a
+///   malformed key reference or profile id; nothing is encrypted.
+/// - [`SecretsError::UnsupportedLegacyKem`]: `policy` names a retired pure
+///   ML-KEM level.
+/// - [`SecretsError::PayloadAeadSeal`] and any error of
+///   [`DekWrapper::wrap_dek`] (e.g. [`SecretsError::DekWrapperUnavailable`]).
+pub fn seal_v3(
+    wrapper: &dyn DekWrapper,
+    policy: &CryptoPolicy,
+    id: SecretId,
+    plaintext: &[u8],
+) -> SecretsResult<SecretRecord> {
+    validate_wrapper_identity(wrapper.key_id(), wrapper.profile_id())?;
+    // Refuse a legacy KEM before any key material is generated.
+    let _ = suite_for(policy.kem, policy.aead)?;
+    let (dek, nonce, ciphertext) = encrypt_payload_under_fresh_dek(policy.aead, id, plaintext)?;
+    v3_record(
+        wrapper,
+        id,
+        &dek,
+        policy.kem,
+        policy.aead,
+        ciphertext,
+        nonce,
+    )
+}
+
+/// Open a [`SecretEnvelopeFormat::KmsWrappedV3`] record through `wrapper`.
+///
+/// # Errors
+/// - [`SecretsError::PersistenceFormat`]: not a V3 record, a V3 field is
+///   missing, or `key_version` does not mirror `key_generation`.
+/// - [`SecretsError::DekWrapperMismatch`]: the record names another key
+///   reference or crypto profile than `wrapper` serves.
+/// - [`SecretsError::KeyGenerationMismatch`] (from the wrapper): the record's
+///   generation cannot be unwrapped.
+/// - Authentication errors of the wrapper for any tampered bound field
+///   (secret id, key id, generation, profile, KEM, AEAD) or wrapped bytes;
+///   [`SecretsError::InvalidDekLength`], [`SecretsError::PayloadAeadOpen`].
+pub fn open_v3(wrapper: &dyn DekWrapper, record: &SecretRecord) -> SecretsResult<SecretBox<[u8]>> {
+    let dek = unwrap_v3_dek(wrapper, record)?;
+    let aad = payload_aad(record.id, record.aead_algo);
+    let plaintext = decrypt_payload(
+        record.aead_algo,
+        &dek,
+        &record.nonce,
+        &aad,
+        &record.ciphertext,
+    )?;
+    Ok(SecretBox::new(plaintext.into_boxed_slice()))
+}
+
+/// Explicitly migrate a V1 or V2 record to [`SecretEnvelopeFormat::KmsWrappedV3`]
+/// (never done implicitly; see [`crate::SecretStore::migrate_all_to_v3`]).
+///
+/// - V2: the DEK is unwrapped once with the existing root `kek_seed` and
+///   re-wrapped by `wrapper`; `ciphertext`, `nonce`, KEM and AEAD are kept
+///   byte for byte (§16.3).
+/// - V1 (direct HPKE) has no separable DEK: the payload is opened with
+///   `kek_seed` and re-encrypted under a fresh DEK and nonce.
+///
+/// The returned record carries the wrapper's key reference, generation and
+/// profile; `key_version` mirrors the generation.
+///
+/// # Errors
+/// - [`SecretsError::PersistenceFormat`]: `record` is already V3.
+/// - Every open error of the record's format and every seal error of
+///   [`seal_v3`].
+pub fn rewrap_to_v3(
+    kek_seed: &[u8],
+    record: &SecretRecord,
+    wrapper: &dyn DekWrapper,
+) -> SecretsResult<SecretRecord> {
+    validate_wrapper_identity(wrapper.key_id(), wrapper.profile_id())?;
+    match record.envelope_format {
+        SecretEnvelopeFormat::DekWrappedV2 => {
+            let suite = suite_for(record.kem_algo, record.aead_algo)?;
+            let dek = Zeroizing::new(unwrap_v2_dek(kek_seed, record, suite)?);
+            v3_record(
+                wrapper,
+                record.id,
+                &dek,
+                record.kem_algo,
+                record.aead_algo,
+                record.ciphertext.clone(),
+                record.nonce.clone(),
+            )
+        }
+        SecretEnvelopeFormat::LegacyDirectHpke => {
+            let plaintext = open_v1(kek_seed, record)?;
+            let policy = CryptoPolicy {
+                kem: record.kem_algo,
+                aead: record.aead_algo,
+            };
+            seal_v3(wrapper, &policy, record.id, plaintext.expose_secret())
+        }
+        SecretEnvelopeFormat::KmsWrappedV3 => Err(SecretsError::PersistenceFormat {
+            operation: "rewrap to V3".to_owned(),
+            reason: "record is already KMS-wrapped V3".to_owned(),
+        }),
+    }
+}
+
+/// Re-wrap a V3 record's DEK from `old_wrapper` to `new_wrapper` (a KMS key
+/// generation rotation or a key/profile change) without touching the payload
+/// ciphertext or nonce.
+///
+/// # Errors
+/// Every error of [`open_v3`] for `old_wrapper` and of
+/// [`DekWrapper::wrap_dek`] for `new_wrapper`.
+pub fn rewrap_v3(
+    old_wrapper: &dyn DekWrapper,
+    record: &SecretRecord,
+    new_wrapper: &dyn DekWrapper,
+) -> SecretsResult<SecretRecord> {
+    validate_wrapper_identity(new_wrapper.key_id(), new_wrapper.profile_id())?;
+    let dek = unwrap_v3_dek(old_wrapper, record)?;
+    v3_record(
+        new_wrapper,
+        record.id,
+        &dek,
+        record.kem_algo,
+        record.aead_algo,
+        record.ciphertext.clone(),
+        record.nonce.clone(),
+    )
+}
+
+/// DEK, nonce and ciphertext produced by sealing a payload.
+type SealedPayload = (Zeroizing<[u8; DEK_LEN]>, Vec<u8>, Vec<u8>);
+
+/// Fresh random DEK and nonce, payload encrypted with the V2 payload AAD.
+fn encrypt_payload_under_fresh_dek(
+    aead: AeadAlgo,
+    id: SecretId,
+    plaintext: &[u8],
+) -> SecretsResult<SealedPayload> {
+    let mut dek = Zeroizing::new([0_u8; DEK_LEN]);
+    getrandom::fill(&mut *dek).map_err(|_| SecretsError::Seal(hpke_internal_failure()))?;
+    let mut nonce = vec![0_u8; nonce_len(aead)];
+    getrandom::fill(&mut nonce).map_err(|_| SecretsError::Seal(hpke_internal_failure()))?;
+    let ciphertext = encrypt_payload(aead, &dek, &nonce, &payload_aad(id, aead), plaintext)?;
+    Ok((dek, nonce, ciphertext))
+}
+
+/// Wrap `dek` with `wrapper` and assemble the V3 record around the given
+/// payload ciphertext and nonce.
+fn v3_record(
+    wrapper: &dyn DekWrapper,
+    id: SecretId,
+    dek: &[u8; DEK_LEN],
+    kem: KemAlgo,
+    aead: AeadAlgo,
+    ciphertext: Vec<u8>,
+    nonce: Vec<u8>,
+) -> SecretsResult<SecretRecord> {
+    let key_id = wrapper.key_id().to_owned();
+    let profile_id = wrapper.profile_id().to_owned();
+    let key_generation = wrapper.key_generation();
+    let aad = v3_wrap_aad(id, &key_id, key_generation, &profile_id, kem, aead)?;
+    let wrapped_dek = wrapper.wrap_dek(dek, &aad)?;
+    Ok(SecretRecord {
+        id,
+        envelope_format: SecretEnvelopeFormat::KmsWrappedV3,
+        ciphertext,
+        nonce,
+        wrapped_dek,
+        kem_algo: kem,
+        aead_algo: aead,
+        key_version: KeyVersion(key_generation),
+        key_id: Some(key_id),
+        key_generation: Some(key_generation),
+        crypto_profile_id: Some(profile_id),
+    })
+}
+
+fn unwrap_v3_dek(
+    wrapper: &dyn DekWrapper,
+    record: &SecretRecord,
+) -> SecretsResult<Zeroizing<[u8; DEK_LEN]>> {
+    if record.envelope_format != SecretEnvelopeFormat::KmsWrappedV3 {
+        return Err(SecretsError::PersistenceFormat {
+            operation: "open V3 DEK".to_owned(),
+            reason: "record is not KMS-wrapped V3".to_owned(),
+        });
+    }
+    let (Some(key_id), Some(key_generation), Some(profile_id)) = (
+        record.key_id.as_deref(),
+        record.key_generation,
+        record.crypto_profile_id.as_deref(),
+    ) else {
+        return Err(SecretsError::PersistenceFormat {
+            operation: "open V3 DEK".to_owned(),
+            reason: "V3 record lacks key_id, key_generation or crypto_profile_id".to_owned(),
+        });
+    };
+    if record.key_version.0 != key_generation {
+        return Err(SecretsError::PersistenceFormat {
+            operation: "open V3 DEK".to_owned(),
+            reason: "V3 key_version does not mirror key_generation".to_owned(),
+        });
+    }
+    if profile_id != wrapper.profile_id() {
+        return Err(SecretsError::DekWrapperMismatch {
+            field: "crypto_profile_id".to_owned(),
+        });
+    }
+    if key_id != wrapper.key_id() {
+        return Err(SecretsError::DekWrapperMismatch {
+            field: "key_id".to_owned(),
+        });
+    }
+    let aad = v3_wrap_aad(
+        record.id,
+        key_id,
+        key_generation,
+        profile_id,
+        record.kem_algo,
+        record.aead_algo,
+    )?;
+    let unwrapped = wrapper.unwrap_dek(&record.wrapped_dek, key_generation, &aad)?;
+    if unwrapped.len() != DEK_LEN {
+        return Err(SecretsError::InvalidDekLength {
+            actual: unwrapped.len(),
+        });
+    }
+    let mut dek = Zeroizing::new([0_u8; DEK_LEN]);
+    dek.copy_from_slice(&unwrapped);
+    Ok(dek)
+}
+
+/// `domain ‖ 0x00 ‖ id ‖ u32(len) key_id ‖ key_generation ‖ u32(len)
+/// profile_id ‖ KEM id ‖ AEAD id`, all integers big endian.
+///
+/// # Errors
+/// [`SecretsError::UnsupportedLegacyKem`] for a retired pure ML-KEM label;
+/// [`SecretsError::InvalidDekWrapperIdentity`] for an over-long string.
+fn v3_wrap_aad(
+    id: SecretId,
+    key_id: &str,
+    key_generation: u32,
+    profile_id: &str,
+    kem: KemAlgo,
+    aead: AeadAlgo,
+) -> SecretsResult<Vec<u8>> {
+    let suite = suite_for(kem, aead)?;
+    let mut aad = Vec::with_capacity(
+        V3_WRAP_AAD_DOMAIN.len() + 1 + 16 + 4 + key_id.len() + 4 + 4 + profile_id.len() + 2 + 2,
+    );
+    aad.extend_from_slice(V3_WRAP_AAD_DOMAIN);
+    aad.push(0);
+    aad.extend_from_slice(id.as_bytes());
+    push_length_prefixed(&mut aad, key_id)?;
+    aad.extend_from_slice(&key_generation.to_be_bytes());
+    push_length_prefixed(&mut aad, profile_id)?;
+    aad.extend_from_slice(&suite.kem().id().to_be_bytes());
+    aad.extend_from_slice(&suite.aead().id().to_be_bytes());
+    Ok(aad)
+}
+
+fn push_length_prefixed(out: &mut Vec<u8>, value: &str) -> SecretsResult<()> {
+    let len = u32::try_from(value.len()).map_err(|_| SecretsError::InvalidDekWrapperIdentity {
+        reason: "identity string too long".to_owned(),
+    })?;
+    out.extend_from_slice(&len.to_be_bytes());
+    out.extend_from_slice(value.as_bytes());
+    Ok(())
 }
 
 /// Rewrap the existing V2 DEK for the next KEK generation without touching
@@ -130,7 +452,7 @@ pub fn rewrap_v2(
     if record.envelope_format != SecretEnvelopeFormat::DekWrappedV2 {
         return Err(SecretsError::PersistenceFormat {
             operation: "rewrap V2 DEK".to_owned(),
-            reason: "legacy direct-HPKE records cannot be rewrapped".to_owned(),
+            reason: "only DEK-wrapped V2 records can be rewrapped under a local KEK".to_owned(),
         });
     }
 
@@ -313,7 +635,7 @@ const fn nonce_len(aead: AeadAlgo) -> usize {
 /// # Errors
 /// - [`SecretsError::UnsupportedLegacyKem`]: `kem` is a retired pure ML-KEM
 ///   level.
-fn suite_for(kem: KemAlgo, aead: AeadAlgo) -> SecretsResult<Suite> {
+pub(crate) fn suite_for(kem: KemAlgo, aead: AeadAlgo) -> SecretsResult<Suite> {
     Ok(Suite::new(
         kem.hpke_kem()?,
         Kdf::Shake256,
@@ -330,7 +652,7 @@ fn suite_for(kem: KemAlgo, aead: AeadAlgo) -> SecretsResult<Suite> {
 /// - [`SecretsError::Open`] with `InvalidRecipientPrivateKey`: `kek_seed` is
 ///   not exactly 32 bytes (checked here because the domain separation would
 ///   otherwise hash any length into a valid-looking seed).
-fn recipient_private_key(
+pub(crate) fn recipient_private_key(
     kem: KemAlgo,
     suite: Suite,
     kek_seed: &[u8],
@@ -395,12 +717,55 @@ fn v1_record_matches_envelope(
         && envelope.encapsulation() == record.wrapped_dek
 }
 
-const fn hpke_authentication_failed() -> crypt_guard::pq_hpke::Error {
+pub(crate) const fn hpke_authentication_failed() -> crypt_guard::pq_hpke::Error {
     crypt_guard::pq_hpke::Error::AuthenticationFailed
 }
 
 const fn hpke_internal_failure() -> crypt_guard::pq_hpke::Error {
     crypt_guard::pq_hpke::Error::InternalInvariant
+}
+
+/// Seal a legacy V1 (direct-HPKE) record. Test-only: production never writes
+/// V1 records any more, but frozen V1 fixtures and the compatibility tests
+/// need the exact layout `open_v1` reads.
+///
+/// # Errors
+/// - [`SecretsError::UnsupportedLegacyKem`]: `policy` names a retired pure
+///   ML-KEM level.
+/// - [`SecretsError::Seal`]: `kek_public` is not a valid key for the policy's
+///   hybrid KEM, or HPKE sealing failed.
+#[cfg(test)]
+pub(crate) fn seal_legacy_v1_for_tests(
+    policy: &CryptoPolicy,
+    id: SecretId,
+    key_version: KeyVersion,
+    kek_public: &[u8],
+    plaintext: &[u8],
+) -> SecretsResult<SecretRecord> {
+    let suite = suite_for(policy.kem, policy.aead)?;
+    let recipient =
+        RecipientPublicKey::from_bytes(suite.kem(), kek_public).map_err(SecretsError::Seal)?;
+    let envelope = HpkeEnvelope::seal(
+        suite,
+        &recipient,
+        HPKE_INFO_V1,
+        &v1_record_aad(id, key_version, suite),
+        plaintext,
+    )
+    .map_err(SecretsError::Seal)?;
+    Ok(SecretRecord {
+        id,
+        envelope_format: SecretEnvelopeFormat::LegacyDirectHpke,
+        ciphertext: envelope.to_bytes(),
+        nonce: Vec::new(),
+        wrapped_dek: envelope.encapsulation().to_vec(),
+        kem_algo: policy.kem,
+        aead_algo: policy.aead,
+        key_version,
+        key_id: None,
+        key_generation: None,
+        crypto_profile_id: None,
+    })
 }
 
 #[cfg(test)]
@@ -505,6 +870,9 @@ mod tests {
             kem_algo: sealed.kem_algo,
             aead_algo: sealed.aead_algo,
             key_version,
+            key_id: None,
+            key_generation: None,
+            crypto_profile_id: None,
         })
     }
 
@@ -619,6 +987,9 @@ mod tests {
                 kem_algo: sealed.kem_algo,
                 aead_algo: sealed.aead_algo,
                 key_version,
+                key_id: None,
+                key_generation: None,
+                crypto_profile_id: None,
             };
 
             assert!(matches!(
@@ -705,28 +1076,20 @@ mod tests {
     #[test]
     fn legacy_direct_hpke_records_still_open() -> TestResult {
         let policy = CryptoPolicy::ml_kem_768_x25519();
-        let suite = suite_for(policy.kem, policy.aead)?;
         let kek_public = hybrid_public_key(policy.kem, &PROVENANCE_SEED)?;
-        let id = SecretId::new();
         let key_version = KeyVersion::initial();
-        let envelope = HpkeEnvelope::seal(
-            suite,
-            &kek_public,
-            HPKE_INFO_V1,
-            &v1_record_aad(id, key_version, suite),
-            b"legacy-api-token",
-        )
-        .map_err(ctx("seal legacy envelope"))?;
-        let record = SecretRecord {
-            id,
-            envelope_format: SecretEnvelopeFormat::LegacyDirectHpke,
-            ciphertext: envelope.to_bytes(),
-            nonce: Vec::new(),
-            wrapped_dek: envelope.encapsulation().to_vec(),
-            kem_algo: policy.kem,
-            aead_algo: policy.aead,
+        let record = seal_legacy_v1_for_tests(
+            &policy,
+            SecretId::new(),
             key_version,
-        };
+            kek_public.as_bytes(),
+            b"legacy-api-token",
+        )?;
+        assert_eq!(
+            record.envelope_format,
+            SecretEnvelopeFormat::LegacyDirectHpke
+        );
+        assert!(record.nonce.is_empty());
 
         assert_eq!(
             open(&PROVENANCE_SEED, &record)?.expose_secret().as_ref(),
@@ -772,8 +1135,10 @@ mod tests {
             (KemAlgo::LegacyMlKem768, Kem::MlKem768, "ml_kem_768"),
             (KemAlgo::LegacyMlKem1024, Kem::MlKem1024, "ml_kem_1024"),
         ] {
-            // Ein echter, mit crypt_guard 3.0.1 erzeugter reiner ML-KEM-Umschlag:
-            // Das Format wäre dekodierbar, der KEM ist aber nicht mehr zulässig.
+            // Ein echter reiner ML-KEM-Umschlag, zur Testlaufzeit mit dem
+            // gepinnten crypt_guard erzeugt (ursprünglich unter 3.0.1
+            // eingeführt): Das Format wäre dekodierbar, der KEM ist aber nach
+            // harw-secrets-Richtlinie nicht mehr zulässig.
             let keys = generate_recipient_key_pair(kem).map_err(ctx("pure ML-KEM keypair"))?;
             let suite = Suite::new(kem, Kdf::Shake256, HpkeAead::XChaCha20Poly1305);
             let envelope = HpkeEnvelope::seal(
@@ -793,6 +1158,9 @@ mod tests {
                 kem_algo: legacy,
                 aead_algo: AeadAlgo::XChaCha20Poly1305,
                 key_version: KeyVersion::initial(),
+                key_id: None,
+                key_generation: None,
+                crypto_profile_id: None,
             };
             let direct_record = SecretRecord {
                 envelope_format: SecretEnvelopeFormat::LegacyDirectHpke,
@@ -857,6 +1225,435 @@ mod tests {
             open(&seed, &record),
             Err(SecretsError::InvalidDekLength { actual: 31 })
         ));
+        Ok(())
+    }
+
+    // ---- V3 (KMS-wrapped) -------------------------------------------------
+
+    use crate::dek_wrapper::{DekWrapper, LOCAL_HPKE_PROFILE_ID, LocalHpkeDekWrapper};
+    use crate::test_support::TestError;
+
+    const V3_KEY_ID: &str = "secrets/dek-wrap";
+
+    fn local_wrapper(key_id: &str, generation: u32) -> TestResult<LocalHpkeDekWrapper> {
+        Ok(LocalHpkeDekWrapper::new(
+            key_id,
+            generation,
+            CryptoPolicy::strongest(),
+            SecretBox::new(PROVENANCE_SEED.to_vec().into_boxed_slice()),
+        )?)
+    }
+
+    /// Delegates to a local wrapper but reports another crypto profile, to
+    /// prove the profile id is bound into the wrap AAD.
+    struct RelabeledProfile {
+        inner: LocalHpkeDekWrapper,
+        profile: &'static str,
+    }
+
+    impl DekWrapper for RelabeledProfile {
+        fn profile_id(&self) -> &str {
+            self.profile
+        }
+        fn key_id(&self) -> &str {
+            self.inner.key_id()
+        }
+        fn key_generation(&self) -> u32 {
+            self.inner.key_generation()
+        }
+        fn wrap_dek(&self, dek: &[u8], aad: &[u8]) -> SecretsResult<Vec<u8>> {
+            self.inner.wrap_dek(dek, aad)
+        }
+        fn unwrap_dek(
+            &self,
+            wrapped: &[u8],
+            key_generation: u32,
+            aad: &[u8],
+        ) -> SecretsResult<Zeroizing<Vec<u8>>> {
+            self.inner.unwrap_dek(wrapped, key_generation, aad)
+        }
+    }
+
+    fn v3_record_with(policy: CryptoPolicy, generation: u32) -> TestResult<SecretRecord> {
+        let wrapper = local_wrapper(V3_KEY_ID, generation)?;
+        Ok(seal_v3(&wrapper, &policy, SecretId::new(), b"api-token")?)
+    }
+
+    #[test]
+    fn v3_round_trips_with_the_local_hpke_wrapper() -> TestResult {
+        let wrapper = local_wrapper(V3_KEY_ID, 4)?;
+        for kem in HYBRID_KEMS {
+            for aead in AEADS {
+                let policy = CryptoPolicy { kem, aead };
+                let record = seal_v3(&wrapper, &policy, SecretId::new(), b"api-token")?;
+
+                assert_eq!(record.envelope_format, SecretEnvelopeFormat::KmsWrappedV3);
+                assert_eq!(record.key_id.as_deref(), Some(V3_KEY_ID));
+                assert_eq!(record.key_generation, Some(4));
+                assert_eq!(record.key_version, KeyVersion(4));
+                assert_eq!(
+                    record.crypto_profile_id.as_deref(),
+                    Some(LOCAL_HPKE_PROFILE_ID)
+                );
+                assert_eq!(record.kem_algo, kem);
+                assert_eq!(record.aead_algo, aead);
+                assert_eq!(record.nonce.len(), nonce_len(aead));
+                assert_eq!(
+                    open_v3(&wrapper, &record)?.expose_secret().as_ref(),
+                    b"api-token"
+                );
+                assert_eq!(
+                    open_with_wrapper(None, Some(&wrapper as &dyn DekWrapper), &record)?
+                        .expose_secret()
+                        .as_ref(),
+                    b"api-token"
+                );
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn v3_without_a_wrapper_fails_closed() -> TestResult {
+        let record = v3_record_with(CryptoPolicy::strongest(), 0)?;
+
+        assert!(matches!(
+            open(&PROVENANCE_SEED, &record),
+            Err(SecretsError::DekWrapperUnavailable { profile, .. })
+                if profile == LOCAL_HPKE_PROFILE_ID
+        ));
+        // And a V2 record without a seed fails closed as well.
+        let (_, v2) = sealed_record(AeadAlgo::XChaCha20Poly1305)?;
+        let wrapper = local_wrapper(V3_KEY_ID, 0)?;
+        assert!(matches!(
+            open_with_wrapper(None, Some(&wrapper as &dyn DekWrapper), &v2),
+            Err(SecretsError::KekUnavailable { .. })
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn v2_to_v3_rewrap_keeps_the_payload_and_the_plaintext() -> TestResult {
+        let wrapper = local_wrapper(V3_KEY_ID, 2)?;
+        for kem in HYBRID_KEMS {
+            for aead in AEADS {
+                let v2 = sealed_record_with(kem, aead)?;
+                let v3 = rewrap_to_v3(&PROVENANCE_SEED, &v2, &wrapper)?;
+
+                assert_eq!(v3.envelope_format, SecretEnvelopeFormat::KmsWrappedV3);
+                assert_eq!(v3.id, v2.id);
+                assert_eq!(v3.ciphertext, v2.ciphertext);
+                assert_eq!(v3.nonce, v2.nonce);
+                assert_eq!(v3.kem_algo, v2.kem_algo);
+                assert_eq!(v3.aead_algo, v2.aead_algo);
+                assert_ne!(v3.wrapped_dek, v2.wrapped_dek);
+                assert_eq!(v3.key_generation, Some(2));
+                assert_eq!(
+                    open_v3(&wrapper, &v3)?.expose_secret().as_ref(),
+                    b"api-token"
+                );
+                // The source record is untouched and still opens under V2.
+                assert_eq!(
+                    open(&PROVENANCE_SEED, &v2)?.expose_secret().as_ref(),
+                    b"api-token"
+                );
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn v2_to_v3_rewrap_requires_the_right_kek_seed() -> TestResult {
+        let wrapper = local_wrapper(V3_KEY_ID, 0)?;
+        let (_, v2) = sealed_record(AeadAlgo::XChaCha20Poly1305)?;
+
+        assert!(matches!(
+            rewrap_to_v3(&ROTATED_SEED, &v2, &wrapper),
+            Err(SecretsError::Open(_))
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn v1_to_v3_rewrap_reencrypts_and_opens() -> TestResult {
+        let wrapper = local_wrapper(V3_KEY_ID, 1)?;
+        for kem in HYBRID_KEMS {
+            let policy = CryptoPolicy {
+                kem,
+                aead: AeadAlgo::XChaCha20Poly1305,
+            };
+            let kek_public = hybrid_public_key(kem, &PROVENANCE_SEED)?;
+            let v1 = seal_legacy_v1_for_tests(
+                &policy,
+                SecretId::new(),
+                KeyVersion::initial(),
+                kek_public.as_bytes(),
+                b"legacy-api-token",
+            )?;
+            let v3 = rewrap_to_v3(&PROVENANCE_SEED, &v1, &wrapper)?;
+
+            assert_eq!(v3.envelope_format, SecretEnvelopeFormat::KmsWrappedV3);
+            assert_eq!(v3.id, v1.id);
+            assert_eq!(v3.kem_algo, kem);
+            assert_eq!(v3.nonce.len(), nonce_len(AeadAlgo::XChaCha20Poly1305));
+            assert_eq!(
+                open_v3(&wrapper, &v3)?.expose_secret().as_ref(),
+                b"legacy-api-token"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn rewrap_to_v3_refuses_a_record_that_already_is_v3() -> TestResult {
+        let wrapper = local_wrapper(V3_KEY_ID, 0)?;
+        let v3 = v3_record_with(CryptoPolicy::strongest(), 0)?;
+
+        assert!(matches!(
+            rewrap_to_v3(&PROVENANCE_SEED, &v3, &wrapper),
+            Err(SecretsError::PersistenceFormat { .. })
+        ));
+        // Local KEK rotation does not apply to V3 either.
+        let next_public = hybrid_public_key(v3.kem_algo, &ROTATED_SEED)?;
+        assert!(matches!(
+            rewrap_v2(&PROVENANCE_SEED, &v3, next_public.as_bytes(), KeyVersion(1)),
+            Err(SecretsError::PersistenceFormat { .. })
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn v3_wrong_key_generation_is_refused_with_a_typed_error() -> TestResult {
+        let record = v3_record_with(CryptoPolicy::strongest(), 1)?;
+
+        // A wrapper that only serves generation 2 (e.g. generation 1 revoked).
+        let newer = local_wrapper(V3_KEY_ID, 2)?;
+        match open_v3(&newer, &record) {
+            Err(SecretsError::KeyGenerationMismatch {
+                expected: 2,
+                found: 1,
+                ..
+            }) => {}
+            other => {
+                return Err(TestError::Unexpected(format!(
+                    "KeyGenerationMismatch erwartet: {:?}",
+                    other.map(|_| "Ok")
+                )));
+            }
+        }
+
+        // A record relabelled to another generation is refused as well,
+        // whether or not key_version still mirrors it.
+        let current = local_wrapper(V3_KEY_ID, 1)?;
+        let mut relabelled = record.clone();
+        relabelled.key_generation = Some(0);
+        relabelled.key_version = KeyVersion(0);
+        assert!(matches!(
+            open_v3(&current, &relabelled),
+            Err(SecretsError::KeyGenerationMismatch {
+                expected: 1,
+                found: 0,
+                ..
+            })
+        ));
+        let mut unmirrored = record.clone();
+        unmirrored.key_version = KeyVersion(7);
+        assert!(matches!(
+            open_v3(&current, &unmirrored),
+            Err(SecretsError::PersistenceFormat { .. })
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn v3_tampered_aad_fields_are_refused() -> TestResult {
+        let wrapper = local_wrapper(V3_KEY_ID, 0)?;
+        let record = v3_record_with(CryptoPolicy::strongest(), 0)?;
+
+        // Secret id: bound only via the AAD.
+        let mut other_id = record.clone();
+        other_id.id = SecretId::new();
+        assert!(matches!(
+            open_v3(&wrapper, &other_id),
+            Err(SecretsError::Open(_))
+        ));
+
+        // KEM label: bound via the AAD.
+        let mut other_kem = record.clone();
+        other_kem.kem_algo = KemAlgo::MlKem768P256;
+        assert!(matches!(
+            open_v3(&wrapper, &other_kem),
+            Err(SecretsError::Open(_))
+        ));
+
+        // key_id: refused against the configured wrapper ...
+        let mut other_key = record.clone();
+        other_key.key_id = Some("secrets/other".to_owned());
+        assert!(matches!(
+            open_v3(&wrapper, &other_key),
+            Err(SecretsError::DekWrapperMismatch { field }) if field == "key_id"
+        ));
+        // ... and cryptographically: a wrapper over the same KEK that serves
+        // the relabelled key id still cannot authenticate the wrap.
+        let relabelled_wrapper = local_wrapper("secrets/other", 0)?;
+        assert!(matches!(
+            open_v3(&relabelled_wrapper, &other_key),
+            Err(SecretsError::Open(_))
+        ));
+
+        // crypto_profile_id: refused against the configured wrapper ...
+        let mut other_profile = record.clone();
+        other_profile.crypto_profile_id = Some("kms-profile-x".to_owned());
+        assert!(matches!(
+            open_v3(&wrapper, &other_profile),
+            Err(SecretsError::DekWrapperMismatch { field }) if field == "crypto_profile_id"
+        ));
+        // ... and cryptographically bound into the AAD.
+        let relabelled_profile = RelabeledProfile {
+            inner: local_wrapper(V3_KEY_ID, 0)?,
+            profile: "kms-profile-x",
+        };
+        assert!(matches!(
+            open_v3(&relabelled_profile, &other_profile),
+            Err(SecretsError::Open(_))
+        ));
+
+        // Wrapped bytes and payload.
+        let mut wrapped = record.clone();
+        let last = wrapped.wrapped_dek.len() - 1;
+        wrapped.wrapped_dek[last] ^= 1;
+        assert!(open_v3(&wrapper, &wrapped).is_err());
+        let mut payload = record.clone();
+        payload.ciphertext[0] ^= 1;
+        assert!(matches!(
+            open_v3(&wrapper, &payload),
+            Err(SecretsError::PayloadAeadOpen(_))
+        ));
+
+        // The untampered record still opens.
+        assert_eq!(
+            open_v3(&wrapper, &record)?.expose_secret().as_ref(),
+            b"api-token"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn v3_record_missing_a_kms_field_is_refused() -> TestResult {
+        let wrapper = local_wrapper(V3_KEY_ID, 0)?;
+        let record = v3_record_with(CryptoPolicy::strongest(), 0)?;
+        let strips: [fn(&mut SecretRecord); 3] = [
+            |r| r.key_id = None,
+            |r| r.key_generation = None,
+            |r| r.crypto_profile_id = None,
+        ];
+        for strip in strips {
+            let mut stripped = record.clone();
+            strip(&mut stripped);
+            assert!(matches!(
+                open_v3(&wrapper, &stripped),
+                Err(SecretsError::PersistenceFormat { .. })
+            ));
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn seal_v3_refuses_a_malformed_wrapper_identity_and_a_legacy_kem() -> TestResult {
+        let bad_profile = RelabeledProfile {
+            inner: local_wrapper(V3_KEY_ID, 0)?,
+            profile: "",
+        };
+        assert!(matches!(
+            seal_v3(
+                &bad_profile,
+                &CryptoPolicy::strongest(),
+                SecretId::new(),
+                b"api-token"
+            ),
+            Err(SecretsError::InvalidDekWrapperIdentity { .. })
+        ));
+        let wrapper = local_wrapper(V3_KEY_ID, 0)?;
+        let legacy = CryptoPolicy {
+            kem: KemAlgo::LegacyMlKem768,
+            aead: AeadAlgo::XChaCha20Poly1305,
+        };
+        assert!(matches!(
+            seal_v3(&wrapper, &legacy, SecretId::new(), b"api-token"),
+            Err(SecretsError::UnsupportedLegacyKem { .. })
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn rewrap_v3_moves_to_a_new_generation_without_touching_the_payload() -> TestResult {
+        let old = local_wrapper(V3_KEY_ID, 0)?;
+        let new = local_wrapper(V3_KEY_ID, 1)?;
+        let record = v3_record_with(CryptoPolicy::strongest(), 0)?;
+
+        let rotated = rewrap_v3(&old, &record, &new)?;
+
+        assert_eq!(rotated.ciphertext, record.ciphertext);
+        assert_eq!(rotated.nonce, record.nonce);
+        assert_eq!(rotated.key_generation, Some(1));
+        assert_eq!(rotated.key_version, KeyVersion(1));
+        assert_eq!(
+            open_v3(&new, &rotated)?.expose_secret().as_ref(),
+            b"api-token"
+        );
+        assert!(matches!(
+            open_v3(&old, &rotated),
+            Err(SecretsError::KeyGenerationMismatch { .. })
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn v3_json_carries_the_kms_fields_while_fresh_v2_json_does_not() -> TestResult {
+        let v3 = v3_record_with(CryptoPolicy::strongest(), 3)?;
+        let v3_json: serde_json::Value = serde_json::to_value(&v3)?;
+        let v3_object = v3_json
+            .as_object()
+            .ok_or(TestError::Missing("V3 JSON object"))?;
+        assert_eq!(
+            v3_object.get("envelope_format"),
+            Some(&serde_json::json!("kms_wrapped_v3"))
+        );
+        assert_eq!(v3_object.get("key_id"), Some(&serde_json::json!(V3_KEY_ID)));
+        assert_eq!(v3_object.get("key_generation"), Some(&serde_json::json!(3)));
+        assert_eq!(
+            v3_object.get("crypto_profile_id"),
+            Some(&serde_json::json!(LOCAL_HPKE_PROFILE_ID))
+        );
+        let decoded: SecretRecord = serde_json::from_value(v3_json)?;
+        assert_eq!(decoded, v3);
+
+        let (_, v2) = sealed_record(AeadAlgo::XChaCha20Poly1305)?;
+        let v2_json: serde_json::Value = serde_json::to_value(&v2)?;
+        let v2_object = v2_json
+            .as_object()
+            .ok_or(TestError::Missing("V2 JSON object"))?;
+        for absent in ["key_id", "key_generation", "crypto_profile_id"] {
+            assert!(
+                !v2_object.contains_key(absent),
+                "fresh V2 JSON must not contain {absent}"
+            );
+        }
+        let mut v2_keys = v2_object.keys().map(String::as_str).collect::<Vec<_>>();
+        v2_keys.sort_unstable();
+        assert_eq!(
+            v2_keys,
+            [
+                "aead_algo",
+                "ciphertext",
+                "envelope_format",
+                "id",
+                "kem_algo",
+                "key_version",
+                "nonce",
+                "wrapped_dek",
+            ]
+        );
         Ok(())
     }
 }

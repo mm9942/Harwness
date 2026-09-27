@@ -188,6 +188,27 @@ layer = "D"
 layer = "D"
 [packages."harw-dod-escalate"]
 layer = "D"
+# Crypto-Masterplan v2 §3/H2: Harw-Schlüsselzwecke, Nutzungsrichtlinie,
+# sichere Rahmen, Abbildung auf crypt_guard_service. Kein TCB; von der
+# Fassade `harw-dod`, Warden, Probes und Sensoren aus unerreichbar
+# (Gate `edges`, FORBIDDEN/FORBIDDEN_REACH).
+[packages."harw-auth-hub"]
+layer = "A"
+
+[packages."harw-infra-client"]
+layer = "I"
+
+[packages."harw-netsec"]
+layer = "A"
+
+[packages."harw-node-transport"]
+layer = "A"
+
+[packages."harw-security-hub"]
+layer = "A"
+
+[packages."harw-dod-encrypt"]
+layer = "D"
 [packages."harw-dod-fixtures"]
 layer = "D"
 [packages."harw-dod-flow"]

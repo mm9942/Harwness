@@ -247,6 +247,31 @@
     },
     "required_env": []
   },
+  "requirements": {
+    "targets": [],
+    "process_exec": false,
+    "host_access": false,
+    "network": "none",
+    "filesystem_write": false,
+    "sandbox": {
+      "filesystem": "not_needed",
+      "network": "not_needed",
+      "no_new_privs": "not_needed",
+      "capabilities": "not_needed",
+      "resource_limits": "not_needed"
+    },
+    "resources": {
+      "memory_max_bytes": null,
+      "pids_max": null,
+      "wall_timeout_secs": null
+    },
+    "kernel": {
+      "landlock": false,
+      "cgroup_v2": false,
+      "user_namespaces": false
+    },
+    "dod_ebpf": false
+  },
   "trace": {
     "steps": [
       {
@@ -282,6 +307,6 @@
   },
   "snapshot": {
     "domain": "harwness.agent-ir.snapshot/v7",
-    "digest": "f1877d44e010adf703c4386714a5d65dd2e437c885c26594bdfe50d587b8757f"
+    "digest": "e9819c286a42d4a685b40162a14dc609fd80b9173544b4102bf5315ee4f79bc0"
   }
 }

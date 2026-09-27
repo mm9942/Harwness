@@ -48,6 +48,16 @@
 //! Es gibt keinen Token im HTTP-Rumpf oder -Header, der die Identität eines
 //! Aufrufers bestimmt.
 //!
+//! # Identität, Mandant, SecurityHub (H12)
+//! [`identity::LocalPeerIdentityResolver`] hebt `SO_PEERCRED → Tier` auf
+//! `SO_PEERCRED → Tier + Mandant (+ vom SecurityHub bestätigter Kontext)`.
+//! Modus `tier_map` (Vorgabe) ist das bisherige Verhalten; Modus
+//! `security_hub` bindet eine vom Client vorgelegte Kontext-Id
+//! ([`identity::SECURITY_CONTEXT_HEADER`]) an die Peer-UID. Die Entscheidung
+//! bleibt bei [`router::decide_resolved_route`] (dieselbe Matrix), der
+//! Mandant gelangt nur über [`identity::ResolvedPeer::scope_op_context`] in
+//! den `OpContext` — nie aus dem Rumpf. Siehe `identity`-Moduldoku.
+//!
 //! # Sequenznummer im Ereignisstrom
 //! `GET /events` liefert Server-Sent Events; jedes [`events::WebEvent`]
 //! trägt ein monoton steigendes `sequence: u64` (siehe `events`-Moduldoku).
@@ -125,6 +135,13 @@
 //! - **Kein Markdown-Rendering, keine aktiven Links.** `OpOutput::text`
 //!   wird unverändert als JSON-Zeichenkette weitergereicht.
 //!
+//! # Infrastruktur-Metafläche und Socket-Aktivierung (H9)
+//! [`meta`] beantwortet `GET /v1/health` (ohne Stufe), `/v1/version` und
+//! `/v1/capabilities` (niedrigste Stufe) im Vertrag von
+//! `harw-infra-client::info`. [`systemd`] übernimmt einen von systemd
+//! übergebenen Listener ([`BoundWebServer::from_std_listener`]) für
+//! `harw web --systemd-socket`.
+//!
 //! # Stand
 //! Gerüst aus Knoten AW0-00 (Workspace-Fundament); Inhalt aus Knoten
 //! **UI-00**; Ebene **L6** im Zielgraphen.
@@ -134,18 +151,26 @@
 pub mod authz;
 pub mod error;
 pub mod events;
+pub mod identity;
+pub mod meta;
 pub mod peer;
 pub mod router;
 pub mod security;
 pub mod server;
+pub mod systemd;
 
 pub use authz::{PeerAuthorizer, StaticUidTierMap, tier_permits};
 pub use error::{WebError, WebResult};
 pub use events::{WebEvent, WebEventBus, WebEventKind, WebEventReceiveError, WebEventSubscription};
+pub use identity::{
+    ContextVerifier, HubVerdict, IdentityConfigError, IdentityError, IdentityMode, IdentitySource,
+    LocalPeerIdentityResolver, ResolvedPeer, SECURITY_CONTEXT_HEADER, SecurityHubResolver,
+    TierMapResolver, UidTenantMap, VerifierError, WebIdentityConfig, presented_context,
+};
 pub use peer::{PeerCredentials, read_peer_credentials};
 pub use router::{
-    ForbiddenReason, RouteDecision, WebMethod, WebRouteTable, decide_route, method_name,
-    parse_web_method,
+    ForbiddenReason, RouteDecision, WebMethod, WebRouteTable, decide_resolved_route, decide_route,
+    method_name, parse_web_method,
 };
 pub use security::{
     ApprovalActorResolver, ApprovalCaller, SecurityError, StaticUidApprovalActorMap,

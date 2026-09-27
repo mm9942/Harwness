@@ -110,8 +110,11 @@ Builds run as a job (`harw-tool-job`) with progress in the panel.
 After lowering, the compiler runs, in order: `ValidateRoles`, `RightsCheck`
 (manifest ≤ base role ≤ author ceiling), `ResolveSkills` (embed skill
 content from the `SkillIndex`), `ReachableTools` (which tool providers are
-needed), `PruneUnusedTools`, and `ResolveModels` (required environment
-variables go into the manifest). `ReachableTools` and `PruneUnusedTools`
+needed), `PruneUnusedTools`, `ResolveModels` (required environment
+variables go into the manifest), `DeriveRequirements` (PL-90: the execution
+requirements — build target, sandbox levels, kernel features — from the
+pruned manifest) and `ChildClosure` (children embedded, their requirements
+unioned into the parent). `ReachableTools` and `PruneUnusedTools`
 use a capability catalog (tool name → provider) in
 `harw-registry-defaults`, as foreseen in the composition contract §6.
 

@@ -1,0 +1,22 @@
+[package]
+publish = false
+name = "harw-dod-encrypt"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "Harw-specific crypto semantics over CryptGuard's service layer: key purposes, usage policy, canonical sign transcripts, secure frame header, replay window (Masterplan v2 H2)."
+
+[dependencies]
+# The one crypto dependency (Masterplan v2 §3, §21: `harw-dod-encrypt ->
+# crypt_guard service` is an allowed edge). Only the typed service layer: no
+# Hyper, no Tower stack (`buffer` feature stays off), no key storage. All
+# crypt_guard types stay behind the `cg` boundary module (see src/cg.rs).
+crypt_guard_service = { workspace = true }
+# `#[derive(harw_macros::HarwError)]` for `error.rs` (one error type per
+# crate, like every other DoD crate). Proc-macro only; no runtime weight.
+harw-macros = { path = "../../../harw-macros" }
+
+[lints]
+workspace = true

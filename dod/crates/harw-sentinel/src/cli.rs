@@ -20,6 +20,7 @@
 use std::path::PathBuf;
 
 use clap::Parser;
+use harw_types::HostId;
 
 /// Vorgabe: das IPC-Empfangssocket liegt unter `<home>/sentinel.sock`.
 ///
@@ -197,6 +198,37 @@ pub struct Cli {
     /// statt endlos zu laufen. Für Diagnose und Tests am realen Host.
     #[arg(long, default_value_t = false)]
     pub once: bool,
+
+    /// Optionaler JSON-Lines-Export jedes zertifizierten Befundes für
+    /// `harw-security-hub` (siehe `crate::export`), z. B.
+    /// `/var/lib/harw-sentinel/findings.jsonl`. Muss absolut sein. Ohne
+    /// Angabe wird nichts exportiert.
+    #[arg(long, value_name = "PATH", value_parser = parse_absolute_path)]
+    pub findings_export: Option<PathBuf>,
+
+    /// `host`-Feld jeder Exportzeile — muss `server.host` des Hubs
+    /// entsprechen. Ohne Angabe: der Kernel-Hostname
+    /// (`/proc/sys/kernel/hostname`). Nur mit `--findings-export` wirksam.
+    #[arg(long, value_name = "ID", value_parser = parse_host_id)]
+    pub findings_host: Option<HostId>,
+}
+
+/// `clap`-Wertparser für `--findings-export`: nur absolute Pfade.
+fn parse_absolute_path(raw: &str) -> Result<PathBuf, String> {
+    let path = PathBuf::from(raw);
+    if path.is_absolute() {
+        Ok(path)
+    } else {
+        Err(format!("'{raw}' is not an absolute path"))
+    }
+}
+
+/// `clap`-Wertparser für `--findings-host`: nicht leer, keine Steuerzeichen.
+fn parse_host_id(raw: &str) -> Result<HostId, String> {
+    if raw.chars().any(char::is_control) {
+        return Err("host id must not contain control characters".to_owned());
+    }
+    HostId::try_from_str(raw.trim()).map_err(|error| error.to_string())
 }
 
 #[cfg(test)]
@@ -329,6 +361,51 @@ mod tests {
             std::path::PathBuf::from(super::DEFAULT_CGROUP_ROOT)
         );
         Ok(())
+    }
+
+    #[test]
+    fn test_findings_export_is_disabled_when_not_configured() -> TestResult {
+        let cli = Cli::try_parse_from(["harw-sentinel"]).map_err(ctx("no required args"))?;
+        assert!(cli.findings_export.is_none());
+        assert!(cli.findings_host.is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn test_findings_export_accepts_an_absolute_path_and_host() -> TestResult {
+        let cli = Cli::try_parse_from([
+            "harw-sentinel",
+            "--findings-export",
+            "/var/lib/harw-sentinel/findings.jsonl",
+            "--findings-host",
+            "host-a",
+        ])
+        .map_err(ctx("valid export flags"))?;
+        assert_eq!(
+            cli.findings_export,
+            Some(std::path::PathBuf::from(
+                "/var/lib/harw-sentinel/findings.jsonl"
+            ))
+        );
+        assert_eq!(
+            cli.findings_host.as_ref().map(harw_types::HostId::as_str),
+            Some("host-a")
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn test_findings_export_rejects_a_relative_path() {
+        let result = Cli::try_parse_from(["harw-sentinel", "--findings-export", "findings.jsonl"]);
+        assert!(result.is_err(), "a relative export path must not parse");
+    }
+
+    #[test]
+    fn test_findings_host_rejects_blank_and_control_characters() {
+        for bad in ["", "   ", "host\nb"] {
+            let result = Cli::try_parse_from(["harw-sentinel", "--findings-host", bad]);
+            assert!(result.is_err(), "{bad:?} must not parse as a host id");
+        }
     }
 
     #[test]

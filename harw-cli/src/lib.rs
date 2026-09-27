@@ -594,6 +594,7 @@ fn command_label(command: Option<&Command>) -> String {
             Command::Onboard => "onboard",
             Command::Doctor { .. } => "doctor",
             Command::Update { .. } => "update",
+            Command::Install { .. } => "install",
             Command::Uninstall { .. } => "uninstall",
             Command::Completions(_) => "completions",
             Command::BugReport { .. } => "bug-report",
@@ -825,11 +826,24 @@ fn dispatch(cli: Cli) -> Result<(), String> {
             serve_mcp(layers, storage_root, home)
         }
         Some(Command::Mcp { action }) => mcp::run(home_override, action),
-        Some(Command::Web { socket }) => {
+        Some(Command::Web {
+            socket,
+            system,
+            systemd_socket,
+            socket_group,
+        }) => {
             // `harw web` kennt kein `--config-dir` mehr: der Root-Space kommt
             // ausschließlich aus `--home` bzw. `HARW_HOME` (siehe `crate::web`).
             let home = web_home(home::resolve_home(home_override))?;
-            web::serve_web(Some(home), socket)
+            web::serve_web(
+                Some(home),
+                web::WebListenOptions {
+                    socket,
+                    system,
+                    systemd_socket,
+                    socket_group,
+                },
+            )
         }
         Some(Command::Project { action }) => project_trust::run(home_override, action),
         Some(Command::Config { action }) => settings::run(home_override, action),
@@ -855,6 +869,7 @@ fn dispatch(cli: Cli) -> Result<(), String> {
         Some(Command::Auth { action }) => auth::run(home_override, action),
         Some(Command::Completions(command)) => completions::run(command),
         Some(Command::Update { check }) => lifecycle::update(home_override, check),
+        Some(Command::Install { print_systemd }) => lifecycle::install(print_systemd),
         Some(Command::Service { action }) => lifecycle::service(home_override, action),
         Some(Command::Catalog { refresh }) => {
             legacy_hint("catalog", "model catalog");
@@ -980,6 +995,7 @@ fn run_startup_migrations(
             | Command::Debug { .. }
             | Command::Completions(_)
             | Command::Update { .. }
+            | Command::Install { .. }
             | Command::Service { .. }
             | Command::Catalog { .. }
             | Command::Auth { .. }

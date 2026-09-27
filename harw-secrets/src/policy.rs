@@ -4,9 +4,11 @@
 //! `kem_algo`/`aead_algo` they recorded at seal time, **sofern** dieser KEM
 //! ein hybrider ist.
 //!
-//! Hybrid-KEM-Umstellung (W0b): `crypt_guard` 3.0.1 leitet deterministische
-//! Empfängerschlüssel aus einem 32-Byte-Seed nur noch für die hybriden
-//! draft-ietf-hpke-pq-05-KEMs ab. Die reinen ML-KEM-Stufen bleiben als
+//! Hybrid-KEM-Umstellung (W0b): `harw-secrets` leitet deterministische
+//! Empfängerschlüssel aus dem 32-Byte-Seed ausschließlich für die hybriden
+//! draft-ietf-hpke-pq-05-KEMs ab. Das ist eine Harwness-Richtlinie, keine
+//! Grenze von `crypt_guard` (3.0.2 könnte über `derive_recipient_key_pair`
+//! auch reine ML-KEM-Schlüssel ableiten). Die reinen ML-KEM-Stufen bleiben als
 //! `Legacy*`-Varianten ausschließlich lesbar (Deserialisierung alter Datensätze),
 //! können aber weder serialisiert noch zum Siegeln oder Öffnen verwendet werden —
 //! jede solche Verwendung endet in [`SecretsError::UnsupportedLegacyKem`].
@@ -73,8 +75,8 @@ impl KemAlgo {
     ///
     /// # Errors
     /// - [`SecretsError::UnsupportedLegacyKem`]: der KEM ist eine veraltete reine
-    ///   ML-KEM-Stufe, für die `crypt_guard` 3.0.1 keine deterministische
-    ///   Seed-Ableitung mehr bietet.
+    ///   ML-KEM-Stufe; `harw-secrets` lässt sie per Richtlinie nur noch als
+    ///   lesbare Metadaten zu (keine Seed-Ableitung, kein Siegeln/Öffnen).
     pub(crate) fn hpke_kem(self) -> SecretsResult<Kem> {
         match self {
             Self::MlKem768P256 => Ok(Kem::MlKem768P256),

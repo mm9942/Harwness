@@ -10,13 +10,15 @@
 //! - [`resources`]: [`JobResources`] (cgroup limits) and [`RlimitSet`].
 //! - [`capabilities`]: capability drop via rustix (no second cap crate).
 //! - [`sandbox`]: [`SandboxPolicy`] model, profiles, Landlock planning;
-//!   enforcement with feature `linux-sandbox`.
+//!   enforcement with feature `linux-sandbox`; side-effect-free host
+//!   probes ([`LandlockSupport`], user namespaces).
 //! - `proc` *(feature `linux-basic`)*: `/proc` observation via `procfs`.
 //! - `recovery` *(feature `linux-basic`)*: `LinuxRecoveryIdentity` —
 //!   verified control of processes after a restart; a PID alone never
 //!   authorises a signal.
-//! - `cgroup` *(feature `linux-cgroup-v2`)*: project-owned `CgroupBackend`
-//!   and the in-house cgroupfs backend `CgroupV2Fs`.
+//! - `cgroup` *(feature `linux-cgroup-v2`)*: project-owned `CgroupBackend`,
+//!   the in-house cgroupfs backend `CgroupV2Fs` and the read-only
+//!   `cgroup::detect` probe.
 //! - `filesystem` *(features `linux-sandbox` / `linux-cgroup-v2`)*:
 //!   `CapDir` — directory capabilities via `cap-std`.
 //! - [`error`]: typed error domains (§22).
@@ -35,7 +37,9 @@
 //! - `linux-cgroup-v2`: cgroup v2 backend.
 //!
 //! # Concurrency
-//! All handles are `Send`. Nothing here spawns threads or holds locks;
+//! All handles are `Send`. Nothing here holds locks, and the only thread
+//! ever spawned is the short-lived, joined Landlock probe thread of
+//! `sandbox::landlock_support`;
 //! blocking waits are explicit (`wait`, `wait_timeout`, `terminate`).
 //! Sandbox and capability operations act on the **calling thread** only.
 
@@ -85,7 +89,9 @@ pub use resources::{
     RlimitValue,
 };
 #[cfg(target_os = "linux")]
-pub use sandbox::{CapabilityPolicy, FilesystemPolicy, LandlockMode, NetworkPolicy, SandboxPolicy};
+pub use sandbox::{
+    CapabilityPolicy, FilesystemPolicy, LandlockMode, LandlockSupport, NetworkPolicy, SandboxPolicy,
+};
 
 /// Job-Runtime-Doc §8 names the resource type `LinuxResources`.
 #[cfg(target_os = "linux")]

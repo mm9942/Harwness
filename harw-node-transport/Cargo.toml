@@ -1,0 +1,49 @@
+[package]
+publish.workspace = true
+name = "harw-node-transport"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "Layer A remote node transport: mutually authenticated node channels (rustls/aws-lc-rs TLS 1.3 with X25519MLKEM768 + ML-DSA-65 node transcripts bound to the TLS exporter), Hyper/Tower service exposure and the read-only DoD uplink (WP-15)."
+
+# Every external crate below is already in the workspace `Cargo.lock` at
+# exactly the version named here; this crate adds no package and no new C
+# provider. See README.md, "Which TLS / crypto stack and why".
+[dependencies]
+harw-types = { path = "../harw-types" }
+
+# TLS 1.3 channel. The workspace already locks rustls 0.23.45 with the
+# aws-lc-rs provider (reqwest 0.13 `rustls`) — reused, not a new stack.
+# `default-features = false`: no TLS 1.2, no implicit process-wide provider;
+# the provider is passed explicitly (`builder_with_provider`).
+rustls = { version = "0.23.45", default-features = false, features = ["std", "aws_lc_rs"] }
+tokio-rustls = { version = "0.26.4", default-features = false }
+# Same aws-lc-rs 1.18.1 rustls already builds, same feature set rustls
+# enables (`aws-lc-sys`, `prebuilt-nasm`): ML-DSA-65 verification of node
+# transcripts, the ephemeral Ed25519 TLS raw public key, nonces.
+aws-lc-rs = { version = "1.18.1", default-features = false, features = ["aws-lc-sys", "prebuilt-nasm"] }
+
+# Hyper/Tower exposure. Same major versions as harw-web / harw-mcp-server /
+# harw-infra-client.
+hyper = { version = "1", features = ["server", "client", "http1"] }
+hyper-util = { version = "0.1", features = ["tokio", "service"] }
+tower-service = "0.3"
+http = "1"
+http-body = "1"
+http-body-util = "0.1"
+bytes = "1"
+tokio = { version = "1", features = ["net", "rt", "time", "io-util", "sync", "macros"] }
+
+# Uplink event wire format (JSON lines).
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = "2"
+tracing = { workspace = true }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["net", "rt", "rt-multi-thread", "time", "io-util", "sync", "macros"] }
+
+[lints]
+workspace = true

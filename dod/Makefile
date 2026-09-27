@@ -12,8 +12,8 @@ SYSCONFDIR ?= /etc/harw-dod
 LOCALSTATEDIR ?= /var
 STATEDIR ?= $(LOCALSTATEDIR)/lib/harw-dod
 LOGDIR ?= $(LOCALSTATEDIR)/log/harw-dod
-RUNSTATEDIR ?= /run
-RUNTIMEDIR ?= $(RUNSTATEDIR)/harw-dod
+# Runtime sockets live in the fixed /run/harw (deploy/tmpfiles.d/harw.conf);
+# there is no runtime-directory knob.
 SYSTEMD_UNITDIR ?= $(PREFIX)/lib/systemd/system
 SYSUSERSDIR ?= $(PREFIX)/lib/sysusers.d
 TMPFILESDIR ?= $(PREFIX)/lib/tmpfiles.d
@@ -41,8 +41,8 @@ BPF_ARTIFACT_DIR ?= $(CURDIR)/bpf
 INSTALL_ENV = DESTDIR='$(DESTDIR)' PREFIX='$(PREFIX)' \
 	LIBEXECDIR='$(LIBEXECDIR)' LIBDIR='$(LIBDIR)' BPFDIR='$(BPFDIR)' \
 	SYSCONFDIR='$(SYSCONFDIR)' LOCALSTATEDIR='$(LOCALSTATEDIR)' \
-	STATEDIR='$(STATEDIR)' LOGDIR='$(LOGDIR)' RUNSTATEDIR='$(RUNSTATEDIR)' \
-	RUNTIMEDIR='$(RUNTIMEDIR)' SYSTEMD_UNITDIR='$(SYSTEMD_UNITDIR)' \
+	STATEDIR='$(STATEDIR)' LOGDIR='$(LOGDIR)' \
+	SYSTEMD_UNITDIR='$(SYSTEMD_UNITDIR)' \
 	SYSUSERSDIR='$(SYSUSERSDIR)' TMPFILESDIR='$(TMPFILESDIR)' \
 	BINARY_DIR='$(BINARY_DIR)' BPF_ARTIFACT_DIR='$(BPF_ARTIFACT_DIR)'
 
@@ -75,7 +75,8 @@ help:
 		'  stage-test   static packaging/placeholder checks (no Cargo invocation)' \
 		'' \
 		'Install variables: DESTDIR PREFIX LIBEXECDIR LIBDIR BPFDIR SYSCONFDIR' \
-		'LOCALSTATEDIR RUNSTATEDIR SYSTEMD_UNITDIR SYSUSERSDIR TMPFILESDIR.'
+		'LOCALSTATEDIR STATEDIR LOGDIR SYSTEMD_UNITDIR SYSUSERSDIR TMPFILESDIR.' \
+		'Units, sysusers and tmpfiles are installed from ../deploy (canonical source).'
 
 doctor:
 	@exec scripts/doctor.sh
@@ -183,7 +184,7 @@ enable-warden:
 	$(PRIV_ESC) install -d -m 0750 '$(SYSCONFDIR)'; \
 	$(PRIV_ESC) touch '$(SYSCONFDIR)/warden.enable'; \
 	$(PRIV_ESC) systemctl daemon-reload; \
-	$(PRIV_ESC) systemctl enable --now harw-dod-warden.socket; \
+	$(PRIV_ESC) systemctl enable --now harw-warden.socket; \
 	printf '%s\n' 'Warden guard file created and socket enabled/started.'
 
 disable:

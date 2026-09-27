@@ -3,7 +3,7 @@
 use std::path::{Path, PathBuf};
 
 use harw_agent_artifact::{ARTIFACT_MAGIC, Artifact, ArtifactDigest, EmbeddedArtifact, PoolStats};
-use harw_agent_dsl::ir_v2::AgentIr;
+use harw_agent_dsl::ir_v2::{AgentIr, ExecutionRequirements};
 use serde::Serialize;
 
 use crate::artifact_out::{INSTRUCTIONS_PAYLOAD_PATH, bundle_of, entry_ir, ir_from_artifact};
@@ -282,6 +282,7 @@ impl InspectReport {
             "  env:        {}\n",
             list(&permissions.required_env)
         ));
+        out.push_str(&requirements_block(&ir.requirements));
         if let Some(models) = &ir.models {
             out.push_str(&format!(
                 "  models:     {}/{} effort={}\n",
@@ -334,6 +335,45 @@ impl InspectReport {
     }
 }
 
+/// The `requirements:` block of [`InspectReport::text`] (PL-90): what the
+/// artifact needs from the machine that executes it.
+#[must_use]
+pub fn requirements_block(requirements: &ExecutionRequirements) -> String {
+    let targets: Vec<String> = requirements
+        .targets
+        .iter()
+        .map(harw_agent_dsl::ir_v2::TargetSpec::label)
+        .collect();
+    let targets = if targets.is_empty() {
+        "any".to_owned()
+    } else {
+        targets.join(", ")
+    };
+    let sandbox = &requirements.sandbox;
+    let resources = &requirements.resources;
+    let kernel = &requirements.kernel;
+    let number = |value: Option<u64>| value.map_or_else(|| "-".to_owned(), |v| v.to_string());
+    format!(
+        "  requirements:\n    targets:    {targets}\n    process:    exec={} host={} write={}\n    network:    {}\n    sandbox:    filesystem={} network={} no_new_privs={} capabilities={} resource_limits={}\n    resources:  memory_bytes={} pids={} wall_secs={}\n    kernel:     landlock={} cgroup_v2={} user_namespaces={} dod_ebpf={}\n",
+        requirements.process_exec,
+        requirements.host_access,
+        requirements.filesystem_write,
+        requirements.network.label(),
+        sandbox.filesystem.as_str(),
+        sandbox.network.as_str(),
+        sandbox.no_new_privs.as_str(),
+        sandbox.capabilities.as_str(),
+        sandbox.resource_limits.as_str(),
+        number(resources.memory_max_bytes),
+        number(resources.pids_max),
+        number(resources.wall_timeout_secs),
+        kernel.landlock,
+        kernel.cgroup_v2,
+        kernel.user_namespaces,
+        requirements.dod_ebpf,
+    )
+}
+
 fn list(items: &[String]) -> String {
     if items.is_empty() {
         "-".to_owned()
@@ -357,5 +397,46 @@ mod tests {
         let line = pool_line(&pool);
         assert!(line.starts_with("12 Referenzen, 5 einzigartig"), "{line}");
         assert!(line.contains("gespart 3072 KiB"), "{line}");
+    }
+
+    #[test]
+    fn test_requirements_block_snapshot() {
+        use harw_agent_dsl::ir_v2::{
+            NetworkRequirement, RequirementLevel, ResourceRequirements, SandboxRequirementLevels,
+            TargetSpec,
+        };
+        let requirements = ExecutionRequirements {
+            targets: vec![TargetSpec {
+                os: "linux".to_owned(),
+                arch: Some("x86_64".to_owned()),
+            }],
+            process_exec: true,
+            filesystem_write: true,
+            network: NetworkRequirement::Hosts(vec!["docs.rs".to_owned()]),
+            sandbox: SandboxRequirementLevels {
+                filesystem: RequirementLevel::Required,
+                network: RequirementLevel::BestEffort,
+                no_new_privs: RequirementLevel::Required,
+                capabilities: RequirementLevel::Required,
+                resource_limits: RequirementLevel::BestEffort,
+            },
+            resources: ResourceRequirements {
+                wall_timeout_secs: Some(300),
+                ..ResourceRequirements::default()
+            },
+            ..ExecutionRequirements::default()
+        };
+        let expected = "  requirements:
+    targets:    linux/x86_64
+    process:    exec=true host=false write=true
+    network:    hosts: docs.rs
+    sandbox:    filesystem=required network=best_effort no_new_privs=required capabilities=required resource_limits=best_effort
+    resources:  memory_bytes=- pids=- wall_secs=300
+    kernel:     landlock=false cgroup_v2=false user_namespaces=false dod_ebpf=false
+";
+        assert_eq!(requirements_block(&requirements), expected);
+        let default = requirements_block(&ExecutionRequirements::default());
+        assert!(default.contains("targets:    any\n"), "{default}");
+        assert!(default.contains("network:    none\n"), "{default}");
     }
 }

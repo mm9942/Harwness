@@ -57,6 +57,11 @@ pub trait ChildResolver {
 /// fewer tools than the workers it starts. Each child's tools are bounded by
 /// its own base role (its own `RightsCheck`), and at runtime the runner
 /// grants min(child manifest, parent's live rights).
+///
+/// Execution requirements go the other way: they are *unioned* upwards
+/// (every child's requirements into the parent's, transitively), because the
+/// target that admits the root artifact must be able to run every agent in
+/// it (`ExecutionRequirements::union_child`).
 pub struct ChildClosure<'a> {
     /// The resolver (the driver).
     pub resolver: &'a dyn ChildResolver,
@@ -128,6 +133,11 @@ impl Pass for ChildClosure<'_> {
                     .with_span(unit.span_of_item(path, &name)),
                 );
             }
+            // The family runs from one artifact on one target: the parent's
+            // execution requirements cover every embedded child (PL-90;
+            // union semantics: `ExecutionRequirements::union_child`). The
+            // child's IR already carries its own children's requirements.
+            unit.ir.requirements = unit.ir.requirements.union_child(&child.ir.requirements);
             let child_rights = RightsSet::claimed_by(&child.ir);
             // Every child runs the same executable, including in job mode.
             // Native linking must therefore include the whole family's tools.

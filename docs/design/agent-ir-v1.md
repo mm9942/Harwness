@@ -246,6 +246,8 @@ control flow:
 | `ReachableTools` | determine which tool providers the admitted tools need |
 | `PruneUnusedTools` | drop providers no admitted tool reaches (implements `RemoveUnusedTools` from §3 at provider level) |
 | `ResolveModels` | resolve model preferences and put required environment variables into the manifest |
+| `DeriveRequirements` | derive `requirements` (build target, process/host/network/write needs, sandbox levels, resource limits, kernel features) from the pruned manifest (PL-90) |
+| `ChildClosure` | embed every reachable child; child ≤ parent; union the children's `requirements` into the parent |
 
 The serialized form of `AgentIr` is the header of the agent artifact:
 [`agent-artifact-v1.md`](agent-artifact-v1.md).

@@ -16,6 +16,8 @@ pub mod dod_toml;
 pub mod dotenv;
 pub mod error;
 pub mod harness_config;
+// Crypto-Infrastruktur H4: `[infrastructure]` — Daemon-Sockets.
+pub mod infrastructure_toml;
 pub mod internal_models;
 pub mod loader;
 pub mod mcp_toml;
@@ -66,6 +68,8 @@ pub use harness_config::{
 pub use shell_limits::ShellToml;
 // Runde 5, Teil I: Live-Stream der Kind-Agenten (`[tui] child_stream`).
 pub use harness_config::ChildStreamModeToml;
+// Crypto-Infrastruktur H4: `[infrastructure]`.
+pub use infrastructure_toml::InfrastructureSection;
 // Runde 5, Teil E: `ANTHROPIC_FAST_MODEL`/`fast_model_for_active_provider`
 // (Vorgabe-Modell des Auto-Modus-Klassifizierers).
 pub use internal_models::{
@@ -99,7 +103,7 @@ pub use uia_worker_models::{
     UiaWorkerModelSource, UiaWorkerModelsToml, catalog_provider_of, provider_is_logged_in,
     resolve_uia_worker_model, resolve_uia_worker_models,
 };
-pub use web_toml::{WebSearchToml, WebSection};
+pub use web_toml::{WebIdentityModeToml, WebIdentityToml, WebSearchToml, WebSection};
 pub use writer::{ConfigWriter, RuleKind};
 
 // Test-Fehlertyp (Bible R087/R165/R182), nur für Tests.

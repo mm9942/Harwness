@@ -9,8 +9,8 @@ use harw_agent_dsl::bind::ContextProgramLibrary;
 use harw_agent_dsl::diagnostics::{Diagnostics, SourceFile};
 use harw_agent_dsl::ids::DefinitionId;
 use harw_agent_dsl::ir_v2::{
-    AGENT_IR_SCHEMA, AGENT_IR_SNAPSHOT_DOMAIN, AgentIr, Effort, Interface, NetworkMode,
-    ReturnContract,
+    AGENT_IR_SCHEMA, AGENT_IR_SNAPSHOT_DOMAIN, AgentIr, Effort, ExecutionRequirements, Interface,
+    NetworkMode, ReturnContract,
 };
 use harw_agent_dsl::layers::DefinitionLayer;
 use harw_agent_dsl::lower_v2::{LowerSources, MapInstructionsLoader, compile_agent};
@@ -266,6 +266,36 @@ fn test_deny_unknown_fields_at_top_level_and_nested() -> TestResult {
     network.insert("ports".to_owned(), serde_json::Value::Null);
     assert!(serde_json::from_value::<AgentIr>(permissions).is_err());
     assert!(ir.verify_snapshot());
+    Ok(())
+}
+
+#[test]
+fn test_requirements_default_after_lowering_are_optional_in_json_and_hashed() -> TestResult {
+    let ir = compile(AGENT)?;
+    assert_eq!(ir.requirements, ExecutionRequirements::default());
+
+    // IR JSON written before PL-90 has no `requirements` key.
+    let mut value = serde_json::to_value(&ir).map_err(ctx("to_value"))?;
+    let object = value.as_object_mut().ok_or(TestError::Missing("object"))?;
+    let removed = object.remove("requirements");
+    assert!(removed.is_some(), "the lowered IR serializes requirements");
+    let back: AgentIr = serde_json::from_value(value).map_err(ctx("from_value"))?;
+    assert_eq!(back, ir);
+
+    // Unknown keys inside `requirements` are rejected.
+    let mut nested = serde_json::to_value(&ir).map_err(ctx("to_value"))?;
+    let requirements = nested
+        .get_mut("requirements")
+        .and_then(serde_json::Value::as_object_mut)
+        .ok_or(TestError::Missing("requirements"))?;
+    requirements.insert("gpu".to_owned(), serde_json::Value::Bool(true));
+    assert!(serde_json::from_value::<AgentIr>(nested).is_err());
+
+    // Part of the hashed canonical form.
+    let mut changed = ir.clone();
+    changed.requirements.process_exec = true;
+    assert_ne!(changed.compute_snapshot(), ir.compute_snapshot());
+    assert!(!changed.verify_snapshot());
     Ok(())
 }
 

@@ -36,6 +36,7 @@ use harw_operations::registry::OperationRegistry;
 
 use crate::authz::{PeerAuthorizer, tier_permits};
 use crate::error::WebError;
+use crate::identity::ResolvedPeer;
 use crate::peer::PeerCredentials;
 
 /// Die für eine `harw-web`-Route zulässige HTTP-Methode — der kanonische
@@ -213,6 +214,56 @@ pub fn decide_route<'a>(
     path: &str,
     method: Option<WebMethod>,
 ) -> RouteDecision<'a> {
+    decide_with_tier(routes, path, method, || authorizer.tier_for(peer))
+}
+
+/// Wie [`decide_route`], aber mit einer bereits aufgelösten Identität
+/// ([`crate::identity::LocalPeerIdentityResolver`], H12).
+///
+/// # Description
+/// Derselbe Prüfpfad in derselben Reihenfolge (Route → Methode → Identität →
+/// Stufe → Genehmigung) und dieselbe Tier-Ablehnungsmatrix
+/// ([`tier_permits`]); nur die Stufe kommt aus [`ResolvedPeer::tier`] statt
+/// direkt aus einem [`PeerAuthorizer`]. `identity == None` (Auflösung
+/// gescheitert) ergibt [`ForbiddenReason::UnknownPeer`] — der konkrete Grund
+/// steht im [`crate::identity::IdentityError`] des Aufrufers
+/// (`IdentityError::code`) und gehört in den `reason` der `403`-Antwort.
+///
+/// Bei [`RouteDecision::Execute`] baut der Aufrufer den `OpContext` wie
+/// bisher über die `WebContextFactory` (mit `caller_tier`) und fädelt danach
+/// Mandant und Kontextzusammenfassung über
+/// [`ResolvedPeer::scope_op_context`] ein — der einzige Weg, auf dem ein
+/// Mandant in eine Operation gelangt; nie aus dem Rumpf.
+///
+/// # Arguments
+/// - `routes` (`&WebRouteTable`): die aus der Registry gebaute Routentabelle.
+/// - `identity` (`Option<&ResolvedPeer>`): die aufgelöste Identität oder
+///   `None`, wenn die Auflösung scheiterte.
+/// - `path` (`&str`), `method` (`Option<WebMethod>`): wie bei [`decide_route`].
+///
+/// # Returns
+/// Ein [`RouteDecision`] mit exakt einem Ausgang.
+///
+/// # Concurrency
+/// Rein; keine Sperren, kein gemeinsamer veränderlicher Zustand.
+#[must_use]
+pub fn decide_resolved_route<'a>(
+    routes: &'a WebRouteTable,
+    identity: Option<&ResolvedPeer>,
+    path: &str,
+    method: Option<WebMethod>,
+) -> RouteDecision<'a> {
+    decide_with_tier(routes, path, method, || identity.map(ResolvedPeer::tier))
+}
+
+// Der gemeinsame Kern von `decide_route` und `decide_resolved_route`. Die
+// Stufe wird erst nach Routen- und Methodenprüfung erfragt (F-031).
+fn decide_with_tier<'a>(
+    routes: &'a WebRouteTable,
+    path: &str,
+    method: Option<WebMethod>,
+    caller_tier: impl FnOnce() -> Option<PermissionTier>,
+) -> RouteDecision<'a> {
     let Some(entry) = routes.find_entry(path) else {
         return RouteDecision::NotFound;
     };
@@ -223,7 +274,7 @@ pub fn decide_route<'a>(
         return RouteDecision::MethodNotAllowed { expected };
     }
 
-    let Some(tier) = authorizer.tier_for(peer) else {
+    let Some(tier) = caller_tier() else {
         return RouteDecision::Forbidden {
             reason: ForbiddenReason::UnknownPeer,
         };
@@ -294,7 +345,9 @@ impl WebRouteTable {
     ///
     /// # Errors
     /// - [`WebError::DuplicateRoute`], wenn zwei Operationen denselben Pfad
-    ///   beanspruchen.
+    ///   beanspruchen oder eine Operation einen vom Server reservierten Pfad
+    ///   (`/v1/health`, `/v1/version`, `/v1/capabilities`, `/events`,
+    ///   [`crate::meta::is_reserved_path`]) deklariert.
     /// - [`WebError::RouteMethodUndeclared`], wenn sich für einen Adapter keine
     ///   `Surface::Web`-Deklaration mit dessen Pfad finden lässt (fail-closed:
     ///   eine Route ohne deklarierte Methode wird nie bedient).
@@ -315,6 +368,15 @@ impl WebRouteTable {
         let mut routes: Vec<WebRoute> = Vec::new();
         for op in registry.iter() {
             for adapter in WebAdapter::from_operation(Arc::clone(op)) {
+                // Metapfade und `/events` beantwortet der Server selbst — eine
+                // Operation darauf würde still verschattet (siehe `crate::meta`).
+                if crate::meta::is_reserved_path(adapter.path()) {
+                    return Err(WebError::DuplicateRoute {
+                        path: adapter.path().to_owned(),
+                        first_owner: "harw-web (reserviert)".to_owned(),
+                        second_owner: adapter.operation_name().to_owned(),
+                    });
+                }
                 if let Some(existing) = routes.iter().find(|r| r.adapter.path() == adapter.path()) {
                     return Err(WebError::DuplicateRoute {
                         path: adapter.path().to_owned(),
@@ -415,10 +477,11 @@ mod tests {
     use harw_operations::registry::OperationRegistry;
 
     use super::{
-        ForbiddenReason, RouteDecision, WebMethod, WebRouteTable, decide_route, method_name,
-        parse_web_method,
+        ForbiddenReason, RouteDecision, WebMethod, WebRouteTable, decide_resolved_route,
+        decide_route, method_name, parse_web_method,
     };
     use crate::authz::StaticUidTierMap;
+    use crate::identity::TierMapResolver;
     use crate::peer::PeerCredentials;
     use crate::test_support::{TestError, TestResult, ctx};
 
@@ -1019,6 +1082,103 @@ mod tests {
             assert_eq!(serialized, format!("\"{}\"", method_name(method)));
             assert_eq!(parse_web_method(method_name(method)), Some(method));
         }
+        Ok(())
+    }
+
+    /// H9: Metapfade und `/events` beantwortet der Server selbst — eine
+    /// Operation darf sie nicht deklarieren (sonst würde sie still verschattet).
+    #[test]
+    fn test_from_registry_rejects_reserved_server_paths() {
+        for path in ["/v1/health", "/v1/version", "/v1/capabilities", "/events"] {
+            let mut registry = OperationRegistry::new();
+            registry.register(tier_op("shadow-op", path, PermissionTier::Observer));
+            let result = WebRouteTable::from_registry(&registry);
+            assert!(
+                matches!(
+                    &result,
+                    Err(crate::error::WebError::DuplicateRoute { second_owner, .. })
+                        if second_owner == "shadow-op"
+                ),
+                "{path}: reservierter Pfad muss abgelehnt werden"
+            );
+        }
+    }
+
+    // ── H12: decide_resolved_route — dieselbe Matrix, Stufe aus ResolvedPeer ──
+
+    #[test]
+    fn test_decide_resolved_route_matches_decide_route_for_every_tier_and_route() -> TestResult {
+        let registry = four_tier_registry();
+        let routes = WebRouteTable::from_registry(&registry).map_err(ctx("from_registry"))?;
+        let tiers = [
+            PermissionTier::Observer,
+            PermissionTier::Operator,
+            PermissionTier::Maintainer,
+            PermissionTier::Owner,
+        ];
+        let paths = [
+            "/api/observer",
+            "/api/operator",
+            "/api/maintainer",
+            "/api/owner",
+        ];
+        for tier in tiers {
+            let authz: std::sync::Arc<dyn crate::authz::PeerAuthorizer> =
+                std::sync::Arc::new(StaticUidTierMap::new(vec![(1000, tier)]));
+            let resolved = TierMapResolver::new(std::sync::Arc::clone(&authz))
+                .resolve_peer(&peer_with_tier())
+                .map_err(ctx("resolve"))?;
+            for path in paths {
+                let direct = decide_route(
+                    &routes,
+                    authz.as_ref(),
+                    &peer_with_tier(),
+                    path,
+                    Some(WebMethod::Get),
+                );
+                let via_identity =
+                    decide_resolved_route(&routes, Some(&resolved), path, Some(WebMethod::Get));
+                let same = match (&direct, &via_identity) {
+                    (
+                        RouteDecision::Execute { caller_tier: a, .. },
+                        RouteDecision::Execute { caller_tier: b, .. },
+                    ) => a == b,
+                    (
+                        RouteDecision::Forbidden { reason: a },
+                        RouteDecision::Forbidden { reason: b },
+                    ) => a == b,
+                    _ => false,
+                };
+                if !same {
+                    return Err(TestError::Unexpected(format!(
+                        "{tier:?} {path}: {direct:?} vs {via_identity:?}"
+                    )));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn test_decide_resolved_route_without_identity_is_unknown_peer() -> TestResult {
+        let registry = four_tier_registry();
+        let routes = WebRouteTable::from_registry(&registry).map_err(ctx("from_registry"))?;
+        let decision = decide_resolved_route(&routes, None, "/api/observer", Some(WebMethod::Get));
+        assert!(matches!(
+            decision,
+            RouteDecision::Forbidden {
+                reason: ForbiddenReason::UnknownPeer
+            }
+        ));
+        // Route- und Methodenprüfung stehen weiterhin vor der Identität.
+        assert!(matches!(
+            decide_resolved_route(&routes, None, "/api/unknown", Some(WebMethod::Get)),
+            RouteDecision::NotFound
+        ));
+        assert!(matches!(
+            decide_resolved_route(&routes, None, "/api/observer", Some(WebMethod::Post)),
+            RouteDecision::MethodNotAllowed { .. }
+        ));
         Ok(())
     }
 }

@@ -1,0 +1,61 @@
+# harw-security-hub.service -- HARW SecurityHub (security.sock).
+#
+# Canonical source: deploy/systemd/ (Crypto Masterplan v2 §22.2, H10).
+# Embedded into harw-install; `harw install --print-systemd
+# harw-security-hub.service` prints it.
+#
+# Socket-activated only: harw-security-hub.socket hands over exactly one
+# listening descriptor (LISTEN_FDS=1); `--systemd-socket` makes the daemon
+# take it and fail hard otherwise (no fallback to binding a path; the
+# config's server.socket is ignored). The socket unit owns path, mode 0660
+# and group harw-security, so members of harw-security are exactly the peers
+# that may connect (the daemon still authorizes every peer via SO_PEERCRED
+# and its policy). No [Install] section; enable the socket (or
+# harw-infra.target), never this service directly.
+
+[Unit]
+Description=HARW SecurityHub (security.sock)
+Requires=harw-security-hub.socket
+After=harw-security-hub.socket
+PartOf=harw-infra.target
+StartLimitIntervalSec=60
+StartLimitBurst=5
+
+[Service]
+Type=simple
+User=harw-security-hub
+Group=harw-security
+ExecStart=/usr/bin/harw-security-hub --systemd-socket
+Sockets=harw-security-hub.socket
+StateDirectory=harw-security-hub
+StateDirectoryMode=0700
+UMask=0077
+Restart=on-failure
+RestartSec=5
+
+# -- Hardening --
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelModules=yes
+ProtectKernelTunables=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+ProtectProc=invisible
+ProcSubset=pid
+RestrictNamespaces=yes
+RestrictAddressFamilies=AF_UNIX
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+RemoveIPC=yes
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallErrorNumber=EPERM
+CapabilityBoundingSet=
+AmbientCapabilities=

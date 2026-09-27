@@ -308,6 +308,13 @@ mod tests {
             "harw-warden",
             "harw-dod-sentinel",
             "harw-dod-escalate",
+            // Subjekte der Krypto-Hüllenregeln (`FORBIDDEN_REACH`).
+            "harw-dod",
+            "harw-dod-warden",
+            "harw-dod-warden-proto",
+            "harw-probe-fs",
+            "harw-probe-bpf",
+            "harw-dod-encrypt",
         ] {
             assert!(
                 graph.get(name).is_some(),

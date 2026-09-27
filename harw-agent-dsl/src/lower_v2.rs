@@ -1696,6 +1696,7 @@ pub fn lower_v2(
         },
         binary,
         permissions,
+        requirements: crate::ir_v2::ExecutionRequirements::default(),
         trace: Trace {
             steps: resolved
                 .trace

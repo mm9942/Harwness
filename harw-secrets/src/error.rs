@@ -43,10 +43,12 @@ pub enum SecretsError {
     KekDerivation { source: crypt_guard::pq_hpke::Error },
 
     /// A policy or durable record names a retired pure ML-KEM level
-    /// (`ml_kem_512`/`ml_kem_768`/`ml_kem_1024`). `crypt_guard` 3.0.1 derives
-    /// deterministic recipient keys only for hybrid KEMs, so such envelopes can
-    /// neither be sealed nor opened. Only the algorithm wire name is retained;
-    /// record contents and key material must never enter this error.
+    /// (`ml_kem_512`/`ml_kem_768`/`ml_kem_1024`). This is a `harw-secrets`
+    /// policy, not a `crypt_guard` limit (3.0.2 can derive pure ML-KEM keys
+    /// too): legacy pure ML-KEM records stay read-only metadata, so such
+    /// envelopes can neither be sealed nor opened. Only the algorithm wire
+    /// name is retained; record contents and key material must never enter
+    /// this error.
     #[msg(
         "KEM algorithm '{algo}' is a retired pure ML-KEM level and is no longer supported; re-create the secret under a hybrid KEM"
     )]
@@ -82,6 +84,37 @@ pub enum SecretsError {
         found: KeyVersion,
         expected: KeyVersion,
     },
+
+    /// A V3 (KMS-wrapped) record names a key generation the configured
+    /// [`crate::dek_wrapper::DekWrapper`] cannot unwrap (wrong, revoked, or
+    /// not yet available generation). Key reference and generations are safe
+    /// metadata; wrapped or unwrapped DEK bytes never enter this error.
+    #[msg(
+        "DEK wrapper key '{key_id}' cannot unwrap generation {found}; available generation is {expected}"
+    )]
+    KeyGenerationMismatch {
+        key_id: String,
+        expected: u32,
+        found: u32,
+    },
+
+    /// A V3 record was wrapped under a different key reference or crypto
+    /// profile than the configured [`crate::dek_wrapper::DekWrapper`] serves.
+    /// Only the name of the mismatching field is retained.
+    #[msg("V3 record {field} does not match the configured DEK wrapper")]
+    DekWrapperMismatch { field: String },
+
+    /// The configured [`crate::dek_wrapper::DekWrapper`] reported an invalid
+    /// identity (key reference not of the form `namespace/id`, or an empty
+    /// crypto profile id). Nothing is sealed in that case.
+    #[msg("DEK wrapper identity is invalid: {reason}")]
+    InvalidDekWrapperIdentity { reason: String },
+
+    /// The DEK wrapper (e.g. the AuthHub KMS) is unreachable or refused the
+    /// request. Always fail closed: no fallback to another wrapping path. The
+    /// reason must be a safe diagnostic without key or DEK material.
+    #[msg("DEK wrapper '{profile}' unavailable: {reason}")]
+    DekWrapperUnavailable { profile: String, reason: String },
 
     /// `crypt_guard` PQ HPKE sealing failure (carries the underlying crypto error).
     #[msg("crypt_guard sealing failed: {0}")]

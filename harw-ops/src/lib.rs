@@ -91,6 +91,13 @@
 //! und stehen ebenfalls in der Grundausstattung, nicht hinter dem
 //! `[tools.plan]`-Gate.
 //!
+//! **Infrastrukturfläche** ([`infra::register_infrastructure`], 4 Ops, nur
+//! mit `[infrastructure]`): `infra.status`, `infra.health`,
+//! `infra.auth.keys.describe`, `infra.auth.keys.rotate`. Nicht Teil von
+//! [`register_all`] — die Runtime registriert sie über ihren
+//! `InfrastructureContributor`, sobald die Sektion konfiguriert ist. Keine
+//! davon trägt eine `ModelTool`-Fläche (siehe `infra`-Moduldoku).
+//!
 //! **Planungsfläche** ([`register_plan_tools`], 7 Ops, hinter dem
 //! `[tools.plan] enabled`-Gate): `plan`, `goal`, `explore`, `research`,
 //! `research_deps`, `research_web`, `analyze`. Sie bilden zusammen den
@@ -170,6 +177,10 @@ pub mod explore;
 pub mod export;
 pub mod goal;
 pub mod help;
+// Crypto-Infrastruktur H5: `infra.*` (Status, Health, AuthHub-Schlüssel).
+// Nicht Teil von `register_all`: registriert nur der
+// `InfrastructureContributor` der Runtime, wenn `[infrastructure]` gesetzt ist.
+pub mod infra;
 pub mod jobs;
 pub mod kanban;
 pub mod knowledge_args;

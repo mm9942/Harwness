@@ -25,13 +25,6 @@ ignore = [
     { id = "RUSTSEC-2024-0436", reason = "paste transitiv über ratatui (nur Compile-Zeit)" },
     # Nicht mehr gepflegt, Proc-Macro über `hax-lib-macros` (libcrux-Kette).
     { id = "RUSTSEC-2026-0173", reason = "proc-macro-error2 transitiv über hax-lib-macros (nur Compile-Zeit)" },
-    # libcrux-Meldungen: blockiert durch `crypt_guard = "=3.0.1"` (auch 3.0.2),
-    # das `libcrux-ml-kem = "=0.0.9"` exakt pinnt. Ein Upgrade braucht ein
-    # neues crypt_guard-Release und ein Neu-Blessing der KEM-KATs in
-    # `harw-secrets` (siehe dortige Cargo.toml). Offen, nicht erledigt.
-    { id = "RUSTSEC-2026-0207", reason = "libcrux-sha3 0.0.9 über crypt_guard =3.0.1; wartet auf crypt_guard-Upgrade" },
-    { id = "RUSTSEC-2026-0208", reason = "libcrux-sha3 0.0.9 über crypt_guard =3.0.1; wartet auf crypt_guard-Upgrade" },
-    { id = "RUSTSEC-2026-0212", reason = "libcrux-secrets 0.0.5 über crypt_guard =3.0.1; wartet auf crypt_guard-Upgrade" },
 ]
 
 [licenses]
@@ -78,3 +71,6 @@ skip = []
 unknown-registry = "deny"
 unknown-git = "deny"
 allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+# crypt_guard 3.1 gibt es nur als Git-Quelle (nicht auf crates.io); das ist
+# die einzige erlaubte Git-Quelle, jede andere bleibt über `unknown-git` verboten.
+allow-git = ["https://github.com/mm9942/crypt_guard"]

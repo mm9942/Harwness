@@ -47,6 +47,11 @@
 //! exit status of jobs that end while the runtime is down, enable the
 //! exit-status shim (`LinuxExecutorOptions::exit_status_dir`).
 //!
+//! # Host capability probe
+//! `harw_job::HostReport::probe()` reports, without side effects, which
+//! sandbox backends this host offers and the strongest [`SandboxReport`]
+//! a job can get here — the input of runtime admission (PL-90).
+//!
 //! # Public API boundary
 //! Only first-party types appear in this API (Job-Runtime-Doc §2.5).
 //!
@@ -71,6 +76,7 @@ pub use harw_job_runtime::coordinator::{
 };
 #[cfg(target_os = "linux")]
 pub use harw_job_runtime::coordinator::{LinuxExecutor, LinuxExecutorOptions, LinuxSandboxBackend};
+pub use harw_job_runtime::host::{HostFacts, HostLandlock, HostReport};
 pub use harw_job_store::FsJobRecordStore;
 pub use harw_types::WorkId;
 
@@ -285,8 +291,9 @@ impl<S: CoordinatorStore, E: Executor> JobRuntime<S, E> {
 #[cfg(all(test, target_os = "linux"))]
 mod tests {
     use super::{
-        FsJobRecordStore, IntoJobSpec, JobRuntime, JobSpec, LifecycleState, LinuxExecutor,
-        RunnerId, RuntimeError, SandboxProfile, SpecError, WorkspacePath,
+        EnforcementState, FsJobRecordStore, HostReport, IntoJobSpec, JobRuntime, JobSpec,
+        LifecycleState, LinuxExecutor, RunnerId, RuntimeError, SandboxProfile, SpecError,
+        WorkspacePath,
     };
     use std::fmt;
     use std::time::Duration;
@@ -353,6 +360,15 @@ mod tests {
             .build();
         assert!(matches!(built, Err(RuntimeError::InvalidConfig { .. })));
         Ok(())
+    }
+
+    #[test]
+    fn host_report_is_reachable_through_the_facade() {
+        let report = HostReport::probe();
+        assert_eq!(report.target_os, "linux");
+        // NO_NEW_PRIVS and the capability drop are always possible on Linux.
+        assert_eq!(report.best_report.no_new_privs, EnforcementState::Enforced);
+        assert_eq!(report.best_report.capabilities, EnforcementState::Enforced);
     }
 
     #[test]

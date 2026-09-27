@@ -14,6 +14,8 @@ use harw_agent_artifact::ArtifactError;
 use harw_agent_artifact::bundle::BundleError;
 use harwness_sdk::SdkError;
 
+use crate::admission::AdmissionRefused;
+
 /// Invalid `--flag` usage or an unusable combination of flags (BSD `EX_USAGE`).
 pub const EXIT_USAGE: u8 = 64;
 /// The embedded artifact is missing, malformed or tampered (BSD `EX_DATAERR`).
@@ -23,6 +25,9 @@ pub const EXIT_DATA: u8 = 65;
 pub const EXIT_SOFTWARE: u8 = 70;
 /// A file or socket could not be read or written (BSD `EX_IOERR`).
 pub const EXIT_IO: u8 = 74;
+/// Runtime admission refused the agent: this host cannot meet its execution
+/// requirements (PL-90, [`crate::admission`]; BSD `EX_UNAVAILABLE`).
+pub const EXIT_ADMISSION: u8 = 69;
 
 /// A failure of the runner itself, before or instead of running an agent.
 #[derive(Debug)]
@@ -69,6 +74,9 @@ pub enum RunnerError {
     },
     /// A `--manifest`/`--capabilities` JSON payload could not be encoded.
     Json(serde_json::Error),
+    /// Runtime admission (PL-90) refused the agent on this host; lists
+    /// every unmet requirement.
+    Admission(AdmissionRefused),
 }
 
 impl RunnerError {
@@ -84,6 +92,7 @@ impl RunnerError {
             Self::Sdk(_) | Self::Runtime(_) => EXIT_SOFTWARE,
             Self::Io { .. } => EXIT_IO,
             Self::Json(_) => EXIT_DATA,
+            Self::Admission(_) => EXIT_ADMISSION,
         }
     }
 }
@@ -122,6 +131,7 @@ impl fmt::Display for RunnerError {
             Self::Runtime(error) => write!(f, "{error}"),
             Self::Io { context, source } => write!(f, "{context}: {source}"),
             Self::Json(error) => write!(f, "{error}"),
+            Self::Admission(refused) => write!(f, "{refused}"),
         }
     }
 }
@@ -135,6 +145,7 @@ impl std::error::Error for RunnerError {
             Self::Runtime(error) => Some(error),
             Self::Io { source, .. } => Some(source),
             Self::Json(error) => Some(error),
+            Self::Admission(refused) => Some(refused),
             Self::UnknownInterface { .. }
             | Self::NoInterface
             | Self::NotCompiled { .. }
@@ -158,6 +169,12 @@ impl From<BundleError> for RunnerError {
 impl From<SdkError> for RunnerError {
     fn from(error: SdkError) -> Self {
         Self::Sdk(error)
+    }
+}
+
+impl From<AdmissionRefused> for RunnerError {
+    fn from(refused: AdmissionRefused) -> Self {
+        Self::Admission(refused)
     }
 }
 
@@ -208,6 +225,19 @@ mod tests {
             assert_eq!(error.exit_code(), expected, "{error}");
         }
         Ok(())
+    }
+
+    #[test]
+    fn test_admission_has_its_own_exit_code() {
+        let error = RunnerError::Admission(AdmissionRefused {
+            missing: Vec::new(),
+            allow_degraded: false,
+        });
+        assert_eq!(error.exit_code(), EXIT_ADMISSION);
+        for other in [EXIT_USAGE, EXIT_DATA, EXIT_SOFTWARE, EXIT_IO] {
+            assert_ne!(EXIT_ADMISSION, other);
+        }
+        assert!(error.to_string().contains("admission refused"));
     }
 
     #[test]

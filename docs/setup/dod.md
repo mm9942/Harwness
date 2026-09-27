@@ -126,7 +126,8 @@ one is responsible for:
                                                     ▼
                                           ┌───────────────┐
                                           │  harw-warden   │  freeze/release cgroup,
-                                          │ (root, socket- │  cut egress, kill tree
+                                          │ (own user,     │  cut egress, kill tree
+                                          │  socket-       │
                                           │  activated,    │
                                           │  DISABLED by   │
                                           │  default)      │
@@ -142,30 +143,39 @@ more.
 
 ## Privilege model
 
-- **System accounts** (installed via `systemd-sysusers`, no login shell,
-  no home directory): `harw-dod` runs `harw-sentinel`; `harw-dod-bpf` runs
-  `harw-probe-bpf`. `harw-warden` runs as `root` (it has to, to freeze
-  cgroups and manage network isolation).
-- **Groups:** `harw-dod-config` gives both service accounts read-only
-  access to `/etc/harw-dod`; `harw-dod-ipc` is reserved for the sentinel
-  socket path both probes push events over.
+- **System accounts** (`deploy/sysusers.d/harw.conf`, installed via
+  `systemd-sysusers`, no login shell, no home directory), one per binary:
+  `harw-sentinel`, `harw-probe-fs`, `harw-probe-bpf`, `harw-warden`. The
+  Warden never runs as `root`.
+- **Groups:** `harw-dod-config` gives the sentinel and the eBPF probe
+  read-only access to `/etc/harw-dod`; `harw-ipc` lets the sentinel create,
+  and the two probes connect to, `/run/harw/sentinel.sock`;
+  `harw-warden-clients` (empty by default) may connect to
+  `/run/harw/warden.sock` — add the escalation client explicitly.
 - **Capabilities, per binary, and nothing beyond them:**
   `CapabilityBoundingSet`/`AmbientCapabilities` are empty for
   `harw-sentinel` (no elevated capability at all); `CAP_BPF CAP_PERFMON`
-  for `harw-probe-bpf`; `CAP_SYS_ADMIN` for `harw-probe-fs` (the only
+  for `harw-probe-bpf` (the loader refuses to attach tracepoint/FEntry
+  programs without both); `CAP_SYS_ADMIN` for `harw-probe-fs` (the only
   capability that permits `fanotify_mark` with `FAN_MARK_FILESYSTEM` and
-  the `FAN_UNLIMITED_*` flags it needs).
+  the `FAN_UNLIMITED_*` flags it needs); `CAP_DAC_OVERRIDE CAP_NET_ADMIN`
+  for `harw-warden` (writing the root-owned `cgroup.freeze`/`cgroup.kill`
+  files, and running `nft` for network isolation).
 - **Root-owned files and FHS directories** (default prefix `/usr/local`;
   `PREFIX=/usr` for a distribution package):
   - programs: `/usr/local/libexec/harw-dod`
   - eBPF objects + manifest: `/usr/local/lib/harw-dod/bpf`
   - configuration: `/etc/harw-dod`
-  - state/telemetry/runtime: `/var/lib/harw-dod`, `/var/log/harw-dod`,
-    `/run/harw-dod`
+  - state/telemetry: `/var/lib/harw-dod`, `/var/log/harw-dod`
+  - runtime sockets: `/run/harw/sentinel.sock`, `/run/harw/warden.sock`
+    (`/run/harw` is created by `deploy/tmpfiles.d/harw.conf`; the
+    infrastructure daemons use `/run/harw/infra/`)
 - Each systemd unit additionally sets `NoNewPrivileges=yes`,
-  `ProtectSystem=strict`/`full`, `ProtectHome=yes`, `PrivateTmp=yes`, and
+  `ProtectSystem=strict`, `ProtectHome=yes`, `PrivateTmp=yes`,
+  `SystemCallFilter=@system-service` (plus the few syscalls the binary
+  needs, e.g. `bpf`, `perf_event_open`, `fanotify_*`, Landlock), and
   scopes its writable paths to exactly what that process needs
-  (`ReadOnlyPaths`/`ReadWritePaths`).
+  (`ReadWritePaths`).
 - The package **never** installs into a user's `~/.harw` tree, and never
   runs as, or touches files owned by, a regular user account.
 
@@ -226,9 +236,13 @@ target list).
    sudo make dod-install   # from the repo root, or: sudo make -C dod install
    ```
    Rebuilds (to avoid installing stale artifacts), then installs files and
-   creates the two system accounts (`systemd-sysusers`), runtime
-   directories (`systemd-tmpfiles`), and systemd units, and reloads the
-   systemd daemon. It performs **no enable/start action** by itself beyond
+   creates the system accounts (`systemd-sysusers`), runtime
+   directories (`systemd-tmpfiles`), and systemd units — all taken from
+   the repository's `deploy/` tree (see
+   [below](#systemd-units-and-the-deploy-tree)) — and reloads the
+   systemd daemon. Unit files of the old layout (`harw-dod-sentinel.service`,
+   `harw-dod-bpf.service`, `harw-dod-warden.*`, `harw-dod.conf`) are
+   removed. It performs **no enable/start action** by itself beyond
    that — see step 5. For package building, use `DESTDIR=/path/to/stage
    make -C dod stage` instead: pure staging, no accounts, no systemd calls,
    no host state touched.
@@ -257,12 +271,15 @@ target list).
    ```
    Runs the explicit configuration/profile validation first and refuses to
    enable without a chosen `active_profile`. This starts and enables
-   `harw-dod-sentinel.service` and `harw-dod-bpf.service` under
+   `harw-sentinel.service` and `harw-probe-bpf.service` under
    `harw-dod.target` — observation only, never the Warden.
+   `harw-probe-fs.service` is installed but not part of the target: set its
+   `--scope-root` in a drop-in, then `systemctl enable --now
+   harw-probe-fs.service`.
 
 ### The Warden — shipped but disabled
 
-`harw-dod-warden.service` and its `SOCK_SEQPACKET` activation socket are
+`harw-warden.service` and its `SOCK_SEQPACKET` activation socket are
 installed by `make dod-install` but have **no `[Install]` section**, no
 dependency from `harw-dod.target`, and an additional
 `ConditionPathExists=/etc/harw-dod/warden.enable` gate. Normal install,
@@ -313,6 +330,40 @@ turned off.
   contract statically, without building or installing anything — useful
   for CI that can't run eBPF builds.
 
+## systemd units and the deploy tree
+
+`deploy/` at the repository root is the **single** source of every Harwness
+system unit (Crypto Masterplan v2 §22, H10); there is no second copy under
+`dod/`:
+
+| Path | Content |
+|---|---|
+| `deploy/systemd/harw-dod.target`, `harw-sentinel.service`, `harw-probe-bpf.service`, `harw-probe-fs.service`, `harw-warden.service`, `harw-warden.socket` | DoD (installed by `make -C dod install`) |
+| `deploy/systemd/harw-infra.target`, `harw-control.{socket,service}`, `harw-auth-hub.{socket,service}`, `harw-netsec.{socket,service}`, `harw-security-hub.{socket,service}` | infrastructure daemons (not installed by the DoD package) |
+| `deploy/sysusers.d/harw.conf` | all system accounts and groups |
+| `deploy/tmpfiles.d/harw.conf` | `/run/harw`, `/run/harw/infra`, DoD state/log directories |
+
+The same files are compiled into `harw` byte-identically (`harw-install`
+parity tests fail on any drift). To inspect exactly what is shipped, with
+the default install paths substituted:
+
+```sh
+harw install --print-systemd                      # every unit
+harw install --print-systemd harw-warden.socket   # one unit
+```
+
+`dod/scripts/install.sh` substitutes the `@LIBEXECDIR@`, `@BPFDIR@`,
+`@SYSCONFDIR@`, `@STATEDIR@` and `@LOGDIR@` placeholders from its own
+variables and refuses to install a unit with an unresolved placeholder.
+Runtime sockets live at fixed paths: `/run/harw/` for DoD,
+`/run/harw/infra/{control,secure,network,security}.sock` for the
+infrastructure daemons. Every infrastructure daemon is socket-activated
+(`--systemd-socket`): `harw web` behind `harw-control.{socket,service}`,
+`harw-auth-hub`, `harw-netsec` and `harw-security-hub`. Only systemd
+creates sockets in `/run/harw/infra`, so the directory is `0755 root:root`;
+access is set per socket unit (mode `0660` plus a client group such as
+`harw-control-clients`).
+
 ## Uninstalling
 
 ```sh
@@ -322,16 +373,16 @@ sudo make dod-uninstall   # from the repo root, or: sudo make -C dod uninstall
 Removes only the files listed in `dod/packaging/manifest` (binaries, eBPF
 objects, systemd units, sysusers/tmpfiles config snippets, and the
 `config.toml.example`). It deliberately leaves `/etc/harw-dod/config.toml`,
-state, logs, runtime data, and the `harw-dod`/`harw-dod-bpf` system
-accounts in place, so an upgrade or a rollback never silently discards
+state, logs, runtime data, and the system accounts in place, so an upgrade or a rollback never silently discards
 operator evidence or configuration. Remove those by hand if you want a
 full teardown:
 
 ```sh
-sudo systemctl disable --now harw-dod.target harw-dod-sentinel.service harw-dod-bpf.service
-sudo rm -rf /etc/harw-dod /var/lib/harw-dod /var/log/harw-dod /run/harw-dod
-sudo userdel harw-dod; sudo userdel harw-dod-bpf
-sudo groupdel harw-dod-config; sudo groupdel harw-dod-ipc
+sudo systemctl disable --now harw-dod.target harw-sentinel.service harw-probe-bpf.service harw-probe-fs.service
+sudo rm -rf /etc/harw-dod /var/lib/harw-dod /var/log/harw-dod
+sudo rm -f /run/harw/sentinel.sock /run/harw/warden.sock
+for u in harw-sentinel harw-probe-fs harw-probe-bpf harw-warden; do sudo userdel "$u"; done
+sudo groupdel harw-dod-config; sudo groupdel harw-ipc; sudo groupdel harw-warden-clients
 ```
 
 ## Troubleshooting

@@ -6,6 +6,7 @@ use crate::dod_toml::DodSection;
 use crate::dotenv::load_env_layer;
 use crate::error::{ConfigError, ConfigResult};
 use crate::harness_config::HarnessConfig;
+use crate::infrastructure_toml::InfrastructureSection;
 use crate::mcp_toml::McpServerToml;
 use crate::merge::{LayerRole, ScopeDiagnostic, merge_layer_into};
 use crate::model_toml::ModelToml;
@@ -157,6 +158,15 @@ pub struct ResolvedConfig {
     /// (siehe `web_toml`). Wird von einem nicht vertrauten Repo-Layer
     /// **nie** beeinflusst (siehe [`apply_restricted_layer`]).
     pub web: WebSection,
+    /// `[infrastructure]` — Sockets der Infrastruktur-Daemons (AuthHub,
+    /// NetSec, SecurityHub; siehe `infrastructure_toml`). `None`, solange
+    /// kein vertrauter Layer die Tabelle setzt: dann baut die Runtime keine
+    /// Infrastruktur-Clients und registriert keine `infra.*`-Operationen.
+    /// Ein vertrauter Layer, der die Tabelle setzt, ersetzt sie vollständig;
+    /// ein nicht vertrauter Repo-Layer wird **nie** berücksichtigt (siehe
+    /// [`apply_restricted_layer`]) — ein fremder Socket- oder Token-Pfad wäre
+    /// Rechteausweitung, kein Verengen.
+    pub infrastructure: Option<InfrastructureSection>,
     /// Nicht-fatale Katalog-Diagnosen aus [`Self::compute_diagnostics`],
     /// von [`discover_config_with_restricted`] automatisch befüllt (nach
     /// [`compose_legacy_provider_registry`], damit ein komponierter
@@ -764,6 +774,11 @@ pub fn discover_config_with_restricted_and_project_settings(
             if let Some(section) = extract_section::<WebSection>(&fields, "web")? {
                 resolved.web = section;
             }
+            if let Some(section) =
+                extract_section::<InfrastructureSection>(&fields, "infrastructure")?
+            {
+                resolved.infrastructure = Some(section);
+            }
 
             let mut harness_fields = fields.clone();
             strip_new_sections(&mut harness_fields);
@@ -881,7 +896,11 @@ const MAX_RESTRICTED_CONFIG_BYTES: u64 = 1024 * 1024;
 /// verengende Schlüssel in `resolved` (siehe
 /// [`discover_config_with_restricted`]). `[web]` wird dabei **nie**
 /// berücksichtigt ("Web-Bind nicht vom Repo", W3 `C-CFG`): weder verengend
-/// noch erweiternd, unabhängig davon, ob es im Repo-Layer vorkommt.
+/// noch erweiternd, unabhängig davon, ob es im Repo-Layer vorkommt. Dasselbe
+/// gilt für `[infrastructure]` (Daemon-Sockets, Token-Datei): ein Repo darf
+/// Harwness weder auf einen fremden Socket noch auf eine fremde Token-Datei
+/// umlenken; die Tabelle wird unten mit `strip_new_sections` entfernt und
+/// sonst nicht gelesen.
 fn apply_restricted_layer(base: &Path, resolved: &mut ResolvedConfig) -> ConfigResult<()> {
     match std::fs::symlink_metadata(base) {
         Ok(meta) if meta.file_type().is_dir() => {}
@@ -932,12 +951,12 @@ fn apply_restricted_layer(base: &Path, resolved: &mut ResolvedConfig) -> ConfigR
 }
 
 /// Keys, die dieses Modul unabhängig von [`HarnessConfig`] parst (siehe
-/// [`extract_section`]). `harness_config.rs` kennt diese vier Tabellen
+/// [`extract_section`]). `harness_config.rs` kennt diese fünf Tabellen
 /// (noch) nicht als eigene Felder (Folgearbeit). Ohne das Entfernen dieser Keys vor
 /// der `HarnessConfig`-Deserialisierung würde
 /// `#[serde(deny_unknown_fields)]` jede `config.toml` ablehnen, die eine
 /// dieser Sektionen enthält.
-const NEW_SECTION_KEYS: [&str; 4] = ["network", "browser", "dod", "web"];
+const NEW_SECTION_KEYS: [&str; 5] = ["network", "browser", "dod", "web", "infrastructure"];
 
 /// Entfernt die in [`NEW_SECTION_KEYS`] gelisteten Top-Level-Tabellen aus
 /// `value`, damit der Rest wie zuvor als [`HarnessConfig`] deserialisiert
@@ -3444,6 +3463,126 @@ allowed_cgroup_prefixes = ["/sys/fs/cgroup/evil.slice/"]
         assert_eq!(config.browser.max_actions, 20);
         assert!(config.dod.auto_freeze);
         assert!(config.dod.allowed_cgroup_prefixes.is_empty());
+
+        std::fs::remove_dir_all(home).map_err(ctx("Home-Verzeichnis entfernen"))?;
+        std::fs::remove_dir_all(repo).map_err(ctx("Repo-Verzeichnis entfernen"))?;
+        Ok(())
+    }
+
+    /// `[infrastructure]` fehlt ⇒ `None` (keine Infrastruktur-Clients, keine
+    /// `infra.*`-Operationen).
+    #[test]
+    fn infrastructure_section_absent_is_none() -> TestResult {
+        let home = test_directory("infra-absent-home")?;
+        write_layer_file(&home, "config.toml", "[logging]\nlevel = \"debug\"\n")?;
+
+        let config =
+            discover_config(std::slice::from_ref(&home)).map_err(ctx("Konfiguration entdecken"))?;
+        assert_eq!(config.infrastructure, None);
+        assert_eq!(config.harness.logging.level, "debug");
+
+        std::fs::remove_dir_all(home).map_err(ctx("Home-Verzeichnis entfernen"))?;
+        Ok(())
+    }
+
+    /// Ein vertrauter Layer setzt `[infrastructure]`; ein späterer vertrauter
+    /// Layer ohne die Tabelle übernimmt sie, einer mit der Tabelle ersetzt sie
+    /// vollständig.
+    #[test]
+    fn infrastructure_section_from_trusted_layers() -> TestResult {
+        let home = test_directory("infra-trusted-home")?;
+        let profile = test_directory("infra-trusted-profile")?;
+        write_layer_file(
+            &home,
+            "config.toml",
+            r#"
+[infrastructure]
+auth_socket = "/run/harw/infra/secure.sock"
+token_file = "/etc/harw/infra/auth.token"
+"#,
+        )?;
+        write_layer_file(&profile, "config.toml", "[logging]\nlevel = \"debug\"\n")?;
+
+        let carried = discover_config(&[home.clone(), profile.clone()])
+            .map_err(ctx("Konfiguration entdecken"))?;
+        let section = carried
+            .infrastructure
+            .ok_or(TestError::Missing("[infrastructure] aus dem Home-Layer"))?;
+        assert_eq!(
+            section.auth_socket.as_deref(),
+            Some(Path::new("/run/harw/infra/secure.sock"))
+        );
+        assert_eq!(
+            section.token_file.as_deref(),
+            Some(Path::new("/etc/harw/infra/auth.token"))
+        );
+        assert_eq!(section.network_socket, None);
+
+        write_layer_file(
+            &profile,
+            "config.toml",
+            "[infrastructure]\nnetwork_socket = \"/run/harw/infra/network.sock\"\n",
+        )?;
+        let replaced = discover_config(&[home.clone(), profile.clone()])
+            .map_err(ctx("Konfiguration entdecken"))?;
+        let section = replaced
+            .infrastructure
+            .ok_or(TestError::Missing("[infrastructure] aus dem Profil-Layer"))?;
+        assert_eq!(section.auth_socket, None);
+        assert_eq!(section.token_file, None);
+        assert_eq!(
+            section.network_socket.as_deref(),
+            Some(Path::new("/run/harw/infra/network.sock"))
+        );
+
+        std::fs::remove_dir_all(home).map_err(ctx("Home-Verzeichnis entfernen"))?;
+        std::fs::remove_dir_all(profile).map_err(ctx("Profilverzeichnis entfernen"))?;
+        Ok(())
+    }
+
+    /// Unbekannte Schlüssel in `[infrastructure]` brechen die Discovery ab
+    /// (`deny_unknown_fields`) — ein Tippfehler darf nicht still einen Socket
+    /// abschalten.
+    #[test]
+    fn infrastructure_section_rejects_unknown_field() -> TestResult {
+        let home = test_directory("infra-unknown-home")?;
+        write_layer_file(
+            &home,
+            "config.toml",
+            "[infrastructure]\nauth_sock = \"/run/harw/infra/secure.sock\"\n",
+        )?;
+
+        let result = discover_config(std::slice::from_ref(&home));
+        assert!(
+            matches!(&result, Err(ConfigError::TomlParse(message)) if message.contains("[infrastructure]")),
+            "unbekanntes Feld muss abgelehnt werden: {result:?}"
+        );
+
+        std::fs::remove_dir_all(home).map_err(ctx("Home-Verzeichnis entfernen"))?;
+        Ok(())
+    }
+
+    /// Ein nicht vertrauter Repo-Layer kann `[infrastructure]` weder setzen
+    /// noch umlenken (fremder Socket/Token wäre Rechteausweitung).
+    #[test]
+    fn restricted_repo_cannot_set_infrastructure() -> TestResult {
+        let home = test_directory("infra-restricted-home")?;
+        let repo = test_directory("infra-restricted-repo")?;
+        write_layer_file(&home, "config.toml", "")?;
+        write_layer_file(
+            &repo,
+            "config.toml",
+            r#"
+[infrastructure]
+auth_socket = "/tmp/evil/secure.sock"
+token_file = "/tmp/evil/auth.token"
+"#,
+        )?;
+
+        let config =
+            discover_config_with_restricted(std::slice::from_ref(&home), Some(repo.as_path()))
+                .map_err(ctx("Eingeschränkte Konfiguration entdecken"))?;
+        assert_eq!(config.infrastructure, None);
 
         std::fs::remove_dir_all(home).map_err(ctx("Home-Verzeichnis entfernen"))?;
         std::fs::remove_dir_all(repo).map_err(ctx("Repo-Verzeichnis entfernen"))?;

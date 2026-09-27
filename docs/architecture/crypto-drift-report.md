@@ -68,6 +68,19 @@ The DoD installer ships a warden running as root and a BPF probe with an extra c
 and neither is covered by the `dod_units.rs` checks. **H0 changes nothing here.** The merge to one
 canonical, embedded source (§22.1) is DoD-integration work (`50-dod-integration`, R12+).
 
+**Resolved in H10.** `deploy/` is the only source; `dod/packaging/{systemd,sysusers.d,tmpfiles.d}`
+are deleted. For each unit the stricter variant was kept and justified from the code:
+
+| Aspect | H10 result |
+|---|---|
+| Files | `deploy/systemd/`: `harw-dod.target`, `harw-sentinel.service`, `harw-probe-bpf.service`, `harw-probe-fs.service`, `harw-warden.{service,socket}`; infra: `harw-infra.target`, `harw-control.{socket,service}`, `harw-auth-hub.{socket,service}`, `harw-netsec.{socket,service}`, `harw-security-hub.{socket,service}`. `deploy/sysusers.d/harw.conf`, `deploy/tmpfiles.d/harw.conf`. |
+| Consumer | `harw-install::deployment::DEPLOYMENT_ASSETS` embeds every `deploy/` file with `include_str!` in production code; `harw install --print-systemd [UNIT]`; `dod/scripts/install.sh` installs from `deploy/` and renders `@LIBEXECDIR@ @BPFDIR@ @SYSCONFDIR@ @STATEDIR@ @LOGDIR@`. Parity tests: `deploy/` ↔ embedded ↔ `dod/packaging/manifest` ↔ `install.sh`. |
+| Runtime dir | `/run/harw` for the DoD sockets (kept, overriding D1's `/run/harw-dod`), `/run/harw/infra/{control,secure,network,security}.sock` for the infra sockets, all four socket-activated (`harw-{control,auth-hub,netsec,security-hub}.socket`), so `/run/harw/infra` is `0755 root:root`. Both directories come from `tmpfiles.d` (no shared `RuntimeDirectory=`). |
+| Users | one per binary: `harw-sentinel`, `harw-probe-fs`, `harw-probe-bpf`, `harw-warden`; infra `harw-auth`, `harw-netsec`, `harw-security-hub`, `harw-control`. Groups `harw-ipc`, `harw-dod-config`, `harw-warden-clients`, `harw-secure`, `harw-network`, `harw-security`, `harw-control-clients` (socket client groups). The former `harw-infra` group for self-binding daemons is gone: no infra daemon binds its own socket any more. |
+| Warden | own user, `CAP_DAC_OVERRIDE CAP_NET_ADMIN` (cgroup file writes; `nft` child), `AF_UNIX AF_NETLINK`, no `[Install]`, `warden.enable` guard. |
+| BPF probe caps | `CAP_BPF CAP_PERFMON` (`harw-dod-bpf/src/real.rs::has_attach_capabilities` requires both). |
+| probe-fs | has a unit, installed, not in `harw-dod.target` (site-specific `--scope-root`). |
+
 ## 6. `/run/harw` is already taken
 
 | User | Path | Namespace |
@@ -77,13 +90,14 @@ canonical, embedded source (§22.1) is DoD-integration work (`50-dod-integration
 | `harw-egress/src/{proxy,relay}.rs` (docs), `harw-browser-thirtyfour/src/launcher.rs:660` | `/run/harw/egress.sock`, `/run/harw/harw-netns-relay` | sandbox side |
 | `harw-web` (docs/tests) | `/run/harw/web.sock` | host (illustrative) |
 | `deploy/systemd/*`, `harw-sentinel`/probe CLIs | `/run/harw/sentinel.sock`, `/run/harw/warden.sock` | host (DoD) |
-| Masterplan §22.3/§39 | `/run/harw/{control,network,secure}.sock` | host (infra) |
+| Masterplan §22.3/§39 | `/run/harw/{control,network,secure}.sock` | host (infra, as planned) |
+| `deploy/systemd/harw-{control,auth-hub,netsec,security-hub}.socket` | `/run/harw/infra/{control,secure,network,security}.sock` | host (infra, as shipped per D1/D2) |
 
 ## 7. Decisions
 
 | # | Decision | Deviation from plan |
 |---|---|---|
-| D1 | Split the runtime namespace: **`/run/harw/sandbox/`** for the fixed in-sandbox paths (relay, egress, tmux) and **`/run/harw/infra/`** for host infrastructure sockets (`control.sock`, `network.sock`, `secure.sock`, `security.sock`). DoD moves to `/run/harw-dod/` as in §22.3. | §22.3/§39 put infra sockets directly under `/run/harw/`. |
+| D1 | Split the runtime namespace: **`/run/harw/sandbox/`** for the fixed in-sandbox paths (relay, egress, tmux) and **`/run/harw/infra/`** for host infrastructure sockets (`control.sock`, `network.sock`, `secure.sock`, `security.sock`). ~~DoD moves to `/run/harw-dod/` as in §22.3.~~ **H10:** DoD stays at `/run/harw/{sentinel,warden}.sock`. | §22.3/§39 put infra sockets directly under `/run/harw/` and DoD under `/run/harw-dod/`. |
 | D2 | **SecurityHub gets its own `security.sock`.** | §39 example points `[infrastructure.security]` at `control.sock`. |
 | D3 | In **R12** the workspace moves from crates.io `crypt_guard =3.0.2` to **CryptGuard git** (`https://github.com/mm9942/crypt_guard`, `branch = "main"`). `Cargo.lock` pins the exact rev. Use the underscore package names (`crypt_guard`, `crypt_guard_core`, `crypt_guard_service`, `crypt_guard_hyper`). Re-bless the `harw-secrets` KATs in the same change, then drop the three libcrux `deny.toml` ignores and allow the git source in `deny.toml` `[sources]`. | Plans assume a released crate with hyphenated names. |
 | D4 | `KeyVersion` (CryptGuard) is the canonical generation type. The plan's `KeyGeneration` is not introduced. | §34 H1 lists `KeyGeneration`. |

@@ -1,9 +1,11 @@
 //! `SecretStore` — the durable, DEK-sealed secret store `harw-config` reads at
-//! process start (spec §1a). On disk every value is a CGv2 envelope; in memory,
-//! after unsealing, callers get `secrecy::SecretBox<[u8]>`.
+//! process start (spec §1a). On disk every new value is a V2 DEK-wrapped
+//! record (payload under a per-secret DEK, DEK wrapped by crypt_guard v3 PQ
+//! HPKE), or a V3 KMS-wrapped record when a [`DekWrapper`] is configured; in
+//! memory, after unsealing, callers get `secrecy::SecretBox<[u8]>`.
 //!
-//! The in-process create/get/delete path is fully sealed through the CGv2
-//! envelope module. Durable record loading and key-provenance resolution stay
+//! The in-process create/get/delete path is fully sealed through the
+//! versioned envelope module. Durable record loading and key-provenance resolution stay
 //! explicit separate boundaries: a caller must supply verified KEK material,
 //! and no guessed key-file format is silently accepted.
 
@@ -11,6 +13,7 @@ use std::collections::HashMap;
 use std::fs::{self, File, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use secrecy::{ExposeSecret, SecretBox};
@@ -24,6 +27,7 @@ use crate::audit::checkpoint::{
     PersistedCheckpointStatus,
 };
 use crate::audit::event::{Actor, SubjectRef};
+use crate::dek_wrapper::DekWrapper;
 use crate::error::{AuditError, AuditResult, SecretsError, SecretsResult};
 use crate::id::{KeyVersion, SecretId};
 use crate::kek::KekProvenance;
@@ -69,13 +73,39 @@ struct StoredSecret {
     metadata: SecretMetadata,
 }
 
+/// Counts returned by [`SecretStore::migrate_all_to_v3`].
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct V3MigrationReport {
+    /// Legacy direct-HPKE (V1) records migrated (payload re-encrypted).
+    pub migrated_v1: usize,
+    /// DEK-wrapped V2 records migrated (payload ciphertext unchanged).
+    pub migrated_v2: usize,
+    /// Records that already were V3 and were left untouched.
+    pub already_v3: usize,
+}
+
+impl V3MigrationReport {
+    /// Total number of records migrated by this run.
+    #[must_use]
+    pub fn migrated(&self) -> usize {
+        self.migrated_v1 + self.migrated_v2
+    }
+}
+
 /// The local, filesystem-backed secret store.
+///
+/// New secrets are sealed as V2 (local KEK) unless a [`DekWrapper`] is
+/// configured via [`Self::with_dek_wrapper`]; then they are sealed as
+/// [`SecretEnvelopeFormat::KmsWrappedV3`]. Existing records are never
+/// rewritten implicitly: migration is the explicit
+/// [`Self::migrate_all_to_v3`].
 pub struct SecretStore {
     root: PathBuf,
     policy: CryptoPolicy,
     provenance: KekProvenance,
     key_version: KeyVersion,
     key_material: Option<KekMaterial>,
+    dek_wrapper: Option<Arc<dyn DekWrapper>>,
     index: HashMap<SecretId, StoredSecret>,
     audit: AuditLog,
     checkpoints: CheckpointLog,
@@ -98,6 +128,7 @@ impl SecretStore {
             provenance,
             key_version,
             key_material: None,
+            dek_wrapper: None,
             index: HashMap::new(),
             audit: AuditLog::new(),
             checkpoints: CheckpointLog::new(),
@@ -122,6 +153,7 @@ impl SecretStore {
             provenance,
             key_version,
             key_material: Some(key_material),
+            dek_wrapper: None,
             index: HashMap::new(),
             audit: AuditLog::new(),
             checkpoints: CheckpointLog::new(),
@@ -157,6 +189,23 @@ impl SecretStore {
         let mut store = Self::open(root, policy, provenance, key_version)?;
         store.key_material = Some(key_material);
         Ok(store)
+    }
+
+    /// Configure a [`DekWrapper`] (AuthHub KMS or
+    /// [`crate::dek_wrapper::LocalHpkeDekWrapper`]): new secrets are then
+    /// sealed as [`SecretEnvelopeFormat::KmsWrappedV3`] and V3 records become
+    /// readable. Existing V1/V2 records are not touched; see
+    /// [`Self::migrate_all_to_v3`].
+    #[must_use]
+    pub fn with_dek_wrapper(mut self, wrapper: Arc<dyn DekWrapper>) -> Self {
+        self.dek_wrapper = Some(wrapper);
+        self
+    }
+
+    /// The configured DEK wrapper, if any.
+    #[must_use]
+    pub fn dek_wrapper(&self) -> Option<&Arc<dyn DekWrapper>> {
+        self.dek_wrapper.as_ref()
     }
 
     /// The directory this store persists under.
@@ -390,7 +439,10 @@ impl SecretStore {
             .ok_or(SecretsError::NotFound { id: *id })
     }
 
-    /// Seal `secret` under a fresh CGv2 session key and return its new id.
+    /// Seal `secret` under a fresh per-secret DEK and return its new id: as
+    /// a [`SecretEnvelopeFormat::KmsWrappedV3`] record when a DEK wrapper is
+    /// configured (no local KEK material needed), otherwise as a V2 record
+    /// under the local KEK (the default, unchanged).
     ///
     /// The sealed entry is durably written before either the index or audit
     /// state advances.
@@ -400,41 +452,49 @@ impl SecretStore {
         purpose: &str,
         secret: &SecretBox<[u8]>,
     ) -> SecretsResult<SecretId> {
-        let material = self
-            .key_material
-            .as_ref()
-            .ok_or_else(|| SecretsError::KekUnavailable {
-                kind: provenance_kind(&self.provenance).to_owned(),
-                reason: "no validated KEK material was supplied".to_owned(),
-            })?;
         let id = SecretId::new();
-        let sealed = crate::envelope::seal(
-            &self.policy,
-            id,
-            self.key_version,
-            &material.public_key,
-            secret.expose_secret().as_ref(),
-        )?;
+        let record = match &self.dek_wrapper {
+            Some(wrapper) => crate::envelope::seal_v3(
+                &**wrapper,
+                &self.policy,
+                id,
+                secret.expose_secret().as_ref(),
+            )?,
+            None => {
+                let material = self.require_key_material()?;
+                let sealed = crate::envelope::seal(
+                    &self.policy,
+                    id,
+                    self.key_version,
+                    &material.public_key,
+                    secret.expose_secret().as_ref(),
+                )?;
+                SecretRecord {
+                    id,
+                    envelope_format: sealed.envelope_format,
+                    ciphertext: sealed.ciphertext,
+                    nonce: sealed.nonce,
+                    wrapped_dek: sealed.wrapped_dek,
+                    kem_algo: sealed.kem_algo,
+                    aead_algo: sealed.aead_algo,
+                    key_version: self.key_version,
+                    key_id: None,
+                    key_generation: None,
+                    crypto_profile_id: None,
+                }
+            }
+        };
         let now = jiff::Timestamp::now();
         let stored = StoredSecret {
-            record: SecretRecord {
-                id,
-                envelope_format: sealed.envelope_format,
-                ciphertext: sealed.ciphertext,
-                nonce: sealed.nonce,
-                wrapped_dek: sealed.wrapped_dek,
-                kem_algo: sealed.kem_algo,
-                aead_algo: sealed.aead_algo,
-                key_version: self.key_version,
-            },
             metadata: SecretMetadata {
                 id,
                 name: name.to_owned(),
                 purpose: purpose.to_owned(),
-                key_version: self.key_version,
+                key_version: record.key_version,
                 created_at: now,
                 updated_at: now,
             },
+            record,
         };
         persist_secret(&self.root, &stored)?;
         let mut next_audit = self.audit.clone();
@@ -460,12 +520,23 @@ impl SecretStore {
         Ok(id)
     }
 
-    /// Unseal and return the secret bytes with the verified deterministic HPKE seed.
+    /// Unseal and return the secret bytes: V1/V2 with the verified
+    /// deterministic HPKE seed, V3 through the configured DEK wrapper (fails
+    /// closed with [`SecretsError::DekWrapperUnavailable`] when none is set).
     pub fn get(&self, id: &SecretId) -> SecretsResult<SecretBox<[u8]>> {
         let stored = self
             .index
             .get(id)
             .ok_or(SecretsError::NotFound { id: *id })?;
+        if stored.record.envelope_format == SecretEnvelopeFormat::KmsWrappedV3 {
+            // The wrapper owns the V3 key generation; the local KEK
+            // generation does not apply.
+            return crate::envelope::open_with_wrapper(
+                None,
+                self.dek_wrapper.as_deref(),
+                &stored.record,
+            );
+        }
         if stored.record.key_version != self.key_version {
             return Err(SecretsError::RotationIncomplete {
                 id: *id,
@@ -547,6 +618,11 @@ impl SecretStore {
         let mut derived_next_public_keys: Vec<(KemAlgo, Vec<u8>)> = Vec::new();
 
         for stored in rotated_index.values_mut() {
+            // V3 DEKs are wrapped by the DEK wrapper's key lifecycle, not by
+            // the local KEK: a local rotation leaves them untouched.
+            if stored.record.envelope_format == SecretEnvelopeFormat::KmsWrappedV3 {
+                continue;
+            }
             if stored.record.key_version != self.key_version {
                 return Err(SecretsError::RotationIncomplete {
                     id: stored.record.id,
@@ -595,8 +671,9 @@ impl SecretStore {
 
         let mut next_audit = self.audit.clone();
         let subjects = rotated_index
-            .keys()
-            .map(|id| SubjectRef::new("secret", &format_secret_id(id)))
+            .values()
+            .filter(|stored| stored.record.envelope_format != SecretEnvelopeFormat::KmsWrappedV3)
+            .map(|stored| SubjectRef::new("secret", &format_secret_id(&stored.record.id)))
             .collect();
         next_audit.append(Actor::System, "secret.rotate", subjects);
         if let Err(error) = persist_audit_state(&self.root, &next_audit, &self.checkpoints) {
@@ -613,6 +690,103 @@ impl SecretStore {
         self.key_material = Some(next_key_material);
         self.audit = next_audit;
         Ok(())
+    }
+
+    /// Explicitly migrate every V1/V2 record to
+    /// [`SecretEnvelopeFormat::KmsWrappedV3`] under the configured DEK
+    /// wrapper (Crypto-Masterplan v2 §16.3/§37: never implicit, never at
+    /// startup). V2 payload ciphertext and nonce stay byte-identical; V1
+    /// payloads are re-encrypted under a fresh DEK. Records that already are
+    /// V3 are left untouched.
+    ///
+    /// Transactional like [`Self::rotate`]: the full replacement directory is
+    /// staged and promoted, then the `secret.migrate_v3` audit event is made
+    /// durable; any failure leaves memory and disk unchanged. With nothing to
+    /// migrate, nothing is written and no audit event is recorded.
+    ///
+    /// # Errors
+    /// - [`SecretsError::DekWrapperUnavailable`]: no DEK wrapper configured.
+    /// - [`SecretsError::KekUnavailable`]: V1/V2 records exist but no local
+    ///   KEK material was supplied to open them.
+    /// - [`SecretsError::RotationIncomplete`]: a V1/V2 record is not at the
+    ///   store's current KEK generation.
+    /// - Every error of [`crate::envelope::rewrap_to_v3`] and of persistence.
+    pub fn migrate_all_to_v3(&mut self) -> SecretsResult<V3MigrationReport> {
+        let wrapper =
+            self.dek_wrapper
+                .clone()
+                .ok_or_else(|| SecretsError::DekWrapperUnavailable {
+                    profile: "none".to_owned(),
+                    reason: "V3 migration requires a configured DEK wrapper".to_owned(),
+                })?;
+        let mut report = V3MigrationReport::default();
+        let mut migrated_index = self.index.clone();
+        let mut subjects = Vec::new();
+        let now = jiff::Timestamp::now();
+
+        for stored in migrated_index.values_mut() {
+            match stored.record.envelope_format {
+                SecretEnvelopeFormat::KmsWrappedV3 => {
+                    report.already_v3 += 1;
+                    continue;
+                }
+                SecretEnvelopeFormat::LegacyDirectHpke => report.migrated_v1 += 1,
+                SecretEnvelopeFormat::DekWrappedV2 => report.migrated_v2 += 1,
+            }
+            if stored.record.key_version != self.key_version {
+                return Err(SecretsError::RotationIncomplete {
+                    id: stored.record.id,
+                    found: stored.record.key_version,
+                    expected: self.key_version,
+                });
+            }
+            let material = self.require_key_material()?;
+            stored.record = crate::envelope::rewrap_to_v3(
+                material.hpke_seed.expose_secret(),
+                &stored.record,
+                &*wrapper,
+            )?;
+            stored.metadata.key_version = stored.record.key_version;
+            stored.metadata.updated_at = now;
+            subjects.push(SubjectRef::new(
+                "secret",
+                &format_secret_id(&stored.record.id),
+            ));
+        }
+
+        if report.migrated() == 0 {
+            return Ok(report);
+        }
+
+        stage_secrets_directory(&self.root, migrated_index.values())?;
+        let replacement = match promote_staged_secrets_directory(&self.root) {
+            Ok(replacement) => replacement,
+            Err(error) => {
+                let _ = remove_staged_secrets_directory(&self.root);
+                return Err(error);
+            }
+        };
+
+        let mut next_audit = self.audit.clone();
+        next_audit.append(Actor::System, "secret.migrate_v3", subjects);
+        if let Err(error) = persist_audit_state(&self.root, &next_audit, &self.checkpoints) {
+            let _ = replacement.rollback();
+            return Err(error);
+        }
+
+        let _ = replacement.finalize();
+        self.index = migrated_index;
+        self.audit = next_audit;
+        Ok(report)
+    }
+
+    fn require_key_material(&self) -> SecretsResult<&KekMaterial> {
+        self.key_material
+            .as_ref()
+            .ok_or_else(|| SecretsError::KekUnavailable {
+                kind: provenance_kind(&self.provenance).to_owned(),
+                reason: "no validated KEK material was supplied".to_owned(),
+            })
     }
 
     /// Durably remove a secret before dropping it from the in-process index.
@@ -948,7 +1122,11 @@ fn load_index(
                 "secret store entry identity or key version does not match its contents",
             ));
         }
-        if stored.record.key_version != current_key_version {
+        // V3 records carry the DEK wrapper's key generation, which is
+        // independent of the local KEK generation.
+        if stored.record.envelope_format != SecretEnvelopeFormat::KmsWrappedV3
+            && stored.record.key_version != current_key_version
+        {
             return Err(SecretsError::RotationIncomplete {
                 id: stored.record.id,
                 found: stored.record.key_version,
@@ -2260,6 +2438,295 @@ mod tests {
         // einem Ereignis ist `events[1].prev_hash`.
         store.verify_checkpoints(&verification_key)?;
         assert_eq!(store.checkpoint_log().len(), 1);
+        Ok(())
+    }
+
+    // ---- V3 (KMS-wrapped) store integration --------------------------------
+
+    use crate::dek_wrapper::LocalHpkeDekWrapper;
+
+    fn local_wrapper(generation: u32) -> TestResult<Arc<dyn DekWrapper>> {
+        Ok(Arc::new(LocalHpkeDekWrapper::new(
+            "secrets/dek-wrap",
+            generation,
+            CryptoPolicy::strongest(),
+            SecretBox::new(vec![0x3C_u8; 32].into_boxed_slice()),
+        )?))
+    }
+
+    fn env_provenance() -> KekProvenance {
+        KekProvenance::EnvSeed {
+            var: "HARW_TEST_SEED".to_owned(),
+        }
+    }
+
+    #[test]
+    fn store_with_a_dek_wrapper_creates_v3_records_without_local_kek() -> TestResult {
+        let root = test_root("v3-create");
+        let policy = CryptoPolicy::strongest();
+        let mut store = SecretStore::new(
+            root.clone(),
+            policy,
+            env_provenance(),
+            KeyVersion::initial(),
+        )
+        .with_dek_wrapper(local_wrapper(5)?);
+        let value = SecretBox::new(b"kms-token".to_vec().into_boxed_slice());
+
+        let id = store.create("provider-token", "provider-auth", &value)?;
+
+        let record = store.record(&id)?;
+        assert_eq!(record.envelope_format, SecretEnvelopeFormat::KmsWrappedV3);
+        assert_eq!(record.key_generation, Some(5));
+        assert_eq!(record.key_version, KeyVersion(5));
+        assert_eq!(store.metadata(&id)?.key_version, KeyVersion(5));
+        assert_eq!(store.get(&id)?.expose_secret().as_ref(), b"kms-token");
+        let on_disk = fs::read_to_string(secrets_root(&root).join(secret_file_name(&id)))?;
+        assert!(on_disk.contains(r#""envelope_format":"kms_wrapped_v3""#));
+        assert!(on_disk.contains(r#""key_id":"secrets/dek-wrap""#));
+
+        // Reopen (local KEK generation 0 differs from the wrapper's 5).
+        let reopened = SecretStore::open(
+            root.clone(),
+            policy,
+            env_provenance(),
+            KeyVersion::initial(),
+        )?
+        .with_dek_wrapper(local_wrapper(5)?);
+        assert_eq!(reopened.get(&id)?.expose_secret().as_ref(), b"kms-token");
+
+        // Without a wrapper a V3 record fails closed.
+        let without = SecretStore::open(root, policy, env_provenance(), KeyVersion::initial())?;
+        assert!(matches!(
+            without.get(&id),
+            Err(SecretsError::DekWrapperUnavailable { .. })
+        ));
+        // A wrapper serving another generation is refused with a typed error.
+        let wrong_generation = SecretStore::open(
+            without.root().to_owned(),
+            policy,
+            env_provenance(),
+            KeyVersion::initial(),
+        )?
+        .with_dek_wrapper(local_wrapper(6)?);
+        assert!(matches!(
+            wrong_generation.get(&id),
+            Err(SecretsError::KeyGenerationMismatch {
+                expected: 6,
+                found: 5,
+                ..
+            })
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn store_without_a_dek_wrapper_still_writes_v2_json_without_kms_fields() -> TestResult {
+        let root = test_root("v2-default");
+        let mut store = store_with_root(root.clone())?;
+        let value = SecretBox::new(b"token".to_vec().into_boxed_slice());
+
+        let id = store.create("provider-token", "provider-auth", &value)?;
+
+        assert_eq!(
+            store.record(&id)?.envelope_format,
+            SecretEnvelopeFormat::DekWrappedV2
+        );
+        let on_disk = fs::read_to_string(secrets_root(&root).join(secret_file_name(&id)))?;
+        for absent in ["key_id", "key_generation", "crypto_profile_id"] {
+            assert!(
+                !on_disk.contains(absent),
+                "V2 entry must not contain {absent}"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn migrate_all_to_v3_rewraps_v1_and_v2_explicitly_and_is_idempotent() -> TestResult {
+        let root = test_root("v3-migrate");
+        let policy = CryptoPolicy::strongest();
+        let mut store = SecretStore::with_key_material(
+            root.clone(),
+            policy,
+            env_provenance(),
+            KeyVersion::initial(),
+            material_from_seed(policy, [0xA5; 32])?,
+        );
+        let first = store.create(
+            "first",
+            "test",
+            &SecretBox::new(b"first-token".to_vec().into_boxed_slice()),
+        )?;
+        let second = store.create(
+            "second",
+            "test",
+            &SecretBox::new(b"second-token".to_vec().into_boxed_slice()),
+        )?;
+        // A genuine legacy direct-HPKE record.
+        let legacy_id = SecretId::new();
+        let legacy_record = crate::envelope::seal_legacy_v1_for_tests(
+            &policy,
+            legacy_id,
+            KeyVersion::initial(),
+            &hybrid_public_key(policy, [0xA5; 32])?,
+            b"legacy-token",
+        )?;
+        let now = jiff::Timestamp::now();
+        let legacy = StoredSecret {
+            record: legacy_record,
+            metadata: SecretMetadata {
+                id: legacy_id,
+                name: "legacy".to_owned(),
+                purpose: "test".to_owned(),
+                key_version: KeyVersion::initial(),
+                created_at: now,
+                updated_at: now,
+            },
+        };
+        persist_secret(&root, &legacy)?;
+        store.index.insert(legacy_id, legacy);
+        let before_first = store.record(&first)?;
+
+        // Configuring the wrapper alone migrates nothing.
+        let mut store = store.with_dek_wrapper(local_wrapper(0)?);
+        assert_eq!(
+            store.record(&first)?.envelope_format,
+            SecretEnvelopeFormat::DekWrappedV2
+        );
+        let events_before = store.audit_log().len();
+
+        let report = store.migrate_all_to_v3()?;
+
+        assert_eq!(
+            report,
+            V3MigrationReport {
+                migrated_v1: 1,
+                migrated_v2: 2,
+                already_v3: 0,
+            }
+        );
+        assert_eq!(report.migrated(), 3);
+        for id in [first, second, legacy_id] {
+            assert_eq!(
+                store.record(&id)?.envelope_format,
+                SecretEnvelopeFormat::KmsWrappedV3
+            );
+        }
+        let after_first = store.record(&first)?;
+        assert_eq!(after_first.ciphertext, before_first.ciphertext);
+        assert_eq!(after_first.nonce, before_first.nonce);
+        assert_eq!(store.get(&first)?.expose_secret().as_ref(), b"first-token");
+        assert_eq!(
+            store.get(&second)?.expose_secret().as_ref(),
+            b"second-token"
+        );
+        assert_eq!(
+            store.get(&legacy_id)?.expose_secret().as_ref(),
+            b"legacy-token"
+        );
+        assert_eq!(store.audit_log().len(), events_before + 1);
+        let last_event = store
+            .audit_log()
+            .events()
+            .last()
+            .ok_or(TestError::Missing("audit event after migration"))?;
+        assert_eq!(last_event.action, "secret.migrate_v3");
+        assert_eq!(last_event.subjects.len(), 3);
+
+        // Durable: a restart with only the wrapper (no local KEK) reads all.
+        let reopened = SecretStore::open(root, policy, env_provenance(), KeyVersion::initial())?
+            .with_dek_wrapper(local_wrapper(0)?);
+        assert_eq!(
+            reopened.get(&legacy_id)?.expose_secret().as_ref(),
+            b"legacy-token"
+        );
+
+        // Idempotent: a second run migrates nothing and records nothing.
+        let again = store.migrate_all_to_v3()?;
+        assert_eq!(
+            again,
+            V3MigrationReport {
+                migrated_v1: 0,
+                migrated_v2: 0,
+                already_v3: 3,
+            }
+        );
+        assert_eq!(store.audit_log().len(), events_before + 1);
+        Ok(())
+    }
+
+    #[test]
+    fn migrate_all_to_v3_without_a_wrapper_is_refused_and_changes_nothing() -> TestResult {
+        let root = test_root("v3-migrate-no-wrapper");
+        let mut store = store_with_root(root.clone())?;
+        let id = store.create(
+            "token",
+            "test",
+            &SecretBox::new(b"token".to_vec().into_boxed_slice()),
+        )?;
+        let before = fs::read(secrets_root(&root).join(secret_file_name(&id)))?;
+
+        assert!(matches!(
+            store.migrate_all_to_v3(),
+            Err(SecretsError::DekWrapperUnavailable { .. })
+        ));
+        assert_eq!(
+            store.record(&id)?.envelope_format,
+            SecretEnvelopeFormat::DekWrappedV2
+        );
+        assert_eq!(
+            fs::read(secrets_root(&root).join(secret_file_name(&id)))?,
+            before
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn local_rotation_leaves_v3_records_untouched() -> TestResult {
+        let root = test_root("v3-rotation");
+        let policy = CryptoPolicy::strongest();
+        let mut store = SecretStore::with_key_material(
+            root.clone(),
+            policy,
+            env_provenance(),
+            KeyVersion::initial(),
+            material_from_seed(policy, [0xA5; 32])?,
+        );
+        let v2_id = store.create(
+            "v2",
+            "test",
+            &SecretBox::new(b"v2-token".to_vec().into_boxed_slice()),
+        )?;
+        let mut store = store.with_dek_wrapper(local_wrapper(3)?);
+        let v3_id = store.create(
+            "v3",
+            "test",
+            &SecretBox::new(b"v3-token".to_vec().into_boxed_slice()),
+        )?;
+        let v3_before = store.record(&v3_id)?;
+
+        store.rotate(material_from_seed(policy, [0x5A; 32])?)?;
+
+        assert_eq!(store.record(&v3_id)?, v3_before);
+        assert_eq!(store.record(&v2_id)?.key_version, KeyVersion(1));
+        let last_event = store
+            .audit_log()
+            .events()
+            .last()
+            .ok_or(TestError::Missing("audit event after rotation"))?;
+        assert_eq!(last_event.subjects.len(), 1);
+
+        let reopened = SecretStore::open_with_key_material(
+            root,
+            policy,
+            env_provenance(),
+            KeyVersion(1),
+            material_from_seed(policy, [0x5A; 32])?,
+        )?
+        .with_dek_wrapper(local_wrapper(3)?);
+        assert_eq!(reopened.get(&v2_id)?.expose_secret().as_ref(), b"v2-token");
+        assert_eq!(reopened.get(&v3_id)?.expose_secret().as_ref(), b"v3-token");
         Ok(())
     }
 }

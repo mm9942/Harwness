@@ -43,6 +43,11 @@ members = [
     "harw-session-store",
     "harw-memory",
     "harw-core-bridge",
+    "harw-auth-hub",
+    "harw-infra-client",
+    "harw-netsec",
+    "harw-node-transport",
+    "harw-security-hub",
     "harw-job-core",
     "harw-job-darwin",
     "harw-job-exec",
@@ -123,6 +128,7 @@ members = [
     "dod/crates/harw-dod-cgroup",
     "dod/crates/harw-dod-config",
     "dod/crates/harw-dod-cpu",
+    "dod/crates/harw-dod-encrypt",
     "dod/crates/harw-dod-escalate",
     "dod/crates/harw-dod-fixtures",
     "dod/crates/harw-dod-flow",
@@ -189,6 +195,11 @@ tracing = "0.1.44"
 
 # Syscalls ohne libc: fanotify im Dateisystem-Wächter.
 rustix = "1.1.4"
+# CryptGuard 3.1 is not on crates.io yet: git until it is published (see
+# docs/architecture/crypto-drift-report.md, D3). Cargo.lock pins the commit.
+crypt_guard = { git = "https://github.com/mm9942/crypt_guard", branch = "main", default-features = false, features = ["ml-kem-backend", "ml-dsa-backend"] }
+crypt_guard_service = { git = "https://github.com/mm9942/crypt_guard", branch = "main" }
+crypt_guard_hyper = { git = "https://github.com/mm9942/crypt_guard", branch = "main" }
 procfs = { version = "0.18.0", default-features = false }
 landlock = "0.4.7"
 cap-std = "3.4.6"

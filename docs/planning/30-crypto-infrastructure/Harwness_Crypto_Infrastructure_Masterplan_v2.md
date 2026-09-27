@@ -1,3 +1,5 @@
+> Status: PARTIALLY LANDED (H0–H12 first cut, see MIG-009…MIG-013; open items listed there)
+
 # Harwness Infrastructure / Crypto / Control Plane Masterplan v2
 
 > **Purpose:** upgrade the previous Harwness master plan with the current Harwness repository reality, the new CryptGuard service/Tower/Hyper design, the three-socket control model, and the decisions from the architecture discussion.

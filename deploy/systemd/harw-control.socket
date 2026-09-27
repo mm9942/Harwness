@@ -1,0 +1,33 @@
+# harw-control.socket -- activation socket of harw-control.service.
+#
+# Canonical source: deploy/systemd/ (Crypto Masterplan v2 §6.1, §22.2, H9,
+# H10). Embedded into harw-install; `harw install --print-systemd
+# harw-control.socket` prints it.
+#
+# AF_UNIX/SOCK_STREAM carrying the `harw web` HTTP API. Exactly one
+# Listen*= line, so `harw web --systemd-socket` receives LISTEN_FDS=1.
+# /run/harw/infra/ is created by tmpfiles.d/harw.conf (0755 root:root, so
+# only systemd creates sockets there).
+#
+# Access: the socket file is 0660 harw-control:harw-control-clients, so only
+# the daemon user and members of harw-control-clients may connect. The group
+# is empty by default; admins add the users that should reach the control
+# plane. `harw web` still authorizes every peer via SO_PEERCRED: only its own
+# UID gets the owner tier, other group members reach only GET /v1/health
+# (403 unknown_peer elsewhere).
+
+[Unit]
+Description=HARW control plane activation socket
+PartOf=harw-infra.target
+
+[Socket]
+ListenStream=/run/harw/infra/control.sock
+SocketUser=harw-control
+SocketGroup=harw-control-clients
+SocketMode=0660
+Service=harw-control.service
+RemoveOnStop=yes
+Accept=no
+
+[Install]
+WantedBy=harw-infra.target

@@ -148,6 +148,12 @@ service`. See [`docs/setup/dod.md`](dod.md) for what it is and how to set
 it up; `make dod-build`, `sudo make dod-install` and `make dod-enable` are
 thin delegations to `dod/Makefile` from the repository root.
 
+All system units (DoD and the infrastructure daemons), the `sysusers.d`
+accounts and the `tmpfiles.d` directories live in one canonical tree,
+`deploy/`, which is also compiled into `harw`. `harw install
+--print-systemd [UNIT]` prints the shipped units; see
+[DoD setup](dod.md#systemd-units-and-the-deploy-tree).
+
 ## Updating
 
 Re-running an install path overwrites `harw` and `killer` in place; it does

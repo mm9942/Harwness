@@ -27,6 +27,8 @@ pub mod guard_wiring;
 pub mod handoff;
 // Runde 5, Teil N: Host-Mode-Anfrage aus dem Orchestrator-Baum.
 pub mod host_escalation_wiring;
+// Crypto-Infrastruktur H4: Infrastruktur-Clients aus `[infrastructure]`.
+pub mod infrastructure;
 pub mod job_ledger;
 // Plan R9, Teil F: Job-Verwaltung der Sitzung und Zustellung ihrer Ereignisse.
 pub mod job_wiring;
@@ -60,7 +62,10 @@ pub use budget::child_limits;
 pub use ceiling::root_ceiling;
 pub use children::RuntimeChildRegistryFactory;
 pub use config::{ConfigTrustReport, load_config, load_config_embedded};
-pub use contributors::{AssemblyContributor, AssemblyInputs, AssemblyParts, default_contributors};
+pub use contributors::{
+    AssemblyContributor, AssemblyInputs, AssemblyParts, InfrastructureContributor,
+    default_contributors,
+};
 pub use embedded::{EffectiveRights, EmbeddedAgent, RightsFlags};
 pub use error::{RuntimeError, RuntimeResult};
 pub use guard_wiring::{

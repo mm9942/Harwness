@@ -77,6 +77,66 @@ fn domain_and_permission_correct() {
     );
 }
 
+// ── infrastructure domains (Masterplan v2 §31) ───────────────────────────────
+
+#[operation(
+    name = "infra.auth.devices.list",
+    summary = "Geräte auflisten.",
+    domain = "identity",
+    permission = "maintainer"
+)]
+async fn infra_identity_op(_ctx: &OpContext, _args: NoArgs) -> Result<OpOutput, OpError> {
+    Ok(OpOutput::from(String::new()))
+}
+
+#[operation(
+    name = "infra.network.nodes.drain",
+    summary = "Knoten drainen.",
+    domain = "network",
+    permission = "maintainer"
+)]
+async fn infra_network_op(_ctx: &OpContext, _args: NoArgs) -> Result<OpOutput, OpError> {
+    Ok(OpOutput::from(String::new()))
+}
+
+#[operation(
+    name = "infra.security.incidents.list",
+    summary = "Incidents auflisten.",
+    domain = "security",
+    permission = "maintainer"
+)]
+async fn infra_security_op(_ctx: &OpContext, _args: NoArgs) -> Result<OpOutput, OpError> {
+    Ok(OpOutput::from(String::new()))
+}
+
+#[operation(
+    name = "infra.auth.keys.rotate",
+    summary = "Schlüssel rotieren.",
+    domain = "crypto",
+    permission = "owner"
+)]
+async fn infra_crypto_op(_ctx: &OpContext, _args: NoArgs) -> Result<OpOutput, OpError> {
+    Ok(OpOutput::from(String::new()))
+}
+
+#[test]
+fn infrastructure_domains_map_to_variants_and_system_category() {
+    use harw_operations::{OperationCategory, OperationDomain};
+
+    let cases: [(&dyn Operation, OperationDomain); 4] = [
+        (&InfraIdentityOpOperation, OperationDomain::Identity),
+        (&InfraNetworkOpOperation, OperationDomain::Network),
+        (&InfraSecurityOpOperation, OperationDomain::Security),
+        (&InfraCryptoOpOperation, OperationDomain::Crypto),
+    ];
+    for (op, domain) in cases {
+        let meta = op.meta();
+        assert_eq!(meta.domain, domain, "{}", meta.name);
+        assert_eq!(meta.category, OperationCategory::System, "{}", meta.name);
+        assert_eq!(meta.category, domain.default_category(), "{}", meta.name);
+    }
+}
+
 // ── model_tool surface ────────────────────────────────────────────────────────
 
 #[derive(Default, Deserialize)]

@@ -29,7 +29,7 @@ use std::time::{Duration, Instant};
 
 use harw_agent_artifact::{Artifact, append_to_executable, write_executable};
 use harw_agent_compiler::{AgentInput, Compiled, Compiler, CompilerEnv, CompilerOptions};
-use harw_agent_runner::error::{EXIT_DATA, EXIT_USAGE};
+use harw_agent_runner::error::{EXIT_ADMISSION, EXIT_DATA, EXIT_USAGE};
 use harw_agent_runner::iface::mcp::MCP_PROTOCOL_VERSION;
 use serde_json::{Value, json};
 
@@ -92,6 +92,23 @@ fn compile_worker(name: &str) -> Result<(tempfile::TempDir, Artifact), Box<dyn s
     let definition = worker_definition(name);
     let (root, env) = home_with(&[(name, &definition)])?;
     let compiled = compile(&env, name)?;
+    Ok((root, compiled.artifact))
+}
+
+/// As [`compile_worker`], but for the build target `target` (a rustc
+/// triple), which the compiled execution requirements name (PL-90).
+fn compile_worker_for_target(
+    name: &str,
+    target: &str,
+) -> Result<(tempfile::TempDir, Artifact), Box<dyn std::error::Error>> {
+    let definition = worker_definition(name);
+    let (root, env) = home_with(&[(name, &definition)])?;
+    let options = CompilerOptions {
+        target: Some(target.to_owned()),
+        ..CompilerOptions::default()
+    };
+    let mut compiler = Compiler::new(env, options)?;
+    let compiled = compiler.compile_input(&AgentInput::Name(name.to_owned()))?;
     Ok((root, compiled.artifact))
 }
 
@@ -466,6 +483,112 @@ fn test_manifest_json_reports_the_compiled_permissions() -> TestResult {
     assert!(tools.iter().any(|tool| tool == "fs.read"), "{permissions}");
     assert_eq!(permissions["shell"], Value::Bool(false), "{permissions}");
     assert_eq!(permissions["host"], Value::Bool(false), "{permissions}");
+    Ok(())
+}
+
+#[test]
+fn test_requirements_json_reports_requirements_host_and_verdict() -> TestResult {
+    let (_root, artifact) = compile_worker("required")?;
+    let out_dir = tempfile::tempdir()?;
+    let exe = build_agent_binary(out_dir.path(), "required", &artifact)?;
+    let home = tempfile::tempdir()?;
+
+    let finished = run_with_timeout(
+        &exe,
+        &["--requirements", "--json"],
+        home.path(),
+        SHORT_TIMEOUT,
+    )?;
+    // A read-only worker compiled for this host needs nothing the host
+    // lacks: admitted, exit 0.
+    assert_eq!(finished.code, Some(0), "stderr: {}", finished.stderr);
+    let doc: Value = serde_json::from_str(finished.stdout.trim())?;
+    assert_eq!(doc["agent"], "acme.agent.required@1", "{doc}");
+    assert_eq!(doc["requirements"]["process_exec"], false, "{doc}");
+    assert_eq!(
+        doc["requirements"]["targets"][0]["os"],
+        std::env::consts::OS,
+        "{doc}"
+    );
+    assert_eq!(doc["host"]["target_os"], std::env::consts::OS, "{doc}");
+    assert!(
+        doc["host"]["best_report"]["filesystem"].is_string(),
+        "{doc}"
+    );
+    assert_eq!(doc["verdict"]["admitted"], true, "{doc}");
+
+    let text = run_with_timeout(&exe, &["--requirements"], home.path(), SHORT_TIMEOUT)?;
+    assert_eq!(text.code, Some(0), "stderr: {}", text.stderr);
+    for expected in ["requirements:", "host:", "verdict: admitted"] {
+        assert!(
+            text.stdout.contains(expected),
+            "`{expected}` in {}",
+            text.stdout
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn test_a_target_mismatch_is_refused_at_startup() -> TestResult {
+    // No real host is `plan9`: the compiled requirements name a foreign
+    // target, so admission must refuse before any interface starts.
+    let (_root, artifact) = compile_worker_for_target("foreign", "x86_64-unknown-plan9")?;
+    let out_dir = tempfile::tempdir()?;
+    let exe = build_agent_binary(out_dir.path(), "foreign", &artifact)?;
+    let home = tempfile::tempdir()?;
+
+    let finished = run_with_timeout(
+        &exe,
+        &["--offline-echo", "hello"],
+        home.path(),
+        SHORT_TIMEOUT,
+    )?;
+    assert_eq!(
+        finished.code,
+        Some(i32::from(EXIT_ADMISSION)),
+        "stdout: {} stderr: {}",
+        finished.stdout,
+        finished.stderr
+    );
+    assert!(
+        finished.stderr.contains("admission refused"),
+        "{}",
+        finished.stderr
+    );
+    assert!(finished.stderr.contains("plan9"), "{}", finished.stderr);
+    assert!(!finished.stdout.contains("echo:"), "{}", finished.stdout);
+
+    // A target mismatch is never overridable.
+    let degraded = run_with_timeout(
+        &exe,
+        &["--allow-degraded", "--offline-echo", "hello"],
+        home.path(),
+        SHORT_TIMEOUT,
+    )?;
+    assert_eq!(
+        degraded.code,
+        Some(i32::from(EXIT_ADMISSION)),
+        "{}",
+        degraded.stderr
+    );
+
+    // `--requirements` reports the same verdict without starting.
+    let report = run_with_timeout(
+        &exe,
+        &["--requirements", "--json"],
+        home.path(),
+        SHORT_TIMEOUT,
+    )?;
+    assert_eq!(
+        report.code,
+        Some(i32::from(EXIT_ADMISSION)),
+        "{}",
+        report.stderr
+    );
+    let doc: Value = serde_json::from_str(report.stdout.trim())?;
+    assert_eq!(doc["verdict"]["admitted"], false, "{doc}");
+    assert_eq!(doc["verdict"]["missing"][0]["item"], "target", "{doc}");
     Ok(())
 }
 

@@ -25,6 +25,15 @@
 //!   (a future container executor).
 //! - `resource_limits` is always `NotEnforced` here: rlimits and cgroup
 //!   limits are applied by other steps, whose results the caller merges in.
+//!
+//! # Host capability probe (side-effect free)
+//! For runtime admission (PL-90) the host is probed without changing it:
+//! [`landlock_lsm_active`] / [`lsm_list_contains_landlock`] read the LSM
+//! list, [`userns_available`] / [`userns_from_sysctls`] read the user
+//! namespace sysctls, and `landlock_support` (feature `linux-sandbox`)
+//! determines the kernel Landlock ABI on a throwaway thread, so the calling
+//! thread is never restricted. All results are [`LandlockSupport`] /
+//! `Option<bool>` plain data.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -243,8 +252,99 @@ pub fn plan_landlock(policy: &SandboxPolicy) -> LandlockPlan {
     }
 }
 
+/// Kernel LSM list (`/sys/kernel/security/lsm`, needs securityfs).
+const LSM_LIST: &str = "/sys/kernel/security/lsm";
+/// Debian/Ubuntu switch for unprivileged user namespaces.
+const USERNS_CLONE_SWITCH: &str = "/proc/sys/kernel/unprivileged_userns_clone";
+/// Upstream per-user namespace limit (`0` disables user namespaces).
+const USERNS_MAX: &str = "/proc/sys/user/max_user_namespaces";
+
+/// Landlock support of the running host (host capability probe for
+/// runtime admission). Plain data; no landlock type leaks.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct LandlockSupport {
+    /// Whether `landlock` is in the active LSM list
+    /// (`/sys/kernel/security/lsm`). `None` if that file is unreadable
+    /// (securityfs not mounted, or no permission).
+    pub lsm_active: Option<bool>,
+    /// Landlock ABI of the running kernel: `Some(n)` with `n >= 1` when
+    /// Landlock works at ABI `n` (a kernel newer than the `landlock` crate
+    /// reports its own, higher number); `Some(0)` when the kernel reports
+    /// Landlock as not implemented or not enabled; `None` when it could not
+    /// be determined (feature `linux-sandbox` off, or the probe thread
+    /// failed).
+    pub abi: Option<u8>,
+}
+
+impl LandlockSupport {
+    /// The usable Landlock ABI (`>= 1`), if any.
+    #[must_use]
+    pub fn usable_abi(&self) -> Option<u8> {
+        self.abi.filter(|abi| *abi >= 1)
+    }
+}
+
+/// Whether an LSM list (the comma-separated content of
+/// `/sys/kernel/security/lsm`) names `landlock`. Pure.
+#[must_use]
+pub fn lsm_list_contains_landlock(content: &str) -> bool {
+    content
+        .trim()
+        .split(',')
+        .any(|name| name.trim() == "landlock")
+}
+
+/// Reads `/sys/kernel/security/lsm`: `Some(true)` if Landlock is an active
+/// LSM, `Some(false)` if not, `None` if the file is unreadable. Read-only.
+#[must_use]
+pub fn landlock_lsm_active() -> Option<bool> {
+    std::fs::read_to_string(LSM_LIST)
+        .ok()
+        .map(|content| lsm_list_contains_landlock(&content))
+}
+
+/// Combines the two user-namespace sysctls into availability of
+/// *unprivileged* user namespaces (what an unprivileged `bwrap` needs).
+/// Pure.
+///
+/// - `unprivileged_userns_clone` (Debian/Ubuntu patch): `0` → `false`.
+/// - `max_user_namespaces`: `0` → `false`.
+/// - Otherwise `true` if at least one of them was readable and parsed,
+///   `None` if neither says anything.
+///
+/// LSM policies (e.g. Ubuntu's AppArmor
+/// `apparmor_restrict_unprivileged_userns`) can still deny namespace
+/// creation for individual binaries; this is a host-level upper bound.
+#[must_use]
+pub fn userns_from_sysctls(
+    unprivileged_userns_clone: Option<&str>,
+    max_user_namespaces: Option<&str>,
+) -> Option<bool> {
+    let parse = |value: Option<&str>| value.and_then(|text| text.trim().parse::<u64>().ok());
+    let clone = parse(unprivileged_userns_clone);
+    let max = parse(max_user_namespaces);
+    if clone == Some(0) || max == Some(0) {
+        Some(false)
+    } else if clone.is_some() || max.is_some() {
+        Some(true)
+    } else {
+        None
+    }
+}
+
+/// Whether unprivileged user namespaces are available on this host (see
+/// [`userns_from_sysctls`]). Read-only: only reads two sysctl files and
+/// never creates a namespace.
+#[must_use]
+pub fn userns_available() -> Option<bool> {
+    let clone = std::fs::read_to_string(USERNS_CLONE_SWITCH).ok();
+    let max = std::fs::read_to_string(USERNS_MAX).ok();
+    userns_from_sysctls(clone.as_deref(), max.as_deref())
+}
+
 #[cfg(feature = "linux-sandbox")]
-pub use enforce::{PreparedRuleset, apply_to_current_process, build_ruleset};
+pub use enforce::{PreparedRuleset, apply_to_current_process, build_ruleset, landlock_support};
 
 #[cfg(feature = "linux-sandbox")]
 mod enforce {
@@ -424,6 +524,77 @@ mod enforce {
         (filesystem, network)
     }
 
+    /// Number of a Landlock ABI (`0` for unsupported).
+    fn abi_number(abi: ABI) -> u8 {
+        match abi {
+            ABI::Unsupported => 0,
+            ABI::V1 => 1,
+            ABI::V2 => 2,
+            ABI::V3 => 3,
+            ABI::V4 => 4,
+            ABI::V5 => 5,
+            ABI::V6 => 6,
+            ABI::V7 => 7,
+            ABI::V8 => 8,
+            // Newer variants of a future `landlock` release: at least V9.
+            _ => 9,
+        }
+    }
+
+    /// Kernel Landlock ABI from a restriction status (see
+    /// [`super::LandlockSupport::abi`]).
+    fn kernel_abi_of(status: &RestrictionStatus) -> u8 {
+        match status.landlock {
+            LandlockStatus::Available {
+                effective_abi,
+                kernel_abi,
+            } => kernel_abi
+                .and_then(|raw| u8::try_from(raw).ok())
+                .unwrap_or_else(|| abi_number(effective_abi)),
+            LandlockStatus::NotEnabled | LandlockStatus::NotImplemented => 0,
+        }
+    }
+
+    /// Probes Landlock support **without restricting the calling thread**.
+    ///
+    /// The ABI is only reported by the `landlock` crate through the
+    /// [`RestrictionStatus`] of `restrict_self`. Landlock domains and
+    /// `NO_NEW_PRIVS` are per-thread (the crate never requests
+    /// `LANDLOCK_RESTRICT_SELF_TSYNC`), so the probe spawns a throwaway
+    /// thread that builds a minimal ruleset (all ABI V1 filesystem rights
+    /// handled, no rules), restricts *itself*, returns the status and
+    /// exits; the caller joins it. The calling thread and every other
+    /// thread of the process keep their unrestricted state; nothing the
+    /// probe thread did survives it (it spawns no children).
+    ///
+    /// Never fails: an unreadable LSM list gives `lsm_active: None`, a
+    /// failed probe thread gives `abi: None`.
+    #[must_use]
+    pub fn landlock_support() -> super::LandlockSupport {
+        super::LandlockSupport {
+            lsm_active: super::landlock_lsm_active(),
+            abi: probe_abi(),
+        }
+    }
+
+    fn probe_abi() -> Option<u8> {
+        let probe = std::thread::Builder::new()
+            .name("harw-landlock-probe".to_owned())
+            .spawn(|| -> Option<u8> {
+                let status = Ruleset::default()
+                    .set_compatibility(CompatLevel::BestEffort)
+                    .handle_access(AccessFs::from_all(ABI::V1))
+                    .ok()?
+                    .create()
+                    .ok()?
+                    .restrict_self()
+                    .ok()?;
+                Some(kernel_abi_of(&status))
+            })
+            .ok()?;
+        probe.join().ok().flatten()
+    }
+
     /// Applies `policy` to the **calling thread** (irreversible) and reports
     /// what is actually enforced.
     ///
@@ -559,6 +730,36 @@ mod enforce {
         }
 
         #[test]
+        fn test_abi_number_is_monotonic() {
+            assert_eq!(abi_number(ABI::Unsupported), 0);
+            assert_eq!(abi_number(ABI::V1), 1);
+            assert_eq!(abi_number(ABI::V4), 4);
+            assert_eq!(abi_number(ABI::V5), 5);
+        }
+
+        #[test]
+        fn test_landlock_support_leaves_calling_thread_unrestricted() -> TestResult {
+            let nnp_before = rustix::thread::no_new_privs().map_err(ctx("nnp before"))?;
+            let first = landlock_support();
+            let second = landlock_support();
+            assert_eq!(first, second, "probe is not idempotent");
+            if first.lsm_active == Some(false) {
+                // Not an active LSM: the kernel cannot report a usable ABI.
+                assert_eq!(first.usable_abi(), None);
+            }
+            // The probe thread restricted itself to "no filesystem access";
+            // this thread must still be able to create and write files.
+            let temp = tempfile::tempdir().map_err(ctx("tempdir"))?;
+            std::fs::write(temp.path().join("after-probe"), b"ok")
+                .map_err(ctx("write after probe"))?;
+            // NO_NEW_PRIVS of this thread is unchanged (the probe thread set
+            // its own).
+            let nnp_after = rustix::thread::no_new_privs().map_err(ctx("nnp after"))?;
+            assert_eq!(nnp_before, nnp_after);
+            Ok(())
+        }
+
+        #[test]
         fn test_build_ruleset_all_profiles() -> TestResult {
             let workspace = tempfile::tempdir().map_err(ctx("tempdir"))?;
             for profile in [
@@ -675,6 +876,49 @@ mod tests {
         let mut sorted = plan.rules.clone();
         sorted.sort_by(|left, right| left.0.cmp(&right.0));
         assert_eq!(sorted, plan.rules);
+    }
+
+    #[test]
+    fn test_lsm_list_parsing() {
+        assert!(lsm_list_contains_landlock(
+            "lockdown,capability,landlock,yama,apparmor\n"
+        ));
+        assert!(lsm_list_contains_landlock("landlock"));
+        assert!(!lsm_list_contains_landlock("lockdown,capability,yama"));
+        assert!(!lsm_list_contains_landlock("notlandlock,landlocked"));
+        assert!(!lsm_list_contains_landlock(""));
+    }
+
+    #[test]
+    fn test_userns_from_sysctls() {
+        assert_eq!(userns_from_sysctls(None, None), None);
+        assert_eq!(
+            userns_from_sysctls(Some("0\n"), Some("63000\n")),
+            Some(false)
+        );
+        assert_eq!(userns_from_sysctls(Some("1\n"), Some("0\n")), Some(false));
+        assert_eq!(
+            userns_from_sysctls(Some("1\n"), Some("63000\n")),
+            Some(true)
+        );
+        assert_eq!(userns_from_sysctls(None, Some("63000")), Some(true));
+        assert_eq!(userns_from_sysctls(Some("garbage"), None), None);
+    }
+
+    #[test]
+    fn test_landlock_support_usable_abi() {
+        let none = LandlockSupport::default();
+        assert_eq!(none.usable_abi(), None);
+        let zero = LandlockSupport {
+            lsm_active: Some(false),
+            abi: Some(0),
+        };
+        assert_eq!(zero.usable_abi(), None);
+        let five = LandlockSupport {
+            lsm_active: Some(true),
+            abi: Some(5),
+        };
+        assert_eq!(five.usable_abi(), Some(5));
     }
 
     #[test]

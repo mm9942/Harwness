@@ -18,8 +18,8 @@ use crate::discovery::{AgentInput, BrokenDefinition, DefinitionEntry, SourceSet,
 use crate::env::CompilerEnv;
 use crate::error::CompileError;
 use crate::passes::{
-    ChildClosure, ChildResolver, Pass, PruneUnusedTools, ReachableTools, ResolveModels,
-    ResolveSkills, ResolvedChild, RightsCheck, ValidateRoles,
+    ChildClosure, ChildResolver, DeriveRequirements, Pass, PruneUnusedTools, ReachableTools,
+    ResolveModels, ResolveSkills, ResolvedChild, RightsCheck, ValidateRoles,
 };
 use crate::rights::{BuiltinCeilings, RightsSet};
 use crate::unit::CompileUnit;
@@ -38,6 +38,9 @@ pub struct CompilerOptions {
     pub default_interface: Option<Interface>,
     /// Binary name for the compiled root, overriding `[binary].name`.
     pub binary_name: Option<String>,
+    /// Build target triple (`--target`) the execution requirements name
+    /// (PL-90); `None` is the host target of the [`CompilerEnv`].
+    pub target: Option<String>,
 }
 
 impl Default for CompilerOptions {
@@ -48,6 +51,7 @@ impl Default for CompilerOptions {
             interfaces: None,
             default_interface: None,
             binary_name: None,
+            target: None,
         }
     }
 }
@@ -197,6 +201,16 @@ impl Compiler {
         }
     }
 
+    /// The build target triple: [`CompilerOptions::target`], else the host
+    /// target of the environment.
+    #[must_use]
+    pub fn build_target(&self) -> &str {
+        self.options
+            .target
+            .as_deref()
+            .unwrap_or(self.env.host_target.as_str())
+    }
+
     /// The passes in pipeline order for a unit at `stack.len()` depth.
     fn passes<'a>(&'a self, stack: &[String]) -> Vec<Box<dyn Pass + 'a>> {
         vec![
@@ -211,6 +225,9 @@ impl Compiler {
             Box::new(ReachableTools),
             Box::new(PruneUnusedTools),
             Box::new(ResolveModels),
+            Box::new(DeriveRequirements {
+                target: self.build_target(),
+            }),
             Box::new(ChildClosure {
                 resolver: self,
                 stack: stack.to_vec(),

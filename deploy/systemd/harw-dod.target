@@ -1,0 +1,18 @@
+# harw-dod.target -- the DoD observation target.
+#
+# Canonical source: deploy/systemd/ (Crypto Masterplan v2 §22, H10). Embedded
+# byte-identically into harw-install (`deployment::DEPLOYMENT_ASSETS`) and
+# installed by dod/scripts/install.sh. There is no second copy.
+#
+# Pulls up only the unprivileged sentinel and the eBPF probe. Deliberately no
+# edge to harw-warden.service/.socket (enforcement is a separate, explicit
+# opt-in: `make -C dod enable-warden`) and none to harw-probe-fs.service (it
+# needs an operator-chosen --scope-root first; enable it explicitly).
+
+[Unit]
+Description=HARW DoD observation
+Wants=harw-sentinel.service harw-probe-bpf.service
+After=harw-sentinel.service harw-probe-bpf.service
+
+[Install]
+WantedBy=multi-user.target

@@ -2763,6 +2763,10 @@ impl RuntimeAssemblyBuilder {
                 registry: Arc::clone(&host_permit_registry),
                 prompts: Some(host_permit_prompt_sender.clone()),
             })),
+            // Crypto-Infrastruktur H4: Clients aus `[infrastructure]`. Eine
+            // fehlende oder ungültige Sektion ergibt `None` (Warnung, nie ein
+            // Montagefehler); es wird hier kein Socket geöffnet.
+            infrastructure: crate::infrastructure::build_infrastructure(&config),
         });
         // Plan Teil D: dieselbe Speicher-Instanz wie die Kind-Registries;
         // `with_home_context` legt nur dann einen eigenen an, wenn hier

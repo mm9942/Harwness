@@ -25,7 +25,9 @@
 //! `snapshot` left out. There are no maps in the IR, so no map ordering can
 //! leak into the hash. Unlike v6 the hash covers the definition version, the
 //! instruction text hash, the skill content hashes, the binary settings and
-//! the permission manifest.
+//! the permission manifest. The execution requirements (PL-90,
+//! [`ExecutionRequirements`]) are hashed as well; their lists (targets,
+//! network hosts) are sorted by construction.
 //!
 //! # Concurrency
 //! All types are `Send + Sync` and immutable after construction.
@@ -771,6 +773,313 @@ impl Trace {
     }
 }
 
+/// One execution target of a compiled agent (PL-90).
+///
+/// # Description
+/// `os` uses `std::env::consts::OS` spelling (`"linux"`, `"macos"`, …);
+/// `arch` uses `std::env::consts::ARCH` spelling, `None` for any
+/// architecture of that OS.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TargetSpec {
+    /// Operating system.
+    pub os: String,
+    /// Architecture, `None` for any.
+    #[serde(default)]
+    pub arch: Option<String>,
+}
+
+impl TargetSpec {
+    /// Parses a rustc target triple (`x86_64-unknown-linux-gnu`,
+    /// `aarch64-apple-darwin`, `x86_64-pc-windows-msvc`) into OS and arch.
+    ///
+    /// # Description
+    /// The first component is the architecture; the OS is recognized from
+    /// the remaining components (`linux`, `darwin` → `macos`, `windows`,
+    /// else the third component verbatim). `None` for a triple with fewer
+    /// than two components.
+    #[must_use]
+    pub fn from_triple(triple: &str) -> Option<Self> {
+        let parts: Vec<&str> = triple.split('-').filter(|part| !part.is_empty()).collect();
+        let (arch, rest) = parts.split_first()?;
+        if rest.is_empty() {
+            return None;
+        }
+        let os = if rest.contains(&"linux") {
+            "linux".to_owned()
+        } else if rest.contains(&"darwin") || rest.contains(&"macos") {
+            "macos".to_owned()
+        } else if rest.contains(&"windows") {
+            "windows".to_owned()
+        } else {
+            let part = rest.get(1).or_else(|| rest.first())?;
+            (*part).to_owned()
+        };
+        Some(Self {
+            os,
+            arch: Some((*arch).to_owned()),
+        })
+    }
+
+    /// `os` or `os/arch`.
+    #[must_use]
+    pub fn label(&self) -> String {
+        match &self.arch {
+            Some(arch) => format!("{}/{arch}", self.os),
+            None => self.os.clone(),
+        }
+    }
+}
+
+/// What network access the compiled agent needs (PL-90).
+///
+/// # Description
+/// Ordered from narrowest to widest: [`Self::None`] < [`Self::ProxyOnly`] <
+/// [`Self::Hosts`].
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum NetworkRequirement {
+    /// No network at all (no network tool admitted).
+    #[default]
+    None,
+    /// Network tools are admitted but name no host: every request goes
+    /// through the runtime's mediated egress (proxy/allowlist of the
+    /// runtime), never direct.
+    ProxyOnly,
+    /// Network tools are admitted for exactly these hosts (sorted, unique).
+    Hosts(Vec<String>),
+}
+
+impl NetworkRequirement {
+    /// Rank for the "widest" comparison.
+    const fn rank(&self) -> u8 {
+        match self {
+            Self::None => 0,
+            Self::ProxyOnly => 1,
+            Self::Hosts(_) => 2,
+        }
+    }
+
+    /// The wider of two requirements; two host lists are merged (sorted,
+    /// unique).
+    #[must_use]
+    pub fn widest(&self, other: &Self) -> Self {
+        match (self, other) {
+            (Self::Hosts(left), Self::Hosts(right)) => {
+                let mut hosts: Vec<String> = left.iter().chain(right).cloned().collect();
+                hosts.sort();
+                hosts.dedup();
+                Self::Hosts(hosts)
+            }
+            _ if other.rank() > self.rank() => other.clone(),
+            _ => self.clone(),
+        }
+    }
+
+    /// `none`, `proxy_only` or `hosts: a, b`.
+    #[must_use]
+    pub fn label(&self) -> String {
+        match self {
+            Self::None => "none".to_owned(),
+            Self::ProxyOnly => "proxy_only".to_owned(),
+            Self::Hosts(hosts) => format!("hosts: {}", hosts.join(", ")),
+        }
+    }
+}
+
+/// How strongly a sandbox guarantee is required (PL-90).
+///
+/// # Description
+/// Ordered `NotNeeded < BestEffort < Required`. The job runner maps it to
+/// its enforcement state: a `Required` guarantee the target cannot enforce
+/// refuses admission, a `BestEffort` one is applied where available and
+/// reported otherwise. (The mapping lives in the runner: this crate is layer
+/// B and must not depend on the job layer.)
+#[derive(
+    Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum RequirementLevel {
+    /// The agent does not need the guarantee.
+    #[default]
+    NotNeeded,
+    /// Apply it where the target can; its absence is reported, not fatal.
+    BestEffort,
+    /// The target must enforce it or refuse the agent.
+    Required,
+}
+
+impl RequirementLevel {
+    /// `not_needed`, `best_effort`, `required`.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::NotNeeded => "not_needed",
+            Self::BestEffort => "best_effort",
+            Self::Required => "required",
+        }
+    }
+}
+
+/// Required sandbox guarantees, one level each (PL-90).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SandboxRequirementLevels {
+    /// Filesystem confinement (Landlock or equivalent).
+    pub filesystem: RequirementLevel,
+    /// Network confinement of started processes.
+    pub network: RequirementLevel,
+    /// `no_new_privs` for started processes.
+    pub no_new_privs: RequirementLevel,
+    /// Dropped capabilities for started processes.
+    pub capabilities: RequirementLevel,
+    /// Resource limits (memory, pids, time) for started processes.
+    pub resource_limits: RequirementLevel,
+}
+
+impl SandboxRequirementLevels {
+    /// Field-wise maximum.
+    #[must_use]
+    pub fn strongest(self, other: Self) -> Self {
+        Self {
+            filesystem: self.filesystem.max(other.filesystem),
+            network: self.network.max(other.network),
+            no_new_privs: self.no_new_privs.max(other.no_new_privs),
+            capabilities: self.capabilities.max(other.capabilities),
+            resource_limits: self.resource_limits.max(other.resource_limits),
+        }
+    }
+}
+
+/// Numeric resource limits the agent asks the runtime to enforce (PL-90);
+/// `None` makes no statement (the runtime's own default applies).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ResourceRequirements {
+    /// Memory ceiling in bytes.
+    pub memory_max_bytes: Option<u64>,
+    /// Maximum number of processes/threads.
+    pub pids_max: Option<u64>,
+    /// Wall-clock timeout in seconds.
+    pub wall_timeout_secs: Option<u64>,
+}
+
+impl ResourceRequirements {
+    /// `true` if a limit needs kernel resource control (memory or pids; a
+    /// wall timeout is a timer, not a cgroup).
+    #[must_use]
+    pub const fn needs_cgroup(&self) -> bool {
+        self.memory_max_bytes.is_some() || self.pids_max.is_some()
+    }
+}
+
+/// Kernel features the agent's guarantees rely on (PL-90).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct KernelRequirements {
+    /// Landlock (filesystem confinement of started processes).
+    pub landlock: bool,
+    /// cgroup v2 (memory/pids limits).
+    pub cgroup_v2: bool,
+    /// Unprivileged user namespaces.
+    pub user_namespaces: bool,
+}
+
+/// What a compiled agent needs from the machine that executes it (PL-90,
+/// ecosystem architecture §12, §35).
+///
+/// # Description
+/// Separates "can harw compile here?" from "can this artifact execute on
+/// this target with its required guarantees?". Filled by the compiler pass
+/// `DeriveRequirements` from the pruned permission manifest; the lowerer
+/// leaves the default (nothing required). Part of the hashed canonical form.
+/// A runtime admits the agent only if it can meet every `Required` level
+/// and kernel feature; the child closure unions the requirements of every
+/// embedded child into the parent ([`Self::union_child`]).
+///
+/// Clamping at runtime ([`AgentIr::clamped_to`]) keeps the compiled
+/// requirements: they describe the artifact, not the live grant.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ExecutionRequirements {
+    /// Admissible targets, sorted; empty means any target (the build
+    /// target when the compiler was given none).
+    pub targets: Vec<TargetSpec>,
+    /// A tool that starts processes is admitted.
+    pub process_exec: bool,
+    /// A tool that acts on the host outside the sandbox is admitted.
+    pub host_access: bool,
+    /// Network access.
+    pub network: NetworkRequirement,
+    /// A tool that writes (workspace or elsewhere) is admitted.
+    pub filesystem_write: bool,
+    /// Sandbox guarantee levels.
+    pub sandbox: SandboxRequirementLevels,
+    /// Numeric resource limits.
+    pub resources: ResourceRequirements,
+    /// Kernel features.
+    pub kernel: KernelRequirements,
+    /// The DoD eBPF monitor must be present.
+    pub dod_ebpf: bool,
+}
+
+impl ExecutionRequirements {
+    /// Unions a child's requirements into these (the parent's).
+    ///
+    /// # Description
+    /// The artifact runs the whole family on one target, so the parent's
+    /// requirements must cover every embedded child:
+    /// - booleans (`process_exec`, `host_access`, `filesystem_write`,
+    ///   `dod_ebpf`, every kernel feature): OR;
+    /// - sandbox levels: field-wise maximum;
+    /// - network: the widest ([`NetworkRequirement::widest`]; host lists
+    ///   merge);
+    /// - targets: an empty list (any) takes the other side; two non-empty
+    ///   lists intersect (the family must run on a common target). A
+    ///   disjoint pair keeps the parent's list — children are compiled with
+    ///   the parent's target, so this cannot arise from one build;
+    /// - resources: **not** merged. Numeric limits are per agent — every
+    ///   child entry keeps its own IR with its own limits, which the runner
+    ///   applies to that child's job. Only their consequences propagate: a
+    ///   child's `resource_limits` level and `kernel.cgroup_v2` are unioned
+    ///   above.
+    #[must_use]
+    pub fn union_child(&self, child: &Self) -> Self {
+        let targets = if self.targets.is_empty() {
+            child.targets.clone()
+        } else if child.targets.is_empty() {
+            self.targets.clone()
+        } else {
+            let common: Vec<TargetSpec> = self
+                .targets
+                .iter()
+                .filter(|target| child.targets.contains(target))
+                .cloned()
+                .collect();
+            if common.is_empty() {
+                self.targets.clone()
+            } else {
+                common
+            }
+        };
+        Self {
+            targets,
+            process_exec: self.process_exec || child.process_exec,
+            host_access: self.host_access || child.host_access,
+            network: self.network.widest(&child.network),
+            filesystem_write: self.filesystem_write || child.filesystem_write,
+            sandbox: self.sandbox.strongest(child.sandbox),
+            resources: self.resources,
+            kernel: KernelRequirements {
+                landlock: self.kernel.landlock || child.kernel.landlock,
+                cgroup_v2: self.kernel.cgroup_v2 || child.kernel.cgroup_v2,
+                user_namespaces: self.kernel.user_namespaces || child.kernel.user_namespaces,
+            },
+            dod_ebpf: self.dod_ebpf || child.dod_ebpf,
+        }
+    }
+}
+
 /// A computed v7 snapshot identity.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -834,6 +1143,10 @@ pub struct AgentIr {
     pub binary: Binary,
     /// Rights manifest.
     pub permissions: Permissions,
+    /// Execution requirements (PL-90); filled by the compiler, the default
+    /// (nothing required) after lowering.
+    #[serde(default)]
+    pub requirements: ExecutionRequirements,
     /// Provenance (not hashed).
     #[serde(default, skip_serializing_if = "Trace::is_empty")]
     pub trace: Trace,
@@ -1109,5 +1422,120 @@ mod tests {
             blake3::hash(b"hello").to_hex().to_string()
         );
         assert_ne!(Instructions::none().blake3, instructions.blake3);
+    }
+
+    #[test]
+    fn test_target_spec_from_triple() {
+        assert_eq!(
+            TargetSpec::from_triple("x86_64-unknown-linux-gnu"),
+            Some(TargetSpec {
+                os: "linux".to_owned(),
+                arch: Some("x86_64".to_owned()),
+            })
+        );
+        assert_eq!(
+            TargetSpec::from_triple("aarch64-apple-darwin").map(|target| target.label()),
+            Some("macos/aarch64".to_owned())
+        );
+        assert_eq!(
+            TargetSpec::from_triple("x86_64-pc-windows-msvc").map(|target| target.os),
+            Some("windows".to_owned())
+        );
+        assert_eq!(TargetSpec::from_triple("x86_64"), None);
+    }
+
+    #[test]
+    fn test_network_requirement_widest() {
+        let hosts = |list: &[&str]| {
+            NetworkRequirement::Hosts(list.iter().map(|host| (*host).to_owned()).collect())
+        };
+        assert_eq!(
+            NetworkRequirement::None.widest(&NetworkRequirement::ProxyOnly),
+            NetworkRequirement::ProxyOnly
+        );
+        assert_eq!(
+            NetworkRequirement::ProxyOnly.widest(&NetworkRequirement::None),
+            NetworkRequirement::ProxyOnly
+        );
+        assert_eq!(
+            NetworkRequirement::ProxyOnly.widest(&hosts(&["a.example"])),
+            hosts(&["a.example"])
+        );
+        assert_eq!(
+            hosts(&["b.example", "a.example"]).widest(&hosts(&["a.example", "c.example"])),
+            hosts(&["a.example", "b.example", "c.example"])
+        );
+    }
+
+    #[test]
+    fn test_union_child_ors_flags_maxes_levels_and_keeps_own_resources() {
+        let parent = ExecutionRequirements {
+            resources: ResourceRequirements {
+                wall_timeout_secs: Some(60),
+                ..ResourceRequirements::default()
+            },
+            ..ExecutionRequirements::default()
+        };
+        let child = ExecutionRequirements {
+            targets: vec![TargetSpec {
+                os: "linux".to_owned(),
+                arch: None,
+            }],
+            process_exec: true,
+            filesystem_write: true,
+            network: NetworkRequirement::ProxyOnly,
+            sandbox: SandboxRequirementLevels {
+                filesystem: RequirementLevel::Required,
+                network: RequirementLevel::BestEffort,
+                ..SandboxRequirementLevels::default()
+            },
+            resources: ResourceRequirements {
+                memory_max_bytes: Some(1 << 20),
+                wall_timeout_secs: Some(5),
+                ..ResourceRequirements::default()
+            },
+            kernel: KernelRequirements {
+                landlock: true,
+                cgroup_v2: true,
+                ..KernelRequirements::default()
+            },
+            ..ExecutionRequirements::default()
+        };
+        let union = parent.union_child(&child);
+        assert!(union.process_exec && union.filesystem_write && !union.host_access);
+        assert_eq!(union.targets, child.targets);
+        assert_eq!(union.network, NetworkRequirement::ProxyOnly);
+        assert_eq!(union.sandbox.filesystem, RequirementLevel::Required);
+        assert_eq!(union.sandbox.network, RequirementLevel::BestEffort);
+        assert_eq!(union.sandbox.no_new_privs, RequirementLevel::NotNeeded);
+        assert!(union.kernel.landlock && union.kernel.cgroup_v2);
+        assert_eq!(union.resources, parent.resources, "limits stay per agent");
+        // Union with the default changes nothing.
+        assert_eq!(union.union_child(&ExecutionRequirements::default()), union);
+    }
+
+    #[test]
+    fn test_requirements_serde_is_snake_case_and_defaults() -> Result<(), serde_json::Error> {
+        let requirements = ExecutionRequirements {
+            network: NetworkRequirement::Hosts(vec!["docs.rs".to_owned()]),
+            sandbox: SandboxRequirementLevels {
+                filesystem: RequirementLevel::BestEffort,
+                ..SandboxRequirementLevels::default()
+            },
+            ..ExecutionRequirements::default()
+        };
+        let json = serde_json::to_string(&requirements)?;
+        assert!(
+            json.contains(r#""network":{"hosts":["docs.rs"]}"#),
+            "{json}"
+        );
+        assert!(json.contains(r#""filesystem":"best_effort""#), "{json}");
+        assert!(json.contains(r#""no_new_privs":"not_needed""#), "{json}");
+        let back: ExecutionRequirements = serde_json::from_str(&json)?;
+        assert_eq!(back, requirements);
+        let proxy = serde_json::to_string(&NetworkRequirement::ProxyOnly)?;
+        assert_eq!(proxy, r#""proxy_only""#);
+        assert!(serde_json::from_str::<ExecutionRequirements>(r#"{"bogus":1}"#).is_err());
+        Ok(())
     }
 }

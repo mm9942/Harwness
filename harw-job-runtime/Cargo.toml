@@ -31,6 +31,10 @@ harw-types = { path = "../harw-types" }
 # envelope as JSON (known inversion in harw-job-core, Eco-Doc §59).
 serde = { workspace = true }
 serde_json = { workspace = true }
+# Darwin sandbox reports: the executor on macOS, and the platform-neutral
+# `DarwinSandbox::report_for` mapping of the host probe (`host`) on every
+# target (the crate is a pure model off macOS).
+harw-job-darwin = { path = "../harw-job-darwin" }
 # Timestamps of leases, deadlines and attempt records.
 jiff = { workspace = true }
 tracing = { workspace = true }
@@ -42,16 +46,15 @@ tokio = { version = "1", features = ["rt", "sync", "time", "macros"] }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 # pidfd process groups, recovery identity, cgroup v2 boundary, sandbox policy.
-harw-job-linux = { path = "../harw-job-linux", features = ["linux-cgroup-v2"] }
+# `linux-sandbox`: `sandbox::landlock_support` for the host probe (`host`);
+# already unified in through `harw-job-exec`, named here explicitly.
+harw-job-linux = { path = "../harw-job-linux", features = ["linux-cgroup-v2", "linux-sandbox"] }
 # Async pidfd supervision (Supervisor, ProcessEvent, AsyncLinuxProcess).
 harw-job-tokio = { path = "../harw-job-tokio" }
 # Landlock trampoline: ExecPlanV1, TrampolineCommand, read_report (library
 # only; the binary is located at runtime through LinuxSandboxBackend).
 harw-job-exec = { path = "../harw-job-exec" }
 harw-job-executor-bwrap = { path = "../harw-job-executor-bwrap", optional = true }
-
-[target.'cfg(target_os = "macos")'.dependencies]
-harw-job-darwin = { path = "../harw-job-darwin" }
 
 [dev-dependencies]
 tempfile = { workspace = true }

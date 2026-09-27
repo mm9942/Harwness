@@ -53,6 +53,15 @@
 //! Fehlt eine der drei Zutaten, fehlt der Ledger (fail closed: `/kanban`
 //! meldet Übergänge dann `NotAvailable`).
 //!
+//! # Infrastruktur-Clients (Crypto-Infrastruktur H4)
+//! `Arc<harw_infra_client::InfrastructureAvailability>` (aus
+//! `[infrastructure]`, gebaut von [`crate::infrastructure::build_infrastructure`])
+//! liegt — fünfte deklarierte Differenz, [`ServiceSurface::allows_infrastructure`]
+//! — nur auf Slash und Web. Das Modell-Werkzeug bekommt ihn **nie**: ein
+//! Sprachmodell darf keine Schlüssel- oder Infrastruktur-Operation auslösen,
+//! auch nicht über eine Operation, die versehentlich eine Modell-Fläche
+//! trüge. Job-Läufe ohne anwesende Person bleiben ebenfalls ohne.
+//!
 //! # Was hier bewusst NICHT registriert wird
 //! - Web-eigene Dienste (`PeerCredentials`, `Arc<dyn ApprovalActorResolver>`,
 //!   `Arc<ApprovalStore>`): sie stammen pro Verbindung aus dem Kernel bzw. aus
@@ -83,6 +92,7 @@ use harw_config::ResolvedConfig;
 use harw_core::{AgentEventHub, ManagedAgentSpawner, StateStore};
 use harw_extension_api::allow_rules::AllowRuleSet;
 use harw_extension_api::approval_mode::ApprovalModeCell;
+use harw_infra_client::InfrastructureAvailability;
 use harw_job_runtime::JobScope;
 use harw_knowledge::KnowledgeStore;
 use harw_knowledge::kanban::lifecycle::JobTransitions;
@@ -261,6 +271,35 @@ impl ServiceSurface {
     pub const fn allows_agent_events(self) -> bool {
         matches!(self, Self::Slash | Self::ModelTool)
     }
+
+    /// Ob diese Fläche die Infrastruktur-Clients
+    /// (`Arc<InfrastructureAvailability>`) erhält.
+    ///
+    /// # Beschreibung
+    /// Fünfte **deklarierte** Differenz (Crypto-Infrastruktur-Masterplan v2
+    /// §11/§12): die `infra.*`-Operationen (Status, Health, Schlüssel-
+    /// Metadaten, Schlüsselrotation) sind Bedienerflächen. Nur eine getippte
+    /// Slash-Eingabe und die lokale Web-Oberfläche (mit ihrer eigenen
+    /// Freigabe für `approval = "always"`) erreichen sie. Das
+    /// Modell-Werkzeug bekommt den Dienst nie — Modelle dürfen keine
+    /// Schlüsseloperation treiben —, ein durabler Job ohne anwesende Person
+    /// ebenfalls nicht.
+    ///
+    /// # Rückgabe
+    /// `true` für [`Self::Slash`] und [`Self::Web`], sonst `false`.
+    ///
+    /// # Beispiel
+    /// ```rust
+    /// use harw_runtime::services::ServiceSurface;
+    /// assert!(ServiceSurface::Slash.allows_infrastructure());
+    /// assert!(ServiceSurface::Web.allows_infrastructure());
+    /// assert!(!ServiceSurface::ModelTool.allows_infrastructure());
+    /// assert!(!ServiceSurface::Job.allows_infrastructure());
+    /// ```
+    #[must_use]
+    pub const fn allows_infrastructure(self) -> bool {
+        matches!(self, Self::Slash | Self::Web)
+    }
 }
 
 // ── PlanServices ──────────────────────────────────────────────────────────────
@@ -372,6 +411,12 @@ pub struct RuntimeServicesParts {
     /// je Montage instanziiertem `host_permit_ledger`/`host_permit_registry`/
     /// `host_permit_prompt_sender` (siehe dort, ~1770).
     pub host_permit_handles: Option<Arc<HostPermitHandles>>,
+    /// Infrastruktur-Clients (AuthHub, NetSec, SecurityHub) aus
+    /// `[infrastructure]` (Crypto-Infrastruktur H4). `None` ohne Sektion oder
+    /// bei ungültiger Sektion (die Montage warnt dann, bricht aber nicht ab).
+    /// Liegt nur auf den Flächen mit
+    /// [`ServiceSurface::allows_infrastructure`] (Slash, Web).
+    pub infrastructure: Option<Arc<InfrastructureAvailability>>,
 }
 
 // ── RuntimeServices ───────────────────────────────────────────────────────────
@@ -731,6 +776,7 @@ impl RuntimeServices {
     /// | `Arc<dyn DreamLauncher>` (falls gebunden, `/dream run`, Plan D5) | ✓ | — | — | — |
     /// | `Arc<dyn LiveModelControl>` (falls gebunden, Live-Modellwechsel) | ✓ | — | — | — |
     /// | `Arc<LiveConfig>` (falls gebunden; `Arc<ResolvedConfig>` ist dann überall der Live-Stand) | ✓ | — | — | — |
+    /// | `Arc<InfrastructureAvailability>` (falls vorhanden, `[infrastructure]`) | ✓ | — | ✓ | — |
     ///
     /// Die Zeile [`OperationRegistry`] trägt in jeder Fläche dieselbe Menge —
     /// nämlich die, die [`crate::spec::EntryProfile::operations`] dem Einstieg
@@ -923,6 +969,15 @@ impl RuntimeServices {
         {
             insert_service(&mut map, &mut names, Arc::clone(hub));
         }
+        // Crypto-Infrastruktur H4: nur Slash und Web, nie das Modell-Werkzeug.
+        if let Some(infrastructure) = self
+            .parts
+            .infrastructure
+            .as_ref()
+            .filter(|_| surface.allows_infrastructure())
+        {
+            insert_service(&mut map, &mut names, Arc::clone(infrastructure));
+        }
         if let Some(plan) = &self.parts.plan {
             // `register_plan_services` legt genau diese vier Typen ab
             // (harw-plan-bridge/src/context_ext.rs:202-205). Der Test
@@ -1098,6 +1153,7 @@ mod tests {
             session_controller: Some(Arc::new(NullSessionController::new())),
             provider_load_registry: ProviderLoadRegistry::new(),
             host_permit_handles: Some(test_host_permit_handles()),
+            infrastructure: None,
         }
     }
 
@@ -1118,6 +1174,7 @@ mod tests {
             session_controller: None,
             provider_load_registry: ProviderLoadRegistry::new(),
             host_permit_handles: None,
+            infrastructure: None,
         }
     }
 
@@ -2061,5 +2118,84 @@ mod tests {
                 surface.as_str()
             );
         }
+    }
+
+    /// Crypto-Infrastruktur H4: Test-Clients auf nicht existierende Sockets —
+    /// die Fabrik verbindet nie, sie legt nur den `Arc` ab.
+    fn test_infrastructure() -> TestResult<Arc<harw_infra_client::InfrastructureAvailability>> {
+        let config = harw_infra_client::InfraClientConfig {
+            auth_socket: Some("/nonexistent/w2b-04/secure.sock".into()),
+            ..harw_infra_client::InfraClientConfig::default()
+        };
+        harw_infra_client::InfrastructureAvailability::from_config(&config)
+            .map(Arc::new)
+            .map_err(|error| TestError::Unexpected(error.to_string()))
+    }
+
+    /// Fünfte deklarierte Differenz: die Infrastruktur-Clients liegen nur auf
+    /// Slash und Web — nie auf dem Modell-Werkzeug, nie auf Job.
+    #[test]
+    fn infrastructure_reaches_slash_and_web_only() -> TestResult {
+        use harw_infra_client::InfrastructureAvailability;
+
+        let infrastructure = test_infrastructure()?;
+        let mut parts = full_parts();
+        parts.infrastructure = Some(Arc::clone(&infrastructure));
+        let services = RuntimeServices::new(parts);
+        for surface in ServiceSurface::ALL {
+            let map = services.service_map(surface);
+            let present = map.get::<Arc<InfrastructureAvailability>>();
+            assert_eq!(
+                present.is_some(),
+                matches!(surface, ServiceSurface::Slash | ServiceSurface::Web),
+                "{}",
+                surface.as_str()
+            );
+            if let Some(present) = present {
+                assert!(
+                    Arc::ptr_eq(present, &infrastructure),
+                    "{}: derselbe Arc, kein Klon der Clients",
+                    surface.as_str()
+                );
+            }
+            assert_eq!(
+                services
+                    .registered(surface)
+                    .contains(&type_name::<Arc<InfrastructureAvailability>>()),
+                surface.allows_infrastructure(),
+                "{}",
+                surface.as_str()
+            );
+        }
+        Ok(())
+    }
+
+    /// Ohne `[infrastructure]` (`None` in den Parts) erfindet keine Fläche
+    /// den Dienst.
+    #[test]
+    fn infrastructure_absent_on_every_surface_without_parts() {
+        use harw_infra_client::InfrastructureAvailability;
+
+        for parts in [full_parts(), minimal_parts()] {
+            let services = RuntimeServices::new(parts);
+            for surface in ServiceSurface::ALL {
+                assert!(
+                    services
+                        .service_map(surface)
+                        .get::<Arc<InfrastructureAvailability>>()
+                        .is_none(),
+                    "{}",
+                    surface.as_str()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn allows_infrastructure_is_slash_and_web() {
+        assert!(ServiceSurface::Slash.allows_infrastructure());
+        assert!(ServiceSurface::Web.allows_infrastructure());
+        assert!(!ServiceSurface::ModelTool.allows_infrastructure());
+        assert!(!ServiceSurface::Job.allows_infrastructure());
     }
 }

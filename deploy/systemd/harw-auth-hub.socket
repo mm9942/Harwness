@@ -1,0 +1,24 @@
+# harw-auth-hub.socket -- activation socket of harw-auth-hub.service.
+#
+# Canonical source: deploy/systemd/ (Crypto Masterplan v2 §6, §22.2, §23, H10).
+#
+# AF_UNIX/SOCK_STREAM carrying Hyper HTTP/1; the daemon authenticates every
+# peer via SO_PEERCRED. Exactly one Listen*= line, so the daemon receives
+# LISTEN_FDS=1. /run/harw/infra/ is created by tmpfiles.d/harw.conf.
+
+[Unit]
+Description=HARW Auth/Crypto Hub activation socket
+PartOf=harw-infra.target
+
+[Socket]
+ListenStream=/run/harw/infra/secure.sock
+SocketUser=harw-auth
+SocketGroup=harw-secure
+SocketMode=0660
+# Only the daemon user and members of harw-secure may connect.
+Service=harw-auth-hub.service
+RemoveOnStop=yes
+Accept=no
+
+[Install]
+WantedBy=harw-infra.target

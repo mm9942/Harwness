@@ -28,6 +28,13 @@ pub struct RunnerArgs {
     pub json: bool,
     /// `--manifest`: print the embedded manifest's permissions and exit.
     pub manifest: bool,
+    /// `--requirements`: print the embedded agent's execution requirements,
+    /// this host's report and the admission verdict (PL-90), then exit.
+    pub requirements: bool,
+    /// `--allow-degraded`: admit the agent although best-effort sandbox
+    /// guarantees or kernel features are unavailable on this host (never a
+    /// `required` one; `crate::admission`).
+    pub allow_degraded: bool,
     /// `--verify`: verify the embedded artifact's integrity and exit.
     pub verify: bool,
     /// `--version`: print the runner version and exit.
@@ -93,6 +100,8 @@ impl RunnerArgs {
                 }
                 "--json" => out.json = true,
                 "--manifest" => out.manifest = true,
+                "--requirements" => out.requirements = true,
+                "--allow-degraded" => out.allow_degraded = true,
                 "--verify" => out.verify = true,
                 "--version" => out.version = true,
                 "--capabilities" => out.capabilities = true,
@@ -220,6 +229,16 @@ mod tests {
         assert!(parsed.verify);
         let parsed = RunnerArgs::parse(args(&["--version"]))?;
         assert!(parsed.version);
+        Ok(())
+    }
+
+    #[test]
+    fn test_requirements_and_allow_degraded_flags() -> TestResult {
+        let parsed = RunnerArgs::parse(args(&[]))?;
+        assert!(!parsed.requirements && !parsed.allow_degraded);
+        let parsed = RunnerArgs::parse(args(&["--requirements", "--json", "--allow-degraded"]))?;
+        assert!(parsed.requirements && parsed.json && parsed.allow_degraded);
+        assert_eq!(parsed.prompt, None);
         Ok(())
     }
 }

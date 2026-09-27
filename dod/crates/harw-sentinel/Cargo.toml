@@ -106,6 +106,10 @@ landlock = "0.4.7"
 # `EventKind`" — `#[serde(deny_unknown_fields)]`, kebab-case, bereits für
 # genau diesen Zweck vorgesehen).
 serde_json = { workspace = true }
+# `#[derive(Serialize)]` für die JSON-Lines-Befundzeile in `src/export.rs`
+# (Vertrag mit `harw-security-hub/src/findings.rs`). Bereits transitiv im
+# Baum (u. a. über `harw-types`), keine neue Fremdcrate, keine Netzfähigkeit.
+serde = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }

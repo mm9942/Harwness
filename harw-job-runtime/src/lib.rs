@@ -11,6 +11,11 @@
 //! cancellation, finalizes outcomes and recovers attempts after a restart
 //! without ever signalling an unverified process.
 //!
+//! # Host capability probe (PL-90)
+//! [`host::HostReport::probe`] reports, without side effects, which
+//! sandbox backends this host offers and the strongest per-dimension
+//! [`SandboxReport`] a job can get here (runtime admission).
+//!
 //! # Compatibility re-exports
 //! Since Job-Doc Phase 1 the job model (budget, lease, retry, lifecycle,
 //! stored record, ids, spec, outcomes) lives in [`harw_job_core`]. This crate
@@ -44,6 +49,9 @@ pub use harw_types::WorkId;
 pub use harw_job_core::JobRuntimeError as JobError;
 
 pub mod coordinator;
+pub mod host;
+
+pub use host::{HostFacts, HostLandlock, HostReport};
 
 #[cfg(target_os = "macos")]
 pub use coordinator::DarwinExecutor;

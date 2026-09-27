@@ -2,6 +2,7 @@
 //!
 //! Reine serde-Daten: ID-Newtypes, `AgentRole`, `RiskLevel`, `ReviewDecision`,
 //! `MessagePhase`, `TokenUsage`, `ReasoningEffort`, `Principal`/`PermissionTier`,
+//! die Infrastruktur-Identität `SecurityContext`/`TrustZone`/`AuthStrength`,
 //! die Wanduhr-Abstraktion `Clock`/`SystemClock`.
 //! Keine `tokio`-, `reqwest`- oder Provider-Abhängigkeiten. Höchste Stabilität,
 //! maximaler Fan-in.
@@ -24,6 +25,7 @@ pub mod principal;
 pub mod provider_ids;
 pub mod reasoning;
 pub mod roles;
+pub mod security;
 pub mod usage;
 
 #[cfg(test)]
@@ -34,9 +36,9 @@ pub use confidence::Confidence;
 pub use digest::ContentDigest;
 pub use error::{ImpactAssessmentError, InvalidDigest, InvalidId};
 pub use ids::{
-    ActionId, ApprovalActor, ApprovalId, BaselineId, CgroupId, ChannelId, FindingId, HostId,
-    ItemId, PeerId, SensorId, SessionId, TenantId, ThreadId, ThreadRef, ToolCallId, TurnId, WorkId,
-    WorkspaceId,
+    ActionId, ApprovalActor, ApprovalId, BaselineId, CgroupId, ChannelId, DeviceId, FindingId,
+    HostId, ItemId, NodeId, PeerId, SecurityContextId, SensorId, ServiceIdentityId, SessionId,
+    TenantId, ThreadId, ThreadRef, ToolCallId, TurnId, WorkId, WorkspaceId,
 };
 pub use impact::{ImpactAssessment, ImpactConfidence, ImpactDomain, ImpactSeverity};
 pub use principal::{IngressSurface, PermissionTier, Principal, PrincipalKind};
@@ -45,6 +47,10 @@ pub use reasoning::ReasoningEffort;
 pub use roles::{
     APPROVAL_TIMEOUT_REASON, AgentRole, DEFAULT_APPROVAL_TIMEOUT, MessagePhase, ReviewDecision,
     RiskLevel,
+};
+pub use security::{
+    AuthStrength, SecurityClaims, SecurityContext, SecurityContextError, SecurityContextIssuer,
+    SecurityContextSummary, TrustZone,
 };
 pub use usage::TokenUsage;
 
@@ -111,6 +117,10 @@ mod aw0_03_tests {
         assert_public_fallible_id_api_rejects_blank!(BaselineId);
         assert_public_fallible_id_api_rejects_blank!(HostId);
         assert_public_fallible_id_api_rejects_blank!(CgroupId);
+        assert_public_fallible_id_api_rejects_blank!(NodeId);
+        assert_public_fallible_id_api_rejects_blank!(DeviceId);
+        assert_public_fallible_id_api_rejects_blank!(ServiceIdentityId);
+        assert_public_fallible_id_api_rejects_blank!(SecurityContextId);
     }
 
     #[test]

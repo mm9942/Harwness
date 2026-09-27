@@ -257,7 +257,10 @@ fn report_prediction_is_partial_for_filesystem_and_open_for_resource_limits() ->
         }
     );
     assert_eq!(plan.report().overall(), S::Partial);
-    assert_eq!(plan.report().shortfalls(), ["filesystem", "resource_limits"]);
+    assert_eq!(
+        plan.report().shortfalls(),
+        ["filesystem", "resource_limits"]
+    );
     Ok(())
 }
 

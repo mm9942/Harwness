@@ -504,6 +504,14 @@ impl LockIndex {
         Ok(Self { deps })
     }
 
+    /// Die Abhängigkeiten von `name` laut `Cargo.lock` (alle Fassungen
+    /// vereinigt), oder `None`, wenn `name` dort nicht verzeichnet ist.
+    /// Genutzt von den Hüllenregeln in `gate_edges.rs`.
+    #[must_use]
+    pub fn deps_of(&self, name: &str) -> Option<&BTreeSet<String>> {
+        self.deps.get(name)
+    }
+
     /// Liest `<repo_root>/Cargo.lock`.
     ///
     /// # Errors

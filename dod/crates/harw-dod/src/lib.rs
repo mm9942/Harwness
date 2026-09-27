@@ -235,6 +235,27 @@
 //! }
 //! ```
 //!
+//! # `harw-dod-encrypt` bleibt unerreichbar
+//! Crypto Masterplan v2 §3.3: `harw-dod-encrypt` (Schlüsselzwecke,
+//! Nutzungsrichtlinie, sichere Rahmen, CryptGuard-Abbildung) liegt aus
+//! Eigentums- und Sicherheitsgründen im DoD-Baum, ist aber keine
+//! Reduktionsfläche und gehört nicht in diese Fassade. Die Fassade hat
+//! keine Kante auf die Crate (siehe `tests/facade.rs`,
+//! `test_facade_manifest_has_no_encrypt_or_crypt_guard_dependency`, und die
+//! verbotene Kante in `xtask/src/gate_edges.rs`). Die beiden Doctests
+//! belegen es je einzeln — ein gemeinsamer Block wäre schon grün, wenn nur
+//! einer der beiden Namen fehlte:
+//!
+//! ```rust,compile_fail
+//! // Kein Modul `encrypt` in der Fassade (E0432).
+//! use harw_dod::encrypt;
+//! ```
+//!
+//! ```rust,compile_fail
+//! // Kein Reexport von `harw_dod_encrypt::HarwKeyPurpose` (E0432).
+//! use harw_dod::HarwKeyPurpose;
+//! ```
+//!
 //! # Bekannte Lücke
 //! `harw-dod-cgroup` ist zum Zeitpunkt dieses Knotens noch ein leeres
 //! Gerüst (kein `pub`-Item außer der Moduldoku). Sobald AW2-13 landet, ist

@@ -37,7 +37,8 @@ use crate::error::WebError;
 /// **entscheidet** anhand dieser Werte nicht — die Zuordnung zu einer
 /// [`harw_operations::operation::PermissionTier`] übernimmt
 /// [`crate::authz::PeerAuthorizer`], eine von außen (serverseitig
-/// vertrauenswürdig) konfigurierte Richtlinie.
+/// vertrauenswürdig) konfigurierte Richtlinie; Mandant und Hub-Kontext löst
+/// [`crate::identity::LocalPeerIdentityResolver`] auf (H12).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PeerCredentials {
     /// Prozess-ID des Peers zum Zeitpunkt von `connect()`.

@@ -118,6 +118,8 @@ use harw_dod_signals::SecurityEvidence;
 use harw_observe::{FieldValue, MetricValue, TelemetrySink};
 use jiff::Timestamp;
 
+use crate::export::FindingsExporter;
+
 /// Label-Feldname für die auslösende Regel ([`harw_dod_rules::Rule::id`]).
 const RULE_LABEL: harw_observe::FieldName = harw_macros::field!("rule_id");
 /// Label-Feldname für [`FindingKind`], über [`finding_kind_label`].
@@ -172,6 +174,10 @@ const fn finding_kind_label(kind: FindingKind) -> &'static str {
 ///   Beleg, dessen `samples`/`events` gegen die Regeln laufen.
 /// - `now` (`jiff::Timestamp`): dieselbe injizierte Zeit, mit der `evidence`
 ///   eingefroren wurde — nie die Systemuhr dieser Funktion selbst.
+/// - `exporter` (`Option<&mut crate::export::FindingsExporter>`): der
+///   optionale JSON-Lines-Export (`--findings-export`); `None` schreibt
+///   nichts. Ein Exportfehler wird dort gezählt und geloggt und ändert
+///   weder Rückgabewert noch Meldung.
 ///
 /// # Returns
 /// Die Anzahl gemeldeter Befunde. `0` ist der häufigste, unauffällige Fall
@@ -192,13 +198,15 @@ const fn finding_kind_label(kind: FindingKind) -> &'static str {
 ///
 /// let evidence = SecurityEvidence::capture(vec![], vec![], Timestamp::UNIX_EPOCH)
 ///     .expect("empty events always encode");
-/// let reported = harw_sentinel::findings::report_findings(&NullSink, &evidence, Timestamp::UNIX_EPOCH);
+/// let reported =
+///     harw_sentinel::findings::report_findings(&NullSink, &evidence, Timestamp::UNIX_EPOCH, None);
 /// assert_eq!(reported, 0);
 /// ```
 pub fn report_findings(
     sink: &dyn TelemetrySink,
     evidence: &SecurityEvidence,
     now: Timestamp,
+    mut exporter: Option<&mut FindingsExporter>,
 ) -> usize {
     let scope = NetworkScope::empty();
     let ctx = RuleContext {
@@ -232,6 +240,9 @@ pub fn report_findings(
                 ),
             ],
         );
+        if let Some(exporter) = exporter.as_deref_mut() {
+            exporter.export(sink, finding);
+        }
     }
 
     findings.len()
@@ -266,7 +277,12 @@ mod tests {
             SecurityEvidence::capture(vec![], vec![structure_drift_event()], Timestamp::UNIX_EPOCH)
                 .map_err(ctx("well-formed content always encodes"))?;
 
-        let reported = report_findings(&harw_observe::NullSink, &evidence, Timestamp::UNIX_EPOCH);
+        let reported = report_findings(
+            &harw_observe::NullSink,
+            &evidence,
+            Timestamp::UNIX_EPOCH,
+            None,
+        );
 
         assert_eq!(
             reported, 1,
@@ -280,12 +296,44 @@ mod tests {
         let evidence = SecurityEvidence::capture(vec![], vec![], Timestamp::UNIX_EPOCH)
             .map_err(ctx("empty content always encodes"))?;
 
-        let reported = report_findings(&harw_observe::NullSink, &evidence, Timestamp::UNIX_EPOCH);
+        let reported = report_findings(
+            &harw_observe::NullSink,
+            &evidence,
+            Timestamp::UNIX_EPOCH,
+            None,
+        );
 
         assert_eq!(
             reported, 0,
             "an empty evidence buffer must report zero findings, not an error"
         );
+        Ok(())
+    }
+
+    #[test]
+    fn test_report_findings_writes_one_export_line_per_finding() -> TestResult {
+        let dir = tempfile::tempdir().map_err(ctx("tempdir"))?;
+        let path = dir.path().join("findings.jsonl");
+        let host = harw_types::HostId::try_from_str("host-a").map_err(ctx("host id"))?;
+        let mut exporter = FindingsExporter::new(path.clone(), host);
+        let evidence =
+            SecurityEvidence::capture(vec![], vec![structure_drift_event()], Timestamp::UNIX_EPOCH)
+                .map_err(ctx("well-formed content always encodes"))?;
+
+        let reported = report_findings(
+            &harw_observe::NullSink,
+            &evidence,
+            Timestamp::UNIX_EPOCH,
+            Some(&mut exporter),
+        );
+
+        assert_eq!(reported, 1);
+        assert_eq!(exporter.written(), 1);
+        let text = std::fs::read_to_string(&path).map_err(ctx("read export"))?;
+        let value: serde_json::Value =
+            serde_json::from_str(text.trim_end()).map_err(ctx("json line"))?;
+        assert_eq!(value["rule_id"], "structure-drift");
+        assert_eq!(value["host"], "host-a");
         Ok(())
     }
 

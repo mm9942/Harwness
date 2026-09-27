@@ -523,6 +523,10 @@ pub enum CommandDomain {
     CatalogConfig,
     Knowledge,
     Channels,
+    Identity,
+    Network,
+    Security,
+    Crypto,
     Misc,
 }
 

@@ -1086,6 +1086,8 @@ belong to `harw-agent-compiler` and are **planned in #22**.
                 ReachableTools    tool providers the admitted tools need
                 PruneUnusedTools  drop providers nothing reaches
                 ResolveModels     model preferences; required env into the manifest
+                DeriveRequirements execution requirements (target, sandbox, kernel; PL-90)
+                ChildClosure      embed children; union their requirements into the parent
 5. backend      A (default): artifact appended to the prebuilt harw-agent-runner
                 B (--native): generated Rust crate, only needed features, cargo build
 ```

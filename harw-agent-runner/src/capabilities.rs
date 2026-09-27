@@ -11,11 +11,18 @@
 //! shape; a field added on one side without the other breaks the contract
 //! silently, so [`crate::capabilities::tests::test_matches_the_compiler_fixture`]
 //! round-trips this module's JSON through the compiler's own parser.
+//!
+//! `host_enforcement` (PL-90) is an optional, additive field: the strongest
+//! per-dimension sandbox state the probing host reaches
+//! ([`harw_job_runtime::HostReport::best_report`]). It is omitted when
+//! absent; the compiler's parser ignores it today (its struct does not deny
+//! unknown fields), so older compilers keep accepting this answer.
 
 use serde::Serialize;
 
 use harw_agent_artifact::FORMAT_VERSION;
 use harw_agent_dsl::AGENT_IR_SCHEMA;
+use harw_job_runtime::{HostReport, SandboxReport};
 
 /// Schema label of the capabilities answer (mirrors
 /// `harw_agent_compiler::backend::runner::CAPABILITIES_SCHEMA`).
@@ -118,6 +125,8 @@ struct Capabilities {
     interfaces: Vec<&'static str>,
     features: Vec<&'static str>,
     child_protocol: Option<&'static str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    host_enforcement: Option<SandboxReport>,
 }
 
 /// Builds the answer for the running build.
@@ -132,6 +141,7 @@ fn capabilities() -> Capabilities {
         interfaces: compiled_interfaces(),
         features: compiled_features(),
         child_protocol: Some(CHILD_PROTOCOL),
+        host_enforcement: Some(HostReport::probe().best_report),
     }
 }
 
@@ -158,6 +168,30 @@ mod tests {
         assert_eq!(value["child_protocol"], CHILD_PROTOCOL);
         assert_eq!(value["ir_schema"], AGENT_IR_SCHEMA);
         assert_eq!(value["artifact_formats"][0], FORMAT_VERSION);
+        for dimension in [
+            "filesystem",
+            "network",
+            "no_new_privs",
+            "capabilities",
+            "resource_limits",
+        ] {
+            assert!(
+                value["host_enforcement"][dimension].is_string(),
+                "host_enforcement.{dimension} missing: {value}"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn test_host_enforcement_is_omitted_when_absent() -> TestResult {
+        let mut answer = capabilities();
+        answer.host_enforcement = None;
+        let value = serde_json::to_value(&answer)?;
+        assert!(value.get("host_enforcement").is_none(), "{value}");
+        // The compiler still parses the answer without the field.
+        harw_agent_compiler::backend::runner::RunnerCapabilities::parse(&value.to_string())
+            .map_err(|error| -> Box<dyn std::error::Error> { error.into() })?;
         Ok(())
     }
 

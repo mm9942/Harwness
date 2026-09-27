@@ -208,6 +208,128 @@ pub(crate) fn parse_controllers(content: &str) -> BTreeSet<CgroupController> {
         .collect()
 }
 
+/// Read-only view of a (candidate) delegated cgroup v2 root, as produced by
+/// [`detect`]. Used by host capability probes (runtime admission) that must
+/// not change the host.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct CgroupDetection {
+    /// The root lies on a `cgroup2` mount.
+    pub mounted_cgroup2: bool,
+    /// The root directory, its `cgroup.procs` and its
+    /// `cgroup.subtree_control` are writable by this process (the
+    /// delegation precondition of [`CgroupV2Fs::open`]).
+    pub delegated_writable: bool,
+    /// Controllers listed in the root's `cgroup.controllers`, sorted.
+    pub available_controllers: Vec<CgroupController>,
+    /// Controllers currently enabled for children (`cgroup.subtree_control`),
+    /// sorted. [`CgroupV2Fs::open`] would *try* to enable every available
+    /// controller; `detect` only reports the current state.
+    pub enabled_controllers: Vec<CgroupController>,
+}
+
+impl CgroupDetection {
+    /// Whether [`CgroupV2Fs::open`] would accept this root (cgroup2 and
+    /// writable).
+    #[must_use]
+    pub const fn is_delegated(&self) -> bool {
+        self.mounted_cgroup2 && self.delegated_writable
+    }
+}
+
+/// Probes `root` without changing anything: no `mkdir`, no write to
+/// `cgroup.subtree_control` (unlike [`CgroupV2Fs::open`], which enables
+/// controllers). Only `fstatfs`, `faccessat(W_OK)` and reads of
+/// `cgroup.controllers` / `cgroup.subtree_control`.
+///
+/// A directory that is not on a `cgroup2` mount is not an error: it yields
+/// a detection with `mounted_cgroup2 == false`.
+///
+/// # Errors
+/// [`CgroupError::CgroupUnavailable`] with
+/// [`CgroupUnavailableReason::RootMissing`] if `root` does not exist;
+/// I/O errors if it cannot be opened or `fstatfs` fails.
+pub fn detect(root: &Path) -> Result<CgroupDetection, CgroupError> {
+    let (dir, _canonical) = open_root(root)?;
+    if !is_cgroup2(&dir)? {
+        return Ok(CgroupDetection::default());
+    }
+    let controllers = |file: &str| -> Vec<CgroupController> {
+        dir.read_to_string(file)
+            .map(|content| parse_controllers(&content).into_iter().collect())
+            .unwrap_or_default()
+    };
+    Ok(CgroupDetection {
+        mounted_cgroup2: true,
+        delegated_writable: is_delegated_writable(&dir),
+        available_controllers: controllers("cgroup.controllers"),
+        enabled_controllers: controllers("cgroup.subtree_control"),
+    })
+}
+
+/// [`detect`] for the cgroup this process runs in (the root
+/// [`CgroupV2Fs::open_own_cgroup`] would use).
+///
+/// # Errors
+/// [`CgroupError::CgroupUnavailable`] with
+/// [`CgroupUnavailableReason::NotCgroup2`] if this process has no cgroup v2
+/// membership; otherwise as [`detect`].
+pub fn detect_own_cgroup() -> Result<CgroupDetection, CgroupError> {
+    detect(&own_cgroup_path()?)
+}
+
+/// `/sys/fs/cgroup/<own cgroup v2 path>` of this process.
+fn own_cgroup_path() -> Result<PathBuf, CgroupError> {
+    let own = crate::proc::snapshot(std::process::id())
+        .ok()
+        .and_then(|snap| snap.cgroup_v2_path)
+        .ok_or_else(|| CgroupError::CgroupUnavailable {
+            root: PathBuf::from("/sys/fs/cgroup"),
+            reason: CgroupUnavailableReason::NotCgroup2,
+        })?;
+    Ok(Path::new("/sys/fs/cgroup").join(own.trim_start_matches('/')))
+}
+
+/// Canonicalizes `path` and opens it as a directory capability. The one
+/// place where ambient filesystem authority is used.
+fn open_root(path: &Path) -> Result<(Dir, PathBuf), CgroupError> {
+    let canonical = std::fs::canonicalize(path).map_err(|error| {
+        if error.kind() == io::ErrorKind::NotFound {
+            CgroupError::CgroupUnavailable {
+                root: path.to_path_buf(),
+                reason: CgroupUnavailableReason::RootMissing,
+            }
+        } else {
+            CgroupError::from_io("canonicalize", &path.display().to_string(), error)
+        }
+    })?;
+    let root = Dir::open_ambient_dir(&canonical, cap_std::ambient_authority())
+        .map_err(|error| CgroupError::from_io("open", &canonical.display().to_string(), error))?;
+    Ok((root, canonical))
+}
+
+/// Whether `dir` lies on a `cgroup2` mount (`fstatfs`).
+fn is_cgroup2(dir: &Dir) -> Result<bool, CgroupError> {
+    let fs = rustix::fs::fstatfs(dir.as_fd())
+        .map_err(|errno| CgroupError::from_io("fstatfs", ".", errno.into()))?;
+    Ok(i128::from(fs.f_type) == CGROUP2_SUPER_MAGIC)
+}
+
+/// Whether the directory and its delegation files are writable
+/// (`faccessat(W_OK)`, no write).
+fn is_delegated_writable(dir: &Dir) -> bool {
+    [".", "cgroup.procs", "cgroup.subtree_control"]
+        .into_iter()
+        .all(|entry| {
+            rustix::fs::accessat(
+                dir.as_fd(),
+                entry,
+                rustix::fs::Access::WRITE_OK,
+                rustix::fs::AtFlags::empty(),
+            )
+            .is_ok()
+        })
+}
+
 /// cgroup v2 backend over cgroupfs files, rooted at a delegated directory.
 #[derive(Debug)]
 pub struct CgroupV2Fs {
@@ -236,34 +358,11 @@ impl CgroupV2Fs {
             root: path.to_path_buf(),
             reason,
         };
-        let canonical = std::fs::canonicalize(path).map_err(|error| {
-            if error.kind() == io::ErrorKind::NotFound {
-                unavailable(CgroupUnavailableReason::RootMissing)
-            } else {
-                CgroupError::from_io("canonicalize", &path.display().to_string(), error)
-            }
-        })?;
-        let root =
-            Dir::open_ambient_dir(&canonical, cap_std::ambient_authority()).map_err(|error| {
-                CgroupError::from_io("open", &canonical.display().to_string(), error)
-            })?;
-        let fs = rustix::fs::fstatfs(root.as_fd())
-            .map_err(|errno| CgroupError::from_io("fstatfs", ".", errno.into()))?;
-        if i128::from(fs.f_type) != CGROUP2_SUPER_MAGIC {
+        let (root, canonical) = open_root(path)?;
+        if !is_cgroup2(&root)? {
             return Err(unavailable(CgroupUnavailableReason::NotCgroup2));
         }
-        let writable = [".", "cgroup.procs", "cgroup.subtree_control"]
-            .into_iter()
-            .all(|entry| {
-                rustix::fs::accessat(
-                    root.as_fd(),
-                    entry,
-                    rustix::fs::Access::WRITE_OK,
-                    rustix::fs::AtFlags::empty(),
-                )
-                .is_ok()
-            });
-        if !writable {
+        if !is_delegated_writable(&root) {
             return Err(unavailable(CgroupUnavailableReason::NotDelegated));
         }
         let root_proc_path = proc_path_of(&canonical)
@@ -286,15 +385,7 @@ impl CgroupV2Fs {
     /// # Errors
     /// As [`CgroupV2Fs::open`].
     pub fn open_own_cgroup() -> Result<Self, CgroupError> {
-        let own = crate::proc::snapshot(std::process::id())
-            .ok()
-            .and_then(|snap| snap.cgroup_v2_path)
-            .ok_or_else(|| CgroupError::CgroupUnavailable {
-                root: PathBuf::from("/sys/fs/cgroup"),
-                reason: CgroupUnavailableReason::NotCgroup2,
-            })?;
-        let path = Path::new("/sys/fs/cgroup").join(own.trim_start_matches('/'));
-        Self::open(&path)
+        Self::open(&own_cgroup_path()?)
     }
 
     /// Controllers enabled for job cgroups created beneath the root.
@@ -610,6 +701,51 @@ mod tests {
                 ..
             }) => Ok(()),
             other => Err(TestError::Unexpected(format!("{other:?}"))),
+        }
+    }
+
+    #[test]
+    fn test_detect_plain_directory_is_not_cgroup2() -> TestResult {
+        let temp = tempfile::tempdir().map_err(ctx("tempdir"))?;
+        let detection = detect(temp.path()).map_err(ctx("detect"))?;
+        assert_eq!(detection, CgroupDetection::default());
+        assert!(!detection.is_delegated());
+        // Nothing was created or written beneath the probed directory.
+        let entries = std::fs::read_dir(temp.path())
+            .map_err(ctx("read_dir"))?
+            .count();
+        assert_eq!(entries, 0);
+        Ok(())
+    }
+
+    #[test]
+    fn test_detect_missing_root() {
+        assert!(matches!(
+            detect(Path::new("/nonexistent/harw-cgroup-root")),
+            Err(CgroupError::CgroupUnavailable {
+                reason: CgroupUnavailableReason::RootMissing,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn test_detect_own_cgroup_is_consistent() {
+        // Host dependent: only the invariants are checked. Enabled
+        // controllers are always a subset of the available ones, and a
+        // non-cgroup2 detection carries no controllers.
+        if let Ok(detection) = detect_own_cgroup() {
+            if detection.mounted_cgroup2 {
+                assert!(
+                    detection
+                        .enabled_controllers
+                        .iter()
+                        .all(|controller| detection.available_controllers.contains(controller))
+                );
+            } else {
+                assert!(detection.available_controllers.is_empty());
+                assert!(!detection.delegated_writable);
+            }
         }
     }
 

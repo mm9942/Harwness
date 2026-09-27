@@ -33,6 +33,10 @@ hyper-util = { version = "0.1", features = ["server", "http1", "tokio"] }
 http-body-util = { version = "0.1", features = ["channel"] }
 bytes = "1"
 tokio = { version = "1", features = ["rt", "net", "sync", "macros", "io-util", "time"] }
+# systemd-Socket-Aktivierung (`--systemd-socket`, Crypto-Masterplan v2 H9):
+# dieselbe Crate und Version wie harw-auth-hub/harw-netsec/harw-warden, damit
+# `src/systemd.rs` ohne eigenes `unsafe` den übergebenen Deskriptor übernimmt.
+sd-listen-fds = "0.2.0"
 
 # Der Genehmigungsbegriff ist durabel und existiert bereits: `ApprovalRecord`,
 # `ApprovalStore`, die Zustandsübergänge im Dateisuffix. `src/security.rs`
@@ -42,6 +46,10 @@ harw-session-store = { path = "../harw-session-store" }
 # abgeleitet, nie aus dem Anfragerumpf.
 harw-types = { path = "../harw-types" }
 jiff = { workspace = true }
+# H12: `SecurityHubClient::verify_context` — der einzige Weg, auf dem
+# `harw-web` einen vom Client vorgelegten Kontextverweis gegen den
+# SecurityHub prüft (`src/identity.rs`). Kein eigener Socket-Code.
+harw-infra-client = { path = "../harw-infra-client" }
 
 serde = { workspace = true }
 serde_json = { workspace = true }
@@ -49,6 +57,14 @@ tracing = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }
+# `tests/identity_routes.rs` führt eine echte `Execute`-Route aus und braucht
+# dafür einen echten `OpContext` — also eine `SandboxSpec` über einer realen
+# `WorkspaceBinding` (`SandboxSpec::from_resolved`). Nur Testabhängigkeit;
+# `harw-authority` ist über `harw-operations` ohnehin im Graphen.
+harw-authority = { path = "../harw-authority" }
+# `[web.identity]`-Beispiele in Tests exakt so parsen, wie sie in der
+# TOML-Konfiguration stehen (Schlüssel `"1000"` usw.).
+toml = { workspace = true }
 
 [lints]
 workspace = true
