@@ -106,9 +106,11 @@ const judge = async f => {
     const tie = await run(tieKey)
     votes = [...first, tie].filter(Boolean)
   }
-  // No verdict at all is not a rejection: keep it apart so it can be retried.
-  if (votes.length === 0) {
-    unverified.push(f)
+  // Fixed quorum: as many answered lenses as were planned (the tie-breaker may
+  // stand in for a lens that died). Fewer answers never decide a finding in
+  // either direction; it stays unverified and can be retried.
+  if (votes.length < firstKeys.length) {
+    unverified.push({ ...f, votes: votes.map(v => ({ lens: v.lens, real: v.real })), reason: `${votes.length} of ${firstKeys.length} planned verdicts` })
     return
   }
   const need = Math.floor(votes.length / 2) + 1
