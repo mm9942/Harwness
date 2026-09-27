@@ -91,6 +91,10 @@ Architecture decision records live in [`adr/`](adr/), numbered in order.
 | [Roles, Models, Modes, and Approval in the TUI](design/tui-roles-models-modes.md) | implemented |
 | [Business Wargaming, Analytical Tradecraft, and Visualization](design/wargaming-and-analysis.md) | partially implemented |
 
+## Planning
+
+Future architecture lives in [`planning/`](planning/README.md), not here. Planning documents describe intended deltas against a pinned baseline commit and are never implemented status; the [migration ledger](planning/90-migration-ledger/MIGRATION_LEDGER.md) records when a plan lands in code.
+
 ## Audits and research
 
 - [Agent Capabilities Audit](audits/agent-capabilities-audit.md) — *partially implemented*

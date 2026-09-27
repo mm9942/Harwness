@@ -1,3 +1,5 @@
+<p align="center"><img src="docs/assets/harwness-logo.png" alt="Harwness" width="480"></p>
+
 # Harwness
 
 **Your local AI team for code and for business, with Rust holding the reins.**

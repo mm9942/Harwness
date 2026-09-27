@@ -1,0 +1,6 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" role="img" aria-label="Harwness">
+  <title>Harwness</title>
+  <rect width="512" height="512" rx="112" fill="#faf7f8"/>
+  <path d="M96 150 L178 368 L256 214 L334 368" fill="none" stroke="#9b5669" stroke-width="68" stroke-linejoin="miter" stroke-miterlimit="8"/>
+  <path d="M334 368 C 356 300, 380 196, 424 150" fill="none" stroke="#484847" stroke-width="68"/>
+</svg>
