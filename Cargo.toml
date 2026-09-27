@@ -202,7 +202,7 @@ crypt_guard_service = { git = "https://github.com/mm9942/crypt_guard", rev = "9b
 crypt_guard_hyper = { git = "https://github.com/mm9942/crypt_guard", rev = "9b2df9a59a238b5bde0ebbccb1b16e0b0764b241" }
 procfs = { version = "0.18.0", default-features = false }
 landlock = "0.4.7"
-cap-std = "3.4.6"
+cap-std = "4.0.3"
 
 # Verzeichniseinbettung: Registry-Definitionen als Dateien statt als Rust-Liste.
 include_dir = "0.7.4"
