@@ -2327,7 +2327,6 @@ dependencies = [
  "serde_json",
  "tempfile",
  "tokio",
- "tokio-util",
  "tracing",
  "uuid",
 ]
@@ -2344,7 +2343,6 @@ dependencies = [
  "harw-extension-api",
  "harw-operations",
  "harw-research",
- "harw-sandbox",
  "harw-types",
  "serde_json",
  "tokio",

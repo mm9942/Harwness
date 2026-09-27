@@ -21,8 +21,7 @@ uuid = { version = "1", features = ["v4"] }
 # `CancelToken` (verschoben aus harw-core, F-160/G-017) wickelt
 # `tokio_util::sync::CancellationToken` — die einzige async-Abhängigkeit
 # dieser sonst reinen Sync-/Datentyp-Crate, bewusst minimal (kein
-# tokio-Runtime-Feature, nur der Cancellation-Primitive). Version/Feature-Zeile
-# identisch zu `harw-core/Cargo.toml`.
+# tokio-Runtime-Feature, nur der Cancellation-Primitive).
 tokio-util = "0.7.18"
 
 [dev-dependencies]

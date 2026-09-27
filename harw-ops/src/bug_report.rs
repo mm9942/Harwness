@@ -22,6 +22,12 @@
 //! Arbeitspaket — dieses Modul ist der einfache manuelle Fallback:
 //! sowohl über `harw bug-report` (CLI) als auch über `/bug-report` (TUI).
 //!
+//! Die Operation `/bug-report` schreibt in den an die Sitzung gebundenen
+//! Root-Space (`harw_home::ResolvedHomeContext`, siehe
+//! `crate::config_util::bound_home`) — nie über `HARW_HOME`; ohne Bindung
+//! schlägt sie geschlossen fehl. `harw bug-report` übergibt seinen eigenen
+//! Root-Space direkt an [`write_bug_report`].
+//!
 //! `/bug-report <title> :: <what happened>` — schreibt einen minimalen,
 //! manuell ausgelösten Bug-Report als SINGLE-LINE-Befehl (Titel und
 //! Beschreibung durch das literale Token `" :: "` getrennt). Ein echter
@@ -323,7 +329,9 @@ impl FromRawArgs for BugReportArgs {
 /// # Errors
 /// - [`OpError::InvalidArguments`]: kein Titel angegeben, oder Titel ohne
 ///   `" :: <what happened>"`-Teil.
-/// - [`OpError::Execution`]: Home nicht auflösbar oder Schreibfehler.
+/// - [`OpError::NotAvailable`]: an die Sitzung ist kein Root-Space gebunden
+///   (kein Rückfall auf `HARW_HOME`).
+/// - [`OpError::Execution`]: Schreibfehler.
 #[operation(
     name = "bug-report",
     summary = "Speichert einen lokalen Bug-Report unter ~/.harw/bug-report/.",
@@ -331,7 +339,7 @@ impl FromRawArgs for BugReportArgs {
     permission = "operator",
     command(path = "/bug-report", visibility = "tui_only")
 )]
-async fn bug_report(_ctx: &OpContext, args: BugReportArgs) -> Result<OpOutput, OpError> {
+async fn bug_report(ctx: &OpContext, args: BugReportArgs) -> Result<OpOutput, OpError> {
     let Some(title) = args.title.clone().filter(|t| !t.is_empty()) else {
         return Err(OpError::InvalidArguments(
             "usage: /bug-report <title> :: <what happened>".into(),
@@ -343,7 +351,7 @@ async fn bug_report(_ctx: &OpContext, args: BugReportArgs) -> Result<OpOutput, O
         ));
     }
 
-    let home = harw_home::home_dir().map_err(|e| OpError::Execution(e.to_string()))?;
+    let home = crate::config_util::bound_home(ctx)?.home.clone();
     let report = BugReport {
         id: new_report_id(),
         report_type: "manual".to_owned(),
@@ -367,7 +375,8 @@ async fn bug_report(_ctx: &OpContext, args: BugReportArgs) -> Result<OpOutput, O
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_support::{TestResult, ctx};
+    use crate::test_support::{TestError, TestResult, ctx};
+    use harw_operations::context::ServiceMap;
 
     fn sample_report(id: &str) -> BugReport {
         BugReport {
@@ -479,5 +488,61 @@ mod tests {
         let first = new_report_id();
         let second = new_report_id();
         assert_ne!(first, second);
+    }
+
+    /// Argumente wie aus `/bug-report Titel :: Text`.
+    fn op_args() -> TestResult<BugReportArgs> {
+        let tokens = ["Titel", "::", "Text"].map(str::to_owned);
+        BugReportArgs::from_raw_args(&tokens).map_err(ctx("parse bug-report args"))
+    }
+
+    /// Die Operation schreibt in den an die Sitzung gebundenen Root-Space —
+    /// nie über `HARW_HOME`.
+    #[tokio::test]
+    async fn bug_report_op_writes_under_the_bound_home() -> TestResult {
+        let temp = tempfile::tempdir().map_err(ctx("tempdir"))?;
+        let mut services = ServiceMap::new();
+        services.insert(crate::config_util::test_home_context(temp.path())?);
+        let op_ctx = crate::knowledge_test_support::op_context(services)?;
+
+        let output = super::bug_report(&op_ctx, op_args()?)
+            .await
+            .map_err(ctx("bug-report op"))?;
+
+        let entries = std::fs::read_dir(temp.path().join("bug-report"))
+            .map_err(ctx("read bound bug-report dir"))?
+            .map(|entry| entry.map(|entry| entry.path()))
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(ctx("list bound bug-report dir"))?;
+        let reports = entries
+            .iter()
+            .filter(|path| path.extension().is_some_and(|ext| ext == "md"))
+            .count();
+        assert_eq!(reports, 1, "{entries:?}");
+        assert!(
+            output.text.starts_with("Bug report saved: "),
+            "{}",
+            output.text
+        );
+        Ok(())
+    }
+
+    /// Ohne gebundenen Root-Space ist die Operation nicht verfügbar, statt
+    /// auf den Prozess-Root-Space auszuweichen.
+    #[tokio::test]
+    async fn bug_report_op_without_bound_home_is_not_available() -> TestResult {
+        let op_ctx = crate::knowledge_test_support::op_context(ServiceMap::new())?;
+
+        match super::bug_report(&op_ctx, op_args()?).await {
+            Err(OpError::NotAvailable(message)) => {
+                assert!(message.contains("Root-Space"), "{message}");
+            }
+            other => {
+                return Err(TestError::Unexpected(format!(
+                    "expected NotAvailable, got: {other:?}"
+                )));
+            }
+        }
+        Ok(())
     }
 }

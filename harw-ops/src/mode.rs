@@ -34,8 +34,11 @@
 //!
 //! `/mode default <modus>` berührt die laufende Sitzung nicht, sondern schreibt
 //! bestes Bemühen `[mode] default` über den Persistenz-Dienst
-//! ([`crate::config_util::SelectionPersistence::persist_default_interaction_mode`],
-//! Standard: [`crate::config_util::persist_default_interaction_mode`]); mit
+//! ([`crate::config_util::SelectionPersistence::persist_default_interaction_mode`]),
+//! den [`crate::config_util::selection_persistence`] auflöst: ein injizierter
+//! Dienst, sonst [`crate::config_util::FileSelectionPersistence`] für das
+//! Profil des gebundenen Root-Space. Ohne Bindung schlägt die Persistenz
+//! geschlossen fehl und meldet eine Notiz — kein Rückfall auf `HARW_HOME`. Mit
 //! registriertem [`crate::live_config::SharedLiveConfig`] zeigt das folgende
 //! `/mode show` den neuen Standard sofort.
 //!
@@ -262,9 +265,12 @@ fn render_show(current: Option<&str>, configured_default: Option<&str>) -> OpOut
 ///
 /// # Beschreibung
 /// `persist` ist in Produktion
-/// [`crate::config_util::persist_default_interaction_mode`]; die Injektion
-/// erlaubt Tests ohne `HARW_HOME`-Zugriff (dieses Crate verbietet `unsafe`,
-/// also auch Env-Isolation über `set_var`).
+/// [`SelectionPersistence::persist_default_interaction_mode`](crate::config_util::SelectionPersistence::persist_default_interaction_mode)
+/// des von [`crate::config_util::selection_persistence`] aufgelösten Dienstes;
+/// die Injektion erlaubt Tests der Antwortform ohne Dienst, gebundenen
+/// Root-Space oder Dateizugriff. Ohne gebundenen Root-Space schreibt der
+/// Dienst nichts und liefert eine Notiz; die Antwort meldet dann
+/// `persisted = false`.
 fn handle_set_default(
     mode: InteractionMode,
     persist: impl FnOnce(&str) -> Option<String>,
@@ -303,14 +309,16 @@ fn handle_set_default(
 /// `known = false` statt einen Vorgabewert zu erfinden — ein erfundenes `"chat"`
 /// wäre schlimmer als ein ehrliches „unbekannt", weil der Nutzer daraus auf
 /// Werkzeug- und Sandbox-Grenzen schließt. `default` stammt aus der
-/// aufgelösten Config (`[mode] default`).
+/// aufgelösten Config (Live-Stand, Sitzungs-Config, sonst gebundener
+/// Root-Space; ohne diese Quellen `null`, nie `HARW_HOME`).
 ///
 /// `/mode <modus>` ruft
 /// [`SessionController::request_mode`](harw_operations::session_control::SessionController::request_mode);
 /// wirksam wird der Wechsel an der nächsten Turn-Grenze.
 ///
-/// `/mode default <modus>` persistiert `[mode] default` (bestes Bemühen) und
-/// braucht keinen Controller.
+/// `/mode default <modus>` persistiert `[mode] default` (bestes Bemühen) in
+/// das Profil des gebundenen Root-Space und braucht keinen Controller; ohne
+/// Bindung wird nichts geschrieben und die Antwort trägt eine Notiz.
 ///
 /// **Command only**: Das Modell darf diese Operation nicht selbst aufrufen; es
 /// würde sonst sein eigenes Werkzeug-Ceiling verschieben. Diese Grenze wird von
@@ -421,7 +429,8 @@ mod tests {
     /// Baut einen minimalen [`OpContext`]; optional mit
     /// [`harw_operations::session_control::NullSessionController`]. Eine
     /// Standard-[`harw_config::ResolvedConfig`] wird immer injiziert, damit
-    /// `show` nie die echte `HARW_HOME`-Config liest.
+    /// `show` einen festen Standard sieht, ohne einen Root-Space zu binden
+    /// (ohne Config und Bindung bliebe `default` leer).
     fn test_context(with_controller: bool) -> TestResult<(OpContext, std::path::PathBuf)> {
         static COUNTER: AtomicU64 = AtomicU64::new(0);
         let id = COUNTER.fetch_add(1, Ordering::Relaxed);
@@ -688,7 +697,7 @@ mod tests {
     }
 
     #[test]
-    fn test_handle_set_default_persists_canonical_name() {
+    fn test_handle_set_default_persists_canonical_name() -> TestResult {
         let mut persisted = None;
         let output = handle_set_default(InteractionMode::Explore, |mode| {
             persisted = Some(mode.to_owned());
@@ -701,9 +710,10 @@ mod tests {
             output.text
         );
         assert!(output.text.contains("nächsten Sitzung"), "{}", output.text);
-        let data = output.data.unwrap_or_default();
+        let data = output.data.ok_or(TestError::Missing("OpOutput.data"))?;
         assert_eq!(data["default"], serde_json::json!("explore"));
         assert_eq!(data["persisted"], serde_json::json!(true));
+        Ok(())
     }
 
     /// Live-Schnappschuss: nach `/mode default work` meldet `/mode show`
@@ -752,12 +762,13 @@ mod tests {
     }
 
     #[test]
-    fn test_handle_set_default_reports_persist_failure_note() {
+    fn test_handle_set_default_reports_persist_failure_note() -> TestResult {
         let output = handle_set_default(InteractionMode::Chat, |_| {
             Some("Hinweis: konnte den Standardmodus nicht dauerhaft speichern (boom).".to_owned())
         });
         assert!(output.text.contains("(boom)"), "{}", output.text);
-        let data = output.data.unwrap_or_default();
+        let data = output.data.ok_or(TestError::Missing("OpOutput.data"))?;
         assert_eq!(data["persisted"], serde_json::json!(false));
+        Ok(())
     }
 }
