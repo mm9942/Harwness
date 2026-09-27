@@ -18,21 +18,28 @@ export const meta = {
 //   reviewOnly  repo-relative files whose fixes are already in the working
 //               tree (e.g. a run died at a session limit after its fixer
 //               finished): skip the fixer, review and repair only
-//   root      absolute path of the checkout to work in (default: the current
-//             working directory). One workflow, one branch: cut a git worktree
-//             per wave and pass its path here, so every wave commits on its own
-//             branch and the main tree stays clean (catalog P11).
+//   root      absolute path of the checkout to work in (required, catalog
+//             P14). One workflow, one branch: cut a git worktree per wave and
+//             pass its path here, so every wave commits on its own branch and
+//             the main tree stays clean (catalog P11).
 //   partial     repo-relative files a dead fixer may have left half-edited:
 //               the new fixer inspects `git diff -- <file>` first and
 //               completes or corrects that edit instead of starting over
-// After a session limit prefer a resume (Workflow resumeFromRunId): completed
-// agents replay from the journal and failed ones run again. Use reviewOnly and
-// partial when the original args are gone or the batch has to be recut.
+// After a session limit, resume with the UNCHANGED script (Workflow
+// resumeFromRunId): completed agents replay from the journal and failed ones
+// run again. A resume replays only the longest unchanged prefix of agent calls;
+// after the first edited or new call everything runs live, fixers included, so
+// never resume a writing wave onto changed logic (catalog P12). Run a missing
+// step as a separate agent instead. Use reviewOnly and partial when the
+// original args are gone or the batch has to be recut.
 const A = args || {}
 const CATALOG = A.catalog || 'docs/planning/85-gap-hunt/patterns.md'
 const RULES = A.rules || 'no let-chains (`if let … && …`, MSRV 1.85), forbid(unsafe), no unwrap/expect/panic! in library code OR tests/doctests (tests return TestResult and use the crate helpers), no third-party types in public APIs, hand-written error types, match the file\'s comment language and density, no book titles/authors/quotes anywhere'
 const BUILD_RULE = 'Subagents and parallel agents must **never** run `cargo` or `rustc` in any form: no `check`, `build`, `test`, `nextest`, `clippy`, `fmt`, `run`, `doc`, `deny`, and no `make` target that calls them. They only read and edit code. At the end they report which tests they added and which commands the central build must run.'
-const ROOT = A.root || ''
+// root is required (catalog P14): the session's working directory follows a
+// `cd` of the main session, so "the current directory" is not a safe default.
+if (!A.root) throw new Error('root is required: pass the absolute path of the checkout (catalog P14)')
+const ROOT = A.root
 const WHERE = ROOT
   ? `Repository root: ${ROOT} (a git worktree on its own branch). Every path below is relative to that root: read and edit files only under it, and run git as \`git -C ${ROOT} …\`. Never touch the same path in any other checkout.`
   : 'Repository: the current working directory (Rust workspace).'

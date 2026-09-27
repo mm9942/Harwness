@@ -1,7 +1,7 @@
 export const meta = {
   name: 'gap-verify',
   description: 'Verify already-found gap findings (tiered lenses, catalog P9/P10), optionally after a completeness critic; read-only, no builds',
-  whenToUse: 'When findings exist but their verification is missing: verifiers died and the original run cannot be resumed, a critic did not run, or findings came from outside a gap-hunt-area run (field reports, reviews). A plain session-limit abort is better handled by resuming the original run.',
+  whenToUse: 'When findings exist but their verification is missing: verifiers died and the original run cannot be resumed, a critic did not run, or findings came from outside a gap-hunt-area run (field reports, reviews). A plain session-limit abort is better handled by resuming the original, unchanged run (catalog P12). Pass base when fixes may already be in the working tree (catalog P13).',
   phases: [
     { title: 'Critic', detail: 'optional Opus completeness critic for one area' },
     { title: 'Verify', detail: 'tiered: M3 intent-only, critical/high intent+scope(+exploit for M1), rest intent+reproduce; tie-breaker on split (sonnet)' },
@@ -16,13 +16,21 @@ export const meta = {
 //   verify    'tiered' (default) or 'classic' (reproduce+intent for every finding)
 //   catalog   pattern catalog path (default docs/planning/85-gap-hunt/patterns.md)
 //   rules     binding code rules (default: the workspace rules below)
+//   base      commit the findings were made against. Set it whenever fix waves
+//             may already have changed the working tree: verifiers then judge
+//             `git show <base>:<file>`, and a fix already in the tree counts as
+//             real (reported as fixedInTree), never as a refutation (catalog P13).
 const A = args || {}
 const CATALOG = A.catalog || 'docs/planning/85-gap-hunt/patterns.md'
 const RULES = A.rules || 'no let-chains (`if let … && …`, MSRV 1.85), forbid(unsafe), no unwrap/expect/panic! in library code OR tests/doctests (tests return TestResult), no third-party types in public APIs, hand-written error types, match the file\'s comment language, no book titles/authors/quotes anywhere'
 const BUILD_RULE = 'Subagents and parallel agents must **never** run `cargo` or `rustc` in any form: no `check`, `build`, `test`, `nextest`, `clippy`, `fmt`, `run`, `doc`, `deny`, and no `make` target that calls them. They only read and edit code. At the end they report which tests they added and which commands the central build must run.'
 
 const C = A.critic || null
-const CONTEXT = `Repository: the current working directory (Rust workspace). Read the current working tree; other processes may be editing some files concurrently, so re-read before concluding.
+const BASE = A.base || ''
+const READ = BASE
+  ? `The findings were made against commit ${BASE}. Fix waves may already have changed the working tree. Judge every finding against the code at that commit (\`git show ${BASE}:<file>\`, \`git grep … ${BASE}\`), not against the working tree. If the working tree already contains a fix for it, the finding is still real: vote real=true, set fixed_in_tree=true and say so in the reason.`
+  : 'Read the current working tree; other processes may be editing some files concurrently, so re-read before concluding.'
+const CONTEXT = `Repository: the current working directory (Rust workspace). ${READ}
 ${C ? `Area: ${C.area}. Crates/paths: ${(C.crates || []).join(', ')}. Out of scope: ${(C.exclude || []).join(', ') || 'none'}.` : ''}
 Binding code rules: ${RULES}. Design decisions: docs/planning/70-decisions; guides: docs/guides; ledger: docs/planning/90-migration-ledger.
 Pattern catalog: ${CATALOG}. Tag every finding with a catalog id (M1…, P5, P8, …) or NEW:<short-name>.
@@ -57,7 +65,7 @@ const FINDINGS = {
 }
 const VERDICT = {
   type: 'object',
-  properties: { real: { type: 'boolean' }, fixable_in_one_file: { type: 'boolean' }, reason: { type: 'string' } },
+  properties: { real: { type: 'boolean' }, fixable_in_one_file: { type: 'boolean' }, fixed_in_tree: { type: 'boolean', description: 'true if the working tree already fixes it (only with base)' }, reason: { type: 'string' } },
   required: ['real', 'fixable_in_one_file', 'reason'],
 }
 
@@ -117,7 +125,7 @@ const judge = async f => {
   const real = votes.filter(v => v.real).length >= need
   const oneFile = Boolean(f.single_file) && votes.filter(v => v.fixable_in_one_file).length >= need
   const tally = votes.map(v => ({ lens: v.lens, real: v.real }))
-  if (real) confirmed.push({ ...f, oneFile, votes: tally, reasons: votes.map(v => v.reason) })
+  if (real) confirmed.push({ ...f, oneFile, fixedInTree: votes.some(v => v.fixed_in_tree), votes: tally, reasons: votes.map(v => v.reason) })
   else rejected.push({ file: f.file, line: f.line, title: f.title, votes: tally, reasons: votes.map(v => v.reason) })
 }
 

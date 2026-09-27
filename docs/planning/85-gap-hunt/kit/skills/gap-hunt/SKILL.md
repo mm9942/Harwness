@@ -84,8 +84,19 @@ The pattern catalog is `docs/planning/85-gap-hunt/patterns.md`. The run logs are
   - `started` and `result` per label;
   - tally the patterns (`pattern` field) and severities.
 - Stop and resume a workflow only while no fixer or repair is writing.
-  Script changes must apply only to later rounds, so the earlier agent calls
-  stay cached (same prompt and opts).
+  A resume replays only the longest unchanged prefix of agent calls (same
+  prompt and opts); from the first edited or new call on, everything runs
+  live, writers included. So never resume a writing wave onto changed logic:
+  run the missing step (for example a re-review) as a separate agent
+  (catalog P12).
+- Never `cd` into a worktree from the main session: the session's working
+  directory follows the `cd`, and every agent started afterwards without an
+  explicit root works in that checkout (catalog P14). Use `git -C` and
+  absolute paths, and pass `root` to every writing workflow, the main tree
+  included.
+- Verify findings after fixes landed only against the base commit they were
+  found in (`gap-verify` option `base`): verifiers reading the fixed tree
+  reject real findings as "already fixed" (catalog P13).
 - Look for these warning signs:
   - two fixers on one file (P7);
   - diffs far above the finding's size (P2);
