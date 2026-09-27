@@ -1,0 +1,199 @@
+{
+ "schema": 1,
+ "wave": "wa-egress",
+ "branch": "claude/r16/wa-egress",
+ "base_sha": "1ad90219d83aa305f5bfe2ca531a30b5ab41a829",
+ "head_sha": "57bb5e7e911625d606ae0de053b7178575eb1e9a",
+ "files": [
+  "harw-egress/src/classify.rs",
+  "harw-egress/src/lib.rs",
+  "harw-egress/src/policy.rs",
+  "harw-egress/src/proxy.rs",
+  "harw-egress/src/relay.rs",
+  "harw-netsec/src/store.rs",
+  "harw-node-transport/README.md"
+ ],
+ "findings": [
+  {
+   "id": "F-108cd5391d3a",
+   "file": "harw-egress/src/classify.rs",
+   "line": 26,
+   "severity": "low",
+   "pattern": "P5",
+   "title": "unwrap() on IP parsing in classify doctests"
+  },
+  {
+   "id": "F-14979c63f983",
+   "file": "harw-egress/src/relay.rs",
+   "line": 145,
+   "severity": "low",
+   "pattern": "P5",
+   "title": "unwrap() in relay doctests (from_args, bind_relay, relay_connection, run_child)"
+  },
+  {
+   "id": "F-211913804ec5",
+   "file": "harw-netsec/src/store.rs",
+   "line": 494,
+   "severity": "low",
+   "pattern": "M3",
+   "title": "persist() fails after the rename when the directory fsync fails: disk holds the new state, memory keeps the old, and the next mutation overwrites it"
+  },
+  {
+   "id": "F-312e291c2dd6",
+   "file": "harw-egress/src/relay.rs",
+   "line": 393,
+   "severity": "low",
+   "pattern": "M2",
+   "title": "The proxy's idle timeout does not free the relay slot: after the proxy closes, the upstream thread blocks until the sandboxed client writes or closes"
+  },
+  {
+   "id": "F-32c097064bc5",
+   "file": "harw-egress/src/policy.rs",
+   "line": 256,
+   "severity": "low",
+   "pattern": "M3",
+   "title": "EgressPolicy::digest doc omits the open-public marker that the code hashes"
+  },
+  {
+   "id": "F-49243ad4d7b8",
+   "file": "harw-egress/src/lib.rs",
+   "line": 13,
+   "severity": "low",
+   "pattern": "M3",
+   "title": "Broken intra-doc link to harw_sandbox::egress::host_matches_suffix, and the resolver is described as check_addr instead of check_resolved"
+  },
+  {
+   "id": "F-4ae9fa7b98ca",
+   "file": "harw-node-transport/README.md",
+   "line": 135,
+   "severity": "low",
+   "pattern": "M3",
+   "title": "README says the AuthHub NodeSigner adapter and the CryptGuard encoding fix are not in this crate; authhub_signer.rs implements both"
+  },
+  {
+   "id": "F-6f5acc9c37df",
+   "file": "harw-egress/src/lib.rs",
+   "line": 3,
+   "severity": "low",
+   "pattern": "M3",
+   "title": "harw-egress crate doc covers only the in-process client; the SOCKS5 proxy and netns relay are missing"
+  },
+  {
+   "id": "F-bd82f38b5ffe",
+   "file": "harw-egress/src/proxy.rs",
+   "line": 189,
+   "severity": "low",
+   "pattern": "P5",
+   "title": "unwrap() in the EgressProxy::new doctest"
+  }
+ ],
+ "workflow_runs": [
+  "wf_28ed6e6c-55d"
+ ],
+ "disposition": {
+  "files": [
+   {
+    "file": "harw-egress/src/classify.rs",
+    "ok": true
+   },
+   {
+    "file": "harw-egress/src/lib.rs",
+    "ok": true
+   },
+   {
+    "file": "harw-egress/src/policy.rs",
+    "ok": true
+   },
+   {
+    "file": "harw-egress/src/proxy.rs",
+    "ok": true
+   },
+   {
+    "file": "harw-egress/src/relay.rs",
+    "ok": true
+   },
+   {
+    "file": "harw-netsec/src/store.rs",
+    "ok": true
+   },
+   {
+    "file": "harw-node-transport/README.md",
+    "ok": false,
+    "repaired": true
+   }
+  ],
+  "ripple": [
+   {
+    "id": null,
+    "file": "/home/user/Harwness/harw-netsec/src/store.rs",
+    "line": 548
+   },
+   {
+    "id": null,
+    "file": "/home/user/Harwness/harw-netsec/README.md",
+    "line": 85
+   },
+   {
+    "id": null,
+    "file": "/home/user/Harwness/harw-netsec/src/server.rs",
+    "line": 217
+   },
+   {
+    "id": null,
+    "file": "/home/user/Harwness/harw-egress/src/relay.rs",
+    "line": 440
+   },
+   {
+    "id": null,
+    "file": "/home/user/Harwness/harw-egress/src/client.rs",
+    "line": 7
+   },
+   {
+    "id": null,
+    "file": "/home/user/Harwness/harw-egress/Cargo.toml",
+    "line": 13
+   },
+   {
+    "id": null,
+    "file": "/home/user/Harwness/harw-egress/src/lib.rs",
+    "line": 88
+   },
+   {
+    "id": null,
+    "file": "/home/user/Harwness/harw-egress/src/policy.rs",
+    "line": 99
+   },
+   {
+    "id": null,
+    "file": "/home/user/Harwness/harw-node-transport/src/authhub_signer.rs",
+    "line": 51
+   },
+   {
+    "id": null,
+    "file": "/home/user/Harwness/harw-node-transport/README.md",
+    "line": 161
+   },
+   {
+    "id": null,
+    "file": "/home/user/Harwness/harw-node-transport/README.md",
+    "line": 111
+   },
+   {
+    "id": null,
+    "file": "/home/user/Harwness/harw-egress/src/relay.rs",
+    "line": 301
+   }
+  ]
+ },
+ "central_build": [
+  "env CARGO_INCREMENTAL=0 CARGO_PROFILE_DEV_DEBUG=0 CARGO_PROFILE_TEST_DEBUG=0 (cloud container, every step)",
+  "cargo fmt --all",
+  "cargo clippy --workspace --all-targets -- -D warnings",
+  "cargo test --workspace (including doc tests)",
+  "cargo run -q -p xtask -- gates",
+  "cargo deny check",
+  "make -C dod clippy test",
+  "actionlint"
+ ],
+ "note": "Backfilled after the merge (kit-4); the wave predates the manifest. Merged before its ripple items were resolved; they are handled by wave ripple-egress and ripple-egress-2."
+}
