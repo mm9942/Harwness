@@ -52,7 +52,9 @@ Binding decisions from the original review:
 
 Work is split into two separately acceptable deliveries: A = DoD system
 operations; B = the authority rebuild. A does not depend on B's completion.
-After B, both Cargo workspaces need re-checking.
+After B, both Cargo workspaces need re-checking. (Since PL-60 DoD is part of
+the root workspace; "both workspaces" now means the product and DoD crates of
+the one root workspace.)
 
 ## 2. Starting point and corrected assumptions (as of the original review)
 

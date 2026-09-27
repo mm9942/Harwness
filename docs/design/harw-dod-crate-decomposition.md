@@ -7,8 +7,10 @@ single-responsibility crates; their dependencies, error types, wiring, and
 who is allowed to do what, how, and where.
 **Related:** `harw-dod-charter.md`, `harw-dod-integration-and-dependencies.md`
 
-The `dod/` Cargo workspace (`dod/Cargo.toml`) now has 32 members implementing
-this decomposition. Illustrative code in this document uses representative
+The DoD domain under `dod/crates/` now has 32 crates implementing this
+decomposition. Until PL-60 they formed a separate, nested Cargo workspace
+(`dod/Cargo.toml`, own `Cargo.lock`); they are now explicit members of the
+root workspace (see `docs/architecture/dod-workspace-merge-plan.md`). Illustrative code in this document uses representative
 names; consult the crate itself for exact type and variant names, which have
 evolved since this document was first written (e.g. `Capability` variants are
 named per concrete source, such as `ReadSysfsThermal`, `ReadProcStat`, rather

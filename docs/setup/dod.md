@@ -7,8 +7,9 @@ what is happening on the host around agent activity (process starts,
 network connections, file writes, authentication, resource pressure, …)
 and — behind an explicit, disabled-by-default enforcement path — can act on
 what it observes. It is a **separate, privileged, opt-in install**: a
-standalone Cargo workspace (`dod/`) with its own Makefile, its own system
-accounts, and its own FHS layout. Nothing in `make install`/`make service`
+set of crates under `dod/` (members of the root Cargo workspace since
+PL-60, built with `-p` selections — one `Cargo.lock`, no nested workspace)
+with its own Makefile, its own system accounts, and its own FHS layout. Nothing in `make install`/`make service`
 (the ordinary Harwness install described in
 [`docs/setup/install.md`](install.md)) touches DoD, and nothing in DoD
 requires it.
@@ -35,7 +36,8 @@ answer, split into two halves:
 
 ## Components
 
-The `dod/` workspace has around 30 crates. Grouped by role, with what each
+The DoD domain (`dod/crates/`, part of the root workspace) has around 30
+crates. Grouped by role, with what each
 one is responsible for:
 
 **Access and data vocabulary** (shared foundations, not sensors themselves)

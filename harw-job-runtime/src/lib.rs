@@ -1,41 +1,38 @@
-//! `harw-job-runtime` — governed background-work primitives.
+//! `harw-job-runtime` — the job coordinator, plus the governed
+//! background-work primitives it builds on.
 //!
-//! This crate owns the substrate every governed unit of work runs on: a [`Job`]
-//! keyed by [`WorkId`], a [`Budget`] (token / wall-time / tool-call ceilings), a
-//! [`Lease`] (acquire / renew / expiry), and an exponential [`RetryPolicy`]. It
-//! is the dependency consumed by `harw-knowledge`'s Dream feature and by kanban
-//! worker lanes, per knowledge-surfaces §4.1 and §6.2.
+//! # Coordinator (Job-Runtime-Doc §14, §15)
+//! [`coordinator`] claims jobs from a fenced store (`harw-job-store`),
+//! starts attempts through a platform [`coordinator::Executor`]
+//! (`LinuxExecutor` on Linux: pidfd process group, optional
+//! cgroup v2 boundary, sandbox backend none / Landlock trampoline /
+//! Bubblewrap; `DarwinExecutor` on macOS), supervises them through
+//! `harw-job-tokio`, renews the lease every TTL/3, enforces deadline and
+//! cancellation, finalizes outcomes and recovers attempts after a restart
+//! without ever signalling an unverified process.
 //!
-//! # Scope
-//! Pure governance arithmetic (budget charging, lease expiry, backoff delay) is
-//! implemented fully. Scheduling and execution live in the callers
-//! (`harw-session-store::JobStore`, `harw-core::DurableJobRunner`, the
-//! `harw-cli` job worker).
+//! # Compatibility re-exports
+//! Since Job-Doc Phase 1 the job model (budget, lease, retry, lifecycle,
+//! stored record, ids, spec, outcomes) lives in [`harw_job_core`]. This crate
+//! re-exports it unchanged so every existing path — `harw_job_runtime::Budget`,
+//! `harw_job_runtime::stored::StoredJob`, `harw_job_runtime::WorkId`, … —
+//! keeps resolving for the eight existing dependents.
 //!
 //! # Errors
-//! Every fallible path returns [`JobRuntimeError`] / [`JobRuntimeResult`].
+//! Governance paths return [`JobRuntimeError`] / [`JobRuntimeResult`]; the
+//! coordinator returns the typed [`coordinator::RuntimeError`] (§22).
 //!
 //! # Concurrency
-//! The types are plain `Send + Sync` data; this crate spawns no threads and
-//! holds no locks. Scheduling across threads/processes is the caller's concern.
+//! The model types are plain `Send + Sync` data. The coordinator runs on
+//! Tokio: one task per active attempt, store I/O on the blocking pool.
 
 #![forbid(unsafe_code)]
 
-pub mod budget;
-pub mod error;
-pub mod job;
-pub mod lease;
-pub mod retry;
-pub mod stored;
+pub use harw_job_core::*;
 
-pub use budget::{Budget, BudgetKind, BudgetUsage};
-pub use error::{JobRuntimeError, JobRuntimeResult};
-pub use job::{Job, JobKind, JobState};
-pub use lease::{Lease, LeaseToken};
-pub use retry::RetryPolicy;
-pub use stored::{
-    JobCancellation, JobClaim, JobCompletion, JobOutcome, JobScope, ReclaimOutcome, StoredJob,
-};
+// Module paths (`harw_job_runtime::budget::Budget`, ...). The glob above
+// already re-exports public modules; these lines make the contract explicit.
+pub use harw_job_core::{budget, error, job, lease, retry, stored};
 
 /// Re-export of the shared work identifier so consumers can write
 /// `harw_job_runtime::WorkId` (knowledge-surfaces §6.1, §8.1). It is the *same*
@@ -44,97 +41,150 @@ pub use harw_types::WorkId;
 
 /// Back-compat alias for the `harw_job_runtime::JobError` name used in the
 /// knowledge-surfaces §8.1 error sketch; canonical name is [`JobRuntimeError`].
-pub use error::JobRuntimeError as JobError;
+pub use harw_job_core::JobRuntimeError as JobError;
+
+pub mod coordinator;
+
+#[cfg(target_os = "macos")]
+pub use coordinator::DarwinExecutor;
+pub use coordinator::{
+    Coordinator, CoordinatorConfig, CoordinatorStore, Executor, JobHandle, JobResult, RecoveredJob,
+    RecoveryDecision, RuntimeError,
+};
+#[cfg(target_os = "linux")]
+pub use coordinator::{LinuxExecutor, LinuxExecutorOptions, LinuxSandboxBackend};
+
+// Test error type (Bible R087/R165/R182), tests only.
+#[cfg(test)]
+mod test_support;
 
 #[cfg(test)]
 mod tests {
-    use super::{Budget, BudgetUsage, JobRuntimeError, Lease, RetryPolicy, WorkId};
-    use crate::test_support::{TestError, TestResult, ctx};
-    use jiff::{SignedDuration, Timestamp};
+    use std::any::TypeId;
 
+    /// Every name the eight dependents import must resolve through this
+    /// crate to the very same type as in `harw-job-core`.
     #[test]
-    fn public_budget_api_rejects_negative_wall_charges_without_accounting_them() -> TestResult {
-        let budget = Budget::unbounded();
-        let mut usage = BudgetUsage {
-            tokens: 7,
-            wall: SignedDuration::from_secs(4),
-            tool_calls: 1,
-        };
-        let original = usage.clone();
-
-        let Err(error) = budget.charge_wall(&mut usage, SignedDuration::from_millis(-1)) else {
-            return Err(TestError::Unexpected(
-                "negative wall charges must fail closed".into(),
-            ));
-        };
-
-        assert!(matches!(error, JobRuntimeError::NegativeWallCharge { .. }));
-        assert_eq!(usage, original);
-        Ok(())
-    }
-
-    #[test]
-    fn public_lease_api_rejects_non_positive_ttl_before_timestamp_arithmetic() -> TestResult {
-        let now = Timestamp::MAX;
-
-        for ttl in [SignedDuration::ZERO, SignedDuration::from_secs(-1)] {
-            let Err(error) = Lease::acquire(WorkId::from_str("work-1"), "worker-a", now, ttl)
-            else {
-                return Err(TestError::Unexpected(
-                    "non-positive lease TTLs must fail closed".into(),
-                ));
-            };
-
-            assert!(matches!(
-                error,
-                JobRuntimeError::LeaseExpired { expired_at, .. } if expired_at == now
-            ));
-        }
-        Ok(())
-    }
-
-    #[test]
-    fn public_retry_api_rejects_non_finite_and_non_positive_factors() {
-        for factor in [f64::NAN, f64::NEG_INFINITY, -1.0, 0.0, f64::INFINITY] {
-            let retry = RetryPolicy {
-                max_attempts: 4,
-                base_delay: SignedDuration::from_secs(1),
-                factor,
-                max_delay: SignedDuration::from_secs(30),
-            };
-
-            assert!(matches!(
-                retry.next_delay(0),
-                Err(JobRuntimeError::RetryExhausted { attempts: 0 })
-            ));
-        }
-    }
-
-    #[test]
-    fn public_retry_api_uses_base_delay_for_the_initial_retry() -> TestResult {
-        let retry = RetryPolicy {
-            max_attempts: 4,
-            base_delay: SignedDuration::from_secs(1),
-            factor: 2.0,
-            max_delay: SignedDuration::from_secs(30),
-        };
-
+    fn root_re_exports_are_the_core_types() {
         assert_eq!(
-            retry
-                .next_delay(0)
-                .map_err(ctx("initial retry must be schedulable"))?,
-            SignedDuration::from_secs(1)
+            TypeId::of::<super::Budget>(),
+            TypeId::of::<harw_job_core::Budget>()
         );
         assert_eq!(
-            retry
-                .next_delay(1)
-                .map_err(ctx("first recorded retry must be schedulable"))?,
-            SignedDuration::from_secs(1)
+            TypeId::of::<super::BudgetKind>(),
+            TypeId::of::<harw_job_core::BudgetKind>()
         );
-        Ok(())
+        assert_eq!(
+            TypeId::of::<super::BudgetUsage>(),
+            TypeId::of::<harw_job_core::BudgetUsage>()
+        );
+        assert_eq!(
+            TypeId::of::<super::JobRuntimeError>(),
+            TypeId::of::<harw_job_core::JobRuntimeError>()
+        );
+        assert_eq!(
+            TypeId::of::<super::JobError>(),
+            TypeId::of::<harw_job_core::JobRuntimeError>()
+        );
+        assert_eq!(
+            TypeId::of::<super::JobRuntimeResult<()>>(),
+            TypeId::of::<Result<(), harw_job_core::JobRuntimeError>>()
+        );
+        assert_eq!(
+            TypeId::of::<super::Job>(),
+            TypeId::of::<harw_job_core::Job>()
+        );
+        assert_eq!(
+            TypeId::of::<super::JobKind>(),
+            TypeId::of::<harw_job_core::JobKind>()
+        );
+        assert_eq!(
+            TypeId::of::<super::JobState>(),
+            TypeId::of::<harw_job_core::JobState>()
+        );
+        assert_eq!(
+            TypeId::of::<super::Lease>(),
+            TypeId::of::<harw_job_core::Lease>()
+        );
+        assert_eq!(
+            TypeId::of::<super::LeaseToken>(),
+            TypeId::of::<harw_job_core::LeaseToken>()
+        );
+        assert_eq!(
+            TypeId::of::<super::RetryPolicy>(),
+            TypeId::of::<harw_job_core::RetryPolicy>()
+        );
+        assert_eq!(
+            TypeId::of::<super::JobScope>(),
+            TypeId::of::<harw_job_core::JobScope>()
+        );
+        assert_eq!(
+            TypeId::of::<super::JobClaim>(),
+            TypeId::of::<harw_job_core::JobClaim>()
+        );
+        assert_eq!(
+            TypeId::of::<super::JobCompletion>(),
+            TypeId::of::<harw_job_core::JobCompletion>()
+        );
+        assert_eq!(
+            TypeId::of::<super::JobCancellation>(),
+            TypeId::of::<harw_job_core::JobCancellation>()
+        );
+        assert_eq!(
+            TypeId::of::<super::JobOutcome>(),
+            TypeId::of::<harw_job_core::JobOutcome>()
+        );
+        assert_eq!(
+            TypeId::of::<super::StoredJob>(),
+            TypeId::of::<harw_job_core::StoredJob>()
+        );
+        assert_eq!(
+            TypeId::of::<super::ReclaimOutcome>(),
+            TypeId::of::<harw_job_core::ReclaimOutcome>()
+        );
+        assert_eq!(
+            TypeId::of::<super::WorkId>(),
+            TypeId::of::<harw_types::WorkId>()
+        );
+    }
+
+    #[test]
+    fn module_paths_still_resolve() {
+        assert_eq!(
+            TypeId::of::<super::budget::Budget>(),
+            TypeId::of::<harw_job_core::budget::Budget>()
+        );
+        assert_eq!(
+            TypeId::of::<super::error::JobRuntimeError>(),
+            TypeId::of::<harw_job_core::error::JobRuntimeError>()
+        );
+        assert_eq!(
+            TypeId::of::<super::job::Job>(),
+            TypeId::of::<harw_job_core::job::Job>()
+        );
+        assert_eq!(
+            TypeId::of::<super::lease::Lease>(),
+            TypeId::of::<harw_job_core::lease::Lease>()
+        );
+        assert_eq!(
+            TypeId::of::<super::retry::RetryPolicy>(),
+            TypeId::of::<harw_job_core::retry::RetryPolicy>()
+        );
+        assert_eq!(
+            TypeId::of::<super::stored::StoredJob>(),
+            TypeId::of::<harw_job_core::stored::StoredJob>()
+        );
+    }
+
+    #[test]
+    fn re_exported_api_still_behaves() {
+        let budget = super::Budget::unbounded();
+        let mut usage = super::BudgetUsage::default();
+        let result = budget.charge_wall(&mut usage, jiff::SignedDuration::from_millis(-1));
+        assert!(matches!(
+            result,
+            Err(super::JobError::NegativeWallCharge { .. })
+        ));
+        assert_eq!(usage, super::BudgetUsage::default());
     }
 }
-
-// Test-Fehlertyp (Bible R087/R165/R182), nur für Tests.
-#[cfg(test)]
-mod test_support;

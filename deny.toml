@@ -62,6 +62,10 @@ ignore = true
 # Fehler: der Baum zieht sie über fremde Abhängigkeiten, nicht über eigene
 # Entscheidungen. Was wir selbst wählen, steht in [workspace.dependencies].
 multiple-versions = "warn"
+# Seit PL-60 (DoD im Wurzel-Workspace, ein Lockfile) erwartet und bewusst
+# getragen: `nix` 0.29 (transitiv über `zbus`, OS-Keyring in `harw-secrets`)
+# neben `nix` 0.31 (direkt, `harw-probe-fs`, Feature `fanotify`). Zwei
+# Major-Fassungen, keine gemeinsame Wahl möglich; `warn` genügt, kein `skip`.
 wildcards = "deny"
 # Pfad-Abhängigkeiten zwischen eigenen, unveröffentlichten Crates tragen
 # keine Versionsangabe.

@@ -2885,6 +2885,7 @@ mod agents_build_tests {
                 state: harw_tool_job::JobState::Running,
                 pid: None,
                 proc_start_ticks: None,
+                identity: None,
                 executed_on_host: true,
                 harw_instance: String::new(),
                 owner: request.owner,

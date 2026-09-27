@@ -70,11 +70,14 @@ crates with one responsibility:
   family: `harw-tool-shell`, `harw-tool-fs`, `harw-tool-web`, `harw-tool-browser`,
   `harw-tool-process`, `harw-tool-plan`, `harw-tool-lens`, `harw-tool-doc`,
   `harw-tool-explorer`, `harw-tool-deps`.
-- **Security / DoD (Defense-of-Depth)** — a separate, excluded workspace at
-  `dod/` (27 sensor, rule, and escalation crates under `dod/crates/`, prefixed
-  `harw-dod-*`), plus the privileged binaries `harw-sentinel` and
-  `harw-warden`. Kept out of the main workspace deliberately: it has a much
-  smaller, audited dependency budget than the rest of the tree.
+- **Security / DoD (Defense-of-Depth)** — the crates under `dod/crates/`
+  (27 sensor, rule, and escalation crates prefixed `harw-dod-*`, the
+  `harw-dod` facade, plus the binaries `harw-sentinel`, `harw-probe-bpf`,
+  `harw-probe-fs` and `harw-warden`). Originally a separate, excluded
+  workspace at `dod/` with its own lockfile, kept apart for its much smaller,
+  audited dependency budget; since PL-60 they are members of the root
+  workspace and that budget is enforced by the `xtask` gates instead of the
+  workspace boundary (see `docs/architecture/dod-workspace-merge-plan.md`).
 - **Sandbox / egress / secrets** — `harw-sandbox`, `harw-egress`, `harw-secrets`,
   `harw-authority`.
 - **Front ends** — `harw-tui` (terminal UI), `harw-web` (HTTP control plane,
@@ -116,8 +119,8 @@ current code, not just historical rationale:
   and pure-crate hulls, a per-binary privilege budget for the four DoD
   binaries, the Warden's runtime-dependency budget and its no-C-build rule)
   are enforced by `cargo run -p xtask -- gates` (`xtask/src/gates.rs`),
-  which reads the dependency graph of the product workspace and the separate
-  `dod/` workspace together, not by documentation asking contributors to
+  which reads the dependency graph of the root workspace (product and DoD
+  crates; until PL-60 two workspaces loaded together), not by documentation asking contributors to
   remember a rule. CI runs the gates in the root job. A gate that checked
   nothing counts as red, not green. The earlier write-scope gate was retired
   together with the build plan's write-scope table.

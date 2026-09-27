@@ -11,6 +11,9 @@ rust-version.workspace = true
 harw-types = { path = "../harw-types" }
 harw-macros = { path = "../harw-macros" }
 harw-job-runtime = { path = "../harw-job-runtime" }
+# Eco-Doc §33: generic job store mechanics (records/locks layout, fs4 locks,
+# atomic persist, fencing). `job_store.rs` is a thin adapter over it.
+harw-job-store = { path = "../harw-job-store" }
 # F-006: symlinkfestes Öffnen (korrektes O_NOFOLLOW je Architektur, `harw-fsutil`).
 harw-fsutil = { path = "../harw-fsutil" }
 # AW1-01: ChildLeaseRecord carries a TraceContext (frozen wire form,

@@ -1,49 +1,56 @@
 //! Durable, fenced job persistence for worker and MCP orchestration.
 //!
-//! The store owns filesystem locking and atomic record replacement; the pure
-//! lifecycle rules remain in `harw-job-runtime`. Every mutation verifies the
-//! current lease token, so an expired or restarted worker cannot overwrite a
-//! job reclaimed by another worker.
+//! Thin Harwness adapter over `harw-job-store` (Eco-Doc §33): the generic
+//! file mechanics — `records/<id>.json`, `locks/<id>.lock`, per-record fs4
+//! try-locks, atomic temp + rename + parent-directory fsync, quarantine of
+//! corrupt records, paginated listing — and the pure lease/fencing mutations
+//! (claim, renew, complete, cancel, reclaim, expiry) live there. This module
+//! keeps the Harwness semantics: the public request/response types, the
+//! trusted-actor provenance (`ApprovalActor`), approval sidecars under
+//! `jobs/approvals/`, `unblock`/`deny_blocked`/`retry`/`mark_ready`, and the
+//! redacted [`JobLifecycleEvent`] publication. Public API and on-disk layout
+//! and format are unchanged, so existing data stays readable.
 //!
-//! Jede Mutation (Claim, Renew, Complete, Cancel, Reconcile) synct nach dem
-//! atomaren `persist()` zusätzlich das Elternverzeichnis des Job-Datensatzes;
-//! ein hier verlorener Fortschritt hieße stillen Stillstand statt eines
-//! bloß veralteten Zustands.
+//! Every mutation verifies the current lease token and fencing epoch, so an
+//! expired or restarted worker cannot overwrite a job reclaimed by another
+//! worker. Jede Mutation (Claim, Renew, Complete, Cancel, Reconcile) synct
+//! nach dem atomaren Ersetzen zusätzlich das Verzeichnis des
+//! Job-Datensatzes; ein hier verlorener Fortschritt hieße stillen Stillstand
+//! statt eines bloß veralteten Zustands.
 //!
 //! A-STORE (G-020, F-179): ein defekter `*.json`-Datensatz legt `list` nicht
 //! mehr lahm — er wird (unter seinem Record-Lock) nach
-//! `<id>.json.corrupt-<ts>` verschoben und übersprungen. `admit` schreibt per
-//! `persist_noclobber`. `reconcile_expired` arbeitet seitenweise
+//! `<id>.json.corrupt-<ts>` verschoben und übersprungen. `admit` schreibt
+//! ohne Überschreiben (no-clobber). `reconcile_expired` arbeitet seitenweise
 //! (`limit`/`cursor`) und überspringt einzelne gesperrte/defekte Jobs, statt
 //! den ganzen Lauf abzubrechen. `unblock` führt einen `Blocked`-Job
 //! (Approval-Pause) nach `Ready` zurück. `mark_ready` gibt einen
 //! `Pending`-Job frei (`Pending → Ready`, idempotent für `Ready`); `reclaim`
 //! holt einen einzelnen `Running`-Job wie der Massen-Reclaim zurück.
 
-use std::fs::File;
-#[cfg(not(unix))]
-use std::fs::OpenOptions;
-use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use fs4::FileExt;
-use harw_fsutil::OpenMode;
 use harw_job_runtime::{
     JobCancellation, JobClaim, JobCompletion, JobOutcome, JobRuntimeError, JobState, Lease,
     LeaseToken, StoredJob,
 };
+use harw_job_store::{
+    Conflict, LEASE_EXPIRED_EXHAUSTED_REASON, RecordStore, StaleLease, StoreError, mechanics,
+    validate_id,
+};
 use harw_types::{ApprovalActor, WorkId};
 use jiff::{SignedDuration, Timestamp};
 use serde::{Deserialize, Serialize};
-use tempfile::NamedTempFile;
 
 use crate::error::{SessionStoreError, SessionStoreResult};
-use crate::store::{persist_noclobber, quarantine_file};
 
-/// Default create-mode für `create`-Aufrufe, identisch zum bisherigen Verhalten:
-/// `std::fs::OpenOptions` legt ohne `.mode(...)` mit `0o666` (abzüglich `umask`) an.
-const DEFAULT_CREATE_MODE: u32 = 0o666;
+/// Sidecar kind (`jobs/approvals/<id>.json`) of [`JobApproval`] records.
+const APPROVALS_KIND: &str = "approvals";
+
+/// Reason recorded when an explicit [`JobStore::reclaim`] exhausts the retry
+/// budget (unchanged wire text).
+const RECLAIM_EXHAUSTED_REASON: &str = "job reclaimed and retry budget is exhausted";
 
 /// Query for an eventually-consistent job list snapshot.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -220,94 +227,51 @@ impl JobStore {
     /// Persists a server-resolved job request. Existing work IDs are never
     /// overwritten, even if an earlier record has reached a terminal state.
     pub fn admit(&self, record: &StoredJob) -> SessionStoreResult<()> {
-        self.ensure_root()?;
-        let path = self.record_path(&record.job.id)?;
-        let lock = self.lock(&record.job.id)?;
-        let result = if path_exists_without_following_symlinks(&path, "job record")? {
-            Err(SessionStoreError::JobAlreadyExists {
-                work_id: record.job.id.clone(),
-            })
-        } else {
-            // F-179: atomar und ohne Überschreiben — ein Absturz hinterlässt nie
-            // eine halbe Datei, ein paralleler Eintrag wird nie ersetzt.
-            serde_json::to_vec(record)
-                .map_err(SessionStoreError::from)
-                .and_then(|bytes| match persist_noclobber(&path, &bytes) {
-                    Err(SessionStoreError::PersistTargetExists { .. }) => {
-                        Err(SessionStoreError::JobAlreadyExists {
-                            work_id: record.job.id.clone(),
-                        })
-                    }
-                    other => other,
-                })
-        };
-        unlock(lock, result)
+        // F-179: atomar und ohne Überschreiben — ein Absturz hinterlässt nie
+        // eine halbe Datei, ein paralleler Eintrag wird nie ersetzt.
+        self.store()?
+            .create(record)
+            .map_err(SessionStoreError::from)
     }
 
     pub fn get(&self, work_id: &WorkId) -> SessionStoreResult<StoredJob> {
-        let path = self.record_path(work_id)?;
-        self.read_record(&path, work_id)
+        validate_id(work_id.as_str())?;
+        match self.existing_store()? {
+            Some(store) => store
+                .load(work_id.as_str())
+                .map_err(SessionStoreError::from),
+            None => Err(SessionStoreError::JobNotFound {
+                work_id: work_id.clone(),
+            }),
+        }
     }
 
     /// Lists an eventually-consistent snapshot. Point mutations take a
     /// per-record lock; list readers deliberately do not serialize every job.
     pub fn list(&self, query: &JobListQuery) -> SessionStoreResult<JobPage> {
-        let records = self.records_dir();
-        if !records.exists() {
+        let Some(store) = self.existing_store()? else {
             return Ok(JobPage {
                 jobs: Vec::new(),
                 next_cursor: None,
             });
-        }
-        let mut jobs = Vec::new();
-        for entry in std::fs::read_dir(records)? {
-            let entry = match entry {
-                Ok(entry) => entry,
-                Err(error) => {
-                    tracing::warn!(error = %error, "job record entry unreadable; skipped");
-                    continue;
-                }
-            };
-            match entry.file_type() {
-                Ok(file_type) if file_type.is_symlink() => continue,
-                Ok(_) => {}
-                Err(error) => {
-                    tracing::warn!(
-                        path = %entry.path().display(),
-                        error = %error,
-                        "job record type unreadable; skipped"
-                    );
-                    continue;
-                }
-            }
-            let path = entry.path();
-            if path.extension().and_then(|extension| extension.to_str()) != Some("json") {
-                continue;
-            }
-            let Some(record) = self.load_listed_record(&path) else {
-                continue;
-            };
-            if query
-                .states
-                .as_ref()
-                .is_some_and(|states| !states.contains(&record.job.state))
-                || query.holder.as_ref().is_some_and(|holder| {
-                    record.lease.as_ref().map(|lease| &lease.holder) != Some(holder)
-                })
-                || query
-                    .cursor
+        };
+        let page = store.list(
+            query.cursor.as_ref().map(WorkId::as_str),
+            query.limit,
+            |record| {
+                query
+                    .states
                     .as_ref()
-                    .is_some_and(|cursor| record.job.id.as_str() <= cursor.as_str())
-            {
-                continue;
-            }
-            jobs.push(record);
-        }
-        jobs.sort_by(|left, right| left.job.id.as_str().cmp(right.job.id.as_str()));
-        let limit = query.limit.clamp(1, 100);
-        let next_cursor = (jobs.len() > limit).then(|| jobs[limit - 1].job.id.clone());
-        jobs.truncate(limit);
-        Ok(JobPage { jobs, next_cursor })
+                    .is_none_or(|states| states.contains(&record.job.state))
+                    && query.holder.as_ref().is_none_or(|holder| {
+                        record.lease.as_ref().map(|lease| &lease.holder) == Some(holder)
+                    })
+            },
+        )?;
+        Ok(JobPage {
+            jobs: page.records,
+            next_cursor: page.next_cursor.map(WorkId::from_str),
+        })
     }
 
     /// Atomically acquires a new fenced lease for a Ready, eligible job.
@@ -316,47 +280,15 @@ impl JobStore {
             return Err(SessionStoreError::InvalidJobLeaseTtl);
         }
         let (claim, revision) = self.with_locked(work_id, |record| {
-            if record.job.state != JobState::Ready {
-                return Err(SessionStoreError::JobNotClaimable {
-                    work_id: work_id.clone(),
-                    state: record.job.state,
-                });
-            }
-            if request.now < record.not_before {
-                return Err(SessionStoreError::JobNotEligible {
-                    work_id: work_id.clone(),
-                    not_before: record.not_before,
-                });
-            }
-            let epoch = record.lease_epoch.checked_add(1).ok_or_else(|| {
-                SessionStoreError::JobLeaseEpochExhausted {
-                    work_id: work_id.clone(),
-                }
-            })?;
             let nonce = WorkId::new().as_str().to_owned();
-            let lease = Lease::acquire_fenced(
-                work_id.clone(),
-                request.worker_id.clone(),
-                request.now,
+            let claim = mechanics::claim(
+                record,
+                &request.worker_id,
                 request.lease_ttl,
-                epoch,
+                request.now,
                 nonce,
-            )
-            .map_err(|error| map_job_error(work_id, error))?;
-            record.job.state = JobState::Running;
-            record.job.updated_at = request.now;
-            record.lease_epoch = epoch;
-            record.lease = Some(lease.clone());
-            record.revision = record.revision.saturating_add(1);
-            Ok((
-                JobClaim {
-                    job: record.job.clone(),
-                    scope: record.scope.clone(),
-                    token: lease.token(),
-                    lease,
-                },
-                record.revision,
-            ))
+            )?;
+            Ok((claim, record.revision))
         })?;
         self.publish(JobLifecycleEvent {
             work_id: claim.job.id.clone(),
@@ -369,15 +301,7 @@ impl JobStore {
     pub fn renew(&self, request: &RenewalRequest) -> SessionStoreResult<Lease> {
         let work_id = request.token.work_id.clone();
         self.with_locked(&work_id, |record| {
-            let renewed = {
-                let lease = current_lease(record, &request.token, request.now)?;
-                lease
-                    .renew(request.now)
-                    .map_err(|error| map_job_error(&work_id, error))?;
-                lease.clone()
-            };
-            record.revision = record.revision.saturating_add(1);
-            Ok(renewed)
+            mechanics::renew(record, &request.token, request.now).map_err(SessionStoreError::from)
         })
     }
 
@@ -393,27 +317,17 @@ impl JobStore {
             });
         }
         let (completion, revision) = self.with_locked(work_id, |record| {
-            if is_terminal(record.job.state) {
-                return Err(SessionStoreError::JobAlreadyTerminal {
-                    work_id: work_id.clone(),
-                    state: record.job.state,
-                });
-            }
-            current_lease(record, &request.token, request.completed_at)?;
-            let completion = JobCompletion {
-                completed_at: request.completed_at,
-                outcome: request.outcome.clone(),
-            };
-            record.job.state = outcome_state(&completion.outcome);
-            record.job.updated_at = request.completed_at;
-            record.lease = None;
-            record.completion = Some(completion.clone());
-            record.revision = record.revision.saturating_add(1);
+            let completion = mechanics::complete(
+                record,
+                &request.token,
+                request.completed_at,
+                request.outcome.clone(),
+            )?;
             Ok((completion, record.revision))
         })?;
         self.publish(JobLifecycleEvent {
             work_id: work_id.clone(),
-            state: outcome_state(&request.outcome),
+            state: mechanics::outcome_state(&request.outcome),
             revision,
         });
         Ok(completion)
@@ -433,45 +347,19 @@ impl JobStore {
             return Err(SessionStoreError::InvalidJobCancellationReason);
         }
         let transition = self.with_locked(work_id, |record| {
-            let previous_state = record.job.state;
-            if !matches!(
-                previous_state,
-                JobState::Pending | JobState::Ready | JobState::Running
-            ) {
-                return Err(SessionStoreError::JobNotCancellable {
-                    work_id: work_id.clone(),
-                    state: previous_state,
-                });
-            }
-
-            let prior_lease = record.lease.take();
-            if previous_state == JobState::Running {
-                record.lease_epoch = record.lease_epoch.checked_add(1).ok_or_else(|| {
-                    SessionStoreError::JobLeaseEpochExhausted {
-                        work_id: work_id.clone(),
-                    }
-                })?;
-            }
-            let completion = JobCompletion {
-                completed_at: request.cancelled_at,
-                outcome: JobOutcome::Cancelled {
+            let cancelled = mechanics::cancel(
+                record,
+                JobCancellation {
+                    cancelled_at: request.cancelled_at,
+                    cancelled_by: request.cancelled_by.clone(),
                     reason: request.reason.clone(),
                 },
-            };
-            record.job.state = JobState::Cancelled;
-            record.job.updated_at = request.cancelled_at;
-            record.completion = Some(completion.clone());
-            record.cancellation = Some(JobCancellation {
-                cancelled_at: request.cancelled_at,
-                cancelled_by: request.cancelled_by.clone(),
-                reason: request.reason.clone(),
-            });
-            record.revision = record.revision.saturating_add(1);
+            )?;
             Ok(CancellationTransition {
                 work_id: work_id.clone(),
-                previous_state,
-                prior_lease,
-                completion,
+                previous_state: cancelled.previous_state,
+                prior_lease: cancelled.prior_lease,
+                completion: cancelled.completion,
                 revision: record.revision,
             })
         })?;
@@ -568,15 +456,15 @@ impl JobStore {
     /// Lock-free read, like [`JobStore::list`]; may race a concurrent
     /// [`JobStore::unblock`] and observe either the old or the new sidecar.
     pub fn get_approval(&self, work_id: &WorkId) -> SessionStoreResult<Option<JobApproval>> {
-        let path = self.approval_path(work_id)?;
-        match read_regular_file(&path) {
-            Ok(bytes) => serde_json::from_slice::<JobApproval>(&bytes)
+        validate_id(work_id.as_str())?;
+        let Some(store) = self.existing_store()? else {
+            return Ok(None);
+        };
+        match store.read_sidecar(APPROVALS_KIND, work_id.as_str())? {
+            Some(bytes) => serde_json::from_slice::<JobApproval>(&bytes)
                 .map(Some)
                 .map_err(SessionStoreError::from),
-            Err(SessionStoreError::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => {
-                Ok(None)
-            }
-            Err(error) => Err(error),
+            None => Ok(None),
         }
     }
 
@@ -896,43 +784,12 @@ impl JobStore {
     ) -> SessionStoreResult<ExpiredJob> {
         let (reclaimed, state, revision) = self.with_locked(work_id, |record| {
             // Fehler im Closure werden nicht persistiert; die Reihenfolge der
-            // Mutationen ist deshalb unkritisch.
-            let prior_lease = record.lease.take();
-            let retry_scheduled_for = match record.job.record_failure(now) {
-                Ok(delay) => Some(
-                    now.checked_add(delay)
-                        .map_err(|error| map_job_error(work_id, JobRuntimeError::Time(error)))?,
-                ),
-                Err(JobRuntimeError::RetryExhausted { .. }) => {
-                    record.completion = Some(JobCompletion {
-                        completed_at: now,
-                        outcome: JobOutcome::Failed {
-                            reason: "job reclaimed and retry budget is exhausted".to_owned(),
-                        },
-                    });
-                    None
-                }
-                Err(error) => return Err(map_job_error(work_id, error)),
-            };
-            let Some(expired_lease) = prior_lease else {
-                return Err(SessionStoreError::JobRuntime {
-                    work_id: work_id.clone(),
-                    detail: "job is Running but carries no lease to reclaim".to_owned(),
-                });
-            };
-            record.lease_epoch = record.lease_epoch.checked_add(1).ok_or_else(|| {
-                SessionStoreError::JobLeaseEpochExhausted {
-                    work_id: work_id.clone(),
-                }
-            })?;
-            if let Some(not_before) = retry_scheduled_for {
-                record.not_before = not_before;
-            }
-            record.revision = record.revision.saturating_add(1);
+            // Mutationen in `mechanics::reclaim` ist deshalb unkritisch.
+            let reclaimed = mechanics::reclaim(record, now, RECLAIM_EXHAUSTED_REASON)?;
             tracing::info!(
                 work_id = %work_id,
                 reclaimed_by = ?reclaimed_by,
-                holder = %expired_lease.holder,
+                holder = %reclaimed.expired_lease.holder,
                 attempts = record.job.attempts,
                 max_attempts = record.job.retry.max_attempts,
                 state = ?record.job.state,
@@ -941,9 +798,9 @@ impl JobStore {
             Ok((
                 ExpiredJob {
                     work_id: work_id.clone(),
-                    expired_lease,
+                    expired_lease: reclaimed.expired_lease,
                     reclaimed_at: now,
-                    retry_scheduled_for,
+                    retry_scheduled_for: reclaimed.retry_scheduled_for,
                 },
                 record.job.state,
                 record.revision,
@@ -1024,49 +881,17 @@ impl JobStore {
         now: Timestamp,
     ) -> SessionStoreResult<Option<(ExpiredJob, JobState, u64)>> {
         self.with_locked(work_id, |record| {
-            let Some(lease) = record.lease.clone() else {
+            let Some(reclaimed) =
+                mechanics::expire_if_due(record, now, LEASE_EXPIRED_EXHAUSTED_REASON)?
+            else {
                 return Ok(None);
             };
-            if record.job.state != JobState::Running || !lease.is_expired(now) {
-                return Ok(None);
-            }
-            record.lease = None;
-            record.lease_epoch = record.lease_epoch.saturating_add(1);
-            let retry_scheduled_for =
-                match record.job.record_failure(now) {
-                    Ok(delay) => Some(now.checked_add(delay).map_err(|error| {
-                        SessionStoreError::JobRuntime {
-                            work_id: work_id.clone(),
-                            detail: error.to_string(),
-                        }
-                    })?),
-                    Err(JobRuntimeError::RetryExhausted { .. }) => {
-                        record.completion = Some(JobCompletion {
-                            completed_at: now,
-                            outcome: JobOutcome::Failed {
-                                reason: "worker lease expired and retry budget is exhausted"
-                                    .to_owned(),
-                            },
-                        });
-                        None
-                    }
-                    Err(error) => {
-                        return Err(SessionStoreError::JobRuntime {
-                            work_id: work_id.clone(),
-                            detail: error.to_string(),
-                        });
-                    }
-                };
-            if let Some(not_before) = retry_scheduled_for {
-                record.not_before = not_before;
-            }
-            record.revision = record.revision.saturating_add(1);
             Ok(Some((
                 ExpiredJob {
                     work_id: work_id.clone(),
-                    expired_lease: lease,
+                    expired_lease: reclaimed.expired_lease,
                     reclaimed_at: now,
-                    retry_scheduled_for,
+                    retry_scheduled_for: reclaimed.retry_scheduled_for,
                 },
                 record.job.state,
                 record.revision,
@@ -1074,155 +899,31 @@ impl JobStore {
         })
     }
 
-    // Reads one listed record lock-free; corrupt records are quarantined and skipped.
-    fn load_listed_record(&self, path: &Path) -> Option<StoredJob> {
-        let bytes = match read_regular_file(path) {
-            Ok(bytes) => bytes,
-            Err(SessionStoreError::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => {
-                return None;
-            }
-            Err(error) => {
-                tracing::warn!(
-                    path = %path.display(),
-                    error = %error,
-                    "job record unreadable; skipped"
-                );
-                return None;
-            }
-        };
-        let expected = path.file_stem().and_then(|stem| stem.to_str());
-        match serde_json::from_slice::<StoredJob>(&bytes) {
-            Ok(record) if Some(record.job.id.as_str()) == expected => Some(record),
-            Ok(_) => {
-                self.quarantine_listed_record(path, "record id does not match its canonical path");
-                None
-            }
-            Err(error) => {
-                self.quarantine_listed_record(path, &error.to_string());
-                None
-            }
-        }
-    }
-
-    // G-020: moves a corrupt listed record aside, but only under its record lock
-    // and only after re-confirming it is still corrupt.
-    fn quarantine_listed_record(&self, path: &Path, detail: &str) {
-        let Some(work_id) = path
-            .file_stem()
-            .and_then(|stem| stem.to_str())
-            .map(WorkId::from_str)
-            .filter(|work_id| safe_component(work_id).is_ok())
-        else {
-            tracing::warn!(
-                path = %path.display(),
-                detail,
-                "corrupt job record has an unsafe name; skipped without quarantine"
-            );
-            return;
-        };
-        if let Err(error) = self.ensure_root() {
-            tracing::warn!(path = %path.display(), error = %error, "job store root unavailable");
-            return;
-        }
-        let lock = match self.lock(&work_id) {
-            Ok(lock) => lock,
-            Err(error) => {
-                tracing::warn!(
-                    work_id = %work_id,
-                    error = %error,
-                    detail,
-                    "corrupt job record skipped; quarantine deferred"
-                );
-                return;
-            }
-        };
-        let result = match self.read_record(path, &work_id) {
-            Err(SessionStoreError::CorruptJob { .. }) => quarantine_file(path),
-            Ok(_) | Err(SessionStoreError::JobNotFound { .. }) => Ok(None),
-            Err(error) => Err(error),
-        };
-        match unlock(lock, result) {
-            Ok(Some(quarantine)) => tracing::warn!(
-                work_id = %work_id,
-                quarantine = %quarantine.display(),
-                detail,
-                "corrupt job record quarantined"
-            ),
-            Ok(None) => {}
-            Err(error) => tracing::warn!(
-                work_id = %work_id,
-                error = %error,
-                "corrupt job record could not be quarantined; skipped"
-            ),
-        }
-    }
-
+    // Lock → load → mutate → persist → fsync → unlock, delegated to
+    // `harw-job-store`. A corrupt record is quarantined under the lock and
+    // reported as `CorruptJob` (G-020).
     fn with_locked<T>(
         &self,
         work_id: &WorkId,
         operation: impl FnOnce(&mut StoredJob) -> SessionStoreResult<T>,
     ) -> SessionStoreResult<T> {
-        self.ensure_root()?;
-        let path = self.record_path(work_id)?;
-        let lock = self.lock(work_id)?;
-        let result = (|| {
-            let mut record = match self.read_record(&path, work_id) {
-                Ok(record) => record,
-                Err(error @ SessionStoreError::CorruptJob { .. }) => {
-                    // G-020: under the record lock the defective file is moved
-                    // aside, so it cannot poison later scans; the caller still
-                    // learns that this job is corrupt.
-                    match quarantine_file(&path) {
-                        Ok(Some(quarantine)) => tracing::warn!(
-                            work_id = %work_id,
-                            quarantine = %quarantine.display(),
-                            "corrupt job record quarantined"
-                        ),
-                        Ok(None) => {}
-                        Err(quarantine_error) => tracing::warn!(
-                            work_id = %work_id,
-                            error = %quarantine_error,
-                            "corrupt job record could not be quarantined"
-                        ),
-                    }
-                    return Err(error);
-                }
-                Err(error) => return Err(error),
-            };
-            let output = operation(&mut record)?;
-            persist_json(&path, &record)?;
-            Ok(output)
-        })();
-        unlock(lock, result)
+        self.store()?.update_locked(work_id.as_str(), operation)
     }
 
     fn publish(&self, event: JobLifecycleEvent) {
         self.event_sink.publish(event);
     }
 
-    fn ensure_root(&self) -> SessionStoreResult<()> {
-        std::fs::create_dir_all(self.records_dir())?;
-        std::fs::create_dir_all(self.locks_dir())?;
-        Ok(())
+    // Opens (creating if needed) the job root with its `records/` and
+    // `locks/` layout. The root is re-opened per operation, exactly like the
+    // former path-based code re-resolved it.
+    fn store(&self) -> SessionStoreResult<RecordStore<StoredJob>> {
+        RecordStore::create_ambient(&self.root).map_err(SessionStoreError::from)
     }
 
-    fn records_dir(&self) -> PathBuf {
-        self.root.join("records")
-    }
-
-    fn locks_dir(&self) -> PathBuf {
-        self.root.join("locks")
-    }
-
-    fn approvals_dir(&self) -> PathBuf {
-        self.root.join("approvals")
-    }
-
-    fn approval_path(&self, work_id: &WorkId) -> SessionStoreResult<PathBuf> {
-        Ok(self
-            .approvals_dir()
-            .join(safe_component(work_id)?)
-            .with_extension("json"))
+    // Opens the job root for reading; `None` if it was never created.
+    fn existing_store(&self) -> SessionStoreResult<Option<RecordStore<StoredJob>>> {
+        RecordStore::open_existing_ambient(&self.root).map_err(SessionStoreError::from)
     }
 
     /// Atomically writes (or overwrites) the [`JobApproval`] sidecar for
@@ -1230,255 +931,106 @@ impl JobStore {
     /// transition is already durable, so this failing never leaves the job
     /// record itself inconsistent — only the audit sidecar is affected.
     fn persist_approval(&self, approval: &JobApproval) -> SessionStoreResult<()> {
-        std::fs::create_dir_all(self.approvals_dir())?;
-        let path = self.approval_path(&approval.work_id)?;
-        persist_json(&path, approval)
+        let bytes = serde_json::to_vec(approval)?;
+        self.store()?
+            .write_sidecar(APPROVALS_KIND, approval.work_id.as_str(), &bytes)
+            .map_err(SessionStoreError::from)
     }
 
+    #[cfg(test)]
+    fn ensure_root(&self) -> SessionStoreResult<()> {
+        self.store().map(|_| ())
+    }
+
+    #[cfg(test)]
+    fn records_dir(&self) -> PathBuf {
+        self.root.join(harw_job_store::RECORDS_DIR)
+    }
+
+    #[cfg(test)]
+    fn locks_dir(&self) -> PathBuf {
+        self.root.join(harw_job_store::LOCKS_DIR)
+    }
+
+    #[cfg(test)]
     fn record_path(&self, work_id: &WorkId) -> SessionStoreResult<PathBuf> {
-        Ok(self
-            .records_dir()
-            .join(safe_component(work_id)?)
-            .with_extension("json"))
-    }
-
-    fn lock(&self, work_id: &WorkId) -> SessionStoreResult<File> {
-        let path = self
-            .locks_dir()
-            .join(safe_component(work_id)?)
-            .with_extension("lock");
-        reject_symlink(&path, "job lock")?;
-        let file = open_without_following_symlinks(
-            OpenMode {
-                read: true,
-                write: true,
-                create: true,
-                create_new: false,
-                truncate: false,
-                append: false,
-                mode: DEFAULT_CREATE_MODE,
-            },
-            &path,
-        )?;
-        FileExt::try_lock(&file).map_err(|error| match error {
-            fs4::TryLockError::WouldBlock => SessionStoreError::JobLockContended {
-                work_id: work_id.clone(),
-            },
-            fs4::TryLockError::Error(error) => SessionStoreError::Io(error),
-        })?;
-        Ok(file)
-    }
-
-    fn read_record(&self, path: &Path, work_id: &WorkId) -> SessionStoreResult<StoredJob> {
-        reject_symlink(path, "job record")?;
-        let open_result = open_without_following_symlinks(OpenMode::read_only(), path);
-        let mut file = open_result.map_err(|error| {
-            if matches!(
-                &error,
-                SessionStoreError::Io(io) if io.kind() == std::io::ErrorKind::NotFound
-            ) {
-                SessionStoreError::JobNotFound {
-                    work_id: work_id.clone(),
-                }
-            } else {
-                error
-            }
-        })?;
-        if !file.metadata()?.file_type().is_file() {
-            return Err(SessionStoreError::JobNotFound {
-                work_id: work_id.clone(),
-            });
-        }
-        let mut bytes = Vec::new();
-        file.read_to_end(&mut bytes)?;
-        let record: StoredJob =
-            serde_json::from_slice(&bytes).map_err(|error| SessionStoreError::CorruptJob {
-                work_id: work_id.clone(),
-                detail: error.to_string(),
-            })?;
-        if record.job.id != *work_id {
-            return Err(SessionStoreError::CorruptJob {
-                work_id: work_id.clone(),
-                detail: "record id does not match its canonical path".to_owned(),
-            });
-        }
-        Ok(record)
-    }
-}
-
-fn current_lease<'a>(
-    record: &'a mut StoredJob,
-    token: &LeaseToken,
-    now: Timestamp,
-) -> SessionStoreResult<&'a mut Lease> {
-    let work_id = record.job.id.clone();
-    let lease = record
-        .lease
-        .as_mut()
-        .ok_or_else(|| SessionStoreError::LeaseTokenMismatch {
-            work_id: work_id.clone(),
-        })?;
-    if !lease.matches_token(token) {
-        return Err(SessionStoreError::LeaseTokenMismatch { work_id });
-    }
-    if lease.is_expired(now) {
-        return Err(SessionStoreError::JobLeaseExpired {
-            work_id,
-            expired_at: lease.expires_at,
-        });
-    }
-    Ok(lease)
-}
-
-fn outcome_state(outcome: &JobOutcome) -> JobState {
-    match outcome {
-        JobOutcome::Succeeded { .. } => JobState::Completed,
-        JobOutcome::Failed { .. } => JobState::Failed,
-        JobOutcome::Cancelled { .. } => JobState::Cancelled,
-        JobOutcome::Blocked { .. } => JobState::Blocked,
+        let id = validate_id(work_id.as_str())?;
+        Ok(self.records_dir().join(id).with_extension("json"))
     }
 }
 
 fn map_job_error(work_id: &WorkId, error: JobRuntimeError) -> SessionStoreError {
-    match error {
-        JobRuntimeError::LeaseExpired { expired_at, .. } => SessionStoreError::JobLeaseExpired {
-            work_id: work_id.clone(),
-            expired_at,
+    SessionStoreError::from(mechanics::job_error(work_id.as_str(), error))
+}
+
+/// Maps the generic store error onto the job variants of
+/// [`SessionStoreError`]. `harw-job-store` is only used by this module, so
+/// every record id is a job [`WorkId`]; the mapping reproduces exactly the
+/// variants the former in-crate implementation returned.
+impl From<StoreError> for SessionStoreError {
+    fn from(error: StoreError) -> Self {
+        match error {
+            StoreError::NotFound { id } => Self::JobNotFound {
+                work_id: WorkId::from_str(id),
+            },
+            StoreError::AlreadyExists { id } => Self::JobAlreadyExists {
+                work_id: WorkId::from_str(id),
+            },
+            StoreError::Contended { id } => Self::JobLockContended {
+                work_id: WorkId::from_str(id),
+            },
+            StoreError::InvalidId { id } => Self::UnsafeJobPath(id),
+            StoreError::Corrupt { id, detail } => Self::CorruptJob {
+                work_id: WorkId::from_str(id),
+                detail,
+            },
+            StoreError::Conflict { id, conflict } => conflict_error(WorkId::from_str(id), conflict),
+            StoreError::StaleLease { id, reason } => {
+                let work_id = WorkId::from_str(id);
+                match reason {
+                    StaleLease::Missing | StaleLease::TokenMismatch => {
+                        Self::LeaseTokenMismatch { work_id }
+                    }
+                    StaleLease::Expired { expired_at } => Self::JobLeaseExpired {
+                        work_id,
+                        expired_at,
+                    },
+                }
+            }
+            StoreError::Encode { source, .. } => Self::Serde(source),
+            StoreError::Io(error) => Self::Io(error),
+            StoreError::Unsupported { operation, detail } => Self::Io(std::io::Error::new(
+                std::io::ErrorKind::Unsupported,
+                format!("{operation}: {detail}"),
+            )),
+        }
+    }
+}
+
+fn conflict_error(work_id: WorkId, conflict: Conflict) -> SessionStoreError {
+    match conflict {
+        Conflict::NotClaimable { state } => SessionStoreError::JobNotClaimable { work_id, state },
+        Conflict::NotEligible { not_before } => SessionStoreError::JobNotEligible {
+            work_id,
+            not_before,
         },
-        error => SessionStoreError::JobRuntime {
-            work_id: work_id.clone(),
-            detail: error.to_string(),
-        },
-    }
-}
-
-fn is_terminal(state: JobState) -> bool {
-    matches!(
-        state,
-        JobState::Completed | JobState::Failed | JobState::Cancelled
-    )
-}
-
-fn safe_component(work_id: &WorkId) -> SessionStoreResult<&str> {
-    let value = work_id.as_str();
-    if value.is_empty()
-        || !value
-            .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
-    {
-        return Err(SessionStoreError::UnsafeJobPath(value.to_owned()));
-    }
-    Ok(value)
-}
-
-// Reads a regular file without following a final symlink.
-fn read_regular_file(path: &Path) -> SessionStoreResult<Vec<u8>> {
-    let mut file = open_without_following_symlinks(OpenMode::read_only(), path)?;
-    if !file.metadata()?.file_type().is_file() {
-        return Err(SessionStoreError::Io(std::io::Error::new(
-            std::io::ErrorKind::InvalidInput,
-            "job record is not a regular file",
-        )));
-    }
-    let mut bytes = Vec::new();
-    file.read_to_end(&mut bytes)?;
-    Ok(bytes)
-}
-
-fn persist_json<T: Serialize>(path: &Path, value: &T) -> SessionStoreResult<()> {
-    let parent = path.parent().ok_or_else(|| {
-        SessionStoreError::Io(std::io::Error::other("job record path has no parent"))
-    })?;
-    let mut temp = NamedTempFile::new_in(parent)?;
-    serde_json::to_writer(temp.as_file_mut(), value)?;
-    temp.as_file().sync_all()?;
-    temp.persist(path)
-        .map_err(|error| SessionStoreError::Io(error.error))?;
-    // Das Elternverzeichnis wird gesynct, weil jede Job-Mutation (Claim,
-    // Renew, Complete, Cancel, Reconcile) über diese Funktion läuft: der
-    // atomare `persist()` ersetzt den Verzeichniseintrag, nicht nur den
-    // Dateiinhalt. Fällt dieser Eintrag nach einem Absturz auf die alte
-    // Version zurück, sieht ein Worker eine überholte Lease oder einen
-    // bereits abgeschlossenen Job wieder als offen an — aus verlorenem
-    // Fortschritt würde stiller Stillstand oder doppelte Bearbeitung.
-    sync_parent_directory(parent)?;
-    Ok(())
-}
-
-/// Synct das Elternverzeichnis eines soeben angelegten oder ersetzten
-/// Job-Datensatzes. Ein `sync_all()` auf der Datei sichert nur ihren Inhalt;
-/// der Verzeichniseintrag, der sie überhaupt auffindbar macht, liegt im
-/// Verzeichnis-Inode und muss separat gesynct werden — sonst kann eine
-/// vollständig geschriebene Datei nach einem Stromausfall trotzdem nicht
-/// existieren. Ein Verzeichnis wird zum Lesen geöffnet (`File::open`), nicht
-/// zum Schreiben; `sync_all()` erfasst dabei genau den Verzeichniseintrag.
-/// Ein Sync-Fehler wird propagiert statt verschluckt, exakt wie in
-/// `store.rs::sync_parent_directory`.
-// Die eine Fassung liegt in `crate::durability`; sie stand vorher in fünf
-// Dateien byte-gleich. Warum ein Eltern-fsync nötig ist, steht dort.
-use crate::durability::sync_parent_directory;
-
-fn path_exists_without_following_symlinks(
-    path: &Path,
-    description: &str,
-) -> SessionStoreResult<bool> {
-    match std::fs::symlink_metadata(path) {
-        Ok(metadata) if metadata.file_type().is_symlink() => Err(symlink_error(path, description)),
-        Ok(_) => Ok(true),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
-        Err(error) => Err(SessionStoreError::Io(error)),
-    }
-}
-
-fn reject_symlink(path: &Path, description: &str) -> SessionStoreResult<()> {
-    path_exists_without_following_symlinks(path, description).map(|_| ())
-}
-
-/// Öffnet `path` ohne dem letzten Pfadglied als Symlink zu folgen
-/// (F-006: das architekturabhängig falsche `O_NOFOLLOW` wurde durch
-/// `harw_fsutil::open_nofollow` ersetzt, das die Konstante über
-/// `rustix::fs::OFlags::NOFOLLOW` plattformkorrekt bezieht).
-fn open_without_following_symlinks(mode: OpenMode, path: &Path) -> SessionStoreResult<File> {
-    #[cfg(unix)]
-    {
-        harw_fsutil::open_nofollow(path, mode).map_err(SessionStoreError::Io)
-    }
-    #[cfg(not(unix))]
-    {
-        let mut options = OpenOptions::new();
-        options
-            .read(mode.read)
-            .write(mode.write || mode.append)
-            .create(mode.create)
-            .create_new(mode.create_new)
-            .truncate(mode.truncate)
-            .append(mode.append);
-        options.open(path).map_err(SessionStoreError::Io)
-    }
-}
-
-fn symlink_error(path: &Path, description: &str) -> SessionStoreError {
-    SessionStoreError::Io(std::io::Error::new(
-        std::io::ErrorKind::InvalidInput,
-        format!(
-            "{description} must not be a symbolic link: {}",
-            path.display()
-        ),
-    ))
-}
-
-fn unlock<T>(lock: File, result: SessionStoreResult<T>) -> SessionStoreResult<T> {
-    let unlock = FileExt::unlock(&lock).map_err(SessionStoreError::Io);
-    match (result, unlock) {
-        (Err(error), _) => Err(error),
-        (Ok(_), Err(error)) => Err(error),
-        (Ok(value), Ok(())) => Ok(value),
+        Conflict::AlreadyTerminal { state } => {
+            SessionStoreError::JobAlreadyTerminal { work_id, state }
+        }
+        Conflict::NotCancellable { state } => {
+            SessionStoreError::JobNotCancellable { work_id, state }
+        }
+        Conflict::InvalidLeaseTtl => SessionStoreError::InvalidJobLeaseTtl,
+        Conflict::EmptyReason => SessionStoreError::InvalidJobCancellationReason,
+        Conflict::EpochExhausted => SessionStoreError::JobLeaseEpochExhausted { work_id },
+        Conflict::Rejected { detail } => SessionStoreError::JobRuntime { work_id, detail },
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::durability::sync_parent_directory;
     use crate::test_support::{TestError, TestResult, ctx};
     use harw_job_runtime::{Budget, Job, JobKind, RetryPolicy};
     use harw_observe::TraceContext;

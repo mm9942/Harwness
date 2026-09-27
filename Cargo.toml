@@ -43,7 +43,15 @@ members = [
     "harw-session-store",
     "harw-memory",
     "harw-core-bridge",
+    "harw-job-core",
+    "harw-job-darwin",
+    "harw-job-exec",
+    "harw-job-linux",
     "harw-job-runtime",
+    "harw-job-store",
+    "harw-job-tokio",
+    "harw-job-executor-bwrap",
+    "harw-job",
     "harw-knowledge",
     "harw-channel",
     "harw-channel-telegram",
@@ -73,8 +81,7 @@ members = [
     "harw-completions",
     "harw",
     # === Ausbauprogramm AW0–AW7: Telemetrie, Kontext, Lens, Control Plane ===
-    # (DoD ist ausgelagert nach `dod/` — eigener Cargo-Workspace, eigene
-    # Builddomäne; siehe `exclude` unten und `dod/Cargo.toml`.)
+    # (DoD liegt unter `dod/crates/` — eigener Block am Ende der Liste.)
     "harw-observe",
     "harw-observe-file",
     "harw-observe-prom",
@@ -98,15 +105,49 @@ members = [
     "harw-runtime",
     "harwness-sdk",
     "xtask",
+    # DoD domain (peer security domain, see docs/planning/50-dod-integration).
+    # Bis PL-60 ein eigener, verschachtelter Cargo-Workspace unter `dod/`
+    # (eigenes Lockfile, `exclude = ["dod"]` hier). Seit PL-60 gewöhnliche
+    # Members dieses Workspace: ein Lockfile, eine `[workspace.package]`-,
+    # `[workspace.dependencies]`- und Lint-Vorgabe. Membership ist
+    # Build-Governance, keine Abhängigkeitserlaubnis: die TCB-Grenzen von
+    # Warden/Sentinel/Probes erzwingen die `xtask`-Gates (`edges`,
+    # `privileges`, `warden-*`), nicht die Workspace-Grenze. Explizit
+    # aufgezählt, kein Glob (Architektur §19). Siehe
+    # `docs/architecture/dod-workspace-merge-plan.md`.
+    "dod/crates/harw-dod",
+    "dod/crates/harw-dod-authlog",
+    "dod/crates/harw-dod-blockio",
+    "dod/crates/harw-dod-bpf",
+    "dod/crates/harw-dod-cap",
+    "dod/crates/harw-dod-cgroup",
+    "dod/crates/harw-dod-config",
+    "dod/crates/harw-dod-cpu",
+    "dod/crates/harw-dod-escalate",
+    "dod/crates/harw-dod-fixtures",
+    "dod/crates/harw-dod-flow",
+    "dod/crates/harw-dod-fsmon",
+    "dod/crates/harw-dod-gpu",
+    "dod/crates/harw-dod-listener",
+    "dod/crates/harw-dod-memory",
+    "dod/crates/harw-dod-netcounters",
+    "dod/crates/harw-dod-netlink",
+    "dod/crates/harw-dod-netpolicy",
+    "dod/crates/harw-dod-procmon",
+    "dod/crates/harw-dod-readfs",
+    "dod/crates/harw-dod-rules",
+    "dod/crates/harw-dod-scanreport",
+    "dod/crates/harw-dod-sentinel",
+    "dod/crates/harw-dod-signals",
+    "dod/crates/harw-dod-thermal",
+    "dod/crates/harw-dod-warden",
+    "dod/crates/harw-dod-warden-proto",
+    "dod/crates/harw-dod-workspace",
+    "dod/crates/harw-probe-bpf",
+    "dod/crates/harw-probe-fs",
+    "dod/crates/harw-sentinel",
+    "dod/crates/harw-warden",
 ]
-# DoD ist ein eigener Cargo-Workspace in derselben Repository-Domäne: eigener
-# Lockfile, eigene `workspace.package`-/`workspace.dependencies`-Vorgaben.
-# `exclude` verhindert, dass Cargo `dod/` versehentlich als Teil des
-# Produkt-Workspace behandelt (z. B. bei Glob-Expansion oder Metadata-Läufen).
-# Pfad-Abhängigkeiten Produkt → DoD (`harw-knowledge`, `harw-plan-bridge`,
-# `harw-core-bridge`, `harw-macros` [dev]) lösen über `dod/crates/…` auf und
-# sind zulässig; DoD-Mitgliedschaft im Produkt-Workspace ist es nicht.
-exclude = ["dod"]
 
 [workspace.package]
 version = "0.3.0"
@@ -148,9 +189,17 @@ tracing = "0.1.44"
 
 # Syscalls ohne libc: fanotify im Dateisystem-Wächter.
 rustix = "1.1.4"
+procfs = { version = "0.18.0", default-features = false }
+landlock = "0.4.7"
+cap-std = "3.4.6"
 
 # Verzeichniseinbettung: Registry-Definitionen als Dateien statt als Rust-Liste.
 include_dir = "0.7.4"
+
+# Versionsvergleich (Security-Signal, kein Stringvergleich). Aus dem
+# früheren `dod/Cargo.toml` übernommen (PL-60); Konsumenten:
+# `harw-dod-rules`, `harw-dod-sentinel`, `harw-dod-workspace`.
+semver = { version = "1.0.28", features = ["serde"] }
 
 # `forbid` statt `deny`: nicht per `#[allow]` überstimmbar. Die Regel stand
 # vorher als Attribut in jeder Crate einzeln und fehlte deshalb in acht von

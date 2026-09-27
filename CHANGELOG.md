@@ -6,6 +6,16 @@ Semantic Versioning within the 0.x pre-release range.
 
 ## [Unreleased]
 
+### One Cargo workspace (PL-60)
+
+- The DoD crates under `dod/crates/` are now members of the root Cargo
+  workspace. `dod/Cargo.toml` (the nested `[workspace]`) and `dod/Cargo.lock`
+  are gone; the root `Cargo.lock` is the single resolution record, and
+  `exclude = ["dod"]` was removed. `semver` moved into the root
+  `[workspace.dependencies]`. CI, `dod/Makefile`, `xtask gates` and the docs
+  build DoD from the root with `-p` selections. See
+  `docs/architecture/dod-workspace-merge-plan.md`.
+
 ### Publication cleanup
 
 Preparing the repository for its first public release under

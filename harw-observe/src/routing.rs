@@ -575,7 +575,7 @@ fn best_protected_export<'a>(
 /// Byte ist `'x'`, kein `'.'` — der Vergleich scheitert schon an
 /// `starts_with`) noch auf `"security_total"` (kein Punkt an der Grenze).
 /// Spiegelbildlich zur Suffix-Grenzprüfung in
-/// `harw_authority::EgressTarget::matches_host`/`host_matches` — siehe
+/// `harw-authority`s `EgressTarget::matches_host`/`host_matches` — siehe
 /// Moduldoc, Abschnitt „Warum die Punktgrenzen-Prüfung hier ein zweites Mal
 /// steht", für die Begründung, warum diese Crate keine Abhängigkeit auf
 /// `harw-sandbox` zieht, sondern dieselbe Regel hier eigenständig umsetzt.

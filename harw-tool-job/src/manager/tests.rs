@@ -3,7 +3,7 @@
 use super::*;
 use crate::event::JobEvent;
 use crate::logs::{LogQuery, read_log};
-use crate::procfs::is_same_process_alive;
+use crate::procfs::test_process_alive;
 use crate::test_support::{Env, TestError, TestResult, ctx, eventually, request};
 use std::time::Duration;
 use tokio::io::AsyncWriteExt;
@@ -115,7 +115,7 @@ async fn test_stop_kills_whole_process_group() -> TestResult {
     let child_pid = child_pid
         .filter(|_| found)
         .ok_or(TestError::Missing("child pid"))?;
-    assert!(is_same_process_alive(child_pid, None));
+    assert!(test_process_alive(child_pid, None));
 
     let stopped = env
         .manager
@@ -124,7 +124,7 @@ async fn test_stop_kills_whole_process_group() -> TestResult {
         .map_err(ctx("stop"))?;
     assert_eq!(stopped.meta.state, JobState::Stopped);
 
-    let dead = eventually(LIMIT, || !is_same_process_alive(child_pid, None)).await;
+    let dead = eventually(LIMIT, || !test_process_alive(child_pid, None)).await;
     assert!(dead, "child {child_pid} of the job survived job.stop");
     Ok(())
 }
@@ -357,7 +357,7 @@ async fn test_detach_keeps_process_and_operator_can_stop_it() -> TestResult {
         .map_err(ctx("status"))?;
     assert_eq!(status.meta.state, JobState::Detached);
     assert!(status.meta.detached);
-    assert!(is_same_process_alive(pid, status.meta.proc_start_ticks));
+    assert!(test_process_alive(pid, status.meta.proc_start_ticks));
 
     let stopped = env
         .manager
@@ -365,11 +365,20 @@ async fn test_detach_keeps_process_and_operator_can_stop_it() -> TestResult {
         .await
         .map_err(ctx("stop"))?;
     assert_eq!(stopped.meta.state, JobState::Stopped);
-    assert!(!is_same_process_alive(pid, stopped.meta.proc_start_ticks));
+    assert!(!test_process_alive(pid, stopped.meta.proc_start_ticks));
     Ok(())
 }
 
 fn previous_meta(id: &str, pid: u32, ticks: Option<u64>) -> TestResult<JobMeta> {
+    previous_meta_with(id, pid, ticks, None)
+}
+
+fn previous_meta_with(
+    id: &str,
+    pid: u32,
+    ticks: Option<u64>,
+    identity: Option<JobProcessIdentity>,
+) -> TestResult<JobMeta> {
     Ok(JobMeta {
         version: META_VERSION,
         job_id: JobId::parse(id).ok_or(TestError::Missing("job id"))?,
@@ -380,6 +389,7 @@ fn previous_meta(id: &str, pid: u32, ticks: Option<u64>) -> TestResult<JobMeta> 
         state: JobState::Running,
         pid: Some(pid),
         proc_start_ticks: ticks,
+        identity,
         executed_on_host: true,
         harw_instance: "harw-old".to_owned(),
         owner: JobOwner::new("old-session", Vec::new()),
@@ -398,12 +408,13 @@ fn previous_meta(id: &str, pid: u32, ticks: Option<u64>) -> TestResult<JobMeta> 
     })
 }
 
+#[cfg(target_os = "linux")]
 #[tokio::test]
 async fn test_reload_marks_previous_jobs_detached_or_unknown() -> TestResult {
     let env = Env::new()?;
     let jobs_dir = env.state_dir().join("jobs");
     let own_pid = std::process::id();
-    let own_ticks = process_start_ticks(own_pid);
+    let own_ticks = crate::procfs::test_start_ticks(own_pid);
     for meta in [
         previous_meta("job-old-alive", own_pid, own_ticks)?,
         previous_meta("job-old-gone", u32::MAX / 2, Some(1))?,
@@ -431,6 +442,385 @@ async fn test_reload_marks_previous_jobs_detached_or_unknown() -> TestResult {
     let on_disk = read_meta(&jobs_dir.join("job-old-gone")).ok_or(TestError::Missing("meta"))?;
     assert_eq!(on_disk.state, JobState::Unknown);
     Ok(())
+}
+
+#[cfg(target_os = "linux")]
+mod recovery {
+    //! Wiederherstellung nach einem Neustart (Job-Runtime-Doc §21.4): ein
+    //! neuer [`JobManager`] über demselben Zustandsverzeichnis.
+
+    use super::*;
+    use crate::event::RecordingNotifier;
+    use crate::procfs::capture_identity;
+    use std::os::unix::process::CommandExt as _;
+
+    /// Ein eigener, fremder Prozess (`sleep 30`, eigene Gruppe), der am Ende
+    /// sicher beendet und eingesammelt wird.
+    struct Sleeper(std::process::Child);
+
+    impl Sleeper {
+        fn spawn() -> TestResult<Self> {
+            let child = std::process::Command::new("sleep")
+                .arg("30")
+                .process_group(0)
+                .spawn()
+                .map_err(ctx("spawn sleep"))?;
+            Ok(Self(child))
+        }
+
+        fn pid(&self) -> u32 {
+            self.0.id()
+        }
+
+        fn identity(&self) -> TestResult<JobProcessIdentity> {
+            capture_identity(self.pid()).ok_or(TestError::Missing("sleeper identity"))
+        }
+    }
+
+    impl Drop for Sleeper {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+
+    fn write_previous(env: &Env, meta: &JobMeta) -> TestResult {
+        let dir = env.state_dir().join("jobs").join(meta.job_id.as_str());
+        fs::create_dir_all(&dir).map_err(ctx("create old job dir"))?;
+        write_meta(&dir, meta).map_err(ctx("write old meta"))
+    }
+
+    fn restart(env: &Env) -> TestResult<(Arc<JobManager>, Arc<RecordingNotifier>)> {
+        let recorder = Arc::new(RecordingNotifier::default());
+        let manager = JobManager::new(
+            env.manager.config().clone(),
+            Arc::clone(&recorder) as Arc<dyn JobNotifier>,
+        )
+        .map_err(ctx("restart"))?;
+        Ok((manager, recorder))
+    }
+
+    fn job_id(raw: &str) -> TestResult<JobId> {
+        JobId::parse(raw).ok_or(TestError::Missing("job id"))
+    }
+
+    fn state_of(manager: &JobManager, id: &JobId) -> TestResult<JobState> {
+        Ok(manager
+            .status(id, Caller::Operator)
+            .map_err(ctx("status"))?
+            .meta
+            .state)
+    }
+
+    fn warnings(recorder: &RecordingNotifier, id: &JobId) -> Vec<String> {
+        recorder
+            .notifications()
+            .into_iter()
+            .filter_map(|notification| match notification.event {
+                JobEvent::Warning {
+                    job_id, message, ..
+                } if &job_id == id => Some(message),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn v2_meta(id: &str, pid: u32, identity: JobProcessIdentity) -> TestResult<JobMeta> {
+        previous_meta_with(id, pid, Some(identity.start_ticks), Some(identity))
+    }
+
+    #[tokio::test]
+    async fn test_alive_after_restart_is_detached_and_stoppable() -> TestResult {
+        let env = Env::new()?;
+        let sleeper = Sleeper::spawn()?;
+        let pid = sleeper.pid();
+        let identity = sleeper.identity()?;
+        write_previous(&env, &v2_meta("job-prev-alive", pid, identity.clone())?)?;
+
+        let (manager, recorder) = restart(&env)?;
+        let id = job_id("job-prev-alive")?;
+        assert_eq!(state_of(&manager, &id)?, JobState::Detached);
+        assert!(warnings(&recorder, &id).is_empty());
+
+        let stopped = manager
+            .stop(&id, Caller::Operator, JobSignal::Term)
+            .await
+            .map_err(ctx("stop"))?;
+        assert_eq!(stopped.meta.state, JobState::Stopped);
+        assert!(stopped.meta.stop_requested);
+        assert!(!test_process_alive(pid, Some(identity.start_ticks)));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_own_job_survives_restart_after_exec_and_is_stoppable() -> TestResult {
+        // The shell `exec`s `sleep`: the leader's program changes after the
+        // start. `detach_all` records the last observation, so the next
+        // session still proves the identity (exe included) and may stop it.
+        let env = Env::new()?;
+        let prepared = env.prepare("exec sleep 30").await?;
+        let started = env
+            .manager
+            .start(request("exec", "agent-a", &[]), prepared)
+            .map_err(ctx("start"))?;
+        let id = started.meta.job_id.clone();
+        let pid = started.meta.pid.ok_or(TestError::Missing("pid"))?;
+        let shell = fs::canonicalize("/bin/sh")
+            .map_err(ctx("resolve /bin/sh"))?
+            .display()
+            .to_string();
+        let mut current = None;
+        let execed = eventually(LIMIT, || {
+            current = capture_identity(pid)
+                .and_then(|identity| identity.executable)
+                .filter(|exe| exe != &shell);
+            current.is_some()
+        })
+        .await;
+        let current = current
+            .filter(|_| execed)
+            .ok_or(TestError::Missing("job did not exec sleep"))?;
+
+        assert_eq!(env.manager.detach_all().detached, 1);
+        let on_disk = read_meta(&started.log_dir).ok_or(TestError::Missing("meta"))?;
+        assert_eq!(on_disk.version, META_VERSION);
+        let persisted = on_disk
+            .identity
+            .as_ref()
+            .and_then(|identity| identity.executable.clone())
+            .ok_or(TestError::Missing("persisted exe"))?;
+        assert_eq!(persisted, current);
+
+        let (manager, _recorder) = restart(&env)?;
+        assert_eq!(state_of(&manager, &id)?, JobState::Detached);
+        let stopped = manager
+            .stop(&id, Caller::Agent("agent-a"), JobSignal::Term)
+            .await
+            .map_err(ctx("stop"))?;
+        assert_eq!(stopped.meta.state, JobState::Stopped);
+        assert!(!test_process_alive(pid, on_disk.proc_start_ticks));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_exited_while_down_is_unknown() -> TestResult {
+        let env = Env::new()?;
+        let mut sleeper = Sleeper::spawn()?;
+        let pid = sleeper.pid();
+        let identity = sleeper.identity()?;
+        sleeper.0.kill().map_err(ctx("kill sleeper"))?;
+        sleeper.0.wait().map_err(ctx("reap sleeper"))?;
+        write_previous(&env, &v2_meta("job-prev-gone", pid, identity)?)?;
+
+        let (manager, _recorder) = restart(&env)?;
+        let id = job_id("job-prev-gone")?;
+        assert_eq!(state_of(&manager, &id)?, JobState::Unknown);
+        let on_disk = read_meta(&env.state_dir().join("jobs").join(id.as_str()))
+            .ok_or(TestError::Missing("meta"))?;
+        assert_eq!(on_disk.state, JobState::Unknown);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_reused_pid_is_never_signalled() -> TestResult {
+        // The PID belongs to a live, unrelated process; the persisted start
+        // time is someone else's. Neither reload nor stop may touch it.
+        let env = Env::new()?;
+        let sleeper = Sleeper::spawn()?;
+        let pid = sleeper.pid();
+        let real = sleeper.identity()?;
+        let recorded = JobProcessIdentity {
+            start_ticks: real.start_ticks.saturating_sub(1),
+            ..real.clone()
+        };
+        write_previous(&env, &v2_meta("job-prev-reused", pid, recorded)?)?;
+
+        let (manager, recorder) = restart(&env)?;
+        let id = job_id("job-prev-reused")?;
+        assert_eq!(state_of(&manager, &id)?, JobState::Unknown);
+        let messages = warnings(&recorder, &id);
+        assert_eq!(messages.len(), 1, "{messages:?}");
+        assert!(
+            messages[0].contains("reused, not controlled"),
+            "{messages:?}"
+        );
+
+        let after = manager
+            .stop(&id, Caller::Operator, JobSignal::Kill)
+            .await
+            .map_err(ctx("stop"))?;
+        assert_eq!(after.meta.state, JobState::Unknown);
+        assert!(!after.meta.stop_requested);
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert!(
+            test_process_alive(pid, Some(real.start_ticks)),
+            "unrelated process {pid} was signalled"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_v1_meta_still_loads_and_controls() -> TestResult {
+        let env = Env::new()?;
+        let sleeper = Sleeper::spawn()?;
+        let pid = sleeper.pid();
+        let ticks = sleeper.identity()?.start_ticks;
+        let jobs_dir = env.state_dir().join("jobs");
+        for (id, ticks_field) in [
+            ("job-v1", format!(r#""proc_start_ticks":{ticks},"#)),
+            ("job-v1-noticks", String::new()),
+        ] {
+            let dir = jobs_dir.join(id);
+            fs::create_dir_all(&dir).map_err(ctx("create v1 dir"))?;
+            let json = format!(
+                r#"{{"version":1,"job_id":"{id}","name":"{id}","command":"sleep 30",
+                   "state":"running","pid":{pid},{ticks_field}"executed_on_host":true,
+                   "harw_instance":"harw-old","owner":{{"session":"old"}},
+                   "created_at":"2026-01-01T00:00:00Z","notify_every_secs":60}}"#
+            );
+            fs::write(dir.join(META_FILE), json).map_err(ctx("write v1 meta"))?;
+        }
+
+        let (manager, recorder) = restart(&env)?;
+        // Without a start time a PID alone is no proof: never controlled.
+        let no_ticks = job_id("job-v1-noticks")?;
+        assert_eq!(state_of(&manager, &no_ticks)?, JobState::Unknown);
+        assert_eq!(warnings(&recorder, &no_ticks).len(), 1);
+        assert!(test_process_alive(pid, Some(ticks)));
+
+        let v1 = job_id("job-v1")?;
+        let status = manager
+            .status(&v1, Caller::Operator)
+            .map_err(ctx("status"))?;
+        assert_eq!(status.meta.state, JobState::Detached);
+        assert_eq!(status.meta.version, 1);
+        assert_eq!(
+            status
+                .meta
+                .process_identity()
+                .map(|identity| identity.executable),
+            Some(None)
+        );
+        let stopped = manager
+            .stop(&v1, Caller::Operator, JobSignal::Term)
+            .await
+            .map_err(ctx("stop v1"))?;
+        assert_eq!(stopped.meta.state, JobState::Stopped);
+        assert!(!test_process_alive(pid, Some(ticks)));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_identity_mismatch_on_stop_is_refused() -> TestResult {
+        let env = Env::new()?;
+        let sleeper = Sleeper::spawn()?;
+        let pid = sleeper.pid();
+        let identity = sleeper.identity()?;
+        write_previous(&env, &v2_meta("job-prev-swap", pid, identity.clone())?)?;
+        let (manager, recorder) = restart(&env)?;
+        let id = job_id("job-prev-swap")?;
+        assert_eq!(state_of(&manager, &id)?, JobState::Detached);
+
+        // Between reload and stop the PID "changes owner": simulated by a
+        // different persisted program.
+        let entry = lock(&manager.jobs)
+            .get(&id)
+            .cloned()
+            .ok_or(TestError::Missing("entry"))?;
+        lock(&entry.state).meta.identity = Some(JobProcessIdentity {
+            executable: Some("/nonexistent/other-program".to_owned()),
+            ..identity.clone()
+        });
+
+        let after = manager
+            .stop(&id, Caller::Operator, JobSignal::Kill)
+            .await
+            .map_err(ctx("stop"))?;
+        assert_eq!(after.meta.state, JobState::Unknown);
+        assert!(!after.meta.stop_requested);
+        assert!(test_process_alive(pid, Some(identity.start_ticks)));
+        let messages = warnings(&recorder, &id);
+        assert!(
+            messages
+                .iter()
+                .any(|message| message.contains("sent no signal")),
+            "{messages:?}"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_detached_own_job_stop_kills_grandchildren() -> TestResult {
+        let env = Env::new()?;
+        let prepared = env
+            .prepare("(trap '' TERM; exec sleep 30) & echo $!; wait")
+            .await?;
+        let started = env
+            .manager
+            .start(request("group", "agent-a", &[]), prepared)
+            .map_err(ctx("start"))?;
+        let id = started.meta.job_id.clone();
+        let stdout = started.log_dir.join(STDOUT_LOG);
+        let mut grandchild = None;
+        let found = eventually(LIMIT, || {
+            grandchild = read_all(&stdout).ok().and_then(|lines| {
+                lines
+                    .first()
+                    .and_then(|line| line.trim().parse::<u32>().ok())
+            });
+            grandchild.is_some()
+        })
+        .await;
+        let grandchild = grandchild
+            .filter(|_| found)
+            .ok_or(TestError::Missing("grandchild pid"))?;
+
+        assert_eq!(env.manager.detach_all().detached, 1);
+        let stopped = env
+            .manager
+            .stop(&id, Caller::Operator, JobSignal::Term)
+            .await
+            .map_err(ctx("stop"))?;
+        assert_eq!(stopped.meta.state, JobState::Stopped);
+        let dead = eventually(LIMIT, || !test_process_alive(grandchild, None)).await;
+        assert!(
+            dead,
+            "grandchild {grandchild} survived job.stop of a detached job"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_stale_tmp_and_corrupt_files_are_ignored() -> TestResult {
+        let env = Env::new()?;
+        let jobs_dir = env.state_dir().join("jobs");
+        let mut done = previous_meta("job-done", u32::MAX / 2, Some(1))?;
+        done.state = JobState::Succeeded;
+        write_previous(&env, &done)?;
+        let done_dir = jobs_dir.join("job-done");
+        fs::write(done_dir.join(format!("{META_FILE}.tmp")), b"{ half-written")
+            .map_err(ctx("stale tmp"))?;
+        let tmp_only = jobs_dir.join("job-tmp-only");
+        fs::create_dir_all(&tmp_only).map_err(ctx("tmp-only dir"))?;
+        fs::write(tmp_only.join(format!("{META_FILE}.tmp")), b"{}").map_err(ctx("tmp only"))?;
+        let corrupt = jobs_dir.join("job-corrupt");
+        fs::create_dir_all(&corrupt).map_err(ctx("corrupt dir"))?;
+        fs::write(corrupt.join(META_FILE), b"not json").map_err(ctx("corrupt meta"))?;
+        fs::write(jobs_dir.join("stale.lock"), b"").map_err(ctx("stray lock"))?;
+
+        let (manager, _recorder) = restart(&env)?;
+        let ids: Vec<String> = manager
+            .list(Caller::Operator)
+            .into_iter()
+            .map(|status| status.meta.job_id.to_string())
+            .collect();
+        assert_eq!(ids, vec!["job-done".to_owned()]);
+        assert_eq!(
+            state_of(&manager, &job_id("job-done")?)?,
+            JobState::Succeeded
+        );
+        Ok(())
+    }
 }
 
 #[tokio::test]
@@ -560,7 +950,7 @@ async fn test_start_piped_stop_kills_process_group() -> TestResult {
         .trim()
         .parse()
         .map_err(|_| TestError::Unexpected(format!("bad pid line: {line}")))?;
-    assert!(is_same_process_alive(child_pid, None));
+    assert!(test_process_alive(child_pid, None));
 
     let stopped = env
         .manager
@@ -569,7 +959,7 @@ async fn test_start_piped_stop_kills_process_group() -> TestResult {
         .map_err(ctx("stop"))?;
     assert_eq!(stopped.meta.state, JobState::Stopped);
 
-    let dead = eventually(LIMIT, || !is_same_process_alive(child_pid, None)).await;
+    let dead = eventually(LIMIT, || !test_process_alive(child_pid, None)).await;
     assert!(dead, "child {child_pid} of the piped job survived job.stop");
     Ok(())
 }

@@ -9,7 +9,7 @@ use harw_types::WorkId;
 use crate::budget::BudgetKind;
 use crate::job::JobState;
 
-/// Central error type for `harw-job-runtime`.
+/// Central error type of the job governance primitives.
 ///
 /// The `HarwError` derive additionally emits `pub type JobRuntimeResult<T>`.
 #[derive(Debug, HarwError)]

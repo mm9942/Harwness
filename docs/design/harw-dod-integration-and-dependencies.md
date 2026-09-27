@@ -105,7 +105,7 @@ two-block boundary had to land before the triage agents, because a triage
 agent without it would be an injection target.
 
 Phases 0–6 are implemented in the current codebase (`harw-context`,
-`harw-observe*`, the `dod/` workspace's sensor/rules/escalate/warden
+`harw-observe*`, the DoD sensor/rules/escalate/warden (`dod/crates/`)
 crates). Phase 7 operational items (off-host mirroring, out-of-band
 alerting) are Open — see `docs/design/harw-security-observability-plan.md`
 for current operational status.

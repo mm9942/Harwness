@@ -8,7 +8,6 @@ repository.workspace = true
 rust-version.workspace = true
 
 [dependencies]
-harw-authority = { path = "../harw-authority" }
 harw-macros = { path = "../harw-macros" }
 serde = { workspace = true }
 

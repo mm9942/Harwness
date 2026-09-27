@@ -1,0 +1,29 @@
+[package]
+publish.workspace = true
+name = "harw-job-darwin"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "Darwin/macOS job mechanics without unsafe code: process-group supervision, exit watching without polling, rlimits for a trampoline, sandbox-exec (SBPL) wrapping, honest per-dimension enforcement reports (Eco-Doc §15, §37)."
+
+[dependencies]
+# Platform-neutral model: ExitOutcome, EnforcementState, SandboxReport,
+# SandboxProfileName, ResourceRequest.
+harw-job-core = { path = "../harw-job-core" }
+# DarwinRecoveryIdentity is persisted metadata.
+serde = { workspace = true }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+# process: kill(2)/killpg(2), waitid(2) with WNOWAIT, setrlimit(2).
+# `event` (kqueue) is deliberately NOT enabled: in rustix 1.1 `kevent` is an
+# `unsafe fn`, and this workspace forbids unsafe code (see src/lib.rs).
+rustix = { workspace = true, features = ["process"] }
+
+[dev-dependencies]
+serde_json = { workspace = true }
+tempfile = { workspace = true }
+
+[lints]
+workspace = true

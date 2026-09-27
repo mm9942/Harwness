@@ -194,7 +194,7 @@ impl StoredJob {
     ///
     /// # Beispiele
     /// ```rust,no_run
-    /// use harw_job_runtime::stored::StoredJob;
+    /// use harw_job_core::stored::StoredJob;
     ///
     /// fn reclaim_if_stranded(record: &mut StoredJob, now: jiff::Timestamp) {
     ///     // `is_holder_alive` liefert hier bewusst immer `false`, um einen
