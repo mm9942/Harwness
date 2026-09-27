@@ -1,0 +1,90 @@
+{
+ "schema": 1,
+ "wave": "contract-c",
+ "branch": "claude/r16/contract-c",
+ "base_sha": "1ad90219d83aa305f5bfe2ca531a30b5ab41a829",
+ "head_sha": "d9aa4e8bc236359ddd259f6690b1d0f3532c9084",
+ "files": [
+  "Cargo.lock",
+  "docs/design/CONTRACT-setup-install.md",
+  "harw-cli/src/home.rs",
+  "harw-core-bridge/Cargo.toml",
+  "harw-core-bridge/src/agent_tool.rs",
+  "harw-core/Cargo.toml",
+  "harw-install/src/error.rs",
+  "harw-install/src/migration.rs",
+  "harw-ops/src/bug_report.rs",
+  "harw-ops/src/config_util.rs",
+  "harw-ops/src/effort.rs",
+  "harw-ops/src/learn.rs",
+  "harw-ops/src/matrix/game_master.rs",
+  "harw-ops/src/matrix/mod.rs",
+  "harw-ops/src/memory.rs",
+  "harw-ops/src/mode.rs",
+  "harw-ops/src/model.rs",
+  "harw-ops/src/provider.rs",
+  "harw-ops/src/skills.rs",
+  "harw-runtime/src/assembly.rs",
+  "harw-runtime/src/children.rs",
+  "harw-runtime/src/services.rs",
+  "harw-tui/src/approval_dialog.rs",
+  "harw-tui/src/session_picker.rs",
+  "harw-tui/src/setup.rs",
+  "harw-types/Cargo.toml"
+ ],
+ "findings": [
+  {
+   "id": "F-983fdef1d84e",
+   "cluster": "c15b",
+   "file": "harw-runtime/src/children.rs",
+   "line": 1,
+   "severity": "high",
+   "pattern": "M1",
+   "title": "Game Master child ServiceMap lacks the bound home context, so /matrix start and draft fail closed with NotAvailable"
+  },
+  {
+   "id": "F-d9165bdba6f7",
+   "cluster": "c15b",
+   "file": "harw-runtime/src/services.rs",
+   "line": 1,
+   "severity": "low",
+   "pattern": "M3",
+   "title": "services.rs '# Root-Space' doc (line ~69) and harw-cli/src/home.rs:15-19 claim every op uses the bound home"
+  },
+  {
+   "id": "F-f990bc67bb0d",
+   "cluster": "c15b",
+   "file": "harw-ops/src/matrix/game_master.rs",
+   "line": 1,
+   "severity": "high",
+   "pattern": "M1",
+   "title": "harw-ops does not compile: matrix_root now takes ctx but game_master.rs still calls it the old way"
+  }
+ ],
+ "workflow_runs": [
+  "wf_509f86e0-476",
+  "wf_5d41e59a-c0b"
+ ],
+ "disposition": {
+  "complete": true,
+  "missing": [],
+  "clusters": [
+   {
+    "id": "c15b",
+    "status": "ok",
+    "reason": null
+   }
+  ]
+ },
+ "central_build": [
+  "env CARGO_INCREMENTAL=0 CARGO_PROFILE_DEV_DEBUG=0 CARGO_PROFILE_TEST_DEBUG=0 (cloud container, every step)",
+  "cargo fmt --all",
+  "cargo clippy --workspace --all-targets -- -D warnings",
+  "cargo test --workspace (including doc tests)",
+  "cargo run -q -p xtask -- gates",
+  "cargo deny check",
+  "make -C dod clippy test",
+  "actionlint"
+ ],
+ "note": "Two rounds. Round 1 (contract-c.js, run wf_509f86e0-476, old logic): c28, c31, c35 ok; c15 repaired without re-review and left a compile break. Round 2 (this manifest's findings and disposition) fixed it and re-reviewed the whole c15 diff; its two repairs after ok=true (catalog P18) were checked by hand: skills.rs removes an unused pub fn, assembly.rs changes a doc comment. Merge deferred until the one-file waves that also edit harw-runtime/src/assembly.rs and harw-core-bridge/src/agent_tool.rs are committed."
+}
