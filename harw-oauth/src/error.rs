@@ -14,7 +14,12 @@ pub enum OAuthError {
     TokenExchange {
         /// HTTP-Statuscode.
         status: u16,
-        /// Roher Antwort-Body (für Diagnose; kann Fehlermeldung enthalten).
+        /// Immer ein redigierter Platzhaltertext, niemals der rohe Antwort-Body.
+        ///
+        /// Der rohe Body wird absichtlich nirgends hierher kopiert, da er
+        /// Tokenmaterial enthalten kann; beide Konstruktoren (`flow.rs`,
+        /// `codex_refresh.rs`) setzen hier ausschließlich einen festen
+        /// "... response body redacted"-Text.
         body: String,
     },
     /// HTTP-Transportfehler (Netzwerk, TLS, …).
