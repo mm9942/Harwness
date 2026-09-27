@@ -11,7 +11,7 @@ export const meta = {
 
 // Args:
 //   key       label for this wave
-//   root      absolute path of the checkout (a git worktree on its own branch); default: cwd
+//   root      absolute path of the checkout (a git worktree on its own branch); required (catalog P14)
 //   clusters  [{id, files: [repo-relative paths], findings: [verified findings]}], file-disjoint
 //   catalog   pattern catalog path (default docs/planning/85-gap-hunt/patterns.md)
 //   rules     binding code rules (default: the workspace rules below)
@@ -19,7 +19,10 @@ const A = args || {}
 const CATALOG = A.catalog || 'docs/planning/85-gap-hunt/patterns.md'
 const RULES = A.rules || 'no let-chains (`if let … && …`, MSRV 1.85), forbid(unsafe), no unwrap/expect/panic! in library code OR tests/doctests (tests return TestResult and use the crate helpers), no third-party types in public APIs, hand-written error types, match the file\'s comment language and density, no book titles/authors/quotes anywhere; ring rules in xtask/arch-policy.toml (a crate may depend only on the rings its ring allows)'
 const BUILD_RULE = 'Subagents and parallel agents must **never** run `cargo` or `rustc` in any form: no `check`, `build`, `test`, `nextest`, `clippy`, `fmt`, `run`, `doc`, `deny`, and no `make` target that calls them. They only read and edit code. At the end they report which tests they added and which commands the central build must run.'
-const ROOT = A.root || ''
+// root is required (catalog P14): the session's working directory follows a
+// `cd` of the main session, so "the current directory" is not a safe default.
+if (!A.root) throw new Error('root is required: pass the absolute path of the checkout (catalog P14)')
+const ROOT = A.root
 const WHERE = ROOT
   ? `Repository root: ${ROOT} (a git worktree on its own branch). Every path below is relative to that root: read and edit files only under it, and run git as \`git -C ${ROOT} …\`. Never touch the same path in any other checkout.`
   : 'Repository: the current working directory (Rust workspace).'

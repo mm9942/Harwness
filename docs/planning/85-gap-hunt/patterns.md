@@ -104,6 +104,46 @@ Jeder Eintrag hat die gleichen Teile:
 - **Regel:** fs4-Locks mit klarer Übernahme-Regel, atomares Schreiben
   (temp + rename).
 
+### M9 — Zustand ohne Endübergang
+- **Erkennen:** Ein Zustand hat einen Eingang, aber keinen sicheren Ausgang.
+  Ein Job bleibt für immer `Running`, ein fertiger Worker gibt seinen Slot nie
+  frei, eine Zielschleife dreht ohne Abbruch, ein abgelaufener Lease wird nie
+  bereinigt.
+- **Regel:** Jede Zustandsmaschine nennt ihre Endzustände. Jeder Pfad, auch
+  Fehler, Abbruch und Neustart, führt in einen davon. Beim Start werden
+  verwaiste Zustände abgeglichen (reconcile).
+- **Werkzeug:** Tests pro Endübergang, dazu ein Neustart-Test mit einem
+  Zustand, der mitten im Lauf liegen geblieben ist.
+
+### M10 — Erst sichtbar, dann persistiert
+- **Erkennen:** Ein Prozess macht einen Zustand sichtbar (Speicher, Event,
+  Antwort), bevor er dauerhaft geschrieben ist. Nach Absturz oder Neustart
+  fehlt, was Clients schon gesehen haben. Beispiele: Speicher vor dem fsync
+  des Verzeichnisses, eine Session-ID nur im Speicher, ein Event-Bus ohne
+  dauerhaften Replay.
+- **Abgrenzung:** M8 betrifft mehrere Prozesse an einer Datei, M10 die
+  Reihenfolge in einem Prozess.
+- **Regel:** Erst schreiben, dann sichtbar machen. Wo das nicht geht, ist
+  „bestätigt, aber nicht dauerhaft“ ein eigener Fehlerfall, den Aufrufer
+  unterscheiden können.
+
+### Zuordnen statt NEW
+Finder taggen viele Funde als `NEW:<name>`, die schon ein Muster haben:
+- `unbounded-read`, `unbounded-line-read`, `unbounded-connections`,
+  `unbounded-event-buffer`, `unbounded-cache-growth`, `unbounded-await`,
+  `no-timeout`: **M5**.
+- `detached-sse-pump`, `detached-per-event-spawn`, `cancel-not-propagated`,
+  `dropped-future-state`, `lock-across-sleep`, `unsupervised-…-death`:
+  **M6**.
+- `insecure-temp-exec`, `predictable-temp-exec`: **M7**.
+- `stale-lock-takeover`, `unlocked multi-process writer`: **M8**.
+- `expired-lease-never-reconciled`, `non-idempotent-recovery`: **M9**.
+- `unpersisted-history-mutation`: **M10**.
+- `let-chain`, `third-party-type-in-public-api`, `unused-dependency`,
+  `dead-feature-flag`: **P8**. `pub-without-caller`: **P1**.
+
+Der Finder-Prompt nennt deshalb alle Kürzel mit je einem Erkennungssatz.
+
 ## Muster im Prozess
 
 ### P1 — Fixes erzeugen Folgefunde
@@ -204,8 +244,58 @@ am Session-Limit hinterlässt halbe Edits mitten zwischen fertigen.
   zentrale Build.
 - Wellen bleiben dateidisjunkt. Wer Dateien einer früheren Welle berührt,
   startet erst nach deren Merge.
-- Nach einem Abbruch die Welle fortsetzen (resume): Fertige Agenten kommen aus
-  dem Journal, fehlgeschlagene laufen neu.
+- Nach einem Abbruch die Welle mit **unverändertem** Skript fortsetzen
+  (resume): Fertige Agenten kommen aus dem Journal, fehlgeschlagene laufen
+  neu. Mit geändertem Skript gilt P12.
 
 Dasselbe Prinzip steckt in DEC-045 für harw selbst: ein Klon je Zellhost mit
 Merge-Barriere statt vieler Schreiber auf einem Workspace.
+
+### P12 — Resume trifft nur den unveränderten Präfix
+Ein Resume liefert nur den **längsten unveränderten Präfix** der Agent-Aufrufe
+aus dem Cache. Ab dem ersten geänderten oder neuen Aufruf läuft alles live,
+auch Fixer und Coder, die schon fertig waren. Beispiel: Eine Welle bekommt
+nachträglich einen Re-Review-Schritt, dann laufen nach dem ersten neuen
+Re-Review alle späteren Fixer ein zweites Mal. Die Edits landen dann doppelt
+oder werden überschrieben, und die Tokens sind verloren.
+
+**Gegenmittel:**
+- Schreibende Wellen nie auf geänderte Logik fortsetzen.
+- Einen fehlenden Schritt (etwa den Re-Review einer Reparatur) als eigenen
+  Agenten nachholen, mit Vertrag, Befund und Reparaturbericht aus dem Journal.
+- Prüfen, ob schon doppelt geschrieben wurde: die mtimes der Dateien mit dem
+  Resume-Zeitpunkt vergleichen.
+
+### P13 — Gegen die Basis prüfen, nicht gegen den gefixten Baum
+Werden Funde nachträglich geprüft, während ihre Fixes schon im Arbeitsbaum
+liegen, lesen die Prüfer den gefixten Code. Dann verwerfen sie echte Funde
+mit „ist schon behoben“. In R16 traf das drei von sechs nachgeprüften Funden.
+Alle drei waren auf HEAD echt.
+
+**Gegenmittel:** `gap-verify` bekommt `base`, den Commit, gegen den gefunden
+wurde. Die Prüfer lesen `git show <base>:<datei>`. „Im Arbeitsbaum schon
+behoben“ zählt als echt und wird als `fixed_in_tree` gemeldet.
+
+### P14 — Das Arbeitsverzeichnis wandert mit
+Wechselt die Hauptsession per `cd` in einen Worktree, wandert ihr
+Arbeitsverzeichnis mit. Jeder Agent, der danach startet und nur „das aktuelle
+Verzeichnis“ kennt, arbeitet im falschen Checkout:
+- Fixer schreiben in den fremden Worktree.
+- Reviewer sehen dort einen leeren Diff und melden „Fix fehlt“.
+- Die Reparatur folgt dem Pfad aus dem Review-Text und schreibt den Fix ein
+  zweites Mal, wieder im falschen Baum, auch wenn sie selbst im richtigen
+  Verzeichnis startet.
+
+In R16 traf das zwei kurze `cd`-Fenster. Betroffen waren etwa 15 Dateien aus
+sieben Wellen, darunter ein doppelter, byte-gleicher Fix und zwei
+verschiedene Fixes für denselben Fund.
+
+**Gegenmittel:**
+- Die Hauptsession wechselt nie per `cd` in einen Worktree, sondern nutzt
+  `git -C <pfad>` und absolute Pfade.
+- Schreibende Workflows verlangen `root`, auch für den Hauptbaum. Ohne
+  `root` brechen `gap-fix` und `contract-wave` ab.
+- Ein Wellen-Commit nimmt nur die benannten Dateien der Welle. Fremde
+  Änderungen im Worktree werden gemeldet und nach dem Ende aller Wellen
+  abgeglichen: Hat der Hauptbaum keinen Fix, wird verschoben; ist er gleich,
+  wird verworfen; sind beide verschieden, entscheidet ein Review.
