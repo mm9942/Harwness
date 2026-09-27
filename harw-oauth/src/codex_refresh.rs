@@ -21,24 +21,29 @@
 //!    (z. B. `auth_mode`, `OPENAI_API_KEY`) bleiben unverändert erhalten.
 //!
 //! ## Nebenläufigkeit
-//! [`refresh_codex_tokens`] sperrt den Refresh-Vorgang selbst über eine
-//! Lock-Datei neben der Credential-Datei (`<dir>/.codex-refresh.lock`) — das
-//! schützt gegen parallele Refreshes aus mehreren Prozessen/Threads, ohne den
-//! Hot-Path normaler Requests zu sperren. Die Lock-Datei trägt einen
-//! einmaligen Nonce als Inhalt; beim Loslassen entfernt ein Halter die Datei
-//! nur, wenn dieser Nonce noch drinsteht — so löscht kein Halter jemals den
-//! Lock, den inzwischen ein anderer Prozess übernommen hat. Ein Lock, der
-//! älter als 10s ist, gilt als verwaist und wird per atomarem `rename` auf
-//! einen eindeutigen Tombstone-Namen übernommen (nie per `remove_file`);
-//! `rename` kann von zwei Wartenden nie beide gleichzeitig gewinnen, sodass
-//! der Lock nie doppelt "erworben" wird. Die Refresh-POST-Anfrage selbst ist
-//! auf deutlich unter 10s begrenzt (siehe [`REFRESH_HTTP_TIMEOUT`]), damit ein
-//! noch aktiver Halter niemals als verwaist erscheint. Nach Erwerb des Locks
-//! wird zusätzlich erneut geprüft, ob das Access-Token inzwischen von einem
-//! anderen Halter bereits erneuert wurde; ist es das, entfällt der
-//! Netzwerk-Call — sonst würde ein bereits rotiertes Refresh-Token erneut
-//! gesendet, was der Endpoint als `invalid_grant` ablehnt und die ganze
-//! Token-Familie invalidieren kann.
+//! [`refresh_codex_tokens`] serialisiert den Refresh-Vorgang über einen
+//! OS-Advisory-Lock (unter Unix `flock`, via `fs4`) auf einer Lock-Datei neben
+//! der Credential-Datei (`<dir>/.<name>.codex-refresh.lock`) — das schützt
+//! gegen parallele Refreshes aus mehreren Prozessen/Threads, ohne den Hot-Path
+//! normaler Requests zu sperren. Den Lock hält das Betriebssystem am offenen
+//! Datei-Handle: stürzt ein Halter ab, gibt der Kernel ihn frei. Es gibt daher
+//! keine Verwaist-Heuristik und keine Übernahme fremder Locks. Die Lock-Datei
+//! bleibt dauerhaft liegen; sie beim Loslassen zu löschen, würde das Rennen
+//! zwischen einem Wartenden auf der alten und einem Neuankömmling auf einer
+//! frisch angelegten Datei wieder öffnen. Die Refresh-POST-Anfrage ist per
+//! [`REFRESH_HTTP_TIMEOUT`] unterhalb von [`LOCK_ACQUIRE_TIMEOUT`] begrenzt,
+//! damit Wartende nicht aufgeben, solange der Halter noch im POST steckt.
+//!
+//! Vor dem Warten auf den Lock merkt sich [`refresh_codex_tokens`] das
+//! aktuelle Access-Token. Der Netzwerk-Call entfällt **nur**, wenn das nach
+//! Erwerb des Locks gelesene Access-Token davon abweicht (ein anderer Halter
+//! hat also während der Wartezeit rotiert) und noch ausreichend lange gilt —
+//! das spart eine überflüssige zweite Rotation. Ein unverändertes Token geht
+//! immer an den Endpoint, auch wenn sein `exp` noch fern ist: der Server kann
+//! es vorzeitig verworfen haben (echter `401`). Das Refresh-Token wird in
+//! jedem Fall erst nach Erwerb des Locks gelesen; der Verzicht auf den
+//! Netzwerk-Call ist also kein Schutz vor `invalid_grant`, sondern nur eine
+//! Einsparung.
 //!
 //! ## Konfigurierbarkeit
 //! | Env-Variable                        | Default |
@@ -48,10 +53,10 @@
 
 use std::fs::OpenOptions;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use base64::Engine as _;
+use secrecy::ExposeSecret as _;
 use secrecy::SecretString;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -66,21 +71,22 @@ const DEFAULT_CLIENT_ID: &str = "app_EMoamEEZ73f0CkXaXp7hrann";
 /// `HARW_CODEX_OAUTH_REFRESH_URL`). Ebenfalls aus `codex-rs` verifiziert.
 const DEFAULT_REFRESH_URL: &str = "https://auth.openai.com/oauth/token";
 
-/// Zeit, nach der ein Lock als verwaist gilt und übernommen wird (Crash-Schutz).
-const LOCK_STALE_AFTER: Duration = Duration::from_secs(10);
 /// Wartezeit zwischen zwei Versuchen, den Refresh-Lock zu erwerben.
 const LOCK_RETRY_INTERVAL: Duration = Duration::from_millis(50);
 /// Maximale Gesamtwartezeit, bis das Erwerben des Refresh-Locks aufgegeben wird.
 const LOCK_ACQUIRE_TIMEOUT: Duration = Duration::from_secs(10);
-/// Obergrenze für die Refresh-POST-Anfrage (Netzwerk + Body lesen), deutlich
-/// unterhalb von [`LOCK_STALE_AFTER`] — ein Halter, der die Anfrage noch
-/// abwartet, darf niemals als verwaist erscheinen.
+/// Obergrenze für die Refresh-POST-Anfrage (Netzwerk + Body lesen). Muss
+/// unterhalb von [`LOCK_ACQUIRE_TIMEOUT`] bleiben: sonst geben Wartende auf
+/// ([`OAuthError::RefreshLockTimeout`]), während der Halter noch im POST
+/// steckt.
 const REFRESH_HTTP_TIMEOUT: Duration = Duration::from_secs(8);
-/// Fenster für die Re-Prüfung direkt nach Erwerb des Locks: läuft das gerade
-/// gelesene Access-Token nicht innerhalb dieses Fensters ab, hat es
-/// vermutlich bereits ein anderer Halter erneuert — der Netzwerk-Call entfällt
-/// dann (siehe [`refresh_codex_tokens`]).
-const LOCK_HOLDER_REFRESH_WINDOW_SECONDS: i64 = 5 * 60;
+/// Mindest-Restlaufzeit eines Access-Tokens, das ein **anderer** Halter
+/// rotiert hat, während dieser Aufruf auf den Lock wartete — nur dann wird es
+/// ohne eigenen Netzwerk-Call übernommen (reine Plausibilitätsprüfung, siehe
+/// [`tokens_rotated_while_waiting`]). Ein unverändertes Token wird immer
+/// erneuert; die Konstante ist daher unabhängig vom proaktiven Refresh-Fenster
+/// in `harw-provider-http`.
+const ROTATED_TOKEN_MIN_REMAINING_SECONDS: i64 = 5 * 60;
 
 /// base64url-Engine ohne Padding — JWT-Segmente sind per RFC 7519 padding-frei.
 const URL_SAFE_NO_PAD: base64::engine::general_purpose::GeneralPurpose =
@@ -197,108 +203,54 @@ fn lock_path_for(auth_json_path: &Path) -> PathBuf {
     auth_json_path.with_file_name(format!(".{file_name}.codex-refresh.lock"))
 }
 
-static LOCK_NONCE_COUNTER: AtomicU64 = AtomicU64::new(0);
-
-/// Erzeugt einen pro Aufruf eindeutigen Nonce-String (Prozess-ID + Nanosekunden
-/// + Zähler), der als Inhalt einer frisch erworbenen Lock-Datei dient. Damit
-/// kann sowohl [`RefreshLockGuard`] beim Loslassen als auch eine Übernahme
-/// erkennen, ob eine Lock-Datei noch demselben Halter gehört.
-fn lock_nonce() -> String {
-    let counter = LOCK_NONCE_COUNTER.fetch_add(1, Ordering::Relaxed);
-    let nanos = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_or(0, |duration| duration.as_nanos());
-    format!("{}-{nanos}-{counter}", std::process::id())
-}
-
-/// Hält den Refresh-Lock, bis sie gedroppt wird.
+/// Hält den Refresh-Lock (exklusiver OS-Advisory-Lock auf dem offenen Handle
+/// der Lock-Datei), bis er gedroppt wird.
 struct RefreshLockGuard {
-    path: PathBuf,
-    /// Nonce, die beim Erwerb in die Lock-Datei geschrieben wurde. Nur wenn
-    /// die Datei beim Drop noch genau diesen Inhalt trägt, gehört sie noch
-    /// uns — sonst hat sie inzwischen ein anderer Prozess übernommen (siehe
-    /// [`acquire_refresh_lock`]), und wir dürfen sie nicht entfernen.
-    nonce: String,
+    file: std::fs::File,
 }
 
 impl Drop for RefreshLockGuard {
     fn drop(&mut self) {
-        match std::fs::read_to_string(&self.path) {
-            Ok(content) if content == self.nonce => {
-                let _ = std::fs::remove_file(&self.path);
-            }
-            // Andere Fälle (fremder Inhalt, Datei bereits verschwunden, I/O-
-            // Fehler beim Lesen): nicht anfassen. Ein fremder Lock darf nicht
-            // gelöscht werden; ein bereits verschwundener braucht nichts mehr.
-            _ => {}
-        }
+        // Explizit entsperren; das Schließen des Handles direkt danach gäbe
+        // den Lock ohnehin frei. Die Lock-Datei wird bewusst NIE gelöscht:
+        // ein Wartender kann sie bereits geöffnet haben und sperrt nach dem
+        // Löschen den verwaisten Inode, während ein Neuankömmling unter
+        // demselben Pfad eine frische Datei anlegt und ebenfalls sperrt — zwei
+        // gleichzeitige Halter, also genau das Rennen, das der Lock verhindert.
+        let _ = fs4::FileExt::unlock(&self.file);
     }
 }
 
-/// Übernimmt einen als verwaist erkannten Lock, indem er atomar auf einen
-/// eindeutigen Tombstone-Namen umbenannt wird, statt ihn per `remove_file` zu
-/// löschen. `rename` kann von der ursprünglichen Quelle aus nur für genau
-/// einen Aufrufer erfolgreich sein — für alle anderen, die dieselbe verwaiste
-/// Datei gesehen haben, schlägt ihr eigener `rename`-Versuch mit `NotFound`
-/// fehl (die Quelle existiert dann schon nicht mehr). So kann ein einzelner
-/// verwaister Lock nie von zwei Wartenden gleichzeitig "erworben" werden, wie
-/// es mit einem bloßen `remove_file` möglich wäre. Der Tombstone selbst wird
-/// direkt danach best-effort aufgeräumt; niemand hält mehr eine Referenz
-/// darauf.
+/// Erwirbt den Refresh-Lock neben `auth_json_path`.
 ///
-/// # Returns
-/// `true`, wenn dieser Aufruf die Übernahme gewonnen hat (der Aufrufer darf
-/// als Nächstes `create_new` versuchen); `false`, wenn ein anderer Wartender
-/// bereits gewonnen hat (der Aufrufer soll die Schleife einfach erneut
-/// durchlaufen).
-fn take_over_stale_lock(lock_path: &Path) -> bool {
-    let file_name = lock_path
-        .file_name()
-        .and_then(|name| name.to_str())
-        .unwrap_or("codex-refresh.lock");
-    let tombstone = lock_path.with_file_name(format!("{file_name}.stale-{}", lock_nonce()));
-    let won = std::fs::rename(lock_path, &tombstone).is_ok();
-    if won {
-        let _ = std::fs::remove_file(&tombstone);
-    }
-    won
-}
-
-/// Erwirbt den dateibasierten Refresh-Lock neben `auth_json_path`.
+/// Öffnet (bzw. legt an) die Lock-Datei aus [`lock_path_for`] und versucht im
+/// Abstand von [`LOCK_RETRY_INTERVAL`], einen exklusiven OS-Advisory-Lock
+/// (unter Unix `flock`) darauf zu nehmen, bis [`LOCK_ACQUIRE_TIMEOUT`]
+/// verstrichen ist. Sperrt nur den Refresh-Vorgang selbst (nicht normale
+/// Requests). Eine liegengebliebene Lock-Datei blockiert nie: gesperrt ist nur,
+/// was ein lebender Prozess gerade hält — stürzt er ab, gibt das
+/// Betriebssystem den Lock frei.
 ///
-/// Sperrt nur den Refresh-Vorgang selbst (nicht normale Requests). Ein Lock,
-/// der älter als [`LOCK_STALE_AFTER`] ist, wird als verwaist betrachtet und
-/// per [`take_over_stale_lock`] übernommen, damit ein abgestürzter Prozess
-/// nicht dauerhaft blockiert.
+/// `fs4::FileExt::try_lock` wird bewusst voll qualifiziert aufgerufen: neuere
+/// Toolchains bringen ein gleichnamiges inhärentes `std::fs::File::try_lock`
+/// mit (stabil erst ab Rust 1.89, MSRV ist 1.85), das die Methoden-Syntax
+/// vorrangig wählen würde.
 async fn acquire_refresh_lock(auth_json_path: &Path) -> OAuthResult<RefreshLockGuard> {
-    use std::io::Write as _;
-
     let lock_path = lock_path_for(auth_json_path);
+    let mut options = OpenOptions::new();
+    options.create(true).truncate(false).write(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        options.mode(0o600);
+    }
+    let file = options.open(&lock_path)?;
+
     let deadline = Instant::now() + LOCK_ACQUIRE_TIMEOUT;
     loop {
-        match OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&lock_path)
-        {
-            Ok(mut file) => {
-                let nonce = lock_nonce();
-                // Best-effort: scheitert das Schreiben (z. B. Platte voll),
-                // bleibt der Lock trotzdem exklusiv gehalten (`create_new` hat
-                // bereits zugeschlagen); nur der Nonce-Abgleich beim Drop
-                // degradiert dann konservativ (siehe `RefreshLockGuard::drop`).
-                let _ = file.write_all(nonce.as_bytes());
-                let _ = file.flush();
-                return Ok(RefreshLockGuard {
-                    path: lock_path,
-                    nonce,
-                });
-            }
-            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
-                if is_lock_stale(&lock_path) {
-                    let _ = take_over_stale_lock(&lock_path);
-                    continue;
-                }
+        match fs4::FileExt::try_lock(&file) {
+            Ok(()) => return Ok(RefreshLockGuard { file }),
+            Err(fs4::TryLockError::WouldBlock) => {
                 if Instant::now() >= deadline {
                     return Err(OAuthError::RefreshLockTimeout(
                         lock_path.display().to_string(),
@@ -306,21 +258,9 @@ async fn acquire_refresh_lock(auth_json_path: &Path) -> OAuthResult<RefreshLockG
                 }
                 tokio::time::sleep(LOCK_RETRY_INTERVAL).await;
             }
-            Err(error) => return Err(error.into()),
+            Err(fs4::TryLockError::Error(error)) => return Err(error.into()),
         }
     }
-}
-
-fn is_lock_stale(lock_path: &Path) -> bool {
-    let Ok(metadata) = std::fs::metadata(lock_path) else {
-        return false;
-    };
-    let Ok(modified) = metadata.modified() else {
-        return false;
-    };
-    SystemTime::now()
-        .duration_since(modified)
-        .is_ok_and(|age| age > LOCK_STALE_AFTER)
 }
 
 fn read_credential_document(path: &Path) -> OAuthResult<Value> {
@@ -329,100 +269,14 @@ fn read_credential_document(path: &Path) -> OAuthResult<Value> {
         .map_err(|error| OAuthError::CodexCredentialFile(format!("invalid JSON: {error}")))
 }
 
-static TEMP_FILE_COUNTER: AtomicU64 = AtomicU64::new(0);
-
-/// Erzeugt einen eindeutigen Temp-Pfad neben `path` (PID + Nanosekunden +
-/// Zähler), damit `create_new` keine kollidierenden Namen sieht.
-fn temporary_credential_path(path: &Path) -> PathBuf {
-    let counter = TEMP_FILE_COUNTER.fetch_add(1, Ordering::Relaxed);
-    let nanos = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_or(0, |duration| duration.as_nanos());
-    let file_name = path
-        .file_name()
-        .and_then(|name| name.to_str())
-        .unwrap_or("auth.json");
-    path.with_file_name(format!(
-        ".{file_name}.tmp-refresh-{}-{nanos}-{counter}",
-        std::process::id()
-    ))
-}
-
-/// Legt eine neue, exklusiv (`create_new`) angelegte Temp-Datei mit `0600`
-/// unter Unix an. `create_new` verweigert sowohl eine bereits existierende
-/// reguläre Datei als auch einen bereits existierenden Symlink (`O_EXCL`) —
-/// anders als `create(true).truncate(true)` folgt es also nie einem
-/// untergeschobenen Symlink und übernimmt nie die Rechte einer
-/// Alt-/Fremddatei. Die `mode(0o600)` beim Öffnen gilt nur für neu angelegte
-/// Dateien; `set_permissions` danach setzt sie zusätzlich explizit auf dem
-/// offenen Handle (doppelte Absicherung, falls die Open-Flags je nach
-/// Plattform/Umask abweichen).
-fn create_restricted_temp(path: &Path) -> OAuthResult<(std::fs::File, PathBuf)> {
-    for _ in 0..16 {
-        let temporary_path = temporary_credential_path(path);
-        let mut options = OpenOptions::new();
-        options.write(true).create_new(true);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::OpenOptionsExt as _;
-            options.mode(0o600);
-        }
-
-        match options.open(&temporary_path) {
-            Ok(file) => {
-                #[cfg(unix)]
-                {
-                    use std::os::unix::fs::PermissionsExt as _;
-                    file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
-                }
-                return Ok((file, temporary_path));
-            }
-            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
-            Err(error) => return Err(error.into()),
-        }
-    }
-
-    Err(std::io::Error::new(
-        std::io::ErrorKind::AlreadyExists,
-        "could not allocate a unique temporary Codex credential file",
-    )
-    .into())
-}
-
-/// Schreibt `document` atomar (eindeutige Temp-Datei + rename, `0600` unter
-/// Unix) nach `path` zurück, gefolgt von `fsync` der Datei und des
-/// Verzeichnisses.
+/// Schreibt `document` als eingerücktes JSON atomar nach `path` zurück — über
+/// den crate-weiten Schreiber [`crate::store::write_private_file_atomically`]
+/// (eindeutige `0600`-Temp-Datei daneben, `fsync`, `rename`; Details dort).
 fn write_credential_document(path: &Path, document: &Value) -> OAuthResult<()> {
-    use std::io::Write as _;
-
-    let parent = path.parent().ok_or_else(|| {
-        OAuthError::CodexCredentialFile("credential path has no parent directory".to_owned())
+    let serialized = serde_json::to_string_pretty(document).map_err(|error| {
+        OAuthError::CodexCredentialFile(format!("could not serialize refreshed tokens: {error}"))
     })?;
-    let (file, temp_path) = create_restricted_temp(path)?;
-
-    let write_result = (|| -> OAuthResult<()> {
-        let mut file = file;
-        let serialized = serde_json::to_string_pretty(document).map_err(|error| {
-            OAuthError::CodexCredentialFile(format!(
-                "could not serialize refreshed tokens: {error}"
-            ))
-        })?;
-        file.write_all(serialized.as_bytes())?;
-        file.flush()?;
-        file.sync_all()?;
-        drop(file);
-        std::fs::rename(&temp_path, path)?;
-        #[cfg(unix)]
-        {
-            std::fs::File::open(parent)?.sync_all()?;
-        }
-        Ok(())
-    })();
-
-    if write_result.is_err() {
-        let _ = std::fs::remove_file(&temp_path);
-    }
-    write_result
+    crate::store::write_private_file_atomically(path, serialized.as_bytes())
 }
 
 fn unix_seconds_to_rfc3339(total_seconds: i64) -> String {
@@ -463,19 +317,40 @@ fn document_access_token(document: &Value) -> Option<&str> {
         .filter(|token| !token.is_empty())
 }
 
-/// Prüft direkt nach Erwerb des Refresh-Locks, ob das gerade gelesene
-/// Access-Token bereits außerhalb von [`LOCK_HOLDER_REFRESH_WINDOW_SECONDS`]
-/// abläuft — dann hat es vermutlich schon ein anderer Halter erneuert,
-/// während dieser Aufruf auf den Lock wartete, und der Netzwerk-Call entfällt.
+/// Momentaufnahme des Access-Tokens in `auth_json_path` *vor* dem Warten auf
+/// den Refresh-Lock (best-effort). Jeder Fehler (Datei fehlt, kein gültiges
+/// JSON, kein Token) ergibt `None`; dann gilt nach Erwerb des Locks nichts als
+/// "während des Wartens rotiert", und Fehler meldet erst das reguläre Lesen
+/// unter dem Lock.
+fn access_token_snapshot(auth_json_path: &Path) -> Option<SecretString> {
+    let document = read_credential_document(auth_json_path).ok()?;
+    let access_token = document_access_token(&document)?;
+    Some(SecretString::new(access_token.to_owned().into_boxed_str()))
+}
+
+/// Prüft direkt nach Erwerb des Refresh-Locks, ob ein anderer Halter die
+/// Tokens rotiert hat, während dieser Aufruf auf den Lock wartete: das gerade
+/// gelesene Access-Token muss sich von `access_token_before_lock` (siehe
+/// [`access_token_snapshot`]) unterscheiden **und** noch länger als
+/// [`ROTATED_TOKEN_MIN_REMAINING_SECONDS`] gelten. Nur dann entfällt der
+/// Netzwerk-Call, und dieses Token-Set wird übernommen.
 ///
-/// Liefert `None` (also: trotzdem erneuern), wenn `exp` nicht bestimmbar ist —
-/// nur eine positiv bestätigte, ausreichend ferne Ablaufzeit gilt als
-/// "bereits frisch". Ein nicht dekodierbares Token darf nie stillschweigend
-/// als frisch durchgehen.
-fn already_fresh_tokens(document: &Value) -> Option<RefreshedCodexTokens> {
+/// Liefert `None` (also: regulär erneuern), wenn keine Momentaufnahme
+/// vorliegt, das Token fehlt oder unverändert ist, `exp` nicht bestimmbar ist
+/// oder das rotierte Token bald abläuft. Ein unverändertes Token wird nie
+/// übersprungen, egal wie fern sein `exp` liegt — es kann serverseitig bereits
+/// verworfen sein (echter `401`).
+fn tokens_rotated_while_waiting(
+    document: &Value,
+    access_token_before_lock: Option<&str>,
+) -> Option<RefreshedCodexTokens> {
+    let access_token_before_lock = access_token_before_lock?;
     let access_token = document_access_token(document)?;
+    if access_token == access_token_before_lock {
+        return None;
+    }
     let exp = jwt_exp_unix_seconds(access_token)?;
-    if exp.saturating_sub(unix_seconds_now()) <= LOCK_HOLDER_REFRESH_WINDOW_SECONDS {
+    if exp.saturating_sub(unix_seconds_now()) <= ROTATED_TOKEN_MIN_REMAINING_SECONDS {
         return None;
     }
 
@@ -497,11 +372,11 @@ fn already_fresh_tokens(document: &Value) -> Option<RefreshedCodexTokens> {
 }
 
 /// Sendet die Refresh-Anfrage an `url`, begrenzt durch [`REFRESH_HTTP_TIMEOUT`]
-/// (deutlich unter [`LOCK_STALE_AFTER`]), damit ein noch aktiver Lock-Halter
-/// nie als verwaist erscheint (siehe Modul-Dokumentation). `url` als Parameter
-/// statt direkt [`refresh_url`] zu lesen, hält die Funktion isoliert testbar
-/// (z. B. gegen einen lokalen Test-Listener), ohne Umgebungsvariablen in
-/// Tests zu mutieren.
+/// (unter [`LOCK_ACQUIRE_TIMEOUT`]), damit Wartende nicht aufgeben, solange
+/// der Lock-Halter noch im POST steckt (siehe Modul-Dokumentation). `url` als
+/// Parameter statt direkt [`refresh_url`] zu lesen, hält die Funktion isoliert
+/// testbar (z. B. gegen einen lokalen Test-Listener), ohne Umgebungsvariablen
+/// in Tests zu mutieren.
 async fn send_refresh_request(
     client: &reqwest::Client,
     url: &str,
@@ -537,10 +412,14 @@ async fn send_refresh_request(
 /// - `auth_json_path` (`&Path`): Pfad zu `~/.codex/auth.json`.
 ///
 /// # Returns
-/// Die neu ausgestellten Tokens (Access-/Refresh-Token, optionale Account-ID).
+/// Entweder ein neu ausgestelltes Token-Set (Access-/Refresh-Token, optionale
+/// Account-ID) oder — falls ein anderer Halter die Tokens rotiert hat,
+/// während dieser Aufruf auf den Refresh-Lock wartete — das von diesem Halter
+/// geschriebene Token-Set.
 ///
 /// # Errors
-/// - [`OAuthError::CodexCredentialFile`][]: Datei nicht lesbar, kein `tokens`-Objekt.
+/// - [`OAuthError::CodexCredentialFile`][]: Datei ist kein gültiges JSON oder
+///   hat kein `tokens`-Objekt.
 /// - [`OAuthError::MissingField`][]: kein `refresh_token` in der Datei, oder
 ///   die Antwort enthielt kein `access_token`.
 /// - [`OAuthError::TokenExchange`][]: nicht-erfolgreiche HTTP-Antwort; der Body
@@ -549,29 +428,52 @@ async fn send_refresh_request(
 ///   von [`REFRESH_HTTP_TIMEOUT`].
 /// - [`OAuthError::RefreshLockTimeout`][]: der Refresh-Lock konnte nicht
 ///   innerhalb des Zeitlimits erworben werden.
-/// - [`OAuthError::TokenStoreIo`][]: I/O-Fehler beim atomaren Zurückschreiben.
+/// - [`OAuthError::TokenStoreIo`][]: Credential-Datei nicht lesbar, Lock-Datei
+///   nicht zu öffnen oder zu sperren, oder I/O-Fehler beim atomaren
+///   Zurückschreiben.
 ///
 /// # Concurrency
-/// `async`; serialisiert parallele Refreshes über einen Datei-Lock neben
-/// `auth_json_path` (siehe Modul-Dokumentation). Treibt eine per
-/// [`REFRESH_HTTP_TIMEOUT`] begrenzte HTTP-Anfrage — außer, das nach Erwerb
-/// des Locks erneut gelesene Access-Token ist bereits frisch, weil ein
-/// anderer Halter zwischenzeitlich erneuert hat; dann entfällt der
-/// Netzwerk-Call ([`already_fresh_tokens`]).
+/// `async`; serialisiert parallele Refreshes über einen OS-Datei-Lock neben
+/// `auth_json_path` (siehe Modul-Dokumentation). Treibt höchstens eine per
+/// [`REFRESH_HTTP_TIMEOUT`] begrenzte HTTP-Anfrage. Keine Anfrage nur dann,
+/// wenn sich das Access-Token während des Wartens auf den Lock geändert hat
+/// (Rotation durch einen anderen Halter) und noch ausreichend lange gilt. Ein
+/// serverseitig verworfenes, aber noch nicht abgelaufenes Token wird nie
+/// übersprungen: ein unverändertes Token geht immer an den Endpoint.
 pub async fn refresh_codex_tokens(
     client: &reqwest::Client,
     auth_json_path: &Path,
 ) -> OAuthResult<RefreshedCodexTokens> {
+    refresh_codex_tokens_at(client, auth_json_path, &refresh_url()).await
+}
+
+/// Kern von [`refresh_codex_tokens`] gegen einen expliziten Refresh-Endpoint
+/// `url`. Der Parameter hält den kompletten Ablauf (Lock, Re-Prüfung, POST,
+/// Zurückschreiben) gegen einen lokalen Test-Listener testbar, ohne
+/// Umgebungsvariablen in Tests zu mutieren (`set_var` ist in Edition 2024
+/// `unsafe`).
+async fn refresh_codex_tokens_at(
+    client: &reqwest::Client,
+    auth_json_path: &Path,
+    url: &str,
+) -> OAuthResult<RefreshedCodexTokens> {
+    // Momentaufnahme VOR dem Warten: nur eine Abweichung davon nach Erwerb
+    // des Locks belegt eine Rotation durch einen anderen Halter.
+    let access_token_before_lock = access_token_snapshot(auth_json_path);
     let _lock = acquire_refresh_lock(auth_json_path).await?;
 
     let mut document = read_credential_document(auth_json_path)?;
 
-    // Re-Prüfung nach Erwerb des Locks: hat ein anderer Halter, der während
-    // unserer Wartezeit den Lock hielt, bereits erneuert, entfällt der
-    // Netzwerk-Call — sonst würde das (jetzt rotierte) alte Refresh-Token
-    // erneut gesendet und vom Endpoint als `invalid_grant` abgelehnt.
-    if let Some(fresh) = already_fresh_tokens(&document) {
-        return Ok(fresh);
+    // Hat ein anderer Halter während unserer Wartezeit rotiert, übernehmen wir
+    // sein Token-Set statt einer überflüssigen zweiten Rotation. Ein
+    // unverändertes Token geht dagegen immer an den Endpoint.
+    if let Some(rotated) = tokens_rotated_while_waiting(
+        &document,
+        access_token_before_lock
+            .as_ref()
+            .map(|token| token.expose_secret()),
+    ) {
+        return Ok(rotated);
     }
 
     let refresh_token = document
@@ -588,7 +490,7 @@ pub async fn refresh_codex_tokens(
         refresh_token,
     };
 
-    let (status, body) = send_refresh_request(client, &refresh_url(), &payload).await?;
+    let (status, body) = send_refresh_request(client, url, &payload).await?;
     if !status.is_success() {
         return Err(OAuthError::TokenExchange {
             status: status.as_u16(),
@@ -676,6 +578,104 @@ mod tests {
         let header = URL_SAFE_NO_PAD.encode(b"{}");
         let payload = URL_SAFE_NO_PAD.encode(format!("{{\"exp\":{exp}}}"));
         format!("{header}.{payload}.sig")
+    }
+
+    /// HTTP-Client ohne System-Proxy: die Tests sprechen nur mit lokalen
+    /// Listenern, die ein Container-Proxy nicht erreichen würde.
+    fn test_client() -> TestResult<reqwest::Client> {
+        reqwest::Client::builder()
+            .no_proxy()
+            .build()
+            .map_err(ctx("HTTP-Client ohne Proxy bauen"))
+    }
+
+    /// Startet einen lokalen Refresh-Endpoint-Stub, der genau eine Anfrage
+    /// annimmt, mit `200` und `response_json` antwortet und den Request-Body
+    /// über den Join-Handle zurückgibt. Liefert die Endpoint-URL und den
+    /// Handle.
+    fn spawn_refresh_stub(
+        response_json: &'static str,
+    ) -> TestResult<(String, std::thread::JoinHandle<TestResult<String>>)> {
+        use std::io::{Read as _, Write as _};
+
+        let listener =
+            std::net::TcpListener::bind("127.0.0.1:0").map_err(ctx("Stub-Listener binden"))?;
+        listener
+            .set_nonblocking(true)
+            .map_err(ctx("Stub-Listener nicht-blockierend schalten"))?;
+        let addr = listener.local_addr().map_err(ctx("Stub-Adresse lesen"))?;
+
+        let handle = std::thread::spawn(move || -> TestResult<String> {
+            // Nicht-blockierendes `accept` mit Frist: ein Test, der gar nicht
+            // erst anfragt, darf den Stub-Thread nicht ewig hängen lassen.
+            let deadline = Instant::now() + Duration::from_secs(10);
+            let mut stream = loop {
+                match listener.accept() {
+                    Ok((stream, _)) => break stream,
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        if Instant::now() >= deadline {
+                            return Err(TestError::Unexpected(
+                                "refresh stub received no request within 10s".to_owned(),
+                            ));
+                        }
+                        std::thread::sleep(Duration::from_millis(10));
+                    }
+                    Err(error) => return Err(ctx("Stub-Anfrage annehmen")(error)),
+                }
+            };
+            stream
+                .set_nonblocking(false)
+                .map_err(ctx("Stub-Verbindung blockierend schalten"))?;
+            stream
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .map_err(ctx("Stub-Lese-Timeout setzen"))?;
+
+            let mut bytes = Vec::new();
+            let mut buffer = [0_u8; 4096];
+            let header_end = loop {
+                let read = stream
+                    .read(&mut buffer)
+                    .map_err(ctx("Stub-Anfrage lesen"))?;
+                if read == 0 {
+                    return Err(TestError::Unexpected(
+                        "client closed connection before headers completed".to_owned(),
+                    ));
+                }
+                bytes.extend_from_slice(&buffer[..read]);
+                if let Some(end) = bytes.windows(4).position(|window| window == b"\r\n\r\n") {
+                    break end + 4;
+                }
+            };
+            let head = String::from_utf8_lossy(&bytes[..header_end]).to_ascii_lowercase();
+            let content_length = head
+                .lines()
+                .find_map(|line| line.strip_prefix("content-length:"))
+                .and_then(|value| value.trim().parse::<usize>().ok())
+                .unwrap_or(0);
+            while bytes.len() < header_end + content_length {
+                let read = stream
+                    .read(&mut buffer)
+                    .map_err(ctx("Stub-Request-Body lesen"))?;
+                if read == 0 {
+                    break;
+                }
+                bytes.extend_from_slice(&buffer[..read]);
+            }
+            let body_end = (header_end + content_length).min(bytes.len());
+            let request_body = String::from_utf8_lossy(&bytes[header_end..body_end]).into_owned();
+
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{response_json}",
+                response_json.len()
+            );
+            stream
+                .write_all(response.as_bytes())
+                .map_err(ctx("Stub-Antwort schreiben"))?;
+            stream.flush().map_err(ctx("Stub-Antwort flushen"))?;
+            Ok(request_body)
+        });
+
+        Ok((format!("http://{addr}/oauth/token"), handle))
     }
 
     #[test]
@@ -779,19 +779,19 @@ mod tests {
     }
 
     #[test]
-    fn test_refresh_http_timeout_is_well_below_lock_stale_after() {
-        // Kernvoraussetzung von Fund #1(a): der Refresh-POST muss deutlich
-        // unter der Verwaist-Schwelle liegen, sonst könnte ein noch aktiver
-        // Halter selbst als verwaist erscheinen.
-        assert!(REFRESH_HTTP_TIMEOUT < LOCK_STALE_AFTER);
+    fn test_refresh_http_timeout_is_below_lock_acquire_timeout() {
+        // Der Refresh-POST muss unter der Wartefrist liegen, sonst geben
+        // Wartende auf, während der Halter noch im POST steckt.
+        assert!(REFRESH_HTTP_TIMEOUT < LOCK_ACQUIRE_TIMEOUT);
     }
 
     #[tokio::test]
-    async fn test_send_refresh_request_times_out_well_before_lock_looks_stale() -> TestResult {
+    async fn test_send_refresh_request_times_out_before_waiters_give_up() -> TestResult {
         // Simuliert einen extrem langsamen Refresh-Endpoint: der Listener
         // nimmt die Verbindung an, antwortet aber nie, bis der Test sie
-        // freigibt. Der eigene Timeout muss lange vor `LOCK_STALE_AFTER`
-        // zuschlagen (siehe Fund #1(a)).
+        // freigibt. Der eigene Timeout muss vor `LOCK_ACQUIRE_TIMEOUT`
+        // zuschlagen, damit Wartende nicht vor dem Halter aufgeben.
+        let client = test_client()?;
         let listener =
             std::net::TcpListener::bind("127.0.0.1:0").map_err(ctx("bind mock server"))?;
         let addr = listener.local_addr().map_err(ctx("mock address"))?;
@@ -802,7 +802,6 @@ mod tests {
             Ok(())
         });
 
-        let client = reqwest::Client::new();
         let payload = RefreshRequest {
             client_id: "test-client".to_owned(),
             grant_type: "refresh_token",
@@ -826,96 +825,159 @@ mod tests {
         };
         assert!(matches!(error, OAuthError::Http(_)));
         assert!(
-            elapsed < LOCK_STALE_AFTER,
-            "refresh timeout must fire well before the lock would look stale"
+            elapsed < LOCK_ACQUIRE_TIMEOUT,
+            "refresh timeout must fire before waiters give up on the lock"
         );
         Ok(())
     }
 
-    #[test]
-    fn test_already_fresh_tokens_none_when_access_token_undecodable() {
-        // Ein nicht dekodierbares Token darf niemals stillschweigend als
-        // "bereits frisch" durchgehen (Fund #1(d)) — sonst würde ein nötiger
-        // Refresh übersprungen.
-        let document = serde_json::json!({
+    fn rotated_document(access_token: &str) -> Value {
+        serde_json::json!({
             "tokens": {
-                "access_token": "not-a-jwt",
-                "refresh_token": "some-refresh",
-            }
-        });
-        assert!(already_fresh_tokens(&document).is_none());
-    }
-
-    #[test]
-    fn test_already_fresh_tokens_none_when_expiring_soon() -> TestResult {
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map_err(ctx("Systemzeit vor UNIX_EPOCH"))?
-            .as_secs() as i64;
-        let token = make_jwt_with_exp(now + 30);
-        let document = serde_json::json!({
-            "tokens": {
-                "access_token": token,
-                "refresh_token": "some-refresh",
-            }
-        });
-        assert!(already_fresh_tokens(&document).is_none());
-        Ok(())
-    }
-
-    #[test]
-    fn test_already_fresh_tokens_some_when_exp_far_in_future() -> TestResult {
-        use secrecy::ExposeSecret as _;
-
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map_err(ctx("Systemzeit vor UNIX_EPOCH"))?
-            .as_secs() as i64;
-        let token = make_jwt_with_exp(now + 3_600);
-        let document = serde_json::json!({
-            "tokens": {
-                "access_token": token,
-                "refresh_token": "still-valid-refresh",
+                "access_token": access_token,
+                "refresh_token": "rotated-refresh",
                 "account_id": "acct-1",
             }
-        });
-        let fresh = already_fresh_tokens(&document).ok_or(TestError::Unexpected(
-            "expected an already-fresh token".to_owned(),
-        ))?;
-        assert_eq!(fresh.access_token.expose_secret(), token.as_str());
-        assert_eq!(fresh.refresh_token.expose_secret(), "still-valid-refresh");
-        assert_eq!(fresh.account_id, Some("acct-1".to_owned()));
+        })
+    }
+
+    #[test]
+    fn test_tokens_rotated_while_waiting_none_when_token_unchanged() {
+        // Fund-Regression: ein unverändertes Token mit fernem `exp` darf nie
+        // als "bereits erneuert" durchgehen — es kann serverseitig verworfen
+        // sein (echter `401`), und dann muss der Refresh wirklich laufen.
+        let token = make_jwt_with_exp(unix_seconds_now() + 3_600);
+        let document = rotated_document(&token);
+        assert!(tokens_rotated_while_waiting(&document, Some(token.as_str())).is_none());
+    }
+
+    #[test]
+    fn test_tokens_rotated_while_waiting_none_without_snapshot() {
+        // Ohne Momentaufnahme vor dem Lock lässt sich keine Rotation belegen.
+        let token = make_jwt_with_exp(unix_seconds_now() + 3_600);
+        let document = rotated_document(&token);
+        assert!(tokens_rotated_while_waiting(&document, None).is_none());
+    }
+
+    #[test]
+    fn test_tokens_rotated_while_waiting_none_when_rotated_token_undecodable() {
+        // Ein nicht dekodierbares Token darf niemals stillschweigend als
+        // rotiert und gültig durchgehen — sonst würde ein nötiger Refresh
+        // übersprungen.
+        let document = rotated_document("not-a-jwt");
+        assert!(tokens_rotated_while_waiting(&document, Some("old-access")).is_none());
+    }
+
+    #[test]
+    fn test_tokens_rotated_while_waiting_none_when_rotated_token_expiring_soon() {
+        let token = make_jwt_with_exp(unix_seconds_now() + 30);
+        let document = rotated_document(&token);
+        assert!(tokens_rotated_while_waiting(&document, Some("old-access")).is_none());
+    }
+
+    #[test]
+    fn test_tokens_rotated_while_waiting_some_when_rotated_and_far_from_expiry() -> TestResult {
+        let token = make_jwt_with_exp(unix_seconds_now() + 3_600);
+        let document = rotated_document(&token);
+        let rotated = tokens_rotated_while_waiting(&document, Some("old-access")).ok_or(
+            TestError::Unexpected("expected the rotated token set to be adopted".to_owned()),
+        )?;
+        assert_eq!(rotated.access_token.expose_secret(), token.as_str());
+        assert_eq!(rotated.refresh_token.expose_secret(), "rotated-refresh");
+        assert_eq!(rotated.account_id, Some("acct-1".to_owned()));
         Ok(())
     }
 
     #[tokio::test]
-    async fn test_refresh_codex_tokens_skips_network_call_when_already_fresh() -> TestResult {
-        use secrecy::ExposeSecret as _;
-
-        let home = temp_home("already-fresh");
+    async fn test_refresh_codex_tokens_refreshes_unchanged_far_future_token() -> TestResult {
+        // Fund-Regression: ein Token, das laut `exp` noch eine Stunde gilt,
+        // aber unverändert ist (z. B. nach einem echten `401`), muss wirklich
+        // an den Endpoint gehen — früher entfiel der Netzwerk-Call hier.
+        let home = temp_home("unchanged-far-future");
         let _ = std::fs::remove_dir_all(&home);
         let path = home.join("auth.json");
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map_err(ctx("Systemzeit vor UNIX_EPOCH"))?
-            .as_secs() as i64;
-        let fresh_access_token = make_jwt_with_exp(now + 3_600);
-        write_auth_json(&path, &fresh_access_token, "still-valid-refresh")?;
+        let access_token = make_jwt_with_exp(unix_seconds_now() + 3_600);
+        write_auth_json(&path, &access_token, "still-valid-refresh")?;
 
-        let client = reqwest::Client::new();
-        let started = Instant::now();
-        let tokens = refresh_codex_tokens(&client, &path).await;
-        let elapsed = started.elapsed();
+        let client = test_client()?;
+        let (url, stub) =
+            spawn_refresh_stub(r#"{"access_token":"new-access","refresh_token":"new-refresh"}"#)?;
+        let outcome = refresh_codex_tokens_at(&client, &path, &url).await;
+        let on_disk = read_credential_document(&path);
         let _ = std::fs::remove_dir_all(&home);
 
-        let tokens = tokens.map_err(ctx(
-            "ein bereits frisches Token darf den Refresh nicht scheitern lassen",
-        ))?;
-        assert_eq!(tokens.access_token.expose_secret(), fresh_access_token.as_str());
+        // Ergebnis VOR dem Join prüfen: ein übersprungener Refresh soll als
+        // Fehlschlag sichtbar werden, nicht als 10s-Hänger im Stub-Thread.
+        let tokens = outcome.map_err(ctx("Refresh gegen den lokalen Stub"))?;
+        let request_body = stub
+            .join()
+            .map_err(|_| TestError::Unexpected("refresh stub thread panicked".to_owned()))??;
+
+        assert_eq!(tokens.access_token.expose_secret(), "new-access");
+        assert_eq!(tokens.refresh_token.expose_secret(), "new-refresh");
         assert!(
-            elapsed < Duration::from_secs(5),
-            "an already-fresh token must short-circuit without a real network round trip"
+            request_body.contains("still-valid-refresh"),
+            "the stored refresh token must be sent: {request_body}"
         );
+        assert!(
+            request_body.contains("refresh_token"),
+            "the request must be a refresh_token grant: {request_body}"
+        );
+
+        let document = on_disk.map_err(ctx("auth.json nach dem Refresh lesen"))?;
+        assert_eq!(
+            document
+                .pointer("/tokens/access_token")
+                .and_then(Value::as_str),
+            Some("new-access")
+        );
+        assert_eq!(
+            document.pointer("/auth_mode").and_then(Value::as_str),
+            Some("chatgpt")
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_refresh_codex_tokens_adopts_token_rotated_while_waiting() -> TestResult {
+        // Der Test hält den Lock selbst als "anderer Halter", rotiert während
+        // der Wartezeit des Refreshs das Token und gibt den Lock dann frei.
+        // Der Refresh muss das rotierte Token ohne Netzwerk-Call übernehmen:
+        // Port 0 ist nie erreichbar, jeder Netzwerkversuch endete in `Err`.
+        let home = temp_home("rotated-while-waiting");
+        let _ = std::fs::remove_dir_all(&home);
+        let path = home.join("auth.json");
+        let now = unix_seconds_now();
+        let original_access_token = make_jwt_with_exp(now + 3_600);
+        let rotated_access_token = make_jwt_with_exp(now + 7_200);
+        write_auth_json(&path, &original_access_token, "original-refresh")?;
+
+        let client = test_client()?;
+        let guard = acquire_refresh_lock(&path)
+            .await
+            .map_err(ctx("Lock als anderer Halter erwerben"))?;
+
+        let rotate = async {
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            let written = write_auth_json(&path, &rotated_access_token, "rotated-refresh");
+            drop(guard);
+            written
+        };
+        let (outcome, rotated) = tokio::join!(
+            refresh_codex_tokens_at(&client, &path, "http://127.0.0.1:0/oauth/token"),
+            rotate
+        );
+        let _ = std::fs::remove_dir_all(&home);
+
+        rotated?;
+        let tokens = outcome.map_err(ctx(
+            "ein während des Wartens rotiertes Token muss ohne Netzwerk übernommen werden",
+        ))?;
+        assert_eq!(
+            tokens.access_token.expose_secret(),
+            rotated_access_token.as_str()
+        );
+        assert_eq!(tokens.refresh_token.expose_secret(), "rotated-refresh");
         Ok(())
     }
 
@@ -942,83 +1004,80 @@ mod tests {
             .map_err(ctx("lock acquired"))?;
         assert!(lock_path_for(&auth_path).exists());
         drop(guard);
-        assert!(!lock_path_for(&auth_path).exists());
+        // Die Lock-Datei bleibt liegen (Löschen öffnete das Rennen wieder);
+        // freigegeben ist nur der OS-Lock, also gelingt ein zweiter Erwerb.
+        assert!(
+            lock_path_for(&auth_path).exists(),
+            "the lock file must persist after release"
+        );
+        let second = acquire_refresh_lock(&auth_path)
+            .await
+            .map_err(ctx("lock re-acquired after release"))?;
+        drop(second);
 
         let _ = std::fs::remove_dir_all(&home);
         Ok(())
     }
 
     #[tokio::test]
-    async fn test_refresh_lock_guard_drop_does_not_remove_a_takenover_lock() -> TestResult {
-        // Fund #1: der Guard darf beim Drop niemals eine Lock-Datei löschen,
-        // die inzwischen ein anderer Prozess übernommen hat (anderer Inhalt =
-        // anderer Nonce).
-        let home = temp_home("lock-guard-takeover");
+    async fn test_acquire_refresh_lock_is_exclusive_until_guard_dropped() -> TestResult {
+        // Ein zweites, unabhängig geöffnetes Handle verhält sich wie ein
+        // anderer Prozess: solange der Guard lebt, bekommt es den Lock nicht.
+        let home = temp_home("lock-exclusive");
         let _ = std::fs::remove_dir_all(&home);
         std::fs::create_dir_all(&home).map_err(ctx("Testverzeichnis anlegen"))?;
         let auth_path = home.join("auth.json");
-        std::fs::write(&auth_path, "{}").map_err(ctx("auth.json schreiben"))?;
 
         let guard = acquire_refresh_lock(&auth_path)
             .await
             .map_err(ctx("lock acquired"))?;
-        let lock_path = lock_path_for(&auth_path);
-
-        // Simuliert eine Übernahme durch einen anderen Prozess: derselbe
-        // Pfad, aber ein frischer, fremder Nonce-Inhalt.
-        std::fs::write(&lock_path, "someone-elses-nonce")
-            .map_err(ctx("Lock-Datei mit fremdem Nonce überschreiben"))?;
-
+        let second_handle = OpenOptions::new()
+            .write(true)
+            .open(lock_path_for(&auth_path))
+            .map_err(ctx("Lock-Datei ein zweites Mal öffnen"))?;
+        let while_held = fs4::FileExt::try_lock(&second_handle);
         drop(guard);
+        let after_drop = fs4::FileExt::try_lock(&second_handle);
+        let _ = fs4::FileExt::unlock(&second_handle);
+        drop(second_handle);
+        let _ = std::fs::remove_dir_all(&home);
 
         assert!(
-            lock_path.exists(),
-            "drop must not remove a lock now owned by someone else"
+            matches!(while_held, Err(fs4::TryLockError::WouldBlock)),
+            "a held refresh lock must block a second handle"
         );
-        let content = std::fs::read_to_string(&lock_path).map_err(ctx("Lock-Datei lesen"))?;
-        assert_eq!(content, "someone-elses-nonce");
-
-        let _ = std::fs::remove_dir_all(&home);
+        assert!(
+            after_drop.is_ok(),
+            "dropping the guard must release the refresh lock"
+        );
         Ok(())
     }
 
-    #[test]
-    fn test_take_over_stale_lock_is_won_by_exactly_one_racer() -> TestResult {
-        // Fund #1: zwei Wartende, die dieselbe verwaiste Lock-Datei sehen,
-        // dürfen sie nie beide "erwerben" (das alte `remove_file`-Verhalten
-        // erlaubte genau das). `rename` von derselben Quelle aus kann für
-        // höchstens einen Aufrufer gelingen.
-        let home = temp_home("takeover-race");
+    #[tokio::test]
+    async fn test_acquire_refresh_lock_not_blocked_by_leftover_lock_file() -> TestResult {
+        // Eine liegengebliebene Lock-Datei (z. B. nach einem Absturz) trägt
+        // keinen OS-Lock mehr und darf den Erwerb nicht verzögern.
+        let home = temp_home("lock-leftover");
         let _ = std::fs::remove_dir_all(&home);
         std::fs::create_dir_all(&home).map_err(ctx("Testverzeichnis anlegen"))?;
-        let lock_path = home.join(".auth.json.codex-refresh.lock");
+        let auth_path = home.join("auth.json");
+        std::fs::write(lock_path_for(&auth_path), "orphaned")
+            .map_err(ctx("liegengebliebene Lock-Datei anlegen"))?;
 
-        for _ in 0..64 {
-            std::fs::write(&lock_path, "orphaned").map_err(ctx("Lock-Datei anlegen"))?;
-
-            let path_a = lock_path.clone();
-            let path_b = lock_path.clone();
-            let thread_a = std::thread::spawn(move || take_over_stale_lock(&path_a));
-            let thread_b = std::thread::spawn(move || take_over_stale_lock(&path_b));
-
-            let won_a = thread_a
-                .join()
-                .map_err(|_| TestError::Unexpected("racer A panicked".to_owned()))?;
-            let won_b = thread_b
-                .join()
-                .map_err(|_| TestError::Unexpected("racer B panicked".to_owned()))?;
-
-            assert_ne!(
-                won_a, won_b,
-                "exactly one racer must win the takeover of the same stale lock"
-            );
-            assert!(
-                !lock_path.exists(),
-                "after the takeover the original stale lock path must be gone"
-            );
-        }
-
+        let started = Instant::now();
+        let outcome = acquire_refresh_lock(&auth_path).await;
+        let elapsed = started.elapsed();
+        // Guard sofort wieder freigeben, dann aufräumen, erst danach prüfen.
+        let acquired = outcome
+            .map(drop)
+            .map_err(ctx("Lock trotz liegengebliebener Lock-Datei erwerben"));
         let _ = std::fs::remove_dir_all(&home);
+
+        acquired?;
+        assert!(
+            elapsed < Duration::from_secs(1),
+            "a leftover lock file must not delay acquisition ({elapsed:?})"
+        );
         Ok(())
     }
 

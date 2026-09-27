@@ -639,7 +639,8 @@ impl WorkspaceBinding {
 /// [`AuthoritySnapshot`]) can never smuggle a canonical root — and therefore
 /// no grant — through deserialization.  [`PolicyBootstrap::reissue`] compares
 /// it against a freshly resolved [`WorkspaceBinding`] instead of trusting a
-/// deserialized path.
+/// deserialized path.  It deliberately offers no id accessors, only
+/// [`Self::matches`].
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WorkspaceReference {
     tenant: TenantId,
@@ -929,7 +930,7 @@ fn harness_read_view_permissions(parent: &PermissionSet) -> PermissionSet {
     ]))
 }
 
-/// Serializable, non-authoritative display/persistence data.
+/// Serializable, non-authoritative persistence data.
 ///
 /// This holds a [`WorkspaceReference`], not a [`WorkspaceBinding`]: a
 /// snapshot never carries a canonical root, so it cannot become a grant by
@@ -937,6 +938,12 @@ fn harness_read_view_permissions(parent: &PermissionSet) -> PermissionSet {
 /// pass it to [`PolicyBootstrap::reissue`] with a freshly resolved workspace
 /// binding, which [`WorkspaceReference::matches`] then checks the reference
 /// against.
+///
+/// The reference is a matching token for [`PolicyBootstrap::reissue`]
+/// (checked via [`WorkspaceReference::matches`]), not display data: it
+/// exposes no id accessors.  Callers that need to show the ids take
+/// them from the live binding ([`AuthorityContext::workspace`],
+/// [`WorkspaceBinding::tenant`], [`WorkspaceBinding::workspace`]).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AuthoritySnapshot {
     workspace: WorkspaceReference,
@@ -945,6 +952,8 @@ pub struct AuthoritySnapshot {
 }
 
 impl AuthoritySnapshot {
+    /// The path-free workspace reference; comparable only via
+    /// [`WorkspaceReference::matches`], it carries no ids for display.
     #[must_use]
     pub fn workspace(&self) -> &WorkspaceReference {
         &self.workspace
@@ -1298,14 +1307,11 @@ fn read_trusted_policy(source: PolicySource, path: &Path) -> AuthorityResult<Vec
     #[cfg(unix)]
     if source == PolicySource::OperatorHome {
         use std::os::unix::fs::MetadataExt;
-        // Primary check: the policy file must actually be owned by the
-        // requesting process, not merely be internally consistent with its
-        // parent (see `matches_process_euid`). Falls back to the
-        // parent-consistency check alone when the euid cannot be resolved
-        // (e.g. no `/proc` on this platform; see `resolve_process_euid`).
-        if let Some(euid) =
-            resolve_process_euid().filter(|&euid| !matches_process_euid(metadata.uid(), euid))
-        {
+        // Primary check: the policy file must be owned by the requesting
+        // process's effective uid, not merely be consistent with its parent;
+        // the parent check below runs in addition, never instead.
+        let euid = process_euid();
+        if !matches_process_euid(metadata.uid(), euid) {
             return Err(AuthorityError::OperatorHomePolicyNotProcessOwned {
                 path: path.to_path_buf(),
                 uid: metadata.uid(),
@@ -1402,30 +1408,21 @@ fn ensure_policy_not_replaced(
     Ok(())
 }
 
-/// Resolves the running process's effective uid without `unsafe` and
-/// without a new dependency (`harw-authority` has `#![forbid(unsafe_code)]`
-/// and no dependency able to call `geteuid()` without unsafe FFI): the
-/// owner of the virtual `/proc/self` entry, as reported by
-/// [`std::fs::metadata`], is the calling process's effective uid. Same
-/// technique as `resolve_process_identity` in `harw-sandbox::bwrap`.
-///
-/// `None` when `/proc` is unavailable (e.g. a non-Linux Unix without a
-/// `/proc` compatibility layer, or a sandboxed environment without procfs
-/// mounted) — callers then fall back to the file/parent self-consistency
-/// check ([`owner_matches`]) alone, exactly as before this function existed.
+/// The running process's effective uid via `rustix::process::geteuid`
+/// (a safe wrapper; this crate stays `#![forbid(unsafe_code)]`), the same
+/// call `harw_fsutil::ensure_private_regular` uses. Deliberately not the
+/// owner of `/proc/self`: for a non-dumpable process that entry is owned
+/// by root, and without procfs it does not exist.
 #[cfg(unix)]
-fn resolve_process_euid() -> Option<u32> {
-    use std::os::unix::fs::MetadataExt;
-
-    fs::metadata("/proc/self").ok().map(|metadata| metadata.uid())
+fn process_euid() -> u32 {
+    rustix::process::geteuid().as_raw()
 }
 
-/// Whether a policy file's owner is the resolved effective uid of the
-/// requesting process. The real `file_uid == process_euid` check
-/// [`read_trusted_policy`] uses whenever [`resolve_process_euid`] can
-/// resolve one; kept as a separate, synthetic-input-testable function like
-/// [`owner_matches`] because a test cannot chown a fixture file to an
-/// arbitrary uid without root.
+/// Whether a policy file's owner is the effective uid of the requesting
+/// process ([`process_euid`]). [`read_trusted_policy`] always applies it to
+/// operator-home policies; kept separate and synthetic-input-testable like
+/// [`owner_matches`] because a test cannot chown a fixture to an arbitrary
+/// uid without root.
 #[cfg(unix)]
 fn matches_process_euid(file_uid: u32, euid: u32) -> bool {
     file_uid == euid
@@ -1434,15 +1431,12 @@ fn matches_process_euid(file_uid: u32, euid: u32) -> bool {
 /// Whether an operator-home policy's parent directory ownership is
 /// consistent with the policy file's own owner.
 ///
-/// This is a secondary, portable check that does not depend on resolving
-/// the process's effective uid: it still closes the concrete attack it
+/// This is a secondary, portable check: it closes the concrete attack it
 /// guards against — a different member of a shared group substituting the
 /// policy file through a group-writable `~/.harw` — because the
 /// substituted file would be owned by the substituting uid, not by the
 /// original file's owner. [`read_trusted_policy`] runs this in addition to,
-/// not instead of, the [`matches_process_euid`] check above; it is the only
-/// one of the two still enforced when [`resolve_process_euid`] returns
-/// `None`.
+/// never instead of, [`matches_process_euid`].
 #[cfg(unix)]
 fn owner_matches(file_uid: u32, ancestor_uid: u32) -> bool {
     file_uid == ancestor_uid
@@ -1558,7 +1552,7 @@ pub enum AuthorityError {
         path: PathBuf,
     },
     /// Die OperatorHome-Policy-Datei gehört nicht der effektiven uid des
-    /// anfragenden Prozesses (`/proc/self`, siehe `resolve_process_euid`) —
+    /// anfragenden Prozesses (`geteuid`, siehe `process_euid`) —
     /// ein fremder Eigentümer der gesamten `~/.harw`-Hierarchie besteht die
     /// reine Selbstkonsistenz-Prüfung sonst unentdeckt.
     OperatorHomePolicyNotProcessOwned {
@@ -1958,6 +1952,17 @@ network_targets = []
     }
 
     #[test]
+    fn snapshot_reference_matches_only_the_binding_it_was_taken_from() -> test_support::TestResult
+    {
+        // `view_workspace` teilt den Tenant und unterscheidet sich nur in der
+        // Workspace-Id; den Tenant-Fall deckt der Test oben ab.
+        let snapshot = test_context([Permission::ReadWorkspace], NetworkScope::empty()).snapshot();
+        assert!(snapshot.workspace().matches(&test_workspace()));
+        assert!(!snapshot.workspace().matches(&view_workspace()));
+        Ok(())
+    }
+
+    #[test]
     fn network_and_workspace_scopes_only_reduce() {
         let parent = test_context(
             [Permission::ReadWorkspace, Permission::NetworkAccess],
@@ -2165,36 +2170,30 @@ network_targets = []
         }
     }
 
-    /// Eigenes, per `Drop` aufräumendes Scratch-Verzeichnis für
-    /// Dateisystem-Tests. Kein `tempfile`, da diese Crate es nicht als
-    /// Dev-Dependency führt (siehe Bericht des Fixer-Agents).
+    /// Scratch-Verzeichnis für Dateisystem-Tests: privates `tempfile::TempDir`
+    /// (räumt per `Drop` auf) plus kanonischer Pfad — `read_trusted_policy`
+    /// lehnt nicht-kanonische Pfade ab (`PolicyPathNotCanonical`), und
+    /// `temp_dir()` kann selbst ein Symlink sein.
     #[cfg(unix)]
-    struct ScratchDir(PathBuf);
-
-    #[cfg(unix)]
-    impl Drop for ScratchDir {
-        fn drop(&mut self) {
-            let _ = fs::remove_dir_all(&self.0);
-        }
+    struct ScratchDir {
+        path: PathBuf,
+        _guard: tempfile::TempDir,
     }
 
     #[cfg(unix)]
     fn scratch_dir(label: &str) -> test_support::TestResult<ScratchDir> {
-        static SEQUENCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-        let nanos = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|elapsed| elapsed.as_nanos())
-            .unwrap_or_default();
-        let sequence = SEQUENCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let dir = std::env::temp_dir().join(format!(
-            "harw-authority-test-{label}-{}-{nanos}-{sequence}",
-            std::process::id()
-        ));
-        fs::create_dir_all(&dir).map_err(test_support::ctx("scratch dir must be creatable"))?;
-        let canonical = dir
+        let guard = tempfile::Builder::new()
+            .prefix(&format!("harw-authority-test-{label}-"))
+            .tempdir()
+            .map_err(test_support::ctx("scratch dir must be creatable"))?;
+        let path = guard
+            .path()
             .canonicalize()
             .map_err(test_support::ctx("scratch dir must canonicalize"))?;
-        Ok(ScratchDir(canonical))
+        Ok(ScratchDir {
+            path,
+            _guard: guard,
+        })
     }
 
     #[cfg(unix)]
@@ -2213,18 +2212,12 @@ network_targets = []
 
     #[cfg(unix)]
     #[test]
-    fn resolve_process_euid_matches_a_file_created_by_this_process() -> test_support::TestResult {
+    fn process_euid_matches_a_file_created_by_this_process() -> test_support::TestResult {
         use std::os::unix::fs::MetadataExt;
 
-        let Some(euid) = resolve_process_euid() else {
-            // Keine `/proc`-Kompatibilitätsschicht auf dieser Plattform (z. B.
-            // macOS/BSD) — dann greift beim Policy-Lesen ohnehin nur die
-            // portable Selbstkonsistenz-Prüfung (`owner_matches`); hier gibt
-            // es nichts zu prüfen.
-            return Ok(());
-        };
+        let euid = process_euid();
         let dir = scratch_dir("euid-self")?;
-        let path = dir.0.join("owned-by-this-process");
+        let path = dir.path.join("owned-by-this-process");
         fs::write(&path, b"x").map_err(test_support::ctx("scratch file must be writable"))?;
         let metadata = fs::symlink_metadata(&path)
             .map_err(test_support::ctx("scratch file must be stat-able"))?;
@@ -2238,16 +2231,11 @@ network_targets = []
     -> test_support::TestResult {
         use std::os::unix::fs::PermissionsExt;
 
-        let Some(euid) = resolve_process_euid() else {
-            // Ohne auflösbare euid greift nur die portable
-            // Selbstkonsistenz-Prüfung; der hier geprüfte euid-Pfad ist auf
-            // dieser Plattform gegenstandslos.
-            return Ok(());
-        };
+        let euid = process_euid();
         let dir = scratch_dir("foreign-owner")?;
-        fs::set_permissions(&dir.0, fs::Permissions::from_mode(0o755))
+        fs::set_permissions(&dir.path, fs::Permissions::from_mode(0o755))
             .map_err(test_support::ctx("scratch dir mode must be settable"))?;
-        let policy_path = dir.0.join("authority.toml");
+        let policy_path = dir.path.join("authority.toml");
         fs::write(&policy_path, b"schema_version = 1\n")
             .map_err(test_support::ctx("policy must be writable"))?;
         fs::set_permissions(&policy_path, fs::Permissions::from_mode(0o644))
@@ -2273,8 +2261,8 @@ network_targets = []
     #[test]
     fn ensure_policy_not_replaced_detects_a_swapped_file() -> test_support::TestResult {
         let dir = scratch_dir("swap")?;
-        let original = dir.0.join("policy.toml");
-        let swapped = dir.0.join("other.toml");
+        let original = dir.path.join("policy.toml");
+        let swapped = dir.path.join("other.toml");
         fs::write(&original, b"schema_version = 1\n")
             .map_err(test_support::ctx("original policy must be writable"))?;
         fs::write(&swapped, b"schema_version = 1\nextra = true\n")
@@ -2304,9 +2292,9 @@ network_targets = []
         use std::os::unix::fs::PermissionsExt;
 
         let dir = scratch_dir("group-writable")?;
-        fs::set_permissions(&dir.0, fs::Permissions::from_mode(0o777))
+        fs::set_permissions(&dir.path, fs::Permissions::from_mode(0o777))
             .map_err(test_support::ctx("scratch dir mode must be settable"))?;
-        let policy_path = dir.0.join("authority.toml");
+        let policy_path = dir.path.join("authority.toml");
         fs::write(&policy_path, b"schema_version = 1\n")
             .map_err(test_support::ctx("policy must be writable"))?;
         fs::set_permissions(&policy_path, fs::Permissions::from_mode(0o644))
@@ -2326,9 +2314,9 @@ network_targets = []
         use std::os::unix::fs::PermissionsExt;
 
         let dir = scratch_dir("well-owned")?;
-        fs::set_permissions(&dir.0, fs::Permissions::from_mode(0o755))
+        fs::set_permissions(&dir.path, fs::Permissions::from_mode(0o755))
             .map_err(test_support::ctx("scratch dir mode must be settable"))?;
-        let policy_path = dir.0.join("authority.toml");
+        let policy_path = dir.path.join("authority.toml");
         fs::write(&policy_path, b"schema_version = 1\n")
             .map_err(test_support::ctx("policy must be writable"))?;
         fs::set_permissions(&policy_path, fs::Permissions::from_mode(0o644))
